@@ -36,6 +36,10 @@ enum Val {
     U(String),
     B(String),
     Buf { len: String, data: String },
+    /// A string literal: its bytes as an SMT array, so proofs know them exactly.
+    Str { len: String, data: String },
+    /// A capability token (Serial). It carries no data the prover needs.
+    Cap,
     Unit,
 }
 
@@ -128,7 +132,13 @@ impl<'p> Verifier<'p> {
         match ty {
             Type::U64 => self.fresh_u64(hint),
             Type::Bool => self.fresh_bool(hint),
-            Type::Buf | Type::RefBuf => Ok(Val::Buf { len: self.fresh_len(hint)?, data: self.fresh_data(hint)? }),
+            Type::Buf => Ok(Val::Buf { len: self.fresh_len(hint)?, data: self.fresh_data(hint)? }),
+            Type::Str => Ok(Val::Str { len: self.fresh_len(hint)?, data: self.fresh_data(hint)? }),
+            Type::Serial => Ok(Val::Cap),
+            Type::Ref(t) => {
+                let t = (**t).clone();
+                self.fresh_of(&t, hint)
+            }
             Type::Unit => Ok(Val::Unit),
         }
     }
@@ -160,7 +170,11 @@ impl<'p> Verifier<'p> {
                             let v = self.solver.get_value(&len).map_err(|e| Diag::new("E-SOLVER", pos, e))?;
                             cex.push(format!("len({}) = {}", n, v));
                         }
-                        Val::Unit => {}
+                        Val::Str { len, .. } => {
+                            let v = self.solver.get_value(&len).map_err(|e| Diag::new("E-SOLVER", pos, e))?;
+                            cex.push(format!("slen({}) = {}", n, v));
+                        }
+                        Val::Unit | Val::Cap => {}
                     }
                 }
                 if !cex.is_empty() {
@@ -269,7 +283,12 @@ impl<'p> Verifier<'p> {
                                         len: if l1 == l2 { l1.clone() } else { format!("(ite {} {} {})", c, l1, l2) },
                                         data: if d1 == d2 { d1.clone() } else { format!("(ite {} {} {})", c, d1, d2) },
                                     },
-                                    _ => a.clone(),
+                                    (Val::Str { len: l1, data: d1 }, Val::Str { len: l2, data: d2 }) => Val::Str {
+                                        len: if l1 == l2 { l1.clone() } else { format!("(ite {} {} {})", c, l1, l2) },
+                                        data: if d1 == d2 { d1.clone() } else { format!("(ite {} {} {})", c, d1, d2) },
+                                    },
+                                    (Val::Cap, Val::Cap) | (Val::Unit, Val::Unit) => a.clone(),
+                                    _ => unreachable!("type checker guarantees matching kinds"),
                                 }
                             };
                             env.insert(name.clone(), merged);
@@ -305,8 +324,10 @@ impl<'p> Verifier<'p> {
                             let len = if only_set { len } else { self.fresh_len(&name)? };
                             Val::Buf { len, data: self.fresh_data(&name)? }
                         }
+                        Val::Str { .. } => Val::Str { len: self.fresh_len(&name)?, data: self.fresh_data(&name)? },
                         Val::U(_) => self.fresh_u64(&name)?,
                         Val::B(_) => self.fresh_bool(&name)?,
+                        Val::Cap => Val::Cap,
                         Val::Unit => Val::Unit,
                     };
                     lst.env.insert(name, nv);
@@ -337,6 +358,7 @@ impl<'p> Verifier<'p> {
         match &e.kind {
             ExprKind::Int(v) => Ok(Val::U(v.to_string())),
             ExprKind::Bool(b) => Ok(Val::B(b.to_string())),
+            ExprKind::Str(bytes) => Ok(str_val(bytes)),
             ExprKind::Var(n) => Ok(st.env[n].clone()),
             ExprKind::Not(x) => {
                 let v = self.eval(x, st)?;
@@ -457,6 +479,30 @@ impl<'p> Verifier<'p> {
                 }
                 _ => unreachable!(),
             },
+            "slen" => match &vals[0] {
+                Val::Str { len, .. } => Ok(Val::U(len.clone())),
+                _ => unreachable!(),
+            },
+            "sget" => match &vals[0] {
+                Val::Str { len, data } => {
+                    let i = vals[1].term();
+                    self.prove(st, &format!("(< {} {})", i, len), pos, "E-VERIFY-BOUNDS", format!("that the index `{}` is within the string `{}` (`{} < slen({})`)", render(&args[1]), render(&args[0]), render(&args[1]), render(&args[0])))?;
+                    let sel = format!("(select {} {})", data, i);
+                    st.pc.push(format!("(and (<= 0 {s}) (<= {s} 255))", s = sel));
+                    Ok(Val::U(sel))
+                }
+                _ => unreachable!(),
+            },
+            "serial_write" => {
+                let b = vals[1].term();
+                self.prove(st, &format!("(<= {} 255)", b), pos, "E-VERIFY-BYTE", format!("that `{}` fits in a byte (`<= 255`)", render(&args[1])))?;
+                Ok(Val::Unit)
+            }
+            "serial_read" => {
+                let v = self.fresh_u64("serial_read")?;
+                st.pc.push(format!("(<= {} 255)", v.term()));
+                Ok(v)
+            }
             "free" | "print" => Ok(Val::Unit),
             _ => unreachable!(),
         }
@@ -467,6 +513,7 @@ impl<'p> Verifier<'p> {
         Ok(match &e.kind {
             ExprKind::Int(v) => v.to_string(),
             ExprKind::Bool(b) => b.to_string(),
+            ExprKind::Str(_) => return Err(Diag::new("E-TYPE", e.pos, "a string literal can only appear as the argument of `slen` or `sget` in a specification")),
             ExprKind::Var(n) => {
                 if bound.contains(n) {
                     format!("q_{}", sanitize(n))
@@ -509,10 +556,11 @@ impl<'p> Verifier<'p> {
                 let buf = match &args[0].kind {
                     ExprKind::Var(n) if n == "result" => result.expect("checked").clone(),
                     ExprKind::Var(n) => env[n].clone(),
+                    ExprKind::Str(bytes) => str_val(bytes),
                     _ => return Err(Diag::new("E-TYPE", args[0].pos, "a buffer in a specification must be a variable")),
                 };
-                let Val::Buf { len, data } = buf else { unreachable!() };
-                if name == "len" {
+                let (Val::Buf { len, data } | Val::Str { len, data }) = buf else { unreachable!() };
+                if name == "len" || name == "slen" {
                     len
                 } else {
                     let i = self.spec(&args[1], env, result, bound)?;
@@ -541,4 +589,13 @@ fn assigned_vars(stmts: &[Stmt], out: &mut HashMap<String, bool>) {
             _ => {}
         }
     }
+}
+
+/// The SMT value of a string literal: exact length and exact bytes.
+fn str_val(bytes: &[u8]) -> Val {
+    let mut data = "((as const (Array Int Int)) 0)".to_string();
+    for (i, b) in bytes.iter().enumerate() {
+        data = format!("(store {} {} {})", data, i, b);
+    }
+    Val::Str { len: bytes.len().to_string(), data }
 }

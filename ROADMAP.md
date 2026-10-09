@@ -34,6 +34,8 @@ The proof pipeline works end to end.
 - [x] Symbolic execution and Z3 proofs: bounds, overflow, division by zero, requires/ensures/invariant/assert
 - [x] Errors with counterexamples
 - [x] C backend with no runtime checks, cross-checked under sanitizers
+- [x] String literals (`Str`) and a linear serial-console capability (`Serial`), with written bytes proved to fit in 8 bits
+- [x] Freestanding kernel target (`--target kernel`); BastiOS boots in QEMU and runs a shell written in Bastio
 
 ## v1: language features needed for self-hosting
 

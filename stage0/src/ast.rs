@@ -9,18 +9,38 @@ pub enum Type {
     Unit,
     /// An owned buffer of u64. Linear: must be consumed exactly once.
     Buf,
-    /// A read-only borrow of a buffer. Only allowed as a parameter type.
-    RefBuf,
+    /// The console capability. Linear: whoever owns it may talk to the
+    /// serial line, and nobody else can. Only `main` receives one.
+    Serial,
+    /// An immutable string literal. Freely copyable.
+    Str,
+    /// A read-only borrow of a linear value. Only allowed as a parameter type.
+    Ref(Box<Type>),
 }
 
 impl Type {
-    pub fn name(&self) -> &'static str {
+    pub fn name(&self) -> String {
         match self {
-            Type::U64 => "u64",
-            Type::Bool => "bool",
-            Type::Unit => "()",
-            Type::Buf => "Buf",
-            Type::RefBuf => "&Buf",
+            Type::U64 => "u64".into(),
+            Type::Bool => "bool".into(),
+            Type::Unit => "()".into(),
+            Type::Buf => "Buf".into(),
+            Type::Serial => "Serial".into(),
+            Type::Str => "Str".into(),
+            Type::Ref(t) => format!("&{}", t.name()),
+        }
+    }
+    pub fn is_linear(&self) -> bool {
+        matches!(self, Type::Buf | Type::Serial)
+    }
+    pub fn is_ref(&self) -> bool {
+        matches!(self, Type::Ref(_))
+    }
+    /// The type with any borrow removed.
+    pub fn base(&self) -> &Type {
+        match self {
+            Type::Ref(t) => t,
+            t => t,
         }
     }
 }
@@ -68,6 +88,8 @@ impl BinOp {
 pub enum ExprKind {
     Int(u128),
     Bool(bool),
+    /// A string literal (already unescaped).
+    Str(Vec<u8>),
     Var(String),
     Not(Box<Expr>),
     Bin(BinOp, Box<Expr>, Box<Expr>),
@@ -129,6 +151,7 @@ pub fn render(e: &Expr) -> String {
         match &e.kind {
             ExprKind::Int(v) => v.to_string(),
             ExprKind::Bool(b) => b.to_string(),
+            ExprKind::Str(b) => format!("{:?}", String::from_utf8_lossy(b)),
             ExprKind::Var(n) => n.clone(),
             ExprKind::Not(x) => format!("!{}", go(x, false)),
             ExprKind::Bin(op, a, b) => {

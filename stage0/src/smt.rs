@@ -92,10 +92,34 @@ impl Solver {
     pub fn get_value(&mut self, term: &str) -> Result<String, String> {
         self.send(&format!("(get-value ({}))", term))?;
         let r = self.read_response()?;
-        // r looks like `((term value))`; strip the outer pair and the term.
-        let inner = r.trim_start_matches('(').trim_end_matches(')');
-        let v = inner.strip_prefix(term).unwrap_or(inner).trim();
-        Ok(pretty_value(v))
+        // r looks like `((term value))`: drop the two outer parens, then take
+        // the last balanced s-expression or atom.
+        let inner = r.trim();
+        let inner = inner.strip_prefix("((").and_then(|x| x.strip_suffix("))")).unwrap_or(inner).trim_end();
+        Ok(pretty_value(last_sexp(inner)))
+    }
+}
+
+/// The last balanced s-expression (or atom) in `s`.
+fn last_sexp(s: &str) -> &str {
+    let b = s.as_bytes();
+    if b.last() == Some(&b')') {
+        let mut depth = 0i64;
+        for i in (0..b.len()).rev() {
+            match b[i] {
+                b')' => depth += 1,
+                b'(' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &s[i..];
+                    }
+                }
+                _ => {}
+            }
+        }
+        s
+    } else {
+        s.rsplit(|c: char| c.is_whitespace()).next().unwrap_or(s)
     }
 }
 

@@ -6,6 +6,7 @@ use crate::diag::{Diag, Pos};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
     Int(u128),
+    Str(Vec<u8>),
     Ident(String),
     // keywords
     Fn,
@@ -85,6 +86,41 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Diag> {
             while i < chars.len() && chars[i] != '\n' {
                 i += 1;
             }
+            continue;
+        }
+        if c == '"' {
+            let mut bytes = Vec::new();
+            i += 1;
+            col += 1;
+            loop {
+                if i >= chars.len() || chars[i] == '\n' {
+                    return Err(Diag::new("E-PARSE", pos, "unterminated string literal"));
+                }
+                let ch = chars[i];
+                i += 1;
+                col += 1;
+                if ch == '"' {
+                    break;
+                }
+                if ch == '\\' {
+                    let esc = chars.get(i).copied().unwrap_or(' ');
+                    i += 1;
+                    col += 1;
+                    match esc {
+                        'n' => bytes.push(b'\n'),
+                        'r' => bytes.push(b'\r'),
+                        't' => bytes.push(b'\t'),
+                        '0' => bytes.push(0),
+                        '\\' => bytes.push(b'\\'),
+                        '"' => bytes.push(b'"'),
+                        _ => return Err(Diag::new("E-PARSE", pos, format!("unknown escape `\\{}` in string literal", esc))),
+                    }
+                    continue;
+                }
+                let mut buf = [0u8; 4];
+                bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
+            out.push(Token { tok: Tok::Str(bytes), pos });
             continue;
         }
         if c.is_ascii_digit() {

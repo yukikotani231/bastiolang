@@ -3,11 +3,13 @@
 // Pipeline: lex -> parse -> check (types + linearity) -> verify (SMT) -> C.
 // The C output is compiled with the system C compiler.
 //
-// usage: bastioc0 [--check] [--emit-c] [--dump-smt] [-o out] <file.bastio>
+// usage: bastioc0 [--check] [--emit-c] [--dump-smt] [--target hosted|kernel] [-o out] <file.bastio>
 //   (default)   verify, then build a native executable `out` (default: a.out)
 //   --check     stop after verification
 //   --emit-c    write the generated C to `out` instead of building
 //   --dump-smt  print every query sent to the solver
+//   --target    `hosted` (default): a normal program on the C library
+//               `kernel`: freestanding C for a bare-metal kernel (implies --emit-c)
 
 mod ast;
 mod check;
@@ -25,6 +27,7 @@ fn main() {
     let mut check_only = false;
     let mut emit_c = false;
     let mut dump_smt = false;
+    let mut target = codegen::Target::Hosted;
     let mut out: Option<String> = None;
     let mut input: Option<String> = None;
     let mut i = 0;
@@ -33,6 +36,20 @@ fn main() {
             "--check" => check_only = true,
             "--emit-c" => emit_c = true,
             "--dump-smt" => dump_smt = true,
+            "--target" => {
+                i += 1;
+                target = match args.get(i).map(|s| s.as_str()) {
+                    Some("hosted") => codegen::Target::Hosted,
+                    Some("kernel") => {
+                        emit_c = true;
+                        codegen::Target::Kernel
+                    }
+                    other => {
+                        eprintln!("bastioc0: unknown target {:?} (expected `hosted` or `kernel`)", other);
+                        exit(2);
+                    }
+                };
+            }
             "-o" => {
                 i += 1;
                 out = args.get(i).cloned();
@@ -46,7 +63,7 @@ fn main() {
         i += 1;
     }
     let Some(input) = input else {
-        eprintln!("usage: bastioc0 [--check] [--emit-c] [--dump-smt] [-o out] <file.bastio>");
+        eprintln!("usage: bastioc0 [--check] [--emit-c] [--dump-smt] [--target hosted|kernel] [-o out] <file.bastio>");
         exit(2);
     };
     let src = match std::fs::read_to_string(&input) {
@@ -76,7 +93,7 @@ fn main() {
         return;
     }
 
-    let c = codegen::emit(&prog);
+    let c = codegen::emit(&prog, target);
     if emit_c {
         let path = out.unwrap_or_else(|| "out.c".into());
         std::fs::write(&path, c).unwrap_or_else(|e| {

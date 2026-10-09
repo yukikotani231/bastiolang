@@ -29,8 +29,14 @@ pub struct Sig {
 pub fn builtin_sigs() -> HashMap<String, Sig> {
     let mut m = HashMap::new();
     m.insert("alloc".into(), Sig { params: vec![Type::U64], ret: Type::Buf });
-    m.insert("len".into(), Sig { params: vec![Type::RefBuf], ret: Type::U64 });
-    m.insert("get".into(), Sig { params: vec![Type::RefBuf, Type::U64], ret: Type::U64 });
+    let rbuf = || Type::Ref(Box::new(Type::Buf));
+    let rser = || Type::Ref(Box::new(Type::Serial));
+    m.insert("len".into(), Sig { params: vec![rbuf()], ret: Type::U64 });
+    m.insert("get".into(), Sig { params: vec![rbuf(), Type::U64], ret: Type::U64 });
+    m.insert("slen".into(), Sig { params: vec![Type::Str], ret: Type::U64 });
+    m.insert("sget".into(), Sig { params: vec![Type::Str, Type::U64], ret: Type::U64 });
+    m.insert("serial_write".into(), Sig { params: vec![rser(), Type::U64], ret: Type::Unit });
+    m.insert("serial_read".into(), Sig { params: vec![rser()], ret: Type::U64 });
     m.insert("set".into(), Sig { params: vec![Type::Buf, Type::U64, Type::U64], ret: Type::Buf });
     m.insert("free".into(), Sig { params: vec![Type::Buf], ret: Type::Unit });
     m.insert("print".into(), Sig { params: vec![Type::U64], ret: Type::Unit });
@@ -38,7 +44,7 @@ pub fn builtin_sigs() -> HashMap<String, Sig> {
 }
 
 pub fn is_builtin(name: &str) -> bool {
-    matches!(name, "alloc" | "len" | "get" | "set" | "free" | "print")
+    matches!(name, "alloc" | "len" | "get" | "set" | "free" | "print" | "slen" | "sget" | "serial_write" | "serial_read")
 }
 
 pub fn signatures(p: &Program) -> Result<HashMap<String, Sig>, Diag> {
@@ -50,16 +56,17 @@ pub fn signatures(p: &Program) -> Result<HashMap<String, Sig>, Diag> {
         if sigs.contains_key(&f.name) {
             return Err(Diag::new("E-TYPE", f.pos, format!("function `{}` is defined twice", f.name)));
         }
-        if f.ret == Type::RefBuf {
+        if f.ret.is_ref() {
             return Err(Diag::new("E-TYPE", f.pos, "a function cannot return a borrow `&Buf`"));
         }
         sigs.insert(f.name.clone(), Sig { params: f.params.iter().map(|p| p.ty.clone()).collect(), ret: f.ret.clone() });
     }
     match sigs.get("main") {
         Some(s) if s.params.is_empty() && s.ret == Type::U64 => {}
+        Some(s) if s.params == vec![Type::Serial] && s.ret == Type::Serial => {}
         Some(_) => {
             let f = p.fns.iter().find(|f| f.name == "main").unwrap();
-            return Err(Diag::new("E-TYPE", f.pos, "`main` must have the signature `fn main() -> u64`"));
+            return Err(Diag::new("E-TYPE", f.pos, "`main` must be `fn main() -> u64` or `fn main(con: Serial) -> Serial`"));
         }
         None => return Err(Diag::new("E-TYPE", Pos { line: 1, col: 1 }, "no `main` function")),
     }
@@ -100,8 +107,8 @@ fn check_fn(f: &mut FnDef, sigs: &HashMap<String, Sig>) -> Result<(), Diag> {
         all_names: HashSet::new(),
     };
     for p in &f.params {
-        if p.ty == Type::RefBuf && p.mutable {
-            return Err(Diag::new("E-TYPE", p.pos, "a borrow `&Buf` cannot be `mut`"));
+        if p.ty.is_ref() && p.mutable {
+            return Err(Diag::new("E-TYPE", p.pos, "a borrow cannot be `mut`"));
         }
         cx.declare(&p.name, p.ty.clone(), p.mutable, p.pos)?;
     }
@@ -149,7 +156,7 @@ impl<'a> Ctx<'a> {
             .scopes
             .iter()
             .flatten()
-            .filter(|n| self.vars[*n].ty == Type::Buf && !self.moved.contains(*n))
+            .filter(|n| self.vars[*n].ty.is_linear() && !self.moved.contains(*n))
             .cloned()
             .collect();
         v.sort();
@@ -159,8 +166,8 @@ impl<'a> Ctx<'a> {
     fn leak_check_all(&self, pos: Pos, when: &str) -> Result<(), Diag> {
         let live = self.live_bufs();
         if !live.is_empty() {
-            return Err(Diag::new("E-LINEAR-LEAK", pos, format!("buffer `{}` is still owned {}", live.join("`, `"), when))
-                .note("every Buf must be consumed exactly once: return it, pass it to a function that takes `Buf`, or `free` it"));
+            return Err(Diag::new("E-LINEAR-LEAK", pos, format!("`{}` is still owned {}", live.join("`, `"), when))
+                .note("every linear value must be consumed exactly once: return it, pass it to a function that takes it by value, or `free` it"));
         }
         Ok(())
     }
@@ -178,8 +185,8 @@ impl<'a> Ctx<'a> {
         let scope = self.scopes.pop().unwrap();
         if !diverges {
             for n in &scope {
-                if self.vars[n].ty == Type::Buf && !self.moved.contains(n) {
-                    return Err(Diag::new("E-LINEAR-LEAK", stmts.last().map(|s| s.pos).unwrap_or_default(), format!("buffer `{}` goes out of scope while still owned", n))
+                if self.vars[n].ty.is_linear() && !self.moved.contains(n) {
+                    return Err(Diag::new("E-LINEAR-LEAK", stmts.last().map(|s| s.pos).unwrap_or_default(), format!("`{}` goes out of scope while still owned", n))
                         .note("every Buf must be consumed exactly once: return it, pass it to a function that takes `Buf`, or `free` it"));
                 }
             }
@@ -197,8 +204,8 @@ impl<'a> Ctx<'a> {
             StmtKind::Let { name, mutable, ty, init } => {
                 let t = self.expr(init)?;
                 if let Some(want) = ty {
-                    if *want == Type::RefBuf {
-                        return Err(Diag::new("E-TYPE", pos, "a local cannot hold a borrow `&Buf`"));
+                    if want.is_ref() {
+                        return Err(Diag::new("E-TYPE", pos, "a local cannot hold a borrow"));
                     }
                     expect_ty(&t, want, init.pos, &format!("the initializer of `{}`", name))?;
                 }
@@ -217,9 +224,9 @@ impl<'a> Ctx<'a> {
                 }
                 let t = self.expr(value)?;
                 expect_ty(&t, &info.ty, value.pos, &format!("the value assigned to `{}`", name))?;
-                if info.ty == Type::Buf {
+                if info.ty.is_linear() {
                     if !self.moved.contains(name.as_str()) {
-                        return Err(Diag::new("E-LINEAR-LEAK", pos, format!("assigning to `{}` would drop the buffer it still owns", name))
+                        return Err(Diag::new("E-LINEAR-LEAK", pos, format!("assigning to `{}` would drop the value it still owns", name))
                             .note("consume the old buffer first, e.g. `b = set(b, i, v);`"));
                     }
                     self.moved.remove(name.as_str());
@@ -290,8 +297,8 @@ impl<'a> Ctx<'a> {
             }
             StmtKind::Expr(e) => {
                 let t = self.expr(e)?;
-                if t == Type::Buf {
-                    return Err(Diag::new("E-LINEAR-LEAK", pos, "this buffer is created and immediately dropped"));
+                if t.is_linear() {
+                    return Err(Diag::new("E-LINEAR-LEAK", pos, "this linear value is created and immediately dropped"));
                 }
                 Ok(false)
             }
@@ -307,17 +314,18 @@ impl<'a> Ctx<'a> {
         match &e.kind {
             ExprKind::Int(_) => Ok(Type::U64),
             ExprKind::Bool(_) => Ok(Type::Bool),
+            ExprKind::Str(_) => Ok(Type::Str),
             ExprKind::Var(n) => {
                 let info = self.var_info(n, e.pos)?;
                 match info.ty {
-                    Type::Buf => {
+                    t if t.is_linear() => {
                         if self.moved.contains(n.as_str()) {
-                            return Err(Diag::new("E-LINEAR-USE", e.pos, format!("buffer `{}` is used after it was consumed", n)));
+                            return Err(Diag::new("E-LINEAR-USE", e.pos, format!("`{}` is used after it was consumed", n)));
                         }
                         self.moved.insert(n.clone());
-                        Ok(Type::Buf)
+                        Ok(t)
                     }
-                    Type::RefBuf => Err(Diag::new("E-LINEAR-USE", e.pos, format!("cannot move out of the borrow `{}`", n))),
+                    Type::Ref(_) => Err(Diag::new("E-LINEAR-USE", e.pos, format!("cannot move out of the borrow `{}`", n))),
                     t => Ok(t),
                 }
             }
@@ -350,37 +358,37 @@ impl<'a> Ctx<'a> {
                 // Scalars first, then borrows, then moves: a scalar argument may
                 // read a buffer that a later argument consumes (`set(b, i, get(b, j))`).
                 for (pt, a) in sig.params.iter().zip(args) {
-                    if *pt != Type::Buf && *pt != Type::RefBuf {
+                    if !pt.is_linear() && !pt.is_ref() {
                         let t = self.expr(a)?;
                         expect_ty(&t, pt, a.pos, &format!("argument of `{}`", name))?;
                     }
                 }
                 let mut borrowed = HashSet::new();
                 for (pt, a) in sig.params.iter().zip(args) {
-                    if *pt == Type::RefBuf {
+                    if pt.is_ref() {
                         let n = match &a.kind {
                             ExprKind::Var(n) => n,
-                            _ => return Err(Diag::new("E-TYPE", a.pos, format!("argument of `{}` must name a buffer to borrow", name))),
+                            _ => return Err(Diag::new("E-TYPE", a.pos, format!("argument of `{}` must name a value to borrow", name))),
                         };
                         let info = self.var_info(n, a.pos)?;
-                        if info.ty != Type::Buf && info.ty != Type::RefBuf {
-                            return Err(Diag::new("E-TYPE", a.pos, format!("argument of `{}` must be a buffer, found {}", name, info.ty.name())));
+                        if info.ty.base() != pt.base() {
+                            return Err(Diag::new("E-TYPE", a.pos, format!("argument of `{}` must be {}, found {}", name, pt.base().name(), info.ty.name())));
                         }
                         if self.moved.contains(n.as_str()) {
-                            return Err(Diag::new("E-LINEAR-USE", a.pos, format!("buffer `{}` is borrowed after it was consumed", n)));
+                            return Err(Diag::new("E-LINEAR-USE", a.pos, format!("`{}` is borrowed after it was consumed", n)));
                         }
                         borrowed.insert(n.clone());
                     }
                 }
                 for (pt, a) in sig.params.iter().zip(args) {
-                    if *pt == Type::Buf {
+                    if pt.is_linear() {
                         if let ExprKind::Var(n) = &a.kind {
                             if borrowed.contains(n) {
-                                return Err(Diag::new("E-LINEAR-USE", a.pos, format!("buffer `{}` is both borrowed and moved in this call", n)));
+                                return Err(Diag::new("E-LINEAR-USE", a.pos, format!("`{}` is both borrowed and moved in this call", n)));
                             }
                         }
                         let t = self.expr(a)?;
-                        expect_ty(&t, &Type::Buf, a.pos, &format!("argument of `{}`", name))?;
+                        expect_ty(&t, pt, a.pos, &format!("argument of `{}`", name))?;
                     }
                 }
                 Ok(sig.ret)
@@ -393,6 +401,7 @@ impl<'a> Ctx<'a> {
         match &e.kind {
             ExprKind::Int(_) => Ok(Type::U64),
             ExprKind::Bool(_) => Ok(Type::Bool),
+            ExprKind::Str(_) => Ok(Type::Str),
             ExprKind::Var(n) => {
                 if bound.contains(n) {
                     return Ok(Type::U64);
@@ -429,16 +438,19 @@ impl<'a> Ctx<'a> {
                 Ok(Type::Bool)
             }
             ExprKind::Call(name, args) => {
-                if name != "len" && name != "get" {
-                    return Err(Diag::new("E-TYPE", e.pos, format!("only `len` and `get` may be called in specifications, not `{}`", name)));
+                if !matches!(name.as_str(), "len" | "get" | "slen" | "sget") {
+                    return Err(Diag::new("E-TYPE", e.pos, format!("only `len`, `get`, `slen` and `sget` may be called in specifications, not `{}`", name)));
                 }
                 let sig = &self.sigs[name.as_str()];
                 if sig.params.len() != args.len() {
                     return Err(Diag::new("E-TYPE", e.pos, format!("`{}` takes {} argument(s), {} given", name, sig.params.len(), args.len())));
                 }
                 let tb = self.spec_expr(&args[0], in_ensures, bound)?;
-                if tb != Type::Buf && tb != Type::RefBuf {
-                    return Err(Diag::new("E-TYPE", args[0].pos, format!("argument of `{}` must be a buffer", name)));
+                if tb.base() != sig.params[0].base() {
+                    return Err(Diag::new("E-TYPE", args[0].pos, format!("argument of `{}` must be {}", name, sig.params[0].base().name())));
+                }
+                if !matches!(&args[0].kind, ExprKind::Var(_) | ExprKind::Str(_)) {
+                    return Err(Diag::new("E-TYPE", args[0].pos, format!("the first argument of `{}` in a specification must be a variable", name)));
                 }
                 if args.len() == 2 {
                     let ti = self.spec_expr(&args[1], in_ensures, bound)?;

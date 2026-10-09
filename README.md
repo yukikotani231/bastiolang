@@ -67,6 +67,7 @@ stage0/target/release/bastioc0 -o hello examples/hello.bastio && ./hello
 - `--check`: verify only
 - `--emit-c`: write the generated C
 - `--dump-smt`: print every query sent to the solver
+- `--target kernel`: emit freestanding C for bare-metal x86-64 (used by BastiOS)
 
 ## Layout
 
@@ -80,4 +81,4 @@ stage0/target/release/bastioc0 -o hello examples/hello.bastio && ./hello
 
 ## Status (v0)
 
-The only types are `u64`, `bool`, `Buf` (an owned buffer of u64) and `&Buf` (a read-only borrow). The backend emits C. What v0 does and does not guarantee is listed under "Soundness scope" in [docs/language.md](docs/language.md).
+The types are `u64`, `bool`, `Buf` (an owned buffer of u64), `&Buf` (a read-only borrow), `Str` (string literals) and `Serial` (the console capability). The backend emits C. What v0 does and does not guarantee is listed under "Soundness scope" in [docs/language.md](docs/language.md).

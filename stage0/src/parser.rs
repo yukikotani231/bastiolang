@@ -5,7 +5,7 @@
 //   fn       := 'fn' IDENT '(' (param (',' param)*)? ')' ('->' type)?
 //               ('requires' expr | 'ensures' expr)* block
 //   param    := 'mut'? IDENT ':' type
-//   type     := 'u64' | 'bool' | 'Buf' | '&' 'Buf'
+//   type     := 'u64' | 'bool' | 'Str' | 'Buf' | 'Serial' | '&' ('Buf' | 'Serial')
 //   block    := '{' stmt* '}'
 //   stmt     := 'let' 'mut'? IDENT (':' type)? '=' expr ';'
 //             | IDENT '=' expr ';'
@@ -88,17 +88,19 @@ impl Parser {
     fn ty(&mut self) -> PResult<Type> {
         let pos = self.pos();
         if self.eat(&Tok::Amp) {
-            let (n, p) = self.ident()?;
-            if n != "Buf" {
-                return Err(Diag::new("E-PARSE", p, format!("only `&Buf` borrows exist in v0, found `&{}`", n)));
+            let inner = self.ty()?;
+            if !inner.is_linear() {
+                return Err(Diag::new("E-PARSE", pos, format!("only linear values can be borrowed, found `&{}`", inner.name())));
             }
-            return Ok(Type::RefBuf);
+            return Ok(Type::Ref(Box::new(inner)));
         }
         let (n, _) = self.ident()?;
         match n.as_str() {
             "u64" => Ok(Type::U64),
             "bool" => Ok(Type::Bool),
             "Buf" => Ok(Type::Buf),
+            "Serial" => Ok(Type::Serial),
+            "Str" => Ok(Type::Str),
             _ => Err(Diag::new("E-PARSE", pos, format!("unknown type `{}`", n))),
         }
     }
@@ -316,6 +318,10 @@ impl Parser {
             Tok::True => {
                 self.bump();
                 Ok(Expr { kind: ExprKind::Bool(true), pos })
+            }
+            Tok::Str(b) => {
+                self.bump();
+                Ok(Expr { kind: ExprKind::Str(b), pos })
             }
             Tok::False => {
                 self.bump();
