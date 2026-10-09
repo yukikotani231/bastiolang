@@ -2,7 +2,8 @@
 # Runs every test. pass/*.bastio must verify, build, and exit with the code in
 # their `// expect-exit: N` header (and print the
 # first line of `// expect-stdout: TEXT`, if given, with stdin empty); fail/*.bastio must be rejected with the error
-# code in their `// expect-error: CODE` header (a rejection for the wrong
+# code in their `// expect-error: CODE` header, checked for the target in an
+# optional `// target: T` header (a rejection for the wrong
 # reason counts as a failure).
 set -u
 cd "$(dirname "$0")/.."
@@ -27,7 +28,8 @@ for f in tests/pass/*.bastio; do
 done
 for f in tests/fail/*.bastio; do
   want=$(sed -n 's|^// expect-error: *||p' "$f" | head -1)
-  if "$BASTIOC" --check "$f" 2>"$tmp/err"; then
+  target=$(sed -n 's|^// target: *||p' "$f" | head -1)
+  if "$BASTIOC" --check --target "${target:-hosted}" "$f" 2>"$tmp/err"; then
     echo "FAIL $f: accepted, want $want"; fail=$((fail+1)); continue
   fi
   if grep -q "error\[$want\]" "$tmp/err"; then pass=$((pass+1)); else

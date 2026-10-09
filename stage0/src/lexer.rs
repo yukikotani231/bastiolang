@@ -10,6 +10,8 @@ pub enum Tok {
     Ident(String),
     // keywords
     Fn,
+    Spec,
+    Const,
     Let,
     Mut,
     If,
@@ -60,7 +62,7 @@ pub struct Token {
     pub pos: Pos,
 }
 
-pub fn lex(src: &str) -> Result<Vec<Token>, Diag> {
+pub fn lex(src: &str, file: usize) -> Result<Vec<Token>, Diag> {
     let chars: Vec<char> = src.chars().collect();
     let mut out = Vec::new();
     let mut i = 0;
@@ -68,7 +70,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Diag> {
     let mut col = 1;
     while i < chars.len() {
         let c = chars[i];
-        let pos = Pos { line, col };
+        let pos = Pos { file, line, col };
         // whitespace
         if c == '\n' {
             i += 1;
@@ -123,6 +125,19 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Diag> {
             out.push(Token { tok: Tok::Str(bytes), pos });
             continue;
         }
+        if c == '0' && matches!(chars.get(i + 1), Some('x') | Some('X')) {
+            let start = i;
+            i += 2;
+            while i < chars.len() && (chars[i].is_ascii_hexdigit() || chars[i] == '_') {
+                i += 1;
+            }
+            let text: String = chars[start + 2..i].iter().filter(|c| **c != '_').collect();
+            col += i - start;
+            let v = u128::from_str_radix(&text, 16).ok().filter(|v| *v <= u64::MAX as u128)
+                .ok_or_else(|| Diag::new("E-PARSE", pos, format!("hex literal `0x{}` does not fit in u64", text)))?;
+            out.push(Token { tok: Tok::Int(v), pos });
+            continue;
+        }
         if c.is_ascii_digit() {
             let start = i;
             while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '_') {
@@ -148,6 +163,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Diag> {
             col += i - start;
             let tok = match text.as_str() {
                 "fn" => Tok::Fn,
+                "spec" => Tok::Spec,
+                "const" => Tok::Const,
                 "let" => Tok::Let,
                 "mut" => Tok::Mut,
                 "if" => Tok::If,
@@ -201,6 +218,6 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Diag> {
         col += len;
         out.push(Token { tok, pos });
     }
-    out.push(Token { tok: Tok::Eof, pos: Pos { line, col } });
+    out.push(Token { tok: Tok::Eof, pos: Pos { file, line, col } });
     Ok(out)
 }

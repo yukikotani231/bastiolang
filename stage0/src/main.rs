@@ -3,13 +3,16 @@
 // Pipeline: lex -> parse -> check (types + linearity) -> verify (SMT) -> C.
 // The C output is compiled with the system C compiler.
 //
-// usage: bastioc0 [--check] [--emit-c] [--dump-smt] [--target hosted|kernel] [-o out] <file.bastio>
+// usage: bastioc0 [--check] [--emit-c] [--dump-smt] [--target T] [-o out] <file.bastio>...
 //   (default)   verify, then build a native executable `out` (default: a.out)
 //   --check     stop after verification
 //   --emit-c    write the generated C to `out` instead of building
 //   --dump-smt  print every query sent to the solver
 //   --target    `hosted` (default): a normal program on the C library
-//               `kernel`: freestanding C for a bare-metal kernel (implies --emit-c)
+//               `kernel`: freestanding C for a bare-metal x86-64 kernel (implies --emit-c)
+//               `user`: freestanding C for a user program under BastiOS (implies --emit-c)
+// Several input files form one program; constants must be defined before use,
+// in command-line order.
 
 mod ast;
 mod check;
@@ -29,7 +32,7 @@ fn main() {
     let mut dump_smt = false;
     let mut target = codegen::Target::Hosted;
     let mut out: Option<String> = None;
-    let mut input: Option<String> = None;
+    let mut inputs: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -44,8 +47,12 @@ fn main() {
                         emit_c = true;
                         codegen::Target::Kernel
                     }
+                    Some("user") => {
+                        emit_c = true;
+                        codegen::Target::User
+                    }
                     other => {
-                        eprintln!("bastioc0: unknown target {:?} (expected `hosted` or `kernel`)", other);
+                        eprintln!("bastioc0: unknown target {:?} (expected `hosted`, `kernel` or `user`)", other);
                         exit(2);
                     }
                 };
@@ -58,30 +65,43 @@ fn main() {
                 eprintln!("bastioc0: unknown option `{}`", a);
                 exit(2);
             }
-            a => input = Some(a.to_string()),
+            a => inputs.push(a.to_string()),
         }
         i += 1;
     }
-    let Some(input) = input else {
-        eprintln!("usage: bastioc0 [--check] [--emit-c] [--dump-smt] [--target hosted|kernel] [-o out] <file.bastio>");
+    if inputs.is_empty() {
+        eprintln!("usage: bastioc0 [--check] [--emit-c] [--dump-smt] [--target hosted|kernel|user] [-o out] <file.bastio>...");
         exit(2);
-    };
-    let src = match std::fs::read_to_string(&input) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("bastioc0: cannot read {}: {}", input, e);
-            exit(2);
+    }
+    let mut files: Vec<(String, String)> = Vec::new();
+    for input in &inputs {
+        match std::fs::read_to_string(input) {
+            Ok(s) => files.push((input.clone(), s)),
+            Err(e) => {
+                eprintln!("bastioc0: cannot read {}: {}", input, e);
+                exit(2);
+            }
         }
-    };
+    }
+    let input = inputs.join(" ");
 
     let fail = |d: diag::Diag| -> ! {
-        eprint!("{}", d.render(&input, &src));
+        eprint!("{}", d.render(&files));
         exit(1);
     };
 
-    let toks = lexer::lex(&src).unwrap_or_else(|d| fail(d));
-    let mut prog = parser::Parser::new(toks).program().unwrap_or_else(|d| fail(d));
-    check::check_program(&mut prog).unwrap_or_else(|d| fail(d));
+    let mut prog = ast::Program { fns: Vec::new(), specs: Vec::new() };
+    let mut consts = std::collections::HashMap::new();
+    for (k, (path, src)) in files.iter().enumerate() {
+        let toks = lexer::lex(src, k).unwrap_or_else(|d| fail(d));
+        let dir = std::path::Path::new(path).parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let mut parser = parser::Parser::new(toks, dir, consts);
+        let part = parser.program().unwrap_or_else(|d| fail(d));
+        consts = parser.consts;
+        prog.fns.extend(part.fns);
+        prog.specs.extend(part.specs);
+    }
+    check::check_program(&mut prog, target).unwrap_or_else(|d| fail(d));
     let (n, log) = verify::verify_program(&prog).unwrap_or_else(|d| fail(d));
     if dump_smt {
         for l in &log {

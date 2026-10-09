@@ -1,0 +1,111 @@
+// expect-exit: 42
+// A physical page allocator whose bookkeeping is proved: the bitmap says
+// "free" exactly when the pool still has the page, so `pool_take` (which
+// demands that the pool has the page) can never hand out a page twice.
+// Then a three-level page table is built from allocated pages, used, and
+// torn down, and every page goes back to the pool.
+
+const NPAGES: u64 = 0x10000;   // the most pages a pool can have
+
+spec fn tracks(bm: &Buf, pool: &Pool) -> bool {
+  len(bm) == NPAGES
+  && (forall i: u64 :: i < NPAGES ==> ((get(bm, i) == 1) == pool_has(pool, i)))
+  && (forall i: u64 :: pool_has(pool, i) ==> i < pool_size(pool))
+}
+
+fn bm_new(pool: &Pool) -> Buf
+  requires forall i: u64 :: pool_has(pool, i) == (i < pool_size(pool))
+  ensures tracks(result, pool)
+{
+  let mut bm = alloc(NPAGES);
+  let n = pool_size(pool);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && n <= NPAGES
+    invariant forall j: u64 :: j < NPAGES ==> ((get(bm, j) == 1) == (j < i))
+  {
+    bm = set(bm, i, 1);
+    i = i + 1;
+  }
+  return bm;
+}
+
+/// The first free page, or NPAGES when there is none.
+fn find_free(bm: &Buf) -> u64
+  requires len(bm) == NPAGES
+  ensures result <= NPAGES
+  ensures result < NPAGES ==> get(bm, result) == 1
+{
+  let mut i = 0;
+  while i < NPAGES && get(bm, i) != 1
+    invariant i <= NPAGES
+  {
+    i = i + 1;
+  }
+  return i;
+}
+
+fn take_page(bm: &mut Buf, pool: &mut Pool, i: u64) -> Frame
+  requires tracks(bm, pool) && i < NPAGES && get(bm, i) == 1
+  ensures tracks(bm, pool)
+  ensures frame_id(result) == i
+{
+  bm = set(bm, i, 0);
+  return pool_take(&mut pool, i);
+}
+
+fn give_page(bm: &mut Buf, pool: &mut Pool, f: Frame)
+  requires tracks(bm, pool)
+  ensures tracks(bm, pool)
+{
+  bm = set(bm, frame_id(f), 1);
+  pool_give(&mut pool, f);
+}
+
+/// Frees a level-1 table and the pages it maps.
+fn free_l1(bm: &mut Buf, pool: &mut Pool, t: PageTable)
+  requires tracks(bm, pool) && pt_level(t) == 1
+  ensures tracks(bm, pool)
+{
+  let mut t1 = t;
+  let mut i = 0;
+  while i < 512
+    invariant i <= 512 && tracks(bm, pool)
+    invariant forall j: u64 :: j < i ==> !pt_used(t1, j)
+  {
+    if pt_has(t1, i) {
+      give_page(&mut bm, &mut pool, pt_take_frame(&mut t1, i));
+    }
+    i = i + 1;
+  }
+  give_page(&mut bm, &mut pool, pt_free(t1));
+}
+
+fn main(pool: &mut Pool) -> u64 {
+  let mut bm = bm_new(pool);
+  let a = find_free(bm);
+  let b = find_free(bm);   // same answer: nothing was taken yet
+  if a >= NPAGES || a != b {
+    free(bm);
+    return 1;
+  }
+  let mut l1 = pt_new(take_page(&mut bm, &mut pool, a), 1);
+  let c = find_free(bm);
+  if c >= NPAGES {
+    free_l1(&mut bm, &mut pool, l1);
+    free(bm);
+    return 2;
+  }
+  let mut page = take_page(&mut bm, &mut pool, c);
+  frame_write(&mut page, 7, 40);
+  frame_write8(&mut page, 4095, 2);
+  pt_put_frame(&mut l1, 3, page, true);
+  // Take the page back out of the table and read what was written.
+  let p2 = pt_take_frame(&mut l1, 3);
+  // Page contents are not tracked by the proof, so bound the sum explicitly.
+  let v = frame_read(p2, 7) % 64 + frame_read8(p2, 4095);
+  pt_put_frame(&mut l1, 3, p2, false);
+  free_l1(&mut bm, &mut pool, l1);
+  free(bm);
+  return v;
+}

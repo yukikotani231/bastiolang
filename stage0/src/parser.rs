@@ -1,11 +1,15 @@
 // Recursive-descent parser.
 //
-// Grammar (v0):
-//   program  := fn*
+// Grammar:
+//   program  := (fn | specfn | const)*
 //   fn       := 'fn' IDENT '(' (param (',' param)*)? ')' ('->' type)?
 //               ('requires' expr | 'ensures' expr)* block
+//   specfn   := 'spec' 'fn' IDENT '(' params ')' '->' type '{' expr '}'
+//   const    := 'const' IDENT ':' 'u64' '=' expr ';'   (constant-folded; define before use)
 //   param    := 'mut'? IDENT ':' type
-//   type     := 'u64' | 'bool' | 'Str' | 'Buf' | 'Serial' | '&' ('Buf' | 'Serial')
+//   type     := 'u64' | 'bool' | 'Str' | linear | '&' linear | '&' 'mut' linear
+//   linear   := 'Buf' | 'Serial' | 'Frame' | 'PageTable' | 'Pool' | 'Mmu' | 'Cpu'
+//   primary  := ... | '&' 'mut' IDENT | 'include_bytes' '(' STRING ')' | 'old' '(' expr ')' 
 //   block    := '{' stmt* '}'
 //   stmt     := 'let' 'mut'? IDENT (':' type)? '=' expr ';'
 //             | IDENT '=' expr ';'
@@ -20,17 +24,23 @@
 use crate::ast::*;
 use crate::diag::{Diag, Pos};
 use crate::lexer::{Tok, Token};
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 pub struct Parser {
     toks: Vec<Token>,
     i: usize,
+    /// Directory of the file being parsed, for `include_bytes`.
+    dir: PathBuf,
+    /// Constants defined so far (in this and earlier files).
+    pub consts: HashMap<String, u128>,
 }
 
 type PResult<T> = Result<T, Diag>;
 
 impl Parser {
-    pub fn new(toks: Vec<Token>) -> Parser {
-        Parser { toks, i: 0 }
+    pub fn new(toks: Vec<Token>, dir: PathBuf, consts: HashMap<String, u128>) -> Parser {
+        Parser { toks, i: 0, dir, consts }
     }
 
     fn peek(&self) -> &Tok {
@@ -79,20 +89,57 @@ impl Parser {
 
     pub fn program(&mut self) -> PResult<Program> {
         let mut fns = Vec::new();
+        let mut specs = Vec::new();
         while *self.peek() != Tok::Eof {
-            fns.push(self.fn_def()?);
+            match self.peek() {
+                Tok::Spec => specs.push(self.spec_def()?),
+                Tok::Const => self.const_def()?,
+                _ => fns.push(self.fn_def()?),
+            }
         }
-        Ok(Program { fns })
+        Ok(Program { fns, specs })
+    }
+
+    fn const_def(&mut self) -> PResult<()> {
+        self.expect(Tok::Const, "`const`")?;
+        let (name, pos) = self.ident()?;
+        self.expect(Tok::Colon, "`:`")?;
+        if self.ty()? != Type::U64 {
+            return Err(Diag::new("E-PARSE", pos, "constants must be u64"));
+        }
+        self.expect(Tok::Eq, "`=`")?;
+        let e = self.expr()?;
+        self.expect(Tok::Semi, "`;`")?;
+        let v = const_eval(&e)?;
+        if self.consts.contains_key(&name) {
+            return Err(Diag::new("E-PARSE", pos, format!("constant `{}` is defined twice", name)));
+        }
+        self.consts.insert(name, v);
+        Ok(())
+    }
+
+    fn spec_def(&mut self) -> PResult<SpecFn> {
+        let pos = self.expect(Tok::Spec, "`spec`")?.pos;
+        self.expect(Tok::Fn, "`fn` after `spec`")?;
+        let (name, _) = self.ident()?;
+        let params = self.params()?;
+        self.expect(Tok::Arrow, "`->`")?;
+        let ret = self.ty()?;
+        self.expect(Tok::LBrace, "`{`")?;
+        let body = self.expr()?;
+        self.expect(Tok::RBrace, "`}`")?;
+        Ok(SpecFn { name, params, ret, body, pos })
     }
 
     fn ty(&mut self) -> PResult<Type> {
         let pos = self.pos();
         if self.eat(&Tok::Amp) {
+            let m = self.eat(&Tok::Mut);
             let inner = self.ty()?;
             if !inner.is_linear() {
                 return Err(Diag::new("E-PARSE", pos, format!("only linear values can be borrowed, found `&{}`", inner.name())));
             }
-            return Ok(Type::Ref(Box::new(inner)));
+            return Ok(if m { Type::MutRef(Box::new(inner)) } else { Type::Ref(Box::new(inner)) });
         }
         let (n, _) = self.ident()?;
         match n.as_str() {
@@ -101,13 +148,16 @@ impl Parser {
             "Buf" => Ok(Type::Buf),
             "Serial" => Ok(Type::Serial),
             "Str" => Ok(Type::Str),
+            "Frame" => Ok(Type::Frame),
+            "PageTable" => Ok(Type::PageTable),
+            "Pool" => Ok(Type::Pool),
+            "Mmu" => Ok(Type::Mmu),
+            "Cpu" => Ok(Type::Cpu),
             _ => Err(Diag::new("E-PARSE", pos, format!("unknown type `{}`", n))),
         }
     }
 
-    fn fn_def(&mut self) -> PResult<FnDef> {
-        let pos = self.expect(Tok::Fn, "`fn`")?.pos;
-        let (name, _) = self.ident()?;
+    fn params(&mut self) -> PResult<Vec<Param>> {
         self.expect(Tok::LParen, "`(`")?;
         let mut params = Vec::new();
         if *self.peek() != Tok::RParen {
@@ -124,6 +174,13 @@ impl Parser {
             }
         }
         self.expect(Tok::RParen, "`)`")?;
+        Ok(params)
+    }
+
+    fn fn_def(&mut self) -> PResult<FnDef> {
+        let pos = self.expect(Tok::Fn, "`fn`")?.pos;
+        let (name, _) = self.ident()?;
+        let params = self.params()?;
         let ret = if self.eat(&Tok::Arrow) { self.ty()? } else { Type::Unit };
         let mut requires = Vec::new();
         let mut ensures = Vec::new();
@@ -345,6 +402,28 @@ impl Parser {
                 let body = self.expr()?;
                 Ok(Expr { kind: ExprKind::Forall(name, Box::new(body)), pos })
             }
+            Tok::Amp => {
+                self.bump();
+                self.expect(Tok::Mut, "`mut` (a shared borrow `&x` is written as just `x`)")?;
+                let (n, _) = self.ident()?;
+                Ok(Expr { kind: ExprKind::MutBorrow(n), pos })
+            }
+            Tok::Ident(name) if name == "include_bytes" => {
+                self.bump();
+                self.expect(Tok::LParen, "`(`")?;
+                let path = match self.bump().tok {
+                    Tok::Str(b) => String::from_utf8_lossy(&b).to_string(),
+                    _ => return Err(Diag::new("E-PARSE", pos, "include_bytes takes a string literal path")),
+                };
+                self.expect(Tok::RParen, "`)`")?;
+                let full = self.dir.join(&path);
+                let bytes = std::fs::read(&full).map_err(|e| Diag::new("E-PARSE", pos, format!("include_bytes: cannot read {}: {}", full.display(), e)))?;
+                Ok(Expr { kind: ExprKind::Blob(bytes), pos })
+            }
+            Tok::Ident(name) if self.consts.contains_key(&name) && self.toks.get(self.i + 1).map(|t| &t.tok) != Some(&Tok::LParen) => {
+                self.bump();
+                Ok(Expr { kind: ExprKind::Int(self.consts[&name]), pos })
+            }
             Tok::Ident(name) => {
                 self.bump();
                 if self.eat(&Tok::LParen) {
@@ -365,5 +444,27 @@ impl Parser {
             }
             t => Err(Diag::new("E-PARSE", pos, format!("expected expression, found {:?}", t))),
         }
+    }
+}
+
+/// Folds a constant initializer. Only literals, earlier constants and
+/// arithmetic; the result must fit in u64.
+fn const_eval(e: &Expr) -> PResult<u128> {
+    let bad = |m: &str| Diag::new("E-PARSE", e.pos, format!("constant initializer: {}", m));
+    match &e.kind {
+        ExprKind::Int(v) => Ok(*v),
+        ExprKind::Bin(op, a, b) => {
+            let (x, y) = (const_eval(a)?, const_eval(b)?);
+            let r = match op {
+                BinOp::Add => x.checked_add(y),
+                BinOp::Sub => x.checked_sub(y),
+                BinOp::Mul => x.checked_mul(y),
+                BinOp::Div => x.checked_div(y),
+                BinOp::Rem => x.checked_rem(y),
+                _ => return Err(bad("only + - * / % are allowed")),
+            };
+            r.filter(|v| *v <= u64::MAX as u128).ok_or_else(|| bad("the value is out of the u64 range"))
+        }
+        _ => Err(bad("only integer literals, earlier constants and arithmetic are allowed")),
     }
 }

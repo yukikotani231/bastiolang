@@ -17,6 +17,7 @@
 // ghost: they may mention any variable, moved or not, and never consume.
 
 use crate::ast::*;
+use crate::codegen::Target;
 use crate::diag::{Diag, Pos};
 use std::collections::{HashMap, HashSet};
 
@@ -26,49 +27,147 @@ pub struct Sig {
     pub ret: Type,
 }
 
+/// Which builtins exist depends on what the program runs on.
+#[derive(Clone, Copy, PartialEq)]
+enum Avail {
+    All,
+    /// Hosted and kernel: physical pages and page tables (hosted simulates them).
+    Mem,
+    Kernel,
+    User,
+}
+
+fn r(t: Type) -> Type {
+    Type::Ref(Box::new(t))
+}
+fn m(t: Type) -> Type {
+    Type::MutRef(Box::new(t))
+}
+
+fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
+    use Type::*;
+    vec![
+        ("alloc", Avail::All, vec![U64], Buf),
+        ("len", Avail::All, vec![r(Buf)], U64),
+        ("get", Avail::All, vec![r(Buf), U64], U64),
+        ("set", Avail::All, vec![Buf, U64, U64], Buf),
+        ("free", Avail::All, vec![Buf], Unit),
+        ("print", Avail::All, vec![U64], Unit),
+        ("slen", Avail::All, vec![Str], U64),
+        ("sget", Avail::All, vec![Str, U64], U64),
+        ("serial_write", Avail::All, vec![r(Serial), U64], Unit),
+        ("serial_read", Avail::All, vec![r(Serial)], U64),
+        ("serial_poll", Avail::Kernel, vec![r(Serial)], U64),
+        ("pool_size", Avail::Mem, vec![r(Pool)], U64),
+        ("pool_take", Avail::Mem, vec![m(Pool), U64], Frame),
+        ("pool_give", Avail::Mem, vec![m(Pool), Frame], Unit),
+        ("frame_id", Avail::Mem, vec![r(Frame)], U64),
+        ("frame_read", Avail::Mem, vec![r(Frame), U64], U64),
+        ("frame_write", Avail::Mem, vec![m(Frame), U64, U64], Unit),
+        ("frame_read8", Avail::Mem, vec![r(Frame), U64], U64),
+        ("frame_write8", Avail::Mem, vec![m(Frame), U64, U64], Unit),
+        ("pt_new", Avail::Mem, vec![Frame, U64], PageTable),
+        ("pt_free", Avail::Mem, vec![PageTable], Frame),
+        ("pt_free_root", Avail::Kernel, vec![r(Mmu), PageTable], Frame),
+        ("pt_has", Avail::Mem, vec![r(PageTable), U64], Bool),
+        ("pt_put", Avail::Mem, vec![m(PageTable), U64, PageTable], Unit),
+        ("pt_take", Avail::Mem, vec![m(PageTable), U64], PageTable),
+        ("pt_put_frame", Avail::Mem, vec![m(PageTable), U64, Frame, Bool], Unit),
+        ("pt_take_frame", Avail::Mem, vec![m(PageTable), U64], Frame),
+        ("mmu_switch", Avail::Kernel, vec![m(Mmu), r(PageTable)], Unit),
+        ("mmu_kernel", Avail::Kernel, vec![m(Mmu)], Unit),
+        ("cpu_run", Avail::Kernel, vec![m(Cpu), r(Mmu)], U64),
+        ("cpu_idle", Avail::Kernel, vec![m(Cpu)], U64),
+        ("cpu_get", Avail::Kernel, vec![r(Cpu), U64], U64),
+        ("cpu_set", Avail::Kernel, vec![m(Cpu), U64, U64], Unit),
+        ("sys_spawn", Avail::User, vec![r(Buf), U64, U64], U64),
+        ("sys_wait", Avail::User, vec![U64], U64),
+        ("sys_kill", Avail::User, vec![U64], U64),
+        ("sys_yield", Avail::User, vec![], Unit),
+        ("sys_getpid", Avail::User, vec![], U64),
+        ("sys_info", Avail::User, vec![U64], U64),
+        ("sys_ps", Avail::User, vec![], Unit),
+        ("sys_poweroff", Avail::User, vec![], Unit),
+    ]
+}
+
+/// Ghost accessors, usable only in specifications: (name, argument type, has an index, result).
+pub const GHOSTS: &[(&str, Type, bool, Type)] = &[
+    ("frame_id", Type::Frame, false, Type::U64),
+    ("pt_id", Type::PageTable, false, Type::U64),
+    ("pt_level", Type::PageTable, false, Type::U64),
+    ("pt_used", Type::PageTable, true, Type::Bool),
+    ("pool_has", Type::Pool, true, Type::Bool),
+    ("pool_size", Type::Pool, false, Type::U64),
+    ("mmu_root", Type::Mmu, false, Type::U64),
+];
+
+pub fn is_ghost(name: &str) -> bool {
+    GHOSTS.iter().any(|g| g.0 == name)
+}
+
 pub fn builtin_sigs() -> HashMap<String, Sig> {
-    let mut m = HashMap::new();
-    m.insert("alloc".into(), Sig { params: vec![Type::U64], ret: Type::Buf });
-    let rbuf = || Type::Ref(Box::new(Type::Buf));
-    let rser = || Type::Ref(Box::new(Type::Serial));
-    m.insert("len".into(), Sig { params: vec![rbuf()], ret: Type::U64 });
-    m.insert("get".into(), Sig { params: vec![rbuf(), Type::U64], ret: Type::U64 });
-    m.insert("slen".into(), Sig { params: vec![Type::Str], ret: Type::U64 });
-    m.insert("sget".into(), Sig { params: vec![Type::Str, Type::U64], ret: Type::U64 });
-    m.insert("serial_write".into(), Sig { params: vec![rser(), Type::U64], ret: Type::Unit });
-    m.insert("serial_read".into(), Sig { params: vec![rser()], ret: Type::U64 });
-    m.insert("set".into(), Sig { params: vec![Type::Buf, Type::U64, Type::U64], ret: Type::Buf });
-    m.insert("free".into(), Sig { params: vec![Type::Buf], ret: Type::Unit });
-    m.insert("print".into(), Sig { params: vec![Type::U64], ret: Type::Unit });
-    m
+    builtin_table().into_iter().map(|(n, _, params, ret)| (n.to_string(), Sig { params, ret })).collect()
 }
 
 pub fn is_builtin(name: &str) -> bool {
-    matches!(name, "alloc" | "len" | "get" | "set" | "free" | "print" | "slen" | "sget" | "serial_write" | "serial_read")
+    builtin_table().iter().any(|b| b.0 == name)
 }
 
-pub fn signatures(p: &Program) -> Result<HashMap<String, Sig>, Diag> {
+fn available(name: &str, target: Target) -> bool {
+    let Some(b) = builtin_table().into_iter().find(|b| b.0 == name) else { return true };
+    match (b.1, target) {
+        (Avail::All, _) => true,
+        (Avail::Mem, Target::Hosted | Target::Kernel) => true,
+        (Avail::Kernel, Target::Kernel) => true,
+        (Avail::User, Target::User) => true,
+        _ => false,
+    }
+}
+
+/// The capabilities `main` may ask for on each target.
+fn main_caps(target: Target) -> &'static [Type] {
+    match target {
+        Target::Hosted => &[Type::Serial, Type::Pool],
+        Target::Kernel => &[Type::Serial, Type::Pool, Type::Mmu, Type::Cpu],
+        Target::User => &[Type::Serial],
+    }
+}
+
+pub fn signatures(p: &Program, target: Target) -> Result<HashMap<String, Sig>, Diag> {
     let mut sigs = builtin_sigs();
     for f in &p.fns {
-        if is_builtin(&f.name) {
+        if is_builtin(&f.name) || is_ghost(&f.name) || f.name == "old" {
             return Err(Diag::new("E-TYPE", f.pos, format!("`{}` is a builtin and cannot be redefined", f.name)));
         }
-        if sigs.contains_key(&f.name) {
+        if sigs.contains_key(&f.name) || p.specs.iter().any(|s| s.name == f.name) {
             return Err(Diag::new("E-TYPE", f.pos, format!("function `{}` is defined twice", f.name)));
         }
         if f.ret.is_ref() {
-            return Err(Diag::new("E-TYPE", f.pos, "a function cannot return a borrow `&Buf`"));
+            return Err(Diag::new("E-TYPE", f.pos, "a function cannot return a borrow"));
         }
         sigs.insert(f.name.clone(), Sig { params: f.params.iter().map(|p| p.ty.clone()).collect(), ret: f.ret.clone() });
     }
-    match sigs.get("main") {
-        Some(s) if s.params.is_empty() && s.ret == Type::U64 => {}
-        Some(s) if s.params == vec![Type::Serial] && s.ret == Type::Serial => {}
-        Some(_) => {
-            let f = p.fns.iter().find(|f| f.name == "main").unwrap();
-            return Err(Diag::new("E-TYPE", f.pos, "`main` must be `fn main() -> u64` or `fn main(con: Serial) -> Serial`"));
-        }
-        None => return Err(Diag::new("E-TYPE", Pos { line: 1, col: 1 }, "no `main` function")),
+    let main = p.fns.iter().find(|f| f.name == "main");
+    let Some(main) = main else { return Err(Diag::new("E-TYPE", Pos::default(), "no `main` function")) };
+    let legacy = main.params.len() == 1 && main.params[0].ty == Type::Serial && main.ret == Type::Serial;
+    let caps = main_caps(target);
+    let mut seen = Vec::new();
+    let caps_ok = (main.ret == Type::U64 || main.ret == Type::Unit)
+        && main.params.iter().all(|p| match &p.ty {
+            Type::MutRef(t) if caps.contains(t) && !seen.contains(&**t) => {
+                seen.push((**t).clone());
+                true
+            }
+            _ => false,
+        });
+    if !(legacy && target != Target::User) && !caps_ok {
+        let names: Vec<String> = caps.iter().map(|c| format!("&mut {}", c.name())).collect();
+        return Err(Diag::new("E-TYPE", main.pos, format!("on this target `main` must take some of {} (each at most once) and return u64 or nothing", names.join(", ")))
+            .note("`fn main() -> u64` and, outside user programs, `fn main(con: Serial) -> Serial` are also accepted"));
+    }
+    if target == Target::User && main.ret != Type::U64 {
+        return Err(Diag::new("E-TYPE", main.pos, "a user program's `main` returns its exit code (u64)"));
     }
     Ok(sigs)
 }
@@ -81,36 +180,60 @@ struct VarInfo {
 
 struct Ctx<'a> {
     sigs: &'a HashMap<String, Sig>,
+    specs: &'a [SpecFn],
+    target: Target,
     ret: Type,
     scopes: Vec<Vec<String>>,
     vars: HashMap<String, VarInfo>,
-    /// Buf variables that have been consumed.
+    /// Linear variables that have been consumed (or, for `&mut` parameters,
+    /// moved out of and not yet put back).
     moved: HashSet<String>,
     all_names: HashSet<String>,
 }
 
-pub fn check_program(p: &mut Program) -> Result<HashMap<String, Sig>, Diag> {
-    let sigs = signatures(p)?;
+pub fn check_program(p: &mut Program, target: Target) -> Result<HashMap<String, Sig>, Diag> {
+    let sigs = signatures(p, target)?;
+    let specs = p.specs.clone();
+    for (i, sf) in specs.iter().enumerate() {
+        check_spec_fn(sf, &specs[..i], &sigs, target)?;
+    }
     for f in &mut p.fns {
-        check_fn(f, &sigs)?;
+        check_fn(f, &sigs, &specs, target)?;
     }
     Ok(sigs)
 }
 
-fn check_fn(f: &mut FnDef, sigs: &HashMap<String, Sig>) -> Result<(), Diag> {
-    let mut cx = Ctx {
-        sigs,
-        ret: f.ret.clone(),
-        scopes: vec![Vec::new()],
-        vars: HashMap::new(),
-        moved: HashSet::new(),
-        all_names: HashSet::new(),
-    };
+fn new_ctx<'a>(sigs: &'a HashMap<String, Sig>, specs: &'a [SpecFn], target: Target, ret: Type) -> Ctx<'a> {
+    Ctx { sigs, specs, target, ret, scopes: vec![Vec::new()], vars: HashMap::new(), moved: HashSet::new(), all_names: HashSet::new() }
+}
+
+/// A spec fn may only call spec fns defined before it, so expansion terminates.
+fn check_spec_fn(sf: &SpecFn, earlier: &[SpecFn], sigs: &HashMap<String, Sig>, target: Target) -> Result<(), Diag> {
+    if sigs.contains_key(&sf.name) || is_ghost(&sf.name) || earlier.iter().any(|e| e.name == sf.name) {
+        return Err(Diag::new("E-TYPE", sf.pos, format!("`{}` is already defined", sf.name)));
+    }
+    if !matches!(sf.ret, Type::Bool | Type::U64) {
+        return Err(Diag::new("E-TYPE", sf.pos, "a spec fn returns bool or u64"));
+    }
+    let mut cx = new_ctx(sigs, earlier, target, Type::Unit);
+    for p in &sf.params {
+        if p.ty.is_linear() || p.ty.is_mut_ref() {
+            return Err(Diag::new("E-TYPE", p.pos, "spec fn parameters are values (`u64`, `bool`) or shared borrows (`&T`)"));
+        }
+        cx.declare(&p.name, p.ty.clone(), false, p.pos)?;
+    }
+    let t = cx.spec_expr(&sf.body, false, &mut Vec::new())?;
+    expect_ty(&t, &sf.ret, sf.body.pos, &format!("the body of spec fn `{}`", sf.name))
+}
+
+fn check_fn(f: &mut FnDef, sigs: &HashMap<String, Sig>, specs: &[SpecFn], target: Target) -> Result<(), Diag> {
+    let mut cx = new_ctx(sigs, specs, target, f.ret.clone());
     for p in &f.params {
         if p.ty.is_ref() && p.mutable {
-            return Err(Diag::new("E-TYPE", p.pos, "a borrow cannot be `mut`"));
+            return Err(Diag::new("E-TYPE", p.pos, "a borrow cannot be `mut` (a `&mut` parameter is already assignable)"));
         }
-        cx.declare(&p.name, p.ty.clone(), p.mutable, p.pos)?;
+        let mutable = p.mutable || p.ty.is_mut_ref();
+        cx.declare(&p.name, p.ty.clone(), mutable, p.pos)?;
     }
     for r in &f.requires {
         let t = cx.spec_expr(r, false, &mut Vec::new())?;
@@ -139,10 +262,10 @@ fn expect_ty(got: &Type, want: &Type, pos: Pos, what: &str) -> Result<(), Diag> 
 
 impl<'a> Ctx<'a> {
     fn declare(&mut self, name: &str, ty: Type, mutable: bool, pos: Pos) -> Result<(), Diag> {
-        if name == "result" {
-            return Err(Diag::new("E-TYPE", pos, "`result` is reserved for `ensures` clauses"));
+        if name == "result" || name == "old" {
+            return Err(Diag::new("E-TYPE", pos, format!("`{}` is reserved for specifications", name)));
         }
-        if self.all_names.contains(name) || self.sigs.contains_key(name) {
+        if self.all_names.contains(name) || self.sigs.contains_key(name) || is_ghost(name) || self.specs.iter().any(|s| s.name == name) {
             return Err(Diag::new("E-TYPE", pos, format!("`{}` is already defined (shadowing is not allowed)", name)));
         }
         self.all_names.insert(name.to_string());
@@ -151,7 +274,8 @@ impl<'a> Ctx<'a> {
         Ok(())
     }
 
-    fn live_bufs(&self) -> Vec<String> {
+    /// Owned linear variables still holding a value (`&mut` parameters excluded).
+    fn live_owned(&self) -> Vec<String> {
         let mut v: Vec<String> = self
             .scopes
             .iter()
@@ -163,11 +287,29 @@ impl<'a> Ctx<'a> {
         v
     }
 
+    /// `&mut` parameters whose value has been moved out and not put back.
+    fn missing_mut_refs(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .scopes
+            .iter()
+            .flatten()
+            .filter(|n| self.vars[*n].ty.is_mut_ref() && self.moved.contains(*n))
+            .cloned()
+            .collect();
+        v.sort();
+        v
+    }
+
     fn leak_check_all(&self, pos: Pos, when: &str) -> Result<(), Diag> {
-        let live = self.live_bufs();
+        let live = self.live_owned();
         if !live.is_empty() {
             return Err(Diag::new("E-LINEAR-LEAK", pos, format!("`{}` is still owned {}", live.join("`, `"), when))
                 .note("every linear value must be consumed exactly once: return it, pass it to a function that takes it by value, or `free` it"));
+        }
+        let missing = self.missing_mut_refs();
+        if !missing.is_empty() {
+            return Err(Diag::new("E-LINEAR-USE", pos, format!("the borrowed `{}` must hold a value again {}", missing.join("`, `"), when))
+                .note("a `&mut` parameter can be moved out of, but the caller gets it back, so assign it a new value before returning"));
         }
         Ok(())
     }
@@ -187,7 +329,7 @@ impl<'a> Ctx<'a> {
             for n in &scope {
                 if self.vars[n].ty.is_linear() && !self.moved.contains(n) {
                     return Err(Diag::new("E-LINEAR-LEAK", stmts.last().map(|s| s.pos).unwrap_or_default(), format!("`{}` goes out of scope while still owned", n))
-                        .note("every Buf must be consumed exactly once: return it, pass it to a function that takes `Buf`, or `free` it"));
+                        .note("every linear value must be consumed exactly once: return it, pass it to a function that takes it by value, or `free` it"));
                 }
             }
         }
@@ -223,11 +365,11 @@ impl<'a> Ctx<'a> {
                     return Err(Diag::new("E-TYPE", pos, format!("`{}` is not mutable (declare it with `mut`)", name)));
                 }
                 let t = self.expr(value)?;
-                expect_ty(&t, &info.ty, value.pos, &format!("the value assigned to `{}`", name))?;
-                if info.ty.is_linear() {
+                expect_ty(&t, info.ty.base(), value.pos, &format!("the value assigned to `{}`", name))?;
+                if info.ty.base().is_linear() {
                     if !self.moved.contains(name.as_str()) {
                         return Err(Diag::new("E-LINEAR-LEAK", pos, format!("assigning to `{}` would drop the value it still owns", name))
-                            .note("consume the old buffer first, e.g. `b = set(b, i, v);`"));
+                            .note("consume the old value first, e.g. `b = set(b, i, v);`"));
                     }
                     self.moved.remove(name.as_str());
                 }
@@ -252,7 +394,7 @@ impl<'a> Ctx<'a> {
                         if after_then != after_else {
                             let mut diff: Vec<_> = after_then.symmetric_difference(&after_else).cloned().collect();
                             diff.sort();
-                            return Err(Diag::new("E-LINEAR-BRANCH", pos, format!("buffer `{}` is consumed in only one branch of this `if`", diff.join("`, `"))));
+                            return Err(Diag::new("E-LINEAR-BRANCH", pos, format!("`{}` is consumed in only one branch of this `if`", diff.join("`, `"))));
                         }
                         Ok(false)
                     }
@@ -262,7 +404,7 @@ impl<'a> Ctx<'a> {
                 let before_cond = self.moved.clone();
                 let t = self.expr(cond)?;
                 if self.moved != before_cond {
-                    return Err(Diag::new("E-LINEAR-USE", cond.pos, "a `while` condition runs many times, so it cannot consume a buffer"));
+                    return Err(Diag::new("E-LINEAR-USE", cond.pos, "a `while` condition runs many times, so it cannot consume a linear value"));
                 }
                 expect_ty(&t, &Type::Bool, cond.pos, "a `while` condition")?;
                 for inv in invariants.iter() {
@@ -275,7 +417,7 @@ impl<'a> Ctx<'a> {
                     let mut diff: Vec<_> = self.moved.symmetric_difference(&before).cloned().collect();
                     diff.sort();
                     return Err(Diag::new("E-LINEAR-BRANCH", pos, format!("the loop body changes the ownership of `{}`", diff.join("`, `")))
-                        .note("a loop body must leave every outer buffer owned exactly as it found it"));
+                        .note("a loop body must leave every outer linear value owned exactly as it found it"));
                 }
                 self.moved = before;
                 Ok(false)
@@ -309,23 +451,24 @@ impl<'a> Ctx<'a> {
         self.vars.get(name).cloned().ok_or_else(|| Diag::new("E-TYPE", pos, format!("unknown variable `{}`", name)))
     }
 
-    /// Code expression: Buf variables in value position are moved.
+    /// Code expression: linear variables in value position are moved.
     fn expr(&mut self, e: &Expr) -> Result<Type, Diag> {
         match &e.kind {
             ExprKind::Int(_) => Ok(Type::U64),
             ExprKind::Bool(_) => Ok(Type::Bool),
-            ExprKind::Str(_) => Ok(Type::Str),
+            ExprKind::Str(_) | ExprKind::Blob(_) => Ok(Type::Str),
+            ExprKind::MutBorrow(_) => Err(Diag::new("E-TYPE", e.pos, "`&mut x` is only allowed as a call argument")),
             ExprKind::Var(n) => {
                 let info = self.var_info(n, e.pos)?;
                 match info.ty {
-                    t if t.is_linear() => {
+                    Type::Ref(_) => Err(Diag::new("E-LINEAR-USE", e.pos, format!("cannot move out of the shared borrow `{}`", n))),
+                    t if t.base().is_linear() => {
                         if self.moved.contains(n.as_str()) {
                             return Err(Diag::new("E-LINEAR-USE", e.pos, format!("`{}` is used after it was consumed", n)));
                         }
                         self.moved.insert(n.clone());
-                        Ok(t)
+                        Ok(t.base().clone())
                     }
-                    Type::Ref(_) => Err(Diag::new("E-LINEAR-USE", e.pos, format!("cannot move out of the borrow `{}`", n))),
                     t => Ok(t),
                 }
             }
@@ -342,42 +485,69 @@ impl<'a> Ctx<'a> {
                 let before_rhs = self.moved.clone();
                 let tb = self.expr(b)?;
                 if matches!(op, BinOp::And | BinOp::Or) && self.moved != before_rhs {
-                    return Err(Diag::new("E-LINEAR-USE", b.pos, format!("the right side of `{}` may not run, so it cannot consume a buffer", op.text())));
+                    return Err(Diag::new("E-LINEAR-USE", b.pos, format!("the right side of `{}` may not run, so it cannot consume a linear value", op.text())));
                 }
                 bin_type(*op, &ta, &tb, e.pos)
             }
             ExprKind::Forall(..) => Err(Diag::new("E-TYPE", e.pos, "`forall` is only allowed in specifications")),
             ExprKind::Call(name, args) => {
-                if name == "result" {
-                    return Err(Diag::new("E-TYPE", e.pos, "`result` is only allowed in `ensures`"));
+                if name == "result" || name == "old" || (is_ghost(name) && !self.sigs.contains_key(name)) || self.specs.iter().any(|s| &s.name == name) {
+                    return Err(Diag::new("E-TYPE", e.pos, format!("`{}` is only allowed in specifications", name)));
                 }
                 let sig = self.sigs.get(name).cloned().ok_or_else(|| Diag::new("E-TYPE", e.pos, format!("unknown function `{}`", name)))?;
+                if !available(name, self.target) {
+                    return Err(Diag::new("E-TARGET", e.pos, format!("`{}` is not available on this target", name)));
+                }
                 if sig.params.len() != args.len() {
                     return Err(Diag::new("E-TYPE", e.pos, format!("`{}` takes {} argument(s), {} given", name, sig.params.len(), args.len())));
                 }
                 // Scalars first, then borrows, then moves: a scalar argument may
-                // read a buffer that a later argument consumes (`set(b, i, get(b, j))`).
+                // read a value that a later argument consumes (`set(b, i, get(b, j))`).
                 for (pt, a) in sig.params.iter().zip(args) {
                     if !pt.is_linear() && !pt.is_ref() {
                         let t = self.expr(a)?;
                         expect_ty(&t, pt, a.pos, &format!("argument of `{}`", name))?;
                     }
                 }
-                let mut borrowed = HashSet::new();
+                let mut borrowed: HashSet<String> = HashSet::new();
                 for (pt, a) in sig.params.iter().zip(args) {
-                    if pt.is_ref() {
-                        let n = match &a.kind {
-                            ExprKind::Var(n) => n,
-                            _ => return Err(Diag::new("E-TYPE", a.pos, format!("argument of `{}` must name a value to borrow", name))),
-                        };
-                        let info = self.var_info(n, a.pos)?;
-                        if info.ty.base() != pt.base() {
-                            return Err(Diag::new("E-TYPE", a.pos, format!("argument of `{}` must be {}, found {}", name, pt.base().name(), info.ty.name())));
+                    if !pt.is_ref() {
+                        continue;
+                    }
+                    let n = match (&a.kind, pt) {
+                        (ExprKind::MutBorrow(n), Type::MutRef(_)) => n,
+                        (ExprKind::Var(n), Type::Ref(_)) => n,
+                        (_, Type::MutRef(_)) => return Err(Diag::new("E-TYPE", a.pos, format!("argument of `{}` must be `&mut x` for a variable `x`", name))),
+                        _ => return Err(Diag::new("E-TYPE", a.pos, format!("argument of `{}` must name a value to borrow", name))),
+                    };
+                    let info = self.var_info(n, a.pos)?;
+                    if info.ty.base() != pt.base() {
+                        return Err(Diag::new("E-TYPE", a.pos, format!("argument of `{}` must be {}, found {}", name, pt.base().name(), info.ty.name())));
+                    }
+                    if pt.is_mut_ref() {
+                        if matches!(info.ty, Type::Ref(_)) {
+                            return Err(Diag::new("E-LINEAR-USE", a.pos, format!("`{}` is a shared borrow and cannot be lent as `&mut`", n)));
                         }
-                        if self.moved.contains(n.as_str()) {
-                            return Err(Diag::new("E-LINEAR-USE", a.pos, format!("`{}` is borrowed after it was consumed", n)));
+                        if !info.mutable {
+                            return Err(Diag::new("E-TYPE", a.pos, format!("`{}` is not mutable (declare it with `mut`)", n)));
                         }
-                        borrowed.insert(n.clone());
+                    }
+                    if self.moved.contains(n.as_str()) {
+                        return Err(Diag::new("E-LINEAR-USE", a.pos, format!("`{}` is borrowed after it was consumed", n)));
+                    }
+                    if !borrowed.insert(n.clone()) && pt.is_mut_ref() {
+                        return Err(Diag::new("E-LINEAR-USE", a.pos, format!("`{}` is lent as `&mut` while also borrowed in this call", n)));
+                    }
+                    if pt.is_mut_ref() {
+                        borrowed.insert(format!("{}#mut", n));
+                    }
+                }
+                // A shared borrow next to a `&mut` of the same variable is aliasing too.
+                for (pt, a) in sig.params.iter().zip(args) {
+                    if let (Type::Ref(_), ExprKind::Var(n)) = (pt, &a.kind) {
+                        if borrowed.contains(&format!("{}#mut", n)) {
+                            return Err(Diag::new("E-LINEAR-USE", a.pos, format!("`{}` is lent as `&mut` while also borrowed in this call", n)));
+                        }
                     }
                 }
                 for (pt, a) in sig.params.iter().zip(args) {
@@ -401,7 +571,8 @@ impl<'a> Ctx<'a> {
         match &e.kind {
             ExprKind::Int(_) => Ok(Type::U64),
             ExprKind::Bool(_) => Ok(Type::Bool),
-            ExprKind::Str(_) => Ok(Type::Str),
+            ExprKind::Str(_) | ExprKind::Blob(_) => Ok(Type::Str),
+            ExprKind::MutBorrow(_) => Err(Diag::new("E-TYPE", e.pos, "`&mut` has no meaning in a specification")),
             ExprKind::Var(n) => {
                 if bound.contains(n) {
                     return Ok(Type::U64);
@@ -415,7 +586,7 @@ impl<'a> Ctx<'a> {
                     }
                     return Ok(self.ret.clone());
                 }
-                Ok(self.var_info(n, e.pos)?.ty)
+                Ok(self.var_info(n, e.pos)?.ty.base().clone())
             }
             ExprKind::Not(x) => {
                 let t = self.spec_expr(x, in_ensures, bound)?;
@@ -438,20 +609,64 @@ impl<'a> Ctx<'a> {
                 Ok(Type::Bool)
             }
             ExprKind::Call(name, args) => {
+                let arity = |n: usize| -> Result<(), Diag> {
+                    if args.len() != n {
+                        return Err(Diag::new("E-TYPE", e.pos, format!("`{}` takes {} argument(s), {} given", name, n, args.len())));
+                    }
+                    Ok(())
+                };
+                if name == "old" {
+                    arity(1)?;
+                    if !in_ensures {
+                        return Err(Diag::new("E-TYPE", e.pos, "`old(..)` is only allowed in `ensures`"));
+                    }
+                    return self.spec_expr(&args[0], false, bound);
+                }
+                // Arguments that stand for a linear value must name one.
+                let check_lin = |a: &Expr| -> Result<(), Diag> {
+                    let ok = match &a.kind {
+                        ExprKind::Var(_) | ExprKind::Str(_) | ExprKind::Blob(_) => true,
+                        ExprKind::Call(n, xs) => n == "old" && xs.len() == 1 && matches!(xs[0].kind, ExprKind::Var(_)),
+                        _ => false,
+                    };
+                    if ok { Ok(()) } else { Err(Diag::new("E-TYPE", a.pos, "a value in this position must be a variable, `result` or `old(x)`")) }
+                };
+                if let Some(sf) = self.specs.iter().find(|s| &s.name == name) {
+                    arity(sf.params.len())?;
+                    for (p, a) in sf.params.iter().zip(args) {
+                        let t = self.spec_expr(a, in_ensures, bound)?;
+                        if t != *p.ty.base() {
+                            return Err(Diag::new("E-TYPE", a.pos, format!("argument of `{}` must be {}, found {}", name, p.ty.base().name(), t.name())));
+                        }
+                        if p.ty.base().is_linear() {
+                            check_lin(a)?;
+                        }
+                    }
+                    return Ok(sf.ret.clone());
+                }
+                if let Some(g) = GHOSTS.iter().find(|g| g.0 == name) {
+                    arity(if g.2 { 2 } else { 1 })?;
+                    let t = self.spec_expr(&args[0], in_ensures, bound)?;
+                    if t != g.1 {
+                        return Err(Diag::new("E-TYPE", args[0].pos, format!("argument of `{}` must be {}, found {}", name, g.1.name(), t.name())));
+                    }
+                    check_lin(&args[0])?;
+                    if g.2 {
+                        let ti = self.spec_expr(&args[1], in_ensures, bound)?;
+                        expect_ty(&ti, &Type::U64, args[1].pos, "an index")?;
+                    }
+                    return Ok(g.3.clone());
+                }
                 if !matches!(name.as_str(), "len" | "get" | "slen" | "sget") {
-                    return Err(Diag::new("E-TYPE", e.pos, format!("only `len`, `get`, `slen` and `sget` may be called in specifications, not `{}`", name)));
+                    return Err(Diag::new("E-TYPE", e.pos, format!("`{}` cannot be called in a specification (allowed: len, get, slen, sget, old, ghost accessors and spec fns)", name)));
                 }
                 let sig = &self.sigs[name.as_str()];
-                if sig.params.len() != args.len() {
-                    return Err(Diag::new("E-TYPE", e.pos, format!("`{}` takes {} argument(s), {} given", name, sig.params.len(), args.len())));
-                }
+                arity(sig.params.len())?;
                 let tb = self.spec_expr(&args[0], in_ensures, bound)?;
-                if tb.base() != sig.params[0].base() {
+                if tb != *sig.params[0].base() {
                     return Err(Diag::new("E-TYPE", args[0].pos, format!("argument of `{}` must be {}", name, sig.params[0].base().name())));
                 }
-                if !matches!(&args[0].kind, ExprKind::Var(_) | ExprKind::Str(_)) {
-                    return Err(Diag::new("E-TYPE", args[0].pos, format!("the first argument of `{}` in a specification must be a variable", name)));
-                }
+                check_lin(&args[0])?;
                 if args.len() == 2 {
                     let ti = self.spec_expr(&args[1], in_ensures, bound)?;
                     expect_ty(&ti, &Type::U64, args[1].pos, "an index")?;

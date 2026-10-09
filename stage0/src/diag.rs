@@ -5,6 +5,8 @@ use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Pos {
+    /// Index into the list of input files.
+    pub file: usize,
     pub line: usize,
     pub col: usize,
 }
@@ -27,7 +29,9 @@ impl Diag {
         self
     }
 
-    pub fn render(&self, file: &str, src: &str) -> String {
+    /// `files` holds (path, source) for every input file.
+    pub fn render(&self, files: &[(String, String)]) -> String {
+        let (file, src) = files.get(self.pos.file).map(|(f, s)| (f.as_str(), s.as_str())).unwrap_or(("?", ""));
         let mut s = format!("{}:{}:{}: error[{}]: {}\n", file, self.pos.line, self.pos.col, self.code, self.msg);
         if let Some(line) = src.lines().nth(self.pos.line.saturating_sub(1)) {
             s.push_str(&format!("  | {}\n", line));

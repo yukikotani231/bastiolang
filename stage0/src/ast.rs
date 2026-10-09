@@ -14,8 +14,25 @@ pub enum Type {
     Serial,
     /// An immutable string literal. Freely copyable.
     Str,
+    /// One physical 4 KiB page, owned. Linear. Kernel and hosted targets.
+    Frame,
+    /// A page-table page (levels 1-4 are x86-64 tables; level 5 is a kernel-side
+    /// directory of address spaces that the MMU never walks). It owns every
+    /// table and frame it points to. Linear.
+    PageTable,
+    /// The physical page pool: the right to turn page number i into a Frame,
+    /// once, while the pool still has it. Linear; only `main` receives it.
+    Pool,
+    /// The MMU: the right to load CR3. Linear; kernel target only.
+    Mmu,
+    /// The CPU's user-mode context: the right to enter user mode and the
+    /// registers saved by the last trap. Linear; kernel target only.
+    Cpu,
     /// A read-only borrow of a linear value. Only allowed as a parameter type.
     Ref(Box<Type>),
+    /// A mutable borrow of a linear value. Only allowed as a parameter type;
+    /// the callee must hand the value back (still owned) when it returns.
+    MutRef(Box<Type>),
 }
 
 impl Type {
@@ -27,19 +44,28 @@ impl Type {
             Type::Buf => "Buf".into(),
             Type::Serial => "Serial".into(),
             Type::Str => "Str".into(),
+            Type::Frame => "Frame".into(),
+            Type::PageTable => "PageTable".into(),
+            Type::Pool => "Pool".into(),
+            Type::Mmu => "Mmu".into(),
+            Type::Cpu => "Cpu".into(),
             Type::Ref(t) => format!("&{}", t.name()),
+            Type::MutRef(t) => format!("&mut {}", t.name()),
         }
     }
     pub fn is_linear(&self) -> bool {
-        matches!(self, Type::Buf | Type::Serial)
+        matches!(self, Type::Buf | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu)
     }
     pub fn is_ref(&self) -> bool {
-        matches!(self, Type::Ref(_))
+        matches!(self, Type::Ref(_) | Type::MutRef(_))
+    }
+    pub fn is_mut_ref(&self) -> bool {
+        matches!(self, Type::MutRef(_))
     }
     /// The type with any borrow removed.
     pub fn base(&self) -> &Type {
         match self {
-            Type::Ref(t) => t,
+            Type::Ref(t) | Type::MutRef(t) => t,
             t => t,
         }
     }
@@ -90,6 +116,11 @@ pub enum ExprKind {
     Bool(bool),
     /// A string literal (already unescaped).
     Str(Vec<u8>),
+    /// `include_bytes("path")`: a file's bytes as a Str. The prover only knows
+    /// its length and that every byte is <= 255, not the bytes themselves.
+    Blob(Vec<u8>),
+    /// `&mut x`, only as a call argument.
+    MutBorrow(String),
     Var(String),
     Not(Box<Expr>),
     Bin(BinOp, Box<Expr>, Box<Expr>),
@@ -140,9 +171,21 @@ pub struct FnDef {
     pub pos: Pos,
 }
 
+/// `spec fn name(params) -> bool { expr }`: a named specification, expanded
+/// in place wherever a specification calls it. Ghost: generates no code.
+#[derive(Debug, Clone)]
+pub struct SpecFn {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub ret: Type,
+    pub body: Expr,
+    pub pos: Pos,
+}
+
 #[derive(Debug, Clone)]
 pub struct Program {
     pub fns: Vec<FnDef>,
+    pub specs: Vec<SpecFn>,
 }
 
 /// Source-like rendering of an expression, used in diagnostics.
@@ -152,6 +195,8 @@ pub fn render(e: &Expr) -> String {
             ExprKind::Int(v) => v.to_string(),
             ExprKind::Bool(b) => b.to_string(),
             ExprKind::Str(b) => format!("{:?}", String::from_utf8_lossy(b)),
+            ExprKind::Blob(b) => format!("include_bytes(<{} bytes>)", b.len()),
+            ExprKind::MutBorrow(n) => format!("&mut {}", n),
             ExprKind::Var(n) => n.clone(),
             ExprKind::Not(x) => format!("!{}", go(x, false)),
             ExprKind::Bin(op, a, b) => {
