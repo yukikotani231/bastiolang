@@ -1,89 +1,88 @@
-# Bastio 言語仕様 v0
+# Bastio language reference (v0)
 
-v0 は「証明の仕組みが端から端まで動くこと」を示す最小の言語です。型は 4 つ、組み込み関数は 6 つです。
+v0 is the smallest language that shows the proof pipeline working end to end: four types and six built-in functions.
 
-## 型
+## Types
 
-| 型 | 意味 |
+| Type | Meaning |
 | --- | --- |
-| `u64` | 符号なし 64bit 整数。演算が範囲を外れないことは証明で保証する(折り返しは起きない) |
-| `bool` | 真偽値 |
-| `Buf` | u64 要素の所有バッファ。**線形**:ちょうど 1 回消費しなければならない |
-| `&Buf` | 読み取り専用の借用。**引数の型としてのみ**書ける。返したり変数に入れたりはできないので、呼び出しより長生きしない |
+| `u64` | Unsigned 64-bit integer. Arithmetic is proved to stay in range; it never wraps |
+| `bool` | Boolean |
+| `Buf` | An owned buffer of u64 elements. **Linear**: must be consumed exactly once |
+| `&Buf` | A read-only borrow. Allowed **only as a parameter type**, so it can never be returned or stored, and never outlives the call |
 
-## 組み込み関数
+## Built-in functions
 
-| 関数 | 前提条件(証明される) | 効果 |
+| Function | Precondition (proved) | Effect |
 | --- | --- | --- |
-| `alloc(n: u64) -> Buf` | `n <= 2^60` | 長さ n、全要素 0 のバッファ |
-| `len(b: &Buf) -> u64` | なし | 長さ |
-| `get(b: &Buf, i: u64) -> u64` | `i < len(b)` | i 番目の要素 |
-| `set(b: Buf, i: u64, v: u64) -> Buf` | `i < len(b)` | b を消費し、i 番目を v にしたバッファを返す(実体はその場で書き換える) |
-| `free(b: Buf)` | なし | b を消費して解放する |
-| `print(v: u64)` | なし | 標準出力に 1 行出す(デバッグ用) |
+| `alloc(n: u64) -> Buf` | `n <= 2^60` | A buffer of length n, all zeros |
+| `len(b: &Buf) -> u64` | none | Length |
+| `get(b: &Buf, i: u64) -> u64` | `i < len(b)` | Element i |
+| `set(b: Buf, i: u64, v: u64) -> Buf` | `i < len(b)` | Consumes b and returns it with element i set to v (updated in place) |
+| `free(b: Buf)` | none | Consumes and frees b |
+| `print(v: u64)` | none | Prints one line to stdout (for debugging) |
 
-## 文と式
+## Statements and expressions
 
 ```
 fn name(p: T, mut q: T) -> R
-  requires <bool 式>       // 呼び出し側が証明する
-  ensures  <bool 式>       // 関数が全 return で証明する。`result` が戻り値
+  requires <bool expr>     // the caller proves it
+  ensures  <bool expr>     // proved at every return; `result` is the return value
 { ... }
 
 let x = e;   let mut x: T = e;   x = e;
 if c { ... } else { ... }
-while c invariant <式> invariant <式> { ... }
-return e;   assert <式>;
+while c invariant <expr> invariant <expr> { ... }
+return e;   assert <expr>;
 ```
 
-- 演算子は `+ - * / %`、`== != < <= > >=`、`&& || !` です。`&&` と `||` は短絡評価です。
-- 同じ関数の中で、変数名の再宣言(シャドーイング)はできません。
-- エントリポイントは `fn main() -> u64` で、戻り値がプロセスの終了コードになります。
+- Operators: `+ - * / %`, `== != < <= > >=`, `&& || !`. `&&` and `||` short-circuit.
+- A name cannot be redeclared (no shadowing) within a function.
+- The entry point is `fn main() -> u64`; its result is the process exit code.
 
-## 仕様式(ゴースト)
+## Specification expressions (ghost)
 
-`requires`/`ensures`/`invariant`/`assert` に書く式は、コンパイル時にだけ存在し、コードを生成しません。
+Expressions in `requires` / `ensures` / `invariant` / `assert` exist only at compile time and generate no code.
 
-- 数学的な整数として評価されます(`a - b` は負になりうる)。
-- `==>`(含意)と `forall x: u64 :: 式` が使えます。
-- 呼べる関数は `len` と `get` だけです。
-- 消費済みのバッファにも言及できます。`ensures` の中の引数名は、**関数の入口での値**を指します。
+- They are evaluated over mathematical integers (`a - b` may be negative).
+- They may use `==>` (implication) and `forall x: u64 :: expr`.
+- The only functions they may call are `len` and `get`.
+- They may mention buffers that have already been consumed. In `ensures`, a parameter name refers to **its value on entry** to the function.
 
-## 線形性の規則(エラーコード)
+## Linearity rules (error codes)
 
-| コード | 規則 |
+| Code | Rule |
 | --- | --- |
-| `E-LINEAR-USE` | 消費済みのバッファを使った。同じ呼び出しで同じバッファを借用と移動の両方に使った。借用を返そうとした。繰り返し評価されうる位置(while 条件、`&&`/`||` の右辺)で消費した |
-| `E-LINEAR-LEAK` | 消費しないままスコープを抜けた、または return した。所有中のバッファを上書きした |
-| `E-LINEAR-BRANCH` | if の片方の枝でだけ消費した。ループ本体が外側のバッファの所有状態を変えた |
+| `E-LINEAR-USE` | A consumed buffer is used; one call both borrows and moves the same buffer; a borrow is returned; a buffer is consumed where the code may run more than once or not at all (a `while` condition, the right side of `&&` / `\|\|`) |
+| `E-LINEAR-LEAK` | A buffer is still owned at the end of its scope or at a `return`; an owned buffer is overwritten |
+| `E-LINEAR-BRANCH` | Only one arm of an `if` consumes a buffer; a loop body changes the ownership of an outer buffer |
 
-## 検証(エラーコード)
+## Verification (error codes)
 
-コンパイラは関数ごとに記号実行を行い、危険になりうる地点ごとに「悪い場合が到達可能か」を Z3 に問い合わせます。到達可能なら、反例を付けて拒否します。
+The compiler executes each function symbolically. At every point where the program could go wrong, it asks Z3 whether the bad case is reachable, and if it is, rejects the program with a counterexample.
 
-| コード | 証明する内容 |
+| Code | What is proved |
 | --- | --- |
-| `E-VERIFY-BOUNDS` | `get`/`set` の添字 < 長さ |
-| `E-VERIFY-OVERFLOW` | `+`、`*` の結果 < 2^64 |
-| `E-VERIFY-UNDERFLOW` | `a - b` で a >= b |
-| `E-VERIFY-DIVZERO` | `/`、`%` の除数 != 0 |
-| `E-VERIFY-ALLOC` | 確保サイズ <= 2^60 |
-| `E-VERIFY-REQUIRES` | 呼び出し先の前提条件 |
-| `E-VERIFY-ENSURES` | 自分の事後条件 |
-| `E-VERIFY-INVARIANT` | ループ不変条件(入口で成り立ち、1 周で保たれる) |
-| `E-VERIFY-ASSERT` | `assert` |
+| `E-VERIFY-BOUNDS` | `get` / `set` index < length |
+| `E-VERIFY-OVERFLOW` | `+` and `*` results < 2^64 |
+| `E-VERIFY-UNDERFLOW` | `a - b` has a >= b |
+| `E-VERIFY-DIVZERO` | the divisor of `/` and `%` is not zero |
+| `E-VERIFY-ALLOC` | allocation size <= 2^60 elements |
+| `E-VERIFY-REQUIRES` | the callee's precondition |
+| `E-VERIFY-ENSURES` | the function's own postcondition |
+| `E-VERIFY-INVARIANT` | a loop invariant holds on entry and is preserved by one iteration |
+| `E-VERIFY-ASSERT` | an `assert` |
 
-検証の性質は次のとおりです。
-- **モジュラー**:呼び出しは相手の `requires`/`ensures` だけを使い、本体は見ません。
-- **ループ**:ループは不変条件で切ります。本体で代入される変数は、ループの後では不変条件以外の情報を失います。
-- **注釈を減らす推論(その 1)**:ループ本体が `x = set(x, ..)` の形でしか更新しないバッファは、長さが変わらないものとして扱います。`invariant len(x) == ...` を書く必要はありません。
-- **注釈を減らす推論(その 2)**:`if i < len(b) { get(b, i) }` のように、プログラマーが書いた分岐条件はそのまま証明に使われます。
+How verification works:
+- **Modular.** A call uses only the callee's `requires` / `ensures`, never its body.
+- **Loops** are cut with their invariants. After a loop, the variables the body assigns are known only through the invariants.
+- **Annotation inference (1).** A buffer that a loop body only ever updates as `x = set(x, ..)` keeps its length across the loop, so `invariant len(x) == ...` is not needed.
+- **Annotation inference (2).** A condition the programmer already tests, as in `if i < len(b) { get(b, i) }`, is used by the proof directly.
 
-## 健全性の範囲(v0 で保証しないこと)
+## Soundness scope (what v0 does not guarantee)
 
-正直に書いておきます。
-- **停止性**:無限ループや無限再帰は検出しません。メモリ安全性とは独立した問題で、非目標です。
-- **メモリ不足**:`alloc` は OOM 時に abort します。カーネル用のプリミティブでは、失敗を型で返す予定です。
-- **信頼の基盤**:Z3、stage0 コンパイラ(Rust)、C コンパイラは信頼する側です。
-- **引数の評価順**:C の引数評価順は未規定です。v0 では副作用は `print`、`alloc`、`free` だけで、線形性によって別々のバッファにしか作用しないので、安全性には影響しません。出力の順序は保証しません。
-- **テスト側の照合**:`tests/run.sh` は、通るべきプログラムを AddressSanitizer と UBSan 付きでも実行して、証明と実行時の挙動が食い違わないことを確かめています(実行時のチェックは本番コードには入りません)。
+- **Termination.** Infinite loops and infinite recursion are not detected. This is independent of memory safety and is a non-goal.
+- **Out of memory.** `alloc` aborts when memory runs out. Kernel primitives will return allocation failure in the type instead.
+- **Trusted base.** Z3, the stage0 compiler (Rust) and the C compiler are trusted.
+- **Argument evaluation order.** C leaves it unspecified. In v0 the only side effects are `print`, `alloc` and `free`, and linearity confines them to distinct buffers, so safety is unaffected; output order is not guaranteed.
+- **Cross-check in the tests.** `tests/run.sh` also runs every passing program under AddressSanitizer and UBSan to confirm that the proofs match runtime behaviour. Those checks exist only in the test build, never in generated code.

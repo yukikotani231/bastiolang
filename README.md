@@ -1,16 +1,14 @@
 # Bastio
 
-メモリ安全性をコンパイル時に**証明する** OS 記述言語です。fz/fzl の後継として書き直しています。この言語で書く OS は BastiOS(`bastios`)の予定です。
+Bastio is a systems language whose memory safety is **proved at compile time**, not checked at run time. It is the successor to fz/fzl, and the language BastiOS (`bastios`) will be written in.
 
-- **unsafe がない**:生のアドレスからメモリを読む手段が、言語に存在しません。
-- **線形な所有権**:バッファは必ずちょうど 1 回消費されます。解放後の使用、二重解放、**リーク**はコンパイルエラーになります。
-- **範囲と算術の証明**:配列の添字、オーバーフロー、アンダーフロー、ゼロ除算を、Z3(SMT ソルバー)がコンパイル時に証明します。
-- **ゼロオーバーヘッド**:証明はすべてコンパイル時に消えます。生成コードには境界チェックも実行時検査もありません。
-- **関数の正しさは任意(opt-in)**:`requires`/`ensures`/`invariant` を書いた関数だけ、仕様どおりであることを証明します。
+- **No `unsafe`.** The language has no way to read memory through a raw integer address.
+- **Linear ownership.** Every buffer is consumed exactly once, so use-after-free, double free and **leaks** are compile errors.
+- **Proved indices and arithmetic.** Array indices, overflow, underflow and division by zero are proved safe by an SMT solver (Z3) during compilation.
+- **Zero overhead.** Proofs are erased. The generated code has no bounds checks and no runtime checks of any kind.
+- **Opt-in functional correctness.** Functions that carry `requires` / `ensures` / `invariant` are proved to meet them.
 
-設計の背景と Rust、Verus、ATS との比較は、設計メモ(Claude Doc)にあります。
-
-## 例
+## Example
 
 ```
 fn fill(mut b: Buf, v: u64) -> Buf
@@ -22,14 +20,14 @@ fn fill(mut b: Buf, v: u64) -> Buf
     invariant i <= len(b)
     invariant forall j: u64 :: j < i ==> get(b, j) == v
   {
-    b = set(b, i, v);   // i < len(b) はループ条件から自動で証明される
-    i = i + 1;          // オーバーフローしないことも自動で証明される
+    b = set(b, i, v);   // i < len(b) follows from the loop condition
+    i = i + 1;          // cannot overflow: also proved automatically
   }
   return b;
 }
 ```
 
-よくある off-by-one(`while i <= len(a)`)を書くと、反例付きで拒否されます。
+A classic off-by-one (`while i <= len(a)`) is rejected with a counterexample:
 
 ```
 tests/fail/oob_loop.bastio:9:9: error[E-VERIFY-BOUNDS]: could not prove that the index `i` is within `a` (`i < len(a)`)
@@ -38,31 +36,48 @@ tests/fail/oob_loop.bastio:9:9: error[E-VERIFY-BOUNDS]: could not prove that the
   = counterexample: len(a) = 4, i = 4
 ```
 
-## ビルドとテスト
+## How Bastio differs
 
-必要なもの:Rust(stage0 のビルド用)、`z3`、C コンパイラ(`cc`)。
+| | Rust | Verus / ATS | Bastio |
+| --- | --- | --- | --- |
+| Raw memory in a kernel | `unsafe` blocks, checked by review | provable, with hand-written proofs | no raw access; hardware is reached through capability types |
+| Index bounds | runtime check (panic) | proved, often with annotations | proved, mostly without annotations |
+| Leaks | allowed (`mem::forget`) | depends on the tool | compile error |
+| Proof style | none | specs plus proofs (Verus), proof terms (ATS) | SMT-checked specs; hand-written proofs are the exception |
+
+## Scope
+
+Bastio targets low-level code that has no runtime and where a memory-safety bug is costly:
+
+- **Primary:** OS kernels and drivers (BastiOS).
+- **Also:** embedded firmware and hypervisors, and safe libraries callable from C, such as parsers for images, fonts, compression and network protocols (code that reads untrusted input).
+- **Not a goal:** web apps, scripting, GUI applications. Rust or a garbage-collected language is a better fit there.
+
+## Build and test
+
+Requirements: Rust (to build stage0), `z3`, and a C compiler (`cc`).
 
 ```sh
 cd stage0 && cargo build --release
-tests/run.sh                       # 通るべき例、拒否されるべき例、ゼロオーバーヘッド、サニタイザー照合
+tests/run.sh       # must-pass and must-fail programs, zero-overhead check, sanitizer cross-check
 stage0/target/release/bastioc0 -o hello examples/hello.bastio && ./hello
 ```
 
-`bastioc0` のオプションは次のとおりです。
-- `--check`:検証だけ行う
-- `--emit-c`:C を出力する
-- `--dump-smt`:ソルバーに送った問い合わせを表示する
+`bastioc0` options:
+- `--check`: verify only
+- `--emit-c`: write the generated C
+- `--dump-smt`: print every query sent to the solver
 
-## 構成
+## Layout
 
-| パス | 中身 |
+| Path | Contents |
 | --- | --- |
-| `stage0/` | 使い捨てのブートストラップコンパイラ(Rust)。selfhost が成立したら凍結する |
-| `tests/pass/` | 検証を通り、期待した終了コードで動くべきプログラム |
-| `tests/fail/` | 決まったエラーコードで拒否されるべきプログラム |
-| `docs/language.md` | v0 の言語仕様 |
-| `ROADMAP.md` | selfhost とカーネルまでの道筋 |
+| `stage0/` | Throwaway bootstrap compiler in Rust, frozen once the self-hosted compiler works |
+| `tests/pass/` | Programs that must verify and exit with a given code |
+| `tests/fail/` | Programs that must be rejected with a given error code |
+| `docs/language.md` | The v0 language reference |
+| `ROADMAP.md` | The path to self-hosting and to a kernel |
 
-## 現在地(v0)
+## Status (v0)
 
-型は `u64`、`bool`、`Buf`(u64 の所有バッファ)、`&Buf`(読み取り専用の借用)だけです。バックエンドは C 出力です。v0 で保証することと保証しないことの一覧は、[docs/language.md](docs/language.md) の「健全性の範囲」にあります。
+The only types are `u64`, `bool`, `Buf` (an owned buffer of u64) and `&Buf` (a read-only borrow). The backend emits C. What v0 does and does not guarantee is listed under "Soundness scope" in [docs/language.md](docs/language.md).

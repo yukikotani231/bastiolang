@@ -1,26 +1,26 @@
-# Bastio(言語)
+# Bastio (the language)
 
-メモリ安全性をコンパイル時に証明する OS 記述言語。fz/fzl の後継。
+A systems language whose memory safety is proved at compile time. The successor to fz/fzl. This is an open-source project: write all code, comments, docs and commit messages in English.
 
-- 設計方針と道筋: [ROADMAP.md](ROADMAP.md)(不変ルールもここ)
-- 言語仕様: [docs/language.md](docs/language.md)
+- Direction and invariants: [ROADMAP.md](ROADMAP.md)
+- Language reference: [docs/language.md](docs/language.md)
 
-## ビルドとテスト
+## Build and test
 
 ```sh
-cd stage0 && cargo build --release     # 警告はエラー扱い(CI 準拠)
-tests/run.sh                           # 要: z3, cc
+cd stage0 && cargo build --release     # warnings are errors in CI
+tests/run.sh                           # needs z3 and cc
 ```
 
-`tests/run.sh` の件数は手で書き写さないこと(fz で数字が腐り続けた教訓)。実物を数える:
-`ls tests/pass tests/fail | grep -c Bastio`
+Never copy test counts into prose: they go stale (a lesson from fz). Count the real thing instead:
+`ls tests/pass tests/fail | grep -c bastio`
 
-## 機能追加のルール
+## Rules for new features
 
-- 新しい保証を足したら、それを**破る**プログラムを `tests/fail/` に足し、正しいエラーコードで落ちることを確かめる
-- 生成コードに実行時検査を足して安全性を得てはいけない(ゼロオーバーヘッドの原則)。証明で得る
-- 信頼する部分(Z3、C コンパイラ、ランタイムのプレリュード)を増やすときは ROADMAP の不変ルール 3 に従う
+- When adding a guarantee, add a program to `tests/fail/` that breaks it and check that it is rejected with the right error code.
+- Never get safety by adding runtime checks to generated code (the zero-overhead rule). Get it from a proof.
+- Growing the trusted base (Z3, the C compiler, the runtime prelude) follows invariant 3 in ROADMAP.md.
 
-## コミット規約
+## Commits
 
-`<area>: <summary>`。area は `stage0` / `lang` / `test` / `docs` / `ci` など。本文には何を証明できるようになったか、何がまだ証明されないかを正直に書く。
+`<area>: <summary>`, where area is `stage0` / `lang` / `test` / `docs` / `ci` and so on. The body says honestly what can now be proved and what still cannot.

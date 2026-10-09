@@ -1,51 +1,67 @@
-# ロードマップ
+# Roadmap
 
-方針は 2026-10-09 に決めた次の 4 点です。
-- 証明は SMT 型(注釈 + Z3)
-- メモリ安全性は必須
-- 関数の正しさは任意(opt-in)
-- 最初から selfhost を目指す
+Direction, decided 2026-10-09:
+- Proofs are SMT-style: annotations checked by Z3.
+- Memory safety is mandatory.
+- Functional correctness is opt-in.
+- The compiler aims at self-hosting from the start.
 
-`stage0/`(Rust)は使い捨てで、selfhost が成立した時点で凍結します。
+`stage0/` (Rust) is throwaway and will be frozen once the compiler compiles itself.
 
-## 不変ルール
+## Scope
 
-1. 生の整数アドレスからメモリを読み書きする手段を、言語に入れない。ハードウェアへのアクセスは、すべて capability 型を経由する。
-2. 証明、capability、仕様はゴーストとし、生成コードに何も残さない(ゼロオーバーヘッド)。
-3. 信頼する部分(asm、組み込みプリミティブ)は一覧にして、機械的に数える。増えたらレビューする。
-4. 機能を足すときは、`tests/pass` と `tests/fail` の両方に例を足す。「通るべきもの」だけでなく、「落ちるべきもの」が落ちることを確かめる。
+- **Primary target:** OS kernels and drivers (BastiOS, in a separate repository once kernel work starts).
+- **Also targeted:** embedded firmware, hypervisors, and safe libraries callable from C (parsers and codecs that read untrusted input).
+- **Not targeted:** web apps, scripting, GUI applications.
 
-## v0(済)
-証明の仕組みが端から端まで動くことの実証。
-- [x] u64 / bool / 線形 `Buf` / 借用 `&Buf`
-- [x] 線形性検査(解放後の使用、二重解放、リーク、分岐の不一致、借用と移動の同時使用)
-- [x] 記号実行と Z3 による証明(境界、オーバーフロー、ゼロ除算、requires/ensures/invariant/assert)
-- [x] 反例付きのエラー
-- [x] C バックエンド(実行時検査なし)と、サニタイザーによる照合
+Design consequences:
+1. The standard library splits into `core` (no OS required) and `std` (uses OS services).
+2. Functions can call and be called through the C ABI. At that boundary, preconditions become obligations on the caller.
+3. No mandatory runtime, ever.
 
-## v1:selfhost に必要な言語機能
-コンパイラ自身を書くのに必要なもの。上から順に進めます。
-1. **バイト列と文字列**:`Bytes`(u8 の線形バッファ)、文字列リテラル、ファイルの読み書き(入力ソースの読み込み、C の出力)
-2. **構造体**:フィールドに線形な型を持てる。部分的な移動の規則
-3. **列挙型と `match`**:AST を表すため。網羅性検査
-4. **所有ポインタ `Box[T]`**:再帰的なデータ構造(木)のため
-5. **ジェネリクス(単相化)**:`Vec[T]`、`Box[T]`。証明済みの成長可能配列を標準ライブラリとして書く
-6. **複数ファイルとモジュール**
-7. **外部プロセスとパイプ**:selfhost コンパイラ自身が Z3 を呼ぶため
+## Invariants
 
-## v2:selfhost
-- [ ] Bastio で書いた bastioc1 が、stage0 と同じ出力を出す(差分テスト)
-- [ ] bastioc1 が自分自身をコンパイルし、固定点に達する(gen2 == gen1)
-- [ ] stage0 を凍結する
+1. The language never gains a way to read or write memory through a raw integer address. All hardware access goes through capability types.
+2. Proofs, capabilities and specifications are ghost and leave nothing in the generated code (zero overhead).
+3. The trusted base (assembly, built-in primitives, the runtime prelude) is listed and counted mechanically. Growth gets reviewed.
+4. Every new feature comes with examples in both `tests/pass` and `tests/fail`: what should be rejected is shown to be rejected.
 
-## v3:カーネル向け
-- [ ] ネイティブ x86-64 バックエンド(C を経由しない)
-- [ ] capability プリミティブ:`Frame[p]`(物理ページ)、`Mmio[R]`、`PortIo`、`IrqOff`
-- [ ] 失敗しうる確保を型で返す(OOM で abort しない)
-- [ ] 小さなカーネル:ブート、物理ページアロケータ(関数の正しさまで証明)、ページテーブル
+## v0 (done)
 
-## 先送りにしている設計判断
-- 並行性(マルチコア、ロック、割り込みとの共有)を型でどう扱うか
-- 可変借用 `&mut` を入れるか。今は「消費して返す」(`b = set(b, ...)`)で代用している
-- 停止性(現状は非目標)
-- 量子化子で Z3 が詰まった場合の手書き証明(補題)の書き方
+The proof pipeline works end to end.
+- [x] u64 / bool / linear `Buf` / borrowed `&Buf`
+- [x] Linearity checking: use-after-free, double free, leaks, branch mismatch, borrow-and-move aliasing
+- [x] Symbolic execution and Z3 proofs: bounds, overflow, division by zero, requires/ensures/invariant/assert
+- [x] Errors with counterexamples
+- [x] C backend with no runtime checks, cross-checked under sanitizers
+
+## v1: language features needed for self-hosting
+
+What the compiler needs in order to be written in Bastio, in order:
+1. **Bytes and strings:** `Bytes` (a linear u8 buffer), string literals, file reading and writing.
+2. **Structs:** fields may hold linear types; rules for partial moves.
+3. **Enums and `match`:** to represent the AST; exhaustiveness checking.
+4. **Owning pointer `Box[T]`:** for recursive data such as trees.
+5. **Generics by monomorphization:** `Vec[T]` and `Box[T]`, with a proved growable array in the standard library.
+6. **Multiple files and modules.**
+7. **Processes and pipes:** so the self-hosted compiler can call Z3 itself.
+
+## v2: self-hosting
+
+- [ ] bastioc1, written in Bastio, produces the same output as stage0 (differential testing)
+- [ ] bastioc1 compiles itself and reaches a fixed point (gen2 == gen1)
+- [ ] stage0 is frozen
+
+## v3: toward a kernel
+
+- [ ] Native x86-64 backend, without going through C
+- [ ] Capability primitives: `Frame[p]` (a physical page), `Mmio[R]`, `PortIo`, `IrqOff`
+- [ ] Allocation failure returned in the type (no abort on OOM)
+- [ ] A small kernel: boot, a physical page allocator (with functional correctness proved), page tables
+
+## Open design questions
+
+- How to express concurrency in types: multiple cores, locks, sharing with interrupt handlers.
+- Whether to add mutable borrows `&mut`. Today "consume and return" (`b = set(b, ...)`) stands in for them.
+- Termination (currently a non-goal).
+- How to write hand-written proofs (lemmas) for the cases where Z3 gets stuck on quantifiers.
