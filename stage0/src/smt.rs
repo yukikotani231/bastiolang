@@ -8,8 +8,13 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 pub const SOLVER_CMD: &str = "z3";
 pub const SOLVER_ARGS: &[&str] = &["-in", "-smt2"];
-/// Per-query timeout in milliseconds.
-pub const TIMEOUT_MS: u32 = 10_000;
+/// The work Z3 may spend on one query before it answers `unknown`, in its
+/// resource units (`:rlimit`, counted per `check-sat`). A resource limit and
+/// not a timeout, so that whether a proof succeeds never depends on how
+/// loaded the machine is: the same question gets the same answer under
+/// `make -j` as alone. 40 million units take about 10 s; the hardest query
+/// in the BastiOS kernel and the compiler takes under 3 million.
+pub const RLIMIT: u64 = 40_000_000;
 
 pub struct Solver {
     child: Child,
@@ -40,7 +45,7 @@ impl Solver {
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let mut s = Solver { child, stdin, stdout, log: Vec::new() };
         s.send("(set-option :produce-models true)")?;
-        s.send(&format!("(set-option :timeout {})", TIMEOUT_MS))?;
+        s.send(&format!("(set-option :rlimit {})", RLIMIT))?;
         Ok(s)
     }
 

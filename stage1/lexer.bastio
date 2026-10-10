@@ -88,7 +88,7 @@ const P_SHR: u64 = 61;        // >>
 const P_PIPE: u64 = 62;       // |
 const P_CARET: u64 = 63;      // ^
 
-struct Tok { kind: u64, start: u64, end: u64, line: u64, col: u64, val: u64 }
+struct Tok { kind: u64, start: u64, end: u64, line: u64, col: u64, val: u64, ecol: u64 }
 
 fn is_digit(c: u64) -> bool
   ensures result == (c >= 48 && c <= 57)
@@ -228,7 +228,7 @@ fn punct_len(code: u64) -> u64
 }
 
 fn err(line: u64, col: u64, kind: u64, start: u64, end: u64) -> Tok {
-  return Tok { kind: K_ERROR, start: start, end: end, line: line, col: col, val: kind };
+  return Tok { kind: K_ERROR, start: start, end: end, line: line, col: col, val: kind, ecol: col };
 }
 
 /// Appends the tokens of `src` from byte `from` on to `out`, ending with an
@@ -278,7 +278,7 @@ fn lex(src: &Bytes, from: u64, out: &mut Vec[Tok]) -> Tok
         }
         let ch = bget(src, i);
         if ch == 34 {
-          vec_push(&mut out, Tok { kind: K_STR, start: start, end: i, line: tl, col: tc, val: 0 });
+          vec_push(&mut out, Tok { kind: K_STR, start: start, end: i, line: tl, col: tc, val: 0, ecol: col + 1 });
           open = false;
         } else if ch == 92 {
           let e = at(src, i + 1);
@@ -329,7 +329,7 @@ fn lex(src: &Bytes, from: u64, out: &mut Vec[Tok]) -> Tok
         }
         return err(tl, tc, LE_INT, start, i);
       }
-      vec_push(&mut out, Tok { kind: K_INT, start: start, end: i, line: tl, col: tc, val: v });
+      vec_push(&mut out, Tok { kind: K_INT, start: start, end: i, line: tl, col: tc, val: v, ecol: col + (i - start) });
       col = col + (i - start);
     } else if is_alpha(c) {
       let start = i;
@@ -341,7 +341,7 @@ fn lex(src: &Bytes, from: u64, out: &mut Vec[Tok]) -> Tok
       let kw = keyword(src, start, i);
       let mut kind = K_IDENT;
       if kw != 0 { kind = K_KEYWORD; }
-      vec_push(&mut out, Tok { kind: kind, start: start, end: i, line: tl, col: tc, val: kw });
+      vec_push(&mut out, Tok { kind: kind, start: start, end: i, line: tl, col: tc, val: kw, ecol: col + (i - start) });
       col = col + (i - start);
     } else {
       let code = punct(src, i);
@@ -349,12 +349,12 @@ fn lex(src: &Bytes, from: u64, out: &mut Vec[Tok]) -> Tok
       if k == 0 || i + k > n {
         return err(tl, tc, LE_CHAR, i, i);
       }
-      vec_push(&mut out, Tok { kind: K_PUNCT, start: i, end: i + k, line: tl, col: tc, val: code });
+      vec_push(&mut out, Tok { kind: K_PUNCT, start: i, end: i + k, line: tl, col: tc, val: code, ecol: col + k });
       i = i + k;
       col = col + k;
     }
   }
-  let eof = Tok { kind: K_EOF, start: n, end: n, line: line, col: col, val: 0 };
+  let eof = Tok { kind: K_EOF, start: n, end: n, line: line, col: col, val: 0, ecol: col };
   vec_push(&mut out, eof);
   return eof;
 }

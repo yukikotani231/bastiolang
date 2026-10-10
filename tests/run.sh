@@ -33,8 +33,17 @@ for f in tests/fail/*.bastio; do
   if "$BASTIOC" --check --target "${target:-hosted}" "$f" 2>"$tmp/err"; then
     echo "FAIL $f: accepted, want $want"; fail=$((fail+1)); continue
   fi
-  if grep -q "error\[$want\]" "$tmp/err"; then pass=$((pass+1)); else
-    echo "FAIL $f: wrong error, want $want"; sed 's/^/    /' "$tmp/err"; fail=$((fail+1)); fi
+  if ! grep -q "error\[$want\]" "$tmp/err"; then
+    echo "FAIL $f: wrong error, want $want"; sed 's/^/    /' "$tmp/err"; fail=$((fail+1)); continue
+  fi
+  # `// expect-text: T` lines: each T must appear in the error output (the
+  # sentence or a `  = ` hint), so the wording of diagnostics is tested too.
+  missing=$(sed -n 's|^// expect-text: *||p' "$f" | while IFS= read -r t; do
+    grep -qF -- "$t" "$tmp/err" || echo "$t"; done)
+  if [ -n "$missing" ]; then
+    echo "FAIL $f: error output lacks: $missing"; sed 's/^/    /' "$tmp/err"; fail=$((fail+1)); continue
+  fi
+  pass=$((pass+1))
 done
 # User programs (for a Bastio kernel such as BastiOS) cannot run here: they
 # must verify and their C must compile freestanding.
@@ -63,17 +72,19 @@ else
   sed 's/^/    /' "$tmp/tb.diff"; fail=$((fail+1))
 fi
 # Library search: a program outside the repository finds core only with
-# `--lib` (docs/language.md, "Several files").
+# `--lib` or BASTIO_LIB (docs/language.md, "Several files").
 mkdir -p "$tmp/away"
 printf 'import "core/option.bastio";\nfn main() -> u64 { return opt_or[u64](Option[u64]::Some(7), 0); }\n' >"$tmp/away/prog.bastio"
-if "$BASTIOC" --check "$tmp/away/prog.bastio" 2>"$tmp/away.err"; then
+if BASTIO_LIB= "$BASTIOC" --check "$tmp/away/prog.bastio" 2>"$tmp/away.err"; then
   echo "FAIL --lib: core found without --lib"; fail=$((fail+1))
 elif ! grep -q 'error\[E-IMPORT\]' "$tmp/away.err"; then
   echo "FAIL --lib: wrong error without --lib"; sed 's/^/    /' "$tmp/away.err"; fail=$((fail+1))
-elif ! "$BASTIOC" --lib "$PWD" -o "$tmp/away/prog" "$tmp/away/prog.bastio" 2>"$tmp/away.err"; then
+elif ! BASTIO_LIB= "$BASTIOC" --lib "$PWD" -o "$tmp/away/prog" "$tmp/away/prog.bastio" 2>"$tmp/away.err"; then
   echo "FAIL --lib: rejected"; sed 's/^/    /' "$tmp/away.err"; fail=$((fail+1))
 elif "$tmp/away/prog"; [ $? != 7 ]; then
   echo "FAIL --lib: wrong exit"; fail=$((fail+1))
+elif ! BASTIO_LIB="/nonexistent:$PWD" "$BASTIOC" --check "$tmp/away/prog.bastio" 2>"$tmp/away.err"; then
+  echo "FAIL BASTIO_LIB: rejected"; sed 's/^/    /' "$tmp/away.err"; fail=$((fail+1))
 else
   pass=$((pass+1))
 fi
