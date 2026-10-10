@@ -121,6 +121,9 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("sys_info", Avail::User, vec![U64], U64),
         ("sys_ps", Avail::User, vec![], Unit),
         ("sys_poweroff", Avail::User, vec![], Unit),
+        ("sys_call", Avail::User, vec![U64, U64, U64], U64),
+        ("sys_send", Avail::User, vec![U64, U64, r(Bytes), U64], U64),
+        ("sys_recv", Avail::User, vec![U64, U64, m(Bytes)], U64),
     ]
 }
 

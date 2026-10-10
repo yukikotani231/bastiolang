@@ -140,7 +140,7 @@ fn main(con: &mut Serial) -> u64 {
 
 | Type | Meaning |
 | --- | --- |
-| `u64` | Unsigned 64-bit integer, the only integer type. Arithmetic is proved to stay in range; it never wraps |
+| `u64` | Unsigned 64-bit integer, the only integer type for now (narrower and signed ones are designed in [integers.md](integers.md)). Arithmetic is proved to stay in range; it never wraps |
 | `bool` | `true` or `false` |
 | `Str` | A string literal: immutable bytes whose length and contents are known at compile time. Never freed |
 | A struct or enum with no linear part | See [Structs](#structs) and [Enums](#enums-and-match) |
@@ -849,6 +849,16 @@ fn main(ports: &mut Ports) -> u64 {
 
 **System calls** (user target only). Programs built with `--target user` run under BastiOS and have `sys_spawn(b: &Buf, from: u64, to: u64)` (start the program named by elements `from..to` of `b`, proved to be a range within `b`), `sys_wait(pid)`, `sys_kill(pid)`, `sys_yield()`, `sys_getpid()`, `sys_info(k)`, `sys_ps()` and `sys_poweroff()`.
 
+Calls the language does not know by name go through three generic builtins. The call number `n` and what the call does belong to the kernel (BastiOS defines its file system calls this way), so a new system call needs no compiler change:
+
+| Builtin | Requires | Meaning |
+| --- | --- | --- |
+| `sys_call(n, a, b) -> u64` | none | System call `n` with two integer arguments |
+| `sys_send(n, a, buf: &Bytes, len) -> u64` | `len <= blen(buf)` | Lends the kernel bytes `0..len` of `buf` to read |
+| `sys_recv(n, a, buf: &mut Bytes) -> u64` | none | Lends the kernel all of `buf` to overwrite. Afterwards its length is the same and every byte is still `<= 255`; nothing else about its contents is known |
+
+The kernel is trusted to stay inside the bytes it is lent; BastiOS proves that it does.
+
 Calling a builtin the target does not have is `E-TARGET`.
 
 ## Specifications
@@ -928,7 +938,7 @@ Proofs:
 
 | Code | What is proved |
 | --- | --- |
-| `E-VERIFY-BOUNDS` | Every index is below its limit: buffer, byte, string and vector indices; I/O port offsets within the claimed range; `vec_pop` on a non-empty vector; page numbers below `pool_size`; words, bytes and slots of a page or table; `cpu_get` / `cpu_set` registers; the `sys_spawn` range |
+| `E-VERIFY-BOUNDS` | Every index is below its limit: buffer, byte, string and vector indices; I/O port offsets within the claimed range; `vec_pop` on a non-empty vector; page numbers below `pool_size`; words, bytes and slots of a page or table; `cpu_get` / `cpu_set` registers; the `sys_spawn` range; the `sys_send` length |
 | `E-VERIFY-LEAK` | A vector of linear elements is empty when it is freed |
 | `E-VERIFY-OVERFLOW` | `+` and `*` results < 2^64 |
 | `E-VERIFY-UNDERFLOW` | `a - b` has `a >= b` |
