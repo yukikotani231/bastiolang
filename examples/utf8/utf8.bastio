@@ -1,0 +1,155 @@
+// UTF-8 (RFC 3629, Unicode table 3-7), strict: overlong forms, surrogates
+// (U+D800..U+DFFF) and code points above U+10FFFF are ill-formed.
+//
+// A C library: each `export fn` is a C function (see README.md). What the
+// compiler proves about this file, with no runtime checks in the generated
+// code: no out-of-bounds read or write for any input, no overflow, every
+// byte written is <= 255, the caller's output buffer is never freed or
+// replaced, and the `ensures` clauses below.
+// Not proved: that the code accepts exactly the well-formed sequences. The C
+// harness checks that against an independent decoder.
+
+enum Utf8 {
+  // The input is well-formed; the number of code points in it.
+  Valid(u64),
+  // The offset of the first byte of the first ill-formed sequence.
+  Invalid(u64),
+}
+
+enum Decoded32 {
+  // The number of code points written to the start of `out`, 4 bytes each.
+  Ok(u64),
+  // As for Utf8::Invalid.
+  Invalid(u64),
+  // `out` is too small: decoding needs this many bytes.
+  TooSmall(u64),
+}
+
+/// Is `b` a continuation byte (10xxxxxx)?
+fn is_cont(b: u64) -> bool {
+  return b >= 128 && b <= 191;
+}
+
+/// The length of the well-formed sequence that starts at `i`, or 0 if the
+/// bytes there are not one. Table 3-7: the second byte's range depends on
+/// the first (E0, ED, F0 and F4 are narrower, which rules out overlong
+/// forms, surrogates and values past U+10FFFF).
+fn utf8_seq(s: &Bytes, i: u64) -> u64
+  requires i < blen(s)
+  ensures result <= 4 && i + result <= blen(s)
+{
+  let n = blen(s);
+  let b0 = bget(s, i);
+  if b0 < 128 {
+    return 1;
+  }
+  if b0 < 194 || b0 > 244 || i + 1 >= n {
+    return 0;
+  }
+  let b1 = bget(s, i + 1);
+  let mut lo = 128;
+  let mut hi = 191;
+  if b0 == 224 { lo = 160; }
+  if b0 == 237 { hi = 159; }
+  if b0 == 240 { lo = 144; }
+  if b0 == 244 { hi = 143; }
+  if b1 < lo || b1 > hi {
+    return 0;
+  }
+  if b0 < 224 {
+    return 2;
+  }
+  if i + 2 >= n || !is_cont(bget(s, i + 2)) {
+    return 0;
+  }
+  if b0 < 240 {
+    return 3;
+  }
+  if i + 3 >= n || !is_cont(bget(s, i + 3)) {
+    return 0;
+  }
+  return 4;
+}
+
+/// Checks that `src` is well-formed UTF-8 and counts its code points.
+export fn utf8_validate(src: &Bytes) -> Utf8
+  ensures result is Utf8::Valid ==> result.Valid <= blen(src)
+  ensures result is Utf8::Invalid ==> result.Invalid < blen(src)
+{
+  let n = blen(src);
+  let mut i = 0;
+  let mut count = 0;
+  while i < n
+    invariant i <= n && count <= i
+  {
+    // ASCII runs first: one comparison per byte.
+    while i < n && bget(src, i) < 128
+      invariant i <= n && count <= i
+    {
+      i = i + 1;
+      count = count + 1;
+    }
+    if i < n {
+      let k = utf8_seq(src, i);
+      if k == 0 {
+        return Utf8::Invalid(i);
+      }
+      i = i + k;
+      count = count + 1;
+    }
+  }
+  return Utf8::Valid(count);
+}
+
+/// Decodes `src` into `out` as UTF-32LE, 4 bytes per code point, after
+/// checking all of it: nothing is written unless `src` is well-formed and
+/// `out` is large enough. `out` is the caller's buffer.
+export fn utf8_decode_into(src: &Bytes, out: &mut Bytes) -> Decoded32
+  ensures result is Decoded32::Ok ==> result.Ok * 4 <= blen(out) && result.Ok <= blen(src)
+  ensures result is Decoded32::Invalid ==> result.Invalid < blen(src)
+  ensures result is Decoded32::TooSmall ==> result.TooSmall > blen(out)
+{
+  let mut count = 0;
+  match utf8_validate(src) {
+    Utf8::Valid(c) => { count = c; }
+    Utf8::Invalid(at) => { return Decoded32::Invalid(at); }
+  }
+  if count * 4 > blen(out) {
+    return Decoded32::TooSmall(count * 4);
+  }
+  let n = blen(src);
+  let mut i = 0;
+  let mut o = 0;
+  while i < n
+    invariant i <= n && o % 4 == 0 && o / 4 <= i && o <= blen(out)
+  {
+    let k = utf8_seq(src, i);
+    // Unreachable after utf8_validate, but this loop does not know that
+    // (the prover sees two separate passes): both tests are kept rather
+    // than assumed.
+    if k == 0 {
+      return Decoded32::Invalid(i);
+    }
+    if o + 4 > blen(out) {
+      return Decoded32::TooSmall(o + 4);
+    }
+    let b0 = bget(src, i);
+    let mut v = b0;
+    if k == 2 {
+      v = b0 % 32 * 64 + bget(src, i + 1) % 64;
+    }
+    if k == 3 {
+      v = b0 % 16 * 4096 + bget(src, i + 1) % 64 * 64 + bget(src, i + 2) % 64;
+    }
+    if k == 4 {
+      v = b0 % 8 * 262144 + bget(src, i + 1) % 64 * 4096 + bget(src, i + 2) % 64 * 64 + bget(src, i + 3) % 64;
+    }
+    bset(&mut out, o, v % 256);
+    bset(&mut out, o + 1, v / 256 % 256);
+    bset(&mut out, o + 2, v / 65536 % 256);
+    bset(&mut out, o + 3, v / 16777216);
+    i = i + k;
+    o = o + 4;
+  }
+  return Decoded32::Ok(o / 4);
+}
