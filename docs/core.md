@@ -100,7 +100,7 @@ hmap_free(m);
 
 Proved: every index is in bounds and no counter overflows (from `hmap_ok`, which every function needs and keeps); after `hmap_insert(m, k, v)` the map holds `k` with `v` (spec fn `hmap_maps`); a value `hmap_get` returns is one the map holds for that key. Not proved: that a lookup finds every key present, and that `len` counts the keys. One decrement in `hmap_remove` is guarded by a test rather than proved, for that reason.
 
-**Linear values.** The map holds only numbers. To map keys to buffers or other linear values, keep the values in a `Vec[T]` and map each key to its index (`tests/pass/core_hashmap.bastio` does this). A generic `HashMap[V]` was tried first and dropped: spec fns cannot be generic, so its well-formedness could not be named in a caller's loop invariant.
+**Linear values.** The map holds only numbers. To map keys to buffers or other linear values, keep the values in a `Vec[T]` and map each key to its index (`tests/pass/core_hashmap.bastio` does this). A generic `HashMap[V]` was tried first and dropped, because spec fns could not be generic then and its well-formedness could not be named in a caller's loop invariant. Spec fns can be generic now, so it can be written; it is not done yet.
 
 ### `core/sort.bastio`
 
@@ -119,7 +119,7 @@ Insertion sort is quadratic in the worst case. It was chosen because its proof i
 
 ## Gaps
 
-What the library would say if the language let it. Each is a language or verifier change, not a library change. (Three earlier gaps are closed: `old(x)` is allowed in loop invariants, which the text functions and `bytes_copy_into` use; a local variable may share a function's name, so importing core no longer reserves its local names; and a `spec fn` may be generic, so a generic `HashMap[V]` can now be written.)
+What the library would say if the language let it. Each is a language or verifier change, not a library change. (Three earlier gaps are closed: `old(x)` is allowed in loop invariants, which the text functions and `bytes_copy_into` use; a local variable may share a function's name, so importing core no longer reserves its local names; and a `spec fn` may be generic.)
 
 1. **Counting.** Specifications have `forall` but no way to count elements, so "the map has `len` keys" and "the sort output is a permutation of the input" cannot be stated. Recursive spec fns or a multiset theory would allow both, and also "this parse gives the value of these digits".
 2. **Library search paths.** Imports are relative to the importing file, so where core lives is written into every import. A `--lib` path or an `import core "text"` form would fix it.
