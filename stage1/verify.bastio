@@ -28,6 +28,7 @@ const VT_NUM: u64 = 2;        // the number a
 const VT_APP: u64 = 3;        // operator a applied to targs[b .. b + c]
 const VT_FORALL: u64 = 4;     // (forall ((a Int)) b)
 const VT_LAMBDA: u64 = 5;     // (lambda ((a Int)) b)
+const VT_FORALLP: u64 = 6;    // (forall ((a Int)) (! b :pattern (p) :pattern (q))), p and q targs[c], targs[c + 1]
 
 const OP_ADD: u64 = 1;
 const OP_SUB: u64 = 2;
@@ -46,6 +47,7 @@ const OP_IMP: u64 = 14;
 const OP_ITE: u64 = 15;
 const OP_SELECT: u64 = 16;
 const OP_STORE: u64 = 17;
+const OP_CNT: u64 = 18;       // vcount: (cnt elements length value)
 
 // Sorts: Int or Bool, under `depth` levels of (Array Int ..): base + 2 * depth.
 const SO_INT: u64 = 0;
@@ -71,6 +73,7 @@ const CMD_PUSH: u64 = 3;
 const CMD_POP: u64 = 4;
 const CMD_CHECK: u64 = 5;
 const CMD_FAIL: u64 = 6;      // not sent: a failure found without the solver (obls says which)
+const CMD_RAW: u64 = 7;       // the text of atom a
 
 /// Largest element count `alloc` accepts (2^60).
 const ALLOC_MAX: u64 = 1152921504606846976;
@@ -163,6 +166,10 @@ struct Vr {
   cur: u64,
   /// The instance being verified, for reading the types written in it.
   env: u64,
+  /// The function definitions whose proofs can mention `vcount` (see
+  /// `count_gate`), and whether the one being verified is one of them.
+  cnt_fns: Vec[u64],
+  counts: bool,
   /// Every function's summaries, grouped by instance: rows
   /// sum_start[x] .. sum_start[x] + sum_n[x] are instance x's.
   sums: Vec[SumRow],
@@ -206,7 +213,7 @@ fn vr_new(m: &mut Mono, p: &Parser) -> Vr {
   vec_push(&mut vals, Vl { kind: 0, ty: 0, a: 0, b: 0, c: 0, n: 0 });
   let mut v = Vr {
     pool: vec_new[u64](), tms: tms, targs: vec_new[u64](), vals: vals, kids: vec_new[u64](),
-    log: vec_new[Cmd](), counter: 0, obligations: 0, box_depth: 0, cur: 0, env: 0,
+    log: vec_new[Cmd](), counter: 0, obligations: 0, box_depth: 0, cur: 0, env: 0, cnt_fns: vec_new[u64](), counts: false,
     sums: vec_new[SumRow](), obls: vec_new[Obl](), snaps: vec_new[Bind](), sum_start: vec_new[u64](), sum_n: vec_new[u64](),
     t_true: 0, t_false: 0, t_zero: 0, t_u64max: 0, t_allocmax: 0, t_flimit: 0, t_plimit: 0, t_mmio_lo: 0, t_mmio_hi: 0, t_poolsize: 0,
     t_zarr: 0, t_nobool: 0, t_k: 0, t_255: 0, unit: 0,
@@ -238,6 +245,7 @@ fn vr_free(v: Vr) {
   vec_free(v.vals);
   vec_free(v.kids);
   vec_free(v.log);
+  vec_free(v.cnt_fns);
   vec_free(v.sums);
   vec_free(v.sum_start);
   vec_free(v.sum_n);
@@ -546,6 +554,194 @@ fn targ(v: &Vr, t: u64, k: u64) -> u64 {
 /// (forall ((q Int)) body)
 fn forall_tm(v: &mut Vr, q: u64, body: u64) -> u64 {
   return new_tm(&mut v, VT_FORALL, q, body, 0);
+}
+
+// ---- Counting (`vcount`) ----
+
+/// `vcount(v, x)` is `(cnt a n x)` over the vector's element array `a` and
+/// length `n`. These facts about it hold for every array and length; each
+/// is a theorem about finite sequences, proved by induction on `n` outside
+/// the solver, so they are part of the trusted base (docs/trusted-base.md).
+/// `cnt_w` names an index where a counted value is. As stage0's
+/// COUNT_LEMMAS.
+fn count_lemmas(v: &mut Vr) {
+  let l0 = atom_str(&mut v, "(declare-fun cnt ((Array Int Int) Int Int) Int)");
+  send(&mut v, CMD_RAW, l0, 0);
+  let l1 = atom_str(&mut v, "(declare-fun cnt_w ((Array Int Int) Int Int) Int)");
+  send(&mut v, CMD_RAW, l1, 0);
+  // A0: a count is between 0 and the length.
+  let a0 = atom_str(&mut v, "(assert (forall ((a (Array Int Int)) (n Int) (x Int)) (! (=> (<= 0 n) (and (<= 0 (cnt a n x)) (<= (cnt a n x) n))) :pattern ((cnt a n x)))))");
+  send(&mut v, CMD_RAW, a0, 0);
+  // A1: an element is counted.
+  let a1 = atom_str(&mut v, "(assert (forall ((a (Array Int Int)) (n Int) (i Int)) (! (=> (and (<= 0 i) (< i n)) (<= 1 (cnt a n (select a i)))) :pattern ((cnt a n (select a i))))))");
+  send(&mut v, CMD_RAW, a1, 0);
+  // A2: a counted value is an element.
+  let a2 = atom_str(&mut v, "(assert (forall ((a (Array Int Int)) (n Int) (x Int)) (! (=> (<= 1 (cnt a n x)) (and (<= 0 (cnt_w a n x)) (< (cnt_w a n x) n) (= (select a (cnt_w a n x)) x))) :pattern ((cnt a n x)))))");
+  send(&mut v, CMD_RAW, a2, 0);
+}
+
+/// `(ite (= y x) 1 0)`: 1 when y is the counted value `x`.
+fn count_one(v: &mut Vr, y: u64) -> u64 {
+  let x = atom_str(&mut v, "x");
+  let eq = app2(&mut v, OP_EQ, y, x);
+  let one = num(&mut v, 1);
+  return app3(&mut v, OP_ITE, eq, one, v.t_zero);
+}
+
+/// How a vector operation changes every count: `(cnt a2 n2 x)` is
+/// `(cnt a n x)` plus `delta` (a term over `x`), triggered by either count.
+fn count_step(v: &mut Vr, a2: u64, n2: u64, a: u64, n: u64, delta: u64) -> u64 {
+  let x = atom_str(&mut v, "x");
+  let c2 = app3(&mut v, OP_CNT, a2, n2, x);
+  let c1 = app3(&mut v, OP_CNT, a, n, x);
+  let sum = app2(&mut v, OP_ADD, c1, delta);
+  let eq = app2(&mut v, OP_EQ, c2, sum);
+  let start = vec_len(v.targs);
+  vec_push(&mut v.targs, c2);
+  vec_push(&mut v.targs, c1);
+  return new_tm(&mut v, VT_FORALLP, x, eq, start);
+}
+
+/// Does node `i` (an expression) call `vcount`, or name a spec fn or
+/// function in `defs` (definitions whose specifications count)? As
+/// stage0's `mentions_count`.
+fn mentions_count(m: &Mono, p: &Parser, i: u64, defs: &Vec[u64]) -> bool {
+  if i == 0 {
+    return false;
+  }
+  let n = node_at(p.nodes, i);
+  let k = n.kind;
+  if k == E_CALL {
+    if name_is(p, i, "vcount") || has_u(defs, find_in(p, p.specs.head, i)) || has_u(defs, find_fn(p, i)) {
+      return true;
+    }
+    return mentions_list(m, p, n.a, defs);
+  }
+  if k == E_VAR {
+    return has_u(defs, find_in(p, p.specs.head, i)) || has_u(defs, find_fn(p, i));
+  }
+  if k == E_TAPP {
+    // A generic instance: it counts when its definition does.
+    if kind_of(p, n.b) == E_CALL {
+      if !is_typed_builtin(p, n.b) && has_u(defs, tapp_def(p, n.b)) {
+        return true;
+      }
+      let inner = node_at(p.nodes, n.b);
+      return mentions_list(m, p, inner.a, defs);
+    }
+    return mentions_count(m, p, n.b, defs);
+  }
+  if k == E_FIELD || k == E_IS || k == E_NOT || k == E_NEG || k == E_FORALL || k == E_VARIANT {
+    return mentions_count(m, p, n.a, defs);
+  }
+  if k == E_SLIT {
+    let mut f = n.a;
+    while f != 0 {
+      let fi = node_at(p.nodes, f);
+      if mentions_count(m, p, fi.a, defs) {
+        return true;
+      }
+      f = fi.next;
+    }
+    return false;
+  }
+  if k == E_BIN {
+    return mentions_count(m, p, n.a, defs) || mentions_count(m, p, n.b, defs);
+  }
+  return false;
+}
+
+fn mentions_list(m: &Mono, p: &Parser, head: u64, defs: &Vec[u64]) -> bool {
+  let mut k = head;
+  while k != 0 {
+    if mentions_count(m, p, k, defs) {
+      return true;
+    }
+    k = next_of(p, k);
+  }
+  return false;
+}
+
+fn block_mentions_count(m: &Mono, p: &Parser, head: u64, defs: &Vec[u64]) -> bool {
+  let mut k = head;
+  while k != 0 {
+    let n = node_at(p.nodes, k);
+    let sk = n.kind;
+    if sk == S_LET || sk == S_ASSIGN {
+      if mentions_count(m, p, n.b, defs) {
+        return true;
+      }
+    } else if sk == S_IF {
+      if mentions_count(m, p, n.a, defs) || block_mentions_count(m, p, n.b, defs) || block_mentions_count(m, p, n.c, defs) {
+        return true;
+      }
+    } else if sk == S_WHILE {
+      if mentions_count(m, p, n.a, defs) || mentions_list(m, p, n.b, defs) || block_mentions_count(m, p, n.c, defs) {
+        return true;
+      }
+    } else if sk == S_RETURN || sk == S_ASSERT || sk == S_EXPR {
+      if mentions_count(m, p, n.a, defs) {
+        return true;
+      }
+    } else if sk == S_MATCH {
+      if mentions_count(m, p, n.a, defs) {
+        return true;
+      }
+      let mut a = n.b;
+      while a != 0 {
+        let arm = node_at(p.nodes, a);
+        if block_mentions_count(m, p, arm.c, defs) {
+          return true;
+        }
+        a = arm.next;
+      }
+    }
+    k = n.next;
+  }
+  return false;
+}
+
+/// Fills `cnt_fns`: the functions whose own contract, loop invariants or
+/// assertions use `vcount` (directly or through spec fns), or that call a
+/// function whose contract does; every function when a struct invariant
+/// counts. As stage0's `counting_fns`, by definition rather than instance
+/// (the instances of one definition all count or all do not).
+fn count_gate(v: &mut Vr, m: &Mono, p: &Parser) {
+  let mut defs = vec_new[u64]();
+  let mut k = p.specs.head;
+  while k != 0 {
+    let n = node_at(p.nodes, k);
+    if mentions_count(m, p, n.c, defs) {
+      vec_push(&mut defs, k);
+    }
+    k = n.next;
+  }
+  let mut all = false;
+  k = p.structs.head;
+  while k != 0 {
+    let n = node_at(p.nodes, k);
+    if n.kind == D_STRUCT && mentions_list(m, p, n.b, defs) {
+      all = true;
+    }
+    k = n.next;
+  }
+  k = p.fns.head;
+  while k != 0 {
+    let n = node_at(p.nodes, k);
+    if mentions_list(m, p, n.c, defs) || mentions_list(m, p, n.d, defs) {
+      vec_push(&mut defs, k);
+    }
+    k = n.next;
+  }
+  k = p.fns.head;
+  while k != 0 {
+    let n = node_at(p.nodes, k);
+    if all || has_u(defs, k) || block_mentions_count(m, p, n.x, defs) {
+      vec_push(&mut v.cnt_fns, k);
+    }
+    k = n.next;
+  }
+  vec_free(defs);
 }
 
 /// (lambda ((q Int)) body)
@@ -859,6 +1055,7 @@ fn out_op(out: &mut Vec[u64], op: u64) {
   else if op == OP_ITE { out_str(&mut out, "ite"); }
   else if op == OP_SELECT { out_str(&mut out, "select"); }
   else if op == OP_STORE { out_str(&mut out, "store"); }
+  else if op == OP_CNT { out_str(&mut out, "cnt"); }
 }
 
 fn out_tm(out: &mut Vec[u64], v: &Vr, t: u64) {
@@ -891,6 +1088,16 @@ fn out_tm(out: &mut Vec[u64], v: &Vr, t: u64) {
     out_str(&mut out, " Int)) ");
     out_tm(&mut out, v, x.b);
     out_str(&mut out, ")");
+  } else if x.kind == VT_FORALLP {
+    out_str(&mut out, "(forall ((");
+    out_tm(&mut out, v, x.a);
+    out_str(&mut out, " Int)) (! ");
+    out_tm(&mut out, v, x.b);
+    out_str(&mut out, " :pattern (");
+    out_tm(&mut out, v, u_at(v.targs, x.c));
+    out_str(&mut out, ") :pattern (");
+    out_tm(&mut out, v, u_at(v.targs, vadd(x.c, 1)));
+    out_str(&mut out, ")))");
   }
 }
 
@@ -926,6 +1133,9 @@ fn out_cmd(out: &mut Vec[u64], v: &Vr, cmd: Cmd) {
     out_str(&mut out, "(assert ");
     out_tm(&mut out, v, cmd.a);
     out_str(&mut out, ")\n");
+  } else if cmd.kind == CMD_RAW {
+    out_tm(&mut out, v, cmd.a);
+    out_str(&mut out, "\n");
   } else if cmd.kind == CMD_PUSH {
     out_str(&mut out, "(push 1)\n");
   } else if cmd.kind == CMD_POP {
@@ -2282,6 +2492,13 @@ fn spec_tm(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env: &Vec[
   if k == E_CALL {
     return vspec_call(&mut v, c, &mut m, p, i, env, oenv, has_old, res, &mut bound);
   }
+  if k == E_TAPP {
+    // An instance of a generic spec fn: the only type application a checked
+    // specification has.
+    let x = tapp_inst(&mut m, p, i, v.env);
+    let xi = inst_at(m, x);
+    return vspec_expand(&mut v, c, &mut m, p, n.b, xi.def, x, env, oenv, has_old, res, &mut bound);
+  }
   return v.t_false;
 }
 
@@ -2309,32 +2526,58 @@ fn vspec_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env: &V
   }
   let sf = vspec_def(p, n.s, n.e);
   if sf != 0 {
-    let sd = node_at(p.nodes, sf);
-    let mut senv = vec_new[Bind]();
-    let mut q = sd.a;
-    let mut a = n.a;
-    while q != 0 && a != 0 {
-      let qn = node_at(p.nodes, q);
-      let pt = base_t(m, conv(&mut m, p, qn.a, 0, q));
-      let mut x = 0;
-      if is_int(m, pt) {
-        let t = spec_tm(&mut v, c, &mut m, p, a, env, oenv, has_old, res, &mut bound);
-        x = mk_u(&mut v, t);
-      } else if kind_t(m, pt) == TY_BOOL {
-        let t = spec_tm(&mut v, c, &mut m, p, a, env, oenv, has_old, res, &mut bound);
-        x = mk_b(&mut v, t);
-      } else {
-        x = spec_val(&mut v, c, &mut m, p, a, env, oenv, has_old, res, &mut bound);
-      }
-      env_put(&mut senv, p, qn.s, qn.e, x);
-      q = qn.next;
-      a = next_of(p, a);
+    return vspec_expand(&mut v, c, &mut m, p, i, sf, 0, env, oenv, has_old, res, &mut bound);
+  }
+  return vspec_builtin(&mut v, c, &mut m, p, i, env, oenv, has_old, res, &mut bound);
+}
+
+/// Call `i` of spec fn `sf` (instance `x` of it, or 0 for a plain one),
+/// expanded in place.
+fn vspec_expand(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, sf: u64, x: u64, env: &Vec[Bind], oenv: &Vec[Bind], has_old: bool, res: u64, bound: &mut Vec[Bnd]) -> u64 {
+  let n = node_at(p.nodes, i);
+  let sd = node_at(p.nodes, sf);
+  let mut senv = vec_new[Bind]();
+  let mut q = sd.a;
+  let mut a = n.a;
+  while q != 0 && a != 0 {
+    let qn = node_at(p.nodes, q);
+    let pt = base_t(m, conv(&mut m, p, qn.a, x, q));
+    let mut y = 0;
+    if is_int(m, pt) {
+      let t = spec_tm(&mut v, c, &mut m, p, a, env, oenv, has_old, res, &mut bound);
+      y = mk_u(&mut v, t);
+    } else if kind_t(m, pt) == TY_BOOL {
+      let t = spec_tm(&mut v, c, &mut m, p, a, env, oenv, has_old, res, &mut bound);
+      y = mk_b(&mut v, t);
+    } else {
+      y = spec_val(&mut v, c, &mut m, p, a, env, oenv, has_old, res, &mut bound);
     }
-    let mut sb = vec_new[Bnd]();
-    let r = spec_tm(&mut v, c, &mut m, p, sd.c, senv, senv, false, 0, &mut sb);
-    vec_free(sb);
-    vec_free(senv);
-    return r;
+    env_put(&mut senv, p, qn.s, qn.e, y);
+    q = qn.next;
+    a = next_of(p, a);
+  }
+  // Type applications in an instance's body are read in that instance.
+  let outer = v.env;
+  if x != 0 {
+    v.env = x;
+  }
+  let mut sb = vec_new[Bnd]();
+  let r = spec_tm(&mut v, c, &mut m, p, sd.c, senv, senv, false, 0, &mut sb);
+  v.env = outer;
+  vec_free(sb);
+  vec_free(senv);
+  return r;
+}
+
+/// A call `i` of a ghost builtin in a specification.
+fn vspec_builtin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env: &Vec[Bind], oenv: &Vec[Bind], has_old: bool, res: u64, bound: &mut Vec[Bnd]) -> u64 {
+  let n = node_at(p.nodes, i);
+  if span_is(p, n.s, n.e, "vcount") {
+    let vx = spec_val(&mut v, c, &mut m, p, n.a, env, oenv, has_old, res, &mut bound);
+    let xv = vl_at(v, vx);
+    let el = vl_at(v, xv.b);
+    let t = spec_tm(&mut v, c, &mut m, p, arg_node(p, i, 1), env, oenv, has_old, res, &mut bound);
+    return app3(&mut v, OP_CNT, el.a, xv.a, t);
   }
   if span_is(p, n.s, n.e, "vget") {
     let x = spec_val(&mut v, c, &mut m, p, i, env, oenv, has_old, res, &mut bound);
@@ -3362,6 +3605,13 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     let el = vec_write(&mut v, m, a0.b, a0.a, x1);
     let one = num(&mut v, 1);
     let nl = app2(&mut v, OP_ADD, a0.a, one);
+    let ea = vl_at(v, a0.b);
+    let eb = vl_at(v, el);
+    if v.counts && ea.kind == VV_U && eb.kind == VV_U {
+      let d = count_one(&mut v, term(v, x1));
+      let f = count_step(&mut v, eb.a, nl, ea.a, a0.a, d);
+      vec_push(&mut st.pc, f);
+    }
     let nv = mk(&mut v, VV_VEC, a0.ty, nl, el, 0, 0);
     put_back(&mut v, m, p, &mut st, u_at(args, 0), nv);
     return v.unit;
@@ -3371,6 +3621,14 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     prove(&mut v, st, g, i, VC_BOUNDS);
     let one = num(&mut v, 1);
     let last = app2(&mut v, OP_SUB, a0.a, one);
+    let ea = vl_at(v, a0.b);
+    if v.counts && ea.kind == VV_U {
+      let y = app2(&mut v, OP_SELECT, ea.a, last);
+      let d1 = count_one(&mut v, y);
+      let d = app1(&mut v, OP_SUB, d1);
+      let f = count_step(&mut v, ea.a, last, ea.a, a0.a, d);
+      vec_push(&mut st.pc, f);
+    }
     let r = vec_read(&mut v, c, m, p, a0.ty, a0.b, last, &mut st);
     let nv = mk(&mut v, VV_VEC, a0.ty, last, a0.b, 0, 0);
     put_back(&mut v, m, p, &mut st, u_at(args, 0), nv);
@@ -3386,6 +3644,16 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     }
     if !name_is(p, i, "vec_get") {
       let el = vec_write(&mut v, m, a0.b, ix, x2);
+      let ea = vl_at(v, a0.b);
+      let eb = vl_at(v, el);
+      if v.counts && ea.kind == VV_U && eb.kind == VV_U {
+        let din = count_one(&mut v, term(v, x2));
+        let y = app2(&mut v, OP_SELECT, ea.a, ix);
+        let dout = count_one(&mut v, y);
+        let d = app2(&mut v, OP_SUB, din, dout);
+        let f = count_step(&mut v, eb.a, a0.a, ea.a, a0.a, d);
+        vec_push(&mut st.pc, f);
+      }
       let nv = mk(&mut v, VV_VEC, a0.ty, a0.a, el, 0, 0);
       put_back(&mut v, m, p, &mut st, u_at(args, 0), nv);
     }
@@ -4613,6 +4881,10 @@ fn verify_fn(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
   let xi = inst_at(m, x);
   let d = node_at(p.nodes, xi.def);
   v.env = x;
+  v.counts = has_u(v.cnt_fns, xi.def);
+  if v.counts {
+    count_lemmas(&mut v);
+  }
   let mut env = vec_new[Bind]();
   let mut q = d.a;
   while q != 0 {
@@ -4719,6 +4991,7 @@ fn buffers_kept(v: &mut Vr, m: &mut Mono, p: &Parser, x: u64) {
 
 fn verify_program(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
   summarize(&mut v, c, &mut m, p);
+  count_gate(&mut v, m, p);
   send(&mut v, CMD_DECL, v.t_poolsize, SO_INT);
   let r = in_range(&mut v, v.t_zero, v.t_poolsize, v.t_flimit);
   assert_tm(&mut v, r);

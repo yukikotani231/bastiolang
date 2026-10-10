@@ -10,30 +10,39 @@ spec fn sorted(v: &Vec[u64]) -> bool {
   sorted_upto(v, vlen(v))
 }
 
+/// `a` and `b` hold the same elements, each as many times: one is a
+/// permutation of the other.
+spec fn same_elems(a: &Vec[u64], b: &Vec[u64]) -> bool {
+  vlen(a) == vlen(b) && forall x: u64 :: vcount(a, x) == vcount(b, x)
+}
+
 /// Sorts `v` in ascending order (insertion sort: fast for short or nearly
-/// sorted vectors, quadratic in the worst case). That the result is a
-/// permutation of the input is not stated: see docs/core.md, "Gaps".
+/// sorted vectors, quadratic in the worst case). The result is proved
+/// sorted and a permutation of the input.
 fn sort_u64(v: &mut Vec[u64])
-  ensures vlen(v) == vlen(old(v)) && sorted(v)
+  ensures same_elems(v, old(v)) && sorted(v)
 {
   let n = vec_len(v);
   let mut i = 1;
   while i < n
     invariant 1 <= i && vlen(v) == n && (n > 0 ==> i <= n) && sorted_upto(v, i)
+    invariant same_elems(v, old(v))
   {
-    let x = vec_get(v, i);
+    // Move element i down by swaps until the one before it is not larger.
     let mut j = i;
-    while j > 0 && vec_get(v, j - 1) > x
-      invariant j <= i && vlen(v) == n
+    while j > 0 && vec_get(v, j - 1) > vec_get(v, j)
+      invariant j <= i && i < n && vlen(v) == n
+      invariant same_elems(v, old(v))
       invariant forall a: u64 :: forall b: u64 :: a < b && b < j ==> vget(v, a) <= vget(v, b)
       invariant forall a: u64 :: forall b: u64 :: j < a && a < b && b <= i ==> vget(v, a) <= vget(v, b)
-      invariant forall a: u64 :: j < a && a <= i ==> vget(v, a) > x
+      invariant forall a: u64 :: j < a && a <= i ==> vget(v, a) > vget(v, j)
       invariant j > 0 && j < i ==> vget(v, j - 1) <= vget(v, j + 1)
     {
-      vec_set(&mut v, j, vec_get(v, j - 1));
+      let below = vec_get(v, j - 1);
+      let here = vec_swap(&mut v, j, below);
+      vec_set(&mut v, j - 1, here);
       j = j - 1;
     }
-    vec_set(&mut v, j, x);
     i = i + 1;
   }
 }

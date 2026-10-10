@@ -1665,8 +1665,22 @@ pub fn trusted_base() -> String {
     for a in EXPORT_ASSUMPTIONS {
         out.push_str(&format!("export assumes {}\n", a));
     }
+    for l in COUNT_FACTS {
+        out.push_str(&format!("lemma vcount: {}\n", l));
+    }
     out
 }
+
+/// What the verifier assumes about `vcount` (COUNT_LEMMAS and `count_step`
+/// in verify.rs), in words: theorems about finite sequences, proved by
+/// induction outside the solver.
+const COUNT_FACTS: [&str; 5] = [
+    "a count is between 0 and the length",
+    "an element at an index below the length is counted at least once",
+    "a value counted at least once is the element at some index below the length",
+    "vec_push of y adds one to the count of y; vec_pop takes one from the count of the last element",
+    "vec_set and vec_swap of y at i take one from the count of the element at i and add one to the count of y",
+];
 
 /// What the proofs of an `export fn` assume about its C caller. Nothing
 /// checks these at run time; the header states them (HEADER_NOTES).
