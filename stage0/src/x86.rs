@@ -20,6 +20,7 @@
 // Data layout: every value is a sequence of 8-byte words.
 //   integers, bool, capability tokens, Box (a pointer), &mut T (a pointer): 1 word
 //   Buf, Bytes, Str: { len, data }       Vec[T]: { len, cap, data }
+//   Frame, PageTable: a page's address   Pool: { base, size }
 //   struct: its fields in order          enum: a tag word, then the payload
 //   ()  : no words                       &T  : a copy of the T
 //
@@ -46,8 +47,9 @@ use std::collections::{HashMap, HashSet};
 fn words(t: &Type) -> Result<usize, String> {
     Ok(match t {
         Type::Unit => 0,
-        Type::U64 | Type::U8 | Type::U16 | Type::U32 | Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Bool | Type::Serial | Type::Box(_) | Type::MutRef(_) => 1,
-        Type::Buf | Type::Bytes | Type::Str => 2,
+        Type::U64 | Type::U8 | Type::U16 | Type::U32 | Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Bool | Type::Serial | Type::Host => 1,
+        Type::Frame | Type::PageTable | Type::Box(_) | Type::MutRef(_) => 1,
+        Type::Buf | Type::Bytes | Type::Str | Type::Pool => 2,
         Type::Vec(_) => 3,
         Type::Ref(t) => words(t)?,
         Type::Struct(n) => {
@@ -251,26 +253,45 @@ pub fn emit(p: &Program) -> R<String> {
 /// for, calls it, and returns its result as the exit status.
 fn entry(p: &Program) -> R<String> {
     let main = p.fns.iter().find(|f| f.name == "main").expect("checked");
-    let mut s = String::from("\t.globl main\nmain:\n\tpush %rbp\n\tmov %rsp, %rbp\n\tsub $64, %rsp\n");
-    for (i, prm) in main.params.iter().enumerate() {
-        match &prm.ty {
-            Type::Serial => s.push_str("\tpushq $0\n"),
-            Type::MutRef(t) | Type::Ref(t) if **t == Type::Serial => {
-                s.push_str(&format!("\tmovq $0, -{}(%rbp)\n", 8 * (i + 1)));
-                if prm.ty.is_mut_ref() {
-                    s.push_str(&format!("\tlea -{}(%rbp), %rax\n\tpush %rax\n", 8 * (i + 1)));
-                } else {
-                    s.push_str("\tpushq $0\n");
-                }
-            }
+    let mut s = String::from("\t.globl main\nmain:\n\tpush %rbp\n\tmov %rsp, %rbp\n\tpush %rbx\n\tsub $72, %rsp\n");
+    s.push_str("\tmov %edi, bst_rt_argc(%rip)\n\tmov %rsi, bst_rt_argv(%rip)\n");
+    // Each capability lives in a frame slot below the saved %rbx; `main`
+    // gets it by value or by address.
+    let mut off = 8;
+    let mut pool = None;
+    for prm in &main.params {
+        let t = prm.ty.base();
+        let n = match t {
+            Type::Serial | Type::Host => 1,
+            Type::Pool => 2,
             t => return Err(format!("the native backend does not support a `main` parameter of type {} yet", t.name())),
+        };
+        off += 8 * n;
+        if *t == Type::Pool {
+            s.push_str(&format!("\tcall bst_rt_pool_init\n\tmov %rax, -{}(%rbp)\n\tmov %rdx, -{}(%rbp)\n", off, off - 8));
+            pool = Some(off);
+        } else {
+            s.push_str(&format!("\tmovq $0, -{}(%rbp)\n", off));
         }
+        if prm.ty.is_mut_ref() {
+            s.push_str(&format!("\tlea -{}(%rbp), %rax\n\tpush %rax\n", off));
+        } else {
+            for i in (0..n).rev() {
+                s.push_str(&format!("\tpush -{}(%rbp)\n", off - 8 * i));
+            }
+        }
+    }
+    if off > 64 {
+        return Err("the native backend does not support so many `main` parameters yet".into());
     }
     s.push_str(&format!("\tcall {}\n", sym("main")));
     if main.ret != Type::U64 {
         s.push_str("\txor %eax, %eax\n");
     }
-    s.push_str("\tleave\n\tret\n\n");
+    if let Some(o) = pool {
+        s.push_str(&format!("\tmov %rax, %rbx\n\tmov -{}(%rbp), %rdi\n\tcall bst_rt_free\n\tmov %rbx, %rax\n", o));
+    }
+    s.push_str("\tmov -8(%rbp), %rbx\n\tleave\n\tret\n\n");
     Ok(s)
 }
 
@@ -1338,6 +1359,93 @@ impl<'a> Gen<'a> {
                 self.emit("call bst_rt_putc");
             }
             "serial_read" => self.emit("call bst_rt_getc"),
+            // Physical pages, simulated with heap memory (as in the C
+            // prelude): a Frame or PageTable is the page's address.
+            // The Host capability: command-line arguments and whole files.
+            "host_argc" => {
+                self.to_regs(args, &["%rdx"])?;
+                self.emit("movslq bst_rt_argc(%rip), %rax");
+            }
+            "host_arg" => {
+                self.to_regs(args, &["%rdx", "%rdi"])?;
+                self.emit("call bst_rt_host_arg");
+                self.push("%rax");
+                self.push("%rdx");
+            }
+            "host_read" => {
+                self.to_regs(args, &["%rcx", "%rdi", "%rsi", "%rdx"])?;
+                self.emit("call bst_rt_host_read");
+            }
+            "host_write" => {
+                self.to_regs(args, &["%r8", "%rdi", "%rsi", "%rdx", "%rcx"])?;
+                self.emit("call bst_rt_host_write");
+            }
+            "pool_size" => {
+                let p = place(&args[0]).expect("checked: a pool variable");
+                let (loc, _) = self.place(&p);
+                self.emit(&format!("mov {}, %rax", loc.op(1)));
+            }
+            "pool_take" | "pt_new" => {
+                // A page is zeroed whenever it is handed out, so it never
+                // leaks what it held before.
+                if name == "pool_take" {
+                    self.to_regs(args, &["%rdx", "%rax"])?;
+                    self.emit("shl $12, %rax");
+                    self.emit("add (%rdx), %rax");
+                } else {
+                    self.to_regs(args, &["%rax", "%rdx"])?;
+                }
+                self.emit("mov %rax, %rdx");
+                self.emit("mov %rax, %rdi");
+                self.emit("mov $512, %ecx");
+                self.emit("xor %eax, %eax");
+                self.emit("rep stosq");
+                self.emit("mov %rdx, %rax");
+            }
+            "pool_give" => self.to_regs(args, &["%rdx", "%rax"])?,
+            "pt_free" => self.to_regs(args, &["%rax"])?,
+            "frame_id" => {
+                self.to_regs(args, &["%rax"])?;
+                self.emit("sub bst_rt_pool_base(%rip), %rax");
+                self.emit("shr $12, %rax");
+            }
+            "frame_read" | "frame_read8" => {
+                self.to_regs(args, &["%rdx", "%rax"])?;
+                self.emit(if name == "frame_read" { "mov (%rdx,%rax,8), %rax" } else { "movzbl (%rdx,%rax), %eax" });
+            }
+            "frame_write" | "frame_write8" => {
+                self.to_regs(args, &["%rdx", "%rcx", "%rax"])?;
+                self.emit("mov (%rdx), %rdx");
+                self.emit(if name == "frame_write" { "mov %rax, (%rdx,%rcx,8)" } else { "mov %al, (%rdx,%rcx)" });
+            }
+            "pt_has" => {
+                self.to_regs(args, &["%rdx", "%rax"])?;
+                self.emit("mov (%rdx,%rax,8), %rax");
+                self.emit("and $1, %eax");
+            }
+            "pt_put" | "pt_put_frame" => {
+                // Present, user, and writable (a frame only when asked).
+                if name == "pt_put" {
+                    self.to_regs(args, &["%rdx", "%rcx", "%rax"])?;
+                    self.emit("or $7, %rax");
+                } else {
+                    self.to_regs(args, &["%rdx", "%rcx", "%rax", "%rsi"])?;
+                    self.emit("shl $1, %rsi");
+                    self.emit("or %rsi, %rax");
+                    self.emit("or $5, %rax");
+                }
+                self.emit("mov (%rdx), %rdx");
+                self.emit("mov %rax, (%rdx,%rcx,8)");
+            }
+            "pt_take" | "pt_take_frame" => {
+                self.to_regs(args, &["%rdx", "%rcx"])?;
+                self.emit("mov (%rdx), %rdx");
+                self.emit("lea (%rdx,%rcx,8), %rdx");
+                self.emit("mov (%rdx), %rax");
+                self.emit("movq $0, (%rdx)");
+                self.emit("movabs $0x000FFFFFFFFFF000, %rcx");
+                self.emit("and %rcx, %rax");
+            }
 
             "box" => {
                 let t = self.type_of(&args[0]);
@@ -1450,6 +1558,19 @@ impl<'a> Gen<'a> {
                 self.emit("call bst_rt_free");
             }
             _ => return Err(format!("the native backend does not support `{}` yet", name)),
+        }
+        Ok(())
+    }
+
+    /// Evaluates the arguments left to right, then loads their words into
+    /// `regs`, in order (a two-word argument takes its data word, then its
+    /// length).
+    fn to_regs(&mut self, args: &[Expr], regs: &[&str]) -> R<()> {
+        for a in args {
+            self.arg(a)?;
+        }
+        for r in regs.iter().rev() {
+            self.pop(r);
         }
         Ok(())
     }
@@ -1591,6 +1712,189 @@ bst_rt_bfrom:                   # Bytes copied from the %rdi bytes at %rsi: %rax
 	mov -16(%rbp), %r12
 	leave
 	ret
+bst_rt_host_arg:                # argument %rdi as Bytes: %rax = data, %rdx = len
+	push %rbp
+	mov %rsp, %rbp
+	push %rbx
+	push %r12
+	and $-16, %rsp
+	movslq bst_rt_argc(%rip), %rax
+	cmp %rax, %rdi
+	jb 1f
+	xor %edi, %edi              # past the end: empty
+	call bst_rt_balloc
+	xor %edx, %edx
+	jmp 2f
+1:	mov bst_rt_argv(%rip), %rax
+	mov (%rax,%rdi,8), %rbx
+	mov %rbx, %rdi
+	call strlen@PLT
+	mov %rax, %r12
+	mov %rax, %rdi
+	call bst_rt_balloc
+	mov %rax, %rdi
+	mov %rbx, %rsi
+	mov %r12, %rcx
+	rep movsb
+	mov %r12, %rdx
+2:	mov -8(%rbp), %rbx
+	mov -16(%rbp), %r12
+	leave
+	ret
+bst_rt_cpath:                   # NUL-terminated copy of the %rsi bytes at %rdi (a NUL inside ends the path)
+	push %rbp
+	mov %rsp, %rbp
+	push %rbx
+	push %r12
+	and $-16, %rsp
+	mov %rdi, %rbx
+	mov %rsi, %r12
+	lea 1(%rsi), %rdi
+	call malloc@PLT
+	test %rax, %rax
+	jz bst_rt_oom
+	mov %rax, %rdi
+	mov %rbx, %rsi
+	mov %r12, %rcx
+	rep movsb
+	movb $0, (%rdi)
+	mov -8(%rbp), %rbx
+	mov -16(%rbp), %r12
+	leave
+	ret
+bst_rt_host_read:               # read the file named by %rdi/%rsi into the Bytes at (%rdx); %rax = 1 if it worked
+	push %rbp
+	mov %rsp, %rbp
+	push %rbx
+	push %r12
+	push %r13
+	push %r14
+	push %r15
+	and $-16, %rsp
+	mov %rdx, %rbx
+	call bst_rt_cpath
+	mov %rax, %r13
+	mov %rax, %rdi
+	xor %esi, %esi              # O_RDONLY
+	xor %eax, %eax
+	call open@PLT
+	movslq %eax, %r12
+	mov %r13, %rdi
+	call free@PLT
+	test %r12, %r12
+	js 8f
+	mov $4096, %r15d            # capacity, doubled when full
+	mov %r15, %rdi
+	call malloc@PLT
+	test %rax, %rax
+	jz bst_rt_oom
+	mov %rax, %r13
+	xor %r14d, %r14d            # bytes read
+1:	mov %r12, %rdi
+	lea (%r13,%r14), %rsi
+	mov %r15, %rdx
+	sub %r14, %rdx
+	call read@PLT
+	test %rax, %rax
+	js 3f
+	jz 4f
+	add %rax, %r14
+	cmp %r15, %r14
+	jne 1b
+	add %r15, %r15
+	mov %r13, %rdi
+	mov %r15, %rsi
+	call realloc@PLT
+	test %rax, %rax
+	jz bst_rt_oom
+	mov %rax, %r13
+	jmp 1b
+3:	mov %r12, %rdi              # a read error: nothing changes
+	call close@PLT
+	mov %r13, %rdi
+	call free@PLT
+	jmp 8f
+4:	mov %r12, %rdi
+	call close@PLT
+	mov 8(%rbx), %rdi           # replace the old contents
+	call free@PLT
+	mov %r14, (%rbx)
+	mov %r13, 8(%rbx)
+	mov $1, %eax
+	jmp 9f
+8:	xor %eax, %eax
+9:	mov -8(%rbp), %rbx
+	mov -16(%rbp), %r12
+	mov -24(%rbp), %r13
+	mov -32(%rbp), %r14
+	mov -40(%rbp), %r15
+	leave
+	ret
+bst_rt_host_write:              # write the %rcx bytes at %rdx to the file named by %rdi/%rsi; %rax = 1 if it worked
+	push %rbp
+	mov %rsp, %rbp
+	push %rbx
+	push %r12
+	push %r13
+	push %r14
+	push %r15
+	and $-16, %rsp
+	mov %rdx, %rbx
+	mov %rcx, %r14
+	call bst_rt_cpath
+	mov %rax, %r13
+	mov %rax, %rdi
+	mov $0x241, %esi            # O_WRONLY | O_CREAT | O_TRUNC
+	mov $0666, %edx
+	xor %eax, %eax
+	call open@PLT
+	movslq %eax, %r12
+	mov %r13, %rdi
+	call free@PLT
+	test %r12, %r12
+	js 8f
+	xor %r15d, %r15d            # bytes written
+1:	cmp %r14, %r15
+	jae 4f
+	mov %r12, %rdi
+	lea (%rbx,%r15), %rsi
+	mov %r14, %rdx
+	sub %r15, %rdx
+	call write@PLT
+	test %rax, %rax
+	jle 3f
+	add %rax, %r15
+	jmp 1b
+3:	mov %r12, %rdi
+	call close@PLT
+	jmp 8f
+4:	mov %r12, %rdi
+	call close@PLT
+	test %eax, %eax
+	jnz 8f
+	mov $1, %eax
+	jmp 9f
+8:	xor %eax, %eax
+9:	mov -8(%rbp), %rbx
+	mov -16(%rbp), %r12
+	mov -24(%rbp), %r13
+	mov -32(%rbp), %r14
+	mov -40(%rbp), %r15
+	leave
+	ret
+bst_rt_pool_init:               # the simulated pool: %rax = base, %rdx = pages
+	push %rbp
+	mov %rsp, %rbp
+	and $-16, %rsp
+	mov $4096, %edi
+	mov $1048576, %esi          # 256 pages
+	call aligned_alloc@PLT
+	test %rax, %rax
+	jz bst_rt_oom
+	mov %rax, bst_rt_pool_base(%rip)
+	mov $256, %edx
+	leave
+	ret
 bst_rt_oom:
 	and $-16, %rsp
 	mov $2, %edi
@@ -1598,6 +1902,11 @@ bst_rt_oom:
 	mov $22, %edx
 	call write@PLT
 	call abort@PLT
+	.bss
+	.p2align 3
+bst_rt_argc:	.quad 0
+bst_rt_argv:	.quad 0
+bst_rt_pool_base:	.quad 0
 	.section .rodata
 .Lrt_fmt:
 	.string "%llu\n"

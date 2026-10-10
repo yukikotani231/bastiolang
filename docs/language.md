@@ -81,7 +81,7 @@ bastioc0 [--check] [--emit-c] [--backend c|native] [--target hosted|kernel|user]
 | `--check` | Check and verify only |
 | `--emit-c` | Write the generated C (`out.c` unless `-o` is given) instead of an executable |
 | `--target T` | `hosted` (the default), `kernel` or `user`; see [Targets](#targets-and-generated-code). `kernel` and `user` imply `--emit-c` |
-| `--backend native` | Experimental: generate x86-64 assembly directly instead of C, assemble it with `as` and link it with `cc`. Hosted target only, and not every builtin yet (`Host`, `Child`, `Pool`, `Lock`, the device types and libraries without `main` are missing); see [Targets](#targets-and-generated-code) |
+| `--backend native` | Experimental: generate x86-64 assembly directly instead of C, assemble it with `as` and link it with `cc`. Hosted target only, and not every builtin yet (`Child`, `Lock`, the device types and libraries without `main` are missing); see [Targets](#targets-and-generated-code) |
 | `--emit-asm` | With `--backend native`: write the assembly (`out.s` unless `-o` is given) instead of an executable |
 | `--header F` | Also write a C header declaring the program's `export fn`s to `F`; see [Calling Bastio from C](#calling-bastio-from-c) |
 | `--dump-smt` | Also print the queries sent to Z3 |
