@@ -162,6 +162,8 @@ typedef uint64_t bst_frame, bst_pt;         /* a page's physical address */
 typedef struct { uint64_t base, size; } bst_pool;
 typedef int bst_ports;                      /* capability token: no data */
 typedef struct { uint64_t base, count; } bst_portio;
+typedef int bst_mmiospace;                  /* capability token: no data */
+typedef struct { uint64_t base, len; } bst_mmio;
 static inline bst_buf bst_set(bst_buf b, uint64_t i, uint64_t v) { b.data[i] = v; return b; }
 "#;
 
@@ -566,6 +568,33 @@ static inline uint64_t bst_port_base(bst_portio io) { return io.base; }
 static inline uint64_t bst_port_count(bst_portio io) { return io.count; }
 "#;
 
+// Memory-mapped registers: like ports, claiming is proof-only. The kernel
+// platform maps the device window (0xC000_0000 to 4 GiB) uncached at its
+// physical address, so an access is one volatile load or store there.
+const PRELUDE_MMIO: &str = r#"
+static inline bst_mmio bst_mmio_claim(bst_mmiospace *s, uint64_t b, uint64_t l) { (void)s; bst_mmio m = { b, l }; return m; }
+static inline void bst_mmio_release(bst_mmiospace *s, bst_mmio m) { (void)s; (void)m; }
+static inline uint64_t bst_mmio_base(bst_mmio m) { return m.base; }
+static inline uint64_t bst_mmio_len(bst_mmio m) { return m.len; }
+"#;
+
+const PRELUDE_MMIO_KERNEL: &str = r#"
+#define BST_MMIO_RW(w, t) \
+    static inline uint64_t bst_mmio_read##w(bst_mmio *m, uint64_t o) { return *(volatile t *)(uintptr_t)(m->base + o); } \
+    static inline void bst_mmio_write##w(bst_mmio *m, uint64_t o, uint64_t v) { *(volatile t *)(uintptr_t)(m->base + o) = (t)v; }
+BST_MMIO_RW(8, uint8_t) BST_MMIO_RW(16, uint16_t) BST_MMIO_RW(32, uint32_t) BST_MMIO_RW(64, uint64_t)
+"#;
+
+// Hosted programs simulate the window with 1 MiB of memory, indexed by the
+// low 20 bits of the address (so registers 1 MiB apart share storage).
+const PRELUDE_MMIO_HOSTED: &str = r#"
+static unsigned char bst_mmio_cell[1u << 20];
+#define BST_MMIO_RW(w, t) \
+    static inline uint64_t bst_mmio_read##w(bst_mmio *m, uint64_t o) { t v; memcpy(&v, &bst_mmio_cell[(m->base + o) & 0xFFFFF], sizeof v); return v; } \
+    static inline void bst_mmio_write##w(bst_mmio *m, uint64_t o, uint64_t v) { t x = (t)v; memcpy(&bst_mmio_cell[(m->base + o) & 0xFFFFF], &x, sizeof x); }
+BST_MMIO_RW(8, uint8_t) BST_MMIO_RW(16, uint16_t) BST_MMIO_RW(32, uint32_t) BST_MMIO_RW(64, uint64_t)
+"#;
+
 const PRELUDE_PORTS_KERNEL: &str = r#"
 static inline uint64_t bst_pio_in8(bst_portio *io, uint64_t o) { return bst_inb((uint16_t)(io->base + o)); }
 static inline uint64_t bst_pio_in16(bst_portio *io, uint64_t o) { uint16_t v; __asm__ volatile ("inw %1, %0" : "=a"(v) : "Nd"((uint16_t)(io->base + o))); return v; }
@@ -742,6 +771,8 @@ fn cty(t: &Type) -> String {
         Type::Cpu => "bst_cpu".into(),
         Type::Ports => "bst_ports".into(),
         Type::PortIo => "bst_portio".into(),
+        Type::MmioSpace => "bst_mmiospace".into(),
+        Type::Mmio => "bst_mmio".into(),
         Type::Struct(n) => format!("bst_s_{}", cid(n)),
         Type::Enum(n) => format!("bst_e_{}", cid(n)),
         Type::Generic(..) => unreachable!("removed by monomorphization"),
@@ -1176,6 +1207,8 @@ pub fn prelude_parts(target: Target) -> Vec<(&'static str, &'static str)> {
             ("child", PRELUDE_CHILD),
             ("ports", PRELUDE_PORTS),
             ("ports_hosted", PRELUDE_PORTS_HOSTED),
+            ("mmio", PRELUDE_MMIO),
+            ("mmio_hosted", PRELUDE_MMIO_HOSTED),
         ],
         Target::Kernel => vec![
             ("common", PRELUDE_COMMON),
@@ -1186,6 +1219,8 @@ pub fn prelude_parts(target: Target) -> Vec<(&'static str, &'static str)> {
             ("kernel_cpu", PRELUDE_KERNEL_CPU),
             ("ports", PRELUDE_PORTS),
             ("ports_kernel", PRELUDE_PORTS_KERNEL),
+            ("mmio", PRELUDE_MMIO),
+            ("mmio_kernel", PRELUDE_MMIO_KERNEL),
         ],
         Target::User => vec![("common", PRELUDE_COMMON), ("user", PRELUDE_USER), ("bytes_arena", PRELUDE_BYTES_ARENA), ("bytes", PRELUDE_BYTES)],
     }

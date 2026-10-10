@@ -43,6 +43,13 @@ pub enum Type {
     /// A claimed range of I/O ports, owned: the only way to read or write
     /// them. Linear; given back with `port_release`.
     PortIo,
+    /// The device window (physical 0xC000_0000 to 4 GiB, mapped uncached by
+    /// the platform): the right to claim each byte of it once. Linear; only
+    /// `main` receives it. Kernel and hosted targets (hosted simulates it).
+    MmioSpace,
+    /// A claimed range of memory-mapped device registers, owned: the only
+    /// way to read or write them. Linear; given back with `mmio_release`.
+    Mmio,
     /// A user-defined struct. Linear when any field is linear; otherwise a
     /// plain value that is copied.
     Struct(String),
@@ -85,6 +92,8 @@ impl Type {
             Type::Cpu => "Cpu".into(),
             Type::Ports => "Ports".into(),
             Type::PortIo => "PortIo".into(),
+            Type::MmioSpace => "MmioSpace".into(),
+            Type::Mmio => "Mmio".into(),
             Type::Struct(n) | Type::Enum(n) => n.clone(),
             Type::Box(t) => format!("Box[{}]", t.name()),
             Type::Vec(t) => format!("Vec[{}]", t.name()),
@@ -95,7 +104,7 @@ impl Type {
     }
     pub fn is_linear(&self) -> bool {
         match self {
-            Type::Buf | Type::Bytes | Type::Host | Type::Child | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu | Type::Ports | Type::PortIo | Type::Box(_) | Type::Vec(_) => true,
+            Type::Buf | Type::Bytes | Type::Host | Type::Child | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu | Type::Ports | Type::PortIo | Type::MmioSpace | Type::Mmio | Type::Box(_) | Type::Vec(_) => true,
             Type::Struct(n) => struct_def(n).map_or(false, |d| d.fields.iter().any(|f| f.1.is_linear())),
             Type::Enum(n) => enum_def(n).map_or(false, |d| d.variants.iter().any(|v| v.1.as_ref().map_or(false, |t| t.is_linear()))),
             _ => false,

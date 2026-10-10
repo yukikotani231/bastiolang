@@ -1,0 +1,35 @@
+// expect-exit: 42
+// Memory-mapped device registers: a driver claims its register block from
+// `MmioSpace`, can touch only those registers, with aligned accesses, and
+// gives them back. Hosted programs simulate the device window.
+
+const LAPIC: u64 = 0xFEE00000;
+const HPET: u64 = 0xFED00000;
+
+struct Timer { regs: Mmio }
+
+fn timer_set(t: &mut Timer, v: u64)
+  requires mmio_len(t.regs) == 1024 && mmio_base(t.regs) % 8 == 0
+{
+  mmio_write64(&mut t.regs, 0xF0, v);
+}
+
+fn main(win: &mut MmioSpace) -> u64 {
+  let mut apic = mmio_claim(&mut win, LAPIC, 4096);
+  let mut t = Timer { regs: mmio_claim(&mut win, HPET, 1024) };
+  mmio_write32(&mut apic, 0x80, 40);
+  mmio_write8(&mut apic, 0x81, 2);
+  mmio_write16(&mut apic, 0x82, 0);
+  timer_set(&mut t, 0x123456789);
+  let x = mmio_read32(&mut apic, 0x80);
+  let y = mmio_read64(&mut t.regs, 0xF0);
+  mmio_release(&mut win, apic);
+  // Released registers can be claimed again.
+  let again = mmio_claim(&mut win, LAPIC + 0x80, 4);
+  mmio_release(&mut win, again);
+  mmio_release(&mut win, t.regs);
+  if y == 0x123456789 {
+    return x / 256 + x % 256;   // 2 * 256 + 40: the byte write landed in byte 1
+  }
+  return 1;
+}
