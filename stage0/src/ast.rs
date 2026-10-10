@@ -5,6 +5,11 @@ use crate::diag::Pos;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
     U64,
+    /// Narrower unsigned integers (docs/integers.md). Like `u64`, arithmetic
+    /// on them is proved to stay in range.
+    U8,
+    U16,
+    U32,
     Bool,
     Unit,
     /// An owned buffer of u64. Linear: must be consumed exactly once.
@@ -77,6 +82,9 @@ impl Type {
     pub fn name(&self) -> String {
         match self {
             Type::U64 => "u64".into(),
+            Type::U8 => "u8".into(),
+            Type::U16 => "u16".into(),
+            Type::U32 => "u32".into(),
             Type::Bool => "bool".into(),
             Type::Unit => "()".into(),
             Type::Buf => "Buf".into(),
@@ -109,6 +117,23 @@ impl Type {
             Type::Enum(n) => enum_def(n).map_or(false, |d| d.variants.iter().any(|v| v.1.as_ref().map_or(false, |t| t.is_linear()))),
             _ => false,
         }
+    }
+    /// The width in bits of an integer type.
+    pub fn int_bits(&self) -> Option<u32> {
+        match self {
+            Type::U8 => Some(8),
+            Type::U16 => Some(16),
+            Type::U32 => Some(32),
+            Type::U64 => Some(64),
+            _ => None,
+        }
+    }
+    pub fn is_int(&self) -> bool {
+        self.int_bits().is_some()
+    }
+    /// The largest value of an integer type.
+    pub fn int_max(&self) -> u128 {
+        (1u128 << self.int_bits().expect("an integer type")) - 1
     }
     pub fn is_ref(&self) -> bool {
         matches!(self, Type::Ref(_) | Type::MutRef(_))
@@ -259,6 +284,11 @@ pub struct FnDef {
     pub ensures: Vec<Expr>,
     pub body: Vec<Stmt>,
     pub pos: Pos,
+    /// Filled in by the checker: the integer type of each arithmetic
+    /// operator and wrapping builtin in the body, by its position. The
+    /// verifier and the code generator need it, since literals take their
+    /// type from context.
+    pub int_ops: std::collections::HashMap<Pos, Type>,
 }
 
 /// `spec fn name(params) -> bool { expr }`: a named specification, expanded

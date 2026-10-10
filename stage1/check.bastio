@@ -396,6 +396,30 @@ fn base_t(m: &Mono, t: u64) -> u64 {
   return t;
 }
 
+/// Is `t` an integer type (`u8`, `u16`, `u32` or `u64`)?
+fn is_int(m: &Mono, t: u64) -> bool {
+  let k = kind_t(m, t);
+  return k == TY_U64 || k == TY_U8 || k == TY_U16 || k == TY_U32;
+}
+
+/// Does the literal value `v` fit in the integer type `t`? (Every literal
+/// fits in `u64`: the lexer allows no more.)
+fn lit_fits(m: &Mono, v: u64, t: u64) -> bool {
+  let k = kind_t(m, t);
+  if k == TY_U8 { return v <= 255; }
+  if k == TY_U16 { return v <= 65535; }
+  if k == TY_U32 { return v <= 4294967295; }
+  return true;
+}
+
+/// In a specification every integer is just a number, whatever its type.
+fn spec_norm(c: &Checker, m: &Mono, t: u64) -> u64 {
+  if is_int(m, t) {
+    return c.tu64;
+  }
+  return t;
+}
+
 /// The j-th field (or payload) type of instance `x`.
 fn fld_ty(c: &Checker, x: u64, j: u64) -> u64 {
   let st = u_at(c.fstart, x);
@@ -519,8 +543,14 @@ fn is_vec_builtin(p: &Parser, s: u64, e: u64) -> bool {
     || span_is(p, s, e, "vec_swap") || span_is(p, s, e, "vec_free");
 }
 
+/// Wrapping arithmetic: both operands and the result have one integer type.
+fn is_wrap_builtin(p: &Parser, s: u64, e: u64) -> bool {
+  return span_is(p, s, e, "wrap_add") || span_is(p, s, e, "wrap_sub") || span_is(p, s, e, "wrap_mul");
+}
+
 fn is_builtin_name(c: &Checker, p: &Parser, s: u64, e: u64) -> bool {
-  return span_is(p, s, e, "box") || span_is(p, s, e, "unbox") || is_vec_builtin(p, s, e) || bs_index(c, p, s, e) != 0;
+  return span_is(p, s, e, "box") || span_is(p, s, e, "unbox") || span_is(p, s, e, "cast") || span_is(p, s, e, "wrap")
+    || is_vec_builtin(p, s, e) || is_wrap_builtin(p, s, e) || bs_index(c, p, s, e) != 0;
 }
 
 /// `result` and `old` belong to specifications.
@@ -939,7 +969,8 @@ fn known_type(c: &mut Checker, m: &Mono, p: &Parser, t: u64, loc: u64) {
 // ---- Definitions and signatures ----
 
 fn is_reserved_type(p: &Parser, s: u64, e: u64) -> bool {
-  return span_is(p, s, e, "u64") || span_is(p, s, e, "bool") || span_is(p, s, e, "Str")
+  return span_is(p, s, e, "u64") || span_is(p, s, e, "u8") || span_is(p, s, e, "u16")
+    || span_is(p, s, e, "u32") || span_is(p, s, e, "bool") || span_is(p, s, e, "Str")
     || span_is(p, s, e, "Buf") || span_is(p, s, e, "Bytes") || span_is(p, s, e, "Host")
     || span_is(p, s, e, "Child") || span_is(p, s, e, "Serial") || span_is(p, s, e, "Frame")
     || span_is(p, s, e, "PageTable") || span_is(p, s, e, "Pool") || span_is(p, s, e, "Mmu")
@@ -1273,12 +1304,16 @@ fn ck_stmt(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> bool {
   let n = node_at(p.nodes, i);
   let k = n.kind;
   if k == S_LET {
-    let t = ck_expr(&mut c, &mut m, p, n.b);
+    // A literal takes the type written, so that is read first.
+    let mut want = 0;
+    if n.a != 0 {
+      want = conv(&mut m, p, n.a, c.env, i);
+    }
+    let t = ck_expr_as(&mut c, &mut m, p, n.b, want);
     if c.failed {
       return false;
     }
     if n.a != 0 {
-      let want = conv(&mut m, p, n.a, c.env, i);
       known_type(&mut c, m, p, want, i);
       if !c.failed && ck_ref(m, want) {
         cfail(&mut c, p, i, C_TYPE);          // a local cannot hold a borrow
@@ -1309,7 +1344,7 @@ fn ck_stmt(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> bool {
       cfail(&mut c, p, i, C_TYPE);            // not mutable
       return false;
     }
-    let t = ck_expr(&mut c, &mut m, p, n.b);
+    let t = ck_expr_as(&mut c, &mut m, p, n.b, want);
     if !c.failed {
       expect_ty(&mut c, p, t, want, n.b);
     }
@@ -1340,7 +1375,7 @@ fn ck_stmt(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> bool {
   if k == S_RETURN {
     let mut t = c.tunit;
     if n.a != 0 {
-      t = ck_expr(&mut c, &mut m, p, n.a);
+      t = ck_expr_as(&mut c, &mut m, p, n.a, c.ret);
     }
     if !c.failed {
       expect_ty(&mut c, p, t, c.ret, i);
@@ -1652,6 +1687,39 @@ fn ck_expr(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
   return ck_named(&mut c, &mut m, p, i, 0);
 }
 
+/// A code expression in a position that expects type `want`: a literal
+/// takes that type when it is an integer type (docs/integers.md).
+fn ck_expr_as(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, want: u64) -> u64 {
+  if c.failed {
+    return 0;
+  }
+  let n = node_at(p.nodes, i);
+  if n.kind == E_INT && is_int(m, want) {
+    if !lit_fits(m, n.v, want) {
+      cfail(&mut c, p, i, C_TYPE);            // does not fit
+      return 0;
+    }
+    return want;
+  }
+  return ck_expr(&mut c, &mut m, p, i);
+}
+
+/// The types of the two operands of a binary operator.
+struct Ops { a: u64, b: u64 }
+
+/// The two operands `a` and `b` of a binary operator: a literal on one
+/// side takes the type of the other side, so that side is checked first.
+fn operands(c: &mut Checker, m: &mut Mono, p: &Parser, a: u64, b: u64) -> Ops {
+  if kind_of(p, a) == E_INT && kind_of(p, b) != E_INT {
+    let tb = ck_expr(&mut c, &mut m, p, b);
+    let ta = ck_expr_as(&mut c, &mut m, p, a, tb);
+    return Ops { a: ta, b: tb };
+  }
+  let ta = ck_expr(&mut c, &mut m, p, a);
+  let tb = ck_expr_as(&mut c, &mut m, p, b, ta);
+  return Ops { a: ta, b: tb };
+}
+
 /// An expression; a call, struct literal or variant names instance `inst`
 /// instead of what is written when `inst` is not 0.
 fn ck_named(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 {
@@ -1662,18 +1730,38 @@ fn ck_named(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64
   let k = n.kind;
   if k == E_TAPP {
     if is_typed_builtin(p, n.b) {
-      // `vec_new[T]()`: the only builtin that needs its type written.
       let call = node_at(p.nodes, n.b);
-      if list_len(p, n.a) != 1 || call.a != 0 {
+      if name_is(p, n.b, "vec_new") {
+        // `vec_new[T]()`
+        if list_len(p, n.a) != 1 || call.a != 0 {
+          cfail(&mut c, p, i, C_TYPE);
+          return 0;
+        }
+        let t = conv(&mut m, p, n.a, c.env, i);
+        known_type(&mut c, m, p, t, i);
+        if c.failed {
+          return 0;
+        }
+        return intern(&mut m, p, TY_VEC, t);
+      }
+      // `cast[T](x)` (proved to fit) and `wrap[T](x)` (modular).
+      if list_len(p, n.a) != 1 || list_len(p, call.a) != 1 {
         cfail(&mut c, p, i, C_TYPE);
         return 0;
       }
       let t = conv(&mut m, p, n.a, c.env, i);
-      known_type(&mut c, m, p, t, i);
+      if !is_int(m, t) {
+        cfail(&mut c, p, i, C_TYPE);          // converts to an integer type
+        return 0;
+      }
+      let ta = ck_expr(&mut c, &mut m, p, call.a);
+      if !c.failed && !is_int(m, ta) {
+        cfail(&mut c, p, call.a, C_TYPE);     // converts an integer
+      }
       if c.failed {
         return 0;
       }
-      return intern(&mut m, p, TY_VEC, t);
+      return t;
     }
     let x = tapp_inst(&mut m, p, i, c.env);
     return ck_named(&mut c, &mut m, p, n.b, x);
@@ -1730,6 +1818,13 @@ fn ck_named(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64
       cfail(&mut c, p, i, C_TYPE);            // `==>` belongs to specifications
       return 0;
     }
+    if n.v != P_ANDAND && n.v != P_OROR {
+      let ts = operands(&mut c, &mut m, p, n.a, n.b);
+      if c.failed {
+        return 0;
+      }
+      return bin_type(&mut c, m, p, n.v, ts.a, ts.b, i);
+    }
     let ta = ck_expr(&mut c, &mut m, p, n.a);
     if c.failed {
       return 0;
@@ -1745,7 +1840,7 @@ fn ck_named(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64
       cfail(&mut c, p, n.b, C_USE);           // the right side may not run
       return 0;
     }
-    return bin_type(&mut c, p, n.v, ta, tb, i);
+    return bin_type(&mut c, m, p, n.v, ta, tb, i);
   }
   if k == E_CALL {
     return ck_call(&mut c, &mut m, p, i, inst);
@@ -1774,7 +1869,7 @@ fn ck_variant(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u
   }
   let pt = fld_ty(c, x, j - 1);
   if pt != 0 && n.a != 0 {
-    let t = ck_expr(&mut c, &mut m, p, n.a);
+    let t = ck_expr_as(&mut c, &mut m, p, n.a, pt);
     if !c.failed {
       expect_ty(&mut c, p, t, pt, n.a);
     }
@@ -1848,9 +1943,10 @@ fn ck_slit(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
       cfail(&mut c, p, qn.a, C_TYPE);         // no such field
       return 0;
     }
-    let t = ck_expr(&mut c, &mut m, p, qn.a);
+    let ft = fld_ty(c, x, j - 1);
+    let t = ck_expr_as(&mut c, &mut m, p, qn.a, ft);
     if !c.failed {
-      expect_ty(&mut c, p, t, fld_ty(c, x, j - 1), qn.a);
+      expect_ty(&mut c, p, t, ft, qn.a);
     }
     q = qn.next;
   }
@@ -1860,22 +1956,25 @@ fn ck_slit(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
   return intern(&mut m, p, TY_STRUCT, x);
 }
 
-fn bin_type(c: &mut Checker, p: &Parser, op: u64, a: u64, b: u64, loc: u64) -> u64 {
-  if op == P_PLUS || op == P_MINUS || op == P_STAR || op == P_SLASH || op == P_PERCENT {
-    if a != c.tu64 || b != c.tu64 {
+fn bin_type(c: &mut Checker, m: &Mono, p: &Parser, op: u64, a: u64, b: u64, loc: u64) -> u64 {
+  let order = op == P_LT || op == P_LE || op == P_GT || op == P_GE;
+  if op == P_PLUS || op == P_MINUS || op == P_STAR || op == P_SLASH || op == P_PERCENT || order {
+    // Both operands have one integer type; there is no promotion.
+    let mut want = c.tu64;
+    if is_int(m, a) {
+      want = a;
+    }
+    if a != want || b != want {
       cfail(&mut c, p, loc, C_TYPE);
     }
-    return c.tu64;
-  }
-  if op == P_LT || op == P_LE || op == P_GT || op == P_GE {
-    if a != c.tu64 || b != c.tu64 {
-      cfail(&mut c, p, loc, C_TYPE);
+    if order {
+      return c.tbool;
     }
-    return c.tbool;
+    return want;
   }
   if op == P_EQEQ || op == P_NE {
-    if a != b || (a != c.tu64 && a != c.tbool) {
-      cfail(&mut c, p, loc, C_TYPE);          // only u64 and bool compare
+    if a != b || !(is_int(m, a) || a == c.tbool) {
+      cfail(&mut c, p, loc, C_TYPE);          // only integers and bool compare
     }
     return c.tbool;
   }
@@ -1914,7 +2013,7 @@ fn user_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, x: u64) -> u64 {
   let dn = node_at(p.nodes, xi.def);
   let r = conv(&mut m, p, dn.b, x, xi.def);
   let call = node_at(p.nodes, i);
-  let t = call_with(&mut c, &mut m, p, ps, r, call.a, i);
+  let t = call_with(&mut c, &mut m, p, ps, r, call.a, i, false);
   vec_free(ps);
   return t;
 }
@@ -1932,6 +2031,20 @@ fn ck_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
   }
   if is_vec_builtin(p, s, e) {
     return vec_call(&mut c, &mut m, p, i);
+  }
+  if is_wrap_builtin(p, s, e) {
+    if list_len(p, n.a) != 2 {
+      cfail(&mut c, p, i, C_TYPE);
+      return 0;
+    }
+    let ts = operands(&mut c, &mut m, p, n.a, next_of(p, n.a));
+    if !c.failed && (!is_int(m, ts.a) || ts.a != ts.b) {
+      cfail(&mut c, p, i, C_TYPE);            // two integers of one type
+    }
+    if c.failed {
+      return 0;
+    }
+    return ts.a;
   }
   if span_is(p, s, e, "box") || span_is(p, s, e, "unbox") {
     // Generic over the boxed type, so not in the builtin table.
@@ -1960,7 +2073,7 @@ fn ck_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
       return 0;
     }
     let ps = bsig_params(bs);
-    let t = call_with(&mut c, &mut m, p, ps, bs.ret, n.a, i);
+    let t = call_with(&mut c, &mut m, p, ps, bs.ret, n.a, i, true);
     vec_free(ps);
     return t;
   }
@@ -2047,7 +2160,7 @@ fn vec_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
     vec_push(&mut ps, c.tu64);
     vec_push(&mut ps, el);
   }
-  let t = call_with(&mut c, &mut m, p, ps, r, a0, i);
+  let t = call_with(&mut c, &mut m, p, ps, r, a0, i, true);
   vec_free(ps);
   return t;
 }
@@ -2055,7 +2168,8 @@ fn vec_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
 /// Checks a call's arguments (list `args`) against the parameter types
 /// `ps`: scalars first, then borrows, then moves, so a scalar argument may
 /// read a value that a later argument consumes (`set(b, i, get(b, j))`).
-fn call_with(c: &mut Checker, m: &mut Mono, p: &Parser, ps: &Vec[u64], r: u64, args: u64, loc: u64) -> u64 {
+/// `builtin` says whether a builtin is called.
+fn call_with(c: &mut Checker, m: &mut Mono, p: &Parser, ps: &Vec[u64], r: u64, args: u64, loc: u64, builtin: bool) -> u64 {
   if list_len(p, args) != vec_len(ps) {
     cfail(&mut c, p, loc, C_TYPE);            // the wrong number of arguments
     return 0;
@@ -2065,8 +2179,11 @@ fn call_with(c: &mut Checker, m: &mut Mono, p: &Parser, ps: &Vec[u64], r: u64, a
   while a != 0 && !c.failed && j < SRC_MAX {
     let pt = u_at(ps, j);
     if !ck_linear(c, m, p, pt) && !ck_ref(m, pt) {
-      let t = ck_expr(&mut c, &mut m, p, a);
-      if !c.failed {
+      let t = ck_expr_as(&mut c, &mut m, p, a, pt);
+      // A builtin's u64 parameter (an index, a length, a value) takes any
+      // narrower unsigned value: widening is free.
+      let widens = builtin && pt == c.tu64 && is_int(m, t);
+      if !c.failed && !widens {
         expect_ty(&mut c, p, t, pt, a);
       }
     }
@@ -2212,7 +2329,7 @@ fn ck_spec(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u64 
   let k = n.kind;
   if k == E_TAPP {
     // A generic instance cannot be called or built in a specification
-    // (stage0 has renamed it by now), nor can `vec_new[T]()`.
+    // (stage0 has renamed it by now), nor can a typed builtin.
     if is_typed_builtin(p, n.b) {
       cfail(&mut c, p, i, C_TYPE);
     } else {
@@ -2296,7 +2413,7 @@ fn ck_spec(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u64 
     if c.failed {
       return 0;
     }
-    return bin_type(&mut c, p, n.v, ta, tb, i);
+    return bin_type(&mut c, m, p, n.v, spec_norm(c, m, ta), spec_norm(c, m, tb), i);
   }
   if k == E_FORALL {
     if find_var(c, p, n.s, n.e) != 0 || is_bound(c, p, n.s, n.e) {
@@ -2328,11 +2445,11 @@ fn check_lin(c: &mut Checker, p: &Parser, a: u64) {
   }
 }
 
-/// An index argument: `u64`.
+/// An index argument: an integer.
 fn spec_index(c: &mut Checker, m: &mut Mono, p: &Parser, a: u64, ens: bool) {
   let t = ck_spec(&mut c, &mut m, p, a, ens);
   if !c.failed {
-    expect_ty(&mut c, p, t, c.tu64, a);
+    expect_ty(&mut c, p, spec_norm(c, m, t), c.tu64, a);
   }
 }
 
@@ -2363,7 +2480,7 @@ fn spec_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u6
       let qn = node_at(p.nodes, q);
       let bt = base_t(m, conv(&mut m, p, qn.a, 0, q));
       let t = ck_spec(&mut c, &mut m, p, a, ens);
-      if !c.failed && t != bt {
+      if !c.failed && spec_norm(c, m, t) != spec_norm(c, m, bt) {
         cfail(&mut c, p, a, C_TYPE);
       }
       if !c.failed && ck_linear(c, m, p, bt) {

@@ -42,6 +42,8 @@ struct Gen<'a> {
     boxed: &'a mut Vec<Type>,
     /// Element types of vectors operated on: each gets a set of helpers.
     vecs: &'a mut Vec<Type>,
+    /// The integer type of each arithmetic operator (`FnDef::int_ops`).
+    int_ops: &'a HashMap<crate::diag::Pos, Type>,
 }
 
 pub fn emit(p: &Program, target: Target) -> String {
@@ -59,6 +61,7 @@ pub fn emit(p: &Program, target: Target) -> String {
             sigs: &sigs,
             boxed: &mut boxed,
             vecs: &mut vecs,
+            int_ops: &f.int_ops,
         };
         bodies.push_str(&format!("{} {{\n", proto(f)));
         for s in &f.body {
@@ -756,6 +759,9 @@ static inline uint64_t bst_sys_recv(uint64_t n, uint64_t a, bst_bytes *b) { bst_
 fn cty(t: &Type) -> String {
     match t {
         Type::U64 => "uint64_t".into(),
+        Type::U8 => "uint8_t".into(),
+        Type::U16 => "uint16_t".into(),
+        Type::U32 => "uint32_t".into(),
         Type::Bool => "bool".into(),
         Type::Unit => "void".into(),
         Type::Buf => "bst_buf".into(),
@@ -922,7 +928,10 @@ impl<'a> Gen<'a> {
     /// The type of a code expression (the checker has already accepted it).
     fn type_of(&self, e: &Expr) -> Type {
         match &e.kind {
-            ExprKind::TypeApp(targs, _) => Type::Vec(Box::new(targs[0].clone())), // vec_new[T]()
+            ExprKind::TypeApp(targs, inner) => match &inner.kind {
+                ExprKind::Call(n, _) if n == "cast" || n == "wrap" => targs[0].clone(),
+                _ => Type::Vec(Box::new(targs[0].clone())), // vec_new[T]()
+            },
             ExprKind::Int(_) => Type::U64,
             ExprKind::Bool(_) | ExprKind::Not(_) | ExprKind::Is(..) => Type::Bool,
             ExprKind::Str(_) | ExprKind::Blob(_) => Type::Str,
@@ -937,7 +946,7 @@ impl<'a> Gen<'a> {
             ExprKind::StructLit(n, _) => Type::Struct(n.clone()),
             ExprKind::Variant(n, ..) => Type::Enum(n.clone()),
             ExprKind::Bin(op, ..) => match op {
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => Type::U64,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => self.int_ops[&e.pos].clone(),
                 _ => Type::Bool,
             },
             ExprKind::Call(n, args) if n == "box" => Type::Box(Box::new(self.type_of(&args[0]))),
@@ -950,6 +959,7 @@ impl<'a> Gen<'a> {
                 "vec_push" | "vec_set" | "vec_free" => Type::Unit,
                 _ => self.vec_elem(&args[0]),
             },
+            ExprKind::Call(n, _) if crate::check::WRAP_BUILTINS.contains(&n.as_str()) => self.int_ops[&e.pos].clone(),
             ExprKind::Call(n, _) => self.sigs[n].ret.clone(),
             ExprKind::MutBorrow(_) | ExprKind::Forall(..) => unreachable!("not a value"),
         }
@@ -1045,7 +1055,12 @@ impl<'a> Gen<'a> {
 
     fn expr(&mut self, e: &Expr) -> String {
         match &e.kind {
-            ExprKind::TypeApp(..) => "((bst_vec){ 0, 0, 0 })".to_string(), // vec_new[T]()
+            // `cast` is proved not to change the value and `wrap` means C's
+            // modular conversion, so both are a plain C cast.
+            ExprKind::TypeApp(targs, inner) => match &inner.kind {
+                ExprKind::Call(n, args) if n == "cast" || n == "wrap" => format!("(({})({}))", cty(&targs[0]), self.expr(&args[0])),
+                _ => "((bst_vec){ 0, 0, 0 })".to_string(), // vec_new[T]()
+            },
             ExprKind::Int(v) => format!("UINT64_C({})", v),
             ExprKind::Bool(b) => b.to_string(),
             ExprKind::Str(bytes) => {
@@ -1115,6 +1130,12 @@ impl<'a> Gen<'a> {
                 let p = format!("bp_{}", self.tmps);
                 self.tmps += 1;
                 format!("({{ {c} *{p} = ({c} *)bst_box_alloc(sizeof({c})); *{p} = {}; {p}; }})", self.expr(&args[0]))
+            }
+            // Computed in uint64_t, where C's unsigned arithmetic is modular
+            // (narrower operands would be promoted to a signed int).
+            ExprKind::Call(name, args) if crate::check::WRAP_BUILTINS.contains(&name.as_str()) => {
+                let op = match name.as_str() { "wrap_add" => "+", "wrap_sub" => "-", _ => "*" };
+                format!("(({})((uint64_t)({}) {} (uint64_t)({})))", cty(&self.int_ops[&e.pos]), self.expr(&args[0]), op, self.expr(&args[1]))
             }
             ExprKind::Call(name, args) => {
                 let (pre, a) = self.operands(&args.iter().collect::<Vec<_>>(), true);
