@@ -1,0 +1,42 @@
+// expect-exit: 42
+// core/csum: CRC-32 and the Internet checksum on known values.
+import "core/csum.bastio";
+
+fn main() -> u64 {
+  // CRC-32 of "123456789" is 0xCBF43926 (the standard check value).
+  let mut s = balloc(9);
+  let mut i = 0;
+  while i < 9
+    invariant i <= 9 && blen(s) == 9
+  {
+    bset(&mut s, i, cast[u8](49 + i));
+    i = i + 1;
+  }
+  let c = crc32(s, 0, 9);
+  // In two pieces, the same.
+  let c2 = crc32_end(crc32_update(crc32_update(crc32_start(), s, 0, 4), s, 4, 5));
+  bfree(s);
+  // An IPv4 header (RFC 1071 example from Wikipedia):
+  // 4500 0073 0000 4000 4011 [b861] c0a8 0001 c0a8 00c7
+  let mut h = balloc(20);              // zeroed
+  bset(&mut h, 0, 69);
+  bset(&mut h, 3, 115);
+  bset(&mut h, 6, 64);
+  bset(&mut h, 8, 64);
+  bset(&mut h, 9, 17);
+  bset(&mut h, 12, 192);
+  bset(&mut h, 13, 168);
+  bset(&mut h, 15, 1);
+  bset(&mut h, 16, 192);
+  bset(&mut h, 17, 168);
+  bset(&mut h, 19, 199);
+  let sum = csum_inet(h, 0, 20);       // with the checksum field zero: 0xb861
+  bset(&mut h, 10, 184);
+  bset(&mut h, 11, 97);
+  let check = csum_inet(h, 0, 20);     // over the filled-in header: 0
+  bfree(h);
+  if c == 3421780262 && c2 == c && sum == 47201 && check == 0 {
+    return 42;
+  }
+  return 1;
+}

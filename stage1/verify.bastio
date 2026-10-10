@@ -49,6 +49,7 @@ const OP_SELECT: u64 = 16;
 const OP_STORE: u64 = 17;
 const OP_CNT: u64 = 18;       // vcount: (cnt elements length value)
 const OP_DEC: u64 = 19;       // bdec: (dec data from to)
+const OP_HEX: u64 = 20;       // bhex: (hex data from to)
 
 // Sorts: Int or Bool, under `depth` levels of (Array Int ..): base + 2 * depth.
 const SO_INT: u64 = 0;
@@ -177,6 +178,8 @@ struct Vr {
   counts: bool,
   /// The function definitions whose proofs can mention `bdec`.
   dec_fns: Vec[u64],
+  /// The same for `bhex`.
+  hex_fns: Vec[u64],
   /// Every function's summaries, grouped by instance: rows
   /// sum_start[x] .. sum_start[x] + sum_n[x] are instance x's.
   sums: Vec[SumRow],
@@ -220,7 +223,7 @@ fn vr_new(m: &mut Mono, p: &Parser) -> Vr {
   vec_push(&mut vals, Vl { kind: 0, ty: 0, a: 0, b: 0, c: 0, n: 0, d: 0, e: 0 });
   let mut v = Vr {
     pool: vec_new[u64](), tms: tms, targs: vec_new[u64](), vals: vals, kids: vec_new[u64](),
-    log: vec_new[Cmd](), counter: 0, obligations: 0, box_depth: 0, cur: 0, env: 0, cnt_fns: vec_new[u64](), counts: false, dec_fns: vec_new[u64](),
+    log: vec_new[Cmd](), counter: 0, obligations: 0, box_depth: 0, cur: 0, env: 0, cnt_fns: vec_new[u64](), counts: false, dec_fns: vec_new[u64](), hex_fns: vec_new[u64](),
     sums: vec_new[SumRow](), obls: vec_new[Obl](), snaps: vec_new[Bind](), sum_start: vec_new[u64](), sum_n: vec_new[u64](),
     t_true: 0, t_false: 0, t_zero: 0, t_u64max: 0, t_allocmax: 0, t_flimit: 0, t_plimit: 0, t_mmio_lo: 0, t_mmio_hi: 0, t_poolsize: 0,
     t_zarr: 0, t_nobool: 0, t_k: 0, t_255: 0, unit: 0,
@@ -254,6 +257,7 @@ fn vr_free(v: Vr) {
   vec_free(v.log);
   vec_free(v.cnt_fns);
   vec_free(v.dec_fns);
+  vec_free(v.hex_fns);
   vec_free(v.sums);
   vec_free(v.sum_start);
   vec_free(v.sum_n);
@@ -603,6 +607,21 @@ fn dec_axioms(v: &mut Vr) {
   let a1 = atom_str(&mut v, "(assert (forall ((a (Array Int Int)) (f Int) (t Int)) (! (= (dec a f t) (dec_l a f t)) :pattern ((dec a f t)))))");
   send(&mut v, CMD_RAW, a1, 0);
   let a2 = atom_str(&mut v, "(assert (forall ((a (Array Int Int)) (f Int) (t Int)) (! (=> (<= t f) (= (dec_l a f t) 0)) :pattern ((dec_l a f t)))))");
+  send(&mut v, CMD_RAW, a2, 0);
+}
+
+/// The definition of `bhex`, as stage0's HEX_AXIOMS: `dec_axioms` in base
+/// 16, a byte read as a hex digit.
+fn hex_axioms(v: &mut Vr) {
+  let l0 = atom_str(&mut v, "(declare-fun hex ((Array Int Int) Int Int) Int)");
+  send(&mut v, CMD_RAW, l0, 0);
+  let l1 = atom_str(&mut v, "(declare-fun hex_l ((Array Int Int) Int Int) Int)");
+  send(&mut v, CMD_RAW, l1, 0);
+  let a0 = atom_str(&mut v, "(assert (forall ((a (Array Int Int)) (f Int) (t Int)) (! (= (hex a f t) (ite (<= t f) 0 (+ (* 16 (hex_l a f (- t 1))) (ite (and (<= 48 (select a (- t 1))) (<= (select a (- t 1)) 57)) (- (select a (- t 1)) 48) (ite (and (<= 97 (select a (- t 1))) (<= (select a (- t 1)) 102)) (- (select a (- t 1)) 87) (- (select a (- t 1)) 55)))))) :pattern ((hex a f t)))))");
+  send(&mut v, CMD_RAW, a0, 0);
+  let a1 = atom_str(&mut v, "(assert (forall ((a (Array Int Int)) (f Int) (t Int)) (! (= (hex a f t) (hex_l a f t)) :pattern ((hex a f t)))))");
+  send(&mut v, CMD_RAW, a1, 0);
+  let a2 = atom_str(&mut v, "(assert (forall ((a (Array Int Int)) (f Int) (t Int)) (! (=> (<= t f) (= (hex_l a f t) 0)) :pattern ((hex_l a f t)))))");
   send(&mut v, CMD_RAW, a2, 0);
 }
 
@@ -1084,6 +1103,7 @@ fn out_op(out: &mut Vec[u64], op: u64) {
   else if op == OP_STORE { out_str(&mut out, "store"); }
   else if op == OP_CNT { out_str(&mut out, "cnt"); }
   else if op == OP_DEC { out_str(&mut out, "dec"); }
+  else if op == OP_HEX { out_str(&mut out, "hex"); }
 }
 
 fn out_tm(out: &mut Vec[u64], v: &Vr, t: u64) {
@@ -2729,6 +2749,13 @@ fn vspec_builtin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env:
     let from = spec_tm(&mut v, c, &mut m, p, arg_node(p, i, 1), env, oenv, has_old, res, &mut bound);
     let to = spec_tm(&mut v, c, &mut m, p, arg_node(p, i, 2), env, oenv, has_old, res, &mut bound);
     return app3(&mut v, OP_DEC, bv.b, from, to);
+  }
+  if span_is(p, n.s, n.e, "bhex") {
+    let bx = spec_val(&mut v, c, &mut m, p, n.a, env, oenv, has_old, res, &mut bound);
+    let bv = vl_at(v, bx);
+    let from = spec_tm(&mut v, c, &mut m, p, arg_node(p, i, 1), env, oenv, has_old, res, &mut bound);
+    let to = spec_tm(&mut v, c, &mut m, p, arg_node(p, i, 2), env, oenv, has_old, res, &mut bound);
+    return app3(&mut v, OP_HEX, bv.b, from, to);
   }
   if span_is(p, n.s, n.e, "vget") {
     let x = spec_val(&mut v, c, &mut m, p, i, env, oenv, has_old, res, &mut bound);
@@ -4440,6 +4467,11 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     // without one).
     return fresh_upto(&mut v, &mut st, "acpi", 256);
   }
+  if name_is(p, i, "boot_info") {
+    // The platform promises nothing about the number: the program checks
+    // it like any other input.
+    return fresh_u64_named(&mut v, "info");
+  }
   if name_is(p, i, "cpu_count") {
     let x = fresh_u64_named(&mut v, "cpus");
     // The platform's promise: at least this processor, and no more than
@@ -5351,6 +5383,9 @@ fn verify_fn(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
   if has_u(v.dec_fns, xi.def) {
     dec_axioms(&mut v);
   }
+  if has_u(v.hex_fns, xi.def) {
+    hex_axioms(&mut v);
+  }
   let mut env = vec_new[Bind]();
   let mut q = d.a;
   while q != 0 {
@@ -5459,6 +5494,7 @@ fn verify_program(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
   summarize(&mut v, c, &mut m, p);
   count_gate(m, p, "vcount", &mut v.cnt_fns);
   count_gate(m, p, "bdec", &mut v.dec_fns);
+  count_gate(m, p, "bhex", &mut v.hex_fns);
   send(&mut v, CMD_DECL, v.t_poolsize, SO_INT);
   let r = in_range(&mut v, v.t_zero, v.t_poolsize, v.t_flimit);
   assert_tm(&mut v, r);

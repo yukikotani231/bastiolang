@@ -990,6 +990,11 @@ static uint64_t bst_boot_fb(bst_cpu c, uint64_t f) {
  * past its end or without one. The platform finds the tables. */
 extern uint64_t bst_platform_acpi(uint64_t sig, uint64_t off);
 static inline uint64_t bst_boot_acpi(bst_cpu c, uint64_t sig, uint64_t off) { (void)c; return bst_platform_acpi(sig, off); }
+/* Answer `i` to the platform's query `what` about the machine (its boot
+ * command line, memory map, processor, ...: the platform defines them), or
+ * 0. Read-only; nothing is promised about the number. */
+extern uint64_t bst_platform_info(uint64_t what, uint64_t i);
+static inline uint64_t bst_boot_info(bst_cpu c, uint64_t what, uint64_t i) { (void)c; return bst_platform_info(what, i); }
 
 /* Called by the platform on a fault in kernel mode: that is a bug in the
  * trusted base or the compiler, never in verified code. */
@@ -1792,6 +1797,7 @@ pub fn trusted_base() -> String {
         out.push_str(&format!("lemma vcount: {}\n", l));
     }
     out.push_str("definition bdec: bdec(b, f, t) is 0 when t <= f, else 10 * bdec(b, f, t - 1) + (bget(b, t - 1) - 48)\n");
+    out.push_str("definition bhex: bhex(b, f, t) is 0 when t <= f, else 16 * bhex(b, f, t - 1) + the value of the hex digit bget(b, t - 1) (0-9, a-f, A-F)\n");
     out
 }
 
