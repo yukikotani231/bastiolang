@@ -674,6 +674,12 @@ static inline uint64_t bst_sys_getpid(void) { return bst_sys(BST_SYS_GETPID, 0, 
 static inline uint64_t bst_sys_info(uint64_t k) { return bst_sys(BST_SYS_INFO, k, 0, 0); }
 static inline void bst_sys_ps(void) { bst_flush(); bst_sys(BST_SYS_PS, 0, 0, 0); }
 static inline void bst_sys_poweroff(void) { bst_flush(); bst_sys(BST_SYS_POWEROFF, 0, 0, 0); }
+/* Calls with numbers the language does not know: the kernel defines them.
+ * sys_send lends the kernel bytes 0..n of b to read; sys_recv lends all of b
+ * to overwrite. Console output is flushed first so it stays in order. */
+static inline uint64_t bst_sys_call(uint64_t n, uint64_t a, uint64_t b) { bst_flush(); return bst_sys(n, a, b, 0); }
+static inline uint64_t bst_sys_send(uint64_t n, uint64_t a, bst_bytes b, uint64_t len) { bst_flush(); return bst_sys(n, a, (uint64_t)b.data, len); }
+static inline uint64_t bst_sys_recv(uint64_t n, uint64_t a, bst_bytes *b) { bst_flush(); return bst_sys(n, a, (uint64_t)b->data, b->len); }
 "#;
 
 fn cty(t: &Type) -> String {
