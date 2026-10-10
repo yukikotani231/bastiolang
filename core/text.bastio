@@ -1,10 +1,6 @@
 // core/text.bastio: building byte strings. A text under construction is a
 // `Vec[u8]`, which grows as bytes are pushed; `text_finish` turns it into
 // `Bytes`.
-//
-// Functions that push in a loop do not promise yet that the bytes already in
-// the text are left alone: saying so needs `old(t)` in a loop invariant,
-// which the language does not allow (see docs/core.md, "Gaps").
 import "bytes.bastio";
 
 /// `t[i..i+n]` holds the bytes `b[j..j+n]`.
@@ -33,13 +29,15 @@ fn text_push(t: &mut Vec[u8], c: u8)
 /// Appends the bytes of a literal.
 fn text_push_str(t: &mut Vec[u8], s: Str)
   ensures vlen(t) == vlen(old(t)) + slen(s)
+  ensures text_keeps(t, old(t), vlen(old(t)))
   ensures forall k: u64 :: k < slen(s) ==> vget(t, vlen(old(t)) + k) == sget(s, k)
 {
   let n0 = vec_len(t);
   let mut i = 0;
   while i < slen(s)
-    invariant i <= slen(s) && vlen(t) == n0 + i
+    invariant i <= slen(s) && vlen(t) == n0 + i && n0 == vlen(old(t))
     invariant forall k: u64 :: k < i ==> vget(t, n0 + k) == sget(s, k)
+    invariant text_keeps(t, old(t), n0)
   {
     vec_push(&mut t, sget(s, i));
     i = i + 1;
@@ -50,13 +48,15 @@ fn text_push_str(t: &mut Vec[u8], s: Str)
 fn text_push_span(t: &mut Vec[u8], b: &Bytes, from: u64, to: u64)
   requires from <= to && to <= blen(b)
   ensures vlen(t) == vlen(old(t)) + (to - from)
+  ensures text_keeps(t, old(t), vlen(old(t)))
   ensures text_same_at(t, vlen(old(t)), b, from, to - from)
 {
   let n0 = vec_len(t);
   let mut i = from;
   while i < to
-    invariant from <= i && i <= to && vlen(t) == n0 + (i - from)
+    invariant from <= i && i <= to && vlen(t) == n0 + (i - from) && n0 == vlen(old(t))
     invariant text_same_at(t, n0, b, from, i - from)
+    invariant text_keeps(t, old(t), n0)
   {
     vec_push(&mut t, bget(b, i));
     i = i + 1;
@@ -66,6 +66,7 @@ fn text_push_span(t: &mut Vec[u8], b: &Bytes, from: u64, to: u64)
 /// Appends all of `b`.
 fn text_push_bytes(t: &mut Vec[u8], b: &Bytes)
   ensures vlen(t) == vlen(old(t)) + blen(b)
+  ensures text_keeps(t, old(t), vlen(old(t)))
   ensures text_same_at(t, vlen(old(t)), b, 0, blen(b))
 {
   text_push_span(&mut t, b, 0, blen(b));
