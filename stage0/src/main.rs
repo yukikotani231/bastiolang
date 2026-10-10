@@ -12,7 +12,8 @@
 //               `kernel`: freestanding C for a bare-metal x86-64 kernel (implies --emit-c)
 //               `user`: freestanding C for a user program under BastiOS (implies --emit-c)
 // Several input files form one program; constants must be defined before use,
-// in command-line order.
+// in command-line order. A file can also pull others in with `import "path";`
+// lines at its top (see `Loader`).
 
 mod ast;
 mod check;
@@ -24,7 +25,80 @@ mod parser;
 mod smt;
 mod verify;
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
+
+/// Reads source files into one program. A file may start with
+/// `import "path";` lines (paths relative to the file); each imported file
+/// is loaded, with its own imports, before the rest of the importing file
+/// is parsed, so constants it defines can be used there. A file is loaded
+/// once however often it is imported; a cycle of imports is an error.
+struct Loader {
+    files: Vec<(String, String)>,
+    /// Canonical path -> finished loading (false while its imports load).
+    state: HashMap<PathBuf, bool>,
+    prog: ast::Program,
+    consts: HashMap<String, u128>,
+}
+
+impl Loader {
+    /// Loads `path`. `from` is the import that names it (None for a file
+    /// on the command line). Errors are diagnostics, or None when the
+    /// message has already been printed.
+    fn load(&mut self, path: &Path, from: Option<diag::Pos>) -> Result<(), Option<diag::Diag>> {
+        let src = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(match from {
+                    Some(pos) => Some(diag::Diag::new("E-IMPORT", pos, format!("cannot read `{}`: {}", path.display(), e))),
+                    None => {
+                        eprintln!("bastioc0: cannot read {}: {}", path.display(), e);
+                        None
+                    }
+                })
+            }
+        };
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        match self.state.get(&canon) {
+            Some(true) => return Ok(()),
+            Some(false) => {
+                let pos = from.expect("a file on the command line is not loading yet");
+                return Err(Some(diag::Diag::new("E-IMPORT", pos, format!("`{}` imports itself (through this chain of imports)", path.display()))));
+            }
+            None => {}
+        }
+        self.state.insert(canon.clone(), false);
+        let k = self.files.len();
+        self.files.push((path.display().to_string(), src));
+        let toks = lexer::lex(&self.files[k].1, k).map_err(Some)?;
+        let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        // Leading `import "path";` lines.
+        let mut i = 0;
+        while toks[i].tok == lexer::Tok::Import {
+            let pos = toks[i].pos;
+            let lexer::Tok::Str(name) = &toks[i + 1].tok else {
+                return Err(Some(diag::Diag::new("E-PARSE", toks[i + 1].pos, "expected a file name in quotes after `import`")));
+            };
+            if toks[i + 2].tok != lexer::Tok::Semi {
+                return Err(Some(diag::Diag::new("E-PARSE", toks[i + 2].pos, "expected `;` after the imported file name")));
+            }
+            let name = String::from_utf8_lossy(name).to_string();
+            self.load(&dir.join(name), Some(pos))?;
+            i += 3;
+        }
+        let consts = std::mem::take(&mut self.consts);
+        let mut parser = parser::Parser::new(toks[i..].to_vec(), dir, consts);
+        let part = parser.program().map_err(Some)?;
+        self.consts = parser.consts;
+        self.prog.fns.extend(part.fns);
+        self.prog.specs.extend(part.specs);
+        self.prog.structs.extend(part.structs);
+        self.prog.enums.extend(part.enums);
+        self.state.insert(canon, true);
+        Ok(())
+    }
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -74,36 +148,28 @@ fn main() {
         eprintln!("usage: bastioc0 [--check] [--emit-c] [--dump-smt] [--target hosted|kernel|user] [-o out] <file.bastio>...");
         exit(2);
     }
-    let mut files: Vec<(String, String)> = Vec::new();
+    let input = inputs.join(" ");
+    let mut ld = Loader {
+        files: Vec::new(),
+        state: HashMap::new(),
+        prog: ast::Program { fns: Vec::new(), specs: Vec::new(), structs: Vec::new(), enums: Vec::new() },
+        consts: HashMap::new(),
+    };
     for input in &inputs {
-        match std::fs::read_to_string(input) {
-            Ok(s) => files.push((input.clone(), s)),
-            Err(e) => {
-                eprintln!("bastioc0: cannot read {}: {}", input, e);
-                exit(2);
+        if let Err(d) = ld.load(Path::new(input), None) {
+            match d {
+                Some(d) => eprint!("{}", d.render(&ld.files)),
+                None => {}
             }
+            exit(if ld.files.is_empty() { 2 } else { 1 });
         }
     }
-    let input = inputs.join(" ");
+    let Loader { files, mut prog, .. } = ld;
 
     let fail = |d: diag::Diag| -> ! {
         eprint!("{}", d.render(&files));
         exit(1);
     };
-
-    let mut prog = ast::Program { fns: Vec::new(), specs: Vec::new(), structs: Vec::new(), enums: Vec::new() };
-    let mut consts = std::collections::HashMap::new();
-    for (k, (path, src)) in files.iter().enumerate() {
-        let toks = lexer::lex(src, k).unwrap_or_else(|d| fail(d));
-        let dir = std::path::Path::new(path).parent().map(|p| p.to_path_buf()).unwrap_or_default();
-        let mut parser = parser::Parser::new(toks, dir, consts);
-        let part = parser.program().unwrap_or_else(|d| fail(d));
-        consts = parser.consts;
-        prog.fns.extend(part.fns);
-        prog.specs.extend(part.specs);
-        prog.structs.extend(part.structs);
-        prog.enums.extend(part.enums);
-    }
     mono::monomorphize(&mut prog).unwrap_or_else(|d| fail(d));
     ast::resolve_enum_types(&mut prog);
     check::check_structs(&prog).unwrap_or_else(|d| fail(d));

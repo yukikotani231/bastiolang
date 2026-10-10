@@ -245,7 +245,8 @@ include_bytes("path")                              // a file's bytes as a Str, p
 
 - Operators: `+ - * / %`, `== != < <= > >=`, `&& || !`. `&&` and `||` short-circuit.
 - Integer literals are decimal or hex (`0x1F`).
-- Several source files can be given on the command line; they form one program, and constants are visible in later files.
+- A program can span several files. A file may start with `import "path";` lines (the path is relative to the importing file); each imported file is loaded, with its own imports, before the rest of the file is read, so its constants can be used there. A file imported more than once is loaded once; files that import each other are `E-IMPORT`, as is a file that cannot be read. Files given together on the command line also form one program, in command-line order.
+- All files share one namespace, as in C: a function, type or constant name must be unique in the whole program.
 - `unreachable;` marks a point the prover must show no execution reaches (`E-VERIFY-UNREACHABLE`). The path ends there like a `return`, so linear values in hand need not be consumed. Its typical use is a `match` arm the specification rules out, such as the `Full` arm after swapping a value into a slot known to be empty. It compiles to `__builtin_unreachable()`, with no check.
 - A name cannot shadow one that is still in scope. Once a block ends, its names can be used again (two `match` arms can both bind `v`).
 - The entry point is `fn main(...) -> u64` (or with no result), taking any of the capabilities its target hands out, each at most once and as `&mut`: hosted `&mut Serial`, `&mut Pool`, `&mut Host`; kernel those plus `&mut Mmu`, `&mut Cpu`; user `&mut Serial` only. A user program's result is its exit code. The older `fn main(con: Serial) -> Serial` is still accepted outside user programs.
@@ -267,6 +268,7 @@ Expressions in `requires` / `ensures` / `invariant` / `assert` exist only at com
 | `E-LINEAR-LEAK` | A buffer is still owned at the end of its scope or at a `return`; an owned buffer is overwritten |
 | `E-LINEAR-BRANCH` | Only one arm of an `if` or a `match` consumes a buffer; a loop body changes the ownership of an outer buffer |
 | `E-MATCH` | A `match` misses a variant, matches one twice, or has an arm after `_` |
+| `E-IMPORT` | An imported file cannot be read, or files import each other |
 
 The same rules apply to every linear type (`Frame`, `PageTable`, the capabilities), and a `&mut` parameter must hold a value again when the function returns.
 
