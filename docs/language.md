@@ -6,7 +6,7 @@ The language as stage0 implements it today: the v0 proof pipeline, plus `&mut` b
 
 | Type | Meaning |
 | --- | --- |
-| `u64` | Unsigned 64-bit integer. Arithmetic is proved to stay in range; it never wraps |
+| `u64` | Unsigned 64-bit integer. Arithmetic is proved to stay in range; it never wraps. (Narrower and signed integers are designed in [integers.md](integers.md), not implemented yet) |
 | `bool` | Boolean |
 | `Buf` | An owned buffer of u64 elements. **Linear**: must be consumed exactly once |
 | `Bytes` | An owned buffer of bytes. **Linear**. Every element is proved to be `<= 255` |
