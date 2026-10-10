@@ -2,7 +2,7 @@
 
 Bastio is a systems language whose memory safety is proved at compile time. This document describes the language that the bootstrap compiler, `bastioc0` (in `stage0/`), accepts on the current `main` branch. The self-hosted compiler in `stage1/` is being written to accept exactly the same language; see [ROADMAP.md](../ROADMAP.md) for how far it has got and for what is planned.
 
-Bastio is pre-release. Anything here may change.
+Bastio is pre-release. Anything here may change. New to the language? Start with the [tutorial](tutorial.md).
 
 **About the examples.** Every example in a `bastio` code block below is a whole program, and `tests/run.sh` compiles each one. Its first line says what must happen: `// expect-exit: N` (it verifies, runs and exits with N), `// expect-error: CODE` (it is rejected with that error), or `// expect-ok` (it verifies; used for kernel programs, which cannot run on the build machine). So if an example here is wrong, the test suite fails. Grammar sketches that are not programs are shown as plain text.
 

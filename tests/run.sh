@@ -74,21 +74,23 @@ for r in examples/*/run.sh; do
   if BASTIOC="$BASTIOC" "$r" >"$tmp/ex.out" 2>&1; then pass=$((pass+1)); else
     echo "FAIL $r"; sed 's/^/    /' "$tmp/ex.out" | tail -20; fail=$((fail+1)); fi
 done
-# Every ```bastio block in the language reference is a whole program, checked
+# Every ```bastio block in docs/*.md is a whole program, checked
 # like a test: its first line is `// expect-exit: N` (built and run on the
 # hosted target), `// expect-error: CODE` (rejected with CODE), or
 # `// expect-ok` (accepted by --check; for kernel and user examples that
 # cannot run here), with an optional `// target: T` line after it. Sketches
 # that are not whole programs use ```text instead.
 mkdir -p "$tmp/doc"
-awk -v dir="$tmp/doc" '
-  /^```bastio$/ { n = NR; f = dir "/line" NR ".bastio"; next }
-  /^```/ && n { n = 0; close(f); next }
-  n { print > f }
-' docs/language.md
+for md in docs/*.md; do
+  awk -v dir="$tmp/doc" -v doc="$(basename "$md" .md)" '
+    /^```bastio$/ { n = NR; f = dir "/" doc "@" NR ".bastio"; next }
+    /^```/ && n { n = 0; close(f); next }
+    n { print > f }
+  ' "$md"
+done
 for f in "$tmp"/doc/*.bastio; do
   [ -e "$f" ] || continue
-  at="docs/language.md:$(basename "$f" .bastio | sed 's/^line//')"
+  at="docs/$(basename "$f" .bastio | sed 's/@/.md:/')"
   head1=$(head -1 "$f")
   target=$(sed -n 's|^// target: *||p' "$f" | head -1)
   case "$head1" in
