@@ -684,8 +684,8 @@ fn x86_words(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, t: u64) -> u64 {
   if k == TY_BUF || k == TY_BYTES || k == TY_STR || k == TY_POOL {
     return 2;
   }
-  if (k == TY_LOCK || k == TY_ATOMIC || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA || k == TY_MMU || k == TY_CPU || k == TY_LEASE) && !g.stage0 {
-    return 1;     // a lock or atomic word's address; Ports, MmioSpace, Mmu and Cpu (0); a frame's address (a Lease: its table)
+  if (k == TY_LOCK || k == TY_ATOMIC || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA || k == TY_MMU || k == TY_CPU || k == TY_LEASE || k == TY_SHARED) && !g.stage0 {
+    return 1;     // a lock or atomic word's address; Ports, MmioSpace, Mmu and Cpu (0); a frame's address (a Lease: its table; a Shared page)
   }
   if (k == TY_PORTIO || k == TY_MMIO) && !g.stage0 {
     return 2;     // base, then count or length
@@ -793,7 +793,9 @@ fn x86_inline_builtin(p: &Parser, i: u64) -> bool {
     || name_is(p, i, "frame_read8") || name_is(p, i, "frame_write") || name_is(p, i, "frame_write8") || name_is(p, i, "pt_has") || name_is(p, i, "pt_writable")
     || name_is(p, i, "pt_put") || name_is(p, i, "pt_put_frame") || name_is(p, i, "pt_take") || name_is(p, i, "pt_take_frame")
     || name_is(p, i, "bcopy") || name_is(p, i, "bmove") || name_is(p, i, "frame_to_bytes") || name_is(p, i, "bytes_to_frame")
-    || name_is(p, i, "pt_lease_count");
+    || name_is(p, i, "pt_lease_count") || name_is(p, i, "shared_new") || name_is(p, i, "shared_dup") || name_is(p, i, "shared_drop")
+    || name_is(p, i, "shared_id") || name_is(p, i, "pt_shared") || name_is(p, i, "pt_put_shared") || name_is(p, i, "pt_take_shared")
+    || name_is(p, i, "pt_dup_shared");
 }
 
 /// The length builtins (stage0's LENS): word 0 of their argument.
@@ -3697,7 +3699,52 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     }
     x86_es(&mut g, "mov (%rdx), %rdx");
     x86_es(&mut g, "mov %rax, (%rdx,%rcx,8)");
-  } else if name_is(p, i, "pt_take") || name_is(p, i, "pt_take_frame") {
+  } else if name_is(p, i, "shared_new") || name_is(p, i, "shared_dup") || name_is(p, i, "pt_dup_shared") {
+    // Shared pages: a 32-bit reference count per pool frame, by page
+    // number. A new page starts at one (a plain store is a release on
+    // x86); a copy adds one atomically. pt_dup_shared copies the page a
+    // slot maps.
+    if name_is(p, i, "pt_dup_shared") {
+      x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RAX, 0, 0, 0);
+      x86_es(&mut g, "mov (%rdx,%rax,8), %rax");
+      x86_es(&mut g, "movabs $0x000FFFFFFFFFF000, %rcx");
+      x86_es(&mut g, "and %rcx, %rax");
+    } else {
+      x86_to_regs(&mut g, c, &mut m, p, i, XR_RAX, 0, 0, 0, 0);
+    }
+    x86_shared_ref(&mut g);
+    if name_is(p, i, "shared_new") {
+      x86_es(&mut g, "movl $1, (%rcx,%rdx,4)");
+    } else {
+      x86_es(&mut g, "lock incl (%rcx,%rdx,4)");
+    }
+  } else if name_is(p, i, "shared_drop") {
+    // Gives up one reference: the page number when it was the last, else
+    // all ones.
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RSI, XR_RAX, 0, 0, 0);
+    x86_shared_ref(&mut g);
+    x86_es(&mut g, "mov %rdx, %rax");
+    x86_es(&mut g, "mov $-1, %rsi");
+    x86_es(&mut g, "lock decl (%rcx,%rdx,4)");
+    x86_es(&mut g, "cmovnz %rsi, %rax");
+  } else if name_is(p, i, "shared_id") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RAX, 0, 0, 0, 0);
+    x86_es(&mut g, "sub bst_rt_pool_base(%rip), %rax");
+    x86_es(&mut g, "shr $12, %rax");
+  } else if name_is(p, i, "pt_shared") {
+    // Bit 9, one the processor ignores, marks a slot mapping a shared page.
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RAX, 0, 0, 0);
+    x86_es(&mut g, "mov (%rdx,%rax,8), %rax");
+    x86_es(&mut g, "shr $9, %rax");
+    x86_es(&mut g, "and $1, %eax");
+  } else if name_is(p, i, "pt_put_shared") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RCX, XR_RAX, XR_RSI, 0);
+    x86_es(&mut g, "shl $1, %rsi");
+    x86_es(&mut g, "or %rsi, %rax");
+    x86_es(&mut g, "or $0x205, %rax");
+    x86_es(&mut g, "mov (%rdx), %rdx");
+    x86_es(&mut g, "mov %rax, (%rdx,%rcx,8)");
+  } else if name_is(p, i, "pt_take") || name_is(p, i, "pt_take_frame") || name_is(p, i, "pt_take_shared") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RCX, 0, 0, 0);
     x86_es(&mut g, "mov (%rdx), %rdx");
     x86_es(&mut g, "lea (%rdx,%rcx,8), %rdx");
@@ -4510,6 +4557,15 @@ fn x86_take_pool(g: &mut X86) {
   g.cg.pool = vec_new[u64]();
   x86_append(&mut g.ln, b);
   vec_free(b);
+}
+
+/// Shared pages: %rdx the page number of the page at %rax, %rcx the
+/// reference counts.
+fn x86_shared_ref(g: &mut X86) {
+  x86_es(&mut g, "mov %rax, %rdx");
+  x86_es(&mut g, "sub bst_rt_pool_base(%rip), %rdx");
+  x86_es(&mut g, "shr $12, %rdx");
+  x86_es(&mut g, "lea bst_rt_shared_refs(%rip), %rcx");
 }
 
 /// The register of expression `i` if it is a variable kept in one (0: none).
@@ -5836,6 +5892,7 @@ fn x86_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
     if !g.stage0 {
       x86_runtime1(&mut g.out);
       cg_s(&mut g.out, "\t.bss\n\t.p2align 3\nbst_rt_pt_leases:\t.zero 262144     # a 32-bit lease count per pool frame\n");
+      cg_s(&mut g.out, "bst_rt_shared_refs:\t.zero 262144   # a 32-bit reference count per shared pool frame\n");
     }
   }
   cg_s(&mut g.out, "\t.section .rodata\n");
@@ -7205,6 +7262,7 @@ fn x86_runtime_kernel(out: &mut Vec[u64]) {
   cg_s(&mut out, "bst_rt_mbi:\t.quad 0\n");
   cg_s(&mut out, "bst_rt_pool_base:\t.quad 0\n");
   cg_s(&mut out, "bst_rt_pt_leases:\t.zero 262144     # a 32-bit lease count per pool frame\n");
+  cg_s(&mut out, "bst_rt_shared_refs:\t.zero 262144   # a 32-bit reference count per shared pool frame\n");
   cg_s(&mut out, "bst_rt_arena_lock:\t.quad 0\n");
   cg_s(&mut out, "bst_rt_arena_top:\t.quad 0\n");
   cg_s(&mut out, "bst_rt_free_list:\t.quad 0\n");
