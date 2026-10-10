@@ -68,7 +68,7 @@ The tests are the worked examples: `tests/pass/core_*.bastio` and `tests/pass/st
 | `parse_u64(b, from, to) -> Option[u64]` | Decimal. `Some` only if the range is non-empty and all digits (spec fn `all_digits`), and then its value is `bdec(b, from, to)`, the number the digits denote; never overflows |
 | `parse_u8`, `parse_u16`, `parse_u32` | The same (value included), and the value fits the type |
 | `parse_i64` and `parse_i8` ... `parse_i32` | An optional `-`, then digits; the value is `bdec` of the digits, negated after a `-` (spec fn `dec_signed`), and fits the type, down to the minimum |
-| `parse_hex_u64(b, from, to)` | Hexadecimal digits, either case, no `0x` |
+| `parse_hex_u64(b, from, to)` | Hexadecimal digits, either case, no `0x`; `Some` only if all are hex digits (spec fn `all_hex`), and then its value is `bhex(b, from, to)` |
 | `fmt_u64(t, x)` | Appends 1 to 20 bytes, every one a decimal digit |
 | `fmt_i64(t, x)` | A `-` when negative, then the digits; 1 to 21 bytes |
 | `fmt_u64_pad(t, x, width)` | Left-padded with spaces |
@@ -115,6 +115,45 @@ Proved, for every `V`: every index is in bounds and no counter overflows; `len` 
 
 Insertion sort is quadratic in the worst case. It was chosen because its proof is short; a heap sort or merge sort with the same guarantee is future work.
 
+### `core/ring.bastio`
+
+A `Ring { h, n, cap }` holds only the indices of a ring buffer: element `i` (0 the oldest) is in slot `(h + i) % cap`, and the elements live wherever the caller keeps them (a console's `Bytes`, a `Buf` of command records, a slice of a bigger buffer). Every function needs and keeps `ring_ok(r)`: `0 < cap <= 2^63`, `h < cap`, `n <= cap`.
+
+| Function | Proved |
+| --- | --- |
+| `ring_new(cap)` | Empty, head at slot 0 |
+| `ring_slot(r, i)` | Needs `i < cap`. The slot of element `i`, below `cap` (spec fn `ring_at`) |
+| `ring_push(r)` | Needs room. Claims and returns the slot after the last element; `n` grows by one, `h` stays |
+| `ring_pop(r)` | Needs an element. Returns the head's slot; the head moves on by one, wrapping |
+| `ring_push_n(r, k)`, `ring_pop_n(r, k)` | The same for `k` elements at once, for callers that copy runs of bytes |
+| `ring_room`, `ring_empty`, `ring_full`, `ring_clear` | Exactly `cap - n`, `n == 0`, `n == cap`; empties it |
+
+`Queue { r: Ring, q: Buf }` is the common case, a FIFO of `u64` words (`queue_new(cap)`, `queue_push`, `queue_pop`, `queue_peek`, `queue_len`, `queue_free`): `queue_pop` and `queue_peek` return the word in the head's slot. A full queue is a precondition, so the caller decides whether to drop (a console) or wait (a pipe).
+
+### `core/bitmap.bastio`
+
+An allocation map is a `Bytes` with one byte per entry (a disk block, a page, a slot): 0 free, anything else in use. Functions take a range `lo..hi`, so a map can reserve its first entries.
+
+| Function | Proved |
+| --- | --- |
+| `map_find_free(m, lo, hi, hint)` | Searches from `hint` to `hi`, then from `lo` (a hint outside the range starts at `lo`). Returns a free entry in `lo..hi`, or `hi` only when all of `lo..hi` is in use (spec fn `map_full`) |
+| `map_take(m, lo, hi, hint)` | The same, and marks the entry it returns in use; no other byte changes (spec fn `map_same_but`) |
+| `map_give(m, i)` | Marks entry `i` free and nothing else |
+| `map_fill(m, lo, hi, v)` | Sets `lo..hi` to `v` and leaves the rest |
+| `map_is_free(m, i)`, `map_count_free(m, lo, hi)` | Exactly whether byte `i` is 0; a count of at most `hi - lo` |
+
+### `core/csum.bastio`
+
+| Function | Proved |
+| --- | --- |
+| `csum_add(s, v)` | One step of a ones'-complement sum of 16-bit words: `s + v`, less 65535 when it carries |
+| `csum_sum16(b, off, n, s0)` | The sum of bytes `off..off+n` as big-endian words, added to `s0` (an odd byte padded); a 16-bit value |
+| `csum_inet(b, off, n)` | The Internet checksum (RFC 1071): 0 over a header that holds its own |
+| `csum_pseudo4(src, dst, proto, size)` | The IPv4 pseudo-header's sum, to start a UDP or TCP sum |
+| `crc32(b, off, n)`; `crc32_start`, `crc32_update`, `crc32_end` | CRC-32 (IEEE 802.3), in one call or in pieces; bit by bit, no table |
+
+That the sums are the checksums the standards define is checked by the tests on known values (`tests/pass/core_csum.bastio`: the CRC-32 check value of "123456789" and an IPv4 header), not proved.
+
 ### `std/host.bastio`
 
 `eprint_str(h, s)`, `eprint_text(h, t)`, `host_arg_is(h, i, s)`, `read_file(h, path) -> Option[Bytes]`, `read_file_str(h, path: Str)`, `write_file_str(h, path: Str, data)`.
@@ -123,11 +162,14 @@ Insertion sort is quadratic in the worst case. It was chosen because its proof i
 
 What the library would say if the language let it. Each is a language or verifier change, not a library change. (Earlier gaps, all closed: `old(x)` is allowed in loop invariants, which the text functions and `bytes_copy_into` use; a local variable may share a function's name, so importing core no longer reserves its local names; a `spec fn` may be generic; `vcount` counts the elements of a vector, which proves the sort a permutation and the map's counters; and imports are searched for, so `import "core/text.bastio"` works from anywhere.)
 
-None open. (The two closed last: `bdec` names the value of a digit string, so every `parse_*` is proved to return the value of its digits; and an existing `Bytes` is known to be at most 2^60 long, which is all a single value can say.)
+- **Packed bitmaps.** `core/bitmap.bastio` spends a byte per entry. Packing 64 entries in a word needs the prover to know what `|` and `&` do to one bit; it reasons exactly only about shifts and low masks.
+- **The order of a FIFO.** `Queue` is proved to return the word at its head, not that words come out in the order they went in: that needs a ghost sequence of the contents, which specifications cannot hold yet.
+
+(Closed last: `bdec` and `bhex` name the value of a digit string, so every `parse_*` is proved to return the value of its digits; and an existing `Bytes` is known to be at most 2^60 long, which is all a single value can say.)
 
 ## Where it came from
 
-A survey of the hand-written helpers in `stage1/`, BastiOS (`src/` and `user/`) and `tests/pass/`, on 2026-10-10, found these copies. They are the candidates for moving onto core. Nothing has been moved yet: stage1 and BastiOS are changed by their own owners.
+A survey of the hand-written helpers in `stage1/`, BastiOS (`src/` and `user/`) and `tests/pass/`, on 2026-10-10, found these copies. They are the candidates for moving onto core; stage1 and BastiOS are changed by their own owners. BastiOS's endian loads and stores and its range comparison moved onto core first (bastios #101).
 
 | Helper | Copies | core |
 | --- | --- | --- |
@@ -146,3 +188,6 @@ A survey of the hand-written helpers in `stage1/`, BastiOS (`src/` and `user/`) 
 | Vector contains (`has_id`, `has_u`) | 2 | `vec_contains_u64` |
 | Insertion sort | 2 (stage1's sort records by a key, which core cannot do yet) | `sort_u64` |
 | Lookup by key: every table is a linear scan (`find_inst`, `env_find`, `find_file`, ...) | many | `HashMap` |
+| Ring buffers: head and count over a fixed capacity (console output, tty input, pipes, AF_UNIX channels, the disk command queue) | 6 (BastiOS) | `Ring`, `Queue` |
+| Allocation maps, a byte or word per entry with a wrap-around search (disk blocks, pages) | 2 (BastiOS) | `core/bitmap.bastio` |
+| The Internet checksum (`cadd`, `sum16`, `csum`, `l4_sum`) | 1 (BastiOS network) | `core/csum.bastio` |

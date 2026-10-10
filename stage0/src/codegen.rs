@@ -1791,6 +1791,7 @@ pub fn trusted_base() -> String {
         out.push_str(&format!("lemma vcount: {}\n", l));
     }
     out.push_str("definition bdec: bdec(b, f, t) is 0 when t <= f, else 10 * bdec(b, f, t - 1) + (bget(b, t - 1) - 48)\n");
+    out.push_str("definition bhex: bhex(b, f, t) is 0 when t <= f, else 16 * bhex(b, f, t - 1) + the value of the hex digit bget(b, t - 1) (0-9, a-f, A-F)\n");
     out
 }
 
