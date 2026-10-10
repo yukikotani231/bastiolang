@@ -125,6 +125,7 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("cpu_fpu_load", Avail::Kernel, vec![m(Cpu), r(Frame)], Unit),
         ("cpu_count", Avail::Kernel, vec![r(Cpu)], U64),
         ("boot_fb", Avail::Kernel, vec![r(Cpu), U64], U64),
+        ("boot_acpi", Avail::Kernel, vec![r(Cpu), U64, U64], U64),
         ("port_claim", Avail::Mem, vec![m(Ports), U64, U64], PortIo),
         ("port_release", Avail::Mem, vec![m(Ports), PortIo], Unit),
         ("port_base", Avail::Mem, vec![r(PortIo)], U64),
