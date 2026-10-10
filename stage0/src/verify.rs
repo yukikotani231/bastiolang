@@ -322,8 +322,19 @@ pub fn verify_program(p: &Program) -> Result<(usize, Vec<String>), Diag> {
     let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0 };
     v.smt(&format!("(declare-const {} Int)", POOLSIZE))?;
     v.smt(&format!("(assert (and (<= 0 {p}) (<= {p} {})))", FRAME_LIMIT, p = POOLSIZE))?;
+    // Each function gets its own solver scope: what is declared and assumed
+    // while verifying one (some of it quantified, such as "every byte of a
+    // Bytes is <= 255") must not burden the queries for all later ones.
+    // BASTIO_TIME=1 prints the time each function took.
+    let timed = std::env::var("BASTIO_TIME").is_ok();
     for f in &p.fns {
+        let t0 = std::time::Instant::now();
+        v.smt("(push 1)")?;
         v.verify_fn(f).map_err(|d| crate::check::in_copy(d, &f.name))?;
+        v.smt("(pop 1)")?;
+        if timed {
+            eprintln!("{:8.1} ms {}", t0.elapsed().as_secs_f64() * 1000.0, f.name);
+        }
     }
     let log = std::mem::take(&mut v.solver.log);
     Ok((v.obligations, log))
