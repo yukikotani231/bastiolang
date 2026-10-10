@@ -131,7 +131,7 @@ Not proved: that a lookup finds every key present.
 | --- | --- |
 | `sort_u64(v)` | Insertion sort. Afterwards the vector is sorted (spec fn `sorted`) and a permutation of what it was (spec fn `same_elems`: same length, and each value as many times) |
 | `merge_sort_u64(v)` | The same guarantee as `sort_u64`, in O(n log n) time: merge sort, with insertion sort below 16 elements. Uses n words of extra memory |
-| `sort_by_key_u64(v, keys)` | Needs every element of `v` to be an index into `keys` (spec fn `all_indices_below`). Afterwards `v` is a permutation of what it was and ascends by key (spec fn `sorted_by_key`: `keys[v[a]] <= keys[v[b]]` for `a < b`), so the indices it returns read `keys` with no further check. Merge sort; equal keys may change order |
+| `sort_by_key_u64(v, keys)` | Needs every element of `v` to be an index into `keys` (spec fn `all_indices_below`). Afterwards `v` is a permutation of what it was and ascends by key, indices with equal keys ascending too (spec fns `sorted_by_key` and `key_le`), so the indices it returns read `keys` with no further check. Sorting `0..n` this way is a stable sort of n records by a field. Merge sort |
 | `lower_bound_u64(v, x)` | Needs `sorted(v)`. The first index whose element is `>= x`: everything before it is smaller, everything from it on is not |
 | `sorted_contains_u64(v, x)` | Needs `sorted(v)`. Exactly whether `x` occurs |
 | `vec_contains_u64(v, x)` | A linear scan; exactly whether `x` occurs |

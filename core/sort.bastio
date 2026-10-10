@@ -123,26 +123,34 @@ spec fn all_indices_below(v: &Vec[u64], n: u64) -> bool {
   forall k: u64 :: k < vlen(v) ==> vget(v, k) < n
 }
 
-/// The elements of `v` are indices into `keys`, in ascending order of key.
+/// Index `x` comes no later than index `y` when sorting by `keys`: a
+/// smaller key first, and on equal keys the smaller index.
+spec fn key_le(keys: &Vec[u64], x: u64, y: u64) -> bool {
+  vget(keys, x) < vget(keys, y) || (vget(keys, x) == vget(keys, y) && x <= y)
+}
+
+/// The elements of `v` are indices into `keys`, in ascending order of key,
+/// and indices with equal keys in ascending order.
 spec fn sorted_by_key(v: &Vec[u64], keys: &Vec[u64]) -> bool {
   all_indices_below(v, vlen(keys)) &&
-  (forall a: u64 :: forall b: u64 :: a < b && b < vlen(v) ==> vget(keys, vget(v, a)) <= vget(keys, vget(v, b)))
+  (forall a: u64 :: forall b: u64 :: a < b && b < vlen(v) ==> key_le(keys, vget(v, a), vget(v, b)))
 }
 
 /// The same, in descending order.
 spec fn sorted_by_key_desc(v: &Vec[u64], keys: &Vec[u64]) -> bool {
   all_indices_below(v, vlen(keys)) &&
-  (forall a: u64 :: forall b: u64 :: a < b && b < vlen(v) ==> vget(keys, vget(v, a)) >= vget(keys, vget(v, b)))
+  (forall a: u64 :: forall b: u64 :: a < b && b < vlen(v) ==> key_le(keys, vget(v, b), vget(v, a)))
 }
 
-/// The key of every element of `v` is at most `x`.
+/// Every element of `v` comes no later than index `x`.
 spec fn all_keys_at_most(v: &Vec[u64], keys: &Vec[u64], x: u64) -> bool {
-  forall k: u64 :: k < vlen(v) ==> vget(keys, vget(v, k)) <= x
+  forall k: u64 :: k < vlen(v) ==> key_le(keys, vget(v, k), x)
 }
 
 /// Sorts `v`, a vector of indices into `keys`, by key: afterwards
-/// `keys[v[0]] <= keys[v[1]] <= ...`, and `v` holds the same indices.
-/// Merge sort, O(n log n); equal keys may change order.
+/// `keys[v[0]] <= keys[v[1]] <= ...`, indices with equal keys ascend, and
+/// `v` holds the same indices. Sorting `0..n` this way is a stable sort of
+/// n records by a field. Merge sort, O(n log n).
 fn sort_by_key_u64(v: &mut Vec[u64], keys: &Vec[u64])
   requires all_indices_below(v, vlen(keys))
   ensures same_elems(v, old(v)) && sorted_by_key(v, keys)
@@ -168,17 +176,26 @@ fn sort_by_key_u64(v: &mut Vec[u64], keys: &Vec[u64])
   }
   sort_by_key_u64(&mut a, keys);
   sort_by_key_u64(&mut b, keys);
-  // Merge from the tails: the larger key goes first, so `out` descends.
+  // Merge from the tails: the later of the two tails (larger key, or equal
+  // key and larger index) goes first, so `out` descends.
   let mut out = vec_new[u64]();
   while vec_len(a) > 0 || vec_len(b) > 0
     invariant vlen(v) == 0 && vlen(out) + vlen(a) + vlen(b) == n
     invariant forall x: u64 :: vcount(out, x) + vcount(a, x) + vcount(b, x) == vcount(old(v), x)
     invariant sorted_by_key(a, keys) && sorted_by_key(b, keys) && sorted_by_key_desc(out, keys)
-    invariant vlen(out) > 0 ==> all_keys_at_most(a, keys, vget(keys, vget(out, vlen(out) - 1))) && all_keys_at_most(b, keys, vget(keys, vget(out, vlen(out) - 1)))
+    invariant vlen(out) > 0 ==> all_keys_at_most(a, keys, vget(out, vlen(out) - 1)) && all_keys_at_most(b, keys, vget(out, vlen(out) - 1))
   {
     let la = vec_len(a);
     let lb = vec_len(b);
-    if lb == 0 || (la > 0 && vec_get(keys, vec_get(a, la - 1)) >= vec_get(keys, vec_get(b, lb - 1))) {
+    let mut take_a = lb == 0;
+    if la > 0 && lb > 0 {
+      let x = vec_get(a, la - 1);
+      let y = vec_get(b, lb - 1);
+      let kx = vec_get(keys, x);
+      let ky = vec_get(keys, y);
+      take_a = kx > ky || (kx == ky && x >= y);
+    }
+    if take_a {
       let x = vec_pop(&mut a);
       vec_push(&mut out, x);
     } else {
@@ -193,7 +210,7 @@ fn sort_by_key_u64(v: &mut Vec[u64], keys: &Vec[u64])
     invariant vlen(v) + vlen(out) == n
     invariant forall x: u64 :: vcount(v, x) + vcount(out, x) == vcount(old(v), x)
     invariant sorted_by_key(v, keys) && sorted_by_key_desc(out, keys)
-    invariant vlen(v) > 0 && vlen(out) > 0 ==> vget(keys, vget(v, vlen(v) - 1)) <= vget(keys, vget(out, vlen(out) - 1))
+    invariant vlen(v) > 0 && vlen(out) > 0 ==> key_le(keys, vget(v, vlen(v) - 1), vget(out, vlen(out) - 1))
   {
     let x = vec_pop(&mut out);
     vec_push(&mut v, x);
