@@ -150,7 +150,10 @@ struct X86 {
   /// Whether `x86_two` swapped its operands.
   sw: bool,
   /// Something the backend does not support yet was found.
-  failed: bool
+  failed: bool,
+  /// Write exactly what stage0's backend writes: none of the improvements
+  /// made only here (for the differential test against stage0).
+  stage0: bool
 }
 
 fn x86_new() -> X86 {
@@ -160,7 +163,7 @@ fn x86_new() -> X86 {
     saves: vec_new[X86Save](), stack: vec_new[u64](), bsize: vec_new[u64](),
     sdata: vec_new[u64](), sstart: vec_new[u64](), slens: vec_new[u64](),
     labels: 0, frame: 0, depth: 0, env: 0, pre: 0, retl: 0, retw: 0, reto: 0, rdk: 0, rda: 0, rdo: 0,
-    parent: vec_new[u64](), cur: 0, decl: vec_new[X86Decl](), sw: false, failed: false
+    parent: vec_new[u64](), cur: 0, decl: vec_new[X86Decl](), sw: false, failed: false, stage0: false
   };
 }
 
@@ -2898,6 +2901,46 @@ fn x86_hex(out: &mut Vec[u64], v: u64) {
 /// A call (node `i`, instance `inst` when it names a generic one) whose
 /// result has type `t`. A one-word result ends in %rax, a larger one on the
 /// stack.
+/// The argument registers, in the order of the words of the arguments
+/// from the top of the stack (the last parameter's first word) up. Not
+/// %r8-%r11, which hold the caller's variables around a call.
+fn x86_argreg(a: u64) -> u64 {
+  if a == 0 { return XR_RDI; }
+  if a == 1 { return XR_RSI; }
+  if a == 2 { return XR_RDX; }
+  return XR_RCX;
+}
+
+/// The number of words of `x`'s parameters if they are passed in
+/// registers (at most 4, and never to `main`, which the entry calls), else
+/// 0. Not in stage0's backend: there every argument is on the stack.
+fn x86_regargs(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> u64 {
+  if g.stage0 {
+    return 0;
+  }
+  let xi = inst_at(m, x);
+  if kind_of(p, xi.def) != D_FN || name_is(p, xi.def, "main") {
+    return 0;
+  }
+  let dn = node_at(p.nodes, xi.def);
+  let mut n = 0;
+  let mut q = dn.a;
+  while q != 0 {
+    let qn = node_at(p.nodes, q);
+    let pt = conv(&mut m, p, qn.a, x, q);
+    if kind_t(m, pt) == TY_MUTREF {
+      n = wrap_add(n, 1);
+    } else {
+      n = wrap_add(n, x86_words(&mut g, c, m, p, pt));
+    }
+    q = qn.next;
+  }
+  if n > 4 {
+    return 0;
+  }
+  return n;
+}
+
 fn x86_call(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64, t: u64) {
   let n = node_at(p.nodes, i);
   let rn = x86_words(&mut g, c, m, p, t);
@@ -2923,6 +2966,15 @@ fn x86_call(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u6
     }
     x86_arg(&mut g, c, &mut m, p, a);
     a = next_of(p, a);
+  }
+  let na = x86_regargs(&mut g, c, &mut m, p, x);
+  if na == aw {
+    let mut j = 0;
+    while j < na {
+      x86_pop(&mut g, x86_reg(x86_argreg(j)));
+      j = j + 1;
+    }
+    aw = 0;
   }
   x86_t(&mut g, "call ");
   x86_sym(&mut g, m, p, x);
@@ -3925,6 +3977,16 @@ fn x86_ln_to(g: &mut X86, out_file: bool) {
 }
 
 /// Generates function instance `x` into the file.
+/// Where word `o` of a parameter is at entry: its argument register when
+/// the `na` words of the parameters, laid out from `base`, came in
+/// registers, else its frame slot.
+fn x86_param_word(na: u64, base: u64, o: u64) -> X86Op {
+  if na > 0 && o >= base && o - base < wrap_mul(8, na) {
+    return x86_reg(x86_argreg((o - base) / 8));
+  }
+  return x86_frame_op(o);
+}
+
 fn x86_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
   let xi = inst_at(m, x);
   let dn = node_at(p.nodes, xi.def);
@@ -3983,7 +4045,15 @@ fn x86_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
     vec_push(&mut sizes, w);
     q = qn.next;
   }
+  // Parameters passed in registers get frame slots laid out as they
+  // would be on the stack.
+  let na = x86_regargs(&mut g, c, &mut m, p, x);
   let mut off = wrap_add(XB, 16);
+  let mut base = 0;
+  if na > 0 {
+    base = x86_slot(&mut g, na);
+    off = base;
+  }
   k = vec_len(qs);
   while k > 0 {
     k = k - 1;
@@ -3999,6 +4069,9 @@ fn x86_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
     off = wrap_add(off, wrap_mul(8, u_at(sizes, k)));
   }
   g.reto = off;
+  if na > 0 {
+    g.reto = wrap_add(XB, 16);
+  }
   // Scalar parameters move to registers, when there are registers left.
   k = 0;
   while k < vec_len(qs) {
@@ -4011,7 +4084,7 @@ fn x86_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
     if vi != 0 && v.k == XS_SLOT {
       let r = x86_reg_for(&mut g, m, id, pt);
       if r != 0 {
-        x86_mov(&mut g, x86_frame_op(v.o), x86_reg(r));
+        x86_mov(&mut g, x86_param_word(na, base, v.o), x86_reg(r));
         x86_set_var(&mut g, wrap_sub(vi, 1), x86_st(XS_REG, 0, r, 0, 0));
       } else {
         let rs = x86_regs_for(&mut g, id);
@@ -4020,12 +4093,30 @@ fn x86_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
           while j < 3 {
             let r2 = x86_st_reg(rs, j);
             if r2 != 0 {
-              x86_mov(&mut g, x86_frame_op(wrap_add(v.o, wrap_mul(8, j))), x86_reg(r2));
+              x86_mov(&mut g, x86_param_word(na, base, wrap_add(v.o, wrap_mul(8, j))), x86_reg(r2));
             }
             j = j + 1;
           }
           x86_set_var(&mut g, wrap_sub(vi, 1), rs);
         }
+      }
+    }
+    k = k + 1;
+  }
+  // The words of the parameters left in the frame.
+  k = 0;
+  while k < vec_len(qs) {
+    let q2 = u_at(qs, k);
+    let qn = node_at(p.nodes, q2);
+    let id = x86_nm(&mut g, p, 0, qn.s, qn.e);
+    let vi = x86_find(g, id);
+    let v = x86_var_at(g, wrap_sub(vi, 1));
+    if na > 0 && vi != 0 && (v.k == XS_SLOT || v.k == XS_PTR) {
+      let mut j = 0;
+      while j < u_at(sizes, k) && j < 4 {
+        let o = wrap_add(v.o, wrap_mul(8, j));
+        x86_mov(&mut g, x86_param_word(na, base, o), x86_frame_op(o));
+        j = j + 1;
       }
     }
     k = k + 1;
