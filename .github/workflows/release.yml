@@ -1,0 +1,92 @@
+# Builds a release from a version tag. Nothing here runs until a tag
+# `vX.Y.Z` is pushed (or the workflow is started by hand), and what it
+# creates is a *draft* GitHub release: publishing it is a separate, manual
+# step. See docs/releasing.md.
+name: release
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag to build, e.g. v0.1.0 (artifacts only, no release)'
+        required: true
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y z3
+      - name: The tag matches the version and the changelog
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' stage0/Cargo.toml | head -1)
+          [ "$TAG" = "v$version" ] || { echo "::error::tag $TAG but stage0/Cargo.toml says $version"; exit 1; }
+          grep -q "^## \[$version\]" CHANGELOG.md || { echo "::error::CHANGELOG.md has no section for $version"; exit 1; }
+      - name: Build stage0
+        run: cd stage0 && RUSTFLAGS="-D warnings" cargo build --release --locked
+      - name: Tests
+        run: |
+          tests/run.sh
+          stage1/difftest.sh
+      - name: Build bastioc1 with stage0, then with itself
+        run: |
+          stage0/target/release/bastioc0 -o bastioc1-gen1 stage1/bastioc1.bastio
+          ./bastioc1-gen1 -o bastioc1 stage1/bastioc1.bastio
+      - name: Build the documentation site
+        run: |
+          curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.52/mdbook-v0.4.52-x86_64-unknown-linux-gnu.tar.gz | tar xz -C /usr/local/bin
+          site/build.sh
+      - name: Package
+        run: |
+          name=bastio-$TAG-x86_64-linux
+          mkdir -p dist/$name/bin
+          cp stage0/target/release/bastioc0 bastioc1 dist/$name/bin/
+          cp README.md CHANGELOG.md LICENSE-APACHE LICENSE-MIT dist/$name/
+          cp -r examples dist/$name/
+          tar -C dist -czf dist/$name.tar.gz $name
+          tar -C site/build -czf dist/bastio-$TAG-docs.tar.gz html
+          # The release notes are this version's section of the changelog.
+          awk -v v="${TAG#v}" '$0 ~ "^## \\[" v "\\]" {on=1; next} on && /^## \[/ {exit} on && !/^\[[^]]*\]: /' CHANGELOG.md > dist/notes.md
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+      - name: Smoke test the package
+        run: |
+          d=$(mktemp -d)
+          tar -C "$d" -xzf dist/bastio-$TAG-x86_64-linux.tar.gz
+          for c in bastioc0 bastioc1; do
+            "$d"/bastio-$TAG-x86_64-linux/bin/$c -o "$d/hello" examples/hello.bastio
+            "$d/hello"
+          done
+      - uses: actions/upload-artifact@v5
+        with:
+          name: bastio-${{ env.TAG }}
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+            dist/notes.md
+  draft-release:
+    # Only for a pushed tag, not for a build started by hand.
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: bastio-${{ github.ref_name }}
+          path: dist
+      - name: Create a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft \
+            --title "Bastio $GITHUB_REF_NAME" --notes-file dist/notes.md \
+            dist/*.tar.gz dist/SHA256SUMS
