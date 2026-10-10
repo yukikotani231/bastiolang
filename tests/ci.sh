@@ -19,6 +19,8 @@ else
   skipped+=("stage0 mirror check (no origin/main to compare with)")
 fi
 
+step "every builtin has native code"; tests/native_builtins.sh
+
 step "build stage0 (warnings are errors)"
 (cd stage0 && RUSTFLAGS="-D warnings" cargo build --release --locked)
 

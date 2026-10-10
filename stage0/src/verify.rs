@@ -2391,6 +2391,9 @@ impl<'p> Verifier<'p> {
                 st.pc.push(format!("(and (>= {0} 1) (<= {0} 4096))", n.term()));
                 Ok(n)
             }
+            // Any number: the proof knows nothing about the counter, not
+            // even that it goes up.
+            "cpu_tsc" => self.fresh_u64("tsc"),
             "cpu_get" => {
                 let r = vals[1].term().to_string();
                 index_ok(self, st, &r, "21", 1, "the saved registers")?;
