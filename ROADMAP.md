@@ -82,6 +82,8 @@ Started early, alongside v1, because the kernel is the primary target and it sha
 - [x] `MmioSpace` / `Mmio`: memory-mapped device registers in the 3-4 GiB device window, claimed once like ports, with bounds and alignment proved. BastiOS maps the window uncached at boot and reads the HPET through it (the local APIC still lives in trusted C until SMP moves it)
 - [x] DMA buffers as linear in-flight tokens (docs/concurrency.md): `dma_lend` turns a page into a `Dma` that cannot be freed, mapped or reused until `dma_take`, and is touched only with volatile, aligned accesses. When the device is done is the driver's word
 - [ ] Typed register layouts (`Mmio[R]`) if plain offsets prove clumsy
+- [x] Networking, first step (BastiOS, 2026-10-10): virtio-net through `Dma` pages, and a minimal stack (Ethernet, ARP, IPv4 without options, ICMP echo, UDP echo) whose every read of a frame is proved to stay inside it whatever the length fields say. Tested in QEMU user-mode networking (ping the gateway, UDP echo through a port forward). Outgoing checksums are computed but not proved correct
+- [ ] Sockets for user programs (UDP first, then TCP), shared with the Linux layer (v4) so musl programs can use them; DHCP instead of a fixed address
 - [ ] `IrqOff` and interrupt handlers (docs/concurrency.md, step 4). Not needed while BastiOS treats interrupts as events with interrupts off in the kernel
 - [ ] Allocation failure returned in the type (no abort on OOM). Enums exist now (v1 item 3); what is left is changing `alloc`, `pool_take` and friends to return them
 - [ ] Native x86-64 backend, without going through C (removes the C compiler from the trusted base)
