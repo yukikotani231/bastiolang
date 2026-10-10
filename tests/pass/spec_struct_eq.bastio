@@ -1,0 +1,48 @@
+// expect-exit: 4
+// In a specification, `==` and `!=` compare structs and enums made of
+// integers and booleans field by field; for an enum, the variants and then
+// the payload of that variant.
+struct Point { x: u64, y: u64 }
+enum Shape { Dot(Point), Line(u64), Empty }
+
+fn moved(p: Point, dx: u64) -> Point
+  requires p.x <= 1000 && dx <= 1000
+  ensures result.y == p.y && result.x == p.x + dx
+  ensures dx == 0 ==> result == p
+  ensures dx != 0 ==> result != p
+{
+  return Point { x: p.x + dx, y: p.y };
+}
+
+fn same_first(v: &Vec[Point], p: Point) -> bool
+  requires vlen(v) > 0
+  ensures result == (vget(v, 0) == p)
+{
+  let q = vec_get(v, 0);
+  return q.x == p.x && q.y == p.y;
+}
+
+fn keep(s: Shape) -> Shape
+  ensures result == s
+{
+  return s;
+}
+
+fn main() -> u64 {
+  let a = Point { x: 1, y: 2 };
+  let b = moved(a, 0);
+  assert a == b;
+  let c = moved(a, 3);
+  assert c != a;
+  let mut v = vec_new[Point]();
+  vec_push(&mut v, c);
+  let s = same_first(v, c);
+  assert s;
+  vec_free(v);
+  let d = keep(Shape::Dot(c));
+  match d {
+    Shape::Dot(p) => { return p.x; },
+    Shape::Line(n) => { return n; },
+    Shape::Empty => { return 0; },
+  }
+}

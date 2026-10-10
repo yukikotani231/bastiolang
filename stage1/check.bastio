@@ -263,7 +263,6 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   bsig(&mut c, "pt_put_frame", AV_MEM, 4, mptb, u, frm, b, un);
   bsig(&mut c, "pt_take_frame", AV_MEM, 2, mptb, u, 0, 0, frm);
   bsig(&mut c, "pt_lease_count", AV_MEM, 1, mptb, 0, 0, 0, u);
-  bsig(&mut c, "mmu_switch", AV_KERNEL, 2, mmmu, rptb, 0, 0, un);
   bsig(&mut c, "mmu_enter", AV_KERNEL, 2, mmmu, mptb, 0, 0, lse);
   bsig(&mut c, "mmu_exit", AV_KERNEL, 2, mmmu, lse, 0, 0, un);
   bsig(&mut c, "mmu_kernel", AV_KERNEL, 1, mmmu, 0, 0, 0, un);
@@ -4188,6 +4187,38 @@ fn borrow_arg(c: &mut Checker, m: &Mono, p: &Parser, pt: u64, a: u64, bp: &mut V
 
 // ---- Specifications ----
 
+/// Can a specification compare two values of type `t` with `==`: is it an
+/// integer, a bool, or a struct or enum made of those?
+fn spec_plain(c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
+  if is_int(m, t) || t == c.tbool {
+    return true;
+  }
+  let k = kind_t(m, t);
+  if k != TY_STRUCT && k != TY_ENUM {
+    return false;
+  }
+  let x = inner_t(m, t);
+  let dn = def_node(m, p, x);
+  let n = list_len(p, dn.a);
+  let mut j = 0;
+  while j < n {
+    let ft = fld_ty(c, x, j);
+    if ft != 0 && !spec_plain(c, m, p, ft) {
+      return false;
+    }
+    j = j + 1;
+  }
+  return true;
+}
+
+/// Does a specification expression name a value: a variable, a field of
+/// one, `vget(..)` or `old(..)`? (The verifier compares such values part
+/// by part.) As stage0's `spec_place`.
+fn spec_place(p: &Parser, i: u64) -> bool {
+  let k = kind_of(p, i);
+  return k == E_VAR || k == E_FIELD || (k == E_CALL && (name_is(p, i, "vget") || name_is(p, i, "old")));
+}
+
 /// Does an argument that stands for a linear value name one?
 fn spec_named(p: &Parser, i: u64) -> bool {
   let n = node_at(p.nodes, i);
@@ -4377,7 +4408,30 @@ fn ck_spec(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u64 
     if c.failed {
       return 0;
     }
-    return bin_type(&mut c, m, p, n.v, spec_norm(c, m, ta), spec_norm(c, m, tb), i);
+    let na = spec_norm(c, m, ta);
+    let nb = spec_norm(c, m, tb);
+    // Structs and enums made of numbers compare field by field.
+    let ka = kind_t(m, na);
+    if (n.v == P_EQEQ || n.v == P_NE) && na == nb && (ka == TY_STRUCT || ka == TY_ENUM) {
+      if !spec_plain(c, m, p, na) {
+        if cm_new(&mut c, p, i, C_TYPE) {
+          cm_s(&mut c, "cannot compare ");
+          cm_ty(&mut c, m, p, na);
+          cm_s(&mut c, " with ");
+          cm_ty(&mut c, m, p, nb);
+          cm_s(&mut c, ": only structs and enums made of integers and booleans compare");
+        }
+        return 0;
+      }
+      if !spec_place(p, n.a) || !spec_place(p, n.b) {
+        if cm_new(&mut c, p, i, C_TYPE) {
+          cm_s(&mut c, "both sides of a struct or enum comparison must name a value: a variable, a field, `vget(..)` or `old(..)`");
+        }
+        return 0;
+      }
+      return c.tbool;
+    }
+    return bin_type(&mut c, m, p, n.v, na, nb, i);
   }
   if k == E_FORALL {
     if find_var(c, p, n.s, n.e) != 0 || is_bound(c, p, n.s, n.e) {
