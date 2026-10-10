@@ -39,10 +39,10 @@ The proof pipeline works end to end.
 
 ## v1: language features needed for self-hosting
 
-What the compiler needs in order to be written in Bastio, in order:
-1. **Bytes and strings:** `Bytes` (a linear u8 buffer), string literals, file reading and writing.
-2. **Structs:** fields may hold linear types; rules for partial moves.
-3. **Enums and `match`:** to represent the AST; exhaustiveness checking.
+What the compiler needs in order to be written in Bastio. Structs come first (reordered 2026-10-10): writing the BastiOS kernel showed they are the biggest gap for kernels too. Without them its process table is one `Buf` cut into 32-word rows, the per-process page tables live in a level-5 table used as a container, and a function that walks four table levels must take every level out and put it back because it cannot return more than one value.
+1. **Structs:** fields may hold linear types (`Frame`, `PageTable`, `Buf`, other structs); a struct with a linear field is linear; rules for moving fields out and back; a struct can be returned, so functions can hand back several values.
+2. **Bytes and strings:** `Bytes` (a linear u8 buffer), string literals (done: `Str`), file reading and writing.
+3. **Enums and `match`:** to represent the AST and optional results (`Option`-like returns for allocation failure); exhaustiveness checking.
 4. **Owning pointer `Box[T]`:** for recursive data such as trees.
 5. **Generics by monomorphization:** `Vec[T]` and `Box[T]`, with a proved growable array in the standard library.
 6. **Multiple files and modules.**
@@ -56,14 +56,17 @@ What the compiler needs in order to be written in Bastio, in order:
 
 ## v3: toward a kernel
 
-- [ ] Native x86-64 backend, without going through C
-- [ ] Capability primitives: `Frame[p]` (a physical page), `Mmio[R]`, `PortIo`, `IrqOff`
-- [ ] Allocation failure returned in the type (no abort on OOM)
-- [ ] A small kernel: boot, a physical page allocator (with functional correctness proved), page tables
+Started early, alongside v1, because the kernel is the primary target and it shapes what v1 needs.
+- [x] Mutable borrows `&mut T` (see "Open design questions": settled)
+- [x] Capabilities for physical pages and address spaces: `Pool`, `Frame`, `PageTable` (levels and slot ownership tracked), `Mmu` (the table in CR3 is never freed), `Cpu` (the user context; entering user mode)
+- [x] `--target user` for programs under a Bastio kernel
+- [x] A small kernel (BastiOS v0.2): boot, a page allocator whose bitmap is proved to agree with the pool, page tables, user processes with preemptive scheduling, system calls, fault isolation; tearing a process down returns every page
+- [ ] More hardware capabilities: `PortIo`, `Mmio[R]`, `IrqOff`, so the UART, PIC and timer code moves from the C prelude and `platform.c` into Bastio
+- [ ] Allocation failure returned in the type (no abort on OOM). Needs enums (v1)
+- [ ] Native x86-64 backend, without going through C (removes the C compiler from the trusted base)
 
 ## Open design questions
 
 - How to express concurrency in types: multiple cores, locks, sharing with interrupt handlers.
-- Whether to add mutable borrows `&mut`. Today "consume and return" (`b = set(b, ...)`) stands in for them.
 - Termination (currently a non-goal).
 - How to write hand-written proofs (lemmas) for the cases where Z3 gets stuck on quantifiers.
