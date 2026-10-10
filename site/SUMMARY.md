@@ -15,6 +15,7 @@
 - [Language reference](language.md)
 - [Sized integers](integers.md)
 - [Concurrency](concurrency.md)
+- [The core and std libraries](core.md)
 
 # Project
 
