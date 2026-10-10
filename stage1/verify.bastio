@@ -1,0 +1,3284 @@
+// Verification-condition generation by symbolic execution, as stage0's
+// verify.rs does it.
+//
+// The verifier walks each function once, keeping a path condition, and at
+// every place the program could go wrong it asks the solver whether the bad
+// case is reachable (bounds, overflow, underflow, division by zero,
+// allocation size, preconditions at calls, postconditions at returns, loop
+// invariants, `assert`, `unreachable`, and the ghost state of pages, page
+// tables, the pool and the MMU). See the long comment at the top of
+// stage0/src/verify.rs for the model; this file follows it function by
+// function, so the two produce the same SMT-LIB commands, character for
+// character. `difftest.sh` checks that on every program stage0 verifies.
+//
+// For now the commands are only collected (`Vr.log`) and printed, and
+// every proof is assumed to succeed: the solver is not run yet.
+//
+// SMT terms live in an arena (`Vr.tms`) and are shared, not copied: a term
+// is an atom (text in `Vr.pool`), a number, an application of an operator,
+// or a `forall`. Two terms are compared by what they print as (`tm_eq`),
+// as stage0 compares strings. Values (`Vr.vals`) are immutable too: an
+// update builds a new value that shares the unchanged parts.
+import "files.bastio";
+import "check.bastio";
+
+// Terms.
+const VT_ATOM: u64 = 1;       // the text pool[a .. a + b]
+const VT_NUM: u64 = 2;        // the number a
+const VT_APP: u64 = 3;        // operator a applied to targs[b .. b + c]
+const VT_FORALL: u64 = 4;     // (forall ((a Int)) b)
+
+const OP_ADD: u64 = 1;
+const OP_SUB: u64 = 2;
+const OP_MUL: u64 = 3;
+const OP_DIV: u64 = 4;
+const OP_MOD: u64 = 5;
+const OP_EQ: u64 = 6;
+const OP_LT: u64 = 7;
+const OP_LE: u64 = 8;
+const OP_GT: u64 = 9;
+const OP_GE: u64 = 10;
+const OP_AND: u64 = 11;
+const OP_OR: u64 = 12;
+const OP_NOT: u64 = 13;
+const OP_IMP: u64 = 14;
+const OP_ITE: u64 = 15;
+const OP_SELECT: u64 = 16;
+const OP_STORE: u64 = 17;
+
+// Sorts: Int or Bool, under `depth` levels of (Array Int ..): base + 2 * depth.
+const SO_INT: u64 = 0;
+const SO_BOOL: u64 = 1;
+
+// Values.
+const VV_U: u64 = 1;          // a: the term
+const VV_B: u64 = 2;          // a: the term
+const VV_BUF: u64 = 3;        // a: length, b: data
+const VV_STR: u64 = 4;        // a: length, b: data
+const VV_OBJ: u64 = 5;        // type ty; ghost fields a, b, c (n of them, see `obj_fields`)
+const VV_STRUCT: u64 = 6;     // type ty; fields kids[a .. a + n]
+const VV_ENUM: u64 = 7;       // type ty; tag a; payloads kids[b .. b + n] (unit for none)
+const VV_BOXK: u64 = 8;       // a box holding value a
+const VV_BOXO: u64 = 9;       // a box of type ty whose contents are not known yet
+const VV_VEC: u64 = 10;       // element type ty; length a; lifted elements b
+const VV_UNIT: u64 = 11;
+
+// Commands.
+const CMD_DECL: u64 = 1;      // (declare-const a sort b)
+const CMD_ASSERT: u64 = 2;    // (assert a)
+const CMD_PUSH: u64 = 3;
+const CMD_POP: u64 = 4;
+const CMD_CHECK: u64 = 5;
+
+/// Largest element count `alloc` accepts (2^60).
+const ALLOC_MAX: u64 = 1152921504606846976;
+/// Page numbers are below this; also `mmu_root` of the kernel's own tables.
+const FRAME_LIMIT: u64 = 65536;
+/// How many boxes deep a fresh value is unfolded.
+const BOX_DEPTH: u64 = 2;
+
+struct Tm { kind: u64, a: u64, b: u64, c: u64 }
+struct Vl { kind: u64, ty: u64, a: u64, b: u64, c: u64, n: u64 }
+struct Cmd { kind: u64, a: u64, b: u64 }
+/// A variable (named by its source text s..e) and its value.
+struct Bind { s: u64, e: u64, val: u64 }
+/// A variable bound by an enclosing `forall` (source text s..e) and its SMT name.
+struct Bnd { s: u64, e: u64, q: u64 }
+/// A place a loop body changes (its dotted path) and whether every change keeps its shape.
+struct Chg { name: u64, keep: bool }
+
+/// The state on one path: the path condition and the variables' values.
+/// `live` is false once every path has returned.
+struct VState { pc: Vec[u64], env: Vec[Bind], live: bool }
+
+struct Vr {
+  pool: Vec[u64],
+  tms: Vec[Tm],
+  targs: Vec[u64],
+  vals: Vec[Vl],
+  kids: Vec[u64],
+  log: Vec[Cmd],
+  counter: u64,
+  obligations: u64,
+  /// Boxes being unfolded by `fresh_of` right now.
+  box_depth: u64,
+  /// A cursor for `rebuild`.
+  cur: u64,
+  /// The instance being verified, for reading the types written in it.
+  env: u64,
+  t_true: u64,
+  t_false: u64,
+  t_zero: u64,
+  t_u64max: u64,
+  t_allocmax: u64,
+  t_flimit: u64,
+  t_poolsize: u64,
+  t_zarr: u64,
+  t_nobool: u64,
+  t_k: u64,
+  t_255: u64,
+  unit: u64,
+  ty_bytes: u64,
+  ty_child: u64,
+  ty_frame: u64,
+  ty_pt: u64,
+  ty_pool: u64
+}
+
+fn vr_new(m: &mut Mono, p: &Parser) -> Vr {
+  let mut tms = vec_new[Tm]();
+  vec_push(&mut tms, Tm { kind: 0, a: 0, b: 0, c: 0 });
+  let mut vals = vec_new[Vl]();
+  vec_push(&mut vals, Vl { kind: 0, ty: 0, a: 0, b: 0, c: 0, n: 0 });
+  let mut v = Vr {
+    pool: vec_new[u64](), tms: tms, targs: vec_new[u64](), vals: vals, kids: vec_new[u64](),
+    log: vec_new[Cmd](), counter: 0, obligations: 0, box_depth: 0, cur: 0, env: 0,
+    t_true: 0, t_false: 0, t_zero: 0, t_u64max: 0, t_allocmax: 0, t_flimit: 0, t_poolsize: 0,
+    t_zarr: 0, t_nobool: 0, t_k: 0, t_255: 0, unit: 0,
+    ty_bytes: prim(&mut m, p, TY_BYTES), ty_child: prim(&mut m, p, TY_CHILD), ty_frame: prim(&mut m, p, TY_FRAME),
+    ty_pt: prim(&mut m, p, TY_PT), ty_pool: prim(&mut m, p, TY_POOL)
+  };
+  v.t_true = atom_str(&mut v, "true");
+  v.t_false = atom_str(&mut v, "false");
+  v.t_zero = num(&mut v, 0);
+  v.t_u64max = num(&mut v, U64_MAX);
+  v.t_allocmax = num(&mut v, ALLOC_MAX);
+  v.t_flimit = num(&mut v, FRAME_LIMIT);
+  v.t_poolsize = atom_str(&mut v, "POOLSIZE");
+  v.t_zarr = atom_str(&mut v, "((as const (Array Int Int)) 0)");
+  v.t_nobool = atom_str(&mut v, "((as const (Array Int Bool)) false)");
+  v.t_k = atom_str(&mut v, "k");
+  v.t_255 = num(&mut v, 255);
+  v.unit = mk(&mut v, VV_UNIT, 0, 0, 0, 0, 0);
+  return v;
+}
+
+fn vr_free(v: Vr) {
+  vec_free(v.pool);
+  vec_free(v.tms);
+  vec_free(v.targs);
+  vec_free(v.vals);
+  vec_free(v.kids);
+  vec_free(v.log);
+}
+
+/// `a + b`, or the largest u64 if that overflows (indices that large are
+/// out of range anyway).
+fn vadd(a: u64, b: u64) -> u64 {
+  if b > U64_MAX - a {
+    return U64_MAX;
+  }
+  return a + b;
+}
+
+// ---- Text ----
+
+fn pool_at(v: &Vr, i: u64) -> u64 {
+  return u_at(v.pool, i);
+}
+
+fn push_str(v: &mut Vr, s: Str) {
+  let mut k = 0;
+  while k < slen(s)
+    invariant k <= slen(s)
+  {
+    vec_push(&mut v.pool, sget(s, k));
+    k = k + 1;
+  }
+}
+
+fn push_src(v: &mut Vr, p: &Parser, s: u64, e: u64) {
+  if s <= e && e <= blen(p.src) {
+    let mut k = s;
+    while k < e
+      invariant k <= e && e <= blen(p.src)
+    {
+      vec_push(&mut v.pool, bget(p.src, k));
+      k = k + 1;
+    }
+  }
+}
+
+/// Appends the text of atom `a`.
+fn push_text(v: &mut Vr, a: u64) {
+  let t = tm_at(v, a);
+  let mut k = 0;
+  while k < t.b {
+    let ch = pool_at(v, vadd(t.a, k));
+    vec_push(&mut v.pool, ch);
+    k = k + 1;
+  }
+}
+
+fn push_num(v: &mut Vr, x: u64) {
+  let mut d = vec_new[u64]();
+  let mut y = x;
+  vec_push(&mut d, 48 + y % 10);
+  y = y / 10;
+  while y > 0 {
+    vec_push(&mut d, 48 + y % 10);
+    y = y / 10;
+  }
+  let mut k = vec_len(d);
+  while k > 0 {
+    k = k - 1;
+    vec_push(&mut v.pool, u_at(d, k));
+  }
+  vec_free(d);
+}
+
+/// The atom whose text is what was appended to the pool since `start`.
+fn seal(v: &mut Vr, start: u64) -> u64 {
+  let n = vec_len(v.pool);
+  if start > n {
+    return new_tm(&mut v, VT_ATOM, n, 0, 0);
+  }
+  return new_tm(&mut v, VT_ATOM, start, n - start, 0);
+}
+
+fn atom_str(v: &mut Vr, s: Str) -> u64 {
+  let start = vec_len(v.pool);
+  push_str(&mut v, s);
+  return seal(&mut v, start);
+}
+
+fn atom_src(v: &mut Vr, p: &Parser, s: u64, e: u64) -> u64 {
+  let start = vec_len(v.pool);
+  push_src(&mut v, p, s, e);
+  return seal(&mut v, start);
+}
+
+/// `s` followed by the text of `a`.
+fn pre_str(v: &mut Vr, s: Str, a: u64) -> u64 {
+  let start = vec_len(v.pool);
+  push_str(&mut v, s);
+  push_text(&mut v, a);
+  return seal(&mut v, start);
+}
+
+/// The text of `a` followed by `s`.
+fn cat_str(v: &mut Vr, a: u64, s: Str) -> u64 {
+  let start = vec_len(v.pool);
+  push_text(&mut v, a);
+  push_str(&mut v, s);
+  return seal(&mut v, start);
+}
+
+/// `a_s..e`: a hint for a part (field, variant) of the thing `a` names.
+fn cat_src(v: &mut Vr, p: &Parser, a: u64, s: u64, e: u64) -> u64 {
+  let start = vec_len(v.pool);
+  push_text(&mut v, a);
+  push_str(&mut v, "_");
+  push_src(&mut v, p, s, e);
+  return seal(&mut v, start);
+}
+
+/// The first `n` bytes of the text of `a` (a prefix of a dotted path).
+fn prefix(v: &mut Vr, a: u64, n: u64) -> u64 {
+  let t = tm_at(v, a);
+  let mut k = n;
+  if k > t.b {
+    k = t.b;
+  }
+  return new_tm(&mut v, VT_ATOM, t.a, k, 0);
+}
+
+/// Is pool[s .. s + n] the source text x..y?
+fn rng_is_src(v: &Vr, s: u64, n: u64, p: &Parser, x: u64, y: u64) -> bool {
+  if !(x <= y && y <= blen(p.src)) || y - x != n {
+    return false;
+  }
+  let mut k = 0;
+  while k < n
+    invariant k <= n && x <= y && y <= blen(p.src) && y - x == n
+  {
+    if pool_at(v, vadd(s, k)) != bget(p.src, x + k) {
+      return false;
+    }
+    k = k + 1;
+  }
+  return true;
+}
+
+fn same_text(v: &Vr, a: u64, b: u64) -> bool {
+  let x = tm_at(v, a);
+  let y = tm_at(v, b);
+  if x.b != y.b {
+    return false;
+  }
+  let mut k = 0;
+  while k < x.b {
+    if pool_at(v, vadd(x.a, k)) != pool_at(v, vadd(y.a, k)) {
+      return false;
+    }
+    k = k + 1;
+  }
+  return true;
+}
+
+/// Is the text of `a` before the text of `b` (byte order, a prefix first)?
+fn text_less(v: &Vr, a: u64, b: u64) -> bool {
+  let x = tm_at(v, a);
+  let y = tm_at(v, b);
+  let mut k = 0;
+  while k < x.b && k < y.b {
+    let cx = pool_at(v, vadd(x.a, k));
+    let cy = pool_at(v, vadd(y.a, k));
+    if cx != cy {
+      return cx < cy;
+    }
+    k = k + 1;
+  }
+  return x.b < y.b;
+}
+
+/// The name of type `t` as stage0 writes it (`Pair[u64, Buf]`).
+fn push_ty(v: &mut Vr, m: &Mono, p: &Parser, t: u64) {
+  let x = ty_at(m, t);
+  let k = x.kind;
+  if k == TY_U64 { push_str(&mut v, "u64"); }
+  else if k == TY_BOOL { push_str(&mut v, "bool"); }
+  else if k == TY_UNIT { push_str(&mut v, "()"); }
+  else if k == TY_STR { push_str(&mut v, "Str"); }
+  else if k == TY_BUF { push_str(&mut v, "Buf"); }
+  else if k == TY_BYTES { push_str(&mut v, "Bytes"); }
+  else if k == TY_HOST { push_str(&mut v, "Host"); }
+  else if k == TY_CHILD { push_str(&mut v, "Child"); }
+  else if k == TY_SERIAL { push_str(&mut v, "Serial"); }
+  else if k == TY_FRAME { push_str(&mut v, "Frame"); }
+  else if k == TY_PT { push_str(&mut v, "PageTable"); }
+  else if k == TY_POOL { push_str(&mut v, "Pool"); }
+  else if k == TY_MMU { push_str(&mut v, "Mmu"); }
+  else if k == TY_CPU { push_str(&mut v, "Cpu"); }
+  else if k == TY_STRUCT || k == TY_ENUM { push_inst(&mut v, m, p, x.a); }
+  else if k == TY_BOX { push_str(&mut v, "Box["); push_ty(&mut v, m, p, x.a); push_str(&mut v, "]"); }
+  else if k == TY_VEC { push_str(&mut v, "Vec["); push_ty(&mut v, m, p, x.a); push_str(&mut v, "]"); }
+  else if k == TY_REF { push_str(&mut v, "&"); push_ty(&mut v, m, p, x.a); }
+  else if k == TY_MUTREF { push_str(&mut v, "&mut "); push_ty(&mut v, m, p, x.a); }
+}
+
+fn push_inst(v: &mut Vr, m: &Mono, p: &Parser, i: u64) {
+  let x = inst_at(m, i);
+  let d = node_at(p.nodes, x.def);
+  push_src(&mut v, p, d.s, d.e);
+  if x.n > 0 && x.args < SRC_MAX {
+    push_str(&mut v, "[");
+    let mut j = 0;
+    while j < x.n && j < SRC_MAX
+      invariant j <= SRC_MAX
+    {
+      if j > 0 {
+        push_str(&mut v, ", ");
+      }
+      push_ty(&mut v, m, p, targ_at(m, x.args + j));
+      j = j + 1;
+    }
+    push_str(&mut v, "]");
+  }
+}
+
+fn inst_name(v: &mut Vr, m: &Mono, p: &Parser, i: u64) -> u64 {
+  let start = vec_len(v.pool);
+  push_inst(&mut v, m, p, i);
+  return seal(&mut v, start);
+}
+
+// ---- Terms ----
+
+fn tm_at(v: &Vr, t: u64) -> Tm {
+  if t < vec_len(v.tms) {
+    return vec_get(v.tms, t);
+  }
+  return Tm { kind: 0, a: 0, b: 0, c: 0 };
+}
+
+fn new_tm(v: &mut Vr, kind: u64, a: u64, b: u64, c: u64) -> u64 {
+  let k = vec_len(v.tms);
+  vec_push(&mut v.tms, Tm { kind: kind, a: a, b: b, c: c });
+  return k;
+}
+
+fn num(v: &mut Vr, x: u64) -> u64 {
+  return new_tm(&mut v, VT_NUM, x, 0, 0);
+}
+
+fn app1(v: &mut Vr, op: u64, x: u64) -> u64 {
+  let start = vec_len(v.targs);
+  vec_push(&mut v.targs, x);
+  return new_tm(&mut v, VT_APP, op, start, 1);
+}
+
+fn app2(v: &mut Vr, op: u64, x: u64, y: u64) -> u64 {
+  let start = vec_len(v.targs);
+  vec_push(&mut v.targs, x);
+  vec_push(&mut v.targs, y);
+  return new_tm(&mut v, VT_APP, op, start, 2);
+}
+
+fn app3(v: &mut Vr, op: u64, x: u64, y: u64, z: u64) -> u64 {
+  let start = vec_len(v.targs);
+  vec_push(&mut v.targs, x);
+  vec_push(&mut v.targs, y);
+  vec_push(&mut v.targs, z);
+  return new_tm(&mut v, VT_APP, op, start, 3);
+}
+
+fn appv(v: &mut Vr, op: u64, xs: &Vec[u64]) -> u64 {
+  let start = vec_len(v.targs);
+  let mut k = 0;
+  while k < vec_len(xs) {
+    vec_push(&mut v.targs, u_at(xs, k));
+    k = k + 1;
+  }
+  return new_tm(&mut v, VT_APP, op, start, vec_len(xs));
+}
+
+fn targ(v: &Vr, t: u64, k: u64) -> u64 {
+  let x = tm_at(v, t);
+  return u_at(v.targs, vadd(x.b, k));
+}
+
+/// (forall ((q Int)) body)
+fn forall_tm(v: &mut Vr, q: u64, body: u64) -> u64 {
+  return new_tm(&mut v, VT_FORALL, q, body, 0);
+}
+
+/// `(not x)`
+fn t_not(v: &mut Vr, x: u64) -> u64 {
+  return app1(&mut v, OP_NOT, x);
+}
+
+/// `(and (<= lo x) (<= x hi))`
+fn in_range(v: &mut Vr, lo: u64, x: u64, hi: u64) -> u64 {
+  let a = app2(&mut v, OP_LE, lo, x);
+  let b = app2(&mut v, OP_LE, x, hi);
+  return app2(&mut v, OP_AND, a, b);
+}
+
+/// Do two terms print the same?
+fn tm_eq(v: &Vr, a: u64, b: u64) -> bool {
+  if a == b {
+    return true;
+  }
+  let x = tm_at(v, a);
+  let y = tm_at(v, b);
+  if x.kind != y.kind {
+    return false;
+  }
+  if x.kind == VT_ATOM {
+    return same_text(v, a, b);
+  }
+  if x.kind == VT_NUM {
+    return x.a == y.a;
+  }
+  if x.kind == VT_FORALL {
+    return tm_eq(v, x.a, y.a) && tm_eq(v, x.b, y.b);
+  }
+  if x.a != y.a || x.c != y.c {
+    return false;
+  }
+  let mut k = 0;
+  while k < x.c {
+    if !tm_eq(v, targ(v, a, k), targ(v, b, k)) {
+      return false;
+    }
+    k = k + 1;
+  }
+  return true;
+}
+
+fn ite(v: &mut Vr, c: u64, a: u64, b: u64) -> u64 {
+  if tm_eq(v, a, b) {
+    return a;
+  }
+  return app3(&mut v, OP_ITE, c, a, b);
+}
+
+fn and_all(v: &mut Vr, xs: &Vec[u64]) -> u64 {
+  if vec_len(xs) == 0 {
+    return v.t_true;
+  }
+  if vec_len(xs) == 1 {
+    return u_at(xs, 0);
+  }
+  return appv(&mut v, OP_AND, xs);
+}
+
+fn or_all(v: &mut Vr, xs: &Vec[u64]) -> u64 {
+  if vec_len(xs) == 0 {
+    return v.t_false;
+  }
+  if vec_len(xs) == 1 {
+    return u_at(xs, 0);
+  }
+  return appv(&mut v, OP_OR, xs);
+}
+
+fn put_op(con: &Serial, op: u64) {
+  if op == OP_ADD { put(con, "+"); }
+  else if op == OP_SUB { put(con, "-"); }
+  else if op == OP_MUL { put(con, "*"); }
+  else if op == OP_DIV { put(con, "div"); }
+  else if op == OP_MOD { put(con, "mod"); }
+  else if op == OP_EQ { put(con, "="); }
+  else if op == OP_LT { put(con, "<"); }
+  else if op == OP_LE { put(con, "<="); }
+  else if op == OP_GT { put(con, ">"); }
+  else if op == OP_GE { put(con, ">="); }
+  else if op == OP_AND { put(con, "and"); }
+  else if op == OP_OR { put(con, "or"); }
+  else if op == OP_NOT { put(con, "not"); }
+  else if op == OP_IMP { put(con, "=>"); }
+  else if op == OP_ITE { put(con, "ite"); }
+  else if op == OP_SELECT { put(con, "select"); }
+  else if op == OP_STORE { put(con, "store"); }
+}
+
+fn put_tm(con: &Serial, v: &Vr, t: u64) {
+  let x = tm_at(v, t);
+  if x.kind == VT_ATOM {
+    let mut k = 0;
+    while k < x.b {
+      let ch = pool_at(v, vadd(x.a, k));
+      if ch <= 255 {
+        serial_write(con, ch);
+      }
+      k = k + 1;
+    }
+  } else if x.kind == VT_NUM {
+    put_num(con, x.a);
+  } else if x.kind == VT_APP {
+    put(con, "(");
+    put_op(con, x.a);
+    let mut k = 0;
+    while k < x.c {
+      put(con, " ");
+      put_tm(con, v, targ(v, t, k));
+      k = k + 1;
+    }
+    put(con, ")");
+  } else if x.kind == VT_FORALL {
+    put(con, "(forall ((");
+    put_tm(con, v, x.a);
+    put(con, " Int)) ");
+    put_tm(con, v, x.b);
+    put(con, ")");
+  }
+}
+
+fn put_sort(con: &Serial, so: u64) {
+  let mut d = so / 2;
+  let depth = d;
+  while d > 0 {
+    put(con, "(Array Int ");
+    d = d - 1;
+  }
+  if so % 2 == SO_BOOL { put(con, "Bool"); } else { put(con, "Int"); }
+  while d < depth {
+    put(con, ")");
+    d = d + 1;
+  }
+}
+
+/// Prints every command sent so far, one per line, as `--dump-smt` does.
+fn put_log(con: &Serial, v: &Vr) {
+  put(con, "(set-option :produce-models true)\n");
+  put(con, "(set-option :timeout 10000)\n");
+  let mut k = 0;
+  while k < vec_len(v.log) {
+    let cmd = vec_get(v.log, k);
+    if cmd.kind == CMD_DECL {
+      put(con, "(declare-const ");
+      put_tm(con, v, cmd.a);
+      put(con, " ");
+      put_sort(con, cmd.b);
+      put(con, ")\n");
+    } else if cmd.kind == CMD_ASSERT {
+      put(con, "(assert ");
+      put_tm(con, v, cmd.a);
+      put(con, ")\n");
+    } else if cmd.kind == CMD_PUSH {
+      put(con, "(push 1)\n");
+    } else if cmd.kind == CMD_POP {
+      put(con, "(pop 1)\n");
+    } else if cmd.kind == CMD_CHECK {
+      put(con, "(check-sat)\n");
+    }
+    k = k + 1;
+  }
+}
+
+fn send(v: &mut Vr, kind: u64, a: u64, b: u64) {
+  vec_push(&mut v.log, Cmd { kind: kind, a: a, b: b });
+}
+
+fn assert_tm(v: &mut Vr, t: u64) {
+  send(&mut v, CMD_ASSERT, t, 0);
+}
+
+// ---- Fresh names ----
+
+/// A new SMT name: the hint with every character that is not a letter or
+/// digit made `_`, then `!` and a counter.
+fn fresh_name(v: &mut Vr, hint: u64) -> u64 {
+  if v.counter < U64_MAX {
+    v.counter = v.counter + 1;
+  }
+  let start = vec_len(v.pool);
+  let h = tm_at(v, hint);
+  let mut k = 0;
+  while k < h.b {
+    let ch = pool_at(v, vadd(h.a, k));
+    if (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) {
+      vec_push(&mut v.pool, ch);
+    } else {
+      vec_push(&mut v.pool, 95);
+    }
+    k = k + 1;
+  }
+  vec_push(&mut v.pool, 33);
+  push_num(&mut v, v.counter);
+  return seal(&mut v, start);
+}
+
+fn fresh_int(v: &mut Vr, hint: u64, lo: u64, hi: u64) -> u64 {
+  let n = fresh_name(&mut v, hint);
+  send(&mut v, CMD_DECL, n, SO_INT);
+  let r = in_range(&mut v, lo, n, hi);
+  assert_tm(&mut v, r);
+  return n;
+}
+
+fn fresh_u64(v: &mut Vr, hint: u64) -> u64 {
+  let t = fresh_int(&mut v, hint, v.t_zero, v.t_u64max);
+  return mk(&mut v, VV_U, 0, t, 0, 0, 0);
+}
+
+fn fresh_bool(v: &mut Vr, hint: u64) -> u64 {
+  let n = fresh_name(&mut v, hint);
+  send(&mut v, CMD_DECL, n, SO_BOOL);
+  return mk(&mut v, VV_B, 0, n, 0, 0, 0);
+}
+
+fn fresh_len(v: &mut Vr, hint: u64) -> u64 {
+  let h = pre_str(&mut v, "len_", hint);
+  return fresh_int(&mut v, h, v.t_zero, v.t_allocmax);
+}
+
+/// A fresh array from Int to `so`.
+fn fresh_array(v: &mut Vr, hint: u64, so: u64) -> u64 {
+  let h = pre_str(&mut v, "data_", hint);
+  let n = fresh_name(&mut v, h);
+  send(&mut v, CMD_DECL, n, vadd(so, 2));
+  return n;
+}
+
+// ---- Values ----
+
+fn vl_at(v: &Vr, x: u64) -> Vl {
+  if x < vec_len(v.vals) {
+    return vec_get(v.vals, x);
+  }
+  return Vl { kind: 0, ty: 0, a: 0, b: 0, c: 0, n: 0 };
+}
+
+fn mk(v: &mut Vr, kind: u64, tyx: u64, a: u64, b: u64, c: u64, n: u64) -> u64 {
+  let k = vec_len(v.vals);
+  vec_push(&mut v.vals, Vl { kind: kind, ty: tyx, a: a, b: b, c: c, n: n });
+  return k;
+}
+
+fn mk_u(v: &mut Vr, t: u64) -> u64 {
+  return mk(&mut v, VV_U, 0, t, 0, 0, 0);
+}
+
+fn mk_b(v: &mut Vr, t: u64) -> u64 {
+  return mk(&mut v, VV_B, 0, t, 0, 0, 0);
+}
+
+/// Stores a list of child values; returns where it starts.
+fn put_kids(v: &mut Vr, xs: &Vec[u64]) -> u64 {
+  let start = vec_len(v.kids);
+  let mut k = 0;
+  while k < vec_len(xs) {
+    vec_push(&mut v.kids, u_at(xs, k));
+    k = k + 1;
+  }
+  return start;
+}
+
+fn mk_struct(v: &mut Vr, tyx: u64, xs: &Vec[u64]) -> u64 {
+  let start = put_kids(&mut v, xs);
+  return mk(&mut v, VV_STRUCT, tyx, start, 0, 0, vec_len(xs));
+}
+
+fn mk_enum(v: &mut Vr, tyx: u64, tag: u64, xs: &Vec[u64]) -> u64 {
+  let start = put_kids(&mut v, xs);
+  return mk(&mut v, VV_ENUM, tyx, tag, start, 0, vec_len(xs));
+}
+
+/// Child `j` of a struct or enum value.
+fn kid(v: &Vr, x: u64, j: u64) -> u64 {
+  let xv = vl_at(v, x);
+  let mut start = xv.a;
+  if xv.kind == VV_ENUM {
+    start = xv.b;
+  }
+  if j >= xv.n {
+    return 0;
+  }
+  return u_at(v.kids, vadd(start, j));
+}
+
+/// The scalar term of a U or B value.
+fn term(v: &Vr, x: u64) -> u64 {
+  let xv = vl_at(v, x);
+  return xv.a;
+}
+
+/// How many ghost fields an object of type kind `k` has.
+fn obj_fields(k: u64) -> u64 {
+  if k == TY_PT { return 3; }
+  if k == TY_POOL { return 2; }
+  if k == TY_FRAME || k == TY_MMU { return 1; }
+  return 0;
+}
+
+fn obj_field(v: &Vr, x: u64, j: u64) -> u64 {
+  let xv = vl_at(v, x);
+  if j == 0 { return xv.a; }
+  if j == 1 { return xv.b; }
+  return xv.c;
+}
+
+// The ghost fields by name.
+fn g_id(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 0); }       // Frame, PageTable
+fn g_level(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 1); }    // PageTable
+fn g_used(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 2); }     // PageTable
+fn g_has(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 0); }      // Pool
+fn g_size(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 1); }     // Pool
+fn g_root(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 0); }     // Mmu
+
+fn mk_obj(v: &mut Vr, m: &Mono, tyx: u64, a: u64, b: u64, c: u64) -> u64 {
+  return mk(&mut v, VV_OBJ, tyx, a, b, c, obj_fields(kind_t(m, tyx)));
+}
+
+/// The sort of ghost field `j` of an object of type kind `k`: an array of
+/// Bool for `used` and `has`, Int otherwise.
+fn obj_field_sort(k: u64, j: u64) -> u64 {
+  if (k == TY_PT && j == 2) || (k == TY_POOL && j == 0) {
+    return SO_BOOL + 2;
+  }
+  return SO_INT;
+}
+
+/// Do two values print the same, term by term?
+fn val_eq(v: &Vr, a: u64, b: u64) -> bool {
+  if a == b {
+    return true;
+  }
+  let x = vl_at(v, a);
+  let y = vl_at(v, b);
+  if x.kind != y.kind || x.ty != y.ty || x.n != y.n {
+    return false;
+  }
+  let k = x.kind;
+  if k == VV_U || k == VV_B {
+    return tm_eq(v, x.a, y.a);
+  }
+  if k == VV_BUF || k == VV_STR {
+    return tm_eq(v, x.a, y.a) && tm_eq(v, x.b, y.b);
+  }
+  if k == VV_OBJ {
+    return (x.n < 1 || tm_eq(v, x.a, y.a)) && (x.n < 2 || tm_eq(v, x.b, y.b)) && (x.n < 3 || tm_eq(v, x.c, y.c));
+  }
+  if k == VV_STRUCT || k == VV_ENUM {
+    if k == VV_ENUM && !tm_eq(v, x.a, y.a) {
+      return false;
+    }
+    let mut j = 0;
+    while j < x.n {
+      if !val_eq(v, kid(v, a, j), kid(v, b, j)) {
+        return false;
+      }
+      j = j + 1;
+    }
+    return true;
+  }
+  if k == VV_BOXK {
+    return val_eq(v, x.a, y.a);
+  }
+  if k == VV_VEC {
+    return tm_eq(v, x.a, y.a) && val_eq(v, x.b, y.b);
+  }
+  return true;            // VV_BOXO (same type) and VV_UNIT
+}
+
+/// `if c then a else b`, field by field.
+fn merge(v: &mut Vr, c: u64, a: u64, b: u64) -> u64 {
+  if a == b {
+    return a;
+  }
+  let x = vl_at(v, a);
+  let y = vl_at(v, b);
+  let k = x.kind;
+  if k == VV_U || k == VV_B {
+    let t = ite(&mut v, c, x.a, y.a);
+    return mk(&mut v, k, 0, t, 0, 0, 0);
+  }
+  if k == VV_BUF || k == VV_STR {
+    let l = ite(&mut v, c, x.a, y.a);
+    let d = ite(&mut v, c, x.b, y.b);
+    return mk(&mut v, k, 0, l, d, 0, 0);
+  }
+  if k == VV_OBJ {
+    let mut f0 = 0;
+    let mut f1 = 0;
+    let mut f2 = 0;
+    if x.n > 0 { f0 = ite(&mut v, c, x.a, y.a); }
+    if x.n > 1 { f1 = ite(&mut v, c, x.b, y.b); }
+    if x.n > 2 { f2 = ite(&mut v, c, x.c, y.c); }
+    return mk(&mut v, VV_OBJ, x.ty, f0, f1, f2, x.n);
+  }
+  if k == VV_STRUCT || k == VV_ENUM {
+    let mut tag = 0;
+    if k == VV_ENUM {
+      tag = ite(&mut v, c, x.a, y.a);
+    }
+    let mut xs = vec_new[u64]();
+    let mut j = 0;
+    while j < x.n {
+      let ka = kid(v, a, j);
+      let kb = kid(v, b, j);
+      let mm = merge(&mut v, c, ka, kb);
+      vec_push(&mut xs, mm);
+      j = j + 1;
+    }
+    let mut r = 0;
+    if k == VV_ENUM {
+      r = mk_enum(&mut v, x.ty, tag, xs);
+    } else {
+      r = mk_struct(&mut v, x.ty, xs);
+    }
+    vec_free(xs);
+    return r;
+  }
+  if k == VV_VEC {
+    let l = ite(&mut v, c, x.a, y.a);
+    let el = merge(&mut v, c, x.b, y.b);
+    return mk(&mut v, VV_VEC, x.ty, l, el, 0, 0);
+  }
+  if k == VV_BOXK && y.kind == VV_BOXK {
+    let inner = merge(&mut v, c, x.a, y.a);
+    return mk(&mut v, VV_BOXK, 0, inner, 0, 0, 0);
+  }
+  // Forgetting what one side knew about a box is sound.
+  if k == VV_BOXO {
+    return a;
+  }
+  if y.kind == VV_BOXO {
+    return b;
+  }
+  return a;               // VV_UNIT
+}
+
+/// Appends the SMT terms `x` is made of, and their sorts, in a fixed order
+/// that depends only on its type. Box contents are left out; a vector's
+/// element terms are arrays one level deeper than the element's own.
+fn leaves_of(v: &Vr, m: &Mono, x: u64, ts: &mut Vec[u64], sorts: &mut Vec[u64]) {
+  let xv = vl_at(v, x);
+  let k = xv.kind;
+  if k == VV_U {
+    vec_push(&mut ts, xv.a);
+    vec_push(&mut sorts, SO_INT);
+  } else if k == VV_B {
+    vec_push(&mut ts, xv.a);
+    vec_push(&mut sorts, SO_BOOL);
+  } else if k == VV_BUF || k == VV_STR {
+    vec_push(&mut ts, xv.a);
+    vec_push(&mut sorts, SO_INT);
+    vec_push(&mut ts, xv.b);
+    vec_push(&mut sorts, SO_INT + 2);
+  } else if k == VV_OBJ {
+    let tk = kind_t(m, xv.ty);
+    let mut j = 0;
+    while j < xv.n {
+      vec_push(&mut ts, obj_field(v, x, j));
+      vec_push(&mut sorts, obj_field_sort(tk, j));
+      j = j + 1;
+    }
+  } else if k == VV_STRUCT || k == VV_ENUM {
+    if k == VV_ENUM {
+      vec_push(&mut ts, xv.a);
+      vec_push(&mut sorts, SO_INT);
+    }
+    let mut j = 0;
+    while j < xv.n {
+      leaves_of(v, m, kid(v, x, j), &mut ts, &mut sorts);
+      j = j + 1;
+    }
+  } else if k == VV_VEC {
+    vec_push(&mut ts, xv.a);
+    vec_push(&mut sorts, SO_INT);
+    let mut its = vec_new[u64]();
+    let mut iso = vec_new[u64]();
+    leaves_of(v, m, xv.b, &mut its, &mut iso);
+    let mut j = 0;
+    while j < vec_len(its) {
+      vec_push(&mut ts, u_at(its, j));
+      vec_push(&mut sorts, vadd(u_at(iso, j), 2));
+      j = j + 1;
+    }
+    vec_free(its);
+    vec_free(iso);
+  }
+}
+
+/// The value shaped like `x` whose terms are `ts[v.cur ..]`, in the order
+/// of `leaves_of` (moving `v.cur` past them).
+fn rebuild(v: &mut Vr, x: u64, ts: &Vec[u64]) -> u64 {
+  let xv = vl_at(v, x);
+  let k = xv.kind;
+  if k == VV_U || k == VV_B {
+    let t = next_leaf(&mut v, ts);
+    return mk(&mut v, k, 0, t, 0, 0, 0);
+  }
+  if k == VV_BUF || k == VV_STR {
+    let l = next_leaf(&mut v, ts);
+    let d = next_leaf(&mut v, ts);
+    return mk(&mut v, k, 0, l, d, 0, 0);
+  }
+  if k == VV_OBJ {
+    let mut f0 = 0;
+    let mut f1 = 0;
+    let mut f2 = 0;
+    if xv.n > 0 { f0 = next_leaf(&mut v, ts); }
+    if xv.n > 1 { f1 = next_leaf(&mut v, ts); }
+    if xv.n > 2 { f2 = next_leaf(&mut v, ts); }
+    return mk(&mut v, VV_OBJ, xv.ty, f0, f1, f2, xv.n);
+  }
+  if k == VV_STRUCT || k == VV_ENUM {
+    let mut tag = 0;
+    if k == VV_ENUM {
+      tag = next_leaf(&mut v, ts);
+    }
+    let mut xs = vec_new[u64]();
+    let mut j = 0;
+    while j < xv.n {
+      let r = rebuild(&mut v, kid(v, x, j), ts);
+      vec_push(&mut xs, r);
+      j = j + 1;
+    }
+    let mut out = 0;
+    if k == VV_ENUM {
+      out = mk_enum(&mut v, xv.ty, tag, xs);
+    } else {
+      out = mk_struct(&mut v, xv.ty, xs);
+    }
+    vec_free(xs);
+    return out;
+  }
+  if k == VV_VEC {
+    let l = next_leaf(&mut v, ts);
+    let el = rebuild(&mut v, xv.b, ts);
+    return mk(&mut v, VV_VEC, xv.ty, l, el, 0, 0);
+  }
+  return x;               // boxes and unit stay as they are
+}
+
+fn next_leaf(v: &mut Vr, ts: &Vec[u64]) -> u64 {
+  let t = u_at(ts, v.cur);
+  v.cur = vadd(v.cur, 1);
+  return t;
+}
+
+/// The lifted elements `elems` with `x` stored at index `i`.
+fn vec_write(v: &mut Vr, m: &Mono, elems: u64, i: u64, x: u64) -> u64 {
+  let mut xs = vec_new[u64]();
+  let mut xso = vec_new[u64]();
+  leaves_of(v, m, x, &mut xs, &mut xso);
+  let mut arrs = vec_new[u64]();
+  let mut aso = vec_new[u64]();
+  leaves_of(v, m, elems, &mut arrs, &mut aso);
+  let mut out = vec_new[u64]();
+  let mut j = 0;
+  while j < vec_len(arrs) {
+    let st = app3(&mut v, OP_STORE, u_at(arrs, j), i, u_at(xs, j));
+    vec_push(&mut out, st);
+    j = j + 1;
+  }
+  v.cur = 0;
+  let r = rebuild(&mut v, elems, out);
+  vec_free(xs);
+  vec_free(xso);
+  vec_free(arrs);
+  vec_free(aso);
+  vec_free(out);
+  return r;
+}
+
+/// The lifted elements read at index `i`: every array term selected.
+fn select_all(v: &mut Vr, m: &Mono, elems: u64, i: u64) -> u64 {
+  let mut arrs = vec_new[u64]();
+  let mut aso = vec_new[u64]();
+  leaves_of(v, m, elems, &mut arrs, &mut aso);
+  let mut out = vec_new[u64]();
+  let mut j = 0;
+  while j < vec_len(arrs) {
+    let s = app2(&mut v, OP_SELECT, u_at(arrs, j), i);
+    vec_push(&mut out, s);
+    j = j + 1;
+  }
+  v.cur = 0;
+  let r = rebuild(&mut v, elems, out);
+  vec_free(arrs);
+  vec_free(aso);
+  vec_free(out);
+  return r;
+}
+
+/// Looks through known boxes.
+fn unbox_known(v: &Vr, x: u64) -> u64 {
+  let mut y = x;
+  let mut xv = vl_at(v, y);
+  let mut n = 0;
+  while xv.kind == VV_BOXK && n < SRC_MAX {
+    y = xv.a;
+    xv = vl_at(v, y);
+    n = n + 1;
+  }
+  return y;
+}
+
+// ---- Variables and places ----
+
+fn bind_at(env: &Vec[Bind], k: u64) -> Bind {
+  if k < vec_len(env) {
+    return vec_get(env, k);
+  }
+  return Bind { s: 0, e: 0, val: 0 };
+}
+
+fn env_clone(env: &Vec[Bind]) -> Vec[Bind] {
+  let mut out = vec_new[Bind]();
+  let mut k = 0;
+  while k < vec_len(env) {
+    vec_push(&mut out, bind_at(env, k));
+    k = k + 1;
+  }
+  return out;
+}
+
+/// The value of the variable named `s..e`, or 0.
+fn env_find(env: &Vec[Bind], p: &Parser, s: u64, e: u64) -> u64 {
+  let mut k = 0;
+  while k < vec_len(env) {
+    let b = bind_at(env, k);
+    if same(p.src, b.s, b.e, s, e) {
+      return b.val;
+    }
+    k = k + 1;
+  }
+  return 0;
+}
+
+/// The value of the variable named pool[rs .. rs + rl], or 0.
+fn env_find_rng(env: &Vec[Bind], v: &Vr, p: &Parser, rs: u64, rl: u64) -> u64 {
+  let mut k = 0;
+  while k < vec_len(env) {
+    let b = bind_at(env, k);
+    if rng_is_src(v, rs, rl, p, b.s, b.e) {
+      return b.val;
+    }
+    k = k + 1;
+  }
+  return 0;
+}
+
+/// Gives the variable named `s..e` the value `x` (adding it if it is new).
+fn env_put(env: &mut Vec[Bind], p: &Parser, s: u64, e: u64, x: u64) {
+  let mut k = 0;
+  while k < vec_len(env) {
+    let b = bind_at(env, k);
+    if same(p.src, b.s, b.e, s, e) {
+      vec_set(&mut env, k, Bind { s: b.s, e: b.e, val: x });
+      return;
+    }
+    k = k + 1;
+  }
+  vec_push(&mut env, Bind { s: s, e: e, val: x });
+}
+
+fn env_set_rng(env: &mut Vec[Bind], v: &Vr, p: &Parser, rs: u64, rl: u64, x: u64) {
+  let mut k = 0;
+  while k < vec_len(env) {
+    let b = bind_at(env, k);
+    if rng_is_src(v, rs, rl, p, b.s, b.e) {
+      vec_set(&mut env, k, Bind { s: b.s, e: b.e, val: x });
+      return;
+    }
+    k = k + 1;
+  }
+}
+
+fn st_clone(st: &VState) -> VState {
+  return VState { pc: copy_set(st.pc), env: env_clone(st.env), live: st.live };
+}
+
+fn st_free(st: VState) {
+  vec_free(st.pc);
+  vec_free(st.env);
+}
+
+/// A state no path reaches.
+fn st_dead() -> VState {
+  return VState { pc: vec_new[u64](), env: vec_new[Bind](), live: false };
+}
+
+/// The number of fields (or variants) of the struct or enum type `t`.
+fn nparts(m: &Mono, p: &Parser, t: u64) -> u64 {
+  let dn = def_node(m, p, inner_t(m, t));
+  return list_len(p, dn.a);
+}
+
+/// The node of field (or variant) `j` of the struct or enum type `t`.
+fn part_node(m: &Mono, p: &Parser, t: u64, j: u64) -> Node {
+  let dn = def_node(m, p, inner_t(m, t));
+  let mut f = dn.a;
+  let mut k = 0;
+  while f != 0 && k < j {
+    f = next_of(p, f);
+    k = k + 1;
+  }
+  return node_at(p.nodes, f);
+}
+
+/// The type of field (or payload of variant) `j` of type `t`, 0 for none.
+fn part_ty(c: &Checker, m: &Mono, t: u64, j: u64) -> u64 {
+  return fld_ty(c, inner_t(m, t), j);
+}
+
+/// The index + 1 of the variant named `s..e` of the enum type `t`, or 0.
+fn variant_index(m: &Mono, p: &Parser, t: u64, s: u64, e: u64) -> u64 {
+  let dn = def_node(m, p, inner_t(m, t));
+  return index_in(p, dn.a, s, e);
+}
+
+/// Field pool[rs .. rs + rl] of the struct value `x`, or 0.
+fn field_of(v: &Vr, m: &Mono, p: &Parser, x: u64, rs: u64, rl: u64) -> u64 {
+  let xv = vl_at(v, x);
+  if xv.kind != VV_STRUCT {
+    return 0;
+  }
+  let dn = def_node(m, p, inner_t(m, xv.ty));
+  let mut f = dn.a;
+  let mut j = 0;
+  while f != 0 && j < SRC_MAX {
+    let fd = node_at(p.nodes, f);
+    if rng_is_src(v, rs, rl, p, fd.s, fd.e) {
+      return kid(v, x, j);
+    }
+    f = fd.next;
+    j = j + 1;
+  }
+  return 0;
+}
+
+/// Where the part of the dotted path `path` that starts at `i` ends (at
+/// the next `.` or the end).
+fn seg_end(v: &Vr, path: u64, i: u64) -> u64 {
+  let pt = tm_at(v, path);
+  let mut j = i;
+  while j < pt.b && pool_at(v, vadd(pt.a, j)) != 46 {
+    j = j + 1;
+  }
+  if j < i {
+    return i;
+  }
+  return j;
+}
+
+/// The value at a dotted path (boxes on the way already opened).
+fn get_path(v: &Vr, m: &Mono, p: &Parser, env: &Vec[Bind], path: u64) -> u64 {
+  let pt = tm_at(v, path);
+  let mut i = seg_end(v, path, 0);
+  let mut x = env_find_rng(env, v, p, pt.a, i);
+  while i < pt.b {
+    let fs = i + 1;
+    let j = seg_end(v, path, fs);
+    x = unbox_known(v, x);
+    if j >= fs {
+      x = field_of(v, m, p, x, vadd(pt.a, fs), j - fs);
+    }
+    i = j;
+  }
+  return x;
+}
+
+/// Replaces the value at a dotted path.
+fn set_path(v: &mut Vr, m: &Mono, p: &Parser, env: &mut Vec[Bind], path: u64, nv: u64) {
+  let pt = tm_at(v, path);
+  let i = seg_end(v, path, 0);
+  let oenv = env_find_rng(env, v, p, pt.a, i);
+  let r = set_in(&mut v, m, p, oenv, path, i, nv);
+  env_set_rng(&mut env, v, p, pt.a, i, r);
+}
+
+/// `x` with the part of `path` from position `i` on replaced by `nv`.
+fn set_in(v: &mut Vr, m: &Mono, p: &Parser, x: u64, path: u64, i: u64, nv: u64) -> u64 {
+  let pt = tm_at(v, path);
+  if i >= pt.b {
+    return nv;
+  }
+  let xv = vl_at(v, x);
+  if xv.kind == VV_BOXK {
+    let inner = set_in(&mut v, m, p, xv.a, path, i, nv);
+    return mk(&mut v, VV_BOXK, 0, inner, 0, 0, 0);
+  }
+  if xv.kind != VV_STRUCT {
+    return x;
+  }
+  let fs = i + 1;
+  let j = seg_end(v, path, fs);
+  if j < fs {
+    return x;
+  }
+  let dn = def_node(m, p, inner_t(m, xv.ty));
+  let mut xs = vec_new[u64]();
+  let mut f = dn.a;
+  let mut k = 0;
+  while f != 0 && k < xv.n {
+    let fd = node_at(p.nodes, f);
+    let mut y = kid(v, x, k);
+    if rng_is_src(v, vadd(pt.a, fs), j - fs, p, fd.s, fd.e) {
+      y = set_in(&mut v, m, p, y, path, j, nv);
+    }
+    vec_push(&mut xs, y);
+    f = fd.next;
+    k = k + 1;
+  }
+  let r = mk_struct(&mut v, xv.ty, xs);
+  vec_free(xs);
+  return r;
+}
+
+/// The dotted path a place expression spells (`x.f.g`), or 0.
+fn place_text(v: &mut Vr, p: &Parser, i: u64) -> u64 {
+  let n = node_at(p.nodes, i);
+  if n.kind != E_VAR && n.kind != E_FIELD {
+    return 0;
+  }
+  let start = vec_len(v.pool);
+  if !push_place(&mut v, p, i) {
+    return 0;
+  }
+  return seal(&mut v, start);
+}
+
+fn push_place(v: &mut Vr, p: &Parser, i: u64) -> bool {
+  let n = node_at(p.nodes, i);
+  if n.kind == E_VAR {
+    push_src(&mut v, p, n.s, n.e);
+    return true;
+  }
+  if n.kind == E_FIELD {
+    if !push_place(&mut v, p, n.a) {
+      return false;
+    }
+    push_str(&mut v, ".");
+    push_src(&mut v, p, n.s, n.e);
+    return true;
+  }
+  return false;
+}
+
+/// The dotted path a list of names spells.
+fn list_text(v: &mut Vr, p: &Parser, head: u64) -> u64 {
+  let start = vec_len(v.pool);
+  let mut k = head;
+  while k != 0 {
+    let n = node_at(p.nodes, k);
+    if k != head {
+      push_str(&mut v, ".");
+    }
+    push_src(&mut v, p, n.s, n.e);
+    k = n.next;
+  }
+  return seal(&mut v, start);
+}
+
+// ---- Fresh values ----
+
+fn fresh_field(v: &mut Vr, tk: u64, j: u64, hint: u64) -> u64 {
+  if tk == TY_PT && j == 2 {
+    let h = cat_str(&mut v, hint, "_used");
+    return fresh_array(&mut v, h, SO_BOOL);
+  }
+  if tk == TY_POOL && j == 0 {
+    let h = cat_str(&mut v, hint, "_has");
+    return fresh_array(&mut v, h, SO_BOOL);
+  }
+  if tk == TY_POOL {
+    return v.t_poolsize;
+  }
+  if tk == TY_PT && j == 1 {
+    let h = cat_str(&mut v, hint, "_level");
+    let one = num(&mut v, 1);
+    let five = num(&mut v, 5);
+    return fresh_int(&mut v, h, one, five);
+  }
+  if tk == TY_MMU {
+    let h = cat_str(&mut v, hint, "_root");
+    return fresh_int(&mut v, h, v.t_zero, v.t_flimit);
+  }
+  let h = cat_str(&mut v, hint, "_id");
+  let n = fresh_int(&mut v, h, v.t_zero, v.t_flimit);
+  let lt = app2(&mut v, OP_LT, n, v.t_poolsize);
+  assert_tm(&mut v, lt);
+  return n;
+}
+
+/// Ghost fields a loop keeps when only builtins that never change them
+/// change the object (a page table keeps its id and level).
+fn kept_by_builtins(tk: u64, j: u64) -> bool {
+  return ((tk == TY_FRAME || tk == TY_PT) && j == 0) || (tk == TY_PT && j == 1) || (tk == TY_POOL && j == 1);
+}
+
+fn fresh_obj(v: &mut Vr, m: &Mono, tyx: u64, hint: u64) -> u64 {
+  let tk = kind_t(m, tyx);
+  let n = obj_fields(tk);
+  let mut f0 = 0;
+  let mut f1 = 0;
+  let mut f2 = 0;
+  if n > 0 { f0 = fresh_field(&mut v, tk, 0, hint); }
+  if n > 1 { f1 = fresh_field(&mut v, tk, 1, hint); }
+  if n > 2 { f2 = fresh_field(&mut v, tk, 2, hint); }
+  return mk(&mut v, VV_OBJ, tyx, f0, f1, f2, n);
+}
+
+/// A value of type `tyx` about which nothing is known but its type.
+fn fresh_of(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, tyx: u64, hint: u64) -> u64 {
+  let k = kind_t(m, tyx);
+  if k == TY_U64 {
+    return fresh_u64(&mut v, hint);
+  }
+  if k == TY_BOOL {
+    return fresh_bool(&mut v, hint);
+  }
+  if k == TY_BUF || k == TY_STR {
+    let l = fresh_len(&mut v, hint);
+    let d = fresh_array(&mut v, hint, SO_INT);
+    if k == TY_STR {
+      return mk(&mut v, VV_STR, 0, l, d, 0, 0);
+    }
+    return mk(&mut v, VV_BUF, 0, l, d, 0, 0);
+  }
+  if k == TY_BYTES {
+    // Every byte of a Bytes value is <= 255.
+    let d = fresh_array(&mut v, hint, SO_INT);
+    let sel = app2(&mut v, OP_SELECT, d, v.t_k);
+    let r = in_range(&mut v, v.t_zero, sel, v.t_255);
+    let all = forall_tm(&mut v, v.t_k, r);
+    assert_tm(&mut v, all);
+    let l = fresh_len(&mut v, hint);
+    return mk(&mut v, VV_BUF, 0, l, d, 0, 0);
+  }
+  if k == TY_REF || k == TY_MUTREF {
+    return fresh_of(&mut v, c, m, p, inner_t(m, tyx), hint);
+  }
+  if k == TY_UNIT {
+    return v.unit;
+  }
+  if k == TY_STRUCT {
+    let n = nparts(m, p, tyx);
+    let mut xs = vec_new[u64]();
+    let mut j = 0;
+    while j < n {
+      let fd = part_node(m, p, tyx, j);
+      let h = cat_src(&mut v, p, hint, fd.s, fd.e);
+      let x = fresh_of(&mut v, c, m, p, part_ty(c, m, tyx, j), h);
+      vec_push(&mut xs, x);
+      j = j + 1;
+    }
+    let r = mk_struct(&mut v, tyx, xs);
+    vec_free(xs);
+    return r;
+  }
+  if k == TY_ENUM {
+    let n = nparts(m, p, tyx);
+    let ht = cat_str(&mut v, hint, "_tag");
+    let mut hi = 0;
+    if n > 0 {
+      hi = n - 1;
+    }
+    let top = num(&mut v, hi);
+    let tag = fresh_int(&mut v, ht, v.t_zero, top);
+    let mut xs = vec_new[u64]();
+    let mut j = 0;
+    while j < n {
+      let pt = part_ty(c, m, tyx, j);
+      let mut x = v.unit;
+      if pt != 0 {
+        let vd = part_node(m, p, tyx, j);
+        let h = cat_src(&mut v, p, hint, vd.s, vd.e);
+        x = fresh_of(&mut v, c, m, p, pt, h);
+      }
+      vec_push(&mut xs, x);
+      j = j + 1;
+    }
+    let r = mk_enum(&mut v, tyx, tag, xs);
+    vec_free(xs);
+    return r;
+  }
+  if k == TY_VEC {
+    let el = fresh_lifted(&mut v, c, m, p, inner_t(m, tyx), hint);
+    let l = fresh_len(&mut v, hint);
+    return mk(&mut v, VV_VEC, inner_t(m, tyx), l, el, 0, 0);
+  }
+  if k == TY_BOX {
+    if v.box_depth >= BOX_DEPTH {
+      return mk(&mut v, VV_BOXO, inner_t(m, tyx), 0, 0, 0, 0);
+    }
+    v.box_depth = v.box_depth + 1;
+    let inner = fresh_of(&mut v, c, m, p, inner_t(m, tyx), hint);
+    if v.box_depth > 0 {
+      v.box_depth = v.box_depth - 1;
+    }
+    return mk(&mut v, VV_BOXK, 0, inner, 0, 0, 0);
+  }
+  return fresh_obj(&mut v, m, tyx, hint);
+}
+
+/// Fresh contents for a vector of `tyx`: every term of an element becomes
+/// an unconstrained array indexed by position.
+fn fresh_lifted(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, tyx: u64, hint: u64) -> u64 {
+  let t0 = fresh_of(&mut v, c, m, p, tyx, hint);
+  let tmpl = opaque_boxes(&mut v, c, m, p, t0, tyx);
+  let mut ts = vec_new[u64]();
+  let mut sorts = vec_new[u64]();
+  leaves_of(v, m, tmpl, &mut ts, &mut sorts);
+  let mut arrs = vec_new[u64]();
+  let mut j = 0;
+  while j < vec_len(sorts) {
+    let h = cat_str(&mut v, hint, "_elems");
+    let a = fresh_array(&mut v, h, u_at(sorts, j));
+    vec_push(&mut arrs, a);
+    j = j + 1;
+  }
+  v.cur = 0;
+  let r = rebuild(&mut v, tmpl, arrs);
+  vec_free(ts);
+  vec_free(sorts);
+  vec_free(arrs);
+  return r;
+}
+
+/// Makes every box in `x` (of type `tyx`) opaque: a lifted template must
+/// not claim the same box contents for every index.
+fn opaque_boxes(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, x: u64, tyx: u64) -> u64 {
+  let xv = vl_at(v, x);
+  if xv.kind == VV_STRUCT || xv.kind == VV_ENUM {
+    let mut xs = vec_new[u64]();
+    let mut j = 0;
+    while j < xv.n {
+      let pt = part_ty(c, m, xv.ty, j);
+      let mut y = v.unit;
+      if xv.kind == VV_STRUCT || pt != 0 {
+        y = opaque_boxes(&mut v, c, m, p, kid(v, x, j), pt);
+      }
+      vec_push(&mut xs, y);
+      j = j + 1;
+    }
+    let mut r = 0;
+    if xv.kind == VV_ENUM {
+      r = mk_enum(&mut v, xv.ty, xv.a, xs);
+    } else {
+      r = mk_struct(&mut v, xv.ty, xs);
+    }
+    vec_free(xs);
+    return r;
+  }
+  if (xv.kind == VV_BOXK || xv.kind == VV_BOXO) && kind_t(m, tyx) == TY_BOX {
+    return mk(&mut v, VV_BOXO, inner_t(m, tyx), 0, 0, 0, 0);
+  }
+  return x;
+}
+
+/// The element at index `i`: a fresh value (with every fact a value of its
+/// type satisfies) equal, term by term, to what the vector stores.
+fn vec_read(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, elem: u64, elems: u64, i: u64, st: &mut VState) -> u64 {
+  let h = atom_str(&mut v, "elem");
+  let x = fresh_of(&mut v, c, m, p, elem, h);
+  let mut a = vec_new[u64]();
+  let mut aso = vec_new[u64]();
+  leaves_of(v, m, x, &mut a, &mut aso);
+  let mut b = vec_new[u64]();
+  let mut bso = vec_new[u64]();
+  leaves_of(v, m, elems, &mut b, &mut bso);
+  let mut j = 0;
+  while j < vec_len(a) && j < vec_len(b) {
+    let sel = app2(&mut v, OP_SELECT, u_at(b, j), i);
+    let eq = app2(&mut v, OP_EQ, u_at(a, j), sel);
+    vec_push(&mut st.pc, eq);
+    j = j + 1;
+  }
+  vec_free(a);
+  vec_free(aso);
+  vec_free(b);
+  vec_free(bso);
+  return x;
+}
+
+/// Gives every opaque box on `path` (before its last part) fresh contents,
+/// so the path can be read and written.
+fn open_path(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, env: &mut Vec[Bind], path: u64) {
+  let pt = tm_at(v, path);
+  let mut i = seg_end(v, path, 0);
+  while i < pt.b {
+    let pre = prefix(&mut v, path, i);
+    let x = get_path(v, m, p, env, pre);
+    let o = open_val(&mut v, c, m, p, x, pre);
+    if o != x {
+      set_path(&mut v, m, p, &mut env, pre, o);
+    }
+    i = seg_end(v, path, i + 1);
+  }
+}
+
+fn open_val(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, x: u64, hint: u64) -> u64 {
+  let xv = vl_at(v, x);
+  if xv.kind == VV_BOXO {
+    let inner = fresh_of(&mut v, c, m, p, xv.ty, hint);
+    let o = open_val(&mut v, c, m, p, inner, hint);
+    return mk(&mut v, VV_BOXK, 0, o, 0, 0, 0);
+  }
+  if xv.kind == VV_BOXK {
+    let o = open_val(&mut v, c, m, p, xv.a, hint);
+    if o == xv.a {
+      return x;
+    }
+    return mk(&mut v, VV_BOXK, 0, o, 0, 0, 0);
+  }
+  return x;
+}
+
+/// What a specification sees inside a box. An opaque box reads as fresh
+/// values each time: only incomplete, never unsound.
+fn look_inside(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, x: u64) -> u64 {
+  let xv = vl_at(v, x);
+  if xv.kind == VV_BOXK {
+    return look_inside(&mut v, c, m, p, xv.a);
+  }
+  if xv.kind == VV_BOXO {
+    let h = atom_str(&mut v, "opaque");
+    let inner = fresh_of(&mut v, c, m, p, xv.ty, h);
+    return look_inside(&mut v, c, m, p, inner);
+  }
+  return x;
+}
+
+/// A fresh value of the same type as `old`. With `keep`, a Buf or a Vec
+/// keeps its length and an object the ghost fields builtins never change.
+fn havoc(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, oenv: u64, keep: bool, name: u64) -> u64 {
+  let xv = vl_at(v, oenv);
+  let k = xv.kind;
+  if k == VV_BUF {
+    let mut l = xv.a;
+    if !keep {
+      l = fresh_len(&mut v, name);
+    }
+    let d = fresh_array(&mut v, name, SO_INT);
+    return mk(&mut v, VV_BUF, 0, l, d, 0, 0);
+  }
+  if k == VV_STR {
+    let l = fresh_len(&mut v, name);
+    let d = fresh_array(&mut v, name, SO_INT);
+    return mk(&mut v, VV_STR, 0, l, d, 0, 0);
+  }
+  if k == VV_U {
+    return fresh_u64(&mut v, name);
+  }
+  if k == VV_B {
+    return fresh_bool(&mut v, name);
+  }
+  if k == VV_OBJ {
+    let tk = kind_t(m, xv.ty);
+    let mut f0 = xv.a;
+    let mut f1 = xv.b;
+    let mut f2 = xv.c;
+    if xv.n > 0 && !(keep && kept_by_builtins(tk, 0)) { f0 = fresh_field(&mut v, tk, 0, name); }
+    if xv.n > 1 && !(keep && kept_by_builtins(tk, 1)) { f1 = fresh_field(&mut v, tk, 1, name); }
+    if xv.n > 2 && !(keep && kept_by_builtins(tk, 2)) { f2 = fresh_field(&mut v, tk, 2, name); }
+    return mk(&mut v, VV_OBJ, xv.ty, f0, f1, f2, xv.n);
+  }
+  if k == VV_STRUCT || k == VV_ENUM {
+    let mut tag = 0;
+    if k == VV_ENUM {
+      let ht = cat_str(&mut v, name, "_tag");
+      let mut hi = 0;
+      if xv.n > 0 {
+        hi = xv.n - 1;
+      }
+      let top = num(&mut v, hi);
+      tag = fresh_int(&mut v, ht, v.t_zero, top);
+    }
+    let mut xs = vec_new[u64]();
+    let mut j = 0;
+    while j < xv.n {
+      let fd = part_node(m, p, xv.ty, j);
+      let h = cat_src(&mut v, p, name, fd.s, fd.e);
+      let y = havoc(&mut v, c, m, p, kid(v, oenv, j), false, h);
+      vec_push(&mut xs, y);
+      j = j + 1;
+    }
+    let mut r = 0;
+    if k == VV_ENUM {
+      r = mk_enum(&mut v, xv.ty, tag, xs);
+    } else {
+      r = mk_struct(&mut v, xv.ty, xs);
+    }
+    vec_free(xs);
+    return r;
+  }
+  if k == VV_VEC {
+    let mut l = xv.a;
+    if !keep {
+      l = fresh_len(&mut v, name);
+    }
+    let el = fresh_lifted(&mut v, c, m, p, xv.ty, name);
+    return mk(&mut v, VV_VEC, xv.ty, l, el, 0, 0);
+  }
+  if k == VV_BOXK {
+    let inner = havoc(&mut v, c, m, p, xv.a, false, name);
+    return mk(&mut v, VV_BOXK, 0, inner, 0, 0, 0);
+  }
+  return oenv;             // opaque boxes and unit
+}
+
+/// Proves `goal` under the path condition. (For now the solver is not
+/// asked: the query is only recorded, and assumed to hold.)
+fn prove(v: &mut Vr, st: &VState, goal: u64) {
+  if v.obligations < U64_MAX {
+    v.obligations = v.obligations + 1;
+  }
+  send(&mut v, CMD_PUSH, 0, 0);
+  let mut k = 0;
+  while k < vec_len(st.pc) {
+    assert_tm(&mut v, u_at(st.pc, k));
+    k = k + 1;
+  }
+  let ng = t_not(&mut v, goal);
+  assert_tm(&mut v, ng);
+  send(&mut v, CMD_CHECK, 0, 0);
+  send(&mut v, CMD_POP, 0, 0);
+}
+
+/// The value of a string literal (token text s..e): exact length and bytes.
+fn str_val(v: &mut Vr, p: &Parser, s: u64, e: u64) -> u64 {
+  if !(s <= e && e <= blen(p.src)) {
+    return mk(&mut v, VV_STR, 0, v.t_zero, v.t_zarr, 0, 0);
+  }
+  let bytes = decode(p.src, s, e);
+  let mut d = v.t_zarr;
+  let mut k = 0;
+  while k < blen(bytes)
+    invariant k <= blen(bytes)
+  {
+    let ik = num(&mut v, k);
+    let bk = num(&mut v, bget(bytes, k));
+    d = app3(&mut v, OP_STORE, d, ik, bk);
+    k = k + 1;
+  }
+  let l = num(&mut v, blen(bytes));
+  bfree(bytes);
+  return mk(&mut v, VV_STR, 0, l, d, 0, 0);
+}
+
+// ---- Specifications ----
+
+/// The spec fn named `s..e`, or 0.
+fn vspec_def(p: &Parser, s: u64, e: u64) -> u64 {
+  let mut k = p.specs.head;
+  while k != 0 {
+    let n = node_at(p.nodes, k);
+    if same(p.src, n.s, n.e, s, e) {
+      return k;
+    }
+    k = n.next;
+  }
+  return 0;
+}
+
+/// Argument `j` of a call node.
+fn arg_node(p: &Parser, call: u64, j: u64) -> u64 {
+  let n = node_at(p.nodes, call);
+  let mut k = n.a;
+  let mut q = 0;
+  while k != 0 && q < j {
+    k = next_of(p, k);
+    q = q + 1;
+  }
+  return k;
+}
+
+/// The value a specification names: a variable, `result`, `old(x)`, a
+/// string literal, `vget(..)` or a field of one of these. `env` is what
+/// variables mean, `old` what `old(..)` reads (when `has_old`), `res` the
+/// value `result` names.
+fn spec_val(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env: &Vec[Bind], oenv: &Vec[Bind], has_old: bool, res: u64, bound: &mut Vec[Bnd]) -> u64 {
+  let n = node_at(p.nodes, i);
+  if n.kind == E_VAR {
+    if span_is(p, n.s, n.e, "result") {
+      return res;
+    }
+    let mut k = vec_len(bound);
+    while k > 0 {
+      k = k - 1;
+      let b = bnd_at(bound, k);
+      if same(p.src, b.s, b.e, n.s, n.e) {
+        return mk_u(&mut v, b.q);
+      }
+    }
+    return env_find(env, p, n.s, n.e);
+  }
+  if n.kind == E_CALL && span_is(p, n.s, n.e, "old") {
+    return spec_val(&mut v, c, &mut m, p, n.a, oenv, oenv, false, 0, &mut bound);
+  }
+  if n.kind == E_STR {
+    return str_val(&mut v, p, n.s, n.e);
+  }
+  if n.kind == E_CALL && span_is(p, n.s, n.e, "vget") {
+    let vx = spec_val(&mut v, c, &mut m, p, n.a, env, oenv, has_old, res, &mut bound);
+    let ix = spec_tm(&mut v, c, &mut m, p, arg_node(p, i, 1), env, oenv, has_old, res, &mut bound);
+    let xv = vl_at(v, vx);
+    return select_all(&mut v, m, xv.b, ix);
+  }
+  if n.kind == E_FIELD {
+    let b0 = spec_val(&mut v, c, &mut m, p, n.a, env, oenv, has_old, res, &mut bound);
+    let b = look_inside(&mut v, c, m, p, b0);
+    let bv = vl_at(v, b);
+    if bv.kind == VV_STRUCT {
+      let dn = def_node(m, p, inner_t(m, bv.ty));
+      let j = index_in(p, dn.a, n.s, n.e);
+      if j > 0 {
+        return kid(v, b, j - 1);
+      }
+    } else if bv.kind == VV_ENUM {
+      // `o.V`: the payload slot of variant V.
+      let j = variant_index(m, p, bv.ty, n.s, n.e);
+      if j > 0 {
+        return kid(v, b, j - 1);
+      }
+    }
+  }
+  return v.unit;
+}
+
+fn bnd_at(b: &Vec[Bnd], k: u64) -> Bnd {
+  if k < vec_len(b) {
+    return vec_get(b, k);
+  }
+  return Bnd { s: 0, e: 0, q: 0 };
+}
+
+/// Translates a specification expression into a term. No obligations.
+fn spec_tm(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env: &Vec[Bind], oenv: &Vec[Bind], has_old: bool, res: u64, bound: &mut Vec[Bnd]) -> u64 {
+  let n = node_at(p.nodes, i);
+  let k = n.kind;
+  if k == E_INT {
+    return num(&mut v, n.v);
+  }
+  if k == E_BOOL {
+    if n.v != 0 {
+      return v.t_true;
+    }
+    return v.t_false;
+  }
+  if k == E_IS {
+    let x = spec_val(&mut v, c, &mut m, p, n.a, env, oenv, has_old, res, &mut bound);
+    let xv = vl_at(v, x);
+    let j = variant_index(m, p, xv.ty, n.s2, n.e2);
+    let mut idx = 0;
+    if j > 0 {
+      idx = j - 1;
+    }
+    let tj = num(&mut v, idx);
+    return app2(&mut v, OP_EQ, xv.a, tj);
+  }
+  if k == E_VAR || k == E_FIELD {
+    let x = spec_val(&mut v, c, &mut m, p, i, env, oenv, has_old, res, &mut bound);
+    return term(v, x);
+  }
+  if k == E_NOT {
+    let x = spec_tm(&mut v, c, &mut m, p, n.a, env, oenv, has_old, res, &mut bound);
+    return t_not(&mut v, x);
+  }
+  if k == E_BIN {
+    let ta = spec_tm(&mut v, c, &mut m, p, n.a, env, oenv, has_old, res, &mut bound);
+    let tb = spec_tm(&mut v, c, &mut m, p, n.b, env, oenv, has_old, res, &mut bound);
+    let op = n.v;
+    if op == P_NE {
+      let eq = app2(&mut v, OP_EQ, ta, tb);
+      return t_not(&mut v, eq);
+    }
+    return app2(&mut v, bin_op(op), ta, tb);
+  }
+  if k == E_FORALL {
+    // A fresh SMT name per quantifier, so expanding a spec fn can never capture.
+    let qv = atom_src(&mut v, p, n.s, n.e);
+    let h = pre_str(&mut v, "q_", qv);
+    let q = fresh_name(&mut v, h);
+    vec_push(&mut bound, Bnd { s: n.s, e: n.e, q: q });
+    let tb = spec_tm(&mut v, c, &mut m, p, n.a, env, oenv, has_old, res, &mut bound);
+    if vec_len(bound) > 0 {
+      vec_pop(&mut bound);
+    }
+    let r = in_range(&mut v, v.t_zero, q, v.t_u64max);
+    let imp = app2(&mut v, OP_IMP, r, tb);
+    return forall_tm(&mut v, q, imp);
+  }
+  if k == E_CALL {
+    return vspec_call(&mut v, c, &mut m, p, i, env, oenv, has_old, res, &mut bound);
+  }
+  return v.t_false;
+}
+
+/// The SMT operator of a binary operator token.
+fn bin_op(op: u64) -> u64 {
+  if op == P_PLUS { return OP_ADD; }
+  if op == P_MINUS { return OP_SUB; }
+  if op == P_STAR { return OP_MUL; }
+  if op == P_SLASH { return OP_DIV; }
+  if op == P_PERCENT { return OP_MOD; }
+  if op == P_EQEQ { return OP_EQ; }
+  if op == P_LT { return OP_LT; }
+  if op == P_LE { return OP_LE; }
+  if op == P_GT { return OP_GT; }
+  if op == P_GE { return OP_GE; }
+  if op == P_ANDAND { return OP_AND; }
+  if op == P_OROR { return OP_OR; }
+  return OP_IMP;
+}
+
+fn vspec_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env: &Vec[Bind], oenv: &Vec[Bind], has_old: bool, res: u64, bound: &mut Vec[Bnd]) -> u64 {
+  let n = node_at(p.nodes, i);
+  if span_is(p, n.s, n.e, "old") {
+    return spec_tm(&mut v, c, &mut m, p, n.a, oenv, oenv, false, 0, &mut bound);
+  }
+  let sf = vspec_def(p, n.s, n.e);
+  if sf != 0 {
+    let sd = node_at(p.nodes, sf);
+    let mut senv = vec_new[Bind]();
+    let mut q = sd.a;
+    let mut a = n.a;
+    while q != 0 && a != 0 {
+      let qn = node_at(p.nodes, q);
+      let pt = base_t(m, conv(&mut m, p, qn.a, 0, q));
+      let mut x = 0;
+      if kind_t(m, pt) == TY_U64 {
+        let t = spec_tm(&mut v, c, &mut m, p, a, env, oenv, has_old, res, &mut bound);
+        x = mk_u(&mut v, t);
+      } else if kind_t(m, pt) == TY_BOOL {
+        let t = spec_tm(&mut v, c, &mut m, p, a, env, oenv, has_old, res, &mut bound);
+        x = mk_b(&mut v, t);
+      } else {
+        x = spec_val(&mut v, c, &mut m, p, a, env, oenv, has_old, res, &mut bound);
+      }
+      env_put(&mut senv, p, qn.s, qn.e, x);
+      q = qn.next;
+      a = next_of(p, a);
+    }
+    let mut sb = vec_new[Bnd]();
+    let r = spec_tm(&mut v, c, &mut m, p, sd.c, senv, senv, false, 0, &mut sb);
+    vec_free(sb);
+    vec_free(senv);
+    return r;
+  }
+  if span_is(p, n.s, n.e, "vget") {
+    let x = spec_val(&mut v, c, &mut m, p, i, env, oenv, has_old, res, &mut bound);
+    return term(v, x);
+  }
+  let x = spec_val(&mut v, c, &mut m, p, n.a, env, oenv, has_old, res, &mut bound);
+  let xv = vl_at(v, x);
+  if span_is(p, n.s, n.e, "vlen") || span_is(p, n.s, n.e, "len") || span_is(p, n.s, n.e, "slen") || span_is(p, n.s, n.e, "blen") {
+    return xv.a;
+  }
+  if span_is(p, n.s, n.e, "get") || span_is(p, n.s, n.e, "sget") || span_is(p, n.s, n.e, "bget") {
+    let ix = spec_tm(&mut v, c, &mut m, p, arg_node(p, i, 1), env, oenv, has_old, res, &mut bound);
+    return app2(&mut v, OP_SELECT, xv.b, ix);
+  }
+  if span_is(p, n.s, n.e, "frame_id") || span_is(p, n.s, n.e, "pt_id") {
+    return g_id(v, x);
+  }
+  if span_is(p, n.s, n.e, "pt_level") {
+    return g_level(v, x);
+  }
+  if span_is(p, n.s, n.e, "pool_size") {
+    return g_size(v, x);
+  }
+  if span_is(p, n.s, n.e, "mmu_root") {
+    return g_root(v, x);
+  }
+  if span_is(p, n.s, n.e, "pt_used") || span_is(p, n.s, n.e, "pool_has") {
+    let mut arr = g_used(v, x);
+    if span_is(p, n.s, n.e, "pool_has") {
+      arr = g_has(v, x);
+    }
+    let ix = spec_tm(&mut v, c, &mut m, p, arg_node(p, i, 1), env, oenv, has_old, res, &mut bound);
+    return app2(&mut v, OP_SELECT, arr, ix);
+  }
+  return v.t_false;
+}
+
+/// A specification read in the state `st`.
+fn here(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &VState) -> u64 {
+  let mut b = vec_new[Bnd]();
+  let t = spec_tm(&mut v, c, &mut m, p, i, st.env, st.env, false, 0, &mut b);
+  vec_free(b);
+  return t;
+}
+
+// ---- Expressions ----
+
+/// Evaluates a code expression, proving its safety obligations on the
+/// way. A call, struct literal or variant names instance `inst` instead of
+/// what is written when `inst` is not 0.
+fn eval(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VState, inst: u64) -> u64 {
+  let n = node_at(p.nodes, i);
+  let k = n.kind;
+  if k == E_TAPP {
+    if is_typed_builtin(p, n.b) {
+      let t = conv(&mut m, p, n.a, v.env, i);
+      let h = atom_str(&mut v, "vec");
+      let el = fresh_lifted(&mut v, c, m, p, t, h);
+      return mk(&mut v, VV_VEC, t, v.t_zero, el, 0, 0);
+    }
+    let x = tapp_inst(&mut m, p, i, v.env);
+    return eval(&mut v, c, &mut m, p, n.b, &mut st, x);
+  }
+  if k == E_INT {
+    let t = num(&mut v, n.v);
+    return mk_u(&mut v, t);
+  }
+  if k == E_BOOL {
+    if n.v != 0 {
+      return mk_b(&mut v, v.t_true);
+    }
+    return mk_b(&mut v, v.t_false);
+  }
+  if k == E_STR {
+    return str_val(&mut v, p, n.s, n.e);
+  }
+  if k == E_BLOB {
+    let h = atom_str(&mut v, "blob");
+    let d = fresh_array(&mut v, h, SO_INT);
+    let l = num(&mut v, n.v);
+    return mk(&mut v, VV_STR, 0, l, d, 0, 0);
+  }
+  if k == E_VAR {
+    return env_find(st.env, p, n.s, n.e);
+  }
+  if k == E_FIELD {
+    let path = place_text(&mut v, p, i);
+    open_path(&mut v, c, m, p, &mut st.env, path);
+    return get_path(v, m, p, st.env, path);
+  }
+  if k == E_SLIT {
+    return eval_slit(&mut v, c, &mut m, p, i, &mut st, inst);
+  }
+  if k == E_VARIANT {
+    return eval_variant(&mut v, c, &mut m, p, i, &mut st, inst);
+  }
+  if k == E_IS {
+    let x = eval(&mut v, c, &mut m, p, n.a, &mut st, 0);
+    let xv = vl_at(v, x);
+    let j = variant_index(m, p, xv.ty, n.s2, n.e2);
+    let mut idx = 0;
+    if j > 0 {
+      idx = j - 1;
+    }
+    let tj = num(&mut v, idx);
+    let eq = app2(&mut v, OP_EQ, xv.a, tj);
+    return mk_b(&mut v, eq);
+  }
+  if k == E_NOT {
+    let x = eval(&mut v, c, &mut m, p, n.a, &mut st, 0);
+    let t = t_not(&mut v, term(v, x));
+    return mk_b(&mut v, t);
+  }
+  if k == E_BIN {
+    return eval_bin(&mut v, c, &mut m, p, i, &mut st);
+  }
+  if k == E_CALL {
+    return vcall(&mut v, c, &mut m, p, i, &mut st, inst);
+  }
+  return v.unit;
+}
+
+fn eval_slit(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VState, inst: u64) -> u64 {
+  let mut x = inst;
+  if x == 0 {
+    x = plain_inst(&mut m, find_in(p, p.structs.head, i));
+  }
+  let tyx = intern(&mut m, p, TY_STRUCT, x);
+  // The fields in the order written, then in the order declared.
+  let n = node_at(p.nodes, i);
+  let mut inits = vec_new[u64]();
+  let mut got = vec_new[u64]();
+  let mut f = n.a;
+  while f != 0 {
+    let fi = node_at(p.nodes, f);
+    let y = eval(&mut v, c, &mut m, p, fi.a, &mut st, 0);
+    vec_push(&mut inits, f);
+    vec_push(&mut got, y);
+    f = fi.next;
+  }
+  let mut xs = vec_new[u64]();
+  let dn = def_node(m, p, x);
+  let mut d = dn.a;
+  while d != 0 {
+    let fd = node_at(p.nodes, d);
+    let mut y = 0;
+    let mut j = 0;
+    while j < vec_len(inits) {
+      let fi = node_at(p.nodes, u_at(inits, j));
+      if same(p.src, fi.s, fi.e, fd.s, fd.e) {
+        y = u_at(got, j);
+      }
+      j = j + 1;
+    }
+    vec_push(&mut xs, y);
+    d = fd.next;
+  }
+  let r = mk_struct(&mut v, tyx, xs);
+  vec_free(inits);
+  vec_free(got);
+  vec_free(xs);
+  return r;
+}
+
+fn eval_variant(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VState, inst: u64) -> u64 {
+  let n = node_at(p.nodes, i);
+  let mut x = inst;
+  if x == 0 {
+    x = plain_inst(&mut m, find_in(p, p.enums.head, i));
+  }
+  let tyx = intern(&mut m, p, TY_ENUM, x);
+  let dn = def_node(m, p, x);
+  let kk = index_in(p, dn.a, n.s2, n.e2);
+  let mut k = 0;
+  if kk > 0 {
+    k = kk - 1;
+  }
+  let nm = inst_name(&mut v, m, p, x);
+  let mut xs = vec_new[u64]();
+  let mut d = dn.a;
+  let mut j = 0;
+  while d != 0 && j < SRC_MAX {
+    let vd = node_at(p.nodes, d);
+    let pt = fld_ty(c, x, j);
+    let mut y = v.unit;
+    if pt != 0 && n.a != 0 && j == k {
+      y = eval(&mut v, c, &mut m, p, n.a, &mut st, 0);
+    } else if pt != 0 {
+      let h = cat_src(&mut v, p, nm, vd.s, vd.e);
+      y = fresh_of(&mut v, c, m, p, pt, h);
+    }
+    vec_push(&mut xs, y);
+    d = vd.next;
+    j = j + 1;
+  }
+  let tag = num(&mut v, k);
+  let r = mk_enum(&mut v, tyx, tag, xs);
+  vec_free(xs);
+  return r;
+}
+
+fn eval_bin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VState) -> u64 {
+  let n = node_at(p.nodes, i);
+  let op = n.v;
+  let va = eval(&mut v, c, &mut m, p, n.a, &mut st, 0);
+  let ta = term(v, va);
+  // && and || short-circuit: the right side runs only when needed.
+  if op == P_ANDAND || op == P_OROR {
+    let mut guard = ta;
+    if op == P_OROR {
+      guard = t_not(&mut v, ta);
+    }
+    let mut sub = st_clone(st);
+    vec_push(&mut sub.pc, guard);
+    let vb = eval(&mut v, c, &mut m, p, n.b, &mut sub, 0);
+    // Facts learned on the right side hold whenever it ran.
+    let extra = tail(sub.pc, vadd(vec_len(st.pc), 1));
+    if vec_len(extra) > 0 {
+      let all = and_all(&mut v, extra);
+      let imp = app2(&mut v, OP_IMP, guard, all);
+      vec_push(&mut st.pc, imp);
+    }
+    vec_free(extra);
+    // So do the new values of anything it lent as `&mut`.
+    let mut k = 0;
+    while k < vec_len(st.env) {
+      let b = bind_at(st.env, k);
+      let sb = bind_at(sub.env, k);
+      if !val_eq(v, sb.val, b.val) {
+        let mm = merge(&mut v, guard, sb.val, b.val);
+        vec_set(&mut st.env, k, Bind { s: b.s, e: b.e, val: mm });
+      }
+      k = k + 1;
+    }
+    st_free(sub);
+    let t = app2(&mut v, bin_op(op), ta, term(v, vb));
+    return mk_b(&mut v, t);
+  }
+  let vb = eval(&mut v, c, &mut m, p, n.b, &mut st, 0);
+  let tb = term(v, vb);
+  if op == P_PLUS || op == P_STAR {
+    let t = app2(&mut v, bin_op(op), ta, tb);
+    let g = app2(&mut v, OP_LE, t, v.t_u64max);
+    prove(&mut v, st, g);
+    return mk_u(&mut v, t);
+  }
+  if op == P_MINUS {
+    let g = app2(&mut v, OP_GE, ta, tb);
+    prove(&mut v, st, g);
+    let t = app2(&mut v, OP_SUB, ta, tb);
+    return mk_u(&mut v, t);
+  }
+  if op == P_SLASH || op == P_PERCENT {
+    let eq = app2(&mut v, OP_EQ, tb, v.t_zero);
+    let g = t_not(&mut v, eq);
+    prove(&mut v, st, g);
+    let t = app2(&mut v, bin_op(op), ta, tb);
+    return mk_u(&mut v, t);
+  }
+  if op == P_NE {
+    let eq = app2(&mut v, OP_EQ, ta, tb);
+    let t = t_not(&mut v, eq);
+    return mk_b(&mut v, t);
+  }
+  let t = app2(&mut v, bin_op(op), ta, tb);
+  return mk_b(&mut v, t);
+}
+
+/// `xs[from ..]`.
+fn tail(xs: &Vec[u64], from: u64) -> Vec[u64] {
+  let mut out = vec_new[u64]();
+  let mut k = from;
+  while k < vec_len(xs) {
+    vec_push(&mut out, u_at(xs, k));
+    k = k + 1;
+  }
+  return out;
+}
+
+/// Is call argument `a` passed as a linear value (a `&mut` borrow, or a
+/// place holding something other than a u64, bool or string)?
+fn is_lin_arg(v: &mut Vr, m: &Mono, p: &Parser, a: u64, st: &VState) -> bool {
+  let an = node_at(p.nodes, a);
+  if an.kind == E_MUTBORROW {
+    return true;
+  }
+  if an.kind == E_VAR || an.kind == E_FIELD {
+    let path = place_text(&mut v, p, a);
+    let x = get_path(v, m, p, st.env, path);
+    let xv = vl_at(v, x);
+    return xv.kind != VV_U && xv.kind != VV_B && xv.kind != VV_STR;
+  }
+  return false;
+}
+
+fn vcall(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VState, inst: u64) -> u64 {
+  let n = node_at(p.nodes, i);
+  let mut args = vec_new[u64]();
+  let mut a = n.a;
+  while a != 0 {
+    vec_push(&mut args, a);
+    let an = node_at(p.nodes, a);
+    let mut path = 0;
+    if an.kind == E_MUTBORROW {
+      path = list_text(&mut v, p, an.a);
+    } else {
+      path = place_text(&mut v, p, a);
+    }
+    if path != 0 {
+      open_path(&mut v, c, m, p, &mut st.env, path);
+    }
+    a = an.next;
+  }
+  // Argument order mirrors the checker: scalars first, then linear values.
+  let mut vals = vec_new[u64]();
+  let mut lin = vec_new[u64]();
+  let mut j = 0;
+  while j < vec_len(args) {
+    let aj = u_at(args, j);
+    if is_lin_arg(&mut v, m, p, aj, st) {
+      vec_push(&mut lin, 1);
+      vec_push(&mut vals, 0);
+    } else {
+      vec_push(&mut lin, 0);
+      let x = eval(&mut v, c, &mut m, p, aj, &mut st, 0);
+      vec_push(&mut vals, x);
+    }
+    j = j + 1;
+  }
+  j = 0;
+  while j < vec_len(args) {
+    if u_at(lin, j) == 1 {
+      let aj = u_at(args, j);
+      let an = node_at(p.nodes, aj);
+      let mut x = 0;
+      if an.kind == E_MUTBORROW {
+        let path = list_text(&mut v, p, an.a);
+        x = get_path(v, m, p, st.env, path);
+      } else {
+        x = eval(&mut v, c, &mut m, p, aj, &mut st, 0);
+      }
+      if j < vec_len(vals) {
+        vec_set(&mut vals, j, x);
+      }
+    }
+    j = j + 1;
+  }
+  vec_free(lin);
+  let mut r = 0;
+  if inst == 0 && is_builtin_name(c, p, n.s, n.e) {
+    r = builtin(&mut v, c, &mut m, p, i, args, vals, &mut st);
+  } else {
+    let mut x = inst;
+    if x == 0 {
+      x = plain_inst(&mut m, plain_fn(p, n.s, n.e));
+    }
+    r = vuser_call(&mut v, c, &mut m, p, x, args, vals, &mut st);
+  }
+  vec_free(args);
+  vec_free(vals);
+  return r;
+}
+
+/// A call of a user function (instance `x`): only its contract is used.
+fn vuser_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64, args: &Vec[u64], vals: &Vec[u64], st: &mut VState) -> u64 {
+  let xi = inst_at(m, x);
+  let d = node_at(p.nodes, xi.def);
+  let mut pre = vec_new[Bind]();
+  let mut q = d.a;
+  let mut j = 0;
+  while q != 0 && j < SRC_MAX {
+    let qn = node_at(p.nodes, q);
+    env_put(&mut pre, p, qn.s, qn.e, u_at(vals, j));
+    q = qn.next;
+    j = j + 1;
+  }
+  let mut b = vec_new[Bnd]();
+  let mut r = d.c;
+  while r != 0 {
+    let t = spec_tm(&mut v, c, &mut m, p, r, pre, pre, false, 0, &mut b);
+    prove(&mut v, st, t);
+    r = next_of(p, r);
+  }
+  let rt = conv(&mut m, p, d.b, x, xi.def);
+  let nm = inst_name(&mut v, m, p, x);
+  let h = cat_str(&mut v, nm, "_ret");
+  let res = fresh_of(&mut v, c, m, p, rt, h);
+  let mut post = env_clone(pre);
+  q = d.a;
+  j = 0;
+  while q != 0 && j < SRC_MAX {
+    let qn = node_at(p.nodes, q);
+    let pt = conv(&mut m, p, qn.a, x, q);
+    let an = node_at(p.nodes, u_at(args, j));
+    if kind_t(m, pt) == TY_MUTREF && an.kind == E_MUTBORROW {
+      let path = list_text(&mut v, p, an.a);
+      let nv = fresh_of(&mut v, c, m, p, inner_t(m, pt), path);
+      env_put(&mut post, p, qn.s, qn.e, nv);
+      set_path(&mut v, m, p, &mut st.env, path, nv);
+    }
+    q = qn.next;
+    j = j + 1;
+  }
+  let mut en = d.d;
+  while en != 0 {
+    let t = spec_tm(&mut v, c, &mut m, p, en, post, pre, true, res, &mut b);
+    vec_push(&mut st.pc, t);
+    en = next_of(p, en);
+  }
+  vec_free(b);
+  vec_free(pre);
+  vec_free(post);
+  return res;
+}
+
+/// Writes the new value of a `&mut` argument back to its place.
+fn put_back(v: &mut Vr, m: &Mono, p: &Parser, st: &mut VState, a: u64, nv: u64) {
+  let an = node_at(p.nodes, a);
+  if an.kind == E_MUTBORROW {
+    let path = list_text(&mut v, p, an.a);
+    set_path(&mut v, m, p, &mut st.env, path, nv);
+  }
+}
+
+/// `(< x lim)` proved.
+fn need_lt(v: &mut Vr, st: &VState, x: u64, lim: u64) {
+  let tl = num(&mut v, lim);
+  let g = app2(&mut v, OP_LT, x, tl);
+  prove(&mut v, st, g);
+}
+
+/// `(<= x 255)` proved.
+fn need_byte(v: &mut Vr, st: &VState, x: u64) {
+  let g = app2(&mut v, OP_LE, x, v.t_255);
+  prove(&mut v, st, g);
+}
+
+/// A fresh u64 that is at most `hi`.
+fn fresh_upto(v: &mut Vr, st: &mut VState, hint: Str, hi: u64) -> u64 {
+  let h = atom_str(&mut v, hint);
+  let x = fresh_u64(&mut v, h);
+  let th = num(&mut v, hi);
+  let g = app2(&mut v, OP_LE, term(v, x), th);
+  vec_push(&mut st.pc, g);
+  return x;
+}
+
+fn fresh_u64_named(v: &mut Vr, hint: Str) -> u64 {
+  let h = atom_str(&mut v, hint);
+  return fresh_u64(&mut v, h);
+}
+
+fn fresh_bool_named(v: &mut Vr, hint: Str) -> u64 {
+  let h = atom_str(&mut v, hint);
+  return fresh_bool(&mut v, h);
+}
+
+fn fresh_of_named(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, tyx: u64, hint: Str) -> u64 {
+  let h = atom_str(&mut v, hint);
+  return fresh_of(&mut v, c, m, p, tyx, h);
+}
+
+/// `(forall ((k Int)) (=> (and (<= lo k) (< k hi)) (not (select used k))))`
+fn all_unused(v: &mut Vr, used: u64, lo: u64, hi: u64) -> u64 {
+  let tlo = num(&mut v, lo);
+  let thi = num(&mut v, hi);
+  let a = app2(&mut v, OP_LE, tlo, v.t_k);
+  let b = app2(&mut v, OP_LT, v.t_k, thi);
+  let r = app2(&mut v, OP_AND, a, b);
+  let sel = app2(&mut v, OP_SELECT, used, v.t_k);
+  let ns = t_not(&mut v, sel);
+  let imp = app2(&mut v, OP_IMP, r, ns);
+  return forall_tm(&mut v, v.t_k, imp);
+}
+
+fn builtin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Vec[u64], vals: &Vec[u64], st: &mut VState) -> u64 {
+  let x0 = u_at(vals, 0);
+  let x1 = u_at(vals, 1);
+  let x2 = u_at(vals, 2);
+  let a0 = vl_at(v, x0);
+  if name_is(p, i, "box") {
+    return mk(&mut v, VV_BOXK, 0, x0, 0, 0, 0);
+  }
+  if name_is(p, i, "unbox") {
+    if a0.kind == VV_BOXK {
+      return a0.a;
+    }
+    return fresh_of_named(&mut v, c, m, p, a0.ty, "unboxed");
+  }
+  if name_is(p, i, "alloc") || name_is(p, i, "balloc") {
+    let g = app2(&mut v, OP_LE, a0.a, v.t_allocmax);
+    prove(&mut v, st, g);
+    // alloc zero-fills.
+    return mk(&mut v, VV_BUF, 0, a0.a, v.t_zarr, 0, 0);
+  }
+  if name_is(p, i, "len") || name_is(p, i, "slen") || name_is(p, i, "blen") || name_is(p, i, "vec_len") {
+    return mk_u(&mut v, a0.a);
+  }
+  if name_is(p, i, "get") || name_is(p, i, "sget") || name_is(p, i, "bget") {
+    let ix = term(v, x1);
+    let g = app2(&mut v, OP_LT, ix, a0.a);
+    prove(&mut v, st, g);
+    let sel = app2(&mut v, OP_SELECT, a0.b, ix);
+    let mut hi = v.t_255;
+    if name_is(p, i, "get") {
+      // Every stored element is a u64 (set only stores u64 values).
+      hi = v.t_u64max;
+    }
+    let r = in_range(&mut v, v.t_zero, sel, hi);
+    vec_push(&mut st.pc, r);
+    return mk_u(&mut v, sel);
+  }
+  if name_is(p, i, "set") || name_is(p, i, "bset") {
+    let ix = term(v, x1);
+    let g = app2(&mut v, OP_LT, ix, a0.a);
+    prove(&mut v, st, g);
+    if name_is(p, i, "bset") {
+      need_byte(&mut v, st, term(v, x2));
+    }
+    let d = app3(&mut v, OP_STORE, a0.b, ix, term(v, x2));
+    let nb = mk(&mut v, VV_BUF, 0, a0.a, d, 0, 0);
+    if name_is(p, i, "set") {
+      return nb;
+    }
+    put_back(&mut v, m, p, &mut st, u_at(args, 0), nb);
+    return v.unit;
+  }
+  if name_is(p, i, "serial_write") {
+    need_byte(&mut v, st, term(v, x1));
+    return v.unit;
+  }
+  if name_is(p, i, "serial_read") {
+    return fresh_upto(&mut v, &mut st, "serial_read", 255);
+  }
+  if name_is(p, i, "serial_poll") {
+    // 256 when no byte is waiting.
+    return fresh_upto(&mut v, &mut st, "serial_poll", 256);
+  }
+
+  // ---- vectors ----
+  if name_is(p, i, "vec_push") {
+    // A push that cannot grow the vector aborts (out of memory), so after
+    // it the length stayed below 2^60.
+    let lt = app2(&mut v, OP_LT, a0.a, v.t_allocmax);
+    vec_push(&mut st.pc, lt);
+    let el = vec_write(&mut v, m, a0.b, a0.a, x1);
+    let one = num(&mut v, 1);
+    let nl = app2(&mut v, OP_ADD, a0.a, one);
+    let nv = mk(&mut v, VV_VEC, a0.ty, nl, el, 0, 0);
+    put_back(&mut v, m, p, &mut st, u_at(args, 0), nv);
+    return v.unit;
+  }
+  if name_is(p, i, "vec_pop") {
+    let g = app2(&mut v, OP_GT, a0.a, v.t_zero);
+    prove(&mut v, st, g);
+    let one = num(&mut v, 1);
+    let last = app2(&mut v, OP_SUB, a0.a, one);
+    let r = vec_read(&mut v, c, m, p, a0.ty, a0.b, last, &mut st);
+    let nv = mk(&mut v, VV_VEC, a0.ty, last, a0.b, 0, 0);
+    put_back(&mut v, m, p, &mut st, u_at(args, 0), nv);
+    return r;
+  }
+  if name_is(p, i, "vec_get") || name_is(p, i, "vec_set") || name_is(p, i, "vec_swap") {
+    let ix = term(v, x1);
+    let g = app2(&mut v, OP_LT, ix, a0.a);
+    prove(&mut v, st, g);
+    let mut prev = v.unit;
+    if !name_is(p, i, "vec_set") {
+      prev = vec_read(&mut v, c, m, p, a0.ty, a0.b, ix, &mut st);
+    }
+    if !name_is(p, i, "vec_get") {
+      let el = vec_write(&mut v, m, a0.b, ix, x2);
+      let nv = mk(&mut v, VV_VEC, a0.ty, a0.a, el, 0, 0);
+      put_back(&mut v, m, p, &mut st, u_at(args, 0), nv);
+    }
+    return prev;
+  }
+  if name_is(p, i, "vec_free") {
+    if ck_linear(c, m, p, a0.ty) {
+      // Freeing the storage would drop the elements still in it.
+      let g = app2(&mut v, OP_EQ, a0.a, v.t_zero);
+      prove(&mut v, st, g);
+    }
+    return v.unit;
+  }
+
+  // ---- bytes and the host ----
+  if name_is(p, i, "bfrom") {
+    return mk(&mut v, VV_BUF, 0, a0.a, a0.b, 0, 0);
+  }
+  if name_is(p, i, "host_argc") {
+    return fresh_u64_named(&mut v, "argc");
+  }
+  if name_is(p, i, "host_arg") {
+    return fresh_of_named(&mut v, c, m, p, v.ty_bytes, "arg");
+  }
+  if name_is(p, i, "host_read") {
+    let nv = fresh_of_named(&mut v, c, m, p, v.ty_bytes, "file");
+    put_back(&mut v, m, p, &mut st, u_at(args, 2), nv);
+    return fresh_bool_named(&mut v, "read_ok");
+  }
+  if name_is(p, i, "host_write") {
+    return fresh_bool_named(&mut v, "write_ok");
+  }
+  if name_is(p, i, "host_spawn") {
+    return fresh_of_named(&mut v, c, m, p, v.ty_child, "child");
+  }
+  if name_is(p, i, "child_write") {
+    return fresh_bool_named(&mut v, "child_write_ok");
+  }
+  if name_is(p, i, "child_read_line") {
+    let nv = fresh_of_named(&mut v, c, m, p, v.ty_bytes, "line");
+    put_back(&mut v, m, p, &mut st, u_at(args, 1), nv);
+    return fresh_bool_named(&mut v, "line_ok");
+  }
+  if name_is(p, i, "child_wait") {
+    // An exit status, or 128 + a signal number.
+    let h = atom_str(&mut v, "status");
+    let t = fresh_int(&mut v, h, v.t_zero, v.t_255);
+    return mk_u(&mut v, t);
+  }
+
+  // ---- physical pages ----
+  if name_is(p, i, "pool_size") {
+    return mk_u(&mut v, g_size(v, x0));
+  }
+  if name_is(p, i, "pool_take") {
+    let ix = term(v, x1);
+    let g = app2(&mut v, OP_LT, ix, g_size(v, x0));
+    prove(&mut v, st, g);
+    let g2 = app2(&mut v, OP_SELECT, g_has(v, x0), ix);
+    prove(&mut v, st, g2);
+    let has = app3(&mut v, OP_STORE, g_has(v, x0), ix, v.t_false);
+    let np = mk_obj(&mut v, m, v.ty_pool, has, g_size(v, x0), 0);
+    put_back(&mut v, m, p, &mut st, u_at(args, 0), np);
+    return mk_obj(&mut v, m, v.ty_frame, ix, 0, 0);
+  }
+  if name_is(p, i, "pool_give") {
+    let has = app3(&mut v, OP_STORE, g_has(v, x0), g_id(v, x1), v.t_true);
+    let np = mk_obj(&mut v, m, v.ty_pool, has, g_size(v, x0), 0);
+    put_back(&mut v, m, p, &mut st, u_at(args, 0), np);
+    return v.unit;
+  }
+  if name_is(p, i, "frame_id") {
+    return mk_u(&mut v, g_id(v, x0));
+  }
+  if name_is(p, i, "frame_read") || name_is(p, i, "frame_write") {
+    need_lt(&mut v, st, term(v, x1), 512);
+    if name_is(p, i, "frame_write") {
+      return v.unit;
+    }
+    return fresh_u64_named(&mut v, "frame_read");
+  }
+  if name_is(p, i, "frame_read8") || name_is(p, i, "frame_write8") {
+    need_lt(&mut v, st, term(v, x1), 4096);
+    if name_is(p, i, "frame_write8") {
+      need_byte(&mut v, st, term(v, x2));
+      return v.unit;
+    }
+    return fresh_upto(&mut v, &mut st, "frame_read8", 255);
+  }
+
+  // ---- page tables ----
+  if name_is(p, i, "pt_new") {
+    let lvl = term(v, x1);
+    let one = num(&mut v, 1);
+    let five = num(&mut v, 5);
+    let g = in_range(&mut v, one, lvl, five);
+    prove(&mut v, st, g);
+    return mk_obj(&mut v, m, v.ty_pt, g_id(v, x0), lvl, v.t_nobool);
+  }
+  if name_is(p, i, "pt_free") || name_is(p, i, "pt_free_root") {
+    let mut t = x0;
+    if name_is(p, i, "pt_free_root") {
+      t = x1;
+    }
+    let lvl = g_level(v, t);
+    let used = g_used(v, t);
+    let four = num(&mut v, 4);
+    if name_is(p, i, "pt_free") {
+      let eq = app2(&mut v, OP_EQ, lvl, four);
+      let g = t_not(&mut v, eq);
+      prove(&mut v, st, g);
+      let g2 = all_unused(&mut v, used, 0, 512);
+      prove(&mut v, st, g2);
+    } else {
+      let g = app2(&mut v, OP_EQ, lvl, four);
+      prove(&mut v, st, g);
+      let g2 = all_unused(&mut v, used, 1, 256);
+      prove(&mut v, st, g2);
+      let eq = app2(&mut v, OP_EQ, g_id(v, t), g_root(v, x0));
+      let g3 = t_not(&mut v, eq);
+      prove(&mut v, st, g3);
+    }
+    return mk_obj(&mut v, m, v.ty_frame, g_id(v, t), 0, 0);
+  }
+  if name_is(p, i, "pt_has") {
+    let ix = term(v, x1);
+    need_lt(&mut v, st, ix, 512);
+    let sel = app2(&mut v, OP_SELECT, g_used(v, x0), ix);
+    return mk_b(&mut v, sel);
+  }
+  if name_is(p, i, "pt_put") || name_is(p, i, "pt_take") || name_is(p, i, "pt_put_frame") || name_is(p, i, "pt_take_frame") {
+    return pt_slot(&mut v, c, m, p, i, args, vals, &mut st);
+  }
+
+  // ---- MMU and CPU ----
+  if name_is(p, i, "mmu_switch") {
+    let four = num(&mut v, 4);
+    let g = app2(&mut v, OP_EQ, g_level(v, x1), four);
+    prove(&mut v, st, g);
+    let nm = mk_obj(&mut v, m, kind_ty(m, p, TY_MMU), g_id(v, x1), 0, 0);
+    put_back(&mut v, m, p, &mut st, u_at(args, 0), nm);
+    return v.unit;
+  }
+  if name_is(p, i, "mmu_kernel") {
+    let nm = mk_obj(&mut v, m, kind_ty(m, p, TY_MMU), v.t_flimit, 0, 0);
+    put_back(&mut v, m, p, &mut st, u_at(args, 0), nm);
+    return v.unit;
+  }
+  if name_is(p, i, "cpu_run") || name_is(p, i, "cpu_idle") {
+    return fresh_upto(&mut v, &mut st, "vector", 255);
+  }
+  if name_is(p, i, "cpu_get") || name_is(p, i, "cpu_set") {
+    let mut lim = 20;
+    if name_is(p, i, "cpu_set") {
+      lim = 18;
+    }
+    need_lt(&mut v, st, term(v, x1), lim);
+    if name_is(p, i, "cpu_set") {
+      return v.unit;
+    }
+    return fresh_u64_named(&mut v, "reg");
+  }
+
+  // ---- user programs ----
+  if name_is(p, i, "sys_spawn") {
+    let from = term(v, x1);
+    let to = term(v, x2);
+    let a = app2(&mut v, OP_LE, from, to);
+    let b = app2(&mut v, OP_LE, to, a0.a);
+    let g = app2(&mut v, OP_AND, a, b);
+    prove(&mut v, st, g);
+    return fresh_u64_named(&mut v, "spawn");
+  }
+  if name_is(p, i, "sys_wait") || name_is(p, i, "sys_kill") || name_is(p, i, "sys_getpid") || name_is(p, i, "sys_info") {
+    let n = node_at(p.nodes, i);
+    let h = atom_src(&mut v, p, n.s, n.e);
+    return fresh_u64(&mut v, h);
+  }
+  // free, print, bfree, child_close, sys_yield, sys_ps, sys_poweroff
+  return v.unit;
+}
+
+/// The type of kind `k` (a builtin type without arguments). Never new:
+/// the checker has interned every builtin type already.
+fn kind_ty(m: &Mono, p: &Parser, k: u64) -> u64 {
+  let mut t = 1;
+  while t < vec_len(m.tys) {
+    let x = vec_get(m.tys, t);
+    if x.kind == k {
+      return t;
+    }
+    t = t + 1;
+  }
+  return 0;
+}
+
+/// pt_put, pt_take, pt_put_frame and pt_take_frame.
+fn pt_slot(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, i: u64, args: &Vec[u64], vals: &Vec[u64], st: &mut VState) -> u64 {
+  let x0 = u_at(vals, 0);
+  let ix = term(v, u_at(vals, 1));
+  let lvl = g_level(v, x0);
+  let used = g_used(v, x0);
+  need_lt(&mut v, st, ix, 512);
+  let leaf = name_is(p, i, "pt_put_frame") || name_is(p, i, "pt_take_frame");
+  if leaf {
+    let one = num(&mut v, 1);
+    let g = app2(&mut v, OP_EQ, lvl, one);
+    prove(&mut v, st, g);
+  } else {
+    let two = num(&mut v, 2);
+    let g = app2(&mut v, OP_GE, lvl, two);
+    prove(&mut v, st, g);
+    // Slot 0 of a top-level table maps the kernel; slots 256.. are never used.
+    let four = num(&mut v, 4);
+    let top = app2(&mut v, OP_EQ, lvl, four);
+    let one = num(&mut v, 1);
+    let lim = num(&mut v, 256);
+    let a = app2(&mut v, OP_LE, one, ix);
+    let b = app2(&mut v, OP_LT, ix, lim);
+    let r = app2(&mut v, OP_AND, a, b);
+    let g2 = app2(&mut v, OP_IMP, top, r);
+    prove(&mut v, st, g2);
+  }
+  let putting = name_is(p, i, "pt_put") || name_is(p, i, "pt_put_frame");
+  if putting {
+    let sel = app2(&mut v, OP_SELECT, used, ix);
+    let g = t_not(&mut v, sel);
+    prove(&mut v, st, g);
+    if !leaf {
+      let one = num(&mut v, 1);
+      let up = app2(&mut v, OP_ADD, g_level(v, u_at(vals, 2)), one);
+      let g2 = app2(&mut v, OP_EQ, up, lvl);
+      prove(&mut v, st, g2);
+    }
+  } else {
+    let g = app2(&mut v, OP_SELECT, used, ix);
+    prove(&mut v, st, g);
+  }
+  let mut mark_t = v.t_false;
+  if putting {
+    mark_t = v.t_true;
+  }
+  let nu = app3(&mut v, OP_STORE, used, ix, mark_t);
+  let nt = mk_obj(&mut v, m, v.ty_pt, g_id(v, x0), lvl, nu);
+  put_back(&mut v, m, p, &mut st, u_at(args, 0), nt);
+  if name_is(p, i, "pt_take") {
+    let r = fresh_of_named(&mut v, c, m, p, v.ty_pt, "pt_take");
+    let rv = vl_at(v, r);
+    let one = num(&mut v, 1);
+    let below = app2(&mut v, OP_SUB, lvl, one);
+    return mk_obj(&mut v, m, v.ty_pt, rv.a, below, rv.c);
+  }
+  if name_is(p, i, "pt_take_frame") {
+    return fresh_of_named(&mut v, c, m, p, v.ty_frame, "pt_take_frame");
+  }
+  return v.unit;
+}
+
+// ---- Statements ----
+
+/// Executes a list of statements from state `st`.
+fn vblock(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, head: u64, st: VState, fdef: u64, entry: &Vec[Bind]) -> VState {
+  let mut s = st;
+  let mut k = head;
+  while k != 0 {
+    s = vstmt(&mut v, c, &mut m, p, k, s, fdef, entry);
+    if !s.live {
+      return s;
+    }
+    k = next_of(p, k);
+  }
+  return s;
+}
+
+fn vstmt(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: VState, fdef: u64, entry: &Vec[Bind]) -> VState {
+  let n = node_at(p.nodes, i);
+  let k = n.kind;
+  let mut s = st;
+  if k == S_LET {
+    let x = eval(&mut v, c, &mut m, p, n.b, &mut s, 0);
+    env_put(&mut s.env, p, n.s, n.e, x);
+    return s;
+  }
+  if k == S_ASSIGN {
+    let x = eval(&mut v, c, &mut m, p, n.b, &mut s, 0);
+    let path = list_text(&mut v, p, n.a);
+    open_path(&mut v, c, m, p, &mut s.env, path);
+    set_path(&mut v, m, p, &mut s.env, path, x);
+    return s;
+  }
+  if k == S_EXPR {
+    eval(&mut v, c, &mut m, p, n.a, &mut s, 0);
+    return s;
+  }
+  if k == S_ASSERT {
+    let t = here(&mut v, c, &mut m, p, n.a, s);
+    prove(&mut v, s, t);
+    vec_push(&mut s.pc, t);
+    return s;
+  }
+  if k == S_UNREACHABLE {
+    prove(&mut v, s, v.t_false);
+    st_free(s);
+    return st_dead();
+  }
+  if k == S_RETURN {
+    let mut x = v.unit;
+    if n.a != 0 {
+      x = eval(&mut v, c, &mut m, p, n.a, &mut s, 0);
+    }
+    check_ensures(&mut v, c, &mut m, p, s, fdef, entry, x);
+    st_free(s);
+    return st_dead();
+  }
+  if k == S_IF {
+    return stmt_if(&mut v, c, &mut m, p, i, s, fdef, entry);
+  }
+  if k == S_MATCH {
+    return stmt_match(&mut v, c, &mut m, p, i, s, fdef, entry);
+  }
+  if k == S_WHILE {
+    return stmt_while(&mut v, c, &mut m, p, i, s, fdef, entry);
+  }
+  return s;
+}
+
+fn stmt_if(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: VState, fdef: u64, entry: &Vec[Bind]) -> VState {
+  let n = node_at(p.nodes, i);
+  let mut s = st;
+  let cv = eval(&mut v, c, &mut m, p, n.a, &mut s, 0);
+  let ct = term(v, cv);
+  let mut ts = st_clone(s);
+  vec_push(&mut ts.pc, ct);
+  let mut es = st_clone(s);
+  let nc = t_not(&mut v, ct);
+  vec_push(&mut es.pc, nc);
+  let t_out = vblock(&mut v, c, &mut m, p, n.b, ts, fdef, entry);
+  let e_out = vblock(&mut v, c, &mut m, p, n.c, es, fdef, entry);
+  if !t_out.live {
+    st_free(t_out);
+    st_free(s);
+    return e_out;
+  }
+  if !e_out.live {
+    st_free(e_out);
+    st_free(s);
+    return t_out;
+  }
+  let mut env = vec_new[Bind]();
+  let mut k = 0;
+  while k < vec_len(s.env) {
+    let b = bind_at(s.env, k);
+    let tb = bind_at(t_out.env, k);
+    let eb = bind_at(e_out.env, k);
+    let x = merge(&mut v, ct, tb.val, eb.val);
+    vec_push(&mut env, Bind { s: b.s, e: b.e, val: x });
+    k = k + 1;
+  }
+  // Facts learned inside either arm are kept as implications.
+  let mut pc = copy_set(s.pc);
+  let from = vadd(vec_len(s.pc), 1);
+  let xt = tail(t_out.pc, from);
+  let xe = tail(e_out.pc, from);
+  if vec_len(xt) > 0 {
+    let all = and_all(&mut v, xt);
+    let imp = app2(&mut v, OP_IMP, ct, all);
+    vec_push(&mut pc, imp);
+  }
+  if vec_len(xe) > 0 {
+    let all = and_all(&mut v, xe);
+    let nc2 = t_not(&mut v, ct);
+    let imp = app2(&mut v, OP_IMP, nc2, all);
+    vec_push(&mut pc, imp);
+  }
+  vec_free(xt);
+  vec_free(xe);
+  st_free(t_out);
+  st_free(e_out);
+  st_free(s);
+  return VState { pc: pc, env: env, live: true };
+}
+
+fn stmt_match(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: VState, fdef: u64, entry: &Vec[Bind]) -> VState {
+  let n = node_at(p.nodes, i);
+  let mut s = st;
+  let sv = eval(&mut v, c, &mut m, p, n.a, &mut s, 0);
+  let x = vl_at(v, sv);
+  let nb = vec_len(s.env);
+  let from = vadd(vec_len(s.pc), 1);
+  let mut covered = vec_new[u64]();
+  // The arms that fall through: their conditions, the facts they learned
+  // (0 for none) and the values of the variables in scope at the match.
+  let mut conds = vec_new[u64]();
+  let mut extras = vec_new[u64]();
+  let mut outv = vec_new[u64]();
+  let mut keep = st_dead();
+  let mut narms = 0;
+  let mut a = n.b;
+  while a != 0 && narms < SRC_MAX {
+    let an = node_at(p.nodes, a);
+    narms = narms + 1;
+    let mut ast = st_clone(s);
+    let mut cond = 0;
+    if an.v == PAT_WILD {
+      let any = or_all(&mut v, covered);
+      cond = t_not(&mut v, any);
+    } else {
+      let j = variant_index(m, p, x.ty, an.s2, an.e2);
+      let mut kx = 0;
+      if j > 0 {
+        kx = j - 1;
+      }
+      let tk = num(&mut v, kx);
+      let cv = app2(&mut v, OP_EQ, x.a, tk);
+      vec_push(&mut covered, cv);
+      if (an.v == PAT_BIND || an.v == PAT_BIND_MUT) && !name_is(p, an.a, "_") {
+        let bn = node_at(p.nodes, an.a);
+        env_put(&mut ast.env, p, bn.s, bn.e, kid(v, sv, kx));
+      }
+      let tk2 = num(&mut v, kx);
+      cond = app2(&mut v, OP_EQ, x.a, tk2);
+    }
+    vec_push(&mut ast.pc, cond);
+    let out = vblock(&mut v, c, &mut m, p, an.c, ast, fdef, entry);
+    if out.live {
+      vec_push(&mut conds, cond);
+      let xt = tail(out.pc, from);
+      let mut ex = 0;
+      if vec_len(xt) > 0 {
+        ex = and_all(&mut v, xt);
+      }
+      vec_free(xt);
+      vec_push(&mut extras, ex);
+      let mut k = 0;
+      while k < nb {
+        let ob = bind_at(out.env, k);
+        vec_push(&mut outv, ob.val);
+        k = k + 1;
+      }
+      if vec_len(conds) == 1 {
+        st_free(keep);
+        keep = out;
+      } else {
+        st_free(out);
+      }
+    } else {
+      st_free(out);
+    }
+    a = an.next;
+  }
+  let nouts = vec_len(conds);
+  if nouts <= 1 {
+    vec_free(covered);
+    vec_free(conds);
+    vec_free(extras);
+    vec_free(outv);
+    st_free(s);
+    return keep;
+  }
+  st_free(keep);
+  // Arms are disjoint, so the merged value is a chain of ites ending in
+  // the last arm that falls through.
+  let mut env = vec_new[Bind]();
+  let mut k = 0;
+  while k < nb {
+    let b = bind_at(s.env, k);
+    let mut y = u_at(outv, vadd(mul_sat(nouts - 1, nb), k));
+    let mut j = nouts - 1;
+    while j > 0 {
+      j = j - 1;
+      let yo = u_at(outv, vadd(mul_sat(j, nb), k));
+      y = merge(&mut v, u_at(conds, j), yo, y);
+    }
+    vec_push(&mut env, Bind { s: b.s, e: b.e, val: y });
+    k = k + 1;
+  }
+  let mut pc = copy_set(s.pc);
+  if nouts < narms {
+    let any = or_all(&mut v, conds);
+    vec_push(&mut pc, any);
+  }
+  let mut j = 0;
+  while j < nouts {
+    let ex = u_at(extras, j);
+    if ex != 0 {
+      let imp = app2(&mut v, OP_IMP, u_at(conds, j), ex);
+      vec_push(&mut pc, imp);
+    }
+    j = j + 1;
+  }
+  vec_free(covered);
+  vec_free(conds);
+  vec_free(extras);
+  vec_free(outv);
+  st_free(s);
+  return VState { pc: pc, env: env, live: true };
+}
+
+/// `a * b`, or the largest u64 if that overflows.
+fn mul_sat(a: u64, b: u64) -> u64 {
+  if a != 0 && b > U64_MAX / a {
+    return U64_MAX;
+  }
+  return a * b;
+}
+
+fn stmt_while(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: VState, fdef: u64, entry: &Vec[Bind]) -> VState {
+  let n = node_at(p.nodes, i);
+  let s = st;
+  // 1. the invariants hold on entry
+  let mut inv = n.b;
+  while inv != 0 {
+    let t = here(&mut v, c, &mut m, p, inv, s);
+    prove(&mut v, s, t);
+    inv = next_of(p, inv);
+  }
+  // 2. havoc what the body (or the condition) changes, enclosing places
+  // first, so a field's own havoc lands inside its struct's
+  let mut changed = vec_new[Chg]();
+  changed_vars(&mut v, p, n.c, &mut changed);
+  changed_in_expr(&mut v, p, n.a, &mut changed);
+  sort_changed(v, &mut changed);
+  let mut l = st_clone(s);
+  let mut k = 0;
+  while k < vec_len(changed) {
+    let ch = chg_at(changed, k);
+    let pt = tm_at(v, ch.name);
+    let root = seg_end(v, ch.name, 0);
+    if env_find_rng(s.env, v, p, pt.a, root) != 0 {
+      open_path(&mut v, c, m, p, &mut l.env, ch.name);
+      let prev = get_path(v, m, p, l.env, ch.name);
+      let nv = havoc(&mut v, c, m, p, prev, ch.keep, ch.name);
+      set_path(&mut v, m, p, &mut l.env, ch.name, nv);
+    }
+    k = k + 1;
+  }
+  vec_free(changed);
+  inv = n.b;
+  while inv != 0 {
+    let t = here(&mut v, c, &mut m, p, inv, l);
+    vec_push(&mut l.pc, t);
+    inv = next_of(p, inv);
+  }
+  // 3. one arbitrary iteration preserves the invariants
+  let cv = eval(&mut v, c, &mut m, p, n.a, &mut l, 0);
+  let ct = term(v, cv);
+  let mut bst = st_clone(l);
+  vec_push(&mut bst.pc, ct);
+  let end = vblock(&mut v, c, &mut m, p, n.c, bst, fdef, entry);
+  if end.live {
+    inv = n.b;
+    while inv != 0 {
+      let t = here(&mut v, c, &mut m, p, inv, end);
+      prove(&mut v, end, t);
+      inv = next_of(p, inv);
+    }
+  }
+  st_free(end);
+  // 4. after the loop: the invariants and the negated condition
+  let nc = t_not(&mut v, ct);
+  vec_push(&mut l.pc, nc);
+  st_free(s);
+  return l;
+}
+
+fn chg_at(xs: &Vec[Chg], k: u64) -> Chg {
+  if k < vec_len(xs) {
+    return vec_get(xs, k);
+  }
+  return Chg { name: 0, keep: false };
+}
+
+/// Records that the loop changes place `name`; `keep` says this change
+/// keeps its shape.
+fn chg_add(v: &Vr, out: &mut Vec[Chg], name: u64, keep: bool) {
+  let mut k = 0;
+  while k < vec_len(out) {
+    let ch = chg_at(out, k);
+    if same_text(v, ch.name, name) {
+      vec_set(&mut out, k, Chg { name: ch.name, keep: ch.keep && keep });
+      return;
+    }
+    k = k + 1;
+  }
+  vec_push(&mut out, Chg { name: name, keep: keep });
+}
+
+fn dots(v: &Vr, a: u64) -> u64 {
+  let t = tm_at(v, a);
+  let mut n = 0;
+  let mut k = 0;
+  while k < t.b
+    invariant n <= k
+  {
+    if pool_at(v, vadd(t.a, k)) == 46 {
+      n = n + 1;
+    }
+    k = k + 1;
+  }
+  return n;
+}
+
+/// Is `a` before `b`: fewer dots, then by text?
+fn chg_less(v: &Vr, a: u64, b: u64) -> bool {
+  let da = dots(v, a);
+  let db = dots(v, b);
+  if da != db {
+    return da < db;
+  }
+  return text_less(v, a, b);
+}
+
+fn sort_changed(v: &Vr, xs: &mut Vec[Chg]) {
+  let mut k = 1;
+  while k < vec_len(xs) {
+    let mut j = k;
+    while j > 0 && j < vec_len(xs) {
+      let x = chg_at(xs, j - 1);
+      let y = chg_at(xs, j);
+      if !chg_less(v, y.name, x.name) {
+        j = 0;
+      } else {
+        vec_set(&mut xs, j - 1, y);
+        vec_set(&mut xs, j, x);
+        j = j - 1;
+      }
+    }
+    k = k + 1;
+  }
+}
+
+/// The places a loop body may change, with a flag that is true when every
+/// change keeps the value's shape: `x = set(x, ..)` keeps a Buf's length,
+/// and the builtins in `shape_keeping` keep an object's id, level and size.
+fn changed_vars(v: &mut Vr, p: &Parser, head: u64, out: &mut Vec[Chg]) {
+  let mut i = head;
+  while i != 0 {
+    let n = node_at(p.nodes, i);
+    let k = n.kind;
+    if k == S_ASSIGN {
+      let name = list_text(&mut v, p, n.a);
+      let val = node_at(p.nodes, n.b);
+      let mut only_set = false;
+      if val.kind == E_CALL && name_is(p, n.b, "set") && val.a != 0 {
+        let a0 = place_text(&mut v, p, val.a);
+        only_set = a0 != 0 && same_text(v, a0, name);
+      }
+      chg_add(v, &mut out, name, only_set);
+      changed_in_expr(&mut v, p, n.b, &mut out);
+    } else if k == S_LET || k == S_EXPR || k == S_RETURN {
+      let e = n.a;
+      if k == S_LET {
+        changed_in_expr(&mut v, p, n.b, &mut out);
+      } else if e != 0 {
+        changed_in_expr(&mut v, p, e, &mut out);
+      }
+    } else if k == S_IF {
+      changed_in_expr(&mut v, p, n.a, &mut out);
+      changed_vars(&mut v, p, n.b, &mut out);
+      changed_vars(&mut v, p, n.c, &mut out);
+    } else if k == S_WHILE {
+      changed_in_expr(&mut v, p, n.a, &mut out);
+      changed_vars(&mut v, p, n.c, &mut out);
+    } else if k == S_MATCH {
+      changed_in_expr(&mut v, p, n.a, &mut out);
+      let mut a = n.b;
+      while a != 0 {
+        let an = node_at(p.nodes, a);
+        changed_vars(&mut v, p, an.c, &mut out);
+        a = an.next;
+      }
+    }
+    i = n.next;
+  }
+}
+
+/// Builtins whose `&mut` argument keeps the ghost fields above.
+fn shape_keeping(p: &Parser, i: u64) -> bool {
+  return name_is(p, i, "bset") || name_is(p, i, "vec_set") || name_is(p, i, "vec_swap") || name_is(p, i, "pt_put")
+    || name_is(p, i, "pt_take") || name_is(p, i, "pt_put_frame") || name_is(p, i, "pt_take_frame")
+    || name_is(p, i, "pool_take") || name_is(p, i, "pool_give") || name_is(p, i, "frame_write")
+    || name_is(p, i, "frame_write8") || name_is(p, i, "cpu_set") || name_is(p, i, "cpu_run") || name_is(p, i, "cpu_idle");
+}
+
+/// The places lent as `&mut` anywhere in `i`.
+fn changed_in_expr(v: &mut Vr, p: &Parser, i: u64, out: &mut Vec[Chg]) {
+  let n = node_at(p.nodes, i);
+  let k = n.kind;
+  if k == E_CALL {
+    let keep = shape_keeping(p, i);
+    let mut a = n.a;
+    while a != 0 {
+      let an = node_at(p.nodes, a);
+      if an.kind == E_MUTBORROW {
+        let name = list_text(&mut v, p, an.a);
+        chg_add(v, &mut out, name, keep);
+      } else {
+        changed_in_expr(&mut v, p, a, &mut out);
+      }
+      a = an.next;
+    }
+  } else if k == E_TAPP {
+    // A call of a generic function (stage0 has made it a plain call by now).
+    if !is_typed_builtin(p, n.b) {
+      changed_in_expr(&mut v, p, n.b, &mut out);
+    }
+  } else if k == E_NOT || k == E_IS || (k == E_VARIANT && n.a != 0) {
+    changed_in_expr(&mut v, p, n.a, &mut out);
+  } else if k == E_BIN {
+    changed_in_expr(&mut v, p, n.a, &mut out);
+    changed_in_expr(&mut v, p, n.b, &mut out);
+  } else if k == E_SLIT {
+    let mut f = n.a;
+    while f != 0 {
+      let fi = node_at(p.nodes, f);
+      changed_in_expr(&mut v, p, fi.a, &mut out);
+      f = fi.next;
+    }
+  }
+}
+
+// ---- Functions ----
+
+/// Proves the postconditions of function `fdef` at a return in state `st`.
+/// Parameters mean their entry values, except `&mut` ones, which mean the
+/// value handed back; `old(..)` reads the entry values.
+fn check_ensures(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, st: &VState, fdef: u64, entry: &Vec[Bind], res: u64) {
+  let d = node_at(p.nodes, fdef);
+  let mut post = env_clone(entry);
+  let mut q = d.a;
+  while q != 0 {
+    let qn = node_at(p.nodes, q);
+    let pt = conv(&mut m, p, qn.a, v.env, q);
+    if kind_t(m, pt) == TY_MUTREF {
+      env_put(&mut post, p, qn.s, qn.e, env_find(st.env, p, qn.s, qn.e));
+    }
+    q = qn.next;
+  }
+  let mut b = vec_new[Bnd]();
+  let mut e = d.d;
+  while e != 0 {
+    let t = spec_tm(&mut v, c, &mut m, p, e, post, entry, true, res, &mut b);
+    prove(&mut v, st, t);
+    e = next_of(p, e);
+  }
+  vec_free(b);
+  vec_free(post);
+}
+
+fn verify_fn(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
+  let xi = inst_at(m, x);
+  let d = node_at(p.nodes, xi.def);
+  v.env = x;
+  let mut env = vec_new[Bind]();
+  let mut q = d.a;
+  while q != 0 {
+    let qn = node_at(p.nodes, q);
+    let pt = conv(&mut m, p, qn.a, x, q);
+    let h = atom_src(&mut v, p, qn.s, qn.e);
+    let y = fresh_of(&mut v, c, m, p, pt, h);
+    env_put(&mut env, p, qn.s, qn.e, y);
+    q = qn.next;
+  }
+  let mut st = VState { pc: vec_new[u64](), env: env_clone(env), live: true };
+  if name_is(p, xi.def, "main") {
+    // What the runtime hands to `main`: a full pool and the kernel's own
+    // tables in CR3.
+    q = d.a;
+    while q != 0 {
+      let qn = node_at(p.nodes, q);
+      let bk = kind_t(m, base_t(m, conv(&mut m, p, qn.a, x, q)));
+      let y = env_find(env, p, qn.s, qn.e);
+      if bk == TY_POOL {
+        let sel = app2(&mut v, OP_SELECT, g_has(v, y), v.t_k);
+        let a = app2(&mut v, OP_LE, v.t_zero, v.t_k);
+        let b = app2(&mut v, OP_LT, v.t_k, g_size(v, y));
+        let r = app2(&mut v, OP_AND, a, b);
+        let eq = app2(&mut v, OP_EQ, sel, r);
+        let all = forall_tm(&mut v, v.t_k, eq);
+        vec_push(&mut st.pc, all);
+      } else if bk == TY_MMU {
+        let eq = app2(&mut v, OP_EQ, g_root(v, y), v.t_flimit);
+        vec_push(&mut st.pc, eq);
+      }
+      q = qn.next;
+    }
+  }
+  let mut b = vec_new[Bnd]();
+  let mut r = d.c;
+  while r != 0 {
+    let t = spec_tm(&mut v, c, &mut m, p, r, env, env, false, 0, &mut b);
+    vec_push(&mut st.pc, t);
+    r = next_of(p, r);
+  }
+  vec_free(b);
+  let end = vblock(&mut v, c, &mut m, p, d.x, st, xi.def, env);
+  if end.live {
+    // Only unit functions can fall through (checked earlier).
+    check_ensures(&mut v, c, &mut m, p, end, xi.def, env, v.unit);
+  }
+  st_free(end);
+  vec_free(env);
+}
+
+/// Verifies every function of the program monomorphized into `m` and
+/// checked by `c`.
+fn verify_program(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
+  send(&mut v, CMD_DECL, v.t_poolsize, SO_INT);
+  let r = in_range(&mut v, v.t_zero, v.t_poolsize, v.t_flimit);
+  assert_tm(&mut v, r);
+  let mut k = 0;
+  while k < vec_len(m.fns) {
+    let x = u_at(m.fns, k);
+    verify_fn(&mut v, c, &mut m, p, x);
+    k = k + 1;
+  }
+}

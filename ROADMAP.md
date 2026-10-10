@@ -55,7 +55,9 @@ What the compiler needs in order to be written in Bastio. Structs come first (re
   - [x] Lexer (`stage1/lexer.bastio`, done 2026-10-10): the same tokens and lexical errors as stage0 on every source in this repository and in BastiOS (`stage1/difftest.sh`, run in CI)
   - [x] Parser (`stage1/parser.bastio`, done 2026-10-10): the same syntax tree as stage0 (`--dump-ast`) on every source, and the same first-error position on damaged copies of them (`stage1/mutate.py`)
   - [x] Checker (`stage1/loader.bastio`, `mono.bastio`, `check.bastio`, done 2026-10-10): imports, monomorphization, types and linearity, with the same result as stage0 (`--dump-mono`, `--dump-check`, including the type of every `let`) on every source and on damaged copies, library files included
-  - [ ] Verifier (talks to Z3 through a `Child`)
+  - [ ] Verifier
+    - [x] Queries (`stage1/verify.bastio`, done 2026-10-10): symbolic execution produces the same SMT-LIB commands as stage0, character for character, and the same number of proof obligations (`--dump-smt`), on every program stage0 verifies (the BastiOS kernel included) and on damaged copies that still verify. Every proof is assumed to succeed for now. Generating all 265,000 commands for stage1's largest program takes 0.6 s; stage0 takes 22 s on it, nearly all of it Z3
+    - [ ] Asking Z3 through a `Child`, with stage0's errors and counterexamples
   - [ ] C code generation
 - [ ] bastioc1 compiles itself and reaches a fixed point (gen2 == gen1)
 - [ ] stage0 is frozen
@@ -101,7 +103,7 @@ Safety must not cost speed at run time; that is the point of proving it instead 
 
 - [ ] Fix `Vec` growth in the C prelude (`realloc` instead of `calloc` plus a byte copy)
 - [ ] BastiOS: `user_byte` walks all four page-table levels for every byte it copies, and the kernel allocator scans its free list linearly and zeroes every page; measure, then batch per page
-- [ ] `bench/`, starting from the programs of the first measurement (sum, sieve, tree, vec, each with its C twin), with a script that prints one line per measurement and a script that prints one line per measurement (generated-code time vs C, compile and proof time per file)
+- [ ] `bench/`, starting from the programs of the first measurement (sum, sieve, tree, vec, each with its C twin), with a script that prints one line per measurement (generated-code time vs C, compile and proof time per file)
 - [ ] CI runs it and keeps the numbers as an artifact, so a regression shows up next to the change that caused it
 - [ ] stage1 data structures: the phases written so far use linear searches (types, instances, places, variables). Fine for today's sources (checking all of stage1, about 6,000 lines, takes 47 ms, the same as stage0); replace with hashing or indexed lookups before self-compilation if measurements show they dominate
 - [ ] BastiOS: a `bench` shell command (or test mode) that times the kernel paths above in QEMU (relative numbers only; QEMU timing is not hardware timing)

@@ -1,0 +1,82 @@
+// Prints every SMT command the verifier sends, in the format of
+// `bastioc0 --check --dump-smt`, then the number of proof obligations, for
+// differential testing against stage0. The solver is not run yet: every
+// obligation is assumed to hold.
+//   usage: smtdump [hosted|kernel|user] FILE
+import "loader.bastio";
+import "print.bastio";
+import "verify.bastio";
+
+fn put_code(con: &Serial, code: u64) {
+  if code == C_USE { put(con, " E-LINEAR-USE\n"); }
+  else if code == C_LEAK { put(con, " E-LINEAR-LEAK\n"); }
+  else if code == C_BRANCH { put(con, " E-LINEAR-BRANCH\n"); }
+  else if code == C_MATCH { put(con, " E-MATCH\n"); }
+  else if code == C_TARGET { put(con, " E-TARGET\n"); }
+  else { put(con, " E-TYPE\n"); }
+}
+
+fn main(con: &mut Serial, host: &mut Host) -> u64 {
+  let mut target = TARGET_HOSTED;
+  let mut file_arg = 1;
+  if host_argc(host) > 2 {
+    let tname = host_arg(host, 1);
+    if spells(tname, 0, blen(tname), "kernel") {
+      target = TARGET_KERNEL;
+    } else if spells(tname, 0, blen(tname), "user") {
+      target = TARGET_USER;
+    }
+    bfree(tname);
+    file_arg = 2;
+  }
+  let path = host_arg(host, file_arg);
+  let mut p = parser_new(balloc(0), vec_new[Tok](), 0);
+  let mut ld = loader_new();
+  let r = load(host, &mut p, &mut ld, path, 0, 0, 0, false);
+  bfree(path);
+  loader_free(ld);
+  let mut code = 0;
+  if r == 2 {
+    code = 2;
+  } else if r != 0 {
+    put(con, "error ");
+    put_num(con, p.efile);
+    put(con, ":");
+    put_pos(con, p.eline, p.ecol);
+    if p.ecode == CODE_IMPORT { put(con, " E-IMPORT\n"); } else { put(con, " E-PARSE\n"); }
+    code = 1;
+  } else {
+    let mut m = mono_new();
+    monomorphize(&mut m, p);
+    if m.failed {
+      put(con, "error ");
+      put_num(con, m.efile);
+      put(con, ":");
+      put_pos(con, m.eline, m.ecol);
+      put(con, " E-TYPE\n");
+      code = 1;
+    } else {
+      let mut c = checker_new(&mut m, p, target);
+      check_program(&mut c, &mut m, p);
+      if c.failed {
+        put(con, "error ");
+        put_num(con, c.efile);
+        put(con, ":");
+        put_pos(con, c.eline, c.ecol);
+        put_code(con, c.ecode);
+        code = 1;
+      } else {
+        let mut v = vr_new(&mut m, p);
+        verify_program(&mut v, c, &mut m, p);
+        put_log(con, v);
+        put_num(con, v.obligations);
+        put(con, " proof obligation(s)\n");
+        vr_free(v);
+      }
+      checker_free(c);
+    }
+    mono_free(m);
+  }
+  bfree(parser_free(p));
+  return code;
+}

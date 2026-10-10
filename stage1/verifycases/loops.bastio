@@ -1,0 +1,76 @@
+// Verifier cases: what a loop havocs. A buffer only changed by `set` keeps
+// its length; struct fields are havocked inside their struct (enclosing
+// places first); an enum, a vector and a box changed in a loop; nested
+// loops and a loop that lends with `&mut` in its condition.
+
+struct Pair { a: u64, b: u64 }
+struct Holder { p: Pair, items: Vec[u64], n: u64 }
+enum Mode { Idle, Run(u64) }
+
+fn more(v: &mut Vec[u64], k: u64) -> bool
+  ensures vlen(v) >= vlen(old(v))
+{
+  if vec_len(v) < k {
+    vec_push(&mut v, k);
+    return true;
+  }
+  return false;
+}
+
+fn main() -> u64 {
+  let mut b = alloc(8);
+  let mut i = 0;
+  while i < len(b)
+    invariant i <= len(b)
+  {
+    b = set(b, i, i);
+    i = i + 1;
+  }
+  let mut h = Holder { p: Pair { a: 0, b: 0 }, items: vec_new[u64](), n: 0 };
+  let mut j = 0;
+  while j < 5
+    invariant j <= 5 && h.p.a <= j && h.n <= j
+  {
+    h.p.a = j;
+    h.n = h.n + 1;
+    if vec_len(h.items) < 100 {
+      vec_push(&mut h.items, j);
+    }
+    j = j + 1;
+  }
+  let mut m = Mode::Idle;
+  let mut k = 0;
+  while k < 3
+    invariant k <= 3
+  {
+    let mut q = 0;
+    while q < k
+      invariant q <= k
+    {
+      q = q + 1;
+    }
+    if m is Mode::Idle { m = Mode::Run(q); } else { m = Mode::Idle; }
+    k = k + 1;
+  }
+  let mut w = vec_new[u64]();
+  let mut guard = 0;
+  while more(&mut w, 4) && guard < 10
+    invariant guard <= 10
+  {
+    guard = guard + 1;
+  }
+  let mut bx = box(Pair { a: 1, b: 2 });
+  let mut t = 0;
+  while t < 2
+    invariant t <= 2
+  {
+    bx.a = t;
+    t = t + 1;
+  }
+  let p = unbox(bx);
+  let r = get(b, 3) % 10 + h.n + vec_len(w) % 7 + p.b % 10;
+  free(b);
+  vec_free(h.items);
+  vec_free(w);
+  return r % 50;
+}
