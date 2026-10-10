@@ -42,6 +42,7 @@
 ; Keywords
 [
   "fn"
+  "export"
   "spec"
   "struct"
   "enum"

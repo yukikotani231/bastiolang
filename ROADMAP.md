@@ -86,8 +86,8 @@ Started early, alongside v1, because the kernel is the primary target and it sha
 ## C boundary
 
 What the "safe libraries callable from C" target needs (Scope, design consequence 2).
-- [x] A first demo: `examples/base64`, a strict base64 codec proved memory safe and called from a C harness, with a differential fuzz against a C decoder and a benchmark (done 2026-10-10). It goes through a hand-written wrapper, `base64_capi.c`, because stage0 cannot export a function yet
-- [ ] `export fn`: a non-static C symbol with a generated header, no `main` required for a library, and the precondition of an exported function either ruled out or checked in a generated wrapper (a C caller cannot be proved to meet it). This touches the lexer and parser, so stage1 must learn it at the same time
+- [x] A first demo: `examples/base64`, a strict base64 codec proved memory safe and called from a C harness, with a differential fuzz against a C decoder and a benchmark (done 2026-10-10). It first went through a hand-written wrapper, `base64_capi.c`; `export fn` replaced it
+- [x] `export fn` (done 2026-10-10): a non-static C symbol with a generated header (`--header`), no `main` required for a library. Preconditions are ruled out (`E-EXPORT`): a C caller cannot be proved to meet one, so the function checks the condition itself and returns an error, which keeps generated code free of checks. Integers, `bool` and `&Bytes` (a pointer and a length) go in; numbers, `Bytes` and structs and enums of those come out. What the proofs assume of the C caller is listed by `--trusted-base`. stage1 parses and checks it too. `examples/base64` no longer needs its hand-written wrapper
 - [ ] Caller-provided output buffers (`&mut Bytes` lent from C), so a library need not allocate; needs a guarantee that the callee does not replace the buffer
 
 ## v4: Linux compatibility
