@@ -4,7 +4,7 @@
 // Pipeline: load -> monomorphize -> check (types and linearity) -> verify
 // (Z3) -> C -> the system C compiler.
 //
-// usage: bastioc1 [--check] [--emit-c] [--target T] [-o out] <file.bastio>...
+// usage: bastioc1 [--check] [--emit-c] [--target T] [--header F] [-o out] <file.bastio>...
 //   (default)   verify, then build a native executable `out` (default: a.out)
 //   --check     stop after verification
 //   --emit-c    write the generated C to `out` (default: out.c) instead of
@@ -12,16 +12,18 @@
 //   --target    `hosted` (default): a normal program on the C library
 //               `kernel`: freestanding C for a bare-metal x86-64 kernel (implies --emit-c)
 //               `user`: freestanding C for a user program under BastiOS (implies --emit-c)
+//   --header F  also write a C header for the program's `export fn`s to F
+//   --trusted-base  list and count the hand-written trusted base, then exit
 // Several input files form one program, as for bastioc0.
 //
 // Errors are reported on standard error as bastioc0 reports them:
 // `file:line:col: error[CODE]: what is wrong`, the source line with a caret
 // under the position, then hints or a failed proof's counterexample. Not
 // yet: the sentence of a failed proof (its code, position and
-// counterexample are printed) and `--header`.
+// counterexample are printed).
 import "loader.bastio";
 import "solve.bastio";
-import "codegen.bastio";
+import "header.bastio";
 
 fn b1_code(code: u64) -> Str {
   if code == C_USE { return "E-LINEAR-USE"; }
@@ -194,6 +196,9 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
   let mut target = TARGET_HOSTED;
   let mut outp = balloc(0);
   let mut has_out = false;
+  let mut hdr = balloc(0);
+  let mut has_hdr = false;
+  let mut listed = false;
   let mut inputs = vec_new[Bytes]();
   let mut status = 0;
   let mut i = 1;
@@ -224,6 +229,27 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
         status = 2;
       }
       bfree(t);
+    } else if b1_is(a, "--trusted-base") {
+      bfree(a);
+      let mut tb = vec_new[u64]();
+      trusted_base(&mut tb);
+      let mut j = 0;
+      while j < vec_len(tb) {
+        let ch = vec_get(tb, j);
+        if ch <= 255 {
+          serial_write(con, cast[u8](ch));
+        }
+        j = j + 1;
+      }
+      vec_free(tb);
+      listed = true;
+      i = host_argc(host);
+    } else if b1_is(a, "--header") {
+      bfree(a);
+      i = cg_add(i, 1);
+      bfree(hdr);
+      hdr = host_arg(host, i);
+      has_hdr = true;
     } else if b1_is(a, "-o") {
       bfree(a);
       i = cg_add(i, 1);
@@ -241,8 +267,15 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
     }
     i = cg_add(i, 1);
   }
+  if listed {
+    vec_free(out);
+    drop_argv(inputs);
+    bfree(outp);
+    bfree(hdr);
+    return 0;
+  }
   if status == 0 && vec_len(inputs) == 0 {
-    out_str(&mut out, "usage: bastioc1 [--check] [--emit-c] [--target hosted|kernel|user] [-o out] <file.bastio>...\n");
+    out_str(&mut out, "usage: bastioc1 [--check] [--emit-c] [--target hosted|kernel|user] [--header F] [-o out] <file.bastio>...\n");
     status = 2;
   }
   // The inputs, as one string for messages.
@@ -317,6 +350,19 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
         }
         vec_free(rep);
         vr_free(v);
+        if status == 0 && !check_only && has_hdr {
+          let guard = header_guard(hdr);
+          let mut h = cg_new(target);
+          header(&mut h, c, &mut m, p, guard);
+          if !b1_write(host, hdr, h.out) {
+            out_str(&mut out, "bastioc1: cannot write ");
+            b1_bytes(&mut out, hdr);
+            out_str(&mut out, "\n");
+            status = 2;
+          }
+          cg_free(h);
+          vec_free(guard);
+        }
         if status == 0 && !check_only {
           // A program without `main` is a library: its C is linked into a
           // C program.
@@ -403,6 +449,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
   vec_free(none);
   drop_argv(inputs);
   bfree(outp);
+  bfree(hdr);
   loader_free(ld);
   bfree(parser_free(p));
   return status;

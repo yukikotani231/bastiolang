@@ -686,39 +686,116 @@ fn cg_prelude_user(out: &mut Vec[u64]) {
   cg_s(&mut out, "static inline uint64_t bst_sys_recv(uint64_t n, uint64_t a, bst_bytes *b) { bst_flush(); return bst_sys(n, a, (uint64_t)b->data, b->len); }\n");
 }
 
-/// The parts of target `target`'s prelude, in stage0's order
-/// (`prelude_parts`).
-fn cg_prelude(out: &mut Vec[u64], target: u64) {
-  if target == TARGET_KERNEL {
-    cg_prelude_common(&mut out);
-    cg_prelude_kernel(&mut out);
-    cg_prelude_bytes_arena(&mut out);
-    cg_prelude_bytes(&mut out);
-    cg_prelude_pages(&mut out);
-    cg_prelude_kernel_cpu(&mut out);
-    cg_prelude_ports(&mut out);
-    cg_prelude_ports_kernel(&mut out);
-    cg_prelude_mmio(&mut out);
-    cg_prelude_mmio_kernel(&mut out);
-    cg_prelude_dma(&mut out);
-  } else if target == TARGET_USER {
-    cg_prelude_common(&mut out);
-    cg_prelude_user(&mut out);
-    cg_prelude_bytes_arena(&mut out);
-    cg_prelude_bytes(&mut out);
-  } else {
+// The prelude parts, numbered: `cg_parts` lists a target's in stage0's
+// order (`prelude_parts`), and `--trusted-base` names and counts them.
+const PART_POSIX: u64 = 0;
+const PART_COMMON: u64 = 1;
+const PART_HOSTED: u64 = 2;
+const PART_BYTES: u64 = 3;
+const PART_PT_HOOK_HOSTED: u64 = 4;
+const PART_PAGES: u64 = 5;
+const PART_CHILD: u64 = 6;
+const PART_PORTS: u64 = 7;
+const PART_PORTS_HOSTED: u64 = 8;
+const PART_MMIO: u64 = 9;
+const PART_MMIO_HOSTED: u64 = 10;
+const PART_DMA: u64 = 11;
+const PART_KERNEL: u64 = 12;
+const PART_BYTES_ARENA: u64 = 13;
+const PART_KERNEL_CPU: u64 = 14;
+const PART_PORTS_KERNEL: u64 = 15;
+const PART_MMIO_KERNEL: u64 = 16;
+const PART_USER: u64 = 17;
+
+fn cg_part_name(id: u64) -> Str {
+  if id == PART_POSIX { return "posix"; }
+  if id == PART_COMMON { return "common"; }
+  if id == PART_HOSTED { return "hosted"; }
+  if id == PART_BYTES { return "bytes"; }
+  if id == PART_PT_HOOK_HOSTED { return "pt_hook_hosted"; }
+  if id == PART_PAGES { return "pages"; }
+  if id == PART_CHILD { return "child"; }
+  if id == PART_PORTS { return "ports"; }
+  if id == PART_PORTS_HOSTED { return "ports_hosted"; }
+  if id == PART_MMIO { return "mmio"; }
+  if id == PART_MMIO_HOSTED { return "mmio_hosted"; }
+  if id == PART_DMA { return "dma"; }
+  if id == PART_KERNEL { return "kernel"; }
+  if id == PART_BYTES_ARENA { return "bytes_arena"; }
+  if id == PART_KERNEL_CPU { return "kernel_cpu"; }
+  if id == PART_PORTS_KERNEL { return "ports_kernel"; }
+  if id == PART_MMIO_KERNEL { return "mmio_kernel"; }
+  return "user";
+}
+
+fn cg_part(out: &mut Vec[u64], id: u64) {
+  if id == PART_POSIX {
     // POSIX for the child-process functions; set before any header.
     cg_s(&mut out, "#define _POSIX_C_SOURCE 200809L\n");
-    cg_prelude_common(&mut out);
-    cg_prelude_hosted(&mut out);
-    cg_prelude_bytes(&mut out);
-    cg_s(&mut out, "#define BST_PT_NEW_HOOK (void)level;\n");
-    cg_prelude_pages(&mut out);
-    cg_prelude_child(&mut out);
-    cg_prelude_ports(&mut out);
-    cg_prelude_ports_hosted(&mut out);
-    cg_prelude_mmio(&mut out);
-    cg_prelude_mmio_hosted(&mut out);
-    cg_prelude_dma(&mut out);
+  } else if id == PART_COMMON { cg_prelude_common(&mut out); }
+  else if id == PART_HOSTED { cg_prelude_hosted(&mut out); }
+  else if id == PART_BYTES { cg_prelude_bytes(&mut out); }
+  else if id == PART_PT_HOOK_HOSTED { cg_s(&mut out, "#define BST_PT_NEW_HOOK (void)level;\n"); }
+  else if id == PART_PAGES { cg_prelude_pages(&mut out); }
+  else if id == PART_CHILD { cg_prelude_child(&mut out); }
+  else if id == PART_PORTS { cg_prelude_ports(&mut out); }
+  else if id == PART_PORTS_HOSTED { cg_prelude_ports_hosted(&mut out); }
+  else if id == PART_MMIO { cg_prelude_mmio(&mut out); }
+  else if id == PART_MMIO_HOSTED { cg_prelude_mmio_hosted(&mut out); }
+  else if id == PART_DMA { cg_prelude_dma(&mut out); }
+  else if id == PART_KERNEL { cg_prelude_kernel(&mut out); }
+  else if id == PART_BYTES_ARENA { cg_prelude_bytes_arena(&mut out); }
+  else if id == PART_KERNEL_CPU { cg_prelude_kernel_cpu(&mut out); }
+  else if id == PART_PORTS_KERNEL { cg_prelude_ports_kernel(&mut out); }
+  else if id == PART_MMIO_KERNEL { cg_prelude_mmio_kernel(&mut out); }
+  else { cg_prelude_user(&mut out); }
+}
+
+/// The parts of target `target`'s prelude, in stage0's order
+/// (`prelude_parts`).
+fn cg_parts(target: u64) -> Vec[u64] {
+  let mut v = vec_new[u64]();
+  if target == TARGET_KERNEL {
+    vec_push(&mut v, PART_COMMON);
+    vec_push(&mut v, PART_KERNEL);
+    vec_push(&mut v, PART_BYTES_ARENA);
+    vec_push(&mut v, PART_BYTES);
+    vec_push(&mut v, PART_PAGES);
+    vec_push(&mut v, PART_KERNEL_CPU);
+    vec_push(&mut v, PART_PORTS);
+    vec_push(&mut v, PART_PORTS_KERNEL);
+    vec_push(&mut v, PART_MMIO);
+    vec_push(&mut v, PART_MMIO_KERNEL);
+    vec_push(&mut v, PART_DMA);
+  } else if target == TARGET_USER {
+    vec_push(&mut v, PART_COMMON);
+    vec_push(&mut v, PART_USER);
+    vec_push(&mut v, PART_BYTES_ARENA);
+    vec_push(&mut v, PART_BYTES);
+  } else {
+    vec_push(&mut v, PART_POSIX);
+    vec_push(&mut v, PART_COMMON);
+    vec_push(&mut v, PART_HOSTED);
+    vec_push(&mut v, PART_BYTES);
+    vec_push(&mut v, PART_PT_HOOK_HOSTED);
+    vec_push(&mut v, PART_PAGES);
+    vec_push(&mut v, PART_CHILD);
+    vec_push(&mut v, PART_PORTS);
+    vec_push(&mut v, PART_PORTS_HOSTED);
+    vec_push(&mut v, PART_MMIO);
+    vec_push(&mut v, PART_MMIO_HOSTED);
+    vec_push(&mut v, PART_DMA);
   }
+  return v;
+}
+
+/// Target `target`'s prelude.
+fn cg_prelude(out: &mut Vec[u64], target: u64) {
+  let parts = cg_parts(target);
+  let mut k = 0;
+  while k < vec_len(parts) {
+    cg_part(&mut out, vec_get(parts, k));
+    k = k + 1;
+  }
+  vec_free(parts);
 }
