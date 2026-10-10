@@ -4,7 +4,7 @@
 // Pipeline: load -> monomorphize -> check (types and linearity) -> verify
 // (Z3) -> C -> the system C compiler.
 //
-// usage: bastioc1 [--check] [--emit-c] [--target T] [--backend B] [--emit-asm] [--header F] [-o out] <file.bastio>...
+// usage: bastioc1 [--check] [--emit-c] [--target T] [--lib DIR] [--backend B] [--emit-asm] [--header F] [-o out] <file.bastio>...
 //   (default)   verify, then build a native executable `out` (default: a.out)
 //               with the C compiler `$CC` (default: cc)
 //   --check     stop after verification
@@ -13,10 +13,12 @@
 //   --target    `hosted` (default): a normal program on the C library
 //               `kernel`: freestanding C for a bare-metal x86-64 kernel (implies --emit-c)
 //               `user`: freestanding C for a user program under BastiOS (implies --emit-c)
+//   --lib DIR   also look for imported files in DIR (see `resolve` in
+//               loader.bastio); may be given more than once
 //   --backend native  generate x86-64 assembly directly instead of C, then
-//               assemble and link it (hosted); with `--target user`, write
-//               the assembly to `out` (default: out.s), to be linked with
-//               BastiOS's user/start.o. Not for `--target kernel` yet
+//               assemble and link it (hosted); with `--target user` or
+//               `kernel`, write the assembly to `out` (default: out.s), to
+//               be linked with BastiOS's start code or platform
 //   --emit-asm  with `--backend native`: write the assembly to `out`
 //               (default: out.s) instead of building
 //   --header F  also write a C header for the program's `export fn`s to F
@@ -218,13 +220,9 @@ fn b1_tool(host: &Host, argv: Vec[Bytes], what: Str, out: &mut Vec[u64]) -> u64 
 /// `outp` (`--emit-asm`), or assembled and linked into the executable
 /// `outp`. Returns the exit status.
 fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, emit_asm: bool, outp: &Bytes, has_out: bool, out: &mut Vec[u64]) -> u64 {
-  if target == TARGET_KERNEL {
-    out_str(&mut out, "bastioc1: the native backend does not support the kernel target yet\n");
-    return 2;
-  }
   let mut g = x86_new();
-  // A BastiOS user program: the assembly is the output (as the C is with
-  // the C backend), to be linked with BastiOS's user/start.o.
+  // A BastiOS user program or kernel: the assembly is the output (as the C
+  // is with the C backend), to be linked with BastiOS's start code.
   g.target = target;
   let mut status = 0;
   if !x86_program(&mut g, c, &mut m, p) {
@@ -236,7 +234,7 @@ fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, em
     }
     out_str(&mut out, "\n");
     status = 4;
-  } else if emit_asm || target == TARGET_USER {
+  } else if emit_asm || target != TARGET_HOSTED {
     let mut path = b1_concat(outp, "");
     if !has_out {
       bfree(path);
@@ -315,6 +313,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
   let mut has_hdr = false;
   let mut listed = false;
   let mut inputs = vec_new[Bytes]();
+  let mut ld = loader_new();
   let mut status = 0;
   let mut i = 1;
   while i < host_argc(host) && status == 0 {
@@ -383,6 +382,10 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
       bfree(hdr);
       hdr = host_arg(host, i);
       has_hdr = true;
+    } else if b1_is(a, "--lib") {
+      bfree(a);
+      i = cg_add(i, 1);
+      loader_lib(&mut ld, host_arg(host, i));
     } else if b1_is(a, "-o") {
       bfree(a);
       i = cg_add(i, 1);
@@ -401,6 +404,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
     i = cg_add(i, 1);
   }
   if listed {
+    loader_free(ld);
     vec_free(out);
     drop_argv(inputs);
     bfree(outp);
@@ -408,7 +412,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
     return 0;
   }
   if status == 0 && vec_len(inputs) == 0 {
-    out_str(&mut out, "usage: bastioc1 [--check] [--emit-c] [--target hosted|kernel|user] [--backend c|native] [--emit-asm] [--header F] [-o out] <file.bastio>...\n");
+    out_str(&mut out, "usage: bastioc1 [--check] [--emit-c] [--target hosted|kernel|user] [--lib DIR] [--backend c|native] [--emit-asm] [--header F] [-o out] <file.bastio>...\n");
     status = 2;
   }
   // The inputs, as one string for messages.
@@ -424,7 +428,6 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
     k = k + 1;
   }
   let mut p = parser_new(balloc(0), vec_new[Tok](), 0);
-  let mut ld = loader_new();
   let none = vec_new[u64]();
   k = 0;
   while status == 0 && k < vec_len(inputs) {
