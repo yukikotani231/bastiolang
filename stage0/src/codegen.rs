@@ -267,11 +267,20 @@ const PRELUDE_PAGES: &str = r#"
 #define BST_PTE_W 2ull
 #define BST_PTE_U 4ull
 #define BST_PTE_ADDR 0x000FFFFFFFFFF000ull
+static inline void bst_zero_page(uint64_t a) {
+#if defined(__x86_64__)
+    void *p = (void *)a;
+    uint64_t n = 512;
+    __asm__ volatile ("rep stosq" : "+D"(p), "+c"(n) : "a"(0ull) : "memory");
+#else
+    uint64_t *w = (uint64_t *)a;
+    for (int k = 0; k < 512; k++) w[k] = 0;
+#endif
+}
 static inline uint64_t bst_pool_size(bst_pool p) { return p.size; }
 static inline bst_frame bst_pool_take(bst_pool *p, uint64_t i) {
     uint64_t a = p->base + i * 4096;
-    uint64_t *w = (uint64_t *)a;
-    for (int k = 0; k < 512; k++) w[k] = 0;      /* never leak a page's old contents */
+    bst_zero_page(a);      /* never leak a page's old contents */
     return a;
 }
 static inline void bst_pool_give(bst_pool *p, bst_frame f) { (void)p; (void)f; }
@@ -282,7 +291,7 @@ static inline uint64_t bst_frame_read8(bst_frame f, uint64_t o) { return ((unsig
 static inline void bst_frame_write8(bst_frame *f, uint64_t o, uint64_t v) { ((unsigned char *)*f)[o] = (unsigned char)v; }
 static inline bst_pt bst_pt_new(bst_frame f, uint64_t level) {
     uint64_t *e = (uint64_t *)f;
-    for (int k = 0; k < 512; k++) e[k] = 0;
+    bst_zero_page(f);      /* f may be a page that held data, not a fresh one */
     BST_PT_NEW_HOOK
     return f;
 }
