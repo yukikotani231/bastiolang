@@ -1263,7 +1263,11 @@ impl<'p> Verifier<'p> {
             "pt_has" => {
                 let i = vals[1].term().to_string();
                 index_ok(self, st, &i, "512", 1, "a page table (512 slots)")?;
-                Ok(Val::B(format!("(select {} {})", vals[0].field("used"), i)))
+                // Slot 0 of a top-level table maps the kernel on the kernel
+                // target: the hardware entry is present although the table
+                // does not own it, so what pt_has says there is unknown.
+                let k = self.fresh_bool("pt_has_kernel")?;
+                Ok(Val::B(format!("(ite (and (= {} 4) (= {} 0)) {} (select {} {}))", vals[0].field("level"), i, k.term(), vals[0].field("used"), i)))
             }
             "pt_put" | "pt_take" | "pt_put_frame" | "pt_take_frame" => {
                 let t = &vals[0];
