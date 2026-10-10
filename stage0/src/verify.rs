@@ -2156,7 +2156,7 @@ impl<'p> Verifier<'p> {
                 let id = t.field("id");
                 self.put_back(&args[0], Val::Obj(Type::Mmu, vec![id.clone()]), st);
                 self.put_back(&args[1], Val::Obj(Type::PageTable, vec![id.clone(), t.field("level"), t.field("used"), format!("(+ {} 1)", t.field("leases"))]), st);
-                Ok(Val::Obj(Type::Lease, vec![id]))
+                Ok(Val::Obj(Type::Lease, vec![]))
             }
             // Loads the kernel's tables and gives the lease back. No table's
             // count in the proof drops (none is named): they only ever
