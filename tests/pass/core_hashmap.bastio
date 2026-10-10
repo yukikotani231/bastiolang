@@ -1,0 +1,91 @@
+// expect-exit: 0
+// core/hashmap.bastio: inserts, lookups, replacement, removal and regrowth,
+// checked against a plain vector; and a map from keys to indices of a
+// vector of buffers, the way to map keys to linear values.
+import "../../core/hashmap.bastio";
+
+fn main() -> u64 {
+  let mut m = hmap_new();
+  let mut i = 0;
+  while i < 5000
+    invariant i <= 5000 && hmap_ok(m)
+  {
+    let prev = hmap_insert(&mut m, hash_u64(i), i);   // spread-out keys
+    if prev is Option::Some { hmap_free(m); return 1; }
+    i = i + 1;
+  }
+  if hmap_len(m) != 5000 { hmap_free(m); return 2; }
+  // Remove the odd ones, then replace the values of the even ones.
+  i = 0;
+  let mut bad = 0;
+  while i < 5000
+    invariant i <= 5000 && hmap_ok(m)
+  {
+    if i % 2 == 1 {
+      if !(hmap_remove(&mut m, hash_u64(i)) is Option::Some) { bad = 3; }
+    } else {
+      match hmap_insert(&mut m, hash_u64(i), i + 1) {
+        Option::Some(v) => { if v != i { bad = 4; } },
+        Option::None => { bad = 5; },
+      }
+    }
+    i = i + 1;
+  }
+  if hmap_len(m) != 2500 { bad = 6; }
+  i = 0;
+  while i < 5000
+    invariant i <= 5000 && hmap_ok(m)
+  {
+    let found = hmap_get_or(m, hash_u64(i), 0);
+    if i % 2 == 1 && (found != 0 || hmap_contains(m, hash_u64(i))) { bad = 7; }
+    if i % 2 == 0 && found != i + 1 { bad = 8; }
+    i = i + 1;
+  }
+  let keys = hmap_keys(m);
+  if vec_len(keys) != 2500 { bad = 9; }
+  vec_free(keys);
+  // Reinserting removed keys reuses the table, and churn does not grow it
+  // without bound: tombstones are dropped when the table is rebuilt.
+  let mut round = 0;
+  while round < 20
+    invariant hmap_ok(m)
+  {
+    let r1 = hmap_insert(&mut m, 77777, round);
+    let r2 = hmap_remove(&mut m, 77777);
+    round = round + 1;
+  }
+  if vec_len(m.keys) > 8192 { bad = 10; }
+  hmap_free(m);
+  if bad != 0 { return bad; }
+
+  // Linear values: the map holds indices into `bufs`.
+  let mut bufs = vec_new[Buf]();
+  let mut idx = hmap_new();
+  let mut k = 0;
+  while k < 10
+    invariant k <= 10 && hmap_ok(idx)
+  {
+    let r = hmap_insert(&mut idx, 1000 + k, vec_len(bufs));
+    vec_push(&mut bufs, alloc(k + 1));
+    k = k + 1;
+  }
+  let mut size = 0;
+  match hmap_get(idx, 1007) {
+    Option::Some(j) => {
+      if j < vec_len(bufs) {
+        let b = vec_swap(&mut bufs, j, alloc(0));
+        size = len(b);
+        let back = vec_swap(&mut bufs, j, b);
+        free(back);
+      }
+    },
+    Option::None => {},
+  }
+  while vec_len(bufs) > 0 {
+    free(vec_pop(&mut bufs));
+  }
+  vec_free(bufs);
+  hmap_free(idx);
+  if size != 8 { return 11; }
+  return 0;
+}

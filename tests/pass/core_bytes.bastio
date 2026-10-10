@@ -1,0 +1,109 @@
+// expect-exit: 0
+// core/bytes.bastio and core/text.bastio. Returns the number of the first
+// failing check, or 0.
+import "../../core/text.bastio";
+
+fn check_split() -> bool {
+  let b = bfrom(" a, bb ,,c ");
+  let parts = bytes_split(b, 44);              // ','
+  let mut ok = vec_len(parts) == 4;
+  if ok {
+    let p0 = bytes_trim(b, vec_get(parts, 0));
+    let p1 = bytes_trim(b, vec_get(parts, 1));
+    let p2 = vec_get(parts, 2);
+    let p3 = bytes_trim(b, vec_get(parts, 3));
+    ok = bytes_span_eq_str(b, p0.start, p0.end, "a")
+      && bytes_span_eq_str(b, p1.start, p1.end, "bb")
+      && p2.start == p2.end
+      && bytes_span_eq_str(b, p3.start, p3.end, "c");
+  }
+  vec_free(parts);
+  let e = bfrom("");
+  let one = bytes_split(e, 44);
+  ok = ok && vec_len(one) == 1;
+  vec_free(one);
+  bfree(e);
+  bfree(b);
+  return ok;
+}
+
+fn check_find() -> bool {
+  let h = bfrom("abcabcabd");
+  let n = bfrom("abd");
+  let m = bfrom("abx");
+  let mut ok = bytes_find_byte(h, 99, 0) == 2 && bytes_find_byte(h, 99, 3) == 5
+    && bytes_find_byte(h, 122, 0) == blen(h);
+  match bytes_find(h, n, 0) {
+    Option::Some(i) => { ok = ok && i == 6; },
+    Option::None => { ok = false; },
+  }
+  match bytes_find(h, m, 0) {
+    Option::Some(_) => { ok = false; },
+    Option::None => {},
+  }
+  bfree(h);
+  bfree(n);
+  bfree(m);
+  return ok;
+}
+
+fn check_cmp() -> bool {
+  let a = bfrom("abc");
+  let b = bfrom("abd");
+  let c = bfrom("ab");
+  let d = bfrom("abc");
+  let ok = bytes_cmp(a, b) == -1 && bytes_cmp(b, a) == 1 && bytes_cmp(c, a) == -1
+    && bytes_cmp(a, c) == 1 && bytes_cmp(a, d) == 0 && bytes_eq(a, d) && !bytes_eq(a, b)
+    && bytes_starts_with(a, c) && !bytes_starts_with(c, a) && bytes_ends_with(d, a)
+    && bytes_eq_str(a, "abc") && !bytes_eq_str(a, "ab")
+    && bytes_hash(a) == bytes_hash(d) && bytes_hash(a) != bytes_hash(b);
+  bfree(a);
+  bfree(b);
+  bfree(c);
+  bfree(d);
+  return ok;
+}
+
+fn check_copy() -> bool {
+  let a = bfrom("hello");
+  let b = bfrom(", world");
+  let ab = bytes_concat(a, b);
+  let s = bytes_slice(ab, 3, 9);
+  let mut ok = bytes_eq_str(ab, "hello, world") && bytes_eq_str(s, "lo, wo");
+  let mut dst = bfrom("xxxxxxx");
+  bytes_copy_into(&mut dst, 1, a);
+  ok = ok && bytes_eq_str(dst, "xhellox");
+  bfree(dst);
+  bfree(s);
+  bfree(ab);
+  bfree(a);
+  bfree(b);
+  return ok;
+}
+
+fn check_text() -> bool {
+  let mut t = text_new();
+  text_push_str(&mut t, "key");
+  text_push(&mut t, 61);                       // '='
+  let v = bfrom("[value]");
+  text_push_span(&mut t, v, 1, 6);
+  text_push_bytes(&mut t, v);
+  let out = text_finish(t);
+  let ok = bytes_eq_str(out, "key=value[value]");
+  bfree(out);
+  bfree(v);
+  return ok;
+}
+
+fn main() -> u64 {
+  if !check_split() { return 1; }
+  if !check_find() { return 2; }
+  if !check_cmp() { return 3; }
+  if !check_copy() { return 4; }
+  if !check_text() { return 5; }
+  let mut args = vec_new[Bytes]();
+  vec_push(&mut args, bfrom("a"));
+  vec_push(&mut args, bfrom("b"));
+  bytes_vec_free(args);
+  return 0;
+}

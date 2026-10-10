@@ -9,7 +9,7 @@
 # Mutants that are not valid UTF-8 are skipped: stage0 cannot even read
 # them. Deterministic: the seed and the number of mutants per file are
 # arguments.
-#   usage: mutate.py [--via DRIVER] [--smt | --verify] BASTIOC FLAG TOOL SEED PER_FILE FILE...
+#   usage: mutate.py [--via DRIVER] [--smt | --verify | --driver] BASTIOC FLAG TOOL SEED PER_FILE FILE...
 # With --via, each mutant temporarily replaces its original file (restored
 # afterwards) and both compilers run on DRIVER, a program that imports it:
 # that is how library files without a `main` reach the checker.
@@ -18,7 +18,10 @@
 # mutants stage0 verifies are compared, and stage0's count of proof
 # obligations (on stderr) is part of what must match. With --verify (FLAG is
 # `--dump-verify ..`), only the mutants that reach the verifier are compared:
-# those stage0 verifies, and those it rejects with a failed proof.
+# those stage0 verifies, and those it rejects with a failed proof. With
+# --driver (TOOL is bastioc1 and FLAG `--check ..`), what both print on
+# stderr and their exit status are compared, masked as difftest.sh masks
+# them (the parts bastioc1 does not print yet).
 import os, random, re, subprocess, sys
 
 args = sys.argv[1:]
@@ -27,13 +30,30 @@ if args[0] == '--via':
     via, args = args[1], args[2:]
 smt = args[0] == '--smt'
 verify = args[0] == '--verify'
-if smt or verify:
+driver = args[0] == '--driver'
+if smt or verify or driver:
     args = args[1:]
 bastioc, flag, tool, seed, per_file = args[0], args[1], args[2], int(args[3]), int(args[4])
 random.seed(seed)
 PUNCT = [b'(', b')', b'{', b'}', b'[', b']', b',', b';', b':', b'::', b'&', b'mut ', b'.', b'=',
          b'->', b'=>', b'_', b'1', b'x', b'is ', b'forall ']
 IDENT = re.compile(rb'[A-Za-z_][A-Za-z0-9_]*')
+
+def mask(want, got):
+    # Mirrors mask() in difftest.sh.
+    keep_msg = re.search(rb'error\[[A-Z-]*\]: ', got)
+    keep_notes = re.search(rb'error\[E-(VERIFY|SOLVER)', want) or re.search(rb'^  = ', got, re.M)
+    out = []
+    for l in want.split(b'\n'):
+        if not keep_notes and l.startswith(b'  = '):
+            continue
+        if not keep_msg:
+            l = re.sub(rb'^(.*: error\[[A-Z-]*\]): .*$', rb'\1', l)
+        l = re.sub(rb'^(.*: error\[E-IMPORT\]: cannot read `[^`]*`): .*$', rb'\1', l)
+        l = re.sub(rb'^(.*: error\[E-PARSE\]: include_bytes: cannot read .*): [^:]*$', rb'\1', l)
+        l = re.sub(rb'^bastioc0: ', b'bastioc1: ', l)
+        out.append(l)
+    return b'\n'.join(out)
 
 def mutate(src):
     r = random.random()
@@ -88,7 +108,12 @@ for f in args[5:]:
             if verify and not re.search(rb'proof obligation|^error \S+ E-(VERIFY|SOLVER|EXPORT)', want, re.M):
                 unverified += 1
                 continue
-            got = subprocess.run(tool.split() + [target], capture_output=True).stdout
+            if driver:
+                g = subprocess.run(tool.split() + flag.split() + [target], capture_output=True)
+                got = g.stderr + b'exit %d\n' % g.returncode
+                want = mask(w.stderr + b'exit %d\n' % w.returncode, got)
+            else:
+                got = subprocess.run(tool.split() + [target], capture_output=True).stdout
         finally:
             if via:
                 open(f, 'wb').write(src)
@@ -96,6 +121,9 @@ for f in args[5:]:
                 os.remove(path)
         runs += 1
         err = [l for l in want.split(b'\n') if l.startswith(b'error ')]
+        if driver:
+            err = [re.search(rb'error\[([A-Z-]*)\]', l) for l in want.split(b'\n')]
+            err = [b'error x ' + e.group(1) for e in err if e]
         if err:
             errors += 1
             for code in err[0].split()[2:3]:

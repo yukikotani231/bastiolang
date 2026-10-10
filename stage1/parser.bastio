@@ -104,6 +104,8 @@ struct Parser {
   ecol: u64,
   /// 0 for E-PARSE; the loader also records E-IMPORT (1).
   ecode: u64,
+  /// What is wrong, as bastioc0 says it (the sentence after the code).
+  emsg: Vec[u64],
   // The definitions of every file parsed so far, one list per kind.
   structs: List,
   enums: List,
@@ -117,7 +119,7 @@ fn parser_new(src: Bytes, toks: Vec[Tok], i: u64) -> Parser {
   vec_push(&mut nodes, Node { kind: 0, line: 0, col: 0, s: 0, e: 0, s2: 0, e2: 0, v: 0, a: 0, b: 0, c: 0, d: 0, x: 0, next: 0, file: 0 });
   return Parser {
     src: src, toks: toks, i: i, nodes: nodes, consts: vec_new[Const](), blobs: vec_new[u64](),
-    bstart: vec_new[u64](), bdata: vec_new[u64](), file: 0, failed: false, efile: 0, eline: 0, ecol: 0, ecode: 0,
+    bstart: vec_new[u64](), bdata: vec_new[u64](), file: 0, failed: false, efile: 0, eline: 0, ecol: 0, ecode: 0, emsg: vec_new[u64](),
     structs: list_new(), enums: list_new(), specs: list_new(), fns: list_new()
   };
 }
@@ -129,6 +131,7 @@ fn parser_free(p: Parser) -> Bytes {
   vec_free(p.blobs);
   vec_free(p.bstart);
   vec_free(p.bdata);
+  vec_free(p.emsg);
   return p.src;
 }
 
@@ -216,6 +219,262 @@ fn fail_at(p: &mut Parser, t: Tok) {
   fail(&mut p, t.line, t.col);
 }
 
+// ---- Messages: what is wrong, as bastioc0 says it ----
+
+fn pm_s(p: &mut Parser, s: Str) {
+  let mut k = 0;
+  while k < slen(s) {
+    vec_push(&mut p.emsg, cast[u64](sget(s, k)));
+    k = k + 1;
+  }
+}
+
+fn pm_num(p: &mut Parser, v: u64) {
+  let mut d = vec_new[u64]();
+  let mut x = v;
+  vec_push(&mut d, 48 + x % 10);
+  x = x / 10;
+  while x > 0 {
+    vec_push(&mut d, 48 + x % 10);
+    x = x / 10;
+  }
+  while vec_len(d) > 0 {
+    let c = vec_pop(&mut d);
+    vec_push(&mut p.emsg, c);
+  }
+  vec_free(d);
+}
+
+/// The text of token `t`.
+fn pm_text(p: &mut Parser, t: Tok) {
+  let mut k = t.start;
+  while k < t.end && k < blen(p.src) {
+    vec_push(&mut p.emsg, cast[u64](bget(p.src, k)));
+    k = k + 1;
+  }
+}
+
+fn pm_clear(p: &mut Parser) {
+  while vec_len(p.emsg) > 0 {
+    vec_pop(&mut p.emsg);
+  }
+}
+
+/// Appends the bytes of `b`.
+fn pm_bytes(p: &mut Parser, b: &Bytes) {
+  let mut k = 0;
+  while k < blen(b) {
+    vec_push(&mut p.emsg, cast[u64](bget(b, k)));
+    k = k + 1;
+  }
+}
+
+/// Records an error at `t` with the message `m`, unless one is recorded.
+fn pm_fail(p: &mut Parser, t: Tok, m: Str) {
+  if !p.failed {
+    fail_at(&mut p, t);
+    pm_s(&mut p, m);
+  }
+}
+
+/// Records an error at `t` with the message `a NAME b`, NAME being the text
+/// of `name`, unless one is recorded.
+fn pm_fail_named(p: &mut Parser, t: Tok, a: Str, name: Tok, b: Str) {
+  if !p.failed {
+    fail_at(&mut p, t);
+    pm_s(&mut p, a);
+    pm_text(&mut p, name);
+    pm_s(&mut p, b);
+  }
+}
+
+fn pm_kw_name(c: u64) -> Str {
+  if c == KW_FN { return "Fn"; }
+  if c == KW_STRUCT { return "Struct"; }
+  if c == KW_ENUM { return "Enum"; }
+  if c == KW_MATCH { return "Match"; }
+  if c == KW_IS { return "Is"; }
+  if c == KW_SPEC { return "Spec"; }
+  if c == KW_CONST { return "Const"; }
+  if c == KW_LET { return "Let"; }
+  if c == KW_MUT { return "Mut"; }
+  if c == KW_IF { return "If"; }
+  if c == KW_ELSE { return "Else"; }
+  if c == KW_WHILE { return "While"; }
+  if c == KW_RETURN { return "Return"; }
+  if c == KW_IMPORT { return "Import"; }
+  if c == KW_EXPORT { return "Export"; }
+  if c == KW_UNREACHABLE { return "Unreachable"; }
+  if c == KW_REQUIRES { return "Requires"; }
+  if c == KW_ENSURES { return "Ensures"; }
+  if c == KW_INVARIANT { return "Invariant"; }
+  if c == KW_ASSERT { return "Assert"; }
+  if c == KW_FORALL { return "Forall"; }
+  if c == KW_TRUE { return "True"; }
+  return "False";
+}
+
+fn pm_kw_spell(c: u64) -> Str {
+  if c == KW_FN { return "fn"; }
+  if c == KW_STRUCT { return "struct"; }
+  if c == KW_ENUM { return "enum"; }
+  if c == KW_MATCH { return "match"; }
+  if c == KW_IS { return "is"; }
+  if c == KW_SPEC { return "spec"; }
+  if c == KW_CONST { return "const"; }
+  if c == KW_LET { return "let"; }
+  if c == KW_MUT { return "mut"; }
+  if c == KW_IF { return "if"; }
+  if c == KW_ELSE { return "else"; }
+  if c == KW_WHILE { return "while"; }
+  if c == KW_RETURN { return "return"; }
+  if c == KW_IMPORT { return "import"; }
+  if c == KW_EXPORT { return "export"; }
+  if c == KW_UNREACHABLE { return "unreachable"; }
+  if c == KW_REQUIRES { return "requires"; }
+  if c == KW_ENSURES { return "ensures"; }
+  if c == KW_INVARIANT { return "invariant"; }
+  if c == KW_ASSERT { return "assert"; }
+  if c == KW_FORALL { return "forall"; }
+  if c == KW_TRUE { return "true"; }
+  return "false";
+}
+
+fn pm_p_name(c: u64) -> Str {
+  if c == P_IMPLIES { return "Implies"; }
+  if c == P_EQEQ { return "EqEq"; }
+  if c == P_FATARROW { return "FatArrow"; }
+  if c == P_NE { return "Ne"; }
+  if c == P_LE { return "Le"; }
+  if c == P_GE { return "Ge"; }
+  if c == P_ANDAND { return "AndAnd"; }
+  if c == P_OROR { return "OrOr"; }
+  if c == P_ARROW { return "Arrow"; }
+  if c == P_COLONCOLON { return "ColonColon"; }
+  if c == P_LPAREN { return "LParen"; }
+  if c == P_RPAREN { return "RParen"; }
+  if c == P_LBRACKET { return "LBracket"; }
+  if c == P_RBRACKET { return "RBracket"; }
+  if c == P_LBRACE { return "LBrace"; }
+  if c == P_RBRACE { return "RBrace"; }
+  if c == P_COMMA { return "Comma"; }
+  if c == P_SEMI { return "Semi"; }
+  if c == P_COLON { return "Colon"; }
+  if c == P_AMP { return "Amp"; }
+  if c == P_DOT { return "Dot"; }
+  if c == P_PLUS { return "Plus"; }
+  if c == P_MINUS { return "Minus"; }
+  if c == P_STAR { return "Star"; }
+  if c == P_SLASH { return "Slash"; }
+  if c == P_PERCENT { return "Percent"; }
+  if c == P_EQ { return "Eq"; }
+  if c == P_LT { return "Lt"; }
+  if c == P_GT { return "Gt"; }
+  if c == P_BANG { return "Bang"; }
+  if c == P_SHL { return "Shl"; }
+  if c == P_SHR { return "Shr"; }
+  if c == P_PIPE { return "Pipe"; }
+  return "Caret";
+}
+
+fn pm_p_spell(c: u64) -> Str {
+  if c == P_IMPLIES { return "==>"; }
+  if c == P_EQEQ { return "=="; }
+  if c == P_FATARROW { return "=>"; }
+  if c == P_NE { return "!="; }
+  if c == P_LE { return "<="; }
+  if c == P_GE { return ">="; }
+  if c == P_ANDAND { return "&&"; }
+  if c == P_OROR { return "||"; }
+  if c == P_ARROW { return "->"; }
+  if c == P_COLONCOLON { return "::"; }
+  if c == P_LPAREN { return "("; }
+  if c == P_RPAREN { return ")"; }
+  if c == P_LBRACKET { return "["; }
+  if c == P_RBRACKET { return "]"; }
+  if c == P_LBRACE { return "{"; }
+  if c == P_RBRACE { return "}"; }
+  if c == P_COMMA { return ","; }
+  if c == P_SEMI { return ";"; }
+  if c == P_COLON { return ":"; }
+  if c == P_AMP { return "&"; }
+  if c == P_DOT { return "."; }
+  if c == P_PLUS { return "+"; }
+  if c == P_MINUS { return "-"; }
+  if c == P_STAR { return "*"; }
+  if c == P_SLASH { return "/"; }
+  if c == P_PERCENT { return "%"; }
+  if c == P_EQ { return "="; }
+  if c == P_LT { return "<"; }
+  if c == P_GT { return ">"; }
+  if c == P_BANG { return "!"; }
+  if c == P_SHL { return "<<"; }
+  if c == P_SHR { return ">>"; }
+  if c == P_PIPE { return "|"; }
+  return "^";
+}
+
+/// Token `t` as stage0 prints it with `{:?}` (Rust's Debug of its `Tok`).
+fn pm_tok(p: &mut Parser, t: Tok) {
+  if t.kind == K_INT {
+    pm_s(&mut p, "Int(");
+    pm_num(&mut p, t.val);
+    pm_s(&mut p, ")");
+  } else if t.kind == K_STR {
+    // The bytes, escapes decoded.
+    pm_s(&mut p, "Str([");
+    let mut k = t.start;
+    let mut first = true;
+    while k < t.end && k < blen(p.src) {
+      let mut c = cast[u64](bget(p.src, k));
+      if c == 92 && k + 1 < blen(p.src) {
+        k = k + 1;
+        let e = cast[u64](bget(p.src, k));
+        if e == 110 { c = 10; } else if e == 114 { c = 13; } else if e == 116 { c = 9; } else if e == 48 { c = 0; } else { c = e; }
+      }
+      if !first {
+        pm_s(&mut p, ", ");
+      }
+      pm_num(&mut p, c);
+      first = false;
+      k = k + 1;
+    }
+    pm_s(&mut p, "])");
+  } else if t.kind == K_IDENT {
+    pm_s(&mut p, "Ident(\"");
+    pm_text(&mut p, t);
+    pm_s(&mut p, "\")");
+  } else if t.kind == K_KEYWORD {
+    pm_s(&mut p, pm_kw_name(t.val));
+  } else if t.kind == K_PUNCT {
+    pm_s(&mut p, pm_p_name(t.val));
+  } else {
+    pm_s(&mut p, "Eof");
+  }
+}
+
+/// Records `expected WHAT, found TOK` at `t`, unless an error is recorded.
+fn pm_expected(p: &mut Parser, t: Tok, what: Str) {
+  if !p.failed {
+    fail_at(&mut p, t);
+    pm_s(&mut p, "expected ");
+    pm_s(&mut p, what);
+    pm_s(&mut p, ", found ");
+    pm_tok(&mut p, t);
+  }
+}
+
+/// The same, with WHAT the spelling `w` in backticks.
+fn pm_expected_spell(p: &mut Parser, t: Tok, w: Str) {
+  if !p.failed {
+    fail_at(&mut p, t);
+    pm_s(&mut p, "expected `");
+    pm_s(&mut p, w);
+    pm_s(&mut p, "`, found ");
+    pm_tok(&mut p, t);
+  }
+}
+
 fn expect_p(p: &mut Parser, c: u64) -> Tok {
   let t = peek(p);
   if p.failed {
@@ -224,7 +483,20 @@ fn expect_p(p: &mut Parser, c: u64) -> Tok {
   if is_p(t, c) {
     return bump(&mut p);
   }
-  fail_at(&mut p, t);
+  pm_expected_spell(&mut p, t, pm_p_spell(c));
+  return t;
+}
+
+/// `expect_p` where stage0 says more than the token.
+fn expect_p_w(p: &mut Parser, c: u64, what: Str) -> Tok {
+  let t = peek(p);
+  if p.failed {
+    return t;
+  }
+  if is_p(t, c) {
+    return bump(&mut p);
+  }
+  pm_expected(&mut p, t, what);
   return t;
 }
 
@@ -236,7 +508,20 @@ fn expect_kw(p: &mut Parser, c: u64) -> Tok {
   if is_kw(t, c) {
     return bump(&mut p);
   }
-  fail_at(&mut p, t);
+  pm_expected_spell(&mut p, t, pm_kw_spell(c));
+  return t;
+}
+
+/// `expect_kw` where stage0 says more than the keyword.
+fn expect_kw_w(p: &mut Parser, c: u64, what: Str) -> Tok {
+  let t = peek(p);
+  if p.failed {
+    return t;
+  }
+  if is_kw(t, c) {
+    return bump(&mut p);
+  }
+  pm_expected(&mut p, t, what);
   return t;
 }
 
@@ -248,7 +533,7 @@ fn ident(p: &mut Parser) -> Tok {
   if t.kind == K_IDENT {
     return bump(&mut p);
   }
-  fail_at(&mut p, t);
+  pm_expected(&mut p, t, "identifier");
   return t;
 }
 
@@ -404,7 +689,7 @@ fn ty(p: &mut Parser) -> u64 {
       return 0;
     }
     if is_ref(p, inner) {
-      fail_at(&mut p, t);           // a borrow of a borrow
+      pm_fail(&mut p, t, "a borrow of a borrow is not allowed");
       return 0;
     }
     let mut r = blank(T_REF, t);
@@ -430,7 +715,7 @@ fn ty(p: &mut Parser) -> u64 {
       return 0;
     }
     if is_ref(p, inner) {
-      fail_at(&mut p, t);           // a Box, Vec or Lock cannot hold a borrow
+      pm_fail_named(&mut p, t, "a ", name, " cannot hold a borrow");
       return 0;
     }
     n.kind = T_GENERIC;
@@ -459,7 +744,7 @@ fn targs(p: &mut Parser) -> u64 {
       return 0;
     }
     if is_ref(p, x) {
-      fail_at(&mut p, t);           // a type argument cannot be a borrow
+      pm_fail(&mut p, t, "a type argument cannot be a borrow");
       return 0;
     }
     l = append(&mut p, l, x);
@@ -482,7 +767,7 @@ fn tparams(p: &mut Parser) -> u64 {
       return 0;
     }
     if has_name(p, l.head, t) {
-      fail_at(&mut p, t);           // declared twice
+      pm_fail_named(&mut p, t, "type parameter `", t, "` is declared twice");
       return 0;
     }
     let n = add(&mut p, named(N_NAME, t));
@@ -778,7 +1063,7 @@ fn slit_fields(p: &mut Parser) -> u64 {
       return 0;
     }
     if has_name(p, l.head, f) {
-      fail_at(&mut p, f);           // given twice
+      pm_fail_named(&mut p, f, "field `", f, "` is given twice");
       return 0;
     }
     let mut n = named(E_FINIT, f);
@@ -851,7 +1136,7 @@ fn primary(p: &mut Parser) -> u64 {
   }
   if is_p(t, P_AMP) {
     bump(&mut p);
-    expect_kw(&mut p, KW_MUT);
+    expect_kw_w(&mut p, KW_MUT, "`mut` (a shared borrow `&x` is written as just `x`)");
     let name = ident(&mut p);
     if p.failed {
       return 0;
@@ -864,7 +1149,7 @@ fn primary(p: &mut Parser) -> u64 {
     return add(&mut p, n);
   }
   if t.kind != K_IDENT {
-    fail_at(&mut p, t);             // expected an expression
+    pm_expected(&mut p, t, "expression");
     return 0;
   }
   if tok_is(p.src, t, "include_bytes") {
@@ -918,7 +1203,7 @@ fn forall_expr(p: &mut Parser) -> u64 {
     return 0;
   }
   if !is_u64(p, x) {
-    fail_at(&mut p, t);             // forall only ranges over u64
+    pm_fail(&mut p, t, "forall only ranges over u64 in v0");
     return 0;
   }
   expect_p(&mut p, P_COLONCOLON);
@@ -943,7 +1228,7 @@ fn blob_expr(p: &mut Parser) -> u64 {
   }
   let s = bump(&mut p);
   if s.kind != K_STR {
-    fail_at(&mut p, t);             // the path must be a string literal
+    pm_fail(&mut p, t, "include_bytes takes a string literal path");
     return 0;
   }
   expect_p(&mut p, P_RPAREN);
@@ -978,7 +1263,7 @@ fn type_app(p: &mut Parser) -> u64 {
     n.a = call_args(&mut p);
     inner = add(&mut p, n);
   } else {
-    fail_at(&mut p, c);             // expected `(`, `{` or `::`
+    pm_expected(&mut p, c, "`(`, `{` or `::` after type arguments");
     return 0;
   }
   if p.failed {
@@ -1001,7 +1286,10 @@ fn const_eval(p: &mut Parser, i: u64) -> u64 {
     return n.v;
   }
   if n.kind != E_BIN {
-    fail(&mut p, n.line, n.col);
+    if !p.failed {
+      fail(&mut p, n.line, n.col);
+      pm_s(&mut p, "constant initializer: only integer literals, earlier constants and arithmetic are allowed");
+    }
     return 0;
   }
   let x = const_eval(&mut p, n.a);
@@ -1024,7 +1312,14 @@ fn const_eval(p: &mut Parser, i: u64) -> u64 {
   if n.v == P_PERCENT && y != 0 {
     return x % y;
   }
-  fail(&mut p, n.line, n.col);
+  if !p.failed {
+    fail(&mut p, n.line, n.col);
+    if n.v == P_PLUS || n.v == P_MINUS || n.v == P_STAR || n.v == P_SLASH || n.v == P_PERCENT {
+      pm_s(&mut p, "constant initializer: the value is out of the u64 range");
+    } else {
+      pm_s(&mut p, "constant initializer: only + - * / % are allowed");
+    }
+  }
   return 0;
 }
 
@@ -1036,7 +1331,7 @@ fn block(p: &mut Parser) -> u64 {
   while !p.failed && !at_p(p, P_RBRACE) {
     let t = peek(p);
     if t.kind == K_EOF {
-      fail_at(&mut p, t);           // missing `}`
+      pm_fail(&mut p, t, "unexpected end of file, missing `}`");
       return 0;
     }
     let s = stmt(&mut p);
@@ -1229,7 +1524,7 @@ fn match_arm(p: &mut Parser) -> u64 {
   let t = peek(p);
   let mut n = blank(S_ARM, t);
   if t.kind != K_IDENT {
-    fail_at(&mut p, t);             // expected a pattern
+    pm_expected(&mut p, t, "a pattern");
     return 0;
   }
   bump(&mut p);
@@ -1285,8 +1580,12 @@ fn struct_def(p: &mut Parser) -> u64 {
     if p.failed {
       return 0;
     }
-    if is_ref(p, x) || has_name(p, l.head, f) {
-      fail_at(&mut p, f);           // a field holding a borrow, or declared twice
+    if is_ref(p, x) {
+      pm_fail(&mut p, f, "a struct field cannot hold a borrow");
+      return 0;
+    }
+    if has_name(p, l.head, f) {
+      pm_fail_named(&mut p, f, "field `", f, "` is declared twice");
       return 0;
     }
     let mut n = named(D_FIELD, f);
@@ -1300,7 +1599,7 @@ fn struct_def(p: &mut Parser) -> u64 {
     return 0;
   }
   if l.head == 0 {
-    fail_at(&mut p, t);             // no fields
+    pm_fail_named(&mut p, t, "struct `", name, "` has no fields");
     return 0;
   }
   // `invariant e ..;` after the fields: specifications over them.
@@ -1313,7 +1612,7 @@ fn struct_def(p: &mut Parser) -> u64 {
       }
       invs = append(&mut p, invs, x);
     }
-    expect_p(&mut p, P_SEMI);
+    expect_p_w(&mut p, P_SEMI, "`;` after the struct's invariants");
     if p.failed {
       return 0;
     }
@@ -1343,7 +1642,7 @@ fn enum_def(p: &mut Parser) -> u64 {
         return 0;
       }
       if is_ref(p, payload) {
-        fail_at(&mut p, v);         // a payload cannot be a borrow
+        pm_fail(&mut p, v, "an enum payload cannot be a borrow");
         return 0;
       }
       expect_p(&mut p, P_RPAREN);
@@ -1352,7 +1651,7 @@ fn enum_def(p: &mut Parser) -> u64 {
       return 0;
     }
     if has_name(p, l.head, v) {
-      fail_at(&mut p, v);           // declared twice
+      pm_fail_named(&mut p, v, "variant `", v, "` is declared twice");
       return 0;
     }
     let mut n = named(D_VARIANT, v);
@@ -1366,7 +1665,7 @@ fn enum_def(p: &mut Parser) -> u64 {
     return 0;
   }
   if l.head == 0 {
-    fail_at(&mut p, t);             // no variants
+    pm_fail_named(&mut p, t, "enum `", name, "` has no variants");
     return 0;
   }
   let mut n = named(D_ENUM, name);
@@ -1386,7 +1685,7 @@ fn const_def(p: &mut Parser) {
     return;
   }
   if !is_u64(p, x) {
-    fail_at(&mut p, name);          // constants must be u64
+    pm_fail(&mut p, name, "constants must be u64");
     return;
   }
   expect_p(&mut p, P_EQ);
@@ -1397,7 +1696,7 @@ fn const_def(p: &mut Parser) {
     return;
   }
   if const_index(p, name) != 0 {
-    fail_at(&mut p, name);          // defined twice
+    pm_fail_named(&mut p, name, "constant `", name, "` is defined twice");
     return;
   }
   vec_push(&mut p.consts, Const { s: name.start, e: name.end, v: v });
@@ -1405,7 +1704,7 @@ fn const_def(p: &mut Parser) {
 
 fn spec_def(p: &mut Parser) -> u64 {
   let t = expect_kw(&mut p, KW_SPEC);
-  expect_kw(&mut p, KW_FN);
+  expect_kw_w(&mut p, KW_FN, "`fn` after `spec`");
   let name = ident(&mut p);
   let ps = params(&mut p);
   expect_p(&mut p, P_ARROW);
@@ -1492,7 +1791,7 @@ fn program(p: &mut Parser) {
     } else if is_kw(t, KW_CONST) {
       const_def(&mut p);
     } else if is_kw(t, KW_IMPORT) {
-      fail_at(&mut p, t);           // imports must come first
+      pm_fail(&mut p, t, "`import` lines must come first in a file, before any definition");
     } else {
       let k = fn_def(&mut p);
       let l = p.fns;

@@ -1,0 +1,99 @@
+// core/text.bastio: building byte strings. A text under construction is a
+// `Vec[u8]`, which grows as bytes are pushed; `text_finish` turns it into
+// `Bytes`.
+//
+// Functions that push in a loop do not promise yet that the bytes already in
+// the text are left alone: saying so needs `old(t)` in a loop invariant,
+// which the language does not allow (see docs/core.md, "Gaps").
+import "bytes.bastio";
+
+/// `t[i..i+n]` holds the bytes `b[j..j+n]`.
+spec fn text_same_at(t: &Vec[u8], i: u64, b: &Bytes, j: u64, n: u64) -> bool {
+  forall k: u64 :: k < n ==> vget(t, i + k) == bget(b, j + k)
+}
+
+/// `t` and `u` agree below `n`.
+spec fn text_keeps(t: &Vec[u8], u: &Vec[u8], n: u64) -> bool {
+  forall k: u64 :: k < n ==> vget(t, k) == vget(u, k)
+}
+
+fn text_new() -> Vec[u8]
+  ensures vlen(result) == 0
+{
+  return vec_new[u8]();
+}
+
+fn text_push(t: &mut Vec[u8], c: u8)
+  ensures vlen(t) == vlen(old(t)) + 1 && vget(t, vlen(old(t))) == c
+  ensures text_keeps(t, old(t), vlen(old(t)))
+{
+  vec_push(&mut t, c);
+}
+
+/// Appends the bytes of a literal.
+fn text_push_str(t: &mut Vec[u8], s: Str)
+  ensures vlen(t) == vlen(old(t)) + slen(s)
+  ensures forall k: u64 :: k < slen(s) ==> vget(t, vlen(old(t)) + k) == sget(s, k)
+{
+  let n0 = vec_len(t);
+  let mut i = 0;
+  while i < slen(s)
+    invariant i <= slen(s) && vlen(t) == n0 + i
+    invariant forall k: u64 :: k < i ==> vget(t, n0 + k) == sget(s, k)
+  {
+    vec_push(&mut t, sget(s, i));
+    i = i + 1;
+  }
+}
+
+/// Appends bytes `from..to` of `b`.
+fn text_push_span(t: &mut Vec[u8], b: &Bytes, from: u64, to: u64)
+  requires from <= to && to <= blen(b)
+  ensures vlen(t) == vlen(old(t)) + (to - from)
+  ensures text_same_at(t, vlen(old(t)), b, from, to - from)
+{
+  let n0 = vec_len(t);
+  let mut i = from;
+  while i < to
+    invariant from <= i && i <= to && vlen(t) == n0 + (i - from)
+    invariant text_same_at(t, n0, b, from, i - from)
+  {
+    vec_push(&mut t, bget(b, i));
+    i = i + 1;
+  }
+}
+
+/// Appends all of `b`.
+fn text_push_bytes(t: &mut Vec[u8], b: &Bytes)
+  ensures vlen(t) == vlen(old(t)) + blen(b)
+  ensures text_same_at(t, vlen(old(t)), b, 0, blen(b))
+{
+  text_push_span(&mut t, b, 0, blen(b));
+}
+
+/// A `Bytes` copy of `t`.
+fn text_to_bytes(t: &Vec[u8]) -> Bytes
+  ensures blen(result) == vlen(t)
+  ensures forall k: u64 :: k < vlen(t) ==> bget(result, k) == vget(t, k)
+{
+  let mut r = balloc(vec_len(t));
+  let mut i = 0;
+  while i < vec_len(t)
+    invariant i <= vlen(t) && blen(r) == vlen(t)
+    invariant forall k: u64 :: k < i ==> bget(r, k) == vget(t, k)
+  {
+    bset(&mut r, i, vec_get(t, i));
+    i = i + 1;
+  }
+  return r;
+}
+
+/// Consumes `t` and returns its bytes.
+fn text_finish(t: Vec[u8]) -> Bytes
+  ensures blen(result) == vlen(t)
+  ensures forall k: u64 :: k < vlen(t) ==> bget(result, k) == vget(t, k)
+{
+  let r = text_to_bytes(t);
+  vec_free(t);
+  return r;
+}

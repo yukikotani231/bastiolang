@@ -91,9 +91,11 @@ stage1/difftest.sh    # the self-hosted compiler's phases against stage0
 | `stage1/` | The self-hosted compiler, written in Bastio and grown one phase at a time (see `stage1/README.md`) |
 | `tests/pass/` | Programs that must verify and exit with a given code |
 | `tests/fail/` | Programs that must be rejected with a given error code |
+| `core/`, `std/` | The library: byte strings, text, numbers, printing, a hash map, sorting (`core/`, every target) and host files (`std/`); see `docs/core.md` |
 | `examples/` | Small programs to start from, and proved libraries called from C through `export fn`: `base64`, `utf8` (validator and decoder) and `der` (ASN.1 structure checker), each with a differential fuzz against a C implementation |
 | `docs/tutorial.md` | A tour of the language for newcomers |
 | `docs/language.md` | The language reference |
+| `docs/core.md` | The core and std libraries: what each function does and what is proved |
 | `docs/concurrency.md` | The concurrency design (not implemented yet) |
 | `ROADMAP.md` | The path to self-hosting and to a kernel |
 
