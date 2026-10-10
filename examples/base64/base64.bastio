@@ -1,0 +1,183 @@
+// Base64 (RFC 4648, section 4), strict: the decoder accepts exactly the
+// strings the encoder produces and rejects everything else.
+//
+// What the compiler proves about this file, with no runtime checks in the
+// generated code:
+// - no out-of-bounds read or write, for every input (the input is untrusted);
+// - no integer overflow or underflow, no division by zero;
+// - every byte written is <= 255;
+// - no leak and no double free: the output buffer is freed on every error
+//   path and handed to the caller on success;
+// - the result's length (see the `ensures` clauses).
+// Not proved: that decoding inverts encoding. The C harness checks that by
+// testing (see README.md).
+
+// Input bytes longer than this are rejected by the decoder, so that the
+// output size fits an allocation (`balloc` takes at most 2^60 bytes).
+const B64_MAX_IN: u64 = 0x1000000000000000;
+// The encoder's limit: its output, 4 bytes per 3, must also fit.
+const B64_MAX_RAW: u64 = 0x0800000000000000;
+
+enum Decoded {
+  Ok(Bytes),
+  // The offset of the first byte that makes the input invalid; the input's
+  // length when the length itself is wrong (not a multiple of 4, too long).
+  Err(u64),
+}
+
+/// The value of base64 symbol `c`, or 64 if `c` is not one. A table lookup:
+/// character `c` of the string below is the value of byte `c` plus 48 (`0`
+/// is 0, `p` is 64; `\\` is one backslash, value 44). The prover reads the
+/// literal's bytes, so the bound is proved from the table itself.
+fn b64_sextet(c: u64) -> u64
+  requires c <= 255
+  ensures result <= 64
+{
+  return sget("pppppppppppppppppppppppppppppppppppppppppppnpppodefghijklmppppppp0123456789:;<=>?@ABCDEFGHIppppppJKLMNOPQRSTUVWXYZ[\\]^_`abcppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp", c) - 48;
+}
+
+/// The base64 symbol for `v`.
+fn b64_symbol(v: u64) -> u64
+  requires v < 64
+  ensures result <= 255
+{
+  if v < 26 { return v + 65; }
+  if v < 52 { return v + 71; }
+  if v < 62 { return v - 4; }
+  if v == 62 { return 43; }
+  return 47;
+}
+
+/// Encodes `src`, padding with `=`.
+fn b64_encode(src: &Bytes) -> Bytes
+  requires blen(src) <= B64_MAX_RAW
+  ensures blen(result) == (blen(src) + 2) / 3 * 4
+{
+  let n = blen(src);
+  let mut out = balloc((n + 2) / 3 * 4);
+  let mut i = 0;
+  let mut o = 0;
+  while i + 3 <= n
+    invariant i <= n && i % 3 == 0 && o == i / 3 * 4
+    invariant blen(out) == (n + 2) / 3 * 4
+  {
+    let a = bget(src, i);
+    let b = bget(src, i + 1);
+    let c = bget(src, i + 2);
+    bset(&mut out, o, b64_symbol(a / 4));
+    bset(&mut out, o + 1, b64_symbol(a % 4 * 16 + b / 16));
+    bset(&mut out, o + 2, b64_symbol(b % 16 * 4 + c / 64));
+    bset(&mut out, o + 3, b64_symbol(c % 64));
+    i = i + 3;
+    o = o + 4;
+  }
+  if n - i == 1 {
+    let a = bget(src, i);
+    bset(&mut out, o, b64_symbol(a / 4));
+    bset(&mut out, o + 1, b64_symbol(a % 4 * 16));
+    bset(&mut out, o + 2, 61);
+    bset(&mut out, o + 3, 61);
+  }
+  if n - i == 2 {
+    let a = bget(src, i);
+    let b = bget(src, i + 1);
+    bset(&mut out, o, b64_symbol(a / 4));
+    bset(&mut out, o + 1, b64_symbol(a % 4 * 16 + b / 16));
+    bset(&mut out, o + 2, b64_symbol(b % 16 * 4));
+    bset(&mut out, o + 3, 61);
+  }
+  return out;
+}
+
+/// Decodes `src`. `=` may appear only as the last one or two bytes, and the
+/// bits that padding leaves over must be zero.
+fn b64_decode(src: &Bytes) -> Decoded
+  ensures result is Decoded::Ok ==> blen(src) % 4 == 0
+  ensures result is Decoded::Ok ==> blen(result.Ok) <= blen(src) / 4 * 3
+  ensures result is Decoded::Ok ==> blen(result.Ok) + 2 >= blen(src) / 4 * 3
+  ensures result is Decoded::Err ==> result.Err <= blen(src)
+{
+  let n = blen(src);
+  if n % 4 != 0 || n > B64_MAX_IN {
+    return Decoded::Err(n);
+  }
+  if n == 0 {
+    return Decoded::Ok(balloc(0));
+  }
+  // Padding: 61 is `=`.
+  let mut pad = 0;
+  if bget(src, n - 1) == 61 {
+    pad = 1;
+    if bget(src, n - 2) == 61 {
+      pad = 2;
+    }
+  }
+  let mut out = balloc(n / 4 * 3 - pad);
+  // Every group but the last: four symbols, three bytes.
+  let mut i = 0;
+  while i + 4 < n
+    invariant i < n && i % 4 == 0
+    invariant blen(out) == n / 4 * 3 - pad
+  {
+    let s0 = b64_sextet(bget(src, i));
+    let s1 = b64_sextet(bget(src, i + 1));
+    let s2 = b64_sextet(bget(src, i + 2));
+    let s3 = b64_sextet(bget(src, i + 3));
+    if s0 == 64 || s1 == 64 || s2 == 64 || s3 == 64 {
+      bfree(out);
+      return Decoded::Err(b64_first_bad(src, i));
+    }
+    let o = i / 4 * 3;
+    bset(&mut out, o, s0 * 4 + s1 / 16);
+    bset(&mut out, o + 1, s1 % 16 * 16 + s2 / 4);
+    bset(&mut out, o + 2, s2 % 4 * 64 + s3);
+    i = i + 4;
+  }
+  // The last group, where padding stands in for the missing symbols.
+  let s0 = b64_sextet(bget(src, i));
+  let s1 = b64_sextet(bget(src, i + 1));
+  let mut s2 = 0;
+  if pad < 2 {
+    s2 = b64_sextet(bget(src, i + 2));
+  }
+  let mut s3 = 0;
+  if pad == 0 {
+    s3 = b64_sextet(bget(src, i + 3));
+  }
+  let mut bad = n;
+  if s3 == 64 { bad = i + 3; }
+  if s2 == 64 { bad = i + 2; }
+  if s1 == 64 { bad = i + 1; }
+  if s0 == 64 { bad = i; }
+  // Non-canonical: the bits the padding drops must be zero.
+  if bad == n && pad == 2 && s1 % 16 != 0 { bad = i + 1; }
+  if bad == n && pad == 1 && s2 % 4 != 0 { bad = i + 2; }
+  if bad != n {
+    bfree(out);
+    return Decoded::Err(bad);
+  }
+  let o = i / 4 * 3;
+  bset(&mut out, o, s0 * 4 + s1 / 16);
+  if pad < 2 {
+    bset(&mut out, o + 1, s1 % 16 * 16 + s2 / 4);
+  }
+  if pad == 0 {
+    bset(&mut out, o + 2, s2 % 4 * 64 + s3);
+  }
+  return Decoded::Ok(out);
+}
+
+/// The offset of the first byte of group `i` that is not a base64 symbol
+/// (`=` included); i + 3 if there is none.
+fn b64_first_bad(src: &Bytes, i: u64) -> u64
+  requires i + 4 <= blen(src)
+  ensures i <= result && result < i + 4
+{
+  let mut k = i;
+  while k < i + 3 && b64_sextet(bget(src, k)) != 64
+    invariant i <= k && k <= i + 3
+  {
+    k = k + 1;
+  }
+  return k;
+}

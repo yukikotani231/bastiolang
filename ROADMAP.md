@@ -71,6 +71,13 @@ Started early, alongside v1, because the kernel is the primary target and it sha
 - [ ] Allocation failure returned in the type (no abort on OOM). Enums exist now (v1 item 3); what is left is changing `alloc`, `pool_take` and friends to return them
 - [ ] Native x86-64 backend, without going through C (removes the C compiler from the trusted base)
 
+## C boundary
+
+What the "safe libraries callable from C" target needs (Scope, design consequence 2).
+- [x] A first demo: `examples/base64`, a strict base64 codec proved memory safe and called from a C harness, with a differential fuzz against a C decoder and a benchmark (done 2026-10-10). It goes through a hand-written wrapper, `base64_capi.c`, because stage0 cannot export a function yet
+- [ ] `export fn`: a non-static C symbol with a generated header, no `main` required for a library, and the precondition of an exported function either ruled out or checked in a generated wrapper (a C caller cannot be proved to meet it). This touches the lexer and parser, so stage1 must learn it at the same time
+- [ ] Caller-provided output buffers (`&mut Bytes` lent from C), so a library need not allocate; needs a guarantee that the callee does not replace the buffer
+
 ## v4: Linux compatibility
 
 Decided 2026-10-10: BastiOS should run existing Linux programs, not only programs written in Bastio. The way in is a Linux system-call compatibility layer.
