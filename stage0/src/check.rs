@@ -315,7 +315,7 @@ fn overlaps(a: &str, b: &str) -> bool {
 /// (`&Bytes`, which becomes a pointer and a length).
 fn c_param_type(t: &Type) -> bool {
     match t {
-        Type::Ref(i) => **i == Type::Bytes,
+        Type::Ref(i) | Type::MutRef(i) => **i == Type::Bytes,
         t => c_value_type(t),
     }
 }
@@ -355,7 +355,7 @@ fn check_exports(p: &Program, target: Target) -> Result<(), Diag> {
         for prm in &f.params {
             if !c_param_type(&prm.ty) {
                 return Err(Diag::new("E-EXPORT", prm.pos, format!("a parameter of an exported function cannot have type `{}`", prm.ty.name()))
-                    .note("C can pass integers, `bool` and `&Bytes` (a pointer and a length)"));
+                    .note("C can pass integers, `bool`, and `&Bytes` or `&mut Bytes` (a pointer and a length)"));
             }
             let len = format!("{}_len", prm.name);
             if *prm.ty.base() == Type::Bytes && f.params.iter().any(|q| q.name == len) {

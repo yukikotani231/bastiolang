@@ -28,3 +28,31 @@ export fn base64_encode(src: &Bytes) -> Encoded
   }
   return Encoded::Ok(b64_encode(src));
 }
+
+enum Written {
+  // The number of bytes written at the start of `out`.
+  Ok(u64),
+  // `out` is too small: the encoding needs this many bytes.
+  TooSmall(u64),
+  // The input is longer than B64_MAX_RAW (2^59) bytes.
+  TooLong,
+}
+
+/// Encodes `src` into the caller's buffer `out`, so the library allocates
+/// nothing. C lends `out` as a pointer and a length; the compiler proves
+/// that this function writes only inside it and hands it back unfreed
+/// (E-EXPORT otherwise).
+export fn base64_encode_into(src: &Bytes, out: &mut Bytes) -> Written
+  ensures result is Written::Ok ==> result.Ok == (blen(src) + 2) / 3 * 4 && result.Ok <= blen(out)
+  ensures result is Written::TooSmall ==> result.TooSmall > blen(out)
+{
+  if blen(src) > B64_MAX_RAW {
+    return Written::TooLong;
+  }
+  let need = (blen(src) + 2) / 3 * 4;
+  if need > blen(out) {
+    return Written::TooSmall(need);
+  }
+  b64_encode_into(src, &mut out);
+  return Written::Ok(need);
+}
