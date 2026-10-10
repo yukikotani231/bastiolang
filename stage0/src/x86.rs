@@ -121,6 +121,28 @@ struct Var {
     ty: Type,
 }
 
+/// Where `val_into` puts a value.
+#[derive(Clone, Copy)]
+enum Dst {
+    /// The frame, word 0 at this offset from %rbp.
+    Frame(i64),
+    /// The stack area reserved when the depth was `.0`, from its word `.1`.
+    Stack(i64, usize),
+    /// The memory a pointer points to, from its word `.1`; the pointer is
+    /// the stack word pushed when the depth became `.0`.
+    Heap(i64, usize),
+}
+
+impl Dst {
+    fn at(self, k: usize) -> Dst {
+        match self {
+            Dst::Frame(o) => Dst::Frame(o + 8 * k as i64),
+            Dst::Stack(m, o) => Dst::Stack(m, o + k),
+            Dst::Heap(m, o) => Dst::Heap(m, o + k),
+        }
+    }
+}
+
 /// A place being read or written: memory at an offset from a base register
 /// (%rbp, or %rcx after following pointers), or a register.
 #[derive(Clone, Copy)]
@@ -515,15 +537,6 @@ impl<'a> Gen<'a> {
         }
         Some(r)
     }
-    /// Pops `n` words (word 0 on top) into the area reserved when the depth
-    /// was `mark`, starting at its word `off`.
-    fn pop_into(&mut self, mark: i64, off: usize, n: usize) {
-        for i in 0..n {
-            self.pop("%rax");
-            let at = 8 * (self.depth - mark + (off + i) as i64);
-            self.emit(&format!("mov %rax, {}(%rsp)", at));
-        }
-    }
     /// Pops `n` words into the place at `loc`.
     fn pop_to(&mut self, loc: Loc, n: usize) {
         for i in 0..n {
@@ -649,6 +662,12 @@ impl<'a> Gen<'a> {
             StmtKind::Let { name, ty, init, .. } => {
                 let t = ty.clone().expect("typed by checker");
                 let n = words(&t)?;
+                if n > 1 {
+                    let o = self.slot(n);
+                    self.val_into(init, Dst::Frame(o))?;
+                    self.vars.insert(name.clone(), Var { st: Store::Slot(o), ty: t });
+                    return Ok(());
+                }
                 if n == 1 {
                     self.scalar(init)?;
                 } else {
@@ -786,9 +805,8 @@ impl<'a> Gen<'a> {
                     if self.ret_words == 1 {
                         self.scalar(e)?;
                     } else {
-                        self.push_val(e)?;
                         let off = self.ret_off;
-                        self.pop_to(Loc::Mem("%rbp", off), self.ret_words);
+                        self.val_into(e, Dst::Frame(off))?;
                     }
                 }
                 let l = self.ret_label.clone();
@@ -1198,26 +1216,10 @@ impl<'a> Gen<'a> {
                 let (loc, _) = self.place(&place(e).expect("checked: a place"));
                 self.push_from(loc, n);
             }
-            ExprKind::StructLit(sn, fs) => {
+            ExprKind::StructLit(..) | ExprKind::Variant(..) => {
                 self.reserve(n);
                 let mark = self.depth;
-                for (f, x) in fs {
-                    let (o, ft) = field(&Type::Struct(sn.clone()), f);
-                    let k = words(&ft)?;
-                    self.push_val(x)?;
-                    self.pop_into(mark, o, k);
-                }
-            }
-            ExprKind::Variant(en, v, payload) => {
-                self.reserve(n);
-                let mark = self.depth;
-                let k = enum_def(en).unwrap().index(v).unwrap();
-                self.emit(&format!("movq ${}, (%rsp)", k));
-                if let Some(x) = payload {
-                    let k = words(&self.type_of(x))?;
-                    self.push_val(x)?;
-                    self.pop_into(mark, 1, k);
-                }
+                self.val_into(e, Dst::Stack(mark, 0))?;
             }
             ExprKind::TypeApp(_, inner) if matches!(&inner.kind, ExprKind::Call(n, _) if n == "vec_new") => {
                 for _ in 0..3 {
@@ -1234,6 +1236,57 @@ impl<'a> Gen<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Evaluates `e` straight into `d`, building struct literals and variants
+    /// field by field where they will stay instead of on the stack first.
+    /// `d` must not be read by `e` (a fresh slot or reserved area).
+    fn val_into(&mut self, e: &Expr, d: Dst) -> R<()> {
+        match &e.kind {
+            ExprKind::StructLit(sn, fs) => {
+                for (f, x) in fs {
+                    let (o, _) = field(&Type::Struct(sn.clone()), f);
+                    self.val_into(x, d.at(o))?;
+                }
+            }
+            ExprKind::Variant(en, v, payload) => {
+                let k = enum_def(en).unwrap().index(v).unwrap();
+                let at = self.dst_op(d);
+                self.emit(&format!("movq ${}, {}", k, at));
+                if let Some(x) = payload {
+                    self.val_into(x, d.at(1))?;
+                }
+            }
+            _ => {
+                let n = words(&self.type_of(e))?;
+                if n == 1 {
+                    self.scalar(e)?;
+                    let at = self.dst_op(d);
+                    self.emit(&format!("mov %rax, {}", at));
+                } else {
+                    self.push_val(e)?;
+                    for i in 0..n {
+                        self.pop("%rax");
+                        let at = self.dst_op(d.at(i));
+                        self.emit(&format!("mov %rax, {}", at));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The operand for word 0 of `d` at this point of the code (it may load
+    /// a pointer into %rcx).
+    fn dst_op(&mut self, d: Dst) -> String {
+        match d {
+            Dst::Frame(o) => format!("{}(%rbp)", o),
+            Dst::Stack(mark, off) => format!("{}(%rsp)", 8 * (self.depth - mark + off as i64)),
+            Dst::Heap(mark, off) => {
+                self.emit(&format!("mov {}(%rsp), %rcx", 8 * (self.depth - mark)));
+                format!("{}(%rcx)", 8 * off)
+            }
+        }
     }
 
     /// Pushes a call argument: the address for `&mut`, else the value.
@@ -1455,9 +1508,8 @@ impl<'a> Gen<'a> {
                 self.emit(&format!("mov ${}, %edi", n));
                 self.emit("call bst_rt_alloc");
                 self.push("%rax");
-                self.push_val(&args[0])?;
-                self.emit(&format!("mov {}(%rsp), %rcx", 8 * n));
-                self.pop_to(Loc::Mem("%rcx", 0), n);
+                let mark = self.depth;
+                self.val_into(&args[0], Dst::Heap(mark, 0))?;
                 self.pop("%rax");
             }
             "unbox" => {
