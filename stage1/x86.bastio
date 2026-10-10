@@ -3817,6 +3817,12 @@ fn x86_builtin1(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RAX, 0, 0, 0, 0);
     x86_es(&mut g, "sub bst_rt_pool_base(%rip), %rax");
     x86_es(&mut g, "shr $12, %rax");
+  } else if name_is(p, i, "host_env") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RCX, XR_RDI, XR_RSI, XR_RDX, 0);
+    x86_es(&mut g, "call bst_rt_host_env");
+  } else if name_is(p, i, "host_cpus") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, 0, 0, 0, 0);
+    x86_es(&mut g, "call bst_rt_host_cpus");
   } else if name_is(p, i, "host_eprint") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RCX, XR_RDI, XR_RSI, 0, 0);
     x86_es(&mut g, "call bst_rt_eprint");
@@ -4925,11 +4931,64 @@ fn x86_runtime(out: &mut Vec[u64]) {
   cg_s(&mut out, "\t.text\n");
 }
 
-/// The routines of the runtime that only stage1's backend uses (Child and
-/// host_eprint), after `x86_runtime`.
+/// The routines of the runtime that only stage1's backend uses (Child,
+/// host_env, host_cpus, host_eprint, the simulated devices), after
+/// `x86_runtime`.
 fn x86_runtime1(out: &mut Vec[u64]) {
   cg_s(&mut out, "# ---- runtime only stage1 writes (trusted base) ----\n");
   cg_s(&mut out, "\t.text\n");
+  cg_s(&mut out, "bst_rt_host_env:                # the variable named by the %rsi bytes at %rdi into the Bytes at (%rdx); %rax = 1 if it is set\n");
+  cg_s(&mut out, "\tpush %rbp\n");
+  cg_s(&mut out, "\tmov %rsp, %rbp\n");
+  cg_s(&mut out, "\tpush %rbx\n");
+  cg_s(&mut out, "\tpush %r12\n");
+  cg_s(&mut out, "\tpush %r13\n");
+  cg_s(&mut out, "\tpush %r14\n");
+  cg_s(&mut out, "\tand $-16, %rsp\n");
+  cg_s(&mut out, "\tmov %rdx, %rbx\n");
+  cg_s(&mut out, "\tcall bst_rt_cpath\n");
+  cg_s(&mut out, "\tmov %rax, %r12\n");
+  cg_s(&mut out, "\tmov %rax, %rdi\n");
+  cg_s(&mut out, "\tcall getenv@PLT\n");
+  cg_s(&mut out, "\tmov %rax, %r13\n");
+  cg_s(&mut out, "\tmov %r12, %rdi\n");
+  cg_s(&mut out, "\tcall free@PLT\n");
+  cg_s(&mut out, "\ttest %r13, %r13\n");
+  cg_s(&mut out, "\tjz 8f\n");
+  cg_s(&mut out, "\tmov %r13, %rdi\n");
+  cg_s(&mut out, "\tcall strlen@PLT\n");
+  cg_s(&mut out, "\tmov %rax, %r14\n");
+  cg_s(&mut out, "\tmov %rax, %rdi\n");
+  cg_s(&mut out, "\tcall bst_rt_balloc\n");
+  cg_s(&mut out, "\tmov %rax, %r12\n");
+  cg_s(&mut out, "\tmov %rax, %rdi\n");
+  cg_s(&mut out, "\tmov %r13, %rsi\n");
+  cg_s(&mut out, "\tmov %r14, %rcx\n");
+  cg_s(&mut out, "\trep movsb\n");
+  cg_s(&mut out, "\tmov 8(%rbx), %rdi           # replace the old contents\n");
+  cg_s(&mut out, "\tcall bst_rt_free\n");
+  cg_s(&mut out, "\tmov %r14, (%rbx)\n");
+  cg_s(&mut out, "\tmov %r12, 8(%rbx)\n");
+  cg_s(&mut out, "\tmov $1, %eax\n");
+  cg_s(&mut out, "\tjmp 9f\n");
+  cg_s(&mut out, "8:\txor %eax, %eax\n");
+  cg_s(&mut out, "9:\tmov -8(%rbp), %rbx\n");
+  cg_s(&mut out, "\tmov -16(%rbp), %r12\n");
+  cg_s(&mut out, "\tmov -24(%rbp), %r13\n");
+  cg_s(&mut out, "\tmov -32(%rbp), %r14\n");
+  cg_s(&mut out, "\tleave\n");
+  cg_s(&mut out, "\tret\n");
+  cg_s(&mut out, "bst_rt_host_cpus:               # %rax = the processors online (at least 1)\n");
+  cg_s(&mut out, "\tpush %rbp\n");
+  cg_s(&mut out, "\tmov %rsp, %rbp\n");
+  cg_s(&mut out, "\tand $-16, %rsp\n");
+  cg_s(&mut out, "\tmov $84, %edi               # _SC_NPROCESSORS_ONLN\n");
+  cg_s(&mut out, "\tcall sysconf@PLT\n");
+  cg_s(&mut out, "\tcmp $1, %rax\n");
+  cg_s(&mut out, "\tjge 1f\n");
+  cg_s(&mut out, "\tmov $1, %eax\n");
+  cg_s(&mut out, "1:\tleave\n");
+  cg_s(&mut out, "\tret\n");
   cg_s(&mut out, "bst_rt_eprint:                  # write the %rsi bytes at %rdi to stderr, after flushing stdout\n");
   cg_s(&mut out, "\tpush %rbp\n");
   cg_s(&mut out, "\tmov %rsp, %rbp\n");
@@ -4985,7 +5044,17 @@ fn x86_runtime1(out: &mut Vec[u64]) {
   cg_s(&mut out, "\tmovslq -52(%rbp), %rdi\n");
   cg_s(&mut out, "\tcall close@PLT\n");
   cg_s(&mut out, "\tjmp 9f\n");
-  cg_s(&mut out, "1:\tlea 8(,%r12,8), %rdi        # argv for execvp, NULL-terminated\n");
+  cg_s(&mut out, "1:\tmovslq -52(%rbp), %rdi      # the parent's ends are not inherited by later children,\n");
+  cg_s(&mut out, "\tmov $2, %esi                # so closing a child's input reaches it as end of file\n");
+  cg_s(&mut out, "\tmov $1, %edx                # (F_SETFD, FD_CLOEXEC)\n");
+  cg_s(&mut out, "\txor %eax, %eax\n");
+  cg_s(&mut out, "\tcall fcntl@PLT\n");
+  cg_s(&mut out, "\tmovslq -64(%rbp), %rdi\n");
+  cg_s(&mut out, "\tmov $2, %esi\n");
+  cg_s(&mut out, "\tmov $1, %edx\n");
+  cg_s(&mut out, "\txor %eax, %eax\n");
+  cg_s(&mut out, "\tcall fcntl@PLT\n");
+  cg_s(&mut out, "\tlea 8(,%r12,8), %rdi        # argv for execvp, NULL-terminated\n");
   cg_s(&mut out, "\tcall malloc@PLT\n");
   cg_s(&mut out, "\ttest %rax, %rax\n");
   cg_s(&mut out, "\tjz bst_rt_oom\n");
