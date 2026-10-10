@@ -234,6 +234,20 @@ fn map_leaves(v: &Val, f: &mut dyn FnMut(&str) -> String) -> Val {
     }
 }
 
+/// The type of the place `rel` (`""`, or `.f.g`) under a value of type `t`,
+/// through borrows and boxes.
+fn path_ty(t: &Type, rel: &str) -> Type {
+    let mut t = t.base().clone();
+    for f in rel.split('.').filter(|f| !f.is_empty()) {
+        while let Type::Box(i) = t {
+            t = *i;
+        }
+        let Type::Struct(n) = &t else { unreachable!("a field of a struct") };
+        t = struct_def(n).unwrap().fields.iter().find(|(g, _)| g == f).expect("checked: a field").1.clone();
+    }
+    t
+}
+
 /// `elems` with `x` stored at index `i`.
 fn vec_write(elems: &Val, i: &str, x: &Val) -> Val {
     let mut xs = Vec::new();
@@ -438,6 +452,11 @@ pub struct Verifier<'p> {
     /// programs get the same queries as before.
     capacity: &'p HashSet<String>,
     caps: bool,
+    /// The declared type of each variable of the function being verified,
+    /// so that a loop or a call that changes one forgets its value but not
+    /// its type's range. Shadowing is not allowed, so the latest binding of a
+    /// name seen in program order is the one in scope.
+    tys: HashMap<String, Type>,
     /// The file of the function being verified: an opaque spec fn's body
     /// is used only in its own file.
     file: usize,
@@ -761,7 +780,7 @@ fn verify_worker(p: &Program, sums: &Summaries, counting: &HashSet<String>, deci
             return w;
         }
     };
-    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, int_ops: HashMap::new(), sums, counting, decimal, hexadecimal, bitwise, capacity, counts: false, bits: false, caps: false, file: 0 };
+    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, int_ops: HashMap::new(), sums, counting, decimal, hexadecimal, bitwise, capacity, counts: false, bits: false, caps: false, tys: HashMap::new(), file: 0 };
     let mut run = || -> Result<(), (usize, Diag)> {
         // Every function is verified on a solver in the same state, fresh
         // or reset: what Z3 answers near its work limit depends on what it
@@ -1115,9 +1134,11 @@ impl<'p> Verifier<'p> {
             }
         }
         let mut env = HashMap::new();
+        self.tys.clear();
         for p in &f.params {
             let v = self.fresh_of(&p.ty, &p.name)?;
             env.insert(p.name.clone(), v);
+            self.tys.insert(p.name.clone(), p.ty.clone());
         }
         let mut st = State { pc: Vec::new(), env: env.clone() };
         if f.name == "main" {
@@ -1199,9 +1220,10 @@ impl<'p> Verifier<'p> {
 
     fn stmt(&mut self, s: &Stmt, mut st: State, cx: &FnCtx) -> Result<Option<State>, Diag> {
         match &s.kind {
-            StmtKind::Let { name, init, .. } => {
+            StmtKind::Let { name, ty, init, .. } => {
                 let v = self.eval(init, &mut st)?;
                 st.env.insert(name.clone(), v);
+                self.tys.insert(name.clone(), ty.clone().expect("typed by checker"));
                 Ok(Some(st))
             }
             StmtKind::Assign { name, value } => {
@@ -1277,6 +1299,7 @@ impl<'p> Verifier<'p> {
                             if let Some(b) = b {
                                 if b != "_" {
                                     ast.env.insert(b.clone(), ps[k].clone());
+                                    self.tys.insert(b.clone(), d.variants[k].1.clone().expect("a variant with a payload"));
                                 }
                             }
                             format!("(= {} {})", tag, k)
@@ -1335,7 +1358,8 @@ impl<'p> Verifier<'p> {
                     }
                     self.open_path(&mut lst.env, &name)?;
                     let old = get_path(&lst.env, &name);
-                    let nv = self.havoc(&old, keep, &name)?;
+                    let ty = path_ty(&self.tys[path_root(&name)], &name[path_root(&name).len()..]);
+                    let nv = self.havoc(&old, &ty, keep, &name)?;
                     set_path(&mut lst.env, &name, nv);
                 }
                 for inv in invariants {
@@ -1406,7 +1430,8 @@ impl<'p> Verifier<'p> {
     /// change, and scalars, enum tags and the fields of structs stay as they
     /// were: no shape-keeping builtin changes them, and any other change to a
     /// place inside is havocked separately, after this.
-    fn havoc(&mut self, old: &Val, keep: bool, name: &str) -> Result<Val, Diag> {
+    fn havoc(&mut self, old: &Val, ty: &Type, keep: bool, name: &str) -> Result<Val, Diag> {
+        let ty = ty.base();
         Ok(match old {
             Val::U(_) | Val::B(_) | Val::Str { .. } if keep => old.clone(),
             Val::Buf { len, .. } => {
@@ -1414,6 +1439,8 @@ impl<'p> Verifier<'p> {
                 Val::Buf { len, data: self.fresh_array(name, "Int")? }
             }
             Val::Str { .. } => Val::Str { len: self.fresh_len(name)?, data: self.fresh_array(name, "Int")? },
+            // Within the range of its type: a signed variable may be negative.
+            Val::U(_) if ty.is_int() => self.fresh_of(ty, name)?,
             Val::U(_) => self.fresh_u64(name)?,
             Val::B(_) => self.fresh_bool(name)?,
             Val::Obj(t, fs) => {
@@ -1429,8 +1456,8 @@ impl<'p> Verifier<'p> {
             }
             Val::Struct(n, fs) => {
                 let mut nf = Vec::new();
-                for ((f, _), fv) in struct_def(n).unwrap().fields.iter().zip(fs) {
-                    nf.push(self.havoc(fv, keep, &format!("{}_{}", name, f))?);
+                for ((f, ft), fv) in struct_def(n).unwrap().fields.iter().zip(fs) {
+                    nf.push(self.havoc(fv, ft, keep, &format!("{}_{}", name, f))?);
                 }
                 Val::Struct(n.clone(), nf)
             }
@@ -1438,8 +1465,11 @@ impl<'p> Verifier<'p> {
                 let d = enum_def(n).unwrap();
                 let tag = if keep { tag.clone() } else { self.fresh_int(&format!("{}_tag", name), "0", &(d.variants.len() - 1).to_string())? };
                 let mut np = Vec::new();
-                for ((v, _), pv) in d.variants.iter().zip(ps) {
-                    np.push(self.havoc(pv, keep, &format!("{}_{}", name, v))?);
+                for ((v, pt), pv) in d.variants.iter().zip(ps) {
+                    np.push(match pt {
+                        Some(pt) => self.havoc(pv, pt, keep, &format!("{}_{}", name, v))?,
+                        None => pv.clone(),
+                    });
                 }
                 Val::Enum(n.clone(), tag, np)
             }
@@ -1453,7 +1483,10 @@ impl<'p> Verifier<'p> {
                 };
                 Val::Vec { elem: elem.clone(), len, cap, elems: Box::new(self.fresh_lifted(elem, name)?) }
             }
-            Val::Box(BoxVal::Known(i)) => Val::Box(BoxVal::Known(Box::new(self.havoc(i, keep, name)?))),
+            Val::Box(BoxVal::Known(i)) => {
+                let Type::Box(it) = ty else { unreachable!("a box value has a box type") };
+                Val::Box(BoxVal::Known(Box::new(self.havoc(i, it, keep, name)?)))
+            }
             Val::Box(BoxVal::Opaque(t)) => Val::Box(BoxVal::Opaque(t.clone())),
             Val::Unit => Val::Unit,
         })
@@ -1775,7 +1808,8 @@ impl<'p> Verifier<'p> {
                         let path = format!("{}{}", var, rel);
                         self.open_path(&mut st.env, &path)?;
                         let old = get_path(&st.env, &path);
-                        let nv = self.havoc(&old, *keep, &path.replace('.', "_"))?;
+                        let ty = path_ty(&p.ty, rel);
+                        let nv = self.havoc(&old, &ty, *keep, &path.replace('.', "_"))?;
                         set_path(&mut st.env, &path, nv);
                     }
                 } else {

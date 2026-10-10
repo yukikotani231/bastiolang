@@ -95,6 +95,16 @@ What will be 0.2.0.
 - A change to `stage0/src` needs its stage1 mirror, or a `Stage0-only:`
   reason in a commit message; CI checks this on every pull request (#78).
 
+### Fixed
+
+- A false proof in both compilers. A loop or call that changes a signed
+  integer (also inside a struct, enum or box) forgot its value but gave the
+  new one the range of `u64`, which leaves out the negative numbers, so an
+  `i64` that went negative in a loop could be proved to be 0 after it
+  (`tests/fail/loop_signed_range.bastio`, `call_signed_range.bastio`). A
+  changed `u8`, `u16` or `u32` got the range of `u64` too, which only made
+  true facts about it unprovable. Each now keeps its type's range.
+
 ### Documentation
 
 - The trusted base is listed and explained (`docs/trusted-base.md`, #66).
