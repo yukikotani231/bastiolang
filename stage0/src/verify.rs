@@ -1592,11 +1592,8 @@ impl<'p> Verifier<'p> {
                 }
                 _ => unreachable!(),
             },
-            "serial_write" => {
-                let b = vals[1].term();
-                self.need(st, format!("(<= {} 255)", b), pos, "E-VERIFY-BYTE", format!("that `{}` fits in a byte (`<= 255`)", ra(1)))?;
-                Ok(Val::Unit)
-            }
+            // A u8 always fits in a byte: the type says what E-VERIFY-BYTE used to prove.
+            "serial_write" => Ok(Val::Unit),
             "serial_read" | "serial_poll" => {
                 // serial_poll returns 256 when no byte is waiting.
                 let v = self.fresh_u64(name)?;
@@ -1671,7 +1668,6 @@ impl<'p> Verifier<'p> {
                 Val::Buf { len, data } => {
                     let (i, v) = (vals[1].term(), vals[2].term());
                     self.need(st, format!("(< {} {})", i, len), pos, "E-VERIFY-BOUNDS", format!("that the index `{}` is within `{}` (`{} < blen({})`)", ra(1), ra(0), ra(1), ra(0)))?;
-                    self.need(st, format!("(<= {} 255)", v), pos, "E-VERIFY-BYTE", format!("that `{}` fits in a byte (`<= 255`)", ra(2)))?;
                     let nv = Val::Buf { len: len.clone(), data: format!("(store {} {} {})", data, i, v) };
                     self.put_back(&args[0], nv, st);
                     Ok(Val::Unit)
@@ -1731,8 +1727,6 @@ impl<'p> Verifier<'p> {
                 let w = vals[1].term().to_string();
                 index_ok(self, st, &w, "4096", 1, "a page (4096 bytes)")?;
                 if name == "frame_write8" {
-                    let b = vals[2].term();
-                    self.need(st, format!("(<= {} 255)", b), pos, "E-VERIFY-BYTE", format!("that `{}` fits in a byte (`<= 255`)", ra(2)))?;
                     return Ok(Val::Unit);
                 }
                 let v = self.fresh_u64("frame_read8")?;
@@ -1869,8 +1863,6 @@ impl<'p> Verifier<'p> {
                 self.need(st, format!("(= (mod (+ {} {}) {}) 0)", io.field("base"), off, bytes), pos, "E-VERIFY-BOUNDS",
                     format!("that the access at offset `{}` of `{}` is aligned to {} bytes", ra(1), ra(0), bytes))?;
                 if name.starts_with("mmio_write") {
-                    self.need(st, format!("(<= {} {})", vals[2].term(), max), pos, "E-VERIFY-BYTE",
-                        format!("that `{}` fits in {} bits (`<= {}`)", ra(2), bytes * 8, max))?;
                     return Ok(Val::Unit);
                 }
                 let v = self.fresh_u64(name)?;
@@ -1901,8 +1893,6 @@ impl<'p> Verifier<'p> {
                 self.need(st, format!("(= (mod {} {}) 0)", off, bytes), pos, "E-VERIFY-BOUNDS",
                     format!("that offset `{}` is aligned to {} bytes", ra(1), bytes))?;
                 if name.starts_with("dma_write") {
-                    self.need(st, format!("(<= {} {})", vals[2].term(), max), pos, "E-VERIFY-BYTE",
-                        format!("that `{}` fits in {} bits (`<= {}`)", ra(2), bytes * 8, max))?;
                     return Ok(Val::Unit);
                 }
                 let v = self.fresh_u64(name)?;
@@ -1921,8 +1911,6 @@ impl<'p> Verifier<'p> {
                 self.need(st, format!("(<= (+ {} {}) {})", off, bytes, io.field("count")), pos, "E-VERIFY-BOUNDS",
                     format!("that port offset `{}` is within `{}` (`{} + {} <= port_count({})`)", ra(1), ra(0), ra(1), bytes, ra(0)))?;
                 if name.starts_with("pio_out") {
-                    self.need(st, format!("(<= {} {})", vals[2].term(), max), pos, "E-VERIFY-BYTE",
-                        format!("that `{}` fits in {} bits (`<= {}`)", ra(2), bytes * 8, max))?;
                     return Ok(Val::Unit);
                 }
                 let v = self.fresh_u64(name)?;

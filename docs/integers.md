@@ -134,7 +134,9 @@ fn port_in16 / port_out16 / port_in32 / port_out32   // u16 and u32 values
 
 The port number cannot exceed 16 bits and the value cannot exceed the access width, and neither needs a proof: the types say it. Memory-mapped registers get their width from the register's declared type in the same way.
 
-At the same time the byte-shaped builtins take and return `u8`: `bget -> u8`, `bset(.., v: u8)`, `serial_write(c, b: u8)`, `serial_read -> u8`, `frame_read8 -> u8`, `frame_write8(.., b: u8)`. `E-VERIFY-BYTE` disappears, since "fits in a byte" is now the type. This changes existing code (stage1's lexer compares `bget` results with literals, which keeps working, but code that does `n * 10 + bget(..)` on a `u64` needs `cast[u64](..)`), so it lands as one change across bastiolang and BastiOS. `serial_poll`'s "256 means nothing" result becomes an enum.
+At the same time the byte-shaped builtins take and return `u8`: `bget -> u8`, `bset(.., v: u8)`, `serial_write(c, b: u8)`, `serial_read -> u8`, `frame_read8 -> u8`, `frame_write8(.., b: u8)`. `E-VERIFY-BYTE` disappears, since "fits in a byte" is now the type. This changes existing code (stage1's lexer compares `bget` results with literals, which keeps working, but code that does `n * 10 + bget(..)` on a `u64` needs `cast[u64](..)`), so it lands as one change across bastiolang and BastiOS. `serial_poll`'s "256 means nothing" result was meant to become an enum; it stays a `u64` for now.
+
+Done 2026-10-10. Besides the builtins above, `sget` returns `u8`; `pio_in8/16/32`, `mmio_read8/16/32` and `dma_read8/16/32` return `u8`/`u16`/`u32` and the writes take them (the 64-bit accesses stay `u64`). Most call sites kept compiling; the rest needed a `cast[u64](..)` where a byte meets `u64` arithmetic, or a parameter narrowed to `u8`.
 
 ## Error codes
 
@@ -144,7 +146,7 @@ At the same time the byte-shaped builtins take and return `u8`: `bget -> u8`, `b
 | `E-VERIFY-CAST` | new: the argument of `cast[T]` fits in `T` |
 | `E-VERIFY-SHIFT` | new (step 3): a shift amount is less than the width |
 | `E-VERIFY-OVERFLOW` / `E-VERIFY-UNDERFLOW` | now relative to the operation's type |
-| `E-VERIFY-BYTE` | removed in step 4 |
+| `E-VERIFY-BYTE` | removed in step 4 (2026-10-10) |
 
 ## Implementation plan
 
@@ -153,7 +155,7 @@ Each step comes with `tests/pass` and `tests/fail` programs (ROADMAP invariant 4
 1. **Unsigned widths and conversions** (done 2026-10-10). `u8`, `u16`, `u32`; literal typing; `cast`, `wrap`, `wrap_add`/`wrap_sub`/`wrap_mul`; index parameters of any unsigned type; C types. Touches stage0's parser (type names), `mono.rs` (type arguments on builtins), `check.rs`, `verify.rs` and `codegen.rs`, and stage1's parser and checker, which must give the same `--dump-check` result (CI's difftest runs every test program through both).
 2. **Signed types.** `i8` to `i64`, unary minus, the signed division encoding. Done 2026-10-10, in stage0 and the stage1 checker.
 3. **Bitwise operators**, with the encoding above. Done 2026-10-10, in stage0 and stage1.
-4. **Byte-shaped builtins move to `u8`, and `PortIo`** (with BastiOS moving the PIC, PIT and UART setup out of `platform.c`).
+4. **Byte-shaped builtins move to `u8`, and `PortIo`** (with BastiOS moving the PIC, PIT and UART setup out of `platform.c`). Done 2026-10-10.
 
 Steps 1 and 2 come before stage1's verifier and code generator are written, so those are written once, with sized integers, rather than retrofitted. Steps 3 and 4 can follow the self-hosting fixed point.
 
