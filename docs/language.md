@@ -966,6 +966,7 @@ Ghost accessors, usable in specifications:
 | `pt_take(t: &mut PageTable, i: u64) -> PageTable` | level >= 2; slot `i` used (same slot rule at level 4); `pt_leases(t) == 0` | Moves the table out of slot `i`; its level is one less. What its slots hold is unknown to the proof, so code that tears it down tests each slot with `pt_has` |
 | `pt_put_frame(t: &mut PageTable, i: u64, f: Frame, writable: bool)` | level 1; slot `i` empty | Maps page `f` in slot `i`, user-accessible |
 | `pt_take_frame(t: &mut PageTable, i: u64) -> Frame` | level 1; slot `i` used; `pt_leases(t) == 0` | Unmaps the page and returns it |
+| `pt_writable(t: &PageTable, i: u64) -> bool` | level 1; `i < 512` | Whether the page in slot `i` was mapped writable. The proof does not track it, so the answer is unknown to it; code that moves a page keeps its permission by passing this to `pt_put_frame` |
 | `pt_borrow(t: &mut PageTable, i: u64, f, args..)` | level >= 2; slot `i` used (same slot rule at level 4) | Calls `f(&mut child, args..)` with the table in slot `i` left in place, and returns what `f` returns. `f` must take `&mut PageTable` first and hand back the same table (`E-VERIFY-OWN`); the child's `pt_leases` is `t`'s |
 | `pt_borrow_frame(t: &mut PageTable, i: u64, f, args..)` | level 1; slot `i` used | The same for the page in slot `i`: `f` takes `&mut Frame` first |
 | `pt_lease_count(t: &mut PageTable) -> u64` | | The leases outstanding on `t` now, counted at run time; `pt_leases(t)` becomes this. Only the holder of `&mut t` could raise it, so a 0 stays 0 while `t` is held |

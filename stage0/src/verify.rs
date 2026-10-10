@@ -1976,6 +1976,15 @@ impl<'p> Verifier<'p> {
                 let k = self.fresh_bool("pt_has_kernel")?;
                 Ok(Val::B(format!("(ite (and (= {} 4) (= {} 0)) {} (select {} {}))", vals[0].field("level"), i, k.term(), vals[0].field("used"), i)))
             }
+            "pt_writable" => {
+                // Whether the page in slot i of a last-level table may be
+                // written. Nothing the proof tracks: the answer is unknown.
+                let i = vals[1].term().to_string();
+                index_ok(self, st, &i, "512", 1, "a page table (512 slots)")?;
+                self.need(st, format!("(= {} 1)", vals[0].field("level")), pos, "E-VERIFY-PT", format!("that `{}` is a last-level table (level 1), which maps pages", ra(0)))?;
+                let w = self.fresh_bool("pt_writable")?;
+                Ok(w)
+            }
             "pt_put" | "pt_take" | "pt_put_frame" | "pt_take_frame" => {
                 let t = &vals[0];
                 let i = vals[1].term().to_string();

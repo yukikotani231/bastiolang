@@ -13,6 +13,12 @@ cd "$(dirname "$0")/.."
 skipped=()
 step() { printf '\n== %s\n' "$1"; }
 
+if git rev-parse -q --verify origin/main >/dev/null; then
+  step "stage0 changes have stage1 mirrors"; tests/stage0_mirror.sh origin/main
+else
+  skipped+=("stage0 mirror check (no origin/main to compare with)")
+fi
+
 step "build stage0 (warnings are errors)"
 (cd stage0 && RUSTFLAGS="-D warnings" cargo build --release --locked)
 

@@ -462,6 +462,7 @@ static inline bst_pt bst_pt_new(bst_frame f, uint64_t level) {
 }
 static inline bst_frame bst_pt_free(bst_pt t) { return t; }
 static inline bool bst_pt_has(bst_pt t, uint64_t i) { return (((uint64_t *)t)[i] & BST_PTE_P) != 0; }
+static inline bool bst_pt_writable(bst_pt t, uint64_t i) { return (((uint64_t *)t)[i] & BST_PTE_W) != 0; }
 /* Another processor may be walking the table (it holds a lease on the
  * tree), so an entry is written with one 64-bit store, present bit
  * included, after everything it points to (release order). */

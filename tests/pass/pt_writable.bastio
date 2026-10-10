@@ -1,0 +1,31 @@
+// expect-exit: 3
+// A last-level table remembers whether each page is writable, so code that
+// takes a page out and puts it back (to copy it, or to move it) can keep
+// it read-only. The proof does not track the bit: it is read at run time.
+
+fn main(pool: &mut Pool) -> u64 {
+  if pool_size(pool) < 3 {
+    return 3;
+  }
+  let mut t = pt_new(pool_take(&mut pool, 0), 1);
+  pt_put_frame(&mut t, 5, pool_take(&mut pool, 1), false);
+  pt_put_frame(&mut t, 6, pool_take(&mut pool, 2), true);
+  let mut r = 0;
+  if !pt_writable(t, 5) {
+    r = r + 1;
+  }
+  if pt_writable(t, 6) {
+    r = r + 2;
+  }
+  // Move the read-only page to slot 7, keeping it read-only.
+  let w = pt_writable(t, 5);
+  let f = pt_take_frame(&mut t, 5);
+  pt_put_frame(&mut t, 7, f, w);
+  if pt_writable(t, 7) {
+    r = 0;
+  }
+  pool_give(&mut pool, pt_take_frame(&mut t, 6));
+  pool_give(&mut pool, pt_take_frame(&mut t, 7));
+  pool_give(&mut pool, pt_free(t));
+  return r;
+}

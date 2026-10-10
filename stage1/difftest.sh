@@ -25,7 +25,8 @@
 #           asmdump also does what stage0 does not (register arguments,
 #           Child, host_eprint): the programs it builds must exit as
 #           tests/pass says, and bastioc1 built by it must write the same C
-#           for itself as stage0
+#           for itself as stage0. With --user it builds tests/user without
+#           the C library (they assemble and link on their own)
 #   driver  stage1/bastioc1.bastio  vs  bastioc0 itself: what `--check`
 #           prints on stderr and its exit status (a failed proof's
 #           sentence masked, as bastioc1 does not print it yet), the
@@ -205,8 +206,20 @@ if "$tmp/asmdump" stage1/bastioc1.bastio >"$tmp/b1.s" 2>/dev/null \
 else
   differ=$((differ+1)); echo "DIFFER bastioc1 built by asmdump"
 fi
-echo "-- native (stage1 only): $built programs built and run (plus asmdump built by itself, and bastioc1), $differ differ"
-{ [ "$differ" = 0 ] && [ "$built" -gt 1 ]; } || status=1
+# User programs (BastiOS) cannot run here: they must assemble and link on
+# their own, with no C library (bastios's make test runs them).
+users=0
+for f in tests/user/*.bastio; do
+  if "$tmp/asmdump" --user "$f" >"$tmp/user.s" 2>/dev/null \
+     && as --64 -o "$tmp/user.o" "$tmp/user.s" \
+     && ld -static -nostdlib --no-undefined -e bst_umain -o "$tmp/user" "$tmp/user.o"; then
+    users=$((users+1))
+  else
+    differ=$((differ+1)); echo "DIFFER $f (user program not built by asmdump --user)"
+  fi
+done
+echo "-- native (stage1 only): $built programs built and run (plus asmdump built by itself, and bastioc1), $users user programs built, $differ differ"
+{ [ "$differ" = 0 ] && [ "$built" -gt 1 ] && [ "$users" -gt 0 ]; } || status=1
 # The driver. The sentence after `error[CODE]:` and the hints (`  = ..`)
 # of the errors before the verifier are being ported phase by phase: where
 # bastioc1 prints none, bastioc0's are left out of the comparison (a failed

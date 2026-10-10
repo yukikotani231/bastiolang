@@ -193,7 +193,7 @@ const LEAF: [&str; 4] = ["%r8", "%r9", "%r10", "%r11"];
 const INLINE_BUILTINS: &[&str] = &[
     "len", "get", "set", "blen", "bget", "bset", "slen", "sget", "vec_len", "vec_get", "vec_set", "vec_swap", "vec_pop", "wrap_add", "wrap_sub", "wrap_mul",
     "cast", "wrap", "vec_new", "pool_size", "pool_take", "pool_give", "pt_new", "pt_free", "frame_id", "frame_read", "frame_read8", "frame_write", "frame_write8",
-    "pt_has", "pt_put", "pt_put_frame", "pt_take", "pt_take_frame",
+    "pt_has", "pt_writable", "pt_put", "pt_put_frame", "pt_take", "pt_take_frame",
 ];
 
 /// How deep inlining goes: the function being generated, then up to two
@@ -2255,6 +2255,12 @@ impl<'a> Gen<'a> {
             "pt_has" => {
                 self.to_regs(args, &["%rdx", "%rax"])?;
                 self.emit("mov (%rdx,%rax,8), %rax");
+                self.emit("and $1, %eax");
+            }
+            "pt_writable" => {
+                self.to_regs(args, &["%rdx", "%rax"])?;
+                self.emit("mov (%rdx,%rax,8), %rax");
+                self.emit("shr $1, %eax");
                 self.emit("and $1, %eax");
             }
             "pt_put" | "pt_put_frame" => {
