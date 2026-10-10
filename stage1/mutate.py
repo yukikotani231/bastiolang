@@ -9,10 +9,18 @@
 # Mutants that are not valid UTF-8 are skipped: stage0 cannot even read
 # them. Deterministic: the seed and the number of mutants per file are
 # arguments.
-#   usage: mutate.py BASTIOC FLAG TOOL SEED PER_FILE FILE...
+#   usage: mutate.py [--via DRIVER] BASTIOC FLAG TOOL SEED PER_FILE FILE...
+# With --via, each mutant temporarily replaces its original file (restored
+# afterwards) and both compilers run on DRIVER, a program that imports it:
+# that is how library files without a `main` reach the checker.
+# FLAG and TOOL may hold several words (`--dump-check --target kernel`).
 import os, random, re, subprocess, sys
 
-bastioc, flag, tool, seed, per_file = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
+args = sys.argv[1:]
+via = None
+if args[0] == '--via':
+    via, args = args[1], args[2:]
+bastioc, flag, tool, seed, per_file = args[0], args[1], args[2], int(args[3]), int(args[4])
 random.seed(seed)
 PUNCT = [b'(', b')', b'{', b'}', b'[', b']', b',', b';', b':', b'::', b'&', b'mut ', b'.', b'=',
          b'->', b'=>', b'_', b'1', b'x', b'is ', b'forall ']
@@ -48,7 +56,7 @@ def mutate(src):
 
 runs = differ = errors = 0
 codes = {}
-for f in sys.argv[6:]:
+for f in args[5:]:
     src = open(f, 'rb').read()
     path = os.path.join(os.path.dirname(f), '.mutant_' + os.path.basename(f))
     for _ in range(per_file):
@@ -57,12 +65,16 @@ for f in sys.argv[6:]:
             m.decode('utf-8')
         except UnicodeDecodeError:
             continue
-        open(path, 'wb').write(m)
+        target = via or path
+        open(f if via else path, 'wb').write(m)
         try:
-            want = subprocess.run([bastioc, flag, path], capture_output=True).stdout
-            got = subprocess.run([tool, path], capture_output=True).stdout
+            want = subprocess.run([bastioc] + flag.split() + [target], capture_output=True).stdout
+            got = subprocess.run(tool.split() + [target], capture_output=True).stdout
         finally:
-            os.remove(path)
+            if via:
+                open(f, 'wb').write(src)
+            else:
+                os.remove(path)
         runs += 1
         err = [l for l in want.split(b'\n') if l.startswith(b'error ')]
         if err:
@@ -74,5 +86,5 @@ for f in sys.argv[6:]:
             print('DIFFER: a mutant of %s (%s):' % (f, flag))
             print('    ' + m.decode('utf-8', 'replace').replace('\n', '\n    ')[:3000])
 tally = ''.join(', %d %s' % (n, c) for c, n in sorted(codes.items()))
-print('-- %s mutants: %d run (%d of them errors%s), %d differ' % (flag, runs, errors, tally, differ))
+print('-- %s%s mutants: %d run (%d of them errors%s), %d differ' % (flag, ' via ' + via if via else '', runs, errors, tally, differ))
 sys.exit(1 if differ else 0)

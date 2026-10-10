@@ -4,8 +4,9 @@
 import "mono.bastio";
 import "out.bastio";
 
-/// How to print: as parsed, or read in instance `env`.
-struct Pr { raw: bool, env: u64 }
+/// How to print: as parsed, or read in instance `env`; `lets` prints the
+/// types the checker found for `let` statements.
+struct Pr { raw: bool, env: u64, lets: bool }
 
 fn text(con: &Serial, p: &Parser, s: u64, e: u64) {
   if s <= e && e <= blen(p.src) {
@@ -293,7 +294,13 @@ fn dump_stmt(con: &Serial, p: &Parser, m: &mut Mono, pr: Pr, i: u64) {
     if n.v == 1 { put(con, "mut "); }
     name_of(con, p, n);
     put(con, " ");
-    if n.a == 0 { put(con, "_"); } else { dump_type(con, p, &mut m, pr, n.a); }
+    if pr.lets {
+      put_ty(con, p, m, let_ty(m, pr.env, i));
+    } else if n.a == 0 {
+      put(con, "_");
+    } else {
+      dump_type(con, p, &mut m, pr, n.a);
+    }
     put(con, " ");
     dump_expr(con, p, &mut m, pr, n.b);
   } else if k == S_ASSIGN {
@@ -488,7 +495,7 @@ fn dump_program(con: &Serial, p: &Parser, m: &mut Mono, pr: Pr) {
 fn dump_typedef(con: &Serial, p: &Parser, m: &mut Mono, x: u64) {
   let xi = inst_at(m, x);
   let n = node_at(p.nodes, xi.def);
-  let pr = Pr { raw: false, env: x };
+  let pr = Pr { raw: false, env: x, lets: false };
   if n.kind == D_STRUCT {
     begin(con, pr, "struct", n);
   } else {
@@ -512,8 +519,9 @@ fn dump_typedef(con: &Serial, p: &Parser, m: &mut Mono, x: u64) {
   put(con, ")\n");
 }
 
-/// The program after monomorphization (`--dump-mono`).
-fn dump_mono(con: &Serial, p: &Parser, m: &mut Mono) {
+/// The program after monomorphization (`--dump-mono`), or after checking
+/// (`--dump-check`) when `lets`.
+fn dump_mono(con: &Serial, p: &Parser, m: &mut Mono, lets: bool) {
   let mut k = 0;
   while k < vec_len(m.structs) {
     dump_typedef(con, p, &mut m, vec_get(m.structs, k));
@@ -524,7 +532,7 @@ fn dump_mono(con: &Serial, p: &Parser, m: &mut Mono) {
     dump_typedef(con, p, &mut m, vec_get(m.enums, k));
     k = k + 1;
   }
-  let none = Pr { raw: false, env: 0 };
+  let none = Pr { raw: false, env: 0, lets: false };
   let mut s = p.specs.head;
   while s != 0 {
     let n = node_at(p.nodes, s);
@@ -544,7 +552,7 @@ fn dump_mono(con: &Serial, p: &Parser, m: &mut Mono) {
     let x = vec_get(m.fns, k);
     let xi = inst_at(m, x);
     let n = node_at(p.nodes, xi.def);
-    let pr = Pr { raw: false, env: x };
+    let pr = Pr { raw: false, env: x, lets: lets };
     begin(con, pr, "fn", n);
     put(con, " ");
     put_inst(con, p, m, x);
