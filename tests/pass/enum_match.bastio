@@ -1,0 +1,111 @@
+// expect-exit: 42
+// Enums and `match`: plain value enums are copied; an enum with a linear
+// payload is linear itself, so every arm must consume what it binds. The
+// verifier knows which variant a value is, so proofs can follow the arms.
+
+struct Point { x: u64, y: u64 }
+
+enum Shape { Square(u64), Rect(Point), Empty }
+
+// An optional result: what a fallible operation hands back.
+enum Opt { Some(u64), None }
+
+// A slot that may own a buffer: linear, because `Buf` is.
+enum Slot { Full(Buf), Vacant }
+
+fn area(s: Shape) -> u64
+  requires (s is Shape::Square ==> s.Square < 1000) && (s is Shape::Rect ==> s.Rect.x < 1000 && s.Rect.y < 1000)
+  ensures result < 1000000
+{
+  match s {
+    Shape::Square(n) => { return n * n; },
+    Shape::Rect(p) => { return p.x * p.y; },
+    Shape::Empty => { return 0; },
+  }
+}
+
+fn checked_div(a: u64, b: u64) -> Opt
+  ensures (b == 0) == (result is Opt::None)
+  ensures result is Opt::Some ==> result.Some <= a
+{
+  if b == 0 {
+    return Opt::None;
+  }
+  return Opt::Some(a / b);
+}
+
+// Arms that fall through are merged, like the arms of an `if`.
+fn or_zero(o: Opt) -> u64
+  ensures o is Opt::Some ==> result == o.Some
+  ensures o is Opt::None ==> result == 0
+{
+  let mut r = 0;
+  match o {
+    Opt::Some(v) => { r = v; },
+    Opt::None => {},
+  }
+  return r;
+}
+
+// A borrowed enum is only inspected: `(_)` tests the variant, nothing moves.
+fn is_full(s: &Slot) -> bool
+  ensures result == (s is Slot::Full)
+{
+  match s {
+    Slot::Full(_) => { return true; },
+    Slot::Vacant => { return false; },
+  }
+}
+
+// Consuming a linear enum: the arm that binds the buffer must free it.
+fn drop_slot(s: Slot) -> u64
+  requires s is Slot::Full ==> len(s.Full) <= 4096
+  ensures s is Slot::Full ==> result == len(s.Full)
+  ensures result <= 4096
+{
+  match s {
+    Slot::Full(b) => {
+      let n = len(b);
+      free(b);
+      return n;
+    },
+    Slot::Vacant => { return 0; },
+  }
+}
+
+fn main() -> u64 {
+  let a = area(Shape::Square(3));                       // 9
+  let b = area(Shape::Rect(Point { x: 2, y: 5 }));      // 10
+  let c = area(Shape::Empty);                           // 0
+  let q = checked_div(20, 4);
+  let mut d = 0;
+  match q {
+    Opt::Some(v) => {
+      assert v <= 20;   // known from checked_div's postcondition
+      d = v;            // 5
+    },
+    Opt::None => {},
+  }
+  let e = or_zero(checked_div(7, 0));                   // 0
+  let s = Slot::Full(alloc(16));
+  let mut f = 0;
+  if is_full(s) {
+    f = 1;
+  }
+  let g = drop_slot(s);                                 // 16
+  let h = drop_slot(Slot::Vacant);                      // 0
+  // An enum changed inside a loop.
+  let mut o = Opt::None;
+  let mut i = 0;
+  while i < 3
+    invariant i <= 3 && (o is Opt::Some ==> o.Some < i)
+  {
+    if o is Opt::None {
+      o = Opt::Some(i);
+    }
+    i = i + 1;
+  }
+  let k = or_zero(o);                                   // 0
+  // 9 + 10 + 0 + 5 + 0 + 1 + 16 + 0 + 0 = 41
+  return a + b + c + d + e + f + g + h + k + 1;
+}

@@ -1,7 +1,9 @@
 // Recursive-descent parser.
 //
 // Grammar:
-//   program  := (fn | specfn | const | struct)*
+//   program  := (fn | specfn | const | struct | enum)*
+//   enum     := 'enum' IDENT '{' variant (',' variant)* ','? '}'
+//   variant  := IDENT ('(' type ')')?
 //   struct   := 'struct' IDENT '{' (IDENT ':' type (',' IDENT ':' type)* ','?)? '}'
 //   fn       := 'fn' IDENT '(' (param (',' param)*)? ')' ('->' type)?
 //               ('requires' expr | 'ensures' expr)* block
@@ -13,6 +15,8 @@
 //   place    := IDENT ('.' IDENT)*
 //   primary  := ... | '&' 'mut' place | 'include_bytes' '(' STRING ')' | 'old' '(' expr ')'
 //             | IDENT '{' (IDENT ':' expr (',' IDENT ':' expr)* ','?)? '}'   (a struct literal)
+//             | IDENT '::' IDENT ('(' expr ')')?                              (an enum value)
+//   cmp      := add (('==' | ... ) add | 'is' IDENT '::' IDENT)?
 //   postfix  := primary ('.' IDENT)*
 //   block    := '{' stmt* '}'
 //   stmt     := 'let' 'mut'? IDENT (':' type)? '=' expr ';'
@@ -21,6 +25,8 @@
 //             | 'while' expr ('invariant' expr)* block
 //             | 'return' expr? ';'
 //             | 'assert' expr ';'
+//             | 'match' expr '{' (pat '=>' block ','?)* '}'
+//   pat      := IDENT '::' IDENT ('(' 'mut'? (IDENT | '_') ')')? | '_'
 //             | expr ';'
 //   expr precedence, lowest first: '==>' (right) < '||' < '&&' < comparisons
 //             < '+' '-' < '*' '/' '%' < '!' < call / primary
@@ -95,15 +101,55 @@ impl Parser {
         let mut fns = Vec::new();
         let mut specs = Vec::new();
         let mut structs = Vec::new();
+        let mut enums = Vec::new();
         while *self.peek() != Tok::Eof {
             match self.peek() {
                 Tok::Spec => specs.push(self.spec_def()?),
                 Tok::Struct => structs.push(self.struct_def()?),
+                Tok::Enum => enums.push(self.enum_def()?),
                 Tok::Const => self.const_def()?,
                 _ => fns.push(self.fn_def()?),
             }
         }
-        Ok(Program { fns, specs, structs })
+        Ok(Program { fns, specs, structs, enums })
+    }
+
+    fn enum_def(&mut self) -> PResult<EnumDef> {
+        let pos = self.expect(Tok::Enum, "`enum`")?.pos;
+        let (name, _) = self.ident()?;
+        self.expect(Tok::LBrace, "`{`")?;
+        let mut variants: Vec<(String, Option<Type>)> = Vec::new();
+        while *self.peek() != Tok::RBrace {
+            let (v, vpos) = self.ident()?;
+            let payload = if self.eat(&Tok::LParen) {
+                let t = self.ty()?;
+                if t.is_ref() {
+                    return Err(Diag::new("E-PARSE", vpos, "an enum payload cannot be a borrow"));
+                }
+                self.expect(Tok::RParen, "`)`")?;
+                Some(t)
+            } else {
+                None
+            };
+            if variants.iter().any(|(w, _)| *w == v) {
+                return Err(Diag::new("E-PARSE", vpos, format!("variant `{}` is declared twice", v)));
+            }
+            variants.push((v, payload));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::RBrace, "`}`")?;
+        if variants.is_empty() {
+            return Err(Diag::new("E-PARSE", pos, format!("enum `{}` has no variants", name)));
+        }
+        Ok(EnumDef { name, variants, pos })
+    }
+
+    /// `Enum::Variant` after the enum's name.
+    fn variant_name(&mut self) -> PResult<String> {
+        self.expect(Tok::ColonColon, "`::`")?;
+        Ok(self.ident()?.0)
     }
 
     fn struct_def(&mut self) -> PResult<StructDef> {
@@ -292,6 +338,40 @@ impl Parser {
                 self.expect(Tok::Semi, "`;`")?;
                 Ok(Stmt { kind: StmtKind::Assert(e), pos })
             }
+            Tok::Match => {
+                self.bump();
+                let scrut = self.expr()?;
+                self.expect(Tok::LBrace, "`{`")?;
+                let mut arms = Vec::new();
+                while *self.peek() != Tok::RBrace {
+                    let apos = self.pos();
+                    let pat = match self.peek().clone() {
+                        Tok::Ident(n) if n == "_" => {
+                            self.bump();
+                            Pat::Wild
+                        }
+                        Tok::Ident(en) => {
+                            self.bump();
+                            let v = self.variant_name()?;
+                            if self.eat(&Tok::LParen) {
+                                let m = self.eat(&Tok::Mut);
+                                let (b, _) = self.ident()?;
+                                self.expect(Tok::RParen, "`)`")?;
+                                Pat::Variant(en, v, Some(b), m)
+                            } else {
+                                Pat::Variant(en, v, None, false)
+                            }
+                        }
+                        t => return Err(Diag::new("E-PARSE", apos, format!("expected a pattern, found {:?}", t))),
+                    };
+                    self.expect(Tok::FatArrow, "`=>`")?;
+                    let body = self.block()?;
+                    self.eat(&Tok::Comma);
+                    arms.push(Arm { pat, body, pos: apos });
+                }
+                self.bump();
+                Ok(Stmt { kind: StmtKind::Match { scrut, arms }, pos })
+            }
             Tok::Ident(name) if self.is_assignment() => {
                 self.bump();
                 let name = self.place_rest(name)?;
@@ -380,6 +460,12 @@ impl Parser {
 
     fn cmp(&mut self) -> PResult<Expr> {
         let lhs = self.add()?;
+        if *self.peek() == Tok::Is {
+            let pos = self.bump().pos;
+            let (en, _) = self.ident()?;
+            let v = self.variant_name()?;
+            return Ok(Expr { kind: ExprKind::Is(Box::new(lhs), en, v), pos });
+        }
         let op = match self.peek() {
             Tok::EqEq => BinOp::Eq,
             Tok::Ne => BinOp::Ne,
@@ -493,6 +579,18 @@ impl Parser {
                 let full = self.dir.join(&path);
                 let bytes = std::fs::read(&full).map_err(|e| Diag::new("E-PARSE", pos, format!("include_bytes: cannot read {}: {}", full.display(), e)))?;
                 Ok(Expr { kind: ExprKind::Blob(bytes), pos })
+            }
+            Tok::Ident(name) if self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::ColonColon) => {
+                self.bump();
+                let v = self.variant_name()?;
+                let payload = if self.eat(&Tok::LParen) {
+                    let e = self.expr()?;
+                    self.expect(Tok::RParen, "`)`")?;
+                    Some(Box::new(e))
+                } else {
+                    None
+                };
+                Ok(Expr { kind: ExprKind::Variant(name, v, payload), pos })
             }
             Tok::Ident(name) if self.is_struct_lit() => {
                 self.bump();

@@ -23,6 +23,7 @@ The language as stage0 implements it today: the v0 proof pipeline, plus `&mut` b
 | `Cpu` | The CPU's saved user context and the right to enter user mode. Linear; kernel target only |
 
 | `S` (a struct) | A user-defined record. Linear when any field is linear; otherwise a plain value that is copied |
+| `E` (an enum) | One of several variants, each with at most one payload. Linear when any payload is linear |
 
 Borrowing at a call site is implicit: passing an owned `b` to a `&Buf` parameter lends it for the duration of the call. A `&mut` parameter needs an explicit `&mut b`, and `b` must be declared `mut` (or itself be a `&mut` parameter). One call cannot lend the same variable twice if one of the loans is `&mut`.
 
@@ -60,6 +61,32 @@ p.space.root = t;                      // ... and put one back
 - Struct literals list every field once, in any order. Fields are evaluated in an unspecified order (as with call arguments).
 - Specifications can read fields, including through `old(..)` and `result`: `ensures result.n == old(s).n + 1`, `pt_level(s.root) == 1`. The proof tracks every field, so bounds, overflow and capability state work through fields exactly as through variables.
 - In generated code a struct is a C struct passed by value; there is no runtime representation of which fields have been moved.
+
+## Enums and `match`
+
+```
+enum Opt  { Some(u64), None }
+enum Slot { Full(Buf), Vacant }        // linear: a variant owns a buffer
+
+let o = Opt::Some(5);
+let s = Slot::Full(alloc(16));
+if o is Opt::None { ... }              // test the variant; consumes nothing
+match s {
+  Slot::Full(b) => { free(b); },       // the arm owns `b` and must consume it
+  Slot::Vacant => {},
+}
+```
+
+- A variant has no payload or exactly one (use a struct for several values). An enum cannot contain itself (recursive data needs `Box[T]`, not implemented yet).
+- An enum with a linear payload is **linear**: it is consumed exactly once, and dropping it is `E-LINEAR-LEAK`.
+- `match` must be **exhaustive**: every variant is handled once, or a final `_` arm takes the rest. A missing variant, a variant matched twice, or an arm after `_` is `E-MATCH`.
+- Matching an owned value moves it into the arms. A pattern `E::V(x)` binds the payload to `x` (`E::V(mut x)` to change it), owned by the arm: a linear payload must be consumed there. `E::V(_)` and `_` drop the payload, which is `E-LINEAR-LEAK` for a linear one.
+- Matching a borrowed place (a `&E` parameter) only inspects it: a linear payload cannot be bound (`E-LINEAR-USE`), only tested with `(_)`. Through a `&mut E` parameter the match moves the value out, and the function must put a new one back.
+- The arms must agree on what they consume (`E-LINEAR-BRANCH`), like the arms of an `if`.
+- `x is E::V` is a `bool` that reads only the tag. Its operand must be a place or a non-linear value, since it consumes nothing.
+- Specifications can use `is`, and `o.V` means the payload of variant `V`. It is meaningful only when `o is E::V`, so write it under an implication: `ensures result is Opt::Some ==> result.Some <= a`. The prover knows which arm of a `match` it is in, so inside `Opt::Some(v) => ...` it knows `v` is `o.Some`.
+- Enum values cannot be built in a specification.
+- In generated code an enum is a C struct holding a tag and a union of the payloads. A `match` is an `if` chain on the tag; the last arm needs no test because the match is exhaustive.
 
 ## Built-in functions
 
@@ -128,6 +155,7 @@ fn name(p: T, mut q: T) -> R
 
 let x = e;   let mut x: T = e;   x = e;
 if c { ... } else { ... }
+match e { E::V(x) => { ... }, _ => { ... } }
 while c invariant <expr> invariant <expr> { ... }
 return e;   assert <expr>;
 
@@ -139,7 +167,7 @@ include_bytes("path")                              // a file's bytes as a Str, p
 - Operators: `+ - * / %`, `== != < <= > >=`, `&& || !`. `&&` and `||` short-circuit.
 - Integer literals are decimal or hex (`0x1F`).
 - Several source files can be given on the command line; they form one program, and constants are visible in later files.
-- A name cannot be redeclared (no shadowing) within a function.
+- A name cannot shadow one that is still in scope. Once a block ends, its names can be used again (two `match` arms can both bind `v`).
 - The entry point is `fn main(...) -> u64` (or with no result), taking any of the capabilities its target hands out, each at most once and as `&mut`: hosted `&mut Serial`, `&mut Pool`, `&mut Host`; kernel those plus `&mut Mmu`, `&mut Cpu`; user `&mut Serial` only. A user program's result is its exit code. The older `fn main(con: Serial) -> Serial` is still accepted outside user programs.
 
 ## Specification expressions (ghost)
@@ -157,7 +185,8 @@ Expressions in `requires` / `ensures` / `invariant` / `assert` exist only at com
 | --- | --- |
 | `E-LINEAR-USE` | A consumed buffer (or a moved-out field, or a struct with a field moved out) is used; one call both borrows and moves the same buffer; a borrow is returned; a buffer is consumed where the code may run more than once or not at all (a `while` condition, the right side of `&&` / `\|\|`) |
 | `E-LINEAR-LEAK` | A buffer is still owned at the end of its scope or at a `return`; an owned buffer is overwritten |
-| `E-LINEAR-BRANCH` | Only one arm of an `if` consumes a buffer; a loop body changes the ownership of an outer buffer |
+| `E-LINEAR-BRANCH` | Only one arm of an `if` or a `match` consumes a buffer; a loop body changes the ownership of an outer buffer |
+| `E-MATCH` | A `match` misses a variant, matches one twice, or has an arm after `_` |
 
 The same rules apply to every linear type (`Frame`, `PageTable`, the capabilities), and a `&mut` parameter must hold a value again when the function returns.
 

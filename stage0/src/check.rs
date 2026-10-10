@@ -153,37 +153,45 @@ fn main_caps(target: Target) -> &'static [Type] {
     }
 }
 
-/// Struct definitions: unique names, known field types, no struct that
-/// contains itself.
+/// Struct and enum definitions: unique names, known field and payload
+/// types, no type that contains itself.
 pub fn check_structs(p: &Program) -> Result<(), Diag> {
     const RESERVED: &[&str] = &["u64", "bool", "Str", "Buf", "Bytes", "Host", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu"];
-    for (i, d) in p.structs.iter().enumerate() {
-        if RESERVED.contains(&d.name.as_str()) || p.structs[..i].iter().any(|e| e.name == d.name) {
-            return Err(Diag::new("E-TYPE", d.pos, format!("type `{}` is already defined", d.name)));
+    // (name, position, the types it holds directly)
+    let mut defs: Vec<(String, Pos, Vec<Type>)> = Vec::new();
+    for d in &p.structs {
+        defs.push((d.name.clone(), d.pos, d.fields.iter().map(|f| f.1.clone()).collect()));
+    }
+    for e in &p.enums {
+        defs.push((e.name.clone(), e.pos, e.variants.iter().filter_map(|v| v.1.clone()).collect()));
+    }
+    for (i, (name, pos, held)) in defs.iter().enumerate() {
+        if RESERVED.contains(&name.as_str()) || defs[..i].iter().any(|e| &e.0 == name) {
+            return Err(Diag::new("E-TYPE", *pos, format!("type `{}` is already defined", name)));
         }
-        for (_, t) in &d.fields {
-            if let Type::Struct(n) = t {
-                if !p.structs.iter().any(|e| &e.name == n) {
-                    return Err(Diag::new("E-TYPE", d.pos, format!("unknown type `{}`", n)));
+        for t in held {
+            if let Type::Struct(n) | Type::Enum(n) = t {
+                if !defs.iter().any(|e| &e.0 == n) {
+                    return Err(Diag::new("E-TYPE", *pos, format!("unknown type `{}`", n)));
                 }
             }
         }
     }
-    fn reaches(p: &Program, from: &str, target: &str, seen: &mut Vec<String>) -> bool {
-        let d = p.structs.iter().find(|d| d.name == from).unwrap();
-        d.fields.iter().any(|(_, t)| match t {
-            Type::Struct(n) if n == target => true,
-            Type::Struct(n) if !seen.contains(n) => {
+    fn reaches(defs: &[(String, Pos, Vec<Type>)], from: &str, target: &str, seen: &mut Vec<String>) -> bool {
+        let d = defs.iter().find(|d| d.0 == from).unwrap();
+        d.2.iter().any(|t| match t {
+            Type::Struct(n) | Type::Enum(n) if n == target => true,
+            Type::Struct(n) | Type::Enum(n) if !seen.contains(n) => {
                 seen.push(n.clone());
-                reaches(p, n, target, seen)
+                reaches(defs, n, target, seen)
             }
             _ => false,
         })
     }
-    for d in &p.structs {
-        if reaches(p, &d.name, &d.name, &mut Vec::new()) {
-            return Err(Diag::new("E-TYPE", d.pos, format!("struct `{}` contains itself", d.name))
-                .note("a struct cannot hold itself by value; recursive data needs an owning pointer, which Bastio does not have yet"));
+    for (name, pos, _) in &defs {
+        if reaches(&defs, name, name, &mut Vec::new()) {
+            return Err(Diag::new("E-TYPE", *pos, format!("type `{}` contains itself", name))
+                .note("a value cannot hold itself; recursive data needs an owning pointer, which Bastio does not have yet"));
         }
     }
     Ok(())
@@ -194,6 +202,7 @@ pub fn check_structs(p: &Program) -> Result<(), Diag> {
 fn known_type(t: &Type, pos: Pos) -> Result<(), Diag> {
     match t {
         Type::Struct(n) if struct_def(n).is_none() => Err(Diag::new("E-TYPE", pos, format!("unknown type `{}`", n))),
+        Type::Enum(n) if enum_def(n).is_none() => Err(Diag::new("E-TYPE", pos, format!("unknown type `{}`", n))),
         Type::Ref(i) | Type::MutRef(i) => {
             known_type(i, pos)?;
             if !i.is_linear() {
@@ -268,7 +277,6 @@ struct Ctx<'a> {
     /// Linear variables that have been consumed (or, for `&mut` parameters,
     /// moved out of and not yet put back).
     moved: HashSet<String>,
-    all_names: HashSet<String>,
 }
 
 pub fn check_program(p: &mut Program, target: Target) -> Result<HashMap<String, Sig>, Diag> {
@@ -284,7 +292,7 @@ pub fn check_program(p: &mut Program, target: Target) -> Result<HashMap<String, 
 }
 
 fn new_ctx<'a>(sigs: &'a HashMap<String, Sig>, specs: &'a [SpecFn], target: Target, ret: Type) -> Ctx<'a> {
-    Ctx { sigs, specs, target, ret, scopes: vec![Vec::new()], vars: HashMap::new(), moved: HashSet::new(), all_names: HashSet::new() }
+    Ctx { sigs, specs, target, ret, scopes: vec![Vec::new()], vars: HashMap::new(), moved: HashSet::new() }
 }
 
 /// A spec fn may only call spec fns defined before it, so expansion terminates.
@@ -346,10 +354,11 @@ impl<'a> Ctx<'a> {
         if name == "result" || name == "old" {
             return Err(Diag::new("E-TYPE", pos, format!("`{}` is reserved for specifications", name)));
         }
-        if self.all_names.contains(name) || self.sigs.contains_key(name) || is_ghost(name) || self.specs.iter().any(|s| s.name == name) {
+        // A name may be reused once its earlier binding's scope has ended
+        // (two arms binding `v`), but never shadow one still in scope.
+        if self.vars.contains_key(name) || self.sigs.contains_key(name) || is_ghost(name) || self.specs.iter().any(|s| s.name == name) {
             return Err(Diag::new("E-TYPE", pos, format!("`{}` is already defined (shadowing is not allowed)", name)));
         }
-        self.all_names.insert(name.to_string());
         self.vars.insert(name.to_string(), VarInfo { ty, mutable });
         self.scopes.last_mut().unwrap().push(name.to_string());
         Ok(())
@@ -635,6 +644,7 @@ impl<'a> Ctx<'a> {
                 expect_ty(&t, &Type::Bool, e.pos, "an `assert`")?;
                 Ok(false)
             }
+            StmtKind::Match { scrut, arms } => self.match_stmt(scrut, arms, pos),
             StmtKind::Expr(e) => {
                 let t = self.expr(e)?;
                 if t.is_linear() {
@@ -643,6 +653,120 @@ impl<'a> Ctx<'a> {
                 Ok(false)
             }
         }
+    }
+
+    /// `match`: every variant handled once (E-MATCH), each payload either
+    /// bound or, when it is linear, accounted for; the arms must leave
+    /// ownership the same way, as the arms of an `if` must.
+    fn match_stmt(&mut self, scrut: &Expr, arms: &mut [Arm], pos: Pos) -> Result<bool, Diag> {
+        // A place of a borrowed enum is only inspected; anything else is
+        // moved (or copied, when the enum is not linear).
+        let borrowed = match place(scrut) {
+            Some(p) => matches!(self.path_type(&p, scrut.pos)?.1.ty, Type::Ref(_)),
+            None => false,
+        };
+        let t = if borrowed {
+            let p = place(scrut).unwrap();
+            if let Some(m) = self.prefix_moved(&p) {
+                return Err(Diag::new("E-LINEAR-USE", scrut.pos, format!("`{}` is used after `{}` was consumed", p, m)));
+            }
+            self.path_type(&p, scrut.pos)?.0
+        } else {
+            self.expr(scrut)?
+        };
+        let Type::Enum(en) = &t else {
+            return Err(Diag::new("E-TYPE", scrut.pos, format!("`match` needs an enum, found {}", t.name())));
+        };
+        let d = enum_def(en).unwrap();
+        let owned_linear = !borrowed && t.is_linear();
+        let mut covered: Vec<usize> = Vec::new();
+        let mut wild = false;
+        for a in arms.iter() {
+            if wild {
+                return Err(Diag::new("E-MATCH", a.pos, "this arm can never run: `_` above already matches everything left"));
+            }
+            match &a.pat {
+                Pat::Wild => {
+                    for (k, (v, pt)) in d.variants.iter().enumerate() {
+                        if !covered.contains(&k) && owned_linear && pt.as_ref().map_or(false, |t| t.is_linear()) {
+                            return Err(Diag::new("E-LINEAR-LEAK", a.pos, format!("`_` would drop the linear payload of `{}::{}`", en, v))
+                                .note("match that variant by name and consume its payload"));
+                        }
+                    }
+                    wild = true;
+                }
+                Pat::Variant(pe, v, b, _) => {
+                    if pe != en {
+                        return Err(Diag::new("E-TYPE", a.pos, format!("this pattern is a `{}`, but the value matched is a `{}`", pe, en)));
+                    }
+                    let k = d.index(v).ok_or_else(|| Diag::new("E-TYPE", a.pos, format!("`{}` has no variant `{}`", en, v)))?;
+                    if covered.contains(&k) {
+                        return Err(Diag::new("E-MATCH", a.pos, format!("`{}::{}` is matched twice", en, v)));
+                    }
+                    covered.push(k);
+                    match (&d.variants[k].1, b) {
+                        (None, Some(_)) => return Err(Diag::new("E-TYPE", a.pos, format!("`{}::{}` has no payload", en, v))),
+                        (Some(_), None) => return Err(Diag::new("E-TYPE", a.pos, format!("`{}::{}` has a payload: write `{}::{}(x)` or `{}::{}(_)`", en, v, en, v, en, v))),
+                        (Some(pt), Some(b)) if pt.is_linear() && b == "_" && owned_linear => {
+                            return Err(Diag::new("E-LINEAR-LEAK", a.pos, format!("`_` would drop the linear payload of `{}::{}`", en, v)));
+                        }
+                        (Some(pt), Some(b)) if pt.is_linear() && b != "_" && borrowed => {
+                            return Err(Diag::new("E-LINEAR-USE", a.pos, format!("cannot move the payload out of the shared borrow `{}`", place(scrut).unwrap()))
+                                .note("write `(_)` to only test which variant it is"));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if !wild && covered.len() < d.variants.len() {
+            let missing: Vec<String> = d.variants.iter().enumerate().filter(|(k, _)| !covered.contains(k)).map(|(_, v)| format!("{}::{}", en, v.0)).collect();
+            return Err(Diag::new("E-MATCH", pos, format!("this `match` does not handle `{}`", missing.join("`, `"))));
+        }
+        // The arms, each from the same ownership state.
+        let before = self.moved.clone();
+        let mut outs: Vec<HashSet<String>> = Vec::new();
+        for a in arms.iter_mut() {
+            self.moved = before.clone();
+            self.scopes.push(Vec::new());
+            if let Pat::Variant(_, v, Some(b), m) = &a.pat {
+                if b != "_" {
+                    let pt = d.variants[d.index(v).unwrap()].1.clone().unwrap();
+                    self.declare(b, pt, *m, a.pos)?;
+                }
+            }
+            let diverges = self.block(&mut a.body)?;
+            let scope = self.scopes.pop().unwrap();
+            if !diverges {
+                for n in &scope {
+                    if self.vars[n].ty.is_linear() && !self.consumed(n, &self.vars[n].ty) {
+                        return Err(Diag::new("E-LINEAR-LEAK", a.pos, format!("`{}` goes out of scope while still owned", n))
+                            .note("the payload bound by a pattern is owned by the arm: consume it"));
+                    }
+                }
+            }
+            for n in &scope {
+                self.vars.remove(n);
+                self.unmove(n);
+            }
+            if !diverges {
+                outs.push(self.moved.clone());
+            }
+        }
+        if outs.is_empty() {
+            return Ok(true);
+        }
+        let mut canons = Vec::new();
+        for o in &outs {
+            self.moved = o.clone();
+            canons.push(self.canon());
+        }
+        if let Some(k) = canons.iter().position(|c| *c != canons[0]) {
+            let diff: Vec<_> = canons[0].symmetric_difference(&canons[k]).cloned().collect();
+            return Err(Diag::new("E-LINEAR-BRANCH", pos, format!("`{}` is consumed in only some arms of this `match`", diff.join("`, `"))));
+        }
+        self.moved = outs.into_iter().flatten().collect();
+        Ok(false)
     }
 
     fn var_info(&self, name: &str, pos: Pos) -> Result<VarInfo, Diag> {
@@ -665,6 +789,45 @@ impl<'a> Ctx<'a> {
             ExprKind::Field(..) => {
                 let p = place(e).ok_or_else(|| Diag::new("E-TYPE", e.pos, "a field can only be read from a variable or a field of one"))?;
                 self.use_place(&p, e.pos)
+            }
+            ExprKind::Variant(en, v, payload) => {
+                let d = enum_def(en).ok_or_else(|| Diag::new("E-TYPE", e.pos, format!("unknown enum `{}`", en)))?;
+                let k = d.index(v).ok_or_else(|| Diag::new("E-TYPE", e.pos, format!("`{}` has no variant `{}`", en, v)))?;
+                match (&d.variants[k].1, payload) {
+                    (None, None) => {}
+                    (Some(pt), Some(x)) => {
+                        let t = self.expr(x)?;
+                        expect_ty(&t, pt, x.pos, &format!("the payload of `{}::{}`", en, v))?;
+                    }
+                    (None, Some(_)) => return Err(Diag::new("E-TYPE", e.pos, format!("`{}::{}` has no payload", en, v))),
+                    (Some(pt), None) => return Err(Diag::new("E-TYPE", e.pos, format!("`{}::{}` needs a payload of type {}", en, v, pt.name()))),
+                }
+                Ok(Type::Enum(en.clone()))
+            }
+            ExprKind::Is(x, en, v) => {
+                // Reads the tag only: nothing is consumed.
+                let t = match place(x) {
+                    Some(p) => {
+                        if let Some(m) = self.prefix_moved(&p) {
+                            return Err(Diag::new("E-LINEAR-USE", x.pos, format!("`{}` is used after `{}` was consumed", p, m)));
+                        }
+                        self.path_type(&p, x.pos)?.0
+                    }
+                    None => {
+                        let t = self.expr(x)?;
+                        if t.is_linear() {
+                            return Err(Diag::new("E-LINEAR-LEAK", x.pos, "`is` does not consume its operand, so this linear value would be dropped"));
+                        }
+                        t
+                    }
+                };
+                if t != Type::Enum(en.clone()) {
+                    return Err(Diag::new("E-TYPE", x.pos, format!("`is {}::{}` needs a `{}`, found {}", en, v, en, t.name())));
+                }
+                if enum_def(en).and_then(|d| d.index(v)).is_none() {
+                    return Err(Diag::new("E-TYPE", e.pos, format!("`{}` has no variant `{}`", en, v)));
+                }
+                Ok(Type::Bool)
             }
             ExprKind::StructLit(n, fs) => {
                 let d = struct_def(n).ok_or_else(|| Diag::new("E-TYPE", e.pos, format!("unknown struct `{}`", n)))?;
@@ -781,11 +944,23 @@ impl<'a> Ctx<'a> {
             ExprKind::Bool(_) => Ok(Type::Bool),
             ExprKind::Str(_) | ExprKind::Blob(_) => Ok(Type::Str),
             ExprKind::MutBorrow(_) => Err(Diag::new("E-TYPE", e.pos, "`&mut` has no meaning in a specification")),
-            ExprKind::StructLit(..) => Err(Diag::new("E-TYPE", e.pos, "struct literals are not allowed in a specification")),
+            ExprKind::StructLit(..) | ExprKind::Variant(..) => Err(Diag::new("E-TYPE", e.pos, "struct and enum values cannot be built in a specification")),
+            ExprKind::Is(x, en, v) => {
+                let t = self.spec_expr(x, in_ensures, bound)?;
+                if t != Type::Enum(en.clone()) || enum_def(en).and_then(|d| d.index(v)).is_none() {
+                    return Err(Diag::new("E-TYPE", e.pos, format!("`is {}::{}` needs a `{}`, found {}", en, v, en, t.name())));
+                }
+                Ok(Type::Bool)
+            }
             ExprKind::Field(b, f) => {
                 let t = self.spec_expr(b, in_ensures, bound)?;
                 match &t {
                     Type::Struct(n) => struct_def(n).and_then(|d| d.field(f)).cloned().ok_or_else(|| Diag::new("E-TYPE", e.pos, format!("`{}` has no field `{}`", n, f))),
+                    // In a specification, `o.V` is the payload of variant V
+                    // (meaningful when `o is E::V`).
+                    Type::Enum(n) => enum_def(n)
+                        .and_then(|d| d.index(f).and_then(|k| d.variants[k].1.clone()))
+                        .ok_or_else(|| Diag::new("E-TYPE", e.pos, format!("`{}` has no variant `{}` with a payload", n, f))),
                     _ => Err(Diag::new("E-TYPE", e.pos, format!("{} has no fields", t.name()))),
                 }
             }
