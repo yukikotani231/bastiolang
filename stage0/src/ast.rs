@@ -28,6 +28,9 @@ pub enum Type {
     /// The CPU's user-mode context: the right to enter user mode and the
     /// registers saved by the last trap. Linear; kernel target only.
     Cpu,
+    /// A user-defined struct. Linear when any field is linear; otherwise a
+    /// plain value that is copied.
+    Struct(String),
     /// A read-only borrow of a linear value. Only allowed as a parameter type.
     Ref(Box<Type>),
     /// A mutable borrow of a linear value. Only allowed as a parameter type;
@@ -49,12 +52,17 @@ impl Type {
             Type::Pool => "Pool".into(),
             Type::Mmu => "Mmu".into(),
             Type::Cpu => "Cpu".into(),
+            Type::Struct(n) => n.clone(),
             Type::Ref(t) => format!("&{}", t.name()),
             Type::MutRef(t) => format!("&mut {}", t.name()),
         }
     }
     pub fn is_linear(&self) -> bool {
-        matches!(self, Type::Buf | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu)
+        match self {
+            Type::Buf | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu => true,
+            Type::Struct(n) => struct_def(n).map_or(false, |d| d.fields.iter().any(|f| f.1.is_linear())),
+            _ => false,
+        }
     }
     pub fn is_ref(&self) -> bool {
         matches!(self, Type::Ref(_) | Type::MutRef(_))
@@ -119,8 +127,13 @@ pub enum ExprKind {
     /// `include_bytes("path")`: a file's bytes as a Str. The prover only knows
     /// its length and that every byte is <= 255, not the bytes themselves.
     Blob(Vec<u8>),
-    /// `&mut x`, only as a call argument.
+    /// `&mut x` or `&mut x.f.g`, only as a call argument. Holds the place as
+    /// a dotted path.
     MutBorrow(String),
+    /// `e.f`. In code, `e` must be a place (a variable or a field of one).
+    Field(Box<Expr>, String),
+    /// `Name { f: e, .. }`
+    StructLit(String, Vec<(String, Expr)>),
     Var(String),
     Not(Box<Expr>),
     Bin(BinOp, Box<Expr>, Box<Expr>),
@@ -138,6 +151,7 @@ pub struct Expr {
 #[derive(Debug, Clone)]
 pub enum StmtKind {
     Let { name: String, mutable: bool, ty: Option<Type>, init: Expr },
+    /// `x = e;` or `x.f.g = e;`; `name` is the dotted path.
     Assign { name: String, value: Expr },
     If { cond: Expr, then_b: Vec<Stmt>, else_b: Vec<Stmt> },
     While { cond: Expr, invariants: Vec<Expr>, body: Vec<Stmt> },
@@ -182,10 +196,51 @@ pub struct SpecFn {
     pub pos: Pos,
 }
 
+/// `struct Name { field: Type, .. }`
+#[derive(Debug, Clone)]
+pub struct StructDef {
+    pub name: String,
+    pub fields: Vec<(String, Type)>,
+    pub pos: Pos,
+}
+
+impl StructDef {
+    pub fn field(&self, f: &str) -> Option<&Type> {
+        self.fields.iter().find(|x| x.0 == f).map(|x| &x.1)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Program {
     pub fns: Vec<FnDef>,
     pub specs: Vec<SpecFn>,
+    pub structs: Vec<StructDef>,
+}
+
+/// The program's struct definitions, registered once after parsing so that
+/// `Type::is_linear` and the later passes can look them up.
+static STRUCTS: std::sync::OnceLock<Vec<StructDef>> = std::sync::OnceLock::new();
+
+pub fn register_structs(defs: Vec<StructDef>) {
+    let _ = STRUCTS.set(defs);
+}
+
+pub fn struct_def(name: &str) -> Option<&'static StructDef> {
+    STRUCTS.get()?.iter().find(|d| d.name == name)
+}
+
+/// The dotted path of a place expression (`x`, `x.f`, `x.f.g`).
+pub fn place(e: &Expr) -> Option<String> {
+    match &e.kind {
+        ExprKind::Var(n) => Some(n.clone()),
+        ExprKind::Field(b, f) => place(b).map(|p| format!("{}.{}", p, f)),
+        _ => None,
+    }
+}
+
+/// The variable a dotted path starts from.
+pub fn path_root(path: &str) -> &str {
+    path.split('.').next().unwrap()
 }
 
 /// Source-like rendering of an expression, used in diagnostics.
@@ -198,6 +253,10 @@ pub fn render(e: &Expr) -> String {
             ExprKind::Blob(b) => format!("include_bytes(<{} bytes>)", b.len()),
             ExprKind::MutBorrow(n) => format!("&mut {}", n),
             ExprKind::Var(n) => n.clone(),
+            ExprKind::Field(b, f) => format!("{}.{}", go(b, false), f),
+            ExprKind::StructLit(n, fs) => {
+                format!("{} {{ {} }}", n, fs.iter().map(|(f, x)| format!("{}: {}", f, go(x, true))).collect::<Vec<_>>().join(", "))
+            }
             ExprKind::Not(x) => format!("!{}", go(x, false)),
             ExprKind::Bin(op, a, b) => {
                 let s = format!("{} {} {}", go(a, false), op.text(), go(b, false));

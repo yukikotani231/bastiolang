@@ -1,18 +1,22 @@
 // Recursive-descent parser.
 //
 // Grammar:
-//   program  := (fn | specfn | const)*
+//   program  := (fn | specfn | const | struct)*
+//   struct   := 'struct' IDENT '{' (IDENT ':' type (',' IDENT ':' type)* ','?)? '}'
 //   fn       := 'fn' IDENT '(' (param (',' param)*)? ')' ('->' type)?
 //               ('requires' expr | 'ensures' expr)* block
 //   specfn   := 'spec' 'fn' IDENT '(' params ')' '->' type '{' expr '}'
 //   const    := 'const' IDENT ':' 'u64' '=' expr ';'   (constant-folded; define before use)
 //   param    := 'mut'? IDENT ':' type
-//   type     := 'u64' | 'bool' | 'Str' | linear | '&' linear | '&' 'mut' linear
+//   type     := 'u64' | 'bool' | 'Str' | linear | IDENT (a struct) | '&' linear | '&' 'mut' linear
 //   linear   := 'Buf' | 'Serial' | 'Frame' | 'PageTable' | 'Pool' | 'Mmu' | 'Cpu'
-//   primary  := ... | '&' 'mut' IDENT | 'include_bytes' '(' STRING ')' | 'old' '(' expr ')' 
+//   place    := IDENT ('.' IDENT)*
+//   primary  := ... | '&' 'mut' place | 'include_bytes' '(' STRING ')' | 'old' '(' expr ')'
+//             | IDENT '{' (IDENT ':' expr (',' IDENT ':' expr)* ','?)? '}'   (a struct literal)
+//   postfix  := primary ('.' IDENT)*
 //   block    := '{' stmt* '}'
 //   stmt     := 'let' 'mut'? IDENT (':' type)? '=' expr ';'
-//             | IDENT '=' expr ';'
+//             | place '=' expr ';'
 //             | 'if' expr block ('else' (block | if-stmt))?
 //             | 'while' expr ('invariant' expr)* block
 //             | 'return' expr? ';'
@@ -90,14 +94,52 @@ impl Parser {
     pub fn program(&mut self) -> PResult<Program> {
         let mut fns = Vec::new();
         let mut specs = Vec::new();
+        let mut structs = Vec::new();
         while *self.peek() != Tok::Eof {
             match self.peek() {
                 Tok::Spec => specs.push(self.spec_def()?),
+                Tok::Struct => structs.push(self.struct_def()?),
                 Tok::Const => self.const_def()?,
                 _ => fns.push(self.fn_def()?),
             }
         }
-        Ok(Program { fns, specs })
+        Ok(Program { fns, specs, structs })
+    }
+
+    fn struct_def(&mut self) -> PResult<StructDef> {
+        let pos = self.expect(Tok::Struct, "`struct`")?.pos;
+        let (name, _) = self.ident()?;
+        self.expect(Tok::LBrace, "`{`")?;
+        let mut fields = Vec::new();
+        while *self.peek() != Tok::RBrace {
+            let (f, fpos) = self.ident()?;
+            self.expect(Tok::Colon, "`:`")?;
+            let ty = self.ty()?;
+            if ty.is_ref() {
+                return Err(Diag::new("E-PARSE", fpos, "a struct field cannot hold a borrow"));
+            }
+            if fields.iter().any(|(g, _): &(String, Type)| *g == f) {
+                return Err(Diag::new("E-PARSE", fpos, format!("field `{}` is declared twice", f)));
+            }
+            fields.push((f, ty));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::RBrace, "`}`")?;
+        if fields.is_empty() {
+            return Err(Diag::new("E-PARSE", pos, format!("struct `{}` has no fields", name)));
+        }
+        Ok(StructDef { name, fields, pos })
+    }
+
+    /// A dotted place after its first identifier has been read.
+    fn place_rest(&mut self, mut path: String) -> PResult<String> {
+        while self.eat(&Tok::Dot) {
+            let (f, _) = self.ident()?;
+            path = format!("{}.{}", path, f);
+        }
+        Ok(path)
     }
 
     fn const_def(&mut self) -> PResult<()> {
@@ -136,7 +178,9 @@ impl Parser {
         if self.eat(&Tok::Amp) {
             let m = self.eat(&Tok::Mut);
             let inner = self.ty()?;
-            if !inner.is_linear() {
+            // Whether a struct is linear is known only once every struct is
+            // parsed; the checker tests borrows of structs.
+            if !inner.is_linear() && !matches!(inner, Type::Struct(_)) {
                 return Err(Diag::new("E-PARSE", pos, format!("only linear values can be borrowed, found `&{}`", inner.name())));
             }
             return Ok(if m { Type::MutRef(Box::new(inner)) } else { Type::Ref(Box::new(inner)) });
@@ -153,7 +197,7 @@ impl Parser {
             "Pool" => Ok(Type::Pool),
             "Mmu" => Ok(Type::Mmu),
             "Cpu" => Ok(Type::Cpu),
-            _ => Err(Diag::new("E-PARSE", pos, format!("unknown type `{}`", n))),
+            _ => Ok(Type::Struct(n)),
         }
     }
 
@@ -246,9 +290,10 @@ impl Parser {
                 self.expect(Tok::Semi, "`;`")?;
                 Ok(Stmt { kind: StmtKind::Assert(e), pos })
             }
-            Tok::Ident(name) if self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::Eq) => {
+            Tok::Ident(name) if self.is_assignment() => {
                 self.bump();
-                self.bump();
+                let name = self.place_rest(name)?;
+                self.expect(Tok::Eq, "`=`")?;
                 let value = self.expr()?;
                 self.expect(Tok::Semi, "`;`")?;
                 Ok(Stmt { kind: StmtKind::Assign { name, value }, pos })
@@ -259,6 +304,26 @@ impl Parser {
                 Ok(Stmt { kind: StmtKind::Expr(e), pos })
             }
         }
+    }
+
+    /// Is the statement here `place = ...`?
+    fn is_assignment(&self) -> bool {
+        let mut j = self.i + 1;
+        loop {
+            match self.toks.get(j).map(|t| &t.tok) {
+                Some(Tok::Eq) => return true,
+                Some(Tok::Dot) if matches!(self.toks.get(j + 1).map(|t| &t.tok), Some(Tok::Ident(_))) => j += 2,
+                _ => return false,
+            }
+        }
+    }
+
+    /// Is `IDENT {` here the start of a struct literal (not a block after a
+    /// condition)? A literal's braces open with `field:`, which no statement
+    /// does. (Structs have at least one field, so `Name {}` is never a literal.)
+    fn is_struct_lit(&self) -> bool {
+        let t = |k: usize| self.toks.get(self.i + k).map(|t| &t.tok);
+        t(1) == Some(&Tok::LBrace) && matches!(t(2), Some(Tok::Ident(_))) && t(3) == Some(&Tok::Colon)
     }
 
     fn if_stmt(&mut self) -> PResult<Stmt> {
@@ -362,7 +427,13 @@ impl Parser {
             let e = self.unary()?;
             return Ok(Expr { kind: ExprKind::Not(Box::new(e)), pos });
         }
-        self.primary()
+        let mut e = self.primary()?;
+        while *self.peek() == Tok::Dot {
+            let pos = self.bump().pos;
+            let (f, _) = self.ident()?;
+            e = Expr { kind: ExprKind::Field(Box::new(e), f), pos };
+        }
+        Ok(e)
     }
 
     fn primary(&mut self) -> PResult<Expr> {
@@ -406,7 +477,8 @@ impl Parser {
                 self.bump();
                 self.expect(Tok::Mut, "`mut` (a shared borrow `&x` is written as just `x`)")?;
                 let (n, _) = self.ident()?;
-                Ok(Expr { kind: ExprKind::MutBorrow(n), pos })
+                let path = self.place_rest(n)?;
+                Ok(Expr { kind: ExprKind::MutBorrow(path), pos })
             }
             Tok::Ident(name) if name == "include_bytes" => {
                 self.bump();
@@ -419,6 +491,25 @@ impl Parser {
                 let full = self.dir.join(&path);
                 let bytes = std::fs::read(&full).map_err(|e| Diag::new("E-PARSE", pos, format!("include_bytes: cannot read {}: {}", full.display(), e)))?;
                 Ok(Expr { kind: ExprKind::Blob(bytes), pos })
+            }
+            Tok::Ident(name) if self.is_struct_lit() => {
+                self.bump();
+                self.bump();
+                let mut fields: Vec<(String, Expr)> = Vec::new();
+                while *self.peek() != Tok::RBrace {
+                    let (f, fpos) = self.ident()?;
+                    self.expect(Tok::Colon, "`:`")?;
+                    let v = self.expr()?;
+                    if fields.iter().any(|(g, _)| *g == f) {
+                        return Err(Diag::new("E-PARSE", fpos, format!("field `{}` is given twice", f)));
+                    }
+                    fields.push((f, v));
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+                self.expect(Tok::RBrace, "`}`")?;
+                Ok(Expr { kind: ExprKind::StructLit(name, fields), pos })
             }
             Tok::Ident(name) if self.consts.contains_key(&name) && self.toks.get(self.i + 1).map(|t| &t.tok) != Some(&Tok::LParen) => {
                 self.bump();

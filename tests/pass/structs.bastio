@@ -1,0 +1,87 @@
+// expect-exit: 42
+// Structs: plain value structs are copied; a struct with a linear field is
+// linear itself. Fields are moved out and put back one at a time, borrowed
+// on their own, returned together, and reasoned about in specifications.
+
+struct Point { x: u64, y: u64 }
+
+// A counter with its storage: linear because `items` is.
+struct Stack { items: Buf, n: u64 }
+
+// Nested: a struct holding another linear struct.
+struct Pair { a: Stack, b: Stack, tag: u64 }
+
+spec fn ok(s: &Stack) -> bool { s.n <= len(s.items) }
+
+fn add(p: Point, q: Point) -> Point
+  requires p.x < 1000 && p.y < 1000 && q.x < 1000 && q.y < 1000
+  ensures result.x == p.x + q.x && result.y == p.y + q.y
+{
+  return Point { x: p.x + q.x, y: p.y + q.y };
+}
+
+fn stack_new(cap: u64) -> Stack
+  requires cap <= 1024
+  ensures ok(result) && result.n == 0 && len(result.items) == cap
+{
+  return Stack { items: alloc(cap), n: 0 };
+}
+
+// `&mut` to a whole struct: the field update stays in place.
+fn push(s: &mut Stack, v: u64)
+  requires ok(s) && s.n < len(s.items)
+  ensures ok(s) && s.n == old(s).n + 1 && len(s.items) == len(old(s).items)
+{
+  s.items = set(s.items, s.n, v);
+  s.n = s.n + 1;
+}
+
+// A field borrowed on its own.
+fn sum(b: &Buf, n: u64) -> u64
+  requires n <= len(b) && n <= 1024
+  ensures result <= n * 100
+{
+  let mut t = 0;
+  let mut i = 0;
+  while i < n
+    invariant i <= n && t <= i * 100
+  {
+    t = t + get(b, i) % 100;
+    i = i + 1;
+  }
+  return t;
+}
+
+// Consuming a struct field by field.
+fn stack_free(s: Stack) {
+  free(s.items);
+}
+
+// Two results at once, which a function without structs could not return.
+fn split(p: Pair) -> Stack
+  ensures result.n == p.b.n
+{
+  stack_free(p.a);
+  return p.b;
+}
+
+fn main() -> u64 {
+  let p = add(Point { x: 1, y: 2 }, Point { x: 3, y: 4 });
+  let q = p;          // copied: Point has no linear field
+  let mut s = stack_new(8);
+  push(&mut s, 10);
+  push(&mut s, 20);
+  // Move a field out, work on it, put it back.
+  let mut it = s.items;
+  it = set(it, 2, 5);
+  s.items = it;
+  s.n = 3;
+  let t = sum(s.items, s.n);   // 35, and the prover knows t <= 300
+  let mut pair = Pair { a: s, b: stack_new(4), tag: 7 };
+  push(&mut pair.b, 1);
+  let rest = split(pair);
+  let r = rest.n;
+  stack_free(rest);
+  // 35 + 1 + 4 + 6 - 4 = 42
+  return t + r + p.x + q.y - 4;
+}

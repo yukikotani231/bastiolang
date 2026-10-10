@@ -1,0 +1,38 @@
+// expect-exit: 45
+// Loops over struct fields: a field updated only with `set` keeps its
+// length across the loop (no invariant needed), other fields are known
+// only through the invariants, and a struct can carry a capability
+// (here the page pool) moved out of a `&mut` parameter and put back.
+
+struct Acc { data: Buf, total: u64, pool: Pool }
+
+fn fill(a: &mut Acc)
+  requires len(a.data) == 10
+  ensures len(a.data) == 10 && a.total <= 90
+{
+  a.total = 0;
+  let mut i = 0;
+  while i < 10
+    invariant i <= 10 && a.total <= i * 9
+  {
+    a.data = set(a.data, i, i);
+    a.total = a.total + i % 10;
+    i = i + 1;
+  }
+}
+
+fn main(pool: &mut Pool) -> u64 {
+  let mut a = Acc { data: alloc(10), total: 0, pool: pool };
+  // Take a page through the struct's pool and give it back. The prover
+  // still knows the pool is full: moving it into the struct kept its state.
+  // (After `fill(&mut a)` it would not: `fill` promises nothing about it.)
+  if pool_size(a.pool) > 0 {
+    let f = pool_take(&mut a.pool, 0);
+    pool_give(&mut a.pool, f);
+  }
+  fill(&mut a);
+  pool = a.pool;
+  let t = a.total;
+  free(a.data);
+  return t;
+}
