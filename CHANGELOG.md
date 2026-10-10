@@ -30,6 +30,8 @@ What will be 0.2.0.
   from 2 GiB (#67) up to 2^46 (#77).
 - `boot_acpi`, a byte of one of the firmware's ACPI tables, so a kernel
   parses them (and the AML it needs) in Bastio, proved in bounds.
+- `boot_info`, the platform's answers about the machine (BastiOS: the boot
+  command line, the memory map, CPUID), unchecked input to the program.
 - `old(x)` in loop invariants (#73).
 - Generic `spec fn`s, and `vcount` for counting in specifications; local
   variables may share a function's name (#74).

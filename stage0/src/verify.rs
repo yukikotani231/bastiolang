@@ -2367,6 +2367,9 @@ impl<'p> Verifier<'p> {
                 st.pc.push(format!("(<= {} 256)", x.term()));
                 Ok(x)
             }
+            // The platform promises nothing about the number: the program
+            // checks it like any other input.
+            "boot_info" => self.fresh_u64("info"),
             "cpu_count" => {
                 let n = self.fresh_u64("cpus")?;
                 // The platform's promise: at least this processor, and no
