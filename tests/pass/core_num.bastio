@@ -1,0 +1,97 @@
+// expect-exit: 0
+// core/num.bastio: parsing and formatting integers, and round trips between
+// them. Returns the number of the first failing check, or 0.
+import "../../core/num.bastio";
+
+fn pu(s: Str) -> Option[u64] {
+  let b = bfrom(s);
+  let r = parse_u64(b, 0, blen(b));
+  bfree(b);
+  return r;
+}
+
+fn pi(s: Str) -> Option[i64] {
+  let b = bfrom(s);
+  let r = parse_i64(b, 0, blen(b));
+  bfree(b);
+  return r;
+}
+
+fn is_u(o: Option[u64], v: u64) -> bool {
+  match o {
+    Option::Some(x) => { return x == v; },
+    Option::None => { return false; },
+  }
+}
+
+fn is_i(o: Option[i64], v: i64) -> bool {
+  match o {
+    Option::Some(x) => { return x == v; },
+    Option::None => { return false; },
+  }
+}
+
+/// `fmt_u64(x)` reads back as `x`.
+fn round_u(x: u64) -> bool {
+  let mut t = text_new();
+  fmt_u64(&mut t, x);
+  let b = text_finish(t);
+  let ok = is_u(parse_u64(b, 0, blen(b)), x);
+  bfree(b);
+  return ok;
+}
+
+fn round_i(x: i64) -> bool {
+  let mut t = text_new();
+  fmt_i64(&mut t, x);
+  let b = text_finish(t);
+  let ok = is_i(parse_i64(b, 0, blen(b)), x);
+  bfree(b);
+  return ok;
+}
+
+fn fmt_is(x: u64, hex: bool, s: Str) -> bool {
+  let mut t = text_new();
+  if hex {
+    fmt_hex_u64(&mut t, x, 4);
+  } else {
+    fmt_u64_pad(&mut t, x, 5);
+  }
+  let b = text_finish(t);
+  let ok = bytes_eq_str(b, s);
+  bfree(b);
+  return ok;
+}
+
+fn main() -> u64 {
+  let one: i64 = 1;
+  let min: i64 = -9223372036854775807 - one;
+  if !is_u(pu("0"), 0) || !is_u(pu("007"), 7) || !is_u(pu("18446744073709551615"), 18446744073709551615) { return 1; }
+  if !(pu("18446744073709551616") is Option::None) || !(pu("") is Option::None) || !(pu("1x") is Option::None) { return 2; }
+  if !is_i(pi("-9223372036854775808"), min) || !is_i(pi("9223372036854775807"), 9223372036854775807) { return 3; }
+  if !(pi("9223372036854775808") is Option::None) || !(pi("-") is Option::None) || !is_i(pi("-0"), 0) { return 4; }
+  let b = bfrom("300 255 -129 -128 ff");
+  let mut bad = 0;
+  if !(parse_u8(b, 0, 3) is Option::None) || !(parse_u8(b, 4, 7) is Option::Some) { bad = 5; }
+  if !(parse_i8(b, 8, 12) is Option::None) || !(parse_i8(b, 13, 17) is Option::Some) { bad = 6; }
+  if !(parse_u16(b, 0, 3) is Option::Some) || !(parse_u32(b, 0, 3) is Option::Some) { bad = 7; }
+  if !(parse_i16(b, 8, 12) is Option::Some) || !(parse_i32(b, 8, 12) is Option::Some) { bad = 8; }
+  if !is_u(parse_hex_u64(b, 18, 20), 255) || !(parse_hex_u64(b, 18, 18) is Option::None) { bad = 9; }
+  bfree(b);
+  if bad != 0 { return bad; }
+  let mut x: u64 = 1;
+  let mut k = 0;
+  while k < 64 invariant k <= 64 && x >= 1 {
+    if !round_u(x - 1) || !round_u(x) { return 10; }
+    if x <= 9223372036854775807 {
+      x = x * 2;
+    }
+    k = k + 1;
+  }
+  if !round_u(18446744073709551615) || !round_u(10000000000000000000) { return 11; }
+  if !round_i(0) || !round_i(-1) || !round_i(min) || !round_i(9223372036854775807) { return 12; }
+  if !fmt_is(42, false, "   42") || !fmt_is(123456, false, "123456") { return 13; }
+  if !fmt_is(255, true, "00ff") || !fmt_is(0xdeadbeef1, true, "deadbeef1") { return 14; }
+  if dec_digits(0) != 1 || dec_digits(18446744073709551615) != 20 || dec_digits(1000) != 4 { return 15; }
+  return 0;
+}

@@ -22,6 +22,7 @@ PAGES = {
     "docs/language.md": "language.md",
     "docs/integers.md": "integers.md",
     "docs/concurrency.md": "concurrency.md",
+    "docs/core.md": "core.md",
     "examples/base64/README.md": "examples-base64.md",
     "examples/utf8/README.md": "examples-utf8.md",
     "examples/der/README.md": "examples-der.md",

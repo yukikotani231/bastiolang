@@ -1,0 +1,315 @@
+// core/num.bastio: parsing integers from bytes and formatting them as text.
+//
+// Parsing reads a span `from..to` of a byte string, so a caller that has
+// split a line need not copy the pieces. Every parser rejects an empty span,
+// a byte that is not a digit, and a value that does not fit its type.
+import "text.bastio";
+
+spec fn is_digit_spec(c: u8) -> bool {
+  48 <= c && c <= 57
+}
+
+/// Bytes `from..to` of `b` are all decimal digits.
+spec fn all_digits(b: &Bytes, from: u64, to: u64) -> bool {
+  forall k: u64 :: from <= k && k < to ==> is_digit_spec(bget(b, k))
+}
+
+/// An ASCII decimal digit, `0` to `9`.
+fn is_digit(c: u8) -> bool
+  ensures result == is_digit_spec(c)
+{
+  return 48 <= c && c <= 57;
+}
+
+/// The value of a hexadecimal digit (`0-9`, `a-f`, `A-F`), or 16 for any
+/// other byte.
+fn hex_value(c: u8) -> u64
+  ensures result <= 16
+  ensures is_digit_spec(c) ==> result == c - 48
+{
+  if 48 <= c && c <= 57 {
+    return cast[u64](c) - 48;
+  }
+  if 97 <= c && c <= 102 {
+    return cast[u64](c) - 87;
+  }
+  if 65 <= c && c <= 70 {
+    return cast[u64](c) - 55;
+  }
+  return 16;
+}
+
+/// Bytes `from..to` of `b` as a decimal `u64`: only digits, at least one,
+/// and the value below 2^64. Leading zeros are allowed.
+fn parse_u64(b: &Bytes, from: u64, to: u64) -> Option[u64]
+  requires from <= to && to <= blen(b)
+  ensures result is Option::Some ==> from < to && all_digits(b, from, to)
+{
+  if from == to {
+    return Option[u64]::None;
+  }
+  let mut v = 0;
+  let mut i = from;
+  while i < to
+    invariant from <= i && i <= to && all_digits(b, from, i)
+  {
+    let c = bget(b, i);
+    if !is_digit(c) {
+      return Option[u64]::None;
+    }
+    let d = cast[u64](c) - 48;
+    if v > (18446744073709551615 - d) / 10 {
+      return Option[u64]::None;
+    }
+    v = v * 10 + d;
+    i = i + 1;
+  }
+  return Option[u64]::Some(v);
+}
+
+/// Bytes `from..to` of `b` as a hexadecimal `u64` (digits `0-9`, `a-f`,
+/// `A-F`, no `0x` prefix): at least one digit, the value below 2^64.
+fn parse_hex_u64(b: &Bytes, from: u64, to: u64) -> Option[u64]
+  requires from <= to && to <= blen(b)
+  ensures result is Option::Some ==> from < to
+{
+  if from == to {
+    return Option[u64]::None;
+  }
+  let mut v = 0;
+  let mut i = from;
+  while i < to
+    invariant from <= i && i <= to
+  {
+    let d = hex_value(bget(b, i));
+    if d == 16 || v > (18446744073709551615 - d) / 16 {
+      return Option[u64]::None;
+    }
+    v = v * 16 + d;
+    i = i + 1;
+  }
+  return Option[u64]::Some(v);
+}
+
+/// Bytes `from..to` of `b` as a decimal `i64`: an optional `-`, then digits.
+fn parse_i64(b: &Bytes, from: u64, to: u64) -> Option[i64]
+  requires from <= to && to <= blen(b)
+  ensures result is Option::Some ==> from < to
+{
+  let mut s = from;
+  let mut neg = false;
+  if s < to && bget(b, s) == 45 {
+    neg = true;
+    s = s + 1;
+  }
+  match parse_u64(b, s, to) {
+    Option::Some(m) => {
+      if neg && m <= 9223372036854775808 {
+        if m == 0 {
+          return Option[i64]::Some(0);
+        }
+        return Option[i64]::Some(-cast[i64](m - 1) - 1);
+      }
+      if !neg && m <= 9223372036854775807 {
+        return Option[i64]::Some(cast[i64](m));
+      }
+      return Option[i64]::None;
+    },
+    Option::None => { return Option[i64]::None; },
+  }
+}
+
+/// `parse_u64`, and the value fits in a `u32`.
+fn parse_u32(b: &Bytes, from: u64, to: u64) -> Option[u32]
+  requires from <= to && to <= blen(b)
+  ensures result is Option::Some ==> from < to && all_digits(b, from, to)
+{
+  match parse_u64(b, from, to) {
+    Option::Some(v) => {
+      if v <= 4294967295 { return Option[u32]::Some(cast[u32](v)); }
+      return Option[u32]::None;
+    },
+    Option::None => { return Option[u32]::None; },
+  }
+}
+
+/// `parse_u64`, and the value fits in a `u16`.
+fn parse_u16(b: &Bytes, from: u64, to: u64) -> Option[u16]
+  requires from <= to && to <= blen(b)
+  ensures result is Option::Some ==> from < to && all_digits(b, from, to)
+{
+  match parse_u64(b, from, to) {
+    Option::Some(v) => {
+      if v <= 65535 { return Option[u16]::Some(cast[u16](v)); }
+      return Option[u16]::None;
+    },
+    Option::None => { return Option[u16]::None; },
+  }
+}
+
+/// `parse_u64`, and the value fits in a `u8`.
+fn parse_u8(b: &Bytes, from: u64, to: u64) -> Option[u8]
+  requires from <= to && to <= blen(b)
+  ensures result is Option::Some ==> from < to && all_digits(b, from, to)
+{
+  match parse_u64(b, from, to) {
+    Option::Some(v) => {
+      if v <= 255 { return Option[u8]::Some(cast[u8](v)); }
+      return Option[u8]::None;
+    },
+    Option::None => { return Option[u8]::None; },
+  }
+}
+
+/// `parse_i64`, and the value fits in an `i32`.
+fn parse_i32(b: &Bytes, from: u64, to: u64) -> Option[i32]
+  requires from <= to && to <= blen(b)
+  ensures result is Option::Some ==> from < to
+{
+  match parse_i64(b, from, to) {
+    Option::Some(v) => {
+      if -2147483648 <= v && v <= 2147483647 { return Option[i32]::Some(cast[i32](v)); }
+      return Option[i32]::None;
+    },
+    Option::None => { return Option[i32]::None; },
+  }
+}
+
+/// `parse_i64`, and the value fits in an `i16`.
+fn parse_i16(b: &Bytes, from: u64, to: u64) -> Option[i16]
+  requires from <= to && to <= blen(b)
+  ensures result is Option::Some ==> from < to
+{
+  match parse_i64(b, from, to) {
+    Option::Some(v) => {
+      if -32768 <= v && v <= 32767 { return Option[i16]::Some(cast[i16](v)); }
+      return Option[i16]::None;
+    },
+    Option::None => { return Option[i16]::None; },
+  }
+}
+
+/// `parse_i64`, and the value fits in an `i8`.
+fn parse_i8(b: &Bytes, from: u64, to: u64) -> Option[i8]
+  requires from <= to && to <= blen(b)
+  ensures result is Option::Some ==> from < to
+{
+  match parse_i64(b, from, to) {
+    Option::Some(v) => {
+      if -128 <= v && v <= 127 { return Option[i8]::Some(cast[i8](v)); }
+      return Option[i8]::None;
+    },
+    Option::None => { return Option[i8]::None; },
+  }
+}
+
+/// The new bytes `t[from..]` are all decimal digits.
+spec fn text_digits_from(t: &Vec[u8], from: u64) -> bool {
+  forall k: u64 :: from <= k && k < vlen(t) ==> is_digit_spec(vget(t, k))
+}
+
+/// The number of decimal digits of `x`: 1 for 0 to 9, up to 20.
+fn dec_digits(x: u64) -> u64
+  ensures 1 <= result && result <= 20
+{
+  let mut n = 1;
+  let mut y = x;
+  while y >= 10 && n < 20
+    invariant 1 <= n && n <= 20
+  {
+    y = y / 10;
+    n = n + 1;
+  }
+  return n;
+}
+
+/// Appends `x` in decimal, with no leading zeros: between 1 and 20 digits.
+fn fmt_u64(t: &mut Vec[u8], x: u64)
+  ensures vlen(old(t)) < vlen(t) && vlen(t) <= vlen(old(t)) + 20
+  ensures text_digits_from(t, vlen(old(t)))
+{
+  let n0 = vec_len(t);
+  let mut p: u64 = 10000000000000000000;
+  let mut i = 0;
+  let mut started = false;
+  while i < 20 && p > 0
+    invariant i <= 20 && n0 <= vlen(t) && vlen(t) <= n0 + i
+    invariant started ==> n0 < vlen(t)
+    invariant !started ==> vlen(t) == n0
+    invariant text_digits_from(t, n0)
+  {
+    let d = x / p % 10;
+    if d != 0 || started || p == 1 {
+      vec_push(&mut t, cast[u8](d) + 48);
+      started = true;
+    }
+    p = p / 10;
+    i = i + 1;
+  }
+  if !started {
+    vec_push(&mut t, 48);              // not reached: p == 1 always pushes
+  }
+}
+
+/// Appends `x` in decimal, padded on the left with spaces to `width` bytes.
+fn fmt_u64_pad(t: &mut Vec[u8], x: u64, width: u64)
+  ensures vlen(old(t)) < vlen(t)
+{
+  let n0 = vec_len(t);
+  let n = dec_digits(x);
+  let mut k = n;
+  while k < width
+    invariant n <= k && n0 <= vlen(t)
+  {
+    vec_push(&mut t, 32);
+    k = k + 1;
+  }
+  fmt_u64(&mut t, x);
+}
+
+/// Appends `x` in decimal, with a `-` in front when it is negative.
+fn fmt_i64(t: &mut Vec[u8], x: i64)
+  ensures vlen(old(t)) < vlen(t) && vlen(t) <= vlen(old(t)) + 21
+{
+  if x < 0 {
+    vec_push(&mut t, 45);
+    fmt_u64(&mut t, cast[u64](-(x + 1)) + 1);
+  } else {
+    fmt_u64(&mut t, cast[u64](x));
+  }
+}
+
+/// The lowercase hexadecimal digit for `d`.
+fn hex_char(d: u64) -> u8
+  requires d < 16
+{
+  if d < 10 {
+    return cast[u8](d) + 48;
+  }
+  return cast[u8](d) + 87;
+}
+
+/// Appends `x` in lowercase hexadecimal, without `0x`, using at least
+/// `min` digits (padded with zeros) and at most 16.
+fn fmt_hex_u64(t: &mut Vec[u8], x: u64, min: u64)
+  ensures vlen(old(t)) < vlen(t) && vlen(t) <= vlen(old(t)) + 16
+{
+  let n0 = vec_len(t);
+  let mut i = 0;
+  let mut started = false;
+  while i < 16
+    invariant i <= 16 && n0 <= vlen(t) && vlen(t) <= n0 + i
+    invariant started ==> n0 < vlen(t)
+    invariant !started ==> vlen(t) == n0
+  {
+    let d = (x >> (60 - 4 * i)) & 15;
+    if d != 0 || started || i == 15 || 16 - i <= min {
+      vec_push(&mut t, hex_char(d));
+      started = true;
+    }
+    i = i + 1;
+  }
+  if !started {
+    vec_push(&mut t, 48);              // not reached: i == 15 always pushes
+  }
+}
