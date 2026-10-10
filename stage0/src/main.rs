@@ -3,7 +3,7 @@
 // Pipeline: lex -> parse -> check (types + linearity) -> verify (SMT) -> C.
 // The C output is compiled with the system C compiler.
 //
-// usage: bastioc0 [--check] [--emit-c] [--dump-smt] [--target T] [--header F] [-o out] <file.bastio>...
+// usage: bastioc0 [--check] [--emit-c] [--dump-smt] [--target T] [--lib DIR] [--header F] [-o out] <file.bastio>...
 //   (default)   verify, then build a native executable `out` (default: a.out)
 //   --check     stop after verification
 //   --emit-c    write the generated C to `out` instead of building
@@ -28,6 +28,8 @@
 //               prints `error file:line:col CODE`, and a verification error
 //               also its notes (`  = counterexample: ...`), without the
 //               message; exits 1
+//   --lib DIR   also look for imported files in DIR (see `Loader::resolve`);
+//               may be given more than once
 //   --header F  also write a C header for the program's `export fn`s to F
 //               (a program with an `export fn` is a library and needs no
 //               `main`; build it with --emit-c and link it into a C program)
@@ -56,7 +58,7 @@ use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
 
 /// Reads source files into one program. A file may start with
-/// `import "path";` lines (paths relative to the file); each imported file
+/// `import "path";` lines (see `resolve` for where a path points); each imported file
 /// is loaded, with its own imports, before the rest of the importing file
 /// is parsed, so constants it defines can be used there. A file is loaded
 /// once however often it is imported; a cycle of imports is an error.
@@ -66,9 +68,83 @@ struct Loader {
     state: HashMap<PathBuf, bool>,
     prog: ast::Program,
     consts: HashMap<String, u128>,
+    /// The `--lib` directories, in command-line order.
+    libs: Vec<String>,
 }
 
+/// `path` with empty and `.` parts dropped and `..` taken back where it can
+/// be, as text (stage1's `normalize`).
+fn normalize(path: &str) -> String {
+    let abs = path.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        if part == ".." && parts.last().is_some_and(|p| *p != "..") {
+            parts.pop();
+        } else if part == ".." && parts.is_empty() && abs {
+            // `/..` is `/`.
+        } else if !part.is_empty() && part != "." {
+            parts.push(part);
+        }
+    }
+    let body = parts.join("/");
+    if abs {
+        format!("/{}", body)
+    } else {
+        body
+    }
+}
+
+/// The directory above `dir` (normalized), as text: stage1's
+/// `dir_above`. None above the root.
+fn dir_above(dir: &str) -> Option<String> {
+    if dir == "/" {
+        None
+    } else if dir.is_empty() {
+        Some("..".to_string())
+    } else if dir == ".." || dir.ends_with("/..") {
+        Some(format!("{}/..", dir))
+    } else {
+        match dir.rfind('/') {
+            None => Some(String::new()),
+            Some(0) => Some("/".to_string()),
+            Some(k) => Some(dir[..k].to_string()),
+        }
+    }
+}
+
+/// How many directories above an importing file are searched.
+const SEARCH_UP: usize = 64;
+
 impl Loader {
+    /// Where `import "name"` in a file in `dir` points. A name that starts
+    /// with `.` or `/` is relative to the file only. Any other name is
+    /// looked for next to the file, then in each directory above it (up
+    /// to `SEARCH_UP` of them, worked out from the path as text), then in
+    /// each `--lib` directory; the first that has it wins. When none has
+    /// it, the name next to the file is returned, for the error message.
+    fn resolve(&self, dir: &Path, name: &str) -> PathBuf {
+        let first = dir.join(name);
+        if name.is_empty() || name.starts_with('.') || name.starts_with('/') || first.is_file() {
+            return first;
+        }
+        let mut d = normalize(&dir.display().to_string());
+        for _ in 0..SEARCH_UP {
+            let Some(up) = dir_above(&d) else { break };
+            d = up;
+            let c = Path::new(&d).join(name);
+            if c.is_file() {
+                return c;
+            }
+        }
+        for lib in &self.libs {
+            let c = Path::new(lib).join(name);
+            if c.is_file() {
+                return c;
+            }
+        }
+        first
+    }
+
     /// Loads `path`. `from` is the import that names it (None for a file
     /// on the command line). Errors are diagnostics, or None when the
     /// message has already been printed.
@@ -110,7 +186,8 @@ impl Loader {
                 return Err(Some(diag::Diag::new("E-PARSE", toks[i + 2].pos, "expected `;` after the imported file name")));
             }
             let name = String::from_utf8_lossy(name).to_string();
-            self.load(&dir.join(name), Some(pos))?;
+            let full = self.resolve(&dir, &name);
+            self.load(&full, Some(pos))?;
             i += 3;
         }
         let consts = std::mem::take(&mut self.consts);
@@ -143,6 +220,7 @@ fn main() {
     let mut out: Option<String> = None;
     let mut header: Option<String> = None;
     let mut inputs: Vec<String> = Vec::new();
+    let mut libs: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -193,6 +271,10 @@ fn main() {
                 i += 1;
                 header = args.get(i).cloned();
             }
+            "--lib" => {
+                i += 1;
+                libs.extend(args.get(i).cloned());
+            }
             "-o" => {
                 i += 1;
                 out = args.get(i).cloned();
@@ -206,7 +288,7 @@ fn main() {
         i += 1;
     }
     if inputs.is_empty() {
-        eprintln!("usage: bastioc0 [--check] [--emit-c] [--dump-smt] [--target hosted|kernel|user] [--header F] [-o out] <file.bastio>...");
+        eprintln!("usage: bastioc0 [--check] [--emit-c] [--dump-smt] [--target hosted|kernel|user] [--lib DIR] [--header F] [-o out] <file.bastio>...");
         exit(2);
     }
     if dump_tokens {
@@ -255,6 +337,7 @@ fn main() {
         state: HashMap::new(),
         prog: ast::Program { fns: Vec::new(), specs: Vec::new(), structs: Vec::new(), enums: Vec::new() },
         consts: HashMap::new(),
+        libs,
     };
     let short = |d: &diag::Diag| println!("error {}:{}:{} {}", d.pos.file, d.pos.line, d.pos.col, d.code);
     for input in &inputs {
