@@ -2116,6 +2116,18 @@ impl<'a> Gen<'a> {
                 self.push("%rax");
                 self.push("%rcx");
             }
+            // Out of memory: a null pointer, and the length becomes 0.
+            "try_alloc" | "try_balloc" => {
+                self.scalar(&args[0])?;
+                self.push("%rax");
+                self.emit("mov %rax, %rdi");
+                self.emit(&format!("call bst_rt_{}", name));
+                self.pop("%rcx");
+                self.emit("test %rax, %rax");
+                self.emit("cmovz %rax, %rcx");
+                self.push("%rax");
+                self.push("%rcx");
+            }
             "free" | "bfree" => {
                 self.load_data(&args[0], 1)?;
                 self.emit("mov %rax, %rdi");
@@ -2599,6 +2611,20 @@ bst_rt_balloc:                  # %rax = %rdi zeroed bytes (at least one)
 2:	call calloc@PLT
 	test %rax, %rax
 	jz bst_rt_oom
+	leave
+	ret
+bst_rt_try_alloc:               # the same, or 0 when out of memory
+	mov $8, %esi
+	jmp 1f
+bst_rt_try_balloc:
+	mov $1, %esi
+1:	push %rbp
+	mov %rsp, %rbp
+	and $-16, %rsp
+	test %rdi, %rdi
+	jnz 2f
+	mov $1, %edi
+2:	call calloc@PLT
 	leave
 	ret
 bst_rt_free:                    # free(%rdi)

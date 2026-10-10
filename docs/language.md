@@ -824,6 +824,8 @@ fn main() -> u64 {
 | `set(b: Buf, i: u64, v: u64) -> Buf` | `i < len(b)` | Consumes `b` and returns it with element `i` set to `v`, updated in place |
 | `free(b: Buf)` | | Frees `b` |
 | `balloc(n: u64) -> Bytes` | `n <= 2^60` | `n` zero bytes |
+| `try_alloc(n: u64) -> Buf` | `n <= 2^60` | Like `alloc`, but when memory runs out it returns an empty buffer instead of stopping the program. The prover knows only that the length is `n` or `0`, so a program must test `len` before indexing |
+| `try_balloc(n: u64) -> Bytes` | `n <= 2^60` | Like `balloc`, but returns empty `Bytes` when memory runs out |
 | `blen(b: &Bytes) -> u64` | | Its length |
 | `bget(b: &Bytes, i: u64) -> u8` | `i < blen(b)` | Byte `i` |
 | `bset(b: &mut Bytes, i: u64, v: u8)` | `i < blen(b)` | Sets byte `i` in place |

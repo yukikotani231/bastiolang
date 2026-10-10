@@ -2066,6 +2066,16 @@ impl<'p> Verifier<'p> {
                 self.need(st, format!("(<= {} {})", n, ALLOC_MAX), pos, "E-VERIFY-ALLOC", format!("that the allocation size `{}` is at most 2^60 bytes", ra(0)))?;
                 Ok(Val::Buf { len: n, data: "((as const (Array Int Int)) 0)".into() })
             }
+            // Like alloc and balloc, but out of memory gives an empty
+            // buffer instead of stopping the program: the length is the
+            // size asked for, or 0.
+            "try_alloc" | "try_balloc" => {
+                let n = vals[0].term().to_string();
+                let what = if name == "try_alloc" { "elements" } else { "bytes" };
+                self.need(st, format!("(<= {} {})", n, ALLOC_MAX), pos, "E-VERIFY-ALLOC", format!("that the allocation size `{}` is at most 2^60 {}", ra(0), what))?;
+                let ok = self.fresh_bool("alloc_ok")?;
+                Ok(Val::Buf { len: format!("(ite {} {} 0)", ok.term(), n), data: "((as const (Array Int Int)) 0)".into() })
+            }
             "blen" => match &vals[0] {
                 Val::Buf { len, .. } => Ok(Val::U(len.clone())),
                 _ => unreachable!(),

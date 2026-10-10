@@ -62,6 +62,8 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("free", Avail::All, vec![Buf], Unit),
         ("print", Avail::All, vec![U64], Unit),
         ("balloc", Avail::All, vec![U64], Bytes),
+        ("try_alloc", Avail::All, vec![U64], Buf),
+        ("try_balloc", Avail::All, vec![U64], Bytes),
         ("blen", Avail::All, vec![r(Bytes)], U64),
         ("bget", Avail::All, vec![r(Bytes), U64], U8),
         ("bset", Avail::All, vec![m(Bytes), U64, U8], Unit),

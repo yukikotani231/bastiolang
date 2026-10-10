@@ -330,6 +330,12 @@ static bst_buf bst_alloc(uint64_t n) {
     if (!b.data) { fputs("Bastio: out of memory\n", stderr); abort(); }
     return b;
 }
+static bst_buf bst_try_alloc(uint64_t n) {
+    bst_buf b;
+    b.data = (uint64_t *)calloc(n ? n : 1, sizeof(uint64_t));
+    b.len = b.data ? n : 0;
+    return b;
+}
 static inline void bst_free(bst_buf b) { free(b.data); }
 /* Grow a block of `old` words to `n` words, keeping its contents; the new
  * words are not zeroed (only Vec uses it, and never reads past its length). */
@@ -346,6 +352,12 @@ static bst_bytes bst_balloc(uint64_t n) {
     b.len = n;
     b.data = (unsigned char *)calloc(n ? n : 1, 1);
     if (!b.data) { fputs("Bastio: out of memory\n", stderr); abort(); }
+    return b;
+}
+static bst_bytes bst_try_balloc(uint64_t n) {
+    bst_bytes b;
+    b.data = (unsigned char *)calloc(n ? n : 1, 1);
+    b.len = b.data ? n : 0;
     return b;
 }
 static inline void bst_bfree(bst_bytes b) { free(b.data); }
@@ -558,7 +570,8 @@ static uint64_t bst_arena_top = 0;
 typedef struct bst_free { uint64_t words; struct bst_free *next; } bst_free_t;
 static bst_free_t *bst_free_list = 0;
 static uint64_t bst_arena_lock;              /* every processor allocates from the one arena */
-static bst_buf bst_alloc(uint64_t n) {
+/* An empty buffer with no memory when the arena is full. */
+static bst_buf bst_try_alloc(uint64_t n) {
     uint64_t words = (n ? n : 1) + 1;            /* one header word for the size */
     if (words < 2) words = 2;
     uint64_t *blk = 0;
@@ -571,18 +584,24 @@ static bst_buf bst_alloc(uint64_t n) {
             break;
         }
     }
-    if (!blk) {
-        if (bst_arena_top + words > BST_ARENA_WORDS) { bst_puts("bastio: out of memory\n"); bst_halt(); }
+    if (!blk && bst_arena_top + words <= BST_ARENA_WORDS) {
         blk = &bst_arena[bst_arena_top];
         bst_arena_top += words;
         blk[0] = words;
     }
     bst_lock_release(&bst_arena_lock);
+    if (!blk) { bst_buf none = { 0, 0 }; return none; }
     for (uint64_t i = 1; i < words; i++) blk[i] = 0;
     bst_buf b = { n, blk + 1 };
     return b;
 }
+static bst_buf bst_alloc(uint64_t n) {
+    bst_buf b = bst_try_alloc(n);
+    if (!b.data) { bst_puts("bastio: out of memory\n"); bst_halt(); }
+    return b;
+}
 static void bst_free(bst_buf b) {
+    if (!b.data) return;
     uint64_t *blk = b.data - 1;
     bst_free_t *f = (bst_free_t *)blk;
     bst_lock_acquire(&bst_arena_lock);
@@ -645,6 +664,11 @@ const PRELUDE_BYTES_ARENA: &str = r#"
 static bst_bytes bst_balloc(uint64_t n) {
     bst_buf w = bst_alloc((n + 7) / 8);
     bst_bytes b = { n, (unsigned char *)w.data };
+    return b;
+}
+static bst_bytes bst_try_balloc(uint64_t n) {
+    bst_buf w = bst_try_alloc((n + 7) / 8);
+    bst_bytes b = { w.data ? n : 0, (unsigned char *)w.data };
     return b;
 }
 static void bst_bfree(bst_bytes b) {
@@ -1035,7 +1059,8 @@ static uint64_t bst_arena[BST_ARENA_WORDS];
 static uint64_t bst_arena_top = 0;
 typedef struct bst_free { uint64_t words; struct bst_free *next; } bst_free_t;
 static bst_free_t *bst_free_list = 0;
-static bst_buf bst_alloc(uint64_t n) {
+/* An empty buffer with no memory when the arena is full. */
+static bst_buf bst_try_alloc(uint64_t n) {
     uint64_t words = (n ? n : 1) + 1;
     if (words < 2) words = 2;
     bst_free_t **pp = &bst_free_list;
@@ -1049,10 +1074,8 @@ static bst_buf bst_alloc(uint64_t n) {
         }
     }
     if (bst_arena_top + words > BST_ARENA_WORDS) {
-        static const char m[] = "bastio: out of memory\n";
-        bst_flush();
-        bst_sys(BST_SYS_WRITE, (uint64_t)m, sizeof m - 1, 0);
-        bst_sys(BST_SYS_EXIT, 255, 0, 0);
+        bst_buf none = { 0, 0 };
+        return none;
     }
     uint64_t *blk = &bst_arena[bst_arena_top];
     bst_arena_top += words;
@@ -1061,7 +1084,18 @@ static bst_buf bst_alloc(uint64_t n) {
     bst_buf b = { n, blk + 1 };
     return b;
 }
+static bst_buf bst_alloc(uint64_t n) {
+    bst_buf b = bst_try_alloc(n);
+    if (!b.data) {
+        static const char m[] = "bastio: out of memory\n";
+        bst_flush();
+        bst_sys(BST_SYS_WRITE, (uint64_t)m, sizeof m - 1, 0);
+        bst_sys(BST_SYS_EXIT, 255, 0, 0);
+    }
+    return b;
+}
 static void bst_free(bst_buf b) {
+    if (!b.data) return;
     uint64_t *blk = b.data - 1;
     bst_free_t *f = (bst_free_t *)blk;
     f->words = blk[0];

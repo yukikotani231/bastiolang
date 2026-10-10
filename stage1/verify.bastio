@@ -4531,6 +4531,22 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     // alloc zero-fills.
     return mk(&mut v, VV_BUF, 0, a0.a, v.t_zarr, 0, 0);
   }
+  // Like alloc and balloc, but out of memory gives an empty buffer instead
+  // of stopping the program: the length is the size asked for, or 0.
+  if name_is(p, i, "try_alloc") || name_is(p, i, "try_balloc") {
+    let g = app2(&mut v, OP_LE, a0.a, v.t_allocmax);
+    vm_s(&mut v, "that the allocation size `");
+    vm_arg(&mut v, p, u_at(args, 0));
+    if name_is(p, i, "try_alloc") {
+      vm_s(&mut v, "` is at most 2^60 elements");
+    } else {
+      vm_s(&mut v, "` is at most 2^60 bytes");
+    }
+    prove(&mut v, st, g, i, VC_ALLOC);
+    let ok = fresh_bool_named(&mut v, "alloc_ok");
+    let len = app3(&mut v, OP_ITE, term(v, ok), a0.a, v.t_zero);
+    return mk(&mut v, VV_BUF, 0, len, v.t_zarr, 0, 0);
+  }
   if name_is(p, i, "len") || name_is(p, i, "slen") || name_is(p, i, "blen") || name_is(p, i, "vec_len") {
     return mk_u(&mut v, a0.a);
   }
