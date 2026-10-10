@@ -656,8 +656,8 @@ fn x86_words(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, t: u64) -> u64 {
   if k == TY_BUF || k == TY_BYTES || k == TY_STR || k == TY_POOL {
     return 2;
   }
-  if k == TY_VEC {
-    return 3;
+  if k == TY_VEC || (k == TY_CHILD && !g.stage0) {
+    return 3;     // a Child: process id, the pipe to its input, its output (FILE *)
   }
   if k == TY_REF {
     return x86_words(&mut g, c, m, p, inner_t(m, t));
@@ -3536,6 +3536,36 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_load_data(&mut g, c, &mut m, p, a0, 2);
     x86_es(&mut g, "mov %rax, %rdi");
     x86_es(&mut g, "call bst_rt_free");
+  } else if !g.stage0 {
+    x86_builtin1(&mut g, c, &mut m, p, i);
+  } else {
+    g.failed = true;
+  }
+}
+
+/// The builtins only stage1's backend supports (see `x86_runtime1`).
+fn x86_builtin1(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
+  if name_is(p, i, "host_eprint") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RCX, XR_RDI, XR_RSI, 0, 0);
+    x86_es(&mut g, "call bst_rt_eprint");
+  } else if name_is(p, i, "host_spawn") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RCX, XR_RDI, XR_RSI, XR_RDX, 0);
+    x86_es(&mut g, "call bst_rt_spawn");
+    x86_push(&mut g, x86_reg(XR_RAX));
+    x86_push(&mut g, x86_reg(XR_RDX));
+    x86_push(&mut g, x86_reg(XR_RCX));
+  } else if name_is(p, i, "child_write") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RDI, XR_RSI, 0, 0);
+    x86_es(&mut g, "call bst_rt_child_write");
+  } else if name_is(p, i, "child_close") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, 0, 0, 0, 0);
+    x86_es(&mut g, "call bst_rt_child_close");
+  } else if name_is(p, i, "child_read_line") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, XR_RSI, 0, 0, 0);
+    x86_es(&mut g, "call bst_rt_child_read_line");
+  } else if name_is(p, i, "child_wait") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, XR_RSI, XR_RDX, 0, 0);
+    x86_es(&mut g, "call bst_rt_child_wait");
   } else {
     g.failed = true;
   }
@@ -4279,6 +4309,9 @@ fn x86_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
     return false;
   }
   x86_runtime(&mut g.out);
+  if !g.stage0 {
+    x86_runtime1(&mut g.out);
+  }
   cg_s(&mut g.out, "\t.section .rodata\n");
   k = 0;
   while k < vec_len(g.slens) {
@@ -4618,4 +4651,300 @@ fn x86_runtime(out: &mut Vec[u64]) {
   cg_s(&mut out, ".Lrt_oom:\n");
   cg_s(&mut out, "\t.string \"Bastio: out of memory\\n\"\n");
   cg_s(&mut out, "\t.text\n");
+}
+
+/// The routines of the runtime that only stage1's backend uses (Child and
+/// host_eprint), after `x86_runtime`.
+fn x86_runtime1(out: &mut Vec[u64]) {
+  cg_s(&mut out, "# ---- runtime only stage1 writes (trusted base) ----\n");
+  cg_s(&mut out, "\t.text\n");
+  cg_s(&mut out, "bst_rt_eprint:                  # write the %rsi bytes at %rdi to stderr, after flushing stdout\n");
+  cg_s(&mut out, "\tpush %rbp\n");
+  cg_s(&mut out, "\tmov %rsp, %rbp\n");
+  cg_s(&mut out, "\tpush %rbx\n");
+  cg_s(&mut out, "\tpush %r12\n");
+  cg_s(&mut out, "\tand $-16, %rsp\n");
+  cg_s(&mut out, "\tmov %rdi, %rbx\n");
+  cg_s(&mut out, "\tmov %rsi, %r12\n");
+  cg_s(&mut out, "\tmov stdout@GOTPCREL(%rip), %rax\n");
+  cg_s(&mut out, "\tmov (%rax), %rdi\n");
+  cg_s(&mut out, "\tcall fflush@PLT\n");
+  cg_s(&mut out, "\tmov %rbx, %rdi\n");
+  cg_s(&mut out, "\tmov $1, %esi\n");
+  cg_s(&mut out, "\tmov %r12, %rdx\n");
+  cg_s(&mut out, "\tmov stderr@GOTPCREL(%rip), %rax\n");
+  cg_s(&mut out, "\tmov (%rax), %rcx\n");
+  cg_s(&mut out, "\tcall fwrite@PLT\n");
+  cg_s(&mut out, "\tmov -8(%rbp), %rbx\n");
+  cg_s(&mut out, "\tmov -16(%rbp), %r12\n");
+  cg_s(&mut out, "\tleave\n");
+  cg_s(&mut out, "\tret\n");
+  cg_s(&mut out, "# A Child is three words: process id, the pipe to its input, and its output\n");
+  cg_s(&mut out, "# (a FILE *). One that cannot be started (no program, no pipes or processes\n");
+  cg_s(&mut out, "# left) is -1, -1, 0, and behaves like one that exited with 127 without\n");
+  cg_s(&mut out, "# output, which is what a failed exec in the child looks like anyway.\n");
+  cg_s(&mut out, "bst_rt_spawn:                   # run the %rdx Bytes at %rdi (argv): %rax = output, %rdx = input, %rcx = pid\n");
+  cg_s(&mut out, "\tpush %rbp\n");
+  cg_s(&mut out, "\tmov %rsp, %rbp\n");
+  cg_s(&mut out, "\tpush %rbx\n");
+  cg_s(&mut out, "\tpush %r12\n");
+  cg_s(&mut out, "\tpush %r13\n");
+  cg_s(&mut out, "\tpush %r14\n");
+  cg_s(&mut out, "\tpush %r15\n");
+  cg_s(&mut out, "\tsub $24, %rsp\n");
+  cg_s(&mut out, "\tand $-16, %rsp\n");
+  cg_s(&mut out, "\tmov %rdi, %rbx\n");
+  cg_s(&mut out, "\tmov %rdx, %r12\n");
+  cg_s(&mut out, "\tmov $-1, %r13\n");
+  cg_s(&mut out, "\tmov $-1, %r14\n");
+  cg_s(&mut out, "\txor %r15d, %r15d\n");
+  cg_s(&mut out, "\ttest %r12, %r12\n");
+  cg_s(&mut out, "\tjz 9f\n");
+  cg_s(&mut out, "\tlea -56(%rbp), %rdi         # to[2]: the child's input\n");
+  cg_s(&mut out, "\tcall pipe@PLT\n");
+  cg_s(&mut out, "\ttest %eax, %eax\n");
+  cg_s(&mut out, "\tjnz 9f\n");
+  cg_s(&mut out, "\tlea -64(%rbp), %rdi         # from[2]: its output\n");
+  cg_s(&mut out, "\tcall pipe@PLT\n");
+  cg_s(&mut out, "\ttest %eax, %eax\n");
+  cg_s(&mut out, "\tjz 1f\n");
+  cg_s(&mut out, "\tmovslq -56(%rbp), %rdi\n");
+  cg_s(&mut out, "\tcall close@PLT\n");
+  cg_s(&mut out, "\tmovslq -52(%rbp), %rdi\n");
+  cg_s(&mut out, "\tcall close@PLT\n");
+  cg_s(&mut out, "\tjmp 9f\n");
+  cg_s(&mut out, "1:\tlea 8(,%r12,8), %rdi        # argv for execvp, NULL-terminated\n");
+  cg_s(&mut out, "\tcall malloc@PLT\n");
+  cg_s(&mut out, "\ttest %rax, %rax\n");
+  cg_s(&mut out, "\tjz bst_rt_oom\n");
+  cg_s(&mut out, "\tmov %rax, %r15\n");
+  cg_s(&mut out, "\txor %r14d, %r14d\n");
+  cg_s(&mut out, "2:\tcmp %r12, %r14\n");
+  cg_s(&mut out, "\tjae 3f\n");
+  cg_s(&mut out, "\tmov %r14, %rax\n");
+  cg_s(&mut out, "\tshl $4, %rax\n");
+  cg_s(&mut out, "\tmov 8(%rbx,%rax), %rdi\n");
+  cg_s(&mut out, "\tmov (%rbx,%rax), %rsi\n");
+  cg_s(&mut out, "\tcall bst_rt_cpath\n");
+  cg_s(&mut out, "\tmov %rax, (%r15,%r14,8)\n");
+  cg_s(&mut out, "\tinc %r14\n");
+  cg_s(&mut out, "\tjmp 2b\n");
+  cg_s(&mut out, "3:\tmovq $0, (%r15,%r12,8)\n");
+  cg_s(&mut out, "\txor %edi, %edi\n");
+  cg_s(&mut out, "\tcall fflush@PLT\n");
+  cg_s(&mut out, "\tcall fork@PLT\n");
+  cg_s(&mut out, "\tmovslq %eax, %r13\n");
+  cg_s(&mut out, "\ttest %r13, %r13\n");
+  cg_s(&mut out, "\tjnz 4f\n");
+  cg_s(&mut out, "\tmovslq -56(%rbp), %rdi      # the child\n");
+  cg_s(&mut out, "\txor %esi, %esi\n");
+  cg_s(&mut out, "\tcall dup2@PLT\n");
+  cg_s(&mut out, "\tmovslq -60(%rbp), %rdi\n");
+  cg_s(&mut out, "\tmov $1, %esi\n");
+  cg_s(&mut out, "\tcall dup2@PLT\n");
+  cg_s(&mut out, "\tmovslq -56(%rbp), %rdi\n");
+  cg_s(&mut out, "\tcall close@PLT\n");
+  cg_s(&mut out, "\tmovslq -52(%rbp), %rdi\n");
+  cg_s(&mut out, "\tcall close@PLT\n");
+  cg_s(&mut out, "\tmovslq -64(%rbp), %rdi\n");
+  cg_s(&mut out, "\tcall close@PLT\n");
+  cg_s(&mut out, "\tmovslq -60(%rbp), %rdi\n");
+  cg_s(&mut out, "\tcall close@PLT\n");
+  cg_s(&mut out, "\tmov (%r15), %rdi\n");
+  cg_s(&mut out, "\tmov %r15, %rsi\n");
+  cg_s(&mut out, "\tcall execvp@PLT\n");
+  cg_s(&mut out, "\tmov $127, %edi\n");
+  cg_s(&mut out, "\tcall _exit@PLT\n");
+  cg_s(&mut out, "4:\txor %r14d, %r14d            # the parent\n");
+  cg_s(&mut out, "5:\tcmp %r12, %r14\n");
+  cg_s(&mut out, "\tjae 6f\n");
+  cg_s(&mut out, "\tmov (%r15,%r14,8), %rdi\n");
+  cg_s(&mut out, "\tcall free@PLT\n");
+  cg_s(&mut out, "\tinc %r14\n");
+  cg_s(&mut out, "\tjmp 5b\n");
+  cg_s(&mut out, "6:\tmov %r15, %rdi\n");
+  cg_s(&mut out, "\tcall free@PLT\n");
+  cg_s(&mut out, "\tmovslq -56(%rbp), %rdi\n");
+  cg_s(&mut out, "\tcall close@PLT\n");
+  cg_s(&mut out, "\tmovslq -60(%rbp), %rdi\n");
+  cg_s(&mut out, "\tcall close@PLT\n");
+  cg_s(&mut out, "\tmov $-1, %r14\n");
+  cg_s(&mut out, "\txor %r15d, %r15d\n");
+  cg_s(&mut out, "\ttest %r13, %r13\n");
+  cg_s(&mut out, "\tjns 7f\n");
+  cg_s(&mut out, "\tmovslq -52(%rbp), %rdi      # no process\n");
+  cg_s(&mut out, "\tcall close@PLT\n");
+  cg_s(&mut out, "\tmovslq -64(%rbp), %rdi\n");
+  cg_s(&mut out, "\tcall close@PLT\n");
+  cg_s(&mut out, "\tmov $-1, %r13\n");
+  cg_s(&mut out, "\tjmp 9f\n");
+  cg_s(&mut out, "7:\tmov $13, %edi               # SIGPIPE ignored: writing to a child that has exited fails instead\n");
+  cg_s(&mut out, "\tmov $1, %esi\n");
+  cg_s(&mut out, "\tcall signal@PLT\n");
+  cg_s(&mut out, "\tmovslq -52(%rbp), %r14\n");
+  cg_s(&mut out, "\tmovslq -64(%rbp), %rdi\n");
+  cg_s(&mut out, "\tlea .Lrt_rb(%rip), %rsi\n");
+  cg_s(&mut out, "\tcall fdopen@PLT\n");
+  cg_s(&mut out, "\ttest %rax, %rax\n");
+  cg_s(&mut out, "\tjz bst_rt_oom\n");
+  cg_s(&mut out, "\tmov %rax, %r15\n");
+  cg_s(&mut out, "9:\tmov %r15, %rax\n");
+  cg_s(&mut out, "\tmov %r14, %rdx\n");
+  cg_s(&mut out, "\tmov %r13, %rcx\n");
+  cg_s(&mut out, "\tmov -8(%rbp), %rbx\n");
+  cg_s(&mut out, "\tmov -16(%rbp), %r12\n");
+  cg_s(&mut out, "\tmov -24(%rbp), %r13\n");
+  cg_s(&mut out, "\tmov -32(%rbp), %r14\n");
+  cg_s(&mut out, "\tmov -40(%rbp), %r15\n");
+  cg_s(&mut out, "\tleave\n");
+  cg_s(&mut out, "\tret\n");
+  cg_s(&mut out, "bst_rt_child_write:             # write the %rsi bytes at %rdi to the Child at (%rdx); %rax = 1 if it worked\n");
+  cg_s(&mut out, "\tpush %rbp\n");
+  cg_s(&mut out, "\tmov %rsp, %rbp\n");
+  cg_s(&mut out, "\tpush %rbx\n");
+  cg_s(&mut out, "\tpush %r12\n");
+  cg_s(&mut out, "\tpush %r13\n");
+  cg_s(&mut out, "\tpush %r14\n");
+  cg_s(&mut out, "\tand $-16, %rsp\n");
+  cg_s(&mut out, "\tmov 8(%rdx), %rbx\n");
+  cg_s(&mut out, "\tmov %rdi, %r12\n");
+  cg_s(&mut out, "\tmov %rsi, %r13\n");
+  cg_s(&mut out, "\txor %r14d, %r14d\n");
+  cg_s(&mut out, "\ttest %rbx, %rbx\n");
+  cg_s(&mut out, "\tjs 8f\n");
+  cg_s(&mut out, "1:\tcmp %r13, %r14\n");
+  cg_s(&mut out, "\tjae 4f\n");
+  cg_s(&mut out, "\tmov %rbx, %rdi\n");
+  cg_s(&mut out, "\tlea (%r12,%r14), %rsi\n");
+  cg_s(&mut out, "\tmov %r13, %rdx\n");
+  cg_s(&mut out, "\tsub %r14, %rdx\n");
+  cg_s(&mut out, "\tcall write@PLT\n");
+  cg_s(&mut out, "\ttest %rax, %rax\n");
+  cg_s(&mut out, "\tjle 8f\n");
+  cg_s(&mut out, "\tadd %rax, %r14\n");
+  cg_s(&mut out, "\tjmp 1b\n");
+  cg_s(&mut out, "4:\tmov $1, %eax\n");
+  cg_s(&mut out, "\tjmp 9f\n");
+  cg_s(&mut out, "8:\txor %eax, %eax\n");
+  cg_s(&mut out, "9:\tmov -8(%rbp), %rbx\n");
+  cg_s(&mut out, "\tmov -16(%rbp), %r12\n");
+  cg_s(&mut out, "\tmov -24(%rbp), %r13\n");
+  cg_s(&mut out, "\tmov -32(%rbp), %r14\n");
+  cg_s(&mut out, "\tleave\n");
+  cg_s(&mut out, "\tret\n");
+  cg_s(&mut out, "bst_rt_child_close:             # close the input of the Child at (%rdi)\n");
+  cg_s(&mut out, "\tpush %rbp\n");
+  cg_s(&mut out, "\tmov %rsp, %rbp\n");
+  cg_s(&mut out, "\tpush %rbx\n");
+  cg_s(&mut out, "\tand $-16, %rsp\n");
+  cg_s(&mut out, "\tmov %rdi, %rbx\n");
+  cg_s(&mut out, "\tmov 8(%rbx), %rdi\n");
+  cg_s(&mut out, "\ttest %rdi, %rdi\n");
+  cg_s(&mut out, "\tjs 1f\n");
+  cg_s(&mut out, "\tcall close@PLT\n");
+  cg_s(&mut out, "\tmovq $-1, 8(%rbx)\n");
+  cg_s(&mut out, "1:\tmov -8(%rbp), %rbx\n");
+  cg_s(&mut out, "\tleave\n");
+  cg_s(&mut out, "\tret\n");
+  cg_s(&mut out, "bst_rt_child_read_line:         # the next line of the Child at (%rdi) into the Bytes at (%rsi); %rax = 1 if there was one\n");
+  cg_s(&mut out, "\tpush %rbp\n");
+  cg_s(&mut out, "\tmov %rsp, %rbp\n");
+  cg_s(&mut out, "\tpush %rbx\n");
+  cg_s(&mut out, "\tpush %r12\n");
+  cg_s(&mut out, "\tpush %r13\n");
+  cg_s(&mut out, "\tpush %r14\n");
+  cg_s(&mut out, "\tpush %r15\n");
+  cg_s(&mut out, "\tand $-16, %rsp\n");
+  cg_s(&mut out, "\tmov 16(%rdi), %rbx\n");
+  cg_s(&mut out, "\tmov %rsi, %r12\n");
+  cg_s(&mut out, "\ttest %rbx, %rbx\n");
+  cg_s(&mut out, "\tjz 8f\n");
+  cg_s(&mut out, "\tmov $64, %r14d              # capacity, doubled when full\n");
+  cg_s(&mut out, "\tmov %r14, %rdi\n");
+  cg_s(&mut out, "\tcall malloc@PLT\n");
+  cg_s(&mut out, "\ttest %rax, %rax\n");
+  cg_s(&mut out, "\tjz bst_rt_oom\n");
+  cg_s(&mut out, "\tmov %rax, %r13\n");
+  cg_s(&mut out, "\txor %r15d, %r15d            # bytes in the line\n");
+  cg_s(&mut out, "1:\tcmp %r14, %r15\n");
+  cg_s(&mut out, "\tjne 2f\n");
+  cg_s(&mut out, "\tadd %r14, %r14\n");
+  cg_s(&mut out, "\tmov %r13, %rdi\n");
+  cg_s(&mut out, "\tmov %r14, %rsi\n");
+  cg_s(&mut out, "\tcall realloc@PLT\n");
+  cg_s(&mut out, "\ttest %rax, %rax\n");
+  cg_s(&mut out, "\tjz bst_rt_oom\n");
+  cg_s(&mut out, "\tmov %rax, %r13\n");
+  cg_s(&mut out, "2:\tmov %rbx, %rdi\n");
+  cg_s(&mut out, "\tcall getc@PLT\n");
+  cg_s(&mut out, "\tcmp $-1, %eax\n");
+  cg_s(&mut out, "\tje 3f\n");
+  cg_s(&mut out, "\tcmp $10, %eax\n");
+  cg_s(&mut out, "\tje 4f\n");
+  cg_s(&mut out, "\tmov %al, (%r13,%r15)\n");
+  cg_s(&mut out, "\tinc %r15\n");
+  cg_s(&mut out, "\tjmp 1b\n");
+  cg_s(&mut out, "3:\ttest %r15, %r15             # the end: a last line without a newline, or none\n");
+  cg_s(&mut out, "\tjnz 4f\n");
+  cg_s(&mut out, "\tmov %r13, %rdi\n");
+  cg_s(&mut out, "\tcall free@PLT\n");
+  cg_s(&mut out, "\tjmp 8f\n");
+  cg_s(&mut out, "4:\tmov 8(%r12), %rdi           # replace the old contents\n");
+  cg_s(&mut out, "\tcall free@PLT\n");
+  cg_s(&mut out, "\tmov %r15, (%r12)\n");
+  cg_s(&mut out, "\tmov %r13, 8(%r12)\n");
+  cg_s(&mut out, "\tmov $1, %eax\n");
+  cg_s(&mut out, "\tjmp 9f\n");
+  cg_s(&mut out, "8:\txor %eax, %eax\n");
+  cg_s(&mut out, "9:\tmov -8(%rbp), %rbx\n");
+  cg_s(&mut out, "\tmov -16(%rbp), %r12\n");
+  cg_s(&mut out, "\tmov -24(%rbp), %r13\n");
+  cg_s(&mut out, "\tmov -32(%rbp), %r14\n");
+  cg_s(&mut out, "\tmov -40(%rbp), %r15\n");
+  cg_s(&mut out, "\tleave\n");
+  cg_s(&mut out, "\tret\n");
+  cg_s(&mut out, "bst_rt_child_wait:              # wait for the Child %rdx (pid), %rsi (input), %rdi (output): %rax = its exit status\n");
+  cg_s(&mut out, "\tpush %rbp\n");
+  cg_s(&mut out, "\tmov %rsp, %rbp\n");
+  cg_s(&mut out, "\tpush %rbx\n");
+  cg_s(&mut out, "\tpush %r12\n");
+  cg_s(&mut out, "\tsub $16, %rsp\n");
+  cg_s(&mut out, "\tand $-16, %rsp\n");
+  cg_s(&mut out, "\tmov %rdx, %rbx\n");
+  cg_s(&mut out, "\tmov %rdi, %r12\n");
+  cg_s(&mut out, "\ttest %rsi, %rsi\n");
+  cg_s(&mut out, "\tjs 1f\n");
+  cg_s(&mut out, "\tmov %rsi, %rdi\n");
+  cg_s(&mut out, "\tcall close@PLT\n");
+  cg_s(&mut out, "1:\ttest %r12, %r12\n");
+  cg_s(&mut out, "\tjz 2f\n");
+  cg_s(&mut out, "\tmov %r12, %rdi\n");
+  cg_s(&mut out, "\tcall fclose@PLT\n");
+  cg_s(&mut out, "2:\tmov $127, %eax\n");
+  cg_s(&mut out, "\ttest %rbx, %rbx\n");
+  cg_s(&mut out, "\tjs 9f\n");
+  cg_s(&mut out, "3:\tmov %ebx, %edi\n");
+  cg_s(&mut out, "\tlea -24(%rbp), %rsi\n");
+  cg_s(&mut out, "\txor %edx, %edx\n");
+  cg_s(&mut out, "\tcall waitpid@PLT\n");
+  cg_s(&mut out, "\ttest %eax, %eax\n");
+  cg_s(&mut out, "\tjs 3b\n");
+  cg_s(&mut out, "\tmov -24(%rbp), %eax\n");
+  cg_s(&mut out, "\tmov %eax, %ecx\n");
+  cg_s(&mut out, "\tand $0x7f, %ecx\n");
+  cg_s(&mut out, "\tjnz 4f\n");
+  cg_s(&mut out, "\tshr $8, %eax                # exited: its status\n");
+  cg_s(&mut out, "\tand $0xff, %eax\n");
+  cg_s(&mut out, "\tjmp 9f\n");
+  cg_s(&mut out, "4:\tcmp $0x7f, %ecx\n");
+  cg_s(&mut out, "\tje 5f\n");
+  cg_s(&mut out, "\tlea 128(%rcx), %eax         # killed by a signal: 128 + the signal\n");
+  cg_s(&mut out, "\tjmp 9f\n");
+  cg_s(&mut out, "5:\tmov $255, %eax\n");
+  cg_s(&mut out, "9:\tmov -8(%rbp), %rbx\n");
+  cg_s(&mut out, "\tmov -16(%rbp), %r12\n");
+  cg_s(&mut out, "\tleave\n");
+  cg_s(&mut out, "\tret\n");
+  cg_s(&mut out, "\t.section .rodata\n");
+  cg_s(&mut out, ".Lrt_rb:\t.string \"rb\"\n");
 }
