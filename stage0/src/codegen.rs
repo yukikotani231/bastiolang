@@ -467,8 +467,18 @@ static inline bst_pt bst_pt_new(bst_frame f, uint64_t level) {
     return f;
 }
 static inline bst_frame bst_pt_free(bst_pt t) { return t; }
-static inline bool bst_pt_has(bst_pt t, uint64_t i) { return (((uint64_t *)t)[i] & BST_PTE_P) != 0; }
+/* A last-level slot the program may not touch (pt_set_access 0) keeps its
+ * page with the present bit clear, marked by a bit the CPU ignores in a
+ * non-present entry, so the table still owns it. */
+#define BST_PTE_HIDDEN 0x400ull
+static inline bool bst_pt_has(bst_pt t, uint64_t i) { return (((uint64_t *)t)[i] & (BST_PTE_P | BST_PTE_HIDDEN)) != 0; }
 static inline bool bst_pt_writable(bst_pt t, uint64_t i) { return (((uint64_t *)t)[i] & BST_PTE_W) != 0; }
+static inline bool bst_pt_accessible(bst_pt t, uint64_t i) { return (((uint64_t *)t)[i] & BST_PTE_P) != 0; }
+static inline void bst_pt_set_access(bst_pt *t, uint64_t i, uint64_t a) {
+    uint64_t e = ((uint64_t *)*t)[i] & ~(BST_PTE_P | BST_PTE_W | BST_PTE_HIDDEN);
+    e |= a == 0 ? BST_PTE_HIDDEN : (BST_PTE_P | (a == 2 ? BST_PTE_W : 0));
+    __atomic_store_n(&((uint64_t *)*t)[i], e, __ATOMIC_RELEASE);
+}
 /* Another processor may be walking the table (it holds a lease on the
  * tree), so an entry is written with one 64-bit store, present bit
  * included, after everything it points to (release order). */

@@ -26,6 +26,11 @@ What will be 0.2.0.
   `bcopy` and `bmove` copy; page contents stay untracked (#91).
 - `pt_writable`: whether a level-1 page-table entry maps its frame
   writable (#81).
+- `pt_set_access` and `pt_accessible`: a level-1 slot can keep its page
+  while the program may not touch it (`PROT_NONE`), or only read it. The
+  table still owns the page (`pt_has` stays true), so it is taken out and
+  freed as before. The present bit is cleared and PTE bit 10 marks the
+  slot, in the runtime prelude (trusted). Not in the native x86 backend.
 - `boot_fb`, the framebuffer the boot loader reported, and a device window
   from 2 GiB (#67) up to 2^46 (#77).
 - `boot_acpi`, a byte of one of the firmware's ACPI tables, so a kernel
