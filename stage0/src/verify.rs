@@ -1338,7 +1338,22 @@ impl<'p> Verifier<'p> {
                     format!("that `{}..{}` is a range within `{}`", ra(1), ra(2), ra(0)))?;
                 self.fresh_u64("spawn")
             }
-            "sys_wait" | "sys_kill" | "sys_getpid" | "sys_info" => self.fresh_u64(name),
+            "sys_wait" | "sys_kill" | "sys_getpid" | "sys_info" | "sys_call" => self.fresh_u64(name),
+            "sys_send" => {
+                let n = vals[3].term();
+                let Val::Buf { len, .. } = &vals[2] else { unreachable!() };
+                self.need(st, format!("(<= {} {})", n, len), pos, "E-VERIFY-BOUNDS",
+                    format!("that `{}` bytes fit in `{}` (`{} <= blen({})`)", ra(3), ra(2), ra(3), ra(2)))?;
+                self.fresh_u64(name)
+            }
+            // The kernel may overwrite every byte of the buffer, but not its length.
+            "sys_recv" => {
+                let Val::Buf { len, .. } = &vals[2] else { unreachable!() };
+                let len = len.clone();
+                let Val::Buf { data, .. } = self.fresh_of(&Type::Bytes, "recv")? else { unreachable!() };
+                self.put_back(&args[2], Val::Buf { len, data }, st);
+                self.fresh_u64(name)
+            }
             "sys_yield" | "sys_ps" | "sys_poweroff" => Ok(Val::Unit),
             _ => unreachable!("unknown builtin {}", name),
         }
