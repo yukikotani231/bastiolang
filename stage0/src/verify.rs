@@ -418,6 +418,62 @@ pub struct Verifier<'p> {
     decimal: &'p HashSet<String>,
     /// The same for `bhex` (HEX_AXIOMS).
     hexadecimal: &'p HashSet<String>,
+    /// A note for the next proof obligation if it fails (where its
+    /// contract is written), set just before `prove`.
+    where_note: Option<String>,
+}
+
+/// Where function `name` asks for a precondition, written at `at`, when
+/// that is in the file of the call at `call` (a line in another file would
+/// mislead).
+fn requires_where(name: &str, at: Pos, call: Pos) -> Option<String> {
+    if at.file == call.file {
+        Some(format!("`{}` requires it on line {}", name, at.line))
+    } else {
+        None
+    }
+}
+
+/// What to do about a failed proof of kind `code`, for the codes a new
+/// user meets first.
+fn proof_hint(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "E-VERIFY-OVERFLOW" => "bound the operands with a `requires` or an `if`, or use `wrap_add`, `wrap_sub` or `wrap_mul` if wrapping around is meant",
+        "E-VERIFY-UNDERFLOW" => "check the operands with an `if` or a `requires` first, or use `wrap_sub` if wrapping around is meant",
+        "E-VERIFY-BOUNDS" => "check the index against the length first, with an `if` or a `requires`, or keep it in range with a loop `invariant`",
+        "E-VERIFY-DIVZERO" => "check that the divisor is not zero first, with an `if` or a `requires`",
+        "E-VERIFY-REQUIRES" => "the caller must make it hold: check it with an `if` before the call, or ask for it in the caller's own `requires`",
+        "E-VERIFY-ENSURES" => "every `return` must make it hold for each input that meets the `requires`",
+        "E-VERIFY-INVARIANT" => "an invariant must hold when the loop starts, and again after any iteration that begins with it and the loop condition true",
+        "E-VERIFY-ASSERT" => "an `assert` must follow from what is known there: the `requires`, the conditions of the enclosing `if`s and loops, and loop invariants",
+        _ => return None,
+    })
+}
+
+/// A counterexample value, with its distance from the nearest power of two
+/// when it is that close to one (`18446744073709551615 (2^64 - 1)`), since
+/// such values are where integers overflow.
+pub fn readable(v: &str) -> String {
+    if v.is_empty() || !v.bytes().all(|c| c.is_ascii_digit()) {
+        return v.to_string();
+    }
+    let Ok(x) = v.parse::<u64>() else { return v.to_string() };
+    for n in 16..64u32 {
+        let p = 1u64 << n;
+        if x == p {
+            return format!("{} (2^{})", v, n);
+        }
+        if x < p && p - x <= 16 {
+            return format!("{} (2^{} - {})", v, n, p - x);
+        }
+        if x > p && x - p <= 16 {
+            return format!("{} (2^{} + {})", v, n, x - p);
+        }
+    }
+    if x >= u64::MAX - 15 {
+        return format!("{} (2^64 - {})", v, u64::MAX - x + 1);
+    }
+    v.to_string()
 }
 
 /// Does `e` call the spec builtin `call` (`vcount`, `bdec`), or name one of
@@ -676,7 +732,7 @@ fn verify_worker(p: &Program, sums: &Summaries, counting: &HashSet<String>, deci
             return w;
         }
     };
-    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, int_ops: HashMap::new(), sums, counting, decimal, hexadecimal, counts: false };
+    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, int_ops: HashMap::new(), sums, counting, decimal, hexadecimal, counts: false, where_note: None };
     let mut run = || -> Result<(), (usize, Diag)> {
         v.smt(&format!("(declare-const {} Int)", POOLSIZE)).map_err(|d| (0, d))?;
         v.smt(&format!("(assert (and (<= 0 {p}) (<= {p} {})))", FRAME_LIMIT, p = POOLSIZE)).map_err(|d| (0, d))?;
@@ -904,6 +960,7 @@ impl<'p> Verifier<'p> {
     /// counterexample drawn from the variables in scope.
     fn prove(&mut self, st: &State, goal: &str, pos: Pos, code: &'static str, what: String) -> Result<(), Diag> {
         self.obligations += 1;
+        let where_note = self.where_note.take();
         self.smt("(push 1)")?;
         for c in &st.pc {
             self.smt(&format!("(assert {})", c))?;
@@ -951,10 +1008,16 @@ impl<'p> Verifier<'p> {
                 let mut cex = Vec::new();
                 for (label, term) in shown {
                     let v = self.solver.get_value(&term).map_err(|e| Diag::new("E-SOLVER", pos, e))?;
-                    cex.push(format!("{} = {}", label, v));
+                    cex.push(format!("{} = {}", label, readable(&v)));
                 }
                 if !cex.is_empty() {
                     d = d.note(format!("counterexample: {}", cex.join(", ")));
+                }
+                if let Some(n) = where_note {
+                    d = d.note(n);
+                }
+                if let Some(h) = proof_hint(code) {
+                    d = d.note(h);
                 }
                 Err(d)
             }
@@ -1039,6 +1102,7 @@ impl<'p> Verifier<'p> {
         for e in &cx.f.ensures {
             let sc = Scope { env: &post, old: Some(&cx.entry), result: Some(result) };
             let t = self.spec(e, sc, &mut Vec::new())?;
+            self.where_note = Some(format!("`{}` promises it on line {}", cx.f.name, e.pos.line));
             self.prove(st, &t, pos, "E-VERIFY-ENSURES", format!("the postcondition `{}` of `{}` at this return", render(e), cx.f.name))?;
         }
         Ok(())
@@ -1587,6 +1651,7 @@ impl<'p> Verifier<'p> {
         }
         for r in &f.requires {
             let t = self.spec(r, Scope { env: &pre, old: None, result: None }, &mut Vec::new())?;
+            self.where_note = requires_where(name, r.pos, pos);
             self.prove(st, &t, pos, "E-VERIFY-REQUIRES", format!("the precondition `{}` of `{}`", render(r), name))?;
         }
         let res = self.fresh_of(&f.ret, &format!("{}_ret", name))?;
@@ -1744,6 +1809,7 @@ impl<'p> Verifier<'p> {
             }
             for r in &f.requires {
                 let t = self.spec(r, Scope { env: &pre, old: None, result: None }, &mut Vec::new())?;
+                self.where_note = requires_where(name, r.pos, pos);
                 self.prove(st, &t, pos, "E-VERIFY-REQUIRES", format!("the precondition `{}` of `{}` on the other processors, which start with the kernel's own tables", render(r), name))?;
             }
         }

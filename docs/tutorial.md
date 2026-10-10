@@ -59,7 +59,8 @@ $ bastioc0 average.bastio
 average.bastio:2:13: error[E-VERIFY-OVERFLOW]: could not prove that `a + b` does not overflow u64
  2 |   return (a + b) / 2;
    |             ^
-   = counterexample: a = 18446744073709551615, b = 1
+   = counterexample: a = 18446744073709551615 (2^64 - 1), b = 1
+   = bound the operands with a `requires` or an `if`, or use `wrap_add`, `wrap_sub` or `wrap_mul` if wrapping around is meant
 ```
 
 This is the central idea of Bastio. `u64` arithmetic never wraps around and never traps: instead, the compiler must prove, before the program runs, that it cannot go out of range. Here it cannot, and it says why: the **counterexample** is a call, `average(2^64 - 1, 1)`, for which `a + b` overflows. The program is rejected even though `main` only ever passes 40 and 44, because `average` is checked on its own, for every argument it could be given.
@@ -206,6 +207,7 @@ sum.bastio:5:21: error[E-VERIFY-BOUNDS]: could not prove that the index `i` is w
  5 |     total = total + get(b, i);
    |                     ^^^
    = counterexample: len(b) = 0, i = 0, total = 0
+   = check the index against the length first, with an `if` or a `requires`, or keep it in range with a loop `invariant`
 ```
 
 With `i < len(b)` the index is fine. But that is not enough here: `total` could still overflow, since the compiler knows nothing about the values in the buffer. Count something instead, and a new problem shows up:
@@ -236,7 +238,8 @@ fn main() -> u64 {
 count.bastio:6:13: error[E-VERIFY-OVERFLOW]: could not prove that `n + 1` does not overflow u64
  6 |       n = n + 1;
    |             ^
-   = counterexample: len(b) = 39, i = 38, n = 18446744073709551615
+   = counterexample: len(b) = 39, i = 38, n = 18446744073709551615 (2^64 - 1)
+   = bound the operands with a `requires` or an `if`, or use `wrap_add`, `wrap_sub` or `wrap_mul` if wrapping around is meant
 ```
 
 `n` counts at most one per element, so it cannot overflow; why can't the compiler see that? Because it does not run the loop. It looks at one iteration, starting from *any* state the loop could be in, and in "any state" `n` can be as large as it likes. You describe the states the loop can actually be in with an **invariant**, a condition that holds every time the loop is about to test its condition:
@@ -304,6 +307,7 @@ nonzero.bastio:19:24: error[E-VERIFY-UNDERFLOW]: could not prove that `len(b) - 
  19 |   let nonzero = len(b) - zeros;
     |                        ^
     = counterexample: len(b) = 5, zeros = 6
+    = check the operands with an `if` or a `requires` first, or use `wrap_sub` if wrapping around is meant
 ```
 
 The compiler checks each function **on its own**. When `main` calls `count_zeros`, it does not look inside; it only knows what the function promises, and so far it promises nothing beyond returning a `u64`, which could be 6. The promise goes in an `ensures` clause, a **postcondition**, where `result` names the value returned:

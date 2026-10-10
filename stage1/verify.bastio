@@ -109,7 +109,7 @@ struct SumRow { x: u64, j: u64, rel: u64, keep: bool }
 /// A proof obligation: its node, code (VC_*), instance and the variables
 /// in scope (snaps[env .. env + n]); what a failure says is
 /// mpool[ms .. ms + ml].
-struct Obl { at: u64, code: u64, x: u64, env: u64, n: u64, ms: u64, ml: u64 }
+struct Obl { at: u64, code: u64, x: u64, env: u64, n: u64, ms: u64, ml: u64, ns: u64, nl: u64 }
 
 // Error codes of failed proofs.
 const VC_ALLOC: u64 = 1;
@@ -225,6 +225,9 @@ struct Vr {
   /// (filled in before `prove`), and every obligation's sentence.
   msg: Vec[u64],
   mpool: Vec[u64],
+  /// Where the next obligation's contract is written, said in a note if
+  /// it fails (filled in before `prove`, like `msg`).
+  wnote: Vec[u64],
   /// The type arguments of the instance whose source the sentences quote
   /// (see `rd_sub`): stage0 quotes the copy made for the instance.
   tsub: Vec[u64]
@@ -243,7 +246,7 @@ fn vr_new(m: &mut Mono, p: &Parser) -> Vr {
     t_zarr: 0, t_nobool: 0, t_k: 0, t_255: 0, unit: 0,
     ty_bytes: prim(&mut m, p, TY_BYTES), ty_child: prim(&mut m, p, TY_CHILD), ty_frame: prim(&mut m, p, TY_FRAME),
     ty_pt: prim(&mut m, p, TY_PT), ty_pool: prim(&mut m, p, TY_POOL), fail_at: 0, fail_code: 0,
-    fail_obl: 0, msg: vec_new[u64](), mpool: vec_new[u64](), tsub: vec_new[u64]()
+    fail_obl: 0, msg: vec_new[u64](), mpool: vec_new[u64](), wnote: vec_new[u64](), tsub: vec_new[u64]()
   };
   v.t_true = atom_str(&mut v, "true");
   v.t_false = atom_str(&mut v, "false");
@@ -280,6 +283,7 @@ fn vr_free(v: Vr) {
   vec_free(v.snaps);
   vec_free(v.msg);
   vec_free(v.mpool);
+  vec_free(v.wnote);
   vec_free(v.tsub);
 }
 
@@ -2555,6 +2559,46 @@ fn vm_text(v: &mut Vr, t: u64) {
   }
 }
 
+/// "`f` requires it on line N" for precondition `r` of `f` (the text of
+/// term `nm`, or else the name of node `nmi`), checked at node `loc`:
+/// only when both are in one file, as stage0's `requires_where` says.
+fn wn_requires(v: &mut Vr, p: &Parser, nm: u64, nmi: u64, r: u64, loc: u64) {
+  let rn = node_at(p.nodes, r);
+  let ln = node_at(p.nodes, loc);
+  if rn.file == ln.file {
+    rd_s(&mut v.wnote, "`");
+    if nm != 0 {
+      let tm = tm_at(v, nm);
+      let mut k = 0;
+      while k < tm.b {
+        let ch = pool_at(v, vadd(tm.a, k));
+        vec_push(&mut v.wnote, ch);
+        k = k + 1;
+      }
+    } else {
+      let n = node_at(p.nodes, nmi);
+      rd_src(&mut v.wnote, p, n.s, n.e);
+    }
+    rd_s(&mut v.wnote, "` requires it on line ");
+    rd_num(&mut v.wnote, rn.line);
+  }
+}
+
+/// "`f` promises it on line N" for postcondition `e` of `f` (term `nm`).
+fn wn_ensures(v: &mut Vr, p: &Parser, nm: u64, e: u64) {
+  let en = node_at(p.nodes, e);
+  rd_s(&mut v.wnote, "`");
+  let tm = tm_at(v, nm);
+  let mut k = 0;
+  while k < tm.b {
+    let ch = pool_at(v, vadd(tm.a, k));
+    vec_push(&mut v.wnote, ch);
+    k = k + 1;
+  }
+  rd_s(&mut v.wnote, "` promises it on line ");
+  rd_num(&mut v.wnote, en.line);
+}
+
 /// "that `a` is empty: ..." for a page table freed.
 fn vm_pt_empty(v: &mut Vr, p: &Parser, a: u64) {
   vm_s(&mut v, "that `");
@@ -2659,7 +2703,17 @@ fn prove(v: &mut Vr, st: &VState, goal: u64, loc: u64, code: u64) {
     }
   }
   let ml = vlen_since(v.mpool, ms);
-  vec_push(&mut v.obls, Obl { at: loc, code: code, x: v.env, env: start, n: vec_len(st.env), ms: ms, ml: ml });
+  let ns = vec_len(v.mpool);
+  k = 0;
+  while k < vec_len(v.wnote) {
+    vec_push(&mut v.mpool, u_at(v.wnote, k));
+    k = k + 1;
+  }
+  while vec_len(v.wnote) > 0 {
+    vec_pop(&mut v.wnote);
+  }
+  let nl = vlen_since(v.mpool, ns);
+  vec_push(&mut v.obls, Obl { at: loc, code: code, x: v.env, env: start, n: vec_len(st.env), ms: ms, ml: ml, ns: ns, nl: nl });
   send(&mut v, CMD_PUSH, 0, 0);
   k = 0;
   while k < vec_len(st.pc) {
@@ -3916,6 +3970,7 @@ fn vsmp_run(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut 
       vm_s(&mut v, "` of `");
       vm_name(&mut v, p, a0);
       vm_s(&mut v, "` on the other processors, which start with the kernel's own tables");
+      wn_requires(&mut v, p, 0, a0, r, i);
       prove(&mut v, st, t, i, VC_REQUIRES);
       r = next_of(p, r);
     }
@@ -3959,6 +4014,7 @@ fn vuser_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64, loc: u6
     vm_s(&mut v, "` of `");
     vm_text(&mut v, nm);
     vm_s(&mut v, "`");
+    wn_requires(&mut v, p, nm, 0, r, loc);
     prove(&mut v, st, t, loc, VC_REQUIRES);
     r = next_of(p, r);
   }
@@ -6040,6 +6096,7 @@ fn check_ensures(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, st: &VState,
     vm_s(&mut v, "` of `");
     vm_text(&mut v, nm);
     vm_s(&mut v, "` at this return");
+    wn_ensures(&mut v, p, nm, e);
     prove(&mut v, st, t, loc, VC_ENSURES);
 
     e = next_of(p, e);
@@ -6166,7 +6223,7 @@ fn buffers_kept(v: &mut Vr, m: &mut Mono, p: &Parser, x: u64) {
         rd_src(&mut v.mpool, p, d.s, d.e);
         rd_s(&mut v.mpool, "` may free or replace it");
         let ml = vlen_since(v.mpool, ms);
-        vec_push(&mut v.obls, Obl { at: q, code: VC_EXPORT, x: x, env: 0, n: 0, ms: ms, ml: ml });
+        vec_push(&mut v.obls, Obl { at: q, code: VC_EXPORT, x: x, env: 0, n: 0, ms: ms, ml: ml, ns: 0, nl: 0 });
         send(&mut v, CMD_FAIL, 0, 0);
         done = true;
       }
