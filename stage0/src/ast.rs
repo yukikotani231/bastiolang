@@ -319,21 +319,50 @@ pub fn resolve_enum_types(p: &mut Program) {
             _ => {}
         }
     }
+    // Type arguments that survive monomorphization (`vec_new[T]()`).
+    fn fix_expr(e: &mut Expr, names: &[String]) {
+        match &mut e.kind {
+            ExprKind::TypeApp(ts, inner) => {
+                ts.iter_mut().for_each(|t| fix(t, names));
+                fix_expr(inner, names);
+            }
+            ExprKind::Field(x, _) | ExprKind::Is(x, _, _) | ExprKind::Not(x) | ExprKind::Forall(_, x) => fix_expr(x, names),
+            ExprKind::Variant(_, _, Some(x)) => fix_expr(x, names),
+            ExprKind::StructLit(_, fs) => fs.iter_mut().for_each(|(_, x)| fix_expr(x, names)),
+            ExprKind::Bin(_, a, b) => {
+                fix_expr(a, names);
+                fix_expr(b, names);
+            }
+            ExprKind::Call(_, xs) => xs.iter_mut().for_each(|x| fix_expr(x, names)),
+            _ => {}
+        }
+    }
     fn fix_stmts(ss: &mut [Stmt], names: &[String]) {
         for s in ss {
             match &mut s.kind {
-                StmtKind::Let { ty: Some(t), .. } => fix(t, names),
-                StmtKind::If { then_b, else_b, .. } => {
+                StmtKind::Let { ty, init, .. } => {
+                    if let Some(t) = ty {
+                        fix(t, names);
+                    }
+                    fix_expr(init, names);
+                }
+                StmtKind::Assign { value: x, .. } | StmtKind::Assert(x) | StmtKind::Expr(x) | StmtKind::Return(Some(x)) => fix_expr(x, names),
+                StmtKind::If { cond, then_b, else_b } => {
+                    fix_expr(cond, names);
                     fix_stmts(then_b, names);
                     fix_stmts(else_b, names);
                 }
-                StmtKind::While { body, .. } => fix_stmts(body, names),
-                StmtKind::Match { arms, .. } => {
+                StmtKind::While { cond, body, .. } => {
+                    fix_expr(cond, names);
+                    fix_stmts(body, names);
+                }
+                StmtKind::Match { scrut, arms } => {
+                    fix_expr(scrut, names);
                     for a in arms {
                         fix_stmts(&mut a.body, names);
                     }
                 }
-                _ => {}
+                StmtKind::Return(None) => {}
             }
         }
     }

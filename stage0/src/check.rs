@@ -1126,7 +1126,9 @@ impl<'a> Ctx<'a> {
                 fn named(a: &Expr) -> bool {
                     match &a.kind {
                         ExprKind::Var(_) | ExprKind::Str(_) | ExprKind::Blob(_) => true,
-                        ExprKind::Call(n, xs) => n == "old" && xs.len() == 1 && matches!(xs[0].kind, ExprKind::Var(_)),
+                        ExprKind::Call(n, xs) if n == "old" => xs.len() == 1 && matches!(xs[0].kind, ExprKind::Var(_)),
+                        // An element of a named vector.
+                        ExprKind::Call(n, xs) if n == "vget" => xs.len() == 2 && named(&xs[0]),
                         ExprKind::Field(b, _) => named(b),
                         _ => false,
                     }
@@ -1163,20 +1165,16 @@ impl<'a> Ctx<'a> {
                 if name == "vlen" || name == "vget" {
                     arity(if name == "vlen" { 1 } else { 2 })?;
                     let t = self.spec_expr(&args[0], in_ensures, bound)?;
-                    let ok = match &t {
-                        Type::Vec(el) => name == "vlen" || **el == Type::U64,
-                        _ => false,
+                    let Type::Vec(el) = &t else {
+                        return Err(Diag::new("E-TYPE", args[0].pos, format!("argument of `{}` must be a Vec, found {}", name, t.name())));
                     };
-                    if !ok {
-                        let want = if name == "vlen" { "a Vec" } else { "a Vec[u64]" };
-                        return Err(Diag::new("E-TYPE", args[0].pos, format!("argument of `{}` must be {}, found {}", name, want, t.name())));
-                    }
                     check_lin(&args[0])?;
-                    if name == "vget" {
-                        let ti = self.spec_expr(&args[1], in_ensures, bound)?;
-                        expect_ty(&ti, &Type::U64, args[1].pos, "an index")?;
+                    if name == "vlen" {
+                        return Ok(Type::U64);
                     }
-                    return Ok(Type::U64);
+                    let ti = self.spec_expr(&args[1], in_ensures, bound)?;
+                    expect_ty(&ti, &Type::U64, args[1].pos, "an index")?;
+                    return Ok((**el).clone());
                 }
                 if !matches!(name.as_str(), "len" | "get" | "slen" | "sget" | "blen" | "bget") {
                     return Err(Diag::new("E-TYPE", e.pos, format!("`{}` cannot be called in a specification (allowed: len, get, slen, sget, blen, bget, vlen, vget, old, ghost accessors and spec fns)", name)));

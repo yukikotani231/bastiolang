@@ -71,9 +71,10 @@ enum Val {
     /// A box: its contents, or (beyond the depth the verifier unfolds
     /// recursive data to) only their type.
     Box(BoxVal),
-    /// A vector: its length, and (for `Vec[u64]`) its elements as an SMT
-    /// array; for other element types, reads give fresh values.
-    Vec { elem: Type, len: String, data: String },
+    /// A vector: its length, and its elements "lifted": a value shaped like
+    /// one element whose every term is an SMT array from index to that term
+    /// (see `leaves`). Boxes inside the elements are opaque.
+    Vec { elem: Type, len: String, elems: Box<Val> },
     Unit,
 }
 
@@ -138,12 +139,92 @@ fn merge_val(c: &str, a: &Val, b: &Val) -> Val {
         (Val::Obj(ty, f1), Val::Obj(_, f2)) => Val::Obj(ty.clone(), f1.iter().zip(f2).map(|(x, y)| ite(c, x, y)).collect()),
         (Val::Struct(n, f1), Val::Struct(_, f2)) => Val::Struct(n.clone(), f1.iter().zip(f2).map(|(x, y)| merge_val(c, x, y)).collect()),
         (Val::Enum(n, t1, p1), Val::Enum(_, t2, p2)) => Val::Enum(n.clone(), ite(c, t1, t2), p1.iter().zip(p2).map(|(x, y)| merge_val(c, x, y)).collect()),
-        (Val::Vec { elem, len: l1, data: d1 }, Val::Vec { len: l2, data: d2, .. }) => Val::Vec { elem: elem.clone(), len: ite(c, l1, l2), data: ite(c, d1, d2) },
+        (Val::Vec { elem, len: l1, elems: e1 }, Val::Vec { len: l2, elems: e2, .. }) => Val::Vec { elem: elem.clone(), len: ite(c, l1, l2), elems: Box::new(merge_val(c, e1, e2)) },
         (Val::Box(BoxVal::Known(x)), Val::Box(BoxVal::Known(y))) => Val::Box(BoxVal::Known(Box::new(merge_val(c, x, y)))),
         // Forgetting what one side knew is sound.
         (Val::Box(BoxVal::Opaque(t)), Val::Box(_)) | (Val::Box(_), Val::Box(BoxVal::Opaque(t))) => Val::Box(BoxVal::Opaque(t.clone())),
         (Val::Unit, Val::Unit) => Val::Unit,
         _ => unreachable!("type checker guarantees matching kinds"),
+    }
+}
+
+/// The SMT terms a value is made of, with their sorts, in a fixed order that
+/// depends only on its type. Box contents are left out. A vector's element
+/// terms are arrays one level deeper than the element's own sorts.
+fn leaves(v: &Val, out: &mut Vec<(String, String)>) {
+    match v {
+        Val::U(t) => out.push((t.clone(), "Int".into())),
+        Val::B(t) => out.push((t.clone(), "Bool".into())),
+        Val::Buf { len, data } | Val::Str { len, data } => {
+            out.push((len.clone(), "Int".into()));
+            out.push((data.clone(), "(Array Int Int)".into()));
+        }
+        Val::Obj(t, fs) => {
+            for ((_, arr, _), f) in ghost_fields(t).iter().zip(fs) {
+                out.push((f.clone(), if *arr { "(Array Int Bool)" } else { "Int" }.into()));
+            }
+        }
+        Val::Struct(_, fs) => fs.iter().for_each(|f| leaves(f, out)),
+        Val::Enum(_, tag, ps) => {
+            out.push((tag.clone(), "Int".into()));
+            ps.iter().for_each(|p| leaves(p, out));
+        }
+        Val::Vec { len, elems, .. } => {
+            out.push((len.clone(), "Int".into()));
+            let mut inner = Vec::new();
+            leaves(elems, &mut inner);
+            out.extend(inner.into_iter().map(|(t, s)| (t, format!("(Array Int {})", s))));
+        }
+        Val::Box(_) | Val::Unit => {}
+    }
+}
+
+/// The value shaped like `v` whose terms are `f` applied to `v`'s terms
+/// (in the order of `leaves`).
+fn map_leaves(v: &Val, f: &mut dyn FnMut(&str) -> String) -> Val {
+    match v {
+        Val::U(t) => Val::U(f(t)),
+        Val::B(t) => Val::B(f(t)),
+        Val::Buf { len, data } => Val::Buf { len: f(len), data: f(data) },
+        Val::Str { len, data } => Val::Str { len: f(len), data: f(data) },
+        Val::Obj(t, fs) => Val::Obj(t.clone(), fs.iter().map(|x| f(x)).collect()),
+        Val::Struct(n, fs) => Val::Struct(n.clone(), fs.iter().map(|x| map_leaves(x, f)).collect()),
+        Val::Enum(n, tag, ps) => {
+            let tag = f(tag);
+            Val::Enum(n.clone(), tag, ps.iter().map(|x| map_leaves(x, f)).collect())
+        }
+        Val::Vec { elem, len, elems } => {
+            let len = f(len);
+            Val::Vec { elem: elem.clone(), len, elems: Box::new(map_leaves(elems, f)) }
+        }
+        Val::Box(b) => Val::Box(b.clone()),
+        Val::Unit => Val::Unit,
+    }
+}
+
+/// `elems` with `x` stored at index `i`.
+fn vec_write(elems: &Val, i: &str, x: &Val) -> Val {
+    let mut xs = Vec::new();
+    leaves(x, &mut xs);
+    let mut it = xs.into_iter();
+    map_leaves(elems, &mut |arr| format!("(store {} {} {})", arr, i, it.next().unwrap().0))
+}
+
+/// Makes every box in `v` (of type `ty`) opaque: a lifted template must not
+/// claim the same box contents for every index.
+fn opaque_boxes(v: &Val, ty: &Type) -> Val {
+    match (v, ty) {
+        (Val::Struct(n, fs), _) => Val::Struct(n.clone(), fs.iter().zip(&struct_def(n).unwrap().fields).map(|(f, (_, ft))| opaque_boxes(f, ft)).collect()),
+        (Val::Enum(n, tag, ps), _) => Val::Enum(
+            n.clone(),
+            tag.clone(),
+            ps.iter().zip(&enum_def(n).unwrap().variants).map(|(p, (_, pt))| match pt {
+                Some(pt) => opaque_boxes(p, pt),
+                None => Val::Unit,
+            }).collect(),
+        ),
+        (Val::Box(_), Type::Box(t)) => Val::Box(BoxVal::Opaque((**t).clone())),
+        (v, _) => v.clone(),
     }
 }
 
@@ -337,7 +418,10 @@ impl<'p> Verifier<'p> {
                 }
                 Ok(Val::Enum(n.clone(), tag, ps))
             }
-            Type::Vec(t) => Ok(Val::Vec { elem: (**t).clone(), len: self.fresh_len(hint)?, data: self.fresh_array(hint, "Int")? }),
+            Type::Vec(t) => {
+                let elems = self.fresh_lifted(t, hint)?;
+                Ok(Val::Vec { elem: (**t).clone(), len: self.fresh_len(hint)?, elems: Box::new(elems) })
+            }
             Type::Box(t) => {
                 if self.box_depth >= BOX_DEPTH {
                     return Ok(Val::Box(BoxVal::Opaque((**t).clone())));
@@ -355,6 +439,34 @@ impl<'p> Verifier<'p> {
                 Ok(Val::Obj(t.clone(), fs))
             }
         }
+    }
+
+    /// Fresh contents for a vector of `ty`: every term of an element becomes
+    /// an unconstrained array indexed by position.
+    fn fresh_lifted(&mut self, ty: &Type, hint: &str) -> Result<Val, Diag> {
+        let tmpl = self.fresh_of(ty, hint)?;
+        let tmpl = opaque_boxes(&tmpl, ty);
+        let mut ls = Vec::new();
+        leaves(&tmpl, &mut ls);
+        let mut arrs = Vec::new();
+        for (_, sort) in &ls {
+            arrs.push(self.fresh_array(&format!("{}_elems", hint), sort)?);
+        }
+        let mut it = arrs.into_iter();
+        Ok(map_leaves(&tmpl, &mut |_| it.next().unwrap()))
+    }
+
+    /// The element at index `i`: a fresh value (with every fact a value of
+    /// its type satisfies) equal, term by term, to what the vector stores.
+    fn vec_read(&mut self, elem: &Type, elems: &Val, i: &str, st: &mut State) -> Result<Val, Diag> {
+        let v = self.fresh_of(elem, "elem")?;
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        leaves(&v, &mut a);
+        leaves(elems, &mut b);
+        for ((x, _), (arr, _)) in a.iter().zip(&b) {
+            st.pc.push(format!("(= {} (select {} {}))", x, arr, i));
+        }
+        Ok(v)
     }
 
     /// Proves `goal` under the path condition, or reports a diagnostic with a
@@ -728,7 +840,7 @@ impl<'p> Verifier<'p> {
             }
             Val::Vec { elem, len, .. } => {
                 let len = if keep { len.clone() } else { self.fresh_len(name)? };
-                Val::Vec { elem: elem.clone(), len, data: self.fresh_array(name, "Int")? }
+                Val::Vec { elem: elem.clone(), len, elems: Box::new(self.fresh_lifted(elem, name)?) }
             }
             Val::Box(BoxVal::Known(i)) => Val::Box(BoxVal::Known(Box::new(self.havoc(i, false, name)?))),
             Val::Box(BoxVal::Opaque(t)) => Val::Box(BoxVal::Opaque(t.clone())),
@@ -741,7 +853,7 @@ impl<'p> Verifier<'p> {
         match &e.kind {
             ExprKind::TypeApp(targs, inner) => match &inner.kind {
                 ExprKind::Call(n, _) if n == "vec_new" => {
-                    Ok(Val::Vec { elem: targs[0].clone(), len: "0".into(), data: "((as const (Array Int Int)) 0)".into() })
+                    Ok(Val::Vec { elem: targs[0].clone(), len: "0".into(), elems: Box::new(self.fresh_lifted(&targs[0], "vec")?) })
                 }
                 _ => unreachable!("removed by monomorphization"),
             },
@@ -914,17 +1026,6 @@ impl<'p> Verifier<'p> {
         set_path(&mut st.env, n, v);
     }
 
-    /// The element at `i` of a vector: tracked for `Vec[u64]`, fresh otherwise.
-    fn vec_elem(&mut self, elem: &Type, data: &str, i: &str, st: &mut State) -> Result<Val, Diag> {
-        if *elem == Type::U64 {
-            let sel = format!("(select {} {})", data, i);
-            st.pc.push(format!("(and (<= 0 {s}) (<= {s} {}))", U64_MAX, s = sel));
-            Ok(Val::U(sel))
-        } else {
-            self.fresh_of(elem, "elem")
-        }
-    }
-
     fn need(&mut self, st: &State, goal: String, pos: Pos, code: &'static str, what: String) -> Result<(), Diag> {
         self.prove(st, &goal, pos, code, what)
     }
@@ -1004,30 +1105,30 @@ impl<'p> Verifier<'p> {
                 _ => unreachable!(),
             },
             "vec_push" => {
-                let Val::Vec { elem, len, data } = vals[0].clone() else { unreachable!() };
+                let Val::Vec { elem, len, elems } = vals[0].clone() else { unreachable!() };
                 // A push that cannot grow the vector aborts (out of memory),
                 // so after it the length stayed below 2^60.
                 st.pc.push(format!("(< {} {})", len, ALLOC_MAX));
-                let data = if elem == Type::U64 { format!("(store {} {} {})", data, len, vals[1].term()) } else { data };
-                self.put_back(&args[0], Val::Vec { elem, len: format!("(+ {} 1)", len), data }, st);
+                let elems = vec_write(&elems, &len, &vals[1]);
+                self.put_back(&args[0], Val::Vec { elem, len: format!("(+ {} 1)", len), elems: Box::new(elems) }, st);
                 Ok(Val::Unit)
             }
             "vec_pop" => {
-                let Val::Vec { elem, len, data } = vals[0].clone() else { unreachable!() };
+                let Val::Vec { elem, len, elems } = vals[0].clone() else { unreachable!() };
                 self.need(st, format!("(> {} 0)", len), pos, "E-VERIFY-BOUNDS", format!("that `{}` is not empty (`vlen({}) > 0`)", ra(0), ra(0)))?;
                 let last = format!("(- {} 1)", len);
-                let v = self.vec_elem(&elem, &data, &last, st)?;
-                self.put_back(&args[0], Val::Vec { elem, len: last, data }, st);
+                let v = self.vec_read(&elem, &elems, &last, st)?;
+                self.put_back(&args[0], Val::Vec { elem, len: last, elems }, st);
                 Ok(v)
             }
             "vec_get" | "vec_set" | "vec_swap" => {
-                let Val::Vec { elem, len, data } = vals[0].clone() else { unreachable!() };
+                let Val::Vec { elem, len, elems } = vals[0].clone() else { unreachable!() };
                 let i = vals[1].term().to_string();
                 self.need(st, format!("(< {} {})", i, len), pos, "E-VERIFY-BOUNDS", format!("that the index `{}` is within `{}` (`{} < vlen({})`)", ra(1), ra(0), ra(1), ra(0)))?;
-                let old = if name == "vec_set" { Val::Unit } else { self.vec_elem(&elem, &data, &i, st)? };
+                let old = if name == "vec_set" { Val::Unit } else { self.vec_read(&elem, &elems, &i, st)? };
                 if name != "vec_get" {
-                    let data = if elem == Type::U64 { format!("(store {} {} {})", data, i, vals[2].term()) } else { data };
-                    self.put_back(&args[0], Val::Vec { elem, len, data }, st);
+                    let elems = vec_write(&elems, &i, &vals[2]);
+                    self.put_back(&args[0], Val::Vec { elem, len, elems: Box::new(elems) }, st);
                 }
                 Ok(old)
             }
@@ -1242,6 +1343,11 @@ impl<'p> Verifier<'p> {
                 self.spec_val(&xs[0], Scope { env: old, old: None, result: None }, bound)
             }
             ExprKind::Str(bytes) => Ok(str_val(bytes)),
+            ExprKind::Call(n, xs) if n == "vget" => {
+                let Val::Vec { elems, .. } = self.spec_val(&xs[0], sc, bound)? else { unreachable!("checked: a Vec") };
+                let i = self.spec(&xs[1], sc, bound)?;
+                Ok(map_leaves(&elems, &mut |arr| format!("(select {} {})", arr, i)))
+            }
             ExprKind::Field(b, f) => match self.spec_val(b, sc, bound).and_then(|v| self.look_inside(v))? {
                 Val::Struct(n, fs) => {
                     let k = struct_def(&n).unwrap().fields.iter().position(|x| &x.0 == f).expect("checked field");
@@ -1317,14 +1423,13 @@ impl<'p> Verifier<'p> {
                     }
                     return self.spec(&sf.body, Scope { env: &env, old: None, result: None }, &mut Vec::new());
                 }
+                if name == "vget" {
+                    return Ok(self.spec_val(e, sc, bound)?.term().to_string());
+                }
                 let v = self.spec_val(&args[0], sc, bound)?;
                 match name.as_str() {
                     "vlen" => match v {
                         Val::Vec { len, .. } => len,
-                        _ => unreachable!(),
-                    },
-                    "vget" => match v {
-                        Val::Vec { data, .. } => format!("(select {} {})", data, self.spec(&args[1], sc, bound)?),
                         _ => unreachable!(),
                     },
                     "len" | "slen" | "blen" => match v {
