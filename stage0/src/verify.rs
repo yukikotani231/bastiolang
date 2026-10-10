@@ -2197,12 +2197,6 @@ impl<'p> Verifier<'p> {
             }
 
             // ---- MMU and CPU ----
-            "mmu_switch" => {
-                let t = &vals[1];
-                self.need(st, format!("(= {} 4)", t.field("level")), pos, "E-VERIFY-PT", format!("that `{}` is a top-level table (level 4)", ra(1)))?;
-                self.put_back(&args[0], Val::Obj(Type::Mmu, vec![t.field("id")]), st);
-                Ok(Val::Unit)
-            }
             "mmu_kernel" => {
                 self.put_back(&args[0], Val::Obj(Type::Mmu, vec![KROOT.into()]), st);
                 Ok(Val::Unit)

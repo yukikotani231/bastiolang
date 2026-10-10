@@ -33,8 +33,17 @@ for f in tests/fail/*.bastio; do
   if "$BASTIOC" --check --target "${target:-hosted}" "$f" 2>"$tmp/err"; then
     echo "FAIL $f: accepted, want $want"; fail=$((fail+1)); continue
   fi
-  if grep -q "error\[$want\]" "$tmp/err"; then pass=$((pass+1)); else
-    echo "FAIL $f: wrong error, want $want"; sed 's/^/    /' "$tmp/err"; fail=$((fail+1)); fi
+  if ! grep -q "error\[$want\]" "$tmp/err"; then
+    echo "FAIL $f: wrong error, want $want"; sed 's/^/    /' "$tmp/err"; fail=$((fail+1)); continue
+  fi
+  # `// expect-text: T` lines: each T must appear in the error output (the
+  # sentence or a `  = ` hint), so the wording of diagnostics is tested too.
+  missing=$(sed -n 's|^// expect-text: *||p' "$f" | while IFS= read -r t; do
+    grep -qF -- "$t" "$tmp/err" || echo "$t"; done)
+  if [ -n "$missing" ]; then
+    echo "FAIL $f: error output lacks: $missing"; sed 's/^/    /' "$tmp/err"; fail=$((fail+1)); continue
+  fi
+  pass=$((pass+1))
 done
 # User programs (for a Bastio kernel such as BastiOS) cannot run here: they
 # must verify and their C must compile freestanding.

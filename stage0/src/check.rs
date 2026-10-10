@@ -102,7 +102,6 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("pt_put_frame", Avail::Mem, vec![m(PageTable), U64, Frame, Bool], Unit),
         ("pt_take_frame", Avail::Mem, vec![m(PageTable), U64], Frame),
         ("pt_lease_count", Avail::Mem, vec![m(PageTable)], U64),
-        ("mmu_switch", Avail::Kernel, vec![m(Mmu), r(PageTable)], Unit),
         ("mmu_enter", Avail::Kernel, vec![m(Mmu), m(PageTable)], Lease),
         ("mmu_exit", Avail::Kernel, vec![m(Mmu), Lease], Unit),
         ("mmu_kernel", Avail::Kernel, vec![m(Mmu)], Unit),
@@ -487,6 +486,8 @@ struct Ctx<'a> {
     /// Linear variables that have been consumed (or, for `&mut` parameters,
     /// moved out of and not yet put back).
     moved: HashSet<String>,
+    /// Where each place was last consumed, for the note under a later use.
+    moved_at: HashMap<String, Pos>,
     /// See `FnDef::int_ops`.
     int_ops: HashMap<Pos, Type>,
     /// The user functions this one calls (`locked` and `smp_run` call the
@@ -602,8 +603,47 @@ fn lock_order(graph: &[(String, Vec<String>, Vec<(Pos, String, String)>)]) -> Re
     Ok(())
 }
 
+/// The number of single-byte insertions, deletions and substitutions that
+/// turn `a` into `b`.
+fn edit_distance(a: &[u8], b: &[u8]) -> usize {
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for i in 0..a.len() {
+        let mut diag = row[0];
+        row[0] = i + 1;
+        for j in 0..b.len() {
+            let up = row[j + 1];
+            let sub = if a[i] == b[j] { diag } else { diag + 1 };
+            row[j + 1] = sub.min(up + 1).min(row[j] + 1);
+            diag = up;
+        }
+    }
+    row[b.len()]
+}
+
+/// Adds `did you mean `x`?` to an error about the unknown name `name`: the
+/// closest of `names` (generic instances, whose names have brackets, left
+/// out), at most one edit away for a name of up to 4 bytes and two edits
+/// otherwise; the first by byte order among equally close ones.
+fn did_you_mean<'a>(d: Diag, name: &str, names: impl Iterator<Item = &'a str>) -> Diag {
+    let limit = if name.len() <= 4 { 1 } else { 2 };
+    let mut best: Option<(usize, &str)> = None;
+    for n in names {
+        if n.contains('[') {
+            continue;
+        }
+        let k = edit_distance(name.as_bytes(), n.as_bytes());
+        if k <= limit && best.map_or(true, |(bk, bn)| k < bk || (k == bk && n < bn)) {
+            best = Some((k, n));
+        }
+    }
+    match best {
+        Some((_, n)) => d.note(format!("did you mean `{}`?", n)),
+        None => d,
+    }
+}
+
 fn new_ctx<'a>(sigs: &'a HashMap<String, Sig>, specs: &'a [SpecFn], target: Target, ret: Type) -> Ctx<'a> {
-    Ctx { sigs, specs, target, ret, scopes: vec![Vec::new()], vars: HashMap::new(), moved: HashSet::new(), int_ops: HashMap::new(), calls: Vec::new(), lock_sites: Vec::new(), params: Vec::new(), in_inv: std::cell::Cell::new(false), old_only: std::cell::Cell::new(false) }
+    Ctx { sigs, specs, target, ret, scopes: vec![Vec::new()], vars: HashMap::new(), moved: HashSet::new(), moved_at: HashMap::new(), int_ops: HashMap::new(), calls: Vec::new(), lock_sites: Vec::new(), params: Vec::new(), in_inv: std::cell::Cell::new(false), old_only: std::cell::Cell::new(false) }
 }
 
 /// A spec fn may only call spec fns defined before it, so expansion terminates.
@@ -834,7 +874,7 @@ impl<'a> Ctx<'a> {
         let (t, info) = self.path_type(path, pos)?;
         if let Some(m) = self.prefix_moved(path) {
             let msg = if m == path { format!("`{}` is used after it was consumed", path) } else { format!("`{}` is used after `{}` was consumed", path, m) };
-            return Err(Diag::new("E-LINEAR-USE", pos, msg));
+            return Err(self.consumed_note(Diag::new("E-LINEAR-USE", pos, msg), &m));
         }
         if t.is_linear() {
             if matches!(info.ty, Type::Ref(_)) {
@@ -844,8 +884,17 @@ impl<'a> Ctx<'a> {
                 return Err(Diag::new("E-LINEAR-USE", pos, format!("`{}` is used after its field `{}` was moved out", path, m)));
             }
             self.moved.insert(path.to_string());
+            self.moved_at.insert(path.to_string(), pos);
         }
         Ok(t)
+    }
+
+    /// Adds where `m` was consumed to an error about a use after that.
+    fn consumed_note(&self, d: Diag, m: &str) -> Diag {
+        match self.moved_at.get(m) {
+            Some(p) => d.note(format!("`{}` was consumed at {}:{}", m, p.line, p.col)),
+            None => d,
+        }
     }
 
     fn leak_check_all(&self, pos: Pos, when: &str) -> Result<(), Diag> {
@@ -921,7 +970,7 @@ impl<'a> Ctx<'a> {
                 expect_ty(&t, &want, value.pos, &format!("the value assigned to `{}`", name))?;
                 if let Some(k) = name.rfind('.') {
                     if let Some(m) = self.prefix_moved(&name[..k]) {
-                        return Err(Diag::new("E-LINEAR-USE", pos, format!("cannot assign to `{}`: `{}` was consumed", name, m)));
+                        return Err(self.consumed_note(Diag::new("E-LINEAR-USE", pos, format!("cannot assign to `{}`: `{}` was consumed", name, m)), &m));
                     }
                 }
                 if want.is_linear() {
@@ -1028,7 +1077,7 @@ impl<'a> Ctx<'a> {
         let t = if borrowed {
             let p = place(scrut).unwrap();
             if let Some(m) = self.prefix_moved(&p) {
-                return Err(Diag::new("E-LINEAR-USE", scrut.pos, format!("`{}` is used after `{}` was consumed", p, m)));
+                return Err(self.consumed_note(Diag::new("E-LINEAR-USE", scrut.pos, format!("`{}` is used after `{}` was consumed", p, m)), &m));
             }
             self.path_type(&p, scrut.pos)?.0
         } else {
@@ -1135,7 +1184,9 @@ impl<'a> Ctx<'a> {
     }
 
     fn var_info(&self, name: &str, pos: Pos) -> Result<VarInfo, Diag> {
-        self.vars.get(name).cloned().ok_or_else(|| Diag::new("E-TYPE", pos, format!("unknown variable `{}`", name)))
+        self.vars.get(name).cloned().ok_or_else(|| {
+            did_you_mean(Diag::new("E-TYPE", pos, format!("unknown variable `{}`", name)), name, self.vars.keys().map(|k| k.as_str()))
+        })
     }
 
     /// A code expression in a position that expects `want`: a literal takes
@@ -1227,7 +1278,7 @@ impl<'a> Ctx<'a> {
                 let t = match place(x) {
                     Some(p) => {
                         if let Some(m) = self.prefix_moved(&p) {
-                            return Err(Diag::new("E-LINEAR-USE", x.pos, format!("`{}` is used after `{}` was consumed", p, m)));
+                            return Err(self.consumed_note(Diag::new("E-LINEAR-USE", x.pos, format!("`{}` is used after `{}` was consumed", p, m)), &m));
                         }
                         self.path_type(&p, x.pos)?.0
                     }
@@ -1374,7 +1425,9 @@ impl<'a> Ctx<'a> {
                 if PT_BORROW_BUILTINS.contains(&name.as_str()) {
                     return self.pt_borrow(name, args, e.pos);
                 }
-                let sig = self.sigs.get(name).cloned().ok_or_else(|| Diag::new("E-TYPE", e.pos, format!("unknown function `{}`", name)))?;
+                let sig = self.sigs.get(name).cloned().ok_or_else(|| {
+                    did_you_mean(Diag::new("E-TYPE", e.pos, format!("unknown function `{}`", name)), name, self.sigs.keys().map(|k| k.as_str()))
+                })?;
                 if !available(name, self.target) {
                     return Err(Diag::new("E-TARGET", e.pos, format!("`{}` is not available on this target", name)));
                 }
@@ -1595,8 +1648,8 @@ impl<'a> Ctx<'a> {
                     return Err(Diag::new("E-TYPE", a.pos, format!("`{}` is not mutable (declare it with `mut`)", path_root(&n))));
                 }
             }
-            if self.prefix_moved(&n).is_some() {
-                return Err(Diag::new("E-LINEAR-USE", a.pos, format!("`{}` is borrowed after it was consumed", n)));
+            if let Some(m) = self.prefix_moved(&n) {
+                return Err(self.consumed_note(Diag::new("E-LINEAR-USE", a.pos, format!("`{}` is borrowed after it was consumed", n)), &m));
             }
             if let Some(m) = self.desc_moved(&n) {
                 return Err(Diag::new("E-LINEAR-USE", a.pos, format!("`{}` is borrowed after its field `{}` was moved out", n, m)));
