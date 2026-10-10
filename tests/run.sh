@@ -63,17 +63,19 @@ else
   sed 's/^/    /' "$tmp/tb.diff"; fail=$((fail+1))
 fi
 # Library search: a program outside the repository finds core only with
-# `--lib` (docs/language.md, "Several files").
+# `--lib` or BASTIO_LIB (docs/language.md, "Several files").
 mkdir -p "$tmp/away"
 printf 'import "core/option.bastio";\nfn main() -> u64 { return opt_or[u64](Option[u64]::Some(7), 0); }\n' >"$tmp/away/prog.bastio"
-if "$BASTIOC" --check "$tmp/away/prog.bastio" 2>"$tmp/away.err"; then
+if BASTIO_LIB= "$BASTIOC" --check "$tmp/away/prog.bastio" 2>"$tmp/away.err"; then
   echo "FAIL --lib: core found without --lib"; fail=$((fail+1))
 elif ! grep -q 'error\[E-IMPORT\]' "$tmp/away.err"; then
   echo "FAIL --lib: wrong error without --lib"; sed 's/^/    /' "$tmp/away.err"; fail=$((fail+1))
-elif ! "$BASTIOC" --lib "$PWD" -o "$tmp/away/prog" "$tmp/away/prog.bastio" 2>"$tmp/away.err"; then
+elif ! BASTIO_LIB= "$BASTIOC" --lib "$PWD" -o "$tmp/away/prog" "$tmp/away/prog.bastio" 2>"$tmp/away.err"; then
   echo "FAIL --lib: rejected"; sed 's/^/    /' "$tmp/away.err"; fail=$((fail+1))
 elif "$tmp/away/prog"; [ $? != 7 ]; then
   echo "FAIL --lib: wrong exit"; fail=$((fail+1))
+elif ! BASTIO_LIB="/nonexistent:$PWD" "$BASTIOC" --check "$tmp/away/prog.bastio" 2>"$tmp/away.err"; then
+  echo "FAIL BASTIO_LIB: rejected"; sed 's/^/    /' "$tmp/away.err"; fail=$((fail+1))
 else
   pass=$((pass+1))
 fi

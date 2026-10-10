@@ -16,7 +16,7 @@ import "core/text.bastio";     // also brings in core/bytes.bastio and core/opti
 import "core/num.bastio";
 ```
 
-An import that does not start with `.` or `/` is looked for next to the importing file, then in each directory above it, then in each `--lib DIR` given to the compiler (see [Programs and files](language.md#programs-and-files)). Inside this repository the walk up finds `core/`; a program elsewhere, such as BastiOS, passes `--lib path/to/bastiolang`.
+An import that does not start with `.` or `/` is looked for next to the importing file, then in each directory above it, then in each `--lib DIR` given to the compiler and each directory of `BASTIO_LIB` (see [Programs and files](language.md#programs-and-files)). Inside this repository the walk up finds `core/`; a program elsewhere, such as BastiOS, passes `--lib path/to/bastiolang`.
 
 All files share one namespace (see [Programs and files](language.md#programs-and-files)), so every function is prefixed by its module (`bytes_`, `text_`, `hmap_`, ...) except the few whose names say what they are (`parse_u64`, `fmt_u64`, `print_str`, `sort_u64`). Two names are taken without a prefix: the types `Option[T]` and `Span`. A program that imports core must not define its own.
 
