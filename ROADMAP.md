@@ -77,7 +77,8 @@ Started early, alongside v1, because the kernel is the primary target and it sha
 - [x] Files on a disk (BastiOS, 2026-10-10): a legacy ATA PIO driver whose port accesses are proved to stay inside its `PortIo` capabilities, and a disk file system (superblock, 32-entry directory, a fixed 1 MiB slot per file) under the same file layer as the in-memory one. Names under `disk/` survive reboots. No journal
 - [ ] Running programs from files instead of images built into the kernel
 - [x] `Ports` / `PortIo`: a driver claims its I/O ports once and can touch only those; no two owners per port. BastiOS's UART, PIC and timer drivers moved from the C prelude and `platform.c` into Bastio, and so did the interrupt acknowledgement (from the trap entry assembly into the kernel loop)
-- [ ] `Mmio[R]`: memory-mapped device registers (local APIC, HPET, PCI BARs), with the same claim-once rule over physical address ranges, and DMA buffers as linear in-flight tokens (docs/concurrency.md)
+- [x] `MmioSpace` / `Mmio`: memory-mapped device registers in the 3-4 GiB device window, claimed once like ports, with bounds and alignment proved. BastiOS maps the window uncached at boot and reads the HPET through it (the local APIC still lives in trusted C until SMP moves it)
+- [ ] DMA buffers as linear in-flight tokens (docs/concurrency.md), and typed register layouts (`Mmio[R]`) if plain offsets prove clumsy
 - [ ] `IrqOff` and interrupt handlers (docs/concurrency.md, step 4). Not needed while BastiOS treats interrupts as events with interrupts off in the kernel
 - [ ] Allocation failure returned in the type (no abort on OOM). Enums exist now (v1 item 3); what is left is changing `alloc`, `pool_take` and friends to return them
 - [ ] Native x86-64 backend, without going through C (removes the C compiler from the trusted base)
