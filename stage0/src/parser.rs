@@ -321,6 +321,9 @@ impl Parser {
         let (n, _) = self.ident()?;
         match n.as_str() {
             "u64" => Ok(Type::U64),
+            "u8" => Ok(Type::U8),
+            "u16" => Ok(Type::U16),
+            "u32" => Ok(Type::U32),
             "bool" => Ok(Type::Bool),
             "Buf" => Ok(Type::Buf),
             "Bytes" => Ok(Type::Bytes),
@@ -385,7 +388,7 @@ impl Parser {
             }
         }
         let body = self.block()?;
-        Ok(FnDef { name, tparams, params, ret, requires, ensures, body, pos })
+        Ok(FnDef { name, tparams, params, ret, requires, ensures, body, pos, int_ops: Default::default() })
     }
 
     fn block(&mut self) -> PResult<Vec<Stmt>> {

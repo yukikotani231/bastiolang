@@ -140,7 +140,8 @@ fn main(con: &mut Serial) -> u64 {
 
 | Type | Meaning |
 | --- | --- |
-| `u64` | Unsigned 64-bit integer, the only integer type for now (narrower and signed ones are designed in [integers.md](integers.md)). Arithmetic is proved to stay in range; it never wraps |
+| `u64` | Unsigned 64-bit integer. Arithmetic is proved to stay in range; it never wraps |
+| `u8`, `u16`, `u32` | Narrower unsigned integers (C's `uint8_t` and so on), with the same proofs. See "Sized integers" below; signed types are designed in [integers.md](integers.md) |
 | `bool` | `true` or `false` |
 | `Str` | A string literal: immutable bytes whose length and contents are known at compile time. Never freed |
 | A struct or enum with no linear part | See [Structs](#structs) and [Enums](#enums-and-match) |
@@ -336,6 +337,45 @@ fn main() -> u64 {
 ```
 
 Call arguments, and the fields of a struct literal, are evaluated in an unspecified order.
+
+**Sized integers.** `u8`, `u16` and `u32` follow the same rules at their own width: `+` and `*` must stay below 2^8, 2^16 or 2^32. Both operands of an arithmetic operator or a comparison have one integer type; there is no implicit promotion. A literal takes the integer type its position asks for (a typed `let`, an assignment, a `return`, a parameter, a field, a payload, the other operand of an operator) and is `u64` when nothing says otherwise; it must fit (`E-TYPE`). Conversions are written out:
+- `cast[T](x)` keeps the value and is proved to fit in `T` (`E-VERIFY-CAST`). Widening always fits, so it needs no annotation.
+- `wrap[T](x)` reduces `x` modulo 2^width of `T`, for code that means to drop bits.
+- `wrap_add(a, b)`, `wrap_sub(a, b)` and `wrap_mul(a, b)` are modular arithmetic on two operands of one type, for checksums and hashes.
+- A builtin's `u64` parameter (an index, a length, a value) accepts any narrower unsigned integer, since widening is free.
+
+```bastio
+// expect-exit: 42
+fn hex_digit(n: u64) -> u8
+  requires n < 16
+{
+  if n < 10 {
+    return cast[u8](n) + 48;     // '0' + n: proved to fit in u8
+  }
+  return cast[u8](n) + 87;       // 'a' + n - 10
+}
+
+fn main() -> u64 {
+  let x: u32 = 70000;
+  let low: u16 = wrap[u16](x);   // 70000 mod 65536 = 4464
+  let s: u8 = wrap_add(hex_digit(15), 200);   // 102 + 200 mod 256 = 46
+  if s != 46 || low != 4464 {
+    return 1;
+  }
+  return 42;
+}
+```
+
+```bastio
+// expect-error: E-VERIFY-CAST
+fn low_byte(n: u64) -> u8 {
+  return cast[u8](n);            // fails: n may be 256 or more; `wrap[u8](n)` drops the bits instead
+}
+
+fn main() -> u64 {
+  return cast[u64](low_byte(300));
+}
+```
 
 ## Structs
 
@@ -819,7 +859,7 @@ Calling a builtin the target does not have is `E-TARGET`.
 
 Expressions in `requires`, `ensures`, `invariant` and `assert` (and the bodies of `spec fn`s) exist only at compile time and generate no code.
 
-- They are evaluated over **mathematical integers**: `a - b` may be negative and `a + b` cannot overflow.
+- They are evaluated over **mathematical integers**: `a - b` may be negative and `a + b` cannot overflow. Integers of different types mix freely there, with no conversions.
 - They may use `==>` (implication) and `forall x: u64 :: e`.
 - They may call `len`, `get`, `slen`, `sget`, `blen`, `bget`, `vlen`, `vget`, the ghost accessors of the capabilities, and `spec fn`s.
 - They may use `is` and enum payloads (`o.Some`), and see through boxes.
@@ -894,7 +934,8 @@ Proofs:
 | --- | --- |
 | `E-VERIFY-BOUNDS` | Every index is below its limit: buffer, byte, string and vector indices; `vec_pop` on a non-empty vector; page numbers below `pool_size`; words, bytes and slots of a page or table; `cpu_get` / `cpu_set` registers; the `sys_spawn` range |
 | `E-VERIFY-LEAK` | A vector of linear elements is empty when it is freed |
-| `E-VERIFY-OVERFLOW` | `+` and `*` results < 2^64 |
+| `E-VERIFY-OVERFLOW` | `+` and `*` results fit the operation's type (< 2^64 for `u64`, < 2^8 for `u8`, ...) |
+| `E-VERIFY-CAST` | the argument of `cast[T]` fits in `T` |
 | `E-VERIFY-UNDERFLOW` | `a - b` has `a >= b` |
 | `E-VERIFY-DIVZERO` | The divisor of `/` and `%` is not zero |
 | `E-VERIFY-ALLOC` | Allocation size <= 2^60 elements |
