@@ -9,6 +9,8 @@ The language as stage0 implements it today: the v0 proof pipeline, plus `&mut` b
 | `u64` | Unsigned 64-bit integer. Arithmetic is proved to stay in range; it never wraps |
 | `bool` | Boolean |
 | `Buf` | An owned buffer of u64 elements. **Linear**: must be consumed exactly once |
+| `Bytes` | An owned buffer of bytes. **Linear**. Every element is proved to be `<= 255` |
+| `Host` | The host operating system: command-line arguments and files. **Linear**; hosted programs only, and only `main` is handed one |
 | `&Buf` | A read-only borrow. Allowed **only as a parameter type**, so it can never be returned or stored, and never outlives the call |
 | `Str` | A string literal: immutable bytes with a length known at compile time. Copyable, never freed |
 | `Serial` | The capability to use the serial console. **Linear**: it cannot be created, only `main` is handed one, and `main` must return it |
@@ -74,6 +76,16 @@ p.space.root = t;                      // ... and put one back
 | `serial_write(c: &Serial, b: u64)` | `b <= 255` | Writes one byte |
 | `serial_read(c: &Serial) -> u64` | none | Reads one byte, blocking; the prover knows the result is `<= 255`. Hosted builds return 4 (EOT) at end of input |
 | `serial_poll(c: &Serial) -> u64` | none | Kernel only. A received byte, or 256 if none is waiting |
+| `balloc(n: u64) -> Bytes` | `n <= 2^60` | n zero bytes |
+| `blen(b: &Bytes) -> u64` | none | Length |
+| `bget(b: &Bytes, i: u64) -> u64` | `i < blen(b)` | Byte i; the prover knows it is `<= 255` |
+| `bset(b: &mut Bytes, i: u64, v: u64)` | `i < blen(b)`, `v <= 255` | Sets byte i in place |
+| `bfree(b: Bytes)` | none | Frees b |
+| `bfrom(s: Str) -> Bytes` | none | A copy of a string literal (the prover knows its bytes) |
+| `host_argc(h: &Host) -> u64` | none | Hosted only. Number of command-line arguments, including the program name |
+| `host_arg(h: &Host, i: u64) -> Bytes` | none | Hosted only. Argument i (empty if there is none) |
+| `host_read(h: &Host, path: &Bytes, out: &mut Bytes) -> bool` | none | Hosted only. Replaces `out` with the whole file; false (and `out` unchanged) if it cannot be read |
+| `host_write(h: &Host, path: &Bytes, data: &Bytes) -> bool` | none | Hosted only. Creates or replaces the file |
 
 Physical pages and page tables (hosted and kernel; hosted builds simulate the pages with ordinary memory, so tests run page code under the sanitizers):
 
@@ -128,7 +140,7 @@ include_bytes("path")                              // a file's bytes as a Str, p
 - Integer literals are decimal or hex (`0x1F`).
 - Several source files can be given on the command line; they form one program, and constants are visible in later files.
 - A name cannot be redeclared (no shadowing) within a function.
-- The entry point is `fn main(...) -> u64` (or with no result), taking any of the capabilities its target hands out, each at most once and as `&mut`: hosted `&mut Serial`, `&mut Pool`; kernel those plus `&mut Mmu`, `&mut Cpu`; user `&mut Serial` only. A user program's result is its exit code. The older `fn main(con: Serial) -> Serial` is still accepted outside user programs.
+- The entry point is `fn main(...) -> u64` (or with no result), taking any of the capabilities its target hands out, each at most once and as `&mut`: hosted `&mut Serial`, `&mut Pool`, `&mut Host`; kernel those plus `&mut Mmu`, `&mut Cpu`; user `&mut Serial` only. A user program's result is its exit code. The older `fn main(con: Serial) -> Serial` is still accepted outside user programs.
 
 ## Specification expressions (ghost)
 
@@ -136,7 +148,7 @@ Expressions in `requires` / `ensures` / `invariant` / `assert` exist only at com
 
 - They are evaluated over mathematical integers (`a - b` may be negative).
 - They may use `==>` (implication) and `forall x: u64 :: expr`.
-- They may call `len`, `get`, `slen`, `sget`, the ghost accessors above, and `spec fn`s.
+- They may call `len`, `get`, `slen`, `sget`, `blen`, `bget`, the ghost accessors above, and `spec fn`s.
 - They may mention buffers that have already been consumed. In `ensures`, a by-value parameter name refers to **its value on entry** to the function; a `&mut` parameter refers to the value handed back, and `old(x)` to its value at the call.
 
 ## Linearity rules (error codes)
@@ -183,7 +195,7 @@ How verification works:
 - `print` on the serial port;
 - the pool (every page from the end of the kernel image to the end of RAM, at most 2^16), page-table entry encoding and CR3 loads.
 
-The user prelude implements the console and the `sys_*` builtins as `int 0x80` system calls, and `alloc` with a 64 KiB arena.
+The user prelude implements the console and the `sys_*` builtins as `int 0x80` system calls, and `alloc` with a 64 KiB arena. On the freestanding targets `Bytes` come from the same arena as `Buf`.
 
 Running out of arena memory halts the machine.
 

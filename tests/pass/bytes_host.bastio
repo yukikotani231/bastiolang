@@ -1,0 +1,78 @@
+// expect-exit: 42
+// Bytes and the Host capability: the program reads its own executable
+// (argument 0), checks the ELF magic, writes a file next to itself, reads it
+// back and compares. Every byte index is proved in bounds and every byte
+// stored is proved to fit in 8 bits.
+
+fn same(a: &Bytes, b: &Bytes) -> bool {
+  if blen(a) != blen(b) {
+    return false;
+  }
+  let mut i = 0;
+  while i < blen(a)
+    invariant i <= blen(a) && blen(a) == blen(b)
+  {
+    if bget(a, i) != bget(b, i) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+/// `a` followed by `b`.
+fn concat(a: &Bytes, b: &Bytes) -> Bytes
+  requires blen(a) <= 1000000 && blen(b) <= 1000000
+  ensures blen(result) == blen(a) + blen(b)
+{
+  let mut r = balloc(blen(a) + blen(b));
+  let mut i = 0;
+  while i < blen(a)
+    invariant i <= blen(a)
+  {
+    bset(&mut r, i, bget(a, i));
+    i = i + 1;
+  }
+  let mut j = 0;
+  while j < blen(b)
+    invariant j <= blen(b)
+  {
+    bset(&mut r, blen(a) + j, bget(b, j));
+    j = j + 1;
+  }
+  return r;
+}
+
+fn main(host: &mut Host) -> u64 {
+  if host_argc(host) < 1 {
+    return 1;
+  }
+  let me = host_arg(host, 0);
+  let mut exe = balloc(0);
+  if !host_read(host, me, &mut exe) {
+    bfree(me);
+    bfree(exe);
+    return 2;
+  }
+  // 0x7f 'E' 'L' 'F'
+  let elf = blen(exe) >= 4 && bget(exe, 0) == 127 && bget(exe, 1) == 69 && bget(exe, 2) == 76 && bget(exe, 3) == 70;
+  bfree(exe);
+  if !elf || blen(me) > 1000000 {
+    bfree(me);
+    return 3;
+  }
+  let suffix = bfrom(".out");
+  let path = concat(me, suffix);
+  let msg = bfrom("hello, bytes\n");
+  let mut back = balloc(0);
+  let ok = host_write(host, path, msg) && host_read(host, path, &mut back) && same(msg, back);
+  bfree(me);
+  bfree(suffix);
+  bfree(path);
+  bfree(msg);
+  bfree(back);
+  if ok {
+    return 42;
+  }
+  return 4;
+}

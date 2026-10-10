@@ -142,7 +142,7 @@ fn kept_by_builtins(t: &Type, field: &str) -> bool {
 
 /// Builtins whose `&mut` argument keeps the fields above.
 const SHAPE_KEEPING: &[&str] =
-    &["pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pool_take", "pool_give", "frame_write", "frame_write8", "cpu_set", "cpu_run", "cpu_idle"];
+    &["bset", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pool_take", "pool_give", "frame_write", "frame_write8", "cpu_set", "cpu_run", "cpu_idle"];
 
 #[derive(Clone)]
 struct State {
@@ -257,6 +257,12 @@ impl<'p> Verifier<'p> {
             Type::U64 => self.fresh_u64(hint),
             Type::Bool => self.fresh_bool(hint),
             Type::Buf => Ok(Val::Buf { len: self.fresh_len(hint)?, data: self.fresh_array(hint, "Int")? }),
+            Type::Bytes => {
+                // Every byte of a Bytes value is <= 255.
+                let data = self.fresh_array(hint, "Int")?;
+                self.smt(&format!("(assert (forall ((k Int)) (and (<= 0 (select {d} k)) (<= (select {d} k) 255))))", d = data))?;
+                Ok(Val::Buf { len: self.fresh_len(hint)?, data })
+            }
             Type::Str => Ok(Val::Str { len: self.fresh_len(hint)?, data: self.fresh_array(hint, "Int")? }),
             Type::Ref(t) | Type::MutRef(t) => {
                 let t = (**t).clone();
@@ -578,6 +584,14 @@ impl<'p> Verifier<'p> {
                     if !extra.is_empty() {
                         st.pc.push(format!("(=> {} {})", guard, and_all(&extra)));
                     }
+                    // So do the new values of anything it lent as `&mut`.
+                    let names: Vec<String> = st.env.keys().cloned().collect();
+                    for n in names {
+                        if sub.env[&n] != st.env[&n] {
+                            let m = merge_val(&guard, &sub.env[&n], &st.env[&n]);
+                            st.env.insert(n, m);
+                        }
+                    }
                     let sop = if *op == BinOp::And { "and" } else { "or" };
                     return Ok(Val::B(format!("({} {} {})", sop, ta, vb.term())));
                 }
@@ -741,7 +755,51 @@ impl<'p> Verifier<'p> {
                 st.pc.push(format!("(<= {} {})", v.term(), if name == "serial_read" { 255 } else { 256 }));
                 Ok(v)
             }
-            "free" | "print" => Ok(Val::Unit),
+            "free" | "print" | "bfree" => Ok(Val::Unit),
+
+            // ---- bytes ----
+            "balloc" => {
+                let n = vals[0].term().to_string();
+                self.need(st, format!("(<= {} {})", n, ALLOC_MAX), pos, "E-VERIFY-ALLOC", format!("that the allocation size `{}` is at most 2^60 bytes", ra(0)))?;
+                Ok(Val::Buf { len: n, data: "((as const (Array Int Int)) 0)".into() })
+            }
+            "blen" => match &vals[0] {
+                Val::Buf { len, .. } => Ok(Val::U(len.clone())),
+                _ => unreachable!(),
+            },
+            "bget" => match &vals[0] {
+                Val::Buf { len, data } => {
+                    let i = vals[1].term();
+                    self.need(st, format!("(< {} {})", i, len), pos, "E-VERIFY-BOUNDS", format!("that the index `{}` is within `{}` (`{} < blen({})`)", ra(1), ra(0), ra(1), ra(0)))?;
+                    let sel = format!("(select {} {})", data, i);
+                    st.pc.push(format!("(and (<= 0 {s}) (<= {s} 255))", s = sel));
+                    Ok(Val::U(sel))
+                }
+                _ => unreachable!(),
+            },
+            "bset" => match &vals[0] {
+                Val::Buf { len, data } => {
+                    let (i, v) = (vals[1].term(), vals[2].term());
+                    self.need(st, format!("(< {} {})", i, len), pos, "E-VERIFY-BOUNDS", format!("that the index `{}` is within `{}` (`{} < blen({})`)", ra(1), ra(0), ra(1), ra(0)))?;
+                    self.need(st, format!("(<= {} 255)", v), pos, "E-VERIFY-BYTE", format!("that `{}` fits in a byte (`<= 255`)", ra(2)))?;
+                    let nv = Val::Buf { len: len.clone(), data: format!("(store {} {} {})", data, i, v) };
+                    self.put_back(&args[0], nv, st);
+                    Ok(Val::Unit)
+                }
+                _ => unreachable!(),
+            },
+            "bfrom" => match &vals[0] {
+                Val::Str { len, data } => Ok(Val::Buf { len: len.clone(), data: data.clone() }),
+                _ => unreachable!(),
+            },
+            "host_argc" => self.fresh_u64("argc"),
+            "host_arg" => self.fresh_of(&Type::Bytes, "arg"),
+            "host_read" => {
+                let nv = self.fresh_of(&Type::Bytes, "file")?;
+                self.put_back(&args[2], nv, st);
+                self.fresh_bool("read_ok")
+            }
+            "host_write" => self.fresh_bool("write_ok"),
 
             // ---- physical pages ----
             "pool_size" => Ok(Val::U(vals[0].field("size"))),
@@ -971,11 +1029,11 @@ impl<'p> Verifier<'p> {
                 }
                 let v = self.spec_val(&args[0], sc, bound)?;
                 match name.as_str() {
-                    "len" | "slen" => match v {
+                    "len" | "slen" | "blen" => match v {
                         Val::Buf { len, .. } | Val::Str { len, .. } => len,
                         _ => unreachable!(),
                     },
-                    "get" | "sget" => match v {
+                    "get" | "sget" | "bget" => match v {
                         Val::Buf { data, .. } | Val::Str { data, .. } => format!("(select {} {})", data, self.spec(&args[1], sc, bound)?),
                         _ => unreachable!(),
                     },

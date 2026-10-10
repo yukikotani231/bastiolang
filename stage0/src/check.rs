@@ -37,6 +37,8 @@ pub struct Sig {
 #[derive(Clone, Copy, PartialEq)]
 enum Avail {
     All,
+    /// Hosted programs only (they have an operating system under them).
+    Hosted,
     /// Hosted and kernel: physical pages and page tables (hosted simulates them).
     Mem,
     Kernel,
@@ -59,6 +61,16 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("set", Avail::All, vec![Buf, U64, U64], Buf),
         ("free", Avail::All, vec![Buf], Unit),
         ("print", Avail::All, vec![U64], Unit),
+        ("balloc", Avail::All, vec![U64], Bytes),
+        ("blen", Avail::All, vec![r(Bytes)], U64),
+        ("bget", Avail::All, vec![r(Bytes), U64], U64),
+        ("bset", Avail::All, vec![m(Bytes), U64, U64], Unit),
+        ("bfree", Avail::All, vec![Bytes], Unit),
+        ("bfrom", Avail::All, vec![Str], Bytes),
+        ("host_argc", Avail::Hosted, vec![r(Host)], U64),
+        ("host_arg", Avail::Hosted, vec![r(Host), U64], Bytes),
+        ("host_read", Avail::Hosted, vec![r(Host), r(Bytes), m(Bytes)], Bool),
+        ("host_write", Avail::Hosted, vec![r(Host), r(Bytes), r(Bytes)], Bool),
         ("slen", Avail::All, vec![Str], U64),
         ("sget", Avail::All, vec![Str, U64], U64),
         ("serial_write", Avail::All, vec![r(Serial), U64], Unit),
@@ -124,6 +136,7 @@ fn available(name: &str, target: Target) -> bool {
     let Some(b) = builtin_table().into_iter().find(|b| b.0 == name) else { return true };
     match (b.1, target) {
         (Avail::All, _) => true,
+        (Avail::Hosted, Target::Hosted) => true,
         (Avail::Mem, Target::Hosted | Target::Kernel) => true,
         (Avail::Kernel, Target::Kernel) => true,
         (Avail::User, Target::User) => true,
@@ -134,7 +147,7 @@ fn available(name: &str, target: Target) -> bool {
 /// The capabilities `main` may ask for on each target.
 fn main_caps(target: Target) -> &'static [Type] {
     match target {
-        Target::Hosted => &[Type::Serial, Type::Pool],
+        Target::Hosted => &[Type::Serial, Type::Pool, Type::Host],
         Target::Kernel => &[Type::Serial, Type::Pool, Type::Mmu, Type::Cpu],
         Target::User => &[Type::Serial],
     }
@@ -143,7 +156,7 @@ fn main_caps(target: Target) -> &'static [Type] {
 /// Struct definitions: unique names, known field types, no struct that
 /// contains itself.
 pub fn check_structs(p: &Program) -> Result<(), Diag> {
-    const RESERVED: &[&str] = &["u64", "bool", "Str", "Buf", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu"];
+    const RESERVED: &[&str] = &["u64", "bool", "Str", "Buf", "Bytes", "Host", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu"];
     for (i, d) in p.structs.iter().enumerate() {
         if RESERVED.contains(&d.name.as_str()) || p.structs[..i].iter().any(|e| e.name == d.name) {
             return Err(Diag::new("E-TYPE", d.pos, format!("type `{}` is already defined", d.name)));
@@ -863,8 +876,8 @@ impl<'a> Ctx<'a> {
                     }
                     return Ok(g.3.clone());
                 }
-                if !matches!(name.as_str(), "len" | "get" | "slen" | "sget") {
-                    return Err(Diag::new("E-TYPE", e.pos, format!("`{}` cannot be called in a specification (allowed: len, get, slen, sget, old, ghost accessors and spec fns)", name)));
+                if !matches!(name.as_str(), "len" | "get" | "slen" | "sget" | "blen" | "bget") {
+                    return Err(Diag::new("E-TYPE", e.pos, format!("`{}` cannot be called in a specification (allowed: len, get, slen, sget, blen, bget, old, ghost accessors and spec fns)", name)));
                 }
                 let sig = &self.sigs[name.as_str()];
                 arity(sig.params.len())?;
