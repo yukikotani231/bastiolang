@@ -381,6 +381,10 @@ fn push_ty(v: &mut Vr, m: &Mono, p: &Parser, t: u64) {
   else if k == TY_U8 { push_str(&mut v, "u8"); }
   else if k == TY_U16 { push_str(&mut v, "u16"); }
   else if k == TY_U32 { push_str(&mut v, "u32"); }
+  else if k == TY_I8 { push_str(&mut v, "i8"); }
+  else if k == TY_I16 { push_str(&mut v, "i16"); }
+  else if k == TY_I32 { push_str(&mut v, "i32"); }
+  else if k == TY_I64 { push_str(&mut v, "i64"); }
   else if k == TY_STRUCT || k == TY_ENUM { push_inst(&mut v, m, p, x.a); }
   else if k == TY_BOX { push_str(&mut v, "Box["); push_ty(&mut v, m, p, x.a); push_str(&mut v, "]"); }
   else if k == TY_VEC { push_str(&mut v, "Vec["); push_ty(&mut v, m, p, x.a); push_str(&mut v, "]"); }
@@ -431,6 +435,16 @@ fn new_tm(v: &mut Vr, kind: u64, a: u64, b: u64, c: u64) -> u64 {
 
 fn num(v: &mut Vr, x: u64) -> u64 {
   return new_tm(&mut v, VT_NUM, x, 0, 0);
+}
+
+/// The number -x, written `(- x)` as stage0 writes a negative number (and
+/// 0 for -0).
+fn neg_num(v: &mut Vr, x: u64) -> u64 {
+  let t = num(&mut v, x);
+  if x == 0 {
+    return t;
+  }
+  return app1(&mut v, OP_SUB, t);
 }
 
 fn app1(v: &mut Vr, op: u64, x: u64) -> u64 {
@@ -500,7 +514,28 @@ fn int_max(v: &mut Vr, m: &Mono, t: u64) -> u64 {
   if k == TY_U8 { return num(&mut v, 255); }
   if k == TY_U16 { return num(&mut v, 65535); }
   if k == TY_U32 { return num(&mut v, 4294967295); }
+  if k == TY_I8 { return num(&mut v, 127); }
+  if k == TY_I16 { return num(&mut v, 32767); }
+  if k == TY_I32 { return num(&mut v, 2147483647); }
+  if k == TY_I64 { return num(&mut v, 9223372036854775807); }
   return v.t_u64max;
+}
+
+/// Half the modulus of a signed integer type: -(the smallest value).
+fn int_half(m: &Mono, t: u64) -> u64 {
+  let k = kind_t(m, t);
+  if k == TY_I8 { return 128; }
+  if k == TY_I16 { return 32768; }
+  if k == TY_I32 { return 2147483648; }
+  return 9223372036854775808;
+}
+
+/// The smallest value of integer type `t`.
+fn int_min(v: &mut Vr, m: &Mono, t: u64) -> u64 {
+  if is_signed(m, t) {
+    return neg_num(&mut v, int_half(m, t));
+  }
+  return v.t_zero;
 }
 
 /// 2^width of integer type `t` (2^64 does not fit in a u64, so it is text).
@@ -509,7 +544,43 @@ fn int_mod(v: &mut Vr, m: &Mono, t: u64) -> u64 {
   if k == TY_U8 { return num(&mut v, 256); }
   if k == TY_U16 { return num(&mut v, 65536); }
   if k == TY_U32 { return num(&mut v, 4294967296); }
+  if k == TY_I8 { return num(&mut v, 256); }
+  if k == TY_I16 { return num(&mut v, 65536); }
+  if k == TY_I32 { return num(&mut v, 4294967296); }
   return atom_str(&mut v, "18446744073709551616");
+}
+
+/// `x` reduced to the range of integer type `t`, as a C conversion to `t`
+/// does: modulo 2^width, two's complement for a signed type.
+fn wrap_term(v: &mut Vr, m: &Mono, t: u64, x: u64) -> u64 {
+  let md = int_mod(&mut v, m, t);
+  if is_signed(m, t) {
+    let h = num(&mut v, int_half(m, t));
+    let a = app2(&mut v, OP_ADD, x, h);
+    let r = app2(&mut v, OP_MOD, a, md);
+    return app2(&mut v, OP_SUB, r, h);
+  }
+  return app2(&mut v, OP_MOD, x, md);
+}
+
+/// `(ite (>= x 0) x (- x))`
+fn t_abs(v: &mut Vr, x: u64) -> u64 {
+  let ge = app2(&mut v, OP_GE, x, v.t_zero);
+  let n = app1(&mut v, OP_SUB, x);
+  return app3(&mut v, OP_ITE, ge, x, n);
+}
+
+/// C's division on signed operands, which truncates toward zero (SMT-LIB's
+/// `div` rounds so that the remainder is never negative).
+fn c_div(v: &mut Vr, a: u64, b: u64) -> u64 {
+  let aa = t_abs(&mut v, a);
+  let ab = t_abs(&mut v, b);
+  let q = app2(&mut v, OP_DIV, aa, ab);
+  let ga = app2(&mut v, OP_GE, a, v.t_zero);
+  let gb = app2(&mut v, OP_GE, b, v.t_zero);
+  let sg = app2(&mut v, OP_EQ, ga, gb);
+  let nq = app1(&mut v, OP_SUB, q);
+  return app3(&mut v, OP_ITE, sg, q, nq);
 }
 
 /// The integer type operator node `i` of instance `x` works on.
@@ -1486,9 +1557,10 @@ fn fresh_of(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, tyx: u64, hint: u64) 
   if k == TY_U64 {
     return fresh_u64(&mut v, hint);
   }
-  if k == TY_U8 || k == TY_U16 || k == TY_U32 {
+  if k == TY_U8 || k == TY_U16 || k == TY_U32 || is_signed(m, tyx) {
+    let min = int_min(&mut v, m, tyx);
     let max = int_max(&mut v, m, tyx);
-    let t = fresh_int(&mut v, hint, v.t_zero, max);
+    let t = fresh_int(&mut v, hint, min, max);
     return mk_u(&mut v, t);
   }
   if k == TY_BOOL {
@@ -1949,6 +2021,10 @@ fn spec_tm(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env: &Vec[
     let x = spec_tm(&mut v, c, &mut m, p, n.a, env, oenv, has_old, res, &mut bound);
     return t_not(&mut v, x);
   }
+  if k == E_NEG {
+    let x = spec_tm(&mut v, c, &mut m, p, n.a, env, oenv, has_old, res, &mut bound);
+    return app1(&mut v, OP_SUB, x);
+  }
   if k == E_BIN {
     let ta = spec_tm(&mut v, c, &mut m, p, n.a, env, oenv, has_old, res, &mut bound);
     let tb = spec_tm(&mut v, c, &mut m, p, n.b, env, oenv, has_old, res, &mut bound);
@@ -2103,12 +2179,19 @@ fn eval(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VSta
       let xv = eval(&mut v, c, &mut m, p, inner.a, &mut st, 0);
       let x = term(v, xv);
       if name_is(p, n.b, "wrap") {
-        let md = int_mod(&mut v, m, t);
-        let r = app2(&mut v, OP_MOD, x, md);
+        let r = wrap_term(&mut v, m, t, x);
         return mk_u(&mut v, r);
       }
+      // Whether the source can be negative decides the bounds proved.
+      let from = int_op_ty(c, m, v.env, i);
       let max = int_max(&mut v, m, t);
-      let g = app2(&mut v, OP_LE, x, max);
+      let mut g = 0;
+      if !is_signed(m, from) && !is_signed(m, t) {
+        g = app2(&mut v, OP_LE, x, max);
+      } else {
+        let min = int_min(&mut v, m, t);
+        g = in_range(&mut v, min, x, max);
+      }
       prove(&mut v, st, g);
       return mk_u(&mut v, x);
     }
@@ -2170,6 +2253,21 @@ fn eval(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VSta
     let x = eval(&mut v, c, &mut m, p, n.a, &mut st, 0);
     let t = t_not(&mut v, term(v, x));
     return mk_b(&mut v, t);
+  }
+  if k == E_NEG {
+    let a = node_at(p.nodes, n.a);
+    if a.kind == E_INT {
+      let t = neg_num(&mut v, a.v);
+      return mk_u(&mut v, t);
+    }
+    let x = eval(&mut v, c, &mut m, p, n.a, &mut st, 0);
+    let tx = term(v, x);
+    let min = int_min(&mut v, m, int_op_ty(c, m, v.env, i));
+    let eq = app2(&mut v, OP_EQ, tx, min);
+    let g = t_not(&mut v, eq);
+    prove(&mut v, st, g);
+    let t = app1(&mut v, OP_SUB, tx);
+    return mk_u(&mut v, t);
   }
   if k == E_BIN {
     return eval_bin(&mut v, c, &mut m, p, i, &mut st);
@@ -2298,6 +2396,10 @@ fn eval_bin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut 
   }
   let vb = eval(&mut v, c, &mut m, p, n.b, &mut st, 0);
   let tb = term(v, vb);
+  let ity = int_op_ty(c, m, v.env, i);
+  if is_signed(m, ity) && (op == P_PLUS || op == P_MINUS || op == P_STAR || op == P_SLASH || op == P_PERCENT) {
+    return signed_arith(&mut v, m, op, ta, tb, ity, st);
+  }
   if op == P_PLUS || op == P_STAR {
     let t = app2(&mut v, bin_op(op), ta, tb);
     let max = int_max(&mut v, m, int_op_ty(c, m, v.env, i));
@@ -2325,6 +2427,38 @@ fn eval_bin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut 
   }
   let t = app2(&mut v, bin_op(op), ta, tb);
   return mk_b(&mut v, t);
+}
+
+/// Arithmetic on a signed type: the result must stay between the type's
+/// minimum and maximum; `/` and `%` truncate toward zero, as in C, and
+/// `MIN / -1` overflows.
+fn signed_arith(v: &mut Vr, m: &Mono, op: u64, ta: u64, tb: u64, ity: u64, st: &VState) -> u64 {
+  let min = int_min(&mut v, m, ity);
+  let max = int_max(&mut v, m, ity);
+  if op == P_SLASH || op == P_PERCENT {
+    let eq = app2(&mut v, OP_EQ, tb, v.t_zero);
+    let g = t_not(&mut v, eq);
+    prove(&mut v, st, g);
+    let am = app2(&mut v, OP_EQ, ta, min);
+    let m1 = neg_num(&mut v, 1);
+    let bm = app2(&mut v, OP_EQ, tb, m1);
+    let both = app2(&mut v, OP_AND, am, bm);
+    let g2 = t_not(&mut v, both);
+    prove(&mut v, st, g2);
+    let q = c_div(&mut v, ta, tb);
+    if op == P_SLASH {
+      return mk_u(&mut v, q);
+    }
+    let bq = app2(&mut v, OP_MUL, tb, q);
+    let r = app2(&mut v, OP_SUB, ta, bq);
+    return mk_u(&mut v, r);
+  }
+  let t = app2(&mut v, bin_op(op), ta, tb);
+  let hi = app2(&mut v, OP_LE, t, max);
+  prove(&mut v, st, hi);
+  let lo = app2(&mut v, OP_LE, min, t);
+  prove(&mut v, st, lo);
+  return mk_u(&mut v, t);
 }
 
 /// `xs[from ..]`.
@@ -2573,8 +2707,7 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
       op = OP_SUB;
     }
     let t = app2(&mut v, op, term(v, x0), term(v, x1));
-    let md = int_mod(&mut v, m, int_op_ty(c, m, v.env, i));
-    let r = app2(&mut v, OP_MOD, t, md);
+    let r = wrap_term(&mut v, m, int_op_ty(c, m, v.env, i), t);
     return mk_u(&mut v, r);
   }
   if name_is(p, i, "unbox") {
@@ -3581,7 +3714,7 @@ fn changed_in_expr(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, ou
       let x = tapp_inst(&mut m, p, i, v.env);
       call_changes(&mut v, c, &mut m, p, n.b, x, &mut out);
     }
-  } else if k == E_NOT || k == E_IS || (k == E_VARIANT && n.a != 0) {
+  } else if k == E_NOT || k == E_NEG || k == E_IS || (k == E_VARIANT && n.a != 0) {
     changed_in_expr(&mut v, c, &mut m, p, n.a, &mut out);
   } else if k == E_BIN {
     changed_in_expr(&mut v, c, &mut m, p, n.a, &mut out);

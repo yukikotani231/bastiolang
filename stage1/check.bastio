@@ -74,9 +74,10 @@ struct Checker {
   eline: u64,
   ecol: u64,
   ecode: u64,
-  /// The integer type of each arithmetic operator and `wrap_*` call whose
-  /// type is narrower than u64, per instance (the verifier's overflow
-  /// bounds; every other one is u64).
+  /// The integer type of each arithmetic operator, unary minus and
+  /// `wrap_*` call, and the source type of each `cast`/`wrap`, when it is
+  /// not u64, per instance (the verifier's overflow bounds; every other one
+  /// is u64).
   int_ops: Vec[IntOp]
 }
 
@@ -1933,6 +1934,9 @@ fn ck_named(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64
       if c.failed {
         return 0;
       }
+      // The type converted from: whether it can be negative matters to the
+      // proof.
+      note_int_op(&mut c, m, i, ta);
       return t;
     }
     let x = tapp_inst(&mut m, p, i, c.env);
@@ -1998,6 +2002,7 @@ fn ck_named(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64
       cfail(&mut c, p, i, C_TYPE);            // unary minus needs a signed integer
       return 0;
     }
+    note_int_op(&mut c, m, i, t);
     return t;
   }
   if k == E_BIN {
