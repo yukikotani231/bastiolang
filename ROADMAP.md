@@ -84,7 +84,8 @@ Started early, alongside v1, because the kernel is the primary target and it sha
 - [x] DMA buffers as linear in-flight tokens (docs/concurrency.md): `dma_lend` turns a page into a `Dma` that cannot be freed, mapped or reused until `dma_take`, and is touched only with volatile, aligned accesses. When the device is done is the driver's word
 - [ ] Typed register layouts (`Mmio[R]`) if plain offsets prove clumsy
 - [x] Networking, first step (BastiOS, 2026-10-10): virtio-net through `Dma` pages, and a minimal stack (Ethernet, ARP, IPv4 without options, ICMP echo, UDP echo) whose every read of a frame is proved to stay inside it whatever the length fields say. Tested in QEMU user-mode networking (ping the gateway, UDP echo through a port forward). Outgoing checksums are computed but not proved correct
-- [ ] Sockets for user programs (UDP first, then TCP), shared with the Linux layer (v4) so musl programs can use them; DHCP instead of a fixed address
+- [x] Sockets and the rest of the small stack (BastiOS, 2026-10-10): UDP sockets with checksums and receive queues (Linux `socket`/`bind`/`sendto`/`recvfrom` on top), a DHCP client, TCP (in-order, go-back-N resends, no congestion control), and no network wait holding the kernel lock. Buffer safety is proved for any packet; protocol behaviour is tested in QEMU, and TCP retransmission is not exercised there (QEMU's user network never drops)
+- [ ] TCP for Linux programs (`SOCK_STREAM`), and a TCP that holds out-of-order segments, backs off its timer and does congestion control
 - [ ] `IrqOff` and interrupt handlers (docs/concurrency.md, step 4). Not needed while BastiOS treats interrupts as events with interrupts off in the kernel
 - [ ] Allocation failure returned in the type (no abort on OOM). Enums exist now (v1 item 3); what is left is changing `alloc`, `pool_take` and friends to return them
 - [ ] Native x86-64 backend, without going through C (removes the C compiler from the trusted base)
