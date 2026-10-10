@@ -403,6 +403,11 @@ static bool bst_host_write(bst_host h, bst_bytes path, bst_bytes data) {
     bool ok = fwrite(data.data, 1, data.len, f) == data.len;
     return fclose(f) == 0 && ok;
 }
+static void bst_host_eprint(bst_host h, bst_bytes b) {
+    (void)h;
+    fflush(stdout);
+    fwrite(b.data, 1, b.len, stderr);
+}
 
 /* Simulated physical memory: a pool of page-aligned pages from the heap. */
 #define BST_HOSTED_PAGES 256

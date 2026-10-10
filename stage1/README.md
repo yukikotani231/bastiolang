@@ -1,7 +1,14 @@
 # stage1: bastioc1, the self-hosted compiler
 
-bastioc1 is written in Bastio and built by stage0. It is grown one phase
-at a time, and each phase is checked against stage0 on every Bastio source
+bastioc1 is written in Bastio and built by stage0, and builds itself:
+
+```sh
+stage0/target/release/bastioc0 -o bastioc1 stage1/bastioc1.bastio
+./bastioc1 -o bastioc1-gen2 stage1/bastioc1.bastio   # the same executable
+./bastioc1 -o b64 tests/pass/base64.bastio           # usage as for bastioc0
+```
+
+It was grown one phase at a time, and each phase is checked against stage0 on every Bastio source
 in the repository (`difftest.sh`, run in CI):
 
 | Phase | File | Compared with |
@@ -13,6 +20,7 @@ in the repository (`difftest.sh`, run in CI):
 | Verifier (queries) | `verify.bastio` | `bastioc0 --check --dump-smt` (`smtdump.bastio`): every SMT command and the number of proof obligations, on every program stage0 verifies and on damaged copies that still verify (`mutate.py --smt`) |
 | Verifier (proofs) | `solve.bastio` | `bastioc0 --dump-verify` (`verifydump.bastio`): both run Z3; the number of proof obligations, or the first failed proof's code, position, counterexample and notes, on every program that reaches the verifier and on damaged copies (`mutate.py --verify`) |
 | C code generation | `codegen.bastio`, `cprelude.bastio` | `bastioc0 --dump-c` (`cdump.bastio`): the whole C file, byte for byte, on every program the checker accepts (the BastiOS kernel and user programs included) and on damaged copies |
+| Driver | `bastioc1.bastio` | `bastioc0` itself: the stderr and exit status of `--check` on every source (with the sentence after `error[CODE]:` and the checker's hints masked, as bastioc1 does not print them yet), the C of `--emit-c`, the test programs it builds, which must exit as they say; and the fixed point: bastioc1 built by itself writes the same C for itself as stage0 |
 
 The syntax tree is an arena: one `Vec[Node]` of plain values, children
 as indices, lists chained through `next`. All files of a program share one

@@ -1690,6 +1690,7 @@ impl<'p> Verifier<'p> {
                 self.fresh_bool("read_ok")
             }
             "host_write" => self.fresh_bool("write_ok"),
+            "host_eprint" => Ok(Val::Unit),
             "host_spawn" => self.fresh_of(&Type::Child, "child"),
             "child_write" => self.fresh_bool("child_write_ok"),
             "child_close" => Ok(Val::Unit),
