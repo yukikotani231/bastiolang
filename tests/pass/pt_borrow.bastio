@@ -1,0 +1,119 @@
+// expect-exit: 42
+// Working on a page-table tree in place. `pt_borrow` lends the table in a
+// slot to a function without unlinking it, as a kernel must when another
+// processor may be running on the tree (it holds a lease, see
+// tests/fail/lease_take.bastio). Under a borrow the tree can still grow
+// (`pt_put` writes one entry), and pages can be read and written through
+// `pt_borrow_frame`; nothing is taken out of it.
+
+/// Writes `v` to byte `o` of the borrowed page.
+fn poke(f: &mut Frame, o: u64, v: u8)
+  requires o < 4096
+{
+  frame_write8(&mut f, o, v);
+}
+
+fn peek(f: &mut Frame, o: u64) -> u8
+  requires o < 4096
+{
+  return frame_read8(f, o);
+}
+
+/// Level 1: maps page `k` of the pool in slot `p` if that is empty.
+fn l1_map(t: &mut PageTable, pool: &mut Pool, k: u64, p: u64)
+  requires pt_level(t) == 1 && p < 512
+  requires k < pool_size(pool) && pool_has(pool, k)
+{
+  if !pt_has(t, p) {
+    pt_put_frame(&mut t, p, pool_take(&mut pool, k), true);
+  }
+}
+
+fn l1_write(t: &mut PageTable, p: u64, o: u64, v: u8)
+  requires pt_level(t) == 1 && p < 512 && o < 4096
+{
+  if pt_has(t, p) {
+    pt_borrow_frame(&mut t, p, poke, o, v);
+  }
+}
+
+fn l1_read(t: &mut PageTable, p: u64, o: u64) -> u8
+  requires pt_level(t) == 1 && p < 512 && o < 4096
+{
+  if !pt_has(t, p) {
+    return 0;
+  }
+  return pt_borrow_frame(&mut t, p, peek, o);
+}
+
+/// Level 2: makes the level-1 table in slot `s` from page `k` if need be,
+/// then maps page `k + 1` under it, in place.
+fn l2_map(t: &mut PageTable, pool: &mut Pool, k: u64, s: u64, p: u64)
+  requires pt_level(t) == 2 && s < 512 && p < 512
+  requires k + 1 < pool_size(pool) && pool_has(pool, k) && pool_has(pool, k + 1)
+{
+  if !pt_has(t, s) {
+    pt_put(&mut t, s, pt_new(pool_take(&mut pool, k), 1));
+  }
+  pt_borrow(&mut t, s, l1_map, &mut pool, k + 1, p);
+}
+
+fn l2_write(t: &mut PageTable, s: u64, p: u64, o: u64, v: u8)
+  requires pt_level(t) == 2 && s < 512 && p < 512 && o < 4096
+{
+  if pt_has(t, s) {
+    pt_borrow(&mut t, s, l1_write, p, o, v);
+  }
+}
+
+fn l2_read(t: &mut PageTable, s: u64, p: u64, o: u64) -> u8
+  requires pt_level(t) == 2 && s < 512 && p < 512 && o < 4096
+{
+  if !pt_has(t, s) {
+    return 0;
+  }
+  return pt_borrow(&mut t, s, l1_read, p, o);
+}
+
+fn free_l1(pool: &mut Pool, t: PageTable)
+  requires pt_level(t) == 1
+{
+  let mut t1 = t;
+  let mut i = 0;
+  while i < 512
+    invariant i <= 512 && pt_level(t1) == 1
+    invariant forall j: u64 :: j < i ==> !pt_used(t1, j)
+  {
+    if pt_has(t1, i) {
+      pool_give(&mut pool, pt_take_frame(&mut t1, i));
+    }
+    i = i + 1;
+  }
+  pool_give(&mut pool, pt_free(t1));
+}
+
+fn main(pool: &mut Pool) -> u64 {
+  if pool_size(pool) < 8 {
+    return 1;
+  }
+  let mut l2 = pt_new(pool_take(&mut pool, 0), 2);
+  // Pages 1 and 2 become a level-1 table and a page, in place.
+  l2_map(&mut l2, &mut pool, 1, 3, 7);
+  l2_write(&mut l2, 3, 7, 100, 40);
+  l2_write(&mut l2, 3, 7, 101, 2);
+  let r = cast[u64](l2_read(&mut l2, 3, 7, 100)) + cast[u64](l2_read(&mut l2, 3, 7, 101)) + cast[u64](l2_read(&mut l2, 4, 7, 100));
+  // Nobody runs on this tree (pt_leases(l2) is 0: it was never leased),
+  // so it can be torn down.
+  let mut i = 0;
+  while i < 512
+    invariant i <= 512 && pt_level(l2) == 2
+    invariant forall j: u64 :: j < i ==> !pt_used(l2, j)
+  {
+    if pt_has(l2, i) {
+      free_l1(&mut pool, pt_take(&mut l2, i));
+    }
+    i = i + 1;
+  }
+  pool_give(&mut pool, pt_free(l2));
+  return r;
+}

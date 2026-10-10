@@ -65,6 +65,11 @@ pub enum Type {
     /// turned back with `dma_take`. While lent it cannot be freed, mapped or
     /// reused, and its physical address (`dma_addr`) can be read. Linear.
     Dma,
+    /// A processor's hold on a top-level page table it loaded with
+    /// `mmu_enter`: while any is outstanding the table's tree only grows
+    /// (`pt_leases`), so other processors may run on it at the same time.
+    /// Linear and pinned; given back with `mmu_exit`. Kernel target only.
+    Lease,
     /// A user-defined struct. Linear when any field is linear; otherwise a
     /// plain value that is copied.
     Struct(String),
@@ -123,6 +128,7 @@ impl Type {
             Type::MmioSpace => "MmioSpace".into(),
             Type::Mmio => "Mmio".into(),
             Type::Dma => "Dma".into(),
+            Type::Lease => "Lease".into(),
             Type::Struct(n) | Type::Enum(n) => n.clone(),
             Type::Box(t) => format!("Box[{}]", t.name()),
             Type::Vec(t) => format!("Vec[{}]", t.name()),
@@ -135,7 +141,7 @@ impl Type {
     }
     pub fn is_linear(&self) -> bool {
         match self {
-            Type::Buf | Type::Bytes | Type::Host | Type::Child | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu | Type::Ports | Type::PortIo | Type::MmioSpace | Type::Mmio | Type::Dma | Type::Box(_) | Type::Vec(_) | Type::Lock(_) | Type::Atomic(_) => true,
+            Type::Buf | Type::Bytes | Type::Host | Type::Child | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu | Type::Ports | Type::PortIo | Type::MmioSpace | Type::Mmio | Type::Dma | Type::Lease | Type::Box(_) | Type::Vec(_) | Type::Lock(_) | Type::Atomic(_) => true,
             Type::Struct(n) => struct_def(n).map_or(false, |d| d.fields.iter().any(|f| f.1.is_linear())),
             Type::Enum(n) => enum_def(n).map_or(false, |d| d.variants.iter().any(|v| v.1.as_ref().map_or(false, |t| t.is_linear()))),
             _ => false,
@@ -181,11 +187,12 @@ impl Type {
     pub fn is_mut_ref(&self) -> bool {
         matches!(self, Type::MutRef(_))
     }
-    /// Pinned: describes the core or thread that holds it (`Cpu`, `Mmu`), so
-    /// it may never reach another one (through `lock_new` or `smp_run`).
+    /// Pinned: describes the core or thread that holds it (`Cpu`, `Mmu`,
+    /// `Lease`), so it may never reach another one (through `lock_new` or
+    /// `smp_run`).
     pub fn is_pinned(&self) -> bool {
         match self {
-            Type::Mmu | Type::Cpu => true,
+            Type::Mmu | Type::Cpu | Type::Lease => true,
             Type::Box(t) | Type::Vec(t) | Type::Lock(t) | Type::Atomic(t) | Type::Ref(t) | Type::MutRef(t) => t.is_pinned(),
             Type::Struct(n) => struct_def(n).map_or(false, |d| d.fields.iter().any(|f| f.1.is_pinned())),
             Type::Enum(n) => enum_def(n).map_or(false, |d| d.variants.iter().any(|v| v.1.as_ref().map_or(false, |t| t.is_pinned()))),

@@ -296,6 +296,7 @@ fn cg_tyname(g: &mut Cg, m: &Mono, p: &Parser, t: u64, mode: u64) {
   else if k == TY_MMIOSPACE { cg_tn(&mut g, "MmioSpace", mode); }
   else if k == TY_MMIO { cg_tn(&mut g, "Mmio", mode); }
   else if k == TY_DMA { cg_tn(&mut g, "Dma", mode); }
+  else if k == TY_LEASE { cg_tn(&mut g, "Lease", mode); }
   else if k == TY_STRUCT || k == TY_ENUM { cg_instname(&mut g, m, p, x.a, mode); }
   else if k == TY_BOX { cg_tn(&mut g, "Box[", mode); cg_tyname(&mut g, m, p, x.a, mode); cg_tn(&mut g, "]", mode); }
   else if k == TY_VEC { cg_tn(&mut g, "Vec[", mode); cg_tyname(&mut g, m, p, x.a, mode); cg_tn(&mut g, "]", mode); }
@@ -356,6 +357,7 @@ fn cg_cty(g: &mut Cg, m: &Mono, p: &Parser, t: u64) {
   else if k == TY_MMIOSPACE { cg_t(&mut g, "bst_mmiospace"); }
   else if k == TY_MMIO { cg_t(&mut g, "bst_mmio"); }
   else if k == TY_DMA { cg_t(&mut g, "bst_dma"); }
+  else if k == TY_LEASE { cg_t(&mut g, "bst_lease"); }
   else if k == TY_STRUCT { cg_t(&mut g, "bst_s_"); cg_instname(&mut g, m, p, x.a, CG_CID); }
   else if k == TY_ENUM { cg_t(&mut g, "bst_e_"); cg_instname(&mut g, m, p, x.a, CG_CID); }
   else if k == TY_BOX { cg_cty(&mut g, m, p, x.a); cg_t(&mut g, " *"); }
@@ -653,6 +655,11 @@ fn cg_type_of(g: &Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) 
       }
       if name_is(p, i, "smp_run") {
         return c.tunit;
+      }
+      if is_pt_borrow_builtin(p, n.s, n.e) {
+        let fnode = node_at(p.nodes, cg_arg(p, i, 2));
+        let x = plain_inst(&mut m, plain_fn(p, fnode.s, fnode.e));
+        return cg_ret_ty(&mut m, p, x);
       }
       let b = bs_index(c, p, n.s, n.e);
       if b != 0 {
@@ -1221,6 +1228,9 @@ fn cg_call(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64)
     if name_is(p, i, "smp_run") {
       return cg_smp_run(&mut g, c, &mut m, p, i);
     }
+    if is_pt_borrow_builtin(p, n.s, n.e) {
+      return cg_pt_borrow(&mut g, c, &mut m, p, i);
+    }
   }
   let xs = cg_args_of(p, i);
   let mut vals = vec_new[CgSp]();
@@ -1590,6 +1600,74 @@ fn cg_locked(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp 
     cg_n(&mut g, k);
     cg_t(&mut g, "; })");
   }
+  return cg_span(g, start);
+}
+
+/// `pt_borrow(&mut t, i, f, args..)`: the child is read from the entry
+/// into a local, which `f` may change only in its contents (proved), so
+/// nothing is written back.
+fn cg_pt_borrow(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp {
+  let n = node_at(p.nodes, i);
+  let fnode = node_at(p.nodes, cg_arg(p, i, 2));
+  let x = plain_inst(&mut m, plain_fn(p, fnode.s, fnode.e));
+  let xi = inst_at(m, x);
+  let ps = fn_params(&mut m, p, xi.def, x);
+  let k = cg_tmp(&mut g);
+  let e0 = cg_expr(&mut g, c, &mut m, p, n.a, 0);
+  let e1 = cg_expr(&mut g, c, &mut m, p, cg_arg(p, i, 1), 0);
+  let mut es = vec_new[CgSp]();
+  let mut a = cg_arg(p, i, 3);
+  let mut j = 1;
+  while a != 0 && j < vec_len(ps) {
+    let e = cg_expr(&mut g, c, &mut m, p, a, 0);
+    vec_push(&mut es, e);
+    a = next_of(p, a);
+    j = j + 1;
+  }
+  let start = cg_mark(g);
+  cg_t(&mut g, "({ bst_pt *pt_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " = ");
+  cg_sp(&mut g, e0);
+  cg_t(&mut g, "; uint64_t pi_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " = ");
+  cg_sp(&mut g, e1);
+  cg_t(&mut g, ";");
+  j = 0;
+  while j < vec_len(es) {
+    cg_t(&mut g, " ");
+    cg_param_cty(&mut g, m, p, u_at(ps, cg_add(j, 1)));
+    cg_t(&mut g, " pa_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, "_");
+    cg_n(&mut g, j);
+    cg_t(&mut g, " = ");
+    cg_sp(&mut g, sp_at(es, j));
+    cg_t(&mut g, ";");
+    j = j + 1;
+  }
+  cg_t(&mut g, " uint64_t pc_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " = bst_pt_child(*pt_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, ", pi_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, "); ");
+  cg_fname(&mut g, m, p, x);
+  cg_t(&mut g, "(&pc_");
+  cg_n(&mut g, k);
+  j = 0;
+  while j < vec_len(es) {
+    cg_t(&mut g, ", pa_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, "_");
+    cg_n(&mut g, j);
+    j = j + 1;
+  }
+  cg_t(&mut g, "); })");
+  vec_free(es);
+  vec_free(ps);
   return cg_span(g, start);
 }
 

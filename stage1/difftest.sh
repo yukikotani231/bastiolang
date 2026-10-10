@@ -26,7 +26,9 @@
 #           Child, host_eprint): the programs it builds must exit as
 #           tests/pass says, and bastioc1 built by it must write the same C
 #           for itself as stage0. With --user it builds tests/user without
-#           the C library (they assemble and link on their own)
+#           the C library (they assemble and link on their own), and with
+#           --kernel BastiOS's kernel when a built checkout is next to this
+#           one (it must need only the platform's symbols)
 #   driver  stage1/bastioc1.bastio  vs  bastioc0 itself: what `--check`
 #           prints on stderr and its exit status (a failed proof's
 #           sentence masked, as bastioc1 does not print it yet), the
@@ -218,7 +220,22 @@ for f in tests/user/*.bastio; do
     differ=$((differ+1)); echo "DIFFER $f (user program not built by asmdump --user)"
   fi
 done
-echo "-- native (stage1 only): $built programs built and run (plus asmdump built by itself, and bastioc1), $users user programs built, $differ differ"
+# BastiOS's kernel, when a built checkout is next to this one (its blobs are
+# the user programs it builds): it must assemble, needing nothing but the
+# platform's own symbols (boot/ in BastiOS).
+kernel=""
+if [ -f ../bastios/build/user/sh.bin ]; then
+  if "$tmp/asmdump" --kernel ../bastios/src/main.bastio >"$tmp/kernel.s" 2>/dev/null \
+     && as --64 -o "$tmp/kernel.o" "$tmp/kernel.s" \
+     && ! nm -u "$tmp/kernel.o" | awk '{print $2}' \
+          | grep -v -x -e _end -e bst_kernel_pml4 -e bst_cpu_enter -e bst_cpu_wait -e bst_platform_ctx \
+                    -e bst_platform_cpus -e bst_platform_smp_start -e bst_platform_smp_join | grep -q .; then
+    kernel=", and BastiOS's kernel"
+  else
+    differ=$((differ+1)); echo "DIFFER ../bastios/src/main.bastio (kernel not built by asmdump --kernel)"
+  fi
+fi
+echo "-- native (stage1 only): $built programs built and run (plus asmdump built by itself, and bastioc1), $users user programs built$kernel, $differ differ"
 { [ "$differ" = 0 ] && [ "$built" -gt 1 ] && [ "$users" -gt 0 ]; } || status=1
 # The driver. The sentence after `error[CODE]:` and the hints (`  = ..`)
 # of the errors before the verifier are being ported phase by phase: where
