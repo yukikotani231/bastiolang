@@ -165,6 +165,16 @@ An allocation map is a `Bytes` with one byte per entry (a disk block, a page, a 
 | `map_fill(m, lo, hi, v)` | Sets `lo..hi` to `v` and leaves the rest |
 | `map_is_free(m, i)`, `map_count_free(m, lo, hi)` | Exactly whether byte `i` is 0; a count of at most `hi - lo` |
 
+`Bits` packs 64 entries in each `u64` word (`bits_new(n)`, all free; a set bit is in use), an eighth of the memory, with the same operations and guarantees, stated per bit with `has_bit` (spec fn `bits_at(b, i)`):
+
+| Function | Proved |
+| --- | --- |
+| `bits_find_clear(b, lo, hi, hint)` | As `map_find_free`: a free entry in `lo..hi`, or `hi` only when all of `lo..hi` is in use (spec fn `bits_full`). A word whose 64 entries are all in use is skipped with one comparison |
+| `bits_take(b, lo, hi, hint)` | The same, and sets the entry it returns; no other bit of any word changes (spec fn `bits_same_but`) |
+| `bits_set(b, i)`, `bits_clear(b, i)`, `bits_give(b, i)` | Set or clear entry `i` and nothing else |
+| `bits_test(b, i)`, `bits_count_clear(b, lo, hi)` | Exactly whether entry `i` is in use; a count of at most `hi - lo` |
+| `bits_free(b)` | |
+
 ### `core/csum.bastio`
 
 | Function | Proved |
@@ -213,5 +223,5 @@ A survey of the hand-written helpers in `stage1/`, BastiOS (`src/` and `user/`) 
 | Insertion sort | 2 (stage1's sorts compare records by a key) | `sort_u64`, `merge_sort_u64`, `sort_by_key_u64` (when the key is a number) |
 | Lookup by key: every table is a linear scan (`find_inst`, `env_find`, `find_file`, ...) | many | `HashMap`, `BytesMap` (for names and paths) |
 | Ring buffers: head and count over a fixed capacity (console output, tty input, pipes, AF_UNIX channels, the disk command queue) | 6 (BastiOS) | `Ring`, `Queue` |
-| Allocation maps, a byte or word per entry with a wrap-around search (disk blocks, pages) | 2 (BastiOS) | `core/bitmap.bastio` |
+| Allocation maps, a byte or word per entry with a wrap-around search (disk blocks, pages) | 2 (BastiOS) | `core/bitmap.bastio` (`map_*` bytes, `Bits` packed) |
 | The Internet checksum (`cadd`, `sum16`, `csum`, `l4_sum`) | 1 (BastiOS network) | `core/csum.bastio` |

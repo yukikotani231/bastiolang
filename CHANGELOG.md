@@ -61,6 +61,15 @@ What will be 0.2.0.
   every sized type; console printing; endian loads and stores; a hash map;
   insertion sort and binary search; host files and standard error (#69).
   The hash map is generic, `HashMap[V]` (#86).
+- Every `parse_*` is proved to return the value of its digits (`bdec`,
+  `bhex`) (#93, #98).
+- `core/ring` (`Ring`, `Queue`), `core/bitmap` (allocation maps) and
+  `core/csum` (Internet checksum, CRC-32) (#98). The bitmap also comes
+  packed, 64 entries a word (`Bits`).
+- `merge_sort_u64`, O(n log n) with the insertion sort's proof, and
+  `sort_by_key_u64`, a proved stable sort of indices by a key vector;
+  `BytesMap[V]`, a hash map from byte strings; `examples/wordfreq.bastio`
+  (#107).
 
 ### Compilers
 
