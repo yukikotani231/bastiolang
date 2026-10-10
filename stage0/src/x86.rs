@@ -113,6 +113,9 @@ enum Store {
     Ptr(i64),
     /// A scalar kept in a callee-saved register.
     Reg(&'static str),
+    /// A buffer or vector value that never changes, one register per word
+    /// ("" for a word that is never read).
+    Regs([&'static str; 3]),
 }
 
 #[derive(Clone, Debug)]
@@ -149,6 +152,8 @@ impl Dst {
 enum Loc {
     Mem(&'static str, i64),
     Reg(&'static str),
+    /// One register per word.
+    Regs([&'static str; 3]),
 }
 
 impl Loc {
@@ -159,6 +164,10 @@ impl Loc {
             Loc::Reg(r) => {
                 assert_eq!(i, 0);
                 r.to_string()
+            }
+            Loc::Regs(rs) => {
+                assert!(!rs[i].is_empty(), "a word read is in a register");
+                rs[i].to_string()
             }
         }
     }
@@ -185,28 +194,48 @@ const INLINE_BUILTINS: &[&str] = &[
     "pt_has", "pt_put", "pt_put_frame", "pt_take", "pt_take_frame",
 ];
 
+/// How deep inlining goes: the function being generated, then up to two
+/// levels of inlined bodies; deeper, only the tiniest functions.
+const INLINE_DEPTH: usize = 3;
+const INLINE_TINY: usize = 10;
+
+/// The body to inline for a call to `name`, given the functions being
+/// generated or inlined at this point (outermost first), if it is inlined:
+/// never into itself, and not too deep.
+fn will_inline<'i>(inl: &'i HashMap<String, FnDef>, name: &str, stack: &[String]) -> Option<&'i FnDef> {
+    inl.get(name).filter(|f| (stack.len() < INLINE_DEPTH || body_size(f) <= INLINE_TINY) && !stack.iter().any(|s| s == name))
+}
+
 /// Does code `ss` call nothing: no function that is not inlined, and no
-/// builtin that calls the runtime?
-/// `fns` is None inside an inlined body, which is not inlined into further.
-fn is_leaf(ss: &[Stmt], fns: Option<&HashMap<String, &FnDef>>) -> bool {
-    fn expr(e: &Expr, fns: Option<&HashMap<String, &FnDef>>) -> bool {
+/// builtin that calls the runtime? `stack` as for `will_inline`.
+fn is_leaf(ss: &[Stmt], inl: &HashMap<String, FnDef>, stack: &mut Vec<String>) -> bool {
+    fn expr(e: &Expr, inl: &HashMap<String, FnDef>, stack: &mut Vec<String>) -> bool {
         match &e.kind {
             ExprKind::Call(n, xs) => {
-                let ok = INLINE_BUILTINS.contains(&n.as_str()) || fns.and_then(|m| m.get(n)).map_or(false, |f| inlinable(f) && is_leaf(&f.body, None));
-                ok && xs.iter().all(|x| expr(x, fns))
+                let ok = INLINE_BUILTINS.contains(&n.as_str())
+                    || match will_inline(inl, n, stack) {
+                        Some(f) => {
+                            stack.push(n.clone());
+                            let l = is_leaf(&f.body, inl, stack);
+                            stack.pop();
+                            l
+                        }
+                        None => false,
+                    };
+                ok && xs.iter().all(|x| expr(x, inl, stack))
             }
-            ExprKind::Field(x, _) | ExprKind::Is(x, _, _) | ExprKind::Not(x) | ExprKind::Neg(x) | ExprKind::TypeApp(_, x) => expr(x, fns),
-            ExprKind::Variant(_, _, Some(x)) => expr(x, fns),
-            ExprKind::StructLit(_, fs) => fs.iter().all(|(_, x)| expr(x, fns)),
-            ExprKind::Bin(_, a, b) => expr(a, fns) && expr(b, fns),
+            ExprKind::Field(x, _) | ExprKind::Is(x, _, _) | ExprKind::Not(x) | ExprKind::Neg(x) | ExprKind::TypeApp(_, x) => expr(x, inl, stack),
+            ExprKind::Variant(_, _, Some(x)) => expr(x, inl, stack),
+            ExprKind::StructLit(_, fs) => fs.iter().all(|(_, x)| expr(x, inl, stack)),
+            ExprKind::Bin(_, a, b) => expr(a, inl, stack) && expr(b, inl, stack),
             _ => true,
         }
     }
     ss.iter().all(|s| match &s.kind {
-        StmtKind::Let { init: x, .. } | StmtKind::Assign { value: x, .. } | StmtKind::Expr(x) | StmtKind::Return(Some(x)) => expr(x, fns),
-        StmtKind::If { cond, then_b, else_b } => expr(cond, fns) && is_leaf(then_b, fns) && is_leaf(else_b, fns),
-        StmtKind::While { cond, body, .. } => expr(cond, fns) && is_leaf(body, fns),
-        StmtKind::Match { scrut, arms } => expr(scrut, fns) && arms.iter().all(|a| is_leaf(&a.body, fns)),
+        StmtKind::Let { init: x, .. } | StmtKind::Assign { value: x, .. } | StmtKind::Expr(x) | StmtKind::Return(Some(x)) => expr(x, inl, stack),
+        StmtKind::If { cond, then_b, else_b } => expr(cond, inl, stack) && is_leaf(then_b, inl, stack) && is_leaf(else_b, inl, stack),
+        StmtKind::While { cond, body, .. } => expr(cond, inl, stack) && is_leaf(body, inl, stack),
+        StmtKind::Match { scrut, arms } => expr(scrut, inl, stack) && arms.iter().all(|a| is_leaf(&a.body, inl, stack)),
         _ => true,
     })
 }
@@ -216,11 +245,11 @@ struct Gen<'a> {
     sigs: &'a HashMap<String, Sig>,
     /// The integer type of each operator, by position (`FnDef::int_ops`).
     int_ops: &'a HashMap<crate::diag::Pos, Type>,
-    /// Every function of the program, for inlining.
-    fns: &'a HashMap<String, &'a FnDef>,
-    /// Generating the body of an inlined function (which is not inlined
-    /// into further).
-    inlining: bool,
+    /// The functions that can be inlined, renamed (see `renamed`).
+    inl: &'a HashMap<String, FnDef>,
+    /// The function being generated, then the functions being inlined at
+    /// this point of it (see `will_inline`).
+    stack: Vec<String>,
     vars: HashMap<String, Var>,
     /// Frame words used so far by locals.
     frame: i64,
@@ -232,10 +261,14 @@ struct Gen<'a> {
     ret_words: usize,
     /// Offset from %rbp of the caller's room for a multi-word result.
     ret_off: i64,
-    /// The variables kept in callee-saved registers (see `assign_regs`).
-    regs: HashMap<String, &'static str>,
+    /// Where an inlined body puts a multi-word result.
+    ret_dst: Option<Dst>,
+    /// The variables kept in registers, one per word (see `assign_regs`).
+    regs: HashMap<String, Vec<&'static str>>,
     /// Callee-saved registers this function uses (saved in its frame).
     used_regs: Vec<&'static str>,
+    /// Where `emit` saves %r8-%r11 around calls.
+    call_saves: Vec<(&'static str, i64)>,
     /// Variables whose address is taken (`&mut x`): never in a register.
     borrowed: HashSet<String>,
 }
@@ -290,15 +323,15 @@ pub fn emit(p: &Program) -> R<String> {
     let sigs = crate::check::signatures(p, crate::codegen::Target::Hosted).expect("checked");
     let mut labels = 0;
     let mut strings = Vec::new();
-    let fns: HashMap<String, &FnDef> = p.fns.iter().map(|f| (f.name.clone(), f)).collect();
     // `export fn` only matters to C callers; a program is still built
     // around its `main` (a library without one is not supported yet).
     if !p.fns.iter().any(|f| f.name == "main") {
         return Err("the native backend does not support libraries (`export fn` without `main`) yet".into());
     }
+    let inl: HashMap<String, FnDef> = p.fns.iter().filter(|f| inlinable(f)).map(|f| (f.name.clone(), renamed(f))).collect();
     let mut out = String::from("# generated by bastioc0 --backend native -- do not edit\n\t.text\n");
     for f in &p.fns {
-        out.push_str(&function(f, &fns, &sigs, &mut labels, &mut strings)?);
+        out.push_str(&function(f, &inl, &sigs, &mut labels, &mut strings)?);
     }
     out.push_str(&entry(p)?);
     out.push_str(RUNTIME);
@@ -359,15 +392,18 @@ fn entry(p: &Program) -> R<String> {
     Ok(s)
 }
 
-fn function<'a>(f: &'a FnDef, fns: &'a HashMap<String, &'a FnDef>, sigs: &'a HashMap<String, Sig>, labels: &mut usize, strings: &mut Vec<Vec<u8>>) -> R<String> {
+fn function<'a>(f: &'a FnDef, inl: &'a HashMap<String, FnDef>, sigs: &'a HashMap<String, Sig>, labels: &mut usize, strings: &mut Vec<Vec<u8>>) -> R<String> {
     let mut borrowed = HashSet::new();
     stmts_borrows(&f.body, &mut borrowed);
+    for g in inl.values() {
+        stmts_borrows(&g.body, &mut borrowed);
+    }
     let mut g = Gen {
         out: String::new(),
         sigs,
         int_ops: &f.int_ops,
-        fns,
-        inlining: false,
+        inl,
+        stack: vec![f.name.clone()],
         vars: HashMap::new(),
         frame: 0,
         depth: 0,
@@ -376,8 +412,10 @@ fn function<'a>(f: &'a FnDef, fns: &'a HashMap<String, &'a FnDef>, sigs: &'a Has
         ret_label: String::new(),
         ret_words: words(&f.ret)?,
         ret_off: 0,
-        regs: assign_regs(f, fns),
+        ret_dst: None,
+        regs: assign_regs(f, inl),
         used_regs: Vec::new(),
+        call_saves: Vec::new(),
         borrowed,
     };
     g.ret_label = g.label();
@@ -399,6 +437,11 @@ fn function<'a>(f: &'a FnDef, fns: &'a HashMap<String, &'a FnDef>, sigs: &'a Has
             if let Some(r) = g.reg_for(&prm.name, &prm.ty) {
                 g.emit(&format!("mov {}(%rbp), {}", o, r));
                 g.vars.get_mut(&prm.name).unwrap().st = Store::Reg(r);
+            } else if let Some(rs) = g.regs_for(&prm.name) {
+                for (i, r) in rs.iter().enumerate().filter(|(_, r)| !r.is_empty()) {
+                    g.emit(&format!("mov {}(%rbp), {}", o + 8 * i as i64, r));
+                }
+                g.vars.get_mut(&prm.name).unwrap().st = Store::Regs(rs);
             }
         }
     }
@@ -415,7 +458,7 @@ fn function<'a>(f: &'a FnDef, fns: &'a HashMap<String, &'a FnDef>, sigs: &'a Has
     let frame = (g.frame + 1) & !1; // keep %rsp 16-byte aligned
     let name = sym(&f.name);
     Ok(format!(
-        "{name}:\n\tpush %rbp\n\tmov %rsp, %rbp\n\tsub ${}, %rsp\n{saves}{}{}:\n{restores}\tleave\n\tret\n\n",
+        "\t.type {name}, @function\n{name}:\n\tpush %rbp\n\tmov %rsp, %rbp\n\tsub ${}, %rsp\n{saves}{}{}:\n{restores}\tleave\n\tret\n\t.size {name}, .-{name}\n\n",
         8 * frame,
         body,
         g.ret_label
@@ -443,93 +486,347 @@ fn peephole(code: &str) -> String {
     out
 }
 
-/// Chooses the scalar variables that live in registers: the five used most,
-/// a use inside a loop counting eight times as much per level of nesting.
-/// The language has no shadowing, so variables of the same name never live
-/// at the same time and can share a register; a name is eligible only if
-/// every variable of that name is a scalar whose address is never taken.
-fn assign_regs(f: &FnDef, fns: &HashMap<String, &FnDef>) -> HashMap<String, &'static str> {
-    fn scalar(t: &Type) -> bool {
-        t.is_int() || *t == Type::Bool
+/// Chooses the variables that live in registers, by use: a use inside a
+/// loop counts eight times as much per level of nesting. Scalars whose
+/// address is never taken qualify, and so do buffers, strings and vectors
+/// (and shared references to them) that are never assigned, borrowed or
+/// matched, one register per word. The language has no shadowing, so
+/// variables of the same name never live at the same time and can share
+/// registers; a name qualifies only if every variable of that name does,
+/// with the same size.
+fn assign_regs(f: &FnDef, inl: &HashMap<String, FnDef>) -> HashMap<String, Vec<&'static str>> {
+    /// Words of a variable of type `t` kept in registers, if it may be.
+    fn size(t: &Type) -> Option<usize> {
+        match t {
+            t if t.is_int() || *t == Type::Bool => Some(1),
+            Type::Buf | Type::Bytes | Type::Str => Some(2),
+            Type::Vec(_) => Some(3),
+            Type::Ref(i) if size(i)? > 1 => size(i),
+            _ => None,
+        }
     }
-    fn expr(e: &Expr, w: u64, uses: &mut HashMap<String, u64>) {
+    /// Counts the uses in `e`. A buffer or vector named only by the builtins
+    /// that read one word of it (its length or its data pointer) needs only
+    /// those words in registers; any other use needs them all (`whole`).
+    fn expr(e: &Expr, w: u64, a: &mut Acc) {
         match &e.kind {
-            ExprKind::Var(n) => *uses.entry(n.clone()).or_insert(0) += w,
-            ExprKind::Field(x, _) | ExprKind::Is(x, _, _) | ExprKind::Not(x) | ExprKind::Neg(x) | ExprKind::TypeApp(_, x) => expr(x, w, uses),
-            ExprKind::Variant(_, _, Some(x)) => expr(x, w, uses),
-            ExprKind::StructLit(_, fs) => fs.iter().for_each(|(_, x)| expr(x, w, uses)),
-            ExprKind::Bin(_, a, b) => {
-                expr(a, w, uses);
-                expr(b, w, uses);
+            ExprKind::Var(n) => {
+                *a.uses.entry(n.clone()).or_insert(0) += w;
+                a.whole.insert(n.clone());
             }
-            ExprKind::Call(_, xs) => xs.iter().for_each(|x| expr(x, w, uses)),
+            ExprKind::Field(x, _) | ExprKind::Is(x, _, _) | ExprKind::Not(x) | ExprKind::Neg(x) | ExprKind::TypeApp(_, x) => expr(x, w, a),
+            ExprKind::Variant(_, _, Some(x)) => expr(x, w, a),
+            ExprKind::StructLit(_, fs) => fs.iter().for_each(|(_, x)| expr(x, w, a)),
+            ExprKind::Bin(_, l, r) => {
+                expr(l, w, a);
+                expr(r, w, a);
+            }
+            ExprKind::Call(f, xs) => {
+                // An inlined body counts as part of the caller.
+                if let Some(g) = will_inline(a.inl, f, &a.stack) {
+                    a.stack.push(f.clone());
+                    let outer = a.enter();
+                    for p in &g.params {
+                        a.declare(&p.name);
+                        if p.ty.is_mut_ref() {
+                            a.bad.insert(p.name.clone());
+                        } else {
+                            a.bind(&p.name, Some(&p.ty));
+                        }
+                        *a.uses.entry(p.name.clone()).or_insert(0) += w;
+                    }
+                    stmts(&g.body, w, a);
+                    a.cur = outer;
+                    a.stack.pop();
+                }
+                let word = match f.as_str() {
+                    f if LENS.contains(&f) => Some(0),
+                    "get" | "bget" | "sget" => Some(1),
+                    "vec_get" => Some(2),
+                    _ => None,
+                };
+                for (i, x) in xs.iter().enumerate() {
+                    match (&x.kind, word) {
+                        (ExprKind::Var(n), Some(k)) if i == 0 => {
+                            *a.uses.entry(n.clone()).or_insert(0) += w;
+                            a.read.entry(n.clone()).or_default().insert(k);
+                        }
+                        _ => expr(x, w, a),
+                    }
+                }
+            }
             _ => {}
         }
     }
-    fn stmts(ss: &[Stmt], w: u64, uses: &mut HashMap<String, u64>, bad: &mut HashSet<String>) {
+    struct Acc<'i> {
+        inl: &'i HashMap<String, FnDef>,
+        stack: Vec<String>,
+        uses: HashMap<String, u64>,
+        whole: HashSet<String>,
+        read: HashMap<String, std::collections::BTreeSet<usize>>,
+        sizes: HashMap<String, usize>,
+        bad: HashSet<String>,
+        assigned: HashSet<String>,
+        /// The scopes (blocks and inlined bodies): each one's parent.
+        parent: Vec<usize>,
+        cur: usize,
+        /// The scopes where each name is declared.
+        decl: HashMap<String, Vec<usize>>,
+    }
+    impl Acc<'_> {
+        /// Enters a new scope inside the current one; returns the current.
+        fn enter(&mut self) -> usize {
+            self.parent.push(self.cur);
+            std::mem::replace(&mut self.cur, self.parent.len() - 1)
+        }
+        fn declare(&mut self, name: &str) {
+            self.decl.entry(name.to_string()).or_default().push(self.cur);
+        }
+        /// Is scope `a` scope `b` or one that encloses it?
+        fn encloses(&self, a: usize, mut b: usize) -> bool {
+            loop {
+                if a == b {
+                    return true;
+                }
+                if b == 0 {
+                    return false;
+                }
+                b = self.parent[b];
+            }
+        }
+        /// Can variables `x` and `y` be alive at the same time? Not when
+        /// they are declared in disjoint scopes.
+        fn overlap(&self, x: &str, y: &str) -> bool {
+            let (dx, dy) = (&self.decl[x], &self.decl[y]);
+            dx.iter().any(|&a| dy.iter().any(|&b| self.encloses(a, b) || self.encloses(b, a)))
+        }
+        fn bind(&mut self, name: &str, t: Option<&Type>) {
+            match (t.and_then(size), self.sizes.get(name)) {
+                (Some(n), None) => {
+                    self.sizes.insert(name.to_string(), n);
+                }
+                (Some(n), Some(m)) if n == *m => {}
+                _ => {
+                    self.bad.insert(name.to_string());
+                }
+            }
+        }
+    }
+    fn stmts(ss: &[Stmt], w: u64, a: &mut Acc) {
         for s in ss {
             match &s.kind {
                 StmtKind::Let { name, ty, init, .. } => {
-                    if !ty.as_ref().map_or(false, scalar) {
-                        bad.insert(name.clone());
-                    }
-                    *uses.entry(name.clone()).or_insert(0) += w;
-                    expr(init, w, uses);
+                    a.bind(name, ty.as_ref());
+                    a.declare(name);
+                    *a.uses.entry(name.clone()).or_insert(0) += w;
+                    expr(init, w, a);
                 }
                 StmtKind::Assign { name, value } => {
-                    *uses.entry(path_root(name).to_string()).or_insert(0) += w;
-                    expr(value, w, uses);
+                    let root = path_root(name).to_string();
+                    *a.uses.entry(root.clone()).or_insert(0) += w;
+                    a.assigned.insert(root);
+                    expr(value, w, a);
                 }
-                StmtKind::Expr(x) | StmtKind::Return(Some(x)) => expr(x, w, uses),
+                StmtKind::Expr(x) | StmtKind::Return(Some(x)) => expr(x, w, a),
                 StmtKind::If { cond, then_b, else_b } => {
-                    expr(cond, w, uses);
-                    stmts(then_b, w, uses, bad);
-                    stmts(else_b, w, uses, bad);
+                    expr(cond, w, a);
+                    let outer = a.enter();
+                    stmts(then_b, w, a);
+                    a.cur = outer;
+                    let outer = a.enter();
+                    stmts(else_b, w, a);
+                    a.cur = outer;
                 }
                 StmtKind::While { cond, body, .. } => {
                     let w = w.saturating_mul(8);
-                    expr(cond, w, uses);
-                    stmts(body, w, uses, bad);
+                    expr(cond, w, a);
+                    let outer = a.enter();
+                    stmts(body, w, a);
+                    a.cur = outer;
                 }
                 StmtKind::Match { scrut, arms } => {
-                    expr(scrut, w, uses);
-                    for a in arms {
+                    expr(scrut, w, a);
+                    for arm in arms {
                         // A payload is bound in place, never in a register.
-                        if let Pat::Variant(_, _, Some(b), _) = &a.pat {
-                            bad.insert(b.clone());
+                        if let Pat::Variant(_, _, Some(b), _) = &arm.pat {
+                            a.bad.insert(b.clone());
                         }
-                        stmts(&a.body, w, uses, bad);
+                        let outer = a.enter();
+                        stmts(&arm.body, w, a);
+                        a.cur = outer;
                     }
                 }
                 _ => {}
             }
         }
     }
-    let mut uses = HashMap::new();
-    let mut bad = HashSet::new();
-    stmts_borrows(&f.body, &mut bad);
+    let mut a = Acc { inl, stack: vec![f.name.clone()], uses: HashMap::new(), whole: HashSet::new(), read: HashMap::new(), sizes: HashMap::new(), bad: HashSet::new(), assigned: HashSet::new(), parent: vec![0], cur: 0, decl: HashMap::new() };
+    stmts_borrows(&f.body, &mut a.bad);
+    for g in inl.values() {
+        stmts_borrows(&g.body, &mut a.bad);
+    }
     for p in &f.params {
-        if p.ty.is_ref() || !scalar(&p.ty) {
-            bad.insert(p.name.clone());
+        a.declare(&p.name);
+        if p.ty.is_mut_ref() {
+            a.bad.insert(p.name.clone());
+        } else {
+            a.bind(&p.name, Some(&p.ty));
         }
     }
-    stmts(&f.body, 1, &mut uses, &mut bad);
-    let mut v: Vec<(String, u64)> = uses.into_iter().filter(|(n, _)| !bad.contains(n)).collect();
+    stmts(&f.body, 1, &mut a);
+    // Each candidate: its name, weight, and the words it needs registers
+    // for (`None` for a word that is never read).
+    let mut v: Vec<(String, u64, Vec<bool>)> = a
+        .uses
+        .iter()
+        .filter_map(|(n, &w)| {
+            let k = *a.sizes.get(n)?;
+            if a.bad.contains(n) || (k > 1 && a.assigned.contains(n)) {
+                return None;
+            }
+            let need = (0..k).map(|i| k == 1 || a.whole.contains(n) || a.read.get(n).map_or(false, |r| r.contains(&i))).collect();
+            Some((n.clone(), w, need))
+        })
+        .collect();
     v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    // A function that calls nothing (inlined calls aside) can also keep
-    // variables in %r8-%r11, which no other code here touches and which,
-    // being caller-saved, cost nothing to save.
-    let regs: Vec<&'static str> = if is_leaf(&f.body, Some(fns)) { LEAF.iter().chain(SAVED.iter()).copied().collect() } else { SAVED.to_vec() };
-    v.into_iter().zip(regs).map(|((n, _), r)| (n, r)).collect()
+    // %r8-%r11 cost nothing to save in a function that calls nothing
+    // (inlined calls aside): it uses them first. Elsewhere they are saved
+    // around each call (see `Gen::emit`), so they come last.
+    let regs: Vec<&'static str> = if is_leaf(&f.body, inl, &mut vec![f.name.clone()]) { LEAF.iter().chain(SAVED.iter()).copied().collect() } else { SAVED.iter().chain(LEAF.iter()).copied().collect() };
+    // Most used first, each takes the first registers that no variable
+    // which may be alive at the same time already has.
+    let mut out: HashMap<String, Vec<&'static str>> = HashMap::new();
+    for (n, _, need) in v {
+        let taken: HashSet<&'static str> = out.iter().filter(|(m, _)| a.overlap(&n, m)).flat_map(|(_, rs)| rs.iter().copied()).collect();
+        let mut free = regs.iter().filter(|r| !taken.contains(*r));
+        let rs: Vec<&'static str> = need.iter().map_while(|b| if *b { free.next().copied() } else { Some("") }).collect();
+        if rs.len() == need.len() {
+            out.insert(n, rs);
+        }
+    }
+    out
 }
 
-/// Can calls to `f` be inlined? Only the smallest functions: a body that is
-/// one `return e;`, with scalar parameters and result and no borrows in `e`
-/// (it is evaluated as an expression in the caller's frame).
+/// Largest body (in statements and expression nodes) that is inlined.
+const INLINE_MAX: usize = 160;
+
+/// Can calls to `f` be inlined (except into `f` itself)? Small functions
+/// can: their body is generated in the caller, one level deep (calls in
+/// an inlined body are calls).
 fn inlinable(f: &FnDef) -> bool {
-    let scalar = |t: &Type| t.is_int() || *t == Type::Bool;
-    let [Stmt { kind: StmtKind::Return(Some(e)), .. }] = f.body.as_slice() else { return false };
-    f.params.iter().all(|p| scalar(&p.ty)) && scalar(&f.ret) && !borrows(e) && f.name != "main"
+    f.name != "main" && body_size(f) <= INLINE_MAX
+}
+
+/// The number of statements and expression nodes in `f`'s body.
+fn body_size(f: &FnDef) -> usize {
+    fn expr(e: &Expr) -> usize {
+        1 + match &e.kind {
+            ExprKind::Field(x, _) | ExprKind::Is(x, _, _) | ExprKind::Not(x) | ExprKind::Neg(x) | ExprKind::TypeApp(_, x) => expr(x),
+            ExprKind::Variant(_, _, Some(x)) => expr(x),
+            ExprKind::StructLit(_, fs) => fs.iter().map(|(_, x)| expr(x)).sum(),
+            ExprKind::Bin(_, a, b) => expr(a) + expr(b),
+            ExprKind::Call(_, xs) => xs.iter().map(expr).sum(),
+            _ => 0,
+        }
+    }
+    fn stmts(ss: &[Stmt]) -> usize {
+        ss.iter()
+            .map(|s| {
+                1 + match &s.kind {
+                    StmtKind::Let { init: x, .. } | StmtKind::Assign { value: x, .. } | StmtKind::Expr(x) | StmtKind::Return(Some(x)) => expr(x),
+                    StmtKind::If { cond, then_b, else_b } => expr(cond) + stmts(then_b) + stmts(else_b),
+                    StmtKind::While { cond, body, .. } => expr(cond) + stmts(body),
+                    StmtKind::Match { scrut, arms } => expr(scrut) + arms.iter().map(|a| 1 + stmts(&a.body)).sum::<usize>(),
+                    _ => 0,
+                }
+            })
+            .sum()
+    }
+    stmts(&f.body)
+}
+
+/// `f` with every variable renamed to `f'x`, which no variable of a caller
+/// can be named: the body that `Gen::inline` generates in callers.
+fn renamed(f: &FnDef) -> FnDef {
+    let pre = format!("{}'", f.name);
+    let rn = |n: &str| format!("{}{}", pre, n);
+    let path = |p: &str| match p.split_once('.') {
+        Some((r, rest)) => format!("{}{}.{}", pre, r, rest),
+        None => rn(p),
+    };
+    fn expr(e: &Expr, path: &dyn Fn(&str) -> String) -> Expr {
+        let k = match &e.kind {
+            ExprKind::Var(n) => ExprKind::Var(path(n)),
+            ExprKind::MutBorrow(p) => ExprKind::MutBorrow(path(p)),
+            ExprKind::Field(x, f) => ExprKind::Field(Box::new(expr(x, path)), f.clone()),
+            ExprKind::Is(x, a, b) => ExprKind::Is(Box::new(expr(x, path)), a.clone(), b.clone()),
+            ExprKind::Not(x) => ExprKind::Not(Box::new(expr(x, path))),
+            ExprKind::Neg(x) => ExprKind::Neg(Box::new(expr(x, path))),
+            ExprKind::TypeApp(t, x) => ExprKind::TypeApp(t.clone(), Box::new(expr(x, path))),
+            ExprKind::Variant(a, b, x) => ExprKind::Variant(a.clone(), b.clone(), x.as_ref().map(|x| Box::new(expr(x, path)))),
+            ExprKind::StructLit(n, fs) => ExprKind::StructLit(n.clone(), fs.iter().map(|(f, x)| (f.clone(), expr(x, path))).collect()),
+            ExprKind::Bin(op, a, b) => ExprKind::Bin(*op, Box::new(expr(a, path)), Box::new(expr(b, path))),
+            ExprKind::Call(n, xs) => ExprKind::Call(n.clone(), xs.iter().map(|x| expr(x, path)).collect()),
+            k => k.clone(),
+        };
+        Expr { kind: k, pos: e.pos }
+    }
+    fn stmts(ss: &[Stmt], path: &dyn Fn(&str) -> String) -> Vec<Stmt> {
+        ss.iter()
+            .map(|s| {
+                let k = match &s.kind {
+                    StmtKind::Let { name, mutable, ty, init } => StmtKind::Let { name: path(name), mutable: *mutable, ty: ty.clone(), init: expr(init, path) },
+                    StmtKind::Assign { name, value } => StmtKind::Assign { name: path(name), value: expr(value, path) },
+                    StmtKind::If { cond, then_b, else_b } => StmtKind::If { cond: expr(cond, path), then_b: stmts(then_b, path), else_b: stmts(else_b, path) },
+                    // Invariants and asserts generate no code.
+                    StmtKind::While { cond, body, .. } => StmtKind::While { cond: expr(cond, path), invariants: Vec::new(), body: stmts(body, path) },
+                    StmtKind::Return(x) => StmtKind::Return(x.as_ref().map(|x| expr(x, path))),
+                    StmtKind::Assert(_) => StmtKind::Assert(Expr { kind: ExprKind::Bool(true), pos: s.pos }),
+                    StmtKind::Expr(x) => StmtKind::Expr(expr(x, path)),
+                    StmtKind::Match { scrut, arms } => StmtKind::Match {
+                        scrut: expr(scrut, path),
+                        arms: arms
+                            .iter()
+                            .map(|a| Arm {
+                                pat: match &a.pat {
+                                    Pat::Variant(e, v, Some(b), m) if b != "_" => Pat::Variant(e.clone(), v.clone(), Some(path(b)), *m),
+                                    p => p.clone(),
+                                },
+                                body: stmts(&a.body, path),
+                                pos: a.pos,
+                            })
+                            .collect(),
+                    },
+                    k => k.clone(),
+                };
+                Stmt { kind: k, pos: s.pos }
+            })
+            .collect()
+    }
+    let mut g = f.clone();
+    g.params = f.params.iter().map(|p| Param { name: rn(&p.name), ..p.clone() }).collect();
+    g.body = stmts(&f.body, &path);
+    g.requires.clear();
+    g.ensures.clear();
+    g
+}
+
+/// The variables assigned (wholly or in part) somewhere in `ss`.
+fn assigned_roots(ss: &[Stmt], out: &mut HashSet<String>) {
+    for s in ss {
+        match &s.kind {
+            StmtKind::Assign { name, .. } => {
+                out.insert(path_root(name).to_string());
+            }
+            StmtKind::If { then_b, else_b, .. } => {
+                assigned_roots(then_b, out);
+                assigned_roots(else_b, out);
+            }
+            StmtKind::While { body, .. } => assigned_roots(body, out),
+            StmtKind::Match { arms, .. } => arms.iter().for_each(|a| assigned_roots(&a.body, out)),
+            _ => {}
+        }
+    }
 }
 
 /// The variables whose address is taken (`&mut x`) somewhere in `ss`.
@@ -621,9 +918,33 @@ fn normalize(t: &Type) -> &'static str {
 
 impl<'a> Gen<'a> {
     fn emit(&mut self, s: &str) {
+        // A call may change %r8-%r11: the variables there so far are saved
+        // in the frame around it.
+        let saves: Vec<(&str, i64)> = if s.starts_with("call ") {
+            let leaf: Vec<&'static str> = self.used_regs.iter().copied().filter(|r| LEAF.contains(r)).collect();
+            leaf.into_iter().map(|r| (r, self.save_slot(r))).collect()
+        } else {
+            Vec::new()
+        };
+        for (r, o) in &saves {
+            self.out.push_str(&format!("\tmov {}, {}(%rbp)\n", r, o));
+        }
         self.out.push('\t');
         self.out.push_str(s);
         self.out.push('\n');
+        for (r, o) in &saves {
+            self.out.push_str(&format!("\tmov {}(%rbp), {}\n", o, r));
+        }
+    }
+
+    /// The frame slot where `emit` saves caller-saved register `r`.
+    fn save_slot(&mut self, r: &'static str) -> i64 {
+        if let Some(&(_, o)) = self.call_saves.iter().find(|(x, _)| *x == r) {
+            return o;
+        }
+        let o = self.slot(1);
+        self.call_saves.push((r, o));
+        o
     }
     fn label(&mut self) -> String {
         *self.labels += 1;
@@ -664,11 +985,40 @@ impl<'a> Gen<'a> {
         if !(t.is_int() || *t == Type::Bool) || self.borrowed.contains(name) {
             return None;
         }
-        let r = *self.regs.get(name)?;
+        let r = *self.regs.get(name)?.first()?;
+        self.use_reg(r);
+        Some(r)
+    }
+
+    /// The registers of a multi-word variable that never changes, if
+    /// `assign_regs` gave it some.
+    fn regs_for(&mut self, name: &str) -> Option<[&'static str; 3]> {
+        let rs = self.regs.get(name).filter(|rs| rs.len() > 1)?.clone();
+        let mut a = [""; 3];
+        for (i, r) in rs.into_iter().enumerate() {
+            if !r.is_empty() {
+                self.use_reg(r);
+            }
+            a[i] = r;
+        }
+        Some(a)
+    }
+
+    /// The register of `e` if it is a variable kept in one.
+    fn var_reg(&self, e: &Expr) -> Option<&'static str> {
+        match &e.kind {
+            ExprKind::Var(n) => match self.vars.get(n)?.st {
+                Store::Reg(r) => Some(r),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn use_reg(&mut self, r: &'static str) {
         if !self.used_regs.contains(&r) {
             self.used_regs.push(r);
         }
-        Some(r)
     }
     /// Pops `n` words into the place at `loc`.
     fn pop_to(&mut self, loc: Loc, n: usize) {
@@ -694,6 +1044,7 @@ impl<'a> Gen<'a> {
         let mut loc = match v.st {
             Store::Slot(o) => Loc::Mem("%rbp", o),
             Store::Reg(r) => Loc::Reg(r),
+            Store::Regs(rs) => Loc::Regs(rs),
             Store::Ptr(o) => {
                 self.emit(&format!("mov {}(%rbp), %rcx", o));
                 Loc::Mem("%rcx", 0)
@@ -796,6 +1147,18 @@ impl<'a> Gen<'a> {
                 let t = ty.clone().expect("typed by checker");
                 let n = words(&t)?;
                 if n > 1 {
+                    if let Some(rs) = self.regs_for(name) {
+                        self.push_val(init)?;
+                        for r in &rs[..n] {
+                            if r.is_empty() {
+                                self.drop_words(1);
+                            } else {
+                                self.pop(r);
+                            }
+                        }
+                        self.vars.insert(name.clone(), Var { st: Store::Regs(rs), ty: t });
+                        return Ok(());
+                    }
                     let o = self.slot(n);
                     self.val_into(init, Dst::Frame(o))?;
                     self.vars.insert(name.clone(), Var { st: Store::Slot(o), ty: t });
@@ -904,9 +1267,8 @@ impl<'a> Gen<'a> {
                 let t = self.type_of(scrut);
                 let en = enum_def(&t.name()).unwrap();
                 let n = words(&t)?;
-                self.push_val(scrut)?;
                 let o = self.slot(n);
-                self.pop_to(Loc::Mem("%rbp", o), n);
+                self.val_into(scrut, Dst::Frame(o))?;
                 let l_end = self.label();
                 for (i, a) in arms.iter().enumerate() {
                     let last = i + 1 == arms.len();
@@ -938,8 +1300,8 @@ impl<'a> Gen<'a> {
                     if self.ret_words == 1 {
                         self.scalar(e)?;
                     } else {
-                        let off = self.ret_off;
-                        self.val_into(e, Dst::Frame(off))?;
+                        let d = self.ret_dst.unwrap_or(Dst::Frame(self.ret_off));
+                        self.val_into(e, d)?;
                     }
                 }
                 let l = self.ret_label.clone();
@@ -971,6 +1333,10 @@ impl<'a> Gen<'a> {
                 }
             }
             ExprKind::Not(x) if !self.int_ops.contains_key(&e.pos) => self.branch(x, target, !when)?,
+            ExprKind::Call(n, args) if will_inline(self.inl, n, &self.stack).map_or(false, |f| matches!(f.body.as_slice(), [Stmt { kind: StmtKind::Return(Some(_)), .. }])) => {
+                let f = will_inline(self.inl, n, &self.stack).unwrap();
+                self.branch_inline(f, args, target, when)?;
+            }
             ExprKind::Bin(op @ (BinOp::And | BinOp::Or | BinOp::Implies), a, b) => {
                 // `a` decides the whole when it is `stop`: false for `&&`,
                 // true for `||`, false for `==>` (which is `!a || b`); the
@@ -1431,6 +1797,12 @@ impl<'a> Gen<'a> {
                     self.val_into(x, d.at(1))?;
                 }
             }
+            // An inlined body returns straight into `d`, which is storage
+            // no variable names, so the body cannot see it change.
+            ExprKind::Call(name, args) if words(&self.type_of(e))? > 1 && will_inline(self.inl, name, &self.stack).is_some() => {
+                let f = will_inline(self.inl, name, &self.stack).unwrap();
+                self.inline(f, args, Some(d))?;
+            }
             _ => {
                 let n = words(&self.type_of(e))?;
                 if n == 1 {
@@ -1479,8 +1851,8 @@ impl<'a> Gen<'a> {
         if crate::check::is_builtin(name) {
             return self.builtin(name, args);
         }
-        if let Some(f) = self.fns.get(name).copied().filter(|f| !self.inlining && inlinable(f)) {
-            return self.inline(f, args);
+        if let Some(f) = will_inline(self.inl, name, &self.stack) {
+            return self.inline(f, args, None);
         }
         if rn > 1 {
             self.reserve(rn);
@@ -1498,26 +1870,126 @@ impl<'a> Gen<'a> {
         Ok(())
     }
 
-    /// Inlines a call to `f` (see `inlinable`): the arguments go to fresh
-    /// frame slots named after the parameters, and `f`'s returned expression
-    /// is generated in their place, with `f`'s own variables and operator
-    /// types. The result is in %rax, as for a call.
-    fn inline(&mut self, f: &'a FnDef, args: &[Expr]) -> R<()> {
-        let mut vars = HashMap::new();
-        for (prm, a) in f.params.iter().zip(args) {
-            self.scalar(a)?;
-            let o = self.slot(1);
-            self.emit(&format!("mov %rax, {}(%rbp)", o));
-            vars.insert(prm.name.clone(), Var { st: Store::Slot(o), ty: prm.ty.clone() });
+    /// Inlines a call to `f` (renamed, see `inlinable`), with the result
+    /// convention of `call`. The arguments are evaluated first, all of them
+    /// (one may inline `f` too), then moved to `f`'s parameters, which live
+    /// in registers or frame slots of the caller like its own variables; a
+    /// `return` jumps to the end of the inlined body.
+    /// A multi-word result goes to `dst` if given.
+    fn inline(&mut self, f: &'a FnDef, args: &[Expr], dst: Option<Dst>) -> R<()> {
+        let rn = words(&f.ret)?;
+        if rn > 1 && dst.is_none() {
+            self.reserve(rn);
         }
-        let StmtKind::Return(Some(body)) = &f.body[0].kind else { unreachable!("inlinable") };
-        let saved = (std::mem::replace(&mut self.vars, vars), self.int_ops);
+        let mark = self.depth;
+        let dst = dst.unwrap_or(Dst::Stack(mark, 0));
+        let saved_vars = self.bind_params(f, args)?;
+        let end = self.label();
+        let saved = (
+            self.int_ops,
+            std::mem::replace(&mut self.ret_label, end.clone()),
+            std::mem::replace(&mut self.ret_words, rn),
+            std::mem::replace(&mut self.ret_dst, Some(dst)),
+        );
         self.int_ops = &f.int_ops;
-        self.inlining = true;
-        let r = self.scalar(body);
-        self.inlining = false;
-        (self.vars, self.int_ops) = saved;
+        self.stack.push(f.name.clone());
+        let r = self.block(&f.body);
+        self.stack.pop();
+        self.place_label(&end);
+        (self.int_ops, self.ret_label, self.ret_words, self.ret_dst) = saved;
+        self.vars = saved_vars;
+        assert_eq!(self.depth, mark, "an inlined body leaves the stack as it found it");
         r
+    }
+
+    /// Branches on a call of a function inlined whose body is one
+    /// `return e;`, as on `e` (no boolean result is materialized).
+    fn branch_inline(&mut self, f: &'a FnDef, args: &[Expr], target: &str, when: bool) -> R<()> {
+        let [Stmt { kind: StmtKind::Return(Some(e)), .. }] = f.body.as_slice() else { unreachable!("checked by the caller") };
+        let saved_vars = self.bind_params(f, args)?;
+        let saved = self.int_ops;
+        self.int_ops = &f.int_ops;
+        self.stack.push(f.name.clone());
+        let r = self.branch(e, target, when);
+        self.stack.pop();
+        self.int_ops = saved;
+        self.vars = saved_vars;
+        r
+    }
+
+    /// Evaluates the arguments of an inlined call to `f` and binds `f`'s
+    /// parameters to them, as the only variables; returns the caller's.
+    fn bind_params(&mut self, f: &'a FnDef, args: &[Expr]) -> R<HashMap<String, Var>> {
+        // A parameter that `f` never changes, given a variable of the caller
+        // (or `&mut` of one), is that variable: nothing else can change it
+        // while `f` runs, since only `&mut` arguments are changed.
+        let mut changed = HashSet::new();
+        stmts_borrows(&f.body, &mut changed);
+        assigned_roots(&f.body, &mut changed);
+        let mut alias = Vec::new();
+        for (prm, a) in f.params.iter().zip(args) {
+            let st = match &a.kind {
+                _ if changed.contains(&prm.name) => None,
+                ExprKind::Var(v) if !prm.ty.is_mut_ref() => Some(self.vars[v].st),
+                ExprKind::MutBorrow(p) if prm.ty.is_mut_ref() => self.store_of(p),
+                _ => None,
+            };
+            alias.push(st);
+            if st.is_none() {
+                self.arg(a)?;
+            }
+        }
+        let saved_vars = std::mem::take(&mut self.vars);
+        for (prm, alias) in f.params.iter().zip(alias).rev() {
+            let t = prm.ty.base().clone();
+            let st = if let Some(st) = alias {
+                st
+            } else if prm.ty.is_mut_ref() {
+                let o = self.slot(1);
+                self.pop_to(Loc::Mem("%rbp", o), 1);
+                Store::Ptr(o)
+            } else if let Some(r) = self.reg_for(&prm.name, &prm.ty) {
+                self.pop(r);
+                Store::Reg(r)
+            } else if let Some(rs) = self.regs_for(&prm.name) {
+                for r in &rs[..words(&t)?] {
+                    if r.is_empty() {
+                        self.drop_words(1);
+                    } else {
+                        self.pop(r);
+                    }
+                }
+                Store::Regs(rs)
+            } else {
+                let n = words(&t)?;
+                let o = self.slot(n);
+                self.pop_to(Loc::Mem("%rbp", o), n);
+                Store::Slot(o)
+            };
+            self.vars.insert(prm.name.clone(), Var { st, ty: t });
+        }
+        Ok(saved_vars)
+    }
+
+    /// The storage of place `p` as a variable's, if it has one: a frame
+    /// slot, or the pointer of a `&mut` parameter.
+    fn store_of(&self, p: &str) -> Option<Store> {
+        let mut parts = p.split('.');
+        let v = &self.vars[parts.next().unwrap()];
+        match v.st {
+            Store::Ptr(_) if !p.contains('.') => Some(v.st),
+            Store::Slot(mut o) => {
+                let mut t = v.ty.clone();
+                for f in parts {
+                    let Type::Struct(_) = t else { return None };
+                    let (k, ft) = field(&t, f);
+                    o += 8 * k as i64;
+                    t = ft;
+                }
+                Some(Store::Slot(o))
+            }
+            _ => None,
+        }
     }
 
     /// Pops a Buf/Bytes/Str value: %rax = len, %rdx = data.
@@ -1561,10 +2033,19 @@ impl<'a> Gen<'a> {
             }
             "get" | "bget" | "sget" => {
                 let byte = name != "get";
+                // The data pointer and the index, from their registers when
+                // they live in some.
+                let (mut base, mut index) = ("%rcx".to_string(), "%rax".to_string());
                 if let Some(p) = place(&args[0]) {
-                    self.scalar(&args[1])?;
+                    match self.var_reg(&args[1]) {
+                        Some(r) => index = r.to_string(),
+                        None => self.scalar(&args[1])?,
+                    }
                     let (loc, _) = self.place(&p);
-                    self.emit(&format!("mov {}, %rcx", loc.op(1)));
+                    match loc {
+                        Loc::Regs(rs) => base = rs[1].to_string(),
+                        _ => self.emit(&format!("mov {}, %rcx", loc.op(1))),
+                    }
                 } else {
                     self.push_val(&args[0])?;
                     self.scalar(&args[1])?;
@@ -1572,9 +2053,9 @@ impl<'a> Gen<'a> {
                     self.drop_words(2);
                 }
                 if byte {
-                    self.emit("movzbl (%rcx,%rax), %eax");
+                    self.emit(&format!("movzbl ({},{}), %eax", base, index));
                 } else {
-                    self.emit("mov (%rcx,%rax,8), %rax");
+                    self.emit(&format!("mov ({},{},8), %rax", base, index));
                 }
             }
             "set" => {
@@ -1629,7 +2110,7 @@ impl<'a> Gen<'a> {
                 self.emit("call bst_rt_host_read");
             }
             "host_write" => {
-                self.to_regs(args, &["%r8", "%rdi", "%rsi", "%rdx", "%rcx"])?;
+                self.to_regs(args, &["%rax", "%rdi", "%rsi", "%rdx", "%rcx"])?;
                 self.emit("call bst_rt_host_write");
             }
             "pool_size" => {
@@ -1763,6 +2244,10 @@ impl<'a> Gen<'a> {
                 let p = place(&args[0]).expect("checked: names a vector");
                 self.scalar(&args[1])?;
                 let (loc, _) = self.place(&p);
+                if let (Loc::Regs(rs), 1) = (loc, n) {
+                    self.emit(&format!("mov ({},%rax,8), %rax", rs[2]));
+                    return Ok(());
+                }
                 self.emit(&format!("mov {}, %rcx", loc.op(2)));
                 if n == 1 {
                     self.emit("mov (%rcx,%rax,8), %rax");
