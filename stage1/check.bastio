@@ -89,7 +89,14 @@ struct Checker {
   /// function they name), without repeats, for `lock_order`.
   calls: Vec[Edge],
   /// Each `locked` call, in checking order.
-  lsites: Vec[LockSite]
+  lsites: Vec[LockSite],
+  /// The function's parameters are `vars[0..nparams]`.
+  nparams: u64,
+  /// Checking a loop invariant, where `old(..)` is allowed.
+  inv: bool,
+  /// Checking the argument of `old(..)` in a loop invariant, which may
+  /// name only parameters (they alone have a value at the call).
+  old_only: bool
 }
 
 struct Edge { from: u64, to: u64 }
@@ -150,7 +157,7 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
     paths: paths, vars: vec_new[Var](), moved: vec_new[u64](), bound: vec_new[u64](),
     target: target, ret: un, env: 0, spec_lim: 0, tu64: u, tbool: b, tunit: un, tstr: st,
     failed: false, efile: 0, eline: 0, ecol: 0, ecode: 0, emsg: vec_new[u64](), enotes: vec_new[u64](), int_ops: vec_new[IntOp](),
-    calls: vec_new[Edge](), lsites: vec_new[LockSite]()
+    calls: vec_new[Edge](), lsites: vec_new[LockSite](), nparams: 0, inv: false, old_only: false
   };
   let buf = prim(&mut m, p, TY_BUF);
   let byt = prim(&mut m, p, TY_BYTES);
@@ -1954,6 +1961,7 @@ fn reset(c: &mut Checker, ret: u64, env: u64) {
   }
   c.ret = ret;
   c.env = env;
+  c.nparams = 0;
 }
 
 /// Checks the program monomorphized into `m`.
@@ -2223,6 +2231,7 @@ fn check_fn_body(c: &mut Checker, m: &mut Mono, p: &Parser, x: u64) {
     declare(&mut c, p, qn.s, qn.e, t, qn.v == 1 || kind_t(m, t) == TY_MUTREF, q);
     q = qn.next;
   }
+  c.nparams = vec_len(c.vars);
   let mut e = d.c;
   while e != 0 && !c.failed {
     let t = ck_spec(&mut c, &mut m, p, e, false);
@@ -2490,6 +2499,7 @@ fn ck_while(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) {
   }
   expect_ty(&mut c, m, p, t, c.tbool, n.a, "a `while` condition");
   let mut v = n.b;
+  c.inv = true;
   while v != 0 && !c.failed {
     let tv = ck_spec(&mut c, &mut m, p, v, false);
     if !c.failed {
@@ -2497,6 +2507,7 @@ fn ck_while(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) {
     }
     v = next_of(p, v);
   }
+  c.inv = false;
   if c.failed {
     return;
   }
@@ -4216,6 +4227,12 @@ fn ck_spec(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u64 
       cm_unknown_var(&mut c, p, i);
       return 0;
     }
+    if c.old_only && v > c.nparams {
+      if cm_new(&mut c, p, i, C_TYPE) {
+        cm_s(&mut c, "`old(..)` in a loop invariant can only name the function's parameters");
+      }
+      return 0;
+    }
     let vr = var_at(c, v - 1);
     return base_t(m, vr.vty);
   }
@@ -4339,9 +4356,18 @@ fn spec_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u6
       cm_spec_arity(&mut c, p, i, 1, na);
       return 0;
     }
+    if c.inv {
+      // The values at the call: only parameters have one.
+      c.inv = false;
+      c.old_only = true;
+      let t = ck_spec(&mut c, &mut m, p, a0, false);
+      c.old_only = false;
+      c.inv = true;
+      return t;
+    }
     if !ens {
       if cm_new(&mut c, p, i, C_TYPE) {
-        cm_s(&mut c, "`old(..)` is only allowed in `ensures`");
+        cm_s(&mut c, "`old(..)` is only allowed in `ensures` and loop invariants");
       }
       return 0;
     }

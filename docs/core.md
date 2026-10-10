@@ -50,7 +50,7 @@ The tests are the worked examples: `tests/pass/core_*.bastio` and `tests/pass/st
 | `bytes_find(hay, needle, from) -> Option[u64]` | A `Some(i)` is a real occurrence at or after `from`. Not proved: that it is the first one, or that `None` means there is none |
 | `bytes_slice(b, from, to) -> Bytes` | A copy of exactly those bytes |
 | `bytes_concat(a, b) -> Bytes` | `a` then `b`. Needs `blen(a) + blen(b) <= 2^60`; for strings of unknown length, build a text instead |
-| `bytes_copy_into(dst, at, src)` | `src` lands at `at`. Not stated: that the rest of `dst` is untouched |
+| `bytes_copy_into(dst, at, src)` | `src` lands at `at`, and the rest of `dst` is untouched |
 | `bytes_trim(b, s: Span) -> Span` | Only white space was cut, and the result does not start or end with white space |
 | `bytes_split(b, sep: u8) -> Vec[Span]` | At least one piece, every piece a span of `b` |
 | `bytes_hash(b) -> u64` | (FNV-1a; nothing to prove beyond safety) |
@@ -59,7 +59,7 @@ The tests are the worked examples: `tests/pass/core_*.bastio` and `tests/pass/st
 
 ### `core/text.bastio`
 
-`text_new()`, `text_push(t, c)`, `text_push_str(t, s: Str)`, `text_push_bytes(t, b)`, `text_push_span(t, b, from, to)`, `text_to_bytes(&t) -> Bytes`, `text_finish(t) -> Bytes`. Each push is proved to add exactly the given bytes at the end, and `text_to_bytes` to copy every byte. Only `text_push` also states that the earlier bytes are left alone (see [Gaps](#gaps)).
+`text_new()`, `text_push(t, c)`, `text_push_str(t, s: Str)`, `text_push_bytes(t, b)`, `text_push_span(t, b, from, to)`, `text_to_bytes(&t) -> Bytes`, `text_finish(t) -> Bytes`. Each push is proved to add exactly the given bytes at the end and to leave the earlier bytes alone (spec fn `text_keeps`), and `text_to_bytes` to copy every byte. The `fmt_*` functions keep the earlier bytes too.
 
 ### `core/num.bastio`
 
@@ -121,14 +121,13 @@ Insertion sort is quadratic in the worst case. It was chosen because its proof i
 
 ## Gaps
 
-What the library would say if the language let it. Each is a language or verifier change, not a library change.
+What the library would say if the language let it. Each is a language or verifier change, not a library change. (`old(x)` in loop invariants was the first such gap; it is in the language now, and the text functions and `bytes_copy_into` use it.)
 
-1. **`old(x)` in loop invariants.** A loop that pushes onto a text cannot state that the bytes already there are left alone, because a loop invariant cannot name the value a `&mut` parameter had at the call. This is why `text_push_str` and friends, and `bytes_copy_into`, promise less than they do.
-2. **Generic spec fns.** `spec fn` cannot take type parameters, so a property of a `HashMap[V]` cannot be named; the hash map therefore holds `u64` values only.
-3. **Counting.** Specifications have `forall` but no way to count elements, so "the map has `len` keys" and "the sort output is a permutation of the input" cannot be stated. Recursive spec fns or a multiset theory would allow both, and also "this parse gives the value of these digits".
-4. **Local names and function names share one namespace.** A program cannot have a function named like any local variable of any function it imports (see [Using it](#using-it)). Letting a local shadow a function, or qualified names (ROADMAP v1 item 6), would remove the trap.
-5. **Library search paths.** Imports are relative to the importing file, so where core lives is written into every import. A `--lib` path or an `import core "text"` form would fix it.
-6. **Length bounds on `Bytes`.** Nothing says an existing `Bytes` is at most 2^60 long (a `Vec` push gets such a fact), so `bytes_concat` must ask for it.
+1. **Generic spec fns.** `spec fn` cannot take type parameters, so a property of a `HashMap[V]` cannot be named; the hash map therefore holds `u64` values only.
+2. **Counting.** Specifications have `forall` but no way to count elements, so "the map has `len` keys" and "the sort output is a permutation of the input" cannot be stated. Recursive spec fns or a multiset theory would allow both, and also "this parse gives the value of these digits".
+3. **Local names and function names share one namespace.** A program cannot have a function named like any local variable of any function it imports (see [Using it](#using-it)). Letting a local shadow a function, or qualified names (ROADMAP v1 item 6), would remove the trap.
+4. **Library search paths.** Imports are relative to the importing file, so where core lives is written into every import. A `--lib` path or an `import core "text"` form would fix it.
+5. **Length bounds on `Bytes`.** Nothing says an existing `Bytes` is at most 2^60 long (a `Vec` push gets such a fact), so `bytes_concat` must ask for it.
 
 ## Where it came from
 

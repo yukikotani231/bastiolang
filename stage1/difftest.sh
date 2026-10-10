@@ -17,6 +17,13 @@
 #           the verifier
 #   C       stage1/cdump.bastio     vs  bastioc0 --dump-c (the whole C file,
 #           runtime prelude included), on every program the checker accepts
+#   native  stage1/asmdump.bastio   vs  bastioc0 --backend native --emit-asm
+#           (the whole assembly file), on every hosted program stage0
+#           builds; where stage0 does not support a program yet (exit 4),
+#           asmdump must not either. asmdump built by the native backend
+#           must print the same assembly for itself. Without --stage0,
+#           asmdump also does what stage0 does not (register arguments):
+#           the programs it builds must exit as tests/pass says
 #   driver  stage1/bastioc1.bastio  vs  bastioc0 itself: what `--check`
 #           prints on stderr and its exit status, the
 #           C file of `--emit-c`, the C header of `--header`, the list of
@@ -30,7 +37,7 @@ cd "$(dirname "$0")/.."
 BASTIOC=${BASTIOC:-stage0/target/release/bastioc0}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-for tool in lexdump astdump monodump checkdump smtdump verifydump cdump bastioc1; do
+for tool in lexdump astdump monodump checkdump smtdump verifydump cdump asmdump bastioc1; do
   "$BASTIOC" -o "$tmp/$tool" "stage1/$tool.bastio" 2>"$tmp/build.err" || { cat "$tmp/build.err"; exit 1; }
 done
 files=$(find tests stage1 ../bastios/src ../bastios/user -name '*.bastio' 2>/dev/null | sort)
@@ -131,6 +138,61 @@ for f in $files; do
 done
 echo "-- C: $match matched ($((match-errors)) of them C files), $differ differ"
 { [ "$differ" = 0 ] && [ "$match" -gt "$errors" ]; } || status=1
+match=0 differ=0 unsup=0
+for f in $files; do
+  [ "$(target_of "$f")" = hosted ] || continue
+  "$BASTIOC" --backend native --emit-asm -o "$tmp/want" "$f" 2>/dev/null; e=$?
+  [ "$e" = 0 ] || [ "$e" = 4 ] || continue
+  "$tmp/asmdump" --stage0 "$f" >"$tmp/got" 2>/dev/null; ge=$?
+  if [ "$e" = 4 ] && [ "$ge" = 4 ]; then
+    unsup=$((unsup+1)); match=$((match+1))
+  elif [ "$e" = 0 ] && [ "$ge" = 0 ] && cmp -s "$tmp/want" "$tmp/got"; then
+    match=$((match+1))
+  else
+    differ=$((differ+1))
+    echo "DIFFER $f (native: stage0 exit $e, asmdump exit $ge)"
+    diff "$tmp/want" "$tmp/got" | head -5 | cut -c1-300 | sed 's/^/    /'
+  fi
+done
+if "$BASTIOC" --backend native -o "$tmp/asmdump_n" stage1/asmdump.bastio 2>/dev/null \
+   && "$tmp/asmdump_n" --stage0 stage1/asmdump.bastio >"$tmp/got" 2>/dev/null \
+   && "$tmp/asmdump" --stage0 stage1/asmdump.bastio >"$tmp/want" 2>/dev/null \
+   && cmp -s "$tmp/want" "$tmp/got"; then
+  match=$((match+1))
+else
+  differ=$((differ+1)); echo "DIFFER asmdump built by the native backend"
+fi
+echo "-- native: $match matched ($unsup of them unsupported, plus asmdump built natively), $differ differ"
+{ [ "$differ" = 0 ] && [ "$match" -gt "$unsup" ]; } || status=1
+# What only stage1's backend does (asmdump without --stage0) has no
+# oracle: the programs it builds must exit as tests/pass says, and asmdump
+# built that way must print the same assembly for itself.
+built=0 differ=0
+for f in tests/pass/*.bastio; do
+  want=$(sed -n 's|^// expect-exit: *||p' "$f" | head -1)
+  "$tmp/asmdump" "$f" >"$tmp/prog.s" 2>/dev/null; e=$?
+  [ "$e" = 4 ] && continue
+  if [ "$e" = 0 ] && as --64 -o "$tmp/prog.o" "$tmp/prog.s" && cc -o "$tmp/prog" "$tmp/prog.o"; then
+    "$tmp/prog" </dev/null >/dev/null; got=$?
+  else
+    got="not built"
+  fi
+  if [ "$got" = "$want" ]; then
+    built=$((built+1))
+  else
+    differ=$((differ+1)); echo "DIFFER $f (built by asmdump: exit $got, want $want)"
+  fi
+done
+if "$tmp/asmdump" stage1/asmdump.bastio >"$tmp/self.s" 2>/dev/null \
+   && as --64 -o "$tmp/self.o" "$tmp/self.s" && cc -o "$tmp/asmdump_s" "$tmp/self.o" \
+   && "$tmp/asmdump_s" stage1/asmdump.bastio >"$tmp/got" 2>/dev/null \
+   && cmp -s "$tmp/self.s" "$tmp/got"; then
+  built=$((built+1))
+else
+  differ=$((differ+1)); echo "DIFFER asmdump built by itself"
+fi
+echo "-- native (stage1 only): $built programs built and run (plus asmdump built by itself), $differ differ"
+{ [ "$differ" = 0 ] && [ "$built" -gt 1 ]; } || status=1
 # The driver. Everything is compared except what bastioc1 cannot know:
 # the reason a file cannot be read and the solver's own words when it
 # fails (E-SOLVER) come from outside; and bastioc1 names itself.
