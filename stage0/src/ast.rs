@@ -54,7 +54,7 @@ pub enum Type {
     /// A claimed range of I/O ports, owned: the only way to read or write
     /// them. Linear; given back with `port_release`.
     PortIo,
-    /// The device window (physical 0x8000_0000 to 4 GiB, mapped uncached by
+    /// The device window (physical 0x8000_0000 to 2^46, mapped uncached by
     /// the platform): the right to claim each byte of it once. Linear; only
     /// `main` receives it. Kernel and hosted targets (hosted simulates it).
     MmioSpace,

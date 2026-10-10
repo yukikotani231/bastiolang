@@ -749,7 +749,7 @@ static inline uint64_t bst_port_count(bst_portio io) { return io.count; }
 "#;
 
 // Memory-mapped registers: like ports, claiming is proof-only. The kernel
-// platform maps the device window (0x8000_0000 to 4 GiB) uncached at its
+// platform maps the device window (0x8000_0000 to 2^46) uncached at its
 // physical address, so an access is one volatile load or store there.
 const PRELUDE_MMIO: &str = r#"
 static inline bst_mmio bst_mmio_claim(bst_mmiospace *s, uint64_t b, uint64_t l) { (void)s; bst_mmio m = { b, l }; return m; }
