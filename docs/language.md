@@ -91,8 +91,8 @@ bastioc0 [--check] [--emit-c] [--target hosted|kernel|user] [--header F] [-o out
 ## Lexical structure
 
 - **Comments** run from `//` to the end of the line. There are no block comments.
-- **Identifiers** are letters, digits and `_`, not starting with a digit.
-- **Integer literals** are decimal (`4096`) or hexadecimal (`0x1000`, `0X1000`). `_` may separate digits (`1_000_000`, `0xffff_0000`). A literal must fit in 64 bits. There are no negative literals and no unary minus: integers are unsigned.
+- **Identifiers** are ASCII letters, digits and `_`, not starting with a digit.
+- **Integer literals** are decimal (`4096`) or hexadecimal (`0x1000`, `0X1000`). `_` may separate digits (`1_000_000`, `0xffff_0000`). A literal must fit in 64 bits, and in the integer type its position gives it. A negative number is unary minus on a literal, where a signed type is expected.
 - **String literals** are written in double quotes and cannot span lines. Escapes: `\n`, `\r`, `\t`, `\0`, `\\`, `\"`.
 - **Keywords:** `assert` `const` `else` `ensures` `enum` `export` `false` `fn` `forall` `if` `import` `invariant` `is` `let` `match` `mut` `requires` `return` `spec` `struct` `true` `unreachable` `while`. The names `result`, `old` and `include_bytes`, and the names of builtins, have special meanings described below.
 

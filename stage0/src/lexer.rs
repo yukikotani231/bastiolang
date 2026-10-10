@@ -198,9 +198,9 @@ pub fn lex(src: &str, file: usize) -> Result<Vec<Token>, Diag> {
             out.push(Token { tok: Tok::Int(v), pos });
             continue;
         }
-        if c.is_alphabetic() || c == '_' {
+        if c.is_ascii_alphabetic() || c == '_' {
             let start = i;
-            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
                 i += 1;
             }
             let text: String = chars[start..i].iter().collect();
