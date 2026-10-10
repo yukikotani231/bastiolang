@@ -491,6 +491,25 @@ static inline uint64_t bst_pt_take(bst_pt *t, uint64_t i) {
     return a;
 }
 #define bst_pt_take_frame bst_pt_take
+/* Shared pages: how many references (Shared values and pt_dup_shared's
+ * reads) each page has, by page number, and a PTE bit the CPU ignores that
+ * marks a slot mapping one. The last shared_drop gives the page back. */
+#define BST_PTE_SHARED 0x200ull
+static uint32_t bst_shared_refs[65536];
+static inline bst_frame bst_shared_new(bst_frame f) { __atomic_store_n(&bst_shared_refs[bst_frame_id(f)], 1, __ATOMIC_RELEASE); return f; }
+static inline bst_frame bst_shared_dup(bst_frame s) { __atomic_fetch_add(&bst_shared_refs[bst_frame_id(s)], 1, __ATOMIC_RELAXED); return s; }
+static inline uint64_t bst_shared_drop(bst_pool *p, bst_frame s) {
+    uint64_t i = bst_frame_id(s);
+    (void)p;
+    return __atomic_sub_fetch(&bst_shared_refs[i], 1, __ATOMIC_ACQ_REL) == 0 ? i : ~0ull;
+}
+static inline uint64_t bst_shared_id(bst_frame s) { return bst_frame_id(s); }
+static inline bool bst_pt_shared(bst_pt t, uint64_t i) { return (((uint64_t *)t)[i] & BST_PTE_SHARED) != 0; }
+static inline void bst_pt_put_shared(bst_pt *t, uint64_t i, bst_frame s, bool w) {
+    __atomic_store_n(&((uint64_t *)*t)[i], s | BST_PTE_P | BST_PTE_U | BST_PTE_SHARED | (w ? BST_PTE_W : 0), __ATOMIC_RELEASE);
+}
+#define bst_pt_take_shared bst_pt_take
+static inline bst_frame bst_pt_dup_shared(bst_pt t, uint64_t i) { return bst_shared_dup(((uint64_t *)t)[i] & BST_PTE_ADDR); }
 "#;
 
 // The freestanding runtime. Part of the trusted base: the only code that
@@ -1095,6 +1114,7 @@ fn cty(t: &Type) -> String {
         Type::Mmio => "bst_mmio".into(),
         Type::Dma => "bst_dma".into(),
         Type::Lease => "bst_lease".into(),
+        Type::Shared => "bst_frame".into(),
         Type::Struct(n) => format!("bst_s_{}", cid(n)),
         Type::Enum(n) => format!("bst_e_{}", cid(n)),
         Type::Generic(..) => unreachable!("removed by monomorphization"),

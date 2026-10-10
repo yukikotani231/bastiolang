@@ -106,6 +106,14 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("pt_put_frame", Avail::Mem, vec![m(PageTable), U64, Frame, Bool], Unit),
         ("pt_take_frame", Avail::Mem, vec![m(PageTable), U64], Frame),
         ("pt_lease_count", Avail::Mem, vec![m(PageTable)], U64),
+        ("shared_new", Avail::Mem, vec![Frame], Shared),
+        ("shared_dup", Avail::Mem, vec![r(Shared)], Shared),
+        ("shared_drop", Avail::Mem, vec![m(Pool), Shared], U64),
+        ("shared_id", Avail::Mem, vec![r(Shared)], U64),
+        ("pt_shared", Avail::Mem, vec![r(PageTable), U64], Bool),
+        ("pt_put_shared", Avail::Mem, vec![m(PageTable), U64, Shared, Bool], Unit),
+        ("pt_take_shared", Avail::Mem, vec![m(PageTable), U64], Shared),
+        ("pt_dup_shared", Avail::Mem, vec![r(PageTable), U64], Shared),
         ("mmu_enter", Avail::Kernel, vec![m(Mmu), m(PageTable)], Lease),
         ("mmu_exit", Avail::Kernel, vec![m(Mmu), Lease], Unit),
         ("mmu_kernel", Avail::Kernel, vec![m(Mmu)], Unit),
@@ -175,6 +183,8 @@ pub const GHOSTS: &[(&str, Type, bool, Type)] = &[
     ("pt_level", Type::PageTable, false, Type::U64),
     ("pt_used", Type::PageTable, true, Type::Bool),
     ("pt_leases", Type::PageTable, false, Type::U64),
+    ("pt_shared", Type::PageTable, true, Type::Bool),
+    ("shared_id", Type::Shared, false, Type::U64),
     ("pool_has", Type::Pool, true, Type::Bool),
     ("pool_size", Type::Pool, false, Type::U64),
     ("mmu_root", Type::Mmu, false, Type::U64),
@@ -294,7 +304,7 @@ fn main_caps(target: Target) -> &'static [Type] {
 /// Struct and enum definitions: unique names, known field and payload
 /// types, no type that contains itself.
 pub fn check_structs(p: &Program) -> Result<(), Diag> {
-    const RESERVED: &[&str] = &["u64", "u8", "u16", "u32", "i8", "i16", "i32", "i64", "bool", "Str", "Buf", "Bytes", "Host", "Child", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu", "Ports", "PortIo", "MmioSpace", "Mmio", "Dma", "Lease", "Lock", "Atomic"];
+    const RESERVED: &[&str] = &["u64", "u8", "u16", "u32", "i8", "i16", "i32", "i64", "bool", "Str", "Buf", "Bytes", "Host", "Child", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu", "Ports", "PortIo", "MmioSpace", "Mmio", "Dma", "Lease", "Shared", "Lock", "Atomic"];
     // (name, position, the types it holds directly)
     let mut defs: Vec<(String, Pos, Vec<Type>)> = Vec::new();
     for d in &p.structs {
