@@ -72,7 +72,9 @@ Started early, alongside v1, because the kernel is the primary target and it sha
 - [x] Capabilities for physical pages and address spaces: `Pool`, `Frame`, `PageTable` (levels and slot ownership tracked), `Mmu` (the table in CR3 is never freed), `Cpu` (the user context; entering user mode)
 - [x] `--target user` for programs under a Bastio kernel
 - [x] A small kernel (BastiOS v0.2): boot, a page allocator whose bitmap is proved to agree with the pool, page tables, user processes with preemptive scheduling, system calls, fault isolation; tearing a process down returns every page
-- [ ] More hardware capabilities: `PortIo`, `Mmio[R]`, `IrqOff`, so the UART, PIC and timer code moves from the C prelude and `platform.c` into Bastio
+- [x] `Ports` / `PortIo`: a driver claims its I/O ports once and can touch only those; no two owners per port. BastiOS's UART, PIC and timer drivers moved from the C prelude and `platform.c` into Bastio, and so did the interrupt acknowledgement (from the trap entry assembly into the kernel loop)
+- [ ] `Mmio[R]`: memory-mapped device registers (local APIC, HPET, PCI BARs), with the same claim-once rule over physical address ranges, and DMA buffers as linear in-flight tokens (docs/concurrency.md)
+- [ ] `IrqOff` and interrupt handlers (docs/concurrency.md, step 4). Not needed while BastiOS treats interrupts as events with interrupts off in the kernel
 - [ ] Allocation failure returned in the type (no abort on OOM). Enums exist now (v1 item 3); what is left is changing `alloc`, `pool_take` and friends to return them
 - [ ] Native x86-64 backend, without going through C (removes the C compiler from the trusted base)
 
