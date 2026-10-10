@@ -628,13 +628,13 @@ static bst_pool bst_pool_init(uint64_t mbi) {
         for (int grew = 1; grew; ) {
             grew = 0;
             uint8_t *e = (uint8_t *)(uint64_t)info[12], *stop = e + info[11];
-            while (e + 24 <= stop) {
+            while (e + 24 <= stop && *(uint32_t *)e >= 20) {
                 uint64_t addr = *(uint64_t *)(e + 4), len = *(uint64_t *)(e + 12);
                 if (*(uint32_t *)(e + 20) == 1 && addr <= end && end < addr + len) {
                     end = addr + len;
                     grew = 1;
                 }
-                e += *(uint32_t *)e + 4;
+                e += (uint64_t)*(uint32_t *)e + 4;    /* not in 32 bits: 0xFFFFFFFC + 4 would stay put */
             }
         }
         ram_end = end;
@@ -987,7 +987,7 @@ static uint64_t bst_boot_fb(bst_cpu c, uint64_t f) {
     if (!mb || !(*(uint32_t *)mb & (1u << 12)) || mb[109] != 1 || mb[108] != 32) return 0;
     uint64_t addr = *(uint64_t *)(mb + 88), pitch = *(uint32_t *)(mb + 96);
     uint64_t w = *(uint32_t *)(mb + 100), h = *(uint32_t *)(mb + 104);
-    if (addr == 0 || pitch < w * 4 || addr + pitch * h > (1ull << 32)) return 0;
+    if (addr == 0 || addr >= (1ull << 32) || pitch < w * 4 || pitch * h > (1ull << 32) - addr) return 0;    /* no wrap: the verifier takes every field as below 2^32 */
     if (f == 0) return addr;
     if (f == 1) return pitch;
     if (f == 2) return w;

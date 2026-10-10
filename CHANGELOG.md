@@ -71,6 +71,12 @@ What will be 0.2.0.
   timeout, so a proof no longer fails on a busy machine (#89).
 - A change to `stage0/src` needs its stage1 mirror, or a `Stage0-only:`
   reason in a commit message; CI checks this on every pull request (#78).
+- The kernel prelude (C and native) reads the boot loader's information
+  defensively: a framebuffer whose address would wrap `addr + pitch * h`,
+  or lies at 4 GiB, is not reported (the verifier takes each `boot_fb`
+  field as below 2^32, which such an address broke), and a memory-map entry
+  whose size is 0xFFFFFFFC no longer makes the page pool's walk loop forever
+  at boot. `tests/prelude_boot.sh` feeds both.
 
 ### Documentation
 

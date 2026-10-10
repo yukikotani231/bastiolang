@@ -20,6 +20,7 @@ else
 fi
 
 step "every builtin has native code"; tests/native_builtins.sh
+step "the prelude refuses hostile boot information"; tests/prelude_boot.sh
 
 step "build stage0 (warnings are errors)"
 (cd stage0 && RUSTFLAGS="-D warnings" cargo build --release --locked)

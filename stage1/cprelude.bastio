@@ -355,13 +355,13 @@ fn cg_prelude_kernel(out: &mut Vec[u64]) {
   cg_s(&mut out, "        for (int grew = 1; grew; ) {\n");
   cg_s(&mut out, "            grew = 0;\n");
   cg_s(&mut out, "            uint8_t *e = (uint8_t *)(uint64_t)info[12], *stop = e + info[11];\n");
-  cg_s(&mut out, "            while (e + 24 <= stop) {\n");
+  cg_s(&mut out, "            while (e + 24 <= stop && *(uint32_t *)e >= 20) {\n");
   cg_s(&mut out, "                uint64_t addr = *(uint64_t *)(e + 4), len = *(uint64_t *)(e + 12);\n");
   cg_s(&mut out, "                if (*(uint32_t *)(e + 20) == 1 && addr <= end && end < addr + len) {\n");
   cg_s(&mut out, "                    end = addr + len;\n");
   cg_s(&mut out, "                    grew = 1;\n");
   cg_s(&mut out, "                }\n");
-  cg_s(&mut out, "                e += *(uint32_t *)e + 4;\n");
+  cg_s(&mut out, "                e += (uint64_t)*(uint32_t *)e + 4;    /* not in 32 bits: 0xFFFFFFFC + 4 would stay put */\n");
   cg_s(&mut out, "            }\n");
   cg_s(&mut out, "        }\n");
   cg_s(&mut out, "        ram_end = end;\n");
@@ -706,7 +706,7 @@ fn cg_prelude_kernel_cpu(out: &mut Vec[u64]) {
   cg_s(&mut out, "    if (!mb || !(*(uint32_t *)mb & (1u << 12)) || mb[109] != 1 || mb[108] != 32) return 0;\n");
   cg_s(&mut out, "    uint64_t addr = *(uint64_t *)(mb + 88), pitch = *(uint32_t *)(mb + 96);\n");
   cg_s(&mut out, "    uint64_t w = *(uint32_t *)(mb + 100), h = *(uint32_t *)(mb + 104);\n");
-  cg_s(&mut out, "    if (addr == 0 || pitch < w * 4 || addr + pitch * h > (1ull << 32)) return 0;\n");
+  cg_s(&mut out, "    if (addr == 0 || addr >= (1ull << 32) || pitch < w * 4 || pitch * h > (1ull << 32) - addr) return 0;    /* no wrap: the verifier takes every field as below 2^32 */\n");
   cg_s(&mut out, "    if (f == 0) return addr;\n");
   cg_s(&mut out, "    if (f == 1) return pitch;\n");
   cg_s(&mut out, "    if (f == 2) return w;\n");
