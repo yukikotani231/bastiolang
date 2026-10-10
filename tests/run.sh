@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Runs every test. pass/*.bastio must verify, build, and exit with the code in
+# Runs every test. user/*.bastio must verify and compile for --target user.
+# pass/*.bastio must verify, build, and exit with the code in
 # their `// expect-exit: N` header (and print the
 # first line of `// expect-stdout: TEXT`, if given, with stdin empty); fail/*.bastio must be rejected with the error
 # code in their `// expect-error: CODE` header, checked for the target in an
@@ -34,6 +35,17 @@ for f in tests/fail/*.bastio; do
   fi
   if grep -q "error\[$want\]" "$tmp/err"; then pass=$((pass+1)); else
     echo "FAIL $f: wrong error, want $want"; sed 's/^/    /' "$tmp/err"; fail=$((fail+1)); fi
+done
+# User programs (for a Bastio kernel such as BastiOS) cannot run here: they
+# must verify and their C must compile freestanding.
+for f in tests/user/*.bastio; do
+  name=$(basename "$f" .bastio)
+  if "$BASTIOC" --target user -o "$tmp/$name.u.c" "$f" 2>"$tmp/$name.err" \
+     && ${CC:-cc} -c -ffreestanding -fpie -o "$tmp/$name.u.o" "$tmp/$name.u.c" 2>>"$tmp/$name.err"; then
+    pass=$((pass+1))
+  else
+    echo "FAIL $f"; sed 's/^/    /' "$tmp/$name.err"; fail=$((fail+1))
+  fi
 done
 # Zero overhead: the generated C must index buffers directly, with no checks.
 "$BASTIOC" --emit-c -o "$tmp/z.c" tests/pass/fill_sum.bastio 2>/dev/null
@@ -73,6 +85,46 @@ for r in examples/*/run.sh; do
   [ -e "$r" ] || continue
   if BASTIOC="$BASTIOC" "$r" >"$tmp/ex.out" 2>&1; then pass=$((pass+1)); else
     echo "FAIL $r"; sed 's/^/    /' "$tmp/ex.out" | tail -20; fail=$((fail+1)); fi
+done
+# Every ```bastio block in docs/*.md is a whole program, checked
+# like a test: its first line is `// expect-exit: N` (built and run on the
+# hosted target), `// expect-error: CODE` (rejected with CODE), or
+# `// expect-ok` (accepted by --check; for kernel and user examples that
+# cannot run here), with an optional `// target: T` line after it. Sketches
+# that are not whole programs use ```text instead.
+mkdir -p "$tmp/doc"
+for md in docs/*.md; do
+  awk -v dir="$tmp/doc" -v doc="$(basename "$md" .md)" '
+    /^```bastio$/ { n = NR; f = dir "/" doc "@" NR ".bastio"; next }
+    /^```/ && n { n = 0; close(f); next }
+    n { print > f }
+  ' "$md"
+done
+for f in "$tmp"/doc/*.bastio; do
+  [ -e "$f" ] || continue
+  at="docs/$(basename "$f" .bastio | sed 's/@/.md:/')"
+  head1=$(head -1 "$f")
+  target=$(sed -n 's|^// target: *||p' "$f" | head -1)
+  case "$head1" in
+    "// expect-exit: "*)
+      want=${head1#// expect-exit: }
+      if ! "$BASTIOC" -o "$tmp/docex" "$f" 2>"$tmp/doc.err"; then
+        echo "FAIL $at: rejected"; sed 's/^/    /' "$tmp/doc.err"; fail=$((fail+1)); continue
+      fi
+      "$tmp/docex" </dev/null >/dev/null; got=$?
+      if [ "$got" = "$want" ]; then pass=$((pass+1)); else echo "FAIL $at: exit $got, want $want"; fail=$((fail+1)); fi ;;
+    "// expect-error: "*)
+      want=${head1#// expect-error: }
+      if "$BASTIOC" --check --target "${target:-hosted}" "$f" 2>"$tmp/doc.err"; then
+        echo "FAIL $at: accepted, want $want"; fail=$((fail+1))
+      elif grep -q "error\[$want\]" "$tmp/doc.err"; then pass=$((pass+1)); else
+        echo "FAIL $at: wrong error, want $want"; sed 's/^/    /' "$tmp/doc.err"; fail=$((fail+1)); fi ;;
+    "// expect-ok")
+      if "$BASTIOC" --check --target "${target:-hosted}" "$f" 2>"$tmp/doc.err"; then pass=$((pass+1)); else
+        echo "FAIL $at: rejected"; sed 's/^/    /' "$tmp/doc.err"; fail=$((fail+1)); fi ;;
+    *)
+      echo "FAIL $at: a \`\`\`bastio block must start with // expect-exit:, // expect-error: or // expect-ok"; fail=$((fail+1)) ;;
+  esac
 done
 echo "-- $pass passed, $fail failed"
 [ "$fail" = 0 ]

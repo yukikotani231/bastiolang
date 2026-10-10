@@ -82,7 +82,6 @@ pub fn emit(p: &Program, target: Target) -> String {
     }
     for t in &boxed {
         let (c, n) = (cty(t), box_helper(t));
-        out.push_str(&format!("static {c} *bst_box_{n}({c} v) {{ {c} *p = ({c} *)bst_box_alloc(sizeof({c})); *p = v; return p; }}\n"));
         out.push_str(&format!("static {c} bst_unbox_{n}({c} *p) {{ {c} v = *p; bst_box_free(p, sizeof({c})); return v; }}\n"));
     }
     for (i, b) in blobs.iter().enumerate() {
@@ -139,7 +138,14 @@ fn entry(p: &Program, target: Target) -> String {
             teardown,
             if returns { "(int)r" } else { "0" }
         ),
-        Target::Kernel => format!("void bst_kmain(uint64_t mbi) {{\n    (void)mbi;\n    bst_serial_init();\n{}    (void){};\n}}\n", setup, call),
+        // COM1 is set up only for a kernel that uses `Serial`; one that drives
+        // the UART itself through `Ports` gets it untouched.
+        Target::Kernel => format!(
+            "void bst_kmain(uint64_t mbi) {{\n    (void)mbi;\n{}{}    (void){};\n}}\n",
+            if legacy || main.params.iter().any(|p| *p.ty.base() == Type::Serial) { "    bst_serial_init();\n" } else { "" },
+            setup,
+            call
+        ),
         Target::User => format!("uint64_t bst_umain(void) {{\n{}    uint64_t r = {};\n    bst_flush();\n    return r;\n}}\n", setup, call),
     }
 }
@@ -154,6 +160,8 @@ typedef struct { uint64_t len; unsigned char *data; } bst_bytes;
 typedef int bst_serial, bst_mmu, bst_cpu, bst_host;   /* capability tokens: no data */
 typedef uint64_t bst_frame, bst_pt;         /* a page's physical address */
 typedef struct { uint64_t base, size; } bst_pool;
+typedef int bst_ports;                      /* capability token: no data */
+typedef struct { uint64_t base, count; } bst_portio;
 static inline bst_buf bst_set(bst_buf b, uint64_t i, uint64_t v) { b.data[i] = v; return b; }
 "#;
 
@@ -171,6 +179,14 @@ static bst_buf bst_alloc(uint64_t n) {
     return b;
 }
 static inline void bst_free(bst_buf b) { free(b.data); }
+/* Grow a block of `old` words to `n` words, keeping its contents; the new
+ * words are not zeroed (only Vec uses it, and never reads past its length). */
+static uint64_t *bst_regrow(uint64_t *p, uint64_t old, uint64_t n) {
+    (void)old;
+    uint64_t *q = (uint64_t *)realloc(p, (n ? n : 1) * sizeof(uint64_t));
+    if (!q) { fputs("Bastio: out of memory\n", stderr); abort(); }
+    return q;
+}
 static inline void bst_print(uint64_t v) { printf("%llu\n", (unsigned long long)v); }
 
 static bst_bytes bst_balloc(uint64_t n) {
@@ -259,11 +275,20 @@ const PRELUDE_PAGES: &str = r#"
 #define BST_PTE_W 2ull
 #define BST_PTE_U 4ull
 #define BST_PTE_ADDR 0x000FFFFFFFFFF000ull
+static inline void bst_zero_page(uint64_t a) {
+#if defined(__x86_64__)
+    void *p = (void *)a;
+    uint64_t n = 512;
+    __asm__ volatile ("rep stosq" : "+D"(p), "+c"(n) : "a"(0ull) : "memory");
+#else
+    uint64_t *w = (uint64_t *)a;
+    for (int k = 0; k < 512; k++) w[k] = 0;
+#endif
+}
 static inline uint64_t bst_pool_size(bst_pool p) { return p.size; }
 static inline bst_frame bst_pool_take(bst_pool *p, uint64_t i) {
     uint64_t a = p->base + i * 4096;
-    uint64_t *w = (uint64_t *)a;
-    for (int k = 0; k < 512; k++) w[k] = 0;      /* never leak a page's old contents */
+    bst_zero_page(a);      /* never leak a page's old contents */
     return a;
 }
 static inline void bst_pool_give(bst_pool *p, bst_frame f) { (void)p; (void)f; }
@@ -274,7 +299,7 @@ static inline uint64_t bst_frame_read8(bst_frame f, uint64_t o) { return ((unsig
 static inline void bst_frame_write8(bst_frame *f, uint64_t o, uint64_t v) { ((unsigned char *)*f)[o] = (unsigned char)v; }
 static inline bst_pt bst_pt_new(bst_frame f, uint64_t level) {
     uint64_t *e = (uint64_t *)f;
-    for (int k = 0; k < 512; k++) e[k] = 0;
+    bst_zero_page(f);      /* f may be a page that held data, not a fresh one */
     BST_PT_NEW_HOOK
     return f;
 }
@@ -406,6 +431,16 @@ static void bst_bfree(bst_bytes b) {
     bst_buf w = { (b.len + 7) / 8, (uint64_t *)b.data };
     bst_free(w);
 }
+/* Grow a block of `old` words to `n` words, keeping its contents. */
+static uint64_t *bst_regrow(uint64_t *p, uint64_t old, uint64_t n) {
+    uint64_t *q = bst_alloc(n).data;
+    if (p) {
+        for (uint64_t i = 0; i < old; i++) q[i] = p[i];
+        bst_buf b = { old, p };
+        bst_free(b);
+    }
+    return q;
+}
 "#;
 
 // Child processes (hosted only): fork and exec with a pipe each way.
@@ -509,11 +544,7 @@ static void bst_vec_release(bst_vec v, uint64_t size) {
 static void bst_vec_grow(bst_vec *v, uint64_t size) {
     uint64_t ncap = v->cap ? v->cap * 2 : 4;
     uint64_t bytes = ncap > (UINT64_C(1) << 60) / size ? ~UINT64_C(0) - 8 : ncap * size;
-    bst_buf nb = bst_alloc((bytes + 7) / 8);
-    unsigned char *d = (unsigned char *)nb.data, *s = (unsigned char *)v->data;
-    for (uint64_t i = 0; i < v->len * size; i++) d[i] = s[i];
-    bst_vec_release(*v, size);
-    v->data = nb.data;
+    v->data = bst_regrow((uint64_t *)v->data, (v->cap * size + 7) / 8, (bytes + 7) / 8);
     v->cap = ncap;
 }
 static inline void bst_bset(bst_bytes *b, uint64_t i, uint64_t v) { b->data[i] = (unsigned char)v; }
@@ -525,6 +556,37 @@ static bst_bytes bst_bfrom(bst_str s) {
 "#;
 
 // Kernel-only: CR3 and user mode. The platform supplies the trap machinery.
+// I/O ports: claiming and releasing are proof-only, so they compile to
+// nothing; an access is one instruction at base + offset. The prover has
+// shown the offset is inside the claimed range.
+const PRELUDE_PORTS: &str = r#"
+static inline bst_portio bst_port_claim(bst_ports *p, uint64_t b, uint64_t c) { (void)p; bst_portio io = { b, c }; return io; }
+static inline void bst_port_release(bst_ports *p, bst_portio io) { (void)p; (void)io; }
+static inline uint64_t bst_port_base(bst_portio io) { return io.base; }
+static inline uint64_t bst_port_count(bst_portio io) { return io.count; }
+"#;
+
+const PRELUDE_PORTS_KERNEL: &str = r#"
+static inline uint64_t bst_pio_in8(bst_portio *io, uint64_t o) { return bst_inb((uint16_t)(io->base + o)); }
+static inline uint64_t bst_pio_in16(bst_portio *io, uint64_t o) { uint16_t v; __asm__ volatile ("inw %1, %0" : "=a"(v) : "Nd"((uint16_t)(io->base + o))); return v; }
+static inline uint64_t bst_pio_in32(bst_portio *io, uint64_t o) { uint32_t v; __asm__ volatile ("inl %1, %0" : "=a"(v) : "Nd"((uint16_t)(io->base + o))); return v; }
+static inline void bst_pio_out8(bst_portio *io, uint64_t o, uint64_t v) { bst_outb((uint16_t)(io->base + o), (uint8_t)v); }
+static inline void bst_pio_out16(bst_portio *io, uint64_t o, uint64_t v) { __asm__ volatile ("outw %0, %1" : : "a"((uint16_t)v), "Nd"((uint16_t)(io->base + o))); }
+static inline void bst_pio_out32(bst_portio *io, uint64_t o, uint64_t v) { __asm__ volatile ("outl %0, %1" : : "a"((uint32_t)v), "Nd"((uint16_t)(io->base + o))); }
+"#;
+
+// Hosted programs have no ports: each port is a cell that remembers the
+// last value written to it, so drivers can be tested off the machine.
+const PRELUDE_PORTS_HOSTED: &str = r#"
+static uint32_t bst_port_cell[65536];
+static inline uint64_t bst_pio_in8(bst_portio *io, uint64_t o) { return bst_port_cell[io->base + o] & 0xFF; }
+static inline uint64_t bst_pio_in16(bst_portio *io, uint64_t o) { return bst_port_cell[io->base + o] & 0xFFFF; }
+static inline uint64_t bst_pio_in32(bst_portio *io, uint64_t o) { return bst_port_cell[io->base + o]; }
+static inline void bst_pio_out8(bst_portio *io, uint64_t o, uint64_t v) { bst_port_cell[io->base + o] = (uint32_t)v; }
+static inline void bst_pio_out16(bst_portio *io, uint64_t o, uint64_t v) { bst_port_cell[io->base + o] = (uint32_t)v; }
+static inline void bst_pio_out32(bst_portio *io, uint64_t o, uint64_t v) { bst_port_cell[io->base + o] = (uint32_t)v; }
+"#;
+
 const PRELUDE_KERNEL_CPU: &str = r#"
 static inline void bst_load_cr3(uint64_t a) { __asm__ volatile ("mov %0, %%cr3" : : "r"(a) : "memory"); }
 static inline void bst_mmu_switch(bst_mmu *m, bst_pt root) { (void)m; bst_load_cr3(root); }
@@ -532,12 +594,26 @@ static inline void bst_mmu_kernel(bst_mmu *m) { (void)m; bst_load_cr3((uint64_t)
 static inline bst_frame bst_pt_free_root(bst_mmu m, bst_pt t) { (void)m; return t; }
 
 /* Saved user registers: rax rbx rcx rdx rsi rdi rbp r8-r15 (0-14), rip (15),
- * rsp (16), rflags (17), error code (18), fault address (19). */
-extern uint64_t bst_cpu_ctx[20];
+ * rsp (16), rflags (17), error code (18), fault address (19), FS base (20). */
+extern uint64_t *bst_platform_ctx(void); /* this processor's saved context, 21 words */
 extern uint64_t bst_cpu_enter(void);   /* enter user mode; returns the trap vector */
 extern uint64_t bst_cpu_wait(void);    /* sti; hlt; cli; returns the interrupt vector */
-static inline uint64_t bst_cpu_get(bst_cpu c, uint64_t r) { (void)c; return bst_cpu_ctx[r]; }
-static inline void bst_cpu_set(bst_cpu *c, uint64_t r, uint64_t v) { (void)c; bst_cpu_ctx[r] = v; }
+static inline uint64_t bst_cpu_get(bst_cpu c, uint64_t r) { (void)c; return bst_platform_ctx()[r]; }
+static inline void bst_cpu_set(bst_cpu *c, uint64_t r, uint64_t v) { (void)c; bst_platform_ctx()[r] = v; }
+/* The user's x87/SSE state, in a page the kernel owns (the platform has
+ * enabled CR4.OSFXSR). fxrstor faults on reserved MXCSR bits, so the load
+ * works from a copy with only the defined bits (0-15) kept. */
+static inline void bst_cpu_fpu_save(bst_cpu *c, bst_frame *f) {
+    (void)c;
+    __asm__ volatile ("fxsave64 (%0)" : : "r"(*f) : "memory");
+}
+static inline void bst_cpu_fpu_load(bst_cpu *c, bst_frame f) {
+    (void)c;
+    uint64_t buf[64] __attribute__((aligned(16)));
+    for (int i = 0; i < 64; i++) buf[i] = ((uint64_t *)f)[i];
+    buf[3] &= 0xFFFF;                   /* bytes 24-27 are MXCSR, 28-31 its mask (ignored) */
+    __asm__ volatile ("fxrstor64 (%0)" : : "r"(buf) : "memory");
+}
 static inline uint64_t bst_cpu_run(bst_cpu *c, bst_mmu m) {
     (void)c; (void)m;
     uint64_t cr3;
@@ -546,6 +622,8 @@ static inline uint64_t bst_cpu_run(bst_cpu *c, bst_mmu m) {
     return bst_cpu_enter();
 }
 static inline uint64_t bst_cpu_idle(bst_cpu *c) { (void)c; return bst_cpu_wait(); }
+extern uint64_t bst_platform_cpus(void); /* processors running, this one included; 1 to 4096 */
+static inline uint64_t bst_cpu_count(bst_cpu c) { (void)c; return bst_platform_cpus(); }
 
 /* Called by the platform on a fault in kernel mode: that is a bug in the
  * trusted base or the compiler, never in verified code. */
@@ -638,6 +716,12 @@ static inline uint64_t bst_sys_getpid(void) { return bst_sys(BST_SYS_GETPID, 0, 
 static inline uint64_t bst_sys_info(uint64_t k) { return bst_sys(BST_SYS_INFO, k, 0, 0); }
 static inline void bst_sys_ps(void) { bst_flush(); bst_sys(BST_SYS_PS, 0, 0, 0); }
 static inline void bst_sys_poweroff(void) { bst_flush(); bst_sys(BST_SYS_POWEROFF, 0, 0, 0); }
+/* Calls with numbers the language does not know: the kernel defines them.
+ * sys_send lends the kernel bytes 0..n of b to read; sys_recv lends all of b
+ * to overwrite. Console output is flushed first so it stays in order. */
+static inline uint64_t bst_sys_call(uint64_t n, uint64_t a, uint64_t b) { bst_flush(); return bst_sys(n, a, b, 0); }
+static inline uint64_t bst_sys_send(uint64_t n, uint64_t a, bst_bytes b, uint64_t len) { bst_flush(); return bst_sys(n, a, (uint64_t)b.data, len); }
+static inline uint64_t bst_sys_recv(uint64_t n, uint64_t a, bst_bytes *b) { bst_flush(); return bst_sys(n, a, (uint64_t)b->data, b->len); }
 "#;
 
 fn cty(t: &Type) -> String {
@@ -656,6 +740,8 @@ fn cty(t: &Type) -> String {
         Type::Pool => "bst_pool".into(),
         Type::Mmu => "bst_mmu".into(),
         Type::Cpu => "bst_cpu".into(),
+        Type::Ports => "bst_ports".into(),
+        Type::PortIo => "bst_portio".into(),
         Type::Struct(n) => format!("bst_s_{}", cid(n)),
         Type::Enum(n) => format!("bst_e_{}", cid(n)),
         Type::Generic(..) => unreachable!("removed by monomorphization"),
@@ -948,8 +1034,10 @@ impl<'a> Gen<'a> {
             }
             ExprKind::Field(..) => self.place(&place(e).expect("checked: a place")),
             ExprKind::StructLit(n, fs) => {
-                let inits: Vec<String> = fs.iter().map(|(f, x)| format!(".{} = {}", f, self.expr(x))).collect();
-                format!("((bst_s_{}){{ {} }})", cid(n), inits.join(", "))
+                let xs: Vec<&Expr> = fs.iter().map(|(_, x)| x).collect();
+                let (pre, vals) = self.operands(&xs, false);
+                let inits: Vec<String> = fs.iter().zip(vals).map(|((f, _), v)| format!(".{} = {}", f, v)).collect();
+                seq(pre, format!("((bst_s_{}){{ {} }})", cid(n), inits.join(", ")))
             }
             ExprKind::Variant(n, v, payload) => match payload {
                 Some(x) => format!("((bst_e_{}){{ .tag = {}, .u.{} = {} }})", cid(n), enum_def(n).unwrap().index(v).unwrap(), v, self.expr(x)),
@@ -960,19 +1048,24 @@ impl<'a> Gen<'a> {
                 format!("({}.tag == {})", self.expr(x), enum_def(&n).unwrap().index(v).unwrap())
             }
             ExprKind::Not(x) => format!("(!{})", self.expr(x)),
-            ExprKind::Bin(op, a, b) => format!("({} {} {})", self.expr(a), op.text(), self.expr(b)),
+            // && and || are sequenced in C already (and must stay short-circuit).
+            ExprKind::Bin(op, a, b) if matches!(op, BinOp::And | BinOp::Or) => format!("({} {} {})", self.expr(a), op.text(), self.expr(b)),
+            ExprKind::Bin(op, a, b) => {
+                let (pre, v) = self.operands(&[a, b], false);
+                seq(pre, format!("({} {} {})", v[0], op.text(), v[1]))
+            }
             ExprKind::Forall(..) => unreachable!("specification only"),
             ExprKind::Call(name, args) if crate::check::VEC_BUILTINS.contains(&name.as_str()) => {
                 let el = self.vec_elem(&args[0]);
                 if !self.vecs.contains(&el) {
                     self.vecs.push(el.clone());
                 }
-                let a: Vec<String> = args.iter().map(|x| self.expr(x)).collect();
-                if name == "vec_len" {
+                let (pre, a) = self.operands(&args.iter().collect::<Vec<_>>(), true);
+                seq(pre, if name == "vec_len" {
                     format!("{}.len", a[0])
                 } else {
                     format!("bst_{}_{}({})", name, box_helper(&el), a.join(", "))
-                }
+                })
             }
             ExprKind::Call(name, args) if name == "box" || name == "unbox" => {
                 let t = self.type_of(&args[0]);
@@ -980,11 +1073,21 @@ impl<'a> Gen<'a> {
                 if !self.boxed.contains(&inner) {
                     self.boxed.push(inner.clone());
                 }
-                format!("bst_{}_{}({})", name, box_helper(&inner), self.expr(&args[0]))
+                if name == "unbox" {
+                    return format!("bst_unbox_{}({})", box_helper(&inner), self.expr(&args[0]));
+                }
+                // Allocate the box before evaluating its contents, so a
+                // recursive structure is laid out parent first (preorder),
+                // the order a traversal reads it in. Allocation has no
+                // observable effect, so moving it earlier changes nothing else.
+                let c = cty(&inner);
+                let p = format!("bp_{}", self.tmps);
+                self.tmps += 1;
+                format!("({{ {c} *{p} = ({c} *)bst_box_alloc(sizeof({c})); *{p} = {}; {p}; }})", self.expr(&args[0]))
             }
             ExprKind::Call(name, args) => {
-                let a: Vec<String> = args.iter().map(|x| self.expr(x)).collect();
-                match name.as_str() {
+                let (pre, a) = self.operands(&args.iter().collect::<Vec<_>>(), true);
+                seq(pre, match name.as_str() {
                     "len" => format!("{}.len", a[0]),
                     "get" => format!("{}.data[{}]", a[0], a[1]),
                     "slen" => format!("{}.len", a[0]),
@@ -993,9 +1096,67 @@ impl<'a> Gen<'a> {
                     "bget" => format!("((uint64_t){}.data[{}])", a[0], a[1]),
                     n if crate::check::is_builtin(n) => format!("bst_{}({})", name, a.join(", ")),
                     _ => format!("f_{}({})", cid(name), a.join(", ")),
-                }
+                })
             }
         }
+    }
+
+    /// Emits the operands of a call, binary operator or struct literal so
+    /// they run in the order the verifier assumes. C leaves that order
+    /// unspecified, so when any operand has a side effect, each one is
+    /// evaluated into a temporary first (the returned prefix). For a call
+    /// (`call`), the verifier reads scalars and computed values left to
+    /// right, then the linear places and `&mut` borrows (plain reads with no
+    /// effect), so those stay inline and are read after every temporary.
+    /// Without side effects the order cannot matter and nothing changes.
+    fn operands(&mut self, xs: &[&Expr], call: bool) -> (String, Vec<String>) {
+        let late = |cg: &Self, x: &Expr| {
+            call && match &x.kind {
+                ExprKind::MutBorrow(_) => true,
+                ExprKind::Var(_) | ExprKind::Field(..) => !matches!(cg.type_of(x).base(), Type::U64 | Type::Bool | Type::Str),
+                _ => false,
+            }
+        };
+        if !xs.iter().any(|x| has_effect(x)) {
+            return (String::new(), xs.iter().map(|x| self.expr(x)).collect());
+        }
+        let mut pre = String::new();
+        let mut vals = vec![String::new(); xs.len()];
+        for (i, x) in xs.iter().enumerate() {
+            if !late(self, x) {
+                let t = format!("o_{}", self.tmps);
+                self.tmps += 1;
+                pre.push_str(&format!("__auto_type {} = {}; ", t, self.expr(x)));
+                vals[i] = t;
+            }
+        }
+        for (i, x) in xs.iter().enumerate() {
+            if late(self, x) {
+                vals[i] = self.expr(x);
+            }
+        }
+        (pre, vals)
+    }
+}
+
+/// `e` after the statements in `pre`, as one C expression (a GNU statement
+/// expression when there are any).
+fn seq(pre: String, e: String) -> String {
+    if pre.is_empty() { e } else { format!("({{ {}{}; }})", pre, e) }
+}
+
+/// Whether evaluating `e` may have a side effect: any call other than the
+/// read-only accessors.
+fn has_effect(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Call(n, args) => {
+            !matches!(n.as_str(), "len" | "get" | "slen" | "sget" | "blen" | "bget" | "vec_len") || args.iter().any(has_effect)
+        }
+        ExprKind::StructLit(_, fs) => fs.iter().any(|(_, x)| has_effect(x)),
+        ExprKind::Variant(_, _, p) => p.as_deref().map_or(false, has_effect),
+        ExprKind::Is(x, ..) | ExprKind::Not(x) => has_effect(x),
+        ExprKind::Bin(_, a, b) => has_effect(a) || has_effect(b),
+        _ => false,
     }
 }
 
@@ -1013,6 +1174,8 @@ pub fn prelude_parts(target: Target) -> Vec<(&'static str, &'static str)> {
             ("pt_hook_hosted", "#define BST_PT_NEW_HOOK (void)level;\n"),
             ("pages", PRELUDE_PAGES),
             ("child", PRELUDE_CHILD),
+            ("ports", PRELUDE_PORTS),
+            ("ports_hosted", PRELUDE_PORTS_HOSTED),
         ],
         Target::Kernel => vec![
             ("common", PRELUDE_COMMON),
@@ -1021,6 +1184,8 @@ pub fn prelude_parts(target: Target) -> Vec<(&'static str, &'static str)> {
             ("bytes", PRELUDE_BYTES),
             ("pages", PRELUDE_PAGES),
             ("kernel_cpu", PRELUDE_KERNEL_CPU),
+            ("ports", PRELUDE_PORTS),
+            ("ports_kernel", PRELUDE_PORTS_KERNEL),
         ],
         Target::User => vec![("common", PRELUDE_COMMON), ("user", PRELUDE_USER), ("bytes_arena", PRELUDE_BYTES_ARENA), ("bytes", PRELUDE_BYTES)],
     }
