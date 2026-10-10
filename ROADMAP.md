@@ -73,6 +73,8 @@ Started early, alongside v1, because the kernel is the primary target and it sha
 - [x] Capabilities for physical pages and address spaces: `Pool`, `Frame`, `PageTable` (levels and slot ownership tracked), `Mmu` (the table in CR3 is never freed), `Cpu` (the user context; entering user mode)
 - [x] `--target user` for programs under a Bastio kernel
 - [x] A small kernel (BastiOS v0.2): boot, a page allocator whose bitmap is proved to agree with the pool, page tables, user processes with preemptive scheduling, system calls, fault isolation; tearing a process down returns every page
+- [x] A file system (BastiOS, 2026-10-10): an in-memory file system whose data pages are owned by its files (removing a file gives each page back exactly once), a per-process open-file table, and open/close/read/write/seek/unlink/stat/readdir system calls. User programs make them through three generic system calls (`sys_call`, `sys_send`, `sys_recv`), so a new kernel call needs no compiler change; the Linux layer (v4) will use the same route
+- [ ] Files on a disk: a block device driver (after `PortIo`/`Mmio` below) and a file system on it, under the same file layer as the in-memory one (BastiOS `src/fs.bastio`); then running programs from files instead of images built into the kernel
 - [ ] More hardware capabilities: `PortIo`, `Mmio[R]`, `IrqOff` (port and register widths come from sized integers, v1 item 8), so the UART, PIC and timer code moves from the C prelude and `platform.c` into Bastio
 - [ ] Allocation failure returned in the type (no abort on OOM). Enums exist now (v1 item 3); what is left is changing `alloc`, `pool_take` and friends to return them
 - [ ] Native x86-64 backend, without going through C (removes the C compiler from the trusted base)

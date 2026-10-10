@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Runs every test. pass/*.bastio must verify, build, and exit with the code in
+# Runs every test. user/*.bastio must verify and compile for --target user.
+# pass/*.bastio must verify, build, and exit with the code in
 # their `// expect-exit: N` header (and print the
 # first line of `// expect-stdout: TEXT`, if given, with stdin empty); fail/*.bastio must be rejected with the error
 # code in their `// expect-error: CODE` header, checked for the target in an
@@ -34,6 +35,17 @@ for f in tests/fail/*.bastio; do
   fi
   if grep -q "error\[$want\]" "$tmp/err"; then pass=$((pass+1)); else
     echo "FAIL $f: wrong error, want $want"; sed 's/^/    /' "$tmp/err"; fail=$((fail+1)); fi
+done
+# User programs (for a Bastio kernel such as BastiOS) cannot run here: they
+# must verify and their C must compile freestanding.
+for f in tests/user/*.bastio; do
+  name=$(basename "$f" .bastio)
+  if "$BASTIOC" --target user -o "$tmp/$name.u.c" "$f" 2>"$tmp/$name.err" \
+     && ${CC:-cc} -c -ffreestanding -fpie -o "$tmp/$name.u.o" "$tmp/$name.u.c" 2>>"$tmp/$name.err"; then
+    pass=$((pass+1))
+  else
+    echo "FAIL $f"; sed 's/^/    /' "$tmp/$name.err"; fail=$((fail+1))
+  fi
 done
 # Zero overhead: the generated C must index buffers directly, with no checks.
 "$BASTIOC" --emit-c -o "$tmp/z.c" tests/pass/fill_sum.bastio 2>/dev/null
