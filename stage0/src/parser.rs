@@ -269,7 +269,14 @@ impl Parser {
         if fields.is_empty() {
             return Err(Diag::new("E-PARSE", pos, format!("struct `{}` has no fields", name)));
         }
-        Ok(StructDef { name, tparams, fields, pos })
+        let mut invariants = Vec::new();
+        if *self.peek() == Tok::Invariant {
+            while self.eat(&Tok::Invariant) {
+                invariants.push(self.expr()?);
+            }
+            self.expect(Tok::Semi, "`;` after the struct's invariants")?;
+        }
+        Ok(StructDef { name, tparams, fields, invariants, pos })
     }
 
     /// A dotted place after its first identifier has been read.
@@ -349,15 +356,19 @@ impl Parser {
             "MmioSpace" => Ok(Type::MmioSpace),
             "Mmio" => Ok(Type::Mmio),
             "Dma" => Ok(Type::Dma),
-            _ if *self.peek() == Tok::LBracket && n != "Box" && n != "Vec" => Ok(Type::Generic(n, self.targs()?)),
-            "Box" | "Vec" => {
+            _ if *self.peek() == Tok::LBracket && n != "Box" && n != "Vec" && n != "Lock" => Ok(Type::Generic(n, self.targs()?)),
+            "Box" | "Vec" | "Lock" => {
                 self.expect(Tok::LBracket, "`[`")?;
                 let inner = self.ty()?;
                 self.expect(Tok::RBracket, "`]`")?;
                 if inner.is_ref() {
                     return Err(Diag::new("E-PARSE", pos, format!("a {} cannot hold a borrow", n)));
                 }
-                Ok(if n == "Box" { Type::Box(Box::new(inner)) } else { Type::Vec(Box::new(inner)) })
+                Ok(match n.as_str() {
+                    "Box" => Type::Box(Box::new(inner)),
+                    "Vec" => Type::Vec(Box::new(inner)),
+                    _ => Type::Lock(Box::new(inner)),
+                })
             }
             _ => Ok(Type::Struct(n)),
         }

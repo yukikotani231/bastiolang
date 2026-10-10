@@ -77,6 +77,9 @@ pub enum Type {
     /// A growable array of `T` on the heap. Always linear. Every slot below
     /// its length holds a value, so there is no per-slot ownership to track.
     Vec(Box<Type>),
+    /// A lock holding a `T`, shared between threads or cores through `&`
+    /// borrows. Linear; its contents are reached only inside `locked`.
+    Lock(Box<Type>),
     /// `Name[T, ..]` as written: a generic struct or enum applied to type
     /// arguments. Only exists before monomorphization, which replaces it with
     /// the `Struct`/`Enum` instance named by `name()` (e.g. `Option[u64]`).
@@ -120,6 +123,7 @@ impl Type {
             Type::Struct(n) | Type::Enum(n) => n.clone(),
             Type::Box(t) => format!("Box[{}]", t.name()),
             Type::Vec(t) => format!("Vec[{}]", t.name()),
+            Type::Lock(t) => format!("Lock[{}]", t.name()),
             Type::Generic(n, args) => format!("{}[{}]", n, args.iter().map(|a| a.name()).collect::<Vec<_>>().join(", ")),
             Type::Ref(t) => format!("&{}", t.name()),
             Type::MutRef(t) => format!("&mut {}", t.name()),
@@ -127,7 +131,7 @@ impl Type {
     }
     pub fn is_linear(&self) -> bool {
         match self {
-            Type::Buf | Type::Bytes | Type::Host | Type::Child | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu | Type::Ports | Type::PortIo | Type::MmioSpace | Type::Mmio | Type::Dma | Type::Box(_) | Type::Vec(_) => true,
+            Type::Buf | Type::Bytes | Type::Host | Type::Child | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu | Type::Ports | Type::PortIo | Type::MmioSpace | Type::Mmio | Type::Dma | Type::Box(_) | Type::Vec(_) | Type::Lock(_) => true,
             Type::Struct(n) => struct_def(n).map_or(false, |d| d.fields.iter().any(|f| f.1.is_linear())),
             Type::Enum(n) => enum_def(n).map_or(false, |d| d.variants.iter().any(|v| v.1.as_ref().map_or(false, |t| t.is_linear()))),
             _ => false,
@@ -172,6 +176,17 @@ impl Type {
     }
     pub fn is_mut_ref(&self) -> bool {
         matches!(self, Type::MutRef(_))
+    }
+    /// Pinned: describes the core or thread that holds it (`Cpu`, `Mmu`), so
+    /// it may never reach another one (through `lock_new` or `smp_run`).
+    pub fn is_pinned(&self) -> bool {
+        match self {
+            Type::Mmu | Type::Cpu => true,
+            Type::Box(t) | Type::Vec(t) | Type::Lock(t) | Type::Ref(t) | Type::MutRef(t) => t.is_pinned(),
+            Type::Struct(n) => struct_def(n).map_or(false, |d| d.fields.iter().any(|f| f.1.is_pinned())),
+            Type::Enum(n) => enum_def(n).map_or(false, |d| d.variants.iter().any(|v| v.1.as_ref().map_or(false, |t| t.is_pinned()))),
+            _ => false,
+        }
     }
     /// The type with any borrow removed.
     pub fn base(&self) -> &Type {
@@ -362,6 +377,9 @@ pub struct StructDef {
     pub name: String,
     pub tparams: Vec<String>,
     pub fields: Vec<(String, Type)>,
+    /// `invariant e` clauses after the fields: facts about the fields that
+    /// hold whenever a value is inside a `Lock` (ghost).
+    pub invariants: Vec<Expr>,
     pub pos: Pos,
 }
 

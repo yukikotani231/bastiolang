@@ -107,6 +107,8 @@ module.exports = grammar({
         '{',
         commaSepTrailing($.field_declaration),
         '}',
+        // What a lock over the struct guarantees: `invariant e ...;`.
+        optional(seq(repeat1(field('invariant', $.invariant_clause)), ';')),
       ),
 
     field_declaration: ($) =>

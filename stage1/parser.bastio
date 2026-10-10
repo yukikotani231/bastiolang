@@ -17,7 +17,7 @@ import "lexer.bastio";
 
 // Types.
 const T_NAMED: u64 = 1;       // a built-in type or a struct/enum name: s..e
-const T_GENERIC: u64 = 2;     // `s..e[a, ..]`, including Box[..] and Vec[..]; a is a list of types
+const T_GENERIC: u64 = 2;     // `s..e[a, ..]`, including Box[..], Vec[..] and Lock[..]; a is a list of types
 const T_REF: u64 = 3;         // `&a`
 const T_MUTREF: u64 = 4;      // `&mut a`
 const T_UNIT: u64 = 5;        // no return type
@@ -60,7 +60,7 @@ const PAT_BIND: u64 = 2;
 const PAT_BIND_MUT: u64 = 3;
 
 // Definitions.
-const D_STRUCT: u64 = 40;     // s..e, type parameters v (list of N_NAME), fields a (list of D_FIELD)
+const D_STRUCT: u64 = 40;     // s..e, type parameters v (list of N_NAME), fields a (list of D_FIELD), invariants b (list)
 const D_FIELD: u64 = 41;      // s..e: a
 const D_ENUM: u64 = 42;       // s..e, type parameters v, variants a (list of D_VARIANT)
 const D_VARIANT: u64 = 43;    // s..e, payload type a (or 0)
@@ -416,7 +416,7 @@ fn ty(p: &mut Parser) -> u64 {
   if builtin_type(p.src, name) {
     return add(&mut p, n);
   }
-  if tok_is(p.src, name, "Box") || tok_is(p.src, name, "Vec") {
+  if tok_is(p.src, name, "Box") || tok_is(p.src, name, "Vec") || tok_is(p.src, name, "Lock") {
     expect_p(&mut p, P_LBRACKET);
     let inner = ty(&mut p);
     expect_p(&mut p, P_RBRACKET);
@@ -424,7 +424,7 @@ fn ty(p: &mut Parser) -> u64 {
       return 0;
     }
     if is_ref(p, inner) {
-      fail_at(&mut p, t);           // a Box or Vec cannot hold a borrow
+      fail_at(&mut p, t);           // a Box, Vec or Lock cannot hold a borrow
       return 0;
     }
     n.kind = T_GENERIC;
@@ -1297,11 +1297,27 @@ fn struct_def(p: &mut Parser) -> u64 {
     fail_at(&mut p, t);             // no fields
     return 0;
   }
+  // `invariant e ..;` after the fields: specifications over them.
+  let mut invs = list_new();
+  if is_kw(peek(p), KW_INVARIANT) {
+    while !p.failed && eat_kw(&mut p, KW_INVARIANT) {
+      let x = expr(&mut p);
+      if p.failed {
+        return 0;
+      }
+      invs = append(&mut p, invs, x);
+    }
+    expect_p(&mut p, P_SEMI);
+    if p.failed {
+      return 0;
+    }
+  }
   let mut n = named(D_STRUCT, name);
   n.line = t.line;
   n.col = t.col;
   n.v = tps;
   n.a = l.head;
+  n.b = invs.head;
   return add(&mut p, n);
 }
 

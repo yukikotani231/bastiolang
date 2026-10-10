@@ -140,6 +140,9 @@ pub fn program(prog: &Program) -> String {
         for (f, t) in &d.fields {
             out.push_str(&format!(" ({} {})", f, t.name()));
         }
+        for i in &d.invariants {
+            out.push_str(&format!(" (invariant {})", expr(i)));
+        }
         out.push_str(")\n");
     }
     for d in &prog.enums {
