@@ -965,6 +965,7 @@ Ghost accessors, usable in specifications:
 | `dirty_id(d: &Dirty) -> u64` | | The page number |
 | `dirty_zero(d: Dirty) -> Frame` | | Zeroes the page; it is now a frame, the same page |
 | `frame_copy(d: Dirty, src: &Frame) -> Frame` | | Copies all of `src` over the page; it is now a frame, the same page. Contents are not tracked |
+| `dirty_fill(d: Dirty, src: &Bytes, s: u64) -> Frame` | `s + 4096 <= blen(src)` | Copies bytes `s .. s+4096` of `src` over the page; it is now a frame, the same page. Contents are not tracked |
 | `shared_copy(d: Dirty, s: &Shared) -> Frame` | | The same from a shared page: a private copy of it |
 | `frame_id(f: &Frame) -> u64` | | The page number |
 | `frame_read(f: &Frame, w: u64) -> u64`, `frame_write(f: &mut Frame, w: u64, v: u64)` | `w < 512` | A 64-bit word of the page. Contents are not tracked by the proof |

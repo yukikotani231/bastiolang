@@ -518,6 +518,7 @@ static inline uint64_t bst_dirty_id(bst_frame d) { return bst_frame_id(d); }
 static inline bst_frame bst_dirty_zero(bst_frame d) { bst_zero_page(d); return d; }
 static inline bst_frame bst_frame_copy(bst_frame d, bst_frame src) { bst_copy_fwd((unsigned char *)d, (const unsigned char *)src, 4096); return d; }
 #define bst_shared_copy bst_frame_copy
+static inline bst_frame bst_dirty_fill(bst_frame d, bst_bytes src, uint64_t s) { bst_copy_fwd((unsigned char *)d, src.data + s, 4096); return d; }
 "#;
 
 // The freestanding runtime. Part of the trusted base: the only code that

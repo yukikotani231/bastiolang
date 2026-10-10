@@ -77,7 +77,7 @@ pub enum Type {
     /// A page taken out of the pool without being zeroed (`pool_take_dirty`):
     /// it may still hold what its last owner wrote, so it cannot be read,
     /// mapped or given out as a `Frame` until it is overwritten whole
-    /// (`dirty_zero`, `frame_copy`, `shared_copy`). Linear.
+    /// (`dirty_zero`, `frame_copy`, `shared_copy`, `dirty_fill`). Linear.
     Dirty,
     /// A user-defined struct. Linear when any field is linear; otherwise a
     /// plain value that is copied.

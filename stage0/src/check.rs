@@ -119,6 +119,7 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("dirty_zero", Avail::Mem, vec![Dirty], Frame),
         ("frame_copy", Avail::Mem, vec![Dirty, r(Frame)], Frame),
         ("shared_copy", Avail::Mem, vec![Dirty, r(Shared)], Frame),
+        ("dirty_fill", Avail::Mem, vec![Dirty, r(Bytes), U64], Frame),
         ("mmu_enter", Avail::Kernel, vec![m(Mmu), m(PageTable)], Lease),
         ("mmu_exit", Avail::Kernel, vec![m(Mmu), Lease], Unit),
         ("mmu_kernel", Avail::Kernel, vec![m(Mmu)], Unit),

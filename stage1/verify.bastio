@@ -2462,6 +2462,22 @@ fn vm_brange(v: &mut Vr, p: &Parser, args: &Vec[u64], which: Str, d: u64, n: u64
   vm_s(&mut v, ")`)");
 }
 
+/// dirty_fill's: "that the source `s` .. `s + 4096` is within `src`
+/// (`s + 4096 <= blen(src)`)".
+fn vm_fill_range(v: &mut Vr, p: &Parser, args: &Vec[u64]) {
+  vm_s(&mut v, "that the source `");
+  vm_arg(&mut v, p, u_at(args, 2));
+  vm_s(&mut v, "` .. `");
+  vm_arg(&mut v, p, u_at(args, 2));
+  vm_s(&mut v, " + 4096` is within `");
+  vm_arg(&mut v, p, u_at(args, 1));
+  vm_s(&mut v, "` (`");
+  vm_arg(&mut v, p, u_at(args, 2));
+  vm_s(&mut v, " + 4096 <= blen(");
+  vm_arg(&mut v, p, u_at(args, 1));
+  vm_s(&mut v, ")`)");
+}
+
 /// "that `o` .. `o + n` is within the page (`o + n <= 4096`)".
 fn vm_prange(v: &mut Vr, p: &Parser, args: &Vec[u64], o: u64, n: u64) {
   vm_s(&mut v, "that `");
@@ -4529,6 +4545,17 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     return mk_u(&mut v, g_id(v, x0));
   }
   if name_is(p, i, "dirty_zero") || name_is(p, i, "frame_copy") || name_is(p, i, "shared_copy") {
+    return mk_obj(&mut v, m, v.ty_frame, g_id(v, x0), 0, 0);
+  }
+  // Or a page's worth of bytes copied over it.
+  if name_is(p, i, "dirty_fill") {
+    let src = vl_at(v, x1);
+    let s = term(v, x2);
+    let page = num(&mut v, 4096);
+    let se = app2(&mut v, OP_ADD, s, page);
+    let g = app2(&mut v, OP_LE, se, src.a);
+    vm_fill_range(&mut v, p, args);
+    prove(&mut v, st, g, i, VC_BOUNDS);
     return mk_obj(&mut v, m, v.ty_frame, g_id(v, x0), 0, 0);
   }
   if name_is(p, i, "pool_give") {

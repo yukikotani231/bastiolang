@@ -2043,6 +2043,14 @@ impl<'p> Verifier<'p> {
             // overwritten whole: zeroed, or a copy of another page.
             "dirty_id" => Ok(Val::U(vals[0].field("id"))),
             "dirty_zero" | "frame_copy" | "shared_copy" => Ok(Val::Obj(Type::Frame, vec![vals[0].field("id")])),
+            // Or a page's worth of bytes copied over it.
+            "dirty_fill" => {
+                let Val::Buf { len, .. } = &vals[1] else { unreachable!() };
+                let s = vals[2].term();
+                self.need(st, format!("(<= (+ {} 4096) {})", s, len), pos, "E-VERIFY-BOUNDS",
+                    format!("that the source `{}` .. `{} + 4096` is within `{}` (`{} + 4096 <= blen({})`)", ra(2), ra(2), ra(1), ra(2), ra(1)))?;
+                Ok(Val::Obj(Type::Frame, vec![vals[0].field("id")]))
+            }
             "pool_give" => {
                 let (p, f) = (&vals[0], &vals[1]);
                 let np = Val::Obj(Type::Pool, vec![format!("(store {} {} true)", p.field("has"), f.field("id")), p.field("size")]);

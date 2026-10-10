@@ -796,7 +796,7 @@ fn x86_inline_builtin(p: &Parser, i: u64) -> bool {
     || name_is(p, i, "pt_lease_count") || name_is(p, i, "shared_new") || name_is(p, i, "shared_dup") || name_is(p, i, "shared_drop")
     || name_is(p, i, "shared_id") || name_is(p, i, "pt_shared") || name_is(p, i, "pt_put_shared") || name_is(p, i, "pt_take_shared")
     || name_is(p, i, "pt_dup_shared") || name_is(p, i, "pool_take_dirty") || name_is(p, i, "dirty_id") || name_is(p, i, "dirty_zero")
-    || name_is(p, i, "frame_copy") || name_is(p, i, "shared_copy");
+    || name_is(p, i, "frame_copy") || name_is(p, i, "shared_copy") || name_is(p, i, "dirty_fill");
 }
 
 /// The length builtins (stage0's LENS): word 0 of their argument.
@@ -3748,6 +3748,24 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
   } else if name_is(p, i, "frame_copy") || name_is(p, i, "shared_copy") {
     // The whole page, a word at a time; the result is the dirty page.
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, XR_RSI, 0, 0, 0);
+    x86_es(&mut g, "mov %rdi, %rax");
+    x86_es(&mut g, "mov $512, %ecx");
+    x86_es(&mut g, "rep movsq");
+  } else if name_is(p, i, "dirty_fill") {
+    // dirty_fill(d, src, s): the page from the source's data + s. The
+    // source is a Bytes value (two words; its data pointer is the first
+    // pushed), as for bcopy.
+    let fn_node = node_at(p.nodes, i);
+    let mut a = fn_node.a;
+    while a != 0 {
+      x86_arg(&mut g, c, &mut m, p, a);
+      a = next_of(p, a);
+    }
+    x86_pop(&mut g, x86_reg(XR_RAX));
+    x86_drop(&mut g, 1);
+    x86_pop(&mut g, x86_reg(XR_RSI));
+    x86_es(&mut g, "add %rax, %rsi");
+    x86_pop(&mut g, x86_reg(XR_RDI));
     x86_es(&mut g, "mov %rdi, %rax");
     x86_es(&mut g, "mov $512, %ecx");
     x86_es(&mut g, "rep movsq");
