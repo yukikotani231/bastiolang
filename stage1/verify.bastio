@@ -162,7 +162,8 @@ fn vc_name(code: u64) -> Str {
 struct VState { pc: Vec[u64], env: Vec[Bind], live: bool }
 
 struct Vr {
-  pool: Vec[u64],
+  /// The text of every atom, one byte per character.
+  pool: Vec[u8],
   tms: Vec[Tm],
   targs: Vec[u64],
   vals: Vec[Vl],
@@ -235,7 +236,7 @@ fn vr_new(m: &mut Mono, p: &Parser) -> Vr {
   let mut vals = vec_new[Vl]();
   vec_push(&mut vals, Vl { kind: 0, ty: 0, a: 0, b: 0, c: 0, n: 0, d: 0, e: 0 });
   let mut v = Vr {
-    pool: vec_new[u64](), tms: tms, targs: vec_new[u64](), vals: vals, kids: vec_new[u64](),
+    pool: vec_new[u8](), tms: tms, targs: vec_new[u64](), vals: vals, kids: vec_new[u64](),
     log: vec_new[Cmd](), counter: 0, obligations: 0, box_depth: 0, cur: 0, env: 0, cnt_fns: vec_new[u64](), counts: false, dec_fns: vec_new[u64](), hex_fns: vec_new[u64](),
     sums: vec_new[SumRow](), obls: vec_new[Obl](), snaps: vec_new[Bind](), sum_start: vec_new[u64](), sum_n: vec_new[u64](),
     t_true: 0, t_false: 0, t_zero: 0, t_u64max: 0, t_allocmax: 0, t_flimit: 0, t_plimit: 0, t_mmio_lo: 0, t_mmio_hi: 0, t_poolsize: 0,
@@ -294,7 +295,18 @@ fn vadd(a: u64, b: u64) -> u64 {
 // ---- Text ----
 
 fn pool_at(v: &Vr, i: u64) -> u64 {
-  return u_at(v.pool, i);
+  if i < vec_len(v.pool) {
+    return cast[u64](vec_get(v.pool, i));
+  }
+  return 0;
+}
+
+/// Byte `i` of the pool (0 past its end).
+fn pool_byte(v: &Vr, i: u64) -> u8 {
+  if i < vec_len(v.pool) {
+    return vec_get(v.pool, i);
+  }
+  return 0;
 }
 
 fn push_str(v: &mut Vr, s: Str) {
@@ -302,7 +314,7 @@ fn push_str(v: &mut Vr, s: Str) {
   while k < slen(s)
     invariant k <= slen(s)
   {
-    vec_push(&mut v.pool, cast[u64](sget(s, k)));
+    vec_push(&mut v.pool, sget(s, k));
     k = k + 1;
   }
 }
@@ -313,7 +325,7 @@ fn push_src(v: &mut Vr, p: &Parser, s: u64, e: u64) {
     while k < e
       invariant k <= e && e <= blen(p.src)
     {
-      vec_push(&mut v.pool, cast[u64](bget(p.src, k)));
+      vec_push(&mut v.pool, bget(p.src, k));
       k = k + 1;
     }
   }
@@ -324,25 +336,27 @@ fn push_text(v: &mut Vr, a: u64) {
   let t = tm_at(v, a);
   let mut k = 0;
   while k < t.b {
-    let ch = pool_at(v, vadd(t.a, k));
+    let ch = pool_byte(v, vadd(t.a, k));
     vec_push(&mut v.pool, ch);
     k = k + 1;
   }
 }
 
 fn push_num(v: &mut Vr, x: u64) {
-  let mut d = vec_new[u64]();
+  let mut d = vec_new[u8]();
   let mut y = x;
-  vec_push(&mut d, 48 + y % 10);
+  vec_push(&mut d, cast[u8](48 + y % 10));
   y = y / 10;
   while y > 0 {
-    vec_push(&mut d, 48 + y % 10);
+    vec_push(&mut d, cast[u8](48 + y % 10));
     y = y / 10;
   }
   let mut k = vec_len(d);
-  while k > 0 {
+  while k > 0
+    invariant k <= vlen(d)
+  {
     k = k - 1;
-    vec_push(&mut v.pool, u_at(d, k));
+    vec_push(&mut v.pool, vec_get(d, k));
   }
   vec_free(d);
 }
@@ -964,7 +978,7 @@ fn pow2_num(v: &mut Vr, k: u64) -> u64 {
   let mut n = vec_len(d);
   while n > 0 {
     n = n - 1;
-    vec_push(&mut v.pool, 48 + u_at(d, n) % 10);
+    vec_push(&mut v.pool, cast[u8](48 + u_at(d, n) % 10));
   }
   vec_free(d);
   return seal(&mut v, start);
@@ -1261,7 +1275,7 @@ fn fresh_name(v: &mut Vr, hint: u64) -> u64 {
   let h = tm_at(v, hint);
   let mut k = 0;
   while k < h.b {
-    let ch = pool_at(v, vadd(h.a, k));
+    let ch = pool_byte(v, vadd(h.a, k));
     if (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) {
       vec_push(&mut v.pool, ch);
     } else {
