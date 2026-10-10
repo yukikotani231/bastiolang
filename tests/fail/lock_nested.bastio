@@ -1,0 +1,23 @@
+// expect-error: E-LOCK-ORDER
+// `move_one` holds one `Count` lock and, through `add`, takes another. Two
+// processors moving in opposite directions would each hold one and spin on
+// the other; with `from` and `to` the same lock, one processor spins on a
+// lock it already holds.
+struct Count { n: u64 }
+
+fn inc(c: &mut Count) { if c.n < 100 { c.n = c.n + 1; } }
+fn add(to: &Lock[Count]) { locked(to, inc); }
+fn take(c: &mut Count, to: &Lock[Count]) {
+  if c.n > 0 { c.n = c.n - 1; }
+  add(to);
+}
+fn move_one(from: &Lock[Count], to: &Lock[Count]) { locked(from, take, to); }
+
+fn main() -> u64 {
+  let a = lock_new(Count { n: 1 });
+  let b = lock_new(Count { n: 0 });
+  move_one(a, b);
+  let av = lock_end(a);
+  let bv = lock_end(b);
+  return 0;
+}

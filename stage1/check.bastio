@@ -18,6 +18,7 @@ const C_MATCH: u64 = 5;
 const C_TARGET: u64 = 6;
 const C_EXPORT: u64 = 7;
 const C_PIN: u64 = 8;
+const C_LOCK_ORDER: u64 = 9;
 
 const TARGET_HOSTED: u64 = 0;
 const TARGET_KERNEL: u64 = 1;
@@ -79,8 +80,19 @@ struct Checker {
   /// `wrap_*` call, and the source type of each `cast`/`wrap`, when it is
   /// not u64, per instance (the verifier's overflow bounds; every other one
   /// is u64).
-  int_ops: Vec[IntOp]
+  int_ops: Vec[IntOp],
+  /// Instance `from` calls instance `to` (`locked` and `smp_run` call the
+  /// function they name), without repeats, for `lock_order`.
+  calls: Vec[Edge],
+  /// Each `locked` call, in checking order.
+  lsites: Vec[LockSite]
 }
+
+struct Edge { from: u64, to: u64 }
+
+/// `locked` call `node` in instance `x` holds a lock of class `cls` (the
+/// type of its contents) while it runs instance `f`.
+struct LockSite { x: u64, node: u64, cls: u64, f: u64 }
 
 /// Operator node `node` of instance `x` works on integer type `ty`.
 struct IntOp { x: u64, node: u64, ty: u64 }
@@ -95,6 +107,8 @@ fn checker_free(c: Checker) {
   vec_free(c.moved);
   vec_free(c.bound);
   vec_free(c.int_ops);
+  vec_free(c.calls);
+  vec_free(c.lsites);
 }
 
 fn bsig(c: &mut Checker, name: Str, avail: u64, np: u64, p0: u64, p1: u64, p2: u64, p3: u64, ret: u64) {
@@ -129,7 +143,8 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
     bs: vec_new[Bsig](), ghosts: vec_new[Ghost](), fstart: vec_new[u64](), ftys: vec_new[u64](),
     paths: paths, vars: vec_new[Var](), moved: vec_new[u64](), bound: vec_new[u64](),
     target: target, ret: un, env: 0, spec_lim: 0, tu64: u, tbool: b, tunit: un, tstr: st,
-    failed: false, efile: 0, eline: 0, ecol: 0, ecode: 0, int_ops: vec_new[IntOp]()
+    failed: false, efile: 0, eline: 0, ecol: 0, ecode: 0, int_ops: vec_new[IntOp](),
+    calls: vec_new[Edge](), lsites: vec_new[LockSite]()
   };
   let buf = prim(&mut m, p, TY_BUF);
   let byt = prim(&mut m, p, TY_BYTES);
@@ -1417,6 +1432,135 @@ fn check_program(c: &mut Checker, m: &mut Mono, p: &Parser) {
     check_fn(&mut c, &mut m, p, u_at(m.fns, j));
     j = j + 1;
   }
+  if !c.failed {
+    lock_order(&mut c, p);
+  }
+}
+
+/// Records that the instance being checked calls instance `x`.
+fn note_call(c: &mut Checker, x: u64) {
+  let mut j = 0;
+  while j < vec_len(c.calls) {
+    let e = vec_get(c.calls, j);
+    if e.from == c.env && e.to == x {
+      return;
+    }
+    j = j + 1;
+  }
+  vec_push(&mut c.calls, Edge { from: c.env, to: x });
+}
+
+/// Adds the edge `a -> b` to `v` unless it is there.
+fn add_edge(v: &mut Vec[Edge], a: u64, b: u64) -> bool {
+  let mut j = 0;
+  while j < vec_len(v) {
+    let e = vec_get(v, j);
+    if e.from == a && e.to == b {
+      return false;
+    }
+    j = j + 1;
+  }
+  vec_push(&mut v, Edge { from: a, to: b });
+  return true;
+}
+
+/// Is class `to` reachable from class `from` along `order`?
+fn class_reaches(order: &Vec[Edge], from: u64, to: u64) -> bool {
+  let mut seen = vec_new[u64]();
+  vec_push(&mut seen, from);
+  let mut i = 0;
+  let mut found = false;
+  while i < vec_len(seen) && !found {
+    let a = vec_get(seen, i);
+    if a == to {
+      found = true;
+    }
+    let mut j = 0;
+    while j < vec_len(order) {
+      let e = vec_get(order, j);
+      if e.from == a && !has_u(seen, e.to) {
+        vec_push(&mut seen, e.to);
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  vec_free(seen);
+  return found;
+}
+
+fn has_u(v: &Vec[u64], x: u64) -> bool {
+  let mut j = 0;
+  while j < vec_len(v) {
+    if vec_get(v, j) == x {
+      return true;
+    }
+    j = j + 1;
+  }
+  return false;
+}
+
+/// Rules out deadlock through locks, as stage0's `lock_order` does: a
+/// lock's class is the type of its contents; while `locked(l, f)` holds a
+/// lock of class C, `f` and everything it calls may take only locks of other
+/// classes, and the classes form no cycle.
+fn lock_order(c: &mut Checker, p: &Parser) {
+  // takes: instance -> a class it may take, itself or through its callees.
+  let mut takes = vec_new[Edge]();
+  let mut j = 0;
+  while j < vec_len(c.lsites) {
+    let s = vec_get(c.lsites, j);
+    add_edge(&mut takes, s.x, s.cls);
+    j = j + 1;
+  }
+  let mut changed = true;
+  while changed {
+    changed = false;
+    j = 0;
+    while j < vec_len(c.calls) {
+      let e = vec_get(c.calls, j);
+      let mut k = 0;
+      while k < vec_len(takes) {
+        let t = vec_get(takes, k);
+        if t.from == e.to && add_edge(&mut takes, e.from, t.to) {
+          changed = true;
+        }
+        k = k + 1;
+      }
+      j = j + 1;
+    }
+  }
+  // order: class C before class D when D can be taken while C is held.
+  let mut order = vec_new[Edge]();
+  j = 0;
+  while j < vec_len(c.lsites) {
+    let s = vec_get(c.lsites, j);
+    let mut k = 0;
+    while k < vec_len(takes) {
+      let t = vec_get(takes, k);
+      if t.from == s.f {
+        add_edge(&mut order, s.cls, t.to);
+      }
+      k = k + 1;
+    }
+    j = j + 1;
+  }
+  j = 0;
+  while j < vec_len(c.lsites) && !c.failed {
+    let s = vec_get(c.lsites, j);
+    let mut k = 0;
+    while k < vec_len(takes) && !c.failed {
+      let t = vec_get(takes, k);
+      if t.from == s.f && class_reaches(order, t.to, s.cls) {
+        // The same class again, or a class taken elsewhere before this one.
+        cfail(&mut c, p, s.node, C_LOCK_ORDER);
+      }
+      k = k + 1;
+    }
+    j = j + 1;
+  }
+  vec_free(takes);
+  vec_free(order);
 }
 
 fn check_spec_fn(c: &mut Checker, m: &mut Mono, p: &Parser, k: u64) {
@@ -2328,6 +2472,7 @@ fn bsig_params(b: Bsig) -> Vec[u64] {
 
 /// A call to the function of instance `x`.
 fn user_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, x: u64) -> u64 {
+  note_call(&mut c, x);
   let xi = inst_at(m, x);
   let ps = fn_params(&mut m, p, xi.def, x);
   let dn = node_at(p.nodes, xi.def);
@@ -2498,6 +2643,8 @@ fn locked_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
     cfail(&mut c, p, a1, C_TYPE);             // must take `&mut` of the contents first
     return 0;
   }
+  note_call(&mut c, x);
+  vec_push(&mut c.lsites, LockSite { x: c.env, node: i, cls: inner, f: x });
   // `f`'s signature with the lock, borrowed, in place of its contents.
   let mut ps = vec_new[u64]();
   vec_push(&mut ps, ref_to(&mut m, p, lt));
@@ -2534,6 +2681,7 @@ fn smp_run_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
   if c.failed {
     return 0;
   }
+  note_call(&mut c, x);
   let xi = inst_at(m, x);
   let ps = fn_params(&mut m, p, xi.def, x);
   let dn = node_at(p.nodes, xi.def);

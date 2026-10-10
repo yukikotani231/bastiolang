@@ -34,8 +34,9 @@ Enough for BastiOS to run its scheduler on every core:
 - **`Lock[T]` with struct invariants**, but scoped instead of `acquire`/`Held`/`release`: `locked(l, f, args..)` calls `f(&mut contents, args..)` with the lock held. The contents cannot outlive the call, so no `Held` value, lock ids or release-matches-acquire proof is needed, and the invariant is assumed before `f` and proved after it exactly as designed below. `lock_new` proves it; `lock_end` gives the value back.
 - **`smp_run(f, args..)`** (kernel) instead of `smp_start`: fork-join over every processor. `f` gets each processor's own `&mut Cpu` / `&mut Mmu` and otherwise only shared borrows, so like `par` it needs no `Share`: the call joins before it returns, and the borrows end there.
 - **Pinned types**: `Cpu` and `Mmu` (and anything holding one) cannot go in a lock or be shared by `smp_run` (`E-PIN`).
+- **Lock order by class**, instead of `Ctx` and ranks (`E-LOCK-ORDER`). Because `locked` is scoped, the locks held at any point are exactly the enclosing `locked` calls, so the checker can find the order from the call graph alone. A lock's class is the type of its contents. While a lock of class C is held, the function `locked` runs and everything it calls may take only other classes, and the classes form no cycle. Nothing is annotated and nothing is generated. It is stricter than ranks in one way: two locks with the same contents type cannot be nested (rank them by giving them different struct types). See "Lock ranks" below for the design it replaces.
 
-Not yet: `par`, `spawn`/`join`, `Share`, `Atomic`, `Ctx` and lock ranks (so deadlock is not ruled out: taking a lock again inside `locked` spins forever), and `irq_lock_new`/`IrqSaved`. BastiOS does not need the interrupt rules yet because its kernel code runs with interrupts off: interrupts reach a processor only while it runs user code or waits in `cpu_idle`, never while it holds a lock.
+Not yet: `par`, `spawn`/`join`, `Share`, `Atomic`, `Ctx`, and `irq_lock_new`/`IrqSaved`. BastiOS does not need the interrupt rules yet because its kernel code runs with interrupts off: interrupts reach a processor only while it runs user code or waits in `cpu_idle`, never while it holds a lock.
 
 ## Layer 1: running code in parallel
 
@@ -124,6 +125,8 @@ release(&mut ctx, &l, h);              // proves the invariant again
 
 ### Lock ranks (cheap deadlock avoidance)
 
+*Implemented differently:* with the scoped `locked`, the order is inferred per lock class over the call graph (see "What exists so far"), so neither `Ctx` nor ranks exist. The rank design below stays relevant if `acquire`/`release` with a `Held` value are added, since a `Held` can then outlive the call that took it.
+
 A **`Ctx`** is a pinned, linear, zero-size capability for the current thread of execution. `main`, every spawned function and every interrupt handler receives one. Its ghost state is `ctx_rank(c)`: the rank of the most recently acquired lock still held, 0 when none.
 
 - `acquire` requires the lock's rank to be strictly greater than `ctx_rank`, and raises `ctx_rank` to it. `release` requires the lock to be the last one taken and restores the previous rank. So locks are taken in increasing rank order and released in reverse, and no two threads can wait for each other through locks (`E-VERIFY-RANK`).
@@ -211,7 +214,7 @@ The trusted base grows by: the lock and atomic primitives and the thread start c
 | --- | --- |
 | `E-PIN` | A pinned capability crosses to another thread (`spawn`, a later `par` branch, a lock, a share) |
 | `E-VERIFY-LOCKINV` | A type invariant is not proved where a value enters a lock or an atomic |
-| `E-VERIFY-RANK` | A lock is acquired out of rank order, or released out of order |
+| `E-VERIFY-RANK` | A lock is acquired out of rank order, or released out of order (for the scoped `locked`, `E-LOCK-ORDER` does this in the checker) |
 | `E-VERIFY-IRQ` | An irq lock is acquired with interrupts on, outside a handler |
 | `E-VERIFY-SHARE` | `share_end` without every handle merged back, or merging handles of different shares |
 
