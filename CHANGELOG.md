@@ -15,6 +15,14 @@ What will be 0.2.0.
 
 ### Language
 
+- `try_alloc` and `try_balloc`: allocation that returns an empty buffer when
+  memory runs out instead of stopping the program. The prover makes the
+  program check the length before using it.
+- `vec_try_reserve` and `vec_push_within`: room for elements is reserved
+  ahead of time, or the reservation reports that memory ran out, and pushes
+  into reserved room never allocate. The prover tracks a vector's capacity
+  (`vcap` in specifications). `alloc`, `balloc`, `vec_push` and `box` still
+  stop the program on out of memory.
 - Page tables shared between processors: a processor takes a `Lease` on a
   top-level table with `mmu_enter` and gives it back with `mmu_exit`, and
   while a tree has leases nothing can be taken out of it, only added
@@ -42,6 +50,13 @@ What will be 0.2.0.
 - Generic `spec fn`s, and `vcount` for counting in specifications; local
   variables may share a function's name (#74).
 - `==` on structs and enums in specifications (#86).
+- `opaque spec fn`: a spec fn whose body is used only in its own file and
+  is an uninterpreted function everywhere else, so a library can describe
+  its data abstractly. `core/ring`'s `Queue` is now proved to be a FIFO
+  (`queue_at`).
+- `has_bit(x, i)` in specifications, and what every bitwise operator does
+  to each bit, so packed bitmaps are proved to change only the bit they
+  set or clear.
 - Imports are searched for in the library path (`--lib`), so
   `import "core/text.bastio"` works from anywhere (#85).
 
@@ -70,6 +85,19 @@ What will be 0.2.0.
   an unknown variable or function (#87).
 - Z3 runs with a fixed work limit per query (`:rlimit`) instead of a 10 s
   timeout, so a proof no longer fails on a busy machine (#89).
+- Each function is verified on a reset solver, so whether a proof near
+  the work limit succeeds no longer depends on which functions shared its
+  solver: the same program could be
+  accepted with one `BASTIO_JOBS` and rejected with another. Found by the
+  fuzzer below.
+- `tests/fuzz.py`: random programs whose meaning the fuzzer computes
+  itself (a proof that holds while some input overflows, divides by zero,
+  shifts too far, indexes out of bounds or breaks an `assert` or `ensures`
+  is a false proof; proved programs are also run, through both backends,
+  against that meaning), and damaged copies of the tests (no compiler may
+  crash or hang; one that is still accepted runs under ASan and UBSan).
+  bastioc1 must agree with bastioc0 on every input. CI runs a short
+  deterministic run.
 - A change to `stage0/src` needs its stage1 mirror, or a `Stage0-only:`
   reason in a commit message; CI checks this on every pull request (#78).
 
