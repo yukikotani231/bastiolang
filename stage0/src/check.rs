@@ -211,6 +211,8 @@ fn spec_norm(t: Type) -> Type {
 /// Every builtin with where it is available, for `--trusted-base`.
 pub fn builtin_list() -> Vec<(String, &'static str)> {
     let mut v: Vec<(String, &'static str)> = vec![("box".into(), "all"), ("unbox".into(), "all")];
+    v.extend(LOCK_BUILTINS.iter().map(|n| (n.to_string(), "all")));
+    v.push(("smp_run".into(), "kernel"));
     v.extend(VEC_BUILTINS.iter().map(|n| (n.to_string(), "all")));
     for (n, a, _, _) in builtin_table() {
         let a = match a {
@@ -225,8 +227,11 @@ pub fn builtin_list() -> Vec<(String, &'static str)> {
     v
 }
 
+/// Builtins over `Lock[T]`: generic, so checked by hand like `box`.
+pub const LOCK_BUILTINS: &[&str] = &["lock_new", "lock_end", "locked"];
+
 pub fn is_builtin(name: &str) -> bool {
-    name == "box" || name == "unbox" || name == "cast" || name == "wrap" || VEC_BUILTINS.contains(&name) || WRAP_BUILTINS.contains(&name) || builtin_table().iter().any(|b| b.0 == name)
+    name == "box" || name == "unbox" || name == "cast" || name == "wrap" || name == "smp_run" || LOCK_BUILTINS.contains(&name) || VEC_BUILTINS.contains(&name) || WRAP_BUILTINS.contains(&name) || builtin_table().iter().any(|b| b.0 == name)
 }
 
 fn available(name: &str, target: Target) -> bool {
@@ -253,7 +258,7 @@ fn main_caps(target: Target) -> &'static [Type] {
 /// Struct and enum definitions: unique names, known field and payload
 /// types, no type that contains itself.
 pub fn check_structs(p: &Program) -> Result<(), Diag> {
-    const RESERVED: &[&str] = &["u64", "u8", "u16", "u32", "i8", "i16", "i32", "i64", "bool", "Str", "Buf", "Bytes", "Host", "Child", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu", "Ports", "PortIo", "MmioSpace", "Mmio", "Dma"];
+    const RESERVED: &[&str] = &["u64", "u8", "u16", "u32", "i8", "i16", "i32", "i64", "bool", "Str", "Buf", "Bytes", "Host", "Child", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu", "Ports", "PortIo", "MmioSpace", "Mmio", "Dma", "Lock"];
     // (name, position, the types it holds directly)
     let mut defs: Vec<(String, Pos, Vec<Type>)> = Vec::new();
     for d in &p.structs {
@@ -268,7 +273,7 @@ pub fn check_structs(p: &Program) -> Result<(), Diag> {
         }
         for t in held {
             let mut t = t;
-            while let Type::Box(i) | Type::Vec(i) = t {
+            while let Type::Box(i) | Type::Vec(i) | Type::Lock(i) = t {
                 t = i;
             }
             if let Type::Struct(n) | Type::Enum(n) = t {
@@ -316,7 +321,7 @@ fn known_type(t: &Type, pos: Pos) -> Result<(), Diag> {
     match t {
         Type::Struct(n) if struct_def(n).is_none() => Err(Diag::new("E-TYPE", pos, format!("unknown type `{}`", n))),
         Type::Enum(n) if enum_def(n).is_none() => Err(Diag::new("E-TYPE", pos, format!("unknown type `{}`", n))),
-        Type::Box(i) | Type::Vec(i) => known_type(i, pos),
+        Type::Box(i) | Type::Vec(i) | Type::Lock(i) => known_type(i, pos),
         // Any value can be borrowed; a borrowed plain value reads as a copy.
         // (Generic code borrows `&T` whatever `T` turns out to be.)
         Type::Ref(i) | Type::MutRef(i) => known_type(i, pos),
@@ -462,6 +467,9 @@ pub fn check_program(p: &mut Program, target: Target) -> Result<HashMap<String, 
     for (i, sf) in specs.iter().enumerate() {
         check_spec_fn(sf, &specs[..i], &sigs, target)?;
     }
+    for d in &p.structs {
+        check_struct_invariants(d, &sigs, &specs, target)?;
+    }
     for f in &mut p.fns {
         check_fn(f, &sigs, &specs, target).map_err(|d| in_copy(d, &f.name))?;
     }
@@ -490,6 +498,22 @@ fn check_spec_fn(sf: &SpecFn, earlier: &[SpecFn], sigs: &HashMap<String, Sig>, t
     }
     let t = cx.spec_expr(&sf.body, false, &mut Vec::new())?;
     expect_ty(&t, &sf.ret, sf.body.pos, &format!("the body of spec fn `{}`", sf.name))
+}
+
+/// A struct's `invariant` clauses are specifications over its fields.
+fn check_struct_invariants(d: &StructDef, sigs: &HashMap<String, Sig>, specs: &[SpecFn], target: Target) -> Result<(), Diag> {
+    if d.invariants.is_empty() {
+        return Ok(());
+    }
+    let mut cx = new_ctx(sigs, specs, target, Type::Unit);
+    for (f, t) in &d.fields {
+        cx.declare(f, t.clone(), false, d.pos)?;
+    }
+    for i in &d.invariants {
+        let t = cx.spec_expr(i, false, &mut Vec::new())?;
+        expect_ty(&t, &Type::Bool, i.pos, "a struct invariant")?;
+    }
+    Ok(())
 }
 
 fn check_fn(f: &mut FnDef, sigs: &HashMap<String, Sig>, specs: &[SpecFn], target: Target) -> Result<(), Diag> {
@@ -1182,6 +1206,29 @@ impl<'a> Ctx<'a> {
                 if name == "main" {
                     return Err(Diag::new("E-TYPE", e.pos, "`main` cannot be called"));
                 }
+                if name == "lock_new" || name == "lock_end" {
+                    if args.len() != 1 {
+                        return Err(Diag::new("E-TYPE", e.pos, format!("`{}` takes 1 argument(s), {} given", name, args.len())));
+                    }
+                    let t = self.expr(&args[0])?;
+                    if name == "lock_new" {
+                        if t.is_pinned() {
+                            return Err(Diag::new("E-PIN", args[0].pos, format!("a {} cannot be put in a lock: it holds a capability of this processor", t.name()))
+                                .note("`Cpu` and `Mmu` describe the processor that holds them, and a lock can be taken on any processor"));
+                        }
+                        return Ok(Type::Lock(Box::new(t)));
+                    }
+                    return match t {
+                        Type::Lock(i) => Ok(*i),
+                        t => Err(Diag::new("E-TYPE", args[0].pos, format!("`lock_end` needs a lock, found {}", t.name()))),
+                    };
+                }
+                if name == "locked" {
+                    return self.locked(args, e.pos);
+                }
+                if name == "smp_run" {
+                    return self.smp_run(args, e.pos);
+                }
                 let sig = self.sigs.get(name).cloned().ok_or_else(|| Diag::new("E-TYPE", e.pos, format!("unknown function `{}`", name)))?;
                 if !available(name, self.target) {
                     return Err(Diag::new("E-TARGET", e.pos, format!("`{}` is not available on this target", name)));
@@ -1189,6 +1236,63 @@ impl<'a> Ctx<'a> {
                 self.call_with(name, sig, args, e.pos)
             }
         }
+    }
+
+    /// The function a `locked` or `smp_run` argument names.
+    fn named_fn(&self, builtin: &str, a: Option<&Expr>, pos: Pos) -> Result<(String, Sig), Diag> {
+        let n = match a.map(|a| &a.kind) {
+            Some(ExprKind::Var(n)) if n != "main" && !is_builtin(n) && self.sigs.contains_key(n) && !self.vars.contains_key(n) => n.clone(),
+            _ => return Err(Diag::new("E-TYPE", a.map_or(pos, |a| a.pos), format!("`{}` needs the name of a function here", builtin))),
+        };
+        Ok((n.clone(), self.sigs[&n].clone()))
+    }
+
+    /// `locked(&l, f, args..)`: takes the lock, calls `f(&mut contents,
+    /// args..)` and releases it. The contents are reachable only during the
+    /// call, so no other processor can see them half updated.
+    fn locked(&mut self, args: &[Expr], pos: Pos) -> Result<Type, Diag> {
+        let lt = match args.first().and_then(place) {
+            Some(p) => self.path_type(&p, args[0].pos)?.0,
+            None => return Err(Diag::new("E-TYPE", args.first().map_or(pos, |a| a.pos), "the first argument of `locked` must name a lock")),
+        };
+        let Type::Lock(inner) = lt else {
+            return Err(Diag::new("E-TYPE", args[0].pos, format!("`locked` needs a Lock, found {}", lt.name())));
+        };
+        let (f, sig) = self.named_fn("locked", args.get(1), pos)?;
+        if sig.params.first() != Some(&m((*inner).clone())) {
+            return Err(Diag::new("E-TYPE", args[1].pos, format!("`{}` must take `&mut {}` first, to receive the contents of the lock", f, inner.name())));
+        }
+        let mut params = vec![r(Type::Lock(inner))];
+        params.extend(sig.params[1..].iter().cloned());
+        let mut rest = vec![args[0].clone()];
+        rest.extend(args[2..].iter().cloned());
+        self.call_with(&f, Sig { params, ret: sig.ret }, &rest, pos)
+    }
+
+    /// `smp_run(f, args..)`: runs `f` on every processor at once and returns
+    /// when all of them have returned. Each processor's call gets its own
+    /// `Cpu` and `Mmu` (this processor's are the ones passed); every other
+    /// argument is a shared borrow, read by all of them.
+    fn smp_run(&mut self, args: &[Expr], pos: Pos) -> Result<Type, Diag> {
+        if !matches!(self.target, Target::Kernel) {
+            return Err(Diag::new("E-TARGET", pos, "`smp_run` is not available on this target"));
+        }
+        let (f, sig) = self.named_fn("smp_run", args.first(), pos)?;
+        if sig.ret != Type::Unit {
+            return Err(Diag::new("E-TYPE", args[0].pos, format!("`{}` must return nothing to run on every processor", f)));
+        }
+        for t in &sig.params {
+            let ok = match t {
+                Type::MutRef(i) => matches!(**i, Type::Cpu | Type::Mmu),
+                Type::Ref(i) => !i.is_pinned(),
+                _ => false,
+            };
+            if !ok {
+                return Err(Diag::new("E-PIN", args[0].pos, format!("`{}` cannot run on every processor: its parameter of type {} would be shared between them", f, t.name()))
+                    .note("each parameter must be `&mut Cpu`, `&mut Mmu` (every processor gets its own) or a shared borrow `&T` of a value with no `Cpu` or `Mmu` in it"));
+            }
+        }
+        self.call_with(&f, sig, &args[1..], pos)
     }
 
     /// The signature of a `Vec` builtin, for the element type of the vector

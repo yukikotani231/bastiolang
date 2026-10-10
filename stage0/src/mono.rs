@@ -67,6 +67,9 @@ pub fn monomorphize(p: &mut Program) -> Result<(), Diag> {
         for (_, t) in &mut d.fields {
             *t = m.ty(t, &none, d.pos)?;
         }
+        for i in &mut d.invariants {
+            m.expr(i, &none)?;
+        }
     }
     for d in &mut p.enums {
         for (_, t) in d.variants.iter_mut() {
@@ -110,7 +113,11 @@ pub fn monomorphize(p: &mut Program) -> Result<(), Diag> {
             for (f, t) in &d.fields {
                 fields.push((f.clone(), m.ty(t, &s, d.pos)?));
             }
-            p.structs.push(StructDef { name: inst, tparams: Vec::new(), fields, pos: d.pos });
+            let mut invariants = d.invariants.clone();
+            for i in &mut invariants {
+                m.expr(i, &s)?;
+            }
+            p.structs.push(StructDef { name: inst, tparams: Vec::new(), fields, invariants, pos: d.pos });
         } else if let Some(d) = m.enums.get(&generic).cloned() {
             let s = subst_map(&d.tparams, &args);
             let mut variants = Vec::new();
@@ -163,6 +170,7 @@ impl Mono {
             }
             Type::Box(i) => Type::Box(Box::new(self.ty(i, s, pos)?)),
             Type::Vec(i) => Type::Vec(Box::new(self.ty(i, s, pos)?)),
+            Type::Lock(i) => Type::Lock(Box::new(self.ty(i, s, pos)?)),
             Type::Ref(i) => Type::Ref(Box::new(self.ty(i, s, pos)?)),
             Type::MutRef(i) => Type::MutRef(Box::new(self.ty(i, s, pos)?)),
             t => t.clone(),
