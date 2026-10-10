@@ -2530,6 +2530,26 @@ fn spec_tm(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env: &Vec[
     return app1(&mut v, OP_SUB, x);
   }
   if k == E_BIN {
+    // `==` on a value that names a struct or enum compares it part by part
+    // (the checker allows it only between such values); on a number it is
+    // the same `(= a b)` as below.
+    if (n.v == P_EQEQ || n.v == P_NE) && spec_place(p, n.a) {
+      let x = spec_val(&mut v, c, &mut m, p, n.a, env, oenv, has_old, res, &mut bound);
+      let xl = vl_at(v, x);
+      let xk = xl.kind;
+      let mut eq = 0;
+      if xk == VV_U || xk == VV_B {
+        let tb = spec_tm(&mut v, c, &mut m, p, n.b, env, oenv, has_old, res, &mut bound);
+        eq = app2(&mut v, OP_EQ, term(v, x), tb);
+      } else {
+        let y = spec_val(&mut v, c, &mut m, p, n.b, env, oenv, has_old, res, &mut bound);
+        eq = eq_term(&mut v, x, y);
+      }
+      if n.v == P_NE {
+        return t_not(&mut v, eq);
+      }
+      return eq;
+    }
     let ta = spec_tm(&mut v, c, &mut m, p, n.a, env, oenv, has_old, res, &mut bound);
     let tb = spec_tm(&mut v, c, &mut m, p, n.b, env, oenv, has_old, res, &mut bound);
     let op = n.v;
@@ -2564,6 +2584,44 @@ fn spec_tm(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env: &Vec[
     return vspec_expand(&mut v, c, &mut m, p, n.b, xi.def, x, env, oenv, has_old, res, &mut bound);
   }
   return v.t_false;
+}
+
+/// Two values of one struct or enum type (made of numbers) are equal: every
+/// field is, and for an enum the tags are and so is the payload the tag
+/// names. As stage0's `eq_term`.
+fn eq_term(v: &mut Vr, a: u64, b: u64) -> u64 {
+  let x = unbox_known(v, a);
+  let y = unbox_known(v, b);
+  let xv = vl_at(v, x);
+  let yv = vl_at(v, y);
+  if (xv.kind == VV_U && yv.kind == VV_U) || (xv.kind == VV_B && yv.kind == VV_B) {
+    return app2(&mut v, OP_EQ, xv.a, yv.a);
+  }
+  let st = xv.kind == VV_STRUCT && yv.kind == VV_STRUCT;
+  let en = xv.kind == VV_ENUM && yv.kind == VV_ENUM;
+  if !st && !en {
+    return v.t_true;
+  }
+  let mut ts = vec_new[u64]();
+  if en {
+    vec_push(&mut ts, app2(&mut v, OP_EQ, xv.a, yv.a));
+  }
+  let mut j = 0;
+  while j < xv.n && j < yv.n && j < SRC_MAX {
+    let t = eq_term(&mut v, kid(v, x, j), kid(v, y, j));
+    if t != v.t_true {
+      if en {
+        let g = app2(&mut v, OP_EQ, xv.a, num(&mut v, j));
+        vec_push(&mut ts, app2(&mut v, OP_IMP, g, t));
+      } else {
+        vec_push(&mut ts, t);
+      }
+    }
+    j = j + 1;
+  }
+  let r = and_all(&mut v, ts);
+  vec_free(ts);
+  return r;
 }
 
 /// The SMT operator of a binary operator token.

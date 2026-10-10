@@ -1705,6 +1705,16 @@ impl<'a> Ctx<'a> {
                 }
                 let ta = spec_norm(self.spec_expr(a, in_ensures, bound)?);
                 let tb = spec_norm(self.spec_expr(b, in_ensures, bound)?);
+                // Structs and enums made of numbers compare field by field.
+                if matches!(op, BinOp::Eq | BinOp::Ne) && ta == tb && matches!(ta, Type::Struct(_) | Type::Enum(_)) {
+                    if !spec_plain(&ta) {
+                        return Err(Diag::new("E-TYPE", e.pos, format!("cannot compare {} with {}: only structs and enums made of integers and booleans compare", ta.name(), tb.name())));
+                    }
+                    if !spec_place(a) || !spec_place(b) {
+                        return Err(Diag::new("E-TYPE", e.pos, "both sides of a struct or enum comparison must name a value: a variable, a field, `vget(..)` or `old(..)`"));
+                    }
+                    return Ok(Type::Bool);
+                }
                 bin_type(*op, &ta, &tb, e.pos)
             }
             ExprKind::Forall(v, body) => {
@@ -1826,6 +1836,29 @@ impl<'a> Ctx<'a> {
                 Ok(Type::U64)
             }
         }
+    }
+}
+
+/// Can a specification compare two values of type `t` with `==`: is it an
+/// integer, a bool, or a struct or enum made of those?
+fn spec_plain(t: &Type) -> bool {
+    match t {
+        Type::Bool => true,
+        t if t.is_int() => true,
+        Type::Struct(n) => struct_def(n).is_some_and(|d| d.fields.iter().all(|f| spec_plain(&f.1))),
+        Type::Enum(n) => enum_def(n).is_some_and(|d| d.variants.iter().all(|v| v.1.as_ref().is_none_or(spec_plain))),
+        _ => false,
+    }
+}
+
+/// Does a specification expression name a value: a variable, a field of
+/// one, `vget(..)` or `old(..)`? (The verifier compares such values part
+/// by part.)
+pub fn spec_place(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Var(_) | ExprKind::Field(..) => true,
+        ExprKind::Call(n, _) => n == "vget" || n == "old",
+        _ => false,
     }
 }
 

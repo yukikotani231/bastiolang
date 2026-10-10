@@ -87,22 +87,22 @@ Narrower integers format through `fmt_u64(t, cast[u64](x))`: widening needs no p
 
 ### `core/hashmap.bastio`
 
-A hash map from `u64` keys to `u64` values: open addressing, linear probing, tombstones, rebuilt (and doubled when half full of keys) at three quarters use.
+A hash map from `u64` keys to values of a type `V` that can be copied (`u64`, `Span`, a struct of numbers): open addressing, linear probing, tombstones, rebuilt (and doubled when half full of keys) at three quarters use. Every function takes `V` as its type argument, since type arguments are not inferred.
 
 ```text
-let mut m = hmap_new();
-while ... invariant hmap_ok(m) {          // a loop that changes a map says it stays well formed
-  let prev = hmap_insert(&mut m, key, value);
+let mut m = hmap_new[u64]();
+while ... invariant hmap_ok[u64](m) {          // a loop that changes a map says it stays well formed
+  let prev = hmap_insert[u64](&mut m, key, value);
 }
-match hmap_get(m, key) { Option::Some(v) => { ... }, Option::None => {} }
-hmap_free(m);
+match hmap_get[u64](m, key) { Option::Some(v) => { ... }, Option::None => {} }
+hmap_free[u64](m);
 ```
 
 `hmap_new`, `hmap_with_cap`, `hmap_len`, `hmap_insert` (returns the replaced value), `hmap_get`, `hmap_get_or`, `hmap_contains`, `hmap_remove`, `hmap_keys`, `hmap_free`, and `hash_u64`, the mixing function it uses.
 
-Proved: every index is in bounds and no counter overflows; `len` is the number of keys and `used` the number of slots that are not empty (both from `hmap_ok`, which every function needs and keeps, and which states them with `vcount`); after `hmap_insert(m, k, v)` the map holds `k` with `v` (spec fn `hmap_maps`); a value `hmap_get` returns is one the map holds for that key. Not proved: that a lookup finds every key present. Inserting a new key falls back to a plain scan for an empty slot if its probe sequence finds none; the probe sequence visits every slot, but the prover does not follow it around the table, so the scan is there and its failure is what is proved unreachable.
+Proved, for every `V`: every index is in bounds and no counter overflows; `len` is the number of keys and `used` the number of slots that are not empty (both from `hmap_ok`, which every function needs and keeps, and which states them with `vcount`); after `hmap_insert(m, k, v)` the map holds `k` with `v` (spec fn `hmap_maps`, which compares struct values with `==`); a value `hmap_get` returns is one the map holds for that key. Not proved: that a lookup finds every key present. Inserting a new key falls back to a plain scan for an empty slot if its probe sequence finds none; the probe sequence visits every slot, but the prover does not follow it around the table, so the scan is there and its failure is what is proved unreachable.
 
-**Linear values.** The map holds only numbers. To map keys to buffers or other linear values, keep the values in a `Vec[T]` and map each key to its index (`tests/pass/core_hashmap.bastio` does this). A generic `HashMap[V]` was tried first and dropped, because spec fns could not be generic then and its well-formedness could not be named in a caller's loop invariant. Spec fns can be generic now, so it can be written; it is not done yet.
+**Linear values.** A `HashMap[Buf]` is rejected: `hmap_get` copies the value out. To map keys to buffers or other linear values, keep the values in a `Vec[T]` and map each key to its index (`tests/pass/core_hashmap.bastio` does this).
 
 ### `core/sort.bastio`
 
