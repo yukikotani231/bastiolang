@@ -108,6 +108,7 @@ impl Parser {
                 Tok::Struct => structs.push(self.struct_def()?),
                 Tok::Enum => enums.push(self.enum_def()?),
                 Tok::Const => self.const_def()?,
+                Tok::Import => return Err(Diag::new("E-PARSE", self.pos(), "`import` lines must come first in a file, before any definition")),
                 _ => fns.push(self.fn_def()?),
             }
         }
