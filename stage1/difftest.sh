@@ -286,6 +286,26 @@ for f in $(grep -l '^export fn' tests/pass/*.bastio examples/*/*.bastio); do
     diff "$tmp/hw/lib.h" "$tmp/hg/lib.h" | head -5 | cut -c1-300 | sed 's/^/    /'
   fi
 done
+# `--lib`: a program outside the repository, without and with it.
+mkdir -p "$tmp/away"
+printf 'import "core/option.bastio";\nfn main() -> u64 { return opt_or[u64](Option[u64]::Some(7), 0); }\n' >"$tmp/away/prog.bastio"
+"$BASTIOC" --check "$tmp/away/prog.bastio" 2>"$tmp/want.err" >/dev/null; echo "exit $?" >>"$tmp/want.err"
+"$tmp/bastioc1" --check "$tmp/away/prog.bastio" 2>"$tmp/got.err" >/dev/null; echo "exit $?" >>"$tmp/got.err"
+mask "$tmp/want.err" "$tmp/got.err" >"$tmp/want"
+if cmp -s "$tmp/want" "$tmp/got.err"; then
+  match=$((match+1))
+else
+  differ=$((differ+1))
+  echo "DIFFER --lib (missing)"
+  diff "$tmp/want" "$tmp/got.err" | head -5 | cut -c1-300 | sed 's/^/    /'
+fi
+"$BASTIOC" --emit-c --lib "$PWD" -o "$tmp/want.c" "$tmp/away/prog.bastio" 2>/dev/null
+if "$tmp/bastioc1" --emit-c --lib "$PWD" -o "$tmp/got.c" "$tmp/away/prog.bastio" 2>/dev/null && cmp -s "$tmp/want.c" "$tmp/got.c"; then
+  match=$((match+1))
+else
+  differ=$((differ+1))
+  echo "DIFFER --lib (--emit-c)"
+fi
 if "$tmp/bastioc1" --trusted-base | cmp -s - <("$BASTIOC" --trusted-base); then
   match=$((match+1))
 else

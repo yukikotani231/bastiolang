@@ -23,16 +23,121 @@ struct Loaded { start: u64, len: u64, done: bool, raw: u64, rawlen: u64, src: u6
 
 struct Loader {
   paths: Vec[u64],
-  files: Vec[Loaded]
+  files: Vec[Loaded],
+  libs: Vec[Bytes]
 }
 
 fn loader_new() -> Loader {
-  return Loader { paths: vec_new[u64](), files: vec_new[Loaded]() };
+  return Loader { paths: vec_new[u64](), files: vec_new[Loaded](), libs: vec_new[Bytes]() };
 }
 
 fn loader_free(ld: Loader) {
   vec_free(ld.paths);
   vec_free(ld.files);
+  let mut libs = ld.libs;
+  while vec_len(libs) > 0 {
+    bfree(vec_pop(&mut libs));
+  }
+  vec_free(libs);
+}
+
+/// Adds a `--lib` directory.
+fn loader_lib(ld: &mut Loader, dir: Bytes) {
+  vec_push(&mut ld.libs, dir);
+}
+
+/// Can `path` be read?
+fn readable(host: &Host, path: &Bytes) -> bool {
+  let mut data = balloc(0);
+  let ok = host_read(host, path, &mut data);
+  bfree(data);
+  return ok;
+}
+
+/// How many directories above an importing file are searched.
+const SEARCH_UP: u64 = 64;
+
+/// `..`
+fn dotdot() -> Bytes {
+  let mut b = balloc(2);
+  bset(&mut b, 0, 46);
+  bset(&mut b, 1, 46);
+  return b;
+}
+
+/// Is `dir` the root directory?
+fn is_root(dir: &Bytes) -> bool {
+  return blen(dir) == 1 && bget(dir, 0) == 47;
+}
+
+/// The directory above `dir` (normalized, not the root), as text, as
+/// stage0's `dir_above`.
+fn dir_above(dir: &Bytes) -> Bytes {
+  let n = blen(dir);
+  if n == 0 {
+    return dotdot();
+  }
+  let dots = (n == 2 || (n > 2 && bget(dir, n - 3) == 47)) && bget(dir, n - 2) == 46 && bget(dir, n - 1) == 46;
+  if dots {
+    let tail = dotdot();
+    let out = join(dir, tail);
+    bfree(tail);
+    return out;
+  }
+  return parent(dir);
+}
+
+/// Where `import "name"` in a file in `dir` points, as stage0's
+/// `Loader::resolve`. A name that starts with `.` or `/` is relative to
+/// the file only. Any other name is looked for next to the file, then in
+/// each directory above it (up to `SEARCH_UP` of them, worked out from
+/// the path as text), then in each `--lib` directory; the first that has
+/// it wins. When none has it, the name next to the file is returned, for
+/// the error message.
+fn resolve(host: &Host, ld: &mut Loader, dir: &Bytes, name: &Bytes) -> Bytes {
+  let first = join(dir, name);
+  if blen(name) == 0 || bget(name, 0) == 46 || bget(name, 0) == 47 || readable(host, first) {
+    return first;
+  }
+  let mut found = balloc(0);
+  let mut has = false;
+  let mut d = normalize(dir);
+  let mut steps = 0;
+  while !has && !is_root(d) && steps < SEARCH_UP {
+    let up = dir_above(d);
+    bfree(d);
+    d = up;
+    let c = join(d, name);
+    if readable(host, c) {
+      bfree(found);
+      found = c;
+      has = true;
+    } else {
+      bfree(c);
+    }
+    steps = steps + 1;
+  }
+  bfree(d);
+  let mut k = 0;
+  while !has && k < vec_len(ld.libs) {
+    let lib = vec_swap(&mut ld.libs, k, balloc(0));
+    let c = join(lib, name);
+    bfree(vec_swap(&mut ld.libs, k, lib));
+    if readable(host, c) {
+      bfree(found);
+      found = c;
+      has = true;
+    } else {
+      bfree(c);
+    }
+    k = k + 1;
+  }
+  if has {
+    bfree(first);
+    return found;
+  }
+  bfree(found);
+  return first;
 }
 
 /// Records an error, replacing any recorded already.
@@ -303,7 +408,7 @@ fn load(host: &Host, p: &mut Parser, ld: &mut Loader, path: &Bytes, file: u64, l
       status = 1;
     } else if name.start <= name.end && name.end <= blen(p.src) {
       let rel = decode(p.src, name.start, name.end);
-      let full = join(dir, rel);
+      let full = resolve(host, &mut ld, dir, rel);
       status = load(host, &mut p, &mut ld, full, k, t.line, t.col, true);
       bfree(full);
       bfree(rel);

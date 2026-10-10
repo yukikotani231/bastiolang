@@ -4,7 +4,7 @@
 // Pipeline: load -> monomorphize -> check (types and linearity) -> verify
 // (Z3) -> C -> the system C compiler.
 //
-// usage: bastioc1 [--check] [--emit-c] [--target T] [--header F] [-o out] <file.bastio>...
+// usage: bastioc1 [--check] [--emit-c] [--target T] [--lib DIR] [--header F] [-o out] <file.bastio>...
 //   (default)   verify, then build a native executable `out` (default: a.out)
 //               with the C compiler `$CC` (default: cc)
 //   --check     stop after verification
@@ -13,6 +13,8 @@
 //   --target    `hosted` (default): a normal program on the C library
 //               `kernel`: freestanding C for a bare-metal x86-64 kernel (implies --emit-c)
 //               `user`: freestanding C for a user program under BastiOS (implies --emit-c)
+//   --lib DIR   also look for imported files in DIR (see `resolve` in
+//               loader.bastio); may be given more than once
 //   --header F  also write a C header for the program's `export fn`s to F
 //   --trusted-base  list and count the hand-written trusted base, then exit
 // Several input files form one program, as for bastioc0.
@@ -201,6 +203,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
   let mut has_hdr = false;
   let mut listed = false;
   let mut inputs = vec_new[Bytes]();
+  let mut ld = loader_new();
   let mut status = 0;
   let mut i = 1;
   while i < host_argc(host) && status == 0 {
@@ -251,6 +254,10 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
       bfree(hdr);
       hdr = host_arg(host, i);
       has_hdr = true;
+    } else if b1_is(a, "--lib") {
+      bfree(a);
+      i = cg_add(i, 1);
+      loader_lib(&mut ld, host_arg(host, i));
     } else if b1_is(a, "-o") {
       bfree(a);
       i = cg_add(i, 1);
@@ -269,6 +276,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
     i = cg_add(i, 1);
   }
   if listed {
+    loader_free(ld);
     vec_free(out);
     drop_argv(inputs);
     bfree(outp);
@@ -276,7 +284,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
     return 0;
   }
   if status == 0 && vec_len(inputs) == 0 {
-    out_str(&mut out, "usage: bastioc1 [--check] [--emit-c] [--target hosted|kernel|user] [--header F] [-o out] <file.bastio>...\n");
+    out_str(&mut out, "usage: bastioc1 [--check] [--emit-c] [--target hosted|kernel|user] [--lib DIR] [--header F] [-o out] <file.bastio>...\n");
     status = 2;
   }
   // The inputs, as one string for messages.
@@ -292,7 +300,6 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
     k = k + 1;
   }
   let mut p = parser_new(balloc(0), vec_new[Tok](), 0);
-  let mut ld = loader_new();
   let none = vec_new[u64]();
   k = 0;
   while status == 0 && k < vec_len(inputs) {
