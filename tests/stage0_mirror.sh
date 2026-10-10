@@ -5,13 +5,15 @@
 # catches a mirror that behaves differently on the corpus; this catches the
 # mirror nobody wrote, including for behaviour the corpus does not reach.
 #
-# A change that has no stage1 counterpart (a stage0-only bug in code stage1
-# does not share, a comment, a bootstrap fix) says so with a line
+# A change that has no stage1 counterpart (comments or formatting, a
+# bootstrap fix, the native backend, whose stage1 version deliberately
+# differs) says so with a line
 #
 #   Stage0-only: <why>
 #
-# in one of the branch's commit messages. The reason is for reviewers; the
-# guard only checks that it is there.
+# in one of the branch's commit messages (any case). Bug fixes and builtin
+# rows are not exempt: difftest compares what they change. The reason is for
+# reviewers; the guard only checks that it is there.
 #
 # usage: tests/stage0_mirror.sh [BASE]
 #   Compares HEAD with its merge base with BASE (default: origin/main).
@@ -61,9 +63,9 @@ if [ ${#missing[@]} -eq 0 ]; then
   echo "stage0_mirror: every stage0 change has a stage1 counterpart"
   exit 0
 fi
-if git log --format=%B "$from..HEAD" | grep -q '^Stage0-only: *[^ ]'; then
+if git log --format=%B "$from..HEAD" | grep -qi '^Stage0-only: *[^ ]'; then
   echo "stage0_mirror: stage0-only change, as a commit message says:"
-  git log --format=%B "$from..HEAD" | grep '^Stage0-only:' | sed 's/^/  /'
+  git log --format=%B "$from..HEAD" | grep -i '^Stage0-only:' | sed 's/^/  /'
   printf '  unmirrored: %s\n' "${missing[@]}"
   exit 0
 fi
