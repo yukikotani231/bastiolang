@@ -58,6 +58,7 @@ module.exports = grammar({
 
     function_definition: ($) =>
       seq(
+        optional('export'),
         'fn',
         field('name', $.identifier),
         optional(field('type_parameters', $.type_parameters)),

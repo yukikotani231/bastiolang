@@ -54,6 +54,9 @@ pub fn monomorphize(p: &mut Program) -> Result<(), Diag> {
         if f.name == "main" {
             return Err(Diag::new("E-TYPE", f.pos, "`main` cannot be generic"));
         }
+        if f.export {
+            return Err(Diag::new("E-TYPE", f.pos, "an `export fn` cannot be generic (C has no generics)"));
+        }
         m.fns.insert(f.name.clone(), f.clone());
     }
     p.structs.retain(|d| d.tparams.is_empty());

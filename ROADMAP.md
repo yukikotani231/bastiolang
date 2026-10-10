@@ -56,7 +56,9 @@ What the compiler needs in order to be written in Bastio. Structs come first (re
   - [x] Lexer (`stage1/lexer.bastio`, done 2026-10-10): the same tokens and lexical errors as stage0 on every source in this repository and in BastiOS (`stage1/difftest.sh`, run in CI)
   - [x] Parser (`stage1/parser.bastio`, done 2026-10-10): the same syntax tree as stage0 (`--dump-ast`) on every source, and the same first-error position on damaged copies of them (`stage1/mutate.py`)
   - [x] Checker (`stage1/loader.bastio`, `mono.bastio`, `check.bastio`, done 2026-10-10): imports, monomorphization, types and linearity, with the same result as stage0 (`--dump-mono`, `--dump-check`, including the type of every `let`) on every source and on damaged copies, library files included
-  - [ ] Verifier (talks to Z3 through a `Child`)
+  - [ ] Verifier
+    - [x] Queries (`stage1/verify.bastio`, done 2026-10-10): symbolic execution produces the same SMT-LIB commands as stage0, character for character, and the same number of proof obligations (`--dump-smt`), on every program stage0 verifies (the BastiOS kernel included) and on damaged copies that still verify. Every proof is assumed to succeed for now. Generating all 273,000 commands for stage1's largest program takes 0.7 s; stage0 takes 3.6 s on it, nearly all of it Z3
+    - [ ] Asking Z3 through a `Child`, with stage0's errors and counterexamples
   - [ ] C code generation
 - [ ] bastioc1 compiles itself and reaches a fixed point (gen2 == gen1)
 - [ ] stage0 is frozen
@@ -86,8 +88,8 @@ Started early, alongside v1, because the kernel is the primary target and it sha
 ## C boundary
 
 What the "safe libraries callable from C" target needs (Scope, design consequence 2).
-- [x] A first demo: `examples/base64`, a strict base64 codec proved memory safe and called from a C harness, with a differential fuzz against a C decoder and a benchmark (done 2026-10-10). It goes through a hand-written wrapper, `base64_capi.c`, because stage0 cannot export a function yet
-- [ ] `export fn`: a non-static C symbol with a generated header, no `main` required for a library, and the precondition of an exported function either ruled out or checked in a generated wrapper (a C caller cannot be proved to meet it). This touches the lexer and parser, so stage1 must learn it at the same time
+- [x] A first demo: `examples/base64`, a strict base64 codec proved memory safe and called from a C harness, with a differential fuzz against a C decoder and a benchmark (done 2026-10-10). It first went through a hand-written wrapper, `base64_capi.c`; `export fn` replaced it
+- [x] `export fn` (done 2026-10-10): a non-static C symbol with a generated header (`--header`), no `main` required for a library. Preconditions are ruled out (`E-EXPORT`): a C caller cannot be proved to meet one, so the function checks the condition itself and returns an error, which keeps generated code free of checks. Integers, `bool` and `&Bytes` (a pointer and a length) go in; numbers, `Bytes` and structs and enums of those come out. What the proofs assume of the C caller is listed by `--trusted-base`. stage1 parses and checks it too. `examples/base64` no longer needs its hand-written wrapper
 - [ ] Caller-provided output buffers (`&mut Bytes` lent from C), so a library need not allocate; needs a guarantee that the callee does not replace the buffer
 
 ## v4: Linux compatibility

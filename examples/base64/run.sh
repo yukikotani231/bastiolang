@@ -9,13 +9,17 @@ BASTIOC=${BASTIOC:-$here/../../stage0/target/release/bastioc0}
 CC=${CC:-cc}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-"$BASTIOC" --emit-c -o "$tmp/base64.gen.c" "$here/lib.bastio"
-cflags=(-std=c11 -Wall -Wno-unused-function -I"$tmp" -I"$here")
+"$BASTIOC" --emit-c --header "$tmp/base64.h" -o "$tmp/base64.c" "$here/lib.bastio"
+# The generated C is compiled with -w: its prelude defines helpers this
+# library does not use. The harness gets -Wall.
+build() {  # C compiler flags...
+  "$CC" -std=c11 "$@" -w -c -o "$tmp/base64.o" "$tmp/base64.c"
+  "$CC" -std=c11 "$@" -Wall -I"$tmp" -o "$tmp/test" "$here/test.c" "$tmp/base64.o"
+}
 if [ "${1:-}" = bench ]; then
-  "$CC" "${cflags[@]}" -O2 -o "$tmp/test" "$here/test.c" "$here/base64_capi.c"
+  build -O2
   "$tmp/test" bench
   exit
 fi
-"$CC" "${cflags[@]}" -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
-  -o "$tmp/test" "$here/test.c" "$here/base64_capi.c"
+build -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all
 "$tmp/test" "$@"

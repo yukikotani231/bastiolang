@@ -109,7 +109,11 @@ impl Parser {
                 Tok::Enum => enums.push(self.enum_def()?),
                 Tok::Const => self.const_def()?,
                 Tok::Import => return Err(Diag::new("E-PARSE", self.pos(), "`import` lines must come first in a file, before any definition")),
-                _ => fns.push(self.fn_def()?),
+                Tok::Export => {
+                    self.bump();
+                    fns.push(self.fn_def(true)?)
+                }
+                _ => fns.push(self.fn_def(false)?),
             }
         }
         Ok(Program { fns, specs, structs, enums })
@@ -378,7 +382,7 @@ impl Parser {
         Ok(params)
     }
 
-    fn fn_def(&mut self) -> PResult<FnDef> {
+    fn fn_def(&mut self, export: bool) -> PResult<FnDef> {
         let pos = self.expect(Tok::Fn, "`fn`")?.pos;
         let (name, _) = self.ident()?;
         let tparams = self.tparams()?;
@@ -396,7 +400,7 @@ impl Parser {
             }
         }
         let body = self.block()?;
-        Ok(FnDef { name, tparams, params, ret, requires, ensures, body, pos, int_ops: Default::default() })
+        Ok(FnDef { name, tparams, params, ret, requires, ensures, body, pos, int_ops: Default::default(), export })
     }
 
     fn block(&mut self) -> PResult<Vec<Stmt>> {
