@@ -18,6 +18,10 @@
 //               `error file:line:col CODE` and exits 1
 //   --dump-check  the same after type and linearity checking (so `let`
 //               types are filled in); an error prints `error file:line:col CODE`
+//   --dump-verify  verify, then print `N proof obligation(s)`; an error
+//               prints `error file:line:col CODE`, and a verification error
+//               also its notes (`  = counterexample: ...`), without the
+//               message; exits 1
 //   --header F  also write a C header for the program's `export fn`s to F
 //               (a program with an `export fn` is a library and needs no
 //               `main`; build it with --emit-c and link it into a C program)
@@ -124,6 +128,7 @@ fn main() {
     let mut dump_ast = false;
     let mut dump_mono = false;
     let mut dump_check = false;
+    let mut dump_verify = false;
     let mut target = codegen::Target::Hosted;
     let mut out: Option<String> = None;
     let mut header: Option<String> = None;
@@ -138,6 +143,7 @@ fn main() {
             "--dump-ast" => dump_ast = true,
             "--dump-mono" => dump_mono = true,
             "--dump-check" => dump_check = true,
+            "--dump-verify" => dump_verify = true,
             "--trusted-base" => {
                 print!("{}", codegen::trusted_base());
                 return;
@@ -231,7 +237,7 @@ fn main() {
     for input in &inputs {
         if let Err(d) = ld.load(Path::new(input), None) {
             match d {
-                Some(d) if dump_mono || dump_check => short(&d),
+                Some(d) if dump_mono || dump_check || dump_verify => short(&d),
                 Some(d) => eprint!("{}", d.render(&ld.files)),
                 None => {}
             }
@@ -250,7 +256,7 @@ fn main() {
     }
 
     let fail = |d: diag::Diag| -> ! {
-        if dump_check {
+        if dump_check || dump_verify {
             short(&d);
         } else {
             eprint!("{}", d.render(&files));
@@ -268,7 +274,20 @@ fn main() {
         print!("{}", dump::program(&prog));
         return;
     }
-    let (n, log) = verify::verify_program(&prog).unwrap_or_else(|d| fail(d));
+    let (n, log) = verify::verify_program(&prog).unwrap_or_else(|d| {
+        if dump_verify {
+            short(&d);
+            for n in &d.notes {
+                println!("  = {}", n);
+            }
+            exit(1);
+        }
+        fail(d)
+    });
+    if dump_verify {
+        println!("{} proof obligation(s)", n);
+        return;
+    }
     if dump_smt {
         for l in &log {
             println!("{}", l);

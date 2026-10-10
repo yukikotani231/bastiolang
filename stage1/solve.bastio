@@ -1,0 +1,488 @@
+// Asks Z3 to discharge the proof obligations `verify.bastio` recorded, and
+// reports the first one that fails as stage0 does: its error code and
+// position, a counterexample (the values of the variables in scope), and
+// a note when the function is a copy of a generic one.
+//
+// The solver runs as a child process (`z3 -in -smt2`) and sees exactly the
+// commands stage0 sends it: the log, one command per line, read after each
+// `(check-sat)`; then, after a failed proof, one `(get-value ..)` per value
+// shown.
+import "verify.bastio";
+
+/// A value shown in a counterexample: its label (lchars[s .. s + n]) and
+/// its term.
+struct Lab { s: u64, n: u64, tm: u64 }
+
+fn push_arg(argv: &mut Vec[Bytes], s: Str) {
+  vec_push(&mut argv, bfrom(s));
+}
+
+fn drop_argv(argv: Vec[Bytes]) {
+  let mut w = argv;
+  while vec_len(w) > 0 {
+    bfree(vec_pop(&mut w));
+  }
+  vec_free(w);
+}
+
+/// Writes the text in `out` to the solver and empties it.
+fn z3_send(z: &mut Child, out: &mut Vec[u64]) -> bool {
+  let n = vec_len(out);
+  let mut b = balloc(n);
+  let mut k = 0;
+  while k < n && k < blen(b) {
+    let ch = u_at(out, k);
+    if ch <= 255 {
+      bset(&mut b, k, ch);
+    }
+    k = k + 1;
+  }
+  let ok = child_write(&mut z, b);
+  bfree(b);
+  while vec_len(out) > 0 {
+    vec_pop(&mut out);
+  }
+  return ok;
+}
+
+/// Reads one complete response into `resp`: a bare word or a balanced
+/// s-expression, possibly over several lines. False if the solver stopped.
+fn z3_read(z: &mut Child, resp: &mut Vec[u64]) -> bool {
+  while vec_len(resp) > 0 {
+    vec_pop(&mut resp);
+  }
+  let mut line = balloc(0);
+  let mut open = 0;
+  let mut close = 0;
+  let mut ok = true;
+  let mut done = false;
+  while !done {
+    if !child_read_line(&mut z, &mut line) {
+      ok = false;
+      done = true;
+    } else {
+      let mut k = 0;
+      while k < blen(line) {
+        let ch = bget(line, k);
+        if ch == 40 && open < U64_MAX { open = open + 1; }
+        if ch == 41 && close < U64_MAX { close = close + 1; }
+        vec_push(&mut resp, ch);
+        k = k + 1;
+      }
+      vec_push(&mut resp, 10);
+      let r = trim(resp);
+      done = close >= open && r.e > r.s;
+    }
+  }
+  bfree(line);
+  return ok;
+}
+
+/// A range s..e of a text.
+struct Rng { s: u64, e: u64 }
+
+/// The text without leading and trailing white space.
+fn trim(t: &Vec[u64]) -> Rng {
+  let mut s = 0;
+  let mut e = vec_len(t);
+  while s < e && is_space(u_at(t, s)) {
+    s = s + 1;
+  }
+  while e > s && is_space(u_at(t, e - 1)) {
+    e = e - 1;
+  }
+  return Rng { s: s, e: e };
+}
+
+/// Is t[r] the text `w`?
+fn is_text(t: &Vec[u64], r: Rng, w: Str) -> bool {
+  if r.e < r.s || r.e - r.s != slen(w) {
+    return false;
+  }
+  let mut k = 0;
+  while k < slen(w)
+    invariant k <= slen(w)
+  {
+    if u_at(t, vadd(r.s, k)) != sget(w, k) {
+      return false;
+    }
+    k = k + 1;
+  }
+  return true;
+}
+
+/// Does t[r] start with `w`?
+fn starts_text(t: &Vec[u64], r: Rng, w: Str) -> bool {
+  if r.e < r.s || r.e - r.s < slen(w) {
+    return false;
+  }
+  return is_text(t, Rng { s: r.s, e: vadd(r.s, slen(w)) }, w);
+}
+
+/// Does t[r] end with `w`?
+fn ends_text(t: &Vec[u64], r: Rng, w: Str) -> bool {
+  if r.e < r.s || r.e - r.s < slen(w) {
+    return false;
+  }
+  return is_text(t, Rng { s: r.e - slen(w), e: r.e }, w);
+}
+
+fn out_rng(out: &mut Vec[u64], t: &Vec[u64], r: Rng) {
+  let mut k = r.s;
+  while k < r.e {
+    vec_push(&mut out, u_at(t, k));
+    k = k + 1;
+  }
+}
+
+/// Appends the value in a `(get-value ..)` response as stage0 shows it:
+/// the last s-expression or atom inside `((term value))`, with `(- 3)`
+/// written `-3`.
+fn out_value(out: &mut Vec[u64], resp: &Vec[u64]) {
+  let mut r = trim(resp);
+  if r.s <= r.e && r.e - r.s >= 4 && starts_text(resp, r, "((") && ends_text(resp, r, "))") {
+    r = Rng { s: r.s + 2, e: r.e - 2 };
+    while r.e > r.s && is_space(u_at(resp, r.e - 1)) {
+      r = Rng { s: r.s, e: r.e - 1 };
+    }
+  }
+  // the last balanced s-expression, or the last atom
+  let mut s = r.s;
+  if r.e > r.s && u_at(resp, r.e - 1) == 41 {
+    let mut depth = 0;
+    let mut k = r.e;
+    let mut found = false;
+    while k > r.s && !found {
+      k = k - 1;
+      let ch = u_at(resp, k);
+      if ch == 41 {
+        depth = vadd(depth, 1);
+      } else if ch == 40 {
+        if depth > 0 {
+          depth = depth - 1;
+        }
+        if depth == 0 {
+          s = k;
+          found = true;
+        }
+      }
+    }
+  } else {
+    let mut k = r.e;
+    while k > r.s && !is_space(u_at(resp, k - 1)) {
+      k = k - 1;
+    }
+    s = k;
+  }
+  let mut x = trim_rng(resp, Rng { s: s, e: r.e });
+  if starts_text(resp, x, "(- ") {
+    vec_push(&mut out, 45);
+    let mut e = x.e;
+    while e > vadd(x.s, 3) && u_at(resp, e - 1) == 41 {
+      e = e - 1;
+    }
+    out_rng(&mut out, resp, Rng { s: vadd(x.s, 3), e: e });
+    return;
+  }
+  out_rng(&mut out, resp, x);
+}
+
+fn trim_rng(t: &Vec[u64], r: Rng) -> Rng {
+  let mut s = r.s;
+  let mut e = r.e;
+  while s < e && is_space(u_at(t, s)) {
+    s = s + 1;
+  }
+  while e > s && is_space(u_at(t, e - 1)) {
+    e = e - 1;
+  }
+  return Rng { s: s, e: e };
+}
+
+// ---- Counterexamples ----
+
+/// Is variable a (source text) before variable b, in byte order?
+fn name_less(p: &Parser, a: Bind, b: Bind) -> bool {
+  let mut i = a.s;
+  let mut j = b.s;
+  while i < a.e && j < b.e {
+    let x = src_at(p, i);
+    let y = src_at(p, j);
+    if x != y {
+      return x < y;
+    }
+    i = i + 1;
+    j = j + 1;
+  }
+  return i >= a.e && j < b.e;
+}
+
+fn src_at(p: &Parser, i: u64) -> u64 {
+  if i < blen(p.src) {
+    return bget(p.src, i);
+  }
+  return 0;
+}
+
+fn out_src(out: &mut Vec[u64], p: &Parser, s: u64, e: u64) {
+  let mut k = s;
+  while k < e {
+    vec_push(&mut out, src_at(p, k));
+    k = k + 1;
+  }
+}
+
+fn add_lab(labs: &mut Vec[Lab], chars: &mut Vec[u64], pre: Str, name: &Vec[u64], post: Str, tm: u64) {
+  let s = vec_len(chars);
+  out_str(&mut chars, pre);
+  let mut k = 0;
+  while k < vec_len(name) {
+    vec_push(&mut chars, u_at(name, k));
+    k = k + 1;
+  }
+  out_str(&mut chars, post);
+  let n = vec_len(chars);
+  if n >= s {
+    vec_push(&mut labs, Lab { s: s, n: n - s, tm: tm });
+  }
+}
+
+/// The accessor that shows ghost field j of an object of type kind k
+/// ("" for the array fields, which are not shown).
+fn ghost_acc(k: u64, j: u64) -> Str {
+  if k == TY_FRAME && j == 0 { return "frame_id"; }
+  if k == TY_PT && j == 0 { return "pt_id"; }
+  if k == TY_PT && j == 1 { return "pt_level"; }
+  if k == TY_POOL && j == 1 { return "pool_size"; }
+  if k == TY_MMU && j == 0 { return "mmu_root"; }
+  if (k == TY_PORTIO || k == TY_MMIO) && j == 0 {
+    if k == TY_PORTIO { return "port_base"; }
+    return "mmio_base";
+  }
+  if k == TY_PORTIO && j == 1 { return "port_count"; }
+  if k == TY_MMIO && j == 1 { return "mmio_len"; }
+  return "";
+}
+
+fn trunc(t: &mut Vec[u64], n: u64) {
+  while vec_len(t) > n {
+    vec_pop(&mut t);
+  }
+}
+
+/// The values shown for variable (or place) `name` holding value x.
+fn show(v: &Vr, m: &Mono, p: &Parser, name: &mut Vec[u64], x: u64, labs: &mut Vec[Lab], chars: &mut Vec[u64]) {
+  let xv = vl_at(v, x);
+  let k = xv.kind;
+  if k == VV_U || k == VV_B {
+    add_lab(&mut labs, &mut chars, "", name, "", xv.a);
+  } else if k == VV_BUF {
+    add_lab(&mut labs, &mut chars, "len(", name, ")", xv.a);
+  } else if k == VV_STR {
+    add_lab(&mut labs, &mut chars, "slen(", name, ")", xv.a);
+  } else if k == VV_VEC {
+    add_lab(&mut labs, &mut chars, "vlen(", name, ")", xv.a);
+  } else if k == VV_OBJ {
+    let tk = kind_t(m, xv.ty);
+    let mut j = 0;
+    while j < xv.n && j < 3 {
+      let acc = ghost_acc(tk, j);
+      if slen(acc) > 0 {
+        let s = vec_len(chars);
+        out_str(&mut chars, acc);
+        out_str(&mut chars, "(");
+        let mut q = 0;
+        while q < vec_len(name) {
+          vec_push(&mut chars, u_at(name, q));
+          q = q + 1;
+        }
+        out_str(&mut chars, ")");
+        let n = vec_len(chars);
+        if n >= s {
+          vec_push(&mut labs, Lab { s: s, n: n - s, tm: obj_field(v, x, j) });
+        }
+      }
+      j = j + 1;
+    }
+  } else if k == VV_STRUCT || k == VV_ENUM {
+    if k == VV_ENUM {
+      add_lab(&mut labs, &mut chars, "tag(", name, ")", xv.a);
+    }
+    let base = vec_len(name);
+    let mut j = 0;
+    while j < xv.n {
+      let fd = part_node(m, p, xv.ty, j);
+      out_str(&mut name, ".");
+      out_src(&mut name, p, fd.s, fd.e);
+      show(v, m, p, &mut name, kid(v, x, j), &mut labs, &mut chars);
+      trunc(&mut name, base);
+      j = j + 1;
+    }
+  } else if k == VV_BOXK {
+    show(v, m, p, &mut name, xv.a, &mut labs, &mut chars);
+  }
+}
+
+/// The labels and terms of obligation o's counterexample, in stage0's order:
+/// variables sorted by name, each shown in full.
+fn cex_labels(v: &Vr, m: &Mono, p: &Parser, o: Obl, labs: &mut Vec[Lab], chars: &mut Vec[u64]) {
+  let mut bs = vec_new[Bind]();
+  let mut k = 0;
+  while k < o.n {
+    vec_push(&mut bs, bind_at(v.snaps, vadd(o.env, k)));
+    k = k + 1;
+  }
+  // insertion sort by name
+  k = 1;
+  while k < vec_len(bs) {
+    let mut j = k;
+    while j > 0 && j < vec_len(bs) {
+      let a = bind_at(bs, j - 1);
+      let b = bind_at(bs, j);
+      if name_less(p, b, a) {
+        vec_set(&mut bs, j - 1, b);
+        vec_set(&mut bs, j, a);
+        j = j - 1;
+      } else {
+        j = 0;
+      }
+    }
+    k = k + 1;
+  }
+  k = 0;
+  while k < vec_len(bs) {
+    let b = bind_at(bs, k);
+    let mut name = vec_new[u64]();
+    out_src(&mut name, p, b.s, b.e);
+    show(v, m, p, &mut name, b.val, &mut labs, &mut chars);
+    vec_free(name);
+    k = k + 1;
+  }
+  vec_free(bs);
+}
+
+fn obl_at(v: &Vr, k: u64) -> Obl {
+  if k < vec_len(v.obls) {
+    return vec_get(v.obls, k);
+  }
+  return Obl { at: 0, code: 0, x: 0, env: 0, n: 0 };
+}
+
+fn lab_at(xs: &Vec[Lab], k: u64) -> Lab {
+  if k < vec_len(xs) {
+    return vec_get(xs, k);
+  }
+  return Lab { s: 0, n: 0, tm: 0 };
+}
+
+/// `error F:L:C ` for node `loc`.
+fn out_error(out: &mut Vec[u64], p: &Parser, loc: u64) {
+  let n = node_at(p.nodes, loc);
+  out_str(&mut out, "error ");
+  out_num(&mut out, n.file);
+  out_str(&mut out, ":");
+  out_num(&mut out, n.line);
+  out_str(&mut out, ":");
+  out_num(&mut out, n.col);
+  out_str(&mut out, " ");
+}
+
+/// Runs the solver over the recorded log. True if every obligation holds;
+/// otherwise `rep` gets the report of the first that fails.
+fn solve(v: &mut Vr, m: &Mono, p: &Parser, h: &Host, rep: &mut Vec[u64]) -> bool {
+  let mut argv = vec_new[Bytes]();
+  push_arg(&mut argv, "z3");
+  push_arg(&mut argv, "-in");
+  push_arg(&mut argv, "-smt2");
+  let mut z = host_spawn(h, argv);
+  drop_argv(argv);
+  let mut out = vec_new[u64]();
+  let mut resp = vec_new[u64]();
+  out_header(&mut out);
+  let mut ok = true;
+  let mut ob = 0;
+  let mut k = 0;
+  while k < vec_len(v.log) && ok {
+    let cmd = vec_get(v.log, k);
+    out_cmd(&mut out, v, cmd);
+    if cmd.kind == CMD_CHECK {
+      let o = obl_at(v, ob);
+      z3_send(&mut z, &mut out);
+      let alive = z3_read(&mut z, &mut resp);
+      let r = trim(resp);
+      if !alive || starts_text(resp, r, "(error") {
+        out_error(&mut rep, p, o.at);
+        out_str(&mut rep, "E-SOLVER\n");
+        ok = false;
+      } else if !is_text(resp, r, "unsat") {
+        out_error(&mut rep, p, o.at);
+        out_str(&mut rep, vc_name(o.code));
+        out_str(&mut rep, "\n");
+        if is_text(resp, r, "sat") {
+          report_cex(&mut v, m, p, &mut z, o, &mut rep);
+        } else {
+          out_str(&mut rep, "  = the solver gave up (timeout or quantifiers); add an `assert` or a stronger invariant as a hint\n");
+        }
+        // A copy of a generic function says which.
+        let nm = inst_name(&mut v, m, p, o.x);
+        let t = tm_at(v, nm);
+        let mut generic = false;
+        let mut q = 0;
+        while q < t.b {
+          if pool_at(v, vadd(t.a, q)) == 91 {
+            generic = true;
+          }
+          q = q + 1;
+        }
+        if generic {
+          out_str(&mut rep, "  = in `");
+          out_tm(&mut rep, v, nm);
+          out_str(&mut rep, "`, the copy of a generic function for these type arguments\n");
+        }
+        ok = false;
+      }
+      ob = vadd(ob, 1);
+    }
+    k = k + 1;
+  }
+  vec_free(out);
+  vec_free(resp);
+  child_close(&mut z);
+  child_wait(z);
+  return ok;
+}
+
+/// After a `sat`: asks for the value of each term shown and appends
+/// `  = counterexample: a = 1, len(b) = 0` (nothing if no value is shown).
+fn report_cex(v: &mut Vr, m: &Mono, p: &Parser, z: &mut Child, o: Obl, rep: &mut Vec[u64]) {
+  let mut labs = vec_new[Lab]();
+  let mut chars = vec_new[u64]();
+  cex_labels(v, m, p, o, &mut labs, &mut chars);
+  let mut out = vec_new[u64]();
+  let mut resp = vec_new[u64]();
+  let mut k = 0;
+  while k < vec_len(labs) {
+    let l = lab_at(labs, k);
+    out_str(&mut out, "(get-value (");
+    out_tm(&mut out, v, l.tm);
+    out_str(&mut out, "))\n");
+    z3_send(&mut z, &mut out);
+    z3_read(&mut z, &mut resp);
+    if k == 0 {
+      out_str(&mut rep, "  = counterexample: ");
+    } else {
+      out_str(&mut rep, ", ");
+    }
+    out_rng(&mut rep, chars, Rng { s: l.s, e: vadd(l.s, l.n) });
+    out_str(&mut rep, " = ");
+    out_value(&mut rep, resp);
+    k = k + 1;
+  }
+  if vec_len(labs) > 0 {
+    out_str(&mut rep, "\n");
+  }
+  vec_free(labs);
+  vec_free(chars);
+  vec_free(out);
+  vec_free(resp);
+}

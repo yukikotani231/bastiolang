@@ -9,14 +9,16 @@
 # Mutants that are not valid UTF-8 are skipped: stage0 cannot even read
 # them. Deterministic: the seed and the number of mutants per file are
 # arguments.
-#   usage: mutate.py [--via DRIVER] [--smt] BASTIOC FLAG TOOL SEED PER_FILE FILE...
+#   usage: mutate.py [--via DRIVER] [--smt | --verify] BASTIOC FLAG TOOL SEED PER_FILE FILE...
 # With --via, each mutant temporarily replaces its original file (restored
 # afterwards) and both compilers run on DRIVER, a program that imports it:
 # that is how library files without a `main` reach the checker.
 # FLAG and TOOL may hold several words (`--dump-check --target kernel`).
 # With --smt (for the verifier: FLAG is `--check --dump-smt ..`), only the
 # mutants stage0 verifies are compared, and stage0's count of proof
-# obligations (on stderr) is part of what must match.
+# obligations (on stderr) is part of what must match. With --verify (FLAG is
+# `--dump-verify ..`), only the mutants that reach the verifier are compared:
+# those stage0 verifies, and those it rejects with a failed proof.
 import os, random, re, subprocess, sys
 
 args = sys.argv[1:]
@@ -24,7 +26,8 @@ via = None
 if args[0] == '--via':
     via, args = args[1], args[2:]
 smt = args[0] == '--smt'
-if smt:
+verify = args[0] == '--verify'
+if smt or verify:
     args = args[1:]
 bastioc, flag, tool, seed, per_file = args[0], args[1], args[2], int(args[3]), int(args[4])
 random.seed(seed)
@@ -82,6 +85,9 @@ for f in args[5:]:
                     unverified += 1
                     continue
                 want += n.group(1) + b' proof obligation(s)\n'
+            if verify and not re.search(rb'proof obligation|^error \S+ E-(VERIFY|SOLVER)', want, re.M):
+                unverified += 1
+                continue
             got = subprocess.run(tool.split() + [target], capture_output=True).stdout
         finally:
             if via:
@@ -101,5 +107,7 @@ for f in args[5:]:
 tally = ''.join(', %d %s' % (n, c) for c, n in sorted(codes.items()))
 if smt:
     tally += ', %d not verified by stage0 (skipped)' % unverified
+if verify:
+    tally += ', %d not reaching the verifier (skipped)' % unverified
 print('-- %s%s mutants: %d run (%d of them errors%s), %d differ' % (flag, ' via ' + via if via else '', runs, errors, tally, differ))
 sys.exit(1 if differ else 0)

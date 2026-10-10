@@ -11,6 +11,10 @@
 #   verifier stage1/smtdump.bastio  vs  bastioc0 --check --dump-smt (every
 #           SMT command, and the number of proof obligations), on the
 #           programs stage0 verifies
+#   proofs  stage1/verifydump.bastio vs bastioc0 --dump-verify (both ask Z3:
+#           the number of proof obligations, or the first failed proof's
+#           code, position and counterexample), on the programs that reach
+#           the verifier
 # The parser, the monomorphizer and the checker are also compared on damaged
 # sources (stage1/mutate.py), so their error positions are checked too.
 set -u
@@ -18,7 +22,7 @@ cd "$(dirname "$0")/.."
 BASTIOC=${BASTIOC:-stage0/target/release/bastioc0}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-for tool in lexdump astdump monodump checkdump smtdump; do
+for tool in lexdump astdump monodump checkdump smtdump verifydump; do
   "$BASTIOC" -o "$tmp/$tool" "stage1/$tool.bastio" 2>"$tmp/build.err" || { cat "$tmp/build.err"; exit 1; }
 done
 files=$(find tests stage1 ../bastios/src ../bastios/user -name '*.bastio' 2>/dev/null | sort)
@@ -83,6 +87,26 @@ for f in $files; do
 done
 echo "-- verifier: $match matched, $differ differ ($skipped not verified by stage0)"
 { [ "$differ" = 0 ] && [ "$match" -gt 0 ]; } || status=1
+match=0 differ=0 skipped=0 failed=0
+for f in $files; do
+  t=$(target_of "$f")
+  "$BASTIOC" --dump-verify --target "$t" "$f" >"$tmp/want" 2>/dev/null
+  if ! grep -q -e 'proof obligation' -e '^error [^ ]* E-VERIFY' -e '^error [^ ]* E-SOLVER' "$tmp/want"; then
+    skipped=$((skipped+1))
+    continue
+  fi
+  grep -q '^error' "$tmp/want" && failed=$((failed+1))
+  "$tmp/verifydump" "$t" "$f" >"$tmp/got" 2>/dev/null
+  if cmp -s "$tmp/want" "$tmp/got"; then
+    match=$((match+1))
+  else
+    differ=$((differ+1))
+    echo "DIFFER $f ($t)"
+    diff "$tmp/want" "$tmp/got" | head -5 | cut -c1-300 | sed 's/^/    /'
+  fi
+done
+echo "-- proofs: $match matched ($failed of them failed proofs), $differ differ ($skipped not reaching the verifier)"
+{ [ "$differ" = 0 ] && [ "$match" -gt 0 ]; } || status=1
 python3 stage1/mutate.py "$BASTIOC" --dump-ast "$tmp/astdump" 1 ${MUTANTS:-5} $files || status=1
 python3 stage1/mutate.py "$BASTIOC" --dump-mono "$tmp/monodump" 2 ${MUTANTS:-5} $files || status=1
 for t in hosted kernel user; do
@@ -100,4 +124,7 @@ if [ -f ../bastios/src/main.bastio ]; then
 fi
 # The verifier, on the mutants that still verify (most do not).
 python3 stage1/mutate.py --smt "$BASTIOC" "--check --dump-smt" "$tmp/smtdump" 6 $((${MUTANTS:-5} * 4)) tests/pass/*.bastio || status=1
+# Proofs, on the mutants that reach the verifier: most of those fail a proof.
+python3 stage1/mutate.py --verify "$BASTIOC" "--dump-verify" "$tmp/verifydump" 7 $((${MUTANTS:-5} * 2)) \
+  tests/pass/*.bastio tests/fail/*.bastio stage1/verifycases/*.bastio || status=1
 exit $status

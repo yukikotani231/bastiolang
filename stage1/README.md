@@ -10,7 +10,8 @@ in the repository (`difftest.sh`, run in CI):
 | Parser | `parser.bastio` | `bastioc0 --dump-ast` (`astdump.bastio`), on every source and on damaged copies (`mutate.py`), so error positions are compared too |
 | Loader and monomorphizer | `loader.bastio`, `mono.bastio` | `bastioc0 --dump-mono` (`monodump.bastio`): the whole program with imports followed, after monomorphization; also on damaged copies |
 | Checker (types and linearity) | `check.bastio` | `bastioc0 --dump-check` (`checkdump.bastio`, with the target BastiOS sources need): the same program with every `let` given its type, or the same first error and error code; also on damaged copies, library files through a program that imports them (`mutate.py --via`) |
-| Verifier (queries) | `verify.bastio` | `bastioc0 --check --dump-smt` (`smtdump.bastio`): every SMT command and the number of proof obligations, on every program stage0 verifies and on damaged copies that still verify (`mutate.py --smt`). The solver is not run yet: every proof is assumed to succeed |
+| Verifier (queries) | `verify.bastio` | `bastioc0 --check --dump-smt` (`smtdump.bastio`): every SMT command and the number of proof obligations, on every program stage0 verifies and on damaged copies that still verify (`mutate.py --smt`) |
+| Verifier (proofs) | `solve.bastio` | `bastioc0 --dump-verify` (`verifydump.bastio`): both run Z3; the number of proof obligations, or the first failed proof's code, position, counterexample and notes, on every program that reaches the verifier and on damaged copies (`mutate.py --verify`) |
 
 The syntax tree is an arena: one `Vec[Node]` of plain values, children
 as indices, lists chained through `next`. All files of a program share one
@@ -29,6 +30,13 @@ live in an arena and are shared rather than copied; two terms are equal
 when they print the same (`tm_eq`), which is what stage0's string
 comparisons decide. Values (`Vl`) are immutable, so a state is cheap to
 copy at a branch: its path condition and its variables' value ids.
+
+Nothing the verifier does depends on the solver's answers, so it runs to
+the end first, recording each obligation with what a failure would report
+(its node, error code and the variables in scope). `solve.bastio` then
+feeds the log to Z3, reading an answer after each `(check-sat)`, and at
+the first failed proof asks for the counterexample's values, as stage0
+does at that point.
 
 `print.bastio` prints the tree for both dumps, and `out.bastio` holds the
 output helpers the drivers share.
