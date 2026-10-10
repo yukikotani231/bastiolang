@@ -52,6 +52,7 @@ use crate::check::is_builtin;
 use crate::diag::{Diag, Pos};
 use crate::smt::{SatResult, Solver};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const U64_MAX: &str = "18446744073709551615";
 /// Largest element count `alloc` accepts (2^60): keeps `n * 8` far from overflow.
@@ -401,7 +402,7 @@ pub struct Verifier<'p> {
     /// The integer type of each arithmetic operator in the function being
     /// verified (`FnDef::int_ops`).
     int_ops: HashMap<Pos, Type>,
-    sums: Summaries,
+    sums: &'p Summaries,
 }
 
 fn sanitize(n: &str) -> String {
@@ -448,34 +449,120 @@ fn c_div(a: &str, b: &str) -> String {
     format!("(ite (= (>= {} 0) (>= {} 0)) {q} (- {q}))", a, b)
 }
 
+/// 2^k for a shift amount `k` already proved less than `w`.
+fn pow2(k: &str, w: u32) -> String {
+    let mut t = "1".to_string();
+    for i in (1..w).rev() {
+        t = format!("(ite (= {} {}) {} {})", k, i, 1u128 << i, t);
+    }
+    t
+}
+
 fn ite(c: &str, a: &str, b: &str) -> String {
     if a == b { a.to_string() } else { format!("(ite {} {} {})", c, a, b) }
 }
 
-pub fn verify_program(p: &Program) -> Result<(usize, Vec<String>), Diag> {
-    let solver = Solver::start().map_err(|e| Diag::new("E-SOLVER", Pos::default(), e))?;
-    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, sums: summarize(p), int_ops: HashMap::new() };
-    v.smt(&format!("(declare-const {} Int)", POOLSIZE))?;
-    v.smt(&format!("(assert (and (<= 0 {p}) (<= {p} {})))", FRAME_LIMIT, p = POOLSIZE))?;
+pub fn verify_program(p: &Program, one_session: bool) -> Result<(usize, Vec<String>), Diag> {
     // Each function gets its own solver scope: what is declared and assumed
     // while verifying one (some of it quantified, such as "every byte of a
     // Bytes is <= 255") must not burden the queries for all later ones.
-    // BASTIO_TIME=1 prints the time each function took.
-    let timed = std::env::var("BASTIO_TIME").is_ok();
-    for f in &p.fns {
-        let t0 = std::time::Instant::now();
-        if f.export {
-            buffers_kept(f, &v.sums)?;
-        }
-        v.smt("(push 1)")?;
-        v.verify_fn(f).map_err(|d| crate::check::in_copy(d, &f.name))?;
-        v.smt("(pop 1)")?;
-        if timed {
-            eprintln!("{:8.1} ms {}", t0.elapsed().as_secs_f64() * 1000.0, f.name);
+    // Because the scopes are independent, the functions are shared out
+    // among several solvers running at once (BASTIO_JOBS, default: the
+    // number of CPUs, at most 8). The error reported is the one sequential
+    // verification would report: that of the first failing function in
+    // program order. BASTIO_TIME=1 prints the time each function took.
+    // `one_session` (for --dump-smt, which stage1/difftest.sh compares with
+    // stage1's verifier) keeps everything on one solver, in program order.
+    let sums = summarize(p);
+    let n = p.fns.len();
+    let jobs = std::env::var("BASTIO_JOBS")
+        .ok()
+        .and_then(|j| j.parse::<usize>().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |c| c.get()).min(8))
+        .clamp(1, if one_session { 1 } else { n.max(1) });
+    let next = AtomicUsize::new(0);
+    // The lowest index of a function that failed so far: no worker starts
+    // a function after it, since its result could not be reported anyway.
+    let failed = AtomicUsize::new(usize::MAX);
+    let workers: Vec<Worker> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..jobs).map(|_| s.spawn(|| verify_worker(p, &sums, &next, &failed))).collect();
+        hs.into_iter().map(|h| h.join().expect("a verifier thread panicked")).collect()
+    });
+    let mut obligations = 0;
+    let mut log = Vec::new();
+    let mut times = Vec::new();
+    let mut err: Option<(usize, Diag)> = None;
+    for w in workers {
+        obligations += w.obligations;
+        log.extend(w.log);
+        times.extend(w.times);
+        if let Some((i, d)) = w.err {
+            if err.as_ref().map_or(true, |(j, _)| i < *j) {
+                err = Some((i, d));
+            }
         }
     }
-    let log = std::mem::take(&mut v.solver.log);
-    Ok((v.obligations, log))
+    if let Some((_, d)) = err {
+        return Err(d);
+    }
+    if std::env::var("BASTIO_TIME").is_ok() {
+        times.sort_by_key(|(i, _)| *i);
+        for (i, ms) in times {
+            eprintln!("{:8.1} ms {}", ms, p.fns[i].name);
+        }
+    }
+    Ok((obligations, log))
+}
+
+/// What one solver did: its obligation count, its session (for
+/// `--dump-smt`, which uses a single worker), the
+/// time per function, and the first function it could not verify.
+struct Worker {
+    obligations: usize,
+    log: Vec<String>,
+    times: Vec<(usize, f64)>,
+    err: Option<(usize, Diag)>,
+}
+
+/// Verifies functions, taking the next unverified index each time, on a
+/// solver of its own.
+fn verify_worker(p: &Program, sums: &Summaries, next: &AtomicUsize, failed: &AtomicUsize) -> Worker {
+    let mut w = Worker { obligations: 0, log: Vec::new(), times: Vec::new(), err: None };
+    let solver = match Solver::start() {
+        Ok(s) => s,
+        Err(e) => {
+            w.err = Some((0, Diag::new("E-SOLVER", Pos::default(), e)));
+            return w;
+        }
+    };
+    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, int_ops: HashMap::new(), sums };
+    let mut run = || -> Result<(), (usize, Diag)> {
+        v.smt(&format!("(declare-const {} Int)", POOLSIZE)).map_err(|d| (0, d))?;
+        v.smt(&format!("(assert (and (<= 0 {p}) (<= {p} {})))", FRAME_LIMIT, p = POOLSIZE)).map_err(|d| (0, d))?;
+        loop {
+            let i = next.fetch_add(1, Ordering::SeqCst);
+            if i >= p.fns.len() || i > failed.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            let f = &p.fns[i];
+            let t0 = std::time::Instant::now();
+            let kept = if f.export { buffers_kept(f, sums) } else { Ok(()) };
+            let r = kept
+                .and_then(|_| v.smt("(push 1)"))
+                .and_then(|_| v.verify_fn(f).map_err(|d| crate::check::in_copy(d, &f.name)))
+                .and_then(|_| v.smt("(pop 1)"));
+            if let Err(d) = r {
+                failed.fetch_min(i, Ordering::SeqCst);
+                return Err((i, d));
+            }
+            w.times.push((i, t0.elapsed().as_secs_f64() * 1000.0));
+        }
+    };
+    let r = run();
+    w.err = r.err();
+    w.obligations = v.obligations;
+    w.log = std::mem::take(&mut v.solver.log);
+    w
 }
 
 /// A `&mut Bytes` that C lends to an `export fn` is the caller's memory:
@@ -919,8 +1006,8 @@ impl<'p> Verifier<'p> {
                 }
                 // 2. havoc what the body (or the condition) changes
                 let mut changed = HashMap::new();
-                changed_vars(body, &mut changed, &self.sums);
-                changed_in_expr(cond, &mut changed, &self.sums);
+                changed_vars(body, &mut changed, self.sums);
+                changed_in_expr(cond, &mut changed, self.sums);
                 let mut lst = st.clone();
                 // Enclosing places first, so a field's own havoc lands inside its struct's.
                 let mut changed: Vec<(String, bool)> = changed.into_iter().collect();
@@ -1113,6 +1200,10 @@ impl<'p> Verifier<'p> {
             ExprKind::MutBorrow(_) => unreachable!("only a call argument"),
             ExprKind::Not(x) => {
                 let v = self.eval(x, st)?;
+                // Bitwise not on an unsigned integer: max - x.
+                if let Some(ity) = self.int_ops.get(&e.pos) {
+                    return Ok(Val::U(format!("(- {} {})", ity.int_max(), v.term())));
+                }
                 Ok(Val::B(format!("(not {})", v.term())))
             }
             ExprKind::Neg(x) => {
@@ -1158,6 +1249,9 @@ impl<'p> Verifier<'p> {
                 if ity.is_signed() && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem) {
                     return self.signed_arith(*op, &ta, &tb, &ra, &rb, &ity, e.pos, st);
                 }
+                if op.is_bitwise() {
+                    return self.bitwise(*op, a, b, &ta, &tb, &ity, e.pos, st);
+                }
                 let v = match op {
                     BinOp::Add => {
                         let t = format!("(+ {} {})", ta, tb);
@@ -1184,7 +1278,7 @@ impl<'p> Verifier<'p> {
                     BinOp::Le => Val::B(format!("(<= {} {})", ta, tb)),
                     BinOp::Gt => Val::B(format!("(> {} {})", ta, tb)),
                     BinOp::Ge => Val::B(format!("(>= {} {})", ta, tb)),
-                    BinOp::And | BinOp::Or | BinOp::Implies => unreachable!(),
+                _ => unreachable!(),
                 };
                 Ok(v)
             }
@@ -1213,6 +1307,47 @@ impl<'p> Verifier<'p> {
         self.prove(st, &format!("(<= {} {})", t, max), pos, "E-VERIFY-OVERFLOW", format!("that `{}` does not overflow {} (`<= {}`)", text, ity.name(), ity.int_max()))?;
         self.prove(st, &format!("(<= {} {})", min, t), pos, "E-VERIFY-UNDERFLOW", format!("that `{}` does not go below the minimum of {} (`>= {}`)", text, ity.name(), ity.int_min()))?;
         Ok(Val::U(t))
+    }
+
+    /// Bitwise operators on an unsigned type. Z3's integers have no bitwise
+    /// operations and its bit-vector bridge is far too slow at 64 bits, so
+    /// the kernel cases are exact arithmetic (a low mask is `mod`, a shift
+    /// is a multiplication or division by a power of two) and the rest is a
+    /// fresh value with facts that always hold (`x & y <= x`, ...).
+    #[allow(clippy::too_many_arguments)]
+    fn bitwise(&mut self, op: BinOp, a: &Expr, b: &Expr, ta: &str, tb: &str, ity: &Type, pos: Pos, st: &mut State) -> Result<Val, Diag> {
+        let (ra, rb) = (render(a), render(b));
+        if matches!(op, BinOp::Shl | BinOp::Shr) {
+            let w = ity.int_bits().expect("checked: an integer");
+            self.prove(st, &format!("(< {} {})", tb, w), pos, "E-VERIFY-SHIFT", format!("that the shift amount `{}` is less than {}, the width of {}", rb, w, ity.name()))?;
+            let p = match b.kind {
+                ExprKind::Int(k) => (1u128 << k.min(127)).to_string(),
+                _ => pow2(tb, w),
+            };
+            if op == BinOp::Shr {
+                return Ok(Val::U(format!("(div {} {})", ta, p)));
+            }
+            let t = format!("(* {} {})", ta, p);
+            self.prove(st, &format!("(<= {} {})", t, ity.int_max()), pos, "E-VERIFY-OVERFLOW", format!("that `{} << {}` loses no bits of {}", ra, rb, ity.name()))?;
+            return Ok(Val::U(t));
+        }
+        // `x & (2^k - 1)` keeps the low k bits.
+        if op == BinOp::BitAnd {
+            for (lit, other) in [(b, ta), (a, tb)] {
+                if let ExprKind::Int(m) = lit.kind {
+                    if (m + 1).is_power_of_two() {
+                        return Ok(Val::U(format!("(mod {} {})", other, m + 1)));
+                    }
+                }
+            }
+        }
+        let r = self.fresh_int("bits", "0", &ity.int_max().to_string())?;
+        st.pc.push(match op {
+            BinOp::BitAnd => format!("(and (<= {r} {ta}) (<= {r} {tb}))"),
+            BinOp::BitOr => format!("(and (<= {ta} {r}) (<= {tb} {r}) (<= {r} (+ {ta} {tb})))"),
+            _ => format!("(<= {r} (+ {ta} {tb}))"),
+        });
+        Ok(Val::U(r))
     }
 
     fn call(&mut self, name: &str, args: &[Expr], pos: Pos, st: &mut State) -> Result<Val, Diag> {
@@ -1929,6 +2064,7 @@ impl<'p> Verifier<'p> {
                     BinOp::And => "and",
                     BinOp::Or => "or",
                     BinOp::Implies => "=>",
+                    _ => unreachable!("rejected by the checker"),
                 };
                 format!("({} {} {})", f, ta, tb)
             }

@@ -589,7 +589,8 @@ impl<'a> Gen<'a> {
             ExprKind::Neg(_) => self.int_ops.get(&e.pos).cloned().unwrap_or(Type::I64),
             ExprKind::Call(n, _) if crate::check::WRAP_BUILTINS.contains(&n.as_str()) => self.int_ops[&e.pos].clone(),
             ExprKind::Int(_) => Type::U64,
-            ExprKind::Bool(_) | ExprKind::Not(_) | ExprKind::Is(..) => Type::Bool,
+            ExprKind::Bool(_) | ExprKind::Is(..) => Type::Bool,
+            ExprKind::Not(_) => self.int_ops.get(&e.pos).cloned().unwrap_or(Type::Bool),
             ExprKind::Str(_) | ExprKind::Blob(_) => Type::Str,
             ExprKind::Var(n) => self.vars[n].ty.clone(),
             ExprKind::Field(b, f) => {
@@ -603,6 +604,7 @@ impl<'a> Gen<'a> {
             ExprKind::Variant(n, ..) => Type::Enum(n.clone()),
             ExprKind::Bin(op, ..) => match op {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => self.int_ops.get(&e.pos).cloned().unwrap_or(Type::U64),
+                op if op.is_bitwise() => self.int_ops[&e.pos].clone(),
                 _ => Type::Bool,
             },
             ExprKind::Call(n, args) if n == "box" => Type::Box(Box::new(self.type_of(&args[0]))),
@@ -837,7 +839,7 @@ impl<'a> Gen<'a> {
                     self.emit(&format!("jmp {}", target));
                 }
             }
-            ExprKind::Not(x) => self.branch(x, target, !when)?,
+            ExprKind::Not(x) if !self.int_ops.contains_key(&e.pos) => self.branch(x, target, !when)?,
             ExprKind::Bin(op @ (BinOp::And | BinOp::Or | BinOp::Implies), a, b) => {
                 // `a` decides the whole when it is `stop`: false for `&&`,
                 // true for `||`, false for `==>` (which is `!a || b`); the
@@ -990,9 +992,19 @@ impl<'a> Gen<'a> {
                     self.emit(&format!("lea {}, %rax", loc.op(0)));
                 }
             }
+            // `!` on an unsigned integer flips its bits within its width.
             ExprKind::Not(x) => {
                 self.scalar(x)?;
-                self.emit("xor $1, %eax");
+                match self.int_ops.get(&e.pos).cloned() {
+                    Some(t) => {
+                        self.emit("not %rax");
+                        let n = normalize(&t);
+                        if !n.is_empty() {
+                            self.emit(n);
+                        }
+                    }
+                    None => self.emit("xor $1, %eax"),
+                }
             }
             ExprKind::Neg(x) => match x.kind {
                 ExprKind::Int(v) => self.emit(&format!("movabs ${}, %rax", (v as i128).wrapping_neg() as i64)),
@@ -1037,6 +1049,30 @@ impl<'a> Gen<'a> {
                         _ => "imul",
                     };
                     self.emit(&format!("{}{} {}, %rax", ins, q(&o), o));
+                }
+                // Unsigned only. A left shift is proved to lose no bits, and
+                // the amount to be less than the width.
+                BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                    let (o, _) = self.two(a, b, true)?;
+                    let ins = match op {
+                        BinOp::BitAnd => "and",
+                        BinOp::BitOr => "or",
+                        _ => "xor",
+                    };
+                    self.emit(&format!("{}{} {}, %rax", ins, q(&o), o));
+                }
+                BinOp::Shl | BinOp::Shr => {
+                    let ins = if *op == BinOp::Shl { "shl" } else { "shr" };
+                    if let Some(k) = small_int(b) {
+                        self.scalar(a)?;
+                        self.emit(&format!("{} ${}, %rax", ins, k));
+                    } else {
+                        let (o, _) = self.two(a, b, false)?;
+                        if o != "%rcx" {
+                            self.emit(&format!("mov {}, %rcx", o));
+                        }
+                        self.emit(&format!("{} %cl, %rax", ins));
+                    }
                 }
                 BinOp::Div | BinOp::Rem if self.signed(e) => {
                     // Truncating division, as C's: what `idiv` does.

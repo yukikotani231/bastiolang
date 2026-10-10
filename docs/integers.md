@@ -110,6 +110,8 @@ Kernels and decoders need them: page-table entries, device registers, the PIT di
 - A shift amount can be any unsigned type and is proved less than the width (`E-VERIFY-SHIFT`).
 - `x << k` follows the never-wraps rule: it is proved not to lose bits (`E-VERIFY-OVERFLOW`). Dropping the high bits on purpose is `wrap[T](cast[u64](x) << k)` or masking first.
 - Signed operands are left out at first. Code that needs them converts with `wrap`.
+- They bind tighter than comparisons, as in Rust: `x & 1 == 0` is `(x & 1) == 0`. From loosest to tightest: `|`, `^`, `&`, the shifts, then `+`/`-` and `*`/`/`/`%`.
+- They are not available in specifications yet; a specification says `x % 2^k` and `x / 2^k` instead. (Specifications compute over mathematical integers, which have no width for `!x` to flip.)
 - Binary `&` does not collide with the borrow `&x`: a borrow is a prefix in argument position, a bitwise and is infix.
 
 ## Encoding in the prover
@@ -117,7 +119,7 @@ Kernels and decoders need them: page-table entries, device registers, the PIT di
 - Values stay SMT integers, as now. Each value of type `T` gets the range fact of `T` when it is created (parameters, reads from buffers and fields, results of calls), exactly as `u64` values get `[0, 2^64)` today. Arithmetic is unchanged; only the bound in each overflow obligation depends on the type.
 - Signed `/` and `%` are encoded with C's truncating rule: `q = sign(a) * sign(b) * (|a| div |b|)`, `r = a - b * q`.
 - `cast` is the identity on the integer plus the obligation. `wrap` to an unsigned type is `mod 2^w`; to a signed type it is `((x + 2^(w-1)) mod 2^w) - 2^(w-1)`.
-- Bitwise operators are where the integer encoding is weakest, since Z3's integer theory has no bitwise operations. The common kernel cases are rewritten into arithmetic Z3 already handles well: `x & (2^k - 1)` is `x mod 2^k`, `x >> k` with a constant `k` is `x div 2^k`, `x << k` with a constant `k` is `x * 2^k`. Everything else goes through `int2bv`/`bv2nat` on the operands, plus cheap facts that let most proofs avoid the bit-vector terms entirely (`x & y <= x`, `x & y <= y`, `x | y >= x`, `x ^ y <= 2^w - 1`). Proof times are watched in `bench/` (ROADMAP invariant 5).
+- Bitwise operators are where the integer encoding is weakest, since Z3's integer theory has no bitwise operations. The common kernel cases are rewritten into arithmetic Z3 already handles well: `x & (2^k - 1)` is `x mod 2^k`, `x >> k` with a constant `k` is `x div 2^k`, `x << k` with a constant `k` is `x * 2^k`. A shift by a variable `k`, once `k < w` is proved, multiplies or divides by 2^k written as a chain of `ite` over the possible values of `k`, which is exact and stays fast. `!x` is `2^w - 1 - x`. Everything else (`&` with another mask, `|`, `^`) is a fresh value of the type with facts that always hold: `x & y <= x`, `x & y <= y`; `x | y >= x`, `x | y >= y`, `x | y <= x + y`; `x ^ y <= x + y`. That is sound but incomplete: a proof that needs the exact bits of such a value fails, and the code masks or shifts instead. The bit-vector bridge (`int2bv`/`bv2nat`) was tried and dropped: Z3 answers in well under a second at 8 bits but did not finish in 20 seconds on `x & y <= x` at 64 bits.
 - The alternative, making every value a bit-vector, was rejected: today's proofs (bounds, lengths, page counts) are linear integer arithmetic, which bit-vectors make much slower, and specifications are meant to read as mathematics.
 
 ## Hardware access (step 4)
@@ -150,7 +152,7 @@ Each step comes with `tests/pass` and `tests/fail` programs (ROADMAP invariant 4
 
 1. **Unsigned widths and conversions** (done 2026-10-10). `u8`, `u16`, `u32`; literal typing; `cast`, `wrap`, `wrap_add`/`wrap_sub`/`wrap_mul`; index parameters of any unsigned type; C types. Touches stage0's parser (type names), `mono.rs` (type arguments on builtins), `check.rs`, `verify.rs` and `codegen.rs`, and stage1's parser and checker, which must give the same `--dump-check` result (CI's difftest runs every test program through both).
 2. **Signed types.** `i8` to `i64`, unary minus, the signed division encoding. Done 2026-10-10, in stage0 and the stage1 checker.
-3. **Bitwise operators**, with the encoding above.
+3. **Bitwise operators**, with the encoding above. Done 2026-10-10, in stage0 and stage1.
 4. **Byte-shaped builtins move to `u8`, and `PortIo`** (with BastiOS moving the PIC, PIT and UART setup out of `platform.c`).
 
 Steps 1 and 2 come before stage1's verifier and code generator are written, so those are written once, with sized integers, rather than retrofitted. Steps 3 and 4 can follow the self-hosting fixed point.

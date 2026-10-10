@@ -576,7 +576,7 @@ fn is_cmp(t: Tok) -> bool {
 }
 
 fn cmp(p: &mut Parser) -> u64 {
-  let lhs = add_expr(&mut p);
+  let lhs = bitor_expr(&mut p);
   if p.failed {
     return 0;
   }
@@ -600,11 +600,65 @@ fn cmp(p: &mut Parser) -> u64 {
     return lhs;
   }
   let op = bump(&mut p);
-  let rhs = add_expr(&mut p);
+  let rhs = bitor_expr(&mut p);
   if p.failed {
     return 0;
   }
   return bin(&mut p, op, lhs, rhs);
+}
+
+// Bitwise operators bind tighter than comparisons, as in Rust:
+// `x & 1 == 0` is `(x & 1) == 0`.
+fn bitor_expr(p: &mut Parser) -> u64 {
+  let mut lhs = bitxor_expr(&mut p);
+  while !p.failed && (at_p(p, P_PIPE)) {
+    let op = bump(&mut p);
+    let rhs = bitxor_expr(&mut p);
+    if p.failed {
+      return 0;
+    }
+    lhs = bin(&mut p, op, lhs, rhs);
+  }
+  return lhs;
+}
+
+fn bitxor_expr(p: &mut Parser) -> u64 {
+  let mut lhs = bitand_expr(&mut p);
+  while !p.failed && (at_p(p, P_CARET)) {
+    let op = bump(&mut p);
+    let rhs = bitand_expr(&mut p);
+    if p.failed {
+      return 0;
+    }
+    lhs = bin(&mut p, op, lhs, rhs);
+  }
+  return lhs;
+}
+
+fn bitand_expr(p: &mut Parser) -> u64 {
+  let mut lhs = shift_expr(&mut p);
+  while !p.failed && (at_p(p, P_AMP)) {
+    let op = bump(&mut p);
+    let rhs = shift_expr(&mut p);
+    if p.failed {
+      return 0;
+    }
+    lhs = bin(&mut p, op, lhs, rhs);
+  }
+  return lhs;
+}
+
+fn shift_expr(p: &mut Parser) -> u64 {
+  let mut lhs = add_expr(&mut p);
+  while !p.failed && (at_p(p, P_SHL) || at_p(p, P_SHR)) {
+    let op = bump(&mut p);
+    let rhs = add_expr(&mut p);
+    if p.failed {
+      return 0;
+    }
+    lhs = bin(&mut p, op, lhs, rhs);
+  }
+  return lhs;
 }
 
 fn add_expr(p: &mut Parser) -> u64 {

@@ -1131,6 +1131,11 @@ impl<'a> Ctx<'a> {
             }
             ExprKind::Not(x) => {
                 let t = self.expr(x)?;
+                // On an unsigned integer, `!` flips every bit.
+                if t.is_int() && !t.is_signed() {
+                    self.int_ops.insert(e.pos, t.clone());
+                    return Ok(t);
+                }
                 expect_ty(&t, &Type::Bool, x.pos, "the operand of `!`")?;
                 Ok(Type::Bool)
             }
@@ -1157,7 +1162,8 @@ impl<'a> Ctx<'a> {
                     }
                     return bin_type(*op, &ta, &tb, e.pos);
                 }
-                let (ta, tb) = self.operands(a, b)?;
+                // A shift amount has its own type: a literal there is a u64.
+                let (ta, tb) = if matches!(op, BinOp::Shl | BinOp::Shr) { (self.expr(a)?, self.expr(b)?) } else { self.operands(a, b)? };
                 let t = bin_type(*op, &ta, &tb, e.pos)?;
                 // The operands' type: the result's for arithmetic, and what a
                 // comparison compares (signed or not matters to the C code).
@@ -1463,6 +1469,9 @@ impl<'a> Ctx<'a> {
                 Ok(Type::U64)
             }
             ExprKind::Bin(op, a, b) => {
+                if op.is_bitwise() {
+                    return Err(Diag::new("E-TYPE", e.pos, format!("`{}` is not available in specifications yet", op.text())));
+                }
                 let ta = spec_norm(self.spec_expr(a, in_ensures, bound)?);
                 let tb = spec_norm(self.spec_expr(b, in_ensures, bound)?);
                 bin_type(*op, &ta, &tb, e.pos)
@@ -1585,6 +1594,14 @@ fn bin_type(op: BinOp, a: &Type, b: &Type, pos: Pos) -> Result<Type, Diag> {
             expect_ty(a, &Type::Bool, pos, &format!("the left operand of `{}`", op.text()))?;
             expect_ty(b, &Type::Bool, pos, &format!("the right operand of `{}`", op.text()))?;
             Ok(Type::Bool)
+        }
+        BitAnd | BitOr | BitXor | Shl | Shr => {
+            let unsigned = |t: &Type| t.is_int() && !t.is_signed();
+            // Both operands have one type, except a shift amount.
+            if !unsigned(a) || !unsigned(b) || (a != b && !matches!(op, Shl | Shr)) {
+                return Err(Diag::new("E-TYPE", pos, format!("`{}` needs unsigned integers{}, found {} and {}", op.text(), if matches!(op, Shl | Shr) { "" } else { " of one type" }, a.name(), b.name())));
+            }
+            Ok(a.clone())
         }
     }
 }

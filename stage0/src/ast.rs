@@ -213,6 +213,11 @@ pub enum BinOp {
     And,
     Or,
     Implies,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
 }
 
 impl BinOp {
@@ -232,7 +237,18 @@ impl BinOp {
             BinOp::And => "&&",
             BinOp::Or => "||",
             BinOp::Implies => "==>",
+            BinOp::BitAnd => "&",
+            BinOp::BitOr => "|",
+            BinOp::BitXor => "^",
+            BinOp::Shl => "<<",
+            BinOp::Shr => ">>",
         }
+    }
+
+    /// `&`, `|`, `^`, `<<`, `>>`: on unsigned integers only, never in
+    /// specifications.
+    pub fn is_bitwise(&self) -> bool {
+        matches!(self, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr)
     }
 }
 
