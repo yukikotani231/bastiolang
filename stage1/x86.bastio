@@ -78,6 +78,10 @@ const X86_INLINE_MAX: u64 = 160;
 const X86_INLINE_DEPTH: u64 = 3;
 const X86_INLINE_TINY: u64 = 10;
 const X86_INLINE_SMALL: u64 = 20;
+// stage1: a body bigger than this is inlined only where at most
+// X86_INLINE_FEW calls name its function, so code grows little.
+const X86_INLINE_SHARED: u64 = 60;
+const X86_INLINE_FEW: u64 = 3;
 
 struct X86Op { k: u64, r: u64, v: u64 }
 
@@ -127,6 +131,9 @@ struct X86 {
   stack: Vec[u64],
   /// Per instance: its body size + 1 (0: not computed yet).
   bsize: Vec[u64],
+  /// Per function definition (by node): how many calls name it, + 1 for
+  /// every entry once counted (empty: not counted yet).
+  ncalls: Vec[u64],
   /// String literals and blobs: string k is `sdata[sstart[k] .. + slens[k]]`.
   sdata: Vec[u64],
   sstart: Vec[u64],
@@ -179,7 +186,7 @@ fn x86_new() -> X86 {
   return X86 {
     out: vec_new[u64](), body: vec_new[u64](), ln: vec_new[u64](), cg: cg_new(TARGET_HOSTED),
     names: vec_new[X86Name](), vars: vec_new[X86Var](), vfloor: 0, used: vec_new[u64](),
-    saves: vec_new[X86Save](), stack: vec_new[u64](), bsize: vec_new[u64](),
+    saves: vec_new[X86Save](), stack: vec_new[u64](), bsize: vec_new[u64](), ncalls: vec_new[u64](),
     sdata: vec_new[u64](), sstart: vec_new[u64](), slens: vec_new[u64](),
     labels: 0, frame: 0, depth: 0, env: 0, pre: 0, retl: 0, retw: 0, reto: 0, rdk: 0, rda: 0, rdo: 0,
     parent: vec_new[u64](), cur: 0, decl: vec_new[X86Decl](), sw: false, failed: false, fmsg: vec_new[u64](),
@@ -199,6 +206,7 @@ fn x86_free(g: X86) {
   vec_free(g.saves);
   vec_free(g.stack);
   vec_free(g.bsize);
+  vec_free(g.ncalls);
   vec_free(g.sdata);
   vec_free(g.sstart);
   vec_free(g.slens);
@@ -912,6 +920,46 @@ fn x86_bsize(g: &mut X86, m: &Mono, p: &Parser, x: u64) -> u64 {
   return s;
 }
 
+/// The function definition named `s..e` (generic or not), or 0.
+fn x86_fn_named(p: &Parser, s: u64, e: u64) -> u64 {
+  let mut k = p.fns.head;
+  let mut steps = 0;
+  while k != 0 && steps < 10000000 {
+    let n = node_at(p.nodes, k);
+    if same(p.src, n.s, n.e, s, e) {
+      return k;
+    }
+    k = n.next;
+    steps = steps + 1;
+  }
+  return 0;
+}
+
+/// How many calls in the loaded program name function definition `def`
+/// (counted once for all definitions).
+fn x86_ncalls(g: &mut X86, p: &Parser, def: u64) -> u64 {
+  if vec_len(g.ncalls) == 0 {
+    let nn = vec_len(p.nodes);
+    let mut k = 0;
+    while k <= nn && vec_len(g.ncalls) <= nn {
+      vec_push(&mut g.ncalls, 0);
+      k = k + 1;
+    }
+    let mut i = 1;
+    while i < nn {
+      let n = node_at(p.nodes, i);
+      if n.kind == E_CALL {
+        let d = x86_fn_named(p, n.s, n.e);
+        if d != 0 && d < vec_len(g.ncalls) {
+          vec_set(&mut g.ncalls, d, wrap_add(vec_get(g.ncalls, d), 1));
+        }
+      }
+      i = i + 1;
+    }
+  }
+  return u_at(g.ncalls, def);
+}
+
 /// Can calls to instance `x` be inlined (stage0's `inlinable`)?
 fn x86_inlinable(g: &mut X86, m: &Mono, p: &Parser, x: u64) -> bool {
   let xi = inst_at(m, x);
@@ -928,8 +976,17 @@ fn x86_will_inline(g: &mut X86, m: &Mono, p: &Parser, x: u64) -> bool {
   }
   if !g.stage0 {
     // stage1: small bodies at any depth (node_at, kind_of and the like
-    // are called everywhere, often from bodies already inlined).
-    return vec_len(g.stack) < X86_INLINE_DEPTH || x86_bsize(&mut g, m, p, x) <= X86_INLINE_SMALL;
+    // are called everywhere, often from bodies already inlined); big ones
+    // only for a function called from few places.
+    let b = x86_bsize(&mut g, m, p, x);
+    if b <= X86_INLINE_SMALL {
+      return true;
+    }
+    if vec_len(g.stack) >= X86_INLINE_DEPTH {
+      return false;
+    }
+    let xi = inst_at(m, x);
+    return b <= X86_INLINE_SHARED || x86_ncalls(&mut g, p, xi.def) <= X86_INLINE_FEW;
   }
   return vec_len(g.stack) < X86_INLINE_DEPTH || x86_bsize(&mut g, m, p, x) <= X86_INLINE_TINY;
 }
