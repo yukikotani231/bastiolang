@@ -109,11 +109,13 @@ Proved, for every `V`: every index is in bounds and no counter overflows; `len` 
 | Function | Proved |
 | --- | --- |
 | `sort_u64(v)` | Insertion sort. Afterwards the vector is sorted (spec fn `sorted`) and a permutation of what it was (spec fn `same_elems`: same length, and each value as many times) |
+| `merge_sort_u64(v)` | The same guarantee as `sort_u64`, in O(n log n) time: merge sort, with insertion sort below 16 elements. Uses n words of extra memory |
+| `sort_by_key_u64(v, keys)` | Needs every element of `v` to be an index into `keys` (spec fn `all_indices_below`). Afterwards `v` is a permutation of what it was and ascends by key (spec fn `sorted_by_key`: `keys[v[a]] <= keys[v[b]]` for `a < b`), so the indices it returns read `keys` with no further check. Merge sort; equal keys may change order |
 | `lower_bound_u64(v, x)` | Needs `sorted(v)`. The first index whose element is `>= x`: everything before it is smaller, everything from it on is not |
 | `sorted_contains_u64(v, x)` | Needs `sorted(v)`. Exactly whether `x` occurs |
 | `vec_contains_u64(v, x)` | A linear scan; exactly whether `x` occurs |
 
-Insertion sort is quadratic in the worst case. It was chosen because its proof is short; a heap sort or merge sort with the same guarantee is future work.
+Insertion sort is quadratic in the worst case; on 50,000 random words it takes 4.8 s where `merge_sort_u64` takes 0.02 s. The merge sort deals the vector out into two, sorts each, and merges them by popping the larger tail, so every step of its proof is about the ends of vectors and the counts in them (`vcount`); no lemma about index arithmetic is needed. To sort records by a field, put the field in `keys` and sort the indices 0..n.
 
 ### `core/ring.bastio`
 
@@ -162,7 +164,7 @@ That the sums are the checksums the standards define is checked by the tests on 
 
 What the library would say if the language let it. Each is a language or verifier change, not a library change. (Earlier gaps, all closed: `old(x)` is allowed in loop invariants, which the text functions and `bytes_copy_into` use; a local variable may share a function's name, so importing core no longer reserves its local names; a `spec fn` may be generic; `vcount` counts the elements of a vector, which proves the sort a permutation and the map's counters; and imports are searched for, so `import "core/text.bastio"` works from anywhere.)
 
-- **Packed bitmaps.** `core/bitmap.bastio` spends a byte per entry. Packing 64 entries in a word needs the prover to know what `|` and `&` do to one bit; it reasons exactly only about shifts and low masks.
+- **Packed bitmaps.** `core/bitmap.bastio` spends a byte per entry. Packing 64 entries in a word needs the prover to know what `|` and `&` do to one bit; it reasons exactly only about shifts and low masks. Setting, clearing and testing one bit can be translated exactly (`x | 2^k` is `x + 2^k` when bit k is clear), but the frame, that every other bit of the word is unchanged, is a statement about `x / 2^j mod 2` for a variable `j`, and Z3 does not finish it in 100 s (tried 2026-10-10). It needs either bit-vector reasoning for that one fact or a hand-written lemma.
 - **The order of a FIFO.** `Queue` is proved to return the word at its head, not that words come out in the order they went in: that needs a ghost sequence of the contents, which specifications cannot hold yet.
 
 (Closed last: `bdec` and `bhex` name the value of a digit string, so every `parse_*` is proved to return the value of its digits; and an existing `Bytes` is known to be at most 2^60 long, which is all a single value can say.)
@@ -186,7 +188,7 @@ A survey of the hand-written helpers in `stage1/`, BastiOS (`src/` and `user/`) 
 | Endian loads and stores (`be16`, `be32`, `put16`, `rd16`, `rd32`, `get_u64`, `put_u64`) | about 7 (BastiOS network, ELF and disk code) | `core/endian.bastio` |
 | Free a `Vec[Bytes]` (`drop_argv`, `drop_args`) | 2 | `bytes_vec_free` |
 | Vector contains (`has_id`, `has_u`) | 2 | `vec_contains_u64` |
-| Insertion sort | 2 (stage1's sort records by a key, which core cannot do yet) | `sort_u64` |
+| Insertion sort | 2 (stage1's sorts compare records by a key) | `sort_u64`, `merge_sort_u64`, `sort_by_key_u64` (when the key is a number) |
 | Lookup by key: every table is a linear scan (`find_inst`, `env_find`, `find_file`, ...) | many | `HashMap` |
 | Ring buffers: head and count over a fixed capacity (console output, tty input, pipes, AF_UNIX channels, the disk command queue) | 6 (BastiOS) | `Ring`, `Queue` |
 | Allocation maps, a byte or word per entry with a wrap-around search (disk blocks, pages) | 2 (BastiOS) | `core/bitmap.bastio` |

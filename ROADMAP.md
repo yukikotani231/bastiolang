@@ -113,7 +113,8 @@ Started early, alongside v1, because the kernel is the primary target and it sha
 - [x] Library search paths: `import "core/text.bastio"` walks up from the importing file, then tries each `--lib DIR`
 - [x] `==` on structs and enums in specifications, and a generic `HashMap[V]` for any copyable `V` (2026-10-10)
 - [x] The value of a digit string (2026-10-10): `bdec(b, from, to)` in specifications, so every `parse_*` is proved to return its digits' value (`bhex` for hex)
-- [ ] A map from byte-string keys, a sort with a key, and an O(n log n) sort with the same proof
+- [x] An O(n log n) sort with the same proof, and a sort with a key (2026-10-10): `merge_sort_u64`, and `sort_by_key_u64`, which sorts indices by a key vector
+- [ ] A map from byte-string keys
 
 ## C boundary
 
