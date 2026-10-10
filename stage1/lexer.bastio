@@ -1,0 +1,234 @@
+// The lexer of bastioc1, the self-hosted Bastio compiler.
+//
+// It turns source bytes into tokens. A token does not copy its text: it
+// records where the text is (`start` to `end` in the source), so tokens are
+// plain values and a vector of them needs no ownership bookkeeping. It must
+// agree with stage0's lexer token for token: `difftest.sh` compares the two
+// on every source file in the repository.
+
+// Token kinds.
+const K_EOF: u64 = 0;
+const K_INT: u64 = 1;          // `val` is the value
+const K_STR: u64 = 2;          // the text between the quotes, escapes not yet decoded
+const K_IDENT: u64 = 3;
+const K_KEYWORD: u64 = 4;      // the text is the keyword
+const K_PUNCT: u64 = 5;        // the text is the operator or punctuation
+const K_ERROR: u64 = 6;        // a lexical error at `line`:`col`
+
+// Sources are at most 2^40 bytes, so positions and counts never overflow.
+const SRC_MAX: u64 = 1099511627776;
+const U64_MAX: u64 = 18446744073709551615;
+
+struct Tok { kind: u64, start: u64, end: u64, line: u64, col: u64, val: u64 }
+
+fn is_digit(c: u64) -> bool
+  ensures result == (c >= 48 && c <= 57)
+{
+  return c >= 48 && c <= 57;
+}
+
+fn hex_val(c: u64) -> u64
+  ensures result <= 16
+{
+  if c >= 48 && c <= 57 { return c - 48; }
+  if c >= 97 && c <= 102 { return c - 87; }
+  if c >= 65 && c <= 70 { return c - 55; }
+  return 16;
+}
+
+fn is_alpha(c: u64) -> bool {
+  return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95;
+}
+
+fn is_space(c: u64) -> bool {
+  // space, \t, \n, \v, \f, \r
+  return c == 32 || (c >= 9 && c <= 13);
+}
+
+/// Does `src[s..e]` spell `w`?
+fn spells(src: &Bytes, s: u64, e: u64, w: Str) -> bool
+  requires s <= e && e <= blen(src)
+{
+  if e - s != slen(w) {
+    return false;
+  }
+  let mut k = 0;
+  while k < slen(w)
+    invariant k <= slen(w) && s + slen(w) <= blen(src)
+  {
+    if bget(src, s + k) != sget(w, k) {
+      return false;
+    }
+    k = k + 1;
+  }
+  return true;
+}
+
+fn is_keyword(src: &Bytes, s: u64, e: u64) -> bool
+  requires s <= e && e <= blen(src)
+{
+  return spells(src, s, e, "fn") || spells(src, s, e, "struct") || spells(src, s, e, "enum")
+    || spells(src, s, e, "match") || spells(src, s, e, "is") || spells(src, s, e, "spec")
+    || spells(src, s, e, "const") || spells(src, s, e, "let") || spells(src, s, e, "mut")
+    || spells(src, s, e, "if") || spells(src, s, e, "else") || spells(src, s, e, "while")
+    || spells(src, s, e, "return") || spells(src, s, e, "import") || spells(src, s, e, "unreachable")
+    || spells(src, s, e, "requires") || spells(src, s, e, "ensures") || spells(src, s, e, "invariant")
+    || spells(src, s, e, "assert") || spells(src, s, e, "forall") || spells(src, s, e, "true")
+    || spells(src, s, e, "false");
+}
+
+/// The byte at `i`, or 0 past the end.
+fn at(src: &Bytes, i: u64) -> u64
+  ensures result <= 255 && (i >= blen(src) ==> result == 0)
+{
+  if i < blen(src) {
+    return bget(src, i);
+  }
+  return 0;
+}
+
+/// How many bytes the operator or punctuation at `i` takes (0 if the byte
+/// starts none).
+fn punct_len(src: &Bytes, i: u64) -> u64
+  requires i < blen(src)
+  ensures result <= 3
+{
+  let c = bget(src, i);
+  let d = at(src, i + 1);
+  if c == 61 && d == 61 && at(src, i + 2) == 62 { return 3; }   // ==>
+  if (c == 61 && (d == 61 || d == 62)) || (c == 33 && d == 61) || (c == 60 && d == 61) || (c == 62 && d == 61) {
+    return 2;                                                    // == => != <= >=
+  }
+  if (c == 38 && d == 38) || (c == 124 && d == 124) || (c == 45 && d == 62) || (c == 58 && d == 58) {
+    return 2;                                                    // && || -> ::
+  }
+  // ( ) [ ] { } , ; : & . + - * / % = < > !
+  if c == 40 || c == 41 || c == 91 || c == 93 || c == 123 || c == 125 || c == 44 || c == 59 || c == 58
+    || c == 38 || c == 46 || c == 43 || c == 45 || c == 42 || c == 47 || c == 37 || c == 61 || c == 60
+    || c == 62 || c == 33 {
+    return 1;
+  }
+  return 0;
+}
+
+fn err(line: u64, col: u64) -> Tok {
+  return Tok { kind: K_ERROR, start: 0, end: 0, line: line, col: col, val: 0 };
+}
+
+/// Appends the tokens of `src` to `out`, ending with an EOF token. Returns
+/// that EOF token, or an error token (and stops) at the first lexical error.
+fn lex(src: &Bytes, out: &mut Vec[Tok]) -> Tok
+  requires blen(src) <= SRC_MAX
+{
+  let n = blen(src);
+  let mut i = 0;
+  let mut line = 1;
+  let mut col = 1;
+  while i < n
+    invariant i <= n && 1 <= line && line <= i + 1 && 1 <= col && col <= i + 1
+  {
+    let c = bget(src, i);
+    let tl = line;
+    let tc = col;
+    if c == 10 {
+      i = i + 1;
+      line = line + 1;
+      col = 1;
+    } else if is_space(c) {
+      i = i + 1;
+      col = col + 1;
+    } else if c == 47 && at(src, i + 1) == 47 {
+      // A line comment runs to the newline, which the loop then sees.
+      while i < n && bget(src, i) != 10
+        invariant i <= n && 1 <= col && col <= i + 1 && line <= i + 1
+      {
+        i = i + 1;
+      }
+    } else if c == 34 {
+      let start = i + 1;
+      i = i + 1;
+      col = col + 1;
+      let mut open = true;
+      while open
+        invariant i <= n && 1 <= col && col <= i + 1 && line <= i + 1 && start <= i
+      {
+        if i >= n || bget(src, i) == 10 {
+          return err(tl, tc);                    // unterminated
+        }
+        let ch = bget(src, i);
+        if ch == 34 {
+          vec_push(&mut out, Tok { kind: K_STR, start: start, end: i, line: tl, col: tc, val: 0 });
+          open = false;
+        } else if ch == 92 {
+          let e = at(src, i + 1);
+          if !(e == 110 || e == 114 || e == 116 || e == 48 || e == 92 || e == 34) {
+            return err(tl, tc);                  // unknown escape
+          }
+          i = i + 1;
+          col = col + 1;
+        }
+        i = i + 1;
+        // Columns count characters: UTF-8 continuation bytes add nothing.
+        if ch < 128 || ch >= 192 {
+          col = col + 1;
+        }
+      }
+    } else if is_digit(c) {
+      let start = i;
+      let mut v = 0;
+      let mut ok = true;
+      if c == 48 && (at(src, i + 1) == 120 || at(src, i + 1) == 88) {
+        i = i + 2;
+        let mut digits = 0;
+        while i < n && (hex_val(bget(src, i)) < 16 || bget(src, i) == 95)
+          invariant i <= n && start <= i && line <= start + 1 && 1 <= col && col <= start + 1
+        {
+          let h = hex_val(bget(src, i));
+          if h < 16 {
+            if v > (U64_MAX - h) / 16 { ok = false; } else { v = v * 16 + h; }
+            digits = 1;
+          }
+          i = i + 1;
+        }
+        if digits == 0 { ok = false; }
+      } else {
+        while i < n && (is_digit(bget(src, i)) || bget(src, i) == 95)
+          invariant i <= n && start <= i && line <= start + 1 && 1 <= col && col <= start + 1
+        {
+          let ch = bget(src, i);
+          if ch != 95 {
+            if v > (U64_MAX - (ch - 48)) / 10 { ok = false; } else { v = v * 10 + (ch - 48); }
+          }
+          i = i + 1;
+        }
+      }
+      if !ok {
+        return err(tl, tc);
+      }
+      vec_push(&mut out, Tok { kind: K_INT, start: start, end: i, line: tl, col: tc, val: v });
+      col = col + (i - start);
+    } else if is_alpha(c) {
+      let start = i;
+      while i < n && (is_alpha(bget(src, i)) || is_digit(bget(src, i)))
+        invariant i <= n && start <= i && line <= start + 1 && 1 <= col && col <= start + 1
+      {
+        i = i + 1;
+      }
+      let mut kind = K_IDENT;
+      if is_keyword(src, start, i) { kind = K_KEYWORD; }
+      vec_push(&mut out, Tok { kind: kind, start: start, end: i, line: tl, col: tc, val: 0 });
+      col = col + (i - start);
+    } else {
+      let k = punct_len(src, i);
+      if k == 0 || i + k > n {
+        return err(tl, tc);
+      }
+      vec_push(&mut out, Tok { kind: K_PUNCT, start: i, end: i + k, line: tl, col: tc, val: 0 });
+      i = i + k;
+      col = col + k;
+    }
+  }
+  let eof = Tok { kind: K_EOF, start: n, end: n, line: line, col: col, val: 0 };
+  vec_push(&mut out, eof);
+  return eof;
+}

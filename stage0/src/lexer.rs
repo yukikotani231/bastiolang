@@ -72,6 +72,35 @@ pub struct Token {
     pub pos: Pos,
 }
 
+/// One token as `--dump-tokens` prints it: `line:col` then the keyword or
+/// punctuation as written, or `ident NAME`, `int N` (decimal), `str HEX`
+/// (the bytes in hex), `eof`. The self-hosted lexer prints the same format,
+/// so the two can be compared on every source file.
+pub fn dump(t: &Token) -> String {
+    let body = match &t.tok {
+        Tok::Int(v) => format!("int {}", v),
+        Tok::Str(b) => format!("str {}", b.iter().map(|x| format!("{:02x}", x)).collect::<String>()),
+        Tok::Ident(n) => format!("ident {}", n),
+        Tok::Eof => "eof".into(),
+        other => match other {
+            Tok::Fn => "fn", Tok::Struct => "struct", Tok::Enum => "enum", Tok::Match => "match", Tok::Is => "is",
+            Tok::FatArrow => "=>", Tok::Spec => "spec", Tok::Const => "const", Tok::Let => "let", Tok::Mut => "mut",
+            Tok::If => "if", Tok::Else => "else", Tok::While => "while", Tok::Return => "return", Tok::Import => "import",
+            Tok::Unreachable => "unreachable", Tok::Requires => "requires", Tok::Ensures => "ensures",
+            Tok::Invariant => "invariant", Tok::Assert => "assert", Tok::Forall => "forall", Tok::True => "true",
+            Tok::False => "false", Tok::LParen => "(", Tok::RParen => ")", Tok::LBracket => "[", Tok::RBracket => "]",
+            Tok::LBrace => "{", Tok::RBrace => "}", Tok::Comma => ",", Tok::Semi => ";", Tok::Colon => ":",
+            Tok::ColonColon => "::", Tok::Arrow => "->", Tok::Amp => "&", Tok::Dot => ".", Tok::Plus => "+",
+            Tok::Minus => "-", Tok::Star => "*", Tok::Slash => "/", Tok::Percent => "%", Tok::Eq => "=",
+            Tok::EqEq => "==", Tok::Ne => "!=", Tok::Lt => "<", Tok::Le => "<=", Tok::Gt => ">", Tok::Ge => ">=",
+            Tok::AndAnd => "&&", Tok::OrOr => "||", Tok::Bang => "!", Tok::Implies => "==>",
+            Tok::Int(_) | Tok::Str(_) | Tok::Ident(_) | Tok::Eof => unreachable!(),
+        }
+        .to_string(),
+    };
+    format!("{}:{} {}", t.pos.line, t.pos.col, body)
+}
+
 pub fn lex(src: &str, file: usize) -> Result<Vec<Token>, Diag> {
     let chars: Vec<char> = src.chars().collect();
     let mut out = Vec::new();

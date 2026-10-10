@@ -8,6 +8,8 @@
 //   --check     stop after verification
 //   --emit-c    write the generated C to `out` instead of building
 //   --dump-smt  print every query sent to the solver
+//   --dump-tokens  print the tokens of one file (see `lexer::dump`) and exit;
+//               a lexical error prints `error line:col` and exits 1
 //   --trusted-base  list and count the hand-written trusted base, then exit
 //   --target    `hosted` (default): a normal program on the C library
 //               `kernel`: freestanding C for a bare-metal x86-64 kernel (implies --emit-c)
@@ -106,6 +108,7 @@ fn main() {
     let mut check_only = false;
     let mut emit_c = false;
     let mut dump_smt = false;
+    let mut dump_tokens = false;
     let mut target = codegen::Target::Hosted;
     let mut out: Option<String> = None;
     let mut inputs: Vec<String> = Vec::new();
@@ -115,6 +118,7 @@ fn main() {
             "--check" => check_only = true,
             "--emit-c" => emit_c = true,
             "--dump-smt" => dump_smt = true,
+            "--dump-tokens" => dump_tokens = true,
             "--trusted-base" => {
                 print!("{}", codegen::trusted_base());
                 return;
@@ -152,6 +156,20 @@ fn main() {
     if inputs.is_empty() {
         eprintln!("usage: bastioc0 [--check] [--emit-c] [--dump-smt] [--target hosted|kernel|user] [-o out] <file.bastio>...");
         exit(2);
+    }
+    if dump_tokens {
+        let src = std::fs::read_to_string(&inputs[0]).unwrap_or_else(|e| {
+            eprintln!("bastioc0: cannot read {}: {}", inputs[0], e);
+            exit(2)
+        });
+        match lexer::lex(&src, 0) {
+            Ok(toks) => toks.iter().for_each(|t| println!("{}", lexer::dump(t))),
+            Err(d) => {
+                println!("error {}:{}", d.pos.line, d.pos.col);
+                exit(1);
+            }
+        }
+        return;
     }
     let input = inputs.join(" ");
     let mut ld = Loader {

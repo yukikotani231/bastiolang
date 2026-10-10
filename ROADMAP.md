@@ -44,13 +44,18 @@ What the compiler needs in order to be written in Bastio. Structs come first (re
 2. [x] **Bytes and strings:** `Bytes` (a linear u8 buffer, every element proved `<= 255`), string literals (`Str`), and file reading and writing through a linear `Host` capability (hosted only), with command-line arguments. (Done 2026-10-10.)
 3. [x] **Enums and `match`:** to represent the AST and optional results (`Option`-like returns for allocation failure); exhaustiveness checking. (Done 2026-10-10: variants with one payload each, linear payloads, `is` tests, payloads and tags in proofs. Not yet generic, so each `Option`-like type is declared on its own until item 5.)
 4. [x] **Owning pointer `Box[T]`:** for recursive data such as trees. (Done 2026-10-10: `box`/`unbox`, field places through a box, read-only walks of borrowed trees. The prover unfolds unknown recursive data only two levels deep, so facts about deeper parts cannot be proved yet; that needs recursive spec functions or inductive predicates, which belong with functional correctness rather than memory safety.)
-5. [x] **Generics by monomorphization and `Vec[T]`:** generic structs, enums and functions (done 2026-10-10, type arguments written out at each use; inferring them is open), and a built-in growable `Vec[T]` whose bounds and emptiness-before-free are proved (done 2026-10-10). Revised: `Vec[T]` is built in rather than written in Bastio, because a library version would need raw memory and per-slot initialization tracking that the language does not have; a vector whose slots below its length are always full needs neither. The prover tracks the contents of vectors of any element type (done 2026-10-10), so facts such as "every row's page table is a level-4 table" can be stated as invariants over a vector.
+5. [x] **Generics by monomorphization and `Vec[T]`:** generic structs, enums and functions (done 2026-10-10, type arguments written out at each use; inferring them is deferred: monomorphization runs before type checking, so inference would mean merging the two, and the self-hosted compiler can write type arguments out), and a built-in growable `Vec[T]` whose bounds and emptiness-before-free are proved (done 2026-10-10). Revised: `Vec[T]` is built in rather than written in Bastio, because a library version would need raw memory and per-slot initialization tracking that the language does not have; a vector whose slots below its length are always full needs neither. The prover tracks the contents of vectors of any element type (done 2026-10-10), so facts such as "every row's page table is a level-4 table" can be stated as invariants over a vector.
 6. [x] **Multiple files and modules:** `import "path";` loads other files into the program, once each, with import cycles rejected (done 2026-10-10). Revised: all files share one namespace, as in C. Qualified names (`mod::f`) and private items are left for later: they matter for libraries shared between programs, and the self-hosted compiler can do without them.
 7. [x] **Processes and pipes:** so the self-hosted compiler can call Z3 itself. (Done 2026-10-10: a linear `Child` from `host_spawn`, with line-based reads from its output; `tests/pass/child_z3.bastio` asks Z3 a question interactively.)
 
 ## v2: self-hosting
 
 - [ ] bastioc1, written in Bastio, produces the same output as stage0 (differential testing)
+  - [x] Lexer (`stage1/lexer.bastio`, done 2026-10-10): the same tokens and lexical errors as stage0 on every source in this repository and in BastiOS (`stage1/difftest.sh`, run in CI)
+  - [ ] Parser
+  - [ ] Checker (types and linearity)
+  - [ ] Verifier (talks to Z3 through a `Child`)
+  - [ ] C code generation
 - [ ] bastioc1 compiles itself and reaches a fixed point (gen2 == gen1)
 - [ ] stage0 is frozen
 
