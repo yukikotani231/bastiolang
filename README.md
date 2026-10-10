@@ -55,12 +55,23 @@ Bastio targets low-level code that has no runtime and where a memory-safety bug 
 
 ## Build and test
 
-Requirements: Rust (to build stage0), `z3`, and a C compiler (`cc`).
+Requirements:
+
+| Tool | Tested with | Notes |
+| --- | --- | --- |
+| Rust | 1.97.0 | Pinned in `rust-toolchain.toml`; rustup installs it on the first build |
+| Z3 | 4.8.12 (Ubuntu 24.04 package), 5.1.0 | Must be on `PATH` as `z3`; the compiler runs it as a subprocess |
+| C compiler | GCC 13 | Called as `cc`; the generated C is C11 |
+| Python 3 | 3.12, 3.13 | Only for `stage1/difftest.sh` |
+
+Tested on x86-64 Linux (Ubuntu 24.04), which is what CI runs; other platforms are untested. On Ubuntu: `sudo apt-get install z3 build-essential python3`, plus [rustup](https://rustup.rs).
 
 ```sh
-cd stage0 && cargo build --release
-tests/run.sh       # must-pass and must-fail programs, zero-overhead check, sanitizer cross-check
+git clone https://github.com/yukikotani231/bastiolang && cd bastiolang
+(cd stage0 && cargo build --release)
 stage0/target/release/bastioc0 -o hello examples/hello.bastio && ./hello
+tests/run.sh          # must-pass and must-fail programs, zero-overhead check, sanitizer cross-check
+stage1/difftest.sh    # the self-hosted compiler's phases against stage0
 ```
 
 `bastioc0` options:
@@ -74,11 +85,17 @@ stage0/target/release/bastioc0 -o hello examples/hello.bastio && ./hello
 | Path | Contents |
 | --- | --- |
 | `stage0/` | Throwaway bootstrap compiler in Rust, frozen once the self-hosted compiler works |
+| `stage1/` | The self-hosted compiler, written in Bastio and grown one phase at a time (see `stage1/README.md`) |
 | `tests/pass/` | Programs that must verify and exit with a given code |
 | `tests/fail/` | Programs that must be rejected with a given error code |
-| `docs/language.md` | The v0 language reference |
+| `examples/` | Small programs to start from |
+| `docs/language.md` | The language reference |
 | `ROADMAP.md` | The path to self-hosting and to a kernel |
 
-## Status (v0)
+## Status
 
-The types are `u64`, `bool`, `Buf` (an owned buffer of u64), `&Buf` (a read-only borrow), `Str` (string literals) and `Serial` (the console capability). The backend emits C. What v0 does and does not guarantee is listed under "Soundness scope" in [docs/language.md](docs/language.md).
+Pre-release. The language and the compiler change without notice, and nothing is stable yet. stage0 implements the language described in [docs/language.md](docs/language.md), whose "Soundness scope" section lists what is and is not guaranteed; the self-hosted compiler in `stage1/` is in progress. [ROADMAP.md](ROADMAP.md) has the plan.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
