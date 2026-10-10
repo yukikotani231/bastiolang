@@ -33,7 +33,7 @@
 
 use crate::ast::*;
 use crate::diag::{Diag, Pos};
-use crate::lexer::{Tok, Token};
+use crate::lexer::{describe, Tok, Token};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -82,8 +82,23 @@ impl Parser {
         if *self.peek() == t {
             Ok(self.bump())
         } else {
-            Err(Diag::new("E-PARSE", self.pos(), format!("expected {}, found {:?}", what, self.peek())))
+            Err(self.expected(what))
         }
+    }
+
+    /// `expected WHAT, found TOKEN` at the current token. A missing `;` at
+    /// the end of a line is reported where it belongs, after the token
+    /// before, rather than at the start of the next line.
+    fn expected(&self, what: &str) -> Diag {
+        let t = &self.toks[self.i];
+        if what == "`;`" && self.i > 0 {
+            let prev = &self.toks[self.i - 1];
+            if prev.pos.line < t.pos.line {
+                let pos = Pos { col: prev.end_col, ..prev.pos };
+                return Diag::new("E-PARSE", pos, "expected `;` at the end of this line");
+            }
+        }
+        Diag::new("E-PARSE", t.pos, format!("expected {}, found {}", what, describe(&t.tok)))
     }
 
     fn ident(&mut self) -> PResult<(String, Pos)> {
@@ -93,7 +108,7 @@ impl Parser {
                 self.bump();
                 Ok((s, pos))
             }
-            t => Err(Diag::new("E-PARSE", pos, format!("expected identifier, found {:?}", t))),
+            t => Err(Diag::new("E-PARSE", pos, format!("expected identifier, found {}", describe(&t)))),
         }
     }
 
@@ -500,7 +515,7 @@ impl Parser {
                                 Pat::Variant(en, v, None, false)
                             }
                         }
-                        t => return Err(Diag::new("E-PARSE", apos, format!("expected a pattern, found {:?}", t))),
+                        t => return Err(Diag::new("E-PARSE", apos, format!("expected a pattern, found {}", describe(&t)))),
                     };
                     self.expect(Tok::FatArrow, "`=>`")?;
                     let body = self.block()?;
@@ -762,7 +777,7 @@ impl Parser {
                     }
                     Tok::LBrace => ExprKind::StructLit(name, self.struct_lit_fields()?),
                     Tok::LParen => ExprKind::Call(name, self.call_args()?),
-                    t => return Err(Diag::new("E-PARSE", self.pos(), format!("expected `(`, `{{` or `::` after type arguments, found {:?}", t))),
+                    t => return Err(Diag::new("E-PARSE", self.pos(), format!("expected `(`, `{{` or `::` after type arguments, found {}", describe(&t)))),
                 };
                 Ok(Expr { kind: ExprKind::TypeApp(targs, Box::new(Expr { kind: inner, pos })), pos })
             }
@@ -788,7 +803,7 @@ impl Parser {
                     Ok(Expr { kind: ExprKind::Var(name), pos })
                 }
             }
-            t => Err(Diag::new("E-PARSE", pos, format!("expected expression, found {:?}", t))),
+            t => Err(Diag::new("E-PARSE", pos, format!("expected expression, found {}", describe(&t)))),
         }
     }
 }
