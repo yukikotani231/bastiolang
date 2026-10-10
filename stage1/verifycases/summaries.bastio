@@ -1,0 +1,64 @@
+// Verifier cases: what a call does to its `&mut` arguments (summaries). A
+// callee that only changes one field leaves the others as they were; a
+// callee that only changes a buffer with `set` keeps its length; summaries
+// pass through calls, generic instances and recursion; a callee that
+// replaces the whole argument loses everything.
+
+struct Pair { a: u64, b: u64 }
+struct Outer { p: Pair, buf: Buf, n: u64 }
+enum Mode { Idle, Run(u64) }
+
+fn bump_a(p: &mut Pair) {
+  if p.a < 1000 {
+    p.a = p.a + 1;
+  }
+}
+
+fn bump_inner(o: &mut Outer) {
+  bump_a(&mut o.p);
+}
+
+fn fill(o: &mut Outer) {
+  if len(o.buf) > 0 {
+    o.buf = set(o.buf, 0, 7);
+  }
+}
+
+fn replace(o: &mut Outer) {
+  o.p = Pair { a: 0, b: 0 };
+}
+
+fn count_down(o: &mut Outer, k: u64) {
+  if k > 0 && o.n < 1000 {
+    o.n = o.n + 1;
+    count_down(&mut o, k - 1);
+  }
+}
+
+fn touch[T](x: &mut T, y: &mut Pair) {
+  bump_a(&mut y);
+}
+
+fn set_mode(m: &mut Mode) {
+  m = Mode::Run(3);
+}
+
+fn main() -> u64 {
+  let mut o = Outer { p: Pair { a: 1, b: 2 }, buf: alloc(4), n: 5 };
+  bump_inner(&mut o);
+  assert o.p.b == 2;
+  assert o.n == 5;
+  fill(&mut o);
+  assert len(o.buf) == 4;
+  count_down(&mut o, 3);
+  assert o.p.b == 2;
+  let mut q = Pair { a: 0, b: 9 };
+  let mut z = 4;
+  touch[u64](&mut z, &mut q);
+  assert q.b == 9;
+  replace(&mut o);
+  let mut md = Mode::Idle;
+  set_mode(&mut md);
+  free(o.buf);
+  return q.b;
+}

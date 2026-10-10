@@ -27,6 +27,7 @@ const VT_ATOM: u64 = 1;       // the text pool[a .. a + b]
 const VT_NUM: u64 = 2;        // the number a
 const VT_APP: u64 = 3;        // operator a applied to targs[b .. b + c]
 const VT_FORALL: u64 = 4;     // (forall ((a Int)) b)
+const VT_LAMBDA: u64 = 5;     // (lambda ((a Int)) b)
 
 const OP_ADD: u64 = 1;
 const OP_SUB: u64 = 2;
@@ -87,6 +88,12 @@ struct Bnd { s: u64, e: u64, q: u64 }
 /// A place a loop body changes (its dotted path) and whether every change keeps its shape.
 struct Chg { name: u64, keep: bool }
 
+/// One row of a function's summary (see `summarize`): call of instance `x`
+/// may change place `rel` (a path relative to parameter `j`, an atom like
+/// `.f.g`, empty for the parameter itself); `keep` says only in ways that
+/// keep its shape.
+struct SumRow { x: u64, j: u64, rel: u64, keep: bool }
+
 /// The state on one path: the path condition and the variables' values.
 /// `live` is false once every path has returned.
 struct VState { pc: Vec[u64], env: Vec[Bind], live: bool }
@@ -106,12 +113,19 @@ struct Vr {
   cur: u64,
   /// The instance being verified, for reading the types written in it.
   env: u64,
+  /// Every function's summaries, grouped by instance: rows
+  /// sum_start[x] .. sum_start[x] + sum_n[x] are instance x's.
+  sums: Vec[SumRow],
+  sum_start: Vec[u64],
+  sum_n: Vec[u64],
   t_true: u64,
   t_false: u64,
   t_zero: u64,
   t_u64max: u64,
   t_allocmax: u64,
   t_flimit: u64,
+  /// 65536: the number of x86 I/O ports.
+  t_plimit: u64,
   t_poolsize: u64,
   t_zarr: u64,
   t_nobool: u64,
@@ -133,7 +147,8 @@ fn vr_new(m: &mut Mono, p: &Parser) -> Vr {
   let mut v = Vr {
     pool: vec_new[u64](), tms: tms, targs: vec_new[u64](), vals: vals, kids: vec_new[u64](),
     log: vec_new[Cmd](), counter: 0, obligations: 0, box_depth: 0, cur: 0, env: 0,
-    t_true: 0, t_false: 0, t_zero: 0, t_u64max: 0, t_allocmax: 0, t_flimit: 0, t_poolsize: 0,
+    sums: vec_new[SumRow](), sum_start: vec_new[u64](), sum_n: vec_new[u64](),
+    t_true: 0, t_false: 0, t_zero: 0, t_u64max: 0, t_allocmax: 0, t_flimit: 0, t_plimit: 0, t_poolsize: 0,
     t_zarr: 0, t_nobool: 0, t_k: 0, t_255: 0, unit: 0,
     ty_bytes: prim(&mut m, p, TY_BYTES), ty_child: prim(&mut m, p, TY_CHILD), ty_frame: prim(&mut m, p, TY_FRAME),
     ty_pt: prim(&mut m, p, TY_PT), ty_pool: prim(&mut m, p, TY_POOL)
@@ -144,6 +159,7 @@ fn vr_new(m: &mut Mono, p: &Parser) -> Vr {
   v.t_u64max = num(&mut v, U64_MAX);
   v.t_allocmax = num(&mut v, ALLOC_MAX);
   v.t_flimit = num(&mut v, FRAME_LIMIT);
+  v.t_plimit = num(&mut v, 65536);
   v.t_poolsize = atom_str(&mut v, "POOLSIZE");
   v.t_zarr = atom_str(&mut v, "((as const (Array Int Int)) 0)");
   v.t_nobool = atom_str(&mut v, "((as const (Array Int Bool)) false)");
@@ -160,6 +176,9 @@ fn vr_free(v: Vr) {
   vec_free(v.vals);
   vec_free(v.kids);
   vec_free(v.log);
+  vec_free(v.sums);
+  vec_free(v.sum_start);
+  vec_free(v.sum_n);
 }
 
 /// `a + b`, or the largest u64 if that overflows (indices that large are
@@ -443,6 +462,26 @@ fn forall_tm(v: &mut Vr, q: u64, body: u64) -> u64 {
   return new_tm(&mut v, VT_FORALL, q, body, 0);
 }
 
+/// (lambda ((q Int)) body)
+fn lambda_tm(v: &mut Vr, q: u64, body: u64) -> u64 {
+  return new_tm(&mut v, VT_LAMBDA, q, body, 0);
+}
+
+/// `(and (<= 0 k) (< k 65536))`: k is an I/O port.
+fn all_ports(v: &mut Vr) -> u64 {
+  let a = app2(&mut v, OP_LE, v.t_zero, v.t_k);
+  let b = app2(&mut v, OP_LT, v.t_k, v.t_plimit);
+  return app2(&mut v, OP_AND, a, b);
+}
+
+/// `(and (<= b k) (< k (+ b n)))`: k is one of the ports b .. b+n.
+fn port_range(v: &mut Vr, b: u64, n: u64) -> u64 {
+  let lo = app2(&mut v, OP_LE, b, v.t_k);
+  let end = app2(&mut v, OP_ADD, b, n);
+  let hi = app2(&mut v, OP_LT, v.t_k, end);
+  return app2(&mut v, OP_AND, lo, hi);
+}
+
 /// `(not x)`
 fn t_not(v: &mut Vr, x: u64) -> u64 {
   return app1(&mut v, OP_NOT, x);
@@ -471,7 +510,7 @@ fn tm_eq(v: &Vr, a: u64, b: u64) -> bool {
   if x.kind == VT_NUM {
     return x.a == y.a;
   }
-  if x.kind == VT_FORALL {
+  if x.kind == VT_FORALL || x.kind == VT_LAMBDA {
     return tm_eq(v, x.a, y.a) && tm_eq(v, x.b, y.b);
   }
   if x.a != y.a || x.c != y.c {
@@ -557,8 +596,12 @@ fn put_tm(con: &Serial, v: &Vr, t: u64) {
       k = k + 1;
     }
     put(con, ")");
-  } else if x.kind == VT_FORALL {
-    put(con, "(forall ((");
+  } else if x.kind == VT_FORALL || x.kind == VT_LAMBDA {
+    if x.kind == VT_FORALL {
+      put(con, "(forall ((");
+    } else {
+      put(con, "(lambda ((");
+    }
     put_tm(con, v, x.a);
     put(con, " Int)) ");
     put_tm(con, v, x.b);
@@ -740,7 +783,8 @@ fn term(v: &Vr, x: u64) -> u64 {
 fn obj_fields(k: u64) -> u64 {
   if k == TY_PT { return 3; }
   if k == TY_POOL { return 2; }
-  if k == TY_FRAME || k == TY_MMU { return 1; }
+  if k == TY_FRAME || k == TY_MMU || k == TY_PORTS { return 1; }
+  if k == TY_PORTIO { return 2; }
   return 0;
 }
 
@@ -758,6 +802,9 @@ fn g_used(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 2); }     // PageTable
 fn g_has(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 0); }      // Pool
 fn g_size(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 1); }     // Pool
 fn g_root(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 0); }     // Mmu
+fn g_free(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 0); }     // Ports
+fn g_base(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 0); }     // PortIo
+fn g_count(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 1); }    // PortIo
 
 fn mk_obj(v: &mut Vr, m: &Mono, tyx: u64, a: u64, b: u64, c: u64) -> u64 {
   return mk(&mut v, VV_OBJ, tyx, a, b, c, obj_fields(kind_t(m, tyx)));
@@ -766,7 +813,7 @@ fn mk_obj(v: &mut Vr, m: &Mono, tyx: u64, a: u64, b: u64, c: u64) -> u64 {
 /// The sort of ghost field `j` of an object of type kind `k`: an array of
 /// Bool for `used` and `has`, Int otherwise.
 fn obj_field_sort(k: u64, j: u64) -> u64 {
-  if (k == TY_PT && j == 2) || (k == TY_POOL && j == 0) {
+  if (k == TY_PT && j == 2) || ((k == TY_POOL || k == TY_PORTS) && j == 0) {
     return SO_BOOL + 2;
   }
   return SO_INT;
@@ -1318,6 +1365,17 @@ fn fresh_field(v: &mut Vr, tk: u64, j: u64, hint: u64) -> u64 {
     let h = cat_str(&mut v, hint, "_has");
     return fresh_array(&mut v, h, SO_BOOL);
   }
+  if tk == TY_PORTS {
+    let h = cat_str(&mut v, hint, "_free");
+    return fresh_array(&mut v, h, SO_BOOL);
+  }
+  if tk == TY_PORTIO {
+    let mut h = cat_str(&mut v, hint, "_base");
+    if j == 1 {
+      h = cat_str(&mut v, hint, "_count");
+    }
+    return fresh_int(&mut v, h, v.t_zero, v.t_plimit);
+  }
   if tk == TY_POOL {
     return v.t_poolsize;
   }
@@ -1341,7 +1399,8 @@ fn fresh_field(v: &mut Vr, tk: u64, j: u64, hint: u64) -> u64 {
 /// Ghost fields a loop keeps when only builtins that never change them
 /// change the object (a page table keeps its id and level).
 fn kept_by_builtins(tk: u64, j: u64) -> bool {
-  return ((tk == TY_FRAME || tk == TY_PT) && j == 0) || (tk == TY_PT && j == 1) || (tk == TY_POOL && j == 1);
+  return ((tk == TY_FRAME || tk == TY_PT) && j == 0) || (tk == TY_PT && j == 1) || (tk == TY_POOL && j == 1)
+    || (tk == TY_PORTIO && j <= 1);
 }
 
 fn fresh_obj(v: &mut Vr, m: &Mono, tyx: u64, hint: u64) -> u64 {
@@ -1353,6 +1412,11 @@ fn fresh_obj(v: &mut Vr, m: &Mono, tyx: u64, hint: u64) -> u64 {
   if n > 0 { f0 = fresh_field(&mut v, tk, 0, hint); }
   if n > 1 { f1 = fresh_field(&mut v, tk, 1, hint); }
   if n > 2 { f2 = fresh_field(&mut v, tk, 2, hint); }
+  if tk == TY_PORTIO {
+    let sum = app2(&mut v, OP_ADD, f0, f1);
+    let le = app2(&mut v, OP_LE, sum, v.t_plimit);
+    assert_tm(&mut v, le);
+  }
   return mk(&mut v, VV_OBJ, tyx, f0, f1, f2, n);
 }
 
@@ -1577,11 +1641,18 @@ fn look_inside(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, x: u64) -> u64 {
   return x;
 }
 
-/// A fresh value of the same type as `old`. With `keep`, a Buf or a Vec
-/// keeps its length and an object the ghost fields builtins never change.
+/// A fresh value of the same type as `old`. With `keep` (the value was
+/// changed only in shape-keeping ways, see `changed_vars`), a Buf or a Vec
+/// keeps its length, an object the ghost fields builtins never change, and
+/// scalars, enum tags and the fields of structs stay as they were: no
+/// shape-keeping builtin changes them, and any other change to a place
+/// inside is havocked separately, after this.
 fn havoc(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, oenv: u64, keep: bool, name: u64) -> u64 {
   let xv = vl_at(v, oenv);
   let k = xv.kind;
+  if keep && (k == VV_U || k == VV_B || k == VV_STR) {
+    return oenv;
+  }
   if k == VV_BUF {
     let mut l = xv.a;
     if !keep {
@@ -1612,8 +1683,8 @@ fn havoc(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, oenv: u64, keep: bool, n
     return mk(&mut v, VV_OBJ, xv.ty, f0, f1, f2, xv.n);
   }
   if k == VV_STRUCT || k == VV_ENUM {
-    let mut tag = 0;
-    if k == VV_ENUM {
+    let mut tag = xv.a;
+    if k == VV_ENUM && !keep {
       let ht = cat_str(&mut v, name, "_tag");
       let mut hi = 0;
       if xv.n > 0 {
@@ -1627,7 +1698,7 @@ fn havoc(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, oenv: u64, keep: bool, n
     while j < xv.n {
       let fd = part_node(m, p, xv.ty, j);
       let h = cat_src(&mut v, p, name, fd.s, fd.e);
-      let y = havoc(&mut v, c, m, p, kid(v, oenv, j), false, h);
+      let y = havoc(&mut v, c, m, p, kid(v, oenv, j), keep, h);
       vec_push(&mut xs, y);
       j = j + 1;
     }
@@ -1649,7 +1720,7 @@ fn havoc(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, oenv: u64, keep: bool, n
     return mk(&mut v, VV_VEC, xv.ty, l, el, 0, 0);
   }
   if k == VV_BOXK {
-    let inner = havoc(&mut v, c, m, p, xv.a, false, name);
+    let inner = havoc(&mut v, c, m, p, xv.a, keep, name);
     return mk(&mut v, VV_BOXK, 0, inner, 0, 0, 0);
   }
   return oenv;             // opaque boxes and unit
@@ -1919,9 +1990,15 @@ fn vspec_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env: &V
   if span_is(p, n.s, n.e, "mmu_root") {
     return g_root(v, x);
   }
-  if span_is(p, n.s, n.e, "pt_used") || span_is(p, n.s, n.e, "pool_has") {
+  if span_is(p, n.s, n.e, "port_base") {
+    return g_base(v, x);
+  }
+  if span_is(p, n.s, n.e, "port_count") {
+    return g_count(v, x);
+  }
+  if span_is(p, n.s, n.e, "pt_used") || span_is(p, n.s, n.e, "pool_has") || span_is(p, n.s, n.e, "port_free") {
     let mut arr = g_used(v, x);
-    if span_is(p, n.s, n.e, "pool_has") {
+    if span_is(p, n.s, n.e, "pool_has") || span_is(p, n.s, n.e, "port_free") {
       arr = g_has(v, x);
     }
     let ix = spec_tm(&mut v, c, &mut m, p, arg_node(p, i, 1), env, oenv, has_old, res, &mut bound);
@@ -2289,9 +2366,32 @@ fn vuser_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64, args: &
     let an = node_at(p.nodes, u_at(args, j));
     if kind_t(m, pt) == TY_MUTREF && an.kind == E_MUTBORROW {
       let path = list_text(&mut v, p, an.a);
-      let nv = fresh_of(&mut v, c, m, p, inner_t(m, pt), path);
-      env_put(&mut post, p, qn.s, qn.e, nv);
-      set_path(&mut v, m, p, &mut st.env, path, nv);
+      let start = u_at(v.sum_start, x);
+      let end = vadd(start, u_at(v.sum_n, x));
+      let mut k = start;
+      while k < end && row_param(v, k) != j {
+        k = k + 1;
+      }
+      let first = sum_row(v, k);
+      if k < end && first.keep && tm_len(v, first.rel) == 0 {
+        // The callee keeps the argument's shape: havoc only what it may
+        // change, as a loop would (shallowest first).
+        while k < end {
+          let row = sum_row(v, k);
+          if row.j == j {
+            let place = cat_text(&mut v, path, row.rel);
+            open_path(&mut v, c, m, p, &mut st.env, place);
+            let prev = get_path(v, m, p, st.env, place);
+            let nv = havoc(&mut v, c, m, p, prev, row.keep, place);
+            set_path(&mut v, m, p, &mut st.env, place, nv);
+          }
+          k = k + 1;
+        }
+      } else {
+        let nv = fresh_of(&mut v, c, m, p, inner_t(m, pt), path);
+        set_path(&mut v, m, p, &mut st.env, path, nv);
+      }
+      env_put(&mut post, p, qn.s, qn.e, get_path(v, m, p, st.env, path));
     }
     q = qn.next;
     j = j + 1;
@@ -2592,8 +2692,83 @@ fn builtin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Vec
   if name_is(p, i, "pt_has") {
     let ix = term(v, x1);
     need_lt(&mut v, st, ix, 512);
+    // Slot 0 of a top-level table maps the kernel on the kernel target: the
+    // hardware entry is present although the table does not own it, so what
+    // pt_has says there is unknown.
+    let k = fresh_bool_named(&mut v, "pt_has_kernel");
+    let four = num(&mut v, 4);
+    let top = app2(&mut v, OP_EQ, g_level(v, x0), four);
+    let zero = app2(&mut v, OP_EQ, ix, v.t_zero);
+    let at0 = app2(&mut v, OP_AND, top, zero);
     let sel = app2(&mut v, OP_SELECT, g_used(v, x0), ix);
-    return mk_b(&mut v, sel);
+    let r = app3(&mut v, OP_ITE, at0, term(v, k), sel);
+    return mk_b(&mut v, r);
+  }
+
+  // ---- I/O ports ----
+  if name_is(p, i, "port_claim") {
+    let b = term(v, x1);
+    let n = term(v, x2);
+    let end = app2(&mut v, OP_ADD, b, n);
+    let g = app2(&mut v, OP_LE, end, v.t_plimit);
+    prove(&mut v, st, g);
+    let inr = port_range(&mut v, b, n);
+    let sel = app2(&mut v, OP_SELECT, g_free(v, x0), v.t_k);
+    let imp = app2(&mut v, OP_IMP, inr, sel);
+    let g2 = forall_tm(&mut v, v.t_k, imp);
+    prove(&mut v, st, g2);
+    // A lambda, not a fresh array with a quantified definition: reads of it
+    // reduce directly, so chains of claims stay quantifier-free.
+    let ni = t_not(&mut v, inr);
+    let body = app2(&mut v, OP_AND, sel, ni);
+    let nf = lambda_tm(&mut v, v.t_k, body);
+    let np = mk_obj(&mut v, m, a0.ty, nf, 0, 0);
+    put_back(&mut v, m, p, &mut st, u_at(args, 0), np);
+    return mk_obj(&mut v, m, kind_ty(m, p, TY_PORTIO), b, n, 0);
+  }
+  if name_is(p, i, "port_release") {
+    let inr = port_range(&mut v, g_base(v, x1), g_count(v, x1));
+    let sel = app2(&mut v, OP_SELECT, g_free(v, x0), v.t_k);
+    let body = app2(&mut v, OP_OR, sel, inr);
+    let nf = lambda_tm(&mut v, v.t_k, body);
+    let np = mk_obj(&mut v, m, a0.ty, nf, 0, 0);
+    put_back(&mut v, m, p, &mut st, u_at(args, 0), np);
+    return v.unit;
+  }
+  if name_is(p, i, "port_base") {
+    return mk_u(&mut v, g_base(v, x0));
+  }
+  if name_is(p, i, "port_count") {
+    return mk_u(&mut v, g_count(v, x0));
+  }
+  if name_is(p, i, "pio_in8") || name_is(p, i, "pio_in16") || name_is(p, i, "pio_in32")
+    || name_is(p, i, "pio_out8") || name_is(p, i, "pio_out16") || name_is(p, i, "pio_out32") {
+    let mut bytes = 4;
+    let mut max = 4294967295;
+    if name_is(p, i, "pio_in8") || name_is(p, i, "pio_out8") {
+      bytes = 1;
+      max = 255;
+    } else if name_is(p, i, "pio_in16") || name_is(p, i, "pio_out16") {
+      bytes = 2;
+      max = 65535;
+    }
+    let tb = num(&mut v, bytes);
+    let end = app2(&mut v, OP_ADD, term(v, x1), tb);
+    let g = app2(&mut v, OP_LE, end, g_count(v, x0));
+    prove(&mut v, st, g);
+    if name_is(p, i, "pio_out8") || name_is(p, i, "pio_out16") || name_is(p, i, "pio_out32") {
+      let tm = num(&mut v, max);
+      let g2 = app2(&mut v, OP_LE, term(v, x2), tm);
+      prove(&mut v, st, g2);
+      return v.unit;
+    }
+    let n = node_at(p.nodes, i);
+    let h = atom_src(&mut v, p, n.s, n.e);
+    let r = fresh_u64(&mut v, h);
+    let tm = num(&mut v, max);
+    let le = app2(&mut v, OP_LE, term(v, r), tm);
+    vec_push(&mut st.pc, le);
+    return r;
   }
   if name_is(p, i, "pt_put") || name_is(p, i, "pt_take") || name_is(p, i, "pt_put_frame") || name_is(p, i, "pt_take_frame") {
     return pt_slot(&mut v, c, m, p, i, args, vals, &mut st);
@@ -2616,16 +2791,35 @@ fn builtin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Vec
   if name_is(p, i, "cpu_run") || name_is(p, i, "cpu_idle") {
     return fresh_upto(&mut v, &mut st, "vector", 255);
   }
-  if name_is(p, i, "cpu_get") || name_is(p, i, "cpu_set") {
-    let mut lim = 20;
-    if name_is(p, i, "cpu_set") {
-      lim = 18;
-    }
-    need_lt(&mut v, st, term(v, x1), lim);
-    if name_is(p, i, "cpu_set") {
-      return v.unit;
-    }
+  if name_is(p, i, "cpu_count") {
+    let x = fresh_u64_named(&mut v, "cpus");
+    // The platform's promise: at least this processor, and no more than
+    // 4096 (so per-processor tables can be allocated).
+    let one = num(&mut v, 1);
+    let most = num(&mut v, 4096);
+    let a = app2(&mut v, OP_GE, term(v, x), one);
+    let b = app2(&mut v, OP_LE, term(v, x), most);
+    let g = app2(&mut v, OP_AND, a, b);
+    vec_push(&mut st.pc, g);
+    return x;
+  }
+  if name_is(p, i, "cpu_get") {
+    need_lt(&mut v, st, term(v, x1), 21);
     return fresh_u64_named(&mut v, "reg");
+  }
+  if name_is(p, i, "cpu_set") {
+    // Registers 0-17 and the FS base (20); the error code and fault address
+    // (18, 19) are only reported by a trap.
+    let r = term(v, x1);
+    let lo = app2(&mut v, OP_LE, v.t_zero, r);
+    let t18 = num(&mut v, 18);
+    let t20 = num(&mut v, 20);
+    let a = app2(&mut v, OP_LT, r, t18);
+    let b = app2(&mut v, OP_EQ, r, t20);
+    let ab = app2(&mut v, OP_OR, a, b);
+    let g = app2(&mut v, OP_AND, lo, ab);
+    prove(&mut v, st, g);
+    return v.unit;
   }
 
   // ---- user programs ----
@@ -2638,12 +2832,27 @@ fn builtin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Vec
     prove(&mut v, st, g);
     return fresh_u64_named(&mut v, "spawn");
   }
-  if name_is(p, i, "sys_wait") || name_is(p, i, "sys_kill") || name_is(p, i, "sys_getpid") || name_is(p, i, "sys_info") {
+  if name_is(p, i, "sys_send") {
+    let a2 = vl_at(v, x2);
+    let g = app2(&mut v, OP_LE, term(v, u_at(vals, 3)), a2.a);
+    prove(&mut v, st, g);
+  }
+  if name_is(p, i, "sys_recv") {
+    // The kernel may overwrite every byte of the buffer, but not its length.
+    let a2 = vl_at(v, x2);
+    let fx = fresh_of_named(&mut v, c, m, p, v.ty_bytes, "recv");
+    let f = vl_at(v, fx);
+    let nb = mk(&mut v, VV_BUF, 0, a2.a, f.b, 0, 0);
+    put_back(&mut v, m, p, &mut st, u_at(args, 2), nb);
+  }
+  if name_is(p, i, "sys_wait") || name_is(p, i, "sys_kill") || name_is(p, i, "sys_getpid") || name_is(p, i, "sys_info")
+    || name_is(p, i, "sys_call") || name_is(p, i, "sys_send") || name_is(p, i, "sys_recv") {
     let n = node_at(p.nodes, i);
     let h = atom_src(&mut v, p, n.s, n.e);
     return fresh_u64(&mut v, h);
   }
-  // free, print, bfree, child_close, sys_yield, sys_ps, sys_poweroff
+  // free, print, bfree, child_close, cpu_fpu_save and cpu_fpu_load (the
+  // page's contents are not tracked), sys_yield, sys_ps, sys_poweroff
   return v.unit;
 }
 
@@ -2984,8 +3193,8 @@ fn stmt_while(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: VSt
   // 2. havoc what the body (or the condition) changes, enclosing places
   // first, so a field's own havoc lands inside its struct's
   let mut changed = vec_new[Chg]();
-  changed_vars(&mut v, p, n.c, &mut changed);
-  changed_in_expr(&mut v, p, n.a, &mut changed);
+  changed_vars(&mut v, c, &mut m, p, n.c, &mut changed);
+  changed_in_expr(&mut v, c, &mut m, p, n.a, &mut changed);
   sort_changed(v, &mut changed);
   let mut l = st_clone(s);
   let mut k = 0;
@@ -3096,10 +3305,12 @@ fn sort_changed(v: &Vr, xs: &mut Vec[Chg]) {
   }
 }
 
-/// The places a loop body may change, with a flag that is true when every
-/// change keeps the value's shape: `x = set(x, ..)` keeps a Buf's length,
-/// and the builtins in `shape_keeping` keep an object's id, level and size.
-fn changed_vars(v: &mut Vr, p: &Parser, head: u64, out: &mut Vec[Chg]) {
+/// The places a loop body (or a function body) may change, with a flag that
+/// is true when every change keeps the value's shape: `x = set(x, ..)` keeps
+/// a Buf's length, the builtins in `shape_keeping` keep an object's id, level
+/// and size, and a user function changes what its summary says. Calls are
+/// resolved in instance `v.env`.
+fn changed_vars(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, head: u64, out: &mut Vec[Chg]) {
   let mut i = head;
   while i != 0 {
     let n = node_at(p.nodes, i);
@@ -3113,27 +3324,27 @@ fn changed_vars(v: &mut Vr, p: &Parser, head: u64, out: &mut Vec[Chg]) {
         only_set = a0 != 0 && same_text(v, a0, name);
       }
       chg_add(v, &mut out, name, only_set);
-      changed_in_expr(&mut v, p, n.b, &mut out);
+      changed_in_expr(&mut v, c, &mut m, p, n.b, &mut out);
     } else if k == S_LET || k == S_EXPR || k == S_RETURN {
       let e = n.a;
       if k == S_LET {
-        changed_in_expr(&mut v, p, n.b, &mut out);
+        changed_in_expr(&mut v, c, &mut m, p, n.b, &mut out);
       } else if e != 0 {
-        changed_in_expr(&mut v, p, e, &mut out);
+        changed_in_expr(&mut v, c, &mut m, p, e, &mut out);
       }
     } else if k == S_IF {
-      changed_in_expr(&mut v, p, n.a, &mut out);
-      changed_vars(&mut v, p, n.b, &mut out);
-      changed_vars(&mut v, p, n.c, &mut out);
+      changed_in_expr(&mut v, c, &mut m, p, n.a, &mut out);
+      changed_vars(&mut v, c, &mut m, p, n.b, &mut out);
+      changed_vars(&mut v, c, &mut m, p, n.c, &mut out);
     } else if k == S_WHILE {
-      changed_in_expr(&mut v, p, n.a, &mut out);
-      changed_vars(&mut v, p, n.c, &mut out);
+      changed_in_expr(&mut v, c, &mut m, p, n.a, &mut out);
+      changed_vars(&mut v, c, &mut m, p, n.c, &mut out);
     } else if k == S_MATCH {
-      changed_in_expr(&mut v, p, n.a, &mut out);
+      changed_in_expr(&mut v, c, &mut m, p, n.a, &mut out);
       let mut a = n.b;
       while a != 0 {
         let an = node_at(p.nodes, a);
-        changed_vars(&mut v, p, an.c, &mut out);
+        changed_vars(&mut v, c, &mut m, p, an.c, &mut out);
         a = an.next;
       }
     }
@@ -3146,44 +3357,256 @@ fn shape_keeping(p: &Parser, i: u64) -> bool {
   return name_is(p, i, "bset") || name_is(p, i, "vec_set") || name_is(p, i, "vec_swap") || name_is(p, i, "pt_put")
     || name_is(p, i, "pt_take") || name_is(p, i, "pt_put_frame") || name_is(p, i, "pt_take_frame")
     || name_is(p, i, "pool_take") || name_is(p, i, "pool_give") || name_is(p, i, "frame_write")
-    || name_is(p, i, "frame_write8") || name_is(p, i, "cpu_set") || name_is(p, i, "cpu_run") || name_is(p, i, "cpu_idle");
+    || name_is(p, i, "frame_write8") || name_is(p, i, "cpu_set") || name_is(p, i, "cpu_run") || name_is(p, i, "cpu_idle")
+    || name_is(p, i, "cpu_fpu_save") || name_is(p, i, "cpu_fpu_load") || name_is(p, i, "pio_in8") || name_is(p, i, "pio_in16")
+    || name_is(p, i, "pio_in32") || name_is(p, i, "pio_out8") || name_is(p, i, "pio_out16") || name_is(p, i, "pio_out32");
 }
 
-/// The places lent as `&mut` anywhere in `i`.
-fn changed_in_expr(v: &mut Vr, p: &Parser, i: u64, out: &mut Vec[Chg]) {
+/// Places deeper than this many parts are summarized by their prefix of
+/// this depth, marked as changed in any way. Recursion through boxes could
+/// otherwise grow paths forever.
+const SUMMARY_DEPTH: u64 = 8;
+
+/// Records that `path` may change (`keep`: only in shape-keeping ways).
+fn note(v: &mut Vr, out: &mut Vec[Chg], path: u64, keep: bool) {
+  if dots(v, path) < SUMMARY_DEPTH {
+    chg_add(v, &mut out, path, keep);
+    return;
+  }
+  let t = tm_at(v, path);
+  let mut seen = 0;
+  let mut k = 0;
+  while k < t.b && seen < SUMMARY_DEPTH {
+    if pool_at(v, vadd(t.a, k)) == 46 {
+      seen = seen + 1;
+    }
+    k = k + 1;
+  }
+  // k is just past the SUMMARY_DEPTH-th dot.
+  let mut cut = k;
+  if cut > 0 {
+    cut = cut - 1;
+  }
+  let short = prefix(&mut v, path, cut);
+  chg_add(v, &mut out, short, false);
+}
+
+/// The places lent as `&mut` anywhere in `i`, and what the callee may
+/// change under them.
+fn changed_in_expr(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, out: &mut Vec[Chg]) {
   let n = node_at(p.nodes, i);
   let k = n.kind;
   if k == E_CALL {
-    let keep = shape_keeping(p, i);
-    let mut a = n.a;
-    while a != 0 {
-      let an = node_at(p.nodes, a);
-      if an.kind == E_MUTBORROW {
-        let name = list_text(&mut v, p, an.a);
-        chg_add(v, &mut out, name, keep);
-      } else {
-        changed_in_expr(&mut v, p, a, &mut out);
-      }
-      a = an.next;
-    }
+    call_changes(&mut v, c, &mut m, p, i, 0, &mut out);
   } else if k == E_TAPP {
     // A call of a generic function (stage0 has made it a plain call by now).
     if !is_typed_builtin(p, n.b) {
-      changed_in_expr(&mut v, p, n.b, &mut out);
+      let x = tapp_inst(&mut m, p, i, v.env);
+      call_changes(&mut v, c, &mut m, p, n.b, x, &mut out);
     }
   } else if k == E_NOT || k == E_IS || (k == E_VARIANT && n.a != 0) {
-    changed_in_expr(&mut v, p, n.a, &mut out);
+    changed_in_expr(&mut v, c, &mut m, p, n.a, &mut out);
   } else if k == E_BIN {
-    changed_in_expr(&mut v, p, n.a, &mut out);
-    changed_in_expr(&mut v, p, n.b, &mut out);
+    changed_in_expr(&mut v, c, &mut m, p, n.a, &mut out);
+    changed_in_expr(&mut v, c, &mut m, p, n.b, &mut out);
   } else if k == E_SLIT {
     let mut f = n.a;
     while f != 0 {
       let fi = node_at(p.nodes, f);
-      changed_in_expr(&mut v, p, fi.a, &mut out);
+      changed_in_expr(&mut v, c, &mut m, p, fi.a, &mut out);
       f = fi.next;
     }
   }
+}
+
+/// `changed_in_expr` for call `i` (of instance `inst`, 0 for a plain call).
+fn call_changes(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64, out: &mut Vec[Chg]) {
+  let n = node_at(p.nodes, i);
+  let bi = inst == 0 && is_builtin_name(c, p, n.s, n.e);
+  let keep = bi && shape_keeping(p, i);
+  let mut x = inst;
+  if !bi && x == 0 {
+    let d = plain_fn(p, n.s, n.e);
+    if d != 0 {
+      x = plain_inst(&mut m, d);
+    }
+  }
+  let mut a = n.a;
+  let mut j = 0;
+  while a != 0 && j < SRC_MAX {
+    let an = node_at(p.nodes, a);
+    if an.kind == E_MUTBORROW {
+      let name = list_text(&mut v, p, an.a);
+      if bi {
+        note(&mut v, &mut out, name, keep);
+      } else if !apply_summary(&mut v, x, j, name, &mut out) {
+        note(&mut v, &mut out, name, false);
+      }
+    } else {
+      changed_in_expr(&mut v, c, &mut m, p, a, &mut out);
+    }
+    a = an.next;
+    j = j + 1;
+  }
+}
+
+/// The length of atom `a`'s text.
+fn tm_len(v: &Vr, a: u64) -> u64 {
+  let t = tm_at(v, a);
+  return t.b;
+}
+
+fn row_param(v: &Vr, k: u64) -> u64 {
+  let r = sum_row(v, k);
+  return r.j;
+}
+
+fn sum_row(v: &Vr, k: u64) -> SumRow {
+  if k < vec_len(v.sums) {
+    return vec_get(v.sums, k);
+  }
+  return SumRow { x: 0, j: 0, rel: 0, keep: false };
+}
+
+/// Notes what instance `x`'s summary for parameter `j` says may change
+/// under place `name`. False if it has none.
+fn apply_summary(v: &mut Vr, x: u64, j: u64, name: u64, out: &mut Vec[Chg]) -> bool {
+  let start = u_at(v.sum_start, x);
+  let end = vadd(start, u_at(v.sum_n, x));
+  let mut found = false;
+  let mut k = start;
+  while k < end {
+    let r = sum_row(v, k);
+    if r.j == j {
+      found = true;
+      let path = cat_text(&mut v, name, r.rel);
+      note(&mut v, &mut out, path, r.keep);
+    }
+    k = k + 1;
+  }
+  return found;
+}
+
+/// The text of `a` followed by the text of `b`.
+fn cat_text(v: &mut Vr, a: u64, b: u64) -> u64 {
+  let start = vec_len(v.pool);
+  push_text(&mut v, a);
+  push_text(&mut v, b);
+  return seal(&mut v, start);
+}
+
+/// Computes every function's summaries from its body: what `changed_vars`
+/// finds under each `&mut` parameter, where lending a place to another
+/// user function counts as that function's summary applied to the place.
+///
+/// This is a greatest fixed point: it starts from "every parameter keeps
+/// its shape" and weakens summaries until none changes. Sound for recursion
+/// too: a change that is not shape-keeping happens at some assignment or
+/// builtin call, which is recorded there and then propagates to every
+/// caller. (Each round reads the previous round's summaries; summaries only
+/// ever weaken, so this reaches the same fixed point as stage0's in-place
+/// updates.)
+fn summarize(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
+  let empty = atom_str(&mut v, "");
+  let mut rows = vec_new[SumRow]();
+  let mut starts = vec_new[u64]();
+  let mut ns = vec_new[u64]();
+  sum_round(&mut v, c, &mut m, p, empty, false, &mut rows, &mut starts, &mut ns);
+  let mut more = true;
+  while more {
+    vec_free(v.sums);
+    vec_free(v.sum_start);
+    vec_free(v.sum_n);
+    v.sums = rows;
+    v.sum_start = starts;
+    v.sum_n = ns;
+    rows = vec_new[SumRow]();
+    starts = vec_new[u64]();
+    ns = vec_new[u64]();
+    sum_round(&mut v, c, &mut m, p, empty, true, &mut rows, &mut starts, &mut ns);
+    more = !same_rows(v, rows);
+  }
+  vec_free(rows);
+  vec_free(starts);
+  vec_free(ns);
+}
+
+/// One round of `summarize`, into `rows`. Without `scan`, every `&mut`
+/// parameter gets the starting summary ("keeps its shape").
+fn sum_round(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, empty: u64, scan: bool,
+             rows: &mut Vec[SumRow], starts: &mut Vec[u64], ns: &mut Vec[u64]) {
+  while vec_len(starts) < vec_len(m.insts) {
+    vec_push(&mut starts, 0);
+    vec_push(&mut ns, 0);
+  }
+  let mut k = 0;
+  while k < vec_len(m.fns) {
+    let x = u_at(m.fns, k);
+    let xi = inst_at(m, x);
+    let d = node_at(p.nodes, xi.def);
+    let mut out = vec_new[Chg]();
+    if scan {
+      v.env = x;
+      changed_vars(&mut v, c, &mut m, p, d.x, &mut out);
+    }
+    let start = vec_len(rows);
+    let mut cnt = 0;
+    let mut q = d.a;
+    let mut j = 0;
+    while q != 0 && j < SRC_MAX {
+      let qn = node_at(p.nodes, q);
+      let pt = conv(&mut m, p, qn.a, x, q);
+      if kind_t(m, pt) == TY_MUTREF {
+        let mut s = vec_new[Chg]();
+        vec_push(&mut s, Chg { name: empty, keep: true });
+        let mut o = 0;
+        while o < vec_len(out) {
+          let ch = chg_at(out, o);
+          let t = tm_at(v, ch.name);
+          let root = seg_end(v, ch.name, 0);
+          if root <= t.b && rng_is_src(v, t.a, root, p, qn.s, qn.e) {
+            let rel = new_tm(&mut v, VT_ATOM, vadd(t.a, root), t.b - root, 0);
+            chg_add(v, &mut s, rel, ch.keep);
+          }
+          o = o + 1;
+        }
+        sort_changed(v, &mut s);
+        o = 0;
+        while o < vec_len(s) {
+          let ch = chg_at(s, o);
+          vec_push(&mut rows, SumRow { x: x, j: j, rel: ch.name, keep: ch.keep });
+          cnt = vadd(cnt, 1);
+          o = o + 1;
+        }
+        vec_free(s);
+      }
+      q = qn.next;
+      j = j + 1;
+    }
+    vec_free(out);
+    if x < vec_len(starts) && x < vec_len(ns) {
+      vec_set(&mut starts, x, start);
+      vec_set(&mut ns, x, cnt);
+    }
+    k = k + 1;
+  }
+}
+
+/// Are `rows` the summaries already in `v`?
+fn same_rows(v: &Vr, rows: &Vec[SumRow]) -> bool {
+  if vec_len(rows) != vec_len(v.sums) {
+    return false;
+  }
+  let mut k = 0;
+  while k < vec_len(rows) {
+    let a = vec_get(rows, k);
+    let b = sum_row(v, k);
+    if a.x != b.x || a.j != b.j || a.keep != b.keep || !same_text(v, a.rel, b.rel) {
+      return false;
+    }
+    k = k + 1;
+  }
+  return true;
 }
 
 // ---- Functions ----
@@ -3248,6 +3671,12 @@ fn verify_fn(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
       } else if bk == TY_MMU {
         let eq = app2(&mut v, OP_EQ, g_root(v, y), v.t_flimit);
         vec_push(&mut st.pc, eq);
+      } else if bk == TY_PORTS {
+        let sel = app2(&mut v, OP_SELECT, g_free(v, y), v.t_k);
+        let r = all_ports(&mut v);
+        let eq = app2(&mut v, OP_EQ, sel, r);
+        let all = forall_tm(&mut v, v.t_k, eq);
+        vec_push(&mut st.pc, all);
       }
       q = qn.next;
     }
@@ -3272,13 +3701,19 @@ fn verify_fn(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
 /// Verifies every function of the program monomorphized into `m` and
 /// checked by `c`.
 fn verify_program(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
+  summarize(&mut v, c, &mut m, p);
   send(&mut v, CMD_DECL, v.t_poolsize, SO_INT);
   let r = in_range(&mut v, v.t_zero, v.t_poolsize, v.t_flimit);
   assert_tm(&mut v, r);
+  // Each function gets its own solver scope: what is declared and assumed
+  // while verifying one (some of it quantified) must not burden the queries
+  // for all later ones.
   let mut k = 0;
   while k < vec_len(m.fns) {
     let x = u_at(m.fns, k);
+    send(&mut v, CMD_PUSH, 0, 0);
     verify_fn(&mut v, c, &mut m, p, x);
+    send(&mut v, CMD_POP, 0, 0);
     k = k + 1;
   }
 }
