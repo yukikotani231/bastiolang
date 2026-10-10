@@ -85,7 +85,7 @@ const FRAME_LIMIT: u64 = 65536;
 const BOX_DEPTH: u64 = 2;
 
 struct Tm { kind: u64, a: u64, b: u64, c: u64 }
-struct Vl { kind: u64, ty: u64, a: u64, b: u64, c: u64, n: u64, d: u64 }
+struct Vl { kind: u64, ty: u64, a: u64, b: u64, c: u64, n: u64, d: u64, e: u64 }
 struct Cmd { kind: u64, a: u64, b: u64 }
 /// A variable (named by its source text s..e) and its value. A variable no
 /// program can name (`locked*N`, see `vlocked`) has its name in the text
@@ -131,6 +131,7 @@ const VC_EXPORT: u64 = 17;
 const VC_LOCKINV: u64 = 18;
 const VC_SHIFT: u64 = 19;
 const VC_LEASE: u64 = 20;
+const VC_SHARED: u64 = 21;
 
 fn vc_name(code: u64) -> Str {
   if code == VC_ALLOC { return "E-VERIFY-ALLOC"; }
@@ -151,6 +152,7 @@ fn vc_name(code: u64) -> Str {
   if code == VC_LOCKINV { return "E-VERIFY-LOCKINV"; }
   if code == VC_SHIFT { return "E-VERIFY-SHIFT"; }
   if code == VC_LEASE { return "E-VERIFY-LEASE"; }
+  if code == VC_SHARED { return "E-VERIFY-SHARED"; }
   return "E-VERIFY-UNREACHABLE";
 }
 
@@ -228,7 +230,7 @@ fn vr_new(m: &mut Mono, p: &Parser) -> Vr {
   let mut tms = vec_new[Tm]();
   vec_push(&mut tms, Tm { kind: 0, a: 0, b: 0, c: 0 });
   let mut vals = vec_new[Vl]();
-  vec_push(&mut vals, Vl { kind: 0, ty: 0, a: 0, b: 0, c: 0, n: 0, d: 0 });
+  vec_push(&mut vals, Vl { kind: 0, ty: 0, a: 0, b: 0, c: 0, n: 0, d: 0, e: 0 });
   let mut v = Vr {
     pool: vec_new[u64](), tms: tms, targs: vec_new[u64](), vals: vals, kids: vec_new[u64](),
     log: vec_new[Cmd](), counter: 0, obligations: 0, box_depth: 0, cur: 0, env: 0, cnt_fns: vec_new[u64](), counts: false, dec_fns: vec_new[u64](),
@@ -470,6 +472,7 @@ fn push_ty(v: &mut Vr, m: &Mono, p: &Parser, t: u64) {
   else if k == TY_MMIO { push_str(&mut v, "Mmio"); }
   else if k == TY_DMA { push_str(&mut v, "Dma"); }
   else if k == TY_LEASE { push_str(&mut v, "Lease"); }
+  else if k == TY_SHARED { push_str(&mut v, "Shared"); }
   else if k == TY_U8 { push_str(&mut v, "u8"); }
   else if k == TY_U16 { push_str(&mut v, "u16"); }
   else if k == TY_U32 { push_str(&mut v, "u32"); }
@@ -1289,19 +1292,19 @@ fn vl_at(v: &Vr, x: u64) -> Vl {
   if x < vec_len(v.vals) {
     return vec_get(v.vals, x);
   }
-  return Vl { kind: 0, ty: 0, a: 0, b: 0, c: 0, n: 0, d: 0 };
+  return Vl { kind: 0, ty: 0, a: 0, b: 0, c: 0, n: 0, d: 0, e: 0 };
 }
 
 fn mk(v: &mut Vr, kind: u64, tyx: u64, a: u64, b: u64, c: u64, n: u64) -> u64 {
   let k = vec_len(v.vals);
-  vec_push(&mut v.vals, Vl { kind: kind, ty: tyx, a: a, b: b, c: c, n: n, d: 0 });
+  vec_push(&mut v.vals, Vl { kind: kind, ty: tyx, a: a, b: b, c: c, n: n, d: 0, e: 0 });
   return k;
 }
 
-/// An object of type `tyx` with ghost fields a, b, c, d (n of them).
-fn mk_o(v: &mut Vr, tyx: u64, a: u64, b: u64, c: u64, d: u64, n: u64) -> u64 {
+/// An object of type `tyx` with ghost fields a, b, c, d, e (n of them).
+fn mk_o(v: &mut Vr, tyx: u64, a: u64, b: u64, c: u64, d: u64, e: u64, n: u64) -> u64 {
   let k = vec_len(v.vals);
-  vec_push(&mut v.vals, Vl { kind: VV_OBJ, ty: tyx, a: a, b: b, c: c, n: n, d: d });
+  vec_push(&mut v.vals, Vl { kind: VV_OBJ, ty: tyx, a: a, b: b, c: c, n: n, d: d, e: e });
   return k;
 }
 
@@ -1355,9 +1358,9 @@ fn term(v: &Vr, x: u64) -> u64 {
 
 /// How many ghost fields an object of type kind `k` has.
 fn obj_fields(k: u64) -> u64 {
-  if k == TY_PT { return 4; }
+  if k == TY_PT { return 5; }
   if k == TY_POOL { return 2; }
-  if k == TY_FRAME || k == TY_MMU || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA { return 1; }
+  if k == TY_FRAME || k == TY_MMU || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA || k == TY_SHARED { return 1; }
   if k == TY_PORTIO || k == TY_MMIO { return 2; }
   return 0;
 }
@@ -1367,7 +1370,8 @@ fn obj_field(v: &Vr, x: u64, j: u64) -> u64 {
   if j == 0 { return xv.a; }
   if j == 1 { return xv.b; }
   if j == 2 { return xv.c; }
-  return xv.d;
+  if j == 3 { return xv.d; }
+  return xv.e;
 }
 
 // The ghost fields by name.
@@ -1375,6 +1379,7 @@ fn g_id(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 0); }       // Frame, Pa
 fn g_level(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 1); }    // PageTable
 fn g_used(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 2); }     // PageTable
 fn g_leases(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 3); }   // PageTable
+fn g_shared(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 4); }   // PageTable
 fn g_has(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 0); }      // Pool
 fn g_size(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 1); }     // Pool
 fn g_root(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 0); }     // Mmu
@@ -1384,18 +1389,18 @@ fn g_count(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 1); }    // PortIo
 fn g_len(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 1); }      // Mmio
 
 fn mk_obj(v: &mut Vr, m: &Mono, tyx: u64, a: u64, b: u64, c: u64) -> u64 {
-  return mk_o(&mut v, tyx, a, b, c, 0, obj_fields(kind_t(m, tyx)));
+  return mk_o(&mut v, tyx, a, b, c, 0, 0, obj_fields(kind_t(m, tyx)));
 }
 
-/// A page table: id, level, used, leases.
-fn mk_pt(v: &mut Vr, tyx: u64, id: u64, level: u64, used: u64, leases: u64) -> u64 {
-  return mk_o(&mut v, tyx, id, level, used, leases, 4);
+/// A page table: id, level, used, leases, shared.
+fn mk_pt(v: &mut Vr, tyx: u64, id: u64, level: u64, used: u64, leases: u64, shared: u64) -> u64 {
+  return mk_o(&mut v, tyx, id, level, used, leases, shared, 5);
 }
 
 /// The sort of ghost field `j` of an object of type kind `k`: an array of
-/// Bool for `used` and `has`, Int otherwise.
+/// Bool for `used`, `shared` and `has`, Int otherwise.
 fn obj_field_sort(k: u64, j: u64) -> u64 {
-  if (k == TY_PT && j == 2) || ((k == TY_POOL || k == TY_PORTS || k == TY_MMIOSPACE) && j == 0) {
+  if (k == TY_PT && (j == 2 || j == 4)) || ((k == TY_POOL || k == TY_PORTS || k == TY_MMIOSPACE) && j == 0) {
     return SO_BOOL + 2;
   }
   return SO_INT;
@@ -1420,7 +1425,7 @@ fn val_eq(v: &Vr, a: u64, b: u64) -> bool {
   }
   if k == VV_OBJ {
     return (x.n < 1 || tm_eq(v, x.a, y.a)) && (x.n < 2 || tm_eq(v, x.b, y.b)) && (x.n < 3 || tm_eq(v, x.c, y.c))
-      && (x.n < 4 || tm_eq(v, x.d, y.d));
+      && (x.n < 4 || tm_eq(v, x.d, y.d)) && (x.n < 5 || tm_eq(v, x.e, y.e));
   }
   if k == VV_STRUCT || k == VV_ENUM {
     if k == VV_ENUM && !tm_eq(v, x.a, y.a) {
@@ -1470,7 +1475,9 @@ fn merge(v: &mut Vr, c: u64, a: u64, b: u64) -> u64 {
     if x.n > 2 { f2 = ite(&mut v, c, x.c, y.c); }
     let mut f3 = 0;
     if x.n > 3 { f3 = ite(&mut v, c, x.d, y.d); }
-    return mk_o(&mut v, x.ty, f0, f1, f2, f3, x.n);
+    let mut f4 = 0;
+    if x.n > 4 { f4 = ite(&mut v, c, x.e, y.e); }
+    return mk_o(&mut v, x.ty, f0, f1, f2, f3, f4, x.n);
   }
   if k == VV_STRUCT || k == VV_ENUM {
     let mut tag = 0;
@@ -1589,7 +1596,9 @@ fn rebuild(v: &mut Vr, x: u64, ts: &Vec[u64]) -> u64 {
     if xv.n > 2 { f2 = next_leaf(&mut v, ts); }
     let mut f3 = 0;
     if xv.n > 3 { f3 = next_leaf(&mut v, ts); }
-    return mk_o(&mut v, xv.ty, f0, f1, f2, f3, xv.n);
+    let mut f4 = 0;
+    if xv.n > 4 { f4 = next_leaf(&mut v, ts); }
+    return mk_o(&mut v, xv.ty, f0, f1, f2, f3, f4, xv.n);
   }
   if k == VV_STRUCT || k == VV_ENUM {
     let mut tag = 0;
@@ -1967,6 +1976,10 @@ fn fresh_field(v: &mut Vr, tk: u64, j: u64, hint: u64) -> u64 {
     let h = cat_str(&mut v, hint, "_used");
     return fresh_array(&mut v, h, SO_BOOL);
   }
+  if tk == TY_PT && j == 4 {
+    let h = cat_str(&mut v, hint, "_shared");
+    return fresh_array(&mut v, h, SO_BOOL);
+  }
   if tk == TY_POOL && j == 0 {
     let h = cat_str(&mut v, hint, "_has");
     return fresh_array(&mut v, h, SO_BOOL);
@@ -2021,7 +2034,7 @@ fn fresh_field(v: &mut Vr, tk: u64, j: u64, hint: u64) -> u64 {
 /// Ghost fields a loop keeps when only builtins that never change them
 /// change the object (a page table keeps its id and level).
 fn kept_by_builtins(tk: u64, j: u64) -> bool {
-  return ((tk == TY_FRAME || tk == TY_PT || tk == TY_DMA) && j == 0) || (tk == TY_PT && (j == 1 || j == 3)) || (tk == TY_POOL && j == 1)
+  return ((tk == TY_FRAME || tk == TY_PT || tk == TY_DMA || tk == TY_SHARED) && j == 0) || (tk == TY_PT && (j == 1 || j == 3)) || (tk == TY_POOL && j == 1)
     || ((tk == TY_PORTIO || tk == TY_MMIO) && j <= 1);
 }
 
@@ -2038,6 +2051,8 @@ fn fresh_obj(v: &mut Vr, m: &Mono, tyx: u64, hint: u64, live: bool) -> u64 {
   if n > 2 { f2 = fresh_field(&mut v, tk, 2, hint); }
   let mut f3 = 0;
   if n > 3 { f3 = fresh_field(&mut v, tk, 3, hint); }
+  let mut f4 = 0;
+  if n > 4 { f4 = fresh_field(&mut v, tk, 4, hint); }
   if tk == TY_PORTIO || tk == TY_MMIO {
     let sum = app2(&mut v, OP_ADD, f0, f1);
     let mut lim = v.t_plimit;
@@ -2057,7 +2072,7 @@ fn fresh_obj(v: &mut Vr, m: &Mono, tyx: u64, hint: u64, live: bool) -> u64 {
     let imp = app2(&mut v, OP_IMP, below, none);
     assert_tm(&mut v, imp);
   }
-  return mk_o(&mut v, tyx, f0, f1, f2, f3, n);
+  return mk_o(&mut v, tyx, f0, f1, f2, f3, f4, n);
 }
 
 /// A value of type `tyx` about which nothing is known but its type.
@@ -2333,7 +2348,9 @@ fn havoc(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, oenv: u64, keep: bool, n
     if xv.n > 2 && !(keep && kept_by_builtins(tk, 2)) { f2 = fresh_field(&mut v, tk, 2, name); }
     let mut f3 = xv.d;
     if xv.n > 3 && !(keep && kept_by_builtins(tk, 3)) { f3 = fresh_field(&mut v, tk, 3, name); }
-    return mk_o(&mut v, xv.ty, f0, f1, f2, f3, xv.n);
+    let mut f4 = xv.e;
+    if xv.n > 4 && !(keep && kept_by_builtins(tk, 4)) { f4 = fresh_field(&mut v, tk, 4, name); }
+    return mk_o(&mut v, xv.ty, f0, f1, f2, f3, f4, xv.n);
   }
   if k == VV_STRUCT || k == VV_ENUM {
     let mut tag = xv.a;
@@ -2957,7 +2974,7 @@ fn vspec_builtin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env:
     let ix = spec_tm(&mut v, c, &mut m, p, arg_node(p, i, 1), env, oenv, has_old, res, &mut bound);
     return app2(&mut v, OP_SELECT, xv.b, ix);
   }
-  if span_is(p, n.s, n.e, "frame_id") || span_is(p, n.s, n.e, "pt_id") || span_is(p, n.s, n.e, "dma_id") {
+  if span_is(p, n.s, n.e, "frame_id") || span_is(p, n.s, n.e, "pt_id") || span_is(p, n.s, n.e, "dma_id") || span_is(p, n.s, n.e, "shared_id") {
     return g_id(v, x);
   }
   if span_is(p, n.s, n.e, "pt_level") {
@@ -2983,6 +3000,10 @@ fn vspec_builtin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env:
   }
   if span_is(p, n.s, n.e, "mmio_len") {
     return g_len(v, x);
+  }
+  if span_is(p, n.s, n.e, "pt_shared") {
+    let ix = spec_tm(&mut v, c, &mut m, p, arg_node(p, i, 1), env, oenv, has_old, res, &mut bound);
+    return app2(&mut v, OP_SELECT, g_shared(v, x), ix);
   }
   if span_is(p, n.s, n.e, "pt_used") || span_is(p, n.s, n.e, "pool_has") || span_is(p, n.s, n.e, "port_free") || span_is(p, n.s, n.e, "mmio_free") {
     let mut arr = g_used(v, x);
@@ -3743,7 +3764,7 @@ fn vpt_borrow(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mu
     let fv = vl_at(v, fc);
     let one2 = num(&mut v, 1);
     let below = app2(&mut v, OP_SUB, lvl, one2);
-    child = mk_pt(&mut v, v.ty_pt, fv.a, below, fv.c, g_leases(v, t));
+    child = mk_pt(&mut v, v.ty_pt, fv.a, below, fv.c, g_leases(v, t), fv.e);
   } else {
     let one = num(&mut v, 1);
     let g = app2(&mut v, OP_EQ, lvl, one);
@@ -4505,7 +4526,7 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     vm_arg(&mut v, p, u_at(args, 1));
     vm_s(&mut v, "` is between 1 and 5");
     prove(&mut v, st, g, i, VC_PT);
-    return mk_pt(&mut v, v.ty_pt, g_id(v, x0), lvl, v.t_nobool, v.t_zero);
+    return mk_pt(&mut v, v.ty_pt, g_id(v, x0), lvl, v.t_nobool, v.t_zero, v.t_nobool);
   }
   if name_is(p, i, "pt_free") || name_is(p, i, "pt_free_root") {
     let mut t = x0;
@@ -4836,6 +4857,101 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     return pt_slot(&mut v, c, m, p, i, args, vals, &mut st);
   }
 
+  // ---- shared pages ----
+  // A Shared is one reference to a page; the runtime counts them (part of
+  // the trusted base). The page goes back to the pool only with the last one.
+  if name_is(p, i, "shared_new") || name_is(p, i, "shared_dup") {
+    return mk_obj(&mut v, m, kind_ty(m, p, TY_SHARED), g_id(v, x0), 0, 0);
+  }
+  if name_is(p, i, "shared_id") {
+    return mk_u(&mut v, g_id(v, x0));
+  }
+  if name_is(p, i, "shared_drop") {
+    // The page's number if this was the last reference (the pool has the
+    // page again), or 2^64 - 1.
+    let id = g_id(v, x1);
+    let r = fresh_u64_named(&mut v, "shared_drop");
+    let last = app2(&mut v, OP_EQ, term(v, r), id);
+    let none = app2(&mut v, OP_EQ, term(v, r), v.t_u64max);
+    let either = app2(&mut v, OP_OR, last, none);
+    vec_push(&mut st.pc, either);
+    let back = app3(&mut v, OP_STORE, g_has(v, x0), id, v.t_true);
+    let nh = app3(&mut v, OP_ITE, last, back, g_has(v, x0));
+    let np = mk_obj(&mut v, m, v.ty_pool, nh, g_size(v, x0), 0);
+    put_back(&mut v, m, p, &mut st, u_at(args, 0), np);
+    return r;
+  }
+  if name_is(p, i, "pt_shared") || name_is(p, i, "pt_put_shared") || name_is(p, i, "pt_take_shared") || name_is(p, i, "pt_dup_shared") {
+    let ix = term(v, x1);
+    let sa0 = u_at(args, 0);
+    let sa1 = u_at(args, 1);
+    need_lt(&mut v, p, st, i, ix, 512, sa1, "a page table (512 slots)");
+    let one = num(&mut v, 1);
+    let g = app2(&mut v, OP_EQ, g_level(v, x0), one);
+    vm_s(&mut v, "that `");
+    vm_arg(&mut v, p, sa0);
+    vm_s(&mut v, "` is a last-level table (level 1), which maps pages");
+    prove(&mut v, st, g, i, VC_PT);
+    let used = g_used(v, x0);
+    let sh = g_shared(v, x0);
+    if name_is(p, i, "pt_shared") {
+      let sel = app2(&mut v, OP_SELECT, sh, ix);
+      return mk_b(&mut v, sel);
+    }
+    if name_is(p, i, "pt_put_shared") {
+      let sel = app2(&mut v, OP_SELECT, used, ix);
+      let g2 = t_not(&mut v, sel);
+      vm_s(&mut v, "that slot `");
+    vm_arg(&mut v, p, sa1);
+    vm_s(&mut v, "` of `");
+    vm_arg(&mut v, p, sa0);
+      vm_s(&mut v, "` is empty (`!pt_used(");
+      vm_arg(&mut v, p, sa0);
+      vm_s(&mut v, ", ");
+      vm_arg(&mut v, p, sa1);
+      vm_s(&mut v, ")`): it would lose what is there");
+      prove(&mut v, st, g2, i, VC_OWN);
+      let nu = app3(&mut v, OP_STORE, used, ix, v.t_true);
+      let ns = app3(&mut v, OP_STORE, sh, ix, v.t_true);
+      let nt = mk_pt(&mut v, v.ty_pt, g_id(v, x0), g_level(v, x0), nu, g_leases(v, x0), ns);
+      put_back(&mut v, m, p, &mut st, u_at(args, 0), nt);
+      return v.unit;
+    }
+    let su = app2(&mut v, OP_SELECT, used, ix);
+    let ss = app2(&mut v, OP_SELECT, sh, ix);
+    let g2 = app2(&mut v, OP_AND, su, ss);
+    vm_s(&mut v, "that slot `");
+    vm_arg(&mut v, p, sa1);
+    vm_s(&mut v, "` of `");
+    vm_arg(&mut v, p, sa0);
+    vm_s(&mut v, "` maps a shared page (`pt_used(");
+    vm_arg(&mut v, p, sa0);
+    vm_s(&mut v, ", ");
+    vm_arg(&mut v, p, sa1);
+    vm_s(&mut v, ") && pt_shared(");
+    vm_arg(&mut v, p, sa0);
+    vm_s(&mut v, ", ");
+    vm_arg(&mut v, p, sa1);
+    vm_s(&mut v, ")`)");
+    prove(&mut v, st, g2, i, VC_SHARED);
+    if name_is(p, i, "pt_take_shared") {
+      let g3 = app2(&mut v, OP_EQ, g_leases(v, x0), v.t_zero);
+      vm_s(&mut v, "that no processor may be running on `");
+      vm_arg(&mut v, p, sa0);
+      vm_s(&mut v, "` (`pt_leases(");
+      vm_arg(&mut v, p, sa0);
+      vm_s(&mut v, ") == 0`): taking would unmap under it");
+      prove(&mut v, st, g3, i, VC_LEASE);
+      let nu = app3(&mut v, OP_STORE, used, ix, v.t_false);
+      let ns = app3(&mut v, OP_STORE, sh, ix, v.t_false);
+      let nt = mk_pt(&mut v, v.ty_pt, g_id(v, x0), g_level(v, x0), nu, g_leases(v, x0), ns);
+      put_back(&mut v, m, p, &mut st, u_at(args, 0), nt);
+    }
+    let n = node_at(p.nodes, i);
+    let h = atom_src(&mut v, p, n.s, n.e);
+    return fresh_of(&mut v, c, m, p, kind_ty(m, p, TY_SHARED), h);
+  }
+
   // ---- MMU and CPU ----
   // A lease counts this processor among those that may be running on the
   // table, so nothing is taken out of its tree until the lease is given back.
@@ -4858,7 +4974,7 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     put_back(&mut v, m, p, &mut st, u_at(args, 0), nm);
     let one = num(&mut v, 1);
     let up = app2(&mut v, OP_ADD, g_leases(v, x1), one);
-    let nt = mk_pt(&mut v, v.ty_pt, id, g_level(v, x1), g_used(v, x1), up);
+    let nt = mk_pt(&mut v, v.ty_pt, id, g_level(v, x1), g_used(v, x1), up, g_shared(v, x1));
     put_back(&mut v, m, p, &mut st, u_at(args, 1), nt);
     return mk_obj(&mut v, m, kind_ty(m, p, TY_LEASE), id, 0, 0);
   }
@@ -4874,7 +4990,7 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
   // (this `&mut`) could raise: from here on that is what the proof knows.
   if name_is(p, i, "pt_lease_count") {
     let r = fresh_u64_named(&mut v, "pt_lease_count");
-    let nt = mk_pt(&mut v, v.ty_pt, g_id(v, x0), g_level(v, x0), g_used(v, x0), term(v, r));
+    let nt = mk_pt(&mut v, v.ty_pt, g_id(v, x0), g_level(v, x0), g_used(v, x0), term(v, r), g_shared(v, x0));
     put_back(&mut v, m, p, &mut st, u_at(args, 0), nt);
     return r;
   }
@@ -5086,14 +5202,33 @@ fn pt_slot(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, i: u64, args: &Vec[u64
     mark_t = v.t_true;
   }
   let nu = app3(&mut v, OP_STORE, used, ix, mark_t);
-  let nt = mk_pt(&mut v, v.ty_pt, g_id(v, x0), lvl, nu, g_leases(v, x0));
+  if name_is(p, i, "pt_take_frame") {
+    let sel = app2(&mut v, OP_SELECT, g_shared(v, x0), ix);
+    let g = t_not(&mut v, sel);
+    vm_s(&mut v, "that slot `");
+    vm_arg(&mut v, p, u_at(args, 1));
+    vm_s(&mut v, "` of `");
+    vm_arg(&mut v, p, a0);
+    vm_s(&mut v, "` does not map a shared page (`!pt_shared(");
+    vm_arg(&mut v, p, a0);
+    vm_s(&mut v, ", ");
+    vm_arg(&mut v, p, u_at(args, 1));
+    vm_s(&mut v, ")`): take it with `pt_take_shared`");
+    prove(&mut v, st, g, i, VC_SHARED);
+  }
+  // A page put in with pt_put_frame is owned by the table: not shared.
+  let mut sh = g_shared(v, x0);
+  if name_is(p, i, "pt_put_frame") {
+    sh = app3(&mut v, OP_STORE, sh, ix, v.t_false);
+  }
+  let nt = mk_pt(&mut v, v.ty_pt, g_id(v, x0), lvl, nu, g_leases(v, x0), sh);
   put_back(&mut v, m, p, &mut st, u_at(args, 0), nt);
   if name_is(p, i, "pt_take") {
     let r = fresh_of_named(&mut v, c, m, p, v.ty_pt, "pt_take");
     let rv = vl_at(v, r);
     let one = num(&mut v, 1);
     let below = app2(&mut v, OP_SUB, lvl, one);
-    return mk_pt(&mut v, v.ty_pt, rv.a, below, rv.c, v.t_zero);
+    return mk_pt(&mut v, v.ty_pt, rv.a, below, rv.c, v.t_zero, rv.e);
   }
   if name_is(p, i, "pt_take_frame") {
     return fresh_of_named(&mut v, c, m, p, v.ty_frame, "pt_take_frame");
@@ -5535,7 +5670,8 @@ fn changed_vars(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, head: u64, ou
 fn shape_keeping(p: &Parser, i: u64) -> bool {
   return name_is(p, i, "bset") || name_is(p, i, "vec_set") || name_is(p, i, "vec_swap") || name_is(p, i, "pt_put")
     || name_is(p, i, "pt_take") || name_is(p, i, "pt_put_frame") || name_is(p, i, "pt_take_frame")
-    || name_is(p, i, "pt_borrow") || name_is(p, i, "pt_borrow_frame") || name_is(p, i, "pt_lease_count") || name_is(p, i, "pool_take") || name_is(p, i, "pool_give") || name_is(p, i, "frame_write")
+    || name_is(p, i, "pt_borrow") || name_is(p, i, "pt_borrow_frame") || name_is(p, i, "pt_lease_count")
+    || name_is(p, i, "pt_put_shared") || name_is(p, i, "pt_take_shared") || name_is(p, i, "shared_drop") || name_is(p, i, "pool_take") || name_is(p, i, "pool_give") || name_is(p, i, "frame_write")
     || name_is(p, i, "frame_write8") || name_is(p, i, "bcopy") || name_is(p, i, "bmove") || name_is(p, i, "frame_to_bytes")
     || name_is(p, i, "bytes_to_frame") || name_is(p, i, "dma_to_bytes") || name_is(p, i, "bytes_to_dma") || name_is(p, i, "cpu_set") || name_is(p, i, "cpu_run") || name_is(p, i, "cpu_idle")
     || name_is(p, i, "cpu_fpu_save") || name_is(p, i, "cpu_fpu_load") || name_is(p, i, "pio_in8") || name_is(p, i, "pio_in16")
