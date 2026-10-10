@@ -50,6 +50,10 @@ pub enum Type {
     /// A claimed range of memory-mapped device registers, owned: the only
     /// way to read or write them. Linear; given back with `mmio_release`.
     Mmio,
+    /// A page lent to devices for DMA: made from a `Frame` with `dma_lend`,
+    /// turned back with `dma_take`. While lent it cannot be freed, mapped or
+    /// reused, and its physical address (`dma_addr`) can be read. Linear.
+    Dma,
     /// A user-defined struct. Linear when any field is linear; otherwise a
     /// plain value that is copied.
     Struct(String),
@@ -94,6 +98,7 @@ impl Type {
             Type::PortIo => "PortIo".into(),
             Type::MmioSpace => "MmioSpace".into(),
             Type::Mmio => "Mmio".into(),
+            Type::Dma => "Dma".into(),
             Type::Struct(n) | Type::Enum(n) => n.clone(),
             Type::Box(t) => format!("Box[{}]", t.name()),
             Type::Vec(t) => format!("Vec[{}]", t.name()),
@@ -104,7 +109,7 @@ impl Type {
     }
     pub fn is_linear(&self) -> bool {
         match self {
-            Type::Buf | Type::Bytes | Type::Host | Type::Child | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu | Type::Ports | Type::PortIo | Type::MmioSpace | Type::Mmio | Type::Box(_) | Type::Vec(_) => true,
+            Type::Buf | Type::Bytes | Type::Host | Type::Child | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu | Type::Ports | Type::PortIo | Type::MmioSpace | Type::Mmio | Type::Dma | Type::Box(_) | Type::Vec(_) => true,
             Type::Struct(n) => struct_def(n).map_or(false, |d| d.fields.iter().any(|f| f.1.is_linear())),
             Type::Enum(n) => enum_def(n).map_or(false, |d| d.variants.iter().any(|v| v.1.as_ref().map_or(false, |t| t.is_linear()))),
             _ => false,

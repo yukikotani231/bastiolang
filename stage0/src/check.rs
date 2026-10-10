@@ -128,6 +128,18 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("mmio_write16", Avail::Mem, vec![m(Mmio), U64, U64], Unit),
         ("mmio_write32", Avail::Mem, vec![m(Mmio), U64, U64], Unit),
         ("mmio_write64", Avail::Mem, vec![m(Mmio), U64, U64], Unit),
+        ("dma_lend", Avail::Mem, vec![Frame], Dma),
+        ("dma_take", Avail::Mem, vec![Dma], Frame),
+        ("dma_id", Avail::Mem, vec![r(Dma)], U64),
+        ("dma_addr", Avail::Mem, vec![r(Dma)], U64),
+        ("dma_read8", Avail::Mem, vec![m(Dma), U64], U64),
+        ("dma_read16", Avail::Mem, vec![m(Dma), U64], U64),
+        ("dma_read32", Avail::Mem, vec![m(Dma), U64], U64),
+        ("dma_read64", Avail::Mem, vec![m(Dma), U64], U64),
+        ("dma_write8", Avail::Mem, vec![m(Dma), U64, U64], Unit),
+        ("dma_write16", Avail::Mem, vec![m(Dma), U64, U64], Unit),
+        ("dma_write32", Avail::Mem, vec![m(Dma), U64, U64], Unit),
+        ("dma_write64", Avail::Mem, vec![m(Dma), U64, U64], Unit),
         ("sys_spawn", Avail::User, vec![r(Buf), U64, U64], U64),
         ("sys_wait", Avail::User, vec![U64], U64),
         ("sys_kill", Avail::User, vec![U64], U64),
@@ -157,6 +169,7 @@ pub const GHOSTS: &[(&str, Type, bool, Type)] = &[
     ("mmio_base", Type::Mmio, false, Type::U64),
     ("mmio_len", Type::Mmio, false, Type::U64),
     ("mmio_free", Type::MmioSpace, true, Type::Bool),
+    ("dma_id", Type::Dma, false, Type::U64),
 ];
 
 pub fn is_ghost(name: &str) -> bool {
@@ -218,7 +231,7 @@ fn main_caps(target: Target) -> &'static [Type] {
 /// Struct and enum definitions: unique names, known field and payload
 /// types, no type that contains itself.
 pub fn check_structs(p: &Program) -> Result<(), Diag> {
-    const RESERVED: &[&str] = &["u64", "bool", "Str", "Buf", "Bytes", "Host", "Child", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu", "Ports", "PortIo", "MmioSpace", "Mmio"];
+    const RESERVED: &[&str] = &["u64", "bool", "Str", "Buf", "Bytes", "Host", "Child", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu", "Ports", "PortIo", "MmioSpace", "Mmio", "Dma"];
     // (name, position, the types it holds directly)
     let mut defs: Vec<(String, Pos, Vec<Type>)> = Vec::new();
     for d in &p.structs {

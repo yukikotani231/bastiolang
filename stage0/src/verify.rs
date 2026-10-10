@@ -30,6 +30,7 @@
 //   MmioSpace  free[a] (the device-window addresses nobody has claimed)
 //   Mmio       base, len (the device registers base .. base+len it owns,
 //              always inside the device window)
+//   Dma        id (the page number of the page it lends to devices)
 //   PortIo     base, count (the ports base .. base+count it owns; always
 //              within the 65536 ports)
 // A struct value is the values of its fields; places like `p.root` read and
@@ -272,6 +273,7 @@ fn ghost_fields(t: &Type) -> &'static [(&'static str, bool, &'static str)] {
         Type::PortIo => &[("base", false, "port_base"), ("count", false, "port_count")],
         Type::MmioSpace => &[("free", true, "")],
         Type::Mmio => &[("base", false, "mmio_base"), ("len", false, "mmio_len")],
+        Type::Dma => &[("id", false, "dma_id")],
         _ => &[],
     }
 }
@@ -279,14 +281,15 @@ fn ghost_fields(t: &Type) -> &'static [(&'static str, bool, &'static str)] {
 /// Ghost fields a loop keeps when the object is changed only by builtins
 /// that never change them (a page table keeps its id and level).
 fn kept_by_builtins(t: &Type, field: &str) -> bool {
-    matches!((t, field), (Type::Frame, "id") | (Type::PageTable, "id") | (Type::PageTable, "level") | (Type::Pool, "size") | (Type::PortIo, "base") | (Type::PortIo, "count") | (Type::Mmio, "base") | (Type::Mmio, "len"))
+    matches!((t, field), (Type::Frame, "id") | (Type::PageTable, "id") | (Type::PageTable, "level") | (Type::Pool, "size") | (Type::PortIo, "base") | (Type::PortIo, "count") | (Type::Mmio, "base") | (Type::Mmio, "len") | (Type::Dma, "id"))
 }
 
 /// Builtins whose `&mut` argument keeps the fields above.
 const SHAPE_KEEPING: &[&str] =
     &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pool_take", "pool_give", "frame_write", "frame_write8", "cpu_set", "cpu_run", "cpu_idle", "cpu_fpu_save", "cpu_fpu_load",
       "pio_in8", "pio_in16", "pio_in32", "pio_out8", "pio_out16", "pio_out32",
-      "mmio_read8", "mmio_read16", "mmio_read32", "mmio_read64", "mmio_write8", "mmio_write16", "mmio_write32", "mmio_write64"];
+      "mmio_read8", "mmio_read16", "mmio_read32", "mmio_read64", "mmio_write8", "mmio_write16", "mmio_write32", "mmio_write64",
+      "dma_read8", "dma_read16", "dma_read32", "dma_read64", "dma_write8", "dma_write16", "dma_write32", "dma_write64"];
 
 /// What a call may do to one `&mut` argument: the places under it that may
 /// change, as paths relative to the parameter (`""` is the parameter itself,
@@ -471,7 +474,7 @@ impl<'p> Verifier<'p> {
             (Type::PortIo, "count") => self.fresh_int(&h, "0", PORT_LIMIT),
             (Type::Mmio, "base") => self.fresh_int(&h, MMIO_LO, MMIO_HI),
             (Type::Mmio, "len") => self.fresh_int(&h, "0", MMIO_HI),
-            (Type::Frame, "id") | (Type::PageTable, "id") => {
+            (Type::Frame, "id") | (Type::PageTable, "id") | (Type::Dma, "id") => {
                 let n = self.fresh_int(&h, "0", FRAME_LIMIT)?;
                 self.smt(&format!("(assert (< {} {}))", n, POOLSIZE))?;
                 Ok(n)
@@ -1510,6 +1513,38 @@ impl<'p> Verifier<'p> {
                 st.pc.push(format!("(<= {} {})", v.term(), max));
                 Ok(v)
             }
+            // ---- pages lent to devices (DMA) ----
+            // Lending and taking back only change the type: the page keeps
+            // its number, and while it is a `Dma` nothing can free, map or
+            // reuse it. That the device has stopped using it by `dma_take`
+            // is the driver's word (devices are outside the proof).
+            "dma_lend" => Ok(Val::Obj(Type::Dma, vec![vals[0].field("id")])),
+            "dma_take" => Ok(Val::Obj(Type::Frame, vec![vals[0].field("id")])),
+            "dma_id" => Ok(Val::U(vals[0].field("id"))),
+            "dma_addr" => self.fresh_u64("dma_addr"),
+            "dma_read8" | "dma_read16" | "dma_read32" | "dma_read64" | "dma_write8" | "dma_write16" | "dma_write32" | "dma_write64" => {
+                let (bytes, max) = match name.trim_start_matches("dma_read").trim_start_matches("dma_write") {
+                    "8" => (1, "255"),
+                    "16" => (2, "65535"),
+                    "32" => (4, "4294967295"),
+                    _ => (8, U64_MAX),
+                };
+                let off = vals[1].term();
+                self.need(st, format!("(<= (+ {} {}) 4096)", off, bytes), pos, "E-VERIFY-BOUNDS",
+                    format!("that offset `{}` is within the page (`{} + {} <= 4096`)", ra(1), ra(1), bytes))?;
+                // The page is page-aligned, so an aligned offset is an
+                // aligned address: devices see whole fields, never torn ones.
+                self.need(st, format!("(= (mod {} {}) 0)", off, bytes), pos, "E-VERIFY-BOUNDS",
+                    format!("that offset `{}` is aligned to {} bytes", ra(1), bytes))?;
+                if name.starts_with("dma_write") {
+                    self.need(st, format!("(<= {} {})", vals[2].term(), max), pos, "E-VERIFY-BYTE",
+                        format!("that `{}` fits in {} bits (`<= {}`)", ra(2), bytes * 8, max))?;
+                    return Ok(Val::Unit);
+                }
+                let v = self.fresh_u64(name)?;
+                st.pc.push(format!("(<= {} {})", v.term(), max));
+                Ok(v)
+            }
             "port_base" => Ok(Val::U(vals[0].field("base"))),
             "port_count" => Ok(Val::U(vals[0].field("count"))),
             "pio_in8" | "pio_in16" | "pio_in32" | "pio_out8" | "pio_out16" | "pio_out32" => {
@@ -1710,7 +1745,7 @@ impl<'p> Verifier<'p> {
                         Val::Buf { data, .. } | Val::Str { data, .. } => format!("(select {} {})", data, self.spec(&args[1], sc, bound)?),
                         _ => unreachable!(),
                     },
-                    "frame_id" | "pt_id" => v.field("id"),
+                    "frame_id" | "pt_id" | "dma_id" => v.field("id"),
                     "pt_level" => v.field("level"),
                     "pool_size" => v.field("size"),
                     "mmu_root" => v.field("root"),

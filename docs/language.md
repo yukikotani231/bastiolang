@@ -157,7 +157,7 @@ fn main(con: &mut Serial) -> u64 {
 | `Box[T]` | An owning pointer to a `T` on the heap; the only way a type can contain itself |
 | A struct with a linear field, an enum with a linear payload | |
 | `Host`, `Child` | The host system, and a child process (hosted target only) |
-| `Serial`, `Pool`, `Frame`, `PageTable`, `Mmu`, `Cpu`, `Ports`, `PortIo`, `MmioSpace`, `Mmio` | Capabilities: the console, physical pages, page tables, the MMU, the CPU's user context, I/O ports and memory-mapped device registers. See [Kernel capabilities](#kernel-capabilities) |
+| `Serial`, `Pool`, `Frame`, `PageTable`, `Mmu`, `Cpu`, `Ports`, `PortIo`, `MmioSpace`, `Mmio`, `Dma` | Capabilities: the console, physical pages, page tables, the MMU, the CPU's user context, I/O ports, memory-mapped device registers and pages lent to devices. See [Kernel capabilities](#kernel-capabilities) |
 
 **Borrows** are allowed only as parameter types, so a borrow can never be stored, returned or outlive the call:
 
@@ -687,7 +687,7 @@ fn main(host: &mut Host) -> u64 {
 
 ## Kernel capabilities
 
-Hardware is reached only through capability types. There is no way to read or write memory through an integer address (ROADMAP invariant 1). Capabilities are linear, and `main` is handed the ones its target provides; they cannot be created. They carry **ghost state** that exists only in the proof: in the generated code a `Frame` or `PageTable` is a bare physical address, `Serial`, `Mmu`, `Cpu`, `Ports` and `MmioSpace` are empty, and a `PortIo` or `Mmio` is its base and size.
+Hardware is reached only through capability types. There is no way to read or write memory through an integer address (ROADMAP invariant 1). Capabilities are linear, and `main` is handed the ones its target provides; they cannot be created. They carry **ghost state** that exists only in the proof: in the generated code a `Frame`, `PageTable` or `Dma` is a bare physical address, `Serial`, `Mmu`, `Cpu`, `Ports` and `MmioSpace` are empty, and a `PortIo` or `Mmio` is its base and size.
 
 | Type | Meaning |
 | --- | --- |
@@ -701,12 +701,13 @@ Hardware is reached only through capability types. There is no way to read or wr
 | `PortIo` | A claimed range of I/O ports, owned: the only way to read or write them |
 | `MmioSpace` | The device window (physical `0xC0000000` up to 4 GiB, which the kernel platform maps uncached): the right to claim each byte of it, once |
 | `Mmio` | A claimed block of memory-mapped device registers, owned: the only way to read or write them |
+| `Dma` | A page lent to devices for DMA: while lent it is not a `Frame`, so it cannot be freed, mapped or reused |
 
 Ghost accessors, usable in specifications:
 
 | Accessor | Meaning |
 | --- | --- |
-| `frame_id(f)`, `pt_id(t)` | The page number |
+| `frame_id(f)`, `pt_id(t)`, `dma_id(d)` | The page number |
 | `pt_level(t)` | 1 (maps pages) to 4 (top level, what CR3 holds); 5 is a container for level-4 tables that is never loaded into CR3 |
 | `pt_used(t, i)` | Slot `i` owns something |
 | `pool_has(p, i)` | The pool can still hand out page `i` |
@@ -865,7 +866,7 @@ fn main(ports: &mut Ports) -> u64 {
 | `mmio_read8` / `16` / `32` / `64(r: &mut Mmio, off: u64) -> u64` | `off + width <= mmio_len(r)`; `mmio_base(r) + off` is a multiple of the width | One volatile load; the result fits the width |
 | `mmio_write8` / `16` / `32` / `64(r: &mut Mmio, off: u64, v: u64)` | the same, and `v` fits the width | One volatile store |
 
-The rules are those of ports: claiming compiles to nothing, two drivers never own the same register, and reads take `&mut`. Because claims must lie in the device window and the page pool stays below 256 MiB, a driver can never reach memory the allocator owns. What a device does with the values is not modelled; nor are DMA buffers yet.
+The rules are those of ports: claiming compiles to nothing, two drivers never own the same register, and reads take `&mut`. Because claims must lie in the device window and the page pool stays below 256 MiB, a driver can never reach memory the allocator owns. What a device does with the values is not modelled.
 
 ```bastio
 // expect-exit: 0
@@ -876,6 +877,36 @@ fn main(win: &mut MmioSpace) -> u64 {
   // mmio_read32(&mut apic, 0x32) would be E-VERIFY-BOUNDS (unaligned).
   mmio_release(&mut win, apic);
   return v % 1;
+}
+```
+
+**Pages lent to devices** (kernel and hosted). A device that reads or writes memory on its own (DMA) is given a page by turning its `Frame` into a `Dma`:
+
+| Builtin | Requires (proved) | Effect |
+| --- | --- | --- |
+| `dma_lend(f: Frame) -> Dma` | | Lends the page to devices. A full memory fence first, so earlier stores reach memory before any device can be told where the page is |
+| `dma_take(d: Dma) -> Frame` | | Takes the same page back (`frame_id` is `dma_id(d)`), after a fence |
+| `dma_id(d: &Dma) -> u64` | | The page number |
+| `dma_addr(d: &Dma) -> u64` | | The page's physical address, to program into a device. Only a lent page's address can be read |
+| `dma_read8` / `16` / `32` / `64(d: &mut Dma, off: u64) -> u64` | `off + width <= 4096`; `off` is a multiple of the width | One volatile load; the result fits the width |
+| `dma_write8` / `16` / `32` / `64(d: &mut Dma, off: u64, v: u64)` | the same, and `v` fits the width | One volatile store |
+
+What is proved: while a page is lent it cannot go back to the pool, into a page table or into anything else that takes a `Frame`, so a device can never write a page that has been reused; the CPU reaches it only with volatile, aligned, in-bounds accesses, so the C compiler cannot cache or tear what the device sees; and a `Dma` must be taken back before the program ends (it is linear). What is trusted: that the driver has stopped the device using the page (for example, seen its completion) before `dma_take`, and that the addresses it programs into the device are those of pages it has lent. Devices are outside the proof.
+
+```bastio
+// expect-exit: 0
+// A one-page buffer handed to a device and taken back.
+fn main(pool: &mut Pool) -> u64 {
+  if pool_size(pool) == 0 {
+    return 0;
+  }
+  let mut d = dma_lend(pool_take(&mut pool, 0));
+  let a = dma_addr(d);
+  dma_write64(&mut d, 0, a);
+  // dma_write64(&mut d, 4092, 0) would be E-VERIFY-BOUNDS (past the page).
+  let f = dma_take(d);
+  pool_give(&mut pool, f);
+  return 0;
 }
 ```
 
@@ -1018,4 +1049,4 @@ What a program that `bastioc0` accepts is guaranteed: no out-of-bounds access, n
 
 ## Not in the language yet
 
-Planned, in [ROADMAP.md](../ROADMAP.md): concurrency (designed in [concurrency.md](concurrency.md)), integer types narrower than `u64`, `export fn` for calling Bastio from C, more hardware capabilities (`IrqOff`, DMA buffers), allocation failure in the type, and a native x86-64 backend. Inference of type arguments, modules with qualified names, and hand-written lemmas for proofs Z3 cannot find are open questions.
+Planned, in [ROADMAP.md](../ROADMAP.md): concurrency (designed in [concurrency.md](concurrency.md)), integer types narrower than `u64`, `export fn` for calling Bastio from C, more hardware capabilities (`IrqOff`), allocation failure in the type, and a native x86-64 backend. Inference of type arguments, modules with qualified names, and hand-written lemmas for proofs Z3 cannot find are open questions.

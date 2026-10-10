@@ -134,6 +134,7 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   let pio = prim(&mut m, p, TY_PORTIO);
   let msp = prim(&mut m, p, TY_MMIOSPACE);
   let mio = prim(&mut m, p, TY_MMIO);
+  let dma = prim(&mut m, p, TY_DMA);
   let rbuf = ref_to(&mut m, p, buf);
   let rbyt = ref_to(&mut m, p, byt);
   let mbyt = mut_to(&mut m, p, byt);
@@ -158,6 +159,8 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   let mmsp = mut_to(&mut m, p, msp);
   let rmio = ref_to(&mut m, p, mio);
   let mmmio = mut_to(&mut m, p, mio);
+  let rdma = ref_to(&mut m, p, dma);
+  let mdma = mut_to(&mut m, p, dma);
   bsig(&mut c, "alloc", AV_ALL, 1, u, 0, 0, 0, buf);
   bsig(&mut c, "len", AV_ALL, 1, rbuf, 0, 0, 0, u);
   bsig(&mut c, "get", AV_ALL, 2, rbuf, u, 0, 0, u);
@@ -231,6 +234,18 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   bsig(&mut c, "mmio_write16", AV_MEM, 3, mmmio, u, u, 0, un);
   bsig(&mut c, "mmio_write32", AV_MEM, 3, mmmio, u, u, 0, un);
   bsig(&mut c, "mmio_write64", AV_MEM, 3, mmmio, u, u, 0, un);
+  bsig(&mut c, "dma_lend", AV_MEM, 1, frm, 0, 0, 0, dma);
+  bsig(&mut c, "dma_take", AV_MEM, 1, dma, 0, 0, 0, frm);
+  bsig(&mut c, "dma_id", AV_MEM, 1, rdma, 0, 0, 0, u);
+  bsig(&mut c, "dma_addr", AV_MEM, 1, rdma, 0, 0, 0, u);
+  bsig(&mut c, "dma_read8", AV_MEM, 2, mdma, u, 0, 0, u);
+  bsig(&mut c, "dma_read16", AV_MEM, 2, mdma, u, 0, 0, u);
+  bsig(&mut c, "dma_read32", AV_MEM, 2, mdma, u, 0, 0, u);
+  bsig(&mut c, "dma_read64", AV_MEM, 2, mdma, u, 0, 0, u);
+  bsig(&mut c, "dma_write8", AV_MEM, 3, mdma, u, u, 0, un);
+  bsig(&mut c, "dma_write16", AV_MEM, 3, mdma, u, u, 0, un);
+  bsig(&mut c, "dma_write32", AV_MEM, 3, mdma, u, u, 0, un);
+  bsig(&mut c, "dma_write64", AV_MEM, 3, mdma, u, u, 0, un);
   bsig(&mut c, "sys_spawn", AV_USER, 3, rbuf, u, u, 0, u);
   bsig(&mut c, "sys_wait", AV_USER, 1, u, 0, 0, 0, u);
   bsig(&mut c, "sys_kill", AV_USER, 1, u, 0, 0, 0, u);
@@ -255,6 +270,7 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   ghost(&mut c, "mmio_base", mio, false, u);
   ghost(&mut c, "mmio_len", mio, false, u);
   ghost(&mut c, "mmio_free", msp, true, b);
+  ghost(&mut c, "dma_id", dma, false, u);
   field_types(&mut c, &mut m, p);
   return c;
 }
@@ -428,7 +444,7 @@ fn def_node(m: &Mono, p: &Parser, x: u64) -> Node {
 /// Is a value of type `t` linear (must it be consumed exactly once)?
 fn ck_linear(c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
   let k = kind_t(m, t);
-  if (k >= TY_BUF && k <= TY_MMIO) || k == TY_BOX || k == TY_VEC {
+  if (k >= TY_BUF && k <= TY_DMA) || k == TY_BOX || k == TY_VEC {
     return true;
   }
   if k == TY_STRUCT || k == TY_ENUM {
@@ -944,7 +960,7 @@ fn is_reserved_type(p: &Parser, s: u64, e: u64) -> bool {
     || span_is(p, s, e, "Child") || span_is(p, s, e, "Serial") || span_is(p, s, e, "Frame")
     || span_is(p, s, e, "PageTable") || span_is(p, s, e, "Pool") || span_is(p, s, e, "Mmu")
     || span_is(p, s, e, "Cpu") || span_is(p, s, e, "Ports") || span_is(p, s, e, "PortIo")
-    || span_is(p, s, e, "MmioSpace") || span_is(p, s, e, "Mmio");
+    || span_is(p, s, e, "MmioSpace") || span_is(p, s, e, "Mmio") || span_is(p, s, e, "Dma");
 }
 
 /// Struct and enum instances: no reserved names, known field and payload
