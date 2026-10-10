@@ -108,6 +108,8 @@ const NAME: u64 = <constant expression>;
 
 A function with no `-> R` returns nothing. Parameters and `let` bindings are immutable unless declared `mut`.
 
+Every program has a `main`, where it starts. `main` cannot be called (`E-TYPE`): the proof assumes it starts holding every resource the target hands it, such as the whole page pool, so a nested run would give the same pages to two owners.
+
 **Constants** have type `u64`. The expression is folded at compile time and may use literals, other constants and arithmetic.
 
 **Several files.** A file may begin with `import "path";` lines, before any definition. The path is relative to the importing file. Each imported file is loaded, with its own imports, before the rest of the importing file is read, so its constants can be used there. A file imported more than once is loaded once. Files that import each other, or an import that cannot be read, are `E-IMPORT`. Files named together on the command line also form one program, in command-line order.
