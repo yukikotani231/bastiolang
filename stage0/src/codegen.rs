@@ -582,6 +582,8 @@ static inline uint64_t bst_cpu_run(bst_cpu *c, bst_mmu m) {
     return bst_cpu_enter();
 }
 static inline uint64_t bst_cpu_idle(bst_cpu *c) { (void)c; return bst_cpu_wait(); }
+extern uint64_t bst_platform_cpus(void); /* processors running, this one included; 1 to 4096 */
+static inline uint64_t bst_cpu_count(bst_cpu c) { (void)c; return bst_platform_cpus(); }
 
 /* Called by the platform on a fault in kernel mode: that is a bug in the
  * trusted base or the compiler, never in verified code. */
