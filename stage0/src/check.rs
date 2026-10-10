@@ -1734,6 +1734,22 @@ impl<'a> Ctx<'a> {
                     }
                     return Ok(g.3.clone());
                 }
+                if name == "vcount" {
+                    // The number of elements equal to a value: integer
+                    // elements only, so that equality is plain.
+                    arity(2)?;
+                    let t = self.spec_expr(&args[0], in_ensures, bound)?;
+                    let Type::Vec(el) = &t else {
+                        return Err(Diag::new("E-TYPE", args[0].pos, format!("argument of `vcount` must be a Vec, found {}", t.name())));
+                    };
+                    if !el.is_int() {
+                        return Err(Diag::new("E-TYPE", args[0].pos, format!("`vcount` counts the elements of a vector of integers, not of {}", t.name())));
+                    }
+                    check_lin(&args[0])?;
+                    let tx = spec_norm(self.spec_expr(&args[1], in_ensures, bound)?);
+                    expect_ty(&tx, &Type::U64, args[1].pos, "the value counted")?;
+                    return Ok(Type::U64);
+                }
                 if name == "vlen" || name == "vget" {
                     arity(if name == "vlen" { 1 } else { 2 })?;
                     let t = self.spec_expr(&args[0], in_ensures, bound)?;
@@ -1749,7 +1765,7 @@ impl<'a> Ctx<'a> {
                     return Ok((**el).clone());
                 }
                 if !matches!(name.as_str(), "len" | "get" | "slen" | "sget" | "blen" | "bget") {
-                    return Err(Diag::new("E-TYPE", e.pos, format!("`{}` cannot be called in a specification (allowed: len, get, slen, sget, blen, bget, vlen, vget, old, ghost accessors and spec fns)", name)));
+                    return Err(Diag::new("E-TYPE", e.pos, format!("`{}` cannot be called in a specification (allowed: len, get, slen, sget, blen, bget, vlen, vget, vcount, old, ghost accessors and spec fns)", name)));
                 }
                 let sig = &self.sigs[name.as_str()];
                 arity(sig.params.len())?;

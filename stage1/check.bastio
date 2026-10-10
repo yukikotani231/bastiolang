@@ -4335,7 +4335,7 @@ fn cm_spec_arity(c: &mut Checker, p: &Parser, i: u64, want: u64, na: u64) {
 
 /// " cannot be called in a specification (allowed: ..)"
 fn cm_not_in_spec(c: &mut Checker) {
-  cm_s(&mut c, "` cannot be called in a specification (allowed: len, get, slen, sget, blen, bget, vlen, vget, old, ghost accessors and spec fns)");
+  cm_s(&mut c, "` cannot be called in a specification (allowed: len, get, slen, sget, blen, bget, vlen, vget, vcount, old, ghost accessors and spec fns)");
 }
 
 /// "argument of `f` must be T" for spec call `i`, then ", found U" when
@@ -4466,6 +4466,37 @@ fn spec_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u6
       spec_index(&mut c, &mut m, p, a1, ens);
     }
     return gh.ret;
+  }
+  if span_is(p, s, e, "vcount") {
+    // The number of elements equal to a value: integer elements only, so
+    // that equality is plain.
+    if na != 2 {
+      cm_spec_arity(&mut c, p, i, 2, na);
+      return 0;
+    }
+    let t = ck_spec(&mut c, &mut m, p, a0, ens);
+    if !c.failed && kind_t(m, t) != TY_VEC && cm_new(&mut c, p, a0, C_TYPE) {
+      cm_s(&mut c, "argument of `vcount` must be a Vec, found ");
+      cm_ty(&mut c, m, p, t);
+    }
+    if !c.failed && !is_int(m, inner_t(m, t)) && cm_new(&mut c, p, a0, C_TYPE) {
+      cm_s(&mut c, "`vcount` counts the elements of a vector of integers, not of ");
+      cm_ty(&mut c, m, p, t);
+    }
+    if !c.failed {
+      check_lin(&mut c, p, a0);
+    }
+    if c.failed {
+      return 0;
+    }
+    let tx = ck_spec(&mut c, &mut m, p, a1, ens);
+    if !c.failed {
+      expect_ty(&mut c, m, p, spec_norm(c, m, tx), c.tu64, a1, "the value counted");
+    }
+    if c.failed {
+      return 0;
+    }
+    return c.tu64;
   }
   if span_is(p, s, e, "vlen") || span_is(p, s, e, "vget") {
     let is_len = span_is(p, s, e, "vlen");

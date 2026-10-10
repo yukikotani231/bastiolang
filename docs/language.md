@@ -1153,7 +1153,8 @@ Expressions in `requires`, `ensures`, `invariant` and `assert` (and the bodies o
 
 - They are evaluated over **mathematical integers**: `a - b` may be negative and `a + b` cannot overflow. Integers of different types mix freely there, with no conversions.
 - They may use `==>` (implication) and `forall x: u64 :: e`.
-- They may call `len`, `get`, `slen`, `sget`, `blen`, `bget`, `vlen`, `vget`, the ghost accessors of the capabilities, and `spec fn`s.
+- They may call `len`, `get`, `slen`, `sget`, `blen`, `bget`, `vlen`, `vget`, `vcount`, the ghost accessors of the capabilities, and `spec fn`s.
+- `vcount(v, x)` is the number of elements of `v` equal to `x`, for a vector of integers. It states what `forall` cannot: that a vector is a permutation of another, or that a counter counts something.
 - They may use `is` and enum payloads (`o.Some`), and see through boxes.
 - They may mention values that have already been consumed. In `ensures`, a by-value parameter means its value on entry, a `&mut` parameter the value handed back, and `old(x)` its value at the call. `result` is the returned value. `old(x)` is also allowed in loop invariants, for parameters only.
 - They cannot build enum values or call ordinary functions.
@@ -1216,6 +1217,38 @@ fn main() -> u64 {
   return n;
 }
 ```
+
+Counting is how a sort states that it loses no element. Each vector operation tells the prover how it changes every count, so a swap of two elements is seen to keep them all:
+
+```bastio
+// expect-exit: 3
+spec fn same_elems(a: &Vec[u64], b: &Vec[u64]) -> bool {
+  vlen(a) == vlen(b) && forall x: u64 :: vcount(a, x) == vcount(b, x)
+}
+
+fn swap(v: &mut Vec[u64], i: u64, j: u64)
+  requires i < vlen(v) && j < vlen(v)
+  ensures same_elems(v, old(v))
+{
+  let a = vec_get(v, i);
+  let b = vec_swap(&mut v, j, a);
+  vec_set(&mut v, i, b);
+}
+
+fn main() -> u64 {
+  let mut v = vec_new[u64]();
+  vec_push(&mut v, 3);
+  vec_push(&mut v, 4);
+  swap(&mut v, 0, 1);
+  assert vcount(v, 3) == 1;
+  let r = vec_pop(&mut v);
+  vec_pop(&mut v);
+  vec_free(v);
+  return r;
+}
+```
+
+The facts the prover is given about counts (a count is at most the length, every element is counted, every counted value is an element, and how each vector operation changes the counts) are listed in [the trusted base](trusted-base.md). A program that never uses `vcount` gets none of them.
 
 ## How verification works
 

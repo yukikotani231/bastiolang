@@ -51,7 +51,7 @@ use crate::ast::*;
 use crate::check::is_builtin;
 use crate::diag::{Diag, Pos};
 use crate::smt::{SatResult, Solver};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const U64_MAX: &str = "18446744073709551615";
@@ -403,6 +403,79 @@ pub struct Verifier<'p> {
     /// verified (`FnDef::int_ops`).
     int_ops: HashMap<Pos, Type>,
     sums: &'p Summaries,
+    /// The functions whose proofs can mention `vcount` (see `counting_fns`).
+    counting: &'p HashSet<String>,
+    /// Whether the function being verified is one of them: only then are
+    /// the counting function and its lemmas declared, so programs that
+    /// never count get the same queries as before counting existed.
+    counts: bool,
+}
+
+/// Does `e` call `vcount`, or name one of `names` (spec fns that count,
+/// functions whose contracts count)?
+fn mentions_count(e: &Expr, names: &HashSet<String>) -> bool {
+    match &e.kind {
+        ExprKind::Call(n, xs) => n == "vcount" || names.contains(n) || xs.iter().any(|x| mentions_count(x, names)),
+        ExprKind::Var(n) => names.contains(n),
+        ExprKind::Field(x, _) | ExprKind::Is(x, _, _) | ExprKind::Not(x) | ExprKind::Neg(x) | ExprKind::Forall(_, x) | ExprKind::TypeApp(_, x) => mentions_count(x, names),
+        ExprKind::Variant(_, _, Some(x)) => mentions_count(x, names),
+        ExprKind::StructLit(_, fs) => fs.iter().any(|(_, x)| mentions_count(x, names)),
+        ExprKind::Bin(_, a, b) => mentions_count(a, names) || mentions_count(b, names),
+        _ => false,
+    }
+}
+
+fn stmts_mention_count(ss: &[Stmt], names: &HashSet<String>) -> bool {
+    ss.iter().any(|st| match &st.kind {
+        StmtKind::Let { init: e, .. } | StmtKind::Assign { value: e, .. } | StmtKind::Assert(e) | StmtKind::Expr(e) | StmtKind::Return(Some(e)) => mentions_count(e, names),
+        StmtKind::If { cond, then_b, else_b } => mentions_count(cond, names) || stmts_mention_count(then_b, names) || stmts_mention_count(else_b, names),
+        StmtKind::While { cond, invariants, body } => mentions_count(cond, names) || invariants.iter().any(|i| mentions_count(i, names)) || stmts_mention_count(body, names),
+        StmtKind::Match { scrut, arms } => mentions_count(scrut, names) || arms.iter().any(|a| stmts_mention_count(&a.body, names)),
+        StmtKind::Return(None) | StmtKind::Unreachable => false,
+    })
+}
+
+/// The functions whose verification needs the counting lemmas: those whose
+/// own contract, loop invariants or assertions use `vcount` (directly or
+/// through spec fns), or that call a function whose contract does. When a
+/// struct invariant counts, every function does.
+fn counting_fns(p: &Program) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for sf in &p.specs {
+        if mentions_count(&sf.body, &names) {
+            names.insert(sf.name.clone());
+        }
+    }
+    let all = p.structs.iter().any(|d| d.invariants.iter().any(|i| mentions_count(i, &names)));
+    for f in &p.fns {
+        if f.requires.iter().chain(&f.ensures).any(|e| mentions_count(e, &names)) {
+            names.insert(f.name.clone());
+        }
+    }
+    p.fns.iter().filter(|f| all || names.contains(&f.name) || stmts_mention_count(&f.body, &names)).map(|f| f.name.clone()).collect()
+}
+
+/// `vcount(v, x)` is `(cnt a n x)` over the vector's element array `a` and
+/// length `n`. These facts about it hold for every array and length; each is
+/// a theorem about finite sequences, proved by induction on `n` outside the
+/// solver, so they are part of the trusted base (docs/trusted-base.md).
+/// `cnt_w` names an index where a counted value is.
+const COUNT_LEMMAS: &[&str] = &[
+    "(declare-fun cnt ((Array Int Int) Int Int) Int)",
+    "(declare-fun cnt_w ((Array Int Int) Int Int) Int)",
+    // A0: a count is between 0 and the length.
+    "(assert (forall ((a (Array Int Int)) (n Int) (x Int)) (! (=> (<= 0 n) (and (<= 0 (cnt a n x)) (<= (cnt a n x) n))) :pattern ((cnt a n x)))))",
+    // A1: an element is counted.
+    "(assert (forall ((a (Array Int Int)) (n Int) (i Int)) (! (=> (and (<= 0 i) (< i n)) (<= 1 (cnt a n (select a i)))) :pattern ((cnt a n (select a i))))))",
+    // A2: a counted value is an element.
+    "(assert (forall ((a (Array Int Int)) (n Int) (x Int)) (! (=> (<= 1 (cnt a n x)) (and (<= 0 (cnt_w a n x)) (< (cnt_w a n x) n) (= (select a (cnt_w a n x)) x))) :pattern ((cnt a n x)))))",
+];
+
+/// How a vector operation changes every count: `(cnt a2 n2 x)` is
+/// `(cnt a n x)` plus `delta` (a term over `x`). Ground in everything but
+/// `x`, and triggered by either count.
+fn count_step(a2: &str, n2: &str, a: &str, n: &str, delta: &str) -> String {
+    format!("(forall ((x Int)) (! (= (cnt {a2} {n2} x) (+ (cnt {a} {n} x) {delta})) :pattern ((cnt {a2} {n2} x)) :pattern ((cnt {a} {n} x))))")
 }
 
 fn sanitize(n: &str) -> String {
@@ -474,6 +547,7 @@ pub fn verify_program(p: &Program, one_session: bool) -> Result<(usize, Vec<Stri
     // `one_session` (for --dump-smt, which stage1/difftest.sh compares with
     // stage1's verifier) keeps everything on one solver, in program order.
     let sums = summarize(p);
+    let counting = counting_fns(p);
     let n = p.fns.len();
     let jobs = std::env::var("BASTIO_JOBS")
         .ok()
@@ -485,7 +559,7 @@ pub fn verify_program(p: &Program, one_session: bool) -> Result<(usize, Vec<Stri
     // a function after it, since its result could not be reported anyway.
     let failed = AtomicUsize::new(usize::MAX);
     let workers: Vec<Worker> = std::thread::scope(|s| {
-        let hs: Vec<_> = (0..jobs).map(|_| s.spawn(|| verify_worker(p, &sums, &next, &failed))).collect();
+        let hs: Vec<_> = (0..jobs).map(|_| s.spawn(|| verify_worker(p, &sums, &counting, &next, &failed))).collect();
         hs.into_iter().map(|h| h.join().expect("a verifier thread panicked")).collect()
     });
     let mut obligations = 0;
@@ -526,7 +600,7 @@ struct Worker {
 
 /// Verifies functions, taking the next unverified index each time, on a
 /// solver of its own.
-fn verify_worker(p: &Program, sums: &Summaries, next: &AtomicUsize, failed: &AtomicUsize) -> Worker {
+fn verify_worker(p: &Program, sums: &Summaries, counting: &HashSet<String>, next: &AtomicUsize, failed: &AtomicUsize) -> Worker {
     let mut w = Worker { obligations: 0, log: Vec::new(), times: Vec::new(), err: None };
     let solver = match Solver::start() {
         Ok(s) => s,
@@ -535,7 +609,7 @@ fn verify_worker(p: &Program, sums: &Summaries, next: &AtomicUsize, failed: &Ato
             return w;
         }
     };
-    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, int_ops: HashMap::new(), sums };
+    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, int_ops: HashMap::new(), sums, counting, counts: false };
     let mut run = || -> Result<(), (usize, Diag)> {
         v.smt(&format!("(declare-const {} Int)", POOLSIZE)).map_err(|d| (0, d))?;
         v.smt(&format!("(assert (and (<= 0 {p}) (<= {p} {})))", FRAME_LIMIT, p = POOLSIZE)).map_err(|d| (0, d))?;
@@ -803,6 +877,12 @@ impl<'p> Verifier<'p> {
 
     fn verify_fn(&mut self, f: &FnDef) -> Result<(), Diag> {
         self.int_ops = f.int_ops.clone();
+        self.counts = self.counting.contains(&f.name);
+        if self.counts {
+            for c in COUNT_LEMMAS {
+                self.smt(c)?;
+            }
+        }
         let mut env = HashMap::new();
         for p in &f.params {
             let v = self.fresh_of(&p.ty, &p.name)?;
@@ -1653,7 +1733,11 @@ impl<'p> Verifier<'p> {
                 // A push that cannot grow the vector aborts (out of memory),
                 // so after it the length stayed below 2^60.
                 st.pc.push(format!("(< {} {})", len, ALLOC_MAX));
-                let elems = vec_write(&elems, &len, &vals[1]);
+                let elems2 = vec_write(&elems, &len, &vals[1]);
+                if let (true, Val::U(a), Val::U(a2)) = (self.counts, &*elems, &elems2) {
+                    st.pc.push(count_step(a2, &format!("(+ {} 1)", len), a, &len, &format!("(ite (= {} x) 1 0)", vals[1].term())));
+                }
+                let elems = elems2;
                 self.put_back(&args[0], Val::Vec { elem, len: format!("(+ {} 1)", len), elems: Box::new(elems) }, st);
                 Ok(Val::Unit)
             }
@@ -1661,6 +1745,9 @@ impl<'p> Verifier<'p> {
                 let Val::Vec { elem, len, elems } = vals[0].clone() else { unreachable!() };
                 self.need(st, format!("(> {} 0)", len), pos, "E-VERIFY-BOUNDS", format!("that `{}` is not empty (`vlen({}) > 0`)", ra(0), ra(0)))?;
                 let last = format!("(- {} 1)", len);
+                if let (true, Val::U(a)) = (self.counts, &*elems) {
+                    st.pc.push(count_step(a, &last, a, &len, &format!("(- (ite (= (select {} {}) x) 1 0))", a, last)));
+                }
                 let v = self.vec_read(&elem, &elems, &last, st)?;
                 self.put_back(&args[0], Val::Vec { elem, len: last, elems }, st);
                 Ok(v)
@@ -1671,7 +1758,11 @@ impl<'p> Verifier<'p> {
                 self.need(st, format!("(< {} {})", i, len), pos, "E-VERIFY-BOUNDS", format!("that the index `{}` is within `{}` (`{} < vlen({})`)", ra(1), ra(0), ra(1), ra(0)))?;
                 let old = if name == "vec_set" { Val::Unit } else { self.vec_read(&elem, &elems, &i, st)? };
                 if name != "vec_get" {
-                    let elems = vec_write(&elems, &i, &vals[2]);
+                    let elems2 = vec_write(&elems, &i, &vals[2]);
+                    if let (true, Val::U(a), Val::U(a2)) = (self.counts, &*elems, &elems2) {
+                        st.pc.push(count_step(a2, &len, a, &len, &format!("(- (ite (= {} x) 1 0) (ite (= (select {} {}) x) 1 0))", vals[2].term(), a, i)));
+                    }
+                    let elems = elems2;
                     self.put_back(&args[0], Val::Vec { elem, len, elems: Box::new(elems) }, st);
                 }
                 Ok(old)
@@ -2132,6 +2223,11 @@ impl<'p> Verifier<'p> {
                 }
                 if name == "vget" {
                     return Ok(self.spec_val(e, sc, bound)?.term().to_string());
+                }
+                if name == "vcount" {
+                    let Val::Vec { len, elems, .. } = self.spec_val(&args[0], sc, bound)? else { unreachable!("checked: a Vec") };
+                    let x = self.spec(&args[1], sc, bound)?;
+                    return Ok(format!("(cnt {} {} {})", elems.term(), len, x));
                 }
                 let v = self.spec_val(&args[0], sc, bound)?;
                 match name.as_str() {

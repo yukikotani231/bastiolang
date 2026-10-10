@@ -103,7 +103,8 @@ Started early, alongside v1, because the kernel is the primary target and it sha
 - [x] `old(x)` in loop invariants (2026-10-10, stage0 and stage1), so a loop can say what it leaves alone
 - [x] Local variables may share a function's name (2026-10-10, stage0 and stage1): a call always means the function, so a library's local names no longer leak into its users
 - [x] Generic spec fns (2026-10-10): copied per type argument like generic functions, so a generic type's well-formedness can be named in callers' specifications
-- [ ] More language support the library needs (docs/core.md, "Gaps"): a way to count (permutations, map sizes), library search paths
+- [x] Counting in specifications (2026-10-10): `vcount(v, x)`, so `sort_u64` is proved a permutation and the hash map's `len` and `used` are proved to count slots
+- [ ] More language support the library needs (docs/core.md, "Gaps"): library search paths, the value of a digit string
 - [ ] A map from byte-string keys, a sort with a key, and an O(n log n) sort with the same proof
 
 ## C boundary

@@ -51,6 +51,14 @@ The compiler also generates small helpers for each `Box` and `Vec` element type 
 
 Every builtin (the `builtin` lines of the listing, with the targets that have it) is an axiom: the checker gives it a type, the verifier gives it a specification, and the prelude implements it. What is trusted is that the implementation does what the specification says. Examples: `pool_take` returns a zeroed page that nothing else owns; `pt_take` hands back exactly the page that `pt_put` stored in that slot; `vec_get` reads the element the verifier thinks is there. A builtin whose run-time state differs from what the proof believes is a soundness bug, and one such bug has been found and fixed (`pt_has` on the kernel's own slot of a top-level table, #39).
 
+**Counting lemmas.** `vcount(v, x)` (specifications only) is an uninterpreted function `cnt` of a vector's element array, its length and the value. What the prover knows about it is given as axioms, each a theorem about finite sequences proved by induction on the length, outside the solver:
+- a count is between 0 and the length;
+- an element at an index below the length is counted at least once;
+- a value counted at least once is the element at some index below the length (`cnt_w` names that index);
+- a push of `y` adds one to the count of `y`; a pop removes one from the count of the last element; `vec_set` and `vec_swap` of `y` at `i` remove one from the count of the old element at `i` and add one to the count of `y`.
+
+They are written out in `COUNT_LEMMAS` and `count_step` in `stage0/src/verify.rs` (`count_lemmas` and `count_step` in `stage1/verify.bastio`). They are sent only for functions whose specifications use `vcount`, or call one whose contract does, so a program that never counts is verified exactly as before.
+
 ## 4. Assumptions at the boundaries
 
 **`export fn`.** A C caller cannot be proved to do anything, so the proof of an exported function assumes things about it. They are listed by `--trusted-base` (the `export assumes` lines) and written into the generated header: buffer pointers are valid for their lengths and not written during the call, `&mut Bytes` arguments do not overlap, and every argument is a valid value of its C type.

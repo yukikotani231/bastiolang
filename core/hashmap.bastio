@@ -5,12 +5,12 @@
 // `Vec[T]` and map each key to its index: the map itself holds only plain
 // numbers, so it can be read through a shared borrow and freed at any time.
 //
-// What is proved: every index is in bounds, no counter overflows, a slot
-// that a lookup returns holds the key asked for, and after `hmap_insert`
-// the map holds the key with the new value. Not proved: that a lookup finds
-// every key present (that needs an invariant about runs of probed slots)
-// and that `len` counts the keys (the prover cannot count; see
-// docs/core.md, "Gaps").
+// What is proved: every index is in bounds, no counter overflows, `len`
+// is the number of keys and `used` the number of slots that are not
+// empty, a slot that a lookup returns holds the key asked for, and after
+// `hmap_insert` the map holds the key with the new value. Not proved: that
+// a lookup finds every key present (that needs an invariant about runs of
+// probed slots).
 import "option.bastio";
 
 struct HashMap {
@@ -22,11 +22,15 @@ struct HashMap {
 }
 
 /// What every map function needs and keeps: the vectors have one length,
-/// the capacity is in range, and some slot is still empty. A loop that
-/// changes a map carries `invariant hmap_ok(m)`.
+/// the capacity is in range, every tag is 0, 1 or 2, `len` counts the
+/// slots holding a key and `used` the slots that are not empty, and some
+/// slot is still empty. A loop that changes a map carries
+/// `invariant hmap_ok(m)`.
 spec fn hmap_ok(m: &HashMap) -> bool {
   vlen(m.tags) == vlen(m.keys) && vlen(m.vals) == vlen(m.keys)
     && 8 <= vlen(m.keys) && vlen(m.keys) <= 1152921504606846976
+    && vcount(m.tags, 0) + vcount(m.tags, 1) + vcount(m.tags, 2) == vlen(m.tags)
+    && m.len == vcount(m.tags, 2) && m.used + vcount(m.tags, 0) == vlen(m.tags)
     && m.len <= m.used && m.used < vlen(m.keys)
 }
 
@@ -60,6 +64,7 @@ fn hmap_with_cap(cap: u64) -> HashMap
   let mut i = 0;
   while i < cap
     invariant i <= cap && vlen(keys) == i && vlen(vals) == i && vlen(tags) == i
+    invariant vcount(tags, 0) == i && vcount(tags, 1) == 0 && vcount(tags, 2) == 0
   {
     vec_push(&mut keys, 0);
     vec_push(&mut vals, 0);
@@ -75,7 +80,7 @@ fn hmap_new() -> HashMap
   return hmap_with_cap(8);
 }
 
-/// The number of keys in the map.
+/// The number of keys in the map (`hmap_ok` says `len` counts them).
 fn hmap_len(m: &HashMap) -> u64
   ensures result == m.len
 {
@@ -200,10 +205,27 @@ fn hmap_put_new(m: &mut HashMap, k: u64, v: u64)
     }
     n = n + 1;
   }
-  // Not reached: `used < cap` leaves an empty slot, but the prover cannot
-  // count slots, so a table found full is grown instead.
-  hmap_grow(&mut m);
-  hmap_put_new(&mut m, k, v);
+  // Not reached: the probe sequence visits every slot, and `used < cap`
+  // leaves one empty. The prover does not follow the probe sequence around
+  // the table, so the empty slot is found again by a plain scan, and the
+  // scan failing is what is proved impossible.
+  let mut i = 0;
+  while i < cap
+    invariant i <= cap && hmap_ok(m) && vlen(m.keys) == cap
+    invariant (m.used + 1) * 4 <= cap * 3
+    invariant forall q: u64 :: q < i ==> vget(m.tags, q) != 0
+  {
+    if vec_get(m.tags, i) == 0 {
+      vec_set(&mut m.tags, i, 2);
+      vec_set(&mut m.keys, i, k);
+      vec_set(&mut m.vals, i, v);
+      m.used = m.used + 1;
+      m.len = m.len + 1;
+      return;
+    }
+    i = i + 1;
+  }
+  unreachable;
 }
 
 /// Sets the value of `k` to `v`. Returns the value it replaces, if `k` was
@@ -230,11 +252,7 @@ fn hmap_remove(m: &mut HashMap, k: u64) -> Option[u64]
   let i = hmap_find(m, k);
   if i < vec_len(m.keys) {
     vec_set(&mut m.tags, i, 1);
-    if m.len > 0 {
-      // Always true while the counters are right. The prover cannot count
-      // keys, so this decrement is guarded instead of proved.
-      m.len = m.len - 1;
-    }
+    m.len = m.len - 1;
     return Option[u64]::Some(vec_get(m.vals, i));
   }
   return Option[u64]::None;
