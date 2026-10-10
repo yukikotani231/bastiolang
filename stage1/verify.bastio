@@ -3550,11 +3550,14 @@ fn vpt_borrow(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mu
   let ix = term(v, eval(&mut v, c, &mut m, p, a1, &mut st, 0));
   let lvl = g_level(v, t);
   let used = g_used(v, t);
-  need_lt(&mut v, st, i, ix, 512);
+  need_lt(&mut v, p, st, i, ix, 512, a1, "a page table (512 slots)");
   let mut child = 0;
   if name_is(p, i, "pt_borrow") {
     let two = num(&mut v, 2);
     let g = app2(&mut v, OP_GE, lvl, two);
+    vm_s(&mut v, "that `");
+    vm_arg(&mut v, p, a0);
+    vm_s(&mut v, "` is not a last-level table: its slots hold tables, not pages");
     prove(&mut v, st, g, i, VC_PT);
     let four = num(&mut v, 4);
     let top = app2(&mut v, OP_EQ, lvl, four);
@@ -3564,6 +3567,9 @@ fn vpt_borrow(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mu
     let hi = app2(&mut v, OP_LT, ix, lim);
     let r = app2(&mut v, OP_AND, lo, hi);
     let g2 = app2(&mut v, OP_IMP, top, r);
+    vm_s(&mut v, "that slot `");
+    vm_arg(&mut v, p, a1);
+    vm_s(&mut v, "` of a top-level table is a user slot (1 to 255; slot 0 maps the kernel)");
     prove(&mut v, st, g2, i, VC_PT);
     let fc = fresh_of_named(&mut v, c, m, p, v.ty_pt, "pt_borrow");
     let fv = vl_at(v, fc);
@@ -3573,10 +3579,22 @@ fn vpt_borrow(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mu
   } else {
     let one = num(&mut v, 1);
     let g = app2(&mut v, OP_EQ, lvl, one);
+    vm_s(&mut v, "that `");
+    vm_arg(&mut v, p, a0);
+    vm_s(&mut v, "` is a last-level table (level 1), which maps pages");
     prove(&mut v, st, g, i, VC_PT);
     child = fresh_of_named(&mut v, c, m, p, v.ty_frame, "pt_borrow_frame");
   }
   let sel = app2(&mut v, OP_SELECT, used, ix);
+  vm_s(&mut v, "that slot `");
+  vm_arg(&mut v, p, a1);
+  vm_s(&mut v, "` of `");
+  vm_arg(&mut v, p, a0);
+  vm_s(&mut v, "` holds something (`pt_used(");
+  vm_arg(&mut v, p, a0);
+  vm_s(&mut v, ", ");
+  vm_arg(&mut v, p, a1);
+  vm_s(&mut v, ")`)");
   prove(&mut v, st, sel, i, VC_OWN);
   // The child lives in a variable no program can name, for the call.
   if v.counter < U64_MAX {
@@ -3617,6 +3635,13 @@ fn vpt_borrow(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mu
     let sl = app2(&mut v, OP_EQ, g_level(v, after), g_level(v, child));
     let sn = app2(&mut v, OP_EQ, g_leases(v, after), g_leases(v, child));
     same = app3(&mut v, OP_AND, same, sl, sn);
+  }
+  vm_s(&mut v, "that `");
+  vm_name(&mut v, p, a2);
+  if name_is(p, i, "pt_borrow") {
+    vm_s(&mut v, "` hands back what `pt_borrow` lent it, unchanged but for its contents");
+  } else {
+    vm_s(&mut v, "` hands back what `pt_borrow_frame` lent it, unchanged but for its contents");
   }
   prove(&mut v, st, same, i, VC_OWN);
   return res;
@@ -4259,6 +4284,11 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
       vm_s(&mut v, ")`)");
       prove(&mut v, st, g3, i, VC_MMU);
       let g4 = app2(&mut v, OP_EQ, g_leases(v, t), v.t_zero);
+      vm_s(&mut v, "that no processor holds a lease on `");
+      vm_arg(&mut v, p, ta);
+      vm_s(&mut v, "` (`pt_leases(");
+      vm_arg(&mut v, p, ta);
+      vm_s(&mut v, ") == 0`): one may be running on it");
       prove(&mut v, st, g4, i, VC_LEASE);
     }
     return mk_obj(&mut v, m, v.ty_frame, g_id(v, t), 0, 0);
@@ -4558,8 +4588,16 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
   if name_is(p, i, "mmu_enter") {
     let four = num(&mut v, 4);
     let g = app2(&mut v, OP_EQ, g_level(v, x1), four);
+    vm_s(&mut v, "that `");
+    vm_arg(&mut v, p, u_at(args, 1));
+    vm_s(&mut v, "` is a top-level table (level 4)");
     prove(&mut v, st, g, i, VC_PT);
     let g2 = app2(&mut v, OP_EQ, g_root(v, x0), v.t_flimit);
+    vm_s(&mut v, "that `");
+    vm_arg(&mut v, p, u_at(args, 0));
+    vm_s(&mut v, "` has the kernel's own tables loaded (`mmu_root(");
+    vm_arg(&mut v, p, u_at(args, 0));
+    vm_s(&mut v, ") == 65536`), not another lease's");
     prove(&mut v, st, g2, i, VC_MMU);
     let id = g_id(v, x1);
     let nm = mk_obj(&mut v, m, kind_ty(m, p, TY_MMU), id, 0, 0);
@@ -4781,6 +4819,11 @@ fn pt_slot(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, i: u64, args: &Vec[u64
     // reach what is taken, through its TLB or a walk under way. Putting
     // only adds.
     let g2 = app2(&mut v, OP_EQ, g_leases(v, x0), v.t_zero);
+    vm_s(&mut v, "that no processor may be running on `");
+    vm_arg(&mut v, p, a0);
+    vm_s(&mut v, "` (`pt_leases(");
+    vm_arg(&mut v, p, a0);
+    vm_s(&mut v, ") == 0`): taking would unmap under it");
     prove(&mut v, st, g2, i, VC_LEASE);
   }
 
@@ -5692,6 +5735,8 @@ fn verify_program(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
     if exported_x(m, p, x) {
       buffers_kept(&mut v, &mut m, p, x);
     }
+    // Names are numbered per function, as stage0's workers number them.
+    v.counter = 0;
     send(&mut v, CMD_PUSH, 0, 0);
     verify_fn(&mut v, c, &mut m, p, x);
     send(&mut v, CMD_POP, 0, 0);
