@@ -1065,6 +1065,7 @@ fn ghost_index(c: &Checker, p: &Parser, s: u64, e: u64) -> u64 {
 
 fn is_vec_builtin(p: &Parser, s: u64, e: u64) -> bool {
   return span_is(p, s, e, "vec_new") || span_is(p, s, e, "vec_len") || span_is(p, s, e, "vec_push")
+    || span_is(p, s, e, "vec_push_within") || span_is(p, s, e, "vec_try_reserve")
     || span_is(p, s, e, "vec_pop") || span_is(p, s, e, "vec_get") || span_is(p, s, e, "vec_set")
     || span_is(p, s, e, "vec_swap") || span_is(p, s, e, "vec_free");
 }
@@ -4214,9 +4215,13 @@ fn vec_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
   if span_is(p, s, e, "vec_len") {
     vec_push(&mut ps, rv);
     r = c.tu64;
-  } else if span_is(p, s, e, "vec_push") {
+  } else if span_is(p, s, e, "vec_push") || span_is(p, s, e, "vec_push_within") {
     vec_push(&mut ps, mv);
     vec_push(&mut ps, el);
+  } else if span_is(p, s, e, "vec_try_reserve") {
+    vec_push(&mut ps, mv);
+    vec_push(&mut ps, c.tu64);
+    r = c.tbool;
   } else if span_is(p, s, e, "vec_pop") {
     vec_push(&mut ps, mv);
     r = el;
@@ -4786,7 +4791,7 @@ fn cm_spec_arity(c: &mut Checker, p: &Parser, i: u64, want: u64, na: u64) {
 
 /// " cannot be called in a specification (allowed: ..)"
 fn cm_not_in_spec(c: &mut Checker) {
-  cm_s(&mut c, "` cannot be called in a specification (allowed: len, get, slen, sget, blen, bget, bdec, bhex, has_bit, vlen, vget, vcount, old, ghost accessors and spec fns)");
+  cm_s(&mut c, "` cannot be called in a specification (allowed: len, get, slen, sget, blen, bget, bdec, bhex, has_bit, vlen, vcap, vget, vcount, old, ghost accessors and spec fns)");
 }
 
 /// "argument of `f` must be T" for spec call `i`, then ", found U" when
@@ -5008,8 +5013,8 @@ fn spec_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u6
     }
     return c.tbool;
   }
-  if span_is(p, s, e, "vlen") || span_is(p, s, e, "vget") {
-    let is_len = span_is(p, s, e, "vlen");
+  if span_is(p, s, e, "vlen") || span_is(p, s, e, "vcap") || span_is(p, s, e, "vget") {
+    let is_len = !span_is(p, s, e, "vget");
     let mut want = 2;
     if is_len {
       want = 1;

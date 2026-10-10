@@ -210,7 +210,7 @@ pub fn builtin_sigs() -> HashMap<String, Sig> {
 }
 
 /// Builtins over `Vec[T]`: generic, so their signatures are built per call.
-pub const VEC_BUILTINS: &[&str] = &["vec_new", "vec_len", "vec_push", "vec_pop", "vec_get", "vec_set", "vec_swap", "vec_free"];
+pub const VEC_BUILTINS: &[&str] = &["vec_new", "vec_len", "vec_push", "vec_push_within", "vec_try_reserve", "vec_pop", "vec_get", "vec_set", "vec_swap", "vec_free"];
 
 /// Builtins written with type arguments (`vec_new[u64]()`, `cast[u8](x)`).
 pub const TYPED_BUILTINS: &[&str] = &["vec_new", "cast", "wrap"];
@@ -1622,7 +1622,8 @@ impl<'a> Ctx<'a> {
         let v = Type::Vec(Box::new(t.clone()));
         let (params, ret) = match name {
             "vec_len" => (vec![r(v)], Type::U64),
-            "vec_push" => (vec![m(v), t.clone()], Type::Unit),
+            "vec_push" | "vec_push_within" => (vec![m(v), t.clone()], Type::Unit),
+            "vec_try_reserve" => (vec![m(v), Type::U64], Type::Bool),
             "vec_pop" => (vec![m(v)], t.clone()),
             "vec_swap" => (vec![m(v), Type::U64, t.clone()], t.clone()),
             "vec_free" => (vec![v], Type::Unit),
@@ -1907,14 +1908,14 @@ impl<'a> Ctx<'a> {
                     }
                     return Ok(Type::Bool);
                 }
-                if name == "vlen" || name == "vget" {
-                    arity(if name == "vlen" { 1 } else { 2 })?;
+                if name == "vlen" || name == "vcap" || name == "vget" {
+                    arity(if name == "vget" { 2 } else { 1 })?;
                     let t = self.spec_expr(&args[0], in_ensures, bound)?;
                     let Type::Vec(el) = &t else {
                         return Err(Diag::new("E-TYPE", args[0].pos, format!("argument of `{}` must be a Vec, found {}", name, t.name())));
                     };
                     check_lin(&args[0])?;
-                    if name == "vlen" {
+                    if name != "vget" {
                         return Ok(Type::U64);
                     }
                     let ti = spec_norm(self.spec_expr(&args[1], in_ensures, bound)?);
@@ -1922,7 +1923,7 @@ impl<'a> Ctx<'a> {
                     return Ok((**el).clone());
                 }
                 if !matches!(name.as_str(), "len" | "get" | "slen" | "sget" | "blen" | "bget") {
-                    return Err(Diag::new("E-TYPE", e.pos, format!("`{}` cannot be called in a specification (allowed: len, get, slen, sget, blen, bget, bdec, bhex, has_bit, vlen, vget, vcount, old, ghost accessors and spec fns)", name)));
+                    return Err(Diag::new("E-TYPE", e.pos, format!("`{}` cannot be called in a specification (allowed: len, get, slen, sget, blen, bget, bdec, bhex, has_bit, vlen, vcap, vget, vcount, old, ghost accessors and spec fns)", name)));
                 }
                 let sig = &self.sigs[name.as_str()];
                 arity(sig.params.len())?;

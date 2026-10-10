@@ -17,8 +17,12 @@ What will be 0.2.0.
 
 - `try_alloc` and `try_balloc`: allocation that returns an empty buffer when
   memory runs out instead of stopping the program. The prover makes the
-  program check the length before using it. `alloc`, `balloc`, `Vec` growth
-  and `box` still stop the program on out of memory.
+  program check the length before using it.
+- `vec_try_reserve` and `vec_push_within`: room for elements is reserved
+  ahead of time, or the reservation reports that memory ran out, and pushes
+  into reserved room never allocate. The prover tracks a vector's capacity
+  (`vcap` in specifications). `alloc`, `balloc`, `vec_push` and `box` still
+  stop the program on out of memory.
 - Page tables shared between processors: a processor takes a `Lease` on a
   top-level table with `mmu_enter` and gives it back with `mmu_exit`, and
   while a tree has leases nothing can be taken out of it, only added

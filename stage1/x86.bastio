@@ -786,7 +786,7 @@ fn x86_norm(g: &mut X86, m: &Mono, t: u64) {
 fn x86_inline_builtin(p: &Parser, i: u64) -> bool {
   return name_is(p, i, "len") || name_is(p, i, "get") || name_is(p, i, "set") || name_is(p, i, "blen") || name_is(p, i, "bget")
     || name_is(p, i, "bset") || name_is(p, i, "slen") || name_is(p, i, "sget") || name_is(p, i, "vec_len") || name_is(p, i, "vec_get")
-    || name_is(p, i, "vec_set") || name_is(p, i, "vec_swap") || name_is(p, i, "vec_pop") || name_is(p, i, "wrap_add")
+    || name_is(p, i, "vec_set") || name_is(p, i, "vec_swap") || name_is(p, i, "vec_pop") || name_is(p, i, "vec_push_within") || name_is(p, i, "wrap_add")
     || name_is(p, i, "wrap_sub") || name_is(p, i, "wrap_mul") || name_is(p, i, "cast") || name_is(p, i, "wrap")
     || name_is(p, i, "vec_new") || name_is(p, i, "pool_size") || name_is(p, i, "pool_take") || name_is(p, i, "pool_give")
     || name_is(p, i, "pt_new") || name_is(p, i, "pt_free") || name_is(p, i, "frame_id") || name_is(p, i, "frame_read")
@@ -1962,7 +1962,10 @@ fn x86_ty_in(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u
         if name_is(p, i, "vec_len") {
           return c.tu64;
         }
-        if name_is(p, i, "vec_push") || name_is(p, i, "vec_set") || name_is(p, i, "vec_free") {
+        if name_is(p, i, "vec_try_reserve") {
+          return c.tbool;
+        }
+        if name_is(p, i, "vec_push") || name_is(p, i, "vec_push_within") || name_is(p, i, "vec_set") || name_is(p, i, "vec_free") {
           return c.tunit;
         }
         return x86_vec_elem(&mut g, c, &mut m, p, n.a);
@@ -3893,6 +3896,25 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
       x86_es(&mut g, "incq (%rdi)");
       x86_drop(&mut g, 1);
     }
+  } else if name_is(p, i, "vec_push_within") {
+    // The proof reserved the room: no check, no growing.
+    let w = x86_words(&mut g, c, m, p, x86_vec_elem(&mut g, c, &mut m, p, a0));
+    x86_arg(&mut g, c, &mut m, p, a0);
+    x86_push_val(&mut g, c, &mut m, p, a1);
+    x86_es_off(&mut g, "mov ", w, "(%rsp), %rdi");
+    x86_es(&mut g, "mov (%rdi), %rax");
+    x86_elem_addr(&mut g, w);
+    x86_pop_to(&mut g, x86_mem_loc(XR_RCX, XB, 0), w);
+    x86_es(&mut g, "incq (%rdi)");
+    x86_drop(&mut g, 1);
+  } else if name_is(p, i, "vec_try_reserve") {
+    let w = x86_words(&mut g, c, m, p, x86_vec_elem(&mut g, c, &mut m, p, a0));
+    x86_arg(&mut g, c, &mut m, p, a0);
+    x86_scalar(&mut g, c, &mut m, p, a1);
+    x86_es(&mut g, "mov %rax, %rsi");
+    x86_pop(&mut g, x86_reg(XR_RDI));
+    x86_es_off(&mut g, "mov $", w, ", %edx");
+    x86_es(&mut g, "call bst_rt_vec_try_reserve");
   } else if name_is(p, i, "vec_pop") {
     let w = x86_words(&mut g, c, m, p, x86_vec_elem(&mut g, c, &mut m, p, a0));
     x86_scalar(&mut g, c, &mut m, p, a0);
@@ -6049,6 +6071,58 @@ fn x86_runtime(out: &mut Vec[u64]) {
   cg_s(&mut out, "\tmov -16(%rbp), %r12\n");
   cg_s(&mut out, "\tleave\n");
   cg_s(&mut out, "\tret\n");
+  cg_s(&mut out, "bst_rt_vec_try_reserve:         # room for %rsi more elements of %rdx bytes in the Vec at (%rdi): %eax = 1, or 0 and unchanged\n");
+  cg_s(&mut out, "\tmov 8(%rdi), %rax\n");
+  cg_s(&mut out, "\tsub (%rdi), %rax\n");
+  cg_s(&mut out, "\tcmp %rsi, %rax\n");
+  cg_s(&mut out, "\tjb 1f\n");
+  cg_s(&mut out, "\tmov $1, %eax\n");
+  cg_s(&mut out, "\tret\n");
+  cg_s(&mut out, "1:\tpush %rbp\n");
+  cg_s(&mut out, "\tmov %rsp, %rbp\n");
+  cg_s(&mut out, "\tpush %rbx\n");
+  cg_s(&mut out, "\tpush %r12\n");
+  cg_s(&mut out, "\tpush %r13\n");
+  cg_s(&mut out, "\tsub $8, %rsp\n");
+  cg_s(&mut out, "\tmov %rdi, %rbx\n");
+  cg_s(&mut out, "\tmov %rdx, %r13\n");
+  cg_s(&mut out, "\tmov $1, %eax                # lim = 2^60 / size: the capacity stays at most 2^60\n");
+  cg_s(&mut out, "\tshl $60, %rax\n");
+  cg_s(&mut out, "\txor %edx, %edx\n");
+  cg_s(&mut out, "\tdiv %r13\n");
+  cg_s(&mut out, "\tmov (%rbx), %rcx\n");
+  cg_s(&mut out, "\tcmp %rax, %rcx\n");
+  cg_s(&mut out, "\tja 3f\n");
+  cg_s(&mut out, "\tmov %rax, %r8\n");
+  cg_s(&mut out, "\tsub %rcx, %r8\n");
+  cg_s(&mut out, "\tcmp %r8, %rsi\n");
+  cg_s(&mut out, "\tja 3f\n");
+  cg_s(&mut out, "\tlea (%rcx,%rsi), %r12       # new capacity: len + k, or double when that is more and fits\n");
+  cg_s(&mut out, "\tmov 8(%rbx), %rdx\n");
+  cg_s(&mut out, "\tshr $1, %rax\n");
+  cg_s(&mut out, "\tcmp %rax, %rdx\n");
+  cg_s(&mut out, "\tja 2f\n");
+  cg_s(&mut out, "\tadd %rdx, %rdx\n");
+  cg_s(&mut out, "\tcmp %r12, %rdx\n");
+  cg_s(&mut out, "\tjbe 2f\n");
+  cg_s(&mut out, "\tmov %rdx, %r12\n");
+  cg_s(&mut out, "2:\tmov %r12, %rax\n");
+  cg_s(&mut out, "\tmul %r13\n");
+  cg_s(&mut out, "\tmov %rax, %rsi\n");
+  cg_s(&mut out, "\tmov 16(%rbx), %rdi\n");
+  cg_s(&mut out, "\tcall realloc@PLT\n");
+  cg_s(&mut out, "\ttest %rax, %rax\n");
+  cg_s(&mut out, "\tjz 3f\n");
+  cg_s(&mut out, "\tmov %rax, 16(%rbx)\n");
+  cg_s(&mut out, "\tmov %r12, 8(%rbx)\n");
+  cg_s(&mut out, "\tmov $1, %eax\n");
+  cg_s(&mut out, "\tjmp 4f\n");
+  cg_s(&mut out, "3:\txor %eax, %eax\n");
+  cg_s(&mut out, "4:\tmov -8(%rbp), %rbx\n");
+  cg_s(&mut out, "\tmov -16(%rbp), %r12\n");
+  cg_s(&mut out, "\tmov -24(%rbp), %r13\n");
+  cg_s(&mut out, "\tleave\n");
+  cg_s(&mut out, "\tret\n");
   cg_s(&mut out, "bst_rt_bfrom:                   # Bytes copied from the %rdi bytes at %rsi: %rax = data, %rdx = len\n");
   cg_s(&mut out, "\tpush %rbp\n");
   cg_s(&mut out, "\tmov %rsp, %rbp\n");
@@ -6806,6 +6880,74 @@ fn x86_runtime_user(out: &mut Vec[u64]) {
   cg_s(&mut out, "\tmov -32(%rbp), %r14\n");
   cg_s(&mut out, "\tleave\n");
   cg_s(&mut out, "\tret\n");
+  cg_s(&mut out, "bst_rt_vec_try_reserve:         # room for %rsi more elements of %rdx bytes in the Vec at (%rdi): %eax = 1, or 0 and unchanged\n");
+  cg_s(&mut out, "\tmov 8(%rdi), %rax\n");
+  cg_s(&mut out, "\tsub (%rdi), %rax\n");
+  cg_s(&mut out, "\tcmp %rsi, %rax\n");
+  cg_s(&mut out, "\tjb 1f\n");
+  cg_s(&mut out, "\tmov $1, %eax\n");
+  cg_s(&mut out, "\tret\n");
+  cg_s(&mut out, "1:\tpush %rbp\n");
+  cg_s(&mut out, "\tmov %rsp, %rbp\n");
+  cg_s(&mut out, "\tpush %rbx\n");
+  cg_s(&mut out, "\tpush %r12\n");
+  cg_s(&mut out, "\tpush %r13\n");
+  cg_s(&mut out, "\tpush %r14\n");
+  cg_s(&mut out, "\tmov %rdi, %rbx\n");
+  cg_s(&mut out, "\tmov %rdx, %r13\n");
+  cg_s(&mut out, "\tmov $1, %eax                # lim = 2^60 / size: the capacity stays at most 2^60\n");
+  cg_s(&mut out, "\tshl $60, %rax\n");
+  cg_s(&mut out, "\txor %edx, %edx\n");
+  cg_s(&mut out, "\tdiv %r13\n");
+  cg_s(&mut out, "\tmov (%rbx), %rcx\n");
+  cg_s(&mut out, "\tcmp %rax, %rcx\n");
+  cg_s(&mut out, "\tja 3f\n");
+  cg_s(&mut out, "\tmov %rax, %r8\n");
+  cg_s(&mut out, "\tsub %rcx, %r8\n");
+  cg_s(&mut out, "\tcmp %r8, %rsi\n");
+  cg_s(&mut out, "\tja 3f\n");
+  cg_s(&mut out, "\tlea (%rcx,%rsi), %r12       # new capacity: len + k, or double when that is more and fits\n");
+  cg_s(&mut out, "\tmov 8(%rbx), %rdx\n");
+  cg_s(&mut out, "\tshr $1, %rax\n");
+  cg_s(&mut out, "\tcmp %rax, %rdx\n");
+  cg_s(&mut out, "\tja 2f\n");
+  cg_s(&mut out, "\tadd %rdx, %rdx\n");
+  cg_s(&mut out, "\tcmp %r12, %rdx\n");
+  cg_s(&mut out, "\tjbe 2f\n");
+  cg_s(&mut out, "\tmov %rdx, %r12\n");
+  cg_s(&mut out, "2:\tmov 8(%rbx), %rax           # the old words\n");
+  cg_s(&mut out, "\tmul %r13\n");
+  cg_s(&mut out, "\tadd $7, %rax\n");
+  cg_s(&mut out, "\tshr $3, %rax\n");
+  cg_s(&mut out, "\tmov %rax, %r14\n");
+  cg_s(&mut out, "\tmov %r12, %rax              # the new words\n");
+  cg_s(&mut out, "\tmul %r13\n");
+  cg_s(&mut out, "\tadd $7, %rax\n");
+  cg_s(&mut out, "\tshr $3, %rax\n");
+  cg_s(&mut out, "\tmov %rax, %rdi\n");
+  cg_s(&mut out, "\tcall bst_rt_try_alloc\n");
+  cg_s(&mut out, "\ttest %rax, %rax\n");
+  cg_s(&mut out, "\tjz 3f\n");
+  cg_s(&mut out, "\tmov %rax, %r13\n");
+  cg_s(&mut out, "\tmov 16(%rbx), %rsi\n");
+  cg_s(&mut out, "\ttest %rsi, %rsi\n");
+  cg_s(&mut out, "\tjz 4f\n");
+  cg_s(&mut out, "\tmov %rax, %rdi\n");
+  cg_s(&mut out, "\tmov %r14, %rcx\n");
+  cg_s(&mut out, "\trep movsq\n");
+  cg_s(&mut out, "\tmov 16(%rbx), %rdi\n");
+  cg_s(&mut out, "\tcall bst_rt_free\n");
+  cg_s(&mut out, "4:\tmov %r13, 16(%rbx)\n");
+  cg_s(&mut out, "\tmov %r12, 8(%rbx)\n");
+  cg_s(&mut out, "\tmov $1, %eax\n");
+  cg_s(&mut out, "\tjmp 5f\n");
+  cg_s(&mut out, "3:\txor %eax, %eax\n");
+  cg_s(&mut out, "5:\tmov -8(%rbp), %rbx\n");
+  cg_s(&mut out, "\tmov -16(%rbp), %r12\n");
+  cg_s(&mut out, "\tmov -24(%rbp), %r13\n");
+  cg_s(&mut out, "\tmov -32(%rbp), %r14\n");
+  cg_s(&mut out, "\tleave\n");
+  cg_s(&mut out, "\tret\n");
   cg_s(&mut out, "bst_rt_bfrom:                   # Bytes copied from the %rdi bytes at %rsi: %rax = data, %rdx = len\n");
   cg_s(&mut out, "\tpush %rbp\n");
   cg_s(&mut out, "\tmov %rsp, %rbp\n");
@@ -7126,6 +7268,74 @@ fn x86_runtime_kernel(out: &mut Vec[u64]) {
   cg_s(&mut out, "2:\tmov %r13, 16(%rbx)\n");
   cg_s(&mut out, "\tmov %r12, 8(%rbx)\n");
   cg_s(&mut out, "\tmov -8(%rbp), %rbx\n");
+  cg_s(&mut out, "\tmov -16(%rbp), %r12\n");
+  cg_s(&mut out, "\tmov -24(%rbp), %r13\n");
+  cg_s(&mut out, "\tmov -32(%rbp), %r14\n");
+  cg_s(&mut out, "\tleave\n");
+  cg_s(&mut out, "\tret\n");
+  cg_s(&mut out, "bst_rt_vec_try_reserve:         # room for %rsi more elements of %rdx bytes in the Vec at (%rdi): %eax = 1, or 0 and unchanged\n");
+  cg_s(&mut out, "\tmov 8(%rdi), %rax\n");
+  cg_s(&mut out, "\tsub (%rdi), %rax\n");
+  cg_s(&mut out, "\tcmp %rsi, %rax\n");
+  cg_s(&mut out, "\tjb 1f\n");
+  cg_s(&mut out, "\tmov $1, %eax\n");
+  cg_s(&mut out, "\tret\n");
+  cg_s(&mut out, "1:\tpush %rbp\n");
+  cg_s(&mut out, "\tmov %rsp, %rbp\n");
+  cg_s(&mut out, "\tpush %rbx\n");
+  cg_s(&mut out, "\tpush %r12\n");
+  cg_s(&mut out, "\tpush %r13\n");
+  cg_s(&mut out, "\tpush %r14\n");
+  cg_s(&mut out, "\tmov %rdi, %rbx\n");
+  cg_s(&mut out, "\tmov %rdx, %r13\n");
+  cg_s(&mut out, "\tmov $1, %eax                # lim = 2^60 / size: the capacity stays at most 2^60\n");
+  cg_s(&mut out, "\tshl $60, %rax\n");
+  cg_s(&mut out, "\txor %edx, %edx\n");
+  cg_s(&mut out, "\tdiv %r13\n");
+  cg_s(&mut out, "\tmov (%rbx), %rcx\n");
+  cg_s(&mut out, "\tcmp %rax, %rcx\n");
+  cg_s(&mut out, "\tja 3f\n");
+  cg_s(&mut out, "\tmov %rax, %r8\n");
+  cg_s(&mut out, "\tsub %rcx, %r8\n");
+  cg_s(&mut out, "\tcmp %r8, %rsi\n");
+  cg_s(&mut out, "\tja 3f\n");
+  cg_s(&mut out, "\tlea (%rcx,%rsi), %r12       # new capacity: len + k, or double when that is more and fits\n");
+  cg_s(&mut out, "\tmov 8(%rbx), %rdx\n");
+  cg_s(&mut out, "\tshr $1, %rax\n");
+  cg_s(&mut out, "\tcmp %rax, %rdx\n");
+  cg_s(&mut out, "\tja 2f\n");
+  cg_s(&mut out, "\tadd %rdx, %rdx\n");
+  cg_s(&mut out, "\tcmp %r12, %rdx\n");
+  cg_s(&mut out, "\tjbe 2f\n");
+  cg_s(&mut out, "\tmov %rdx, %r12\n");
+  cg_s(&mut out, "2:\tmov 8(%rbx), %rax           # the old words\n");
+  cg_s(&mut out, "\tmul %r13\n");
+  cg_s(&mut out, "\tadd $7, %rax\n");
+  cg_s(&mut out, "\tshr $3, %rax\n");
+  cg_s(&mut out, "\tmov %rax, %r14\n");
+  cg_s(&mut out, "\tmov %r12, %rax              # the new words\n");
+  cg_s(&mut out, "\tmul %r13\n");
+  cg_s(&mut out, "\tadd $7, %rax\n");
+  cg_s(&mut out, "\tshr $3, %rax\n");
+  cg_s(&mut out, "\tmov %rax, %rdi\n");
+  cg_s(&mut out, "\tcall bst_rt_try_alloc\n");
+  cg_s(&mut out, "\ttest %rax, %rax\n");
+  cg_s(&mut out, "\tjz 3f\n");
+  cg_s(&mut out, "\tmov %rax, %r13\n");
+  cg_s(&mut out, "\tmov 16(%rbx), %rsi\n");
+  cg_s(&mut out, "\ttest %rsi, %rsi\n");
+  cg_s(&mut out, "\tjz 4f\n");
+  cg_s(&mut out, "\tmov %rax, %rdi\n");
+  cg_s(&mut out, "\tmov %r14, %rcx\n");
+  cg_s(&mut out, "\trep movsq\n");
+  cg_s(&mut out, "\tmov 16(%rbx), %rdi\n");
+  cg_s(&mut out, "\tcall bst_rt_free\n");
+  cg_s(&mut out, "4:\tmov %r13, 16(%rbx)\n");
+  cg_s(&mut out, "\tmov %r12, 8(%rbx)\n");
+  cg_s(&mut out, "\tmov $1, %eax\n");
+  cg_s(&mut out, "\tjmp 5f\n");
+  cg_s(&mut out, "3:\txor %eax, %eax\n");
+  cg_s(&mut out, "5:\tmov -8(%rbp), %rbx\n");
   cg_s(&mut out, "\tmov -16(%rbp), %r12\n");
   cg_s(&mut out, "\tmov -24(%rbp), %r13\n");
   cg_s(&mut out, "\tmov -32(%rbp), %r14\n");

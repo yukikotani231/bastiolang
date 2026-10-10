@@ -802,6 +802,8 @@ fn main() -> u64 {
 | `vec_new[T]() -> Vec[T]` | | An empty vector |
 | `vec_len(v: &Vec[T]) -> u64` | | Its length (`vlen(v)` in specifications) |
 | `vec_push(v: &mut Vec[T], x: T)` | | Appends `x`, growing the storage when full |
+| `vec_try_reserve(v: &mut Vec[T], n: u64) -> bool` | | Makes room for `n` more elements without a push having to allocate, and returns `true`; or returns `false`, with `v` unchanged, when memory runs out. On `true`, `vcap(v) >= vlen(v) + n` |
+| `vec_push_within(v: &mut Vec[T], x: T)` | `vlen(v) < vcap(v)` | Appends `x` into room already reserved: never allocates, so it cannot stop the program |
 | `vec_pop(v: &mut Vec[T]) -> T` | `vlen(v) > 0` | Removes and returns the last element |
 | `vec_get(v: &Vec[T], i: u64) -> T` | `i < vlen(v)`; `T` not linear | A copy of element `i` |
 | `vec_set(v: &mut Vec[T], i: u64, x: T)` | `i < vlen(v)`; `T` not linear | Overwrites element `i` |
@@ -812,6 +814,45 @@ fn main() -> u64 {
 - In specifications, `vlen(v)` is the length and `vget(v, i)` is element `i`, of the element type, for any element type. So `vget(v, i).page`, `len(vget(v, i).page)`, `vget(v, i) is State::Used` and `vlen(vget(grid, i))` all work, typically under `forall i: u64 :: i < vlen(v) ==> ...`.
 - The prover tracks every element's contents: scalars, struct fields, enum tags and payloads, buffer lengths and contents, ghost state of capabilities, nested vectors. A read gives back what was last written at that index. The exception is boxes inside elements: what a box in an element holds is unknown once the element is in the vector.
 - The storage doubles when full. A push that cannot get memory aborts; the prover takes this into account by assuming the length stays below 2^60 after a push.
+- Code that must not abort when memory runs out reserves first and then pushes within the room:
+
+```bastio
+// expect-exit: 3
+fn fill(v: &mut Vec[u64], n: u64) -> bool
+  requires vlen(v) == 0 && n <= 1000
+  ensures result ==> vlen(v) == n
+  ensures !result ==> vlen(v) == 0
+{
+  if !vec_try_reserve(&mut v, n) {
+    return false;                      // out of memory: nothing was lost
+  }
+  let mut i = 0;
+  while i < n
+    invariant i <= n && vlen(v) == i && vcap(v) >= n
+  {
+    vec_push_within(&mut v, i);        // proved: vlen(v) < vcap(v)
+    i = i + 1;
+  }
+  return true;
+}
+
+fn main() -> u64 {
+  let mut v = vec_new[u64]();
+  let mut n = 0;
+  if fill(&mut v, 3) {
+    n = vec_len(v);
+  }
+  while vec_len(v) > 0
+    invariant true
+  {
+    let x = vec_pop(&mut v);
+  }
+  vec_free(v);
+  return n;
+}
+```
+
+`vcap(v)` is the capacity, in specifications. The prover tracks it through `vec_push` (which keeps it while there is room), `vec_pop`, `vec_set` and `vec_swap` (which keep it), loops and calls. What it knows across a call is what the callee's contract says. The capacity of a vector stored inside another vector is not tracked. Room is reserved before the element exists, so a vector of linear values works the same way: nothing has to be given back when there is no room.
 - In generated code a `Vec[T]` is `{ len, cap, data }` and element access is a plain array access, with no bounds check.
 
 ## Buffers, bytes and strings
@@ -1228,7 +1269,7 @@ Expressions in `requires`, `ensures`, `invariant` and `assert` (and the bodies o
 
 - They are evaluated over **mathematical integers**: `a - b` may be negative and `a + b` cannot overflow. Integers of different types mix freely there, with no conversions.
 - They may use `==>` (implication) and `forall x: u64 :: e`.
-- They may call `len`, `get`, `slen`, `sget`, `blen`, `bget`, `bdec`, `bhex`, `has_bit`, `vlen`, `vget`, `vcount`, the ghost accessors of the capabilities, and `spec fn`s.
+- They may call `len`, `get`, `slen`, `sget`, `blen`, `bget`, `bdec`, `bhex`, `has_bit`, `vlen`, `vcap`, `vget`, `vcount`, the ghost accessors of the capabilities, and `spec fn`s.
 - `vcount(v, x)` is the number of elements of `v` equal to `x`, for a vector of integers. It states what `forall` cannot: that a vector is a permutation of another, or that a counter counts something.
 - `bdec(b, from, to)` is the decimal value of bytes `from..to` of `b`, each byte read as a digit (byte - 48): 0 for an empty range, and `10 * bdec(b, from, to - 1) + (bget(b, to - 1) - 48)` otherwise. The prover unfolds that definition one digit for each `bdec` term a proof mentions, so a loop that parses digits states `v == bdec(b, from, i)` as its invariant, and a constant is evaluated by asserting each prefix in turn (`tests/pass/bdec.bastio`).
 - `bhex(b, from, to)` is the same in base 16: `16 * bhex(b, from, to - 1)` plus the value of the hex digit `bget(b, to - 1)` (`0-9`, `a-f`, `A-F`; another byte has no meaningful value, so a spec says the bytes are hex digits separately, as `core/num.bastio`'s `all_hex` does).

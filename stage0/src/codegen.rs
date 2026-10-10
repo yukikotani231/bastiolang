@@ -85,6 +85,8 @@ pub fn emit(p: &Program, target: Target) -> String {
     for t in &vecs {
         let (c, n) = (cty(t), box_helper(t));
         out.push_str(&format!("static void bst_vec_push_{n}(bst_vec *v, {c} x) {{ if (v->len == v->cap) bst_vec_grow(v, sizeof({c})); (({c} *)v->data)[v->len++] = x; }}\n"));
+        out.push_str(&format!("static void bst_vec_push_within_{n}(bst_vec *v, {c} x) {{ (({c} *)v->data)[v->len++] = x; }}\n"));
+        out.push_str(&format!("static bool bst_vec_try_reserve_{n}(bst_vec *v, uint64_t k) {{ return bst_vec_try_grow(v, k, sizeof({c})); }}\n"));
         out.push_str(&format!("static {c} bst_vec_pop_{n}(bst_vec *v) {{ return (({c} *)v->data)[--v->len]; }}\n"));
         out.push_str(&format!("static {c} bst_vec_get_{n}(bst_vec v, uint64_t i) {{ return (({c} *)v.data)[i]; }}\n"));
         out.push_str(&format!("static void bst_vec_set_{n}(bst_vec *v, uint64_t i, {c} x) {{ (({c} *)v->data)[i] = x; }}\n"));
@@ -339,9 +341,12 @@ static bst_buf bst_try_alloc(uint64_t n) {
 static inline void bst_free(bst_buf b) { free(b.data); }
 /* Grow a block of `old` words to `n` words, keeping its contents; the new
  * words are not zeroed (only Vec uses it, and never reads past its length). */
-static uint64_t *bst_regrow(uint64_t *p, uint64_t old, uint64_t n) {
+static uint64_t *bst_try_regrow(uint64_t *p, uint64_t old, uint64_t n) {
     (void)old;
-    uint64_t *q = (uint64_t *)realloc(p, (n ? n : 1) * sizeof(uint64_t));
+    return (uint64_t *)realloc(p, (n ? n : 1) * sizeof(uint64_t));
+}
+static uint64_t *bst_regrow(uint64_t *p, uint64_t old, uint64_t n) {
+    uint64_t *q = bst_try_regrow(p, old, n);
     if (!q) { fputs("Bastio: out of memory\n", stderr); abort(); }
     return q;
 }
@@ -676,14 +681,19 @@ static void bst_bfree(bst_bytes b) {
     bst_free(w);
 }
 /* Grow a block of `old` words to `n` words, keeping its contents. */
-static uint64_t *bst_regrow(uint64_t *p, uint64_t old, uint64_t n) {
-    uint64_t *q = bst_alloc(n).data;
-    if (p) {
+static uint64_t *bst_copy_over(uint64_t *q, uint64_t *p, uint64_t old) {
+    if (q && p) {
         for (uint64_t i = 0; i < old; i++) q[i] = p[i];
         bst_buf b = { old, p };
         bst_free(b);
     }
     return q;
+}
+static uint64_t *bst_regrow(uint64_t *p, uint64_t old, uint64_t n) {
+    return bst_copy_over(bst_alloc(n).data, p, old);
+}
+static uint64_t *bst_try_regrow(uint64_t *p, uint64_t old, uint64_t n) {
+    return bst_copy_over(bst_try_alloc(n).data, p, old);
 }
 "#;
 
@@ -815,6 +825,21 @@ static void bst_vec_grow(bst_vec *v, uint64_t size) {
     uint64_t bytes = ncap > (UINT64_C(1) << 60) / size ? ~UINT64_C(0) - 8 : ncap * size;
     v->data = bst_regrow((uint64_t *)v->data, (v->cap * size + 7) / 8, (bytes + 7) / 8);
     v->cap = ncap;
+}
+/* vec_try_reserve: room for k more elements, or false with the vector
+ * unchanged. The capacity stays at most 2^60 elements, as the prover
+ * assumes. */
+static bool bst_vec_try_grow(bst_vec *v, uint64_t k, uint64_t size) {
+    uint64_t lim = (UINT64_C(1) << 60) / size;
+    if (k <= v->cap - v->len) return true;
+    if (v->len > lim || k > lim - v->len) return false;
+    uint64_t ncap = v->len + k;
+    if (v->cap <= lim / 2 && v->cap * 2 > ncap) ncap = v->cap * 2;
+    uint64_t *d = bst_try_regrow((uint64_t *)v->data, (v->cap * size + 7) / 8, (ncap * size + 7) / 8);
+    if (!d) return false;
+    v->data = d;
+    v->cap = ncap;
+    return true;
 }
 static inline void bst_bset(bst_bytes *b, uint64_t i, uint64_t v) { b->data[i] = (unsigned char)v; }
 /* Bulk copies. The prover has shown both ranges in bounds, so there are no
@@ -1343,7 +1368,8 @@ impl<'a> Gen<'a> {
             },
             ExprKind::Call(n, args) if crate::check::VEC_BUILTINS.contains(&n.as_str()) => match n.as_str() {
                 "vec_len" => Type::U64,
-                "vec_push" | "vec_set" | "vec_free" => Type::Unit,
+                "vec_try_reserve" => Type::Bool,
+                "vec_push" | "vec_push_within" | "vec_set" | "vec_free" => Type::Unit,
                 _ => self.vec_elem(&args[0]),
             },
             ExprKind::Call(n, _) if crate::check::WRAP_BUILTINS.contains(&n.as_str()) => self.int_ops[&e.pos].clone(),

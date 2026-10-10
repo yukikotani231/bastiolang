@@ -96,8 +96,11 @@ enum Val {
     Box(BoxVal),
     /// A vector: its length, and its elements "lifted": a value shaped like
     /// one element whose every term is an SMT array from index to that term
-    /// (see `leaves`). Boxes inside the elements are opaque.
-    Vec { elem: Type, len: String, elems: Box<Val> },
+    /// (see `leaves`). Boxes inside the elements are opaque. `cap` is the
+    /// capacity, tracked only in functions that can mention it (see
+    /// `capacity`) and only for vectors that are not elements of another:
+    /// `None` when unknown. It is not a leaf, so lifting never sees it.
+    Vec { elem: Type, len: String, cap: Option<String>, elems: Box<Val> },
     Unit,
 }
 
@@ -162,7 +165,13 @@ fn merge_val(c: &str, a: &Val, b: &Val) -> Val {
         (Val::Obj(ty, f1), Val::Obj(_, f2)) => Val::Obj(ty.clone(), f1.iter().zip(f2).map(|(x, y)| ite(c, x, y)).collect()),
         (Val::Struct(n, f1), Val::Struct(_, f2)) => Val::Struct(n.clone(), f1.iter().zip(f2).map(|(x, y)| merge_val(c, x, y)).collect()),
         (Val::Enum(n, t1, p1), Val::Enum(_, t2, p2)) => Val::Enum(n.clone(), ite(c, t1, t2), p1.iter().zip(p2).map(|(x, y)| merge_val(c, x, y)).collect()),
-        (Val::Vec { elem, len: l1, elems: e1 }, Val::Vec { len: l2, elems: e2, .. }) => Val::Vec { elem: elem.clone(), len: ite(c, l1, l2), elems: Box::new(merge_val(c, e1, e2)) },
+        (Val::Vec { elem, len: l1, cap: c1, elems: e1 }, Val::Vec { len: l2, cap: c2, elems: e2, .. }) => {
+            let cap = match (c1, c2) {
+                (Some(x), Some(y)) => Some(ite(c, x, y)),
+                _ => None,
+            };
+            Val::Vec { elem: elem.clone(), len: ite(c, l1, l2), cap, elems: Box::new(merge_val(c, e1, e2)) }
+        }
         (Val::Box(BoxVal::Known(x)), Val::Box(BoxVal::Known(y))) => Val::Box(BoxVal::Known(Box::new(merge_val(c, x, y)))),
         // Forgetting what one side knew is sound.
         (Val::Box(BoxVal::Opaque(t)), Val::Box(_)) | (Val::Box(_), Val::Box(BoxVal::Opaque(t))) => Val::Box(BoxVal::Opaque(t.clone())),
@@ -216,9 +225,9 @@ fn map_leaves(v: &Val, f: &mut dyn FnMut(&str) -> String) -> Val {
             let tag = f(tag);
             Val::Enum(n.clone(), tag, ps.iter().map(|x| map_leaves(x, f)).collect())
         }
-        Val::Vec { elem, len, elems } => {
+        Val::Vec { elem, len, elems, .. } => {
             let len = f(len);
-            Val::Vec { elem: elem.clone(), len, elems: Box::new(map_leaves(elems, f)) }
+            Val::Vec { elem: elem.clone(), len, cap: None, elems: Box::new(map_leaves(elems, f)) }
         }
         Val::Box(b) => Val::Box(b.clone()),
         Val::Unit => Val::Unit,
@@ -423,6 +432,12 @@ pub struct Verifier<'p> {
     /// is `bit` declared and every bitwise operator described bit by bit.
     bitwise: &'p HashSet<String>,
     bits: bool,
+    /// The functions whose proofs can mention a vector's capacity (`vcap`,
+    /// `vec_try_reserve`, `vec_push_within`), and whether the one being
+    /// verified is one of them: only then are capacities tracked, so other
+    /// programs get the same queries as before.
+    capacity: &'p HashSet<String>,
+    caps: bool,
     /// The file of the function being verified: an opaque spec fn's body
     /// is used only in its own file.
     file: usize,
@@ -684,6 +699,7 @@ pub fn verify_program(p: &Program, one_session: bool) -> Result<(usize, Vec<Stri
     let decimal = counting_fns(p, "bdec");
     let hexadecimal = counting_fns(p, "bhex");
     let bitwise = counting_fns(p, "has_bit");
+    let capacity: HashSet<String> = ["vcap", "vec_try_reserve", "vec_push_within"].iter().flat_map(|c| counting_fns(p, c)).collect();
     let n = p.fns.len();
     let jobs = std::env::var("BASTIO_JOBS")
         .ok()
@@ -695,7 +711,7 @@ pub fn verify_program(p: &Program, one_session: bool) -> Result<(usize, Vec<Stri
     // a function after it, since its result could not be reported anyway.
     let failed = AtomicUsize::new(usize::MAX);
     let workers: Vec<Worker> = std::thread::scope(|s| {
-        let hs: Vec<_> = (0..jobs).map(|_| s.spawn(|| verify_worker(p, &sums, &counting, &decimal, &hexadecimal, &bitwise, &next, &failed))).collect();
+        let hs: Vec<_> = (0..jobs).map(|_| s.spawn(|| verify_worker(p, &sums, &counting, &decimal, &hexadecimal, &bitwise, &capacity, &next, &failed))).collect();
         hs.into_iter().map(|h| h.join().expect("a verifier thread panicked")).collect()
     });
     let mut obligations = 0;
@@ -736,7 +752,7 @@ struct Worker {
 
 /// Verifies functions, taking the next unverified index each time, on a
 /// solver of its own.
-fn verify_worker(p: &Program, sums: &Summaries, counting: &HashSet<String>, decimal: &HashSet<String>, hexadecimal: &HashSet<String>, bitwise: &HashSet<String>, next: &AtomicUsize, failed: &AtomicUsize) -> Worker {
+fn verify_worker(p: &Program, sums: &Summaries, counting: &HashSet<String>, decimal: &HashSet<String>, hexadecimal: &HashSet<String>, bitwise: &HashSet<String>, capacity: &HashSet<String>, next: &AtomicUsize, failed: &AtomicUsize) -> Worker {
     let mut w = Worker { obligations: 0, log: Vec::new(), times: Vec::new(), err: None };
     let solver = match Solver::start() {
         Ok(s) => s,
@@ -745,7 +761,7 @@ fn verify_worker(p: &Program, sums: &Summaries, counting: &HashSet<String>, deci
             return w;
         }
     };
-    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, int_ops: HashMap::new(), sums, counting, decimal, hexadecimal, bitwise, counts: false, bits: false, file: 0 };
+    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, int_ops: HashMap::new(), sums, counting, decimal, hexadecimal, bitwise, capacity, counts: false, bits: false, caps: false, file: 0 };
     let mut run = || -> Result<(), (usize, Diag)> {
         // Every function is verified on a solver in the same state, fresh
         // or reset: what Z3 answers near its work limit depends on what it
@@ -849,6 +865,18 @@ impl<'p> Verifier<'p> {
         self.fresh_int(&format!("len_{}", hint), "0", ALLOC_MAX)
     }
 
+    /// A vector's capacity, at least its length `len`, when the function
+    /// tracks capacities. The allocators never give a vector room for more
+    /// than 2^60 elements (`bst_vec_grow`, `bst_vec_try_grow`).
+    fn fresh_cap(&mut self, len: &str, hint: &str) -> Result<Option<String>, Diag> {
+        if !self.caps {
+            return Ok(None);
+        }
+        let c = self.fresh_int(&format!("cap_{}", hint), "0", ALLOC_MAX)?;
+        self.smt(&format!("(assert (<= {} {}))", len, c))?;
+        Ok(Some(c))
+    }
+
     fn fresh_array(&mut self, hint: &str, elem: &str) -> Result<String, Diag> {
         let n = self.fresh_name(&format!("data_{}", hint));
         self.smt(&format!("(declare-const {} (Array Int {}))", n, elem))?;
@@ -918,7 +946,9 @@ impl<'p> Verifier<'p> {
             }
             Type::Vec(t) => {
                 let elems = self.fresh_lifted(t, hint)?;
-                Ok(Val::Vec { elem: (**t).clone(), len: self.fresh_len(hint)?, elems: Box::new(elems) })
+                let len = self.fresh_len(hint)?;
+                let cap = self.fresh_cap(&len, hint)?;
+                Ok(Val::Vec { elem: (**t).clone(), len, cap, elems: Box::new(elems) })
             }
             Type::Box(t) => {
                 if self.box_depth >= BOX_DEPTH {
@@ -1056,6 +1086,7 @@ impl<'p> Verifier<'p> {
     fn verify_fn(&mut self, f: &FnDef) -> Result<(), Diag> {
         self.int_ops = f.int_ops.clone();
         self.counts = self.counting.contains(&f.name);
+        self.caps = self.capacity.contains(&f.name);
         if self.counts {
             for c in COUNT_LEMMAS {
                 self.smt(c)?;
@@ -1412,9 +1443,15 @@ impl<'p> Verifier<'p> {
                 }
                 Val::Enum(n.clone(), tag, np)
             }
-            Val::Vec { elem, len, .. } => {
-                let len = if keep { len.clone() } else { self.fresh_len(name)? };
-                Val::Vec { elem: elem.clone(), len, elems: Box::new(self.fresh_lifted(elem, name)?) }
+            Val::Vec { elem, len, cap, .. } => {
+                let (len, cap) = if keep {
+                    (len.clone(), cap.clone())
+                } else {
+                    let len = self.fresh_len(name)?;
+                    let cap = self.fresh_cap(&len, name)?;
+                    (len, cap)
+                };
+                Val::Vec { elem: elem.clone(), len, cap, elems: Box::new(self.fresh_lifted(elem, name)?) }
             }
             Val::Box(BoxVal::Known(i)) => Val::Box(BoxVal::Known(Box::new(self.havoc(i, keep, name)?))),
             Val::Box(BoxVal::Opaque(t)) => Val::Box(BoxVal::Opaque(t.clone())),
@@ -1427,7 +1464,8 @@ impl<'p> Verifier<'p> {
         match &e.kind {
             ExprKind::TypeApp(targs, inner) => match &inner.kind {
                 ExprKind::Call(n, _) if n == "vec_new" => {
-                    Ok(Val::Vec { elem: targs[0].clone(), len: "0".into(), elems: Box::new(self.fresh_lifted(&targs[0], "vec")?) })
+                    let cap = self.caps.then(|| "0".to_string());
+                    Ok(Val::Vec { elem: targs[0].clone(), len: "0".into(), cap, elems: Box::new(self.fresh_lifted(&targs[0], "vec")?) })
                 }
                 // `cast[T](x)` keeps the value and proves it fits; `wrap[T](x)`
                 // reduces it modulo 2^width.
@@ -2012,32 +2050,68 @@ impl<'p> Verifier<'p> {
                 Val::Vec { len, .. } => Ok(Val::U(len.clone())),
                 _ => unreachable!(),
             },
-            "vec_push" => {
-                let Val::Vec { elem, len, elems } = vals[0].clone() else { unreachable!() };
-                // A push that cannot grow the vector aborts (out of memory),
-                // so after it the length stayed below 2^60.
-                st.pc.push(format!("(< {} {})", len, ALLOC_MAX));
+            "vec_push" | "vec_push_within" => {
+                let Val::Vec { elem, len, cap, elems } = vals[0].clone() else { unreachable!() };
+                let cap = if name == "vec_push" {
+                    // A push that cannot grow the vector aborts (out of
+                    // memory), so after it the length stayed below 2^60.
+                    st.pc.push(format!("(< {} {})", len, ALLOC_MAX));
+                    // It grows the storage only when it is full.
+                    match cap {
+                        Some(c) => {
+                            let g = self.fresh_int("cap_grown", "0", ALLOC_MAX)?;
+                            st.pc.push(format!("(< {} {})", len, g));
+                            Some(format!("(ite (< {} {}) {} {})", len, c, c, g))
+                        }
+                        None => None,
+                    }
+                } else {
+                    // Never allocates: the room was reserved.
+                    let c = match cap {
+                        Some(c) => c,
+                        None => self.fresh_int("cap", "0", ALLOC_MAX)?,
+                    };
+                    self.need(st, format!("(< {} {})", len, c), pos, "E-VERIFY-BOUNDS", format!("that `{}` has room for one more element (`vlen({}) < vcap({})`)", ra(0), ra(0), ra(0)))?;
+                    Some(c)
+                };
                 let elems2 = vec_write(&elems, &len, &vals[1]);
                 if let (true, Val::U(a), Val::U(a2)) = (self.counts, &*elems, &elems2) {
                     st.pc.push(count_step(a2, &format!("(+ {} 1)", len), a, &len, &format!("(ite (= {} x) 1 0)", vals[1].term())));
                 }
                 let elems = elems2;
-                self.put_back(&args[0], Val::Vec { elem, len: format!("(+ {} 1)", len), elems: Box::new(elems) }, st);
+                self.put_back(&args[0], Val::Vec { elem, len: format!("(+ {} 1)", len), cap, elems: Box::new(elems) }, st);
                 Ok(Val::Unit)
             }
+            "vec_try_reserve" => {
+                let Val::Vec { elem, len, cap, elems } = vals[0].clone() else { unreachable!() };
+                let n = vals[1].term().to_string();
+                // On success there is room for `n` more elements; on failure
+                // the vector is unchanged. Either way the capacity stays
+                // within what the allocators give (`fresh_cap`).
+                let ok = self.fresh_bool("reserved")?.term().to_string();
+                let c2 = self.fresh_int("cap_reserved", "0", ALLOC_MAX)?;
+                st.pc.push(format!("(<= {} {})", len, c2));
+                st.pc.push(format!("(=> {} (<= (+ {} {}) {}))", ok, len, n, c2));
+                let cap = Some(match cap {
+                    Some(c) => format!("(ite {} {} {})", ok, c2, c),
+                    None => c2,
+                });
+                self.put_back(&args[0], Val::Vec { elem, len, cap, elems }, st);
+                Ok(Val::B(ok))
+            }
             "vec_pop" => {
-                let Val::Vec { elem, len, elems } = vals[0].clone() else { unreachable!() };
+                let Val::Vec { elem, len, cap, elems } = vals[0].clone() else { unreachable!() };
                 self.need(st, format!("(> {} 0)", len), pos, "E-VERIFY-BOUNDS", format!("that `{}` is not empty (`vlen({}) > 0`)", ra(0), ra(0)))?;
                 let last = format!("(- {} 1)", len);
                 if let (true, Val::U(a)) = (self.counts, &*elems) {
                     st.pc.push(count_step(a, &last, a, &len, &format!("(- (ite (= (select {} {}) x) 1 0))", a, last)));
                 }
                 let v = self.vec_read(&elem, &elems, &last, st)?;
-                self.put_back(&args[0], Val::Vec { elem, len: last, elems }, st);
+                self.put_back(&args[0], Val::Vec { elem, len: last, cap, elems }, st);
                 Ok(v)
             }
             "vec_get" | "vec_set" | "vec_swap" => {
-                let Val::Vec { elem, len, elems } = vals[0].clone() else { unreachable!() };
+                let Val::Vec { elem, len, cap, elems } = vals[0].clone() else { unreachable!() };
                 let i = vals[1].term().to_string();
                 self.need(st, format!("(< {} {})", i, len), pos, "E-VERIFY-BOUNDS", format!("that the index `{}` is within `{}` (`{} < vlen({})`)", ra(1), ra(0), ra(1), ra(0)))?;
                 let old = if name == "vec_set" { Val::Unit } else { self.vec_read(&elem, &elems, &i, st)? };
@@ -2047,7 +2121,7 @@ impl<'p> Verifier<'p> {
                         st.pc.push(count_step(a2, &len, a, &len, &format!("(- (ite (= {} x) 1 0) (ite (= (select {} {}) x) 1 0))", vals[2].term(), a, i)));
                     }
                     let elems = elems2;
-                    self.put_back(&args[0], Val::Vec { elem, len, elems: Box::new(elems) }, st);
+                    self.put_back(&args[0], Val::Vec { elem, len, cap, elems: Box::new(elems) }, st);
                 }
                 Ok(old)
             }
@@ -2722,6 +2796,17 @@ impl<'p> Verifier<'p> {
                 match name.as_str() {
                     "vlen" => match v {
                         Val::Vec { len, .. } => len,
+                        _ => unreachable!(),
+                    },
+                    "vcap" => match v {
+                        Val::Vec { cap: Some(c), .. } => c,
+                        // The capacity of an element of a vector is not
+                        // tracked: all that is known is its range.
+                        Val::Vec { len, .. } => {
+                            let c = self.fresh_int("cap", "0", ALLOC_MAX)?;
+                            self.smt(&format!("(assert (<= {} {}))", len, c))?;
+                            c
+                        }
                         _ => unreachable!(),
                     },
                     "len" | "slen" | "blen" => match v {
