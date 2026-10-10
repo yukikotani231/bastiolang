@@ -11,7 +11,7 @@
 // docs/language.md). They are the only C a Bastio program runs on.
 
 use crate::ast::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Target {
@@ -34,13 +34,28 @@ struct Gen<'a> {
     blobs: &'a mut Vec<Vec<u8>>,
     /// Counter for the temporaries that hold a `match` scrutinee.
     tmps: usize,
+    /// The type of every variable declared so far in this function (a name
+    /// reused in a later scope is overwritten, as code is emitted in order).
+    types: HashMap<String, Type>,
+    sigs: &'a HashMap<String, crate::check::Sig>,
+    /// Boxed types used anywhere: each gets a pair of helpers.
+    boxed: &'a mut Vec<Type>,
 }
 
 pub fn emit(p: &Program, target: Target) -> String {
+    let sigs = crate::check::signatures(p, target).expect("checked");
     let mut blobs = Vec::new();
+    let mut boxed = Vec::new();
     let mut bodies = String::new();
     for f in &p.fns {
-        let mut g = Gen { mut_params: f.params.iter().filter(|p| p.ty.is_mut_ref()).map(|p| p.name.clone()).collect(), blobs: &mut blobs, tmps: 0 };
+        let mut g = Gen {
+            mut_params: f.params.iter().filter(|p| p.ty.is_mut_ref()).map(|p| p.name.clone()).collect(),
+            blobs: &mut blobs,
+            tmps: 0,
+            types: f.params.iter().map(|p| (p.name.clone(), p.ty.base().clone())).collect(),
+            sigs: &sigs,
+            boxed: &mut boxed,
+        };
         bodies.push_str(&format!("{} {{\n", proto(f)));
         for s in &f.body {
             g.stmt(s, 1, &mut bodies);
@@ -52,6 +67,11 @@ pub fn emit(p: &Program, target: Target) -> String {
         out.push_str(part);
     }
     out.push_str(&struct_decls(p));
+    for t in &boxed {
+        let (c, n) = (cty(t), box_helper(t));
+        out.push_str(&format!("static {c} *bst_box_{n}({c} v) {{ {c} *p = ({c} *)bst_box_alloc(sizeof({c})); *p = v; return p; }}\n"));
+        out.push_str(&format!("static {c} bst_unbox_{n}({c} *p) {{ {c} v = *p; bst_box_free(p, sizeof({c})); return v; }}\n"));
+    }
     for (i, b) in blobs.iter().enumerate() {
         out.push_str(&format!("static const unsigned char bst_blob{}[{}] = {{", i, b.len().max(1)));
         for (j, x) in b.iter().enumerate() {
@@ -377,6 +397,9 @@ static void bst_bfree(bst_bytes b) {
 
 // Bytes operations shared by every target.
 const PRELUDE_BYTES: &str = r#"
+/* Box[T]: one allocation from the same allocator as Buf. */
+static void *bst_box_alloc(uint64_t n) { return bst_alloc((n + 7) / 8).data; }
+static void bst_box_free(void *p, uint64_t n) { bst_buf w = { (n + 7) / 8, (uint64_t *)p }; bst_free(w); }
 static inline void bst_bset(bst_bytes *b, uint64_t i, uint64_t v) { b->data[i] = (unsigned char)v; }
 static bst_bytes bst_bfrom(bst_str s) {
     bst_bytes b = bst_balloc(s.len);
@@ -518,13 +541,15 @@ fn cty(t: &Type) -> String {
         Type::Cpu => "bst_cpu".into(),
         Type::Struct(n) => format!("bst_s_{}", n),
         Type::Enum(n) => format!("bst_e_{}", n),
+        Type::Box(t) => format!("{} *", cty(t)),
         Type::Ref(t) => cty(t),
         Type::MutRef(_) => unreachable!("written by proto"),
     }
 }
 
-/// C types for the program's structs and enums, each after the types it
-/// contains. An enum is a tag plus a union of its payloads.
+/// C types for the program's structs and enums. All are declared first, so a
+/// box (a pointer) can name any of them; then each is defined after the types
+/// it holds by value. An enum is a tag plus a union of its payloads.
 fn struct_decls(p: &Program) -> String {
     fn emit_one(n: &str, p: &Program, done: &mut Vec<String>, out: &mut String) {
         if done.iter().any(|d| d == n) {
@@ -541,14 +566,14 @@ fn struct_decls(p: &Program) -> String {
             }
         }
         if let Some(d) = p.structs.iter().find(|x| x.name == n) {
-            out.push_str("typedef struct {");
+            out.push_str(&format!("struct bst_s_{} {{", n));
             for (f, t) in &d.fields {
                 out.push_str(&format!(" {} {};", cty(t), f));
             }
-            out.push_str(&format!(" }} bst_s_{};\n", n));
+            out.push_str(" };\n");
         } else {
             let d = p.enums.iter().find(|x| x.name == n).unwrap();
-            out.push_str("typedef struct { uint64_t tag;");
+            out.push_str(&format!("struct bst_e_{} {{ uint64_t tag;", n));
             if held.iter().any(|t| *t != Type::Unit) {
                 out.push_str(" union {");
                 for (v, t) in &d.variants {
@@ -558,15 +583,26 @@ fn struct_decls(p: &Program) -> String {
                 }
                 out.push_str(" } u;");
             }
-            out.push_str(&format!(" }} bst_e_{};\n", n));
+            out.push_str(" };\n");
         }
     }
-    let mut done = Vec::new();
     let mut out = String::new();
+    for d in &p.structs {
+        out.push_str(&format!("typedef struct bst_s_{0} bst_s_{0};\n", d.name));
+    }
+    for d in &p.enums {
+        out.push_str(&format!("typedef struct bst_e_{0} bst_e_{0};\n", d.name));
+    }
+    let mut done = Vec::new();
     for n in p.structs.iter().map(|d| &d.name).chain(p.enums.iter().map(|d| &d.name)) {
         emit_one(n, p, &mut done, &mut out);
     }
     out
+}
+
+/// The C identifier part for a boxed type's helpers.
+fn box_helper(t: &Type) -> String {
+    t.name().chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect()
 }
 
 fn proto(f: &FnDef) -> String {
@@ -591,11 +627,50 @@ impl<'a> Gen<'a> {
         if self.mut_params.contains(n) { format!("(*v_{})", n) } else { format!("v_{}", n) }
     }
 
-    /// The C lvalue for a dotted place.
+    /// The C lvalue for a dotted place; a box on the way is dereferenced.
     fn place(&self, path: &str) -> String {
-        match path.split_once('.') {
-            Some((root, rest)) => format!("{}.{}", self.var(root), rest),
-            None => self.var(path),
+        let mut parts = path.split('.');
+        let root = parts.next().unwrap();
+        let mut s = self.var(root);
+        let mut t = self.types[root].clone();
+        for f in parts {
+            while let Type::Box(i) = t {
+                s = format!("(*{})", s);
+                t = *i;
+            }
+            s = format!("{}.{}", s, f);
+            t = struct_def(t.name().as_str()).unwrap().field(f).unwrap().clone();
+        }
+        s
+    }
+
+    /// The type of a code expression (the checker has already accepted it).
+    fn type_of(&self, e: &Expr) -> Type {
+        match &e.kind {
+            ExprKind::Int(_) => Type::U64,
+            ExprKind::Bool(_) | ExprKind::Not(_) | ExprKind::Is(..) => Type::Bool,
+            ExprKind::Str(_) | ExprKind::Blob(_) => Type::Str,
+            ExprKind::Var(n) => self.types[n].clone(),
+            ExprKind::Field(b, f) => {
+                let mut t = self.type_of(b);
+                while let Type::Box(i) = t {
+                    t = *i;
+                }
+                struct_def(t.name().as_str()).unwrap().field(f).unwrap().clone()
+            }
+            ExprKind::StructLit(n, _) => Type::Struct(n.clone()),
+            ExprKind::Variant(n, ..) => Type::Enum(n.clone()),
+            ExprKind::Bin(op, ..) => match op {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => Type::U64,
+                _ => Type::Bool,
+            },
+            ExprKind::Call(n, args) if n == "box" => Type::Box(Box::new(self.type_of(&args[0]))),
+            ExprKind::Call(n, args) if n == "unbox" => match self.type_of(&args[0]) {
+                Type::Box(i) => *i,
+                _ => unreachable!("checked"),
+            },
+            ExprKind::Call(n, _) => self.sigs[n].ret.clone(),
+            ExprKind::MutBorrow(_) | ExprKind::Forall(..) => unreachable!("not a value"),
         }
     }
 
@@ -603,6 +678,7 @@ impl<'a> Gen<'a> {
         match &s.kind {
             StmtKind::Let { name, ty, init, .. } => {
                 let e = self.expr(init);
+                self.types.insert(name.clone(), ty.clone().expect("typed by checker"));
                 out.push_str(&format!("{}{} v_{} = {};\n", ind(d), cty(ty.as_ref().expect("typed by checker")), name, e));
             }
             StmtKind::Assign { name, value } => {
@@ -667,6 +743,7 @@ impl<'a> Gen<'a> {
                             }
                             if let Some(b) = b.as_ref().filter(|b| *b != "_") {
                                 let pt = d_en.variants[k].1.as_ref().unwrap();
+                                self.types.insert(b.clone(), pt.clone());
                                 out.push_str(&format!("{}{} v_{} = {}.u.{};\n", ind(d + 2), cty(pt), b, m, v));
                             }
                         }
@@ -714,7 +791,7 @@ impl<'a> Gen<'a> {
             ExprKind::MutBorrow(n) => {
                 if self.mut_params.contains(n) { format!("v_{}", n) } else { format!("&{}", self.place(n)) }
             }
-            ExprKind::Field(b, f) => format!("{}.{}", self.expr(b), f),
+            ExprKind::Field(..) => self.place(&place(e).expect("checked: a place")),
             ExprKind::StructLit(n, fs) => {
                 let inits: Vec<String> = fs.iter().map(|(f, x)| format!(".{} = {}", f, self.expr(x))).collect();
                 format!("((bst_s_{}){{ {} }})", n, inits.join(", "))
@@ -727,6 +804,14 @@ impl<'a> Gen<'a> {
             ExprKind::Not(x) => format!("(!{})", self.expr(x)),
             ExprKind::Bin(op, a, b) => format!("({} {} {})", self.expr(a), op.text(), self.expr(b)),
             ExprKind::Forall(..) => unreachable!("specification only"),
+            ExprKind::Call(name, args) if name == "box" || name == "unbox" => {
+                let t = self.type_of(&args[0]);
+                let inner = if name == "box" { t } else { let Type::Box(i) = t else { unreachable!("checked") }; *i };
+                if !self.boxed.contains(&inner) {
+                    self.boxed.push(inner.clone());
+                }
+                format!("bst_{}_{}({})", name, box_helper(&inner), self.expr(&args[0]))
+            }
             ExprKind::Call(name, args) => {
                 let a: Vec<String> = args.iter().map(|x| self.expr(x)).collect();
                 match name.as_str() {

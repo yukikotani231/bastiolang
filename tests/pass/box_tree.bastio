@@ -1,0 +1,86 @@
+// expect-exit: 42
+// Box[T]: an owning pointer. Recursive data goes through a box; fields of a
+// boxed struct are places like any other (`b.n`, `&mut b.items`); a borrowed
+// tree is walked without moving anything; dropping a tree frees every box.
+
+struct Node { l: Tree, r: Tree }
+enum Tree { Leaf(u64), Branch(Box[Node]) }
+
+fn leaf(v: u64) -> Tree { return Tree::Leaf(v); }
+
+fn node(l: Tree, r: Tree) -> Tree {
+  return Tree::Branch(box(Node { l: l, r: r }));
+}
+
+// A read-only walk: out of a borrowed tree, `n` is bound as a borrow too.
+// (Bastio does not prove termination; `fuel` bounds the result.)
+fn sum(t: &Tree, fuel: u64) -> u64
+  requires fuel <= 1000000
+  ensures result <= fuel * 100
+{
+  if fuel == 0 { return 0; }
+  match t {
+    Tree::Leaf(v) => { return v % 100; },
+    Tree::Branch(n) => {
+      let half = (fuel - 1) / 2;
+      return sum(n.l, half) + sum(n.r, half);
+    },
+  }
+}
+
+// In place: the match moves the tree out of the borrow, the arm changes the
+// boxed node's fields through the box, and the tree is put back.
+fn bump_left(t: &mut Tree) {
+  match t {
+    Tree::Leaf(v) => { t = Tree::Leaf(v % 1000 + 1); },
+    Tree::Branch(mut b) => {
+      bump_left(&mut b.l);
+      t = Tree::Branch(b);
+    },
+  }
+}
+
+fn drop_tree(t: Tree) {
+  match t {
+    Tree::Leaf(_) => {},
+    Tree::Branch(b) => {
+      let n = unbox(b);
+      drop_tree(n.l);
+      drop_tree(n.r);
+    },
+  }
+}
+
+// A boxed struct with a linear field, reasoned about through the box.
+struct Stack { items: Buf, n: u64 }
+
+fn stack_new() -> Box[Stack]
+  ensures result.n == 0 && len(result.items) == 4
+{
+  return box(Stack { items: alloc(4), n: 0 });
+}
+
+fn push(s: &mut Box[Stack], v: u64)
+  requires s.n < len(s.items)
+  ensures s.n == old(s).n + 1 && len(s.items) == len(old(s).items)
+{
+  s.items = set(s.items, s.n, v);
+  s.n = s.n + 1;
+}
+
+fn main() -> u64 {
+  let mut t = node(node(leaf(1), leaf(2)), node(leaf(3), node(leaf(4), leaf(5))));
+  bump_left(&mut t);                     // the leftmost leaf 1 becomes 2
+  let a = sum(t, 1000);                  // 2 + 2 + 3 + 4 + 5 = 16
+  drop_tree(t);
+  let mut s = stack_new();
+  push(&mut s, 10);
+  push(&mut s, 15);
+  assert s.n == 2;                       // known through the box
+  let b = get(s.items, 0) % 100 + get(s.items, 1) % 100;   // 25, in bounds by the proof
+  let st = unbox(s);
+  free(st.items);
+  let x = unbox(box(box(1)));
+  let one = unbox(x);
+  return a + b + one;                    // 16 + 25 + 1
+}

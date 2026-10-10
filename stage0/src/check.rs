@@ -129,7 +129,7 @@ pub fn builtin_sigs() -> HashMap<String, Sig> {
 }
 
 pub fn is_builtin(name: &str) -> bool {
-    builtin_table().iter().any(|b| b.0 == name)
+    name == "box" || name == "unbox" || builtin_table().iter().any(|b| b.0 == name)
 }
 
 fn available(name: &str, target: Target) -> bool {
@@ -170,6 +170,10 @@ pub fn check_structs(p: &Program) -> Result<(), Diag> {
             return Err(Diag::new("E-TYPE", *pos, format!("type `{}` is already defined", name)));
         }
         for t in held {
+            let mut t = t;
+            while let Type::Box(i) = t {
+                t = i;
+            }
             if let Type::Struct(n) | Type::Enum(n) = t {
                 if !defs.iter().any(|e| &e.0 == n) {
                     return Err(Diag::new("E-TYPE", *pos, format!("unknown type `{}`", n)));
@@ -191,7 +195,7 @@ pub fn check_structs(p: &Program) -> Result<(), Diag> {
     for (name, pos, _) in &defs {
         if reaches(&defs, name, name, &mut Vec::new()) {
             return Err(Diag::new("E-TYPE", *pos, format!("type `{}` contains itself", name))
-                .note("a value cannot hold itself; recursive data needs an owning pointer, which Bastio does not have yet"));
+                .note("a value cannot hold itself; put the recursive part in a `Box[..]`"));
         }
     }
     Ok(())
@@ -203,6 +207,7 @@ fn known_type(t: &Type, pos: Pos) -> Result<(), Diag> {
     match t {
         Type::Struct(n) if struct_def(n).is_none() => Err(Diag::new("E-TYPE", pos, format!("unknown type `{}`", n))),
         Type::Enum(n) if enum_def(n).is_none() => Err(Diag::new("E-TYPE", pos, format!("unknown type `{}`", n))),
+        Type::Box(i) => known_type(i, pos),
         Type::Ref(i) | Type::MutRef(i) => {
             known_type(i, pos)?;
             if !i.is_linear() {
@@ -371,6 +376,10 @@ impl<'a> Ctx<'a> {
         let mut t = info.ty.base().clone();
         let mut sofar = path_root(path).to_string();
         for f in parts {
+            // A box is looked through: `b.f` is the field `f` of the boxed struct.
+            while let Type::Box(i) = t {
+                t = *i;
+            }
             let ft = match &t {
                 Type::Struct(n) => struct_def(n).and_then(|d| d.field(f)).cloned(),
                 _ => None,
@@ -432,6 +441,14 @@ impl<'a> Ctx<'a> {
                 Type::Struct(n) => {
                     for (f, ft) in &struct_def(n).unwrap().fields {
                         leaves(cx, &format!("{}.{}", path, f), ft, out);
+                    }
+                }
+                // The box itself is a resource, and so is what is inside it.
+                Type::Box(i) => {
+                    if cx.prefix_moved(path).is_some() {
+                        out.insert(path.to_string());
+                    } else {
+                        leaves(cx, path, i, out);
                     }
                 }
                 _ => {
@@ -710,10 +727,6 @@ impl<'a> Ctx<'a> {
                         (Some(pt), Some(b)) if pt.is_linear() && b == "_" && owned_linear => {
                             return Err(Diag::new("E-LINEAR-LEAK", a.pos, format!("`_` would drop the linear payload of `{}::{}`", en, v)));
                         }
-                        (Some(pt), Some(b)) if pt.is_linear() && b != "_" && borrowed => {
-                            return Err(Diag::new("E-LINEAR-USE", a.pos, format!("cannot move the payload out of the shared borrow `{}`", place(scrut).unwrap()))
-                                .note("write `(_)` to only test which variant it is"));
-                        }
                         _ => {}
                     }
                 }
@@ -732,7 +745,16 @@ impl<'a> Ctx<'a> {
             if let Pat::Variant(_, v, Some(b), m) = &a.pat {
                 if b != "_" {
                     let pt = d.variants[d.index(v).unwrap()].1.clone().unwrap();
-                    self.declare(b, pt, *m, a.pos)?;
+                    // Out of a shared borrow, a linear payload is bound as a
+                    // shared borrow too: it can be read and lent, never moved.
+                    if borrowed && pt.is_linear() {
+                        if *m {
+                            return Err(Diag::new("E-TYPE", a.pos, format!("`{}` borrows from `{}` and cannot be `mut`", b, place(scrut).unwrap())));
+                        }
+                        self.declare(b, Type::Ref(Box::new(pt)), false, a.pos)?;
+                    } else {
+                        self.declare(b, pt, *m, a.pos)?;
+                    }
                 }
             }
             let diverges = self.block(&mut a.body)?;
@@ -865,6 +887,20 @@ impl<'a> Ctx<'a> {
                 if name == "result" || name == "old" || (is_ghost(name) && !self.sigs.contains_key(name)) || self.specs.iter().any(|s| &s.name == name) {
                     return Err(Diag::new("E-TYPE", e.pos, format!("`{}` is only allowed in specifications", name)));
                 }
+                if name == "box" || name == "unbox" {
+                    // Generic over the boxed type, so not in the builtin table.
+                    if args.len() != 1 {
+                        return Err(Diag::new("E-TYPE", e.pos, format!("`{}` takes 1 argument(s), {} given", name, args.len())));
+                    }
+                    let t = self.expr(&args[0])?;
+                    if name == "box" {
+                        return Ok(Type::Box(Box::new(t)));
+                    }
+                    return match t {
+                        Type::Box(i) => Ok(*i),
+                        t => Err(Diag::new("E-TYPE", args[0].pos, format!("`unbox` needs a box, found {}", t.name()))),
+                    };
+                }
                 let sig = self.sigs.get(name).cloned().ok_or_else(|| Diag::new("E-TYPE", e.pos, format!("unknown function `{}`", name)))?;
                 if !available(name, self.target) {
                     return Err(Diag::new("E-TARGET", e.pos, format!("`{}` is not available on this target", name)));
@@ -953,7 +989,10 @@ impl<'a> Ctx<'a> {
                 Ok(Type::Bool)
             }
             ExprKind::Field(b, f) => {
-                let t = self.spec_expr(b, in_ensures, bound)?;
+                let mut t = self.spec_expr(b, in_ensures, bound)?;
+                while let Type::Box(i) = t {
+                    t = *i;
+                }
                 match &t {
                     Type::Struct(n) => struct_def(n).and_then(|d| d.field(f)).cloned().ok_or_else(|| Diag::new("E-TYPE", e.pos, format!("`{}` has no field `{}`", n, f))),
                     // In a specification, `o.V` is the payload of variant V

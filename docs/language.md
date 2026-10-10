@@ -24,6 +24,7 @@ The language as stage0 implements it today: the v0 proof pipeline, plus `&mut` b
 
 | `S` (a struct) | A user-defined record. Linear when any field is linear; otherwise a plain value that is copied |
 | `E` (an enum) | One of several variants, each with at most one payload. Linear when any payload is linear |
+| `Box[T]` | An owning pointer to a `T` on the heap. Always **linear** (it owns the allocation). The only way a type can contain itself |
 
 Borrowing at a call site is implicit: passing an owned `b` to a `&Buf` parameter lends it for the duration of the call. A `&mut` parameter needs an explicit `&mut b`, and `b` must be declared `mut` (or itself be a `&mut` parameter). One call cannot lend the same variable twice if one of the loans is `&mut`.
 
@@ -52,7 +53,7 @@ let t = p.space.root;                  // move a linear field out ...
 p.space.root = t;                      // ... and put one back
 ```
 
-- A struct has at least one field, and a field cannot be a borrow. A struct cannot contain itself.
+- A struct has at least one field, and a field cannot be a borrow. A struct cannot contain itself, except through a `Box`.
 - A struct with a linear field is **linear**: it must be consumed exactly once, like a `Buf`. A struct without one is a plain value and is copied.
 - Ownership is tracked **per place** (`p`, `p.space`, `p.space.root`). Moving a linear field out leaves the rest of the struct usable: its scalar fields can still be read and its other fields used. The struct as a whole cannot be moved, borrowed or returned until the field is put back (`E-LINEAR-USE`). A struct counts as consumed once every linear field in it has been moved out, so `free(s.items)` consumes a `Stack { items: Buf, n: u64 }`.
 - Assigning a linear field that still holds a value is `E-LINEAR-LEAK`, as for variables.
@@ -77,16 +78,40 @@ match s {
 }
 ```
 
-- A variant has no payload or exactly one (use a struct for several values). An enum cannot contain itself (recursive data needs `Box[T]`, not implemented yet).
+- A variant has no payload or exactly one (use a struct for several values). An enum cannot contain itself, except through a `Box`.
 - An enum with a linear payload is **linear**: it is consumed exactly once, and dropping it is `E-LINEAR-LEAK`.
 - `match` must be **exhaustive**: every variant is handled once, or a final `_` arm takes the rest. A missing variant, a variant matched twice, or an arm after `_` is `E-MATCH`.
 - Matching an owned value moves it into the arms. A pattern `E::V(x)` binds the payload to `x` (`E::V(mut x)` to change it), owned by the arm: a linear payload must be consumed there. `E::V(_)` and `_` drop the payload, which is `E-LINEAR-LEAK` for a linear one.
-- Matching a borrowed place (a `&E` parameter) only inspects it: a linear payload cannot be bound (`E-LINEAR-USE`), only tested with `(_)`. Through a `&mut E` parameter the match moves the value out, and the function must put a new one back.
+- Matching a borrowed place (a `&E` parameter, or a payload bound out of one) only inspects it. A linear payload is then bound as a shared borrow: it can be read, lent to `&T` parameters and matched again, but not moved (`E-LINEAR-USE`) or declared `mut`. Through a `&mut E` parameter the match moves the value out, and the function must put a new one back.
 - The arms must agree on what they consume (`E-LINEAR-BRANCH`), like the arms of an `if`.
 - `x is E::V` is a `bool` that reads only the tag. Its operand must be a place or a non-linear value, since it consumes nothing.
 - Specifications can use `is`, and `o.V` means the payload of variant `V`. It is meaningful only when `o is E::V`, so write it under an implication: `ensures result is Opt::Some ==> result.Some <= a`. The prover knows which arm of a `match` it is in, so inside `Opt::Some(v) => ...` it knows `v` is `o.Some`.
 - Enum values cannot be built in a specification.
 - In generated code an enum is a C struct holding a tag and a union of the payloads. A `match` is an `if` chain on the tag; the last arm needs no test because the match is exhaustive.
+
+## Boxes
+
+```
+struct Node { l: Tree, r: Tree }
+enum Tree { Leaf(u64), Branch(Box[Node]) }    // recursive through the box
+
+let t = Tree::Branch(box(Node { l: Tree::Leaf(1), r: Tree::Leaf(2) }));
+fn leftmost(t: &Tree) -> u64 {
+  match t {
+    Tree::Leaf(v) => { return v; },
+    Tree::Branch(n) => { return leftmost(n.l); },   // `n` is a borrow
+  }
+}
+let n = unbox(b);        // frees the box, hands back what it held
+```
+
+- `box(e)` moves `e` into a new heap allocation; `unbox(b)` consumes the box, frees the allocation and returns the value.
+- A box is linear whatever it holds: `box(7)` must still be unboxed.
+- Fields of a boxed struct are places, as if the box were not there: `b.n`, `b.items = ..`, `&mut b.l`, `b.l` lent to a `&T` parameter. Ownership is tracked through the box as through a struct. The box itself is a separate resource: moving every field out does not consume it, and it cannot be unboxed, moved or borrowed whole while a field is out.
+- Specifications see through boxes the same way: `ensures result.n == 0` for a `Box[Stack]` result.
+- The prover unfolds a box that arrives from outside (a parameter, a function's result) two levels deep. Deeper contents are unknown until code looks inside them, and then nothing is known about them: a proof that needs a fact deeper down fails (it is never assumed). Values the function builds itself are tracked to any depth.
+- `box` uses the same allocator as `alloc`: `malloc` on the hosted target, the arena on the freestanding ones. Running out of memory aborts, as for `alloc`.
+- In generated code a `Box[T]` is a `T *`.
 
 ## Built-in functions
 

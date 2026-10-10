@@ -33,6 +33,8 @@ pub enum Tok {
     // punctuation
     LParen,
     RParen,
+    LBracket,
+    RBracket,
     LBrace,
     RBrace,
     Comma,
@@ -207,6 +209,8 @@ pub fn lex(src: &str, file: usize) -> Result<Vec<Token>, Diag> {
             ('-', Some('>'), _) => (Tok::Arrow, 2),
             (':', Some(':'), _) => (Tok::ColonColon, 2),
             ('(', _, _) => (Tok::LParen, 1),
+            ('[', _, _) => (Tok::LBracket, 1),
+            (']', _, _) => (Tok::RBracket, 1),
             (')', _, _) => (Tok::RParen, 1),
             ('{', _, _) => (Tok::LBrace, 1),
             ('}', _, _) => (Tok::RBrace, 1),
