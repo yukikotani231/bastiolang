@@ -1419,6 +1419,13 @@ impl<'p> Verifier<'p> {
                 st.pc.push(format!("(<= {} 255)", v.term()));
                 Ok(v)
             }
+            "cpu_count" => {
+                let n = self.fresh_u64("cpus")?;
+                // The platform's promise: at least this processor, and no
+                // more than 4096 (so per-processor tables can be allocated).
+                st.pc.push(format!("(and (>= {0} 1) (<= {0} 4096))", n.term()));
+                Ok(n)
+            }
             "cpu_get" => {
                 let r = vals[1].term().to_string();
                 index_ok(self, st, &r, "21", 1, "the saved registers")?;
