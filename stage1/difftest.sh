@@ -25,11 +25,12 @@
 #           asmdump also does what stage0 does not (register arguments):
 #           the programs it builds must exit as tests/pass says
 #   driver  stage1/bastioc1.bastio  vs  bastioc0 itself: what `--check`
-#           prints on stderr and its exit status, the
-#           C file of `--emit-c`, the C header of `--header`, the list of
-#           `--trusted-base`, and the programs it builds, which must
-#           exit as tests/pass says; and bastioc1 built by itself must
-#           write the same C for itself as stage0 (the fixed point)
+#           prints on stderr and its exit status, the C file of
+#           `--emit-c`, the C header of `--header`, the list of
+#           `--trusted-base`, what `--backend native` prints, and the
+#           programs it builds either way, which must exit as tests/pass
+#           says; and bastioc1 built by itself must write the same C for
+#           itself as stage0 (the fixed point)
 # The parser, the monomorphizer and the checker are also compared on damaged
 # sources (stage1/mutate.py), so their error positions are checked too.
 set -u
@@ -264,8 +265,31 @@ for f in tests/pass/*.bastio; do
     echo "DIFFER $f (built by bastioc1: exit $got, want $want)"
   fi
 done
-echo "-- driver: $match matched ($errors rejected, $cfiles C files, $built programs built and run), $differ differ"
-{ [ "$differ" = 0 ] && [ "$built" -gt 0 ]; } || status=1
+# `--backend native`: the same stderr and exit status as bastioc0 (an
+# unsupported program exits 4 with the same reason), and what it builds
+# must exit as tests/pass says.
+nbuilt=0
+for f in tests/pass/*.bastio; do
+  "$BASTIOC" --backend native -o "$tmp/nwant" "$f" 2>"$tmp/want.err" >/dev/null; echo "exit $?" >>"$tmp/want.err"
+  "$tmp/bastioc1" --backend native -o "$tmp/ngot" "$f" 2>"$tmp/got.err" >/dev/null; e=$?; echo "exit $e" >>"$tmp/got.err"
+  mask "$tmp/want.err" >"$tmp/want"
+  ok=1
+  cmp -s "$tmp/want" "$tmp/got.err" || ok=0
+  if [ $ok = 1 ] && [ "$e" = 0 ]; then
+    want=$(sed -n 's|^// expect-exit: *||p' "$f" | head -1)
+    "$tmp/ngot" </dev/null >/dev/null; got=$?
+    if [ "$got" = "$want" ]; then nbuilt=$((nbuilt+1)); else ok=0; fi
+  fi
+  if [ $ok = 1 ]; then
+    match=$((match+1))
+  else
+    differ=$((differ+1))
+    echo "DIFFER $f (--backend native)"
+    diff "$tmp/want" "$tmp/got.err" | head -5 | cut -c1-300 | sed 's/^/    /'
+  fi
+done
+echo "-- driver: $match matched ($errors rejected, $cfiles C files, $built programs built and run, $nbuilt built natively and run), $differ differ"
+{ [ "$differ" = 0 ] && [ "$built" -gt 0 ] && [ "$nbuilt" -gt 0 ]; } || status=1
 # The fixed point: bastioc1 (built by stage0) builds itself, and that
 # build writes the same C for bastioc1 as stage0 does.
 if "$tmp/bastioc1" -o "$tmp/gen2" stage1/bastioc1.bastio 2>"$tmp/gen2.err" \

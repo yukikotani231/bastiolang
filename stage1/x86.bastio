@@ -21,6 +21,7 @@
 // are small (frame offsets, word counts), and stage0 would panic where they
 // could overflow, so the proofs this compiler would need buy nothing.
 import "codegen.bastio";
+import "render.bastio";
 
 // Registers. SAVED (callee-saved) and LEAF (caller-saved, for variables of
 // leaf functions first) are the ranges XR_RBX..XR_R15 and XR_R8..XR_R11.
@@ -149,8 +150,10 @@ struct X86 {
   decl: Vec[X86Decl],
   /// Whether `x86_two` swapped its operands.
   sw: bool,
-  /// Something the backend does not support yet was found.
+  /// Something the backend does not support yet was found, and what
+  /// (stage0's message for the first such thing).
   failed: bool,
+  fmsg: Vec[u64],
   /// Write exactly what stage0's backend writes: none of the improvements
   /// made only here (for the differential test against stage0).
   stage0: bool
@@ -163,7 +166,8 @@ fn x86_new() -> X86 {
     saves: vec_new[X86Save](), stack: vec_new[u64](), bsize: vec_new[u64](),
     sdata: vec_new[u64](), sstart: vec_new[u64](), slens: vec_new[u64](),
     labels: 0, frame: 0, depth: 0, env: 0, pre: 0, retl: 0, retw: 0, reto: 0, rdk: 0, rda: 0, rdo: 0,
-    parent: vec_new[u64](), cur: 0, decl: vec_new[X86Decl](), sw: false, failed: false, stage0: false
+    parent: vec_new[u64](), cur: 0, decl: vec_new[X86Decl](), sw: false, failed: false, fmsg: vec_new[u64](),
+    stage0: false
   };
 }
 
@@ -183,6 +187,16 @@ fn x86_free(g: X86) {
   vec_free(g.slens);
   vec_free(g.parent);
   vec_free(g.decl);
+  vec_free(g.fmsg);
+}
+
+/// Gives up on the program, saying why in `s` unless an earlier failure
+/// already did.
+fn x86_fail(g: &mut X86, s: Str) {
+  if !g.failed {
+    g.failed = true;
+    cg_s(&mut g.fmsg, s);
+  }
 }
 
 // ---- Small helpers ----
@@ -685,7 +699,12 @@ fn x86_words(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, t: u64) -> u64 {
     }
     return s;
   }
-  g.failed = true;
+  if !g.failed {
+    g.failed = true;
+    cg_s(&mut g.fmsg, "the native backend does not support ");
+    tyn_to(&mut g.fmsg, m, p, t);
+    cg_s(&mut g.fmsg, " yet");
+  }
   return 0;
 }
 
@@ -699,7 +718,7 @@ fn x86_field(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, t: u64, s: u64, e: 
   let dn = def_node(m, p, x);
   let j = index_in(p, dn.a, s, e);
   if j == 0 {
-    g.failed = true;
+    x86_fail(&mut g, "internal: not a field");
     return x86_mem_loc(0, 0, 0);
   }
   let mut off = 0;
@@ -1565,7 +1584,7 @@ fn x86_var(g: &mut X86, p: &Parser, i: u64) -> X86Var {
   let id = x86_nmn(&mut g, p, i);
   let k = x86_find(g, id);
   if k == 0 {
-    g.failed = true;
+    x86_fail(&mut g, "internal: not a variable");
   }
   return x86_var_at(g, wrap_sub(k, 1));
 }
@@ -1719,7 +1738,7 @@ fn x86_place(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, segs: &Vec[u64]) ->
     }
     let fl = x86_field(&mut g, c, m, p, t, f.s, f.e);
     if l.k != XL_MEM {
-      g.failed = true;
+      x86_fail(&mut g, "internal: a register holds no struct");
     }
     l = x86_mem_loc(l.b, wrap_add(l.o, wrap_mul(8, fl.o)), fl.ty);
     t = fl.ty;
@@ -2267,7 +2286,7 @@ fn x86_scalar(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     } else {
       let l = x86_place(&mut g, c, m, p, segs);
       if l.k != XL_MEM {
-        g.failed = true;
+        x86_fail(&mut g, "internal: a borrowed variable is in memory");
       }
       x86_t(&mut g, "lea ");
       x86_o(&mut g, x86_lop(l, 0));
@@ -2363,7 +2382,7 @@ fn x86_scalar(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     }
     let t = x86_ty(&mut g, c, &mut m, p, i);
     if x86_words(&mut g, c, m, p, t) != 1 {
-      g.failed = true;
+      x86_fail(&mut g, "internal: a call used as a scalar");
       return;
     }
     x86_call(&mut g, c, &mut m, p, ci, inst, t);
@@ -2375,7 +2394,7 @@ fn x86_scalar(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_pop(&mut g, x86_reg(XR_RAX));
     return;
   }
-  g.failed = true;
+  x86_fail(&mut g, "internal: not a scalar");
 }
 
 fn x86_bin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
@@ -2755,7 +2774,7 @@ fn x86_push_val(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     return;
   }
   if w != 1 {
-    g.failed = true;
+    x86_fail(&mut g, "internal: cannot push a value of several words");
     return;
   }
   x86_scalar(&mut g, c, &mut m, p, i);
@@ -3536,8 +3555,11 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_load_data(&mut g, c, &mut m, p, a0, 2);
     x86_es(&mut g, "mov %rax, %rdi");
     x86_es(&mut g, "call bst_rt_free");
-  } else {
+  } else if !g.failed {
     g.failed = true;
+    cg_s(&mut g.fmsg, "the native backend does not support `");
+    rd_src(&mut g.fmsg, p, n.s, n.e);
+    cg_s(&mut g.fmsg, "` yet");
   }
 }
 
@@ -4194,6 +4216,8 @@ fn x86_entry(g: &mut X86, m: &mut Mono, p: &Parser, x: u64) {
   // gets it by value or by address.
   let mut off = 8;
   let mut pool = 0;
+  // stage0 stops at the first parameter it cannot pass.
+  let mut bad = false;
   let mut q = dn.a;
   while q != 0 && off <= 64 {
     let qn = node_at(p.nodes, q);
@@ -4203,8 +4227,14 @@ fn x86_entry(g: &mut X86, m: &mut Mono, p: &Parser, x: u64) {
     let mut w = 1;
     if tk == TY_POOL {
       w = 2;
-    } else if tk != TY_SERIAL && tk != TY_HOST {
-      g.failed = true;
+    } else if tk != TY_SERIAL && tk != TY_HOST && !bad {
+      bad = true;
+      if !g.failed {
+        g.failed = true;
+        cg_s(&mut g.fmsg, "the native backend does not support a `main` parameter of type ");
+        tyn_to(&mut g.fmsg, m, p, t);
+        cg_s(&mut g.fmsg, " yet");
+      }
     }
     off = off + 8 * w;
     if tk == TY_POOL {
@@ -4234,8 +4264,8 @@ fn x86_entry(g: &mut X86, m: &mut Mono, p: &Parser, x: u64) {
     }
     q = qn.next;
   }
-  if off > 64 {
-    g.failed = true;
+  if off > 64 && !bad {
+    x86_fail(&mut g, "the native backend does not support so many `main` parameters yet");
   }
   cg_s(&mut g.out, "\tcall f_main\n");
   if kind_t(m, cg_ret_ty(&mut m, p, x)) != TY_U64 {
@@ -4266,8 +4296,10 @@ fn x86_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
     k = k + 1;
   }
   if main_x == 0 {
+    x86_fail(&mut g, "the native backend does not support libraries (`export fn` without `main`) yet");
     return false;
   }
+
   cg_s(&mut g.out, "# generated by bastioc0 --backend native -- do not edit\n\t.text\n");
   k = 0;
   while k < vec_len(m.fns) && !g.failed {
