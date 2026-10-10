@@ -299,7 +299,34 @@ f(a, b);            // a call whose result is not used
 - `let` may give a type (`let mut v: u64 = 0;`); otherwise it is the type of the initializer.
 - `assert e;` is proved, not checked at run time (`E-VERIFY-ASSERT`); it generates no code.
 - `unreachable;` marks a point the prover must show no execution reaches (`E-VERIFY-UNREACHABLE`). The path ends there like a `return`, so linear values in hand need not be consumed. It compiles to `__builtin_unreachable()`, with no check. Its typical use is a `match` arm the specification rules out.
-- A loop's `invariant` clauses must hold on entry and be preserved by one iteration (`E-VERIFY-INVARIANT`). After the loop, the variables the body assigns are known only through the invariants and the negated condition.
+- A loop's `invariant` clauses must hold on entry and be preserved by one iteration (`E-VERIFY-INVARIANT`). After the loop, the variables the body assigns are known only through the invariants and the negated condition. In an invariant, `old(x)` is a parameter's value at the call, which is how a loop says what it leaves alone; it can name only parameters (`E-TYPE`), since locals have no value at the call.
+
+```bastio
+// expect-exit: 7
+fn append(t: &mut Vec[u64], n: u64)
+  requires n <= 100
+  ensures vlen(t) == vlen(old(t)) + n
+  ensures forall k: u64 :: k < vlen(old(t)) ==> vget(t, k) == vget(old(t), k)
+{
+  let mut i = 0;
+  while i < n
+    invariant i <= n && vlen(t) == vlen(old(t)) + i
+    invariant forall k: u64 :: k < vlen(old(t)) ==> vget(t, k) == vget(old(t), k)
+  {
+    vec_push(&mut t, 0);
+    i = i + 1;
+  }
+}
+
+fn main() -> u64 {
+  let mut v = vec_new[u64]();
+  vec_push(&mut v, 7);
+  append(&mut v, 3);
+  let first = vec_get(v, 0);     // proved to be 7: append keeps what was there
+  vec_free(v);
+  return first;
+}
+```
 
 **Operators**, loosest first:
 
@@ -1128,7 +1155,7 @@ Expressions in `requires`, `ensures`, `invariant` and `assert` (and the bodies o
 - They may use `==>` (implication) and `forall x: u64 :: e`.
 - They may call `len`, `get`, `slen`, `sget`, `blen`, `bget`, `vlen`, `vget`, the ghost accessors of the capabilities, and `spec fn`s.
 - They may use `is` and enum payloads (`o.Some`), and see through boxes.
-- They may mention values that have already been consumed. In `ensures`, a by-value parameter means its value on entry, a `&mut` parameter the value handed back, and `old(x)` its value at the call. `result` is the returned value.
+- They may mention values that have already been consumed. In `ensures`, a by-value parameter means its value on entry, a `&mut` parameter the value handed back, and `old(x)` its value at the call. `result` is the returned value. `old(x)` is also allowed in loop invariants, for parameters only.
 - They cannot build enum values or call ordinary functions.
 
 A `spec fn` names a specification. It is inlined where it is used, and it can call only spec fns defined before it, so it cannot be recursive:
