@@ -138,7 +138,7 @@ fn parser_free(p: Parser) -> Bytes {
 // ---- Tokens ----
 
 fn eof_tok() -> Tok {
-  return Tok { kind: K_EOF, start: 0, end: 0, line: 0, col: 0, val: 0 };
+  return Tok { kind: K_EOF, start: 0, end: 0, line: 0, col: 0, val: 0, ecol: 0 };
 }
 
 /// Token `i`, or an EOF token past the end.
@@ -288,32 +288,6 @@ fn pm_fail_named(p: &mut Parser, t: Tok, a: Str, name: Tok, b: Str) {
   }
 }
 
-fn pm_kw_name(c: u64) -> Str {
-  if c == KW_FN { return "Fn"; }
-  if c == KW_STRUCT { return "Struct"; }
-  if c == KW_ENUM { return "Enum"; }
-  if c == KW_MATCH { return "Match"; }
-  if c == KW_IS { return "Is"; }
-  if c == KW_SPEC { return "Spec"; }
-  if c == KW_CONST { return "Const"; }
-  if c == KW_LET { return "Let"; }
-  if c == KW_MUT { return "Mut"; }
-  if c == KW_IF { return "If"; }
-  if c == KW_ELSE { return "Else"; }
-  if c == KW_WHILE { return "While"; }
-  if c == KW_RETURN { return "Return"; }
-  if c == KW_IMPORT { return "Import"; }
-  if c == KW_EXPORT { return "Export"; }
-  if c == KW_UNREACHABLE { return "Unreachable"; }
-  if c == KW_REQUIRES { return "Requires"; }
-  if c == KW_ENSURES { return "Ensures"; }
-  if c == KW_INVARIANT { return "Invariant"; }
-  if c == KW_ASSERT { return "Assert"; }
-  if c == KW_FORALL { return "Forall"; }
-  if c == KW_TRUE { return "True"; }
-  return "False";
-}
-
 fn pm_kw_spell(c: u64) -> Str {
   if c == KW_FN { return "fn"; }
   if c == KW_STRUCT { return "struct"; }
@@ -338,43 +312,6 @@ fn pm_kw_spell(c: u64) -> Str {
   if c == KW_FORALL { return "forall"; }
   if c == KW_TRUE { return "true"; }
   return "false";
-}
-
-fn pm_p_name(c: u64) -> Str {
-  if c == P_IMPLIES { return "Implies"; }
-  if c == P_EQEQ { return "EqEq"; }
-  if c == P_FATARROW { return "FatArrow"; }
-  if c == P_NE { return "Ne"; }
-  if c == P_LE { return "Le"; }
-  if c == P_GE { return "Ge"; }
-  if c == P_ANDAND { return "AndAnd"; }
-  if c == P_OROR { return "OrOr"; }
-  if c == P_ARROW { return "Arrow"; }
-  if c == P_COLONCOLON { return "ColonColon"; }
-  if c == P_LPAREN { return "LParen"; }
-  if c == P_RPAREN { return "RParen"; }
-  if c == P_LBRACKET { return "LBracket"; }
-  if c == P_RBRACKET { return "RBracket"; }
-  if c == P_LBRACE { return "LBrace"; }
-  if c == P_RBRACE { return "RBrace"; }
-  if c == P_COMMA { return "Comma"; }
-  if c == P_SEMI { return "Semi"; }
-  if c == P_COLON { return "Colon"; }
-  if c == P_AMP { return "Amp"; }
-  if c == P_DOT { return "Dot"; }
-  if c == P_PLUS { return "Plus"; }
-  if c == P_MINUS { return "Minus"; }
-  if c == P_STAR { return "Star"; }
-  if c == P_SLASH { return "Slash"; }
-  if c == P_PERCENT { return "Percent"; }
-  if c == P_EQ { return "Eq"; }
-  if c == P_LT { return "Lt"; }
-  if c == P_GT { return "Gt"; }
-  if c == P_BANG { return "Bang"; }
-  if c == P_SHL { return "Shl"; }
-  if c == P_SHR { return "Shr"; }
-  if c == P_PIPE { return "Pipe"; }
-  return "Caret";
 }
 
 fn pm_p_spell(c: u64) -> Str {
@@ -414,43 +351,45 @@ fn pm_p_spell(c: u64) -> Str {
   return "^";
 }
 
-/// Token `t` as stage0 prints it with `{:?}` (Rust's Debug of its `Tok`).
+/// Token `t` as an error message names it (stage0's `lexer::describe`): as
+/// written, in backticks.
 fn pm_tok(p: &mut Parser, t: Tok) {
   if t.kind == K_INT {
-    pm_s(&mut p, "Int(");
+    pm_s(&mut p, "`");
     pm_num(&mut p, t.val);
-    pm_s(&mut p, ")");
+    pm_s(&mut p, "`");
   } else if t.kind == K_STR {
-    // The bytes, escapes decoded.
-    pm_s(&mut p, "Str([");
-    let mut k = t.start;
-    let mut first = true;
-    while k < t.end && k < blen(p.src) {
-      let mut c = cast[u64](bget(p.src, k));
-      if c == 92 && k + 1 < blen(p.src) {
-        k = k + 1;
-        let e = cast[u64](bget(p.src, k));
-        if e == 110 { c = 10; } else if e == 114 { c = 13; } else if e == 116 { c = 9; } else if e == 48 { c = 0; } else { c = e; }
-      }
-      if !first {
-        pm_s(&mut p, ", ");
-      }
-      pm_num(&mut p, c);
-      first = false;
-      k = k + 1;
-    }
-    pm_s(&mut p, "])");
+    pm_s(&mut p, "a string literal");
   } else if t.kind == K_IDENT {
-    pm_s(&mut p, "Ident(\"");
+    pm_s(&mut p, "`");
     pm_text(&mut p, t);
-    pm_s(&mut p, "\")");
+    pm_s(&mut p, "`");
   } else if t.kind == K_KEYWORD {
-    pm_s(&mut p, pm_kw_name(t.val));
+    pm_s(&mut p, "`");
+    pm_s(&mut p, pm_kw_spell(t.val));
+    pm_s(&mut p, "`");
   } else if t.kind == K_PUNCT {
-    pm_s(&mut p, pm_p_name(t.val));
+    pm_s(&mut p, "`");
+    pm_s(&mut p, pm_p_spell(t.val));
+    pm_s(&mut p, "`");
   } else {
-    pm_s(&mut p, "Eof");
+    pm_s(&mut p, "the end of the file");
   }
+}
+
+/// A missing `;` at the end of a line is reported after the token before
+/// it, not at the start of the next line. True if it was.
+fn pm_semi_eol(p: &mut Parser, t: Tok) -> bool {
+  if p.failed || p.i == 0 {
+    return false;
+  }
+  let prev = tok_at(p.toks, p.i - 1);
+  if prev.line < t.line {
+    fail(&mut p, prev.line, prev.ecol);
+    pm_s(&mut p, "expected `;` at the end of this line");
+    return true;
+  }
+  return false;
 }
 
 /// Records `expected WHAT, found TOK` at `t`, unless an error is recorded.
@@ -482,6 +421,9 @@ fn expect_p(p: &mut Parser, c: u64) -> Tok {
   }
   if is_p(t, c) {
     return bump(&mut p);
+  }
+  if c == P_SEMI && pm_semi_eol(&mut p, t) {
+    return t;
   }
   pm_expected_spell(&mut p, t, pm_p_spell(c));
   return t;

@@ -1075,13 +1075,12 @@ Only leases matter at levels below 4 through `pt_borrow`: a table below the top 
 
 `pt_leases` counts in the proof only up: `mmu_exit` cannot say which table its lease was for (it came from an earlier turn, through a lock), so when a program wants to tear down a table it asks the run-time count with `pt_lease_count`. A count of 0 stays 0 while the program holds `&mut t`, because only `mmu_enter`, which needs `&mut t`, raises it. BastiOS waits for 0 before freeing an address space; a processor holding a lease never waits for anything, so the wait ends.
 
-`mmu_switch` still exists and takes no lease; it does not combine with sharing (another processor could free a table loaded that way) and will be rejected under `smp_run`.
+Every top-level table a processor loads is entered with a lease; there is no other way to put a program's table in CR3.
 
 **MMU and CPU** (kernel only; the kernel's platform code provides the trap entry):
 
 | Builtin | Requires (proved) | Effect |
 | --- | --- | --- |
-| `mmu_switch(m: &mut Mmu, t: &PageTable)` | level 4 | Loads `t` into CR3; `mmu_root(m)` becomes `pt_id(t)` |
 | `mmu_kernel(m: &mut Mmu)` | | Loads the kernel's own map |
 | `mmu_enter(m: &mut Mmu, t: &mut PageTable) -> Lease` | level 4; `mmu_root(m)` is the kernel's (`0x10000`) | Takes a lease on `t` and loads it into CR3: `pt_leases(t)` goes up by one, `mmu_root(m)` becomes `pt_id(t)`. `t` can then go back where it came from (a lock, say) and other processors can enter it too |
 | `mmu_exit(m: &mut Mmu, l: Lease)` | | Loads the kernel's own map, then gives the lease back. No table's `pt_leases` drops in the proof (it does not name one): it stays an overcount until `pt_lease_count` reads the true count |

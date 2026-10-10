@@ -20,8 +20,10 @@ cd "$here"
 list=$(mktemp)
 trap 'rm -f "$list"' EXIT
 # stage1/lexcases holds token streams for the lexer tests, not programs; some
-# are deliberately malformed.
-find "$repo" "$@" -name '*.bastio' -not -path '*/stage1/lexcases/*' -not -path '*/editors/*' | sort > "$list"
+# are deliberately malformed. So are tests/fail/parse_*, which test the
+# compiler's syntax errors.
+find "$repo" "$@" -name '*.bastio' -not -path '*/stage1/lexcases/*' -not -path '*/editors/*' \
+  -not -path '*/tests/fail/parse_*' | sort > "$list"
 n=$(wc -l < "$list")
 if "$ts" parse --quiet --paths "$list"; then
   echo "parse_all: all $n files parse without errors"

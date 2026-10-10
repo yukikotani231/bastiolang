@@ -871,7 +871,6 @@ static inline void bst_pio_out32(bst_portio *io, uint64_t o, uint64_t v) { bst_p
 
 const PRELUDE_KERNEL_CPU: &str = r#"
 static inline void bst_load_cr3(uint64_t a) { __asm__ volatile ("mov %0, %%cr3" : : "r"(a) : "memory"); }
-static inline void bst_mmu_switch(bst_mmu *m, bst_pt root) { (void)m; bst_load_cr3(root); }
 static inline void bst_mmu_kernel(bst_mmu *m) { (void)m; bst_load_cr3((uint64_t)bst_kernel_pml4); }
 static inline bst_lease bst_mmu_enter(bst_mmu *m, bst_pt *t) {
     (void)m;
