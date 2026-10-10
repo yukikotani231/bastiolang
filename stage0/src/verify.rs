@@ -2340,6 +2340,13 @@ impl<'p> Verifier<'p> {
                 st.pc.push(format!("(<= {} 4294967295)", x.term()));
                 Ok(x)
             }
+            "boot_acpi" => {
+                // The platform's promise: a byte of the table, or 256 past
+                // its end (or without one).
+                let x = self.fresh_u64("acpi")?;
+                st.pc.push(format!("(<= {} 256)", x.term()));
+                Ok(x)
+            }
             "cpu_count" => {
                 let n = self.fresh_u64("cpus")?;
                 // The platform's promise: at least this processor, and no

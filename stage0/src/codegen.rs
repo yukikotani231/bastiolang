@@ -985,6 +985,11 @@ static uint64_t bst_boot_fb(bst_cpu c, uint64_t f) {
     if (f == 4) return mb[110] | (uint64_t)mb[112] << 8 | (uint64_t)mb[114] << 16;
     return 0;
 }
+/* Byte `off` of the ACPI table whose signature is `sig` (its four letters
+ * as a little-endian number; "DSDT" is the one the FADT points at), or 256
+ * past its end or without one. The platform finds the tables. */
+extern uint64_t bst_platform_acpi(uint64_t sig, uint64_t off);
+static inline uint64_t bst_boot_acpi(bst_cpu c, uint64_t sig, uint64_t off) { (void)c; return bst_platform_acpi(sig, off); }
 
 /* Called by the platform on a fault in kernel mode: that is a bug in the
  * trusted base or the compiler, never in verified code. */
