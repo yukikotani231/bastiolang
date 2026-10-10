@@ -684,8 +684,8 @@ fn x86_words(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, t: u64) -> u64 {
   if k == TY_BUF || k == TY_BYTES || k == TY_STR || k == TY_POOL {
     return 2;
   }
-  if (k == TY_LOCK || k == TY_ATOMIC || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA || k == TY_MMU || k == TY_CPU || k == TY_LEASE || k == TY_SHARED) && !g.stage0 {
-    return 1;     // a lock or atomic word's address; Ports, MmioSpace, Mmu and Cpu (0); a frame's address (a Lease: its table; a Shared page)
+  if (k == TY_LOCK || k == TY_ATOMIC || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA || k == TY_MMU || k == TY_CPU || k == TY_LEASE || k == TY_SHARED || k == TY_DIRTY) && !g.stage0 {
+    return 1;     // a lock or atomic word's address; Ports, MmioSpace, Mmu and Cpu (0); a frame's address (a Lease: its table; a Shared or Dirty page)
   }
   if (k == TY_PORTIO || k == TY_MMIO) && !g.stage0 {
     return 2;     // base, then count or length
@@ -795,7 +795,8 @@ fn x86_inline_builtin(p: &Parser, i: u64) -> bool {
     || name_is(p, i, "bcopy") || name_is(p, i, "bmove") || name_is(p, i, "frame_to_bytes") || name_is(p, i, "bytes_to_frame")
     || name_is(p, i, "pt_lease_count") || name_is(p, i, "shared_new") || name_is(p, i, "shared_dup") || name_is(p, i, "shared_drop")
     || name_is(p, i, "shared_id") || name_is(p, i, "pt_shared") || name_is(p, i, "pt_put_shared") || name_is(p, i, "pt_take_shared")
-    || name_is(p, i, "pt_dup_shared");
+    || name_is(p, i, "pt_dup_shared") || name_is(p, i, "pool_take_dirty") || name_is(p, i, "dirty_id") || name_is(p, i, "dirty_zero")
+    || name_is(p, i, "frame_copy") || name_is(p, i, "shared_copy");
 }
 
 /// The length builtins (stage0's LENS): word 0 of their argument.
@@ -3727,6 +3728,29 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_es(&mut g, "mov $-1, %rsi");
     x86_es(&mut g, "lock decl (%rcx,%rdx,4)");
     x86_es(&mut g, "cmovnz %rsi, %rax");
+  } else if name_is(p, i, "pool_take_dirty") {
+    // pool_take without the zeroing: the page is not a frame yet.
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RAX, 0, 0, 0);
+    x86_es(&mut g, "shl $12, %rax");
+    x86_es(&mut g, "add (%rdx), %rax");
+  } else if name_is(p, i, "dirty_id") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RAX, 0, 0, 0, 0);
+    x86_es(&mut g, "sub bst_rt_pool_base(%rip), %rax");
+    x86_es(&mut g, "shr $12, %rax");
+  } else if name_is(p, i, "dirty_zero") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RAX, 0, 0, 0, 0);
+    x86_es(&mut g, "mov %rax, %rdx");
+    x86_es(&mut g, "mov %rax, %rdi");
+    x86_es(&mut g, "mov $512, %ecx");
+    x86_es(&mut g, "xor %eax, %eax");
+    x86_es(&mut g, "rep stosq");
+    x86_es(&mut g, "mov %rdx, %rax");
+  } else if name_is(p, i, "frame_copy") || name_is(p, i, "shared_copy") {
+    // The whole page, a word at a time; the result is the dirty page.
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, XR_RSI, 0, 0, 0);
+    x86_es(&mut g, "mov %rdi, %rax");
+    x86_es(&mut g, "mov $512, %ecx");
+    x86_es(&mut g, "rep movsq");
   } else if name_is(p, i, "shared_id") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RAX, 0, 0, 0, 0);
     x86_es(&mut g, "sub bst_rt_pool_base(%rip), %rax");

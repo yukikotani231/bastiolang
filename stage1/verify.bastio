@@ -477,6 +477,7 @@ fn push_ty(v: &mut Vr, m: &Mono, p: &Parser, t: u64) {
   else if k == TY_DMA { push_str(&mut v, "Dma"); }
   else if k == TY_LEASE { push_str(&mut v, "Lease"); }
   else if k == TY_SHARED { push_str(&mut v, "Shared"); }
+  else if k == TY_DIRTY { push_str(&mut v, "Dirty"); }
   else if k == TY_U8 { push_str(&mut v, "u8"); }
   else if k == TY_U16 { push_str(&mut v, "u16"); }
   else if k == TY_U32 { push_str(&mut v, "u32"); }
@@ -1380,7 +1381,7 @@ fn term(v: &Vr, x: u64) -> u64 {
 fn obj_fields(k: u64) -> u64 {
   if k == TY_PT { return 5; }
   if k == TY_POOL { return 2; }
-  if k == TY_FRAME || k == TY_MMU || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA || k == TY_SHARED { return 1; }
+  if k == TY_FRAME || k == TY_MMU || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA || k == TY_SHARED || k == TY_DIRTY { return 1; }
   if k == TY_PORTIO || k == TY_MMIO { return 2; }
   return 0;
 }
@@ -2054,7 +2055,7 @@ fn fresh_field(v: &mut Vr, tk: u64, j: u64, hint: u64) -> u64 {
 /// Ghost fields a loop keeps when only builtins that never change them
 /// change the object (a page table keeps its id and level).
 fn kept_by_builtins(tk: u64, j: u64) -> bool {
-  return ((tk == TY_FRAME || tk == TY_PT || tk == TY_DMA || tk == TY_SHARED) && j == 0) || (tk == TY_PT && (j == 1 || j == 3)) || (tk == TY_POOL && j == 1)
+  return ((tk == TY_FRAME || tk == TY_PT || tk == TY_DMA || tk == TY_SHARED || tk == TY_DIRTY) && j == 0) || (tk == TY_PT && (j == 1 || j == 3)) || (tk == TY_POOL && j == 1)
     || ((tk == TY_PORTIO || tk == TY_MMIO) && j <= 1);
 }
 
@@ -3001,7 +3002,7 @@ fn vspec_builtin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env:
     let ix = spec_tm(&mut v, c, &mut m, p, arg_node(p, i, 1), env, oenv, has_old, res, &mut bound);
     return app2(&mut v, OP_SELECT, xv.b, ix);
   }
-  if span_is(p, n.s, n.e, "frame_id") || span_is(p, n.s, n.e, "pt_id") || span_is(p, n.s, n.e, "dma_id") || span_is(p, n.s, n.e, "shared_id") {
+  if span_is(p, n.s, n.e, "frame_id") || span_is(p, n.s, n.e, "pt_id") || span_is(p, n.s, n.e, "dma_id") || span_is(p, n.s, n.e, "shared_id") || span_is(p, n.s, n.e, "dirty_id") {
     return g_id(v, x);
   }
   if span_is(p, n.s, n.e, "pt_level") {
@@ -4494,7 +4495,7 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
   if name_is(p, i, "pool_size") {
     return mk_u(&mut v, g_size(v, x0));
   }
-  if name_is(p, i, "pool_take") {
+  if name_is(p, i, "pool_take") || name_is(p, i, "pool_take_dirty") {
     let ix = term(v, x1);
     let g = app2(&mut v, OP_LT, ix, g_size(v, x0));
     vm_s(&mut v, "that page `");
@@ -4517,7 +4518,18 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     let has = app3(&mut v, OP_STORE, g_has(v, x0), ix, v.t_false);
     let np = mk_obj(&mut v, m, v.ty_pool, has, g_size(v, x0), 0);
     put_back(&mut v, m, p, &mut st, u_at(args, 0), np);
+    if name_is(p, i, "pool_take_dirty") {
+      return mk_obj(&mut v, m, kind_ty(m, p, TY_DIRTY), ix, 0, 0);
+    }
     return mk_obj(&mut v, m, v.ty_frame, ix, 0, 0);
+  }
+  // A dirty page becomes a frame, the same page, only by being overwritten
+  // whole: zeroed, or a copy of another page.
+  if name_is(p, i, "dirty_id") {
+    return mk_u(&mut v, g_id(v, x0));
+  }
+  if name_is(p, i, "dirty_zero") || name_is(p, i, "frame_copy") || name_is(p, i, "shared_copy") {
+    return mk_obj(&mut v, m, v.ty_frame, g_id(v, x0), 0, 0);
   }
   if name_is(p, i, "pool_give") {
     let has = app3(&mut v, OP_STORE, g_has(v, x0), g_id(v, x1), v.t_true);
@@ -5713,7 +5725,7 @@ fn shape_keeping(p: &Parser, i: u64) -> bool {
   return name_is(p, i, "bset") || name_is(p, i, "vec_set") || name_is(p, i, "vec_swap") || name_is(p, i, "pt_put")
     || name_is(p, i, "pt_take") || name_is(p, i, "pt_put_frame") || name_is(p, i, "pt_take_frame")
     || name_is(p, i, "pt_borrow") || name_is(p, i, "pt_borrow_frame") || name_is(p, i, "pt_lease_count")
-    || name_is(p, i, "pt_put_shared") || name_is(p, i, "pt_take_shared") || name_is(p, i, "shared_drop") || name_is(p, i, "pool_take") || name_is(p, i, "pool_give") || name_is(p, i, "frame_write")
+    || name_is(p, i, "pt_put_shared") || name_is(p, i, "pt_take_shared") || name_is(p, i, "shared_drop") || name_is(p, i, "pool_take") || name_is(p, i, "pool_take_dirty") || name_is(p, i, "pool_give") || name_is(p, i, "frame_write")
     || name_is(p, i, "frame_write8") || name_is(p, i, "bcopy") || name_is(p, i, "bmove") || name_is(p, i, "frame_to_bytes")
     || name_is(p, i, "bytes_to_frame") || name_is(p, i, "dma_to_bytes") || name_is(p, i, "bytes_to_dma") || name_is(p, i, "cpu_set") || name_is(p, i, "cpu_run") || name_is(p, i, "cpu_idle")
     || name_is(p, i, "cpu_fpu_save") || name_is(p, i, "cpu_fpu_load") || name_is(p, i, "pio_in8") || name_is(p, i, "pio_in16")

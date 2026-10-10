@@ -114,6 +114,11 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("pt_put_shared", Avail::Mem, vec![m(PageTable), U64, Shared, Bool], Unit),
         ("pt_take_shared", Avail::Mem, vec![m(PageTable), U64], Shared),
         ("pt_dup_shared", Avail::Mem, vec![r(PageTable), U64], Shared),
+        ("pool_take_dirty", Avail::Mem, vec![m(Pool), U64], Dirty),
+        ("dirty_id", Avail::Mem, vec![r(Dirty)], U64),
+        ("dirty_zero", Avail::Mem, vec![Dirty], Frame),
+        ("frame_copy", Avail::Mem, vec![Dirty, r(Frame)], Frame),
+        ("shared_copy", Avail::Mem, vec![Dirty, r(Shared)], Frame),
         ("mmu_enter", Avail::Kernel, vec![m(Mmu), m(PageTable)], Lease),
         ("mmu_exit", Avail::Kernel, vec![m(Mmu), Lease], Unit),
         ("mmu_kernel", Avail::Kernel, vec![m(Mmu)], Unit),
@@ -187,6 +192,7 @@ pub const GHOSTS: &[(&str, Type, bool, Type)] = &[
     ("pt_leases", Type::PageTable, false, Type::U64),
     ("pt_shared", Type::PageTable, true, Type::Bool),
     ("shared_id", Type::Shared, false, Type::U64),
+    ("dirty_id", Type::Dirty, false, Type::U64),
     ("pool_has", Type::Pool, true, Type::Bool),
     ("pool_size", Type::Pool, false, Type::U64),
     ("mmu_root", Type::Mmu, false, Type::U64),
@@ -306,7 +312,7 @@ fn main_caps(target: Target) -> &'static [Type] {
 /// Struct and enum definitions: unique names, known field and payload
 /// types, no type that contains itself.
 pub fn check_structs(p: &Program) -> Result<(), Diag> {
-    const RESERVED: &[&str] = &["u64", "u8", "u16", "u32", "i8", "i16", "i32", "i64", "bool", "Str", "Buf", "Bytes", "Host", "Child", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu", "Ports", "PortIo", "MmioSpace", "Mmio", "Dma", "Lease", "Shared", "Lock", "Atomic"];
+    const RESERVED: &[&str] = &["u64", "u8", "u16", "u32", "i8", "i16", "i32", "i64", "bool", "Str", "Buf", "Bytes", "Host", "Child", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu", "Ports", "PortIo", "MmioSpace", "Mmio", "Dma", "Lease", "Shared", "Dirty", "Lock", "Atomic"];
     // (name, position, the types it holds directly)
     let mut defs: Vec<(String, Pos, Vec<Type>)> = Vec::new();
     for d in &p.structs {

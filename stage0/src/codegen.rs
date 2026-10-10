@@ -510,6 +510,14 @@ static inline void bst_pt_put_shared(bst_pt *t, uint64_t i, bst_frame s, bool w)
 }
 #define bst_pt_take_shared bst_pt_take
 static inline bst_frame bst_pt_dup_shared(bst_pt t, uint64_t i) { return bst_shared_dup(((uint64_t *)t)[i] & BST_PTE_ADDR); }
+/* Dirty pages: taken without zeroing, so whoever takes them (under a lock,
+ * say) does not pay for it; they become frames only by being overwritten
+ * whole, which can happen later and elsewhere. */
+static inline bst_frame bst_pool_take_dirty(bst_pool *p, uint64_t i) { return p->base + i * 4096; }
+static inline uint64_t bst_dirty_id(bst_frame d) { return bst_frame_id(d); }
+static inline bst_frame bst_dirty_zero(bst_frame d) { bst_zero_page(d); return d; }
+static inline bst_frame bst_frame_copy(bst_frame d, bst_frame src) { bst_copy_fwd((unsigned char *)d, (const unsigned char *)src, 4096); return d; }
+#define bst_shared_copy bst_frame_copy
 "#;
 
 // The freestanding runtime. Part of the trusted base: the only code that
@@ -1125,6 +1133,7 @@ fn cty(t: &Type) -> String {
         Type::Dma => "bst_dma".into(),
         Type::Lease => "bst_lease".into(),
         Type::Shared => "bst_frame".into(),
+        Type::Dirty => "bst_frame".into(),
         Type::Struct(n) => format!("bst_s_{}", cid(n)),
         Type::Enum(n) => format!("bst_e_{}", cid(n)),
         Type::Generic(..) => unreachable!("removed by monomorphization"),
