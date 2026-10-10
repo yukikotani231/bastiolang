@@ -63,6 +63,11 @@ What the compiler needs in order to be written in Bastio. Structs come first (re
 ## v3: toward a kernel
 
 Started early, alongside v1, because the kernel is the primary target and it shapes what v1 needs.
+- [ ] **Concurrency** (design: [docs/concurrency.md](docs/concurrency.md), 2026-10-10). Data-race freedom becomes part of mandatory memory safety, with no `unsafe` escape: `par` and `spawn`/`join`, `Share[T]` (read-only sharing with ghost fractions instead of a reference count), `Lock[T]` and `Atomic[T]` guarded by type invariants, lock ranks proved at compile time, pinned per-core capabilities, and interrupt-safe locks. Prioritized because kernels and drivers need it and it is where Rust kernels still rely on `unsafe` (the first CVE in Rust-for-Linux code, CVE-2025-68260, was a race in an `unsafe` block). Implemented in the self-hosted compiler right after the fixed point, so the checker is not written twice, in four steps:
+  - [ ] Fork-join and threads on the hosted target (`par`, `spawn`/`join`, `Share`, pinned types)
+  - [ ] Locks and atomics (type invariants, `Lock`/`Held`, `Atomic`, `Ctx` with ranks)
+  - [ ] BastiOS on several cores (`smp_start`, one kernel lock, then per-core run queues)
+  - [ ] Interrupt handlers and interrupt-safe locks, with the first driver that needs them
 - [x] Mutable borrows `&mut T` (see "Open design questions": settled)
 - [x] Capabilities for physical pages and address spaces: `Pool`, `Frame`, `PageTable` (levels and slot ownership tracked), `Mmu` (the table in CR3 is never freed), `Cpu` (the user context; entering user mode)
 - [x] `--target user` for programs under a Bastio kernel
@@ -98,6 +103,6 @@ Safety must not cost speed at run time; that is the point of proving it instead 
 
 ## Open design questions
 
-- How to express concurrency in types: multiple cores, locks, sharing with interrupt handlers.
+- Concurrency: settled in [docs/concurrency.md](docs/concurrency.md); its own open questions (monotonic facts, blocking, channels, multi-threaded user processes, weaker atomics, RCU) are listed there.
 - Termination (currently a non-goal).
 - How to write hand-written proofs (lemmas) for the cases where Z3 gets stuck on quantifiers.
