@@ -6,14 +6,19 @@
 # code in their `// expect-error: CODE` header, checked for the target in an
 # optional `// target: T` header (a rejection for the wrong
 # reason counts as a failure). diag/*.bastio must print exactly diag/*.err.
+# A program with a `// stage1-only: <feature>` header is skipped when
+# BASTIOC is stage0 (tests/stage1_only.sh).
 set -u
 cd "$(dirname "$0")/.."
 BASTIOC=${BASTIOC:-stage0/target/release/bastioc0}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
+. tests/stage1_only.sh
 pass=0
 fail=0
+s1skip=0
 for f in tests/pass/*.bastio; do
+  if [ -n "$stage0_compiler" ] && stage1_only "$f"; then s1skip=$((s1skip+1)); continue; fi
   want=$(sed -n 's|^// expect-exit: *||p' "$f" | head -1)
   name=$(basename "$f" .bastio)
   if ! "$BASTIOC" -o "$tmp/$name" "$f" 2>"$tmp/$name.err"; then
@@ -28,6 +33,7 @@ for f in tests/pass/*.bastio; do
   pass=$((pass+1))
 done
 for f in tests/fail/*.bastio; do
+  if [ -n "$stage0_compiler" ] && stage1_only "$f"; then s1skip=$((s1skip+1)); continue; fi
   want=$(sed -n 's|^// expect-error: *||p' "$f" | head -1)
   target=$(sed -n 's|^// target: *||p' "$f" | head -1)
   if "$BASTIOC" --check --target "${target:-hosted}" "$f" 2>"$tmp/err"; then
@@ -62,6 +68,7 @@ done
 # User programs (for a Bastio kernel such as BastiOS) cannot run here: they
 # must verify and their C must compile freestanding.
 for f in tests/user/*.bastio; do
+  if [ -n "$stage0_compiler" ] && stage1_only "$f"; then s1skip=$((s1skip+1)); continue; fi
   name=$(basename "$f" .bastio)
   if "$BASTIOC" --target user -o "$tmp/$name.u.c" "$f" 2>"$tmp/$name.err" \
      && ${CC:-cc} -c -ffreestanding -fpie -o "$tmp/$name.u.o" "$tmp/$name.u.c" 2>>"$tmp/$name.err"; then
@@ -188,5 +195,9 @@ for f in examples/*.bastio; do
   if "$tmp/ex_$name" </dev/null >/dev/null; then pass=$((pass+1)); else
     echo "FAIL $f: exit $?, want 0"; fail=$((fail+1)); fi
 done
-echo "-- $pass passed, $fail failed"
+if [ "$s1skip" -gt 0 ]; then
+  echo "-- $pass passed, $fail failed, $s1skip skipped (stage1-only, and BASTIOC is stage0)"
+else
+  echo "-- $pass passed, $fail failed"
+fi
 [ "$fail" = 0 ]

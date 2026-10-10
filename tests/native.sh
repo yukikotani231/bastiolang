@@ -34,8 +34,12 @@ if [ "${1:-}" = --stage1 ]; then
   BASTIOC="$tmp/bastioc" stage1/difftest.sh
   exit
 fi
+. tests/stage1_only.sh
 pass=0; fail=0; skip=0
 for f in tests/pass/*.bastio bench/*.bastio; do
+  if [ -n "$stage0_compiler" ] && stage1_only "$f"; then
+    echo "skip $f: stage1-only, and BASTIOC is stage0"; skip=$((skip+1)); continue
+  fi
   n=$(basename "$f" .bastio)
   [ "${f#bench/}" != "$f" ] && n="bench_$n"
   if ! "$BASTIOC" -o "$tmp/$n.c.exe" "$f" 2>/dev/null; then
