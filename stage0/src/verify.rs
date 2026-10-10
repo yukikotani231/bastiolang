@@ -289,7 +289,7 @@ impl Val {
 fn ghost_fields(t: &Type) -> &'static [(&'static str, bool, &'static str)] {
     match t {
         Type::Frame => &[("id", false, "frame_id")],
-        Type::PageTable => &[("id", false, "pt_id"), ("level", false, "pt_level"), ("used", true, ""), ("leases", false, "pt_leases")],
+        Type::PageTable => &[("id", false, "pt_id"), ("level", false, "pt_level"), ("used", true, ""), ("leases", false, "pt_leases"), ("shared", true, "")],
         Type::Pool => &[("has", true, ""), ("size", false, "pool_size")],
         Type::Mmu => &[("root", false, "mmu_root")],
         Type::Ports => &[("free", true, "")],
@@ -297,6 +297,7 @@ fn ghost_fields(t: &Type) -> &'static [(&'static str, bool, &'static str)] {
         Type::MmioSpace => &[("free", true, "")],
         Type::Mmio => &[("base", false, "mmio_base"), ("len", false, "mmio_len")],
         Type::Dma => &[("id", false, "dma_id")],
+        Type::Shared => &[("id", false, "shared_id")],
         _ => &[],
     }
 }
@@ -304,12 +305,12 @@ fn ghost_fields(t: &Type) -> &'static [(&'static str, bool, &'static str)] {
 /// Ghost fields a loop keeps when the object is changed only by builtins
 /// that never change them (a page table keeps its id and level).
 fn kept_by_builtins(t: &Type, field: &str) -> bool {
-    matches!((t, field), (Type::Frame, "id") | (Type::PageTable, "id") | (Type::PageTable, "level") | (Type::PageTable, "leases") | (Type::Pool, "size") | (Type::PortIo, "base") | (Type::PortIo, "count") | (Type::Mmio, "base") | (Type::Mmio, "len") | (Type::Dma, "id"))
+    matches!((t, field), (Type::Frame, "id") | (Type::PageTable, "id") | (Type::PageTable, "level") | (Type::PageTable, "leases") | (Type::Pool, "size") | (Type::PortIo, "base") | (Type::PortIo, "count") | (Type::Mmio, "base") | (Type::Mmio, "len") | (Type::Dma, "id") | (Type::Shared, "id"))
 }
 
 /// Builtins whose `&mut` argument keeps the fields above.
 const SHAPE_KEEPING: &[&str] =
-    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pt_borrow", "pt_borrow_frame", "pt_lease_count", "pool_take", "pool_give", "frame_write", "frame_write8", "bcopy", "bmove", "frame_to_bytes", "bytes_to_frame", "dma_to_bytes", "bytes_to_dma", "cpu_set", "cpu_run", "cpu_idle", "cpu_fpu_save", "cpu_fpu_load",
+    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pt_borrow", "pt_borrow_frame", "pt_lease_count", "pt_put_shared", "pt_take_shared", "shared_drop", "pool_take", "pool_give", "frame_write", "frame_write8", "bcopy", "bmove", "frame_to_bytes", "bytes_to_frame", "dma_to_bytes", "bytes_to_dma", "cpu_set", "cpu_run", "cpu_idle", "cpu_fpu_save", "cpu_fpu_load",
       "pio_in8", "pio_in16", "pio_in32", "pio_out8", "pio_out16", "pio_out32",
       "mmio_read8", "mmio_read16", "mmio_read32", "mmio_read64", "mmio_write8", "mmio_write16", "mmio_write32", "mmio_write64",
       "dma_read8", "dma_read16", "dma_read32", "dma_read64", "dma_write8", "dma_write16", "dma_write32", "dma_write64"];
@@ -750,12 +751,12 @@ impl<'p> Verifier<'p> {
     fn fresh_field(&mut self, t: &Type, field: &str, hint: &str) -> Result<String, Diag> {
         let h = format!("{}_{}", hint, field);
         match (t, field) {
-            (_, "used") | (_, "has") | (_, "free") => self.fresh_array(&h, "Bool"),
+            (_, "used") | (_, "has") | (_, "free") | (_, "shared") => self.fresh_array(&h, "Bool"),
             (Type::PortIo, "base") => self.fresh_int(&h, "0", PORT_LIMIT),
             (Type::PortIo, "count") => self.fresh_int(&h, "0", PORT_LIMIT),
             (Type::Mmio, "base") => self.fresh_int(&h, MMIO_LO, MMIO_HI),
             (Type::Mmio, "len") => self.fresh_int(&h, "0", MMIO_HI),
-            (Type::Frame, "id") | (Type::PageTable, "id") | (Type::Dma, "id") => {
+            (Type::Frame, "id") | (Type::PageTable, "id") | (Type::Dma, "id") | (Type::Shared, "id") => {
                 let n = self.fresh_int(&h, "0", FRAME_LIMIT)?;
                 self.smt(&format!("(assert (< {} {}))", n, POOLSIZE))?;
                 Ok(n)
@@ -2041,7 +2042,7 @@ impl<'p> Verifier<'p> {
             "pt_new" => {
                 let (f, lvl) = (&vals[0], vals[1].term());
                 self.need(st, format!("(and (<= 1 {l}) (<= {l} 5))", l = lvl), pos, "E-VERIFY-PT", format!("that the level `{}` is between 1 and 5", ra(1)))?;
-                Ok(Val::Obj(Type::PageTable, vec![f.field("id"), lvl.to_string(), NO_BOOL.into(), "0".into()]))
+                Ok(Val::Obj(Type::PageTable, vec![f.field("id"), lvl.to_string(), NO_BOOL.into(), "0".into(), NO_BOOL.into()]))
             }
             "pt_free" | "pt_free_root" => {
                 let k = if name == "pt_free" { 0 } else { 1 };
@@ -2109,7 +2110,13 @@ impl<'p> Verifier<'p> {
                     self.need(st, format!("(= {} 0)", t.field("leases")), pos, "E-VERIFY-LEASE",
                         format!("that no processor may be running on `{}` (`pt_leases({}) == 0`): taking would unmap under it", ra(0), ra(0)))?;
                 }
-                let nt = Val::Obj(Type::PageTable, vec![t.field("id"), lvl.clone(), format!("(store {} {} {})", used, i, putting), t.field("leases")]);
+                if name == "pt_take_frame" {
+                    self.need(st, format!("(not (select {} {}))", t.field("shared"), i), pos, "E-VERIFY-SHARED",
+                        format!("that slot `{}` of `{}` does not map a shared page (`!pt_shared({}, {})`): take it with `pt_take_shared`", ra(1), ra(0), ra(0), ra(1)))?;
+                }
+                // A page put in with pt_put_frame is owned by the table: not shared.
+                let sh = if name == "pt_put_frame" { format!("(store {} {} false)", t.field("shared"), i) } else { t.field("shared") };
+                let nt = Val::Obj(Type::PageTable, vec![t.field("id"), lvl.clone(), format!("(store {} {} {})", used, i, putting), t.field("leases"), sh]);
                 self.put_back(&args[0], nt, st);
                 match name {
                     "pt_take" => {
@@ -2123,6 +2130,52 @@ impl<'p> Verifier<'p> {
                     "pt_take_frame" => self.fresh_of(&Type::Frame, "pt_take_frame"),
                     _ => Ok(Val::Unit),
                 }
+            }
+
+            // ---- shared pages ----
+            // A Shared is one reference to a page; the runtime counts them
+            // (part of the trusted base). The page goes back to the pool
+            // only with the last one.
+            "shared_new" => Ok(Val::Obj(Type::Shared, vec![vals[0].field("id")])),
+            "shared_dup" => Ok(Val::Obj(Type::Shared, vec![vals[0].field("id")])),
+            "shared_id" => Ok(Val::U(vals[0].field("id"))),
+            "shared_drop" => {
+                // The page's number if this was the last reference (the pool
+                // has the page again), or 2^64 - 1.
+                let (p, id) = (&vals[0], vals[1].field("id"));
+                let r = self.fresh_u64("shared_drop")?;
+                st.pc.push(format!("(or (= {r} {id}) (= {r} {max}))", r = r.term(), id = id, max = U64_MAX));
+                let nh = format!("(ite (= {} {}) (store {} {} true) {})", r.term(), id, p.field("has"), id, p.field("has"));
+                self.put_back(&args[0], Val::Obj(Type::Pool, vec![nh, p.field("size")]), st);
+                Ok(r)
+            }
+            "pt_shared" => {
+                let i = vals[1].term().to_string();
+                index_ok(self, st, &i, "512", 1, "a page table (512 slots)")?;
+                self.need(st, format!("(= {} 1)", vals[0].field("level")), pos, "E-VERIFY-PT", format!("that `{}` is a last-level table (level 1), which maps pages", ra(0)))?;
+                Ok(Val::B(format!("(select {} {})", vals[0].field("shared"), i)))
+            }
+            "pt_put_shared" | "pt_take_shared" | "pt_dup_shared" => {
+                let t = &vals[0];
+                let i = vals[1].term().to_string();
+                let (lvl, used, sh) = (t.field("level"), t.field("used"), t.field("shared"));
+                index_ok(self, st, &i, "512", 1, "a page table (512 slots)")?;
+                self.need(st, format!("(= {} 1)", lvl), pos, "E-VERIFY-PT", format!("that `{}` is a last-level table (level 1), which maps pages", ra(0)))?;
+                if name == "pt_put_shared" {
+                    self.need(st, format!("(not (select {} {}))", used, i), pos, "E-VERIFY-OWN", format!("that slot `{}` of `{}` is empty (`!pt_used({}, {})`): it would lose what is there", ra(1), ra(0), ra(0), ra(1)))?;
+                    let nt = Val::Obj(Type::PageTable, vec![t.field("id"), lvl.clone(), format!("(store {} {} true)", used, i), t.field("leases"), format!("(store {} {} true)", sh, i)]);
+                    self.put_back(&args[0], nt, st);
+                    return Ok(Val::Unit);
+                }
+                self.need(st, format!("(and (select {u} {i}) (select {s} {i}))", u = used, s = sh, i = i), pos, "E-VERIFY-SHARED",
+                    format!("that slot `{}` of `{}` maps a shared page (`pt_used({}, {}) && pt_shared({}, {})`)", ra(1), ra(0), ra(0), ra(1), ra(0), ra(1)))?;
+                if name == "pt_take_shared" {
+                    self.need(st, format!("(= {} 0)", t.field("leases")), pos, "E-VERIFY-LEASE",
+                        format!("that no processor may be running on `{}` (`pt_leases({}) == 0`): taking would unmap under it", ra(0), ra(0)))?;
+                    let nt = Val::Obj(Type::PageTable, vec![t.field("id"), lvl.clone(), format!("(store {} {} false)", used, i), t.field("leases"), format!("(store {} {} false)", sh, i)]);
+                    self.put_back(&args[0], nt, st);
+                }
+                self.fresh_of(&Type::Shared, name)
             }
 
             // ---- I/O ports ----
@@ -2253,7 +2306,7 @@ impl<'p> Verifier<'p> {
                     format!("that `{}` has the kernel's own tables loaded (`mmu_root({}) == {}`), not another lease's", ra(0), ra(0), KROOT))?;
                 let id = t.field("id");
                 self.put_back(&args[0], Val::Obj(Type::Mmu, vec![id.clone()]), st);
-                self.put_back(&args[1], Val::Obj(Type::PageTable, vec![id.clone(), t.field("level"), t.field("used"), format!("(+ {} 1)", t.field("leases"))]), st);
+                self.put_back(&args[1], Val::Obj(Type::PageTable, vec![id.clone(), t.field("level"), t.field("used"), format!("(+ {} 1)", t.field("leases")), t.field("shared")]), st);
                 Ok(Val::Obj(Type::Lease, vec![]))
             }
             // Loads the kernel's tables and gives the lease back. No table's
@@ -2269,7 +2322,7 @@ impl<'p> Verifier<'p> {
             "pt_lease_count" => {
                 let t = &vals[0];
                 let n = self.fresh_u64("pt_lease_count")?;
-                self.put_back(&args[0], Val::Obj(Type::PageTable, vec![t.field("id"), t.field("level"), t.field("used"), n.term().to_string()]), st);
+                self.put_back(&args[0], Val::Obj(Type::PageTable, vec![t.field("id"), t.field("level"), t.field("used"), n.term().to_string(), t.field("shared")]), st);
                 Ok(n)
             }
             // The page's contents are not tracked, so neither changes anything
@@ -2474,7 +2527,7 @@ impl<'p> Verifier<'p> {
                         Val::Buf { data, .. } | Val::Str { data, .. } => format!("(select {} {})", data, self.spec(&args[1], sc, bound)?),
                         _ => unreachable!(),
                     },
-                    "frame_id" | "pt_id" | "dma_id" => v.field("id"),
+                    "frame_id" | "pt_id" | "dma_id" | "shared_id" => v.field("id"),
                     "pt_level" => v.field("level"),
                     "pt_leases" => v.field("leases"),
                     "pool_size" => v.field("size"),
@@ -2485,6 +2538,7 @@ impl<'p> Verifier<'p> {
                     "mmio_base" => v.field("base"),
                     "mmio_len" => v.field("len"),
                     "pt_used" => format!("(select {} {})", v.field("used"), self.spec(&args[1], sc, bound)?),
+                    "pt_shared" => format!("(select {} {})", v.field("shared"), self.spec(&args[1], sc, bound)?),
                     "pool_has" => format!("(select {} {})", v.field("has"), self.spec(&args[1], sc, bound)?),
                     _ => unreachable!("checked: {}", name),
                 }

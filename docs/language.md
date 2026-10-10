@@ -918,6 +918,7 @@ Hardware is reached only through capability types. There is no way to read or wr
 | `Pool` | The physical pages the kernel may hand out |
 | `Frame` | One physical page (4 KiB), owned by exactly one place at a time |
 | `PageTable` | A page-table page at level 1 to 5. It owns the tables and pages its slots point to |
+| `Shared` | One reference to a page that several page tables may map at once (`MAP_SHARED` memory): the page stays allocated while any reference is held, and the last `shared_drop` gives it back to the pool |
 | `Mmu` | The right to load CR3 (kernel only) |
 | `Cpu` | The CPU's saved user context and the right to enter user mode (kernel only) |
 | `Lease` | This processor's hold on the top-level table it loaded with `mmu_enter`: while any is outstanding, other processors may be running on the tree, so nothing is taken out of it (kernel only; pinned to its processor) |
@@ -935,6 +936,8 @@ Ghost accessors, usable in specifications:
 | `pt_level(t)` | 1 (maps pages) to 4 (top level, what CR3 holds); 5 is a container for level-4 tables that is never loaded into CR3 |
 | `pt_used(t, i)` | Slot `i` owns something |
 | `pt_leases(t)` | At least the number of leases outstanding on `t`'s tree: processors that may be running on it. A table you own below level 4 has 0; a table lent by `pt_borrow` has its tree's. Only `mmu_enter` raises it and only `pt_lease_count` lowers it |
+| `pt_shared(t, i)` | Slot `i` maps a shared page, through a `Shared` the table holds (also callable at run time, level 1) |
+| `shared_id(s)` | The page number of a shared page (also callable at run time) |
 | `pool_has(p, i)` | The pool can still hand out page `i` |
 | `pool_size(p)` | Number of pages in the pool (also callable at run time) |
 | `mmio_free(w, a)` | Nobody has claimed device-window address `a`; `main` receives the whole window free |
@@ -974,6 +977,40 @@ Ghost accessors, usable in specifications:
 | `pt_borrow(t: &mut PageTable, i: u64, f, args..)` | level >= 2; slot `i` used (same slot rule at level 4) | Calls `f(&mut child, args..)` with the table in slot `i` left in place, and returns what `f` returns. `f` must take `&mut PageTable` first and hand back the same table (`E-VERIFY-OWN`); the child's `pt_leases` is `t`'s |
 | `pt_borrow_frame(t: &mut PageTable, i: u64, f, args..)` | level 1; slot `i` used | The same for the page in slot `i`: `f` takes `&mut Frame` first |
 | `pt_lease_count(t: &mut PageTable) -> u64` | | The leases outstanding on `t` now, counted at run time; `pt_leases(t)` becomes this. Only the holder of `&mut t` could raise it, so a 0 stays 0 while `t` is held |
+| `shared_new(f: Frame) -> Shared` | | Makes a page shareable; this is its only reference |
+| `shared_dup(s: &Shared) -> Shared` | | Another reference to the same page |
+| `shared_drop(p: &mut Pool, s: Shared) -> u64` | | Gives up a reference. If it was the last one, returns the page number and the pool has the page again (`pool_has(p, shared_id(s))`); otherwise returns 2^64 - 1 |
+| `pt_put_shared(t: &mut PageTable, i: u64, s: Shared, writable: bool)` | level 1; slot `i` empty | Maps the shared page in slot `i`; the table holds the reference, and `pt_shared(t, i)` is true |
+| `pt_take_shared(t: &mut PageTable, i: u64) -> Shared` | level 1; `pt_used(t, i) && pt_shared(t, i)`; `pt_leases(t) == 0` | Unmaps it and returns the table's reference |
+| `pt_dup_shared(t: &PageTable, i: u64) -> Shared` | level 1; `pt_used(t, i) && pt_shared(t, i)` | A new reference to the shared page in slot `i`, which stays mapped (how `fork` copies a shared mapping) |
+
+`pt_take_frame` also needs `!pt_shared(t, i)` (`E-VERIFY-SHARED`): a shared page is never handed out as a `Frame`, which would let it be freed while another table still maps it. The proof cannot count references, so the count lives at run time (`bst_shared_refs` in the prelude, part of the trusted base); what the proof keeps is that each `Shared` is one reference, used once, so the count is right as long as the prelude counts correctly. The native x86 backend does not support shared pages yet.
+
+```bastio
+// expect-exit: 0
+// A page mapped by two tables. It goes back to the pool with the last reference.
+fn main(pool: &mut Pool) -> u64 {
+  if pool_size(pool) < 3 {
+    return 1;
+  }
+  let mut a = pt_new(pool_take(&mut pool, 0), 1);
+  let mut b = pt_new(pool_take(&mut pool, 1), 1);
+  let s = shared_new(pool_take(&mut pool, 2));
+  pt_put_shared(&mut b, 4, shared_dup(s), false);
+  pt_put_shared(&mut a, 3, s, true);
+  let first = shared_drop(&mut pool, pt_take_shared(&mut a, 3));
+  let last = shared_drop(&mut pool, pt_take_shared(&mut b, 4));
+  if last != 18446744073709551615 {
+    pool_give(&mut pool, pool_take(&mut pool, last));
+  }
+  pool_give(&mut pool, pt_free(a));
+  pool_give(&mut pool, pt_free(b));
+  if first == 18446744073709551615 && last == 2 {
+    return 0;
+  }
+  return 2;
+}
+```
 
 ```bastio
 // expect-exit: 0
@@ -990,7 +1027,12 @@ fn free_l1(pool: &mut Pool, t: PageTable)
     invariant forall j: u64 :: j < i ==> !pt_used(t1, j)
   {
     if pt_has(t1, i) {
-      pool_give(&mut pool, pt_take_frame(&mut t1, i));
+      if pt_shared(t1, i) {
+        // A shared page goes back to the pool with its last reference.
+        shared_drop(&mut pool, pt_take_shared(&mut t1, i));
+      } else {
+        pool_give(&mut pool, pt_take_frame(&mut t1, i));
+      }
     }
     i = i + 1;
   }
@@ -1331,6 +1373,7 @@ Proofs:
 | `E-VERIFY-PT` | Table levels line up; frames go only into level-1 tables; slot 0 of a top-level table (the kernel's map) is never touched |
 | `E-VERIFY-MMU` | The table in CR3 is never freed; a processor enters one address space at a time |
 | `E-VERIFY-LEASE` | Nothing is taken out of a page-table tree, and its top-level table is not freed, while a processor may be running on it |
+| `E-VERIFY-SHARED` | A shared page is taken out of a table only as a `Shared` (`pt_take_shared`), never as a `Frame`; `pt_take_shared` and `pt_dup_shared` read a slot that maps one |
 | `E-VERIFY-REQUIRES` | The callee's `requires` |
 | `E-VERIFY-ENSURES` | The function's own postcondition |
 | `E-VERIFY-INVARIANT` | A loop invariant holds on entry and is preserved by one iteration |
