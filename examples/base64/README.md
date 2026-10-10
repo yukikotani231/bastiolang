@@ -1,17 +1,15 @@
 # A proved base64 codec, called from C
 
 A small, real decoder for untrusted input, written in Bastio and called from a
-C program through a plain C header. This is the shape Bastio is meant to be
+C program through a C header the compiler generates. This is the shape Bastio is meant to be
 adopted in first: replace one parser in a C code base, keep the rest.
 
 | File | What it is |
 | --- | --- |
 | `base64.bastio` | The codec: strict RFC 4648 base64 decoding and encoding. Proved |
-| `base64.h` | The C API: `base64_decode`, `base64_encode`, `base64_free` |
-| `base64_capi.c` | The C boundary: converts between the C API and the Bastio functions. Hand-written, trusted |
-| `lib.bastio` | The library as one program (stage0 needs a `main`, see below) |
+| `lib.bastio` | The C API: `export fn base64_decode` and `base64_encode`. Proved |
 | `test.c` | The C harness: RFC 4648 vectors, a differential fuzz, a benchmark |
-| `run.sh` | Builds and runs the harness under AddressSanitizer + UBSan (`run.sh bench`: throughput) |
+| `run.sh` | Generates `base64.c` and `base64.h` from `lib.bastio`, builds the harness and runs it under AddressSanitizer + UBSan (`run.sh bench`: throughput) |
 
 `tests/pass/base64.bastio` runs the same vectors from Bastio, and
 `tests/run.sh` runs `run.sh`, so both are in CI.
@@ -52,35 +50,36 @@ mutated inputs.
 
 ## The C boundary
 
+`lib.bastio` marks the two API functions `export fn`, and
+`bastioc0 --emit-c --header base64.h -o base64.c lib.bastio` turns them into
+C functions with a generated header (`run.sh` does this):
+
+```c
+bst_e_Decoded base64_decode(const uint8_t *src, size_t src_len);
+bst_e_Encoded base64_encode(const uint8_t *src, size_t src_len);
+```
+
 ```c
 #include "base64.h"
 
-uint8_t *out; size_t n, bad;
-if (base64_decode(src, len, &out, &n, &bad) == 0) {
-    use(out, n);
-    base64_free(out);
+bst_e_Decoded r = base64_decode(src, len);
+if (r.tag == bst_e_Decoded_Ok) {
+    use(r.u.Ok.data, r.u.Ok.len);
+    free(r.u.Ok.data);
 } else {
-    report(bad);   /* offset of the first invalid byte */
+    report(r.u.Err);   /* offset of the first invalid byte */
 }
 ```
 
-stage0 has no way yet to export a function to C. Until it does,
-`base64_capi.c` includes the generated C as one translation unit (its
-functions are `static`), renames the unused `main` with the preprocessor, and
-wraps the two functions. That file is trusted. What it relies on:
-- `&Bytes` parameters are read-only (the type checker allows no write, free
-  or move through them), so passing the caller's `const` buffer is sound;
+There is no hand-written C between the caller and the proofs any more (an
+earlier version needed a trusted wrapper, `base64_capi.c`). What remains:
 - `b64_encode` `requires blen(src) <= 2^59`. A C caller cannot be proved to
-  meet a precondition, so the wrapper checks it: at the boundary, a
-  precondition becomes the caller's obligation, and here the caller is
-  hand-written C;
-- the result buffers come from the hosted prelude's `calloc`, so
-  `base64_free` frees them with `free`;
-- the tags of `enum Decoded` are numbered in declaration order.
-
-An `export fn` (no `main` required, a non-static C symbol, a generated header,
-preconditions on exported functions either ruled out or checked in a
-generated wrapper) would remove this file. See ROADMAP.md.
+  meet a precondition, so an exported function may not have one;
+  `base64_encode` checks the length in Bastio and returns
+  `Encoded::TooLong`, and that check is proved like the rest;
+- the proofs assume what every exported function assumes of its C caller:
+  `src` is readable for `src_len` bytes and not written during the call, and
+  the arguments are valid C values (docs/language.md, "Calling Bastio from C").
 
 ## Speed
 
@@ -89,4 +88,8 @@ generated wrapper) would remove this file. See ROADMAP.md.
 table-driven C of the same strictness, not a tuned or SIMD decoder. On one
 x86-64 Linux machine (2026-10-10) the Bastio decoder ran at about 1000 MiB/s
 and the C reference at about 770 MiB/s: the proofs cost nothing at run time,
-because they leave no checks behind. Numbers vary by machine; run it.
+because they leave no checks behind. Numbers vary by machine, and even by how
+the compiler lays out the harness: on a second machine, the Bastio decoder
+ran at about 670 MiB/s both before and after the switch to `export fn`, while
+the reference moved between 480 and 700 MiB/s with the harness's own code.
+Read them as "on par with plain C", and run it.

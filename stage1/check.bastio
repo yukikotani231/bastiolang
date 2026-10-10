@@ -16,6 +16,7 @@ const C_LEAK: u64 = 3;
 const C_BRANCH: u64 = 4;
 const C_MATCH: u64 = 5;
 const C_TARGET: u64 = 6;
+const C_EXPORT: u64 = 7;
 
 const TARGET_HOSTED: u64 = 0;
 const TARGET_KERNEL: u64 = 1;
@@ -1108,6 +1109,10 @@ fn signatures(c: &mut Checker, m: &mut Mono, p: &Parser) {
   if c.failed {
     return;
   }
+  check_exports(&mut c, &mut m, p);
+  if c.failed {
+    return;
+  }
   k = 0;
   let mut main_x = 0;
   while k < vec_len(m.fns) && main_x == 0 {
@@ -1119,10 +1124,139 @@ fn signatures(c: &mut Checker, m: &mut Mono, p: &Parser) {
     k = k + 1;
   }
   if main_x == 0 {
-    cfail(&mut c, p, 0, C_TYPE);              // no `main`
+    if !any_export(m, p) {
+      cfail(&mut c, p, 0, C_TYPE);            // no `main` (only a library may lack one)
+    }
     return;
   }
   check_main(&mut c, &mut m, p, main_x);
+}
+
+// ---- The C boundary (`export fn`) ----
+
+/// Is instance `x` an `export fn`? (Exported functions are never generic.)
+fn exported_x(m: &Mono, p: &Parser, x: u64) -> bool {
+  let xi = inst_at(m, x);
+  let d = node_at(p.nodes, xi.def);
+  return xi.n == 0 && d.e2 > d.s2;
+}
+
+fn any_export(m: &Mono, p: &Parser) -> bool {
+  let mut k = 0;
+  while k < vec_len(m.fns) {
+    if exported_x(m, p, u_at(m.fns, k)) {
+      return true;
+    }
+    k = k + 1;
+  }
+  return false;
+}
+
+/// A type C can pass to an `export fn`: a number, or bytes it lends.
+fn c_param_t(m: &Mono, t: u64) -> bool {
+  let k = kind_t(m, t);
+  if k == TY_REF {
+    return kind_t(m, inner_t(m, t)) == TY_BYTES;
+  }
+  return c_value_k(k);
+}
+
+/// A plain number C has a type for.
+fn c_value_k(k: u64) -> bool {
+  return k == TY_U64 || k == TY_U32 || k == TY_U16 || k == TY_U8 || k == TY_BOOL;
+}
+
+/// A type an `export fn` can return to C: numbers, owned bytes, and
+/// structs and enums made only of those.
+fn c_return_t(c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
+  let k = kind_t(m, t);
+  if c_value_k(k) || k == TY_UNIT || k == TY_BYTES {
+    return true;
+  }
+  if k == TY_STRUCT || k == TY_ENUM {
+    let x = inner_t(m, t);
+    let dn = def_node(m, p, x);
+    let n = list_len(p, dn.a);
+    let mut j = 0;
+    while j < n {
+      let ft = fld_ty(c, x, j);
+      if ft != 0 && !c_return_t(c, m, p, ft) {
+        return false;
+      }
+      j = j + 1;
+    }
+    return true;
+  }
+  return false;
+}
+
+/// Is `b` named like `a` followed by `_len`?
+fn len_name_of(p: &Parser, a: Node, b: Node) -> bool {
+  if !(a.s <= a.e && a.e - a.s < SRC_MAX && b.s <= b.e && b.e <= blen(p.src)) {
+    return false;
+  }
+  if b.e - b.s != a.e - a.s + 4 {
+    return false;
+  }
+  return same(p.src, a.s, a.e, b.s, b.e - 4) && spells(p.src, b.e - 4, b.e, "_len");
+}
+
+/// The rules of the C boundary, for every exported function in order.
+fn check_exports(c: &mut Checker, m: &mut Mono, p: &Parser) {
+  let mut k = 0;
+  while k < vec_len(m.fns) && !c.failed {
+    let x = u_at(m.fns, k);
+    if exported_x(m, p, x) {
+      check_export(&mut c, &mut m, p, x);
+    }
+    k = k + 1;
+  }
+}
+
+fn check_export(c: &mut Checker, m: &mut Mono, p: &Parser, x: u64) {
+  let xi = inst_at(m, x);
+  let d = node_at(p.nodes, xi.def);
+  if c.target != TARGET_HOSTED {
+    cfail(&mut c, p, xi.def, C_EXPORT);       // hosted only
+    return;
+  }
+  if name_is(p, xi.def, "main") {
+    cfail(&mut c, p, xi.def, C_EXPORT);       // `main` cannot be exported
+    return;
+  }
+  if d.s <= d.e && d.e <= blen(p.src) && d.e - d.s >= 4 && spells(p.src, d.s, d.s + 4, "bst_") {
+    cfail(&mut c, p, xi.def, C_EXPORT);       // reserved for the runtime
+    return;
+  }
+  if d.c != 0 {
+    cfail(&mut c, p, d.c, C_EXPORT);          // a precondition C cannot be proved to meet
+    return;
+  }
+  let mut q = d.a;
+  while q != 0 && !c.failed {
+    let qn = node_at(p.nodes, q);
+    let t = conv(&mut m, p, qn.a, x, q);
+    if !c_param_t(m, t) {
+      cfail(&mut c, p, q, C_EXPORT);          // C cannot pass this type
+    } else if kind_t(m, base_t(m, t)) == TY_BYTES {
+      let mut r = d.a;
+      while r != 0 && !c.failed {
+        let rn = node_at(p.nodes, r);
+        if len_name_of(p, qn, rn) {
+          cfail(&mut c, p, q, C_EXPORT);      // its C length parameter's name is taken
+        }
+        r = rn.next;
+      }
+    }
+    q = qn.next;
+  }
+  if c.failed {
+    return;
+  }
+  let r = conv(&mut m, p, d.b, x, xi.def);
+  if !c_return_t(c, m, p, r) {
+    cfail(&mut c, p, xi.def, C_EXPORT);       // C cannot receive this type
+  }
 }
 
 fn check_main(c: &mut Checker, m: &mut Mono, p: &Parser, x: u64) {
