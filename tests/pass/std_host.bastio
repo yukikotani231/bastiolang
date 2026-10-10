@@ -1,0 +1,35 @@
+// expect-exit: 0
+// std/host.bastio: writing and reading back a file (next to the program),
+// and the command line.
+import "../../std/host.bastio";
+import "../../core/num.bastio";
+
+fn main(host: &mut Host) -> u64 {
+  let me = host_arg(host, 0);
+  let mut p = text_new();
+  text_push_bytes(&mut p, me);
+  text_push_str(&mut p, ".std");
+  let path = text_finish(p);
+  bfree(me);
+  let mut t = text_new();
+  text_push_str(&mut t, "line ");
+  fmt_u64(&mut t, 1);
+  let data = text_finish(t);
+  let mut bad = 0;
+  if !host_write(host, path, data) { bad = 1; }
+  match read_file(host, path) {
+    Option::Some(got) => {
+      if !bytes_eq_str(got, "line 1") { bad = 2; }
+      bfree(got);
+    },
+    Option::None => { bad = 3; },
+  }
+  match read_file_str(host, "/nonexistent/bastio") {
+    Option::Some(got) => { bfree(got); bad = 4; },
+    Option::None => {},
+  }
+  bfree(path);
+  bfree(data);
+  if host_arg_is(host, 1, "x") { bad = 5; }      // run with no arguments
+  return bad;
+}

@@ -1,0 +1,335 @@
+// core/bytes.bastio: comparing, searching, slicing and hashing byte strings.
+import "option.bastio";
+
+/// Bytes `a[i..i+n]` and `b[j..j+n]` are equal.
+spec fn bytes_same_at(a: &Bytes, i: u64, b: &Bytes, j: u64, n: u64) -> bool {
+  forall k: u64 :: k < n ==> bget(a, i + k) == bget(b, j + k)
+}
+
+/// `a` and `b` hold the same bytes.
+spec fn bytes_equal(a: &Bytes, b: &Bytes) -> bool {
+  blen(a) == blen(b) && bytes_same_at(a, 0, b, 0, blen(a))
+}
+
+/// `a` holds exactly the bytes of the literal `s`.
+spec fn bytes_equal_str(a: &Bytes, s: Str) -> bool {
+  blen(a) == slen(s) && (forall k: u64 :: k < blen(a) ==> bget(a, k) == sget(s, k))
+}
+
+/// `s` is a span of `b`.
+spec fn span_in(s: Span, b: &Bytes) -> bool {
+  s.start <= s.end && s.end <= blen(b)
+}
+
+fn bytes_eq(a: &Bytes, b: &Bytes) -> bool
+  ensures result == bytes_equal(a, b)
+{
+  if blen(a) != blen(b) {
+    return false;
+  }
+  let mut i = 0;
+  while i < blen(a)
+    invariant i <= blen(a) && bytes_same_at(a, 0, b, 0, i)
+  {
+    if bget(a, i) != bget(b, i) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn bytes_eq_str(a: &Bytes, s: Str) -> bool
+  ensures result == bytes_equal_str(a, s)
+{
+  if blen(a) != slen(s) {
+    return false;
+  }
+  let mut i = 0;
+  while i < blen(a)
+    invariant i <= blen(a) && (forall k: u64 :: k < i ==> bget(a, k) == sget(s, k))
+  {
+    if bget(a, i) != sget(s, i) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+/// Bytes `from..to` of `a` are the bytes of `s`.
+fn bytes_span_eq_str(a: &Bytes, from: u64, to: u64, s: Str) -> bool
+  requires from <= to && to <= blen(a)
+  ensures result == (to - from == slen(s) && (forall k: u64 :: k < slen(s) ==> bget(a, from + k) == sget(s, k)))
+{
+  if to - from != slen(s) {
+    return false;
+  }
+  let mut i = 0;
+  while i < slen(s)
+    invariant i <= slen(s) && (forall k: u64 :: k < i ==> bget(a, from + k) == sget(s, k))
+  {
+    if bget(a, from + i) != sget(s, i) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+/// `a` begins with `p`.
+fn bytes_starts_with(a: &Bytes, p: &Bytes) -> bool
+  ensures result == (blen(p) <= blen(a) && bytes_same_at(a, 0, p, 0, blen(p)))
+{
+  if blen(p) > blen(a) {
+    return false;
+  }
+  let mut i = 0;
+  while i < blen(p)
+    invariant i <= blen(p) && bytes_same_at(a, 0, p, 0, i)
+  {
+    if bget(a, i) != bget(p, i) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+/// `a` ends with `p`.
+fn bytes_ends_with(a: &Bytes, p: &Bytes) -> bool
+  ensures result == (blen(p) <= blen(a) && bytes_same_at(a, blen(a) - blen(p), p, 0, blen(p)))
+{
+  if blen(p) > blen(a) {
+    return false;
+  }
+  let d = blen(a) - blen(p);
+  let mut i = 0;
+  while i < blen(p)
+    invariant i <= blen(p) && bytes_same_at(a, d, p, 0, i)
+  {
+    if bget(a, d + i) != bget(p, i) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+/// Lexicographic order: -1 if `a` sorts before `b`, 0 if they are equal,
+/// 1 if after. A proper prefix sorts first.
+fn bytes_cmp(a: &Bytes, b: &Bytes) -> i8
+  ensures result == -1 || result == 0 || result == 1
+  ensures (result == 0) == bytes_equal(a, b)
+{
+  let mut i = 0;
+  while i < blen(a) && i < blen(b)
+    invariant i <= blen(a) && i <= blen(b) && bytes_same_at(a, 0, b, 0, i)
+  {
+    if bget(a, i) < bget(b, i) {
+      return -1;
+    }
+    if bget(a, i) > bget(b, i) {
+      return 1;
+    }
+    i = i + 1;
+  }
+  if blen(a) < blen(b) {
+    return -1;
+  }
+  if blen(a) > blen(b) {
+    return 1;
+  }
+  return 0;
+}
+
+/// The first index at or after `from` holding `c`, or `blen(b)` if there is none.
+fn bytes_find_byte(b: &Bytes, c: u8, from: u64) -> u64
+  requires from <= blen(b)
+  ensures from <= result && result <= blen(b)
+  ensures result < blen(b) ==> bget(b, result) == c
+  ensures forall k: u64 :: from <= k && k < result ==> bget(b, k) != c
+{
+  let mut i = from;
+  while i < blen(b)
+    invariant from <= i && i <= blen(b)
+    invariant forall k: u64 :: from <= k && k < i ==> bget(b, k) != c
+  {
+    if bget(b, i) == c {
+      return i;
+    }
+    i = i + 1;
+  }
+  return i;
+}
+
+/// The first index at or after `from` where `needle` occurs in `hay`, if any.
+fn bytes_find(hay: &Bytes, needle: &Bytes, from: u64) -> Option[u64]
+  requires from <= blen(hay)
+  ensures result is Option::Some ==> from <= result.Some && result.Some + blen(needle) <= blen(hay)
+  ensures result is Option::Some ==> bytes_same_at(hay, result.Some, needle, 0, blen(needle))
+{
+  if blen(needle) > blen(hay) {
+    return Option[u64]::None;
+  }
+  let last = blen(hay) - blen(needle);
+  let mut i = from;
+  while i <= last
+    invariant from <= i
+  {
+    let mut j = 0;
+    while j < blen(needle) && bget(hay, i + j) == bget(needle, j)
+      invariant j <= blen(needle) && bytes_same_at(hay, i, needle, 0, j)
+    {
+      j = j + 1;
+    }
+    if j == blen(needle) {
+      return Option[u64]::Some(i);
+    }
+    i = i + 1;
+  }
+  return Option[u64]::None;
+}
+
+/// A copy of bytes `from..to` of `b`.
+fn bytes_slice(b: &Bytes, from: u64, to: u64) -> Bytes
+  requires from <= to && to <= blen(b)
+  ensures blen(result) == to - from && bytes_same_at(result, 0, b, from, to - from)
+{
+  let mut r = balloc(to - from);
+  let mut i = 0;
+  while i < to - from
+    invariant i <= to - from && blen(r) == to - from
+    invariant bytes_same_at(r, 0, b, from, i)
+  {
+    bset(&mut r, i, bget(b, from + i));
+    i = i + 1;
+  }
+  return r;
+}
+
+/// A new byte string holding `a` followed by `b`.
+fn bytes_concat(a: &Bytes, b: &Bytes) -> Bytes
+  requires blen(a) + blen(b) <= 1152921504606846976
+  ensures blen(result) == blen(a) + blen(b)
+  ensures bytes_same_at(result, 0, a, 0, blen(a)) && bytes_same_at(result, blen(a), b, 0, blen(b))
+{
+  let mut r = balloc(blen(a) + blen(b));
+  let mut i = 0;
+  while i < blen(a)
+    invariant i <= blen(a) && blen(r) == blen(a) + blen(b)
+    invariant bytes_same_at(r, 0, a, 0, i)
+  {
+    bset(&mut r, i, bget(a, i));
+    i = i + 1;
+  }
+  let mut j = 0;
+  while j < blen(b)
+    invariant j <= blen(b) && blen(r) == blen(a) + blen(b)
+    invariant bytes_same_at(r, 0, a, 0, blen(a)) && bytes_same_at(r, blen(a), b, 0, j)
+  {
+    bset(&mut r, blen(a) + j, bget(b, j));
+    j = j + 1;
+  }
+  return r;
+}
+
+/// Copies `src` into `dst` at `at`. (That the other bytes of `dst` are left
+/// alone is not stated yet: a loop invariant cannot mention `old(dst)`.)
+fn bytes_copy_into(dst: &mut Bytes, at: u64, src: &Bytes)
+  requires at + blen(src) <= blen(dst)
+  ensures blen(dst) == blen(old(dst))
+  ensures bytes_same_at(dst, at, src, 0, blen(src))
+{
+  let mut i = 0;
+  while i < blen(src)
+    invariant i <= blen(src) && at + blen(src) <= blen(dst)
+    invariant bytes_same_at(dst, at, src, 0, i)
+  {
+    bset(&mut dst, at + i, bget(src, i));
+    i = i + 1;
+  }
+}
+
+/// Space, tab, newline or carriage return.
+fn is_space(c: u8) -> bool
+  ensures result == (c == 32 || c == 9 || c == 10 || c == 13)
+{
+  return c == 32 || c == 9 || c == 10 || c == 13;
+}
+
+/// `s` without the white space (`is_space`) at either end.
+fn bytes_trim(b: &Bytes, s: Span) -> Span
+  requires span_in(s, b)
+  ensures s.start <= result.start && result.start <= result.end && result.end <= s.end
+  ensures forall k: u64 :: s.start <= k && k < result.start ==> is_space_spec(bget(b, k))
+  ensures forall k: u64 :: result.end <= k && k < s.end ==> is_space_spec(bget(b, k))
+  ensures result.start < result.end ==> !is_space_spec(bget(b, result.start)) && !is_space_spec(bget(b, result.end - 1))
+{
+  let mut i = s.start;
+  while i < s.end && is_space(bget(b, i))
+    invariant s.start <= i && i <= s.end
+    invariant forall k: u64 :: s.start <= k && k < i ==> is_space_spec(bget(b, k))
+  {
+    i = i + 1;
+  }
+  let mut e = s.end;
+  while e > i && is_space(bget(b, e - 1))
+    invariant i <= e && e <= s.end
+    invariant forall k: u64 :: e <= k && k < s.end ==> is_space_spec(bget(b, k))
+  {
+    e = e - 1;
+  }
+  return Span { start: i, end: e };
+}
+
+spec fn is_space_spec(c: u8) -> bool {
+  c == 32 || c == 9 || c == 10 || c == 13
+}
+
+/// The pieces of `b` between occurrences of `sep`, in order. There is one
+/// more piece than there are separators, so an empty `b` gives one empty span.
+fn bytes_split(b: &Bytes, sep: u8) -> Vec[Span]
+  ensures vlen(result) >= 1
+  ensures forall i: u64 :: i < vlen(result) ==> span_in(vget(result, i), b)
+{
+  let mut out = vec_new[Span]();
+  let mut s = 0;
+  let mut done = false;
+  while !done
+    invariant s <= blen(b)
+    invariant done ==> vlen(out) >= 1
+    invariant forall i: u64 :: i < vlen(out) ==> span_in(vget(out, i), b)
+  {
+    let e = bytes_find_byte(b, sep, s);
+    vec_push(&mut out, Span { start: s, end: e });
+    if e == blen(b) {
+      done = true;
+    } else {
+      s = e + 1;
+    }
+  }
+  return out;
+}
+
+/// The 64-bit FNV-1a hash of `b`.
+fn bytes_hash(b: &Bytes) -> u64 {
+  let mut h: u64 = 14695981039346656037;
+  let mut i = 0;
+  while i < blen(b)
+    invariant i <= blen(b)
+  {
+    h = wrap_mul(h ^ cast[u64](bget(b, i)), 1099511628211);
+    i = i + 1;
+  }
+  return h;
+}
+
+/// Frees a vector of byte strings and every string in it.
+fn bytes_vec_free(v: Vec[Bytes]) {
+  let mut w = v;
+  while vec_len(w) > 0 {
+    bfree(vec_pop(&mut w));
+  }
+  vec_free(w);
+}

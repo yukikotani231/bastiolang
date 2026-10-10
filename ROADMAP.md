@@ -95,6 +95,14 @@ Started early, alongside v1, because the kernel is the primary target and it sha
   - [ ] Close the performance gap before the native backend becomes the default: arguments in registers, inlining small functions, keeping struct fields in registers
   - [ ] The native backend in the self-hosted compiler (after its C code generation, so the two can be compared)
 
+## Libraries
+
+`core` and `std` (design consequence 1), in [docs/core.md](docs/core.md).
+- [x] A first `core/` and `std/` (2026-10-10), from the helpers that `stage1/`, BastiOS and the tests wrote again and again: byte-string comparison, search, trimming and splitting by spans; text building on `Vec[u8]`; integer parsing and formatting for every sized type; console printing; endian loads and stores; a `u64` hash map; insertion sort and binary search; host files and standard error. Memory safety is proved, and most functions state what they compute (equality, sortedness, digit-only parses, found keys). `core/` builds for every target
+- [ ] Move `stage1/` and BastiOS onto core where it fits (candidates listed in docs/core.md)
+- [ ] Language support the library needs (docs/core.md, "Gaps"): `old(x)` in loop invariants, generic spec fns, a way to count (permutations, map sizes), local names that do not clash with function names, library search paths
+- [ ] A map from byte-string keys, a sort with a key, and an O(n log n) sort with the same proof
+
 ## C boundary
 
 What the "safe libraries callable from C" target needs (Scope, design consequence 2).

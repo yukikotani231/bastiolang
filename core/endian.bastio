@@ -1,0 +1,104 @@
+// core/endian.bastio: fixed-width integers stored in byte strings, as
+// packet headers, file formats and disk blocks hold them.
+
+/// The little-endian `u16` at `b[at..at+2]`.
+fn load_le16(b: &Bytes, at: u64) -> u16
+  requires at + 2 <= blen(b)
+  ensures result == bget(b, at) + 256 * bget(b, at + 1)
+{
+  return cast[u16](bget(b, at)) + (cast[u16](bget(b, at + 1)) << 8);
+}
+
+/// The big-endian `u16` at `b[at..at+2]` (network byte order).
+fn load_be16(b: &Bytes, at: u64) -> u16
+  requires at + 2 <= blen(b)
+  ensures result == 256 * bget(b, at) + bget(b, at + 1)
+{
+  return (cast[u16](bget(b, at)) << 8) + cast[u16](bget(b, at + 1));
+}
+
+/// The little-endian `u32` at `b[at..at+4]`.
+fn load_le32(b: &Bytes, at: u64) -> u32
+  requires at + 4 <= blen(b)
+{
+  let lo = cast[u32](load_le16(b, at));
+  let hi = cast[u32](load_le16(b, at + 2));
+  return lo + (hi << 16);
+}
+
+/// The big-endian `u32` at `b[at..at+4]`.
+fn load_be32(b: &Bytes, at: u64) -> u32
+  requires at + 4 <= blen(b)
+{
+  let hi = cast[u32](load_be16(b, at));
+  let lo = cast[u32](load_be16(b, at + 2));
+  return (hi << 16) + lo;
+}
+
+/// The little-endian `u64` at `b[at..at+8]`.
+fn load_le64(b: &Bytes, at: u64) -> u64
+  requires at + 8 <= blen(b)
+{
+  let lo = cast[u64](load_le32(b, at));
+  let hi = cast[u64](load_le32(b, at + 4));
+  return lo + (hi << 32);
+}
+
+/// The big-endian `u64` at `b[at..at+8]`.
+fn load_be64(b: &Bytes, at: u64) -> u64
+  requires at + 8 <= blen(b)
+{
+  let hi = cast[u64](load_be32(b, at));
+  let lo = cast[u64](load_be32(b, at + 4));
+  return (hi << 32) + lo;
+}
+
+fn store_le16(b: &mut Bytes, at: u64, v: u16)
+  requires at + 2 <= blen(b)
+  ensures blen(b) == blen(old(b))
+  ensures bget(b, at) + 256 * bget(b, at + 1) == v
+{
+  bset(&mut b, at, cast[u8](v & 255));
+  bset(&mut b, at + 1, cast[u8](v >> 8));
+}
+
+fn store_be16(b: &mut Bytes, at: u64, v: u16)
+  requires at + 2 <= blen(b)
+  ensures blen(b) == blen(old(b))
+  ensures 256 * bget(b, at) + bget(b, at + 1) == v
+{
+  bset(&mut b, at, cast[u8](v >> 8));
+  bset(&mut b, at + 1, cast[u8](v & 255));
+}
+
+fn store_le32(b: &mut Bytes, at: u64, v: u32)
+  requires at + 4 <= blen(b)
+  ensures blen(b) == blen(old(b))
+{
+  store_le16(&mut b, at, cast[u16](v & 65535));
+  store_le16(&mut b, at + 2, cast[u16](v >> 16));
+}
+
+fn store_be32(b: &mut Bytes, at: u64, v: u32)
+  requires at + 4 <= blen(b)
+  ensures blen(b) == blen(old(b))
+{
+  store_be16(&mut b, at, cast[u16](v >> 16));
+  store_be16(&mut b, at + 2, cast[u16](v & 65535));
+}
+
+fn store_le64(b: &mut Bytes, at: u64, v: u64)
+  requires at + 8 <= blen(b)
+  ensures blen(b) == blen(old(b))
+{
+  store_le32(&mut b, at, cast[u32](v & 4294967295));
+  store_le32(&mut b, at + 4, cast[u32](v >> 32));
+}
+
+fn store_be64(b: &mut Bytes, at: u64, v: u64)
+  requires at + 8 <= blen(b)
+  ensures blen(b) == blen(old(b))
+{
+  store_be32(&mut b, at, cast[u32](v >> 32));
+  store_be32(&mut b, at + 4, cast[u32](v & 4294967295));
+}
