@@ -151,7 +151,7 @@ A `Ring { h, n, cap }` holds only the indices of a ring buffer: element `i` (0 t
 | `ring_push_n(r, k)`, `ring_pop_n(r, k)` | The same for `k` elements at once, for callers that copy runs of bytes |
 | `ring_room`, `ring_empty`, `ring_full`, `ring_clear` | Exactly `cap - n`, `n == 0`, `n == cap`; empties it |
 
-`Queue { r: Ring, q: Buf }` is the common case, a FIFO of `u64` words (`queue_new(cap)`, `queue_push`, `queue_pop`, `queue_peek`, `queue_len`, `queue_free`): `queue_pop` and `queue_peek` return the word in the head's slot. A full queue is a precondition, so the caller decides whether to drop (a console) or wait (a pipe).
+`Queue { r: Ring, q: Buf }` is the common case, a FIFO of `u64` words (`queue_new(cap)`, `queue_push`, `queue_pop`, `queue_peek`, `queue_len`, `queue_free`): `queue_pop` and `queue_peek` return the word in the head's slot. The contents are the sequence `queue_at(q, 0)`, `queue_at(q, 1)`, ... (oldest first). `queue_push` appends to it and `queue_pop` returns its first word and shifts the rest, so words come out in the order they went in. `queue_at` is an opaque spec fn, so users' proofs never see the slot arithmetic (`tests/pass/queue_fifo.bastio`). A full queue is a precondition, so the caller decides whether to drop (a console) or wait (a pipe).
 
 ### `core/bitmap.bastio`
 
@@ -185,10 +185,11 @@ That the sums are the checksums the standards define is checked by the tests on 
 
 What the library would say if the language let it. Each is a language or verifier change, not a library change. (Earlier gaps, all closed: `old(x)` is allowed in loop invariants, which the text functions and `bytes_copy_into` use; a local variable may share a function's name, so importing core no longer reserves its local names; a `spec fn` may be generic; `vcount` counts the elements of a vector, which proves the sort a permutation and the map's counters; and imports are searched for, so `import "core/text.bastio"` works from anywhere.)
 
-- **Packed bitmaps.** `core/bitmap.bastio` spends a byte per entry. Packing 64 entries in a word needs the prover to know what `|` and `&` do to one bit; it reasons exactly only about shifts and low masks. Setting, clearing and testing one bit can be translated exactly (`x | 2^k` is `x + 2^k` when bit k is clear), but the frame, that every other bit of the word is unchanged, is a statement about `x / 2^j mod 2` for a variable `j`, and Z3 does not finish it in 100 s (tried 2026-10-10). It needs either bit-vector reasoning for that one fact or a hand-written lemma.
-- **The order of a FIFO.** `Queue` is proved to return the word at its head, not that words come out in the order they went in: that needs a ghost sequence of the contents, which specifications cannot hold yet.
+No language gap is open at the moment. One library proof is missing:
 
-(Closed last: `bdec` and `bhex` name the value of a digit string, so every `parse_*` is proved to return the value of its digits; and an existing `Bytes` is known to be at most 2^60 long, which is all a single value can say.)
+- **A lookup finds every key present.** `HashMap` and `BytesMap` prove that a slot a lookup returns holds the key asked for, not that a lookup finds a key the map holds. That needs an invariant about runs of probed slots (no empty slot between a key's home and the key), which no one has written yet.
+
+(Closed last: `has_bit` states what each bitwise operator does to every bit, so `Bits` packs 64 entries in a word with the same guarantees as the byte maps; an `opaque spec fn` (`queue_at`) gives `Queue` an abstract view of its contents, so it is proved to be a FIFO; `bdec` and `bhex` name the value of a digit string, so every `parse_*` is proved to return the value of its digits; and an existing `Bytes` is known to be at most 2^60 long, which is all a single value can say.)
 
 ## Where it came from
 

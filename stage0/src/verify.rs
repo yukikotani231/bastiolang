@@ -96,8 +96,11 @@ enum Val {
     Box(BoxVal),
     /// A vector: its length, and its elements "lifted": a value shaped like
     /// one element whose every term is an SMT array from index to that term
-    /// (see `leaves`). Boxes inside the elements are opaque.
-    Vec { elem: Type, len: String, elems: Box<Val> },
+    /// (see `leaves`). Boxes inside the elements are opaque. `cap` is the
+    /// capacity, tracked only in functions that can mention it (see
+    /// `capacity`) and only for vectors that are not elements of another:
+    /// `None` when unknown. It is not a leaf, so lifting never sees it.
+    Vec { elem: Type, len: String, cap: Option<String>, elems: Box<Val> },
     Unit,
 }
 
@@ -162,7 +165,13 @@ fn merge_val(c: &str, a: &Val, b: &Val) -> Val {
         (Val::Obj(ty, f1), Val::Obj(_, f2)) => Val::Obj(ty.clone(), f1.iter().zip(f2).map(|(x, y)| ite(c, x, y)).collect()),
         (Val::Struct(n, f1), Val::Struct(_, f2)) => Val::Struct(n.clone(), f1.iter().zip(f2).map(|(x, y)| merge_val(c, x, y)).collect()),
         (Val::Enum(n, t1, p1), Val::Enum(_, t2, p2)) => Val::Enum(n.clone(), ite(c, t1, t2), p1.iter().zip(p2).map(|(x, y)| merge_val(c, x, y)).collect()),
-        (Val::Vec { elem, len: l1, elems: e1 }, Val::Vec { len: l2, elems: e2, .. }) => Val::Vec { elem: elem.clone(), len: ite(c, l1, l2), elems: Box::new(merge_val(c, e1, e2)) },
+        (Val::Vec { elem, len: l1, cap: c1, elems: e1 }, Val::Vec { len: l2, cap: c2, elems: e2, .. }) => {
+            let cap = match (c1, c2) {
+                (Some(x), Some(y)) => Some(ite(c, x, y)),
+                _ => None,
+            };
+            Val::Vec { elem: elem.clone(), len: ite(c, l1, l2), cap, elems: Box::new(merge_val(c, e1, e2)) }
+        }
         (Val::Box(BoxVal::Known(x)), Val::Box(BoxVal::Known(y))) => Val::Box(BoxVal::Known(Box::new(merge_val(c, x, y)))),
         // Forgetting what one side knew is sound.
         (Val::Box(BoxVal::Opaque(t)), Val::Box(_)) | (Val::Box(_), Val::Box(BoxVal::Opaque(t))) => Val::Box(BoxVal::Opaque(t.clone())),
@@ -216,9 +225,9 @@ fn map_leaves(v: &Val, f: &mut dyn FnMut(&str) -> String) -> Val {
             let tag = f(tag);
             Val::Enum(n.clone(), tag, ps.iter().map(|x| map_leaves(x, f)).collect())
         }
-        Val::Vec { elem, len, elems } => {
+        Val::Vec { elem, len, elems, .. } => {
             let len = f(len);
-            Val::Vec { elem: elem.clone(), len, elems: Box::new(map_leaves(elems, f)) }
+            Val::Vec { elem: elem.clone(), len, cap: None, elems: Box::new(map_leaves(elems, f)) }
         }
         Val::Box(b) => Val::Box(b.clone()),
         Val::Unit => Val::Unit,
@@ -418,6 +427,20 @@ pub struct Verifier<'p> {
     decimal: &'p HashSet<String>,
     /// The same for `bhex` (HEX_AXIOMS).
     hexadecimal: &'p HashSet<String>,
+    /// The functions whose proofs can mention `has_bit` (gated the same
+    /// way), and whether the one being verified is one of them: only then
+    /// is `bit` declared and every bitwise operator described bit by bit.
+    bitwise: &'p HashSet<String>,
+    bits: bool,
+    /// The functions whose proofs can mention a vector's capacity (`vcap`,
+    /// `vec_try_reserve`, `vec_push_within`), and whether the one being
+    /// verified is one of them: only then are capacities tracked, so other
+    /// programs get the same queries as before.
+    capacity: &'p HashSet<String>,
+    caps: bool,
+    /// The file of the function being verified: an opaque spec fn's body
+    /// is used only in its own file.
+    file: usize,
 }
 
 /// Does `e` call the spec builtin `call` (`vcount`, `bdec`), or name one of
@@ -495,6 +518,66 @@ const HEX_AXIOMS: &[&str] = &[
     "(assert (forall ((a (Array Int Int)) (f Int) (t Int)) (! (= (hex a f t) (hex_l a f t)) :pattern ((hex a f t)))))",
     "(assert (forall ((a (Array Int Int)) (f Int) (t Int)) (! (=> (<= t f) (= (hex_l a f t) 0)) :pattern ((hex_l a f t)))))",
 ];
+
+/// `has_bit(x, i)` is `(bit x i)`: whether bit `i` of `x` is set. `bit` is
+/// uninterpreted; what the prover knows about it is that no bit of 0 is
+/// set, that bits 0 to w - 1 of the largest w-bit number are, and, for
+/// each bitwise operator a function evaluates, how each bit of the result
+/// follows from the bits of the operands (`bit_facts`). Each of these is a
+/// fact about the binary digits of the natural numbers.
+const BIT_AXIOMS: &[&str] = &[
+    "(declare-fun bit (Int Int) Bool)",
+    "(assert (forall ((j Int)) (! (not (bit 0 j)) :pattern ((bit 0 j)))))",
+    "(assert (forall ((j Int)) (! (= (bit 255 j) (and (<= 0 j) (< j 8))) :pattern ((bit 255 j)))))",
+    "(assert (forall ((j Int)) (! (= (bit 65535 j) (and (<= 0 j) (< j 16))) :pattern ((bit 65535 j)))))",
+    "(assert (forall ((j Int)) (! (= (bit 4294967295 j) (and (<= 0 j) (< j 32))) :pattern ((bit 4294967295 j)))))",
+    "(assert (forall ((j Int)) (! (= (bit 18446744073709551615 j) (and (<= 0 j) (< j 64))) :pattern ((bit 18446744073709551615 j)))))",
+];
+
+/// The SMT sorts an opaque spec fn's parameter of type `t` is passed as
+/// (see `check::opaque_arg`), in the order `opaque_terms` lists its terms.
+fn opaque_sorts(t: &Type) -> Vec<&'static str> {
+    match t {
+        Type::Ref(x) => opaque_sorts(x),
+        Type::Bool => vec!["Bool"],
+        Type::Buf | Type::Bytes => vec!["Int", "(Array Int Int)"],
+        Type::Struct(n) => struct_def(n).unwrap().fields.iter().flat_map(|(_, ft)| opaque_sorts(ft)).collect(),
+        _ => vec!["Int"],
+    }
+}
+
+fn opaque_terms(v: &Val, out: &mut Vec<String>) {
+    match v {
+        Val::U(t) | Val::B(t) => out.push(t.clone()),
+        Val::Buf { len, data } => {
+            out.push(len.clone());
+            out.push(data.clone());
+        }
+        Val::Struct(_, fs) => fs.iter().for_each(|f| opaque_terms(f, out)),
+        _ => unreachable!("checked: check::opaque_arg"),
+    }
+}
+
+/// Bit `j` of the term `t`: `(bit t j)`, or for a literal, which bits are
+/// set spelled out.
+fn bit_of(t: &str, j: &str) -> String {
+    let Ok(c) = t.parse::<u64>() else {
+        return format!("(bit {} {})", t, j);
+    };
+    if c == 0 {
+        return "false".into();
+    }
+    if c.wrapping_add(1) & c == 0 {
+        return format!("(and (<= 0 {j}) (< {j} {}))", c.trailing_ones());
+    }
+    let set: Vec<String> = (0..64).filter(|k| c >> k & 1 == 1).map(|k| format!("(= {} {})", j, k)).collect();
+    if set.len() == 1 { set[0].clone() } else { format!("(or {})", set.join(" ")) }
+}
+
+/// Every bit `j` of `r` is `body` (a formula over `j`).
+fn bit_fact(r: &str, body: &str) -> String {
+    format!("(assert (forall ((j Int)) (! (=> (<= 0 j) (= (bit {r} j) {body})) :pattern ((bit {r} j)))))")
+}
 
 /// `vcount(v, x)` is `(cnt a n x)` over the vector's element array `a` and
 /// length `n`. These facts about it hold for every array and length; each is
@@ -615,6 +698,8 @@ pub fn verify_program(p: &Program, one_session: bool) -> Result<(usize, Vec<Stri
     let counting = counting_fns(p, "vcount");
     let decimal = counting_fns(p, "bdec");
     let hexadecimal = counting_fns(p, "bhex");
+    let bitwise = counting_fns(p, "has_bit");
+    let capacity: HashSet<String> = ["vcap", "vec_try_reserve", "vec_push_within"].iter().flat_map(|c| counting_fns(p, c)).collect();
     let n = p.fns.len();
     let jobs = std::env::var("BASTIO_JOBS")
         .ok()
@@ -626,7 +711,7 @@ pub fn verify_program(p: &Program, one_session: bool) -> Result<(usize, Vec<Stri
     // a function after it, since its result could not be reported anyway.
     let failed = AtomicUsize::new(usize::MAX);
     let workers: Vec<Worker> = std::thread::scope(|s| {
-        let hs: Vec<_> = (0..jobs).map(|_| s.spawn(|| verify_worker(p, &sums, &counting, &decimal, &hexadecimal, &next, &failed))).collect();
+        let hs: Vec<_> = (0..jobs).map(|_| s.spawn(|| verify_worker(p, &sums, &counting, &decimal, &hexadecimal, &bitwise, &capacity, &next, &failed))).collect();
         hs.into_iter().map(|h| h.join().expect("a verifier thread panicked")).collect()
     });
     let mut obligations = 0;
@@ -667,7 +752,7 @@ struct Worker {
 
 /// Verifies functions, taking the next unverified index each time, on a
 /// solver of its own.
-fn verify_worker(p: &Program, sums: &Summaries, counting: &HashSet<String>, decimal: &HashSet<String>, hexadecimal: &HashSet<String>, next: &AtomicUsize, failed: &AtomicUsize) -> Worker {
+fn verify_worker(p: &Program, sums: &Summaries, counting: &HashSet<String>, decimal: &HashSet<String>, hexadecimal: &HashSet<String>, bitwise: &HashSet<String>, capacity: &HashSet<String>, next: &AtomicUsize, failed: &AtomicUsize) -> Worker {
     let mut w = Worker { obligations: 0, log: Vec::new(), times: Vec::new(), err: None };
     let solver = match Solver::start() {
         Ok(s) => s,
@@ -676,15 +761,25 @@ fn verify_worker(p: &Program, sums: &Summaries, counting: &HashSet<String>, deci
             return w;
         }
     };
-    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, int_ops: HashMap::new(), sums, counting, decimal, hexadecimal, counts: false };
+    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, int_ops: HashMap::new(), sums, counting, decimal, hexadecimal, bitwise, capacity, counts: false, bits: false, caps: false, file: 0 };
     let mut run = || -> Result<(), (usize, Diag)> {
-        v.smt(&format!("(declare-const {} Int)", POOLSIZE)).map_err(|d| (0, d))?;
-        v.smt(&format!("(assert (and (<= 0 {p}) (<= {p} {})))", FRAME_LIMIT, p = POOLSIZE)).map_err(|d| (0, d))?;
+        // Every function is verified on a solver in the same state, fresh
+        // or reset: what Z3 answers near its work limit depends on what it
+        // was asked before, so otherwise a proof could succeed or fail with
+        // the functions that happened to share its solver (BASTIO_JOBS, and
+        // the timing of the other workers).
+        let mut fresh = true;
         loop {
             let i = next.fetch_add(1, Ordering::SeqCst);
             if i >= p.fns.len() || i > failed.load(Ordering::SeqCst) {
                 return Ok(());
             }
+            if !fresh {
+                v.solver.reset().map_err(|e| (i, Diag::new("E-SOLVER", Pos::default(), e)))?;
+            }
+            fresh = false;
+            v.smt(&format!("(declare-const {} Int)", POOLSIZE)).map_err(|d| (i, d))?;
+            v.smt(&format!("(assert (and (<= 0 {p}) (<= {p} {})))", FRAME_LIMIT, p = POOLSIZE)).map_err(|d| (i, d))?;
             let f = &p.fns[i];
             let t0 = std::time::Instant::now();
             // Names are numbered per function, so they (and the
@@ -740,6 +835,15 @@ impl<'p> Verifier<'p> {
         format!("{}!{}", sanitize(hint), self.counter)
     }
 
+    /// A fresh name for the value of `t`, so that facts about the bits of
+    /// `t` can be triggered by it (a pattern cannot contain an `ite`).
+    fn named(&mut self, t: &str) -> Result<String, Diag> {
+        let n = self.fresh_name("bits");
+        self.smt(&format!("(declare-const {} Int)", n))?;
+        self.smt(&format!("(assert (= {} {}))", n, t))?;
+        Ok(n)
+    }
+
     fn fresh_int(&mut self, hint: &str, lo: &str, hi_incl: &str) -> Result<String, Diag> {
         let n = self.fresh_name(hint);
         self.smt(&format!("(declare-const {} Int)", n))?;
@@ -759,6 +863,18 @@ impl<'p> Verifier<'p> {
 
     fn fresh_len(&mut self, hint: &str) -> Result<String, Diag> {
         self.fresh_int(&format!("len_{}", hint), "0", ALLOC_MAX)
+    }
+
+    /// A vector's capacity, at least its length `len`, when the function
+    /// tracks capacities. The allocators never give a vector room for more
+    /// than 2^60 elements (`bst_vec_grow`, `bst_vec_try_grow`).
+    fn fresh_cap(&mut self, len: &str, hint: &str) -> Result<Option<String>, Diag> {
+        if !self.caps {
+            return Ok(None);
+        }
+        let c = self.fresh_int(&format!("cap_{}", hint), "0", ALLOC_MAX)?;
+        self.smt(&format!("(assert (<= {} {}))", len, c))?;
+        Ok(Some(c))
     }
 
     fn fresh_array(&mut self, hint: &str, elem: &str) -> Result<String, Diag> {
@@ -830,7 +946,9 @@ impl<'p> Verifier<'p> {
             }
             Type::Vec(t) => {
                 let elems = self.fresh_lifted(t, hint)?;
-                Ok(Val::Vec { elem: (**t).clone(), len: self.fresh_len(hint)?, elems: Box::new(elems) })
+                let len = self.fresh_len(hint)?;
+                let cap = self.fresh_cap(&len, hint)?;
+                Ok(Val::Vec { elem: (**t).clone(), len, cap, elems: Box::new(elems) })
             }
             Type::Box(t) => {
                 if self.box_depth >= BOX_DEPTH {
@@ -968,6 +1086,7 @@ impl<'p> Verifier<'p> {
     fn verify_fn(&mut self, f: &FnDef) -> Result<(), Diag> {
         self.int_ops = f.int_ops.clone();
         self.counts = self.counting.contains(&f.name);
+        self.caps = self.capacity.contains(&f.name);
         if self.counts {
             for c in COUNT_LEMMAS {
                 self.smt(c)?;
@@ -980,6 +1099,18 @@ impl<'p> Verifier<'p> {
         }
         if self.hexadecimal.contains(&f.name) {
             for c in HEX_AXIOMS {
+                self.smt(c)?;
+            }
+        }
+        self.file = f.pos.file;
+        for sf in self.prog.specs.iter().filter(|s| s.opaque) {
+            let sorts: Vec<&str> = sf.params.iter().flat_map(|p| opaque_sorts(&p.ty)).collect();
+            let ret = if sf.ret == Type::Bool { "Bool" } else { "Int" };
+            self.smt(&format!("(declare-fun o!{} ({}) {})", sf.name, sorts.join(" "), ret))?;
+        }
+        self.bits = self.bitwise.contains(&f.name);
+        if self.bits {
+            for c in BIT_AXIOMS {
                 self.smt(c)?;
             }
         }
@@ -1312,9 +1443,15 @@ impl<'p> Verifier<'p> {
                 }
                 Val::Enum(n.clone(), tag, np)
             }
-            Val::Vec { elem, len, .. } => {
-                let len = if keep { len.clone() } else { self.fresh_len(name)? };
-                Val::Vec { elem: elem.clone(), len, elems: Box::new(self.fresh_lifted(elem, name)?) }
+            Val::Vec { elem, len, cap, .. } => {
+                let (len, cap) = if keep {
+                    (len.clone(), cap.clone())
+                } else {
+                    let len = self.fresh_len(name)?;
+                    let cap = self.fresh_cap(&len, name)?;
+                    (len, cap)
+                };
+                Val::Vec { elem: elem.clone(), len, cap, elems: Box::new(self.fresh_lifted(elem, name)?) }
             }
             Val::Box(BoxVal::Known(i)) => Val::Box(BoxVal::Known(Box::new(self.havoc(i, keep, name)?))),
             Val::Box(BoxVal::Opaque(t)) => Val::Box(BoxVal::Opaque(t.clone())),
@@ -1327,7 +1464,8 @@ impl<'p> Verifier<'p> {
         match &e.kind {
             ExprKind::TypeApp(targs, inner) => match &inner.kind {
                 ExprKind::Call(n, _) if n == "vec_new" => {
-                    Ok(Val::Vec { elem: targs[0].clone(), len: "0".into(), elems: Box::new(self.fresh_lifted(&targs[0], "vec")?) })
+                    let cap = self.caps.then(|| "0".to_string());
+                    Ok(Val::Vec { elem: targs[0].clone(), len: "0".into(), cap, elems: Box::new(self.fresh_lifted(&targs[0], "vec")?) })
                 }
                 // `cast[T](x)` keeps the value and proves it fits; `wrap[T](x)`
                 // reduces it modulo 2^width.
@@ -1387,8 +1525,15 @@ impl<'p> Verifier<'p> {
             ExprKind::Not(x) => {
                 let v = self.eval(x, st)?;
                 // Bitwise not on an unsigned integer: max - x.
-                if let Some(ity) = self.int_ops.get(&e.pos) {
-                    return Ok(Val::U(format!("(- {} {})", ity.int_max(), v.term())));
+                if let Some(ity) = self.int_ops.get(&e.pos).cloned() {
+                    let t = format!("(- {} {})", ity.int_max(), v.term());
+                    if self.bits {
+                        let r = self.named(&t)?;
+                        let w = ity.int_bits().expect("checked: an integer");
+                        self.smt(&bit_fact(&r, &format!("(and (< j {}) (not {}))", w, bit_of(v.term(), "j"))))?;
+                        return Ok(Val::U(r));
+                    }
+                    return Ok(Val::U(t));
                 }
                 Ok(Val::B(format!("(not {})", v.term())))
             }
@@ -1511,10 +1656,21 @@ impl<'p> Verifier<'p> {
                 _ => pow2(tb, w),
             };
             if op == BinOp::Shr {
-                return Ok(Val::U(format!("(div {} {})", ta, p)));
+                let t = format!("(div {} {})", ta, p);
+                if self.bits {
+                    let r = self.named(&t)?;
+                    self.smt(&bit_fact(&r, &bit_of(ta, &format!("(+ j {})", tb))))?;
+                    return Ok(Val::U(r));
+                }
+                return Ok(Val::U(t));
             }
             let t = format!("(* {} {})", ta, p);
             self.prove(st, &format!("(<= {} {})", t, ity.int_max()), pos, "E-VERIFY-OVERFLOW", format!("that `{} << {}` loses no bits of {}", ra, rb, ity.name()))?;
+            if self.bits {
+                let r = self.named(&t)?;
+                self.smt(&bit_fact(&r, &format!("(and (<= {} j) {})", tb, bit_of(ta, &format!("(- j {})", tb)))))?;
+                return Ok(Val::U(r));
+            }
             return Ok(Val::U(t));
         }
         // `x & (2^k - 1)` keeps the low k bits.
@@ -1522,7 +1678,17 @@ impl<'p> Verifier<'p> {
             for (lit, other) in [(b, ta), (a, tb)] {
                 if let ExprKind::Int(m) = lit.kind {
                     if (m + 1).is_power_of_two() {
-                        return Ok(Val::U(format!("(mod {} {})", other, m + 1)));
+                        let t = format!("(mod {} {})", other, m + 1);
+                        if self.bits {
+                            let r = self.named(&t)?;
+                            self.smt(&bit_fact(&r, &format!("(and (< j {}) {})", (m + 1).trailing_zeros(), bit_of(other, "j"))))?;
+                            if m == 1 {
+                                // Bit 0 says what `x & 1` is.
+                                self.smt(&format!("(assert (= {} (= {} 1)))", bit_of(other, "0"), r))?;
+                            }
+                            return Ok(Val::U(r));
+                        }
+                        return Ok(Val::U(t));
                     }
                 }
             }
@@ -1533,6 +1699,14 @@ impl<'p> Verifier<'p> {
             BinOp::BitOr => format!("(and (<= {ta} {r}) (<= {tb} {r}) (<= {r} (+ {ta} {tb})))"),
             _ => format!("(<= {r} (+ {ta} {tb}))"),
         });
+        if self.bits {
+            let (x, y) = (bit_of(ta, "j"), bit_of(tb, "j"));
+            self.smt(&bit_fact(&r, &match op {
+                BinOp::BitAnd => format!("(and {} {})", x, y),
+                BinOp::BitOr => format!("(or {} {})", x, y),
+                _ => format!("(not (= {} {}))", x, y),
+            }))?;
+        }
         Ok(Val::U(r))
     }
 
@@ -1876,32 +2050,68 @@ impl<'p> Verifier<'p> {
                 Val::Vec { len, .. } => Ok(Val::U(len.clone())),
                 _ => unreachable!(),
             },
-            "vec_push" => {
-                let Val::Vec { elem, len, elems } = vals[0].clone() else { unreachable!() };
-                // A push that cannot grow the vector aborts (out of memory),
-                // so after it the length stayed below 2^60.
-                st.pc.push(format!("(< {} {})", len, ALLOC_MAX));
+            "vec_push" | "vec_push_within" => {
+                let Val::Vec { elem, len, cap, elems } = vals[0].clone() else { unreachable!() };
+                let cap = if name == "vec_push" {
+                    // A push that cannot grow the vector aborts (out of
+                    // memory), so after it the length stayed below 2^60.
+                    st.pc.push(format!("(< {} {})", len, ALLOC_MAX));
+                    // It grows the storage only when it is full.
+                    match cap {
+                        Some(c) => {
+                            let g = self.fresh_int("cap_grown", "0", ALLOC_MAX)?;
+                            st.pc.push(format!("(< {} {})", len, g));
+                            Some(format!("(ite (< {} {}) {} {})", len, c, c, g))
+                        }
+                        None => None,
+                    }
+                } else {
+                    // Never allocates: the room was reserved.
+                    let c = match cap {
+                        Some(c) => c,
+                        None => self.fresh_int("cap", "0", ALLOC_MAX)?,
+                    };
+                    self.need(st, format!("(< {} {})", len, c), pos, "E-VERIFY-BOUNDS", format!("that `{}` has room for one more element (`vlen({}) < vcap({})`)", ra(0), ra(0), ra(0)))?;
+                    Some(c)
+                };
                 let elems2 = vec_write(&elems, &len, &vals[1]);
                 if let (true, Val::U(a), Val::U(a2)) = (self.counts, &*elems, &elems2) {
                     st.pc.push(count_step(a2, &format!("(+ {} 1)", len), a, &len, &format!("(ite (= {} x) 1 0)", vals[1].term())));
                 }
                 let elems = elems2;
-                self.put_back(&args[0], Val::Vec { elem, len: format!("(+ {} 1)", len), elems: Box::new(elems) }, st);
+                self.put_back(&args[0], Val::Vec { elem, len: format!("(+ {} 1)", len), cap, elems: Box::new(elems) }, st);
                 Ok(Val::Unit)
             }
+            "vec_try_reserve" => {
+                let Val::Vec { elem, len, cap, elems } = vals[0].clone() else { unreachable!() };
+                let n = vals[1].term().to_string();
+                // On success there is room for `n` more elements; on failure
+                // the vector is unchanged. Either way the capacity stays
+                // within what the allocators give (`fresh_cap`).
+                let ok = self.fresh_bool("reserved")?.term().to_string();
+                let c2 = self.fresh_int("cap_reserved", "0", ALLOC_MAX)?;
+                st.pc.push(format!("(<= {} {})", len, c2));
+                st.pc.push(format!("(=> {} (<= (+ {} {}) {}))", ok, len, n, c2));
+                let cap = Some(match cap {
+                    Some(c) => format!("(ite {} {} {})", ok, c2, c),
+                    None => c2,
+                });
+                self.put_back(&args[0], Val::Vec { elem, len, cap, elems }, st);
+                Ok(Val::B(ok))
+            }
             "vec_pop" => {
-                let Val::Vec { elem, len, elems } = vals[0].clone() else { unreachable!() };
+                let Val::Vec { elem, len, cap, elems } = vals[0].clone() else { unreachable!() };
                 self.need(st, format!("(> {} 0)", len), pos, "E-VERIFY-BOUNDS", format!("that `{}` is not empty (`vlen({}) > 0`)", ra(0), ra(0)))?;
                 let last = format!("(- {} 1)", len);
                 if let (true, Val::U(a)) = (self.counts, &*elems) {
                     st.pc.push(count_step(a, &last, a, &len, &format!("(- (ite (= (select {} {}) x) 1 0))", a, last)));
                 }
                 let v = self.vec_read(&elem, &elems, &last, st)?;
-                self.put_back(&args[0], Val::Vec { elem, len: last, elems }, st);
+                self.put_back(&args[0], Val::Vec { elem, len: last, cap, elems }, st);
                 Ok(v)
             }
             "vec_get" | "vec_set" | "vec_swap" => {
-                let Val::Vec { elem, len, elems } = vals[0].clone() else { unreachable!() };
+                let Val::Vec { elem, len, cap, elems } = vals[0].clone() else { unreachable!() };
                 let i = vals[1].term().to_string();
                 self.need(st, format!("(< {} {})", i, len), pos, "E-VERIFY-BOUNDS", format!("that the index `{}` is within `{}` (`{} < vlen({})`)", ra(1), ra(0), ra(1), ra(0)))?;
                 let old = if name == "vec_set" { Val::Unit } else { self.vec_read(&elem, &elems, &i, st)? };
@@ -1911,7 +2121,7 @@ impl<'p> Verifier<'p> {
                         st.pc.push(count_step(a2, &len, a, &len, &format!("(- (ite (= {} x) 1 0) (ite (= (select {} {}) x) 1 0))", vals[2].term(), a, i)));
                     }
                     let elems = elems2;
-                    self.put_back(&args[0], Val::Vec { elem, len, elems: Box::new(elems) }, st);
+                    self.put_back(&args[0], Val::Vec { elem, len, cap, elems: Box::new(elems) }, st);
                 }
                 Ok(old)
             }
@@ -1929,6 +2139,16 @@ impl<'p> Verifier<'p> {
                 let n = vals[0].term().to_string();
                 self.need(st, format!("(<= {} {})", n, ALLOC_MAX), pos, "E-VERIFY-ALLOC", format!("that the allocation size `{}` is at most 2^60 bytes", ra(0)))?;
                 Ok(Val::Buf { len: n, data: "((as const (Array Int Int)) 0)".into() })
+            }
+            // Like alloc and balloc, but out of memory gives an empty
+            // buffer instead of stopping the program: the length is the
+            // size asked for, or 0.
+            "try_alloc" | "try_balloc" => {
+                let n = vals[0].term().to_string();
+                let what = if name == "try_alloc" { "elements" } else { "bytes" };
+                self.need(st, format!("(<= {} {})", n, ALLOC_MAX), pos, "E-VERIFY-ALLOC", format!("that the allocation size `{}` is at most 2^60 {}", ra(0), what))?;
+                let ok = self.fresh_bool("alloc_ok")?;
+                Ok(Val::Buf { len: format!("(ite {} {} 0)", ok.term(), n), data: "((as const (Array Int Int)) 0)".into() })
             }
             "blen" => match &vals[0] {
                 Val::Buf { len, .. } => Ok(Val::U(len.clone())),
@@ -2524,6 +2744,21 @@ impl<'p> Verifier<'p> {
                     let old = sc.old.expect("checked: old() only in ensures and loop invariants");
                     return self.spec(&args[0], Scope { env: old, old: None, result: None }, bound);
                 }
+                if let Some(sf) = self.prog.specs.iter().find(|s| &s.name == name && s.opaque && s.pos.file != self.file).cloned() {
+                    // Outside its file, an opaque spec fn is an
+                    // uninterpreted function of its arguments' terms.
+                    let mut terms = Vec::new();
+                    for (p, a) in sf.params.iter().zip(args) {
+                        match p.ty.base() {
+                            t if t.is_int() || *t == Type::Bool => terms.push(self.spec(a, sc, bound)?),
+                            _ => opaque_terms(&self.spec_val(a, sc, bound)?, &mut terms),
+                        }
+                    }
+                    if terms.is_empty() {
+                        return Ok(format!("o!{}", sf.name));
+                    }
+                    return Ok(format!("(o!{} {})", sf.name, terms.join(" ")));
+                }
                 if let Some(sf) = self.prog.specs.iter().find(|s| &s.name == name).cloned() {
                     let mut env = HashMap::new();
                     for (p, a) in sf.params.iter().zip(args) {
@@ -2545,6 +2780,13 @@ impl<'p> Verifier<'p> {
                     let to = self.spec(&args[2], sc, bound)?;
                     return Ok(format!("({} {} {} {})", if name == "bdec" { "dec" } else { "hex" }, data, from, to));
                 }
+                if name == "has_bit" {
+                    let x = self.spec(&args[0], sc, bound)?;
+                    let i = self.spec(&args[1], sc, bound)?;
+                    // Bits from 64 up are never set: every integer in a
+                    // specification is at most a u64.
+                    return Ok(format!("(and (< {i} 64) (bit {x} {i}))"));
+                }
                 if name == "vcount" {
                     let Val::Vec { len, elems, .. } = self.spec_val(&args[0], sc, bound)? else { unreachable!("checked: a Vec") };
                     let x = self.spec(&args[1], sc, bound)?;
@@ -2554,6 +2796,17 @@ impl<'p> Verifier<'p> {
                 match name.as_str() {
                     "vlen" => match v {
                         Val::Vec { len, .. } => len,
+                        _ => unreachable!(),
+                    },
+                    "vcap" => match v {
+                        Val::Vec { cap: Some(c), .. } => c,
+                        // The capacity of an element of a vector is not
+                        // tracked: all that is known is its range.
+                        Val::Vec { len, .. } => {
+                            let c = self.fresh_int("cap", "0", ALLOC_MAX)?;
+                            self.smt(&format!("(assert (<= {} {}))", len, c))?;
+                            c
+                        }
                         _ => unreachable!(),
                     },
                     "len" | "slen" | "blen" => match v {

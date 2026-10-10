@@ -1,0 +1,33 @@
+// expect-exit: 45
+// A queue returns words in the order they went in: `core/ring`'s
+// contracts describe the queue as a sequence (`queue_at`), and since
+// `queue_at` is an opaque spec fn this file sees only those contracts, so
+// the loops below are proved without the ring's slot arithmetic.
+import "core/ring.bastio";
+
+fn main() -> u64 {
+  let n: u64 = 10;
+  let mut q = queue_new(4);
+  // Fill and drain twice around the ring: what comes out is 0, 1, 2, ...
+  let mut sum: u64 = 0;
+  let mut next: u64 = 0;
+  let mut want: u64 = 0;
+  while want < n
+    invariant queue_ok(q) && q.r.cap == 4 && want <= next && next <= n
+    invariant q.r.n == next - want
+    invariant forall k: u64 :: k < q.r.n ==> queue_at(q, k) == want + k
+    invariant sum <= want * 9
+  {
+    if next < n && q.r.n < q.r.cap {
+      queue_push(&mut q, next);
+      next = next + 1;
+    } else {
+      let x = queue_pop(&mut q);
+      assert x == want;
+      sum = sum + x;
+      want = want + 1;
+    }
+  }
+  queue_free(q);
+  return sum;
+}

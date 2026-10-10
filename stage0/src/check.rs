@@ -62,6 +62,8 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("free", Avail::All, vec![Buf], Unit),
         ("print", Avail::All, vec![U64], Unit),
         ("balloc", Avail::All, vec![U64], Bytes),
+        ("try_alloc", Avail::All, vec![U64], Buf),
+        ("try_balloc", Avail::All, vec![U64], Bytes),
         ("blen", Avail::All, vec![r(Bytes)], U64),
         ("bget", Avail::All, vec![r(Bytes), U64], U8),
         ("bset", Avail::All, vec![m(Bytes), U64, U8], Unit),
@@ -208,7 +210,7 @@ pub fn builtin_sigs() -> HashMap<String, Sig> {
 }
 
 /// Builtins over `Vec[T]`: generic, so their signatures are built per call.
-pub const VEC_BUILTINS: &[&str] = &["vec_new", "vec_len", "vec_push", "vec_pop", "vec_get", "vec_set", "vec_swap", "vec_free"];
+pub const VEC_BUILTINS: &[&str] = &["vec_new", "vec_len", "vec_push", "vec_push_within", "vec_try_reserve", "vec_pop", "vec_get", "vec_set", "vec_swap", "vec_free"];
 
 /// Builtins written with type arguments (`vec_new[u64]()`, `cast[u8](x)`).
 pub const TYPED_BUILTINS: &[&str] = &["vec_new", "cast", "wrap"];
@@ -665,6 +667,17 @@ fn new_ctx<'a>(sigs: &'a HashMap<String, Sig>, specs: &'a [SpecFn], target: Targ
     Ctx { sigs, specs, target, ret, scopes: vec![Vec::new()], vars: HashMap::new(), moved: HashSet::new(), moved_at: HashMap::new(), int_ops: HashMap::new(), calls: Vec::new(), lock_sites: Vec::new(), params: Vec::new(), in_inv: std::cell::Cell::new(false), old_only: std::cell::Cell::new(false) }
 }
 
+/// What an opaque spec fn can take: values the verifier can hand to an
+/// uninterpreted function as a fixed list of terms.
+pub fn opaque_arg(t: &Type) -> bool {
+    match t {
+        Type::Ref(x) => opaque_arg(x),
+        Type::Bool | Type::Buf | Type::Bytes => true,
+        Type::Struct(n) => crate::ast::struct_def(n).map_or(false, |d| d.fields.iter().all(|(_, ft)| opaque_arg(ft))),
+        t => t.is_int(),
+    }
+}
+
 /// A spec fn may only call spec fns defined before it, so expansion terminates.
 fn check_spec_fn(sf: &SpecFn, earlier: &[SpecFn], sigs: &HashMap<String, Sig>, target: Target) -> Result<(), Diag> {
     if sigs.contains_key(&sf.name) || is_ghost(&sf.name) || earlier.iter().any(|e| e.name == sf.name) {
@@ -676,6 +689,9 @@ fn check_spec_fn(sf: &SpecFn, earlier: &[SpecFn], sigs: &HashMap<String, Sig>, t
     let mut cx = new_ctx(sigs, earlier, target, Type::Unit);
     for p in &sf.params {
         known_type(&p.ty, p.pos)?;
+        if sf.opaque && !opaque_arg(&p.ty) {
+            return Err(Diag::new("E-TYPE", p.pos, format!("a parameter of an opaque spec fn is an integer, bool, Buf or Bytes, or a struct of those (or a borrow of one), not {}", p.ty.name())));
+        }
         if p.ty.is_linear() || p.ty.is_mut_ref() {
             return Err(Diag::new("E-TYPE", p.pos, "spec fn parameters are values (`u64`, `bool`) or shared borrows (`&T`)"));
         }
@@ -1606,7 +1622,8 @@ impl<'a> Ctx<'a> {
         let v = Type::Vec(Box::new(t.clone()));
         let (params, ret) = match name {
             "vec_len" => (vec![r(v)], Type::U64),
-            "vec_push" => (vec![m(v), t.clone()], Type::Unit),
+            "vec_push" | "vec_push_within" => (vec![m(v), t.clone()], Type::Unit),
+            "vec_try_reserve" => (vec![m(v), Type::U64], Type::Bool),
             "vec_pop" => (vec![m(v)], t.clone()),
             "vec_swap" => (vec![m(v), Type::U64, t.clone()], t.clone()),
             "vec_free" => (vec![v], Type::Unit),
@@ -1882,14 +1899,23 @@ impl<'a> Ctx<'a> {
                     }
                     return Ok(Type::U64);
                 }
-                if name == "vlen" || name == "vget" {
-                    arity(if name == "vlen" { 1 } else { 2 })?;
+                if name == "has_bit" {
+                    // Whether bit `i` of an integer is set.
+                    arity(2)?;
+                    for (k, what) in [(0, "the value"), (1, "the bit number")] {
+                        let t = spec_norm(self.spec_expr(&args[k], in_ensures, bound)?);
+                        expect_ty(&t, &Type::U64, args[k].pos, what)?;
+                    }
+                    return Ok(Type::Bool);
+                }
+                if name == "vlen" || name == "vcap" || name == "vget" {
+                    arity(if name == "vget" { 2 } else { 1 })?;
                     let t = self.spec_expr(&args[0], in_ensures, bound)?;
                     let Type::Vec(el) = &t else {
                         return Err(Diag::new("E-TYPE", args[0].pos, format!("argument of `{}` must be a Vec, found {}", name, t.name())));
                     };
                     check_lin(&args[0])?;
-                    if name == "vlen" {
+                    if name != "vget" {
                         return Ok(Type::U64);
                     }
                     let ti = spec_norm(self.spec_expr(&args[1], in_ensures, bound)?);
@@ -1897,7 +1923,7 @@ impl<'a> Ctx<'a> {
                     return Ok((**el).clone());
                 }
                 if !matches!(name.as_str(), "len" | "get" | "slen" | "sget" | "blen" | "bget") {
-                    return Err(Diag::new("E-TYPE", e.pos, format!("`{}` cannot be called in a specification (allowed: len, get, slen, sget, blen, bget, bdec, bhex, vlen, vget, vcount, old, ghost accessors and spec fns)", name)));
+                    return Err(Diag::new("E-TYPE", e.pos, format!("`{}` cannot be called in a specification (allowed: len, get, slen, sget, blen, bget, bdec, bhex, has_bit, vlen, vcap, vget, vcount, old, ghost accessors and spec fns)", name)));
                 }
                 let sig = &self.sigs[name.as_str()];
                 arity(sig.params.len())?;

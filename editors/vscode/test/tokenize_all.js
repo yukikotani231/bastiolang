@@ -42,6 +42,8 @@ const EXPECT = [
   ['fn main() -> u64 {', 'main', 'entity.name.function.bastio'],
   ['fn main() -> u64 {', 'u64', 'support.type.builtin.bastio'],
   ['spec fn sq(x: u64) -> u64 { x * x }', 'sq', 'entity.name.function.bastio'],
+  ['opaque spec fn at(q: &Queue, i: u64) -> u64 { get(q.q, i) }', 'opaque', 'storage.modifier.opaque.bastio'],
+  ['opaque spec fn at(q: &Queue, i: u64) -> u64 { get(q.q, i) }', 'at', 'entity.name.function.bastio'],
   ['  requires forall i: u64 :: i < n', 'forall', 'keyword.other.proof.bastio'],
   // The body of a forall is not an enum variant.
   ['  requires forall i: u64 :: i < n', ' i ', 'source.bastio'],
