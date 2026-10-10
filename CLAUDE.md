@@ -10,7 +10,10 @@ A systems language whose memory safety is proved at compile time. The successor 
 ```sh
 cd stage0 && cargo build --release     # warnings are errors in CI
 tests/run.sh                           # needs z3 and cc
+tests/ci.sh                            # every CI check; run before each push
 ```
+
+Run `tests/ci.sh` after merging the latest `main` and before every push. Many branches land in parallel, so a stage0 change that is not mirrored in stage1, or new syntax the editor grammars do not know, fails CI on the next branch that merges `main`. Each failed run notifies the owner.
 
 Never copy test counts into prose: they go stale (a lesson from fz). Count the real thing instead:
 `ls tests/pass tests/fail | grep -c bastio`
