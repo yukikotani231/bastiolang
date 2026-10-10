@@ -11,6 +11,10 @@ pub enum Tok {
     // keywords
     Fn,
     Struct,
+    Enum,
+    Match,
+    Is,
+    FatArrow,
     Spec,
     Const,
     Let,
@@ -166,6 +170,9 @@ pub fn lex(src: &str, file: usize) -> Result<Vec<Token>, Diag> {
             let tok = match text.as_str() {
                 "fn" => Tok::Fn,
                 "struct" => Tok::Struct,
+                "enum" => Tok::Enum,
+                "match" => Tok::Match,
+                "is" => Tok::Is,
                 "spec" => Tok::Spec,
                 "const" => Tok::Const,
                 "let" => Tok::Let,
@@ -191,6 +198,7 @@ pub fn lex(src: &str, file: usize) -> Result<Vec<Token>, Diag> {
         let (tok, len) = match (c, two, three) {
             ('=', Some('='), Some('>')) => (Tok::Implies, 3),
             ('=', Some('='), _) => (Tok::EqEq, 2),
+            ('=', Some('>'), _) => (Tok::FatArrow, 2),
             ('!', Some('='), _) => (Tok::Ne, 2),
             ('<', Some('='), _) => (Tok::Le, 2),
             ('>', Some('='), _) => (Tok::Ge, 2),

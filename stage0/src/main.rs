@@ -90,7 +90,7 @@ fn main() {
         exit(1);
     };
 
-    let mut prog = ast::Program { fns: Vec::new(), specs: Vec::new(), structs: Vec::new() };
+    let mut prog = ast::Program { fns: Vec::new(), specs: Vec::new(), structs: Vec::new(), enums: Vec::new() };
     let mut consts = std::collections::HashMap::new();
     for (k, (path, src)) in files.iter().enumerate() {
         let toks = lexer::lex(src, k).unwrap_or_else(|d| fail(d));
@@ -101,9 +101,12 @@ fn main() {
         prog.fns.extend(part.fns);
         prog.specs.extend(part.specs);
         prog.structs.extend(part.structs);
+        prog.enums.extend(part.enums);
     }
+    ast::resolve_enum_types(&mut prog);
     check::check_structs(&prog).unwrap_or_else(|d| fail(d));
     ast::register_structs(prog.structs.clone());
+    ast::register_enums(prog.enums.clone());
     check::check_program(&mut prog, target).unwrap_or_else(|d| fail(d));
     let (n, log) = verify::verify_program(&prog).unwrap_or_else(|d| fail(d));
     if dump_smt {

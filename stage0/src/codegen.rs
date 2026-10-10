@@ -32,13 +32,15 @@ struct Gen<'a> {
     /// `&mut` parameters of the current function: their C value is a pointer.
     mut_params: HashSet<String>,
     blobs: &'a mut Vec<Vec<u8>>,
+    /// Counter for the temporaries that hold a `match` scrutinee.
+    tmps: usize,
 }
 
 pub fn emit(p: &Program, target: Target) -> String {
     let mut blobs = Vec::new();
     let mut bodies = String::new();
     for f in &p.fns {
-        let mut g = Gen { mut_params: f.params.iter().filter(|p| p.ty.is_mut_ref()).map(|p| p.name.clone()).collect(), blobs: &mut blobs };
+        let mut g = Gen { mut_params: f.params.iter().filter(|p| p.ty.is_mut_ref()).map(|p| p.name.clone()).collect(), blobs: &mut blobs, tmps: 0 };
         bodies.push_str(&format!("{} {{\n", proto(f)));
         for s in &f.body {
             g.stmt(s, 1, &mut bodies);
@@ -515,33 +517,54 @@ fn cty(t: &Type) -> String {
         Type::Mmu => "bst_mmu".into(),
         Type::Cpu => "bst_cpu".into(),
         Type::Struct(n) => format!("bst_s_{}", n),
+        Type::Enum(n) => format!("bst_e_{}", n),
         Type::Ref(t) => cty(t),
         Type::MutRef(_) => unreachable!("written by proto"),
     }
 }
 
-/// C structs for the program's structs, each after the structs it contains.
+/// C types for the program's structs and enums, each after the types it
+/// contains. An enum is a tag plus a union of its payloads.
 fn struct_decls(p: &Program) -> String {
-    fn emit_one(d: &StructDef, p: &Program, done: &mut Vec<String>, out: &mut String) {
-        if done.contains(&d.name) {
+    fn emit_one(n: &str, p: &Program, done: &mut Vec<String>, out: &mut String) {
+        if done.iter().any(|d| d == n) {
             return;
         }
-        done.push(d.name.clone());
-        for (_, t) in &d.fields {
-            if let Type::Struct(n) = t {
-                emit_one(p.structs.iter().find(|x| &x.name == n).unwrap(), p, done, out);
+        done.push(n.to_string());
+        let held: Vec<Type> = match p.structs.iter().find(|x| x.name == n) {
+            Some(d) => d.fields.iter().map(|f| f.1.clone()).collect(),
+            None => p.enums.iter().find(|x| x.name == n).unwrap().variants.iter().filter_map(|v| v.1.clone()).collect(),
+        };
+        for t in &held {
+            if let Type::Struct(m) | Type::Enum(m) = t {
+                emit_one(m, p, done, out);
             }
         }
-        out.push_str(&format!("typedef struct {{"));
-        for (f, t) in &d.fields {
-            out.push_str(&format!(" {} {};", cty(t), f));
+        if let Some(d) = p.structs.iter().find(|x| x.name == n) {
+            out.push_str("typedef struct {");
+            for (f, t) in &d.fields {
+                out.push_str(&format!(" {} {};", cty(t), f));
+            }
+            out.push_str(&format!(" }} bst_s_{};\n", n));
+        } else {
+            let d = p.enums.iter().find(|x| x.name == n).unwrap();
+            out.push_str("typedef struct { uint64_t tag;");
+            if held.iter().any(|t| *t != Type::Unit) {
+                out.push_str(" union {");
+                for (v, t) in &d.variants {
+                    if let Some(t) = t.as_ref().filter(|t| **t != Type::Unit) {
+                        out.push_str(&format!(" {} {};", cty(t), v));
+                    }
+                }
+                out.push_str(" } u;");
+            }
+            out.push_str(&format!(" }} bst_e_{};\n", n));
         }
-        out.push_str(&format!(" }} bst_s_{};\n", d.name));
     }
     let mut done = Vec::new();
     let mut out = String::new();
-    for d in &p.structs {
-        emit_one(d, p, &mut done, &mut out);
+    for n in p.structs.iter().map(|d| &d.name).chain(p.enums.iter().map(|d| &d.name)) {
+        emit_one(n, p, &mut done, &mut out);
     }
     out
 }
@@ -610,6 +633,55 @@ impl<'a> Gen<'a> {
                 }
                 out.push_str(&format!("{}}}\n", ind(d)));
             }
+            StmtKind::Match { scrut, arms } => {
+                // The enum's name comes from the patterns; a match with only
+                // `_` needs no temporary, it just evaluates the scrutinee.
+                let e = self.expr(scrut);
+                let en = arms.iter().find_map(|a| match &a.pat {
+                    Pat::Variant(en, ..) => Some(en.clone()),
+                    Pat::Wild => None,
+                });
+                let Some(en) = en else {
+                    out.push_str(&format!("{}{{\n{}(void)({});\n", ind(d), ind(d + 1), e));
+                    for s in arms.iter().flat_map(|a| &a.body) {
+                        self.stmt(s, d + 1, out);
+                    }
+                    out.push_str(&format!("{}}}\n", ind(d)));
+                    return;
+                };
+                let d_en = enum_def(&en).unwrap();
+                let m = format!("m_{}", self.tmps);
+                self.tmps += 1;
+                out.push_str(&format!("{}{{\n{}bst_e_{} {} = {};\n", ind(d), ind(d + 1), en, m, e));
+                // The match is exhaustive (checked), so the last arm needs no test.
+                for (i, a) in arms.iter().enumerate() {
+                    let kw = if i == 0 { "if" } else { "} else if" };
+                    let last = i + 1 == arms.len();
+                    match &a.pat {
+                        Pat::Variant(_, v, b, _) => {
+                            let k = d_en.index(v).unwrap();
+                            match (i, last) {
+                                (0, true) => out.push_str(&format!("{}{{\n", ind(d + 1))),
+                                (_, true) => out.push_str(&format!("{}}} else {{\n", ind(d + 1))),
+                                _ => out.push_str(&format!("{}{} ({}.tag == {}) {{\n", ind(d + 1), kw, m, k)),
+                            }
+                            if let Some(b) = b.as_ref().filter(|b| *b != "_") {
+                                let pt = d_en.variants[k].1.as_ref().unwrap();
+                                out.push_str(&format!("{}{} v_{} = {}.u.{};\n", ind(d + 2), cty(pt), b, m, v));
+                            }
+                        }
+                        Pat::Wild if i == 0 => out.push_str(&format!("{}{{\n", ind(d + 1))),
+                        Pat::Wild => out.push_str(&format!("{}}} else {{\n", ind(d + 1))),
+                    }
+                    for s in &a.body {
+                        self.stmt(s, d + 2, out);
+                    }
+                }
+                if !arms.is_empty() {
+                    out.push_str(&format!("{}}}\n", ind(d + 1)));
+                }
+                out.push_str(&format!("{}}}\n", ind(d)));
+            }
             StmtKind::Return(Some(e)) => {
                 let e = self.expr(e);
                 out.push_str(&format!("{}return {};\n", ind(d), e));
@@ -647,6 +719,11 @@ impl<'a> Gen<'a> {
                 let inits: Vec<String> = fs.iter().map(|(f, x)| format!(".{} = {}", f, self.expr(x))).collect();
                 format!("((bst_s_{}){{ {} }})", n, inits.join(", "))
             }
+            ExprKind::Variant(n, v, payload) => match payload {
+                Some(x) => format!("((bst_e_{}){{ .tag = {}, .u.{} = {} }})", n, enum_def(n).unwrap().index(v).unwrap(), v, self.expr(x)),
+                None => format!("((bst_e_{}){{ .tag = {} }})", n, enum_def(n).unwrap().index(v).unwrap()),
+            },
+            ExprKind::Is(x, n, v) => format!("({}.tag == {})", self.expr(x), enum_def(n).unwrap().index(v).unwrap()),
             ExprKind::Not(x) => format!("(!{})", self.expr(x)),
             ExprKind::Bin(op, a, b) => format!("({} {} {})", self.expr(a), op.text(), self.expr(b)),
             ExprKind::Forall(..) => unreachable!("specification only"),

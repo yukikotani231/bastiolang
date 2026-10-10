@@ -36,6 +36,9 @@ pub enum Type {
     /// A user-defined struct. Linear when any field is linear; otherwise a
     /// plain value that is copied.
     Struct(String),
+    /// A user-defined enum (a tagged union). Linear when any variant's
+    /// payload is linear.
+    Enum(String),
     /// A read-only borrow of a linear value. Only allowed as a parameter type.
     Ref(Box<Type>),
     /// A mutable borrow of a linear value. Only allowed as a parameter type;
@@ -59,7 +62,7 @@ impl Type {
             Type::Pool => "Pool".into(),
             Type::Mmu => "Mmu".into(),
             Type::Cpu => "Cpu".into(),
-            Type::Struct(n) => n.clone(),
+            Type::Struct(n) | Type::Enum(n) => n.clone(),
             Type::Ref(t) => format!("&{}", t.name()),
             Type::MutRef(t) => format!("&mut {}", t.name()),
         }
@@ -68,6 +71,7 @@ impl Type {
         match self {
             Type::Buf | Type::Bytes | Type::Host | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu => true,
             Type::Struct(n) => struct_def(n).map_or(false, |d| d.fields.iter().any(|f| f.1.is_linear())),
+            Type::Enum(n) => enum_def(n).map_or(false, |d| d.variants.iter().any(|v| v.1.as_ref().map_or(false, |t| t.is_linear()))),
             _ => false,
         }
     }
@@ -141,6 +145,10 @@ pub enum ExprKind {
     Field(Box<Expr>, String),
     /// `Name { f: e, .. }`
     StructLit(String, Vec<(String, Expr)>),
+    /// `Enum::Variant` or `Enum::Variant(e)`
+    Variant(String, String, Option<Box<Expr>>),
+    /// `e is Enum::Variant`: does not consume `e`.
+    Is(Box<Expr>, String, String),
     Var(String),
     Not(Box<Expr>),
     Bin(BinOp, Box<Expr>, Box<Expr>),
@@ -165,6 +173,24 @@ pub enum StmtKind {
     Return(Option<Expr>),
     Assert(Expr),
     Expr(Expr),
+    /// `match e { Pat => { .. } .. }`
+    Match { scrut: Expr, arms: Vec<Arm> },
+}
+
+#[derive(Debug, Clone)]
+pub enum Pat {
+    /// `Enum::Variant`, or `Enum::Variant(x)` / `(mut x)` / `(_)` for a variant
+    /// with a payload: (enum, variant, binding, binding is mutable).
+    Variant(String, String, Option<String>, bool),
+    /// `_`: every variant not named by an earlier arm.
+    Wild,
+}
+
+#[derive(Debug, Clone)]
+pub struct Arm {
+    pub pat: Pat,
+    pub body: Vec<Stmt>,
+    pub pos: Pos,
 }
 
 #[derive(Debug, Clone)]
@@ -217,11 +243,26 @@ impl StructDef {
     }
 }
 
+/// `enum Name { A, B(Type), .. }`
+#[derive(Debug, Clone)]
+pub struct EnumDef {
+    pub name: String,
+    pub variants: Vec<(String, Option<Type>)>,
+    pub pos: Pos,
+}
+
+impl EnumDef {
+    pub fn index(&self, v: &str) -> Option<usize> {
+        self.variants.iter().position(|x| x.0 == v)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Program {
     pub fns: Vec<FnDef>,
     pub specs: Vec<SpecFn>,
     pub structs: Vec<StructDef>,
+    pub enums: Vec<EnumDef>,
 }
 
 /// The program's struct definitions, registered once after parsing so that
@@ -234,6 +275,71 @@ pub fn register_structs(defs: Vec<StructDef>) {
 
 pub fn struct_def(name: &str) -> Option<&'static StructDef> {
     STRUCTS.get()?.iter().find(|d| d.name == name)
+}
+
+static ENUMS: std::sync::OnceLock<Vec<EnumDef>> = std::sync::OnceLock::new();
+
+pub fn register_enums(defs: Vec<EnumDef>) {
+    let _ = ENUMS.set(defs);
+}
+
+pub fn enum_def(name: &str) -> Option<&'static EnumDef> {
+    ENUMS.get()?.iter().find(|d| d.name == name)
+}
+
+/// The parser reads every unknown type name as a struct; turn the names of
+/// enums into `Type::Enum` everywhere a type is written.
+pub fn resolve_enum_types(p: &mut Program) {
+    let names: Vec<String> = p.enums.iter().map(|e| e.name.clone()).collect();
+    fn fix(t: &mut Type, names: &[String]) {
+        match t {
+            Type::Struct(n) if names.contains(n) => *t = Type::Enum(n.clone()),
+            Type::Ref(i) | Type::MutRef(i) => fix(i, names),
+            _ => {}
+        }
+    }
+    fn fix_stmts(ss: &mut [Stmt], names: &[String]) {
+        for s in ss {
+            match &mut s.kind {
+                StmtKind::Let { ty: Some(t), .. } => fix(t, names),
+                StmtKind::If { then_b, else_b, .. } => {
+                    fix_stmts(then_b, names);
+                    fix_stmts(else_b, names);
+                }
+                StmtKind::While { body, .. } => fix_stmts(body, names),
+                StmtKind::Match { arms, .. } => {
+                    for a in arms {
+                        fix_stmts(&mut a.body, names);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for f in &mut p.fns {
+        for prm in &mut f.params {
+            fix(&mut prm.ty, &names);
+        }
+        fix(&mut f.ret, &names);
+        fix_stmts(&mut f.body, &names);
+    }
+    for sf in &mut p.specs {
+        for prm in &mut sf.params {
+            fix(&mut prm.ty, &names);
+        }
+    }
+    for d in &mut p.structs {
+        for (_, t) in &mut d.fields {
+            fix(t, &names);
+        }
+    }
+    for e in &mut p.enums {
+        for (_, t) in &mut e.variants {
+            if let Some(t) = t {
+                fix(t, &names);
+            }
+        }
+    }
 }
 
 /// The dotted path of a place expression (`x`, `x.f`, `x.f.g`).
@@ -263,6 +369,12 @@ pub fn render(e: &Expr) -> String {
             ExprKind::Field(b, f) => format!("{}.{}", go(b, false), f),
             ExprKind::StructLit(n, fs) => {
                 format!("{} {{ {} }}", n, fs.iter().map(|(f, x)| format!("{}: {}", f, go(x, true))).collect::<Vec<_>>().join(", "))
+            }
+            ExprKind::Variant(en, v, None) => format!("{}::{}", en, v),
+            ExprKind::Variant(en, v, Some(x)) => format!("{}::{}({})", en, v, go(x, true)),
+            ExprKind::Is(x, en, v) => {
+                let s = format!("{} is {}::{}", go(x, false), en, v);
+                if top { s } else { format!("({})", s) }
             }
             ExprKind::Not(x) => format!("!{}", go(x, false)),
             ExprKind::Bin(op, a, b) => {

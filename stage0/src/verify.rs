@@ -64,6 +64,10 @@ enum Val {
     Obj(Type, Vec<String>),
     /// A struct: its fields' values in declaration order.
     Struct(String, Vec<Val>),
+    /// An enum: its tag (the variant's index) and one payload slot per
+    /// variant (`Unit` for variants without one). Only the slot the tag
+    /// names means anything.
+    Enum(String, String, Vec<Val>),
     Unit,
 }
 
@@ -103,6 +107,7 @@ fn merge_val(c: &str, a: &Val, b: &Val) -> Val {
         (Val::Str { len: l1, data: d1 }, Val::Str { len: l2, data: d2 }) => Val::Str { len: ite(c, l1, l2), data: ite(c, d1, d2) },
         (Val::Obj(ty, f1), Val::Obj(_, f2)) => Val::Obj(ty.clone(), f1.iter().zip(f2).map(|(x, y)| ite(c, x, y)).collect()),
         (Val::Struct(n, f1), Val::Struct(_, f2)) => Val::Struct(n.clone(), f1.iter().zip(f2).map(|(x, y)| merge_val(c, x, y)).collect()),
+        (Val::Enum(n, t1, p1), Val::Enum(_, t2, p2)) => Val::Enum(n.clone(), ite(c, t1, t2), p1.iter().zip(p2).map(|(x, y)| merge_val(c, x, y)).collect()),
         (Val::Unit, Val::Unit) => Val::Unit,
         _ => unreachable!("type checker guarantees matching kinds"),
     }
@@ -180,6 +185,14 @@ fn and_all(ts: &[String]) -> String {
         0 => "true".into(),
         1 => ts[0].clone(),
         _ => format!("(and {})", ts.join(" ")),
+    }
+}
+
+fn or_all(ts: &[String]) -> String {
+    match ts.len() {
+        0 => "false".into(),
+        1 => ts[0].clone(),
+        _ => format!("(or {})", ts.join(" ")),
     }
 }
 
@@ -276,6 +289,18 @@ impl<'p> Verifier<'p> {
                 }
                 Ok(Val::Struct(n.clone(), fs))
             }
+            Type::Enum(n) => {
+                let d = enum_def(n).unwrap();
+                let tag = self.fresh_int(&format!("{}_tag", hint), "0", &(d.variants.len() - 1).to_string())?;
+                let mut ps = Vec::new();
+                for (v, pt) in &d.variants {
+                    ps.push(match pt {
+                        Some(pt) => self.fresh_of(pt, &format!("{}_{}", hint, v))?,
+                        None => Val::Unit,
+                    });
+                }
+                Ok(Val::Enum(n.clone(), tag, ps))
+            }
             t => {
                 let mut fs = Vec::new();
                 for (f, _, _) in ghost_fields(t) {
@@ -317,6 +342,12 @@ impl<'p> Verifier<'p> {
                         Val::Struct(sn, fs) => {
                             for ((f, _), fv) in struct_def(sn).unwrap().fields.iter().zip(fs) {
                                 show(&format!("{}.{}", n, f), fv, shown);
+                            }
+                        }
+                        Val::Enum(en, tag, ps) => {
+                            shown.push((format!("tag({})", n), tag.clone()));
+                            for ((v, _), pv) in enum_def(en).unwrap().variants.iter().zip(ps) {
+                                show(&format!("{}.{}", n, v), pv, shown);
                             }
                         }
                         Val::Unit => {}
@@ -471,6 +502,58 @@ impl<'p> Verifier<'p> {
                     }
                 }
             }
+            StmtKind::Match { scrut, arms } => {
+                let Val::Enum(en, tag, ps) = self.eval(scrut, &mut st)? else { unreachable!("checked: an enum") };
+                let d = enum_def(&en).unwrap();
+                let mut covered = Vec::new();
+                let mut outs: Vec<(String, State)> = Vec::new();
+                for a in arms {
+                    let mut ast = st.clone();
+                    let c = match &a.pat {
+                        Pat::Variant(_, v, b, _) => {
+                            let k = d.index(v).unwrap();
+                            covered.push(format!("(= {} {})", tag, k));
+                            if let Some(b) = b {
+                                if b != "_" {
+                                    ast.env.insert(b.clone(), ps[k].clone());
+                                }
+                            }
+                            format!("(= {} {})", tag, k)
+                        }
+                        Pat::Wild => format!("(not {})", or_all(&covered)),
+                    };
+                    ast.pc.push(c.clone());
+                    if let Some(out) = self.block(&a.body, ast, cx)? {
+                        outs.push((c, out));
+                    }
+                }
+                if outs.len() <= 1 {
+                    return Ok(outs.pop().map(|(_, o)| o));
+                }
+                // Arms are disjoint, so the merged value is a chain of ites
+                // ending in the last arm that falls through.
+                let (_, last) = outs.last().unwrap().clone();
+                let mut env = HashMap::new();
+                for name in st.env.keys() {
+                    let mut v = last.env[name].clone();
+                    for (c, o) in outs[..outs.len() - 1].iter().rev() {
+                        v = merge_val(c, &o.env[name], &v);
+                    }
+                    env.insert(name.clone(), v);
+                }
+                let mut pc = st.pc.clone();
+                if outs.len() < arms.len() {
+                    let conds: Vec<String> = outs.iter().map(|(c, _)| c.clone()).collect();
+                    pc.push(or_all(&conds));
+                }
+                for (c, o) in &outs {
+                    let extra: Vec<_> = o.pc[st.pc.len() + 1..].to_vec();
+                    if !extra.is_empty() {
+                        pc.push(format!("(=> {} {})", c, and_all(&extra)));
+                    }
+                }
+                Ok(Some(State { pc, env }))
+            }
             StmtKind::While { cond, invariants, body } => {
                 // 1. invariants hold on entry
                 for inv in invariants {
@@ -543,6 +626,15 @@ impl<'p> Verifier<'p> {
                 }
                 Val::Struct(n.clone(), nf)
             }
+            Val::Enum(n, _, ps) => {
+                let d = enum_def(n).unwrap();
+                let tag = self.fresh_int(&format!("{}_tag", name), "0", &(d.variants.len() - 1).to_string())?;
+                let mut np = Vec::new();
+                for ((v, _), pv) in d.variants.iter().zip(ps) {
+                    np.push(self.havoc(pv, false, &format!("{}_{}", name, v))?);
+                }
+                Val::Enum(n.clone(), tag, np)
+            }
             Val::Unit => Val::Unit,
         })
     }
@@ -564,6 +656,23 @@ impl<'p> Verifier<'p> {
                 let fields = struct_def(n).unwrap().fields.iter().map(|(f, _)| vals.remove(f).unwrap()).collect();
                 Ok(Val::Struct(n.clone(), fields))
             }
+            ExprKind::Variant(n, v, payload) => {
+                let d = enum_def(n).unwrap();
+                let k = d.index(v).unwrap();
+                let mut ps = Vec::new();
+                for (j, (vn, pt)) in d.variants.iter().enumerate() {
+                    ps.push(match (pt, payload) {
+                        (Some(_), Some(x)) if j == k => self.eval(x, st)?,
+                        (Some(pt), _) => self.fresh_of(pt, &format!("{}_{}", n, vn))?,
+                        (None, _) => Val::Unit,
+                    });
+                }
+                Ok(Val::Enum(n.clone(), k.to_string(), ps))
+            }
+            ExprKind::Is(x, _, v) => match self.eval(x, st)? {
+                Val::Enum(n, tag, _) => Ok(Val::B(format!("(= {} {})", tag, enum_def(&n).unwrap().index(v).unwrap()))),
+                _ => unreachable!("checked: an enum"),
+            },
             ExprKind::MutBorrow(_) => unreachable!("only a call argument"),
             ExprKind::Not(x) => {
                 let v = self.eval(x, st)?;
@@ -964,6 +1073,8 @@ impl<'p> Verifier<'p> {
                     let k = struct_def(&n).unwrap().fields.iter().position(|x| &x.0 == f).expect("checked field");
                     Ok(fs[k].clone())
                 }
+                // `o.V`: the payload slot of variant V.
+                Val::Enum(n, _, ps) => Ok(ps[enum_def(&n).unwrap().index(f).expect("checked variant")].clone()),
                 _ => unreachable!("checked: a field of a struct"),
             },
             _ => Err(Diag::new("E-TYPE", e.pos, "this argument must be a variable, a field of one, `result` or `old(x)`")),
@@ -978,7 +1089,11 @@ impl<'p> Verifier<'p> {
             ExprKind::Str(_) | ExprKind::Blob(_) => {
                 return Err(Diag::new("E-TYPE", e.pos, "a string literal can only appear as the argument of `slen` or `sget` in a specification"))
             }
-            ExprKind::MutBorrow(_) | ExprKind::StructLit(..) => unreachable!("rejected by the checker"),
+            ExprKind::MutBorrow(_) | ExprKind::StructLit(..) | ExprKind::Variant(..) => unreachable!("rejected by the checker"),
+            ExprKind::Is(x, _, v) => match self.spec_val(x, sc, bound)? {
+                Val::Enum(n, tag, _) => format!("(= {} {})", tag, enum_def(&n).unwrap().index(v).unwrap()),
+                _ => unreachable!("checked: an enum"),
+            },
             ExprKind::Var(_) | ExprKind::Field(..) => self.spec_val(e, sc, bound)?.term().to_string(),
             ExprKind::Not(x) => format!("(not {})", self.spec(x, sc, bound)?),
             ExprKind::Bin(op, a, b) => {
@@ -1073,6 +1188,12 @@ fn changed_vars(stmts: &[Stmt], out: &mut HashMap<String, bool>) {
                 changed_in_expr(cond, out);
                 changed_vars(body, out);
             }
+            StmtKind::Match { scrut, arms } => {
+                changed_in_expr(scrut, out);
+                for a in arms {
+                    changed_vars(&a.body, out);
+                }
+            }
             StmtKind::Return(None) | StmtKind::Assert(_) => {}
         }
     }
@@ -1097,6 +1218,12 @@ fn changed_in_expr(e: &Expr, out: &mut HashMap<String, bool>) {
             changed_in_expr(a, out);
             changed_in_expr(b, out);
         }
+        ExprKind::StructLit(_, fs) => {
+            for (_, x) in fs {
+                changed_in_expr(x, out);
+            }
+        }
+        ExprKind::Variant(_, _, Some(x)) | ExprKind::Is(x, _, _) => changed_in_expr(x, out),
         _ => {}
     }
 }
