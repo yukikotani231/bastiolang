@@ -82,17 +82,17 @@ The name is deliberately not `as`. In Rust and C, a cast truncates silently; in 
 
 Wrapping arithmetic for hashes and checksums comes as three builtins on operands of the same type: `wrap_add(a, b)`, `wrap_sub(a, b)`, `wrap_mul(a, b)`. They have no obligation and mean `wrap[T](a + b)` and so on. (Writing that out directly does not work for `u64`, whose sum may not fit any type.)
 
-There is no conversion between integers and `bool`.
+There is no conversion between integers and `bool`. `cast`, `wrap` and the `wrap_*` names are builtins, so a program cannot define functions with those names.
 
 ## Builtins and existing APIs
 
-- **Index and length parameters** of the builtins (`get`, `set`, `bget`, `vec_get`, `alloc`, ...) accept any unsigned integer type, since widening to `u64` is free and always fits. Lengths are still returned as `u64`.
-- `print` accepts any integer type and prints signed values with their sign.
+- **`u64` parameters of the builtins** (indexes, lengths, values: `get`, `set`, `bget`, `vec_get`, `alloc`, `print`, ...) accept any unsigned integer type, since widening to `u64` is free and always fits. Lengths are still returned as `u64`. Functions the program defines get no such exception.
+- `print` will print signed values with their sign (step 2).
 - `Bytes`, `serial_write`, `serial_read` and `frame_read8`/`frame_write8` move to `u8` in step 4 (below). Until then they keep their `u64` signatures and range facts, so nothing breaks.
 
 ## Specifications
 
-Specification expressions keep evaluating over mathematical integers. Every integer value, of any type, is just a number there, so specifications may mix types freely (`ensures cast[u64](result) == n + 48` can be written `ensures result == n + 48`). A bound variable gets its type's range: `forall x: u8 :: ...` ranges over 0 to 255.
+Specification expressions keep evaluating over mathematical integers. Every integer value, of any type, is just a number there, so specifications mix types freely and need no conversions: with `result: u8` and `n: u64`, `ensures result == n + 48` is fine. (`forall` ranges over `u64` only at first; `forall x: u8 :: ...`, ranging over 0 to 255, comes later.)
 
 ## C ABI and layout
 
