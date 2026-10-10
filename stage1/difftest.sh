@@ -227,7 +227,7 @@ done
 # platform's own symbols (boot/ in BastiOS).
 kernel=""
 if [ -f ../bastios/build/user/sh.bin ]; then
-  if "$tmp/asmdump" --kernel ../bastios/src/main.bastio >"$tmp/kernel.s" 2>/dev/null \
+  if "$tmp/asmdump" --lib "$PWD" --kernel ../bastios/src/main.bastio >"$tmp/kernel.s" 2>/dev/null \
      && as --64 -o "$tmp/kernel.o" "$tmp/kernel.s" \
      && ! nm -u "$tmp/kernel.o" | awk '{print $2}' \
           | grep -v -x -e _end -e bst_kernel_pml4 -e bst_cpu_enter -e bst_cpu_wait -e bst_platform_ctx \

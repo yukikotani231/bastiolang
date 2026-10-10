@@ -91,8 +91,8 @@ fn dir_above(dir: &Bytes) -> Bytes {
 /// `Loader::resolve`. A name that starts with `.` or `/` is relative to
 /// the file only. Any other name is looked for next to the file, then in
 /// each directory above it (up to `SEARCH_UP` of them, worked out from
-/// the path as text), then in each `--lib` directory, then in each
-/// directory of BASTIO_LIB; the first that has it wins. When none has
+/// the path as text), then in each `--lib` directory (the drivers add
+/// BASTIO_LIB's after them, libenv.bastio); the first that has it wins. When none has
 /// it, the name next to the file is returned, for the error message.
 fn resolve(host: &Host, ld: &mut Loader, dir: &Bytes, name: &Bytes) -> Bytes {
   let first = join(dir, name);
@@ -132,57 +132,12 @@ fn resolve(host: &Host, ld: &mut Loader, dir: &Bytes, name: &Bytes) -> Bytes {
     }
     k = k + 1;
   }
-  // Then each directory of BASTIO_LIB, `:`-separated.
-  let mut env = balloc(0);
-  if !has && host_env(host, "BASTIO_LIB", &mut env) {
-    let n = blen(env);
-    let mut s = 0;
-    while !has && s < n
-      invariant s <= n + 1 && n == blen(env) && n <= 1152921504606846976
-    {
-      let mut e = s;
-      while e < n && bget(env, e) != 58
-        invariant s <= e && e <= n && n == blen(env)
-      {
-        e = e + 1;
-      }
-      if e > s {
-        let lib = byte_range(env, s, e);
-        let c = join(lib, name);
-        bfree(lib);
-        if readable(host, c) {
-          bfree(found);
-          found = c;
-          has = true;
-        } else {
-          bfree(c);
-        }
-      }
-      s = e + 1;
-    }
-  }
-  bfree(env);
   if has {
     bfree(first);
     return found;
   }
   bfree(found);
   return first;
-}
-
-/// A copy of bytes `s..e` of `b`.
-fn byte_range(b: &Bytes, s: u64, e: u64) -> Bytes
-  requires s <= e && e <= blen(b)
-{
-  let mut out = balloc(e - s);
-  let mut i = 0;
-  while i < e - s
-    invariant i <= e - s && blen(out) == e - s && e <= blen(b)
-  {
-    bset(&mut out, i, bget(b, s + i));
-    i = i + 1;
-  }
-  return out;
 }
 
 /// Records an error, replacing any recorded already.
