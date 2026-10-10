@@ -23,7 +23,9 @@
 //
 // Linear objects carry ghost state that exists only in the proof:
 //   Frame      id (its physical page number, < POOLSIZE <= FRAME_LIMIT)
-//   PageTable  id, level, used[i] (which of its 512 slots own something)
+//   PageTable  id, level, used[i] (which of its 512 slots own something),
+//              leases (how many processors may be running on its tree:
+//              while it is not 0 the tree only grows, see `mmu_enter`)
 //   Pool       has[i] (the page numbers it can still hand out), size
 //   Mmu        root (the id of the table in CR3; KROOT for the kernel's own)
 //   Ports      free[p] (the I/O ports nobody has claimed yet)
@@ -287,7 +289,7 @@ impl Val {
 fn ghost_fields(t: &Type) -> &'static [(&'static str, bool, &'static str)] {
     match t {
         Type::Frame => &[("id", false, "frame_id")],
-        Type::PageTable => &[("id", false, "pt_id"), ("level", false, "pt_level"), ("used", true, "")],
+        Type::PageTable => &[("id", false, "pt_id"), ("level", false, "pt_level"), ("used", true, ""), ("leases", false, "pt_leases")],
         Type::Pool => &[("has", true, ""), ("size", false, "pool_size")],
         Type::Mmu => &[("root", false, "mmu_root")],
         Type::Ports => &[("free", true, "")],
@@ -302,12 +304,12 @@ fn ghost_fields(t: &Type) -> &'static [(&'static str, bool, &'static str)] {
 /// Ghost fields a loop keeps when the object is changed only by builtins
 /// that never change them (a page table keeps its id and level).
 fn kept_by_builtins(t: &Type, field: &str) -> bool {
-    matches!((t, field), (Type::Frame, "id") | (Type::PageTable, "id") | (Type::PageTable, "level") | (Type::Pool, "size") | (Type::PortIo, "base") | (Type::PortIo, "count") | (Type::Mmio, "base") | (Type::Mmio, "len") | (Type::Dma, "id"))
+    matches!((t, field), (Type::Frame, "id") | (Type::PageTable, "id") | (Type::PageTable, "level") | (Type::PageTable, "leases") | (Type::Pool, "size") | (Type::PortIo, "base") | (Type::PortIo, "count") | (Type::Mmio, "base") | (Type::Mmio, "len") | (Type::Dma, "id"))
 }
 
 /// Builtins whose `&mut` argument keeps the fields above.
 const SHAPE_KEEPING: &[&str] =
-    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pool_take", "pool_give", "frame_write", "frame_write8", "cpu_set", "cpu_run", "cpu_idle", "cpu_fpu_save", "cpu_fpu_load",
+    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pt_borrow", "pt_borrow_frame", "pt_lease_count", "pool_take", "pool_give", "frame_write", "frame_write8", "cpu_set", "cpu_run", "cpu_idle", "cpu_fpu_save", "cpu_fpu_load",
       "pio_in8", "pio_in16", "pio_in32", "pio_out8", "pio_out16", "pio_out32",
       "mmio_read8", "mmio_read16", "mmio_read32", "mmio_read64", "mmio_write8", "mmio_write16", "mmio_write32", "mmio_write64",
       "dma_read8", "dma_read16", "dma_read32", "dma_read64", "dma_write8", "dma_write16", "dma_write32", "dma_write64"];
@@ -711,6 +713,7 @@ impl<'p> Verifier<'p> {
                 Ok(n)
             }
             (Type::PageTable, "level") => self.fresh_int(&h, "1", "5"),
+            (Type::PageTable, "leases") => self.fresh_int(&h, "0", U64_MAX),
             (Type::Pool, "size") => Ok(POOLSIZE.to_string()),
             (Type::Mmu, "root") => self.fresh_int(&h, "0", KROOT),
             _ => unreachable!("unknown ghost field"),
@@ -730,6 +733,9 @@ impl<'p> Verifier<'p> {
                 Ok(Val::Buf { len: self.fresh_len(hint)?, data })
             }
             Type::Str => Ok(Val::Str { len: self.fresh_len(hint)?, data: self.fresh_array(hint, "Int")? }),
+            // A borrowed table may be one `pt_borrow` lent, with its tree's
+            // leases at any level.
+            Type::Ref(t) | Type::MutRef(t) if **t == Type::PageTable => self.fresh_table(hint),
             Type::Ref(t) | Type::MutRef(t) => {
                 let t = (**t).clone();
                 self.fresh_of(&t, hint)
@@ -778,9 +784,24 @@ impl<'p> Verifier<'p> {
                 if *t == Type::Mmio {
                     self.smt(&format!("(assert (<= (+ {} {}) {}))", fs[0], fs[1], MMIO_HI))?;
                 }
+                // An owned table below the top is never live: it was taken
+                // out of a tree no processor ran on, or never in one (only
+                // `pt_borrow` lends a live one, and only as `&mut`).
+                if *t == Type::PageTable {
+                    self.smt(&format!("(assert (=> (< {} 4) (= {} 0)))", fs[1], fs[3]))?;
+                }
                 Ok(Val::Obj(t.clone(), fs))
             }
         }
+    }
+
+    /// A fresh table that may be live at any level (a borrowed one).
+    fn fresh_table(&mut self, hint: &str) -> Result<Val, Diag> {
+        let mut fs = Vec::new();
+        for (f, _, _) in ghost_fields(&Type::PageTable) {
+            fs.push(self.fresh_field(&Type::PageTable, f, hint)?);
+        }
+        Ok(Val::Obj(Type::PageTable, fs))
     }
 
     /// Fresh contents for a vector of `ty`: every term of an element becomes
@@ -1444,6 +1465,9 @@ impl<'p> Verifier<'p> {
         if name == "smp_run" {
             return self.smp_run(args, pos, st);
         }
+        if name == "pt_borrow" || name == "pt_borrow_frame" {
+            return self.pt_borrow(name, args, pos, st);
+        }
         for a in args {
             if let Some(p) = match &a.kind {
                 ExprKind::MutBorrow(n) => Some(n.clone()),
@@ -1490,7 +1514,7 @@ impl<'p> Verifier<'p> {
         let res = self.fresh_of(&f.ret, &format!("{}_ret", name))?;
         let mut post = pre.clone();
         for (i, (p, a)) in f.params.iter().zip(args).enumerate() {
-            if let (Type::MutRef(t), ExprKind::MutBorrow(var)) = (&p.ty, &a.kind) {
+            if let (Type::MutRef(_), ExprKind::MutBorrow(var)) = (&p.ty, &a.kind) {
                 let sum = self.sums[name][i].clone().expect("a &mut parameter has a summary");
                 if sum[0] == (String::new(), true) {
                     // The callee keeps the argument's shape: havoc only what
@@ -1503,7 +1527,7 @@ impl<'p> Verifier<'p> {
                         set_path(&mut st.env, &path, nv);
                     }
                 } else {
-                    let nv = self.fresh_of(t, &var.replace('.', "_"))?;
+                    let nv = self.fresh_of(&p.ty, &var.replace('.', "_"))?;
                     set_path(&mut st.env, var, nv);
                 }
                 post.insert(p.name.clone(), get_path(&st.env, var));
@@ -1573,6 +1597,51 @@ impl<'p> Verifier<'p> {
         for (what, i) in self.invariants_of(&after)? {
             self.prove(st, &i, pos, "E-VERIFY-LOCKINV", format!("that `{}` keeps the invariant {} before the lock `{}` is released", f, what, lp))?;
         }
+        Ok(res)
+    }
+
+    /// `pt_borrow(&mut t, i, f, args..)`: `f` gets the table in slot `i` of
+    /// `t` (`pt_borrow_frame`: the page) as its `&mut` first argument, left
+    /// in place. Nothing is known about what is under it, except that it is
+    /// as live as `t`: it has `t`'s leases, so `f` cannot take anything out
+    /// of it while a processor may be running on the tree. `f` must hand
+    /// back the same table (id, level and leases unchanged) or page.
+    fn pt_borrow(&mut self, name: &str, args: &[Expr], pos: Pos, st: &mut State) -> Result<Val, Diag> {
+        let ra = |i: usize| render(&args[i]).trim_start_matches("&mut ").to_string();
+        let ExprKind::MutBorrow(tp) = &args[0].kind else { unreachable!("checked: a &mut argument") };
+        self.open_path(&mut st.env, tp)?;
+        let t = get_path(&st.env, tp);
+        let i = self.eval(&args[1], st)?.term().to_string();
+        let ExprKind::Var(f) = &args[2].kind else { unreachable!("checked: a function name") };
+        let (lvl, used) = (t.field("level"), t.field("used"));
+        self.need(st, format!("(< {} 512)", i), pos, "E-VERIFY-BOUNDS", format!("that the index `{}` is within a page table (512 slots) (`{} < 512`)", ra(1), ra(1)))?;
+        let child = if name == "pt_borrow" {
+            self.need(st, format!("(>= {} 2)", lvl), pos, "E-VERIFY-PT", format!("that `{}` is not a last-level table: its slots hold tables, not pages", ra(0)))?;
+            self.need(st, format!("(=> (= {} 4) (and (<= 1 {i}) (< {i} 256)))", lvl), pos, "E-VERIFY-PT",
+                format!("that slot `{}` of a top-level table is a user slot (1 to 255; slot 0 maps the kernel)", ra(1)))?;
+            let mut c = self.fresh_of(&Type::PageTable, "pt_borrow")?;
+            if let Val::Obj(_, fs) = &mut c {
+                fs[1] = format!("(- {} 1)", lvl);
+                fs[3] = t.field("leases");
+            }
+            c
+        } else {
+            self.need(st, format!("(= {} 1)", lvl), pos, "E-VERIFY-PT", format!("that `{}` is a last-level table (level 1), which maps pages", ra(0)))?;
+            self.fresh_of(&Type::Frame, "pt_borrow_frame")?
+        };
+        self.need(st, format!("(select {} {})", used, i), pos, "E-VERIFY-OWN", format!("that slot `{}` of `{}` holds something (`pt_used({}, {})`)", ra(1), ra(0), ra(0), ra(1)))?;
+        self.counter += 1;
+        let key = format!("borrowed*{}", self.counter);
+        st.env.insert(key.clone(), child.clone());
+        let mut cargs = vec![Expr { kind: ExprKind::MutBorrow(key.clone()), pos: args[0].pos }];
+        cargs.extend(args[3..].iter().cloned());
+        let res = self.call(f, &cargs, pos, st)?;
+        let after = st.env.remove(&key).expect("still there");
+        let same = match &child {
+            Val::Obj(Type::PageTable, _) => format!("(and (= {} {}) (= {} {}) (= {} {}))", after.field("id"), child.field("id"), after.field("level"), child.field("level"), after.field("leases"), child.field("leases")),
+            _ => format!("(= {} {})", after.field("id"), child.field("id")),
+        };
+        self.need(st, same, pos, "E-VERIFY-OWN", format!("that `{}` hands back what `{}` lent it, unchanged but for its contents", f, name))?;
         Ok(res)
     }
 
@@ -1877,7 +1946,7 @@ impl<'p> Verifier<'p> {
             "pt_new" => {
                 let (f, lvl) = (&vals[0], vals[1].term());
                 self.need(st, format!("(and (<= 1 {l}) (<= {l} 5))", l = lvl), pos, "E-VERIFY-PT", format!("that the level `{}` is between 1 and 5", ra(1)))?;
-                Ok(Val::Obj(Type::PageTable, vec![f.field("id"), lvl.to_string(), NO_BOOL.into()]))
+                Ok(Val::Obj(Type::PageTable, vec![f.field("id"), lvl.to_string(), NO_BOOL.into(), "0".into()]))
             }
             "pt_free" | "pt_free_root" => {
                 let k = if name == "pt_free" { 0 } else { 1 };
@@ -1893,6 +1962,8 @@ impl<'p> Verifier<'p> {
                         format!("that `{}` is empty: freeing a table that still owns pages would lose them", ra(k)))?;
                     self.need(st, format!("(not (= {} {}))", t.field("id"), vals[0].field("root")), pos, "E-VERIFY-MMU",
                         format!("that `{}` is not the address space the MMU is using (`pt_id({}) != mmu_root({})`)", ra(k), ra(k), ra(0)))?;
+                    self.need(st, format!("(= {} 0)", t.field("leases")), pos, "E-VERIFY-LEASE",
+                        format!("that no processor holds a lease on `{}` (`pt_leases({}) == 0`): one may be running on it", ra(k), ra(k)))?;
                 }
                 Ok(Val::Obj(Type::Frame, vec![t.field("id")]))
             }
@@ -1937,14 +2008,20 @@ impl<'p> Verifier<'p> {
                     }
                 } else {
                     self.need(st, format!("(select {} {})", used, i), pos, "E-VERIFY-OWN", format!("that slot `{}` of `{}` holds something (`pt_used({}, {})`)", ra(1), ra(0), ra(0), ra(1)))?;
+                    // Taking unmaps: another processor running on the tree
+                    // could still reach what is taken, through its TLB or a
+                    // walk under way. Putting only adds.
+                    self.need(st, format!("(= {} 0)", t.field("leases")), pos, "E-VERIFY-LEASE",
+                        format!("that no processor may be running on `{}` (`pt_leases({}) == 0`): taking would unmap under it", ra(0), ra(0)))?;
                 }
-                let nt = Val::Obj(Type::PageTable, vec![t.field("id"), lvl.clone(), format!("(store {} {} {})", used, i, putting)]);
+                let nt = Val::Obj(Type::PageTable, vec![t.field("id"), lvl.clone(), format!("(store {} {} {})", used, i, putting), t.field("leases")]);
                 self.put_back(&args[0], nt, st);
                 match name {
                     "pt_take" => {
                         let mut c = self.fresh_of(&Type::PageTable, "pt_take")?;
                         if let Val::Obj(_, fs) = &mut c {
                             fs[1] = format!("(- {} 1)", lvl);
+                            fs[3] = "0".into();
                         }
                         Ok(c)
                     }
@@ -2076,6 +2153,35 @@ impl<'p> Verifier<'p> {
             "mmu_kernel" => {
                 self.put_back(&args[0], Val::Obj(Type::Mmu, vec![KROOT.into()]), st);
                 Ok(Val::Unit)
+            }
+            // A lease counts this processor among those that may be running
+            // on the table, so nothing is taken out of its tree until the
+            // lease is given back.
+            "mmu_enter" => {
+                let t = &vals[1];
+                self.need(st, format!("(= {} 4)", t.field("level")), pos, "E-VERIFY-PT", format!("that `{}` is a top-level table (level 4)", ra(1)))?;
+                self.need(st, format!("(= {} {})", vals[0].field("root"), KROOT), pos, "E-VERIFY-MMU",
+                    format!("that `{}` has the kernel's own tables loaded (`mmu_root({}) == {}`), not another lease's", ra(0), ra(0), KROOT))?;
+                let id = t.field("id");
+                self.put_back(&args[0], Val::Obj(Type::Mmu, vec![id.clone()]), st);
+                self.put_back(&args[1], Val::Obj(Type::PageTable, vec![id.clone(), t.field("level"), t.field("used"), format!("(+ {} 1)", t.field("leases"))]), st);
+                Ok(Val::Obj(Type::Lease, vec![]))
+            }
+            // Loads the kernel's tables and gives the lease back. No table's
+            // count in the proof drops (none is named): they only ever
+            // overcount, which is safe. `pt_lease_count` reads the true one.
+            "mmu_exit" => {
+                self.put_back(&args[0], Val::Obj(Type::Mmu, vec![KROOT.into()]), st);
+                Ok(Val::Unit)
+            }
+            // The number of leases outstanding on the table, which only its
+            // holder (this `&mut`) could raise: from here on that is what the
+            // proof knows.
+            "pt_lease_count" => {
+                let t = &vals[0];
+                let n = self.fresh_u64("pt_lease_count")?;
+                self.put_back(&args[0], Val::Obj(Type::PageTable, vec![t.field("id"), t.field("level"), t.field("used"), n.term().to_string()]), st);
+                Ok(n)
             }
             // The page's contents are not tracked, so neither changes anything
             // the proof knows about.
@@ -2261,6 +2367,7 @@ impl<'p> Verifier<'p> {
                     },
                     "frame_id" | "pt_id" | "dma_id" => v.field("id"),
                     "pt_level" => v.field("level"),
+                    "pt_leases" => v.field("leases"),
                     "pool_size" => v.field("size"),
                     "mmu_root" => v.field("root"),
                     "port_base" => v.field("base"),
@@ -2327,9 +2434,15 @@ fn changed_in_expr(e: &Expr, out: &mut HashMap<String, bool>, sums: &Summaries) 
         ExprKind::Call(f, args) => {
             // `locked(l, f, ..)` and `smp_run(f, ..)` lend their trailing
             // arguments to `f`: shift them onto its parameters.
-            let (f, skip, shift) = match (f.as_str(), args.get(1), args.first()) {
-                ("locked", Some(Expr { kind: ExprKind::Var(g), .. }), _) => (g, 2, 1),
-                ("smp_run", _, Some(Expr { kind: ExprKind::Var(g), .. })) => (g, 1, 1),
+            // `pt_borrow(t, i, f, ..)` keeps `t` and lends the rest to `f`.
+            let (f, skip, shift) = match (f.as_str(), args.get(1), args.first(), args.get(2)) {
+                ("locked", Some(Expr { kind: ExprKind::Var(g), .. }), _, _) => (g, 2, 1),
+                ("smp_run", _, Some(Expr { kind: ExprKind::Var(g), .. }), _) => (g, 1, 1),
+                ("pt_borrow" | "pt_borrow_frame", _, Some(Expr { kind: ExprKind::MutBorrow(t), .. }), Some(Expr { kind: ExprKind::Var(g), .. })) => {
+                    note(out, t.clone(), true);
+                    changed_in_expr(&args[1], out, sums);
+                    (g, 3, 2)
+                }
                 _ => (f, 0, 0),
             };
             for (i, a) in args.iter().enumerate().skip(skip) {

@@ -1,0 +1,22 @@
+// expect-error: E-VERIFY-LEASE
+// target: kernel
+// Giving a lease back does not tell the proof which table it was for (the
+// lease may have come from another processor's turn on the same table), so
+// a table stays counted until `pt_lease_count` reads its true count. The
+// first branch verifies; the second, which never asked, does not.
+fn main(pool: &mut Pool, mmu: &mut Mmu) {
+  if pool_size(pool) > 1 {
+    let mut a = pt_new(pool_take(&mut pool, 0), 4);
+    let la = mmu_enter(&mut mmu, &mut a);
+    mmu_exit(&mut mmu, la);
+    if pt_lease_count(&mut a) == 0 {
+      pool_give(&mut pool, pt_free_root(mmu, a));
+    } else {
+      pool_give(&mut pool, pt_free_root(mmu, a));
+    }
+    let mut b = pt_new(pool_take(&mut pool, 1), 4);
+    let lb = mmu_enter(&mut mmu, &mut b);
+    mmu_exit(&mut mmu, lb);
+    pool_give(&mut pool, pt_free_root(mmu, b));
+  }
+}

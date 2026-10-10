@@ -177,6 +177,7 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   let msp = prim(&mut m, p, TY_MMIOSPACE);
   let mio = prim(&mut m, p, TY_MMIO);
   let dma = prim(&mut m, p, TY_DMA);
+  let lse = prim(&mut m, p, TY_LEASE);
   let u8t = prim(&mut m, p, TY_U8);
   let u16t = prim(&mut m, p, TY_U16);
   let u32t = prim(&mut m, p, TY_U32);
@@ -252,7 +253,10 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   bsig(&mut c, "pt_take", AV_MEM, 2, mptb, u, 0, 0, ptb);
   bsig(&mut c, "pt_put_frame", AV_MEM, 4, mptb, u, frm, b, un);
   bsig(&mut c, "pt_take_frame", AV_MEM, 2, mptb, u, 0, 0, frm);
+  bsig(&mut c, "pt_lease_count", AV_MEM, 1, mptb, 0, 0, 0, u);
   bsig(&mut c, "mmu_switch", AV_KERNEL, 2, mmmu, rptb, 0, 0, un);
+  bsig(&mut c, "mmu_enter", AV_KERNEL, 2, mmmu, mptb, 0, 0, lse);
+  bsig(&mut c, "mmu_exit", AV_KERNEL, 2, mmmu, lse, 0, 0, un);
   bsig(&mut c, "mmu_kernel", AV_KERNEL, 1, mmmu, 0, 0, 0, un);
   bsig(&mut c, "cpu_run", AV_KERNEL, 2, mcpu, rmmu, 0, 0, u);
   bsig(&mut c, "cpu_idle", AV_KERNEL, 1, mcpu, 0, 0, 0, u);
@@ -311,6 +315,7 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   ghost(&mut c, "pt_id", ptb, false, u);
   ghost(&mut c, "pt_level", ptb, false, u);
   ghost(&mut c, "pt_used", ptb, true, b);
+  ghost(&mut c, "pt_leases", ptb, false, u);
   ghost(&mut c, "pool_has", pol, true, b);
   ghost(&mut c, "pool_size", pol, false, u);
   ghost(&mut c, "mmu_root", mmu, false, u);
@@ -541,7 +546,7 @@ fn def_node(m: &Mono, p: &Parser, x: u64) -> Node {
 /// Is a value of type `t` linear (must it be consumed exactly once)?
 fn ck_linear(c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
   let k = kind_t(m, t);
-  if (k >= TY_BUF && k <= TY_DMA) || k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_ATOMIC {
+  if (k >= TY_BUF && k <= TY_DMA) || k == TY_LEASE || k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_ATOMIC {
     return true;
   }
   if k == TY_STRUCT || k == TY_ENUM {
@@ -560,11 +565,11 @@ fn ck_linear(c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
   return false;
 }
 
-/// Is a value of type `t` pinned: does it hold a `Cpu` or `Mmu`, which
-/// describe the processor that holds them and may never reach another one?
+/// Is a value of type `t` pinned: does it hold a `Cpu`, `Mmu` or `Lease`,
+/// which describe the processor that holds them and may never reach another one?
 fn is_pinned(c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
   let k = kind_t(m, t);
-  if k == TY_MMU || k == TY_CPU {
+  if k == TY_MMU || k == TY_CPU || k == TY_LEASE {
     return true;
   }
   if k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_ATOMIC || k == TY_REF || k == TY_MUTREF {
@@ -712,6 +717,7 @@ fn tyn_to(out: &mut Vec[u64], m: &Mono, p: &Parser, t: u64) {
   else if k == TY_MMIOSPACE { tyn_s(&mut out, "MmioSpace"); }
   else if k == TY_MMIO { tyn_s(&mut out, "Mmio"); }
   else if k == TY_DMA { tyn_s(&mut out, "Dma"); }
+  else if k == TY_LEASE { tyn_s(&mut out, "Lease"); }
   else if k == TY_STRUCT || k == TY_ENUM { tyn_inst_to(&mut out, m, p, x.a); }
   else if k == TY_UNKNOWN { tyn_name(&mut out, p, x.a); }
   else if k == TY_BOX { tyn_s(&mut out, "Box["); tyn_to(&mut out, m, p, x.a); tyn_s(&mut out, "]"); }
@@ -1048,9 +1054,15 @@ fn is_atomic_builtin(p: &Parser, s: u64, e: u64) -> bool {
     || span_is(p, s, e, "atomic_wrap_add");
 }
 
+/// The builtins that lend a page table's child in place to a function they
+/// name, like `locked`.
+fn is_pt_borrow_builtin(p: &Parser, s: u64, e: u64) -> bool {
+  return span_is(p, s, e, "pt_borrow") || span_is(p, s, e, "pt_borrow_frame");
+}
+
 fn is_builtin_name(c: &Checker, p: &Parser, s: u64, e: u64) -> bool {
   return span_is(p, s, e, "box") || span_is(p, s, e, "unbox") || span_is(p, s, e, "cast") || span_is(p, s, e, "wrap")
-    || span_is(p, s, e, "smp_run") || is_lock_builtin(p, s, e) || is_atomic_builtin(p, s, e)
+    || span_is(p, s, e, "smp_run") || is_pt_borrow_builtin(p, s, e) || is_lock_builtin(p, s, e) || is_atomic_builtin(p, s, e)
     || is_vec_builtin(p, s, e) || is_wrap_builtin(p, s, e) || bs_index(c, p, s, e) != 0;
 }
 
@@ -1587,7 +1599,7 @@ fn is_reserved_type(p: &Parser, s: u64, e: u64) -> bool {
     || span_is(p, s, e, "PageTable") || span_is(p, s, e, "Pool") || span_is(p, s, e, "Mmu")
     || span_is(p, s, e, "Cpu") || span_is(p, s, e, "Ports") || span_is(p, s, e, "PortIo")
     || span_is(p, s, e, "MmioSpace") || span_is(p, s, e, "Mmio") || span_is(p, s, e, "Dma")
-    || span_is(p, s, e, "Lock") || span_is(p, s, e, "Atomic");
+    || span_is(p, s, e, "Lease") || span_is(p, s, e, "Lock") || span_is(p, s, e, "Atomic");
 }
 
 /// Struct and enum instances: no reserved names, known field and payload
@@ -3486,6 +3498,9 @@ fn ck_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
   if span_is(p, s, e, "smp_run") {
     return smp_run_call(&mut c, &mut m, p, i);
   }
+  if is_pt_borrow_builtin(p, s, e) {
+    return pt_borrow_call(&mut c, &mut m, p, i);
+  }
   let d = plain_fn(p, s, e);
   if d == 0 {
     if cm_new(&mut c, p, i, C_TYPE) {
@@ -3735,6 +3750,80 @@ fn cm_not_word(c: &mut Checker, m: &Mono, p: &Parser, loc: u64, t: u64) {
     cm_ty(&mut c, m, p, t);
     cm_note(&mut c, "an Atomic holds one word: an integer, a bool, or a struct with a single field of one of those");
   }
+}
+
+/// `pt_borrow(&mut t, i, f, args..)`: calls `f(&mut child, args..)` with
+/// the table in slot `i` of `t` left in place (`pt_borrow_frame`: the page
+/// in slot `i` of a level-1 table), so processors running on the tree keep
+/// seeing it. The verifier checks that `f` hands it back.
+fn pt_borrow_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
+  if c.target == TARGET_USER {
+    if cm_new(&mut c, p, i, C_TARGET) {
+      cm_s(&mut c, "`");
+      cm_name(&mut c, p, i);
+      cm_s(&mut c, "` is not available on this target");
+    }
+    return 0;
+  }
+  let n = node_at(p.nodes, i);
+  let a0 = n.a;
+  let mut a1 = 0;
+  let mut a2 = 0;
+  if a0 != 0 {
+    a1 = next_of(p, a0);
+  }
+  if a1 != 0 {
+    a2 = next_of(p, a1);
+  }
+  let x = named_fn(&mut c, &mut m, p, i, a2);
+  if c.failed {
+    return 0;
+  }
+  let xi = inst_at(m, x);
+  let fps = fn_params(&mut m, p, xi.def, x);
+  let dn = node_at(p.nodes, xi.def);
+  let r = conv(&mut m, p, dn.b, x, xi.def);
+  let mut child = prim(&mut m, p, TY_FRAME);
+  if name_is(p, i, "pt_borrow") {
+    child = prim(&mut m, p, TY_PT);
+  }
+  if vec_len(fps) == 0 || u_at(fps, 0) != mut_to(&mut m, p, child) {
+    vec_free(fps);
+    if cm_new(&mut c, p, a2, C_TYPE) {
+      cm_s(&mut c, "`");
+      cm_inst(&mut c, m, p, x);
+      cm_s(&mut c, "` must take `&mut ");
+      cm_ty(&mut c, m, p, child);
+      cm_s(&mut c, "` first, to receive what `");
+      cm_name(&mut c, p, i);
+      cm_s(&mut c, "` lends");
+    }
+    return 0;
+  }
+  note_call(&mut c, x);
+  // `f`'s signature with the table and the slot in place of the child.
+  let ptb = prim(&mut m, p, TY_PT);
+  let mut ps = vec_new[u64]();
+  vec_push(&mut ps, mut_to(&mut m, p, ptb));
+  vec_push(&mut ps, c.tu64);
+  let mut j = 1;
+  while j < vec_len(fps) {
+    vec_push(&mut ps, vec_get(fps, j));
+    j = j + 1;
+  }
+  vec_free(fps);
+  let mut args = vec_new[u64]();
+  vec_push(&mut args, a0);
+  vec_push(&mut args, a1);
+  let mut a = next_of(p, a2);
+  while a != 0 {
+    vec_push(&mut args, a);
+    a = next_of(p, a);
+  }
+  let t = call_with_v(&mut c, &mut m, p, ps, r, args, i, x);
+  vec_free(ps);
+  vec_free(args);
+  return t;
 }
 
 /// `smp_run(f, args..)`: runs `f` on every processor at once and returns
