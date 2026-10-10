@@ -5239,6 +5239,8 @@ fn verify_fn(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
   let xi = inst_at(m, x);
   let d = node_at(p.nodes, xi.def);
   v.env = x;
+  // Names restart with each function, as in stage0.
+  v.counter = 0;
   v.counts = has_u(v.cnt_fns, xi.def);
   if v.counts {
     count_lemmas(&mut v);
@@ -5354,15 +5356,25 @@ fn verify_program(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
   summarize(&mut v, c, &mut m, p);
   count_gate(m, p, "vcount", &mut v.cnt_fns);
   count_gate(m, p, "bdec", &mut v.dec_fns);
-  send(&mut v, CMD_DECL, v.t_poolsize, SO_INT);
-  let r = in_range(&mut v, v.t_zero, v.t_poolsize, v.t_flimit);
-  assert_tm(&mut v, r);
   // Each function gets its own solver scope: what is declared and assumed
   // while verifying one (some of it quantified) must not burden the queries
-  // for all later ones.
+  // for all later ones. And every function after the first starts on a
+  // reset solver, so that what Z3 answers near its work limit does not
+  // depend on which functions shared its solver (stage0's verify_worker).
+  let r0 = atom_str(&mut v, "(reset)");
+  let r1 = atom_str(&mut v, "(set-option :produce-models true)");
+  let r2 = atom_str(&mut v, "(set-option :rlimit 40000000)");
   let mut k = 0;
   while k < vec_len(m.fns) {
     let x = u_at(m.fns, k);
+    if k > 0 {
+      send(&mut v, CMD_RAW, r0, 0);
+      send(&mut v, CMD_RAW, r1, 0);
+      send(&mut v, CMD_RAW, r2, 0);
+    }
+    send(&mut v, CMD_DECL, v.t_poolsize, SO_INT);
+    let r = in_range(&mut v, v.t_zero, v.t_poolsize, v.t_flimit);
+    assert_tm(&mut v, r);
     if exported_x(m, p, x) {
       buffers_kept(&mut v, &mut m, p, x);
     }

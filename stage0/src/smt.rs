@@ -44,9 +44,20 @@ impl Solver {
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let mut s = Solver { child, stdin, stdout, log: Vec::new() };
-        s.send("(set-option :produce-models true)")?;
-        s.send(&format!("(set-option :rlimit {})", RLIMIT))?;
+        s.options()?;
         Ok(s)
+    }
+
+    fn options(&mut self) -> Result<(), String> {
+        self.send("(set-option :produce-models true)")?;
+        self.send(&format!("(set-option :rlimit {})", RLIMIT))
+    }
+
+    /// Back to the state `start` leaves the solver in: no declarations, no
+    /// assertions, the same options.
+    pub fn reset(&mut self) -> Result<(), String> {
+        self.send("(reset)")?;
+        self.options()
     }
 
     pub fn send(&mut self, cmd: &str) -> Result<(), String> {

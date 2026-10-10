@@ -662,13 +662,23 @@ fn verify_worker(p: &Program, sums: &Summaries, counting: &HashSet<String>, deci
     };
     let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, int_ops: HashMap::new(), sums, counting, decimal, counts: false };
     let mut run = || -> Result<(), (usize, Diag)> {
-        v.smt(&format!("(declare-const {} Int)", POOLSIZE)).map_err(|d| (0, d))?;
-        v.smt(&format!("(assert (and (<= 0 {p}) (<= {p} {})))", FRAME_LIMIT, p = POOLSIZE)).map_err(|d| (0, d))?;
+        // Every function is verified on a solver in the same state, fresh
+        // or reset: what Z3 answers near its work limit depends on what it
+        // was asked before, so otherwise a proof could succeed or fail with
+        // the functions that happened to share its solver (BASTIO_JOBS, and
+        // the timing of the other workers).
+        let mut fresh = true;
         loop {
             let i = next.fetch_add(1, Ordering::SeqCst);
             if i >= p.fns.len() || i > failed.load(Ordering::SeqCst) {
                 return Ok(());
             }
+            if !fresh {
+                v.solver.reset().map_err(|e| (i, Diag::new("E-SOLVER", Pos::default(), e)))?;
+            }
+            fresh = false;
+            v.smt(&format!("(declare-const {} Int)", POOLSIZE)).map_err(|d| (i, d))?;
+            v.smt(&format!("(assert (and (<= 0 {p}) (<= {p} {})))", FRAME_LIMIT, p = POOLSIZE)).map_err(|d| (i, d))?;
             let f = &p.fns[i];
             let t0 = std::time::Instant::now();
             let kept = if f.export { buffers_kept(f, sums) } else { Ok(()) };
@@ -946,6 +956,9 @@ impl<'p> Verifier<'p> {
     }
 
     fn verify_fn(&mut self, f: &FnDef) -> Result<(), Diag> {
+        // Names restart with each function, so its queries are the same
+        // whichever functions were verified before it on this solver.
+        self.counter = 0;
         self.int_ops = f.int_ops.clone();
         self.counts = self.counting.contains(&f.name);
         if self.counts {

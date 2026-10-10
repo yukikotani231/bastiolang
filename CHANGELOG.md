@@ -60,6 +60,19 @@ What will be 0.2.0.
   an unknown variable or function (#87).
 - Z3 runs with a fixed work limit per query (`:rlimit`) instead of a 10 s
   timeout, so a proof no longer fails on a busy machine (#89).
+- Each function is verified on a reset solver, with names numbered from
+  scratch, so whether a proof near the work limit succeeds no longer
+  depends on which functions shared its solver: the same program could be
+  accepted with one `BASTIO_JOBS` and rejected with another. Found by the
+  fuzzer below.
+- `tests/fuzz.py`: random programs whose meaning the fuzzer computes
+  itself (a proof that holds while some input overflows, divides by zero,
+  shifts too far, indexes out of bounds or breaks an `assert` or `ensures`
+  is a false proof; proved programs are also run, through both backends,
+  against that meaning), and damaged copies of the tests (no compiler may
+  crash or hang; one that is still accepted runs under ASan and UBSan).
+  bastioc1 must agree with bastioc0 on every input. CI runs a short
+  deterministic run.
 - A change to `stage0/src` needs its stage1 mirror, or a `Stage0-only:`
   reason in a commit message; CI checks this on every pull request (#78).
 
