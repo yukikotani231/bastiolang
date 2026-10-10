@@ -115,7 +115,7 @@ Started early, alongside v1, because the kernel is the primary target and it sha
 - [x] `==` on structs and enums in specifications, and a generic `HashMap[V]` for any copyable `V` (2026-10-10)
 - [x] The value of a digit string (2026-10-10): `bdec(b, from, to)` in specifications, so every `parse_*` is proved to return its digits' value (`bhex` for hex)
 - [x] An O(n log n) sort with the same proof, and a sort with a key (2026-10-10): `merge_sort_u64`, and `sort_by_key_u64`, which sorts indices by a key vector
-- [ ] A map from byte-string keys
+- [x] A map from byte-string keys (2026-10-10): `BytesMap[V]` in `core/bytesmap.bastio`, keys copied into one arena, a returned slot proved to hold exactly the bytes asked for
 
 ## C boundary
 

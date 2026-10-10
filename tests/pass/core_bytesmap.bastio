@@ -1,0 +1,65 @@
+// expect-exit: 0
+// core/bytesmap.bastio: a map from byte strings. A lookup that answers is
+// proved to have matched the key's bytes exactly, and every slot's key is
+// proved to lie inside the map's arena, so walking the map copies keys out
+// with no checks.
+import "core/bytesmap.bastio";
+
+fn key2(a: u8, b: u8) -> Bytes {
+  let mut k = balloc(2);
+  bset(&mut k, 0, a);
+  bset(&mut k, 1, b);
+  return k;
+}
+
+fn main() -> u64 {
+  let mut m = bmap_new[u64]();
+  let mut i = 0;
+  while i < 300
+    invariant bmap_ok[u64](m) && i <= 300
+  {
+    let k = key2(cast[u8](65 + i / 26), cast[u8](97 + i % 26));
+    bmap_insert[u64](&mut m, k, i);
+    bfree(k);
+    i = i + 1;
+  }
+  let ab = key2(65, 98);
+  let mut ok = bmap_get_or[u64](m, ab, 999) == 1 && bmap_len[u64](m) == 300;
+  // Replacing a value keeps the count; the proof says the map holds it.
+  bmap_insert[u64](&mut m, ab, 7);
+  assert bmap_maps[u64](m, ab, 7);
+  ok = ok && bmap_get_or[u64](m, ab, 999) == 7 && bmap_len[u64](m) == 300;
+  bmap_remove[u64](&mut m, ab);
+  ok = ok && !bmap_contains[u64](m, ab) && bmap_len[u64](m) == 299;
+  // A key of another length, and the empty key.
+  let mut abc = balloc(3);
+  bset(&mut abc, 0, 65);
+  bset(&mut abc, 1, 98);
+  bset(&mut abc, 2, 99);
+  ok = ok && !bmap_contains[u64](m, abc);
+  let e = balloc(0);
+  bmap_insert[u64](&mut m, e, 5);
+  ok = ok && bmap_get_or[u64](m, e, 0) == 5;
+  // Walk the slots: each key copied out is the bytes that slot holds.
+  let mut total = 0;
+  let mut s = 0;
+  while s < vec_len(m.tags)
+    invariant bmap_ok[u64](m) && total <= s
+  {
+    if vec_get(m.tags, s) == 2 {
+      let k = bmap_key[u64](m, s);
+      if blen(k) == 2 {
+        total = total + 1;
+      }
+      bfree(k);
+    }
+    s = s + 1;
+  }
+  ok = ok && total == 299;
+  bfree(ab);
+  bfree(abc);
+  bfree(e);
+  bmap_free[u64](m);
+  if ok { return 0; }
+  return 1;
+}

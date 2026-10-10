@@ -18,7 +18,7 @@ import "core/num.bastio";
 
 An import that does not start with `.` or `/` is looked for next to the importing file, then in each directory above it, then in each `--lib DIR` given to the compiler and each directory of `BASTIO_LIB` (see [Programs and files](language.md#programs-and-files)). Inside this repository the walk up finds `core/`; a program elsewhere, such as BastiOS, passes `--lib path/to/bastiolang`.
 
-All files share one namespace (see [Programs and files](language.md#programs-and-files)), so every function is prefixed by its module (`bytes_`, `text_`, `hmap_`, ...) except the few whose names say what they are (`parse_u64`, `fmt_u64`, `print_str`, `sort_u64`). Two names are taken without a prefix: the types `Option[T]` and `Span`. A program that imports core must not define its own.
+All files share one namespace (see [Programs and files](language.md#programs-and-files)), so every function is prefixed by its module (`bytes_`, `text_`, `hmap_`, `bmap_`, ...) except the few whose names say what they are (`parse_u64`, `fmt_u64`, `print_str`, `sort_u64`). Two names are taken without a prefix: the types `Option[T]` and `Span`. A program that imports core must not define its own.
 
 The tests are the worked examples: `tests/pass/core_*.bastio` and `tests/pass/std_host.bastio` use every function, and `tests/user/core_user.bastio` builds core for a BastiOS user program.
 
@@ -103,6 +103,27 @@ hmap_free[u64](m);
 Proved, for every `V`: every index is in bounds and no counter overflows; `len` is the number of keys and `used` the number of slots that are not empty (both from `hmap_ok`, which every function needs and keeps, and which states them with `vcount`); after `hmap_insert(m, k, v)` the map holds `k` with `v` (spec fn `hmap_maps`, which compares struct values with `==`); a value `hmap_get` returns is one the map holds for that key. Not proved: that a lookup finds every key present. Inserting a new key falls back to a plain scan for an empty slot if its probe sequence finds none; the probe sequence visits every slot, but the prover does not follow it around the table, so the scan is there and its failure is what is proved unreachable.
 
 **Linear values.** A `HashMap[Buf]` is rejected: `hmap_get` copies the value out. To map keys to buffers or other linear values, keep the values in a `Vec[T]` and map each key to its index (`tests/pass/core_hashmap.bastio` does this).
+
+### `core/bytesmap.bastio`
+
+A hash map from byte strings to values of a type `V` that can be copied, for symbol tables, paths and names. The map owns copies of its keys, packed into one byte arena (slot `i`'s key is `arena[starts[i] .. starts[i] + lens[i]]`), so a key costs no allocation of its own and lookups take a `&Bytes` without copying it. The table is managed as in `core/hashmap.bastio`. Growing it also compacts the arena, which drops the bytes of removed keys.
+
+```text
+let mut m = bmap_new[u64]();
+bmap_insert[u64](&mut m, name, 7);             // copies `name` into the map
+match bmap_get[u64](m, name) { Option::Some(v) => { ... }, Option::None => {} }
+bmap_free[u64](m);
+```
+
+`bmap_new`, `bmap_with_cap`, `bmap_len`, `bmap_insert` (returns the replaced value), `bmap_get`, `bmap_get_or`, `bmap_contains`, `bmap_remove`, `bmap_key` (a copy of the key in a slot that holds one, for walking the map), `bmap_free`.
+
+Proved, for every `V`:
+- Every index is in bounds; in particular every slot that holds a key names bytes inside the arena (part of `bmap_ok`), so comparing and copying keys needs no checks.
+- `len` and `used` count, as for `HashMap`.
+- A slot a lookup returns holds exactly the bytes asked for (spec fn `bmap_key_at`).
+- After `bmap_insert(m, k, v)` the map holds `k` with `v` (spec fn `bmap_maps`).
+
+Not proved: that a lookup finds every key present.
 
 ### `core/sort.bastio`
 
@@ -189,7 +210,7 @@ A survey of the hand-written helpers in `stage1/`, BastiOS (`src/` and `user/`) 
 | Free a `Vec[Bytes]` (`drop_argv`, `drop_args`) | 2 | `bytes_vec_free` |
 | Vector contains (`has_id`, `has_u`) | 2 | `vec_contains_u64` |
 | Insertion sort | 2 (stage1's sorts compare records by a key) | `sort_u64`, `merge_sort_u64`, `sort_by_key_u64` (when the key is a number) |
-| Lookup by key: every table is a linear scan (`find_inst`, `env_find`, `find_file`, ...) | many | `HashMap` |
+| Lookup by key: every table is a linear scan (`find_inst`, `env_find`, `find_file`, ...) | many | `HashMap`, `BytesMap` (for names and paths) |
 | Ring buffers: head and count over a fixed capacity (console output, tty input, pipes, AF_UNIX channels, the disk command queue) | 6 (BastiOS) | `Ring`, `Queue` |
 | Allocation maps, a byte or word per entry with a wrap-around search (disk blocks, pages) | 2 (BastiOS) | `core/bitmap.bastio` |
 | The Internet checksum (`cadd`, `sum16`, `csum`, `l4_sum`) | 1 (BastiOS network) | `core/csum.bastio` |
