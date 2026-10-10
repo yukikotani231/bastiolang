@@ -20,6 +20,8 @@ The language as stage0 implements it today: the v0 proof pipeline, plus `&mut` b
 | `Mmu` | The right to load CR3. Linear; only `main` (kernel target) is handed one |
 | `Cpu` | The CPU's saved user context and the right to enter user mode. Linear; kernel target only |
 
+| `S` (a struct) | A user-defined record. Linear when any field is linear; otherwise a plain value that is copied |
+
 Borrowing at a call site is implicit: passing an owned `b` to a `&Buf` parameter lends it for the duration of the call. A `&mut` parameter needs an explicit `&mut b`, and `b` must be declared `mut` (or itself be a `&mut` parameter). One call cannot lend the same variable twice if one of the loans is `&mut`.
 
 The capability types carry **ghost state** that exists only in the proof and costs nothing at run time (a `Frame` or `PageTable` is a bare physical address in the generated code; `Serial`, `Mmu` and `Cpu` are empty):
@@ -32,6 +34,30 @@ The capability types carry **ghost state** that exists only in the proof and cos
 | `pool_has(p, i)` | The pool can still hand out page `i` |
 | `pool_size(p)` | Number of pages in the pool (also callable at run time) |
 | `mmu_root(m)` | The id of the table in CR3; `0x10000` while the kernel's own map is loaded |
+
+## Structs
+
+```
+struct Space { root: PageTable, pages: u64 }
+struct Proc  { space: Space, regs: Buf, state: u64 }
+
+let p = Proc { space: Space { root: t, pages: 0 }, regs: alloc(18), state: 1 };
+let n = p.space.pages;                 // read a scalar field
+pt_put(&mut p.space.root, 1, l3);      // lend a field as &mut
+let r = sum(p.regs);                   // lend a field as &Buf
+let t = p.space.root;                  // move a linear field out ...
+p.space.root = t;                      // ... and put one back
+```
+
+- A struct has at least one field, and a field cannot be a borrow. A struct cannot contain itself.
+- A struct with a linear field is **linear**: it must be consumed exactly once, like a `Buf`. A struct without one is a plain value and is copied.
+- Ownership is tracked **per place** (`p`, `p.space`, `p.space.root`). Moving a linear field out leaves the rest of the struct usable: its scalar fields can still be read and its other fields used. The struct as a whole cannot be moved, borrowed or returned until the field is put back (`E-LINEAR-USE`). A struct counts as consumed once every linear field in it has been moved out, so `free(s.items)` consumes a `Stack { items: Buf, n: u64 }`.
+- Assigning a linear field that still holds a value is `E-LINEAR-LEAK`, as for variables.
+- A place cannot be borrowed in a call that also lends an overlapping place as `&mut` (`p` and `p.regs` overlap).
+- A `&mut` struct parameter must be whole again when the function returns.
+- Struct literals list every field once, in any order. Fields are evaluated in an unspecified order (as with call arguments).
+- Specifications can read fields, including through `old(..)` and `result`: `ensures result.n == old(s).n + 1`, `pt_level(s.root) == 1`. The proof tracks every field, so bounds, overflow and capability state work through fields exactly as through variables.
+- In generated code a struct is a C struct passed by value; there is no runtime representation of which fields have been moved.
 
 ## Built-in functions
 
@@ -117,7 +143,7 @@ Expressions in `requires` / `ensures` / `invariant` / `assert` exist only at com
 
 | Code | Rule |
 | --- | --- |
-| `E-LINEAR-USE` | A consumed buffer is used; one call both borrows and moves the same buffer; a borrow is returned; a buffer is consumed where the code may run more than once or not at all (a `while` condition, the right side of `&&` / `\|\|`) |
+| `E-LINEAR-USE` | A consumed buffer (or a moved-out field, or a struct with a field moved out) is used; one call both borrows and moves the same buffer; a borrow is returned; a buffer is consumed where the code may run more than once or not at all (a `while` condition, the right side of `&&` / `\|\|`) |
 | `E-LINEAR-LEAK` | A buffer is still owned at the end of its scope or at a `return`; an owned buffer is overwritten |
 | `E-LINEAR-BRANCH` | Only one arm of an `if` consumes a buffer; a loop body changes the ownership of an outer buffer |
 

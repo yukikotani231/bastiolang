@@ -26,6 +26,8 @@
 //   PageTable  id, level, used[i] (which of its 512 slots own something)
 //   Pool       has[i] (the page numbers it can still hand out), size
 //   Mmu        root (the id of the table in CR3; KROOT for the kernel's own)
+// A struct value is the values of its fields; places like `p.root` read and
+// write inside it.
 // The builtins' preconditions over this state (see `builtin`) are what make
 // page ownership, page-table structure and CR3 switching safe.
 //
@@ -60,7 +62,50 @@ enum Val {
     Str { len: String, data: String },
     /// A linear object; its ghost fields follow `ghost_fields(type)`.
     Obj(Type, Vec<String>),
+    /// A struct: its fields' values in declaration order.
+    Struct(String, Vec<Val>),
     Unit,
+}
+
+/// The value at a dotted path.
+fn get_path(env: &HashMap<String, Val>, path: &str) -> Val {
+    let mut parts = path.split('.');
+    let mut v = &env[parts.next().unwrap()];
+    for f in parts {
+        let Val::Struct(n, fs) = v else { unreachable!("checked: a field of a struct") };
+        let k = struct_def(n).unwrap().fields.iter().position(|x| x.0 == f).expect("checked field");
+        v = &fs[k];
+    }
+    v.clone()
+}
+
+/// Replaces the value at a dotted path.
+fn set_path(env: &mut HashMap<String, Val>, path: &str, nv: Val) {
+    fn go(v: &mut Val, rest: &[&str], nv: Val) {
+        if rest.is_empty() {
+            *v = nv;
+            return;
+        }
+        let Val::Struct(n, fs) = v else { unreachable!("checked: a field of a struct") };
+        let k = struct_def(n).unwrap().fields.iter().position(|x| x.0 == rest[0]).expect("checked field");
+        go(&mut fs[k], &rest[1..], nv);
+    }
+    let parts: Vec<&str> = path.split('.').collect();
+    go(env.get_mut(parts[0]).expect("known variable"), &parts[1..], nv);
+}
+
+/// `if c then a else b`, field by field.
+fn merge_val(c: &str, a: &Val, b: &Val) -> Val {
+    match (a, b) {
+        (Val::U(x), Val::U(y)) => Val::U(ite(c, x, y)),
+        (Val::B(x), Val::B(y)) => Val::B(ite(c, x, y)),
+        (Val::Buf { len: l1, data: d1 }, Val::Buf { len: l2, data: d2 }) => Val::Buf { len: ite(c, l1, l2), data: ite(c, d1, d2) },
+        (Val::Str { len: l1, data: d1 }, Val::Str { len: l2, data: d2 }) => Val::Str { len: ite(c, l1, l2), data: ite(c, d1, d2) },
+        (Val::Obj(ty, f1), Val::Obj(_, f2)) => Val::Obj(ty.clone(), f1.iter().zip(f2).map(|(x, y)| ite(c, x, y)).collect()),
+        (Val::Struct(n, f1), Val::Struct(_, f2)) => Val::Struct(n.clone(), f1.iter().zip(f2).map(|(x, y)| merge_val(c, x, y)).collect()),
+        (Val::Unit, Val::Unit) => Val::Unit,
+        _ => unreachable!("type checker guarantees matching kinds"),
+    }
 }
 
 impl Val {
@@ -218,6 +263,13 @@ impl<'p> Verifier<'p> {
                 self.fresh_of(&t, hint)
             }
             Type::Unit => Ok(Val::Unit),
+            Type::Struct(n) => {
+                let mut fs = Vec::new();
+                for (f, ft) in &struct_def(n).unwrap().fields {
+                    fs.push(self.fresh_of(ft, &format!("{}_{}", hint, f))?);
+                }
+                Ok(Val::Struct(n.clone(), fs))
+            }
             t => {
                 let mut fs = Vec::new();
                 for (f, _, _) in ghost_fields(t) {
@@ -244,21 +296,29 @@ impl<'p> Verifier<'p> {
                 let mut d = Diag::new(code, pos, format!("could not prove {}", what));
                 let mut names: Vec<_> = st.env.keys().cloned().collect();
                 names.sort();
-                let mut shown: Vec<(String, String)> = Vec::new();
-                for n in names {
-                    match st.env[&n].clone() {
-                        Val::U(t) | Val::B(t) => shown.push((n.clone(), t)),
-                        Val::Buf { len, .. } => shown.push((format!("len({})", n), len)),
-                        Val::Str { len, .. } => shown.push((format!("slen({})", n), len)),
+                fn show(n: &str, v: &Val, shown: &mut Vec<(String, String)>) {
+                    match v {
+                        Val::U(t) | Val::B(t) => shown.push((n.to_string(), t.clone())),
+                        Val::Buf { len, .. } => shown.push((format!("len({})", n), len.clone())),
+                        Val::Str { len, .. } => shown.push((format!("slen({})", n), len.clone())),
                         Val::Obj(t, fs) => {
-                            for ((_, arr, acc), term) in ghost_fields(&t).iter().zip(&fs) {
+                            for ((_, arr, acc), term) in ghost_fields(t).iter().zip(fs) {
                                 if !arr {
                                     shown.push((format!("{}({})", acc, n), term.clone()));
                                 }
                             }
                         }
+                        Val::Struct(sn, fs) => {
+                            for ((f, _), fv) in struct_def(sn).unwrap().fields.iter().zip(fs) {
+                                show(&format!("{}.{}", n, f), fv, shown);
+                            }
+                        }
                         Val::Unit => {}
                     }
+                }
+                let mut shown: Vec<(String, String)> = Vec::new();
+                for n in names {
+                    show(&n, &st.env[&n], &mut shown);
                 }
                 let mut cex = Vec::new();
                 for (label, term) in shown {
@@ -353,7 +413,7 @@ impl<'p> Verifier<'p> {
             }
             StmtKind::Assign { name, value } => {
                 let v = self.eval(value, &mut st)?;
-                st.env.insert(name.clone(), v);
+                set_path(&mut st.env, name, v);
                 Ok(Some(st))
             }
             StmtKind::Expr(e) => {
@@ -389,21 +449,7 @@ impl<'p> Verifier<'p> {
                     (Some(t), Some(e)) => {
                         let mut env = HashMap::new();
                         for (name, _) in st.env.iter() {
-                            let (a, b) = (&t.env[name], &e.env[name]);
-                            let merged = match (a, b) {
-                                (Val::U(x), Val::U(y)) => Val::U(ite(&c, x, y)),
-                                (Val::B(x), Val::B(y)) => Val::B(ite(&c, x, y)),
-                                (Val::Buf { len: l1, data: d1 }, Val::Buf { len: l2, data: d2 }) => {
-                                    Val::Buf { len: ite(&c, l1, l2), data: ite(&c, d1, d2) }
-                                }
-                                (Val::Str { len: l1, data: d1 }, Val::Str { len: l2, data: d2 }) => {
-                                    Val::Str { len: ite(&c, l1, l2), data: ite(&c, d1, d2) }
-                                }
-                                (Val::Obj(ty, f1), Val::Obj(_, f2)) => Val::Obj(ty.clone(), f1.iter().zip(f2).map(|(x, y)| ite(&c, x, y)).collect()),
-                                (Val::Unit, Val::Unit) => Val::Unit,
-                                _ => unreachable!("type checker guarantees matching kinds"),
-                            };
-                            env.insert(name.clone(), merged);
+                            env.insert(name.clone(), merge_val(&c, &t.env[name], &e.env[name]));
                         }
                         // Facts learned inside either arm are kept as implications.
                         let mut pc = st.pc.clone();
@@ -430,30 +476,16 @@ impl<'p> Verifier<'p> {
                 changed_vars(body, &mut changed);
                 changed_in_expr(cond, &mut changed);
                 let mut lst = st.clone();
+                // Enclosing places first, so a field's own havoc lands inside its struct's.
+                let mut changed: Vec<(String, bool)> = changed.into_iter().collect();
+                changed.sort_by_key(|(n, _)| (n.matches('.').count(), n.clone()));
                 for (name, keep) in changed {
-                    let Some(old) = st.env.get(&name).cloned() else { continue };
-                    let nv = match old {
-                        Val::Buf { len, .. } => {
-                            let len = if keep { len } else { self.fresh_len(&name)? };
-                            Val::Buf { len, data: self.fresh_array(&name, "Int")? }
-                        }
-                        Val::Str { .. } => Val::Str { len: self.fresh_len(&name)?, data: self.fresh_array(&name, "Int")? },
-                        Val::U(_) => self.fresh_u64(&name)?,
-                        Val::B(_) => self.fresh_bool(&name)?,
-                        Val::Obj(t, fs) => {
-                            let mut nf = Vec::new();
-                            for ((fname, _, _), old_term) in ghost_fields(&t).iter().zip(&fs) {
-                                if keep && kept_by_builtins(&t, fname) {
-                                    nf.push(old_term.clone());
-                                } else {
-                                    nf.push(self.fresh_field(&t, fname, &name)?);
-                                }
-                            }
-                            Val::Obj(t, nf)
-                        }
-                        Val::Unit => Val::Unit,
-                    };
-                    lst.env.insert(name, nv);
+                    if !st.env.contains_key(path_root(&name)) {
+                        continue; // declared inside the loop
+                    }
+                    let old = get_path(&lst.env, &name);
+                    let nv = self.havoc(&old, keep, &name)?;
+                    set_path(&mut lst.env, &name, nv);
                 }
                 for inv in invariants {
                     let t = self.here(inv, &lst)?;
@@ -476,6 +508,39 @@ impl<'p> Verifier<'p> {
         }
     }
 
+    /// A fresh value of the same type as `old`. With `keep`, a Buf keeps its
+    /// length and an object the ghost fields builtins never change.
+    fn havoc(&mut self, old: &Val, keep: bool, name: &str) -> Result<Val, Diag> {
+        Ok(match old {
+            Val::Buf { len, .. } => {
+                let len = if keep { len.clone() } else { self.fresh_len(name)? };
+                Val::Buf { len, data: self.fresh_array(name, "Int")? }
+            }
+            Val::Str { .. } => Val::Str { len: self.fresh_len(name)?, data: self.fresh_array(name, "Int")? },
+            Val::U(_) => self.fresh_u64(name)?,
+            Val::B(_) => self.fresh_bool(name)?,
+            Val::Obj(t, fs) => {
+                let mut nf = Vec::new();
+                for ((fname, _, _), old_term) in ghost_fields(t).iter().zip(fs) {
+                    if keep && kept_by_builtins(t, fname) {
+                        nf.push(old_term.clone());
+                    } else {
+                        nf.push(self.fresh_field(t, fname, name)?);
+                    }
+                }
+                Val::Obj(t.clone(), nf)
+            }
+            Val::Struct(n, fs) => {
+                let mut nf = Vec::new();
+                for ((f, _), fv) in struct_def(n).unwrap().fields.iter().zip(fs) {
+                    nf.push(self.havoc(fv, false, &format!("{}_{}", name, f))?);
+                }
+                Val::Struct(n.clone(), nf)
+            }
+            Val::Unit => Val::Unit,
+        })
+    }
+
     /// Evaluates a code expression, proving its safety obligations on the way.
     fn eval(&mut self, e: &Expr, st: &mut State) -> Result<Val, Diag> {
         match &e.kind {
@@ -484,6 +549,15 @@ impl<'p> Verifier<'p> {
             ExprKind::Str(bytes) => Ok(str_val(bytes)),
             ExprKind::Blob(bytes) => Ok(Val::Str { len: bytes.len().to_string(), data: self.fresh_array("blob", "Int")? }),
             ExprKind::Var(n) => Ok(st.env[n].clone()),
+            ExprKind::Field(..) => Ok(get_path(&st.env, &place(e).expect("checked: a place"))),
+            ExprKind::StructLit(n, fs) => {
+                let mut vals = HashMap::new();
+                for (f, x) in fs {
+                    vals.insert(f.clone(), self.eval(x, st)?);
+                }
+                let fields = struct_def(n).unwrap().fields.iter().map(|(f, _)| vals.remove(f).unwrap()).collect();
+                Ok(Val::Struct(n.clone(), fields))
+            }
             ExprKind::MutBorrow(_) => unreachable!("only a call argument"),
             ExprKind::Not(x) => {
                 let v = self.eval(x, st)?;
@@ -548,7 +622,9 @@ impl<'p> Verifier<'p> {
         // Argument order mirrors the checker: scalars first, then linear values.
         let is_lin = |a: &Expr, st: &State| match &a.kind {
             ExprKind::MutBorrow(_) => true,
-            ExprKind::Var(n) => !matches!(st.env.get(n), Some(Val::U(_)) | Some(Val::B(_)) | Some(Val::Str { .. })),
+            ExprKind::Var(_) | ExprKind::Field(..) => {
+                !matches!(get_path(&st.env, &place(a).unwrap()), Val::U(_) | Val::B(_) | Val::Str { .. })
+            }
             _ => false,
         };
         let mut vals: Vec<Option<Val>> = vec![None; args.len()];
@@ -560,7 +636,7 @@ impl<'p> Verifier<'p> {
         for (i, a) in args.iter().enumerate() {
             if vals[i].is_none() {
                 vals[i] = Some(match &a.kind {
-                    ExprKind::MutBorrow(n) => st.env[n].clone(),
+                    ExprKind::MutBorrow(n) => get_path(&st.env, n),
                     _ => self.eval(a, st)?,
                 });
             }
@@ -582,9 +658,9 @@ impl<'p> Verifier<'p> {
         let mut post = pre.clone();
         for (p, a) in f.params.iter().zip(args) {
             if let (Type::MutRef(t), ExprKind::MutBorrow(var)) = (&p.ty, &a.kind) {
-                let nv = self.fresh_of(t, var)?;
+                let nv = self.fresh_of(t, &var.replace('.', "_"))?;
                 post.insert(p.name.clone(), nv.clone());
-                st.env.insert(var.clone(), nv);
+                set_path(&mut st.env, var, nv);
             }
         }
         for en in &f.ensures {
@@ -597,7 +673,7 @@ impl<'p> Verifier<'p> {
     /// Writes the new value of a `&mut` argument back to its variable.
     fn put_back(&mut self, arg: &Expr, v: Val, st: &mut State) {
         let ExprKind::MutBorrow(n) = &arg.kind else { unreachable!("checked: a &mut argument") };
-        st.env.insert(n.clone(), v);
+        set_path(&mut st.env, n, v);
     }
 
     fn need(&mut self, st: &State, goal: String, pos: Pos, code: &'static str, what: String) -> Result<(), Diag> {
@@ -825,7 +901,14 @@ impl<'p> Verifier<'p> {
                 self.spec_val(&xs[0], Scope { env: old, old: None, result: None }, bound)
             }
             ExprKind::Str(bytes) => Ok(str_val(bytes)),
-            _ => Err(Diag::new("E-TYPE", e.pos, "this argument must be a variable, `result` or `old(x)`")),
+            ExprKind::Field(b, f) => match self.spec_val(b, sc, bound)? {
+                Val::Struct(n, fs) => {
+                    let k = struct_def(&n).unwrap().fields.iter().position(|x| &x.0 == f).expect("checked field");
+                    Ok(fs[k].clone())
+                }
+                _ => unreachable!("checked: a field of a struct"),
+            },
+            _ => Err(Diag::new("E-TYPE", e.pos, "this argument must be a variable, a field of one, `result` or `old(x)`")),
         }
     }
 
@@ -837,8 +920,8 @@ impl<'p> Verifier<'p> {
             ExprKind::Str(_) | ExprKind::Blob(_) => {
                 return Err(Diag::new("E-TYPE", e.pos, "a string literal can only appear as the argument of `slen` or `sget` in a specification"))
             }
-            ExprKind::MutBorrow(_) => unreachable!("rejected by the checker"),
-            ExprKind::Var(_) => self.spec_val(e, sc, bound)?.term().to_string(),
+            ExprKind::MutBorrow(_) | ExprKind::StructLit(..) => unreachable!("rejected by the checker"),
+            ExprKind::Var(_) | ExprKind::Field(..) => self.spec_val(e, sc, bound)?.term().to_string(),
             ExprKind::Not(x) => format!("(not {})", self.spec(x, sc, bound)?),
             ExprKind::Bin(op, a, b) => {
                 let ta = self.spec(a, sc, bound)?;
@@ -916,7 +999,7 @@ fn changed_vars(stmts: &[Stmt], out: &mut HashMap<String, bool>) {
     for s in stmts {
         match &s.kind {
             StmtKind::Assign { name, value } => {
-                let only_set = matches!(&value.kind, ExprKind::Call(f, args) if f == "set" && matches!(&args[0].kind, ExprKind::Var(n) if n == name));
+                let only_set = matches!(&value.kind, ExprKind::Call(f, args) if f == "set" && place(&args[0]).as_deref() == Some(name.as_str()));
                 let e = out.entry(name.clone()).or_insert(true);
                 *e = *e && only_set;
                 changed_in_expr(value, out);

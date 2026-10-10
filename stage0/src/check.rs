@@ -15,11 +15,17 @@
 //
 // Specification expressions (requires / ensures / invariant / assert) are
 // ghost: they may mention any variable, moved or not, and never consume.
+//
+// Structs: a struct with a linear field is itself linear. Ownership is
+// tracked per place (`p`, `p.root`, `p.inner.buf`): a linear field can be
+// moved out and later assigned back, and a struct counts as consumed once
+// every linear field in it has been moved out. Scalar fields can be read as
+// long as the struct itself has not been moved.
 
 use crate::ast::*;
 use crate::codegen::Target;
 use crate::diag::{Diag, Pos};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 #[derive(Clone)]
 pub struct Sig {
@@ -134,9 +140,70 @@ fn main_caps(target: Target) -> &'static [Type] {
     }
 }
 
+/// Struct definitions: unique names, known field types, no struct that
+/// contains itself.
+pub fn check_structs(p: &Program) -> Result<(), Diag> {
+    const RESERVED: &[&str] = &["u64", "bool", "Str", "Buf", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu"];
+    for (i, d) in p.structs.iter().enumerate() {
+        if RESERVED.contains(&d.name.as_str()) || p.structs[..i].iter().any(|e| e.name == d.name) {
+            return Err(Diag::new("E-TYPE", d.pos, format!("type `{}` is already defined", d.name)));
+        }
+        for (_, t) in &d.fields {
+            if let Type::Struct(n) = t {
+                if !p.structs.iter().any(|e| &e.name == n) {
+                    return Err(Diag::new("E-TYPE", d.pos, format!("unknown type `{}`", n)));
+                }
+            }
+        }
+    }
+    fn reaches(p: &Program, from: &str, target: &str, seen: &mut Vec<String>) -> bool {
+        let d = p.structs.iter().find(|d| d.name == from).unwrap();
+        d.fields.iter().any(|(_, t)| match t {
+            Type::Struct(n) if n == target => true,
+            Type::Struct(n) if !seen.contains(n) => {
+                seen.push(n.clone());
+                reaches(p, n, target, seen)
+            }
+            _ => false,
+        })
+    }
+    for d in &p.structs {
+        if reaches(p, &d.name, &d.name, &mut Vec::new()) {
+            return Err(Diag::new("E-TYPE", d.pos, format!("struct `{}` contains itself", d.name))
+                .note("a struct cannot hold itself by value; recursive data needs an owning pointer, which Bastio does not have yet"));
+        }
+    }
+    Ok(())
+}
+
+/// A type written in the program must name a known struct, and only linear
+/// values can be borrowed.
+fn known_type(t: &Type, pos: Pos) -> Result<(), Diag> {
+    match t {
+        Type::Struct(n) if struct_def(n).is_none() => Err(Diag::new("E-TYPE", pos, format!("unknown type `{}`", n))),
+        Type::Ref(i) | Type::MutRef(i) => {
+            known_type(i, pos)?;
+            if !i.is_linear() {
+                return Err(Diag::new("E-TYPE", pos, format!("only linear values can be borrowed, found `{}`", t.name()))
+                    .note("a struct without linear fields is a plain value: pass it by value"));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn overlaps(a: &str, b: &str) -> bool {
+    a == b || a.starts_with(&format!("{}.", b)) || b.starts_with(&format!("{}.", a))
+}
+
 pub fn signatures(p: &Program, target: Target) -> Result<HashMap<String, Sig>, Diag> {
     let mut sigs = builtin_sigs();
     for f in &p.fns {
+        for prm in &f.params {
+            known_type(&prm.ty, prm.pos)?;
+        }
+        known_type(&f.ret, f.pos)?;
         if is_builtin(&f.name) || is_ghost(&f.name) || f.name == "old" {
             return Err(Diag::new("E-TYPE", f.pos, format!("`{}` is a builtin and cannot be redefined", f.name)));
         }
@@ -217,6 +284,7 @@ fn check_spec_fn(sf: &SpecFn, earlier: &[SpecFn], sigs: &HashMap<String, Sig>, t
     }
     let mut cx = new_ctx(sigs, earlier, target, Type::Unit);
     for p in &sf.params {
+        known_type(&p.ty, p.pos)?;
         if p.ty.is_linear() || p.ty.is_mut_ref() {
             return Err(Diag::new("E-TYPE", p.pos, "spec fn parameters are values (`u64`, `bool`) or shared borrows (`&T`)"));
         }
@@ -274,30 +342,136 @@ impl<'a> Ctx<'a> {
         Ok(())
     }
 
+    /// The type at a dotted path, and the info of the variable it starts from.
+    fn path_type(&self, path: &str, pos: Pos) -> Result<(Type, VarInfo), Diag> {
+        let mut parts = path.split('.');
+        let info = self.var_info(parts.next().unwrap(), pos)?;
+        let mut t = info.ty.base().clone();
+        let mut sofar = path_root(path).to_string();
+        for f in parts {
+            let ft = match &t {
+                Type::Struct(n) => struct_def(n).and_then(|d| d.field(f)).cloned(),
+                _ => None,
+            };
+            t = ft.ok_or_else(|| Diag::new("E-TYPE", pos, format!("`{}` ({}) has no field `{}`", sofar, t.name(), f)))?;
+            sofar = format!("{}.{}", sofar, f);
+        }
+        Ok((t, info))
+    }
+
+    /// The moved place that `path` is, or lies inside.
+    fn prefix_moved(&self, path: &str) -> Option<String> {
+        let mut p = path;
+        loop {
+            if self.moved.contains(p) {
+                return Some(p.to_string());
+            }
+            match p.rfind('.') {
+                Some(k) => p = &p[..k],
+                None => return None,
+            }
+        }
+    }
+
+    /// A moved place strictly inside `path`.
+    fn desc_moved(&self, path: &str) -> Option<String> {
+        let pre = format!("{}.", path);
+        let mut v: Vec<&String> = self.moved.iter().filter(|m| m.starts_with(&pre)).collect();
+        v.sort();
+        v.first().map(|m| m.to_string())
+    }
+
+    /// Nothing is left to own at `path`: it was moved, or (for a struct)
+    /// every linear field in it was.
+    fn consumed(&self, path: &str, t: &Type) -> bool {
+        if !t.is_linear() || self.prefix_moved(path).is_some() {
+            return true;
+        }
+        match t {
+            Type::Struct(n) => struct_def(n).unwrap().fields.iter().all(|(f, ft)| self.consumed(&format!("{}.{}", path, f), ft)),
+            _ => false,
+        }
+    }
+
+    /// `path` holds a whole value again.
+    fn unmove(&mut self, path: &str) {
+        let pre = format!("{}.", path);
+        self.moved.retain(|m| m != path && !m.starts_with(&pre));
+    }
+
+    /// The consumed linear leaves of every variable in scope: the ownership
+    /// state, independent of whether a struct was moved whole or field by field.
+    fn canon(&self) -> BTreeSet<String> {
+        fn leaves(cx: &Ctx, path: &str, t: &Type, out: &mut BTreeSet<String>) {
+            if !t.is_linear() {
+                return;
+            }
+            match t {
+                Type::Struct(n) => {
+                    for (f, ft) in &struct_def(n).unwrap().fields {
+                        leaves(cx, &format!("{}.{}", path, f), ft, out);
+                    }
+                }
+                _ => {
+                    if cx.prefix_moved(path).is_some() {
+                        out.insert(path.to_string());
+                    }
+                }
+            }
+        }
+        let mut out = BTreeSet::new();
+        for n in self.scopes.iter().flatten() {
+            let t = &self.vars[n].ty;
+            if !matches!(t, Type::Ref(_)) {
+                leaves(self, n, t.base(), &mut out);
+            }
+        }
+        out
+    }
+
     /// Owned linear variables still holding a value (`&mut` parameters excluded).
     fn live_owned(&self) -> Vec<String> {
         let mut v: Vec<String> = self
             .scopes
             .iter()
             .flatten()
-            .filter(|n| self.vars[*n].ty.is_linear() && !self.moved.contains(*n))
+            .filter(|n| self.vars[*n].ty.is_linear() && !self.consumed(n, &self.vars[*n].ty))
             .cloned()
             .collect();
         v.sort();
         v
     }
 
-    /// `&mut` parameters whose value has been moved out and not put back.
+    /// `&mut` parameters whose value (or part of it) has been moved out and not put back.
     fn missing_mut_refs(&self) -> Vec<String> {
         let mut v: Vec<String> = self
             .scopes
             .iter()
             .flatten()
-            .filter(|n| self.vars[*n].ty.is_mut_ref() && self.moved.contains(*n))
+            .filter(|n| self.vars[*n].ty.is_mut_ref() && (self.prefix_moved(n).is_some() || self.desc_moved(n).is_some()))
             .cloned()
             .collect();
         v.sort();
         v
+    }
+
+    /// A place used as a value: moves it if it is linear, copies it otherwise.
+    fn use_place(&mut self, path: &str, pos: Pos) -> Result<Type, Diag> {
+        let (t, info) = self.path_type(path, pos)?;
+        if let Some(m) = self.prefix_moved(path) {
+            let msg = if m == path { format!("`{}` is used after it was consumed", path) } else { format!("`{}` is used after `{}` was consumed", path, m) };
+            return Err(Diag::new("E-LINEAR-USE", pos, msg));
+        }
+        if t.is_linear() {
+            if matches!(info.ty, Type::Ref(_)) {
+                return Err(Diag::new("E-LINEAR-USE", pos, format!("cannot move out of the shared borrow `{}`", path_root(path))));
+            }
+            if let Some(m) = self.desc_moved(path) {
+                return Err(Diag::new("E-LINEAR-USE", pos, format!("`{}` is used after its field `{}` was moved out", path, m)));
+            }
+            self.moved.insert(path.to_string());
+        }
+        Ok(t)
     }
 
     fn leak_check_all(&self, pos: Pos, when: &str) -> Result<(), Diag> {
@@ -327,7 +501,7 @@ impl<'a> Ctx<'a> {
         let scope = self.scopes.pop().unwrap();
         if !diverges {
             for n in &scope {
-                if self.vars[n].ty.is_linear() && !self.moved.contains(n) {
+                if self.vars[n].ty.is_linear() && !self.consumed(n, &self.vars[n].ty) {
                     return Err(Diag::new("E-LINEAR-LEAK", stmts.last().map(|s| s.pos).unwrap_or_default(), format!("`{}` goes out of scope while still owned", n))
                         .note("every linear value must be consumed exactly once: return it, pass it to a function that takes it by value, or `free` it"));
                 }
@@ -335,7 +509,7 @@ impl<'a> Ctx<'a> {
         }
         for n in &scope {
             self.vars.remove(n);
-            self.moved.remove(n);
+            self.unmove(n);
         }
         Ok(diverges)
     }
@@ -346,6 +520,7 @@ impl<'a> Ctx<'a> {
             StmtKind::Let { name, mutable, ty, init } => {
                 let t = self.expr(init)?;
                 if let Some(want) = ty {
+                    known_type(want, pos)?;
                     if want.is_ref() {
                         return Err(Diag::new("E-TYPE", pos, "a local cannot hold a borrow"));
                     }
@@ -360,18 +535,24 @@ impl<'a> Ctx<'a> {
                 Ok(false)
             }
             StmtKind::Assign { name, value } => {
-                let info = self.vars.get(name.as_str()).cloned().ok_or_else(|| Diag::new("E-TYPE", pos, format!("unknown variable `{}`", name)))?;
+                let root = path_root(name).to_string();
+                let (want, info) = self.path_type(name, pos)?;
                 if !info.mutable {
-                    return Err(Diag::new("E-TYPE", pos, format!("`{}` is not mutable (declare it with `mut`)", name)));
+                    return Err(Diag::new("E-TYPE", pos, format!("`{}` is not mutable (declare it with `mut`)", root)));
                 }
                 let t = self.expr(value)?;
-                expect_ty(&t, info.ty.base(), value.pos, &format!("the value assigned to `{}`", name))?;
-                if info.ty.base().is_linear() {
-                    if !self.moved.contains(name.as_str()) {
-                        return Err(Diag::new("E-LINEAR-LEAK", pos, format!("assigning to `{}` would drop the value it still owns", name))
-                            .note("consume the old value first, e.g. `b = set(b, i, v);`"));
+                expect_ty(&t, &want, value.pos, &format!("the value assigned to `{}`", name))?;
+                if let Some(k) = name.rfind('.') {
+                    if let Some(m) = self.prefix_moved(&name[..k]) {
+                        return Err(Diag::new("E-LINEAR-USE", pos, format!("cannot assign to `{}`: `{}` was consumed", name, m)));
                     }
-                    self.moved.remove(name.as_str());
+                }
+                if want.is_linear() {
+                    if !self.consumed(name, &want) {
+                        return Err(Diag::new("E-LINEAR-LEAK", pos, format!("assigning to `{}` would drop the value it still owns", name))
+                            .note("consume the old value first, e.g. `b = set(b, i, v);` or move the field out before putting a new one in"));
+                    }
+                    self.unmove(name);
                 }
                 Ok(false)
             }
@@ -391,11 +572,14 @@ impl<'a> Ctx<'a> {
                         Ok(false)
                     }
                     (false, false) => {
-                        if after_then != after_else {
-                            let mut diff: Vec<_> = after_then.symmetric_difference(&after_else).cloned().collect();
-                            diff.sort();
+                        let ce = self.canon();
+                        self.moved = after_then.clone();
+                        let ct = self.canon();
+                        if ct != ce {
+                            let diff: Vec<_> = ct.symmetric_difference(&ce).cloned().collect();
                             return Err(Diag::new("E-LINEAR-BRANCH", pos, format!("`{}` is consumed in only one branch of this `if`", diff.join("`, `"))));
                         }
+                        self.moved = after_then.union(&after_else).cloned().collect();
                         Ok(false)
                     }
                 }
@@ -412,10 +596,11 @@ impl<'a> Ctx<'a> {
                     expect_ty(&t, &Type::Bool, inv.pos, "a loop invariant")?;
                 }
                 let before = self.moved.clone();
+                let cb = self.canon();
                 let d = self.block(body)?;
-                if !d && self.moved != before {
-                    let mut diff: Vec<_> = self.moved.symmetric_difference(&before).cloned().collect();
-                    diff.sort();
+                let ca = self.canon();
+                if !d && ca != cb {
+                    let diff: Vec<_> = ca.symmetric_difference(&cb).cloned().collect();
                     return Err(Diag::new("E-LINEAR-BRANCH", pos, format!("the loop body changes the ownership of `{}`", diff.join("`, `")))
                         .note("a loop body must leave every outer linear value owned exactly as it found it"));
                 }
@@ -459,18 +644,28 @@ impl<'a> Ctx<'a> {
             ExprKind::Str(_) | ExprKind::Blob(_) => Ok(Type::Str),
             ExprKind::MutBorrow(_) => Err(Diag::new("E-TYPE", e.pos, "`&mut x` is only allowed as a call argument")),
             ExprKind::Var(n) => {
-                let info = self.var_info(n, e.pos)?;
-                match info.ty {
-                    Type::Ref(_) => Err(Diag::new("E-LINEAR-USE", e.pos, format!("cannot move out of the shared borrow `{}`", n))),
-                    t if t.base().is_linear() => {
-                        if self.moved.contains(n.as_str()) {
-                            return Err(Diag::new("E-LINEAR-USE", e.pos, format!("`{}` is used after it was consumed", n)));
-                        }
-                        self.moved.insert(n.clone());
-                        Ok(t.base().clone())
-                    }
-                    t => Ok(t),
+                if let Type::Ref(_) = self.var_info(n, e.pos)?.ty {
+                    return Err(Diag::new("E-LINEAR-USE", e.pos, format!("cannot move out of the shared borrow `{}`", n)));
                 }
+                self.use_place(n, e.pos)
+            }
+            ExprKind::Field(..) => {
+                let p = place(e).ok_or_else(|| Diag::new("E-TYPE", e.pos, "a field can only be read from a variable or a field of one"))?;
+                self.use_place(&p, e.pos)
+            }
+            ExprKind::StructLit(n, fs) => {
+                let d = struct_def(n).ok_or_else(|| Diag::new("E-TYPE", e.pos, format!("unknown struct `{}`", n)))?;
+                for (f, _) in &d.fields {
+                    if !fs.iter().any(|x| &x.0 == f) {
+                        return Err(Diag::new("E-TYPE", e.pos, format!("field `{}` of `{}` is missing", f, n)));
+                    }
+                }
+                for (f, x) in fs {
+                    let ft = d.field(f).ok_or_else(|| Diag::new("E-TYPE", x.pos, format!("`{}` has no field `{}`", n, f)))?;
+                    let t = self.expr(x)?;
+                    expect_ty(&t, ft, x.pos, &format!("field `{}`", f))?;
+                }
+                Ok(Type::Struct(n.clone()))
             }
             ExprKind::Not(x) => {
                 let t = self.expr(x)?;
@@ -509,51 +704,51 @@ impl<'a> Ctx<'a> {
                         expect_ty(&t, pt, a.pos, &format!("argument of `{}`", name))?;
                     }
                 }
-                let mut borrowed: HashSet<String> = HashSet::new();
+                // Borrows: a place lent as `&mut` may not overlap any other
+                // borrow in the same call (a place overlaps its fields).
+                let mut borrowed: Vec<(String, bool)> = Vec::new();
                 for (pt, a) in sig.params.iter().zip(args) {
                     if !pt.is_ref() {
                         continue;
                     }
                     let n = match (&a.kind, pt) {
-                        (ExprKind::MutBorrow(n), Type::MutRef(_)) => n,
-                        (ExprKind::Var(n), Type::Ref(_)) => n,
-                        (_, Type::MutRef(_)) => return Err(Diag::new("E-TYPE", a.pos, format!("argument of `{}` must be `&mut x` for a variable `x`", name))),
+                        (ExprKind::MutBorrow(n), Type::MutRef(_)) => n.clone(),
+                        (_, Type::Ref(_)) if place(a).is_some() => place(a).unwrap(),
+                        (_, Type::MutRef(_)) => return Err(Diag::new("E-TYPE", a.pos, format!("argument of `{}` must be `&mut x` for a variable or field `x`", name))),
                         _ => return Err(Diag::new("E-TYPE", a.pos, format!("argument of `{}` must name a value to borrow", name))),
                     };
-                    let info = self.var_info(n, a.pos)?;
-                    if info.ty.base() != pt.base() {
-                        return Err(Diag::new("E-TYPE", a.pos, format!("argument of `{}` must be {}, found {}", name, pt.base().name(), info.ty.name())));
+                    let (t, info) = self.path_type(&n, a.pos)?;
+                    if t != *pt.base() {
+                        return Err(Diag::new("E-TYPE", a.pos, format!("argument of `{}` must be {}, found {}", name, pt.base().name(), t.name())));
                     }
                     if pt.is_mut_ref() {
                         if matches!(info.ty, Type::Ref(_)) {
-                            return Err(Diag::new("E-LINEAR-USE", a.pos, format!("`{}` is a shared borrow and cannot be lent as `&mut`", n)));
+                            return Err(Diag::new("E-LINEAR-USE", a.pos, format!("`{}` is a shared borrow and cannot be lent as `&mut`", path_root(&n))));
                         }
                         if !info.mutable {
-                            return Err(Diag::new("E-TYPE", a.pos, format!("`{}` is not mutable (declare it with `mut`)", n)));
+                            return Err(Diag::new("E-TYPE", a.pos, format!("`{}` is not mutable (declare it with `mut`)", path_root(&n))));
                         }
                     }
-                    if self.moved.contains(n.as_str()) {
+                    if self.prefix_moved(&n).is_some() {
                         return Err(Diag::new("E-LINEAR-USE", a.pos, format!("`{}` is borrowed after it was consumed", n)));
                     }
-                    if !borrowed.insert(n.clone()) && pt.is_mut_ref() {
-                        return Err(Diag::new("E-LINEAR-USE", a.pos, format!("`{}` is lent as `&mut` while also borrowed in this call", n)));
+                    if let Some(m) = self.desc_moved(&n) {
+                        return Err(Diag::new("E-LINEAR-USE", a.pos, format!("`{}` is borrowed after its field `{}` was moved out", n, m)));
                     }
-                    if pt.is_mut_ref() {
-                        borrowed.insert(format!("{}#mut", n));
+                    if let Some((q, _)) = borrowed.iter().find(|(q, qm)| overlaps(&n, q) && (*qm || pt.is_mut_ref())) {
+                        let msg = if *q == n {
+                            format!("`{}` is lent as `&mut` while also borrowed in this call", n)
+                        } else {
+                            format!("`{}` and `{}` overlap, and one of them is lent as `&mut` in this call", q, n)
+                        };
+                        return Err(Diag::new("E-LINEAR-USE", a.pos, msg));
                     }
-                }
-                // A shared borrow next to a `&mut` of the same variable is aliasing too.
-                for (pt, a) in sig.params.iter().zip(args) {
-                    if let (Type::Ref(_), ExprKind::Var(n)) = (pt, &a.kind) {
-                        if borrowed.contains(&format!("{}#mut", n)) {
-                            return Err(Diag::new("E-LINEAR-USE", a.pos, format!("`{}` is lent as `&mut` while also borrowed in this call", n)));
-                        }
-                    }
+                    borrowed.push((n, pt.is_mut_ref()));
                 }
                 for (pt, a) in sig.params.iter().zip(args) {
                     if pt.is_linear() {
-                        if let ExprKind::Var(n) = &a.kind {
-                            if borrowed.contains(n) {
+                        if let Some(n) = place(a) {
+                            if borrowed.iter().any(|(q, _)| overlaps(&n, q)) {
                                 return Err(Diag::new("E-LINEAR-USE", a.pos, format!("`{}` is both borrowed and moved in this call", n)));
                             }
                         }
@@ -573,6 +768,14 @@ impl<'a> Ctx<'a> {
             ExprKind::Bool(_) => Ok(Type::Bool),
             ExprKind::Str(_) | ExprKind::Blob(_) => Ok(Type::Str),
             ExprKind::MutBorrow(_) => Err(Diag::new("E-TYPE", e.pos, "`&mut` has no meaning in a specification")),
+            ExprKind::StructLit(..) => Err(Diag::new("E-TYPE", e.pos, "struct literals are not allowed in a specification")),
+            ExprKind::Field(b, f) => {
+                let t = self.spec_expr(b, in_ensures, bound)?;
+                match &t {
+                    Type::Struct(n) => struct_def(n).and_then(|d| d.field(f)).cloned().ok_or_else(|| Diag::new("E-TYPE", e.pos, format!("`{}` has no field `{}`", n, f))),
+                    _ => Err(Diag::new("E-TYPE", e.pos, format!("{} has no fields", t.name()))),
+                }
+            }
             ExprKind::Var(n) => {
                 if bound.contains(n) {
                     return Ok(Type::U64);
@@ -623,13 +826,16 @@ impl<'a> Ctx<'a> {
                     return self.spec_expr(&args[0], false, bound);
                 }
                 // Arguments that stand for a linear value must name one.
-                let check_lin = |a: &Expr| -> Result<(), Diag> {
-                    let ok = match &a.kind {
+                fn named(a: &Expr) -> bool {
+                    match &a.kind {
                         ExprKind::Var(_) | ExprKind::Str(_) | ExprKind::Blob(_) => true,
                         ExprKind::Call(n, xs) => n == "old" && xs.len() == 1 && matches!(xs[0].kind, ExprKind::Var(_)),
+                        ExprKind::Field(b, _) => named(b),
                         _ => false,
-                    };
-                    if ok { Ok(()) } else { Err(Diag::new("E-TYPE", a.pos, "a value in this position must be a variable, `result` or `old(x)`")) }
+                    }
+                }
+                let check_lin = |a: &Expr| -> Result<(), Diag> {
+                    if named(a) { Ok(()) } else { Err(Diag::new("E-TYPE", a.pos, "a value in this position must be a variable, a field of one, `result` or `old(x)`")) }
                 };
                 if let Some(sf) = self.specs.iter().find(|s| &s.name == name) {
                     arity(sf.params.len())?;

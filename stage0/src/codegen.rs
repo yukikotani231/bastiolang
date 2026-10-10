@@ -49,6 +49,7 @@ pub fn emit(p: &Program, target: Target) -> String {
     for part in prelude_parts(target) {
         out.push_str(part);
     }
+    out.push_str(&struct_decls(p));
     for (i, b) in blobs.iter().enumerate() {
         out.push_str(&format!("static const unsigned char bst_blob{}[{}] = {{", i, b.len().max(1)));
         for (j, x) in b.iter().enumerate() {
@@ -410,22 +411,49 @@ static inline void bst_sys_ps(void) { bst_flush(); bst_sys(BST_SYS_PS, 0, 0, 0);
 static inline void bst_sys_poweroff(void) { bst_flush(); bst_sys(BST_SYS_POWEROFF, 0, 0, 0); }
 "#;
 
-fn cty(t: &Type) -> &'static str {
+fn cty(t: &Type) -> String {
     match t {
-        Type::U64 => "uint64_t",
-        Type::Bool => "bool",
-        Type::Unit => "void",
-        Type::Buf => "bst_buf",
-        Type::Str => "bst_str",
-        Type::Serial => "bst_serial",
-        Type::Frame => "bst_frame",
-        Type::PageTable => "bst_pt",
-        Type::Pool => "bst_pool",
-        Type::Mmu => "bst_mmu",
-        Type::Cpu => "bst_cpu",
+        Type::U64 => "uint64_t".into(),
+        Type::Bool => "bool".into(),
+        Type::Unit => "void".into(),
+        Type::Buf => "bst_buf".into(),
+        Type::Str => "bst_str".into(),
+        Type::Serial => "bst_serial".into(),
+        Type::Frame => "bst_frame".into(),
+        Type::PageTable => "bst_pt".into(),
+        Type::Pool => "bst_pool".into(),
+        Type::Mmu => "bst_mmu".into(),
+        Type::Cpu => "bst_cpu".into(),
+        Type::Struct(n) => format!("bst_s_{}", n),
         Type::Ref(t) => cty(t),
         Type::MutRef(_) => unreachable!("written by proto"),
     }
+}
+
+/// C structs for the program's structs, each after the structs it contains.
+fn struct_decls(p: &Program) -> String {
+    fn emit_one(d: &StructDef, p: &Program, done: &mut Vec<String>, out: &mut String) {
+        if done.contains(&d.name) {
+            return;
+        }
+        done.push(d.name.clone());
+        for (_, t) in &d.fields {
+            if let Type::Struct(n) = t {
+                emit_one(p.structs.iter().find(|x| &x.name == n).unwrap(), p, done, out);
+            }
+        }
+        out.push_str(&format!("typedef struct {{"));
+        for (f, t) in &d.fields {
+            out.push_str(&format!(" {} {};", cty(t), f));
+        }
+        out.push_str(&format!(" }} bst_s_{};\n", d.name));
+    }
+    let mut done = Vec::new();
+    let mut out = String::new();
+    for d in &p.structs {
+        emit_one(d, p, &mut done, &mut out);
+    }
+    out
 }
 
 fn proto(f: &FnDef) -> String {
@@ -450,6 +478,14 @@ impl<'a> Gen<'a> {
         if self.mut_params.contains(n) { format!("(*v_{})", n) } else { format!("v_{}", n) }
     }
 
+    /// The C lvalue for a dotted place.
+    fn place(&self, path: &str) -> String {
+        match path.split_once('.') {
+            Some((root, rest)) => format!("{}.{}", self.var(root), rest),
+            None => self.var(path),
+        }
+    }
+
     fn stmt(&mut self, s: &Stmt, d: usize, out: &mut String) {
         match &s.kind {
             StmtKind::Let { name, ty, init, .. } => {
@@ -458,7 +494,7 @@ impl<'a> Gen<'a> {
             }
             StmtKind::Assign { name, value } => {
                 let e = self.expr(value);
-                out.push_str(&format!("{}{} = {};\n", ind(d), self.var(name), e));
+                out.push_str(&format!("{}{} = {};\n", ind(d), self.place(name), e));
             }
             StmtKind::If { cond, then_b, else_b } => {
                 let c = self.expr(cond);
@@ -514,7 +550,12 @@ impl<'a> Gen<'a> {
             }
             ExprKind::Var(n) => self.var(n),
             ExprKind::MutBorrow(n) => {
-                if self.mut_params.contains(n) { format!("v_{}", n) } else { format!("&v_{}", n) }
+                if self.mut_params.contains(n) { format!("v_{}", n) } else { format!("&{}", self.place(n)) }
+            }
+            ExprKind::Field(b, f) => format!("{}.{}", self.expr(b), f),
+            ExprKind::StructLit(n, fs) => {
+                let inits: Vec<String> = fs.iter().map(|(f, x)| format!(".{} = {}", f, self.expr(x))).collect();
+                format!("((bst_s_{}){{ {} }})", n, inits.join(", "))
             }
             ExprKind::Not(x) => format!("(!{})", self.expr(x)),
             ExprKind::Bin(op, a, b) => format!("({} {} {})", self.expr(a), op.text(), self.expr(b)),

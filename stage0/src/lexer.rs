@@ -10,6 +10,7 @@ pub enum Tok {
     Ident(String),
     // keywords
     Fn,
+    Struct,
     Spec,
     Const,
     Let,
@@ -36,6 +37,7 @@ pub enum Tok {
     ColonColon,
     Arrow,
     Amp,
+    Dot,
     // operators
     Plus,
     Minus,
@@ -163,6 +165,7 @@ pub fn lex(src: &str, file: usize) -> Result<Vec<Token>, Diag> {
             col += i - start;
             let tok = match text.as_str() {
                 "fn" => Tok::Fn,
+                "struct" => Tok::Struct,
                 "spec" => Tok::Spec,
                 "const" => Tok::Const,
                 "let" => Tok::Let,
@@ -203,6 +206,7 @@ pub fn lex(src: &str, file: usize) -> Result<Vec<Token>, Diag> {
             (';', _, _) => (Tok::Semi, 1),
             (':', _, _) => (Tok::Colon, 1),
             ('&', _, _) => (Tok::Amp, 1),
+            ('.', _, _) => (Tok::Dot, 1),
             ('+', _, _) => (Tok::Plus, 1),
             ('-', _, _) => (Tok::Minus, 1),
             ('*', _, _) => (Tok::Star, 1),

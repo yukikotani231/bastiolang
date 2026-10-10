@@ -40,7 +40,7 @@ The proof pipeline works end to end.
 ## v1: language features needed for self-hosting
 
 What the compiler needs in order to be written in Bastio. Structs come first (reordered 2026-10-10): writing the BastiOS kernel showed they are the biggest gap for kernels too. Without them its process table is one `Buf` cut into 32-word rows, the per-process page tables live in a level-5 table used as a container, and a function that walks four table levels must take every level out and put it back because it cannot return more than one value.
-1. **Structs:** fields may hold linear types (`Frame`, `PageTable`, `Buf`, other structs); a struct with a linear field is linear; rules for moving fields out and back; a struct can be returned, so functions can hand back several values.
+1. [x] **Structs:** fields may hold linear types (`Frame`, `PageTable`, `Buf`, other structs); a struct with a linear field is linear; rules for moving fields out and back; a struct can be returned, so functions can hand back several values. (Done 2026-10-10. A table of linear values, such as a process table whose rows own page tables, still needs `Vec[T]` from item 5.)
 2. **Bytes and strings:** `Bytes` (a linear u8 buffer), string literals (done: `Str`), file reading and writing.
 3. **Enums and `match`:** to represent the AST and optional results (`Option`-like returns for allocation failure); exhaustiveness checking.
 4. **Owning pointer `Box[T]`:** for recursive data such as trees.
