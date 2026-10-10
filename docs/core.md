@@ -68,7 +68,7 @@ The tests are the worked examples: `tests/pass/core_*.bastio` and `tests/pass/st
 | `parse_u64(b, from, to) -> Option[u64]` | Decimal. `Some` only if the range is non-empty and all digits (spec fn `all_digits`), and then its value is `bdec(b, from, to)`, the number the digits denote; never overflows |
 | `parse_u8`, `parse_u16`, `parse_u32` | The same (value included), and the value fits the type |
 | `parse_i64` and `parse_i8` ... `parse_i32` | An optional `-`, then digits; the value is `bdec` of the digits, negated after a `-` (spec fn `dec_signed`), and fits the type, down to the minimum |
-| `parse_hex_u64(b, from, to)` | Hexadecimal digits, either case, no `0x` |
+| `parse_hex_u64(b, from, to)` | Hexadecimal digits, either case, no `0x`; `Some` only if all are hex digits (spec fn `all_hex`), and then its value is `bhex(b, from, to)` |
 | `fmt_u64(t, x)` | Appends 1 to 20 bytes, every one a decimal digit |
 | `fmt_i64(t, x)` | A `-` when negative, then the digits; 1 to 21 bytes |
 | `fmt_u64_pad(t, x, width)` | Left-padded with spaces |
@@ -123,7 +123,7 @@ Insertion sort is quadratic in the worst case. It was chosen because its proof i
 
 What the library would say if the language let it. Each is a language or verifier change, not a library change. (Earlier gaps, all closed: `old(x)` is allowed in loop invariants, which the text functions and `bytes_copy_into` use; a local variable may share a function's name, so importing core no longer reserves its local names; a `spec fn` may be generic; `vcount` counts the elements of a vector, which proves the sort a permutation and the map's counters; and imports are searched for, so `import "core/text.bastio"` works from anywhere.)
 
-None open. (The two closed last: `bdec` names the value of a digit string, so every `parse_*` is proved to return the value of its digits; and an existing `Bytes` is known to be at most 2^60 long, which is all a single value can say.)
+None open. (Closed last: `bdec` and `bhex` name the value of a digit string, so every `parse_*` is proved to return the value of its digits; and an existing `Bytes` is known to be at most 2^60 long, which is all a single value can say.)
 
 ## Where it came from
 

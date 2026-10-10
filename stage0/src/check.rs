@@ -1854,13 +1854,13 @@ impl<'a> Ctx<'a> {
                     expect_ty(&tx, &Type::U64, args[1].pos, "the value counted")?;
                     return Ok(Type::U64);
                 }
-                if name == "bdec" {
-                    // The decimal value of bytes `from..to`, each read as a
-                    // digit (byte - 48).
+                if name == "bdec" || name == "bhex" {
+                    // The decimal (hexadecimal) value of bytes `from..to`,
+                    // each read as a digit.
                     arity(3)?;
                     let t = self.spec_expr(&args[0], in_ensures, bound)?;
                     if t != Type::Bytes {
-                        return Err(Diag::new("E-TYPE", args[0].pos, format!("argument of `bdec` must be Bytes, found {}", t.name())));
+                        return Err(Diag::new("E-TYPE", args[0].pos, format!("argument of `{}` must be Bytes, found {}", name, t.name())));
                     }
                     check_lin(&args[0])?;
                     for (k, what) in [(1, "the start"), (2, "the end")] {
@@ -1884,7 +1884,7 @@ impl<'a> Ctx<'a> {
                     return Ok((**el).clone());
                 }
                 if !matches!(name.as_str(), "len" | "get" | "slen" | "sget" | "blen" | "bget") {
-                    return Err(Diag::new("E-TYPE", e.pos, format!("`{}` cannot be called in a specification (allowed: len, get, slen, sget, blen, bget, bdec, vlen, vget, vcount, old, ghost accessors and spec fns)", name)));
+                    return Err(Diag::new("E-TYPE", e.pos, format!("`{}` cannot be called in a specification (allowed: len, get, slen, sget, blen, bget, bdec, bhex, vlen, vget, vcount, old, ghost accessors and spec fns)", name)));
                 }
                 let sig = &self.sigs[name.as_str()];
                 arity(sig.params.len())?;

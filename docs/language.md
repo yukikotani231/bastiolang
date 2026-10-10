@@ -1181,9 +1181,10 @@ Expressions in `requires`, `ensures`, `invariant` and `assert` (and the bodies o
 
 - They are evaluated over **mathematical integers**: `a - b` may be negative and `a + b` cannot overflow. Integers of different types mix freely there, with no conversions.
 - They may use `==>` (implication) and `forall x: u64 :: e`.
-- They may call `len`, `get`, `slen`, `sget`, `blen`, `bget`, `bdec`, `vlen`, `vget`, `vcount`, the ghost accessors of the capabilities, and `spec fn`s.
+- They may call `len`, `get`, `slen`, `sget`, `blen`, `bget`, `bdec`, `bhex`, `vlen`, `vget`, `vcount`, the ghost accessors of the capabilities, and `spec fn`s.
 - `vcount(v, x)` is the number of elements of `v` equal to `x`, for a vector of integers. It states what `forall` cannot: that a vector is a permutation of another, or that a counter counts something.
 - `bdec(b, from, to)` is the decimal value of bytes `from..to` of `b`, each byte read as a digit (byte - 48): 0 for an empty range, and `10 * bdec(b, from, to - 1) + (bget(b, to - 1) - 48)` otherwise. The prover unfolds that definition one digit for each `bdec` term a proof mentions, so a loop that parses digits states `v == bdec(b, from, i)` as its invariant, and a constant is evaluated by asserting each prefix in turn (`tests/pass/bdec.bastio`).
+- `bhex(b, from, to)` is the same in base 16: `16 * bhex(b, from, to - 1)` plus the value of the hex digit `bget(b, to - 1)` (`0-9`, `a-f`, `A-F`; another byte has no meaningful value, so a spec says the bytes are hex digits separately, as `core/num.bastio`'s `all_hex` does).
 - They may use `is` and enum payloads (`o.Some`), and see through boxes.
 - `==` and `!=` also compare structs and enums made of integers and booleans (no buffers, boxes or vectors inside): field by field, and for an enum the variant and then that variant's payload. Both sides must name a value (a variable, a field, `vget(..)` or `old(..)`), since specifications cannot build one. Ordinary code still compares only integers and `bool`.
 - They may mention values that have already been consumed. In `ensures`, a by-value parameter means its value on entry, a `&mut` parameter the value handed back, and `old(x)` its value at the call. `result` is the returned value. `old(x)` is also allowed in loop invariants, for parameters only.
