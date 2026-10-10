@@ -12,6 +12,7 @@ in the repository (`difftest.sh`, run in CI):
 | Checker (types and linearity) | `check.bastio` | `bastioc0 --dump-check` (`checkdump.bastio`, with the target BastiOS sources need): the same program with every `let` given its type, or the same first error and error code; also on damaged copies, library files through a program that imports them (`mutate.py --via`) |
 | Verifier (queries) | `verify.bastio` | `bastioc0 --check --dump-smt` (`smtdump.bastio`): every SMT command and the number of proof obligations, on every program stage0 verifies and on damaged copies that still verify (`mutate.py --smt`) |
 | Verifier (proofs) | `solve.bastio` | `bastioc0 --dump-verify` (`verifydump.bastio`): both run Z3; the number of proof obligations, or the first failed proof's code, position, counterexample and notes, on every program that reaches the verifier and on damaged copies (`mutate.py --verify`) |
+| C code generation | `codegen.bastio`, `cprelude.bastio` | `bastioc0 --dump-c` (`cdump.bastio`): the whole C file, byte for byte, on every program the checker accepts (the BastiOS kernel and user programs included) and on damaged copies |
 
 The syntax tree is an arena: one `Vec[Node]` of plain values, children
 as indices, lists chained through `next`. All files of a program share one
@@ -37,6 +38,12 @@ the end first, recording each obligation with what a failure would report
 feeds the log to Z3, reading an answer after each `(check-sat)`, and at
 the first failed proof asks for the counterexample's values, as stage0
 does at that point.
+
+The code generator builds text in a scratch pool and copies finished
+lines out, generating every sub-expression before the text around it in
+stage0's order, since that order numbers the temporaries. The runtime
+preludes (`cprelude.bastio`) are copies of stage0's; the differential test
+keeps them identical.
 
 `print.bastio` prints the tree for both dumps, and `out.bastio` holds the
 output helpers the drivers share.
