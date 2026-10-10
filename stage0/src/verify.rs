@@ -262,7 +262,7 @@ fn kept_by_builtins(t: &Type, field: &str) -> bool {
 
 /// Builtins whose `&mut` argument keeps the fields above.
 const SHAPE_KEEPING: &[&str] =
-    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pool_take", "pool_give", "frame_write", "frame_write8", "cpu_set", "cpu_run", "cpu_idle"];
+    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pool_take", "pool_give", "frame_write", "frame_write8", "cpu_set", "cpu_run", "cpu_idle", "cpu_fpu_save", "cpu_fpu_load"];
 
 #[derive(Clone)]
 struct State {
@@ -1315,19 +1315,26 @@ impl<'p> Verifier<'p> {
                 self.put_back(&args[0], Val::Obj(Type::Mmu, vec![KROOT.into()]), st);
                 Ok(Val::Unit)
             }
+            // The page's contents are not tracked, so neither changes anything
+            // the proof knows about.
+            "cpu_fpu_save" | "cpu_fpu_load" => Ok(Val::Unit),
             "cpu_run" | "cpu_idle" => {
                 let v = self.fresh_u64("vector")?;
                 st.pc.push(format!("(<= {} 255)", v.term()));
                 Ok(v)
             }
-            "cpu_get" | "cpu_set" => {
+            "cpu_get" => {
                 let r = vals[1].term().to_string();
-                let lim = if name == "cpu_get" { "20" } else { "18" };
-                index_ok(self, st, &r, lim, 1, "the saved registers")?;
-                if name == "cpu_set" {
-                    return Ok(Val::Unit);
-                }
+                index_ok(self, st, &r, "21", 1, "the saved registers")?;
                 self.fresh_u64("reg")
+            }
+            "cpu_set" => {
+                // Registers 0-17 and the FS base (20); the error code and
+                // fault address (18, 19) are only reported by a trap.
+                let r = vals[1].term().to_string();
+                self.need(st, format!("(and (<= 0 {r}) (or (< {r} 18) (= {r} 20)))"), pos, "E-VERIFY-BOUNDS",
+                    format!("that register `{}` can be set (0-17 or 20)", ra(1)))?;
+                Ok(Val::Unit)
             }
 
             // ---- user programs ----

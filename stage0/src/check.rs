@@ -103,6 +103,8 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("cpu_idle", Avail::Kernel, vec![m(Cpu)], U64),
         ("cpu_get", Avail::Kernel, vec![r(Cpu), U64], U64),
         ("cpu_set", Avail::Kernel, vec![m(Cpu), U64, U64], Unit),
+        ("cpu_fpu_save", Avail::Kernel, vec![m(Cpu), m(Frame)], Unit),
+        ("cpu_fpu_load", Avail::Kernel, vec![m(Cpu), r(Frame)], Unit),
         ("sys_spawn", Avail::User, vec![r(Buf), U64, U64], U64),
         ("sys_wait", Avail::User, vec![U64], U64),
         ("sys_kill", Avail::User, vec![U64], U64),
