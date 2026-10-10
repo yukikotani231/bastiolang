@@ -28,8 +28,9 @@ Bastio is pre-release. Anything here may change. New to the language? Start with
 18. [How verification works](#how-verification-works)
 19. [Error codes](#error-codes)
 20. [Targets and generated code](#targets-and-generated-code)
-21. [Soundness scope](#soundness-scope)
-22. [Not in the language yet](#not-in-the-language-yet)
+21. [Calling Bastio from C](#calling-bastio-from-c)
+22. [Soundness scope](#soundness-scope)
+23. [Not in the language yet](#not-in-the-language-yet)
 
 ## A first program
 
@@ -71,7 +72,7 @@ Take away `requires n <= len(b)` and the program is rejected with `E-VERIFY-BOUN
 ## Using the compiler
 
 ```text
-bastioc0 [--check] [--emit-c] [--target hosted|kernel|user] [-o out] <file.bastio>...
+bastioc0 [--check] [--emit-c] [--target hosted|kernel|user] [--header F] [-o out] <file.bastio>...
 ```
 
 | Option | Effect |
@@ -80,6 +81,7 @@ bastioc0 [--check] [--emit-c] [--target hosted|kernel|user] [-o out] <file.basti
 | `--check` | Check and verify only |
 | `--emit-c` | Write the generated C (`out.c` unless `-o` is given) instead of an executable |
 | `--target T` | `hosted` (the default), `kernel` or `user`; see [Targets](#targets-and-generated-code). `kernel` and `user` imply `--emit-c` |
+| `--header F` | Also write a C header declaring the program's `export fn`s to `F`; see [Calling Bastio from C](#calling-bastio-from-c) |
 | `--dump-smt` | Also print the queries sent to Z3 |
 | `--trusted-base` | Print the hand-written C each target links in, and every builtin with the targets that have it |
 | `--dump-tokens`, `--dump-ast`, `--dump-mono`, `--dump-check` | Print the result of one compiler phase. These exist so the self-hosted compiler can be tested against stage0 |
@@ -92,7 +94,7 @@ bastioc0 [--check] [--emit-c] [--target hosted|kernel|user] [-o out] <file.basti
 - **Identifiers** are letters, digits and `_`, not starting with a digit.
 - **Integer literals** are decimal (`4096`) or hexadecimal (`0x1000`, `0X1000`). `_` may separate digits (`1_000_000`, `0xffff_0000`). A literal must fit in 64 bits. There are no negative literals and no unary minus: integers are unsigned.
 - **String literals** are written in double quotes and cannot span lines. Escapes: `\n`, `\r`, `\t`, `\0`, `\\`, `\"`.
-- **Keywords:** `assert` `const` `else` `ensures` `enum` `false` `fn` `forall` `if` `import` `invariant` `is` `let` `match` `mut` `requires` `return` `spec` `struct` `true` `unreachable` `while`. The names `result`, `old` and `include_bytes`, and the names of builtins, have special meanings described below.
+- **Keywords:** `assert` `const` `else` `ensures` `enum` `export` `false` `fn` `forall` `if` `import` `invariant` `is` `let` `match` `mut` `requires` `return` `spec` `struct` `true` `unreachable` `while`. The names `result`, `old` and `include_bytes`, and the names of builtins, have special meanings described below.
 
 ## Programs and files
 
@@ -100,6 +102,7 @@ A program is a list of definitions in any order, except that a constant must be 
 
 ```text
 fn name[T, ...](p: T, mut q: T, ...) -> R  requires ...  ensures ...  { ... }
+export fn name(p: T, ...) -> R  ensures ...  { ... }
 spec fn name(p: T, ...) -> bool { <specification expression> }
 struct Name[T, ...] { field: T, ... }
 enum Name[T, ...] { Variant(T), Variant, ... }
@@ -1035,6 +1038,7 @@ Syntax, types and linearity:
 | `E-TYPE` | Type error: wrong argument or field types, an unknown name, a borrow used outside a parameter, shadowing, a bad `main` signature, a generic definition that cannot be instantiated, and so on |
 | `E-TARGET` | A builtin the target does not have (such as `host_read` in a kernel) |
 | `E-IMPORT` | An imported file cannot be read, or files import each other |
+| `E-EXPORT` | An `export fn` breaks a rule of the C boundary: it has a `requires`, takes or returns a type C cannot pass, is `main`, or is outside the hosted target |
 | `E-MATCH` | A `match` misses a variant, matches one twice, or has an arm after `_` |
 | `E-LINEAR-USE` | A consumed value (or a moved-out field, or a struct with a field moved out) is used; one call both borrows and moves a value, or lends it twice with one loan `&mut`; a borrow is returned; a value is consumed where the code may run more than once or not at all (a `while` condition, the right side of `&&` / `\|\|`) |
 | `E-LINEAR-LEAK` | A linear value is still owned at the end of its scope or at a `return`, is overwritten, or is dropped by `_` |
@@ -1075,6 +1079,51 @@ On the freestanding targets `Bytes` come from the same arena as `Buf`.
 
 In the generated C, a struct is a C struct passed by value, an enum is a tag and a union, a `Box[T]` is a `T *`, a `Vec[T]` is `{ len, cap, data }`, and ghost state (capability state, specifications, `assert`) leaves nothing behind.
 
+## Calling Bastio from C
+
+A function marked `export` is also a C function of the same name, so a C program can call proved Bastio code directly. A program with an `export fn` is a library: it needs no `main`. Build it with `--emit-c` and `--header`, and compile the C with the rest of the C program:
+
+```text
+bastioc0 --emit-c --header find.h -o find.c find.bastio
+cc -c find.c && cc app.c find.o
+```
+
+```bastio
+// expect-ok
+enum Found { At(u64), Missing }
+
+/// Where `c` first occurs in `b`.
+export fn find(b: &Bytes, c: u64) -> Found
+  ensures result is Found::At ==> result.At < blen(b)
+{
+  let mut i = 0;
+  while i < blen(b)
+    invariant i <= blen(b)
+  {
+    if bget(b, i) == c {
+      return Found::At(i);
+    }
+    i = i + 1;
+  }
+  return Found::Missing;
+}
+```
+
+```c
+/* in the generated header */
+bst_e_Found find(const uint8_t *b, size_t b_len, uint64_t c);
+```
+
+What may cross the boundary (otherwise `E-EXPORT`):
+- **Parameters:** integers, `bool`, and `&Bytes`, which becomes a pointer and a length (`b`, `b_len`). C can only lend bytes for reading; `&mut` and owned values are not accepted yet.
+- **Results:** integers, `bool`, nothing, `Bytes`, and structs and enums built only from those. The header defines the C types (`bst_bytes`, `bst_s_Name`, `bst_e_Name`, with a `bst_e_Name_Variant` constant for each enum tag) exactly as the generated C lays them out. Bytes handed back belong to the caller, who releases `data` with `free()`.
+- **No `requires`.** A C caller cannot be proved to meet a precondition, so an exported function has none: it checks the condition itself and returns an error value instead, which is then proved like any other code (`examples/base64/lib.bastio` does this for the encoder's length limit). This keeps the boundary free of generated checks. `ensures` clauses are allowed and are copied into the header as comments: they are proved, so the caller may rely on them.
+- Not generic (`E-TYPE`), not `main`, not a name starting with `bst_`, and only on the hosted target.
+
+The proof of an exported function assumes three things about its C caller that nothing checks (they are listed by `--trusted-base` and stated in the header): a `&Bytes` pointer is readable for its length and nothing writes those bytes during the call; that length is at most 2^60 (which follows from the first, since no x86-64 address space is that large); and every argument is a valid value of its C type. A C caller that breaks them can make the Bastio code misbehave, as with any C library.
+
+The C function is a thin wrapper that converts the pointer and length into the internal `bst_bytes` and calls the proved function; it does no other work. A worked example with a test harness and a benchmark is in `examples/base64`.
+
 ## Soundness scope
 
 What a program that `bastioc0` accepts is guaranteed: no out-of-bounds access, no use after free, no double free, no leak, no integer overflow or underflow, no division by zero, and, in kernel code, no page owned twice, no malformed page table and no freeing of the active one. Plus every `requires`, `ensures`, `invariant` and `assert` the programmer wrote. What is not guaranteed:
@@ -1084,10 +1133,11 @@ What a program that `bastioc0` accepts is guaranteed: no out-of-bounds access, n
 - **Stack depth.** Deep recursion can overflow the stack.
 - **Page contents.** The proof tracks who owns each page, not what is in it.
 - **The trusted base.** Z3, the stage0 compiler (Rust) and the C compiler are trusted, as is the hand-written C prelude each target links in (in `stage0/src/codegen.rs`), and the platform's boot and trap entry code. `bastioc0 --trusted-base` lists every prelude part with its size, the parts each target links, and every builtin; the listing is checked into `tests/trusted_base.txt` and `tests/run.sh` fails when it changes, so growth is reviewed (ROADMAP invariant 3). The small per-type helpers the compiler generates for `Box` and `Vec` are part of the compiler, not of this listing.
+- **C callers.** An `export fn` relies on its C caller for the assumptions listed in [Calling Bastio from C](#calling-bastio-from-c).
 - **Child processes and files.** What another program writes, or what a file contains, is unknown to the proof, beyond each byte being `<= 255`.
 
 `tests/run.sh` also runs every program in `tests/pass/` under AddressSanitizer and UBSan, to confirm that the proofs match what happens at run time. Those checks exist only in the test build, never in generated code.
 
 ## Not in the language yet
 
-Planned, in [ROADMAP.md](../ROADMAP.md): concurrency (designed in [concurrency.md](concurrency.md)), integer types narrower than `u64`, `export fn` for calling Bastio from C, more hardware capabilities (`IrqOff`), allocation failure in the type, and a native x86-64 backend. Inference of type arguments, modules with qualified names, and hand-written lemmas for proofs Z3 cannot find are open questions.
+Planned, in [ROADMAP.md](../ROADMAP.md): concurrency (designed in [concurrency.md](concurrency.md)), signed integer types, C buffers lent for writing to an `export fn`, more hardware capabilities (`IrqOff`), allocation failure in the type, and a native x86-64 backend. Inference of type arguments, modules with qualified names, and hand-written lemmas for proofs Z3 cannot find are open questions.

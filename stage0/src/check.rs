@@ -324,6 +324,65 @@ fn overlaps(a: &str, b: &str) -> bool {
     a == b || a.starts_with(&format!("{}.", b)) || b.starts_with(&format!("{}.", a))
 }
 
+/// A type a C caller can pass to an `export fn`: a number, or bytes it lends
+/// (`&Bytes`, which becomes a pointer and a length).
+fn c_param_type(t: &Type) -> bool {
+    match t {
+        Type::Ref(i) => **i == Type::Bytes,
+        t => c_value_type(t),
+    }
+}
+
+/// A type an `export fn` can hand back to C: numbers, owned bytes, and
+/// structs and enums made only of those.
+fn c_return_type(t: &Type) -> bool {
+    match t {
+        Type::Unit | Type::Bytes => true,
+        Type::Struct(n) => struct_def(n).map_or(false, |d| d.fields.iter().all(|(_, t)| c_return_type(t))),
+        Type::Enum(n) => enum_def(n).map_or(false, |d| d.variants.iter().all(|(_, t)| t.as_ref().map_or(true, c_return_type))),
+        t => c_value_type(t),
+    }
+}
+
+/// A plain number C has a type for.
+fn c_value_type(t: &Type) -> bool {
+    matches!(t, Type::U64 | Type::U32 | Type::U16 | Type::U8 | Type::Bool)
+}
+
+/// The rules of the C boundary (see docs/language.md, "Calling Bastio from C").
+fn check_exports(p: &Program, target: Target) -> Result<(), Diag> {
+    for f in p.fns.iter().filter(|f| f.export) {
+        if target != Target::Hosted {
+            return Err(Diag::new("E-EXPORT", f.pos, "`export fn` is only supported on the hosted target"));
+        }
+        if f.name == "main" {
+            return Err(Diag::new("E-EXPORT", f.pos, "`main` cannot be exported"));
+        }
+        if f.name.starts_with("bst_") {
+            return Err(Diag::new("E-EXPORT", f.pos, "names starting with `bst_` are reserved for the runtime"));
+        }
+        if let Some(r) = f.requires.first() {
+            return Err(Diag::new("E-EXPORT", r.pos, format!("`{}` is exported, so it cannot have a precondition", f.name))
+                .note("a C caller cannot be proved to meet it; check the condition in the function and return an error instead"));
+        }
+        for prm in &f.params {
+            if !c_param_type(&prm.ty) {
+                return Err(Diag::new("E-EXPORT", prm.pos, format!("a parameter of an exported function cannot have type `{}`", prm.ty.name()))
+                    .note("C can pass integers, `bool` and `&Bytes` (a pointer and a length)"));
+            }
+            let len = format!("{}_len", prm.name);
+            if *prm.ty.base() == Type::Bytes && f.params.iter().any(|q| q.name == len) {
+                return Err(Diag::new("E-EXPORT", prm.pos, format!("the C length parameter of `{}` would be named `{}`, like another parameter", prm.name, len)));
+            }
+        }
+        if !c_return_type(&f.ret) {
+            return Err(Diag::new("E-EXPORT", f.pos, format!("an exported function cannot return `{}`", f.ret.name()))
+                .note("C can receive integers, `bool`, `Bytes`, and structs and enums made only of those"));
+        }
+    }
+    Ok(())
+}
+
 pub fn signatures(p: &Program, target: Target) -> Result<HashMap<String, Sig>, Diag> {
     let mut sigs = builtin_sigs();
     for f in &p.fns {
@@ -342,8 +401,15 @@ pub fn signatures(p: &Program, target: Target) -> Result<HashMap<String, Sig>, D
         }
         sigs.insert(f.name.clone(), Sig { params: f.params.iter().map(|p| p.ty.clone()).collect(), ret: f.ret.clone() });
     }
+    check_exports(p, target)?;
     let main = p.fns.iter().find(|f| f.name == "main");
-    let Some(main) = main else { return Err(Diag::new("E-TYPE", Pos::default(), "no `main` function")) };
+    // A library (a program with an `export fn`) needs no `main`.
+    let Some(main) = main else {
+        if p.fns.iter().any(|f| f.export) {
+            return Ok(sigs);
+        }
+        return Err(Diag::new("E-TYPE", Pos::default(), "no `main` function"));
+    };
     let legacy = main.params.len() == 1 && main.params[0].ty == Type::Serial && main.ret == Type::Serial;
     let caps = main_caps(target);
     let mut seen = Vec::new();

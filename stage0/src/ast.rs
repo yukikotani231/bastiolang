@@ -294,6 +294,8 @@ pub struct FnDef {
     /// verifier and the code generator need it, since literals take their
     /// type from context.
     pub int_ops: std::collections::HashMap<Pos, Type>,
+    /// `export fn`: also a C function of the same name, callable from C.
+    pub export: bool,
 }
 
 /// `spec fn name(params) -> bool { expr }`: a named specification, expanded

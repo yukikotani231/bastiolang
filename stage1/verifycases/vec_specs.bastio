@@ -1,0 +1,110 @@
+// Verifier cases: vectors of structs, enums, boxes and vectors; `vget` with
+// fields in specifications; spec fns over u64, bool and struct values;
+// `forall`, `old` on `&mut` struct fields, `result` fields, `is` and
+// payloads; strings.
+
+struct Cell { key: u64, val: u64 }
+enum Item { Num(u64), Pt(Cell), None }
+struct Acc { total: u64, count: u64 }
+
+spec fn small(x: u64) -> bool { x < 1000 }
+spec fn cell_ok(c: Cell) -> bool { small(c.key) && c.val <= c.key }
+spec fn both(a: bool, b: bool) -> bool { a && b }
+
+fn first_key(v: &Vec[Cell]) -> u64
+  requires vlen(v) > 0 && cell_ok(vget(v, 0))
+  ensures result < 1000
+{
+  let c = vec_get(v, 0);
+  return c.key;
+}
+
+fn all_small(v: &Vec[u64]) -> bool
+  ensures result ==> forall i: u64 :: i < vlen(v) ==> small(vget(v, i))
+{
+  let mut i = 0;
+  while i < vec_len(v)
+    invariant i <= vlen(v) && forall j: u64 :: j < i ==> vget(v, j) < 1000
+  {
+    if vec_get(v, i) >= 1000 { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn add(a: &mut Acc, x: u64)
+  requires a.total < 1000 && x < 1000 && a.count < 10
+  ensures a.total == old(a.total) + x && a.count == old(a.count) + 1
+{
+  a.total = a.total + x;
+  a.count = a.count + 1;
+}
+
+fn mk(k: u64) -> Cell
+  requires both(k < 500, true)
+  ensures result.key == k && cell_ok(result)
+{
+  return Cell { key: k, val: k / 2 };
+}
+
+fn item_val(it: Item) -> u64
+  requires it is Item::Num ==> it.Num < 100
+  requires it is Item::Pt ==> it.Pt.val < 100
+  ensures result < 100
+{
+  match it {
+    Item::Num(n) => { return n; },
+    Item::Pt(c) => { return c.val; },
+    Item::None => { return 0; },
+  }
+}
+
+fn main() -> u64 {
+  let mut cells = vec_new[Cell]();
+  vec_push(&mut cells, mk(7));
+  vec_push(&mut cells, mk(9));
+  let k = first_key(cells);
+  vec_set(&mut cells, 1, Cell { key: 3, val: 1 });
+  vec_swap(&mut cells, 0, Cell { key: 4, val: 2 });
+  let last = vec_pop(&mut cells);
+  vec_free(cells);
+  let mut items = vec_new[Item]();
+  vec_push(&mut items, Item::Num(5));
+  vec_push(&mut items, Item::Pt(Cell { key: 8, val: 4 }));
+  let mut s = 0;
+  while vec_len(items) > 0
+    invariant s < 1000
+  {
+    let it = vec_pop(&mut items);
+    match it {
+      Item::Num(x) => { s = (s + x % 100) % 500; },
+      _ => {},
+    }
+  }
+  vec_free(items);
+  let mut grid = vec_new[Vec[u64]]();
+  let mut row = vec_new[u64]();
+  vec_push(&mut row, 1);
+  vec_push(&mut grid, row);
+  let mut r2 = vec_pop(&mut grid);
+  let ok = all_small(r2);
+  vec_free(r2);
+  vec_free(grid);
+  let mut bs = vec_new[Box[Cell]]();
+  vec_push(&mut bs, box(Cell { key: 1, val: 1 }));
+  let bc = vec_pop(&mut bs);
+  let c2 = unbox(bc);
+  vec_free(bs);
+  let mut a = Acc { total: 0, count: 0 };
+  add(&mut a, 5);
+  let msg = "hi\n";
+  let mut n = 0;
+  if slen(msg) == 3 && sget(msg, 2) == 10 { n = 1; }
+  let mut bytes = bfrom("abc");
+  bset(&mut bytes, 0, 65);
+  let b0 = bget(bytes, 0);
+  bfree(bytes);
+  let mut t = 0;
+  if ok { t = 1; }
+  return (k + last.key % 10 + s + c2.val % 10 + a.total + n + t + b0) % 100;
+}
