@@ -4,13 +4,11 @@ Thanks for your interest. Bastio is pre-release: the language changes often, and
 
 ## Before you send a pull request
 
-1. Build and run every test (see "Build and test" in [README.md](README.md)):
+1. Merge the latest `main`, then run every check CI runs:
    ```sh
-   (cd stage0 && RUSTFLAGS="-D warnings" cargo build --release)
-   tests/run.sh
-   stage1/difftest.sh
+   tests/ci.sh
    ```
-   CI runs the same commands, and treats compiler warnings as errors.
+   It builds stage0 with warnings as errors, runs `tests/run.sh`, `tests/native.sh`, `stage1/difftest.sh` and both editor grammars, and lists any step it skipped for a missing tool (z3, the tree-sitter CLI, npm). A change to the stage0 checker, verifier or code generator must be mirrored in `stage1/` or `stage1/difftest.sh` fails; new syntax must be added to `editors/` or the grammar checks fail.
 2. A new guarantee comes with a program in `tests/fail/` that breaks it, with an `// expect-error: CODE` header naming the error it must be rejected with. A new feature also gets a program in `tests/pass/` (ROADMAP invariant 4).
 3. Safety comes from a proof, never from a runtime check in the generated code (the zero-overhead rule, ROADMAP invariant 2).
 4. If the trusted base grows (Z3, the C compiler, the runtime preludes), regenerate `tests/trusted_base.txt` with `bastioc0 --trusted-base` and say in the pull request what grew and why (ROADMAP invariant 3).

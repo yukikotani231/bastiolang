@@ -561,17 +561,36 @@ static void bst_print(uint64_t v) {
 }
 
 /* Physical pages: everything from the end of the kernel image to the end of
- * RAM (from the Multiboot memory info), capped at 2^16 pages and at the
- * 1 GiB the boot code identity-maps. */
+ * the RAM that follows it, capped at 2^16 pages and at the 1 GiB the boot
+ * code identity-maps. With a Multiboot memory map (flags bit 6) that is the
+ * run of available entries, merged where they touch, that holds the first
+ * page after the kernel: UEFI firmware leaves holes low in memory, where
+ * mem_upper (bit 0, the fallback) stops. */
 extern char _end[];
 extern uint64_t bst_kernel_pml4[512];
 static uint64_t bst_pool_base;
 static bst_pool bst_pool_init(uint64_t mbi) {
     uint32_t *info = (uint32_t *)mbi;
+    uint64_t base = ((uint64_t)_end + 4095) & ~4095ull;
     uint64_t ram_end = 64ull << 20;
     if (info && (info[0] & 1)) ram_end = (1ull << 20) + ((uint64_t)info[2] << 10);
+    if (info && (info[0] & 64)) {
+        uint64_t end = base;
+        for (int grew = 1; grew; ) {
+            grew = 0;
+            uint8_t *e = (uint8_t *)(uint64_t)info[12], *stop = e + info[11];
+            while (e + 24 <= stop) {
+                uint64_t addr = *(uint64_t *)(e + 4), len = *(uint64_t *)(e + 12);
+                if (*(uint32_t *)(e + 20) == 1 && addr <= end && end < addr + len) {
+                    end = addr + len;
+                    grew = 1;
+                }
+                e += *(uint32_t *)e + 4;
+            }
+        }
+        ram_end = end;
+    }
     if (ram_end > (1ull << 30)) ram_end = 1ull << 30;
-    uint64_t base = ((uint64_t)_end + 4095) & ~4095ull;
     bst_pool p;
     p.base = base;
     p.size = ram_end > base ? (ram_end - base) / 4096 : 0;
