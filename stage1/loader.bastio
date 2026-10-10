@@ -236,7 +236,11 @@ fn load(host: &Host, p: &mut Parser, ld: &mut Loader, path: &Bytes, file: u64, l
   if !ok || blen(data) + 0 > SRC_MAX || blen(p.src) > SRC_MAX - blen(data) {
     bfree(data);
     if has_from {
-      force_fail(&mut p, file, line, col, CODE_IMPORT);   // cannot read
+      force_fail(&mut p, file, line, col, CODE_IMPORT);
+      pm_clear(&mut p);
+      pm_s(&mut p, "cannot read `");
+      pm_bytes(&mut p, path);
+      pm_s(&mut p, "`");
       return 1;
     }
     return 2;
@@ -250,7 +254,11 @@ fn load(host: &Host, p: &mut Parser, ld: &mut Loader, path: &Bytes, file: u64, l
     if f.done {
       return 0;
     }
-    force_fail(&mut p, file, line, col, CODE_IMPORT);     // an import cycle
+    force_fail(&mut p, file, line, col, CODE_IMPORT);
+    pm_clear(&mut p);
+    pm_s(&mut p, "`");
+    pm_bytes(&mut p, path);
+    pm_s(&mut p, "` imports itself (through this chain of imports)");
     return 1;
   }
   let start = blen(p.src);
@@ -270,6 +278,8 @@ fn load(host: &Host, p: &mut Parser, ld: &mut Loader, path: &Bytes, file: u64, l
     let last = lex(p.src, start, &mut toks);
     if last.kind == K_ERROR {
       force_fail(&mut p, k, last.line, last.col, CODE_PARSE);
+      pm_clear(&mut p);
+      lex_msg(p.src, last, &mut p.emsg);
       status = 1;
     }
   }
@@ -283,9 +293,13 @@ fn load(host: &Host, p: &mut Parser, ld: &mut Loader, path: &Bytes, file: u64, l
     let semi = tok_at(toks, i + 2);
     if name.kind != K_STR {
       force_fail(&mut p, k, name.line, name.col, CODE_PARSE);
+      pm_clear(&mut p);
+      pm_s(&mut p, "expected a file name in quotes after `import`");
       status = 1;
     } else if !is_p(semi, P_SEMI) {
       force_fail(&mut p, k, semi.line, semi.col, CODE_PARSE);
+      pm_clear(&mut p);
+      pm_s(&mut p, "expected `;` after the imported file name");
       status = 1;
     } else if name.start <= name.end && name.end <= blen(p.src) {
       let rel = decode(p.src, name.start, name.end);
