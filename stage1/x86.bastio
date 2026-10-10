@@ -77,6 +77,7 @@ const XD_HEAP: u64 = 3;
 const X86_INLINE_MAX: u64 = 160;
 const X86_INLINE_DEPTH: u64 = 3;
 const X86_INLINE_TINY: u64 = 10;
+const X86_INLINE_SMALL: u64 = 20;
 
 struct X86Op { k: u64, r: u64, v: u64 }
 
@@ -168,7 +169,10 @@ struct X86 {
   nsmp: u64,
   /// The literal or blob node of each string (stage1 writes each one once,
   /// however often its function is inlined).
-  snode: Vec[u64]
+  snode: Vec[u64],
+  /// A `let` whose struct is only read through some of its fields: its
+  /// storage (as an X86Dst) and the words to fill (a bit each; stage1).
+  mk: u64, ma: u64, mmask: u64
 }
 
 fn x86_new() -> X86 {
@@ -179,7 +183,8 @@ fn x86_new() -> X86 {
     sdata: vec_new[u64](), sstart: vec_new[u64](), slens: vec_new[u64](),
     labels: 0, frame: 0, depth: 0, env: 0, pre: 0, retl: 0, retw: 0, reto: 0, rdk: 0, rda: 0, rdo: 0,
     parent: vec_new[u64](), cur: 0, decl: vec_new[X86Decl](), sw: false, failed: false, fmsg: vec_new[u64](),
-    stage0: false, target: TARGET_HOSTED, smp: vec_new[u64](), nsmp: 0, snode: vec_new[u64]()
+    stage0: false, target: TARGET_HOSTED, smp: vec_new[u64](), nsmp: 0, snode: vec_new[u64](),
+    mk: 0, ma: 0, mmask: 0
   };
 }
 
@@ -921,6 +926,11 @@ fn x86_will_inline(g: &mut X86, m: &Mono, p: &Parser, x: u64) -> bool {
   if x == 0 || !x86_inlinable(&mut g, m, p, x) || has_id(g.stack, x) {
     return false;
   }
+  if !g.stage0 {
+    // stage1: small bodies at any depth (node_at, kind_of and the like
+    // are called everywhere, often from bodies already inlined).
+    return vec_len(g.stack) < X86_INLINE_DEPTH || x86_bsize(&mut g, m, p, x) <= X86_INLINE_SMALL;
+  }
   return vec_len(g.stack) < X86_INLINE_DEPTH || x86_bsize(&mut g, m, p, x) <= X86_INLINE_TINY;
 }
 
@@ -1470,7 +1480,7 @@ fn x86_assign_regs(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
     while q != 0 {
       let qn = node_at(p.nodes, q);
       let pt = conv(&mut m, p, qn.a, x, q);
-      if kind_t(m, pt) == TY_MUTREF {
+      if kind_t(m, pt) == TY_MUTREF || x86_byaddr(&mut g, c, m, p, pt) {
         let id = x86_nm(&mut g, p, 0, qn.s, qn.e);
         let mut nm = x86_name_at(g, id);
         nm.bad = false;
@@ -2993,6 +3003,28 @@ fn x86_val_into(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, d: X
     }
   }
   let w = x86_ewords(&mut g, c, &mut m, p, i);
+  // stage1: an element of a vector, or a place, copied word by word into
+  // the frame (only the words the `let` it fills reads).
+  if !g.stage0 && w > 1 && d.k == XD_FRAME && k == E_CALL && x86_inst_of(g, &mut m, p, i) == 0 && name_is(p, ci, "vec_get") {
+    let a0 = cg_arg(p, ci, 0);
+    x86_scalar(&mut g, c, &mut m, p, cg_arg(p, ci, 1));
+    let l = x86_place_e(&mut g, c, m, p, a0);
+    x86_mov(&mut g, x86_lop(l, 2), x86_reg(XR_RCX));
+    x86_t(&mut g, "imul $");
+    x86_n(&mut g, wrap_mul(8, w));
+    x86_t(&mut g, ", %rax, %rax");
+    x86_e(&mut g);
+    x86_es(&mut g, "add %rax, %rcx");
+    x86_copy_words(&mut g, x86_mem_loc(XR_RCX, XB, 0), d, w);
+    return;
+  }
+  if !g.stage0 && w > 1 && d.k == XD_FRAME && x86_is_place(p, ci) {
+    let l = x86_place_e(&mut g, c, m, p, ci);
+    if l.k == XL_MEM {
+      x86_copy_words(&mut g, l, d, w);
+      return;
+    }
+  }
   // A two-word result in %rax:%rdx is stored where it goes (stage1).
   if !g.stage0 && k == E_CALL && w == 2 && !(x86_inst_of(g, &mut m, p, i) == 0 && is_builtin_name(c, p, n.s, n.e)) {
     let inst = x86_inst_of(g, &mut m, p, i);
@@ -3028,6 +3060,94 @@ fn x86_val_into(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, d: X
   }
 }
 
+/// Copies the `w` words at `l` (not based on %rax) to frame destination
+/// `d`, through %rax: the words `g.mmask` names when `d` is the `let` it
+/// was set for, else all.
+fn x86_copy_words(g: &mut X86, l: X86Loc, d: X86Dst, w: u64) {
+  let mut mask = 18446744073709551615;
+  if g.mmask != 0 && g.mk == d.k && g.ma == d.a && d.o == 0 {
+    mask = g.mmask;
+  }
+  let mut j = 0;
+  let mut b = 1;
+  while j < w {
+    if j >= 64 || (mask & b) != 0 {
+      x86_mov(&mut g, x86_lop(l, j), x86_reg(XR_RAX));
+      x86_mov(&mut g, x86_reg(XR_RAX), x86_dst_op(&mut g, x86_dst_at(d, j)));
+    }
+    b = wrap_mul(b, 2);
+    j = j + 1;
+  }
+}
+
+/// The words of struct `t` that the statements from `head` on read of the
+/// variable spelled `s..e` (a bit each), when they read it only through
+/// fields; 0 when they use it whole or name it otherwise.
+fn x86_let_mask(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, head: u64, s: u64, e: u64, t: u64) -> u64 {
+  let mut mask = 0;
+  let mut ok = true;
+  let mut todo = vec_new[u64]();
+  if head != 0 {
+    vec_push(&mut todo, head);
+  }
+  let mut steps = 0;
+  while vec_len(todo) > 0 && ok && steps < 1000000 {
+    steps = steps + 1;
+    let i = u_at(todo, vec_len(todo) - 1);
+    vec_pop(&mut todo);
+    let n = node_at(p.nodes, i);
+    if n.next != 0 {
+      vec_push(&mut todo, n.next);
+    }
+    if (n.kind == E_VAR || n.kind == N_NAME) && same(p.src, n.s, n.e, s, e) {
+      ok = false;
+    } else if n.kind == E_FIELD && kind_of(p, n.a) == E_VAR && same_name_span(p, n.a, s, e) {
+      let fl = x86_field(&mut g, c, m, p, t, n.s, n.e);
+      let fw = x86_words(&mut g, c, m, p, fl.ty);
+      let mut j = fl.o;
+      while j < wrap_add(fl.o, fw) && ok {
+        if j >= 64 {
+          ok = false;
+        } else {
+          mask = mask | x86_wbit(j);
+        }
+        j = j + 1;
+      }
+    } else if n.kind >= E_INT && n.kind < D_STRUCT {
+      if n.a != 0 { vec_push(&mut todo, n.a); }
+      if n.b != 0 { vec_push(&mut todo, n.b); }
+      if n.c != 0 { vec_push(&mut todo, n.c); }
+      if n.d != 0 { vec_push(&mut todo, n.d); }
+      if n.x != 0 { vec_push(&mut todo, n.x); }
+    }
+  }
+  if vec_len(todo) > 0 {
+    ok = false;
+  }
+  vec_free(todo);
+  if !ok || mask == 0 {
+    return 0;
+  }
+  return mask;
+}
+
+/// Does node `a` spell `s..e`?
+fn same_name_span(p: &Parser, a: u64, s: u64, e: u64) -> bool {
+  let x = node_at(p.nodes, a);
+  return same(p.src, x.s, x.e, s, e);
+}
+
+/// 2 to the power `j` (j < 64).
+fn x86_wbit(j: u64) -> u64 {
+  let mut b = 1;
+  let mut k = 0;
+  while k < j && k < 64 {
+    b = wrap_mul(b, 2);
+    k = k + 1;
+  }
+  return b;
+}
+
 /// Pushes a call argument: the address for `&mut`, else the value.
 fn x86_arg(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, a: u64) {
   if kind_of(p, a) == E_MUTBORROW {
@@ -3036,6 +3156,64 @@ fn x86_arg(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, a: u64) {
     return;
   }
   x86_push_val(&mut g, c, &mut m, p, a);
+}
+
+/// Is a parameter of type `pt` given the address of its value rather than
+/// a copy (stage1 only)? A shared borrow of four words or more: the callee
+/// only reads it, and nothing can change it while it is lent.
+fn x86_byaddr(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, pt: u64) -> bool {
+  if g.stage0 || pt == 0 || kind_t(m, pt) != TY_REF {
+    return false;
+  }
+  return x86_words(&mut g, c, m, p, inner_t(m, pt)) >= 4;
+}
+
+/// The words a parameter of type `pt` takes among the arguments.
+fn x86_pwords(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, pt: u64) -> u64 {
+  if kind_t(m, pt) == TY_MUTREF || x86_byaddr(&mut g, c, m, p, pt) {
+    return 1;
+  }
+  return x86_words(&mut g, c, m, p, pt);
+}
+
+/// The words argument `a` for a parameter of type `pt` (0: unknown) takes.
+fn x86_argw(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, a: u64, pt: u64) -> u64 {
+  if kind_of(p, a) == E_MUTBORROW || x86_byaddr(&mut g, c, m, p, pt) {
+    return 1;
+  }
+  return x86_ewords(&mut g, c, &mut m, p, a);
+}
+
+/// Pushes argument `a` for a parameter of type `pt` (0: unknown): the
+/// address of its value when `x86_byaddr`, a place's own or a copy's in
+/// the frame.
+fn x86_arg_for(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, a: u64, pt: u64) {
+  if !x86_byaddr(&mut g, c, m, p, pt) {
+    x86_arg(&mut g, c, &mut m, p, a);
+    return;
+  }
+  let mut l = x86_mem_loc(0, 0, 0);
+  if x86_is_place(p, a) {
+    l = x86_place_e(&mut g, c, m, p, a);
+  }
+  if l.k != XL_MEM || l.b == 0 {
+    let o = x86_slot(&mut g, x86_ewords(&mut g, c, &mut m, p, a));
+    x86_val_into(&mut g, c, &mut m, p, a, x86_dst(XD_FRAME, o, 0));
+    l = x86_mem_loc(XR_RBP, o, 0);
+  }
+  x86_t(&mut g, "lea ");
+  x86_o(&mut g, x86_lop(l, 0));
+  x86_t(&mut g, ", %rax");
+  x86_e(&mut g);
+  x86_push(&mut g, x86_reg(XR_RAX));
+}
+
+/// The type of parameter `j` in `ps` (0 past the end).
+fn x86_pt_at(ps: &Vec[u64], j: u64) -> u64 {
+  if j < vec_len(ps) {
+    return u_at(ps, j);
+  }
+  return 0;
 }
 
 /// The assembler symbol of function instance `x` (stage0's `sym`), in the
@@ -3121,11 +3299,7 @@ fn x86_regargs(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> u6
   while q != 0 {
     let qn = node_at(p.nodes, q);
     let pt = conv(&mut m, p, qn.a, x, q);
-    if kind_t(m, pt) == TY_MUTREF {
-      n = wrap_add(n, 1);
-    } else {
-      n = wrap_add(n, x86_words(&mut g, c, m, p, pt));
-    }
+    n = wrap_add(n, x86_pwords(&mut g, c, m, p, pt));
     q = qn.next;
   }
   if n > 4 {
@@ -3181,15 +3355,17 @@ fn x86_call_to(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst:
   }
   let mut aw = 0;
   let mut a = n.a;
+  let xd = inst_at(m, x);
+  let ps = fn_params(&mut m, p, xd.def, x);
+  let mut q = 0;
   while a != 0 {
-    if kind_of(p, a) == E_MUTBORROW {
-      aw = wrap_add(aw, 1);
-    } else {
-      aw = wrap_add(aw, x86_ewords(&mut g, c, &mut m, p, a));
-    }
-    x86_arg(&mut g, c, &mut m, p, a);
+    let pt = x86_pt_at(ps, q);
+    aw = wrap_add(aw, x86_argw(&mut g, c, &mut m, p, a, pt));
+    x86_arg_for(&mut g, c, &mut m, p, a, pt);
     a = next_of(p, a);
+    q = wrap_add(q, 1);
   }
+  vec_free(ps);
   let na = x86_regargs(&mut g, c, &mut m, p, x);
   if na == aw {
     let mut j = 0;
@@ -3307,7 +3483,7 @@ fn x86_bind_params(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, i
     vec_push(&mut qs, q);
     vec_push(&mut sts, st);
     if st.k == 0 {
-      x86_arg(&mut g, c, &mut m, p, a);
+      x86_arg_for(&mut g, c, &mut m, p, a, pt);
     }
     q = qn.next;
     a = an.next;
@@ -3328,7 +3504,7 @@ fn x86_bind_params(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, i
       st = vec_get(sts, j);
     }
     if st.k == 0 {
-      if kind_t(m, pt) == TY_MUTREF {
+      if kind_t(m, pt) == TY_MUTREF || x86_byaddr(&mut g, c, m, p, pt) {
         let o = x86_slot(&mut g, 1);
         x86_pop_to(&mut g, x86_mem_loc(XR_RBP, o, 0), 1);
         st = x86_st(XS_PTR, o, 0, 0, 0);
@@ -4007,15 +4183,17 @@ fn x86_locked(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
   x86_push(&mut g, x86_reg(XR_RAX));       // the first argument: the value
   let mut aw = 1;
   let mut a = cg_arg(p, i, 2);
+  let xd = inst_at(m, x);
+  let ps = fn_params(&mut m, p, xd.def, x);
+  let mut q = 1;
   while a != 0 {
-    if kind_of(p, a) == E_MUTBORROW {
-      aw = wrap_add(aw, 1);
-    } else {
-      aw = wrap_add(aw, x86_ewords(&mut g, c, &mut m, p, a));
-    }
-    x86_arg(&mut g, c, &mut m, p, a);
+    let pt = x86_pt_at(ps, q);
+    aw = wrap_add(aw, x86_argw(&mut g, c, &mut m, p, a, pt));
+    x86_arg_for(&mut g, c, &mut m, p, a, pt);
     a = next_of(p, a);
+    q = wrap_add(q, 1);
   }
+  vec_free(ps);
   let spin = x86_label(&mut g);
   let got = x86_label(&mut g);
   x86_es_off(&mut g, "mov ", wrap_sub(aw, 1), "(%rsp), %rdi");
@@ -4087,15 +4265,17 @@ fn x86_pt_borrow(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
   x86_push(&mut g, x86_reg(XR_RAX));       // the first argument: its address
   let mut aw = 1;
   let mut a = cg_arg(p, i, 3);
+  let xd = inst_at(m, x);
+  let ps = fn_params(&mut m, p, xd.def, x);
+  let mut q = 1;
   while a != 0 {
-    if kind_of(p, a) == E_MUTBORROW {
-      aw = wrap_add(aw, 1);
-    } else {
-      aw = wrap_add(aw, x86_ewords(&mut g, c, &mut m, p, a));
-    }
-    x86_arg(&mut g, c, &mut m, p, a);
+    let pt = x86_pt_at(ps, q);
+    aw = wrap_add(aw, x86_argw(&mut g, c, &mut m, p, a, pt));
+    x86_arg_for(&mut g, c, &mut m, p, a, pt);
     a = next_of(p, a);
+    q = wrap_add(q, 1);
   }
+  vec_free(ps);
   let na = x86_regargs(&mut g, c, &mut m, p, x);
   if na == aw {
     let mut j = 0;
@@ -4167,6 +4347,13 @@ fn x86_smp_run(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     let w = u_at(ws, j);
     if kind_t(m, u_at(ps, j)) == TY_MUTREF {
       cg_s(&mut g.smp, "\tlea -16(%rbp), %rax\n\tpush %rax\n");
+      words = wrap_add(words, 1);
+    } else if x86_byaddr(&mut g, c, m, p, u_at(ps, j)) {
+      // The callee gets the address of the copy in the block.
+      off = wrap_sub(off, w);
+      cg_s(&mut g.smp, "\tlea ");
+      x86_num(&mut g.smp, wrap_mul(8, off));
+      cg_s(&mut g.smp, "(%rbx), %rax\n\tpush %rax\n");
       words = wrap_add(words, 1);
     } else {
       off = wrap_sub(off, w);
@@ -4652,7 +4839,18 @@ fn x86_stmt(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
         return;
       }
       let o = x86_slot(&mut g, w);
+      // stage1: a struct read only through some fields gets only those.
+      let mut mask = 0;
+      if !g.stage0 && n.v != 1 && w >= 4 && kind_t(m, t) == TY_STRUCT {
+        mask = x86_let_mask(&mut g, c, m, p, n.next, n.s, n.e, t);
+      }
+      if mask != 0 {
+        g.mk = XD_FRAME;
+        g.ma = o;
+        g.mmask = mask;
+      }
       x86_val_into(&mut g, c, &mut m, p, n.b, x86_dst(XD_FRAME, o, 0));
+      g.mmask = 0;
       x86_bindv(&mut g, id, x86_st(XS_SLOT, o, 0, 0, 0), t);
       return;
     }
@@ -5340,6 +5538,13 @@ fn x86_peep_acc(code: &Vec[u64], out: &mut Vec[u64]) {
       }
     }
     if !done {
+      let nx = x86_peep_copy(code, starts, i, &mut out);
+      if nx > i && nx <= nl {
+        i = nx;
+        done = true;
+      }
+    }
+    if !done {
       let nx = x86_peep_chain(code, starts, i, &mut out);
       if nx > i && nx <= nl {
         i = nx;
@@ -5353,6 +5558,84 @@ fn x86_peep_acc(code: &Vec[u64], out: &mut Vec[u64]) {
     }
   }
   vec_free(starts);
+}
+
+/// Does the text from `s` to `e` name a register of a family in `bad`
+/// (a bit per family, as `x86_fams`), or %rsp?
+fn x86_names_any(code: &Vec[u64], s: u64, e: u64, bad: u64) -> bool {
+  return (x86_fams(code, s, e) & (bad | 256)) != 0;
+}
+
+/// A copy through the stack: `push` of words at %rcx, maybe word 0 moved
+/// through %rax, then as many `pop %rax` each stored somewhere that does not
+/// name %rax, %rcx or %rsp. The same as word by word moves through %rax:
+/// the stores cannot overlap the words read (a value never overlaps part of
+/// itself) and nothing changes %rcx. Returns the line after it, or 0.
+fn x86_peep_copy(code: &Vec[u64], starts: &Vec[u64], i: u64, out: &mut Vec[u64]) -> u64 {
+  let nl = vec_len(starts);
+  let mut k = 0;
+  let mut j = i;
+  while j < nl && k < 64 && x86_has_prefix(code, u_at(starts, j), "\tpush ") {
+    let s = u_at(starts, j);
+    let e = x86_line_end(code, s);
+    let a = wrap_add(s, 6);
+    if !x86_is_mem(code, a, e) || x86_fams(code, a, e) != 4 {
+      return 0;
+    }
+    k = k + 1;
+    j = j + 1;
+  }
+  if k == 0 {
+    return 0;
+  }
+  // Word 0, moved through %rax.
+  let mut mid = 0;
+  if wrap_add(j, 1) < nl && x86_has_prefix(code, u_at(starts, j), "\tmov ") && x86_has_prefix(code, u_at(starts, wrap_add(j, 1)), "\tmov %rax, ") {
+    let s = u_at(starts, j);
+    let e = x86_line_end(code, s);
+    let d1 = x86_last_op(code, s, e);
+    let s2 = u_at(starts, wrap_add(j, 1));
+    let e2 = x86_line_end(code, s2);
+    if d1 != e && d1 > wrap_add(s, 7) && x86_txt(code, d1, e, "%rax") && (x86_fams(code, wrap_add(s, 5), wrap_sub(d1, 2)) & 0x1FFFB) == 0
+      && !x86_names_any(code, wrap_add(s2, 11), e2, 6) {
+      mid = 2;
+    }
+  }
+  let p0 = wrap_add(j, mid);
+  let mut q = 0;
+  while q < k {
+    let ps = wrap_add(p0, wrap_mul(2, q));
+    if wrap_add(ps, 1) >= nl {
+      return 0;
+    }
+    let s = u_at(starts, ps);
+    let s2 = u_at(starts, wrap_add(ps, 1));
+    let e2 = x86_line_end(code, s2);
+    if !x86_txt(code, s, x86_line_end(code, s), "\tpop %rax") || !x86_has_prefix(code, s2, "\tmov %rax, ")
+      || x86_names_any(code, wrap_add(s2, 11), e2, 6) {
+      return 0;
+    }
+    q = q + 1;
+  }
+  q = j;
+  while q < p0 {
+    let s = u_at(starts, q);
+    x86_copy_text(code, s, x86_line_end(code, s), &mut out);
+    cg_s(&mut out, "\n");
+    q = q + 1;
+  }
+  q = 0;
+  while q < k {
+    let src = u_at(starts, wrap_sub(wrap_add(i, k), wrap_add(q, 1)));
+    cg_s(&mut out, "\tmov ");
+    x86_copy_text(code, wrap_add(src, 6), x86_line_end(code, src), &mut out);
+    cg_s(&mut out, ", %rax\n");
+    let s2 = u_at(starts, wrap_add(wrap_add(p0, wrap_mul(2, q)), 1));
+    x86_copy_text(code, s2, x86_line_end(code, s2), &mut out);
+    cg_s(&mut out, "\n");
+    q = q + 1;
+  }
+  return wrap_add(p0, wrap_mul(2, k));
 }
 
 /// Does every register the line from `s` to `e` names in %rax's family
@@ -5592,7 +5875,7 @@ fn x86_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
     let qn = node_at(p.nodes, q);
     vec_push(&mut qs, q);
     let pt = conv(&mut m, p, qn.a, x, q);
-    let w = x86_words(&mut g, c, m, p, pt);
+    let w = x86_pwords(&mut g, c, m, p, pt);
     vec_push(&mut sizes, w);
     q = qn.next;
   }
@@ -5612,7 +5895,7 @@ fn x86_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
     let qn = node_at(p.nodes, q2);
     let pt = conv(&mut m, p, qn.a, x, q2);
     let id = x86_nm(&mut g, p, 0, qn.s, qn.e);
-    if kind_t(m, pt) == TY_MUTREF {
+    if kind_t(m, pt) == TY_MUTREF || x86_byaddr(&mut g, c, m, p, pt) {
       x86_bindv(&mut g, id, x86_st(XS_PTR, off, 0, 0, 0), base_t(m, pt));
     } else {
       x86_bindv(&mut g, id, x86_st(XS_SLOT, off, 0, 0, 0), base_t(m, pt));
