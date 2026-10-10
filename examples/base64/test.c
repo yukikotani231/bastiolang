@@ -162,12 +162,45 @@ static void bench(void) {
     free(ref);
 }
 
+/* base64_encode_into writes into a buffer the caller owns: it must agree
+ * with base64_encode, write nothing past the encoding (the bytes after it
+ * keep a sentinel), and refuse a buffer that is too small. Each buffer is a
+ * separate allocation of exactly the size given, so AddressSanitizer would
+ * catch a write outside it. */
+static void into(long rounds) {
+    uint8_t buf[64];
+    for (long r = 0; r < rounds; r++) {
+        size_t n = rnd() % 64;
+        for (size_t i = 0; i < n; i++) buf[i] = (uint8_t)rnd();
+        size_t need = (n + 2) / 3 * 4, extra = rnd() % 3 == 0 ? rnd() % 8 : 0;
+        uint8_t *want;
+        size_t wl;
+        CHECK(enc64(buf, n, &want, &wl) == 0 && wl == need, "encode length");
+        if (need > 0) {
+            uint8_t *small = malloc(need - 1);
+            bst_e_Written w = base64_encode_into(buf, n, small, need - 1);
+            CHECK(w.tag == bst_e_Written_TooSmall && w.u.TooSmall == need, "%zu bytes into %zu: not refused", n, need - 1);
+            free(small);
+        }
+        uint8_t *out = malloc(need + extra + 1);
+        memset(out, 0xa5, need + extra);
+        bst_e_Written w = base64_encode_into(buf, n, out, need + extra);
+        CHECK(w.tag == bst_e_Written_Ok && w.u.Ok == need && memcmp(out, want, need) == 0, "encode of %zu bytes into a buffer differs", n);
+        for (size_t i = need; i < need + extra; i++) CHECK(out[i] == 0xa5, "byte %zu past the encoding was written", i);
+        free(out);
+        free(want);
+    }
+    uint8_t one = 0;
+    CHECK(base64_encode_into(buf, 0, &one, 0).tag == bst_e_Written_Ok, "empty input into an empty buffer");
+}
+
 int main(int argc, char **argv) {
     ref_init();
     if (argc > 1 && strcmp(argv[1], "bench") == 0) { bench(); return failures != 0; }
     long rounds = argc > 1 ? atol(argv[1]) : 200000;
     vectors();
     fuzz(rounds);
+    into(rounds / 10);
     printf("base64: %s (%ld fuzz rounds)\n", failures ? "FAILED" : "ok", rounds);
     return failures != 0;
 }

@@ -11,7 +11,7 @@
 //   const    := 'const' IDENT ':' 'u64' '=' expr ';'   (constant-folded; define before use)
 //   param    := 'mut'? IDENT ':' type
 //   type     := 'u64' | 'bool' | 'Str' | linear | IDENT (a struct) | '&' linear | '&' 'mut' linear
-//   linear   := 'Buf' | 'Bytes' | 'Host' | 'Child' | 'Serial' | 'Frame' | 'PageTable' | 'Pool' | 'Mmu' | 'Cpu' | 'Ports' | 'PortIo' | 'MmioSpace' | 'Mmio'
+//   linear   := 'Buf' | 'Bytes' | 'Host' | 'Child' | 'Serial' | 'Frame' | 'PageTable' | 'Pool' | 'Mmu' | 'Cpu' | 'Ports' | 'PortIo' | 'MmioSpace' | 'Mmio' | 'Dma'
 //   place    := IDENT ('.' IDENT)*
 //   primary  := ... | '&' 'mut' place | 'include_bytes' '(' STRING ')' | 'old' '(' expr ')'
 //             | IDENT '{' (IDENT ':' expr (',' IDENT ':' expr)* ','?)? '}'   (a struct literal)
@@ -328,6 +328,10 @@ impl Parser {
             "u8" => Ok(Type::U8),
             "u16" => Ok(Type::U16),
             "u32" => Ok(Type::U32),
+            "i8" => Ok(Type::I8),
+            "i16" => Ok(Type::I16),
+            "i32" => Ok(Type::I32),
+            "i64" => Ok(Type::I64),
             "bool" => Ok(Type::Bool),
             "Buf" => Ok(Type::Buf),
             "Bytes" => Ok(Type::Bytes),
@@ -344,6 +348,7 @@ impl Parser {
             "PortIo" => Ok(Type::PortIo),
             "MmioSpace" => Ok(Type::MmioSpace),
             "Mmio" => Ok(Type::Mmio),
+            "Dma" => Ok(Type::Dma),
             _ if *self.peek() == Tok::LBracket && n != "Box" && n != "Vec" => Ok(Type::Generic(n, self.targs()?)),
             "Box" | "Vec" => {
                 self.expect(Tok::LBracket, "`[`")?;
@@ -634,6 +639,11 @@ impl Parser {
             let pos = self.bump().pos;
             let e = self.unary()?;
             return Ok(Expr { kind: ExprKind::Not(Box::new(e)), pos });
+        }
+        if *self.peek() == Tok::Minus {
+            let pos = self.bump().pos;
+            let e = self.unary()?;
+            return Ok(Expr { kind: ExprKind::Neg(Box::new(e)), pos });
         }
         let mut e = self.primary()?;
         while *self.peek() == Tok::Dot {

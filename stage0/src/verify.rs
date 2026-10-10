@@ -30,6 +30,7 @@
 //   MmioSpace  free[a] (the device-window addresses nobody has claimed)
 //   Mmio       base, len (the device registers base .. base+len it owns,
 //              always inside the device window)
+//   Dma        id (the page number of the page it lends to devices)
 //   PortIo     base, count (the ports base .. base+count it owns; always
 //              within the 65536 ports)
 // A struct value is the values of its fields; places like `p.root` read and
@@ -272,6 +273,7 @@ fn ghost_fields(t: &Type) -> &'static [(&'static str, bool, &'static str)] {
         Type::PortIo => &[("base", false, "port_base"), ("count", false, "port_count")],
         Type::MmioSpace => &[("free", true, "")],
         Type::Mmio => &[("base", false, "mmio_base"), ("len", false, "mmio_len")],
+        Type::Dma => &[("id", false, "dma_id")],
         _ => &[],
     }
 }
@@ -279,14 +281,15 @@ fn ghost_fields(t: &Type) -> &'static [(&'static str, bool, &'static str)] {
 /// Ghost fields a loop keeps when the object is changed only by builtins
 /// that never change them (a page table keeps its id and level).
 fn kept_by_builtins(t: &Type, field: &str) -> bool {
-    matches!((t, field), (Type::Frame, "id") | (Type::PageTable, "id") | (Type::PageTable, "level") | (Type::Pool, "size") | (Type::PortIo, "base") | (Type::PortIo, "count") | (Type::Mmio, "base") | (Type::Mmio, "len"))
+    matches!((t, field), (Type::Frame, "id") | (Type::PageTable, "id") | (Type::PageTable, "level") | (Type::Pool, "size") | (Type::PortIo, "base") | (Type::PortIo, "count") | (Type::Mmio, "base") | (Type::Mmio, "len") | (Type::Dma, "id"))
 }
 
 /// Builtins whose `&mut` argument keeps the fields above.
 const SHAPE_KEEPING: &[&str] =
     &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pool_take", "pool_give", "frame_write", "frame_write8", "cpu_set", "cpu_run", "cpu_idle", "cpu_fpu_save", "cpu_fpu_load",
       "pio_in8", "pio_in16", "pio_in32", "pio_out8", "pio_out16", "pio_out32",
-      "mmio_read8", "mmio_read16", "mmio_read32", "mmio_read64", "mmio_write8", "mmio_write16", "mmio_write32", "mmio_write64"];
+      "mmio_read8", "mmio_read16", "mmio_read32", "mmio_read64", "mmio_write8", "mmio_write16", "mmio_write32", "mmio_write64",
+      "dma_read8", "dma_read16", "dma_read32", "dma_read64", "dma_write8", "dma_write16", "dma_write32", "dma_write64"];
 
 /// What a call may do to one `&mut` argument: the places under it that may
 /// change, as paths relative to the parameter (`""` is the parameter itself,
@@ -402,6 +405,30 @@ fn or_all(ts: &[String]) -> String {
     }
 }
 
+/// An integer as an SMT-LIB term (negative numbers are written `(- n)`).
+fn num(v: i128) -> String {
+    if v < 0 { format!("(- {})", -v) } else { v.to_string() }
+}
+
+/// `x` reduced to the range of the integer type `t`, as a C conversion to
+/// `t` does: modulo 2^width, two's complement for a signed type.
+fn wrap_term(t: &Type, x: &str) -> String {
+    if t.is_signed() {
+        let h = t.int_modulus() / 2;
+        format!("(- (mod (+ {} {}) {}) {})", x, h, t.int_modulus(), h)
+    } else {
+        format!("(mod {} {})", x, t.int_modulus())
+    }
+}
+
+/// C's division on signed operands, which truncates toward zero (SMT-LIB's
+/// `div` rounds so that the remainder is never negative).
+fn c_div(a: &str, b: &str) -> String {
+    let abs = |x: &str| format!("(ite (>= {x} 0) {x} (- {x}))");
+    let q = format!("(div {} {})", abs(a), abs(b));
+    format!("(ite (= (>= {} 0) (>= {} 0)) {q} (- {q}))", a, b)
+}
+
 fn ite(c: &str, a: &str, b: &str) -> String {
     if a == b { a.to_string() } else { format!("(ite {} {} {})", c, a, b) }
 }
@@ -418,6 +445,9 @@ pub fn verify_program(p: &Program) -> Result<(usize, Vec<String>), Diag> {
     let timed = std::env::var("BASTIO_TIME").is_ok();
     for f in &p.fns {
         let t0 = std::time::Instant::now();
+        if f.export {
+            buffers_kept(f, &v.sums)?;
+        }
         v.smt("(push 1)")?;
         v.verify_fn(f).map_err(|d| crate::check::in_copy(d, &f.name))?;
         v.smt("(pop 1)")?;
@@ -427,6 +457,26 @@ pub fn verify_program(p: &Program) -> Result<(usize, Vec<String>), Diag> {
     }
     let log = std::mem::take(&mut v.solver.log);
     Ok((v.obligations, log))
+}
+
+/// A `&mut Bytes` that C lends to an `export fn` is the caller's memory:
+/// the function may write its bytes but must hand back the same buffer,
+/// never free or replace it. Its summary shows that: the parameter is
+/// changed only by shape-keeping builtins (`bset`), directly or through
+/// other functions' summaries, so it is the same allocation of the same
+/// length on return.
+fn buffers_kept(f: &FnDef, sums: &Summaries) -> Result<(), Diag> {
+    for (i, q) in f.params.iter().enumerate() {
+        if !matches!(&q.ty, Type::MutRef(t) if **t == Type::Bytes) {
+            continue;
+        }
+        let kept = sums[&f.name][i].as_ref().map_or(false, |s| s.iter().all(|(_, keep)| *keep));
+        if !kept {
+            return Err(Diag::new("E-EXPORT", q.pos, format!("`{}` belongs to the C caller, but `{}` may free or replace it", q.name, f.name))
+                .note("a buffer lent by C may only be written in place (`bset`, or lent to functions that do only that)"));
+        }
+    }
+    Ok(())
 }
 
 impl<'p> Verifier<'p> {
@@ -474,7 +524,7 @@ impl<'p> Verifier<'p> {
             (Type::PortIo, "count") => self.fresh_int(&h, "0", PORT_LIMIT),
             (Type::Mmio, "base") => self.fresh_int(&h, MMIO_LO, MMIO_HI),
             (Type::Mmio, "len") => self.fresh_int(&h, "0", MMIO_HI),
-            (Type::Frame, "id") | (Type::PageTable, "id") => {
+            (Type::Frame, "id") | (Type::PageTable, "id") | (Type::Dma, "id") => {
                 let n = self.fresh_int(&h, "0", FRAME_LIMIT)?;
                 self.smt(&format!("(assert (< {} {}))", n, POOLSIZE))?;
                 Ok(n)
@@ -489,7 +539,7 @@ impl<'p> Verifier<'p> {
     fn fresh_of(&mut self, ty: &Type, hint: &str) -> Result<Val, Diag> {
         match ty {
             Type::U64 => self.fresh_u64(hint),
-            Type::U8 | Type::U16 | Type::U32 => Ok(Val::U(self.fresh_int(hint, "0", &ty.int_max().to_string())?)),
+            Type::U8 | Type::U16 | Type::U32 | Type::I8 | Type::I16 | Type::I32 | Type::I64 => Ok(Val::U(self.fresh_int(hint, &num(ty.int_min()), &num(ty.int_max()))?)),
             Type::Bool => self.fresh_bool(hint),
             Type::Buf => Ok(Val::Buf { len: self.fresh_len(hint)?, data: self.fresh_array(hint, "Int")? }),
             Type::Bytes => {
@@ -993,10 +1043,15 @@ impl<'p> Verifier<'p> {
                     let x = self.eval(&args[0], st)?.term().to_string();
                     let t = &targs[0];
                     if n == "wrap" {
-                        return Ok(Val::U(format!("(mod {} {})", x, t.int_max() + 1)));
+                        return Ok(Val::U(wrap_term(t, &x)));
                     }
-                    let max = t.int_max().to_string();
-                    self.prove(st, &format!("(<= {} {})", x, max), e.pos, "E-VERIFY-CAST", format!("that `{}` fits in {} (`<= {}`)", render(&args[0]), t.name(), max))?;
+                    let from = self.int_ops.get(&e.pos).cloned().unwrap_or(Type::U64);
+                    let max = num(t.int_max());
+                    if !from.is_signed() && !t.is_signed() {
+                        self.prove(st, &format!("(<= {} {})", x, max), e.pos, "E-VERIFY-CAST", format!("that `{}` fits in {} (`<= {}`)", render(&args[0]), t.name(), max))?;
+                    } else {
+                        self.prove(st, &format!("(and (<= {} {}) (<= {} {}))", num(t.int_min()), x, x, max), e.pos, "E-VERIFY-CAST", format!("that `{}` fits in {} ({} to {})", render(&args[0]), t.name(), t.int_min(), t.int_max()))?;
+                    }
                     Ok(Val::U(x))
                 }
                 _ => unreachable!("removed by monomorphization"),
@@ -1041,6 +1096,15 @@ impl<'p> Verifier<'p> {
                 let v = self.eval(x, st)?;
                 Ok(Val::B(format!("(not {})", v.term())))
             }
+            ExprKind::Neg(x) => {
+                if let ExprKind::Int(v) = x.kind {
+                    return Ok(Val::U(num(-(v as i128))));
+                }
+                let v = self.eval(x, st)?.term().to_string();
+                let ity = self.int_ops[&e.pos].clone();
+                self.prove(st, &format!("(not (= {} {}))", v, num(ity.int_min())), e.pos, "E-VERIFY-OVERFLOW", format!("that `-{}` does not overflow {} (`{}` is not {})", render(x), ity.name(), render(x), ity.int_min()))?;
+                Ok(Val::U(format!("(- {})", v)))
+            }
             ExprKind::Forall(..) => unreachable!("rejected by the checker"),
             ExprKind::Bin(op, a, b) => {
                 let va = self.eval(a, st)?;
@@ -1072,6 +1136,9 @@ impl<'p> Verifier<'p> {
                 let (ra, rb) = (render(a), render(b));
                 let ity = self.int_ops.get(&e.pos).cloned().unwrap_or(Type::U64);
                 let max = ity.int_max().to_string();
+                if ity.is_signed() && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem) {
+                    return self.signed_arith(*op, &ta, &tb, &ra, &rb, &ity, e.pos, st);
+                }
                 let v = match op {
                     BinOp::Add => {
                         let t = format!("(+ {} {})", ta, tb);
@@ -1104,6 +1171,29 @@ impl<'p> Verifier<'p> {
             }
             ExprKind::Call(name, args) => self.call(name, args, e.pos, st),
         }
+    }
+
+    /// Arithmetic on a signed type: the result must stay between the type's
+    /// minimum (E-VERIFY-UNDERFLOW) and maximum (E-VERIFY-OVERFLOW); `/` and
+    /// `%` truncate toward zero, as in C, and `MIN / -1` overflows.
+    #[allow(clippy::too_many_arguments)]
+    fn signed_arith(&mut self, op: BinOp, ta: &str, tb: &str, ra: &str, rb: &str, ity: &Type, pos: Pos, st: &mut State) -> Result<Val, Diag> {
+        let (min, max) = (num(ity.int_min()), num(ity.int_max()));
+        let t = match op {
+            BinOp::Add => format!("(+ {} {})", ta, tb),
+            BinOp::Sub => format!("(- {} {})", ta, tb),
+            BinOp::Mul => format!("(* {} {})", ta, tb),
+            _ => {
+                self.prove(st, &format!("(not (= {} 0))", tb), pos, "E-VERIFY-DIVZERO", format!("that the divisor `{}` is not zero", rb))?;
+                self.prove(st, &format!("(not (and (= {} {}) (= {} (- 1))))", ta, min, tb), pos, "E-VERIFY-OVERFLOW", format!("that `{} {} {}` is not {} {} -1, which overflows {}", ra, op.text(), rb, ity.int_min(), op.text(), ity.name()))?;
+                let q = c_div(ta, tb);
+                return Ok(Val::U(if op == BinOp::Div { q } else { format!("(- {} (* {} {}))", ta, tb, q) }));
+            }
+        };
+        let text = format!("{} {} {}", ra, op.text(), rb);
+        self.prove(st, &format!("(<= {} {})", t, max), pos, "E-VERIFY-OVERFLOW", format!("that `{}` does not overflow {} (`<= {}`)", text, ity.name(), ity.int_max()))?;
+        self.prove(st, &format!("(<= {} {})", min, t), pos, "E-VERIFY-UNDERFLOW", format!("that `{}` does not go below the minimum of {} (`>= {}`)", text, ity.name(), ity.int_min()))?;
+        Ok(Val::U(t))
     }
 
     fn call(&mut self, name: &str, args: &[Expr], pos: Pos, st: &mut State) -> Result<Val, Diag> {
@@ -1200,7 +1290,7 @@ impl<'p> Verifier<'p> {
             "wrap_add" | "wrap_sub" | "wrap_mul" => {
                 let ity = self.int_ops.get(&pos).cloned().expect("typed by the checker");
                 let op = match name { "wrap_add" => "+", "wrap_sub" => "-", _ => "*" };
-                Ok(Val::U(format!("(mod ({} {} {}) {})", op, vals[0].term(), vals[1].term(), ity.int_max() + 1)))
+                Ok(Val::U(wrap_term(&ity, &format!("({} {} {})", op, vals[0].term(), vals[1].term()))))
             }
             "unbox" => match &vals[0] {
                 Val::Box(BoxVal::Known(v)) => Ok((**v).clone()),
@@ -1534,6 +1624,38 @@ impl<'p> Verifier<'p> {
                 st.pc.push(format!("(<= {} {})", v.term(), max));
                 Ok(v)
             }
+            // ---- pages lent to devices (DMA) ----
+            // Lending and taking back only change the type: the page keeps
+            // its number, and while it is a `Dma` nothing can free, map or
+            // reuse it. That the device has stopped using it by `dma_take`
+            // is the driver's word (devices are outside the proof).
+            "dma_lend" => Ok(Val::Obj(Type::Dma, vec![vals[0].field("id")])),
+            "dma_take" => Ok(Val::Obj(Type::Frame, vec![vals[0].field("id")])),
+            "dma_id" => Ok(Val::U(vals[0].field("id"))),
+            "dma_addr" => self.fresh_u64("dma_addr"),
+            "dma_read8" | "dma_read16" | "dma_read32" | "dma_read64" | "dma_write8" | "dma_write16" | "dma_write32" | "dma_write64" => {
+                let (bytes, max) = match name.trim_start_matches("dma_read").trim_start_matches("dma_write") {
+                    "8" => (1, "255"),
+                    "16" => (2, "65535"),
+                    "32" => (4, "4294967295"),
+                    _ => (8, U64_MAX),
+                };
+                let off = vals[1].term();
+                self.need(st, format!("(<= (+ {} {}) 4096)", off, bytes), pos, "E-VERIFY-BOUNDS",
+                    format!("that offset `{}` is within the page (`{} + {} <= 4096`)", ra(1), ra(1), bytes))?;
+                // The page is page-aligned, so an aligned offset is an
+                // aligned address: devices see whole fields, never torn ones.
+                self.need(st, format!("(= (mod {} {}) 0)", off, bytes), pos, "E-VERIFY-BOUNDS",
+                    format!("that offset `{}` is aligned to {} bytes", ra(1), bytes))?;
+                if name.starts_with("dma_write") {
+                    self.need(st, format!("(<= {} {})", vals[2].term(), max), pos, "E-VERIFY-BYTE",
+                        format!("that `{}` fits in {} bits (`<= {}`)", ra(2), bytes * 8, max))?;
+                    return Ok(Val::Unit);
+                }
+                let v = self.fresh_u64(name)?;
+                st.pc.push(format!("(<= {} {})", v.term(), max));
+                Ok(v)
+            }
             "port_base" => Ok(Val::U(vals[0].field("base"))),
             "port_count" => Ok(Val::U(vals[0].field("count"))),
             "pio_in8" | "pio_in16" | "pio_in32" | "pio_out8" | "pio_out16" | "pio_out32" => {
@@ -1671,6 +1793,7 @@ impl<'p> Verifier<'p> {
             },
             ExprKind::Var(_) | ExprKind::Field(..) => self.spec_val(e, sc, bound)?.term().to_string(),
             ExprKind::Not(x) => format!("(not {})", self.spec(x, sc, bound)?),
+            ExprKind::Neg(x) => format!("(- {})", self.spec(x, sc, bound)?),
             ExprKind::Bin(op, a, b) => {
                 let ta = self.spec(a, sc, bound)?;
                 let tb = self.spec(b, sc, bound)?;
@@ -1734,7 +1857,7 @@ impl<'p> Verifier<'p> {
                         Val::Buf { data, .. } | Val::Str { data, .. } => format!("(select {} {})", data, self.spec(&args[1], sc, bound)?),
                         _ => unreachable!(),
                     },
-                    "frame_id" | "pt_id" => v.field("id"),
+                    "frame_id" | "pt_id" | "dma_id" => v.field("id"),
                     "pt_level" => v.field("level"),
                     "pool_size" => v.field("size"),
                     "mmu_root" => v.field("root"),
@@ -1815,7 +1938,7 @@ fn changed_in_expr(e: &Expr, out: &mut HashMap<String, bool>, sums: &Summaries) 
                 }
             }
         }
-        ExprKind::Not(x) => changed_in_expr(x, out, sums),
+        ExprKind::Not(x) | ExprKind::Neg(x) => changed_in_expr(x, out, sums),
         ExprKind::Bin(_, a, b) => {
             changed_in_expr(a, out, sums);
             changed_in_expr(b, out, sums);

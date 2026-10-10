@@ -128,6 +128,18 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("mmio_write16", Avail::Mem, vec![m(Mmio), U64, U64], Unit),
         ("mmio_write32", Avail::Mem, vec![m(Mmio), U64, U64], Unit),
         ("mmio_write64", Avail::Mem, vec![m(Mmio), U64, U64], Unit),
+        ("dma_lend", Avail::Mem, vec![Frame], Dma),
+        ("dma_take", Avail::Mem, vec![Dma], Frame),
+        ("dma_id", Avail::Mem, vec![r(Dma)], U64),
+        ("dma_addr", Avail::Mem, vec![r(Dma)], U64),
+        ("dma_read8", Avail::Mem, vec![m(Dma), U64], U64),
+        ("dma_read16", Avail::Mem, vec![m(Dma), U64], U64),
+        ("dma_read32", Avail::Mem, vec![m(Dma), U64], U64),
+        ("dma_read64", Avail::Mem, vec![m(Dma), U64], U64),
+        ("dma_write8", Avail::Mem, vec![m(Dma), U64, U64], Unit),
+        ("dma_write16", Avail::Mem, vec![m(Dma), U64, U64], Unit),
+        ("dma_write32", Avail::Mem, vec![m(Dma), U64, U64], Unit),
+        ("dma_write64", Avail::Mem, vec![m(Dma), U64, U64], Unit),
         ("sys_spawn", Avail::User, vec![r(Buf), U64, U64], U64),
         ("sys_wait", Avail::User, vec![U64], U64),
         ("sys_kill", Avail::User, vec![U64], U64),
@@ -157,6 +169,7 @@ pub const GHOSTS: &[(&str, Type, bool, Type)] = &[
     ("mmio_base", Type::Mmio, false, Type::U64),
     ("mmio_len", Type::Mmio, false, Type::U64),
     ("mmio_free", Type::MmioSpace, true, Type::Bool),
+    ("dma_id", Type::Dma, false, Type::U64),
 ];
 
 pub fn is_ghost(name: &str) -> bool {
@@ -179,9 +192,13 @@ pub const WRAP_BUILTINS: &[&str] = &["wrap_add", "wrap_sub", "wrap_mul"];
 /// An integer literal written directly (constants are folded into literals
 /// by the parser). It has no type of its own: it takes the integer type its
 /// position asks for (docs/integers.md).
-fn int_lit(e: &Expr) -> Option<u128> {
-    match e.kind {
-        ExprKind::Int(v) => Some(v),
+fn int_lit(e: &Expr) -> Option<i128> {
+    match &e.kind {
+        ExprKind::Int(v) => Some(*v as i128),
+        ExprKind::Neg(x) => match x.kind {
+            ExprKind::Int(v) => Some(-(v as i128)),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -236,7 +253,7 @@ fn main_caps(target: Target) -> &'static [Type] {
 /// Struct and enum definitions: unique names, known field and payload
 /// types, no type that contains itself.
 pub fn check_structs(p: &Program) -> Result<(), Diag> {
-    const RESERVED: &[&str] = &["u64", "u8", "u16", "u32", "bool", "Str", "Buf", "Bytes", "Host", "Child", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu", "Ports", "PortIo", "MmioSpace", "Mmio"];
+    const RESERVED: &[&str] = &["u64", "u8", "u16", "u32", "i8", "i16", "i32", "i64", "bool", "Str", "Buf", "Bytes", "Host", "Child", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu", "Ports", "PortIo", "MmioSpace", "Mmio", "Dma"];
     // (name, position, the types it holds directly)
     let mut defs: Vec<(String, Pos, Vec<Type>)> = Vec::new();
     for d in &p.structs {
@@ -315,7 +332,7 @@ fn overlaps(a: &str, b: &str) -> bool {
 /// (`&Bytes`, which becomes a pointer and a length).
 fn c_param_type(t: &Type) -> bool {
     match t {
-        Type::Ref(i) => **i == Type::Bytes,
+        Type::Ref(i) | Type::MutRef(i) => **i == Type::Bytes,
         t => c_value_type(t),
     }
 }
@@ -355,7 +372,7 @@ fn check_exports(p: &Program, target: Target) -> Result<(), Diag> {
         for prm in &f.params {
             if !c_param_type(&prm.ty) {
                 return Err(Diag::new("E-EXPORT", prm.pos, format!("a parameter of an exported function cannot have type `{}`", prm.ty.name()))
-                    .note("C can pass integers, `bool` and `&Bytes` (a pointer and a length)"));
+                    .note("C can pass integers, `bool`, and `&Bytes` or `&mut Bytes` (a pointer and a length)"));
             }
             let len = format!("{}_len", prm.name);
             if *prm.ty.base() == Type::Bytes && f.params.iter().any(|q| q.name == len) {
@@ -504,8 +521,8 @@ fn check_fn(f: &mut FnDef, sigs: &HashMap<String, Sig>, specs: &[SpecFn], target
 }
 
 /// Checks that the literal `v` fits in the integer type `t`.
-fn lit_fits(v: u128, t: &Type, pos: Pos) -> Result<(), Diag> {
-    if v > t.int_max() {
+fn lit_fits(v: i128, t: &Type, pos: Pos) -> Result<(), Diag> {
+    if v > t.int_max() || v < t.int_min() {
         return Err(Diag::new("E-TYPE", pos, format!("{} does not fit in {}", v, t.name())));
     }
     Ok(())
@@ -1013,6 +1030,9 @@ impl<'a> Ctx<'a> {
                     if !t.is_int() {
                         return Err(Diag::new("E-TYPE", args[0].pos, format!("`{}` converts an integer, found {}", n, t.name())));
                     }
+                    // The type converted from: whether it can be negative
+                    // matters to the proof.
+                    self.int_ops.insert(e.pos, t);
                     Ok(targs[0].clone())
                 }
                 _ => unreachable!("removed by monomorphization"),
@@ -1090,6 +1110,16 @@ impl<'a> Ctx<'a> {
                 expect_ty(&t, &Type::Bool, x.pos, "the operand of `!`")?;
                 Ok(Type::Bool)
             }
+            ExprKind::Neg(x) => {
+                // A negated literal with nothing to give it a signed type
+                // would be a u64.
+                let t = if int_lit(e).is_some() { Type::U64 } else { self.expr(x)? };
+                if !t.is_signed() {
+                    return Err(Diag::new("E-TYPE", e.pos, format!("unary minus needs a signed integer, found {}", t.name())));
+                }
+                self.int_ops.insert(e.pos, t.clone());
+                Ok(t)
+            }
             ExprKind::Bin(op, a, b) => {
                 if *op == BinOp::Implies {
                     return Err(Diag::new("E-TYPE", e.pos, "`==>` is only allowed in specifications"));
@@ -1105,8 +1135,10 @@ impl<'a> Ctx<'a> {
                 }
                 let (ta, tb) = self.operands(a, b)?;
                 let t = bin_type(*op, &ta, &tb, e.pos)?;
-                if t.is_int() {
-                    self.int_ops.insert(e.pos, t.clone());
+                // The operands' type: the result's for arithmetic, and what a
+                // comparison compares (signed or not matters to the C code).
+                if ta.is_int() {
+                    self.int_ops.insert(e.pos, ta.clone());
                 }
                 Ok(t)
             }
@@ -1205,7 +1237,7 @@ impl<'a> Ctx<'a> {
                 let t = self.expr_as(a, pt)?;
                 // A builtin's u64 parameter (an index, a length, a value)
                 // takes any narrower unsigned value: widening is free.
-                if *pt == Type::U64 && t.is_int() && t != Type::U64 && is_builtin(name) {
+                if *pt == Type::U64 && t.is_int() && !t.is_signed() && t != Type::U64 && is_builtin(name) {
                     continue;
                 }
                 expect_ty(&t, pt, a.pos, &format!("argument of `{}`", name))?;
@@ -1318,6 +1350,13 @@ impl<'a> Ctx<'a> {
                 let t = self.spec_expr(x, in_ensures, bound)?;
                 expect_ty(&t, &Type::Bool, x.pos, "the operand of `!`")?;
                 Ok(Type::Bool)
+            }
+            ExprKind::Neg(x) => {
+                let t = self.spec_expr(x, in_ensures, bound)?;
+                if !t.is_int() {
+                    return Err(Diag::new("E-TYPE", e.pos, format!("unary minus needs an integer, found {}", t.name())));
+                }
+                Ok(Type::U64)
             }
             ExprKind::Bin(op, a, b) => {
                 let ta = spec_norm(self.spec_expr(a, in_ensures, bound)?);

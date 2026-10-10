@@ -70,6 +70,7 @@ const CMD_ASSERT: u64 = 2;    // (assert a)
 const CMD_PUSH: u64 = 3;
 const CMD_POP: u64 = 4;
 const CMD_CHECK: u64 = 5;
+const CMD_FAIL: u64 = 6;      // not sent: a failure found without the solver (obls says which)
 
 /// Largest element count `alloc` accepts (2^60).
 const ALLOC_MAX: u64 = 1152921504606846976;
@@ -116,6 +117,8 @@ const VC_PT: u64 = 13;
 const VC_REQUIRES: u64 = 14;
 const VC_UNDERFLOW: u64 = 15;
 const VC_UNREACHABLE: u64 = 16;
+/// Not a proof: an `export fn` may free or replace a buffer C lent it.
+const VC_EXPORT: u64 = 17;
 
 fn vc_name(code: u64) -> Str {
   if code == VC_ALLOC { return "E-VERIFY-ALLOC"; }
@@ -133,6 +136,7 @@ fn vc_name(code: u64) -> Str {
   if code == VC_PT { return "E-VERIFY-PT"; }
   if code == VC_REQUIRES { return "E-VERIFY-REQUIRES"; }
   if code == VC_UNDERFLOW { return "E-VERIFY-UNDERFLOW"; }
+  if code == VC_EXPORT { return "E-EXPORT"; }
   return "E-VERIFY-UNREACHABLE";
 }
 
@@ -425,9 +429,14 @@ fn push_ty(v: &mut Vr, m: &Mono, p: &Parser, t: u64) {
   else if k == TY_PORTIO { push_str(&mut v, "PortIo"); }
   else if k == TY_MMIOSPACE { push_str(&mut v, "MmioSpace"); }
   else if k == TY_MMIO { push_str(&mut v, "Mmio"); }
+  else if k == TY_DMA { push_str(&mut v, "Dma"); }
   else if k == TY_U8 { push_str(&mut v, "u8"); }
   else if k == TY_U16 { push_str(&mut v, "u16"); }
   else if k == TY_U32 { push_str(&mut v, "u32"); }
+  else if k == TY_I8 { push_str(&mut v, "i8"); }
+  else if k == TY_I16 { push_str(&mut v, "i16"); }
+  else if k == TY_I32 { push_str(&mut v, "i32"); }
+  else if k == TY_I64 { push_str(&mut v, "i64"); }
   else if k == TY_STRUCT || k == TY_ENUM { push_inst(&mut v, m, p, x.a); }
   else if k == TY_BOX { push_str(&mut v, "Box["); push_ty(&mut v, m, p, x.a); push_str(&mut v, "]"); }
   else if k == TY_VEC { push_str(&mut v, "Vec["); push_ty(&mut v, m, p, x.a); push_str(&mut v, "]"); }
@@ -478,6 +487,16 @@ fn new_tm(v: &mut Vr, kind: u64, a: u64, b: u64, c: u64) -> u64 {
 
 fn num(v: &mut Vr, x: u64) -> u64 {
   return new_tm(&mut v, VT_NUM, x, 0, 0);
+}
+
+/// The number -x, written `(- x)` as stage0 writes a negative number (and
+/// 0 for -0).
+fn neg_num(v: &mut Vr, x: u64) -> u64 {
+  let t = num(&mut v, x);
+  if x == 0 {
+    return t;
+  }
+  return app1(&mut v, OP_SUB, t);
 }
 
 fn app1(v: &mut Vr, op: u64, x: u64) -> u64 {
@@ -547,7 +566,28 @@ fn int_max(v: &mut Vr, m: &Mono, t: u64) -> u64 {
   if k == TY_U8 { return num(&mut v, 255); }
   if k == TY_U16 { return num(&mut v, 65535); }
   if k == TY_U32 { return num(&mut v, 4294967295); }
+  if k == TY_I8 { return num(&mut v, 127); }
+  if k == TY_I16 { return num(&mut v, 32767); }
+  if k == TY_I32 { return num(&mut v, 2147483647); }
+  if k == TY_I64 { return num(&mut v, 9223372036854775807); }
   return v.t_u64max;
+}
+
+/// Half the modulus of a signed integer type: -(the smallest value).
+fn int_half(m: &Mono, t: u64) -> u64 {
+  let k = kind_t(m, t);
+  if k == TY_I8 { return 128; }
+  if k == TY_I16 { return 32768; }
+  if k == TY_I32 { return 2147483648; }
+  return 9223372036854775808;
+}
+
+/// The smallest value of integer type `t`.
+fn int_min(v: &mut Vr, m: &Mono, t: u64) -> u64 {
+  if is_signed(m, t) {
+    return neg_num(&mut v, int_half(m, t));
+  }
+  return v.t_zero;
 }
 
 /// 2^width of integer type `t` (2^64 does not fit in a u64, so it is text).
@@ -556,7 +596,43 @@ fn int_mod(v: &mut Vr, m: &Mono, t: u64) -> u64 {
   if k == TY_U8 { return num(&mut v, 256); }
   if k == TY_U16 { return num(&mut v, 65536); }
   if k == TY_U32 { return num(&mut v, 4294967296); }
+  if k == TY_I8 { return num(&mut v, 256); }
+  if k == TY_I16 { return num(&mut v, 65536); }
+  if k == TY_I32 { return num(&mut v, 4294967296); }
   return atom_str(&mut v, "18446744073709551616");
+}
+
+/// `x` reduced to the range of integer type `t`, as a C conversion to `t`
+/// does: modulo 2^width, two's complement for a signed type.
+fn wrap_term(v: &mut Vr, m: &Mono, t: u64, x: u64) -> u64 {
+  let md = int_mod(&mut v, m, t);
+  if is_signed(m, t) {
+    let h = num(&mut v, int_half(m, t));
+    let a = app2(&mut v, OP_ADD, x, h);
+    let r = app2(&mut v, OP_MOD, a, md);
+    return app2(&mut v, OP_SUB, r, h);
+  }
+  return app2(&mut v, OP_MOD, x, md);
+}
+
+/// `(ite (>= x 0) x (- x))`
+fn t_abs(v: &mut Vr, x: u64) -> u64 {
+  let ge = app2(&mut v, OP_GE, x, v.t_zero);
+  let n = app1(&mut v, OP_SUB, x);
+  return app3(&mut v, OP_ITE, ge, x, n);
+}
+
+/// C's division on signed operands, which truncates toward zero (SMT-LIB's
+/// `div` rounds so that the remainder is never negative).
+fn c_div(v: &mut Vr, a: u64, b: u64) -> u64 {
+  let aa = t_abs(&mut v, a);
+  let ab = t_abs(&mut v, b);
+  let q = app2(&mut v, OP_DIV, aa, ab);
+  let ga = app2(&mut v, OP_GE, a, v.t_zero);
+  let gb = app2(&mut v, OP_GE, b, v.t_zero);
+  let sg = app2(&mut v, OP_EQ, ga, gb);
+  let nq = app1(&mut v, OP_SUB, q);
+  return app3(&mut v, OP_ITE, sg, q, nq);
 }
 
 /// The integer type operator node `i` of instance `x` works on.
@@ -929,7 +1005,7 @@ fn term(v: &Vr, x: u64) -> u64 {
 fn obj_fields(k: u64) -> u64 {
   if k == TY_PT { return 3; }
   if k == TY_POOL { return 2; }
-  if k == TY_FRAME || k == TY_MMU || k == TY_PORTS || k == TY_MMIOSPACE { return 1; }
+  if k == TY_FRAME || k == TY_MMU || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA { return 1; }
   if k == TY_PORTIO || k == TY_MMIO { return 2; }
   return 0;
 }
@@ -942,7 +1018,7 @@ fn obj_field(v: &Vr, x: u64, j: u64) -> u64 {
 }
 
 // The ghost fields by name.
-fn g_id(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 0); }       // Frame, PageTable
+fn g_id(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 0); }       // Frame, PageTable, Dma
 fn g_level(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 1); }    // PageTable
 fn g_used(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 2); }     // PageTable
 fn g_has(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 0); }      // Pool
@@ -1558,7 +1634,7 @@ fn fresh_field(v: &mut Vr, tk: u64, j: u64, hint: u64) -> u64 {
 /// Ghost fields a loop keeps when only builtins that never change them
 /// change the object (a page table keeps its id and level).
 fn kept_by_builtins(tk: u64, j: u64) -> bool {
-  return ((tk == TY_FRAME || tk == TY_PT) && j == 0) || (tk == TY_PT && j == 1) || (tk == TY_POOL && j == 1)
+  return ((tk == TY_FRAME || tk == TY_PT || tk == TY_DMA) && j == 0) || (tk == TY_PT && j == 1) || (tk == TY_POOL && j == 1)
     || ((tk == TY_PORTIO || tk == TY_MMIO) && j <= 1);
 }
 
@@ -1589,9 +1665,10 @@ fn fresh_of(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, tyx: u64, hint: u64) 
   if k == TY_U64 {
     return fresh_u64(&mut v, hint);
   }
-  if k == TY_U8 || k == TY_U16 || k == TY_U32 {
+  if k == TY_U8 || k == TY_U16 || k == TY_U32 || is_signed(m, tyx) {
+    let min = int_min(&mut v, m, tyx);
     let max = int_max(&mut v, m, tyx);
-    let t = fresh_int(&mut v, hint, v.t_zero, max);
+    let t = fresh_int(&mut v, hint, min, max);
     return mk_u(&mut v, t);
   }
   if k == TY_BOOL {
@@ -2062,6 +2139,10 @@ fn spec_tm(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env: &Vec[
     let x = spec_tm(&mut v, c, &mut m, p, n.a, env, oenv, has_old, res, &mut bound);
     return t_not(&mut v, x);
   }
+  if k == E_NEG {
+    let x = spec_tm(&mut v, c, &mut m, p, n.a, env, oenv, has_old, res, &mut bound);
+    return app1(&mut v, OP_SUB, x);
+  }
   if k == E_BIN {
     let ta = spec_tm(&mut v, c, &mut m, p, n.a, env, oenv, has_old, res, &mut bound);
     let tb = spec_tm(&mut v, c, &mut m, p, n.b, env, oenv, has_old, res, &mut bound);
@@ -2156,7 +2237,7 @@ fn vspec_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env: &V
     let ix = spec_tm(&mut v, c, &mut m, p, arg_node(p, i, 1), env, oenv, has_old, res, &mut bound);
     return app2(&mut v, OP_SELECT, xv.b, ix);
   }
-  if span_is(p, n.s, n.e, "frame_id") || span_is(p, n.s, n.e, "pt_id") {
+  if span_is(p, n.s, n.e, "frame_id") || span_is(p, n.s, n.e, "pt_id") || span_is(p, n.s, n.e, "dma_id") {
     return g_id(v, x);
   }
   if span_is(p, n.s, n.e, "pt_level") {
@@ -2216,12 +2297,19 @@ fn eval(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VSta
       let xv = eval(&mut v, c, &mut m, p, inner.a, &mut st, 0);
       let x = term(v, xv);
       if name_is(p, n.b, "wrap") {
-        let md = int_mod(&mut v, m, t);
-        let r = app2(&mut v, OP_MOD, x, md);
+        let r = wrap_term(&mut v, m, t, x);
         return mk_u(&mut v, r);
       }
+      // Whether the source can be negative decides the bounds proved.
+      let from = int_op_ty(c, m, v.env, i);
       let max = int_max(&mut v, m, t);
-      let g = app2(&mut v, OP_LE, x, max);
+      let mut g = 0;
+      if !is_signed(m, from) && !is_signed(m, t) {
+        g = app2(&mut v, OP_LE, x, max);
+      } else {
+        let min = int_min(&mut v, m, t);
+        g = in_range(&mut v, min, x, max);
+      }
       prove(&mut v, st, g, i, VC_CAST);
       return mk_u(&mut v, x);
     }
@@ -2283,6 +2371,21 @@ fn eval(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VSta
     let x = eval(&mut v, c, &mut m, p, n.a, &mut st, 0);
     let t = t_not(&mut v, term(v, x));
     return mk_b(&mut v, t);
+  }
+  if k == E_NEG {
+    let a = node_at(p.nodes, n.a);
+    if a.kind == E_INT {
+      let t = neg_num(&mut v, a.v);
+      return mk_u(&mut v, t);
+    }
+    let x = eval(&mut v, c, &mut m, p, n.a, &mut st, 0);
+    let tx = term(v, x);
+    let min = int_min(&mut v, m, int_op_ty(c, m, v.env, i));
+    let eq = app2(&mut v, OP_EQ, tx, min);
+    let g = t_not(&mut v, eq);
+    prove(&mut v, st, g, i, VC_OVERFLOW);
+    let t = app1(&mut v, OP_SUB, tx);
+    return mk_u(&mut v, t);
   }
   if k == E_BIN {
     return eval_bin(&mut v, c, &mut m, p, i, &mut st);
@@ -2411,6 +2514,10 @@ fn eval_bin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut 
   }
   let vb = eval(&mut v, c, &mut m, p, n.b, &mut st, 0);
   let tb = term(v, vb);
+  let ity = int_op_ty(c, m, v.env, i);
+  if is_signed(m, ity) && (op == P_PLUS || op == P_MINUS || op == P_STAR || op == P_SLASH || op == P_PERCENT) {
+    return signed_arith(&mut v, m, op, ta, tb, ity, st, i);
+  }
   if op == P_PLUS || op == P_STAR {
     let t = app2(&mut v, bin_op(op), ta, tb);
     let max = int_max(&mut v, m, int_op_ty(c, m, v.env, i));
@@ -2438,6 +2545,38 @@ fn eval_bin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut 
   }
   let t = app2(&mut v, bin_op(op), ta, tb);
   return mk_b(&mut v, t);
+}
+
+/// Arithmetic on a signed type: the result must stay between the type's
+/// minimum and maximum; `/` and `%` truncate toward zero, as in C, and
+/// `MIN / -1` overflows.
+fn signed_arith(v: &mut Vr, m: &Mono, op: u64, ta: u64, tb: u64, ity: u64, st: &VState, i: u64) -> u64 {
+  let min = int_min(&mut v, m, ity);
+  let max = int_max(&mut v, m, ity);
+  if op == P_SLASH || op == P_PERCENT {
+    let eq = app2(&mut v, OP_EQ, tb, v.t_zero);
+    let g = t_not(&mut v, eq);
+    prove(&mut v, st, g, i, VC_DIVZERO);
+    let am = app2(&mut v, OP_EQ, ta, min);
+    let m1 = neg_num(&mut v, 1);
+    let bm = app2(&mut v, OP_EQ, tb, m1);
+    let both = app2(&mut v, OP_AND, am, bm);
+    let g2 = t_not(&mut v, both);
+    prove(&mut v, st, g2, i, VC_OVERFLOW);
+    let q = c_div(&mut v, ta, tb);
+    if op == P_SLASH {
+      return mk_u(&mut v, q);
+    }
+    let bq = app2(&mut v, OP_MUL, tb, q);
+    let r = app2(&mut v, OP_SUB, ta, bq);
+    return mk_u(&mut v, r);
+  }
+  let t = app2(&mut v, bin_op(op), ta, tb);
+  let hi = app2(&mut v, OP_LE, t, max);
+  prove(&mut v, st, hi, i, VC_OVERFLOW);
+  let lo = app2(&mut v, OP_LE, min, t);
+  prove(&mut v, st, lo, i, VC_UNDERFLOW);
+  return mk_u(&mut v, t);
 }
 
 /// `xs[from ..]`.
@@ -2686,8 +2825,7 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
       op = OP_SUB;
     }
     let t = app2(&mut v, op, term(v, x0), term(v, x1));
-    let md = int_mod(&mut v, m, int_op_ty(c, m, v.env, i));
-    let r = app2(&mut v, OP_MOD, t, md);
+    let r = wrap_term(&mut v, m, int_op_ty(c, m, v.env, i), t);
     return mk_u(&mut v, r);
   }
   if name_is(p, i, "unbox") {
@@ -3012,6 +3150,56 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     prove(&mut v, st, g2, i, VC_BOUNDS);
     let tm = num(&mut v, max);
     if name_is(p, i, "mmio_write8") || name_is(p, i, "mmio_write16") || name_is(p, i, "mmio_write32") || name_is(p, i, "mmio_write64") {
+      let g3 = app2(&mut v, OP_LE, term(v, x2), tm);
+      prove(&mut v, st, g3, i, VC_BYTE);
+      return v.unit;
+    }
+    let n = node_at(p.nodes, i);
+    let h = atom_src(&mut v, p, n.s, n.e);
+    let r = fresh_u64(&mut v, h);
+    let le = app2(&mut v, OP_LE, term(v, r), tm);
+    vec_push(&mut st.pc, le);
+    return r;
+  }
+  // Pages lent to devices: lending and taking back keep the page number.
+  if name_is(p, i, "dma_lend") {
+    return mk_obj(&mut v, m, kind_ty(m, p, TY_DMA), g_id(v, x0), 0, 0);
+  }
+  if name_is(p, i, "dma_take") {
+    return mk_obj(&mut v, m, v.ty_frame, g_id(v, x0), 0, 0);
+  }
+  if name_is(p, i, "dma_id") {
+    return mk_u(&mut v, g_id(v, x0));
+  }
+  if name_is(p, i, "dma_addr") {
+    return fresh_u64_named(&mut v, "dma_addr");
+  }
+  if name_is(p, i, "dma_read8") || name_is(p, i, "dma_read16") || name_is(p, i, "dma_read32") || name_is(p, i, "dma_read64")
+    || name_is(p, i, "dma_write8") || name_is(p, i, "dma_write16") || name_is(p, i, "dma_write32") || name_is(p, i, "dma_write64") {
+    let mut bytes = 8;
+    let mut max = U64_MAX;
+    if name_is(p, i, "dma_read8") || name_is(p, i, "dma_write8") {
+      bytes = 1;
+      max = 255;
+    } else if name_is(p, i, "dma_read16") || name_is(p, i, "dma_write16") {
+      bytes = 2;
+      max = 65535;
+    } else if name_is(p, i, "dma_read32") || name_is(p, i, "dma_write32") {
+      bytes = 4;
+      max = 4294967295;
+    }
+    let off = term(v, x1);
+    let tb = num(&mut v, bytes);
+    let end = app2(&mut v, OP_ADD, off, tb);
+    let page = num(&mut v, 4096);
+    let g = app2(&mut v, OP_LE, end, page);
+    prove(&mut v, st, g, i, VC_BOUNDS);
+    // The page is page-aligned, so an aligned offset is an aligned address.
+    let md = app2(&mut v, OP_MOD, off, tb);
+    let g2 = app2(&mut v, OP_EQ, md, v.t_zero);
+    prove(&mut v, st, g2, i, VC_BOUNDS);
+    let tm = num(&mut v, max);
+    if name_is(p, i, "dma_write8") || name_is(p, i, "dma_write16") || name_is(p, i, "dma_write32") || name_is(p, i, "dma_write64") {
       let g3 = app2(&mut v, OP_LE, term(v, x2), tm);
       prove(&mut v, st, g3, i, VC_BYTE);
       return v.unit;
@@ -3649,7 +3837,9 @@ fn shape_keeping(p: &Parser, i: u64) -> bool {
     || name_is(p, i, "cpu_fpu_save") || name_is(p, i, "cpu_fpu_load") || name_is(p, i, "pio_in8") || name_is(p, i, "pio_in16")
     || name_is(p, i, "pio_in32") || name_is(p, i, "pio_out8") || name_is(p, i, "pio_out16") || name_is(p, i, "pio_out32")
     || name_is(p, i, "mmio_read8") || name_is(p, i, "mmio_read16") || name_is(p, i, "mmio_read32") || name_is(p, i, "mmio_read64")
-    || name_is(p, i, "mmio_write8") || name_is(p, i, "mmio_write16") || name_is(p, i, "mmio_write32") || name_is(p, i, "mmio_write64");
+    || name_is(p, i, "mmio_write8") || name_is(p, i, "mmio_write16") || name_is(p, i, "mmio_write32") || name_is(p, i, "mmio_write64")
+    || name_is(p, i, "dma_read8") || name_is(p, i, "dma_read16") || name_is(p, i, "dma_read32") || name_is(p, i, "dma_read64")
+    || name_is(p, i, "dma_write8") || name_is(p, i, "dma_write16") || name_is(p, i, "dma_write32") || name_is(p, i, "dma_write64");
 }
 
 /// Places deeper than this many parts are summarized by their prefix of
@@ -3694,7 +3884,7 @@ fn changed_in_expr(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, ou
       let x = tapp_inst(&mut m, p, i, v.env);
       call_changes(&mut v, c, &mut m, p, n.b, x, &mut out);
     }
-  } else if k == E_NOT || k == E_IS || (k == E_VARIANT && n.a != 0) {
+  } else if k == E_NOT || k == E_NEG || k == E_IS || (k == E_VARIANT && n.a != 0) {
     changed_in_expr(&mut v, c, &mut m, p, n.a, &mut out);
   } else if k == E_BIN {
     changed_in_expr(&mut v, c, &mut m, p, n.a, &mut out);
@@ -3995,6 +4185,46 @@ fn verify_fn(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
 
 /// Verifies every function of the program monomorphized into `m` and
 /// checked by `c`.
+/// A `&mut Bytes` that C lends to an `export fn` is the caller's memory:
+/// the function may write its bytes but must hand back the same buffer,
+/// never free or replace it. Its summary shows that: every place under the
+/// parameter is changed only in shape-keeping ways. A parameter that is not
+/// kept is recorded as a failure (CMD_FAIL) at this point of the log, which
+/// is where stage0 reports it.
+fn buffers_kept(v: &mut Vr, m: &mut Mono, p: &Parser, x: u64) {
+  let xi = inst_at(m, x);
+  let d = node_at(p.nodes, xi.def);
+  let mut q = d.a;
+  let mut j = 0;
+  let mut done = false;
+  while q != 0 && j < SRC_MAX && !done {
+    let qn = node_at(p.nodes, q);
+    let pt = conv(&mut m, p, qn.a, x, q);
+    if kind_t(m, pt) == TY_MUTREF && kind_t(m, inner_t(m, pt)) == TY_BYTES {
+      let start = u_at(v.sum_start, x);
+      let end = vadd(start, u_at(v.sum_n, x));
+      let mut any = false;
+      let mut all = true;
+      let mut k = start;
+      while k < end {
+        let r = sum_row(v, k);
+        if r.j == j {
+          any = true;
+          all = all && r.keep;
+        }
+        k = k + 1;
+      }
+      if !(any && all) {
+        vec_push(&mut v.obls, Obl { at: q, code: VC_EXPORT, x: x, env: 0, n: 0 });
+        send(&mut v, CMD_FAIL, 0, 0);
+        done = true;
+      }
+    }
+    q = qn.next;
+    j = j + 1;
+  }
+}
+
 fn verify_program(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
   summarize(&mut v, c, &mut m, p);
   send(&mut v, CMD_DECL, v.t_poolsize, SO_INT);
@@ -4006,6 +4236,9 @@ fn verify_program(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
   let mut k = 0;
   while k < vec_len(m.fns) {
     let x = u_at(m.fns, k);
+    if exported_x(m, p, x) {
+      buffers_kept(&mut v, &mut m, p, x);
+    }
     send(&mut v, CMD_PUSH, 0, 0);
     verify_fn(&mut v, c, &mut m, p, x);
     send(&mut v, CMD_POP, 0, 0);

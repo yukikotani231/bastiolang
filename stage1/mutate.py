@@ -85,7 +85,7 @@ for f in args[5:]:
                     unverified += 1
                     continue
                 want += n.group(1) + b' proof obligation(s)\n'
-            if verify and not re.search(rb'proof obligation|^error \S+ E-(VERIFY|SOLVER)', want, re.M):
+            if verify and not re.search(rb'proof obligation|^error \S+ E-(VERIFY|SOLVER|EXPORT)', want, re.M):
                 unverified += 1
                 continue
             got = subprocess.run(tool.split() + [target], capture_output=True).stdout

@@ -91,7 +91,7 @@ match=0 differ=0 skipped=0 failed=0
 for f in $files; do
   t=$(target_of "$f")
   "$BASTIOC" --dump-verify --target "$t" "$f" >"$tmp/want" 2>/dev/null
-  if ! grep -q -e 'proof obligation' -e '^error [^ ]* E-VERIFY' -e '^error [^ ]* E-SOLVER' "$tmp/want"; then
+  if ! grep -q -e 'proof obligation' -e '^error [^ ]* E-VERIFY' -e '^error [^ ]* E-SOLVER' -e '^error [^ ]* E-EXPORT' "$tmp/want"; then
     skipped=$((skipped+1))
     continue
   fi

@@ -1,0 +1,52 @@
+// DER checking (examples/der): one SEQUENCE of about 16 MiB holding a
+// 35-byte record (`der_template.bin`, 10 elements, nested 3 deep) over and
+// over, checked 20 times.
+import "../examples/der/der.bastio";
+
+// 479349 records.
+const BODY: u64 = 16777215;
+
+fn input() -> Bytes
+  ensures blen(result) == BODY + 5
+{
+  let t = include_bytes("der_template.bin");
+  let mut b = balloc(BODY + 5);
+  // SEQUENCE, three length bytes: 0xffffff.
+  bset(&mut b, 0, 48);
+  bset(&mut b, 1, 131);
+  bset(&mut b, 2, 255);
+  bset(&mut b, 3, 255);
+  bset(&mut b, 4, 255);
+  let mut i = 0;
+  while i < BODY
+    invariant i <= BODY
+  {
+    bset(&mut b, 5 + i, sget(t, i % 35));
+    i = i + 1;
+  }
+  return b;
+}
+
+fn main() -> u64 {
+  let b = input();
+  let mut total = 0;
+  let mut round = 0;
+  while round < 20
+    invariant round <= 20 && total <= round * (BODY + 5) && blen(b) == BODY + 5
+  {
+    match der_check(b) {
+      Der::Ok(c) => { total = total + c; }
+      Der::Bad(at) => { total = total + 0; }
+    }
+    round = round + 1;
+  }
+  // Walk the first record's header too, so der_read is used as in the
+  // library (and the C twin keeps the same callers).
+  match der_read(b, 5) {
+    Tlv::Ok(e) => { total = total + e.end - e.value; }
+    Tlv::Bad(at) => { total = total + 0; }
+  }
+  bfree(b);
+  print(total);
+  return 0;
+}

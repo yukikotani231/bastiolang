@@ -269,7 +269,7 @@ module.exports = grammar({
       );
     },
 
-    unary_expression: ($) => prec(PREC.unary, seq('!', field('operand', $._expression))),
+    unary_expression: ($) => prec(PREC.unary, seq(field('operator', choice('!', '-')), field('operand', $._expression))),
 
     is_expression: ($) =>
       prec.left(

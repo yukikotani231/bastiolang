@@ -1,0 +1,51 @@
+// expect-exit: 42
+// Signed integers (docs/integers.md, step 2): i8 to i64, two's complement,
+// proved to stay between their minimum and maximum. `/` truncates toward
+// zero and `%` takes the sign of the dividend, as in C.
+
+struct Delta { dx: i16, dy: i16 }
+
+fn abs(x: i32) -> i32
+  requires x > -2147483648
+  ensures result >= 0 && (result == x || result == -x)
+{
+  if x < 0 { return -x; }
+  return x;
+}
+
+// A Linux-style system call result: a negative number is an error code.
+fn errno_of(ret: u64) -> i64 {
+  let r: i64 = wrap[i64](ret);
+  if r < 0 && r > -4096 { return -r; }
+  return 0;
+}
+
+// What the prover knows about `/` and `%` is C's rule: these hold for every
+// pair of operands, and the sanitizer run checks the C code agrees.
+fn divmod(a: i8, b: i8) -> i8
+  requires b != 0 && !(a == -128 && b == -1)
+{
+  let q = a / b;
+  let r = a % b;
+  assert q * b + r == a;
+  assert r == 0 || (r > 0) == (a > 0);
+  assert r * r < b * b;
+  return r;
+}
+
+fn main() -> u64 {
+  let d = Delta { dx: -300, dy: 120 };
+  let total: i32 = abs(cast[i32](d.dx)) + abs(cast[i32](d.dy));   // 420
+  let n: i8 = -7;
+  let q = n / 2;                                                 // -3
+  let r = n % 2;                                                 // -1
+  let lo: i8 = -128;
+  let hi: i64 = 9223372036854775807;
+  let e = errno_of(18446744073709551614);                        // -2 as u64: ENOENT
+  let back: u8 = wrap[u8](lo);                                   // 128
+  let m: i16 = wrap_mul(cast[i16](lo), 300);                     // -38400 mod 2^16 = 27136
+  if divmod(-7, 2) != -1 || divmod(7, -2) != 1 || divmod(-128, 3) != -2 { return 3; }
+  if total != 420 || q != -3 || r != -1 || e != 2 || back != 128 || m != 27136 { return 1; }
+  if lo >= 0 || hi - 1 < 0 || -cast[i16](lo) != 128 { return 2; }
+  return cast[u64](total / 10);                                    // 42
+}

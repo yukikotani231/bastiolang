@@ -146,7 +146,8 @@ fn main(con: &mut Serial) -> u64 {
 | Type | Meaning |
 | --- | --- |
 | `u64` | Unsigned 64-bit integer. Arithmetic is proved to stay in range; it never wraps |
-| `u8`, `u16`, `u32` | Narrower unsigned integers (C's `uint8_t` and so on), with the same proofs. See "Sized integers" below; signed types are designed in [integers.md](integers.md) |
+| `u8`, `u16`, `u32` | Narrower unsigned integers (C's `uint8_t` and so on), with the same proofs. See "Sized integers" below |
+| `i8`, `i16`, `i32`, `i64` | Signed integers (C's `int8_t` and so on), proved to stay in range. See "Sized integers" below |
 | `bool` | `true` or `false` |
 | `Str` | A string literal: immutable bytes whose length and contents are known at compile time. Never freed |
 | A struct or enum with no linear part | See [Structs](#structs) and [Enums](#enums-and-match) |
@@ -161,7 +162,7 @@ fn main(con: &mut Serial) -> u64 {
 | `Box[T]` | An owning pointer to a `T` on the heap; the only way a type can contain itself |
 | A struct with a linear field, an enum with a linear payload | |
 | `Host`, `Child` | The host system, and a child process (hosted target only) |
-| `Serial`, `Pool`, `Frame`, `PageTable`, `Mmu`, `Cpu`, `Ports`, `PortIo`, `MmioSpace`, `Mmio` | Capabilities: the console, physical pages, page tables, the MMU, the CPU's user context, I/O ports and memory-mapped device registers. See [Kernel capabilities](#kernel-capabilities) |
+| `Serial`, `Pool`, `Frame`, `PageTable`, `Mmu`, `Cpu`, `Ports`, `PortIo`, `MmioSpace`, `Mmio`, `Dma` | Capabilities: the console, physical pages, page tables, the MMU, the CPU's user context, I/O ports, memory-mapped device registers and pages lent to devices. See [Kernel capabilities](#kernel-capabilities) |
 
 **Borrows** are allowed only as parameter types, so a borrow can never be stored, returned or outlive the call:
 
@@ -379,6 +380,42 @@ fn low_byte(n: u64) -> u8 {
 
 fn main() -> u64 {
   return cast[u64](low_byte(300));
+}
+```
+
+**Signed integers.** `i8`, `i16`, `i32` and `i64` are proved to stay between their minimum and maximum: an operation that could go below the minimum is `E-VERIFY-UNDERFLOW`, above the maximum `E-VERIFY-OVERFLOW`. Unary minus `-x` works on signed types only (`E-TYPE` on unsigned ones) and is proved not to be applied to the minimum, whose negation does not fit. Division truncates toward zero and `%` takes the sign of the dividend, as in C; `MIN / -1` is `E-VERIFY-OVERFLOW`. `cast[u64](x)` on a signed `x` is proved non-negative; builtins that take `u64` do not accept a signed value without such a conversion. An expression made only of literals is `u64`, so a negative number needs a signed position (`let n: i8 = -7;`).
+
+```bastio
+// expect-exit: 42
+fn abs(x: i32) -> i32
+  requires x != -2147483648
+  ensures result >= 0 && (result == x || result == -x)
+{
+  if x < 0 {
+    return -x;
+  }
+  return x;
+}
+
+fn main() -> u64 {
+  let n: i8 = -7;
+  let q: i8 = n / 2;             // -3: truncates toward zero
+  let r: i8 = n % 2;             // -1: sign of the dividend
+  if q != -3 || r != -1 {
+    return 1;
+  }
+  return cast[u64](abs(-40)) + 2;
+}
+```
+
+```bastio
+// expect-error: E-VERIFY-OVERFLOW
+fn negate(x: i8) -> i8 {
+  return -x;                     // fails: x may be -128, and 128 does not fit in i8
+}
+
+fn main() -> u64 {
+  return cast[u64](negate(-5));
 }
 ```
 
@@ -730,7 +767,7 @@ fn main(host: &mut Host) -> u64 {
 
 ## Kernel capabilities
 
-Hardware is reached only through capability types. There is no way to read or write memory through an integer address (ROADMAP invariant 1). Capabilities are linear, and `main` is handed the ones its target provides; they cannot be created. They carry **ghost state** that exists only in the proof: in the generated code a `Frame` or `PageTable` is a bare physical address, `Serial`, `Mmu`, `Cpu`, `Ports` and `MmioSpace` are empty, and a `PortIo` or `Mmio` is its base and size.
+Hardware is reached only through capability types. There is no way to read or write memory through an integer address (ROADMAP invariant 1). Capabilities are linear, and `main` is handed the ones its target provides; they cannot be created. They carry **ghost state** that exists only in the proof: in the generated code a `Frame`, `PageTable` or `Dma` is a bare physical address, `Serial`, `Mmu`, `Cpu`, `Ports` and `MmioSpace` are empty, and a `PortIo` or `Mmio` is its base and size.
 
 | Type | Meaning |
 | --- | --- |
@@ -744,12 +781,13 @@ Hardware is reached only through capability types. There is no way to read or wr
 | `PortIo` | A claimed range of I/O ports, owned: the only way to read or write them |
 | `MmioSpace` | The device window (physical `0xC0000000` up to 4 GiB, which the kernel platform maps uncached): the right to claim each byte of it, once |
 | `Mmio` | A claimed block of memory-mapped device registers, owned: the only way to read or write them |
+| `Dma` | A page lent to devices for DMA: while lent it is not a `Frame`, so it cannot be freed, mapped or reused |
 
 Ghost accessors, usable in specifications:
 
 | Accessor | Meaning |
 | --- | --- |
-| `frame_id(f)`, `pt_id(t)` | The page number |
+| `frame_id(f)`, `pt_id(t)`, `dma_id(d)` | The page number |
 | `pt_level(t)` | 1 (maps pages) to 4 (top level, what CR3 holds); 5 is a container for level-4 tables that is never loaded into CR3 |
 | `pt_used(t, i)` | Slot `i` owns something |
 | `pool_has(p, i)` | The pool can still hand out page `i` |
@@ -908,7 +946,7 @@ fn main(ports: &mut Ports) -> u64 {
 | `mmio_read8` / `16` / `32` / `64(r: &mut Mmio, off: u64) -> u64` | `off + width <= mmio_len(r)`; `mmio_base(r) + off` is a multiple of the width | One volatile load; the result fits the width |
 | `mmio_write8` / `16` / `32` / `64(r: &mut Mmio, off: u64, v: u64)` | the same, and `v` fits the width | One volatile store |
 
-The rules are those of ports: claiming compiles to nothing, two drivers never own the same register, and reads take `&mut`. Because claims must lie in the device window and the page pool stays below 256 MiB, a driver can never reach memory the allocator owns. What a device does with the values is not modelled; nor are DMA buffers yet.
+The rules are those of ports: claiming compiles to nothing, two drivers never own the same register, and reads take `&mut`. Because claims must lie in the device window and the page pool stays below 256 MiB, a driver can never reach memory the allocator owns. What a device does with the values is not modelled.
 
 ```bastio
 // expect-exit: 0
@@ -919,6 +957,36 @@ fn main(win: &mut MmioSpace) -> u64 {
   // mmio_read32(&mut apic, 0x32) would be E-VERIFY-BOUNDS (unaligned).
   mmio_release(&mut win, apic);
   return v % 1;
+}
+```
+
+**Pages lent to devices** (kernel and hosted). A device that reads or writes memory on its own (DMA) is given a page by turning its `Frame` into a `Dma`:
+
+| Builtin | Requires (proved) | Effect |
+| --- | --- | --- |
+| `dma_lend(f: Frame) -> Dma` | | Lends the page to devices. A full memory fence first, so earlier stores reach memory before any device can be told where the page is |
+| `dma_take(d: Dma) -> Frame` | | Takes the same page back (`frame_id` is `dma_id(d)`), after a fence |
+| `dma_id(d: &Dma) -> u64` | | The page number |
+| `dma_addr(d: &Dma) -> u64` | | The page's physical address, to program into a device. Only a lent page's address can be read |
+| `dma_read8` / `16` / `32` / `64(d: &mut Dma, off: u64) -> u64` | `off + width <= 4096`; `off` is a multiple of the width | One volatile load; the result fits the width |
+| `dma_write8` / `16` / `32` / `64(d: &mut Dma, off: u64, v: u64)` | the same, and `v` fits the width | One volatile store |
+
+What is proved: while a page is lent it cannot go back to the pool, into a page table or into anything else that takes a `Frame`, so a device can never write a page that has been reused; the CPU reaches it only with volatile, aligned, in-bounds accesses, so the C compiler cannot cache or tear what the device sees; and a `Dma` must be taken back before the program ends (it is linear). What is trusted: that the driver has stopped the device using the page (for example, seen its completion) before `dma_take`, and that the addresses it programs into the device are those of pages it has lent. Devices are outside the proof.
+
+```bastio
+// expect-exit: 0
+// A one-page buffer handed to a device and taken back.
+fn main(pool: &mut Pool) -> u64 {
+  if pool_size(pool) == 0 {
+    return 0;
+  }
+  let mut d = dma_lend(pool_take(&mut pool, 0));
+  let a = dma_addr(d);
+  dma_write64(&mut d, 0, a);
+  // dma_write64(&mut d, 4092, 0) would be E-VERIFY-BOUNDS (past the page).
+  let f = dma_take(d);
+  pool_give(&mut pool, f);
+  return 0;
 }
 ```
 
@@ -1007,7 +1075,7 @@ Syntax, types and linearity:
 | `E-TYPE` | Type error: wrong argument or field types, an unknown name, a borrow used outside a parameter, shadowing, a bad `main` signature, a generic definition that cannot be instantiated, and so on |
 | `E-TARGET` | A builtin the target does not have (such as `host_read` in a kernel) |
 | `E-IMPORT` | An imported file cannot be read, or files import each other |
-| `E-EXPORT` | An `export fn` breaks a rule of the C boundary: it has a `requires`, takes or returns a type C cannot pass, is `main`, or is outside the hosted target |
+| `E-EXPORT` | An `export fn` breaks a rule of the C boundary: it has a `requires`, takes or returns a type C cannot pass, may free or replace a buffer C lends it, is `main`, or is outside the hosted target |
 | `E-MATCH` | A `match` misses a variant, matches one twice, or has an arm after `_` |
 | `E-LINEAR-USE` | A consumed value (or a moved-out field, or a struct with a field moved out) is used; one call both borrows and moves a value, or lends it twice with one loan `&mut`; a borrow is returned; a value is consumed where the code may run more than once or not at all (a `while` condition, the right side of `&&` / `\|\|`) |
 | `E-LINEAR-LEAK` | A linear value is still owned at the end of its scope or at a `return`, is overwritten, or is dropped by `_` |
@@ -1084,14 +1152,15 @@ bst_e_Found find(const uint8_t *b, size_t b_len, uint64_t c);
 ```
 
 What may cross the boundary (otherwise `E-EXPORT`):
-- **Parameters:** integers, `bool`, and `&Bytes`, which becomes a pointer and a length (`b`, `b_len`). C can only lend bytes for reading; `&mut` and owned values are not accepted yet.
+- **Parameters:** integers, `bool`, `&Bytes`, which becomes a `const` pointer and a length (`b`, `b_len`), and `&mut Bytes`, a buffer the caller owns and the function writes into (`uint8_t *b, size_t b_len`), so a library need not allocate. Owned values are not accepted.
+- **A lent `&mut Bytes` stays the caller's.** The function may write its bytes (`bset`, or by lending it to functions that only do that) but never free or replace it. The compiler proves this from the summary it already computes of what each function may change in its `&mut` arguments ([How verification works](#how-verification-works)), through any depth of calls; a function that might replace the buffer is `E-EXPORT`. So the buffer is the same allocation, of the same length, when the call returns, and there is nothing to copy back.
 - **Results:** integers, `bool`, nothing, `Bytes`, and structs and enums built only from those. The header defines the C types (`bst_bytes`, `bst_s_Name`, `bst_e_Name`, with a `bst_e_Name_Variant` constant for each enum tag) exactly as the generated C lays them out. Bytes handed back belong to the caller, who releases `data` with `free()`.
 - **No `requires`.** A C caller cannot be proved to meet a precondition, so an exported function has none: it checks the condition itself and returns an error value instead, which is then proved like any other code (`examples/base64/lib.bastio` does this for the encoder's length limit). This keeps the boundary free of generated checks. `ensures` clauses are allowed and are copied into the header as comments: they are proved, so the caller may rely on them.
 - Not generic (`E-TYPE`), not `main`, not a name starting with `bst_`, and only on the hosted target.
 
-The proof of an exported function assumes three things about its C caller that nothing checks (they are listed by `--trusted-base` and stated in the header): a `&Bytes` pointer is readable for its length and nothing writes those bytes during the call; that length is at most 2^60 (which follows from the first, since no x86-64 address space is that large); and every argument is a valid value of its C type. A C caller that breaks them can make the Bastio code misbehave, as with any C library.
+The proof of an exported function assumes these things about its C caller that nothing checks (they are listed by `--trusted-base` and stated in the header): a `&Bytes` pointer is readable for its length and nothing writes those bytes during the call; a `&mut Bytes` pointer is readable and writable for its length, overlaps no other buffer argument, and nothing else uses it during the call; such a length is at most 2^60 (which follows from the first two, since no x86-64 address space is that large); and every argument is a valid value of its C type. A C caller that breaks them can make the Bastio code misbehave, as with any C library.
 
-The C function is a thin wrapper that converts the pointer and length into the internal `bst_bytes` and calls the proved function; it does no other work. A worked example with a test harness and a benchmark is in `examples/base64`.
+The C function is a thin wrapper that converts each pointer and length into the internal `bst_bytes` and calls the proved function; it does no other work. A worked example with a test harness and a benchmark is in `examples/base64`.
 
 ## Soundness scope
 
@@ -1109,4 +1178,4 @@ What a program that `bastioc0` accepts is guaranteed: no out-of-bounds access, n
 
 ## Not in the language yet
 
-Planned, in [ROADMAP.md](../ROADMAP.md): concurrency (designed in [concurrency.md](concurrency.md)), signed integer types, C buffers lent for writing to an `export fn`, more hardware capabilities (`IrqOff`, DMA buffers), allocation failure in the type, and a native x86-64 backend. Inference of type arguments, modules with qualified names, and hand-written lemmas for proofs Z3 cannot find are open questions.
+Planned, in [ROADMAP.md](../ROADMAP.md): concurrency (designed in [concurrency.md](concurrency.md)), signed integer types, more hardware capabilities (`IrqOff`), allocation failure in the type, and a native x86-64 backend. Inference of type arguments, modules with qualified names, and hand-written lemmas for proofs Z3 cannot find are open questions.

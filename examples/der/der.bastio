@@ -1,0 +1,162 @@
+// DER (ASN.1 Distinguished Encoding Rules) structure checker: the
+// tag-length-value format of X.509 certificates and PKCS keys, where a
+// length field read without care sends a parser past its buffer.
+//
+// A C library: each `export fn` is a C function (see README.md). What the
+// compiler proves, for every input and with no runtime checks in the
+// generated code: no out-of-bounds read, no overflow, and the `ensures`
+// clauses (every span handed back lies inside the input). Not proved: that
+// the checker accepts exactly the DER it should; the C harness compares it
+// with an independent C implementation.
+//
+// Supported: tags below 31 (one tag byte; the high-tag-number form is
+// rejected), definite lengths of up to 4 bytes in minimal form, nesting up
+// to DER_MAX_DEPTH constructed elements deep.
+
+const DER_MAX_DEPTH: u64 = 64;
+
+/// One element: its tag byte and its value, `value..end` in the input.
+struct Elem { tag: u8, value: u64, end: u64 }
+
+enum Tlv {
+  Ok(Elem),
+  // The offset of the element whose header is malformed.
+  Bad(u64),
+}
+
+enum Der {
+  // The input is one well-formed element; the number of elements in it,
+  // nested ones included.
+  Ok(u64),
+  // The offset of the first malformed element, or of the first byte after
+  // the top-level element if more follows.
+  Bad(u64),
+}
+
+/// Reads the header of the element at `at`, which must end by `limit`.
+fn header(s: &Bytes, at: u64, limit: u64) -> Tlv
+  requires at <= limit && limit <= blen(s)
+  ensures result is Tlv::Ok ==> at + 2 <= result.Ok.value && result.Ok.value <= result.Ok.end && result.Ok.end <= limit
+  ensures result is Tlv::Bad ==> result.Bad == at
+{
+  if limit - at < 2 {
+    return Tlv::Bad(at);
+  }
+  let tag = bget(s, at);
+  let b = bget(s, at + 1);
+  // The high-tag-number form; the indefinite length; more than 4 length bytes.
+  if tag % 32 == 31 || b == 128 || b > 132 {
+    return Tlv::Bad(at);
+  }
+  let mut p = at + 2;
+  let mut size = b;
+  if b > 128 {
+    let k = b - 128;
+    if limit - p < k || bget(s, p) == 0 {
+      return Tlv::Bad(at);
+    }
+    size = 0;
+    let mut j = 0;
+    while j < k
+      invariant j <= k && k <= 4 && p + k <= limit
+      invariant (j == 0 ==> size == 0) && (j == 1 ==> size < 256) && (j == 2 ==> size < 65536)
+      invariant (j == 3 ==> size < 16777216) && (j == 4 ==> size < 4294967296)
+    {
+      size = size * 256 + bget(s, p + j);
+      j = j + 1;
+    }
+    // DER: the long form only for lengths the short form cannot hold.
+    if size < 128 {
+      return Tlv::Bad(at);
+    }
+    p = p + k;
+  }
+  if limit - p < size {
+    return Tlv::Bad(at);
+  }
+  return Tlv::Ok(Elem { tag: cast[u8](tag), value: p, end: p + size });
+}
+
+/// Is an element with this tag constructed (its value a list of elements)?
+fn constructed(tag: u8) -> bool {
+  return tag / 32 % 2 == 1;
+}
+
+/// Checks the elements filling `s[at..limit)`, recursively, and counts them.
+/// `depth` is how many constructed elements enclose them.
+fn elems(s: &Bytes, at: u64, limit: u64, depth: u64) -> Der
+  requires at <= limit && limit <= blen(s)
+  ensures result is Der::Ok ==> result.Ok <= limit - at
+  ensures result is Der::Bad ==> at <= result.Bad && result.Bad < limit
+{
+  let mut p = at;
+  let mut count = 0;
+  while p < limit
+    invariant at <= p && p <= limit && count <= p - at
+  {
+    match header(s, p, limit) {
+      Tlv::Bad(x) => {
+        return Der::Bad(x);
+      }
+      Tlv::Ok(e) => {
+        if constructed(e.tag) {
+          if depth >= DER_MAX_DEPTH {
+            return Der::Bad(p);
+          }
+          match elems(s, e.value, e.end, depth + 1) {
+            Der::Bad(x) => {
+              return Der::Bad(x);
+            }
+            Der::Ok(c) => {
+              count = count + c;
+            }
+          }
+        }
+        count = count + 1;
+        p = e.end;
+      }
+    }
+  }
+  return Der::Ok(count);
+}
+
+/// Checks that `src` is exactly one well-formed DER element.
+export fn der_check(src: &Bytes) -> Der
+  ensures result is Der::Ok ==> result.Ok >= 1 && result.Ok <= blen(src)
+  ensures result is Der::Bad ==> result.Bad <= blen(src)
+{
+  let n = blen(src);
+  match header(src, 0, n) {
+    Tlv::Bad(x) => {
+      return Der::Bad(x);
+    }
+    Tlv::Ok(e) => {
+      if e.end != n {
+        return Der::Bad(e.end);
+      }
+      if !constructed(e.tag) {
+        return Der::Ok(1);
+      }
+      match elems(src, e.value, e.end, 1) {
+        Der::Bad(x) => {
+          return Der::Bad(x);
+        }
+        Der::Ok(c) => {
+          return Der::Ok(c + 1);
+        }
+      }
+    }
+  }
+}
+
+/// Reads the header of the element at `at` in `src`, for walking a checked
+/// structure from C: the value is `src[value..end)`, and the next sibling
+/// starts at `end`.
+export fn der_read(src: &Bytes, at: u64) -> Tlv
+  ensures result is Tlv::Ok ==> at < result.Ok.value && result.Ok.value <= result.Ok.end && result.Ok.end <= blen(src)
+{
+  if at > blen(src) {
+    return Tlv::Bad(at);
+  }
+  return header(src, at, blen(src));
+}
