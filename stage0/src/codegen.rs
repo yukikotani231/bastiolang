@@ -565,7 +565,7 @@ static void bst_print(uint64_t v) {
  * code identity-maps. With a Multiboot memory map (flags bit 6) that is the
  * run of available entries, merged where they touch, that holds the first
  * page after the kernel: UEFI firmware leaves holes low in memory, where
- * mem_upper (bit 0, the fallback) stops. */
+ * mem_upper (bit 0, the fallback) stops. A map outside the 1 GiB is not read. */
 extern char _end[];
 extern uint64_t bst_kernel_pml4[512];
 static uint64_t bst_pool_base;
@@ -574,7 +574,7 @@ static bst_pool bst_pool_init(uint64_t mbi) {
     uint64_t base = ((uint64_t)_end + 4095) & ~4095ull;
     uint64_t ram_end = 64ull << 20;
     if (info && (info[0] & 1)) ram_end = (1ull << 20) + ((uint64_t)info[2] << 10);
-    if (info && (info[0] & 64)) {
+    if (info && (info[0] & 64) && (uint64_t)info[12] + info[11] <= (1ull << 30)) {
         uint64_t end = base;
         for (int grew = 1; grew; ) {
             grew = 0;
