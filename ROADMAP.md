@@ -56,7 +56,9 @@ What the compiler needs in order to be written in Bastio. Structs come first (re
   - [x] Lexer (`stage1/lexer.bastio`, done 2026-10-10): the same tokens and lexical errors as stage0 on every source in this repository and in BastiOS (`stage1/difftest.sh`, run in CI)
   - [x] Parser (`stage1/parser.bastio`, done 2026-10-10): the same syntax tree as stage0 (`--dump-ast`) on every source, and the same first-error position on damaged copies of them (`stage1/mutate.py`)
   - [x] Checker (`stage1/loader.bastio`, `mono.bastio`, `check.bastio`, done 2026-10-10): imports, monomorphization, types and linearity, with the same result as stage0 (`--dump-mono`, `--dump-check`, including the type of every `let`) on every source and on damaged copies, library files included
-  - [ ] Verifier (talks to Z3 through a `Child`)
+  - [ ] Verifier
+    - [x] Queries (`stage1/verify.bastio`, done 2026-10-10): symbolic execution produces the same SMT-LIB commands as stage0, character for character, and the same number of proof obligations (`--dump-smt`), on every program stage0 verifies (the BastiOS kernel included) and on damaged copies that still verify. Every proof is assumed to succeed for now. Generating all 273,000 commands for stage1's largest program takes 0.7 s; stage0 takes 3.6 s on it, nearly all of it Z3
+    - [ ] Asking Z3 through a `Child`, with stage0's errors and counterexamples
   - [ ] C code generation
 - [ ] bastioc1 compiles itself and reaches a fixed point (gen2 == gen1)
 - [ ] stage0 is frozen
