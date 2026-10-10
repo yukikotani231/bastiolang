@@ -70,6 +70,10 @@ pub enum Type {
     /// (`pt_leases`), so other processors may run on it at the same time.
     /// Linear and pinned; given back with `mmu_exit`. Kernel target only.
     Lease,
+    /// One reference to a page that several page tables may map at once
+    /// (`shared_new`): the page stays allocated while any reference is
+    /// held, and the last `shared_drop` gives it back to the pool. Linear.
+    Shared,
     /// A user-defined struct. Linear when any field is linear; otherwise a
     /// plain value that is copied.
     Struct(String),
@@ -129,6 +133,7 @@ impl Type {
             Type::Mmio => "Mmio".into(),
             Type::Dma => "Dma".into(),
             Type::Lease => "Lease".into(),
+            Type::Shared => "Shared".into(),
             Type::Struct(n) | Type::Enum(n) => n.clone(),
             Type::Box(t) => format!("Box[{}]", t.name()),
             Type::Vec(t) => format!("Vec[{}]", t.name()),
@@ -141,7 +146,7 @@ impl Type {
     }
     pub fn is_linear(&self) -> bool {
         match self {
-            Type::Buf | Type::Bytes | Type::Host | Type::Child | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu | Type::Ports | Type::PortIo | Type::MmioSpace | Type::Mmio | Type::Dma | Type::Lease | Type::Box(_) | Type::Vec(_) | Type::Lock(_) | Type::Atomic(_) => true,
+            Type::Buf | Type::Bytes | Type::Host | Type::Child | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu | Type::Ports | Type::PortIo | Type::MmioSpace | Type::Mmio | Type::Dma | Type::Lease | Type::Shared | Type::Box(_) | Type::Vec(_) | Type::Lock(_) | Type::Atomic(_) => true,
             Type::Struct(n) => struct_def(n).map_or(false, |d| d.fields.iter().any(|f| f.1.is_linear())),
             Type::Enum(n) => enum_def(n).map_or(false, |d| d.variants.iter().any(|v| v.1.as_ref().map_or(false, |t| t.is_linear()))),
             _ => false,

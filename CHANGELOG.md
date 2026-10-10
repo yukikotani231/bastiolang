@@ -11,7 +11,20 @@ The version is the one in `stage0/Cargo.toml`. A release is a tag `vX.Y.Z` on
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- Shared pages: `Shared`, one counted reference to a page several page
+  tables map at once (`MAP_SHARED` memory after `fork`), with `shared_new`,
+  `shared_dup`, `shared_drop`, `shared_id`, `pt_put_shared`,
+  `pt_take_shared`, `pt_dup_shared` and the ghost `pt_shared(t, i)`. The
+  proof keeps each reference used once; the count itself is in the runtime
+  prelude (trusted). Not in the native x86 backend yet.
+
+### Changed
+
+- `pt_take_frame` now needs `!pt_shared(t, i)` (`E-VERIFY-SHARED`). Code that
+  tears down a table it did not build itself tests `pt_shared` and takes
+  such slots with `pt_take_shared`.
 
 ## [0.1.0] - not yet tagged
 
