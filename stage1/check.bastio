@@ -31,8 +31,8 @@ const AV_MEM: u64 = 2;       // hosted and kernel
 const AV_KERNEL: u64 = 3;
 const AV_USER: u64 = 4;
 
-/// A builtin's signature: up to four parameter types.
-struct Bsig { name: Str, avail: u64, np: u64, p0: u64, p1: u64, p2: u64, p3: u64, ret: u64 }
+/// A builtin's signature: up to five parameter types.
+struct Bsig { name: Str, avail: u64, np: u64, p0: u64, p1: u64, p2: u64, p3: u64, p4: u64, ret: u64 }
 
 /// A ghost accessor (specifications only): its argument type, whether it
 /// also takes an index, and its result type.
@@ -132,7 +132,12 @@ fn checker_free(c: Checker) {
 }
 
 fn bsig(c: &mut Checker, name: Str, avail: u64, np: u64, p0: u64, p1: u64, p2: u64, p3: u64, ret: u64) {
-  vec_push(&mut c.bs, Bsig { name: name, avail: avail, np: np, p0: p0, p1: p1, p2: p2, p3: p3, ret: ret });
+  vec_push(&mut c.bs, Bsig { name: name, avail: avail, np: np, p0: p0, p1: p1, p2: p2, p3: p3, p4: 0, ret: ret });
+}
+
+/// A builtin with five parameters (the bulk copies).
+fn bsig5(c: &mut Checker, name: Str, avail: u64, p0: u64, p1: u64, p2: u64, p3: u64, p4: u64, ret: u64) {
+  vec_push(&mut c.bs, Bsig { name: name, avail: avail, np: 5, p0: p0, p1: p1, p2: p2, p3: p3, p4: p4, ret: ret });
 }
 
 fn ghost(c: &mut Checker, name: Str, arg: u64, idx: bool, ret: u64) {
@@ -221,6 +226,8 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   bsig(&mut c, "blen", AV_ALL, 1, rbyt, 0, 0, 0, u);
   bsig(&mut c, "bget", AV_ALL, 2, rbyt, u, 0, 0, u8t);
   bsig(&mut c, "bset", AV_ALL, 3, mbyt, u, u8t, 0, un);
+  bsig5(&mut c, "bcopy", AV_ALL, mbyt, u, rbyt, u, u, un);
+  bsig(&mut c, "bmove", AV_ALL, 4, mbyt, u, u, u, un);
   bsig(&mut c, "bfree", AV_ALL, 1, byt, 0, 0, 0, un);
   bsig(&mut c, "bfrom", AV_ALL, 1, st, 0, 0, 0, byt);
   bsig(&mut c, "host_argc", AV_HOSTED, 1, rhst, 0, 0, 0, u);
@@ -248,6 +255,8 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   bsig(&mut c, "frame_write", AV_MEM, 3, mfrm, u, u, 0, un);
   bsig(&mut c, "frame_read8", AV_MEM, 2, rfrm, u, 0, 0, u8t);
   bsig(&mut c, "frame_write8", AV_MEM, 3, mfrm, u, u8t, 0, un);
+  bsig5(&mut c, "frame_to_bytes", AV_MEM, mbyt, u, rfrm, u, u, un);
+  bsig5(&mut c, "bytes_to_frame", AV_MEM, mfrm, u, rbyt, u, u, un);
   bsig(&mut c, "pt_new", AV_MEM, 2, frm, u, 0, 0, ptb);
   bsig(&mut c, "pt_free", AV_MEM, 1, ptb, 0, 0, 0, frm);
   bsig(&mut c, "pt_free_root", AV_KERNEL, 2, rmmu, ptb, 0, 0, frm);
@@ -303,6 +312,8 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   bsig(&mut c, "dma_write16", AV_MEM, 3, mdma, u, u16t, 0, un);
   bsig(&mut c, "dma_write32", AV_MEM, 3, mdma, u, u32t, 0, un);
   bsig(&mut c, "dma_write64", AV_MEM, 3, mdma, u, u, 0, un);
+  bsig5(&mut c, "dma_to_bytes", AV_MEM, mbyt, u, mdma, u, u, un);
+  bsig5(&mut c, "bytes_to_dma", AV_MEM, mdma, u, rbyt, u, u, un);
   bsig(&mut c, "sys_spawn", AV_USER, 3, rbuf, u, u, 0, u);
   bsig(&mut c, "sys_wait", AV_USER, 1, u, 0, 0, 0, u);
   bsig(&mut c, "sys_kill", AV_USER, 1, u, 0, 0, 0, u);
@@ -999,7 +1010,7 @@ fn bs_at(c: &Checker, k: u64) -> Bsig {
   if k < vec_len(c.bs) {
     return vec_get(c.bs, k);
   }
-  return Bsig { name: "", avail: 0, np: 0, p0: 0, p1: 0, p2: 0, p3: 0, ret: 0 };
+  return Bsig { name: "", avail: 0, np: 0, p0: 0, p1: 0, p2: 0, p3: 0, p4: 0, ret: 0 };
 }
 
 fn ghost_at(c: &Checker, k: u64) -> Ghost {
@@ -3565,6 +3576,7 @@ fn bsig_params(b: Bsig) -> Vec[u64] {
   if b.np > 1 { vec_push(&mut out, b.p1); }
   if b.np > 2 { vec_push(&mut out, b.p2); }
   if b.np > 3 { vec_push(&mut out, b.p3); }
+  if b.np > 4 { vec_push(&mut out, b.p4); }
   return out;
 }
 

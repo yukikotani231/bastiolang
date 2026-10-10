@@ -193,7 +193,7 @@ const LEAF: [&str; 4] = ["%r8", "%r9", "%r10", "%r11"];
 const INLINE_BUILTINS: &[&str] = &[
     "len", "get", "set", "blen", "bget", "bset", "slen", "sget", "vec_len", "vec_get", "vec_set", "vec_swap", "vec_pop", "wrap_add", "wrap_sub", "wrap_mul",
     "cast", "wrap", "vec_new", "pool_size", "pool_take", "pool_give", "pt_new", "pt_free", "frame_id", "frame_read", "frame_read8", "frame_write", "frame_write8",
-    "pt_has", "pt_writable", "pt_put", "pt_put_frame", "pt_take", "pt_take_frame",
+    "pt_has", "pt_writable", "pt_put", "pt_put_frame", "pt_take", "pt_take_frame", "bcopy", "bmove", "frame_to_bytes", "bytes_to_frame",
 ];
 
 /// How deep inlining goes: the function being generated, then up to two
@@ -2252,6 +2252,52 @@ impl<'a> Gen<'a> {
                 self.emit("mov (%rdx), %rdx");
                 self.emit(if name == "frame_write" { "mov %rax, (%rdx,%rcx,8)" } else { "mov %al, (%rdx,%rcx)" });
             }
+            // Bulk copies: %rdi the destination, %rsi the source, %rcx the
+            // count. The prover has shown both ranges in bounds.
+            "bcopy" | "bytes_to_frame" => {
+                // The source is a Bytes value: its data pointer is word 1.
+                for a in args {
+                    self.arg(a)?;
+                }
+                self.pop("%rcx");
+                self.pop("%rax");
+                self.drop_words(1);
+                self.pop("%rsi");
+                self.emit("add %rax, %rsi");
+                self.pop("%rax");
+                self.pop("%rdi");
+                self.emit(if name == "bcopy" { "mov 8(%rdi), %rdi" } else { "mov (%rdi), %rdi" });
+                self.emit("add %rax, %rdi");
+                self.copy_fwd();
+            }
+            "frame_to_bytes" => {
+                self.to_regs(args, &["%rdi", "%rax", "%rsi", "%rdx", "%rcx"])?;
+                self.emit("mov 8(%rdi), %rdi");
+                self.emit("add %rax, %rdi");
+                self.emit("add %rdx, %rsi");
+                self.copy_fwd();
+            }
+            "bmove" => {
+                // Backward, a byte at a time, when the destination starts
+                // inside the source (memmove semantics).
+                self.to_regs(args, &["%rdx", "%rdi", "%rsi", "%rcx"])?;
+                self.emit("mov 8(%rdx), %rdx");
+                self.emit("add %rdx, %rdi");
+                self.emit("add %rdx, %rsi");
+                let (back, done) = (self.label(), self.label());
+                self.emit("mov %rdi, %rax");
+                self.emit("sub %rsi, %rax");
+                self.emit("cmp %rcx, %rax");
+                self.emit(&format!("jb {}", back));
+                self.copy_fwd();
+                self.emit(&format!("jmp {}", done));
+                self.place_label(&back);
+                self.emit("dec %rcx");
+                self.emit("movzbl (%rsi,%rcx), %eax");
+                self.emit("mov %al, (%rdi,%rcx)");
+                self.emit(&format!("jnz {}", back));
+                self.place_label(&done);
+            }
             "pt_has" => {
                 self.to_regs(args, &["%rdx", "%rax"])?;
                 self.emit("mov (%rdx,%rax,8), %rax");
@@ -2452,6 +2498,18 @@ impl<'a> Gen<'a> {
             self.pop(r);
         }
         Ok(())
+    }
+
+    /// Copies %rcx bytes from (%rsi) to (%rdi), lowest first: whole words
+    /// with rep movsq, then the rest with rep movsb (the C prelude's
+    /// bst_copy_fwd).
+    fn copy_fwd(&mut self) {
+        self.emit("mov %rcx, %rax");
+        self.emit("shr $3, %rcx");
+        self.emit("rep movsq");
+        self.emit("mov %eax, %ecx");
+        self.emit("and $7, %ecx");
+        self.emit("rep movsb");
     }
 
     /// %rcx = the address of element %rax of the vector at (%rdi), for
