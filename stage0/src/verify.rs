@@ -624,6 +624,10 @@ impl<'p> Verifier<'p> {
                 st.pc.push(t);
                 Ok(Some(st))
             }
+            StmtKind::Unreachable => {
+                self.prove(&st, "false", s.pos, "E-VERIFY-UNREACHABLE", "that this point is unreachable".into())?;
+                Ok(None)
+            }
             StmtKind::Return(e) => {
                 let v = match e {
                     Some(e) => self.eval(e, &mut st)?,
@@ -1482,7 +1486,7 @@ fn changed_vars(stmts: &[Stmt], out: &mut HashMap<String, bool>) {
                     changed_vars(&a.body, out);
                 }
             }
-            StmtKind::Return(None) | StmtKind::Assert(_) => {}
+            StmtKind::Return(None) | StmtKind::Assert(_) | StmtKind::Unreachable => {}
         }
     }
 }

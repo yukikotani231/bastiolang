@@ -187,6 +187,9 @@ pub enum StmtKind {
     If { cond: Expr, then_b: Vec<Stmt>, else_b: Vec<Stmt> },
     While { cond: Expr, invariants: Vec<Expr>, body: Vec<Stmt> },
     Return(Option<Expr>),
+    /// `unreachable;`: a point the prover shows no execution reaches. Ends
+    /// the path like `return`, with nothing left to consume.
+    Unreachable,
     Assert(Expr),
     Expr(Expr),
     /// `match e { Pat => { .. } .. }`
@@ -362,7 +365,7 @@ pub fn resolve_enum_types(p: &mut Program) {
                         fix_stmts(&mut a.body, names);
                     }
                 }
-                StmtKind::Return(None) => {}
+                StmtKind::Return(None) | StmtKind::Unreachable => {}
             }
         }
     }

@@ -832,6 +832,7 @@ impl<'a> Gen<'a> {
             }
             StmtKind::Return(None) => out.push_str(&format!("{}return;\n", ind(d))),
             StmtKind::Assert(_) => {} // ghost: proved at compile time, erased
+            StmtKind::Unreachable => out.push_str(&format!("{}__builtin_unreachable();\n", ind(d))),
             StmtKind::Expr(e) => {
                 let e = self.expr(e);
                 out.push_str(&format!("{}{};\n", ind(d), e));

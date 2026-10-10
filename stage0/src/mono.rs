@@ -194,7 +194,7 @@ impl Mono {
                     self.stmts(body, s)?;
                 }
                 StmtKind::Return(Some(e)) | StmtKind::Assert(e) | StmtKind::Expr(e) => self.expr(e, s)?,
-                StmtKind::Return(None) => {}
+                StmtKind::Return(None) | StmtKind::Unreachable => {}
                 StmtKind::Match { scrut, arms } => {
                     self.expr(scrut, s)?;
                     for a in arms {

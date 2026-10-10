@@ -236,7 +236,7 @@ let x = e;   let mut x: T = e;   x = e;
 if c { ... } else { ... }
 match e { E::V(x) => { ... }, _ => { ... } }
 while c invariant <expr> invariant <expr> { ... }
-return e;   assert <expr>;
+return e;   assert <expr>;   unreachable;
 
 spec fn name(p: T, ...) -> bool { <spec expr> }   // a named specification, inlined where used
 const NAME: u64 = <constant expr>;                 // folded at compile time; define before use
@@ -246,6 +246,7 @@ include_bytes("path")                              // a file's bytes as a Str, p
 - Operators: `+ - * / %`, `== != < <= > >=`, `&& || !`. `&&` and `||` short-circuit.
 - Integer literals are decimal or hex (`0x1F`).
 - Several source files can be given on the command line; they form one program, and constants are visible in later files.
+- `unreachable;` marks a point the prover must show no execution reaches (`E-VERIFY-UNREACHABLE`). The path ends there like a `return`, so linear values in hand need not be consumed. Its typical use is a `match` arm the specification rules out, such as the `Full` arm after swapping a value into a slot known to be empty. It compiles to `__builtin_unreachable()`, with no check.
 - A name cannot shadow one that is still in scope. Once a block ends, its names can be used again (two `match` arms can both bind `v`).
 - The entry point is `fn main(...) -> u64` (or with no result), taking any of the capabilities its target hands out, each at most once and as `&mut`: hosted `&mut Serial`, `&mut Pool`, `&mut Host`; kernel those plus `&mut Mmu`, `&mut Cpu`; user `&mut Serial` only. A user program's result is its exit code. The older `fn main(con: Serial) -> Serial` is still accepted outside user programs.
 
@@ -289,6 +290,7 @@ The compiler executes each function symbolically. At every point where the progr
 | `E-VERIFY-ENSURES` | the function's own postcondition |
 | `E-VERIFY-INVARIANT` | a loop invariant holds on entry and is preserved by one iteration |
 | `E-VERIFY-ASSERT` | an `assert` |
+| `E-VERIFY-UNREACHABLE` | an `unreachable;` the code can reach |
 
 How verification works:
 - **Modular.** A call uses only the callee's `requires` / `ensures`, never its body.
