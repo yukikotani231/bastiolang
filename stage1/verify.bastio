@@ -3785,6 +3785,81 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     put_back(&mut v, m, p, &mut st, u_at(args, 0), nb);
     return v.unit;
   }
+  // Bulk copies. A copied range is a lambda over the old arrays, so a read
+  // of it reduces to a read of the source or the old data.
+  if name_is(p, i, "bcopy") || name_is(p, i, "bmove") {
+    let mut sx = x0;
+    let d = term(v, x1);
+    let mut s = term(v, x2);
+    let mut n = term(v, u_at(vals, 3));
+    if name_is(p, i, "bcopy") {
+      sx = x2;
+      s = term(v, u_at(vals, 3));
+      n = term(v, u_at(vals, 4));
+    }
+    let src = vl_at(v, sx);
+    let de = app2(&mut v, OP_ADD, d, n);
+    let g = app2(&mut v, OP_LE, de, a0.a);
+    prove(&mut v, st, g, i, VC_BOUNDS);
+    let se = app2(&mut v, OP_ADD, s, n);
+    let g2 = app2(&mut v, OP_LE, se, src.a);
+    prove(&mut v, st, g2, i, VC_BOUNDS);
+    let inr = port_range(&mut v, d, n);
+    let off = app2(&mut v, OP_SUB, v.t_k, d);
+    let at = app2(&mut v, OP_ADD, s, off);
+    let from = app2(&mut v, OP_SELECT, src.b, at);
+    let kept = app2(&mut v, OP_SELECT, a0.b, v.t_k);
+    let body = app3(&mut v, OP_ITE, inr, from, kept);
+    let nd = lambda_tm(&mut v, v.t_k, body);
+    let nb = mk(&mut v, VV_BUF, 0, a0.a, nd, 0, 0);
+    put_back(&mut v, m, p, &mut st, u_at(args, 0), nb);
+    return v.unit;
+  }
+  // From a page into bytes: what the page holds is not tracked, so the
+  // copied range of the destination becomes unknown.
+  if name_is(p, i, "frame_to_bytes") || name_is(p, i, "dma_to_bytes") {
+    let d = term(v, x1);
+    let o = term(v, u_at(vals, 3));
+    let n = term(v, u_at(vals, 4));
+    let oe = app2(&mut v, OP_ADD, o, n);
+    let page = num(&mut v, 4096);
+    let g = app2(&mut v, OP_LE, oe, page);
+    prove(&mut v, st, g, i, VC_BOUNDS);
+    let de = app2(&mut v, OP_ADD, d, n);
+    let g2 = app2(&mut v, OP_LE, de, a0.a);
+    prove(&mut v, st, g2, i, VC_BOUNDS);
+    let mut h = 0;
+    if name_is(p, i, "frame_to_bytes") {
+      h = atom_str(&mut v, "frame_to_bytes");
+    } else {
+      h = atom_str(&mut v, "dma_to_bytes");
+    }
+    let fresh = fresh_array(&mut v, h, SO_INT);
+    let inr = port_range(&mut v, d, n);
+    let from = app2(&mut v, OP_SELECT, fresh, v.t_k);
+    let kept = app2(&mut v, OP_SELECT, a0.b, v.t_k);
+    let body = app3(&mut v, OP_ITE, inr, from, kept);
+    let nd = lambda_tm(&mut v, v.t_k, body);
+    let nb = mk(&mut v, VV_BUF, 0, a0.a, nd, 0, 0);
+    put_back(&mut v, m, p, &mut st, u_at(args, 0), nb);
+    return v.unit;
+  }
+  // From bytes into a page: the page's contents are not tracked, and it
+  // stays the same page.
+  if name_is(p, i, "bytes_to_frame") || name_is(p, i, "bytes_to_dma") {
+    let o = term(v, x1);
+    let src = vl_at(v, x2);
+    let s = term(v, u_at(vals, 3));
+    let n = term(v, u_at(vals, 4));
+    let oe = app2(&mut v, OP_ADD, o, n);
+    let page = num(&mut v, 4096);
+    let g = app2(&mut v, OP_LE, oe, page);
+    prove(&mut v, st, g, i, VC_BOUNDS);
+    let se = app2(&mut v, OP_ADD, s, n);
+    let g2 = app2(&mut v, OP_LE, se, src.a);
+    prove(&mut v, st, g2, i, VC_BOUNDS);
+    return v.unit;
+  }
   // A u8 always fits in a byte: the type says what E-VERIFY-BYTE used to prove.
   if name_is(p, i, "serial_write") {
     return v.unit;
@@ -4818,7 +4893,8 @@ fn shape_keeping(p: &Parser, i: u64) -> bool {
   return name_is(p, i, "bset") || name_is(p, i, "vec_set") || name_is(p, i, "vec_swap") || name_is(p, i, "pt_put")
     || name_is(p, i, "pt_take") || name_is(p, i, "pt_put_frame") || name_is(p, i, "pt_take_frame")
     || name_is(p, i, "pt_borrow") || name_is(p, i, "pt_borrow_frame") || name_is(p, i, "pt_lease_count") || name_is(p, i, "pool_take") || name_is(p, i, "pool_give") || name_is(p, i, "frame_write")
-    || name_is(p, i, "frame_write8") || name_is(p, i, "cpu_set") || name_is(p, i, "cpu_run") || name_is(p, i, "cpu_idle")
+    || name_is(p, i, "frame_write8") || name_is(p, i, "bcopy") || name_is(p, i, "bmove") || name_is(p, i, "frame_to_bytes")
+    || name_is(p, i, "bytes_to_frame") || name_is(p, i, "dma_to_bytes") || name_is(p, i, "bytes_to_dma") || name_is(p, i, "cpu_set") || name_is(p, i, "cpu_run") || name_is(p, i, "cpu_idle")
     || name_is(p, i, "cpu_fpu_save") || name_is(p, i, "cpu_fpu_load") || name_is(p, i, "pio_in8") || name_is(p, i, "pio_in16")
     || name_is(p, i, "pio_in32") || name_is(p, i, "pio_out8") || name_is(p, i, "pio_out16") || name_is(p, i, "pio_out32")
     || name_is(p, i, "mmio_read8") || name_is(p, i, "mmio_read16") || name_is(p, i, "mmio_read32") || name_is(p, i, "mmio_read64")
