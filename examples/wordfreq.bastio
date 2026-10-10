@@ -1,0 +1,95 @@
+// Word frequencies with the core library: split a text into words, count
+// them in a map keyed by the words' bytes, sort by count, print the top
+// five. Every step is proved memory safe, and the library's proofs carry
+// over: the spans `bytes_split` returns lie inside the text, every slot the
+// map reports holds a key inside its arena, and the order
+// `sort_by_key_u64` returns indexes the counts with no bounds checks.
+
+import "core/text.bastio";
+import "core/bytesmap.bastio";
+import "core/sort.bastio";
+import "core/print.bastio";
+
+/// Every element of `v` is a slot of `m` that holds a key.
+spec fn all_used(v: &Vec[u64], m: &BytesMap[u64]) -> bool {
+  forall k: u64 :: k < vlen(v) ==> vget(v, k) < vlen(m.tags) && vget(m.tags, vget(v, k)) == 2
+}
+
+fn main(con: &mut Serial) -> u64 {
+  let mut t = text_new();
+  text_push_str(&mut t, "the quick brown fox jumps over the lazy dog and the dog sleeps while the fox runs over the hill and the quick fox is gone");
+  let text = text_finish(t);
+
+  // Count each word. A word is copied out of the text to look it up; the
+  // map keeps its own copy the first time it sees it.
+  let parts = bytes_split(text, 32);
+  let mut count = bmap_new[u64]();
+  let mut i = 0;
+  while i < vec_len(parts)
+    invariant bmap_ok[u64](count)
+  {
+    let s = vec_get(parts, i);
+    i = i + 1;
+    if s.start < s.end {
+      let word = bytes_slice(text, s.start, s.end);
+      let c = bmap_get_or[u64](count, word, 0);
+      if c < 18446744073709551615 {
+        bmap_insert[u64](&mut count, word, c + 1);
+      }
+      bfree(word);
+    }
+  }
+
+  // List the slots that hold a word, with their counts side by side.
+  let mut slots = vec_new[u64]();
+  let mut counts = vec_new[u64]();
+  let mut j = 0;
+  while j < vec_len(count.tags)
+    invariant bmap_ok[u64](count) && vlen(slots) == vlen(counts) && all_used(slots, count)
+  {
+    if vec_get(count.tags, j) == 2 {
+      match vec_get(count.vals, j) {
+        Option::Some(c) => {
+          vec_push(&mut slots, j);
+          vec_push(&mut counts, c);
+        },
+        Option::None => {},
+      }
+    }
+    j = j + 1;
+  }
+
+  // Sort the positions 0..n by count; the most frequent come last.
+  let mut order = vec_new[u64]();
+  let mut w = 0;
+  while w < vec_len(counts)
+    invariant w <= vlen(counts) && vlen(order) == w && all_indices_below(order, w)
+  {
+    vec_push(&mut order, w);
+    w = w + 1;
+  }
+  sort_by_key_u64(&mut order, counts);
+
+  let mut k = vec_len(order);
+  while k > 0 && k + 5 > vec_len(order)
+    invariant k <= vlen(order) && sorted_by_key(order, counts)
+    invariant bmap_ok[u64](count) && vlen(slots) == vlen(counts) && all_used(slots, count)
+  {
+    k = k - 1;
+    let n = vec_get(order, k);
+    let word = bmap_key[u64](count, vec_get(slots, n));
+    print_u64_pad(con, vec_get(counts, n), 3);
+    print_str(con, " ");
+    print_bytes(con, word);
+    print_nl(con);
+    bfree(word);
+  }
+
+  vec_free(order);
+  vec_free(counts);
+  vec_free(slots);
+  bmap_free[u64](count);
+  vec_free(parts);
+  bfree(text);
+  return 0;
+}

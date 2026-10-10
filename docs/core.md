@@ -20,7 +20,7 @@ An import that does not start with `.` or `/` is looked for next to the importin
 
 All files share one namespace (see [Programs and files](language.md#programs-and-files)), so every function is prefixed by its module (`bytes_`, `text_`, `hmap_`, `bmap_`, ...) except the few whose names say what they are (`parse_u64`, `fmt_u64`, `print_str`, `sort_u64`). Two names are taken without a prefix: the types `Option[T]` and `Span`. A program that imports core must not define its own.
 
-The tests are the worked examples: `tests/pass/core_*.bastio` and `tests/pass/std_host.bastio` use every function, and `tests/user/core_user.bastio` builds core for a BastiOS user program.
+For a whole program, see [`examples/wordfreq.bastio`](../examples/wordfreq.bastio): it splits a text, counts words in a `BytesMap`, sorts them by count and prints the top five, and every library proof it leans on is named in its comments. The tests are the worked examples of each function: `tests/pass/core_*.bastio` and `tests/pass/std_host.bastio` use every function, and `tests/user/core_user.bastio` builds core for a BastiOS user program.
 
 ## Conventions
 
