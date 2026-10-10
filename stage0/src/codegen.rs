@@ -1,4 +1,6 @@
-// C backend (stage0 only; the self-hosted compiler will emit x86-64 directly).
+// C backend. stage1/codegen.bastio produces the same output (stage1/difftest.sh),
+// so a change here needs the same change there, and to the copied preludes in
+// stage1/cprelude.bastio.
 //
 // Zero overhead: everything the verifier proved is erased here. There are no
 // bounds checks, no overflow checks and no length bookkeeping beyond the
@@ -1553,6 +1555,7 @@ pub fn trusted_base() -> String {
             }
         }
     }
+    out.push_str(&format!("native backend (--backend native, hosted): {} runtime lines of assembly\n", lines(crate::x86::RUNTIME)));
     for (name, avail) in crate::check::builtin_list() {
         out.push_str(&format!("builtin {} ({})\n", name, avail));
     }
