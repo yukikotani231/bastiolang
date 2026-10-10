@@ -142,7 +142,8 @@ mask() {  # stage0's stderr, bastioc1's stderr
   grep -q 'error\[E-\(VERIFY\|SOLVER\)' "$1" || grep -q '^  = ' "$2" || keep_notes=0
   if [ $keep_notes = 1 ]; then cat "$1"; else grep -v '^  = ' "$1"; fi \
     | if [ $keep_msg = 1 ]; then cat; else sed -e 's/^\(.*: error\[[A-Z-]*\]\): .*$/\1/'; fi \
-    | sed -e 's/^\(.*: error\[E-IMPORT\]: cannot read `[^`]*`\): .*$/\1/' -e 's/^bastioc0: /bastioc1: /'
+    | sed -e 's/^\(.*: error\[E-IMPORT\]: cannot read `[^`]*`\): .*$/\1/' \
+          -e 's/^\(.*: error\[E-PARSE\]: include_bytes: cannot read .*\): [^:]*$/\1/' -e 's/^bastioc0: /bastioc1: /'
 }
 match=0 differ=0 errors=0
 for f in $files; do

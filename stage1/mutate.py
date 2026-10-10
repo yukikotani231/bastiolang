@@ -50,6 +50,7 @@ def mask(want, got):
         if not keep_msg:
             l = re.sub(rb'^(.*: error\[[A-Z-]*\]): .*$', rb'\1', l)
         l = re.sub(rb'^(.*: error\[E-IMPORT\]: cannot read `[^`]*`): .*$', rb'\1', l)
+        l = re.sub(rb'^(.*: error\[E-PARSE\]: include_bytes: cannot read .*): [^:]*$', rb'\1', l)
         l = re.sub(rb'^bastioc0: ', b'bastioc1: ', l)
         out.append(l)
     return b'\n'.join(out)
