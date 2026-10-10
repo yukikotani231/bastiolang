@@ -16,8 +16,10 @@ import "files.bastio";
 const CODE_PARSE: u64 = 0;
 const CODE_IMPORT: u64 = 1;
 
-/// A file loaded or being loaded: its normalized path (in `Loader.paths`).
-struct Loaded { start: u64, len: u64, done: bool }
+/// A file loaded or being loaded: its normalized path (in `Loader.paths`),
+/// the path as given (`raw`, for messages, as stage0 prints it) and where
+/// its text starts in the shared source buffer.
+struct Loaded { start: u64, len: u64, done: bool, raw: u64, rawlen: u64, src: u64 }
 
 struct Loader {
   paths: Vec[u64],
@@ -169,7 +171,7 @@ fn pool_equals(pool: &Vec[u64], start: u64, b: &Bytes) -> bool {
 }
 
 /// Records a file as being loaded; returns its index.
-fn add_file(ld: &mut Loader, canon: &Bytes) -> u64 {
+fn add_file(ld: &mut Loader, canon: &Bytes, path: &Bytes, src: u64) -> u64 {
   let start = vec_len(ld.paths);
   let mut i = 0;
   while i < blen(canon)
@@ -178,8 +180,16 @@ fn add_file(ld: &mut Loader, canon: &Bytes) -> u64 {
     vec_push(&mut ld.paths, cast[u64](bget(canon, i)));
     i = i + 1;
   }
+  let raw = vec_len(ld.paths);
+  i = 0;
+  while i < blen(path)
+    invariant i <= blen(path)
+  {
+    vec_push(&mut ld.paths, bget(path, i));
+    i = i + 1;
+  }
   let k = vec_len(ld.files);
-  vec_push(&mut ld.files, Loaded { start: start, len: blen(canon), done: false });
+  vec_push(&mut ld.files, Loaded { start: start, len: blen(canon), done: false, raw: raw, rawlen: blen(path), src: src });
   return k;
 }
 
@@ -243,9 +253,9 @@ fn load(host: &Host, p: &mut Parser, ld: &mut Loader, path: &Bytes, file: u64, l
     force_fail(&mut p, file, line, col, CODE_IMPORT);     // an import cycle
     return 1;
   }
-  let k = add_file(&mut ld, canon);
-  bfree(canon);
   let start = blen(p.src);
+  let k = add_file(&mut ld, canon, path, start);
+  bfree(canon);
   let before = p.src;
   p.src = concat(before, data);
   bfree(before);
