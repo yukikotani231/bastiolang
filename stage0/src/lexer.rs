@@ -75,6 +75,9 @@ pub enum Tok {
 pub struct Token {
     pub tok: Tok,
     pub pos: Pos,
+    /// The column just after the token (tokens never span lines), where a
+    /// missing `;` after it is reported.
+    pub end_col: usize,
 }
 
 /// One token as `--dump-tokens` prints it: `line:col` then the keyword or
@@ -87,23 +90,38 @@ pub fn dump(t: &Token) -> String {
         Tok::Str(b) => format!("str {}", b.iter().map(|x| format!("{:02x}", x)).collect::<String>()),
         Tok::Ident(n) => format!("ident {}", n),
         Tok::Eof => "eof".into(),
-        other => match other {
-            Tok::Fn => "fn", Tok::Struct => "struct", Tok::Enum => "enum", Tok::Match => "match", Tok::Is => "is",
-            Tok::FatArrow => "=>", Tok::Spec => "spec", Tok::Const => "const", Tok::Let => "let", Tok::Mut => "mut",
-            Tok::If => "if", Tok::Else => "else", Tok::While => "while", Tok::Return => "return", Tok::Import => "import", Tok::Export => "export",
-            Tok::Unreachable => "unreachable", Tok::Requires => "requires", Tok::Ensures => "ensures",
-            Tok::Invariant => "invariant", Tok::Assert => "assert", Tok::Forall => "forall", Tok::True => "true",
-            Tok::False => "false", Tok::LParen => "(", Tok::RParen => ")", Tok::LBracket => "[", Tok::RBracket => "]",
-            Tok::LBrace => "{", Tok::RBrace => "}", Tok::Comma => ",", Tok::Semi => ";", Tok::Colon => ":",
-            Tok::ColonColon => "::", Tok::Arrow => "->", Tok::Amp => "&", Tok::Dot => ".", Tok::Plus => "+",
-            Tok::Minus => "-", Tok::Star => "*", Tok::Slash => "/", Tok::Percent => "%", Tok::Eq => "=",
-            Tok::EqEq => "==", Tok::Ne => "!=", Tok::Lt => "<", Tok::Le => "<=", Tok::Gt => ">", Tok::Ge => ">=",
-            Tok::AndAnd => "&&", Tok::Pipe => "|", Tok::Caret => "^", Tok::Shl => "<<", Tok::Shr => ">>", Tok::OrOr => "||", Tok::Bang => "!", Tok::Implies => "==>",
-            Tok::Int(_) | Tok::Str(_) | Tok::Ident(_) | Tok::Eof => unreachable!(),
-        }
-        .to_string(),
+        other => spelling(other).to_string(),
     };
     format!("{}:{} {}", t.pos.line, t.pos.col, body)
+}
+
+/// A keyword or punctuation token as written.
+pub fn spelling(t: &Tok) -> &'static str {
+    match t {
+        Tok::Fn => "fn", Tok::Struct => "struct", Tok::Enum => "enum", Tok::Match => "match", Tok::Is => "is",
+        Tok::FatArrow => "=>", Tok::Spec => "spec", Tok::Const => "const", Tok::Let => "let", Tok::Mut => "mut",
+        Tok::If => "if", Tok::Else => "else", Tok::While => "while", Tok::Return => "return", Tok::Import => "import", Tok::Export => "export",
+        Tok::Unreachable => "unreachable", Tok::Requires => "requires", Tok::Ensures => "ensures",
+        Tok::Invariant => "invariant", Tok::Assert => "assert", Tok::Forall => "forall", Tok::True => "true",
+        Tok::False => "false", Tok::LParen => "(", Tok::RParen => ")", Tok::LBracket => "[", Tok::RBracket => "]",
+        Tok::LBrace => "{", Tok::RBrace => "}", Tok::Comma => ",", Tok::Semi => ";", Tok::Colon => ":",
+        Tok::ColonColon => "::", Tok::Arrow => "->", Tok::Amp => "&", Tok::Dot => ".", Tok::Plus => "+",
+        Tok::Minus => "-", Tok::Star => "*", Tok::Slash => "/", Tok::Percent => "%", Tok::Eq => "=",
+        Tok::EqEq => "==", Tok::Ne => "!=", Tok::Lt => "<", Tok::Le => "<=", Tok::Gt => ">", Tok::Ge => ">=",
+        Tok::AndAnd => "&&", Tok::Pipe => "|", Tok::Caret => "^", Tok::Shl => "<<", Tok::Shr => ">>", Tok::OrOr => "||", Tok::Bang => "!", Tok::Implies => "==>",
+        Tok::Int(_) | Tok::Str(_) | Tok::Ident(_) | Tok::Eof => unreachable!(),
+    }
+}
+
+/// A token as an error message names it: as written, in backticks.
+pub fn describe(t: &Tok) -> String {
+    match t {
+        Tok::Int(v) => format!("`{}`", v),
+        Tok::Str(_) => "a string literal".into(),
+        Tok::Ident(n) => format!("`{}`", n),
+        Tok::Eof => "the end of the file".into(),
+        other => format!("`{}`", spelling(other)),
+    }
 }
 
 pub fn lex(src: &str, file: usize) -> Result<Vec<Token>, Diag> {
@@ -166,7 +184,7 @@ pub fn lex(src: &str, file: usize) -> Result<Vec<Token>, Diag> {
                 let mut buf = [0u8; 4];
                 bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
             }
-            out.push(Token { tok: Tok::Str(bytes), pos });
+            out.push(Token { tok: Tok::Str(bytes), pos, end_col: col });
             continue;
         }
         if c == '0' && matches!(chars.get(i + 1), Some('x') | Some('X')) {
@@ -179,7 +197,7 @@ pub fn lex(src: &str, file: usize) -> Result<Vec<Token>, Diag> {
             col += i - start;
             let v = u128::from_str_radix(&text, 16).ok().filter(|v| *v <= u64::MAX as u128)
                 .ok_or_else(|| Diag::new("E-PARSE", pos, format!("hex literal `0x{}` does not fit in u64", text)))?;
-            out.push(Token { tok: Tok::Int(v), pos });
+            out.push(Token { tok: Tok::Int(v), pos, end_col: col });
             continue;
         }
         if c.is_ascii_digit() {
@@ -195,7 +213,7 @@ pub fn lex(src: &str, file: usize) -> Result<Vec<Token>, Diag> {
             if v > u64::MAX as u128 {
                 return Err(Diag::new("E-PARSE", pos, format!("integer literal `{}` does not fit in u64", text)));
             }
-            out.push(Token { tok: Tok::Int(v), pos });
+            out.push(Token { tok: Tok::Int(v), pos, end_col: col });
             continue;
         }
         if c.is_ascii_alphabetic() || c == '_' {
@@ -231,7 +249,7 @@ pub fn lex(src: &str, file: usize) -> Result<Vec<Token>, Diag> {
                 "false" => Tok::False,
                 _ => Tok::Ident(text),
             };
-            out.push(Token { tok, pos });
+            out.push(Token { tok, pos, end_col: col });
             continue;
         }
         let two = if i + 1 < chars.len() { Some(chars[i + 1]) } else { None };
@@ -275,8 +293,8 @@ pub fn lex(src: &str, file: usize) -> Result<Vec<Token>, Diag> {
         };
         i += len;
         col += len;
-        out.push(Token { tok, pos });
+        out.push(Token { tok, pos, end_col: col });
     }
-    out.push(Token { tok: Tok::Eof, pos: Pos { file, line, col } });
+    out.push(Token { tok: Tok::Eof, pos: Pos { file, line, col }, end_col: col });
     Ok(out)
 }

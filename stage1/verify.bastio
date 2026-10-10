@@ -49,6 +49,7 @@ const OP_ITE: u64 = 15;
 const OP_SELECT: u64 = 16;
 const OP_STORE: u64 = 17;
 const OP_CNT: u64 = 18;       // vcount: (cnt elements length value)
+const OP_DEC: u64 = 19;       // bdec: (dec data from to)
 
 // Sorts: Int or Bool, under `depth` levels of (Array Int ..): base + 2 * depth.
 const SO_INT: u64 = 0;
@@ -176,6 +177,8 @@ struct Vr {
   /// `count_gate`), and whether the one being verified is one of them.
   cnt_fns: Vec[u64],
   counts: bool,
+  /// The function definitions whose proofs can mention `bdec`.
+  dec_fns: Vec[u64],
   /// Every function's summaries, grouped by instance: rows
   /// sum_start[x] .. sum_start[x] + sum_n[x] are instance x's.
   sums: Vec[SumRow],
@@ -215,7 +218,10 @@ struct Vr {
   /// What the next obligation says when it fails, after "could not prove"
   /// (filled in before `prove`), and every obligation's sentence.
   msg: Vec[u64],
-  mpool: Vec[u64]
+  mpool: Vec[u64],
+  /// The type arguments of the instance whose source the sentences quote
+  /// (see `rd_sub`): stage0 quotes the copy made for the instance.
+  tsub: Vec[u64]
 }
 
 fn vr_new(m: &mut Mono, p: &Parser) -> Vr {
@@ -225,13 +231,13 @@ fn vr_new(m: &mut Mono, p: &Parser) -> Vr {
   vec_push(&mut vals, Vl { kind: 0, ty: 0, a: 0, b: 0, c: 0, n: 0, d: 0 });
   let mut v = Vr {
     pool: vec_new[u64](), tms: tms, targs: vec_new[u64](), vals: vals, kids: vec_new[u64](),
-    log: vec_new[Cmd](), counter: 0, obligations: 0, box_depth: 0, cur: 0, env: 0, cnt_fns: vec_new[u64](), counts: false,
+    log: vec_new[Cmd](), counter: 0, obligations: 0, box_depth: 0, cur: 0, env: 0, cnt_fns: vec_new[u64](), counts: false, dec_fns: vec_new[u64](),
     sums: vec_new[SumRow](), obls: vec_new[Obl](), snaps: vec_new[Bind](), sum_start: vec_new[u64](), sum_n: vec_new[u64](),
     t_true: 0, t_false: 0, t_zero: 0, t_u64max: 0, t_allocmax: 0, t_flimit: 0, t_plimit: 0, t_mmio_lo: 0, t_mmio_hi: 0, t_poolsize: 0,
     t_zarr: 0, t_nobool: 0, t_k: 0, t_255: 0, unit: 0,
     ty_bytes: prim(&mut m, p, TY_BYTES), ty_child: prim(&mut m, p, TY_CHILD), ty_frame: prim(&mut m, p, TY_FRAME),
     ty_pt: prim(&mut m, p, TY_PT), ty_pool: prim(&mut m, p, TY_POOL), fail_at: 0, fail_code: 0,
-    fail_obl: 0, msg: vec_new[u64](), mpool: vec_new[u64]()
+    fail_obl: 0, msg: vec_new[u64](), mpool: vec_new[u64](), tsub: vec_new[u64]()
   };
   v.t_true = atom_str(&mut v, "true");
   v.t_false = atom_str(&mut v, "false");
@@ -259,6 +265,7 @@ fn vr_free(v: Vr) {
   vec_free(v.kids);
   vec_free(v.log);
   vec_free(v.cnt_fns);
+  vec_free(v.dec_fns);
   vec_free(v.sums);
   vec_free(v.sum_start);
   vec_free(v.sum_n);
@@ -266,6 +273,7 @@ fn vr_free(v: Vr) {
   vec_free(v.snaps);
   vec_free(v.msg);
   vec_free(v.mpool);
+  vec_free(v.tsub);
 }
 
 /// `a + b`, or the largest u64 if that overflows (indices that large are
@@ -596,6 +604,22 @@ fn count_lemmas(v: &mut Vr) {
   send(&mut v, CMD_RAW, a2, 0);
 }
 
+/// The definition of `bdec`, as stage0's DEC_AXIOMS: `(dec a from to)` is
+/// the decimal value of `a[from..to]`, unfolded through the never-unfolded
+/// copy `dec_l`.
+fn dec_axioms(v: &mut Vr) {
+  let l0 = atom_str(&mut v, "(declare-fun dec ((Array Int Int) Int Int) Int)");
+  send(&mut v, CMD_RAW, l0, 0);
+  let l1 = atom_str(&mut v, "(declare-fun dec_l ((Array Int Int) Int Int) Int)");
+  send(&mut v, CMD_RAW, l1, 0);
+  let a0 = atom_str(&mut v, "(assert (forall ((a (Array Int Int)) (f Int) (t Int)) (! (= (dec a f t) (ite (<= t f) 0 (+ (* 10 (dec_l a f (- t 1))) (- (select a (- t 1)) 48)))) :pattern ((dec a f t)))))");
+  send(&mut v, CMD_RAW, a0, 0);
+  let a1 = atom_str(&mut v, "(assert (forall ((a (Array Int Int)) (f Int) (t Int)) (! (= (dec a f t) (dec_l a f t)) :pattern ((dec a f t)))))");
+  send(&mut v, CMD_RAW, a1, 0);
+  let a2 = atom_str(&mut v, "(assert (forall ((a (Array Int Int)) (f Int) (t Int)) (! (=> (<= t f) (= (dec_l a f t) 0)) :pattern ((dec_l a f t)))))");
+  send(&mut v, CMD_RAW, a2, 0);
+}
+
 /// `(ite (= y x) 1 0)`: 1 when y is the counted value `x`.
 fn count_one(v: &mut Vr, y: u64) -> u64 {
   let x = atom_str(&mut v, "x");
@@ -618,20 +642,20 @@ fn count_step(v: &mut Vr, a2: u64, n2: u64, a: u64, n: u64, delta: u64) -> u64 {
   return new_tm(&mut v, VT_FORALLP, x, eq, start);
 }
 
-/// Does node `i` (an expression) call `vcount`, or name a spec fn or
-/// function in `defs` (definitions whose specifications count)? As
-/// stage0's `mentions_count`.
-fn mentions_count(m: &Mono, p: &Parser, i: u64, defs: &Vec[u64]) -> bool {
+/// Does node `i` (an expression) call the spec builtin `call` (`vcount`,
+/// `bdec`), or name a spec fn or function in `defs` (definitions whose
+/// specifications use it)? As stage0's `mentions_count`.
+fn mentions_count(m: &Mono, p: &Parser, i: u64, call: Str, defs: &Vec[u64]) -> bool {
   if i == 0 {
     return false;
   }
   let n = node_at(p.nodes, i);
   let k = n.kind;
   if k == E_CALL {
-    if name_is(p, i, "vcount") || has_u(defs, find_in(p, p.specs.head, i)) || has_u(defs, find_fn(p, i)) {
+    if name_is(p, i, call) || has_u(defs, find_in(p, p.specs.head, i)) || has_u(defs, find_fn(p, i)) {
       return true;
     }
-    return mentions_list(m, p, n.a, defs);
+    return mentions_list(m, p, n.a, call, defs);
   }
   if k == E_VAR {
     return has_u(defs, find_in(p, p.specs.head, i)) || has_u(defs, find_fn(p, i));
@@ -643,18 +667,18 @@ fn mentions_count(m: &Mono, p: &Parser, i: u64, defs: &Vec[u64]) -> bool {
         return true;
       }
       let inner = node_at(p.nodes, n.b);
-      return mentions_list(m, p, inner.a, defs);
+      return mentions_list(m, p, inner.a, call, defs);
     }
-    return mentions_count(m, p, n.b, defs);
+    return mentions_count(m, p, n.b, call, defs);
   }
   if k == E_FIELD || k == E_IS || k == E_NOT || k == E_NEG || k == E_FORALL || k == E_VARIANT {
-    return mentions_count(m, p, n.a, defs);
+    return mentions_count(m, p, n.a, call, defs);
   }
   if k == E_SLIT {
     let mut f = n.a;
     while f != 0 {
       let fi = node_at(p.nodes, f);
-      if mentions_count(m, p, fi.a, defs) {
+      if mentions_count(m, p, fi.a, call, defs) {
         return true;
       }
       f = fi.next;
@@ -662,15 +686,15 @@ fn mentions_count(m: &Mono, p: &Parser, i: u64, defs: &Vec[u64]) -> bool {
     return false;
   }
   if k == E_BIN {
-    return mentions_count(m, p, n.a, defs) || mentions_count(m, p, n.b, defs);
+    return mentions_count(m, p, n.a, call, defs) || mentions_count(m, p, n.b, call, defs);
   }
   return false;
 }
 
-fn mentions_list(m: &Mono, p: &Parser, head: u64, defs: &Vec[u64]) -> bool {
+fn mentions_list(m: &Mono, p: &Parser, head: u64, call: Str, defs: &Vec[u64]) -> bool {
   let mut k = head;
   while k != 0 {
-    if mentions_count(m, p, k, defs) {
+    if mentions_count(m, p, k, call, defs) {
       return true;
     }
     k = next_of(p, k);
@@ -678,35 +702,35 @@ fn mentions_list(m: &Mono, p: &Parser, head: u64, defs: &Vec[u64]) -> bool {
   return false;
 }
 
-fn block_mentions_count(m: &Mono, p: &Parser, head: u64, defs: &Vec[u64]) -> bool {
+fn block_mentions_count(m: &Mono, p: &Parser, head: u64, call: Str, defs: &Vec[u64]) -> bool {
   let mut k = head;
   while k != 0 {
     let n = node_at(p.nodes, k);
     let sk = n.kind;
     if sk == S_LET || sk == S_ASSIGN {
-      if mentions_count(m, p, n.b, defs) {
+      if mentions_count(m, p, n.b, call, defs) {
         return true;
       }
     } else if sk == S_IF {
-      if mentions_count(m, p, n.a, defs) || block_mentions_count(m, p, n.b, defs) || block_mentions_count(m, p, n.c, defs) {
+      if mentions_count(m, p, n.a, call, defs) || block_mentions_count(m, p, n.b, call, defs) || block_mentions_count(m, p, n.c, call, defs) {
         return true;
       }
     } else if sk == S_WHILE {
-      if mentions_count(m, p, n.a, defs) || mentions_list(m, p, n.b, defs) || block_mentions_count(m, p, n.c, defs) {
+      if mentions_count(m, p, n.a, call, defs) || mentions_list(m, p, n.b, call, defs) || block_mentions_count(m, p, n.c, call, defs) {
         return true;
       }
     } else if sk == S_RETURN || sk == S_ASSERT || sk == S_EXPR {
-      if mentions_count(m, p, n.a, defs) {
+      if mentions_count(m, p, n.a, call, defs) {
         return true;
       }
     } else if sk == S_MATCH {
-      if mentions_count(m, p, n.a, defs) {
+      if mentions_count(m, p, n.a, call, defs) {
         return true;
       }
       let mut a = n.b;
       while a != 0 {
         let arm = node_at(p.nodes, a);
-        if block_mentions_count(m, p, arm.c, defs) {
+        if block_mentions_count(m, p, arm.c, call, defs) {
           return true;
         }
         a = arm.next;
@@ -717,17 +741,18 @@ fn block_mentions_count(m: &Mono, p: &Parser, head: u64, defs: &Vec[u64]) -> boo
   return false;
 }
 
-/// Fills `cnt_fns`: the functions whose own contract, loop invariants or
-/// assertions use `vcount` (directly or through spec fns), or that call a
-/// function whose contract does; every function when a struct invariant
-/// counts. As stage0's `counting_fns`, by definition rather than instance
-/// (the instances of one definition all count or all do not).
-fn count_gate(v: &mut Vr, m: &Mono, p: &Parser) {
+/// Fills `out` (`cnt_fns`, `dec_fns`): the functions whose own contract,
+/// loop invariants or assertions use the spec builtin `call` (directly or
+/// through spec fns), or that call a function whose contract does; every
+/// function when a struct invariant uses it. As stage0's `counting_fns`, by
+/// definition rather than instance (the instances of one definition all
+/// use it or all do not).
+fn count_gate(m: &Mono, p: &Parser, call: Str, out: &mut Vec[u64]) {
   let mut defs = vec_new[u64]();
   let mut k = p.specs.head;
   while k != 0 {
     let n = node_at(p.nodes, k);
-    if mentions_count(m, p, n.c, defs) {
+    if mentions_count(m, p, n.c, call, defs) {
       vec_push(&mut defs, k);
     }
     k = n.next;
@@ -736,7 +761,7 @@ fn count_gate(v: &mut Vr, m: &Mono, p: &Parser) {
   k = p.structs.head;
   while k != 0 {
     let n = node_at(p.nodes, k);
-    if n.kind == D_STRUCT && mentions_list(m, p, n.b, defs) {
+    if n.kind == D_STRUCT && mentions_list(m, p, n.b, call, defs) {
       all = true;
     }
     k = n.next;
@@ -744,7 +769,7 @@ fn count_gate(v: &mut Vr, m: &Mono, p: &Parser) {
   k = p.fns.head;
   while k != 0 {
     let n = node_at(p.nodes, k);
-    if mentions_list(m, p, n.c, defs) || mentions_list(m, p, n.d, defs) {
+    if mentions_list(m, p, n.c, call, defs) || mentions_list(m, p, n.d, call, defs) {
       vec_push(&mut defs, k);
     }
     k = n.next;
@@ -752,8 +777,8 @@ fn count_gate(v: &mut Vr, m: &Mono, p: &Parser) {
   k = p.fns.head;
   while k != 0 {
     let n = node_at(p.nodes, k);
-    if all || has_u(defs, k) || block_mentions_count(m, p, n.x, defs) {
-      vec_push(&mut v.cnt_fns, k);
+    if all || has_u(defs, k) || block_mentions_count(m, p, n.x, call, defs) {
+      vec_push(&mut out, k);
     }
     k = n.next;
   }
@@ -1072,6 +1097,7 @@ fn out_op(out: &mut Vec[u64], op: u64) {
   else if op == OP_SELECT { out_str(&mut out, "select"); }
   else if op == OP_STORE { out_str(&mut out, "store"); }
   else if op == OP_CNT { out_str(&mut out, "cnt"); }
+  else if op == OP_DEC { out_str(&mut out, "dec"); }
 }
 
 fn out_tm(out: &mut Vec[u64], v: &Vr, t: u64) {
@@ -1134,7 +1160,7 @@ fn out_sort(out: &mut Vec[u64], so: u64) {
 /// The two commands every session starts with.
 fn out_header(out: &mut Vec[u64]) {
   out_str(&mut out, "(set-option :produce-models true)\n");
-  out_str(&mut out, "(set-option :timeout 10000)\n");
+  out_str(&mut out, "(set-option :rlimit 40000000)\n");
 }
 
 /// Command `cmd`, with its newline.
@@ -2365,14 +2391,91 @@ fn vm_num(v: &mut Vr, x: u64) {
 
 /// Expression `i` as stage0's `render` writes it.
 fn vm_expr(v: &mut Vr, p: &Parser, i: u64) {
-  rd_expr(&mut v.msg, p, i, true);
+  let mut t = vec_new[u64]();
+  rd_expr_s(&mut t, p, i, true, v.tsub);
+  let mut k = 0;
+  while k < vec_len(t) {
+    vec_push(&mut v.msg, u_at(t, k));
+    k = k + 1;
+  }
+  vec_free(t);
+}
+
+/// "that the destination `d` .. `d + n` is within `b` (`d + n <= blen(b)`)",
+/// for arguments `d`, `n` and `b` of call `args` (`which` is "destination"
+/// or "source").
+fn vm_brange(v: &mut Vr, p: &Parser, args: &Vec[u64], which: Str, d: u64, n: u64, b: u64) {
+  vm_s(&mut v, "that the ");
+  vm_s(&mut v, which);
+  vm_s(&mut v, " `");
+  vm_arg(&mut v, p, u_at(args, d));
+  vm_s(&mut v, "` .. `");
+  vm_arg(&mut v, p, u_at(args, d));
+  vm_s(&mut v, " + ");
+  vm_arg(&mut v, p, u_at(args, n));
+  vm_s(&mut v, "` is within `");
+  vm_arg(&mut v, p, u_at(args, b));
+  vm_s(&mut v, "` (`");
+  vm_arg(&mut v, p, u_at(args, d));
+  vm_s(&mut v, " + ");
+  vm_arg(&mut v, p, u_at(args, n));
+  vm_s(&mut v, " <= blen(");
+  vm_arg(&mut v, p, u_at(args, b));
+  vm_s(&mut v, ")`)");
+}
+
+/// "that `o` .. `o + n` is within the page (`o + n <= 4096`)".
+fn vm_prange(v: &mut Vr, p: &Parser, args: &Vec[u64], o: u64, n: u64) {
+  vm_s(&mut v, "that `");
+  vm_arg(&mut v, p, u_at(args, o));
+  vm_s(&mut v, "` .. `");
+  vm_arg(&mut v, p, u_at(args, o));
+  vm_s(&mut v, " + ");
+  vm_arg(&mut v, p, u_at(args, n));
+  vm_s(&mut v, "` is within the page (`");
+  vm_arg(&mut v, p, u_at(args, o));
+  vm_s(&mut v, " + ");
+  vm_arg(&mut v, p, u_at(args, n));
+  vm_s(&mut v, " <= 4096`)");
+}
+
+/// What `rd_sub` needs for instance `x`: each type parameter's name and
+/// the name of the type it stands for.
+fn vm_tsub(m: &Mono, p: &Parser, x: u64) -> Vec[u64] {
+  let mut sub = vec_new[u64]();
+  let xi = inst_at(m, x);
+  if xi.n == 0 || xi.args >= SRC_MAX {
+    return sub;
+  }
+  let d = node_at(p.nodes, xi.def);
+  let mut k = d.v;
+  let mut j = 0;
+  while k != 0 && j < xi.n && j < SRC_MAX
+    invariant j <= SRC_MAX
+  {
+    let kn = node_at(p.nodes, k);
+    let mut name = vec_new[u64]();
+    tyn_to(&mut name, m, p, targ_at(m, xi.args + j));
+    vec_push(&mut sub, kn.s);
+    vec_push(&mut sub, kn.e);
+    vec_push(&mut sub, vec_len(name));
+    let mut q = 0;
+    while q < vec_len(name) {
+      vec_push(&mut sub, u_at(name, q));
+      q = q + 1;
+    }
+    vec_free(name);
+    k = kn.next;
+    j = j + 1;
+  }
+  return sub;
 }
 
 /// An argument: rendered, with a leading `&mut ` dropped (it reads as
 /// plain `x` in specifications).
 fn vm_arg(v: &mut Vr, p: &Parser, i: u64) {
   let mut t = vec_new[u64]();
-  rd_expr(&mut t, p, i, true);
+  rd_expr_s(&mut t, p, i, true, v.tsub);
   let mut k = 0;
   if vec_len(t) >= 5 && u_at(t, 0) == 38 && u_at(t, 1) == 109 && u_at(t, 2) == 117 && u_at(t, 3) == 116 && u_at(t, 4) == 32 {
     k = 5;
@@ -2663,6 +2766,26 @@ fn spec_tm(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env: &Vec[
     return app1(&mut v, OP_SUB, x);
   }
   if k == E_BIN {
+    // `==` on a value that names a struct or enum compares it part by part
+    // (the checker allows it only between such values); on a number it is
+    // the same `(= a b)` as below.
+    if (n.v == P_EQEQ || n.v == P_NE) && spec_place(p, n.a) {
+      let x = spec_val(&mut v, c, &mut m, p, n.a, env, oenv, has_old, res, &mut bound);
+      let xl = vl_at(v, x);
+      let xk = xl.kind;
+      let mut eq = 0;
+      if xk == VV_U || xk == VV_B {
+        let tb = spec_tm(&mut v, c, &mut m, p, n.b, env, oenv, has_old, res, &mut bound);
+        eq = app2(&mut v, OP_EQ, term(v, x), tb);
+      } else {
+        let y = spec_val(&mut v, c, &mut m, p, n.b, env, oenv, has_old, res, &mut bound);
+        eq = eq_term(&mut v, x, y);
+      }
+      if n.v == P_NE {
+        return t_not(&mut v, eq);
+      }
+      return eq;
+    }
     let ta = spec_tm(&mut v, c, &mut m, p, n.a, env, oenv, has_old, res, &mut bound);
     let tb = spec_tm(&mut v, c, &mut m, p, n.b, env, oenv, has_old, res, &mut bound);
     let op = n.v;
@@ -2697,6 +2820,44 @@ fn spec_tm(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env: &Vec[
     return vspec_expand(&mut v, c, &mut m, p, n.b, xi.def, x, env, oenv, has_old, res, &mut bound);
   }
   return v.t_false;
+}
+
+/// Two values of one struct or enum type (made of numbers) are equal: every
+/// field is, and for an enum the tags are and so is the payload the tag
+/// names. As stage0's `eq_term`.
+fn eq_term(v: &mut Vr, a: u64, b: u64) -> u64 {
+  let x = unbox_known(v, a);
+  let y = unbox_known(v, b);
+  let xv = vl_at(v, x);
+  let yv = vl_at(v, y);
+  if (xv.kind == VV_U && yv.kind == VV_U) || (xv.kind == VV_B && yv.kind == VV_B) {
+    return app2(&mut v, OP_EQ, xv.a, yv.a);
+  }
+  let st = xv.kind == VV_STRUCT && yv.kind == VV_STRUCT;
+  let en = xv.kind == VV_ENUM && yv.kind == VV_ENUM;
+  if !st && !en {
+    return v.t_true;
+  }
+  let mut ts = vec_new[u64]();
+  if en {
+    vec_push(&mut ts, app2(&mut v, OP_EQ, xv.a, yv.a));
+  }
+  let mut j = 0;
+  while j < xv.n && j < yv.n && j < SRC_MAX {
+    let t = eq_term(&mut v, kid(v, x, j), kid(v, y, j));
+    if t != v.t_true {
+      if en {
+        let g = app2(&mut v, OP_EQ, xv.a, num(&mut v, j));
+        vec_push(&mut ts, app2(&mut v, OP_IMP, g, t));
+      } else {
+        vec_push(&mut ts, t);
+      }
+    }
+    j = j + 1;
+  }
+  let r = and_all(&mut v, ts);
+  vec_free(ts);
+  return r;
 }
 
 /// The SMT operator of a binary operator token.
@@ -2775,6 +2936,13 @@ fn vspec_builtin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env:
     let el = vl_at(v, xv.b);
     let t = spec_tm(&mut v, c, &mut m, p, arg_node(p, i, 1), env, oenv, has_old, res, &mut bound);
     return app3(&mut v, OP_CNT, el.a, xv.a, t);
+  }
+  if span_is(p, n.s, n.e, "bdec") {
+    let bx = spec_val(&mut v, c, &mut m, p, n.a, env, oenv, has_old, res, &mut bound);
+    let bv = vl_at(v, bx);
+    let from = spec_tm(&mut v, c, &mut m, p, arg_node(p, i, 1), env, oenv, has_old, res, &mut bound);
+    let to = spec_tm(&mut v, c, &mut m, p, arg_node(p, i, 2), env, oenv, has_old, res, &mut bound);
+    return app3(&mut v, OP_DEC, bv.b, from, to);
   }
   if span_is(p, n.s, n.e, "vget") {
     let x = spec_val(&mut v, c, &mut m, p, i, env, oenv, has_old, res, &mut bound);
@@ -3719,6 +3887,9 @@ fn vuser_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64, loc: u6
   let nm = inst_name(&mut v, m, p, x);
   let mut b = vec_new[Bnd]();
   let mut r = d.c;
+  // The callee's precondition, quoted from its copy for instance `x`.
+  let mine = v.tsub;
+  v.tsub = vm_tsub(m, p, x);
   while r != 0 {
     let t = spec_tm(&mut v, c, &mut m, p, r, pre, pre, false, 0, &mut b);
     vm_s(&mut v, "the precondition `");
@@ -3729,6 +3900,9 @@ fn vuser_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64, loc: u6
     prove(&mut v, st, t, loc, VC_REQUIRES);
     r = next_of(p, r);
   }
+  let theirs = v.tsub;
+  v.tsub = mine;
+  vec_free(theirs);
   let rt = conv(&mut m, p, d.b, x, xi.def);
   let h = cat_str(&mut v, nm, "_ret");
   let res = fresh_of(&mut v, c, m, p, rt, h);
@@ -4036,6 +4210,95 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
       return nb;
     }
     put_back(&mut v, m, p, &mut st, u_at(args, 0), nb);
+    return v.unit;
+  }
+  // Bulk copies. A copied range is a lambda over the old arrays, so a read
+  // of it reduces to a read of the source or the old data.
+  if name_is(p, i, "bcopy") || name_is(p, i, "bmove") {
+    let mut sx = x0;
+    let d = term(v, x1);
+    let mut s = term(v, x2);
+    let mut n = term(v, u_at(vals, 3));
+    if name_is(p, i, "bcopy") {
+      sx = x2;
+      s = term(v, u_at(vals, 3));
+      n = term(v, u_at(vals, 4));
+    }
+    let src = vl_at(v, sx);
+    let mut ri = 3;
+    let mut si = 2;
+    let mut sk = 0;
+    if name_is(p, i, "bcopy") {
+      ri = 4;
+      si = 3;
+      sk = 2;
+    }
+    let de = app2(&mut v, OP_ADD, d, n);
+    let g = app2(&mut v, OP_LE, de, a0.a);
+    vm_brange(&mut v, p, args, "destination", 1, ri, 0);
+    prove(&mut v, st, g, i, VC_BOUNDS);
+    let se = app2(&mut v, OP_ADD, s, n);
+    let g2 = app2(&mut v, OP_LE, se, src.a);
+    vm_brange(&mut v, p, args, "source", si, ri, sk);
+    prove(&mut v, st, g2, i, VC_BOUNDS);
+    let inr = port_range(&mut v, d, n);
+    let off = app2(&mut v, OP_SUB, v.t_k, d);
+    let at = app2(&mut v, OP_ADD, s, off);
+    let from = app2(&mut v, OP_SELECT, src.b, at);
+    let kept = app2(&mut v, OP_SELECT, a0.b, v.t_k);
+    let body = app3(&mut v, OP_ITE, inr, from, kept);
+    let nd = lambda_tm(&mut v, v.t_k, body);
+    let nb = mk(&mut v, VV_BUF, 0, a0.a, nd, 0, 0);
+    put_back(&mut v, m, p, &mut st, u_at(args, 0), nb);
+    return v.unit;
+  }
+  // From a page into bytes: what the page holds is not tracked, so the
+  // copied range of the destination becomes unknown.
+  if name_is(p, i, "frame_to_bytes") || name_is(p, i, "dma_to_bytes") {
+    let d = term(v, x1);
+    let o = term(v, u_at(vals, 3));
+    let n = term(v, u_at(vals, 4));
+    let oe = app2(&mut v, OP_ADD, o, n);
+    let page = num(&mut v, 4096);
+    let g = app2(&mut v, OP_LE, oe, page);
+    vm_prange(&mut v, p, args, 3, 4);
+    prove(&mut v, st, g, i, VC_BOUNDS);
+    let de = app2(&mut v, OP_ADD, d, n);
+    let g2 = app2(&mut v, OP_LE, de, a0.a);
+    vm_brange(&mut v, p, args, "destination", 1, 4, 0);
+    prove(&mut v, st, g2, i, VC_BOUNDS);
+    let mut h = 0;
+    if name_is(p, i, "frame_to_bytes") {
+      h = atom_str(&mut v, "frame_to_bytes");
+    } else {
+      h = atom_str(&mut v, "dma_to_bytes");
+    }
+    let fresh = fresh_array(&mut v, h, SO_INT);
+    let inr = port_range(&mut v, d, n);
+    let from = app2(&mut v, OP_SELECT, fresh, v.t_k);
+    let kept = app2(&mut v, OP_SELECT, a0.b, v.t_k);
+    let body = app3(&mut v, OP_ITE, inr, from, kept);
+    let nd = lambda_tm(&mut v, v.t_k, body);
+    let nb = mk(&mut v, VV_BUF, 0, a0.a, nd, 0, 0);
+    put_back(&mut v, m, p, &mut st, u_at(args, 0), nb);
+    return v.unit;
+  }
+  // From bytes into a page: the page's contents are not tracked, and it
+  // stays the same page.
+  if name_is(p, i, "bytes_to_frame") || name_is(p, i, "bytes_to_dma") {
+    let o = term(v, x1);
+    let src = vl_at(v, x2);
+    let s = term(v, u_at(vals, 3));
+    let n = term(v, u_at(vals, 4));
+    let oe = app2(&mut v, OP_ADD, o, n);
+    let page = num(&mut v, 4096);
+    let g = app2(&mut v, OP_LE, oe, page);
+    vm_prange(&mut v, p, args, 1, 4);
+    prove(&mut v, st, g, i, VC_BOUNDS);
+    let se = app2(&mut v, OP_ADD, s, n);
+    let g2 = app2(&mut v, OP_LE, se, src.a);
+    vm_brange(&mut v, p, args, "source", 3, 4, 2);
+    prove(&mut v, st, g2, i, VC_BOUNDS);
     return v.unit;
   }
   // A u8 always fits in a byte: the type says what E-VERIFY-BYTE used to prove.
@@ -4574,15 +4837,6 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
   }
 
   // ---- MMU and CPU ----
-  if name_is(p, i, "mmu_switch") {
-    let four = num(&mut v, 4);
-    let g = app2(&mut v, OP_EQ, g_level(v, x1), four);
-    vm_pt_top(&mut v, p, u_at(args, 1));
-    prove(&mut v, st, g, i, VC_PT);
-    let nm = mk_obj(&mut v, m, kind_ty(m, p, TY_MMU), g_id(v, x1), 0, 0);
-    put_back(&mut v, m, p, &mut st, u_at(args, 0), nm);
-    return v.unit;
-  }
   // A lease counts this processor among those that may be running on the
   // table, so nothing is taken out of its tree until the lease is given back.
   if name_is(p, i, "mmu_enter") {
@@ -5282,7 +5536,8 @@ fn shape_keeping(p: &Parser, i: u64) -> bool {
   return name_is(p, i, "bset") || name_is(p, i, "vec_set") || name_is(p, i, "vec_swap") || name_is(p, i, "pt_put")
     || name_is(p, i, "pt_take") || name_is(p, i, "pt_put_frame") || name_is(p, i, "pt_take_frame")
     || name_is(p, i, "pt_borrow") || name_is(p, i, "pt_borrow_frame") || name_is(p, i, "pt_lease_count") || name_is(p, i, "pool_take") || name_is(p, i, "pool_give") || name_is(p, i, "frame_write")
-    || name_is(p, i, "frame_write8") || name_is(p, i, "cpu_set") || name_is(p, i, "cpu_run") || name_is(p, i, "cpu_idle")
+    || name_is(p, i, "frame_write8") || name_is(p, i, "bcopy") || name_is(p, i, "bmove") || name_is(p, i, "frame_to_bytes")
+    || name_is(p, i, "bytes_to_frame") || name_is(p, i, "dma_to_bytes") || name_is(p, i, "bytes_to_dma") || name_is(p, i, "cpu_set") || name_is(p, i, "cpu_run") || name_is(p, i, "cpu_idle")
     || name_is(p, i, "cpu_fpu_save") || name_is(p, i, "cpu_fpu_load") || name_is(p, i, "pio_in8") || name_is(p, i, "pio_in16")
     || name_is(p, i, "pio_in32") || name_is(p, i, "pio_out8") || name_is(p, i, "pio_out16") || name_is(p, i, "pio_out32")
     || name_is(p, i, "mmio_read8") || name_is(p, i, "mmio_read16") || name_is(p, i, "mmio_read32") || name_is(p, i, "mmio_read64")
@@ -5605,9 +5860,15 @@ fn verify_fn(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
   let xi = inst_at(m, x);
   let d = node_at(p.nodes, xi.def);
   v.env = x;
+  let prev = v.tsub;
+  v.tsub = vm_tsub(m, p, x);
+  vec_free(prev);
   v.counts = has_u(v.cnt_fns, xi.def);
   if v.counts {
     count_lemmas(&mut v);
+  }
+  if has_u(v.dec_fns, xi.def) {
+    dec_axioms(&mut v);
   }
   let mut env = vec_new[Bind]();
   let mut q = d.a;
@@ -5722,7 +5983,8 @@ fn buffers_kept(v: &mut Vr, m: &mut Mono, p: &Parser, x: u64) {
 
 fn verify_program(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
   summarize(&mut v, c, &mut m, p);
-  count_gate(&mut v, m, p);
+  count_gate(m, p, "vcount", &mut v.cnt_fns);
+  count_gate(m, p, "bdec", &mut v.dec_fns);
   send(&mut v, CMD_DECL, v.t_poolsize, SO_INT);
   let r = in_range(&mut v, v.t_zero, v.t_poolsize, v.t_flimit);
   assert_tm(&mut v, r);

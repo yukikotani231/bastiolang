@@ -31,8 +31,8 @@ const AV_MEM: u64 = 2;       // hosted and kernel
 const AV_KERNEL: u64 = 3;
 const AV_USER: u64 = 4;
 
-/// A builtin's signature: up to four parameter types.
-struct Bsig { name: Str, avail: u64, np: u64, p0: u64, p1: u64, p2: u64, p3: u64, ret: u64 }
+/// A builtin's signature: up to five parameter types.
+struct Bsig { name: Str, avail: u64, np: u64, p0: u64, p1: u64, p2: u64, p3: u64, p4: u64, ret: u64 }
 
 /// A ghost accessor (specifications only): its argument type, whether it
 /// also takes an index, and its result type.
@@ -58,6 +58,9 @@ struct Checker {
   /// The variables in scope, innermost last.
   vars: Vec[Var],
   moved: Vec[u64],
+  /// Where places were consumed, as pairs (place, node), latest last, for
+  /// the note under a later use (stage0's `moved_at`).
+  mlocs: Vec[u64],
   /// The variables bound by enclosing `forall`s (their nodes).
   bound: Vec[u64],
   target: u64,
@@ -119,6 +122,7 @@ fn checker_free(c: Checker) {
   vec_free(c.paths);
   vec_free(c.vars);
   vec_free(c.moved);
+  vec_free(c.mlocs);
   vec_free(c.bound);
   vec_free(c.int_ops);
   vec_free(c.calls);
@@ -128,7 +132,12 @@ fn checker_free(c: Checker) {
 }
 
 fn bsig(c: &mut Checker, name: Str, avail: u64, np: u64, p0: u64, p1: u64, p2: u64, p3: u64, ret: u64) {
-  vec_push(&mut c.bs, Bsig { name: name, avail: avail, np: np, p0: p0, p1: p1, p2: p2, p3: p3, ret: ret });
+  vec_push(&mut c.bs, Bsig { name: name, avail: avail, np: np, p0: p0, p1: p1, p2: p2, p3: p3, p4: 0, ret: ret });
+}
+
+/// A builtin with five parameters (the bulk copies).
+fn bsig5(c: &mut Checker, name: Str, avail: u64, p0: u64, p1: u64, p2: u64, p3: u64, p4: u64, ret: u64) {
+  vec_push(&mut c.bs, Bsig { name: name, avail: avail, np: 5, p0: p0, p1: p1, p2: p2, p3: p3, p4: p4, ret: ret });
 }
 
 fn ghost(c: &mut Checker, name: Str, arg: u64, idx: bool, ret: u64) {
@@ -157,7 +166,7 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   vec_push(&mut paths, Path { up: 0, s: 0, e: 0 });
   let mut c = Checker {
     bs: vec_new[Bsig](), ghosts: vec_new[Ghost](), fstart: vec_new[u64](), ftys: vec_new[u64](),
-    paths: paths, vars: vec_new[Var](), moved: vec_new[u64](), bound: vec_new[u64](),
+    paths: paths, vars: vec_new[Var](), moved: vec_new[u64](), mlocs: vec_new[u64](), bound: vec_new[u64](),
     target: target, ret: un, env: 0, spec_lim: 0, spec_pos: 0, tu64: u, tbool: b, tunit: un, tstr: st,
     failed: false, efile: 0, eline: 0, ecol: 0, ecode: 0, emsg: vec_new[u64](), enotes: vec_new[u64](), int_ops: vec_new[IntOp](),
     calls: vec_new[Edge](), lsites: vec_new[LockSite](), nparams: 0, inv: false, old_only: false
@@ -217,6 +226,8 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   bsig(&mut c, "blen", AV_ALL, 1, rbyt, 0, 0, 0, u);
   bsig(&mut c, "bget", AV_ALL, 2, rbyt, u, 0, 0, u8t);
   bsig(&mut c, "bset", AV_ALL, 3, mbyt, u, u8t, 0, un);
+  bsig5(&mut c, "bcopy", AV_ALL, mbyt, u, rbyt, u, u, un);
+  bsig(&mut c, "bmove", AV_ALL, 4, mbyt, u, u, u, un);
   bsig(&mut c, "bfree", AV_ALL, 1, byt, 0, 0, 0, un);
   bsig(&mut c, "bfrom", AV_ALL, 1, st, 0, 0, 0, byt);
   bsig(&mut c, "host_argc", AV_HOSTED, 1, rhst, 0, 0, 0, u);
@@ -244,6 +255,8 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   bsig(&mut c, "frame_write", AV_MEM, 3, mfrm, u, u, 0, un);
   bsig(&mut c, "frame_read8", AV_MEM, 2, rfrm, u, 0, 0, u8t);
   bsig(&mut c, "frame_write8", AV_MEM, 3, mfrm, u, u8t, 0, un);
+  bsig5(&mut c, "frame_to_bytes", AV_MEM, mbyt, u, rfrm, u, u, un);
+  bsig5(&mut c, "bytes_to_frame", AV_MEM, mfrm, u, rbyt, u, u, un);
   bsig(&mut c, "pt_new", AV_MEM, 2, frm, u, 0, 0, ptb);
   bsig(&mut c, "pt_free", AV_MEM, 1, ptb, 0, 0, 0, frm);
   bsig(&mut c, "pt_free_root", AV_KERNEL, 2, rmmu, ptb, 0, 0, frm);
@@ -254,7 +267,6 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   bsig(&mut c, "pt_put_frame", AV_MEM, 4, mptb, u, frm, b, un);
   bsig(&mut c, "pt_take_frame", AV_MEM, 2, mptb, u, 0, 0, frm);
   bsig(&mut c, "pt_lease_count", AV_MEM, 1, mptb, 0, 0, 0, u);
-  bsig(&mut c, "mmu_switch", AV_KERNEL, 2, mmmu, rptb, 0, 0, un);
   bsig(&mut c, "mmu_enter", AV_KERNEL, 2, mmmu, mptb, 0, 0, lse);
   bsig(&mut c, "mmu_exit", AV_KERNEL, 2, mmmu, lse, 0, 0, un);
   bsig(&mut c, "mmu_kernel", AV_KERNEL, 1, mmmu, 0, 0, 0, un);
@@ -300,6 +312,8 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   bsig(&mut c, "dma_write16", AV_MEM, 3, mdma, u, u16t, 0, un);
   bsig(&mut c, "dma_write32", AV_MEM, 3, mdma, u, u32t, 0, un);
   bsig(&mut c, "dma_write64", AV_MEM, 3, mdma, u, u, 0, un);
+  bsig5(&mut c, "dma_to_bytes", AV_MEM, mbyt, u, mdma, u, u, un);
+  bsig5(&mut c, "bytes_to_dma", AV_MEM, mdma, u, rbyt, u, u, un);
   bsig(&mut c, "sys_spawn", AV_USER, 3, rbuf, u, u, 0, u);
   bsig(&mut c, "sys_wait", AV_USER, 1, u, 0, 0, 0, u);
   bsig(&mut c, "sys_kill", AV_USER, 1, u, 0, 0, 0, u);
@@ -996,7 +1010,7 @@ fn bs_at(c: &Checker, k: u64) -> Bsig {
   if k < vec_len(c.bs) {
     return vec_get(c.bs, k);
   }
-  return Bsig { name: "", avail: 0, np: 0, p0: 0, p1: 0, p2: 0, p3: 0, ret: 0 };
+  return Bsig { name: "", avail: 0, np: 0, p0: 0, p1: 0, p2: 0, p3: 0, p4: 0, ret: 0 };
 }
 
 fn ghost_at(c: &Checker, k: u64) -> Ghost {
@@ -1291,6 +1305,7 @@ fn path_type(c: &mut Checker, m: &Mono, p: &Parser, k: u64, loc: u64) -> u64 {
         cm_s(&mut c, "unknown variable `");
         cm_src(&mut c, p, x.s, x.e);
         cm_s(&mut c, "`");
+        sg_var(&mut c, p, x.s, x.e);
       }
       return 0;
     }
@@ -1345,6 +1360,7 @@ fn use_place(c: &mut Checker, m: &Mono, p: &Parser, k: u64, loc: u64) -> u64 {
         cm_place(&mut c, p, pm);
         cm_s(&mut c, "` was consumed");
       }
+      cm_note_consumed(&mut c, p, pm);
     }
     return 0;
   }
@@ -1368,8 +1384,203 @@ fn use_place(c: &mut Checker, m: &Mono, p: &Parser, k: u64, loc: u64) -> u64 {
       return 0;
     }
     mark(&mut c, k);
+    vec_push(&mut c.mlocs, k);
+    vec_push(&mut c.mlocs, loc);
   }
   return t;
+}
+
+// ---- "did you mean" (stage0's `did_you_mean`) ----
+
+fn sg_span(out: &mut Vec[u64], p: &Parser, s: u64, e: u64) {
+  if s <= e && e <= blen(p.src) {
+    let mut k = s;
+    while k < e
+      invariant e <= blen(p.src)
+    {
+      vec_push(&mut out, cast[u64](bget(p.src, k)));
+      k = k + 1;
+    }
+  }
+}
+
+fn sg_str(out: &mut Vec[u64], w: Str) {
+  let mut k = 0;
+  while k < slen(w)
+    invariant k <= slen(w)
+  {
+    vec_push(&mut out, cast[u64](sget(w, k)));
+    k = k + 1;
+  }
+}
+
+/// The number of single-byte insertions, deletions and substitutions that
+/// turn `a` into `b`. Names are short, so the counts cannot wrap.
+fn sg_dist(a: &Vec[u64], b: &Vec[u64]) -> u64 {
+  let mut row = vec_new[u64]();
+  let mut j = 0;
+  while j <= vec_len(b)
+    invariant j <= vlen(b) + 1 && vlen(row) == j
+  {
+    vec_push(&mut row, j);
+    j = j + 1;
+  }
+  let mut i = 0;
+  while i < vec_len(a)
+    invariant vlen(row) == vlen(b) + 1
+  {
+    let mut diag = vec_get(row, 0);
+    vec_set(&mut row, 0, wrap_add(i, 1));
+    let mut k = 0;
+    while k < vec_len(b)
+      invariant vlen(row) == vlen(b) + 1 && i < vlen(a)
+    {
+      let up = vec_get(row, k + 1);
+      let mut best = diag;
+      if vec_get(a, i) != vec_get(b, k) {
+        best = wrap_add(diag, 1);
+      }
+      if wrap_add(up, 1) < best {
+        best = wrap_add(up, 1);
+      }
+      if wrap_add(vec_get(row, k), 1) < best {
+        best = wrap_add(vec_get(row, k), 1);
+      }
+      vec_set(&mut row, k + 1, best);
+      diag = up;
+      k = k + 1;
+    }
+    i = i + 1;
+  }
+  let d = vec_get(row, vec_len(b));
+  vec_free(row);
+  return d;
+}
+
+/// Is `a` before `b` in byte order?
+fn sg_less(a: &Vec[u64], b: &Vec[u64]) -> bool {
+  let mut k = 0;
+  while k < vec_len(a) && k < vec_len(b) {
+    if vec_get(a, k) != vec_get(b, k) {
+      return vec_get(a, k) < vec_get(b, k);
+    }
+    k = k + 1;
+  }
+  return vec_len(a) < vec_len(b);
+}
+
+/// Candidate `cand` for the unknown name `want`: kept in `best` when it is
+/// within the limit and closer, or as close and earlier, than the best so
+/// far, whose distance `bd` is returned updated (`U64_MAX`: none yet).
+fn sg_try(best: &mut Vec[u64], bd: u64, want: &Vec[u64], cand: Vec[u64]) -> u64 {
+  let mut limit = 2;
+  if vec_len(want) <= 4 {
+    limit = 1;
+  }
+  let d = sg_dist(want, cand);
+  if d <= limit && (d < bd || (d == bd && sg_less(cand, best))) {
+    while vec_len(best) > 0 {
+      vec_pop(&mut best);
+    }
+    let mut k = 0;
+    while k < vec_len(cand) {
+      vec_push(&mut best, vec_get(cand, k));
+      k = k + 1;
+    }
+    vec_free(cand);
+    return d;
+  }
+  vec_free(cand);
+  return bd;
+}
+
+/// The hint "did you mean `x`?" when a candidate was found.
+fn sg_note(c: &mut Checker, best: Vec[u64], bd: u64) {
+  if bd != U64_MAX {
+    let msg = c.emsg;
+    c.emsg = vec_new[u64]();
+    cm_s(&mut c, "  = did you mean `");
+    let mut k = 0;
+    while k < vec_len(best) {
+      vec_push(&mut c.emsg, vec_get(best, k));
+      k = k + 1;
+    }
+    cm_s(&mut c, "`?\n");
+    cm_take_note(&mut c, msg);
+  }
+  vec_free(best);
+}
+
+/// The hint under "unknown variable `s..e`": the closest variable in scope.
+fn sg_var(c: &mut Checker, p: &Parser, s: u64, e: u64) {
+  let mut want = vec_new[u64]();
+  sg_span(&mut want, p, s, e);
+  let mut best = vec_new[u64]();
+  let mut bd = U64_MAX;
+  let mut k = 0;
+  while k < vec_len(c.vars) {
+    let v = vec_get(c.vars, k);
+    let mut cand = vec_new[u64]();
+    sg_span(&mut cand, p, v.s, v.e);
+    bd = sg_try(&mut best, bd, want, cand);
+    k = k + 1;
+  }
+  vec_free(want);
+  sg_note(&mut c, best, bd);
+}
+
+/// The hint under "unknown function `s..e`": the closest builtin or
+/// function that is not generic.
+fn sg_fn(c: &mut Checker, p: &Parser, s: u64, e: u64) {
+  let mut want = vec_new[u64]();
+  sg_span(&mut want, p, s, e);
+  let mut best = vec_new[u64]();
+  let mut bd = U64_MAX;
+  let mut k = 0;
+  while k < vec_len(c.bs) {
+    let b = bs_at(c, k);
+    let mut cand = vec_new[u64]();
+    sg_str(&mut cand, b.name);
+    bd = sg_try(&mut best, bd, want, cand);
+    k = k + 1;
+  }
+  let mut f = p.fns.head;
+  while f != 0 {
+    let n = node_at(p.nodes, f);
+    if n.v == 0 {
+      let mut cand = vec_new[u64]();
+      sg_span(&mut cand, p, n.s, n.e);
+      bd = sg_try(&mut best, bd, want, cand);
+    }
+    f = n.next;
+  }
+  vec_free(want);
+  sg_note(&mut c, best, bd);
+}
+
+/// The hint under an error about using place `pm` after it was consumed:
+/// where it was (stage0's `consumed_note`).
+fn cm_note_consumed(c: &mut Checker, p: &Parser, pm: u64) {
+  let mut j = vec_len(c.mlocs);
+  while j >= 2
+    invariant j <= vlen(c.mlocs)
+  {
+    j = j - 2;
+    if vec_get(c.mlocs, j) == pm {
+      let n = node_at(p.nodes, vec_get(c.mlocs, j + 1));
+      let msg = c.emsg;
+      c.emsg = vec_new[u64]();
+      cm_s(&mut c, "  = `");
+      cm_place(&mut c, p, pm);
+      cm_s(&mut c, "` was consumed at ");
+      cm_num(&mut c, n.line);
+      cm_s(&mut c, ":");
+      cm_num(&mut c, n.col);
+      cm_s(&mut c, "\n");
+      cm_take_note(&mut c, msg);
+      return;
+    }
+  }
 }
 
 /// Is nothing left to own at place `k` (of type `t`)? It was moved, or
@@ -1566,6 +1777,7 @@ fn cm_used_after(c: &mut Checker, p: &Parser, loc: u64, k: u64, pm: u64) {
     cm_s(&mut c, "` is used after `");
     cm_place(&mut c, p, pm);
     cm_s(&mut c, "` was consumed");
+    cm_note_consumed(&mut c, p, pm);
   }
 }
 
@@ -1976,6 +2188,9 @@ fn reset(c: &mut Checker, ret: u64, env: u64) {
     vec_pop(&mut c.vars);
   }
   set_moved(&mut c, vec_new[u64]());
+  while vec_len(c.mlocs) > 0 {
+    vec_pop(&mut c.mlocs);
+  }
   while vec_len(c.bound) > 0 {
     vec_pop(&mut c.bound);
   }
@@ -2403,6 +2618,7 @@ fn ck_stmt(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> bool {
         cm_s(&mut c, "`: `");
         cm_place(&mut c, p, pm);
         cm_s(&mut c, "` was consumed");
+        cm_note_consumed(&mut c, p, pm);
       }
       return false;
     }
@@ -3100,6 +3316,8 @@ fn cm_unknown_var(c: &mut Checker, p: &Parser, i: u64) {
     cm_s(&mut c, "unknown variable `");
     cm_name(&mut c, p, i);
     cm_s(&mut c, "`");
+    let n = node_at(p.nodes, i);
+    sg_var(&mut c, p, n.s, n.e);
   }
 }
 
@@ -3358,6 +3576,7 @@ fn bsig_params(b: Bsig) -> Vec[u64] {
   if b.np > 1 { vec_push(&mut out, b.p1); }
   if b.np > 2 { vec_push(&mut out, b.p2); }
   if b.np > 3 { vec_push(&mut out, b.p3); }
+  if b.np > 4 { vec_push(&mut out, b.p4); }
   return out;
 }
 
@@ -3507,6 +3726,7 @@ fn ck_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
       cm_s(&mut c, "unknown function `");
       cm_name(&mut c, p, i);
       cm_s(&mut c, "`");
+      sg_fn(&mut c, p, s, e);
     }
     return 0;
   }
@@ -4158,11 +4378,13 @@ fn borrow_arg(c: &mut Checker, m: &Mono, p: &Parser, pt: u64, a: u64, bp: &mut V
       return;
     }
   }
-  if prefix_moved(c, pk) != 0 {
+  let brw_moved = prefix_moved(c, pk);
+  if brw_moved != 0 {
     if cm_new(&mut c, p, a, C_USE) {
       cm_s(&mut c, "`");
       cm_place(&mut c, p, pk);
       cm_s(&mut c, "` is borrowed after it was consumed");
+      cm_note_consumed(&mut c, p, brw_moved);
     }
     return;
   }
@@ -4204,6 +4426,38 @@ fn borrow_arg(c: &mut Checker, m: &Mono, p: &Parser, pt: u64, a: u64, bp: &mut V
 }
 
 // ---- Specifications ----
+
+/// Can a specification compare two values of type `t` with `==`: is it an
+/// integer, a bool, or a struct or enum made of those?
+fn spec_plain(c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
+  if is_int(m, t) || t == c.tbool {
+    return true;
+  }
+  let k = kind_t(m, t);
+  if k != TY_STRUCT && k != TY_ENUM {
+    return false;
+  }
+  let x = inner_t(m, t);
+  let dn = def_node(m, p, x);
+  let n = list_len(p, dn.a);
+  let mut j = 0;
+  while j < n {
+    let ft = fld_ty(c, x, j);
+    if ft != 0 && !spec_plain(c, m, p, ft) {
+      return false;
+    }
+    j = j + 1;
+  }
+  return true;
+}
+
+/// Does a specification expression name a value: a variable, a field of
+/// one, `vget(..)` or `old(..)`? (The verifier compares such values part
+/// by part.) As stage0's `spec_place`.
+fn spec_place(p: &Parser, i: u64) -> bool {
+  let k = kind_of(p, i);
+  return k == E_VAR || k == E_FIELD || (k == E_CALL && (name_is(p, i, "vget") || name_is(p, i, "old")));
+}
 
 /// Does an argument that stands for a linear value name one?
 fn spec_named(p: &Parser, i: u64) -> bool {
@@ -4394,7 +4648,30 @@ fn ck_spec(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u64 
     if c.failed {
       return 0;
     }
-    return bin_type(&mut c, m, p, n.v, spec_norm(c, m, ta), spec_norm(c, m, tb), i);
+    let na = spec_norm(c, m, ta);
+    let nb = spec_norm(c, m, tb);
+    // Structs and enums made of numbers compare field by field.
+    let ka = kind_t(m, na);
+    if (n.v == P_EQEQ || n.v == P_NE) && na == nb && (ka == TY_STRUCT || ka == TY_ENUM) {
+      if !spec_plain(c, m, p, na) {
+        if cm_new(&mut c, p, i, C_TYPE) {
+          cm_s(&mut c, "cannot compare ");
+          cm_ty(&mut c, m, p, na);
+          cm_s(&mut c, " with ");
+          cm_ty(&mut c, m, p, nb);
+          cm_s(&mut c, ": only structs and enums made of integers and booleans compare");
+        }
+        return 0;
+      }
+      if !spec_place(p, n.a) || !spec_place(p, n.b) {
+        if cm_new(&mut c, p, i, C_TYPE) {
+          cm_s(&mut c, "both sides of a struct or enum comparison must name a value: a variable, a field, `vget(..)` or `old(..)`");
+        }
+        return 0;
+      }
+      return c.tbool;
+    }
+    return bin_type(&mut c, m, p, n.v, na, nb, i);
   }
   if k == E_FORALL {
     if find_var(c, p, n.s, n.e) != 0 || is_bound(c, p, n.s, n.e) {
@@ -4456,7 +4733,7 @@ fn cm_spec_arity(c: &mut Checker, p: &Parser, i: u64, want: u64, na: u64) {
 
 /// " cannot be called in a specification (allowed: ..)"
 fn cm_not_in_spec(c: &mut Checker) {
-  cm_s(&mut c, "` cannot be called in a specification (allowed: len, get, slen, sget, blen, bget, vlen, vget, vcount, old, ghost accessors and spec fns)");
+  cm_s(&mut c, "` cannot be called in a specification (allowed: len, get, slen, sget, blen, bget, bdec, vlen, vget, vcount, old, ghost accessors and spec fns)");
 }
 
 /// "argument of `f` must be T" for spec call `i`, then ", found U" when
@@ -4613,6 +4890,40 @@ fn spec_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u6
     let tx = ck_spec(&mut c, &mut m, p, a1, ens);
     if !c.failed {
       expect_ty(&mut c, m, p, spec_norm(c, m, tx), c.tu64, a1, "the value counted");
+    }
+    if c.failed {
+      return 0;
+    }
+    return c.tu64;
+  }
+  if span_is(p, s, e, "bdec") {
+    // The decimal value of bytes `from..to`, each read as a digit.
+    if na != 3 {
+      cm_spec_arity(&mut c, p, i, 3, na);
+      return 0;
+    }
+    let t = ck_spec(&mut c, &mut m, p, a0, ens);
+    if !c.failed && kind_t(m, t) != TY_BYTES && cm_new(&mut c, p, a0, C_TYPE) {
+      cm_s(&mut c, "argument of `bdec` must be Bytes, found ");
+      cm_ty(&mut c, m, p, t);
+    }
+    if !c.failed {
+      check_lin(&mut c, p, a0);
+    }
+    if c.failed {
+      return 0;
+    }
+    let tf = ck_spec(&mut c, &mut m, p, a1, ens);
+    if !c.failed {
+      expect_ty(&mut c, m, p, spec_norm(c, m, tf), c.tu64, a1, "the start");
+    }
+    if c.failed {
+      return 0;
+    }
+    let a2 = next_of(p, a1);
+    let tt = ck_spec(&mut c, &mut m, p, a2, ens);
+    if !c.failed {
+      expect_ty(&mut c, m, p, spec_norm(c, m, tt), c.tu64, a2, "the end");
     }
     if c.failed {
       return 0;

@@ -1,9 +1,12 @@
-// core/hashmap.bastio: a hash map from `u64` keys to `u64` values.
+// core/hashmap.bastio: a hash map from `u64` keys to values of any type
+// `V` that can be copied (`u64`, `Span`, a struct of numbers, ...).
 //
-// Open addressing with linear probing and tombstones. To map keys to
-// linear values (buffers, structs owning pages), keep the values in a
-// `Vec[T]` and map each key to its index: the map itself holds only plain
-// numbers, so it can be read through a shared borrow and freed at any time.
+// Open addressing with linear probing and tombstones. Every function takes
+// the value type as its type argument: `hmap_new[u64]()`,
+// `hmap_insert[Span](&mut m, k, s)`. To map keys to linear values
+// (buffers, structs owning pages), keep the values in a `Vec[T]` and map
+// each key to its index: a `HashMap[V]` with a linear `V` is rejected
+// where a function copies a value.
 //
 // What is proved: every index is in bounds, no counter overflows, `len`
 // is the number of keys and `used` the number of slots that are not
@@ -13,9 +16,9 @@
 // probed slots).
 import "option.bastio";
 
-struct HashMap {
+struct HashMap[V] {
   keys: Vec[u64],
-  vals: Vec[u64],
+  vals: Vec[Option[V]],   // None in a slot that has never held a key
   tags: Vec[u8],   // 0 empty, 1 removed (a tombstone), 2 holds a key
   len: u64,        // slots holding a key
   used: u64,       // slots holding a key or a tombstone
@@ -25,8 +28,8 @@ struct HashMap {
 /// the capacity is in range, every tag is 0, 1 or 2, `len` counts the
 /// slots holding a key and `used` the slots that are not empty, and some
 /// slot is still empty. A loop that changes a map carries
-/// `invariant hmap_ok(m)`.
-spec fn hmap_ok(m: &HashMap) -> bool {
+/// `invariant hmap_ok[V](m)`.
+spec fn hmap_ok[V](m: &HashMap[V]) -> bool {
   vlen(m.tags) == vlen(m.keys) && vlen(m.vals) == vlen(m.keys)
     && 8 <= vlen(m.keys) && vlen(m.keys) <= 1152921504606846976
     && vcount(m.tags, 0) + vcount(m.tags, 1) + vcount(m.tags, 2) == vlen(m.tags)
@@ -35,13 +38,14 @@ spec fn hmap_ok(m: &HashMap) -> bool {
 }
 
 /// The map holds key `k` with value `v`.
-spec fn hmap_maps(m: &HashMap, k: u64, v: u64) -> bool {
+spec fn hmap_maps[V](m: &HashMap[V], k: u64, v: V) -> bool {
   !(forall i: u64 :: i < vlen(m.keys) ==>
-      !(vget(m.tags, i) == 2 && vget(m.keys, i) == k && vget(m.vals, i) == v))
+      !(vget(m.tags, i) == 2 && vget(m.keys, i) == k
+        && vget(m.vals, i) is Option::Some && vget(m.vals, i).Some == v))
 }
 
 /// The map holds key `k`.
-spec fn hmap_has(m: &HashMap, k: u64) -> bool {
+spec fn hmap_has[V](m: &HashMap[V], k: u64) -> bool {
   !(forall i: u64 :: i < vlen(m.keys) ==> !(vget(m.tags, i) == 2 && vget(m.keys, i) == k))
 }
 
@@ -54,12 +58,12 @@ fn hash_u64(k: u64) -> u64 {
 }
 
 /// An empty map with room for `cap` slots (at least 8).
-fn hmap_with_cap(cap: u64) -> HashMap
+fn hmap_with_cap[V](cap: u64) -> HashMap[V]
   requires 8 <= cap && cap <= 1152921504606846976
-  ensures hmap_ok(result) && result.len == 0 && vlen(result.keys) == cap
+  ensures hmap_ok[V](result) && result.len == 0 && vlen(result.keys) == cap
 {
   let mut keys = vec_new[u64]();
-  let mut vals = vec_new[u64]();
+  let mut vals = vec_new[Option[V]]();
   let mut tags = vec_new[u8]();
   let mut i = 0;
   while i < cap
@@ -67,29 +71,29 @@ fn hmap_with_cap(cap: u64) -> HashMap
     invariant vcount(tags, 0) == i && vcount(tags, 1) == 0 && vcount(tags, 2) == 0
   {
     vec_push(&mut keys, 0);
-    vec_push(&mut vals, 0);
+    vec_push(&mut vals, Option[V]::None);
     vec_push(&mut tags, 0);
     i = i + 1;
   }
-  return HashMap { keys: keys, vals: vals, tags: tags, len: 0, used: 0 };
+  return HashMap[V] { keys: keys, vals: vals, tags: tags, len: 0, used: 0 };
 }
 
-fn hmap_new() -> HashMap
-  ensures hmap_ok(result) && result.len == 0
+fn hmap_new[V]() -> HashMap[V]
+  ensures hmap_ok[V](result) && result.len == 0
 {
-  return hmap_with_cap(8);
+  return hmap_with_cap[V](8);
 }
 
 /// The number of keys in the map (`hmap_ok` says `len` counts them).
-fn hmap_len(m: &HashMap) -> u64
+fn hmap_len[V](m: &HashMap[V]) -> u64
   ensures result == m.len
 {
   return m.len;
 }
 
 /// The slot holding `k`, or the capacity if `k` is not in the map.
-fn hmap_find(m: &HashMap, k: u64) -> u64
-  requires hmap_ok(m)
+fn hmap_find[V](m: &HashMap[V], k: u64) -> u64
+  requires hmap_ok[V](m)
   ensures result <= vlen(m.keys)
   ensures result < vlen(m.keys) ==> vget(m.tags, result) == 2 && vget(m.keys, result) == k
 {
@@ -113,56 +117,58 @@ fn hmap_find(m: &HashMap, k: u64) -> u64
 }
 
 /// `k` is in the map.
-fn hmap_contains(m: &HashMap, k: u64) -> bool
-  requires hmap_ok(m)
-  ensures result ==> hmap_has(m, k)
+fn hmap_contains[V](m: &HashMap[V], k: u64) -> bool
+  requires hmap_ok[V](m)
+  ensures result ==> hmap_has[V](m, k)
 {
-  return hmap_find(m, k) < vec_len(m.keys);
+  return hmap_find[V](m, k) < vec_len(m.keys);
 }
 
 /// The value of `k`.
-fn hmap_get(m: &HashMap, k: u64) -> Option[u64]
-  requires hmap_ok(m)
-  ensures result is Option::Some ==> hmap_maps(m, k, result.Some)
+fn hmap_get[V](m: &HashMap[V], k: u64) -> Option[V]
+  requires hmap_ok[V](m)
+  ensures result is Option::Some ==> hmap_maps[V](m, k, result.Some)
 {
-  let i = hmap_find(m, k);
-  if i < vec_len(m.keys) {
-    return Option[u64]::Some(vec_get(m.vals, i));
-  }
-  return Option[u64]::None;
-}
-
-/// The value of `k`, or `d` if `k` is not in the map.
-fn hmap_get_or(m: &HashMap, k: u64, d: u64) -> u64
-  requires hmap_ok(m)
-  ensures result == d || hmap_maps(m, k, result)
-{
-  let i = hmap_find(m, k);
+  let i = hmap_find[V](m, k);
   if i < vec_len(m.keys) {
     return vec_get(m.vals, i);
   }
-  return d;
+  return Option[V]::None;
+}
+
+/// The value of `k`, or `d` if `k` is not in the map.
+fn hmap_get_or[V](m: &HashMap[V], k: u64, d: V) -> V
+  requires hmap_ok[V](m)
+  ensures result == d || hmap_maps[V](m, k, result)
+{
+  match hmap_get[V](m, k) {
+    Option::Some(v) => { return v; },
+    Option::None => { return d; },
+  }
 }
 
 /// Rebuilds the table without tombstones, doubling it when at least half
 /// of it holds keys.
-fn hmap_grow(m: &mut HashMap)
-  requires hmap_ok(m)
-  ensures hmap_ok(m)
+fn hmap_grow[V](m: &mut HashMap[V])
+  requires hmap_ok[V](m)
+  ensures hmap_ok[V](m)
 {
   let old_cap = vec_len(m.keys);
   let mut cap = old_cap;
   if m.len * 2 >= old_cap && old_cap <= 576460752303423488 {
     cap = old_cap * 2;
   }
-  let mut fresh = hmap_with_cap(cap);
+  let mut fresh = hmap_with_cap[V](cap);
   let mut i = 0;
   while i < old_cap
-    invariant i <= old_cap && hmap_ok(fresh)
+    invariant i <= old_cap && hmap_ok[V](fresh)
     invariant vlen(m.keys) == old_cap && vlen(m.vals) == old_cap && vlen(m.tags) == old_cap
   {
     if vec_get(m.tags, i) == 2 {
-      hmap_put_new(&mut fresh, vec_get(m.keys, i), vec_get(m.vals, i));
+      match vec_get(m.vals, i) {
+        Option::Some(v) => { hmap_put_new[V](&mut fresh, vec_get(m.keys, i), v); },
+        Option::None => {},
+      }
     }
     i = i + 1;
   }
@@ -178,27 +184,27 @@ fn hmap_grow(m: &mut HashMap)
 
 /// Puts `k`, known not to be in the map, into the first empty slot of its
 /// probe sequence, growing the table first if it is three quarters used.
-fn hmap_put_new(m: &mut HashMap, k: u64, v: u64)
-  requires hmap_ok(m)
-  ensures hmap_ok(m) && hmap_maps(m, k, v)
+fn hmap_put_new[V](m: &mut HashMap[V], k: u64, v: V)
+  requires hmap_ok[V](m)
+  ensures hmap_ok[V](m) && hmap_maps[V](m, k, v)
 {
   let cap = vec_len(m.keys);
   if (m.used + 1) * 4 > cap * 3 {
-    hmap_grow(&mut m);
-    hmap_put_new(&mut m, k, v);
+    hmap_grow[V](&mut m);
+    hmap_put_new[V](&mut m, k, v);
     return;
   }
   let start = hash_u64(k) % cap;
   let mut n = 0;
   while n < cap
-    invariant n <= cap && hmap_ok(m) && vlen(m.keys) == cap
+    invariant n <= cap && hmap_ok[V](m) && vlen(m.keys) == cap
     invariant (m.used + 1) * 4 <= cap * 3
   {
     let i = (start + n) % cap;
     if vec_get(m.tags, i) == 0 {
       vec_set(&mut m.tags, i, 2);
       vec_set(&mut m.keys, i, k);
-      vec_set(&mut m.vals, i, v);
+      vec_set(&mut m.vals, i, Option[V]::Some(v));
       m.used = m.used + 1;
       m.len = m.len + 1;
       return;
@@ -211,14 +217,14 @@ fn hmap_put_new(m: &mut HashMap, k: u64, v: u64)
   // scan failing is what is proved impossible.
   let mut i = 0;
   while i < cap
-    invariant i <= cap && hmap_ok(m) && vlen(m.keys) == cap
+    invariant i <= cap && hmap_ok[V](m) && vlen(m.keys) == cap
     invariant (m.used + 1) * 4 <= cap * 3
     invariant forall q: u64 :: q < i ==> vget(m.tags, q) != 0
   {
     if vec_get(m.tags, i) == 0 {
       vec_set(&mut m.tags, i, 2);
       vec_set(&mut m.keys, i, k);
-      vec_set(&mut m.vals, i, v);
+      vec_set(&mut m.vals, i, Option[V]::Some(v));
       m.used = m.used + 1;
       m.len = m.len + 1;
       return;
@@ -230,44 +236,44 @@ fn hmap_put_new(m: &mut HashMap, k: u64, v: u64)
 
 /// Sets the value of `k` to `v`. Returns the value it replaces, if `k` was
 /// already in the map.
-fn hmap_insert(m: &mut HashMap, k: u64, v: u64) -> Option[u64]
-  requires hmap_ok(m)
-  ensures hmap_ok(m) && hmap_maps(m, k, v)
+fn hmap_insert[V](m: &mut HashMap[V], k: u64, v: V) -> Option[V]
+  requires hmap_ok[V](m)
+  ensures hmap_ok[V](m) && hmap_maps[V](m, k, v)
 {
-  let i = hmap_find(m, k);
+  let i = hmap_find[V](m, k);
   if i < vec_len(m.keys) {
     let prev = vec_get(m.vals, i);
-    vec_set(&mut m.vals, i, v);
-    return Option[u64]::Some(prev);
+    vec_set(&mut m.vals, i, Option[V]::Some(v));
+    return prev;
   }
-  hmap_put_new(&mut m, k, v);
-  return Option[u64]::None;
+  hmap_put_new[V](&mut m, k, v);
+  return Option[V]::None;
 }
 
 /// Takes `k` out of the map. Returns its value, if it was there.
-fn hmap_remove(m: &mut HashMap, k: u64) -> Option[u64]
-  requires hmap_ok(m)
-  ensures hmap_ok(m)
+fn hmap_remove[V](m: &mut HashMap[V], k: u64) -> Option[V]
+  requires hmap_ok[V](m)
+  ensures hmap_ok[V](m)
 {
-  let i = hmap_find(m, k);
+  let i = hmap_find[V](m, k);
   if i < vec_len(m.keys) {
     vec_set(&mut m.tags, i, 1);
     m.len = m.len - 1;
-    return Option[u64]::Some(vec_get(m.vals, i));
+    return vec_get(m.vals, i);
   }
-  return Option[u64]::None;
+  return Option[V]::None;
 }
 
 /// The keys in the map, in slot order.
-fn hmap_keys(m: &HashMap) -> Vec[u64]
-  requires hmap_ok(m)
-  ensures forall j: u64 :: j < vlen(result) ==> hmap_has(m, vget(result, j))
+fn hmap_keys[V](m: &HashMap[V]) -> Vec[u64]
+  requires hmap_ok[V](m)
+  ensures forall j: u64 :: j < vlen(result) ==> hmap_has[V](m, vget(result, j))
 {
   let mut out = vec_new[u64]();
   let mut i = 0;
   while i < vec_len(m.keys)
     invariant i <= vlen(m.keys)
-    invariant forall j: u64 :: j < vlen(out) ==> hmap_has(m, vget(out, j))
+    invariant forall j: u64 :: j < vlen(out) ==> hmap_has[V](m, vget(out, j))
   {
     if vec_get(m.tags, i) == 2 {
       vec_push(&mut out, vec_get(m.keys, i));
@@ -277,7 +283,7 @@ fn hmap_keys(m: &HashMap) -> Vec[u64]
   return out;
 }
 
-fn hmap_free(m: HashMap) {
+fn hmap_free[V](m: HashMap[V]) {
   vec_free(m.keys);
   vec_free(m.vals);
   vec_free(m.tags);

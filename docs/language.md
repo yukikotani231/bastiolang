@@ -117,7 +117,7 @@ Every program has a `main`, where it starts. `main` cannot be called (`E-TYPE`):
 
 **Constants** have type `u64`. The expression is folded at compile time and may use literals, other constants and arithmetic.
 
-**Several files.** A file may begin with `import "path";` lines, before any definition. A path that starts with `.` or `/` is relative to the importing file (or absolute). Any other path is looked for next to the importing file, then in each directory above it, then in each directory given with `--lib DIR` on the command line, in order; the first place that has the file wins. So `import "core/text.bastio"` finds the library from anywhere inside this repository, and from elsewhere with `--lib path/to/bastiolang`. The walk up follows the path as written: a file named by a relative path stops at the current directory. Each imported file is loaded, with its own imports, before the rest of the importing file is read, so its constants can be used there. A file imported more than once is loaded once. Files that import each other, or an import that cannot be read, are `E-IMPORT`. Files named together on the command line also form one program, in command-line order.
+**Several files.** A file may begin with `import "path";` lines, before any definition. A path that starts with `.` or `/` is relative to the importing file (or absolute). Any other path is looked for next to the importing file, then in each directory above it, then in each directory given with `--lib DIR` on the command line, in order, then in each directory of the environment variable `BASTIO_LIB` (separated by `:`); the first place that has the file wins. So `import "core/text.bastio"` finds the library from anywhere inside this repository, and from elsewhere with `--lib path/to/bastiolang` or `BASTIO_LIB=path/to/bastiolang`. The walk up follows the path as written: a file named by a relative path stops at the current directory. Each imported file is loaded, with its own imports, before the rest of the importing file is read, so its constants can be used there. A file imported more than once is loaded once. Files that import each other, or an import that cannot be read, are `E-IMPORT`. Files named together on the command line also form one program, in command-line order.
 
 All files share one namespace, as in C: a function, type or constant name must be unique in the whole program. There are no modules, qualified names or private items yet.
 
@@ -827,6 +827,8 @@ fn main() -> u64 {
 | `blen(b: &Bytes) -> u64` | | Its length |
 | `bget(b: &Bytes, i: u64) -> u8` | `i < blen(b)` | Byte `i` |
 | `bset(b: &mut Bytes, i: u64, v: u8)` | `i < blen(b)` | Sets byte `i` in place |
+| `bcopy(dst: &mut Bytes, d: u64, src: &Bytes, s: u64, n: u64)` | `d + n <= blen(dst)` and `s + n <= blen(src)` | Copies bytes `s .. s+n` of `src` over bytes `d .. d+n` of `dst` in one go. The prover knows the result: byte `d + j` of `dst` is byte `s + j` of `src`, and the rest of `dst` is unchanged. `dst` and `src` are always different buffers (one buffer cannot be lent as `&mut` and `&` at once) |
+| `bmove(b: &mut Bytes, d: u64, s: u64, n: u64)` | `d + n <= blen(b)` and `s + n <= blen(b)` | The same within one buffer; the ranges may overlap (as if bytes `s .. s+n` were copied out first) |
 | `bfree(b: Bytes)` | | Frees `b` |
 | `bfrom(s: Str) -> Bytes` | | A copy of a string literal; the prover knows its bytes |
 | `slen(s: Str) -> u64` | | Length of a string literal |
@@ -958,6 +960,8 @@ Ghost accessors, usable in specifications:
 | `frame_id(f: &Frame) -> u64` | | The page number |
 | `frame_read(f: &Frame, w: u64) -> u64`, `frame_write(f: &mut Frame, w: u64, v: u64)` | `w < 512` | A 64-bit word of the page. Contents are not tracked by the proof |
 | `frame_read8(f: &Frame, o: u64) -> u8`, `frame_write8(f: &mut Frame, o: u64, b: u8)` | `o < 4096` | A byte of the page |
+| `frame_to_bytes(dst: &mut Bytes, d: u64, f: &Frame, o: u64, n: u64)` | `o + n <= 4096` and `d + n <= blen(dst)` | Copies bytes `o .. o+n` of the page over bytes `d .. d+n` of `dst` in one go. The page's contents are not tracked, so those bytes of `dst` become unknown to the proof; the rest stay as they were |
+| `bytes_to_frame(f: &mut Frame, o: u64, src: &Bytes, s: u64, n: u64)` | `o + n <= 4096` and `s + n <= blen(src)` | Copies bytes `s .. s+n` of `src` into the page at `o`. It stays the same page |
 | `pt_new(f: Frame, level: u64) -> PageTable` | `1 <= level <= 5` | Turns a page into an empty table. A level-4 table gets the kernel's map in slot 0 (not owned, never touched) |
 | `pt_free(t: PageTable) -> Frame` | level is not 4; every slot empty | Turns an empty table back into a page |
 | `pt_free_root(m: &Mmu, t: PageTable) -> Frame` | level 4; slots 1-255 empty; `pt_id(t) != mmu_root(m)`; `pt_leases(t) == 0` | Kernel only. The same for a top-level table, which must not be in CR3, here or on another processor |
@@ -1033,13 +1037,12 @@ Only leases matter at levels below 4 through `pt_borrow`: a table below the top 
 
 `pt_leases` counts in the proof only up: `mmu_exit` cannot say which table its lease was for (it came from an earlier turn, through a lock), so when a program wants to tear down a table it asks the run-time count with `pt_lease_count`. A count of 0 stays 0 while the program holds `&mut t`, because only `mmu_enter`, which needs `&mut t`, raises it. BastiOS waits for 0 before freeing an address space; a processor holding a lease never waits for anything, so the wait ends.
 
-`mmu_switch` still exists and takes no lease; it does not combine with sharing (another processor could free a table loaded that way) and will be rejected under `smp_run`.
+Every top-level table a processor loads is entered with a lease; there is no other way to put a program's table in CR3.
 
 **MMU and CPU** (kernel only; the kernel's platform code provides the trap entry):
 
 | Builtin | Requires (proved) | Effect |
 | --- | --- | --- |
-| `mmu_switch(m: &mut Mmu, t: &PageTable)` | level 4 | Loads `t` into CR3; `mmu_root(m)` becomes `pt_id(t)` |
 | `mmu_kernel(m: &mut Mmu)` | | Loads the kernel's own map |
 | `mmu_enter(m: &mut Mmu, t: &mut PageTable) -> Lease` | level 4; `mmu_root(m)` is the kernel's (`0x10000`) | Takes a lease on `t` and loads it into CR3: `pt_leases(t)` goes up by one, `mmu_root(m)` becomes `pt_id(t)`. `t` can then go back where it came from (a lock, say) and other processors can enter it too |
 | `mmu_exit(m: &mut Mmu, l: Lease)` | | Loads the kernel's own map, then gives the lease back. No table's `pt_leases` drops in the proof (it does not name one): it stays an overcount until `pt_lease_count` reads the true count |
@@ -1136,8 +1139,10 @@ fn main(win: &mut MmioSpace) -> u64 {
 | `dma_addr(d: &Dma) -> u64` | | The page's physical address, to program into a device. Only a lent page's address can be read |
 | `dma_read8` / `16` / `32` / `64(d: &mut Dma, off: u64) -> u8` / `u16` / `u32` / `u64` | `off + width <= 4096`; `off` is a multiple of the width | One volatile load |
 | `dma_write8` / `16` / `32` / `64(d: &mut Dma, off: u64, v: u8` / `u16` / `u32` / `u64)` | the same | One volatile store |
+| `dma_to_bytes(dst: &mut Bytes, d: u64, m: &mut Dma, o: u64, n: u64)` | `o + n <= 4096` and `d + n <= blen(dst)` | Copies bytes `o .. o+n` of the page over bytes `d .. d+n` of `dst`, as `frame_to_bytes`; those bytes become unknown to the proof. The copy is a compiler barrier on both sides |
+| `bytes_to_dma(m: &mut Dma, o: u64, src: &Bytes, s: u64, n: u64)` | `o + n <= 4096` and `s + n <= blen(src)` | Copies bytes `s .. s+n` of `src` into the page at `o`, as `bytes_to_frame`, with the same barriers |
 
-What is proved: while a page is lent it cannot go back to the pool, into a page table or into anything else that takes a `Frame`, so a device can never write a page that has been reused; the CPU reaches it only with volatile, aligned, in-bounds accesses, so the C compiler cannot cache or tear what the device sees; and a `Dma` must be taken back before the program ends (it is linear). What is trusted: that the driver has stopped the device using the page (for example, seen its completion) before `dma_take`, and that the addresses it programs into the device are those of pages it has lent. Devices are outside the proof.
+What is proved: while a page is lent it cannot go back to the pool, into a page table or into anything else that takes a `Frame`, so a device can never write a page that has been reused; the CPU reaches it only with volatile, aligned, in-bounds accesses or with in-bounds bulk copies that are compiler barriers on both sides, so the C compiler cannot cache what the device sees or move an access across a copy (a bulk copy itself may be done in any width, so it suits buffers, not device fields that must not tear); and a `Dma` must be taken back before the program ends (it is linear). What is trusted: that the driver has stopped the device using the page (for example, seen its completion) before `dma_take`, and that the addresses it programs into the device are those of pages it has lent. Devices are outside the proof.
 
 ```bastio
 // expect-exit: 0
@@ -1176,9 +1181,11 @@ Expressions in `requires`, `ensures`, `invariant` and `assert` (and the bodies o
 
 - They are evaluated over **mathematical integers**: `a - b` may be negative and `a + b` cannot overflow. Integers of different types mix freely there, with no conversions.
 - They may use `==>` (implication) and `forall x: u64 :: e`.
-- They may call `len`, `get`, `slen`, `sget`, `blen`, `bget`, `vlen`, `vget`, `vcount`, the ghost accessors of the capabilities, and `spec fn`s.
+- They may call `len`, `get`, `slen`, `sget`, `blen`, `bget`, `bdec`, `vlen`, `vget`, `vcount`, the ghost accessors of the capabilities, and `spec fn`s.
 - `vcount(v, x)` is the number of elements of `v` equal to `x`, for a vector of integers. It states what `forall` cannot: that a vector is a permutation of another, or that a counter counts something.
+- `bdec(b, from, to)` is the decimal value of bytes `from..to` of `b`, each byte read as a digit (byte - 48): 0 for an empty range, and `10 * bdec(b, from, to - 1) + (bget(b, to - 1) - 48)` otherwise. The prover unfolds that definition one digit for each `bdec` term a proof mentions, so a loop that parses digits states `v == bdec(b, from, i)` as its invariant, and a constant is evaluated by asserting each prefix in turn (`tests/pass/bdec.bastio`).
 - They may use `is` and enum payloads (`o.Some`), and see through boxes.
+- `==` and `!=` also compare structs and enums made of integers and booleans (no buffers, boxes or vectors inside): field by field, and for an enum the variant and then that variant's payload. Both sides must name a value (a variable, a field, `vget(..)` or `old(..)`), since specifications cannot build one. Ordinary code still compares only integers and `bool`.
 - They may mention values that have already been consumed. In `ensures`, a by-value parameter means its value on entry, a `&mut` parameter the value handed back, and `old(x)` its value at the call. `result` is the returned value. `old(x)` is also allowed in loop invariants, for parameters only.
 - They cannot build enum values or call ordinary functions.
 

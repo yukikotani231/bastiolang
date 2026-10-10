@@ -1,0 +1,89 @@
+// expect-exit: 42
+// Bulk copies: `bcopy` between two buffers, `bmove` within one (overlap
+// allowed), and `frame_to_bytes` / `bytes_to_frame` between a page and a
+// buffer. Each range is proved in bounds, so the copy has no checks, and
+// what `bcopy` and `bmove` copy is known to the proof.
+
+/// After the copy, the destination holds the source's bytes.
+fn copy_at(dst: &mut Bytes, d: u64, src: &Bytes, s: u64, n: u64)
+  requires n > 0 && d + n <= blen(dst) && s + n <= blen(src)
+  ensures blen(dst) == old(blen(dst))
+  ensures bget(dst, d) == bget(src, s)
+  ensures forall j: u64 :: j < n ==> bget(dst, d + j) == bget(src, s + j)
+{
+  bcopy(&mut dst, d, src, s, n);
+}
+
+/// Byte k is k * 7 mod 256.
+fn pattern(n: u64) -> Bytes
+  requires n <= 100000
+  ensures blen(result) == n
+{
+  let mut b = balloc(n);
+  let mut k = 0;
+  while k < n
+    invariant k <= n && blen(b) == n
+  {
+    bset(&mut b, k, cast[u8]((k * 7) % 256));
+    k = k + 1;
+  }
+  return b;
+}
+
+/// Whether bytes a..a+n of x equal bytes b..b+n of y.
+fn same(x: &Bytes, a: u64, y: &Bytes, b: u64, n: u64) -> bool
+  requires a + n <= blen(x) && b + n <= blen(y)
+{
+  let mut k = 0;
+  while k < n
+    invariant k <= n
+  {
+    if bget(x, a + k) != bget(y, b + k) {
+      return false;
+    }
+    k = k + 1;
+  }
+  return true;
+}
+
+fn main(pool: &mut Pool) -> u64 {
+  if pool_size(pool) < 1 {
+    return 0;
+  }
+  let src = pattern(5000);
+  let mut dst = balloc(5000);
+  // An odd length and odd offsets: whole words and a tail.
+  copy_at(&mut dst, 3, src, 11, 4093);
+  assert bget(dst, 3) == bget(src, 11);
+  let ok1 = same(dst, 3, src, 11, 4093) && bget(dst, 2) == 0 && bget(dst, 4096) == 0;
+
+  // bmove up and down, overlapping: memmove semantics.
+  let mut m = pattern(64);
+  bmove(&mut m, 5, 0, 50);         // destination above the source
+  let up = bget(m, 5) == 0 && bget(m, 54) == 87 && bget(m, 4) == 28 && bget(m, 55) == 129;
+  bmove(&mut m, 0, 5, 50);         // and back down
+  let orig = pattern(64);
+  let down = same(m, 0, orig, 0, 50);
+  bfree(orig);
+  bmove(&mut m, 9, 9, 10);         // onto itself
+  assert blen(m) == 64;
+
+  // Through a page and back.
+  let mut f = pool_take(&mut pool, 0);
+  bytes_to_frame(&mut f, 1, src, 0, 4095);
+  let mut back = balloc(4096);
+  frame_to_bytes(&mut back, 0, f, 1, 4095);
+  let ok2 = same(back, 0, src, 0, 4095) && frame_read8(f, 0) == 0 && frame_read8(f, 2) == 7;
+  frame_to_bytes(&mut back, 4095, f, 4095, 1);
+  pool_give(&mut pool, f);
+  bcopy(&mut back, 0, src, 0, 0);  // copying nothing is fine
+
+  bfree(src);
+  bfree(dst);
+  bfree(m);
+  bfree(back);
+  if ok1 && up && down && ok2 {
+    return 42;
+  }
+  return 1;
+}

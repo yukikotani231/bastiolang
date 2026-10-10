@@ -1,0 +1,46 @@
+// stage1/libenv.bastio: the directories of BASTIO_LIB, for the loader.
+//
+// A file of its own, not part of loader.bastio, so a tool that never reads
+// the environment does not need `host_env`: asmdump is also built by
+// stage0's native backend, which has none.
+import "loader.bastio";
+
+/// Adds each directory of BASTIO_LIB (`:`-separated, empty ones skipped)
+/// after the `--lib` ones.
+fn loader_env_libs(host: &Host, ld: &mut Loader) {
+  let mut env = balloc(0);
+  if host_env(host, "BASTIO_LIB", &mut env) {
+    let n = blen(env);
+    let mut s = 0;
+    while s < n
+      invariant s <= n + 1 && n == blen(env) && n <= 1152921504606846976
+    {
+      let mut e = s;
+      while e < n && bget(env, e) != 58
+        invariant s <= e && e <= n && n == blen(env)
+      {
+        e = e + 1;
+      }
+      if e > s {
+        loader_lib(&mut ld, byte_range(env, s, e));
+      }
+      s = e + 1;
+    }
+  }
+  bfree(env);
+}
+
+/// A copy of bytes `s..e` of `b`.
+fn byte_range(b: &Bytes, s: u64, e: u64) -> Bytes
+  requires s <= e && e <= blen(b)
+{
+  let mut out = balloc(e - s);
+  let mut i = 0;
+  while i < e - s
+    invariant i <= e - s && blen(out) == e - s && e <= blen(b)
+  {
+    bset(&mut out, i, bget(b, s + i));
+    i = i + 1;
+  }
+  return out;
+}

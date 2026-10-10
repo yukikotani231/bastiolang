@@ -789,7 +789,8 @@ fn x86_inline_builtin(p: &Parser, i: u64) -> bool {
     || name_is(p, i, "vec_new") || name_is(p, i, "pool_size") || name_is(p, i, "pool_take") || name_is(p, i, "pool_give")
     || name_is(p, i, "pt_new") || name_is(p, i, "pt_free") || name_is(p, i, "frame_id") || name_is(p, i, "frame_read")
     || name_is(p, i, "frame_read8") || name_is(p, i, "frame_write") || name_is(p, i, "frame_write8") || name_is(p, i, "pt_has") || name_is(p, i, "pt_writable")
-    || name_is(p, i, "pt_put") || name_is(p, i, "pt_put_frame") || name_is(p, i, "pt_take") || name_is(p, i, "pt_take_frame");
+    || name_is(p, i, "pt_put") || name_is(p, i, "pt_put_frame") || name_is(p, i, "pt_take") || name_is(p, i, "pt_take_frame")
+    || name_is(p, i, "bcopy") || name_is(p, i, "bmove") || name_is(p, i, "frame_to_bytes") || name_is(p, i, "bytes_to_frame");
 }
 
 /// The length builtins (stage0's LENS): word 0 of their argument.
@@ -3230,6 +3231,37 @@ fn x86_to_regs(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, r1: u
   if r1 != 0 { x86_pop(&mut g, x86_reg(r1)); }
 }
 
+/// Copies %rcx bytes from (%rsi) to (%rdi), lowest first: whole words with
+/// rep movsq, then the rest with rep movsb (the C prelude's bst_copy_fwd).
+fn x86_copy_fwd(g: &mut X86) {
+  x86_es(&mut g, "mov %rcx, %rax");
+  x86_es(&mut g, "shr $3, %rcx");
+  x86_es(&mut g, "rep movsq");
+  x86_es(&mut g, "mov %eax, %ecx");
+  x86_es(&mut g, "and $7, %ecx");
+  x86_es(&mut g, "rep movsb");
+}
+
+/// For a copy call `i` whose source is a Bytes value (argument 2) between
+/// two scalars before it and two after (`bcopy(dst, d, src, s, n)`):
+/// evaluates the arguments, then %rcx = n, %rsi = the source's data + s,
+/// %rax = d, and %rdi = argument 0 (the address of the destination).
+fn x86_copy_bytes_src(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
+  let n = node_at(p.nodes, i);
+  let mut a = n.a;
+  while a != 0 {
+    x86_arg(&mut g, c, &mut m, p, a);
+    a = next_of(p, a);
+  }
+  x86_pop(&mut g, x86_reg(XR_RCX));
+  x86_pop(&mut g, x86_reg(XR_RAX));
+  x86_drop(&mut g, 1);
+  x86_pop(&mut g, x86_reg(XR_RSI));
+  x86_es(&mut g, "add %rax, %rsi");
+  x86_pop(&mut g, x86_reg(XR_RAX));
+  x86_pop(&mut g, x86_reg(XR_RDI));
+}
+
 /// %rcx = the address of element %rax of the vector at (%rdi), for
 /// elements of `n` words.
 fn x86_elem_addr(g: &mut X86, n: u64) {
@@ -3443,6 +3475,45 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     } else {
       x86_es(&mut g, "mov %al, (%rdx,%rcx)");
     }
+  } else if name_is(p, i, "bcopy") || name_is(p, i, "bytes_to_frame") {
+    // Bulk copies: %rdi the destination, %rsi the source, %rcx the count.
+    // The prover has shown both ranges in bounds. The source is a Bytes
+    // value: its data pointer is word 1.
+    x86_copy_bytes_src(&mut g, c, &mut m, p, i);
+    if name_is(p, i, "bcopy") {
+      x86_es(&mut g, "mov 8(%rdi), %rdi");
+    } else {
+      x86_es(&mut g, "mov (%rdi), %rdi");
+    }
+    x86_es(&mut g, "add %rax, %rdi");
+    x86_copy_fwd(&mut g);
+  } else if name_is(p, i, "frame_to_bytes") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, XR_RAX, XR_RSI, XR_RDX, XR_RCX);
+    x86_es(&mut g, "mov 8(%rdi), %rdi");
+    x86_es(&mut g, "add %rax, %rdi");
+    x86_es(&mut g, "add %rdx, %rsi");
+    x86_copy_fwd(&mut g);
+  } else if name_is(p, i, "bmove") {
+    // Backward, a byte at a time, when the destination starts inside the
+    // source (memmove semantics).
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RDI, XR_RSI, XR_RCX, 0);
+    x86_es(&mut g, "mov 8(%rdx), %rdx");
+    x86_es(&mut g, "add %rdx, %rdi");
+    x86_es(&mut g, "add %rdx, %rsi");
+    let back = x86_label(&mut g);
+    let done = x86_label(&mut g);
+    x86_es(&mut g, "mov %rdi, %rax");
+    x86_es(&mut g, "sub %rsi, %rax");
+    x86_es(&mut g, "cmp %rcx, %rax");
+    x86_jump(&mut g, "jb", back);
+    x86_copy_fwd(&mut g);
+    x86_jump(&mut g, "jmp", done);
+    x86_place_label(&mut g, back);
+    x86_es(&mut g, "dec %rcx");
+    x86_es(&mut g, "movzbl (%rsi,%rcx), %eax");
+    x86_es(&mut g, "mov %al, (%rdi,%rcx)");
+    x86_jump(&mut g, "jnz", back);
+    x86_place_label(&mut g, done);
   } else if name_is(p, i, "pt_has") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RAX, 0, 0, 0);
     x86_es(&mut g, "mov (%rdx,%rax,8), %rax");
@@ -3991,6 +4062,20 @@ fn x86_builtin1(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     // accesses before and after, as the C prelude's does.
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RAX, 0, 0, 0, 0);
     x86_es(&mut g, "mfence");
+  } else if name_is(p, i, "bytes_to_dma") {
+    // As bytes_to_frame: a lent page is the frame's address.
+    x86_copy_bytes_src(&mut g, c, &mut m, p, i);
+    x86_es(&mut g, "mov (%rdi), %rdi");
+    x86_es(&mut g, "add %rax, %rdi");
+    x86_copy_fwd(&mut g);
+  } else if name_is(p, i, "dma_to_bytes") {
+    // As frame_to_bytes, but the page is lent as `&mut`: its address.
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, XR_RAX, XR_RSI, XR_RDX, XR_RCX);
+    x86_es(&mut g, "mov 8(%rdi), %rdi");
+    x86_es(&mut g, "add %rax, %rdi");
+    x86_es(&mut g, "mov (%rsi), %rsi");
+    x86_es(&mut g, "add %rdx, %rsi");
+    x86_copy_fwd(&mut g);
   } else if name_is(p, i, "dma_addr") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RAX, 0, 0, 0, 0);
   } else if name_is(p, i, "dma_id") {
@@ -4029,9 +4114,6 @@ fn x86_builtin1(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_es(&mut g, "call bst_rt_poll");
   } else if name_is(p, i, "pt_free_root") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RAX, 0, 0, 0);
-  } else if name_is(p, i, "mmu_switch") {
-    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RAX, 0, 0, 0);
-    x86_es(&mut g, "mov %rax, %cr3");
   } else if name_is(p, i, "mmu_kernel") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, 0, 0, 0, 0);
     x86_es(&mut g, "lea bst_kernel_pml4(%rip), %rax");

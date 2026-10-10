@@ -454,6 +454,12 @@ static inline uint64_t bst_frame_read(bst_frame f, uint64_t w) { return ((uint64
 static inline void bst_frame_write(bst_frame *f, uint64_t w, uint64_t v) { ((uint64_t *)*f)[w] = v; }
 static inline uint64_t bst_frame_read8(bst_frame f, uint64_t o) { return ((unsigned char *)f)[o]; }
 static inline void bst_frame_write8(bst_frame *f, uint64_t o, uint64_t v) { ((unsigned char *)*f)[o] = (unsigned char)v; }
+static inline void bst_frame_to_bytes(bst_bytes *dst, uint64_t d, bst_frame f, uint64_t o, uint64_t n) {
+    if (n) bst_copy_fwd(dst->data + d, (const unsigned char *)f + o, n);
+}
+static inline void bst_bytes_to_frame(bst_frame *f, uint64_t o, bst_bytes src, uint64_t s, uint64_t n) {
+    if (n) bst_copy_fwd((unsigned char *)*f + o, src.data + s, n);
+}
 static inline bst_pt bst_pt_new(bst_frame f, uint64_t level) {
     uint64_t *e = (uint64_t *)f;
     bst_zero_page(f);      /* f may be a page that held data, not a fresh one */
@@ -768,6 +774,34 @@ static void bst_vec_grow(bst_vec *v, uint64_t size) {
     v->cap = ncap;
 }
 static inline void bst_bset(bst_bytes *b, uint64_t i, uint64_t v) { b->data[i] = (unsigned char)v; }
+/* Bulk copies. The prover has shown both ranges in bounds, so there are no
+ * checks. Kernels are built with -mgeneral-regs-only and no libc, so on
+ * x86-64 a forward copy is rep movsq then rep movsb, and nothing here calls
+ * memcpy or memmove. */
+static inline void bst_copy_fwd(unsigned char *d, const unsigned char *s, uint64_t n) {
+#if defined(__x86_64__)
+    uint64_t w = n >> 3, r = n & 7;
+    __asm__ volatile ("rep movsq" : "+D"(d), "+S"(s), "+c"(w) : : "memory");
+    __asm__ volatile ("rep movsb" : "+D"(d), "+S"(s), "+c"(r) : : "memory");
+#else
+    for (uint64_t k = 0; k < n; k++) d[k] = s[k];
+#endif
+}
+/* Highest byte first, for an overlapping move to a higher address. Not
+ * std + rep movsb: an interrupt taken while the direction flag is set would
+ * run its handler with it set. The empty asm keeps the compiler from
+ * turning the loop into a call to memmove. */
+static inline void bst_copy_back(unsigned char *d, const unsigned char *s, uint64_t n) {
+    while (n > 0) { n--; d[n] = s[n]; __asm__ volatile ("" : : : "memory"); }
+}
+static inline void bst_bcopy(bst_bytes *dst, uint64_t d, bst_bytes src, uint64_t s, uint64_t n) {
+    if (n) bst_copy_fwd(dst->data + d, src.data + s, n);
+}
+static inline void bst_bmove(bst_bytes *b, uint64_t d, uint64_t s, uint64_t n) {
+    if (n == 0) return;
+    if (d <= s || d - s >= n) bst_copy_fwd(b->data + d, b->data + s, n);
+    else bst_copy_back(b->data + d, b->data + s, n);
+}
 static bst_bytes bst_bfrom(bst_str s) {
     bst_bytes b = bst_balloc(s.len);
     for (uint64_t i = 0; i < s.len; i++) b.data[i] = s.data[i];
@@ -817,6 +851,18 @@ static inline uint64_t bst_dma_addr(bst_dma d) { return d; }
     static inline uint64_t bst_dma_read##w(bst_dma *d, uint64_t o) { return *(volatile t *)(uintptr_t)(*d + o); } \
     static inline void bst_dma_write##w(bst_dma *d, uint64_t o, uint64_t v) { *(volatile t *)(uintptr_t)(*d + o) = (t)v; }
 BST_DMA_RW(8, uint8_t) BST_DMA_RW(16, uint16_t) BST_DMA_RW(32, uint32_t) BST_DMA_RW(64, uint64_t)
+/* A copy to or from a lent page is a compiler barrier on both sides, so it
+ * stays in order with the volatile accesses around it. */
+static inline void bst_dma_to_bytes(bst_bytes *dst, uint64_t d, bst_dma *m, uint64_t o, uint64_t n) {
+    __asm__ volatile ("" : : : "memory");
+    if (n) bst_copy_fwd(dst->data + d, (const unsigned char *)(uintptr_t)(*m + o), n);
+    __asm__ volatile ("" : : : "memory");
+}
+static inline void bst_bytes_to_dma(bst_dma *m, uint64_t o, bst_bytes src, uint64_t s, uint64_t n) {
+    __asm__ volatile ("" : : : "memory");
+    if (n) bst_copy_fwd((unsigned char *)(uintptr_t)(*m + o), src.data + s, n);
+    __asm__ volatile ("" : : : "memory");
+}
 "#;
 
 // Hosted programs simulate the window with 1 MiB of memory, indexed by the
@@ -852,7 +898,6 @@ static inline void bst_pio_out32(bst_portio *io, uint64_t o, uint64_t v) { bst_p
 
 const PRELUDE_KERNEL_CPU: &str = r#"
 static inline void bst_load_cr3(uint64_t a) { __asm__ volatile ("mov %0, %%cr3" : : "r"(a) : "memory"); }
-static inline void bst_mmu_switch(bst_mmu *m, bst_pt root) { (void)m; bst_load_cr3(root); }
 static inline void bst_mmu_kernel(bst_mmu *m) { (void)m; bst_load_cr3((uint64_t)bst_kernel_pml4); }
 static inline bst_lease bst_mmu_enter(bst_mmu *m, bst_pt *t) {
     (void)m;
@@ -1720,6 +1765,7 @@ pub fn trusted_base() -> String {
     for l in COUNT_FACTS {
         out.push_str(&format!("lemma vcount: {}\n", l));
     }
+    out.push_str("definition bdec: bdec(b, f, t) is 0 when t <= f, else 10 * bdec(b, f, t - 1) + (bget(b, t - 1) - 48)\n");
     out
 }
 
