@@ -21,14 +21,15 @@ struct Mono {
     structs: HashMap<String, StructDef>,
     enums: HashMap<String, EnumDef>,
     fns: HashMap<String, FnDef>,
-    /// Instances already requested, by kind (`type` or `function`) and
-    /// name. A generic function may share its name with a generic type.
+    specs: HashMap<String, SpecFn>,
+    /// Instances already requested, by kind (`type`, `function` or `spec
+    /// fn`) and name. A generic function may share its name with a generic type.
     seen: HashSet<(&'static str, String)>,
     queue: VecDeque<(&'static str, String, Vec<Type>, String)>,
 }
 
 pub fn monomorphize(p: &mut Program) -> Result<(), Diag> {
-    let mut m = Mono { structs: HashMap::new(), enums: HashMap::new(), fns: HashMap::new(), seen: HashSet::new(), queue: VecDeque::new() };
+    let mut m = Mono { structs: HashMap::new(), enums: HashMap::new(), fns: HashMap::new(), specs: HashMap::new(), seen: HashSet::new(), queue: VecDeque::new() };
     // Names stay unique across generic and plain definitions.
     let mut types: Vec<&str> = Vec::new();
     for (n, pos) in p.structs.iter().map(|d| (&d.name, d.pos)).chain(p.enums.iter().map(|d| (&d.name, d.pos))) {
@@ -59,6 +60,14 @@ pub fn monomorphize(p: &mut Program) -> Result<(), Diag> {
         }
         m.fns.insert(f.name.clone(), f.clone());
     }
+    // A generic spec fn's instances are named `G[..]`, so the checker would
+    // not see a clash with its plain name: check it here.
+    for sf in p.specs.iter().filter(|s| !s.tparams.is_empty()) {
+        if p.fns.iter().any(|f| f.name == sf.name) || p.specs.iter().filter(|s| s.name == sf.name).count() > 1 {
+            return Err(Diag::new("E-TYPE", sf.pos, format!("`{}` is already defined", sf.name)));
+        }
+        m.specs.insert(sf.name.clone(), sf.clone());
+    }
     p.structs.retain(|d| d.tparams.is_empty());
     p.enums.retain(|d| d.tparams.is_empty());
     p.fns.retain(|f| f.tparams.is_empty());
@@ -81,19 +90,19 @@ pub fn monomorphize(p: &mut Program) -> Result<(), Diag> {
     for f in &mut p.fns {
         m.fn_def(f, &none)?;
     }
-    for sf in &mut p.specs {
-        for prm in &mut sf.params {
-            prm.ty = m.ty(&prm.ty, &none, prm.pos)?;
-        }
-        sf.ret = m.ty(&sf.ret, &none, sf.pos)?;
-        m.expr(&mut sf.body, &none)?;
+    for sf in p.specs.iter_mut().filter(|s| s.tparams.is_empty()) {
+        m.spec_def(sf, &none)?;
     }
+    // Spec fn instances, by the generic they copy.
+    let mut spec_insts: HashMap<String, Vec<SpecFn>> = HashMap::new();
     let mut count = 0;
     while let Some((what, generic, args, inst)) = m.queue.pop_front() {
         count += 1;
         if count > MAX_INSTANCES {
             let pos = if what == "function" {
                 m.fns.get(&generic).map(|f| f.pos)
+            } else if what == "spec fn" {
+                m.specs.get(&generic).map(|f| f.pos)
             } else {
                 m.structs.get(&generic).map(|d| d.pos).or(m.enums.get(&generic).map(|d| d.pos))
             };
@@ -107,6 +116,13 @@ pub fn monomorphize(p: &mut Program) -> Result<(), Diag> {
             f.tparams = Vec::new();
             m.fn_def(&mut f, &s)?;
             p.fns.push(f);
+        } else if what == "spec fn" {
+            let mut sf = m.specs[&generic].clone();
+            let s = subst_map(&sf.tparams, &args);
+            sf.name = inst;
+            sf.tparams = Vec::new();
+            m.spec_def(&mut sf, &s)?;
+            spec_insts.entry(generic).or_default().push(sf);
         } else if let Some(d) = m.structs.get(&generic).cloned() {
             let s = subst_map(&d.tparams, &args);
             let mut fields = Vec::new();
@@ -128,6 +144,18 @@ pub fn monomorphize(p: &mut Program) -> Result<(), Diag> {
                 }));
             }
             p.enums.push(EnumDef { name: inst, tparams: Vec::new(), variants, pos: d.pos });
+        }
+    }
+    // A spec fn may only call the spec fns before it, so each instance takes
+    // the place of its generic definition: what it calls is still earlier,
+    // and an instance calling itself (or a later instance of the same
+    // generic) is still rejected as recursion.
+    let specs = std::mem::take(&mut p.specs);
+    for sf in specs {
+        if sf.tparams.is_empty() {
+            p.specs.push(sf);
+        } else if let Some(insts) = spec_insts.remove(&sf.name) {
+            p.specs.extend(insts);
         }
     }
     Ok(())
@@ -176,6 +204,14 @@ impl Mono {
             Type::MutRef(i) => Type::MutRef(Box::new(self.ty(i, s, pos)?)),
             t => t.clone(),
         })
+    }
+
+    fn spec_def(&mut self, sf: &mut SpecFn, s: &HashMap<String, Type>) -> Result<(), Diag> {
+        for prm in &mut sf.params {
+            prm.ty = self.ty(&prm.ty, s, prm.pos)?;
+        }
+        sf.ret = self.ty(&sf.ret, s, sf.pos)?;
+        self.expr(&mut sf.body, s)
     }
 
     fn fn_def(&mut self, f: &mut FnDef, s: &HashMap<String, Type>) -> Result<(), Diag> {
@@ -240,6 +276,10 @@ impl Mono {
             }
             let mut inner = (**inner).clone();
             match &mut inner.kind {
+                ExprKind::Call(n, _) if self.specs.contains_key(n) => {
+                    let arity = self.specs[n.as_str()].tparams.len();
+                    *n = self.instance(n, a, arity, "spec fn", pos)?;
+                }
                 ExprKind::Call(n, _) => {
                     let arity = self.fns.get(n).map(|f| f.tparams.len()).ok_or_else(|| Diag::new("E-TYPE", pos, format!("`{}` is not a generic function", n)))?;
                     *n = self.instance(n, a, arity, "function", pos)?;
@@ -260,7 +300,7 @@ impl Mono {
             return self.children(e, s);
         }
         match &e.kind {
-            ExprKind::Call(n, _) if self.fns.contains_key(n) => {
+            ExprKind::Call(n, _) if self.fns.contains_key(n) || self.specs.contains_key(n) => {
                 return Err(Diag::new("E-TYPE", pos, format!("`{}` is generic: write its type arguments, e.g. `{}[u64](..)`", n, n)));
             }
             ExprKind::StructLit(n, _) | ExprKind::Variant(n, _, _) if self.structs.contains_key(n) || self.enums.contains_key(n) => {

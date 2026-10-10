@@ -54,7 +54,7 @@ pub enum Type {
     /// A claimed range of I/O ports, owned: the only way to read or write
     /// them. Linear; given back with `port_release`.
     PortIo,
-    /// The device window (physical 0x8000_0000 to 4 GiB, mapped uncached by
+    /// The device window (physical 0x8000_0000 to 2^46, mapped uncached by
     /// the platform): the right to claim each byte of it once. Linear; only
     /// `main` receives it. Kernel and hosted targets (hosted simulates it).
     MmioSpace,
@@ -369,6 +369,9 @@ pub struct FnDef {
 #[derive(Debug, Clone)]
 pub struct SpecFn {
     pub name: String,
+    /// `spec fn name[T, ..]`: copied per use by monomorphization, like a
+    /// generic function.
+    pub tparams: Vec<String>,
     pub params: Vec<Param>,
     pub ret: Type,
     pub body: Expr,
