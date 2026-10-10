@@ -521,7 +521,7 @@ fn main() -> u64 {
 - The invariants of a struct held directly as a field are included; ones behind a box, in a vector or in an enum payload are not yet. Outside a lock, invariants are not enforced: they are what the lock promises about its contents.
 - A lock cannot hold a value with a `Cpu` or `Mmu` in it (`E-PIN`): they describe the processor that holds them.
 - Lending `&mut` a place that overlaps the lock in the same call is `E-LINEAR-USE`, so the contents have no second way in.
-- Deadlock is not ruled out: taking a lock again inside `f` (directly or through another call) spins forever.
+- Deadlock through locks is ruled out at compile time, with nothing written down (`E-LOCK-ORDER`). A lock's *class* is the type of its contents. The checker finds, over the whole call graph, which classes each function may take (`smp_run` counts as a call of its function). While `locked(l, f)` holds a lock of class C, `f` and everything it calls may take only locks of other classes, and the classes must form no cycle: if a `B` lock is ever taken while an `A` lock is held, an `A` lock is never taken while a `B` lock is held. Every processor then takes locks in one global order, so none can wait for another forever, and none spins on a lock it already holds. Two locks with the same contents type cannot be nested; give them different contents types (two structs) to order them. Nothing is generated for this.
 - Generated code: a lock is a pointer to a lock word followed by the contents; `locked` spins with an atomic exchange (acquire) and releases with a store (release). Invariants generate nothing.
 
 ## Enums and `match`
@@ -1150,6 +1150,7 @@ Syntax, types and linearity:
 | `E-LINEAR-USE` | A consumed value (or a moved-out field, or a struct with a field moved out) is used; one call both borrows and moves a value, or lends it twice with one loan `&mut`; a borrow is returned; a value is consumed where the code may run more than once or not at all (a `while` condition, the right side of `&&` / `\|\|`) |
 | `E-LINEAR-LEAK` | A linear value is still owned at the end of its scope or at a `return`, is overwritten, or is dropped by `_` |
 | `E-LINEAR-BRANCH` | Only one arm of an `if` or a `match` consumes a value; a loop body changes the ownership of an outer value |
+| `E-LOCK-ORDER` | A lock may be taken while a lock of the same class (contents type) is held, or lock classes are taken in opposite orders in two places |
 | `E-PIN` | A `Cpu` or `Mmu` (or a value holding one) is put in a lock or shared between processors by `smp_run` |
 
 Proofs:

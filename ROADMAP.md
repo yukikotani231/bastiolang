@@ -69,7 +69,7 @@ What the compiler needs in order to be written in Bastio. Structs come first (re
 Started early, alongside v1, because the kernel is the primary target and it shapes what v1 needs.
 - [ ] **Concurrency** (design: [docs/concurrency.md](docs/concurrency.md), 2026-10-10). Data-race freedom becomes part of mandatory memory safety, with no `unsafe` escape: `par` and `spawn`/`join`, `Share[T]` (read-only sharing with ghost fractions instead of a reference count), `Lock[T]` and `Atomic[T]` guarded by type invariants, lock ranks proved at compile time, pinned per-core capabilities, and interrupt-safe locks. Prioritized because kernels and drivers need it and it is where Rust kernels still rely on `unsafe` (the first CVE in Rust-for-Linux code, CVE-2025-68260, was a race in an `unsafe` block). Implemented in the self-hosted compiler right after the fixed point, so the checker is not written twice, in four steps:
   - [ ] Fork-join and threads on the hosted target (`par`, `spawn`/`join`, `Share`, pinned types)
-  - [ ] Locks and atomics (type invariants, `Lock`/`Held`, `Atomic`, `Ctx` with ranks)
+  - [ ] Locks and atomics (type invariants, `Lock`/`Held`, `Atomic`, `Ctx` with ranks). Done: struct invariants, the scoped `Lock` (`locked`), and lock order inferred per lock class over the call graph (`E-LOCK-ORDER`, 2026-10-10) in place of `Ctx` and ranks. Left: `Atomic`
   - [ ] BastiOS on several cores (`smp_start`, one kernel lock, then per-core run queues)
   - [ ] Interrupt handlers and interrupt-safe locks, with the first driver that needs them
 - [x] Mutable borrows `&mut T` (see "Open design questions": settled)
