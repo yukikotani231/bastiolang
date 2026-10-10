@@ -40,6 +40,8 @@
 set -u
 cd "$(dirname "$0")/.."
 BASTIOC=${BASTIOC:-stage0/target/release/bastioc0}
+# BastiOS imports core from this checkout (`import "core/..."`).
+export BASTIO_LIB="$PWD"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 for tool in lexdump astdump monodump checkdump smtdump verifydump cdump asmdump bastioc1; do
@@ -224,7 +226,7 @@ done
 # platform's own symbols (boot/ in BastiOS).
 kernel=""
 if [ -f ../bastios/build/user/sh.bin ]; then
-  if "$tmp/asmdump" --kernel ../bastios/src/main.bastio >"$tmp/kernel.s" 2>/dev/null \
+  if "$tmp/asmdump" --lib "$PWD" --kernel ../bastios/src/main.bastio >"$tmp/kernel.s" 2>/dev/null \
      && as --64 -o "$tmp/kernel.o" "$tmp/kernel.s" \
      && ! nm -u "$tmp/kernel.o" | awk '{print $2}' \
           | grep -v -x -e _end -e bst_kernel_pml4 -e bst_cpu_enter -e bst_cpu_wait -e bst_platform_ctx \
@@ -289,8 +291,8 @@ done
 # `--lib`: a program outside the repository, without and with it.
 mkdir -p "$tmp/away"
 printf 'import "core/option.bastio";\nfn main() -> u64 { return opt_or[u64](Option[u64]::Some(7), 0); }\n' >"$tmp/away/prog.bastio"
-"$BASTIOC" --check "$tmp/away/prog.bastio" 2>"$tmp/want.err" >/dev/null; echo "exit $?" >>"$tmp/want.err"
-"$tmp/bastioc1" --check "$tmp/away/prog.bastio" 2>"$tmp/got.err" >/dev/null; echo "exit $?" >>"$tmp/got.err"
+BASTIO_LIB= "$BASTIOC" --check "$tmp/away/prog.bastio" 2>"$tmp/want.err" >/dev/null; echo "exit $?" >>"$tmp/want.err"
+BASTIO_LIB= "$tmp/bastioc1" --check "$tmp/away/prog.bastio" 2>"$tmp/got.err" >/dev/null; echo "exit $?" >>"$tmp/got.err"
 mask "$tmp/want.err" "$tmp/got.err" >"$tmp/want"
 if cmp -s "$tmp/want" "$tmp/got.err"; then
   match=$((match+1))
@@ -299,12 +301,20 @@ else
   echo "DIFFER --lib (missing)"
   diff "$tmp/want" "$tmp/got.err" | head -5 | cut -c1-300 | sed 's/^/    /'
 fi
-"$BASTIOC" --emit-c --lib "$PWD" -o "$tmp/want.c" "$tmp/away/prog.bastio" 2>/dev/null
-if "$tmp/bastioc1" --emit-c --lib "$PWD" -o "$tmp/got.c" "$tmp/away/prog.bastio" 2>/dev/null && cmp -s "$tmp/want.c" "$tmp/got.c"; then
+BASTIO_LIB= "$BASTIOC" --emit-c --lib "$PWD" -o "$tmp/want.c" "$tmp/away/prog.bastio" 2>/dev/null
+if BASTIO_LIB= "$tmp/bastioc1" --emit-c --lib "$PWD" -o "$tmp/got.c" "$tmp/away/prog.bastio" 2>/dev/null && cmp -s "$tmp/want.c" "$tmp/got.c"; then
   match=$((match+1))
 else
   differ=$((differ+1))
   echo "DIFFER --lib (--emit-c)"
+fi
+# The same through BASTIO_LIB (a missing directory first, to skip).
+BASTIO_LIB="/nonexistent:$PWD" "$BASTIOC" --emit-c -o "$tmp/want.c" "$tmp/away/prog.bastio" 2>/dev/null
+if BASTIO_LIB="/nonexistent:$PWD" "$tmp/bastioc1" --emit-c -o "$tmp/got.c" "$tmp/away/prog.bastio" 2>/dev/null && cmp -s "$tmp/want.c" "$tmp/got.c"; then
+  match=$((match+1))
+else
+  differ=$((differ+1))
+  echo "DIFFER BASTIO_LIB (--emit-c)"
 fi
 if "$tmp/bastioc1" --trusted-base | cmp -s - <("$BASTIOC" --trusted-base); then
   match=$((match+1))

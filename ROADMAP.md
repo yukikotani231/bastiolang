@@ -113,7 +113,7 @@ Started early, alongside v1, because the kernel is the primary target and it sha
 - [x] Counting in specifications (2026-10-10): `vcount(v, x)`, so `sort_u64` is proved a permutation and the hash map's `len` and `used` are proved to count slots
 - [x] Library search paths: `import "core/text.bastio"` walks up from the importing file, then tries each `--lib DIR`
 - [x] `==` on structs and enums in specifications, and a generic `HashMap[V]` for any copyable `V` (2026-10-10)
-- [ ] More language support the library needs (docs/core.md, "Gaps"): the value of a digit string
+- [x] The value of a digit string (2026-10-10): `bdec(b, from, to)` in specifications, so every `parse_*` is proved to return its digits' value
 - [ ] A map from byte-string keys, a sort with a key, and an O(n log n) sort with the same proof
 
 ## C boundary
