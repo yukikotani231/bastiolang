@@ -25,13 +25,15 @@
 #           asmdump also does what stage0 does not (register arguments,
 #           Child, host_eprint): the programs it builds must exit as
 #           tests/pass says, and bastioc1 built by it must write the same C
-#           for itself as stage0
+#           for itself as stage0. With --user it builds tests/user without
+#           the C library (they assemble and link on their own)
 #   driver  stage1/bastioc1.bastio  vs  bastioc0 itself: what `--check`
 #           prints on stderr and its exit status, the C file of
 #           `--emit-c`, the C header of `--header`, the list of
 #           `--trusted-base`, what `--backend native` prints, and the
 #           programs it builds either way, which must exit as tests/pass
-#           says; and bastioc1 built by itself must write the same C for
+#           says; with `--backend native --target user`, the assembly of
+#           asmdump --user; and bastioc1 built by itself must write the same C for
 #           itself as stage0 (the fixed point)
 # The parser, the monomorphizer and the checker are also compared on damaged
 # sources (stage1/mutate.py), so their error positions are checked too.
@@ -205,8 +207,20 @@ if "$tmp/asmdump" stage1/bastioc1.bastio >"$tmp/b1.s" 2>/dev/null \
 else
   differ=$((differ+1)); echo "DIFFER bastioc1 built by asmdump"
 fi
-echo "-- native (stage1 only): $built programs built and run (plus asmdump built by itself, and bastioc1), $differ differ"
-{ [ "$differ" = 0 ] && [ "$built" -gt 1 ]; } || status=1
+# User programs (BastiOS) cannot run here: they must assemble and link on
+# their own, with no C library (bastios's make test runs them).
+users=0
+for f in tests/user/*.bastio; do
+  if "$tmp/asmdump" --user "$f" >"$tmp/user.s" 2>/dev/null \
+     && as --64 -o "$tmp/user.o" "$tmp/user.s" \
+     && ld -static -nostdlib --no-undefined -e bst_umain -o "$tmp/user" "$tmp/user.o"; then
+    users=$((users+1))
+  else
+    differ=$((differ+1)); echo "DIFFER $f (user program not built by asmdump --user)"
+  fi
+done
+echo "-- native (stage1 only): $built programs built and run (plus asmdump built by itself, and bastioc1), $users user programs built, $differ differ"
+{ [ "$differ" = 0 ] && [ "$built" -gt 1 ] && [ "$users" -gt 0 ]; } || status=1
 # The driver. Everything is compared except what bastioc1 cannot know:
 # the reason a file cannot be read and the solver's own words when it
 # fails (E-SOLVER) come from outside; and bastioc1 names itself.
@@ -302,8 +316,22 @@ for f in tests/pass/*.bastio; do
     diff "$tmp/want" "$tmp/got.err" | head -5 | cut -c1-300 | sed 's/^/    /'
   fi
 done
-echo "-- driver: $match matched ($errors rejected, $cfiles C files, $built programs built and run, $nbuilt built natively and run), $differ differ"
-{ [ "$differ" = 0 ] && [ "$built" -gt 0 ] && [ "$nbuilt" -gt 0 ]; } || status=1
+# `--backend native --target user` (stage0 has no such backend): the
+# assembly asmdump --user writes, which links with no C library.
+nuser=0
+for f in tests/user/*.bastio; do
+  if "$tmp/bastioc1" --backend native --target user -o "$tmp/nuser.s" "$f" 2>/dev/null \
+     && "$tmp/asmdump" --user "$f" >"$tmp/nuser_want.s" 2>/dev/null \
+     && cmp -s "$tmp/nuser.s" "$tmp/nuser_want.s" \
+     && as --64 -o "$tmp/nuser.o" "$tmp/nuser.s" \
+     && ld -static -nostdlib --no-undefined -e bst_umain -o "$tmp/nuser" "$tmp/nuser.o"; then
+    nuser=$((nuser+1)); match=$((match+1))
+  else
+    differ=$((differ+1)); echo "DIFFER $f (--backend native --target user)"
+  fi
+done
+echo "-- driver: $match matched ($errors rejected, $cfiles C files, $built programs built and run, $nbuilt built natively and run, $nuser user programs built natively), $differ differ"
+{ [ "$differ" = 0 ] && [ "$built" -gt 0 ] && [ "$nbuilt" -gt 0 ] && [ "$nuser" -gt 0 ]; } || status=1
 # The fixed point: bastioc1 (built by stage0) builds itself, and that
 # build writes the same C for bastioc1 as stage0 does.
 if "$tmp/bastioc1" -o "$tmp/gen2" stage1/bastioc1.bastio 2>"$tmp/gen2.err" \

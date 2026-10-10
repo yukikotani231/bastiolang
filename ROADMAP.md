@@ -6,7 +6,7 @@ Direction, decided 2026-10-09:
 - Functional correctness is opt-in.
 - The compiler aims at self-hosting from the start.
 
-`stage0/` (Rust) is throwaway and will be frozen once the compiler compiles itself.
+`stage0/` (Rust) is throwaway. Now that the compiler compiles itself, it is being frozen (see "stage0 is frozen" under v2).
 
 ## Scope
 
@@ -64,7 +64,12 @@ What the compiler needs in order to be written in Bastio. Structs come first (re
   - [x] Every error's sentence and hints (done 2026-10-10): bastioc1's stderr is compared with bastioc0's in full, except the OS's reason a file cannot be read and the solver's own words when it fails (E-SOLVER)
   - [x] `--backend native` and `--emit-asm` (done 2026-10-10): bastioc1 uses stage1's own backend (`stage1/x86.bastio`, with arguments in registers), says what it does not support yet in stage0's words, and is compared with bastioc0 on every test program: stderr, exit status, and the programs it builds, which must exit as they say. `tests/run.sh` and `tests/native.sh` now pass in full with `BASTIOC=bastioc1`
 - [x] bastioc1 compiles itself and reaches a fixed point (2026-10-10): bastioc1 built by stage0 (gen1) builds itself (gen2), gen2 builds gen3, and the three executables are identical, byte for byte; gen2's C for bastioc1 is the C stage0 writes (`stage1/difftest.sh` checks this). Building bastioc1 with itself takes 15 s, 6 s of it proving its 912 obligations
-- [ ] stage0 is frozen
+- [ ] stage0 is frozen. Frozen means stage1 is the compiler that changes: features land there, and stage0 stays only to bootstrap bastioc1 and to be the oracle `stage1/difftest.sh` compares against. In steps:
+  - [x] Every change to stage0's compiler comes with its stage1 mirror, checked on every pull request (`tests/stage0_mirror.sh`, 2026-10-10): a changed `stage0/src/*.rs` needs a change to the stage1 file that mirrors it, or a `Stage0-only: <why>` line in a commit message. Behaviour is still compared by difftest; this catches the mirror nobody wrote, such as stage0's parallel proving (#46), which stage1 got only later (#71)
+  - [ ] Parity: bastioc1 passes every test in `tests/run.sh`. Left: the sentence of a failed proof (#75) and `--backend native`
+  - [ ] bastioc1 is the default compiler: `tests/run.sh`, `tests/native.sh`, the benchmarks and BastiOS build with bastioc1, which stage0 builds once per run. stage0 runs only for that bootstrap and in difftest
+  - [ ] The freeze: new language features land in stage1 only. stage1's own source keeps to the language stage0 accepts, so stage0 can still bootstrap it. stage0 changes only to keep that bootstrap working, and in the native backend (`x86.rs`), where stage1's version deliberately differs and `asmdump` compares the two; each such change is marked `Stage0-only:`. Fixes to a bug both compilers share, soundness fixes first, are still made in both, so the oracle does not keep the bug. Programs that use stage1-only features are tested by what they do (`tests/pass`, `tests/fail`), since stage0 has no answer for them
+  - [ ] Decide whether to drop stage0 entirely by bootstrapping from bastioc1's generated C kept in the repository. That would let stage1's source use stage1-only features, but it moves the bootstrap's trust from readable Rust to generated C (invariant 3)
 
 ## v3: toward a kernel
 

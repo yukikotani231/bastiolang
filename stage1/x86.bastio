@@ -156,7 +156,10 @@ struct X86 {
   fmsg: Vec[u64],
   /// Write exactly what stage0's backend writes: none of the improvements
   /// made only here (for the differential test against stage0).
-  stage0: bool
+  stage0: bool,
+  /// TARGET_HOSTED, or TARGET_USER: a BastiOS user program, with its own
+  /// runtime over the kernel's system calls instead of the C library.
+  target: u64
 }
 
 fn x86_new() -> X86 {
@@ -167,7 +170,7 @@ fn x86_new() -> X86 {
     sdata: vec_new[u64](), sstart: vec_new[u64](), slens: vec_new[u64](),
     labels: 0, frame: 0, depth: 0, env: 0, pre: 0, retl: 0, retw: 0, reto: 0, rdk: 0, rda: 0, rdo: 0,
     parent: vec_new[u64](), cur: 0, decl: vec_new[X86Decl](), sw: false, failed: false, fmsg: vec_new[u64](),
-    stage0: false
+    stage0: false, target: TARGET_HOSTED
   };
 }
 
@@ -776,7 +779,7 @@ fn x86_inline_builtin(p: &Parser, i: u64) -> bool {
     || name_is(p, i, "wrap_sub") || name_is(p, i, "wrap_mul") || name_is(p, i, "cast") || name_is(p, i, "wrap")
     || name_is(p, i, "vec_new") || name_is(p, i, "pool_size") || name_is(p, i, "pool_take") || name_is(p, i, "pool_give")
     || name_is(p, i, "pt_new") || name_is(p, i, "pt_free") || name_is(p, i, "frame_id") || name_is(p, i, "frame_read")
-    || name_is(p, i, "frame_read8") || name_is(p, i, "frame_write") || name_is(p, i, "frame_write8") || name_is(p, i, "pt_has")
+    || name_is(p, i, "frame_read8") || name_is(p, i, "frame_write") || name_is(p, i, "frame_write8") || name_is(p, i, "pt_has") || name_is(p, i, "pt_writable")
     || name_is(p, i, "pt_put") || name_is(p, i, "pt_put_frame") || name_is(p, i, "pt_take") || name_is(p, i, "pt_take_frame");
 }
 
@@ -3408,6 +3411,11 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RAX, 0, 0, 0);
     x86_es(&mut g, "mov (%rdx,%rax,8), %rax");
     x86_es(&mut g, "and $1, %eax");
+  } else if name_is(p, i, "pt_writable") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RAX, 0, 0, 0);
+    x86_es(&mut g, "mov (%rdx,%rax,8), %rax");
+    x86_es(&mut g, "shr $1, %eax");
+    x86_es(&mut g, "and $1, %eax");
   } else if name_is(p, i, "pt_put") || name_is(p, i, "pt_put_frame") {
     // Present, user, and writable (a frame only when asked).
     if name_is(p, i, "pt_put") {
@@ -3874,6 +3882,47 @@ fn x86_builtin1(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
   } else if name_is(p, i, "child_wait") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, XR_RSI, XR_RDX, 0, 0);
     x86_es(&mut g, "call bst_rt_child_wait");
+  } else if name_is(p, i, "sys_spawn") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, XR_RCX, XR_RSI, XR_RDX, 0);
+    x86_es(&mut g, "call bst_rt_sys_spawn");
+  } else if name_is(p, i, "sys_wait") || name_is(p, i, "sys_kill") || name_is(p, i, "sys_info") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, 0, 0, 0, 0);
+    if name_is(p, i, "sys_wait") {
+      x86_es(&mut g, "mov $4, %eax");
+    } else if name_is(p, i, "sys_kill") {
+      x86_es(&mut g, "mov $9, %eax");
+    } else {
+      x86_es(&mut g, "mov $7, %eax");
+    }
+    x86_es(&mut g, "call bst_rt_sys");
+  } else if name_is(p, i, "sys_yield") || name_is(p, i, "sys_getpid") {
+    x86_es(&mut g, "xor %edi, %edi");
+    if name_is(p, i, "sys_yield") {
+      x86_es(&mut g, "mov $5, %eax");
+    } else {
+      x86_es(&mut g, "mov $6, %eax");
+    }
+    x86_es(&mut g, "call bst_rt_sys");
+  } else if name_is(p, i, "sys_ps") || name_is(p, i, "sys_poweroff") {
+    x86_es(&mut g, "xor %edi, %edi");
+    if name_is(p, i, "sys_ps") {
+      x86_es(&mut g, "mov $8, %eax");
+    } else {
+      x86_es(&mut g, "mov $10, %eax");
+    }
+    x86_es(&mut g, "call bst_rt_fsys");
+  } else if name_is(p, i, "sys_call") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RAX, XR_RDI, XR_RSI, 0, 0);
+    x86_es(&mut g, "xor %edx, %edx");
+    x86_es(&mut g, "call bst_rt_fsys");
+  } else if name_is(p, i, "sys_send") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RAX, XR_RDI, XR_RSI, XR_RCX, XR_RDX);
+    x86_es(&mut g, "call bst_rt_fsys");
+  } else if name_is(p, i, "sys_recv") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RAX, XR_RDI, XR_RCX, 0, 0);
+    x86_es(&mut g, "mov 8(%rcx), %rsi");
+    x86_es(&mut g, "mov (%rcx), %rdx");
+    x86_es(&mut g, "call bst_rt_fsys");
   } else {
     x86_fail_builtin(&mut g, p, i);
   }
@@ -4526,8 +4575,13 @@ fn x86_set_var(g: &mut X86, k: u64, s: X86St) {
 fn x86_entry(g: &mut X86, m: &mut Mono, p: &Parser, x: u64) {
   let xi = inst_at(m, x);
   let dn = node_at(p.nodes, xi.def);
-  cg_s(&mut g.out, "\t.globl main\nmain:\n\tpush %rbp\n\tmov %rsp, %rbp\n\tpush %rbx\n\tsub $72, %rsp\n");
-  cg_s(&mut g.out, "\tmov %edi, bst_rt_argc(%rip)\n\tmov %rsi, bst_rt_argv(%rip)\n");
+  if g.target == TARGET_USER {
+    // Called by user/start.S; its result is the exit code.
+    cg_s(&mut g.out, "\t.globl bst_umain\nbst_umain:\n\tpush %rbp\n\tmov %rsp, %rbp\n\tpush %rbx\n\tsub $72, %rsp\n");
+  } else {
+    cg_s(&mut g.out, "\t.globl main\nmain:\n\tpush %rbp\n\tmov %rsp, %rbp\n\tpush %rbx\n\tsub $72, %rsp\n");
+    cg_s(&mut g.out, "\tmov %edi, bst_rt_argc(%rip)\n\tmov %rsi, bst_rt_argv(%rip)\n");
+  }
   // Each capability lives in a frame slot below the saved %rbx; `main`
   // gets it by value or by address.
   let mut off = 8;
@@ -4592,6 +4646,9 @@ fn x86_entry(g: &mut X86, m: &mut Mono, p: &Parser, x: u64) {
     x86_num(&mut g.out, pool);
     cg_s(&mut g.out, "(%rbp), %rdi\n\tcall bst_rt_free\n\tmov %rbx, %rax\n");
   }
+  if g.target == TARGET_USER {
+    cg_s(&mut g.out, "\tmov %rax, %rbx\n\tcall bst_rt_flush\n\tmov %rbx, %rax\n");
+  }
   cg_s(&mut g.out, "\tmov -8(%rbp), %rbx\n\tleave\n\tret\n\n");
 }
 
@@ -4626,9 +4683,13 @@ fn x86_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
   if g.failed {
     return false;
   }
-  x86_runtime(&mut g.out);
-  if !g.stage0 {
-    x86_runtime1(&mut g.out);
+  if g.target == TARGET_USER {
+    x86_runtime_user(&mut g.out);
+  } else {
+    x86_runtime(&mut g.out);
+    if !g.stage0 {
+      x86_runtime1(&mut g.out);
+    }
   }
   cg_s(&mut g.out, "\t.section .rodata\n");
   k = 0;
@@ -5332,4 +5393,229 @@ fn x86_runtime1(out: &mut Vec[u64]) {
   cg_s(&mut out, "\t.p2align 4\n");
   cg_s(&mut out, "bst_rt_port_cell:\t.zero 262144            # the simulated I/O ports\n");
   cg_s(&mut out, "bst_rt_mmio_cell:\t.zero 1048576           # the simulated MMIO window\n");
+}
+
+/// The runtime of the native backend for BastiOS user programs: the
+/// C prelude's user part (`cg_prelude_user`) in assembly over the kernel's
+/// system calls (`int $0x80`), with no C library. Part of the trusted base.
+fn x86_runtime_user(out: &mut Vec[u64]) {
+  cg_s(&mut out, "\n");
+  cg_s(&mut out, "# ---- runtime: BastiOS user programs (trusted base) ----\n");
+  cg_s(&mut out, "bst_rt_sys:                     # system call %rax with %rdi, %rsi, %rdx: %rax = its result\n");
+  cg_s(&mut out, "\tint $0x80\n");
+  cg_s(&mut out, "\tret\n");
+  cg_s(&mut out, "bst_rt_fsys:                    # the same, after the console output so far\n");
+  cg_s(&mut out, "\tpush %rax\n");
+  cg_s(&mut out, "\tpush %rdi\n");
+  cg_s(&mut out, "\tpush %rsi\n");
+  cg_s(&mut out, "\tpush %rdx\n");
+  cg_s(&mut out, "\tcall bst_rt_flush\n");
+  cg_s(&mut out, "\tpop %rdx\n");
+  cg_s(&mut out, "\tpop %rsi\n");
+  cg_s(&mut out, "\tpop %rdi\n");
+  cg_s(&mut out, "\tpop %rax\n");
+  cg_s(&mut out, "\tint $0x80\n");
+  cg_s(&mut out, "\tret\n");
+  cg_s(&mut out, "bst_rt_flush:                   # write out the console buffer\n");
+  cg_s(&mut out, "\tmov bst_rt_out_n(%rip), %rsi\n");
+  cg_s(&mut out, "\ttest %rsi, %rsi\n");
+  cg_s(&mut out, "\tjz 1f\n");
+  cg_s(&mut out, "\tmov $1, %eax                # SYS_WRITE\n");
+  cg_s(&mut out, "\tlea bst_rt_out(%rip), %rdi\n");
+  cg_s(&mut out, "\txor %edx, %edx\n");
+  cg_s(&mut out, "\tint $0x80\n");
+  cg_s(&mut out, "\tmovq $0, bst_rt_out_n(%rip)\n");
+  cg_s(&mut out, "1:\tret\n");
+  cg_s(&mut out, "bst_rt_putc:                    # write byte %rdi to the console; flush at a newline or when full\n");
+  cg_s(&mut out, "\tmov bst_rt_out_n(%rip), %rax\n");
+  cg_s(&mut out, "\tlea bst_rt_out(%rip), %rcx\n");
+  cg_s(&mut out, "\tmov %dil, (%rcx,%rax)\n");
+  cg_s(&mut out, "\tinc %rax\n");
+  cg_s(&mut out, "\tmov %rax, bst_rt_out_n(%rip)\n");
+  cg_s(&mut out, "\tcmp $10, %dil\n");
+  cg_s(&mut out, "\tje bst_rt_flush\n");
+  cg_s(&mut out, "\tcmp $256, %rax\n");
+  cg_s(&mut out, "\tje bst_rt_flush\n");
+  cg_s(&mut out, "\tret\n");
+  cg_s(&mut out, "bst_rt_print:                   # print(%rdi) as a decimal line\n");
+  cg_s(&mut out, "\tpush %rbp\n");
+  cg_s(&mut out, "\tmov %rsp, %rbp\n");
+  cg_s(&mut out, "\tpush %r12\n");
+  cg_s(&mut out, "\tsub $24, %rsp\n");
+  cg_s(&mut out, "\tmov %rdi, %rax\n");
+  cg_s(&mut out, "\txor %r12d, %r12d            # digits, last first\n");
+  cg_s(&mut out, "\tmov $10, %ecx\n");
+  cg_s(&mut out, "1:\txor %edx, %edx\n");
+  cg_s(&mut out, "\tdiv %rcx\n");
+  cg_s(&mut out, "\tadd $48, %edx\n");
+  cg_s(&mut out, "\tmov %dl, (%rsp,%r12)\n");
+  cg_s(&mut out, "\tinc %r12\n");
+  cg_s(&mut out, "\ttest %rax, %rax\n");
+  cg_s(&mut out, "\tjnz 1b\n");
+  cg_s(&mut out, "2:\tdec %r12\n");
+  cg_s(&mut out, "\tmovzbl (%rsp,%r12), %edi\n");
+  cg_s(&mut out, "\tcall bst_rt_putc\n");
+  cg_s(&mut out, "\ttest %r12, %r12\n");
+  cg_s(&mut out, "\tjnz 2b\n");
+  cg_s(&mut out, "\tmov $10, %edi\n");
+  cg_s(&mut out, "\tcall bst_rt_putc\n");
+  cg_s(&mut out, "\tmov -8(%rbp), %r12\n");
+  cg_s(&mut out, "\tleave\n");
+  cg_s(&mut out, "\tret\n");
+  cg_s(&mut out, "bst_rt_getc:                    # %rax = the next byte of console input\n");
+  cg_s(&mut out, "\tcall bst_rt_flush\n");
+  cg_s(&mut out, "\tmov $2, %eax                # SYS_READ\n");
+  cg_s(&mut out, "\txor %edi, %edi\n");
+  cg_s(&mut out, "\txor %esi, %esi\n");
+  cg_s(&mut out, "\txor %edx, %edx\n");
+  cg_s(&mut out, "\tint $0x80\n");
+  cg_s(&mut out, "\tret\n");
+  cg_s(&mut out, "bst_rt_balloc:                  # %rax = %rdi zeroed bytes (at least one)\n");
+  cg_s(&mut out, "\tadd $7, %rdi\n");
+  cg_s(&mut out, "\tshr $3, %rdi\n");
+  cg_s(&mut out, "bst_rt_alloc:                   # %rax = %rdi zeroed words (at least one), after a header word\n");
+  cg_s(&mut out, "\ttest %rdi, %rdi\n");
+  cg_s(&mut out, "\tjnz 1f\n");
+  cg_s(&mut out, "\tmov $1, %edi\n");
+  cg_s(&mut out, "1:\tadd $1, %rdi                # the block's words, header included\n");
+  cg_s(&mut out, "\tjc bst_rt_oom\n");
+  cg_s(&mut out, "\tlea bst_rt_free_list(%rip), %rdx\n");
+  cg_s(&mut out, "2:\tmov (%rdx), %rax            # a free block of exactly that size first\n");
+  cg_s(&mut out, "\ttest %rax, %rax\n");
+  cg_s(&mut out, "\tjz 4f\n");
+  cg_s(&mut out, "\tcmp (%rax), %rdi\n");
+  cg_s(&mut out, "\tje 3f\n");
+  cg_s(&mut out, "\tlea 8(%rax), %rdx\n");
+  cg_s(&mut out, "\tjmp 2b\n");
+  cg_s(&mut out, "3:\tmov 8(%rax), %rcx\n");
+  cg_s(&mut out, "\tmov %rcx, (%rdx)\n");
+  cg_s(&mut out, "\tjmp 5f\n");
+  cg_s(&mut out, "4:\tmov bst_rt_arena_top(%rip), %rax\n");
+  cg_s(&mut out, "\tmov $8192, %ecx             # the arena's words\n");
+  cg_s(&mut out, "\tsub %rax, %rcx\n");
+  cg_s(&mut out, "\tcmp %rcx, %rdi\n");
+  cg_s(&mut out, "\tja bst_rt_oom\n");
+  cg_s(&mut out, "\tlea (%rax,%rdi), %rcx\n");
+  cg_s(&mut out, "\tmov %rcx, bst_rt_arena_top(%rip)\n");
+  cg_s(&mut out, "\tlea bst_rt_arena(%rip), %rcx\n");
+  cg_s(&mut out, "\tlea (%rcx,%rax,8), %rax\n");
+  cg_s(&mut out, "\tmov %rdi, (%rax)\n");
+  cg_s(&mut out, "5:\tlea 8(%rax), %rdx\n");
+  cg_s(&mut out, "\tlea -1(%rdi), %rcx\n");
+  cg_s(&mut out, "\tmov %rdx, %rdi\n");
+  cg_s(&mut out, "\txor %eax, %eax\n");
+  cg_s(&mut out, "\trep stosq\n");
+  cg_s(&mut out, "\tmov %rdx, %rax\n");
+  cg_s(&mut out, "\tret\n");
+  cg_s(&mut out, "bst_rt_free:                    # give the block at %rdi back to the free list (0: none)\n");
+  cg_s(&mut out, "\ttest %rdi, %rdi\n");
+  cg_s(&mut out, "\tjz 1f\n");
+  cg_s(&mut out, "\tmov bst_rt_free_list(%rip), %rax\n");
+  cg_s(&mut out, "\tmov %rax, (%rdi)\n");
+  cg_s(&mut out, "\tsub $8, %rdi\n");
+  cg_s(&mut out, "\tmov %rdi, bst_rt_free_list(%rip)\n");
+  cg_s(&mut out, "1:\tret\n");
+  cg_s(&mut out, "bst_rt_vec_grow:                # grow the Vec at (%rdi), elements of %rsi bytes\n");
+  cg_s(&mut out, "\tpush %rbp\n");
+  cg_s(&mut out, "\tmov %rsp, %rbp\n");
+  cg_s(&mut out, "\tpush %rbx\n");
+  cg_s(&mut out, "\tpush %r12\n");
+  cg_s(&mut out, "\tpush %r13\n");
+  cg_s(&mut out, "\tpush %r14\n");
+  cg_s(&mut out, "\tmov %rdi, %rbx\n");
+  cg_s(&mut out, "\tmov %rsi, %r13\n");
+  cg_s(&mut out, "\tmov 8(%rbx), %rax           # the old words\n");
+  cg_s(&mut out, "\tmul %rsi\n");
+  cg_s(&mut out, "\tadd $7, %rax\n");
+  cg_s(&mut out, "\tshr $3, %rax\n");
+  cg_s(&mut out, "\tmov %rax, %r14\n");
+  cg_s(&mut out, "\tmov 8(%rbx), %r12           # new capacity: double, or 4 when empty\n");
+  cg_s(&mut out, "\tadd %r12, %r12\n");
+  cg_s(&mut out, "\tjnz 1f\n");
+  cg_s(&mut out, "\tmov $4, %r12d\n");
+  cg_s(&mut out, "1:\tmov %r12, %rax\n");
+  cg_s(&mut out, "\tmul %r13                    # bytes; past 64 bits the request cannot be met\n");
+  cg_s(&mut out, "\tjo bst_rt_oom\n");
+  cg_s(&mut out, "\tmov %rax, %rdi\n");
+  cg_s(&mut out, "\tadd $7, %rdi\n");
+  cg_s(&mut out, "\tjc bst_rt_oom\n");
+  cg_s(&mut out, "\tshr $3, %rdi\n");
+  cg_s(&mut out, "\tcall bst_rt_alloc\n");
+  cg_s(&mut out, "\tmov %rax, %r13\n");
+  cg_s(&mut out, "\tmov 16(%rbx), %rsi\n");
+  cg_s(&mut out, "\ttest %rsi, %rsi\n");
+  cg_s(&mut out, "\tjz 2f\n");
+  cg_s(&mut out, "\tmov %rax, %rdi\n");
+  cg_s(&mut out, "\tmov %r14, %rcx\n");
+  cg_s(&mut out, "\trep movsq\n");
+  cg_s(&mut out, "\tmov 16(%rbx), %rdi\n");
+  cg_s(&mut out, "\tcall bst_rt_free\n");
+  cg_s(&mut out, "2:\tmov %r13, 16(%rbx)\n");
+  cg_s(&mut out, "\tmov %r12, 8(%rbx)\n");
+  cg_s(&mut out, "\tmov -8(%rbp), %rbx\n");
+  cg_s(&mut out, "\tmov -16(%rbp), %r12\n");
+  cg_s(&mut out, "\tmov -24(%rbp), %r13\n");
+  cg_s(&mut out, "\tmov -32(%rbp), %r14\n");
+  cg_s(&mut out, "\tleave\n");
+  cg_s(&mut out, "\tret\n");
+  cg_s(&mut out, "bst_rt_bfrom:                   # Bytes copied from the %rdi bytes at %rsi: %rax = data, %rdx = len\n");
+  cg_s(&mut out, "\tpush %rbp\n");
+  cg_s(&mut out, "\tmov %rsp, %rbp\n");
+  cg_s(&mut out, "\tpush %rbx\n");
+  cg_s(&mut out, "\tpush %r12\n");
+  cg_s(&mut out, "\tmov %rdi, %rbx\n");
+  cg_s(&mut out, "\tmov %rsi, %r12\n");
+  cg_s(&mut out, "\tcall bst_rt_balloc\n");
+  cg_s(&mut out, "\tmov %rax, %rdi\n");
+  cg_s(&mut out, "\tmov %r12, %rsi\n");
+  cg_s(&mut out, "\tmov %rbx, %rcx\n");
+  cg_s(&mut out, "\trep movsb\n");
+  cg_s(&mut out, "\tmov %rbx, %rdx\n");
+  cg_s(&mut out, "\tmov -8(%rbp), %rbx\n");
+  cg_s(&mut out, "\tmov -16(%rbp), %r12\n");
+  cg_s(&mut out, "\tleave\n");
+  cg_s(&mut out, "\tret\n");
+  cg_s(&mut out, "bst_rt_sys_spawn:               # start the program named by words %rsi..%rdx of the Buf data at %rdi\n");
+  cg_s(&mut out, "\tpush %rbp\n");
+  cg_s(&mut out, "\tmov %rsp, %rbp\n");
+  cg_s(&mut out, "\tsub $64, %rsp\n");
+  cg_s(&mut out, "\txor %ecx, %ecx              # the name's bytes, at most 64\n");
+  cg_s(&mut out, "1:\tcmp %rdx, %rsi\n");
+  cg_s(&mut out, "\tjae 2f\n");
+  cg_s(&mut out, "\tcmp $64, %rcx\n");
+  cg_s(&mut out, "\tjae 2f\n");
+  cg_s(&mut out, "\tmov (%rdi,%rsi,8), %rax\n");
+  cg_s(&mut out, "\tmov %al, (%rsp,%rcx)\n");
+  cg_s(&mut out, "\tinc %rcx\n");
+  cg_s(&mut out, "\tinc %rsi\n");
+  cg_s(&mut out, "\tjmp 1b\n");
+  cg_s(&mut out, "2:\tmov $3, %eax                # SYS_SPAWN\n");
+  cg_s(&mut out, "\tmov %rsp, %rdi\n");
+  cg_s(&mut out, "\tmov %rcx, %rsi\n");
+  cg_s(&mut out, "\txor %edx, %edx\n");
+  cg_s(&mut out, "\tint $0x80\n");
+  cg_s(&mut out, "\tleave\n");
+  cg_s(&mut out, "\tret\n");
+  cg_s(&mut out, "bst_rt_oom:\n");
+  cg_s(&mut out, "\tcall bst_rt_flush\n");
+  cg_s(&mut out, "\tmov $1, %eax\n");
+  cg_s(&mut out, "\tlea .Lrt_oom(%rip), %rdi\n");
+  cg_s(&mut out, "\tmov $22, %esi\n");
+  cg_s(&mut out, "\txor %edx, %edx\n");
+  cg_s(&mut out, "\tint $0x80\n");
+  cg_s(&mut out, "\txor %eax, %eax              # SYS_EXIT\n");
+  cg_s(&mut out, "\tmov $255, %edi\n");
+  cg_s(&mut out, "\tint $0x80\n");
+  cg_s(&mut out, "\tud2\n");
+  cg_s(&mut out, "\t.bss\n");
+  cg_s(&mut out, "\t.p2align 3\n");
+  cg_s(&mut out, "bst_rt_out_n:\t.quad 0\n");
+  cg_s(&mut out, "bst_rt_arena_top:\t.quad 0\n");
+  cg_s(&mut out, "bst_rt_free_list:\t.quad 0\n");
+  cg_s(&mut out, "bst_rt_out:\t.zero 256\n");
+  cg_s(&mut out, "bst_rt_arena:\t.zero 65536\n");
+  cg_s(&mut out, "\t.section .rodata\n");
+  cg_s(&mut out, ".Lrt_oom:\n");
+  cg_s(&mut out, "\t.string \"bastio: out of memory\\n\"\n");
+  cg_s(&mut out, "\t.text\n");
 }

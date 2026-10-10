@@ -964,6 +964,7 @@ Ghost accessors, usable in specifications:
 | `pt_take(t: &mut PageTable, i: u64) -> PageTable` | level >= 2; slot `i` used (same slot rule at level 4) | Moves the table out of slot `i`; its level is one less. What its slots hold is unknown to the proof, so code that tears it down tests each slot with `pt_has` |
 | `pt_put_frame(t: &mut PageTable, i: u64, f: Frame, writable: bool)` | level 1; slot `i` empty | Maps page `f` in slot `i`, user-accessible |
 | `pt_take_frame(t: &mut PageTable, i: u64) -> Frame` | level 1; slot `i` used | Unmaps the page and returns it |
+| `pt_writable(t: &PageTable, i: u64) -> bool` | level 1; `i < 512` | Whether the page in slot `i` was mapped writable. The proof does not track it, so the answer is unknown to it; code that moves a page keeps its permission by passing this to `pt_put_frame` |
 
 ```bastio
 // expect-exit: 0

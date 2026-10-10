@@ -13,8 +13,10 @@
 //   --target    `hosted` (default): a normal program on the C library
 //               `kernel`: freestanding C for a bare-metal x86-64 kernel (implies --emit-c)
 //               `user`: freestanding C for a user program under BastiOS (implies --emit-c)
-//   --backend native  generate x86-64 assembly directly instead of C
-//               (hosted programs only), then assemble and link it
+//   --backend native  generate x86-64 assembly directly instead of C, then
+//               assemble and link it (hosted); with `--target user`, write
+//               the assembly to `out` (default: out.s), to be linked with
+//               BastiOS's user/start.o. Not for `--target kernel` yet
 //   --emit-asm  with `--backend native`: write the assembly to `out`
 //               (default: out.s) instead of building
 //   --header F  also write a C header for the program's `export fn`s to F
@@ -216,11 +218,14 @@ fn b1_tool(host: &Host, argv: Vec[Bytes], what: Str, out: &mut Vec[u64]) -> u64 
 /// `outp` (`--emit-asm`), or assembled and linked into the executable
 /// `outp`. Returns the exit status.
 fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, emit_asm: bool, outp: &Bytes, has_out: bool, out: &mut Vec[u64]) -> u64 {
-  if target != TARGET_HOSTED {
-    out_str(&mut out, "bastioc1: the native backend supports only the hosted target so far\n");
+  if target == TARGET_KERNEL {
+    out_str(&mut out, "bastioc1: the native backend does not support the kernel target yet\n");
     return 2;
   }
   let mut g = x86_new();
+  // A BastiOS user program: the assembly is the output (as the C is with
+  // the C backend), to be linked with BastiOS's user/start.o.
+  g.target = target;
   let mut status = 0;
   if !x86_program(&mut g, c, &mut m, p) {
     out_str(&mut out, "bastioc1: ");
@@ -231,7 +236,7 @@ fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, em
     }
     out_str(&mut out, "\n");
     status = 4;
-  } else if emit_asm {
+  } else if emit_asm || target == TARGET_USER {
     let mut path = b1_concat(outp, "");
     if !has_out {
       bfree(path);
