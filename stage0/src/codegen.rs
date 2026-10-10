@@ -555,8 +555,8 @@ static inline void bst_mmu_kernel(bst_mmu *m) { (void)m; bst_load_cr3((uint64_t)
 static inline bst_frame bst_pt_free_root(bst_mmu m, bst_pt t) { (void)m; return t; }
 
 /* Saved user registers: rax rbx rcx rdx rsi rdi rbp r8-r15 (0-14), rip (15),
- * rsp (16), rflags (17), error code (18), fault address (19). */
-extern uint64_t bst_cpu_ctx[20];
+ * rsp (16), rflags (17), error code (18), fault address (19), FS base (20). */
+extern uint64_t bst_cpu_ctx[21];
 extern uint64_t bst_cpu_enter(void);   /* enter user mode; returns the trap vector */
 extern uint64_t bst_cpu_wait(void);    /* sti; hlt; cli; returns the interrupt vector */
 static inline uint64_t bst_cpu_get(bst_cpu c, uint64_t r) { (void)c; return bst_cpu_ctx[r]; }

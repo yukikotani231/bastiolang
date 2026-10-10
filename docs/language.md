@@ -790,8 +790,8 @@ fn main(pool: &mut Pool) -> u64 {
 | --- | --- | --- |
 | `mmu_switch(m: &mut Mmu, t: &PageTable)` | level 4 | Loads `t` into CR3; `mmu_root(m)` becomes `pt_id(t)` |
 | `mmu_kernel(m: &mut Mmu)` | | Loads the kernel's own map |
-| `cpu_get(c: &Cpu, r: u64) -> u64` | `r < 20` | Saved user register `r`: rax rbx rcx rdx rsi rdi rbp r8-r15 (0-14), rip (15), rsp (16), rflags (17), error code (18), fault address (19) |
-| `cpu_set(c: &mut Cpu, r: u64, v: u64)` | `r < 18` | Sets a saved register. Whatever is stored, user mode is entered in ring 3 with the user segments, IOPL 0 and interrupts on |
+| `cpu_get(c: &Cpu, r: u64) -> u64` | `r < 21` | Saved user register `r`: rax rbx rcx rdx rsi rdi rbp r8-r15 (0-14), rip (15), rsp (16), rflags (17), error code (18), fault address (19), FS base (20) |
+| `cpu_set(c: &mut Cpu, r: u64, v: u64)` | `r < 18` or `r == 20` | Sets a saved register or the FS base (the error code and fault address are only reported by a trap). Whatever is stored, user mode is entered in ring 3 with the user segments, IOPL 0 and interrupts on; the platform replaces a non-canonical address with 0 |
 | `cpu_run(c: &mut Cpu, m: &Mmu) -> u64` | | Runs the saved context in user mode until the next trap; returns its vector (`<= 255`) |
 | `cpu_idle(c: &mut Cpu) -> u64` | | Waits for an interrupt; returns its vector |
 
