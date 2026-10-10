@@ -378,6 +378,7 @@ fn push_ty(v: &mut Vr, m: &Mono, p: &Parser, t: u64) {
   else if k == TY_PORTIO { push_str(&mut v, "PortIo"); }
   else if k == TY_MMIOSPACE { push_str(&mut v, "MmioSpace"); }
   else if k == TY_MMIO { push_str(&mut v, "Mmio"); }
+  else if k == TY_DMA { push_str(&mut v, "Dma"); }
   else if k == TY_U8 { push_str(&mut v, "u8"); }
   else if k == TY_U16 { push_str(&mut v, "u16"); }
   else if k == TY_U32 { push_str(&mut v, "u32"); }
@@ -826,7 +827,7 @@ fn term(v: &Vr, x: u64) -> u64 {
 fn obj_fields(k: u64) -> u64 {
   if k == TY_PT { return 3; }
   if k == TY_POOL { return 2; }
-  if k == TY_FRAME || k == TY_MMU || k == TY_PORTS || k == TY_MMIOSPACE { return 1; }
+  if k == TY_FRAME || k == TY_MMU || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA { return 1; }
   if k == TY_PORTIO || k == TY_MMIO { return 2; }
   return 0;
 }
@@ -839,7 +840,7 @@ fn obj_field(v: &Vr, x: u64, j: u64) -> u64 {
 }
 
 // The ghost fields by name.
-fn g_id(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 0); }       // Frame, PageTable
+fn g_id(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 0); }       // Frame, PageTable, Dma
 fn g_level(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 1); }    // PageTable
 fn g_used(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 2); }     // PageTable
 fn g_has(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 0); }      // Pool
@@ -1455,7 +1456,7 @@ fn fresh_field(v: &mut Vr, tk: u64, j: u64, hint: u64) -> u64 {
 /// Ghost fields a loop keeps when only builtins that never change them
 /// change the object (a page table keeps its id and level).
 fn kept_by_builtins(tk: u64, j: u64) -> bool {
-  return ((tk == TY_FRAME || tk == TY_PT) && j == 0) || (tk == TY_PT && j == 1) || (tk == TY_POOL && j == 1)
+  return ((tk == TY_FRAME || tk == TY_PT || tk == TY_DMA) && j == 0) || (tk == TY_PT && j == 1) || (tk == TY_POOL && j == 1)
     || ((tk == TY_PORTIO || tk == TY_MMIO) && j <= 1);
 }
 
@@ -2043,7 +2044,7 @@ fn vspec_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env: &V
     let ix = spec_tm(&mut v, c, &mut m, p, arg_node(p, i, 1), env, oenv, has_old, res, &mut bound);
     return app2(&mut v, OP_SELECT, xv.b, ix);
   }
-  if span_is(p, n.s, n.e, "frame_id") || span_is(p, n.s, n.e, "pt_id") {
+  if span_is(p, n.s, n.e, "frame_id") || span_is(p, n.s, n.e, "pt_id") || span_is(p, n.s, n.e, "dma_id") {
     return g_id(v, x);
   }
   if span_is(p, n.s, n.e, "pt_level") {
@@ -2910,6 +2911,56 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     vec_push(&mut st.pc, le);
     return r;
   }
+  // Pages lent to devices: lending and taking back keep the page number.
+  if name_is(p, i, "dma_lend") {
+    return mk_obj(&mut v, m, kind_ty(m, p, TY_DMA), g_id(v, x0), 0, 0);
+  }
+  if name_is(p, i, "dma_take") {
+    return mk_obj(&mut v, m, v.ty_frame, g_id(v, x0), 0, 0);
+  }
+  if name_is(p, i, "dma_id") {
+    return mk_u(&mut v, g_id(v, x0));
+  }
+  if name_is(p, i, "dma_addr") {
+    return fresh_u64_named(&mut v, "dma_addr");
+  }
+  if name_is(p, i, "dma_read8") || name_is(p, i, "dma_read16") || name_is(p, i, "dma_read32") || name_is(p, i, "dma_read64")
+    || name_is(p, i, "dma_write8") || name_is(p, i, "dma_write16") || name_is(p, i, "dma_write32") || name_is(p, i, "dma_write64") {
+    let mut bytes = 8;
+    let mut max = U64_MAX;
+    if name_is(p, i, "dma_read8") || name_is(p, i, "dma_write8") {
+      bytes = 1;
+      max = 255;
+    } else if name_is(p, i, "dma_read16") || name_is(p, i, "dma_write16") {
+      bytes = 2;
+      max = 65535;
+    } else if name_is(p, i, "dma_read32") || name_is(p, i, "dma_write32") {
+      bytes = 4;
+      max = 4294967295;
+    }
+    let off = term(v, x1);
+    let tb = num(&mut v, bytes);
+    let end = app2(&mut v, OP_ADD, off, tb);
+    let page = num(&mut v, 4096);
+    let g = app2(&mut v, OP_LE, end, page);
+    prove(&mut v, st, g);
+    // The page is page-aligned, so an aligned offset is an aligned address.
+    let md = app2(&mut v, OP_MOD, off, tb);
+    let g2 = app2(&mut v, OP_EQ, md, v.t_zero);
+    prove(&mut v, st, g2);
+    let tm = num(&mut v, max);
+    if name_is(p, i, "dma_write8") || name_is(p, i, "dma_write16") || name_is(p, i, "dma_write32") || name_is(p, i, "dma_write64") {
+      let g3 = app2(&mut v, OP_LE, term(v, x2), tm);
+      prove(&mut v, st, g3);
+      return v.unit;
+    }
+    let n = node_at(p.nodes, i);
+    let h = atom_src(&mut v, p, n.s, n.e);
+    let r = fresh_u64(&mut v, h);
+    let le = app2(&mut v, OP_LE, term(v, r), tm);
+    vec_push(&mut st.pc, le);
+    return r;
+  }
   if name_is(p, i, "port_base") {
     return mk_u(&mut v, g_base(v, x0));
   }
@@ -3536,7 +3587,9 @@ fn shape_keeping(p: &Parser, i: u64) -> bool {
     || name_is(p, i, "cpu_fpu_save") || name_is(p, i, "cpu_fpu_load") || name_is(p, i, "pio_in8") || name_is(p, i, "pio_in16")
     || name_is(p, i, "pio_in32") || name_is(p, i, "pio_out8") || name_is(p, i, "pio_out16") || name_is(p, i, "pio_out32")
     || name_is(p, i, "mmio_read8") || name_is(p, i, "mmio_read16") || name_is(p, i, "mmio_read32") || name_is(p, i, "mmio_read64")
-    || name_is(p, i, "mmio_write8") || name_is(p, i, "mmio_write16") || name_is(p, i, "mmio_write32") || name_is(p, i, "mmio_write64");
+    || name_is(p, i, "mmio_write8") || name_is(p, i, "mmio_write16") || name_is(p, i, "mmio_write32") || name_is(p, i, "mmio_write64")
+    || name_is(p, i, "dma_read8") || name_is(p, i, "dma_read16") || name_is(p, i, "dma_read32") || name_is(p, i, "dma_read64")
+    || name_is(p, i, "dma_write8") || name_is(p, i, "dma_write16") || name_is(p, i, "dma_write32") || name_is(p, i, "dma_write64");
 }
 
 /// Places deeper than this many parts are summarized by their prefix of

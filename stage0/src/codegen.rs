@@ -291,6 +291,7 @@ typedef int bst_ports;                      /* capability token: no data */
 typedef struct { uint64_t base, count; } bst_portio;
 typedef int bst_mmiospace;                  /* capability token: no data */
 typedef struct { uint64_t base, len; } bst_mmio;
+typedef uint64_t bst_dma;                   /* a lent page's physical address */
 static inline bst_buf bst_set(bst_buf b, uint64_t i, uint64_t v) { b.data[i] = v; return b; }
 "#;
 
@@ -712,6 +713,22 @@ const PRELUDE_MMIO_KERNEL: &str = r#"
 BST_MMIO_RW(8, uint8_t) BST_MMIO_RW(16, uint16_t) BST_MMIO_RW(32, uint32_t) BST_MMIO_RW(64, uint64_t)
 "#;
 
+// Pages lent to devices. A `Dma` is the page's address, like a `Frame`, so
+// lending is only a fence: every store before it reaches memory before the
+// driver can tell a device where the page is, and taking the page back
+// orders the device's writes before later reads. Accesses while lent are
+// volatile: the device may read or write the page at any time.
+const PRELUDE_DMA: &str = r#"
+static inline bst_dma bst_dma_lend(bst_frame f) { __atomic_thread_fence(__ATOMIC_SEQ_CST); return f; }
+static inline bst_frame bst_dma_take(bst_dma d) { __atomic_thread_fence(__ATOMIC_SEQ_CST); return d; }
+static inline uint64_t bst_dma_id(bst_dma d) { return (d - bst_pool_base) / 4096; }
+static inline uint64_t bst_dma_addr(bst_dma d) { return d; }
+#define BST_DMA_RW(w, t) \
+    static inline uint64_t bst_dma_read##w(bst_dma *d, uint64_t o) { return *(volatile t *)(uintptr_t)(*d + o); } \
+    static inline void bst_dma_write##w(bst_dma *d, uint64_t o, uint64_t v) { *(volatile t *)(uintptr_t)(*d + o) = (t)v; }
+BST_DMA_RW(8, uint8_t) BST_DMA_RW(16, uint16_t) BST_DMA_RW(32, uint32_t) BST_DMA_RW(64, uint64_t)
+"#;
+
 // Hosted programs simulate the window with 1 MiB of memory, indexed by the
 // low 20 bits of the address (so registers 1 MiB apart share storage).
 const PRELUDE_MMIO_HOSTED: &str = r#"
@@ -903,6 +920,7 @@ fn cty(t: &Type) -> String {
         Type::PortIo => "bst_portio".into(),
         Type::MmioSpace => "bst_mmiospace".into(),
         Type::Mmio => "bst_mmio".into(),
+        Type::Dma => "bst_dma".into(),
         Type::Struct(n) => format!("bst_s_{}", cid(n)),
         Type::Enum(n) => format!("bst_e_{}", cid(n)),
         Type::Generic(..) => unreachable!("removed by monomorphization"),
@@ -1354,6 +1372,7 @@ pub fn prelude_parts(target: Target) -> Vec<(&'static str, &'static str)> {
             ("ports_hosted", PRELUDE_PORTS_HOSTED),
             ("mmio", PRELUDE_MMIO),
             ("mmio_hosted", PRELUDE_MMIO_HOSTED),
+            ("dma", PRELUDE_DMA),
         ],
         Target::Kernel => vec![
             ("common", PRELUDE_COMMON),
@@ -1366,6 +1385,7 @@ pub fn prelude_parts(target: Target) -> Vec<(&'static str, &'static str)> {
             ("ports_kernel", PRELUDE_PORTS_KERNEL),
             ("mmio", PRELUDE_MMIO),
             ("mmio_kernel", PRELUDE_MMIO_KERNEL),
+            ("dma", PRELUDE_DMA),
         ],
         Target::User => vec![("common", PRELUDE_COMMON), ("user", PRELUDE_USER), ("bytes_arena", PRELUDE_BYTES_ARENA), ("bytes", PRELUDE_BYTES)],
     }

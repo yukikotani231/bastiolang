@@ -181,7 +181,7 @@ irq_restore(&mut ctx, s);             // linear: interrupts cannot be left off b
 
 ### Devices and DMA (direction only)
 
-The same ownership idea extends to hardware that writes memory on its own. A buffer given to a device for DMA is moved into a linear "in flight" token and comes back only when the device reports completion, so the kernel cannot read or free it meanwhile. This belongs with the `Mmio` and `PortIo` capabilities in v3 and is not designed further here.
+The same ownership idea extends to hardware that writes memory on its own. A buffer given to a device for DMA is moved into a linear "in flight" token and comes back only when the device reports completion, so the kernel cannot read or free it meanwhile. This belongs with the `Mmio` and `PortIo` capabilities in v3; it is implemented as `Dma` (see [language.md](language.md#kernel-capabilities)), where completion is still the driver's word rather than something proved.
 
 ## What gets proved, and what is trusted
 

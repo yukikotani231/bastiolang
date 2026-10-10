@@ -1,0 +1,45 @@
+// expect-exit: 42
+// Pages lent to devices: a driver turns a page into a `Dma`, which is the
+// only way to learn its physical address, touches it with volatile, aligned
+// accesses while the device may use it, and takes it back as the same page.
+// Nothing can free or map the page in between, because it is not a `Frame`.
+
+struct Ring { page: Dma, head: u64 }
+
+/// Writes one 16-byte descriptor (address, length) into slot `i`.
+fn put_desc(r: &mut Ring, i: u64, addr: u64, n: u64)
+  requires i < 256 && n <= 0xFFFFFFFF
+{
+  dma_write64(&mut r.page, i * 16, addr);
+  dma_write32(&mut r.page, i * 16 + 8, n);
+  dma_write16(&mut r.page, i * 16 + 12, 1);
+  r.head = i + 1;
+}
+
+fn main(pool: &mut Pool) -> u64 {
+  if pool_size(pool) < 8 {
+    return 0;
+  }
+  let f = pool_take(&mut pool, 3);
+  let mut buf = pool_take(&mut pool, 4);
+  frame_write8(&mut buf, 0, 40);
+  let mut data = dma_lend(buf);
+  let mut r = Ring { page: dma_lend(f), head: 0 };
+  assert dma_id(r.page) == 3 && dma_id(data) == 4;
+  put_desc(&mut r, 2, dma_addr(data), 512);
+  // The device would fill the buffer here; play its part.
+  dma_write8(&mut data, 1, 1);
+  let n = dma_read32(&mut r.page, 2 * 16 + 8);
+  let flags = dma_read16(&mut r.page, 2 * 16 + 12);
+  let back = dma_take(data);
+  let ring = dma_take(r.page);
+  // Taking a page back gives the same page, so it can go back to the pool.
+  assert frame_id(back) == 4 && frame_id(ring) == 3;
+  let v = frame_read8(back, 0) + frame_read8(back, 1);
+  pool_give(&mut pool, back);
+  pool_give(&mut pool, ring);
+  if n == 512 && flags == 1 && r.head == 3 {
+    return v + 1;
+  }
+  return 1;
+}
