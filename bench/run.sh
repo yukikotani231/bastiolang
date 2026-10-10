@@ -2,7 +2,10 @@
 # Performance benchmarks (ROADMAP invariant 5). Prints one line per
 # measurement, so two runs can be diffed or kept as a CI artifact:
 #
-#   run NAME bastio=SECONDS c=SECONDS ratio=X      generated code vs its C twin
+#   run NAME bastio=SECONDS c=SECONDS ratio=X native=SECONDS native_ratio=Y
+#                                         generated code vs its C twin; `native`
+#                                         is the same program built with
+#                                         `--backend native` (no C compiler)
 #   compile FILE obligations=N check=SECONDS build=SECONDS
 #                                         proof time; proof + C build (one run)
 #
@@ -44,7 +47,12 @@ for n in "${names[@]}"; do
     echo "run $n FAILED: output differs from the C twin"; status=1; continue
   fi
   tb=$(best "$tmp/$n") && tc=$(best "$tmp/$n.c.exe") || { echo "run $n FAILED: nonzero exit"; status=1; continue; }
-  echo "run $n bastio=$tb c=$tc ratio=$(awk -v b="$tb" -v c="$tc" 'BEGIN { printf "%.2f", (c > 0 ? b / c : 0) }')"
+  native=""
+  if "$BASTIOC" --backend native -o "$tmp/$n.x" "bench/$n.bastio" 2>/dev/null && [ "$("$tmp/$n.x")" = "$("$tmp/$n.c.exe")" ]; then
+    tx=$(best "$tmp/$n.x") && native=" native=$tx native_ratio=$(awk -v b="$tx" -v c="$tc" 'BEGIN { printf "%.2f", (c > 0 ? b / c : 0) }')"
+  fi
+  [ -n "$native" ] || { echo "run $n FAILED: the native backend build differs or failed"; status=1; }
+  echo "run $n bastio=$tb c=$tc ratio=$(awk -v b="$tb" -v c="$tc" 'BEGIN { printf "%.2f", (c > 0 ? b / c : 0) }')$native"
 done
 
 # Compile time: the benchmarks themselves (when no names were given, also the

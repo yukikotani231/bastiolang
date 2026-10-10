@@ -81,6 +81,7 @@ stage1/difftest.sh    # the self-hosted compiler's phases against stage0
 - `--emit-c`: write the generated C
 - `--dump-smt`: print every query sent to the solver
 - `--target kernel`: emit freestanding C for bare-metal x86-64 (used by BastiOS)
+- `--backend native`: experimental, generate x86-64 assembly directly instead of C (hosted target only; `tests/native.sh` checks it against the C backend)
 
 ## Layout
 

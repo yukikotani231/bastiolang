@@ -71,7 +71,7 @@ Take away `requires n <= len(b)` and the program is rejected with `E-VERIFY-BOUN
 ## Using the compiler
 
 ```text
-bastioc0 [--check] [--emit-c] [--target hosted|kernel|user] [-o out] <file.bastio>...
+bastioc0 [--check] [--emit-c] [--backend c|native] [--target hosted|kernel|user] [-o out] <file.bastio>...
 ```
 
 | Option | Effect |
@@ -80,11 +80,13 @@ bastioc0 [--check] [--emit-c] [--target hosted|kernel|user] [-o out] <file.basti
 | `--check` | Check and verify only |
 | `--emit-c` | Write the generated C (`out.c` unless `-o` is given) instead of an executable |
 | `--target T` | `hosted` (the default), `kernel` or `user`; see [Targets](#targets-and-generated-code). `kernel` and `user` imply `--emit-c` |
+| `--backend native` | Experimental: generate x86-64 assembly directly instead of C, assemble it with `as` and link it with `cc`. Hosted target only, and not every builtin yet (`Host`, `Child` and `Pool` are missing); see [Targets](#targets-and-generated-code) |
+| `--emit-asm` | With `--backend native`: write the assembly (`out.s` unless `-o` is given) instead of an executable |
 | `--dump-smt` | Also print the queries sent to Z3 |
 | `--trusted-base` | Print the hand-written C each target links in, and every builtin with the targets that have it |
 | `--dump-tokens`, `--dump-ast`, `--dump-mono`, `--dump-check` | Print the result of one compiler phase. These exist so the self-hosted compiler can be tested against stage0 |
 
-`bastioc0` runs `z3` (found on `PATH`) as a subprocess and `cc` (or `$CC`) to compile the C it emits. Errors are printed with the source line, a caret and, for proof failures, a counterexample. Exit status: 0 on success, 1 when the program is rejected, 2 for a usage or file error, 3 when the C compiler fails (which is a compiler bug).
+`bastioc0` runs `z3` (found on `PATH`) as a subprocess and `cc` (or `$CC`) to compile the C it emits. Errors are printed with the source line, a caret and, for proof failures, a counterexample. Exit status: 0 on success, 1 when the program is rejected, 2 for a usage or file error, 3 when the C compiler (or, with `--backend native`, the assembler or linker) fails (which is a compiler bug), 4 when the native backend does not support something the program uses yet.
 
 ## Lexical structure
 
@@ -919,6 +921,8 @@ The compiler emits C, which a C compiler turns into machine code. The C contains
 - **`--target user`** emits freestanding C for a user program under BastiOS, entered at `bst_umain`. Its prelude implements the console and the `sys_*` builtins as `int 0x80` system calls, and `alloc` with a 64 KiB arena.
 
 On the freestanding targets `Bytes` come from the same arena as `Buf`.
+
+The native backend (`--backend native`, hosted only, experimental) skips C: it writes x86-64 assembly, so the C compiler leaves the trusted base for the program's own code, while its small runtime (printing, the console and the allocator, written in assembly over the C library) is listed by `--trusted-base`. `tests/native.sh` builds every test and benchmark with both backends and requires the same exit status and output. It loses the C compiler's optimizations (inlining, vectorization), so it is slower; `bench/run.sh` reports the gap.
 
 In the generated C, a struct is a C struct passed by value, an enum is a tag and a union, a `Box[T]` is a `T *`, a `Vec[T]` is `{ len, cap, data }`, and ghost state (capability state, specifications, `assert`) leaves nothing behind.
 
