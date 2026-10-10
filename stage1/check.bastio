@@ -584,10 +584,354 @@ fn cfail(c: &mut Checker, p: &Parser, loc: u64, code: u64) {
   }
 }
 
-fn expect_ty(c: &mut Checker, p: &Parser, got: u64, want: u64, loc: u64) {
-  if got != want {
-    cfail(&mut c, p, loc, C_TYPE);
+// ---- Messages ----
+//
+// The sentence after the code and the hints, as bastioc0 words them. Only
+// the first error is reported, so a message is written only by the call
+// that records the error: `cm_new` records it and says whether it did.
+
+/// Records an error at node `loc` with `code`, as `cfail` does; true when
+/// it is the first, so the caller goes on to write its sentence.
+fn cm_new(c: &mut Checker, p: &Parser, loc: u64, code: u64) -> bool {
+  if c.failed {
+    return false;
   }
+  cfail(&mut c, p, loc, code);
+  return true;
+}
+
+/// Appends `s` to the sentence.
+fn cm_s(c: &mut Checker, s: Str) {
+  let mut k = 0;
+  while k < slen(s)
+    invariant k <= slen(s)
+  {
+    vec_push(&mut c.emsg, cast[u64](sget(s, k)));
+    k = k + 1;
+  }
+}
+
+/// Appends the source text `s..e`.
+fn cm_src(c: &mut Checker, p: &Parser, s: u64, e: u64) {
+  let mut k = s;
+  while k < e && k < blen(p.src) {
+    vec_push(&mut c.emsg, cast[u64](bget(p.src, k)));
+    k = k + 1;
+  }
+}
+
+/// Appends the name of node `i`.
+fn cm_name(c: &mut Checker, p: &Parser, i: u64) {
+  let n = node_at(p.nodes, i);
+  cm_src(&mut c, p, n.s, n.e);
+}
+
+/// Appends the second name of node `i` (a variant's, after `Enum::`).
+fn cm_name2(c: &mut Checker, p: &Parser, i: u64) {
+  let n = node_at(p.nodes, i);
+  cm_src(&mut c, p, n.s2, n.e2);
+}
+
+fn cm_num(c: &mut Checker, x: u64) {
+  let mut digs = vec_new[u64]();
+  let mut y = x;
+  vec_push(&mut digs, 48 + y % 10);
+  y = y / 10;
+  while y > 0 {
+    vec_push(&mut digs, 48 + y % 10);
+    y = y / 10;
+  }
+  let mut k = vec_len(digs);
+  while k > 0 {
+    k = k - 1;
+    vec_push(&mut c.emsg, u_at(digs, k));
+  }
+  vec_free(digs);
+}
+
+/// Appends the name of type `t`, as stage0's `Type::name`.
+fn cm_ty(c: &mut Checker, m: &Mono, p: &Parser, t: u64) {
+  let x = ty_at(m, t);
+  let k = x.kind;
+  if k == TY_U64 { cm_s(&mut c, "u64"); }
+  else if k == TY_U8 { cm_s(&mut c, "u8"); }
+  else if k == TY_U16 { cm_s(&mut c, "u16"); }
+  else if k == TY_U32 { cm_s(&mut c, "u32"); }
+  else if k == TY_I8 { cm_s(&mut c, "i8"); }
+  else if k == TY_I16 { cm_s(&mut c, "i16"); }
+  else if k == TY_I32 { cm_s(&mut c, "i32"); }
+  else if k == TY_I64 { cm_s(&mut c, "i64"); }
+  else if k == TY_BOOL { cm_s(&mut c, "bool"); }
+  else if k == TY_UNIT { cm_s(&mut c, "()"); }
+  else if k == TY_STR { cm_s(&mut c, "Str"); }
+  else if k == TY_BUF { cm_s(&mut c, "Buf"); }
+  else if k == TY_BYTES { cm_s(&mut c, "Bytes"); }
+  else if k == TY_HOST { cm_s(&mut c, "Host"); }
+  else if k == TY_CHILD { cm_s(&mut c, "Child"); }
+  else if k == TY_SERIAL { cm_s(&mut c, "Serial"); }
+  else if k == TY_FRAME { cm_s(&mut c, "Frame"); }
+  else if k == TY_PT { cm_s(&mut c, "PageTable"); }
+  else if k == TY_POOL { cm_s(&mut c, "Pool"); }
+  else if k == TY_MMU { cm_s(&mut c, "Mmu"); }
+  else if k == TY_CPU { cm_s(&mut c, "Cpu"); }
+  else if k == TY_PORTS { cm_s(&mut c, "Ports"); }
+  else if k == TY_PORTIO { cm_s(&mut c, "PortIo"); }
+  else if k == TY_MMIOSPACE { cm_s(&mut c, "MmioSpace"); }
+  else if k == TY_MMIO { cm_s(&mut c, "Mmio"); }
+  else if k == TY_DMA { cm_s(&mut c, "Dma"); }
+  else if k == TY_STRUCT || k == TY_ENUM { cm_inst(&mut c, m, p, x.a); }
+  else if k == TY_UNKNOWN { cm_name(&mut c, p, x.a); }
+  else if k == TY_BOX { cm_s(&mut c, "Box["); cm_ty(&mut c, m, p, x.a); cm_s(&mut c, "]"); }
+  else if k == TY_VEC { cm_s(&mut c, "Vec["); cm_ty(&mut c, m, p, x.a); cm_s(&mut c, "]"); }
+  else if k == TY_LOCK { cm_s(&mut c, "Lock["); cm_ty(&mut c, m, p, x.a); cm_s(&mut c, "]"); }
+  else if k == TY_ATOMIC { cm_s(&mut c, "Atomic["); cm_ty(&mut c, m, p, x.a); cm_s(&mut c, "]"); }
+  else if k == TY_REF { cm_s(&mut c, "&"); cm_ty(&mut c, m, p, x.a); }
+  else if k == TY_MUTREF { cm_s(&mut c, "&mut "); cm_ty(&mut c, m, p, x.a); }
+}
+
+/// Appends the name of instance `x`: `Pair[u64, Buf]`, or `Rect`.
+fn cm_inst(c: &mut Checker, m: &Mono, p: &Parser, x: u64) {
+  let xi = inst_at(m, x);
+  cm_name(&mut c, p, xi.def);
+  if xi.n > 0 && xi.args < SRC_MAX {
+    cm_s(&mut c, "[");
+    let mut j = 0;
+    while j < xi.n && j < SRC_MAX
+      invariant j <= SRC_MAX
+    {
+      if j > 0 {
+        cm_s(&mut c, ", ");
+      }
+      cm_ty(&mut c, m, p, targ_at(m, xi.args + j));
+      j = j + 1;
+    }
+    cm_s(&mut c, "]");
+  }
+}
+
+/// ` must be WANT, found GOT`, the end of a type mismatch.
+fn cm_must(c: &mut Checker, m: &Mono, p: &Parser, want: u64, got: u64) {
+  cm_s(&mut c, " must be ");
+  cm_ty(&mut c, m, p, want);
+  cm_s(&mut c, ", found ");
+  cm_ty(&mut c, m, p, got);
+}
+
+/// Appends the text of place `k` (`x.f.g`) to `buf`.
+fn cm_place_to(c: &Checker, p: &Parser, k: u64, buf: &mut Vec[u64]) {
+  let mut chain = vec_new[u64]();
+  let mut q = k;
+  while q != 0 && vec_len(chain) < SRC_MAX {
+    vec_push(&mut chain, q);
+    let x = path_at(c, q);
+    q = x.up;
+  }
+  let mut j = vec_len(chain);
+  while j > 0 {
+    j = j - 1;
+    let x = path_at(c, u_at(chain, j));
+    let mut i = x.s;
+    while i < x.e && i < blen(p.src) {
+      vec_push(&mut buf, cast[u64](bget(p.src, i)));
+      i = i + 1;
+    }
+    if j > 0 {
+      vec_push(&mut buf, 46);
+    }
+  }
+  vec_free(chain);
+}
+
+/// Appends the text of place `k`.
+fn cm_place(c: &mut Checker, p: &Parser, k: u64) {
+  let mut buf = vec_new[u64]();
+  cm_place_to(c, p, k, &mut buf);
+  let mut j = 0;
+  while j < vec_len(buf) {
+    vec_push(&mut c.emsg, vec_get(buf, j));
+    j = j + 1;
+  }
+  vec_free(buf);
+}
+
+/// Does the text of place `a` sort before that of place `b`?
+fn cm_place_lt(c: &Checker, p: &Parser, a: u64, b: u64) -> bool {
+  let mut ta = vec_new[u64]();
+  let mut tb = vec_new[u64]();
+  cm_place_to(c, p, a, &mut ta);
+  cm_place_to(c, p, b, &mut tb);
+  let mut j = 0;
+  let mut r = 0;
+  while r == 0 && j < vec_len(ta) && j < vec_len(tb) {
+    let x = vec_get(ta, j);
+    let y = vec_get(tb, j);
+    if x < y {
+      r = 1;
+    } else if x > y {
+      r = 2;
+    }
+    j = j + 1;
+  }
+  if r == 0 && vec_len(ta) < vec_len(tb) {
+    r = 1;
+  }
+  vec_free(ta);
+  vec_free(tb);
+  return r == 1;
+}
+
+/// Sorts the places in `v` by their text.
+fn cm_sort(c: &Checker, p: &Parser, v: &mut Vec[u64]) {
+  let mut i = 1;
+  while i < vec_len(v) {
+    let mut j = i;
+    while j > 0 && j < vec_len(v) && cm_place_lt(c, p, vec_get(v, j), vec_get(v, j - 1)) {
+      let x = vec_get(v, j);
+      vec_set(&mut v, j, vec_get(v, j - 1));
+      vec_set(&mut v, j - 1, x);
+      j = j - 1;
+    }
+    i = i + 1;
+  }
+}
+
+/// Appends the places in `v`, sorted, joined by "`, `".
+fn cm_places(c: &mut Checker, p: &Parser, v: &Vec[u64]) {
+  let mut w = copy_set(v);
+  cm_sort(c, p, &mut w);
+  let mut j = 0;
+  while j < vec_len(w) {
+    if j > 0 {
+      cm_s(&mut c, "`, `");
+    }
+    cm_place(&mut c, p, vec_get(w, j));
+    j = j + 1;
+  }
+  vec_free(w);
+}
+
+/// "`A` is consumed in only ...": the places in `a` or `b` but not both.
+fn cm_symdiff(c: &mut Checker, p: &Parser, a: &Vec[u64], b: &Vec[u64]) {
+  let mut d = vec_new[u64]();
+  let mut j = 0;
+  while j < vec_len(a) {
+    if !has_id(b, vec_get(a, j)) {
+      add_id(&mut d, vec_get(a, j));
+    }
+    j = j + 1;
+  }
+  j = 0;
+  while j < vec_len(b) {
+    if !has_id(a, vec_get(b, j)) {
+      add_id(&mut d, vec_get(b, j));
+    }
+    j = j + 1;
+  }
+  cm_s(&mut c, "`");
+  cm_places(&mut c, p, d);
+  cm_s(&mut c, "`");
+  vec_free(d);
+}
+
+/// The first, by text, of the moved places strictly inside place `k`, or 0.
+fn cm_desc_first(c: &Checker, p: &Parser, k: u64) -> u64 {
+  let mut best = 0;
+  let mut j = 0;
+  while j < vec_len(c.moved) {
+    let q = vec_get(c.moved, j);
+    if inside(c, q, k) && (best == 0 || cm_place_lt(c, p, q, best)) {
+      best = q;
+    }
+    j = j + 1;
+  }
+  return best;
+}
+
+/// Adds the hint line `  = s`.
+fn cm_note(c: &mut Checker, s: Str) {
+  let msg = c.emsg;
+  c.emsg = vec_new[u64]();
+  cm_s(&mut c, "  = ");
+  cm_s(&mut c, s);
+  cm_s(&mut c, "\n");
+  cm_take_note(&mut c, msg);
+}
+
+/// The sentence written since `msg` was set aside becomes a hint line;
+/// `msg` is the sentence again.
+fn cm_take_note(c: &mut Checker, msg: Vec[u64]) {
+  let line = c.emsg;
+  c.emsg = msg;
+  let mut j = 0;
+  while j < vec_len(line) {
+    vec_push(&mut c.enotes, vec_get(line, j));
+    j = j + 1;
+  }
+  vec_free(line);
+}
+
+/// The hint stage0's `in_copy` adds to an error in instance `x` of a
+/// generic function.
+fn cm_in_copy(c: &mut Checker, m: &Mono, p: &Parser, x: u64) {
+  let xi = inst_at(m, x);
+  if xi.n == 0 {
+    return;
+  }
+  let msg = c.emsg;
+  c.emsg = vec_new[u64]();
+  cm_s(&mut c, "  = in `");
+  cm_inst(&mut c, m, p, x);
+  cm_s(&mut c, "`, the copy of a generic function for these type arguments\n");
+  cm_take_note(&mut c, msg);
+}
+
+/// The hint on a value left owned.
+fn cm_note_consume(c: &mut Checker) {
+  cm_note(&mut c, "every linear value must be consumed exactly once: return it, pass it to a function that takes it by value, or `free` it");
+}
+
+/// The text of operator `op`.
+fn cm_op(c: &mut Checker, op: u64) {
+  if op == P_IMPLIES { cm_s(&mut c, "==>"); }
+  else if op == P_EQEQ { cm_s(&mut c, "=="); }
+  else if op == P_NE { cm_s(&mut c, "!="); }
+  else if op == P_LE { cm_s(&mut c, "<="); }
+  else if op == P_GE { cm_s(&mut c, ">="); }
+  else if op == P_ANDAND { cm_s(&mut c, "&&"); }
+  else if op == P_OROR { cm_s(&mut c, "||"); }
+  else if op == P_PLUS { cm_s(&mut c, "+"); }
+  else if op == P_MINUS { cm_s(&mut c, "-"); }
+  else if op == P_STAR { cm_s(&mut c, "*"); }
+  else if op == P_SLASH { cm_s(&mut c, "/"); }
+  else if op == P_PERCENT { cm_s(&mut c, "%"); }
+  else if op == P_LT { cm_s(&mut c, "<"); }
+  else if op == P_GT { cm_s(&mut c, ">"); }
+  else if op == P_AMP { cm_s(&mut c, "&"); }
+  else if op == P_PIPE { cm_s(&mut c, "|"); }
+  else if op == P_CARET { cm_s(&mut c, "^"); }
+  else if op == P_SHL { cm_s(&mut c, "<<"); }
+  else if op == P_SHR { cm_s(&mut c, ">>"); }
+}
+
+/// Records a type mismatch at `loc` unless `got` is `want`; true when the
+/// caller is to write what must have type `want`, then `cm_must`.
+fn cm_mismatch(c: &mut Checker, p: &Parser, got: u64, want: u64, loc: u64) -> bool {
+  return got != want && cm_new(&mut c, p, loc, C_TYPE);
+}
+
+/// `WHAT must be WANT, found GOT` unless `got` is `want`.
+fn expect_ty(c: &mut Checker, m: &Mono, p: &Parser, got: u64, want: u64, loc: u64, what: Str) {
+  if cm_mismatch(&mut c, p, got, want, loc) {
+    cm_s(&mut c, what);
+    cm_must(&mut c, m, p, want, got);
+  }
+}
+
+/// `E::V` for variant `v` (node `i`'s second name) of enum instance `x`.
+fn cm_variant(c: &mut Checker, m: &Mono, p: &Parser, x: u64, i: u64) {
+  cm_inst(&mut c, m, p, x);
+  cm_s(&mut c, "::");
+  cm_name2(&mut c, p, i);
 }
 
 // ---- Names ----
@@ -888,7 +1232,11 @@ fn path_type(c: &mut Checker, m: &Mono, p: &Parser, k: u64, loc: u64) -> u64 {
   if x.up == 0 {
     let v = find_var(c, p, x.s, x.e);
     if v == 0 {
-      cfail(&mut c, p, loc, C_TYPE);          // unknown variable
+      if cm_new(&mut c, p, loc, C_TYPE) {
+        cm_s(&mut c, "unknown variable `");
+        cm_src(&mut c, p, x.s, x.e);
+        cm_s(&mut c, "`");
+      }
       return 0;
     }
     let vr = var_at(c, v - 1);
@@ -911,7 +1259,15 @@ fn path_type(c: &mut Checker, m: &Mono, p: &Parser, k: u64, loc: u64) -> u64 {
       return fld_ty(c, y, j - 1);
     }
   }
-  cfail(&mut c, p, loc, C_TYPE);              // no such field
+  if cm_new(&mut c, p, loc, C_TYPE) {
+    cm_s(&mut c, "`");
+    cm_place(&mut c, p, x.up);
+    cm_s(&mut c, "` (");
+    cm_ty(&mut c, m, p, u);
+    cm_s(&mut c, ") has no field `");
+    cm_src(&mut c, p, x.s, x.e);
+    cm_s(&mut c, "`");
+  }
   return 0;
 }
 
@@ -922,17 +1278,38 @@ fn use_place(c: &mut Checker, m: &Mono, p: &Parser, k: u64, loc: u64) -> u64 {
     return 0;
   }
   let vr = root_var(c, p, k);
-  if prefix_moved(c, k) != 0 {
-    cfail(&mut c, p, loc, C_USE);             // used after it was consumed
+  let pm = prefix_moved(c, k);
+  if pm != 0 {
+    if cm_new(&mut c, p, loc, C_USE) {
+      cm_s(&mut c, "`");
+      cm_place(&mut c, p, k);
+      if pm == k {
+        cm_s(&mut c, "` is used after it was consumed");
+      } else {
+        cm_s(&mut c, "` is used after `");
+        cm_place(&mut c, p, pm);
+        cm_s(&mut c, "` was consumed");
+      }
+    }
     return 0;
   }
   if ck_linear(c, m, p, t) {
     if kind_t(m, vr.vty) == TY_REF {
-      cfail(&mut c, p, loc, C_USE);           // a move out of a shared borrow
+      if cm_new(&mut c, p, loc, C_USE) {
+        cm_s(&mut c, "cannot move out of the shared borrow `");
+        cm_place(&mut c, p, vr.path);
+        cm_s(&mut c, "`");
+      }
       return 0;
     }
     if desc_moved(c, k) {
-      cfail(&mut c, p, loc, C_USE);           // a field of it was moved out
+      if cm_new(&mut c, p, loc, C_USE) {
+        cm_s(&mut c, "`");
+        cm_place(&mut c, p, k);
+        cm_s(&mut c, "` is used after its field `");
+        cm_place(&mut c, p, cm_desc_first(c, p, k));
+        cm_s(&mut c, "` was moved out");
+      }
       return 0;
     }
     mark(&mut c, k);
@@ -1007,37 +1384,69 @@ fn own_state(c: &mut Checker, m: &Mono, p: &Parser) -> Vec[u64] {
 }
 
 /// No owned linear value may be left at `loc`, and every `&mut`
-/// parameter must hold a value again.
-fn leak_check_all(c: &mut Checker, m: &Mono, p: &Parser, loc: u64) {
+/// parameter must hold a value again. `when` says where `loc` is, for the
+/// message.
+fn leak_check_all(c: &mut Checker, m: &Mono, p: &Parser, loc: u64, when: Str) {
+  let mut live = vec_new[u64]();
   let mut j = 0;
   while j < vec_len(c.vars) {
     let vr = var_at(c, j);
     if ck_linear(c, m, p, vr.vty) && !consumed(&mut c, m, p, vr.path, vr.vty) {
-      cfail(&mut c, p, loc, C_LEAK);
-      return;
+      vec_push(&mut live, vr.path);
     }
     j = j + 1;
+  }
+  if vec_len(live) > 0 {
+    if cm_new(&mut c, p, loc, C_LEAK) {
+      cm_s(&mut c, "`");
+      cm_places(&mut c, p, live);
+      cm_s(&mut c, "` is still owned ");
+      cm_s(&mut c, when);
+      cm_note_consume(&mut c);
+    }
+    vec_free(live);
+    return;
   }
   j = 0;
   while j < vec_len(c.vars) {
     let vr = var_at(c, j);
     if kind_t(m, vr.vty) == TY_MUTREF && (prefix_moved(c, vr.path) != 0 || desc_moved(c, vr.path)) {
-      cfail(&mut c, p, loc, C_USE);
-      return;
+      vec_push(&mut live, vr.path);
     }
     j = j + 1;
   }
+  if vec_len(live) > 0 && cm_new(&mut c, p, loc, C_USE) {
+    cm_s(&mut c, "the borrowed `");
+    cm_places(&mut c, p, live);
+    cm_s(&mut c, "` must hold a value again ");
+    cm_s(&mut c, when);
+    cm_note(&mut c, "a `&mut` parameter can be moved out of, but the caller gets it back, so assign it a new value before returning");
+  }
+  vec_free(live);
 }
 
-/// Is a variable declared from index `start` on still owning a value?
-fn scope_leaks(c: &mut Checker, m: &Mono, p: &Parser, start: u64) -> bool {
+/// The first variable declared from index `start` on that still owns a
+/// value: its place, or 0.
+fn scope_leaks(c: &mut Checker, m: &Mono, p: &Parser, start: u64) -> u64 {
   let mut j = start;
   while j < vec_len(c.vars) {
     let vr = var_at(c, j);
     if ck_linear(c, m, p, vr.vty) && !consumed(&mut c, m, p, vr.path, vr.vty) {
-      return true;
+      return vr.path;
     }
     j = j + 1;
+  }
+  return 0;
+}
+
+/// "`x` goes out of scope while still owned", for place `k`, at `loc`;
+/// true when it is the first error.
+fn cm_scope_leak(c: &mut Checker, p: &Parser, loc: u64, k: u64) -> bool {
+  if cm_new(&mut c, p, loc, C_LEAK) {
+    cm_s(&mut c, "`");
+    cm_place(&mut c, p, k);
+    cm_s(&mut c, "` goes out of scope while still owned");
+    return true;
   }
   return false;
 }
@@ -1057,24 +1466,66 @@ fn pop_scope(c: &mut Checker, start: u64) {
 
 fn declare(c: &mut Checker, p: &Parser, s: u64, e: u64, t: u64, mutable: bool, loc: u64) {
   if is_spec_word(p, s, e) {
-    cfail(&mut c, p, loc, C_TYPE);            // reserved for specifications
+    if cm_new(&mut c, p, loc, C_TYPE) {
+      cm_s(&mut c, "`");
+      cm_src(&mut c, p, s, e);
+      cm_s(&mut c, "` is reserved for specifications");
+    }
     return;
   }
   // A name may be reused once its earlier binding's scope has ended, but
   // never shadow one still in scope.
   if find_var(c, p, s, e) != 0 || sigs_has(c, p, s, e) || ghost_index(c, p, s, e) != 0 || find_spec(c, p, s, e) != 0 {
-    cfail(&mut c, p, loc, C_TYPE);
+    cm_shadow(&mut c, p, loc, s, e);
     return;
   }
   let k = ck_path(&mut c, p, 0, s, e);
   vec_push(&mut c.vars, Var { s: s, e: e, path: k, vty: t, mutable: mutable });
 }
 
+/// "`x` is already defined (shadowing is not allowed)" at `loc`.
+fn cm_shadow(c: &mut Checker, p: &Parser, loc: u64, s: u64, e: u64) {
+  if cm_new(&mut c, p, loc, C_TYPE) {
+    cm_s(&mut c, "`");
+    cm_src(&mut c, p, s, e);
+    cm_s(&mut c, "` is already defined (shadowing is not allowed)");
+  }
+}
+
+/// "`x` is not mutable (declare it with `mut`)" at `loc`, for variable place `k`.
+fn cm_not_mut(c: &mut Checker, p: &Parser, loc: u64, k: u64) {
+  if cm_new(&mut c, p, loc, C_TYPE) {
+    cm_s(&mut c, "`");
+    cm_place(&mut c, p, k);
+    cm_s(&mut c, "` is not mutable (declare it with `mut`)");
+  }
+}
+
+/// "`p` is used after `m` was consumed" at `loc`.
+fn cm_used_after(c: &mut Checker, p: &Parser, loc: u64, k: u64, pm: u64) {
+  if cm_new(&mut c, p, loc, C_USE) {
+    cm_s(&mut c, "`");
+    cm_place(&mut c, p, k);
+    cm_s(&mut c, "` is used after `");
+    cm_place(&mut c, p, pm);
+    cm_s(&mut c, "` was consumed");
+  }
+}
+
+/// "unknown type `T`" at `loc`.
+fn cm_unknown_type(c: &mut Checker, m: &Mono, p: &Parser, loc: u64, t: u64) {
+  if cm_new(&mut c, p, loc, C_TYPE) {
+    cm_s(&mut c, "unknown type `");
+    cm_ty(&mut c, m, p, t);
+    cm_s(&mut c, "`");
+  }
+}
+
 /// A type written in the program must name a known type.
 fn known_type(c: &mut Checker, m: &Mono, p: &Parser, t: u64, loc: u64) {
   let k = kind_t(m, t);
   if k == TY_UNKNOWN {
-    cfail(&mut c, p, loc, C_TYPE);
+    cm_unknown_type(&mut c, m, p, loc, t);
   } else if k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_ATOMIC || k == TY_REF || k == TY_MUTREF {
     known_type(&mut c, m, p, inner_t(m, t), loc);
   }
@@ -1104,7 +1555,11 @@ fn check_structs(c: &mut Checker, m: &Mono, p: &Parser) {
     let xi = inst_at(m, x);
     let d = node_at(p.nodes, xi.def);
     if xi.n == 0 && is_reserved_type(p, d.s, d.e) {
-      cfail(&mut c, p, xi.def, C_TYPE);       // already defined
+      if cm_new(&mut c, p, xi.def, C_TYPE) {
+        cm_s(&mut c, "type `");
+        cm_inst(&mut c, m, p, x);
+        cm_s(&mut c, "` is already defined");
+      }
       return;
     }
     let n = list_len(p, d.a);
@@ -1115,7 +1570,7 @@ fn check_structs(c: &mut Checker, m: &Mono, p: &Parser) {
         u = inner_t(m, u);
       }
       if u != 0 && kind_t(m, u) == TY_UNKNOWN {
-        cfail(&mut c, p, xi.def, C_TYPE);     // unknown type
+        cm_unknown_type(&mut c, m, p, xi.def, u);
         return;
       }
       j = j + 1;
@@ -1130,7 +1585,12 @@ fn check_structs(c: &mut Checker, m: &Mono, p: &Parser) {
     vec_free(seen);
     if r {
       let xi = inst_at(m, x);
-      cfail(&mut c, p, xi.def, C_TYPE);       // contains itself
+      if cm_new(&mut c, p, xi.def, C_TYPE) {
+        cm_s(&mut c, "type `");
+        cm_inst(&mut c, m, p, x);
+        cm_s(&mut c, "` contains itself");
+        cm_note(&mut c, "a value cannot hold itself; put the recursive part in a `Box[..]`");
+      }
     }
     k = k + 1;
   }
@@ -1213,11 +1673,21 @@ fn signatures(c: &mut Checker, m: &mut Mono, p: &Parser) {
       return;
     }
     if xi.n == 0 && (is_builtin_name(c, p, d.s, d.e) || ghost_index(c, p, d.s, d.e) != 0 || span_is(p, d.s, d.e, "old")) {
-      cfail(&mut c, p, xi.def, C_TYPE);       // a builtin redefined
+      if cm_new(&mut c, p, xi.def, C_TYPE) {
+        cm_s(&mut c, "`");
+        cm_name(&mut c, p, xi.def);
+        cm_s(&mut c, "` is a builtin and cannot be redefined");
+      }
     } else if xi.n == 0 && any_spec(p, d.s, d.e) {
-      cfail(&mut c, p, xi.def, C_TYPE);       // defined twice
+      if cm_new(&mut c, p, xi.def, C_TYPE) {
+        cm_s(&mut c, "function `");
+        cm_name(&mut c, p, xi.def);
+        cm_s(&mut c, "` is defined twice");
+      }
     } else if ck_ref(m, r) {
-      cfail(&mut c, p, xi.def, C_TYPE);       // returns a borrow
+      if cm_new(&mut c, p, xi.def, C_TYPE) {
+        cm_s(&mut c, "a function cannot return a borrow");
+      }
     }
     k = k + 1;
   }
@@ -1239,8 +1709,8 @@ fn signatures(c: &mut Checker, m: &mut Mono, p: &Parser) {
     k = k + 1;
   }
   if main_x == 0 {
-    if !any_export(m, p) {
-      cfail(&mut c, p, 0, C_TYPE);            // no `main` (only a library may lack one)
+    if !any_export(m, p) && cm_new(&mut c, p, 0, C_TYPE) {
+      cm_s(&mut c, "no `main` function");     // only a library may lack one
     }
     return;
   }
@@ -1332,19 +1802,30 @@ fn check_export(c: &mut Checker, m: &mut Mono, p: &Parser, x: u64) {
   let xi = inst_at(m, x);
   let d = node_at(p.nodes, xi.def);
   if c.target != TARGET_HOSTED {
-    cfail(&mut c, p, xi.def, C_EXPORT);       // hosted only
+    if cm_new(&mut c, p, xi.def, C_EXPORT) {
+      cm_s(&mut c, "`export fn` is only supported on the hosted target");
+    }
     return;
   }
   if name_is(p, xi.def, "main") {
-    cfail(&mut c, p, xi.def, C_EXPORT);       // `main` cannot be exported
+    if cm_new(&mut c, p, xi.def, C_EXPORT) {
+      cm_s(&mut c, "`main` cannot be exported");
+    }
     return;
   }
   if d.s <= d.e && d.e <= blen(p.src) && d.e - d.s >= 4 && spells(p.src, d.s, d.s + 4, "bst_") {
-    cfail(&mut c, p, xi.def, C_EXPORT);       // reserved for the runtime
+    if cm_new(&mut c, p, xi.def, C_EXPORT) {
+      cm_s(&mut c, "names starting with `bst_` are reserved for the runtime");
+    }
     return;
   }
   if d.c != 0 {
-    cfail(&mut c, p, d.c, C_EXPORT);          // a precondition C cannot be proved to meet
+    if cm_new(&mut c, p, d.c, C_EXPORT) {
+      cm_s(&mut c, "`");
+      cm_name(&mut c, p, xi.def);
+      cm_s(&mut c, "` is exported, so it cannot have a precondition");
+      cm_note(&mut c, "a C caller cannot be proved to meet it; check the condition in the function and return an error instead");
+    }
     return;
   }
   let mut q = d.a;
@@ -1352,13 +1833,22 @@ fn check_export(c: &mut Checker, m: &mut Mono, p: &Parser, x: u64) {
     let qn = node_at(p.nodes, q);
     let t = conv(&mut m, p, qn.a, x, q);
     if !c_param_t(m, t) {
-      cfail(&mut c, p, q, C_EXPORT);          // C cannot pass this type
+      if cm_new(&mut c, p, q, C_EXPORT) {
+        cm_s(&mut c, "a parameter of an exported function cannot have type `");
+        cm_ty(&mut c, m, p, t);
+        cm_s(&mut c, "`");
+        cm_note(&mut c, "C can pass integers, `bool`, and `&Bytes` or `&mut Bytes` (a pointer and a length)");
+      }
     } else if kind_t(m, base_t(m, t)) == TY_BYTES {
       let mut r = d.a;
       while r != 0 && !c.failed {
         let rn = node_at(p.nodes, r);
-        if len_name_of(p, qn, rn) {
-          cfail(&mut c, p, q, C_EXPORT);      // its C length parameter's name is taken
+        if len_name_of(p, qn, rn) && cm_new(&mut c, p, q, C_EXPORT) {
+          cm_s(&mut c, "the C length parameter of `");
+          cm_name(&mut c, p, q);
+          cm_s(&mut c, "` would be named `");
+          cm_name(&mut c, p, q);
+          cm_s(&mut c, "_len`, like another parameter");
         }
         r = rn.next;
       }
@@ -1369,8 +1859,11 @@ fn check_export(c: &mut Checker, m: &mut Mono, p: &Parser, x: u64) {
     return;
   }
   let r = conv(&mut m, p, d.b, x, xi.def);
-  if !c_return_t(c, m, p, r) {
-    cfail(&mut c, p, xi.def, C_EXPORT);       // C cannot receive this type
+  if !c_return_t(c, m, p, r) && cm_new(&mut c, p, xi.def, C_EXPORT) {
+    cm_s(&mut c, "an exported function cannot return `");
+    cm_ty(&mut c, m, p, r);
+    cm_s(&mut c, "`");
+    cm_note(&mut c, "C can receive integers, `bool`, `Bytes`, and structs and enums made only of those");
   }
 }
 
@@ -1401,9 +1894,22 @@ fn check_main(c: &mut Checker, m: &mut Mono, p: &Parser, x: u64) {
   }
   vec_free(seen);
   if !(legacy && c.target != TARGET_USER) && !caps_ok {
-    cfail(&mut c, p, xi.def, C_TYPE);         // the wrong capabilities
+    if cm_new(&mut c, p, xi.def, C_TYPE) {
+      cm_s(&mut c, "on this target `main` must take some of ");
+      if c.target == TARGET_USER {
+        cm_s(&mut c, "&mut Serial");
+      } else if c.target == TARGET_KERNEL {
+        cm_s(&mut c, "&mut Serial, &mut Pool, &mut Mmu, &mut Cpu, &mut Ports, &mut MmioSpace");
+      } else {
+        cm_s(&mut c, "&mut Serial, &mut Pool, &mut Host, &mut Ports, &mut MmioSpace");
+      }
+      cm_s(&mut c, " (each at most once) and return u64 or nothing");
+      cm_note(&mut c, "`fn main() -> u64` and, outside user programs, `fn main(con: Serial) -> Serial` are also accepted");
+    }
   } else if c.target == TARGET_USER && kind_t(m, r) != TY_U64 {
-    cfail(&mut c, p, xi.def, C_TYPE);         // a user program returns its exit code
+    if cm_new(&mut c, p, xi.def, C_TYPE) {
+      cm_s(&mut c, "a user program's `main` returns its exit code (u64)");
+    }
   }
 }
 
@@ -1446,7 +1952,7 @@ fn check_program(c: &mut Checker, m: &mut Mono, p: &Parser) {
     j = j + 1;
   }
   if !c.failed {
-    lock_order(&mut c, p);
+    lock_order(&mut c, m, p);
   }
 }
 
@@ -1517,7 +2023,7 @@ fn has_u(v: &Vec[u64], x: u64) -> bool {
 /// lock's class is the type of its contents; while `locked(l, f)` holds a
 /// lock of class C, `f` and everything it calls may take only locks of other
 /// classes, and the classes form no cycle.
-fn lock_order(c: &mut Checker, p: &Parser) {
+fn lock_order(c: &mut Checker, m: &Mono, p: &Parser) {
   // takes: instance -> a class it may take, itself or through its callees.
   let mut takes = vec_new[Edge]();
   let mut j = 0;
@@ -1564,9 +2070,29 @@ fn lock_order(c: &mut Checker, p: &Parser) {
     let mut k = 0;
     while k < vec_len(takes) && !c.failed {
       let t = vec_get(takes, k);
-      if t.from == s.f && class_reaches(order, t.to, s.cls) {
+      if t.from == s.f && class_reaches(order, t.to, s.cls) && cm_new(&mut c, p, s.node, C_LOCK_ORDER) {
         // The same class again, or a class taken elsewhere before this one.
-        cfail(&mut c, p, s.node, C_LOCK_ORDER);
+        cm_s(&mut c, "`");
+        cm_inst(&mut c, m, p, s.f);
+        cm_s(&mut c, "` may take a lock of class ");
+        if t.to == s.cls {
+          cm_ty(&mut c, m, p, s.cls);
+          cm_s(&mut c, " while this one, also of class ");
+          cm_ty(&mut c, m, p, s.cls);
+          cm_s(&mut c, ", is held");
+          cm_note(&mut c, "a processor spins forever on a lock it already holds; two locks with the same contents type cannot be nested. Give them different contents types to order them");
+        } else {
+          cm_ty(&mut c, m, p, t.to);
+          cm_s(&mut c, " while this lock of class ");
+          cm_ty(&mut c, m, p, s.cls);
+          cm_s(&mut c, " is held, but elsewhere ");
+          cm_ty(&mut c, m, p, t.to);
+          cm_s(&mut c, " is held while ");
+          cm_ty(&mut c, m, p, s.cls);
+          cm_s(&mut c, " is taken");
+          cm_note(&mut c, "two processors taking them in opposite orders can wait for each other forever; take locks of these classes in one order everywhere");
+        }
+        cm_in_copy(&mut c, m, p, s.x);
       }
       k = k + 1;
     }
@@ -1579,12 +2105,18 @@ fn lock_order(c: &mut Checker, p: &Parser) {
 fn check_spec_fn(c: &mut Checker, m: &mut Mono, p: &Parser, k: u64) {
   let sn = node_at(p.nodes, k);
   if sigs_has(c, p, sn.s, sn.e) || ghost_index(c, p, sn.s, sn.e) != 0 || find_spec(c, p, sn.s, sn.e) != 0 {
-    cfail(&mut c, p, k, C_TYPE);              // already defined
+    if cm_new(&mut c, p, k, C_TYPE) {
+      cm_s(&mut c, "`");
+      cm_name(&mut c, p, k);
+      cm_s(&mut c, "` is already defined");
+    }
     return;
   }
   let r = conv(&mut m, p, sn.b, 0, k);
   if r != c.tbool && r != c.tu64 {
-    cfail(&mut c, p, k, C_TYPE);              // returns bool or u64
+    if cm_new(&mut c, p, k, C_TYPE) {
+      cm_s(&mut c, "a spec fn returns bool or u64");
+    }
     return;
   }
   reset(&mut c, c.tunit, 0);
@@ -1593,8 +2125,8 @@ fn check_spec_fn(c: &mut Checker, m: &mut Mono, p: &Parser, k: u64) {
     let qn = node_at(p.nodes, q);
     let t = conv(&mut m, p, qn.a, 0, q);
     known_type(&mut c, m, p, t, q);
-    if !c.failed && (ck_linear(c, m, p, t) || kind_t(m, t) == TY_MUTREF) {
-      cfail(&mut c, p, q, C_TYPE);            // values or shared borrows only
+    if !c.failed && (ck_linear(c, m, p, t) || kind_t(m, t) == TY_MUTREF) && cm_new(&mut c, p, q, C_TYPE) {
+      cm_s(&mut c, "spec fn parameters are values (`u64`, `bool`) or shared borrows (`&T`)");
     }
     declare(&mut c, p, qn.s, qn.e, t, false, q);
     q = qn.next;
@@ -1603,8 +2135,11 @@ fn check_spec_fn(c: &mut Checker, m: &mut Mono, p: &Parser, k: u64) {
     return;
   }
   let t = ck_spec(&mut c, &mut m, p, sn.c, false);
-  if !c.failed {
-    expect_ty(&mut c, p, t, r, sn.c);
+  if !c.failed && cm_mismatch(&mut c, p, t, r, sn.c) {
+    cm_s(&mut c, "the body of spec fn `");
+    cm_name(&mut c, p, k);
+    cm_s(&mut c, "`");
+    cm_must(&mut c, m, p, r, t);
   }
 }
 
@@ -1629,13 +2164,21 @@ fn check_struct_invariants(c: &mut Checker, m: &mut Mono, p: &Parser, x: u64) {
   while e != 0 && !c.failed {
     let t = ck_spec(&mut c, &mut m, p, e, false);
     if !c.failed {
-      expect_ty(&mut c, p, t, c.tbool, e);    // a struct invariant is a bool
+      expect_ty(&mut c, m, p, t, c.tbool, e, "a struct invariant");
     }
     e = next_of(p, e);
   }
 }
 
 fn check_fn(c: &mut Checker, m: &mut Mono, p: &Parser, x: u64) {
+  check_fn_body(&mut c, &mut m, p, x);
+  if c.failed {
+    // Only reached when the error was found in this function.
+    cm_in_copy(&mut c, m, p, x);
+  }
+}
+
+fn check_fn_body(c: &mut Checker, m: &mut Mono, p: &Parser, x: u64) {
   let xi = inst_at(m, x);
   let d = node_at(p.nodes, xi.def);
   let r = conv(&mut m, p, d.b, x, xi.def);
@@ -1644,8 +2187,8 @@ fn check_fn(c: &mut Checker, m: &mut Mono, p: &Parser, x: u64) {
   while q != 0 && !c.failed {
     let qn = node_at(p.nodes, q);
     let t = conv(&mut m, p, qn.a, x, q);
-    if ck_ref(m, t) && qn.v == 1 {
-      cfail(&mut c, p, q, C_TYPE);            // a borrow cannot be `mut`
+    if ck_ref(m, t) && qn.v == 1 && cm_new(&mut c, p, q, C_TYPE) {
+      cm_s(&mut c, "a borrow cannot be `mut` (a `&mut` parameter is already assignable)");
     }
     declare(&mut c, p, qn.s, qn.e, t, qn.v == 1 || kind_t(m, t) == TY_MUTREF, q);
     q = qn.next;
@@ -1654,7 +2197,7 @@ fn check_fn(c: &mut Checker, m: &mut Mono, p: &Parser, x: u64) {
   while e != 0 && !c.failed {
     let t = ck_spec(&mut c, &mut m, p, e, false);
     if !c.failed {
-      expect_ty(&mut c, p, t, c.tbool, e);
+      expect_ty(&mut c, m, p, t, c.tbool, e, "a `requires` clause");
     }
     e = next_of(p, e);
   }
@@ -1662,7 +2205,7 @@ fn check_fn(c: &mut Checker, m: &mut Mono, p: &Parser, x: u64) {
   while e != 0 && !c.failed {
     let t = ck_spec(&mut c, &mut m, p, e, true);
     if !c.failed {
-      expect_ty(&mut c, p, t, c.tbool, e);
+      expect_ty(&mut c, m, p, t, c.tbool, e, "an `ensures` clause");
     }
     e = next_of(p, e);
   }
@@ -1672,9 +2215,14 @@ fn check_fn(c: &mut Checker, m: &mut Mono, p: &Parser, x: u64) {
   let div = ck_block(&mut c, &mut m, p, d.x);
   if !c.failed && !div {
     if kind_t(m, r) != TY_UNIT {
-      cfail(&mut c, p, xi.def, C_TYPE);       // can reach its end without returning
+      if cm_new(&mut c, p, xi.def, C_TYPE) {
+        cm_s(&mut c, "function `");
+        cm_inst(&mut c, m, p, x);
+        cm_s(&mut c, "` can reach its end without returning a ");
+        cm_ty(&mut c, m, p, r);
+      }
     } else {
-      leak_check_all(&mut c, m, p, xi.def);
+      leak_check_all(&mut c, m, p, xi.def, "at the end of the function");
     }
   }
 }
@@ -1689,7 +2237,9 @@ fn ck_block(c: &mut Checker, m: &mut Mono, p: &Parser, head: u64) -> bool {
   let mut last = 0;
   while k != 0 && !c.failed {
     if div {
-      cfail(&mut c, p, k, C_TYPE);            // unreachable statement after `return`
+      if cm_new(&mut c, p, k, C_TYPE) {
+        cm_s(&mut c, "unreachable statement after `return`");
+      }
       return false;
     }
     div = ck_stmt(&mut c, &mut m, p, k);
@@ -1699,8 +2249,11 @@ fn ck_block(c: &mut Checker, m: &mut Mono, p: &Parser, head: u64) -> bool {
   if c.failed {
     return false;
   }
-  if !div && scope_leaks(&mut c, m, p, start) {
-    cfail(&mut c, p, last, C_LEAK);           // goes out of scope while still owned
+  let lk = scope_leaks(&mut c, m, p, start);
+  if !div && lk != 0 {
+    if cm_scope_leak(&mut c, p, last, lk) {
+      cm_note_consume(&mut c);
+    }
     return false;
   }
   pop_scope(&mut c, start);
@@ -1725,18 +2278,23 @@ fn ck_stmt(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> bool {
     }
     if n.a != 0 {
       known_type(&mut c, m, p, want, i);
-      if !c.failed && ck_ref(m, want) {
-        cfail(&mut c, p, i, C_TYPE);          // a local cannot hold a borrow
+      if !c.failed && ck_ref(m, want) && cm_new(&mut c, p, i, C_TYPE) {
+        cm_s(&mut c, "a local cannot hold a borrow");
       }
-      if !c.failed {
-        expect_ty(&mut c, p, t, want, n.b);
+      if !c.failed && cm_mismatch(&mut c, p, t, want, n.b) {
+        cm_s(&mut c, "the initializer of `");
+        cm_name(&mut c, p, i);
+        cm_s(&mut c, "`");
+        cm_must(&mut c, m, p, want, t);
       }
       if c.failed {
         return false;
       }
     }
     if kind_t(m, t) == TY_UNIT {
-      cfail(&mut c, p, n.b, C_TYPE);          // cannot bind ()
+      if cm_new(&mut c, p, n.b, C_TYPE) {
+        cm_s(&mut c, "cannot bind a value of type ()");
+      }
       return false;
     }
     vec_push(&mut m.lets, LetTy { env: c.env, node: i, lty: t });
@@ -1751,24 +2309,39 @@ fn ck_stmt(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> bool {
     }
     let vr = root_var(c, p, pk);
     if !vr.mutable {
-      cfail(&mut c, p, i, C_TYPE);            // not mutable
+      cm_not_mut(&mut c, p, i, vr.path);
       return false;
     }
     let t = ck_expr_as(&mut c, &mut m, p, n.b, want);
-    if !c.failed {
-      expect_ty(&mut c, p, t, want, n.b);
+    if !c.failed && cm_mismatch(&mut c, p, t, want, n.b) {
+      cm_s(&mut c, "the value assigned to `");
+      cm_place(&mut c, p, pk);
+      cm_s(&mut c, "`");
+      cm_must(&mut c, m, p, want, t);
     }
     if c.failed {
       return false;
     }
     let pa = path_at(c, pk);
-    if pa.up != 0 && prefix_moved(c, pa.up) != 0 {
-      cfail(&mut c, p, i, C_USE);             // assigning into a consumed value
+    let pm = prefix_moved(c, pa.up);
+    if pa.up != 0 && pm != 0 {
+      if cm_new(&mut c, p, i, C_USE) {
+        cm_s(&mut c, "cannot assign to `");
+        cm_place(&mut c, p, pk);
+        cm_s(&mut c, "`: `");
+        cm_place(&mut c, p, pm);
+        cm_s(&mut c, "` was consumed");
+      }
       return false;
     }
     if ck_linear(c, m, p, want) {
       if !consumed(&mut c, m, p, pk, want) {
-        cfail(&mut c, p, i, C_LEAK);          // would drop the value it still owns
+        if cm_new(&mut c, p, i, C_LEAK) {
+          cm_s(&mut c, "assigning to `");
+          cm_place(&mut c, p, pk);
+          cm_s(&mut c, "` would drop the value it still owns");
+          cm_note(&mut c, "consume the old value first, e.g. `b = set(b, i, v);` or move the field out before putting a new one in");
+        }
         return false;
       }
       unmove(&mut c, pk);
@@ -1788,10 +2361,10 @@ fn ck_stmt(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> bool {
       t = ck_expr_as(&mut c, &mut m, p, n.a, c.ret);
     }
     if !c.failed {
-      expect_ty(&mut c, p, t, c.ret, i);
+      expect_ty(&mut c, m, p, t, c.ret, i, "the returned value");
     }
     if !c.failed {
-      leak_check_all(&mut c, m, p, i);
+      leak_check_all(&mut c, m, p, i, "at this `return`");
     }
     return true;
   }
@@ -1802,7 +2375,7 @@ fn ck_stmt(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> bool {
   if k == S_ASSERT {
     let t = ck_spec(&mut c, &mut m, p, n.a, false);
     if !c.failed {
-      expect_ty(&mut c, p, t, c.tbool, n.a);
+      expect_ty(&mut c, m, p, t, c.tbool, n.a, "an `assert`");
     }
     return false;
   }
@@ -1811,8 +2384,8 @@ fn ck_stmt(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> bool {
   }
   if k == S_EXPR {
     let t = ck_expr(&mut c, &mut m, p, n.a);
-    if !c.failed && ck_linear(c, m, p, t) {
-      cfail(&mut c, p, i, C_LEAK);            // created and immediately dropped
+    if !c.failed && ck_linear(c, m, p, t) && cm_new(&mut c, p, i, C_LEAK) {
+      cm_s(&mut c, "this linear value is created and immediately dropped");
     }
     return false;
   }
@@ -1825,7 +2398,7 @@ fn ck_if(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> bool {
   let n = node_at(p.nodes, i);
   let t = ck_expr(&mut c, &mut m, p, n.a);
   if !c.failed {
-    expect_ty(&mut c, p, t, c.tbool, n.a);
+    expect_ty(&mut c, m, p, t, c.tbool, n.a, "an `if` condition");
   }
   if c.failed {
     return false;
@@ -1855,8 +2428,9 @@ fn ck_if(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> bool {
   let after_else = copy_set(c.moved);
   set_moved(&mut c, copy_set(after_then));
   let ct = own_state(&mut c, m, p);
-  if !same_set(ct, ce) {
-    cfail(&mut c, p, i, C_BRANCH);            // consumed in only one branch
+  if !same_set(ct, ce) && cm_new(&mut c, p, i, C_BRANCH) {
+    cm_symdiff(&mut c, p, ct, ce);
+    cm_s(&mut c, " is consumed in only one branch of this `if`");
   }
   let mut all = after_then;
   union_into(&mut all, after_else);
@@ -1879,15 +2453,17 @@ fn ck_while(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) {
     return;
   }
   if changed {
-    cfail(&mut c, p, n.a, C_USE);             // the condition runs many times
+    if cm_new(&mut c, p, n.a, C_USE) {
+      cm_s(&mut c, "a `while` condition runs many times, so it cannot consume a linear value");
+    }
     return;
   }
-  expect_ty(&mut c, p, t, c.tbool, n.a);
+  expect_ty(&mut c, m, p, t, c.tbool, n.a, "a `while` condition");
   let mut v = n.b;
   while v != 0 && !c.failed {
     let tv = ck_spec(&mut c, &mut m, p, v, false);
     if !c.failed {
-      expect_ty(&mut c, p, tv, c.tbool, v);
+      expect_ty(&mut c, m, p, tv, c.tbool, v, "a loop invariant");
     }
     v = next_of(p, v);
   }
@@ -1899,13 +2475,58 @@ fn ck_while(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) {
   let d = ck_block(&mut c, &mut m, p, n.c);
   if !c.failed {
     let ca = own_state(&mut c, m, p);
-    if !d && !same_set(ca, cb) {
-      cfail(&mut c, p, i, C_BRANCH);          // the body changes ownership
+    if !d && !same_set(ca, cb) && cm_new(&mut c, p, i, C_BRANCH) {
+      cm_s(&mut c, "the loop body changes the ownership of ");
+      cm_symdiff(&mut c, p, ca, cb);
+      cm_note(&mut c, "a loop body must leave every outer linear value owned exactly as it found it");
     }
     vec_free(ca);
   }
   set_moved(&mut c, before);
   vec_free(cb);
+}
+
+/// "`E` has no variant `V`" at `loc`, for enum instance `x` and the
+/// variant named second in node `i`.
+fn cm_no_variant(c: &mut Checker, m: &Mono, p: &Parser, loc: u64, x: u64, i: u64) {
+  if cm_new(&mut c, p, loc, C_TYPE) {
+    cm_s(&mut c, "`");
+    cm_inst(&mut c, m, p, x);
+    cm_s(&mut c, "` has no variant `");
+    cm_name2(&mut c, p, i);
+    cm_s(&mut c, "`");
+  }
+}
+
+/// The variants of enum instance `x` that no arm of `match` `i` names, as
+/// `E::A`, `E::B`, joined by "`, `".
+fn cm_missing(c: &mut Checker, m: &Mono, p: &Parser, i: u64, x: u64) {
+  let n = node_at(p.nodes, i);
+  let dn = def_node(m, p, x);
+  let mut vk = dn.a;
+  let mut first = true;
+  while vk != 0 {
+    let vn = node_at(p.nodes, vk);
+    let mut hit = false;
+    let mut a = n.b;
+    while a != 0 {
+      let an = node_at(p.nodes, a);
+      if an.v != PAT_WILD && same(p.src, an.s2, an.e2, vn.s, vn.e) {
+        hit = true;
+      }
+      a = an.next;
+    }
+    if !hit {
+      if !first {
+        cm_s(&mut c, "`, `");
+      }
+      cm_inst(&mut c, m, p, x);
+      cm_s(&mut c, "::");
+      cm_name(&mut c, p, vk);
+      first = false;
+    }
+    vk = vn.next;
+  }
 }
 
 /// The k-th set of places stored back to back in `outs`, the j-th ending
@@ -1944,8 +2565,9 @@ fn ck_match(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> bool {
   }
   let mut t = 0;
   if borrowed {
-    if prefix_moved(c, pk) != 0 {
-      cfail(&mut c, p, scrut, C_USE);
+    let pm = prefix_moved(c, pk);
+    if pm != 0 {
+      cm_used_after(&mut c, p, scrut, pk, pm);
       return false;
     }
     t = path_type(&mut c, m, p, pk, scrut);
@@ -1956,7 +2578,10 @@ fn ck_match(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> bool {
     return false;
   }
   if kind_t(m, t) != TY_ENUM {
-    cfail(&mut c, p, scrut, C_TYPE);          // `match` needs an enum
+    if cm_new(&mut c, p, scrut, C_TYPE) {
+      cm_s(&mut c, "`match` needs an enum, found ");
+      cm_ty(&mut c, m, p, t);
+    }
     return false;
   }
   let x = inner_t(m, t);
@@ -1968,37 +2593,70 @@ fn ck_match(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> bool {
   while a != 0 && !c.failed {
     let an = node_at(p.nodes, a);
     if wild {
-      cfail(&mut c, p, a, C_MATCH);           // after `_`, this arm never runs
+      if cm_new(&mut c, p, a, C_MATCH) {
+        cm_s(&mut c, "this arm can never run: `_` above already matches everything left");
+      }
     } else if an.v == PAT_WILD {
       let mut vk = dn.a;
       let mut j = 0;
       while vk != 0 && j < SRC_MAX {
         let pt = fld_ty(c, x, j);
-        if !has_id(covered, j) && owned_linear && pt != 0 && ck_linear(c, m, p, pt) {
-          cfail(&mut c, p, a, C_LEAK);        // `_` would drop a linear payload
+        if !has_id(covered, j) && owned_linear && pt != 0 && ck_linear(c, m, p, pt) && cm_new(&mut c, p, a, C_LEAK) {
+          cm_s(&mut c, "`_` would drop the linear payload of `");
+          cm_inst(&mut c, m, p, x);
+          cm_s(&mut c, "::");
+          cm_name(&mut c, p, vk);
+          cm_s(&mut c, "`");
+          cm_note(&mut c, "match that variant by name and consume its payload");
         }
         vk = next_of(p, vk);
         j = j + 1;
       }
       wild = true;
     } else if !names_enum(m, p, an.s, an.e, x) {
-      cfail(&mut c, p, a, C_TYPE);            // a pattern of another enum
+      if cm_new(&mut c, p, a, C_TYPE) {
+        cm_s(&mut c, "this pattern is a `");
+        cm_name(&mut c, p, a);
+        cm_s(&mut c, "`, but the value matched is a `");
+        cm_inst(&mut c, m, p, x);
+        cm_s(&mut c, "`");
+      }
     } else {
       let j = index_in(p, dn.a, an.s2, an.e2);
       if j == 0 {
-        cfail(&mut c, p, a, C_TYPE);          // no such variant
+        cm_no_variant(&mut c, m, p, a, x, a);
       } else if has_id(covered, j - 1) {
-        cfail(&mut c, p, a, C_MATCH);         // matched twice
+        if cm_new(&mut c, p, a, C_MATCH) {
+          cm_s(&mut c, "`");
+          cm_variant(&mut c, m, p, x, a);
+          cm_s(&mut c, "` is matched twice");
+        }
       } else {
         vec_push(&mut covered, j - 1);
         let pt = fld_ty(c, x, j - 1);
         let bind = an.v != PAT_VARIANT;
         if pt == 0 && bind {
-          cfail(&mut c, p, a, C_TYPE);        // no payload to bind
+          if cm_new(&mut c, p, a, C_TYPE) {
+            cm_s(&mut c, "`");
+            cm_variant(&mut c, m, p, x, a);
+            cm_s(&mut c, "` has no payload");
+          }
         } else if pt != 0 && !bind {
-          cfail(&mut c, p, a, C_TYPE);        // a payload left unbound
+          if cm_new(&mut c, p, a, C_TYPE) {
+            cm_s(&mut c, "`");
+            cm_variant(&mut c, m, p, x, a);
+            cm_s(&mut c, "` has a payload: write `");
+            cm_variant(&mut c, m, p, x, a);
+            cm_s(&mut c, "(x)` or `");
+            cm_variant(&mut c, m, p, x, a);
+            cm_s(&mut c, "(_)`");
+          }
         } else if pt != 0 && name_is(p, an.a, "_") && ck_linear(c, m, p, pt) && owned_linear {
-          cfail(&mut c, p, a, C_LEAK);        // `_` would drop a linear payload
+          if cm_new(&mut c, p, a, C_LEAK) {
+            cm_s(&mut c, "`_` would drop the linear payload of `");
+            cm_variant(&mut c, m, p, x, a);
+            cm_s(&mut c, "`");
+          }
         }
       }
     }
@@ -2010,7 +2668,11 @@ fn ck_match(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> bool {
     return false;
   }
   if !wild && ncovered < list_len(p, dn.a) {
-    cfail(&mut c, p, i, C_MATCH);             // a variant not handled
+    if cm_new(&mut c, p, i, C_MATCH) {
+      cm_s(&mut c, "this `match` does not handle `");
+      cm_missing(&mut c, m, p, i, x);
+      cm_s(&mut c, "`");
+    }
     return false;
   }
   // The arms, each from the same ownership state.
@@ -2033,7 +2695,13 @@ fn ck_match(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> bool {
       // borrow too: it can be read and lent, never moved.
       if borrowed && ck_linear(c, m, p, pt) {
         if an.v == PAT_BIND_MUT {
-          cfail(&mut c, p, a, C_TYPE);        // a borrow cannot be `mut`
+          if cm_new(&mut c, p, a, C_TYPE) {
+            cm_s(&mut c, "`");
+            cm_name(&mut c, p, an.a);
+            cm_s(&mut c, "` borrows from `");
+            cm_place(&mut c, p, pk);
+            cm_s(&mut c, "` and cannot be `mut`");
+          }
         } else {
           let rt = ref_to(&mut m, p, pt);
           declare(&mut c, p, bn.s, bn.e, rt, false, a);
@@ -2044,8 +2712,11 @@ fn ck_match(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> bool {
     }
     if !c.failed {
       let d = ck_block(&mut c, &mut m, p, an.c);
-      if !c.failed && !d && scope_leaks(&mut c, m, p, start) {
-        cfail(&mut c, p, a, C_LEAK);          // the payload is still owned
+      if !c.failed && !d {
+        let lk = scope_leaks(&mut c, m, p, start);
+        if lk != 0 && cm_scope_leak(&mut c, p, a, lk) {
+          cm_note(&mut c, "the payload bound by a pattern is owned by the arm: consume it");
+        }
       }
       if !c.failed {
         pop_scope(&mut c, start);
@@ -2077,8 +2748,9 @@ fn ck_match(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> bool {
     union_into(&mut all, o);
     set_moved(&mut c, o);
     let ck = own_state(&mut c, m, p);
-    if !same_set(ck, c0) {
-      cfail(&mut c, p, i, C_BRANCH);          // consumed in only some arms
+    if !same_set(ck, c0) && cm_new(&mut c, p, i, C_BRANCH) {
+      cm_symdiff(&mut c, p, c0, ck);
+      cm_s(&mut c, " is consumed in only some arms of this `match`");
     }
     vec_free(ck);
     k = k + 1;
@@ -2112,7 +2784,14 @@ fn ck_expr_as(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, want: u64) -> u
       v = x.v;
     }
     if !lit_fits(m, v, neg, want) {
-      cfail(&mut c, p, i, C_TYPE);            // does not fit
+      if cm_new(&mut c, p, i, C_TYPE) {
+        if neg && v != 0 {
+          cm_s(&mut c, "-");
+        }
+        cm_num(&mut c, v);
+        cm_s(&mut c, " does not fit in ");
+        cm_ty(&mut c, m, p, want);
+      }
       return 0;
     }
     return want;
@@ -2150,7 +2829,9 @@ fn ck_named(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64
       if name_is(p, n.b, "vec_new") {
         // `vec_new[T]()`
         if list_len(p, n.a) != 1 || call.a != 0 {
-          cfail(&mut c, p, i, C_TYPE);
+          if cm_new(&mut c, p, i, C_TYPE) {
+            cm_s(&mut c, "write `vec_new[T]()`: one type argument, no arguments");
+          }
           return 0;
         }
         let t = conv(&mut m, p, n.a, c.env, i);
@@ -2162,17 +2843,29 @@ fn ck_named(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64
       }
       // `cast[T](x)` (proved to fit) and `wrap[T](x)` (modular).
       if list_len(p, n.a) != 1 || list_len(p, call.a) != 1 {
-        cfail(&mut c, p, i, C_TYPE);
+        if cm_new(&mut c, p, i, C_TYPE) {
+          cm_s(&mut c, "write `");
+          cm_name(&mut c, p, n.b);
+          cm_s(&mut c, "[T](x)`: one type argument, one argument");
+        }
         return 0;
       }
       let t = conv(&mut m, p, n.a, c.env, i);
       if !is_int(m, t) {
-        cfail(&mut c, p, i, C_TYPE);          // converts to an integer type
+        if cm_new(&mut c, p, i, C_TYPE) {
+          cm_s(&mut c, "`");
+          cm_name(&mut c, p, n.b);
+          cm_s(&mut c, "` converts to an integer type, not ");
+          cm_ty(&mut c, m, p, t);
+        }
         return 0;
       }
       let ta = ck_expr(&mut c, &mut m, p, call.a);
-      if !c.failed && !is_int(m, ta) {
-        cfail(&mut c, p, call.a, C_TYPE);     // converts an integer
+      if !c.failed && !is_int(m, ta) && cm_new(&mut c, p, call.a, C_TYPE) {
+        cm_s(&mut c, "`");
+        cm_name(&mut c, p, n.b);
+        cm_s(&mut c, "` converts an integer, found ");
+        cm_ty(&mut c, m, p, ta);
       }
       if c.failed {
         return 0;
@@ -2197,12 +2890,16 @@ fn ck_named(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64
   if k == E_VAR {
     let v = find_var(c, p, n.s, n.e);
     if v == 0 {
-      cfail(&mut c, p, i, C_TYPE);            // unknown variable
+      cm_unknown_var(&mut c, p, i);
       return 0;
     }
     let vr = var_at(c, v - 1);
     if kind_t(m, vr.vty) == TY_REF && ck_linear(c, m, p, inner_t(m, vr.vty)) {
-      cfail(&mut c, p, i, C_USE);             // a move out of a shared borrow
+      if cm_new(&mut c, p, i, C_USE) {
+        cm_s(&mut c, "cannot move out of the shared borrow `");
+        cm_name(&mut c, p, i);
+        cm_s(&mut c, "`");
+      }
       return 0;
     }
     let pk = ck_path(&mut c, p, 0, n.s, n.e);
@@ -2211,7 +2908,9 @@ fn ck_named(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64
   if k == E_FIELD {
     let pk = place_of(&mut c, p, i);
     if pk == 0 {
-      cfail(&mut c, p, i, C_TYPE);            // a field of something not a place
+      if cm_new(&mut c, p, i, C_TYPE) {
+        cm_s(&mut c, "a field can only be read from a variable or a field of one");
+      }
       return 0;
     }
     return use_place(&mut c, m, p, pk, i);
@@ -2234,7 +2933,7 @@ fn ck_named(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64
       return t;
     }
     if !c.failed {
-      expect_ty(&mut c, p, t, c.tbool, n.a);
+      expect_ty(&mut c, m, p, t, c.tbool, n.a, "the operand of `!`");
     }
     return c.tbool;
   }
@@ -2248,7 +2947,10 @@ fn ck_named(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64
       }
     }
     if !is_signed(m, t) {
-      cfail(&mut c, p, i, C_TYPE);            // unary minus needs a signed integer
+      if cm_new(&mut c, p, i, C_TYPE) {
+        cm_s(&mut c, "unary minus needs a signed integer, found ");
+        cm_ty(&mut c, m, p, t);
+      }
       return 0;
     }
     note_int_op(&mut c, m, i, t);
@@ -2256,7 +2958,9 @@ fn ck_named(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64
   }
   if k == E_BIN {
     if n.v == P_IMPLIES {
-      cfail(&mut c, p, i, C_TYPE);            // `==>` belongs to specifications
+      if cm_new(&mut c, p, i, C_TYPE) {
+        cm_s(&mut c, "`==>` is only allowed in specifications");
+      }
       return 0;
     }
     if n.v == P_SHL || n.v == P_SHR {
@@ -2293,7 +2997,11 @@ fn ck_named(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64
       return 0;
     }
     if (n.v == P_ANDAND || n.v == P_OROR) && changed {
-      cfail(&mut c, p, n.b, C_USE);           // the right side may not run
+      if cm_new(&mut c, p, n.b, C_USE) {
+        cm_s(&mut c, "the right side of `");
+        cm_op(&mut c, n.v);
+        cm_s(&mut c, "` may not run, so it cannot consume a linear value");
+      }
       return 0;
     }
     return bin_type(&mut c, m, p, n.v, ta, tb, i);
@@ -2302,8 +3010,23 @@ fn ck_named(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64
     return ck_call(&mut c, &mut m, p, i, inst);
   }
   // `&mut x` outside a call's arguments, or `forall` in code.
-  cfail(&mut c, p, i, C_TYPE);
+  if cm_new(&mut c, p, i, C_TYPE) {
+    if k == E_MUTBORROW {
+      cm_s(&mut c, "`&mut x` is only allowed as a call argument");
+    } else if k == E_FORALL {
+      cm_s(&mut c, "`forall` is only allowed in specifications");
+    }
+  }
   return 0;
+}
+
+/// "unknown variable `x`" for variable node `i`.
+fn cm_unknown_var(c: &mut Checker, p: &Parser, i: u64) {
+  if cm_new(&mut c, p, i, C_TYPE) {
+    cm_s(&mut c, "unknown variable `");
+    cm_name(&mut c, p, i);
+    cm_s(&mut c, "`");
+  }
 }
 
 fn ck_variant(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 {
@@ -2312,7 +3035,11 @@ fn ck_variant(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u
   if x == 0 {
     let d = find_in(p, p.enums.head, i);
     if d == 0 {
-      cfail(&mut c, p, i, C_TYPE);            // unknown enum
+      if cm_new(&mut c, p, i, C_TYPE) {
+        cm_s(&mut c, "unknown enum `");
+        cm_name(&mut c, p, i);
+        cm_s(&mut c, "`");
+      }
       return 0;
     }
     x = plain_inst(&mut m, d);
@@ -2320,17 +3047,29 @@ fn ck_variant(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u
   let dn = def_node(m, p, x);
   let j = index_in(p, dn.a, n.s2, n.e2);
   if j == 0 {
-    cfail(&mut c, p, i, C_TYPE);              // no such variant
+    cm_no_variant(&mut c, m, p, i, x, i);
     return 0;
   }
   let pt = fld_ty(c, x, j - 1);
   if pt != 0 && n.a != 0 {
     let t = ck_expr_as(&mut c, &mut m, p, n.a, pt);
-    if !c.failed {
-      expect_ty(&mut c, p, t, pt, n.a);
+    if !c.failed && cm_mismatch(&mut c, p, t, pt, n.a) {
+      cm_s(&mut c, "the payload of `");
+      cm_variant(&mut c, m, p, x, i);
+      cm_s(&mut c, "`");
+      cm_must(&mut c, m, p, pt, t);
     }
   } else if pt != 0 || n.a != 0 {
-    cfail(&mut c, p, i, C_TYPE);              // a payload missing or extra
+    if cm_new(&mut c, p, i, C_TYPE) {
+      cm_s(&mut c, "`");
+      cm_variant(&mut c, m, p, x, i);
+      if pt == 0 {
+        cm_s(&mut c, "` has no payload");
+      } else {
+        cm_s(&mut c, "` needs a payload of type ");
+        cm_ty(&mut c, m, p, pt);
+      }
+    }
   }
   if c.failed {
     return 0;
@@ -2344,30 +3083,51 @@ fn ck_is(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
   let pk = place_of(&mut c, p, n.a);
   let mut t = 0;
   if pk != 0 {
-    if prefix_moved(c, pk) != 0 {
-      cfail(&mut c, p, n.a, C_USE);
+    let pm = prefix_moved(c, pk);
+    if pm != 0 {
+      cm_used_after(&mut c, p, n.a, pk, pm);
       return 0;
     }
     t = path_type(&mut c, m, p, pk, n.a);
   } else {
     t = ck_expr(&mut c, &mut m, p, n.a);
-    if !c.failed && ck_linear(c, m, p, t) {
-      cfail(&mut c, p, n.a, C_LEAK);          // the linear operand would be dropped
+    if !c.failed && ck_linear(c, m, p, t) && cm_new(&mut c, p, n.a, C_LEAK) {
+      cm_s(&mut c, "`is` does not consume its operand, so this linear value would be dropped");
     }
   }
   if c.failed {
     return 0;
   }
   if kind_t(m, t) != TY_ENUM || !names_enum(m, p, n.s, n.e, inner_t(m, t)) {
-    cfail(&mut c, p, n.a, C_TYPE);
+    cm_is_needs(&mut c, m, p, n.a, i, t);
     return 0;
   }
   let dn = def_node(m, p, inner_t(m, t));
   if index_in(p, dn.a, n.s2, n.e2) == 0 {
-    cfail(&mut c, p, i, C_TYPE);              // no such variant
+    if cm_new(&mut c, p, i, C_TYPE) {
+      cm_s(&mut c, "`");
+      cm_name(&mut c, p, i);
+      cm_s(&mut c, "` has no variant `");
+      cm_name2(&mut c, p, i);
+      cm_s(&mut c, "`");
+    }
     return 0;
   }
   return c.tbool;
+}
+
+/// "`is E::V` needs a `E`, found T" at `loc`, for `is` node `i`.
+fn cm_is_needs(c: &mut Checker, m: &Mono, p: &Parser, loc: u64, i: u64, t: u64) {
+  if cm_new(&mut c, p, loc, C_TYPE) {
+    cm_s(&mut c, "`is ");
+    cm_name(&mut c, p, i);
+    cm_s(&mut c, "::");
+    cm_name2(&mut c, p, i);
+    cm_s(&mut c, "` needs a `");
+    cm_name(&mut c, p, i);
+    cm_s(&mut c, "`, found ");
+    cm_ty(&mut c, m, p, t);
+  }
 }
 
 fn ck_slit(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 {
@@ -2376,7 +3136,11 @@ fn ck_slit(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
   if x == 0 {
     let d = find_in(p, p.structs.head, i);
     if d == 0 {
-      cfail(&mut c, p, i, C_TYPE);            // unknown struct
+      if cm_new(&mut c, p, i, C_TYPE) {
+        cm_s(&mut c, "unknown struct `");
+        cm_name(&mut c, p, i);
+        cm_s(&mut c, "`");
+      }
       return 0;
     }
     x = plain_inst(&mut m, d);
@@ -2386,7 +3150,13 @@ fn ck_slit(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
   while f != 0 {
     let fd = node_at(p.nodes, f);
     if index_in(p, n.a, fd.s, fd.e) == 0 {
-      cfail(&mut c, p, i, C_TYPE);            // a field missing
+      if cm_new(&mut c, p, i, C_TYPE) {
+        cm_s(&mut c, "field `");
+        cm_name(&mut c, p, f);
+        cm_s(&mut c, "` of `");
+        cm_inst(&mut c, m, p, x);
+        cm_s(&mut c, "` is missing");
+      }
       return 0;
     }
     f = fd.next;
@@ -2396,13 +3166,22 @@ fn ck_slit(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
     let qn = node_at(p.nodes, q);
     let j = index_in(p, dn.a, qn.s, qn.e);
     if j == 0 {
-      cfail(&mut c, p, qn.a, C_TYPE);         // no such field
+      if cm_new(&mut c, p, qn.a, C_TYPE) {
+        cm_s(&mut c, "`");
+        cm_inst(&mut c, m, p, x);
+        cm_s(&mut c, "` has no field `");
+        cm_name(&mut c, p, q);
+        cm_s(&mut c, "`");
+      }
       return 0;
     }
     let ft = fld_ty(c, x, j - 1);
     let t = ck_expr_as(&mut c, &mut m, p, qn.a, ft);
-    if !c.failed {
-      expect_ty(&mut c, p, t, ft, qn.a);
+    if !c.failed && cm_mismatch(&mut c, p, t, ft, qn.a) {
+      cm_s(&mut c, "field `");
+      cm_name(&mut c, p, q);
+      cm_s(&mut c, "`");
+      cm_must(&mut c, m, p, ft, t);
     }
     q = qn.next;
   }
@@ -2433,9 +3212,7 @@ fn bin_type(c: &mut Checker, m: &Mono, p: &Parser, op: u64, a: u64, b: u64, loc:
     if is_int(m, a) {
       want = a;
     }
-    if a != want || b != want {
-      cfail(&mut c, p, loc, C_TYPE);
-    }
+    cm_operands(&mut c, m, p, op, a, b, want, loc);
     if order {
       return c.tbool;
     }
@@ -2444,21 +3221,48 @@ fn bin_type(c: &mut Checker, m: &Mono, p: &Parser, op: u64, a: u64, b: u64, loc:
   if is_bitwise(op) {
     // Unsigned integers, of one type except a shift amount.
     let shift = op == P_SHL || op == P_SHR;
-    if !is_int(m, a) || is_signed(m, a) || !is_int(m, b) || is_signed(m, b) || (a != b && !shift) {
-      cfail(&mut c, p, loc, C_TYPE);
+    if (!is_int(m, a) || is_signed(m, a) || !is_int(m, b) || is_signed(m, b) || (a != b && !shift)) && cm_new(&mut c, p, loc, C_TYPE) {
+      cm_s(&mut c, "`");
+      cm_op(&mut c, op);
+      cm_s(&mut c, "` needs unsigned integers");
+      if !shift {
+        cm_s(&mut c, " of one type");
+      }
+      cm_s(&mut c, ", found ");
+      cm_ty(&mut c, m, p, a);
+      cm_s(&mut c, " and ");
+      cm_ty(&mut c, m, p, b);
     }
     return a;
   }
   if op == P_EQEQ || op == P_NE {
-    if a != b || !(is_int(m, a) || a == c.tbool) {
-      cfail(&mut c, p, loc, C_TYPE);          // only integers and bool compare
+    if (a != b || !(is_int(m, a) || a == c.tbool)) && cm_new(&mut c, p, loc, C_TYPE) {
+      // Only integers and bool compare.
+      cm_s(&mut c, "cannot compare ");
+      cm_ty(&mut c, m, p, a);
+      cm_s(&mut c, " with ");
+      cm_ty(&mut c, m, p, b);
     }
     return c.tbool;
   }
-  if a != c.tbool || b != c.tbool {
-    cfail(&mut c, p, loc, C_TYPE);
-  }
+  cm_operands(&mut c, m, p, op, a, b, c.tbool, loc);
   return c.tbool;
+}
+
+/// Both operands of `op` (types `a` and `b`) must have type `want`.
+fn cm_operands(c: &mut Checker, m: &Mono, p: &Parser, op: u64, a: u64, b: u64, want: u64, loc: u64) {
+  if cm_mismatch(&mut c, p, a, want, loc) {
+    cm_s(&mut c, "the left operand of `");
+    cm_op(&mut c, op);
+    cm_s(&mut c, "`");
+    cm_must(&mut c, m, p, want, a);
+  }
+  if cm_mismatch(&mut c, p, b, want, loc) {
+    cm_s(&mut c, "the right operand of `");
+    cm_op(&mut c, op);
+    cm_s(&mut c, "`");
+    cm_must(&mut c, m, p, want, b);
+  }
 }
 
 /// The parameter types of function `d` read in instance `x`.
@@ -2491,7 +3295,7 @@ fn user_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, x: u64) -> u64 {
   let dn = node_at(p.nodes, xi.def);
   let r = conv(&mut m, p, dn.b, x, xi.def);
   let call = node_at(p.nodes, i);
-  let t = call_with(&mut c, &mut m, p, ps, r, call.a, i, false);
+  let t = call_with(&mut c, &mut m, p, ps, r, call.a, i, x);
   vec_free(ps);
   return t;
 }
@@ -2504,7 +3308,11 @@ fn ck_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
   let s = n.s;
   let e = n.e;
   if is_spec_word(p, s, e) || (ghost_index(c, p, s, e) != 0 && bs_index(c, p, s, e) == 0) || find_spec(c, p, s, e) != 0 {
-    cfail(&mut c, p, i, C_TYPE);              // only allowed in specifications
+    if cm_new(&mut c, p, i, C_TYPE) {
+      cm_s(&mut c, "`");
+      cm_name(&mut c, p, i);
+      cm_s(&mut c, "` is only allowed in specifications");
+    }
     return 0;
   }
   if is_vec_builtin(p, s, e) {
@@ -2512,12 +3320,17 @@ fn ck_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
   }
   if is_wrap_builtin(p, s, e) {
     if list_len(p, n.a) != 2 {
-      cfail(&mut c, p, i, C_TYPE);
+      cm_arity(&mut c, p, i, 2);
       return 0;
     }
     let ts = operands(&mut c, &mut m, p, n.a, next_of(p, n.a));
-    if !c.failed && (!is_int(m, ts.a) || ts.a != ts.b) {
-      cfail(&mut c, p, i, C_TYPE);            // two integers of one type
+    if !c.failed && (!is_int(m, ts.a) || ts.a != ts.b) && cm_new(&mut c, p, i, C_TYPE) {
+      cm_s(&mut c, "`");
+      cm_name(&mut c, p, i);
+      cm_s(&mut c, "` needs two integers of the same type, found ");
+      cm_ty(&mut c, m, p, ts.a);
+      cm_s(&mut c, " and ");
+      cm_ty(&mut c, m, p, ts.b);
     }
     if c.failed {
       return 0;
@@ -2528,7 +3341,7 @@ fn ck_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
   if span_is(p, s, e, "box") || span_is(p, s, e, "unbox") {
     // Generic over the boxed type, so not in the builtin table.
     if list_len(p, n.a) != 1 {
-      cfail(&mut c, p, i, C_TYPE);
+      cm_arity(&mut c, p, i, 1);
       return 0;
     }
     let t = ck_expr(&mut c, &mut m, p, n.a);
@@ -2539,7 +3352,7 @@ fn ck_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
       return intern(&mut m, p, TY_BOX, t);
     }
     if kind_t(m, t) != TY_BOX {
-      cfail(&mut c, p, n.a, C_TYPE);          // `unbox` needs a box
+      cm_needs(&mut c, m, p, n.a, "`unbox` needs a box, found ", t);
       return 0;
     }
     return inner_t(m, t);
@@ -2548,21 +3361,27 @@ fn ck_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
   if b != 0 {
     let bs = bs_at(c, b - 1);
     if !available(bs.avail, c.target) {
-      cfail(&mut c, p, i, C_TARGET);
+      if cm_new(&mut c, p, i, C_TARGET) {
+        cm_s(&mut c, "`");
+        cm_name(&mut c, p, i);
+        cm_s(&mut c, "` is not available on this target");
+      }
       return 0;
     }
     let ps = bsig_params(bs);
-    let t = call_with(&mut c, &mut m, p, ps, bs.ret, n.a, i, true);
+    let t = call_with(&mut c, &mut m, p, ps, bs.ret, n.a, i, 0);
     vec_free(ps);
     return t;
   }
   if span_is(p, s, e, "main") {
-    cfail(&mut c, p, i, C_TYPE);              // `main` cannot be called
+    if cm_new(&mut c, p, i, C_TYPE) {
+      cm_s(&mut c, "`main` cannot be called");
+    }
     return 0;
   }
   if span_is(p, s, e, "lock_new") || span_is(p, s, e, "lock_end") {
     if list_len(p, n.a) != 1 {
-      cfail(&mut c, p, i, C_TYPE);
+      cm_arity(&mut c, p, i, 1);
       return 0;
     }
     let t = ck_expr(&mut c, &mut m, p, n.a);
@@ -2571,15 +3390,18 @@ fn ck_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
     }
     if span_is(p, s, e, "lock_new") {
       if is_pinned(c, m, p, t) {
-        // `Cpu` and `Mmu` describe the processor that holds them, and a
-        // lock can be taken on any processor.
-        cfail(&mut c, p, n.a, C_PIN);
+        if cm_new(&mut c, p, n.a, C_PIN) {
+          cm_s(&mut c, "a ");
+          cm_ty(&mut c, m, p, t);
+          cm_s(&mut c, " cannot be put in a lock: it holds a capability of this processor");
+          cm_note(&mut c, "`Cpu` and `Mmu` describe the processor that holds them, and a lock can be taken on any processor");
+        }
         return 0;
       }
       return intern(&mut m, p, TY_LOCK, t);
     }
     if kind_t(m, t) != TY_LOCK {
-      cfail(&mut c, p, n.a, C_TYPE);          // `lock_end` needs a lock
+      cm_needs(&mut c, m, p, n.a, "`lock_end` needs a lock, found ", t);
       return 0;
     }
     return inner_t(m, t);
@@ -2595,11 +3417,47 @@ fn ck_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
   }
   let d = plain_fn(p, s, e);
   if d == 0 {
-    cfail(&mut c, p, i, C_TYPE);              // unknown function
+    if cm_new(&mut c, p, i, C_TYPE) {
+      cm_s(&mut c, "unknown function `");
+      cm_name(&mut c, p, i);
+      cm_s(&mut c, "`");
+    }
     return 0;
   }
   let x = plain_inst(&mut m, d);
   return user_call(&mut c, &mut m, p, i, x);
+}
+
+/// "`f` takes N argument(s), K given" for builtin call `i`.
+fn cm_arity(c: &mut Checker, p: &Parser, i: u64, want: u64) {
+  if cm_new(&mut c, p, i, C_TYPE) {
+    let n = node_at(p.nodes, i);
+    cm_s(&mut c, "`");
+    cm_name(&mut c, p, i);
+    cm_s(&mut c, "` takes ");
+    cm_num(&mut c, want);
+    cm_s(&mut c, " argument(s), ");
+    cm_num(&mut c, list_len(p, n.a));
+    cm_s(&mut c, " given");
+  }
+}
+
+/// `what` followed by the name of type `t`, at `loc`.
+fn cm_needs(c: &mut Checker, m: &Mono, p: &Parser, loc: u64, what: Str, t: u64) {
+  if cm_new(&mut c, p, loc, C_TYPE) {
+    cm_s(&mut c, what);
+    cm_ty(&mut c, m, p, t);
+  }
+}
+
+/// "`f` needs an Atomic, found T" (and the like) for call `i`.
+fn cm_call_needs(c: &mut Checker, m: &Mono, p: &Parser, loc: u64, i: u64, what: Str, t: u64) {
+  if cm_new(&mut c, p, loc, C_TYPE) {
+    cm_s(&mut c, "`");
+    cm_name(&mut c, p, i);
+    cm_s(&mut c, what);
+    cm_ty(&mut c, m, p, t);
+  }
 }
 
 /// The function that argument `a` of a `locked` or `smp_run` call (node
@@ -2611,11 +3469,20 @@ fn named_fn(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, a: u64) -> u64 {
       && sigs_has(c, p, an.s, an.e) && find_var(c, p, an.s, an.e) == 0 {
       return plain_inst(&mut m, plain_fn(p, an.s, an.e));
     }
-    cfail(&mut c, p, a, C_TYPE);              // needs the name of a function
+    cm_needs_fn(&mut c, p, a, i);
     return 0;
   }
-  cfail(&mut c, p, i, C_TYPE);
+  cm_needs_fn(&mut c, p, i, i);
   return 0;
+}
+
+/// "`locked` needs the name of a function here", at `loc`, for call `i`.
+fn cm_needs_fn(c: &mut Checker, p: &Parser, loc: u64, i: u64) {
+  if cm_new(&mut c, p, loc, C_TYPE) {
+    cm_s(&mut c, "`");
+    cm_name(&mut c, p, i);
+    cm_s(&mut c, "` needs the name of a function here");
+  }
 }
 
 /// `locked(&l, f, args..)`: takes the lock, calls `f(&mut contents,
@@ -2629,10 +3496,12 @@ fn locked_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
     pk = place_of(&mut c, p, a0);
   }
   if pk == 0 {
+    let mut loc = i;
     if a0 != 0 {
-      cfail(&mut c, p, a0, C_TYPE);           // must name a lock
-    } else {
-      cfail(&mut c, p, i, C_TYPE);
+      loc = a0;
+    }
+    if cm_new(&mut c, p, loc, C_TYPE) {
+      cm_s(&mut c, "the first argument of `locked` must name a lock");
     }
     return 0;
   }
@@ -2641,7 +3510,7 @@ fn locked_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
     return 0;
   }
   if kind_t(m, lt) != TY_LOCK {
-    cfail(&mut c, p, a0, C_TYPE);             // needs a Lock
+    cm_needs(&mut c, m, p, a0, "`locked` needs a Lock, found ", lt);
     return 0;
   }
   let a1 = next_of(p, a0);
@@ -2656,7 +3525,13 @@ fn locked_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
   let inner = inner_t(m, lt);
   if vec_len(fps) == 0 || u_at(fps, 0) != mut_to(&mut m, p, inner) {
     vec_free(fps);
-    cfail(&mut c, p, a1, C_TYPE);             // must take `&mut` of the contents first
+    if cm_new(&mut c, p, a1, C_TYPE) {
+      cm_s(&mut c, "`");
+      cm_inst(&mut c, m, p, x);
+      cm_s(&mut c, "` must take `&mut ");
+      cm_ty(&mut c, m, p, inner);
+      cm_s(&mut c, "` first, to receive the contents of the lock");
+    }
     return 0;
   }
   note_call(&mut c, x);
@@ -2677,7 +3552,7 @@ fn locked_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
     vec_push(&mut args, a);
     a = next_of(p, a);
   }
-  let t = call_with_v(&mut c, &mut m, p, ps, r, args, i, false);
+  let t = call_with_v(&mut c, &mut m, p, ps, r, args, i, x);
   vec_free(ps);
   vec_free(args);
   return t;
@@ -2706,7 +3581,7 @@ fn atomic_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
   let a0 = n.a;
   if name_is(p, i, "atomic_new") || name_is(p, i, "atomic_end") {
     if list_len(p, a0) != 1 {
-      cfail(&mut c, p, i, C_TYPE);
+      cm_arity(&mut c, p, i, 1);
       return 0;
     }
     let t = ck_expr(&mut c, &mut m, p, a0);
@@ -2715,7 +3590,7 @@ fn atomic_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
     }
     if name_is(p, i, "atomic_new") {
       if !atomic_word(c, m, p, t) {
-        cfail(&mut c, p, a0, C_TYPE);         // an Atomic holds one word
+        cm_not_word(&mut c, m, p, a0, t);
         return 0;
       }
       // The verifier reads every integer as a u64.
@@ -2723,7 +3598,7 @@ fn atomic_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
       return intern(&mut m, p, TY_ATOMIC, t);
     }
     if kind_t(m, t) != TY_ATOMIC {
-      cfail(&mut c, p, a0, C_TYPE);           // `atomic_end` needs an Atomic
+      cm_needs(&mut c, m, p, a0, "`atomic_end` needs an Atomic, found ", t);
       return 0;
     }
     return inner_t(m, t);
@@ -2733,10 +3608,14 @@ fn atomic_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
     pk = place_of(&mut c, p, a0);
   }
   if pk == 0 {
+    let mut loc = i;
     if a0 != 0 {
-      cfail(&mut c, p, a0, C_TYPE);           // must name an atomic
-    } else {
-      cfail(&mut c, p, i, C_TYPE);
+      loc = a0;
+    }
+    if cm_new(&mut c, p, loc, C_TYPE) {
+      cm_s(&mut c, "the first argument of `");
+      cm_name(&mut c, p, i);
+      cm_s(&mut c, "` must name an atomic");
     }
     return 0;
   }
@@ -2745,12 +3624,12 @@ fn atomic_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
     return 0;
   }
   if kind_t(m, aty) != TY_ATOMIC {
-    cfail(&mut c, p, a0, C_TYPE);             // needs an Atomic
+    cm_call_needs(&mut c, m, p, a0, i, "` needs an Atomic, found ", aty);
     return 0;
   }
   let t = inner_t(m, aty);
   if !atomic_word(c, m, p, t) {
-    cfail(&mut c, p, a0, C_TYPE);
+    cm_not_word(&mut c, m, p, a0, t);
     return 0;
   }
   let mut ps = vec_new[u64]();
@@ -2768,14 +3647,23 @@ fn atomic_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
   } else if name_is(p, i, "atomic_wrap_add") {
     if !is_int(m, t) {
       vec_free(ps);
-      cfail(&mut c, p, a0, C_TYPE);           // needs an Atomic of an integer type
+      cm_needs(&mut c, m, p, a0, "`atomic_wrap_add` needs an Atomic of an integer type, found ", aty);
       return 0;
     }
     vec_push(&mut ps, t);
   }
-  let r2 = call_with(&mut c, &mut m, p, ps, r, a0, i, true);
+  let r2 = call_with(&mut c, &mut m, p, ps, r, a0, i, 0);
   vec_free(ps);
   return r2;
+}
+
+/// "an Atomic cannot hold a T" at `loc`.
+fn cm_not_word(c: &mut Checker, m: &Mono, p: &Parser, loc: u64, t: u64) {
+  if cm_new(&mut c, p, loc, C_TYPE) {
+    cm_s(&mut c, "an Atomic cannot hold a ");
+    cm_ty(&mut c, m, p, t);
+    cm_note(&mut c, "an Atomic holds one word: an integer, a bool, or a struct with a single field of one of those");
+  }
 }
 
 /// `smp_run(f, args..)`: runs `f` on every processor at once and returns
@@ -2783,7 +3671,9 @@ fn atomic_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
 /// `Cpu` and `Mmu`; every other argument is a shared borrow.
 fn smp_run_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
   if c.target != TARGET_KERNEL {
-    cfail(&mut c, p, i, C_TARGET);
+    if cm_new(&mut c, p, i, C_TARGET) {
+      cm_s(&mut c, "`smp_run` is not available on this target");
+    }
     return 0;
   }
   let n = node_at(p.nodes, i);
@@ -2799,7 +3689,11 @@ fn smp_run_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
   let r = conv(&mut m, p, dn.b, x, xi.def);
   if r != c.tunit {
     vec_free(ps);
-    cfail(&mut c, p, a0, C_TYPE);             // must return nothing
+    if cm_new(&mut c, p, a0, C_TYPE) {
+      cm_s(&mut c, "`");
+      cm_inst(&mut c, m, p, x);
+      cm_s(&mut c, "` must return nothing to run on every processor");
+    }
     return 0;
   }
   let mut j = 0;
@@ -2817,7 +3711,14 @@ fn smp_run_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
       // Each parameter must be `&mut Cpu`, `&mut Mmu` (every processor
       // gets its own) or a shared borrow of a value with no `Cpu` or `Mmu`.
       vec_free(ps);
-      cfail(&mut c, p, a0, C_PIN);
+      if cm_new(&mut c, p, a0, C_PIN) {
+        cm_s(&mut c, "`");
+        cm_inst(&mut c, m, p, x);
+        cm_s(&mut c, "` cannot run on every processor: its parameter of type ");
+        cm_ty(&mut c, m, p, t);
+        cm_s(&mut c, " would be shared between them");
+        cm_note(&mut c, "each parameter must be `&mut Cpu`, `&mut Mmu` (every processor gets its own) or a shared borrow `&T` of a value with no `Cpu` or `Mmu` in it");
+      }
       return 0;
     }
     j = j + 1;
@@ -2828,7 +3729,7 @@ fn smp_run_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
     vec_push(&mut args, a);
     a = next_of(p, a);
   }
-  let t = call_with_v(&mut c, &mut m, p, ps, r, args, i, false);
+  let t = call_with_v(&mut c, &mut m, p, ps, r, args, i, x);
   vec_free(ps);
   vec_free(args);
   return t;
@@ -2841,7 +3742,9 @@ fn vec_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
   let s = n.s;
   let e = n.e;
   if span_is(p, s, e, "vec_new") {
-    cfail(&mut c, p, i, C_TYPE);              // write `vec_new[T]()`
+    if cm_new(&mut c, p, i, C_TYPE) {
+      cm_s(&mut c, "write the element type: `vec_new[T]()`");
+    }
     return 0;
   }
   let a0 = n.a;
@@ -2855,7 +3758,11 @@ fn vec_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
     }
   }
   if pk == 0 {
-    cfail(&mut c, p, i, C_TYPE);              // must name a vector
+    if cm_new(&mut c, p, i, C_TYPE) {
+      cm_s(&mut c, "the first argument of `");
+      cm_name(&mut c, p, i);
+      cm_s(&mut c, "` must name a vector");
+    }
     return 0;
   }
   let vt = path_type(&mut c, m, p, pk, i);
@@ -2863,7 +3770,7 @@ fn vec_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
     return 0;
   }
   if kind_t(m, vt) != TY_VEC {
-    cfail(&mut c, p, a0, C_TYPE);             // needs a Vec
+    cm_call_needs(&mut c, m, p, a0, i, "` needs a Vec, found ", vt);
     return 0;
   }
   let el = inner_t(m, vt);
@@ -2889,10 +3796,21 @@ fn vec_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
     vec_push(&mut ps, vt);
   } else if ck_linear(c, m, p, el) {
     vec_free(ps);
-    if span_is(p, s, e, "vec_get") {
-      cfail(&mut c, p, i, C_USE);             // would copy a linear element
-    } else {
-      cfail(&mut c, p, i, C_LEAK);            // would drop a linear element
+    let is_get = span_is(p, s, e, "vec_get");
+    let mut code = C_LEAK;
+    if is_get {
+      code = C_USE;
+    }
+    if cm_new(&mut c, p, i, code) {
+      cm_s(&mut c, "`");
+      cm_name(&mut c, p, i);
+      if is_get {
+        cm_s(&mut c, "` would copy a linear ");
+      } else {
+        cm_s(&mut c, "` would drop a linear ");
+      }
+      cm_ty(&mut c, m, p, el);
+      cm_note(&mut c, "use `vec_swap` to exchange an element, or `vec_pop`");
     }
     return 0;
   } else if span_is(p, s, e, "vec_get") {
@@ -2904,7 +3822,7 @@ fn vec_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
     vec_push(&mut ps, c.tu64);
     vec_push(&mut ps, el);
   }
-  let t = call_with(&mut c, &mut m, p, ps, r, a0, i, true);
+  let t = call_with(&mut c, &mut m, p, ps, r, a0, i, 0);
   vec_free(ps);
   return t;
 }
@@ -2912,23 +3830,33 @@ fn vec_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
 /// Checks a call's arguments (list `args`) against the parameter types
 /// `ps`: scalars first, then borrows, then moves, so a scalar argument may
 /// read a value that a later argument consumes (`set(b, i, get(b, j))`).
-/// `builtin` says whether a builtin is called.
-fn call_with(c: &mut Checker, m: &mut Mono, p: &Parser, ps: &Vec[u64], r: u64, args: u64, loc: u64, builtin: bool) -> u64 {
+/// The function called is instance `fx`, or the builtin call `loc` names
+/// when `fx` is 0.
+fn call_with(c: &mut Checker, m: &mut Mono, p: &Parser, ps: &Vec[u64], r: u64, args: u64, loc: u64, fx: u64) -> u64 {
   let mut v = vec_new[u64]();
   let mut a = args;
   while a != 0 {
     vec_push(&mut v, a);
     a = next_of(p, a);
   }
-  let t = call_with_v(&mut c, &mut m, p, ps, r, v, loc, builtin);
+  let t = call_with_v(&mut c, &mut m, p, ps, r, v, loc, fx);
   vec_free(v);
   return t;
 }
 
 /// `call_with` over the argument nodes `args`, in order.
-fn call_with_v(c: &mut Checker, m: &mut Mono, p: &Parser, ps: &Vec[u64], r: u64, args: &Vec[u64], loc: u64, builtin: bool) -> u64 {
+fn call_with_v(c: &mut Checker, m: &mut Mono, p: &Parser, ps: &Vec[u64], r: u64, args: &Vec[u64], loc: u64, fx: u64) -> u64 {
+  let builtin = fx == 0;
   if vec_len(args) != vec_len(ps) {
-    cfail(&mut c, p, loc, C_TYPE);            // the wrong number of arguments
+    if cm_new(&mut c, p, loc, C_TYPE) {
+      cm_s(&mut c, "`");
+      cm_callee(&mut c, m, p, loc, fx);
+      cm_s(&mut c, "` takes ");
+      cm_num(&mut c, vec_len(ps));
+      cm_s(&mut c, " argument(s), ");
+      cm_num(&mut c, vec_len(args));
+      cm_s(&mut c, " given");
+    }
     return 0;
   }
   let mut j = 0;
@@ -2940,8 +3868,9 @@ fn call_with_v(c: &mut Checker, m: &mut Mono, p: &Parser, ps: &Vec[u64], r: u64,
       // A builtin's u64 parameter (an index, a length, a value) takes any
       // narrower unsigned value: widening is free.
       let widens = builtin && pt == c.tu64 && is_int(m, t) && !is_signed(m, t);
-      if !c.failed && !widens {
-        expect_ty(&mut c, p, t, pt, a);
+      if !c.failed && !widens && cm_mismatch(&mut c, p, t, pt, a) {
+        cm_arg_of(&mut c, m, p, loc, fx);
+        cm_must(&mut c, m, p, pt, t);
       }
     }
     j = j + 1;
@@ -2958,7 +3887,7 @@ fn call_with_v(c: &mut Checker, m: &mut Mono, p: &Parser, ps: &Vec[u64], r: u64,
     let a = vec_get(args, j);
     let pt = u_at(ps, j);
     if ck_ref(m, pt) {
-      borrow_arg(&mut c, m, p, pt, a, &mut bp, &mut bm);
+      borrow_arg(&mut c, m, p, pt, a, &mut bp, &mut bm, loc, fx);
     }
     j = j + 1;
   }
@@ -2969,11 +3898,16 @@ fn call_with_v(c: &mut Checker, m: &mut Mono, p: &Parser, ps: &Vec[u64], r: u64,
     if ck_linear(c, m, p, pt) {
       let pk = place_of(&mut c, p, a);
       if pk != 0 && overlaps_any(c, pk, bp) {
-        cfail(&mut c, p, a, C_USE);           // both borrowed and moved
+        if cm_new(&mut c, p, a, C_USE) {
+          cm_s(&mut c, "`");
+          cm_place(&mut c, p, pk);
+          cm_s(&mut c, "` is both borrowed and moved in this call");
+        }
       } else {
         let t = ck_expr(&mut c, &mut m, p, a);
-        if !c.failed {
-          expect_ty(&mut c, p, t, pt, a);
+        if !c.failed && cm_mismatch(&mut c, p, t, pt, a) {
+          cm_arg_of(&mut c, m, p, loc, fx);
+          cm_must(&mut c, m, p, pt, t);
         }
       }
     }
@@ -2985,6 +3919,23 @@ fn call_with_v(c: &mut Checker, m: &mut Mono, p: &Parser, ps: &Vec[u64], r: u64,
     return 0;
   }
   return r;
+}
+
+/// The name of the function called: instance `fx`, or the builtin call
+/// `loc` names.
+fn cm_callee(c: &mut Checker, m: &Mono, p: &Parser, loc: u64, fx: u64) {
+  if fx != 0 {
+    cm_inst(&mut c, m, p, fx);
+  } else {
+    cm_name(&mut c, p, loc);
+  }
+}
+
+/// "argument of `f`"
+fn cm_arg_of(c: &mut Checker, m: &Mono, p: &Parser, loc: u64, fx: u64) {
+  cm_s(&mut c, "argument of `");
+  cm_callee(&mut c, m, p, loc, fx);
+  cm_s(&mut c, "`");
 }
 
 fn overlaps_any(c: &Checker, k: u64, bp: &Vec[u64]) -> bool {
@@ -3000,7 +3951,8 @@ fn overlaps_any(c: &Checker, k: u64, bp: &Vec[u64]) -> bool {
 
 /// Argument `a` lent to a parameter of borrow type `pt`; the places lent
 /// so far in the call are `bp` (with `bm` saying which were `&mut`).
-fn borrow_arg(c: &mut Checker, m: &Mono, p: &Parser, pt: u64, a: u64, bp: &mut Vec[u64], bm: &mut Vec[u64]) {
+/// The call is to instance `fx`, or the builtin call `loc` names.
+fn borrow_arg(c: &mut Checker, m: &Mono, p: &Parser, pt: u64, a: u64, bp: &mut Vec[u64], bm: &mut Vec[u64], loc: u64, fx: u64) {
   let an = node_at(p.nodes, a);
   let mut_p = kind_t(m, pt) == TY_MUTREF;
   let mut pk = 0;
@@ -3010,7 +3962,14 @@ fn borrow_arg(c: &mut Checker, m: &Mono, p: &Parser, pt: u64, a: u64, bp: &mut V
     pk = place_of(&mut c, p, a);
   }
   if pk == 0 {
-    cfail(&mut c, p, a, C_TYPE);              // must name a value to borrow
+    if cm_new(&mut c, p, a, C_TYPE) {
+      cm_arg_of(&mut c, m, p, loc, fx);
+      if mut_p {
+        cm_s(&mut c, " must be `&mut x` for a variable or field `x`");
+      } else {
+        cm_s(&mut c, " must name a value to borrow");
+      }
+    }
     return;
   }
   let t = path_type(&mut c, m, p, pk, a);
@@ -3018,28 +3977,60 @@ fn borrow_arg(c: &mut Checker, m: &Mono, p: &Parser, pt: u64, a: u64, bp: &mut V
     return;
   }
   if t != base_t(m, pt) {
-    cfail(&mut c, p, a, C_TYPE);
+    if cm_new(&mut c, p, a, C_TYPE) {
+      cm_arg_of(&mut c, m, p, loc, fx);
+      cm_must(&mut c, m, p, base_t(m, pt), t);
+    }
     return;
   }
   let vr = root_var(c, p, pk);
   if mut_p {
     if kind_t(m, vr.vty) == TY_REF {
-      cfail(&mut c, p, a, C_USE);             // a shared borrow lent as `&mut`
+      if cm_new(&mut c, p, a, C_USE) {
+        cm_s(&mut c, "`");
+        cm_place(&mut c, p, vr.path);
+        cm_s(&mut c, "` is a shared borrow and cannot be lent as `&mut`");
+      }
       return;
     }
     if !vr.mutable {
-      cfail(&mut c, p, a, C_TYPE);            // not mutable
+      cm_not_mut(&mut c, p, a, vr.path);
       return;
     }
   }
-  if prefix_moved(c, pk) != 0 || desc_moved(c, pk) {
-    cfail(&mut c, p, a, C_USE);               // borrowed after a move
+  if prefix_moved(c, pk) != 0 {
+    if cm_new(&mut c, p, a, C_USE) {
+      cm_s(&mut c, "`");
+      cm_place(&mut c, p, pk);
+      cm_s(&mut c, "` is borrowed after it was consumed");
+    }
+    return;
+  }
+  if desc_moved(c, pk) {
+    if cm_new(&mut c, p, a, C_USE) {
+      cm_s(&mut c, "`");
+      cm_place(&mut c, p, pk);
+      cm_s(&mut c, "` is borrowed after its field `");
+      cm_place(&mut c, p, cm_desc_first(c, p, pk));
+      cm_s(&mut c, "` was moved out");
+    }
     return;
   }
   let mut j = 0;
   while j < vec_len(bp) && j < vec_len(bm) {
-    if overlaps(c, pk, vec_get(bp, j)) && (vec_get(bm, j) == 1 || mut_p) {
-      cfail(&mut c, p, a, C_USE);             // overlapping borrows, one `&mut`
+    let q = vec_get(bp, j);
+    if overlaps(c, pk, q) && (vec_get(bm, j) == 1 || mut_p) {
+      if cm_new(&mut c, p, a, C_USE) {
+        cm_s(&mut c, "`");
+        cm_place(&mut c, p, q);
+        if q == pk {
+          cm_s(&mut c, "` is lent as `&mut` while also borrowed in this call");
+        } else {
+          cm_s(&mut c, "` and `");
+          cm_place(&mut c, p, pk);
+          cm_s(&mut c, "` overlap, and one of them is lent as `&mut` in this call");
+        }
+      }
       return;
     }
     j = j + 1;
@@ -3085,9 +4076,28 @@ fn ck_spec(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u64 
     // A generic instance cannot be called or built in a specification
     // (stage0 has renamed it by now), nor can a typed builtin.
     if is_typed_builtin(p, n.b) {
-      cfail(&mut c, p, i, C_TYPE);
-    } else {
-      cfail(&mut c, p, n.b, C_TYPE);
+      if cm_new(&mut c, p, i, C_TYPE) {
+        cm_s(&mut c, "`vec_new` cannot be called in a specification");
+      }
+    } else if cm_new(&mut c, p, n.b, C_TYPE) {
+      if kind_of(p, n.b) == E_CALL {
+        cm_s(&mut c, "`");
+        cm_name(&mut c, p, n.b);
+        cm_s(&mut c, "[");
+        let mut q = n.a;
+        while q != 0 {
+          if q != n.a {
+            cm_s(&mut c, ", ");
+          }
+          let qt = conv(&mut m, p, q, c.env, i);
+          cm_ty(&mut c, m, p, qt);
+          q = next_of(p, q);
+        }
+        cm_s(&mut c, "]");
+        cm_not_in_spec(&mut c);
+      } else {
+        cm_s(&mut c, "struct and enum values cannot be built in a specification");
+      }
     }
     return 0;
   }
@@ -3108,7 +4118,7 @@ fn ck_spec(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u64 
     let x = inner_t(m, t);
     let dn = def_node(m, p, x);
     if !(kind_t(m, t) == TY_ENUM && names_enum(m, p, n.s, n.e, x) && index_in(p, dn.a, n.s2, n.e2) != 0) {
-      cfail(&mut c, p, i, C_TYPE);
+      cm_is_needs(&mut c, m, p, i, i, t);
       return 0;
     }
     return c.tbool;
@@ -3132,7 +4142,26 @@ fn ck_spec(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u64 
         return fld_ty(c, x, j - 1);
       }
     }
-    cfail(&mut c, p, i, C_TYPE);              // no such field
+    if cm_new(&mut c, p, i, C_TYPE) {
+      if ku == TY_STRUCT || ku == TY_ENUM {
+        cm_s(&mut c, "`");
+        cm_ty(&mut c, m, p, u);
+        if ku == TY_STRUCT {
+          cm_s(&mut c, "` has no field `");
+        } else {
+          cm_s(&mut c, "` has no variant `");
+        }
+        cm_name(&mut c, p, i);
+        if ku == TY_STRUCT {
+          cm_s(&mut c, "`");
+        } else {
+          cm_s(&mut c, "` with a payload");
+        }
+      } else {
+        cm_ty(&mut c, m, p, u);
+        cm_s(&mut c, " has no fields");
+      }
+    }
     return 0;
   }
   if k == E_VAR {
@@ -3141,14 +4170,20 @@ fn ck_spec(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u64 
     }
     if span_is(p, n.s, n.e, "result") {
       if !ens || c.ret == c.tunit {
-        cfail(&mut c, p, i, C_TYPE);          // no `result` here
+        if cm_new(&mut c, p, i, C_TYPE) {
+          if !ens {
+            cm_s(&mut c, "`result` is only allowed in `ensures`");
+          } else {
+            cm_s(&mut c, "this function returns nothing, so `result` does not exist");
+          }
+        }
         return 0;
       }
       return c.ret;
     }
     let v = find_var(c, p, n.s, n.e);
     if v == 0 {
-      cfail(&mut c, p, i, C_TYPE);            // unknown variable
+      cm_unknown_var(&mut c, p, i);
       return 0;
     }
     let vr = var_at(c, v - 1);
@@ -3157,20 +4192,24 @@ fn ck_spec(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u64 
   if k == E_NOT {
     let t = ck_spec(&mut c, &mut m, p, n.a, ens);
     if !c.failed {
-      expect_ty(&mut c, p, t, c.tbool, n.a);
+      expect_ty(&mut c, m, p, t, c.tbool, n.a, "the operand of `!`");
     }
     return c.tbool;
   }
   if k == E_NEG {
     let t = ck_spec(&mut c, &mut m, p, n.a, ens);
     if !c.failed && !is_int(m, t) {
-      cfail(&mut c, p, i, C_TYPE);            // unary minus needs an integer
+      cm_needs(&mut c, m, p, i, "unary minus needs an integer, found ", t);
     }
     return c.tu64;
   }
   if k == E_BIN {
     if is_bitwise(n.v) {
-      cfail(&mut c, p, i, C_TYPE);            // not available in specifications yet
+      if cm_new(&mut c, p, i, C_TYPE) {
+        cm_s(&mut c, "`");
+        cm_op(&mut c, n.v);
+        cm_s(&mut c, "` is not available in specifications yet");
+      }
       return 0;
     }
     let ta = ck_spec(&mut c, &mut m, p, n.a, ens);
@@ -3182,7 +4221,7 @@ fn ck_spec(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u64 
   }
   if k == E_FORALL {
     if find_var(c, p, n.s, n.e) != 0 || is_bound(c, p, n.s, n.e) {
-      cfail(&mut c, p, i, C_TYPE);            // shadowing
+      cm_shadow(&mut c, p, i, n.s, n.e);
       return 0;
     }
     vec_push(&mut c.bound, i);
@@ -3191,7 +4230,7 @@ fn ck_spec(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u64 
       vec_pop(&mut c.bound);
     }
     if !c.failed {
-      expect_ty(&mut c, p, t, c.tbool, n.a);
+      expect_ty(&mut c, m, p, t, c.tbool, n.a, "the body of `forall`");
     }
     return c.tbool;
   }
@@ -3199,14 +4238,20 @@ fn ck_spec(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u64 
     return spec_call(&mut c, &mut m, p, i, ens);
   }
   // `&mut`, or a struct or enum value being built.
-  cfail(&mut c, p, i, C_TYPE);
+  if cm_new(&mut c, p, i, C_TYPE) {
+    if k == E_MUTBORROW {
+      cm_s(&mut c, "`&mut` has no meaning in a specification");
+    } else if k == E_SLIT || k == E_VARIANT {
+      cm_s(&mut c, "struct and enum values cannot be built in a specification");
+    }
+  }
   return 0;
 }
 
 /// The argument of a linear-valued position must name a value.
 fn check_lin(c: &mut Checker, p: &Parser, a: u64) {
-  if !spec_named(p, a) {
-    cfail(&mut c, p, a, C_TYPE);
+  if !spec_named(p, a) && cm_new(&mut c, p, a, C_TYPE) {
+    cm_s(&mut c, "a value in this position must be a variable, a field of one, `result` or `old(x)`");
   }
 }
 
@@ -3214,7 +4259,41 @@ fn check_lin(c: &mut Checker, p: &Parser, a: u64) {
 fn spec_index(c: &mut Checker, m: &mut Mono, p: &Parser, a: u64, ens: bool) {
   let t = ck_spec(&mut c, &mut m, p, a, ens);
   if !c.failed {
-    expect_ty(&mut c, p, spec_norm(c, m, t), c.tu64, a);
+    expect_ty(&mut c, m, p, spec_norm(c, m, t), c.tu64, a, "an index");
+  }
+}
+
+/// ", K given": the end of "`f` takes N argument(s)" for spec call `i`
+/// with `want` parameters.
+fn cm_spec_arity(c: &mut Checker, p: &Parser, i: u64, want: u64, na: u64) {
+  if cm_new(&mut c, p, i, C_TYPE) {
+    cm_s(&mut c, "`");
+    cm_name(&mut c, p, i);
+    cm_s(&mut c, "` takes ");
+    cm_num(&mut c, want);
+    cm_s(&mut c, " argument(s), ");
+    cm_num(&mut c, na);
+    cm_s(&mut c, " given");
+  }
+}
+
+/// " cannot be called in a specification (allowed: ..)"
+fn cm_not_in_spec(c: &mut Checker) {
+  cm_s(&mut c, "` cannot be called in a specification (allowed: len, get, slen, sget, blen, bget, vlen, vget, old, ghost accessors and spec fns)");
+}
+
+/// "argument of `f` must be T" for spec call `i`, then ", found U" when
+/// `got` is not 0.
+fn cm_spec_arg(c: &mut Checker, m: &Mono, p: &Parser, loc: u64, i: u64, want: u64, got: u64) {
+  if cm_new(&mut c, p, loc, C_TYPE) {
+    cm_s(&mut c, "argument of `");
+    cm_name(&mut c, p, i);
+    cm_s(&mut c, "` must be ");
+    cm_ty(&mut c, m, p, want);
+    if got != 0 {
+      cm_s(&mut c, ", found ");
+      cm_ty(&mut c, m, p, got);
+    }
   }
 }
 
@@ -3226,8 +4305,14 @@ fn spec_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u6
   let a0 = n.a;
   let a1 = next_of(p, a0);
   if span_is(p, s, e, "old") {
-    if na != 1 || !ens {
-      cfail(&mut c, p, i, C_TYPE);
+    if na != 1 {
+      cm_spec_arity(&mut c, p, i, 1, na);
+      return 0;
+    }
+    if !ens {
+      if cm_new(&mut c, p, i, C_TYPE) {
+        cm_s(&mut c, "`old(..)` is only allowed in `ensures`");
+      }
       return 0;
     }
     return ck_spec(&mut c, &mut m, p, a0, false);
@@ -3236,7 +4321,7 @@ fn spec_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u6
   if sf != 0 {
     let sn = node_at(p.nodes, sf);
     if na != list_len(p, sn.a) {
-      cfail(&mut c, p, i, C_TYPE);
+      cm_spec_arity(&mut c, p, i, list_len(p, sn.a), na);
       return 0;
     }
     let mut q = sn.a;
@@ -3246,7 +4331,7 @@ fn spec_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u6
       let bt = base_t(m, conv(&mut m, p, qn.a, 0, q));
       let t = ck_spec(&mut c, &mut m, p, a, ens);
       if !c.failed && spec_norm(c, m, t) != spec_norm(c, m, bt) {
-        cfail(&mut c, p, a, C_TYPE);
+        cm_spec_arg(&mut c, m, p, a, i, bt, spec_norm(c, m, t));
       }
       if !c.failed && ck_linear(c, m, p, bt) {
         check_lin(&mut c, p, a);
@@ -3267,12 +4352,12 @@ fn spec_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u6
       want = 2;
     }
     if na != want {
-      cfail(&mut c, p, i, C_TYPE);
+      cm_spec_arity(&mut c, p, i, want, na);
       return 0;
     }
     let t = ck_spec(&mut c, &mut m, p, a0, ens);
     if !c.failed && t != gh.arg {
-      cfail(&mut c, p, a0, C_TYPE);
+      cm_spec_arg(&mut c, m, p, a0, i, gh.arg, t);
     }
     if !c.failed {
       check_lin(&mut c, p, a0);
@@ -3289,12 +4374,15 @@ fn spec_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u6
       want = 1;
     }
     if na != want {
-      cfail(&mut c, p, i, C_TYPE);
+      cm_spec_arity(&mut c, p, i, want, na);
       return 0;
     }
     let t = ck_spec(&mut c, &mut m, p, a0, ens);
-    if !c.failed && kind_t(m, t) != TY_VEC {
-      cfail(&mut c, p, a0, C_TYPE);
+    if !c.failed && kind_t(m, t) != TY_VEC && cm_new(&mut c, p, a0, C_TYPE) {
+      cm_s(&mut c, "argument of `");
+      cm_name(&mut c, p, i);
+      cm_s(&mut c, "` must be a Vec, found ");
+      cm_ty(&mut c, m, p, t);
     }
     if !c.failed {
       check_lin(&mut c, p, a0);
@@ -3310,22 +4398,26 @@ fn spec_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u6
   }
   if !(span_is(p, s, e, "len") || span_is(p, s, e, "get") || span_is(p, s, e, "slen")
        || span_is(p, s, e, "sget") || span_is(p, s, e, "blen") || span_is(p, s, e, "bget")) {
-    cfail(&mut c, p, i, C_TYPE);              // cannot be called in a specification
+    if cm_new(&mut c, p, i, C_TYPE) {
+      cm_s(&mut c, "`");
+      cm_name(&mut c, p, i);
+      cm_not_in_spec(&mut c);
+    }
     return 0;
   }
   let bi = bs_index(c, p, s, e);
   if bi == 0 {
-    cfail(&mut c, p, i, C_TYPE);
+    cfail(&mut c, p, i, C_TYPE);              // not reached: these are all builtins
     return 0;
   }
   let bs = bs_at(c, bi - 1);
   if na != bs.np {
-    cfail(&mut c, p, i, C_TYPE);
+    cm_spec_arity(&mut c, p, i, bs.np, na);
     return 0;
   }
   let tb = ck_spec(&mut c, &mut m, p, a0, ens);
   if !c.failed && tb != base_t(m, bs.p0) {
-    cfail(&mut c, p, a0, C_TYPE);
+    cm_spec_arg(&mut c, m, p, a0, i, base_t(m, bs.p0), 0);
   }
   if !c.failed {
     check_lin(&mut c, p, a0);
