@@ -1,6 +1,6 @@
 # Concurrency in Bastio (design)
 
-Status: design, not implemented. Written 2026-10-10 to settle the "how to express concurrency in types" question in [ROADMAP.md](../ROADMAP.md). Nothing here is in stage0 yet; [language.md](language.md) describes only what exists.
+Status: design, partly implemented. Written 2026-10-10 to settle the "how to express concurrency in types" question in [ROADMAP.md](../ROADMAP.md). [language.md](language.md) describes only what exists; "What exists so far" below lists it and where it departs from this design.
 
 ## Goals
 
@@ -26,6 +26,16 @@ Consequences:
 - Bastio needs no `Send`/`Sync` traits. Every type can be sent (moved) to another thread and every `&T` can be shared across threads, with one exception: **pinned** capabilities that describe *this* core or *this* thread (see "Pinned types").
 - The sequential verifier stays sound. Its one assumption that concurrency could break is "a value behind `&T` does not change during the call". It still holds: the only things that change behind a shared reference are the contents of `Lock` and `Atomic`, and the prover never knows those contents except through the invariant (below).
 - Because every compiled program is data-race-free and its only synchronization is locks and sequentially consistent atomics, the C11 memory model guarantees it behaves as if threads were interleaved one step at a time (the "DRF-SC" theorem). The C backend therefore stays valid: non-atomic accesses compile to plain loads and stores, and the C compiler keeps its optimizations.
+
+## What exists so far
+
+Enough for BastiOS to run its scheduler on every core:
+
+- **`Lock[T]` with struct invariants**, but scoped instead of `acquire`/`Held`/`release`: `locked(l, f, args..)` calls `f(&mut contents, args..)` with the lock held. The contents cannot outlive the call, so no `Held` value, lock ids or release-matches-acquire proof is needed, and the invariant is assumed before `f` and proved after it exactly as designed below. `lock_new` proves it; `lock_end` gives the value back.
+- **`smp_run(f, args..)`** (kernel) instead of `smp_start`: fork-join over every processor. `f` gets each processor's own `&mut Cpu` / `&mut Mmu` and otherwise only shared borrows, so like `par` it needs no `Share`: the call joins before it returns, and the borrows end there.
+- **Pinned types**: `Cpu` and `Mmu` (and anything holding one) cannot go in a lock or be shared by `smp_run` (`E-PIN`).
+
+Not yet: `par`, `spawn`/`join`, `Share`, `Atomic`, `Ctx` and lock ranks (so deadlock is not ruled out: taking a lock again inside `locked` spins forever), and `irq_lock_new`/`IrqSaved`. BastiOS does not need the interrupt rules yet because its kernel code runs with interrupts off: interrupts reach a processor only while it runs user code or waits in `cpu_idle`, never while it holds a lock.
 
 ## Layer 1: running code in parallel
 
@@ -181,7 +191,7 @@ irq_restore(&mut ctx, s);             // linear: interrupts cannot be left off b
 
 ### Devices and DMA (direction only)
 
-The same ownership idea extends to hardware that writes memory on its own. A buffer given to a device for DMA is moved into a linear "in flight" token and comes back only when the device reports completion, so the kernel cannot read or free it meanwhile. This belongs with the `Mmio` and `PortIo` capabilities in v3 and is not designed further here.
+The same ownership idea extends to hardware that writes memory on its own. A buffer given to a device for DMA is moved into a linear "in flight" token and comes back only when the device reports completion, so the kernel cannot read or free it meanwhile. This belongs with the `Mmio` and `PortIo` capabilities in v3; it is implemented as `Dma` (see [language.md](language.md#kernel-capabilities)), where completion is still the driver's word rather than something proved.
 
 ## What gets proved, and what is trusted
 

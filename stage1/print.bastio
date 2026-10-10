@@ -80,6 +80,13 @@ fn put_ty(con: &Serial, p: &Parser, m: &Mono, t: u64) {
   let x = ty_at(m, t);
   let k = x.kind;
   if k == TY_U64 { put(con, "u64"); }
+  else if k == TY_U8 { put(con, "u8"); }
+  else if k == TY_U16 { put(con, "u16"); }
+  else if k == TY_U32 { put(con, "u32"); }
+  else if k == TY_I8 { put(con, "i8"); }
+  else if k == TY_I16 { put(con, "i16"); }
+  else if k == TY_I32 { put(con, "i32"); }
+  else if k == TY_I64 { put(con, "i64"); }
   else if k == TY_BOOL { put(con, "bool"); }
   else if k == TY_UNIT { put(con, "()"); }
   else if k == TY_STR { put(con, "Str"); }
@@ -93,10 +100,16 @@ fn put_ty(con: &Serial, p: &Parser, m: &Mono, t: u64) {
   else if k == TY_POOL { put(con, "Pool"); }
   else if k == TY_MMU { put(con, "Mmu"); }
   else if k == TY_CPU { put(con, "Cpu"); }
+  else if k == TY_PORTS { put(con, "Ports"); }
+  else if k == TY_PORTIO { put(con, "PortIo"); }
+  else if k == TY_MMIOSPACE { put(con, "MmioSpace"); }
+  else if k == TY_MMIO { put(con, "Mmio"); }
+  else if k == TY_DMA { put(con, "Dma"); }
   else if k == TY_STRUCT || k == TY_ENUM { put_inst(con, p, m, x.a); }
   else if k == TY_UNKNOWN { name_of(con, p, node_at(p.nodes, x.a)); }
   else if k == TY_BOX { put(con, "Box["); put_ty(con, p, m, x.a); put(con, "]"); }
   else if k == TY_VEC { put(con, "Vec["); put_ty(con, p, m, x.a); put(con, "]"); }
+  else if k == TY_LOCK { put(con, "Lock["); put_ty(con, p, m, x.a); put(con, "]"); }
   else if k == TY_REF { put(con, "&"); put_ty(con, p, m, x.a); }
   else if k == TY_MUTREF { put(con, "&mut "); put_ty(con, p, m, x.a); }
 }
@@ -135,6 +148,14 @@ fn dump_names(con: &Serial, p: &Parser, i: u64, sep: Str) {
 }
 
 /// `(kind L:C`
+/// How a function definition is printed: `export-fn` or `fn`.
+fn fn_kind(n: Node) -> Str {
+  if n.e2 > n.s2 {
+    return "export-fn";
+  }
+  return "fn";
+}
+
 fn begin(con: &Serial, pr: Pr, kind: Str, n: Node) {
   put(con, "(");
   put(con, kind);
@@ -230,6 +251,10 @@ fn dump_named(con: &Serial, p: &Parser, m: &mut Mono, pr: Pr, i: u64, inst: u64)
     name_of(con, p, n);
   } else if k == E_NOT {
     begin(con, pr, "not", n);
+    put(con, " ");
+    dump_expr(con, p, &mut m, pr, n.a);
+  } else if k == E_NEG {
+    begin(con, pr, "neg", n);
     put(con, " ");
     dump_expr(con, p, &mut m, pr, n.a);
   } else if k == E_BIN {
@@ -421,6 +446,7 @@ fn dump_program(con: &Serial, p: &Parser, m: &mut Mono, pr: Pr) {
       put(con, ")");
       f = fd.next;
     }
+    dump_invariants(con, p, &mut m, pr, n.b);
     put(con, ")\n");
     k = n.next;
   }
@@ -463,7 +489,7 @@ fn dump_program(con: &Serial, p: &Parser, m: &mut Mono, pr: Pr) {
   k = p.fns.head;
   while k != 0 {
     let n = node_at(p.nodes, k);
-    begin(con, pr, "fn", n);
+    begin(con, pr, fn_kind(n), n);
     put(con, " ");
     name_of(con, p, n);
     dump_tparams(con, p, &mut m, pr, n.v);
@@ -516,7 +542,21 @@ fn dump_typedef(con: &Serial, p: &Parser, m: &mut Mono, x: u64) {
     put(con, ")");
     f = fd.next;
   }
+  if n.kind == D_STRUCT {
+    dump_invariants(con, p, &mut m, pr, n.b);
+  }
   put(con, ")\n");
+}
+
+/// A struct's `invariant` clauses.
+fn dump_invariants(con: &Serial, p: &Parser, m: &mut Mono, pr: Pr, head: u64) {
+  let mut v = head;
+  while v != 0 {
+    put(con, " (invariant ");
+    dump_expr(con, p, &mut m, pr, v);
+    put(con, ")");
+    v = next_of(p, v);
+  }
 }
 
 /// The program after monomorphization (`--dump-mono`), or after checking
@@ -553,7 +593,7 @@ fn dump_mono(con: &Serial, p: &Parser, m: &mut Mono, lets: bool) {
     let xi = inst_at(m, x);
     let n = node_at(p.nodes, xi.def);
     let pr = Pr { raw: false, env: x, lets: lets };
-    begin(con, pr, "fn", n);
+    begin(con, pr, fn_kind(n), n);
     put(con, " ");
     put_inst(con, p, m, x);
     put(con, " []");

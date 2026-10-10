@@ -12,8 +12,8 @@
 (type_identifier) @type
 ((type_identifier) @type.builtin
   (#any-of? @type.builtin
-    "u64" "bool" "Str" "Buf" "Bytes" "Host" "Child" "Serial" "Frame"
-    "PageTable" "Pool" "Mmu" "Cpu" "Vec" "Box"))
+    "u64" "u32" "u16" "u8" "i64" "i32" "i16" "i8" "bool" "Str" "Buf" "Bytes" "Host" "Child" "Serial" "Frame"
+    "PageTable" "Pool" "Mmu" "Cpu" "Vec" "Box" "Lock"))
 (variant_identifier) @constructor
 (struct_expression name: (identifier) @type)
 (variant_expression type: (identifier) @type)
@@ -42,6 +42,7 @@
 ; Keywords
 [
   "fn"
+  "export"
   "spec"
   "struct"
   "enum"

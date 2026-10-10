@@ -1,0 +1,60 @@
+// expect-exit: 42
+// Sized integers (docs/integers.md): u8, u16 and u32 are proved never to
+// wrap, like u64; literals take their type from context; `cast` proves a
+// value fits and `wrap` reduces it modulo 2^width.
+
+struct Pixel { r: u8, g: u8, b: u8 }
+enum Reg { Port(u16), None }
+
+fn hex_digit(n: u64) -> u8
+  requires n < 16
+  ensures result < 103
+{
+  if n < 10 { return cast[u8](n) + 48; }   // '0' + n
+  return cast[u8](n) + 87;                 // 'a' + n - 10
+}
+
+// Each copy is checked on its own: `a + b` is u8 arithmetic in one and u32 in the other.
+fn add[T](a: T, b: T) -> T
+  requires a + b <= 255
+{
+  return a + b;
+}
+
+// A checksum that is meant to wrap.
+fn sum8(b: &Bytes) -> u8 {
+  let mut s: u8 = 0;
+  let mut i = 0;
+  while i < blen(b) invariant i <= blen(b) {
+    s = wrap_add(s, wrap[u8](bget(b, i)));
+    i = i + 1;
+  }
+  return s;
+}
+
+fn main() -> u64 {
+  let p = Pixel { r: 200, g: 50, b: 5 };
+  let avg: u16 = (cast[u16](p.r) + cast[u16](p.g) + cast[u16](p.b)) / 3;   // 85
+  let x: u32 = 70000;
+  let low: u16 = wrap[u16](x);                                            // 4464
+  let mut v = vec_new[u8]();
+  vec_push(&mut v, hex_digit(10));                                        // 'a' = 97
+  vec_push(&mut v, add[u8](1, 2));
+  let r = Reg::Port(0x3F8);
+  let mut port: u32 = 0;
+  match r {
+    Reg::Port(n) => { port = cast[u32](n); },
+    Reg::None => {},
+  }
+  let mut bs = balloc(3);
+  bset(&mut bs, 0, 200);
+  bset(&mut bs, 1, 100);
+  bset(&mut bs, 2, 1);
+  let s = sum8(bs);                                                       // 301 mod 256 = 45
+  bfree(bs);
+  let d = vec_get(v, 0);
+  let k: u32 = add[u32](2, 3);
+  vec_free(v);
+  if avg != 85 || low != 4464 || d != 97 || port != 1016 || s != 45 || k != 5 { return 1; }
+  return cast[u64](s) - cast[u64](k) + wrap_sub(cast[u64](0), 18446744073709551614);   // 45 - 5 + 2
+}

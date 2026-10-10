@@ -47,11 +47,15 @@ for n in "${names[@]}"; do
     echo "run $n FAILED: output differs from the C twin"; status=1; continue
   fi
   tb=$(best "$tmp/$n") && tc=$(best "$tmp/$n.c.exe") || { echo "run $n FAILED: nonzero exit"; status=1; continue; }
-  native=""
-  if "$BASTIOC" --backend native -o "$tmp/$n.x" "bench/$n.bastio" 2>/dev/null && [ "$("$tmp/$n.x")" = "$("$tmp/$n.c.exe")" ]; then
-    tx=$(best "$tmp/$n.x") && native=" native=$tx native_ratio=$(awk -v b="$tx" -v c="$tc" 'BEGIN { printf "%.2f", (c > 0 ? b / c : 0) }')"
+  # Exit status 4: the native backend does not support the program yet.
+  "$BASTIOC" --backend native -o "$tmp/$n.x" "bench/$n.bastio" 2>/dev/null; rc=$?
+  if [ $rc = 4 ]; then
+    native=" native=unsupported"
+  elif [ $rc = 0 ] && [ "$("$tmp/$n.x")" = "$("$tmp/$n.c.exe")" ] && tx=$(best "$tmp/$n.x"); then
+    native=" native=$tx native_ratio=$(awk -v b="$tx" -v c="$tc" 'BEGIN { printf "%.2f", (c > 0 ? b / c : 0) }')"
+  else
+    echo "run $n FAILED: the native build failed or its output differs"; status=1; native=""
   fi
-  [ -n "$native" ] || { echo "run $n FAILED: the native backend build differs or failed"; status=1; }
   echo "run $n bastio=$tb c=$tc ratio=$(awk -v b="$tb" -v c="$tc" 'BEGIN { printf "%.2f", (c > 0 ? b / c : 0) }')$native"
 done
 

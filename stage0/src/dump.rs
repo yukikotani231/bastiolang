@@ -63,6 +63,7 @@ pub fn expr(e: &Expr) -> String {
         ExprKind::Is(x, en, v) => format!("(is {} {} {} {})", at, expr(x), en, v),
         ExprKind::Var(n) => format!("(var {} {})", at, n),
         ExprKind::Not(x) => format!("(not {} {})", at, expr(x)),
+        ExprKind::Neg(x) => format!("(neg {} {})", at, expr(x)),
         ExprKind::Bin(op, a, b) => format!("(bin {} {} {} {})", at, op.text(), expr(a), expr(b)),
         ExprKind::Call(n, xs) => {
             let mut s = format!("(call {} {}", at, n);
@@ -139,6 +140,9 @@ pub fn program(prog: &Program) -> String {
         for (f, t) in &d.fields {
             out.push_str(&format!(" ({} {})", f, t.name()));
         }
+        for i in &d.invariants {
+            out.push_str(&format!(" (invariant {})", expr(i)));
+        }
         out.push_str(")\n");
     }
     for d in &prog.enums {
@@ -155,7 +159,7 @@ pub fn program(prog: &Program) -> String {
         out.push_str(&format!("(spec {} {} {} {} {})\n", p(s.pos), s.name, params(&s.params), s.ret.name(), expr(&s.body)));
     }
     for f in &prog.fns {
-        out.push_str(&format!("(fn {} {} {} {} {}", p(f.pos), f.name, tparams(&f.tparams), params(&f.params), f.ret.name()));
+        out.push_str(&format!("({} {} {} {} {} {}", if f.export { "export-fn" } else { "fn" }, p(f.pos), f.name, tparams(&f.tparams), params(&f.params), f.ret.name()));
         for r in &f.requires {
             out.push_str(&format!(" (requires {})", expr(r)));
         }

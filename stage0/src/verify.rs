@@ -26,14 +26,26 @@
 //   PageTable  id, level, used[i] (which of its 512 slots own something)
 //   Pool       has[i] (the page numbers it can still hand out), size
 //   Mmu        root (the id of the table in CR3; KROOT for the kernel's own)
+//   Ports      free[p] (the I/O ports nobody has claimed yet)
+//   MmioSpace  free[a] (the device-window addresses nobody has claimed)
+//   Mmio       base, len (the device registers base .. base+len it owns,
+//              always inside the device window)
+//   Dma        id (the page number of the page it lends to devices)
+//   PortIo     base, count (the ports base .. base+count it owns; always
+//              within the 65536 ports)
 // A struct value is the values of its fields; places like `p.root` read and
 // write inside it.
 // The builtins' preconditions over this state (see `builtin`) are what make
 // page ownership, page-table structure and CR3 switching safe.
 //
 // `&mut x` arguments: the callee's `requires` see x's value at the call; after
-// the call x gets a fresh value, constrained only by the callee's `ensures`,
-// where `x` means the new value and `old(..)` the value at the call.
+// the call x gets a fresh value, constrained by the callee's `ensures`, where
+// `x` means the new value and `old(..)` the value at the call, and by the
+// callee's summary (see `summarize`): the parts of x that the callee's body
+// provably leaves alone, or changes only in ways that keep their shape, keep
+// what is known about them. So a driver function taking `&mut Dev` does not
+// have to restate `port_count(d.io) == 8` in its `ensures`, nor its callers'
+// loops in their invariants.
 
 use crate::ast::*;
 use crate::check::is_builtin;
@@ -51,6 +63,13 @@ const KROOT: &str = "65536";
 /// There is one pool per program, so its size is one global ghost constant.
 /// Every page number is below it: pages only ever come from `pool_take`.
 const POOLSIZE: &str = "POOLSIZE";
+/// The number of x86 I/O ports: a PortIo's ports are all below it.
+const PORT_LIMIT: &str = "65536";
+/// The device window a `Mmio` lies in: physical 0xC000_0000 up to 4 GiB,
+/// which the platform maps uncached (and which holds no pool page, since
+/// pages stay below FRAME_LIMIT).
+const MMIO_LO: &str = "3221225472";
+const MMIO_HI: &str = "4294967296";
 const NO_BOOL: &str = "((as const (Array Int Bool)) false)";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -228,6 +247,25 @@ fn opaque_boxes(v: &Val, ty: &Type) -> Val {
     }
 }
 
+/// The type of a value, for `lock_new`. A `Bytes` reads as `Buf`: the
+/// lock then forgets that every byte is <= 255, which loses facts but never
+/// assumes a false one.
+fn val_type(v: &Val) -> Type {
+    match v {
+        Val::U(_) => Type::U64,
+        Val::B(_) => Type::Bool,
+        Val::Buf { .. } => Type::Buf,
+        Val::Str { .. } => Type::Str,
+        Val::Obj(t, _) => t.clone(),
+        Val::Struct(n, _) => Type::Struct(n.clone()),
+        Val::Enum(n, _, _) => Type::Enum(n.clone()),
+        Val::Box(BoxVal::Known(i)) => Type::Box(Box::new(val_type(i))),
+        Val::Box(BoxVal::Opaque(t)) => Type::Box(Box::new(t.clone())),
+        Val::Vec { elem, .. } => Type::Vec(Box::new(elem.clone())),
+        Val::Unit => Type::Unit,
+    }
+}
+
 impl Val {
     fn term(&self) -> &str {
         match self {
@@ -250,6 +288,11 @@ fn ghost_fields(t: &Type) -> &'static [(&'static str, bool, &'static str)] {
         Type::PageTable => &[("id", false, "pt_id"), ("level", false, "pt_level"), ("used", true, "")],
         Type::Pool => &[("has", true, ""), ("size", false, "pool_size")],
         Type::Mmu => &[("root", false, "mmu_root")],
+        Type::Ports => &[("free", true, "")],
+        Type::PortIo => &[("base", false, "port_base"), ("count", false, "port_count")],
+        Type::MmioSpace => &[("free", true, "")],
+        Type::Mmio => &[("base", false, "mmio_base"), ("len", false, "mmio_len")],
+        Type::Dma => &[("id", false, "dma_id")],
         _ => &[],
     }
 }
@@ -257,12 +300,76 @@ fn ghost_fields(t: &Type) -> &'static [(&'static str, bool, &'static str)] {
 /// Ghost fields a loop keeps when the object is changed only by builtins
 /// that never change them (a page table keeps its id and level).
 fn kept_by_builtins(t: &Type, field: &str) -> bool {
-    matches!((t, field), (Type::Frame, "id") | (Type::PageTable, "id") | (Type::PageTable, "level") | (Type::Pool, "size"))
+    matches!((t, field), (Type::Frame, "id") | (Type::PageTable, "id") | (Type::PageTable, "level") | (Type::Pool, "size") | (Type::PortIo, "base") | (Type::PortIo, "count") | (Type::Mmio, "base") | (Type::Mmio, "len") | (Type::Dma, "id"))
 }
 
 /// Builtins whose `&mut` argument keeps the fields above.
 const SHAPE_KEEPING: &[&str] =
-    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pool_take", "pool_give", "frame_write", "frame_write8", "cpu_set", "cpu_run", "cpu_idle"];
+    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pool_take", "pool_give", "frame_write", "frame_write8", "cpu_set", "cpu_run", "cpu_idle", "cpu_fpu_save", "cpu_fpu_load",
+      "pio_in8", "pio_in16", "pio_in32", "pio_out8", "pio_out16", "pio_out32",
+      "mmio_read8", "mmio_read16", "mmio_read32", "mmio_read64", "mmio_write8", "mmio_write16", "mmio_write32", "mmio_write64",
+      "dma_read8", "dma_read16", "dma_read32", "dma_read64", "dma_write8", "dma_write16", "dma_write32", "dma_write64"];
+
+/// What a call may do to one `&mut` argument: the places under it that may
+/// change, as paths relative to the parameter (`""` is the parameter itself,
+/// `".f.g"` a field of it), each with the `changed_vars` flag (true: changed
+/// only in ways that keep the shape). The parameter itself is always listed.
+type Summary = Vec<(String, bool)>;
+
+/// Each function's summary for each of its parameters (`None` for those
+/// that are not `&mut`).
+type Summaries = HashMap<String, Vec<Option<Summary>>>;
+
+/// Places deeper than this are summarized by their prefix of this depth,
+/// marked as changed in any way. Recursion through boxes could otherwise
+/// grow paths forever.
+const SUMMARY_DEPTH: usize = 8;
+
+/// Computes every function's summaries from its body: what `changed_vars`
+/// finds under each `&mut` parameter, where lending a place to another user
+/// function counts as that function's summary applied to the place.
+///
+/// This is a greatest fixed point: it starts from "every parameter keeps its
+/// shape" and weakens summaries until none changes. Sound for recursion too:
+/// a change that is not shape-keeping happens at some assignment or builtin
+/// call, which is recorded there and then propagates to every caller.
+fn summarize(p: &Program) -> Summaries {
+    let mut sums: Summaries = HashMap::new();
+    for f in &p.fns {
+        let ps = f.params.iter().map(|q| q.ty.is_mut_ref().then(|| vec![(String::new(), true)])).collect();
+        sums.insert(f.name.clone(), ps);
+    }
+    loop {
+        let mut changed = false;
+        for f in &p.fns {
+            let mut m = HashMap::new();
+            changed_vars(&f.body, &mut m, &sums);
+            for (i, q) in f.params.iter().enumerate() {
+                if !q.ty.is_mut_ref() {
+                    continue;
+                }
+                let mut s: HashMap<String, bool> = HashMap::new();
+                s.insert(String::new(), true);
+                for (path, keep) in &m {
+                    if path_root(path) == q.name {
+                        let x = s.entry(path[q.name.len()..].to_string()).or_insert(true);
+                        *x = *x && *keep;
+                    }
+                }
+                let mut s: Summary = s.into_iter().collect();
+                s.sort_by_key(|(r, _)| (r.matches('.').count(), r.clone()));
+                let slot = &mut sums.get_mut(&f.name).unwrap()[i];
+                if slot.as_ref() != Some(&s) {
+                    *slot = Some(s);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return sums;
+        }
+    }
+}
 
 #[derive(Clone)]
 struct State {
@@ -291,6 +398,10 @@ pub struct Verifier<'p> {
     pub obligations: usize,
     /// Boxes being unfolded by `fresh_of` right now.
     box_depth: usize,
+    /// The integer type of each arithmetic operator in the function being
+    /// verified (`FnDef::int_ops`).
+    int_ops: HashMap<Pos, Type>,
+    sums: Summaries,
 }
 
 fn sanitize(n: &str) -> String {
@@ -313,20 +424,78 @@ fn or_all(ts: &[String]) -> String {
     }
 }
 
+/// An integer as an SMT-LIB term (negative numbers are written `(- n)`).
+fn num(v: i128) -> String {
+    if v < 0 { format!("(- {})", -v) } else { v.to_string() }
+}
+
+/// `x` reduced to the range of the integer type `t`, as a C conversion to
+/// `t` does: modulo 2^width, two's complement for a signed type.
+fn wrap_term(t: &Type, x: &str) -> String {
+    if t.is_signed() {
+        let h = t.int_modulus() / 2;
+        format!("(- (mod (+ {} {}) {}) {})", x, h, t.int_modulus(), h)
+    } else {
+        format!("(mod {} {})", x, t.int_modulus())
+    }
+}
+
+/// C's division on signed operands, which truncates toward zero (SMT-LIB's
+/// `div` rounds so that the remainder is never negative).
+fn c_div(a: &str, b: &str) -> String {
+    let abs = |x: &str| format!("(ite (>= {x} 0) {x} (- {x}))");
+    let q = format!("(div {} {})", abs(a), abs(b));
+    format!("(ite (= (>= {} 0) (>= {} 0)) {q} (- {q}))", a, b)
+}
+
 fn ite(c: &str, a: &str, b: &str) -> String {
     if a == b { a.to_string() } else { format!("(ite {} {} {})", c, a, b) }
 }
 
 pub fn verify_program(p: &Program) -> Result<(usize, Vec<String>), Diag> {
     let solver = Solver::start().map_err(|e| Diag::new("E-SOLVER", Pos::default(), e))?;
-    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0 };
+    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, sums: summarize(p), int_ops: HashMap::new() };
     v.smt(&format!("(declare-const {} Int)", POOLSIZE))?;
     v.smt(&format!("(assert (and (<= 0 {p}) (<= {p} {})))", FRAME_LIMIT, p = POOLSIZE))?;
+    // Each function gets its own solver scope: what is declared and assumed
+    // while verifying one (some of it quantified, such as "every byte of a
+    // Bytes is <= 255") must not burden the queries for all later ones.
+    // BASTIO_TIME=1 prints the time each function took.
+    let timed = std::env::var("BASTIO_TIME").is_ok();
     for f in &p.fns {
+        let t0 = std::time::Instant::now();
+        if f.export {
+            buffers_kept(f, &v.sums)?;
+        }
+        v.smt("(push 1)")?;
         v.verify_fn(f).map_err(|d| crate::check::in_copy(d, &f.name))?;
+        v.smt("(pop 1)")?;
+        if timed {
+            eprintln!("{:8.1} ms {}", t0.elapsed().as_secs_f64() * 1000.0, f.name);
+        }
     }
     let log = std::mem::take(&mut v.solver.log);
     Ok((v.obligations, log))
+}
+
+/// A `&mut Bytes` that C lends to an `export fn` is the caller's memory:
+/// the function may write its bytes but must hand back the same buffer,
+/// never free or replace it. Its summary shows that: the parameter is
+/// changed only by shape-keeping builtins (`bset`), directly or through
+/// other functions' summaries, so it is the same allocation of the same
+/// length on return.
+fn buffers_kept(f: &FnDef, sums: &Summaries) -> Result<(), Diag> {
+    for (i, q) in f.params.iter().enumerate() {
+        if !matches!(&q.ty, Type::MutRef(t) if **t == Type::Bytes) {
+            continue;
+        }
+        let kept = sums[&f.name][i].as_ref().map_or(false, |s| s.iter().all(|(_, keep)| *keep));
+        if !kept {
+            return Err(Diag::new("E-EXPORT", q.pos, format!("`{}` belongs to the C caller, but `{}` may free or replace it", q.name, f.name))
+                .note("a buffer lent by C may only be written in place (`bset`, or lent to functions that do only that)"));
+        }
+    }
+    Ok(())
 }
 
 impl<'p> Verifier<'p> {
@@ -369,8 +538,12 @@ impl<'p> Verifier<'p> {
     fn fresh_field(&mut self, t: &Type, field: &str, hint: &str) -> Result<String, Diag> {
         let h = format!("{}_{}", hint, field);
         match (t, field) {
-            (_, "used") | (_, "has") => self.fresh_array(&h, "Bool"),
-            (Type::Frame, "id") | (Type::PageTable, "id") => {
+            (_, "used") | (_, "has") | (_, "free") => self.fresh_array(&h, "Bool"),
+            (Type::PortIo, "base") => self.fresh_int(&h, "0", PORT_LIMIT),
+            (Type::PortIo, "count") => self.fresh_int(&h, "0", PORT_LIMIT),
+            (Type::Mmio, "base") => self.fresh_int(&h, MMIO_LO, MMIO_HI),
+            (Type::Mmio, "len") => self.fresh_int(&h, "0", MMIO_HI),
+            (Type::Frame, "id") | (Type::PageTable, "id") | (Type::Dma, "id") => {
                 let n = self.fresh_int(&h, "0", FRAME_LIMIT)?;
                 self.smt(&format!("(assert (< {} {}))", n, POOLSIZE))?;
                 Ok(n)
@@ -385,6 +558,7 @@ impl<'p> Verifier<'p> {
     fn fresh_of(&mut self, ty: &Type, hint: &str) -> Result<Val, Diag> {
         match ty {
             Type::U64 => self.fresh_u64(hint),
+            Type::U8 | Type::U16 | Type::U32 | Type::I8 | Type::I16 | Type::I32 | Type::I64 => Ok(Val::U(self.fresh_int(hint, &num(ty.int_min()), &num(ty.int_max()))?)),
             Type::Bool => self.fresh_bool(hint),
             Type::Buf => Ok(Val::Buf { len: self.fresh_len(hint)?, data: self.fresh_array(hint, "Int")? }),
             Type::Bytes => {
@@ -435,6 +609,12 @@ impl<'p> Verifier<'p> {
                 let mut fs = Vec::new();
                 for (f, _, _) in ghost_fields(t) {
                     fs.push(self.fresh_field(t, f, hint)?);
+                }
+                if *t == Type::PortIo {
+                    self.smt(&format!("(assert (<= (+ {} {}) {}))", fs[0], fs[1], PORT_LIMIT))?;
+                }
+                if *t == Type::Mmio {
+                    self.smt(&format!("(assert (<= (+ {} {}) {}))", fs[0], fs[1], MMIO_HI))?;
                 }
                 Ok(Val::Obj(t.clone(), fs))
             }
@@ -535,6 +715,7 @@ impl<'p> Verifier<'p> {
     }
 
     fn verify_fn(&mut self, f: &FnDef) -> Result<(), Diag> {
+        self.int_ops = f.int_ops.clone();
         let mut env = HashMap::new();
         for p in &f.params {
             let v = self.fresh_of(&p.ty, &p.name)?;
@@ -551,6 +732,17 @@ impl<'p> Verifier<'p> {
                         v.field("size")
                     )),
                     (Type::Mmu, v) => st.pc.push(format!("(= {} {})", v.field("root"), KROOT)),
+                    (Type::Ports, v) => st.pc.push(format!(
+                        "(forall ((k Int)) (= (select {} k) (and (<= 0 k) (< k {}))))",
+                        v.field("free"),
+                        PORT_LIMIT
+                    )),
+                    (Type::MmioSpace, v) => st.pc.push(format!(
+                        "(forall ((k Int)) (= (select {} k) (and (<= {} k) (< k {}))))",
+                        v.field("free"),
+                        MMIO_LO,
+                        MMIO_HI
+                    )),
                     _ => {}
                 }
             }
@@ -727,8 +919,8 @@ impl<'p> Verifier<'p> {
                 }
                 // 2. havoc what the body (or the condition) changes
                 let mut changed = HashMap::new();
-                changed_vars(body, &mut changed);
-                changed_in_expr(cond, &mut changed);
+                changed_vars(body, &mut changed, &self.sums);
+                changed_in_expr(cond, &mut changed, &self.sums);
                 let mut lst = st.clone();
                 // Enclosing places first, so a field's own havoc lands inside its struct's.
                 let mut changed: Vec<(String, bool)> = changed.into_iter().collect();
@@ -804,10 +996,15 @@ impl<'p> Verifier<'p> {
         }
     }
 
-    /// A fresh value of the same type as `old`. With `keep`, a Buf keeps its
-    /// length and an object the ghost fields builtins never change.
+    /// A fresh value of the same type as `old`. With `keep` (the value was
+    /// changed only in shape-keeping ways, see `changed_vars`), a Buf or a
+    /// vector keeps its length, an object the ghost fields builtins never
+    /// change, and scalars, enum tags and the fields of structs stay as they
+    /// were: no shape-keeping builtin changes them, and any other change to a
+    /// place inside is havocked separately, after this.
     fn havoc(&mut self, old: &Val, keep: bool, name: &str) -> Result<Val, Diag> {
         Ok(match old {
+            Val::U(_) | Val::B(_) | Val::Str { .. } if keep => old.clone(),
             Val::Buf { len, .. } => {
                 let len = if keep { len.clone() } else { self.fresh_len(name)? };
                 Val::Buf { len, data: self.fresh_array(name, "Int")? }
@@ -829,16 +1026,16 @@ impl<'p> Verifier<'p> {
             Val::Struct(n, fs) => {
                 let mut nf = Vec::new();
                 for ((f, _), fv) in struct_def(n).unwrap().fields.iter().zip(fs) {
-                    nf.push(self.havoc(fv, false, &format!("{}_{}", name, f))?);
+                    nf.push(self.havoc(fv, keep, &format!("{}_{}", name, f))?);
                 }
                 Val::Struct(n.clone(), nf)
             }
-            Val::Enum(n, _, ps) => {
+            Val::Enum(n, tag, ps) => {
                 let d = enum_def(n).unwrap();
-                let tag = self.fresh_int(&format!("{}_tag", name), "0", &(d.variants.len() - 1).to_string())?;
+                let tag = if keep { tag.clone() } else { self.fresh_int(&format!("{}_tag", name), "0", &(d.variants.len() - 1).to_string())? };
                 let mut np = Vec::new();
                 for ((v, _), pv) in d.variants.iter().zip(ps) {
-                    np.push(self.havoc(pv, false, &format!("{}_{}", name, v))?);
+                    np.push(self.havoc(pv, keep, &format!("{}_{}", name, v))?);
                 }
                 Val::Enum(n.clone(), tag, np)
             }
@@ -846,7 +1043,7 @@ impl<'p> Verifier<'p> {
                 let len = if keep { len.clone() } else { self.fresh_len(name)? };
                 Val::Vec { elem: elem.clone(), len, elems: Box::new(self.fresh_lifted(elem, name)?) }
             }
-            Val::Box(BoxVal::Known(i)) => Val::Box(BoxVal::Known(Box::new(self.havoc(i, false, name)?))),
+            Val::Box(BoxVal::Known(i)) => Val::Box(BoxVal::Known(Box::new(self.havoc(i, keep, name)?))),
             Val::Box(BoxVal::Opaque(t)) => Val::Box(BoxVal::Opaque(t.clone())),
             Val::Unit => Val::Unit,
         })
@@ -858,6 +1055,23 @@ impl<'p> Verifier<'p> {
             ExprKind::TypeApp(targs, inner) => match &inner.kind {
                 ExprKind::Call(n, _) if n == "vec_new" => {
                     Ok(Val::Vec { elem: targs[0].clone(), len: "0".into(), elems: Box::new(self.fresh_lifted(&targs[0], "vec")?) })
+                }
+                // `cast[T](x)` keeps the value and proves it fits; `wrap[T](x)`
+                // reduces it modulo 2^width.
+                ExprKind::Call(n, args) if n == "cast" || n == "wrap" => {
+                    let x = self.eval(&args[0], st)?.term().to_string();
+                    let t = &targs[0];
+                    if n == "wrap" {
+                        return Ok(Val::U(wrap_term(t, &x)));
+                    }
+                    let from = self.int_ops.get(&e.pos).cloned().unwrap_or(Type::U64);
+                    let max = num(t.int_max());
+                    if !from.is_signed() && !t.is_signed() {
+                        self.prove(st, &format!("(<= {} {})", x, max), e.pos, "E-VERIFY-CAST", format!("that `{}` fits in {} (`<= {}`)", render(&args[0]), t.name(), max))?;
+                    } else {
+                        self.prove(st, &format!("(and (<= {} {}) (<= {} {}))", num(t.int_min()), x, x, max), e.pos, "E-VERIFY-CAST", format!("that `{}` fits in {} ({} to {})", render(&args[0]), t.name(), t.int_min(), t.int_max()))?;
+                    }
+                    Ok(Val::U(x))
                 }
                 _ => unreachable!("removed by monomorphization"),
             },
@@ -901,6 +1115,15 @@ impl<'p> Verifier<'p> {
                 let v = self.eval(x, st)?;
                 Ok(Val::B(format!("(not {})", v.term())))
             }
+            ExprKind::Neg(x) => {
+                if let ExprKind::Int(v) = x.kind {
+                    return Ok(Val::U(num(-(v as i128))));
+                }
+                let v = self.eval(x, st)?.term().to_string();
+                let ity = self.int_ops[&e.pos].clone();
+                self.prove(st, &format!("(not (= {} {}))", v, num(ity.int_min())), e.pos, "E-VERIFY-OVERFLOW", format!("that `-{}` does not overflow {} (`{}` is not {})", render(x), ity.name(), render(x), ity.int_min()))?;
+                Ok(Val::U(format!("(- {})", v)))
+            }
             ExprKind::Forall(..) => unreachable!("rejected by the checker"),
             ExprKind::Bin(op, a, b) => {
                 let va = self.eval(a, st)?;
@@ -930,10 +1153,15 @@ impl<'p> Verifier<'p> {
                 let vb = self.eval(b, st)?;
                 let tb = vb.term().to_string();
                 let (ra, rb) = (render(a), render(b));
+                let ity = self.int_ops.get(&e.pos).cloned().unwrap_or(Type::U64);
+                let max = ity.int_max().to_string();
+                if ity.is_signed() && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem) {
+                    return self.signed_arith(*op, &ta, &tb, &ra, &rb, &ity, e.pos, st);
+                }
                 let v = match op {
                     BinOp::Add => {
                         let t = format!("(+ {} {})", ta, tb);
-                        self.prove(st, &format!("(<= {} {})", t, U64_MAX), e.pos, "E-VERIFY-OVERFLOW", format!("that `{} + {}` does not overflow u64", ra, rb))?;
+                        self.prove(st, &format!("(<= {} {})", t, max), e.pos, "E-VERIFY-OVERFLOW", format!("that `{} + {}` does not overflow {}", ra, rb, ity.name()))?;
                         Val::U(t)
                     }
                     BinOp::Sub => {
@@ -942,7 +1170,7 @@ impl<'p> Verifier<'p> {
                     }
                     BinOp::Mul => {
                         let t = format!("(* {} {})", ta, tb);
-                        self.prove(st, &format!("(<= {} {})", t, U64_MAX), e.pos, "E-VERIFY-OVERFLOW", format!("that `{} * {}` does not overflow u64", ra, rb))?;
+                        self.prove(st, &format!("(<= {} {})", t, max), e.pos, "E-VERIFY-OVERFLOW", format!("that `{} * {}` does not overflow {}", ra, rb, ity.name()))?;
                         Val::U(t)
                     }
                     BinOp::Div | BinOp::Rem => {
@@ -964,7 +1192,36 @@ impl<'p> Verifier<'p> {
         }
     }
 
+    /// Arithmetic on a signed type: the result must stay between the type's
+    /// minimum (E-VERIFY-UNDERFLOW) and maximum (E-VERIFY-OVERFLOW); `/` and
+    /// `%` truncate toward zero, as in C, and `MIN / -1` overflows.
+    #[allow(clippy::too_many_arguments)]
+    fn signed_arith(&mut self, op: BinOp, ta: &str, tb: &str, ra: &str, rb: &str, ity: &Type, pos: Pos, st: &mut State) -> Result<Val, Diag> {
+        let (min, max) = (num(ity.int_min()), num(ity.int_max()));
+        let t = match op {
+            BinOp::Add => format!("(+ {} {})", ta, tb),
+            BinOp::Sub => format!("(- {} {})", ta, tb),
+            BinOp::Mul => format!("(* {} {})", ta, tb),
+            _ => {
+                self.prove(st, &format!("(not (= {} 0))", tb), pos, "E-VERIFY-DIVZERO", format!("that the divisor `{}` is not zero", rb))?;
+                self.prove(st, &format!("(not (and (= {} {}) (= {} (- 1))))", ta, min, tb), pos, "E-VERIFY-OVERFLOW", format!("that `{} {} {}` is not {} {} -1, which overflows {}", ra, op.text(), rb, ity.int_min(), op.text(), ity.name()))?;
+                let q = c_div(ta, tb);
+                return Ok(Val::U(if op == BinOp::Div { q } else { format!("(- {} (* {} {}))", ta, tb, q) }));
+            }
+        };
+        let text = format!("{} {} {}", ra, op.text(), rb);
+        self.prove(st, &format!("(<= {} {})", t, max), pos, "E-VERIFY-OVERFLOW", format!("that `{}` does not overflow {} (`<= {}`)", text, ity.name(), ity.int_max()))?;
+        self.prove(st, &format!("(<= {} {})", min, t), pos, "E-VERIFY-UNDERFLOW", format!("that `{}` does not go below the minimum of {} (`>= {}`)", text, ity.name(), ity.int_min()))?;
+        Ok(Val::U(t))
+    }
+
     fn call(&mut self, name: &str, args: &[Expr], pos: Pos, st: &mut State) -> Result<Val, Diag> {
+        if name == "locked" {
+            return self.locked(args, pos, st);
+        }
+        if name == "smp_run" {
+            return self.smp_run(args, pos, st);
+        }
         for a in args {
             if let Some(p) = match &a.kind {
                 ExprKind::MutBorrow(n) => Some(n.clone()),
@@ -1010,11 +1267,24 @@ impl<'p> Verifier<'p> {
         }
         let res = self.fresh_of(&f.ret, &format!("{}_ret", name))?;
         let mut post = pre.clone();
-        for (p, a) in f.params.iter().zip(args) {
+        for (i, (p, a)) in f.params.iter().zip(args).enumerate() {
             if let (Type::MutRef(t), ExprKind::MutBorrow(var)) = (&p.ty, &a.kind) {
-                let nv = self.fresh_of(t, &var.replace('.', "_"))?;
-                post.insert(p.name.clone(), nv.clone());
-                set_path(&mut st.env, var, nv);
+                let sum = self.sums[name][i].clone().expect("a &mut parameter has a summary");
+                if sum[0] == (String::new(), true) {
+                    // The callee keeps the argument's shape: havoc only what
+                    // it may change, as a loop would (shallowest first).
+                    for (rel, keep) in &sum {
+                        let path = format!("{}{}", var, rel);
+                        self.open_path(&mut st.env, &path)?;
+                        let old = get_path(&st.env, &path);
+                        let nv = self.havoc(&old, *keep, &path.replace('.', "_"))?;
+                        set_path(&mut st.env, &path, nv);
+                    }
+                } else {
+                    let nv = self.fresh_of(t, &var.replace('.', "_"))?;
+                    set_path(&mut st.env, var, nv);
+                }
+                post.insert(p.name.clone(), get_path(&st.env, var));
             }
         }
         for en in &f.ensures {
@@ -1022,6 +1292,84 @@ impl<'p> Verifier<'p> {
             st.pc.push(t);
         }
         Ok(res)
+    }
+
+    /// The facts a value's struct invariants state, with how to name each
+    /// one in a message. Structs held directly as fields count too; ones
+    /// behind a box, in a vector or in an enum payload do not (yet).
+    fn invariant_terms(&mut self, v: &Val, out: &mut Vec<(String, String)>) -> Result<(), Diag> {
+        if let Val::Struct(n, fs) = v {
+            let d = struct_def(n).unwrap();
+            let env: HashMap<String, Val> = d.fields.iter().map(|(f, _)| f.clone()).zip(fs.iter().cloned()).collect();
+            for i in &d.invariants {
+                let t = self.spec(i, Scope { env: &env, old: None, result: None }, &mut Vec::new())?;
+                out.push((format!("`{}` of {}", render(i), n), t));
+            }
+            for f in fs {
+                self.invariant_terms(f, out)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn invariants_of(&mut self, v: &Val) -> Result<Vec<(String, String)>, Diag> {
+        let mut out = Vec::new();
+        self.invariant_terms(v, &mut out)?;
+        Ok(out)
+    }
+
+    /// `locked(l, f, args..)`: the contents are a fresh value about which
+    /// only the invariants are known (another processor may have changed
+    /// them since this one last looked). `f` gets them as its `&mut` first
+    /// argument and must hand them back with the invariants holding again.
+    fn locked(&mut self, args: &[Expr], pos: Pos, st: &mut State) -> Result<Val, Diag> {
+        let lp = place(&args[0]).expect("checked: a place");
+        self.open_path(&mut st.env, &lp)?;
+        let Val::Obj(Type::Lock(t), _) = get_path(&st.env, &lp) else { unreachable!("checked: a lock") };
+        let ExprKind::Var(f) = &args[1].kind else { unreachable!("checked: a function name") };
+        let inner = self.fresh_of(&t, &format!("{}_contents", sanitize(&lp)))?;
+        for (_, i) in self.invariants_of(&inner)? {
+            st.pc.push(i);
+        }
+        // The contents live in a variable no program can name, for the call.
+        self.counter += 1;
+        let key = format!("locked*{}", self.counter);
+        st.env.insert(key.clone(), inner);
+        let mut cargs = vec![Expr { kind: ExprKind::MutBorrow(key.clone()), pos: args[0].pos }];
+        cargs.extend(args[2..].iter().cloned());
+        let res = self.call(f, &cargs, pos, st)?;
+        let after = st.env.remove(&key).expect("still there");
+        for (what, i) in self.invariants_of(&after)? {
+            self.prove(st, &i, pos, "E-VERIFY-LOCKINV", format!("that `{}` keeps the invariant {} before the lock `{}` is released", f, what, lp))?;
+        }
+        Ok(res)
+    }
+
+    /// `smp_run(f, args..)`: this processor's call is an ordinary call. The
+    /// other processors' calls get the same shared arguments and their own
+    /// `Cpu` and `Mmu`, with the kernel's tables in CR3, so `f`'s
+    /// precondition must hold for those too. They change nothing this
+    /// processor can see: everything shared is behind `&` (locks hold their
+    /// contents outside the proof's view).
+    fn smp_run(&mut self, args: &[Expr], pos: Pos, st: &mut State) -> Result<Val, Diag> {
+        let ExprKind::Var(name) = &args[0].kind else { unreachable!("checked: a function name") };
+        let f = self.prog.fns.iter().find(|f| &f.name == name).expect("checked");
+        if !f.requires.is_empty() {
+            let mut pre = HashMap::new();
+            for (p, a) in f.params.iter().zip(&args[1..]) {
+                let v = match p.ty.base() {
+                    Type::Cpu => Val::Obj(Type::Cpu, vec![]),
+                    Type::Mmu => Val::Obj(Type::Mmu, vec![KROOT.into()]),
+                    _ => self.eval(a, st)?,
+                };
+                pre.insert(p.name.clone(), v);
+            }
+            for r in &f.requires {
+                let t = self.spec(r, Scope { env: &pre, old: None, result: None }, &mut Vec::new())?;
+                self.prove(st, &t, pos, "E-VERIFY-REQUIRES", format!("the precondition `{}` of `{}` on the other processors, which start with the kernel's own tables", render(r), name))?;
+            }
+        }
+        self.call(name, &args[1..], pos, st)
     }
 
     /// Writes the new value of a `&mut` argument back to its variable.
@@ -1042,6 +1390,25 @@ impl<'p> Verifier<'p> {
         };
         match name {
             "box" => Ok(Val::Box(BoxVal::Known(Box::new(vals[0].clone())))),
+            "wrap_add" | "wrap_sub" | "wrap_mul" => {
+                let ity = self.int_ops.get(&pos).cloned().expect("typed by the checker");
+                let op = match name { "wrap_add" => "+", "wrap_sub" => "-", _ => "*" };
+                Ok(Val::U(wrap_term(&ity, &format!("({} {} {})", op, vals[0].term(), vals[1].term()))))
+            }
+            "lock_new" => {
+                for (what, i) in self.invariants_of(&vals[0])? {
+                    self.need(st, i, pos, "E-VERIFY-LOCKINV", format!("that the value put in the lock satisfies the invariant {}", what))?;
+                }
+                Ok(Val::Obj(Type::Lock(Box::new(val_type(&vals[0]))), vec![]))
+            }
+            "lock_end" => {
+                let Val::Obj(Type::Lock(t), _) = &vals[0] else { unreachable!("checked: a lock") };
+                let v = self.fresh_of(t, "unlocked")?;
+                for (_, i) in self.invariants_of(&v)? {
+                    st.pc.push(i);
+                }
+                Ok(v)
+            }
             "unbox" => match &vals[0] {
                 Val::Box(BoxVal::Known(v)) => Ok((**v).clone()),
                 Val::Box(BoxVal::Opaque(t)) => self.fresh_of(t, "unboxed"),
@@ -1263,7 +1630,11 @@ impl<'p> Verifier<'p> {
             "pt_has" => {
                 let i = vals[1].term().to_string();
                 index_ok(self, st, &i, "512", 1, "a page table (512 slots)")?;
-                Ok(Val::B(format!("(select {} {})", vals[0].field("used"), i)))
+                // Slot 0 of a top-level table maps the kernel on the kernel
+                // target: the hardware entry is present although the table
+                // does not own it, so what pt_has says there is unknown.
+                let k = self.fresh_bool("pt_has_kernel")?;
+                Ok(Val::B(format!("(ite (and (= {} 4) (= {} 0)) {} (select {} {}))", vals[0].field("level"), i, k.term(), vals[0].field("used"), i)))
             }
             "pt_put" | "pt_take" | "pt_put_frame" | "pt_take_frame" => {
                 let t = &vals[0];
@@ -1304,6 +1675,125 @@ impl<'p> Verifier<'p> {
                 }
             }
 
+            // ---- I/O ports ----
+            "port_claim" => {
+                let (p, b, c) = (&vals[0], vals[1].term(), vals[2].term());
+                let inr = format!("(and (<= {b} k) (< k (+ {b} {c})))");
+                self.need(st, format!("(<= (+ {} {}) {})", b, c, PORT_LIMIT), pos, "E-VERIFY-BOUNDS",
+                    format!("that the ports `{}` .. `{} + {}` exist (`{} + {} <= 65536`)", ra(1), ra(1), ra(2), ra(1), ra(2)))?;
+                self.need(st, format!("(forall ((k Int)) (=> {} (select {} k)))", inr, p.field("free")), pos, "E-VERIFY-OWN",
+                    format!("that nobody has claimed any of these ports (`port_free({}, k)` for each): two owners could drive one device", ra(0)))?;
+                // A lambda, not a fresh array with a quantified definition:
+                // reads of it reduce directly, so chains of claims stay
+                // quantifier-free.
+                let nf = format!("(lambda ((k Int)) (and (select {} k) (not {})))", p.field("free"), inr);
+                self.put_back(&args[0], Val::Obj(Type::Ports, vec![nf]), st);
+                Ok(Val::Obj(Type::PortIo, vec![b.to_string(), c.to_string()]))
+            }
+            "port_release" => {
+                let (p, io) = (&vals[0], &vals[1]);
+                let inr = format!("(and (<= {b} k) (< k (+ {b} {c})))", b = io.field("base"), c = io.field("count"));
+                let nf = format!("(lambda ((k Int)) (or (select {} k) {}))", p.field("free"), inr);
+                self.put_back(&args[0], Val::Obj(Type::Ports, vec![nf]), st);
+                Ok(Val::Unit)
+            }
+            // ---- memory-mapped device registers ----
+            "mmio_claim" => {
+                let (p, b, l) = (&vals[0], vals[1].term(), vals[2].term());
+                let inr = format!("(and (<= {b} k) (< k (+ {b} {l})))");
+                self.need(st, format!("(and (<= {} {}) (<= (+ {} {}) {}))", MMIO_LO, b, b, l, MMIO_HI), pos, "E-VERIFY-BOUNDS",
+                    format!("that `{}` .. `{} + {}` lies in the device window (0xC0000000 to 4 GiB)", ra(1), ra(1), ra(2)))?;
+                self.need(st, format!("(forall ((k Int)) (=> {} (select {} k)))", inr, p.field("free")), pos, "E-VERIFY-OWN",
+                    format!("that nobody has claimed any of these addresses (`mmio_free({}, a)` for each): two owners could drive one device", ra(0)))?;
+                let nf = format!("(lambda ((k Int)) (and (select {} k) (not {})))", p.field("free"), inr);
+                self.put_back(&args[0], Val::Obj(Type::MmioSpace, vec![nf]), st);
+                Ok(Val::Obj(Type::Mmio, vec![b.to_string(), l.to_string()]))
+            }
+            "mmio_release" => {
+                let (p, io) = (&vals[0], &vals[1]);
+                let inr = format!("(and (<= {b} k) (< k (+ {b} {l})))", b = io.field("base"), l = io.field("len"));
+                let nf = format!("(lambda ((k Int)) (or (select {} k) {}))", p.field("free"), inr);
+                self.put_back(&args[0], Val::Obj(Type::MmioSpace, vec![nf]), st);
+                Ok(Val::Unit)
+            }
+            "mmio_base" => Ok(Val::U(vals[0].field("base"))),
+            "mmio_len" => Ok(Val::U(vals[0].field("len"))),
+            "mmio_read8" | "mmio_read16" | "mmio_read32" | "mmio_read64" | "mmio_write8" | "mmio_write16" | "mmio_write32" | "mmio_write64" => {
+                let (bytes, max) = match name.trim_start_matches("mmio_read").trim_start_matches("mmio_write") {
+                    "8" => (1, "255"),
+                    "16" => (2, "65535"),
+                    "32" => (4, "4294967295"),
+                    _ => (8, U64_MAX),
+                };
+                let (io, off) = (&vals[0], vals[1].term());
+                self.need(st, format!("(<= (+ {} {}) {})", off, bytes, io.field("len")), pos, "E-VERIFY-BOUNDS",
+                    format!("that register offset `{}` is within `{}` (`{} + {} <= mmio_len({})`)", ra(1), ra(0), ra(1), bytes, ra(0)))?;
+                // Devices want naturally aligned accesses (and an unaligned
+                // one could straddle into the next register).
+                self.need(st, format!("(= (mod (+ {} {}) {}) 0)", io.field("base"), off, bytes), pos, "E-VERIFY-BOUNDS",
+                    format!("that the access at offset `{}` of `{}` is aligned to {} bytes", ra(1), ra(0), bytes))?;
+                if name.starts_with("mmio_write") {
+                    self.need(st, format!("(<= {} {})", vals[2].term(), max), pos, "E-VERIFY-BYTE",
+                        format!("that `{}` fits in {} bits (`<= {}`)", ra(2), bytes * 8, max))?;
+                    return Ok(Val::Unit);
+                }
+                let v = self.fresh_u64(name)?;
+                st.pc.push(format!("(<= {} {})", v.term(), max));
+                Ok(v)
+            }
+            // ---- pages lent to devices (DMA) ----
+            // Lending and taking back only change the type: the page keeps
+            // its number, and while it is a `Dma` nothing can free, map or
+            // reuse it. That the device has stopped using it by `dma_take`
+            // is the driver's word (devices are outside the proof).
+            "dma_lend" => Ok(Val::Obj(Type::Dma, vec![vals[0].field("id")])),
+            "dma_take" => Ok(Val::Obj(Type::Frame, vec![vals[0].field("id")])),
+            "dma_id" => Ok(Val::U(vals[0].field("id"))),
+            "dma_addr" => self.fresh_u64("dma_addr"),
+            "dma_read8" | "dma_read16" | "dma_read32" | "dma_read64" | "dma_write8" | "dma_write16" | "dma_write32" | "dma_write64" => {
+                let (bytes, max) = match name.trim_start_matches("dma_read").trim_start_matches("dma_write") {
+                    "8" => (1, "255"),
+                    "16" => (2, "65535"),
+                    "32" => (4, "4294967295"),
+                    _ => (8, U64_MAX),
+                };
+                let off = vals[1].term();
+                self.need(st, format!("(<= (+ {} {}) 4096)", off, bytes), pos, "E-VERIFY-BOUNDS",
+                    format!("that offset `{}` is within the page (`{} + {} <= 4096`)", ra(1), ra(1), bytes))?;
+                // The page is page-aligned, so an aligned offset is an
+                // aligned address: devices see whole fields, never torn ones.
+                self.need(st, format!("(= (mod {} {}) 0)", off, bytes), pos, "E-VERIFY-BOUNDS",
+                    format!("that offset `{}` is aligned to {} bytes", ra(1), bytes))?;
+                if name.starts_with("dma_write") {
+                    self.need(st, format!("(<= {} {})", vals[2].term(), max), pos, "E-VERIFY-BYTE",
+                        format!("that `{}` fits in {} bits (`<= {}`)", ra(2), bytes * 8, max))?;
+                    return Ok(Val::Unit);
+                }
+                let v = self.fresh_u64(name)?;
+                st.pc.push(format!("(<= {} {})", v.term(), max));
+                Ok(v)
+            }
+            "port_base" => Ok(Val::U(vals[0].field("base"))),
+            "port_count" => Ok(Val::U(vals[0].field("count"))),
+            "pio_in8" | "pio_in16" | "pio_in32" | "pio_out8" | "pio_out16" | "pio_out32" => {
+                let (bytes, max) = match &name[name.len() - 1..] {
+                    "8" => (1, "255"),
+                    "6" => (2, "65535"),
+                    _ => (4, "4294967295"),
+                };
+                let (io, off) = (&vals[0], vals[1].term());
+                self.need(st, format!("(<= (+ {} {}) {})", off, bytes, io.field("count")), pos, "E-VERIFY-BOUNDS",
+                    format!("that port offset `{}` is within `{}` (`{} + {} <= port_count({})`)", ra(1), ra(0), ra(1), bytes, ra(0)))?;
+                if name.starts_with("pio_out") {
+                    self.need(st, format!("(<= {} {})", vals[2].term(), max), pos, "E-VERIFY-BYTE",
+                        format!("that `{}` fits in {} bits (`<= {}`)", ra(2), bytes * 8, max))?;
+                    return Ok(Val::Unit);
+                }
+                let v = self.fresh_u64(name)?;
+                st.pc.push(format!("(<= {} {})", v.term(), max));
+                Ok(v)
+            }
+
             // ---- MMU and CPU ----
             "mmu_switch" => {
                 let t = &vals[1];
@@ -1315,19 +1805,33 @@ impl<'p> Verifier<'p> {
                 self.put_back(&args[0], Val::Obj(Type::Mmu, vec![KROOT.into()]), st);
                 Ok(Val::Unit)
             }
+            // The page's contents are not tracked, so neither changes anything
+            // the proof knows about.
+            "cpu_fpu_save" | "cpu_fpu_load" => Ok(Val::Unit),
             "cpu_run" | "cpu_idle" => {
                 let v = self.fresh_u64("vector")?;
                 st.pc.push(format!("(<= {} 255)", v.term()));
                 Ok(v)
             }
-            "cpu_get" | "cpu_set" => {
+            "cpu_count" => {
+                let n = self.fresh_u64("cpus")?;
+                // The platform's promise: at least this processor, and no
+                // more than 4096 (so per-processor tables can be allocated).
+                st.pc.push(format!("(and (>= {0} 1) (<= {0} 4096))", n.term()));
+                Ok(n)
+            }
+            "cpu_get" => {
                 let r = vals[1].term().to_string();
-                let lim = if name == "cpu_get" { "20" } else { "18" };
-                index_ok(self, st, &r, lim, 1, "the saved registers")?;
-                if name == "cpu_set" {
-                    return Ok(Val::Unit);
-                }
+                index_ok(self, st, &r, "21", 1, "the saved registers")?;
                 self.fresh_u64("reg")
+            }
+            "cpu_set" => {
+                // Registers 0-17 and the FS base (20); the error code and
+                // fault address (18, 19) are only reported by a trap.
+                let r = vals[1].term().to_string();
+                self.need(st, format!("(and (<= 0 {r}) (or (< {r} 18) (= {r} 20)))"), pos, "E-VERIFY-BOUNDS",
+                    format!("that register `{}` can be set (0-17 or 20)", ra(1)))?;
+                Ok(Val::Unit)
             }
 
             // ---- user programs ----
@@ -1338,7 +1842,22 @@ impl<'p> Verifier<'p> {
                     format!("that `{}..{}` is a range within `{}`", ra(1), ra(2), ra(0)))?;
                 self.fresh_u64("spawn")
             }
-            "sys_wait" | "sys_kill" | "sys_getpid" | "sys_info" => self.fresh_u64(name),
+            "sys_wait" | "sys_kill" | "sys_getpid" | "sys_info" | "sys_call" => self.fresh_u64(name),
+            "sys_send" => {
+                let n = vals[3].term();
+                let Val::Buf { len, .. } = &vals[2] else { unreachable!() };
+                self.need(st, format!("(<= {} {})", n, len), pos, "E-VERIFY-BOUNDS",
+                    format!("that `{}` bytes fit in `{}` (`{} <= blen({})`)", ra(3), ra(2), ra(3), ra(2)))?;
+                self.fresh_u64(name)
+            }
+            // The kernel may overwrite every byte of the buffer, but not its length.
+            "sys_recv" => {
+                let Val::Buf { len, .. } = &vals[2] else { unreachable!() };
+                let len = len.clone();
+                let Val::Buf { data, .. } = self.fresh_of(&Type::Bytes, "recv")? else { unreachable!() };
+                self.put_back(&args[2], Val::Buf { len, data }, st);
+                self.fresh_u64(name)
+            }
             "sys_yield" | "sys_ps" | "sys_poweroff" => Ok(Val::Unit),
             _ => unreachable!("unknown builtin {}", name),
         }
@@ -1391,6 +1910,7 @@ impl<'p> Verifier<'p> {
             },
             ExprKind::Var(_) | ExprKind::Field(..) => self.spec_val(e, sc, bound)?.term().to_string(),
             ExprKind::Not(x) => format!("(not {})", self.spec(x, sc, bound)?),
+            ExprKind::Neg(x) => format!("(- {})", self.spec(x, sc, bound)?),
             ExprKind::Bin(op, a, b) => {
                 let ta = self.spec(a, sc, bound)?;
                 let tb = self.spec(b, sc, bound)?;
@@ -1429,7 +1949,7 @@ impl<'p> Verifier<'p> {
                     let mut env = HashMap::new();
                     for (p, a) in sf.params.iter().zip(args) {
                         let v = match p.ty.base() {
-                            Type::U64 => Val::U(self.spec(a, sc, bound)?),
+                            t if t.is_int() => Val::U(self.spec(a, sc, bound)?),
                             Type::Bool => Val::B(self.spec(a, sc, bound)?),
                             _ => self.spec_val(a, sc, bound)?,
                         };
@@ -1454,10 +1974,15 @@ impl<'p> Verifier<'p> {
                         Val::Buf { data, .. } | Val::Str { data, .. } => format!("(select {} {})", data, self.spec(&args[1], sc, bound)?),
                         _ => unreachable!(),
                     },
-                    "frame_id" | "pt_id" => v.field("id"),
+                    "frame_id" | "pt_id" | "dma_id" => v.field("id"),
                     "pt_level" => v.field("level"),
                     "pool_size" => v.field("size"),
                     "mmu_root" => v.field("root"),
+                    "port_base" => v.field("base"),
+                    "port_count" => v.field("count"),
+                    "port_free" | "mmio_free" => format!("(select {} {})", v.field("free"), self.spec(&args[1], sc, bound)?),
+                    "mmio_base" => v.field("base"),
+                    "mmio_len" => v.field("len"),
                     "pt_used" => format!("(select {} {})", v.field("used"), self.spec(&args[1], sc, bound)?),
                     "pool_has" => format!("(select {} {})", v.field("has"), self.spec(&args[1], sc, bound)?),
                     _ => unreachable!("checked: {}", name),
@@ -1467,33 +1992,34 @@ impl<'p> Verifier<'p> {
     }
 }
 
-/// Variables a loop body may change, with a flag that is true when every
-/// change keeps the value's shape: `x = set(x, ..)` keeps a Buf's length,
-/// and the builtins in SHAPE_KEEPING keep an object's id, level and size.
-fn changed_vars(stmts: &[Stmt], out: &mut HashMap<String, bool>) {
+/// Places a loop body (or a function body) may change, with a flag that is
+/// true when every change keeps the value's shape: `x = set(x, ..)` keeps a
+/// Buf's length, the builtins in SHAPE_KEEPING keep an object's id, level
+/// and size, and a user function changes what its summary says.
+fn changed_vars(stmts: &[Stmt], out: &mut HashMap<String, bool>, sums: &Summaries) {
     for s in stmts {
         match &s.kind {
             StmtKind::Assign { name, value } => {
                 let only_set = matches!(&value.kind, ExprKind::Call(f, args) if f == "set" && place(&args[0]).as_deref() == Some(name.as_str()));
                 let e = out.entry(name.clone()).or_insert(true);
                 *e = *e && only_set;
-                changed_in_expr(value, out);
+                changed_in_expr(value, out, sums);
             }
-            StmtKind::Let { init, .. } => changed_in_expr(init, out),
-            StmtKind::Expr(e) | StmtKind::Return(Some(e)) => changed_in_expr(e, out),
+            StmtKind::Let { init, .. } => changed_in_expr(init, out, sums),
+            StmtKind::Expr(e) | StmtKind::Return(Some(e)) => changed_in_expr(e, out, sums),
             StmtKind::If { cond, then_b, else_b } => {
-                changed_in_expr(cond, out);
-                changed_vars(then_b, out);
-                changed_vars(else_b, out);
+                changed_in_expr(cond, out, sums);
+                changed_vars(then_b, out, sums);
+                changed_vars(else_b, out, sums);
             }
             StmtKind::While { cond, body, .. } => {
-                changed_in_expr(cond, out);
-                changed_vars(body, out);
+                changed_in_expr(cond, out, sums);
+                changed_vars(body, out, sums);
             }
             StmtKind::Match { scrut, arms } => {
-                changed_in_expr(scrut, out);
+                changed_in_expr(scrut, out, sums);
                 for a in arms {
-                    changed_vars(&a.body, out);
+                    changed_vars(&a.body, out, sums);
                 }
             }
             StmtKind::Return(None) | StmtKind::Assert(_) | StmtKind::Unreachable => {}
@@ -1501,31 +2027,53 @@ fn changed_vars(stmts: &[Stmt], out: &mut HashMap<String, bool>) {
     }
 }
 
-/// Variables lent as `&mut` anywhere in `e`.
-fn changed_in_expr(e: &Expr, out: &mut HashMap<String, bool>) {
+/// Records that `path` may change (`keep`: only in shape-keeping ways).
+fn note(out: &mut HashMap<String, bool>, path: String, keep: bool) {
+    let parts: Vec<&str> = path.split('.').collect();
+    let (path, keep) = if parts.len() > SUMMARY_DEPTH { (parts[..SUMMARY_DEPTH].join("."), false) } else { (path, keep) };
+    let x = out.entry(path).or_insert(true);
+    *x = *x && keep;
+}
+
+/// Places lent as `&mut` anywhere in `e`, and what the callee may change
+/// under them.
+fn changed_in_expr(e: &Expr, out: &mut HashMap<String, bool>, sums: &Summaries) {
     match &e.kind {
         ExprKind::Call(f, args) => {
-            for a in args {
+            // `locked(l, f, ..)` and `smp_run(f, ..)` lend their trailing
+            // arguments to `f`: shift them onto its parameters.
+            let (f, skip, shift) = match (f.as_str(), args.get(1), args.first()) {
+                ("locked", Some(Expr { kind: ExprKind::Var(g), .. }), _) => (g, 2, 1),
+                ("smp_run", _, Some(Expr { kind: ExprKind::Var(g), .. })) => (g, 1, 1),
+                _ => (f, 0, 0),
+            };
+            for (i, a) in args.iter().enumerate().skip(skip) {
+                let i = i - shift;
                 if let ExprKind::MutBorrow(n) = &a.kind {
-                    let keep = SHAPE_KEEPING.contains(&f.as_str());
-                    let x = out.entry(n.clone()).or_insert(true);
-                    *x = *x && keep;
+                    if is_builtin(f) {
+                        note(out, n.clone(), SHAPE_KEEPING.contains(&f.as_str()));
+                    } else {
+                        match sums.get(f).and_then(|ps| ps.get(i).cloned()).flatten() {
+                            Some(sum) => sum.into_iter().for_each(|(rel, keep)| note(out, format!("{}{}", n, rel), keep)),
+                            None => note(out, n.clone(), false),
+                        }
+                    }
                 } else {
-                    changed_in_expr(a, out);
+                    changed_in_expr(a, out, sums);
                 }
             }
         }
-        ExprKind::Not(x) => changed_in_expr(x, out),
+        ExprKind::Not(x) | ExprKind::Neg(x) => changed_in_expr(x, out, sums),
         ExprKind::Bin(_, a, b) => {
-            changed_in_expr(a, out);
-            changed_in_expr(b, out);
+            changed_in_expr(a, out, sums);
+            changed_in_expr(b, out, sums);
         }
         ExprKind::StructLit(_, fs) => {
             for (_, x) in fs {
-                changed_in_expr(x, out);
+                changed_in_expr(x, out, sums);
             }
         }
-        ExprKind::Variant(_, _, Some(x)) | ExprKind::Is(x, _, _) => changed_in_expr(x, out),
+        ExprKind::Variant(_, _, Some(x)) | ExprKind::Is(x, _, _) => changed_in_expr(x, out, sums),
         _ => {}
     }
 }

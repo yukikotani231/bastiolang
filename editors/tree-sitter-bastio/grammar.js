@@ -58,6 +58,7 @@ module.exports = grammar({
 
     function_definition: ($) =>
       seq(
+        optional('export'),
         'fn',
         field('name', $.identifier),
         optional(field('type_parameters', $.type_parameters)),
@@ -102,6 +103,8 @@ module.exports = grammar({
         '{',
         commaSepTrailing($.field_declaration),
         '}',
+        // What a lock over the struct guarantees: `invariant e ...;`.
+        optional(seq(repeat1(field('invariant', $.invariant_clause)), ';')),
       ),
 
     field_declaration: ($) =>
@@ -268,7 +271,7 @@ module.exports = grammar({
       );
     },
 
-    unary_expression: ($) => prec(PREC.unary, seq('!', field('operand', $._expression))),
+    unary_expression: ($) => prec(PREC.unary, seq(field('operator', choice('!', '-')), field('operand', $._expression))),
 
     is_expression: ($) =>
       prec.left(

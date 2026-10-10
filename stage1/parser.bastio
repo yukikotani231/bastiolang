@@ -17,7 +17,7 @@ import "lexer.bastio";
 
 // Types.
 const T_NAMED: u64 = 1;       // a built-in type or a struct/enum name: s..e
-const T_GENERIC: u64 = 2;     // `s..e[a, ..]`, including Box[..] and Vec[..]; a is a list of types
+const T_GENERIC: u64 = 2;     // `s..e[a, ..]`, including Box[..], Vec[..] and Lock[..]; a is a list of types
 const T_REF: u64 = 3;         // `&a`
 const T_MUTREF: u64 = 4;      // `&mut a`
 const T_UNIT: u64 = 5;        // no return type
@@ -40,6 +40,7 @@ const E_BIN: u64 = 22;        // a op b; v is the operator's punctuation code
 const E_CALL: u64 = 23;       // s..e(a, ..)
 const E_FORALL: u64 = 24;     // forall s..e: u64 :: a
 const E_TAPP: u64 = 25;       // type arguments a (list) applied to b
+const E_NEG: u64 = 26;        // -a
 
 // Statements.
 const S_LET: u64 = 30;        // let (mut if v == 1) s..e: a (or 0) = b
@@ -59,12 +60,13 @@ const PAT_BIND: u64 = 2;
 const PAT_BIND_MUT: u64 = 3;
 
 // Definitions.
-const D_STRUCT: u64 = 40;     // s..e, type parameters v (list of N_NAME), fields a (list of D_FIELD)
+const D_STRUCT: u64 = 40;     // s..e, type parameters v (list of N_NAME), fields a (list of D_FIELD), invariants b (list)
 const D_FIELD: u64 = 41;      // s..e: a
 const D_ENUM: u64 = 42;       // s..e, type parameters v, variants a (list of D_VARIANT)
 const D_VARIANT: u64 = 43;    // s..e, payload type a (or 0)
 const D_SPEC: u64 = 44;       // s..e, params a, return type b, body c
-const D_FN: u64 = 45;         // s..e, type parameters v, params a, return type b, requires c, ensures d, body x
+const D_FN: u64 = 45;         // s..e, type parameters v, params a, return type b, requires c, ensures d, body x;
+                               // s2..e2 is the `export` keyword (empty if none)
 const D_PARAM: u64 = 46;      // (mut if v == 1) s..e: a
 
 struct Node {
@@ -375,10 +377,13 @@ fn is_u64(p: &Parser, i: u64) -> bool {
 }
 
 fn builtin_type(src: &Bytes, t: Tok) -> bool {
-  return tok_is(src, t, "u64") || tok_is(src, t, "bool") || tok_is(src, t, "Buf") || tok_is(src, t, "Bytes")
+  return tok_is(src, t, "u64") || tok_is(src, t, "u8") || tok_is(src, t, "u16") || tok_is(src, t, "u32")
+    || tok_is(src, t, "i8") || tok_is(src, t, "i16") || tok_is(src, t, "i32") || tok_is(src, t, "i64")
+    || tok_is(src, t, "bool") || tok_is(src, t, "Buf") || tok_is(src, t, "Bytes")
     || tok_is(src, t, "Host") || tok_is(src, t, "Child") || tok_is(src, t, "Serial") || tok_is(src, t, "Str")
     || tok_is(src, t, "Frame") || tok_is(src, t, "PageTable") || tok_is(src, t, "Pool") || tok_is(src, t, "Mmu")
-    || tok_is(src, t, "Cpu");
+    || tok_is(src, t, "Cpu") || tok_is(src, t, "Ports") || tok_is(src, t, "PortIo")
+    || tok_is(src, t, "MmioSpace") || tok_is(src, t, "Mmio") || tok_is(src, t, "Dma");
 }
 
 fn ty(p: &mut Parser) -> u64 {
@@ -411,7 +416,7 @@ fn ty(p: &mut Parser) -> u64 {
   if builtin_type(p.src, name) {
     return add(&mut p, n);
   }
-  if tok_is(p.src, name, "Box") || tok_is(p.src, name, "Vec") {
+  if tok_is(p.src, name, "Box") || tok_is(p.src, name, "Vec") || tok_is(p.src, name, "Lock") {
     expect_p(&mut p, P_LBRACKET);
     let inner = ty(&mut p);
     expect_p(&mut p, P_RBRACKET);
@@ -419,7 +424,7 @@ fn ty(p: &mut Parser) -> u64 {
       return 0;
     }
     if is_ref(p, inner) {
-      fail_at(&mut p, t);           // a Box or Vec cannot hold a borrow
+      fail_at(&mut p, t);           // a Box, Vec or Lock cannot hold a borrow
       return 0;
     }
     n.kind = T_GENERIC;
@@ -640,6 +645,16 @@ fn unary(p: &mut Parser) -> u64 {
       return 0;
     }
     let mut n = blank(E_NOT, t);
+    n.a = x;
+    return add(&mut p, n);
+  }
+  if is_p(t, P_MINUS) {
+    bump(&mut p);
+    let x = unary(&mut p);
+    if p.failed {
+      return 0;
+    }
+    let mut n = blank(E_NEG, t);
     n.a = x;
     return add(&mut p, n);
   }
@@ -1228,11 +1243,27 @@ fn struct_def(p: &mut Parser) -> u64 {
     fail_at(&mut p, t);             // no fields
     return 0;
   }
+  // `invariant e ..;` after the fields: specifications over them.
+  let mut invs = list_new();
+  if is_kw(peek(p), KW_INVARIANT) {
+    while !p.failed && eat_kw(&mut p, KW_INVARIANT) {
+      let x = expr(&mut p);
+      if p.failed {
+        return 0;
+      }
+      invs = append(&mut p, invs, x);
+    }
+    expect_p(&mut p, P_SEMI);
+    if p.failed {
+      return 0;
+    }
+  }
   let mut n = named(D_STRUCT, name);
   n.line = t.line;
   n.col = t.col;
   n.v = tps;
   n.a = l.head;
+  n.b = invs.head;
   return add(&mut p, n);
 }
 
@@ -1335,6 +1366,8 @@ fn spec_def(p: &mut Parser) -> u64 {
 }
 
 fn fn_def(p: &mut Parser) -> u64 {
+  let ex = peek(p);
+  let exported = eat_kw(&mut p, KW_EXPORT);
   let t = expect_kw(&mut p, KW_FN);
   let name = ident(&mut p);
   let tps = tparams(&mut p);
@@ -1372,6 +1405,10 @@ fn fn_def(p: &mut Parser) -> u64 {
   n.c = req.head;
   n.d = ens.head;
   n.x = body;
+  if exported {
+    n.s2 = ex.start;
+    n.e2 = ex.end;
+  }
   return add(&mut p, n);
 }
 

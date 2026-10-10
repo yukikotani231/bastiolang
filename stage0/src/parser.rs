@@ -11,7 +11,7 @@
 //   const    := 'const' IDENT ':' 'u64' '=' expr ';'   (constant-folded; define before use)
 //   param    := 'mut'? IDENT ':' type
 //   type     := 'u64' | 'bool' | 'Str' | linear | IDENT (a struct) | '&' linear | '&' 'mut' linear
-//   linear   := 'Buf' | 'Bytes' | 'Host' | 'Child' | 'Serial' | 'Frame' | 'PageTable' | 'Pool' | 'Mmu' | 'Cpu'
+//   linear   := 'Buf' | 'Bytes' | 'Host' | 'Child' | 'Serial' | 'Frame' | 'PageTable' | 'Pool' | 'Mmu' | 'Cpu' | 'Ports' | 'PortIo' | 'MmioSpace' | 'Mmio' | 'Dma'
 //   place    := IDENT ('.' IDENT)*
 //   primary  := ... | '&' 'mut' place | 'include_bytes' '(' STRING ')' | 'old' '(' expr ')'
 //             | IDENT '{' (IDENT ':' expr (',' IDENT ':' expr)* ','?)? '}'   (a struct literal)
@@ -109,7 +109,11 @@ impl Parser {
                 Tok::Enum => enums.push(self.enum_def()?),
                 Tok::Const => self.const_def()?,
                 Tok::Import => return Err(Diag::new("E-PARSE", self.pos(), "`import` lines must come first in a file, before any definition")),
-                _ => fns.push(self.fn_def()?),
+                Tok::Export => {
+                    self.bump();
+                    fns.push(self.fn_def(true)?)
+                }
+                _ => fns.push(self.fn_def(false)?),
             }
         }
         Ok(Program { fns, specs, structs, enums })
@@ -265,7 +269,14 @@ impl Parser {
         if fields.is_empty() {
             return Err(Diag::new("E-PARSE", pos, format!("struct `{}` has no fields", name)));
         }
-        Ok(StructDef { name, tparams, fields, pos })
+        let mut invariants = Vec::new();
+        if *self.peek() == Tok::Invariant {
+            while self.eat(&Tok::Invariant) {
+                invariants.push(self.expr()?);
+            }
+            self.expect(Tok::Semi, "`;` after the struct's invariants")?;
+        }
+        Ok(StructDef { name, tparams, fields, invariants, pos })
     }
 
     /// A dotted place after its first identifier has been read.
@@ -321,6 +332,13 @@ impl Parser {
         let (n, _) = self.ident()?;
         match n.as_str() {
             "u64" => Ok(Type::U64),
+            "u8" => Ok(Type::U8),
+            "u16" => Ok(Type::U16),
+            "u32" => Ok(Type::U32),
+            "i8" => Ok(Type::I8),
+            "i16" => Ok(Type::I16),
+            "i32" => Ok(Type::I32),
+            "i64" => Ok(Type::I64),
             "bool" => Ok(Type::Bool),
             "Buf" => Ok(Type::Buf),
             "Bytes" => Ok(Type::Bytes),
@@ -333,15 +351,24 @@ impl Parser {
             "Pool" => Ok(Type::Pool),
             "Mmu" => Ok(Type::Mmu),
             "Cpu" => Ok(Type::Cpu),
-            _ if *self.peek() == Tok::LBracket && n != "Box" && n != "Vec" => Ok(Type::Generic(n, self.targs()?)),
-            "Box" | "Vec" => {
+            "Ports" => Ok(Type::Ports),
+            "PortIo" => Ok(Type::PortIo),
+            "MmioSpace" => Ok(Type::MmioSpace),
+            "Mmio" => Ok(Type::Mmio),
+            "Dma" => Ok(Type::Dma),
+            _ if *self.peek() == Tok::LBracket && n != "Box" && n != "Vec" && n != "Lock" => Ok(Type::Generic(n, self.targs()?)),
+            "Box" | "Vec" | "Lock" => {
                 self.expect(Tok::LBracket, "`[`")?;
                 let inner = self.ty()?;
                 self.expect(Tok::RBracket, "`]`")?;
                 if inner.is_ref() {
                     return Err(Diag::new("E-PARSE", pos, format!("a {} cannot hold a borrow", n)));
                 }
-                Ok(if n == "Box" { Type::Box(Box::new(inner)) } else { Type::Vec(Box::new(inner)) })
+                Ok(match n.as_str() {
+                    "Box" => Type::Box(Box::new(inner)),
+                    "Vec" => Type::Vec(Box::new(inner)),
+                    _ => Type::Lock(Box::new(inner)),
+                })
             }
             _ => Ok(Type::Struct(n)),
         }
@@ -367,7 +394,7 @@ impl Parser {
         Ok(params)
     }
 
-    fn fn_def(&mut self) -> PResult<FnDef> {
+    fn fn_def(&mut self, export: bool) -> PResult<FnDef> {
         let pos = self.expect(Tok::Fn, "`fn`")?.pos;
         let (name, _) = self.ident()?;
         let tparams = self.tparams()?;
@@ -385,7 +412,7 @@ impl Parser {
             }
         }
         let body = self.block()?;
-        Ok(FnDef { name, tparams, params, ret, requires, ensures, body, pos })
+        Ok(FnDef { name, tparams, params, ret, requires, ensures, body, pos, int_ops: Default::default(), export })
     }
 
     fn block(&mut self) -> PResult<Vec<Stmt>> {
@@ -623,6 +650,11 @@ impl Parser {
             let pos = self.bump().pos;
             let e = self.unary()?;
             return Ok(Expr { kind: ExprKind::Not(Box::new(e)), pos });
+        }
+        if *self.peek() == Tok::Minus {
+            let pos = self.bump().pos;
+            let e = self.unary()?;
+            return Ok(Expr { kind: ExprKind::Neg(Box::new(e)), pos });
         }
         let mut e = self.primary()?;
         while *self.peek() == Tok::Dot {

@@ -1,0 +1,57 @@
+// Verifier cases: page objects changed in loops only by builtins that keep
+// their shape (a pool keeps its size, a table its id and level, but the
+// pool's `has` and the table's `used` are havocked), and by user calls
+// (everything havocked).
+
+fn cycle(pool: &mut Pool, n: u64)
+  requires n < 16 && forall i: u64 :: i < 32 ==> (pool_has(pool, i) && i < pool_size(pool))
+  ensures forall i: u64 :: i < 32 ==> (pool_has(pool, i) && i < pool_size(pool))
+{
+  let mut i = 0;
+  while i < n
+    invariant i <= n && forall j: u64 :: j < 32 ==> (pool_has(pool, j) && j < pool_size(pool))
+  {
+    let f = pool_take(&mut pool, i);
+    pool_give(&mut pool, f);
+    i = i + 1;
+  }
+}
+
+fn fill(t: &mut PageTable, pool: &mut Pool)
+  requires pt_level(t) == 1 && forall i: u64 :: i < 512 ==> !pt_used(t, i)
+  requires forall i: u64 :: i < 8 ==> (pool_has(pool, i) && i < pool_size(pool))
+  ensures pt_level(t) == 1
+{
+  let mut i = 0;
+  while i < 8
+    invariant i <= 8 && pt_level(t) == 1
+    invariant forall j: u64 :: j < 512 ==> (pt_used(t, j) == (j < i))
+    invariant forall j: u64 :: (j >= i && j < 8) ==> (pool_has(pool, j) && j < pool_size(pool))
+  {
+    let f = pool_take(&mut pool, i);
+    pt_put_frame(&mut t, i, f, true);
+    i = i + 1;
+  }
+}
+
+fn main(pool: &mut Pool) -> u64 {
+  if pool_size(pool) < 600 {
+    return 1;
+  }
+  cycle(&mut pool, 3);
+  let f = pool_take(&mut pool, 20);
+  let mut t = pt_new(f, 1);
+  fill(&mut t, &mut pool);
+  let mut i = 0;
+  while i < 512
+    invariant i <= 512 && pt_level(t) == 1
+    invariant forall j: u64 :: j < i ==> !pt_used(t, j)
+  {
+    if pt_has(t, i) {
+      pool_give(&mut pool, pt_take_frame(&mut t, i));
+    }
+    i = i + 1;
+  }
+  pool_give(&mut pool, pt_free(t));
+  return 0;
+}

@@ -28,8 +28,9 @@ Bastio is pre-release. Anything here may change. New to the language? Start with
 18. [How verification works](#how-verification-works)
 19. [Error codes](#error-codes)
 20. [Targets and generated code](#targets-and-generated-code)
-21. [Soundness scope](#soundness-scope)
-22. [Not in the language yet](#not-in-the-language-yet)
+21. [Calling Bastio from C](#calling-bastio-from-c)
+22. [Soundness scope](#soundness-scope)
+23. [Not in the language yet](#not-in-the-language-yet)
 
 ## A first program
 
@@ -71,7 +72,7 @@ Take away `requires n <= len(b)` and the program is rejected with `E-VERIFY-BOUN
 ## Using the compiler
 
 ```text
-bastioc0 [--check] [--emit-c] [--backend c|native] [--target hosted|kernel|user] [-o out] <file.bastio>...
+bastioc0 [--check] [--emit-c] [--backend c|native] [--target hosted|kernel|user] [--header F] [-o out] <file.bastio>...
 ```
 
 | Option | Effect |
@@ -80,8 +81,9 @@ bastioc0 [--check] [--emit-c] [--backend c|native] [--target hosted|kernel|user]
 | `--check` | Check and verify only |
 | `--emit-c` | Write the generated C (`out.c` unless `-o` is given) instead of an executable |
 | `--target T` | `hosted` (the default), `kernel` or `user`; see [Targets](#targets-and-generated-code). `kernel` and `user` imply `--emit-c` |
-| `--backend native` | Experimental: generate x86-64 assembly directly instead of C, assemble it with `as` and link it with `cc`. Hosted target only, and not every builtin yet (`Host`, `Child` and `Pool` are missing); see [Targets](#targets-and-generated-code) |
+| `--backend native` | Experimental: generate x86-64 assembly directly instead of C, assemble it with `as` and link it with `cc`. Hosted target only, and not every builtin yet (`Host`, `Child`, `Pool`, `Lock`, the device types and libraries without `main` are missing); see [Targets](#targets-and-generated-code) |
 | `--emit-asm` | With `--backend native`: write the assembly (`out.s` unless `-o` is given) instead of an executable |
+| `--header F` | Also write a C header declaring the program's `export fn`s to `F`; see [Calling Bastio from C](#calling-bastio-from-c) |
 | `--dump-smt` | Also print the queries sent to Z3 |
 | `--trusted-base` | Print the hand-written C each target links in, and every builtin with the targets that have it |
 | `--dump-tokens`, `--dump-ast`, `--dump-mono`, `--dump-check` | Print the result of one compiler phase. These exist so the self-hosted compiler can be tested against stage0 |
@@ -94,7 +96,7 @@ bastioc0 [--check] [--emit-c] [--backend c|native] [--target hosted|kernel|user]
 - **Identifiers** are letters, digits and `_`, not starting with a digit.
 - **Integer literals** are decimal (`4096`) or hexadecimal (`0x1000`, `0X1000`). `_` may separate digits (`1_000_000`, `0xffff_0000`). A literal must fit in 64 bits. There are no negative literals and no unary minus: integers are unsigned.
 - **String literals** are written in double quotes and cannot span lines. Escapes: `\n`, `\r`, `\t`, `\0`, `\\`, `\"`.
-- **Keywords:** `assert` `const` `else` `ensures` `enum` `false` `fn` `forall` `if` `import` `invariant` `is` `let` `match` `mut` `requires` `return` `spec` `struct` `true` `unreachable` `while`. The names `result`, `old` and `include_bytes`, and the names of builtins, have special meanings described below.
+- **Keywords:** `assert` `const` `else` `ensures` `enum` `export` `false` `fn` `forall` `if` `import` `invariant` `is` `let` `match` `mut` `requires` `return` `spec` `struct` `true` `unreachable` `while`. The names `result`, `old` and `include_bytes`, and the names of builtins, have special meanings described below.
 
 ## Programs and files
 
@@ -102,6 +104,7 @@ A program is a list of definitions in any order, except that a constant must be 
 
 ```text
 fn name[T, ...](p: T, mut q: T, ...) -> R  requires ...  ensures ...  { ... }
+export fn name(p: T, ...) -> R  ensures ...  { ... }
 spec fn name(p: T, ...) -> bool { <specification expression> }
 struct Name[T, ...] { field: T, ... }
 enum Name[T, ...] { Variant(T), Variant, ... }
@@ -109,6 +112,8 @@ const NAME: u64 = <constant expression>;
 ```
 
 A function with no `-> R` returns nothing. Parameters and `let` bindings are immutable unless declared `mut`.
+
+Every program has a `main`, where it starts. `main` cannot be called (`E-TYPE`): the proof assumes it starts holding every resource the target hands it, such as the whole page pool, so a nested run would give the same pages to two owners.
 
 **Constants** have type `u64`. The expression is folded at compile time and may use literals, other constants and arithmetic.
 
@@ -120,8 +125,8 @@ All files share one namespace, as in C: a function, type or constant name must b
 
 | Target | `main` may take |
 | --- | --- |
-| `hosted` | `&mut Serial`, `&mut Pool`, `&mut Host` |
-| `kernel` | `&mut Serial`, `&mut Pool`, `&mut Mmu`, `&mut Cpu` |
+| `hosted` | `&mut Serial`, `&mut Pool`, `&mut Host`, `&mut Ports`, `&mut MmioSpace` |
+| `kernel` | `&mut Serial`, `&mut Pool`, `&mut Mmu`, `&mut Cpu`, `&mut Ports`, `&mut MmioSpace` |
 | `user` | `&mut Serial` (and must return `u64`) |
 
 The older form `fn main(con: Serial) -> Serial` is still accepted outside user programs.
@@ -142,7 +147,9 @@ fn main(con: &mut Serial) -> u64 {
 
 | Type | Meaning |
 | --- | --- |
-| `u64` | Unsigned 64-bit integer, the only integer type. Arithmetic is proved to stay in range; it never wraps |
+| `u64` | Unsigned 64-bit integer. Arithmetic is proved to stay in range; it never wraps |
+| `u8`, `u16`, `u32` | Narrower unsigned integers (C's `uint8_t` and so on), with the same proofs. See "Sized integers" below |
+| `i8`, `i16`, `i32`, `i64` | Signed integers (C's `int8_t` and so on), proved to stay in range. See "Sized integers" below |
 | `bool` | `true` or `false` |
 | `Str` | A string literal: immutable bytes whose length and contents are known at compile time. Never freed |
 | A struct or enum with no linear part | See [Structs](#structs) and [Enums](#enums-and-match) |
@@ -157,7 +164,7 @@ fn main(con: &mut Serial) -> u64 {
 | `Box[T]` | An owning pointer to a `T` on the heap; the only way a type can contain itself |
 | A struct with a linear field, an enum with a linear payload | |
 | `Host`, `Child` | The host system, and a child process (hosted target only) |
-| `Serial`, `Pool`, `Frame`, `PageTable`, `Mmu`, `Cpu` | Capabilities: the console, physical pages, page tables, the MMU and the CPU's user context. See [Kernel capabilities](#kernel-capabilities) |
+| `Serial`, `Pool`, `Frame`, `PageTable`, `Mmu`, `Cpu`, `Ports`, `PortIo`, `MmioSpace`, `Mmio`, `Dma` | Capabilities: the console, physical pages, page tables, the MMU, the CPU's user context, I/O ports, memory-mapped device registers and pages lent to devices. See [Kernel capabilities](#kernel-capabilities) |
 
 **Borrows** are allowed only as parameter types, so a borrow can never be stored, returned or outlive the call:
 
@@ -337,7 +344,82 @@ fn main() -> u64 {
 }
 ```
 
-Call arguments, and the fields of a struct literal, are evaluated in an unspecified order.
+Call arguments, the operands of an operator and the fields of a struct literal are evaluated left to right, and the proof assumes that order. (One exception: a linear value passed by name or lent as `&mut` is read after the other arguments have run, so `f(b, g(&mut b))` passes `b` as `g` left it.) C leaves this order unspecified, so when an operand has a side effect the generated C evaluates each operand into a temporary first; without side effects it emits the expression as written.
+
+**Sized integers.** `u8`, `u16` and `u32` follow the same rules at their own width: `+` and `*` must stay below 2^8, 2^16 or 2^32. Both operands of an arithmetic operator or a comparison have one integer type; there is no implicit promotion. A literal takes the integer type its position asks for (a typed `let`, an assignment, a `return`, a parameter, a field, a payload, the other operand of an operator) and is `u64` when nothing says otherwise; it must fit (`E-TYPE`). Conversions are written out:
+- `cast[T](x)` keeps the value and is proved to fit in `T` (`E-VERIFY-CAST`). Widening always fits, so it needs no annotation.
+- `wrap[T](x)` reduces `x` modulo 2^width of `T`, for code that means to drop bits.
+- `wrap_add(a, b)`, `wrap_sub(a, b)` and `wrap_mul(a, b)` are modular arithmetic on two operands of one type, for checksums and hashes.
+- A builtin's `u64` parameter (an index, a length, a value) accepts any narrower unsigned integer, since widening is free.
+
+```bastio
+// expect-exit: 42
+fn hex_digit(n: u64) -> u8
+  requires n < 16
+{
+  if n < 10 {
+    return cast[u8](n) + 48;     // '0' + n: proved to fit in u8
+  }
+  return cast[u8](n) + 87;       // 'a' + n - 10
+}
+
+fn main() -> u64 {
+  let x: u32 = 70000;
+  let low: u16 = wrap[u16](x);   // 70000 mod 65536 = 4464
+  let s: u8 = wrap_add(hex_digit(15), 200);   // 102 + 200 mod 256 = 46
+  if s != 46 || low != 4464 {
+    return 1;
+  }
+  return 42;
+}
+```
+
+```bastio
+// expect-error: E-VERIFY-CAST
+fn low_byte(n: u64) -> u8 {
+  return cast[u8](n);            // fails: n may be 256 or more; `wrap[u8](n)` drops the bits instead
+}
+
+fn main() -> u64 {
+  return cast[u64](low_byte(300));
+}
+```
+
+**Signed integers.** `i8`, `i16`, `i32` and `i64` are proved to stay between their minimum and maximum: an operation that could go below the minimum is `E-VERIFY-UNDERFLOW`, above the maximum `E-VERIFY-OVERFLOW`. Unary minus `-x` works on signed types only (`E-TYPE` on unsigned ones) and is proved not to be applied to the minimum, whose negation does not fit. Division truncates toward zero and `%` takes the sign of the dividend, as in C; `MIN / -1` is `E-VERIFY-OVERFLOW`. `cast[u64](x)` on a signed `x` is proved non-negative; builtins that take `u64` do not accept a signed value without such a conversion. An expression made only of literals is `u64`, so a negative number needs a signed position (`let n: i8 = -7;`).
+
+```bastio
+// expect-exit: 42
+fn abs(x: i32) -> i32
+  requires x != -2147483648
+  ensures result >= 0 && (result == x || result == -x)
+{
+  if x < 0 {
+    return -x;
+  }
+  return x;
+}
+
+fn main() -> u64 {
+  let n: i8 = -7;
+  let q: i8 = n / 2;             // -3: truncates toward zero
+  let r: i8 = n % 2;             // -1: sign of the dividend
+  if q != -3 || r != -1 {
+    return 1;
+  }
+  return cast[u64](abs(-40)) + 2;
+}
+```
+
+```bastio
+// expect-error: E-VERIFY-OVERFLOW
+fn negate(x: i8) -> i8 {
+  return -x;                     // fails: x may be -128, and 128 does not fit in i8
+}
+
+fn main() -> u64 {
+  return cast[u64](negate(-5));
+}
+```
 
 ## Structs
 
@@ -376,6 +458,37 @@ fn main() -> u64 {
 - A `&mut` struct parameter must be whole again when the function returns.
 - Specifications can read fields, including through `old(..)` and `result`: `ensures result.n == old(s).n + 1`. The prover tracks every field, so bounds, overflow and capability state work through fields exactly as through variables.
 - In generated code a struct is a C struct passed by value; nothing at run time records which fields have been moved.
+
+### Locks and struct invariants
+
+A `Lock[T]` holds a value that code on several processors can update through a shared borrow `&Lock[T]`. The contents are reachable only inside `locked`, which takes the lock, calls a function on them and releases it.
+
+```bastio
+// expect-exit: 3
+struct Count { n: u64 } invariant n < 1000;
+
+fn bump(c: &mut Count) requires c.n < 1000 ensures c.n < 1000 {
+  if c.n < 999 { c.n = c.n + 1; }
+}
+
+fn main() -> u64 {
+  let l = lock_new(Count { n: 0 });            // proves the invariant
+  locked(l, bump);                             // bump(&mut contents) under the lock
+  locked(l, bump);
+  locked(l, bump);
+  let c = lock_end(l);                         // frees the lock, returns the Count
+  return c.n;
+}
+```
+
+- A struct may end with `invariant e` clauses (then `;`): specifications over its fields.
+- `lock_new(v)` proves the invariants of `v` (`E-VERIFY-LOCKINV`) and moves it into a new lock. `lock_end(l)` consumes the lock and returns the value; the invariants are known of it.
+- `locked(l, f, args..)` calls `f(&mut contents, args..)` with the lock held. `f` must take `&mut T` first; its result is `locked`'s result. The contents are a fresh value of which only the invariants are known, since another processor may have changed them, so `f`'s `requires` must follow from the invariants. After the call the invariants are proved again (`E-VERIFY-LOCKINV`).
+- The invariants of a struct held directly as a field are included; ones behind a box, in a vector or in an enum payload are not yet. Outside a lock, invariants are not enforced: they are what the lock promises about its contents.
+- A lock cannot hold a value with a `Cpu` or `Mmu` in it (`E-PIN`): they describe the processor that holds them.
+- Lending `&mut` a place that overlaps the lock in the same call is `E-LINEAR-USE`, so the contents have no second way in.
+- Deadlock is not ruled out: taking a lock again inside `f` (directly or through another call) spins forever.
+- Generated code: a lock is a pointer to a lock word followed by the contents; `locked` spins with an atomic exchange (acquire) and releases with a store (release). Invariants generate nothing.
 
 ## Enums and `match`
 
@@ -687,7 +800,7 @@ fn main(host: &mut Host) -> u64 {
 
 ## Kernel capabilities
 
-Hardware is reached only through capability types. There is no way to read or write memory through an integer address (ROADMAP invariant 1). Capabilities are linear, and `main` is handed the ones its target provides; they cannot be created. They carry **ghost state** that exists only in the proof: in the generated code a `Frame` or `PageTable` is a bare physical address, and `Serial`, `Mmu` and `Cpu` are empty.
+Hardware is reached only through capability types. There is no way to read or write memory through an integer address (ROADMAP invariant 1). Capabilities are linear, and `main` is handed the ones its target provides; they cannot be created. They carry **ghost state** that exists only in the proof: in the generated code a `Frame`, `PageTable` or `Dma` is a bare physical address, `Serial`, `Mmu`, `Cpu`, `Ports` and `MmioSpace` are empty, and a `PortIo` or `Mmio` is its base and size.
 
 | Type | Meaning |
 | --- | --- |
@@ -697,17 +810,26 @@ Hardware is reached only through capability types. There is no way to read or wr
 | `PageTable` | A page-table page at level 1 to 5. It owns the tables and pages its slots point to |
 | `Mmu` | The right to load CR3 (kernel only) |
 | `Cpu` | The CPU's saved user context and the right to enter user mode (kernel only) |
+| `Ports` | The x86 I/O port space: the right to claim each of the 65536 ports, once |
+| `PortIo` | A claimed range of I/O ports, owned: the only way to read or write them |
+| `MmioSpace` | The device window (physical `0xC0000000` up to 4 GiB, which the kernel platform maps uncached): the right to claim each byte of it, once |
+| `Mmio` | A claimed block of memory-mapped device registers, owned: the only way to read or write them |
+| `Dma` | A page lent to devices for DMA: while lent it is not a `Frame`, so it cannot be freed, mapped or reused |
 
 Ghost accessors, usable in specifications:
 
 | Accessor | Meaning |
 | --- | --- |
-| `frame_id(f)`, `pt_id(t)` | The page number |
+| `frame_id(f)`, `pt_id(t)`, `dma_id(d)` | The page number |
 | `pt_level(t)` | 1 (maps pages) to 4 (top level, what CR3 holds); 5 is a container for level-4 tables that is never loaded into CR3 |
 | `pt_used(t, i)` | Slot `i` owns something |
 | `pool_has(p, i)` | The pool can still hand out page `i` |
 | `pool_size(p)` | Number of pages in the pool (also callable at run time) |
+| `mmio_free(w, a)` | Nobody has claimed device-window address `a`; `main` receives the whole window free |
+| `mmio_base(r)`, `mmio_len(r)` | The registers `r` owns, `mmio_base(r)` up to `mmio_base(r) + mmio_len(r)`, always inside the device window (also callable at run time) |
 | `mmu_root(m)` | The id of the table in CR3; `0x10000` while the kernel's own map is loaded |
+| `port_free(p, k)` | Nobody has claimed port `k`; `main` receives every port free |
+| `port_base(io)`, `port_count(io)` | The ports `io` owns, `port_base(io)` up to `port_base(io) + port_count(io)`, always within the 65536 ports (also callable at run time) |
 
 **Console** (all targets):
 
@@ -792,10 +914,16 @@ fn main(pool: &mut Pool) -> u64 {
 | --- | --- | --- |
 | `mmu_switch(m: &mut Mmu, t: &PageTable)` | level 4 | Loads `t` into CR3; `mmu_root(m)` becomes `pt_id(t)` |
 | `mmu_kernel(m: &mut Mmu)` | | Loads the kernel's own map |
-| `cpu_get(c: &Cpu, r: u64) -> u64` | `r < 20` | Saved user register `r`: rax rbx rcx rdx rsi rdi rbp r8-r15 (0-14), rip (15), rsp (16), rflags (17), error code (18), fault address (19) |
-| `cpu_set(c: &mut Cpu, r: u64, v: u64)` | `r < 18` | Sets a saved register. Whatever is stored, user mode is entered in ring 3 with the user segments, IOPL 0 and interrupts on |
+| `cpu_get(c: &Cpu, r: u64) -> u64` | `r < 21` | Saved user register `r`: rax rbx rcx rdx rsi rdi rbp r8-r15 (0-14), rip (15), rsp (16), rflags (17), error code (18), fault address (19), FS base (20) |
+| `cpu_set(c: &mut Cpu, r: u64, v: u64)` | `r < 18` or `r == 20` | Sets a saved register or the FS base (the error code and fault address are only reported by a trap). Whatever is stored, user mode is entered in ring 3 with the user segments, IOPL 0 and interrupts on; the platform replaces a non-canonical address with 0 |
+| `cpu_fpu_save(c: &mut Cpu, f: &mut Frame)` | | Saves the user's x87/SSE registers into the page (`fxsave64`) |
+| `cpu_fpu_load(c: &mut Cpu, f: &Frame)` | | Loads them from the page (`fxrstor64`); reserved MXCSR bits are cleared first, so any contents are safe to load. A kernel that runs several user contexts keeps one page per context and swaps them around `cpu_run` |
 | `cpu_run(c: &mut Cpu, m: &Mmu) -> u64` | | Runs the saved context in user mode until the next trap; returns its vector (`<= 255`) |
 | `cpu_idle(c: &mut Cpu) -> u64` | | Waits for an interrupt; returns its vector |
+| `cpu_count(c: &Cpu) -> u64` | | Processors the platform has started, this one included: between 1 and 4096 |
+| `smp_run(f, args..)` | `f`'s `requires`, also for the other processors (below) | Runs `f(args..)` on every processor at once and returns when all have returned |
+
+`smp_run(f, args..)` is how kernel code runs on the other processors. `f` returns nothing, and each parameter is `&mut Cpu` or `&mut Mmu` (this processor passes its own; every other processor gets its own, with the kernel's tables in CR3) or a shared borrow `&T` of a value with no `Cpu` or `Mmu` in it (`E-PIN` otherwise). So the processors share only what cannot change, plus locks. `f`'s precondition is proved for this processor's arguments and again with `mmu_root` equal to the kernel's for the others. See [concurrency.md](concurrency.md).
 
 ```bastio
 // expect-ok
@@ -813,7 +941,102 @@ fn main(con: &mut Serial, mmu: &mut Mmu) {
 }
 ```
 
+**I/O ports** (kernel and hosted; hosted builds simulate the ports, each remembering the last value written, so drivers can be tested off the machine):
+
+| Builtin | Requires (proved) | Effect |
+| --- | --- | --- |
+| `port_claim(p: &mut Ports, base: u64, count: u64) -> PortIo` | `base + count <= 65536`; `port_free(p, k)` for every `k` in the range | Takes the ports out of `p` |
+| `port_release(p: &mut Ports, io: PortIo)` | | Gives them back |
+| `pio_in8` / `pio_in16` / `pio_in32(io: &mut PortIo, off: u64) -> u64` | `off + 1` / `2` / `4 <= port_count(io)` | `in` from port `port_base(io) + off`; the result fits the width |
+| `pio_out8` / `pio_out16` / `pio_out32(io: &mut PortIo, off: u64, v: u64)` | the same, and `v` fits the width | `out` to that port |
+
+Reads take `&mut` too: reading a device register changes the device (it pops a FIFO or acknowledges an interrupt). Claiming compiles to nothing and each access is one instruction. Ports nobody claimed cannot be touched, and two drivers never own the same port. What a device does with the values is not modelled.
+
+```bastio
+// expect-exit: 0
+// A driver owns the eight ports of a UART and touches only those.
+struct Uart { io: PortIo }
+
+fn uart_send(u: &mut Uart, b: u64)
+  requires port_count(u.io) == 8 && b <= 255
+  ensures port_count(u.io) == 8
+{
+  pio_out8(&mut u.io, 0, b);
+}
+
+fn main(ports: &mut Ports) -> u64 {
+  let mut u = Uart { io: port_claim(&mut ports, 0x3F8, 8) };
+  uart_send(&mut u, 65);
+  // port_claim(&mut ports, 0x3FC, 1) here would be E-VERIFY-OWN.
+  port_release(&mut ports, u.io);
+  return 0;
+}
+```
+
+**Memory-mapped registers** (kernel and hosted; hosted builds simulate the window with 1 MiB of memory indexed by the low 20 bits of the address):
+
+| Builtin | Requires (proved) | Effect |
+| --- | --- | --- |
+| `mmio_claim(w: &mut MmioSpace, base: u64, len: u64) -> Mmio` | `0xC0000000 <= base`, `base + len <= 2^32`; `mmio_free(w, a)` for every `a` in the block | Takes the block out of `w` |
+| `mmio_release(w: &mut MmioSpace, r: Mmio)` | | Gives it back |
+| `mmio_read8` / `16` / `32` / `64(r: &mut Mmio, off: u64) -> u64` | `off + width <= mmio_len(r)`; `mmio_base(r) + off` is a multiple of the width | One volatile load; the result fits the width |
+| `mmio_write8` / `16` / `32` / `64(r: &mut Mmio, off: u64, v: u64)` | the same, and `v` fits the width | One volatile store |
+
+The rules are those of ports: claiming compiles to nothing, two drivers never own the same register, and reads take `&mut`. Because claims must lie in the device window and the page pool stays below 256 MiB, a driver can never reach memory the allocator owns. What a device does with the values is not modelled.
+
+```bastio
+// expect-exit: 0
+// The local APIC's version register, read through a claimed block.
+fn main(win: &mut MmioSpace) -> u64 {
+  let mut apic = mmio_claim(&mut win, 0xFEE00000, 4096);
+  let v = mmio_read32(&mut apic, 0x30);
+  // mmio_read32(&mut apic, 0x32) would be E-VERIFY-BOUNDS (unaligned).
+  mmio_release(&mut win, apic);
+  return v % 1;
+}
+```
+
+**Pages lent to devices** (kernel and hosted). A device that reads or writes memory on its own (DMA) is given a page by turning its `Frame` into a `Dma`:
+
+| Builtin | Requires (proved) | Effect |
+| --- | --- | --- |
+| `dma_lend(f: Frame) -> Dma` | | Lends the page to devices. A full memory fence first, so earlier stores reach memory before any device can be told where the page is |
+| `dma_take(d: Dma) -> Frame` | | Takes the same page back (`frame_id` is `dma_id(d)`), after a fence |
+| `dma_id(d: &Dma) -> u64` | | The page number |
+| `dma_addr(d: &Dma) -> u64` | | The page's physical address, to program into a device. Only a lent page's address can be read |
+| `dma_read8` / `16` / `32` / `64(d: &mut Dma, off: u64) -> u64` | `off + width <= 4096`; `off` is a multiple of the width | One volatile load; the result fits the width |
+| `dma_write8` / `16` / `32` / `64(d: &mut Dma, off: u64, v: u64)` | the same, and `v` fits the width | One volatile store |
+
+What is proved: while a page is lent it cannot go back to the pool, into a page table or into anything else that takes a `Frame`, so a device can never write a page that has been reused; the CPU reaches it only with volatile, aligned, in-bounds accesses, so the C compiler cannot cache or tear what the device sees; and a `Dma` must be taken back before the program ends (it is linear). What is trusted: that the driver has stopped the device using the page (for example, seen its completion) before `dma_take`, and that the addresses it programs into the device are those of pages it has lent. Devices are outside the proof.
+
+```bastio
+// expect-exit: 0
+// A one-page buffer handed to a device and taken back.
+fn main(pool: &mut Pool) -> u64 {
+  if pool_size(pool) == 0 {
+    return 0;
+  }
+  let mut d = dma_lend(pool_take(&mut pool, 0));
+  let a = dma_addr(d);
+  dma_write64(&mut d, 0, a);
+  // dma_write64(&mut d, 4092, 0) would be E-VERIFY-BOUNDS (past the page).
+  let f = dma_take(d);
+  pool_give(&mut pool, f);
+  return 0;
+}
+```
+
 **System calls** (user target only). Programs built with `--target user` run under BastiOS and have `sys_spawn(b: &Buf, from: u64, to: u64)` (start the program named by elements `from..to` of `b`, proved to be a range within `b`), `sys_wait(pid)`, `sys_kill(pid)`, `sys_yield()`, `sys_getpid()`, `sys_info(k)`, `sys_ps()` and `sys_poweroff()`.
+
+Calls the language does not know by name go through three generic builtins. The call number `n` and what the call does belong to the kernel (BastiOS defines its file system calls this way), so a new system call needs no compiler change:
+
+| Builtin | Requires | Meaning |
+| --- | --- | --- |
+| `sys_call(n, a, b) -> u64` | none | System call `n` with two integer arguments |
+| `sys_send(n, a, buf: &Bytes, len) -> u64` | `len <= blen(buf)` | Lends the kernel bytes `0..len` of `buf` to read |
+| `sys_recv(n, a, buf: &mut Bytes) -> u64` | none | Lends the kernel all of `buf` to overwrite. Afterwards its length is the same and every byte is still `<= 255`; nothing else about its contents is known |
+
+The kernel is trusted to stay inside the bytes it is lent; BastiOS proves that it does.
 
 Calling a builtin the target does not have is `E-TARGET`.
 
@@ -821,7 +1044,7 @@ Calling a builtin the target does not have is `E-TARGET`.
 
 Expressions in `requires`, `ensures`, `invariant` and `assert` (and the bodies of `spec fn`s) exist only at compile time and generate no code.
 
-- They are evaluated over **mathematical integers**: `a - b` may be negative and `a + b` cannot overflow.
+- They are evaluated over **mathematical integers**: `a - b` may be negative and `a + b` cannot overflow. Integers of different types mix freely there, with no conversions.
 - They may use `==>` (implication) and `forall x: u64 :: e`.
 - They may call `len`, `get`, `slen`, `sget`, `blen`, `bget`, `vlen`, `vget`, the ghost accessors of the capabilities, and `spec fn`s.
 - They may use `is` and enum payloads (`o.Some`), and see through boxes.
@@ -865,10 +1088,13 @@ fn main() -> u64 {
 
 After the type and linearity checks, the compiler executes each function symbolically. At every point where the program could go wrong it asks Z3 whether the bad case is reachable, and if it is, it rejects the program and shows a counterexample (values of the variables that lead there).
 
-- **Modular.** A call uses only the callee's `requires` and `ensures`, never its body.
+- **Modular.** A call uses the callee's `requires` and `ensures`, and a summary of which parts of each `&mut` argument the callee may change (below), never the rest of its body.
 - **Loops** are cut with their invariants. After a loop, the variables the body assigns are known only through the invariants and the negated condition.
 - **Branches** are followed separately; the condition of an `if` or the variant of a `match` arm is known inside it. So a test the code already makes, as in `if i < len(b) { get(b, i) }`, is enough for the proof.
-- **Annotation inference.** A buffer that a loop body only ever updates as `x = set(x, ..)` keeps its length across the loop, so `invariant len(x) == ...` is not needed.
+- **Annotation inference.** What a loop body or a callee provably leaves alone keeps what is known about it, so it need not be restated in an `invariant` or `ensures`:
+  - A buffer only ever updated as `x = set(x, ..)` keeps its length, and a vector changed only by `vec_set` and `vec_swap` its length. A capability changed only by builtins that cannot change them keeps its identity: a `Frame` its id, a `PageTable` its id and level, a `Pool` its size.
+  - For each `&mut` parameter, the compiler works out from the function's body which places under it the function may change, and how: by assigning them, or only through the shape-keeping updates above. Lending a place to another function counts as that function's summary applied to it, so this goes through any depth of calls, and through recursion. At a call, and in a loop that makes the call, every other part of the argument (scalar fields, enum tags, lengths, capability ids) keeps its value. So a driver function that takes `&mut Dev` and only ever uses `d.page` through builtins needs no `ensures` restating `frame_id(d.page)`, and the loops of its callers no `invariant` either.
+  - The contents of buffers and vectors, and capability state such as which slots of a page table are used, are still forgotten when changed: say what is kept of them in `ensures` or `invariant`.
 - **Boxes and vectors.** The prover unfolds unknown recursive data two levels deep, and tracks vector contents element by element (see [Boxes](#boxes) and [Vectors](#vectors)).
 
 What is proved, by error code, is listed in the next section.
@@ -885,28 +1111,32 @@ Syntax, types and linearity:
 | `E-TYPE` | Type error: wrong argument or field types, an unknown name, a borrow used outside a parameter, shadowing, a bad `main` signature, a generic definition that cannot be instantiated, and so on |
 | `E-TARGET` | A builtin the target does not have (such as `host_read` in a kernel) |
 | `E-IMPORT` | An imported file cannot be read, or files import each other |
+| `E-EXPORT` | An `export fn` breaks a rule of the C boundary: it has a `requires`, takes or returns a type C cannot pass, may free or replace a buffer C lends it, is `main`, or is outside the hosted target |
 | `E-MATCH` | A `match` misses a variant, matches one twice, or has an arm after `_` |
 | `E-LINEAR-USE` | A consumed value (or a moved-out field, or a struct with a field moved out) is used; one call both borrows and moves a value, or lends it twice with one loan `&mut`; a borrow is returned; a value is consumed where the code may run more than once or not at all (a `while` condition, the right side of `&&` / `\|\|`) |
 | `E-LINEAR-LEAK` | A linear value is still owned at the end of its scope or at a `return`, is overwritten, or is dropped by `_` |
 | `E-LINEAR-BRANCH` | Only one arm of an `if` or a `match` consumes a value; a loop body changes the ownership of an outer value |
+| `E-PIN` | A `Cpu` or `Mmu` (or a value holding one) is put in a lock or shared between processors by `smp_run` |
 
 Proofs:
 
 | Code | What is proved |
 | --- | --- |
-| `E-VERIFY-BOUNDS` | Every index is below its limit: buffer, byte, string and vector indices; `vec_pop` on a non-empty vector; page numbers below `pool_size`; words, bytes and slots of a page or table; `cpu_get` / `cpu_set` registers; the `sys_spawn` range |
+| `E-VERIFY-BOUNDS` | Every index is below its limit: buffer, byte, string and vector indices; I/O port and register offsets within the claimed range, and register accesses aligned; `vec_pop` on a non-empty vector; page numbers below `pool_size`; words, bytes and slots of a page or table; `cpu_get` / `cpu_set` registers; the `sys_spawn` range; the `sys_send` length |
 | `E-VERIFY-LEAK` | A vector of linear elements is empty when it is freed |
-| `E-VERIFY-OVERFLOW` | `+` and `*` results < 2^64 |
+| `E-VERIFY-OVERFLOW` | `+` and `*` results fit the operation's type (< 2^64 for `u64`, < 2^8 for `u8`, ...) |
+| `E-VERIFY-CAST` | the argument of `cast[T]` fits in `T` |
 | `E-VERIFY-UNDERFLOW` | `a - b` has `a >= b` |
 | `E-VERIFY-DIVZERO` | The divisor of `/` and `%` is not zero |
 | `E-VERIFY-ALLOC` | Allocation size <= 2^60 elements |
-| `E-VERIFY-BYTE` | A value stored as a byte (`serial_write`, `bset`, `frame_write8`) is `<= 255` |
-| `E-VERIFY-OWN` | A page is taken from the pool at most once; a table slot is empty before `pt_put` and used before `pt_take`; a table is empty before it is freed |
+| `E-VERIFY-BYTE` | A value stored as a byte (`serial_write`, `bset`, `frame_write8`, `pio_out8`) is `<= 255`; `pio_out16` / `pio_out32` and `mmio_write*` values fit their width |
+| `E-VERIFY-OWN` | A page is taken from the pool at most once; an I/O port or device register has at most one owner; a table slot is empty before `pt_put` and used before `pt_take`; a table is empty before it is freed |
 | `E-VERIFY-PT` | Table levels line up; frames go only into level-1 tables; slot 0 of a top-level table (the kernel's map) is never touched |
 | `E-VERIFY-MMU` | The table in CR3 is never freed |
 | `E-VERIFY-REQUIRES` | The callee's `requires` |
 | `E-VERIFY-ENSURES` | The function's own postcondition |
 | `E-VERIFY-INVARIANT` | A loop invariant holds on entry and is preserved by one iteration |
+| `E-VERIFY-LOCKINV` | A struct invariant holds of a value put in a lock, and again at the end of every `locked` call |
 | `E-VERIFY-ASSERT` | An `assert` |
 | `E-VERIFY-UNREACHABLE` | An `unreachable;` the code can reach |
 
@@ -917,7 +1147,7 @@ Proofs:
 The compiler emits C, which a C compiler turns into machine code. The C contains no runtime checks: every check was discharged by a proof, and `tests/run.sh` verifies this for a sample program by inspecting the C.
 
 - **`--target hosted`** (the default) builds an ordinary program against the C library. `alloc`, `box` and vectors use `malloc`; running out of memory aborts. `Serial` is standard input and output. `Pool` is simulated with ordinary memory.
-- **`--target kernel`** emits freestanding C for bare-metal x86-64 that needs no C library. It provides `bst_kmain`, which initialises COM1 and calls `main`. The boot code that calls `bst_kmain`, and the trap entry code behind `cpu_run` and `cpu_idle`, live in the kernel's own repository (BastiOS). The prelude implements the console with port I/O on COM1, `alloc` and `free` with a fixed 8 MiB arena and an exact-size free list, `print` on the serial port, the pool (every page from the end of the kernel image to the end of RAM, at most 2^16), page-table entry encoding and CR3 loads. Running out of arena memory halts the machine.
+- **`--target kernel`** emits freestanding C for bare-metal x86-64 that needs no C library. It provides `bst_kmain`, which initialises COM1 (only when `main` takes `Serial`) and calls `main`. The boot code that calls `bst_kmain`, and the trap entry code behind `cpu_run` and `cpu_idle`, live in the kernel's own repository (BastiOS). The prelude implements the console with port I/O on COM1, `alloc` and `free` with a fixed 8 MiB arena and an exact-size free list, `print` on the serial port, the pool (every page from the end of the kernel image to the end of RAM, at most 2^16), page-table entry encoding and CR3 loads. Running out of arena memory halts the machine.
 - **`--target user`** emits freestanding C for a user program under BastiOS, entered at `bst_umain`. Its prelude implements the console and the `sys_*` builtins as `int 0x80` system calls, and `alloc` with a 64 KiB arena.
 
 On the freestanding targets `Bytes` come from the same arena as `Buf`.
@@ -925,6 +1155,52 @@ On the freestanding targets `Bytes` come from the same arena as `Buf`.
 The native backend (`--backend native`, hosted only, experimental) skips C: it writes x86-64 assembly, so the C compiler leaves the trusted base for the program's own code, while its small runtime (printing, the console and the allocator, written in assembly over the C library) is listed by `--trusted-base`. `tests/native.sh` builds every test and benchmark with both backends and requires the same exit status and output. It loses the C compiler's optimizations (inlining, vectorization), so it is slower; `bench/run.sh` reports the gap.
 
 In the generated C, a struct is a C struct passed by value, an enum is a tag and a union, a `Box[T]` is a `T *`, a `Vec[T]` is `{ len, cap, data }`, and ghost state (capability state, specifications, `assert`) leaves nothing behind.
+
+## Calling Bastio from C
+
+A function marked `export` is also a C function of the same name, so a C program can call proved Bastio code directly. A program with an `export fn` is a library: it needs no `main`. Build it with `--emit-c` and `--header`, and compile the C with the rest of the C program:
+
+```text
+bastioc0 --emit-c --header find.h -o find.c find.bastio
+cc -c find.c && cc app.c find.o
+```
+
+```bastio
+// expect-ok
+enum Found { At(u64), Missing }
+
+/// Where `c` first occurs in `b`.
+export fn find(b: &Bytes, c: u64) -> Found
+  ensures result is Found::At ==> result.At < blen(b)
+{
+  let mut i = 0;
+  while i < blen(b)
+    invariant i <= blen(b)
+  {
+    if bget(b, i) == c {
+      return Found::At(i);
+    }
+    i = i + 1;
+  }
+  return Found::Missing;
+}
+```
+
+```c
+/* in the generated header */
+bst_e_Found find(const uint8_t *b, size_t b_len, uint64_t c);
+```
+
+What may cross the boundary (otherwise `E-EXPORT`):
+- **Parameters:** integers, `bool`, `&Bytes`, which becomes a `const` pointer and a length (`b`, `b_len`), and `&mut Bytes`, a buffer the caller owns and the function writes into (`uint8_t *b, size_t b_len`), so a library need not allocate. Owned values are not accepted.
+- **A lent `&mut Bytes` stays the caller's.** The function may write its bytes (`bset`, or by lending it to functions that only do that) but never free or replace it. The compiler proves this from the summary it already computes of what each function may change in its `&mut` arguments ([How verification works](#how-verification-works)), through any depth of calls; a function that might replace the buffer is `E-EXPORT`. So the buffer is the same allocation, of the same length, when the call returns, and there is nothing to copy back.
+- **Results:** integers, `bool`, nothing, `Bytes`, and structs and enums built only from those. The header defines the C types (`bst_bytes`, `bst_s_Name`, `bst_e_Name`, with a `bst_e_Name_Variant` constant for each enum tag) exactly as the generated C lays them out. Bytes handed back belong to the caller, who releases `data` with `free()`.
+- **No `requires`.** A C caller cannot be proved to meet a precondition, so an exported function has none: it checks the condition itself and returns an error value instead, which is then proved like any other code (`examples/base64/lib.bastio` does this for the encoder's length limit). This keeps the boundary free of generated checks. `ensures` clauses are allowed and are copied into the header as comments: they are proved, so the caller may rely on them.
+- Not generic (`E-TYPE`), not `main`, not a name starting with `bst_`, and only on the hosted target.
+
+The proof of an exported function assumes these things about its C caller that nothing checks (they are listed by `--trusted-base` and stated in the header): a `&Bytes` pointer is readable for its length and nothing writes those bytes during the call; a `&mut Bytes` pointer is readable and writable for its length, overlaps no other buffer argument, and nothing else uses it during the call; such a length is at most 2^60 (which follows from the first two, since no x86-64 address space is that large); and every argument is a valid value of its C type. A C caller that breaks them can make the Bastio code misbehave, as with any C library.
+
+The C function is a thin wrapper that converts each pointer and length into the internal `bst_bytes` and calls the proved function; it does no other work. A worked example with a test harness and a benchmark is in `examples/base64`.
 
 ## Soundness scope
 
@@ -935,11 +1211,11 @@ What a program that `bastioc0` accepts is guaranteed: no out-of-bounds access, n
 - **Stack depth.** Deep recursion can overflow the stack.
 - **Page contents.** The proof tracks who owns each page, not what is in it.
 - **The trusted base.** Z3, the stage0 compiler (Rust) and the C compiler are trusted, as is the hand-written C prelude each target links in (in `stage0/src/codegen.rs`), and the platform's boot and trap entry code. `bastioc0 --trusted-base` lists every prelude part with its size, the parts each target links, and every builtin; the listing is checked into `tests/trusted_base.txt` and `tests/run.sh` fails when it changes, so growth is reviewed (ROADMAP invariant 3). The small per-type helpers the compiler generates for `Box` and `Vec` are part of the compiler, not of this listing.
-- **Evaluation order.** C leaves the order of call arguments unspecified. Linearity keeps side effects on distinct values, so safety is unaffected, but output order is not guaranteed when two calls in one expression both do I/O.
+- **C callers.** An `export fn` relies on its C caller for the assumptions listed in [Calling Bastio from C](#calling-bastio-from-c).
 - **Child processes and files.** What another program writes, or what a file contains, is unknown to the proof, beyond each byte being `<= 255`.
 
 `tests/run.sh` also runs every program in `tests/pass/` under AddressSanitizer and UBSan, to confirm that the proofs match what happens at run time. Those checks exist only in the test build, never in generated code.
 
 ## Not in the language yet
 
-Planned, in [ROADMAP.md](../ROADMAP.md): concurrency (designed in [concurrency.md](concurrency.md)), integer types narrower than `u64`, `export fn` for calling Bastio from C, more hardware capabilities (`PortIo`, `Mmio`), allocation failure in the type, and a native x86-64 backend. Inference of type arguments, modules with qualified names, and hand-written lemmas for proofs Z3 cannot find are open questions.
+Planned, in [ROADMAP.md](../ROADMAP.md): the rest of concurrency (threads, atomics, interrupt-safe locks; designed in [concurrency.md](concurrency.md)), signed integer types, more hardware capabilities (`IrqOff`), allocation failure in the type, and a native x86-64 backend. Inference of type arguments, modules with qualified names, and hand-written lemmas for proofs Z3 cannot find are open questions.

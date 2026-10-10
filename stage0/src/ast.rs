@@ -5,6 +5,17 @@ use crate::diag::Pos;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
     U64,
+    /// Narrower unsigned integers (docs/integers.md). Like `u64`, arithmetic
+    /// on them is proved to stay in range.
+    U8,
+    U16,
+    U32,
+    /// Signed integers, two's complement. Arithmetic is proved to stay
+    /// between the type's minimum and maximum.
+    I8,
+    I16,
+    I32,
+    I64,
     Bool,
     Unit,
     /// An owned buffer of u64. Linear: must be consumed exactly once.
@@ -36,6 +47,24 @@ pub enum Type {
     /// The CPU's user-mode context: the right to enter user mode and the
     /// registers saved by the last trap. Linear; kernel target only.
     Cpu,
+    /// The I/O port space: the right to claim ranges of the 65536 x86 I/O
+    /// ports, each at most once. Linear; only `main` receives it. Kernel and
+    /// hosted targets (hosted simulates the ports).
+    Ports,
+    /// A claimed range of I/O ports, owned: the only way to read or write
+    /// them. Linear; given back with `port_release`.
+    PortIo,
+    /// The device window (physical 0xC000_0000 to 4 GiB, mapped uncached by
+    /// the platform): the right to claim each byte of it once. Linear; only
+    /// `main` receives it. Kernel and hosted targets (hosted simulates it).
+    MmioSpace,
+    /// A claimed range of memory-mapped device registers, owned: the only
+    /// way to read or write them. Linear; given back with `mmio_release`.
+    Mmio,
+    /// A page lent to devices for DMA: made from a `Frame` with `dma_lend`,
+    /// turned back with `dma_take`. While lent it cannot be freed, mapped or
+    /// reused, and its physical address (`dma_addr`) can be read. Linear.
+    Dma,
     /// A user-defined struct. Linear when any field is linear; otherwise a
     /// plain value that is copied.
     Struct(String),
@@ -48,6 +77,9 @@ pub enum Type {
     /// A growable array of `T` on the heap. Always linear. Every slot below
     /// its length holds a value, so there is no per-slot ownership to track.
     Vec(Box<Type>),
+    /// A lock holding a `T`, shared between threads or cores through `&`
+    /// borrows. Linear; its contents are reached only inside `locked`.
+    Lock(Box<Type>),
     /// `Name[T, ..]` as written: a generic struct or enum applied to type
     /// arguments. Only exists before monomorphization, which replaces it with
     /// the `Struct`/`Enum` instance named by `name()` (e.g. `Option[u64]`).
@@ -63,6 +95,13 @@ impl Type {
     pub fn name(&self) -> String {
         match self {
             Type::U64 => "u64".into(),
+            Type::U8 => "u8".into(),
+            Type::U16 => "u16".into(),
+            Type::U32 => "u32".into(),
+            Type::I8 => "i8".into(),
+            Type::I16 => "i16".into(),
+            Type::I32 => "i32".into(),
+            Type::I64 => "i64".into(),
             Type::Bool => "bool".into(),
             Type::Unit => "()".into(),
             Type::Buf => "Buf".into(),
@@ -76,9 +115,15 @@ impl Type {
             Type::Pool => "Pool".into(),
             Type::Mmu => "Mmu".into(),
             Type::Cpu => "Cpu".into(),
+            Type::Ports => "Ports".into(),
+            Type::PortIo => "PortIo".into(),
+            Type::MmioSpace => "MmioSpace".into(),
+            Type::Mmio => "Mmio".into(),
+            Type::Dma => "Dma".into(),
             Type::Struct(n) | Type::Enum(n) => n.clone(),
             Type::Box(t) => format!("Box[{}]", t.name()),
             Type::Vec(t) => format!("Vec[{}]", t.name()),
+            Type::Lock(t) => format!("Lock[{}]", t.name()),
             Type::Generic(n, args) => format!("{}[{}]", n, args.iter().map(|a| a.name()).collect::<Vec<_>>().join(", ")),
             Type::Ref(t) => format!("&{}", t.name()),
             Type::MutRef(t) => format!("&mut {}", t.name()),
@@ -86,17 +131,62 @@ impl Type {
     }
     pub fn is_linear(&self) -> bool {
         match self {
-            Type::Buf | Type::Bytes | Type::Host | Type::Child | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu | Type::Box(_) | Type::Vec(_) => true,
+            Type::Buf | Type::Bytes | Type::Host | Type::Child | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu | Type::Ports | Type::PortIo | Type::MmioSpace | Type::Mmio | Type::Dma | Type::Box(_) | Type::Vec(_) | Type::Lock(_) => true,
             Type::Struct(n) => struct_def(n).map_or(false, |d| d.fields.iter().any(|f| f.1.is_linear())),
             Type::Enum(n) => enum_def(n).map_or(false, |d| d.variants.iter().any(|v| v.1.as_ref().map_or(false, |t| t.is_linear()))),
             _ => false,
         }
+    }
+    /// The width in bits of an integer type.
+    pub fn int_bits(&self) -> Option<u32> {
+        match self {
+            Type::U8 => Some(8),
+            Type::U16 => Some(16),
+            Type::U32 => Some(32),
+            Type::U64 => Some(64),
+            Type::I8 => Some(8),
+            Type::I16 => Some(16),
+            Type::I32 => Some(32),
+            Type::I64 => Some(64),
+            _ => None,
+        }
+    }
+    pub fn is_int(&self) -> bool {
+        self.int_bits().is_some()
+    }
+    pub fn is_signed(&self) -> bool {
+        matches!(self, Type::I8 | Type::I16 | Type::I32 | Type::I64)
+    }
+    /// The largest value of an integer type.
+    pub fn int_max(&self) -> i128 {
+        let w = self.int_bits().expect("an integer type");
+        if self.is_signed() { (1i128 << (w - 1)) - 1 } else { (1i128 << w) - 1 }
+    }
+    /// The smallest value of an integer type.
+    pub fn int_min(&self) -> i128 {
+        let w = self.int_bits().expect("an integer type");
+        if self.is_signed() { -(1i128 << (w - 1)) } else { 0 }
+    }
+    /// 2^width: the modulus of wrapping arithmetic.
+    pub fn int_modulus(&self) -> i128 {
+        1i128 << self.int_bits().expect("an integer type")
     }
     pub fn is_ref(&self) -> bool {
         matches!(self, Type::Ref(_) | Type::MutRef(_))
     }
     pub fn is_mut_ref(&self) -> bool {
         matches!(self, Type::MutRef(_))
+    }
+    /// Pinned: describes the core or thread that holds it (`Cpu`, `Mmu`), so
+    /// it may never reach another one (through `lock_new` or `smp_run`).
+    pub fn is_pinned(&self) -> bool {
+        match self {
+            Type::Mmu | Type::Cpu => true,
+            Type::Box(t) | Type::Vec(t) | Type::Lock(t) | Type::Ref(t) | Type::MutRef(t) => t.is_pinned(),
+            Type::Struct(n) => struct_def(n).map_or(false, |d| d.fields.iter().any(|f| f.1.is_pinned())),
+            Type::Enum(n) => enum_def(n).map_or(false, |d| d.variants.iter().any(|v| v.1.as_ref().map_or(false, |t| t.is_pinned()))),
+            _ => false,
+        }
     }
     /// The type with any borrow removed.
     pub fn base(&self) -> &Type {
@@ -168,6 +258,9 @@ pub enum ExprKind {
     Is(Box<Expr>, String, String),
     Var(String),
     Not(Box<Expr>),
+    /// Unary minus, on signed integers only. In front of a literal it is part
+    /// of the literal (`-128` is an `i8`).
+    Neg(Box<Expr>),
     Bin(BinOp, Box<Expr>, Box<Expr>),
     Call(String, Vec<Expr>),
     /// `forall x: u64 :: body` (specifications only)
@@ -241,6 +334,14 @@ pub struct FnDef {
     pub ensures: Vec<Expr>,
     pub body: Vec<Stmt>,
     pub pos: Pos,
+    /// Filled in by the checker: the integer type of the operands of each
+    /// arithmetic operator, comparison, unary minus and wrapping builtin in
+    /// the body, by its position. The
+    /// verifier and the code generator need it, since literals take their
+    /// type from context.
+    pub int_ops: std::collections::HashMap<Pos, Type>,
+    /// `export fn`: also a C function of the same name, callable from C.
+    pub export: bool,
 }
 
 /// `spec fn name(params) -> bool { expr }`: a named specification, expanded
@@ -260,6 +361,9 @@ pub struct StructDef {
     pub name: String,
     pub tparams: Vec<String>,
     pub fields: Vec<(String, Type)>,
+    /// `invariant e` clauses after the fields: facts about the fields that
+    /// hold whenever a value is inside a `Lock` (ghost).
+    pub invariants: Vec<Expr>,
     pub pos: Pos,
 }
 
@@ -333,7 +437,7 @@ pub fn resolve_enum_types(p: &mut Program) {
                 ts.iter_mut().for_each(|t| fix(t, names));
                 fix_expr(inner, names);
             }
-            ExprKind::Field(x, _) | ExprKind::Is(x, _, _) | ExprKind::Not(x) | ExprKind::Forall(_, x) => fix_expr(x, names),
+            ExprKind::Field(x, _) | ExprKind::Is(x, _, _) | ExprKind::Not(x) | ExprKind::Neg(x) | ExprKind::Forall(_, x) => fix_expr(x, names),
             ExprKind::Variant(_, _, Some(x)) => fix_expr(x, names),
             ExprKind::StructLit(_, fs) => fs.iter_mut().for_each(|(_, x)| fix_expr(x, names)),
             ExprKind::Bin(_, a, b) => {
@@ -443,6 +547,7 @@ pub fn render(e: &Expr) -> String {
                 format!("{}[{}]{}", &inner[..n], ts.iter().map(|t| t.name()).collect::<Vec<_>>().join(", "), &inner[n..])
             }
             ExprKind::Not(x) => format!("!{}", go(x, false)),
+            ExprKind::Neg(x) => format!("-{}", go(x, false)),
             ExprKind::Bin(op, a, b) => {
                 let s = format!("{} {} {}", go(a, false), op.text(), go(b, false));
                 if top { s } else { format!("({})", s) }

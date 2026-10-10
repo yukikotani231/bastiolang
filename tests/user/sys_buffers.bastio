@@ -1,0 +1,24 @@
+// User programs pass buffers to the kernel with sys_send and get them back
+// filled with sys_recv. The numbers are the kernel's; these are BastiOS's
+// file system calls.
+const SYS_OPEN: u64 = 11;
+const SYS_CLOSE: u64 = 12;
+const SYS_FREAD: u64 = 13;
+
+fn main(con: &mut Serial) -> u64 {
+  let name = bfrom("motd");
+  let fd = sys_send(SYS_OPEN, 0, name, blen(name));
+  bfree(name);
+  let mut buf = balloc(64);
+  let n = sys_recv(SYS_FREAD, fd, &mut buf);
+  // The kernel kept the length and wrote only bytes.
+  let mut i = 0;
+  while i < n && i < blen(buf)
+    invariant i <= blen(buf)
+  {
+    serial_write(con, bget(buf, i));
+    i = i + 1;
+  }
+  bfree(buf);
+  return sys_call(SYS_CLOSE, fd, 0);
+}

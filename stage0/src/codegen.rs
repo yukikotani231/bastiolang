@@ -42,6 +42,11 @@ struct Gen<'a> {
     boxed: &'a mut Vec<Type>,
     /// Element types of vectors operated on: each gets a set of helpers.
     vecs: &'a mut Vec<Type>,
+    /// The integer type of each arithmetic operator (`FnDef::int_ops`).
+    int_ops: &'a HashMap<crate::diag::Pos, Type>,
+    /// One argument block and thunk per `smp_run` call, emitted before the
+    /// function bodies.
+    smps: &'a mut Vec<String>,
 }
 
 pub fn emit(p: &Program, target: Target) -> String {
@@ -49,6 +54,7 @@ pub fn emit(p: &Program, target: Target) -> String {
     let mut blobs = Vec::new();
     let mut boxed = Vec::new();
     let mut vecs = Vec::new();
+    let mut smps = Vec::new();
     let mut bodies = String::new();
     for f in &p.fns {
         let mut g = Gen {
@@ -59,6 +65,8 @@ pub fn emit(p: &Program, target: Target) -> String {
             sigs: &sigs,
             boxed: &mut boxed,
             vecs: &mut vecs,
+            int_ops: &f.int_ops,
+            smps: &mut smps,
         };
         bodies.push_str(&format!("{} {{\n", proto(f)));
         for s in &f.body {
@@ -70,7 +78,8 @@ pub fn emit(p: &Program, target: Target) -> String {
     for (_, part) in prelude_parts(target) {
         out.push_str(part);
     }
-    out.push_str(&struct_decls(p));
+    let all: Vec<String> = p.structs.iter().map(|d| d.name.clone()).chain(p.enums.iter().map(|d| d.name.clone())).collect();
+    out.push_str(&struct_decls(p, &all));
     for t in &vecs {
         let (c, n) = (cty(t), box_helper(t));
         out.push_str(&format!("static void bst_vec_push_{n}(bst_vec *v, {c} x) {{ if (v->len == v->cap) bst_vec_grow(v, sizeof({c})); (({c} *)v->data)[v->len++] = x; }}\n"));
@@ -97,11 +106,137 @@ pub fn emit(p: &Program, target: Target) -> String {
     for f in &p.fns {
         out.push_str(&format!("{};\n", proto(f)));
     }
+    for s in &smps {
+        out.push_str(s);
+    }
     out.push('\n');
     out.push_str(&bodies);
-    out.push_str(&entry(p, target));
+    for f in p.fns.iter().filter(|f| f.export) {
+        out.push_str(&export_wrapper(f));
+    }
+    if p.fns.iter().any(|f| f.name == "main") {
+        out.push_str(&entry(p, target));
+    }
     out
 }
+
+/// The C side of an `export fn`: a non-static function under the Bastio
+/// name, whose parameters are C types (`&Bytes` is a pointer and a length).
+fn export_proto(f: &FnDef) -> String {
+    let mut params = Vec::new();
+    for prm in &f.params {
+        if *prm.ty.base() == Type::Bytes {
+            params.push(format!("{}uint8_t *{}", if prm.ty.is_mut_ref() { "" } else { "const " }, prm.name));
+            params.push(format!("size_t {}_len", prm.name));
+        } else {
+            params.push(format!("{} {}", cty(&prm.ty), prm.name));
+        }
+    }
+    let ps = if params.is_empty() { "void".to_string() } else { params.join(", ") };
+    format!("{} {}({})", cty(&f.ret), f.name, ps)
+}
+
+/// The definition behind `export_proto`. It only converts: a lent buffer
+/// becomes a `bst_bytes` (`const` is dropped, which is sound because a
+/// `&Bytes` is never written through; see check.rs), and everything else is
+/// passed and returned as is.
+fn export_wrapper(f: &FnDef) -> String {
+    // A lent `&mut Bytes` is a local the callee writes through; the verifier
+    // proved it is not replaced (verify.rs, `buffers_kept`), so there is
+    // nothing to copy back.
+    let mut locals = String::new();
+    for prm in f.params.iter().filter(|p| p.ty.is_mut_ref()) {
+        locals.push_str(&format!("    bst_bytes m_{0} = {{ (uint64_t){0}_len, {0} }};\n", prm.name));
+    }
+    let args: Vec<String> = f
+        .params
+        .iter()
+        .map(|prm| {
+            if prm.ty.is_mut_ref() {
+                format!("&m_{}", prm.name)
+            } else if *prm.ty.base() == Type::Bytes {
+                format!("(bst_bytes){{ (uint64_t){0}_len, (unsigned char *){0} }}", prm.name)
+            } else {
+                prm.name.clone()
+            }
+        })
+        .collect();
+    let call = format!("f_{}({})", cid(&f.name), args.join(", "));
+    let body = if f.ret == Type::Unit { format!("{};", call) } else { format!("return {};", call) };
+    format!("{} {{\n{}    {}\n}}\n\n", export_proto(f), locals, body)
+}
+
+/// The C header of a library: the types its exported functions return,
+/// and their prototypes, each with its postconditions as a comment.
+/// `guard` names the include guard.
+pub fn header(p: &Program, guard: &str) -> String {
+    fn collect(t: &Type, out: &mut Vec<String>) {
+        let held: Vec<Type> = match t {
+            Type::Struct(n) if !out.contains(n) => {
+                out.push(n.clone());
+                p_struct(n).fields.iter().map(|f| f.1.clone()).collect()
+            }
+            Type::Enum(n) if !out.contains(n) => {
+                out.push(n.clone());
+                p_enum(n).variants.iter().filter_map(|v| v.1.clone()).collect()
+            }
+            _ => Vec::new(),
+        };
+        for t in &held {
+            collect(t, out);
+        }
+    }
+    fn p_struct(n: &str) -> &'static StructDef {
+        struct_def(n).expect("checked")
+    }
+    fn p_enum(n: &str) -> &'static EnumDef {
+        enum_def(n).expect("checked")
+    }
+    let exports: Vec<&FnDef> = p.fns.iter().filter(|f| f.export).collect();
+    let mut types = Vec::new();
+    for f in &exports {
+        collect(&f.ret, &mut types);
+    }
+    let mut out = format!(
+        "/* generated by bastioc0 -- do not edit */\n#ifndef {g}\n#define {g}\n\n#include <stdbool.h>\n#include <stddef.h>\n#include <stdint.h>\n\n",
+        g = guard
+    );
+    out.push_str(HEADER_NOTES);
+    out.push_str("#ifndef BST_BYTES_DEFINED\n#define BST_BYTES_DEFINED\ntypedef struct { uint64_t len; unsigned char *data; } bst_bytes;\n#endif\n\n");
+    if !types.is_empty() {
+        out.push_str(&struct_decls(p, &types));
+        for n in &types {
+            if let Some(d) = enum_def(n) {
+                let tags: Vec<String> = d.variants.iter().enumerate().map(|(i, (v, _))| format!("bst_e_{}_{} = {}", cid(n), v, i)).collect();
+                out.push_str(&format!("enum {{ {} }};\n", tags.join(", ")));
+            }
+        }
+        out.push('\n');
+    }
+    for f in &exports {
+        for e in &f.ensures {
+            out.push_str(&format!("/* ensures {} */\n", render(e)));
+        }
+        out.push_str(&format!("{};\n\n", export_proto(f)));
+    }
+    out.push_str("#endif\n");
+    out
+}
+
+const HEADER_NOTES: &str = r#"/* The functions below are written in Bastio and proved memory safe. What
+ * they rely on from their C caller, which the proofs cannot check:
+ * - a `const uint8_t *p, size_t p_len` pair is readable for p_len bytes and
+ *   is not written (by any thread) during the call;
+ * - a `uint8_t *p, size_t p_len` pair (a buffer the function writes into) is
+ *   readable and writable for p_len bytes, overlaps no other buffer argument,
+ *   and is not used by anyone else during the call. The function writes
+ *   only inside it and never frees it;
+ * - every argument is a valid value of its C type.
+ * A returned `bst_bytes` (also inside a returned struct or enum) belongs to
+ * the caller: release its `data` with free(). An enum is a struct with a
+ * `tag` (the constants below) and a union `u` holding the payload of the
+ * variant named by the tag. */
+"#;
 
 /// The entry point: builds the capabilities `main` asks for and calls it.
 fn entry(p: &Program, target: Target) -> String {
@@ -138,7 +273,14 @@ fn entry(p: &Program, target: Target) -> String {
             teardown,
             if returns { "(int)r" } else { "0" }
         ),
-        Target::Kernel => format!("void bst_kmain(uint64_t mbi) {{\n    (void)mbi;\n    bst_serial_init();\n{}    (void){};\n}}\n", setup, call),
+        // COM1 is set up only for a kernel that uses `Serial`; one that drives
+        // the UART itself through `Ports` gets it untouched.
+        Target::Kernel => format!(
+            "void bst_kmain(uint64_t mbi) {{\n    (void)mbi;\n{}{}    (void){};\n}}\n",
+            if legacy || main.params.iter().any(|p| *p.ty.base() == Type::Serial) { "    bst_serial_init();\n" } else { "" },
+            setup,
+            call
+        ),
         Target::User => format!("uint64_t bst_umain(void) {{\n{}    uint64_t r = {};\n    bst_flush();\n    return r;\n}}\n", setup, call),
     }
 }
@@ -153,6 +295,22 @@ typedef struct { uint64_t len; unsigned char *data; } bst_bytes;
 typedef int bst_serial, bst_mmu, bst_cpu, bst_host;   /* capability tokens: no data */
 typedef uint64_t bst_frame, bst_pt;         /* a page's physical address */
 typedef struct { uint64_t base, size; } bst_pool;
+typedef int bst_ports;                      /* capability token: no data */
+typedef struct { uint64_t base, count; } bst_portio;
+typedef int bst_mmiospace;                  /* capability token: no data */
+typedef struct { uint64_t base, len; } bst_mmio;
+typedef uint64_t bst_dma;                   /* a lent page's physical address */
+/* Lock[T]: a lock word followed by the T. A spin lock; acquire and release
+ * order the accesses to the contents between processors. */
+static inline void bst_lock_acquire(uint64_t *w) {
+    while (__atomic_exchange_n(w, 1, __ATOMIC_ACQUIRE))
+        while (__atomic_load_n(w, __ATOMIC_RELAXED)) {
+#if defined(__x86_64__) || defined(__i386__)
+            __asm__ volatile ("pause");
+#endif
+        }
+}
+static inline void bst_lock_release(uint64_t *w) { __atomic_store_n(w, 0, __ATOMIC_RELEASE); }
 static inline bst_buf bst_set(bst_buf b, uint64_t i, uint64_t v) { b.data[i] = v; return b; }
 "#;
 
@@ -354,23 +512,27 @@ static uint64_t bst_arena[BST_ARENA_WORDS];
 static uint64_t bst_arena_top = 0;
 typedef struct bst_free { uint64_t words; struct bst_free *next; } bst_free_t;
 static bst_free_t *bst_free_list = 0;
+static uint64_t bst_arena_lock;              /* every processor allocates from the one arena */
 static bst_buf bst_alloc(uint64_t n) {
     uint64_t words = (n ? n : 1) + 1;            /* one header word for the size */
     if (words < 2) words = 2;
+    uint64_t *blk = 0;
+    bst_lock_acquire(&bst_arena_lock);
     bst_free_t **pp = &bst_free_list;
     for (bst_free_t *f = bst_free_list; f; pp = &f->next, f = f->next) {
         if (f->words == words) {
             *pp = f->next;
-            uint64_t *blk = (uint64_t *)f;
-            for (uint64_t i = 1; i < words; i++) blk[i] = 0;
-            bst_buf b = { n, blk + 1 };
-            return b;
+            blk = (uint64_t *)f;
+            break;
         }
     }
-    if (bst_arena_top + words > BST_ARENA_WORDS) { bst_puts("bastio: out of memory\n"); bst_halt(); }
-    uint64_t *blk = &bst_arena[bst_arena_top];
-    bst_arena_top += words;
-    blk[0] = words;
+    if (!blk) {
+        if (bst_arena_top + words > BST_ARENA_WORDS) { bst_puts("bastio: out of memory\n"); bst_halt(); }
+        blk = &bst_arena[bst_arena_top];
+        bst_arena_top += words;
+        blk[0] = words;
+    }
+    bst_lock_release(&bst_arena_lock);
     for (uint64_t i = 1; i < words; i++) blk[i] = 0;
     bst_buf b = { n, blk + 1 };
     return b;
@@ -378,9 +540,11 @@ static bst_buf bst_alloc(uint64_t n) {
 static void bst_free(bst_buf b) {
     uint64_t *blk = b.data - 1;
     bst_free_t *f = (bst_free_t *)blk;
+    bst_lock_acquire(&bst_arena_lock);
     f->words = blk[0];
     f->next = bst_free_list;
     bst_free_list = f;
+    bst_lock_release(&bst_arena_lock);
 }
 static void bst_print(uint64_t v) {
     char d[20]; int n = 0;
@@ -547,6 +711,80 @@ static bst_bytes bst_bfrom(bst_str s) {
 "#;
 
 // Kernel-only: CR3 and user mode. The platform supplies the trap machinery.
+// I/O ports: claiming and releasing are proof-only, so they compile to
+// nothing; an access is one instruction at base + offset. The prover has
+// shown the offset is inside the claimed range.
+const PRELUDE_PORTS: &str = r#"
+static inline bst_portio bst_port_claim(bst_ports *p, uint64_t b, uint64_t c) { (void)p; bst_portio io = { b, c }; return io; }
+static inline void bst_port_release(bst_ports *p, bst_portio io) { (void)p; (void)io; }
+static inline uint64_t bst_port_base(bst_portio io) { return io.base; }
+static inline uint64_t bst_port_count(bst_portio io) { return io.count; }
+"#;
+
+// Memory-mapped registers: like ports, claiming is proof-only. The kernel
+// platform maps the device window (0xC000_0000 to 4 GiB) uncached at its
+// physical address, so an access is one volatile load or store there.
+const PRELUDE_MMIO: &str = r#"
+static inline bst_mmio bst_mmio_claim(bst_mmiospace *s, uint64_t b, uint64_t l) { (void)s; bst_mmio m = { b, l }; return m; }
+static inline void bst_mmio_release(bst_mmiospace *s, bst_mmio m) { (void)s; (void)m; }
+static inline uint64_t bst_mmio_base(bst_mmio m) { return m.base; }
+static inline uint64_t bst_mmio_len(bst_mmio m) { return m.len; }
+"#;
+
+const PRELUDE_MMIO_KERNEL: &str = r#"
+#define BST_MMIO_RW(w, t) \
+    static inline uint64_t bst_mmio_read##w(bst_mmio *m, uint64_t o) { return *(volatile t *)(uintptr_t)(m->base + o); } \
+    static inline void bst_mmio_write##w(bst_mmio *m, uint64_t o, uint64_t v) { *(volatile t *)(uintptr_t)(m->base + o) = (t)v; }
+BST_MMIO_RW(8, uint8_t) BST_MMIO_RW(16, uint16_t) BST_MMIO_RW(32, uint32_t) BST_MMIO_RW(64, uint64_t)
+"#;
+
+// Pages lent to devices. A `Dma` is the page's address, like a `Frame`, so
+// lending is only a fence: every store before it reaches memory before the
+// driver can tell a device where the page is, and taking the page back
+// orders the device's writes before later reads. Accesses while lent are
+// volatile: the device may read or write the page at any time.
+const PRELUDE_DMA: &str = r#"
+static inline bst_dma bst_dma_lend(bst_frame f) { __atomic_thread_fence(__ATOMIC_SEQ_CST); return f; }
+static inline bst_frame bst_dma_take(bst_dma d) { __atomic_thread_fence(__ATOMIC_SEQ_CST); return d; }
+static inline uint64_t bst_dma_id(bst_dma d) { return (d - bst_pool_base) / 4096; }
+static inline uint64_t bst_dma_addr(bst_dma d) { return d; }
+#define BST_DMA_RW(w, t) \
+    static inline uint64_t bst_dma_read##w(bst_dma *d, uint64_t o) { return *(volatile t *)(uintptr_t)(*d + o); } \
+    static inline void bst_dma_write##w(bst_dma *d, uint64_t o, uint64_t v) { *(volatile t *)(uintptr_t)(*d + o) = (t)v; }
+BST_DMA_RW(8, uint8_t) BST_DMA_RW(16, uint16_t) BST_DMA_RW(32, uint32_t) BST_DMA_RW(64, uint64_t)
+"#;
+
+// Hosted programs simulate the window with 1 MiB of memory, indexed by the
+// low 20 bits of the address (so registers 1 MiB apart share storage).
+const PRELUDE_MMIO_HOSTED: &str = r#"
+static unsigned char bst_mmio_cell[1u << 20];
+#define BST_MMIO_RW(w, t) \
+    static inline uint64_t bst_mmio_read##w(bst_mmio *m, uint64_t o) { t v; memcpy(&v, &bst_mmio_cell[(m->base + o) & 0xFFFFF], sizeof v); return v; } \
+    static inline void bst_mmio_write##w(bst_mmio *m, uint64_t o, uint64_t v) { t x = (t)v; memcpy(&bst_mmio_cell[(m->base + o) & 0xFFFFF], &x, sizeof x); }
+BST_MMIO_RW(8, uint8_t) BST_MMIO_RW(16, uint16_t) BST_MMIO_RW(32, uint32_t) BST_MMIO_RW(64, uint64_t)
+"#;
+
+const PRELUDE_PORTS_KERNEL: &str = r#"
+static inline uint64_t bst_pio_in8(bst_portio *io, uint64_t o) { return bst_inb((uint16_t)(io->base + o)); }
+static inline uint64_t bst_pio_in16(bst_portio *io, uint64_t o) { uint16_t v; __asm__ volatile ("inw %1, %0" : "=a"(v) : "Nd"((uint16_t)(io->base + o))); return v; }
+static inline uint64_t bst_pio_in32(bst_portio *io, uint64_t o) { uint32_t v; __asm__ volatile ("inl %1, %0" : "=a"(v) : "Nd"((uint16_t)(io->base + o))); return v; }
+static inline void bst_pio_out8(bst_portio *io, uint64_t o, uint64_t v) { bst_outb((uint16_t)(io->base + o), (uint8_t)v); }
+static inline void bst_pio_out16(bst_portio *io, uint64_t o, uint64_t v) { __asm__ volatile ("outw %0, %1" : : "a"((uint16_t)v), "Nd"((uint16_t)(io->base + o))); }
+static inline void bst_pio_out32(bst_portio *io, uint64_t o, uint64_t v) { __asm__ volatile ("outl %0, %1" : : "a"((uint32_t)v), "Nd"((uint16_t)(io->base + o))); }
+"#;
+
+// Hosted programs have no ports: each port is a cell that remembers the
+// last value written to it, so drivers can be tested off the machine.
+const PRELUDE_PORTS_HOSTED: &str = r#"
+static uint32_t bst_port_cell[65536];
+static inline uint64_t bst_pio_in8(bst_portio *io, uint64_t o) { return bst_port_cell[io->base + o] & 0xFF; }
+static inline uint64_t bst_pio_in16(bst_portio *io, uint64_t o) { return bst_port_cell[io->base + o] & 0xFFFF; }
+static inline uint64_t bst_pio_in32(bst_portio *io, uint64_t o) { return bst_port_cell[io->base + o]; }
+static inline void bst_pio_out8(bst_portio *io, uint64_t o, uint64_t v) { bst_port_cell[io->base + o] = (uint32_t)v; }
+static inline void bst_pio_out16(bst_portio *io, uint64_t o, uint64_t v) { bst_port_cell[io->base + o] = (uint32_t)v; }
+static inline void bst_pio_out32(bst_portio *io, uint64_t o, uint64_t v) { bst_port_cell[io->base + o] = (uint32_t)v; }
+"#;
+
 const PRELUDE_KERNEL_CPU: &str = r#"
 static inline void bst_load_cr3(uint64_t a) { __asm__ volatile ("mov %0, %%cr3" : : "r"(a) : "memory"); }
 static inline void bst_mmu_switch(bst_mmu *m, bst_pt root) { (void)m; bst_load_cr3(root); }
@@ -554,12 +792,26 @@ static inline void bst_mmu_kernel(bst_mmu *m) { (void)m; bst_load_cr3((uint64_t)
 static inline bst_frame bst_pt_free_root(bst_mmu m, bst_pt t) { (void)m; return t; }
 
 /* Saved user registers: rax rbx rcx rdx rsi rdi rbp r8-r15 (0-14), rip (15),
- * rsp (16), rflags (17), error code (18), fault address (19). */
-extern uint64_t bst_cpu_ctx[20];
+ * rsp (16), rflags (17), error code (18), fault address (19), FS base (20). */
+extern uint64_t *bst_platform_ctx(void); /* this processor's saved context, 21 words */
 extern uint64_t bst_cpu_enter(void);   /* enter user mode; returns the trap vector */
 extern uint64_t bst_cpu_wait(void);    /* sti; hlt; cli; returns the interrupt vector */
-static inline uint64_t bst_cpu_get(bst_cpu c, uint64_t r) { (void)c; return bst_cpu_ctx[r]; }
-static inline void bst_cpu_set(bst_cpu *c, uint64_t r, uint64_t v) { (void)c; bst_cpu_ctx[r] = v; }
+static inline uint64_t bst_cpu_get(bst_cpu c, uint64_t r) { (void)c; return bst_platform_ctx()[r]; }
+static inline void bst_cpu_set(bst_cpu *c, uint64_t r, uint64_t v) { (void)c; bst_platform_ctx()[r] = v; }
+/* The user's x87/SSE state, in a page the kernel owns (the platform has
+ * enabled CR4.OSFXSR). fxrstor faults on reserved MXCSR bits, so the load
+ * works from a copy with only the defined bits (0-15) kept. */
+static inline void bst_cpu_fpu_save(bst_cpu *c, bst_frame *f) {
+    (void)c;
+    __asm__ volatile ("fxsave64 (%0)" : : "r"(*f) : "memory");
+}
+static inline void bst_cpu_fpu_load(bst_cpu *c, bst_frame f) {
+    (void)c;
+    uint64_t buf[64] __attribute__((aligned(16)));
+    for (int i = 0; i < 64; i++) buf[i] = ((uint64_t *)f)[i];
+    buf[3] &= 0xFFFF;                   /* bytes 24-27 are MXCSR, 28-31 its mask (ignored) */
+    __asm__ volatile ("fxrstor64 (%0)" : : "r"(buf) : "memory");
+}
 static inline uint64_t bst_cpu_run(bst_cpu *c, bst_mmu m) {
     (void)c; (void)m;
     uint64_t cr3;
@@ -568,6 +820,10 @@ static inline uint64_t bst_cpu_run(bst_cpu *c, bst_mmu m) {
     return bst_cpu_enter();
 }
 static inline uint64_t bst_cpu_idle(bst_cpu *c) { (void)c; return bst_cpu_wait(); }
+extern void bst_platform_smp_start(void (*fn)(void *), void *arg); /* run fn(arg) on every other processor */
+extern void bst_platform_smp_join(void);                           /* wait until all of them have returned */
+extern uint64_t bst_platform_cpus(void); /* processors running, this one included; 1 to 4096 */
+static inline uint64_t bst_cpu_count(bst_cpu c) { (void)c; return bst_platform_cpus(); }
 
 /* Called by the platform on a fault in kernel mode: that is a bug in the
  * trusted base or the compiler, never in verified code. */
@@ -660,11 +916,24 @@ static inline uint64_t bst_sys_getpid(void) { return bst_sys(BST_SYS_GETPID, 0, 
 static inline uint64_t bst_sys_info(uint64_t k) { return bst_sys(BST_SYS_INFO, k, 0, 0); }
 static inline void bst_sys_ps(void) { bst_flush(); bst_sys(BST_SYS_PS, 0, 0, 0); }
 static inline void bst_sys_poweroff(void) { bst_flush(); bst_sys(BST_SYS_POWEROFF, 0, 0, 0); }
+/* Calls with numbers the language does not know: the kernel defines them.
+ * sys_send lends the kernel bytes 0..n of b to read; sys_recv lends all of b
+ * to overwrite. Console output is flushed first so it stays in order. */
+static inline uint64_t bst_sys_call(uint64_t n, uint64_t a, uint64_t b) { bst_flush(); return bst_sys(n, a, b, 0); }
+static inline uint64_t bst_sys_send(uint64_t n, uint64_t a, bst_bytes b, uint64_t len) { bst_flush(); return bst_sys(n, a, (uint64_t)b.data, len); }
+static inline uint64_t bst_sys_recv(uint64_t n, uint64_t a, bst_bytes *b) { bst_flush(); return bst_sys(n, a, (uint64_t)b->data, b->len); }
 "#;
 
 fn cty(t: &Type) -> String {
     match t {
         Type::U64 => "uint64_t".into(),
+        Type::U8 => "uint8_t".into(),
+        Type::U16 => "uint16_t".into(),
+        Type::U32 => "uint32_t".into(),
+        Type::I8 => "int8_t".into(),
+        Type::I16 => "int16_t".into(),
+        Type::I32 => "int32_t".into(),
+        Type::I64 => "int64_t".into(),
         Type::Bool => "bool".into(),
         Type::Unit => "void".into(),
         Type::Buf => "bst_buf".into(),
@@ -678,11 +947,18 @@ fn cty(t: &Type) -> String {
         Type::Pool => "bst_pool".into(),
         Type::Mmu => "bst_mmu".into(),
         Type::Cpu => "bst_cpu".into(),
+        Type::Ports => "bst_ports".into(),
+        Type::PortIo => "bst_portio".into(),
+        Type::MmioSpace => "bst_mmiospace".into(),
+        Type::Mmio => "bst_mmio".into(),
+        Type::Dma => "bst_dma".into(),
         Type::Struct(n) => format!("bst_s_{}", cid(n)),
         Type::Enum(n) => format!("bst_e_{}", cid(n)),
         Type::Generic(..) => unreachable!("removed by monomorphization"),
         Type::Box(t) => format!("{} *", cty(t)),
         Type::Vec(_) => "bst_vec".into(),
+        // The lock word, followed by the contents (see bst_lock_acquire).
+        Type::Lock(_) => "uint64_t *".into(),
         Type::Ref(t) => cty(t),
         Type::MutRef(_) => unreachable!("written by proto"),
     }
@@ -691,7 +967,7 @@ fn cty(t: &Type) -> String {
 /// C types for the program's structs and enums. All are declared first, so a
 /// box (a pointer) can name any of them; then each is defined after the types
 /// it holds by value. An enum is a tag plus a union of its payloads.
-fn struct_decls(p: &Program) -> String {
+fn struct_decls(p: &Program, names: &[String]) -> String {
     fn emit_one(n: &str, p: &Program, done: &mut Vec<String>, out: &mut String) {
         if done.iter().any(|d| d == n) {
             return;
@@ -728,14 +1004,14 @@ fn struct_decls(p: &Program) -> String {
         }
     }
     let mut out = String::new();
-    for d in &p.structs {
+    for d in p.structs.iter().filter(|d| names.contains(&d.name)) {
         out.push_str(&format!("typedef struct bst_s_{0} bst_s_{0};\n", cid(&d.name)));
     }
-    for d in &p.enums {
+    for d in p.enums.iter().filter(|d| names.contains(&d.name)) {
         out.push_str(&format!("typedef struct bst_e_{0} bst_e_{0};\n", cid(&d.name)));
     }
     let mut done = Vec::new();
-    for n in p.structs.iter().map(|d| &d.name).chain(p.enums.iter().map(|d| &d.name)) {
+    for n in names {
         emit_one(n, p, &mut done, &mut out);
     }
     out
@@ -827,9 +1103,13 @@ impl<'a> Gen<'a> {
     /// The type of a code expression (the checker has already accepted it).
     fn type_of(&self, e: &Expr) -> Type {
         match &e.kind {
-            ExprKind::TypeApp(targs, _) => Type::Vec(Box::new(targs[0].clone())), // vec_new[T]()
+            ExprKind::TypeApp(targs, inner) => match &inner.kind {
+                ExprKind::Call(n, _) if n == "cast" || n == "wrap" => targs[0].clone(),
+                _ => Type::Vec(Box::new(targs[0].clone())), // vec_new[T]()
+            },
             ExprKind::Int(_) => Type::U64,
             ExprKind::Bool(_) | ExprKind::Not(_) | ExprKind::Is(..) => Type::Bool,
+            ExprKind::Neg(_) => self.int_ops.get(&e.pos).cloned().unwrap_or(Type::I64),
             ExprKind::Str(_) | ExprKind::Blob(_) => Type::Str,
             ExprKind::Var(n) => self.types[n].clone(),
             ExprKind::Field(b, f) => {
@@ -842,7 +1122,7 @@ impl<'a> Gen<'a> {
             ExprKind::StructLit(n, _) => Type::Struct(n.clone()),
             ExprKind::Variant(n, ..) => Type::Enum(n.clone()),
             ExprKind::Bin(op, ..) => match op {
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => Type::U64,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => self.int_ops[&e.pos].clone(),
                 _ => Type::Bool,
             },
             ExprKind::Call(n, args) if n == "box" => Type::Box(Box::new(self.type_of(&args[0]))),
@@ -855,6 +1135,17 @@ impl<'a> Gen<'a> {
                 "vec_push" | "vec_set" | "vec_free" => Type::Unit,
                 _ => self.vec_elem(&args[0]),
             },
+            ExprKind::Call(n, _) if crate::check::WRAP_BUILTINS.contains(&n.as_str()) => self.int_ops[&e.pos].clone(),
+            ExprKind::Call(n, args) if n == "lock_new" => Type::Lock(Box::new(self.type_of(&args[0]))),
+            ExprKind::Call(n, args) if n == "lock_end" => match self.type_of(&args[0]) {
+                Type::Lock(i) => *i,
+                _ => unreachable!("checked"),
+            },
+            ExprKind::Call(n, args) if n == "locked" => match &args[1].kind {
+                ExprKind::Var(f) => self.sigs[f].ret.clone(),
+                _ => unreachable!("checked"),
+            },
+            ExprKind::Call(n, _) if n == "smp_run" => Type::Unit,
             ExprKind::Call(n, _) => self.sigs[n].ret.clone(),
             ExprKind::MutBorrow(_) | ExprKind::Forall(..) => unreachable!("not a value"),
         }
@@ -950,7 +1241,12 @@ impl<'a> Gen<'a> {
 
     fn expr(&mut self, e: &Expr) -> String {
         match &e.kind {
-            ExprKind::TypeApp(..) => "((bst_vec){ 0, 0, 0 })".to_string(), // vec_new[T]()
+            // `cast` is proved not to change the value and `wrap` means C's
+            // modular conversion, so both are a plain C cast.
+            ExprKind::TypeApp(targs, inner) => match &inner.kind {
+                ExprKind::Call(n, args) if n == "cast" || n == "wrap" => format!("(({})({}))", cty(&targs[0]), self.expr(&args[0])),
+                _ => "((bst_vec){ 0, 0, 0 })".to_string(), // vec_new[T]()
+            },
             ExprKind::Int(v) => format!("UINT64_C({})", v),
             ExprKind::Bool(b) => b.to_string(),
             ExprKind::Str(bytes) => {
@@ -970,8 +1266,10 @@ impl<'a> Gen<'a> {
             }
             ExprKind::Field(..) => self.place(&place(e).expect("checked: a place")),
             ExprKind::StructLit(n, fs) => {
-                let inits: Vec<String> = fs.iter().map(|(f, x)| format!(".{} = {}", f, self.expr(x))).collect();
-                format!("((bst_s_{}){{ {} }})", cid(n), inits.join(", "))
+                let xs: Vec<&Expr> = fs.iter().map(|(_, x)| x).collect();
+                let (pre, vals) = self.operands(&xs, false);
+                let inits: Vec<String> = fs.iter().zip(vals).map(|((f, _), v)| format!(".{} = {}", f, v)).collect();
+                seq(pre, format!("((bst_s_{}){{ {} }})", cid(n), inits.join(", ")))
             }
             ExprKind::Variant(n, v, payload) => match payload {
                 Some(x) => format!("((bst_e_{}){{ .tag = {}, .u.{} = {} }})", cid(n), enum_def(n).unwrap().index(v).unwrap(), v, self.expr(x)),
@@ -982,19 +1280,36 @@ impl<'a> Gen<'a> {
                 format!("({}.tag == {})", self.expr(x), enum_def(&n).unwrap().index(v).unwrap())
             }
             ExprKind::Not(x) => format!("(!{})", self.expr(x)),
-            ExprKind::Bin(op, a, b) => format!("({} {} {})", self.expr(a), op.text(), self.expr(b)),
+            // A negated literal is a constant; `-x` is proved not to overflow.
+            ExprKind::Neg(x) => match x.kind {
+                ExprKind::Int(v) if v == 1 << 63 => "INT64_MIN".to_string(),
+                ExprKind::Int(v) => format!("(-INT64_C({}))", v),
+                _ => format!("(-(int64_t)({}))", self.expr(x)),
+            },
+            // && and || are sequenced in C already (and must stay short-circuit).
+            ExprKind::Bin(op, a, b) if matches!(op, BinOp::And | BinOp::Or) => format!("({} {} {})", self.expr(a), op.text(), self.expr(b)),
+            ExprKind::Bin(op, a, b) => {
+                let (pre, v) = self.operands(&[a, b], false);
+                // Signed operands are computed in int64_t, so a literal
+                // (a uint64_t constant) cannot turn the operation unsigned.
+                // The proof keeps every result in range, so nothing overflows.
+                if self.int_ops.get(&e.pos).map_or(false, |t| t.is_signed()) {
+                    return seq(pre, format!("((int64_t)({}) {} (int64_t)({}))", v[0], op.text(), v[1]));
+                }
+                seq(pre, format!("({} {} {})", v[0], op.text(), v[1]))
+            }
             ExprKind::Forall(..) => unreachable!("specification only"),
             ExprKind::Call(name, args) if crate::check::VEC_BUILTINS.contains(&name.as_str()) => {
                 let el = self.vec_elem(&args[0]);
                 if !self.vecs.contains(&el) {
                     self.vecs.push(el.clone());
                 }
-                let a: Vec<String> = args.iter().map(|x| self.expr(x)).collect();
-                if name == "vec_len" {
+                let (pre, a) = self.operands(&args.iter().collect::<Vec<_>>(), true);
+                seq(pre, if name == "vec_len" {
                     format!("{}.len", a[0])
                 } else {
                     format!("bst_{}_{}({})", name, box_helper(&el), a.join(", "))
-                }
+                })
             }
             ExprKind::Call(name, args) if name == "box" || name == "unbox" => {
                 let t = self.type_of(&args[0]);
@@ -1014,9 +1329,90 @@ impl<'a> Gen<'a> {
                 self.tmps += 1;
                 format!("({{ {c} *{p} = ({c} *)bst_box_alloc(sizeof({c})); *{p} = {}; {p}; }})", self.expr(&args[0]))
             }
+            // Computed in uint64_t, where C's unsigned arithmetic is modular
+            // (narrower operands would be promoted to a signed int).
+            ExprKind::Call(name, args) if crate::check::WRAP_BUILTINS.contains(&name.as_str()) => {
+                let op = match name.as_str() { "wrap_add" => "+", "wrap_sub" => "-", _ => "*" };
+                format!("(({})((uint64_t)({}) {} (uint64_t)({})))", cty(&self.int_ops[&e.pos]), self.expr(&args[0]), op, self.expr(&args[1]))
+            }
+            ExprKind::Call(name, args) if name == "lock_new" || name == "lock_end" => {
+                let (l, c) = (format!("lk_{}", self.tmps), format!("lv_{}", self.tmps));
+                self.tmps += 1;
+                if name == "lock_new" {
+                    let t = cty(&self.type_of(&args[0]));
+                    // Like a box: allocated first, then filled.
+                    format!("({{ uint64_t *{l} = (uint64_t *)bst_box_alloc(8 + sizeof({t})); *{l} = 0; *({t} *)({l} + 1) = {}; {l}; }})", self.expr(&args[0]))
+                } else {
+                    let Type::Lock(inner) = self.type_of(&args[0]) else { unreachable!("checked") };
+                    let t = cty(&inner);
+                    format!("({{ uint64_t *{l} = {}; {t} {c} = *({t} *)({l} + 1); bst_box_free({l}, 8 + sizeof({t})); {c}; }})", self.expr(&args[0]))
+                }
+            }
+            ExprKind::Call(name, args) if name == "locked" => {
+                let Type::Lock(inner) = self.type_of(&args[0]) else { unreachable!("checked") };
+                let ExprKind::Var(f) = &args[1].kind else { unreachable!("checked") };
+                let sig = self.sigs[f].clone();
+                let k = self.tmps;
+                self.tmps += 1;
+                // The arguments are evaluated before the lock is taken.
+                let mut pre = format!("uint64_t *lk_{k} = {};", self.expr(&args[0]));
+                let mut call = vec![format!("({} *)(lk_{k} + 1)", cty(&inner))];
+                for (j, (pt, a)) in sig.params[1..].iter().zip(&args[2..]).enumerate() {
+                    let ct = match pt {
+                        Type::MutRef(t) => format!("{} *", cty(t)),
+                        t => cty(t),
+                    };
+                    pre.push_str(&format!(" {ct} la_{k}_{j} = {};", self.expr(a)));
+                    call.push(format!("la_{k}_{j}"));
+                }
+                let call = format!("f_{}({})", cid(f), call.join(", "));
+                if sig.ret == Type::Unit {
+                    format!("({{ {pre} bst_lock_acquire(lk_{k}); {call}; bst_lock_release(lk_{k}); }})")
+                } else {
+                    format!("({{ {pre} bst_lock_acquire(lk_{k}); {} lr_{k} = {call}; bst_lock_release(lk_{k}); lr_{k}; }})", cty(&sig.ret))
+                }
+            }
+            ExprKind::Call(name, args) if name == "smp_run" => {
+                let ExprKind::Var(f) = &args[0].kind else { unreachable!("checked") };
+                let sig = self.sigs[f].clone();
+                let k = self.smps.len();
+                // Shared arguments go in a block every processor reads; each
+                // processor's own Cpu and Mmu are made where it runs.
+                let mut fields = String::new();
+                let mut inits = Vec::new();
+                let (mut here, mut there) = (Vec::new(), Vec::new());
+                for (j, (pt, a)) in sig.params.iter().zip(&args[1..]).enumerate() {
+                    match pt {
+                        Type::MutRef(t) => {
+                            here.push(self.expr(a));
+                            there.push(if **t == Type::Cpu { "&cpu" } else { "&mmu" }.to_string());
+                        }
+                        t => {
+                            fields.push_str(&format!(" {} a{};", cty(t), j));
+                            inits.push(format!(".a{} = {}", j, self.expr(a)));
+                            here.push(format!("sa_{k}.a{j}"));
+                            there.push(format!("a->a{j}"));
+                        }
+                    }
+                }
+                if fields.is_empty() {
+                    fields.push_str(" uint64_t unused;");
+                }
+                self.smps.push(format!(
+                    "struct bst_smp_{k} {{{fields} }};\nstatic void bst_smp_thunk_{k}(void *p) {{ struct bst_smp_{k} *a = p; bst_cpu cpu = 0; bst_mmu mmu = 0; (void)a; (void)cpu; (void)mmu; f_{}({}); }}\n",
+                    cid(f),
+                    there.join(", ")
+                ));
+                format!(
+                    "({{ struct bst_smp_{k} sa_{k} = {{ {} }}; bst_platform_smp_start(bst_smp_thunk_{k}, &sa_{k}); f_{}({}); bst_platform_smp_join(); }})",
+                    inits.join(", "),
+                    cid(f),
+                    here.join(", ")
+                )
+            }
             ExprKind::Call(name, args) => {
-                let a: Vec<String> = args.iter().map(|x| self.expr(x)).collect();
-                match name.as_str() {
+                let (pre, a) = self.operands(&args.iter().collect::<Vec<_>>(), true);
+                seq(pre, match name.as_str() {
                     "len" => format!("{}.len", a[0]),
                     "get" => format!("{}.data[{}]", a[0], a[1]),
                     "slen" => format!("{}.len", a[0]),
@@ -1025,9 +1421,67 @@ impl<'a> Gen<'a> {
                     "bget" => format!("((uint64_t){}.data[{}])", a[0], a[1]),
                     n if crate::check::is_builtin(n) => format!("bst_{}({})", name, a.join(", ")),
                     _ => format!("f_{}({})", cid(name), a.join(", ")),
-                }
+                })
             }
         }
+    }
+
+    /// Emits the operands of a call, binary operator or struct literal so
+    /// they run in the order the verifier assumes. C leaves that order
+    /// unspecified, so when any operand has a side effect, each one is
+    /// evaluated into a temporary first (the returned prefix). For a call
+    /// (`call`), the verifier reads scalars and computed values left to
+    /// right, then the linear places and `&mut` borrows (plain reads with no
+    /// effect), so those stay inline and are read after every temporary.
+    /// Without side effects the order cannot matter and nothing changes.
+    fn operands(&mut self, xs: &[&Expr], call: bool) -> (String, Vec<String>) {
+        let late = |cg: &Self, x: &Expr| {
+            call && match &x.kind {
+                ExprKind::MutBorrow(_) => true,
+                ExprKind::Var(_) | ExprKind::Field(..) => !matches!(cg.type_of(x).base(), Type::U64 | Type::Bool | Type::Str),
+                _ => false,
+            }
+        };
+        if !xs.iter().any(|x| has_effect(x)) {
+            return (String::new(), xs.iter().map(|x| self.expr(x)).collect());
+        }
+        let mut pre = String::new();
+        let mut vals = vec![String::new(); xs.len()];
+        for (i, x) in xs.iter().enumerate() {
+            if !late(self, x) {
+                let t = format!("o_{}", self.tmps);
+                self.tmps += 1;
+                pre.push_str(&format!("__auto_type {} = {}; ", t, self.expr(x)));
+                vals[i] = t;
+            }
+        }
+        for (i, x) in xs.iter().enumerate() {
+            if late(self, x) {
+                vals[i] = self.expr(x);
+            }
+        }
+        (pre, vals)
+    }
+}
+
+/// `e` after the statements in `pre`, as one C expression (a GNU statement
+/// expression when there are any).
+fn seq(pre: String, e: String) -> String {
+    if pre.is_empty() { e } else { format!("({{ {}{}; }})", pre, e) }
+}
+
+/// Whether evaluating `e` may have a side effect: any call other than the
+/// read-only accessors.
+fn has_effect(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Call(n, args) => {
+            !matches!(n.as_str(), "len" | "get" | "slen" | "sget" | "blen" | "bget" | "vec_len") || args.iter().any(has_effect)
+        }
+        ExprKind::StructLit(_, fs) => fs.iter().any(|(_, x)| has_effect(x)),
+        ExprKind::Variant(_, _, p) => p.as_deref().map_or(false, has_effect),
+        ExprKind::Is(x, ..) | ExprKind::Not(x) | ExprKind::Neg(x) | ExprKind::TypeApp(_, x) => has_effect(x),
+        ExprKind::Bin(_, a, b) => has_effect(a) || has_effect(b),
+        _ => false,
     }
 }
 
@@ -1045,6 +1499,11 @@ pub fn prelude_parts(target: Target) -> Vec<(&'static str, &'static str)> {
             ("pt_hook_hosted", "#define BST_PT_NEW_HOOK (void)level;\n"),
             ("pages", PRELUDE_PAGES),
             ("child", PRELUDE_CHILD),
+            ("ports", PRELUDE_PORTS),
+            ("ports_hosted", PRELUDE_PORTS_HOSTED),
+            ("mmio", PRELUDE_MMIO),
+            ("mmio_hosted", PRELUDE_MMIO_HOSTED),
+            ("dma", PRELUDE_DMA),
         ],
         Target::Kernel => vec![
             ("common", PRELUDE_COMMON),
@@ -1053,6 +1512,11 @@ pub fn prelude_parts(target: Target) -> Vec<(&'static str, &'static str)> {
             ("bytes", PRELUDE_BYTES),
             ("pages", PRELUDE_PAGES),
             ("kernel_cpu", PRELUDE_KERNEL_CPU),
+            ("ports", PRELUDE_PORTS),
+            ("ports_kernel", PRELUDE_PORTS_KERNEL),
+            ("mmio", PRELUDE_MMIO),
+            ("mmio_kernel", PRELUDE_MMIO_KERNEL),
+            ("dma", PRELUDE_DMA),
         ],
         Target::User => vec![("common", PRELUDE_COMMON), ("user", PRELUDE_USER), ("bytes_arena", PRELUDE_BYTES_ARENA), ("bytes", PRELUDE_BYTES)],
     }
@@ -1082,5 +1546,17 @@ pub fn trusted_base() -> String {
     for (name, avail) in crate::check::builtin_list() {
         out.push_str(&format!("builtin {} ({})\n", name, avail));
     }
+    for a in EXPORT_ASSUMPTIONS {
+        out.push_str(&format!("export assumes {}\n", a));
+    }
     out
 }
+
+/// What the proofs of an `export fn` assume about its C caller. Nothing
+/// checks these at run time; the header states them (HEADER_NOTES).
+const EXPORT_ASSUMPTIONS: [&str; 4] = [
+    "a `&Bytes` parameter's pointer is readable for its length, and nothing writes the bytes during the call",
+    "a `&mut Bytes` parameter's pointer is readable and writable for its length, overlaps no other buffer argument, and nothing else uses it during the call",
+    "a `&Bytes` or `&mut Bytes` parameter's length is at most 2^60 (follows from the first two: no x86-64 address space is that large)",
+    "every argument is a valid value of its C type (a `bool` is 0 or 1)",
+];
