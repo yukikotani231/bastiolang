@@ -84,7 +84,10 @@ struct Mono {
   eline: u64,
   ecol: u64,
   /// What is wrong, as bastioc0 says it (the sentence after the code).
-  emsg: Vec[u64]
+  emsg: Vec[u64],
+  /// Hash indexes over `tys` and `insts`.
+  tix: Ix,
+  iix: Ix
 }
 
 fn mono_new() -> Mono {
@@ -95,7 +98,7 @@ fn mono_new() -> Mono {
   return Mono {
     tys: tys, insts: insts, targs: vec_new[u64](), queue: vec_new[u64](),
     structs: vec_new[u64](), enums: vec_new[u64](), fns: vec_new[u64](), specs: vec_new[u64](), lets: vec_new[LetTy](),
-    failed: false, efile: 0, eline: 0, ecol: 0, emsg: vec_new[u64]()
+    failed: false, efile: 0, eline: 0, ecol: 0, emsg: vec_new[u64](), tix: ix_new(), iix: ix_new()
   };
 }
 
@@ -110,6 +113,8 @@ fn mono_free(m: Mono) {
   vec_free(m.specs);
   vec_free(m.lets);
   vec_free(m.emsg);
+  ix_free(m.tix);
+  ix_free(m.iix);
 }
 
 /// Records an error (E-TYPE) at node `loc`, unless one is recorded already.
@@ -271,6 +276,15 @@ fn list_len(p: &Parser, head: u64) -> u64 {
 
 /// The node in the list starting loc `head` with the name of node `name`, or 0.
 fn find_in(p: &Parser, head: u64, name: u64) -> u64 {
+  // The definition lists have name indexes (a list head is no other
+  // node's `next`, so `head` names the whole list).
+  if head != 0 {
+    let x = node_at(p.nodes, name);
+    if head == p.fns.head { return ix_node(p, p.ix_fns, x.s, x.e); }
+    if head == p.structs.head { return ix_node(p, p.ix_structs, x.s, x.e); }
+    if head == p.enums.head { return ix_node(p, p.ix_enums, x.s, x.e); }
+    if head == p.specs.head { return ix_node(p, p.ix_specs, x.s, x.e); }
+  }
   let mut k = head;
   while k != 0 {
     if same_name(p, k, name) {
@@ -312,17 +326,32 @@ fn is_generic(p: &Parser, def: u64) -> bool {
 
 /// The interned type (`kind`, `a`).
 fn intern(m: &mut Mono, p: &Parser, kind: u64, a: u64) -> u64 {
-  let mut k = 1;
-  while k < vec_len(m.tys) {
-    let t = vec_get(m.tys, k);
-    if t.kind == kind && (t.a == a || (kind == TY_UNKNOWN && same_name(p, t.a, a))) {
-      return k;
+  let h = ty_hash(p, kind, a);
+  let mut j = ix_first(m.tix, h);
+  while j != 0 {
+    let k = ix_val(m.tix, j);
+    if k < vec_len(m.tys) {
+      let t = vec_get(m.tys, k);
+      if t.kind == kind && (t.a == a || (kind == TY_UNKNOWN && same_name(p, t.a, a))) {
+        return k;
+      }
     }
-    k = k + 1;
+    j = ix_next(m.tix, h, j);
   }
   let n = vec_len(m.tys);
   vec_push(&mut m.tys, Ty { kind: kind, a: a });
+  ix_add(&mut m.tix, h, n);
   return n;
+}
+
+/// The hash `intern` files type (`kind`, `a`) under: an unknown type by
+/// the name of node `a`, since it matches any node of that name.
+fn ty_hash(p: &Parser, kind: u64, a: u64) -> u64 {
+  if kind == TY_UNKNOWN {
+    let n = node_at(p.nodes, a);
+    return hash_mix(text_hash(p.src, n.s, n.e), kind);
+  }
+  return hash_mix(hash_mix(14695981039346656037, kind), a);
 }
 
 fn builtin_kind(p: &Parser, name: u64) -> u64 {
@@ -358,15 +387,29 @@ fn builtin_kind(p: &Parser, name: u64) -> u64 {
 
 /// The instance of `def` whose arguments are `args`, or 0.
 fn find_inst(m: &Mono, def: u64, args: &Vec[u64]) -> u64 {
-  let mut k = 1;
-  while k < vec_len(m.insts) {
-    let x = vec_get(m.insts, k);
-    if x.def == def && x.n == vec_len(args) && same_args(m, x.args, args) {
-      return k;
+  let h = inst_hash(def, args);
+  let mut j = ix_first(m.iix, h);
+  while j != 0 {
+    let k = ix_val(m.iix, j);
+    if k < vec_len(m.insts) {
+      let x = vec_get(m.insts, k);
+      if x.def == def && x.n == vec_len(args) && same_args(m, x.args, args) {
+        return k;
+      }
     }
-    k = k + 1;
+    j = ix_next(m.iix, h, j);
   }
   return 0;
+}
+
+fn inst_hash(def: u64, args: &Vec[u64]) -> u64 {
+  let mut h = hash_mix(14695981039346656037, def);
+  let mut j = 0;
+  while j < vec_len(args) {
+    h = hash_mix(h, vec_get(args, j));
+    j = j + 1;
+  }
+  return h;
 }
 
 fn same_args(m: &Mono, start: u64, args: &Vec[u64]) -> bool {
@@ -393,6 +436,7 @@ fn new_inst(m: &mut Mono, def: u64, args: &Vec[u64]) -> u64 {
   }
   let k = vec_len(m.insts);
   vec_push(&mut m.insts, Inst { def: def, args: start, n: vec_len(args) });
+  ix_add(&mut m.iix, inst_hash(def, args), k);
   return k;
 }
 

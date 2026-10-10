@@ -55,6 +55,10 @@ struct Checker {
   ftys: Vec[u64],
   /// Places; index 0 is unused.
   paths: Vec[Path],
+  /// Hash indexes over `paths`, `calls` and the builtins in `bs`.
+  pix: Ix,
+  cix: Ix,
+  bix: Ix,
   /// The variables in scope, innermost last.
   vars: Vec[Var],
   moved: Vec[u64],
@@ -120,6 +124,9 @@ fn checker_free(c: Checker) {
   vec_free(c.fstart);
   vec_free(c.ftys);
   vec_free(c.paths);
+  ix_free(c.pix);
+  ix_free(c.cix);
+  ix_free(c.bix);
   vec_free(c.vars);
   vec_free(c.moved);
   vec_free(c.mlocs);
@@ -132,11 +139,13 @@ fn checker_free(c: Checker) {
 }
 
 fn bsig(c: &mut Checker, name: Str, avail: u64, np: u64, p0: u64, p1: u64, p2: u64, p3: u64, ret: u64) {
+  ix_add(&mut c.bix, str_hash(name), vec_len(c.bs));
   vec_push(&mut c.bs, Bsig { name: name, avail: avail, np: np, p0: p0, p1: p1, p2: p2, p3: p3, p4: 0, ret: ret });
 }
 
 /// A builtin with five parameters (the bulk copies).
 fn bsig5(c: &mut Checker, name: Str, avail: u64, p0: u64, p1: u64, p2: u64, p3: u64, p4: u64, ret: u64) {
+  ix_add(&mut c.bix, str_hash(name), vec_len(c.bs));
   vec_push(&mut c.bs, Bsig { name: name, avail: avail, np: 5, p0: p0, p1: p1, p2: p2, p3: p3, p4: p4, ret: ret });
 }
 
@@ -166,7 +175,7 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   vec_push(&mut paths, Path { up: 0, s: 0, e: 0 });
   let mut c = Checker {
     bs: vec_new[Bsig](), ghosts: vec_new[Ghost](), fstart: vec_new[u64](), ftys: vec_new[u64](),
-    paths: paths, vars: vec_new[Var](), moved: vec_new[u64](), mlocs: vec_new[u64](), bound: vec_new[u64](),
+    paths: paths, pix: ix_new(), cix: ix_new(), bix: ix_new(), vars: vec_new[Var](), moved: vec_new[u64](), mlocs: vec_new[u64](), bound: vec_new[u64](),
     target: target, ret: un, env: 0, spec_lim: 0, spec_pos: 0, tu64: u, tbool: b, tunit: un, tstr: st,
     failed: false, efile: 0, eline: 0, ecol: 0, ecode: 0, emsg: vec_new[u64](), enotes: vec_new[u64](), int_ops: vec_new[IntOp](),
     calls: vec_new[Edge](), lsites: vec_new[LockSite](), nparams: 0, inv: false, old_only: false
@@ -1038,15 +1047,21 @@ fn ghost_at(c: &Checker, k: u64) -> Ghost {
 
 /// The builtin named `s..e` in the table: its index + 1, or 0.
 fn bs_index(c: &Checker, p: &Parser, s: u64, e: u64) -> u64 {
-  let mut k = 0;
-  while k < vec_len(c.bs) {
-    let b = vec_get(c.bs, k);
-    if span_is(p, s, e, b.name) {
-      return k + 1;
+  // The first row of that name, as a scan of the table finds it.
+  let h = text_hash(p.src, s, e);
+  let mut best = 0;
+  let mut j = ix_first(c.bix, h);
+  while j != 0 {
+    let k = ix_val(c.bix, j);
+    if k < vec_len(c.bs) && (best == 0 || k < best - 1) {
+      let b = vec_get(c.bs, k);
+      if span_is(p, s, e, b.name) {
+        best = k + 1;
+      }
     }
-    k = k + 1;
+    j = ix_next(c.bix, h, j);
   }
-  return 0;
+  return best;
 }
 
 fn ghost_index(c: &Checker, p: &Parser, s: u64, e: u64) -> u64 {
@@ -1103,18 +1118,12 @@ fn is_spec_word(p: &Parser, s: u64, e: u64) -> bool {
 
 /// The first function named `s..e`, when it is not generic; otherwise 0.
 fn plain_fn(p: &Parser, s: u64, e: u64) -> u64 {
-  let mut k = p.fns.head;
-  while k != 0 {
-    let n = node_at(p.nodes, k);
-    if same(p.src, n.s, n.e, s, e) {
-      if n.v != 0 {
-        return 0;
-      }
-      return k;
-    }
-    k = n.next;
+  let k = ix_node(p, p.ix_fns, s, e);
+  let n = node_at(p.nodes, k);
+  if n.v != 0 {
+    return 0;
   }
-  return 0;
+  return k;
 }
 
 /// Is `s..e` the name of a function with a signature (a builtin in the
@@ -1137,7 +1146,7 @@ fn find_spec(c: &Checker, p: &Parser, s: u64, e: u64) -> u64 {
 }
 
 fn any_spec(p: &Parser, s: u64, e: u64) -> bool {
-  return index_in(p, p.specs.head, s, e) != 0;
+  return ix_node(p, p.ix_specs, s, e) != 0;
 }
 
 fn var_at(c: &Checker, j: u64) -> Var {
@@ -1190,16 +1199,21 @@ fn path_at(c: &Checker, k: u64) -> Path {
 
 /// The place `up.s..e` (the variable `s..e` when `up` is 0).
 fn ck_path(c: &mut Checker, p: &Parser, up: u64, s: u64, e: u64) -> u64 {
-  let mut k = 1;
-  while k < vec_len(c.paths) {
-    let x = vec_get(c.paths, k);
-    if x.up == up && same(p.src, x.s, x.e, s, e) {
-      return k;
+  let h = hash_mix(text_hash(p.src, s, e), up);
+  let mut j = ix_first(c.pix, h);
+  while j != 0 {
+    let k = ix_val(c.pix, j);
+    if k < vec_len(c.paths) {
+      let x = vec_get(c.paths, k);
+      if x.up == up && same(p.src, x.s, x.e, s, e) {
+        return k;
+      }
     }
-    k = k + 1;
+    j = ix_next(c.pix, h, j);
   }
   let n = vec_len(c.paths);
   vec_push(&mut c.paths, Path { up: up, s: s, e: e });
+  ix_add(&mut c.pix, h, n);
   return n;
 }
 
@@ -2251,14 +2265,19 @@ fn check_program(c: &mut Checker, m: &mut Mono, p: &Parser) {
 
 /// Records that the instance being checked calls instance `x`.
 fn note_call(c: &mut Checker, x: u64) {
-  let mut j = 0;
-  while j < vec_len(c.calls) {
-    let e = vec_get(c.calls, j);
-    if e.from == c.env && e.to == x {
-      return;
+  let h = hash_mix(hash_mix(14695981039346656037, c.env), x);
+  let mut j = ix_first(c.cix, h);
+  while j != 0 {
+    let k = ix_val(c.cix, j);
+    if k < vec_len(c.calls) {
+      let e = vec_get(c.calls, k);
+      if e.from == c.env && e.to == x {
+        return;
+      }
     }
-    j = j + 1;
+    j = ix_next(c.cix, h, j);
   }
+  ix_add(&mut c.cix, h, vec_len(c.calls));
   vec_push(&mut c.calls, Edge { from: c.env, to: x });
 }
 
