@@ -16,11 +16,11 @@
 //   --trusted-base  list and count the hand-written trusted base, then exit
 // Several input files form one program, as for bastioc0.
 //
-// Errors are reported as bastioc0 reports them: `file:line:col:
-// error[CODE]`, the source line with a caret under the position, and the
-// notes of a failed proof (its counterexample), on standard error. Not
-// yet: the sentence that says what is wrong (bastioc0's message after the
-// code).
+// Errors are reported on standard error as bastioc0 reports them:
+// `file:line:col: error[CODE]: what is wrong`, the source line with a caret
+// under the position, then hints or a failed proof's counterexample. Not
+// yet: the sentence of a failed proof (its code, position and
+// counterexample are printed).
 import "loader.bastio";
 import "solve.bastio";
 import "header.bastio";
@@ -54,7 +54,7 @@ fn loaded_at(ld: &Loader, k: u64) -> Loaded {
 
 /// The error at `file:line:col` with code `code`, as bastioc0 renders it
 /// (diag.rs), followed by the notes in `notes`.
-fn b1_render(out: &mut Vec[u64], p: &Parser, ld: &Loader, file: u64, line: u64, col: u64, code: Str, notes: &Vec[u64]) {
+fn b1_render(out: &mut Vec[u64], p: &Parser, ld: &Loader, file: u64, line: u64, col: u64, code: Str, msg: &Vec[u64], notes: &Vec[u64]) {
   let f = loaded_at(ld, file);
   let mut k = f.raw;
   let rend = cg_add(f.raw, f.rawlen);
@@ -68,7 +68,16 @@ fn b1_render(out: &mut Vec[u64], p: &Parser, ld: &Loader, file: u64, line: u64, 
   out_num(&mut out, col);
   out_str(&mut out, ": error[");
   out_str(&mut out, code);
-  out_str(&mut out, "]\n");
+  out_str(&mut out, "]");
+  if vec_len(msg) > 0 {
+    out_str(&mut out, ": ");
+    k = 0;
+    while k < vec_len(msg) {
+      vec_push(&mut out, u_at(msg, k));
+      k = k + 1;
+    }
+  }
+  out_str(&mut out, "\n");
   // The source line: the file's text runs to where the next file's starts.
   let mut end = blen(p.src);
   let nf = cg_add(file, 1);
@@ -295,9 +304,9 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
       status = 2;
     } else if r != 0 {
       if p.ecode == CODE_IMPORT {
-        b1_render(&mut out, p, ld, p.efile, p.eline, p.ecol, "E-IMPORT", none);
+        b1_render(&mut out, p, ld, p.efile, p.eline, p.ecol, "E-IMPORT", p.emsg, none);
       } else {
-        b1_render(&mut out, p, ld, p.efile, p.eline, p.ecol, "E-PARSE", none);
+        b1_render(&mut out, p, ld, p.efile, p.eline, p.ecol, "E-PARSE", p.emsg, none);
       }
       status = 1;
     }
@@ -308,13 +317,13 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
     let mut m = mono_new();
     monomorphize(&mut m, p);
     if m.failed {
-      b1_render(&mut out, p, ld, m.efile, m.eline, m.ecol, "E-TYPE", none);
+      b1_render(&mut out, p, ld, m.efile, m.eline, m.ecol, "E-TYPE", m.emsg, none);
       status = 1;
     } else {
       let mut c = checker_new(&mut m, p, target);
       check_program(&mut c, &mut m, p);
       if c.failed {
-        b1_render(&mut out, p, ld, c.efile, c.eline, c.ecol, b1_code(c.ecode), none);
+        b1_render(&mut out, p, ld, c.efile, c.eline, c.ecol, b1_code(c.ecode), c.emsg, c.enotes);
         status = 1;
       } else {
         let mut v = vr_new(&mut m, p);
@@ -326,7 +335,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
           if v.fail_code != 0 {
             code = vc_name(v.fail_code);
           }
-          b1_render(&mut out, p, ld, n.file, n.line, n.col, code, rep);
+          b1_render(&mut out, p, ld, n.file, n.line, n.col, code, none, rep);
           status = 1;
         } else {
           out_str(&mut out, "bastioc1: ");
