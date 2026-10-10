@@ -63,23 +63,24 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("print", Avail::All, vec![U64], Unit),
         ("balloc", Avail::All, vec![U64], Bytes),
         ("blen", Avail::All, vec![r(Bytes)], U64),
-        ("bget", Avail::All, vec![r(Bytes), U64], U64),
-        ("bset", Avail::All, vec![m(Bytes), U64, U64], Unit),
+        ("bget", Avail::All, vec![r(Bytes), U64], U8),
+        ("bset", Avail::All, vec![m(Bytes), U64, U8], Unit),
         ("bfree", Avail::All, vec![Bytes], Unit),
         ("bfrom", Avail::All, vec![Str], Bytes),
         ("host_argc", Avail::Hosted, vec![r(Host)], U64),
         ("host_arg", Avail::Hosted, vec![r(Host), U64], Bytes),
         ("host_read", Avail::Hosted, vec![r(Host), r(Bytes), m(Bytes)], Bool),
         ("host_write", Avail::Hosted, vec![r(Host), r(Bytes), r(Bytes)], Bool),
+        ("host_eprint", Avail::Hosted, vec![r(Host), r(Bytes)], Unit),
         ("host_spawn", Avail::Hosted, vec![r(Host), r(Vec(std::boxed::Box::new(Bytes)))], Child),
         ("child_write", Avail::Hosted, vec![m(Child), r(Bytes)], Bool),
         ("child_close", Avail::Hosted, vec![m(Child)], Unit),
         ("child_read_line", Avail::Hosted, vec![m(Child), m(Bytes)], Bool),
         ("child_wait", Avail::Hosted, vec![Child], U64),
         ("slen", Avail::All, vec![Str], U64),
-        ("sget", Avail::All, vec![Str, U64], U64),
-        ("serial_write", Avail::All, vec![r(Serial), U64], Unit),
-        ("serial_read", Avail::All, vec![r(Serial)], U64),
+        ("sget", Avail::All, vec![Str, U64], U8),
+        ("serial_write", Avail::All, vec![r(Serial), U8], Unit),
+        ("serial_read", Avail::All, vec![r(Serial)], U8),
         ("serial_poll", Avail::Kernel, vec![r(Serial)], U64),
         ("pool_size", Avail::Mem, vec![r(Pool)], U64),
         ("pool_take", Avail::Mem, vec![m(Pool), U64], Frame),
@@ -87,8 +88,8 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("frame_id", Avail::Mem, vec![r(Frame)], U64),
         ("frame_read", Avail::Mem, vec![r(Frame), U64], U64),
         ("frame_write", Avail::Mem, vec![m(Frame), U64, U64], Unit),
-        ("frame_read8", Avail::Mem, vec![r(Frame), U64], U64),
-        ("frame_write8", Avail::Mem, vec![m(Frame), U64, U64], Unit),
+        ("frame_read8", Avail::Mem, vec![r(Frame), U64], U8),
+        ("frame_write8", Avail::Mem, vec![m(Frame), U64, U8], Unit),
         ("pt_new", Avail::Mem, vec![Frame, U64], PageTable),
         ("pt_free", Avail::Mem, vec![PageTable], Frame),
         ("pt_free_root", Avail::Kernel, vec![r(Mmu), PageTable], Frame),
@@ -110,35 +111,35 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("port_release", Avail::Mem, vec![m(Ports), PortIo], Unit),
         ("port_base", Avail::Mem, vec![r(PortIo)], U64),
         ("port_count", Avail::Mem, vec![r(PortIo)], U64),
-        ("pio_in8", Avail::Mem, vec![m(PortIo), U64], U64),
-        ("pio_in16", Avail::Mem, vec![m(PortIo), U64], U64),
-        ("pio_in32", Avail::Mem, vec![m(PortIo), U64], U64),
-        ("pio_out8", Avail::Mem, vec![m(PortIo), U64, U64], Unit),
-        ("pio_out16", Avail::Mem, vec![m(PortIo), U64, U64], Unit),
-        ("pio_out32", Avail::Mem, vec![m(PortIo), U64, U64], Unit),
+        ("pio_in8", Avail::Mem, vec![m(PortIo), U64], U8),
+        ("pio_in16", Avail::Mem, vec![m(PortIo), U64], U16),
+        ("pio_in32", Avail::Mem, vec![m(PortIo), U64], U32),
+        ("pio_out8", Avail::Mem, vec![m(PortIo), U64, U8], Unit),
+        ("pio_out16", Avail::Mem, vec![m(PortIo), U64, U16], Unit),
+        ("pio_out32", Avail::Mem, vec![m(PortIo), U64, U32], Unit),
         ("mmio_claim", Avail::Mem, vec![m(MmioSpace), U64, U64], Mmio),
         ("mmio_release", Avail::Mem, vec![m(MmioSpace), Mmio], Unit),
         ("mmio_base", Avail::Mem, vec![r(Mmio)], U64),
         ("mmio_len", Avail::Mem, vec![r(Mmio)], U64),
-        ("mmio_read8", Avail::Mem, vec![m(Mmio), U64], U64),
-        ("mmio_read16", Avail::Mem, vec![m(Mmio), U64], U64),
-        ("mmio_read32", Avail::Mem, vec![m(Mmio), U64], U64),
+        ("mmio_read8", Avail::Mem, vec![m(Mmio), U64], U8),
+        ("mmio_read16", Avail::Mem, vec![m(Mmio), U64], U16),
+        ("mmio_read32", Avail::Mem, vec![m(Mmio), U64], U32),
         ("mmio_read64", Avail::Mem, vec![m(Mmio), U64], U64),
-        ("mmio_write8", Avail::Mem, vec![m(Mmio), U64, U64], Unit),
-        ("mmio_write16", Avail::Mem, vec![m(Mmio), U64, U64], Unit),
-        ("mmio_write32", Avail::Mem, vec![m(Mmio), U64, U64], Unit),
+        ("mmio_write8", Avail::Mem, vec![m(Mmio), U64, U8], Unit),
+        ("mmio_write16", Avail::Mem, vec![m(Mmio), U64, U16], Unit),
+        ("mmio_write32", Avail::Mem, vec![m(Mmio), U64, U32], Unit),
         ("mmio_write64", Avail::Mem, vec![m(Mmio), U64, U64], Unit),
         ("dma_lend", Avail::Mem, vec![Frame], Dma),
         ("dma_take", Avail::Mem, vec![Dma], Frame),
         ("dma_id", Avail::Mem, vec![r(Dma)], U64),
         ("dma_addr", Avail::Mem, vec![r(Dma)], U64),
-        ("dma_read8", Avail::Mem, vec![m(Dma), U64], U64),
-        ("dma_read16", Avail::Mem, vec![m(Dma), U64], U64),
-        ("dma_read32", Avail::Mem, vec![m(Dma), U64], U64),
+        ("dma_read8", Avail::Mem, vec![m(Dma), U64], U8),
+        ("dma_read16", Avail::Mem, vec![m(Dma), U64], U16),
+        ("dma_read32", Avail::Mem, vec![m(Dma), U64], U32),
         ("dma_read64", Avail::Mem, vec![m(Dma), U64], U64),
-        ("dma_write8", Avail::Mem, vec![m(Dma), U64, U64], Unit),
-        ("dma_write16", Avail::Mem, vec![m(Dma), U64, U64], Unit),
-        ("dma_write32", Avail::Mem, vec![m(Dma), U64, U64], Unit),
+        ("dma_write8", Avail::Mem, vec![m(Dma), U64, U8], Unit),
+        ("dma_write16", Avail::Mem, vec![m(Dma), U64, U16], Unit),
+        ("dma_write32", Avail::Mem, vec![m(Dma), U64, U32], Unit),
         ("dma_write64", Avail::Mem, vec![m(Dma), U64, U64], Unit),
         ("sys_spawn", Avail::User, vec![r(Buf), U64, U64], U64),
         ("sys_wait", Avail::User, vec![U64], U64),
@@ -212,6 +213,7 @@ fn spec_norm(t: Type) -> Type {
 pub fn builtin_list() -> Vec<(String, &'static str)> {
     let mut v: Vec<(String, &'static str)> = vec![("box".into(), "all"), ("unbox".into(), "all")];
     v.extend(LOCK_BUILTINS.iter().map(|n| (n.to_string(), "all")));
+    v.extend(ATOMIC_BUILTINS.iter().map(|n| (n.to_string(), "all")));
     v.push(("smp_run".into(), "kernel"));
     v.extend(VEC_BUILTINS.iter().map(|n| (n.to_string(), "all")));
     for (n, a, _, _) in builtin_table() {
@@ -230,8 +232,23 @@ pub fn builtin_list() -> Vec<(String, &'static str)> {
 /// Builtins over `Lock[T]`: generic, so checked by hand like `box`.
 pub const LOCK_BUILTINS: &[&str] = &["lock_new", "lock_end", "locked"];
 
+/// Builtins over `Atomic[T]`: generic too.
+pub const ATOMIC_BUILTINS: &[&str] = &["atomic_new", "atomic_end", "atomic_load", "atomic_store", "atomic_swap", "atomic_cas", "atomic_wrap_add"];
+
+/// Can an `Atomic` hold a `T`? One machine word that C's `__atomic`
+/// builtins handle without a lock: an integer, a bool, or a struct with a
+/// single such field (which is how an atomic value gets an invariant).
+pub fn atomic_word(t: &Type) -> bool {
+    match t {
+        Type::Bool => true,
+        t if t.is_int() => true,
+        Type::Struct(n) => struct_def(n).map_or(false, |d| d.fields.len() == 1 && (d.fields[0].1 == Type::Bool || d.fields[0].1.is_int())),
+        _ => false,
+    }
+}
+
 pub fn is_builtin(name: &str) -> bool {
-    name == "box" || name == "unbox" || name == "cast" || name == "wrap" || name == "smp_run" || LOCK_BUILTINS.contains(&name) || VEC_BUILTINS.contains(&name) || WRAP_BUILTINS.contains(&name) || builtin_table().iter().any(|b| b.0 == name)
+    name == "box" || name == "unbox" || name == "cast" || name == "wrap" || name == "smp_run" || LOCK_BUILTINS.contains(&name) || ATOMIC_BUILTINS.contains(&name) || VEC_BUILTINS.contains(&name) || WRAP_BUILTINS.contains(&name) || builtin_table().iter().any(|b| b.0 == name)
 }
 
 fn available(name: &str, target: Target) -> bool {
@@ -258,7 +275,7 @@ fn main_caps(target: Target) -> &'static [Type] {
 /// Struct and enum definitions: unique names, known field and payload
 /// types, no type that contains itself.
 pub fn check_structs(p: &Program) -> Result<(), Diag> {
-    const RESERVED: &[&str] = &["u64", "u8", "u16", "u32", "i8", "i16", "i32", "i64", "bool", "Str", "Buf", "Bytes", "Host", "Child", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu", "Ports", "PortIo", "MmioSpace", "Mmio", "Dma", "Lock"];
+    const RESERVED: &[&str] = &["u64", "u8", "u16", "u32", "i8", "i16", "i32", "i64", "bool", "Str", "Buf", "Bytes", "Host", "Child", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu", "Ports", "PortIo", "MmioSpace", "Mmio", "Dma", "Lock", "Atomic"];
     // (name, position, the types it holds directly)
     let mut defs: Vec<(String, Pos, Vec<Type>)> = Vec::new();
     for d in &p.structs {
@@ -273,7 +290,7 @@ pub fn check_structs(p: &Program) -> Result<(), Diag> {
         }
         for t in held {
             let mut t = t;
-            while let Type::Box(i) | Type::Vec(i) | Type::Lock(i) = t {
+            while let Type::Box(i) | Type::Vec(i) | Type::Lock(i) | Type::Atomic(i) = t {
                 t = i;
             }
             if let Type::Struct(n) | Type::Enum(n) = t {
@@ -321,7 +338,7 @@ fn known_type(t: &Type, pos: Pos) -> Result<(), Diag> {
     match t {
         Type::Struct(n) if struct_def(n).is_none() => Err(Diag::new("E-TYPE", pos, format!("unknown type `{}`", n))),
         Type::Enum(n) if enum_def(n).is_none() => Err(Diag::new("E-TYPE", pos, format!("unknown type `{}`", n))),
-        Type::Box(i) | Type::Vec(i) | Type::Lock(i) => known_type(i, pos),
+        Type::Box(i) | Type::Vec(i) | Type::Lock(i) | Type::Atomic(i) => known_type(i, pos),
         // Any value can be borrowed; a borrowed plain value reads as a copy.
         // (Generic code borrows `&T` whatever `T` turns out to be.)
         Type::Ref(i) | Type::MutRef(i) => known_type(i, pos),
@@ -459,6 +476,12 @@ struct Ctx<'a> {
     moved: HashSet<String>,
     /// See `FnDef::int_ops`.
     int_ops: HashMap<Pos, Type>,
+    /// The user functions this one calls (`locked` and `smp_run` call the
+    /// function they name), for `lock_order`.
+    calls: Vec<String>,
+    /// Each `locked` call: its position, the lock's class (the type of its
+    /// contents) and the function run with the lock held.
+    lock_sites: Vec<(Pos, String, String)>,
 }
 
 pub fn check_program(p: &mut Program, target: Target) -> Result<HashMap<String, Sig>, Diag> {
@@ -470,14 +493,97 @@ pub fn check_program(p: &mut Program, target: Target) -> Result<HashMap<String, 
     for d in &p.structs {
         check_struct_invariants(d, &sigs, &specs, target)?;
     }
+    let mut graph = Vec::new();
     for f in &mut p.fns {
-        check_fn(f, &sigs, &specs, target).map_err(|d| in_copy(d, &f.name))?;
+        let (calls, sites) = check_fn(f, &sigs, &specs, target).map_err(|d| in_copy(d, &f.name))?;
+        graph.push((f.name.clone(), calls, sites));
     }
+    lock_order(&graph)?;
     Ok(sigs)
 }
 
+/// Rules out deadlock through locks, without annotations. A lock's class is
+/// the type of its contents. While `locked(l, f)` holds a lock of class C,
+/// `f` and everything it calls may take only locks of other classes, and the
+/// classes must form no cycle (C taken before D somewhere and D before C
+/// elsewhere). Then every processor takes locks in one global order of
+/// classes, and no two can wait for each other.
+fn lock_order(graph: &[(String, Vec<String>, Vec<(Pos, String, String)>)]) -> Result<(), Diag> {
+    // The classes each function may take, itself or through its callees.
+    let mut takes: HashMap<&str, Vec<String>> = HashMap::new();
+    for (f, _, sites) in graph {
+        let mut v: Vec<String> = Vec::new();
+        for (_, c, _) in sites {
+            if !v.contains(c) {
+                v.push(c.clone());
+            }
+        }
+        takes.insert(f, v);
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (f, calls, _) in graph {
+            for g in calls {
+                let add: Vec<String> = takes.get(g.as_str()).map_or(Vec::new(), |v| v.clone());
+                let mine = takes.get_mut(f.as_str()).unwrap();
+                for c in add {
+                    if !mine.contains(&c) {
+                        mine.push(c);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    // Class C before class D whenever a lock of class D can be taken while
+    // one of class C is held.
+    let under = |f: &str| takes.get(f).cloned().unwrap_or_default();
+    let mut edges: Vec<(String, String)> = Vec::new();
+    for (_, _, sites) in graph {
+        for (_, c, f) in sites {
+            for d in under(f) {
+                if !edges.contains(&(c.clone(), d.clone())) {
+                    edges.push((c.clone(), d));
+                }
+            }
+        }
+    }
+    let reaches = |from: &str, to: &str| {
+        let mut seen: Vec<&str> = vec![from];
+        let mut i = 0;
+        while i < seen.len() {
+            if seen[i] == to {
+                return true;
+            }
+            for (a, b) in &edges {
+                if a == seen[i] && !seen.contains(&b.as_str()) {
+                    seen.push(b);
+                }
+            }
+            i += 1;
+        }
+        false
+    };
+    for (name, _, sites) in graph {
+        for (pos, c, f) in sites {
+            for d in under(f) {
+                if d == *c {
+                    return Err(in_copy(Diag::new("E-LOCK-ORDER", *pos, format!("`{}` may take a lock of class {} while this one, also of class {}, is held", f, c, c))
+                        .note("a processor spins forever on a lock it already holds; two locks with the same contents type cannot be nested. Give them different contents types to order them"), name));
+                }
+                if reaches(&d, c) {
+                    return Err(in_copy(Diag::new("E-LOCK-ORDER", *pos, format!("`{}` may take a lock of class {} while this lock of class {} is held, but elsewhere {} is held while {} is taken", f, d, c, d, c))
+                        .note("two processors taking them in opposite orders can wait for each other forever; take locks of these classes in one order everywhere"), name));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn new_ctx<'a>(sigs: &'a HashMap<String, Sig>, specs: &'a [SpecFn], target: Target, ret: Type) -> Ctx<'a> {
-    Ctx { sigs, specs, target, ret, scopes: vec![Vec::new()], vars: HashMap::new(), moved: HashSet::new(), int_ops: HashMap::new() }
+    Ctx { sigs, specs, target, ret, scopes: vec![Vec::new()], vars: HashMap::new(), moved: HashSet::new(), int_ops: HashMap::new(), calls: Vec::new(), lock_sites: Vec::new() }
 }
 
 /// A spec fn may only call spec fns defined before it, so expansion terminates.
@@ -516,7 +622,8 @@ fn check_struct_invariants(d: &StructDef, sigs: &HashMap<String, Sig>, specs: &[
     Ok(())
 }
 
-fn check_fn(f: &mut FnDef, sigs: &HashMap<String, Sig>, specs: &[SpecFn], target: Target) -> Result<(), Diag> {
+/// Returns the functions `f` calls and its `locked` calls, for `lock_order`.
+fn check_fn(f: &mut FnDef, sigs: &HashMap<String, Sig>, specs: &[SpecFn], target: Target) -> Result<(Vec<String>, Vec<(Pos, String, String)>), Diag> {
     let mut cx = new_ctx(sigs, specs, target, f.ret.clone());
     for p in &f.params {
         if p.ty.is_ref() && p.mutable {
@@ -541,7 +648,7 @@ fn check_fn(f: &mut FnDef, sigs: &HashMap<String, Sig>, specs: &[SpecFn], target
         cx.leak_check_all(f.pos, "at the end of the function")?;
     }
     f.int_ops = cx.int_ops;
-    Ok(())
+    Ok((cx.calls, cx.lock_sites))
 }
 
 /// Checks that the literal `v` fits in the integer type `t`.
@@ -1232,6 +1339,9 @@ impl<'a> Ctx<'a> {
                 if name == "locked" {
                     return self.locked(args, e.pos);
                 }
+                if ATOMIC_BUILTINS.contains(&name.as_str()) {
+                    return self.atomic(name, args, e.pos);
+                }
                 if name == "smp_run" {
                     return self.smp_run(args, e.pos);
                 }
@@ -1268,11 +1378,66 @@ impl<'a> Ctx<'a> {
         if sig.params.first() != Some(&m((*inner).clone())) {
             return Err(Diag::new("E-TYPE", args[1].pos, format!("`{}` must take `&mut {}` first, to receive the contents of the lock", f, inner.name())));
         }
+        self.lock_sites.push((pos, inner.name(), f.clone()));
         let mut params = vec![r(Type::Lock(inner))];
         params.extend(sig.params[1..].iter().cloned());
         let mut rest = vec![args[0].clone()];
         rest.extend(args[2..].iter().cloned());
         self.call_with(&f, Sig { params, ret: sig.ret }, &rest, pos)
+    }
+
+    /// The `Atomic` builtins. `atomic_new` and `atomic_end` move the value in
+    /// and out; the others take the atomic as a shared borrow, so any
+    /// number of processors can use it at once.
+    fn atomic(&mut self, name: &str, args: &[Expr], pos: Pos) -> Result<Type, Diag> {
+        let word = |t: &Type, at: Pos| -> Result<(), Diag> {
+            if atomic_word(t) {
+                return Ok(());
+            }
+            Err(Diag::new("E-TYPE", at, format!("an Atomic cannot hold a {}", t.name()))
+                .note("an Atomic holds one word: an integer, a bool, or a struct with a single field of one of those"))
+        };
+        if name == "atomic_new" || name == "atomic_end" {
+            if args.len() != 1 {
+                return Err(Diag::new("E-TYPE", pos, format!("`{}` takes 1 argument(s), {} given", name, args.len())));
+            }
+            let t = self.expr(&args[0])?;
+            if name == "atomic_new" {
+                word(&t, args[0].pos)?;
+                if t.is_int() {
+                    // The verifier's view of the value, which reads every
+                    // integer as a u64, does not say which type it has.
+                    self.int_ops.insert(pos, t.clone());
+                }
+                return Ok(Type::Atomic(Box::new(t)));
+            }
+            return match t {
+                Type::Atomic(i) => Ok(*i),
+                t => Err(Diag::new("E-TYPE", args[0].pos, format!("`atomic_end` needs an Atomic, found {}", t.name()))),
+            };
+        }
+        let at = match args.first().and_then(place) {
+            Some(p) => self.path_type(&p, args[0].pos)?.0,
+            None => return Err(Diag::new("E-TYPE", args.first().map_or(pos, |a| a.pos), format!("the first argument of `{}` must name an atomic", name))),
+        };
+        let Type::Atomic(t) = at.clone() else {
+            return Err(Diag::new("E-TYPE", args[0].pos, format!("`{}` needs an Atomic, found {}", name, at.name())));
+        };
+        word(&t, args[0].pos)?;
+        let t = *t;
+        let (params, ret) = match name {
+            "atomic_load" => (vec![r(at)], t),
+            "atomic_store" => (vec![r(at), t], Type::Unit),
+            "atomic_swap" => (vec![r(at), t.clone()], t),
+            "atomic_cas" => (vec![r(at), t.clone(), t], Type::Bool),
+            _ => {
+                if !t.is_int() {
+                    return Err(Diag::new("E-TYPE", args[0].pos, format!("`atomic_wrap_add` needs an Atomic of an integer type, found {}", at.name())));
+                }
+                (vec![r(at), t.clone()], t)
+            }
+        };
+        self.call_with(name, Sig { params, ret }, args, pos)
     }
 
     /// `smp_run(f, args..)`: runs `f` on every processor at once and returns
@@ -1337,6 +1502,9 @@ impl<'a> Ctx<'a> {
 
     /// Checks a call's arguments against `sig`: scalars, then borrows, then moves.
     fn call_with(&mut self, name: &str, sig: Sig, args: &[Expr], pos: Pos) -> Result<Type, Diag> {
+        if !is_builtin(name) && !self.calls.iter().any(|c| c == name) {
+            self.calls.push(name.to_string());
+        }
         if sig.params.len() != args.len() {
             return Err(Diag::new("E-TYPE", pos, format!("`{}` takes {} argument(s), {} given", name, sig.params.len(), args.len())));
         }

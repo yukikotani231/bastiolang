@@ -33,7 +33,7 @@ fn z3_send(z: &mut Child, out: &mut Vec[u64]) -> bool {
   while k < n && k < blen(b) {
     let ch = u_at(out, k);
     if ch <= 255 {
-      bset(&mut b, k, ch);
+      bset(&mut b, k, cast[u8](ch));
     }
     k = k + 1;
   }
@@ -66,7 +66,7 @@ fn z3_read(z: &mut Child, resp: &mut Vec[u64]) -> bool {
         let ch = bget(line, k);
         if ch == 40 && open < U64_MAX { open = open + 1; }
         if ch == 41 && close < U64_MAX { close = close + 1; }
-        vec_push(&mut resp, ch);
+        vec_push(&mut resp, cast[u64](ch));
         k = k + 1;
       }
       vec_push(&mut resp, 10);
@@ -103,7 +103,7 @@ fn is_text(t: &Vec[u64], r: Rng, w: Str) -> bool {
   while k < slen(w)
     invariant k <= slen(w)
   {
-    if u_at(t, vadd(r.s, k)) != sget(w, k) {
+    if u_at(t, vadd(r.s, k)) != cast[u64](sget(w, k)) {
       return false;
     }
     k = k + 1;
@@ -238,7 +238,7 @@ fn name_less(v: &Vr, p: &Parser, a: Bind, b: Bind) -> bool {
 
 fn src_at(p: &Parser, i: u64) -> u64 {
   if i < blen(p.src) {
-    return bget(p.src, i);
+    return cast[u64](bget(p.src, i));
   }
   return 0;
 }
@@ -395,9 +395,9 @@ fn lab_at(xs: &Vec[Lab], k: u64) -> Lab {
   return Lab { s: 0, n: 0, tm: 0 };
 }
 
-/// `error F:L:C ` for node `loc`.
-fn out_error(out: &mut Vec[u64], p: &Parser, loc: u64) {
-  let n = node_at(p.nodes, loc);
+/// `error F:L:C CODE` for the failed obligation, as the dumps print it.
+fn out_error(out: &mut Vec[u64], v: &Vr, p: &Parser) {
+  let n = node_at(p.nodes, v.fail_at);
   out_str(&mut out, "error ");
   out_num(&mut out, n.file);
   out_str(&mut out, ":");
@@ -405,10 +405,17 @@ fn out_error(out: &mut Vec[u64], p: &Parser, loc: u64) {
   out_str(&mut out, ":");
   out_num(&mut out, n.col);
   out_str(&mut out, " ");
+  if v.fail_code == 0 {
+    out_str(&mut out, "E-SOLVER");
+  } else {
+    out_str(&mut out, vc_name(v.fail_code));
+  }
+  out_str(&mut out, "\n");
 }
 
 /// Runs the solver over the recorded log. True if every obligation holds;
-/// otherwise `rep` gets the report of the first that fails.
+/// otherwise the first that fails is recorded (`fail_at`, `fail_code`) and
+/// `rep` gets its notes, one `  = ..` line each.
 fn solve(v: &mut Vr, m: &Mono, p: &Parser, h: &Host, rep: &mut Vec[u64]) -> bool {
   let mut argv = vec_new[Bytes]();
   push_arg(&mut argv, "z3");
@@ -427,9 +434,9 @@ fn solve(v: &mut Vr, m: &Mono, p: &Parser, h: &Host, rep: &mut Vec[u64]) -> bool
     out_cmd(&mut out, v, cmd);
     if cmd.kind == CMD_FAIL {
       let o = obl_at(v, ob);
-      out_error(&mut rep, p, o.at);
-      out_str(&mut rep, vc_name(o.code));
-      out_str(&mut rep, "\n  = a buffer lent by C may only be written in place (`bset`, or lent to functions that do only that)\n");
+      v.fail_at = o.at;
+      v.fail_code = o.code;
+      out_str(&mut rep, "  = a buffer lent by C may only be written in place (`bset`, or lent to functions that do only that)\n");
       ok = false;
       ob = vadd(ob, 1);
     } else if cmd.kind == CMD_CHECK {
@@ -438,13 +445,12 @@ fn solve(v: &mut Vr, m: &Mono, p: &Parser, h: &Host, rep: &mut Vec[u64]) -> bool
       let alive = z3_read(&mut z, &mut resp);
       let r = trim(resp);
       if !alive || starts_text(resp, r, "(error") {
-        out_error(&mut rep, p, o.at);
-        out_str(&mut rep, "E-SOLVER\n");
+        v.fail_at = o.at;
+        v.fail_code = 0;
         ok = false;
       } else if !is_text(resp, r, "unsat") {
-        out_error(&mut rep, p, o.at);
-        out_str(&mut rep, vc_name(o.code));
-        out_str(&mut rep, "\n");
+        v.fail_at = o.at;
+        v.fail_code = o.code;
         if is_text(resp, r, "sat") {
           report_cex(&mut v, m, p, &mut z, o, &mut rep);
         } else {

@@ -93,8 +93,8 @@ bastioc0 [--check] [--emit-c] [--backend c|native] [--target hosted|kernel|user]
 ## Lexical structure
 
 - **Comments** run from `//` to the end of the line. There are no block comments.
-- **Identifiers** are letters, digits and `_`, not starting with a digit.
-- **Integer literals** are decimal (`4096`) or hexadecimal (`0x1000`, `0X1000`). `_` may separate digits (`1_000_000`, `0xffff_0000`). A literal must fit in 64 bits. There are no negative literals and no unary minus: integers are unsigned.
+- **Identifiers** are ASCII letters, digits and `_`, not starting with a digit.
+- **Integer literals** are decimal (`4096`) or hexadecimal (`0x1000`, `0X1000`). `_` may separate digits (`1_000_000`, `0xffff_0000`). A literal must fit in 64 bits, and in the integer type its position gives it. A negative number is unary minus on a literal, where a signed type is expected.
 - **String literals** are written in double quotes and cannot span lines. Escapes: `\n`, `\r`, `\t`, `\0`, `\\`, `\"`.
 - **Keywords:** `assert` `const` `else` `ensures` `enum` `export` `false` `fn` `forall` `if` `import` `invariant` `is` `let` `match` `mut` `requires` `return` `spec` `struct` `true` `unreachable` `while`. The names `result`, `old` and `include_bytes`, and the names of builtins, have special meanings described below.
 
@@ -159,7 +159,7 @@ fn main(con: &mut Serial) -> u64 {
 | Type | Meaning |
 | --- | --- |
 | `Buf` | An owned buffer of `u64` |
-| `Bytes` | An owned buffer of bytes. Every element is proved to be `<= 255` |
+| `Bytes` | An owned buffer of bytes. Its elements are `u8`s |
 | `Vec[T]` | A growable array of `T` on the heap |
 | `Box[T]` | An owning pointer to a `T` on the heap; the only way a type can contain itself |
 | A struct with a linear field, an enum with a linear payload | |
@@ -521,8 +521,52 @@ fn main() -> u64 {
 - The invariants of a struct held directly as a field are included; ones behind a box, in a vector or in an enum payload are not yet. Outside a lock, invariants are not enforced: they are what the lock promises about its contents.
 - A lock cannot hold a value with a `Cpu` or `Mmu` in it (`E-PIN`): they describe the processor that holds them.
 - Lending `&mut` a place that overlaps the lock in the same call is `E-LINEAR-USE`, so the contents have no second way in.
-- Deadlock is not ruled out: taking a lock again inside `f` (directly or through another call) spins forever.
+- Deadlock through locks is ruled out at compile time, with nothing written down (`E-LOCK-ORDER`). A lock's *class* is the type of its contents. The checker finds, over the whole call graph, which classes each function may take (`smp_run` counts as a call of its function). While `locked(l, f)` holds a lock of class C, `f` and everything it calls may take only locks of other classes, and the classes must form no cycle: if a `B` lock is ever taken while an `A` lock is held, an `A` lock is never taken while a `B` lock is held. Every processor then takes locks in one global order, so none can wait for another forever, and none spins on a lock it already holds. Two locks with the same contents type cannot be nested; give them different contents types (two structs) to order them. Nothing is generated for this.
 - Generated code: a lock is a pointer to a lock word followed by the contents; `locked` spins with an atomic exchange (acquire) and releases with a store (release). Invariants generate nothing.
+
+### Atomics
+
+An `Atomic[T]` holds one word that any number of processors read and write at once through a shared borrow `&Atomic[T]`, with no lock. `T` is an integer type, `bool`, or a struct with a single field of one of those, which is how an atomic value gets an invariant (`E-TYPE` otherwise).
+
+```bastio
+// expect-exit: 4
+struct Pending { n: u64 } invariant n <= 1024;
+
+fn reserve(a: &Atomic[Pending]) -> bool {
+  let x = atomic_load(a);                      // x.n <= 1024 is known
+  if x.n < 1024 {
+    return atomic_cas(a, x, Pending { n: x.n + 1 });   // proves x.n + 1 <= 1024
+  }
+  return false;
+}
+
+fn main() -> u64 {
+  let a = atomic_new(Pending { n: 1020 });
+  let mut i = 0;
+  while i < 6 invariant i <= 6 {
+    let ok = reserve(a);
+    i = i + 1;
+  }
+  let p = atomic_end(a);
+  return p.n % 1000 / 5;
+}
+```
+
+| Builtin | Effect |
+| --- | --- |
+| `atomic_new(v: T) -> Atomic[T]` | A new atomic holding `v`; proves the invariants of `v` |
+| `atomic_end(a: Atomic[T]) -> T` | Consumes the atomic and returns its value |
+| `atomic_load(a: &Atomic[T]) -> T` | Reads the value |
+| `atomic_store(a: &Atomic[T], v: T)` | Writes `v`; proves its invariants |
+| `atomic_swap(a: &Atomic[T], v: T) -> T` | Writes `v` and returns the value it replaced; proves the invariants of `v` |
+| `atomic_cas(a: &Atomic[T], expected: T, v: T) -> bool` | Writes `v` if the value is `expected` (compared bit for bit), and says whether it did; proves the invariants of `v` |
+| `atomic_wrap_add(a: &Atomic[T], d: T) -> T` | Integer `T` only: adds `d`, wrapping around (as `wrap_add`), and returns the value before |
+
+- Another processor may change the value at any moment, so a value read (`atomic_load`, `atomic_swap`, `atomic_wrap_add`, `atomic_end`) is fresh: only the invariants are known of it. Every value written must satisfy them (`E-VERIFY-LOCKINV`).
+- There is no checked `atomic_add`: since the current value is unknown, it would have to be proved not to overflow for every value the invariants allow. Use `atomic_wrap_add` when wrapping is wanted, or a compare-and-swap loop like `reserve` above.
+- Every access is sequentially consistent, so a program behaves as if the processors' steps were interleaved one at a time. Weaker orderings are not available (see [concurrency.md](concurrency.md)).
+- An atomic is linear: it must be consumed by `atomic_end` (`E-LINEAR-LEAK`). It cannot hand over ownership: it never holds a linear value.
+- Generated code: an atomic is a pointer to the word on the heap; the operations are the C compiler's `__atomic` builtins with `__ATOMIC_SEQ_CST`. Invariants generate nothing.
 
 ## Enums and `match`
 
@@ -754,19 +798,19 @@ fn main() -> u64 {
 | `free(b: Buf)` | | Frees `b` |
 | `balloc(n: u64) -> Bytes` | `n <= 2^60` | `n` zero bytes |
 | `blen(b: &Bytes) -> u64` | | Its length |
-| `bget(b: &Bytes, i: u64) -> u64` | `i < blen(b)` | Byte `i`; the prover knows it is `<= 255` |
-| `bset(b: &mut Bytes, i: u64, v: u64)` | `i < blen(b)`, `v <= 255` | Sets byte `i` in place |
+| `bget(b: &Bytes, i: u64) -> u8` | `i < blen(b)` | Byte `i` |
+| `bset(b: &mut Bytes, i: u64, v: u8)` | `i < blen(b)` | Sets byte `i` in place |
 | `bfree(b: Bytes)` | | Frees `b` |
 | `bfrom(s: Str) -> Bytes` | | A copy of a string literal; the prover knows its bytes |
 | `slen(s: Str) -> u64` | | Length of a string literal |
-| `sget(s: Str, i: u64) -> u64` | `i < slen(s)` | Byte `i`; the prover knows the literal's bytes exactly |
+| `sget(s: Str, i: u64) -> u8` | `i < slen(s)` | Byte `i`; the prover knows the literal's bytes exactly |
 | `print(v: u64)` | | Prints `v` in decimal on a line of its own (for debugging) |
 
 `include_bytes("path")` is a `Str` holding a file's contents, read at compile time; the path is relative to the source file.
 
 ```bastio
 // expect-exit: 5
-fn count(s: &Bytes, c: u64) -> u64
+fn count(s: &Bytes, c: u8) -> u64
   ensures result <= blen(s)
 {
   let mut n = 0;
@@ -802,6 +846,7 @@ On the hosted target, `main` can ask for `&mut Host`: the program's command line
 | `host_arg(h: &Host, i: u64) -> Bytes` | Argument `i` (empty if there is none) |
 | `host_read(h: &Host, path: &Bytes, out: &mut Bytes) -> bool` | Replaces `out` with the whole file; false (and `out` unchanged) if it cannot be read |
 | `host_write(h: &Host, path: &Bytes, data: &Bytes) -> bool` | Creates or replaces the file |
+| `host_eprint(h: &Host, text: &Bytes)` | Writes the bytes to standard error |
 | `host_spawn(h: &Host, argv: &Vec[Bytes]) -> Child` | Starts `argv[0]` (looked up in `PATH`) with arguments `argv`. A program that cannot be started gives a child that exits with 127 and writes nothing |
 | `child_write(c: &mut Child, data: &Bytes) -> bool` | Writes to the child's standard input; false if it can no longer be written |
 | `child_close(c: &mut Child)` | Closes the child's standard input, so a program that reads to the end of its input can finish |
@@ -869,8 +914,8 @@ Ghost accessors, usable in specifications:
 
 | Builtin | Requires (proved) | Effect |
 | --- | --- | --- |
-| `serial_write(c: &Serial, b: u64)` | `b <= 255` | Writes one byte |
-| `serial_read(c: &Serial) -> u64` | | Reads one byte, blocking; the result is `<= 255`. Hosted builds read standard input and return 4 (EOT) at its end |
+| `serial_write(c: &Serial, b: u8)` | | Writes one byte |
+| `serial_read(c: &Serial) -> u8` | | Reads one byte, blocking. Hosted builds read standard input and return 4 (EOT) at its end |
 | `serial_poll(c: &Serial) -> u64` | | Kernel only. A received byte, or 256 if none is waiting |
 
 **Pages and page tables** (hosted and kernel; hosted builds simulate the pages with ordinary memory, so page code can be tested under the sanitizers):
@@ -881,7 +926,7 @@ Ghost accessors, usable in specifications:
 | `pool_give(p: &mut Pool, f: Frame)` | | Gives a page back |
 | `frame_id(f: &Frame) -> u64` | | The page number |
 | `frame_read(f: &Frame, w: u64) -> u64`, `frame_write(f: &mut Frame, w: u64, v: u64)` | `w < 512` | A 64-bit word of the page. Contents are not tracked by the proof |
-| `frame_read8(f: &Frame, o: u64) -> u64`, `frame_write8(f: &mut Frame, o: u64, b: u64)` | `o < 4096`; writing: `b <= 255` | A byte of the page |
+| `frame_read8(f: &Frame, o: u64) -> u8`, `frame_write8(f: &mut Frame, o: u64, b: u8)` | `o < 4096` | A byte of the page |
 | `pt_new(f: Frame, level: u64) -> PageTable` | `1 <= level <= 5` | Turns a page into an empty table. A level-4 table gets the kernel's map in slot 0 (not owned, never touched) |
 | `pt_free(t: PageTable) -> Frame` | level is not 4; every slot empty | Turns an empty table back into a page |
 | `pt_free_root(m: &Mmu, t: PageTable) -> Frame` | level 4; slots 1-255 empty; `pt_id(t) != mmu_root(m)` | Kernel only. The same for a top-level table, which must not be in CR3 |
@@ -981,8 +1026,8 @@ fn main(con: &mut Serial, mmu: &mut Mmu) {
 | --- | --- | --- |
 | `port_claim(p: &mut Ports, base: u64, count: u64) -> PortIo` | `base + count <= 65536`; `port_free(p, k)` for every `k` in the range | Takes the ports out of `p` |
 | `port_release(p: &mut Ports, io: PortIo)` | | Gives them back |
-| `pio_in8` / `pio_in16` / `pio_in32(io: &mut PortIo, off: u64) -> u64` | `off + 1` / `2` / `4 <= port_count(io)` | `in` from port `port_base(io) + off`; the result fits the width |
-| `pio_out8` / `pio_out16` / `pio_out32(io: &mut PortIo, off: u64, v: u64)` | the same, and `v` fits the width | `out` to that port |
+| `pio_in8` / `pio_in16` / `pio_in32(io: &mut PortIo, off: u64) -> u8` / `u16` / `u32` | `off + 1` / `2` / `4 <= port_count(io)` | `in` from port `port_base(io) + off` |
+| `pio_out8` / `pio_out16` / `pio_out32(io: &mut PortIo, off: u64, v: u8` / `u16` / `u32)` | the same | `out` to that port |
 
 Reads take `&mut` too: reading a device register changes the device (it pops a FIFO or acknowledges an interrupt). Claiming compiles to nothing and each access is one instruction. Ports nobody claimed cannot be touched, and two drivers never own the same port. What a device does with the values is not modelled.
 
@@ -991,8 +1036,8 @@ Reads take `&mut` too: reading a device register changes the device (it pops a F
 // A driver owns the eight ports of a UART and touches only those.
 struct Uart { io: PortIo }
 
-fn uart_send(u: &mut Uart, b: u64)
-  requires port_count(u.io) == 8 && b <= 255
+fn uart_send(u: &mut Uart, b: u8)
+  requires port_count(u.io) == 8
   ensures port_count(u.io) == 8
 {
   pio_out8(&mut u.io, 0, b);
@@ -1013,8 +1058,8 @@ fn main(ports: &mut Ports) -> u64 {
 | --- | --- | --- |
 | `mmio_claim(w: &mut MmioSpace, base: u64, len: u64) -> Mmio` | `0xC0000000 <= base`, `base + len <= 2^32`; `mmio_free(w, a)` for every `a` in the block | Takes the block out of `w` |
 | `mmio_release(w: &mut MmioSpace, r: Mmio)` | | Gives it back |
-| `mmio_read8` / `16` / `32` / `64(r: &mut Mmio, off: u64) -> u64` | `off + width <= mmio_len(r)`; `mmio_base(r) + off` is a multiple of the width | One volatile load; the result fits the width |
-| `mmio_write8` / `16` / `32` / `64(r: &mut Mmio, off: u64, v: u64)` | the same, and `v` fits the width | One volatile store |
+| `mmio_read8` / `16` / `32` / `64(r: &mut Mmio, off: u64) -> u8` / `u16` / `u32` / `u64` | `off + width <= mmio_len(r)`; `mmio_base(r) + off` is a multiple of the width | One volatile load |
+| `mmio_write8` / `16` / `32` / `64(r: &mut Mmio, off: u64, v: u8` / `u16` / `u32` / `u64)` | the same | One volatile store |
 
 The rules are those of ports: claiming compiles to nothing, two drivers never own the same register, and reads take `&mut`. Because claims must lie in the device window and the page pool stays below 256 MiB, a driver can never reach memory the allocator owns. What a device does with the values is not modelled.
 
@@ -1026,7 +1071,7 @@ fn main(win: &mut MmioSpace) -> u64 {
   let v = mmio_read32(&mut apic, 0x30);
   // mmio_read32(&mut apic, 0x32) would be E-VERIFY-BOUNDS (unaligned).
   mmio_release(&mut win, apic);
-  return v % 1;
+  return cast[u64](v % 1);
 }
 ```
 
@@ -1038,8 +1083,8 @@ fn main(win: &mut MmioSpace) -> u64 {
 | `dma_take(d: Dma) -> Frame` | | Takes the same page back (`frame_id` is `dma_id(d)`), after a fence |
 | `dma_id(d: &Dma) -> u64` | | The page number |
 | `dma_addr(d: &Dma) -> u64` | | The page's physical address, to program into a device. Only a lent page's address can be read |
-| `dma_read8` / `16` / `32` / `64(d: &mut Dma, off: u64) -> u64` | `off + width <= 4096`; `off` is a multiple of the width | One volatile load; the result fits the width |
-| `dma_write8` / `16` / `32` / `64(d: &mut Dma, off: u64, v: u64)` | the same, and `v` fits the width | One volatile store |
+| `dma_read8` / `16` / `32` / `64(d: &mut Dma, off: u64) -> u8` / `u16` / `u32` / `u64` | `off + width <= 4096`; `off` is a multiple of the width | One volatile load |
+| `dma_write8` / `16` / `32` / `64(d: &mut Dma, off: u64, v: u8` / `u16` / `u32` / `u64)` | the same | One volatile store |
 
 What is proved: while a page is lent it cannot go back to the pool, into a page table or into anything else that takes a `Frame`, so a device can never write a page that has been reused; the CPU reaches it only with volatile, aligned, in-bounds accesses, so the C compiler cannot cache or tear what the device sees; and a `Dma` must be taken back before the program ends (it is linear). What is trusted: that the driver has stopped the device using the page (for example, seen its completion) before `dma_take`, and that the addresses it programs into the device are those of pages it has lent. Devices are outside the proof.
 
@@ -1150,6 +1195,7 @@ Syntax, types and linearity:
 | `E-LINEAR-USE` | A consumed value (or a moved-out field, or a struct with a field moved out) is used; one call both borrows and moves a value, or lends it twice with one loan `&mut`; a borrow is returned; a value is consumed where the code may run more than once or not at all (a `while` condition, the right side of `&&` / `\|\|`) |
 | `E-LINEAR-LEAK` | A linear value is still owned at the end of its scope or at a `return`, is overwritten, or is dropped by `_` |
 | `E-LINEAR-BRANCH` | Only one arm of an `if` or a `match` consumes a value; a loop body changes the ownership of an outer value |
+| `E-LOCK-ORDER` | A lock may be taken while a lock of the same class (contents type) is held, or lock classes are taken in opposite orders in two places |
 | `E-PIN` | A `Cpu` or `Mmu` (or a value holding one) is put in a lock or shared between processors by `smp_run` |
 
 Proofs:
@@ -1164,14 +1210,13 @@ Proofs:
 | `E-VERIFY-UNDERFLOW` | `a - b` has `a >= b` |
 | `E-VERIFY-DIVZERO` | The divisor of `/` and `%` is not zero |
 | `E-VERIFY-ALLOC` | Allocation size <= 2^60 elements |
-| `E-VERIFY-BYTE` | A value stored as a byte (`serial_write`, `bset`, `frame_write8`, `pio_out8`) is `<= 255`; `pio_out16` / `pio_out32` and `mmio_write*` values fit their width |
 | `E-VERIFY-OWN` | A page is taken from the pool at most once; an I/O port or device register has at most one owner; a table slot is empty before `pt_put` and used before `pt_take`; a table is empty before it is freed |
 | `E-VERIFY-PT` | Table levels line up; frames go only into level-1 tables; slot 0 of a top-level table (the kernel's map) is never touched |
 | `E-VERIFY-MMU` | The table in CR3 is never freed |
 | `E-VERIFY-REQUIRES` | The callee's `requires` |
 | `E-VERIFY-ENSURES` | The function's own postcondition |
 | `E-VERIFY-INVARIANT` | A loop invariant holds on entry and is preserved by one iteration |
-| `E-VERIFY-LOCKINV` | A struct invariant holds of a value put in a lock, and again at the end of every `locked` call |
+| `E-VERIFY-LOCKINV` | A struct invariant holds of a value put in a lock, and again at the end of every `locked` call; of every value written to an atomic |
 | `E-VERIFY-ASSERT` | An `assert` |
 | `E-VERIFY-UNREACHABLE` | An `unreachable;` the code can reach |
 
@@ -1205,7 +1250,7 @@ cc -c find.c && cc app.c find.o
 enum Found { At(u64), Missing }
 
 /// Where `c` first occurs in `b`.
-export fn find(b: &Bytes, c: u64) -> Found
+export fn find(b: &Bytes, c: u8) -> Found
   ensures result is Found::At ==> result.At < blen(b)
 {
   let mut i = 0;
@@ -1223,7 +1268,7 @@ export fn find(b: &Bytes, c: u64) -> Found
 
 ```c
 /* in the generated header */
-bst_e_Found find(const uint8_t *b, size_t b_len, uint64_t c);
+bst_e_Found find(const uint8_t *b, size_t b_len, uint8_t c);
 ```
 
 What may cross the boundary (otherwise `E-EXPORT`):
@@ -1253,4 +1298,4 @@ What a program that `bastioc0` accepts is guaranteed: no out-of-bounds access, n
 
 ## Not in the language yet
 
-Planned, in [ROADMAP.md](../ROADMAP.md): the rest of concurrency (threads, atomics, interrupt-safe locks; designed in [concurrency.md](concurrency.md)), signed integer types, more hardware capabilities (`IrqOff`), allocation failure in the type, and a native x86-64 backend. Inference of type arguments, modules with qualified names, and hand-written lemmas for proofs Z3 cannot find are open questions.
+Planned, in [ROADMAP.md](../ROADMAP.md): the rest of concurrency (threads, atomics, interrupt-safe locks; designed in [concurrency.md](concurrency.md)), more hardware capabilities (`IrqOff`), allocation failure in the type, and a native x86-64 backend. Inference of type arguments, modules with qualified names, and hand-written lemmas for proofs Z3 cannot find are open questions.

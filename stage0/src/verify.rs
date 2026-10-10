@@ -1453,6 +1453,15 @@ impl<'p> Verifier<'p> {
         Ok(out)
     }
 
+    /// A value read from an atomic: fresh, with its invariants.
+    fn atomic_read(&mut self, t: &Type, st: &mut State) -> Result<Val, Diag> {
+        let v = self.fresh_of(t, "atomic")?;
+        for (_, i) in self.invariants_of(&v)? {
+            st.pc.push(i);
+        }
+        Ok(v)
+    }
+
     /// `locked(l, f, args..)`: the contents are a fresh value about which
     /// only the invariants are known (another processor may have changed
     /// them since this one last looked). `f` gets them as its `&mut` first
@@ -1536,6 +1545,32 @@ impl<'p> Verifier<'p> {
                 }
                 Ok(Val::Obj(Type::Lock(Box::new(val_type(&vals[0]))), vec![]))
             }
+            // An atomic's value may change at any moment, so like a lock's
+            // contents only its invariants are known when it is read, and
+            // they are proved of every value written.
+            "atomic_new" => {
+                for (what, i) in self.invariants_of(&vals[0])? {
+                    self.need(st, i, pos, "E-VERIFY-LOCKINV", format!("that the value put in the atomic satisfies the invariant {}", what))?;
+                }
+                let t = self.int_ops.get(&pos).cloned().unwrap_or_else(|| val_type(&vals[0]));
+                Ok(Val::Obj(Type::Atomic(Box::new(t)), vec![]))
+            }
+            "atomic_store" | "atomic_swap" | "atomic_cas" => {
+                let Val::Obj(Type::Atomic(t), _) = &vals[0] else { unreachable!("checked: an atomic") };
+                let new = if name == "atomic_cas" { &vals[2] } else { &vals[1] };
+                for (what, i) in self.invariants_of(new)? {
+                    self.need(st, i, pos, "E-VERIFY-LOCKINV", format!("that the value stored in the atomic `{}` satisfies the invariant {}", ra(0), what))?;
+                }
+                match name {
+                    "atomic_store" => Ok(Val::Unit),
+                    "atomic_cas" => self.fresh_of(&Type::Bool, "cas"),
+                    _ => self.atomic_read(t, st),
+                }
+            }
+            "atomic_end" | "atomic_load" | "atomic_wrap_add" => {
+                let Val::Obj(Type::Atomic(t), _) = &vals[0] else { unreachable!("checked: an atomic") };
+                self.atomic_read(t, st)
+            }
             "lock_end" => {
                 let Val::Obj(Type::Lock(t), _) = &vals[0] else { unreachable!("checked: a lock") };
                 let v = self.fresh_of(t, "unlocked")?;
@@ -1592,11 +1627,8 @@ impl<'p> Verifier<'p> {
                 }
                 _ => unreachable!(),
             },
-            "serial_write" => {
-                let b = vals[1].term();
-                self.need(st, format!("(<= {} 255)", b), pos, "E-VERIFY-BYTE", format!("that `{}` fits in a byte (`<= 255`)", ra(1)))?;
-                Ok(Val::Unit)
-            }
+            // A u8 always fits in a byte: the type says what E-VERIFY-BYTE used to prove.
+            "serial_write" => Ok(Val::Unit),
             "serial_read" | "serial_poll" => {
                 // serial_poll returns 256 when no byte is waiting.
                 let v = self.fresh_u64(name)?;
@@ -1671,7 +1703,6 @@ impl<'p> Verifier<'p> {
                 Val::Buf { len, data } => {
                     let (i, v) = (vals[1].term(), vals[2].term());
                     self.need(st, format!("(< {} {})", i, len), pos, "E-VERIFY-BOUNDS", format!("that the index `{}` is within `{}` (`{} < blen({})`)", ra(1), ra(0), ra(1), ra(0)))?;
-                    self.need(st, format!("(<= {} 255)", v), pos, "E-VERIFY-BYTE", format!("that `{}` fits in a byte (`<= 255`)", ra(2)))?;
                     let nv = Val::Buf { len: len.clone(), data: format!("(store {} {} {})", data, i, v) };
                     self.put_back(&args[0], nv, st);
                     Ok(Val::Unit)
@@ -1690,6 +1721,7 @@ impl<'p> Verifier<'p> {
                 self.fresh_bool("read_ok")
             }
             "host_write" => self.fresh_bool("write_ok"),
+            "host_eprint" => Ok(Val::Unit),
             "host_spawn" => self.fresh_of(&Type::Child, "child"),
             "child_write" => self.fresh_bool("child_write_ok"),
             "child_close" => Ok(Val::Unit),
@@ -1730,8 +1762,6 @@ impl<'p> Verifier<'p> {
                 let w = vals[1].term().to_string();
                 index_ok(self, st, &w, "4096", 1, "a page (4096 bytes)")?;
                 if name == "frame_write8" {
-                    let b = vals[2].term();
-                    self.need(st, format!("(<= {} 255)", b), pos, "E-VERIFY-BYTE", format!("that `{}` fits in a byte (`<= 255`)", ra(2)))?;
                     return Ok(Val::Unit);
                 }
                 let v = self.fresh_u64("frame_read8")?;
@@ -1868,8 +1898,6 @@ impl<'p> Verifier<'p> {
                 self.need(st, format!("(= (mod (+ {} {}) {}) 0)", io.field("base"), off, bytes), pos, "E-VERIFY-BOUNDS",
                     format!("that the access at offset `{}` of `{}` is aligned to {} bytes", ra(1), ra(0), bytes))?;
                 if name.starts_with("mmio_write") {
-                    self.need(st, format!("(<= {} {})", vals[2].term(), max), pos, "E-VERIFY-BYTE",
-                        format!("that `{}` fits in {} bits (`<= {}`)", ra(2), bytes * 8, max))?;
                     return Ok(Val::Unit);
                 }
                 let v = self.fresh_u64(name)?;
@@ -1900,8 +1928,6 @@ impl<'p> Verifier<'p> {
                 self.need(st, format!("(= (mod {} {}) 0)", off, bytes), pos, "E-VERIFY-BOUNDS",
                     format!("that offset `{}` is aligned to {} bytes", ra(1), bytes))?;
                 if name.starts_with("dma_write") {
-                    self.need(st, format!("(<= {} {})", vals[2].term(), max), pos, "E-VERIFY-BYTE",
-                        format!("that `{}` fits in {} bits (`<= {}`)", ra(2), bytes * 8, max))?;
                     return Ok(Val::Unit);
                 }
                 let v = self.fresh_u64(name)?;
@@ -1920,8 +1946,6 @@ impl<'p> Verifier<'p> {
                 self.need(st, format!("(<= (+ {} {}) {})", off, bytes, io.field("count")), pos, "E-VERIFY-BOUNDS",
                     format!("that port offset `{}` is within `{}` (`{} + {} <= port_count({})`)", ra(1), ra(0), ra(1), bytes, ra(0)))?;
                 if name.starts_with("pio_out") {
-                    self.need(st, format!("(<= {} {})", vals[2].term(), max), pos, "E-VERIFY-BYTE",
-                        format!("that `{}` fits in {} bits (`<= {}`)", ra(2), bytes * 8, max))?;
                     return Ok(Val::Unit);
                 }
                 let v = self.fresh_u64(name)?;

@@ -15,6 +15,14 @@
 #           the number of proof obligations, or the first failed proof's
 #           code, position and counterexample), on the programs that reach
 #           the verifier
+#   C       stage1/cdump.bastio     vs  bastioc0 --dump-c (the whole C file,
+#           runtime prelude included), on every program the checker accepts
+#   driver  stage1/bastioc1.bastio  vs  bastioc0 itself: what `--check`
+#           prints on stderr and its exit status (the sentence after
+#           `error[CODE]:` masked, as bastioc1 does not print it yet), the
+#           C file of `--emit-c`, and the programs it builds, which must
+#           exit as tests/pass says; and bastioc1 built by itself must
+#           write the same C for itself as stage0 (the fixed point)
 # The parser, the monomorphizer and the checker are also compared on damaged
 # sources (stage1/mutate.py), so their error positions are checked too.
 set -u
@@ -22,7 +30,7 @@ cd "$(dirname "$0")/.."
 BASTIOC=${BASTIOC:-stage0/target/release/bastioc0}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-for tool in lexdump astdump monodump checkdump smtdump verifydump; do
+for tool in lexdump astdump monodump checkdump smtdump verifydump cdump bastioc1; do
   "$BASTIOC" -o "$tmp/$tool" "stage1/$tool.bastio" 2>"$tmp/build.err" || { cat "$tmp/build.err"; exit 1; }
 done
 files=$(find tests stage1 ../bastios/src ../bastios/user -name '*.bastio' 2>/dev/null | sort)
@@ -107,6 +115,86 @@ for f in $files; do
 done
 echo "-- proofs: $match matched ($failed of them failed proofs), $differ differ ($skipped not reaching the verifier)"
 { [ "$differ" = 0 ] && [ "$match" -gt 0 ]; } || status=1
+match=0 differ=0 errors=0
+for f in $files; do
+  t=$(target_of "$f")
+  "$BASTIOC" --dump-c --target "$t" "$f" >"$tmp/want" 2>/dev/null
+  grep -q '^error' "$tmp/want" && errors=$((errors+1))
+  "$tmp/cdump" "$t" "$f" >"$tmp/got" 2>/dev/null
+  if cmp -s "$tmp/want" "$tmp/got"; then
+    match=$((match+1))
+  else
+    differ=$((differ+1))
+    echo "DIFFER $f ($t)"
+    diff "$tmp/want" "$tmp/got" | head -5 | cut -c1-300 | sed 's/^/    /'
+  fi
+done
+echo "-- C: $match matched ($((match-errors)) of them C files), $differ differ"
+{ [ "$differ" = 0 ] && [ "$match" -gt "$errors" ]; } || status=1
+# The driver. bastioc1 does not print the sentence after the error code
+# yet, nor the hints (`  = ..`) that follow the errors before the
+# verifier (a failed proof's counterexample is compared), and names itself
+# in its own messages.
+mask() {
+  if grep -q 'error\[E-\(VERIFY\|SOLVER\)' "$1"; then cat "$1"; else grep -v '^  = ' "$1"; fi \
+    | sed -e 's/^\(.*: error\[[A-Z-]*\]\): .*$/\1/' -e 's/^bastioc0: /bastioc1: /'
+}
+match=0 differ=0 errors=0
+for f in $files; do
+  t=$(target_of "$f")
+  "$BASTIOC" --check --target "$t" "$f" 2>"$tmp/want.err" >/dev/null; echo "exit $?" >>"$tmp/want.err"
+  "$tmp/bastioc1" --check --target "$t" "$f" 2>"$tmp/got.err" >/dev/null; echo "exit $?" >>"$tmp/got.err"
+  grep -q 'error\[' "$tmp/want.err" && errors=$((errors+1))
+  mask "$tmp/want.err" >"$tmp/want"
+  mask "$tmp/got.err" >"$tmp/got"
+  if cmp -s "$tmp/want" "$tmp/got"; then
+    match=$((match+1))
+  else
+    differ=$((differ+1))
+    echo "DIFFER $f ($t, --check)"
+    diff "$tmp/want" "$tmp/got" | head -5 | cut -c1-300 | sed 's/^/    /'
+  fi
+done
+cfiles=0
+for f in tests/pass/*.bastio tests/user/*.bastio ../bastios/src/main.bastio ../bastios/user/*.bastio; do
+  [ -f "$f" ] || continue
+  case "$f" in tests/user/*) t=user ;; *) t=$(target_of "$f") ;; esac
+  "$BASTIOC" --emit-c --target "$t" -o "$tmp/want.c" "$f" 2>/dev/null || continue
+  cfiles=$((cfiles+1))
+  if "$tmp/bastioc1" --emit-c --target "$t" -o "$tmp/got.c" "$f" 2>/dev/null && cmp -s "$tmp/want.c" "$tmp/got.c"; then
+    match=$((match+1))
+  else
+    differ=$((differ+1))
+    echo "DIFFER $f ($t, --emit-c)"
+  fi
+done
+built=0
+for f in tests/pass/*.bastio; do
+  want=$(sed -n 's|^// expect-exit: *||p' "$f" | head -1)
+  if "$tmp/bastioc1" -o "$tmp/prog" "$f" 2>/dev/null; then
+    "$tmp/prog" </dev/null >/dev/null; got=$?
+  else
+    got=rejected
+  fi
+  if [ "$got" = "$want" ]; then
+    built=$((built+1)); match=$((match+1))
+  else
+    differ=$((differ+1))
+    echo "DIFFER $f (built by bastioc1: exit $got, want $want)"
+  fi
+done
+echo "-- driver: $match matched ($errors rejected, $cfiles C files, $built programs built and run), $differ differ"
+{ [ "$differ" = 0 ] && [ "$built" -gt 0 ]; } || status=1
+# The fixed point: bastioc1 (built by stage0) builds itself, and that
+# build writes the same C for bastioc1 as stage0 does.
+if "$tmp/bastioc1" -o "$tmp/gen2" stage1/bastioc1.bastio 2>"$tmp/gen2.err" \
+   && "$tmp/gen2" --emit-c -o "$tmp/gen2.c" stage1/bastioc1.bastio 2>>"$tmp/gen2.err" \
+   && "$BASTIOC" --emit-c -o "$tmp/gen1.c" stage1/bastioc1.bastio 2>/dev/null \
+   && cmp -s "$tmp/gen1.c" "$tmp/gen2.c"; then
+  echo "-- fixed point: bastioc1 built by itself writes the same C for itself as stage0 ($(wc -l <"$tmp/gen1.c") lines)"
+else
+  echo "-- fixed point: FAILED"; sed 's/^/    /' "$tmp/gen2.err" | head -10; status=1
+fi
 python3 stage1/mutate.py "$BASTIOC" --dump-ast "$tmp/astdump" 1 ${MUTANTS:-5} $files || status=1
 python3 stage1/mutate.py "$BASTIOC" --dump-mono "$tmp/monodump" 2 ${MUTANTS:-5} $files || status=1
 for t in hosted kernel user; do
@@ -127,4 +215,10 @@ python3 stage1/mutate.py --smt "$BASTIOC" "--check --dump-smt" "$tmp/smtdump" 6 
 # Proofs, on the mutants that reach the verifier: most of those fail a proof.
 python3 stage1/mutate.py --verify "$BASTIOC" "--dump-verify" "$tmp/verifydump" 7 $((${MUTANTS:-5} * 2)) \
   tests/pass/*.bastio tests/fail/*.bastio stage1/verifycases/*.bastio || status=1
+# C, on the mutants that still type-check (the rest print the same error).
+python3 stage1/mutate.py "$BASTIOC" "--dump-c" "$tmp/cdump" 8 ${MUTANTS:-5} tests/pass/*.bastio || status=1
+if [ -f ../bastios/src/main.bastio ]; then
+  python3 stage1/mutate.py --via ../bastios/src/main.bastio "$BASTIOC" "--dump-c --target kernel" "$tmp/cdump kernel" 9 ${MUTANTS:-5} \
+    $(ls ../bastios/src/*.bastio | grep -v /main.bastio) || status=1
+fi
 exit $status

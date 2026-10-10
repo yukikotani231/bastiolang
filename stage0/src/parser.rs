@@ -356,8 +356,8 @@ impl Parser {
             "MmioSpace" => Ok(Type::MmioSpace),
             "Mmio" => Ok(Type::Mmio),
             "Dma" => Ok(Type::Dma),
-            _ if *self.peek() == Tok::LBracket && n != "Box" && n != "Vec" && n != "Lock" => Ok(Type::Generic(n, self.targs()?)),
-            "Box" | "Vec" | "Lock" => {
+            _ if *self.peek() == Tok::LBracket && n != "Box" && n != "Vec" && n != "Lock" && n != "Atomic" => Ok(Type::Generic(n, self.targs()?)),
+            "Box" | "Vec" | "Lock" | "Atomic" => {
                 self.expect(Tok::LBracket, "`[`")?;
                 let inner = self.ty()?;
                 self.expect(Tok::RBracket, "`]`")?;
@@ -367,7 +367,8 @@ impl Parser {
                 Ok(match n.as_str() {
                     "Box" => Type::Box(Box::new(inner)),
                     "Vec" => Type::Vec(Box::new(inner)),
-                    _ => Type::Lock(Box::new(inner)),
+                    "Lock" => Type::Lock(Box::new(inner)),
+                    _ => Type::Atomic(Box::new(inner)),
                 })
             }
             _ => Ok(Type::Struct(n)),

@@ -18,6 +18,7 @@ const C_MATCH: u64 = 5;
 const C_TARGET: u64 = 6;
 const C_EXPORT: u64 = 7;
 const C_PIN: u64 = 8;
+const C_LOCK_ORDER: u64 = 9;
 
 const TARGET_HOSTED: u64 = 0;
 const TARGET_KERNEL: u64 = 1;
@@ -79,8 +80,19 @@ struct Checker {
   /// `wrap_*` call, and the source type of each `cast`/`wrap`, when it is
   /// not u64, per instance (the verifier's overflow bounds; every other one
   /// is u64).
-  int_ops: Vec[IntOp]
+  int_ops: Vec[IntOp],
+  /// Instance `from` calls instance `to` (`locked` and `smp_run` call the
+  /// function they name), without repeats, for `lock_order`.
+  calls: Vec[Edge],
+  /// Each `locked` call, in checking order.
+  lsites: Vec[LockSite]
 }
+
+struct Edge { from: u64, to: u64 }
+
+/// `locked` call `node` in instance `x` holds a lock of class `cls` (the
+/// type of its contents) while it runs instance `f`.
+struct LockSite { x: u64, node: u64, cls: u64, f: u64 }
 
 /// Operator node `node` of instance `x` works on integer type `ty`.
 struct IntOp { x: u64, node: u64, ty: u64 }
@@ -95,6 +107,8 @@ fn checker_free(c: Checker) {
   vec_free(c.moved);
   vec_free(c.bound);
   vec_free(c.int_ops);
+  vec_free(c.calls);
+  vec_free(c.lsites);
 }
 
 fn bsig(c: &mut Checker, name: Str, avail: u64, np: u64, p0: u64, p1: u64, p2: u64, p3: u64, ret: u64) {
@@ -129,7 +143,8 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
     bs: vec_new[Bsig](), ghosts: vec_new[Ghost](), fstart: vec_new[u64](), ftys: vec_new[u64](),
     paths: paths, vars: vec_new[Var](), moved: vec_new[u64](), bound: vec_new[u64](),
     target: target, ret: un, env: 0, spec_lim: 0, tu64: u, tbool: b, tunit: un, tstr: st,
-    failed: false, efile: 0, eline: 0, ecol: 0, ecode: 0, int_ops: vec_new[IntOp]()
+    failed: false, efile: 0, eline: 0, ecol: 0, ecode: 0, int_ops: vec_new[IntOp](),
+    calls: vec_new[Edge](), lsites: vec_new[LockSite]()
   };
   let buf = prim(&mut m, p, TY_BUF);
   let byt = prim(&mut m, p, TY_BYTES);
@@ -146,6 +161,9 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   let msp = prim(&mut m, p, TY_MMIOSPACE);
   let mio = prim(&mut m, p, TY_MMIO);
   let dma = prim(&mut m, p, TY_DMA);
+  let u8t = prim(&mut m, p, TY_U8);
+  let u16t = prim(&mut m, p, TY_U16);
+  let u32t = prim(&mut m, p, TY_U32);
   let rbuf = ref_to(&mut m, p, buf);
   let rbyt = ref_to(&mut m, p, byt);
   let mbyt = mut_to(&mut m, p, byt);
@@ -180,23 +198,24 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   bsig(&mut c, "print", AV_ALL, 1, u, 0, 0, 0, un);
   bsig(&mut c, "balloc", AV_ALL, 1, u, 0, 0, 0, byt);
   bsig(&mut c, "blen", AV_ALL, 1, rbyt, 0, 0, 0, u);
-  bsig(&mut c, "bget", AV_ALL, 2, rbyt, u, 0, 0, u);
-  bsig(&mut c, "bset", AV_ALL, 3, mbyt, u, u, 0, un);
+  bsig(&mut c, "bget", AV_ALL, 2, rbyt, u, 0, 0, u8t);
+  bsig(&mut c, "bset", AV_ALL, 3, mbyt, u, u8t, 0, un);
   bsig(&mut c, "bfree", AV_ALL, 1, byt, 0, 0, 0, un);
   bsig(&mut c, "bfrom", AV_ALL, 1, st, 0, 0, 0, byt);
   bsig(&mut c, "host_argc", AV_HOSTED, 1, rhst, 0, 0, 0, u);
   bsig(&mut c, "host_arg", AV_HOSTED, 2, rhst, u, 0, 0, byt);
   bsig(&mut c, "host_read", AV_HOSTED, 3, rhst, rbyt, mbyt, 0, b);
   bsig(&mut c, "host_write", AV_HOSTED, 3, rhst, rbyt, rbyt, 0, b);
+  bsig(&mut c, "host_eprint", AV_HOSTED, 2, rhst, rbyt, 0, 0, un);
   bsig(&mut c, "host_spawn", AV_HOSTED, 2, rhst, rvbyt, 0, 0, chd);
   bsig(&mut c, "child_write", AV_HOSTED, 2, mchd, rbyt, 0, 0, b);
   bsig(&mut c, "child_close", AV_HOSTED, 1, mchd, 0, 0, 0, un);
   bsig(&mut c, "child_read_line", AV_HOSTED, 2, mchd, mbyt, 0, 0, b);
   bsig(&mut c, "child_wait", AV_HOSTED, 1, chd, 0, 0, 0, u);
   bsig(&mut c, "slen", AV_ALL, 1, st, 0, 0, 0, u);
-  bsig(&mut c, "sget", AV_ALL, 2, st, u, 0, 0, u);
-  bsig(&mut c, "serial_write", AV_ALL, 2, rser, u, 0, 0, un);
-  bsig(&mut c, "serial_read", AV_ALL, 1, rser, 0, 0, 0, u);
+  bsig(&mut c, "sget", AV_ALL, 2, st, u, 0, 0, u8t);
+  bsig(&mut c, "serial_write", AV_ALL, 2, rser, u8t, 0, 0, un);
+  bsig(&mut c, "serial_read", AV_ALL, 1, rser, 0, 0, 0, u8t);
   bsig(&mut c, "serial_poll", AV_KERNEL, 1, rser, 0, 0, 0, u);
   bsig(&mut c, "pool_size", AV_MEM, 1, rpol, 0, 0, 0, u);
   bsig(&mut c, "pool_take", AV_MEM, 2, mpol, u, 0, 0, frm);
@@ -204,8 +223,8 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   bsig(&mut c, "frame_id", AV_MEM, 1, rfrm, 0, 0, 0, u);
   bsig(&mut c, "frame_read", AV_MEM, 2, rfrm, u, 0, 0, u);
   bsig(&mut c, "frame_write", AV_MEM, 3, mfrm, u, u, 0, un);
-  bsig(&mut c, "frame_read8", AV_MEM, 2, rfrm, u, 0, 0, u);
-  bsig(&mut c, "frame_write8", AV_MEM, 3, mfrm, u, u, 0, un);
+  bsig(&mut c, "frame_read8", AV_MEM, 2, rfrm, u, 0, 0, u8t);
+  bsig(&mut c, "frame_write8", AV_MEM, 3, mfrm, u, u8t, 0, un);
   bsig(&mut c, "pt_new", AV_MEM, 2, frm, u, 0, 0, ptb);
   bsig(&mut c, "pt_free", AV_MEM, 1, ptb, 0, 0, 0, frm);
   bsig(&mut c, "pt_free_root", AV_KERNEL, 2, rmmu, ptb, 0, 0, frm);
@@ -227,35 +246,35 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   bsig(&mut c, "port_release", AV_MEM, 2, mprt, pio, 0, 0, un);
   bsig(&mut c, "port_base", AV_MEM, 1, rpio, 0, 0, 0, u);
   bsig(&mut c, "port_count", AV_MEM, 1, rpio, 0, 0, 0, u);
-  bsig(&mut c, "pio_in8", AV_MEM, 2, mpio, u, 0, 0, u);
-  bsig(&mut c, "pio_in16", AV_MEM, 2, mpio, u, 0, 0, u);
-  bsig(&mut c, "pio_in32", AV_MEM, 2, mpio, u, 0, 0, u);
-  bsig(&mut c, "pio_out8", AV_MEM, 3, mpio, u, u, 0, un);
-  bsig(&mut c, "pio_out16", AV_MEM, 3, mpio, u, u, 0, un);
-  bsig(&mut c, "pio_out32", AV_MEM, 3, mpio, u, u, 0, un);
+  bsig(&mut c, "pio_in8", AV_MEM, 2, mpio, u, 0, 0, u8t);
+  bsig(&mut c, "pio_in16", AV_MEM, 2, mpio, u, 0, 0, u16t);
+  bsig(&mut c, "pio_in32", AV_MEM, 2, mpio, u, 0, 0, u32t);
+  bsig(&mut c, "pio_out8", AV_MEM, 3, mpio, u, u8t, 0, un);
+  bsig(&mut c, "pio_out16", AV_MEM, 3, mpio, u, u16t, 0, un);
+  bsig(&mut c, "pio_out32", AV_MEM, 3, mpio, u, u32t, 0, un);
   bsig(&mut c, "mmio_claim", AV_MEM, 3, mmsp, u, u, 0, mio);
   bsig(&mut c, "mmio_release", AV_MEM, 2, mmsp, mio, 0, 0, un);
   bsig(&mut c, "mmio_base", AV_MEM, 1, rmio, 0, 0, 0, u);
   bsig(&mut c, "mmio_len", AV_MEM, 1, rmio, 0, 0, 0, u);
-  bsig(&mut c, "mmio_read8", AV_MEM, 2, mmmio, u, 0, 0, u);
-  bsig(&mut c, "mmio_read16", AV_MEM, 2, mmmio, u, 0, 0, u);
-  bsig(&mut c, "mmio_read32", AV_MEM, 2, mmmio, u, 0, 0, u);
+  bsig(&mut c, "mmio_read8", AV_MEM, 2, mmmio, u, 0, 0, u8t);
+  bsig(&mut c, "mmio_read16", AV_MEM, 2, mmmio, u, 0, 0, u16t);
+  bsig(&mut c, "mmio_read32", AV_MEM, 2, mmmio, u, 0, 0, u32t);
   bsig(&mut c, "mmio_read64", AV_MEM, 2, mmmio, u, 0, 0, u);
-  bsig(&mut c, "mmio_write8", AV_MEM, 3, mmmio, u, u, 0, un);
-  bsig(&mut c, "mmio_write16", AV_MEM, 3, mmmio, u, u, 0, un);
-  bsig(&mut c, "mmio_write32", AV_MEM, 3, mmmio, u, u, 0, un);
+  bsig(&mut c, "mmio_write8", AV_MEM, 3, mmmio, u, u8t, 0, un);
+  bsig(&mut c, "mmio_write16", AV_MEM, 3, mmmio, u, u16t, 0, un);
+  bsig(&mut c, "mmio_write32", AV_MEM, 3, mmmio, u, u32t, 0, un);
   bsig(&mut c, "mmio_write64", AV_MEM, 3, mmmio, u, u, 0, un);
   bsig(&mut c, "dma_lend", AV_MEM, 1, frm, 0, 0, 0, dma);
   bsig(&mut c, "dma_take", AV_MEM, 1, dma, 0, 0, 0, frm);
   bsig(&mut c, "dma_id", AV_MEM, 1, rdma, 0, 0, 0, u);
   bsig(&mut c, "dma_addr", AV_MEM, 1, rdma, 0, 0, 0, u);
-  bsig(&mut c, "dma_read8", AV_MEM, 2, mdma, u, 0, 0, u);
-  bsig(&mut c, "dma_read16", AV_MEM, 2, mdma, u, 0, 0, u);
-  bsig(&mut c, "dma_read32", AV_MEM, 2, mdma, u, 0, 0, u);
+  bsig(&mut c, "dma_read8", AV_MEM, 2, mdma, u, 0, 0, u8t);
+  bsig(&mut c, "dma_read16", AV_MEM, 2, mdma, u, 0, 0, u16t);
+  bsig(&mut c, "dma_read32", AV_MEM, 2, mdma, u, 0, 0, u32t);
   bsig(&mut c, "dma_read64", AV_MEM, 2, mdma, u, 0, 0, u);
-  bsig(&mut c, "dma_write8", AV_MEM, 3, mdma, u, u, 0, un);
-  bsig(&mut c, "dma_write16", AV_MEM, 3, mdma, u, u, 0, un);
-  bsig(&mut c, "dma_write32", AV_MEM, 3, mdma, u, u, 0, un);
+  bsig(&mut c, "dma_write8", AV_MEM, 3, mdma, u, u8t, 0, un);
+  bsig(&mut c, "dma_write16", AV_MEM, 3, mdma, u, u16t, 0, un);
+  bsig(&mut c, "dma_write32", AV_MEM, 3, mdma, u, u32t, 0, un);
   bsig(&mut c, "dma_write64", AV_MEM, 3, mdma, u, u, 0, un);
   bsig(&mut c, "sys_spawn", AV_USER, 3, rbuf, u, u, 0, u);
   bsig(&mut c, "sys_wait", AV_USER, 1, u, 0, 0, 0, u);
@@ -502,7 +521,7 @@ fn def_node(m: &Mono, p: &Parser, x: u64) -> Node {
 /// Is a value of type `t` linear (must it be consumed exactly once)?
 fn ck_linear(c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
   let k = kind_t(m, t);
-  if (k >= TY_BUF && k <= TY_DMA) || k == TY_BOX || k == TY_VEC || k == TY_LOCK {
+  if (k >= TY_BUF && k <= TY_DMA) || k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_ATOMIC {
     return true;
   }
   if k == TY_STRUCT || k == TY_ENUM {
@@ -528,7 +547,7 @@ fn is_pinned(c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
   if k == TY_MMU || k == TY_CPU {
     return true;
   }
-  if k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_REF || k == TY_MUTREF {
+  if k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_ATOMIC || k == TY_REF || k == TY_MUTREF {
     return is_pinned(c, m, p, inner_t(m, t));
   }
   if k == TY_STRUCT || k == TY_ENUM {
@@ -629,9 +648,16 @@ fn is_lock_builtin(p: &Parser, s: u64, e: u64) -> bool {
   return span_is(p, s, e, "lock_new") || span_is(p, s, e, "lock_end") || span_is(p, s, e, "locked");
 }
 
+/// The builtins over `Atomic[T]`: generic too.
+fn is_atomic_builtin(p: &Parser, s: u64, e: u64) -> bool {
+  return span_is(p, s, e, "atomic_new") || span_is(p, s, e, "atomic_end") || span_is(p, s, e, "atomic_load")
+    || span_is(p, s, e, "atomic_store") || span_is(p, s, e, "atomic_swap") || span_is(p, s, e, "atomic_cas")
+    || span_is(p, s, e, "atomic_wrap_add");
+}
+
 fn is_builtin_name(c: &Checker, p: &Parser, s: u64, e: u64) -> bool {
   return span_is(p, s, e, "box") || span_is(p, s, e, "unbox") || span_is(p, s, e, "cast") || span_is(p, s, e, "wrap")
-    || span_is(p, s, e, "smp_run") || is_lock_builtin(p, s, e)
+    || span_is(p, s, e, "smp_run") || is_lock_builtin(p, s, e) || is_atomic_builtin(p, s, e)
     || is_vec_builtin(p, s, e) || is_wrap_builtin(p, s, e) || bs_index(c, p, s, e) != 0;
 }
 
@@ -1043,7 +1069,7 @@ fn known_type(c: &mut Checker, m: &Mono, p: &Parser, t: u64, loc: u64) {
   let k = kind_t(m, t);
   if k == TY_UNKNOWN {
     cfail(&mut c, p, loc, C_TYPE);
-  } else if k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_REF || k == TY_MUTREF {
+  } else if k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_ATOMIC || k == TY_REF || k == TY_MUTREF {
     known_type(&mut c, m, p, inner_t(m, t), loc);
   }
 }
@@ -1059,7 +1085,7 @@ fn is_reserved_type(p: &Parser, s: u64, e: u64) -> bool {
     || span_is(p, s, e, "PageTable") || span_is(p, s, e, "Pool") || span_is(p, s, e, "Mmu")
     || span_is(p, s, e, "Cpu") || span_is(p, s, e, "Ports") || span_is(p, s, e, "PortIo")
     || span_is(p, s, e, "MmioSpace") || span_is(p, s, e, "Mmio") || span_is(p, s, e, "Dma")
-    || span_is(p, s, e, "Lock");
+    || span_is(p, s, e, "Lock") || span_is(p, s, e, "Atomic");
 }
 
 /// Struct and enum instances: no reserved names, known field and payload
@@ -1079,7 +1105,7 @@ fn check_structs(c: &mut Checker, m: &Mono, p: &Parser) {
     let mut j = 0;
     while j < n {
       let mut u = fld_ty(c, x, j);
-      while kind_t(m, u) == TY_BOX || kind_t(m, u) == TY_VEC || kind_t(m, u) == TY_LOCK {
+      while kind_t(m, u) == TY_BOX || kind_t(m, u) == TY_VEC || kind_t(m, u) == TY_LOCK || kind_t(m, u) == TY_ATOMIC {
         u = inner_t(m, u);
       }
       if u != 0 && kind_t(m, u) == TY_UNKNOWN {
@@ -1413,6 +1439,135 @@ fn check_program(c: &mut Checker, m: &mut Mono, p: &Parser) {
     check_fn(&mut c, &mut m, p, u_at(m.fns, j));
     j = j + 1;
   }
+  if !c.failed {
+    lock_order(&mut c, p);
+  }
+}
+
+/// Records that the instance being checked calls instance `x`.
+fn note_call(c: &mut Checker, x: u64) {
+  let mut j = 0;
+  while j < vec_len(c.calls) {
+    let e = vec_get(c.calls, j);
+    if e.from == c.env && e.to == x {
+      return;
+    }
+    j = j + 1;
+  }
+  vec_push(&mut c.calls, Edge { from: c.env, to: x });
+}
+
+/// Adds the edge `a -> b` to `v` unless it is there.
+fn add_edge(v: &mut Vec[Edge], a: u64, b: u64) -> bool {
+  let mut j = 0;
+  while j < vec_len(v) {
+    let e = vec_get(v, j);
+    if e.from == a && e.to == b {
+      return false;
+    }
+    j = j + 1;
+  }
+  vec_push(&mut v, Edge { from: a, to: b });
+  return true;
+}
+
+/// Is class `to` reachable from class `from` along `order`?
+fn class_reaches(order: &Vec[Edge], from: u64, to: u64) -> bool {
+  let mut seen = vec_new[u64]();
+  vec_push(&mut seen, from);
+  let mut i = 0;
+  let mut found = false;
+  while i < vec_len(seen) && !found {
+    let a = vec_get(seen, i);
+    if a == to {
+      found = true;
+    }
+    let mut j = 0;
+    while j < vec_len(order) {
+      let e = vec_get(order, j);
+      if e.from == a && !has_u(seen, e.to) {
+        vec_push(&mut seen, e.to);
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  vec_free(seen);
+  return found;
+}
+
+fn has_u(v: &Vec[u64], x: u64) -> bool {
+  let mut j = 0;
+  while j < vec_len(v) {
+    if vec_get(v, j) == x {
+      return true;
+    }
+    j = j + 1;
+  }
+  return false;
+}
+
+/// Rules out deadlock through locks, as stage0's `lock_order` does: a
+/// lock's class is the type of its contents; while `locked(l, f)` holds a
+/// lock of class C, `f` and everything it calls may take only locks of other
+/// classes, and the classes form no cycle.
+fn lock_order(c: &mut Checker, p: &Parser) {
+  // takes: instance -> a class it may take, itself or through its callees.
+  let mut takes = vec_new[Edge]();
+  let mut j = 0;
+  while j < vec_len(c.lsites) {
+    let s = vec_get(c.lsites, j);
+    add_edge(&mut takes, s.x, s.cls);
+    j = j + 1;
+  }
+  let mut changed = true;
+  while changed {
+    changed = false;
+    j = 0;
+    while j < vec_len(c.calls) {
+      let e = vec_get(c.calls, j);
+      let mut k = 0;
+      while k < vec_len(takes) {
+        let t = vec_get(takes, k);
+        if t.from == e.to && add_edge(&mut takes, e.from, t.to) {
+          changed = true;
+        }
+        k = k + 1;
+      }
+      j = j + 1;
+    }
+  }
+  // order: class C before class D when D can be taken while C is held.
+  let mut order = vec_new[Edge]();
+  j = 0;
+  while j < vec_len(c.lsites) {
+    let s = vec_get(c.lsites, j);
+    let mut k = 0;
+    while k < vec_len(takes) {
+      let t = vec_get(takes, k);
+      if t.from == s.f {
+        add_edge(&mut order, s.cls, t.to);
+      }
+      k = k + 1;
+    }
+    j = j + 1;
+  }
+  j = 0;
+  while j < vec_len(c.lsites) && !c.failed {
+    let s = vec_get(c.lsites, j);
+    let mut k = 0;
+    while k < vec_len(takes) && !c.failed {
+      let t = vec_get(takes, k);
+      if t.from == s.f && class_reaches(order, t.to, s.cls) {
+        // The same class again, or a class taken elsewhere before this one.
+        cfail(&mut c, p, s.node, C_LOCK_ORDER);
+      }
+      k = k + 1;
+    }
+    j = j + 1;
+  }
+  vec_free(takes);
+  vec_free(order);
 }
 
 fn check_spec_fn(c: &mut Checker, m: &mut Mono, p: &Parser, k: u64) {
@@ -2115,7 +2270,9 @@ fn ck_named(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64
         return 0;
       }
       let t = bin_type(&mut c, m, p, n.v, ts.a, ts.b, i);
-      note_int_op(&mut c, m, i, t);
+      // The operands' type: the result's for arithmetic, and what a
+      // comparison compares (signed or not matters to the C code).
+      note_int_op(&mut c, m, i, ts.a);
       return t;
     }
     let ta = ck_expr(&mut c, &mut m, p, n.a);
@@ -2322,6 +2479,7 @@ fn bsig_params(b: Bsig) -> Vec[u64] {
 
 /// A call to the function of instance `x`.
 fn user_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, x: u64) -> u64 {
+  note_call(&mut c, x);
   let xi = inst_at(m, x);
   let ps = fn_params(&mut m, p, xi.def, x);
   let dn = node_at(p.nodes, xi.def);
@@ -2423,6 +2581,9 @@ fn ck_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
   if span_is(p, s, e, "locked") {
     return locked_call(&mut c, &mut m, p, i);
   }
+  if is_atomic_builtin(p, s, e) {
+    return atomic_call(&mut c, &mut m, p, i);
+  }
   if span_is(p, s, e, "smp_run") {
     return smp_run_call(&mut c, &mut m, p, i);
   }
@@ -2492,6 +2653,8 @@ fn locked_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
     cfail(&mut c, p, a1, C_TYPE);             // must take `&mut` of the contents first
     return 0;
   }
+  note_call(&mut c, x);
+  vec_push(&mut c.lsites, LockSite { x: c.env, node: i, cls: inner, f: x });
   // `f`'s signature with the lock, borrowed, in place of its contents.
   let mut ps = vec_new[u64]();
   vec_push(&mut ps, ref_to(&mut m, p, lt));
@@ -2514,6 +2677,101 @@ fn locked_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
   return t;
 }
 
+/// Can an `Atomic` hold a `t`? One word: an integer, a bool, or a struct
+/// with a single such field.
+fn atomic_word(c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
+  if t == c.tbool || is_int(m, t) {
+    return true;
+  }
+  if kind_t(m, t) == TY_STRUCT {
+    let x = inner_t(m, t);
+    let dn = def_node(m, p, x);
+    if list_len(p, dn.a) == 1 {
+      let ft = fld_ty(c, x, 0);
+      return ft == c.tbool || is_int(m, ft);
+    }
+  }
+  return false;
+}
+
+/// The `Atomic` builtins, as stage0's `Ctx::atomic`.
+fn atomic_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
+  let n = node_at(p.nodes, i);
+  let a0 = n.a;
+  if name_is(p, i, "atomic_new") || name_is(p, i, "atomic_end") {
+    if list_len(p, a0) != 1 {
+      cfail(&mut c, p, i, C_TYPE);
+      return 0;
+    }
+    let t = ck_expr(&mut c, &mut m, p, a0);
+    if c.failed {
+      return 0;
+    }
+    if name_is(p, i, "atomic_new") {
+      if !atomic_word(c, m, p, t) {
+        cfail(&mut c, p, a0, C_TYPE);         // an Atomic holds one word
+        return 0;
+      }
+      // The verifier reads every integer as a u64.
+      note_int_op(&mut c, m, i, t);
+      return intern(&mut m, p, TY_ATOMIC, t);
+    }
+    if kind_t(m, t) != TY_ATOMIC {
+      cfail(&mut c, p, a0, C_TYPE);           // `atomic_end` needs an Atomic
+      return 0;
+    }
+    return inner_t(m, t);
+  }
+  let mut pk = 0;
+  if a0 != 0 {
+    pk = place_of(&mut c, p, a0);
+  }
+  if pk == 0 {
+    if a0 != 0 {
+      cfail(&mut c, p, a0, C_TYPE);           // must name an atomic
+    } else {
+      cfail(&mut c, p, i, C_TYPE);
+    }
+    return 0;
+  }
+  let aty = path_type(&mut c, m, p, pk, a0);
+  if c.failed {
+    return 0;
+  }
+  if kind_t(m, aty) != TY_ATOMIC {
+    cfail(&mut c, p, a0, C_TYPE);             // needs an Atomic
+    return 0;
+  }
+  let t = inner_t(m, aty);
+  if !atomic_word(c, m, p, t) {
+    cfail(&mut c, p, a0, C_TYPE);
+    return 0;
+  }
+  let mut ps = vec_new[u64]();
+  vec_push(&mut ps, ref_to(&mut m, p, aty));
+  let mut r = t;
+  if name_is(p, i, "atomic_store") {
+    vec_push(&mut ps, t);
+    r = c.tunit;
+  } else if name_is(p, i, "atomic_swap") {
+    vec_push(&mut ps, t);
+  } else if name_is(p, i, "atomic_cas") {
+    vec_push(&mut ps, t);
+    vec_push(&mut ps, t);
+    r = c.tbool;
+  } else if name_is(p, i, "atomic_wrap_add") {
+    if !is_int(m, t) {
+      vec_free(ps);
+      cfail(&mut c, p, a0, C_TYPE);           // needs an Atomic of an integer type
+      return 0;
+    }
+    vec_push(&mut ps, t);
+  }
+  let r2 = call_with(&mut c, &mut m, p, ps, r, a0, i, true);
+  vec_free(ps);
+  return r2;
+}
+
 /// `smp_run(f, args..)`: runs `f` on every processor at once and returns
 /// when all of them have returned. Each processor's call gets its own
 /// `Cpu` and `Mmu`; every other argument is a shared borrow.
@@ -2528,6 +2786,7 @@ fn smp_run_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
   if c.failed {
     return 0;
   }
+  note_call(&mut c, x);
   let xi = inst_at(m, x);
   let ps = fn_params(&mut m, p, xi.def, x);
   let dn = node_at(p.nodes, xi.def);

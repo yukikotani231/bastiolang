@@ -80,6 +80,9 @@ pub enum Type {
     /// A lock holding a `T`, shared between threads or cores through `&`
     /// borrows. Linear; its contents are reached only inside `locked`.
     Lock(Box<Type>),
+    /// A one-word value (an integer, a bool, or a struct with one such
+    /// field) read and written atomically through `&` borrows. Linear.
+    Atomic(Box<Type>),
     /// `Name[T, ..]` as written: a generic struct or enum applied to type
     /// arguments. Only exists before monomorphization, which replaces it with
     /// the `Struct`/`Enum` instance named by `name()` (e.g. `Option[u64]`).
@@ -124,6 +127,7 @@ impl Type {
             Type::Box(t) => format!("Box[{}]", t.name()),
             Type::Vec(t) => format!("Vec[{}]", t.name()),
             Type::Lock(t) => format!("Lock[{}]", t.name()),
+            Type::Atomic(t) => format!("Atomic[{}]", t.name()),
             Type::Generic(n, args) => format!("{}[{}]", n, args.iter().map(|a| a.name()).collect::<Vec<_>>().join(", ")),
             Type::Ref(t) => format!("&{}", t.name()),
             Type::MutRef(t) => format!("&mut {}", t.name()),
@@ -131,7 +135,7 @@ impl Type {
     }
     pub fn is_linear(&self) -> bool {
         match self {
-            Type::Buf | Type::Bytes | Type::Host | Type::Child | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu | Type::Ports | Type::PortIo | Type::MmioSpace | Type::Mmio | Type::Dma | Type::Box(_) | Type::Vec(_) | Type::Lock(_) => true,
+            Type::Buf | Type::Bytes | Type::Host | Type::Child | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu | Type::Ports | Type::PortIo | Type::MmioSpace | Type::Mmio | Type::Dma | Type::Box(_) | Type::Vec(_) | Type::Lock(_) | Type::Atomic(_) => true,
             Type::Struct(n) => struct_def(n).map_or(false, |d| d.fields.iter().any(|f| f.1.is_linear())),
             Type::Enum(n) => enum_def(n).map_or(false, |d| d.variants.iter().any(|v| v.1.as_ref().map_or(false, |t| t.is_linear()))),
             _ => false,
@@ -182,7 +186,7 @@ impl Type {
     pub fn is_pinned(&self) -> bool {
         match self {
             Type::Mmu | Type::Cpu => true,
-            Type::Box(t) | Type::Vec(t) | Type::Lock(t) | Type::Ref(t) | Type::MutRef(t) => t.is_pinned(),
+            Type::Box(t) | Type::Vec(t) | Type::Lock(t) | Type::Atomic(t) | Type::Ref(t) | Type::MutRef(t) => t.is_pinned(),
             Type::Struct(n) => struct_def(n).map_or(false, |d| d.fields.iter().any(|f| f.1.is_pinned())),
             Type::Enum(n) => enum_def(n).map_or(false, |d| d.variants.iter().any(|v| v.1.as_ref().map_or(false, |t| t.is_pinned()))),
             _ => false,

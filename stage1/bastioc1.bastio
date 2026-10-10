@@ -1,0 +1,400 @@
+// bastioc1 -- the self-hosted compiler for Bastio: the whole pipeline of
+// stage0's bastioc0 (stage0/src/main.rs), written in Bastio.
+//
+// Pipeline: load -> monomorphize -> check (types and linearity) -> verify
+// (Z3) -> C -> the system C compiler.
+//
+// usage: bastioc1 [--check] [--emit-c] [--target T] [-o out] <file.bastio>...
+//   (default)   verify, then build a native executable `out` (default: a.out)
+//   --check     stop after verification
+//   --emit-c    write the generated C to `out` (default: out.c) instead of
+//               building
+//   --target    `hosted` (default): a normal program on the C library
+//               `kernel`: freestanding C for a bare-metal x86-64 kernel (implies --emit-c)
+//               `user`: freestanding C for a user program under BastiOS (implies --emit-c)
+// Several input files form one program, as for bastioc0.
+//
+// Errors are reported as bastioc0 reports them: `file:line:col:
+// error[CODE]`, the source line with a caret under the position, and the
+// notes of a failed proof (its counterexample), on standard error. Not
+// yet: the sentence that says what is wrong (bastioc0's message after the
+// code) and `--header`.
+import "loader.bastio";
+import "solve.bastio";
+import "codegen.bastio";
+
+fn b1_code(code: u64) -> Str {
+  if code == C_USE { return "E-LINEAR-USE"; }
+  if code == C_LEAK { return "E-LINEAR-LEAK"; }
+  if code == C_BRANCH { return "E-LINEAR-BRANCH"; }
+  if code == C_MATCH { return "E-MATCH"; }
+  if code == C_TARGET { return "E-TARGET"; }
+  if code == C_EXPORT { return "E-EXPORT"; }
+  if code == C_PIN { return "E-PIN"; }
+  if code == C_LOCK_ORDER { return "E-LOCK-ORDER"; }
+  return "E-TYPE";
+}
+
+fn b1_bytes(out: &mut Vec[u64], b: &Bytes) {
+  let mut k = 0;
+  while k < blen(b) {
+    vec_push(&mut out, cast[u64](bget(b, k)));
+    k = k + 1;
+  }
+}
+
+fn loaded_at(ld: &Loader, k: u64) -> Loaded {
+  if k < vec_len(ld.files) {
+    return vec_get(ld.files, k);
+  }
+  return Loaded { start: 0, len: 0, done: false, raw: 0, rawlen: 0, src: 0 };
+}
+
+/// The error at `file:line:col` with code `code`, as bastioc0 renders it
+/// (diag.rs), followed by the notes in `notes`.
+fn b1_render(out: &mut Vec[u64], p: &Parser, ld: &Loader, file: u64, line: u64, col: u64, code: Str, notes: &Vec[u64]) {
+  let f = loaded_at(ld, file);
+  let mut k = f.raw;
+  let rend = cg_add(f.raw, f.rawlen);
+  while k < rend {
+    vec_push(&mut out, u_at(ld.paths, k));
+    k = k + 1;
+  }
+  out_str(&mut out, ":");
+  out_num(&mut out, line);
+  out_str(&mut out, ":");
+  out_num(&mut out, col);
+  out_str(&mut out, ": error[");
+  out_str(&mut out, code);
+  out_str(&mut out, "]\n");
+  // The source line: the file's text runs to where the next file's starts.
+  let mut end = blen(p.src);
+  let nf = cg_add(file, 1);
+  if nf < vec_len(ld.files) {
+    let g = loaded_at(ld, nf);
+    if g.src < end {
+      end = g.src;
+    }
+  }
+  let mut i = f.src;
+  let mut l = 1;
+  while l < line && i < end {
+    if src_at(p, i) == 10 {
+      l = l + 1;
+    }
+    i = i + 1;
+  }
+  if l >= line && i < end {
+    out_str(&mut out, "  | ");
+    let mut j = i;
+    while j < end && src_at(p, j) != 10 {
+      j = j + 1;
+    }
+    let mut e = j;
+    if e > i && src_at(p, e - 1) == 13 {
+      e = e - 1;
+    }
+    while i < e {
+      vec_push(&mut out, src_at(p, i));
+      i = i + 1;
+    }
+    out_str(&mut out, "\n  | ");
+    let mut c = 1;
+    while c < col {
+      out_str(&mut out, " ");
+      c = c + 1;
+    }
+    out_str(&mut out, "^\n");
+  }
+  k = 0;
+  while k < vec_len(notes) {
+    vec_push(&mut out, u_at(notes, k));
+    k = k + 1;
+  }
+}
+
+/// Writes the bytes in `out` to standard error and empties it.
+fn b1_flush(host: &Host, out: &mut Vec[u64]) {
+  let mut b = balloc(vec_len(out));
+  let mut k = 0;
+  while k < vec_len(out) && k < blen(b) {
+    let ch = u_at(out, k);
+    if ch <= 255 {
+      bset(&mut b, k, cast[u8](ch));
+    }
+    k = k + 1;
+  }
+  host_eprint(host, b);
+  bfree(b);
+  while vec_len(out) > 0 {
+    vec_pop(&mut out);
+  }
+}
+
+/// Writes the bytes in `text` to the file `path`.
+fn b1_write(host: &Host, path: &Bytes, text: &Vec[u64]) -> bool {
+  let mut b = balloc(vec_len(text));
+  let mut k = 0;
+  while k < vec_len(text) && k < blen(b) {
+    let ch = u_at(text, k);
+    if ch <= 255 {
+      bset(&mut b, k, cast[u8](ch));
+    }
+    k = k + 1;
+  }
+  let ok = host_write(host, path, b);
+  bfree(b);
+  return ok;
+}
+
+fn b1_concat(a: &Bytes, s: Str) -> Bytes {
+  let mut n = blen(a);
+  if n < 1152921504606846976 && slen(s) < 1152921504606846976 - n {
+    n = n + slen(s);
+  }
+  let mut b = balloc(n);
+  let mut k = 0;
+  while k < blen(a) && k < blen(b) {
+    bset(&mut b, k, bget(a, k));
+    k = k + 1;
+  }
+  let mut j = 0;
+  while j < slen(s) && k < blen(b) {
+    bset(&mut b, k, sget(s, j));
+    k = k + 1;
+    j = j + 1;
+  }
+  return b;
+}
+
+fn b1_is(b: &Bytes, w: Str) -> bool {
+  return spells(b, 0, blen(b), w);
+}
+
+/// Runs `argv` and waits for it: its exit status (127 if it cannot run).
+fn b1_run(host: &Host, argv: Vec[Bytes]) -> u64 {
+  let ch = host_spawn(host, argv);
+  drop_argv(argv);
+  return child_wait(ch);
+}
+
+fn main(con: &mut Serial, host: &mut Host) -> u64 {
+  let mut out = vec_new[u64]();
+  let mut check_only = false;
+  let mut emit_c = false;
+  let mut target = TARGET_HOSTED;
+  let mut outp = balloc(0);
+  let mut has_out = false;
+  let mut inputs = vec_new[Bytes]();
+  let mut status = 0;
+  let mut i = 1;
+  while i < host_argc(host) && status == 0 {
+    let a = host_arg(host, i);
+    if b1_is(a, "--check") {
+      check_only = true;
+      bfree(a);
+    } else if b1_is(a, "--emit-c") {
+      emit_c = true;
+      bfree(a);
+    } else if b1_is(a, "--target") {
+      bfree(a);
+      i = cg_add(i, 1);
+      let t = host_arg(host, i);
+      if b1_is(t, "hosted") {
+        target = TARGET_HOSTED;
+      } else if b1_is(t, "kernel") {
+        target = TARGET_KERNEL;
+        emit_c = true;
+      } else if b1_is(t, "user") {
+        target = TARGET_USER;
+        emit_c = true;
+      } else {
+        out_str(&mut out, "bastioc1: unknown target `");
+        b1_bytes(&mut out, t);
+        out_str(&mut out, "` (expected `hosted`, `kernel` or `user`)\n");
+        status = 2;
+      }
+      bfree(t);
+    } else if b1_is(a, "-o") {
+      bfree(a);
+      i = cg_add(i, 1);
+      bfree(outp);
+      outp = host_arg(host, i);
+      has_out = true;
+    } else if blen(a) > 0 && bget(a, 0) == 45 {
+      out_str(&mut out, "bastioc1: unknown option `");
+      b1_bytes(&mut out, a);
+      out_str(&mut out, "`\n");
+      bfree(a);
+      status = 2;
+    } else {
+      vec_push(&mut inputs, a);
+    }
+    i = cg_add(i, 1);
+  }
+  if status == 0 && vec_len(inputs) == 0 {
+    out_str(&mut out, "usage: bastioc1 [--check] [--emit-c] [--target hosted|kernel|user] [-o out] <file.bastio>...\n");
+    status = 2;
+  }
+  // The inputs, as one string for messages.
+  let mut input = vec_new[u64]();
+  let mut k = 0;
+  while k < vec_len(inputs) {
+    if k > 0 {
+      out_str(&mut input, " ");
+    }
+    let b = vec_swap(&mut inputs, k, balloc(0));
+    b1_bytes(&mut input, b);
+    bfree(vec_swap(&mut inputs, k, b));
+    k = k + 1;
+  }
+  let mut p = parser_new(balloc(0), vec_new[Tok](), 0);
+  let mut ld = loader_new();
+  let none = vec_new[u64]();
+  k = 0;
+  while status == 0 && k < vec_len(inputs) {
+    let path = vec_swap(&mut inputs, k, balloc(0));
+    let r = load(host, &mut p, &mut ld, path, 0, 0, 0, false);
+    if r == 2 {
+      out_str(&mut out, "bastioc1: cannot read ");
+      b1_bytes(&mut out, path);
+      out_str(&mut out, "\n");
+      status = 2;
+    } else if r != 0 {
+      if p.ecode == CODE_IMPORT {
+        b1_render(&mut out, p, ld, p.efile, p.eline, p.ecol, "E-IMPORT", none);
+      } else {
+        b1_render(&mut out, p, ld, p.efile, p.eline, p.ecol, "E-PARSE", none);
+      }
+      status = 1;
+    }
+    bfree(vec_swap(&mut inputs, k, path));
+    k = k + 1;
+  }
+  if status == 0 {
+    let mut m = mono_new();
+    monomorphize(&mut m, p);
+    if m.failed {
+      b1_render(&mut out, p, ld, m.efile, m.eline, m.ecol, "E-TYPE", none);
+      status = 1;
+    } else {
+      let mut c = checker_new(&mut m, p, target);
+      check_program(&mut c, &mut m, p);
+      if c.failed {
+        b1_render(&mut out, p, ld, c.efile, c.eline, c.ecol, b1_code(c.ecode), none);
+        status = 1;
+      } else {
+        let mut v = vr_new(&mut m, p);
+        verify_program(&mut v, c, &mut m, p);
+        let mut rep = vec_new[u64]();
+        if !solve(&mut v, m, p, host, &mut rep) {
+          let n = node_at(p.nodes, v.fail_at);
+          let mut code = "E-SOLVER";
+          if v.fail_code != 0 {
+            code = vc_name(v.fail_code);
+          }
+          b1_render(&mut out, p, ld, n.file, n.line, n.col, code, rep);
+          status = 1;
+        } else {
+          out_str(&mut out, "bastioc1: ");
+          k = 0;
+          while k < vec_len(input) {
+            vec_push(&mut out, u_at(input, k));
+            k = k + 1;
+          }
+          out_str(&mut out, ": ");
+          out_num(&mut out, v.obligations);
+          out_str(&mut out, " proof obligation(s) discharged\n");
+        }
+        vec_free(rep);
+        vr_free(v);
+        if status == 0 && !check_only {
+          // A program without `main` is a library: its C is linked into a
+          // C program.
+          let mut has_main = false;
+          k = 0;
+          while k < vec_len(m.fns) {
+            let xi = inst_at(m, u_at(m.fns, k));
+            if name_is(p, xi.def, "main") {
+              has_main = true;
+            }
+            k = k + 1;
+          }
+          if !emit_c && !has_main {
+            out_str(&mut out, "bastioc1: ");
+            k = 0;
+            while k < vec_len(input) {
+              vec_push(&mut out, u_at(input, k));
+              k = k + 1;
+            }
+            out_str(&mut out, " is a library (it has no `main`): build it with --emit-c and link the C into a program\n");
+            status = 2;
+          } else {
+            let mut g = cg_new(target);
+            cg_program(&mut g, c, &mut m, p);
+            b1_flush(host, &mut out);
+            if emit_c {
+              if !has_out {
+                bfree(outp);
+                outp = bfrom("out.c");
+              }
+              if !b1_write(host, outp, g.out) {
+                out_str(&mut out, "bastioc1: cannot write ");
+                b1_bytes(&mut out, outp);
+                out_str(&mut out, "\n");
+                status = 2;
+              }
+            } else {
+              if !has_out {
+                bfree(outp);
+                outp = bfrom("a.out");
+              }
+              let cfile = b1_concat(outp, ".c");
+              if !b1_write(host, cfile, g.out) {
+                out_str(&mut out, "bastioc1: cannot write ");
+                b1_bytes(&mut out, cfile);
+                out_str(&mut out, "\n");
+                status = 2;
+              } else {
+                let mut argv = vec_new[Bytes]();
+                push_arg(&mut argv, "cc");
+                push_arg(&mut argv, "-O2");
+                push_arg(&mut argv, "-std=c11");
+                push_arg(&mut argv, "-w");
+                push_arg(&mut argv, "-o");
+                vec_push(&mut argv, b1_concat(outp, ""));
+                vec_push(&mut argv, b1_concat(cfile, ""));
+                let st = b1_run(host, argv);
+                let mut rm = vec_new[Bytes]();
+                push_arg(&mut rm, "rm");
+                push_arg(&mut rm, "-f");
+                vec_push(&mut rm, b1_concat(cfile, ""));
+                b1_run(host, rm);
+                if st == 127 {
+                  out_str(&mut out, "bastioc1: cannot run `cc`\n");
+                  status = 3;
+                } else if st != 0 {
+                  out_str(&mut out, "bastioc1: the C compiler failed (this is a compiler bug)\n");
+                  status = 3;
+                }
+              }
+              bfree(cfile);
+            }
+            cg_free(g);
+          }
+        }
+      }
+      checker_free(c);
+    }
+    mono_free(m);
+  }
+  b1_flush(host, &mut out);
+  vec_free(out);
+  vec_free(input);
+  vec_free(none);
+  drop_argv(inputs);
+  bfree(outp);
+  loader_free(ld);
+  bfree(parser_free(p));
+  return status;
+}
