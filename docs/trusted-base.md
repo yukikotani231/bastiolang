@@ -22,7 +22,7 @@ BastiOS has its own trusted base on top of this one (boot code, processor startu
 | The C compiler and linker | Translate the generated C as C11 says, including the memory model for `Lock` and `Atomic` | The default backend writes C. The generated C has no undefined behavior that the proofs do not rule out: no overflow, no out-of-bounds access, a fixed evaluation order (`operands()` in `stage0/src/codegen.rs` hoists side effects into temporaries). Converting an out-of-range value to a signed type is implementation-defined in C and modular in GCC and Clang; `wrap` to a signed type relies on that ([integers.md](integers.md)) |
 | The C library (hosted target only) | `calloc`, `stdio`, `fork`/`exec`/pipes for `Child`, and pthreads | Hosted programs run on an operating system anyway |
 
-The native backend (`--backend native`, hosted only, experimental) writes x86-64 assembly instead of C, which takes the C compiler out of the trusted base for the program's own code. The assembler and linker stay. stage1's port of it (`stage1/x86.bastio`) also builds BastiOS user programs, with no C at all: neither the compiler nor the C library.
+The native backend (`--backend native`, hosted only, experimental) writes x86-64 assembly instead of C, which takes the C compiler out of the trusted base for the program's own code. The assembler and linker stay. stage1's port of it (`stage1/x86.bastio`) also builds BastiOS's kernel and user programs, with no C compiler for any Bastio code (the kernel's platform code in `boot/` stays C).
 
 ## 2. Runtime preludes
 
@@ -43,7 +43,7 @@ Each target links in a hand-written C prelude, emitted at the top of every gener
 | `user` | user | System call stubs (`int 0x80`), buffered console, the 64 KiB arena | The kernel's ABI |
 | `posix` | hosted | `_POSIX_C_SOURCE` | Needed before any header |
 
-The native backend has its own runtime in assembly (`RUNTIME` in `stage0/src/x86.rs`), also listed and counted: printing, the console and the allocator, over the C library. stage1's backend adds routines for `Child`, `host_env`, `host_cpus` and the simulated devices (`x86_runtime1`), and for user programs it replaces the whole runtime with one over the kernel's system calls (`x86_runtime_user`, about 200 lines: the `user` and `bytes_arena` parts in assembly).
+The native backend has its own runtime in assembly (`RUNTIME` in `stage0/src/x86.rs`), also listed and counted: printing, the console and the allocator, over the C library. stage1's backend adds routines for `Child`, `host_env`, `host_cpus` and the simulated devices (`x86_runtime1`), and for user programs and kernels it replaces the whole runtime: one over the kernel's system calls (`x86_runtime_user`, about 200 lines: the `user` and `bytes_arena` parts in assembly), and one for the kernel (`x86_runtime_kernel`, about 450 lines: the `kernel`, `kernel_cpu` and `bytes_arena` parts, calling the platform's C where the C prelude does). Ports, MMIO, DMA, page tables and control registers are single instructions in the generated code, as in the C prelude.
 
 The compiler also generates small helpers for each `Box` and `Vec` element type and a thunk per `smp_run` call. Those are part of the compiler (section 1), not of the listing.
 
@@ -79,7 +79,7 @@ These are not trusted parts so much as properties nobody claims:
 
 ## 6. How it shrinks
 
-- **The C compiler**, by the native backend (ROADMAP v3, "Native x86-64 backend"). It covers the hosted target today; the kernel and user targets need their preludes rewritten in assembly or in Bastio first.
+- **The C compiler**, by the native backend (ROADMAP v3, "Native x86-64 backend"). It covers the hosted target, and in stage1 also the kernel and user targets (their preludes rewritten in assembly), though BastiOS still builds with the C backend until bastioc1 offers the native one for them.
 - **Preludes into Bastio**, as capabilities appear that can express them. This has already happened once: BastiOS's UART driver used to be C in the kernel prelude, and now only the one `in` or `out` instruction behind each port access is trusted. The `kernel` prelude's COM1 code is still there for kernels that use `Serial` and for the prelude's own messages.
 - **The Multiboot memory map** is parsed in trusted C because Bastio cannot read memory at an address it was not given as a capability (ROADMAP invariant 1). A read-only capability for boot-time firmware memory would move this, and BastiOS's ACPI parsing, into Bastio.
 - **stage0** leaves when it is frozen; the trusted compiler is then stage1, which is checked by its own differential tests against stage0's last output and by the bootstrap fixed point.
