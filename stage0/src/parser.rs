@@ -11,7 +11,7 @@
 //   const    := 'const' IDENT ':' 'u64' '=' expr ';'   (constant-folded; define before use)
 //   param    := 'mut'? IDENT ':' type
 //   type     := 'u64' | 'bool' | 'Str' | linear | IDENT (a struct) | '&' linear | '&' 'mut' linear
-//   linear   := 'Buf' | 'Bytes' | 'Host' | 'Serial' | 'Frame' | 'PageTable' | 'Pool' | 'Mmu' | 'Cpu'
+//   linear   := 'Buf' | 'Bytes' | 'Host' | 'Child' | 'Serial' | 'Frame' | 'PageTable' | 'Pool' | 'Mmu' | 'Cpu'
 //   place    := IDENT ('.' IDENT)*
 //   primary  := ... | '&' 'mut' place | 'include_bytes' '(' STRING ')' | 'old' '(' expr ')'
 //             | IDENT '{' (IDENT ':' expr (',' IDENT ':' expr)* ','?)? '}'   (a struct literal)
@@ -325,6 +325,7 @@ impl Parser {
             "Buf" => Ok(Type::Buf),
             "Bytes" => Ok(Type::Bytes),
             "Host" => Ok(Type::Host),
+            "Child" => Ok(Type::Child),
             "Serial" => Ok(Type::Serial),
             "Str" => Ok(Type::Str),
             "Frame" => Ok(Type::Frame),

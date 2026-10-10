@@ -1188,6 +1188,16 @@ impl<'p> Verifier<'p> {
                 self.fresh_bool("read_ok")
             }
             "host_write" => self.fresh_bool("write_ok"),
+            "host_spawn" => self.fresh_of(&Type::Child, "child"),
+            "child_write" => self.fresh_bool("child_write_ok"),
+            "child_close" => Ok(Val::Unit),
+            "child_read_line" => {
+                let nv = self.fresh_of(&Type::Bytes, "line")?;
+                self.put_back(&args[1], nv, st);
+                self.fresh_bool("line_ok")
+            }
+            // An exit status, or 128 + a signal number.
+            "child_wait" => Ok(Val::U(self.fresh_int("status", "0", "255")?)),
 
             // ---- physical pages ----
             "pool_size" => Ok(Val::U(vals[0].field("size"))),

@@ -14,6 +14,9 @@ pub enum Type {
     /// The host operating system: files and command-line arguments. Linear;
     /// hosted programs only, and only `main` receives it.
     Host,
+    /// A child process started by `host_spawn`, with pipes to its standard
+    /// input and output. Linear: it must be waited for. Hosted only.
+    Child,
     /// The console capability. Linear: whoever owns it may talk to the
     /// serial line, and nobody else can. Only `main` receives one.
     Serial,
@@ -65,6 +68,7 @@ impl Type {
             Type::Buf => "Buf".into(),
             Type::Bytes => "Bytes".into(),
             Type::Host => "Host".into(),
+            Type::Child => "Child".into(),
             Type::Serial => "Serial".into(),
             Type::Str => "Str".into(),
             Type::Frame => "Frame".into(),
@@ -82,7 +86,7 @@ impl Type {
     }
     pub fn is_linear(&self) -> bool {
         match self {
-            Type::Buf | Type::Bytes | Type::Host | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu | Type::Box(_) | Type::Vec(_) => true,
+            Type::Buf | Type::Bytes | Type::Host | Type::Child | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu | Type::Box(_) | Type::Vec(_) => true,
             Type::Struct(n) => struct_def(n).map_or(false, |d| d.fields.iter().any(|f| f.1.is_linear())),
             Type::Enum(n) => enum_def(n).map_or(false, |d| d.variants.iter().any(|v| v.1.as_ref().map_or(false, |t| t.is_linear()))),
             _ => false,

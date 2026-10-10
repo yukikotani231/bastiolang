@@ -1,0 +1,64 @@
+// expect-exit: 42
+// Child processes: `host_spawn` starts a program with pipes to its standard
+// input and output; the `Child` is linear, so it must be waited for.
+
+fn arg(v: &mut Vec[Bytes], s: Str) {
+  vec_push(&mut v, bfrom(s));
+}
+
+fn drop_args(v: Vec[Bytes]) {
+  let mut w = v;
+  while vec_len(w) > 0 {
+    bfree(vec_pop(&mut w));
+  }
+  vec_free(w);
+}
+
+// Runs argv and returns its exit status.
+fn run(h: &Host, argv: Vec[Bytes]) -> u64
+  ensures result <= 255
+{
+  let c = host_spawn(h, argv);
+  drop_args(argv);
+  return child_wait(c);
+}
+
+fn main(h: &mut Host) -> u64 {
+  // Round trip through `cat`: write two lines, close its input, read back.
+  let mut argv = vec_new[Bytes]();
+  arg(&mut argv, "cat");
+  let mut c = host_spawn(h, argv);
+  drop_args(argv);
+  let msg = bfrom("hello\nworld\n");
+  let ok = child_write(&mut c, msg);
+  bfree(msg);
+  child_close(&mut c);
+  let mut line = balloc(0);
+  let mut lines = 0;
+  let mut first = 0;
+  while child_read_line(&mut c, &mut line)
+    invariant lines <= 1000
+  {
+    if lines == 0 && blen(line) == 5 {
+      first = bget(line, 0);                       // 'h' = 104
+    }
+    if lines < 1000 { lines = lines + 1; }
+  }
+  bfree(line);
+  let st = child_wait(c);                          // 0
+
+  // An exit status comes back; a program that cannot start gives 127.
+  let mut a2 = vec_new[Bytes]();
+  arg(&mut a2, "sh");
+  arg(&mut a2, "-c");
+  arg(&mut a2, "exit 3");
+  let three = run(h, a2);
+  let mut a3 = vec_new[Bytes]();
+  arg(&mut a3, "/no/such/program");
+  let missing = run(h, a3);
+
+  if !ok || st != 0 || lines != 2 || first != 104 || three != 3 || missing != 127 {
+    return 1;
+  }
+  return 42;
+}

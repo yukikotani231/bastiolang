@@ -1,0 +1,22 @@
+// expect-exit: 1
+// What v1 item 7 is for: a Bastio program asking Z3 a question itself.
+// Z3 in `-in` mode answers each command as it arrives, so the answer can
+// be read before its input is closed. (The tests already need z3.)
+fn main(h: &mut Host) -> u64 {
+  let mut argv = vec_new[Bytes]();
+  vec_push(&mut argv, bfrom("z3"));
+  vec_push(&mut argv, bfrom("-in"));
+  let mut c = host_spawn(h, argv);
+  while vec_len(argv) > 0 { bfree(vec_pop(&mut argv)); }
+  vec_free(argv);
+  let q = bfrom("(declare-const x Int)\n(assert (> x 5))\n(assert (< x 3))\n(check-sat)\n");
+  let ok = child_write(&mut c, q);
+  bfree(q);
+  let mut line = balloc(0);
+  let got = child_read_line(&mut c, &mut line);   // interactive: answer arrives before stdin closes
+  let mut r = 0;
+  if got && blen(line) == 5 { r = 1; }             // "unsat"
+  bfree(line);
+  let st = child_wait(c);
+  return r + st;
+}
