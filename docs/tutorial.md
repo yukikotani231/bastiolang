@@ -57,9 +57,9 @@ fn main() -> u64 {
 ```text
 $ bastioc0 average.bastio
 average.bastio:2:13: error[E-VERIFY-OVERFLOW]: could not prove that `a + b` does not overflow u64
-  |   return (a + b) / 2;
-  |             ^
-  = counterexample: a = 18446744073709551615, b = 1
+ 2 |   return (a + b) / 2;
+   |             ^
+   = counterexample: a = 18446744073709551615, b = 1
 ```
 
 This is the central idea of Bastio. `u64` arithmetic never wraps around and never traps: instead, the compiler must prove, before the program runs, that it cannot go out of range. Here it cannot, and it says why: the **counterexample** is a call, `average(2^64 - 1, 1)`, for which `a + b` overflows. The program is rejected even though `main` only ever passes 40 and 44, because `average` is checked on its own, for every argument it could be given.
@@ -114,9 +114,9 @@ fn main() -> u64 {
 
 ```text
 leak.bastio:4:3: error[E-LINEAR-LEAK]: `b` is still owned at this `return`
-  |   return n;
-  |   ^
-  = every linear value must be consumed exactly once: return it, pass it to a function that takes it by value, or `free` it
+ 4 |   return n;
+   |   ^^^^^^
+   = every linear value must be consumed exactly once: return it, pass it to a function that takes it by value, or `free` it
 ```
 
 So is using it after it is gone (`E-LINEAR-USE`), which rules out use after free and double free:
@@ -203,9 +203,9 @@ fn main() -> u64 {
 
 ```text
 sum.bastio:5:21: error[E-VERIFY-BOUNDS]: could not prove that the index `i` is within `b` (`i < len(b)`)
-  |     total = total + get(b, i);
-  |                     ^
-  = counterexample: len(b) = 0, i = 0, total = 0
+ 5 |     total = total + get(b, i);
+   |                     ^^^
+   = counterexample: len(b) = 0, i = 0, total = 0
 ```
 
 With `i < len(b)` the index is fine. But that is not enough here: `total` could still overflow, since the compiler knows nothing about the values in the buffer. Count something instead, and a new problem shows up:
@@ -234,9 +234,9 @@ fn main() -> u64 {
 
 ```text
 count.bastio:6:13: error[E-VERIFY-OVERFLOW]: could not prove that `n + 1` does not overflow u64
-  |       n = n + 1;
-  |             ^
-  = counterexample: len(b) = 21239, i = 21238, n = 18446744073709551615
+ 6 |       n = n + 1;
+   |             ^
+   = counterexample: len(b) = 39, i = 38, n = 18446744073709551615
 ```
 
 `n` counts at most one per element, so it cannot overflow; why can't the compiler see that? Because it does not run the loop. It looks at one iteration, starting from *any* state the loop could be in, and in "any state" `n` can be as large as it likes. You describe the states the loop can actually be in with an **invariant**, a condition that holds every time the loop is about to test its condition:
@@ -301,9 +301,9 @@ fn main() -> u64 {
 
 ```text
 nonzero.bastio:19:24: error[E-VERIFY-UNDERFLOW]: could not prove that `len(b) - zeros` does not go below zero
-  |   let nonzero = len(b) - zeros;
-  |                        ^
-  = counterexample: len(b) = 5, zeros = 6
+ 19 |   let nonzero = len(b) - zeros;
+    |                        ^
+    = counterexample: len(b) = 5, zeros = 6
 ```
 
 The compiler checks each function **on its own**. When `main` calls `count_zeros`, it does not look inside; it only knows what the function promises, and so far it promises nothing beyond returning a `u64`, which could be 6. The promise goes in an `ensures` clause, a **postcondition**, where `result` names the value returned:
@@ -478,9 +478,9 @@ export fn line_len(b: &Bytes, start: u64) -> Line
 ```text
 $ bastioc0 lines.bastio
 lines.bastio:4:18: error[E-EXPORT]: `line_len` is exported, so it cannot have a precondition
-  |   requires start <= blen(b)
-  |                  ^
-  = a C caller cannot be proved to meet it; check the condition in the function and return an error instead
+ 4 |   requires start <= blen(b)
+   |                  ^
+   = a C caller cannot be proved to meet it; check the condition in the function and return an error instead
 ```
 
 Inside Bastio, a `requires` is checked at every call. A C caller is not checked, so the compiler will not take its word for it. The function has to check `start` itself, and the check becomes ordinary code that is proved like the rest. Here is the whole library:
