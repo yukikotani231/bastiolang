@@ -960,6 +960,12 @@ impl<'a> Ctx<'a> {
                         t => Err(Diag::new("E-TYPE", args[0].pos, format!("`unbox` needs a box, found {}", t.name()))),
                     };
                 }
+                // The verifier assumes `main` starts with every resource
+                // (a full pool, the only Serial): a second, nested run of it
+                // would hand the same pages to two owners.
+                if name == "main" {
+                    return Err(Diag::new("E-TYPE", e.pos, "`main` cannot be called"));
+                }
                 let sig = self.sigs.get(name).cloned().ok_or_else(|| Diag::new("E-TYPE", e.pos, format!("unknown function `{}`", name)))?;
                 if !available(name, self.target) {
                     return Err(Diag::new("E-TARGET", e.pos, format!("`{}` is not available on this target", name)));

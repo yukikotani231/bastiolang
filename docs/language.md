@@ -108,6 +108,8 @@ const NAME: u64 = <constant expression>;
 
 A function with no `-> R` returns nothing. Parameters and `let` bindings are immutable unless declared `mut`.
 
+Every program has a `main`, where it starts. `main` cannot be called (`E-TYPE`): the proof assumes it starts holding every resource the target hands it, such as the whole page pool, so a nested run would give the same pages to two owners.
+
 **Constants** have type `u64`. The expression is folded at compile time and may use literals, other constants and arithmetic.
 
 **Several files.** A file may begin with `import "path";` lines, before any definition. The path is relative to the importing file. Each imported file is loaded, with its own imports, before the rest of the importing file is read, so its constants can be used there. A file imported more than once is loaded once. Files that import each other, or an import that cannot be read, are `E-IMPORT`. Files named together on the command line also form one program, in command-line order.
@@ -335,7 +337,7 @@ fn main() -> u64 {
 }
 ```
 
-Call arguments, and the fields of a struct literal, are evaluated in an unspecified order.
+Call arguments, the operands of an operator and the fields of a struct literal are evaluated left to right, and the proof assumes that order. (One exception: a linear value passed by name or lent as `&mut` is read after the other arguments have run, so `f(b, g(&mut b))` passes `b` as `g` left it.) C leaves this order unspecified, so when an operand has a side effect the generated C evaluates each operand into a temporary first; without side effects it emits the expression as written.
 
 ## Structs
 
@@ -947,7 +949,6 @@ What a program that `bastioc0` accepts is guaranteed: no out-of-bounds access, n
 - **Stack depth.** Deep recursion can overflow the stack.
 - **Page contents.** The proof tracks who owns each page, not what is in it.
 - **The trusted base.** Z3, the stage0 compiler (Rust) and the C compiler are trusted, as is the hand-written C prelude each target links in (in `stage0/src/codegen.rs`), and the platform's boot and trap entry code. `bastioc0 --trusted-base` lists every prelude part with its size, the parts each target links, and every builtin; the listing is checked into `tests/trusted_base.txt` and `tests/run.sh` fails when it changes, so growth is reviewed (ROADMAP invariant 3). The small per-type helpers the compiler generates for `Box` and `Vec` are part of the compiler, not of this listing.
-- **Evaluation order.** C leaves the order of call arguments unspecified. Linearity keeps side effects on distinct values, so safety is unaffected, but output order is not guaranteed when two calls in one expression both do I/O.
 - **Child processes and files.** What another program writes, or what a file contains, is unknown to the proof, beyond each byte being `<= 255`.
 
 `tests/run.sh` also runs every program in `tests/pass/` under AddressSanitizer and UBSan, to confirm that the proofs match what happens at run time. Those checks exist only in the test build, never in generated code.

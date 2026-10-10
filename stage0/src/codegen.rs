@@ -992,8 +992,10 @@ impl<'a> Gen<'a> {
             }
             ExprKind::Field(..) => self.place(&place(e).expect("checked: a place")),
             ExprKind::StructLit(n, fs) => {
-                let inits: Vec<String> = fs.iter().map(|(f, x)| format!(".{} = {}", f, self.expr(x))).collect();
-                format!("((bst_s_{}){{ {} }})", cid(n), inits.join(", "))
+                let xs: Vec<&Expr> = fs.iter().map(|(_, x)| x).collect();
+                let (pre, vals) = self.operands(&xs, false);
+                let inits: Vec<String> = fs.iter().zip(vals).map(|((f, _), v)| format!(".{} = {}", f, v)).collect();
+                seq(pre, format!("((bst_s_{}){{ {} }})", cid(n), inits.join(", ")))
             }
             ExprKind::Variant(n, v, payload) => match payload {
                 Some(x) => format!("((bst_e_{}){{ .tag = {}, .u.{} = {} }})", cid(n), enum_def(n).unwrap().index(v).unwrap(), v, self.expr(x)),
@@ -1004,19 +1006,24 @@ impl<'a> Gen<'a> {
                 format!("({}.tag == {})", self.expr(x), enum_def(&n).unwrap().index(v).unwrap())
             }
             ExprKind::Not(x) => format!("(!{})", self.expr(x)),
-            ExprKind::Bin(op, a, b) => format!("({} {} {})", self.expr(a), op.text(), self.expr(b)),
+            // && and || are sequenced in C already (and must stay short-circuit).
+            ExprKind::Bin(op, a, b) if matches!(op, BinOp::And | BinOp::Or) => format!("({} {} {})", self.expr(a), op.text(), self.expr(b)),
+            ExprKind::Bin(op, a, b) => {
+                let (pre, v) = self.operands(&[a, b], false);
+                seq(pre, format!("({} {} {})", v[0], op.text(), v[1]))
+            }
             ExprKind::Forall(..) => unreachable!("specification only"),
             ExprKind::Call(name, args) if crate::check::VEC_BUILTINS.contains(&name.as_str()) => {
                 let el = self.vec_elem(&args[0]);
                 if !self.vecs.contains(&el) {
                     self.vecs.push(el.clone());
                 }
-                let a: Vec<String> = args.iter().map(|x| self.expr(x)).collect();
-                if name == "vec_len" {
+                let (pre, a) = self.operands(&args.iter().collect::<Vec<_>>(), true);
+                seq(pre, if name == "vec_len" {
                     format!("{}.len", a[0])
                 } else {
                     format!("bst_{}_{}({})", name, box_helper(&el), a.join(", "))
-                }
+                })
             }
             ExprKind::Call(name, args) if name == "box" || name == "unbox" => {
                 let t = self.type_of(&args[0]);
@@ -1037,8 +1044,8 @@ impl<'a> Gen<'a> {
                 format!("({{ {c} *{p} = ({c} *)bst_box_alloc(sizeof({c})); *{p} = {}; {p}; }})", self.expr(&args[0]))
             }
             ExprKind::Call(name, args) => {
-                let a: Vec<String> = args.iter().map(|x| self.expr(x)).collect();
-                match name.as_str() {
+                let (pre, a) = self.operands(&args.iter().collect::<Vec<_>>(), true);
+                seq(pre, match name.as_str() {
                     "len" => format!("{}.len", a[0]),
                     "get" => format!("{}.data[{}]", a[0], a[1]),
                     "slen" => format!("{}.len", a[0]),
@@ -1047,9 +1054,67 @@ impl<'a> Gen<'a> {
                     "bget" => format!("((uint64_t){}.data[{}])", a[0], a[1]),
                     n if crate::check::is_builtin(n) => format!("bst_{}({})", name, a.join(", ")),
                     _ => format!("f_{}({})", cid(name), a.join(", ")),
-                }
+                })
             }
         }
+    }
+
+    /// Emits the operands of a call, binary operator or struct literal so
+    /// they run in the order the verifier assumes. C leaves that order
+    /// unspecified, so when any operand has a side effect, each one is
+    /// evaluated into a temporary first (the returned prefix). For a call
+    /// (`call`), the verifier reads scalars and computed values left to
+    /// right, then the linear places and `&mut` borrows (plain reads with no
+    /// effect), so those stay inline and are read after every temporary.
+    /// Without side effects the order cannot matter and nothing changes.
+    fn operands(&mut self, xs: &[&Expr], call: bool) -> (String, Vec<String>) {
+        let late = |cg: &Self, x: &Expr| {
+            call && match &x.kind {
+                ExprKind::MutBorrow(_) => true,
+                ExprKind::Var(_) | ExprKind::Field(..) => !matches!(cg.type_of(x).base(), Type::U64 | Type::Bool | Type::Str),
+                _ => false,
+            }
+        };
+        if !xs.iter().any(|x| has_effect(x)) {
+            return (String::new(), xs.iter().map(|x| self.expr(x)).collect());
+        }
+        let mut pre = String::new();
+        let mut vals = vec![String::new(); xs.len()];
+        for (i, x) in xs.iter().enumerate() {
+            if !late(self, x) {
+                let t = format!("o_{}", self.tmps);
+                self.tmps += 1;
+                pre.push_str(&format!("__auto_type {} = {}; ", t, self.expr(x)));
+                vals[i] = t;
+            }
+        }
+        for (i, x) in xs.iter().enumerate() {
+            if late(self, x) {
+                vals[i] = self.expr(x);
+            }
+        }
+        (pre, vals)
+    }
+}
+
+/// `e` after the statements in `pre`, as one C expression (a GNU statement
+/// expression when there are any).
+fn seq(pre: String, e: String) -> String {
+    if pre.is_empty() { e } else { format!("({{ {}{}; }})", pre, e) }
+}
+
+/// Whether evaluating `e` may have a side effect: any call other than the
+/// read-only accessors.
+fn has_effect(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Call(n, args) => {
+            !matches!(n.as_str(), "len" | "get" | "slen" | "sget" | "blen" | "bget" | "vec_len") || args.iter().any(has_effect)
+        }
+        ExprKind::StructLit(_, fs) => fs.iter().any(|(_, x)| has_effect(x)),
+        ExprKind::Variant(_, _, p) => p.as_deref().map_or(false, has_effect),
+        ExprKind::Is(x, ..) | ExprKind::Not(x) => has_effect(x),
+        ExprKind::Bin(_, a, b) => has_effect(a) || has_effect(b),
+        _ => false,
     }
 }
 
