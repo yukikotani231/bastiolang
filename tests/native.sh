@@ -19,6 +19,7 @@ if [ "${1:-}" = --stage1 ]; then
   {
     echo '#!/usr/bin/env bash'
     echo "b='$BASTIOC'"
+    echo 'case " $* " in *" --"*) exec "$b" "$@" ;; esac  # a dump or --emit-c'
     echo 'for a in "$@"; do'
     echo '  if [ "$a" = -o ]; then'
     echo '    "$b" --backend native "$@"; s=$?'
