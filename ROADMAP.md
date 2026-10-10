@@ -70,6 +70,15 @@ Started early, alongside v1, because the kernel is the primary target and it sha
 - [ ] Allocation failure returned in the type (no abort on OOM). Enums exist now (v1 item 3); what is left is changing `alloc`, `pool_take` and friends to return them
 - [ ] Native x86-64 backend, without going through C (removes the C compiler from the trusted base)
 
+## v4: Linux compatibility
+
+Decided 2026-10-10: BastiOS should run existing Linux programs, not only programs written in Bastio. The way in is a Linux system-call compatibility layer.
+- [ ] Load static x86-64 Linux ELF binaries into a user address space
+- [ ] Accept the Linux system-call ABI (`syscall` instruction, Linux numbers and argument registers) next to the native one
+- [ ] Translate the common calls (`read`, `write`, `open`, `close`, `mmap`, `brk`, `exit`, `fork`/`execve`, ...) onto BastiOS services, growing until a static busybox shell runs
+
+The layer is written in Bastio, so it is held to the same memory-safety proofs as the rest of the kernel. This is the opposite of fz, where the compatibility layer was assembly kept outside verification. User programs themselves are not trusted; page tables isolate them, so a misbehaving Linux binary can only fault itself. Only the small entry stub (saving registers on `syscall`) belongs to the trusted assembly base.
+
 ## Open design questions
 
 - How to express concurrency in types: multiple cores, locks, sharing with interrupt handlers.
