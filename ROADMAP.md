@@ -108,6 +108,7 @@ Safety must not cost speed at run time; that is the point of proving it instead 
 - [ ] BastiOS: `user_byte` walks all four page-table levels for every byte it copies, and the kernel allocator scans its free list linearly and zeroes every page; measure, then batch per page
 - [x] `bench/`, starting from the programs of the first measurement (sum, sieve, tree, vec, each with its C twin), with a script that prints one line per measurement (generated-code time vs C, compile and proof time per file): `bench/run.sh`
 - [x] CI runs it and keeps the numbers as an artifact (`bench-<sha>`), so a regression shows up next to the change that caused it
+- [x] One solver scope per function (2026-10-10): the verifier used to keep every function's declarations and assumptions in one Z3 context, so each function's queries also carried the quantified facts of all earlier ones. Popping them after each function took the BastiOS kernel from 4.5 s to 1.6 s and `stage1/checkdump.bastio` from 9.3 s to 2.3 s. `BASTIO_TIME=1` prints the proof time of each function
 - [ ] stage1 data structures: the phases written so far use linear searches (types, instances, places, variables). Fine for today's sources (checking all of stage1, about 6,000 lines, takes 47 ms, the same as stage0); replace with hashing or indexed lookups before self-compilation if measurements show they dominate
 - [ ] BastiOS: a `bench` shell command (or test mode) that times the kernel paths above in QEMU (relative numbers only; QEMU timing is not hardware timing)
 

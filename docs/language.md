@@ -794,8 +794,10 @@ fn main(pool: &mut Pool) -> u64 {
 | --- | --- | --- |
 | `mmu_switch(m: &mut Mmu, t: &PageTable)` | level 4 | Loads `t` into CR3; `mmu_root(m)` becomes `pt_id(t)` |
 | `mmu_kernel(m: &mut Mmu)` | | Loads the kernel's own map |
-| `cpu_get(c: &Cpu, r: u64) -> u64` | `r < 20` | Saved user register `r`: rax rbx rcx rdx rsi rdi rbp r8-r15 (0-14), rip (15), rsp (16), rflags (17), error code (18), fault address (19) |
-| `cpu_set(c: &mut Cpu, r: u64, v: u64)` | `r < 18` | Sets a saved register. Whatever is stored, user mode is entered in ring 3 with the user segments, IOPL 0 and interrupts on |
+| `cpu_get(c: &Cpu, r: u64) -> u64` | `r < 21` | Saved user register `r`: rax rbx rcx rdx rsi rdi rbp r8-r15 (0-14), rip (15), rsp (16), rflags (17), error code (18), fault address (19), FS base (20) |
+| `cpu_set(c: &mut Cpu, r: u64, v: u64)` | `r < 18` or `r == 20` | Sets a saved register or the FS base (the error code and fault address are only reported by a trap). Whatever is stored, user mode is entered in ring 3 with the user segments, IOPL 0 and interrupts on; the platform replaces a non-canonical address with 0 |
+| `cpu_fpu_save(c: &mut Cpu, f: &mut Frame)` | | Saves the user's x87/SSE registers into the page (`fxsave64`) |
+| `cpu_fpu_load(c: &mut Cpu, f: &Frame)` | | Loads them from the page (`fxrstor64`); reserved MXCSR bits are cleared first, so any contents are safe to load. A kernel that runs several user contexts keeps one page per context and swaps them around `cpu_run` |
 | `cpu_run(c: &mut Cpu, m: &Mmu) -> u64` | | Runs the saved context in user mode until the next trap; returns its vector (`<= 255`) |
 | `cpu_idle(c: &mut Cpu) -> u64` | | Waits for an interrupt; returns its vector |
 
@@ -909,10 +911,13 @@ fn main() -> u64 {
 
 After the type and linearity checks, the compiler executes each function symbolically. At every point where the program could go wrong it asks Z3 whether the bad case is reachable, and if it is, it rejects the program and shows a counterexample (values of the variables that lead there).
 
-- **Modular.** A call uses only the callee's `requires` and `ensures`, never its body.
+- **Modular.** A call uses the callee's `requires` and `ensures`, and a summary of which parts of each `&mut` argument the callee may change (below), never the rest of its body.
 - **Loops** are cut with their invariants. After a loop, the variables the body assigns are known only through the invariants and the negated condition.
 - **Branches** are followed separately; the condition of an `if` or the variant of a `match` arm is known inside it. So a test the code already makes, as in `if i < len(b) { get(b, i) }`, is enough for the proof.
-- **Annotation inference.** A buffer that a loop body only ever updates as `x = set(x, ..)` keeps its length across the loop, so `invariant len(x) == ...` is not needed.
+- **Annotation inference.** What a loop body or a callee provably leaves alone keeps what is known about it, so it need not be restated in an `invariant` or `ensures`:
+  - A buffer only ever updated as `x = set(x, ..)` keeps its length, and a vector changed only by `vec_set` and `vec_swap` its length. A capability changed only by builtins that cannot change them keeps its identity: a `Frame` its id, a `PageTable` its id and level, a `Pool` its size.
+  - For each `&mut` parameter, the compiler works out from the function's body which places under it the function may change, and how: by assigning them, or only through the shape-keeping updates above. Lending a place to another function counts as that function's summary applied to it, so this goes through any depth of calls, and through recursion. At a call, and in a loop that makes the call, every other part of the argument (scalar fields, enum tags, lengths, capability ids) keeps its value. So a driver function that takes `&mut Dev` and only ever uses `d.page` through builtins needs no `ensures` restating `frame_id(d.page)`, and the loops of its callers no `invariant` either.
+  - The contents of buffers and vectors, and capability state such as which slots of a page table are used, are still forgotten when changed: say what is kept of them in `ensures` or `invariant`.
 - **Boxes and vectors.** The prover unfolds unknown recursive data two levels deep, and tracks vector contents element by element (see [Boxes](#boxes) and [Vectors](#vectors)).
 
 What is proved, by error code, is listed in the next section.
