@@ -3,7 +3,7 @@
 
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Pos {
     /// Index into the list of input files.
     pub file: usize,
