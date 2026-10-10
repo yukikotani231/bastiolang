@@ -278,7 +278,7 @@ fn entry(p: &Program, target: Target) -> String {
         // COM1 is set up only for a kernel that uses `Serial`; one that drives
         // the UART itself through `Ports` gets it untouched.
         Target::Kernel => format!(
-            "void bst_kmain(uint64_t mbi) {{\n    (void)mbi;\n{}{}    (void){};\n}}\n",
+            "void bst_kmain(uint64_t mbi) {{\n    bst_mbi = mbi;\n{}{}    (void){};\n}}\n",
             if legacy || main.params.iter().any(|p| *p.ty.base() == Type::Serial) { "    bst_serial_init();\n" } else { "" },
             setup,
             call
@@ -569,6 +569,7 @@ static void bst_print(uint64_t v) {
 extern char _end[];
 extern uint64_t bst_kernel_pml4[512];
 static uint64_t bst_pool_base;
+static uint64_t bst_mbi;
 static bst_pool bst_pool_init(uint64_t mbi) {
     uint32_t *info = (uint32_t *)mbi;
     uint64_t base = ((uint64_t)_end + 4095) & ~4095ull;
@@ -748,7 +749,7 @@ static inline uint64_t bst_port_count(bst_portio io) { return io.count; }
 "#;
 
 // Memory-mapped registers: like ports, claiming is proof-only. The kernel
-// platform maps the device window (0xC000_0000 to 4 GiB) uncached at its
+// platform maps the device window (0x8000_0000 to 4 GiB) uncached at its
 // physical address, so an access is one volatile load or store there.
 const PRELUDE_MMIO: &str = r#"
 static inline bst_mmio bst_mmio_claim(bst_mmiospace *s, uint64_t b, uint64_t l) { (void)s; bst_mmio m = { b, l }; return m; }
@@ -850,6 +851,24 @@ extern void bst_platform_smp_start(void (*fn)(void *), void *arg); /* run fn(arg
 extern void bst_platform_smp_join(void);                           /* wait until all of them have returned */
 extern uint64_t bst_platform_cpus(void); /* processors running, this one included; 1 to 4096 */
 static inline uint64_t bst_cpu_count(bst_cpu c) { (void)c; return bst_platform_cpus(); }
+/* The Multiboot information the loader passed (0: none), and field f of the
+ * linear framebuffer it set up, if that is 32-bit RGB and lies below 4 GiB:
+ * 0 its address, 1 bytes per line, 2 width and 3 height in pixels, 4 the
+ * bit positions of red, green and blue, a byte each. All 0 without one. */
+static uint64_t bst_boot_fb(bst_cpu c, uint64_t f) {
+    (void)c;
+    uint8_t *mb = (uint8_t *)bst_mbi;
+    if (!mb || !(*(uint32_t *)mb & (1u << 12)) || mb[109] != 1 || mb[108] != 32) return 0;
+    uint64_t addr = *(uint64_t *)(mb + 88), pitch = *(uint32_t *)(mb + 96);
+    uint64_t w = *(uint32_t *)(mb + 100), h = *(uint32_t *)(mb + 104);
+    if (addr == 0 || pitch < w * 4 || addr + pitch * h > (1ull << 32)) return 0;
+    if (f == 0) return addr;
+    if (f == 1) return pitch;
+    if (f == 2) return w;
+    if (f == 3) return h;
+    if (f == 4) return mb[110] | (uint64_t)mb[112] << 8 | (uint64_t)mb[114] << 16;
+    return 0;
+}
 
 /* Called by the platform on a fault in kernel mode: that is a bug in the
  * trusted base or the compiler, never in verified code. */
