@@ -50,7 +50,7 @@
 // loops in their invariants.
 
 use crate::ast::*;
-use crate::check::is_builtin;
+use crate::check::{is_builtin, spec_place};
 use crate::diag::{Diag, Pos};
 use crate::smt::{SatResult, Solver};
 use std::collections::{HashMap, HashSet};
@@ -490,6 +490,30 @@ fn and_all(ts: &[String]) -> String {
         0 => "true".into(),
         1 => ts[0].clone(),
         _ => format!("(and {})", ts.join(" ")),
+    }
+}
+
+/// Two values of one struct or enum type (made of numbers) are equal: every
+/// field is, and for an enum the tags are and so is the payload the tag
+/// names.
+fn eq_term(a: &Val, b: &Val) -> String {
+    match (unbox_known(a), unbox_known(b)) {
+        (Val::U(x), Val::U(y)) | (Val::B(x), Val::B(y)) => format!("(= {} {})", x, y),
+        (Val::Struct(_, xs), Val::Struct(_, ys)) => {
+            let ts: Vec<String> = xs.iter().zip(ys).map(|(x, y)| eq_term(x, y)).filter(|t| t != "true").collect();
+            and_all(&ts)
+        }
+        (Val::Enum(_, tx, xs), Val::Enum(_, ty, ys)) => {
+            let mut ts = vec![format!("(= {} {})", tx, ty)];
+            for (k, (x, y)) in xs.iter().zip(ys).enumerate() {
+                let t = eq_term(x, y);
+                if t != "true" {
+                    ts.push(format!("(=> (= {} {}) {})", tx, k, t));
+                }
+            }
+            and_all(&ts)
+        }
+        _ => "true".into(),
     }
 }
 
@@ -2297,6 +2321,20 @@ impl<'p> Verifier<'p> {
             ExprKind::Not(x) => format!("(not {})", self.spec(x, sc, bound)?),
             ExprKind::Neg(x) => format!("(- {})", self.spec(x, sc, bound)?),
             ExprKind::Bin(op, a, b) => {
+                // `==` on a value that names a struct or enum compares it
+                // part by part (the checker allows it only between such
+                // values); on a number it is the same `(= a b)` as below.
+                if matches!(op, BinOp::Eq | BinOp::Ne) && spec_place(a) {
+                    let va = self.spec_val(a, sc, bound)?;
+                    let eq = match va {
+                        Val::U(_) | Val::B(_) => format!("(= {} {})", va.term(), self.spec(b, sc, bound)?),
+                        _ => {
+                            let vb = self.spec_val(b, sc, bound)?;
+                            eq_term(&va, &vb)
+                        }
+                    };
+                    return Ok(if *op == BinOp::Ne { format!("(not {})", eq) } else { eq });
+                }
                 let ta = self.spec(a, sc, bound)?;
                 let tb = self.spec(b, sc, bound)?;
                 let f = match op {

@@ -1179,6 +1179,7 @@ Expressions in `requires`, `ensures`, `invariant` and `assert` (and the bodies o
 - They may call `len`, `get`, `slen`, `sget`, `blen`, `bget`, `vlen`, `vget`, `vcount`, the ghost accessors of the capabilities, and `spec fn`s.
 - `vcount(v, x)` is the number of elements of `v` equal to `x`, for a vector of integers. It states what `forall` cannot: that a vector is a permutation of another, or that a counter counts something.
 - They may use `is` and enum payloads (`o.Some`), and see through boxes.
+- `==` and `!=` also compare structs and enums made of integers and booleans (no buffers, boxes or vectors inside): field by field, and for an enum the variant and then that variant's payload. Both sides must name a value (a variable, a field, `vget(..)` or `old(..)`), since specifications cannot build one. Ordinary code still compares only integers and `bool`.
 - They may mention values that have already been consumed. In `ensures`, a by-value parameter means its value on entry, a `&mut` parameter the value handed back, and `old(x)` its value at the call. `result` is the returned value. `old(x)` is also allowed in loop invariants, for parameters only.
 - They cannot build enum values or call ordinary functions.
 
