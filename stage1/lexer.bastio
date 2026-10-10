@@ -13,7 +13,15 @@ const K_STR: u64 = 2;          // the text between the quotes, escapes not yet d
 const K_IDENT: u64 = 3;
 const K_KEYWORD: u64 = 4;      // `val` is its code (KW_*)
 const K_PUNCT: u64 = 5;        // `val` is its code (P_*)
-const K_ERROR: u64 = 6;        // a lexical error at `line`:`col`
+const K_ERROR: u64 = 6;        // a lexical error at `line`:`col`, of kind `val` (LE_*),
+                               // in the token starting at byte `start`
+
+// Lexical errors.
+const LE_UNTERMINATED: u64 = 1;  // a string literal
+const LE_ESCAPE: u64 = 2;        // an unknown escape; `end` is the byte after the backslash
+const LE_HEX: u64 = 3;           // a hex literal out of range (or without digits)
+const LE_INT: u64 = 4;           // a decimal literal out of range
+const LE_CHAR: u64 = 5;          // a character that starts no token
 
 // Sources are at most 2^40 bytes, so positions and counts never overflow.
 const SRC_MAX: u64 = 1099511627776;
@@ -219,8 +227,8 @@ fn punct_len(code: u64) -> u64
   return 1;
 }
 
-fn err(line: u64, col: u64) -> Tok {
-  return Tok { kind: K_ERROR, start: 0, end: 0, line: line, col: col, val: 0 };
+fn err(line: u64, col: u64, kind: u64, start: u64, end: u64) -> Tok {
+  return Tok { kind: K_ERROR, start: start, end: end, line: line, col: col, val: kind };
 }
 
 /// Appends the tokens of `src` from byte `from` on to `out`, ending with an
@@ -266,7 +274,7 @@ fn lex(src: &Bytes, from: u64, out: &mut Vec[Tok]) -> Tok
         invariant i <= n && 1 <= col && col <= i + 1 && line <= i + 1 && start <= i
       {
         if i >= n || bget(src, i) == 10 {
-          return err(tl, tc);                    // unterminated
+          return err(tl, tc, LE_UNTERMINATED, start - 1, i);
         }
         let ch = bget(src, i);
         if ch == 34 {
@@ -275,7 +283,7 @@ fn lex(src: &Bytes, from: u64, out: &mut Vec[Tok]) -> Tok
         } else if ch == 92 {
           let e = at(src, i + 1);
           if !(e == 110 || e == 114 || e == 116 || e == 48 || e == 92 || e == 34) {
-            return err(tl, tc);                  // unknown escape
+            return err(tl, tc, LE_ESCAPE, start - 1, i + 1);
           }
           i = i + 1;
           col = col + 1;
@@ -316,7 +324,10 @@ fn lex(src: &Bytes, from: u64, out: &mut Vec[Tok]) -> Tok
         }
       }
       if !ok {
-        return err(tl, tc);
+        if c == 48 && (at(src, start + 1) == 120 || at(src, start + 1) == 88) {
+          return err(tl, tc, LE_HEX, start, i);
+        }
+        return err(tl, tc, LE_INT, start, i);
       }
       vec_push(&mut out, Tok { kind: K_INT, start: start, end: i, line: tl, col: tc, val: v });
       col = col + (i - start);
@@ -336,7 +347,7 @@ fn lex(src: &Bytes, from: u64, out: &mut Vec[Tok]) -> Tok
       let code = punct(src, i);
       let k = punct_len(code);
       if k == 0 || i + k > n {
-        return err(tl, tc);
+        return err(tl, tc, LE_CHAR, i, i);
       }
       vec_push(&mut out, Tok { kind: K_PUNCT, start: i, end: i + k, line: tl, col: tc, val: code });
       i = i + k;
@@ -346,4 +357,116 @@ fn lex(src: &Bytes, from: u64, out: &mut Vec[Tok]) -> Tok
   let eof = Tok { kind: K_EOF, start: n, end: n, line: line, col: col, val: 0 };
   vec_push(&mut out, eof);
   return eof;
+}
+
+// ---- Messages ----
+
+fn lm_push(out: &mut Vec[u64], src: &Bytes, i: u64) {
+  vec_push(&mut out, at(src, i));
+}
+
+fn lm_s(out: &mut Vec[u64], s: Str) {
+  let mut k = 0;
+  while k < slen(s) {
+    vec_push(&mut out, cast[u64](sget(s, k)));
+    k = k + 1;
+  }
+}
+
+/// The length of the UTF-8 character whose first byte is `c`.
+fn lm_charlen(c: u64) -> u64
+  ensures result <= 4
+{
+  if c >= 240 { return 4; }
+  if c >= 224 { return 3; }
+  if c >= 192 { return 2; }
+  return 1;
+}
+
+/// Appends the character at byte `i` of `src`.
+fn lm_char(out: &mut Vec[u64], src: &Bytes, i: u64) {
+  let n = lm_charlen(at(src, i));
+  let mut k = 0;
+  while k < n && i < SRC_MAX {
+    lm_push(&mut out, src, i + k);
+    k = k + 1;
+  }
+}
+
+/// Appends the digits of `src[s..e]` without the `_` separators.
+fn lm_digits(out: &mut Vec[u64], src: &Bytes, s: u64, e: u64) {
+  let mut k = s;
+  while k < e {
+    if at(src, k) != 95 {
+      lm_push(&mut out, src, k);
+    }
+    k = k + 1;
+  }
+}
+
+/// Is the decimal literal `src[s..e]` above 2^128 - 1 (too large for
+/// stage0 to parse at all, rather than out of the u64 range)?
+fn lm_huge(src: &Bytes, s: u64, e: u64) -> bool {
+  let max = "340282366920938463463374607431768211455";
+  let mut k = s;
+  while k < e && (at(src, k) == 48 || at(src, k) == 95) {
+    k = k + 1;
+  }
+  let mut n = 0;
+  let mut j = k;
+  while j < e && n < 100 {
+    if at(src, j) != 95 {
+      n = n + 1;
+    }
+    j = j + 1;
+  }
+  if n != slen(max) {
+    return n > slen(max);
+  }
+  let mut d = 0;
+  while k < e && d < slen(max) {
+    let c = at(src, k);
+    if c != 95 {
+      let m = cast[u64](sget(max, d));
+      if c != m {
+        return c > m;
+      }
+      d = d + 1;
+    }
+    k = k + 1;
+  }
+  return false;
+}
+
+/// What the lexical error `t` (a K_ERROR token) is, as bastioc0 says it.
+fn lex_msg(src: &Bytes, t: Tok, out: &mut Vec[u64]) {
+  if t.val == LE_UNTERMINATED {
+    lm_s(&mut out, "unterminated string literal");
+  } else if t.val == LE_ESCAPE {
+    lm_s(&mut out, "unknown escape `\\");
+    if t.end < blen(src) {
+      lm_char(&mut out, src, t.end);
+    } else {
+      lm_s(&mut out, " ");
+    }
+    lm_s(&mut out, "` in string literal");
+  } else if t.val == LE_HEX {
+    lm_s(&mut out, "hex literal `0x");
+    if t.start < SRC_MAX {
+      lm_digits(&mut out, src, t.start + 2, t.end);
+    }
+    lm_s(&mut out, "` does not fit in u64");
+  } else if t.val == LE_INT {
+    lm_s(&mut out, "integer literal `");
+    lm_digits(&mut out, src, t.start, t.end);
+    if lm_huge(src, t.start, t.end) {
+      lm_s(&mut out, "` is too large");
+    } else {
+      lm_s(&mut out, "` does not fit in u64");
+    }
+  } else if t.val == LE_CHAR {
+    lm_s(&mut out, "unexpected character `");
+    lm_char(&mut out, src, t.start);
+    lm_s(&mut out, "`");
+  }
 }

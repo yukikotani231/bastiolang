@@ -77,7 +77,9 @@ struct Mono {
   failed: bool,
   efile: u64,
   eline: u64,
-  ecol: u64
+  ecol: u64,
+  /// What is wrong, as bastioc0 says it (the sentence after the code).
+  emsg: Vec[u64]
 }
 
 fn mono_new() -> Mono {
@@ -88,7 +90,7 @@ fn mono_new() -> Mono {
   return Mono {
     tys: tys, insts: insts, targs: vec_new[u64](), queue: vec_new[u64](),
     structs: vec_new[u64](), enums: vec_new[u64](), fns: vec_new[u64](), lets: vec_new[LetTy](),
-    failed: false, efile: 0, eline: 0, ecol: 0
+    failed: false, efile: 0, eline: 0, ecol: 0, emsg: vec_new[u64]()
   };
 }
 
@@ -101,6 +103,7 @@ fn mono_free(m: Mono) {
   vec_free(m.enums);
   vec_free(m.fns);
   vec_free(m.lets);
+  vec_free(m.emsg);
 }
 
 /// Records an error (E-TYPE) at node `loc`, unless one is recorded already.
@@ -111,6 +114,82 @@ fn mfail(m: &mut Mono, p: &Parser, loc: u64) {
     m.efile = n.file;
     m.eline = n.line;
     m.ecol = n.col;
+  }
+}
+
+// ---- Messages: what is wrong, as bastioc0 says it ----
+
+fn mm_s(m: &mut Mono, s: Str) {
+  let mut k = 0;
+  while k < slen(s) {
+    vec_push(&mut m.emsg, cast[u64](sget(s, k)));
+    k = k + 1;
+  }
+}
+
+/// The source text of node `i` (a name).
+fn mm_name(m: &mut Mono, p: &Parser, i: u64) {
+  let n = node_at(p.nodes, i);
+  let mut k = n.s;
+  while k < n.e && k < blen(p.src) {
+    vec_push(&mut m.emsg, cast[u64](bget(p.src, k)));
+    k = k + 1;
+  }
+}
+
+fn mm_num(m: &mut Mono, v: u64) {
+  let mut d = vec_new[u64]();
+  let mut x = v;
+  vec_push(&mut d, 48 + x % 10);
+  x = x / 10;
+  while x > 0 {
+    vec_push(&mut d, 48 + x % 10);
+    x = x / 10;
+  }
+  while vec_len(d) > 0 {
+    let c = vec_pop(&mut d);
+    vec_push(&mut m.emsg, c);
+  }
+  vec_free(d);
+}
+
+/// Records an error at `loc` with the message `a NAME b`, NAME the text of
+/// node `name`, unless one is recorded already.
+fn mfail_named(m: &mut Mono, p: &Parser, loc: u64, a: Str, name: u64, b: Str) {
+  if !m.failed {
+    mfail(&mut m, p, loc);
+    mm_s(&mut m, a);
+    mm_name(&mut m, p, name);
+    mm_s(&mut m, b);
+  }
+}
+
+/// `NAME` is generic: write its type arguments, e.g. `NAME[u64]SUFFIX`
+fn mfail_generic(m: &mut Mono, p: &Parser, loc: u64, name: u64, suffix: Str) {
+  if !m.failed {
+    mfail(&mut m, p, loc);
+    mm_s(&mut m, "`");
+    mm_name(&mut m, p, name);
+    mm_s(&mut m, "` is generic: write its type arguments, e.g. `");
+    mm_name(&mut m, p, name);
+    mm_s(&mut m, "[u64]");
+    mm_s(&mut m, suffix);
+    mm_s(&mut m, "`");
+  }
+}
+
+/// WHAT `NAME` takes N type argument(s), G given
+fn mfail_arity(m: &mut Mono, p: &Parser, loc: u64, what: Str, name: u64, n: u64, g: u64) {
+  if !m.failed {
+    mfail(&mut m, p, loc);
+    mm_s(&mut m, what);
+    mm_s(&mut m, " `");
+    mm_name(&mut m, p, name);
+    mm_s(&mut m, "` takes ");
+    mm_num(&mut m, n);
+    mm_s(&mut m, " type argument(s), ");
+    mm_num(&mut m, g);
+    mm_s(&mut m, " given");
   }
 }
 
@@ -378,7 +457,7 @@ fn conv(m: &mut Mono, p: &Parser, t: u64, env: u64, loc: u64) -> u64 {
       return intern(&mut m, p, TY_UNKNOWN, t);
     }
     if is_generic(p, d) {
-      mfail(&mut m, p, loc);         // a generic type without its arguments
+      mfail_generic(&mut m, p, loc, t, "");
       return 0;
     }
     let x = plain_inst(&mut m, d);
@@ -435,12 +514,12 @@ fn generic_ty(m: &mut Mono, p: &Parser, name: u64, args: &Vec[u64], loc: u64) ->
   }
   let d = find_type(p, name);
   if !is_generic(p, d) {
-    mfail(&mut m, p, loc);           // not a generic struct or enum
+    mfail_named(&mut m, p, loc, "`", name, "` is not a generic struct or enum");
     return 0;
   }
   let dn = node_at(p.nodes, d);
   if list_len(p, dn.v) != vec_len(args) {
-    mfail(&mut m, p, loc);           // the wrong number of type arguments
+    mfail_arity(&mut m, p, loc, "type", name, list_len(p, dn.v), vec_len(args));
     return 0;
   }
   let x = instance(&mut m, d, args);
@@ -498,7 +577,14 @@ fn monomorphize(m: &mut Mono, p: &Parser) {
     let xi = inst_at(m, x);
     let d = xi.def;
     if j + 1 > MAX_INSTANCES {
-      mfail(&mut m, p, d);          // instantiating itself with growing arguments
+      if !m.failed {
+        mfail(&mut m, p, d);
+        mm_s(&mut m, "more than ");
+        mm_num(&mut m, MAX_INSTANCES);
+        mm_s(&mut m, " generic instances (is `");
+        mm_name(&mut m, p, d);
+        mm_s(&mut m, "` instantiating itself with growing arguments?)");
+      }
     } else {
       let kd = kind_of(p, d);
       if kd == D_STRUCT {
@@ -523,7 +609,7 @@ fn check_unique(m: &mut Mono, p: &Parser) {
   let mut in_enums = false;
   while k != 0 && !m.failed {
     if earlier_type(p, k, in_enums) {
-      mfail(&mut m, p, k);          // already defined
+      mfail_named(&mut m, p, k, "type `", k, "` is already defined");
     }
     k = next_of(p, k);
     if k == 0 && !in_enums {
@@ -535,14 +621,18 @@ fn check_unique(m: &mut Mono, p: &Parser) {
   while k != 0 && !m.failed {
     let e = find_fn(p, k);
     if e != k {
-      mfail(&mut m, p, k);          // defined twice
+      mfail_named(&mut m, p, k, "function `", k, "` is defined twice");
     }
     k = next_of(p, k);
   }
   k = p.fns.head;
   while k != 0 && !m.failed {
     if is_generic(p, k) && (name_is(p, k, "main") || is_export(p, k)) {
-      mfail(&mut m, p, k);          // `main` or an `export fn` cannot be generic
+      if name_is(p, k, "main") {
+        mfail_named(&mut m, p, k, "`main` cannot be generic", 0, "");
+      } else {
+        mfail_named(&mut m, p, k, "an `export fn` cannot be generic (C has no generics)", 0, "");
+      }
     }
     k = next_of(p, k);
   }
@@ -684,8 +774,21 @@ fn tapp_inst(m: &mut Mono, p: &Parser, e: u64, env: u64) -> u64 {
   if !m.failed {
     let d = tapp_def(p, n.b);
     let dn = node_at(p.nodes, d);
-    if d == 0 || list_len(p, dn.v) != vec_len(args) {
-      mfail(&mut m, p, e);          // not generic, or the wrong number of arguments
+    let k = kind_of(p, n.b);
+    if d == 0 {
+      if k == E_CALL {
+        mfail_named(&mut m, p, e, "`", n.b, "` is not a generic function");
+      } else if k == E_SLIT {
+        mfail_named(&mut m, p, e, "`", n.b, "` is not a generic struct");
+      } else {
+        mfail_named(&mut m, p, e, "`", n.b, "` is not a generic enum");
+      }
+    } else if list_len(p, dn.v) != vec_len(args) {
+      if k == E_CALL {
+        mfail_arity(&mut m, p, e, "function", n.b, list_len(p, dn.v), vec_len(args));
+      } else {
+        mfail_arity(&mut m, p, e, "type", n.b, list_len(p, dn.v), vec_len(args));
+      }
     } else {
       x = instance(&mut m, d, args);
     }
@@ -711,11 +814,11 @@ fn mono_expr(m: &mut Mono, p: &Parser, i: u64, env: u64) {
     return;
   }
   if n.kind == E_CALL && is_generic(p, find_fn(p, i)) {
-    mfail(&mut m, p, i);            // a generic function without type arguments
+    mfail_generic(&mut m, p, i, i, "(..)");
     return;
   }
   if (n.kind == E_SLIT || n.kind == E_VARIANT) && is_generic(p, find_type(p, i)) {
-    mfail(&mut m, p, i);            // a generic type without type arguments
+    mfail_generic(&mut m, p, i, i, "");
     return;
   }
   mono_children(&mut m, p, i, env);
