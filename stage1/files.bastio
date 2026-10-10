@@ -1,0 +1,150 @@
+// File and path helpers shared by the stage1 drivers: decoding a string
+// token, joining and splitting paths as Rust's `std::path` does, and
+// reading the files named by `include_bytes`.
+import "parser.bastio";
+
+/// The bytes of a string token's text, escapes decoded.
+fn decode(src: &Bytes, s: u64, e: u64) -> Bytes
+  requires s <= e && e <= blen(src)
+{
+  // First count, then fill.
+  let mut n = 0;
+  let mut i = s;
+  while i < e
+    invariant s <= i && i <= e && e <= blen(src) && n <= i - s
+  {
+    if bget(src, i) == 92 && i + 1 < e { i = i + 2; } else { i = i + 1; }
+    n = n + 1;
+  }
+  let mut out = balloc(n);
+  let mut k = 0;
+  i = s;
+  while i < e && k < n
+    invariant s <= i && i <= e && e <= blen(src) && k <= n && blen(out) == n
+  {
+    let c = bget(src, i);
+    if c == 92 && i + 1 < e {
+      let x = bget(src, i + 1);
+      if x == 110 { bset(&mut out, k, 10); }
+      else if x == 114 { bset(&mut out, k, 13); }
+      else if x == 116 { bset(&mut out, k, 9); }
+      else if x == 48 { bset(&mut out, k, 0); }
+      else { bset(&mut out, k, x); }
+      i = i + 2;
+    } else {
+      bset(&mut out, k, c);
+      i = i + 1;
+    }
+    k = k + 1;
+  }
+  return out;
+}
+
+/// `dir` joined with `path`, as Rust's `Path::join` does: an absolute
+/// `path` replaces `dir`.
+fn join(dir: &Bytes, path: &Bytes) -> Bytes {
+  let a = blen(dir);
+  let b = blen(path);
+  if a == 0 || (b > 0 && bget(path, 0) == 47) || a > SRC_MAX || b > SRC_MAX {
+    return copy_bytes(path);
+  }
+  let mut sep = 1;
+  if bget(dir, a - 1) == 47 {
+    sep = 0;
+  }
+  let mut out = balloc(a + sep + b);
+  let mut k = 0;
+  while k < a
+    invariant k <= a && blen(out) == a + sep + b && a == blen(dir)
+  {
+    bset(&mut out, k, bget(dir, k));
+    k = k + 1;
+  }
+  if sep == 1 {
+    bset(&mut out, a, 47);
+  }
+  k = 0;
+  while k < b
+    invariant k <= b && blen(out) == a + sep + b && b == blen(path)
+  {
+    bset(&mut out, a + sep + k, bget(path, k));
+    k = k + 1;
+  }
+  return out;
+}
+
+fn copy_bytes(b: &Bytes) -> Bytes {
+  let n = blen(b);
+  if n > SRC_MAX {
+    return balloc(0);
+  }
+  let mut out = balloc(n);
+  let mut k = 0;
+  while k < n
+    invariant k <= n && blen(out) == n && n == blen(b)
+  {
+    bset(&mut out, k, bget(b, k));
+    k = k + 1;
+  }
+  return out;
+}
+
+/// The directory part of `path`, as Rust's `Path::parent` gives it.
+fn parent(path: &Bytes) -> Bytes {
+  let n = blen(path);
+  let mut k = n;
+  let mut slash = U64_MAX;
+  while k > 0 && slash == U64_MAX
+    invariant k <= n && n == blen(path) && (slash == U64_MAX || slash < n)
+  {
+    k = k - 1;
+    if bget(path, k) == 47 {
+      slash = k;
+    }
+  }
+  if slash == U64_MAX || n > SRC_MAX {
+    return balloc(0);
+  }
+  let mut plen = slash;
+  if slash == 0 {
+    plen = 1;                        // the root directory
+  }
+  let mut out = balloc(plen);
+  let mut i = 0;
+  while i < plen
+    invariant i <= plen && blen(out) == plen && plen <= n && n == blen(path)
+  {
+    bset(&mut out, i, bget(path, i));
+    i = i + 1;
+  }
+  return out;
+}
+
+/// Reads the file of every `include_bytes` from blob `from` on, in source
+/// order, and records its length. Returns the node of the first that cannot
+/// be read, or 0.
+fn read_blobs(host: &Host, p: &mut Parser, dir: &Bytes, from: u64) -> u64 {
+  let mut k = from;
+  while k < vec_len(p.blobs) {
+    let i = vec_get(p.blobs, k);
+    let mut n = node_at(p.nodes, i);
+    if !(n.s <= n.e && n.e <= blen(p.src)) {
+      return i;
+    }
+    let rel = decode(p.src, n.s, n.e);
+    let full = join(dir, rel);
+    let mut data = balloc(0);
+    let ok = host_read(host, full, &mut data);
+    n.v = blen(data);
+    bfree(data);
+    bfree(full);
+    bfree(rel);
+    if !ok || i >= vec_len(p.nodes) {
+      return i;
+    }
+    vec_set(&mut p.nodes, i, n);
+    k = k + 1;
+  }
+  return 0;
+}
+

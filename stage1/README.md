@@ -8,9 +8,18 @@ in the repository (`difftest.sh`, run in CI):
 | --- | --- | --- |
 | Lexer | `lexer.bastio` | `bastioc0 --dump-tokens` (`lexdump.bastio` prints the same format) |
 | Parser | `parser.bastio` | `bastioc0 --dump-ast` (`astdump.bastio`), on every source and on damaged copies (`mutate.py`), so error positions are compared too |
+| Loader and monomorphizer | `loader.bastio`, `mono.bastio` | `bastioc0 --dump-mono` (`monodump.bastio`): the whole program with imports followed, after monomorphization; also on damaged copies |
 
 The syntax tree is an arena: one `Vec[Node]` of plain values, children
-as indices, lists chained through `next`. `out.bastio` holds the output
-helpers the dump drivers share.
+as indices, lists chained through `next`. All files of a program share one
+source buffer, so a node's text range means the same in every file.
 
-`lexcases/` holds sources that exercise lexical errors and edge cases.
+Types are interned (`Mono.tys`), so equal types have equal indices. A
+generic definition is not copied per instance: an instance is the
+definition plus its type arguments, applied whenever a type in it is read.
+
+`print.bastio` prints the tree for both dumps, and `out.bastio` holds the
+output helpers the drivers share.
+
+`lexcases/` and `monocases/` hold sources that exercise lexical and
+monomorphization errors.

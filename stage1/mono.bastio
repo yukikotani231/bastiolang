@@ -1,0 +1,681 @@
+// Types and monomorphization, as stage0/src/mono.rs does it.
+//
+// Types are interned in `Mono.tys`, so two types are equal exactly when
+// their indices are. A struct or enum type names an *instance*: a
+// definition together with its type arguments (none for a plain one).
+// Generic definitions are not copied: an instance is the definition plus
+// a substitution for its type parameters, applied whenever a type in it is
+// read (`conv`). Instances are requested as uses are found, and processed
+// in that order (`queue`), as stage0 does, so errors come in the same order.
+import "parser.bastio";
+
+const TY_U64: u64 = 1;
+const TY_BOOL: u64 = 2;
+const TY_UNIT: u64 = 3;
+const TY_STR: u64 = 4;
+const TY_BUF: u64 = 5;
+const TY_BYTES: u64 = 6;
+const TY_HOST: u64 = 7;
+const TY_CHILD: u64 = 8;
+const TY_SERIAL: u64 = 9;
+const TY_FRAME: u64 = 10;
+const TY_PT: u64 = 11;
+const TY_POOL: u64 = 12;
+const TY_MMU: u64 = 13;
+const TY_CPU: u64 = 14;
+const TY_STRUCT: u64 = 20;     // a: the instance
+const TY_ENUM: u64 = 21;       // a: the instance
+const TY_UNKNOWN: u64 = 22;    // a name that is no type (reported later); a: the T_NAMED node
+const TY_BOX: u64 = 23;        // a: the boxed type
+const TY_VEC: u64 = 24;
+const TY_REF: u64 = 25;
+const TY_MUTREF: u64 = 26;
+
+/// More instances than this means a definition instantiates itself with
+/// ever larger arguments.
+const MAX_INSTANCES: u64 = 1000;
+
+struct Ty { kind: u64, a: u64 }
+
+/// A definition (D_STRUCT, D_ENUM or D_FN node) with type arguments
+/// `targs[args .. args + n]`.
+struct Inst { def: u64, args: u64, n: u64 }
+
+struct Mono {
+  /// Interned types; index 0 means "no type" (after an error).
+  tys: Vec[Ty],
+  /// Instances; index 0 is unused.
+  insts: Vec[Inst],
+  targs: Vec[u64],
+  /// Generic instances in the order they were requested.
+  queue: Vec[u64],
+  /// The program after monomorphization, as instances: plain definitions
+  /// in source order, then generic instances in the order processed.
+  structs: Vec[u64],
+  enums: Vec[u64],
+  fns: Vec[u64],
+  failed: bool,
+  efile: u64,
+  eline: u64,
+  ecol: u64
+}
+
+fn mono_new() -> Mono {
+  let mut tys = vec_new[Ty]();
+  vec_push(&mut tys, Ty { kind: 0, a: 0 });
+  let mut insts = vec_new[Inst]();
+  vec_push(&mut insts, Inst { def: 0, args: 0, n: 0 });
+  return Mono {
+    tys: tys, insts: insts, targs: vec_new[u64](), queue: vec_new[u64](),
+    structs: vec_new[u64](), enums: vec_new[u64](), fns: vec_new[u64](),
+    failed: false, efile: 0, eline: 0, ecol: 0
+  };
+}
+
+fn mono_free(m: Mono) {
+  vec_free(m.tys);
+  vec_free(m.insts);
+  vec_free(m.targs);
+  vec_free(m.queue);
+  vec_free(m.structs);
+  vec_free(m.enums);
+  vec_free(m.fns);
+}
+
+/// Records an error (E-TYPE) at node `loc`, unless one is recorded already.
+fn mfail(m: &mut Mono, p: &Parser, loc: u64) {
+  if !m.failed {
+    let n = node_at(p.nodes, loc);
+    m.failed = true;
+    m.efile = n.file;
+    m.eline = n.line;
+    m.ecol = n.col;
+  }
+}
+
+// ---- Lookups ----
+
+fn ty_at(m: &Mono, t: u64) -> Ty {
+  if t < vec_len(m.tys) {
+    return vec_get(m.tys, t);
+  }
+  return Ty { kind: 0, a: 0 };
+}
+
+fn inst_at(m: &Mono, i: u64) -> Inst {
+  if i < vec_len(m.insts) {
+    return vec_get(m.insts, i);
+  }
+  return Inst { def: 0, args: 0, n: 0 };
+}
+
+fn targ_at(m: &Mono, k: u64) -> u64 {
+  if k < vec_len(m.targs) {
+    return vec_get(m.targs, k);
+  }
+  return 0;
+}
+
+/// Do nodes `a` and `b` have the same name?
+fn same_name(p: &Parser, a: u64, b: u64) -> bool {
+  let x = node_at(p.nodes, a);
+  let y = node_at(p.nodes, b);
+  return same(p.src, x.s, x.e, y.s, y.e);
+}
+
+/// Does node `a` have the name `w`?
+fn name_is(p: &Parser, a: u64, w: Str) -> bool {
+  let x = node_at(p.nodes, a);
+  if x.s <= x.e && x.e <= blen(p.src) {
+    return spells(p.src, x.s, x.e, w);
+  }
+  return false;
+}
+
+fn list_len(p: &Parser, head: u64) -> u64 {
+  let mut k = head;
+  let mut n = 0;
+  while k != 0 && n < SRC_MAX
+    invariant n <= SRC_MAX
+  {
+    n = n + 1;
+    k = next_of(p, k);
+  }
+  return n;
+}
+
+/// The node in the list starting loc `head` with the name of node `name`, or 0.
+fn find_in(p: &Parser, head: u64, name: u64) -> u64 {
+  let mut k = head;
+  while k != 0 {
+    if same_name(p, k, name) {
+      return k;
+    }
+    k = next_of(p, k);
+  }
+  return 0;
+}
+
+/// The struct or enum definition with the name of node `name`, or 0.
+fn find_type(p: &Parser, name: u64) -> u64 {
+  let s = find_in(p, p.structs.head, name);
+  if s != 0 {
+    return s;
+  }
+  return find_in(p, p.enums.head, name);
+}
+
+fn find_fn(p: &Parser, name: u64) -> u64 {
+  return find_in(p, p.fns.head, name);
+}
+
+fn is_generic(p: &Parser, def: u64) -> bool {
+  let n = node_at(p.nodes, def);
+  return def != 0 && n.v != 0;
+}
+
+// ---- Types ----
+
+/// The interned type (`kind`, `a`).
+fn intern(m: &mut Mono, p: &Parser, kind: u64, a: u64) -> u64 {
+  let mut k = 1;
+  while k < vec_len(m.tys) {
+    let t = vec_get(m.tys, k);
+    if t.kind == kind && (t.a == a || (kind == TY_UNKNOWN && same_name(p, t.a, a))) {
+      return k;
+    }
+    k = k + 1;
+  }
+  let n = vec_len(m.tys);
+  vec_push(&mut m.tys, Ty { kind: kind, a: a });
+  return n;
+}
+
+fn builtin_kind(p: &Parser, name: u64) -> u64 {
+  if name_is(p, name, "u64") { return TY_U64; }
+  if name_is(p, name, "bool") { return TY_BOOL; }
+  if name_is(p, name, "Str") { return TY_STR; }
+  if name_is(p, name, "Buf") { return TY_BUF; }
+  if name_is(p, name, "Bytes") { return TY_BYTES; }
+  if name_is(p, name, "Host") { return TY_HOST; }
+  if name_is(p, name, "Child") { return TY_CHILD; }
+  if name_is(p, name, "Serial") { return TY_SERIAL; }
+  if name_is(p, name, "Frame") { return TY_FRAME; }
+  if name_is(p, name, "PageTable") { return TY_PT; }
+  if name_is(p, name, "Pool") { return TY_POOL; }
+  if name_is(p, name, "Mmu") { return TY_MMU; }
+  if name_is(p, name, "Cpu") { return TY_CPU; }
+  return 0;
+}
+
+/// The instance of `def` whose arguments are `args`, or 0.
+fn find_inst(m: &Mono, def: u64, args: &Vec[u64]) -> u64 {
+  let mut k = 1;
+  while k < vec_len(m.insts) {
+    let x = vec_get(m.insts, k);
+    if x.def == def && x.n == vec_len(args) && same_args(m, x.args, args) {
+      return k;
+    }
+    k = k + 1;
+  }
+  return 0;
+}
+
+fn same_args(m: &Mono, start: u64, args: &Vec[u64]) -> bool {
+  let mut j = 0;
+  while j < vec_len(args)
+    invariant j <= vlen(args)
+  {
+    if start >= SRC_MAX || targ_at(m, start + j) != vec_get(args, j) {
+      return false;
+    }
+    j = j + 1;
+  }
+  return true;
+}
+
+fn new_inst(m: &mut Mono, def: u64, args: &Vec[u64]) -> u64 {
+  let start = vec_len(m.targs);
+  let mut j = 0;
+  while j < vec_len(args)
+    invariant j <= vlen(args)
+  {
+    vec_push(&mut m.targs, vec_get(args, j));
+    j = j + 1;
+  }
+  let k = vec_len(m.insts);
+  vec_push(&mut m.insts, Inst { def: def, args: start, n: vec_len(args) });
+  return k;
+}
+
+/// The instance of a plain definition.
+fn plain_inst(m: &mut Mono, def: u64) -> u64 {
+  let none = vec_new[u64]();
+  let mut k = find_inst(m, def, none);
+  if k == 0 {
+    k = new_inst(&mut m, def, none);
+  }
+  vec_free(none);
+  return k;
+}
+
+/// The instance `def[args]` of a generic definition, queued the first time
+/// it is asked for.
+fn instance(m: &mut Mono, def: u64, args: &Vec[u64]) -> u64 {
+  let mut k = find_inst(m, def, args);
+  if k == 0 {
+    k = new_inst(&mut m, def, args);
+    vec_push(&mut m.queue, k);
+  }
+  return k;
+}
+
+/// What type parameter `name` stands for in instance `env`, or 0.
+fn subst(m: &Mono, p: &Parser, env: u64, name: u64) -> u64 {
+  let x = inst_at(m, env);
+  if x.n == 0 {
+    return 0;
+  }
+  let d = node_at(p.nodes, x.def);
+  let mut k = d.v;
+  let mut j = 0;
+  while k != 0 && j < x.n && j < SRC_MAX {
+    if same_name(p, k, name) {
+      if x.args >= SRC_MAX {
+        return 0;
+      }
+      return targ_at(m, x.args + j);
+    }
+    k = next_of(p, k);
+    j = j + 1;
+  }
+  return 0;
+}
+
+/// The type written as node `t`, read in instance `env`. Errors are
+/// reported loc node `loc`. Returns 0 after an error.
+fn conv(m: &mut Mono, p: &Parser, t: u64, env: u64, loc: u64) -> u64 {
+  if m.failed {
+    return 0;
+  }
+  let n = node_at(p.nodes, t);
+  if n.kind == T_UNIT {
+    return intern(&mut m, p, TY_UNIT, 0);
+  }
+  if n.kind == T_REF || n.kind == T_MUTREF {
+    let inner = conv(&mut m, p, n.a, env, loc);
+    if m.failed {
+      return 0;
+    }
+    if n.kind == T_REF {
+      return intern(&mut m, p, TY_REF, inner);
+    }
+    return intern(&mut m, p, TY_MUTREF, inner);
+  }
+  if n.kind == T_NAMED {
+    let b = builtin_kind(p, t);
+    if b != 0 {
+      return intern(&mut m, p, b, 0);
+    }
+    let s = subst(m, p, env, t);
+    if s != 0 {
+      return s;
+    }
+    let d = find_type(p, t);
+    if d == 0 {
+      return intern(&mut m, p, TY_UNKNOWN, t);
+    }
+    if is_generic(p, d) {
+      mfail(&mut m, p, loc);         // a generic type without its arguments
+      return 0;
+    }
+    let x = plain_inst(&mut m, d);
+    return intern(&mut m, p, def_ty_kind(p, d), x);
+  }
+  if n.kind == T_GENERIC {
+    if name_is(p, t, "Box") || name_is(p, t, "Vec") {
+      let inner = conv(&mut m, p, n.a, env, loc);
+      if m.failed {
+        return 0;
+      }
+      if name_is(p, t, "Box") {
+        return intern(&mut m, p, TY_BOX, inner);
+      }
+      return intern(&mut m, p, TY_VEC, inner);
+    }
+    let args = conv_list(&mut m, p, n.a, env, loc);
+    let r = generic_ty(&mut m, p, t, args, loc);
+    vec_free(args);
+    return r;
+  }
+  return 0;
+}
+
+fn def_ty_kind(p: &Parser, d: u64) -> u64 {
+  if kind_of(p, d) == D_ENUM {
+    return TY_ENUM;
+  }
+  return TY_STRUCT;
+}
+
+/// The types of a list of type nodes.
+fn conv_list(m: &mut Mono, p: &Parser, head: u64, env: u64, loc: u64) -> Vec[u64] {
+  let mut out = vec_new[u64]();
+  let mut k = head;
+  while k != 0 && !m.failed {
+    let x = conv(&mut m, p, k, env, loc);
+    vec_push(&mut out, x);
+    k = next_of(p, k);
+  }
+  return out;
+}
+
+/// `name[args]` as a type: an instance of a generic struct or enum.
+fn generic_ty(m: &mut Mono, p: &Parser, name: u64, args: &Vec[u64], loc: u64) -> u64 {
+  if m.failed {
+    return 0;
+  }
+  let d = find_type(p, name);
+  if !is_generic(p, d) {
+    mfail(&mut m, p, loc);           // not a generic struct or enum
+    return 0;
+  }
+  let dn = node_at(p.nodes, d);
+  if list_len(p, dn.v) != vec_len(args) {
+    mfail(&mut m, p, loc);           // the wrong number of type arguments
+    return 0;
+  }
+  let x = instance(&mut m, d, args);
+  return intern(&mut m, p, def_ty_kind(p, d), x);
+}
+
+// ---- The program ----
+
+/// Monomorphizes the program parsed into `p`.
+fn monomorphize(m: &mut Mono, p: &Parser) {
+  check_unique(&mut m, p);
+  let mut k = p.structs.head;
+  while k != 0 && !m.failed {
+    if !is_generic(p, k) {
+      let x = plain_inst(&mut m, k);
+      vec_push(&mut m.structs, x);
+      mono_fields(&mut m, p, k, x);
+    }
+    k = next_of(p, k);
+  }
+  k = p.enums.head;
+  while k != 0 && !m.failed {
+    if !is_generic(p, k) {
+      let x = plain_inst(&mut m, k);
+      vec_push(&mut m.enums, x);
+      mono_fields(&mut m, p, k, x);
+    }
+    k = next_of(p, k);
+  }
+  k = p.fns.head;
+  while k != 0 && !m.failed {
+    if !is_generic(p, k) {
+      let x = plain_inst(&mut m, k);
+      vec_push(&mut m.fns, x);
+      mono_fn(&mut m, p, k, x);
+    }
+    k = next_of(p, k);
+  }
+  k = p.specs.head;
+  while k != 0 && !m.failed {
+    let sf = node_at(p.nodes, k);
+    let mut q = sf.a;
+    while q != 0 && !m.failed {
+      let pn = node_at(p.nodes, q);
+      conv(&mut m, p, pn.a, 0, q);
+      q = pn.next;
+    }
+    conv(&mut m, p, sf.b, 0, k);
+    mono_expr(&mut m, p, sf.c, 0);
+    k = sf.next;
+  }
+  let mut j = 0;
+  while j < vec_len(m.queue) && !m.failed {
+    let x = vec_get(m.queue, j);
+    let xi = inst_at(m, x);
+    let d = xi.def;
+    if j + 1 > MAX_INSTANCES {
+      mfail(&mut m, p, d);          // instantiating itself with growing arguments
+    } else {
+      let kd = kind_of(p, d);
+      if kd == D_STRUCT {
+        vec_push(&mut m.structs, x);
+        mono_fields(&mut m, p, d, x);
+      } else if kd == D_ENUM {
+        vec_push(&mut m.enums, x);
+        mono_fields(&mut m, p, d, x);
+      } else {
+        vec_push(&mut m.fns, x);
+        mono_fn(&mut m, p, d, x);
+      }
+    }
+    j = j + 1;
+  }
+}
+
+/// Type names are unique among structs and enums, function names among
+/// functions, and `main` is not generic.
+fn check_unique(m: &mut Mono, p: &Parser) {
+  let mut k = p.structs.head;
+  let mut in_enums = false;
+  while k != 0 && !m.failed {
+    if earlier_type(p, k, in_enums) {
+      mfail(&mut m, p, k);          // already defined
+    }
+    k = next_of(p, k);
+    if k == 0 && !in_enums {
+      k = p.enums.head;
+      in_enums = true;
+    }
+  }
+  k = p.fns.head;
+  while k != 0 && !m.failed {
+    let e = find_fn(p, k);
+    if e != k {
+      mfail(&mut m, p, k);          // defined twice
+    }
+    k = next_of(p, k);
+  }
+  k = p.fns.head;
+  while k != 0 && !m.failed {
+    if is_generic(p, k) && name_is(p, k, "main") {
+      mfail(&mut m, p, k);          // `main` cannot be generic
+    }
+    k = next_of(p, k);
+  }
+}
+
+/// Is there a struct or enum before `d` with its name? (`d` is in the enum
+/// list when `in_enums`; every struct comes before every enum.)
+fn earlier_type(p: &Parser, d: u64, in_enums: bool) -> bool {
+  let mut k = p.structs.head;
+  while k != 0 && k != d {
+    if same_name(p, k, d) {
+      return true;
+    }
+    k = next_of(p, k);
+  }
+  if !in_enums {
+    return false;
+  }
+  k = p.enums.head;
+  while k != 0 && k != d {
+    if same_name(p, k, d) {
+      return true;
+    }
+    k = next_of(p, k);
+  }
+  return false;
+}
+
+/// The field or payload types of a struct or enum instance.
+fn mono_fields(m: &mut Mono, p: &Parser, d: u64, env: u64) {
+  let dn = node_at(p.nodes, d);
+  let mut f = dn.a;
+  while f != 0 && !m.failed {
+    let fd = node_at(p.nodes, f);
+    if fd.a != 0 {
+      conv(&mut m, p, fd.a, env, d);
+    }
+    f = fd.next;
+  }
+}
+
+fn mono_fn(m: &mut Mono, p: &Parser, d: u64, env: u64) {
+  let f = node_at(p.nodes, d);
+  let mut q = f.a;
+  while q != 0 && !m.failed {
+    let pn = node_at(p.nodes, q);
+    conv(&mut m, p, pn.a, env, q);
+    q = pn.next;
+  }
+  conv(&mut m, p, f.b, env, d);
+  mono_exprs(&mut m, p, f.c, env);
+  mono_exprs(&mut m, p, f.d, env);
+  mono_block(&mut m, p, f.x, env);
+}
+
+fn mono_exprs(m: &mut Mono, p: &Parser, head: u64, env: u64) {
+  let mut k = head;
+  while k != 0 && !m.failed {
+    mono_expr(&mut m, p, k, env);
+    k = next_of(p, k);
+  }
+}
+
+fn mono_block(m: &mut Mono, p: &Parser, head: u64, env: u64) {
+  let mut k = head;
+  while k != 0 && !m.failed {
+    mono_stmt(&mut m, p, k, env);
+    k = next_of(p, k);
+  }
+}
+
+fn mono_stmt(m: &mut Mono, p: &Parser, i: u64, env: u64) {
+  let n = node_at(p.nodes, i);
+  let k = n.kind;
+  if k == S_LET {
+    if n.a != 0 {
+      conv(&mut m, p, n.a, env, i);
+    }
+    mono_expr(&mut m, p, n.b, env);
+  } else if k == S_ASSIGN {
+    mono_expr(&mut m, p, n.b, env);
+  } else if k == S_IF {
+    mono_expr(&mut m, p, n.a, env);
+    mono_block(&mut m, p, n.b, env);
+    mono_block(&mut m, p, n.c, env);
+  } else if k == S_WHILE {
+    mono_expr(&mut m, p, n.a, env);
+    mono_exprs(&mut m, p, n.b, env);
+    mono_block(&mut m, p, n.c, env);
+  } else if k == S_RETURN || k == S_ASSERT || k == S_EXPR {
+    if n.a != 0 {
+      mono_expr(&mut m, p, n.a, env);
+    }
+  } else if k == S_MATCH {
+    mono_expr(&mut m, p, n.a, env);
+    let mut a = n.b;
+    while a != 0 && !m.failed {
+      let arm = node_at(p.nodes, a);
+      mono_block(&mut m, p, arm.c, env);
+      a = arm.next;
+    }
+  }
+}
+
+/// Is node `i` a call of `vec_new` (the one builtin written with type
+/// arguments)?
+fn is_typed_builtin(p: &Parser, i: u64) -> bool {
+  return kind_of(p, i) == E_CALL && name_is(p, i, "vec_new");
+}
+
+/// The definition a type application `name[..]` instantiates: a generic
+/// function for a call, a generic struct for a struct literal, a generic
+/// enum for a variant. 0 if there is none.
+fn tapp_def(p: &Parser, inner: u64) -> u64 {
+  let k = kind_of(p, inner);
+  let mut d = 0;
+  if k == E_CALL {
+    d = find_fn(p, inner);
+  } else if k == E_SLIT {
+    d = find_in(p, p.structs.head, inner);
+  } else if k == E_VARIANT {
+    d = find_in(p, p.enums.head, inner);
+  }
+  if !is_generic(p, d) {
+    return 0;
+  }
+  return d;
+}
+
+/// The instance a type application `e` names, read in instance `env`
+/// (requesting it if it is new), or 0 after an error.
+fn tapp_inst(m: &mut Mono, p: &Parser, e: u64, env: u64) -> u64 {
+  let n = node_at(p.nodes, e);
+  let args = conv_list(&mut m, p, n.a, env, e);
+  let mut x = 0;
+  if !m.failed {
+    let d = tapp_def(p, n.b);
+    let dn = node_at(p.nodes, d);
+    if d == 0 || list_len(p, dn.v) != vec_len(args) {
+      mfail(&mut m, p, e);          // not generic, or the wrong number of arguments
+    } else {
+      x = instance(&mut m, d, args);
+    }
+  }
+  vec_free(args);
+  return x;
+}
+
+fn mono_expr(m: &mut Mono, p: &Parser, i: u64, env: u64) {
+  if m.failed || i == 0 {
+    return;
+  }
+  let n = node_at(p.nodes, i);
+  if n.kind == E_TAPP {
+    if is_typed_builtin(p, n.b) {
+      let args = conv_list(&mut m, p, n.a, env, i);
+      vec_free(args);
+      mono_children(&mut m, p, n.b, env);
+      return;
+    }
+    tapp_inst(&mut m, p, i, env);
+    mono_children(&mut m, p, n.b, env);
+    return;
+  }
+  if n.kind == E_CALL && is_generic(p, find_fn(p, i)) {
+    mfail(&mut m, p, i);            // a generic function without type arguments
+    return;
+  }
+  if (n.kind == E_SLIT || n.kind == E_VARIANT) && is_generic(p, find_type(p, i)) {
+    mfail(&mut m, p, i);            // a generic type without type arguments
+    return;
+  }
+  mono_children(&mut m, p, i, env);
+}
+
+fn mono_children(m: &mut Mono, p: &Parser, i: u64, env: u64) {
+  let n = node_at(p.nodes, i);
+  let k = n.kind;
+  if k == E_FIELD || k == E_IS || k == E_NOT || k == E_FORALL || k == E_VARIANT {
+    mono_expr(&mut m, p, n.a, env);
+  } else if k == E_SLIT {
+    let mut f = n.a;
+    while f != 0 && !m.failed {
+      let fi = node_at(p.nodes, f);
+      mono_expr(&mut m, p, fi.a, env);
+      f = fi.next;
+    }
+  } else if k == E_BIN {
+    mono_expr(&mut m, p, n.a, env);
+    mono_expr(&mut m, p, n.b, env);
+  } else if k == E_CALL {
+    mono_exprs(&mut m, p, n.a, env);
+  }
+}

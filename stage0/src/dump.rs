@@ -10,8 +10,16 @@
 use crate::ast::*;
 use crate::diag::Pos;
 
+/// Set for `--dump-mono`, whose program spans several files: positions
+/// then start with the file's index in load order.
+pub static WITH_FILE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn p(pos: Pos) -> String {
-    format!("{}:{}", pos.line, pos.col)
+    if WITH_FILE.load(std::sync::atomic::Ordering::Relaxed) {
+        format!("{}:{}:{}", pos.file, pos.line, pos.col)
+    } else {
+        format!("{}:{}", pos.line, pos.col)
+    }
 }
 
 fn hex(b: &[u8]) -> String {
