@@ -1,0 +1,105 @@
+// expect-exit: 42
+// The prover tracks the contents of a vector of any element type: struct
+// fields, enum tags and payloads, buffer lengths, nested vectors. `vget(v, i)`
+// names element i in a specification and has the element's type, so its
+// fields and accessors can be used.
+
+struct Slot { id: u64, page: Buf }
+
+enum State { Free, Used(u64) }
+
+// Every slot owns a 4096-element page; the prover keeps that fact per
+// element through pushes, swaps and loops.
+fn make(n: u64) -> Vec[Slot]
+  requires n <= 100
+  ensures vlen(result) == n
+  ensures forall i: u64 :: i < n ==> len(vget(result, i).page) == 4096 && vget(result, i).id == i
+{
+  let mut v = vec_new[Slot]();
+  let mut i = 0;
+  while i < n
+    invariant i <= n && vlen(v) == i
+    invariant forall k: u64 :: k < i ==> len(vget(v, k).page) == 4096 && vget(v, k).id == k
+  {
+    vec_push(&mut v, Slot { id: i, page: alloc(4096) });
+    i = i + 1;
+  }
+  return v;
+}
+
+// Writes to an element's page at an index the prover knows is in bounds,
+// because it knows that element's length.
+fn touch(v: &mut Vec[Slot], i: u64)
+  requires i < vlen(v)
+  requires forall k: u64 :: k < vlen(v) ==> len(vget(v, k).page) == 4096
+  ensures vlen(v) == old(vlen(v))
+  ensures forall k: u64 :: k < vlen(v) ==> len(vget(v, k).page) == 4096
+{
+  let mut s = vec_swap(&mut v, i, Slot { id: 0, page: alloc(1) });
+  s.page = set(s.page, 4095, s.id);
+  let back = vec_swap(&mut v, i, s);
+  free(back.page);
+}
+
+fn release(w: Vec[Slot]) -> u64
+  requires vlen(w) <= 100
+  ensures result <= 100
+{
+  let mut v = w;
+  let mut n = 0;
+  while vec_len(v) > 0
+    invariant n + vlen(v) <= 100
+  {
+    let s = vec_pop(&mut v);
+    free(s.page);
+    n = n + 1;
+  }
+  vec_free(v);
+  return n;
+}
+
+fn count_used(st: &Vec[State]) -> u64
+  requires vlen(st) <= 100
+  ensures result <= vlen(st)
+{
+  let mut n = 0;
+  let mut i = 0;
+  while i < vec_len(st)
+    invariant i <= vlen(st) && n <= i
+  {
+    if vec_get(st, i) is State::Used { n = n + 1; }
+    i = i + 1;
+  }
+  return n;
+}
+
+fn main() -> u64 {
+  let mut v = make(10);
+  touch(&mut v, 3);
+  // The prover knows element 3's page length, so this read needs no check.
+  let s = vec_swap(&mut v, 3, Slot { id: 3, page: alloc(4096) });
+  let x = get(s.page, 4095);                       // 3, written by touch
+  free(s.page);
+  let r = release(v);                              // 10
+
+  let mut st = vec_new[State]();
+  vec_push(&mut st, State::Free);
+  vec_push(&mut st, State::Used(7));
+  vec_push(&mut st, State::Used(8));
+  assert vget(st, 1) is State::Used && vget(st, 1).Used == 7;
+  let u = count_used(st);                          // 2
+  vec_free(st);
+
+  // A vector of vectors.
+  let mut grid = vec_new[Vec[u64]]();
+  let mut row = vec_new[u64]();
+  vec_push(&mut row, 5);
+  vec_push(&mut grid, row);
+  assert vlen(vget(grid, 0)) == 1 && vget(vget(grid, 0), 0) == 5;
+  let mut r0 = vec_pop(&mut grid);
+  let five = vec_pop(&mut r0);
+  vec_free(r0);
+  vec_free(grid);
+
+  return x % 100 + r + u + five * 0 + 27;          // 3 + 10 + 2 + 27
+}

@@ -162,7 +162,8 @@ vec_free(ps);                    // proved: vlen(ps) == 0
 | `vec_free(v: Vec[T])` | Frees the storage. For linear `T`, requires `vlen(v) == 0` (`E-VERIFY-LEAK`) |
 
 - Every slot below the length holds a value, so a vector of linear values needs no per-slot ownership: elements leave only through `vec_pop` and `vec_swap`, and freeing is allowed only when nothing is left.
-- Specifications: `vlen(v)` for any vector, and `vget(v, i)` for the elements of a `Vec[u64]`. The prover tracks the contents of `Vec[u64]` only; elements of other types read back as unknown values (still of the right type).
+- Specifications: `vlen(v)` is the length and `vget(v, i)` is element `i`, of the element type, for any vector. So `vget(v, i).page`, `len(vget(v, i).page)`, `pt_level(vget(v, i).root)`, `vget(v, i) is State::Used` and `vlen(vget(grid, i))` all work, typically under `forall i: u64 :: i < vlen(v) ==> ...`.
+- The prover tracks every element's contents: scalars, struct fields, enum tags and payloads, buffer lengths and contents, ghost fields of linear objects, nested vectors. A read gives back what was last written at that index. The exception is boxes inside elements: what a box in an element holds is unknown once the element is in the vector (as for a box that arrives from outside, see Boxes).
 - The storage doubles when full. A push that cannot get memory aborts, as `alloc` does; the prover takes this into account by assuming the length stays below 2^60 after a push.
 - In generated code a `Vec[T]` is `{ len, cap, data }` and element access is a plain array access, with no bounds checks.
 
