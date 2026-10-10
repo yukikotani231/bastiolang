@@ -22,6 +22,8 @@ The language as stage0 implements it today: the v0 proof pipeline, plus `&mut` b
 | `PageTable` | A page-table page at level 1 to 5. Linear; it owns the tables and pages its slots point to |
 | `Mmu` | The right to load CR3. Linear; only `main` (kernel target) is handed one |
 | `Cpu` | The CPU's saved user context and the right to enter user mode. Linear; kernel target only |
+| `Ports` | The x86 I/O port space: the right to claim each of the 65536 ports once. Linear; only `main` is handed one (kernel and hosted targets; hosted simulates the ports) |
+| `PortIo` | A claimed range of I/O ports, owned: the only way to read or write them. Linear |
 
 | `S` (a struct) | A user-defined record. Linear when any field is linear; otherwise a plain value that is copied |
 | `E` (an enum) | One of several variants, each with at most one payload. Linear when any payload is linear |
@@ -30,7 +32,7 @@ The language as stage0 implements it today: the v0 proof pipeline, plus `&mut` b
 
 Borrowing at a call site is implicit: passing an owned `b` to a `&Buf` parameter lends it for the duration of the call. A `&mut` parameter needs an explicit `&mut b`, and `b` must be declared `mut` (or itself be a `&mut` parameter). One call cannot lend the same variable twice if one of the loans is `&mut`.
 
-The capability types carry **ghost state** that exists only in the proof and costs nothing at run time (a `Frame` or `PageTable` is a bare physical address in the generated code; `Serial`, `Mmu` and `Cpu` are empty):
+The capability types carry **ghost state** that exists only in the proof and costs nothing at run time (a `Frame` or `PageTable` is a bare physical address in the generated code; `Serial`, `Mmu`, `Cpu` and `Ports` are empty; a `PortIo` is its base and count):
 
 | Accessor (specifications only) | Meaning |
 | --- | --- |
@@ -40,6 +42,8 @@ The capability types carry **ghost state** that exists only in the proof and cos
 | `pool_has(p, i)` | The pool can still hand out page `i` |
 | `pool_size(p)` | Number of pages in the pool (also callable at run time) |
 | `mmu_root(m)` | The id of the table in CR3; `0x10000` while the kernel's own map is loaded |
+| `port_free(p, k)` | Nobody has claimed port `k` (`main` receives every port free) |
+| `port_base(io)`, `port_count(io)` | The ports `io` owns: `port_base(io) ..< port_base(io) + port_count(io)`, always within the 65536 ports (also callable at run time) |
 
 ## Structs
 
@@ -228,6 +232,17 @@ MMU and CPU (kernel only; the platform provides the trap entry code):
 | `cpu_run(c: &mut Cpu, m: &Mmu) -> u64` | none | Runs the saved context in user mode until the next trap; returns its vector (`<= 255`) |
 | `cpu_idle(c: &mut Cpu) -> u64` | none | Waits for an interrupt; returns its vector |
 
+I/O ports (kernel and hosted):
+
+| Function | Precondition (proved) | Effect |
+| --- | --- | --- |
+| `port_claim(p: &mut Ports, base, count) -> PortIo` | `base + count <= 65536`; `port_free(p, k)` for every k in the range | Takes the ports out of `p` |
+| `port_release(p: &mut Ports, io: PortIo)` | none | Gives them back |
+| `pio_in8/16/32(io: &mut PortIo, off) -> u64` | `off + 1/2/4 <= port_count(io)` | `in` from port `port_base(io) + off`; the result fits in 8/16/32 bits |
+| `pio_out8/16/32(io: &mut PortIo, off, v)` | same, and v fits in 8/16/32 bits | `out` to that port |
+
+Both directions take `&mut`: reading a device register changes the device (it pops a FIFO, acknowledges an interrupt), so a read is not a shared, side-effect-free access. Claiming and releasing compile to nothing; an access is one instruction. Ports that are never claimed (or devices whose drivers were not written) cannot be touched at all, and two drivers can never own the same port. What a device does with the values written to it is not modelled.
+
 User programs (`--target user`) instead have system calls: `sys_spawn(b: &Buf, from, to)` (the program named by bytes `from..to` of b; proved to be a range within b), `sys_wait(pid)`, `sys_kill(pid)`, `sys_yield()`, `sys_getpid()`, `sys_info(k)`, `sys_ps()`, `sys_poweroff()`. Calling a builtin the target does not have is `E-TARGET`.
 
 ## Statements and expressions
@@ -255,7 +270,7 @@ include_bytes("path")                              // a file's bytes as a Str, p
 - All files share one namespace, as in C: a function, type or constant name must be unique in the whole program.
 - `unreachable;` marks a point the prover must show no execution reaches (`E-VERIFY-UNREACHABLE`). The path ends there like a `return`, so linear values in hand need not be consumed. Its typical use is a `match` arm the specification rules out, such as the `Full` arm after swapping a value into a slot known to be empty. It compiles to `__builtin_unreachable()`, with no check.
 - A name cannot shadow one that is still in scope. Once a block ends, its names can be used again (two `match` arms can both bind `v`).
-- The entry point is `fn main(...) -> u64` (or with no result), taking any of the capabilities its target hands out, each at most once and as `&mut`: hosted `&mut Serial`, `&mut Pool`, `&mut Host`; kernel those plus `&mut Mmu`, `&mut Cpu`; user `&mut Serial` only. A user program's result is its exit code. The older `fn main(con: Serial) -> Serial` is still accepted outside user programs.
+- The entry point is `fn main(...) -> u64` (or with no result), taking any of the capabilities its target hands out, each at most once and as `&mut`: hosted `&mut Serial`, `&mut Pool`, `&mut Host`, `&mut Ports`; kernel `&mut Serial`, `&mut Pool`, `&mut Mmu`, `&mut Cpu`, `&mut Ports`; user `&mut Serial` only. A user program's result is its exit code. The older `fn main(con: Serial) -> Serial` is still accepted outside user programs.
 
 ## Specification expressions (ghost)
 
@@ -284,14 +299,14 @@ The compiler executes each function symbolically. At every point where the progr
 
 | Code | What is proved |
 | --- | --- |
-| `E-VERIFY-BOUNDS` | `get` / `set` / `sget` / `vec_get` / `vec_set` / `vec_swap` index < length; `vec_pop` on a non-empty vector |
+| `E-VERIFY-BOUNDS` | `get` / `set` / `sget` / `vec_get` / `vec_set` / `vec_swap` index < length; `vec_pop` on a non-empty vector; an I/O port access stays inside the claimed range |
 | `E-VERIFY-LEAK` | a vector of linear elements is empty when it is freed |
 | `E-VERIFY-OVERFLOW` | `+` and `*` results < 2^64 |
 | `E-VERIFY-UNDERFLOW` | `a - b` has a >= b |
 | `E-VERIFY-DIVZERO` | the divisor of `/` and `%` is not zero |
 | `E-VERIFY-ALLOC` | allocation size <= 2^60 elements |
-| `E-VERIFY-BYTE` | a value passed to `serial_write` or `frame_write8` is `<= 255` |
-| `E-VERIFY-OWN` | a page is taken from the pool at most once; a table slot is empty before `pt_put` and used before `pt_take`; a table is empty before it is freed |
+| `E-VERIFY-BYTE` | a value passed to `serial_write` or `frame_write8` is `<= 255`; a value passed to `pio_out16` / `pio_out32` fits in 16 / 32 bits |
+| `E-VERIFY-OWN` | a page is taken from the pool at most once; an I/O port is claimed by at most one owner; a table slot is empty before `pt_put` and used before `pt_take`; a table is empty before it is freed |
 | `E-VERIFY-PT` | table levels line up; frames go only into level-1 tables; slot 0 of a top-level table (the kernel's map) is never touched |
 | `E-VERIFY-MMU` | the table in CR3 is never freed |
 | `E-VERIFY-REQUIRES` | the callee's precondition |
@@ -308,8 +323,9 @@ How verification works:
 
 ## Targets
 
-`bastioc0 --target hosted` (the default) builds a normal program with the C library. `bastioc0 --target kernel` emits freestanding C for bare-metal x86-64 and implies `--emit-c`. That C needs no C library and provides `bst_kmain`, which initialises COM1 and calls `main`; the boot code that calls `bst_kmain`, and the trap entry code behind `cpu_run` / `cpu_idle`, live in the kernel's own repository (BastiOS). `--target user` emits freestanding C for a user program under BastiOS, entered at `bst_umain`. The kernel prelude implements:
+`bastioc0 --target hosted` (the default) builds a normal program with the C library. `bastioc0 --target kernel` emits freestanding C for bare-metal x86-64 and implies `--emit-c`. That C needs no C library and provides `bst_kmain`, which initialises COM1 (only if `main` asks for `Serial`) and calls `main`; the boot code that calls `bst_kmain`, and the trap entry code behind `cpu_run` / `cpu_idle`, live in the kernel's own repository (BastiOS). `--target user` emits freestanding C for a user program under BastiOS, entered at `bst_umain`. The kernel prelude implements:
 - `Serial` with port I/O on COM1;
+- `pio_in*` / `pio_out*` as single `in` / `out` instructions;
 - `alloc` / `free` with a fixed 8 MiB arena and an exact-size free list;
 - `print` on the serial port;
 - the pool (every page from the end of the kernel image to the end of RAM, at most 2^16), page-table entry encoding and CR3 loads.

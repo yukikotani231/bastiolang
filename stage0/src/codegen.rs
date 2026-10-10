@@ -139,7 +139,14 @@ fn entry(p: &Program, target: Target) -> String {
             teardown,
             if returns { "(int)r" } else { "0" }
         ),
-        Target::Kernel => format!("void bst_kmain(uint64_t mbi) {{\n    (void)mbi;\n    bst_serial_init();\n{}    (void){};\n}}\n", setup, call),
+        // COM1 is set up only for a kernel that uses `Serial`; one that drives
+        // the UART itself through `Ports` gets it untouched.
+        Target::Kernel => format!(
+            "void bst_kmain(uint64_t mbi) {{\n    (void)mbi;\n{}{}    (void){};\n}}\n",
+            if legacy || main.params.iter().any(|p| *p.ty.base() == Type::Serial) { "    bst_serial_init();\n" } else { "" },
+            setup,
+            call
+        ),
         Target::User => format!("uint64_t bst_umain(void) {{\n{}    uint64_t r = {};\n    bst_flush();\n    return r;\n}}\n", setup, call),
     }
 }
@@ -154,6 +161,8 @@ typedef struct { uint64_t len; unsigned char *data; } bst_bytes;
 typedef int bst_serial, bst_mmu, bst_cpu, bst_host;   /* capability tokens: no data */
 typedef uint64_t bst_frame, bst_pt;         /* a page's physical address */
 typedef struct { uint64_t base, size; } bst_pool;
+typedef int bst_ports;                      /* capability token: no data */
+typedef struct { uint64_t base, count; } bst_portio;
 static inline bst_buf bst_set(bst_buf b, uint64_t i, uint64_t v) { b.data[i] = v; return b; }
 "#;
 
@@ -548,6 +557,37 @@ static bst_bytes bst_bfrom(bst_str s) {
 "#;
 
 // Kernel-only: CR3 and user mode. The platform supplies the trap machinery.
+// I/O ports: claiming and releasing are proof-only, so they compile to
+// nothing; an access is one instruction at base + offset. The prover has
+// shown the offset is inside the claimed range.
+const PRELUDE_PORTS: &str = r#"
+static inline bst_portio bst_port_claim(bst_ports *p, uint64_t b, uint64_t c) { (void)p; bst_portio io = { b, c }; return io; }
+static inline void bst_port_release(bst_ports *p, bst_portio io) { (void)p; (void)io; }
+static inline uint64_t bst_port_base(bst_portio io) { return io.base; }
+static inline uint64_t bst_port_count(bst_portio io) { return io.count; }
+"#;
+
+const PRELUDE_PORTS_KERNEL: &str = r#"
+static inline uint64_t bst_pio_in8(bst_portio *io, uint64_t o) { return bst_inb((uint16_t)(io->base + o)); }
+static inline uint64_t bst_pio_in16(bst_portio *io, uint64_t o) { uint16_t v; __asm__ volatile ("inw %1, %0" : "=a"(v) : "Nd"((uint16_t)(io->base + o))); return v; }
+static inline uint64_t bst_pio_in32(bst_portio *io, uint64_t o) { uint32_t v; __asm__ volatile ("inl %1, %0" : "=a"(v) : "Nd"((uint16_t)(io->base + o))); return v; }
+static inline void bst_pio_out8(bst_portio *io, uint64_t o, uint64_t v) { bst_outb((uint16_t)(io->base + o), (uint8_t)v); }
+static inline void bst_pio_out16(bst_portio *io, uint64_t o, uint64_t v) { __asm__ volatile ("outw %0, %1" : : "a"((uint16_t)v), "Nd"((uint16_t)(io->base + o))); }
+static inline void bst_pio_out32(bst_portio *io, uint64_t o, uint64_t v) { __asm__ volatile ("outl %0, %1" : : "a"((uint32_t)v), "Nd"((uint16_t)(io->base + o))); }
+"#;
+
+// Hosted programs have no ports: each port is a cell that remembers the
+// last value written to it, so drivers can be tested off the machine.
+const PRELUDE_PORTS_HOSTED: &str = r#"
+static uint32_t bst_port_cell[65536];
+static inline uint64_t bst_pio_in8(bst_portio *io, uint64_t o) { return bst_port_cell[io->base + o] & 0xFF; }
+static inline uint64_t bst_pio_in16(bst_portio *io, uint64_t o) { return bst_port_cell[io->base + o] & 0xFFFF; }
+static inline uint64_t bst_pio_in32(bst_portio *io, uint64_t o) { return bst_port_cell[io->base + o]; }
+static inline void bst_pio_out8(bst_portio *io, uint64_t o, uint64_t v) { bst_port_cell[io->base + o] = (uint32_t)v; }
+static inline void bst_pio_out16(bst_portio *io, uint64_t o, uint64_t v) { bst_port_cell[io->base + o] = (uint32_t)v; }
+static inline void bst_pio_out32(bst_portio *io, uint64_t o, uint64_t v) { bst_port_cell[io->base + o] = (uint32_t)v; }
+"#;
+
 const PRELUDE_KERNEL_CPU: &str = r#"
 static inline void bst_load_cr3(uint64_t a) { __asm__ volatile ("mov %0, %%cr3" : : "r"(a) : "memory"); }
 static inline void bst_mmu_switch(bst_mmu *m, bst_pt root) { (void)m; bst_load_cr3(root); }
@@ -679,6 +719,8 @@ fn cty(t: &Type) -> String {
         Type::Pool => "bst_pool".into(),
         Type::Mmu => "bst_mmu".into(),
         Type::Cpu => "bst_cpu".into(),
+        Type::Ports => "bst_ports".into(),
+        Type::PortIo => "bst_portio".into(),
         Type::Struct(n) => format!("bst_s_{}", cid(n)),
         Type::Enum(n) => format!("bst_e_{}", cid(n)),
         Type::Generic(..) => unreachable!("removed by monomorphization"),
@@ -1036,6 +1078,8 @@ pub fn prelude_parts(target: Target) -> Vec<(&'static str, &'static str)> {
             ("pt_hook_hosted", "#define BST_PT_NEW_HOOK (void)level;\n"),
             ("pages", PRELUDE_PAGES),
             ("child", PRELUDE_CHILD),
+            ("ports", PRELUDE_PORTS),
+            ("ports_hosted", PRELUDE_PORTS_HOSTED),
         ],
         Target::Kernel => vec![
             ("common", PRELUDE_COMMON),
@@ -1044,6 +1088,8 @@ pub fn prelude_parts(target: Target) -> Vec<(&'static str, &'static str)> {
             ("bytes", PRELUDE_BYTES),
             ("pages", PRELUDE_PAGES),
             ("kernel_cpu", PRELUDE_KERNEL_CPU),
+            ("ports", PRELUDE_PORTS),
+            ("ports_kernel", PRELUDE_PORTS_KERNEL),
         ],
         Target::User => vec![("common", PRELUDE_COMMON), ("user", PRELUDE_USER), ("bytes_arena", PRELUDE_BYTES_ARENA), ("bytes", PRELUDE_BYTES)],
     }
