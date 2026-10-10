@@ -122,6 +122,7 @@ const VC_UNREACHABLE: u64 = 16;
 /// Not a proof: an `export fn` may free or replace a buffer C lent it.
 const VC_EXPORT: u64 = 17;
 const VC_LOCKINV: u64 = 18;
+const VC_SHIFT: u64 = 19;
 
 fn vc_name(code: u64) -> Str {
   if code == VC_ALLOC { return "E-VERIFY-ALLOC"; }
@@ -141,6 +142,7 @@ fn vc_name(code: u64) -> Str {
   if code == VC_UNDERFLOW { return "E-VERIFY-UNDERFLOW"; }
   if code == VC_EXPORT { return "E-EXPORT"; }
   if code == VC_LOCKINV { return "E-VERIFY-LOCKINV"; }
+  if code == VC_SHIFT { return "E-VERIFY-SHIFT"; }
   return "E-VERIFY-UNREACHABLE";
 }
 
@@ -261,7 +263,7 @@ fn push_str(v: &mut Vr, s: Str) {
   while k < slen(s)
     invariant k <= slen(s)
   {
-    vec_push(&mut v.pool, sget(s, k));
+    vec_push(&mut v.pool, cast[u64](sget(s, k)));
     k = k + 1;
   }
 }
@@ -272,7 +274,7 @@ fn push_src(v: &mut Vr, p: &Parser, s: u64, e: u64) {
     while k < e
       invariant k <= e && e <= blen(p.src)
     {
-      vec_push(&mut v.pool, bget(p.src, k));
+      vec_push(&mut v.pool, cast[u64](bget(p.src, k)));
       k = k + 1;
     }
   }
@@ -371,7 +373,7 @@ fn rng_is_src(v: &Vr, s: u64, n: u64, p: &Parser, x: u64, y: u64) -> bool {
   while k < n
     invariant k <= n && x <= y && y <= blen(p.src) && y - x == n
   {
-    if pool_at(v, vadd(s, k)) != bget(p.src, x + k) {
+    if pool_at(v, vadd(s, k)) != cast[u64](bget(p.src, x + k)) {
       return false;
     }
     k = k + 1;
@@ -815,7 +817,7 @@ fn out_str(out: &mut Vec[u64], s: Str) {
   while k < slen(s)
     invariant k <= slen(s)
   {
-    vec_push(&mut out, sget(s, k));
+    vec_push(&mut out, cast[u64](sget(s, k)));
     k = k + 1;
   }
 }
@@ -937,7 +939,7 @@ fn flush_out(con: &Serial, out: &mut Vec[u64]) {
   while k < vec_len(out) {
     let ch = u_at(out, k);
     if ch <= 255 {
-      serial_write(con, ch);
+      serial_write(con, cast[u8](ch));
     }
     k = k + 1;
   }
@@ -2119,7 +2121,7 @@ fn str_val(v: &mut Vr, p: &Parser, s: u64, e: u64) -> u64 {
     invariant k <= blen(bytes)
   {
     let ik = num(&mut v, k);
-    let bk = num(&mut v, bget(bytes, k));
+    let bk = num(&mut v, cast[u64](bget(bytes, k)));
     d = app3(&mut v, OP_STORE, d, ik, bk);
     k = k + 1;
   }
@@ -2633,7 +2635,7 @@ fn eval_bin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut 
     return signed_arith(&mut v, m, op, ta, tb, ity, st, i);
   }
   if op == P_AMP || op == P_PIPE || op == P_CARET || op == P_SHL || op == P_SHR {
-    return bitwise(&mut v, m, p, op, n.a, n.b, ta, tb, ity, &mut st);
+    return bitwise(&mut v, m, p, op, n.a, n.b, ta, tb, ity, &mut st, i);
   }
   if op == P_PLUS || op == P_STAR {
     let t = app2(&mut v, bin_op(op), ta, tb);
@@ -2667,12 +2669,12 @@ fn eval_bin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut 
 /// Bitwise operators on an unsigned type, as stage0's `bitwise`: a low mask
 /// is `mod`, a shift is a multiplication or division by a power of two, and
 /// the rest is a fresh value with facts that always hold.
-fn bitwise(v: &mut Vr, m: &Mono, p: &Parser, op: u64, a: u64, b: u64, ta: u64, tb: u64, ity: u64, st: &mut VState) -> u64 {
+fn bitwise(v: &mut Vr, m: &Mono, p: &Parser, op: u64, a: u64, b: u64, ta: u64, tb: u64, ity: u64, st: &mut VState, i: u64) -> u64 {
   if op == P_SHL || op == P_SHR {
     let w = int_bits(m, ity);
     let tw = num(&mut v, w);
     let g = app2(&mut v, OP_LT, tb, tw);
-    prove(&mut v, st, g);
+    prove(&mut v, st, g, i, VC_SHIFT);
     let bn = node_at(p.nodes, b);
     let mut pw = 0;
     if bn.kind == E_INT {
@@ -2691,7 +2693,7 @@ fn bitwise(v: &mut Vr, m: &Mono, p: &Parser, op: u64, a: u64, b: u64, ta: u64, t
     let t = app2(&mut v, OP_MUL, ta, pw);
     let max = int_max(&mut v, m, ity);
     let g2 = app2(&mut v, OP_LE, t, max);
-    prove(&mut v, st, g2);
+    prove(&mut v, st, g2, i, VC_OVERFLOW);
     return mk_u(&mut v, t);
   }
   // `x & (2^k - 1)` keeps the low k bits.
@@ -3152,12 +3154,6 @@ fn need_lt(v: &mut Vr, st: &VState, i: u64, x: u64, lim: u64) {
   prove(&mut v, st, g, i, VC_BOUNDS);
 }
 
-/// `(<= x 255)` proved.
-fn need_byte(v: &mut Vr, st: &VState, i: u64, x: u64) {
-  let g = app2(&mut v, OP_LE, x, v.t_255);
-  prove(&mut v, st, g, i, VC_BYTE);
-}
-
 /// A fresh u64 that is at most `hi`.
 fn fresh_upto(v: &mut Vr, st: &mut VState, hint: Str, hi: u64) -> u64 {
   let h = atom_str(&mut v, hint);
@@ -3273,9 +3269,6 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     let ix = term(v, x1);
     let g = app2(&mut v, OP_LT, ix, a0.a);
     prove(&mut v, st, g, i, VC_BOUNDS);
-    if name_is(p, i, "bset") {
-      need_byte(&mut v, st, i, term(v, x2));
-    }
     let d = app3(&mut v, OP_STORE, a0.b, ix, term(v, x2));
     let nb = mk(&mut v, VV_BUF, 0, a0.a, d, 0, 0);
     if name_is(p, i, "set") {
@@ -3284,8 +3277,8 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     put_back(&mut v, m, p, &mut st, u_at(args, 0), nb);
     return v.unit;
   }
+  // A u8 always fits in a byte: the type says what E-VERIFY-BYTE used to prove.
   if name_is(p, i, "serial_write") {
-    need_byte(&mut v, st, i, term(v, x1));
     return v.unit;
   }
   if name_is(p, i, "serial_read") {
@@ -3413,7 +3406,6 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
   if name_is(p, i, "frame_read8") || name_is(p, i, "frame_write8") {
     need_lt(&mut v, st, i, term(v, x1), 4096);
     if name_is(p, i, "frame_write8") {
-      need_byte(&mut v, st, i, term(v, x2));
       return v.unit;
     }
     return fresh_upto(&mut v, &mut st, "frame_read8", 255);
@@ -3562,8 +3554,6 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     prove(&mut v, st, g2, i, VC_BOUNDS);
     let tm = num(&mut v, max);
     if name_is(p, i, "mmio_write8") || name_is(p, i, "mmio_write16") || name_is(p, i, "mmio_write32") || name_is(p, i, "mmio_write64") {
-      let g3 = app2(&mut v, OP_LE, term(v, x2), tm);
-      prove(&mut v, st, g3, i, VC_BYTE);
       return v.unit;
     }
     let n = node_at(p.nodes, i);
@@ -3612,8 +3602,6 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     prove(&mut v, st, g2, i, VC_BOUNDS);
     let tm = num(&mut v, max);
     if name_is(p, i, "dma_write8") || name_is(p, i, "dma_write16") || name_is(p, i, "dma_write32") || name_is(p, i, "dma_write64") {
-      let g3 = app2(&mut v, OP_LE, term(v, x2), tm);
-      prove(&mut v, st, g3, i, VC_BYTE);
       return v.unit;
     }
     let n = node_at(p.nodes, i);
@@ -3645,9 +3633,6 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     let g = app2(&mut v, OP_LE, end, g_count(v, x0));
     prove(&mut v, st, g, i, VC_BOUNDS);
     if name_is(p, i, "pio_out8") || name_is(p, i, "pio_out16") || name_is(p, i, "pio_out32") {
-      let tm = num(&mut v, max);
-      let g2 = app2(&mut v, OP_LE, term(v, x2), tm);
-      prove(&mut v, st, g2, i, VC_BYTE);
       return v.unit;
     }
     let n = node_at(p.nodes, i);
