@@ -14,10 +14,14 @@ const PREC = {
   or: 2,
   and: 3,
   compare: 4,
-  additive: 5,
-  multiplicative: 6,
-  unary: 7,
-  field: 8,
+  bit_or: 5,
+  bit_xor: 6,
+  bit_and: 7,
+  shift: 8,
+  additive: 9,
+  multiplicative: 10,
+  unary: 11,
+  field: 12,
 };
 
 const commaSep1 = (rule) => seq(rule, repeat(seq(',', rule)));
@@ -257,6 +261,10 @@ module.exports = grammar({
         [prec.left, PREC.or, '||'],
         [prec.left, PREC.and, '&&'],
         [prec.left, PREC.compare, choice('==', '!=', '<', '<=', '>', '>=')],
+        [prec.left, PREC.bit_or, '|'],
+        [prec.left, PREC.bit_xor, '^'],
+        [prec.left, PREC.bit_and, '&'],
+        [prec.left, PREC.shift, choice('<<', '>>')],
         [prec.left, PREC.additive, choice('+', '-')],
         [prec.left, PREC.multiplicative, choice('*', '/', '%')],
       ];

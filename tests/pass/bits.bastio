@@ -1,0 +1,68 @@
+// expect-exit: 42
+// Bitwise operators (docs/integers.md, step 3) on unsigned types. A low
+// mask is `mod`, a shift by a constant is a multiplication or division by a
+// power of two, and a left shift is proved to lose no bits.
+
+// A page-table entry: flags in the low 12 bits, the frame above them.
+fn pte(frame: u64, flags: u64) -> u64
+  requires frame < 1048576 && flags < 4096
+{
+  return (frame << 12) | flags;
+}
+
+fn present(e: u64) -> bool {
+  return e & 1 == 1;
+}
+
+// The PIT divisor goes out low byte first.
+fn split(d: u16) -> u8 {
+  let lo: u8 = cast[u8](d & 255);
+  let hi: u8 = cast[u8](d >> 8);
+  return wrap_add(lo, hi);
+}
+
+// A little-endian load from four bytes.
+fn le32(b0: u8, b1: u8, b2: u8, b3: u8) -> u32 {
+  let w0: u32 = cast[u32](b0);
+  let w1: u32 = cast[u32](b1) << 8;
+  let w2: u32 = cast[u32](b2) << 16;
+  let w3: u32 = cast[u32](b3) << 24;
+  return w0 | w1 | w2 | w3;
+}
+
+// A shift by a variable amount, proved less than the width.
+fn bit(n: u64) -> u64
+  requires n < 64
+{
+  return 1 << n;
+}
+
+fn parity(x: u8) -> u8 {
+  let a: u8 = x ^ (x >> 4);
+  let b: u8 = a ^ (a >> 2);
+  let c: u8 = b ^ (b >> 1);
+  return c & 1;
+}
+
+fn main() -> u64 {
+  let e = pte(5, 3);
+  if e != 20483 || !present(e) || present(e & !1) {
+    return 1;
+  }
+  if split(4660) != 70 {            // 0x1234: 0x34 + 0x12
+    return 2;
+  }
+  if le32(120, 86, 52, 18) != 305419896 {   // 0x12345678
+    return 3;
+  }
+  if bit(40) != 1099511627776 || parity(7) != 1 || parity(3) != 0 {
+    return 4;
+  }
+  let m: u8 = 15;
+  let n: u8 = !m;                   // 240
+  let k: u16 = 1;
+  if n != 240 || (m | n) != 255 || (m & n) != 0 || (cast[u64](n) >> k) != 120 {
+    return 5;
+  }
+  return 42;
+}

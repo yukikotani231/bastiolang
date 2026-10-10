@@ -2066,6 +2066,12 @@ fn ck_named(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64
   }
   if k == E_NOT {
     let t = ck_expr(&mut c, &mut m, p, n.a);
+    // On an unsigned integer, `!` flips every bit. It is recorded even on a
+    // u64: the verifier tells it from a boolean `!` by the record.
+    if !c.failed && is_int(m, t) && !is_signed(m, t) {
+      vec_push(&mut c.int_ops, IntOp { x: c.env, node: i, ty: t });
+      return t;
+    }
     if !c.failed {
       expect_ty(&mut c, p, t, c.tbool, n.a);
     }
@@ -2091,6 +2097,17 @@ fn ck_named(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64
     if n.v == P_IMPLIES {
       cfail(&mut c, p, i, C_TYPE);            // `==>` belongs to specifications
       return 0;
+    }
+    if n.v == P_SHL || n.v == P_SHR {
+      // A shift amount has its own type: a literal there is a u64.
+      let ta = ck_expr(&mut c, &mut m, p, n.a);
+      let tb = ck_expr(&mut c, &mut m, p, n.b);
+      if c.failed {
+        return 0;
+      }
+      let t = bin_type(&mut c, m, p, n.v, ta, tb, i);
+      note_int_op(&mut c, m, i, t);
+      return t;
     }
     if n.v != P_ANDAND && n.v != P_OROR {
       let ts = operands(&mut c, &mut m, p, n.a, n.b);
@@ -2239,6 +2256,12 @@ fn note_int_op(c: &mut Checker, m: &Mono, i: u64, t: u64) {
   }
 }
 
+/// `&`, `|`, `^`, `<<`, `>>`: on unsigned integers only, never in
+/// specifications.
+fn is_bitwise(op: u64) -> bool {
+  return op == P_AMP || op == P_PIPE || op == P_CARET || op == P_SHL || op == P_SHR;
+}
+
 fn bin_type(c: &mut Checker, m: &Mono, p: &Parser, op: u64, a: u64, b: u64, loc: u64) -> u64 {
   let order = op == P_LT || op == P_LE || op == P_GT || op == P_GE;
   if op == P_PLUS || op == P_MINUS || op == P_STAR || op == P_SLASH || op == P_PERCENT || order {
@@ -2254,6 +2277,14 @@ fn bin_type(c: &mut Checker, m: &Mono, p: &Parser, op: u64, a: u64, b: u64, loc:
       return c.tbool;
     }
     return want;
+  }
+  if is_bitwise(op) {
+    // Unsigned integers, of one type except a shift amount.
+    let shift = op == P_SHL || op == P_SHR;
+    if !is_int(m, a) || is_signed(m, a) || !is_int(m, b) || is_signed(m, b) || (a != b && !shift) {
+      cfail(&mut c, p, loc, C_TYPE);
+    }
+    return a;
   }
   if op == P_EQEQ || op == P_NE {
     if a != b || !(is_int(m, a) || a == c.tbool) {
@@ -2873,6 +2904,10 @@ fn ck_spec(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u64 
     return c.tu64;
   }
   if k == E_BIN {
+    if is_bitwise(n.v) {
+      cfail(&mut c, p, i, C_TYPE);            // not available in specifications yet
+      return 0;
+    }
     let ta = ck_spec(&mut c, &mut m, p, n.a, ens);
     let tb = ck_spec(&mut c, &mut m, p, n.b, ens);
     if c.failed {
