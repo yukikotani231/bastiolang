@@ -52,7 +52,7 @@ What the compiler needs in order to be written in Bastio. Structs come first (re
 
 - [ ] bastioc1, written in Bastio, produces the same output as stage0 (differential testing)
   - [x] Lexer (`stage1/lexer.bastio`, done 2026-10-10): the same tokens and lexical errors as stage0 on every source in this repository and in BastiOS (`stage1/difftest.sh`, run in CI)
-  - [ ] Parser
+  - [x] Parser (`stage1/parser.bastio`, done 2026-10-10): the same syntax tree as stage0 (`--dump-ast`) on every source, and the same first-error position on damaged copies of them (`stage1/mutate.py`)
   - [ ] Checker (types and linearity)
   - [ ] Verifier (talks to Z3 through a `Child`)
   - [ ] C code generation

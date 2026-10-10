@@ -11,13 +11,69 @@ const K_EOF: u64 = 0;
 const K_INT: u64 = 1;          // `val` is the value
 const K_STR: u64 = 2;          // the text between the quotes, escapes not yet decoded
 const K_IDENT: u64 = 3;
-const K_KEYWORD: u64 = 4;      // the text is the keyword
-const K_PUNCT: u64 = 5;        // the text is the operator or punctuation
+const K_KEYWORD: u64 = 4;      // `val` is its code (KW_*)
+const K_PUNCT: u64 = 5;        // `val` is its code (P_*)
 const K_ERROR: u64 = 6;        // a lexical error at `line`:`col`
 
 // Sources are at most 2^40 bytes, so positions and counts never overflow.
 const SRC_MAX: u64 = 1099511627776;
 const U64_MAX: u64 = 18446744073709551615;
+
+// Keyword codes.
+const KW_FN: u64 = 1;
+const KW_STRUCT: u64 = 2;
+const KW_ENUM: u64 = 3;
+const KW_MATCH: u64 = 4;
+const KW_IS: u64 = 5;
+const KW_SPEC: u64 = 6;
+const KW_CONST: u64 = 7;
+const KW_LET: u64 = 8;
+const KW_MUT: u64 = 9;
+const KW_IF: u64 = 10;
+const KW_ELSE: u64 = 11;
+const KW_WHILE: u64 = 12;
+const KW_RETURN: u64 = 13;
+const KW_IMPORT: u64 = 14;
+const KW_UNREACHABLE: u64 = 15;
+const KW_REQUIRES: u64 = 16;
+const KW_ENSURES: u64 = 17;
+const KW_INVARIANT: u64 = 18;
+const KW_ASSERT: u64 = 19;
+const KW_FORALL: u64 = 20;
+const KW_TRUE: u64 = 21;
+const KW_FALSE: u64 = 22;
+
+// Operator and punctuation codes.
+const P_IMPLIES: u64 = 30;     // ==>
+const P_EQEQ: u64 = 31;
+const P_FATARROW: u64 = 32;    // =>
+const P_NE: u64 = 33;
+const P_LE: u64 = 34;
+const P_GE: u64 = 35;
+const P_ANDAND: u64 = 36;
+const P_OROR: u64 = 37;
+const P_ARROW: u64 = 38;       // ->
+const P_COLONCOLON: u64 = 39;
+const P_LPAREN: u64 = 40;
+const P_RPAREN: u64 = 41;
+const P_LBRACKET: u64 = 42;
+const P_RBRACKET: u64 = 43;
+const P_LBRACE: u64 = 44;
+const P_RBRACE: u64 = 45;
+const P_COMMA: u64 = 46;
+const P_SEMI: u64 = 47;
+const P_COLON: u64 = 48;
+const P_AMP: u64 = 49;
+const P_DOT: u64 = 50;
+const P_PLUS: u64 = 51;
+const P_MINUS: u64 = 52;
+const P_STAR: u64 = 53;
+const P_SLASH: u64 = 54;
+const P_PERCENT: u64 = 55;
+const P_EQ: u64 = 56;
+const P_LT: u64 = 57;
+const P_GT: u64 = 58;
+const P_BANG: u64 = 59;
 
 struct Tok { kind: u64, start: u64, end: u64, line: u64, col: u64, val: u64 }
 
@@ -64,17 +120,33 @@ fn spells(src: &Bytes, s: u64, e: u64, w: Str) -> bool
   return true;
 }
 
-fn is_keyword(src: &Bytes, s: u64, e: u64) -> bool
+/// The keyword code of `src[s..e]`, or 0 if it is not a keyword.
+fn keyword(src: &Bytes, s: u64, e: u64) -> u64
   requires s <= e && e <= blen(src)
 {
-  return spells(src, s, e, "fn") || spells(src, s, e, "struct") || spells(src, s, e, "enum")
-    || spells(src, s, e, "match") || spells(src, s, e, "is") || spells(src, s, e, "spec")
-    || spells(src, s, e, "const") || spells(src, s, e, "let") || spells(src, s, e, "mut")
-    || spells(src, s, e, "if") || spells(src, s, e, "else") || spells(src, s, e, "while")
-    || spells(src, s, e, "return") || spells(src, s, e, "import") || spells(src, s, e, "unreachable")
-    || spells(src, s, e, "requires") || spells(src, s, e, "ensures") || spells(src, s, e, "invariant")
-    || spells(src, s, e, "assert") || spells(src, s, e, "forall") || spells(src, s, e, "true")
-    || spells(src, s, e, "false");
+  if spells(src, s, e, "fn") { return KW_FN; }
+  if spells(src, s, e, "struct") { return KW_STRUCT; }
+  if spells(src, s, e, "enum") { return KW_ENUM; }
+  if spells(src, s, e, "match") { return KW_MATCH; }
+  if spells(src, s, e, "is") { return KW_IS; }
+  if spells(src, s, e, "spec") { return KW_SPEC; }
+  if spells(src, s, e, "const") { return KW_CONST; }
+  if spells(src, s, e, "let") { return KW_LET; }
+  if spells(src, s, e, "mut") { return KW_MUT; }
+  if spells(src, s, e, "if") { return KW_IF; }
+  if spells(src, s, e, "else") { return KW_ELSE; }
+  if spells(src, s, e, "while") { return KW_WHILE; }
+  if spells(src, s, e, "return") { return KW_RETURN; }
+  if spells(src, s, e, "import") { return KW_IMPORT; }
+  if spells(src, s, e, "unreachable") { return KW_UNREACHABLE; }
+  if spells(src, s, e, "requires") { return KW_REQUIRES; }
+  if spells(src, s, e, "ensures") { return KW_ENSURES; }
+  if spells(src, s, e, "invariant") { return KW_INVARIANT; }
+  if spells(src, s, e, "assert") { return KW_ASSERT; }
+  if spells(src, s, e, "forall") { return KW_FORALL; }
+  if spells(src, s, e, "true") { return KW_TRUE; }
+  if spells(src, s, e, "false") { return KW_FALSE; }
+  return 0;
 }
 
 /// The byte at `i`, or 0 past the end.
@@ -87,28 +159,53 @@ fn at(src: &Bytes, i: u64) -> u64
   return 0;
 }
 
-/// How many bytes the operator or punctuation at `i` takes (0 if the byte
-/// starts none).
-fn punct_len(src: &Bytes, i: u64) -> u64
+/// The operator or punctuation at `i`: its code, or 0 if the byte starts
+/// none. `punct_len` gives its length.
+fn punct(src: &Bytes, i: u64) -> u64
   requires i < blen(src)
-  ensures result <= 3
 {
   let c = bget(src, i);
   let d = at(src, i + 1);
-  if c == 61 && d == 61 && at(src, i + 2) == 62 { return 3; }   // ==>
-  if (c == 61 && (d == 61 || d == 62)) || (c == 33 && d == 61) || (c == 60 && d == 61) || (c == 62 && d == 61) {
-    return 2;                                                    // == => != <= >=
-  }
-  if (c == 38 && d == 38) || (c == 124 && d == 124) || (c == 45 && d == 62) || (c == 58 && d == 58) {
-    return 2;                                                    // && || -> ::
-  }
-  // ( ) [ ] { } , ; : & . + - * / % = < > !
-  if c == 40 || c == 41 || c == 91 || c == 93 || c == 123 || c == 125 || c == 44 || c == 59 || c == 58
-    || c == 38 || c == 46 || c == 43 || c == 45 || c == 42 || c == 47 || c == 37 || c == 61 || c == 60
-    || c == 62 || c == 33 {
-    return 1;
-  }
+  if c == 61 && d == 61 && at(src, i + 2) == 62 { return P_IMPLIES; }
+  if c == 61 && d == 61 { return P_EQEQ; }
+  if c == 61 && d == 62 { return P_FATARROW; }
+  if c == 33 && d == 61 { return P_NE; }
+  if c == 60 && d == 61 { return P_LE; }
+  if c == 62 && d == 61 { return P_GE; }
+  if c == 38 && d == 38 { return P_ANDAND; }
+  if c == 124 && d == 124 { return P_OROR; }
+  if c == 45 && d == 62 { return P_ARROW; }
+  if c == 58 && d == 58 { return P_COLONCOLON; }
+  if c == 40 { return P_LPAREN; }
+  if c == 41 { return P_RPAREN; }
+  if c == 91 { return P_LBRACKET; }
+  if c == 93 { return P_RBRACKET; }
+  if c == 123 { return P_LBRACE; }
+  if c == 125 { return P_RBRACE; }
+  if c == 44 { return P_COMMA; }
+  if c == 59 { return P_SEMI; }
+  if c == 58 { return P_COLON; }
+  if c == 38 { return P_AMP; }
+  if c == 46 { return P_DOT; }
+  if c == 43 { return P_PLUS; }
+  if c == 45 { return P_MINUS; }
+  if c == 42 { return P_STAR; }
+  if c == 47 { return P_SLASH; }
+  if c == 37 { return P_PERCENT; }
+  if c == 61 { return P_EQ; }
+  if c == 60 { return P_LT; }
+  if c == 62 { return P_GT; }
+  if c == 33 { return P_BANG; }
   return 0;
+}
+
+fn punct_len(code: u64) -> u64
+  ensures result <= 3
+{
+  if code == P_IMPLIES { return 3; }
+  if code >= P_EQEQ && code <= P_COLONCOLON { return 2; }
+  if code == 0 { return 0; }
+  return 1;
 }
 
 fn err(line: u64, col: u64) -> Tok {
@@ -214,16 +311,18 @@ fn lex(src: &Bytes, out: &mut Vec[Tok]) -> Tok
       {
         i = i + 1;
       }
+      let kw = keyword(src, start, i);
       let mut kind = K_IDENT;
-      if is_keyword(src, start, i) { kind = K_KEYWORD; }
-      vec_push(&mut out, Tok { kind: kind, start: start, end: i, line: tl, col: tc, val: 0 });
+      if kw != 0 { kind = K_KEYWORD; }
+      vec_push(&mut out, Tok { kind: kind, start: start, end: i, line: tl, col: tc, val: kw });
       col = col + (i - start);
     } else {
-      let k = punct_len(src, i);
+      let code = punct(src, i);
+      let k = punct_len(code);
       if k == 0 || i + k > n {
         return err(tl, tc);
       }
-      vec_push(&mut out, Tok { kind: K_PUNCT, start: i, end: i + k, line: tl, col: tc, val: 0 });
+      vec_push(&mut out, Tok { kind: K_PUNCT, start: i, end: i + k, line: tl, col: tc, val: code });
       i = i + k;
       col = col + k;
     }

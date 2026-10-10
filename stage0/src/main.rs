@@ -10,6 +10,8 @@
 //   --dump-smt  print every query sent to the solver
 //   --dump-tokens  print the tokens of one file (see `lexer::dump`) and exit;
 //               a lexical error prints `error line:col` and exits 1
+//   --dump-ast  print the parse of one file (see `dump.rs`) and exit; an
+//               error prints `error line:col` and exits 1
 //   --trusted-base  list and count the hand-written trusted base, then exit
 //   --target    `hosted` (default): a normal program on the C library
 //               `kernel`: freestanding C for a bare-metal x86-64 kernel (implies --emit-c)
@@ -22,6 +24,7 @@ mod ast;
 mod check;
 mod codegen;
 mod diag;
+mod dump;
 mod lexer;
 mod mono;
 mod parser;
@@ -109,6 +112,7 @@ fn main() {
     let mut emit_c = false;
     let mut dump_smt = false;
     let mut dump_tokens = false;
+    let mut dump_ast = false;
     let mut target = codegen::Target::Hosted;
     let mut out: Option<String> = None;
     let mut inputs: Vec<String> = Vec::new();
@@ -119,6 +123,7 @@ fn main() {
             "--emit-c" => emit_c = true,
             "--dump-smt" => dump_smt = true,
             "--dump-tokens" => dump_tokens = true,
+            "--dump-ast" => dump_ast = true,
             "--trusted-base" => {
                 print!("{}", codegen::trusted_base());
                 return;
@@ -169,6 +174,32 @@ fn main() {
                 exit(1);
             }
         }
+        return;
+    }
+    if dump_ast {
+        let path = Path::new(&inputs[0]);
+        let src = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            eprintln!("bastioc0: cannot read {}: {}", inputs[0], e);
+            exit(2)
+        });
+        let err = |d: diag::Diag| -> ! {
+            println!("error {}:{}", d.pos.line, d.pos.col);
+            exit(1)
+        };
+        let toks = lexer::lex(&src, 0).unwrap_or_else(|d| err(d));
+        let mut i = 0;
+        while toks[i].tok == lexer::Tok::Import {
+            let lexer::Tok::Str(name) = &toks[i + 1].tok else { err(diag::Diag::new("E-PARSE", toks[i + 1].pos, "")) };
+            if toks[i + 2].tok != lexer::Tok::Semi {
+                err(diag::Diag::new("E-PARSE", toks[i + 2].pos, ""));
+            }
+            println!("(import {}:{} {})", toks[i].pos.line, toks[i].pos.col, name.iter().map(|x| format!("{:02x}", x)).collect::<String>());
+            i += 3;
+        }
+        let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let mut parser = parser::Parser::new(toks[i..].to_vec(), dir, HashMap::new());
+        let prog = parser.program().unwrap_or_else(|d| err(d));
+        print!("{}", dump::program(&prog));
         return;
     }
     let input = inputs.join(" ");
