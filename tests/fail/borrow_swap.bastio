@@ -1,0 +1,23 @@
+// expect-error: E-VERIFY-OWN
+// What `pt_borrow` lends must come back: swapping in another table would
+// leave the tree pointing at one page while the caller owns it too.
+fn swap(t: &mut PageTable, spare: &mut PageTable) {
+  let a = t;
+  let b = spare;
+  t = b;
+  spare = a;
+}
+
+fn main(pool: &mut Pool) -> u64 {
+  if pool_size(pool) < 3 {
+    return 1;
+  }
+  let mut l2 = pt_new(pool_take(&mut pool, 0), 2);
+  pt_put(&mut l2, 0, pt_new(pool_take(&mut pool, 1), 1));
+  let mut spare = pt_new(pool_take(&mut pool, 2), 1);
+  pt_borrow(&mut l2, 0, swap, &mut spare);
+  pool_give(&mut pool, pt_free(spare));
+  pool_give(&mut pool, pt_free(pt_take(&mut l2, 0)));
+  pool_give(&mut pool, pt_free(l2));
+  return 0;
+}
