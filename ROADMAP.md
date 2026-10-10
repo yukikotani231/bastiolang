@@ -25,6 +25,7 @@ Design consequences:
 2. Proofs, capabilities and specifications are ghost and leave nothing in the generated code (zero overhead).
 3. The trusted base (assembly, built-in primitives, the runtime prelude) is listed and counted mechanically. Growth gets reviewed.
 4. Every new feature comes with examples in both `tests/pass` and `tests/fail`: what should be rejected is shown to be rejected.
+5. Performance is measured, not assumed (see "Performance"). A change that makes generated code, the compiler or the kernel measurably slower says so in its PR, with numbers.
 
 ## v0 (done)
 
@@ -78,6 +79,20 @@ Decided 2026-10-10: BastiOS should run existing Linux programs, not only program
 - [ ] Translate the common calls (`read`, `write`, `open`, `close`, `mmap`, `brk`, `exit`, `fork`/`execve`, ...) onto BastiOS services, growing until a static busybox shell runs
 
 The layer is written in Bastio, so it is held to the same memory-safety proofs as the rest of the kernel. This is the opposite of fz, where the compatibility layer was assembly kept outside verification. User programs themselves are not trusted; page tables isolate them, so a misbehaving Linux binary can only fault itself. Only the small entry stub (saving registers on `syscall`) belongs to the trusted assembly base.
+
+## Performance
+
+Safety must not cost speed at run time; that is the point of proving it instead of checking it. Three things are tracked:
+1. **Generated code.** Zero runtime checks is already an invariant, but speed is not yet measured. Compare Bastio programs with equivalent hand-written C (same algorithm, `-O2`) on a small benchmark set: a byte-stream decoder, a page allocator loop, vector-heavy code.
+2. **Compile time.** Most of it is Z3. Track proof time per file and the slowest obligations, so a spec that makes the solver crawl is noticed when it lands, not months later. Self-hosting (v2) must stay practical: stage1 compiling itself should take seconds, not minutes.
+3. **Kernel paths.** In BastiOS: system-call round trip, context switch, page fault to resolution, process spawn and teardown.
+
+- [ ] `bench/` with the benchmark set above and a script that prints one line per measurement (generated-code time vs C, compile and proof time per file)
+- [ ] CI runs it and keeps the numbers as an artifact, so a regression shows up next to the change that caused it
+- [ ] stage1 data structures: the phases written so far use linear searches (types, instances, places, variables). Fine for today's sources (a few ms per file); replace with hashing or indexed lookups before self-compilation if measurements show they dominate
+- [ ] BastiOS: a `bench` shell command (or test mode) that times the kernel paths above in QEMU (relative numbers only; QEMU timing is not hardware timing)
+
+**Review cadence.** Performance is reviewed at every roadmap milestone (each checked item in v2 to v4) and whenever a phase of the self-hosted compiler lands: run `bench/`, compare with the previous numbers, and note anything that got slower in the PR.
 
 ## Open design questions
 
