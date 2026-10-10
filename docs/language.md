@@ -140,7 +140,7 @@ fn main(con: &mut Serial) -> u64 {
 
 | Type | Meaning |
 | --- | --- |
-| `u64` | Unsigned 64-bit integer, the only integer type. Arithmetic is proved to stay in range; it never wraps |
+| `u64` | Unsigned 64-bit integer, the only integer type for now (narrower and signed ones are designed in [integers.md](integers.md)). Arithmetic is proved to stay in range; it never wraps |
 | `bool` | `true` or `false` |
 | `Str` | A string literal: immutable bytes whose length and contents are known at compile time. Never freed |
 | A struct or enum with no linear part | See [Structs](#structs) and [Enums](#enums-and-match) |
