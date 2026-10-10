@@ -911,3 +911,34 @@ fn report_cex(v: &mut Vr, m: &Mono, p: &Parser, z: &mut Child, o: Obl, rep: &mut
   vec_free(out);
   vec_free(resp);
 }
+
+/// Commands recorded before the solvers are run on them (see
+/// `verify_batched`).
+const SOLVE_BATCH: u64 = 200000;
+
+/// `verify_program` and `solve_par` in batches: once a batch of functions
+/// has recorded SOLVE_BATCH commands, they are proved, and everything made
+/// for them is dropped, so the verifier's memory is that of one batch, not
+/// of the whole program. The answer is the same: every function is proved
+/// in its own scope after the same preamble, and the first function that
+/// fails, in program order, is the one reported, since batches are proved
+/// in order and later ones are not started. The dumps keep one log for
+/// the whole program. True if every obligation holds.
+fn verify_batched(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, h: &Host, rep: &mut Vec[u64], jobs: u64) -> bool {
+  verify_begin(&mut v, c, &mut m, p);
+  let mark = vr_mark(v);
+  let n = vec_len(m.fns);
+  let mut ok = true;
+  let mut k = 0;
+  while ok && k < n {
+    verify_nth(&mut v, c, &mut m, p, k);
+    k = k + 1;
+    if k >= n || vec_len(v.log) >= vadd(mark.log, SOLVE_BATCH) {
+      ok = solve_par(&mut v, m, p, h, &mut rep, jobs);
+      if ok {
+        vr_cut(&mut v, mark);
+      }
+    }
+  }
+  return ok;
+}

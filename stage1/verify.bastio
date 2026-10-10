@@ -6176,7 +6176,9 @@ fn buffers_kept(v: &mut Vr, m: &mut Mono, p: &Parser, x: u64) {
   }
 }
 
-fn verify_program(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
+/// What comes before the first function: the summaries, and the solver
+/// preamble.
+fn verify_begin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
   summarize(&mut v, c, &mut m, p);
   count_gate(m, p, "vcount", &mut v.cnt_fns);
   count_gate(m, p, "bdec", &mut v.dec_fns);
@@ -6184,11 +6186,13 @@ fn verify_program(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
   send(&mut v, CMD_DECL, v.t_poolsize, SO_INT);
   let r = in_range(&mut v, v.t_zero, v.t_poolsize, v.t_flimit);
   assert_tm(&mut v, r);
-  // Each function gets its own solver scope: what is declared and assumed
-  // while verifying one (some of it quantified) must not burden the queries
-  // for all later ones.
-  let mut k = 0;
-  while k < vec_len(m.fns) {
+}
+
+/// Verifies the k-th function. Each function gets its own solver scope:
+/// what is declared and assumed while verifying one (some of it
+/// quantified) must not burden the queries for all later ones.
+fn verify_nth(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, k: u64) {
+  if k < vec_len(m.fns) {
     let x = u_at(m.fns, k);
     if exported_x(m, p, x) {
       buffers_kept(&mut v, &mut m, p, x);
@@ -6198,6 +6202,39 @@ fn verify_program(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
     send(&mut v, CMD_PUSH, 0, 0);
     verify_fn(&mut v, c, &mut m, p, x);
     send(&mut v, CMD_POP, 0, 0);
+  }
+}
+
+fn verify_program(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
+  verify_begin(&mut v, c, &mut m, p);
+  let mut k = 0;
+  while k < vec_len(m.fns) {
+    verify_nth(&mut v, c, &mut m, p, k);
     k = k + 1;
   }
+}
+
+/// The lengths of the tables that grow while functions are verified.
+/// Nothing made while verifying one function is used once its scope is
+/// closed and its obligations are proved, so cutting the tables back to a
+/// mark taken after `verify_begin` frees all of it (see `b1_verify`).
+struct VMark { pool: u64, tms: u64, targs: u64, vals: u64, kids: u64, log: u64, obls: u64, snaps: u64, msg: u64, mpool: u64 }
+
+fn vr_mark(v: &Vr) -> VMark {
+  return VMark { pool: vec_len(v.pool), tms: vec_len(v.tms), targs: vec_len(v.targs), vals: vec_len(v.vals),
+    kids: vec_len(v.kids), log: vec_len(v.log), obls: vec_len(v.obls), snaps: vec_len(v.snaps),
+    msg: vec_len(v.msg), mpool: vec_len(v.mpool) };
+}
+
+fn vr_cut(v: &mut Vr, k: VMark) {
+  while vec_len(v.pool) > k.pool { vec_pop(&mut v.pool); }
+  while vec_len(v.tms) > k.tms { vec_pop(&mut v.tms); }
+  while vec_len(v.targs) > k.targs { vec_pop(&mut v.targs); }
+  while vec_len(v.vals) > k.vals { vec_pop(&mut v.vals); }
+  while vec_len(v.kids) > k.kids { vec_pop(&mut v.kids); }
+  while vec_len(v.log) > k.log { vec_pop(&mut v.log); }
+  while vec_len(v.obls) > k.obls { vec_pop(&mut v.obls); }
+  while vec_len(v.snaps) > k.snaps { vec_pop(&mut v.snaps); }
+  while vec_len(v.msg) > k.msg { vec_pop(&mut v.msg); }
+  while vec_len(v.mpool) > k.mpool { vec_pop(&mut v.mpool); }
 }
