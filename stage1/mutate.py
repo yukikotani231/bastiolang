@@ -3,7 +3,8 @@
 # random ways (a word deleted, duplicated or cut off, punctuation dropped
 # in) and checks that astdump and `bastioc0 --dump-ast` still print the
 # same thing, which for most mutants is the position of the first error.
-# Deterministic: the seed and the number of mutants per file are arguments.
+# Mutants that are not valid UTF-8 are skipped: stage0 cannot even read
+# them. Deterministic: the seed and the number of mutants per file are arguments.
 #   usage: mutate.py BASTIOC ASTDUMP SEED PER_FILE FILE...
 import os, random, subprocess, sys, tempfile
 
@@ -32,6 +33,10 @@ with tempfile.TemporaryDirectory() as tmp:
                 s[j:j + 1] = random.choice(PUNCT)
                 w = [bytes(s)]
             m = b' '.join(w)
+            try:
+                m.decode('utf-8')
+            except UnicodeDecodeError:
+                continue  # stage0 refuses files that are not UTF-8 before lexing
             open(path, 'wb').write(m)
             want = subprocess.run([bastioc, '--dump-ast', path], capture_output=True).stdout
             got = subprocess.run([astdump, path], capture_output=True).stdout
