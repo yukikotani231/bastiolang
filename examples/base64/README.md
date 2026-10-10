@@ -7,7 +7,7 @@ adopted in first: replace one parser in a C code base, keep the rest.
 | File | What it is |
 | --- | --- |
 | `base64.bastio` | The codec: strict RFC 4648 base64 decoding and encoding. Proved |
-| `lib.bastio` | The C API: `export fn base64_decode` and `base64_encode`. Proved |
+| `lib.bastio` | The C API: `export fn base64_decode`, `base64_encode` and `base64_encode_into`. Proved |
 | `test.c` | The C harness: RFC 4648 vectors, a differential fuzz, a benchmark |
 | `run.sh` | Generates `base64.c` and `base64.h` from `lib.bastio`, builds the harness and runs it under AddressSanitizer + UBSan (`run.sh bench`: throughput) |
 
@@ -57,7 +57,17 @@ C functions with a generated header (`run.sh` does this):
 ```c
 bst_e_Decoded base64_decode(const uint8_t *src, size_t src_len);
 bst_e_Encoded base64_encode(const uint8_t *src, size_t src_len);
+bst_e_Written base64_encode_into(const uint8_t *src, size_t src_len, uint8_t *out, size_t out_len);
 ```
+
+`base64_encode_into` writes into a buffer the caller provides, so nothing
+is allocated: it returns the number of bytes written, or `TooSmall` with
+the size needed. Its `out` parameter is `&mut Bytes` in Bastio, and the
+compiler proves that the function writes only inside it and never frees or
+replaces it (the encoder writes through `bset`, which keeps the buffer;
+anything else would be rejected with `E-EXPORT`). `test.c` checks it
+against `base64_encode` with exact-size heap buffers under AddressSanitizer,
+and that the bytes after the encoding are left alone.
 
 ```c
 #include "base64.h"
@@ -78,8 +88,9 @@ earlier version needed a trusted wrapper, `base64_capi.c`). What remains:
   `base64_encode` checks the length in Bastio and returns
   `Encoded::TooLong`, and that check is proved like the rest;
 - the proofs assume what every exported function assumes of its C caller:
-  `src` is readable for `src_len` bytes and not written during the call, and
-  the arguments are valid C values (docs/language.md, "Calling Bastio from C").
+  `src` is readable for `src_len` bytes and not written during the call;
+  `out` is writable for `out_len` bytes and overlaps nothing else; and the
+  arguments are valid C values (docs/language.md, "Calling Bastio from C").
 
 ## Speed
 

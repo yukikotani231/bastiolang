@@ -118,7 +118,7 @@ fn export_proto(f: &FnDef) -> String {
     let mut params = Vec::new();
     for prm in &f.params {
         if *prm.ty.base() == Type::Bytes {
-            params.push(format!("const uint8_t *{}", prm.name));
+            params.push(format!("{}uint8_t *{}", if prm.ty.is_mut_ref() { "" } else { "const " }, prm.name));
             params.push(format!("size_t {}_len", prm.name));
         } else {
             params.push(format!("{} {}", cty(&prm.ty), prm.name));
@@ -133,11 +133,20 @@ fn export_proto(f: &FnDef) -> String {
 /// `&Bytes` is never written through; see check.rs), and everything else is
 /// passed and returned as is.
 fn export_wrapper(f: &FnDef) -> String {
+    // A lent `&mut Bytes` is a local the callee writes through; the verifier
+    // proved it is not replaced (verify.rs, `buffers_kept`), so there is
+    // nothing to copy back.
+    let mut locals = String::new();
+    for prm in f.params.iter().filter(|p| p.ty.is_mut_ref()) {
+        locals.push_str(&format!("    bst_bytes m_{0} = {{ (uint64_t){0}_len, {0} }};\n", prm.name));
+    }
     let args: Vec<String> = f
         .params
         .iter()
         .map(|prm| {
-            if *prm.ty.base() == Type::Bytes {
+            if prm.ty.is_mut_ref() {
+                format!("&m_{}", prm.name)
+            } else if *prm.ty.base() == Type::Bytes {
                 format!("(bst_bytes){{ (uint64_t){0}_len, (unsigned char *){0} }}", prm.name)
             } else {
                 prm.name.clone()
@@ -146,7 +155,7 @@ fn export_wrapper(f: &FnDef) -> String {
         .collect();
     let call = format!("f_{}({})", cid(&f.name), args.join(", "));
     let body = if f.ret == Type::Unit { format!("{};", call) } else { format!("return {};", call) };
-    format!("{} {{\n    {}\n}}\n\n", export_proto(f), body)
+    format!("{} {{\n{}    {}\n}}\n\n", export_proto(f), locals, body)
 }
 
 /// The C header of a library: the types its exported functions return,
@@ -210,6 +219,10 @@ const HEADER_NOTES: &str = r#"/* The functions below are written in Bastio and p
  * they rely on from their C caller, which the proofs cannot check:
  * - a `const uint8_t *p, size_t p_len` pair is readable for p_len bytes and
  *   is not written (by any thread) during the call;
+ * - a `uint8_t *p, size_t p_len` pair (a buffer the function writes into) is
+ *   readable and writable for p_len bytes, overlaps no other buffer argument,
+ *   and is not used by anyone else during the call. The function writes
+ *   only inside it and never frees it;
  * - every argument is a valid value of its C type.
  * A returned `bst_bytes` (also inside a returned struct or enum) belongs to
  * the caller: release its `data` with free(). An enum is a struct with a
@@ -278,6 +291,7 @@ typedef int bst_ports;                      /* capability token: no data */
 typedef struct { uint64_t base, count; } bst_portio;
 typedef int bst_mmiospace;                  /* capability token: no data */
 typedef struct { uint64_t base, len; } bst_mmio;
+typedef uint64_t bst_dma;                   /* a lent page's physical address */
 static inline bst_buf bst_set(bst_buf b, uint64_t i, uint64_t v) { b.data[i] = v; return b; }
 "#;
 
@@ -699,6 +713,22 @@ const PRELUDE_MMIO_KERNEL: &str = r#"
 BST_MMIO_RW(8, uint8_t) BST_MMIO_RW(16, uint16_t) BST_MMIO_RW(32, uint32_t) BST_MMIO_RW(64, uint64_t)
 "#;
 
+// Pages lent to devices. A `Dma` is the page's address, like a `Frame`, so
+// lending is only a fence: every store before it reaches memory before the
+// driver can tell a device where the page is, and taking the page back
+// orders the device's writes before later reads. Accesses while lent are
+// volatile: the device may read or write the page at any time.
+const PRELUDE_DMA: &str = r#"
+static inline bst_dma bst_dma_lend(bst_frame f) { __atomic_thread_fence(__ATOMIC_SEQ_CST); return f; }
+static inline bst_frame bst_dma_take(bst_dma d) { __atomic_thread_fence(__ATOMIC_SEQ_CST); return d; }
+static inline uint64_t bst_dma_id(bst_dma d) { return (d - bst_pool_base) / 4096; }
+static inline uint64_t bst_dma_addr(bst_dma d) { return d; }
+#define BST_DMA_RW(w, t) \
+    static inline uint64_t bst_dma_read##w(bst_dma *d, uint64_t o) { return *(volatile t *)(uintptr_t)(*d + o); } \
+    static inline void bst_dma_write##w(bst_dma *d, uint64_t o, uint64_t v) { *(volatile t *)(uintptr_t)(*d + o) = (t)v; }
+BST_DMA_RW(8, uint8_t) BST_DMA_RW(16, uint16_t) BST_DMA_RW(32, uint32_t) BST_DMA_RW(64, uint64_t)
+"#;
+
 // Hosted programs simulate the window with 1 MiB of memory, indexed by the
 // low 20 bits of the address (so registers 1 MiB apart share storage).
 const PRELUDE_MMIO_HOSTED: &str = r#"
@@ -894,6 +924,7 @@ fn cty(t: &Type) -> String {
         Type::PortIo => "bst_portio".into(),
         Type::MmioSpace => "bst_mmiospace".into(),
         Type::Mmio => "bst_mmio".into(),
+        Type::Dma => "bst_dma".into(),
         Type::Struct(n) => format!("bst_s_{}", cid(n)),
         Type::Enum(n) => format!("bst_e_{}", cid(n)),
         Type::Generic(..) => unreachable!("removed by monomorphization"),
@@ -1358,6 +1389,7 @@ pub fn prelude_parts(target: Target) -> Vec<(&'static str, &'static str)> {
             ("ports_hosted", PRELUDE_PORTS_HOSTED),
             ("mmio", PRELUDE_MMIO),
             ("mmio_hosted", PRELUDE_MMIO_HOSTED),
+            ("dma", PRELUDE_DMA),
         ],
         Target::Kernel => vec![
             ("common", PRELUDE_COMMON),
@@ -1370,6 +1402,7 @@ pub fn prelude_parts(target: Target) -> Vec<(&'static str, &'static str)> {
             ("ports_kernel", PRELUDE_PORTS_KERNEL),
             ("mmio", PRELUDE_MMIO),
             ("mmio_kernel", PRELUDE_MMIO_KERNEL),
+            ("dma", PRELUDE_DMA),
         ],
         Target::User => vec![("common", PRELUDE_COMMON), ("user", PRELUDE_USER), ("bytes_arena", PRELUDE_BYTES_ARENA), ("bytes", PRELUDE_BYTES)],
     }
@@ -1406,8 +1439,9 @@ pub fn trusted_base() -> String {
 
 /// What the proofs of an `export fn` assume about its C caller. Nothing
 /// checks these at run time; the header states them (HEADER_NOTES).
-const EXPORT_ASSUMPTIONS: [&str; 3] = [
+const EXPORT_ASSUMPTIONS: [&str; 4] = [
     "a `&Bytes` parameter's pointer is readable for its length, and nothing writes the bytes during the call",
-    "a `&Bytes` parameter's length is at most 2^60 (follows from the first: no x86-64 address space is that large)",
+    "a `&mut Bytes` parameter's pointer is readable and writable for its length, overlaps no other buffer argument, and nothing else uses it during the call",
+    "a `&Bytes` or `&mut Bytes` parameter's length is at most 2^60 (follows from the first two: no x86-64 address space is that large)",
     "every argument is a valid value of its C type (a `bool` is 0 or 1)",
 ];

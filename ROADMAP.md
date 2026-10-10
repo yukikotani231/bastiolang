@@ -80,7 +80,8 @@ Started early, alongside v1, because the kernel is the primary target and it sha
 - [ ] Running programs from files instead of images built into the kernel
 - [x] `Ports` / `PortIo`: a driver claims its I/O ports once and can touch only those; no two owners per port. BastiOS's UART, PIC and timer drivers moved from the C prelude and `platform.c` into Bastio, and so did the interrupt acknowledgement (from the trap entry assembly into the kernel loop)
 - [x] `MmioSpace` / `Mmio`: memory-mapped device registers in the 3-4 GiB device window, claimed once like ports, with bounds and alignment proved. BastiOS maps the window uncached at boot and reads the HPET through it (the local APIC still lives in trusted C until SMP moves it)
-- [ ] DMA buffers as linear in-flight tokens (docs/concurrency.md), and typed register layouts (`Mmio[R]`) if plain offsets prove clumsy
+- [x] DMA buffers as linear in-flight tokens (docs/concurrency.md): `dma_lend` turns a page into a `Dma` that cannot be freed, mapped or reused until `dma_take`, and is touched only with volatile, aligned accesses. When the device is done is the driver's word
+- [ ] Typed register layouts (`Mmio[R]`) if plain offsets prove clumsy
 - [ ] `IrqOff` and interrupt handlers (docs/concurrency.md, step 4). Not needed while BastiOS treats interrupts as events with interrupts off in the kernel
 - [ ] Allocation failure returned in the type (no abort on OOM). Enums exist now (v1 item 3); what is left is changing `alloc`, `pool_take` and friends to return them
 - [ ] Native x86-64 backend, without going through C (removes the C compiler from the trusted base)
@@ -90,7 +91,7 @@ Started early, alongside v1, because the kernel is the primary target and it sha
 What the "safe libraries callable from C" target needs (Scope, design consequence 2).
 - [x] A first demo: `examples/base64`, a strict base64 codec proved memory safe and called from a C harness, with a differential fuzz against a C decoder and a benchmark (done 2026-10-10). It first went through a hand-written wrapper, `base64_capi.c`; `export fn` replaced it
 - [x] `export fn` (done 2026-10-10): a non-static C symbol with a generated header (`--header`), no `main` required for a library. Preconditions are ruled out (`E-EXPORT`): a C caller cannot be proved to meet one, so the function checks the condition itself and returns an error, which keeps generated code free of checks. Integers, `bool` and `&Bytes` (a pointer and a length) go in; numbers, `Bytes` and structs and enums of those come out. What the proofs assume of the C caller is listed by `--trusted-base`. stage1 parses and checks it too. `examples/base64` no longer needs its hand-written wrapper
-- [ ] Caller-provided output buffers (`&mut Bytes` lent from C), so a library need not allocate; needs a guarantee that the callee does not replace the buffer
+- [x] Caller-provided output buffers (done 2026-10-10): an `export fn` may take `&mut Bytes` (`uint8_t *p, size_t p_len`), so a library need not allocate. That the function never frees or replaces the buffer is proved from the `&mut` summaries the verifier already infers (only shape-keeping writes, through any depth of calls), so the wrapper has nothing to copy back. `examples/base64` gained `base64_encode_into`
 
 ## v4: Linux compatibility
 

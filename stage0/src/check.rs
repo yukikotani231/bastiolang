@@ -128,6 +128,18 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("mmio_write16", Avail::Mem, vec![m(Mmio), U64, U64], Unit),
         ("mmio_write32", Avail::Mem, vec![m(Mmio), U64, U64], Unit),
         ("mmio_write64", Avail::Mem, vec![m(Mmio), U64, U64], Unit),
+        ("dma_lend", Avail::Mem, vec![Frame], Dma),
+        ("dma_take", Avail::Mem, vec![Dma], Frame),
+        ("dma_id", Avail::Mem, vec![r(Dma)], U64),
+        ("dma_addr", Avail::Mem, vec![r(Dma)], U64),
+        ("dma_read8", Avail::Mem, vec![m(Dma), U64], U64),
+        ("dma_read16", Avail::Mem, vec![m(Dma), U64], U64),
+        ("dma_read32", Avail::Mem, vec![m(Dma), U64], U64),
+        ("dma_read64", Avail::Mem, vec![m(Dma), U64], U64),
+        ("dma_write8", Avail::Mem, vec![m(Dma), U64, U64], Unit),
+        ("dma_write16", Avail::Mem, vec![m(Dma), U64, U64], Unit),
+        ("dma_write32", Avail::Mem, vec![m(Dma), U64, U64], Unit),
+        ("dma_write64", Avail::Mem, vec![m(Dma), U64, U64], Unit),
         ("sys_spawn", Avail::User, vec![r(Buf), U64, U64], U64),
         ("sys_wait", Avail::User, vec![U64], U64),
         ("sys_kill", Avail::User, vec![U64], U64),
@@ -157,6 +169,7 @@ pub const GHOSTS: &[(&str, Type, bool, Type)] = &[
     ("mmio_base", Type::Mmio, false, Type::U64),
     ("mmio_len", Type::Mmio, false, Type::U64),
     ("mmio_free", Type::MmioSpace, true, Type::Bool),
+    ("dma_id", Type::Dma, false, Type::U64),
 ];
 
 pub fn is_ghost(name: &str) -> bool {
@@ -240,7 +253,7 @@ fn main_caps(target: Target) -> &'static [Type] {
 /// Struct and enum definitions: unique names, known field and payload
 /// types, no type that contains itself.
 pub fn check_structs(p: &Program) -> Result<(), Diag> {
-    const RESERVED: &[&str] = &["u64", "u8", "u16", "u32", "i8", "i16", "i32", "i64", "bool", "Str", "Buf", "Bytes", "Host", "Child", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu", "Ports", "PortIo", "MmioSpace", "Mmio"];
+    const RESERVED: &[&str] = &["u64", "u8", "u16", "u32", "i8", "i16", "i32", "i64", "bool", "Str", "Buf", "Bytes", "Host", "Child", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu", "Ports", "PortIo", "MmioSpace", "Mmio", "Dma"];
     // (name, position, the types it holds directly)
     let mut defs: Vec<(String, Pos, Vec<Type>)> = Vec::new();
     for d in &p.structs {
@@ -319,7 +332,7 @@ fn overlaps(a: &str, b: &str) -> bool {
 /// (`&Bytes`, which becomes a pointer and a length).
 fn c_param_type(t: &Type) -> bool {
     match t {
-        Type::Ref(i) => **i == Type::Bytes,
+        Type::Ref(i) | Type::MutRef(i) => **i == Type::Bytes,
         t => c_value_type(t),
     }
 }
@@ -359,7 +372,7 @@ fn check_exports(p: &Program, target: Target) -> Result<(), Diag> {
         for prm in &f.params {
             if !c_param_type(&prm.ty) {
                 return Err(Diag::new("E-EXPORT", prm.pos, format!("a parameter of an exported function cannot have type `{}`", prm.ty.name()))
-                    .note("C can pass integers, `bool` and `&Bytes` (a pointer and a length)"));
+                    .note("C can pass integers, `bool`, and `&Bytes` or `&mut Bytes` (a pointer and a length)"));
             }
             let len = format!("{}_len", prm.name);
             if *prm.ty.base() == Type::Bytes && f.params.iter().any(|q| q.name == len) {
