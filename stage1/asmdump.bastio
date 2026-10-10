@@ -1,15 +1,23 @@
 // Prints the x86-64 assembly a program compiles to, in the format of
 // `bastioc0 --backend native --emit-asm` (type and linearity checking, then
 // code generation; no verification), for differential testing against
-// stage0. A program the native backend does not support yet exits 4, as
-// stage0 does.
-//   usage: asmdump FILE
+// stage0 (with --stage0, which leaves out what only stage1 does). A
+// program the native backend does not support yet exits 4, as stage0 does.
+//   usage: asmdump [--stage0] FILE
 import "loader.bastio";
 import "out.bastio";
 import "x86.bastio";
 
 fn main(con: &mut Serial, host: &mut Host) -> u64 {
-  let path = host_arg(host, 1);
+  let mut file_arg = 1;
+  let mut compat = false;
+  if host_argc(host) > 2 {
+    let flag = host_arg(host, 1);
+    compat = spells(flag, 0, blen(flag), "--stage0");
+    bfree(flag);
+    file_arg = 2;
+  }
+  let path = host_arg(host, file_arg);
   let mut p = parser_new(balloc(0), vec_new[Tok](), 0);
   let mut ld = loader_new();
   let r = load(host, &mut p, &mut ld, path, 0, 0, 0, false);
@@ -33,6 +41,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
         code = 1;
       } else {
         let mut g = x86_new();
+        g.stage0 = compat;
         if x86_program(&mut g, c, &mut m, p) {
           let mut k = 0;
           while k < vec_len(g.out) {

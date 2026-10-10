@@ -880,6 +880,12 @@ impl<'p> Verifier<'p> {
         self.spec(e, sc, &mut Vec::new())
     }
 
+    /// A loop invariant read in `st`; `old(..)` reads the function's entry.
+    fn here_inv(&mut self, e: &Expr, st: &State, cx: &FnCtx) -> Result<String, Diag> {
+        let sc = Scope { env: &st.env, old: Some(&cx.entry), result: None };
+        self.spec(e, sc, &mut Vec::new())
+    }
+
     fn stmt(&mut self, s: &Stmt, mut st: State, cx: &FnCtx) -> Result<Option<State>, Diag> {
         match &s.kind {
             StmtKind::Let { name, init, .. } => {
@@ -1001,7 +1007,7 @@ impl<'p> Verifier<'p> {
             StmtKind::While { cond, invariants, body } => {
                 // 1. invariants hold on entry
                 for inv in invariants {
-                    let t = self.here(inv, &st)?;
+                    let t = self.here_inv(inv, &st, cx)?;
                     self.prove(&st, &t, inv.pos, "E-VERIFY-INVARIANT", format!("the loop invariant `{}` on entry to the loop", render(inv)))?;
                 }
                 // 2. havoc what the body (or the condition) changes
@@ -1022,7 +1028,7 @@ impl<'p> Verifier<'p> {
                     set_path(&mut lst.env, &name, nv);
                 }
                 for inv in invariants {
-                    let t = self.here(inv, &lst)?;
+                    let t = self.here_inv(inv, &lst, cx)?;
                     lst.pc.push(t);
                 }
                 // 3. one arbitrary iteration preserves the invariants
@@ -1031,7 +1037,7 @@ impl<'p> Verifier<'p> {
                 bst.pc.push(c.clone());
                 if let Some(end) = self.block(body, bst, cx)? {
                     for inv in invariants {
-                        let t = self.here(inv, &end)?;
+                        let t = self.here_inv(inv, &end, cx)?;
                         self.prove(&end, &t, inv.pos, "E-VERIFY-INVARIANT", format!("that the loop body preserves the invariant `{}`", render(inv)))?;
                     }
                 }
@@ -2044,7 +2050,7 @@ impl<'p> Verifier<'p> {
                 None => Ok(sc.env[n].clone()),
             },
             ExprKind::Call(n, xs) if n == "old" => {
-                let old = sc.old.expect("checked: old() only in ensures");
+                let old = sc.old.expect("checked: old() only in ensures and loop invariants");
                 self.spec_val(&xs[0], Scope { env: old, old: None, result: None }, bound)
             }
             ExprKind::Str(bytes) => Ok(str_val(bytes)),
@@ -2115,7 +2121,7 @@ impl<'p> Verifier<'p> {
             }
             ExprKind::Call(name, args) => {
                 if name == "old" {
-                    let old = sc.old.expect("checked: old() only in ensures");
+                    let old = sc.old.expect("checked: old() only in ensures and loop invariants");
                     return self.spec(&args[0], Scope { env: old, old: None, result: None }, bound);
                 }
                 if let Some(sf) = self.prog.specs.iter().find(|s| &s.name == name).cloned() {

@@ -21,7 +21,9 @@
 #           (the whole assembly file), on every hosted program stage0
 #           builds; where stage0 does not support a program yet (exit 4),
 #           asmdump must not either. asmdump built by the native backend
-#           must print the same assembly for itself
+#           must print the same assembly for itself. Without --stage0,
+#           asmdump also does what stage0 does not (register arguments):
+#           the programs it builds must exit as tests/pass says
 #   driver  stage1/bastioc1.bastio  vs  bastioc0 itself: what `--check`
 #           prints on stderr and its exit status (a failed proof's
 #           sentence masked, as bastioc1 does not print it yet), the
@@ -142,7 +144,7 @@ for f in $files; do
   [ "$(target_of "$f")" = hosted ] || continue
   "$BASTIOC" --backend native --emit-asm -o "$tmp/want" "$f" 2>/dev/null; e=$?
   [ "$e" = 0 ] || [ "$e" = 4 ] || continue
-  "$tmp/asmdump" "$f" >"$tmp/got" 2>/dev/null; ge=$?
+  "$tmp/asmdump" --stage0 "$f" >"$tmp/got" 2>/dev/null; ge=$?
   if [ "$e" = 4 ] && [ "$ge" = 4 ]; then
     unsup=$((unsup+1)); match=$((match+1))
   elif [ "$e" = 0 ] && [ "$ge" = 0 ] && cmp -s "$tmp/want" "$tmp/got"; then
@@ -154,8 +156,8 @@ for f in $files; do
   fi
 done
 if "$BASTIOC" --backend native -o "$tmp/asmdump_n" stage1/asmdump.bastio 2>/dev/null \
-   && "$tmp/asmdump_n" stage1/asmdump.bastio >"$tmp/got" 2>/dev/null \
-   && "$tmp/asmdump" stage1/asmdump.bastio >"$tmp/want" 2>/dev/null \
+   && "$tmp/asmdump_n" --stage0 stage1/asmdump.bastio >"$tmp/got" 2>/dev/null \
+   && "$tmp/asmdump" --stage0 stage1/asmdump.bastio >"$tmp/want" 2>/dev/null \
    && cmp -s "$tmp/want" "$tmp/got"; then
   match=$((match+1))
 else
@@ -163,6 +165,35 @@ else
 fi
 echo "-- native: $match matched ($unsup of them unsupported, plus asmdump built natively), $differ differ"
 { [ "$differ" = 0 ] && [ "$match" -gt "$unsup" ]; } || status=1
+# What only stage1's backend does (asmdump without --stage0) has no
+# oracle: the programs it builds must exit as tests/pass says, and asmdump
+# built that way must print the same assembly for itself.
+built=0 differ=0
+for f in tests/pass/*.bastio; do
+  want=$(sed -n 's|^// expect-exit: *||p' "$f" | head -1)
+  "$tmp/asmdump" "$f" >"$tmp/prog.s" 2>/dev/null; e=$?
+  [ "$e" = 4 ] && continue
+  if [ "$e" = 0 ] && as --64 -o "$tmp/prog.o" "$tmp/prog.s" && cc -o "$tmp/prog" "$tmp/prog.o"; then
+    "$tmp/prog" </dev/null >/dev/null; got=$?
+  else
+    got="not built"
+  fi
+  if [ "$got" = "$want" ]; then
+    built=$((built+1))
+  else
+    differ=$((differ+1)); echo "DIFFER $f (built by asmdump: exit $got, want $want)"
+  fi
+done
+if "$tmp/asmdump" stage1/asmdump.bastio >"$tmp/self.s" 2>/dev/null \
+   && as --64 -o "$tmp/self.o" "$tmp/self.s" && cc -o "$tmp/asmdump_s" "$tmp/self.o" \
+   && "$tmp/asmdump_s" stage1/asmdump.bastio >"$tmp/got" 2>/dev/null \
+   && cmp -s "$tmp/self.s" "$tmp/got"; then
+  built=$((built+1))
+else
+  differ=$((differ+1)); echo "DIFFER asmdump built by itself"
+fi
+echo "-- native (stage1 only): $built programs built and run (plus asmdump built by itself), $differ differ"
+{ [ "$differ" = 0 ] && [ "$built" -gt 1 ]; } || status=1
 # The driver. The sentence after `error[CODE]:` and the hints (`  = ..`)
 # of the errors before the verifier are being ported phase by phase: where
 # bastioc1 prints none, bastioc0's are left out of the comparison (a failed

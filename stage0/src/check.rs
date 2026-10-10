@@ -485,6 +485,13 @@ struct Ctx<'a> {
     /// Each `locked` call: its position, the lock's class (the type of its
     /// contents) and the function run with the lock held.
     lock_sites: Vec<(Pos, String, String)>,
+    /// The function's parameters, which `old(..)` in a loop invariant may name.
+    params: Vec<String>,
+    /// Checking a loop invariant, where `old(..)` is allowed.
+    in_inv: std::cell::Cell<bool>,
+    /// Checking the argument of `old(..)` in a loop invariant, which may
+    /// name only parameters (they alone have a value at the call).
+    old_only: std::cell::Cell<bool>,
 }
 
 pub fn check_program(p: &mut Program, target: Target) -> Result<HashMap<String, Sig>, Diag> {
@@ -586,7 +593,7 @@ fn lock_order(graph: &[(String, Vec<String>, Vec<(Pos, String, String)>)]) -> Re
 }
 
 fn new_ctx<'a>(sigs: &'a HashMap<String, Sig>, specs: &'a [SpecFn], target: Target, ret: Type) -> Ctx<'a> {
-    Ctx { sigs, specs, target, ret, scopes: vec![Vec::new()], vars: HashMap::new(), moved: HashSet::new(), int_ops: HashMap::new(), calls: Vec::new(), lock_sites: Vec::new() }
+    Ctx { sigs, specs, target, ret, scopes: vec![Vec::new()], vars: HashMap::new(), moved: HashSet::new(), int_ops: HashMap::new(), calls: Vec::new(), lock_sites: Vec::new(), params: Vec::new(), in_inv: std::cell::Cell::new(false), old_only: std::cell::Cell::new(false) }
 }
 
 /// A spec fn may only call spec fns defined before it, so expansion terminates.
@@ -634,6 +641,7 @@ fn check_fn(f: &mut FnDef, sigs: &HashMap<String, Sig>, specs: &[SpecFn], target
         }
         let mutable = p.mutable || p.ty.is_mut_ref();
         cx.declare(&p.name, p.ty.clone(), mutable, p.pos)?;
+        cx.params.push(p.name.clone());
     }
     for r in &f.requires {
         let t = cx.spec_expr(r, false, &mut Vec::new())?;
@@ -948,10 +956,13 @@ impl<'a> Ctx<'a> {
                     return Err(Diag::new("E-LINEAR-USE", cond.pos, "a `while` condition runs many times, so it cannot consume a linear value"));
                 }
                 expect_ty(&t, &Type::Bool, cond.pos, "a `while` condition")?;
+                self.in_inv.set(true);
                 for inv in invariants.iter() {
-                    let t = self.spec_expr(inv, false, &mut Vec::new())?;
-                    expect_ty(&t, &Type::Bool, inv.pos, "a loop invariant")?;
+                    let t = self.spec_expr(inv, false, &mut Vec::new());
+                    let t = t.and_then(|t| expect_ty(&t, &Type::Bool, inv.pos, "a loop invariant"));
+                    t.inspect_err(|_| self.in_inv.set(false))?;
                 }
+                self.in_inv.set(false);
                 let before = self.moved.clone();
                 let cb = self.canon();
                 let d = self.block(body)?;
@@ -1625,7 +1636,11 @@ impl<'a> Ctx<'a> {
                     }
                     return Ok(self.ret.clone());
                 }
-                Ok(self.var_info(n, e.pos)?.ty.base().clone())
+                let t = self.var_info(n, e.pos)?.ty.base().clone();
+                if self.old_only.get() && !self.params.contains(n) {
+                    return Err(Diag::new("E-TYPE", e.pos, "`old(..)` in a loop invariant can only name the function's parameters"));
+                }
+                Ok(t)
             }
             ExprKind::Not(x) => {
                 let t = self.spec_expr(x, in_ensures, bound)?;
@@ -1666,8 +1681,16 @@ impl<'a> Ctx<'a> {
                 };
                 if name == "old" {
                     arity(1)?;
+                    if self.in_inv.get() {
+                        self.in_inv.set(false);
+                        self.old_only.set(true);
+                        let t = self.spec_expr(&args[0], false, bound);
+                        self.old_only.set(false);
+                        self.in_inv.set(true);
+                        return t;
+                    }
                     if !in_ensures {
-                        return Err(Diag::new("E-TYPE", e.pos, "`old(..)` is only allowed in `ensures`"));
+                        return Err(Diag::new("E-TYPE", e.pos, "`old(..)` is only allowed in `ensures` and loop invariants"));
                     }
                     return self.spec_expr(&args[0], false, bound);
                 }
