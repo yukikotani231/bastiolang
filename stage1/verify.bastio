@@ -83,7 +83,7 @@ const FRAME_LIMIT: u64 = 65536;
 const BOX_DEPTH: u64 = 2;
 
 struct Tm { kind: u64, a: u64, b: u64, c: u64 }
-struct Vl { kind: u64, ty: u64, a: u64, b: u64, c: u64, n: u64 }
+struct Vl { kind: u64, ty: u64, a: u64, b: u64, c: u64, n: u64, d: u64 }
 struct Cmd { kind: u64, a: u64, b: u64 }
 /// A variable (named by its source text s..e) and its value. A variable no
 /// program can name (`locked*N`, see `vlocked`) has its name in the text
@@ -125,6 +125,7 @@ const VC_UNREACHABLE: u64 = 16;
 const VC_EXPORT: u64 = 17;
 const VC_LOCKINV: u64 = 18;
 const VC_SHIFT: u64 = 19;
+const VC_LEASE: u64 = 20;
 
 fn vc_name(code: u64) -> Str {
   if code == VC_ALLOC { return "E-VERIFY-ALLOC"; }
@@ -144,6 +145,7 @@ fn vc_name(code: u64) -> Str {
   if code == VC_EXPORT { return "E-EXPORT"; }
   if code == VC_LOCKINV { return "E-VERIFY-LOCKINV"; }
   if code == VC_SHIFT { return "E-VERIFY-SHIFT"; }
+  if code == VC_LEASE { return "E-VERIFY-LEASE"; }
   return "E-VERIFY-UNREACHABLE";
 }
 
@@ -210,7 +212,7 @@ fn vr_new(m: &mut Mono, p: &Parser) -> Vr {
   let mut tms = vec_new[Tm]();
   vec_push(&mut tms, Tm { kind: 0, a: 0, b: 0, c: 0 });
   let mut vals = vec_new[Vl]();
-  vec_push(&mut vals, Vl { kind: 0, ty: 0, a: 0, b: 0, c: 0, n: 0 });
+  vec_push(&mut vals, Vl { kind: 0, ty: 0, a: 0, b: 0, c: 0, n: 0, d: 0 });
   let mut v = Vr {
     pool: vec_new[u64](), tms: tms, targs: vec_new[u64](), vals: vals, kids: vec_new[u64](),
     log: vec_new[Cmd](), counter: 0, obligations: 0, box_depth: 0, cur: 0, env: 0, cnt_fns: vec_new[u64](), counts: false,
@@ -446,6 +448,7 @@ fn push_ty(v: &mut Vr, m: &Mono, p: &Parser, t: u64) {
   else if k == TY_MMIOSPACE { push_str(&mut v, "MmioSpace"); }
   else if k == TY_MMIO { push_str(&mut v, "Mmio"); }
   else if k == TY_DMA { push_str(&mut v, "Dma"); }
+  else if k == TY_LEASE { push_str(&mut v, "Lease"); }
   else if k == TY_U8 { push_str(&mut v, "u8"); }
   else if k == TY_U16 { push_str(&mut v, "u16"); }
   else if k == TY_U32 { push_str(&mut v, "u32"); }
@@ -1247,12 +1250,19 @@ fn vl_at(v: &Vr, x: u64) -> Vl {
   if x < vec_len(v.vals) {
     return vec_get(v.vals, x);
   }
-  return Vl { kind: 0, ty: 0, a: 0, b: 0, c: 0, n: 0 };
+  return Vl { kind: 0, ty: 0, a: 0, b: 0, c: 0, n: 0, d: 0 };
 }
 
 fn mk(v: &mut Vr, kind: u64, tyx: u64, a: u64, b: u64, c: u64, n: u64) -> u64 {
   let k = vec_len(v.vals);
-  vec_push(&mut v.vals, Vl { kind: kind, ty: tyx, a: a, b: b, c: c, n: n });
+  vec_push(&mut v.vals, Vl { kind: kind, ty: tyx, a: a, b: b, c: c, n: n, d: 0 });
+  return k;
+}
+
+/// An object of type `tyx` with ghost fields a, b, c, d (n of them).
+fn mk_o(v: &mut Vr, tyx: u64, a: u64, b: u64, c: u64, d: u64, n: u64) -> u64 {
+  let k = vec_len(v.vals);
+  vec_push(&mut v.vals, Vl { kind: VV_OBJ, ty: tyx, a: a, b: b, c: c, n: n, d: d });
   return k;
 }
 
@@ -1306,9 +1316,9 @@ fn term(v: &Vr, x: u64) -> u64 {
 
 /// How many ghost fields an object of type kind `k` has.
 fn obj_fields(k: u64) -> u64 {
-  if k == TY_PT { return 3; }
+  if k == TY_PT { return 4; }
   if k == TY_POOL { return 2; }
-  if k == TY_FRAME || k == TY_MMU || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA { return 1; }
+  if k == TY_FRAME || k == TY_MMU || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA || k == TY_LEASE { return 1; }
   if k == TY_PORTIO || k == TY_MMIO { return 2; }
   return 0;
 }
@@ -1317,13 +1327,15 @@ fn obj_field(v: &Vr, x: u64, j: u64) -> u64 {
   let xv = vl_at(v, x);
   if j == 0 { return xv.a; }
   if j == 1 { return xv.b; }
-  return xv.c;
+  if j == 2 { return xv.c; }
+  return xv.d;
 }
 
 // The ghost fields by name.
 fn g_id(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 0); }       // Frame, PageTable, Dma
 fn g_level(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 1); }    // PageTable
 fn g_used(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 2); }     // PageTable
+fn g_leases(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 3); }   // PageTable
 fn g_has(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 0); }      // Pool
 fn g_size(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 1); }     // Pool
 fn g_root(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 0); }     // Mmu
@@ -1333,7 +1345,12 @@ fn g_count(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 1); }    // PortIo
 fn g_len(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 1); }      // Mmio
 
 fn mk_obj(v: &mut Vr, m: &Mono, tyx: u64, a: u64, b: u64, c: u64) -> u64 {
-  return mk(&mut v, VV_OBJ, tyx, a, b, c, obj_fields(kind_t(m, tyx)));
+  return mk_o(&mut v, tyx, a, b, c, 0, obj_fields(kind_t(m, tyx)));
+}
+
+/// A page table: id, level, used, leases.
+fn mk_pt(v: &mut Vr, tyx: u64, id: u64, level: u64, used: u64, leases: u64) -> u64 {
+  return mk_o(&mut v, tyx, id, level, used, leases, 4);
 }
 
 /// The sort of ghost field `j` of an object of type kind `k`: an array of
@@ -1363,7 +1380,8 @@ fn val_eq(v: &Vr, a: u64, b: u64) -> bool {
     return tm_eq(v, x.a, y.a) && tm_eq(v, x.b, y.b);
   }
   if k == VV_OBJ {
-    return (x.n < 1 || tm_eq(v, x.a, y.a)) && (x.n < 2 || tm_eq(v, x.b, y.b)) && (x.n < 3 || tm_eq(v, x.c, y.c));
+    return (x.n < 1 || tm_eq(v, x.a, y.a)) && (x.n < 2 || tm_eq(v, x.b, y.b)) && (x.n < 3 || tm_eq(v, x.c, y.c))
+      && (x.n < 4 || tm_eq(v, x.d, y.d));
   }
   if k == VV_STRUCT || k == VV_ENUM {
     if k == VV_ENUM && !tm_eq(v, x.a, y.a) {
@@ -1411,7 +1429,9 @@ fn merge(v: &mut Vr, c: u64, a: u64, b: u64) -> u64 {
     if x.n > 0 { f0 = ite(&mut v, c, x.a, y.a); }
     if x.n > 1 { f1 = ite(&mut v, c, x.b, y.b); }
     if x.n > 2 { f2 = ite(&mut v, c, x.c, y.c); }
-    return mk(&mut v, VV_OBJ, x.ty, f0, f1, f2, x.n);
+    let mut f3 = 0;
+    if x.n > 3 { f3 = ite(&mut v, c, x.d, y.d); }
+    return mk_o(&mut v, x.ty, f0, f1, f2, f3, x.n);
   }
   if k == VV_STRUCT || k == VV_ENUM {
     let mut tag = 0;
@@ -1528,7 +1548,9 @@ fn rebuild(v: &mut Vr, x: u64, ts: &Vec[u64]) -> u64 {
     if xv.n > 0 { f0 = next_leaf(&mut v, ts); }
     if xv.n > 1 { f1 = next_leaf(&mut v, ts); }
     if xv.n > 2 { f2 = next_leaf(&mut v, ts); }
-    return mk(&mut v, VV_OBJ, xv.ty, f0, f1, f2, xv.n);
+    let mut f3 = 0;
+    if xv.n > 3 { f3 = next_leaf(&mut v, ts); }
+    return mk_o(&mut v, xv.ty, f0, f1, f2, f3, xv.n);
   }
   if k == VV_STRUCT || k == VV_ENUM {
     let mut tag = 0;
@@ -1936,6 +1958,10 @@ fn fresh_field(v: &mut Vr, tk: u64, j: u64, hint: u64) -> u64 {
   if tk == TY_POOL {
     return v.t_poolsize;
   }
+  if tk == TY_PT && j == 3 {
+    let h = cat_str(&mut v, hint, "_leases");
+    return fresh_int(&mut v, h, v.t_zero, v.t_u64max);
+  }
   if tk == TY_PT && j == 1 {
     let h = cat_str(&mut v, hint, "_level");
     let one = num(&mut v, 1);
@@ -1956,11 +1982,13 @@ fn fresh_field(v: &mut Vr, tk: u64, j: u64, hint: u64) -> u64 {
 /// Ghost fields a loop keeps when only builtins that never change them
 /// change the object (a page table keeps its id and level).
 fn kept_by_builtins(tk: u64, j: u64) -> bool {
-  return ((tk == TY_FRAME || tk == TY_PT || tk == TY_DMA) && j == 0) || (tk == TY_PT && j == 1) || (tk == TY_POOL && j == 1)
+  return ((tk == TY_FRAME || tk == TY_PT || tk == TY_DMA) && j == 0) || (tk == TY_PT && (j == 1 || j == 3)) || (tk == TY_POOL && j == 1)
     || ((tk == TY_PORTIO || tk == TY_MMIO) && j <= 1);
 }
 
-fn fresh_obj(v: &mut Vr, m: &Mono, tyx: u64, hint: u64) -> u64 {
+/// Fresh ghost fields for an object of type `tyx`. `live`: a table that
+/// may be live at any level (a borrowed one, see `fresh_of`).
+fn fresh_obj(v: &mut Vr, m: &Mono, tyx: u64, hint: u64, live: bool) -> u64 {
   let tk = kind_t(m, tyx);
   let n = obj_fields(tk);
   let mut f0 = 0;
@@ -1969,6 +1997,8 @@ fn fresh_obj(v: &mut Vr, m: &Mono, tyx: u64, hint: u64) -> u64 {
   if n > 0 { f0 = fresh_field(&mut v, tk, 0, hint); }
   if n > 1 { f1 = fresh_field(&mut v, tk, 1, hint); }
   if n > 2 { f2 = fresh_field(&mut v, tk, 2, hint); }
+  let mut f3 = 0;
+  if n > 3 { f3 = fresh_field(&mut v, tk, 3, hint); }
   if tk == TY_PORTIO || tk == TY_MMIO {
     let sum = app2(&mut v, OP_ADD, f0, f1);
     let mut lim = v.t_plimit;
@@ -1978,7 +2008,17 @@ fn fresh_obj(v: &mut Vr, m: &Mono, tyx: u64, hint: u64) -> u64 {
     let le = app2(&mut v, OP_LE, sum, lim);
     assert_tm(&mut v, le);
   }
-  return mk(&mut v, VV_OBJ, tyx, f0, f1, f2, n);
+  // An owned table below the top is never live: it was taken out of a
+  // tree no processor ran on, or never in one (only `pt_borrow` lends a
+  // live one, and only as `&mut`).
+  if tk == TY_PT && !live {
+    let four = num(&mut v, 4);
+    let below = app2(&mut v, OP_LT, f1, four);
+    let none = app2(&mut v, OP_EQ, f3, v.t_zero);
+    let imp = app2(&mut v, OP_IMP, below, none);
+    assert_tm(&mut v, imp);
+  }
+  return mk_o(&mut v, tyx, f0, f1, f2, f3, n);
 }
 
 /// A value of type `tyx` about which nothing is known but its type.
@@ -2015,6 +2055,11 @@ fn fresh_of(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, tyx: u64, hint: u64) 
     return mk(&mut v, VV_BUF, 0, l, d, 0, 0);
   }
   if k == TY_REF || k == TY_MUTREF {
+    // A borrowed table may be one `pt_borrow` lent, with its tree's
+    // leases at any level.
+    if kind_t(m, inner_t(m, tyx)) == TY_PT {
+      return fresh_obj(&mut v, m, inner_t(m, tyx), hint, true);
+    }
     return fresh_of(&mut v, c, m, p, inner_t(m, tyx), hint);
   }
   if k == TY_UNIT {
@@ -2077,7 +2122,7 @@ fn fresh_of(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, tyx: u64, hint: u64) 
     }
     return mk(&mut v, VV_BOXK, 0, inner, 0, 0, 0);
   }
-  return fresh_obj(&mut v, m, tyx, hint);
+  return fresh_obj(&mut v, m, tyx, hint, false);
 }
 
 /// Fresh contents for a vector of `tyx`: every term of an element becomes
@@ -2247,7 +2292,9 @@ fn havoc(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, oenv: u64, keep: bool, n
     if xv.n > 0 && !(keep && kept_by_builtins(tk, 0)) { f0 = fresh_field(&mut v, tk, 0, name); }
     if xv.n > 1 && !(keep && kept_by_builtins(tk, 1)) { f1 = fresh_field(&mut v, tk, 1, name); }
     if xv.n > 2 && !(keep && kept_by_builtins(tk, 2)) { f2 = fresh_field(&mut v, tk, 2, name); }
-    return mk(&mut v, VV_OBJ, xv.ty, f0, f1, f2, xv.n);
+    let mut f3 = xv.d;
+    if xv.n > 3 && !(keep && kept_by_builtins(tk, 3)) { f3 = fresh_field(&mut v, tk, 3, name); }
+    return mk_o(&mut v, xv.ty, f0, f1, f2, f3, xv.n);
   }
   if k == VV_STRUCT || k == VV_ENUM {
     let mut tag = xv.a;
@@ -2597,6 +2644,9 @@ fn vspec_builtin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env:
   }
   if span_is(p, n.s, n.e, "pt_level") {
     return g_level(v, x);
+  }
+  if span_is(p, n.s, n.e, "pt_leases") {
+    return g_leases(v, x);
   }
   if span_is(p, n.s, n.e, "pool_size") {
     return g_size(v, x);
@@ -3057,6 +3107,9 @@ fn vcall(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VSt
   if inst == 0 && name_is(p, i, "smp_run") {
     return vsmp_run(&mut v, c, &mut m, p, i, &mut st);
   }
+  if inst == 0 && (name_is(p, i, "pt_borrow") || name_is(p, i, "pt_borrow_frame")) {
+    return vpt_borrow(&mut v, c, &mut m, p, i, &mut st);
+  }
   let n = node_at(p.nodes, i);
   let mut args = vec_new[u64]();
   let mut a = n.a;
@@ -3262,6 +3315,96 @@ fn vlocked(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut V
   return res;
 }
 
+/// `pt_borrow(&mut t, i, f, args..)`: `f` gets the table in slot `i` of `t`
+/// (`pt_borrow_frame`: the page) as its `&mut` first argument, left in
+/// place. Nothing is known about what is under it, except that it is as
+/// live as `t`: it has `t`'s leases, so `f` cannot take anything out of it
+/// while a processor may be running on the tree. `f` must hand back the
+/// same table (id, level and leases unchanged) or page.
+fn vpt_borrow(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VState) -> u64 {
+  let n = node_at(p.nodes, i);
+  let a0 = n.a;
+  let a1 = next_of(p, a0);
+  let a2 = next_of(p, a1);
+  let tn = node_at(p.nodes, a0);
+  let tp = list_text(&mut v, p, tn.a);
+  open_path(&mut v, c, m, p, &mut st.env, tp);
+  let t = get_path(v, m, p, st.env, tp);
+  let ix = term(v, eval(&mut v, c, &mut m, p, a1, &mut st, 0));
+  let lvl = g_level(v, t);
+  let used = g_used(v, t);
+  need_lt(&mut v, st, i, ix, 512);
+  let mut child = 0;
+  if name_is(p, i, "pt_borrow") {
+    let two = num(&mut v, 2);
+    let g = app2(&mut v, OP_GE, lvl, two);
+    prove(&mut v, st, g, i, VC_PT);
+    let four = num(&mut v, 4);
+    let top = app2(&mut v, OP_EQ, lvl, four);
+    let one = num(&mut v, 1);
+    let lim = num(&mut v, 256);
+    let lo = app2(&mut v, OP_LE, one, ix);
+    let hi = app2(&mut v, OP_LT, ix, lim);
+    let r = app2(&mut v, OP_AND, lo, hi);
+    let g2 = app2(&mut v, OP_IMP, top, r);
+    prove(&mut v, st, g2, i, VC_PT);
+    let fc = fresh_of_named(&mut v, c, m, p, v.ty_pt, "pt_borrow");
+    let fv = vl_at(v, fc);
+    let one2 = num(&mut v, 1);
+    let below = app2(&mut v, OP_SUB, lvl, one2);
+    child = mk_pt(&mut v, v.ty_pt, fv.a, below, fv.c, g_leases(v, t));
+  } else {
+    let one = num(&mut v, 1);
+    let g = app2(&mut v, OP_EQ, lvl, one);
+    prove(&mut v, st, g, i, VC_PT);
+    child = fresh_of_named(&mut v, c, m, p, v.ty_frame, "pt_borrow_frame");
+  }
+  let sel = app2(&mut v, OP_SELECT, used, ix);
+  prove(&mut v, st, sel, i, VC_OWN);
+  // The child lives in a variable no program can name, for the call.
+  if v.counter < U64_MAX {
+    v.counter = v.counter + 1;
+  }
+  let start = vec_len(v.pool);
+  push_str(&mut v, "borrowed*");
+  push_num(&mut v, v.counter);
+  let key = seal(&mut v, start);
+  let kt = tm_at(v, key);
+  vec_push(&mut st.env, Bind { s: vadd(kt.a, kt.b), e: kt.a, val: child });
+  let mut args = vec_new[u64]();
+  vec_push(&mut args, 0);
+  let mut a = next_of(p, a2);
+  while a != 0 {
+    vec_push(&mut args, a);
+    a = next_of(p, a);
+  }
+  let an = node_at(p.nodes, a2);
+  let x = plain_inst(&mut m, plain_fn(p, an.s, an.e));
+  let res = vcall_args(&mut v, c, &mut m, p, i, args, key, &mut st, x);
+  vec_free(args);
+  let after = get_path(v, m, p, st.env, key);
+  let mut env = vec_new[Bind]();
+  let mut k = 0;
+  while k < vec_len(st.env) {
+    let b = bind_at(st.env, k);
+    if !bind_named(v, p, b, kt.a, kt.b) {
+      vec_push(&mut env, b);
+    }
+    k = k + 1;
+  }
+  let prev = st.env;
+  st.env = env;
+  vec_free(prev);
+  let mut same = app2(&mut v, OP_EQ, g_id(v, after), g_id(v, child));
+  if name_is(p, i, "pt_borrow") {
+    let sl = app2(&mut v, OP_EQ, g_level(v, after), g_level(v, child));
+    let sn = app2(&mut v, OP_EQ, g_leases(v, after), g_leases(v, child));
+    same = app3(&mut v, OP_AND, same, sl, sn);
+  }
+  prove(&mut v, st, same, i, VC_OWN);
+  return res;
+}
+
 /// `smp_run(f, args..)`: this processor's call is an ordinary call. The
 /// other processors' calls get the same shared arguments and their own
 /// `Cpu` and `Mmu`, with the kernel's tables in CR3, so `f`'s precondition
@@ -3372,7 +3515,7 @@ fn vuser_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64, loc: u6
           k = k + 1;
         }
       } else {
-        let nv = fresh_of(&mut v, c, m, p, inner_t(m, pt), path);
+        let nv = fresh_of(&mut v, c, m, p, pt, path);
         set_path(&mut v, m, p, &mut st.env, path, nv);
       }
       env_put(&mut post, p, qn.s, qn.e, get_path(v, m, p, st.env, path));
@@ -3758,7 +3901,7 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     let five = num(&mut v, 5);
     let g = in_range(&mut v, one, lvl, five);
     prove(&mut v, st, g, i, VC_PT);
-    return mk_obj(&mut v, m, v.ty_pt, g_id(v, x0), lvl, v.t_nobool);
+    return mk_pt(&mut v, v.ty_pt, g_id(v, x0), lvl, v.t_nobool, v.t_zero);
   }
   if name_is(p, i, "pt_free") || name_is(p, i, "pt_free_root") {
     let mut t = x0;
@@ -3782,6 +3925,8 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
       let eq = app2(&mut v, OP_EQ, g_id(v, t), g_root(v, x0));
       let g3 = t_not(&mut v, eq);
       prove(&mut v, st, g3, i, VC_MMU);
+      let g4 = app2(&mut v, OP_EQ, g_leases(v, t), v.t_zero);
+      prove(&mut v, st, g4, i, VC_LEASE);
     }
     return mk_obj(&mut v, m, v.ty_frame, g_id(v, t), 0, 0);
   }
@@ -3996,6 +4141,41 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     put_back(&mut v, m, p, &mut st, u_at(args, 0), nm);
     return v.unit;
   }
+  // A lease counts this processor among those that may be running on the
+  // table, so nothing is taken out of its tree until the lease is given back.
+  if name_is(p, i, "mmu_enter") {
+    let four = num(&mut v, 4);
+    let g = app2(&mut v, OP_EQ, g_level(v, x1), four);
+    prove(&mut v, st, g, i, VC_PT);
+    let g2 = app2(&mut v, OP_EQ, g_root(v, x0), v.t_flimit);
+    prove(&mut v, st, g2, i, VC_MMU);
+    let id = g_id(v, x1);
+    let nm = mk_obj(&mut v, m, kind_ty(m, p, TY_MMU), id, 0, 0);
+    put_back(&mut v, m, p, &mut st, u_at(args, 0), nm);
+    let one = num(&mut v, 1);
+    let up = app2(&mut v, OP_ADD, g_leases(v, x1), one);
+    let nt = mk_pt(&mut v, v.ty_pt, id, g_level(v, x1), g_used(v, x1), up);
+    put_back(&mut v, m, p, &mut st, u_at(args, 1), nt);
+    return mk_obj(&mut v, m, kind_ty(m, p, TY_LEASE), id, 0, 0);
+  }
+  // Always loads the kernel's tables. The count drops only when the lease
+  // is one for this table; otherwise it stays as it was, which overcounts
+  // and so is safe. The result says which.
+  if name_is(p, i, "mmu_exit") {
+    let r = fresh_bool_named(&mut v, "mmu_exit");
+    let same = app2(&mut v, OP_EQ, g_id(v, x2), g_id(v, x1));
+    let eq = app2(&mut v, OP_EQ, term(v, r), same);
+    vec_push(&mut st.pc, eq);
+    let l = g_leases(v, x1);
+    let one = num(&mut v, 1);
+    let down = app2(&mut v, OP_SUB, l, one);
+    let leases = app3(&mut v, OP_ITE, term(v, r), down, l);
+    let nm = mk_obj(&mut v, m, kind_ty(m, p, TY_MMU), v.t_flimit, 0, 0);
+    put_back(&mut v, m, p, &mut st, u_at(args, 0), nm);
+    let nt = mk_pt(&mut v, v.ty_pt, g_id(v, x1), g_level(v, x1), g_used(v, x1), leases);
+    put_back(&mut v, m, p, &mut st, u_at(args, 1), nt);
+    return r;
+  }
   if name_is(p, i, "mmu_kernel") {
     let nm = mk_obj(&mut v, m, kind_ty(m, p, TY_MMU), v.t_flimit, 0, 0);
     put_back(&mut v, m, p, &mut st, u_at(args, 0), nm);
@@ -4129,20 +4309,25 @@ fn pt_slot(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, i: u64, args: &Vec[u64
   } else {
     let g = app2(&mut v, OP_SELECT, used, ix);
     prove(&mut v, st, g, i, VC_OWN);
+    // Taking unmaps: another processor running on the tree could still
+    // reach what is taken, through its TLB or a walk under way. Putting
+    // only adds.
+    let g2 = app2(&mut v, OP_EQ, g_leases(v, x0), v.t_zero);
+    prove(&mut v, st, g2, i, VC_LEASE);
   }
   let mut mark_t = v.t_false;
   if putting {
     mark_t = v.t_true;
   }
   let nu = app3(&mut v, OP_STORE, used, ix, mark_t);
-  let nt = mk_obj(&mut v, m, v.ty_pt, g_id(v, x0), lvl, nu);
+  let nt = mk_pt(&mut v, v.ty_pt, g_id(v, x0), lvl, nu, g_leases(v, x0));
   put_back(&mut v, m, p, &mut st, u_at(args, 0), nt);
   if name_is(p, i, "pt_take") {
     let r = fresh_of_named(&mut v, c, m, p, v.ty_pt, "pt_take");
     let rv = vl_at(v, r);
     let one = num(&mut v, 1);
     let below = app2(&mut v, OP_SUB, lvl, one);
-    return mk_obj(&mut v, m, v.ty_pt, rv.a, below, rv.c);
+    return mk_pt(&mut v, v.ty_pt, rv.a, below, rv.c, v.t_zero);
   }
   if name_is(p, i, "pt_take_frame") {
     return fresh_of_named(&mut v, c, m, p, v.ty_frame, "pt_take_frame");
@@ -4574,7 +4759,7 @@ fn changed_vars(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, head: u64, ou
 fn shape_keeping(p: &Parser, i: u64) -> bool {
   return name_is(p, i, "bset") || name_is(p, i, "vec_set") || name_is(p, i, "vec_swap") || name_is(p, i, "pt_put")
     || name_is(p, i, "pt_take") || name_is(p, i, "pt_put_frame") || name_is(p, i, "pt_take_frame")
-    || name_is(p, i, "pool_take") || name_is(p, i, "pool_give") || name_is(p, i, "frame_write")
+    || name_is(p, i, "pt_borrow") || name_is(p, i, "pt_borrow_frame") || name_is(p, i, "pool_take") || name_is(p, i, "pool_give") || name_is(p, i, "frame_write")
     || name_is(p, i, "frame_write8") || name_is(p, i, "cpu_set") || name_is(p, i, "cpu_run") || name_is(p, i, "cpu_idle")
     || name_is(p, i, "cpu_fpu_save") || name_is(p, i, "cpu_fpu_load") || name_is(p, i, "pio_in8") || name_is(p, i, "pio_in16")
     || name_is(p, i, "pio_in32") || name_is(p, i, "pio_out8") || name_is(p, i, "pio_out16") || name_is(p, i, "pio_out32")
@@ -4657,6 +4842,16 @@ fn call_changes(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst:
   } else if inst == 0 && name_is(p, i, "smp_run") && kind_of(p, n.a) == E_VAR {
     fnode = n.a;
     skip = 1;
+  } else if inst == 0 && (name_is(p, i, "pt_borrow") || name_is(p, i, "pt_borrow_frame")) && n.a != 0
+    && kind_of(p, n.a) == E_MUTBORROW && next_of(p, n.a) != 0 && kind_of(p, next_of(p, next_of(p, n.a))) == E_VAR {
+    // `pt_borrow(t, i, f, ..)` keeps `t` and lends the rest to `f`.
+    let tn = node_at(p.nodes, n.a);
+    let tname = list_text(&mut v, p, tn.a);
+    note(&mut v, &mut out, tname, true);
+    changed_in_expr(&mut v, c, &mut m, p, next_of(p, n.a), &mut out);
+    fnode = next_of(p, next_of(p, n.a));
+    skip = 3;
+    j = 1;
   }
   let fname = node_at(p.nodes, fnode);
   let bi = inst == 0 && is_builtin_name(c, p, fname.s, fname.e);
