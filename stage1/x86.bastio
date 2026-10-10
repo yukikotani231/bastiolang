@@ -2183,6 +2183,43 @@ fn x86_cc(op: u64, signed: bool, when: bool) -> Str {
 fn x86_compare(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, op: u64, a: u64, b: u64) -> u64 {
   // A register variable against a simple operand needs no %rax.
   let an = node_at(p.nodes, a);
+  // An element against a constant compares in memory (stage1 only).
+  let bn = node_at(p.nodes, b);
+  if !g.stage0 && an.kind == E_CALL && bn.kind == E_INT && x86_is_place(p, an.a)
+    && ((bn.v <= 255 && (name_is(p, a, "bget") || name_is(p, a, "sget"))) || (bn.v <= 2147483647 && name_is(p, a, "get"))) {
+    let a1 = cg_arg(p, a, 1);
+    let mut base = XR_RCX;
+    let mut index = XR_RAX;
+    let r = x86_var_reg(&mut g, p, a1);
+    if r != 0 {
+      index = r;
+    } else {
+      x86_scalar(&mut g, c, &mut m, p, a1);
+    }
+    let l = x86_place_e(&mut g, c, m, p, an.a);
+    if l.k == XL_REGS {
+      base = l.r1;
+    } else {
+      x86_mov(&mut g, x86_lop(l, 1), x86_reg(XR_RCX));
+    }
+    if name_is(p, a, "get") {
+      x86_t(&mut g, "cmpq $");
+    } else {
+      x86_t(&mut g, "cmpb $");
+    }
+    x86_n(&mut g, bn.v);
+    x86_t(&mut g, ", (");
+    x86_r(&mut g, base);
+    x86_t(&mut g, ",");
+    x86_r(&mut g, index);
+    if name_is(p, a, "get") {
+      x86_t(&mut g, ",8)");
+    } else {
+      x86_t(&mut g, ")");
+    }
+    x86_e(&mut g);
+    return op;
+  }
   if an.kind == E_VAR && x86_simple(p, b) {
     let v = x86_var(&mut g, p, a);
     if v.k == XS_REG {
@@ -2936,6 +2973,23 @@ fn x86_val_into(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, d: X
     }
   }
   let w = x86_ewords(&mut g, c, &mut m, p, i);
+  // A two-word result in %rax:%rdx is stored where it goes (stage1).
+  if !g.stage0 && k == E_CALL && w == 2 && !(x86_inst_of(g, &mut m, p, i) == 0 && is_builtin_name(c, p, n.s, n.e)) {
+    let inst = x86_inst_of(g, &mut m, p, i);
+    let x = x86_callee(c, &mut m, p, ci, inst);
+    if x86_regret(&mut g, c, &mut m, p, x) {
+      let t = x86_ty(&mut g, c, &mut m, p, i);
+      x86_call_to(&mut g, c, &mut m, p, ci, inst, t, false);
+      let d0 = x86_dst_op(&mut g, d);
+      x86_mov(&mut g, x86_reg(XR_RAX), d0);
+      let mut d1 = x86_mem(XR_RCX, wrap_add(XB, wrap_mul(8, wrap_add(d.o, 1))));
+      if d.k == XD_FRAME || d.k == XD_STACK {
+        d1 = x86_dst_op(&mut g, x86_dst_at(d, 1));
+      }
+      x86_mov(&mut g, x86_reg(XR_RDX), d1);
+      return;
+    }
+  }
   if w == 1 && d.k == XD_FRAME {
     x86_scalar_into(&mut g, c, &mut m, p, i, x86_frame_op(d.a));
   } else if w == 1 {
@@ -3085,6 +3139,12 @@ fn x86_push_regret(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
 }
 
 fn x86_call(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64, t: u64) {
+  x86_call_to(&mut g, c, &mut m, p, i, inst, t, true);
+}
+
+/// `x86_call`; with `!push`, a result in %rax:%rdx (`x86_regret`) is left
+/// there.
+fn x86_call_to(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64, t: u64, push: bool) {
   let n = node_at(p.nodes, i);
   let rn = x86_words(&mut g, c, m, p, t);
   if inst == 0 && is_builtin_name(c, p, n.s, n.e) {
@@ -3123,7 +3183,9 @@ fn x86_call(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u6
   x86_sym(&mut g, m, p, x);
   x86_e(&mut g);
   x86_drop(&mut g, aw);
-  x86_push_regret(&mut g, c, &mut m, p, x);
+  if push {
+    x86_push_regret(&mut g, c, &mut m, p, x);
+  }
 }
 
 /// What `x86_bind_params` saves: the caller's variables.
@@ -3656,7 +3718,63 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     }
   } else if name_is(p, i, "vec_push") {
     let w = x86_words(&mut g, c, m, p, x86_vec_elem(&mut g, c, &mut m, p, a0));
-    if w == 1 && kind_of(p, a0) == E_MUTBORROW {
+    let pr = x86_mutref_reg(&mut g, p, a0);
+    if w == 1 && pr != 0 {
+      // stage1: the vector's address is in register `pr`, which a call
+      // keeps (or `x86_e` saves around it); a register or small constant
+      // value is stored from where it is.
+      let l = x86_label(&mut g);
+      let mut v = x86_none();
+      if x86_simple(p, a1) {
+        let o = x86_operand(&mut g, c, m, p, a1);
+        if o.k == XO_REG || o.k == XO_IMM {
+          v = o;
+        }
+      }
+      if v.k == 0 {
+        x86_scalar(&mut g, c, &mut m, p, a1);
+        x86_es(&mut g, "mov %rax, %rdx");
+        v = x86_reg(XR_RDX);
+      }
+      x86_t(&mut g, "mov (");
+      x86_r(&mut g, pr);
+      x86_t(&mut g, "), %rax");
+      x86_e(&mut g);
+      x86_t(&mut g, "cmp 8(");
+      x86_r(&mut g, pr);
+      x86_t(&mut g, "), %rax");
+      x86_e(&mut g);
+      x86_jump(&mut g, "jne", l);
+      let keep = v.k == XO_REG && v.r == XR_RDX;
+      if keep {
+        x86_push(&mut g, v);
+      }
+      x86_mov(&mut g, x86_reg(pr), x86_reg(XR_RDI));
+      x86_es(&mut g, "mov $8, %esi");
+      x86_es(&mut g, "call bst_rt_vec_grow");
+      if keep {
+        x86_pop(&mut g, v);
+      }
+      x86_t(&mut g, "mov (");
+      x86_r(&mut g, pr);
+      x86_t(&mut g, "), %rax");
+      x86_e(&mut g);
+      x86_place_label(&mut g, l);
+      x86_t(&mut g, "mov 16(");
+      x86_r(&mut g, pr);
+      x86_t(&mut g, "), %rcx");
+      x86_e(&mut g);
+      x86_t(&mut g, "mov");
+      x86_q(&mut g, v);
+      x86_t(&mut g, " ");
+      x86_o(&mut g, v);
+      x86_t(&mut g, ", (%rcx,%rax,8)");
+      x86_e(&mut g);
+      x86_t(&mut g, "incq (");
+      x86_r(&mut g, pr);
+      x86_t(&mut g, ")");
+      x86_e(&mut g);
+    } else if w == 1 && kind_of(p, a0) == E_MUTBORROW {
       // The value cannot change the vector (it is lent), so it goes first,
       // into %rdx, and the vector's address into %rdi.
       let l = x86_label(&mut g);
@@ -4358,6 +4476,29 @@ fn x86_take_pool(g: &mut X86) {
 }
 
 /// The register of expression `i` if it is a variable kept in one (0: none).
+/// The register holding the address `&mut v` (expression `i`) gives, when
+/// `v` is a `&mut` parameter kept in one (stage1 only), else 0.
+fn x86_mutref_reg(g: &mut X86, p: &Parser, i: u64) -> u64 {
+  if g.stage0 || kind_of(p, i) != E_MUTBORROW {
+    return 0;
+  }
+  let n = node_at(p.nodes, i);
+  let segs = x86_lsegs(p, n.a);
+  let mut r = 0;
+  if vec_len(segs) == 1 {
+    let id = x86_nmn(&mut g, p, u_at(segs, 0));
+    let k = x86_find(g, id);
+    if k != 0 {
+      let v = x86_var_at(g, k - 1);
+      if v.k == XS_PREG {
+        r = v.r0;
+      }
+    }
+  }
+  vec_free(segs);
+  return r;
+}
+
 fn x86_var_reg(g: &mut X86, p: &Parser, i: u64) -> u64 {
   if kind_of(p, i) != E_VAR {
     return 0;
@@ -5106,12 +5247,137 @@ fn x86_peep_acc(code: &Vec[u64], out: &mut Vec[u64]) {
       }
     }
     if !done {
+      let nx = x86_peep_chain(code, starts, i, &mut out);
+      if nx > i && nx <= nl {
+        i = nx;
+        done = true;
+      }
+    }
+    if !done {
       x86_copy_text(code, s, e, &mut out);
       cg_s(&mut out, "\n");
       i = i + 1;
     }
   }
   vec_free(starts);
+}
+
+/// Does every register the line from `s` to `e` names in %rax's family
+/// name it `%rax`?
+fn x86_only_rax(code: &Vec[u64], s: u64, e: u64) -> bool {
+  let mut k = s;
+  while k < e && k < vec_len(code) {
+    if vec_get(code, k) == 37 && x86_fam_at(code, k + 1) == 1 && !x86_has_prefix(code, k, "%rax") {
+      return false;
+    }
+    k = k + 1;
+  }
+  return true;
+}
+
+/// Is the line at `s` two-operand arithmetic into %rax (and nothing else
+/// written, no stack)?
+fn x86_chain_op(code: &Vec[u64], s: u64) -> bool {
+  let e = x86_line_end(code, s);
+  let ok = x86_has_prefix(code, s, "\tadd ") || x86_has_prefix(code, s, "\taddq ") || x86_has_prefix(code, s, "\tsub ")
+    || x86_has_prefix(code, s, "\tsubq ") || x86_has_prefix(code, s, "\tand ") || x86_has_prefix(code, s, "\tandq ")
+    || x86_has_prefix(code, s, "\tor ") || x86_has_prefix(code, s, "\torq ") || x86_has_prefix(code, s, "\txor ")
+    || x86_has_prefix(code, s, "\tshl ") || x86_has_prefix(code, s, "\tshr ") || x86_has_prefix(code, s, "\tsar ")
+    || x86_has_prefix(code, s, "\timul ") || x86_has_prefix(code, s, "\timulq ");
+  if !ok || x86_has_rsp(code, s, e) || !x86_only_rax(code, s, e) {
+    return false;
+  }
+  let d = x86_last_op(code, s, e);
+  return d != e && x86_txt(code, d, e, "%rax");
+}
+
+/// Is the text from `s` to `e` the name of a whole 64-bit register?
+fn x86_is_r64(code: &Vec[u64], s: u64, e: u64) -> bool {
+  if u_at(code, s) != 37 || u_at(code, wrap_add(s, 1)) != 114 {
+    return false;
+  }
+  let n = wrap_sub(e, s);
+  let c2 = u_at(code, wrap_add(s, 2));
+  let c3 = u_at(code, wrap_add(s, 3));
+  let d2 = c2 >= 48 && c2 <= 57;
+  let d3 = c3 >= 48 && c3 <= 57;
+  if n == 3 {
+    return c2 == 56 || c2 == 57;
+  }
+  if n == 4 && d2 {
+    return c2 == 49 && d3;
+  }
+  return n == 4 && !d3 && x86_fam_at(code, wrap_add(s, 1)) != 0;
+}
+
+/// `mov A, %rax`, arithmetic into %rax that does not name B, `mov %rax, B`
+/// (B a register), before a line that sets %rax without reading it or a
+/// call of a Bastio function (which reads no %rax): the same computed in
+/// B. Returns the line after the move, or 0.
+fn x86_peep_chain(code: &Vec[u64], starts: &Vec[u64], i: u64, out: &mut Vec[u64]) -> u64 {
+  let nl = vec_len(starts);
+  let s = u_at(starts, i);
+  let e = x86_line_end(code, s);
+  if !x86_has_prefix(code, s, "\tmov ") || x86_has_rsp(code, s, e) {
+    return 0;
+  }
+  let d1 = x86_last_op(code, s, e);
+  if d1 == e || !x86_txt(code, d1, e, "%rax") || d1 < wrap_add(s, 7) {
+    return 0;
+  }
+  let mut j = wrap_add(i, 1);
+  while j < nl && wrap_sub(j, i) < 8 && x86_chain_op(code, u_at(starts, j)) {
+    j = j + 1;
+  }
+  if j == wrap_add(i, 1) || wrap_add(j, 1) >= nl {
+    return 0;
+  }
+  let ms = u_at(starts, j);
+  let me = x86_line_end(code, ms);
+  let b = wrap_add(ms, 11);
+  if !x86_has_prefix(code, ms, "\tmov %rax, %") || !x86_is_r64(code, b, me) {
+    return 0;
+  }
+  let bf = x86_fams(code, b, me);
+  if bf == 0 || (bf & 2) != 0 || (bf & 256) != 0 {
+    return 0;
+  }
+  let mut k = wrap_add(i, 1);
+  while k < j {
+    let ks = u_at(starts, k);
+    if (x86_fams(code, ks, x86_line_end(code, ks)) & bf) != 0 {
+      return 0;
+    }
+    k = k + 1;
+  }
+  let ns = u_at(starts, wrap_add(j, 1));
+  let ne = x86_line_end(code, ns);
+  if !x86_acc_dead(code, ns, ne) && !x86_has_prefix(code, ns, "\tcall f_") {
+    return 0;
+  }
+  cg_s(&mut out, "\tmov ");
+  x86_copy_text(code, wrap_add(s, 5), wrap_sub(d1, 2), &mut out);
+  cg_s(&mut out, ", ");
+  x86_copy_text(code, b, me, &mut out);
+  cg_s(&mut out, "\n");
+  k = wrap_add(i, 1);
+  while k < j {
+    let ks = u_at(starts, k);
+    let ke = x86_line_end(code, ks);
+    let mut q = ks;
+    while q < ke && q < vec_len(code) {
+      if x86_has_prefix(code, q, "%rax") {
+        x86_copy_text(code, b, me, &mut out);
+        q = wrap_add(q, 4);
+      } else {
+        vec_push(&mut out, vec_get(code, q));
+        q = q + 1;
+      }
+    }
+    cg_s(&mut out, "\n");
+    k = k + 1;
+  }
+  return wrap_add(j, 1);
 }
 
 /// The end of the line starting at `s` (its newline, or the end).
