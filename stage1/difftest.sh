@@ -17,6 +17,11 @@
 #           the verifier
 #   C       stage1/cdump.bastio     vs  bastioc0 --dump-c (the whole C file,
 #           runtime prelude included), on every program the checker accepts
+#   native  stage1/asmdump.bastio   vs  bastioc0 --backend native --emit-asm
+#           (the whole assembly file), on every hosted program stage0
+#           builds; where stage0 does not support a program yet (exit 4),
+#           asmdump must not either. asmdump built by the native backend
+#           must print the same assembly for itself
 #   driver  stage1/bastioc1.bastio  vs  bastioc0 itself: what `--check`
 #           prints on stderr and its exit status (the sentence after
 #           `error[CODE]:` masked, as bastioc1 does not print it yet), the
@@ -30,7 +35,7 @@ cd "$(dirname "$0")/.."
 BASTIOC=${BASTIOC:-stage0/target/release/bastioc0}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-for tool in lexdump astdump monodump checkdump smtdump verifydump cdump bastioc1; do
+for tool in lexdump astdump monodump checkdump smtdump verifydump cdump asmdump bastioc1; do
   "$BASTIOC" -o "$tmp/$tool" "stage1/$tool.bastio" 2>"$tmp/build.err" || { cat "$tmp/build.err"; exit 1; }
 done
 files=$(find tests stage1 ../bastios/src ../bastios/user -name '*.bastio' 2>/dev/null | sort)
@@ -131,6 +136,32 @@ for f in $files; do
 done
 echo "-- C: $match matched ($((match-errors)) of them C files), $differ differ"
 { [ "$differ" = 0 ] && [ "$match" -gt "$errors" ]; } || status=1
+match=0 differ=0 unsup=0
+for f in $files; do
+  [ "$(target_of "$f")" = hosted ] || continue
+  "$BASTIOC" --backend native --emit-asm -o "$tmp/want" "$f" 2>/dev/null; e=$?
+  [ "$e" = 0 ] || [ "$e" = 4 ] || continue
+  "$tmp/asmdump" "$f" >"$tmp/got" 2>/dev/null; ge=$?
+  if [ "$e" = 4 ] && [ "$ge" = 4 ]; then
+    unsup=$((unsup+1)); match=$((match+1))
+  elif [ "$e" = 0 ] && [ "$ge" = 0 ] && cmp -s "$tmp/want" "$tmp/got"; then
+    match=$((match+1))
+  else
+    differ=$((differ+1))
+    echo "DIFFER $f (native: stage0 exit $e, asmdump exit $ge)"
+    diff "$tmp/want" "$tmp/got" | head -5 | cut -c1-300 | sed 's/^/    /'
+  fi
+done
+if "$BASTIOC" --backend native -o "$tmp/asmdump_n" stage1/asmdump.bastio 2>/dev/null \
+   && "$tmp/asmdump_n" stage1/asmdump.bastio >"$tmp/got" 2>/dev/null \
+   && "$tmp/asmdump" stage1/asmdump.bastio >"$tmp/want" 2>/dev/null \
+   && cmp -s "$tmp/want" "$tmp/got"; then
+  match=$((match+1))
+else
+  differ=$((differ+1)); echo "DIFFER asmdump built by the native backend"
+fi
+echo "-- native: $match matched ($unsup of them unsupported, plus asmdump built natively), $differ differ"
+{ [ "$differ" = 0 ] && [ "$match" -gt "$unsup" ]; } || status=1
 # The driver. bastioc1 does not print the sentence after the error code
 # yet, nor the hints (`  = ..`) that follow the errors before the
 # verifier (a failed proof's counterexample is compared), and names itself
