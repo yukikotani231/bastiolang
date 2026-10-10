@@ -461,6 +461,7 @@ static inline bst_pt bst_pt_new(bst_frame f, uint64_t level) {
 }
 static inline bst_frame bst_pt_free(bst_pt t) { return t; }
 static inline bool bst_pt_has(bst_pt t, uint64_t i) { return (((uint64_t *)t)[i] & BST_PTE_P) != 0; }
+static inline bool bst_pt_writable(bst_pt t, uint64_t i) { return (((uint64_t *)t)[i] & BST_PTE_W) != 0; }
 static inline void bst_pt_put(bst_pt *t, uint64_t i, bst_pt c) { ((uint64_t *)*t)[i] = c | BST_PTE_P | BST_PTE_W | BST_PTE_U; }
 static inline void bst_pt_put_frame(bst_pt *t, uint64_t i, bst_frame f, bool w) {
     ((uint64_t *)*t)[i] = f | BST_PTE_P | BST_PTE_U | (w ? BST_PTE_W : 0);
