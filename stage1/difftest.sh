@@ -15,6 +15,8 @@
 #           the number of proof obligations, or the first failed proof's
 #           code, position and counterexample), on the programs that reach
 #           the verifier
+#   C       stage1/cdump.bastio     vs  bastioc0 --dump-c (the whole C file,
+#           runtime prelude included), on every program the checker accepts
 # The parser, the monomorphizer and the checker are also compared on damaged
 # sources (stage1/mutate.py), so their error positions are checked too.
 set -u
@@ -22,7 +24,7 @@ cd "$(dirname "$0")/.."
 BASTIOC=${BASTIOC:-stage0/target/release/bastioc0}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-for tool in lexdump astdump monodump checkdump smtdump verifydump; do
+for tool in lexdump astdump monodump checkdump smtdump verifydump cdump; do
   "$BASTIOC" -o "$tmp/$tool" "stage1/$tool.bastio" 2>"$tmp/build.err" || { cat "$tmp/build.err"; exit 1; }
 done
 files=$(find tests stage1 ../bastios/src ../bastios/user -name '*.bastio' 2>/dev/null | sort)
@@ -107,6 +109,22 @@ for f in $files; do
 done
 echo "-- proofs: $match matched ($failed of them failed proofs), $differ differ ($skipped not reaching the verifier)"
 { [ "$differ" = 0 ] && [ "$match" -gt 0 ]; } || status=1
+match=0 differ=0 errors=0
+for f in $files; do
+  t=$(target_of "$f")
+  "$BASTIOC" --dump-c --target "$t" "$f" >"$tmp/want" 2>/dev/null
+  grep -q '^error' "$tmp/want" && errors=$((errors+1))
+  "$tmp/cdump" "$t" "$f" >"$tmp/got" 2>/dev/null
+  if cmp -s "$tmp/want" "$tmp/got"; then
+    match=$((match+1))
+  else
+    differ=$((differ+1))
+    echo "DIFFER $f ($t)"
+    diff "$tmp/want" "$tmp/got" | head -5 | cut -c1-300 | sed 's/^/    /'
+  fi
+done
+echo "-- C: $match matched ($((match-errors)) of them C files), $differ differ"
+{ [ "$differ" = 0 ] && [ "$match" -gt "$errors" ]; } || status=1
 python3 stage1/mutate.py "$BASTIOC" --dump-ast "$tmp/astdump" 1 ${MUTANTS:-5} $files || status=1
 python3 stage1/mutate.py "$BASTIOC" --dump-mono "$tmp/monodump" 2 ${MUTANTS:-5} $files || status=1
 for t in hosted kernel user; do
@@ -127,4 +145,10 @@ python3 stage1/mutate.py --smt "$BASTIOC" "--check --dump-smt" "$tmp/smtdump" 6 
 # Proofs, on the mutants that reach the verifier: most of those fail a proof.
 python3 stage1/mutate.py --verify "$BASTIOC" "--dump-verify" "$tmp/verifydump" 7 $((${MUTANTS:-5} * 2)) \
   tests/pass/*.bastio tests/fail/*.bastio stage1/verifycases/*.bastio || status=1
+# C, on the mutants that still type-check (the rest print the same error).
+python3 stage1/mutate.py "$BASTIOC" "--dump-c" "$tmp/cdump" 8 ${MUTANTS:-5} tests/pass/*.bastio || status=1
+if [ -f ../bastios/src/main.bastio ]; then
+  python3 stage1/mutate.py --via ../bastios/src/main.bastio "$BASTIOC" "--dump-c --target kernel" "$tmp/cdump kernel" 9 ${MUTANTS:-5} \
+    $(ls ../bastios/src/*.bastio | grep -v /main.bastio) || status=1
+fi
 exit $status

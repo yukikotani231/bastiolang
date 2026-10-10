@@ -18,6 +18,9 @@
 //               `error file:line:col CODE` and exits 1
 //   --dump-check  the same after type and linearity checking (so `let`
 //               types are filled in); an error prints `error file:line:col CODE`
+//   --dump-c    the generated C, after type and linearity checking but
+//               without verifying, on stdout; an error prints
+//               `error file:line:col CODE` (stage1's differential test)
 //   --backend native  generate x86-64 assembly directly instead of C
 //               (experimental, hosted target only; see `x86.rs`)
 //   --emit-asm  with `--backend native`: write the assembly to `out`
@@ -135,6 +138,7 @@ fn main() {
     let mut native = false;
     let mut emit_asm = false;
     let mut dump_verify = false;
+    let mut dump_c = false;
     let mut target = codegen::Target::Hosted;
     let mut out: Option<String> = None;
     let mut header: Option<String> = None;
@@ -162,6 +166,7 @@ fn main() {
                 };
             }
             "--dump-verify" => dump_verify = true,
+            "--dump-c" => dump_c = true,
             "--trusted-base" => {
                 print!("{}", codegen::trusted_base());
                 return;
@@ -255,7 +260,7 @@ fn main() {
     for input in &inputs {
         if let Err(d) = ld.load(Path::new(input), None) {
             match d {
-                Some(d) if dump_mono || dump_check || dump_verify => short(&d),
+                Some(d) if dump_mono || dump_check || dump_verify || dump_c => short(&d),
                 Some(d) => eprint!("{}", d.render(&ld.files)),
                 None => {}
             }
@@ -274,7 +279,7 @@ fn main() {
     }
 
     let fail = |d: diag::Diag| -> ! {
-        if dump_check || dump_verify {
+        if dump_check || dump_verify || dump_c {
             short(&d);
         } else {
             eprint!("{}", d.render(&files));
@@ -290,6 +295,10 @@ fn main() {
     if dump_check {
         dump::WITH_FILE.store(true, std::sync::atomic::Ordering::Relaxed);
         print!("{}", dump::program(&prog));
+        return;
+    }
+    if dump_c {
+        print!("{}", codegen::emit(&prog, target));
         return;
     }
     // One solver session in function order for the dumps: stage1's

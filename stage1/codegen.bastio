@@ -1,0 +1,2315 @@
+// C code generation, as stage0/src/codegen.rs does it: the checked program
+// becomes one C file, the target's prelude followed by the program's types,
+// helpers and functions. The output must be byte for byte what stage0 emits
+// (`bastioc0 --dump-c`), which stage1/difftest.sh checks.
+//
+// Zero overhead: everything the verifier proved is erased. There are no
+// bounds or overflow checks, specifications produce no code, and every
+// capability's ghost state is gone (a Frame is a physical address, Serial
+// an empty token).
+//
+// Text is built in a scratch pool (`Cg.pool`) as spans, then copied to the
+// output. Sub-expressions are always generated before the text around
+// them, in the order stage0 generates them, since that order numbers the
+// temporaries (`o_3`, `bp_4`, ...).
+import "check.bastio";
+import "files.bastio";
+import "cprelude.bastio";
+
+/// A piece of text: `pool[s .. s + n]`.
+struct CgSp { s: u64, n: u64 }
+
+/// A variable of the function being generated and its type.
+struct CgVar { s: u64, e: u64, ty: u64 }
+
+struct Cg {
+  /// The finished C file.
+  out: Vec[u64],
+  /// The function bodies, generated first: they decide which helpers,
+  /// blobs and `smp_run` thunks the file needs.
+  body: Vec[u64],
+  pool: Vec[u64],
+  /// One argument block and thunk per `smp_run` call (`nsmp` of them).
+  smp: Vec[u64],
+  nsmp: u64,
+  /// Element types of the vectors operated on, and boxed types, in order
+  /// of first use: each gets a set of helpers.
+  vecs: Vec[u64],
+  boxed: Vec[u64],
+  /// The E_BLOB node of every `include_bytes` generated, in order.
+  blobs: Vec[u64],
+  /// Every variable declared so far in this function (the last one of a
+  /// name wins, as code is generated in order), and the `&mut` parameters.
+  vars: Vec[CgVar],
+  mutp: Vec[CgVar],
+  /// Counter for temporaries, per function.
+  tmps: u64,
+  /// The instance being generated.
+  env: u64,
+  target: u64
+}
+
+fn cg_new(target: u64) -> Cg {
+  return Cg {
+    out: vec_new[u64](), body: vec_new[u64](), pool: vec_new[u64](), smp: vec_new[u64](), nsmp: 0,
+    vecs: vec_new[u64](), boxed: vec_new[u64](), blobs: vec_new[u64](),
+    vars: vec_new[CgVar](), mutp: vec_new[CgVar](), tmps: 0, env: 0, target: target
+  };
+}
+
+fn cg_free(g: Cg) {
+  vec_free(g.out);
+  vec_free(g.body);
+  vec_free(g.pool);
+  vec_free(g.smp);
+  vec_free(g.vecs);
+  vec_free(g.boxed);
+  vec_free(g.blobs);
+  vec_free(g.vars);
+  vec_free(g.mutp);
+}
+
+fn cg_add(a: u64, b: u64) -> u64 {
+  if a <= 18446744073709551615 - b {
+    return a + b;
+  }
+  return 18446744073709551615;
+}
+
+/// The next temporary's number.
+fn cg_tmp(g: &mut Cg) -> u64 {
+  let k = g.tmps;
+  g.tmps = cg_add(k, 1);
+  return k;
+}
+
+// ---- Text ----
+
+fn cg_mark(g: &Cg) -> u64 {
+  return vec_len(g.pool);
+}
+
+fn cg_span(g: &Cg, start: u64) -> CgSp {
+  if start <= vec_len(g.pool) {
+    return CgSp { s: start, n: vec_len(g.pool) - start };
+  }
+  return CgSp { s: 0, n: 0 };
+}
+
+/// Forgets the text from `start` on.
+fn cg_cut(g: &mut Cg, start: u64) {
+  while vec_len(g.pool) > start {
+    vec_pop(&mut g.pool);
+  }
+}
+
+fn cg_t(g: &mut Cg, s: Str) {
+  cg_s(&mut g.pool, s);
+}
+
+fn cg_sp(g: &mut Cg, x: CgSp) {
+  let end = cg_add(x.s, x.n);
+  let mut k = x.s;
+  while k < end {
+    let ch = u_at(g.pool, k);
+    vec_push(&mut g.pool, ch);
+    k = k + 1;
+  }
+}
+
+fn cg_n(g: &mut Cg, x: u64) {
+  let mut d = vec_new[u64]();
+  let mut y = x;
+  vec_push(&mut d, 48 + y % 10);
+  y = y / 10;
+  while y > 0 {
+    vec_push(&mut d, 48 + y % 10);
+    y = y / 10;
+  }
+  let mut k = vec_len(d);
+  while k > 0 {
+    k = k - 1;
+    vec_push(&mut g.pool, u_at(d, k));
+  }
+  vec_free(d);
+}
+
+fn cg_src(g: &mut Cg, p: &Parser, s: u64, e: u64) {
+  if s <= e && e <= blen(p.src) {
+    let mut k = s;
+    while k < e
+      invariant e <= blen(p.src)
+    {
+      vec_push(&mut g.pool, bget(p.src, k));
+      k = k + 1;
+    }
+  }
+}
+
+/// A span holding just `s`.
+fn cg_lit(g: &mut Cg, s: Str) -> CgSp {
+  let start = cg_mark(g);
+  cg_t(&mut g, s);
+  return cg_span(g, start);
+}
+
+/// Copies a span to the end of `out`.
+fn cg_copy(g: &Cg, x: CgSp, out: &mut Vec[u64]) {
+  let end = cg_add(x.s, x.n);
+  let mut k = x.s;
+  while k < end {
+    vec_push(&mut out, u_at(g.pool, k));
+    k = k + 1;
+  }
+}
+
+/// Moves the text from `start` on into the bodies.
+fn cg_to_body(g: &mut Cg, start: u64) {
+  let x = cg_span(g, start);
+  let mut b = vec_new[u64]();
+  cg_copy(g, x, &mut b);
+  let mut k = 0;
+  while k < vec_len(b) {
+    vec_push(&mut g.body, u_at(b, k));
+    k = k + 1;
+  }
+  vec_free(b);
+  cg_cut(&mut g, start);
+}
+
+/// Moves the text from `start` on into the output.
+fn cg_to_out(g: &mut Cg, start: u64) {
+  let x = cg_span(g, start);
+  let mut b = vec_new[u64]();
+  cg_copy(g, x, &mut b);
+  let mut k = 0;
+  while k < vec_len(b) {
+    vec_push(&mut g.out, u_at(b, k));
+    k = k + 1;
+  }
+  vec_free(b);
+  cg_cut(&mut g, start);
+}
+
+fn cg_ind(g: &mut Cg, d: u64) {
+  let mut k = 0;
+  while k < d {
+    cg_t(&mut g, "    ");
+    k = k + 1;
+  }
+}
+
+fn sp_at(xs: &Vec[CgSp], k: u64) -> CgSp {
+  if k < vec_len(xs) {
+    return vec_get(xs, k);
+  }
+  return CgSp { s: 0, n: 0 };
+}
+
+/// `xs`, separated by `, `.
+fn cg_list(g: &mut Cg, xs: &Vec[CgSp]) {
+  let mut k = 0;
+  while k < vec_len(xs) {
+    if k > 0 {
+      cg_t(&mut g, ", ");
+    }
+    cg_sp(&mut g, sp_at(xs, k));
+    k = k + 1;
+  }
+}
+
+// ---- Names ----
+
+// How a name is spelled: as written, as a C identifier part for a struct,
+// enum or function (`cid`: `Pair[u64, Buf]` is `Pair_Lu64_CBuf_R`), or for
+// a helper's name (`box_helper`: every other character becomes `_`).
+const CG_PLAIN: u64 = 0;
+const CG_CID: u64 = 1;
+const CG_HELPER: u64 = 2;
+
+fn cg_ch(g: &mut Cg, ch: u64, mode: u64) {
+  if mode == CG_CID {
+    if ch == 91 { cg_t(&mut g, "_L"); }
+    else if ch == 93 { cg_t(&mut g, "_R"); }
+    else if ch == 44 { cg_t(&mut g, "_C"); }
+    else if ch != 32 { vec_push(&mut g.pool, ch); }
+  } else if mode == CG_HELPER {
+    if (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) {
+      vec_push(&mut g.pool, ch);
+    } else {
+      vec_push(&mut g.pool, 95);
+    }
+  } else {
+    vec_push(&mut g.pool, ch);
+  }
+}
+
+fn cg_tn(g: &mut Cg, s: Str, mode: u64) {
+  let mut k = 0;
+  while k < slen(s)
+    invariant k <= slen(s)
+  {
+    cg_ch(&mut g, sget(s, k), mode);
+    k = k + 1;
+  }
+}
+
+fn cg_srcn(g: &mut Cg, p: &Parser, s: u64, e: u64, mode: u64) {
+  if s <= e && e <= blen(p.src) {
+    let mut k = s;
+    while k < e
+      invariant e <= blen(p.src)
+    {
+      cg_ch(&mut g, bget(p.src, k), mode);
+      k = k + 1;
+    }
+  }
+}
+
+/// A type's name, as stage0's `Type::name`.
+fn cg_tyname(g: &mut Cg, m: &Mono, p: &Parser, t: u64, mode: u64) {
+  let x = ty_at(m, t);
+  let k = x.kind;
+  if k == TY_U64 { cg_tn(&mut g, "u64", mode); }
+  else if k == TY_U8 { cg_tn(&mut g, "u8", mode); }
+  else if k == TY_U16 { cg_tn(&mut g, "u16", mode); }
+  else if k == TY_U32 { cg_tn(&mut g, "u32", mode); }
+  else if k == TY_I8 { cg_tn(&mut g, "i8", mode); }
+  else if k == TY_I16 { cg_tn(&mut g, "i16", mode); }
+  else if k == TY_I32 { cg_tn(&mut g, "i32", mode); }
+  else if k == TY_I64 { cg_tn(&mut g, "i64", mode); }
+  else if k == TY_BOOL { cg_tn(&mut g, "bool", mode); }
+  else if k == TY_UNIT { cg_tn(&mut g, "()", mode); }
+  else if k == TY_STR { cg_tn(&mut g, "Str", mode); }
+  else if k == TY_BUF { cg_tn(&mut g, "Buf", mode); }
+  else if k == TY_BYTES { cg_tn(&mut g, "Bytes", mode); }
+  else if k == TY_HOST { cg_tn(&mut g, "Host", mode); }
+  else if k == TY_CHILD { cg_tn(&mut g, "Child", mode); }
+  else if k == TY_SERIAL { cg_tn(&mut g, "Serial", mode); }
+  else if k == TY_FRAME { cg_tn(&mut g, "Frame", mode); }
+  else if k == TY_PT { cg_tn(&mut g, "PageTable", mode); }
+  else if k == TY_POOL { cg_tn(&mut g, "Pool", mode); }
+  else if k == TY_MMU { cg_tn(&mut g, "Mmu", mode); }
+  else if k == TY_CPU { cg_tn(&mut g, "Cpu", mode); }
+  else if k == TY_PORTS { cg_tn(&mut g, "Ports", mode); }
+  else if k == TY_PORTIO { cg_tn(&mut g, "PortIo", mode); }
+  else if k == TY_MMIOSPACE { cg_tn(&mut g, "MmioSpace", mode); }
+  else if k == TY_MMIO { cg_tn(&mut g, "Mmio", mode); }
+  else if k == TY_DMA { cg_tn(&mut g, "Dma", mode); }
+  else if k == TY_STRUCT || k == TY_ENUM { cg_instname(&mut g, m, p, x.a, mode); }
+  else if k == TY_BOX { cg_tn(&mut g, "Box[", mode); cg_tyname(&mut g, m, p, x.a, mode); cg_tn(&mut g, "]", mode); }
+  else if k == TY_VEC { cg_tn(&mut g, "Vec[", mode); cg_tyname(&mut g, m, p, x.a, mode); cg_tn(&mut g, "]", mode); }
+  else if k == TY_LOCK { cg_tn(&mut g, "Lock[", mode); cg_tyname(&mut g, m, p, x.a, mode); cg_tn(&mut g, "]", mode); }
+  else if k == TY_REF { cg_tn(&mut g, "&", mode); cg_tyname(&mut g, m, p, x.a, mode); }
+  else if k == TY_MUTREF { cg_tn(&mut g, "&mut ", mode); cg_tyname(&mut g, m, p, x.a, mode); }
+}
+
+/// An instance's name: `Pair[u64, Buf]`, or just `Rect` for a plain one.
+fn cg_instname(g: &mut Cg, m: &Mono, p: &Parser, i: u64, mode: u64) {
+  let xi = inst_at(m, i);
+  let dn = node_at(p.nodes, xi.def);
+  cg_srcn(&mut g, p, dn.s, dn.e, mode);
+  if xi.n > 0 && xi.args < SRC_MAX {
+    cg_tn(&mut g, "[", mode);
+    let mut j = 0;
+    while j < xi.n && j < SRC_MAX
+      invariant j <= SRC_MAX
+    {
+      if j > 0 {
+        cg_tn(&mut g, ", ", mode);
+      }
+      cg_tyname(&mut g, m, p, targ_at(m, xi.args + j), mode);
+      j = j + 1;
+    }
+    cg_tn(&mut g, "]", mode);
+  }
+}
+
+/// The C type of `t`.
+fn cg_cty(g: &mut Cg, m: &Mono, p: &Parser, t: u64) {
+  let x = ty_at(m, t);
+  let k = x.kind;
+  if k == TY_U64 { cg_t(&mut g, "uint64_t"); }
+  else if k == TY_U8 { cg_t(&mut g, "uint8_t"); }
+  else if k == TY_U16 { cg_t(&mut g, "uint16_t"); }
+  else if k == TY_U32 { cg_t(&mut g, "uint32_t"); }
+  else if k == TY_I8 { cg_t(&mut g, "int8_t"); }
+  else if k == TY_I16 { cg_t(&mut g, "int16_t"); }
+  else if k == TY_I32 { cg_t(&mut g, "int32_t"); }
+  else if k == TY_I64 { cg_t(&mut g, "int64_t"); }
+  else if k == TY_BOOL { cg_t(&mut g, "bool"); }
+  else if k == TY_UNIT { cg_t(&mut g, "void"); }
+  else if k == TY_BUF { cg_t(&mut g, "bst_buf"); }
+  else if k == TY_BYTES { cg_t(&mut g, "bst_bytes"); }
+  else if k == TY_HOST { cg_t(&mut g, "bst_host"); }
+  else if k == TY_CHILD { cg_t(&mut g, "bst_child"); }
+  else if k == TY_STR { cg_t(&mut g, "bst_str"); }
+  else if k == TY_SERIAL { cg_t(&mut g, "bst_serial"); }
+  else if k == TY_FRAME { cg_t(&mut g, "bst_frame"); }
+  else if k == TY_PT { cg_t(&mut g, "bst_pt"); }
+  else if k == TY_POOL { cg_t(&mut g, "bst_pool"); }
+  else if k == TY_MMU { cg_t(&mut g, "bst_mmu"); }
+  else if k == TY_CPU { cg_t(&mut g, "bst_cpu"); }
+  else if k == TY_PORTS { cg_t(&mut g, "bst_ports"); }
+  else if k == TY_PORTIO { cg_t(&mut g, "bst_portio"); }
+  else if k == TY_MMIOSPACE { cg_t(&mut g, "bst_mmiospace"); }
+  else if k == TY_MMIO { cg_t(&mut g, "bst_mmio"); }
+  else if k == TY_DMA { cg_t(&mut g, "bst_dma"); }
+  else if k == TY_STRUCT { cg_t(&mut g, "bst_s_"); cg_instname(&mut g, m, p, x.a, CG_CID); }
+  else if k == TY_ENUM { cg_t(&mut g, "bst_e_"); cg_instname(&mut g, m, p, x.a, CG_CID); }
+  else if k == TY_BOX { cg_cty(&mut g, m, p, x.a); cg_t(&mut g, " *"); }
+  else if k == TY_VEC { cg_t(&mut g, "bst_vec"); }
+  // The lock word, followed by the contents (see bst_lock_acquire).
+  else if k == TY_LOCK { cg_t(&mut g, "uint64_t *"); }
+  else if k == TY_REF || k == TY_MUTREF { cg_cty(&mut g, m, p, x.a); }
+}
+
+/// `f_<cid>` for the function of instance `x`.
+fn cg_fname(g: &mut Cg, m: &Mono, p: &Parser, x: u64) {
+  cg_t(&mut g, "f_");
+  cg_instname(&mut g, m, p, x, CG_CID);
+}
+
+// ---- Types of expressions ----
+
+fn cvar_at(xs: &Vec[CgVar], k: u64) -> CgVar {
+  if k < vec_len(xs) {
+    return vec_get(xs, k);
+  }
+  return CgVar { s: 0, e: 0, ty: 0 };
+}
+
+fn cg_bind(g: &mut Cg, s: u64, e: u64, t: u64) {
+  vec_push(&mut g.vars, CgVar { s: s, e: e, ty: t });
+}
+
+fn cg_var_ty(g: &Cg, p: &Parser, s: u64, e: u64) -> u64 {
+  let mut k = vec_len(g.vars);
+  while k > 0 {
+    k = k - 1;
+    let x = cvar_at(g.vars, k);
+    if same(p.src, x.s, x.e, s, e) {
+      return x.ty;
+    }
+  }
+  return 0;
+}
+
+fn cg_is_mutp(g: &Cg, p: &Parser, s: u64, e: u64) -> bool {
+  let mut k = 0;
+  while k < vec_len(g.mutp) {
+    let x = cvar_at(g.mutp, k);
+    if same(p.src, x.s, x.e, s, e) {
+      return true;
+    }
+    k = k + 1;
+  }
+  return false;
+}
+
+/// The integer type the checker recorded for operator node `i`, or 0.
+fn cg_int_op(c: &Checker, x: u64, i: u64) -> u64 {
+  let mut k = 0;
+  while k < vec_len(c.int_ops) {
+    let o = vec_get(c.int_ops, k);
+    if o.x == x && o.node == i {
+      return o.ty;
+    }
+    k = k + 1;
+  }
+  return 0;
+}
+
+/// The same, u64 when none is recorded.
+fn cg_int_ty(c: &Checker, x: u64, i: u64) -> u64 {
+  let t = cg_int_op(c, x, i);
+  if t == 0 {
+    return c.tu64;
+  }
+  return t;
+}
+
+fn cg_is_bitwise(op: u64) -> bool {
+  return op == P_AMP || op == P_PIPE || op == P_CARET || op == P_SHL || op == P_SHR;
+}
+
+fn cg_is_arith(op: u64) -> bool {
+  return op == P_PLUS || op == P_MINUS || op == P_STAR || op == P_SLASH || op == P_PERCENT;
+}
+
+/// The type of field `s..e` of a value of type `t` (boxes looked through).
+fn cg_field_ty(c: &Checker, m: &Mono, p: &Parser, t: u64, s: u64, e: u64) -> u64 {
+  let mut u = t;
+  let mut guard = 0;
+  while kind_t(m, u) == TY_BOX && guard < SRC_MAX {
+    u = inner_t(m, u);
+    guard = guard + 1;
+  }
+  let tu = ty_at(m, u);
+  let x = tu.a;
+  let dn = def_node(m, p, x);
+  let j = index_in(p, dn.a, s, e);
+  if j == 0 {
+    return 0;
+  }
+  return fld_ty(c, x, j - 1);
+}
+
+/// The index of variant `s..e` of enum instance `x`.
+fn cg_variant(m: &Mono, p: &Parser, x: u64, s: u64, e: u64) -> u64 {
+  let dn = def_node(m, p, x);
+  let j = index_in(p, dn.a, s, e);
+  if j == 0 {
+    return 0;
+  }
+  return j - 1;
+}
+
+/// The function instance call node `i` calls (`inst`, or what it names).
+fn cg_callee(m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 {
+  if inst != 0 {
+    return inst;
+  }
+  let n = node_at(p.nodes, i);
+  return plain_inst(&mut m, plain_fn(p, n.s, n.e));
+}
+
+fn cg_ret_ty(m: &mut Mono, p: &Parser, x: u64) -> u64 {
+  let xi = inst_at(m, x);
+  let dn = node_at(p.nodes, xi.def);
+  return conv(&mut m, p, dn.b, x, xi.def);
+}
+
+/// Argument `j` of call node `i`, or 0.
+fn cg_arg(p: &Parser, i: u64, j: u64) -> u64 {
+  let n = node_at(p.nodes, i);
+  let mut a = n.a;
+  let mut k = 0;
+  while a != 0 && k < j {
+    a = next_of(p, a);
+    k = k + 1;
+  }
+  return a;
+}
+
+/// The places a path names, as nodes with a name each: the variable, then
+/// the fields. From an E_VAR/E_FIELD chain:
+fn cg_segs_expr(p: &Parser, i: u64, out: &mut Vec[u64]) {
+  let n = node_at(p.nodes, i);
+  if n.kind == E_FIELD {
+    cg_segs_expr(p, n.a, &mut out);
+  }
+  vec_push(&mut out, i);
+}
+
+/// ... and from a list of N_NAME nodes.
+fn cg_segs_list(p: &Parser, head: u64, out: &mut Vec[u64]) {
+  let mut k = head;
+  while k != 0 {
+    vec_push(&mut out, k);
+    k = next_of(p, k);
+  }
+}
+
+fn cg_place_ty(g: &Cg, c: &Checker, m: &Mono, p: &Parser, segs: &Vec[u64]) -> u64 {
+  let r = node_at(p.nodes, u_at(segs, 0));
+  let mut t = cg_var_ty(g, p, r.s, r.e);
+  let mut k = 1;
+  while k < vec_len(segs) {
+    let f = node_at(p.nodes, u_at(segs, k));
+    t = cg_field_ty(c, m, p, t, f.s, f.e);
+    k = k + 1;
+  }
+  return t;
+}
+
+/// The element type of the vector a `vec_*` call's first argument names.
+fn cg_vec_elem(g: &Cg, c: &Checker, m: &mut Mono, p: &Parser, a: u64) -> u64 {
+  let an = node_at(p.nodes, a);
+  let mut t = 0;
+  if an.kind == E_MUTBORROW {
+    let mut segs = vec_new[u64]();
+    cg_segs_list(p, an.a, &mut segs);
+    t = cg_place_ty(g, c, m, p, segs);
+    vec_free(segs);
+  } else {
+    t = cg_type_of(g, c, &mut m, p, a, 0);
+  }
+  return inner_t(m, t);
+}
+
+/// The type of a code expression (the checker has already accepted it).
+fn cg_type_of(g: &Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 {
+  let n = node_at(p.nodes, i);
+  let k = n.kind;
+  if k == E_TAPP {
+    if is_typed_builtin(p, n.b) {
+      let t = conv(&mut m, p, n.a, g.env, i);
+      if name_is(p, n.b, "vec_new") {
+        return intern(&mut m, p, TY_VEC, t);
+      }
+      return t;
+    }
+    let x = tapp_inst(&mut m, p, i, g.env);
+    return cg_type_of(g, c, &mut m, p, n.b, x);
+  }
+  if k == E_INT {
+    return c.tu64;
+  }
+  if k == E_BOOL || k == E_IS {
+    return c.tbool;
+  }
+  if k == E_NOT {
+    let t = cg_int_op(c, g.env, i);
+    if t == 0 {
+      return c.tbool;
+    }
+    return t;
+  }
+  if k == E_NEG {
+    let t = cg_int_op(c, g.env, i);
+    if t == 0 {
+      return prim(&mut m, p, TY_I64);
+    }
+    return t;
+  }
+  if k == E_STR || k == E_BLOB {
+    return c.tstr;
+  }
+  if k == E_VAR {
+    return cg_var_ty(g, p, n.s, n.e);
+  }
+  if k == E_FIELD {
+    let t = cg_type_of(g, c, &mut m, p, n.a, 0);
+    return cg_field_ty(c, m, p, t, n.s, n.e);
+  }
+  if k == E_SLIT {
+    let mut x = inst;
+    if x == 0 {
+      x = plain_inst(&mut m, find_in(p, p.structs.head, i));
+    }
+    return intern(&mut m, p, TY_STRUCT, x);
+  }
+  if k == E_VARIANT {
+    let mut x = inst;
+    if x == 0 {
+      x = plain_inst(&mut m, find_in(p, p.enums.head, i));
+    }
+    return intern(&mut m, p, TY_ENUM, x);
+  }
+  if k == E_BIN {
+    if cg_is_arith(n.v) || cg_is_bitwise(n.v) {
+      return cg_int_ty(c, g.env, i);
+    }
+    return c.tbool;
+  }
+  if k == E_CALL {
+    let a0 = n.a;
+    if inst == 0 {
+      if name_is(p, i, "box") {
+        let t = cg_type_of(g, c, &mut m, p, a0, 0);
+        return intern(&mut m, p, TY_BOX, t);
+      }
+      if name_is(p, i, "unbox") || name_is(p, i, "lock_end") {
+        let t = cg_type_of(g, c, &mut m, p, a0, 0);
+        return inner_t(m, t);
+      }
+      if is_vec_builtin(p, n.s, n.e) {
+        if name_is(p, i, "vec_len") {
+          return c.tu64;
+        }
+        if name_is(p, i, "vec_push") || name_is(p, i, "vec_set") || name_is(p, i, "vec_free") {
+          return c.tunit;
+        }
+        return cg_vec_elem(g, c, &mut m, p, a0);
+      }
+      if is_wrap_builtin(p, n.s, n.e) {
+        return cg_int_ty(c, g.env, i);
+      }
+      if name_is(p, i, "lock_new") {
+        let t = cg_type_of(g, c, &mut m, p, a0, 0);
+        return intern(&mut m, p, TY_LOCK, t);
+      }
+      if name_is(p, i, "locked") {
+        let fnode = node_at(p.nodes, cg_arg(p, i, 1));
+        let x = plain_inst(&mut m, plain_fn(p, fnode.s, fnode.e));
+        return cg_ret_ty(&mut m, p, x);
+      }
+      if name_is(p, i, "smp_run") {
+        return c.tunit;
+      }
+      let b = bs_index(c, p, n.s, n.e);
+      if b != 0 {
+        let bs = bs_at(c, b - 1);
+        return bs.ret;
+      }
+    }
+    let x = cg_callee(&mut m, p, i, inst);
+    return cg_ret_ty(&mut m, p, x);
+  }
+  return 0;
+}
+
+// ---- Expressions ----
+
+/// Whether evaluating `i` may have a side effect: any call other than the
+/// read-only accessors.
+fn cg_has_effect(p: &Parser, i: u64) -> bool {
+  if i == 0 {
+    return false;
+  }
+  let n = node_at(p.nodes, i);
+  let k = n.kind;
+  if k == E_CALL {
+    if !(name_is(p, i, "len") || name_is(p, i, "get") || name_is(p, i, "slen") || name_is(p, i, "sget")
+      || name_is(p, i, "blen") || name_is(p, i, "bget") || name_is(p, i, "vec_len")) {
+      return true;
+    }
+    let mut a = n.a;
+    while a != 0 {
+      if cg_has_effect(p, a) {
+        return true;
+      }
+      a = next_of(p, a);
+    }
+    return false;
+  }
+  if k == E_SLIT {
+    let mut f = n.a;
+    while f != 0 {
+      let fnode = node_at(p.nodes, f);
+      if cg_has_effect(p, fnode.a) {
+        return true;
+      }
+      f = fnode.next;
+    }
+    return false;
+  }
+  if k == E_VARIANT || k == E_IS || k == E_NOT || k == E_NEG {
+    return cg_has_effect(p, n.a);
+  }
+  if k == E_TAPP {
+    return cg_has_effect(p, n.b);
+  }
+  if k == E_BIN {
+    return cg_has_effect(p, n.a) || cg_has_effect(p, n.b);
+  }
+  return false;
+}
+
+/// Whether call argument `x` is read after the other arguments: a `&mut`
+/// borrow or a linear place (see `cg_operands`).
+fn cg_late(g: &Cg, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> bool {
+  let k = kind_of(p, x);
+  if k == E_MUTBORROW {
+    return true;
+  }
+  if k == E_VAR || k == E_FIELD {
+    let t = base_t(m, cg_type_of(g, c, &mut m, p, x, 0));
+    let tk = kind_t(m, t);
+    return !(tk == TY_U64 || tk == TY_BOOL || tk == TY_STR);
+  }
+  return false;
+}
+
+/// Generates the operands `xs` of a call, binary operator or struct literal
+/// so they run in the order the verifier assumes, filling `vals`; returns
+/// the statements to run first. C leaves the order unspecified, so when any
+/// operand has a side effect, each one is evaluated into a temporary first.
+/// For a call (`call`), the verifier reads scalars and computed values left
+/// to right, then the linear places and `&mut` borrows (plain reads with no
+/// effect), so those stay inline and are read after every temporary.
+fn cg_operands(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, xs: &Vec[u64], call: bool, vals: &mut Vec[CgSp]) -> CgSp {
+  let mut any = false;
+  let mut k = 0;
+  while k < vec_len(xs) {
+    if cg_has_effect(p, u_at(xs, k)) {
+      any = true;
+    }
+    k = k + 1;
+  }
+  k = 0;
+  if !any {
+    while k < vec_len(xs) {
+      let e = cg_expr(&mut g, c, &mut m, p, u_at(xs, k), 0);
+      vec_push(&mut vals, e);
+      k = k + 1;
+    }
+    return CgSp { s: 0, n: 0 };
+  }
+  // Temporaries for the early operands (0: a late one), then the late ones.
+  let mut tnum = vec_new[u64]();
+  let mut late = vec_new[u64]();
+  while k < vec_len(xs) {
+    let x = u_at(xs, k);
+    if call && cg_late(g, c, &mut m, p, x) {
+      vec_push(&mut late, 1);
+      vec_push(&mut tnum, 0);
+      vec_push(&mut vals, CgSp { s: 0, n: 0 });
+    } else {
+      vec_push(&mut late, 0);
+      vec_push(&mut tnum, cg_tmp(&mut g));
+      let e = cg_expr(&mut g, c, &mut m, p, x, 0);
+      vec_push(&mut vals, e);
+    }
+    k = k + 1;
+  }
+  k = 0;
+  while k < vec_len(xs) {
+    if u_at(late, k) == 1 && k < vec_len(vals) {
+      let e = cg_expr(&mut g, c, &mut m, p, u_at(xs, k), 0);
+      vec_set(&mut vals, k, e);
+    }
+    k = k + 1;
+  }
+  let start = cg_mark(g);
+  k = 0;
+  while k < vec_len(xs) {
+    if u_at(late, k) == 0 {
+      cg_t(&mut g, "__auto_type o_");
+      cg_n(&mut g, u_at(tnum, k));
+      cg_t(&mut g, " = ");
+      cg_sp(&mut g, sp_at(vals, k));
+      cg_t(&mut g, "; ");
+    }
+    k = k + 1;
+  }
+  let pre = cg_span(g, start);
+  k = 0;
+  while k < vec_len(xs) {
+    if u_at(late, k) == 0 && k < vec_len(vals) {
+      let s2 = cg_mark(g);
+      cg_t(&mut g, "o_");
+      cg_n(&mut g, u_at(tnum, k));
+      let nm = cg_span(g, s2);
+      vec_set(&mut vals, k, nm);
+    }
+    k = k + 1;
+  }
+  vec_free(tnum);
+  vec_free(late);
+  return pre;
+}
+
+/// `e` after the statements in `pre`, as one C expression (a GNU statement
+/// expression when there are any).
+fn cg_seq(g: &mut Cg, pre: CgSp, e: CgSp) -> CgSp {
+  if pre.n == 0 {
+    return e;
+  }
+  let start = cg_mark(g);
+  cg_t(&mut g, "({ ");
+  cg_sp(&mut g, pre);
+  cg_sp(&mut g, e);
+  cg_t(&mut g, "; })");
+  return cg_span(g, start);
+}
+
+fn cg_op(g: &mut Cg, op: u64) {
+  if op == P_EQEQ { cg_t(&mut g, "=="); }
+  else if op == P_NE { cg_t(&mut g, "!="); }
+  else if op == P_LE { cg_t(&mut g, "<="); }
+  else if op == P_GE { cg_t(&mut g, ">="); }
+  else if op == P_ANDAND { cg_t(&mut g, "&&"); }
+  else if op == P_OROR { cg_t(&mut g, "||"); }
+  else if op == P_PLUS { cg_t(&mut g, "+"); }
+  else if op == P_MINUS { cg_t(&mut g, "-"); }
+  else if op == P_STAR { cg_t(&mut g, "*"); }
+  else if op == P_SLASH { cg_t(&mut g, "/"); }
+  else if op == P_PERCENT { cg_t(&mut g, "%"); }
+  else if op == P_LT { cg_t(&mut g, "<"); }
+  else if op == P_GT { cg_t(&mut g, ">"); }
+  else if op == P_AMP { cg_t(&mut g, "&"); }
+  else if op == P_PIPE { cg_t(&mut g, "|"); }
+  else if op == P_CARET { cg_t(&mut g, "^"); }
+  else if op == P_SHL { cg_t(&mut g, "<<"); }
+  else if op == P_SHR { cg_t(&mut g, ">>"); }
+}
+
+fn cg_hex2(g: &mut Cg, b: u64) {
+  let hi = (b / 16) % 16;
+  let lo = b % 16;
+  if hi < 10 { vec_push(&mut g.pool, 48 + hi); } else { vec_push(&mut g.pool, 87 + hi); }
+  if lo < 10 { vec_push(&mut g.pool, 48 + lo); } else { vec_push(&mut g.pool, 87 + lo); }
+}
+
+/// The C lvalue for a place; a box on the way is dereferenced.
+fn cg_place(g: &mut Cg, c: &Checker, m: &Mono, p: &Parser, segs: &Vec[u64]) -> CgSp {
+  let r = node_at(p.nodes, u_at(segs, 0));
+  let mut start = cg_mark(g);
+  if cg_is_mutp(g, p, r.s, r.e) {
+    cg_t(&mut g, "(*v_");
+    cg_src(&mut g, p, r.s, r.e);
+    cg_t(&mut g, ")");
+  } else {
+    cg_t(&mut g, "v_");
+    cg_src(&mut g, p, r.s, r.e);
+  }
+  let mut cur = cg_span(g, start);
+  let mut t = cg_var_ty(g, p, r.s, r.e);
+  let mut k = 1;
+  while k < vec_len(segs) {
+    let f = node_at(p.nodes, u_at(segs, k));
+    let mut guard = 0;
+    while kind_t(m, t) == TY_BOX && guard < SRC_MAX {
+      start = cg_mark(g);
+      cg_t(&mut g, "(*");
+      cg_sp(&mut g, cur);
+      cg_t(&mut g, ")");
+      cur = cg_span(g, start);
+      t = inner_t(m, t);
+      guard = guard + 1;
+    }
+    start = cg_mark(g);
+    cg_sp(&mut g, cur);
+    cg_t(&mut g, ".");
+    cg_src(&mut g, p, f.s, f.e);
+    cur = cg_span(g, start);
+    t = cg_field_ty(c, m, p, t, f.s, f.e);
+    k = k + 1;
+  }
+  return cur;
+}
+
+/// Adds `t` to `xs` unless it is there already.
+fn cg_note(xs: &mut Vec[u64], t: u64) {
+  if !has_id(xs, t) {
+    vec_push(&mut xs, t);
+  }
+}
+
+fn cg_expr(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> CgSp {
+  let n = node_at(p.nodes, i);
+  let k = n.kind;
+  if k == E_TAPP {
+    if is_typed_builtin(p, n.b) {
+      if name_is(p, n.b, "vec_new") {
+        return cg_lit(&mut g, "((bst_vec){ 0, 0, 0 })");
+      }
+      // `cast` is proved not to change the value and `wrap` means C's
+      // modular conversion, so both are a plain C cast.
+      let t = conv(&mut m, p, n.a, g.env, i);
+      let inner = node_at(p.nodes, n.b);
+      let e = cg_expr(&mut g, c, &mut m, p, inner.a, 0);
+      let start = cg_mark(g);
+      cg_t(&mut g, "((");
+      cg_cty(&mut g, m, p, t);
+      cg_t(&mut g, ")(");
+      cg_sp(&mut g, e);
+      cg_t(&mut g, "))");
+      return cg_span(g, start);
+    }
+    let x = tapp_inst(&mut m, p, i, g.env);
+    return cg_expr(&mut g, c, &mut m, p, n.b, x);
+  }
+  if k == E_INT {
+    let start = cg_mark(g);
+    cg_t(&mut g, "UINT64_C(");
+    cg_n(&mut g, n.v);
+    cg_t(&mut g, ")");
+    return cg_span(g, start);
+  }
+  if k == E_BOOL {
+    if n.v != 0 {
+      return cg_lit(&mut g, "true");
+    }
+    return cg_lit(&mut g, "false");
+  }
+  if k == E_STR {
+    let mut bytes = balloc(0);
+    if n.s <= n.e && n.e <= blen(p.src) {
+      bfree(bytes);
+      bytes = decode(p.src, n.s, n.e);
+    }
+    let start = cg_mark(g);
+    cg_t(&mut g, "((bst_str){ ");
+    cg_n(&mut g, blen(bytes));
+    cg_t(&mut g, ", (const unsigned char *)\"");
+    let mut j = 0;
+    while j < blen(bytes) {
+      cg_t(&mut g, "\\x");
+      cg_hex2(&mut g, bget(bytes, j));
+      j = j + 1;
+    }
+    cg_t(&mut g, "\" })");
+    bfree(bytes);
+    return cg_span(g, start);
+  }
+  if k == E_BLOB {
+    vec_push(&mut g.blobs, i);
+    let start = cg_mark(g);
+    cg_t(&mut g, "((bst_str){ ");
+    cg_n(&mut g, n.v);
+    cg_t(&mut g, ", bst_blob");
+    cg_n(&mut g, vec_len(g.blobs) - 1);
+    cg_t(&mut g, " })");
+    return cg_span(g, start);
+  }
+  if k == E_VAR || k == E_FIELD {
+    let mut segs = vec_new[u64]();
+    cg_segs_expr(p, i, &mut segs);
+    let r = cg_place(&mut g, c, m, p, segs);
+    vec_free(segs);
+    return r;
+  }
+  if k == E_MUTBORROW {
+    let first = node_at(p.nodes, n.a);
+    if first.next == 0 && cg_is_mutp(g, p, first.s, first.e) {
+      let start = cg_mark(g);
+      cg_t(&mut g, "v_");
+      cg_src(&mut g, p, first.s, first.e);
+      return cg_span(g, start);
+    }
+    let mut segs = vec_new[u64]();
+    cg_segs_list(p, n.a, &mut segs);
+    let pl = cg_place(&mut g, c, m, p, segs);
+    vec_free(segs);
+    let start = cg_mark(g);
+    cg_t(&mut g, "&");
+    cg_sp(&mut g, pl);
+    return cg_span(g, start);
+  }
+  if k == E_SLIT {
+    let mut x = inst;
+    if x == 0 {
+      x = plain_inst(&mut m, find_in(p, p.structs.head, i));
+    }
+    let mut xs = vec_new[u64]();
+    let mut f = n.a;
+    while f != 0 {
+      let fnode = node_at(p.nodes, f);
+      vec_push(&mut xs, fnode.a);
+      f = fnode.next;
+    }
+    let mut vals = vec_new[CgSp]();
+    let pre = cg_operands(&mut g, c, &mut m, p, xs, false, &mut vals);
+    let start = cg_mark(g);
+    cg_t(&mut g, "((bst_s_");
+    cg_instname(&mut g, m, p, x, CG_CID);
+    cg_t(&mut g, "){ ");
+    f = n.a;
+    let mut j = 0;
+    while f != 0 {
+      let fnode = node_at(p.nodes, f);
+      if j > 0 {
+        cg_t(&mut g, ", ");
+      }
+      cg_t(&mut g, ".");
+      cg_src(&mut g, p, fnode.s, fnode.e);
+      cg_t(&mut g, " = ");
+      cg_sp(&mut g, sp_at(vals, j));
+      f = fnode.next;
+      j = cg_add(j, 1);
+    }
+    cg_t(&mut g, " })");
+    let e = cg_span(g, start);
+    vec_free(xs);
+    vec_free(vals);
+    return cg_seq(&mut g, pre, e);
+  }
+  if k == E_VARIANT {
+    let mut x = inst;
+    if x == 0 {
+      x = plain_inst(&mut m, find_in(p, p.enums.head, i));
+    }
+    let idx = cg_variant(m, p, x, n.s2, n.e2);
+    let mut e = CgSp { s: 0, n: 0 };
+    if n.a != 0 {
+      e = cg_expr(&mut g, c, &mut m, p, n.a, 0);
+    }
+    let start = cg_mark(g);
+    cg_t(&mut g, "((bst_e_");
+    cg_instname(&mut g, m, p, x, CG_CID);
+    cg_t(&mut g, "){ .tag = ");
+    cg_n(&mut g, idx);
+    if n.a != 0 {
+      cg_t(&mut g, ", .u.");
+      cg_src(&mut g, p, n.s2, n.e2);
+      cg_t(&mut g, " = ");
+      cg_sp(&mut g, e);
+    }
+    cg_t(&mut g, " })");
+    return cg_span(g, start);
+  }
+  if k == E_IS {
+    let t = cg_type_of(g, c, &mut m, p, n.a, 0);
+    let idx = cg_variant(m, p, inner_t(m, t), n.s2, n.e2);
+    let e = cg_expr(&mut g, c, &mut m, p, n.a, 0);
+    let start = cg_mark(g);
+    cg_t(&mut g, "(");
+    cg_sp(&mut g, e);
+    cg_t(&mut g, ".tag == ");
+    cg_n(&mut g, idx);
+    cg_t(&mut g, ")");
+    return cg_span(g, start);
+  }
+  if k == E_NOT {
+    // C promotes a narrow operand to int, so `~` is cast back.
+    let t = cg_int_op(c, g.env, i);
+    let e = cg_expr(&mut g, c, &mut m, p, n.a, 0);
+    let start = cg_mark(g);
+    if t != 0 {
+      cg_t(&mut g, "((");
+      cg_cty(&mut g, m, p, t);
+      cg_t(&mut g, ")~");
+    } else {
+      cg_t(&mut g, "(!");
+    }
+    cg_sp(&mut g, e);
+    cg_t(&mut g, ")");
+    return cg_span(g, start);
+  }
+  if k == E_NEG {
+    // A negated literal is a constant; `-x` is proved not to overflow.
+    let an = node_at(p.nodes, n.a);
+    if an.kind == E_INT {
+      if an.v == 9223372036854775808 {
+        return cg_lit(&mut g, "INT64_MIN");
+      }
+      let start = cg_mark(g);
+      cg_t(&mut g, "(-INT64_C(");
+      cg_n(&mut g, an.v);
+      cg_t(&mut g, "))");
+      return cg_span(g, start);
+    }
+    let e = cg_expr(&mut g, c, &mut m, p, n.a, 0);
+    let start = cg_mark(g);
+    cg_t(&mut g, "(-(int64_t)(");
+    cg_sp(&mut g, e);
+    cg_t(&mut g, "))");
+    return cg_span(g, start);
+  }
+  if k == E_BIN {
+    return cg_bin(&mut g, c, &mut m, p, i);
+  }
+  if k == E_CALL {
+    return cg_call(&mut g, c, &mut m, p, i, inst);
+  }
+  return CgSp { s: 0, n: 0 };
+}
+
+fn cg_bin(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp {
+  let n = node_at(p.nodes, i);
+  // && and || are sequenced in C already (and must stay short-circuit).
+  if n.v == P_ANDAND || n.v == P_OROR {
+    let a = cg_expr(&mut g, c, &mut m, p, n.a, 0);
+    let b = cg_expr(&mut g, c, &mut m, p, n.b, 0);
+    let start = cg_mark(g);
+    cg_t(&mut g, "(");
+    cg_sp(&mut g, a);
+    cg_t(&mut g, " ");
+    cg_op(&mut g, n.v);
+    cg_t(&mut g, " ");
+    cg_sp(&mut g, b);
+    cg_t(&mut g, ")");
+    return cg_span(g, start);
+  }
+  let mut xs = vec_new[u64]();
+  vec_push(&mut xs, n.a);
+  vec_push(&mut xs, n.b);
+  let mut vals = vec_new[CgSp]();
+  let pre = cg_operands(&mut g, c, &mut m, p, xs, false, &mut vals);
+  let a = sp_at(vals, 0);
+  let b = sp_at(vals, 1);
+  vec_free(xs);
+  vec_free(vals);
+  let t = cg_int_op(c, g.env, i);
+  let start = cg_mark(g);
+  if cg_is_bitwise(n.v) {
+    // A narrow operand is promoted to int; the proof keeps a left shift
+    // inside the type, and the cast brings the type back.
+    cg_t(&mut g, "((");
+    cg_cty(&mut g, m, p, cg_int_ty(c, g.env, i));
+    cg_t(&mut g, ")(");
+    cg_sp(&mut g, a);
+    cg_t(&mut g, " ");
+    cg_op(&mut g, n.v);
+    cg_t(&mut g, " ");
+    cg_sp(&mut g, b);
+    cg_t(&mut g, "))");
+  } else if t != 0 && is_signed(m, t) {
+    // Signed operands are computed in int64_t, so a literal (a uint64_t
+    // constant) cannot turn the operation unsigned. The proof keeps every
+    // result in range, so nothing overflows.
+    cg_t(&mut g, "((int64_t)(");
+    cg_sp(&mut g, a);
+    cg_t(&mut g, ") ");
+    cg_op(&mut g, n.v);
+    cg_t(&mut g, " (int64_t)(");
+    cg_sp(&mut g, b);
+    cg_t(&mut g, "))");
+  } else {
+    cg_t(&mut g, "(");
+    cg_sp(&mut g, a);
+    cg_t(&mut g, " ");
+    cg_op(&mut g, n.v);
+    cg_t(&mut g, " ");
+    cg_sp(&mut g, b);
+    cg_t(&mut g, ")");
+  }
+  let e = cg_span(g, start);
+  return cg_seq(&mut g, pre, e);
+}
+
+fn cg_args_of(p: &Parser, i: u64) -> Vec[u64] {
+  let mut xs = vec_new[u64]();
+  let n = node_at(p.nodes, i);
+  let mut a = n.a;
+  while a != 0 {
+    vec_push(&mut xs, a);
+    a = next_of(p, a);
+  }
+  return xs;
+}
+
+fn cg_call(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> CgSp {
+  let n = node_at(p.nodes, i);
+  if inst == 0 {
+    if is_vec_builtin(p, n.s, n.e) {
+      return cg_vec_call(&mut g, c, &mut m, p, i);
+    }
+    if name_is(p, i, "box") || name_is(p, i, "unbox") {
+      return cg_box(&mut g, c, &mut m, p, i);
+    }
+    if is_wrap_builtin(p, n.s, n.e) {
+      // Computed in uint64_t, where C's unsigned arithmetic is modular
+      // (narrower operands would be promoted to a signed int).
+      let t = cg_int_ty(c, g.env, i);
+      let a = cg_expr(&mut g, c, &mut m, p, cg_arg(p, i, 0), 0);
+      let b = cg_expr(&mut g, c, &mut m, p, cg_arg(p, i, 1), 0);
+      let start = cg_mark(g);
+      cg_t(&mut g, "((");
+      cg_cty(&mut g, m, p, t);
+      cg_t(&mut g, ")((uint64_t)(");
+      cg_sp(&mut g, a);
+      if name_is(p, i, "wrap_add") {
+        cg_t(&mut g, ") + (uint64_t)(");
+      } else if name_is(p, i, "wrap_sub") {
+        cg_t(&mut g, ") - (uint64_t)(");
+      } else {
+        cg_t(&mut g, ") * (uint64_t)(");
+      }
+      cg_sp(&mut g, b);
+      cg_t(&mut g, ")))");
+      return cg_span(g, start);
+    }
+    if name_is(p, i, "lock_new") || name_is(p, i, "lock_end") {
+      return cg_lock(&mut g, c, &mut m, p, i);
+    }
+    if name_is(p, i, "locked") {
+      return cg_locked(&mut g, c, &mut m, p, i);
+    }
+    if name_is(p, i, "smp_run") {
+      return cg_smp_run(&mut g, c, &mut m, p, i);
+    }
+  }
+  let xs = cg_args_of(p, i);
+  let mut vals = vec_new[CgSp]();
+  let pre = cg_operands(&mut g, c, &mut m, p, xs, true, &mut vals);
+  vec_free(xs);
+  let a0 = sp_at(vals, 0);
+  let a1 = sp_at(vals, 1);
+  let start = cg_mark(g);
+  if inst == 0 && (name_is(p, i, "len") || name_is(p, i, "slen") || name_is(p, i, "blen")) {
+    cg_sp(&mut g, a0);
+    cg_t(&mut g, ".len");
+  } else if inst == 0 && name_is(p, i, "get") {
+    cg_sp(&mut g, a0);
+    cg_t(&mut g, ".data[");
+    cg_sp(&mut g, a1);
+    cg_t(&mut g, "]");
+  } else if inst == 0 && (name_is(p, i, "sget") || name_is(p, i, "bget")) {
+    cg_t(&mut g, "((uint64_t)");
+    cg_sp(&mut g, a0);
+    cg_t(&mut g, ".data[");
+    cg_sp(&mut g, a1);
+    cg_t(&mut g, "])");
+  } else if inst == 0 && bs_index(c, p, n.s, n.e) != 0 {
+    cg_t(&mut g, "bst_");
+    cg_src(&mut g, p, n.s, n.e);
+    cg_t(&mut g, "(");
+    cg_list(&mut g, vals);
+    cg_t(&mut g, ")");
+  } else {
+    let x = cg_callee(&mut m, p, i, inst);
+    cg_fname(&mut g, m, p, x);
+    cg_t(&mut g, "(");
+    cg_list(&mut g, vals);
+    cg_t(&mut g, ")");
+  }
+  vec_free(vals);
+  let e = cg_span(g, start);
+  return cg_seq(&mut g, pre, e);
+}
+
+fn cg_vec_call(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp {
+  let n = node_at(p.nodes, i);
+  let el = cg_vec_elem(g, c, &mut m, p, n.a);
+  cg_note(&mut g.vecs, el);
+  let xs = cg_args_of(p, i);
+  let mut vals = vec_new[CgSp]();
+  let pre = cg_operands(&mut g, c, &mut m, p, xs, true, &mut vals);
+  vec_free(xs);
+  let start = cg_mark(g);
+  if name_is(p, i, "vec_len") {
+    cg_sp(&mut g, sp_at(vals, 0));
+    cg_t(&mut g, ".len");
+  } else {
+    cg_t(&mut g, "bst_");
+    cg_src(&mut g, p, n.s, n.e);
+    cg_t(&mut g, "_");
+    cg_tyname(&mut g, m, p, el, CG_HELPER);
+    cg_t(&mut g, "(");
+    cg_list(&mut g, vals);
+    cg_t(&mut g, ")");
+  }
+  vec_free(vals);
+  let e = cg_span(g, start);
+  return cg_seq(&mut g, pre, e);
+}
+
+fn cg_box(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp {
+  let n = node_at(p.nodes, i);
+  let t = cg_type_of(g, c, &mut m, p, n.a, 0);
+  let mut inner = t;
+  if name_is(p, i, "unbox") {
+    inner = inner_t(m, t);
+  }
+  cg_note(&mut g.boxed, inner);
+  if name_is(p, i, "unbox") {
+    let e = cg_expr(&mut g, c, &mut m, p, n.a, 0);
+    let start = cg_mark(g);
+    cg_t(&mut g, "bst_unbox_");
+    cg_tyname(&mut g, m, p, inner, CG_HELPER);
+    cg_t(&mut g, "(");
+    cg_sp(&mut g, e);
+    cg_t(&mut g, ")");
+    return cg_span(g, start);
+  }
+  // Allocate the box before evaluating its contents, so a recursive
+  // structure is laid out parent first (preorder), the order a traversal
+  // reads it in. Allocation has no observable effect, so moving it earlier
+  // changes nothing else.
+  let k = cg_tmp(&mut g);
+  let e = cg_expr(&mut g, c, &mut m, p, n.a, 0);
+  let s1 = cg_mark(g);
+  cg_cty(&mut g, m, p, inner);
+  let ct = cg_span(g, s1);
+  let start = cg_mark(g);
+  cg_t(&mut g, "({ ");
+  cg_sp(&mut g, ct);
+  cg_t(&mut g, " *bp_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " = (");
+  cg_sp(&mut g, ct);
+  cg_t(&mut g, " *)bst_box_alloc(sizeof(");
+  cg_sp(&mut g, ct);
+  cg_t(&mut g, ")); *bp_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " = ");
+  cg_sp(&mut g, e);
+  cg_t(&mut g, "; bp_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, "; })");
+  return cg_span(g, start);
+}
+
+fn cg_lock(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp {
+  let n = node_at(p.nodes, i);
+  let k = cg_tmp(&mut g);
+  let t = cg_type_of(g, c, &mut m, p, n.a, 0);
+  let mut ty0 = t;
+  if name_is(p, i, "lock_end") {
+    ty0 = inner_t(m, t);
+  }
+  let s1 = cg_mark(g);
+  cg_cty(&mut g, m, p, ty0);
+  let ct = cg_span(g, s1);
+  let e = cg_expr(&mut g, c, &mut m, p, n.a, 0);
+  let start = cg_mark(g);
+  if name_is(p, i, "lock_new") {
+    // Like a box: allocated first, then filled.
+    cg_t(&mut g, "({ uint64_t *lk_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, " = (uint64_t *)bst_box_alloc(8 + sizeof(");
+    cg_sp(&mut g, ct);
+    cg_t(&mut g, ")); *lk_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, " = 0; *(");
+    cg_sp(&mut g, ct);
+    cg_t(&mut g, " *)(lk_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, " + 1) = ");
+    cg_sp(&mut g, e);
+    cg_t(&mut g, "; lk_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, "; })");
+  } else {
+    cg_t(&mut g, "({ uint64_t *lk_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, " = ");
+    cg_sp(&mut g, e);
+    cg_t(&mut g, "; ");
+    cg_sp(&mut g, ct);
+    cg_t(&mut g, " lv_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, " = *(");
+    cg_sp(&mut g, ct);
+    cg_t(&mut g, " *)(lk_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, " + 1); bst_box_free(lk_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, ", 8 + sizeof(");
+    cg_sp(&mut g, ct);
+    cg_t(&mut g, ")); lv_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, "; })");
+  }
+  return cg_span(g, start);
+}
+
+/// `T` or `T *` for a parameter of type `pt`.
+fn cg_param_cty(g: &mut Cg, m: &Mono, p: &Parser, pt: u64) {
+  if kind_t(m, pt) == TY_MUTREF {
+    cg_cty(&mut g, m, p, inner_t(m, pt));
+    cg_t(&mut g, " *");
+  } else {
+    cg_cty(&mut g, m, p, pt);
+  }
+}
+
+fn cg_locked(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp {
+  let n = node_at(p.nodes, i);
+  let lt = cg_type_of(g, c, &mut m, p, n.a, 0);
+  let inner = inner_t(m, lt);
+  let fnode = node_at(p.nodes, cg_arg(p, i, 1));
+  let x = plain_inst(&mut m, plain_fn(p, fnode.s, fnode.e));
+  let xi = inst_at(m, x);
+  let ps = fn_params(&mut m, p, xi.def, x);
+  let ret = cg_ret_ty(&mut m, p, x);
+  let k = cg_tmp(&mut g);
+  // The arguments are evaluated before the lock is taken.
+  let e0 = cg_expr(&mut g, c, &mut m, p, n.a, 0);
+  let mut es = vec_new[CgSp]();
+  let mut a = cg_arg(p, i, 2);
+  let mut j = 1;
+  while a != 0 && j < vec_len(ps) {
+    let e = cg_expr(&mut g, c, &mut m, p, a, 0);
+    vec_push(&mut es, e);
+    a = next_of(p, a);
+    j = j + 1;
+  }
+  let s1 = cg_mark(g);
+  cg_t(&mut g, "uint64_t *lk_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " = ");
+  cg_sp(&mut g, e0);
+  cg_t(&mut g, ";");
+  j = 0;
+  while j < vec_len(es) {
+    cg_t(&mut g, " ");
+    cg_param_cty(&mut g, m, p, u_at(ps, cg_add(j, 1)));
+    cg_t(&mut g, " la_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, "_");
+    cg_n(&mut g, j);
+    cg_t(&mut g, " = ");
+    cg_sp(&mut g, sp_at(es, j));
+    cg_t(&mut g, ";");
+    j = j + 1;
+  }
+  let pre = cg_span(g, s1);
+  let s2 = cg_mark(g);
+  cg_fname(&mut g, m, p, x);
+  cg_t(&mut g, "((");
+  cg_cty(&mut g, m, p, inner);
+  cg_t(&mut g, " *)(lk_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " + 1)");
+  j = 0;
+  while j < vec_len(es) {
+    cg_t(&mut g, ", la_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, "_");
+    cg_n(&mut g, j);
+    j = j + 1;
+  }
+  cg_t(&mut g, ")");
+  let call = cg_span(g, s2);
+  vec_free(es);
+  vec_free(ps);
+  let start = cg_mark(g);
+  cg_t(&mut g, "({ ");
+  cg_sp(&mut g, pre);
+  cg_t(&mut g, " bst_lock_acquire(lk_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, "); ");
+  if kind_t(m, ret) == TY_UNIT {
+    cg_sp(&mut g, call);
+    cg_t(&mut g, "; bst_lock_release(lk_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, "); })");
+  } else {
+    cg_cty(&mut g, m, p, ret);
+    cg_t(&mut g, " lr_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, " = ");
+    cg_sp(&mut g, call);
+    cg_t(&mut g, "; bst_lock_release(lk_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, "); lr_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, "; })");
+  }
+  return cg_span(g, start);
+}
+
+fn cg_smp_run(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp {
+  let fnode = node_at(p.nodes, cg_arg(p, i, 0));
+  let x = plain_inst(&mut m, plain_fn(p, fnode.s, fnode.e));
+  let xi = inst_at(m, x);
+  let ps = fn_params(&mut m, p, xi.def, x);
+  let k = g.nsmp;
+  // Shared arguments go in a block every processor reads; each processor's
+  // own Cpu and Mmu are made where it runs.
+  let mut es = vec_new[CgSp]();
+  let mut a = cg_arg(p, i, 1);
+  let mut j = 0;
+  while a != 0 && j < vec_len(ps) {
+    let e = cg_expr(&mut g, c, &mut m, p, a, 0);
+    vec_push(&mut es, e);
+    a = next_of(p, a);
+    j = j + 1;
+  }
+  // The argument block and thunk.
+  let s1 = cg_mark(g);
+  cg_t(&mut g, "struct bst_smp_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " {");
+  let mut fields = false;
+  j = 0;
+  while j < vec_len(es) {
+    let pt = u_at(ps, j);
+    if kind_t(m, pt) != TY_MUTREF {
+      cg_t(&mut g, " ");
+      cg_cty(&mut g, m, p, pt);
+      cg_t(&mut g, " a");
+      cg_n(&mut g, j);
+      cg_t(&mut g, ";");
+      fields = true;
+    }
+    j = j + 1;
+  }
+  if !fields {
+    cg_t(&mut g, " uint64_t unused;");
+  }
+  cg_t(&mut g, " };\nstatic void bst_smp_thunk_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, "(void *p) { struct bst_smp_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " *a = p; bst_cpu cpu = 0; bst_mmu mmu = 0; (void)a; (void)cpu; (void)mmu; ");
+  cg_fname(&mut g, m, p, x);
+  cg_t(&mut g, "(");
+  j = 0;
+  while j < vec_len(es) {
+    if j > 0 {
+      cg_t(&mut g, ", ");
+    }
+    let pt = u_at(ps, j);
+    if kind_t(m, pt) == TY_MUTREF {
+      if kind_t(m, inner_t(m, pt)) == TY_CPU {
+        cg_t(&mut g, "&cpu");
+      } else {
+        cg_t(&mut g, "&mmu");
+      }
+    } else {
+      cg_t(&mut g, "a->a");
+      cg_n(&mut g, j);
+    }
+    j = j + 1;
+  }
+  cg_t(&mut g, "); }\n");
+  let def = cg_span(g, s1);
+  let mut b = vec_new[u64]();
+  cg_copy(g, def, &mut b);
+  let mut q = 0;
+  while q < vec_len(b) {
+    vec_push(&mut g.smp, u_at(b, q));
+    q = q + 1;
+  }
+  vec_free(b);
+  g.nsmp = cg_add(k, 1);
+  // The call: start the other processors, run here too, wait for them.
+  let start = cg_mark(g);
+  cg_t(&mut g, "({ struct bst_smp_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " sa_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " = { ");
+  let mut first = true;
+  j = 0;
+  while j < vec_len(es) {
+    if kind_t(m, u_at(ps, j)) != TY_MUTREF {
+      if !first {
+        cg_t(&mut g, ", ");
+      }
+      cg_t(&mut g, ".a");
+      cg_n(&mut g, j);
+      cg_t(&mut g, " = ");
+      cg_sp(&mut g, sp_at(es, j));
+      first = false;
+    }
+    j = j + 1;
+  }
+  cg_t(&mut g, " }; bst_platform_smp_start(bst_smp_thunk_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, ", &sa_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, "); ");
+  cg_fname(&mut g, m, p, x);
+  cg_t(&mut g, "(");
+  j = 0;
+  while j < vec_len(es) {
+    if j > 0 {
+      cg_t(&mut g, ", ");
+    }
+    if kind_t(m, u_at(ps, j)) == TY_MUTREF {
+      cg_sp(&mut g, sp_at(es, j));
+    } else {
+      cg_t(&mut g, "sa_");
+      cg_n(&mut g, k);
+      cg_t(&mut g, ".a");
+      cg_n(&mut g, j);
+    }
+    j = j + 1;
+  }
+  cg_t(&mut g, "); bst_platform_smp_join(); })");
+  vec_free(es);
+  vec_free(ps);
+  return cg_span(g, start);
+}
+
+// ---- Statements ----
+
+fn cg_block(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, head: u64, d: u64) {
+  let mut k = head;
+  while k != 0 {
+    cg_stmt(&mut g, c, &mut m, p, k, d);
+    k = next_of(p, k);
+  }
+}
+
+/// Generates statement `i` at depth `d` into the bodies.
+fn cg_stmt(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64, d: u64) {
+  let n = node_at(p.nodes, i);
+  let k = n.kind;
+  let start = cg_mark(g);
+  if k == S_LET {
+    let e = cg_expr(&mut g, c, &mut m, p, n.b, 0);
+    let t = let_ty(m, g.env, i);
+    cg_bind(&mut g, n.s, n.e, t);
+    let ln = cg_mark(g);
+    cg_ind(&mut g, d);
+    cg_cty(&mut g, m, p, t);
+    cg_t(&mut g, " v_");
+    cg_src(&mut g, p, n.s, n.e);
+    cg_t(&mut g, " = ");
+    cg_sp(&mut g, e);
+    cg_t(&mut g, ";\n");
+    cg_to_body(&mut g, ln);
+  } else if k == S_ASSIGN {
+    let e = cg_expr(&mut g, c, &mut m, p, n.b, 0);
+    let mut segs = vec_new[u64]();
+    cg_segs_list(p, n.a, &mut segs);
+    let pl = cg_place(&mut g, c, m, p, segs);
+    vec_free(segs);
+    let ln = cg_mark(g);
+    cg_ind(&mut g, d);
+    cg_sp(&mut g, pl);
+    cg_t(&mut g, " = ");
+    cg_sp(&mut g, e);
+    cg_t(&mut g, ";\n");
+    cg_to_body(&mut g, ln);
+  } else if k == S_IF {
+    let e = cg_expr(&mut g, c, &mut m, p, n.a, 0);
+    let ln = cg_mark(g);
+    cg_ind(&mut g, d);
+    cg_t(&mut g, "if (");
+    cg_sp(&mut g, e);
+    cg_t(&mut g, ") {\n");
+    cg_to_body(&mut g, ln);
+    cg_block(&mut g, c, &mut m, p, n.b, cg_add(d, 1));
+    cg_ind(&mut g, d);
+    if n.c == 0 {
+      cg_t(&mut g, "}\n");
+      cg_to_body(&mut g, ln);
+    } else {
+      cg_t(&mut g, "} else {\n");
+      cg_to_body(&mut g, ln);
+      cg_block(&mut g, c, &mut m, p, n.c, cg_add(d, 1));
+      cg_ind(&mut g, d);
+      cg_t(&mut g, "}\n");
+      cg_to_body(&mut g, ln);
+    }
+  } else if k == S_WHILE {
+    let e = cg_expr(&mut g, c, &mut m, p, n.a, 0);
+    let ln = cg_mark(g);
+    cg_ind(&mut g, d);
+    cg_t(&mut g, "while (");
+    cg_sp(&mut g, e);
+    cg_t(&mut g, ") {\n");
+    cg_to_body(&mut g, ln);
+    cg_block(&mut g, c, &mut m, p, n.c, cg_add(d, 1));
+    cg_ind(&mut g, d);
+    cg_t(&mut g, "}\n");
+    cg_to_body(&mut g, ln);
+  } else if k == S_MATCH {
+    cg_match(&mut g, c, &mut m, p, i, d);
+  } else if k == S_RETURN {
+    if n.a != 0 {
+      let e = cg_expr(&mut g, c, &mut m, p, n.a, 0);
+      let ln = cg_mark(g);
+      cg_ind(&mut g, d);
+      cg_t(&mut g, "return ");
+      cg_sp(&mut g, e);
+      cg_t(&mut g, ";\n");
+      cg_to_body(&mut g, ln);
+    } else {
+      cg_ind(&mut g, d);
+      cg_t(&mut g, "return;\n");
+      cg_to_body(&mut g, start);
+    }
+  } else if k == S_UNREACHABLE {
+    cg_ind(&mut g, d);
+    cg_t(&mut g, "__builtin_unreachable();\n");
+    cg_to_body(&mut g, start);
+  } else if k == S_EXPR {
+    let e = cg_expr(&mut g, c, &mut m, p, n.a, 0);
+    let ln = cg_mark(g);
+    cg_ind(&mut g, d);
+    cg_sp(&mut g, e);
+    cg_t(&mut g, ";\n");
+    cg_to_body(&mut g, ln);
+  }
+  // S_ASSERT: ghost, proved at compile time and erased.
+  cg_cut(&mut g, start);
+}
+
+fn cg_match(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64, d: u64) {
+  let n = node_at(p.nodes, i);
+  let start = cg_mark(g);
+  // The enum comes from the scrutinee's type (a pattern may leave out a
+  // generic enum's type arguments).
+  let e = cg_expr(&mut g, c, &mut m, p, n.a, 0);
+  let x = inner_t(m, cg_type_of(g, c, &mut m, p, n.a, 0));
+  let mk = cg_tmp(&mut g);
+  let ln = cg_mark(g);
+  cg_ind(&mut g, d);
+  cg_t(&mut g, "{\n");
+  cg_ind(&mut g, cg_add(d, 1));
+  cg_t(&mut g, "bst_e_");
+  cg_instname(&mut g, m, p, x, CG_CID);
+  cg_t(&mut g, " m_");
+  cg_n(&mut g, mk);
+  cg_t(&mut g, " = ");
+  cg_sp(&mut g, e);
+  cg_t(&mut g, ";\n");
+  cg_to_body(&mut g, ln);
+  cg_cut(&mut g, start);
+  // The match is exhaustive (checked), so the last arm needs no test.
+  let narms = list_len(p, n.b);
+  let mut arm = n.b;
+  let mut j = 0;
+  while arm != 0 {
+    let an = node_at(p.nodes, arm);
+    let last = cg_add(j, 1) == narms;
+    cg_ind(&mut g, cg_add(d, 1));
+    if an.v == PAT_WILD {
+      if j == 0 {
+        cg_t(&mut g, "{\n");
+      } else {
+        cg_t(&mut g, "} else {\n");
+      }
+    } else {
+      let idx = cg_variant(m, p, x, an.s2, an.e2);
+      if j == 0 && last {
+        cg_t(&mut g, "{\n");
+      } else if last {
+        cg_t(&mut g, "} else {\n");
+      } else {
+        if j == 0 {
+          cg_t(&mut g, "if (m_");
+        } else {
+          cg_t(&mut g, "} else if (m_");
+        }
+        cg_n(&mut g, mk);
+        cg_t(&mut g, ".tag == ");
+        cg_n(&mut g, idx);
+        cg_t(&mut g, ") {\n");
+      }
+      if an.a != 0 {
+        let bn = node_at(p.nodes, an.a);
+        if !span_is(p, bn.s, bn.e, "_") {
+          let pt = fld_ty(c, x, idx);
+          cg_bind(&mut g, bn.s, bn.e, pt);
+          cg_ind(&mut g, cg_add(d, 2));
+          cg_cty(&mut g, m, p, pt);
+          cg_t(&mut g, " v_");
+          cg_src(&mut g, p, bn.s, bn.e);
+          cg_t(&mut g, " = m_");
+          cg_n(&mut g, mk);
+          cg_t(&mut g, ".u.");
+          cg_src(&mut g, p, an.s2, an.e2);
+          cg_t(&mut g, ";\n");
+        }
+      }
+    }
+    cg_to_body(&mut g, start);
+    cg_block(&mut g, c, &mut m, p, an.c, cg_add(d, 2));
+    arm = an.next;
+    j = cg_add(j, 1);
+  }
+  if n.b != 0 {
+    cg_ind(&mut g, cg_add(d, 1));
+    cg_t(&mut g, "}\n");
+  }
+  cg_ind(&mut g, d);
+  cg_t(&mut g, "}\n");
+  cg_to_body(&mut g, start);
+}
+
+// ---- Functions and the file ----
+
+/// `static RET f_name(params)`
+fn cg_proto(g: &mut Cg, m: &mut Mono, p: &Parser, x: u64) {
+  let xi = inst_at(m, x);
+  let dn = node_at(p.nodes, xi.def);
+  let ret = cg_ret_ty(&mut m, p, x);
+  cg_t(&mut g, "static ");
+  cg_cty(&mut g, m, p, ret);
+  cg_t(&mut g, " ");
+  cg_fname(&mut g, m, p, x);
+  cg_t(&mut g, "(");
+  let mut q = dn.a;
+  if q == 0 {
+    cg_t(&mut g, "void");
+  }
+  while q != 0 {
+    let qn = node_at(p.nodes, q);
+    let pt = conv(&mut m, p, qn.a, x, q);
+    if kind_t(m, pt) == TY_MUTREF {
+      cg_cty(&mut g, m, p, inner_t(m, pt));
+      cg_t(&mut g, " *v_");
+    } else {
+      cg_cty(&mut g, m, p, pt);
+      cg_t(&mut g, " v_");
+    }
+    cg_src(&mut g, p, qn.s, qn.e);
+    q = qn.next;
+    if q != 0 {
+      cg_t(&mut g, ", ");
+    }
+  }
+  cg_t(&mut g, ")");
+}
+
+fn cg_fn(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
+  let xi = inst_at(m, x);
+  let dn = node_at(p.nodes, xi.def);
+  g.env = x;
+  g.tmps = 0;
+  while vec_len(g.vars) > 0 {
+    vec_pop(&mut g.vars);
+  }
+  while vec_len(g.mutp) > 0 {
+    vec_pop(&mut g.mutp);
+  }
+  let mut q = dn.a;
+  while q != 0 {
+    let qn = node_at(p.nodes, q);
+    let pt = conv(&mut m, p, qn.a, x, q);
+    if kind_t(m, pt) == TY_MUTREF {
+      vec_push(&mut g.mutp, CgVar { s: qn.s, e: qn.e, ty: pt });
+    }
+    cg_bind(&mut g, qn.s, qn.e, base_t(m, pt));
+    q = qn.next;
+  }
+  let start = cg_mark(g);
+  cg_proto(&mut g, &mut m, p, x);
+  cg_t(&mut g, " {\n");
+  cg_to_body(&mut g, start);
+  cg_block(&mut g, c, &mut m, p, dn.x, 1);
+  cg_t(&mut g, "}\n\n");
+  cg_to_body(&mut g, start);
+}
+
+/// Types the struct or enum instance `x` holds by value, then `x` itself,
+/// unless done already. An enum is a tag plus a union of its payloads.
+fn cg_typedef(g: &mut Cg, c: &Checker, m: &Mono, p: &Parser, x: u64, done: &mut Vec[u64], is_enum: bool) {
+  if has_id(done, x) {
+    return;
+  }
+  vec_push(&mut done, x);
+  let dn = def_node(m, p, x);
+  let nf = list_len(p, dn.a);
+  let mut j = 0;
+  while j < nf && j < SRC_MAX {
+    let t = fld_ty(c, x, j);
+    let tk = kind_t(m, t);
+    if tk == TY_STRUCT || tk == TY_ENUM {
+      cg_typedef(&mut g, c, m, p, inner_t(m, t), &mut done, tk == TY_ENUM);
+    }
+    j = j + 1;
+  }
+  let start = cg_mark(g);
+  if !is_enum {
+    cg_t(&mut g, "struct bst_s_");
+    cg_instname(&mut g, m, p, x, CG_CID);
+    cg_t(&mut g, " {");
+    let mut f = dn.a;
+    j = 0;
+    while f != 0 && j < SRC_MAX {
+      let fnode = node_at(p.nodes, f);
+      cg_t(&mut g, " ");
+      cg_cty(&mut g, m, p, fld_ty(c, x, j));
+      cg_t(&mut g, " ");
+      cg_src(&mut g, p, fnode.s, fnode.e);
+      cg_t(&mut g, ";");
+      f = fnode.next;
+      j = j + 1;
+    }
+    cg_t(&mut g, " };\n");
+  } else {
+    cg_t(&mut g, "struct bst_e_");
+    cg_instname(&mut g, m, p, x, CG_CID);
+    cg_t(&mut g, " { uint64_t tag;");
+    let mut payload = false;
+    j = 0;
+    while j < nf && j < SRC_MAX {
+      let t = fld_ty(c, x, j);
+      if t != 0 && kind_t(m, t) != TY_UNIT {
+        payload = true;
+      }
+      j = j + 1;
+    }
+    if payload {
+      cg_t(&mut g, " union {");
+      let mut f = dn.a;
+      j = 0;
+      while f != 0 && j < SRC_MAX {
+        let fnode = node_at(p.nodes, f);
+        let t = fld_ty(c, x, j);
+        if t != 0 && kind_t(m, t) != TY_UNIT {
+          cg_t(&mut g, " ");
+          cg_cty(&mut g, m, p, t);
+          cg_t(&mut g, " ");
+          cg_src(&mut g, p, fnode.s, fnode.e);
+          cg_t(&mut g, ";");
+        }
+        f = fnode.next;
+        j = j + 1;
+      }
+      cg_t(&mut g, " } u;");
+    }
+    cg_t(&mut g, " };\n");
+  }
+  cg_to_out(&mut g, start);
+}
+
+fn cg_out(g: &mut Cg, s: Str) {
+  cg_s(&mut g.out, s);
+}
+
+/// The C types for the program's structs and enums. All are declared first,
+/// so a box (a pointer) can name any of them; then each is defined after the
+/// types it holds by value.
+fn cg_types(g: &mut Cg, c: &Checker, m: &Mono, p: &Parser) {
+  let mut k = 0;
+  while k < vec_len(m.structs) {
+    let start = cg_mark(g);
+    cg_t(&mut g, "typedef struct bst_s_");
+    cg_instname(&mut g, m, p, u_at(m.structs, k), CG_CID);
+    cg_t(&mut g, " bst_s_");
+    cg_instname(&mut g, m, p, u_at(m.structs, k), CG_CID);
+    cg_t(&mut g, ";\n");
+    cg_to_out(&mut g, start);
+    k = k + 1;
+  }
+  k = 0;
+  while k < vec_len(m.enums) {
+    let start = cg_mark(g);
+    cg_t(&mut g, "typedef struct bst_e_");
+    cg_instname(&mut g, m, p, u_at(m.enums, k), CG_CID);
+    cg_t(&mut g, " bst_e_");
+    cg_instname(&mut g, m, p, u_at(m.enums, k), CG_CID);
+    cg_t(&mut g, ";\n");
+    cg_to_out(&mut g, start);
+    k = k + 1;
+  }
+  let mut done = vec_new[u64]();
+  k = 0;
+  while k < vec_len(m.structs) {
+    cg_typedef(&mut g, c, m, p, u_at(m.structs, k), &mut done, false);
+    k = k + 1;
+  }
+  k = 0;
+  while k < vec_len(m.enums) {
+    cg_typedef(&mut g, c, m, p, u_at(m.enums, k), &mut done, true);
+    k = k + 1;
+  }
+  vec_free(done);
+}
+
+fn cg_helpers(g: &mut Cg, m: &Mono, p: &Parser) {
+  let mut k = 0;
+  while k < vec_len(g.vecs) {
+    let t = u_at(g.vecs, k);
+    let s1 = cg_mark(g);
+    cg_cty(&mut g, m, p, t);
+    let ct = cg_span(g, s1);
+    let s2 = cg_mark(g);
+    cg_tyname(&mut g, m, p, t, CG_HELPER);
+    let hn = cg_span(g, s2);
+    let start = cg_mark(g);
+    cg_t(&mut g, "static void bst_vec_push_"); cg_sp(&mut g, hn);
+    cg_t(&mut g, "(bst_vec *v, "); cg_sp(&mut g, ct);
+    cg_t(&mut g, " x) { if (v->len == v->cap) bst_vec_grow(v, sizeof("); cg_sp(&mut g, ct);
+    cg_t(&mut g, ")); (("); cg_sp(&mut g, ct);
+    cg_t(&mut g, " *)v->data)[v->len++] = x; }\n");
+    cg_t(&mut g, "static "); cg_sp(&mut g, ct);
+    cg_t(&mut g, " bst_vec_pop_"); cg_sp(&mut g, hn);
+    cg_t(&mut g, "(bst_vec *v) { return (("); cg_sp(&mut g, ct);
+    cg_t(&mut g, " *)v->data)[--v->len]; }\n");
+    cg_t(&mut g, "static "); cg_sp(&mut g, ct);
+    cg_t(&mut g, " bst_vec_get_"); cg_sp(&mut g, hn);
+    cg_t(&mut g, "(bst_vec v, uint64_t i) { return (("); cg_sp(&mut g, ct);
+    cg_t(&mut g, " *)v.data)[i]; }\n");
+    cg_t(&mut g, "static void bst_vec_set_"); cg_sp(&mut g, hn);
+    cg_t(&mut g, "(bst_vec *v, uint64_t i, "); cg_sp(&mut g, ct);
+    cg_t(&mut g, " x) { (("); cg_sp(&mut g, ct);
+    cg_t(&mut g, " *)v->data)[i] = x; }\n");
+    cg_t(&mut g, "static "); cg_sp(&mut g, ct);
+    cg_t(&mut g, " bst_vec_swap_"); cg_sp(&mut g, hn);
+    cg_t(&mut g, "(bst_vec *v, uint64_t i, "); cg_sp(&mut g, ct);
+    cg_t(&mut g, " x) { "); cg_sp(&mut g, ct);
+    cg_t(&mut g, " o = (("); cg_sp(&mut g, ct);
+    cg_t(&mut g, " *)v->data)[i]; (("); cg_sp(&mut g, ct);
+    cg_t(&mut g, " *)v->data)[i] = x; return o; }\n");
+    cg_t(&mut g, "static void bst_vec_free_"); cg_sp(&mut g, hn);
+    cg_t(&mut g, "(bst_vec v) { bst_vec_release(v, sizeof("); cg_sp(&mut g, ct);
+    cg_t(&mut g, ")); }\n");
+    cg_to_out(&mut g, start);
+    cg_cut(&mut g, s1);
+    k = k + 1;
+  }
+  k = 0;
+  while k < vec_len(g.boxed) {
+    let t = u_at(g.boxed, k);
+    let s1 = cg_mark(g);
+    cg_cty(&mut g, m, p, t);
+    let ct = cg_span(g, s1);
+    let start = cg_mark(g);
+    cg_t(&mut g, "static "); cg_sp(&mut g, ct);
+    cg_t(&mut g, " bst_unbox_"); cg_tyname(&mut g, m, p, t, CG_HELPER);
+    cg_t(&mut g, "("); cg_sp(&mut g, ct);
+    cg_t(&mut g, " *p) { "); cg_sp(&mut g, ct);
+    cg_t(&mut g, " v = *p; bst_box_free(p, sizeof("); cg_sp(&mut g, ct);
+    cg_t(&mut g, ")); return v; }\n");
+    cg_to_out(&mut g, start);
+    cg_cut(&mut g, s1);
+    k = k + 1;
+  }
+}
+
+/// The contents of every `include_bytes`, as constant arrays.
+fn cg_blobs(g: &mut Cg, p: &Parser) {
+  let mut k = 0;
+  while k < vec_len(g.blobs) {
+    let i = u_at(g.blobs, k);
+    let n = node_at(p.nodes, i);
+    // Which of the parser's blobs it is: its data is there.
+    let mut b = 0;
+    while b < vec_len(p.blobs) && u_at(p.blobs, b) != i {
+      b = b + 1;
+    }
+    let from = u_at(p.bstart, b);
+    let start = cg_mark(g);
+    cg_t(&mut g, "static const unsigned char bst_blob");
+    cg_n(&mut g, k);
+    cg_t(&mut g, "[");
+    if n.v == 0 {
+      cg_n(&mut g, 1);
+    } else {
+      cg_n(&mut g, n.v);
+    }
+    cg_t(&mut g, "] = {");
+    let mut j = 0;
+    while j < n.v {
+      if j % 24 == 0 {
+        cg_t(&mut g, "\n");
+      }
+      cg_n(&mut g, u_at(p.bdata, cg_add(from, j)));
+      cg_t(&mut g, ",");
+      j = j + 1;
+    }
+    cg_t(&mut g, "\n};\n");
+    cg_to_out(&mut g, start);
+    k = k + 1;
+  }
+}
+
+/// The C side of an `export fn`: a non-static function under the Bastio
+/// name, whose parameters are C types (`&Bytes` is a pointer and a length).
+fn cg_export_proto(g: &mut Cg, m: &mut Mono, p: &Parser, x: u64) {
+  let xi = inst_at(m, x);
+  let dn = node_at(p.nodes, xi.def);
+  let ret = cg_ret_ty(&mut m, p, x);
+  cg_cty(&mut g, m, p, ret);
+  cg_t(&mut g, " ");
+  cg_src(&mut g, p, dn.s, dn.e);
+  cg_t(&mut g, "(");
+  let mut q = dn.a;
+  if q == 0 {
+    cg_t(&mut g, "void");
+  }
+  while q != 0 {
+    let qn = node_at(p.nodes, q);
+    let pt = conv(&mut m, p, qn.a, x, q);
+    if kind_t(m, base_t(m, pt)) == TY_BYTES {
+      if kind_t(m, pt) != TY_MUTREF {
+        cg_t(&mut g, "const ");
+      }
+      cg_t(&mut g, "uint8_t *");
+      cg_src(&mut g, p, qn.s, qn.e);
+      cg_t(&mut g, ", size_t ");
+      cg_src(&mut g, p, qn.s, qn.e);
+      cg_t(&mut g, "_len");
+    } else {
+      cg_cty(&mut g, m, p, pt);
+      cg_t(&mut g, " ");
+      cg_src(&mut g, p, qn.s, qn.e);
+    }
+    q = qn.next;
+    if q != 0 {
+      cg_t(&mut g, ", ");
+    }
+  }
+  cg_t(&mut g, ")");
+}
+
+/// The definition behind `cg_export_proto`. It only converts: a lent buffer
+/// becomes a `bst_bytes` (`const` is dropped, which is sound because a
+/// `&Bytes` is never written through), and everything else is passed and
+/// returned as is. A lent `&mut Bytes` is a local the callee writes
+/// through; the verifier proved it is not replaced, so there is nothing to
+/// copy back.
+fn cg_export(g: &mut Cg, m: &mut Mono, p: &Parser, x: u64) {
+  let xi = inst_at(m, x);
+  let dn = node_at(p.nodes, xi.def);
+  let start = cg_mark(g);
+  cg_export_proto(&mut g, &mut m, p, x);
+  cg_t(&mut g, " {\n");
+  let mut q = dn.a;
+  while q != 0 {
+    let qn = node_at(p.nodes, q);
+    let pt = conv(&mut m, p, qn.a, x, q);
+    if kind_t(m, pt) == TY_MUTREF {
+      cg_t(&mut g, "    bst_bytes m_");
+      cg_src(&mut g, p, qn.s, qn.e);
+      cg_t(&mut g, " = { (uint64_t)");
+      cg_src(&mut g, p, qn.s, qn.e);
+      cg_t(&mut g, "_len, ");
+      cg_src(&mut g, p, qn.s, qn.e);
+      cg_t(&mut g, " };\n");
+    }
+    q = qn.next;
+  }
+  let ret = cg_ret_ty(&mut m, p, x);
+  cg_t(&mut g, "    ");
+  if kind_t(m, ret) != TY_UNIT {
+    cg_t(&mut g, "return ");
+  }
+  cg_fname(&mut g, m, p, x);
+  cg_t(&mut g, "(");
+  q = dn.a;
+  while q != 0 {
+    let qn = node_at(p.nodes, q);
+    let pt = conv(&mut m, p, qn.a, x, q);
+    if kind_t(m, pt) == TY_MUTREF {
+      cg_t(&mut g, "&m_");
+      cg_src(&mut g, p, qn.s, qn.e);
+    } else if kind_t(m, base_t(m, pt)) == TY_BYTES {
+      cg_t(&mut g, "(bst_bytes){ (uint64_t)");
+      cg_src(&mut g, p, qn.s, qn.e);
+      cg_t(&mut g, "_len, (unsigned char *)");
+      cg_src(&mut g, p, qn.s, qn.e);
+      cg_t(&mut g, " }");
+    } else {
+      cg_src(&mut g, p, qn.s, qn.e);
+    }
+    q = qn.next;
+    if q != 0 {
+      cg_t(&mut g, ", ");
+    }
+  }
+  cg_t(&mut g, ");\n}\n\n");
+  cg_to_out(&mut g, start);
+}
+
+/// The entry point: builds the capabilities `main` asks for and calls it.
+fn cg_entry(g: &mut Cg, m: &mut Mono, p: &Parser, x: u64) {
+  let xi = inst_at(m, x);
+  let dn = node_at(p.nodes, xi.def);
+  let np = list_len(p, dn.a);
+  let first = node_at(p.nodes, dn.a);
+  let legacy = np == 1 && kind_t(m, conv(&mut m, p, first.a, x, dn.a)) == TY_SERIAL;
+  let mut serial = legacy;
+  let s1 = cg_mark(g);
+  let mut q = dn.a;
+  let mut j = 0;
+  if !legacy {
+    while q != 0 {
+      let qn = node_at(p.nodes, q);
+      let t = base_t(m, conv(&mut m, p, qn.a, x, q));
+      cg_t(&mut g, "    ");
+      cg_cty(&mut g, m, p, t);
+      cg_t(&mut g, " c");
+      cg_n(&mut g, j);
+      if kind_t(m, t) == TY_POOL && g.target == TARGET_KERNEL {
+        cg_t(&mut g, " = bst_pool_init(mbi);\n");
+      } else if kind_t(m, t) == TY_POOL {
+        cg_t(&mut g, " = bst_pool_init();\n");
+      } else {
+        cg_t(&mut g, " = 0;\n");
+      }
+      if kind_t(m, t) == TY_SERIAL {
+        serial = true;
+      }
+      q = qn.next;
+      j = cg_add(j, 1);
+    }
+  }
+  let setup = cg_span(g, s1);
+  let s2 = cg_mark(g);
+  cg_t(&mut g, "f_main(");
+  if legacy {
+    cg_t(&mut g, "0");
+  } else {
+    j = 0;
+    while j < np && j < SRC_MAX {
+      if j > 0 {
+        cg_t(&mut g, ", ");
+      }
+      cg_t(&mut g, "&c");
+      cg_n(&mut g, j);
+      j = j + 1;
+    }
+  }
+  cg_t(&mut g, ")");
+  let call = cg_span(g, s2);
+  let s3 = cg_mark(g);
+  if !legacy && g.target == TARGET_HOSTED {
+    q = dn.a;
+    j = 0;
+    while q != 0 {
+      let qn = node_at(p.nodes, q);
+      let t = base_t(m, conv(&mut m, p, qn.a, x, q));
+      if kind_t(m, t) == TY_POOL {
+        cg_t(&mut g, "    bst_pool_fini(c");
+        cg_n(&mut g, j);
+        cg_t(&mut g, ");\n");
+      }
+      q = qn.next;
+      j = cg_add(j, 1);
+    }
+  }
+  let teardown = cg_span(g, s3);
+  let returns = kind_t(m, cg_ret_ty(&mut m, p, x)) == TY_U64;
+  let start = cg_mark(g);
+  if g.target == TARGET_HOSTED {
+    cg_t(&mut g, "int main(int argc, char **argv) {\n    bst_argc = argc;\n    bst_argv = argv;\n");
+    cg_sp(&mut g, setup);
+    if returns {
+      cg_t(&mut g, "    uint64_t r = ");
+    } else {
+      cg_t(&mut g, "    (void)");
+    }
+    cg_sp(&mut g, call);
+    cg_t(&mut g, ";\n");
+    cg_sp(&mut g, teardown);
+    if returns {
+      cg_t(&mut g, "    return (int)r;\n}\n");
+    } else {
+      cg_t(&mut g, "    return 0;\n}\n");
+    }
+  } else if g.target == TARGET_KERNEL {
+    // COM1 is set up only for a kernel that uses `Serial`; one that drives
+    // the UART itself through `Ports` gets it untouched.
+    cg_t(&mut g, "void bst_kmain(uint64_t mbi) {\n    (void)mbi;\n");
+    if serial {
+      cg_t(&mut g, "    bst_serial_init();\n");
+    }
+    cg_sp(&mut g, setup);
+    cg_t(&mut g, "    (void)");
+    cg_sp(&mut g, call);
+    cg_t(&mut g, ";\n}\n");
+  } else {
+    cg_t(&mut g, "uint64_t bst_umain(void) {\n");
+    cg_sp(&mut g, setup);
+    cg_t(&mut g, "    uint64_t r = ");
+    cg_sp(&mut g, call);
+    cg_t(&mut g, ";\n    bst_flush();\n    return r;\n}\n");
+  }
+  cg_to_out(&mut g, start);
+  cg_cut(&mut g, s1);
+}
+
+/// Generates the C file for the program monomorphized into `m` and checked
+/// by `c`, into `g.out`.
+fn cg_program(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser) {
+  let mut k = 0;
+  while k < vec_len(m.fns) {
+    cg_fn(&mut g, c, &mut m, p, u_at(m.fns, k));
+    k = k + 1;
+  }
+  cg_prelude(&mut g.out, g.target);
+  cg_types(&mut g, c, m, p);
+  cg_helpers(&mut g, m, p);
+  cg_blobs(&mut g, p);
+  k = 0;
+  while k < vec_len(m.fns) {
+    let start = cg_mark(g);
+    cg_proto(&mut g, &mut m, p, u_at(m.fns, k));
+    cg_t(&mut g, ";\n");
+    cg_to_out(&mut g, start);
+    k = k + 1;
+  }
+  k = 0;
+  while k < vec_len(g.smp) {
+    vec_push(&mut g.out, u_at(g.smp, k));
+    k = k + 1;
+  }
+  cg_out(&mut g, "\n");
+  k = 0;
+  while k < vec_len(g.body) {
+    vec_push(&mut g.out, u_at(g.body, k));
+    k = k + 1;
+  }
+  k = 0;
+  while k < vec_len(m.fns) {
+    let x = u_at(m.fns, k);
+    if exported_x(m, p, x) {
+      cg_export(&mut g, &mut m, p, x);
+    }
+    k = k + 1;
+  }
+  k = 0;
+  while k < vec_len(m.fns) {
+    let x = u_at(m.fns, k);
+    let xi = inst_at(m, x);
+    if name_is(p, xi.def, "main") {
+      cg_entry(&mut g, &mut m, p, x);
+    }
+    k = k + 1;
+  }
+}
