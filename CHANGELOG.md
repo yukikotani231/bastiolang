@@ -11,7 +11,21 @@ The version is the one in `stage0/Cargo.toml`. A release is a tag `vX.Y.Z` on
 
 ## [Unreleased]
 
-Nothing yet.
+### Compiler
+
+- Diagnostics name tokens as written, report a missing `;` at the end of the
+  line, say where a linear value was consumed, and suggest a close name for
+  an unknown variable or function (#87).
+- Z3 runs with a fixed work limit per query (`:rlimit`) instead of a 10 s
+  timeout, so a proof no longer fails on a busy machine (#89).
+
+### Documentation
+
+- The tutorial's section on calling Bastio from C walks through a new
+  example, `examples/lines`, built on `export fn` and `--header`.
+- `tests/run.sh` checks that error messages shown in `docs/` are what the
+  compiler prints, that file copies in `docs/` match the files, and that
+  `examples/*.bastio` build and run.
 
 ## [0.1.0] - not yet tagged
 

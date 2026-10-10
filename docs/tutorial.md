@@ -2,11 +2,11 @@
 
 This tutorial walks through Bastio by writing small programs and reading what the compiler says about them. It assumes you know C or a language like it. It does not assume you know anything about proofs or SMT solvers: the compiler does the proving, and you mostly tell it what you mean.
 
-The full rules are in the [language reference](language.md). Every program in a `bastio` block below is compiled by `tests/run.sh`, so they are known to behave as described. The first line of each says what the compiler does with it: `// expect-exit: N` means it compiles, runs and exits with `N`; `// expect-error: CODE` means it is rejected with that error.
+The full rules are in the [language reference](language.md). Every program in a `bastio` block below is compiled by `tests/run.sh`, so they are known to behave as described. The first line of each says what the compiler does with it: `// expect-exit: N` means it compiles, runs and exits with `N`; `// expect-error: CODE` means it is rejected with that error. The error messages shown after them are checked too: they are what the compiler prints, except that the values in a counterexample can differ between Z3 versions.
 
 ## 1. Building the compiler
 
-You need Rust, Z3 and a C compiler. On Ubuntu: `sudo apt-get install z3 build-essential`, plus [rustup](https://rustup.rs). Then:
+You need [rustup](https://rustup.rs), Z3 and a C compiler. On Ubuntu or Debian: `sudo apt-get install z3 build-essential`. CI uses the Z3 in Ubuntu 24.04 (4.8.12); 5.1 works too. Then:
 
 ```text
 $ git clone https://github.com/yukikotani231/bastiolang && cd bastiolang
@@ -14,11 +14,19 @@ $ (cd stage0 && cargo build --release)
 $ export PATH=$PWD/stage0/target/release:$PATH
 ```
 
-The compiler is `bastioc0`. It checks a program, proves it safe with Z3, turns it into C and calls `cc` on that C:
+The first `cargo` run installs the Rust release the repository pins (`rust-toolchain.toml`). The compiler is `bastioc0`. It checks a program, proves it safe with Z3, turns it into C and calls `cc` on that C:
 
 ```text
 $ bastioc0 -o hello examples/hello.bastio && ./hello
+bastioc0: examples/hello.bastio: 12 proof obligation(s) discharged
+1
+4
+9
+16
+25
 ```
+
+The first line says how many facts the compiler proved: here, that each `set` and `get` is in bounds and that `(i + 1) * (i + 1)` and the counters do not overflow. To check the whole setup, run `tests/run.sh`. It compiles every test and every program in this tutorial.
 
 ## 2. A first proof
 
@@ -437,32 +445,157 @@ For an `E-VERIFY-` error, the counterexample is a state the compiler believes th
 - **No, an earlier function guarantees it.** Then that function needs an `ensures` saying so. Values from a call are known only through the callee's `ensures`, as in section 5.
 - **No, the loop can't get there.** Then the loop needs an invariant, as in section 4. Inside and after a loop, variables the loop changes are known only through its invariants. A counterexample with absurd values (a counter near 2^64 after a short loop) usually means a missing invariant.
 
+Some errors have a hint instead of a counterexample. The one to know is `the solver gave up (its work limit, or quantifiers)`: Z3 could neither prove the fact nor find a counterexample within its fixed budget of work. That is not a timeout, and running the compiler again will not change the answer. It usually means the fact needs a step Z3 does not find on its own, often one involving `forall`. Help it with an `assert` of an intermediate fact, or a stronger invariant.
+
 `bastioc0 --dump-smt` prints the questions the compiler sends to Z3, if you want to see exactly what it was asked.
 
 ## 8. Calling Bastio from C
 
-Bastio compiles to C, so a proved Bastio function can replace one piece of a C program: a parser or decoder that reads untrusted input, say. [`examples/base64`](../examples/base64) does that with a strict base64 codec. Its decoder is proved free of out-of-bounds accesses, overflows and leaks for every input, and C programs call it through an ordinary header:
+Bastio compiles to C, so a proved Bastio function can replace one piece of a C program, such as a parser or decoder that reads untrusted input. This section builds the smallest such library, [`examples/lines`](../examples/lines). It is a line counter whose C side reads standard input and asks Bastio about it.
 
-```c
-#include "base64.h"
+A function marked `export` is also a C function. Here is a first try at one that measures the line starting at a given offset:
 
-uint8_t *out; size_t n, bad;
-if (base64_decode(src, len, &out, &n, &bad) == 0) {
-    use(out, n);
-    base64_free(out);
-} else {
-    report(bad);   /* offset of the first invalid byte */
+```bastio
+// expect-error: E-EXPORT
+enum Line { Len(u64), OutOfRange }
+
+export fn line_len(b: &Bytes, start: u64) -> Line
+  requires start <= blen(b)
+{
+  let mut i = start;
+  while i < blen(b)
+    invariant start <= i && i <= blen(b)
+  {
+    if bget(b, i) == 10 {
+      return Line::Len(i - start);
+    }
+    i = i + 1;
+  }
+  return Line::Len(i - start);
 }
 ```
 
-How the pieces fit:
+```text
+$ bastioc0 lines.bastio
+lines.bastio:4:18: error[E-EXPORT]: `line_len` is exported, so it cannot have a precondition
+  |   requires start <= blen(b)
+  |                  ^
+  = a C caller cannot be proved to meet it; check the condition in the function and return an error instead
+```
 
-1. `base64.bastio` is the codec. Its contract says what the C side may rely on, for example that an encoding of `n` bytes is `(n + 2) / 3 * 4` bytes long.
-2. `bastioc0 --emit-c` turns it into C, with no runtime checks.
-3. `base64_capi.c` is a small hand-written file that includes that C and exposes the functions in `base64.h`. It is trusted, not proved, so it is kept to conversions. It also checks the one precondition the codec has: a C caller cannot be proved to meet a `requires`, so at the boundary a precondition becomes a runtime check in the wrapper.
-4. `run.sh` builds it all, and the C test harness compares the decoder with an independent C implementation on random input.
+Inside Bastio, a `requires` is checked at every call. A C caller is not checked, so the compiler will not take its word for it. The function has to check `start` itself, and the check becomes ordinary code that is proved like the rest. Here is the whole library:
 
-Run it with `examples/base64/run.sh`, and see its [README](../examples/base64/README.md) for what is proved, what is only tested, and how fast it is. (The decoder keeps up with a table-driven C decoder, since the proofs leave nothing behind in the code.) An `export fn` that generates the wrapper and the header is planned; see the ROADMAP.
+<!-- file: examples/lines/lines.bastio -->
+```bastio
+// expect-ok
+enum Line { Len(u64), OutOfRange }
+
+/// How many times `c` occurs in `b`.
+export fn count_byte(b: &Bytes, c: u8) -> u64
+  ensures result <= blen(b)
+{
+  let mut n = 0;
+  let mut i = 0;
+  while i < blen(b)
+    invariant i <= blen(b) && n <= i
+  {
+    if bget(b, i) == c {
+      n = n + 1;
+    }
+    i = i + 1;
+  }
+  return n;
+}
+
+/// The length of the line that starts at offset `start` of `b`, not
+/// counting its '\n'. The last line need not end in one.
+export fn line_len(b: &Bytes, start: u64) -> Line
+  ensures result is Line::Len ==> start + result.Len <= blen(b)
+{
+  if start > blen(b) {
+    return Line::OutOfRange;
+  }
+  let mut i = start;
+  while i < blen(b)
+    invariant start <= i && i <= blen(b)
+  {
+    if bget(b, i) == 10 {
+      return Line::Len(i - start);
+    }
+    i = i + 1;
+  }
+  return Line::Len(i - start);
+}
+```
+
+`&Bytes` is a read-only byte buffer; at the C boundary it becomes a pointer and a length. Build the library into C with a header:
+
+```text
+$ bastioc0 --emit-c --header lines.h -o lines.c lines.bastio
+bastioc0: lines.bastio: 15 proof obligation(s) discharged
+```
+
+The header declares the two functions and copies each `ensures` into a comment above it. Those promises are proved, so C code may rely on them:
+
+```c
+typedef struct bst_e_Line bst_e_Line;
+struct bst_e_Line { uint64_t tag; union { uint64_t Len; } u; };
+enum { bst_e_Line_Len = 0, bst_e_Line_OutOfRange = 1 };
+
+/* ensures result <= blen(b) */
+uint64_t count_byte(const uint8_t *b, size_t b_len, uint8_t c);
+
+/* ensures (result is Line::Len) ==> ((start + result.Len) <= blen(b)) */
+bst_e_Line line_len(const uint8_t *b, size_t b_len, uint64_t start);
+```
+
+The C program is ordinary C:
+
+<!-- file: examples/lines/main.c -->
+```c
+/* Reads standard input and prints how many lines it has and how long the
+ * longest one is, using the two proved functions in lines.bastio. */
+#include <stdio.h>
+#include <stdlib.h>
+#include "lines.h"
+
+int main(void) {
+    size_t cap = 1 << 16, len = 0, got;
+    uint8_t *buf = malloc(cap);
+    if (!buf) return 1;
+    while ((got = fread(buf + len, 1, cap - len, stdin)) > 0) {
+        len += got;
+        if (len == cap) {
+            uint8_t *bigger = realloc(buf, cap *= 2);
+            if (!bigger) { free(buf); return 1; }
+            buf = bigger;
+        }
+    }
+
+    uint64_t lines = count_byte(buf, len, '\n');
+    uint64_t longest = 0, start = 0;
+    while (start < len) {
+        bst_e_Line l = line_len(buf, len, start);
+        if (l.tag != bst_e_Line_Len) break;   /* cannot happen: start <= len */
+        if (l.u.Len > longest) longest = l.u.Len;
+        start += l.u.Len + 1;                 /* the header promises start + Len <= len */
+    }
+    printf("lines: %llu, longest: %llu bytes\n",
+           (unsigned long long)lines, (unsigned long long)longest);
+    free(buf);
+    return 0;
+}
+```
+
+```text
+$ cc -c -w lines.c && cc -o lines main.c lines.o
+$ printf 'one\ntwo\nthree\n' | ./lines
+lines: 3, longest: 5 bytes
+```
+
+The header's opening comment lists what the proofs assume about the C caller and cannot check, for example that the pointer is readable for the length passed with it. Nothing else is trusted: the generated C has no runtime checks, and the wrapper that turns a pointer and a length into a Bastio buffer is generated too. The rules for what may cross the boundary are in the reference, under [Calling Bastio from C](language.md#calling-bastio-from-c).
+
+`examples/lines/run.sh` builds this example under AddressSanitizer and UBSan and checks its output, and CI runs it. The library and the C program shown above are checked to be the same as the files in the repository. Larger libraries for untrusted input, each with a differential fuzz against a C implementation and a benchmark, are [base64](../examples/base64), [UTF-8](../examples/utf8) and [DER](../examples/der).
 
 ## Where to go next
 

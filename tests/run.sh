@@ -150,5 +150,24 @@ for f in "$tmp"/doc/*.bastio; do
       echo "FAIL $at: a \`\`\`bastio block must start with // expect-exit:, // expect-error: or // expect-ok"; fail=$((fail+1)) ;;
   esac
 done
+# Error transcripts in the docs match what the compiler prints, and blocks
+# marked `<!-- file: PATH -->` match that file (tests/doc_check.py).
+python3 tests/doc_check.py "$BASTIOC" docs/*.md >"$tmp/doccheck.out"
+dc=$(sed -n 's/^doc_check: \([0-9]*\) passed, \([0-9]*\) failed$/\1 \2/p' "$tmp/doccheck.out")
+if [ -n "$dc" ]; then
+  grep -v '^doc_check: ' "$tmp/doccheck.out"
+  pass=$((pass + ${dc% *})); fail=$((fail + ${dc#* }))
+else
+  echo "FAIL tests/doc_check.py did not finish"; sed 's/^/    /' "$tmp/doccheck.out"; fail=$((fail+1))
+fi
+# Single-file examples (examples/*.bastio) build and run, exiting with 0.
+for f in examples/*.bastio; do
+  name=$(basename "$f" .bastio)
+  if ! "$BASTIOC" -o "$tmp/ex_$name" "$f" 2>"$tmp/ex.err"; then
+    echo "FAIL $f: rejected"; sed 's/^/    /' "$tmp/ex.err"; fail=$((fail+1)); continue
+  fi
+  if "$tmp/ex_$name" </dev/null >/dev/null; then pass=$((pass+1)); else
+    echo "FAIL $f: exit $?, want 0"; fail=$((fail+1)); fi
+done
 echo "-- $pass passed, $fail failed"
 [ "$fail" = 0 ]
