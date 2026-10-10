@@ -524,6 +524,50 @@ fn main() -> u64 {
 - Deadlock through locks is ruled out at compile time, with nothing written down (`E-LOCK-ORDER`). A lock's *class* is the type of its contents. The checker finds, over the whole call graph, which classes each function may take (`smp_run` counts as a call of its function). While `locked(l, f)` holds a lock of class C, `f` and everything it calls may take only locks of other classes, and the classes must form no cycle: if a `B` lock is ever taken while an `A` lock is held, an `A` lock is never taken while a `B` lock is held. Every processor then takes locks in one global order, so none can wait for another forever, and none spins on a lock it already holds. Two locks with the same contents type cannot be nested; give them different contents types (two structs) to order them. Nothing is generated for this.
 - Generated code: a lock is a pointer to a lock word followed by the contents; `locked` spins with an atomic exchange (acquire) and releases with a store (release). Invariants generate nothing.
 
+### Atomics
+
+An `Atomic[T]` holds one word that any number of processors read and write at once through a shared borrow `&Atomic[T]`, with no lock. `T` is an integer type, `bool`, or a struct with a single field of one of those, which is how an atomic value gets an invariant (`E-TYPE` otherwise).
+
+```bastio
+// expect-exit: 4
+struct Pending { n: u64 } invariant n <= 1024;
+
+fn reserve(a: &Atomic[Pending]) -> bool {
+  let x = atomic_load(a);                      // x.n <= 1024 is known
+  if x.n < 1024 {
+    return atomic_cas(a, x, Pending { n: x.n + 1 });   // proves x.n + 1 <= 1024
+  }
+  return false;
+}
+
+fn main() -> u64 {
+  let a = atomic_new(Pending { n: 1020 });
+  let mut i = 0;
+  while i < 6 invariant i <= 6 {
+    let ok = reserve(a);
+    i = i + 1;
+  }
+  let p = atomic_end(a);
+  return p.n % 1000 / 5;
+}
+```
+
+| Builtin | Effect |
+| --- | --- |
+| `atomic_new(v: T) -> Atomic[T]` | A new atomic holding `v`; proves the invariants of `v` |
+| `atomic_end(a: Atomic[T]) -> T` | Consumes the atomic and returns its value |
+| `atomic_load(a: &Atomic[T]) -> T` | Reads the value |
+| `atomic_store(a: &Atomic[T], v: T)` | Writes `v`; proves its invariants |
+| `atomic_swap(a: &Atomic[T], v: T) -> T` | Writes `v` and returns the value it replaced; proves the invariants of `v` |
+| `atomic_cas(a: &Atomic[T], expected: T, v: T) -> bool` | Writes `v` if the value is `expected` (compared bit for bit), and says whether it did; proves the invariants of `v` |
+| `atomic_wrap_add(a: &Atomic[T], d: T) -> T` | Integer `T` only: adds `d`, wrapping around (as `wrap_add`), and returns the value before |
+
+- Another processor may change the value at any moment, so a value read (`atomic_load`, `atomic_swap`, `atomic_wrap_add`, `atomic_end`) is fresh: only the invariants are known of it. Every value written must satisfy them (`E-VERIFY-LOCKINV`).
+- There is no checked `atomic_add`: since the current value is unknown, it would have to be proved not to overflow for every value the invariants allow. Use `atomic_wrap_add` when wrapping is wanted, or a compare-and-swap loop like `reserve` above.
+- Every access is sequentially consistent, so a program behaves as if the processors' steps were interleaved one at a time. Weaker orderings are not available (see [concurrency.md](concurrency.md)).
+- An atomic is linear: it must be consumed by `atomic_end` (`E-LINEAR-LEAK`). It cannot hand over ownership: it never holds a linear value.
+- Generated code: an atomic is a pointer to the word on the heap; the operations are the C compiler's `__atomic` builtins with `__ATOMIC_SEQ_CST`. Invariants generate nothing.
+
 ## Enums and `match`
 
 ```bastio
@@ -1171,7 +1215,7 @@ Proofs:
 | `E-VERIFY-REQUIRES` | The callee's `requires` |
 | `E-VERIFY-ENSURES` | The function's own postcondition |
 | `E-VERIFY-INVARIANT` | A loop invariant holds on entry and is preserved by one iteration |
-| `E-VERIFY-LOCKINV` | A struct invariant holds of a value put in a lock, and again at the end of every `locked` call |
+| `E-VERIFY-LOCKINV` | A struct invariant holds of a value put in a lock, and again at the end of every `locked` call; of every value written to an atomic |
 | `E-VERIFY-ASSERT` | An `assert` |
 | `E-VERIFY-UNREACHABLE` | An `unreachable;` the code can reach |
 

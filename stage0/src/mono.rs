@@ -171,6 +171,7 @@ impl Mono {
             Type::Box(i) => Type::Box(Box::new(self.ty(i, s, pos)?)),
             Type::Vec(i) => Type::Vec(Box::new(self.ty(i, s, pos)?)),
             Type::Lock(i) => Type::Lock(Box::new(self.ty(i, s, pos)?)),
+            Type::Atomic(i) => Type::Atomic(Box::new(self.ty(i, s, pos)?)),
             Type::Ref(i) => Type::Ref(Box::new(self.ty(i, s, pos)?)),
             Type::MutRef(i) => Type::MutRef(Box::new(self.ty(i, s, pos)?)),
             t => t.clone(),
