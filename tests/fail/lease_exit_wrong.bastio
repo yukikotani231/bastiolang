@@ -1,0 +1,20 @@
+// expect-error: E-VERIFY-LEASE
+// target: kernel
+// `mmu_exit` lowers a table's count only when the lease is one for that
+// table. Here it is not, so `a` stays counted and cannot be freed. (Given
+// back with its own table, the proof sees the count drop: the
+// `pt_free_root(mmu, b)` line verifies.)
+fn main(pool: &mut Pool, mmu: &mut Mmu) {
+  if pool_size(pool) > 1 {
+    let mut a = pt_new(pool_take(&mut pool, 0), 4);
+    let mut b = pt_new(pool_take(&mut pool, 1), 4);
+    let lb = mmu_enter(&mut mmu, &mut b);
+    let x = mmu_exit(&mut mmu, &mut b, lb);
+    pool_give(&mut pool, pt_free_root(mmu, b));
+    let la = mmu_enter(&mut mmu, &mut a);
+    let mut c = pt_new(pool_take(&mut pool, 1), 4);
+    let y = mmu_exit(&mut mmu, &mut c, la);
+    pool_give(&mut pool, pt_free_root(mmu, c));
+    pool_give(&mut pool, pt_free_root(mmu, a));
+  }
+}

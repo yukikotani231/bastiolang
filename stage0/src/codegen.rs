@@ -302,6 +302,7 @@ typedef struct { uint64_t base, count; } bst_portio;
 typedef int bst_mmiospace;                  /* capability token: no data */
 typedef struct { uint64_t base, len; } bst_mmio;
 typedef uint64_t bst_dma;                   /* a lent page's physical address */
+typedef uint64_t bst_lease;                 /* the address of the table it holds */
 /* Lock[T]: a lock word followed by the T. A spin lock; acquire and release
  * order the accesses to the contents between processors. */
 static inline void bst_lock_acquire(uint64_t *w) {
@@ -461,10 +462,17 @@ static inline bst_pt bst_pt_new(bst_frame f, uint64_t level) {
 }
 static inline bst_frame bst_pt_free(bst_pt t) { return t; }
 static inline bool bst_pt_has(bst_pt t, uint64_t i) { return (((uint64_t *)t)[i] & BST_PTE_P) != 0; }
-static inline void bst_pt_put(bst_pt *t, uint64_t i, bst_pt c) { ((uint64_t *)*t)[i] = c | BST_PTE_P | BST_PTE_W | BST_PTE_U; }
-static inline void bst_pt_put_frame(bst_pt *t, uint64_t i, bst_frame f, bool w) {
-    ((uint64_t *)*t)[i] = f | BST_PTE_P | BST_PTE_U | (w ? BST_PTE_W : 0);
+/* Another processor may be walking the table (it holds a lease on the
+ * tree), so an entry is written with one 64-bit store, present bit
+ * included, after everything it points to (release order). */
+static inline void bst_pt_put(bst_pt *t, uint64_t i, bst_pt c) {
+    __atomic_store_n(&((uint64_t *)*t)[i], c | BST_PTE_P | BST_PTE_W | BST_PTE_U, __ATOMIC_RELEASE);
 }
+static inline void bst_pt_put_frame(bst_pt *t, uint64_t i, bst_frame f, bool w) {
+    __atomic_store_n(&((uint64_t *)*t)[i], f | BST_PTE_P | BST_PTE_U | (w ? BST_PTE_W : 0), __ATOMIC_RELEASE);
+}
+/* What slot i points to, left in place (pt_borrow). */
+static inline uint64_t bst_pt_child(bst_pt t, uint64_t i) { return ((uint64_t *)t)[i] & BST_PTE_ADDR; }
 static inline uint64_t bst_pt_take(bst_pt *t, uint64_t i) {
     uint64_t *e = &((uint64_t *)*t)[i];
     uint64_t a = *e & BST_PTE_ADDR;
@@ -841,6 +849,8 @@ const PRELUDE_KERNEL_CPU: &str = r#"
 static inline void bst_load_cr3(uint64_t a) { __asm__ volatile ("mov %0, %%cr3" : : "r"(a) : "memory"); }
 static inline void bst_mmu_switch(bst_mmu *m, bst_pt root) { (void)m; bst_load_cr3(root); }
 static inline void bst_mmu_kernel(bst_mmu *m) { (void)m; bst_load_cr3((uint64_t)bst_kernel_pml4); }
+static inline bst_lease bst_mmu_enter(bst_mmu *m, bst_pt *t) { (void)m; bst_load_cr3(*t); return *t; }
+static inline bool bst_mmu_exit(bst_mmu *m, bst_pt *t, bst_lease l) { (void)m; bst_load_cr3((uint64_t)bst_kernel_pml4); return l == *t; }
 static inline bst_frame bst_pt_free_root(bst_mmu m, bst_pt t) { (void)m; return t; }
 
 /* Saved user registers: rax rbx rcx rdx rsi rdi rbp r8-r15 (0-14), rip (15),
@@ -1022,6 +1032,7 @@ fn cty(t: &Type) -> String {
         Type::MmioSpace => "bst_mmiospace".into(),
         Type::Mmio => "bst_mmio".into(),
         Type::Dma => "bst_dma".into(),
+        Type::Lease => "bst_lease".into(),
         Type::Struct(n) => format!("bst_s_{}", cid(n)),
         Type::Enum(n) => format!("bst_e_{}", cid(n)),
         Type::Generic(..) => unreachable!("removed by monomorphization"),
@@ -1229,6 +1240,10 @@ impl<'a> Gen<'a> {
                 _ => unreachable!("checked"),
             },
             ExprKind::Call(n, _) if n == "smp_run" => Type::Unit,
+            ExprKind::Call(n, args) if n == "pt_borrow" || n == "pt_borrow_frame" => match &args[2].kind {
+                ExprKind::Var(f) => self.sigs[f].ret.clone(),
+                _ => unreachable!("checked"),
+            },
             ExprKind::Call(n, _) => self.sigs[n].ret.clone(),
             ExprKind::MutBorrow(_) | ExprKind::Forall(..) => unreachable!("not a value"),
         }
@@ -1487,6 +1502,27 @@ impl<'a> Gen<'a> {
                 } else {
                     format!("({{ {pre} bst_lock_acquire(lk_{k}); {} lr_{k} = {call}; bst_lock_release(lk_{k}); lr_{k}; }})", cty(&sig.ret))
                 }
+            }
+            ExprKind::Call(name, args) if name == "pt_borrow" || name == "pt_borrow_frame" => {
+                let ExprKind::Var(f) = &args[2].kind else { unreachable!("checked") };
+                let sig = self.sigs[f].clone();
+                let k = self.tmps;
+                self.tmps += 1;
+                // The child is read from the entry into a local, which `f`
+                // may change only in its contents (proved), so nothing is
+                // written back.
+                let mut pre = format!("bst_pt *pt_{k} = {}; uint64_t pi_{k} = {};", self.expr(&args[0]), self.expr(&args[1]));
+                let mut call = vec![format!("&pc_{k}")];
+                for (j, (pt, a)) in sig.params[1..].iter().zip(&args[3..]).enumerate() {
+                    let ct = match pt {
+                        Type::MutRef(t) => format!("{} *", cty(t)),
+                        t => cty(t),
+                    };
+                    pre.push_str(&format!(" {ct} pa_{k}_{j} = {};", self.expr(a)));
+                    call.push(format!("pa_{k}_{j}"));
+                }
+                pre.push_str(&format!(" uint64_t pc_{k} = bst_pt_child(*pt_{k}, pi_{k});"));
+                format!("({{ {pre} f_{}({}); }})", cid(f), call.join(", "))
             }
             ExprKind::Call(name, args) if name == "smp_run" => {
                 let ExprKind::Var(f) = &args[0].kind else { unreachable!("checked") };

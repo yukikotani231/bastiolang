@@ -101,6 +101,8 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("pt_put_frame", Avail::Mem, vec![m(PageTable), U64, Frame, Bool], Unit),
         ("pt_take_frame", Avail::Mem, vec![m(PageTable), U64], Frame),
         ("mmu_switch", Avail::Kernel, vec![m(Mmu), r(PageTable)], Unit),
+        ("mmu_enter", Avail::Kernel, vec![m(Mmu), m(PageTable)], Lease),
+        ("mmu_exit", Avail::Kernel, vec![m(Mmu), m(PageTable), Lease], Bool),
         ("mmu_kernel", Avail::Kernel, vec![m(Mmu)], Unit),
         ("cpu_run", Avail::Kernel, vec![m(Cpu), r(Mmu)], U64),
         ("cpu_idle", Avail::Kernel, vec![m(Cpu)], U64),
@@ -164,6 +166,7 @@ pub const GHOSTS: &[(&str, Type, bool, Type)] = &[
     ("pt_id", Type::PageTable, false, Type::U64),
     ("pt_level", Type::PageTable, false, Type::U64),
     ("pt_used", Type::PageTable, true, Type::Bool),
+    ("pt_leases", Type::PageTable, false, Type::U64),
     ("pool_has", Type::Pool, true, Type::Bool),
     ("pool_size", Type::Pool, false, Type::U64),
     ("mmu_root", Type::Mmu, false, Type::U64),
@@ -218,6 +221,7 @@ pub fn builtin_list() -> Vec<(String, &'static str)> {
     v.extend(LOCK_BUILTINS.iter().map(|n| (n.to_string(), "all")));
     v.extend(ATOMIC_BUILTINS.iter().map(|n| (n.to_string(), "all")));
     v.push(("smp_run".into(), "kernel"));
+    v.extend(PT_BORROW_BUILTINS.iter().map(|n| (n.to_string(), "hosted, kernel")));
     v.extend(VEC_BUILTINS.iter().map(|n| (n.to_string(), "all")));
     for (n, a, _, _) in builtin_table() {
         let a = match a {
@@ -235,6 +239,10 @@ pub fn builtin_list() -> Vec<(String, &'static str)> {
 /// Builtins over `Lock[T]`: generic, so checked by hand like `box`.
 pub const LOCK_BUILTINS: &[&str] = &["lock_new", "lock_end", "locked"];
 
+/// Builtins that lend a page table's child (a table, or a page at level 1)
+/// in place to a function they name, like `locked`.
+pub const PT_BORROW_BUILTINS: &[&str] = &["pt_borrow", "pt_borrow_frame"];
+
 /// Builtins over `Atomic[T]`: generic too.
 pub const ATOMIC_BUILTINS: &[&str] = &["atomic_new", "atomic_end", "atomic_load", "atomic_store", "atomic_swap", "atomic_cas", "atomic_wrap_add"];
 
@@ -251,7 +259,7 @@ pub fn atomic_word(t: &Type) -> bool {
 }
 
 pub fn is_builtin(name: &str) -> bool {
-    name == "box" || name == "unbox" || name == "cast" || name == "wrap" || name == "smp_run" || LOCK_BUILTINS.contains(&name) || ATOMIC_BUILTINS.contains(&name) || VEC_BUILTINS.contains(&name) || WRAP_BUILTINS.contains(&name) || builtin_table().iter().any(|b| b.0 == name)
+    name == "box" || name == "unbox" || name == "cast" || name == "wrap" || name == "smp_run" || PT_BORROW_BUILTINS.contains(&name) || LOCK_BUILTINS.contains(&name) || ATOMIC_BUILTINS.contains(&name) || VEC_BUILTINS.contains(&name) || WRAP_BUILTINS.contains(&name) || builtin_table().iter().any(|b| b.0 == name)
 }
 
 fn available(name: &str, target: Target) -> bool {
@@ -278,7 +286,7 @@ fn main_caps(target: Target) -> &'static [Type] {
 /// Struct and enum definitions: unique names, known field and payload
 /// types, no type that contains itself.
 pub fn check_structs(p: &Program) -> Result<(), Diag> {
-    const RESERVED: &[&str] = &["u64", "u8", "u16", "u32", "i8", "i16", "i32", "i64", "bool", "Str", "Buf", "Bytes", "Host", "Child", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu", "Ports", "PortIo", "MmioSpace", "Mmio", "Dma", "Lock", "Atomic"];
+    const RESERVED: &[&str] = &["u64", "u8", "u16", "u32", "i8", "i16", "i32", "i64", "bool", "Str", "Buf", "Bytes", "Host", "Child", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu", "Ports", "PortIo", "MmioSpace", "Mmio", "Dma", "Lease", "Lock", "Atomic"];
     // (name, position, the types it holds directly)
     let mut defs: Vec<(String, Pos, Vec<Type>)> = Vec::new();
     for d in &p.structs {
@@ -1361,6 +1369,9 @@ impl<'a> Ctx<'a> {
                 if name == "smp_run" {
                     return self.smp_run(args, e.pos);
                 }
+                if PT_BORROW_BUILTINS.contains(&name.as_str()) {
+                    return self.pt_borrow(name, args, e.pos);
+                }
                 let sig = self.sigs.get(name).cloned().ok_or_else(|| Diag::new("E-TYPE", e.pos, format!("unknown function `{}`", name)))?;
                 if !available(name, self.target) {
                     return Err(Diag::new("E-TARGET", e.pos, format!("`{}` is not available on this target", name)));
@@ -1454,6 +1465,26 @@ impl<'a> Ctx<'a> {
             }
         };
         self.call_with(name, Sig { params, ret }, args, pos)
+    }
+
+    /// `pt_borrow(&mut t, i, f, args..)`: calls `f(&mut child, args..)` with
+    /// the table in slot `i` of `t` left in place (`pt_borrow_frame`: the
+    /// page in slot `i` of a level-1 table), so processors running on the
+    /// tree keep seeing it. The verifier checks that `f` hands it back.
+    fn pt_borrow(&mut self, name: &str, args: &[Expr], pos: Pos) -> Result<Type, Diag> {
+        if matches!(self.target, Target::User) {
+            return Err(Diag::new("E-TARGET", pos, format!("`{}` is not available on this target", name)));
+        }
+        let (f, sig) = self.named_fn(name, args.get(2), pos)?;
+        let child = if name == "pt_borrow" { Type::PageTable } else { Type::Frame };
+        if sig.params.first() != Some(&m(child.clone())) {
+            return Err(Diag::new("E-TYPE", args[2].pos, format!("`{}` must take `&mut {}` first, to receive what `{}` lends", f, child.name(), name)));
+        }
+        let mut params = vec![m(Type::PageTable), Type::U64];
+        params.extend(sig.params[1..].iter().cloned());
+        let mut rest = vec![args[0].clone(), args[1].clone()];
+        rest.extend(args[3..].iter().cloned());
+        self.call_with(&f, Sig { params, ret: sig.ret }, &rest, pos)
     }
 
     /// `smp_run(f, args..)`: runs `f` on every processor at once and returns

@@ -1123,6 +1123,10 @@ impl<'a> Gen<'a> {
                 "vec_push" | "vec_set" | "vec_free" => Type::Unit,
                 _ => self.vec_elem(&args[0]),
             },
+            ExprKind::Call(n, args) if crate::check::PT_BORROW_BUILTINS.contains(&n.as_str()) => match &args[2].kind {
+                ExprKind::Var(f) => self.sigs[f].ret.clone(),
+                _ => unreachable!("checked"),
+            },
             ExprKind::Call(n, _) => self.sigs[n].ret.clone(),
             ExprKind::MutBorrow(p) => Type::MutRef(Box::new(self.place_type(p))),
             ExprKind::Forall(..) => unreachable!("not a value"),
