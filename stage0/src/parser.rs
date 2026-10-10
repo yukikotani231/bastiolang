@@ -117,6 +117,7 @@ impl Parser {
     fn enum_def(&mut self) -> PResult<EnumDef> {
         let pos = self.expect(Tok::Enum, "`enum`")?.pos;
         let (name, _) = self.ident()?;
+        let tparams = self.tparams()?;
         self.expect(Tok::LBrace, "`{`")?;
         let mut variants: Vec<(String, Option<Type>)> = Vec::new();
         while *self.peek() != Tok::RBrace {
@@ -143,7 +144,93 @@ impl Parser {
         if variants.is_empty() {
             return Err(Diag::new("E-PARSE", pos, format!("enum `{}` has no variants", name)));
         }
-        Ok(EnumDef { name, variants, pos })
+        Ok(EnumDef { name, tparams, variants, pos })
+    }
+
+    /// `[T, U]` after a definition's name: its type parameters.
+    fn tparams(&mut self) -> PResult<Vec<String>> {
+        let mut ps: Vec<String> = Vec::new();
+        if self.eat(&Tok::LBracket) {
+            loop {
+                let (n, npos) = self.ident()?;
+                if ps.contains(&n) {
+                    return Err(Diag::new("E-PARSE", npos, format!("type parameter `{}` is declared twice", n)));
+                }
+                ps.push(n);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(Tok::RBracket, "`]`")?;
+        }
+        Ok(ps)
+    }
+
+    /// `[T, U]` after a name in a type or an expression: type arguments.
+    fn targs(&mut self) -> PResult<Vec<Type>> {
+        self.expect(Tok::LBracket, "`[`")?;
+        let mut ts = Vec::new();
+        loop {
+            let pos = self.pos();
+            let t = self.ty()?;
+            if t.is_ref() {
+                return Err(Diag::new("E-PARSE", pos, "a type argument cannot be a borrow"));
+            }
+            ts.push(t);
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::RBracket, "`]`")?;
+        Ok(ts)
+    }
+
+    fn call_args(&mut self) -> PResult<Vec<Expr>> {
+        self.expect(Tok::LParen, "`(`")?;
+        let mut args = Vec::new();
+        if *self.peek() != Tok::RParen {
+            loop {
+                args.push(self.expr()?);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(Tok::RParen, "`)`")?;
+        Ok(args)
+    }
+
+    /// The `{ field: value, .. }` of a struct literal.
+    fn struct_lit_fields(&mut self) -> PResult<Vec<(String, Expr)>> {
+        self.expect(Tok::LBrace, "`{`")?;
+        let mut fields: Vec<(String, Expr)> = Vec::new();
+        while *self.peek() != Tok::RBrace {
+            let (f, fpos) = self.ident()?;
+            self.expect(Tok::Colon, "`:`")?;
+            let v = self.expr()?;
+            if fields.iter().any(|(g, _)| *g == f) {
+                return Err(Diag::new("E-PARSE", fpos, format!("field `{}` is given twice", f)));
+            }
+            fields.push((f, v));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(Tok::RBrace, "`}`")?;
+        Ok(fields)
+    }
+
+    /// `::Variant` and its optional `(payload)`.
+    fn variant_rest(&mut self) -> PResult<(String, Option<Box<Expr>>)> {
+        let v = self.variant_name()?;
+        let payload = if self.eat(&Tok::LParen) {
+            let e = self.expr()?;
+            self.expect(Tok::RParen, "`)`")?;
+            Some(Box::new(e))
+        } else {
+            None
+        };
+        Ok((v, payload))
     }
 
     /// `Enum::Variant` after the enum's name.
@@ -155,6 +242,7 @@ impl Parser {
     fn struct_def(&mut self) -> PResult<StructDef> {
         let pos = self.expect(Tok::Struct, "`struct`")?.pos;
         let (name, _) = self.ident()?;
+        let tparams = self.tparams()?;
         self.expect(Tok::LBrace, "`{`")?;
         let mut fields = Vec::new();
         while *self.peek() != Tok::RBrace {
@@ -176,7 +264,7 @@ impl Parser {
         if fields.is_empty() {
             return Err(Diag::new("E-PARSE", pos, format!("struct `{}` has no fields", name)));
         }
-        Ok(StructDef { name, fields, pos })
+        Ok(StructDef { name, tparams, fields, pos })
     }
 
     /// A dotted place after its first identifier has been read.
@@ -224,10 +312,8 @@ impl Parser {
         if self.eat(&Tok::Amp) {
             let m = self.eat(&Tok::Mut);
             let inner = self.ty()?;
-            // Whether a struct is linear is known only once every struct is
-            // parsed; the checker tests borrows of structs.
-            if !inner.is_linear() && !matches!(inner, Type::Struct(_)) {
-                return Err(Diag::new("E-PARSE", pos, format!("only linear values can be borrowed, found `&{}`", inner.name())));
+            if inner.is_ref() {
+                return Err(Diag::new("E-PARSE", pos, "a borrow of a borrow is not allowed"));
             }
             return Ok(if m { Type::MutRef(Box::new(inner)) } else { Type::Ref(Box::new(inner)) });
         }
@@ -245,6 +331,7 @@ impl Parser {
             "Pool" => Ok(Type::Pool),
             "Mmu" => Ok(Type::Mmu),
             "Cpu" => Ok(Type::Cpu),
+            _ if *self.peek() == Tok::LBracket && n != "Box" => Ok(Type::Generic(n, self.targs()?)),
             "Box" => {
                 self.expect(Tok::LBracket, "`[` after `Box`")?;
                 let inner = self.ty()?;
@@ -281,6 +368,7 @@ impl Parser {
     fn fn_def(&mut self) -> PResult<FnDef> {
         let pos = self.expect(Tok::Fn, "`fn`")?.pos;
         let (name, _) = self.ident()?;
+        let tparams = self.tparams()?;
         let params = self.params()?;
         let ret = if self.eat(&Tok::Arrow) { self.ty()? } else { Type::Unit };
         let mut requires = Vec::new();
@@ -295,7 +383,7 @@ impl Parser {
             }
         }
         let body = self.block()?;
-        Ok(FnDef { name, params, ret, requires, ensures, body, pos })
+        Ok(FnDef { name, tparams, params, ret, requires, ensures, body, pos })
     }
 
     fn block(&mut self) -> PResult<Vec<Stmt>> {
@@ -361,6 +449,11 @@ impl Parser {
                         }
                         Tok::Ident(en) => {
                             self.bump();
+                            // Type arguments in a pattern are redundant (the
+                            // matched value's type has them) and are ignored.
+                            if *self.peek() == Tok::LBracket {
+                                self.targs()?;
+                            }
                             let v = self.variant_name()?;
                             if self.eat(&Tok::LParen) {
                                 let m = self.eat(&Tok::Mut);
@@ -589,35 +682,29 @@ impl Parser {
                 let bytes = std::fs::read(&full).map_err(|e| Diag::new("E-PARSE", pos, format!("include_bytes: cannot read {}: {}", full.display(), e)))?;
                 Ok(Expr { kind: ExprKind::Blob(bytes), pos })
             }
+            Tok::Ident(name) if self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::LBracket) => {
+                // `f[T](..)`, `S[T] { .. }` or `E[T]::V(..)`.
+                self.bump();
+                let targs = self.targs()?;
+                let inner = match self.peek() {
+                    Tok::ColonColon => {
+                        let (v, payload) = self.variant_rest()?;
+                        ExprKind::Variant(name, v, payload)
+                    }
+                    Tok::LBrace => ExprKind::StructLit(name, self.struct_lit_fields()?),
+                    Tok::LParen => ExprKind::Call(name, self.call_args()?),
+                    t => return Err(Diag::new("E-PARSE", self.pos(), format!("expected `(`, `{{` or `::` after type arguments, found {:?}", t))),
+                };
+                Ok(Expr { kind: ExprKind::TypeApp(targs, Box::new(Expr { kind: inner, pos })), pos })
+            }
             Tok::Ident(name) if self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::ColonColon) => {
                 self.bump();
-                let v = self.variant_name()?;
-                let payload = if self.eat(&Tok::LParen) {
-                    let e = self.expr()?;
-                    self.expect(Tok::RParen, "`)`")?;
-                    Some(Box::new(e))
-                } else {
-                    None
-                };
+                let (v, payload) = self.variant_rest()?;
                 Ok(Expr { kind: ExprKind::Variant(name, v, payload), pos })
             }
             Tok::Ident(name) if self.is_struct_lit() => {
                 self.bump();
-                self.bump();
-                let mut fields: Vec<(String, Expr)> = Vec::new();
-                while *self.peek() != Tok::RBrace {
-                    let (f, fpos) = self.ident()?;
-                    self.expect(Tok::Colon, "`:`")?;
-                    let v = self.expr()?;
-                    if fields.iter().any(|(g, _)| *g == f) {
-                        return Err(Diag::new("E-PARSE", fpos, format!("field `{}` is given twice", f)));
-                    }
-                    fields.push((f, v));
-                    if !self.eat(&Tok::Comma) {
-                        break;
-                    }
-                }
-                self.expect(Tok::RBrace, "`}`")?;
+                let fields = self.struct_lit_fields()?;
                 Ok(Expr { kind: ExprKind::StructLit(name, fields), pos })
             }
             Tok::Ident(name) if self.consts.contains_key(&name) && self.toks.get(self.i + 1).map(|t| &t.tok) != Some(&Tok::LParen) => {
@@ -626,18 +713,8 @@ impl Parser {
             }
             Tok::Ident(name) => {
                 self.bump();
-                if self.eat(&Tok::LParen) {
-                    let mut args = Vec::new();
-                    if *self.peek() != Tok::RParen {
-                        loop {
-                            args.push(self.expr()?);
-                            if !self.eat(&Tok::Comma) {
-                                break;
-                            }
-                        }
-                    }
-                    self.expect(Tok::RParen, "`)`")?;
-                    Ok(Expr { kind: ExprKind::Call(name, args), pos })
+                if *self.peek() == Tok::LParen {
+                    Ok(Expr { kind: ExprKind::Call(name, self.call_args()?), pos })
                 } else {
                     Ok(Expr { kind: ExprKind::Var(name), pos })
                 }

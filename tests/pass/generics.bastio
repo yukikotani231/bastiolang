@@ -1,0 +1,102 @@
+// expect-exit: 42
+// Generics by monomorphization: each generic struct, enum and function is
+// copied once per list of type arguments, and each copy is checked and
+// verified on its own. Type arguments are written at every use for now.
+
+enum Option[T] { Some(T), None }
+struct Pair[A, B] { a: A, b: B }
+enum List[T] { Cons(Box[Node[T]]), Nil }
+struct Node[T] { head: T, tail: List[T] }
+
+fn swap[A, B](p: Pair[A, B]) -> Pair[B, A] {
+  return Pair[B, A] { a: p.b, b: p.a };
+}
+
+// Matching a generic enum: patterns may leave out the type arguments.
+fn or_else[T](o: Option[T], d: T) -> T {
+  match o {
+    Option::Some(v) => { return v; },
+    Option::None => { return d; },
+  }
+}
+
+// Any value can be borrowed now, so generic code can take `&T` for any `T`.
+// A borrowed plain value reads as a copy. Like the specification, this body
+// only checks for a plain `A` (with `A = Buf` it would move out of a borrow).
+fn first_of[A, B](p: &Pair[A, B]) -> A
+  ensures result == p.a
+{
+  return p.a;
+}
+
+fn bump(x: &mut u64)
+  requires x < 100
+  ensures x == old(x) + 1
+{
+  x = x + 1;
+}
+
+fn checked_div(a: u64, b: u64) -> Option[u64]
+  ensures (b == 0) == (result is Option::None)
+  ensures result is Option::Some ==> result.Some <= a
+{
+  if b == 0 { return Option[u64]::None; }
+  return Option[u64]::Some(a / b);
+}
+
+fn cons[T](x: T, l: List[T]) -> List[T] {
+  return List[T]::Cons(box(Node[T] { head: x, tail: l }));
+}
+
+fn length[T](l: &List[T], fuel: u64) -> u64
+  ensures result <= fuel
+{
+  if fuel == 0 { return 0; }
+  match l {
+    List::Cons(n) => { return 1 + length[T](n.tail, fuel - 1); },
+    List::Nil => { return 0; },
+  }
+}
+
+// The same generic code with a linear element type: freeing is up to the caller.
+fn drop_bufs(l: List[Buf]) {
+  match l {
+    List::Cons(n) => {
+      let node = unbox(n);
+      free(node.head);
+      drop_bufs(node.tail);
+    },
+    List::Nil => {},
+  }
+}
+
+fn drop_nums(l: List[u64]) {
+  match l {
+    List::Cons(n) => { let node = unbox(n); drop_nums(node.tail); },
+    List::Nil => {},
+  }
+}
+
+fn main() -> u64 {
+  let p = swap[u64, bool](Pair[u64, bool] { a: 7, b: true });
+  let mut x = 0;
+  if p.a { x = p.b; }                                    // 7
+  let pp = Pair[u64, u64] { a: 4, b: 5 };
+  let mut w = first_of[u64, u64](pp);                    // 4
+  bump(&mut w);
+  assert w == 5;
+  x = x % 100 + w - 5;
+  let q = checked_div(30, 5);
+  let y = or_else[u64](q, 0);                            // 6
+  let z = or_else[u64](checked_div(1, 0), 9);            // 9
+  let nums = cons[u64](1, cons[u64](2, cons[u64](3, List[u64]::Nil)));
+  let n = length[u64](nums, 100);                        // 3
+  drop_nums(nums);
+  let bufs = cons[Buf](alloc(2), cons[Buf](alloc(3), List[Buf]::Nil));
+  let m = length[Buf](bufs, 100);                        // 2
+  drop_bufs(bufs);
+  let b = swap[u64, Buf](Pair[u64, Buf] { a: 15, b: alloc(1) });
+  free(b.a);
+  // 7 + 6 + 9 + 3 + 2 + 15 = 42
+  return x % 100 + y % 100 + z % 100 + n + m + b.b % 100;
+}

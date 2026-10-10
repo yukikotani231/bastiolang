@@ -42,6 +42,10 @@ pub enum Type {
     /// An owning pointer to a heap value. Always linear (it owns the
     /// allocation), and the only way a type may refer to itself.
     Box(Box<Type>),
+    /// `Name[T, ..]` as written: a generic struct or enum applied to type
+    /// arguments. Only exists before monomorphization, which replaces it with
+    /// the `Struct`/`Enum` instance named by `name()` (e.g. `Option[u64]`).
+    Generic(String, Vec<Type>),
     /// A read-only borrow of a linear value. Only allowed as a parameter type.
     Ref(Box<Type>),
     /// A mutable borrow of a linear value. Only allowed as a parameter type;
@@ -67,6 +71,7 @@ impl Type {
             Type::Cpu => "Cpu".into(),
             Type::Struct(n) | Type::Enum(n) => n.clone(),
             Type::Box(t) => format!("Box[{}]", t.name()),
+            Type::Generic(n, args) => format!("{}[{}]", n, args.iter().map(|a| a.name()).collect::<Vec<_>>().join(", ")),
             Type::Ref(t) => format!("&{}", t.name()),
             Type::MutRef(t) => format!("&mut {}", t.name()),
         }
@@ -159,6 +164,9 @@ pub enum ExprKind {
     Call(String, Vec<Expr>),
     /// `forall x: u64 :: body` (specifications only)
     Forall(String, Box<Expr>),
+    /// `name[T, ..]` applied to a call, struct literal or variant: removed by
+    /// monomorphization, which renames the inner expression to the instance.
+    TypeApp(Vec<Type>, Box<Expr>),
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +222,8 @@ pub struct Param {
 #[derive(Debug, Clone)]
 pub struct FnDef {
     pub name: String,
+    /// Type parameters (`fn f[T]`); empty after monomorphization.
+    pub tparams: Vec<String>,
     pub params: Vec<Param>,
     pub ret: Type,
     pub requires: Vec<Expr>,
@@ -237,6 +247,7 @@ pub struct SpecFn {
 #[derive(Debug, Clone)]
 pub struct StructDef {
     pub name: String,
+    pub tparams: Vec<String>,
     pub fields: Vec<(String, Type)>,
     pub pos: Pos,
 }
@@ -251,6 +262,7 @@ impl StructDef {
 #[derive(Debug, Clone)]
 pub struct EnumDef {
     pub name: String,
+    pub tparams: Vec<String>,
     pub variants: Vec<(String, Option<Type>)>,
     pub pos: Pos,
 }
@@ -299,6 +311,7 @@ pub fn resolve_enum_types(p: &mut Program) {
         match t {
             Type::Struct(n) if names.contains(n) => *t = Type::Enum(n.clone()),
             Type::Ref(i) | Type::MutRef(i) | Type::Box(i) => fix(i, names),
+            Type::Generic(_, args) => args.iter_mut().for_each(|a| fix(a, names)),
             _ => {}
         }
     }
@@ -379,6 +392,15 @@ pub fn render(e: &Expr) -> String {
             ExprKind::Is(x, en, v) => {
                 let s = format!("{} is {}::{}", go(x, false), en, v);
                 if top { s } else { format!("({})", s) }
+            }
+            ExprKind::TypeApp(ts, x) => {
+                // Shown as written: `f[T](..)`; the inner name is still generic.
+                let inner = go(x, top);
+                let n = match &x.kind {
+                    ExprKind::Call(n, _) | ExprKind::StructLit(n, _) | ExprKind::Variant(n, _, _) => n.len(),
+                    _ => 0,
+                };
+                format!("{}[{}]{}", &inner[..n], ts.iter().map(|t| t.name()).collect::<Vec<_>>().join(", "), &inner[n..])
             }
             ExprKind::Not(x) => format!("!{}", go(x, false)),
             ExprKind::Bin(op, a, b) => {
