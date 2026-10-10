@@ -402,6 +402,30 @@ fn or_all(ts: &[String]) -> String {
     }
 }
 
+/// An integer as an SMT-LIB term (negative numbers are written `(- n)`).
+fn num(v: i128) -> String {
+    if v < 0 { format!("(- {})", -v) } else { v.to_string() }
+}
+
+/// `x` reduced to the range of the integer type `t`, as a C conversion to
+/// `t` does: modulo 2^width, two's complement for a signed type.
+fn wrap_term(t: &Type, x: &str) -> String {
+    if t.is_signed() {
+        let h = t.int_modulus() / 2;
+        format!("(- (mod (+ {} {}) {}) {})", x, h, t.int_modulus(), h)
+    } else {
+        format!("(mod {} {})", x, t.int_modulus())
+    }
+}
+
+/// C's division on signed operands, which truncates toward zero (SMT-LIB's
+/// `div` rounds so that the remainder is never negative).
+fn c_div(a: &str, b: &str) -> String {
+    let abs = |x: &str| format!("(ite (>= {x} 0) {x} (- {x}))");
+    let q = format!("(div {} {})", abs(a), abs(b));
+    format!("(ite (= (>= {} 0) (>= {} 0)) {q} (- {q}))", a, b)
+}
+
 fn ite(c: &str, a: &str, b: &str) -> String {
     if a == b { a.to_string() } else { format!("(ite {} {} {})", c, a, b) }
 }
@@ -489,7 +513,7 @@ impl<'p> Verifier<'p> {
     fn fresh_of(&mut self, ty: &Type, hint: &str) -> Result<Val, Diag> {
         match ty {
             Type::U64 => self.fresh_u64(hint),
-            Type::U8 | Type::U16 | Type::U32 => Ok(Val::U(self.fresh_int(hint, "0", &ty.int_max().to_string())?)),
+            Type::U8 | Type::U16 | Type::U32 | Type::I8 | Type::I16 | Type::I32 | Type::I64 => Ok(Val::U(self.fresh_int(hint, &num(ty.int_min()), &num(ty.int_max()))?)),
             Type::Bool => self.fresh_bool(hint),
             Type::Buf => Ok(Val::Buf { len: self.fresh_len(hint)?, data: self.fresh_array(hint, "Int")? }),
             Type::Bytes => {
@@ -993,10 +1017,15 @@ impl<'p> Verifier<'p> {
                     let x = self.eval(&args[0], st)?.term().to_string();
                     let t = &targs[0];
                     if n == "wrap" {
-                        return Ok(Val::U(format!("(mod {} {})", x, t.int_max() + 1)));
+                        return Ok(Val::U(wrap_term(t, &x)));
                     }
-                    let max = t.int_max().to_string();
-                    self.prove(st, &format!("(<= {} {})", x, max), e.pos, "E-VERIFY-CAST", format!("that `{}` fits in {} (`<= {}`)", render(&args[0]), t.name(), max))?;
+                    let from = self.int_ops.get(&e.pos).cloned().unwrap_or(Type::U64);
+                    let max = num(t.int_max());
+                    if !from.is_signed() && !t.is_signed() {
+                        self.prove(st, &format!("(<= {} {})", x, max), e.pos, "E-VERIFY-CAST", format!("that `{}` fits in {} (`<= {}`)", render(&args[0]), t.name(), max))?;
+                    } else {
+                        self.prove(st, &format!("(and (<= {} {}) (<= {} {}))", num(t.int_min()), x, x, max), e.pos, "E-VERIFY-CAST", format!("that `{}` fits in {} ({} to {})", render(&args[0]), t.name(), t.int_min(), t.int_max()))?;
+                    }
                     Ok(Val::U(x))
                 }
                 _ => unreachable!("removed by monomorphization"),
@@ -1041,6 +1070,15 @@ impl<'p> Verifier<'p> {
                 let v = self.eval(x, st)?;
                 Ok(Val::B(format!("(not {})", v.term())))
             }
+            ExprKind::Neg(x) => {
+                if let ExprKind::Int(v) = x.kind {
+                    return Ok(Val::U(num(-(v as i128))));
+                }
+                let v = self.eval(x, st)?.term().to_string();
+                let ity = self.int_ops[&e.pos].clone();
+                self.prove(st, &format!("(not (= {} {}))", v, num(ity.int_min())), e.pos, "E-VERIFY-OVERFLOW", format!("that `-{}` does not overflow {} (`{}` is not {})", render(x), ity.name(), render(x), ity.int_min()))?;
+                Ok(Val::U(format!("(- {})", v)))
+            }
             ExprKind::Forall(..) => unreachable!("rejected by the checker"),
             ExprKind::Bin(op, a, b) => {
                 let va = self.eval(a, st)?;
@@ -1072,6 +1110,9 @@ impl<'p> Verifier<'p> {
                 let (ra, rb) = (render(a), render(b));
                 let ity = self.int_ops.get(&e.pos).cloned().unwrap_or(Type::U64);
                 let max = ity.int_max().to_string();
+                if ity.is_signed() && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem) {
+                    return self.signed_arith(*op, &ta, &tb, &ra, &rb, &ity, e.pos, st);
+                }
                 let v = match op {
                     BinOp::Add => {
                         let t = format!("(+ {} {})", ta, tb);
@@ -1104,6 +1145,29 @@ impl<'p> Verifier<'p> {
             }
             ExprKind::Call(name, args) => self.call(name, args, e.pos, st),
         }
+    }
+
+    /// Arithmetic on a signed type: the result must stay between the type's
+    /// minimum (E-VERIFY-UNDERFLOW) and maximum (E-VERIFY-OVERFLOW); `/` and
+    /// `%` truncate toward zero, as in C, and `MIN / -1` overflows.
+    #[allow(clippy::too_many_arguments)]
+    fn signed_arith(&mut self, op: BinOp, ta: &str, tb: &str, ra: &str, rb: &str, ity: &Type, pos: Pos, st: &mut State) -> Result<Val, Diag> {
+        let (min, max) = (num(ity.int_min()), num(ity.int_max()));
+        let t = match op {
+            BinOp::Add => format!("(+ {} {})", ta, tb),
+            BinOp::Sub => format!("(- {} {})", ta, tb),
+            BinOp::Mul => format!("(* {} {})", ta, tb),
+            _ => {
+                self.prove(st, &format!("(not (= {} 0))", tb), pos, "E-VERIFY-DIVZERO", format!("that the divisor `{}` is not zero", rb))?;
+                self.prove(st, &format!("(not (and (= {} {}) (= {} (- 1))))", ta, min, tb), pos, "E-VERIFY-OVERFLOW", format!("that `{} {} {}` is not {} {} -1, which overflows {}", ra, op.text(), rb, ity.int_min(), op.text(), ity.name()))?;
+                let q = c_div(ta, tb);
+                return Ok(Val::U(if op == BinOp::Div { q } else { format!("(- {} (* {} {}))", ta, tb, q) }));
+            }
+        };
+        let text = format!("{} {} {}", ra, op.text(), rb);
+        self.prove(st, &format!("(<= {} {})", t, max), pos, "E-VERIFY-OVERFLOW", format!("that `{}` does not overflow {} (`<= {}`)", text, ity.name(), ity.int_max()))?;
+        self.prove(st, &format!("(<= {} {})", min, t), pos, "E-VERIFY-UNDERFLOW", format!("that `{}` does not go below the minimum of {} (`>= {}`)", text, ity.name(), ity.int_min()))?;
+        Ok(Val::U(t))
     }
 
     fn call(&mut self, name: &str, args: &[Expr], pos: Pos, st: &mut State) -> Result<Val, Diag> {
@@ -1200,7 +1264,7 @@ impl<'p> Verifier<'p> {
             "wrap_add" | "wrap_sub" | "wrap_mul" => {
                 let ity = self.int_ops.get(&pos).cloned().expect("typed by the checker");
                 let op = match name { "wrap_add" => "+", "wrap_sub" => "-", _ => "*" };
-                Ok(Val::U(format!("(mod ({} {} {}) {})", op, vals[0].term(), vals[1].term(), ity.int_max() + 1)))
+                Ok(Val::U(wrap_term(&ity, &format!("({} {} {})", op, vals[0].term(), vals[1].term()))))
             }
             "unbox" => match &vals[0] {
                 Val::Box(BoxVal::Known(v)) => Ok((**v).clone()),
@@ -1671,6 +1735,7 @@ impl<'p> Verifier<'p> {
             },
             ExprKind::Var(_) | ExprKind::Field(..) => self.spec_val(e, sc, bound)?.term().to_string(),
             ExprKind::Not(x) => format!("(not {})", self.spec(x, sc, bound)?),
+            ExprKind::Neg(x) => format!("(- {})", self.spec(x, sc, bound)?),
             ExprKind::Bin(op, a, b) => {
                 let ta = self.spec(a, sc, bound)?;
                 let tb = self.spec(b, sc, bound)?;
@@ -1815,7 +1880,7 @@ fn changed_in_expr(e: &Expr, out: &mut HashMap<String, bool>, sums: &Summaries) 
                 }
             }
         }
-        ExprKind::Not(x) => changed_in_expr(x, out, sums),
+        ExprKind::Not(x) | ExprKind::Neg(x) => changed_in_expr(x, out, sums),
         ExprKind::Bin(_, a, b) => {
             changed_in_expr(a, out, sums);
             changed_in_expr(b, out, sums);

@@ -10,6 +10,12 @@ pub enum Type {
     U8,
     U16,
     U32,
+    /// Signed integers, two's complement. Arithmetic is proved to stay
+    /// between the type's minimum and maximum.
+    I8,
+    I16,
+    I32,
+    I64,
     Bool,
     Unit,
     /// An owned buffer of u64. Linear: must be consumed exactly once.
@@ -85,6 +91,10 @@ impl Type {
             Type::U8 => "u8".into(),
             Type::U16 => "u16".into(),
             Type::U32 => "u32".into(),
+            Type::I8 => "i8".into(),
+            Type::I16 => "i16".into(),
+            Type::I32 => "i32".into(),
+            Type::I64 => "i64".into(),
             Type::Bool => "bool".into(),
             Type::Unit => "()".into(),
             Type::Buf => "Buf".into(),
@@ -125,15 +135,32 @@ impl Type {
             Type::U16 => Some(16),
             Type::U32 => Some(32),
             Type::U64 => Some(64),
+            Type::I8 => Some(8),
+            Type::I16 => Some(16),
+            Type::I32 => Some(32),
+            Type::I64 => Some(64),
             _ => None,
         }
     }
     pub fn is_int(&self) -> bool {
         self.int_bits().is_some()
     }
+    pub fn is_signed(&self) -> bool {
+        matches!(self, Type::I8 | Type::I16 | Type::I32 | Type::I64)
+    }
     /// The largest value of an integer type.
-    pub fn int_max(&self) -> u128 {
-        (1u128 << self.int_bits().expect("an integer type")) - 1
+    pub fn int_max(&self) -> i128 {
+        let w = self.int_bits().expect("an integer type");
+        if self.is_signed() { (1i128 << (w - 1)) - 1 } else { (1i128 << w) - 1 }
+    }
+    /// The smallest value of an integer type.
+    pub fn int_min(&self) -> i128 {
+        let w = self.int_bits().expect("an integer type");
+        if self.is_signed() { -(1i128 << (w - 1)) } else { 0 }
+    }
+    /// 2^width: the modulus of wrapping arithmetic.
+    pub fn int_modulus(&self) -> i128 {
+        1i128 << self.int_bits().expect("an integer type")
     }
     pub fn is_ref(&self) -> bool {
         matches!(self, Type::Ref(_) | Type::MutRef(_))
@@ -211,6 +238,9 @@ pub enum ExprKind {
     Is(Box<Expr>, String, String),
     Var(String),
     Not(Box<Expr>),
+    /// Unary minus, on signed integers only. In front of a literal it is part
+    /// of the literal (`-128` is an `i8`).
+    Neg(Box<Expr>),
     Bin(BinOp, Box<Expr>, Box<Expr>),
     Call(String, Vec<Expr>),
     /// `forall x: u64 :: body` (specifications only)
@@ -284,8 +314,9 @@ pub struct FnDef {
     pub ensures: Vec<Expr>,
     pub body: Vec<Stmt>,
     pub pos: Pos,
-    /// Filled in by the checker: the integer type of each arithmetic
-    /// operator and wrapping builtin in the body, by its position. The
+    /// Filled in by the checker: the integer type of the operands of each
+    /// arithmetic operator, comparison, unary minus and wrapping builtin in
+    /// the body, by its position. The
     /// verifier and the code generator need it, since literals take their
     /// type from context.
     pub int_ops: std::collections::HashMap<Pos, Type>,
@@ -381,7 +412,7 @@ pub fn resolve_enum_types(p: &mut Program) {
                 ts.iter_mut().for_each(|t| fix(t, names));
                 fix_expr(inner, names);
             }
-            ExprKind::Field(x, _) | ExprKind::Is(x, _, _) | ExprKind::Not(x) | ExprKind::Forall(_, x) => fix_expr(x, names),
+            ExprKind::Field(x, _) | ExprKind::Is(x, _, _) | ExprKind::Not(x) | ExprKind::Neg(x) | ExprKind::Forall(_, x) => fix_expr(x, names),
             ExprKind::Variant(_, _, Some(x)) => fix_expr(x, names),
             ExprKind::StructLit(_, fs) => fs.iter_mut().for_each(|(_, x)| fix_expr(x, names)),
             ExprKind::Bin(_, a, b) => {
@@ -491,6 +522,7 @@ pub fn render(e: &Expr) -> String {
                 format!("{}[{}]{}", &inner[..n], ts.iter().map(|t| t.name()).collect::<Vec<_>>().join(", "), &inner[n..])
             }
             ExprKind::Not(x) => format!("!{}", go(x, false)),
+            ExprKind::Neg(x) => format!("-{}", go(x, false)),
             ExprKind::Bin(op, a, b) => {
                 let s = format!("{} {} {}", go(a, false), op.text(), go(b, false));
                 if top { s } else { format!("({})", s) }

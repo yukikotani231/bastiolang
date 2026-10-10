@@ -63,6 +63,7 @@ pub fn expr(e: &Expr) -> String {
         ExprKind::Is(x, en, v) => format!("(is {} {} {} {})", at, expr(x), en, v),
         ExprKind::Var(n) => format!("(var {} {})", at, n),
         ExprKind::Not(x) => format!("(not {} {})", at, expr(x)),
+        ExprKind::Neg(x) => format!("(neg {} {})", at, expr(x)),
         ExprKind::Bin(op, a, b) => format!("(bin {} {} {} {})", at, op.text(), expr(a), expr(b)),
         ExprKind::Call(n, xs) => {
             let mut s = format!("(call {} {}", at, n);

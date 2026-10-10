@@ -324,6 +324,10 @@ impl Parser {
             "u8" => Ok(Type::U8),
             "u16" => Ok(Type::U16),
             "u32" => Ok(Type::U32),
+            "i8" => Ok(Type::I8),
+            "i16" => Ok(Type::I16),
+            "i32" => Ok(Type::I32),
+            "i64" => Ok(Type::I64),
             "bool" => Ok(Type::Bool),
             "Buf" => Ok(Type::Buf),
             "Bytes" => Ok(Type::Bytes),
@@ -630,6 +634,11 @@ impl Parser {
             let pos = self.bump().pos;
             let e = self.unary()?;
             return Ok(Expr { kind: ExprKind::Not(Box::new(e)), pos });
+        }
+        if *self.peek() == Tok::Minus {
+            let pos = self.bump().pos;
+            let e = self.unary()?;
+            return Ok(Expr { kind: ExprKind::Neg(Box::new(e)), pos });
         }
         let mut e = self.primary()?;
         while *self.peek() == Tok::Dot {

@@ -86,8 +86,9 @@ There is no conversion between integers and `bool`. `cast`, `wrap` and the `wrap
 
 ## Builtins and existing APIs
 
-- **`u64` parameters of the builtins** (indexes, lengths, values: `get`, `set`, `bget`, `vec_get`, `alloc`, `print`, ...) accept any unsigned integer type, since widening to `u64` is free and always fits. Lengths are still returned as `u64`. Functions the program defines get no such exception.
-- `print` will print signed values with their sign (step 2).
+- **`u64` parameters of the builtins** (indexes, lengths, values: `get`, `set`, `bget`, `vec_get`, `alloc`, `print`, ...) accept any unsigned integer type, since widening to `u64` is free and always fits. A signed value is not accepted there: it may be negative, so it is converted with `cast[u64]` (proved non-negative) or `wrap[u64]`. Lengths are still returned as `u64`. Functions the program defines get no such exception.
+- `print` takes `u64` only for now; a signed value is printed after `cast[u64]` or `wrap[u64]`. Printing with a sign can come later.
+- An expression made only of literals has no position to take a type from and is `u64`, so `-7 / 2` on its own is `E-TYPE`; write it where a signed type is expected (`let n: i8 = -7;`).
 - `Bytes`, `serial_write`, `serial_read` and `frame_read8`/`frame_write8` move to `u8` in step 4 (below). Until then they keep their `u64` signatures and range facts, so nothing breaks.
 
 ## Specifications
@@ -147,8 +148,8 @@ At the same time the byte-shaped builtins take and return `u8`: `bget -> u8`, `b
 
 Each step comes with `tests/pass` and `tests/fail` programs (ROADMAP invariant 4), including a failing program per new obligation, and is checked under UBSan like every passing test.
 
-1. **Unsigned widths and conversions.** `u8`, `u16`, `u32`; literal typing; `cast`, `wrap`, `wrap_add`/`wrap_sub`/`wrap_mul`; index parameters of any unsigned type; C types. Touches stage0's parser (type names), `mono.rs` (type arguments on builtins), `check.rs`, `verify.rs` and `codegen.rs`, and stage1's parser and checker, which must give the same `--dump-check` result (CI's difftest runs every test program through both).
-2. **Signed types.** `i8` to `i64`, unary minus, the signed division encoding.
+1. **Unsigned widths and conversions** (done 2026-10-10). `u8`, `u16`, `u32`; literal typing; `cast`, `wrap`, `wrap_add`/`wrap_sub`/`wrap_mul`; index parameters of any unsigned type; C types. Touches stage0's parser (type names), `mono.rs` (type arguments on builtins), `check.rs`, `verify.rs` and `codegen.rs`, and stage1's parser and checker, which must give the same `--dump-check` result (CI's difftest runs every test program through both).
+2. **Signed types.** `i8` to `i64`, unary minus, the signed division encoding. Done 2026-10-10, in stage0 and the stage1 checker.
 3. **Bitwise operators**, with the encoding above.
 4. **Byte-shaped builtins move to `u8`, and `PortIo`** (with BastiOS moving the PIC, PIT and UART setup out of `platform.c`).
 

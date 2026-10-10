@@ -762,6 +762,10 @@ fn cty(t: &Type) -> String {
         Type::U8 => "uint8_t".into(),
         Type::U16 => "uint16_t".into(),
         Type::U32 => "uint32_t".into(),
+        Type::I8 => "int8_t".into(),
+        Type::I16 => "int16_t".into(),
+        Type::I32 => "int32_t".into(),
+        Type::I64 => "int64_t".into(),
         Type::Bool => "bool".into(),
         Type::Unit => "void".into(),
         Type::Buf => "bst_buf".into(),
@@ -934,6 +938,7 @@ impl<'a> Gen<'a> {
             },
             ExprKind::Int(_) => Type::U64,
             ExprKind::Bool(_) | ExprKind::Not(_) | ExprKind::Is(..) => Type::Bool,
+            ExprKind::Neg(_) => self.int_ops.get(&e.pos).cloned().unwrap_or(Type::I64),
             ExprKind::Str(_) | ExprKind::Blob(_) => Type::Str,
             ExprKind::Var(n) => self.types[n].clone(),
             ExprKind::Field(b, f) => {
@@ -1094,10 +1099,22 @@ impl<'a> Gen<'a> {
                 format!("({}.tag == {})", self.expr(x), enum_def(&n).unwrap().index(v).unwrap())
             }
             ExprKind::Not(x) => format!("(!{})", self.expr(x)),
+            // A negated literal is a constant; `-x` is proved not to overflow.
+            ExprKind::Neg(x) => match x.kind {
+                ExprKind::Int(v) if v == 1 << 63 => "INT64_MIN".to_string(),
+                ExprKind::Int(v) => format!("(-INT64_C({}))", v),
+                _ => format!("(-(int64_t)({}))", self.expr(x)),
+            },
             // && and || are sequenced in C already (and must stay short-circuit).
             ExprKind::Bin(op, a, b) if matches!(op, BinOp::And | BinOp::Or) => format!("({} {} {})", self.expr(a), op.text(), self.expr(b)),
             ExprKind::Bin(op, a, b) => {
                 let (pre, v) = self.operands(&[a, b], false);
+                // Signed operands are computed in int64_t, so a literal
+                // (a uint64_t constant) cannot turn the operation unsigned.
+                // The proof keeps every result in range, so nothing overflows.
+                if self.int_ops.get(&e.pos).map_or(false, |t| t.is_signed()) {
+                    return seq(pre, format!("((int64_t)({}) {} (int64_t)({}))", v[0], op.text(), v[1]));
+                }
                 seq(pre, format!("({} {} {})", v[0], op.text(), v[1]))
             }
             ExprKind::Forall(..) => unreachable!("specification only"),
@@ -1206,7 +1223,7 @@ fn has_effect(e: &Expr) -> bool {
         }
         ExprKind::StructLit(_, fs) => fs.iter().any(|(_, x)| has_effect(x)),
         ExprKind::Variant(_, _, p) => p.as_deref().map_or(false, has_effect),
-        ExprKind::Is(x, ..) | ExprKind::Not(x) => has_effect(x),
+        ExprKind::Is(x, ..) | ExprKind::Not(x) | ExprKind::Neg(x) | ExprKind::TypeApp(_, x) => has_effect(x),
         ExprKind::Bin(_, a, b) => has_effect(a) || has_effect(b),
         _ => false,
     }

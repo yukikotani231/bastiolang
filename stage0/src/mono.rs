@@ -261,7 +261,7 @@ impl Mono {
 
     fn children(&mut self, e: &mut Expr, s: &HashMap<String, Type>) -> Result<(), Diag> {
         match &mut e.kind {
-            ExprKind::Field(x, _) | ExprKind::Is(x, _, _) | ExprKind::Not(x) | ExprKind::Forall(_, x) => self.expr(x, s),
+            ExprKind::Field(x, _) | ExprKind::Is(x, _, _) | ExprKind::Not(x) | ExprKind::Neg(x) | ExprKind::Forall(_, x) => self.expr(x, s),
             ExprKind::Variant(_, _, Some(x)) => self.expr(x, s),
             ExprKind::StructLit(_, fs) => {
                 for (_, x) in fs {
