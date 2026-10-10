@@ -80,6 +80,7 @@ module.exports = grammar({
         'spec',
         'fn',
         field('name', $.identifier),
+        optional(field('type_parameters', $.type_parameters)),
         field('parameters', $.parameters),
         '->',
         field('return_type', $._type),

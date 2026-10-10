@@ -52,7 +52,7 @@ const MAX_INSTANCES: u64 = 1000;
 
 struct Ty { kind: u64, a: u64 }
 
-/// A definition (D_STRUCT, D_ENUM or D_FN node) with type arguments
+/// A definition (D_STRUCT, D_ENUM, D_FN or D_SPEC node) with type arguments
 /// `targs[args .. args + n]`.
 struct Inst { def: u64, args: u64, n: u64 }
 
@@ -72,6 +72,9 @@ struct Mono {
   structs: Vec[u64],
   enums: Vec[u64],
   fns: Vec[u64],
+  /// Spec fns: plain ones in source order, each generic one replaced by its
+  /// instances (a spec fn may only call the spec fns before it).
+  specs: Vec[u64],
   /// Filled in by the checker.
   lets: Vec[LetTy],
   failed: bool,
@@ -89,7 +92,7 @@ fn mono_new() -> Mono {
   vec_push(&mut insts, Inst { def: 0, args: 0, n: 0 });
   return Mono {
     tys: tys, insts: insts, targs: vec_new[u64](), queue: vec_new[u64](),
-    structs: vec_new[u64](), enums: vec_new[u64](), fns: vec_new[u64](), lets: vec_new[LetTy](),
+    structs: vec_new[u64](), enums: vec_new[u64](), fns: vec_new[u64](), specs: vec_new[u64](), lets: vec_new[LetTy](),
     failed: false, efile: 0, eline: 0, ecol: 0, emsg: vec_new[u64]()
   };
 }
@@ -102,6 +105,7 @@ fn mono_free(m: Mono) {
   vec_free(m.structs);
   vec_free(m.enums);
   vec_free(m.fns);
+  vec_free(m.specs);
   vec_free(m.lets);
   vec_free(m.emsg);
 }
@@ -286,6 +290,15 @@ fn find_type(p: &Parser, name: u64) -> u64 {
 
 fn find_fn(p: &Parser, name: u64) -> u64 {
   return find_in(p, p.fns.head, name);
+}
+
+/// The generic spec fn with the name of node `name`, or 0.
+fn generic_spec(p: &Parser, name: u64) -> u64 {
+  let d = find_in(p, p.specs.head, name);
+  if is_generic(p, d) {
+    return d;
+  }
+  return 0;
 }
 
 fn is_generic(p: &Parser, def: u64) -> bool {
@@ -560,16 +573,10 @@ fn monomorphize(m: &mut Mono, p: &Parser) {
   }
   k = p.specs.head;
   while k != 0 && !m.failed {
-    let sf = node_at(p.nodes, k);
-    let mut q = sf.a;
-    while q != 0 && !m.failed {
-      let pn = node_at(p.nodes, q);
-      conv(&mut m, p, pn.a, 0, q);
-      q = pn.next;
+    if !is_generic(p, k) {
+      mono_spec(&mut m, p, k, 0);
     }
-    conv(&mut m, p, sf.b, 0, k);
-    mono_expr(&mut m, p, sf.c, 0);
-    k = sf.next;
+    k = next_of(p, k);
   }
   let mut j = 0;
   while j < vec_len(m.queue) && !m.failed {
@@ -593,6 +600,8 @@ fn monomorphize(m: &mut Mono, p: &Parser) {
       } else if kd == D_ENUM {
         vec_push(&mut m.enums, x);
         mono_fields(&mut m, p, d, x);
+      } else if kd == D_SPEC {
+        mono_spec(&mut m, p, d, x);
       } else {
         vec_push(&mut m.fns, x);
         mono_fn(&mut m, p, d, x);
@@ -600,6 +609,39 @@ fn monomorphize(m: &mut Mono, p: &Parser) {
     }
     j = j + 1;
   }
+  // Each instance takes the place of its generic definition: what it calls
+  // is still earlier, and an instance calling itself (or a later instance
+  // of the same generic) is still rejected as recursion.
+  k = p.specs.head;
+  while k != 0 && !m.failed {
+    if is_generic(p, k) {
+      j = 0;
+      while j < vec_len(m.queue) {
+        let x = vec_get(m.queue, j);
+        let xi = inst_at(m, x);
+        if xi.def == k {
+          vec_push(&mut m.specs, x);
+        }
+        j = j + 1;
+      }
+    } else {
+      let x = plain_inst(&mut m, k);
+      vec_push(&mut m.specs, x);
+    }
+    k = next_of(p, k);
+  }
+}
+
+fn mono_spec(m: &mut Mono, p: &Parser, d: u64, env: u64) {
+  let sf = node_at(p.nodes, d);
+  let mut q = sf.a;
+  while q != 0 && !m.failed {
+    let pn = node_at(p.nodes, q);
+    conv(&mut m, p, pn.a, env, q);
+    q = pn.next;
+  }
+  conv(&mut m, p, sf.b, env, d);
+  mono_expr(&mut m, p, sf.c, env);
 }
 
 /// Type names are unique among structs and enums, function names among
@@ -633,6 +675,15 @@ fn check_unique(m: &mut Mono, p: &Parser) {
       } else {
         mfail_named(&mut m, p, k, "an `export fn` cannot be generic (C has no generics)", 0, "");
       }
+    }
+    k = next_of(p, k);
+  }
+  // A generic spec fn's instances are named `G[..]`, so the checker would
+  // not see a clash with its plain name.
+  k = p.specs.head;
+  while k != 0 && !m.failed {
+    if is_generic(p, k) && (find_fn(p, k) != 0 || find_in(p, p.specs.head, k) != k || find_in(p, next_of(p, k), k) != 0) {
+      mfail_named(&mut m, p, k, "`", k, "` is already defined");
     }
     k = next_of(p, k);
   }
@@ -753,7 +804,10 @@ fn tapp_def(p: &Parser, inner: u64) -> u64 {
   let k = kind_of(p, inner);
   let mut d = 0;
   if k == E_CALL {
-    d = find_fn(p, inner);
+    d = generic_spec(p, inner);
+    if d == 0 {
+      d = find_fn(p, inner);
+    }
   } else if k == E_SLIT {
     d = find_in(p, p.structs.head, inner);
   } else if k == E_VARIANT {
@@ -784,7 +838,9 @@ fn tapp_inst(m: &mut Mono, p: &Parser, e: u64, env: u64) -> u64 {
         mfail_named(&mut m, p, e, "`", n.b, "` is not a generic enum");
       }
     } else if list_len(p, dn.v) != vec_len(args) {
-      if k == E_CALL {
+      if kind_of(p, d) == D_SPEC {
+        mfail_arity(&mut m, p, e, "spec fn", n.b, list_len(p, dn.v), vec_len(args));
+      } else if k == E_CALL {
         mfail_arity(&mut m, p, e, "function", n.b, list_len(p, dn.v), vec_len(args));
       } else {
         mfail_arity(&mut m, p, e, "type", n.b, list_len(p, dn.v), vec_len(args));
@@ -813,7 +869,7 @@ fn mono_expr(m: &mut Mono, p: &Parser, i: u64, env: u64) {
     mono_children(&mut m, p, n.b, env);
     return;
   }
-  if n.kind == E_CALL && is_generic(p, find_fn(p, i)) {
+  if n.kind == E_CALL && (is_generic(p, find_fn(p, i)) || generic_spec(p, i) != 0) {
     mfail_generic(&mut m, p, i, i, "(..)");
     return;
   }

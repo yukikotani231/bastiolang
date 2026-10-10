@@ -1,0 +1,52 @@
+// expect-error: E-VERIFY-INVARIANT
+// A "sort" that overwrites an element with its neighbour instead of
+// swapping them keeps the order but loses an element: the permutation
+// invariant cannot be proved.
+spec fn same_elems(a: &Vec[u64], b: &Vec[u64]) -> bool {
+  vlen(a) == vlen(b) && forall x: u64 :: vcount(a, x) == vcount(b, x)
+}
+spec fn sorted_upto(v: &Vec[u64], n: u64) -> bool {
+  forall a: u64 :: forall b: u64 :: a < b && b < n ==> vget(v, a) <= vget(v, b)
+}
+
+fn sort(v: &mut Vec[u64])
+  ensures same_elems(v, old(v)) && sorted_upto(v, vlen(v))
+{
+  let n = vec_len(v);
+  let mut i = 1;
+  while i < n
+    invariant 1 <= i && vlen(v) == n && (n > 0 ==> i <= n) && sorted_upto(v, i)
+    invariant same_elems(v, old(v))
+  {
+    let mut j = i;
+    while j > 0 && vec_get(v, j - 1) > vec_get(v, j)
+      invariant j <= i && i < n && vlen(v) == n
+      invariant same_elems(v, old(v))
+      invariant forall a: u64 :: forall b: u64 :: a < b && b < j ==> vget(v, a) <= vget(v, b)
+      invariant forall a: u64 :: forall b: u64 :: j < a && a < b && b <= i ==> vget(v, a) <= vget(v, b)
+      invariant forall a: u64 :: j < a && a <= i ==> vget(v, a) > vget(v, j)
+      invariant j > 0 && j < i ==> vget(v, j - 1) <= vget(v, j + 1)
+    {
+      let a = vec_get(v, j - 1);
+      let b = vec_get(v, j);
+      vec_set(&mut v, j, a);
+      vec_set(&mut v, j - 1, a);
+      j = j - 1;
+    }
+    i = i + 1;
+  }
+}
+
+fn main() -> u64 {
+  let mut v = vec_new[u64]();
+  vec_push(&mut v, 3);
+  vec_push(&mut v, 1);
+  vec_push(&mut v, 2);
+  sort(&mut v);
+  let r = vec_get(v, 0);
+  vec_pop(&mut v);
+  vec_pop(&mut v);
+  vec_pop(&mut v);
+  vec_free(v);
+  return r;
+}
