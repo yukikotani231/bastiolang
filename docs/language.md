@@ -1191,6 +1191,32 @@ fn main() -> u64 {
 }
 ```
 
+A `spec fn` can be generic. Like a generic function, it is copied once per list of type arguments, which are written at every call (`grew_by[u64](v, w, 1)`), and a generic function's specifications can pass its own type parameters on:
+
+```bastio
+// expect-exit: 2
+spec fn grew_by[T](v: &Vec[T], w: &Vec[T], n: u64) -> bool {
+  vlen(v) == vlen(w) + n
+}
+
+fn push_two[T](v: &mut Vec[T], a: T, b: T)
+  ensures grew_by[T](v, old(v), 2)
+{
+  vec_push(&mut v, a);
+  vec_push(&mut v, b);
+}
+
+fn main() -> u64 {
+  let mut v = vec_new[u64]();
+  push_two[u64](&mut v, 1, 2);
+  let n = vec_len(v);
+  vec_pop(&mut v);
+  vec_pop(&mut v);
+  vec_free(v);
+  return n;
+}
+```
+
 ## How verification works
 
 After the type and linearity checks, the compiler executes each function symbolically. At every point where the program could go wrong it asks Z3 whether the bad case is reachable, and if it is, it rejects the program and shows a counterexample (values of the variables that lead there).

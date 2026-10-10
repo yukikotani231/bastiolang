@@ -63,10 +63,13 @@ struct Checker {
   target: u64,
   /// The return type of the function being checked.
   ret: u64,
-  /// The instance being checked (0 for a spec fn).
+  /// The instance being checked (0 for a plain spec fn).
   env: u64,
   /// Only the spec fns before this one are visible (0: all of them).
   spec_lim: u64,
+  /// When checking spec fn `Mono.specs[j]`, j + 1: only the instances of
+  /// generic spec fns before it are visible (0: all of them).
+  spec_pos: u64,
   tu64: u64,
   tbool: u64,
   tunit: u64,
@@ -155,7 +158,7 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   let mut c = Checker {
     bs: vec_new[Bsig](), ghosts: vec_new[Ghost](), fstart: vec_new[u64](), ftys: vec_new[u64](),
     paths: paths, vars: vec_new[Var](), moved: vec_new[u64](), bound: vec_new[u64](),
-    target: target, ret: un, env: 0, spec_lim: 0, tu64: u, tbool: b, tunit: un, tstr: st,
+    target: target, ret: un, env: 0, spec_lim: 0, spec_pos: 0, tu64: u, tbool: b, tunit: un, tstr: st,
     failed: false, efile: 0, eline: 0, ecol: 0, ecode: 0, emsg: vec_new[u64](), enotes: vec_new[u64](), int_ops: vec_new[IntOp](),
     calls: vec_new[Edge](), lsites: vec_new[LockSite](), nparams: 0, inv: false, old_only: false
   };
@@ -1944,15 +1947,19 @@ fn check_program(c: &mut Checker, m: &mut Mono, p: &Parser) {
     return;
   }
   signatures(&mut c, &mut m, p);
-  let mut k = p.specs.head;
-  while k != 0 && !c.failed {
+  let mut j = 0;
+  while j < vec_len(m.specs) && !c.failed {
     // A spec fn may only call spec fns defined before it.
-    c.spec_lim = k;
-    check_spec_fn(&mut c, &mut m, p, k);
-    k = next_of(p, k);
+    let x = u_at(m.specs, j);
+    let xi = inst_at(m, x);
+    c.spec_lim = xi.def;
+    c.spec_pos = j + 1;
+    check_spec_fn(&mut c, &mut m, p, x);
+    j = j + 1;
   }
   c.spec_lim = 0;
-  let mut j = 0;
+  c.spec_pos = 0;
+  j = 0;
   while j < vec_len(m.structs) && !c.failed {
     check_struct_invariants(&mut c, &mut m, p, u_at(m.structs, j));
     j = j + 1;
@@ -2113,9 +2120,14 @@ fn lock_order(c: &mut Checker, m: &Mono, p: &Parser) {
   vec_free(order);
 }
 
-fn check_spec_fn(c: &mut Checker, m: &mut Mono, p: &Parser, k: u64) {
+fn check_spec_fn(c: &mut Checker, m: &mut Mono, p: &Parser, x: u64) {
+  let xi = inst_at(m, x);
+  let k = xi.def;
   let sn = node_at(p.nodes, k);
-  if sigs_has(c, p, sn.s, sn.e) || ghost_index(c, p, sn.s, sn.e) != 0 || find_spec(c, p, sn.s, sn.e) != 0 {
+  let generic = xi.n > 0;
+  // An instance is named `G[..]`, which clashes with nothing (monomorphization
+  // checked the name `G`).
+  if !generic && (sigs_has(c, p, sn.s, sn.e) || ghost_index(c, p, sn.s, sn.e) != 0 || find_spec(c, p, sn.s, sn.e) != 0) {
     if cm_new(&mut c, p, k, C_TYPE) {
       cm_s(&mut c, "`");
       cm_name(&mut c, p, k);
@@ -2123,18 +2135,22 @@ fn check_spec_fn(c: &mut Checker, m: &mut Mono, p: &Parser, k: u64) {
     }
     return;
   }
-  let r = conv(&mut m, p, sn.b, 0, k);
+  let r = conv(&mut m, p, sn.b, x, k);
   if r != c.tbool && r != c.tu64 {
     if cm_new(&mut c, p, k, C_TYPE) {
       cm_s(&mut c, "a spec fn returns bool or u64");
     }
     return;
   }
-  reset(&mut c, c.tunit, 0);
+  let mut env = 0;
+  if generic {
+    env = x;
+  }
+  reset(&mut c, c.tunit, env);
   let mut q = sn.a;
   while q != 0 && !c.failed {
     let qn = node_at(p.nodes, q);
-    let t = conv(&mut m, p, qn.a, 0, q);
+    let t = conv(&mut m, p, qn.a, env, q);
     known_type(&mut c, m, p, t, q);
     if !c.failed && (ck_linear(c, m, p, t) || kind_t(m, t) == TY_MUTREF) && cm_new(&mut c, p, q, C_TYPE) {
       cm_s(&mut c, "spec fn parameters are values (`u64`, `bool`) or shared borrows (`&T`)");
@@ -2148,7 +2164,7 @@ fn check_spec_fn(c: &mut Checker, m: &mut Mono, p: &Parser, k: u64) {
   let t = ck_spec(&mut c, &mut m, p, sn.c, false);
   if !c.failed && cm_mismatch(&mut c, p, t, r, sn.c) {
     cm_s(&mut c, "the body of spec fn `");
-    cm_name(&mut c, p, k);
+    cm_callee(&mut c, m, p, k, env);
     cm_s(&mut c, "`");
     cm_must(&mut c, m, p, r, t);
   }
@@ -3315,6 +3331,15 @@ fn user_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, x: u64) -> u64 {
 }
 
 fn ck_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 {
+  let ii = inst_at(m, inst);
+  if inst != 0 && kind_of(p, ii.def) == D_SPEC {
+    if cm_new(&mut c, p, i, C_TYPE) {
+      cm_s(&mut c, "`");
+      cm_inst(&mut c, m, p, inst);
+      cm_s(&mut c, "` is only allowed in specifications");
+    }
+    return 0;
+  }
   if inst != 0 {
     return user_call(&mut c, &mut m, p, i, inst);
   }
@@ -4086,6 +4111,17 @@ fn ck_spec(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u64 
   }
   let n = node_at(p.nodes, i);
   let k = n.kind;
+  if k == E_TAPP && kind_of(p, n.b) == E_CALL && generic_spec(p, n.b) != 0 {
+    let x = tapp_inst(&mut m, p, i, c.env);
+    if m.failed {
+      cfail(&mut c, p, i, C_TYPE);              // not reached: monomorphization made it
+      return 0;
+    }
+    if spec_visible(c, m, x) {
+      let xi = inst_at(m, x);
+      return spec_fn_call(&mut c, &mut m, p, n.b, xi.def, x, ens);
+    }
+  }
   if k == E_TAPP {
     // A generic instance cannot be called or built in a specification
     // (stage0 has renamed it by now), nor can a typed builtin.
@@ -4317,6 +4353,64 @@ fn cm_spec_arg(c: &mut Checker, m: &Mono, p: &Parser, loc: u64, i: u64, want: u6
   }
 }
 
+/// Is spec fn instance `x` defined before the spec fn being checked?
+fn spec_visible(c: &Checker, m: &Mono, x: u64) -> bool {
+  if c.spec_pos == 0 {
+    return true;
+  }
+  let mut j = 0;
+  while j < c.spec_pos - 1 && j < vec_len(m.specs) {
+    if vec_get(m.specs, j) == x {
+      return true;
+    }
+    j = j + 1;
+  }
+  return false;
+}
+
+/// A call `i` of spec fn `sf`, generic instance `x` of it when `x` is not 0.
+fn spec_fn_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, sf: u64, x: u64, ens: bool) -> u64 {
+  let n = node_at(p.nodes, i);
+  let na = list_len(p, n.a);
+  let sn = node_at(p.nodes, sf);
+  if na != list_len(p, sn.a) {
+    if cm_new(&mut c, p, i, C_TYPE) {
+      cm_s(&mut c, "`");
+      cm_callee(&mut c, m, p, i, x);
+      cm_s(&mut c, "` takes ");
+      cm_num(&mut c, list_len(p, sn.a));
+      cm_s(&mut c, " argument(s), ");
+      cm_num(&mut c, na);
+      cm_s(&mut c, " given");
+    }
+    return 0;
+  }
+  let mut q = sn.a;
+  let mut a = n.a;
+  while q != 0 && a != 0 && !c.failed {
+    let qn = node_at(p.nodes, q);
+    let bt = base_t(m, conv(&mut m, p, qn.a, x, q));
+    let t = ck_spec(&mut c, &mut m, p, a, ens);
+    if !c.failed && spec_norm(c, m, t) != spec_norm(c, m, bt) && cm_new(&mut c, p, a, C_TYPE) {
+      cm_s(&mut c, "argument of `");
+      cm_callee(&mut c, m, p, i, x);
+      cm_s(&mut c, "` must be ");
+      cm_ty(&mut c, m, p, bt);
+      cm_s(&mut c, ", found ");
+      cm_ty(&mut c, m, p, spec_norm(c, m, t));
+    }
+    if !c.failed && ck_linear(c, m, p, bt) {
+      check_lin(&mut c, p, a);
+    }
+    q = qn.next;
+    a = next_of(p, a);
+  }
+  if c.failed {
+    return 0;
+  }
+  return conv(&mut m, p, sn.b, x, sf);
+}
+
 fn spec_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u64 {
   let n = node_at(p.nodes, i);
   let s = n.s;
@@ -4348,30 +4442,7 @@ fn spec_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u6
   }
   let sf = find_spec(c, p, s, e);
   if sf != 0 {
-    let sn = node_at(p.nodes, sf);
-    if na != list_len(p, sn.a) {
-      cm_spec_arity(&mut c, p, i, list_len(p, sn.a), na);
-      return 0;
-    }
-    let mut q = sn.a;
-    let mut a = n.a;
-    while q != 0 && a != 0 && !c.failed {
-      let qn = node_at(p.nodes, q);
-      let bt = base_t(m, conv(&mut m, p, qn.a, 0, q));
-      let t = ck_spec(&mut c, &mut m, p, a, ens);
-      if !c.failed && spec_norm(c, m, t) != spec_norm(c, m, bt) {
-        cm_spec_arg(&mut c, m, p, a, i, bt, spec_norm(c, m, t));
-      }
-      if !c.failed && ck_linear(c, m, p, bt) {
-        check_lin(&mut c, p, a);
-      }
-      q = qn.next;
-      a = next_of(p, a);
-    }
-    if c.failed {
-      return 0;
-    }
-    return conv(&mut m, p, sn.b, 0, sf);
+    return spec_fn_call(&mut c, &mut m, p, i, sf, 0, ens);
   }
   let g = ghost_index(c, p, s, e);
   if g != 0 {

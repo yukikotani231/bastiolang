@@ -119,12 +119,11 @@ Insertion sort is quadratic in the worst case. It was chosen because its proof i
 
 ## Gaps
 
-What the library would say if the language let it. Each is a language or verifier change, not a library change. (Two earlier gaps are closed: `old(x)` is allowed in loop invariants, which the text functions and `bytes_copy_into` use, and a local variable may share a function's name, so importing core no longer reserves its local names.)
+What the library would say if the language let it. Each is a language or verifier change, not a library change. (Three earlier gaps are closed: `old(x)` is allowed in loop invariants, which the text functions and `bytes_copy_into` use; a local variable may share a function's name, so importing core no longer reserves its local names; and a `spec fn` may be generic, so a generic `HashMap[V]` can now be written.)
 
-1. **Generic spec fns.** `spec fn` cannot take type parameters, so a property of a `HashMap[V]` cannot be named; the hash map therefore holds `u64` values only.
-2. **Counting.** Specifications have `forall` but no way to count elements, so "the map has `len` keys" and "the sort output is a permutation of the input" cannot be stated. Recursive spec fns or a multiset theory would allow both, and also "this parse gives the value of these digits".
-3. **Library search paths.** Imports are relative to the importing file, so where core lives is written into every import. A `--lib` path or an `import core "text"` form would fix it.
-4. **Length bounds on `Bytes`.** Nothing says an existing `Bytes` is at most 2^60 long (a `Vec` push gets such a fact), so `bytes_concat` must ask for it.
+1. **Counting.** Specifications have `forall` but no way to count elements, so "the map has `len` keys" and "the sort output is a permutation of the input" cannot be stated. Recursive spec fns or a multiset theory would allow both, and also "this parse gives the value of these digits".
+2. **Library search paths.** Imports are relative to the importing file, so where core lives is written into every import. A `--lib` path or an `import core "text"` form would fix it.
+3. **Length bounds on `Bytes`.** Nothing says an existing `Bytes` is at most 2^60 long (a `Vec` push gets such a fact), so `bytes_concat` must ask for it.
 
 ## Where it came from
 

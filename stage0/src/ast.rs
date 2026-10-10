@@ -369,6 +369,9 @@ pub struct FnDef {
 #[derive(Debug, Clone)]
 pub struct SpecFn {
     pub name: String,
+    /// `spec fn name[T, ..]`: copied per use by monomorphization, like a
+    /// generic function.
+    pub tparams: Vec<String>,
     pub params: Vec<Param>,
     pub ret: Type,
     pub body: Expr,

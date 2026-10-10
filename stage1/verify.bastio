@@ -2282,6 +2282,13 @@ fn spec_tm(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env: &Vec[
   if k == E_CALL {
     return vspec_call(&mut v, c, &mut m, p, i, env, oenv, has_old, res, &mut bound);
   }
+  if k == E_TAPP {
+    // An instance of a generic spec fn: the only type application a checked
+    // specification has.
+    let x = tapp_inst(&mut m, p, i, v.env);
+    let xi = inst_at(m, x);
+    return vspec_expand(&mut v, c, &mut m, p, n.b, xi.def, x, env, oenv, has_old, res, &mut bound);
+  }
   return v.t_false;
 }
 
@@ -2309,33 +2316,52 @@ fn vspec_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env: &V
   }
   let sf = vspec_def(p, n.s, n.e);
   if sf != 0 {
-    let sd = node_at(p.nodes, sf);
-    let mut senv = vec_new[Bind]();
-    let mut q = sd.a;
-    let mut a = n.a;
-    while q != 0 && a != 0 {
-      let qn = node_at(p.nodes, q);
-      let pt = base_t(m, conv(&mut m, p, qn.a, 0, q));
-      let mut x = 0;
-      if is_int(m, pt) {
-        let t = spec_tm(&mut v, c, &mut m, p, a, env, oenv, has_old, res, &mut bound);
-        x = mk_u(&mut v, t);
-      } else if kind_t(m, pt) == TY_BOOL {
-        let t = spec_tm(&mut v, c, &mut m, p, a, env, oenv, has_old, res, &mut bound);
-        x = mk_b(&mut v, t);
-      } else {
-        x = spec_val(&mut v, c, &mut m, p, a, env, oenv, has_old, res, &mut bound);
-      }
-      env_put(&mut senv, p, qn.s, qn.e, x);
-      q = qn.next;
-      a = next_of(p, a);
-    }
-    let mut sb = vec_new[Bnd]();
-    let r = spec_tm(&mut v, c, &mut m, p, sd.c, senv, senv, false, 0, &mut sb);
-    vec_free(sb);
-    vec_free(senv);
-    return r;
+    return vspec_expand(&mut v, c, &mut m, p, i, sf, 0, env, oenv, has_old, res, &mut bound);
   }
+  return vspec_builtin(&mut v, c, &mut m, p, i, env, oenv, has_old, res, &mut bound);
+}
+
+/// Call `i` of spec fn `sf` (instance `x` of it, or 0 for a plain one),
+/// expanded in place.
+fn vspec_expand(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, sf: u64, x: u64, env: &Vec[Bind], oenv: &Vec[Bind], has_old: bool, res: u64, bound: &mut Vec[Bnd]) -> u64 {
+  let n = node_at(p.nodes, i);
+  let sd = node_at(p.nodes, sf);
+  let mut senv = vec_new[Bind]();
+  let mut q = sd.a;
+  let mut a = n.a;
+  while q != 0 && a != 0 {
+    let qn = node_at(p.nodes, q);
+    let pt = base_t(m, conv(&mut m, p, qn.a, x, q));
+    let mut y = 0;
+    if is_int(m, pt) {
+      let t = spec_tm(&mut v, c, &mut m, p, a, env, oenv, has_old, res, &mut bound);
+      y = mk_u(&mut v, t);
+    } else if kind_t(m, pt) == TY_BOOL {
+      let t = spec_tm(&mut v, c, &mut m, p, a, env, oenv, has_old, res, &mut bound);
+      y = mk_b(&mut v, t);
+    } else {
+      y = spec_val(&mut v, c, &mut m, p, a, env, oenv, has_old, res, &mut bound);
+    }
+    env_put(&mut senv, p, qn.s, qn.e, y);
+    q = qn.next;
+    a = next_of(p, a);
+  }
+  // Type applications in an instance's body are read in that instance.
+  let outer = v.env;
+  if x != 0 {
+    v.env = x;
+  }
+  let mut sb = vec_new[Bnd]();
+  let r = spec_tm(&mut v, c, &mut m, p, sd.c, senv, senv, false, 0, &mut sb);
+  v.env = outer;
+  vec_free(sb);
+  vec_free(senv);
+  return r;
+}
+
+/// A call `i` of a ghost builtin in a specification.
+fn vspec_builtin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env: &Vec[Bind], oenv: &Vec[Bind], has_old: bool, res: u64, bound: &mut Vec[Bnd]) -> u64 {
+  let n = node_at(p.nodes, i);
   if span_is(p, n.s, n.e, "vget") {
     let x = spec_val(&mut v, c, &mut m, p, i, env, oenv, has_old, res, &mut bound);
     return term(v, x);
