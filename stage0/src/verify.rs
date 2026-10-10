@@ -919,7 +919,7 @@ impl<'p> Verifier<'p> {
                 Err(d)
             }
             SatResult::Unknown => Err(Diag::new(code, pos, format!("could not prove {}", what))
-                .note("the solver gave up (timeout or quantifiers); add an `assert` or a stronger invariant as a hint")),
+                .note("the solver gave up (its work limit, or quantifiers); add an `assert` or a stronger invariant as a hint")),
         };
         self.smt("(pop 1)")?;
         res
