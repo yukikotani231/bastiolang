@@ -842,7 +842,7 @@ impl<'a> Gen<'a> {
                 Type::Box(i) => *i,
                 _ => unreachable!("checked"),
             },
-            ExprKind::Call(n, args) if n.starts_with("vec_") => match n.as_str() {
+            ExprKind::Call(n, args) if crate::check::VEC_BUILTINS.contains(&n.as_str()) => match n.as_str() {
                 "vec_len" => Type::U64,
                 "vec_push" | "vec_set" | "vec_free" => Type::Unit,
                 _ => self.vec_elem(&args[0]),
@@ -976,7 +976,7 @@ impl<'a> Gen<'a> {
             ExprKind::Not(x) => format!("(!{})", self.expr(x)),
             ExprKind::Bin(op, a, b) => format!("({} {} {})", self.expr(a), op.text(), self.expr(b)),
             ExprKind::Forall(..) => unreachable!("specification only"),
-            ExprKind::Call(name, args) if name.starts_with("vec_") => {
+            ExprKind::Call(name, args) if crate::check::VEC_BUILTINS.contains(&name.as_str()) => {
                 let el = self.vec_elem(&args[0]);
                 if !self.vecs.contains(&el) {
                     self.vecs.push(el.clone());
