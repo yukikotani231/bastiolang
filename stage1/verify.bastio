@@ -81,7 +81,9 @@ const BOX_DEPTH: u64 = 2;
 struct Tm { kind: u64, a: u64, b: u64, c: u64 }
 struct Vl { kind: u64, ty: u64, a: u64, b: u64, c: u64, n: u64 }
 struct Cmd { kind: u64, a: u64, b: u64 }
-/// A variable (named by its source text s..e) and its value.
+/// A variable (named by its source text s..e) and its value. A variable no
+/// program can name (`locked*N`, see `vlocked`) has its name in the text
+/// pool instead, at pool[e .. s]: s > e tells the two apart.
 struct Bind { s: u64, e: u64, val: u64 }
 /// A variable bound by an enclosing `forall` (source text s..e) and its SMT name.
 struct Bnd { s: u64, e: u64, q: u64 }
@@ -1245,12 +1247,31 @@ fn env_find(env: &Vec[Bind], p: &Parser, s: u64, e: u64) -> u64 {
   return 0;
 }
 
+/// Is `b` the variable named pool[rs .. rs + rl]?
+fn bind_named(v: &Vr, p: &Parser, b: Bind, rs: u64, rl: u64) -> bool {
+  if b.s > b.e {
+    // A hidden variable: its name is pool[b.e .. b.s].
+    if b.s - b.e != rl {
+      return false;
+    }
+    let mut k = 0;
+    while k < rl {
+      if pool_at(v, vadd(rs, k)) != pool_at(v, vadd(b.e, k)) {
+        return false;
+      }
+      k = k + 1;
+    }
+    return true;
+  }
+  return rng_is_src(v, rs, rl, p, b.s, b.e);
+}
+
 /// The value of the variable named pool[rs .. rs + rl], or 0.
 fn env_find_rng(env: &Vec[Bind], v: &Vr, p: &Parser, rs: u64, rl: u64) -> u64 {
   let mut k = 0;
   while k < vec_len(env) {
     let b = bind_at(env, k);
-    if rng_is_src(v, rs, rl, p, b.s, b.e) {
+    if bind_named(v, p, b, rs, rl) {
       return b.val;
     }
     k = k + 1;
@@ -1276,7 +1297,7 @@ fn env_set_rng(env: &mut Vec[Bind], v: &Vr, p: &Parser, rs: u64, rl: u64, x: u64
   let mut k = 0;
   while k < vec_len(env) {
     let b = bind_at(env, k);
-    if rng_is_src(v, rs, rl, p, b.s, b.e) {
+    if bind_named(v, p, b, rs, rl) {
       vec_set(&mut env, k, Bind { s: b.s, e: b.e, val: x });
       return;
     }
@@ -2490,14 +2511,37 @@ fn is_lin_arg(v: &mut Vr, m: &Mono, p: &Parser, a: u64, st: &VState) -> bool {
 }
 
 fn vcall(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VState, inst: u64) -> u64 {
+  if inst == 0 && name_is(p, i, "locked") {
+    return vlocked(&mut v, c, &mut m, p, i, &mut st);
+  }
+  if inst == 0 && name_is(p, i, "smp_run") {
+    return vsmp_run(&mut v, c, &mut m, p, i, &mut st);
+  }
   let n = node_at(p.nodes, i);
   let mut args = vec_new[u64]();
   let mut a = n.a;
   while a != 0 {
     vec_push(&mut args, a);
+    a = next_of(p, a);
+  }
+  let r = vcall_args(&mut v, c, &mut m, p, i, args, 0, &mut st, inst);
+  vec_free(args);
+  return r;
+}
+
+/// The call node `i` with the argument nodes `args`, calling instance
+/// `inst` (0: what `i` names). An argument node 0 stands for `&mut` of the
+/// hidden variable named by atom `hid`.
+fn vcall_args(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Vec[u64], hid: u64, st: &mut VState, inst: u64) -> u64 {
+  let n = node_at(p.nodes, i);
+  let mut j = 0;
+  while j < vec_len(args) {
+    let a = u_at(args, j);
     let an = node_at(p.nodes, a);
     let mut path = 0;
-    if an.kind == E_MUTBORROW {
+    if a == 0 {
+      path = 0;             // the hidden variable: no boxes on its path
+    } else if an.kind == E_MUTBORROW {
       path = list_text(&mut v, p, an.a);
     } else {
       path = place_text(&mut v, p, a);
@@ -2505,15 +2549,15 @@ fn vcall(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VSt
     if path != 0 {
       open_path(&mut v, c, m, p, &mut st.env, path);
     }
-    a = an.next;
+    j = j + 1;
   }
   // Argument order mirrors the checker: scalars first, then linear values.
   let mut vals = vec_new[u64]();
   let mut lin = vec_new[u64]();
-  let mut j = 0;
+  j = 0;
   while j < vec_len(args) {
     let aj = u_at(args, j);
-    if is_lin_arg(&mut v, m, p, aj, st) {
+    if aj == 0 || is_lin_arg(&mut v, m, p, aj, st) {
       vec_push(&mut lin, 1);
       vec_push(&mut vals, 0);
     } else {
@@ -2529,7 +2573,9 @@ fn vcall(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VSt
       let aj = u_at(args, j);
       let an = node_at(p.nodes, aj);
       let mut x = 0;
-      if an.kind == E_MUTBORROW {
+      if aj == 0 {
+        x = get_path(v, m, p, st.env, hid);
+      } else if an.kind == E_MUTBORROW {
         let path = list_text(&mut v, p, an.a);
         x = get_path(v, m, p, st.env, path);
       } else {
@@ -2550,15 +2596,185 @@ fn vcall(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VSt
     if x == 0 {
       x = plain_inst(&mut m, plain_fn(p, n.s, n.e));
     }
-    r = vuser_call(&mut v, c, &mut m, p, x, args, vals, &mut st);
+    r = vuser_call(&mut v, c, &mut m, p, x, args, vals, hid, &mut st);
   }
-  vec_free(args);
   vec_free(vals);
   return r;
 }
 
+/// The facts the struct invariants of value `x` state, appended to `out`.
+/// Structs held directly as fields count too; ones behind a box, in a
+/// vector or in an enum payload do not (yet), as in stage0.
+fn invariant_terms(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64, out: &mut Vec[u64]) {
+  let xv = vl_at(v, x);
+  if xv.kind != VV_STRUCT {
+    return;
+  }
+  let dn = def_node(m, p, inner_t(m, xv.ty));
+  let mut env = vec_new[Bind]();
+  let mut f = dn.a;
+  let mut j = 0;
+  while f != 0 && j < xv.n {
+    let fd = node_at(p.nodes, f);
+    env_put(&mut env, p, fd.s, fd.e, kid(v, x, j));
+    f = fd.next;
+    j = j + 1;
+  }
+  let mut b = vec_new[Bnd]();
+  let mut i = dn.b;
+  while i != 0 {
+    let t = spec_tm(&mut v, c, &mut m, p, i, env, env, false, 0, &mut b);
+    vec_push(&mut out, t);
+    i = next_of(p, i);
+  }
+  vec_free(b);
+  vec_free(env);
+  j = 0;
+  while j < xv.n {
+    invariant_terms(&mut v, c, &mut m, p, kid(v, x, j), &mut out);
+    j = j + 1;
+  }
+}
+
+/// The type of value `x`, for `lock_new`. A Bytes value reads as a Buf:
+/// the lock then forgets that every byte is <= 255, which loses facts but
+/// never assumes a false one.
+fn val_type(v: &Vr, m: &mut Mono, p: &Parser, x: u64) -> u64 {
+  let xv = vl_at(v, x);
+  let k = xv.kind;
+  if k == VV_U { return intern(&mut m, p, TY_U64, 0); }
+  if k == VV_B { return intern(&mut m, p, TY_BOOL, 0); }
+  if k == VV_BUF { return intern(&mut m, p, TY_BUF, 0); }
+  if k == VV_STR { return intern(&mut m, p, TY_STR, 0); }
+  if k == VV_OBJ || k == VV_STRUCT || k == VV_ENUM { return xv.ty; }
+  if k == VV_BOXK {
+    let t = val_type(v, &mut m, p, xv.a);
+    return intern(&mut m, p, TY_BOX, t);
+  }
+  if k == VV_BOXO { return intern(&mut m, p, TY_BOX, xv.ty); }
+  if k == VV_VEC { return intern(&mut m, p, TY_VEC, xv.ty); }
+  return intern(&mut m, p, TY_UNIT, 0);
+}
+
+/// `locked(l, f, args..)`: the contents are a fresh value about which only
+/// the invariants are known (another processor may have changed them since
+/// this one last looked). `f` gets them as its `&mut` first argument and
+/// must hand them back with the invariants holding again.
+fn vlocked(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VState) -> u64 {
+  let n = node_at(p.nodes, i);
+  let a0 = n.a;
+  let a1 = next_of(p, a0);
+  let lp = place_text(&mut v, p, a0);
+  open_path(&mut v, c, m, p, &mut st.env, lp);
+  let lv = vl_at(v, get_path(v, m, p, st.env, lp));
+  let h = cat_str(&mut v, lp, "_contents");
+  let inner = fresh_of(&mut v, c, m, p, inner_t(m, lv.ty), h);
+  let mut invs = vec_new[u64]();
+  invariant_terms(&mut v, c, &mut m, p, inner, &mut invs);
+  let mut k = 0;
+  while k < vec_len(invs) {
+    vec_push(&mut st.pc, u_at(invs, k));
+    k = k + 1;
+  }
+  vec_free(invs);
+  // The contents live in a variable no program can name, for the call.
+  if v.counter < U64_MAX {
+    v.counter = v.counter + 1;
+  }
+  let start = vec_len(v.pool);
+  push_str(&mut v, "locked*");
+  push_num(&mut v, v.counter);
+  let key = seal(&mut v, start);
+  let kt = tm_at(v, key);
+  vec_push(&mut st.env, Bind { s: vadd(kt.a, kt.b), e: kt.a, val: inner });
+  let mut args = vec_new[u64]();
+  vec_push(&mut args, 0);
+  let mut a = next_of(p, a1);
+  while a != 0 {
+    vec_push(&mut args, a);
+    a = next_of(p, a);
+  }
+  let an = node_at(p.nodes, a1);
+  let x = plain_inst(&mut m, plain_fn(p, an.s, an.e));
+  let res = vcall_args(&mut v, c, &mut m, p, i, args, key, &mut st, x);
+  vec_free(args);
+  let after = get_path(v, m, p, st.env, key);
+  let mut env = vec_new[Bind]();
+  k = 0;
+  while k < vec_len(st.env) {
+    let b = bind_at(st.env, k);
+    if !bind_named(v, p, b, kt.a, kt.b) {
+      vec_push(&mut env, b);
+    }
+    k = k + 1;
+  }
+  let prev = st.env;
+  st.env = env;
+  vec_free(prev);
+  let mut outs = vec_new[u64]();
+  invariant_terms(&mut v, c, &mut m, p, after, &mut outs);
+  k = 0;
+  while k < vec_len(outs) {
+    prove(&mut v, st, u_at(outs, k));
+    k = k + 1;
+  }
+  vec_free(outs);
+  return res;
+}
+
+/// `smp_run(f, args..)`: this processor's call is an ordinary call. The
+/// other processors' calls get the same shared arguments and their own
+/// `Cpu` and `Mmu`, with the kernel's tables in CR3, so `f`'s precondition
+/// must hold for those too.
+fn vsmp_run(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VState) -> u64 {
+  let n = node_at(p.nodes, i);
+  let a0 = n.a;
+  let fnode = node_at(p.nodes, a0);
+  let x = plain_inst(&mut m, plain_fn(p, fnode.s, fnode.e));
+  let xi = inst_at(m, x);
+  let d = node_at(p.nodes, xi.def);
+  if d.c != 0 {
+    let mut pre = vec_new[Bind]();
+    let mut q = d.a;
+    let mut a = next_of(p, a0);
+    while q != 0 && a != 0 {
+      let qn = node_at(p.nodes, q);
+      let pt = base_t(m, conv(&mut m, p, qn.a, x, q));
+      let mut y = 0;
+      if kind_t(m, pt) == TY_CPU {
+        y = mk_obj(&mut v, m, pt, 0, 0, 0);
+      } else if kind_t(m, pt) == TY_MMU {
+        y = mk_obj(&mut v, m, pt, v.t_flimit, 0, 0);
+      } else {
+        y = eval(&mut v, c, &mut m, p, a, &mut st, 0);
+      }
+      env_put(&mut pre, p, qn.s, qn.e, y);
+      q = qn.next;
+      a = next_of(p, a);
+    }
+    let mut b = vec_new[Bnd]();
+    let mut r = d.c;
+    while r != 0 {
+      let t = spec_tm(&mut v, c, &mut m, p, r, pre, pre, false, 0, &mut b);
+      prove(&mut v, st, t);
+      r = next_of(p, r);
+    }
+    vec_free(b);
+    vec_free(pre);
+  }
+  let mut args = vec_new[u64]();
+  let mut a = next_of(p, a0);
+  while a != 0 {
+    vec_push(&mut args, a);
+    a = next_of(p, a);
+  }
+  let res = vcall_args(&mut v, c, &mut m, p, i, args, 0, &mut st, x);
+  vec_free(args);
+  return res;
+}
+
 /// A call of a user function (instance `x`): only its contract is used.
-fn vuser_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64, args: &Vec[u64], vals: &Vec[u64], st: &mut VState) -> u64 {
+fn vuser_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64, args: &Vec[u64], vals: &Vec[u64], hid: u64, st: &mut VState) -> u64 {
   let xi = inst_at(m, x);
   let d = node_at(p.nodes, xi.def);
   let mut pre = vec_new[Bind]();
@@ -2587,9 +2803,13 @@ fn vuser_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64, args: &
   while q != 0 && j < SRC_MAX {
     let qn = node_at(p.nodes, q);
     let pt = conv(&mut m, p, qn.a, x, q);
-    let an = node_at(p.nodes, u_at(args, j));
-    if kind_t(m, pt) == TY_MUTREF && an.kind == E_MUTBORROW {
-      let path = list_text(&mut v, p, an.a);
+    let aj = u_at(args, j);
+    let an = node_at(p.nodes, aj);
+    if kind_t(m, pt) == TY_MUTREF && (aj == 0 || an.kind == E_MUTBORROW) {
+      let mut path = hid;
+      if aj != 0 {
+        path = list_text(&mut v, p, an.a);
+      }
       let start = u_at(v.sum_start, x);
       let end = vadd(start, u_at(v.sum_n, x));
       let mut k = start;
@@ -2710,6 +2930,31 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     let t = app2(&mut v, op, term(v, x0), term(v, x1));
     let r = wrap_term(&mut v, m, int_op_ty(c, m, v.env, i), t);
     return mk_u(&mut v, r);
+  }
+  if name_is(p, i, "lock_new") {
+    let mut invs = vec_new[u64]();
+    invariant_terms(&mut v, c, &mut m, p, x0, &mut invs);
+    let mut k = 0;
+    while k < vec_len(invs) {
+      prove(&mut v, st, u_at(invs, k));
+      k = k + 1;
+    }
+    vec_free(invs);
+    let t = val_type(v, &mut m, p, x0);
+    let lt = intern(&mut m, p, TY_LOCK, t);
+    return mk_obj(&mut v, m, lt, 0, 0, 0);
+  }
+  if name_is(p, i, "lock_end") {
+    let r = fresh_of_named(&mut v, c, m, p, inner_t(m, a0.ty), "unlocked");
+    let mut invs = vec_new[u64]();
+    invariant_terms(&mut v, c, &mut m, p, r, &mut invs);
+    let mut k = 0;
+    while k < vec_len(invs) {
+      vec_push(&mut st.pc, u_at(invs, k));
+      k = k + 1;
+    }
+    vec_free(invs);
+    return r;
   }
   if name_is(p, i, "unbox") {
     if a0.kind == VV_BOXK {
@@ -3785,17 +4030,35 @@ fn changed_in_expr(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, ou
 /// `changed_in_expr` for call `i` (of instance `inst`, 0 for a plain call).
 fn call_changes(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64, out: &mut Vec[Chg]) {
   let n = node_at(p.nodes, i);
-  let bi = inst == 0 && is_builtin_name(c, p, n.s, n.e);
-  let keep = bi && shape_keeping(p, i);
+  // `locked(l, f, ..)` and `smp_run(f, ..)` lend their trailing arguments
+  // to `f`: shift them onto its parameters.
+  // (`j` counts parameters of the function that receives the arguments.)
+  let mut fnode = i;
+  let mut skip = 0;
+  let mut j = 0;
+  if inst == 0 && name_is(p, i, "locked") && n.a != 0 && kind_of(p, next_of(p, n.a)) == E_VAR {
+    fnode = next_of(p, n.a);
+    skip = 2;
+    j = 1;
+  } else if inst == 0 && name_is(p, i, "smp_run") && kind_of(p, n.a) == E_VAR {
+    fnode = n.a;
+    skip = 1;
+  }
+  let fname = node_at(p.nodes, fnode);
+  let bi = inst == 0 && is_builtin_name(c, p, fname.s, fname.e);
+  let keep = bi && shape_keeping(p, fnode);
   let mut x = inst;
   if !bi && x == 0 {
-    let d = plain_fn(p, n.s, n.e);
+    let d = plain_fn(p, fname.s, fname.e);
     if d != 0 {
       x = plain_inst(&mut m, d);
     }
   }
   let mut a = n.a;
-  let mut j = 0;
+  while skip > 0 && a != 0 {
+    a = next_of(p, a);
+    skip = skip - 1;
+  }
   while a != 0 && j < SRC_MAX {
     let an = node_at(p.nodes, a);
     if an.kind == E_MUTBORROW {
