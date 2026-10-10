@@ -95,14 +95,14 @@ The layer is written in Bastio, so it is held to the same memory-safety proofs a
 ## Performance
 
 Safety must not cost speed at run time; that is the point of proving it instead of checking it. Three things are tracked:
-1. **Generated code.** Compare Bastio programs with equivalent hand-written C (same algorithm, `-O2`). A first measurement (2026-10-10, array sum, sieve, binary tree, vector push) found tight loops on par with C, and two runtime gaps: `Vec` growth (`bst_vec_grow` uses `calloc` plus a byte-by-byte copy, about 3x slower pushes; `realloc` fixes it) and allocation order in tree building (about 1.4x). A native backend (v3) would lose the C compiler's optimizations, so it must be measured against the C backend before it replaces it.
+1. **Generated code.** Compare Bastio programs with equivalent hand-written C (same algorithm, `-O2`). A first measurement (2026-10-10, array sum, sieve, binary tree, vector push) found tight loops on par with C, and two runtime gaps: `Vec` growth (`bst_vec_grow` used `calloc` plus a byte-by-byte copy, about 3x slower pushes; fixed with `realloc`, now 1.04x) and allocation order in tree building (about 1.4x). A native backend (v3) would lose the C compiler's optimizations, so it must be measured against the C backend before it replaces it.
 2. **Compile time.** Most of it is Z3. Track proof time per file and the slowest obligations, so a spec that makes the solver crawl is noticed when it lands, not months later. Self-hosting (v2) must stay practical: stage1 compiling itself should take seconds, not minutes.
 3. **Kernel paths.** In BastiOS: system-call round trip, context switch, page fault to resolution, process spawn and teardown.
 
-- [ ] Fix `Vec` growth in the C prelude (`realloc` instead of `calloc` plus a byte copy)
+- [x] Fix `Vec` growth in the C prelude (`realloc` instead of `calloc` plus a byte copy): `bench/vec` went from 2.96x to 1.04x the time of C
 - [ ] BastiOS: `user_byte` walks all four page-table levels for every byte it copies, and the kernel allocator scans its free list linearly and zeroes every page; measure, then batch per page
-- [ ] `bench/`, starting from the programs of the first measurement (sum, sieve, tree, vec, each with its C twin), with a script that prints one line per measurement and a script that prints one line per measurement (generated-code time vs C, compile and proof time per file)
-- [ ] CI runs it and keeps the numbers as an artifact, so a regression shows up next to the change that caused it
+- [x] `bench/`, starting from the programs of the first measurement (sum, sieve, tree, vec, each with its C twin), with a script that prints one line per measurement (generated-code time vs C, compile and proof time per file): `bench/run.sh`
+- [x] CI runs it and keeps the numbers as an artifact (`bench-<sha>`), so a regression shows up next to the change that caused it
 - [ ] stage1 data structures: the phases written so far use linear searches (types, instances, places, variables). Fine for today's sources (checking all of stage1, about 6,000 lines, takes 47 ms, the same as stage0); replace with hashing or indexed lookups before self-compilation if measurements show they dominate
 - [ ] BastiOS: a `bench` shell command (or test mode) that times the kernel paths above in QEMU (relative numbers only; QEMU timing is not hardware timing)
 

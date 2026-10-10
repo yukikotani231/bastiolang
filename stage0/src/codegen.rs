@@ -171,6 +171,14 @@ static bst_buf bst_alloc(uint64_t n) {
     return b;
 }
 static inline void bst_free(bst_buf b) { free(b.data); }
+/* Grow a block of `old` words to `n` words, keeping its contents; the new
+ * words are not zeroed (only Vec uses it, and never reads past its length). */
+static uint64_t *bst_regrow(uint64_t *p, uint64_t old, uint64_t n) {
+    (void)old;
+    uint64_t *q = (uint64_t *)realloc(p, (n ? n : 1) * sizeof(uint64_t));
+    if (!q) { fputs("Bastio: out of memory\n", stderr); abort(); }
+    return q;
+}
 static inline void bst_print(uint64_t v) { printf("%llu\n", (unsigned long long)v); }
 
 static bst_bytes bst_balloc(uint64_t n) {
@@ -406,6 +414,16 @@ static void bst_bfree(bst_bytes b) {
     bst_buf w = { (b.len + 7) / 8, (uint64_t *)b.data };
     bst_free(w);
 }
+/* Grow a block of `old` words to `n` words, keeping its contents. */
+static uint64_t *bst_regrow(uint64_t *p, uint64_t old, uint64_t n) {
+    uint64_t *q = bst_alloc(n).data;
+    if (p) {
+        for (uint64_t i = 0; i < old; i++) q[i] = p[i];
+        bst_buf b = { old, p };
+        bst_free(b);
+    }
+    return q;
+}
 "#;
 
 // Child processes (hosted only): fork and exec with a pipe each way.
@@ -509,11 +527,7 @@ static void bst_vec_release(bst_vec v, uint64_t size) {
 static void bst_vec_grow(bst_vec *v, uint64_t size) {
     uint64_t ncap = v->cap ? v->cap * 2 : 4;
     uint64_t bytes = ncap > (UINT64_C(1) << 60) / size ? ~UINT64_C(0) - 8 : ncap * size;
-    bst_buf nb = bst_alloc((bytes + 7) / 8);
-    unsigned char *d = (unsigned char *)nb.data, *s = (unsigned char *)v->data;
-    for (uint64_t i = 0; i < v->len * size; i++) d[i] = s[i];
-    bst_vec_release(*v, size);
-    v->data = nb.data;
+    v->data = bst_regrow((uint64_t *)v->data, (v->cap * size + 7) / 8, (bytes + 7) / 8);
     v->cap = ncap;
 }
 static inline void bst_bset(bst_bytes *b, uint64_t i, uint64_t v) { b->data[i] = (unsigned char)v; }
