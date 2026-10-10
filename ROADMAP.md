@@ -78,7 +78,7 @@ Started early, alongside v1, because the kernel is the primary target and it sha
 - [x] A small kernel (BastiOS v0.2): boot, a page allocator whose bitmap is proved to agree with the pool, page tables, user processes with preemptive scheduling, system calls, fault isolation; tearing a process down returns every page
 - [x] A file system (BastiOS, 2026-10-10): an in-memory file system whose data pages are owned by its files (removing a file gives each page back exactly once), a per-process open-file table, and open/close/read/write/seek/unlink/stat/readdir system calls. User programs make them through three generic system calls (`sys_call`, `sys_send`, `sys_recv`), so a new kernel call needs no compiler change; the Linux layer (v4) will use the same route
 - [x] Files on a disk (BastiOS, 2026-10-10): a legacy ATA PIO driver whose port accesses are proved to stay inside its `PortIo` capabilities, and a disk file system (superblock, 32-entry directory, a fixed 1 MiB slot per file) under the same file layer as the in-memory one. Names under `disk/` survive reboots. No journal
-- [ ] Running programs from files instead of images built into the kernel
+- [x] Running programs from files instead of images built into the kernel (BastiOS, 2026-10-10): Linux `execve` loads an ELF file from memory or `disk/` through the file layer, every header field and segment read proved to stay inside the file (bastios #23)
 - [x] `Ports` / `PortIo`: a driver claims its I/O ports once and can touch only those; no two owners per port. BastiOS's UART, PIC and timer drivers moved from the C prelude and `platform.c` into Bastio, and so did the interrupt acknowledgement (from the trap entry assembly into the kernel loop)
 - [x] `MmioSpace` / `Mmio`: memory-mapped device registers in the 3-4 GiB device window, claimed once like ports, with bounds and alignment proved. BastiOS maps the window uncached at boot and reads the HPET through it (the local APIC still lives in trusted C until SMP moves it)
 - [x] DMA buffers as linear in-flight tokens (docs/concurrency.md): `dma_lend` turns a page into a `Dma` that cannot be freed, mapped or reused until `dma_take`, and is touched only with volatile, aligned accesses. When the device is done is the driver's word
@@ -100,9 +100,13 @@ What the "safe libraries callable from C" target needs (Scope, design consequenc
 ## v4: Linux compatibility
 
 Decided 2026-10-10: BastiOS should run existing Linux programs, not only programs written in Bastio. The way in is a Linux system-call compatibility layer.
-- [ ] Load static x86-64 Linux ELF binaries into a user address space
-- [ ] Accept the Linux system-call ABI (`syscall` instruction, Linux numbers and argument registers) next to the native one
-- [ ] Translate the common calls (`read`, `write`, `open`, `close`, `mmap`, `brk`, `exit`, `fork`/`execve`, ...) onto BastiOS services, growing until a static busybox shell runs
+- [x] Load static x86-64 Linux ELF binaries into a user address space (BastiOS, 2026-10-10): fixed-address executables inside the user window and static PIEs, started with the Linux initial stack (argc, argv, envp, auxv). Every header field is untrusted and every read and copy is proved in bounds. No dynamic linking
+- [x] Accept the Linux system-call ABI (`syscall` instruction, Linux numbers and argument registers) next to the native one (BastiOS, 2026-10-10). The entry stub is the only new trusted assembly
+- [x] Translate the common calls onto BastiOS services until a static busybox shell runs (BastiOS, 2026-10-10): BusyBox 1.36.1 `ash`, built unmodified against musl, runs interactively on the console with fork/execve/wait4, pipes, redirection and the environment, and BusyBox `ls`, `cat`, `wc`, `head`, `rm` and `cp` work. The calls are listed in the bastios README. They include a terminal line discipline, refcounted open file descriptions shared by dup and fork, pipes, getdents64, stat/fstat, brk/mmap, per-process FPU state, and UDP sockets over the kernel's own
+- [ ] A user window larger than 2 MiB (one level-1 table today), so bigger programs and heaps fit
+- [ ] Copy-on-write fork (fork copies the whole window today) and real blocking in poll, pipes and sockets (they wait by restarting the call)
+- [ ] Signals (none are delivered yet: `rt_sigaction` is accepted and ignored), so Ctrl-C and `kill` reach Linux programs
+- [ ] Subdirectories, once the file layer has them (Linux paths are one flat directory plus `/bin`)
 
 The layer is written in Bastio, so it is held to the same memory-safety proofs as the rest of the kernel. This is the opposite of fz, where the compatibility layer was assembly kept outside verification. User programs themselves are not trusted; page tables isolate them, so a misbehaving Linux binary can only fault itself. Only the small entry stub (saving registers on `syscall`) belongs to the trusted assembly base.
 
