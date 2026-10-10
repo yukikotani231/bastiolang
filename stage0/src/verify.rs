@@ -26,6 +26,9 @@
 //   PageTable  id, level, used[i] (which of its 512 slots own something)
 //   Pool       has[i] (the page numbers it can still hand out), size
 //   Mmu        root (the id of the table in CR3; KROOT for the kernel's own)
+//   Ports      free[p] (the I/O ports nobody has claimed yet)
+//   PortIo     base, count (the ports base .. base+count it owns; always
+//              within the 65536 ports)
 // A struct value is the values of its fields; places like `p.root` read and
 // write inside it.
 // The builtins' preconditions over this state (see `builtin`) are what make
@@ -56,6 +59,8 @@ const KROOT: &str = "65536";
 /// There is one pool per program, so its size is one global ghost constant.
 /// Every page number is below it: pages only ever come from `pool_take`.
 const POOLSIZE: &str = "POOLSIZE";
+/// The number of x86 I/O ports: a PortIo's ports are all below it.
+const PORT_LIMIT: &str = "65536";
 const NO_BOOL: &str = "((as const (Array Int Bool)) false)";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -255,6 +260,8 @@ fn ghost_fields(t: &Type) -> &'static [(&'static str, bool, &'static str)] {
         Type::PageTable => &[("id", false, "pt_id"), ("level", false, "pt_level"), ("used", true, "")],
         Type::Pool => &[("has", true, ""), ("size", false, "pool_size")],
         Type::Mmu => &[("root", false, "mmu_root")],
+        Type::Ports => &[("free", true, "")],
+        Type::PortIo => &[("base", false, "port_base"), ("count", false, "port_count")],
         _ => &[],
     }
 }
@@ -262,12 +269,13 @@ fn ghost_fields(t: &Type) -> &'static [(&'static str, bool, &'static str)] {
 /// Ghost fields a loop keeps when the object is changed only by builtins
 /// that never change them (a page table keeps its id and level).
 fn kept_by_builtins(t: &Type, field: &str) -> bool {
-    matches!((t, field), (Type::Frame, "id") | (Type::PageTable, "id") | (Type::PageTable, "level") | (Type::Pool, "size"))
+    matches!((t, field), (Type::Frame, "id") | (Type::PageTable, "id") | (Type::PageTable, "level") | (Type::Pool, "size") | (Type::PortIo, "base") | (Type::PortIo, "count"))
 }
 
 /// Builtins whose `&mut` argument keeps the fields above.
 const SHAPE_KEEPING: &[&str] =
-    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pool_take", "pool_give", "frame_write", "frame_write8", "cpu_set", "cpu_run", "cpu_idle", "cpu_fpu_save", "cpu_fpu_load"];
+    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pool_take", "pool_give", "frame_write", "frame_write8", "cpu_set", "cpu_run", "cpu_idle", "cpu_fpu_save", "cpu_fpu_load",
+      "pio_in8", "pio_in16", "pio_in32", "pio_out8", "pio_out16", "pio_out32"];
 
 /// What a call may do to one `&mut` argument: the places under it that may
 /// change, as paths relative to the parameter (`""` is the parameter itself,
@@ -447,7 +455,9 @@ impl<'p> Verifier<'p> {
     fn fresh_field(&mut self, t: &Type, field: &str, hint: &str) -> Result<String, Diag> {
         let h = format!("{}_{}", hint, field);
         match (t, field) {
-            (_, "used") | (_, "has") => self.fresh_array(&h, "Bool"),
+            (_, "used") | (_, "has") | (_, "free") => self.fresh_array(&h, "Bool"),
+            (Type::PortIo, "base") => self.fresh_int(&h, "0", PORT_LIMIT),
+            (Type::PortIo, "count") => self.fresh_int(&h, "0", PORT_LIMIT),
             (Type::Frame, "id") | (Type::PageTable, "id") => {
                 let n = self.fresh_int(&h, "0", FRAME_LIMIT)?;
                 self.smt(&format!("(assert (< {} {}))", n, POOLSIZE))?;
@@ -513,6 +523,9 @@ impl<'p> Verifier<'p> {
                 let mut fs = Vec::new();
                 for (f, _, _) in ghost_fields(t) {
                     fs.push(self.fresh_field(t, f, hint)?);
+                }
+                if *t == Type::PortIo {
+                    self.smt(&format!("(assert (<= (+ {} {}) {}))", fs[0], fs[1], PORT_LIMIT))?;
                 }
                 Ok(Val::Obj(t.clone(), fs))
             }
@@ -629,6 +642,11 @@ impl<'p> Verifier<'p> {
                         v.field("size")
                     )),
                     (Type::Mmu, v) => st.pc.push(format!("(= {} {})", v.field("root"), KROOT)),
+                    (Type::Ports, v) => st.pc.push(format!(
+                        "(forall ((k Int)) (= (select {} k) (and (<= 0 k) (< k {}))))",
+                        v.field("free"),
+                        PORT_LIMIT
+                    )),
                     _ => {}
                 }
             }
@@ -1404,6 +1422,49 @@ impl<'p> Verifier<'p> {
                 }
             }
 
+            // ---- I/O ports ----
+            "port_claim" => {
+                let (p, b, c) = (&vals[0], vals[1].term(), vals[2].term());
+                let inr = format!("(and (<= {b} k) (< k (+ {b} {c})))");
+                self.need(st, format!("(<= (+ {} {}) {})", b, c, PORT_LIMIT), pos, "E-VERIFY-BOUNDS",
+                    format!("that the ports `{}` .. `{} + {}` exist (`{} + {} <= 65536`)", ra(1), ra(1), ra(2), ra(1), ra(2)))?;
+                self.need(st, format!("(forall ((k Int)) (=> {} (select {} k)))", inr, p.field("free")), pos, "E-VERIFY-OWN",
+                    format!("that nobody has claimed any of these ports (`port_free({}, k)` for each): two owners could drive one device", ra(0)))?;
+                // A lambda, not a fresh array with a quantified definition:
+                // reads of it reduce directly, so chains of claims stay
+                // quantifier-free.
+                let nf = format!("(lambda ((k Int)) (and (select {} k) (not {})))", p.field("free"), inr);
+                self.put_back(&args[0], Val::Obj(Type::Ports, vec![nf]), st);
+                Ok(Val::Obj(Type::PortIo, vec![b.to_string(), c.to_string()]))
+            }
+            "port_release" => {
+                let (p, io) = (&vals[0], &vals[1]);
+                let inr = format!("(and (<= {b} k) (< k (+ {b} {c})))", b = io.field("base"), c = io.field("count"));
+                let nf = format!("(lambda ((k Int)) (or (select {} k) {}))", p.field("free"), inr);
+                self.put_back(&args[0], Val::Obj(Type::Ports, vec![nf]), st);
+                Ok(Val::Unit)
+            }
+            "port_base" => Ok(Val::U(vals[0].field("base"))),
+            "port_count" => Ok(Val::U(vals[0].field("count"))),
+            "pio_in8" | "pio_in16" | "pio_in32" | "pio_out8" | "pio_out16" | "pio_out32" => {
+                let (bytes, max) = match &name[name.len() - 1..] {
+                    "8" => (1, "255"),
+                    "6" => (2, "65535"),
+                    _ => (4, "4294967295"),
+                };
+                let (io, off) = (&vals[0], vals[1].term());
+                self.need(st, format!("(<= (+ {} {}) {})", off, bytes, io.field("count")), pos, "E-VERIFY-BOUNDS",
+                    format!("that port offset `{}` is within `{}` (`{} + {} <= port_count({})`)", ra(1), ra(0), ra(1), bytes, ra(0)))?;
+                if name.starts_with("pio_out") {
+                    self.need(st, format!("(<= {} {})", vals[2].term(), max), pos, "E-VERIFY-BYTE",
+                        format!("that `{}` fits in {} bits (`<= {}`)", ra(2), bytes * 8, max))?;
+                    return Ok(Val::Unit);
+                }
+                let v = self.fresh_u64(name)?;
+                st.pc.push(format!("(<= {} {})", v.term(), max));
+                Ok(v)
+            }
+
             // ---- MMU and CPU ----
             "mmu_switch" => {
                 let t = &vals[1];
@@ -1587,6 +1648,9 @@ impl<'p> Verifier<'p> {
                     "pt_level" => v.field("level"),
                     "pool_size" => v.field("size"),
                     "mmu_root" => v.field("root"),
+                    "port_base" => v.field("base"),
+                    "port_count" => v.field("count"),
+                    "port_free" => format!("(select {} {})", v.field("free"), self.spec(&args[1], sc, bound)?),
                     "pt_used" => format!("(select {} {})", v.field("used"), self.spec(&args[1], sc, bound)?),
                     "pool_has" => format!("(select {} {})", v.field("has"), self.spec(&args[1], sc, bound)?),
                     _ => unreachable!("checked: {}", name),

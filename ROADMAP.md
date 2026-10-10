@@ -74,8 +74,10 @@ Started early, alongside v1, because the kernel is the primary target and it sha
 - [x] `--target user` for programs under a Bastio kernel
 - [x] A small kernel (BastiOS v0.2): boot, a page allocator whose bitmap is proved to agree with the pool, page tables, user processes with preemptive scheduling, system calls, fault isolation; tearing a process down returns every page
 - [x] A file system (BastiOS, 2026-10-10): an in-memory file system whose data pages are owned by its files (removing a file gives each page back exactly once), a per-process open-file table, and open/close/read/write/seek/unlink/stat/readdir system calls. User programs make them through three generic system calls (`sys_call`, `sys_send`, `sys_recv`), so a new kernel call needs no compiler change; the Linux layer (v4) will use the same route
-- [ ] Files on a disk: a block device driver (after `PortIo`/`Mmio` below) and a file system on it, under the same file layer as the in-memory one (BastiOS `src/fs.bastio`); then running programs from files instead of images built into the kernel
-- [ ] More hardware capabilities: `PortIo`, `Mmio[R]`, `IrqOff` (port and register widths come from sized integers, v1 item 8), so the UART, PIC and timer code moves from the C prelude and `platform.c` into Bastio
+- [ ] Files on a disk: a block device driver (legacy ATA through `PortIo` needs no `Mmio`) and a file system on it, under the same file layer as the in-memory one (BastiOS `src/fs.bastio`); then running programs from files instead of images built into the kernel
+- [x] `Ports` / `PortIo`: a driver claims its I/O ports once and can touch only those; no two owners per port. BastiOS's UART, PIC and timer drivers moved from the C prelude and `platform.c` into Bastio, and so did the interrupt acknowledgement (from the trap entry assembly into the kernel loop)
+- [ ] `Mmio[R]`: memory-mapped device registers (local APIC, HPET, PCI BARs), with the same claim-once rule over physical address ranges, and DMA buffers as linear in-flight tokens (docs/concurrency.md)
+- [ ] `IrqOff` and interrupt handlers (docs/concurrency.md, step 4). Not needed while BastiOS treats interrupts as events with interrupts off in the kernel
 - [ ] Allocation failure returned in the type (no abort on OOM). Enums exist now (v1 item 3); what is left is changing `alloc`, `pool_take` and friends to return them
 - [ ] Native x86-64 backend, without going through C (removes the C compiler from the trusted base)
 

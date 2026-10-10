@@ -120,8 +120,8 @@ All files share one namespace, as in C: a function, type or constant name must b
 
 | Target | `main` may take |
 | --- | --- |
-| `hosted` | `&mut Serial`, `&mut Pool`, `&mut Host` |
-| `kernel` | `&mut Serial`, `&mut Pool`, `&mut Mmu`, `&mut Cpu` |
+| `hosted` | `&mut Serial`, `&mut Pool`, `&mut Host`, `&mut Ports` |
+| `kernel` | `&mut Serial`, `&mut Pool`, `&mut Mmu`, `&mut Cpu`, `&mut Ports` |
 | `user` | `&mut Serial` (and must return `u64`) |
 
 The older form `fn main(con: Serial) -> Serial` is still accepted outside user programs.
@@ -157,7 +157,7 @@ fn main(con: &mut Serial) -> u64 {
 | `Box[T]` | An owning pointer to a `T` on the heap; the only way a type can contain itself |
 | A struct with a linear field, an enum with a linear payload | |
 | `Host`, `Child` | The host system, and a child process (hosted target only) |
-| `Serial`, `Pool`, `Frame`, `PageTable`, `Mmu`, `Cpu` | Capabilities: the console, physical pages, page tables, the MMU and the CPU's user context. See [Kernel capabilities](#kernel-capabilities) |
+| `Serial`, `Pool`, `Frame`, `PageTable`, `Mmu`, `Cpu`, `Ports`, `PortIo` | Capabilities: the console, physical pages, page tables, the MMU, the CPU's user context and I/O ports. See [Kernel capabilities](#kernel-capabilities) |
 
 **Borrows** are allowed only as parameter types, so a borrow can never be stored, returned or outlive the call:
 
@@ -687,7 +687,7 @@ fn main(host: &mut Host) -> u64 {
 
 ## Kernel capabilities
 
-Hardware is reached only through capability types. There is no way to read or write memory through an integer address (ROADMAP invariant 1). Capabilities are linear, and `main` is handed the ones its target provides; they cannot be created. They carry **ghost state** that exists only in the proof: in the generated code a `Frame` or `PageTable` is a bare physical address, and `Serial`, `Mmu` and `Cpu` are empty.
+Hardware is reached only through capability types. There is no way to read or write memory through an integer address (ROADMAP invariant 1). Capabilities are linear, and `main` is handed the ones its target provides; they cannot be created. They carry **ghost state** that exists only in the proof: in the generated code a `Frame` or `PageTable` is a bare physical address, `Serial`, `Mmu`, `Cpu` and `Ports` are empty, and a `PortIo` is its base and count.
 
 | Type | Meaning |
 | --- | --- |
@@ -697,6 +697,8 @@ Hardware is reached only through capability types. There is no way to read or wr
 | `PageTable` | A page-table page at level 1 to 5. It owns the tables and pages its slots point to |
 | `Mmu` | The right to load CR3 (kernel only) |
 | `Cpu` | The CPU's saved user context and the right to enter user mode (kernel only) |
+| `Ports` | The x86 I/O port space: the right to claim each of the 65536 ports, once |
+| `PortIo` | A claimed range of I/O ports, owned: the only way to read or write them |
 
 Ghost accessors, usable in specifications:
 
@@ -708,6 +710,8 @@ Ghost accessors, usable in specifications:
 | `pool_has(p, i)` | The pool can still hand out page `i` |
 | `pool_size(p)` | Number of pages in the pool (also callable at run time) |
 | `mmu_root(m)` | The id of the table in CR3; `0x10000` while the kernel's own map is loaded |
+| `port_free(p, k)` | Nobody has claimed port `k`; `main` receives every port free |
+| `port_base(io)`, `port_count(io)` | The ports `io` owns, `port_base(io)` up to `port_base(io) + port_count(io)`, always within the 65536 ports (also callable at run time) |
 
 **Console** (all targets):
 
@@ -816,6 +820,38 @@ fn main(con: &mut Serial, mmu: &mut Mmu) {
 }
 ```
 
+**I/O ports** (kernel and hosted; hosted builds simulate the ports, each remembering the last value written, so drivers can be tested off the machine):
+
+| Builtin | Requires (proved) | Effect |
+| --- | --- | --- |
+| `port_claim(p: &mut Ports, base: u64, count: u64) -> PortIo` | `base + count <= 65536`; `port_free(p, k)` for every `k` in the range | Takes the ports out of `p` |
+| `port_release(p: &mut Ports, io: PortIo)` | | Gives them back |
+| `pio_in8` / `pio_in16` / `pio_in32(io: &mut PortIo, off: u64) -> u64` | `off + 1` / `2` / `4 <= port_count(io)` | `in` from port `port_base(io) + off`; the result fits the width |
+| `pio_out8` / `pio_out16` / `pio_out32(io: &mut PortIo, off: u64, v: u64)` | the same, and `v` fits the width | `out` to that port |
+
+Reads take `&mut` too: reading a device register changes the device (it pops a FIFO or acknowledges an interrupt). Claiming compiles to nothing and each access is one instruction. Ports nobody claimed cannot be touched, and two drivers never own the same port. What a device does with the values is not modelled.
+
+```bastio
+// expect-exit: 0
+// A driver owns the eight ports of a UART and touches only those.
+struct Uart { io: PortIo }
+
+fn uart_send(u: &mut Uart, b: u64)
+  requires port_count(u.io) == 8 && b <= 255
+  ensures port_count(u.io) == 8
+{
+  pio_out8(&mut u.io, 0, b);
+}
+
+fn main(ports: &mut Ports) -> u64 {
+  let mut u = Uart { io: port_claim(&mut ports, 0x3F8, 8) };
+  uart_send(&mut u, 65);
+  // port_claim(&mut ports, 0x3FC, 1) here would be E-VERIFY-OWN.
+  port_release(&mut ports, u.io);
+  return 0;
+}
+```
+
 **System calls** (user target only). Programs built with `--target user` run under BastiOS and have `sys_spawn(b: &Buf, from: u64, to: u64)` (start the program named by elements `from..to` of `b`, proved to be a range within `b`), `sys_wait(pid)`, `sys_kill(pid)`, `sys_yield()`, `sys_getpid()`, `sys_info(k)`, `sys_ps()` and `sys_poweroff()`.
 
 Calls the language does not know by name go through three generic builtins. The call number `n` and what the call does belong to the kernel (BastiOS defines its file system calls this way), so a new system call needs no compiler change:
@@ -910,14 +946,14 @@ Proofs:
 
 | Code | What is proved |
 | --- | --- |
-| `E-VERIFY-BOUNDS` | Every index is below its limit: buffer, byte, string and vector indices; `vec_pop` on a non-empty vector; page numbers below `pool_size`; words, bytes and slots of a page or table; `cpu_get` / `cpu_set` registers; the `sys_spawn` range; the `sys_send` length |
+| `E-VERIFY-BOUNDS` | Every index is below its limit: buffer, byte, string and vector indices; I/O port offsets within the claimed range; `vec_pop` on a non-empty vector; page numbers below `pool_size`; words, bytes and slots of a page or table; `cpu_get` / `cpu_set` registers; the `sys_spawn` range; the `sys_send` length |
 | `E-VERIFY-LEAK` | A vector of linear elements is empty when it is freed |
 | `E-VERIFY-OVERFLOW` | `+` and `*` results < 2^64 |
 | `E-VERIFY-UNDERFLOW` | `a - b` has `a >= b` |
 | `E-VERIFY-DIVZERO` | The divisor of `/` and `%` is not zero |
 | `E-VERIFY-ALLOC` | Allocation size <= 2^60 elements |
-| `E-VERIFY-BYTE` | A value stored as a byte (`serial_write`, `bset`, `frame_write8`) is `<= 255` |
-| `E-VERIFY-OWN` | A page is taken from the pool at most once; a table slot is empty before `pt_put` and used before `pt_take`; a table is empty before it is freed |
+| `E-VERIFY-BYTE` | A value stored as a byte (`serial_write`, `bset`, `frame_write8`, `pio_out8`) is `<= 255`; `pio_out16` / `pio_out32` values fit 16 / 32 bits |
+| `E-VERIFY-OWN` | A page is taken from the pool at most once; an I/O port has at most one owner; a table slot is empty before `pt_put` and used before `pt_take`; a table is empty before it is freed |
 | `E-VERIFY-PT` | Table levels line up; frames go only into level-1 tables; slot 0 of a top-level table (the kernel's map) is never touched |
 | `E-VERIFY-MMU` | The table in CR3 is never freed |
 | `E-VERIFY-REQUIRES` | The callee's `requires` |
@@ -933,7 +969,7 @@ Proofs:
 The compiler emits C, which a C compiler turns into machine code. The C contains no runtime checks: every check was discharged by a proof, and `tests/run.sh` verifies this for a sample program by inspecting the C.
 
 - **`--target hosted`** (the default) builds an ordinary program against the C library. `alloc`, `box` and vectors use `malloc`; running out of memory aborts. `Serial` is standard input and output. `Pool` is simulated with ordinary memory.
-- **`--target kernel`** emits freestanding C for bare-metal x86-64 that needs no C library. It provides `bst_kmain`, which initialises COM1 and calls `main`. The boot code that calls `bst_kmain`, and the trap entry code behind `cpu_run` and `cpu_idle`, live in the kernel's own repository (BastiOS). The prelude implements the console with port I/O on COM1, `alloc` and `free` with a fixed 8 MiB arena and an exact-size free list, `print` on the serial port, the pool (every page from the end of the kernel image to the end of RAM, at most 2^16), page-table entry encoding and CR3 loads. Running out of arena memory halts the machine.
+- **`--target kernel`** emits freestanding C for bare-metal x86-64 that needs no C library. It provides `bst_kmain`, which initialises COM1 (only when `main` takes `Serial`) and calls `main`. The boot code that calls `bst_kmain`, and the trap entry code behind `cpu_run` and `cpu_idle`, live in the kernel's own repository (BastiOS). The prelude implements the console with port I/O on COM1, `alloc` and `free` with a fixed 8 MiB arena and an exact-size free list, `print` on the serial port, the pool (every page from the end of the kernel image to the end of RAM, at most 2^16), page-table entry encoding and CR3 loads. Running out of arena memory halts the machine.
 - **`--target user`** emits freestanding C for a user program under BastiOS, entered at `bst_umain`. Its prelude implements the console and the `sys_*` builtins as `int 0x80` system calls, and `alloc` with a 64 KiB arena.
 
 On the freestanding targets `Bytes` come from the same arena as `Buf`.
@@ -955,4 +991,4 @@ What a program that `bastioc0` accepts is guaranteed: no out-of-bounds access, n
 
 ## Not in the language yet
 
-Planned, in [ROADMAP.md](../ROADMAP.md): concurrency (designed in [concurrency.md](concurrency.md)), integer types narrower than `u64`, `export fn` for calling Bastio from C, more hardware capabilities (`PortIo`, `Mmio`), allocation failure in the type, and a native x86-64 backend. Inference of type arguments, modules with qualified names, and hand-written lemmas for proofs Z3 cannot find are open questions.
+Planned, in [ROADMAP.md](../ROADMAP.md): concurrency (designed in [concurrency.md](concurrency.md)), integer types narrower than `u64`, `export fn` for calling Bastio from C, more hardware capabilities (`Mmio`, `IrqOff`), allocation failure in the type, and a native x86-64 backend. Inference of type arguments, modules with qualified names, and hand-written lemmas for proofs Z3 cannot find are open questions.

@@ -36,6 +36,13 @@ pub enum Type {
     /// The CPU's user-mode context: the right to enter user mode and the
     /// registers saved by the last trap. Linear; kernel target only.
     Cpu,
+    /// The I/O port space: the right to claim ranges of the 65536 x86 I/O
+    /// ports, each at most once. Linear; only `main` receives it. Kernel and
+    /// hosted targets (hosted simulates the ports).
+    Ports,
+    /// A claimed range of I/O ports, owned: the only way to read or write
+    /// them. Linear; given back with `port_release`.
+    PortIo,
     /// A user-defined struct. Linear when any field is linear; otherwise a
     /// plain value that is copied.
     Struct(String),
@@ -76,6 +83,8 @@ impl Type {
             Type::Pool => "Pool".into(),
             Type::Mmu => "Mmu".into(),
             Type::Cpu => "Cpu".into(),
+            Type::Ports => "Ports".into(),
+            Type::PortIo => "PortIo".into(),
             Type::Struct(n) | Type::Enum(n) => n.clone(),
             Type::Box(t) => format!("Box[{}]", t.name()),
             Type::Vec(t) => format!("Vec[{}]", t.name()),
@@ -86,7 +95,7 @@ impl Type {
     }
     pub fn is_linear(&self) -> bool {
         match self {
-            Type::Buf | Type::Bytes | Type::Host | Type::Child | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu | Type::Box(_) | Type::Vec(_) => true,
+            Type::Buf | Type::Bytes | Type::Host | Type::Child | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu | Type::Ports | Type::PortIo | Type::Box(_) | Type::Vec(_) => true,
             Type::Struct(n) => struct_def(n).map_or(false, |d| d.fields.iter().any(|f| f.1.is_linear())),
             Type::Enum(n) => enum_def(n).map_or(false, |d| d.variants.iter().any(|v| v.1.as_ref().map_or(false, |t| t.is_linear()))),
             _ => false,

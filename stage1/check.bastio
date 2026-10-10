@@ -130,6 +130,8 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   let pol = prim(&mut m, p, TY_POOL);
   let mmu = prim(&mut m, p, TY_MMU);
   let cpu = prim(&mut m, p, TY_CPU);
+  let prt = prim(&mut m, p, TY_PORTS);
+  let pio = prim(&mut m, p, TY_PORTIO);
   let rbuf = ref_to(&mut m, p, buf);
   let rbyt = ref_to(&mut m, p, byt);
   let mbyt = mut_to(&mut m, p, byt);
@@ -148,6 +150,9 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   let mmmu = mut_to(&mut m, p, mmu);
   let rcpu = ref_to(&mut m, p, cpu);
   let mcpu = mut_to(&mut m, p, cpu);
+  let mprt = mut_to(&mut m, p, prt);
+  let rpio = ref_to(&mut m, p, pio);
+  let mpio = mut_to(&mut m, p, pio);
   bsig(&mut c, "alloc", AV_ALL, 1, u, 0, 0, 0, buf);
   bsig(&mut c, "len", AV_ALL, 1, rbuf, 0, 0, 0, u);
   bsig(&mut c, "get", AV_ALL, 2, rbuf, u, 0, 0, u);
@@ -199,6 +204,16 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   bsig(&mut c, "cpu_fpu_save", AV_KERNEL, 2, mcpu, mfrm, 0, 0, un);
   bsig(&mut c, "cpu_fpu_load", AV_KERNEL, 2, mcpu, rfrm, 0, 0, un);
   bsig(&mut c, "cpu_count", AV_KERNEL, 1, rcpu, 0, 0, 0, u);
+  bsig(&mut c, "port_claim", AV_MEM, 3, mprt, u, u, 0, pio);
+  bsig(&mut c, "port_release", AV_MEM, 2, mprt, pio, 0, 0, un);
+  bsig(&mut c, "port_base", AV_MEM, 1, rpio, 0, 0, 0, u);
+  bsig(&mut c, "port_count", AV_MEM, 1, rpio, 0, 0, 0, u);
+  bsig(&mut c, "pio_in8", AV_MEM, 2, mpio, u, 0, 0, u);
+  bsig(&mut c, "pio_in16", AV_MEM, 2, mpio, u, 0, 0, u);
+  bsig(&mut c, "pio_in32", AV_MEM, 2, mpio, u, 0, 0, u);
+  bsig(&mut c, "pio_out8", AV_MEM, 3, mpio, u, u, 0, un);
+  bsig(&mut c, "pio_out16", AV_MEM, 3, mpio, u, u, 0, un);
+  bsig(&mut c, "pio_out32", AV_MEM, 3, mpio, u, u, 0, un);
   bsig(&mut c, "sys_spawn", AV_USER, 3, rbuf, u, u, 0, u);
   bsig(&mut c, "sys_wait", AV_USER, 1, u, 0, 0, 0, u);
   bsig(&mut c, "sys_kill", AV_USER, 1, u, 0, 0, 0, u);
@@ -217,6 +232,9 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   ghost(&mut c, "pool_has", pol, true, b);
   ghost(&mut c, "pool_size", pol, false, u);
   ghost(&mut c, "mmu_root", mmu, false, u);
+  ghost(&mut c, "port_base", pio, false, u);
+  ghost(&mut c, "port_count", pio, false, u);
+  ghost(&mut c, "port_free", prt, true, b);
   field_types(&mut c, &mut m, p);
   return c;
 }
@@ -390,7 +408,7 @@ fn def_node(m: &Mono, p: &Parser, x: u64) -> Node {
 /// Is a value of type `t` linear (must it be consumed exactly once)?
 fn ck_linear(c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
   let k = kind_t(m, t);
-  if (k >= TY_BUF && k <= TY_CPU) || k == TY_BOX || k == TY_VEC {
+  if (k >= TY_BUF && k <= TY_PORTIO) || k == TY_BOX || k == TY_VEC {
     return true;
   }
   if k == TY_STRUCT || k == TY_ENUM {
@@ -905,7 +923,7 @@ fn is_reserved_type(p: &Parser, s: u64, e: u64) -> bool {
     || span_is(p, s, e, "Buf") || span_is(p, s, e, "Bytes") || span_is(p, s, e, "Host")
     || span_is(p, s, e, "Child") || span_is(p, s, e, "Serial") || span_is(p, s, e, "Frame")
     || span_is(p, s, e, "PageTable") || span_is(p, s, e, "Pool") || span_is(p, s, e, "Mmu")
-    || span_is(p, s, e, "Cpu");
+    || span_is(p, s, e, "Cpu") || span_is(p, s, e, "Ports") || span_is(p, s, e, "PortIo");
 }
 
 /// Struct and enum instances: no reserved names, known field and payload
@@ -982,9 +1000,9 @@ fn is_cap(target: u64, k: u64) -> bool {
     return k == TY_SERIAL;
   }
   if target == TARGET_KERNEL {
-    return k == TY_SERIAL || k == TY_POOL || k == TY_MMU || k == TY_CPU;
+    return k == TY_SERIAL || k == TY_POOL || k == TY_MMU || k == TY_CPU || k == TY_PORTS;
   }
-  return k == TY_SERIAL || k == TY_POOL || k == TY_HOST;
+  return k == TY_SERIAL || k == TY_POOL || k == TY_HOST || k == TY_PORTS;
 }
 
 fn available(avail: u64, target: u64) -> bool {

@@ -106,6 +106,16 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("cpu_fpu_save", Avail::Kernel, vec![m(Cpu), m(Frame)], Unit),
         ("cpu_fpu_load", Avail::Kernel, vec![m(Cpu), r(Frame)], Unit),
         ("cpu_count", Avail::Kernel, vec![r(Cpu)], U64),
+        ("port_claim", Avail::Mem, vec![m(Ports), U64, U64], PortIo),
+        ("port_release", Avail::Mem, vec![m(Ports), PortIo], Unit),
+        ("port_base", Avail::Mem, vec![r(PortIo)], U64),
+        ("port_count", Avail::Mem, vec![r(PortIo)], U64),
+        ("pio_in8", Avail::Mem, vec![m(PortIo), U64], U64),
+        ("pio_in16", Avail::Mem, vec![m(PortIo), U64], U64),
+        ("pio_in32", Avail::Mem, vec![m(PortIo), U64], U64),
+        ("pio_out8", Avail::Mem, vec![m(PortIo), U64, U64], Unit),
+        ("pio_out16", Avail::Mem, vec![m(PortIo), U64, U64], Unit),
+        ("pio_out32", Avail::Mem, vec![m(PortIo), U64, U64], Unit),
         ("sys_spawn", Avail::User, vec![r(Buf), U64, U64], U64),
         ("sys_wait", Avail::User, vec![U64], U64),
         ("sys_kill", Avail::User, vec![U64], U64),
@@ -129,6 +139,9 @@ pub const GHOSTS: &[(&str, Type, bool, Type)] = &[
     ("pool_has", Type::Pool, true, Type::Bool),
     ("pool_size", Type::Pool, false, Type::U64),
     ("mmu_root", Type::Mmu, false, Type::U64),
+    ("port_base", Type::PortIo, false, Type::U64),
+    ("port_count", Type::PortIo, false, Type::U64),
+    ("port_free", Type::Ports, true, Type::Bool),
 ];
 
 pub fn is_ghost(name: &str) -> bool {
@@ -181,8 +194,8 @@ fn available(name: &str, target: Target) -> bool {
 /// The capabilities `main` may ask for on each target.
 fn main_caps(target: Target) -> &'static [Type] {
     match target {
-        Target::Hosted => &[Type::Serial, Type::Pool, Type::Host],
-        Target::Kernel => &[Type::Serial, Type::Pool, Type::Mmu, Type::Cpu],
+        Target::Hosted => &[Type::Serial, Type::Pool, Type::Host, Type::Ports],
+        Target::Kernel => &[Type::Serial, Type::Pool, Type::Mmu, Type::Cpu, Type::Ports],
         Target::User => &[Type::Serial],
     }
 }
@@ -190,7 +203,7 @@ fn main_caps(target: Target) -> &'static [Type] {
 /// Struct and enum definitions: unique names, known field and payload
 /// types, no type that contains itself.
 pub fn check_structs(p: &Program) -> Result<(), Diag> {
-    const RESERVED: &[&str] = &["u64", "bool", "Str", "Buf", "Bytes", "Host", "Child", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu"];
+    const RESERVED: &[&str] = &["u64", "bool", "Str", "Buf", "Bytes", "Host", "Child", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu", "Ports", "PortIo"];
     // (name, position, the types it holds directly)
     let mut defs: Vec<(String, Pos, Vec<Type>)> = Vec::new();
     for d in &p.structs {
