@@ -2379,6 +2379,44 @@ fn vm_expr(v: &mut Vr, p: &Parser, i: u64) {
   vec_free(t);
 }
 
+/// "that the destination `d` .. `d + n` is within `b` (`d + n <= blen(b)`)",
+/// for arguments `d`, `n` and `b` of call `args` (`which` is "destination"
+/// or "source").
+fn vm_brange(v: &mut Vr, p: &Parser, args: &Vec[u64], which: Str, d: u64, n: u64, b: u64) {
+  vm_s(&mut v, "that the ");
+  vm_s(&mut v, which);
+  vm_s(&mut v, " `");
+  vm_arg(&mut v, p, u_at(args, d));
+  vm_s(&mut v, "` .. `");
+  vm_arg(&mut v, p, u_at(args, d));
+  vm_s(&mut v, " + ");
+  vm_arg(&mut v, p, u_at(args, n));
+  vm_s(&mut v, "` is within `");
+  vm_arg(&mut v, p, u_at(args, b));
+  vm_s(&mut v, "` (`");
+  vm_arg(&mut v, p, u_at(args, d));
+  vm_s(&mut v, " + ");
+  vm_arg(&mut v, p, u_at(args, n));
+  vm_s(&mut v, " <= blen(");
+  vm_arg(&mut v, p, u_at(args, b));
+  vm_s(&mut v, ")`)");
+}
+
+/// "that `o` .. `o + n` is within the page (`o + n <= 4096`)".
+fn vm_prange(v: &mut Vr, p: &Parser, args: &Vec[u64], o: u64, n: u64) {
+  vm_s(&mut v, "that `");
+  vm_arg(&mut v, p, u_at(args, o));
+  vm_s(&mut v, "` .. `");
+  vm_arg(&mut v, p, u_at(args, o));
+  vm_s(&mut v, " + ");
+  vm_arg(&mut v, p, u_at(args, n));
+  vm_s(&mut v, "` is within the page (`");
+  vm_arg(&mut v, p, u_at(args, o));
+  vm_s(&mut v, " + ");
+  vm_arg(&mut v, p, u_at(args, n));
+  vm_s(&mut v, " <= 4096`)");
+}
+
 /// What `rd_sub` needs for instance `x`: each type parameter's name and
 /// the name of the type it stands for.
 fn vm_tsub(m: &Mono, p: &Parser, x: u64) -> Vec[u64] {
@@ -4158,11 +4196,21 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
       n = term(v, u_at(vals, 4));
     }
     let src = vl_at(v, sx);
+    let mut ri = 3;
+    let mut si = 2;
+    let mut sk = 0;
+    if name_is(p, i, "bcopy") {
+      ri = 4;
+      si = 3;
+      sk = 2;
+    }
     let de = app2(&mut v, OP_ADD, d, n);
     let g = app2(&mut v, OP_LE, de, a0.a);
+    vm_brange(&mut v, p, args, "destination", 1, ri, 0);
     prove(&mut v, st, g, i, VC_BOUNDS);
     let se = app2(&mut v, OP_ADD, s, n);
     let g2 = app2(&mut v, OP_LE, se, src.a);
+    vm_brange(&mut v, p, args, "source", si, ri, sk);
     prove(&mut v, st, g2, i, VC_BOUNDS);
     let inr = port_range(&mut v, d, n);
     let off = app2(&mut v, OP_SUB, v.t_k, d);
@@ -4184,9 +4232,11 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     let oe = app2(&mut v, OP_ADD, o, n);
     let page = num(&mut v, 4096);
     let g = app2(&mut v, OP_LE, oe, page);
+    vm_prange(&mut v, p, args, 3, 4);
     prove(&mut v, st, g, i, VC_BOUNDS);
     let de = app2(&mut v, OP_ADD, d, n);
     let g2 = app2(&mut v, OP_LE, de, a0.a);
+    vm_brange(&mut v, p, args, "destination", 1, 4, 0);
     prove(&mut v, st, g2, i, VC_BOUNDS);
     let mut h = 0;
     if name_is(p, i, "frame_to_bytes") {
@@ -4214,9 +4264,11 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     let oe = app2(&mut v, OP_ADD, o, n);
     let page = num(&mut v, 4096);
     let g = app2(&mut v, OP_LE, oe, page);
+    vm_prange(&mut v, p, args, 1, 4);
     prove(&mut v, st, g, i, VC_BOUNDS);
     let se = app2(&mut v, OP_ADD, s, n);
     let g2 = app2(&mut v, OP_LE, se, src.a);
+    vm_brange(&mut v, p, args, "source", 3, 4, 2);
     prove(&mut v, st, g2, i, VC_BOUNDS);
     return v.unit;
   }
