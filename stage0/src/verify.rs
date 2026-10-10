@@ -423,6 +423,9 @@ pub struct Verifier<'p> {
     /// is `bit` declared and every bitwise operator described bit by bit.
     bitwise: &'p HashSet<String>,
     bits: bool,
+    /// The file of the function being verified: an opaque spec fn's body
+    /// is used only in its own file.
+    file: usize,
 }
 
 /// Does `e` call the spec builtin `call` (`vcount`, `bdec`), or name one of
@@ -515,6 +518,30 @@ const BIT_AXIOMS: &[&str] = &[
     "(assert (forall ((j Int)) (! (= (bit 4294967295 j) (and (<= 0 j) (< j 32))) :pattern ((bit 4294967295 j)))))",
     "(assert (forall ((j Int)) (! (= (bit 18446744073709551615 j) (and (<= 0 j) (< j 64))) :pattern ((bit 18446744073709551615 j)))))",
 ];
+
+/// The SMT sorts an opaque spec fn's parameter of type `t` is passed as
+/// (see `check::opaque_arg`), in the order `opaque_terms` lists its terms.
+fn opaque_sorts(t: &Type) -> Vec<&'static str> {
+    match t {
+        Type::Ref(x) => opaque_sorts(x),
+        Type::Bool => vec!["Bool"],
+        Type::Buf | Type::Bytes => vec!["Int", "(Array Int Int)"],
+        Type::Struct(n) => struct_def(n).unwrap().fields.iter().flat_map(|(_, ft)| opaque_sorts(ft)).collect(),
+        _ => vec!["Int"],
+    }
+}
+
+fn opaque_terms(v: &Val, out: &mut Vec<String>) {
+    match v {
+        Val::U(t) | Val::B(t) => out.push(t.clone()),
+        Val::Buf { len, data } => {
+            out.push(len.clone());
+            out.push(data.clone());
+        }
+        Val::Struct(_, fs) => fs.iter().for_each(|f| opaque_terms(f, out)),
+        _ => unreachable!("checked: check::opaque_arg"),
+    }
+}
 
 /// Bit `j` of the term `t`: `(bit t j)`, or for a literal, which bits are
 /// set spelled out.
@@ -718,7 +745,7 @@ fn verify_worker(p: &Program, sums: &Summaries, counting: &HashSet<String>, deci
             return w;
         }
     };
-    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, int_ops: HashMap::new(), sums, counting, decimal, hexadecimal, bitwise, counts: false, bits: false };
+    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, int_ops: HashMap::new(), sums, counting, decimal, hexadecimal, bitwise, counts: false, bits: false, file: 0 };
     let mut run = || -> Result<(), (usize, Diag)> {
         // Every function is verified on a solver in the same state, fresh
         // or reset: what Z3 answers near its work limit depends on what it
@@ -1043,6 +1070,12 @@ impl<'p> Verifier<'p> {
             for c in HEX_AXIOMS {
                 self.smt(c)?;
             }
+        }
+        self.file = f.pos.file;
+        for sf in self.prog.specs.iter().filter(|s| s.opaque) {
+            let sorts: Vec<&str> = sf.params.iter().flat_map(|p| opaque_sorts(&p.ty)).collect();
+            let ret = if sf.ret == Type::Bool { "Bool" } else { "Int" };
+            self.smt(&format!("(declare-fun o!{} ({}) {})", sf.name, sorts.join(" "), ret))?;
         }
         self.bits = self.bitwise.contains(&f.name);
         if self.bits {
@@ -2626,6 +2659,21 @@ impl<'p> Verifier<'p> {
                 if name == "old" {
                     let old = sc.old.expect("checked: old() only in ensures and loop invariants");
                     return self.spec(&args[0], Scope { env: old, old: None, result: None }, bound);
+                }
+                if let Some(sf) = self.prog.specs.iter().find(|s| &s.name == name && s.opaque && s.pos.file != self.file).cloned() {
+                    // Outside its file, an opaque spec fn is an
+                    // uninterpreted function of its arguments' terms.
+                    let mut terms = Vec::new();
+                    for (p, a) in sf.params.iter().zip(args) {
+                        match p.ty.base() {
+                            t if t.is_int() || *t == Type::Bool => terms.push(self.spec(a, sc, bound)?),
+                            _ => opaque_terms(&self.spec_val(a, sc, bound)?, &mut terms),
+                        }
+                    }
+                    if terms.is_empty() {
+                        return Ok(format!("o!{}", sf.name));
+                    }
+                    return Ok(format!("(o!{} {})", sf.name, terms.join(" ")));
                 }
                 if let Some(sf) = self.prog.specs.iter().find(|s| &s.name == name).cloned() {
                     let mut env = HashMap::new();

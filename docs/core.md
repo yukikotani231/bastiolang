@@ -128,7 +128,7 @@ A `Ring { h, n, cap }` holds only the indices of a ring buffer: element `i` (0 t
 | `ring_push_n(r, k)`, `ring_pop_n(r, k)` | The same for `k` elements at once, for callers that copy runs of bytes |
 | `ring_room`, `ring_empty`, `ring_full`, `ring_clear` | Exactly `cap - n`, `n == 0`, `n == cap`; empties it |
 
-`Queue { r: Ring, q: Buf }` is the common case, a FIFO of `u64` words (`queue_new(cap)`, `queue_push`, `queue_pop`, `queue_peek`, `queue_len`, `queue_free`): `queue_pop` and `queue_peek` return the word in the head's slot. A full queue is a precondition, so the caller decides whether to drop (a console) or wait (a pipe).
+`Queue { r: Ring, q: Buf }` is the common case, a FIFO of `u64` words (`queue_new(cap)`, `queue_push`, `queue_pop`, `queue_peek`, `queue_len`, `queue_free`): `queue_pop` and `queue_peek` return the word in the head's slot. The contents are the sequence `queue_at(q, 0)`, `queue_at(q, 1)`, ... (oldest first). `queue_push` appends to it and `queue_pop` returns its first word and shifts the rest, so words come out in the order they went in. `queue_at` is an opaque spec fn, so users' proofs never see the slot arithmetic (`tests/pass/queue_fifo.bastio`). A full queue is a precondition, so the caller decides whether to drop (a console) or wait (a pipe).
 
 ### `core/bitmap.bastio`
 
@@ -163,9 +163,8 @@ That the sums are the checksums the standards define is checked by the tests on 
 What the library would say if the language let it. Each is a language or verifier change, not a library change. (Earlier gaps, all closed: `old(x)` is allowed in loop invariants, which the text functions and `bytes_copy_into` use; a local variable may share a function's name, so importing core no longer reserves its local names; a `spec fn` may be generic; `vcount` counts the elements of a vector, which proves the sort a permutation and the map's counters; and imports are searched for, so `import "core/text.bastio"` works from anywhere.)
 
 - **Packed bitmaps.** `core/bitmap.bastio` spends a byte per entry. The language can now state and prove what packing needs (`has_bit`: setting, clearing or flipping a bit leaves the other 63 alone; `tests/pass/bits_packed.bastio`), so this is now a library change.
-- **The order of a FIFO.** `Queue` is proved to return the word at its head, not that words come out in the order they went in: that needs a ghost sequence of the contents, which specifications cannot hold yet.
 
-(Closed last: `bdec` and `bhex` name the value of a digit string, so every `parse_*` is proved to return the value of its digits; and an existing `Bytes` is known to be at most 2^60 long, which is all a single value can say.)
+(Closed last: an `opaque spec fn` (`queue_at`) gives `Queue` an abstract view of its contents, so it is proved to be a FIFO; `bdec` and `bhex` name the value of a digit string, so every `parse_*` is proved to return the value of its digits; and an existing `Bytes` is known to be at most 2^60 long, which is all a single value can say.)
 
 ## Where it came from
 

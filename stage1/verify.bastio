@@ -53,6 +53,7 @@ const OP_CNT: u64 = 18;       // vcount: (cnt elements length value)
 const OP_DEC: u64 = 19;       // bdec: (dec data from to)
 const OP_HEX: u64 = 20;       // bhex: (hex data from to)
 const OP_BIT: u64 = 21;       // has_bit: (bit x i)
+const OP_CALL: u64 = 22;      // an opaque spec fn: (f x ..), f the first argument (an atom)
 
 // Sorts: Int or Bool, under `depth` levels of (Array Int ..): base + 2 * depth.
 const SO_INT: u64 = 0;
@@ -190,6 +191,9 @@ struct Vr {
   /// them: only then is every bitwise operator described bit by bit.
   bit_fns: Vec[u64],
   bits: bool,
+  /// The file of the function being verified: an opaque spec fn's body is
+  /// used only in its own file.
+  file: u64,
   /// Every function's summaries, grouped by instance: rows
   /// sum_start[x] .. sum_start[x] + sum_n[x] are instance x's.
   sums: Vec[SumRow],
@@ -242,7 +246,7 @@ fn vr_new(m: &mut Mono, p: &Parser) -> Vr {
   vec_push(&mut vals, Vl { kind: 0, ty: 0, a: 0, b: 0, c: 0, n: 0, d: 0, e: 0 });
   let mut v = Vr {
     pool: vec_new[u64](), tms: tms, targs: vec_new[u64](), vals: vals, kids: vec_new[u64](),
-    log: vec_new[Cmd](), counter: 0, obligations: 0, box_depth: 0, cur: 0, env: 0, cnt_fns: vec_new[u64](), counts: false, dec_fns: vec_new[u64](), hex_fns: vec_new[u64](), bit_fns: vec_new[u64](), bits: false,
+    log: vec_new[Cmd](), counter: 0, obligations: 0, box_depth: 0, cur: 0, env: 0, cnt_fns: vec_new[u64](), counts: false, dec_fns: vec_new[u64](), hex_fns: vec_new[u64](), bit_fns: vec_new[u64](), bits: false, file: 0,
     sums: vec_new[SumRow](), obls: vec_new[Obl](), snaps: vec_new[Bind](), sum_start: vec_new[u64](), sum_n: vec_new[u64](),
     t_true: 0, t_false: 0, t_zero: 0, t_u64max: 0, t_allocmax: 0, t_flimit: 0, t_plimit: 0, t_mmio_lo: 0, t_mmio_hi: 0, t_poolsize: 0,
     t_zarr: 0, t_nobool: 0, t_k: 0, t_255: 0, unit: 0,
@@ -1226,6 +1230,16 @@ fn out_tm(out: &mut Vec[u64], v: &Vr, t: u64) {
     }
   } else if x.kind == VT_NUM {
     out_num(&mut out, x.a);
+  } else if x.kind == VT_APP && x.a == OP_CALL {
+    out_str(&mut out, "(");
+    out_tm(&mut out, v, targ(v, t, 0));
+    let mut k = 1;
+    while k < x.c {
+      out_str(&mut out, " ");
+      out_tm(&mut out, v, targ(v, t, k));
+      k = k + 1;
+    }
+    out_str(&mut out, ")");
   } else if x.kind == VT_APP {
     out_str(&mut out, "(");
     out_op(&mut out, x.a);
@@ -3021,10 +3035,134 @@ fn vspec_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env: &V
     return spec_tm(&mut v, c, &mut m, p, n.a, oenv, oenv, false, 0, &mut bound);
   }
   let sf = vspec_def(p, n.s, n.e);
+  let sfn = node_at(p.nodes, sf);
+  if sf != 0 && sfn.x == 1 && sfn.file != v.file {
+    return vspec_opaque(&mut v, c, &mut m, p, i, sf, env, oenv, has_old, res, &mut bound);
+  }
   if sf != 0 {
     return vspec_expand(&mut v, c, &mut m, p, i, sf, 0, env, oenv, has_old, res, &mut bound);
   }
   return vspec_builtin(&mut v, c, &mut m, p, i, env, oenv, has_old, res, &mut bound);
+}
+
+/// Call `i` of opaque spec fn `sf` outside its file: an uninterpreted
+/// function of its arguments' terms. As stage0.
+fn vspec_opaque(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, sf: u64, env: &Vec[Bind], oenv: &Vec[Bind], has_old: bool, res: u64, bound: &mut Vec[Bnd]) -> u64 {
+  let n = node_at(p.nodes, i);
+  let sd = node_at(p.nodes, sf);
+  let nm = atom_src(&mut v, p, sd.s, sd.e);
+  let f = pre_str(&mut v, "o!", nm);
+  let mut ts = vec_new[u64]();
+  vec_push(&mut ts, f);
+  let mut q = sd.a;
+  let mut a = n.a;
+  while q != 0 && a != 0 {
+    let qn = node_at(p.nodes, q);
+    let pt = base_t(m, conv(&mut m, p, qn.a, 0, q));
+    if is_int(m, pt) || kind_t(m, pt) == TY_BOOL {
+      let t = spec_tm(&mut v, c, &mut m, p, a, env, oenv, has_old, res, &mut bound);
+      vec_push(&mut ts, t);
+    } else {
+      let y = spec_val(&mut v, c, &mut m, p, a, env, oenv, has_old, res, &mut bound);
+      opaque_terms(v, y, &mut ts, 0);
+    }
+    q = qn.next;
+    a = next_of(p, a);
+  }
+  let mut r = f;
+  if vec_len(ts) > 1 {
+    r = appv(&mut v, OP_CALL, ts);
+  }
+  vec_free(ts);
+  return r;
+}
+
+/// The terms of value `y` handed to an opaque spec fn, as stage0's
+/// `opaque_terms`.
+fn opaque_terms(v: &Vr, y: u64, out: &mut Vec[u64], depth: u64) {
+  let yv = vl_at(v, y);
+  if depth > 64 {
+    return;
+  }
+  if yv.kind == VV_U || yv.kind == VV_B {
+    vec_push(&mut out, yv.a);
+  } else if yv.kind == VV_BUF {
+    vec_push(&mut out, yv.a);
+    vec_push(&mut out, yv.b);
+  } else if yv.kind == VV_STRUCT {
+    let mut j = 0;
+    while j < yv.n {
+      opaque_terms(v, kid(v, y, j), &mut out, depth + 1);
+      j = j + 1;
+    }
+  }
+}
+
+/// The SMT sorts a parameter of type `t` is passed as, as stage0's
+/// `opaque_sorts`, separated by spaces (`first`: none written yet).
+fn opaque_sorts(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, t: u64, first: &mut bool, depth: u64) {
+  let k = kind_t(m, t);
+  if depth > 64 {
+    return;
+  }
+  if k == TY_REF {
+    opaque_sorts(&mut v, c, m, p, inner_t(m, t), &mut first, depth + 1);
+    return;
+  }
+  if k == TY_STRUCT {
+    let x = inner_t(m, t);
+    let dn = def_node(m, p, x);
+    let n = list_len(p, dn.a);
+    let mut j = 0;
+    while j < n {
+      opaque_sorts(&mut v, c, m, p, fld_ty(c, x, j), &mut first, depth + 1);
+      j = j + 1;
+    }
+    return;
+  }
+  if !first {
+    push_str(&mut v, " ");
+  }
+  first = false;
+  if k == TY_BOOL {
+    push_str(&mut v, "Bool");
+  } else if k == TY_BUF || k == TY_BYTES {
+    push_str(&mut v, "Int (Array Int Int)");
+  } else {
+    push_str(&mut v, "Int");
+  }
+}
+
+/// `(declare-fun o!f (sorts) ret)` for every opaque spec fn, as stage0
+/// sends them at the start of each function.
+fn opaque_decls(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
+  let mut k = p.specs.head;
+  while k != 0 {
+    let sd = node_at(p.nodes, k);
+    if sd.x == 1 {
+      let start = vec_len(v.pool);
+      push_str(&mut v, "(declare-fun o!");
+      push_src(&mut v, p, sd.s, sd.e);
+      push_str(&mut v, " (");
+      let mut q = sd.a;
+      let mut first = true;
+      while q != 0 {
+        let qn = node_at(p.nodes, q);
+        let pt = conv(&mut m, p, qn.a, 0, q);
+        opaque_sorts(&mut v, c, m, p, pt, &mut first, 0);
+        q = qn.next;
+      }
+      push_str(&mut v, ")");
+      if conv(&mut m, p, sd.b, 0, k) == c.tbool {
+        push_str(&mut v, " Bool)");
+      } else {
+        push_str(&mut v, " Int)");
+      }
+      let a = seal(&mut v, start);
+      send(&mut v, CMD_RAW, a, 0);
+    }
+    k = sd.next;
+  }
 }
 
 /// Call `i` of spec fn `sf` (instance `x` of it, or 0 for a plain one),
@@ -6225,6 +6363,8 @@ fn verify_fn(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
   if has_u(v.hex_fns, xi.def) {
     hex_axioms(&mut v);
   }
+  v.file = d.file;
+  opaque_decls(&mut v, c, &mut m, p);
   v.bits = has_u(v.bit_fns, xi.def);
   if v.bits {
     bit_axioms(&mut v);

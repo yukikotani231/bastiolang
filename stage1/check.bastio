@@ -2395,6 +2395,37 @@ fn lock_order(c: &mut Checker, m: &Mono, p: &Parser) {
   vec_free(order);
 }
 
+/// What an opaque spec fn can take: values the verifier can hand to an
+/// uninterpreted function as a fixed list of terms. As stage0's
+/// `opaque_arg`.
+fn opaque_arg(c: &Checker, m: &Mono, p: &Parser, t: u64, depth: u64) -> bool {
+  let k = kind_t(m, t);
+  if depth > 64 {
+    return false;
+  }
+  if k == TY_REF {
+    return opaque_arg(c, m, p, inner_t(m, t), depth + 1);
+  }
+  if k == TY_BOOL || k == TY_BUF || k == TY_BYTES || is_int(m, t) {
+    return true;
+  }
+  if k == TY_STRUCT {
+    let x = inner_t(m, t);
+    let dn = def_node(m, p, x);
+    let n = list_len(p, dn.a);
+    let mut j = 0;
+    while j < n {
+      let ft = fld_ty(c, x, j);
+      if ft == 0 || !opaque_arg(c, m, p, ft, depth + 1) {
+        return false;
+      }
+      j = j + 1;
+    }
+    return true;
+  }
+  return false;
+}
+
 fn check_spec_fn(c: &mut Checker, m: &mut Mono, p: &Parser, x: u64) {
   let xi = inst_at(m, x);
   let k = xi.def;
@@ -2427,6 +2458,10 @@ fn check_spec_fn(c: &mut Checker, m: &mut Mono, p: &Parser, x: u64) {
     let qn = node_at(p.nodes, q);
     let t = conv(&mut m, p, qn.a, env, q);
     known_type(&mut c, m, p, t, q);
+    if !c.failed && sn.x == 1 && !opaque_arg(c, m, p, t, 0) && cm_new(&mut c, p, q, C_TYPE) {
+      cm_s(&mut c, "a parameter of an opaque spec fn is an integer, bool, Buf or Bytes, or a struct of those (or a borrow of one), not ");
+      cm_ty(&mut c, m, p, t);
+    }
     if !c.failed && (ck_linear(c, m, p, t) || kind_t(m, t) == TY_MUTREF) && cm_new(&mut c, p, q, C_TYPE) {
       cm_s(&mut c, "spec fn parameters are values (`u64`, `bool`) or shared borrows (`&T`)");
     }

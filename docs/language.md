@@ -96,7 +96,7 @@ bastioc0 [--check] [--emit-c] [--backend c|native] [--target hosted|kernel|user]
 - **Identifiers** are ASCII letters, digits and `_`, not starting with a digit.
 - **Integer literals** are decimal (`4096`) or hexadecimal (`0x1000`, `0X1000`). `_` may separate digits (`1_000_000`, `0xffff_0000`). A literal must fit in 64 bits, and in the integer type its position gives it. A negative number is unary minus on a literal, where a signed type is expected.
 - **String literals** are written in double quotes and cannot span lines. Escapes: `\n`, `\r`, `\t`, `\0`, `\\`, `\"`.
-- **Keywords:** `assert` `const` `else` `ensures` `enum` `export` `false` `fn` `forall` `if` `import` `invariant` `is` `let` `match` `mut` `requires` `return` `spec` `struct` `true` `unreachable` `while`. The names `result`, `old` and `include_bytes`, and the names of builtins, have special meanings described below.
+- **Keywords:** `assert` `const` `else` `ensures` `enum` `export` `false` `fn` `forall` `if` `import` `invariant` `is` `let` `match` `mut` `requires` `return` `spec` `struct` `true` `unreachable` `while`. `opaque` is a keyword only before `spec fn`. The names `result`, `old` and `include_bytes`, and the names of builtins, have special meanings described below.
 
 ## Programs and files
 
@@ -1268,6 +1268,8 @@ fn main() -> u64 {
   return 0;
 }
 ```
+
+An `opaque spec fn` is inlined only in its own file. Everywhere else it is an uninterpreted function of its arguments: a proof there knows only what contracts say about it, not its body. This lets a library describe its data abstractly and keeps the details out of its users' proofs. `core/ring.bastio` says what a queue holds as `queue_at(q, i)`, its i-th oldest word, computed from the ring's slot arithmetic. Its push and pop are proved against that body, inside the file. A user of the queue sees only that `queue_push` appends to the sequence and `queue_pop` returns its first word and shifts the rest, so a loop that fills and drains a queue proves the order of the words in milliseconds (`tests/pass/queue_fifo.bastio`), where the inlined arithmetic took the solver minutes. This hides nothing that matters for soundness: what a proof concludes about an unknown function also holds for the real one. An opaque spec fn cannot be generic (`E-PARSE`), and its parameters are integers, `bool`, `Buf`, `Bytes`, and structs of those or borrows of one (`E-TYPE`). `opaque` is a keyword only before `spec fn`.
 
 A `spec fn` can be generic. Like a generic function, it is copied once per list of type arguments, which are written at every call (`grew_by[u64](v, w, 1)`), and a generic function's specifications can pass its own type parameters on:
 

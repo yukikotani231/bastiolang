@@ -36,6 +36,10 @@ What will be 0.2.0.
 - Generic `spec fn`s, and `vcount` for counting in specifications; local
   variables may share a function's name (#74).
 - `==` on structs and enums in specifications (#86).
+- `opaque spec fn`: a spec fn whose body is used only in its own file and
+  is an uninterpreted function everywhere else, so a library can describe
+  its data abstractly. `core/ring`'s `Queue` is now proved to be a FIFO
+  (`queue_at`).
 - `has_bit(x, i)` in specifications, and what every bitwise operator does
   to each bit, so packed bitmaps are proved to change only the bit they
   set or clear.

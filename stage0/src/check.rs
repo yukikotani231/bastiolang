@@ -665,6 +665,17 @@ fn new_ctx<'a>(sigs: &'a HashMap<String, Sig>, specs: &'a [SpecFn], target: Targ
     Ctx { sigs, specs, target, ret, scopes: vec![Vec::new()], vars: HashMap::new(), moved: HashSet::new(), moved_at: HashMap::new(), int_ops: HashMap::new(), calls: Vec::new(), lock_sites: Vec::new(), params: Vec::new(), in_inv: std::cell::Cell::new(false), old_only: std::cell::Cell::new(false) }
 }
 
+/// What an opaque spec fn can take: values the verifier can hand to an
+/// uninterpreted function as a fixed list of terms.
+pub fn opaque_arg(t: &Type) -> bool {
+    match t {
+        Type::Ref(x) => opaque_arg(x),
+        Type::Bool | Type::Buf | Type::Bytes => true,
+        Type::Struct(n) => crate::ast::struct_def(n).map_or(false, |d| d.fields.iter().all(|(_, ft)| opaque_arg(ft))),
+        t => t.is_int(),
+    }
+}
+
 /// A spec fn may only call spec fns defined before it, so expansion terminates.
 fn check_spec_fn(sf: &SpecFn, earlier: &[SpecFn], sigs: &HashMap<String, Sig>, target: Target) -> Result<(), Diag> {
     if sigs.contains_key(&sf.name) || is_ghost(&sf.name) || earlier.iter().any(|e| e.name == sf.name) {
@@ -676,6 +687,9 @@ fn check_spec_fn(sf: &SpecFn, earlier: &[SpecFn], sigs: &HashMap<String, Sig>, t
     let mut cx = new_ctx(sigs, earlier, target, Type::Unit);
     for p in &sf.params {
         known_type(&p.ty, p.pos)?;
+        if sf.opaque && !opaque_arg(&p.ty) {
+            return Err(Diag::new("E-TYPE", p.pos, format!("a parameter of an opaque spec fn is an integer, bool, Buf or Bytes, or a struct of those (or a borrow of one), not {}", p.ty.name())));
+        }
         if p.ty.is_linear() || p.ty.is_mut_ref() {
             return Err(Diag::new("E-TYPE", p.pos, "spec fn parameters are values (`u64`, `bool`) or shared borrows (`&T`)"));
         }
