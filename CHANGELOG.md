@@ -30,6 +30,8 @@ What will be 0.2.0.
   from 2 GiB (#67) up to 2^46 (#77).
 - `boot_acpi`, a byte of one of the firmware's ACPI tables, so a kernel
   parses them (and the AML it needs) in Bastio, proved in bounds.
+- `boot_info`, the platform's answers about the machine (BastiOS: the boot
+  command line, the memory map, CPUID), unchecked input to the program.
 - `old(x)` in loop invariants (#73).
 - Generic `spec fn`s, and `vcount` for counting in specifications; local
   variables may share a function's name (#74).
@@ -62,9 +64,9 @@ What will be 0.2.0.
   an unknown variable or function (#87).
 - Z3 runs with a fixed work limit per query (`:rlimit`) instead of a 10 s
   timeout, so a proof no longer fails on a busy machine (#89).
-- Each function is verified on a reset solver, with names numbered from
-  scratch, so whether a proof near the work limit succeeds no longer
-  depends on which functions shared its solver: the same program could be
+- Each function is verified on a reset solver, so whether a proof near
+  the work limit succeeds no longer depends on which functions shared its
+  solver: the same program could be
   accepted with one `BASTIO_JOBS` and rejected with another. Found by the
   fuzzer below.
 - `tests/fuzz.py`: random programs whose meaning the fuzzer computes

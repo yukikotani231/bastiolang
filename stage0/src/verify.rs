@@ -416,6 +416,8 @@ pub struct Verifier<'p> {
     /// The functions whose proofs can mention `bdec` (gated the same way):
     /// only they get its definition (DEC_AXIOMS).
     decimal: &'p HashSet<String>,
+    /// The same for `bhex` (HEX_AXIOMS).
+    hexadecimal: &'p HashSet<String>,
 }
 
 /// Does `e` call the spec builtin `call` (`vcount`, `bdec`), or name one of
@@ -480,6 +482,18 @@ const DEC_AXIOMS: &[&str] = &[
     "(assert (forall ((a (Array Int Int)) (f Int) (t Int)) (! (= (dec a f t) (ite (<= t f) 0 (+ (* 10 (dec_l a f (- t 1))) (- (select a (- t 1)) 48)))) :pattern ((dec a f t)))))",
     "(assert (forall ((a (Array Int Int)) (f Int) (t Int)) (! (= (dec a f t) (dec_l a f t)) :pattern ((dec a f t)))))",
     "(assert (forall ((a (Array Int Int)) (f Int) (t Int)) (! (=> (<= t f) (= (dec_l a f t) 0)) :pattern ((dec_l a f t)))))",
+];
+
+/// `bhex(b, from, to)` is `(hex a from to)`, the same as `bdec` in base 16:
+/// a byte `c` reads as `c - 48` for `0-9`, `c - 87` for `a-f`, and
+/// `c - 55` otherwise (right for `A-F`; any other byte is not a hex digit,
+/// and callers say so separately).
+const HEX_AXIOMS: &[&str] = &[
+    "(declare-fun hex ((Array Int Int) Int Int) Int)",
+    "(declare-fun hex_l ((Array Int Int) Int Int) Int)",
+    "(assert (forall ((a (Array Int Int)) (f Int) (t Int)) (! (= (hex a f t) (ite (<= t f) 0 (+ (* 16 (hex_l a f (- t 1))) (ite (and (<= 48 (select a (- t 1))) (<= (select a (- t 1)) 57)) (- (select a (- t 1)) 48) (ite (and (<= 97 (select a (- t 1))) (<= (select a (- t 1)) 102)) (- (select a (- t 1)) 87) (- (select a (- t 1)) 55)))))) :pattern ((hex a f t)))))",
+    "(assert (forall ((a (Array Int Int)) (f Int) (t Int)) (! (= (hex a f t) (hex_l a f t)) :pattern ((hex a f t)))))",
+    "(assert (forall ((a (Array Int Int)) (f Int) (t Int)) (! (=> (<= t f) (= (hex_l a f t) 0)) :pattern ((hex_l a f t)))))",
 ];
 
 /// `vcount(v, x)` is `(cnt a n x)` over the vector's element array `a` and
@@ -600,6 +614,7 @@ pub fn verify_program(p: &Program, one_session: bool) -> Result<(usize, Vec<Stri
     let sums = summarize(p);
     let counting = counting_fns(p, "vcount");
     let decimal = counting_fns(p, "bdec");
+    let hexadecimal = counting_fns(p, "bhex");
     let n = p.fns.len();
     let jobs = std::env::var("BASTIO_JOBS")
         .ok()
@@ -611,7 +626,7 @@ pub fn verify_program(p: &Program, one_session: bool) -> Result<(usize, Vec<Stri
     // a function after it, since its result could not be reported anyway.
     let failed = AtomicUsize::new(usize::MAX);
     let workers: Vec<Worker> = std::thread::scope(|s| {
-        let hs: Vec<_> = (0..jobs).map(|_| s.spawn(|| verify_worker(p, &sums, &counting, &decimal, &next, &failed))).collect();
+        let hs: Vec<_> = (0..jobs).map(|_| s.spawn(|| verify_worker(p, &sums, &counting, &decimal, &hexadecimal, &next, &failed))).collect();
         hs.into_iter().map(|h| h.join().expect("a verifier thread panicked")).collect()
     });
     let mut obligations = 0;
@@ -652,7 +667,7 @@ struct Worker {
 
 /// Verifies functions, taking the next unverified index each time, on a
 /// solver of its own.
-fn verify_worker(p: &Program, sums: &Summaries, counting: &HashSet<String>, decimal: &HashSet<String>, next: &AtomicUsize, failed: &AtomicUsize) -> Worker {
+fn verify_worker(p: &Program, sums: &Summaries, counting: &HashSet<String>, decimal: &HashSet<String>, hexadecimal: &HashSet<String>, next: &AtomicUsize, failed: &AtomicUsize) -> Worker {
     let mut w = Worker { obligations: 0, log: Vec::new(), times: Vec::new(), err: None };
     let solver = match Solver::start() {
         Ok(s) => s,
@@ -661,7 +676,7 @@ fn verify_worker(p: &Program, sums: &Summaries, counting: &HashSet<String>, deci
             return w;
         }
     };
-    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, int_ops: HashMap::new(), sums, counting, decimal, counts: false };
+    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, int_ops: HashMap::new(), sums, counting, decimal, hexadecimal, counts: false };
     let mut run = || -> Result<(), (usize, Diag)> {
         // Every function is verified on a solver in the same state, fresh
         // or reset: what Z3 answers near its work limit depends on what it
@@ -682,6 +697,10 @@ fn verify_worker(p: &Program, sums: &Summaries, counting: &HashSet<String>, deci
             v.smt(&format!("(assert (and (<= 0 {p}) (<= {p} {})))", FRAME_LIMIT, p = POOLSIZE)).map_err(|d| (i, d))?;
             let f = &p.fns[i];
             let t0 = std::time::Instant::now();
+            // Names are numbered per function, so they (and the
+            // counterexamples that show them) do not depend on which
+            // functions this worker verified before.
+            v.counter = 0;
             let kept = if f.export { buffers_kept(f, sums) } else { Ok(()) };
             let r = kept
                 .and_then(|_| v.smt("(push 1)"))
@@ -957,9 +976,6 @@ impl<'p> Verifier<'p> {
     }
 
     fn verify_fn(&mut self, f: &FnDef) -> Result<(), Diag> {
-        // Names restart with each function, so its queries are the same
-        // whichever functions were verified before it on this solver.
-        self.counter = 0;
         self.int_ops = f.int_ops.clone();
         self.counts = self.counting.contains(&f.name);
         if self.counts {
@@ -969,6 +985,11 @@ impl<'p> Verifier<'p> {
         }
         if self.decimal.contains(&f.name) {
             for c in DEC_AXIOMS {
+                self.smt(c)?;
+            }
+        }
+        if self.hexadecimal.contains(&f.name) {
+            for c in HEX_AXIOMS {
                 self.smt(c)?;
             }
         }
@@ -2360,6 +2381,9 @@ impl<'p> Verifier<'p> {
                 st.pc.push(format!("(<= {} 256)", x.term()));
                 Ok(x)
             }
+            // The platform promises nothing about the number: the program
+            // checks it like any other input.
+            "boot_info" => self.fresh_u64("info"),
             "cpu_count" => {
                 let n = self.fresh_u64("cpus")?;
                 // The platform's promise: at least this processor, and no
@@ -2522,11 +2546,11 @@ impl<'p> Verifier<'p> {
                 if name == "vget" {
                     return Ok(self.spec_val(e, sc, bound)?.term().to_string());
                 }
-                if name == "bdec" {
+                if name == "bdec" || name == "bhex" {
                     let Val::Buf { data, .. } = self.spec_val(&args[0], sc, bound)? else { unreachable!("checked: Bytes") };
                     let from = self.spec(&args[1], sc, bound)?;
                     let to = self.spec(&args[2], sc, bound)?;
-                    return Ok(format!("(dec {} {} {})", data, from, to));
+                    return Ok(format!("({} {} {} {})", if name == "bdec" { "dec" } else { "hex" }, data, from, to));
                 }
                 if name == "vcount" {
                     let Val::Vec { len, elems, .. } = self.spec_val(&args[0], sc, bound)? else { unreachable!("checked: a Vec") };

@@ -1,0 +1,115 @@
+// core/csum.bastio: checksums over byte strings.
+//
+// The Internet checksum (RFC 1071) that IPv4, ICMP, UDP and TCP headers
+// carry, and CRC-32 (the IEEE 802.3 polynomial, as Ethernet, zlib, PNG and
+// GPT use it). Both read a range `off..off+n` of a `Bytes`, so a packet
+// buffer is summed in place.
+//
+// What is proved: every index is in bounds and every sum stays a 16-bit
+// (or 32-bit) value; one step of the ones'-complement sum is the sum
+// modulo 65535 (`csum_add`). Not proved: that the result is the checksum
+// the RFC defines over the whole range (the tests check known values).
+
+/// Adds the 16-bit word `v` to a ones'-complement sum `s` (end-around
+/// carry: a carry out of bit 15 is added back in at bit 0).
+fn csum_add(s: u64, v: u64) -> u64
+  requires s <= 65535 && v <= 65535
+  ensures result <= 65535
+  ensures (s + v <= 65535 ==> result == s + v) && (65535 < s + v ==> result == s + v - 65535)
+{
+  let t = s + v;
+  if t > 65535 {
+    return t - 65535;
+  }
+  return t;
+}
+
+/// The ones'-complement sum of bytes `off..off+n` of `b` as big-endian
+/// 16-bit words, added to `s0`. An odd last byte is padded with a zero.
+fn csum_sum16(b: &Bytes, off: u64, n: u64, s0: u64) -> u64
+  requires off + n <= blen(b) && s0 <= 65535
+  ensures result <= 65535
+{
+  let mut s = s0;
+  let mut i = 0;
+  while i + 1 < n
+    invariant i <= n && s <= 65535 && off + n <= blen(b)
+  {
+    s = csum_add(s, 256 * cast[u64](bget(b, off + i)) + cast[u64](bget(b, off + i + 1)));
+    i = i + 2;
+  }
+  if i < n {
+    s = csum_add(s, 256 * cast[u64](bget(b, off + i)));
+  }
+  return s;
+}
+
+/// The Internet checksum of bytes `off..off+n`: the complement of their
+/// sum. Over a header that already holds its own checksum it is 0.
+fn csum_inet(b: &Bytes, off: u64, n: u64) -> u64
+  requires off + n <= blen(b)
+  ensures result <= 65535
+{
+  return 65535 - csum_sum16(b, off, n, 0);
+}
+
+/// The sum of an IPv4 pseudo-header (source and destination addresses,
+/// protocol, length), to start the sum of a UDP datagram or TCP segment:
+/// `csum_sum16(b, off, size, csum_pseudo4(src, dst, proto, size))` is
+/// 65535 when the segment's checksum is right.
+fn csum_pseudo4(src: u64, dst: u64, proto: u64, size: u64) -> u64
+  requires src <= 4294967295 && dst <= 4294967295 && proto <= 255 && size <= 65535
+  ensures result <= 65535
+{
+  let mut s = csum_add(0, src / 65536);
+  s = csum_add(s, src % 65536);
+  s = csum_add(s, dst / 65536);
+  s = csum_add(s, dst % 65536);
+  s = csum_add(s, proto);
+  return csum_add(s, size);
+}
+
+/// Continues a CRC-32 over bytes `off..off+n`: `c` is the running value
+/// (start with `crc32_start()`), the result goes into the next call or
+/// into `crc32_end`. Bit by bit, with no table, so it needs no memory.
+fn crc32_update(c: u32, b: &Bytes, off: u64, n: u64) -> u32
+  requires off + n <= blen(b)
+{
+  let mut x = c;
+  let mut i = 0;
+  while i < n
+    invariant i <= n && off + n <= blen(b)
+  {
+    x = x ^ cast[u32](bget(b, off + i));
+    let mut k = 0;
+    while k < 8
+      invariant k <= 8
+    {
+      if x & 1 == 1 {
+        x = (x >> 1) ^ 3988292384;     // 0xEDB88320, the reflected polynomial
+      } else {
+        x = x >> 1;
+      }
+      k = k + 1;
+    }
+    i = i + 1;
+  }
+  return x;
+}
+
+/// The running value a CRC-32 starts from.
+fn crc32_start() -> u32 {
+  return 4294967295;
+}
+
+/// The finished CRC-32 of a running value.
+fn crc32_end(c: u32) -> u32 {
+  return c ^ 4294967295;
+}
+
+/// The CRC-32 of bytes `off..off+n` of `b`.
+fn crc32(b: &Bytes, off: u64, n: u64) -> u32
+  requires off + n <= blen(b)
+{
+  return crc32_end(crc32_update(crc32_start(), b, off, n));
+}

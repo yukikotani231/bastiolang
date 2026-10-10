@@ -30,12 +30,13 @@
 #           --kernel BastiOS's kernel when a built checkout is next to this
 #           one (it must need only the platform's symbols)
 #   driver  stage1/bastioc1.bastio  vs  bastioc0 itself: what `--check`
-#           prints on stderr and its exit status (a failed proof's
-#           sentence masked, as bastioc1 does not print it yet), the
-#           C file of `--emit-c`, the C header of `--header`, the list of
-#           `--trusted-base`, and the programs it builds, which must
-#           exit as tests/pass says; and bastioc1 built by itself must
-#           write the same C for itself as stage0 (the fixed point)
+#           prints on stderr and its exit status, the C file of
+#           `--emit-c`, the C header of `--header`, the list of
+#           `--trusted-base`, what `--backend native` prints, and the
+#           programs it builds either way, which must exit as tests/pass
+#           says; with `--backend native --target user` (and `kernel`),
+#           the assembly of asmdump --user (--kernel); and bastioc1 built by itself must write the same C for
+#           itself as stage0 (the fixed point)
 # The parser, the monomorphizer and the checker are also compared on damaged
 # sources (stage1/mutate.py), so their error positions are checked too.
 set -u
@@ -231,7 +232,7 @@ if [ -f ../bastios/build/user/sh.bin ]; then
      && as --64 -o "$tmp/kernel.o" "$tmp/kernel.s" \
      && ! nm -u "$tmp/kernel.o" | awk '{print $2}' \
           | grep -v -x -e _end -e bst_kernel_pml4 -e bst_cpu_enter -e bst_cpu_wait -e bst_platform_ctx \
-                    -e bst_platform_cpus -e bst_platform_smp_start -e bst_platform_smp_join -e bst_platform_acpi | grep -q .; then
+                    -e bst_platform_cpus -e bst_platform_smp_start -e bst_platform_smp_join -e bst_platform_acpi -e bst_platform_info | grep -q .; then
     kernel=", and BastiOS's kernel"
   else
     differ=$((differ+1)); echo "DIFFER ../bastios/src/main.bastio (kernel not built by asmdump --kernel)"
@@ -239,19 +240,13 @@ if [ -f ../bastios/build/user/sh.bin ]; then
 fi
 echo "-- native (stage1 only): $built programs built and run (plus asmdump built by itself, and bastioc1), $users user programs built$kernel, $differ differ"
 { [ "$differ" = 0 ] && [ "$built" -gt 1 ] && [ "$users" -gt 0 ]; } || status=1
-# The driver. The sentence after `error[CODE]:` and the hints (`  = ..`)
-# of the errors before the verifier are being ported phase by phase: where
-# bastioc1 prints none, bastioc0's are left out of the comparison (a failed
-# proof's counterexample is always compared). The reason a file cannot be
-# read comes from the OS and is left out, and bastioc1 names itself.
-mask() {  # stage0's stderr, bastioc1's stderr
-  local keep_msg=1 keep_notes=1
-  grep -q 'error\[[A-Z-]*\]: ' "$2" || keep_msg=0
-  grep -q 'error\[E-\(VERIFY\|SOLVER\)' "$1" || grep -q '^  = ' "$2" || keep_notes=0
-  if [ $keep_notes = 1 ]; then cat "$1"; else grep -v '^  = ' "$1"; fi \
-    | if [ $keep_msg = 1 ]; then cat; else sed -e 's/^\(.*: error\[[A-Z-]*\]\): .*$/\1/'; fi \
-    | sed -e 's/^\(.*: error\[E-IMPORT\]: cannot read `[^`]*`\): .*$/\1/' \
-          -e 's/^\(.*: error\[E-PARSE\]: include_bytes: cannot read .*\): [^:]*$/\1/' -e 's/^bastioc0: /bastioc1: /'
+# The driver. Everything is compared except what bastioc1 cannot know:
+# the reason a file cannot be read and the solver's own words when it
+# fails (E-SOLVER) come from outside; and bastioc1 names itself.
+mask() {  # stage0's stderr
+  sed -e 's/^\(.*: error\[E-SOLVER\]\): .*$/\1/' \
+      -e 's/^\(.*: error\[E-IMPORT\]: cannot read `[^`]*`\): .*$/\1/' \
+      -e 's/^\(.*: error\[E-PARSE\]: include_bytes: cannot read .*\): [^:]*$/\1/' -e 's/^bastioc0: /bastioc1: /' "$1"
 }
 match=0 differ=0 errors=0
 for f in $files; do
@@ -259,7 +254,7 @@ for f in $files; do
   "$BASTIOC" --check --target "$t" "$f" 2>"$tmp/want.err" >/dev/null; echo "exit $?" >>"$tmp/want.err"
   "$tmp/bastioc1" --check --target "$t" "$f" 2>"$tmp/got.err" >/dev/null; echo "exit $?" >>"$tmp/got.err"
   grep -q 'error\[' "$tmp/want.err" && errors=$((errors+1))
-  mask "$tmp/want.err" "$tmp/got.err" >"$tmp/want"
+  mask "$tmp/want.err" >"$tmp/want"
   cp "$tmp/got.err" "$tmp/got"
   if cmp -s "$tmp/want" "$tmp/got"; then
     match=$((match+1))
@@ -344,8 +339,60 @@ for f in tests/pass/*.bastio; do
     echo "DIFFER $f (built by bastioc1: exit $got, want $want)"
   fi
 done
-echo "-- driver: $match matched ($errors rejected, $cfiles C files, $built programs built and run), $differ differ"
-{ [ "$differ" = 0 ] && [ "$built" -gt 0 ]; } || status=1
+# `--backend native`: the same stderr and exit status as bastioc0 (an
+# unsupported program exits 4 with the same reason), except that stage1's
+# backend may build what stage0's does not support, or stop at something
+# later; what it builds must exit as tests/pass says.
+nbuilt=0
+for f in tests/pass/*.bastio; do
+  "$BASTIOC" --backend native -o "$tmp/nwant" "$f" 2>"$tmp/want.err" >/dev/null; e0=$?; echo "exit $e0" >>"$tmp/want.err"
+  "$tmp/bastioc1" --backend native -o "$tmp/ngot" "$f" 2>"$tmp/got.err" >/dev/null; e=$?; echo "exit $e" >>"$tmp/got.err"
+  mask "$tmp/want.err" >"$tmp/want"
+  ok=1
+  # Both unsupported: stage1's backend supports more, so it may stop at a
+  # later construct than stage0's, with its own reason.
+  [ "$e0" = 4 ] && { [ "$e" = 0 ] || { [ "$e" = 4 ] && grep -q '^bastioc1: the native backend does not support ' "$tmp/got.err"; }; } \
+    || cmp -s "$tmp/want" "$tmp/got.err" || ok=0
+  if [ $ok = 1 ] && [ "$e" = 0 ]; then
+    want=$(sed -n 's|^// expect-exit: *||p' "$f" | head -1)
+    "$tmp/ngot" </dev/null >/dev/null; got=$?
+    if [ "$got" = "$want" ]; then nbuilt=$((nbuilt+1)); else ok=0; fi
+  fi
+  if [ $ok = 1 ]; then
+    match=$((match+1))
+  else
+    differ=$((differ+1))
+    echo "DIFFER $f (--backend native)"
+    diff "$tmp/want" "$tmp/got.err" | head -5 | cut -c1-300 | sed 's/^/    /'
+  fi
+done
+# `--backend native --target user` (stage0 has no such backend): the
+# assembly asmdump --user writes, which links with no C library.
+nuser=0
+for f in tests/user/*.bastio; do
+  if "$tmp/bastioc1" --backend native --target user -o "$tmp/nuser.s" "$f" 2>/dev/null \
+     && "$tmp/asmdump" --user "$f" >"$tmp/nuser_want.s" 2>/dev/null \
+     && cmp -s "$tmp/nuser.s" "$tmp/nuser_want.s" \
+     && as --64 -o "$tmp/nuser.o" "$tmp/nuser.s" \
+     && ld -static -nostdlib --no-undefined -e bst_umain -o "$tmp/nuser" "$tmp/nuser.o"; then
+    nuser=$((nuser+1)); match=$((match+1))
+  else
+    differ=$((differ+1)); echo "DIFFER $f (--backend native --target user)"
+  fi
+done
+# And BastiOS's kernel (`--target kernel`), when a built checkout is next to
+# this one and asmdump builds it (see above).
+if [ -f ../bastios/build/user/sh.bin ] \
+   && "$tmp/asmdump" --kernel ../bastios/src/main.bastio >"$tmp/nkernel_want.s" 2>/dev/null; then
+  if "$tmp/bastioc1" --backend native --target kernel -o "$tmp/nkernel.s" ../bastios/src/main.bastio 2>/dev/null \
+     && cmp -s "$tmp/nkernel.s" "$tmp/nkernel_want.s"; then
+    nuser=$((nuser+1)); match=$((match+1))
+  else
+    differ=$((differ+1)); echo "DIFFER ../bastios/src/main.bastio (--backend native --target kernel)"
+  fi
+fi
+echo "-- driver: $match matched ($errors rejected, $cfiles C files, $built programs built and run, $nbuilt built natively and run, $nuser BastiOS programs built natively), $differ differ"
+{ [ "$differ" = 0 ] && [ "$built" -gt 0 ] && [ "$nbuilt" -gt 0 ] && [ "$nuser" -gt 0 ]; } || status=1
 # The fixed point: bastioc1 (built by stage0) builds itself, and that
 # build writes the same C for bastioc1 as stage0 does.
 if "$tmp/bastioc1" -o "$tmp/gen2" stage1/bastioc1.bastio 2>"$tmp/gen2.err" \
