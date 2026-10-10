@@ -18,8 +18,8 @@
 #   C       stage1/cdump.bastio     vs  bastioc0 --dump-c (the whole C file,
 #           runtime prelude included), on every program the checker accepts
 #   driver  stage1/bastioc1.bastio  vs  bastioc0 itself: what `--check`
-#           prints on stderr and its exit status (the sentence after
-#           `error[CODE]:` masked, as bastioc1 does not print it yet), the
+#           prints on stderr and its exit status (a failed proof's
+#           sentence masked, as bastioc1 does not print it yet), the
 #           C file of `--emit-c`, and the programs it builds, which must
 #           exit as tests/pass says; and bastioc1 built by itself must
 #           write the same C for itself as stage0 (the fixed point)
