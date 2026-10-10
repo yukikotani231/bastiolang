@@ -29,7 +29,8 @@
 //               also its notes (`  = counterexample: ...`), without the
 //               message; exits 1
 //   --lib DIR   also look for imported files in DIR (see `Loader::resolve`);
-//               may be given more than once
+//               may be given more than once; the directories in the
+//               environment variable BASTIO_LIB (`:`-separated) come after
 //   --header F  also write a C header for the program's `export fn`s to F
 //               (a program with an `export fn` is a library and needs no
 //               `main`; build it with --emit-c and link it into a C program)
@@ -120,7 +121,9 @@ impl Loader {
     /// with `.` or `/` is relative to the file only. Any other name is
     /// looked for next to the file, then in each directory above it (up
     /// to `SEARCH_UP` of them, worked out from the path as text), then in
-    /// each `--lib` directory; the first that has it wins. When none has
+    /// each `--lib` directory, then in each directory of the environment
+    /// variable `BASTIO_LIB` (separated by `:`); the first that has it
+    /// wins. When none has
     /// it, the name next to the file is returned, for the error message.
     fn resolve(&self, dir: &Path, name: &str) -> PathBuf {
         let first = dir.join(name);
@@ -136,7 +139,8 @@ impl Loader {
                 return c;
             }
         }
-        for lib in &self.libs {
+        let env = std::env::var("BASTIO_LIB").unwrap_or_default();
+        for lib in self.libs.iter().map(|s| s.as_str()).chain(env.split(':').filter(|s| !s.is_empty())) {
             let c = Path::new(lib).join(name);
             if c.is_file() {
                 return c;
