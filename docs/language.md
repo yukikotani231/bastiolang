@@ -11,11 +11,11 @@ The language as stage0 implements it today: the v0 proof pipeline, plus `&mut` b
 | `Buf` | An owned buffer of u64 elements. **Linear**: must be consumed exactly once |
 | `Bytes` | An owned buffer of bytes. **Linear**. Every element is proved to be `<= 255` |
 | `Host` | The host operating system: command-line arguments and files. **Linear**; hosted programs only, and only `main` is handed one |
-| `&Buf` | A read-only borrow. Allowed **only as a parameter type**, so it can never be returned or stored, and never outlives the call |
+| `&T` | A read-only borrow of any `T`. Allowed **only as a parameter type**, so it can never be returned or stored, and never outlives the call. A borrowed plain value (`&u64`) reads as a copy |
 | `Str` | A string literal: immutable bytes with a length known at compile time. Copyable, never freed |
 | `Serial` | The capability to use the serial console. **Linear**: it cannot be created, only `main` is handed one, and `main` must return it |
 | `&Serial` | A borrowed console, so a helper function can print without taking ownership |
-| `&mut T` | A mutable borrow of any linear `T`, again only as a parameter type. Lent with `&mut x`. The callee may move out of the borrow, but must have put a value back by the time it returns |
+| `&mut T` | A mutable borrow of any `T`, again only as a parameter type. Lent with `&mut x`. The callee may move out of the borrow, but must have put a value back by the time it returns |
 | `Pool` | The physical pages the kernel may hand out. Linear; only `main` is handed one |
 | `Frame` | One physical page (4 KiB). Linear: owned by exactly one place at a time |
 | `PageTable` | A page-table page at level 1 to 5. Linear; it owns the tables and pages its slots point to |
@@ -112,6 +112,27 @@ let n = unbox(b);        // frees the box, hands back what it held
 - The prover unfolds a box that arrives from outside (a parameter, a function's result) two levels deep. Deeper contents are unknown until code looks inside them, and then nothing is known about them: a proof that needs a fact deeper down fails (it is never assumed). Values the function builds itself are tracked to any depth.
 - `box` uses the same allocator as `alloc`: `malloc` on the hosted target, the arena on the freestanding ones. Running out of memory aborts, as for `alloc`.
 - In generated code a `Box[T]` is a `T *`.
+
+## Generics
+
+```
+enum Option[T] { Some(T), None }
+struct Pair[A, B] { a: A, b: B }
+
+fn swap[A, B](p: Pair[A, B]) -> Pair[B, A] {
+  return Pair[B, A] { a: p.b, b: p.a };
+}
+
+let p = swap[u64, Buf](Pair[u64, Buf] { a: 1, b: alloc(4) });
+let o = Option[u64]::Some(5);
+match o { Option::Some(v) => { .. }, Option::None => { .. } }
+```
+
+- Structs, enums and functions can take type parameters. Generics are **monomorphized**: each definition is copied once per list of type arguments it is used with (`Option[u64]`, `swap[u64, Buf]`), and the copies are what is checked, verified and compiled. There is no runtime cost and no boxing.
+- Type arguments are written at every use: calls (`swap[u64, Buf](..)`), struct literals and variants (`Option[u64]::None`). They are not inferred yet. Patterns and `is` tests may leave them out, since the matched value's type has them.
+- A type parameter can stand for any type, linear or not. Each copy is checked on its own, so a generic function that copies or drops its argument works for `u64` and is rejected for `Buf`, with a note naming the copy (like C++ templates, unlike Rust traits).
+- Specifications in a generic function are verified for every copy.
+- A definition that instantiates itself with ever larger arguments (`struct S[T] { next: Box[S[Box[T]]] }`) is rejected.
 
 ## Built-in functions
 

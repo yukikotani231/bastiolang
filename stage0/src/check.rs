@@ -201,6 +201,18 @@ pub fn check_structs(p: &Program) -> Result<(), Diag> {
     Ok(())
 }
 
+/// Locates an error in a copy of a generic function (`dup[Buf]`).
+pub fn in_copy(d: Diag, f: &str) -> Diag {
+    if f.contains('[') { d.note(format!("in `{}`, the copy of a generic function for these type arguments", f)) } else { d }
+}
+
+/// Does the enum name written in a pattern or an `is` test name the enum
+/// `actual`? A generic enum may be written without its type arguments
+/// (`Option::Some` for an `Option[u64]`), since the value's type has them.
+fn names_enum(written: &str, actual: &str) -> bool {
+    written == actual || (actual.starts_with(written) && actual[written.len()..].starts_with('['))
+}
+
 /// A type written in the program must name a known struct, and only linear
 /// values can be borrowed.
 fn known_type(t: &Type, pos: Pos) -> Result<(), Diag> {
@@ -208,14 +220,9 @@ fn known_type(t: &Type, pos: Pos) -> Result<(), Diag> {
         Type::Struct(n) if struct_def(n).is_none() => Err(Diag::new("E-TYPE", pos, format!("unknown type `{}`", n))),
         Type::Enum(n) if enum_def(n).is_none() => Err(Diag::new("E-TYPE", pos, format!("unknown type `{}`", n))),
         Type::Box(i) => known_type(i, pos),
-        Type::Ref(i) | Type::MutRef(i) => {
-            known_type(i, pos)?;
-            if !i.is_linear() {
-                return Err(Diag::new("E-TYPE", pos, format!("only linear values can be borrowed, found `{}`", t.name()))
-                    .note("a struct without linear fields is a plain value: pass it by value"));
-            }
-            Ok(())
-        }
+        // Any value can be borrowed; a borrowed plain value reads as a copy.
+        // (Generic code borrows `&T` whatever `T` turns out to be.)
+        Type::Ref(i) | Type::MutRef(i) => known_type(i, pos),
         _ => Ok(()),
     }
 }
@@ -291,7 +298,7 @@ pub fn check_program(p: &mut Program, target: Target) -> Result<HashMap<String, 
         check_spec_fn(sf, &specs[..i], &sigs, target)?;
     }
     for f in &mut p.fns {
-        check_fn(f, &sigs, &specs, target)?;
+        check_fn(f, &sigs, &specs, target).map_err(|d| in_copy(d, &f.name))?;
     }
     Ok(sigs)
 }
@@ -713,7 +720,7 @@ impl<'a> Ctx<'a> {
                     wild = true;
                 }
                 Pat::Variant(pe, v, b, _) => {
-                    if pe != en {
+                    if !names_enum(pe, en) {
                         return Err(Diag::new("E-TYPE", a.pos, format!("this pattern is a `{}`, but the value matched is a `{}`", pe, en)));
                     }
                     let k = d.index(v).ok_or_else(|| Diag::new("E-TYPE", a.pos, format!("`{}` has no variant `{}`", en, v)))?;
@@ -798,12 +805,13 @@ impl<'a> Ctx<'a> {
     /// Code expression: linear variables in value position are moved.
     fn expr(&mut self, e: &Expr) -> Result<Type, Diag> {
         match &e.kind {
+            ExprKind::TypeApp(..) => unreachable!("removed by monomorphization"),
             ExprKind::Int(_) => Ok(Type::U64),
             ExprKind::Bool(_) => Ok(Type::Bool),
             ExprKind::Str(_) | ExprKind::Blob(_) => Ok(Type::Str),
             ExprKind::MutBorrow(_) => Err(Diag::new("E-TYPE", e.pos, "`&mut x` is only allowed as a call argument")),
             ExprKind::Var(n) => {
-                if let Type::Ref(_) = self.var_info(n, e.pos)?.ty {
+                if matches!(self.var_info(n, e.pos)?.ty, Type::Ref(i) if i.is_linear()) {
                     return Err(Diag::new("E-LINEAR-USE", e.pos, format!("cannot move out of the shared borrow `{}`", n)));
                 }
                 self.use_place(n, e.pos)
@@ -843,10 +851,11 @@ impl<'a> Ctx<'a> {
                         t
                     }
                 };
-                if t != Type::Enum(en.clone()) {
-                    return Err(Diag::new("E-TYPE", x.pos, format!("`is {}::{}` needs a `{}`, found {}", en, v, en, t.name())));
-                }
-                if enum_def(en).and_then(|d| d.index(v)).is_none() {
+                let actual = match &t {
+                    Type::Enum(a) if names_enum(en, a) => a.clone(),
+                    _ => return Err(Diag::new("E-TYPE", x.pos, format!("`is {}::{}` needs a `{}`, found {}", en, v, en, t.name()))),
+                };
+                if enum_def(&actual).and_then(|d| d.index(v)).is_none() {
                     return Err(Diag::new("E-TYPE", e.pos, format!("`{}` has no variant `{}`", en, v)));
                 }
                 Ok(Type::Bool)
@@ -976,6 +985,7 @@ impl<'a> Ctx<'a> {
     /// Specification expression: ghost, never consumes.
     fn spec_expr(&self, e: &Expr, in_ensures: bool, bound: &mut Vec<String>) -> Result<Type, Diag> {
         match &e.kind {
+            ExprKind::TypeApp(..) => unreachable!("removed by monomorphization"),
             ExprKind::Int(_) => Ok(Type::U64),
             ExprKind::Bool(_) => Ok(Type::Bool),
             ExprKind::Str(_) | ExprKind::Blob(_) => Ok(Type::Str),
@@ -983,7 +993,8 @@ impl<'a> Ctx<'a> {
             ExprKind::StructLit(..) | ExprKind::Variant(..) => Err(Diag::new("E-TYPE", e.pos, "struct and enum values cannot be built in a specification")),
             ExprKind::Is(x, en, v) => {
                 let t = self.spec_expr(x, in_ensures, bound)?;
-                if t != Type::Enum(en.clone()) || enum_def(en).and_then(|d| d.index(v)).is_none() {
+                let ok = matches!(&t, Type::Enum(a) if names_enum(en, a) && enum_def(a).and_then(|d| d.index(v)).is_some());
+                if !ok {
                     return Err(Diag::new("E-TYPE", e.pos, format!("`is {}::{}` needs a `{}`, found {}", en, v, en, t.name())));
                 }
                 Ok(Type::Bool)

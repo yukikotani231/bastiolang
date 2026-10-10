@@ -238,7 +238,7 @@ pub fn verify_program(p: &Program) -> Result<(usize, Vec<String>), Diag> {
     v.smt(&format!("(declare-const {} Int)", POOLSIZE))?;
     v.smt(&format!("(assert (and (<= 0 {p}) (<= {p} {})))", FRAME_LIMIT, p = POOLSIZE))?;
     for f in &p.fns {
-        v.verify_fn(f)?;
+        v.verify_fn(f).map_err(|d| crate::check::in_copy(d, &f.name))?;
     }
     let log = std::mem::take(&mut v.solver.log);
     Ok((v.obligations, log))
@@ -729,6 +729,7 @@ impl<'p> Verifier<'p> {
     /// Evaluates a code expression, proving its safety obligations on the way.
     fn eval(&mut self, e: &Expr, st: &mut State) -> Result<Val, Diag> {
         match &e.kind {
+            ExprKind::TypeApp(..) => unreachable!("removed by monomorphization"),
             ExprKind::Int(v) => Ok(Val::U(v.to_string())),
             ExprKind::Bool(b) => Ok(Val::B(b.to_string())),
             ExprKind::Str(bytes) => Ok(str_val(bytes)),
@@ -1189,6 +1190,7 @@ impl<'p> Verifier<'p> {
     /// Translates a ghost specification expression. No obligations.
     fn spec(&mut self, e: &Expr, sc: Scope, bound: &mut Vec<(String, String)>) -> Result<String, Diag> {
         Ok(match &e.kind {
+            ExprKind::TypeApp(..) => unreachable!("removed by monomorphization"),
             ExprKind::Int(v) => v.to_string(),
             ExprKind::Bool(b) => b.to_string(),
             ExprKind::Str(_) | ExprKind::Blob(_) => {

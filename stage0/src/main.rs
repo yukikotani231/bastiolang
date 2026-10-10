@@ -19,6 +19,7 @@ mod check;
 mod codegen;
 mod diag;
 mod lexer;
+mod mono;
 mod parser;
 mod smt;
 mod verify;
@@ -103,6 +104,7 @@ fn main() {
         prog.structs.extend(part.structs);
         prog.enums.extend(part.enums);
     }
+    mono::monomorphize(&mut prog).unwrap_or_else(|d| fail(d));
     ast::resolve_enum_types(&mut prog);
     check::check_structs(&prog).unwrap_or_else(|d| fail(d));
     ast::register_structs(prog.structs.clone());

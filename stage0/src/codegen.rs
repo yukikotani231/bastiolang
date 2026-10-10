@@ -539,8 +539,9 @@ fn cty(t: &Type) -> String {
         Type::Pool => "bst_pool".into(),
         Type::Mmu => "bst_mmu".into(),
         Type::Cpu => "bst_cpu".into(),
-        Type::Struct(n) => format!("bst_s_{}", n),
-        Type::Enum(n) => format!("bst_e_{}", n),
+        Type::Struct(n) => format!("bst_s_{}", cid(n)),
+        Type::Enum(n) => format!("bst_e_{}", cid(n)),
+        Type::Generic(..) => unreachable!("removed by monomorphization"),
         Type::Box(t) => format!("{} *", cty(t)),
         Type::Ref(t) => cty(t),
         Type::MutRef(_) => unreachable!("written by proto"),
@@ -566,14 +567,14 @@ fn struct_decls(p: &Program) -> String {
             }
         }
         if let Some(d) = p.structs.iter().find(|x| x.name == n) {
-            out.push_str(&format!("struct bst_s_{} {{", n));
+            out.push_str(&format!("struct bst_s_{} {{", cid(n)));
             for (f, t) in &d.fields {
                 out.push_str(&format!(" {} {};", cty(t), f));
             }
             out.push_str(" };\n");
         } else {
             let d = p.enums.iter().find(|x| x.name == n).unwrap();
-            out.push_str(&format!("struct bst_e_{} {{ uint64_t tag;", n));
+            out.push_str(&format!("struct bst_e_{} {{ uint64_t tag;", cid(n)));
             if held.iter().any(|t| *t != Type::Unit) {
                 out.push_str(" union {");
                 for (v, t) in &d.variants {
@@ -588,16 +589,33 @@ fn struct_decls(p: &Program) -> String {
     }
     let mut out = String::new();
     for d in &p.structs {
-        out.push_str(&format!("typedef struct bst_s_{0} bst_s_{0};\n", d.name));
+        out.push_str(&format!("typedef struct bst_s_{0} bst_s_{0};\n", cid(&d.name)));
     }
     for d in &p.enums {
-        out.push_str(&format!("typedef struct bst_e_{0} bst_e_{0};\n", d.name));
+        out.push_str(&format!("typedef struct bst_e_{0} bst_e_{0};\n", cid(&d.name)));
     }
     let mut done = Vec::new();
     for n in p.structs.iter().map(|d| &d.name).chain(p.enums.iter().map(|d| &d.name)) {
         emit_one(n, p, &mut done, &mut out);
     }
     out
+}
+
+/// A C identifier for a struct, enum or function name. Generic instances
+/// (`Pair[u64, Buf]`) are spelled with `_L`, `_C` and `_R`; plain names are
+/// unchanged.
+fn cid(n: &str) -> String {
+    let mut s = String::new();
+    for c in n.chars() {
+        match c {
+            '[' => s.push_str("_L"),
+            ']' => s.push_str("_R"),
+            ',' => s.push_str("_C"),
+            ' ' => {}
+            c => s.push(c),
+        }
+    }
+    s
 }
 
 /// The C identifier part for a boxed type's helpers.
@@ -615,7 +633,7 @@ fn proto(f: &FnDef) -> String {
         })
         .collect();
     let ps = if params.is_empty() { "void".to_string() } else { params.join(", ") };
-    format!("static {} f_{}({})", cty(&f.ret), f.name, ps)
+    format!("static {} f_{}({})", cty(&f.ret), cid(&f.name), ps)
 }
 
 fn ind(n: usize) -> String {
@@ -647,6 +665,7 @@ impl<'a> Gen<'a> {
     /// The type of a code expression (the checker has already accepted it).
     fn type_of(&self, e: &Expr) -> Type {
         match &e.kind {
+            ExprKind::TypeApp(..) => unreachable!("removed by monomorphization"),
             ExprKind::Int(_) => Type::U64,
             ExprKind::Bool(_) | ExprKind::Not(_) | ExprKind::Is(..) => Type::Bool,
             ExprKind::Str(_) | ExprKind::Blob(_) => Type::Str,
@@ -710,25 +729,14 @@ impl<'a> Gen<'a> {
                 out.push_str(&format!("{}}}\n", ind(d)));
             }
             StmtKind::Match { scrut, arms } => {
-                // The enum's name comes from the patterns; a match with only
-                // `_` needs no temporary, it just evaluates the scrutinee.
+                // The enum comes from the scrutinee's type (a pattern may
+                // leave out a generic enum's type arguments).
                 let e = self.expr(scrut);
-                let en = arms.iter().find_map(|a| match &a.pat {
-                    Pat::Variant(en, ..) => Some(en.clone()),
-                    Pat::Wild => None,
-                });
-                let Some(en) = en else {
-                    out.push_str(&format!("{}{{\n{}(void)({});\n", ind(d), ind(d + 1), e));
-                    for s in arms.iter().flat_map(|a| &a.body) {
-                        self.stmt(s, d + 1, out);
-                    }
-                    out.push_str(&format!("{}}}\n", ind(d)));
-                    return;
-                };
+                let en = self.type_of(scrut).name();
                 let d_en = enum_def(&en).unwrap();
                 let m = format!("m_{}", self.tmps);
                 self.tmps += 1;
-                out.push_str(&format!("{}{{\n{}bst_e_{} {} = {};\n", ind(d), ind(d + 1), en, m, e));
+                out.push_str(&format!("{}{{\n{}bst_e_{} {} = {};\n", ind(d), ind(d + 1), cid(&en), m, e));
                 // The match is exhaustive (checked), so the last arm needs no test.
                 for (i, a) in arms.iter().enumerate() {
                     let kw = if i == 0 { "if" } else { "} else if" };
@@ -774,6 +782,7 @@ impl<'a> Gen<'a> {
 
     fn expr(&mut self, e: &Expr) -> String {
         match &e.kind {
+            ExprKind::TypeApp(..) => unreachable!("removed by monomorphization"),
             ExprKind::Int(v) => format!("UINT64_C({})", v),
             ExprKind::Bool(b) => b.to_string(),
             ExprKind::Str(bytes) => {
@@ -794,13 +803,16 @@ impl<'a> Gen<'a> {
             ExprKind::Field(..) => self.place(&place(e).expect("checked: a place")),
             ExprKind::StructLit(n, fs) => {
                 let inits: Vec<String> = fs.iter().map(|(f, x)| format!(".{} = {}", f, self.expr(x))).collect();
-                format!("((bst_s_{}){{ {} }})", n, inits.join(", "))
+                format!("((bst_s_{}){{ {} }})", cid(n), inits.join(", "))
             }
             ExprKind::Variant(n, v, payload) => match payload {
-                Some(x) => format!("((bst_e_{}){{ .tag = {}, .u.{} = {} }})", n, enum_def(n).unwrap().index(v).unwrap(), v, self.expr(x)),
-                None => format!("((bst_e_{}){{ .tag = {} }})", n, enum_def(n).unwrap().index(v).unwrap()),
+                Some(x) => format!("((bst_e_{}){{ .tag = {}, .u.{} = {} }})", cid(n), enum_def(n).unwrap().index(v).unwrap(), v, self.expr(x)),
+                None => format!("((bst_e_{}){{ .tag = {} }})", cid(n), enum_def(n).unwrap().index(v).unwrap()),
             },
-            ExprKind::Is(x, n, v) => format!("({}.tag == {})", self.expr(x), enum_def(n).unwrap().index(v).unwrap()),
+            ExprKind::Is(x, _, v) => {
+                let n = self.type_of(x).name();
+                format!("({}.tag == {})", self.expr(x), enum_def(&n).unwrap().index(v).unwrap())
+            }
             ExprKind::Not(x) => format!("(!{})", self.expr(x)),
             ExprKind::Bin(op, a, b) => format!("({} {} {})", self.expr(a), op.text(), self.expr(b)),
             ExprKind::Forall(..) => unreachable!("specification only"),
@@ -822,7 +834,7 @@ impl<'a> Gen<'a> {
                     "blen" => format!("{}.len", a[0]),
                     "bget" => format!("((uint64_t){}.data[{}])", a[0], a[1]),
                     n if crate::check::is_builtin(n) => format!("bst_{}({})", name, a.join(", ")),
-                    _ => format!("f_{}({})", name, a.join(", ")),
+                    _ => format!("f_{}({})", cid(name), a.join(", ")),
                 }
             }
         }
