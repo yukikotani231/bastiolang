@@ -555,11 +555,11 @@ static inline bst_frame bst_pt_free_root(bst_mmu m, bst_pt t) { (void)m; return 
 
 /* Saved user registers: rax rbx rcx rdx rsi rdi rbp r8-r15 (0-14), rip (15),
  * rsp (16), rflags (17), error code (18), fault address (19), FS base (20). */
-extern uint64_t bst_cpu_ctx[21];
+extern uint64_t *bst_platform_ctx(void); /* this processor's saved context, 21 words */
 extern uint64_t bst_cpu_enter(void);   /* enter user mode; returns the trap vector */
 extern uint64_t bst_cpu_wait(void);    /* sti; hlt; cli; returns the interrupt vector */
-static inline uint64_t bst_cpu_get(bst_cpu c, uint64_t r) { (void)c; return bst_cpu_ctx[r]; }
-static inline void bst_cpu_set(bst_cpu *c, uint64_t r, uint64_t v) { (void)c; bst_cpu_ctx[r] = v; }
+static inline uint64_t bst_cpu_get(bst_cpu c, uint64_t r) { (void)c; return bst_platform_ctx()[r]; }
+static inline void bst_cpu_set(bst_cpu *c, uint64_t r, uint64_t v) { (void)c; bst_platform_ctx()[r] = v; }
 /* The user's x87/SSE state, in a page the kernel owns (the platform has
  * enabled CR4.OSFXSR). fxrstor faults on reserved MXCSR bits, so the load
  * works from a copy with only the defined bits (0-15) kept. */
