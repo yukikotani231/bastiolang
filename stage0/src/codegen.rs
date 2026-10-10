@@ -82,7 +82,6 @@ pub fn emit(p: &Program, target: Target) -> String {
     }
     for t in &boxed {
         let (c, n) = (cty(t), box_helper(t));
-        out.push_str(&format!("static {c} *bst_box_{n}({c} v) {{ {c} *p = ({c} *)bst_box_alloc(sizeof({c})); *p = v; return p; }}\n"));
         out.push_str(&format!("static {c} bst_unbox_{n}({c} *p) {{ {c} v = *p; bst_box_free(p, sizeof({c})); return v; }}\n"));
     }
     for (i, b) in blobs.iter().enumerate() {
@@ -1017,7 +1016,17 @@ impl<'a> Gen<'a> {
                 if !self.boxed.contains(&inner) {
                     self.boxed.push(inner.clone());
                 }
-                format!("bst_{}_{}({})", name, box_helper(&inner), self.expr(&args[0]))
+                if name == "unbox" {
+                    return format!("bst_unbox_{}({})", box_helper(&inner), self.expr(&args[0]));
+                }
+                // Allocate the box before evaluating its contents, so a
+                // recursive structure is laid out parent first (preorder),
+                // the order a traversal reads it in. Allocation has no
+                // observable effect, so moving it earlier changes nothing else.
+                let c = cty(&inner);
+                let p = format!("bp_{}", self.tmps);
+                self.tmps += 1;
+                format!("({{ {c} *{p} = ({c} *)bst_box_alloc(sizeof({c})); *{p} = {}; {p}; }})", self.expr(&args[0]))
             }
             ExprKind::Call(name, args) => {
                 let a: Vec<String> = args.iter().map(|x| self.expr(x)).collect();
