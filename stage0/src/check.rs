@@ -682,7 +682,9 @@ impl<'a> Ctx<'a> {
         }
         // A name may be reused once its earlier binding's scope has ended
         // (two arms binding `v`), but never shadow one still in scope.
-        if self.vars.contains_key(name) || self.sigs.contains_key(name) || is_ghost(name) || self.specs.iter().any(|s| s.name == name) {
+        // Functions, spec fns and builtins live apart: a call `f(..)` always
+        // means the function, so a local may share its name.
+        if self.vars.contains_key(name) {
             return Err(Diag::new("E-TYPE", pos, format!("`{}` is already defined (shadowing is not allowed)", name)));
         }
         self.vars.insert(name.to_string(), VarInfo { ty, mutable });

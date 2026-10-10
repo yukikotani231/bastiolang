@@ -252,7 +252,7 @@ fn main() -> u64 {
 }
 ```
 
-**Names.** A name cannot shadow another that is still in scope (`E-TYPE`). Once a block ends its names can be used again, so two `match` arms can both bind `v`.
+**Names.** A name cannot shadow another that is still in scope (`E-TYPE`). Once a block ends its names can be used again, so two `match` arms can both bind `v`. Functions (including builtins and spec fns) are named apart from variables: a call `f(..)` always means the function, so a local may be called `len` or `step` even where a function `step` exists. Where a function is passed by name (`locked(l, f)`, `smp_run(f, ..)`), a local of the same name in scope is `E-TYPE`.
 
 ## Functions and contracts
 

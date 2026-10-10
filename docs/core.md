@@ -18,8 +18,6 @@ import "../core/num.bastio";
 
 All files share one namespace (see [Programs and files](language.md#programs-and-files)), so every function is prefixed by its module (`bytes_`, `text_`, `hmap_`, ...) except the few whose names say what they are (`parse_u64`, `fmt_u64`, `print_str`, `sort_u64`). Two names are taken without a prefix: the types `Option[T]` and `Span`. A program that imports core must not define its own.
 
-**A trap: local names.** In Bastio a local variable or parameter may not have the name of any function in the program. core's functions use ordinary local names (`i`, `n`, `start`, `out`, ...), so a program that defines a function with one of those names cannot import core. Give such helpers longer names. This is a language rule, not a library choice; it is listed under [Gaps](#gaps).
-
 The tests are the worked examples: `tests/pass/core_*.bastio` and `tests/pass/std_host.bastio` use every function, and `tests/user/core_user.bastio` builds core for a BastiOS user program.
 
 ## Conventions
@@ -121,13 +119,12 @@ Insertion sort is quadratic in the worst case. It was chosen because its proof i
 
 ## Gaps
 
-What the library would say if the language let it. Each is a language or verifier change, not a library change. (`old(x)` in loop invariants was the first such gap; it is in the language now, and the text functions and `bytes_copy_into` use it.)
+What the library would say if the language let it. Each is a language or verifier change, not a library change. (Two earlier gaps are closed: `old(x)` is allowed in loop invariants, which the text functions and `bytes_copy_into` use, and a local variable may share a function's name, so importing core no longer reserves its local names.)
 
 1. **Generic spec fns.** `spec fn` cannot take type parameters, so a property of a `HashMap[V]` cannot be named; the hash map therefore holds `u64` values only.
 2. **Counting.** Specifications have `forall` but no way to count elements, so "the map has `len` keys" and "the sort output is a permutation of the input" cannot be stated. Recursive spec fns or a multiset theory would allow both, and also "this parse gives the value of these digits".
-3. **Local names and function names share one namespace.** A program cannot have a function named like any local variable of any function it imports (see [Using it](#using-it)). Letting a local shadow a function, or qualified names (ROADMAP v1 item 6), would remove the trap.
-4. **Library search paths.** Imports are relative to the importing file, so where core lives is written into every import. A `--lib` path or an `import core "text"` form would fix it.
-5. **Length bounds on `Bytes`.** Nothing says an existing `Bytes` is at most 2^60 long (a `Vec` push gets such a fact), so `bytes_concat` must ask for it.
+3. **Library search paths.** Imports are relative to the importing file, so where core lives is written into every import. A `--lib` path or an `import core "text"` form would fix it.
+4. **Length bounds on `Bytes`.** Nothing says an existing `Bytes` is at most 2^60 long (a `Vec` push gets such a fact), so `bytes_concat` must ask for it.
 
 ## Where it came from
 
