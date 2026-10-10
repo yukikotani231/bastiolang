@@ -1555,6 +1555,7 @@ pub fn trusted_base() -> String {
             }
         }
     }
+    out.push_str(&format!("native backend (--backend native, hosted): {} runtime lines of assembly\n", lines(crate::x86::RUNTIME)));
     for (name, avail) in crate::check::builtin_list() {
         out.push_str(&format!("builtin {} ({})\n", name, avail));
     }

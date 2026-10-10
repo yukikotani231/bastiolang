@@ -21,6 +21,9 @@
 //   --dump-c    the generated C, after type and linearity checking but
 //               without verifying, on stdout; an error prints
 //               `error file:line:col CODE` (stage1's differential test)
+//   --backend native  generate x86-64 assembly directly instead of C
+//               (experimental, hosted target only; see `x86.rs`)
+//   --emit-asm  with `--backend native`: write the assembly to `out`
 //   --dump-verify  verify, then print `N proof obligation(s)`; an error
 //               prints `error file:line:col CODE`, and a verification error
 //               also its notes (`  = counterexample: ...`), without the
@@ -46,6 +49,7 @@ mod mono;
 mod parser;
 mod smt;
 mod verify;
+mod x86;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -131,6 +135,8 @@ fn main() {
     let mut dump_ast = false;
     let mut dump_mono = false;
     let mut dump_check = false;
+    let mut native = false;
+    let mut emit_asm = false;
     let mut dump_verify = false;
     let mut dump_c = false;
     let mut target = codegen::Target::Hosted;
@@ -147,6 +153,18 @@ fn main() {
             "--dump-ast" => dump_ast = true,
             "--dump-mono" => dump_mono = true,
             "--dump-check" => dump_check = true,
+            "--emit-asm" => emit_asm = true,
+            "--backend" => {
+                i += 1;
+                native = match args.get(i).map(|s| s.as_str()) {
+                    Some("c") => false,
+                    Some("native") => true,
+                    other => {
+                        eprintln!("bastioc0: unknown backend {:?} (expected `c` or `native`)", other);
+                        exit(2);
+                    }
+                };
+            }
             "--dump-verify" => dump_verify = true,
             "--dump-c" => dump_c = true,
             "--trusted-base" => {
@@ -321,6 +339,9 @@ fn main() {
         exit(2);
     }
 
+    if native {
+        return x86::build(&prog, target, emit_asm, out);
+    }
     let c = codegen::emit(&prog, target);
     if emit_c {
         let path = out.unwrap_or_else(|| "out.c".into());
