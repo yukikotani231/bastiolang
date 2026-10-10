@@ -800,6 +800,7 @@ fn main(pool: &mut Pool) -> u64 {
 | `cpu_fpu_load(c: &mut Cpu, f: &Frame)` | | Loads them from the page (`fxrstor64`); reserved MXCSR bits are cleared first, so any contents are safe to load. A kernel that runs several user contexts keeps one page per context and swaps them around `cpu_run` |
 | `cpu_run(c: &mut Cpu, m: &Mmu) -> u64` | | Runs the saved context in user mode until the next trap; returns its vector (`<= 255`) |
 | `cpu_idle(c: &mut Cpu) -> u64` | | Waits for an interrupt; returns its vector |
+| `cpu_count(c: &Cpu) -> u64` | | Processors the platform has started, this one included: between 1 and 4096. The others run no Bastio code yet; see [concurrency.md](concurrency.md) |
 
 ```bastio
 // expect-ok
