@@ -413,23 +413,46 @@ fn out_error(out: &mut Vec[u64], v: &Vr, p: &Parser) {
   out_str(&mut out, "\n");
 }
 
-/// Runs the solver over the recorded log. True if every obligation holds;
-/// otherwise the first that fails is recorded (`fail_at`, `fail_code`) and
-/// `rep` gets its notes, one `  = ..` line each.
-fn solve(v: &mut Vr, m: &Mono, p: &Parser, h: &Host, rep: &mut Vec[u64]) -> bool {
+/// Starts the solver (`BASTIO_SOLVER`, default `z3`, as stage0 does) and
+/// sends the two commands every session starts with.
+fn z3_start(h: &Host) -> Child {
   let mut argv = vec_new[Bytes]();
-  push_arg(&mut argv, "z3");
+  let mut cmd = balloc(0);
+  if host_env(h, "BASTIO_SOLVER", &mut cmd) {
+    vec_push(&mut argv, cmd);
+  } else {
+    bfree(cmd);
+    push_arg(&mut argv, "z3");
+  }
   push_arg(&mut argv, "-in");
   push_arg(&mut argv, "-smt2");
   let mut z = host_spawn(h, argv);
   drop_argv(argv);
   let mut out = vec_new[u64]();
-  let mut resp = vec_new[u64]();
   out_header(&mut out);
+  z3_send(&mut z, &mut out);
+  vec_free(out);
+  return z;
+}
+
+fn z3_stop(z: Child) {
+  let mut w = z;
+  child_close(&mut w);
+  child_wait(w);
+}
+
+/// Sends the commands log[from..to) to the solver `z`, reading the answer
+/// to each `(check-sat)`; `ob0` is the index of the first obligation among
+/// them. True if every obligation holds; otherwise the first that fails is
+/// recorded (`fail_at`, `fail_code`) and `rep` gets its notes, one `  = ..`
+/// line each.
+fn solve_range(v: &mut Vr, m: &Mono, p: &Parser, z: &mut Child, rep: &mut Vec[u64], from: u64, to: u64, ob0: u64) -> bool {
+  let mut out = vec_new[u64]();
+  let mut resp = vec_new[u64]();
   let mut ok = true;
-  let mut ob = 0;
-  let mut k = 0;
-  while k < vec_len(v.log) && ok {
+  let mut ob = ob0;
+  let mut k = from;
+  while k < to && k < vec_len(v.log) && ok {
     let cmd = vec_get(v.log, k);
     out_cmd(&mut out, v, cmd);
     if cmd.kind == CMD_FAIL {
@@ -478,10 +501,360 @@ fn solve(v: &mut Vr, m: &Mono, p: &Parser, h: &Host, rep: &mut Vec[u64]) -> bool
     }
     k = k + 1;
   }
+  if ok {
+    z3_send(&mut z, &mut out);
+  }
   vec_free(out);
   vec_free(resp);
-  child_close(&mut z);
-  child_wait(z);
+  return ok;
+}
+
+/// Runs one solver over the whole recorded log, in program order (what
+/// `--dump-verify` does, which verifydump.bastio is compared with). True
+/// if every obligation holds; otherwise the first that fails is recorded.
+fn solve(v: &mut Vr, m: &Mono, p: &Parser, h: &Host, rep: &mut Vec[u64]) -> bool {
+  let mut z = z3_start(h);
+  let ok = solve_range(&mut v, m, p, &mut z, &mut rep, 0, vec_len(v.log), 0);
+  z3_stop(z);
+  return ok;
+}
+
+// ---- Proving in parallel ----
+
+/// The commands of one function: log[s..e), its obligations from `ob` on,
+/// `checks` of them sent to the solver, and whether a failure found
+/// without the solver (CMD_FAIL) is among them.
+struct Unit { s: u64, e: u64, ob: u64, checks: u64, fail: bool }
+
+fn unit_len(u: Unit) -> u64 {
+  if u.e >= u.s {
+    return u.e - u.s;
+  }
+  return 0;
+}
+
+fn unit_at(us: &Vec[Unit], k: u64) -> Unit {
+  if k < vec_len(us) {
+    return vec_get(us, k);
+  }
+  return Unit { s: 0, e: 0, ob: 0, checks: 0, fail: false };
+}
+
+/// Splits the log into the preamble (log[0..returned)) and one unit per
+/// function. Each function is verified in a solver scope of its own
+/// (verify_program), so a unit ends where the scope it opened is closed.
+fn units_of(v: &Vr, us: &mut Vec[Unit]) -> u64 {
+  let n = vec_len(v.log);
+  let mut pre = n;
+  let mut started = false;
+  let mut s = 0;
+  let mut depth = 0;
+  let mut ob = 0;
+  let mut uob = 0;
+  let mut checks = 0;
+  let mut bad = false;
+  let mut k = 0;
+  while k < n {
+    let cmd = vec_get(v.log, k);
+    if !started && depth == 0 && (cmd.kind == CMD_PUSH || cmd.kind == CMD_FAIL) {
+      started = true;
+      pre = k;
+      s = k;
+    }
+    if cmd.kind == CMD_PUSH {
+      depth = vadd(depth, 1);
+    } else if cmd.kind == CMD_CHECK {
+      checks = vadd(checks, 1);
+      ob = vadd(ob, 1);
+    } else if cmd.kind == CMD_FAIL {
+      bad = true;
+      ob = vadd(ob, 1);
+    } else if cmd.kind == CMD_POP && depth > 0 {
+      depth = depth - 1;
+      if depth == 0 && started {
+        vec_push(&mut us, Unit { s: s, e: k + 1, ob: uob, checks: checks, fail: bad });
+        s = k + 1;
+        uob = ob;
+        checks = 0;
+        bad = false;
+      }
+    }
+    k = k + 1;
+  }
+  return pre;
+}
+
+/// The number of solvers to run at once: `BASTIO_JOBS`, or the number of
+/// processors (at most 8), as stage0 decides it.
+fn solve_jobs(h: &Host) -> u64 {
+  let mut j = host_cpus(h);
+  if j > 8 {
+    j = 8;
+  }
+  let mut b = balloc(0);
+  if host_env(h, "BASTIO_JOBS", &mut b) && blen(b) > 0 && blen(b) <= 18 {
+    let mut n = 0;
+    let mut digits = true;
+    let mut k = 0;
+    while k < blen(b) && k <= 18 {
+      let ch = cast[u64](bget(b, k));
+      if ch >= 48 && ch <= 57 && n < 100000000000000000 {
+        n = n * 10 + (ch - 48);
+      } else {
+        digits = false;
+      }
+      k = k + 1;
+    }
+    if digits {
+      j = n;
+    }
+  }
+  bfree(b);
+  if j < 1 {
+    j = 1;
+  }
+  return j;
+}
+
+/// Appends the commands log[s..e) to `out`.
+fn out_range(out: &mut Vec[u64], v: &Vr, s: u64, e: u64) {
+  let mut k = s;
+  while k < e && k < vec_len(v.log) {
+    out_cmd(&mut out, v, vec_get(v.log, k));
+    k = k + 1;
+  }
+}
+
+/// Sends log[s..e) to the solver `z` without reading anything.
+fn send_range(v: &Vr, z: &mut Child, s: u64, e: u64) {
+  let mut out = vec_new[u64]();
+  out_range(&mut out, v, s, e);
+  z3_send(&mut z, &mut out);
+  vec_free(out);
+}
+
+/// Reads the answers to unit u's checks: true if all are `unsat`.
+fn unit_holds(z: &mut Child, u: Unit) -> bool {
+  if u.fail {
+    return false;
+  }
+  let mut resp = vec_new[u64]();
+  let mut ok = true;
+  let mut k = 0;
+  while k < u.checks && ok {
+    ok = z3_read(&mut z, &mut resp) && is_text(resp, trim(resp), "unsat");
+    k = k + 1;
+  }
+  vec_free(resp);
+  return ok;
+}
+
+/// A child that is no process (there is no program to start): a
+/// placeholder while a solver is taken out of the list.
+fn no_child(h: &Host) -> Child {
+  let argv = vec_new[Bytes]();
+  let c = host_spawn(h, argv);
+  vec_free(argv);
+  return c;
+}
+
+/// Runs `argv` and returns the first line it prints (empty if none).
+fn run_line(h: &Host, argv: Vec[Bytes]) -> Bytes {
+  let mut c = host_spawn(h, argv);
+  drop_argv(argv);
+  child_close(&mut c);
+  let mut line = balloc(0);
+  child_read_line(&mut c, &mut line);
+  child_wait(c);
+  return line;
+}
+
+/// Writes the text in `body` to the file `path`.
+fn write_body(h: &Host, path: &Bytes, body: &Vec[u64]) -> bool {
+  let mut b = balloc(vec_len(body));
+  let mut k = 0;
+  while k < vec_len(body) && k < blen(b) {
+    let ch = u_at(body, k);
+    if ch <= 255 {
+      bset(&mut b, k, cast[u8](ch));
+    }
+    k = k + 1;
+  }
+  let ok = host_write(h, path, b);
+  bfree(b);
+  return ok;
+}
+
+/// As `solve`, with up to `jobs` solvers at once, as stage0 proves. Each
+/// function goes to the solver with the least work so far (counted in
+/// commands). A solver reads its functions from a file, so none waits for
+/// this process to hand it the next; its answers are read in program
+/// order, so the first function found failing is the first in program
+/// order. Then the solvers are stopped, and that function is proved again
+/// on a solver of its own, step by step, for its counterexample and notes:
+/// the same report as `solve` gives. Without a temporary directory
+/// (`mktemp -d`) the proofs run on one solver.
+fn solve_par(v: &mut Vr, m: &Mono, p: &Parser, h: &Host, rep: &mut Vec[u64], jobs: u64) -> bool {
+  let mut us = vec_new[Unit]();
+  let pre = units_of(v, &mut us);
+  let n = vec_len(us);
+  let mut dir = balloc(0);
+  if jobs > 1 && n > 1 {
+    let mut argv = vec_new[Bytes]();
+    push_arg(&mut argv, "mktemp");
+    push_arg(&mut argv, "-d");
+    bfree(dir);
+    dir = run_line(h, argv);
+  }
+  if blen(dir) == 0 {
+    bfree(dir);
+    vec_free(us);
+    return solve(&mut v, m, p, h, &mut rep);
+  }
+  let mut nj = jobs;
+  if nj > n {
+    nj = n;
+  }
+  // Who proves each function.
+  let mut owner = vec_new[u64]();
+  let mut work = vec_new[u64]();
+  let mut j = 0;
+  while j < nj {
+    vec_push(&mut work, 0);
+    j = j + 1;
+  }
+  let mut k = 0;
+  while k < n {
+    let u = unit_at(us, k);
+    let mut best = 0;
+    j = 1;
+    while j < nj {
+      if u_at(work, j) < u_at(work, best) {
+        best = j;
+      }
+      j = j + 1;
+    }
+    if best < vec_len(work) {
+      let w = vadd(u_at(work, best), unit_len(u));
+      vec_set(&mut work, best, w);
+    }
+    vec_push(&mut owner, best);
+    k = k + 1;
+  }
+  vec_free(work);
+  // Each solver's script, and the solver started on it. `sh` prints the
+  // solver's process id first, so it can be stopped.
+  let mut solver = balloc(0);
+  if !host_env(h, "BASTIO_SOLVER", &mut solver) {
+    bfree(solver);
+    solver = bfrom("z3");
+  }
+  let mut zs = vec_new[Child]();
+  let mut pids = vec_new[Bytes]();
+  j = 0;
+  while j < nj {
+    let mut script = vec_new[u64]();
+    out_header(&mut script);
+    out_range(&mut script, v, 0, pre);
+    k = 0;
+    while k < n {
+      if u_at(owner, k) == j {
+        let u = unit_at(us, k);
+        out_range(&mut script, v, u.s, u.e);
+      }
+      k = k + 1;
+    }
+    // `<dir>/<j>.smt2`
+    let mut full = vec_new[u64]();
+    k = 0;
+    while k < blen(dir) {
+      vec_push(&mut full, cast[u64](bget(dir, k)));
+      k = k + 1;
+    }
+    out_str(&mut full, "/");
+    out_num(&mut full, j);
+    out_str(&mut full, ".smt2");
+    let mut fb = balloc(vec_len(full));
+    k = 0;
+    while k < vec_len(full) && k < blen(fb) {
+      let ch = u_at(full, k);
+      if ch <= 255 {
+        bset(&mut fb, k, cast[u8](ch));
+      }
+      k = k + 1;
+    }
+    vec_free(full);
+    write_body(h, fb, script);
+    vec_free(script);
+    let mut argv = vec_new[Bytes]();
+    push_arg(&mut argv, "sh");
+    push_arg(&mut argv, "-c");
+    push_arg(&mut argv, "echo $$; exec \"$0\" -smt2 \"$1\"");
+    vec_push(&mut argv, copy_bytes(solver));
+    vec_push(&mut argv, fb);
+    let mut z = host_spawn(h, argv);
+    drop_argv(argv);
+    let mut pid = balloc(0);
+    child_read_line(&mut z, &mut pid);
+    vec_push(&mut pids, pid);
+    vec_push(&mut zs, z);
+    j = j + 1;
+  }
+  bfree(solver);
+  let mut failed = n;
+  let mut r = 0;
+  while r < n && failed == n {
+    let o = u_at(owner, r);
+    if o < vec_len(zs) {
+      let mut z = vec_swap(&mut zs, o, no_child(h));
+      if !unit_holds(&mut z, unit_at(us, r)) {
+        failed = r;
+      }
+      child_wait(vec_swap(&mut zs, o, z));
+    }
+    r = r + 1;
+  }
+  // Stop the solvers still working (after a failure), then wait for all.
+  while vec_len(pids) > 0 {
+    let pid = vec_pop(&mut pids);
+    if failed < n && blen(pid) > 0 {
+      let mut argv = vec_new[Bytes]();
+      push_arg(&mut argv, "kill");
+      vec_push(&mut argv, pid);
+      let c = host_spawn(h, argv);
+      drop_argv(argv);
+      child_wait(c);
+    } else {
+      bfree(pid);
+    }
+  }
+  vec_free(pids);
+  while vec_len(zs) > 0 {
+    z3_stop(vec_pop(&mut zs));
+  }
+  vec_free(zs);
+  vec_free(owner);
+  let mut argv = vec_new[Bytes]();
+  push_arg(&mut argv, "rm");
+  push_arg(&mut argv, "-rf");
+  vec_push(&mut argv, dir);
+  let rm = host_spawn(h, argv);
+  drop_argv(argv);
+  child_wait(rm);
+  let mut ok = true;
+  if failed < n {
+    let u = unit_at(us, failed);
+    let mut z = z3_start(h);
+    send_range(v, &mut z, 0, pre);
+    ok = solve_range(&mut v, m, p, &mut z, &mut rep, u.s, u.e, u.ob);
+    z3_stop(z);
+    if ok {
+      // It held on its own (a query near the timeout): the whole log in
+      // order decides.
+      ok = solve(&mut v, m, p, h, &mut rep);
+    }
+  }
+  vec_free(us);
   return ok;
 }
 

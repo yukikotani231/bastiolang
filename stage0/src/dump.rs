@@ -156,7 +156,7 @@ pub fn program(prog: &Program) -> String {
         out.push_str(")\n");
     }
     for s in &prog.specs {
-        out.push_str(&format!("(spec {} {} {} {} {})\n", p(s.pos), s.name, params(&s.params), s.ret.name(), expr(&s.body)));
+        out.push_str(&format!("(spec {} {} {} {} {} {})\n", p(s.pos), s.name, tparams(&s.tparams), params(&s.params), s.ret.name(), expr(&s.body)));
     }
     for f in &prog.fns {
         out.push_str(&format!("({} {} {} {} {} {}", if f.export { "export-fn" } else { "fn" }, p(f.pos), f.name, tparams(&f.tparams), params(&f.params), f.ret.name()));

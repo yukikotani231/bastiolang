@@ -1,0 +1,50 @@
+// expect-exit: 42
+// The environment and the processor count (`host_env`, `host_cpus`), and
+// two children at once: closing the first one's input ends it even while
+// the second is running (the second does not hold the first one's pipe).
+
+fn cat(h: &Host) -> Child {
+  let mut argv = vec_new[Bytes]();
+  vec_push(&mut argv, bfrom("cat"));
+  let c = host_spawn(h, argv);
+  while vec_len(argv) > 0 {
+    bfree(vec_pop(&mut argv));
+  }
+  vec_free(argv);
+  return c;
+}
+
+fn main(h: &mut Host) -> u64 {
+  let mut score = 0;
+  let mut v = bfrom("unchanged");
+  // Not set: false, and `v` is kept.
+  if !host_env(h, "BASTIO_TEST_SURELY_UNSET", &mut v) && blen(v) == 9 {
+    score = score + 10;
+  }
+  // PATH is set wherever the tests run (they start `cc`).
+  if host_env(h, "PATH", &mut v) && blen(v) > 0 {
+    score = score + 10;
+  }
+  bfree(v);
+  if host_cpus(h) >= 1 {
+    score = score + 10;
+  }
+  let mut a = cat(h);
+  let mut b = cat(h);
+  let line = bfrom("x\n");
+  child_write(&mut a, line);
+  bfree(line);
+  child_close(&mut a);
+  let mut got = balloc(0);
+  if child_read_line(&mut a, &mut got) && blen(got) == 1 {
+    score = score + 6;
+  }
+  // `a` has ended although `b` still runs.
+  if child_wait(a) == 0 {
+    score = score + 6;
+  }
+  bfree(got);
+  child_close(&mut b);
+  child_wait(b);
+  return score;
+}

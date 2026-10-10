@@ -18,8 +18,6 @@ import "../core/num.bastio";
 
 All files share one namespace (see [Programs and files](language.md#programs-and-files)), so every function is prefixed by its module (`bytes_`, `text_`, `hmap_`, ...) except the few whose names say what they are (`parse_u64`, `fmt_u64`, `print_str`, `sort_u64`). Two names are taken without a prefix: the types `Option[T]` and `Span`. A program that imports core must not define its own.
 
-**A trap: local names.** In Bastio a local variable or parameter may not have the name of any function in the program. core's functions use ordinary local names (`i`, `n`, `start`, `out`, ...), so a program that defines a function with one of those names cannot import core. Give such helpers longer names. This is a language rule, not a library choice; it is listed under [Gaps](#gaps).
-
 The tests are the worked examples: `tests/pass/core_*.bastio` and `tests/pass/std_host.bastio` use every function, and `tests/user/core_user.bastio` builds core for a BastiOS user program.
 
 ## Conventions
@@ -100,15 +98,15 @@ hmap_free(m);
 
 `hmap_new`, `hmap_with_cap`, `hmap_len`, `hmap_insert` (returns the replaced value), `hmap_get`, `hmap_get_or`, `hmap_contains`, `hmap_remove`, `hmap_keys`, `hmap_free`, and `hash_u64`, the mixing function it uses.
 
-Proved: every index is in bounds and no counter overflows (from `hmap_ok`, which every function needs and keeps); after `hmap_insert(m, k, v)` the map holds `k` with `v` (spec fn `hmap_maps`); a value `hmap_get` returns is one the map holds for that key. Not proved: that a lookup finds every key present, and that `len` counts the keys. One decrement in `hmap_remove` is guarded by a test rather than proved, for that reason.
+Proved: every index is in bounds and no counter overflows; `len` is the number of keys and `used` the number of slots that are not empty (both from `hmap_ok`, which every function needs and keeps, and which states them with `vcount`); after `hmap_insert(m, k, v)` the map holds `k` with `v` (spec fn `hmap_maps`); a value `hmap_get` returns is one the map holds for that key. Not proved: that a lookup finds every key present. Inserting a new key falls back to a plain scan for an empty slot if its probe sequence finds none; the probe sequence visits every slot, but the prover does not follow it around the table, so the scan is there and its failure is what is proved unreachable.
 
-**Linear values.** The map holds only numbers. To map keys to buffers or other linear values, keep the values in a `Vec[T]` and map each key to its index (`tests/pass/core_hashmap.bastio` does this). A generic `HashMap[V]` was tried first and dropped: spec fns cannot be generic, so its well-formedness could not be named in a caller's loop invariant.
+**Linear values.** The map holds only numbers. To map keys to buffers or other linear values, keep the values in a `Vec[T]` and map each key to its index (`tests/pass/core_hashmap.bastio` does this). A generic `HashMap[V]` was tried first and dropped, because spec fns could not be generic then and its well-formedness could not be named in a caller's loop invariant. Spec fns can be generic now, so it can be written; it is not done yet.
 
 ### `core/sort.bastio`
 
 | Function | Proved |
 | --- | --- |
-| `sort_u64(v)` | Insertion sort. Afterwards the vector is sorted (spec fn `sorted`) and has the same length. Not proved: that it holds the same elements |
+| `sort_u64(v)` | Insertion sort. Afterwards the vector is sorted (spec fn `sorted`) and a permutation of what it was (spec fn `same_elems`: same length, and each value as many times) |
 | `lower_bound_u64(v, x)` | Needs `sorted(v)`. The first index whose element is `>= x`: everything before it is smaller, everything from it on is not |
 | `sorted_contains_u64(v, x)` | Needs `sorted(v)`. Exactly whether `x` occurs |
 | `vec_contains_u64(v, x)` | A linear scan; exactly whether `x` occurs |
@@ -121,13 +119,11 @@ Insertion sort is quadratic in the worst case. It was chosen because its proof i
 
 ## Gaps
 
-What the library would say if the language let it. Each is a language or verifier change, not a library change. (`old(x)` in loop invariants was the first such gap; it is in the language now, and the text functions and `bytes_copy_into` use it.)
+What the library would say if the language let it. Each is a language or verifier change, not a library change. (Four earlier gaps are closed: `old(x)` is allowed in loop invariants, which the text functions and `bytes_copy_into` use; a local variable may share a function's name, so importing core no longer reserves its local names; a `spec fn` may be generic; and `vcount` counts the elements of a vector, which proves the sort a permutation and the map's counters.)
 
-1. **Generic spec fns.** `spec fn` cannot take type parameters, so a property of a `HashMap[V]` cannot be named; the hash map therefore holds `u64` values only.
-2. **Counting.** Specifications have `forall` but no way to count elements, so "the map has `len` keys" and "the sort output is a permutation of the input" cannot be stated. Recursive spec fns or a multiset theory would allow both, and also "this parse gives the value of these digits".
-3. **Local names and function names share one namespace.** A program cannot have a function named like any local variable of any function it imports (see [Using it](#using-it)). Letting a local shadow a function, or qualified names (ROADMAP v1 item 6), would remove the trap.
-4. **Library search paths.** Imports are relative to the importing file, so where core lives is written into every import. A `--lib` path or an `import core "text"` form would fix it.
-5. **Length bounds on `Bytes`.** Nothing says an existing `Bytes` is at most 2^60 long (a `Vec` push gets such a fact), so `bytes_concat` must ask for it.
+1. **Values of digit strings.** Nothing says what number a run of digits denotes, so `parse_u64` is proved never to overflow but not to return the value of its digits. That needs a recursive spec fn or a value-of-prefix ghost function.
+2. **Library search paths.** Imports are relative to the importing file, so where core lives is written into every import. A `--lib` path or an `import core "text"` form would fix it.
+3. **Length bounds on `Bytes`.** Nothing says an existing `Bytes` is at most 2^60 long (a `Vec` push gets such a fact), so `bytes_concat` must ask for it.
 
 ## Where it came from
 

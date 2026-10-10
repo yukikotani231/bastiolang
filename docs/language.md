@@ -252,7 +252,7 @@ fn main() -> u64 {
 }
 ```
 
-**Names.** A name cannot shadow another that is still in scope (`E-TYPE`). Once a block ends its names can be used again, so two `match` arms can both bind `v`.
+**Names.** A name cannot shadow another that is still in scope (`E-TYPE`). Once a block ends its names can be used again, so two `match` arms can both bind `v`. Functions (including builtins and spec fns) are named apart from variables: a call `f(..)` always means the function, so a local may be called `len` or `step` even where a function `step` exists. Where a function is passed by name (`locked(l, f)`, `smp_run(f, ..)`), a local of the same name in scope is `E-TYPE`.
 
 ## Functions and contracts
 
@@ -874,6 +874,8 @@ On the hosted target, `main` can ask for `&mut Host`: the program's command line
 | `host_read(h: &Host, path: &Bytes, out: &mut Bytes) -> bool` | Replaces `out` with the whole file; false (and `out` unchanged) if it cannot be read |
 | `host_write(h: &Host, path: &Bytes, data: &Bytes) -> bool` | Creates or replaces the file |
 | `host_eprint(h: &Host, text: &Bytes)` | Writes the bytes to standard error |
+| `host_env(h: &Host, name: Str, out: &mut Bytes) -> bool` | Replaces `out` with the value of the environment variable `name`; false (and `out` unchanged) if it is not set |
+| `host_cpus(h: &Host) -> u64` | Number of processors online (at least 1, which the prover does not know) |
 | `host_spawn(h: &Host, argv: &Vec[Bytes]) -> Child` | Starts `argv[0]` (looked up in `PATH`) with arguments `argv`. A program that cannot be started gives a child that exits with 127 and writes nothing |
 | `child_write(c: &mut Child, data: &Bytes) -> bool` | Writes to the child's standard input; false if it can no longer be written |
 | `child_close(c: &mut Child)` | Closes the child's standard input, so a program that reads to the end of its input can finish |
@@ -918,7 +920,7 @@ Hardware is reached only through capability types. There is no way to read or wr
 | `Cpu` | The CPU's saved user context and the right to enter user mode (kernel only) |
 | `Ports` | The x86 I/O port space: the right to claim each of the 65536 ports, once |
 | `PortIo` | A claimed range of I/O ports, owned: the only way to read or write them |
-| `MmioSpace` | The device window (physical `0x80000000` up to 4 GiB, which the kernel platform maps uncached; the page pool never reaches it, as it stops at 1 GiB): the right to claim each byte of it, once |
+| `MmioSpace` | The device window (physical `0x80000000` up to 2^46, which the kernel platform maps uncached, so 64-bit PCI BARs above 4 GiB fit; the page pool never reaches it, as it stops at 1 GiB): the right to claim each byte of it, once |
 | `Mmio` | A claimed block of memory-mapped device registers, owned: the only way to read or write them |
 | `Dma` | A page lent to devices for DMA: while lent it is not a `Frame`, so it cannot be freed, mapped or reused |
 
@@ -1084,7 +1086,7 @@ fn main(ports: &mut Ports) -> u64 {
 
 | Builtin | Requires (proved) | Effect |
 | --- | --- | --- |
-| `mmio_claim(w: &mut MmioSpace, base: u64, len: u64) -> Mmio` | `0x80000000 <= base`, `base + len <= 2^32`; `mmio_free(w, a)` for every `a` in the block | Takes the block out of `w` |
+| `mmio_claim(w: &mut MmioSpace, base: u64, len: u64) -> Mmio` | `0x80000000 <= base`, `base + len <= 2^46`; `mmio_free(w, a)` for every `a` in the block | Takes the block out of `w` |
 | `mmio_release(w: &mut MmioSpace, r: Mmio)` | | Gives it back |
 | `mmio_read8` / `16` / `32` / `64(r: &mut Mmio, off: u64) -> u8` / `u16` / `u32` / `u64` | `off + width <= mmio_len(r)`; `mmio_base(r) + off` is a multiple of the width | One volatile load |
 | `mmio_write8` / `16` / `32` / `64(r: &mut Mmio, off: u64, v: u8` / `u16` / `u32` / `u64)` | the same | One volatile store |
@@ -1153,7 +1155,8 @@ Expressions in `requires`, `ensures`, `invariant` and `assert` (and the bodies o
 
 - They are evaluated over **mathematical integers**: `a - b` may be negative and `a + b` cannot overflow. Integers of different types mix freely there, with no conversions.
 - They may use `==>` (implication) and `forall x: u64 :: e`.
-- They may call `len`, `get`, `slen`, `sget`, `blen`, `bget`, `vlen`, `vget`, the ghost accessors of the capabilities, and `spec fn`s.
+- They may call `len`, `get`, `slen`, `sget`, `blen`, `bget`, `vlen`, `vget`, `vcount`, the ghost accessors of the capabilities, and `spec fn`s.
+- `vcount(v, x)` is the number of elements of `v` equal to `x`, for a vector of integers. It states what `forall` cannot: that a vector is a permutation of another, or that a counter counts something.
 - They may use `is` and enum payloads (`o.Some`), and see through boxes.
 - They may mention values that have already been consumed. In `ensures`, a by-value parameter means its value on entry, a `&mut` parameter the value handed back, and `old(x)` its value at the call. `result` is the returned value. `old(x)` is also allowed in loop invariants, for parameters only.
 - They cannot build enum values or call ordinary functions.
@@ -1190,6 +1193,64 @@ fn main() -> u64 {
   return 0;
 }
 ```
+
+A `spec fn` can be generic. Like a generic function, it is copied once per list of type arguments, which are written at every call (`grew_by[u64](v, w, 1)`), and a generic function's specifications can pass its own type parameters on:
+
+```bastio
+// expect-exit: 2
+spec fn grew_by[T](v: &Vec[T], w: &Vec[T], n: u64) -> bool {
+  vlen(v) == vlen(w) + n
+}
+
+fn push_two[T](v: &mut Vec[T], a: T, b: T)
+  ensures grew_by[T](v, old(v), 2)
+{
+  vec_push(&mut v, a);
+  vec_push(&mut v, b);
+}
+
+fn main() -> u64 {
+  let mut v = vec_new[u64]();
+  push_two[u64](&mut v, 1, 2);
+  let n = vec_len(v);
+  vec_pop(&mut v);
+  vec_pop(&mut v);
+  vec_free(v);
+  return n;
+}
+```
+
+Counting is how a sort states that it loses no element. Each vector operation tells the prover how it changes every count, so a swap of two elements is seen to keep them all:
+
+```bastio
+// expect-exit: 3
+spec fn same_elems(a: &Vec[u64], b: &Vec[u64]) -> bool {
+  vlen(a) == vlen(b) && forall x: u64 :: vcount(a, x) == vcount(b, x)
+}
+
+fn swap(v: &mut Vec[u64], i: u64, j: u64)
+  requires i < vlen(v) && j < vlen(v)
+  ensures same_elems(v, old(v))
+{
+  let a = vec_get(v, i);
+  let b = vec_swap(&mut v, j, a);
+  vec_set(&mut v, i, b);
+}
+
+fn main() -> u64 {
+  let mut v = vec_new[u64]();
+  vec_push(&mut v, 3);
+  vec_push(&mut v, 4);
+  swap(&mut v, 0, 1);
+  assert vcount(v, 3) == 1;
+  let r = vec_pop(&mut v);
+  vec_pop(&mut v);
+  vec_free(v);
+  return r;
+}
+```
+
+The facts the prover is given about counts (a count is at most the length, every element is counted, every counted value is an element, and how each vector operation changes the counts) are listed in [the trusted base](trusted-base.md). A program that never uses `vcount` gets none of them.
 
 ## How verification works
 

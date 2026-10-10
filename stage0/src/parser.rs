@@ -310,13 +310,14 @@ impl Parser {
         let pos = self.expect(Tok::Spec, "`spec`")?.pos;
         self.expect(Tok::Fn, "`fn` after `spec`")?;
         let (name, _) = self.ident()?;
+        let tparams = self.tparams()?;
         let params = self.params()?;
         self.expect(Tok::Arrow, "`->`")?;
         let ret = self.ty()?;
         self.expect(Tok::LBrace, "`{`")?;
         let body = self.expr()?;
         self.expect(Tok::RBrace, "`}`")?;
-        Ok(SpecFn { name, params, ret, body, pos })
+        Ok(SpecFn { name, tparams, params, ret, body, pos })
     }
 
     fn ty(&mut self) -> PResult<Type> {
