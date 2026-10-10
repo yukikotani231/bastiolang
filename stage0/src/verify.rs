@@ -687,6 +687,10 @@ fn verify_worker(p: &Program, sums: &Summaries, counting: &HashSet<String>, deci
             }
             let f = &p.fns[i];
             let t0 = std::time::Instant::now();
+            // Names are numbered per function, so they (and the
+            // counterexamples that show them) do not depend on which
+            // functions this worker verified before.
+            v.counter = 0;
             let kept = if f.export { buffers_kept(f, sums) } else { Ok(()) };
             let r = kept
                 .and_then(|_| v.smt("(push 1)"))

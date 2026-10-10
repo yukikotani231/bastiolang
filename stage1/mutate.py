@@ -39,16 +39,11 @@ PUNCT = [b'(', b')', b'{', b'}', b'[', b']', b',', b';', b':', b'::', b'&', b'mu
          b'->', b'=>', b'_', b'1', b'x', b'is ', b'forall ']
 IDENT = re.compile(rb'[A-Za-z_][A-Za-z0-9_]*')
 
-def mask(want, got):
+def mask(want):
     # Mirrors mask() in difftest.sh.
-    keep_msg = re.search(rb'error\[[A-Z-]*\]: ', got)
-    keep_notes = re.search(rb'error\[E-(VERIFY|SOLVER)', want) or re.search(rb'^  = ', got, re.M)
     out = []
     for l in want.split(b'\n'):
-        if not keep_notes and l.startswith(b'  = '):
-            continue
-        if not keep_msg:
-            l = re.sub(rb'^(.*: error\[[A-Z-]*\]): .*$', rb'\1', l)
+        l = re.sub(rb'^(.*: error\[E-SOLVER\]): .*$', rb'\1', l)
         l = re.sub(rb'^(.*: error\[E-IMPORT\]: cannot read `[^`]*`): .*$', rb'\1', l)
         l = re.sub(rb'^(.*: error\[E-PARSE\]: include_bytes: cannot read .*): [^:]*$', rb'\1', l)
         l = re.sub(rb'^bastioc0: ', b'bastioc1: ', l)
@@ -111,7 +106,7 @@ for f in args[5:]:
             if driver:
                 g = subprocess.run(tool.split() + flag.split() + [target], capture_output=True)
                 got = g.stderr + b'exit %d\n' % g.returncode
-                want = mask(w.stderr + b'exit %d\n' % w.returncode, got)
+                want = mask(w.stderr + b'exit %d\n' % w.returncode)
             else:
                 got = subprocess.run(tool.split() + [target], capture_output=True).stdout
         finally:

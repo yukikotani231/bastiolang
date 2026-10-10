@@ -387,7 +387,21 @@ fn obl_at(v: &Vr, k: u64) -> Obl {
   if k < vec_len(v.obls) {
     return vec_get(v.obls, k);
   }
-  return Obl { at: 0, code: 0, x: 0, env: 0, n: 0 };
+  return Obl { at: 0, code: 0, x: 0, env: 0, n: 0, ms: 0, ml: 0 };
+}
+
+/// After `solve` fails on a proof: what the failed obligation says, as
+/// stage0's message ("could not prove ..."); nothing for E-SOLVER.
+fn fail_msg(v: &Vr, out: &mut Vec[u64]) {
+  if v.fail_code == 0 || v.fail_obl == 0 {
+    return;
+  }
+  let o = obl_at(v, v.fail_obl - 1);
+  let mut k = 0;
+  while k < o.ml {
+    vec_push(&mut out, u_at(v.mpool, vadd(o.ms, k)));
+    k = k + 1;
+  }
 }
 
 fn lab_at(xs: &Vec[Lab], k: u64) -> Lab {
@@ -461,6 +475,7 @@ fn solve_range(v: &mut Vr, m: &Mono, p: &Parser, z: &mut Child, rep: &mut Vec[u6
       let o = obl_at(v, ob);
       v.fail_at = o.at;
       v.fail_code = o.code;
+      v.fail_obl = vadd(ob, 1);
       out_str(&mut rep, "  = a buffer lent by C may only be written in place (`bset`, or lent to functions that do only that)\n");
       ok = false;
       ob = vadd(ob, 1);
@@ -472,10 +487,12 @@ fn solve_range(v: &mut Vr, m: &Mono, p: &Parser, z: &mut Child, rep: &mut Vec[u6
       if !alive || starts_text(resp, r, "(error") {
         v.fail_at = o.at;
         v.fail_code = 0;
+        v.fail_obl = vadd(ob, 1);
         ok = false;
       } else if !is_text(resp, r, "unsat") {
         v.fail_at = o.at;
         v.fail_code = o.code;
+        v.fail_obl = vadd(ob, 1);
         if is_text(resp, r, "sat") {
           report_cex(&mut v, m, p, &mut z, o, &mut rep);
         } else {

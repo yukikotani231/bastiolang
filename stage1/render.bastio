@@ -91,17 +91,20 @@ fn rd_op(out: &mut Vec[u64], op: u64) {
   else if op == P_SHR { rd_s(&mut out, ">>"); }
 }
 
-/// A type as written (stage0's `Type::name`).
-fn rd_type(out: &mut Vec[u64], p: &Parser, i: u64) {
+/// A type as written (stage0's `Type::name`), the type parameters in `sub`
+/// (see `rd_sub`) written as the types they stand for.
+fn rd_type_s(out: &mut Vec[u64], p: &Parser, i: u64, sub: &Vec[u64]) {
   let n = node_at(p.nodes, i);
   if n.kind == T_NAMED {
-    rd_src(&mut out, p, n.s, n.e);
+    if !rd_sub(&mut out, p, n.s, n.e, sub) {
+      rd_src(&mut out, p, n.s, n.e);
+    }
   } else if n.kind == T_GENERIC {
     rd_src(&mut out, p, n.s, n.e);
     rd_s(&mut out, "[");
     let mut k = n.a;
     while k != 0 {
-      rd_type(&mut out, p, k);
+      rd_type_s(&mut out, p, k, sub);
       k = next_of(p, k);
       if k != 0 {
         rd_s(&mut out, ", ");
@@ -110,10 +113,10 @@ fn rd_type(out: &mut Vec[u64], p: &Parser, i: u64) {
     rd_s(&mut out, "]");
   } else if n.kind == T_REF {
     rd_s(&mut out, "&");
-    rd_type(&mut out, p, n.a);
+    rd_type_s(&mut out, p, n.a, sub);
   } else if n.kind == T_MUTREF {
     rd_s(&mut out, "&mut ");
-    rd_type(&mut out, p, n.a);
+    rd_type_s(&mut out, p, n.a, sub);
   } else {
     rd_s(&mut out, "()");
   }
@@ -149,11 +152,11 @@ fn rd_str(out: &mut Vec[u64], p: &Parser, s: u64, e: u64) {
   rd_s(&mut out, "\"");
 }
 
-/// The comma-separated expressions of the list `head`.
-fn rd_list(out: &mut Vec[u64], p: &Parser, head: u64) {
+/// `rd_list`, with type parameters substituted as `rd_type_s` does.
+fn rd_list_s(out: &mut Vec[u64], p: &Parser, head: u64, sub: &Vec[u64]) {
   let mut k = head;
   while k != 0 {
-    rd_expr(&mut out, p, k, true);
+    rd_expr_s(&mut out, p, k, true, sub);
     k = next_of(p, k);
     if k != 0 {
       rd_s(&mut out, ", ");
@@ -161,8 +164,8 @@ fn rd_list(out: &mut Vec[u64], p: &Parser, head: u64) {
   }
 }
 
-/// Appends the expression `i` to `out`; `top` when it stands alone.
-fn rd_expr(out: &mut Vec[u64], p: &Parser, i: u64, top: bool) {
+/// `rd_expr`, with type parameters substituted as `rd_type_s` does.
+fn rd_expr_s(out: &mut Vec[u64], p: &Parser, i: u64, top: bool, sub: &Vec[u64]) {
   let n = node_at(p.nodes, i);
   let k = n.kind;
   if k == E_INT {
@@ -189,7 +192,7 @@ fn rd_expr(out: &mut Vec[u64], p: &Parser, i: u64, top: bool) {
   } else if k == E_VAR {
     rd_src(&mut out, p, n.s, n.e);
   } else if k == E_FIELD {
-    rd_expr(&mut out, p, n.a, false);
+    rd_expr_s(&mut out, p, n.a, false, sub);
     rd_s(&mut out, ".");
     rd_src(&mut out, p, n.s, n.e);
   } else if k == E_SLIT {
@@ -200,7 +203,7 @@ fn rd_expr(out: &mut Vec[u64], p: &Parser, i: u64, top: bool) {
       let fi = node_at(p.nodes, f);
       rd_src(&mut out, p, fi.s, fi.e);
       rd_s(&mut out, ": ");
-      rd_expr(&mut out, p, fi.a, true);
+      rd_expr_s(&mut out, p, fi.a, true, sub);
       f = fi.next;
       if f != 0 {
         rd_s(&mut out, ", ");
@@ -213,12 +216,12 @@ fn rd_expr(out: &mut Vec[u64], p: &Parser, i: u64, top: bool) {
     rd_src(&mut out, p, n.s2, n.e2);
     if n.a != 0 {
       rd_s(&mut out, "(");
-      rd_expr(&mut out, p, n.a, true);
+      rd_expr_s(&mut out, p, n.a, true, sub);
       rd_s(&mut out, ")");
     }
   } else if k == E_IS {
     if !top { rd_s(&mut out, "("); }
-    rd_expr(&mut out, p, n.a, false);
+    rd_expr_s(&mut out, p, n.a, false, sub);
     rd_s(&mut out, " is ");
     rd_src(&mut out, p, n.s, n.e);
     rd_s(&mut out, "::");
@@ -231,7 +234,7 @@ fn rd_expr(out: &mut Vec[u64], p: &Parser, i: u64, top: bool) {
     rd_s(&mut out, "[");
     let mut t = n.a;
     while t != 0 {
-      rd_type(&mut out, p, t);
+      rd_type_s(&mut out, p, t, sub);
       t = next_of(p, t);
       if t != 0 {
         rd_s(&mut out, ", ");
@@ -239,7 +242,7 @@ fn rd_expr(out: &mut Vec[u64], p: &Parser, i: u64, top: bool) {
     }
     rd_s(&mut out, "]");
     let mut rest = vec_new[u64]();
-    rd_expr(&mut rest, p, n.b, top);
+    rd_expr_s(&mut rest, p, n.b, top, sub);
     let mut j = 0;
     if b.s <= b.e {
       j = b.e - b.s;
@@ -251,29 +254,98 @@ fn rd_expr(out: &mut Vec[u64], p: &Parser, i: u64, top: bool) {
     vec_free(rest);
   } else if k == E_NOT {
     rd_s(&mut out, "!");
-    rd_expr(&mut out, p, n.a, false);
+    rd_expr_s(&mut out, p, n.a, false, sub);
   } else if k == E_NEG {
     rd_s(&mut out, "-");
-    rd_expr(&mut out, p, n.a, false);
+    rd_expr_s(&mut out, p, n.a, false, sub);
   } else if k == E_BIN {
     if !top { rd_s(&mut out, "("); }
-    rd_expr(&mut out, p, n.a, false);
+    rd_expr_s(&mut out, p, n.a, false, sub);
     rd_s(&mut out, " ");
     rd_op(&mut out, n.v);
     rd_s(&mut out, " ");
-    rd_expr(&mut out, p, n.b, false);
+    rd_expr_s(&mut out, p, n.b, false, sub);
     if !top { rd_s(&mut out, ")"); }
   } else if k == E_CALL {
     rd_src(&mut out, p, n.s, n.e);
     rd_s(&mut out, "(");
-    rd_list(&mut out, p, n.a);
+    rd_list_s(&mut out, p, n.a, sub);
     rd_s(&mut out, ")");
   } else if k == E_FORALL {
     if !top { rd_s(&mut out, "("); }
     rd_s(&mut out, "forall ");
     rd_src(&mut out, p, n.s, n.e);
     rd_s(&mut out, ": u64 :: ");
-    rd_expr(&mut out, p, n.a, true);
+    rd_expr_s(&mut out, p, n.a, true, sub);
     if !top { rd_s(&mut out, ")"); }
   }
+}
+
+/// A type as written (stage0's `Type::name`).
+fn rd_type(out: &mut Vec[u64], p: &Parser, i: u64) {
+  let none = vec_new[u64]();
+  rd_type_s(&mut out, p, i, none);
+  vec_free(none);
+}
+
+/// The comma-separated expressions of the list `head`.
+fn rd_list(out: &mut Vec[u64], p: &Parser, head: u64) {
+  let none = vec_new[u64]();
+  rd_list_s(&mut out, p, head, none);
+  vec_free(none);
+}
+
+/// Appends the expression `i` to `out`; `top` when it stands alone.
+fn rd_expr(out: &mut Vec[u64], p: &Parser, i: u64, top: bool) {
+  let none = vec_new[u64]();
+  rd_expr_s(&mut out, p, i, top, none);
+  vec_free(none);
+}
+
+/// If the name at `s..e` is a type parameter that `sub` gives a type for,
+/// appends that type's name and returns true. `sub` holds, per parameter,
+/// the start and end of its name in the source, the length of the type's
+/// name, then its characters (as stage0 writes a copy made for an
+/// instance: the type arguments of `f[T](..)` are those of the instance).
+fn rd_sub(out: &mut Vec[u64], p: &Parser, s: u64, e: u64, sub: &Vec[u64]) -> bool {
+  let mut k = 0;
+  while k < vec_len(sub) && vec_len(sub) - k >= 3
+    invariant k <= vlen(sub)
+  {
+    let ns = vec_get(sub, k);
+    let ne = vec_get(sub, k + 1);
+    let len = vec_get(sub, k + 2);
+    if len > vec_len(sub) - k - 3 {
+      return false;
+    }
+    if src_same(p, s, e, ns, ne) {
+      let mut j = 0;
+      while j < len
+        invariant j <= len && k <= vlen(sub) && len <= vlen(sub) - k - 3
+      {
+        vec_push(&mut out, vec_get(sub, k + 3 + j));
+        j = j + 1;
+      }
+      return true;
+    }
+    k = k + 3 + len;
+  }
+  return false;
+}
+
+/// Whether the source text at `a..b` is the same as at `c..d`.
+fn src_same(p: &Parser, a: u64, b: u64, c: u64, d: u64) -> bool {
+  if a > b || c > d || b > blen(p.src) || d > blen(p.src) || b - a != d - c {
+    return false;
+  }
+  let mut k = 0;
+  while k < b - a
+    invariant a <= b && b <= blen(p.src) && c <= d && d <= blen(p.src) && b - a == d - c
+  {
+    if bget(p.src, a + k) != bget(p.src, c + k) {
+      return false;
+    }
+    k = k + 1;
+  }
+  return true;
 }
