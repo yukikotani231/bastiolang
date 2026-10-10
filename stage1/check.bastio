@@ -520,7 +520,7 @@ fn def_node(m: &Mono, p: &Parser, x: u64) -> Node {
 /// Is a value of type `t` linear (must it be consumed exactly once)?
 fn ck_linear(c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
   let k = kind_t(m, t);
-  if (k >= TY_BUF && k <= TY_DMA) || k == TY_BOX || k == TY_VEC || k == TY_LOCK {
+  if (k >= TY_BUF && k <= TY_DMA) || k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_ATOMIC {
     return true;
   }
   if k == TY_STRUCT || k == TY_ENUM {
@@ -546,7 +546,7 @@ fn is_pinned(c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
   if k == TY_MMU || k == TY_CPU {
     return true;
   }
-  if k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_REF || k == TY_MUTREF {
+  if k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_ATOMIC || k == TY_REF || k == TY_MUTREF {
     return is_pinned(c, m, p, inner_t(m, t));
   }
   if k == TY_STRUCT || k == TY_ENUM {
@@ -647,9 +647,16 @@ fn is_lock_builtin(p: &Parser, s: u64, e: u64) -> bool {
   return span_is(p, s, e, "lock_new") || span_is(p, s, e, "lock_end") || span_is(p, s, e, "locked");
 }
 
+/// The builtins over `Atomic[T]`: generic too.
+fn is_atomic_builtin(p: &Parser, s: u64, e: u64) -> bool {
+  return span_is(p, s, e, "atomic_new") || span_is(p, s, e, "atomic_end") || span_is(p, s, e, "atomic_load")
+    || span_is(p, s, e, "atomic_store") || span_is(p, s, e, "atomic_swap") || span_is(p, s, e, "atomic_cas")
+    || span_is(p, s, e, "atomic_wrap_add");
+}
+
 fn is_builtin_name(c: &Checker, p: &Parser, s: u64, e: u64) -> bool {
   return span_is(p, s, e, "box") || span_is(p, s, e, "unbox") || span_is(p, s, e, "cast") || span_is(p, s, e, "wrap")
-    || span_is(p, s, e, "smp_run") || is_lock_builtin(p, s, e)
+    || span_is(p, s, e, "smp_run") || is_lock_builtin(p, s, e) || is_atomic_builtin(p, s, e)
     || is_vec_builtin(p, s, e) || is_wrap_builtin(p, s, e) || bs_index(c, p, s, e) != 0;
 }
 
@@ -1061,7 +1068,7 @@ fn known_type(c: &mut Checker, m: &Mono, p: &Parser, t: u64, loc: u64) {
   let k = kind_t(m, t);
   if k == TY_UNKNOWN {
     cfail(&mut c, p, loc, C_TYPE);
-  } else if k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_REF || k == TY_MUTREF {
+  } else if k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_ATOMIC || k == TY_REF || k == TY_MUTREF {
     known_type(&mut c, m, p, inner_t(m, t), loc);
   }
 }
@@ -1077,7 +1084,7 @@ fn is_reserved_type(p: &Parser, s: u64, e: u64) -> bool {
     || span_is(p, s, e, "PageTable") || span_is(p, s, e, "Pool") || span_is(p, s, e, "Mmu")
     || span_is(p, s, e, "Cpu") || span_is(p, s, e, "Ports") || span_is(p, s, e, "PortIo")
     || span_is(p, s, e, "MmioSpace") || span_is(p, s, e, "Mmio") || span_is(p, s, e, "Dma")
-    || span_is(p, s, e, "Lock");
+    || span_is(p, s, e, "Lock") || span_is(p, s, e, "Atomic");
 }
 
 /// Struct and enum instances: no reserved names, known field and payload
@@ -1097,7 +1104,7 @@ fn check_structs(c: &mut Checker, m: &Mono, p: &Parser) {
     let mut j = 0;
     while j < n {
       let mut u = fld_ty(c, x, j);
-      while kind_t(m, u) == TY_BOX || kind_t(m, u) == TY_VEC || kind_t(m, u) == TY_LOCK {
+      while kind_t(m, u) == TY_BOX || kind_t(m, u) == TY_VEC || kind_t(m, u) == TY_LOCK || kind_t(m, u) == TY_ATOMIC {
         u = inner_t(m, u);
       }
       if u != 0 && kind_t(m, u) == TY_UNKNOWN {
@@ -2573,6 +2580,9 @@ fn ck_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
   if span_is(p, s, e, "locked") {
     return locked_call(&mut c, &mut m, p, i);
   }
+  if is_atomic_builtin(p, s, e) {
+    return atomic_call(&mut c, &mut m, p, i);
+  }
   if span_is(p, s, e, "smp_run") {
     return smp_run_call(&mut c, &mut m, p, i);
   }
@@ -2664,6 +2674,101 @@ fn locked_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
   vec_free(ps);
   vec_free(args);
   return t;
+}
+
+/// Can an `Atomic` hold a `t`? One word: an integer, a bool, or a struct
+/// with a single such field.
+fn atomic_word(c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
+  if t == c.tbool || is_int(m, t) {
+    return true;
+  }
+  if kind_t(m, t) == TY_STRUCT {
+    let x = inner_t(m, t);
+    let dn = def_node(m, p, x);
+    if list_len(p, dn.a) == 1 {
+      let ft = fld_ty(c, x, 0);
+      return ft == c.tbool || is_int(m, ft);
+    }
+  }
+  return false;
+}
+
+/// The `Atomic` builtins, as stage0's `Ctx::atomic`.
+fn atomic_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
+  let n = node_at(p.nodes, i);
+  let a0 = n.a;
+  if name_is(p, i, "atomic_new") || name_is(p, i, "atomic_end") {
+    if list_len(p, a0) != 1 {
+      cfail(&mut c, p, i, C_TYPE);
+      return 0;
+    }
+    let t = ck_expr(&mut c, &mut m, p, a0);
+    if c.failed {
+      return 0;
+    }
+    if name_is(p, i, "atomic_new") {
+      if !atomic_word(c, m, p, t) {
+        cfail(&mut c, p, a0, C_TYPE);         // an Atomic holds one word
+        return 0;
+      }
+      // The verifier reads every integer as a u64.
+      note_int_op(&mut c, m, i, t);
+      return intern(&mut m, p, TY_ATOMIC, t);
+    }
+    if kind_t(m, t) != TY_ATOMIC {
+      cfail(&mut c, p, a0, C_TYPE);           // `atomic_end` needs an Atomic
+      return 0;
+    }
+    return inner_t(m, t);
+  }
+  let mut pk = 0;
+  if a0 != 0 {
+    pk = place_of(&mut c, p, a0);
+  }
+  if pk == 0 {
+    if a0 != 0 {
+      cfail(&mut c, p, a0, C_TYPE);           // must name an atomic
+    } else {
+      cfail(&mut c, p, i, C_TYPE);
+    }
+    return 0;
+  }
+  let aty = path_type(&mut c, m, p, pk, a0);
+  if c.failed {
+    return 0;
+  }
+  if kind_t(m, aty) != TY_ATOMIC {
+    cfail(&mut c, p, a0, C_TYPE);             // needs an Atomic
+    return 0;
+  }
+  let t = inner_t(m, aty);
+  if !atomic_word(c, m, p, t) {
+    cfail(&mut c, p, a0, C_TYPE);
+    return 0;
+  }
+  let mut ps = vec_new[u64]();
+  vec_push(&mut ps, ref_to(&mut m, p, aty));
+  let mut r = t;
+  if name_is(p, i, "atomic_store") {
+    vec_push(&mut ps, t);
+    r = c.tunit;
+  } else if name_is(p, i, "atomic_swap") {
+    vec_push(&mut ps, t);
+  } else if name_is(p, i, "atomic_cas") {
+    vec_push(&mut ps, t);
+    vec_push(&mut ps, t);
+    r = c.tbool;
+  } else if name_is(p, i, "atomic_wrap_add") {
+    if !is_int(m, t) {
+      vec_free(ps);
+      cfail(&mut c, p, a0, C_TYPE);           // needs an Atomic of an integer type
+      return 0;
+    }
+    vec_push(&mut ps, t);
+  }
+  let r2 = call_with(&mut c, &mut m, p, ps, r, a0, i, true);
+  vec_free(ps);
+  return r2;
 }
 
 /// `smp_run(f, args..)`: runs `f` on every processor at once and returns

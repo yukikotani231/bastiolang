@@ -1453,6 +1453,15 @@ impl<'p> Verifier<'p> {
         Ok(out)
     }
 
+    /// A value read from an atomic: fresh, with its invariants.
+    fn atomic_read(&mut self, t: &Type, st: &mut State) -> Result<Val, Diag> {
+        let v = self.fresh_of(t, "atomic")?;
+        for (_, i) in self.invariants_of(&v)? {
+            st.pc.push(i);
+        }
+        Ok(v)
+    }
+
     /// `locked(l, f, args..)`: the contents are a fresh value about which
     /// only the invariants are known (another processor may have changed
     /// them since this one last looked). `f` gets them as its `&mut` first
@@ -1535,6 +1544,32 @@ impl<'p> Verifier<'p> {
                     self.need(st, i, pos, "E-VERIFY-LOCKINV", format!("that the value put in the lock satisfies the invariant {}", what))?;
                 }
                 Ok(Val::Obj(Type::Lock(Box::new(val_type(&vals[0]))), vec![]))
+            }
+            // An atomic's value may change at any moment, so like a lock's
+            // contents only its invariants are known when it is read, and
+            // they are proved of every value written.
+            "atomic_new" => {
+                for (what, i) in self.invariants_of(&vals[0])? {
+                    self.need(st, i, pos, "E-VERIFY-LOCKINV", format!("that the value put in the atomic satisfies the invariant {}", what))?;
+                }
+                let t = self.int_ops.get(&pos).cloned().unwrap_or_else(|| val_type(&vals[0]));
+                Ok(Val::Obj(Type::Atomic(Box::new(t)), vec![]))
+            }
+            "atomic_store" | "atomic_swap" | "atomic_cas" => {
+                let Val::Obj(Type::Atomic(t), _) = &vals[0] else { unreachable!("checked: an atomic") };
+                let new = if name == "atomic_cas" { &vals[2] } else { &vals[1] };
+                for (what, i) in self.invariants_of(new)? {
+                    self.need(st, i, pos, "E-VERIFY-LOCKINV", format!("that the value stored in the atomic `{}` satisfies the invariant {}", ra(0), what))?;
+                }
+                match name {
+                    "atomic_store" => Ok(Val::Unit),
+                    "atomic_cas" => self.fresh_of(&Type::Bool, "cas"),
+                    _ => self.atomic_read(t, st),
+                }
+            }
+            "atomic_end" | "atomic_load" | "atomic_wrap_add" => {
+                let Val::Obj(Type::Atomic(t), _) = &vals[0] else { unreachable!("checked: an atomic") };
+                self.atomic_read(t, st)
             }
             "lock_end" => {
                 let Val::Obj(Type::Lock(t), _) = &vals[0] else { unreachable!("checked: a lock") };

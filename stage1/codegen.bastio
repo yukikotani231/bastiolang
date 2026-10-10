@@ -300,6 +300,7 @@ fn cg_tyname(g: &mut Cg, m: &Mono, p: &Parser, t: u64, mode: u64) {
   else if k == TY_BOX { cg_tn(&mut g, "Box[", mode); cg_tyname(&mut g, m, p, x.a, mode); cg_tn(&mut g, "]", mode); }
   else if k == TY_VEC { cg_tn(&mut g, "Vec[", mode); cg_tyname(&mut g, m, p, x.a, mode); cg_tn(&mut g, "]", mode); }
   else if k == TY_LOCK { cg_tn(&mut g, "Lock[", mode); cg_tyname(&mut g, m, p, x.a, mode); cg_tn(&mut g, "]", mode); }
+  else if k == TY_ATOMIC { cg_tn(&mut g, "Atomic[", mode); cg_tyname(&mut g, m, p, x.a, mode); cg_tn(&mut g, "]", mode); }
   else if k == TY_REF { cg_tn(&mut g, "&", mode); cg_tyname(&mut g, m, p, x.a, mode); }
   else if k == TY_MUTREF { cg_tn(&mut g, "&mut ", mode); cg_tyname(&mut g, m, p, x.a, mode); }
 }
@@ -361,6 +362,8 @@ fn cg_cty(g: &mut Cg, m: &Mono, p: &Parser, t: u64) {
   else if k == TY_VEC { cg_t(&mut g, "bst_vec"); }
   // The lock word, followed by the contents (see bst_lock_acquire).
   else if k == TY_LOCK { cg_t(&mut g, "uint64_t *"); }
+  // A word on the heap, so its address stays put while it is shared.
+  else if k == TY_ATOMIC { cg_cty(&mut g, m, p, x.a); cg_t(&mut g, " *"); }
   else if k == TY_REF || k == TY_MUTREF { cg_cty(&mut g, m, p, x.a); }
 }
 
@@ -629,6 +632,19 @@ fn cg_type_of(g: &Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) 
       if name_is(p, i, "lock_new") {
         let t = cg_type_of(g, c, &mut m, p, a0, 0);
         return intern(&mut m, p, TY_LOCK, t);
+      }
+      if name_is(p, i, "atomic_new") {
+        let t = cg_type_of(g, c, &mut m, p, a0, 0);
+        return intern(&mut m, p, TY_ATOMIC, t);
+      }
+      if is_atomic_builtin(p, n.s, n.e) {
+        if name_is(p, i, "atomic_store") {
+          return c.tunit;
+        }
+        if name_is(p, i, "atomic_cas") {
+          return c.tbool;
+        }
+        return cg_atomic_inner(g, c, &mut m, p, a0);
       }
       if name_is(p, i, "locked") {
         let fnode = node_at(p.nodes, cg_arg(p, i, 1));
@@ -1199,6 +1215,9 @@ fn cg_call(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64)
     if name_is(p, i, "locked") {
       return cg_locked(&mut g, c, &mut m, p, i);
     }
+    if is_atomic_builtin(p, n.s, n.e) {
+      return cg_atomic(&mut g, c, &mut m, p, i);
+    }
     if name_is(p, i, "smp_run") {
       return cg_smp_run(&mut g, c, &mut m, p, i);
     }
@@ -1311,6 +1330,116 @@ fn cg_box(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp {
   cg_t(&mut g, "; bp_");
   cg_n(&mut g, k);
   cg_t(&mut g, "; })");
+  return cg_span(g, start);
+}
+
+/// The type of the word in the atomic that node `a` names.
+fn cg_atomic_inner(g: &Cg, c: &Checker, m: &mut Mono, p: &Parser, a: u64) -> u64 {
+  let mut t = cg_type_of(g, c, &mut m, p, a, 0);
+  if kind_t(m, t) == TY_REF || kind_t(m, t) == TY_MUTREF {
+    t = inner_t(m, t);
+  }
+  return inner_t(m, t);
+}
+
+/// The `Atomic` builtins, as stage0 writes them: a word on the heap, every
+/// access sequentially consistent.
+fn cg_atomic(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp {
+  let n = node_at(p.nodes, i);
+  let k = cg_tmp(&mut g);
+  let mut t = 0;
+  if name_is(p, i, "atomic_new") {
+    t = cg_type_of(g, c, &mut m, p, n.a, 0);
+  } else {
+    t = cg_atomic_inner(g, c, &mut m, p, n.a);
+  }
+  let s1 = cg_mark(g);
+  cg_cty(&mut g, m, p, t);
+  let ct = cg_span(g, s1);
+  let e0 = cg_expr(&mut g, c, &mut m, p, n.a, 0);
+  let mut e1 = e0;
+  let mut e2 = e0;
+  let a1 = cg_arg(p, i, 1);
+  if a1 != 0 {
+    e1 = cg_expr(&mut g, c, &mut m, p, a1, 0);
+    let a2 = cg_arg(p, i, 2);
+    if a2 != 0 {
+      e2 = cg_expr(&mut g, c, &mut m, p, a2, 0);
+    }
+  }
+  let start = cg_mark(g);
+  cg_t(&mut g, "({ ");
+  if name_is(p, i, "atomic_load") {
+    cg_sp(&mut g, ct);
+    cg_t(&mut g, " av_"); cg_n(&mut g, k);
+    cg_t(&mut g, "; __atomic_load(");
+    cg_sp(&mut g, e0);
+    cg_t(&mut g, ", &av_"); cg_n(&mut g, k);
+    cg_t(&mut g, ", __ATOMIC_SEQ_CST); av_"); cg_n(&mut g, k);
+    cg_t(&mut g, "; })");
+    return cg_span(g, start);
+  }
+  // `T *at_K = `
+  cg_sp(&mut g, ct);
+  cg_t(&mut g, " *at_"); cg_n(&mut g, k);
+  cg_t(&mut g, " = ");
+  if name_is(p, i, "atomic_new") {
+    cg_t(&mut g, "(");
+    cg_sp(&mut g, ct);
+    cg_t(&mut g, " *)bst_box_alloc(sizeof(");
+    cg_sp(&mut g, ct);
+    cg_t(&mut g, ")); *at_"); cg_n(&mut g, k);
+    cg_t(&mut g, " = ");
+    cg_sp(&mut g, e0);
+    cg_t(&mut g, "; at_"); cg_n(&mut g, k);
+    cg_t(&mut g, "; })");
+    return cg_span(g, start);
+  }
+  cg_sp(&mut g, e0);
+  cg_t(&mut g, "; ");
+  cg_sp(&mut g, ct);
+  if name_is(p, i, "atomic_end") {
+    cg_t(&mut g, " av_"); cg_n(&mut g, k);
+    cg_t(&mut g, " = *at_"); cg_n(&mut g, k);
+    cg_t(&mut g, "; bst_box_free(at_"); cg_n(&mut g, k);
+    cg_t(&mut g, ", sizeof(");
+    cg_sp(&mut g, ct);
+    cg_t(&mut g, ")); av_"); cg_n(&mut g, k);
+    cg_t(&mut g, "; })");
+    return cg_span(g, start);
+  }
+  if name_is(p, i, "atomic_cas") {
+    cg_t(&mut g, " ae_"); cg_n(&mut g, k);
+    cg_t(&mut g, " = ");
+    cg_sp(&mut g, e1);
+    cg_t(&mut g, ", av_"); cg_n(&mut g, k);
+    cg_t(&mut g, " = ");
+    cg_sp(&mut g, e2);
+    cg_t(&mut g, "; (bool)__atomic_compare_exchange(at_"); cg_n(&mut g, k);
+    cg_t(&mut g, ", &ae_"); cg_n(&mut g, k);
+    cg_t(&mut g, ", &av_"); cg_n(&mut g, k);
+    cg_t(&mut g, ", 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); })");
+    return cg_span(g, start);
+  }
+  cg_t(&mut g, " av_"); cg_n(&mut g, k);
+  cg_t(&mut g, " = ");
+  cg_sp(&mut g, e1);
+  if name_is(p, i, "atomic_store") {
+    cg_t(&mut g, "; __atomic_store(at_"); cg_n(&mut g, k);
+    cg_t(&mut g, ", &av_"); cg_n(&mut g, k);
+    cg_t(&mut g, ", __ATOMIC_SEQ_CST); })");
+  } else if name_is(p, i, "atomic_swap") {
+    cg_t(&mut g, ", ao_"); cg_n(&mut g, k);
+    cg_t(&mut g, "; __atomic_exchange(at_"); cg_n(&mut g, k);
+    cg_t(&mut g, ", &av_"); cg_n(&mut g, k);
+    cg_t(&mut g, ", &ao_"); cg_n(&mut g, k);
+    cg_t(&mut g, ", __ATOMIC_SEQ_CST); ao_"); cg_n(&mut g, k);
+    cg_t(&mut g, "; })");
+  } else {
+    cg_t(&mut g, "; __atomic_fetch_add(at_"); cg_n(&mut g, k);
+    cg_t(&mut g, ", av_"); cg_n(&mut g, k);
+    cg_t(&mut g, ", __ATOMIC_SEQ_CST); })");
+  }
   return cg_span(g, start);
 }
 

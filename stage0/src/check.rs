@@ -212,6 +212,7 @@ fn spec_norm(t: Type) -> Type {
 pub fn builtin_list() -> Vec<(String, &'static str)> {
     let mut v: Vec<(String, &'static str)> = vec![("box".into(), "all"), ("unbox".into(), "all")];
     v.extend(LOCK_BUILTINS.iter().map(|n| (n.to_string(), "all")));
+    v.extend(ATOMIC_BUILTINS.iter().map(|n| (n.to_string(), "all")));
     v.push(("smp_run".into(), "kernel"));
     v.extend(VEC_BUILTINS.iter().map(|n| (n.to_string(), "all")));
     for (n, a, _, _) in builtin_table() {
@@ -230,8 +231,23 @@ pub fn builtin_list() -> Vec<(String, &'static str)> {
 /// Builtins over `Lock[T]`: generic, so checked by hand like `box`.
 pub const LOCK_BUILTINS: &[&str] = &["lock_new", "lock_end", "locked"];
 
+/// Builtins over `Atomic[T]`: generic too.
+pub const ATOMIC_BUILTINS: &[&str] = &["atomic_new", "atomic_end", "atomic_load", "atomic_store", "atomic_swap", "atomic_cas", "atomic_wrap_add"];
+
+/// Can an `Atomic` hold a `T`? One machine word that C's `__atomic`
+/// builtins handle without a lock: an integer, a bool, or a struct with a
+/// single such field (which is how an atomic value gets an invariant).
+pub fn atomic_word(t: &Type) -> bool {
+    match t {
+        Type::Bool => true,
+        t if t.is_int() => true,
+        Type::Struct(n) => struct_def(n).map_or(false, |d| d.fields.len() == 1 && (d.fields[0].1 == Type::Bool || d.fields[0].1.is_int())),
+        _ => false,
+    }
+}
+
 pub fn is_builtin(name: &str) -> bool {
-    name == "box" || name == "unbox" || name == "cast" || name == "wrap" || name == "smp_run" || LOCK_BUILTINS.contains(&name) || VEC_BUILTINS.contains(&name) || WRAP_BUILTINS.contains(&name) || builtin_table().iter().any(|b| b.0 == name)
+    name == "box" || name == "unbox" || name == "cast" || name == "wrap" || name == "smp_run" || LOCK_BUILTINS.contains(&name) || ATOMIC_BUILTINS.contains(&name) || VEC_BUILTINS.contains(&name) || WRAP_BUILTINS.contains(&name) || builtin_table().iter().any(|b| b.0 == name)
 }
 
 fn available(name: &str, target: Target) -> bool {
@@ -258,7 +274,7 @@ fn main_caps(target: Target) -> &'static [Type] {
 /// Struct and enum definitions: unique names, known field and payload
 /// types, no type that contains itself.
 pub fn check_structs(p: &Program) -> Result<(), Diag> {
-    const RESERVED: &[&str] = &["u64", "u8", "u16", "u32", "i8", "i16", "i32", "i64", "bool", "Str", "Buf", "Bytes", "Host", "Child", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu", "Ports", "PortIo", "MmioSpace", "Mmio", "Dma", "Lock"];
+    const RESERVED: &[&str] = &["u64", "u8", "u16", "u32", "i8", "i16", "i32", "i64", "bool", "Str", "Buf", "Bytes", "Host", "Child", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu", "Ports", "PortIo", "MmioSpace", "Mmio", "Dma", "Lock", "Atomic"];
     // (name, position, the types it holds directly)
     let mut defs: Vec<(String, Pos, Vec<Type>)> = Vec::new();
     for d in &p.structs {
@@ -273,7 +289,7 @@ pub fn check_structs(p: &Program) -> Result<(), Diag> {
         }
         for t in held {
             let mut t = t;
-            while let Type::Box(i) | Type::Vec(i) | Type::Lock(i) = t {
+            while let Type::Box(i) | Type::Vec(i) | Type::Lock(i) | Type::Atomic(i) = t {
                 t = i;
             }
             if let Type::Struct(n) | Type::Enum(n) = t {
@@ -321,7 +337,7 @@ fn known_type(t: &Type, pos: Pos) -> Result<(), Diag> {
     match t {
         Type::Struct(n) if struct_def(n).is_none() => Err(Diag::new("E-TYPE", pos, format!("unknown type `{}`", n))),
         Type::Enum(n) if enum_def(n).is_none() => Err(Diag::new("E-TYPE", pos, format!("unknown type `{}`", n))),
-        Type::Box(i) | Type::Vec(i) | Type::Lock(i) => known_type(i, pos),
+        Type::Box(i) | Type::Vec(i) | Type::Lock(i) | Type::Atomic(i) => known_type(i, pos),
         // Any value can be borrowed; a borrowed plain value reads as a copy.
         // (Generic code borrows `&T` whatever `T` turns out to be.)
         Type::Ref(i) | Type::MutRef(i) => known_type(i, pos),
@@ -1322,6 +1338,9 @@ impl<'a> Ctx<'a> {
                 if name == "locked" {
                     return self.locked(args, e.pos);
                 }
+                if ATOMIC_BUILTINS.contains(&name.as_str()) {
+                    return self.atomic(name, args, e.pos);
+                }
                 if name == "smp_run" {
                     return self.smp_run(args, e.pos);
                 }
@@ -1364,6 +1383,60 @@ impl<'a> Ctx<'a> {
         let mut rest = vec![args[0].clone()];
         rest.extend(args[2..].iter().cloned());
         self.call_with(&f, Sig { params, ret: sig.ret }, &rest, pos)
+    }
+
+    /// The `Atomic` builtins. `atomic_new` and `atomic_end` move the value in
+    /// and out; the others take the atomic as a shared borrow, so any
+    /// number of processors can use it at once.
+    fn atomic(&mut self, name: &str, args: &[Expr], pos: Pos) -> Result<Type, Diag> {
+        let word = |t: &Type, at: Pos| -> Result<(), Diag> {
+            if atomic_word(t) {
+                return Ok(());
+            }
+            Err(Diag::new("E-TYPE", at, format!("an Atomic cannot hold a {}", t.name()))
+                .note("an Atomic holds one word: an integer, a bool, or a struct with a single field of one of those"))
+        };
+        if name == "atomic_new" || name == "atomic_end" {
+            if args.len() != 1 {
+                return Err(Diag::new("E-TYPE", pos, format!("`{}` takes 1 argument(s), {} given", name, args.len())));
+            }
+            let t = self.expr(&args[0])?;
+            if name == "atomic_new" {
+                word(&t, args[0].pos)?;
+                if t.is_int() {
+                    // The verifier's view of the value, which reads every
+                    // integer as a u64, does not say which type it has.
+                    self.int_ops.insert(pos, t.clone());
+                }
+                return Ok(Type::Atomic(Box::new(t)));
+            }
+            return match t {
+                Type::Atomic(i) => Ok(*i),
+                t => Err(Diag::new("E-TYPE", args[0].pos, format!("`atomic_end` needs an Atomic, found {}", t.name()))),
+            };
+        }
+        let at = match args.first().and_then(place) {
+            Some(p) => self.path_type(&p, args[0].pos)?.0,
+            None => return Err(Diag::new("E-TYPE", args.first().map_or(pos, |a| a.pos), format!("the first argument of `{}` must name an atomic", name))),
+        };
+        let Type::Atomic(t) = at.clone() else {
+            return Err(Diag::new("E-TYPE", args[0].pos, format!("`{}` needs an Atomic, found {}", name, at.name())));
+        };
+        word(&t, args[0].pos)?;
+        let t = *t;
+        let (params, ret) = match name {
+            "atomic_load" => (vec![r(at)], t),
+            "atomic_store" => (vec![r(at), t], Type::Unit),
+            "atomic_swap" => (vec![r(at), t.clone()], t),
+            "atomic_cas" => (vec![r(at), t.clone(), t], Type::Bool),
+            _ => {
+                if !t.is_int() {
+                    return Err(Diag::new("E-TYPE", args[0].pos, format!("`atomic_wrap_add` needs an Atomic of an integer type, found {}", at.name())));
+                }
+                (vec![r(at), t.clone()], t)
+            }
+        };
+        self.call_with(name, Sig { params, ret }, args, pos)
     }
 
     /// `smp_run(f, args..)`: runs `f` on every processor at once and returns

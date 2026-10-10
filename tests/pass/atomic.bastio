@@ -1,0 +1,39 @@
+// expect-exit: 47
+// Atomics: one word read and written by any number of processors through a
+// shared borrow. A struct with one field gives the word an invariant, which
+// is known of every value read and proved of every value written.
+struct Pending { n: u64 } invariant n <= 1024;
+
+// Takes a slot unless all 1024 are taken. Another processor may change the
+// count between the load and the compare-and-swap; then the swap fails and
+// nothing is written.
+fn reserve(a: &Atomic[Pending]) -> bool {
+  let x = atomic_load(a);
+  if x.n < 1024 {
+    return atomic_cas(a, x, Pending { n: x.n + 1 });
+  }
+  return false;
+}
+
+fn main() -> u64 {
+  let p = atomic_new(Pending { n: 1020 });
+  let mut got = 0;
+  let mut i = 0;
+  while i < 10 invariant got <= i && i <= 10 {
+    if reserve(p) { got = got + 1; }
+    i = i + 1;
+  }
+  let left = atomic_end(p);                    // left.n <= 1024 is known
+  let flag = atomic_new(false);
+  let was = atomic_swap(flag, true);
+  atomic_store(flag, false);
+  let f = atomic_end(flag);
+  let ids = atomic_new(cast[u32](4294967290));
+  let first = atomic_wrap_add(ids, 10);        // wraps around 2^32
+  let next = atomic_load(ids);
+  let last = atomic_end(ids);
+  let mut r = got * 10 + left.n % 10;          // 40 + 4
+  if !was && !f { r = r + 1; }
+  if first == 4294967290 && next == 4 && last == 4 { r = r + 2; }
+  return r;
+}
