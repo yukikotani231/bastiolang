@@ -459,6 +459,12 @@ struct Ctx<'a> {
     moved: HashSet<String>,
     /// See `FnDef::int_ops`.
     int_ops: HashMap<Pos, Type>,
+    /// The user functions this one calls (`locked` and `smp_run` call the
+    /// function they name), for `lock_order`.
+    calls: Vec<String>,
+    /// Each `locked` call: its position, the lock's class (the type of its
+    /// contents) and the function run with the lock held.
+    lock_sites: Vec<(Pos, String, String)>,
 }
 
 pub fn check_program(p: &mut Program, target: Target) -> Result<HashMap<String, Sig>, Diag> {
@@ -470,14 +476,97 @@ pub fn check_program(p: &mut Program, target: Target) -> Result<HashMap<String, 
     for d in &p.structs {
         check_struct_invariants(d, &sigs, &specs, target)?;
     }
+    let mut graph = Vec::new();
     for f in &mut p.fns {
-        check_fn(f, &sigs, &specs, target).map_err(|d| in_copy(d, &f.name))?;
+        let (calls, sites) = check_fn(f, &sigs, &specs, target).map_err(|d| in_copy(d, &f.name))?;
+        graph.push((f.name.clone(), calls, sites));
     }
+    lock_order(&graph)?;
     Ok(sigs)
 }
 
+/// Rules out deadlock through locks, without annotations. A lock's class is
+/// the type of its contents. While `locked(l, f)` holds a lock of class C,
+/// `f` and everything it calls may take only locks of other classes, and the
+/// classes must form no cycle (C taken before D somewhere and D before C
+/// elsewhere). Then every processor takes locks in one global order of
+/// classes, and no two can wait for each other.
+fn lock_order(graph: &[(String, Vec<String>, Vec<(Pos, String, String)>)]) -> Result<(), Diag> {
+    // The classes each function may take, itself or through its callees.
+    let mut takes: HashMap<&str, Vec<String>> = HashMap::new();
+    for (f, _, sites) in graph {
+        let mut v: Vec<String> = Vec::new();
+        for (_, c, _) in sites {
+            if !v.contains(c) {
+                v.push(c.clone());
+            }
+        }
+        takes.insert(f, v);
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (f, calls, _) in graph {
+            for g in calls {
+                let add: Vec<String> = takes.get(g.as_str()).map_or(Vec::new(), |v| v.clone());
+                let mine = takes.get_mut(f.as_str()).unwrap();
+                for c in add {
+                    if !mine.contains(&c) {
+                        mine.push(c);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    // Class C before class D whenever a lock of class D can be taken while
+    // one of class C is held.
+    let under = |f: &str| takes.get(f).cloned().unwrap_or_default();
+    let mut edges: Vec<(String, String)> = Vec::new();
+    for (_, _, sites) in graph {
+        for (_, c, f) in sites {
+            for d in under(f) {
+                if !edges.contains(&(c.clone(), d.clone())) {
+                    edges.push((c.clone(), d));
+                }
+            }
+        }
+    }
+    let reaches = |from: &str, to: &str| {
+        let mut seen: Vec<&str> = vec![from];
+        let mut i = 0;
+        while i < seen.len() {
+            if seen[i] == to {
+                return true;
+            }
+            for (a, b) in &edges {
+                if a == seen[i] && !seen.contains(&b.as_str()) {
+                    seen.push(b);
+                }
+            }
+            i += 1;
+        }
+        false
+    };
+    for (name, _, sites) in graph {
+        for (pos, c, f) in sites {
+            for d in under(f) {
+                if d == *c {
+                    return Err(in_copy(Diag::new("E-LOCK-ORDER", *pos, format!("`{}` may take a lock of class {} while this one, also of class {}, is held", f, c, c))
+                        .note("a processor spins forever on a lock it already holds; two locks with the same contents type cannot be nested. Give them different contents types to order them"), name));
+                }
+                if reaches(&d, c) {
+                    return Err(in_copy(Diag::new("E-LOCK-ORDER", *pos, format!("`{}` may take a lock of class {} while this lock of class {} is held, but elsewhere {} is held while {} is taken", f, d, c, d, c))
+                        .note("two processors taking them in opposite orders can wait for each other forever; take locks of these classes in one order everywhere"), name));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn new_ctx<'a>(sigs: &'a HashMap<String, Sig>, specs: &'a [SpecFn], target: Target, ret: Type) -> Ctx<'a> {
-    Ctx { sigs, specs, target, ret, scopes: vec![Vec::new()], vars: HashMap::new(), moved: HashSet::new(), int_ops: HashMap::new() }
+    Ctx { sigs, specs, target, ret, scopes: vec![Vec::new()], vars: HashMap::new(), moved: HashSet::new(), int_ops: HashMap::new(), calls: Vec::new(), lock_sites: Vec::new() }
 }
 
 /// A spec fn may only call spec fns defined before it, so expansion terminates.
@@ -516,7 +605,8 @@ fn check_struct_invariants(d: &StructDef, sigs: &HashMap<String, Sig>, specs: &[
     Ok(())
 }
 
-fn check_fn(f: &mut FnDef, sigs: &HashMap<String, Sig>, specs: &[SpecFn], target: Target) -> Result<(), Diag> {
+/// Returns the functions `f` calls and its `locked` calls, for `lock_order`.
+fn check_fn(f: &mut FnDef, sigs: &HashMap<String, Sig>, specs: &[SpecFn], target: Target) -> Result<(Vec<String>, Vec<(Pos, String, String)>), Diag> {
     let mut cx = new_ctx(sigs, specs, target, f.ret.clone());
     for p in &f.params {
         if p.ty.is_ref() && p.mutable {
@@ -541,7 +631,7 @@ fn check_fn(f: &mut FnDef, sigs: &HashMap<String, Sig>, specs: &[SpecFn], target
         cx.leak_check_all(f.pos, "at the end of the function")?;
     }
     f.int_ops = cx.int_ops;
-    Ok(())
+    Ok((cx.calls, cx.lock_sites))
 }
 
 /// Checks that the literal `v` fits in the integer type `t`.
@@ -1268,6 +1358,7 @@ impl<'a> Ctx<'a> {
         if sig.params.first() != Some(&m((*inner).clone())) {
             return Err(Diag::new("E-TYPE", args[1].pos, format!("`{}` must take `&mut {}` first, to receive the contents of the lock", f, inner.name())));
         }
+        self.lock_sites.push((pos, inner.name(), f.clone()));
         let mut params = vec![r(Type::Lock(inner))];
         params.extend(sig.params[1..].iter().cloned());
         let mut rest = vec![args[0].clone()];
@@ -1337,6 +1428,9 @@ impl<'a> Ctx<'a> {
 
     /// Checks a call's arguments against `sig`: scalars, then borrows, then moves.
     fn call_with(&mut self, name: &str, sig: Sig, args: &[Expr], pos: Pos) -> Result<Type, Diag> {
+        if !is_builtin(name) && !self.calls.iter().any(|c| c == name) {
+            self.calls.push(name.to_string());
+        }
         if sig.params.len() != args.len() {
             return Err(Diag::new("E-TYPE", pos, format!("`{}` takes {} argument(s), {} given", name, sig.params.len(), args.len())));
         }

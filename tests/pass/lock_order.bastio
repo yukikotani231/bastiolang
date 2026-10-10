@@ -1,0 +1,30 @@
+// expect-exit: 7
+// Two lock classes taken in one order: a `Table` lock may be held while a
+// `Stats` lock is taken, never the other way round, so no two processors can
+// wait for each other. The order is found from the call graph; nothing is
+// written down and nothing is generated for it.
+struct Table { n: u64 }
+struct Stats { hits: u64 }
+
+fn count(s: &mut Stats) {
+  if s.hits < 1000 { s.hits = s.hits + 1; }
+}
+
+fn insert(t: &mut Table, s: &Lock[Stats]) {
+  if t.n < 100 { t.n = t.n + 1; }
+  locked(s, count);
+}
+
+fn read(s: &mut Stats) -> u64 { return s.hits; }
+
+fn main() -> u64 {
+  let t = lock_new(Table { n: 0 });
+  let s = lock_new(Stats { hits: 4 });
+  locked(t, insert, s);
+  locked(t, insert, s);
+  locked(t, insert, s);
+  let h = locked(s, read);
+  let tv = lock_end(t);
+  let sv = lock_end(s);
+  return h;
+}

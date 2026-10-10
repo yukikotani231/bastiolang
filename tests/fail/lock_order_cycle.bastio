@@ -1,0 +1,23 @@
+// expect-error: E-LOCK-ORDER
+// `a_then_b` holds an `A` lock while taking a `B` lock, and `b_then_a` does
+// the opposite. Run on two processors at once, each can take its first lock
+// and then spin forever on the other's.
+struct A { n: u64 }
+struct B { n: u64 }
+
+fn touch_b(b: &mut B) { b.n = 1; }
+fn touch_a(a: &mut A) { a.n = 1; }
+fn under_a(a: &mut A, lb: &Lock[B]) { locked(lb, touch_b); }
+fn under_b(b: &mut B, la: &Lock[A]) { locked(la, touch_a); }
+fn a_then_b(la: &Lock[A], lb: &Lock[B]) { locked(la, under_a, lb); }
+fn b_then_a(la: &Lock[A], lb: &Lock[B]) { locked(lb, under_b, la); }
+
+fn main() -> u64 {
+  let la = lock_new(A { n: 0 });
+  let lb = lock_new(B { n: 0 });
+  a_then_b(la, lb);
+  b_then_a(la, lb);
+  let a = lock_end(la);
+  let b = lock_end(lb);
+  return 0;
+}
