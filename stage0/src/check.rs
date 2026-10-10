@@ -72,6 +72,8 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("host_read", Avail::Hosted, vec![r(Host), r(Bytes), m(Bytes)], Bool),
         ("host_write", Avail::Hosted, vec![r(Host), r(Bytes), r(Bytes)], Bool),
         ("host_eprint", Avail::Hosted, vec![r(Host), r(Bytes)], Unit),
+        ("host_env", Avail::Hosted, vec![r(Host), Str, m(Bytes)], Bool),
+        ("host_cpus", Avail::Hosted, vec![r(Host)], U64),
         ("host_spawn", Avail::Hosted, vec![r(Host), r(Vec(std::boxed::Box::new(Bytes)))], Child),
         ("child_write", Avail::Hosted, vec![m(Child), r(Bytes)], Bool),
         ("child_close", Avail::Hosted, vec![m(Child)], Unit),

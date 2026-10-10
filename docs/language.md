@@ -847,6 +847,8 @@ On the hosted target, `main` can ask for `&mut Host`: the program's command line
 | `host_read(h: &Host, path: &Bytes, out: &mut Bytes) -> bool` | Replaces `out` with the whole file; false (and `out` unchanged) if it cannot be read |
 | `host_write(h: &Host, path: &Bytes, data: &Bytes) -> bool` | Creates or replaces the file |
 | `host_eprint(h: &Host, text: &Bytes)` | Writes the bytes to standard error |
+| `host_env(h: &Host, name: Str, out: &mut Bytes) -> bool` | Replaces `out` with the value of the environment variable `name`; false (and `out` unchanged) if it is not set |
+| `host_cpus(h: &Host) -> u64` | Number of processors online (at least 1, which the prover does not know) |
 | `host_spawn(h: &Host, argv: &Vec[Bytes]) -> Child` | Starts `argv[0]` (looked up in `PATH`) with arguments `argv`. A program that cannot be started gives a child that exits with 127 and writes nothing |
 | `child_write(c: &mut Child, data: &Bytes) -> bool` | Writes to the child's standard input; false if it can no longer be written |
 | `child_close(c: &mut Child)` | Closes the child's standard input, so a program that reads to the end of its input can finish |

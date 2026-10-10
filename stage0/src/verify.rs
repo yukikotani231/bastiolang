@@ -1722,6 +1722,12 @@ impl<'p> Verifier<'p> {
             }
             "host_write" => self.fresh_bool("write_ok"),
             "host_eprint" => Ok(Val::Unit),
+            "host_env" => {
+                let nv = self.fresh_of(&Type::Bytes, "env")?;
+                self.put_back(&args[2], nv, st);
+                self.fresh_bool("env_set")
+            }
+            "host_cpus" => self.fresh_u64("cpus"),
             "host_spawn" => self.fresh_of(&Type::Child, "child"),
             "child_write" => self.fresh_bool("child_write_ok"),
             "child_close" => Ok(Val::Unit),
