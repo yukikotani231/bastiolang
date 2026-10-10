@@ -20,7 +20,8 @@
 #   driver  stage1/bastioc1.bastio  vs  bastioc0 itself: what `--check`
 #           prints on stderr and its exit status (a failed proof's
 #           sentence masked, as bastioc1 does not print it yet), the
-#           C file of `--emit-c`, and the programs it builds, which must
+#           C file of `--emit-c`, the C header of `--header`, the list of
+#           `--trusted-base`, and the programs it builds, which must
 #           exit as tests/pass says; and bastioc1 built by itself must
 #           write the same C for itself as stage0 (the fixed point)
 # The parser, the monomorphizer and the checker are also compared on damaged
@@ -174,6 +175,25 @@ for f in tests/pass/*.bastio tests/user/*.bastio ../bastios/src/main.bastio ../b
     echo "DIFFER $f ($t, --emit-c)"
   fi
 done
+# The C header of every library with an `export fn`, and the trusted base.
+mkdir -p "$tmp/hw" "$tmp/hg"
+for f in $(grep -l '^export fn' tests/pass/*.bastio examples/*/*.bastio); do
+  "$BASTIOC" --emit-c --header "$tmp/hw/lib.h" -o "$tmp/want.c" "$f" 2>/dev/null || continue
+  cfiles=$((cfiles+1))
+  if "$tmp/bastioc1" --emit-c --header "$tmp/hg/lib.h" -o "$tmp/got.c" "$f" 2>/dev/null && cmp -s "$tmp/hw/lib.h" "$tmp/hg/lib.h"; then
+    match=$((match+1))
+  else
+    differ=$((differ+1))
+    echo "DIFFER $f (--header)"
+    diff "$tmp/hw/lib.h" "$tmp/hg/lib.h" | head -5 | cut -c1-300 | sed 's/^/    /'
+  fi
+done
+if "$tmp/bastioc1" --trusted-base | cmp -s - <("$BASTIOC" --trusted-base); then
+  match=$((match+1))
+else
+  differ=$((differ+1))
+  echo "DIFFER --trusted-base"
+fi
 built=0
 for f in tests/pass/*.bastio; do
   want=$(sed -n 's|^// expect-exit: *||p' "$f" | head -1)

@@ -1,0 +1,279 @@
+// Expressions as source text, the way stage0's `ast::render` writes them:
+// in a C header's `/* ensures .. */` comments and in error sentences. A
+// binary operator, `is` and `forall` get parentheses unless they are the
+// whole expression or an argument.
+import "parser.bastio";
+
+fn rd_s(out: &mut Vec[u64], s: Str) {
+  let mut k = 0;
+  while k < slen(s)
+    invariant k <= slen(s)
+  {
+    vec_push(&mut out, cast[u64](sget(s, k)));
+    k = k + 1;
+  }
+}
+
+fn rd_src(out: &mut Vec[u64], p: &Parser, s: u64, e: u64) {
+  if s <= e && e <= blen(p.src) {
+    let mut k = s;
+    while k < e
+      invariant e <= blen(p.src)
+    {
+      vec_push(&mut out, cast[u64](bget(p.src, k)));
+      k = k + 1;
+    }
+  }
+}
+
+fn rd_num(out: &mut Vec[u64], x: u64) {
+  let mut d = vec_new[u64]();
+  let mut y = x;
+  vec_push(&mut d, 48 + y % 10);
+  y = y / 10;
+  while y > 0 {
+    vec_push(&mut d, 48 + y % 10);
+    y = y / 10;
+  }
+  let mut k = vec_len(d);
+  while k > 0
+    invariant k <= vlen(d)
+  {
+    k = k - 1;
+    vec_push(&mut out, vec_get(d, k));
+  }
+  vec_free(d);
+}
+
+fn rd_hex(out: &mut Vec[u64], x: u64) {
+  let mut d = vec_new[u64]();
+  let mut y = x;
+  vec_push(&mut d, y % 16);
+  y = y / 16;
+  while y > 0 {
+    vec_push(&mut d, y % 16);
+    y = y / 16;
+  }
+  let mut k = vec_len(d);
+  while k > 0
+    invariant k <= vlen(d)
+  {
+    k = k - 1;
+    let h = vec_get(d, k);
+    if h < 10 {
+      vec_push(&mut out, 48 + h);
+    } else if h < 16 {
+      vec_push(&mut out, 87 + h);
+    }
+  }
+  vec_free(d);
+}
+
+fn rd_op(out: &mut Vec[u64], op: u64) {
+  if op == P_IMPLIES { rd_s(&mut out, "==>"); }
+  else if op == P_EQEQ { rd_s(&mut out, "=="); }
+  else if op == P_NE { rd_s(&mut out, "!="); }
+  else if op == P_LE { rd_s(&mut out, "<="); }
+  else if op == P_GE { rd_s(&mut out, ">="); }
+  else if op == P_ANDAND { rd_s(&mut out, "&&"); }
+  else if op == P_OROR { rd_s(&mut out, "||"); }
+  else if op == P_PLUS { rd_s(&mut out, "+"); }
+  else if op == P_MINUS { rd_s(&mut out, "-"); }
+  else if op == P_STAR { rd_s(&mut out, "*"); }
+  else if op == P_SLASH { rd_s(&mut out, "/"); }
+  else if op == P_PERCENT { rd_s(&mut out, "%"); }
+  else if op == P_LT { rd_s(&mut out, "<"); }
+  else if op == P_GT { rd_s(&mut out, ">"); }
+  else if op == P_AMP { rd_s(&mut out, "&"); }
+  else if op == P_PIPE { rd_s(&mut out, "|"); }
+  else if op == P_CARET { rd_s(&mut out, "^"); }
+  else if op == P_SHL { rd_s(&mut out, "<<"); }
+  else if op == P_SHR { rd_s(&mut out, ">>"); }
+}
+
+/// A type as written (stage0's `Type::name`).
+fn rd_type(out: &mut Vec[u64], p: &Parser, i: u64) {
+  let n = node_at(p.nodes, i);
+  if n.kind == T_NAMED {
+    rd_src(&mut out, p, n.s, n.e);
+  } else if n.kind == T_GENERIC {
+    rd_src(&mut out, p, n.s, n.e);
+    rd_s(&mut out, "[");
+    let mut k = n.a;
+    while k != 0 {
+      rd_type(&mut out, p, k);
+      k = next_of(p, k);
+      if k != 0 {
+        rd_s(&mut out, ", ");
+      }
+    }
+    rd_s(&mut out, "]");
+  } else if n.kind == T_REF {
+    rd_s(&mut out, "&");
+    rd_type(&mut out, p, n.a);
+  } else if n.kind == T_MUTREF {
+    rd_s(&mut out, "&mut ");
+    rd_type(&mut out, p, n.a);
+  } else {
+    rd_s(&mut out, "()");
+  }
+}
+
+/// A string literal as Rust's `{:?}` writes the decoded string: the
+/// source's escapes are the same ones, except that `\0` is kept and a raw
+/// control character is escaped.
+fn rd_str(out: &mut Vec[u64], p: &Parser, s: u64, e: u64) {
+  rd_s(&mut out, "\"");
+  if s <= e && e <= blen(p.src) {
+    let mut k = s;
+    while k < e
+      invariant e <= blen(p.src)
+    {
+      let ch = cast[u64](bget(p.src, k));
+      if ch == 9 {
+        rd_s(&mut out, "\\t");
+      } else if ch == 10 {
+        rd_s(&mut out, "\\n");
+      } else if ch == 13 {
+        rd_s(&mut out, "\\r");
+      } else if ch < 32 || ch == 127 {
+        rd_s(&mut out, "\\u{");
+        rd_hex(&mut out, ch);
+        rd_s(&mut out, "}");
+      } else {
+        vec_push(&mut out, ch);
+      }
+      k = k + 1;
+    }
+  }
+  rd_s(&mut out, "\"");
+}
+
+/// The comma-separated expressions of the list `head`.
+fn rd_list(out: &mut Vec[u64], p: &Parser, head: u64) {
+  let mut k = head;
+  while k != 0 {
+    rd_expr(&mut out, p, k, true);
+    k = next_of(p, k);
+    if k != 0 {
+      rd_s(&mut out, ", ");
+    }
+  }
+}
+
+/// Appends the expression `i` to `out`; `top` when it stands alone.
+fn rd_expr(out: &mut Vec[u64], p: &Parser, i: u64, top: bool) {
+  let n = node_at(p.nodes, i);
+  let k = n.kind;
+  if k == E_INT {
+    rd_num(&mut out, n.v);
+  } else if k == E_BOOL {
+    if n.v == 1 { rd_s(&mut out, "true"); } else { rd_s(&mut out, "false"); }
+  } else if k == E_STR {
+    rd_str(&mut out, p, n.s, n.e);
+  } else if k == E_BLOB {
+    rd_s(&mut out, "include_bytes(<");
+    rd_num(&mut out, n.v);
+    rd_s(&mut out, " bytes>)");
+  } else if k == E_MUTBORROW {
+    rd_s(&mut out, "&mut ");
+    let mut q = n.a;
+    while q != 0 {
+      let qn = node_at(p.nodes, q);
+      rd_src(&mut out, p, qn.s, qn.e);
+      q = qn.next;
+      if q != 0 {
+        rd_s(&mut out, ".");
+      }
+    }
+  } else if k == E_VAR {
+    rd_src(&mut out, p, n.s, n.e);
+  } else if k == E_FIELD {
+    rd_expr(&mut out, p, n.a, false);
+    rd_s(&mut out, ".");
+    rd_src(&mut out, p, n.s, n.e);
+  } else if k == E_SLIT {
+    rd_src(&mut out, p, n.s, n.e);
+    rd_s(&mut out, " { ");
+    let mut f = n.a;
+    while f != 0 {
+      let fi = node_at(p.nodes, f);
+      rd_src(&mut out, p, fi.s, fi.e);
+      rd_s(&mut out, ": ");
+      rd_expr(&mut out, p, fi.a, true);
+      f = fi.next;
+      if f != 0 {
+        rd_s(&mut out, ", ");
+      }
+    }
+    rd_s(&mut out, " }");
+  } else if k == E_VARIANT {
+    rd_src(&mut out, p, n.s, n.e);
+    rd_s(&mut out, "::");
+    rd_src(&mut out, p, n.s2, n.e2);
+    if n.a != 0 {
+      rd_s(&mut out, "(");
+      rd_expr(&mut out, p, n.a, true);
+      rd_s(&mut out, ")");
+    }
+  } else if k == E_IS {
+    if !top { rd_s(&mut out, "("); }
+    rd_expr(&mut out, p, n.a, false);
+    rd_s(&mut out, " is ");
+    rd_src(&mut out, p, n.s, n.e);
+    rd_s(&mut out, "::");
+    rd_src(&mut out, p, n.s2, n.e2);
+    if !top { rd_s(&mut out, ")"); }
+  } else if k == E_TAPP {
+    // As written: the name, the type arguments, then the rest.
+    let b = node_at(p.nodes, n.b);
+    rd_src(&mut out, p, b.s, b.e);
+    rd_s(&mut out, "[");
+    let mut t = n.a;
+    while t != 0 {
+      rd_type(&mut out, p, t);
+      t = next_of(p, t);
+      if t != 0 {
+        rd_s(&mut out, ", ");
+      }
+    }
+    rd_s(&mut out, "]");
+    let mut rest = vec_new[u64]();
+    rd_expr(&mut rest, p, n.b, top);
+    let mut j = 0;
+    if b.s <= b.e {
+      j = b.e - b.s;
+    }
+    while j < vec_len(rest) {
+      vec_push(&mut out, vec_get(rest, j));
+      j = j + 1;
+    }
+    vec_free(rest);
+  } else if k == E_NOT {
+    rd_s(&mut out, "!");
+    rd_expr(&mut out, p, n.a, false);
+  } else if k == E_NEG {
+    rd_s(&mut out, "-");
+    rd_expr(&mut out, p, n.a, false);
+  } else if k == E_BIN {
+    if !top { rd_s(&mut out, "("); }
+    rd_expr(&mut out, p, n.a, false);
+    rd_s(&mut out, " ");
+    rd_op(&mut out, n.v);
+    rd_s(&mut out, " ");
+    rd_expr(&mut out, p, n.b, false);
+    if !top { rd_s(&mut out, ")"); }
+  } else if k == E_CALL {
+    rd_src(&mut out, p, n.s, n.e);
+    rd_s(&mut out, "(");
+    rd_list(&mut out, p, n.a);
+    rd_s(&mut out, ")");
+  } else if k == E_FORALL {
+    if !top { rd_s(&mut out, "("); }
+    rd_s(&mut out, "forall ");
+    rd_src(&mut out, p, n.s, n.e);
+    rd_s(&mut out, ": u64 :: ");
+    rd_expr(&mut out, p, n.a, true);
+    if !top { rd_s(&mut out, ")"); }
+  }
+}
