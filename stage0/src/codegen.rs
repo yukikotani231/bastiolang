@@ -663,12 +663,14 @@ static uint64_t *bst_regrow(uint64_t *p, uint64_t old, uint64_t n) {
 }
 "#;
 
-// Child processes (hosted only): fork and exec with a pipe each way.
+// Child processes (hosted only): posix_spawn with a pipe each way.
 const PRELUDE_CHILD: &str = r#"
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <spawn.h>
+extern char **environ;
 typedef struct { int pid; int in; FILE *out; } bst_child;
 /* A child that cannot be started (no such program, no pipes or processes
  * left) behaves like one that exited with 127 without output, which is
@@ -688,13 +690,18 @@ static bst_child bst_host_spawn(bst_host h, bst_vec argv) {
     for (uint64_t i = 0; i < argv.len; i++) av[i] = bst_cpath(((bst_bytes *)argv.data)[i]);
     av[argv.len] = NULL;
     fflush(NULL);
-    int pid = fork();
-    if (pid == 0) {
-        dup2(to[0], 0);
-        dup2(from[1], 1);
-        close(to[0]); close(to[1]); close(from[0]); close(from[1]);
-        execvp(av[0], av);
-        _exit(127);
+    /* posix_spawn, not fork: the parent's memory is never copied, which a
+     * kernel without copy-on-write (BastiOS) cannot do for a large one.
+     * The parent's ends are close-on-exec already. */
+    int pid = -1;
+    posix_spawn_file_actions_t fa;
+    if (posix_spawn_file_actions_init(&fa) == 0) {
+        if (posix_spawn_file_actions_adddup2(&fa, to[0], 0) != 0 ||
+            posix_spawn_file_actions_adddup2(&fa, from[1], 1) != 0 ||
+            posix_spawn_file_actions_addclose(&fa, to[0]) != 0 ||
+            posix_spawn_file_actions_addclose(&fa, from[1]) != 0 ||
+            posix_spawnp(&pid, av[0], &fa, NULL, av, environ) != 0) pid = -1;
+        posix_spawn_file_actions_destroy(&fa);
     }
     for (uint64_t i = 0; i < argv.len; i++) free(av[i]);
     free(av);
