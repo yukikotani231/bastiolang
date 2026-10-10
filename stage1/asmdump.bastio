@@ -3,7 +3,8 @@
 // code generation; no verification), for differential testing against
 // stage0 (with --stage0, which leaves out what only stage1 does). A
 // program the native backend does not support yet exits 4, as stage0 does.
-//   usage: asmdump [--stage0] FILE
+// With --user, the program is a BastiOS user program (`--target user`).
+//   usage: asmdump [--stage0 | --user] FILE
 import "loader.bastio";
 import "out.bastio";
 import "x86.bastio";
@@ -11,9 +12,13 @@ import "x86.bastio";
 fn main(con: &mut Serial, host: &mut Host) -> u64 {
   let mut file_arg = 1;
   let mut compat = false;
+  let mut target = TARGET_HOSTED;
   if host_argc(host) > 2 {
     let flag = host_arg(host, 1);
     compat = spells(flag, 0, blen(flag), "--stage0");
+    if spells(flag, 0, blen(flag), "--user") {
+      target = TARGET_USER;
+    }
     bfree(flag);
     file_arg = 2;
   }
@@ -34,7 +39,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
       put(con, "error\n");
       code = 1;
     } else {
-      let mut c = checker_new(&mut m, p, TARGET_HOSTED);
+      let mut c = checker_new(&mut m, p, target);
       check_program(&mut c, &mut m, p);
       if c.failed {
         put(con, "error\n");
@@ -42,6 +47,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
       } else {
         let mut g = x86_new();
         g.stage0 = compat;
+        g.target = target;
         if x86_program(&mut g, c, &mut m, p) {
           let mut k = 0;
           while k < vec_len(g.out) {
