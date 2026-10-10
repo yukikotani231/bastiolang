@@ -67,5 +67,12 @@ if echo 'int main(void){return 0;}' | ${CC:-cc} -fsanitize=address,undefined -x 
 else
   echo "(sanitizer cross-check skipped: no -fsanitize support)"
 fi
+# Examples with a C side: each builds its Bastio code into C, links it with a
+# C harness and runs it (examples/*/run.sh).
+for r in examples/*/run.sh; do
+  [ -e "$r" ] || continue
+  if BASTIOC="$BASTIOC" "$r" >"$tmp/ex.out" 2>&1; then pass=$((pass+1)); else
+    echo "FAIL $r"; sed 's/^/    /' "$tmp/ex.out" | tail -20; fail=$((fail+1)); fi
+done
 echo "-- $pass passed, $fail failed"
 [ "$fail" = 0 ]

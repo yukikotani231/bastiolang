@@ -1068,7 +1068,8 @@ impl<'a> Ctx<'a> {
     /// Specification expression: ghost, never consumes.
     fn spec_expr(&self, e: &Expr, in_ensures: bool, bound: &mut Vec<String>) -> Result<Type, Diag> {
         match &e.kind {
-            ExprKind::TypeApp(..) => unreachable!("removed by monomorphization"),
+            // Only `vec_new[T]()` keeps its type arguments after monomorphization.
+            ExprKind::TypeApp(..) => Err(Diag::new("E-TYPE", e.pos, "`vec_new` cannot be called in a specification")),
             ExprKind::Int(_) => Ok(Type::U64),
             ExprKind::Bool(_) => Ok(Type::Bool),
             ExprKind::Str(_) | ExprKind::Blob(_) => Ok(Type::Str),

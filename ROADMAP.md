@@ -54,7 +54,7 @@ What the compiler needs in order to be written in Bastio. Structs come first (re
 - [ ] bastioc1, written in Bastio, produces the same output as stage0 (differential testing)
   - [x] Lexer (`stage1/lexer.bastio`, done 2026-10-10): the same tokens and lexical errors as stage0 on every source in this repository and in BastiOS (`stage1/difftest.sh`, run in CI)
   - [x] Parser (`stage1/parser.bastio`, done 2026-10-10): the same syntax tree as stage0 (`--dump-ast`) on every source, and the same first-error position on damaged copies of them (`stage1/mutate.py`)
-  - [ ] Checker (types and linearity). Loading (imports) and monomorphization are done (2026-10-10, compared through `--dump-mono`); the checker proper is next
+  - [x] Checker (`stage1/loader.bastio`, `mono.bastio`, `check.bastio`, done 2026-10-10): imports, monomorphization, types and linearity, with the same result as stage0 (`--dump-mono`, `--dump-check`, including the type of every `let`) on every source and on damaged copies, library files included
   - [ ] Verifier (talks to Z3 through a `Child`)
   - [ ] C code generation
 - [ ] bastioc1 compiles itself and reaches a fixed point (gen2 == gen1)
@@ -63,6 +63,11 @@ What the compiler needs in order to be written in Bastio. Structs come first (re
 ## v3: toward a kernel
 
 Started early, alongside v1, because the kernel is the primary target and it shapes what v1 needs.
+- [ ] **Concurrency** (design: [docs/concurrency.md](docs/concurrency.md), 2026-10-10). Data-race freedom becomes part of mandatory memory safety, with no `unsafe` escape: `par` and `spawn`/`join`, `Share[T]` (read-only sharing with ghost fractions instead of a reference count), `Lock[T]` and `Atomic[T]` guarded by type invariants, lock ranks proved at compile time, pinned per-core capabilities, and interrupt-safe locks. Prioritized because kernels and drivers need it and it is where Rust kernels still rely on `unsafe` (the first CVE in Rust-for-Linux code, CVE-2025-68260, was a race in an `unsafe` block). Implemented in the self-hosted compiler right after the fixed point, so the checker is not written twice, in four steps:
+  - [ ] Fork-join and threads on the hosted target (`par`, `spawn`/`join`, `Share`, pinned types)
+  - [ ] Locks and atomics (type invariants, `Lock`/`Held`, `Atomic`, `Ctx` with ranks)
+  - [ ] BastiOS on several cores (`smp_start`, one kernel lock, then per-core run queues)
+  - [ ] Interrupt handlers and interrupt-safe locks, with the first driver that needs them
 - [x] Mutable borrows `&mut T` (see "Open design questions": settled)
 - [x] Capabilities for physical pages and address spaces: `Pool`, `Frame`, `PageTable` (levels and slot ownership tracked), `Mmu` (the table in CR3 is never freed), `Cpu` (the user context; entering user mode)
 - [x] `--target user` for programs under a Bastio kernel
@@ -70,6 +75,13 @@ Started early, alongside v1, because the kernel is the primary target and it sha
 - [ ] More hardware capabilities: `PortIo`, `Mmio[R]`, `IrqOff`, so the UART, PIC and timer code moves from the C prelude and `platform.c` into Bastio
 - [ ] Allocation failure returned in the type (no abort on OOM). Enums exist now (v1 item 3); what is left is changing `alloc`, `pool_take` and friends to return them
 - [ ] Native x86-64 backend, without going through C (removes the C compiler from the trusted base)
+
+## C boundary
+
+What the "safe libraries callable from C" target needs (Scope, design consequence 2).
+- [x] A first demo: `examples/base64`, a strict base64 codec proved memory safe and called from a C harness, with a differential fuzz against a C decoder and a benchmark (done 2026-10-10). It goes through a hand-written wrapper, `base64_capi.c`, because stage0 cannot export a function yet
+- [ ] `export fn`: a non-static C symbol with a generated header, no `main` required for a library, and the precondition of an exported function either ruled out or checked in a generated wrapper (a C caller cannot be proved to meet it). This touches the lexer and parser, so stage1 must learn it at the same time
+- [ ] Caller-provided output buffers (`&mut Bytes` lent from C), so a library need not allocate; needs a guarantee that the callee does not replace the buffer
 
 ## v4: Linux compatibility
 
@@ -91,13 +103,13 @@ Safety must not cost speed at run time; that is the point of proving it instead 
 - [ ] BastiOS: `user_byte` walks all four page-table levels for every byte it copies, and the kernel allocator scans its free list linearly and zeroes every page; measure, then batch per page
 - [ ] `bench/`, starting from the programs of the first measurement (sum, sieve, tree, vec, each with its C twin), with a script that prints one line per measurement and a script that prints one line per measurement (generated-code time vs C, compile and proof time per file)
 - [ ] CI runs it and keeps the numbers as an artifact, so a regression shows up next to the change that caused it
-- [ ] stage1 data structures: the phases written so far use linear searches (types, instances, places, variables). Fine for today's sources (a few ms per file); replace with hashing or indexed lookups before self-compilation if measurements show they dominate
+- [ ] stage1 data structures: the phases written so far use linear searches (types, instances, places, variables). Fine for today's sources (checking all of stage1, about 6,000 lines, takes 47 ms, the same as stage0); replace with hashing or indexed lookups before self-compilation if measurements show they dominate
 - [ ] BastiOS: a `bench` shell command (or test mode) that times the kernel paths above in QEMU (relative numbers only; QEMU timing is not hardware timing)
 
 **Review cadence.** Performance is reviewed at every roadmap milestone (each checked item in v2 to v4) and whenever a phase of the self-hosted compiler lands: run `bench/`, compare with the previous numbers, and note anything that got slower in the PR.
 
 ## Open design questions
 
-- How to express concurrency in types: multiple cores, locks, sharing with interrupt handlers.
+- Concurrency: settled in [docs/concurrency.md](docs/concurrency.md); its own open questions (monotonic facts, blocking, channels, multi-threaded user processes, weaker atomics, RCU) are listed there.
 - Termination (currently a non-goal).
 - How to write hand-written proofs (lemmas) for the cases where Z3 gets stuck on quantifiers.
