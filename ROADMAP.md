@@ -54,7 +54,7 @@ What the compiler needs in order to be written in Bastio. Structs come first (re
 - [ ] bastioc1, written in Bastio, produces the same output as stage0 (differential testing)
   - [x] Lexer (`stage1/lexer.bastio`, done 2026-10-10): the same tokens and lexical errors as stage0 on every source in this repository and in BastiOS (`stage1/difftest.sh`, run in CI)
   - [x] Parser (`stage1/parser.bastio`, done 2026-10-10): the same syntax tree as stage0 (`--dump-ast`) on every source, and the same first-error position on damaged copies of them (`stage1/mutate.py`)
-  - [ ] Checker (types and linearity). Loading (imports) and monomorphization are done (2026-10-10, compared through `--dump-mono`); the checker proper is next
+  - [x] Checker (`stage1/loader.bastio`, `mono.bastio`, `check.bastio`, done 2026-10-10): imports, monomorphization, types and linearity, with the same result as stage0 (`--dump-mono`, `--dump-check`, including the type of every `let`) on every source and on damaged copies, library files included
   - [ ] Verifier (talks to Z3 through a `Child`)
   - [ ] C code generation
 - [ ] bastioc1 compiles itself and reaches a fixed point (gen2 == gen1)
@@ -91,7 +91,7 @@ Safety must not cost speed at run time; that is the point of proving it instead 
 - [ ] BastiOS: `user_byte` walks all four page-table levels for every byte it copies, and the kernel allocator scans its free list linearly and zeroes every page; measure, then batch per page
 - [ ] `bench/`, starting from the programs of the first measurement (sum, sieve, tree, vec, each with its C twin), with a script that prints one line per measurement and a script that prints one line per measurement (generated-code time vs C, compile and proof time per file)
 - [ ] CI runs it and keeps the numbers as an artifact, so a regression shows up next to the change that caused it
-- [ ] stage1 data structures: the phases written so far use linear searches (types, instances, places, variables). Fine for today's sources (a few ms per file); replace with hashing or indexed lookups before self-compilation if measurements show they dominate
+- [ ] stage1 data structures: the phases written so far use linear searches (types, instances, places, variables). Fine for today's sources (checking all of stage1, about 6,000 lines, takes 47 ms, the same as stage0); replace with hashing or indexed lookups before self-compilation if measurements show they dominate
 - [ ] BastiOS: a `bench` shell command (or test mode) that times the kernel paths above in QEMU (relative numbers only; QEMU timing is not hardware timing)
 
 **Review cadence.** Performance is reviewed at every roadmap milestone (each checked item in v2 to v4) and whenever a phase of the self-hosted compiler lands: run `bench/`, compare with the previous numbers, and note anything that got slower in the PR.

@@ -41,6 +41,9 @@ struct Ty { kind: u64, a: u64 }
 /// `targs[args .. args + n]`.
 struct Inst { def: u64, args: u64, n: u64 }
 
+/// The type the checker found for the `let` statement `node` in instance `env`.
+struct LetTy { env: u64, node: u64, lty: u64 }
+
 struct Mono {
   /// Interned types; index 0 means "no type" (after an error).
   tys: Vec[Ty],
@@ -54,6 +57,8 @@ struct Mono {
   structs: Vec[u64],
   enums: Vec[u64],
   fns: Vec[u64],
+  /// Filled in by the checker.
+  lets: Vec[LetTy],
   failed: bool,
   efile: u64,
   eline: u64,
@@ -67,7 +72,7 @@ fn mono_new() -> Mono {
   vec_push(&mut insts, Inst { def: 0, args: 0, n: 0 });
   return Mono {
     tys: tys, insts: insts, targs: vec_new[u64](), queue: vec_new[u64](),
-    structs: vec_new[u64](), enums: vec_new[u64](), fns: vec_new[u64](),
+    structs: vec_new[u64](), enums: vec_new[u64](), fns: vec_new[u64](), lets: vec_new[LetTy](),
     failed: false, efile: 0, eline: 0, ecol: 0
   };
 }
@@ -80,6 +85,7 @@ fn mono_free(m: Mono) {
   vec_free(m.structs);
   vec_free(m.enums);
   vec_free(m.fns);
+  vec_free(m.lets);
 }
 
 /// Records an error (E-TYPE) at node `loc`, unless one is recorded already.
@@ -107,6 +113,19 @@ fn inst_at(m: &Mono, i: u64) -> Inst {
     return vec_get(m.insts, i);
   }
   return Inst { def: 0, args: 0, n: 0 };
+}
+
+/// The checked type of `let` statement `node` in instance `env`, or 0.
+fn let_ty(m: &Mono, env: u64, node: u64) -> u64 {
+  let mut k = 0;
+  while k < vec_len(m.lets) {
+    let x = vec_get(m.lets, k);
+    if x.env == env && x.node == node {
+      return x.lty;
+    }
+    k = k + 1;
+  }
+  return 0;
 }
 
 fn targ_at(m: &Mono, k: u64) -> u64 {

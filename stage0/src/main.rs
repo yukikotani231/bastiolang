@@ -16,6 +16,8 @@
 //               monomorphization, in the `--dump-ast` format with positions
 //               as `file:line:col`, and exit; an error prints
 //               `error file:line:col CODE` and exits 1
+//   --dump-check  the same after type and linearity checking (so `let`
+//               types are filled in); an error prints `error file:line:col CODE`
 //   --trusted-base  list and count the hand-written trusted base, then exit
 //   --target    `hosted` (default): a normal program on the C library
 //               `kernel`: freestanding C for a bare-metal x86-64 kernel (implies --emit-c)
@@ -118,6 +120,7 @@ fn main() {
     let mut dump_tokens = false;
     let mut dump_ast = false;
     let mut dump_mono = false;
+    let mut dump_check = false;
     let mut target = codegen::Target::Hosted;
     let mut out: Option<String> = None;
     let mut inputs: Vec<String> = Vec::new();
@@ -130,6 +133,7 @@ fn main() {
             "--dump-tokens" => dump_tokens = true,
             "--dump-ast" => dump_ast = true,
             "--dump-mono" => dump_mono = true,
+            "--dump-check" => dump_check = true,
             "--trusted-base" => {
                 print!("{}", codegen::trusted_base());
                 return;
@@ -219,7 +223,7 @@ fn main() {
     for input in &inputs {
         if let Err(d) = ld.load(Path::new(input), None) {
             match d {
-                Some(d) if dump_mono => short(&d),
+                Some(d) if dump_mono || dump_check => short(&d),
                 Some(d) => eprint!("{}", d.render(&ld.files)),
                 None => {}
             }
@@ -238,7 +242,11 @@ fn main() {
     }
 
     let fail = |d: diag::Diag| -> ! {
-        eprint!("{}", d.render(&files));
+        if dump_check {
+            short(&d);
+        } else {
+            eprint!("{}", d.render(&files));
+        }
         exit(1);
     };
     mono::monomorphize(&mut prog).unwrap_or_else(|d| fail(d));
@@ -247,6 +255,11 @@ fn main() {
     ast::register_structs(prog.structs.clone());
     ast::register_enums(prog.enums.clone());
     check::check_program(&mut prog, target).unwrap_or_else(|d| fail(d));
+    if dump_check {
+        dump::WITH_FILE.store(true, std::sync::atomic::Ordering::Relaxed);
+        print!("{}", dump::program(&prog));
+        return;
+    }
     let (n, log) = verify::verify_program(&prog).unwrap_or_else(|d| fail(d));
     if dump_smt {
         for l in &log {
