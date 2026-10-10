@@ -33,7 +33,6 @@
 //   Mmio       base, len (the device registers base .. base+len it owns,
 //              always inside the device window)
 //   Dma        id (the page number of the page it lends to devices)
-//   Lease      id (the id of the table a processor loaded with it)
 //   PortIo     base, count (the ports base .. base+count it owns; always
 //              within the 65536 ports)
 // A struct value is the values of its fields; places like `p.root` read and
@@ -298,7 +297,6 @@ fn ghost_fields(t: &Type) -> &'static [(&'static str, bool, &'static str)] {
         Type::MmioSpace => &[("free", true, "")],
         Type::Mmio => &[("base", false, "mmio_base"), ("len", false, "mmio_len")],
         Type::Dma => &[("id", false, "dma_id")],
-        Type::Lease => &[("id", false, "")],
         _ => &[],
     }
 }
@@ -311,7 +309,7 @@ fn kept_by_builtins(t: &Type, field: &str) -> bool {
 
 /// Builtins whose `&mut` argument keeps the fields above.
 const SHAPE_KEEPING: &[&str] =
-    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pt_borrow", "pt_borrow_frame", "pool_take", "pool_give", "frame_write", "frame_write8", "cpu_set", "cpu_run", "cpu_idle", "cpu_fpu_save", "cpu_fpu_load",
+    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pt_borrow", "pt_borrow_frame", "pt_lease_count", "pool_take", "pool_give", "frame_write", "frame_write8", "cpu_set", "cpu_run", "cpu_idle", "cpu_fpu_save", "cpu_fpu_load",
       "pio_in8", "pio_in16", "pio_in32", "pio_out8", "pio_out16", "pio_out32",
       "mmio_read8", "mmio_read16", "mmio_read32", "mmio_read64", "mmio_write8", "mmio_write16", "mmio_write32", "mmio_write64",
       "dma_read8", "dma_read16", "dma_read32", "dma_read64", "dma_write8", "dma_write16", "dma_write32", "dma_write64"];
@@ -709,7 +707,7 @@ impl<'p> Verifier<'p> {
             (Type::PortIo, "count") => self.fresh_int(&h, "0", PORT_LIMIT),
             (Type::Mmio, "base") => self.fresh_int(&h, MMIO_LO, MMIO_HI),
             (Type::Mmio, "len") => self.fresh_int(&h, "0", MMIO_HI),
-            (Type::Frame, "id") | (Type::PageTable, "id") | (Type::Dma, "id") | (Type::Lease, "id") => {
+            (Type::Frame, "id") | (Type::PageTable, "id") | (Type::Dma, "id") => {
                 let n = self.fresh_int(&h, "0", FRAME_LIMIT)?;
                 self.smt(&format!("(assert (< {} {}))", n, POOLSIZE))?;
                 Ok(n)
@@ -2160,17 +2158,21 @@ impl<'p> Verifier<'p> {
                 self.put_back(&args[1], Val::Obj(Type::PageTable, vec![id.clone(), t.field("level"), t.field("used"), format!("(+ {} 1)", t.field("leases"))]), st);
                 Ok(Val::Obj(Type::Lease, vec![id]))
             }
-            // Always loads the kernel's tables. The count drops only when the
-            // lease is one for this table; otherwise it stays as it was,
-            // which overcounts and so is safe. The result says which.
+            // Loads the kernel's tables and gives the lease back. No table's
+            // count in the proof drops (none is named): they only ever
+            // overcount, which is safe. `pt_lease_count` reads the true one.
             "mmu_exit" => {
-                let t = &vals[1];
-                let r = self.fresh_bool("mmu_exit")?;
-                st.pc.push(format!("(= {} (= {} {}))", r.term(), vals[2].field("id"), t.field("id")));
-                let leases = format!("(ite {} (- {l} 1) {l})", r.term(), l = t.field("leases"));
                 self.put_back(&args[0], Val::Obj(Type::Mmu, vec![KROOT.into()]), st);
-                self.put_back(&args[1], Val::Obj(Type::PageTable, vec![t.field("id"), t.field("level"), t.field("used"), leases]), st);
-                Ok(r)
+                Ok(Val::Unit)
+            }
+            // The number of leases outstanding on the table, which only its
+            // holder (this `&mut`) could raise: from here on that is what the
+            // proof knows.
+            "pt_lease_count" => {
+                let t = &vals[0];
+                let n = self.fresh_u64("pt_lease_count")?;
+                self.put_back(&args[0], Val::Obj(Type::PageTable, vec![t.field("id"), t.field("level"), t.field("used"), n.term().to_string()]), st);
+                Ok(n)
             }
             // The page's contents are not tracked, so neither changes anything
             // the proof knows about.

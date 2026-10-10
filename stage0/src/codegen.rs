@@ -473,6 +473,10 @@ static inline void bst_pt_put_frame(bst_pt *t, uint64_t i, bst_frame f, bool w) 
 }
 /* What slot i points to, left in place (pt_borrow). */
 static inline uint64_t bst_pt_child(bst_pt t, uint64_t i) { return ((uint64_t *)t)[i] & BST_PTE_ADDR; }
+/* Leases outstanding on each top-level table (mmu_enter, mmu_exit), by page
+ * number: a pool has at most 65536 pages. */
+static uint32_t bst_pt_leases[65536];
+static inline uint64_t bst_pt_lease_count(bst_pt *t) { return __atomic_load_n(&bst_pt_leases[bst_frame_id(*t)], __ATOMIC_ACQUIRE); }
 static inline uint64_t bst_pt_take(bst_pt *t, uint64_t i) {
     uint64_t *e = &((uint64_t *)*t)[i];
     uint64_t a = *e & BST_PTE_ADDR;
@@ -849,8 +853,19 @@ const PRELUDE_KERNEL_CPU: &str = r#"
 static inline void bst_load_cr3(uint64_t a) { __asm__ volatile ("mov %0, %%cr3" : : "r"(a) : "memory"); }
 static inline void bst_mmu_switch(bst_mmu *m, bst_pt root) { (void)m; bst_load_cr3(root); }
 static inline void bst_mmu_kernel(bst_mmu *m) { (void)m; bst_load_cr3((uint64_t)bst_kernel_pml4); }
-static inline bst_lease bst_mmu_enter(bst_mmu *m, bst_pt *t) { (void)m; bst_load_cr3(*t); return *t; }
-static inline bool bst_mmu_exit(bst_mmu *m, bst_pt *t, bst_lease l) { (void)m; bst_load_cr3((uint64_t)bst_kernel_pml4); return l == *t; }
+static inline bst_lease bst_mmu_enter(bst_mmu *m, bst_pt *t) {
+    (void)m;
+    __atomic_fetch_add(&bst_pt_leases[bst_frame_id(*t)], 1, __ATOMIC_SEQ_CST);
+    bst_load_cr3(*t);
+    return *t;
+}
+/* The count drops only once this processor no longer uses the table (the
+ * CR3 load also empties its TLB of the table's entries). */
+static inline void bst_mmu_exit(bst_mmu *m, bst_lease l) {
+    (void)m;
+    bst_load_cr3((uint64_t)bst_kernel_pml4);
+    __atomic_fetch_sub(&bst_pt_leases[bst_frame_id(l)], 1, __ATOMIC_RELEASE);
+}
 static inline bst_frame bst_pt_free_root(bst_mmu m, bst_pt t) { (void)m; return t; }
 
 /* Saved user registers: rax rbx rcx rdx rsi rdi rbp r8-r15 (0-14), rip (15),
