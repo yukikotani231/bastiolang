@@ -1,0 +1,75 @@
+// expect-exit: 0
+// The base64 example (examples/base64) against the test vectors of RFC 4648,
+// section 10, and inputs it must reject. Returns the number of the first
+// failing check, or 0.
+import "../../examples/base64/base64.bastio";
+
+fn same(a: &Bytes, b: &Bytes) -> bool {
+  if blen(a) != blen(b) {
+    return false;
+  }
+  let mut i = 0;
+  while i < blen(a)
+    invariant i <= blen(a) && blen(a) == blen(b)
+  {
+    if bget(a, i) != bget(b, i) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+/// `raw` encodes to `enc`, and `enc` decodes back to `raw`.
+fn vector(raw: Str, enc: Str) -> bool {
+  let r = bfrom(raw);
+  let e = bfrom(enc);
+  let mut ok = false;
+  if blen(r) <= B64_MAX_RAW {
+    let got = b64_encode(r);
+    ok = same(got, e);
+    bfree(got);
+  }
+  match b64_decode(e) {
+    Decoded::Ok(d) => {
+      ok = ok && same(d, r);
+      bfree(d);
+    },
+    Decoded::Err(_) => { ok = false; },
+  }
+  bfree(r);
+  bfree(e);
+  return ok;
+}
+
+/// `enc` is rejected, and the error points at byte `at`.
+fn rejects(enc: Str, at: u64) -> bool {
+  let e = bfrom(enc);
+  let mut ok = false;
+  match b64_decode(e) {
+    Decoded::Ok(d) => { bfree(d); },
+    Decoded::Err(k) => { ok = k == at; },
+  }
+  bfree(e);
+  return ok;
+}
+
+fn main() -> u64 {
+  if !vector("", "") { return 1; }
+  if !vector("f", "Zg==") { return 2; }
+  if !vector("fo", "Zm8=") { return 3; }
+  if !vector("foo", "Zm9v") { return 4; }
+  if !vector("foob", "Zm9vYg==") { return 5; }
+  if !vector("fooba", "Zm9vYmE=") { return 6; }
+  if !vector("foobar", "Zm9vYmFy") { return 7; }
+  if !vector("any carnal pleas", "YW55IGNhcm5hbCBwbGVhcw==") { return 8; }
+  if !vector("<<???>>", "PDw/Pz8+Pg==") { return 9; }
+  if !rejects("Zg=", 3) { return 10; }          // length not a multiple of 4
+  if !rejects("Zm9v!A==", 4) { return 11; }     // not a symbol
+  if !rejects("Zh==", 1) { return 12; }         // non-canonical: dropped bits set
+  if !rejects("Zm9=", 2) { return 13; }         // same, one `=`
+  if !rejects("Zg==Zg==", 2) { return 14; }     // `=` before the last group
+  if !rejects("====", 0) { return 15; }
+  if !rejects("Z===", 1) { return 16; }
+  return 0;
+}
