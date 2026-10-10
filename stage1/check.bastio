@@ -17,6 +17,7 @@ const C_BRANCH: u64 = 4;
 const C_MATCH: u64 = 5;
 const C_TARGET: u64 = 6;
 const C_EXPORT: u64 = 7;
+const C_PIN: u64 = 8;
 
 const TARGET_HOSTED: u64 = 0;
 const TARGET_KERNEL: u64 = 1;
@@ -501,7 +502,7 @@ fn def_node(m: &Mono, p: &Parser, x: u64) -> Node {
 /// Is a value of type `t` linear (must it be consumed exactly once)?
 fn ck_linear(c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
   let k = kind_t(m, t);
-  if (k >= TY_BUF && k <= TY_DMA) || k == TY_BOX || k == TY_VEC {
+  if (k >= TY_BUF && k <= TY_DMA) || k == TY_BOX || k == TY_VEC || k == TY_LOCK {
     return true;
   }
   if k == TY_STRUCT || k == TY_ENUM {
@@ -512,6 +513,32 @@ fn ck_linear(c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
     while j < n {
       let ft = fld_ty(c, x, j);
       if ft != 0 && ck_linear(c, m, p, ft) {
+        return true;
+      }
+      j = j + 1;
+    }
+  }
+  return false;
+}
+
+/// Is a value of type `t` pinned: does it hold a `Cpu` or `Mmu`, which
+/// describe the processor that holds them and may never reach another one?
+fn is_pinned(c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
+  let k = kind_t(m, t);
+  if k == TY_MMU || k == TY_CPU {
+    return true;
+  }
+  if k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_REF || k == TY_MUTREF {
+    return is_pinned(c, m, p, inner_t(m, t));
+  }
+  if k == TY_STRUCT || k == TY_ENUM {
+    let x = inner_t(m, t);
+    let dn = def_node(m, p, x);
+    let n = list_len(p, dn.a);
+    let mut j = 0;
+    while j < n {
+      let ft = fld_ty(c, x, j);
+      if ft != 0 && is_pinned(c, m, p, ft) {
         return true;
       }
       j = j + 1;
@@ -597,8 +624,14 @@ fn is_wrap_builtin(p: &Parser, s: u64, e: u64) -> bool {
   return span_is(p, s, e, "wrap_add") || span_is(p, s, e, "wrap_sub") || span_is(p, s, e, "wrap_mul");
 }
 
+/// The builtins over `Lock[T]`: generic, so checked by hand like `box`.
+fn is_lock_builtin(p: &Parser, s: u64, e: u64) -> bool {
+  return span_is(p, s, e, "lock_new") || span_is(p, s, e, "lock_end") || span_is(p, s, e, "locked");
+}
+
 fn is_builtin_name(c: &Checker, p: &Parser, s: u64, e: u64) -> bool {
   return span_is(p, s, e, "box") || span_is(p, s, e, "unbox") || span_is(p, s, e, "cast") || span_is(p, s, e, "wrap")
+    || span_is(p, s, e, "smp_run") || is_lock_builtin(p, s, e)
     || is_vec_builtin(p, s, e) || is_wrap_builtin(p, s, e) || bs_index(c, p, s, e) != 0;
 }
 
@@ -1010,7 +1043,7 @@ fn known_type(c: &mut Checker, m: &Mono, p: &Parser, t: u64, loc: u64) {
   let k = kind_t(m, t);
   if k == TY_UNKNOWN {
     cfail(&mut c, p, loc, C_TYPE);
-  } else if k == TY_BOX || k == TY_VEC || k == TY_REF || k == TY_MUTREF {
+  } else if k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_REF || k == TY_MUTREF {
     known_type(&mut c, m, p, inner_t(m, t), loc);
   }
 }
@@ -1025,7 +1058,8 @@ fn is_reserved_type(p: &Parser, s: u64, e: u64) -> bool {
     || span_is(p, s, e, "Child") || span_is(p, s, e, "Serial") || span_is(p, s, e, "Frame")
     || span_is(p, s, e, "PageTable") || span_is(p, s, e, "Pool") || span_is(p, s, e, "Mmu")
     || span_is(p, s, e, "Cpu") || span_is(p, s, e, "Ports") || span_is(p, s, e, "PortIo")
-    || span_is(p, s, e, "MmioSpace") || span_is(p, s, e, "Mmio") || span_is(p, s, e, "Dma");
+    || span_is(p, s, e, "MmioSpace") || span_is(p, s, e, "Mmio") || span_is(p, s, e, "Dma")
+    || span_is(p, s, e, "Lock");
 }
 
 /// Struct and enum instances: no reserved names, known field and payload
@@ -1045,7 +1079,7 @@ fn check_structs(c: &mut Checker, m: &Mono, p: &Parser) {
     let mut j = 0;
     while j < n {
       let mut u = fld_ty(c, x, j);
-      while kind_t(m, u) == TY_BOX || kind_t(m, u) == TY_VEC {
+      while kind_t(m, u) == TY_BOX || kind_t(m, u) == TY_VEC || kind_t(m, u) == TY_LOCK {
         u = inner_t(m, u);
       }
       if u != 0 && kind_t(m, u) == TY_UNKNOWN {
@@ -1370,6 +1404,11 @@ fn check_program(c: &mut Checker, m: &mut Mono, p: &Parser) {
   }
   c.spec_lim = 0;
   let mut j = 0;
+  while j < vec_len(m.structs) && !c.failed {
+    check_struct_invariants(&mut c, &mut m, p, u_at(m.structs, j));
+    j = j + 1;
+  }
+  j = 0;
   while j < vec_len(m.fns) && !c.failed {
     check_fn(&mut c, &mut m, p, u_at(m.fns, j));
     j = j + 1;
@@ -1405,6 +1444,33 @@ fn check_spec_fn(c: &mut Checker, m: &mut Mono, p: &Parser, k: u64) {
   let t = ck_spec(&mut c, &mut m, p, sn.c, false);
   if !c.failed {
     expect_ty(&mut c, p, t, r, sn.c);
+  }
+}
+
+/// A struct's `invariant` clauses are specifications over its fields
+/// (struct instance `x`).
+fn check_struct_invariants(c: &mut Checker, m: &mut Mono, p: &Parser, x: u64) {
+  let xi = inst_at(m, x);
+  let d = node_at(p.nodes, xi.def);
+  if d.b == 0 {
+    return;
+  }
+  reset(&mut c, c.tunit, x);
+  let mut f = d.a;
+  let mut j = 0;
+  while f != 0 && !c.failed && j < SRC_MAX {
+    let fd = node_at(p.nodes, f);
+    declare(&mut c, p, fd.s, fd.e, fld_ty(c, x, j), false, xi.def);
+    f = fd.next;
+    j = j + 1;
+  }
+  let mut e = d.b;
+  while e != 0 && !c.failed {
+    let t = ck_spec(&mut c, &mut m, p, e, false);
+    if !c.failed {
+      expect_ty(&mut c, p, t, c.tbool, e);    // a struct invariant is a bool
+    }
+    e = next_of(p, e);
   }
 }
 
@@ -2299,6 +2365,36 @@ fn ck_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
     cfail(&mut c, p, i, C_TYPE);              // `main` cannot be called
     return 0;
   }
+  if span_is(p, s, e, "lock_new") || span_is(p, s, e, "lock_end") {
+    if list_len(p, n.a) != 1 {
+      cfail(&mut c, p, i, C_TYPE);
+      return 0;
+    }
+    let t = ck_expr(&mut c, &mut m, p, n.a);
+    if c.failed {
+      return 0;
+    }
+    if span_is(p, s, e, "lock_new") {
+      if is_pinned(c, m, p, t) {
+        // `Cpu` and `Mmu` describe the processor that holds them, and a
+        // lock can be taken on any processor.
+        cfail(&mut c, p, n.a, C_PIN);
+        return 0;
+      }
+      return intern(&mut m, p, TY_LOCK, t);
+    }
+    if kind_t(m, t) != TY_LOCK {
+      cfail(&mut c, p, n.a, C_TYPE);          // `lock_end` needs a lock
+      return 0;
+    }
+    return inner_t(m, t);
+  }
+  if span_is(p, s, e, "locked") {
+    return locked_call(&mut c, &mut m, p, i);
+  }
+  if span_is(p, s, e, "smp_run") {
+    return smp_run_call(&mut c, &mut m, p, i);
+  }
   let d = plain_fn(p, s, e);
   if d == 0 {
     cfail(&mut c, p, i, C_TYPE);              // unknown function
@@ -2306,6 +2402,140 @@ fn ck_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
   }
   let x = plain_inst(&mut m, d);
   return user_call(&mut c, &mut m, p, i, x);
+}
+
+/// The function that argument `a` of a `locked` or `smp_run` call (node
+/// `i`) names: its plain instance, or 0 after an error.
+fn named_fn(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, a: u64) -> u64 {
+  if a != 0 {
+    let an = node_at(p.nodes, a);
+    if an.kind == E_VAR && !span_is(p, an.s, an.e, "main") && !is_builtin_name(c, p, an.s, an.e)
+      && sigs_has(c, p, an.s, an.e) && find_var(c, p, an.s, an.e) == 0 {
+      return plain_inst(&mut m, plain_fn(p, an.s, an.e));
+    }
+    cfail(&mut c, p, a, C_TYPE);              // needs the name of a function
+    return 0;
+  }
+  cfail(&mut c, p, i, C_TYPE);
+  return 0;
+}
+
+/// `locked(&l, f, args..)`: takes the lock, calls `f(&mut contents,
+/// args..)` and releases it. The contents are reachable only during the
+/// call, so no other processor can see them half updated.
+fn locked_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
+  let n = node_at(p.nodes, i);
+  let a0 = n.a;
+  let mut pk = 0;
+  if a0 != 0 {
+    pk = place_of(&mut c, p, a0);
+  }
+  if pk == 0 {
+    if a0 != 0 {
+      cfail(&mut c, p, a0, C_TYPE);           // must name a lock
+    } else {
+      cfail(&mut c, p, i, C_TYPE);
+    }
+    return 0;
+  }
+  let lt = path_type(&mut c, m, p, pk, a0);
+  if c.failed {
+    return 0;
+  }
+  if kind_t(m, lt) != TY_LOCK {
+    cfail(&mut c, p, a0, C_TYPE);             // needs a Lock
+    return 0;
+  }
+  let a1 = next_of(p, a0);
+  let x = named_fn(&mut c, &mut m, p, i, a1);
+  if c.failed {
+    return 0;
+  }
+  let xi = inst_at(m, x);
+  let fps = fn_params(&mut m, p, xi.def, x);
+  let dn = node_at(p.nodes, xi.def);
+  let r = conv(&mut m, p, dn.b, x, xi.def);
+  let inner = inner_t(m, lt);
+  if vec_len(fps) == 0 || u_at(fps, 0) != mut_to(&mut m, p, inner) {
+    vec_free(fps);
+    cfail(&mut c, p, a1, C_TYPE);             // must take `&mut` of the contents first
+    return 0;
+  }
+  // `f`'s signature with the lock, borrowed, in place of its contents.
+  let mut ps = vec_new[u64]();
+  vec_push(&mut ps, ref_to(&mut m, p, lt));
+  let mut j = 1;
+  while j < vec_len(fps) {
+    vec_push(&mut ps, vec_get(fps, j));
+    j = j + 1;
+  }
+  vec_free(fps);
+  let mut args = vec_new[u64]();
+  vec_push(&mut args, a0);
+  let mut a = next_of(p, a1);
+  while a != 0 {
+    vec_push(&mut args, a);
+    a = next_of(p, a);
+  }
+  let t = call_with_v(&mut c, &mut m, p, ps, r, args, i, false);
+  vec_free(ps);
+  vec_free(args);
+  return t;
+}
+
+/// `smp_run(f, args..)`: runs `f` on every processor at once and returns
+/// when all of them have returned. Each processor's call gets its own
+/// `Cpu` and `Mmu`; every other argument is a shared borrow.
+fn smp_run_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
+  if c.target != TARGET_KERNEL {
+    cfail(&mut c, p, i, C_TARGET);
+    return 0;
+  }
+  let n = node_at(p.nodes, i);
+  let a0 = n.a;
+  let x = named_fn(&mut c, &mut m, p, i, a0);
+  if c.failed {
+    return 0;
+  }
+  let xi = inst_at(m, x);
+  let ps = fn_params(&mut m, p, xi.def, x);
+  let dn = node_at(p.nodes, xi.def);
+  let r = conv(&mut m, p, dn.b, x, xi.def);
+  if r != c.tunit {
+    vec_free(ps);
+    cfail(&mut c, p, a0, C_TYPE);             // must return nothing
+    return 0;
+  }
+  let mut j = 0;
+  while j < vec_len(ps) {
+    let t = vec_get(ps, j);
+    let k = kind_t(m, t);
+    let ik = kind_t(m, inner_t(m, t));
+    let mut ok = false;
+    if k == TY_MUTREF {
+      ok = ik == TY_CPU || ik == TY_MMU;
+    } else if k == TY_REF {
+      ok = !is_pinned(c, m, p, inner_t(m, t));
+    }
+    if !ok {
+      // Each parameter must be `&mut Cpu`, `&mut Mmu` (every processor
+      // gets its own) or a shared borrow of a value with no `Cpu` or `Mmu`.
+      vec_free(ps);
+      cfail(&mut c, p, a0, C_PIN);
+      return 0;
+    }
+    j = j + 1;
+  }
+  let mut args = vec_new[u64]();
+  let mut a = next_of(p, a0);
+  while a != 0 {
+    vec_push(&mut args, a);
+    a = next_of(p, a);
+  }
+  let t = call_with_v(&mut c, &mut m, p, ps, r, args, i, false);
+  vec_free(ps);
+  vec_free(args);
+  return t;
 }
 
 /// A call of a `Vec` builtin: its signature is for the element type of
@@ -2388,13 +2618,26 @@ fn vec_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
 /// read a value that a later argument consumes (`set(b, i, get(b, j))`).
 /// `builtin` says whether a builtin is called.
 fn call_with(c: &mut Checker, m: &mut Mono, p: &Parser, ps: &Vec[u64], r: u64, args: u64, loc: u64, builtin: bool) -> u64 {
-  if list_len(p, args) != vec_len(ps) {
+  let mut v = vec_new[u64]();
+  let mut a = args;
+  while a != 0 {
+    vec_push(&mut v, a);
+    a = next_of(p, a);
+  }
+  let t = call_with_v(&mut c, &mut m, p, ps, r, v, loc, builtin);
+  vec_free(v);
+  return t;
+}
+
+/// `call_with` over the argument nodes `args`, in order.
+fn call_with_v(c: &mut Checker, m: &mut Mono, p: &Parser, ps: &Vec[u64], r: u64, args: &Vec[u64], loc: u64, builtin: bool) -> u64 {
+  if vec_len(args) != vec_len(ps) {
     cfail(&mut c, p, loc, C_TYPE);            // the wrong number of arguments
     return 0;
   }
-  let mut a = args;
   let mut j = 0;
-  while a != 0 && !c.failed && j < SRC_MAX {
+  while j < vec_len(args) && !c.failed {
+    let a = vec_get(args, j);
     let pt = u_at(ps, j);
     if !ck_linear(c, m, p, pt) && !ck_ref(m, pt) {
       let t = ck_expr_as(&mut c, &mut m, p, a, pt);
@@ -2405,7 +2648,6 @@ fn call_with(c: &mut Checker, m: &mut Mono, p: &Parser, ps: &Vec[u64], r: u64, a
         expect_ty(&mut c, p, t, pt, a);
       }
     }
-    a = next_of(p, a);
     j = j + 1;
   }
   if c.failed {
@@ -2415,19 +2657,18 @@ fn call_with(c: &mut Checker, m: &mut Mono, p: &Parser, ps: &Vec[u64], r: u64, a
   // the same call (a place overlaps its fields).
   let mut bp = vec_new[u64]();
   let mut bm = vec_new[u64]();
-  a = args;
   j = 0;
-  while a != 0 && !c.failed && j < SRC_MAX {
+  while j < vec_len(args) && !c.failed {
+    let a = vec_get(args, j);
     let pt = u_at(ps, j);
     if ck_ref(m, pt) {
       borrow_arg(&mut c, m, p, pt, a, &mut bp, &mut bm);
     }
-    a = next_of(p, a);
     j = j + 1;
   }
-  a = args;
   j = 0;
-  while a != 0 && !c.failed && j < SRC_MAX {
+  while j < vec_len(args) && !c.failed {
+    let a = vec_get(args, j);
     let pt = u_at(ps, j);
     if ck_linear(c, m, p, pt) {
       let pk = place_of(&mut c, p, a);
@@ -2440,7 +2681,6 @@ fn call_with(c: &mut Checker, m: &mut Mono, p: &Parser, ps: &Vec[u64], r: u64, a
         }
       }
     }
-    a = next_of(p, a);
     j = j + 1;
   }
   vec_free(bp);

@@ -457,6 +457,37 @@ fn main() -> u64 {
 - Specifications can read fields, including through `old(..)` and `result`: `ensures result.n == old(s).n + 1`. The prover tracks every field, so bounds, overflow and capability state work through fields exactly as through variables.
 - In generated code a struct is a C struct passed by value; nothing at run time records which fields have been moved.
 
+### Locks and struct invariants
+
+A `Lock[T]` holds a value that code on several processors can update through a shared borrow `&Lock[T]`. The contents are reachable only inside `locked`, which takes the lock, calls a function on them and releases it.
+
+```bastio
+// expect-exit: 3
+struct Count { n: u64 } invariant n < 1000;
+
+fn bump(c: &mut Count) requires c.n < 1000 ensures c.n < 1000 {
+  if c.n < 999 { c.n = c.n + 1; }
+}
+
+fn main() -> u64 {
+  let l = lock_new(Count { n: 0 });            // proves the invariant
+  locked(l, bump);                             // bump(&mut contents) under the lock
+  locked(l, bump);
+  locked(l, bump);
+  let c = lock_end(l);                         // frees the lock, returns the Count
+  return c.n;
+}
+```
+
+- A struct may end with `invariant e` clauses (then `;`): specifications over its fields.
+- `lock_new(v)` proves the invariants of `v` (`E-VERIFY-LOCKINV`) and moves it into a new lock. `lock_end(l)` consumes the lock and returns the value; the invariants are known of it.
+- `locked(l, f, args..)` calls `f(&mut contents, args..)` with the lock held. `f` must take `&mut T` first; its result is `locked`'s result. The contents are a fresh value of which only the invariants are known, since another processor may have changed them, so `f`'s `requires` must follow from the invariants. After the call the invariants are proved again (`E-VERIFY-LOCKINV`).
+- The invariants of a struct held directly as a field are included; ones behind a box, in a vector or in an enum payload are not yet. Outside a lock, invariants are not enforced: they are what the lock promises about its contents.
+- A lock cannot hold a value with a `Cpu` or `Mmu` in it (`E-PIN`): they describe the processor that holds them.
+- Lending `&mut` a place that overlaps the lock in the same call is `E-LINEAR-USE`, so the contents have no second way in.
+- Deadlock is not ruled out: taking a lock again inside `f` (directly or through another call) spins forever.
+- Generated code: a lock is a pointer to a lock word followed by the contents; `locked` spins with an atomic exchange (acquire) and releases with a store (release). Invariants generate nothing.
+
 ## Enums and `match`
 
 ```bastio
@@ -887,7 +918,10 @@ fn main(pool: &mut Pool) -> u64 {
 | `cpu_fpu_load(c: &mut Cpu, f: &Frame)` | | Loads them from the page (`fxrstor64`); reserved MXCSR bits are cleared first, so any contents are safe to load. A kernel that runs several user contexts keeps one page per context and swaps them around `cpu_run` |
 | `cpu_run(c: &mut Cpu, m: &Mmu) -> u64` | | Runs the saved context in user mode until the next trap; returns its vector (`<= 255`) |
 | `cpu_idle(c: &mut Cpu) -> u64` | | Waits for an interrupt; returns its vector |
-| `cpu_count(c: &Cpu) -> u64` | | Processors the platform has started, this one included: between 1 and 4096. The others run no Bastio code yet; see [concurrency.md](concurrency.md) |
+| `cpu_count(c: &Cpu) -> u64` | | Processors the platform has started, this one included: between 1 and 4096 |
+| `smp_run(f, args..)` | `f`'s `requires`, also for the other processors (below) | Runs `f(args..)` on every processor at once and returns when all have returned |
+
+`smp_run(f, args..)` is how kernel code runs on the other processors. `f` returns nothing, and each parameter is `&mut Cpu` or `&mut Mmu` (this processor passes its own; every other processor gets its own, with the kernel's tables in CR3) or a shared borrow `&T` of a value with no `Cpu` or `Mmu` in it (`E-PIN` otherwise). So the processors share only what cannot change, plus locks. `f`'s precondition is proved for this processor's arguments and again with `mmu_root` equal to the kernel's for the others. See [concurrency.md](concurrency.md).
 
 ```bastio
 // expect-ok
@@ -1080,6 +1114,7 @@ Syntax, types and linearity:
 | `E-LINEAR-USE` | A consumed value (or a moved-out field, or a struct with a field moved out) is used; one call both borrows and moves a value, or lends it twice with one loan `&mut`; a borrow is returned; a value is consumed where the code may run more than once or not at all (a `while` condition, the right side of `&&` / `\|\|`) |
 | `E-LINEAR-LEAK` | A linear value is still owned at the end of its scope or at a `return`, is overwritten, or is dropped by `_` |
 | `E-LINEAR-BRANCH` | Only one arm of an `if` or a `match` consumes a value; a loop body changes the ownership of an outer value |
+| `E-PIN` | A `Cpu` or `Mmu` (or a value holding one) is put in a lock or shared between processors by `smp_run` |
 
 Proofs:
 
@@ -1099,6 +1134,7 @@ Proofs:
 | `E-VERIFY-REQUIRES` | The callee's `requires` |
 | `E-VERIFY-ENSURES` | The function's own postcondition |
 | `E-VERIFY-INVARIANT` | A loop invariant holds on entry and is preserved by one iteration |
+| `E-VERIFY-LOCKINV` | A struct invariant holds of a value put in a lock, and again at the end of every `locked` call |
 | `E-VERIFY-ASSERT` | An `assert` |
 | `E-VERIFY-UNREACHABLE` | An `unreachable;` the code can reach |
 
@@ -1178,4 +1214,4 @@ What a program that `bastioc0` accepts is guaranteed: no out-of-bounds access, n
 
 ## Not in the language yet
 
-Planned, in [ROADMAP.md](../ROADMAP.md): concurrency (designed in [concurrency.md](concurrency.md)), signed integer types, more hardware capabilities (`IrqOff`), allocation failure in the type, and a native x86-64 backend. Inference of type arguments, modules with qualified names, and hand-written lemmas for proofs Z3 cannot find are open questions.
+Planned, in [ROADMAP.md](../ROADMAP.md): the rest of concurrency (threads, atomics, interrupt-safe locks; designed in [concurrency.md](concurrency.md)), signed integer types, more hardware capabilities (`IrqOff`), allocation failure in the type, and a native x86-64 backend. Inference of type arguments, modules with qualified names, and hand-written lemmas for proofs Z3 cannot find are open questions.

@@ -247,6 +247,25 @@ fn opaque_boxes(v: &Val, ty: &Type) -> Val {
     }
 }
 
+/// The type of a value, for `lock_new`. A `Bytes` reads as `Buf`: the
+/// lock then forgets that every byte is <= 255, which loses facts but never
+/// assumes a false one.
+fn val_type(v: &Val) -> Type {
+    match v {
+        Val::U(_) => Type::U64,
+        Val::B(_) => Type::Bool,
+        Val::Buf { .. } => Type::Buf,
+        Val::Str { .. } => Type::Str,
+        Val::Obj(t, _) => t.clone(),
+        Val::Struct(n, _) => Type::Struct(n.clone()),
+        Val::Enum(n, _, _) => Type::Enum(n.clone()),
+        Val::Box(BoxVal::Known(i)) => Type::Box(Box::new(val_type(i))),
+        Val::Box(BoxVal::Opaque(t)) => Type::Box(Box::new(t.clone())),
+        Val::Vec { elem, .. } => Type::Vec(Box::new(elem.clone())),
+        Val::Unit => Type::Unit,
+    }
+}
+
 impl Val {
     fn term(&self) -> &str {
         match self {
@@ -1197,6 +1216,12 @@ impl<'p> Verifier<'p> {
     }
 
     fn call(&mut self, name: &str, args: &[Expr], pos: Pos, st: &mut State) -> Result<Val, Diag> {
+        if name == "locked" {
+            return self.locked(args, pos, st);
+        }
+        if name == "smp_run" {
+            return self.smp_run(args, pos, st);
+        }
         for a in args {
             if let Some(p) = match &a.kind {
                 ExprKind::MutBorrow(n) => Some(n.clone()),
@@ -1269,6 +1294,84 @@ impl<'p> Verifier<'p> {
         Ok(res)
     }
 
+    /// The facts a value's struct invariants state, with how to name each
+    /// one in a message. Structs held directly as fields count too; ones
+    /// behind a box, in a vector or in an enum payload do not (yet).
+    fn invariant_terms(&mut self, v: &Val, out: &mut Vec<(String, String)>) -> Result<(), Diag> {
+        if let Val::Struct(n, fs) = v {
+            let d = struct_def(n).unwrap();
+            let env: HashMap<String, Val> = d.fields.iter().map(|(f, _)| f.clone()).zip(fs.iter().cloned()).collect();
+            for i in &d.invariants {
+                let t = self.spec(i, Scope { env: &env, old: None, result: None }, &mut Vec::new())?;
+                out.push((format!("`{}` of {}", render(i), n), t));
+            }
+            for f in fs {
+                self.invariant_terms(f, out)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn invariants_of(&mut self, v: &Val) -> Result<Vec<(String, String)>, Diag> {
+        let mut out = Vec::new();
+        self.invariant_terms(v, &mut out)?;
+        Ok(out)
+    }
+
+    /// `locked(l, f, args..)`: the contents are a fresh value about which
+    /// only the invariants are known (another processor may have changed
+    /// them since this one last looked). `f` gets them as its `&mut` first
+    /// argument and must hand them back with the invariants holding again.
+    fn locked(&mut self, args: &[Expr], pos: Pos, st: &mut State) -> Result<Val, Diag> {
+        let lp = place(&args[0]).expect("checked: a place");
+        self.open_path(&mut st.env, &lp)?;
+        let Val::Obj(Type::Lock(t), _) = get_path(&st.env, &lp) else { unreachable!("checked: a lock") };
+        let ExprKind::Var(f) = &args[1].kind else { unreachable!("checked: a function name") };
+        let inner = self.fresh_of(&t, &format!("{}_contents", sanitize(&lp)))?;
+        for (_, i) in self.invariants_of(&inner)? {
+            st.pc.push(i);
+        }
+        // The contents live in a variable no program can name, for the call.
+        self.counter += 1;
+        let key = format!("locked*{}", self.counter);
+        st.env.insert(key.clone(), inner);
+        let mut cargs = vec![Expr { kind: ExprKind::MutBorrow(key.clone()), pos: args[0].pos }];
+        cargs.extend(args[2..].iter().cloned());
+        let res = self.call(f, &cargs, pos, st)?;
+        let after = st.env.remove(&key).expect("still there");
+        for (what, i) in self.invariants_of(&after)? {
+            self.prove(st, &i, pos, "E-VERIFY-LOCKINV", format!("that `{}` keeps the invariant {} before the lock `{}` is released", f, what, lp))?;
+        }
+        Ok(res)
+    }
+
+    /// `smp_run(f, args..)`: this processor's call is an ordinary call. The
+    /// other processors' calls get the same shared arguments and their own
+    /// `Cpu` and `Mmu`, with the kernel's tables in CR3, so `f`'s
+    /// precondition must hold for those too. They change nothing this
+    /// processor can see: everything shared is behind `&` (locks hold their
+    /// contents outside the proof's view).
+    fn smp_run(&mut self, args: &[Expr], pos: Pos, st: &mut State) -> Result<Val, Diag> {
+        let ExprKind::Var(name) = &args[0].kind else { unreachable!("checked: a function name") };
+        let f = self.prog.fns.iter().find(|f| &f.name == name).expect("checked");
+        if !f.requires.is_empty() {
+            let mut pre = HashMap::new();
+            for (p, a) in f.params.iter().zip(&args[1..]) {
+                let v = match p.ty.base() {
+                    Type::Cpu => Val::Obj(Type::Cpu, vec![]),
+                    Type::Mmu => Val::Obj(Type::Mmu, vec![KROOT.into()]),
+                    _ => self.eval(a, st)?,
+                };
+                pre.insert(p.name.clone(), v);
+            }
+            for r in &f.requires {
+                let t = self.spec(r, Scope { env: &pre, old: None, result: None }, &mut Vec::new())?;
+                self.prove(st, &t, pos, "E-VERIFY-REQUIRES", format!("the precondition `{}` of `{}` on the other processors, which start with the kernel's own tables", render(r), name))?;
+            }
+        }
+        self.call(name, &args[1..], pos, st)
+    }
+
     /// Writes the new value of a `&mut` argument back to its variable.
     fn put_back(&mut self, arg: &Expr, v: Val, st: &mut State) {
         let ExprKind::MutBorrow(n) = &arg.kind else { unreachable!("checked: a &mut argument") };
@@ -1291,6 +1394,20 @@ impl<'p> Verifier<'p> {
                 let ity = self.int_ops.get(&pos).cloned().expect("typed by the checker");
                 let op = match name { "wrap_add" => "+", "wrap_sub" => "-", _ => "*" };
                 Ok(Val::U(wrap_term(&ity, &format!("({} {} {})", op, vals[0].term(), vals[1].term()))))
+            }
+            "lock_new" => {
+                for (what, i) in self.invariants_of(&vals[0])? {
+                    self.need(st, i, pos, "E-VERIFY-LOCKINV", format!("that the value put in the lock satisfies the invariant {}", what))?;
+                }
+                Ok(Val::Obj(Type::Lock(Box::new(val_type(&vals[0]))), vec![]))
+            }
+            "lock_end" => {
+                let Val::Obj(Type::Lock(t), _) = &vals[0] else { unreachable!("checked: a lock") };
+                let v = self.fresh_of(t, "unlocked")?;
+                for (_, i) in self.invariants_of(&v)? {
+                    st.pc.push(i);
+                }
+                Ok(v)
             }
             "unbox" => match &vals[0] {
                 Val::Box(BoxVal::Known(v)) => Ok((**v).clone()),
@@ -1923,7 +2040,15 @@ fn note(out: &mut HashMap<String, bool>, path: String, keep: bool) {
 fn changed_in_expr(e: &Expr, out: &mut HashMap<String, bool>, sums: &Summaries) {
     match &e.kind {
         ExprKind::Call(f, args) => {
-            for (i, a) in args.iter().enumerate() {
+            // `locked(l, f, ..)` and `smp_run(f, ..)` lend their trailing
+            // arguments to `f`: shift them onto its parameters.
+            let (f, skip, shift) = match (f.as_str(), args.get(1), args.first()) {
+                ("locked", Some(Expr { kind: ExprKind::Var(g), .. }), _) => (g, 2, 1),
+                ("smp_run", _, Some(Expr { kind: ExprKind::Var(g), .. })) => (g, 1, 1),
+                _ => (f, 0, 0),
+            };
+            for (i, a) in args.iter().enumerate().skip(skip) {
+                let i = i - shift;
                 if let ExprKind::MutBorrow(n) = &a.kind {
                     if is_builtin(f) {
                         note(out, n.clone(), SHAPE_KEEPING.contains(&f.as_str()));

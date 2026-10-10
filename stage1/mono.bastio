@@ -43,6 +43,7 @@ const TY_I8: u64 = 30;
 const TY_I16: u64 = 31;
 const TY_I32: u64 = 32;
 const TY_I64: u64 = 33;
+const TY_LOCK: u64 = 34;       // a: the locked type
 
 /// More instances than this means a definition instantiates itself with
 /// ever larger arguments.
@@ -383,13 +384,16 @@ fn conv(m: &mut Mono, p: &Parser, t: u64, env: u64, loc: u64) -> u64 {
     return intern(&mut m, p, def_ty_kind(p, d), x);
   }
   if n.kind == T_GENERIC {
-    if name_is(p, t, "Box") || name_is(p, t, "Vec") {
+    if name_is(p, t, "Box") || name_is(p, t, "Vec") || name_is(p, t, "Lock") {
       let inner = conv(&mut m, p, n.a, env, loc);
       if m.failed {
         return 0;
       }
       if name_is(p, t, "Box") {
         return intern(&mut m, p, TY_BOX, inner);
+      }
+      if name_is(p, t, "Lock") {
+        return intern(&mut m, p, TY_LOCK, inner);
       }
       return intern(&mut m, p, TY_VEC, inner);
     }
@@ -573,6 +577,9 @@ fn mono_fields(m: &mut Mono, p: &Parser, d: u64, env: u64) {
       conv(&mut m, p, fd.a, env, d);
     }
     f = fd.next;
+  }
+  if dn.kind == D_STRUCT {
+    mono_exprs(&mut m, p, dn.b, env);     // the struct's invariants
   }
 }
 

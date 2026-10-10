@@ -44,6 +44,9 @@ struct Gen<'a> {
     vecs: &'a mut Vec<Type>,
     /// The integer type of each arithmetic operator (`FnDef::int_ops`).
     int_ops: &'a HashMap<crate::diag::Pos, Type>,
+    /// One argument block and thunk per `smp_run` call, emitted before the
+    /// function bodies.
+    smps: &'a mut Vec<String>,
 }
 
 pub fn emit(p: &Program, target: Target) -> String {
@@ -51,6 +54,7 @@ pub fn emit(p: &Program, target: Target) -> String {
     let mut blobs = Vec::new();
     let mut boxed = Vec::new();
     let mut vecs = Vec::new();
+    let mut smps = Vec::new();
     let mut bodies = String::new();
     for f in &p.fns {
         let mut g = Gen {
@@ -62,6 +66,7 @@ pub fn emit(p: &Program, target: Target) -> String {
             boxed: &mut boxed,
             vecs: &mut vecs,
             int_ops: &f.int_ops,
+            smps: &mut smps,
         };
         bodies.push_str(&format!("{} {{\n", proto(f)));
         for s in &f.body {
@@ -100,6 +105,9 @@ pub fn emit(p: &Program, target: Target) -> String {
     }
     for f in &p.fns {
         out.push_str(&format!("{};\n", proto(f)));
+    }
+    for s in &smps {
+        out.push_str(s);
     }
     out.push('\n');
     out.push_str(&bodies);
@@ -292,6 +300,17 @@ typedef struct { uint64_t base, count; } bst_portio;
 typedef int bst_mmiospace;                  /* capability token: no data */
 typedef struct { uint64_t base, len; } bst_mmio;
 typedef uint64_t bst_dma;                   /* a lent page's physical address */
+/* Lock[T]: a lock word followed by the T. A spin lock; acquire and release
+ * order the accesses to the contents between processors. */
+static inline void bst_lock_acquire(uint64_t *w) {
+    while (__atomic_exchange_n(w, 1, __ATOMIC_ACQUIRE))
+        while (__atomic_load_n(w, __ATOMIC_RELAXED)) {
+#if defined(__x86_64__) || defined(__i386__)
+            __asm__ volatile ("pause");
+#endif
+        }
+}
+static inline void bst_lock_release(uint64_t *w) { __atomic_store_n(w, 0, __ATOMIC_RELEASE); }
 static inline bst_buf bst_set(bst_buf b, uint64_t i, uint64_t v) { b.data[i] = v; return b; }
 "#;
 
@@ -493,23 +512,27 @@ static uint64_t bst_arena[BST_ARENA_WORDS];
 static uint64_t bst_arena_top = 0;
 typedef struct bst_free { uint64_t words; struct bst_free *next; } bst_free_t;
 static bst_free_t *bst_free_list = 0;
+static uint64_t bst_arena_lock;              /* every processor allocates from the one arena */
 static bst_buf bst_alloc(uint64_t n) {
     uint64_t words = (n ? n : 1) + 1;            /* one header word for the size */
     if (words < 2) words = 2;
+    uint64_t *blk = 0;
+    bst_lock_acquire(&bst_arena_lock);
     bst_free_t **pp = &bst_free_list;
     for (bst_free_t *f = bst_free_list; f; pp = &f->next, f = f->next) {
         if (f->words == words) {
             *pp = f->next;
-            uint64_t *blk = (uint64_t *)f;
-            for (uint64_t i = 1; i < words; i++) blk[i] = 0;
-            bst_buf b = { n, blk + 1 };
-            return b;
+            blk = (uint64_t *)f;
+            break;
         }
     }
-    if (bst_arena_top + words > BST_ARENA_WORDS) { bst_puts("bastio: out of memory\n"); bst_halt(); }
-    uint64_t *blk = &bst_arena[bst_arena_top];
-    bst_arena_top += words;
-    blk[0] = words;
+    if (!blk) {
+        if (bst_arena_top + words > BST_ARENA_WORDS) { bst_puts("bastio: out of memory\n"); bst_halt(); }
+        blk = &bst_arena[bst_arena_top];
+        bst_arena_top += words;
+        blk[0] = words;
+    }
+    bst_lock_release(&bst_arena_lock);
     for (uint64_t i = 1; i < words; i++) blk[i] = 0;
     bst_buf b = { n, blk + 1 };
     return b;
@@ -517,9 +540,11 @@ static bst_buf bst_alloc(uint64_t n) {
 static void bst_free(bst_buf b) {
     uint64_t *blk = b.data - 1;
     bst_free_t *f = (bst_free_t *)blk;
+    bst_lock_acquire(&bst_arena_lock);
     f->words = blk[0];
     f->next = bst_free_list;
     bst_free_list = f;
+    bst_lock_release(&bst_arena_lock);
 }
 static void bst_print(uint64_t v) {
     char d[20]; int n = 0;
@@ -795,6 +820,8 @@ static inline uint64_t bst_cpu_run(bst_cpu *c, bst_mmu m) {
     return bst_cpu_enter();
 }
 static inline uint64_t bst_cpu_idle(bst_cpu *c) { (void)c; return bst_cpu_wait(); }
+extern void bst_platform_smp_start(void (*fn)(void *), void *arg); /* run fn(arg) on every other processor */
+extern void bst_platform_smp_join(void);                           /* wait until all of them have returned */
 extern uint64_t bst_platform_cpus(void); /* processors running, this one included; 1 to 4096 */
 static inline uint64_t bst_cpu_count(bst_cpu c) { (void)c; return bst_platform_cpus(); }
 
@@ -930,6 +957,8 @@ fn cty(t: &Type) -> String {
         Type::Generic(..) => unreachable!("removed by monomorphization"),
         Type::Box(t) => format!("{} *", cty(t)),
         Type::Vec(_) => "bst_vec".into(),
+        // The lock word, followed by the contents (see bst_lock_acquire).
+        Type::Lock(_) => "uint64_t *".into(),
         Type::Ref(t) => cty(t),
         Type::MutRef(_) => unreachable!("written by proto"),
     }
@@ -1107,6 +1136,16 @@ impl<'a> Gen<'a> {
                 _ => self.vec_elem(&args[0]),
             },
             ExprKind::Call(n, _) if crate::check::WRAP_BUILTINS.contains(&n.as_str()) => self.int_ops[&e.pos].clone(),
+            ExprKind::Call(n, args) if n == "lock_new" => Type::Lock(Box::new(self.type_of(&args[0]))),
+            ExprKind::Call(n, args) if n == "lock_end" => match self.type_of(&args[0]) {
+                Type::Lock(i) => *i,
+                _ => unreachable!("checked"),
+            },
+            ExprKind::Call(n, args) if n == "locked" => match &args[1].kind {
+                ExprKind::Var(f) => self.sigs[f].ret.clone(),
+                _ => unreachable!("checked"),
+            },
+            ExprKind::Call(n, _) if n == "smp_run" => Type::Unit,
             ExprKind::Call(n, _) => self.sigs[n].ret.clone(),
             ExprKind::MutBorrow(_) | ExprKind::Forall(..) => unreachable!("not a value"),
         }
@@ -1295,6 +1334,81 @@ impl<'a> Gen<'a> {
             ExprKind::Call(name, args) if crate::check::WRAP_BUILTINS.contains(&name.as_str()) => {
                 let op = match name.as_str() { "wrap_add" => "+", "wrap_sub" => "-", _ => "*" };
                 format!("(({})((uint64_t)({}) {} (uint64_t)({})))", cty(&self.int_ops[&e.pos]), self.expr(&args[0]), op, self.expr(&args[1]))
+            }
+            ExprKind::Call(name, args) if name == "lock_new" || name == "lock_end" => {
+                let (l, c) = (format!("lk_{}", self.tmps), format!("lv_{}", self.tmps));
+                self.tmps += 1;
+                if name == "lock_new" {
+                    let t = cty(&self.type_of(&args[0]));
+                    // Like a box: allocated first, then filled.
+                    format!("({{ uint64_t *{l} = (uint64_t *)bst_box_alloc(8 + sizeof({t})); *{l} = 0; *({t} *)({l} + 1) = {}; {l}; }})", self.expr(&args[0]))
+                } else {
+                    let Type::Lock(inner) = self.type_of(&args[0]) else { unreachable!("checked") };
+                    let t = cty(&inner);
+                    format!("({{ uint64_t *{l} = {}; {t} {c} = *({t} *)({l} + 1); bst_box_free({l}, 8 + sizeof({t})); {c}; }})", self.expr(&args[0]))
+                }
+            }
+            ExprKind::Call(name, args) if name == "locked" => {
+                let Type::Lock(inner) = self.type_of(&args[0]) else { unreachable!("checked") };
+                let ExprKind::Var(f) = &args[1].kind else { unreachable!("checked") };
+                let sig = self.sigs[f].clone();
+                let k = self.tmps;
+                self.tmps += 1;
+                // The arguments are evaluated before the lock is taken.
+                let mut pre = format!("uint64_t *lk_{k} = {};", self.expr(&args[0]));
+                let mut call = vec![format!("({} *)(lk_{k} + 1)", cty(&inner))];
+                for (j, (pt, a)) in sig.params[1..].iter().zip(&args[2..]).enumerate() {
+                    let ct = match pt {
+                        Type::MutRef(t) => format!("{} *", cty(t)),
+                        t => cty(t),
+                    };
+                    pre.push_str(&format!(" {ct} la_{k}_{j} = {};", self.expr(a)));
+                    call.push(format!("la_{k}_{j}"));
+                }
+                let call = format!("f_{}({})", cid(f), call.join(", "));
+                if sig.ret == Type::Unit {
+                    format!("({{ {pre} bst_lock_acquire(lk_{k}); {call}; bst_lock_release(lk_{k}); }})")
+                } else {
+                    format!("({{ {pre} bst_lock_acquire(lk_{k}); {} lr_{k} = {call}; bst_lock_release(lk_{k}); lr_{k}; }})", cty(&sig.ret))
+                }
+            }
+            ExprKind::Call(name, args) if name == "smp_run" => {
+                let ExprKind::Var(f) = &args[0].kind else { unreachable!("checked") };
+                let sig = self.sigs[f].clone();
+                let k = self.smps.len();
+                // Shared arguments go in a block every processor reads; each
+                // processor's own Cpu and Mmu are made where it runs.
+                let mut fields = String::new();
+                let mut inits = Vec::new();
+                let (mut here, mut there) = (Vec::new(), Vec::new());
+                for (j, (pt, a)) in sig.params.iter().zip(&args[1..]).enumerate() {
+                    match pt {
+                        Type::MutRef(t) => {
+                            here.push(self.expr(a));
+                            there.push(if **t == Type::Cpu { "&cpu" } else { "&mmu" }.to_string());
+                        }
+                        t => {
+                            fields.push_str(&format!(" {} a{};", cty(t), j));
+                            inits.push(format!(".a{} = {}", j, self.expr(a)));
+                            here.push(format!("sa_{k}.a{j}"));
+                            there.push(format!("a->a{j}"));
+                        }
+                    }
+                }
+                if fields.is_empty() {
+                    fields.push_str(" uint64_t unused;");
+                }
+                self.smps.push(format!(
+                    "struct bst_smp_{k} {{{fields} }};\nstatic void bst_smp_thunk_{k}(void *p) {{ struct bst_smp_{k} *a = p; bst_cpu cpu = 0; bst_mmu mmu = 0; (void)a; (void)cpu; (void)mmu; f_{}({}); }}\n",
+                    cid(f),
+                    there.join(", ")
+                ));
+                format!(
+                    "({{ struct bst_smp_{k} sa_{k} = {{ {} }}; bst_platform_smp_start(bst_smp_thunk_{k}, &sa_{k}); f_{}({}); bst_platform_smp_join(); }})",
+                    inits.join(", "),
+                    cid(f),
+                    here.join(", ")
+                )
             }
             ExprKind::Call(name, args) => {
                 let (pre, a) = self.operands(&args.iter().collect::<Vec<_>>(), true);
