@@ -32,8 +32,13 @@
 // page ownership, page-table structure and CR3 switching safe.
 //
 // `&mut x` arguments: the callee's `requires` see x's value at the call; after
-// the call x gets a fresh value, constrained only by the callee's `ensures`,
-// where `x` means the new value and `old(..)` the value at the call.
+// the call x gets a fresh value, constrained by the callee's `ensures`, where
+// `x` means the new value and `old(..)` the value at the call, and by the
+// callee's summary (see `summarize`): the parts of x that the callee's body
+// provably leaves alone, or changes only in ways that keep their shape, keep
+// what is known about them. So a driver function taking `&mut Dev` does not
+// have to restate `port_count(d.io) == 8` in its `ensures`, nor its callers'
+// loops in their invariants.
 
 use crate::ast::*;
 use crate::check::is_builtin;
@@ -264,6 +269,67 @@ fn kept_by_builtins(t: &Type, field: &str) -> bool {
 const SHAPE_KEEPING: &[&str] =
     &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pool_take", "pool_give", "frame_write", "frame_write8", "cpu_set", "cpu_run", "cpu_idle"];
 
+/// What a call may do to one `&mut` argument: the places under it that may
+/// change, as paths relative to the parameter (`""` is the parameter itself,
+/// `".f.g"` a field of it), each with the `changed_vars` flag (true: changed
+/// only in ways that keep the shape). The parameter itself is always listed.
+type Summary = Vec<(String, bool)>;
+
+/// Each function's summary for each of its parameters (`None` for those
+/// that are not `&mut`).
+type Summaries = HashMap<String, Vec<Option<Summary>>>;
+
+/// Places deeper than this are summarized by their prefix of this depth,
+/// marked as changed in any way. Recursion through boxes could otherwise
+/// grow paths forever.
+const SUMMARY_DEPTH: usize = 8;
+
+/// Computes every function's summaries from its body: what `changed_vars`
+/// finds under each `&mut` parameter, where lending a place to another user
+/// function counts as that function's summary applied to the place.
+///
+/// This is a greatest fixed point: it starts from "every parameter keeps its
+/// shape" and weakens summaries until none changes. Sound for recursion too:
+/// a change that is not shape-keeping happens at some assignment or builtin
+/// call, which is recorded there and then propagates to every caller.
+fn summarize(p: &Program) -> Summaries {
+    let mut sums: Summaries = HashMap::new();
+    for f in &p.fns {
+        let ps = f.params.iter().map(|q| q.ty.is_mut_ref().then(|| vec![(String::new(), true)])).collect();
+        sums.insert(f.name.clone(), ps);
+    }
+    loop {
+        let mut changed = false;
+        for f in &p.fns {
+            let mut m = HashMap::new();
+            changed_vars(&f.body, &mut m, &sums);
+            for (i, q) in f.params.iter().enumerate() {
+                if !q.ty.is_mut_ref() {
+                    continue;
+                }
+                let mut s: HashMap<String, bool> = HashMap::new();
+                s.insert(String::new(), true);
+                for (path, keep) in &m {
+                    if path_root(path) == q.name {
+                        let x = s.entry(path[q.name.len()..].to_string()).or_insert(true);
+                        *x = *x && *keep;
+                    }
+                }
+                let mut s: Summary = s.into_iter().collect();
+                s.sort_by_key(|(r, _)| (r.matches('.').count(), r.clone()));
+                let slot = &mut sums.get_mut(&f.name).unwrap()[i];
+                if slot.as_ref() != Some(&s) {
+                    *slot = Some(s);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return sums;
+        }
+    }
+}
+
 #[derive(Clone)]
 struct State {
     pc: Vec<String>,
@@ -291,6 +357,7 @@ pub struct Verifier<'p> {
     pub obligations: usize,
     /// Boxes being unfolded by `fresh_of` right now.
     box_depth: usize,
+    sums: Summaries,
 }
 
 fn sanitize(n: &str) -> String {
@@ -319,7 +386,7 @@ fn ite(c: &str, a: &str, b: &str) -> String {
 
 pub fn verify_program(p: &Program) -> Result<(usize, Vec<String>), Diag> {
     let solver = Solver::start().map_err(|e| Diag::new("E-SOLVER", Pos::default(), e))?;
-    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0 };
+    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, sums: summarize(p) };
     v.smt(&format!("(declare-const {} Int)", POOLSIZE))?;
     v.smt(&format!("(assert (and (<= 0 {p}) (<= {p} {})))", FRAME_LIMIT, p = POOLSIZE))?;
     for f in &p.fns {
@@ -727,8 +794,8 @@ impl<'p> Verifier<'p> {
                 }
                 // 2. havoc what the body (or the condition) changes
                 let mut changed = HashMap::new();
-                changed_vars(body, &mut changed);
-                changed_in_expr(cond, &mut changed);
+                changed_vars(body, &mut changed, &self.sums);
+                changed_in_expr(cond, &mut changed, &self.sums);
                 let mut lst = st.clone();
                 // Enclosing places first, so a field's own havoc lands inside its struct's.
                 let mut changed: Vec<(String, bool)> = changed.into_iter().collect();
@@ -804,10 +871,15 @@ impl<'p> Verifier<'p> {
         }
     }
 
-    /// A fresh value of the same type as `old`. With `keep`, a Buf keeps its
-    /// length and an object the ghost fields builtins never change.
+    /// A fresh value of the same type as `old`. With `keep` (the value was
+    /// changed only in shape-keeping ways, see `changed_vars`), a Buf or a
+    /// vector keeps its length, an object the ghost fields builtins never
+    /// change, and scalars, enum tags and the fields of structs stay as they
+    /// were: no shape-keeping builtin changes them, and any other change to a
+    /// place inside is havocked separately, after this.
     fn havoc(&mut self, old: &Val, keep: bool, name: &str) -> Result<Val, Diag> {
         Ok(match old {
+            Val::U(_) | Val::B(_) | Val::Str { .. } if keep => old.clone(),
             Val::Buf { len, .. } => {
                 let len = if keep { len.clone() } else { self.fresh_len(name)? };
                 Val::Buf { len, data: self.fresh_array(name, "Int")? }
@@ -829,16 +901,16 @@ impl<'p> Verifier<'p> {
             Val::Struct(n, fs) => {
                 let mut nf = Vec::new();
                 for ((f, _), fv) in struct_def(n).unwrap().fields.iter().zip(fs) {
-                    nf.push(self.havoc(fv, false, &format!("{}_{}", name, f))?);
+                    nf.push(self.havoc(fv, keep, &format!("{}_{}", name, f))?);
                 }
                 Val::Struct(n.clone(), nf)
             }
-            Val::Enum(n, _, ps) => {
+            Val::Enum(n, tag, ps) => {
                 let d = enum_def(n).unwrap();
-                let tag = self.fresh_int(&format!("{}_tag", name), "0", &(d.variants.len() - 1).to_string())?;
+                let tag = if keep { tag.clone() } else { self.fresh_int(&format!("{}_tag", name), "0", &(d.variants.len() - 1).to_string())? };
                 let mut np = Vec::new();
                 for ((v, _), pv) in d.variants.iter().zip(ps) {
-                    np.push(self.havoc(pv, false, &format!("{}_{}", name, v))?);
+                    np.push(self.havoc(pv, keep, &format!("{}_{}", name, v))?);
                 }
                 Val::Enum(n.clone(), tag, np)
             }
@@ -846,7 +918,7 @@ impl<'p> Verifier<'p> {
                 let len = if keep { len.clone() } else { self.fresh_len(name)? };
                 Val::Vec { elem: elem.clone(), len, elems: Box::new(self.fresh_lifted(elem, name)?) }
             }
-            Val::Box(BoxVal::Known(i)) => Val::Box(BoxVal::Known(Box::new(self.havoc(i, false, name)?))),
+            Val::Box(BoxVal::Known(i)) => Val::Box(BoxVal::Known(Box::new(self.havoc(i, keep, name)?))),
             Val::Box(BoxVal::Opaque(t)) => Val::Box(BoxVal::Opaque(t.clone())),
             Val::Unit => Val::Unit,
         })
@@ -1010,11 +1082,24 @@ impl<'p> Verifier<'p> {
         }
         let res = self.fresh_of(&f.ret, &format!("{}_ret", name))?;
         let mut post = pre.clone();
-        for (p, a) in f.params.iter().zip(args) {
+        for (i, (p, a)) in f.params.iter().zip(args).enumerate() {
             if let (Type::MutRef(t), ExprKind::MutBorrow(var)) = (&p.ty, &a.kind) {
-                let nv = self.fresh_of(t, &var.replace('.', "_"))?;
-                post.insert(p.name.clone(), nv.clone());
-                set_path(&mut st.env, var, nv);
+                let sum = self.sums[name][i].clone().expect("a &mut parameter has a summary");
+                if sum[0] == (String::new(), true) {
+                    // The callee keeps the argument's shape: havoc only what
+                    // it may change, as a loop would (shallowest first).
+                    for (rel, keep) in &sum {
+                        let path = format!("{}{}", var, rel);
+                        self.open_path(&mut st.env, &path)?;
+                        let old = get_path(&st.env, &path);
+                        let nv = self.havoc(&old, *keep, &path.replace('.', "_"))?;
+                        set_path(&mut st.env, &path, nv);
+                    }
+                } else {
+                    let nv = self.fresh_of(t, &var.replace('.', "_"))?;
+                    set_path(&mut st.env, var, nv);
+                }
+                post.insert(p.name.clone(), get_path(&st.env, var));
             }
         }
         for en in &f.ensures {
@@ -1467,33 +1552,34 @@ impl<'p> Verifier<'p> {
     }
 }
 
-/// Variables a loop body may change, with a flag that is true when every
-/// change keeps the value's shape: `x = set(x, ..)` keeps a Buf's length,
-/// and the builtins in SHAPE_KEEPING keep an object's id, level and size.
-fn changed_vars(stmts: &[Stmt], out: &mut HashMap<String, bool>) {
+/// Places a loop body (or a function body) may change, with a flag that is
+/// true when every change keeps the value's shape: `x = set(x, ..)` keeps a
+/// Buf's length, the builtins in SHAPE_KEEPING keep an object's id, level
+/// and size, and a user function changes what its summary says.
+fn changed_vars(stmts: &[Stmt], out: &mut HashMap<String, bool>, sums: &Summaries) {
     for s in stmts {
         match &s.kind {
             StmtKind::Assign { name, value } => {
                 let only_set = matches!(&value.kind, ExprKind::Call(f, args) if f == "set" && place(&args[0]).as_deref() == Some(name.as_str()));
                 let e = out.entry(name.clone()).or_insert(true);
                 *e = *e && only_set;
-                changed_in_expr(value, out);
+                changed_in_expr(value, out, sums);
             }
-            StmtKind::Let { init, .. } => changed_in_expr(init, out),
-            StmtKind::Expr(e) | StmtKind::Return(Some(e)) => changed_in_expr(e, out),
+            StmtKind::Let { init, .. } => changed_in_expr(init, out, sums),
+            StmtKind::Expr(e) | StmtKind::Return(Some(e)) => changed_in_expr(e, out, sums),
             StmtKind::If { cond, then_b, else_b } => {
-                changed_in_expr(cond, out);
-                changed_vars(then_b, out);
-                changed_vars(else_b, out);
+                changed_in_expr(cond, out, sums);
+                changed_vars(then_b, out, sums);
+                changed_vars(else_b, out, sums);
             }
             StmtKind::While { cond, body, .. } => {
-                changed_in_expr(cond, out);
-                changed_vars(body, out);
+                changed_in_expr(cond, out, sums);
+                changed_vars(body, out, sums);
             }
             StmtKind::Match { scrut, arms } => {
-                changed_in_expr(scrut, out);
+                changed_in_expr(scrut, out, sums);
                 for a in arms {
-                    changed_vars(&a.body, out);
+                    changed_vars(&a.body, out, sums);
                 }
             }
             StmtKind::Return(None) | StmtKind::Assert(_) | StmtKind::Unreachable => {}
@@ -1501,31 +1587,45 @@ fn changed_vars(stmts: &[Stmt], out: &mut HashMap<String, bool>) {
     }
 }
 
-/// Variables lent as `&mut` anywhere in `e`.
-fn changed_in_expr(e: &Expr, out: &mut HashMap<String, bool>) {
+/// Records that `path` may change (`keep`: only in shape-keeping ways).
+fn note(out: &mut HashMap<String, bool>, path: String, keep: bool) {
+    let parts: Vec<&str> = path.split('.').collect();
+    let (path, keep) = if parts.len() > SUMMARY_DEPTH { (parts[..SUMMARY_DEPTH].join("."), false) } else { (path, keep) };
+    let x = out.entry(path).or_insert(true);
+    *x = *x && keep;
+}
+
+/// Places lent as `&mut` anywhere in `e`, and what the callee may change
+/// under them.
+fn changed_in_expr(e: &Expr, out: &mut HashMap<String, bool>, sums: &Summaries) {
     match &e.kind {
         ExprKind::Call(f, args) => {
-            for a in args {
+            for (i, a) in args.iter().enumerate() {
                 if let ExprKind::MutBorrow(n) = &a.kind {
-                    let keep = SHAPE_KEEPING.contains(&f.as_str());
-                    let x = out.entry(n.clone()).or_insert(true);
-                    *x = *x && keep;
+                    if is_builtin(f) {
+                        note(out, n.clone(), SHAPE_KEEPING.contains(&f.as_str()));
+                    } else {
+                        match sums.get(f).and_then(|ps| ps.get(i).cloned()).flatten() {
+                            Some(sum) => sum.into_iter().for_each(|(rel, keep)| note(out, format!("{}{}", n, rel), keep)),
+                            None => note(out, n.clone(), false),
+                        }
+                    }
                 } else {
-                    changed_in_expr(a, out);
+                    changed_in_expr(a, out, sums);
                 }
             }
         }
-        ExprKind::Not(x) => changed_in_expr(x, out),
+        ExprKind::Not(x) => changed_in_expr(x, out, sums),
         ExprKind::Bin(_, a, b) => {
-            changed_in_expr(a, out);
-            changed_in_expr(b, out);
+            changed_in_expr(a, out, sums);
+            changed_in_expr(b, out, sums);
         }
         ExprKind::StructLit(_, fs) => {
             for (_, x) in fs {
-                changed_in_expr(x, out);
+                changed_in_expr(x, out, sums);
             }
         }
-        ExprKind::Variant(_, _, Some(x)) | ExprKind::Is(x, _, _) => changed_in_expr(x, out),
+        ExprKind::Variant(_, _, Some(x)) | ExprKind::Is(x, _, _) => changed_in_expr(x, out, sums),
         _ => {}
     }
 }
