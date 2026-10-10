@@ -22,8 +22,10 @@
 #           builds; where stage0 does not support a program yet (exit 4),
 #           asmdump must not either. asmdump built by the native backend
 #           must print the same assembly for itself. Without --stage0,
-#           asmdump also does what stage0 does not (register arguments):
-#           the programs it builds must exit as tests/pass says
+#           asmdump also does what stage0 does not (register arguments,
+#           Child, host_eprint): the programs it builds must exit as
+#           tests/pass says, and bastioc1 built by it must write the same C
+#           for itself as stage0
 #   driver  stage1/bastioc1.bastio  vs  bastioc0 itself: what `--check`
 #           prints on stderr and its exit status, the
 #           C file of `--emit-c`, the C header of `--header`, the list of
@@ -191,7 +193,18 @@ if "$tmp/asmdump" stage1/asmdump.bastio >"$tmp/self.s" 2>/dev/null \
 else
   differ=$((differ+1)); echo "DIFFER asmdump built by itself"
 fi
-echo "-- native (stage1 only): $built programs built and run (plus asmdump built by itself), $differ differ"
+# bastioc1 built this way (it runs Z3 as a Child) must write the same C
+# for itself as stage0.
+if "$tmp/asmdump" stage1/bastioc1.bastio >"$tmp/b1.s" 2>/dev/null \
+   && as --64 -o "$tmp/b1.o" "$tmp/b1.s" && cc -o "$tmp/bastioc1_n" "$tmp/b1.o" \
+   && "$tmp/bastioc1_n" --emit-c -o "$tmp/b1n.c" stage1/bastioc1.bastio 2>/dev/null \
+   && "$BASTIOC" --emit-c -o "$tmp/b1c.c" stage1/bastioc1.bastio 2>/dev/null \
+   && cmp -s "$tmp/b1c.c" "$tmp/b1n.c"; then
+  built=$((built+1))
+else
+  differ=$((differ+1)); echo "DIFFER bastioc1 built by asmdump"
+fi
+echo "-- native (stage1 only): $built programs built and run (plus asmdump built by itself, and bastioc1), $differ differ"
 { [ "$differ" = 0 ] && [ "$built" -gt 1 ]; } || status=1
 # The driver. Everything is compared except what bastioc1 cannot know:
 # the reason a file cannot be read and the solver's own words when it
