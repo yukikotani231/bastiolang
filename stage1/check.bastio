@@ -396,19 +396,42 @@ fn base_t(m: &Mono, t: u64) -> u64 {
   return t;
 }
 
-/// Is `t` an integer type (`u8`, `u16`, `u32` or `u64`)?
-fn is_int(m: &Mono, t: u64) -> bool {
+/// Is `t` a signed integer type (`i8`, `i16`, `i32` or `i64`)?
+fn is_signed(m: &Mono, t: u64) -> bool {
   let k = kind_t(m, t);
-  return k == TY_U64 || k == TY_U8 || k == TY_U16 || k == TY_U32;
+  return k == TY_I8 || k == TY_I16 || k == TY_I32 || k == TY_I64;
 }
 
-/// Does the literal value `v` fit in the integer type `t`? (Every literal
-/// fits in `u64`: the lexer allows no more.)
-fn lit_fits(m: &Mono, v: u64, t: u64) -> bool {
+/// Is `t` an integer type (`u8` .. `u64` or `i8` .. `i64`)?
+fn is_int(m: &Mono, t: u64) -> bool {
   let k = kind_t(m, t);
+  return k == TY_U64 || k == TY_U8 || k == TY_U16 || k == TY_U32 || is_signed(m, t);
+}
+
+/// Is node `i` an integer literal: `v`, or `-v`, which is the literal -v?
+fn is_lit(p: &Parser, i: u64) -> bool {
+  let n = node_at(p.nodes, i);
+  return n.kind == E_INT || (n.kind == E_NEG && kind_of(p, n.a) == E_INT);
+}
+
+/// Does the literal value `v` (negated when `neg`) fit in the integer type
+/// `t`? (Every literal fits in `u64`: the lexer allows no more.)
+fn lit_fits(m: &Mono, v: u64, neg: bool, t: u64) -> bool {
+  let k = kind_t(m, t);
+  if neg && v != 0 {
+    if k == TY_I8 { return v <= 128; }
+    if k == TY_I16 { return v <= 32768; }
+    if k == TY_I32 { return v <= 2147483648; }
+    if k == TY_I64 { return v <= 9223372036854775808; }
+    return false;
+  }
   if k == TY_U8 { return v <= 255; }
   if k == TY_U16 { return v <= 65535; }
   if k == TY_U32 { return v <= 4294967295; }
+  if k == TY_I8 { return v <= 127; }
+  if k == TY_I16 { return v <= 32767; }
+  if k == TY_I32 { return v <= 2147483647; }
+  if k == TY_I64 { return v <= 9223372036854775807; }
   return true;
 }
 
@@ -970,7 +993,8 @@ fn known_type(c: &mut Checker, m: &Mono, p: &Parser, t: u64, loc: u64) {
 
 fn is_reserved_type(p: &Parser, s: u64, e: u64) -> bool {
   return span_is(p, s, e, "u64") || span_is(p, s, e, "u8") || span_is(p, s, e, "u16")
-    || span_is(p, s, e, "u32") || span_is(p, s, e, "bool") || span_is(p, s, e, "Str")
+    || span_is(p, s, e, "u32") || span_is(p, s, e, "i8") || span_is(p, s, e, "i16")
+    || span_is(p, s, e, "i32") || span_is(p, s, e, "i64") || span_is(p, s, e, "bool") || span_is(p, s, e, "Str")
     || span_is(p, s, e, "Buf") || span_is(p, s, e, "Bytes") || span_is(p, s, e, "Host")
     || span_is(p, s, e, "Child") || span_is(p, s, e, "Serial") || span_is(p, s, e, "Frame")
     || span_is(p, s, e, "PageTable") || span_is(p, s, e, "Pool") || span_is(p, s, e, "Mmu")
@@ -1693,9 +1717,15 @@ fn ck_expr_as(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, want: u64) -> u
   if c.failed {
     return 0;
   }
-  let n = node_at(p.nodes, i);
-  if n.kind == E_INT && is_int(m, want) {
-    if !lit_fits(m, n.v, want) {
+  if is_lit(p, i) && is_int(m, want) {
+    let n = node_at(p.nodes, i);
+    let neg = n.kind == E_NEG;
+    let mut v = n.v;
+    if neg {
+      let x = node_at(p.nodes, n.a);
+      v = x.v;
+    }
+    if !lit_fits(m, v, neg, want) {
       cfail(&mut c, p, i, C_TYPE);            // does not fit
       return 0;
     }
@@ -1710,7 +1740,7 @@ struct Ops { a: u64, b: u64 }
 /// The two operands `a` and `b` of a binary operator: a literal on one
 /// side takes the type of the other side, so that side is checked first.
 fn operands(c: &mut Checker, m: &mut Mono, p: &Parser, a: u64, b: u64) -> Ops {
-  if kind_of(p, a) == E_INT && kind_of(p, b) != E_INT {
+  if is_lit(p, a) && !is_lit(p, b) {
     let tb = ck_expr(&mut c, &mut m, p, b);
     let ta = ck_expr_as(&mut c, &mut m, p, a, tb);
     return Ops { a: ta, b: tb };
@@ -1812,6 +1842,21 @@ fn ck_named(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64
       expect_ty(&mut c, p, t, c.tbool, n.a);
     }
     return c.tbool;
+  }
+  if k == E_NEG {
+    // A negated literal with nothing to give it a signed type would be a u64.
+    let mut t = c.tu64;
+    if kind_of(p, n.a) != E_INT {
+      t = ck_expr(&mut c, &mut m, p, n.a);
+      if c.failed {
+        return 0;
+      }
+    }
+    if !is_signed(m, t) {
+      cfail(&mut c, p, i, C_TYPE);            // unary minus needs a signed integer
+      return 0;
+    }
+    return t;
   }
   if k == E_BIN {
     if n.v == P_IMPLIES {
@@ -2182,7 +2227,7 @@ fn call_with(c: &mut Checker, m: &mut Mono, p: &Parser, ps: &Vec[u64], r: u64, a
       let t = ck_expr_as(&mut c, &mut m, p, a, pt);
       // A builtin's u64 parameter (an index, a length, a value) takes any
       // narrower unsigned value: widening is free.
-      let widens = builtin && pt == c.tu64 && is_int(m, t);
+      let widens = builtin && pt == c.tu64 && is_int(m, t) && !is_signed(m, t);
       if !c.failed && !widens {
         expect_ty(&mut c, p, t, pt, a);
       }
@@ -2406,6 +2451,13 @@ fn ck_spec(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, ens: bool) -> u64 
       expect_ty(&mut c, p, t, c.tbool, n.a);
     }
     return c.tbool;
+  }
+  if k == E_NEG {
+    let t = ck_spec(&mut c, &mut m, p, n.a, ens);
+    if !c.failed && !is_int(m, t) {
+      cfail(&mut c, p, i, C_TYPE);            // unary minus needs an integer
+    }
+    return c.tu64;
   }
   if k == E_BIN {
     let ta = ck_spec(&mut c, &mut m, p, n.a, ens);
