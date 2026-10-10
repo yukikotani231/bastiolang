@@ -71,7 +71,9 @@ struct Node {
   kind: u64, line: u64, col: u64,
   s: u64, e: u64, s2: u64, e2: u64,
   v: u64, a: u64, b: u64, c: u64, d: u64, x: u64,
-  next: u64
+  next: u64,
+  /// The file it comes from, by index in load order.
+  file: u64
 }
 
 /// A constant defined so far: its name and value.
@@ -88,23 +90,29 @@ struct Parser {
   consts: Vec[Const],
   /// The E_BLOB nodes, in source order: the driver reads their files.
   blobs: Vec[u64],
+  /// The file being parsed (its index in load order), for node positions.
+  file: u64,
   failed: bool,
+  efile: u64,
   eline: u64,
   ecol: u64,
-  // The definitions, one list per kind.
-  structs: u64,
-  enums: u64,
-  specs: u64,
-  fns: u64
+  /// 0 for E-PARSE; the loader also records E-IMPORT (1).
+  ecode: u64,
+  // The definitions of every file parsed so far, one list per kind.
+  structs: List,
+  enums: List,
+  specs: List,
+  fns: List
 }
 
 /// A parser over `toks` (the tokens of `src`), starting at token `i`.
 fn parser_new(src: Bytes, toks: Vec[Tok], i: u64) -> Parser {
   let mut nodes = vec_new[Node]();
-  vec_push(&mut nodes, Node { kind: 0, line: 0, col: 0, s: 0, e: 0, s2: 0, e2: 0, v: 0, a: 0, b: 0, c: 0, d: 0, x: 0, next: 0 });
+  vec_push(&mut nodes, Node { kind: 0, line: 0, col: 0, s: 0, e: 0, s2: 0, e2: 0, v: 0, a: 0, b: 0, c: 0, d: 0, x: 0, next: 0, file: 0 });
   return Parser {
     src: src, toks: toks, i: i, nodes: nodes, consts: vec_new[Const](), blobs: vec_new[u64](),
-    failed: false, eline: 0, ecol: 0, structs: 0, enums: 0, specs: 0, fns: 0
+    file: 0, failed: false, efile: 0, eline: 0, ecol: 0, ecode: 0,
+    structs: list_new(), enums: list_new(), specs: list_new(), fns: list_new()
   };
 }
 
@@ -190,6 +198,7 @@ fn eat_kw(p: &mut Parser, c: u64) -> bool {
 fn fail(p: &mut Parser, line: u64, col: u64) {
   if !p.failed {
     p.failed = true;
+    p.efile = p.file;
     p.eline = line;
     p.ecol = col;
   }
@@ -268,7 +277,7 @@ fn same(src: &Bytes, s1: u64, e1: u64, s2: u64, e2: u64) -> bool {
 // ---- Nodes ----
 
 fn blank(kind: u64, t: Tok) -> Node {
-  return Node { kind: kind, line: t.line, col: t.col, s: 0, e: 0, s2: 0, e2: 0, v: 0, a: 0, b: 0, c: 0, d: 0, x: 0, next: 0 };
+  return Node { kind: kind, line: t.line, col: t.col, s: 0, e: 0, s2: 0, e2: 0, v: 0, a: 0, b: 0, c: 0, d: 0, x: 0, next: 0, file: 0 };
 }
 
 /// A node named by token `t`, at `t`.
@@ -281,7 +290,9 @@ fn named(kind: u64, t: Tok) -> Node {
 
 fn add(p: &mut Parser, n: Node) -> u64 {
   let k = vec_len(p.nodes);
-  vec_push(&mut p.nodes, n);
+  let mut m = n;
+  m.file = p.file;
+  vec_push(&mut p.nodes, m);
   return k;
 }
 
@@ -1364,36 +1375,32 @@ fn fn_def(p: &mut Parser) -> u64 {
   return add(&mut p, n);
 }
 
-/// Parses definitions up to the end of the file into `structs`, `enums`,
-/// `specs` and `fns`.
+/// Parses definitions up to the end of the file, appending them to
+/// `structs`, `enums`, `specs` and `fns`.
 fn program(p: &mut Parser) {
-  let mut structs = list_new();
-  let mut enums = list_new();
-  let mut specs = list_new();
-  let mut fns = list_new();
   let mut t = peek(p);
   while !p.failed && t.kind != K_EOF {
     if is_kw(t, KW_SPEC) {
       let k = spec_def(&mut p);
-      specs = append(&mut p, specs, k);
+      let l = p.specs;
+      p.specs = append(&mut p, l, k);
     } else if is_kw(t, KW_STRUCT) {
       let k = struct_def(&mut p);
-      structs = append(&mut p, structs, k);
+      let l = p.structs;
+      p.structs = append(&mut p, l, k);
     } else if is_kw(t, KW_ENUM) {
       let k = enum_def(&mut p);
-      enums = append(&mut p, enums, k);
+      let l = p.enums;
+      p.enums = append(&mut p, l, k);
     } else if is_kw(t, KW_CONST) {
       const_def(&mut p);
     } else if is_kw(t, KW_IMPORT) {
       fail_at(&mut p, t);           // imports must come first
     } else {
       let k = fn_def(&mut p);
-      fns = append(&mut p, fns, k);
+      let l = p.fns;
+      p.fns = append(&mut p, l, k);
     }
     t = peek(p);
   }
-  p.structs = structs.head;
-  p.enums = enums.head;
-  p.specs = specs.head;
-  p.fns = fns.head;
 }

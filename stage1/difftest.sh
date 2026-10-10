@@ -3,15 +3,17 @@
 # stage0, must print exactly what stage0 prints for every Bastio source in
 # the repository (and in a BastiOS checkout next to it, if there is one):
 #   lexer   stage1/lexdump.bastio  vs  bastioc0 --dump-tokens
-#   parser  stage1/astdump.bastio  vs  bastioc0 --dump-ast
-# The parser is also compared on damaged sources (stage1/mutate.py), so
-# its error positions are checked too.
+#   parser  stage1/astdump.bastio   vs  bastioc0 --dump-ast
+#   loader and monomorphizer
+#           stage1/monodump.bastio  vs  bastioc0 --dump-mono
+# The parser and the monomorphizer are also compared on damaged sources
+# (stage1/mutate.py), so their error positions are checked too.
 set -u
 cd "$(dirname "$0")/.."
 BASTIOC=${BASTIOC:-stage0/target/release/bastioc0}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-for tool in lexdump astdump; do
+for tool in lexdump astdump monodump; do
   "$BASTIOC" -o "$tmp/$tool" "stage1/$tool.bastio" 2>"$tmp/build.err" || { cat "$tmp/build.err"; exit 1; }
 done
 files=$(find tests stage1 ../bastios/src ../bastios/user -name '*.bastio' 2>/dev/null | sort)
@@ -34,5 +36,7 @@ compare() {  # phase, stage0 flag, stage1 tool
 }
 compare lexer --dump-tokens lexdump
 compare parser --dump-ast astdump
-python3 stage1/mutate.py "$BASTIOC" "$tmp/astdump" 1 ${MUTANTS:-5} $files || status=1
+compare mono --dump-mono monodump
+python3 stage1/mutate.py "$BASTIOC" --dump-ast "$tmp/astdump" 1 ${MUTANTS:-5} $files || status=1
+python3 stage1/mutate.py "$BASTIOC" --dump-mono "$tmp/monodump" 2 ${MUTANTS:-5} $files || status=1
 exit $status

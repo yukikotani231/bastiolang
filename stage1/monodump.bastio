@@ -1,0 +1,40 @@
+// Prints a whole program (imports followed) after monomorphization, in the
+// format of `bastioc0 --dump-mono`, for differential testing against stage0.
+import "loader.bastio";
+import "print.bastio";
+
+fn main(con: &mut Serial, host: &mut Host) -> u64 {
+  let path = host_arg(host, 1);
+  let mut p = parser_new(balloc(0), vec_new[Tok](), 0);
+  let mut ld = loader_new();
+  let r = load(host, &mut p, &mut ld, path, 0, 0, 0, false);
+  bfree(path);
+  loader_free(ld);
+  let mut code = 0;
+  if r == 2 {
+    code = 2;
+  } else if r != 0 {
+    put(con, "error ");
+    put_num(con, p.efile);
+    put(con, ":");
+    put_pos(con, p.eline, p.ecol);
+    if p.ecode == CODE_IMPORT { put(con, " E-IMPORT\n"); } else { put(con, " E-PARSE\n"); }
+    code = 1;
+  } else {
+    let mut m = mono_new();
+    monomorphize(&mut m, p);
+    if m.failed {
+      put(con, "error ");
+      put_num(con, m.efile);
+      put(con, ":");
+      put_pos(con, m.eline, m.ecol);
+      put(con, " E-TYPE\n");
+      code = 1;
+    } else {
+      dump_mono(con, p, &mut m);
+    }
+    mono_free(m);
+  }
+  bfree(parser_free(p));
+  return code;
+}

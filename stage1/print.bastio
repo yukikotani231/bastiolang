@@ -1,0 +1,581 @@
+// Printing the syntax tree in the formats of stage0's `--dump-ast` (as
+// parsed, `raw`) and `--dump-mono` (after monomorphization: types read in
+// an instance, positions with their file), for differential testing.
+import "mono.bastio";
+import "out.bastio";
+
+/// How to print: as parsed, or read in instance `env`.
+struct Pr { raw: bool, env: u64 }
+
+fn text(con: &Serial, p: &Parser, s: u64, e: u64) {
+  if s <= e && e <= blen(p.src) {
+    put_text(con, p.src, s, e);
+  }
+}
+
+fn name_of(con: &Serial, p: &Parser, n: Node) {
+  text(con, p, n.s, n.e);
+}
+
+fn pos_of(con: &Serial, n: Node) {
+  put_pos(con, n.line, n.col);
+}
+
+fn op_text(con: &Serial, op: u64) {
+  if op == P_IMPLIES { put(con, "==>"); }
+  else if op == P_EQEQ { put(con, "=="); }
+  else if op == P_NE { put(con, "!="); }
+  else if op == P_LE { put(con, "<="); }
+  else if op == P_GE { put(con, ">="); }
+  else if op == P_ANDAND { put(con, "&&"); }
+  else if op == P_OROR { put(con, "||"); }
+  else if op == P_PLUS { put(con, "+"); }
+  else if op == P_MINUS { put(con, "-"); }
+  else if op == P_STAR { put(con, "*"); }
+  else if op == P_SLASH { put(con, "/"); }
+  else if op == P_PERCENT { put(con, "%"); }
+  else if op == P_LT { put(con, "<"); }
+  else if op == P_GT { put(con, ">"); }
+}
+
+fn raw_type(con: &Serial, p: &Parser, i: u64) {
+  let n = node_at(p.nodes, i);
+  if n.kind == T_NAMED {
+    name_of(con, p, n);
+  } else if n.kind == T_GENERIC {
+    name_of(con, p, n);
+    put(con, "[");
+    let mut k = n.a;
+    while k != 0 {
+      raw_type(con, p, k);
+      k = next_of(p, k);
+      if k != 0 {
+        put(con, ", ");
+      }
+    }
+    put(con, "]");
+  } else if n.kind == T_REF {
+    put(con, "&");
+    raw_type(con, p, n.a);
+  } else if n.kind == T_MUTREF {
+    put(con, "&mut ");
+    raw_type(con, p, n.a);
+  } else if n.kind == T_UNIT {
+    put(con, "()");
+  }
+}
+
+/// A type as written (`raw`), or as monomorphization reads it in `pr.env`.
+fn dump_type(con: &Serial, p: &Parser, m: &mut Mono, pr: Pr, i: u64) {
+  if pr.raw {
+    raw_type(con, p, i);
+  } else {
+    let t = conv(&mut m, p, i, pr.env, i);
+    put_ty(con, p, m, t);
+  }
+}
+
+fn put_ty(con: &Serial, p: &Parser, m: &Mono, t: u64) {
+  let x = ty_at(m, t);
+  let k = x.kind;
+  if k == TY_U64 { put(con, "u64"); }
+  else if k == TY_BOOL { put(con, "bool"); }
+  else if k == TY_UNIT { put(con, "()"); }
+  else if k == TY_STR { put(con, "Str"); }
+  else if k == TY_BUF { put(con, "Buf"); }
+  else if k == TY_BYTES { put(con, "Bytes"); }
+  else if k == TY_HOST { put(con, "Host"); }
+  else if k == TY_CHILD { put(con, "Child"); }
+  else if k == TY_SERIAL { put(con, "Serial"); }
+  else if k == TY_FRAME { put(con, "Frame"); }
+  else if k == TY_PT { put(con, "PageTable"); }
+  else if k == TY_POOL { put(con, "Pool"); }
+  else if k == TY_MMU { put(con, "Mmu"); }
+  else if k == TY_CPU { put(con, "Cpu"); }
+  else if k == TY_STRUCT || k == TY_ENUM { put_inst(con, p, m, x.a); }
+  else if k == TY_UNKNOWN { name_of(con, p, node_at(p.nodes, x.a)); }
+  else if k == TY_BOX { put(con, "Box["); put_ty(con, p, m, x.a); put(con, "]"); }
+  else if k == TY_VEC { put(con, "Vec["); put_ty(con, p, m, x.a); put(con, "]"); }
+  else if k == TY_REF { put(con, "&"); put_ty(con, p, m, x.a); }
+  else if k == TY_MUTREF { put(con, "&mut "); put_ty(con, p, m, x.a); }
+}
+
+/// An instance's name: `Pair[u64, Buf]`, or just `Rect` for a plain one.
+fn put_inst(con: &Serial, p: &Parser, m: &Mono, i: u64) {
+  let x = inst_at(m, i);
+  name_of(con, p, node_at(p.nodes, x.def));
+  if x.n > 0 && x.args < SRC_MAX {
+    put(con, "[");
+    let mut j = 0;
+    while j < x.n && j < SRC_MAX
+      invariant j <= SRC_MAX
+    {
+      if j > 0 {
+        put(con, ", ");
+      }
+      put_ty(con, p, m, targ_at(m, x.args + j));
+      j = j + 1;
+    }
+    put(con, "]");
+  }
+}
+
+/// The names of a list, separated by `sep`.
+fn dump_names(con: &Serial, p: &Parser, i: u64, sep: Str) {
+  let mut k = i;
+  while k != 0 {
+    let n = node_at(p.nodes, k);
+    name_of(con, p, n);
+    k = n.next;
+    if k != 0 {
+      put(con, sep);
+    }
+  }
+}
+
+/// `(kind L:C`
+fn begin(con: &Serial, pr: Pr, kind: Str, n: Node) {
+  put(con, "(");
+  put(con, kind);
+  put(con, " ");
+  if !pr.raw {
+    put_num(con, n.file);
+    put(con, ":");
+  }
+  pos_of(con, n);
+}
+
+/// Each expression of a list, each after a space.
+fn dump_exprs(con: &Serial, p: &Parser, m: &mut Mono, pr: Pr, i: u64) {
+  let mut k = i;
+  while k != 0 {
+    put(con, " ");
+    dump_expr(con, p, &mut m, pr, k);
+    k = next_of(p, k);
+  }
+}
+
+fn dump_expr(con: &Serial, p: &Parser, m: &mut Mono, pr: Pr, i: u64) {
+  dump_named(con, p, &mut m, pr, i, 0);
+}
+
+/// An expression; a call, struct literal or variant is named after instance
+/// `inst` instead of as written when `inst` is not 0.
+fn dump_named(con: &Serial, p: &Parser, m: &mut Mono, pr: Pr, i: u64, inst: u64) {
+  let n = node_at(p.nodes, i);
+  let k = n.kind;
+  if k == E_INT {
+    begin(con, pr, "int", n);
+    put(con, " ");
+    put_num(con, n.v);
+  } else if k == E_BOOL {
+    begin(con, pr, "bool", n);
+    if n.v == 1 { put(con, " true"); } else { put(con, " false"); }
+  } else if k == E_STR {
+    begin(con, pr, "str", n);
+    put(con, " ");
+    if n.s <= n.e && n.e <= blen(p.src) {
+      put_str_hex(con, p.src, n.s, n.e);
+    }
+  } else if k == E_BLOB {
+    begin(con, pr, "blob", n);
+    put(con, " ");
+    put_num(con, n.v);
+  } else if k == E_MUTBORROW {
+    begin(con, pr, "mutborrow", n);
+    put(con, " ");
+    dump_names(con, p, n.a, ".");
+  } else if k == E_FIELD {
+    begin(con, pr, "field", n);
+    put(con, " ");
+    dump_expr(con, p, &mut m, pr, n.a);
+    put(con, " ");
+    name_of(con, p, n);
+  } else if k == E_SLIT {
+    begin(con, pr, "slit", n);
+    put(con, " ");
+    if inst != 0 { put_inst(con, p, m, inst); } else { name_of(con, p, n); }
+    let mut f = n.a;
+    while f != 0 {
+      let fi = node_at(p.nodes, f);
+      put(con, " (");
+      name_of(con, p, fi);
+      put(con, " ");
+      dump_expr(con, p, &mut m, pr, fi.a);
+      put(con, ")");
+      f = fi.next;
+    }
+  } else if k == E_VARIANT {
+    begin(con, pr, "variant", n);
+    put(con, " ");
+    if inst != 0 { put_inst(con, p, m, inst); } else { name_of(con, p, n); }
+    put(con, " ");
+    text(con, p, n.s2, n.e2);
+    if n.a != 0 {
+      put(con, " ");
+      dump_expr(con, p, &mut m, pr, n.a);
+    }
+  } else if k == E_IS {
+    begin(con, pr, "is", n);
+    put(con, " ");
+    dump_expr(con, p, &mut m, pr, n.a);
+    put(con, " ");
+    name_of(con, p, n);
+    put(con, " ");
+    text(con, p, n.s2, n.e2);
+  } else if k == E_VAR {
+    begin(con, pr, "var", n);
+    put(con, " ");
+    name_of(con, p, n);
+  } else if k == E_NOT {
+    begin(con, pr, "not", n);
+    put(con, " ");
+    dump_expr(con, p, &mut m, pr, n.a);
+  } else if k == E_BIN {
+    begin(con, pr, "bin", n);
+    put(con, " ");
+    op_text(con, n.v);
+    put(con, " ");
+    dump_expr(con, p, &mut m, pr, n.a);
+    put(con, " ");
+    dump_expr(con, p, &mut m, pr, n.b);
+  } else if k == E_CALL {
+    begin(con, pr, "call", n);
+    put(con, " ");
+    if inst != 0 { put_inst(con, p, m, inst); } else { name_of(con, p, n); }
+    dump_exprs(con, p, &mut m, pr, n.a);
+  } else if k == E_FORALL {
+    begin(con, pr, "forall", n);
+    put(con, " ");
+    name_of(con, p, n);
+    put(con, " ");
+    dump_expr(con, p, &mut m, pr, n.a);
+  } else if k == E_TAPP && !pr.raw && !is_typed_builtin(p, n.b) {
+    // Monomorphization renames the inner call, literal or variant to the
+    // instance and drops the type arguments.
+    let x = tapp_inst(&mut m, p, i, pr.env);
+    dump_named(con, p, &mut m, pr, n.b, x);
+    return;
+  } else if k == E_TAPP {
+    begin(con, pr, "tapp", n);
+    put(con, " [");
+    let mut t = n.a;
+    while t != 0 {
+      dump_type(con, p, &mut m, pr, t);
+      t = next_of(p, t);
+      if t != 0 {
+        put(con, " ");
+      }
+    }
+    put(con, "] ");
+    dump_expr(con, p, &mut m, pr, n.b);
+  }
+  put(con, ")");
+}
+
+fn dump_block(con: &Serial, p: &Parser, m: &mut Mono, pr: Pr, i: u64) {
+  put(con, "(block");
+  let mut k = i;
+  while k != 0 {
+    put(con, " ");
+    dump_stmt(con, p, &mut m, pr, k);
+    k = next_of(p, k);
+  }
+  put(con, ")");
+}
+
+fn dump_stmt(con: &Serial, p: &Parser, m: &mut Mono, pr: Pr, i: u64) {
+  let n = node_at(p.nodes, i);
+  let k = n.kind;
+  if k == S_LET {
+    begin(con, pr, "let", n);
+    put(con, " ");
+    if n.v == 1 { put(con, "mut "); }
+    name_of(con, p, n);
+    put(con, " ");
+    if n.a == 0 { put(con, "_"); } else { dump_type(con, p, &mut m, pr, n.a); }
+    put(con, " ");
+    dump_expr(con, p, &mut m, pr, n.b);
+  } else if k == S_ASSIGN {
+    begin(con, pr, "assign", n);
+    put(con, " ");
+    dump_names(con, p, n.a, ".");
+    put(con, " ");
+    dump_expr(con, p, &mut m, pr, n.b);
+  } else if k == S_IF {
+    begin(con, pr, "if", n);
+    put(con, " ");
+    dump_expr(con, p, &mut m, pr, n.a);
+    put(con, " ");
+    dump_block(con, p, &mut m, pr, n.b);
+    put(con, " ");
+    dump_block(con, p, &mut m, pr, n.c);
+  } else if k == S_WHILE {
+    begin(con, pr, "while", n);
+    put(con, " ");
+    dump_expr(con, p, &mut m, pr, n.a);
+    let mut v = n.b;
+    while v != 0 {
+      put(con, " (inv ");
+      dump_expr(con, p, &mut m, pr, v);
+      put(con, ")");
+      v = next_of(p, v);
+    }
+    put(con, " ");
+    dump_block(con, p, &mut m, pr, n.c);
+  } else if k == S_RETURN {
+    begin(con, pr, "return", n);
+    if n.a != 0 {
+      put(con, " ");
+      dump_expr(con, p, &mut m, pr, n.a);
+    }
+  } else if k == S_UNREACHABLE {
+    begin(con, pr, "unreachable", n);
+  } else if k == S_ASSERT {
+    begin(con, pr, "assert", n);
+    put(con, " ");
+    dump_expr(con, p, &mut m, pr, n.a);
+  } else if k == S_EXPR {
+    begin(con, pr, "expr", n);
+    put(con, " ");
+    dump_expr(con, p, &mut m, pr, n.a);
+  } else if k == S_MATCH {
+    begin(con, pr, "match", n);
+    put(con, " ");
+    dump_expr(con, p, &mut m, pr, n.a);
+    let mut a = n.b;
+    while a != 0 {
+      let arm = node_at(p.nodes, a);
+      put(con, " ");
+      begin(con, pr, "arm", arm);
+      put(con, " ");
+      if arm.v == PAT_WILD {
+        put(con, "_");
+      } else {
+        name_of(con, p, arm);
+        put(con, "::");
+        text(con, p, arm.s2, arm.e2);
+        if arm.v != PAT_VARIANT {
+          put(con, "(");
+          if arm.v == PAT_BIND_MUT { put(con, "mut "); }
+          name_of(con, p, node_at(p.nodes, arm.a));
+          put(con, ")");
+        }
+      }
+      put(con, " ");
+      dump_block(con, p, &mut m, pr, arm.c);
+      put(con, ")");
+      a = arm.next;
+    }
+  }
+  put(con, ")");
+}
+
+fn dump_tparams(con: &Serial, p: &Parser, m: &mut Mono, pr: Pr, i: u64) {
+  put(con, " [");
+  dump_names(con, p, i, " ");
+  put(con, "]");
+}
+
+fn dump_params(con: &Serial, p: &Parser, m: &mut Mono, pr: Pr, i: u64) {
+  put(con, " (params");
+  let mut k = i;
+  while k != 0 {
+    let n = node_at(p.nodes, k);
+    put(con, " ");
+    begin(con, pr, "p", n);
+    put(con, " ");
+    if n.v == 1 { put(con, "mut "); }
+    name_of(con, p, n);
+    put(con, " ");
+    dump_type(con, p, &mut m, pr, n.a);
+    put(con, ")");
+    k = n.next;
+  }
+  put(con, ")");
+}
+
+/// The program as parsed (`--dump-ast`).
+fn dump_program(con: &Serial, p: &Parser, m: &mut Mono, pr: Pr) {
+  let mut k = p.structs.head;
+  while k != 0 {
+    let n = node_at(p.nodes, k);
+    begin(con, pr, "struct", n);
+    put(con, " ");
+    name_of(con, p, n);
+    dump_tparams(con, p, &mut m, pr, n.v);
+    let mut f = n.a;
+    while f != 0 {
+      let fd = node_at(p.nodes, f);
+      put(con, " (");
+      name_of(con, p, fd);
+      put(con, " ");
+      dump_type(con, p, &mut m, pr, fd.a);
+      put(con, ")");
+      f = fd.next;
+    }
+    put(con, ")\n");
+    k = n.next;
+  }
+  k = p.enums.head;
+  while k != 0 {
+    let n = node_at(p.nodes, k);
+    begin(con, pr, "enum", n);
+    put(con, " ");
+    name_of(con, p, n);
+    dump_tparams(con, p, &mut m, pr, n.v);
+    let mut v = n.a;
+    while v != 0 {
+      let vd = node_at(p.nodes, v);
+      put(con, " (");
+      name_of(con, p, vd);
+      if vd.a != 0 {
+        put(con, " ");
+        dump_type(con, p, &mut m, pr, vd.a);
+      }
+      put(con, ")");
+      v = vd.next;
+    }
+    put(con, ")\n");
+    k = n.next;
+  }
+  k = p.specs.head;
+  while k != 0 {
+    let n = node_at(p.nodes, k);
+    begin(con, pr, "spec", n);
+    put(con, " ");
+    name_of(con, p, n);
+    dump_params(con, p, &mut m, pr, n.a);
+    put(con, " ");
+    dump_type(con, p, &mut m, pr, n.b);
+    put(con, " ");
+    dump_expr(con, p, &mut m, pr, n.c);
+    put(con, ")\n");
+    k = n.next;
+  }
+  k = p.fns.head;
+  while k != 0 {
+    let n = node_at(p.nodes, k);
+    begin(con, pr, "fn", n);
+    put(con, " ");
+    name_of(con, p, n);
+    dump_tparams(con, p, &mut m, pr, n.v);
+    dump_params(con, p, &mut m, pr, n.a);
+    put(con, " ");
+    dump_type(con, p, &mut m, pr, n.b);
+    let mut r = n.c;
+    while r != 0 {
+      put(con, " (requires ");
+      dump_expr(con, p, &mut m, pr, r);
+      put(con, ")");
+      r = next_of(p, r);
+    }
+    let mut e = n.d;
+    while e != 0 {
+      put(con, " (ensures ");
+      dump_expr(con, p, &mut m, pr, e);
+      put(con, ")");
+      e = next_of(p, e);
+    }
+    put(con, " ");
+    dump_block(con, p, &mut m, pr, n.x);
+    put(con, ")\n");
+    k = n.next;
+  }
+}
+
+/// One struct or enum instance's line.
+fn dump_typedef(con: &Serial, p: &Parser, m: &mut Mono, x: u64) {
+  let xi = inst_at(m, x);
+  let n = node_at(p.nodes, xi.def);
+  let pr = Pr { raw: false, env: x };
+  if n.kind == D_STRUCT {
+    begin(con, pr, "struct", n);
+  } else {
+    begin(con, pr, "enum", n);
+  }
+  put(con, " ");
+  put_inst(con, p, m, x);
+  put(con, " []");
+  let mut f = n.a;
+  while f != 0 {
+    let fd = node_at(p.nodes, f);
+    put(con, " (");
+    name_of(con, p, fd);
+    if fd.a != 0 {
+      put(con, " ");
+      dump_type(con, p, &mut m, pr, fd.a);
+    }
+    put(con, ")");
+    f = fd.next;
+  }
+  put(con, ")\n");
+}
+
+/// The program after monomorphization (`--dump-mono`).
+fn dump_mono(con: &Serial, p: &Parser, m: &mut Mono) {
+  let mut k = 0;
+  while k < vec_len(m.structs) {
+    dump_typedef(con, p, &mut m, vec_get(m.structs, k));
+    k = k + 1;
+  }
+  k = 0;
+  while k < vec_len(m.enums) {
+    dump_typedef(con, p, &mut m, vec_get(m.enums, k));
+    k = k + 1;
+  }
+  let none = Pr { raw: false, env: 0 };
+  let mut s = p.specs.head;
+  while s != 0 {
+    let n = node_at(p.nodes, s);
+    begin(con, none, "spec", n);
+    put(con, " ");
+    name_of(con, p, n);
+    dump_params(con, p, &mut m, none, n.a);
+    put(con, " ");
+    dump_type(con, p, &mut m, none, n.b);
+    put(con, " ");
+    dump_expr(con, p, &mut m, none, n.c);
+    put(con, ")\n");
+    s = n.next;
+  }
+  k = 0;
+  while k < vec_len(m.fns) {
+    let x = vec_get(m.fns, k);
+    let xi = inst_at(m, x);
+    let n = node_at(p.nodes, xi.def);
+    let pr = Pr { raw: false, env: x };
+    begin(con, pr, "fn", n);
+    put(con, " ");
+    put_inst(con, p, m, x);
+    put(con, " []");
+    dump_params(con, p, &mut m, pr, n.a);
+    put(con, " ");
+    dump_type(con, p, &mut m, pr, n.b);
+    let mut r = n.c;
+    while r != 0 {
+      put(con, " (requires ");
+      dump_expr(con, p, &mut m, pr, r);
+      put(con, ")");
+      r = next_of(p, r);
+    }
+    let mut e = n.d;
+    while e != 0 {
+      put(con, " (ensures ");
+      dump_expr(con, p, &mut m, pr, e);
+      put(con, ")");
+      e = next_of(p, e);
+    }
+    put(con, " ");
+    dump_block(con, p, &mut m, pr, n.x);
+    put(con, ")\n");
+    k = k + 1;
+  }
+}
+
+fn put_error(con: &Serial, line: u64, col: u64) {
+  put(con, "error ");
+  put_pos(con, line, col);
+  put(con, "\n");
+}
+

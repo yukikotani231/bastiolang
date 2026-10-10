@@ -1,0 +1,319 @@
+// Loading a whole program: a file and, through its leading `import "path";`
+// lines, every file it pulls in, as stage0's `Loader` does (stage0/src/main.rs).
+//
+// Each imported file is loaded, with its own imports, before the rest of
+// the importing file is parsed, so constants it defines can be used there.
+// A file is loaded once however often it is imported; a cycle is an error.
+// All files share one source buffer (`Parser.src`), each appended as it is
+// read, so a node's text range means the same thing whichever file it is
+// in; `Node.file` says which file, by index in load order.
+//
+// Files are told apart by their path with `.` and `..` resolved as text.
+// stage0 asks the operating system instead (`canonicalize`), so the two
+// differ only for a file reached through two different symbolic links.
+import "files.bastio";
+
+const CODE_PARSE: u64 = 0;
+const CODE_IMPORT: u64 = 1;
+
+/// A file loaded or being loaded: its normalized path (in `Loader.paths`).
+struct Loaded { start: u64, len: u64, done: bool }
+
+struct Loader {
+  paths: Vec[u64],
+  files: Vec[Loaded]
+}
+
+fn loader_new() -> Loader {
+  return Loader { paths: vec_new[u64](), files: vec_new[Loaded]() };
+}
+
+fn loader_free(ld: Loader) {
+  vec_free(ld.paths);
+  vec_free(ld.files);
+}
+
+/// Records an error, replacing any recorded already.
+fn force_fail(p: &mut Parser, file: u64, line: u64, col: u64, code: u64) {
+  p.failed = true;
+  p.efile = file;
+  p.eline = line;
+  p.ecol = col;
+  p.ecode = code;
+}
+
+/// `path` with empty and `.` parts dropped and `..` taken back where it can
+/// be, as text.
+fn normalize(path: &Bytes) -> Bytes {
+  let n = blen(path);
+  if n > SRC_MAX {
+    return balloc(0);
+  }
+  // The kept parts, as (start, end) pairs.
+  let mut parts = vec_new[u64]();
+  let mut i = 0;
+  while i < n
+    invariant i <= n + 1 && n == blen(path) && n <= SRC_MAX
+  {
+    let mut j = i;
+    while j < n && bget(path, j) != 47
+      invariant i <= j && j <= n && n == blen(path)
+    {
+      j = j + 1;
+    }
+    let plen = j - i;
+    let dot = plen == 1 && bget(path, i) == 46;
+    let dotdot = plen == 2 && bget(path, i) == 46 && bget(path, i + 1) == 46;
+    if dotdot && vec_len(parts) >= 2 && !last_is_dotdot(path, parts) {
+      vec_pop(&mut parts);
+      vec_pop(&mut parts);
+    } else if dotdot && vec_len(parts) == 0 && bget(path, 0) == 47 {
+      // `/..` is `/`.
+    } else if plen > 0 && !dot {
+      vec_push(&mut parts, i);
+      vec_push(&mut parts, j);
+    }
+    i = j + 1;
+  }
+  // Measure, then copy.
+  let abs = n > 0 && bget(path, 0) == 47;
+  let mut total = 0;
+  if abs {
+    total = 1;
+  }
+  let mut k = 0;
+  while k + 1 < vec_len(parts) && total <= SRC_MAX
+    invariant k <= vlen(parts) && total <= SRC_MAX + SRC_MAX + 1
+  {
+    let s = vec_get(parts, k);
+    let e = vec_get(parts, k + 1);
+    if s <= e && e <= n {
+      total = total + (e - s) + 1;
+    }
+    k = k + 2;
+  }
+  if total > SRC_MAX {
+    vec_free(parts);
+    return balloc(0);
+  }
+  let mut out = balloc(total);
+  let mut w = 0;
+  if abs && total > 0 {
+    bset(&mut out, 0, 47);
+    w = 1;
+  }
+  k = 0;
+  while k + 1 < vec_len(parts)
+    invariant k <= vlen(parts) && blen(out) == total && w <= total
+  {
+    let s = vec_get(parts, k);
+    let e = vec_get(parts, k + 1);
+    if k > 0 && w < total {
+      bset(&mut out, w, 47);
+      w = w + 1;
+    }
+    let mut c = s;
+    while c < e && c < n && w < total
+      invariant w <= total && blen(out) == total && n == blen(path)
+    {
+      bset(&mut out, w, bget(path, c));
+      w = w + 1;
+      c = c + 1;
+    }
+    k = k + 2;
+  }
+  vec_free(parts);
+  return out;
+}
+
+/// Is the last kept part `..`?
+fn last_is_dotdot(path: &Bytes, parts: &Vec[u64]) -> bool {
+  let k = vec_len(parts);
+  if k < 2 {
+    return false;
+  }
+  let s = vec_get(parts, k - 2);
+  let e = vec_get(parts, k - 1);
+  return s < e && e - s == 2 && e <= blen(path) && bget(path, s) == 46 && bget(path, s + 1) == 46;
+}
+
+/// The file whose normalized path is `canon`: its index + 1, or 0.
+fn find_file(ld: &Loader, canon: &Bytes) -> u64
+  ensures result <= vlen(ld.files)
+{
+  let mut k = 0;
+  while k < vec_len(ld.files)
+    invariant k <= vlen(ld.files)
+  {
+    let f = vec_get(ld.files, k);
+    if f.len == blen(canon) && pool_equals(ld.paths, f.start, canon) {
+      return k + 1;
+    }
+    k = k + 1;
+  }
+  return 0;
+}
+
+/// Does `pool[start..]` begin with the bytes of `b`?
+fn pool_equals(pool: &Vec[u64], start: u64, b: &Bytes) -> bool {
+  let mut i = 0;
+  while i < blen(b)
+    invariant i <= blen(b)
+  {
+    if start >= SRC_MAX || start + i >= vec_len(pool) || vec_get(pool, start + i) != bget(b, i) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+/// Records a file as being loaded; returns its index.
+fn add_file(ld: &mut Loader, canon: &Bytes) -> u64 {
+  let start = vec_len(ld.paths);
+  let mut i = 0;
+  while i < blen(canon)
+    invariant i <= blen(canon)
+  {
+    vec_push(&mut ld.paths, bget(canon, i));
+    i = i + 1;
+  }
+  let k = vec_len(ld.files);
+  vec_push(&mut ld.files, Loaded { start: start, len: blen(canon), done: false });
+  return k;
+}
+
+fn finish_file(ld: &mut Loader, k: u64) {
+  if k < vec_len(ld.files) {
+    let mut f = vec_get(ld.files, k);
+    f.done = true;
+    vec_set(&mut ld.files, k, f);
+  }
+}
+
+/// `a` followed by `b`.
+fn concat(a: &Bytes, b: &Bytes) -> Bytes {
+  let x = blen(a);
+  let y = blen(b);
+  if x > SRC_MAX || y > SRC_MAX {
+    return balloc(0);
+  }
+  let mut out = balloc(x + y);
+  let mut i = 0;
+  while i < x
+    invariant i <= x && x == blen(a) && blen(out) == x + y
+  {
+    bset(&mut out, i, bget(a, i));
+    i = i + 1;
+  }
+  i = 0;
+  while i < y
+    invariant i <= y && y == blen(b) && blen(out) == x + y
+  {
+    bset(&mut out, x + i, bget(b, i));
+    i = i + 1;
+  }
+  return out;
+}
+
+/// Loads the file at `path` into `p`. `has_from` says whether an import
+/// names it, at `file:line:col` (otherwise it is on the command line).
+/// Returns 0 on success, 1 after recording an error in `p`, and 2 when a
+/// file on the command line cannot be read (nothing is recorded).
+fn load(host: &Host, p: &mut Parser, ld: &mut Loader, path: &Bytes, file: u64, line: u64, col: u64, has_from: bool) -> u64 {
+  let mut data = balloc(0);
+  let ok = host_read(host, path, &mut data);
+  if !ok || blen(data) + 0 > SRC_MAX || blen(p.src) > SRC_MAX - blen(data) {
+    bfree(data);
+    if has_from {
+      force_fail(&mut p, file, line, col, CODE_IMPORT);   // cannot read
+      return 1;
+    }
+    return 2;
+  }
+  let canon = normalize(path);
+  let seen = find_file(ld, canon);
+  if seen != 0 {
+    let f = vec_get(ld.files, seen - 1);
+    bfree(canon);
+    bfree(data);
+    if f.done {
+      return 0;
+    }
+    force_fail(&mut p, file, line, col, CODE_IMPORT);     // an import cycle
+    return 1;
+  }
+  let k = add_file(&mut ld, canon);
+  bfree(canon);
+  let start = blen(p.src);
+  let before = p.src;
+  p.src = concat(before, data);
+  bfree(before);
+  bfree(data);
+  let dir = parent(path);
+  let mut toks = vec_new[Tok]();
+  let mut status = 0;
+  if blen(p.src) > SRC_MAX {
+    force_fail(&mut p, k, 1, 1, CODE_PARSE);
+    status = 1;
+  } else {
+    let last = lex(p.src, start, &mut toks);
+    if last.kind == K_ERROR {
+      force_fail(&mut p, k, last.line, last.col, CODE_PARSE);
+      status = 1;
+    }
+  }
+  // Leading `import "path";` lines.
+  let mut i = 0;
+  while status == 0 && is_kw(tok_at(toks, i), KW_IMPORT) && i < SRC_MAX
+    invariant i <= SRC_MAX + 2
+  {
+    let t = tok_at(toks, i);
+    let name = tok_at(toks, i + 1);
+    let semi = tok_at(toks, i + 2);
+    if name.kind != K_STR {
+      force_fail(&mut p, k, name.line, name.col, CODE_PARSE);
+      status = 1;
+    } else if !is_p(semi, P_SEMI) {
+      force_fail(&mut p, k, semi.line, semi.col, CODE_PARSE);
+      status = 1;
+    } else if name.start <= name.end && name.end <= blen(p.src) {
+      let rel = decode(p.src, name.start, name.end);
+      let full = join(dir, rel);
+      status = load(host, &mut p, &mut ld, full, k, t.line, t.col, true);
+      bfree(full);
+      bfree(rel);
+      i = i + 3;
+    } else {
+      status = 1;
+    }
+  }
+  if status != 0 {
+    vec_free(toks);
+    bfree(dir);
+    return status;
+  }
+  // The rest of the file.
+  p.file = k;
+  let prev = p.toks;
+  p.toks = toks;
+  p.i = i;
+  let first_blob = vec_len(p.blobs);
+  program(&mut p);
+  let mine = p.toks;
+  p.toks = prev;
+  vec_free(mine);
+  // stage0 reads each `include_bytes` file as it parses, so a failed read
+  // comes before any parse error later in the file.
+  let bad = read_blobs(host, &mut p, dir, first_blob);
+  bfree(dir);
+  if bad != 0 {
+    let n = node_at(p.nodes, bad);
+    force_fail(&mut p, k, n.line, n.col, CODE_PARSE);
+  }
+  if p.failed {
+    return 1;
+  }
+  finish_file(&mut ld, k);
+  return 0;
+}

@@ -12,6 +12,10 @@
 //               a lexical error prints `error line:col` and exits 1
 //   --dump-ast  print the parse of one file (see `dump.rs`) and exit; an
 //               error prints `error line:col` and exits 1
+//   --dump-mono print the whole program (imports followed) after
+//               monomorphization, in the `--dump-ast` format with positions
+//               as `file:line:col`, and exit; an error prints
+//               `error file:line:col CODE` and exits 1
 //   --trusted-base  list and count the hand-written trusted base, then exit
 //   --target    `hosted` (default): a normal program on the C library
 //               `kernel`: freestanding C for a bare-metal x86-64 kernel (implies --emit-c)
@@ -113,6 +117,7 @@ fn main() {
     let mut dump_smt = false;
     let mut dump_tokens = false;
     let mut dump_ast = false;
+    let mut dump_mono = false;
     let mut target = codegen::Target::Hosted;
     let mut out: Option<String> = None;
     let mut inputs: Vec<String> = Vec::new();
@@ -124,6 +129,7 @@ fn main() {
             "--dump-smt" => dump_smt = true,
             "--dump-tokens" => dump_tokens = true,
             "--dump-ast" => dump_ast = true,
+            "--dump-mono" => dump_mono = true,
             "--trusted-base" => {
                 print!("{}", codegen::trusted_base());
                 return;
@@ -209,9 +215,11 @@ fn main() {
         prog: ast::Program { fns: Vec::new(), specs: Vec::new(), structs: Vec::new(), enums: Vec::new() },
         consts: HashMap::new(),
     };
+    let short = |d: &diag::Diag| println!("error {}:{}:{} {}", d.pos.file, d.pos.line, d.pos.col, d.code);
     for input in &inputs {
         if let Err(d) = ld.load(Path::new(input), None) {
             match d {
+                Some(d) if dump_mono => short(&d),
                 Some(d) => eprint!("{}", d.render(&ld.files)),
                 None => {}
             }
@@ -219,6 +227,15 @@ fn main() {
         }
     }
     let Loader { files, mut prog, .. } = ld;
+    if dump_mono {
+        if let Err(d) = mono::monomorphize(&mut prog) {
+            short(&d);
+            exit(1);
+        }
+        dump::WITH_FILE.store(true, std::sync::atomic::Ordering::Relaxed);
+        print!("{}", dump::program(&prog));
+        return;
+    }
 
     let fail = |d: diag::Diag| -> ! {
         eprint!("{}", d.render(&files));

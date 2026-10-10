@@ -21,9 +21,10 @@ struct Mono {
     structs: HashMap<String, StructDef>,
     enums: HashMap<String, EnumDef>,
     fns: HashMap<String, FnDef>,
-    /// Instances already requested, by name.
-    seen: HashSet<String>,
-    queue: VecDeque<(String, Vec<Type>, String)>,
+    /// Instances already requested, by kind (`type` or `function`) and
+    /// name. A generic function may share its name with a generic type.
+    seen: HashSet<(&'static str, String)>,
+    queue: VecDeque<(&'static str, String, Vec<Type>, String)>,
 }
 
 pub fn monomorphize(p: &mut Program) -> Result<(), Diag> {
@@ -82,13 +83,25 @@ pub fn monomorphize(p: &mut Program) -> Result<(), Diag> {
         m.expr(&mut sf.body, &none)?;
     }
     let mut count = 0;
-    while let Some((generic, args, inst)) = m.queue.pop_front() {
+    while let Some((what, generic, args, inst)) = m.queue.pop_front() {
         count += 1;
         if count > MAX_INSTANCES {
-            let pos = m.structs.get(&generic).map(|d| d.pos).or(m.enums.get(&generic).map(|d| d.pos)).or(m.fns.get(&generic).map(|f| f.pos)).unwrap_or_default();
+            let pos = if what == "function" {
+                m.fns.get(&generic).map(|f| f.pos)
+            } else {
+                m.structs.get(&generic).map(|d| d.pos).or(m.enums.get(&generic).map(|d| d.pos))
+            };
+            let pos = pos.unwrap_or_default();
             return Err(Diag::new("E-TYPE", pos, format!("more than {} generic instances (is `{}` instantiating itself with growing arguments?)", MAX_INSTANCES, generic)));
         }
-        if let Some(d) = m.structs.get(&generic).cloned() {
+        if what == "function" {
+            let mut f = m.fns[&generic].clone();
+            let s = subst_map(&f.tparams, &args);
+            f.name = inst;
+            f.tparams = Vec::new();
+            m.fn_def(&mut f, &s)?;
+            p.fns.push(f);
+        } else if let Some(d) = m.structs.get(&generic).cloned() {
             let s = subst_map(&d.tparams, &args);
             let mut fields = Vec::new();
             for (f, t) in &d.fields {
@@ -105,13 +118,6 @@ pub fn monomorphize(p: &mut Program) -> Result<(), Diag> {
                 }));
             }
             p.enums.push(EnumDef { name: inst, tparams: Vec::new(), variants, pos: d.pos });
-        } else {
-            let mut f = m.fns[&generic].clone();
-            let s = subst_map(&f.tparams, &args);
-            f.name = inst;
-            f.tparams = Vec::new();
-            m.fn_def(&mut f, &s)?;
-            p.fns.push(f);
         }
     }
     Ok(())
@@ -123,13 +129,13 @@ fn subst_map(params: &[String], args: &[Type]) -> HashMap<String, Type> {
 
 impl Mono {
     /// The instance `name[args]` of a generic definition, requested once.
-    fn instance(&mut self, name: &str, args: Vec<Type>, arity: usize, what: &str, pos: Pos) -> Result<String, Diag> {
+    fn instance(&mut self, name: &str, args: Vec<Type>, arity: usize, what: &'static str, pos: Pos) -> Result<String, Diag> {
         if args.len() != arity {
             return Err(Diag::new("E-TYPE", pos, format!("{} `{}` takes {} type argument(s), {} given", what, name, arity, args.len())));
         }
         let inst = Type::Generic(name.to_string(), args.clone()).name();
-        if self.seen.insert(inst.clone()) {
-            self.queue.push_back((name.to_string(), args, inst.clone()));
+        if self.seen.insert((what, inst.clone())) {
+            self.queue.push_back((what, name.to_string(), args, inst.clone()));
         }
         Ok(inst)
     }
