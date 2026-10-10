@@ -35,10 +35,10 @@ A bug is a compile error with a counterexample. Leave out the check of the
 fourth symbol in the main loop, and:
 
 ```
-base64.bastio:133:5: error[E-VERIFY-BYTE]: could not prove that `((s2 % 4) * 64) + s3` fits in a byte (`<= 255`)
+base64.bastio:139:39: error[E-VERIFY-OVERFLOW]: could not prove that `(s2 % 4) * 64 + s3` does not overflow u8
   |     bset(&mut out, o + 2, s2 % 4 * 64 + s3);
-  |     ^
-  = counterexample: i = 0, n = 8, o = 0, len(out) = 6, pad = 0, s0 = 63, s1 = 63, s2 = 3, s3 = 64, len(src) = 8
+  |                                       ^
+  = counterexample: ..., s0 = 63, s1 = 63, s2 = 3, s3 = 64, ...
 ```
 
 **Not proved:** that decoding is the inverse of encoding, or that the decoder
