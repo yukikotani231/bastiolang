@@ -23,7 +23,7 @@ Design consequences:
 
 1. The language never gains a way to read or write memory through a raw integer address. All hardware access goes through capability types.
 2. Proofs, capabilities and specifications are ghost and leave nothing in the generated code (zero overhead).
-3. The trusted base (assembly, built-in primitives, the runtime prelude) is listed and counted mechanically. Growth gets reviewed.
+3. The trusted base (assembly, built-in primitives, the runtime prelude) is listed and counted mechanically. Growth gets reviewed. [docs/trusted-base.md](docs/trusted-base.md) explains each part.
 4. Every new feature comes with examples in both `tests/pass` and `tests/fail`: what should be rejected is shown to be rejected.
 5. Performance is measured, not assumed (see "Performance"). A change that makes generated code, the compiler or the kernel measurably slower says so in its PR, with numbers.
 
