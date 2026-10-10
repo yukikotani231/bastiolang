@@ -1,0 +1,44 @@
+// expect-exit: 12
+// A lock guards a buffer and an index into it. The struct invariant says the
+// index is in bounds; `locked` assumes it when the lock is taken and proves it
+// again before the lock is released. A function the lock calls sees only its
+// own precondition, so it states what it needs (here, through a spec fn).
+struct Ring { buf: Buf, at: u64 } invariant at < len(buf) invariant len(buf) == 4;
+
+spec fn ring_ok(r: &Ring) -> bool { r.at < len(r.buf) && len(r.buf) == 4 }
+
+fn bump(r: &mut Ring, by: u64) -> u64
+  requires ring_ok(r) && by < 10
+  ensures ring_ok(r) && result < 1000
+{
+  let x = get(r.buf, r.at);
+  if x <= 1000 {
+    r.buf = set(r.buf, r.at, x + by);
+  }
+  r.at = (r.at + 1) % 4;
+  return x % 1000;
+}
+
+fn read_all(r: &mut Ring) -> u64
+  requires ring_ok(r)
+  ensures ring_ok(r)
+{
+  return get(r.buf, 0) % 100 + get(r.buf, 1) % 100;
+}
+
+fn work(l: &Lock[Ring]) -> u64 ensures result < 2000 {
+  let a = locked(l, bump, 5);
+  let b = locked(l, bump, 7);
+  return a + b;
+}
+
+fn main() -> u64 {
+  let l = lock_new(Ring { buf: alloc(4), at: 0 });
+  let z = work(l);
+  assert z < 2000;
+  let s = locked(l, read_all);
+  let r = lock_end(l);
+  assert r.at < 4;
+  free(r.buf);
+  return s;
+}

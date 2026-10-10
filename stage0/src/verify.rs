@@ -52,6 +52,7 @@ use crate::check::is_builtin;
 use crate::diag::{Diag, Pos};
 use crate::smt::{SatResult, Solver};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const U64_MAX: &str = "18446744073709551615";
 /// Largest element count `alloc` accepts (2^60): keeps `n * 8` far from overflow.
@@ -247,6 +248,25 @@ fn opaque_boxes(v: &Val, ty: &Type) -> Val {
     }
 }
 
+/// The type of a value, for `lock_new`. A `Bytes` reads as `Buf`: the
+/// lock then forgets that every byte is <= 255, which loses facts but never
+/// assumes a false one.
+fn val_type(v: &Val) -> Type {
+    match v {
+        Val::U(_) => Type::U64,
+        Val::B(_) => Type::Bool,
+        Val::Buf { .. } => Type::Buf,
+        Val::Str { .. } => Type::Str,
+        Val::Obj(t, _) => t.clone(),
+        Val::Struct(n, _) => Type::Struct(n.clone()),
+        Val::Enum(n, _, _) => Type::Enum(n.clone()),
+        Val::Box(BoxVal::Known(i)) => Type::Box(Box::new(val_type(i))),
+        Val::Box(BoxVal::Opaque(t)) => Type::Box(Box::new(t.clone())),
+        Val::Vec { elem, .. } => Type::Vec(Box::new(elem.clone())),
+        Val::Unit => Type::Unit,
+    }
+}
+
 impl Val {
     fn term(&self) -> &str {
         match self {
@@ -382,7 +402,7 @@ pub struct Verifier<'p> {
     /// The integer type of each arithmetic operator in the function being
     /// verified (`FnDef::int_ops`).
     int_ops: HashMap<Pos, Type>,
-    sums: Summaries,
+    sums: &'p Summaries,
 }
 
 fn sanitize(n: &str) -> String {
@@ -433,30 +453,107 @@ fn ite(c: &str, a: &str, b: &str) -> String {
     if a == b { a.to_string() } else { format!("(ite {} {} {})", c, a, b) }
 }
 
-pub fn verify_program(p: &Program) -> Result<(usize, Vec<String>), Diag> {
-    let solver = Solver::start().map_err(|e| Diag::new("E-SOLVER", Pos::default(), e))?;
-    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, sums: summarize(p), int_ops: HashMap::new() };
-    v.smt(&format!("(declare-const {} Int)", POOLSIZE))?;
-    v.smt(&format!("(assert (and (<= 0 {p}) (<= {p} {})))", FRAME_LIMIT, p = POOLSIZE))?;
+pub fn verify_program(p: &Program, one_session: bool) -> Result<(usize, Vec<String>), Diag> {
     // Each function gets its own solver scope: what is declared and assumed
     // while verifying one (some of it quantified, such as "every byte of a
     // Bytes is <= 255") must not burden the queries for all later ones.
-    // BASTIO_TIME=1 prints the time each function took.
-    let timed = std::env::var("BASTIO_TIME").is_ok();
-    for f in &p.fns {
-        let t0 = std::time::Instant::now();
-        if f.export {
-            buffers_kept(f, &v.sums)?;
-        }
-        v.smt("(push 1)")?;
-        v.verify_fn(f).map_err(|d| crate::check::in_copy(d, &f.name))?;
-        v.smt("(pop 1)")?;
-        if timed {
-            eprintln!("{:8.1} ms {}", t0.elapsed().as_secs_f64() * 1000.0, f.name);
+    // Because the scopes are independent, the functions are shared out
+    // among several solvers running at once (BASTIO_JOBS, default: the
+    // number of CPUs, at most 8). The error reported is the one sequential
+    // verification would report: that of the first failing function in
+    // program order. BASTIO_TIME=1 prints the time each function took.
+    // `one_session` (for --dump-smt, which stage1/difftest.sh compares with
+    // stage1's verifier) keeps everything on one solver, in program order.
+    let sums = summarize(p);
+    let n = p.fns.len();
+    let jobs = std::env::var("BASTIO_JOBS")
+        .ok()
+        .and_then(|j| j.parse::<usize>().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |c| c.get()).min(8))
+        .clamp(1, if one_session { 1 } else { n.max(1) });
+    let next = AtomicUsize::new(0);
+    // The lowest index of a function that failed so far: no worker starts
+    // a function after it, since its result could not be reported anyway.
+    let failed = AtomicUsize::new(usize::MAX);
+    let workers: Vec<Worker> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..jobs).map(|_| s.spawn(|| verify_worker(p, &sums, &next, &failed))).collect();
+        hs.into_iter().map(|h| h.join().expect("a verifier thread panicked")).collect()
+    });
+    let mut obligations = 0;
+    let mut log = Vec::new();
+    let mut times = Vec::new();
+    let mut err: Option<(usize, Diag)> = None;
+    for w in workers {
+        obligations += w.obligations;
+        log.extend(w.log);
+        times.extend(w.times);
+        if let Some((i, d)) = w.err {
+            if err.as_ref().map_or(true, |(j, _)| i < *j) {
+                err = Some((i, d));
+            }
         }
     }
-    let log = std::mem::take(&mut v.solver.log);
-    Ok((v.obligations, log))
+    if let Some((_, d)) = err {
+        return Err(d);
+    }
+    if std::env::var("BASTIO_TIME").is_ok() {
+        times.sort_by_key(|(i, _)| *i);
+        for (i, ms) in times {
+            eprintln!("{:8.1} ms {}", ms, p.fns[i].name);
+        }
+    }
+    Ok((obligations, log))
+}
+
+/// What one solver did: its obligation count, its session (for
+/// `--dump-smt`, which uses a single worker), the
+/// time per function, and the first function it could not verify.
+struct Worker {
+    obligations: usize,
+    log: Vec<String>,
+    times: Vec<(usize, f64)>,
+    err: Option<(usize, Diag)>,
+}
+
+/// Verifies functions, taking the next unverified index each time, on a
+/// solver of its own.
+fn verify_worker(p: &Program, sums: &Summaries, next: &AtomicUsize, failed: &AtomicUsize) -> Worker {
+    let mut w = Worker { obligations: 0, log: Vec::new(), times: Vec::new(), err: None };
+    let solver = match Solver::start() {
+        Ok(s) => s,
+        Err(e) => {
+            w.err = Some((0, Diag::new("E-SOLVER", Pos::default(), e)));
+            return w;
+        }
+    };
+    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, int_ops: HashMap::new(), sums };
+    let mut run = || -> Result<(), (usize, Diag)> {
+        v.smt(&format!("(declare-const {} Int)", POOLSIZE)).map_err(|d| (0, d))?;
+        v.smt(&format!("(assert (and (<= 0 {p}) (<= {p} {})))", FRAME_LIMIT, p = POOLSIZE)).map_err(|d| (0, d))?;
+        loop {
+            let i = next.fetch_add(1, Ordering::SeqCst);
+            if i >= p.fns.len() || i > failed.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            let f = &p.fns[i];
+            let t0 = std::time::Instant::now();
+            let kept = if f.export { buffers_kept(f, sums) } else { Ok(()) };
+            let r = kept
+                .and_then(|_| v.smt("(push 1)"))
+                .and_then(|_| v.verify_fn(f).map_err(|d| crate::check::in_copy(d, &f.name)))
+                .and_then(|_| v.smt("(pop 1)"));
+            if let Err(d) = r {
+                failed.fetch_min(i, Ordering::SeqCst);
+                return Err((i, d));
+            }
+            w.times.push((i, t0.elapsed().as_secs_f64() * 1000.0));
+        }
+    };
+    let r = run();
+    w.err = r.err();
+    w.obligations = v.obligations;
+    w.log = std::mem::take(&mut v.solver.log);
+    w
 }
 
 /// A `&mut Bytes` that C lends to an `export fn` is the caller's memory:
@@ -900,8 +997,8 @@ impl<'p> Verifier<'p> {
                 }
                 // 2. havoc what the body (or the condition) changes
                 let mut changed = HashMap::new();
-                changed_vars(body, &mut changed, &self.sums);
-                changed_in_expr(cond, &mut changed, &self.sums);
+                changed_vars(body, &mut changed, self.sums);
+                changed_in_expr(cond, &mut changed, self.sums);
                 let mut lst = st.clone();
                 // Enclosing places first, so a field's own havoc lands inside its struct's.
                 let mut changed: Vec<(String, bool)> = changed.into_iter().collect();
@@ -1197,6 +1294,12 @@ impl<'p> Verifier<'p> {
     }
 
     fn call(&mut self, name: &str, args: &[Expr], pos: Pos, st: &mut State) -> Result<Val, Diag> {
+        if name == "locked" {
+            return self.locked(args, pos, st);
+        }
+        if name == "smp_run" {
+            return self.smp_run(args, pos, st);
+        }
         for a in args {
             if let Some(p) = match &a.kind {
                 ExprKind::MutBorrow(n) => Some(n.clone()),
@@ -1269,6 +1372,84 @@ impl<'p> Verifier<'p> {
         Ok(res)
     }
 
+    /// The facts a value's struct invariants state, with how to name each
+    /// one in a message. Structs held directly as fields count too; ones
+    /// behind a box, in a vector or in an enum payload do not (yet).
+    fn invariant_terms(&mut self, v: &Val, out: &mut Vec<(String, String)>) -> Result<(), Diag> {
+        if let Val::Struct(n, fs) = v {
+            let d = struct_def(n).unwrap();
+            let env: HashMap<String, Val> = d.fields.iter().map(|(f, _)| f.clone()).zip(fs.iter().cloned()).collect();
+            for i in &d.invariants {
+                let t = self.spec(i, Scope { env: &env, old: None, result: None }, &mut Vec::new())?;
+                out.push((format!("`{}` of {}", render(i), n), t));
+            }
+            for f in fs {
+                self.invariant_terms(f, out)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn invariants_of(&mut self, v: &Val) -> Result<Vec<(String, String)>, Diag> {
+        let mut out = Vec::new();
+        self.invariant_terms(v, &mut out)?;
+        Ok(out)
+    }
+
+    /// `locked(l, f, args..)`: the contents are a fresh value about which
+    /// only the invariants are known (another processor may have changed
+    /// them since this one last looked). `f` gets them as its `&mut` first
+    /// argument and must hand them back with the invariants holding again.
+    fn locked(&mut self, args: &[Expr], pos: Pos, st: &mut State) -> Result<Val, Diag> {
+        let lp = place(&args[0]).expect("checked: a place");
+        self.open_path(&mut st.env, &lp)?;
+        let Val::Obj(Type::Lock(t), _) = get_path(&st.env, &lp) else { unreachable!("checked: a lock") };
+        let ExprKind::Var(f) = &args[1].kind else { unreachable!("checked: a function name") };
+        let inner = self.fresh_of(&t, &format!("{}_contents", sanitize(&lp)))?;
+        for (_, i) in self.invariants_of(&inner)? {
+            st.pc.push(i);
+        }
+        // The contents live in a variable no program can name, for the call.
+        self.counter += 1;
+        let key = format!("locked*{}", self.counter);
+        st.env.insert(key.clone(), inner);
+        let mut cargs = vec![Expr { kind: ExprKind::MutBorrow(key.clone()), pos: args[0].pos }];
+        cargs.extend(args[2..].iter().cloned());
+        let res = self.call(f, &cargs, pos, st)?;
+        let after = st.env.remove(&key).expect("still there");
+        for (what, i) in self.invariants_of(&after)? {
+            self.prove(st, &i, pos, "E-VERIFY-LOCKINV", format!("that `{}` keeps the invariant {} before the lock `{}` is released", f, what, lp))?;
+        }
+        Ok(res)
+    }
+
+    /// `smp_run(f, args..)`: this processor's call is an ordinary call. The
+    /// other processors' calls get the same shared arguments and their own
+    /// `Cpu` and `Mmu`, with the kernel's tables in CR3, so `f`'s
+    /// precondition must hold for those too. They change nothing this
+    /// processor can see: everything shared is behind `&` (locks hold their
+    /// contents outside the proof's view).
+    fn smp_run(&mut self, args: &[Expr], pos: Pos, st: &mut State) -> Result<Val, Diag> {
+        let ExprKind::Var(name) = &args[0].kind else { unreachable!("checked: a function name") };
+        let f = self.prog.fns.iter().find(|f| &f.name == name).expect("checked");
+        if !f.requires.is_empty() {
+            let mut pre = HashMap::new();
+            for (p, a) in f.params.iter().zip(&args[1..]) {
+                let v = match p.ty.base() {
+                    Type::Cpu => Val::Obj(Type::Cpu, vec![]),
+                    Type::Mmu => Val::Obj(Type::Mmu, vec![KROOT.into()]),
+                    _ => self.eval(a, st)?,
+                };
+                pre.insert(p.name.clone(), v);
+            }
+            for r in &f.requires {
+                let t = self.spec(r, Scope { env: &pre, old: None, result: None }, &mut Vec::new())?;
+                self.prove(st, &t, pos, "E-VERIFY-REQUIRES", format!("the precondition `{}` of `{}` on the other processors, which start with the kernel's own tables", render(r), name))?;
+            }
+        }
+        self.call(name, &args[1..], pos, st)
+    }
+
     /// Writes the new value of a `&mut` argument back to its variable.
     fn put_back(&mut self, arg: &Expr, v: Val, st: &mut State) {
         let ExprKind::MutBorrow(n) = &arg.kind else { unreachable!("checked: a &mut argument") };
@@ -1291,6 +1472,20 @@ impl<'p> Verifier<'p> {
                 let ity = self.int_ops.get(&pos).cloned().expect("typed by the checker");
                 let op = match name { "wrap_add" => "+", "wrap_sub" => "-", _ => "*" };
                 Ok(Val::U(wrap_term(&ity, &format!("({} {} {})", op, vals[0].term(), vals[1].term()))))
+            }
+            "lock_new" => {
+                for (what, i) in self.invariants_of(&vals[0])? {
+                    self.need(st, i, pos, "E-VERIFY-LOCKINV", format!("that the value put in the lock satisfies the invariant {}", what))?;
+                }
+                Ok(Val::Obj(Type::Lock(Box::new(val_type(&vals[0]))), vec![]))
+            }
+            "lock_end" => {
+                let Val::Obj(Type::Lock(t), _) = &vals[0] else { unreachable!("checked: a lock") };
+                let v = self.fresh_of(t, "unlocked")?;
+                for (_, i) in self.invariants_of(&v)? {
+                    st.pc.push(i);
+                }
+                Ok(v)
             }
             "unbox" => match &vals[0] {
                 Val::Box(BoxVal::Known(v)) => Ok((**v).clone()),
@@ -1923,7 +2118,15 @@ fn note(out: &mut HashMap<String, bool>, path: String, keep: bool) {
 fn changed_in_expr(e: &Expr, out: &mut HashMap<String, bool>, sums: &Summaries) {
     match &e.kind {
         ExprKind::Call(f, args) => {
-            for (i, a) in args.iter().enumerate() {
+            // `locked(l, f, ..)` and `smp_run(f, ..)` lend their trailing
+            // arguments to `f`: shift them onto its parameters.
+            let (f, skip, shift) = match (f.as_str(), args.get(1), args.first()) {
+                ("locked", Some(Expr { kind: ExprKind::Var(g), .. }), _) => (g, 2, 1),
+                ("smp_run", _, Some(Expr { kind: ExprKind::Var(g), .. })) => (g, 1, 1),
+                _ => (f, 0, 0),
+            };
+            for (i, a) in args.iter().enumerate().skip(skip) {
+                let i = i - shift;
                 if let ExprKind::MutBorrow(n) = &a.kind {
                     if is_builtin(f) {
                         note(out, n.clone(), SHAPE_KEEPING.contains(&f.as_str()));

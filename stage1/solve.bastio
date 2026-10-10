@@ -201,20 +201,39 @@ fn trim_rng(t: &Vec[u64], r: Rng) -> Rng {
 
 // ---- Counterexamples ----
 
-/// Is variable a (source text) before variable b, in byte order?
-fn name_less(p: &Parser, a: Bind, b: Bind) -> bool {
-  let mut i = a.s;
-  let mut j = b.s;
-  while i < a.e && j < b.e {
-    let x = src_at(p, i);
-    let y = src_at(p, j);
-    if x != y {
-      return x < y;
+/// The name of variable b: its source text, or for a hidden variable
+/// (s > e) the pool text e..s.
+fn out_name(out: &mut Vec[u64], v: &Vr, p: &Parser, b: Bind) {
+  if b.s > b.e {
+    let mut k = b.e;
+    while k < b.s {
+      vec_push(&mut out, pool_at(v, k));
+      k = k + 1;
     }
-    i = i + 1;
-    j = j + 1;
+  } else {
+    out_src(&mut out, p, b.s, b.e);
   }
-  return i >= a.e && j < b.e;
+}
+
+/// Is variable a's name before b's, in byte order?
+fn name_less(v: &Vr, p: &Parser, a: Bind, b: Bind) -> bool {
+  let mut x = vec_new[u64]();
+  let mut y = vec_new[u64]();
+  out_name(&mut x, v, p, a);
+  out_name(&mut y, v, p, b);
+  let mut k = 0;
+  let mut r = vec_len(x) < vec_len(y);
+  let mut done = false;
+  while k < vec_len(x) && k < vec_len(y) && !done {
+    if u_at(x, k) != u_at(y, k) {
+      r = u_at(x, k) < u_at(y, k);
+      done = true;
+    }
+    k = k + 1;
+  }
+  vec_free(x);
+  vec_free(y);
+  return r;
 }
 
 fn src_at(p: &Parser, i: u64) -> u64 {
@@ -340,7 +359,7 @@ fn cex_labels(v: &Vr, m: &Mono, p: &Parser, o: Obl, labs: &mut Vec[Lab], chars: 
     while j > 0 && j < vec_len(bs) {
       let a = bind_at(bs, j - 1);
       let b = bind_at(bs, j);
-      if name_less(p, b, a) {
+      if name_less(v, p, b, a) {
         vec_set(&mut bs, j - 1, b);
         vec_set(&mut bs, j, a);
         j = j - 1;
@@ -354,7 +373,7 @@ fn cex_labels(v: &Vr, m: &Mono, p: &Parser, o: Obl, labs: &mut Vec[Lab], chars: 
   while k < vec_len(bs) {
     let b = bind_at(bs, k);
     let mut name = vec_new[u64]();
-    out_src(&mut name, p, b.s, b.e);
+    out_name(&mut name, v, p, b);
     show(v, m, p, &mut name, b.val, &mut labs, &mut chars);
     vec_free(name);
     k = k + 1;

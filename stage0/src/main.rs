@@ -274,7 +274,9 @@ fn main() {
         print!("{}", dump::program(&prog));
         return;
     }
-    let (n, log) = verify::verify_program(&prog).unwrap_or_else(|d| {
+    // One solver session in function order for the dumps: stage1's
+    // differential test compares its queries and counterexamples with these.
+    let (n, log) = verify::verify_program(&prog, dump_smt || dump_verify).unwrap_or_else(|d| {
         if dump_verify {
             short(&d);
             for n in &d.notes {
