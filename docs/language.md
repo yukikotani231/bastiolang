@@ -164,7 +164,7 @@ fn main(con: &mut Serial) -> u64 {
 | `Box[T]` | An owning pointer to a `T` on the heap; the only way a type can contain itself |
 | A struct with a linear field, an enum with a linear payload | |
 | `Host`, `Child` | The host system, and a child process (hosted target only) |
-| `Serial`, `Pool`, `Frame`, `PageTable`, `Mmu`, `Cpu`, `Ports`, `PortIo`, `MmioSpace`, `Mmio`, `Dma` | Capabilities: the console, physical pages, page tables, the MMU, the CPU's user context, I/O ports, memory-mapped device registers and pages lent to devices. See [Kernel capabilities](#kernel-capabilities) |
+| `Serial`, `Pool`, `Frame`, `PageTable`, `Mmu`, `Cpu`, `Lease`, `Ports`, `PortIo`, `MmioSpace`, `Mmio`, `Dma` | Capabilities: the console, physical pages, page tables, the MMU, the CPU's user context, a processor's hold on the address space it runs on, I/O ports, memory-mapped device registers and pages lent to devices. See [Kernel capabilities](#kernel-capabilities) |
 
 **Borrows** are allowed only as parameter types, so a borrow can never be stored, returned or outlive the call:
 
@@ -546,7 +546,7 @@ fn main() -> u64 {
 - `lock_new(v)` proves the invariants of `v` (`E-VERIFY-LOCKINV`) and moves it into a new lock. `lock_end(l)` consumes the lock and returns the value; the invariants are known of it.
 - `locked(l, f, args..)` calls `f(&mut contents, args..)` with the lock held. `f` must take `&mut T` first; its result is `locked`'s result. The contents are a fresh value of which only the invariants are known, since another processor may have changed them, so `f`'s `requires` must follow from the invariants. After the call the invariants are proved again (`E-VERIFY-LOCKINV`).
 - The invariants of a struct held directly as a field are included; ones behind a box, in a vector or in an enum payload are not yet. Outside a lock, invariants are not enforced: they are what the lock promises about its contents.
-- A lock cannot hold a value with a `Cpu` or `Mmu` in it (`E-PIN`): they describe the processor that holds them.
+- A lock cannot hold a value with a `Cpu`, `Mmu` or `Lease` in it (`E-PIN`): they describe the processor that holds them.
 - Lending `&mut` a place that overlaps the lock in the same call is `E-LINEAR-USE`, so the contents have no second way in.
 - Deadlock through locks is ruled out at compile time, with nothing written down (`E-LOCK-ORDER`). A lock's *class* is the type of its contents. The checker finds, over the whole call graph, which classes each function may take (`smp_run` counts as a call of its function). While `locked(l, f)` holds a lock of class C, `f` and everything it calls may take only locks of other classes, and the classes must form no cycle: if a `B` lock is ever taken while an `A` lock is held, an `A` lock is never taken while a `B` lock is held. Every processor then takes locks in one global order, so none can wait for another forever, and none spins on a lock it already holds. Two locks with the same contents type cannot be nested; give them different contents types (two structs) to order them. Nothing is generated for this.
 - Generated code: a lock is a pointer to a lock word followed by the contents; `locked` spins with an atomic exchange (acquire) and releases with a store (release). Invariants generate nothing.
@@ -908,7 +908,7 @@ fn main(host: &mut Host) -> u64 {
 
 ## Kernel capabilities
 
-Hardware is reached only through capability types. There is no way to read or write memory through an integer address (ROADMAP invariant 1). Capabilities are linear, and `main` is handed the ones its target provides; they cannot be created. They carry **ghost state** that exists only in the proof: in the generated code a `Frame`, `PageTable` or `Dma` is a bare physical address, `Serial`, `Mmu`, `Cpu`, `Ports` and `MmioSpace` are empty, and a `PortIo` or `Mmio` is its base and size.
+Hardware is reached only through capability types. There is no way to read or write memory through an integer address (ROADMAP invariant 1). Capabilities are linear, and `main` is handed the ones its target provides; they cannot be created. They carry **ghost state** that exists only in the proof: in the generated code a `Frame`, `PageTable`, `Dma` or `Lease` is a bare physical address, `Serial`, `Mmu`, `Cpu`, `Ports` and `MmioSpace` are empty, and a `PortIo` or `Mmio` is its base and size.
 
 | Type | Meaning |
 | --- | --- |
@@ -918,6 +918,7 @@ Hardware is reached only through capability types. There is no way to read or wr
 | `PageTable` | A page-table page at level 1 to 5. It owns the tables and pages its slots point to |
 | `Mmu` | The right to load CR3 (kernel only) |
 | `Cpu` | The CPU's saved user context and the right to enter user mode (kernel only) |
+| `Lease` | This processor's hold on the top-level table it loaded with `mmu_enter`: while any is outstanding, other processors may be running on the tree, so nothing is taken out of it (kernel only; pinned to its processor) |
 | `Ports` | The x86 I/O port space: the right to claim each of the 65536 ports, once |
 | `PortIo` | A claimed range of I/O ports, owned: the only way to read or write them |
 | `MmioSpace` | The device window (physical `0x80000000` up to 2^46, which the kernel platform maps uncached, so 64-bit PCI BARs above 4 GiB fit; the page pool never reaches it, as it stops at 1 GiB): the right to claim each byte of it, once |
@@ -931,6 +932,7 @@ Ghost accessors, usable in specifications:
 | `frame_id(f)`, `pt_id(t)`, `dma_id(d)` | The page number |
 | `pt_level(t)` | 1 (maps pages) to 4 (top level, what CR3 holds); 5 is a container for level-4 tables that is never loaded into CR3 |
 | `pt_used(t, i)` | Slot `i` owns something |
+| `pt_leases(t)` | At least the number of leases outstanding on `t`'s tree: processors that may be running on it. A table you own below level 4 has 0; a table lent by `pt_borrow` has its tree's. Only `mmu_enter` raises it and only `pt_lease_count` lowers it |
 | `pool_has(p, i)` | The pool can still hand out page `i` |
 | `pool_size(p)` | Number of pages in the pool (also callable at run time) |
 | `mmio_free(w, a)` | Nobody has claimed device-window address `a`; `main` receives the whole window free |
@@ -958,12 +960,15 @@ Ghost accessors, usable in specifications:
 | `frame_read8(f: &Frame, o: u64) -> u8`, `frame_write8(f: &mut Frame, o: u64, b: u8)` | `o < 4096` | A byte of the page |
 | `pt_new(f: Frame, level: u64) -> PageTable` | `1 <= level <= 5` | Turns a page into an empty table. A level-4 table gets the kernel's map in slot 0 (not owned, never touched) |
 | `pt_free(t: PageTable) -> Frame` | level is not 4; every slot empty | Turns an empty table back into a page |
-| `pt_free_root(m: &Mmu, t: PageTable) -> Frame` | level 4; slots 1-255 empty; `pt_id(t) != mmu_root(m)` | Kernel only. The same for a top-level table, which must not be in CR3 |
+| `pt_free_root(m: &Mmu, t: PageTable) -> Frame` | level 4; slots 1-255 empty; `pt_id(t) != mmu_root(m)`; `pt_leases(t) == 0` | Kernel only. The same for a top-level table, which must not be in CR3, here or on another processor |
 | `pt_has(t: &PageTable, i: u64) -> bool` | `i < 512` | Whether slot `i` owns something (`pt_used(t, i)`) |
 | `pt_put(t: &mut PageTable, i: u64, c: PageTable)` | level >= 2; slot `i` empty; `pt_level(c) + 1 == pt_level(t)`; at level 4, `1 <= i < 256` | Moves table `c` into slot `i` |
-| `pt_take(t: &mut PageTable, i: u64) -> PageTable` | level >= 2; slot `i` used (same slot rule at level 4) | Moves the table out of slot `i`; its level is one less. What its slots hold is unknown to the proof, so code that tears it down tests each slot with `pt_has` |
+| `pt_take(t: &mut PageTable, i: u64) -> PageTable` | level >= 2; slot `i` used (same slot rule at level 4); `pt_leases(t) == 0` | Moves the table out of slot `i`; its level is one less. What its slots hold is unknown to the proof, so code that tears it down tests each slot with `pt_has` |
 | `pt_put_frame(t: &mut PageTable, i: u64, f: Frame, writable: bool)` | level 1; slot `i` empty | Maps page `f` in slot `i`, user-accessible |
-| `pt_take_frame(t: &mut PageTable, i: u64) -> Frame` | level 1; slot `i` used | Unmaps the page and returns it |
+| `pt_take_frame(t: &mut PageTable, i: u64) -> Frame` | level 1; slot `i` used; `pt_leases(t) == 0` | Unmaps the page and returns it |
+| `pt_borrow(t: &mut PageTable, i: u64, f, args..)` | level >= 2; slot `i` used (same slot rule at level 4) | Calls `f(&mut child, args..)` with the table in slot `i` left in place, and returns what `f` returns. `f` must take `&mut PageTable` first and hand back the same table (`E-VERIFY-OWN`); the child's `pt_leases` is `t`'s |
+| `pt_borrow_frame(t: &mut PageTable, i: u64, f, args..)` | level 1; slot `i` used | The same for the page in slot `i`: `f` takes `&mut Frame` first |
+| `pt_lease_count(t: &mut PageTable) -> u64` | | The leases outstanding on `t` now, counted at run time; `pt_leases(t)` becomes this. Only the holder of `&mut t` could raise it, so a 0 stays 0 while `t` is held |
 
 ```bastio
 // expect-exit: 0
@@ -1016,12 +1021,27 @@ fn main(pool: &mut Pool) -> u64 {
 }
 ```
 
+**Address spaces shared between processors.** The threads of one process run on several processors at once, all with the same top-level table in CR3. Each processor takes a `Lease` with `mmu_enter` before it runs on the table and gives it back with `mmu_exit` after; the table itself stays in shared state (a lock), where system calls on any processor keep using it. The rule that makes this safe is that a leased tree only grows:
+
+- Nothing comes out of it: `pt_take` and `pt_take_frame` need `pt_leases(t) == 0`, and so does `pt_free_root`. Code that works on a live tree reaches its lower tables and pages with `pt_borrow` and `pt_borrow_frame`, which lend them in place instead of unlinking them; what they lend has the tree's leases, so it cannot give anything up either.
+- Things go into it: `pt_put` and `pt_put_frame` are allowed on a live table. Each writes the entry with one 64-bit store, present bit included, after everything the entry points to is written (release order), so a processor walking the table sees either no entry or a complete one.
+
+Why this needs no TLB shootdown: a TLB caches only present entries, and an entry of a leased tree never stops being present or changes where it points. Entries that were not present are not cached, so a new mapping is seen at once, at worst after one page fault. A mapping goes away only when the tree has no lease left; `mmu_exit` loads the kernel's own table first, which also empties that processor's TLB, so by then no processor holds a translation for it.
+
+Only leases matter at levels below 4 through `pt_borrow`: a table below the top that a program owns was taken out of a tree nobody ran on (or was never in one), so its `pt_leases` is 0 and taking from it is fine, as it always was.
+
+`pt_leases` counts in the proof only up: `mmu_exit` cannot say which table its lease was for (it came from an earlier turn, through a lock), so when a program wants to tear down a table it asks the run-time count with `pt_lease_count`. A count of 0 stays 0 while the program holds `&mut t`, because only `mmu_enter`, which needs `&mut t`, raises it. BastiOS waits for 0 before freeing an address space; a processor holding a lease never waits for anything, so the wait ends.
+
+`mmu_switch` still exists and takes no lease; it does not combine with sharing (another processor could free a table loaded that way) and will be rejected under `smp_run`.
+
 **MMU and CPU** (kernel only; the kernel's platform code provides the trap entry):
 
 | Builtin | Requires (proved) | Effect |
 | --- | --- | --- |
 | `mmu_switch(m: &mut Mmu, t: &PageTable)` | level 4 | Loads `t` into CR3; `mmu_root(m)` becomes `pt_id(t)` |
 | `mmu_kernel(m: &mut Mmu)` | | Loads the kernel's own map |
+| `mmu_enter(m: &mut Mmu, t: &mut PageTable) -> Lease` | level 4; `mmu_root(m)` is the kernel's (`0x10000`) | Takes a lease on `t` and loads it into CR3: `pt_leases(t)` goes up by one, `mmu_root(m)` becomes `pt_id(t)`. `t` can then go back where it came from (a lock, say) and other processors can enter it too |
+| `mmu_exit(m: &mut Mmu, l: Lease)` | | Loads the kernel's own map, then gives the lease back. No table's `pt_leases` drops in the proof (it does not name one): it stays an overcount until `pt_lease_count` reads the true count |
 | `cpu_get(c: &Cpu, r: u64) -> u64` | `r < 21` | Saved user register `r`: rax rbx rcx rdx rsi rdi rbp r8-r15 (0-14), rip (15), rsp (16), rflags (17), error code (18), fault address (19), FS base (20) |
 | `cpu_set(c: &mut Cpu, r: u64, v: u64)` | `r < 18` or `r == 20` | Sets a saved register or the FS base (the error code and fault address are only reported by a trap). Whatever is stored, user mode is entered in ring 3 with the user segments, IOPL 0 and interrupts on; the platform replaces a non-canonical address with 0 |
 | `cpu_fpu_save(c: &mut Cpu, f: &mut Frame)` | | Saves the user's x87/SSE registers into the page (`fxsave64`) |
@@ -1285,7 +1305,7 @@ Syntax, types and linearity:
 | `E-LINEAR-LEAK` | A linear value is still owned at the end of its scope or at a `return`, is overwritten, or is dropped by `_` |
 | `E-LINEAR-BRANCH` | Only one arm of an `if` or a `match` consumes a value; a loop body changes the ownership of an outer value |
 | `E-LOCK-ORDER` | A lock may be taken while a lock of the same class (contents type) is held, or lock classes are taken in opposite orders in two places |
-| `E-PIN` | A `Cpu` or `Mmu` (or a value holding one) is put in a lock or shared between processors by `smp_run` |
+| `E-PIN` | A `Cpu`, `Mmu` or `Lease` (or a value holding one) is put in a lock or shared between processors by `smp_run` |
 
 Proofs:
 
@@ -1301,7 +1321,8 @@ Proofs:
 | `E-VERIFY-ALLOC` | Allocation size <= 2^60 elements |
 | `E-VERIFY-OWN` | A page is taken from the pool at most once; an I/O port or device register has at most one owner; a table slot is empty before `pt_put` and used before `pt_take`; a table is empty before it is freed |
 | `E-VERIFY-PT` | Table levels line up; frames go only into level-1 tables; slot 0 of a top-level table (the kernel's map) is never touched |
-| `E-VERIFY-MMU` | The table in CR3 is never freed |
+| `E-VERIFY-MMU` | The table in CR3 is never freed; a processor enters one address space at a time |
+| `E-VERIFY-LEASE` | Nothing is taken out of a page-table tree, and its top-level table is not freed, while a processor may be running on it |
 | `E-VERIFY-REQUIRES` | The callee's `requires` |
 | `E-VERIFY-ENSURES` | The function's own postcondition |
 | `E-VERIFY-INVARIANT` | A loop invariant holds on entry and is preserved by one iteration |
