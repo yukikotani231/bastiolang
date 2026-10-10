@@ -28,9 +28,11 @@
 // caller reserves room for a result of more than one word, then pushes the
 // arguments left to right (each argument's word 0 at its lowest address),
 // calls, and pops the arguments, which leaves a multi-word result on top of
-// the stack. A one-word result comes back in %rax. Scalar locals live in the
-// callee-saved registers %rbx, %r12-%r15 when one is free; everything else
-// lives in the frame. Expression code works like a stack machine with %rax
+// the stack. A one-word result comes back in %rax. Small functions are
+// mostly not called but inlined (`Gen::inline`). Variables live in
+// registers when `assign_regs` gives them some (%rbx, %r12-%r15, and
+// %r8-%r11, which are saved around calls); everything else lives in the
+// frame. Expression code works like a stack machine with %rax
 // as the accumulator: `scalar` leaves a one-word value in %rax, `push_val`
 // pushes a value of any size. %rcx holds the address of a place being read
 // or written; %rdx, %rsi and %rdi are scratch.
@@ -511,8 +513,9 @@ fn assign_regs(f: &FnDef, inl: &HashMap<String, FnDef>) -> HashMap<String, Vec<&
     fn expr(e: &Expr, w: u64, a: &mut Acc) {
         match &e.kind {
             ExprKind::Var(n) => {
+                let n = a.resolve(n);
                 *a.uses.entry(n.clone()).or_insert(0) += w;
-                a.whole.insert(n.clone());
+                a.whole.insert(n);
             }
             ExprKind::Field(x, _) | ExprKind::Is(x, _, _) | ExprKind::Not(x) | ExprKind::Neg(x) | ExprKind::TypeApp(_, x) => expr(x, w, a),
             ExprKind::Variant(_, _, Some(x)) => expr(x, w, a),
@@ -526,7 +529,17 @@ fn assign_regs(f: &FnDef, inl: &HashMap<String, FnDef>) -> HashMap<String, Vec<&
                 if let Some(g) = will_inline(a.inl, f, &a.stack) {
                     a.stack.push(f.clone());
                     let outer = a.enter();
-                    for p in &g.params {
+                    let mut changed = HashSet::new();
+                    stmts_borrows(&g.body, &mut changed);
+                    assigned_roots(&g.body, &mut changed);
+                    for (p, x) in g.params.iter().zip(xs) {
+                        // As in `Gen::bind_params`: the caller's variable.
+                        if let (ExprKind::Var(v), false, false) = (&x.kind, p.ty.is_mut_ref(), changed.contains(&p.name)) {
+                            let v = a.resolve(v);
+                            a.alias.insert(p.name.clone(), v);
+                            continue;
+                        }
+                        a.alias.remove(&p.name);
                         a.declare(&p.name);
                         if p.ty.is_mut_ref() {
                             a.bad.insert(p.name.clone());
@@ -536,6 +549,9 @@ fn assign_regs(f: &FnDef, inl: &HashMap<String, FnDef>) -> HashMap<String, Vec<&
                         *a.uses.entry(p.name.clone()).or_insert(0) += w;
                     }
                     stmts(&g.body, w, a);
+                    for p in &g.params {
+                        a.alias.remove(&p.name);
+                    }
                     a.cur = outer;
                     a.stack.pop();
                 }
@@ -548,8 +564,9 @@ fn assign_regs(f: &FnDef, inl: &HashMap<String, FnDef>) -> HashMap<String, Vec<&
                 for (i, x) in xs.iter().enumerate() {
                     match (&x.kind, word) {
                         (ExprKind::Var(n), Some(k)) if i == 0 => {
+                            let n = a.resolve(n);
                             *a.uses.entry(n.clone()).or_insert(0) += w;
-                            a.read.entry(n.clone()).or_default().insert(k);
+                            a.read.entry(n).or_default().insert(k);
                         }
                         _ => expr(x, w, a),
                     }
@@ -572,8 +589,13 @@ fn assign_regs(f: &FnDef, inl: &HashMap<String, FnDef>) -> HashMap<String, Vec<&
         cur: usize,
         /// The scopes where each name is declared.
         decl: HashMap<String, Vec<usize>>,
+        /// Parameters of inlined bodies that are a caller's variable.
+        alias: HashMap<String, String>,
     }
     impl Acc<'_> {
+        fn resolve(&self, n: &str) -> String {
+            self.alias.get(n).cloned().unwrap_or_else(|| n.to_string())
+        }
         /// Enters a new scope inside the current one; returns the current.
         fn enter(&mut self) -> usize {
             self.parent.push(self.cur);
@@ -660,7 +682,7 @@ fn assign_regs(f: &FnDef, inl: &HashMap<String, FnDef>) -> HashMap<String, Vec<&
             }
         }
     }
-    let mut a = Acc { inl, stack: vec![f.name.clone()], uses: HashMap::new(), whole: HashSet::new(), read: HashMap::new(), sizes: HashMap::new(), bad: HashSet::new(), assigned: HashSet::new(), parent: vec![0], cur: 0, decl: HashMap::new() };
+    let mut a = Acc { inl, stack: vec![f.name.clone()], uses: HashMap::new(), whole: HashSet::new(), read: HashMap::new(), sizes: HashMap::new(), bad: HashSet::new(), assigned: HashSet::new(), parent: vec![0], cur: 0, decl: HashMap::new(), alias: HashMap::new() };
     stmts_borrows(&f.body, &mut a.bad);
     for g in inl.values() {
         stmts_borrows(&g.body, &mut a.bad);
@@ -1165,26 +1187,21 @@ impl<'a> Gen<'a> {
                     return Ok(());
                 }
                 if n == 1 {
-                    self.scalar(init)?;
-                } else {
-                    self.push_val(init)?;
-                }
-                let st = match self.reg_for(name, &t) {
-                    Some(r) => {
-                        self.emit(&format!("mov %rax, {}", r));
-                        Store::Reg(r)
-                    }
-                    None => {
-                        let o = self.slot(n);
-                        if n == 1 {
-                            self.emit(&format!("mov %rax, {}(%rbp)", o));
-                        } else {
-                            self.pop_to(Loc::Mem("%rbp", o), n);
+                    let (dst, st) = match self.reg_for(name, &t) {
+                        Some(r) => (r.to_string(), Store::Reg(r)),
+                        None => {
+                            let o = self.slot(1);
+                            (format!("{}(%rbp)", o), Store::Slot(o))
                         }
-                        Store::Slot(o)
-                    }
-                };
-                self.vars.insert(name.clone(), Var { st, ty: t });
+                    };
+                    self.scalar_into(init, &dst)?;
+                    self.vars.insert(name.clone(), Var { st, ty: t });
+                    return Ok(());
+                }
+                // A value of no words (`()`).
+                self.push_val(init)?;
+                let o = self.slot(0);
+                self.vars.insert(name.clone(), Var { st: Store::Slot(o), ty: t });
             }
             StmtKind::Assign { name, value } => {
                 // `b = set(b, i, v)` stores one word in place.
@@ -1229,7 +1246,18 @@ impl<'a> Gen<'a> {
                     }
                 }
                 let n = words(&self.place_type(name))?;
-                if n == 1 {
+                // Straight into a register or frame slot.
+                let direct = match self.vars[path_root(name)].st {
+                    Store::Reg(r) => Some(r.to_string()),
+                    Store::Slot(_) => match self.store_of(name) {
+                        Some(Store::Slot(o)) => Some(format!("{}(%rbp)", o)),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let (1, Some(d)) = (n, &direct) {
+                    self.scalar_into(value, d)?;
+                } else if n == 1 {
                     self.scalar(value)?;
                     let (loc, _) = self.place(name);
                     self.emit(&format!("mov %rax, {}", loc.op(0)));
@@ -1267,8 +1295,29 @@ impl<'a> Gen<'a> {
                 let t = self.type_of(scrut);
                 let en = enum_def(&t.name()).unwrap();
                 let n = words(&t)?;
-                let o = self.slot(n);
-                self.val_into(scrut, Dst::Frame(o))?;
+                // A variable in the frame that no arm changes is matched
+                // where it is.
+                let in_place = place(scrut).and_then(|p| {
+                    let mut changed = HashSet::new();
+                    for a in arms.iter() {
+                        stmts_borrows(&a.body, &mut changed);
+                        assigned_roots(&a.body, &mut changed);
+                    }
+                    // Nor its payload, through a binding.
+                    let payload_changed = arms.iter().any(|a| matches!(&a.pat, Pat::Variant(_, _, Some(b), _) if changed.contains(b)));
+                    match self.store_of(&p) {
+                        Some(Store::Slot(o)) if !changed.contains(path_root(&p)) && !payload_changed => Some(o),
+                        _ => None,
+                    }
+                });
+                let o = match in_place {
+                    Some(o) => o,
+                    None => {
+                        let o = self.slot(n);
+                        self.val_into(scrut, Dst::Frame(o))?;
+                        o
+                    }
+                };
                 let l_end = self.label();
                 for (i, a) in arms.iter().enumerate() {
                     let last = i + 1 == arms.len();
@@ -1398,6 +1447,52 @@ impl<'a> Gen<'a> {
             ExprKind::Call(n, args) if LENS.contains(&n.as_str()) => place(&args[0]).is_some(),
             _ => place(e).is_some(),
         }
+    }
+
+    /// Puts the one-word value of `e` in `dst` (a register, or memory not
+    /// addressed through %rcx). Through %rax unless one move does it, or,
+    /// for `a + b` / `a - b` into a register, two instructions on it.
+    fn scalar_into(&mut self, e: &Expr, dst: &str) -> R<()> {
+        let reg = dst.starts_with('%');
+        if self.simple(e) && !dst.contains("%rcx") {
+            let op = self.operand(e).unwrap();
+            if reg || op.starts_with('%') || op.starts_with('$') {
+                if op != dst {
+                    self.emit(&format!("mov{} {}, {}", if op.starts_with('$') && !reg { "q" } else { "" }, op, dst));
+                }
+                return Ok(());
+            }
+            self.emit(&format!("mov {}, %rax", op));
+        } else if let (true, ExprKind::Bin(op @ (BinOp::Add | BinOp::Sub), a, b)) = (reg, &e.kind) {
+            // `dst` is written before `b` is read: `b` must not be in it.
+            if self.simple(a) && self.simple(b) && !self.mentions(b, dst) {
+                let x = self.operand(a).unwrap();
+                if x != dst {
+                    self.emit(&format!("mov {}, {}", x, dst));
+                }
+                let y = self.operand(b).unwrap();
+                self.emit(&format!("{} {}, {}", if *op == BinOp::Add { "add" } else { "sub" }, y, dst));
+                return Ok(());
+            }
+            self.scalar(e)?;
+        } else {
+            self.scalar(e)?;
+        }
+        self.emit(&format!("mov %rax, {}", dst));
+        Ok(())
+    }
+
+    /// Might reading simple expression `e` read register `r`?
+    fn mentions(&self, e: &Expr, r: &str) -> bool {
+        let p = match &e.kind {
+            ExprKind::Call(_, args) => place(&args[0]),
+            _ => place(e),
+        };
+        p.map_or(false, |p| match self.vars.get(path_root(&p)).map(|v| v.st) {
+            Some(Store::Reg(x)) => x == r,
+            Some(Store::Regs(xs)) => xs.contains(&r),
+            _ => false,
+        })
     }
 
     /// One operand in %rax and the other as a direct operand or in %rcx.
@@ -1805,7 +1900,9 @@ impl<'a> Gen<'a> {
             }
             _ => {
                 let n = words(&self.type_of(e))?;
-                if n == 1 {
+                if let (1, Dst::Frame(o)) = (n, d) {
+                    self.scalar_into(e, &format!("{}(%rbp)", o))?;
+                } else if n == 1 {
                     self.scalar(e)?;
                     let at = self.dst_op(d);
                     self.emit(&format!("mov %rax, {}", at));
@@ -2207,6 +2304,29 @@ impl<'a> Gen<'a> {
                     self.pop("%rax");
                 }
             }
+            "vec_push" if words(&self.vec_elem(&args[0]))? == 1 && matches!(args[0].kind, ExprKind::MutBorrow(_)) => {
+                // The value cannot change the vector (it is lent), so it
+                // goes first, into %rdx, and the vector's address into %rdi.
+                let l = self.label();
+                self.scalar(&args[1])?;
+                self.emit("mov %rax, %rdx");
+                self.scalar(&args[0])?;
+                self.emit("mov %rax, %rdi");
+                self.emit("mov (%rdi), %rax");
+                self.emit("cmp 8(%rdi), %rax");
+                self.emit(&format!("jne {}", l));
+                self.push("%rdx");
+                self.push("%rdi");
+                self.emit("mov $8, %esi");
+                self.emit("call bst_rt_vec_grow");
+                self.pop("%rdi");
+                self.pop("%rdx");
+                self.emit("mov (%rdi), %rax");
+                self.place_label(&l);
+                self.emit("mov 16(%rdi), %rcx");
+                self.emit("mov %rdx, (%rcx,%rax,8)");
+                self.emit("incq (%rdi)");
+            }
             "vec_push" => {
                 let n = words(&self.vec_elem(&args[0]))?;
                 self.arg(&args[0])?;
@@ -2242,10 +2362,23 @@ impl<'a> Gen<'a> {
             "vec_get" => {
                 let n = words(&self.vec_elem(&args[0]))?;
                 let p = place(&args[0]).expect("checked: names a vector");
-                self.scalar(&args[1])?;
+                let index = match self.var_reg(&args[1]) {
+                    Some(r) if n == 1 => r,
+                    _ => {
+                        self.scalar(&args[1])?;
+                        "%rax"
+                    }
+                };
                 let (loc, _) = self.place(&p);
-                if let (Loc::Regs(rs), 1) = (loc, n) {
-                    self.emit(&format!("mov ({},%rax,8), %rax", rs[2]));
+                if n == 1 {
+                    let base = match loc {
+                        Loc::Regs(rs) => rs[2].to_string(),
+                        _ => {
+                            self.emit(&format!("mov {}, %rcx", loc.op(2)));
+                            "%rcx".to_string()
+                        }
+                    };
+                    self.emit(&format!("mov ({},{},8), %rax", base, index));
                     return Ok(());
                 }
                 self.emit(&format!("mov {}, %rcx", loc.op(2)));

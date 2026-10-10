@@ -4,11 +4,35 @@
 # and both executables must exit with the same status and print the same
 # output (stdin empty). A program using something the native backend does
 # not support yet is reported as skipped; anything else that differs fails.
+#
+# tests/native.sh --stage1 instead runs stage1/difftest.sh with the tools of
+# the self-hosted compiler built by the native backend (by the C backend
+# when it does not support one yet): large programs whose output is checked
+# against stage0's own.
 set -u
 cd "$(dirname "$0")/.."
 BASTIOC=${BASTIOC:-stage0/target/release/bastioc0}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
+if [ "${1:-}" = --stage1 ]; then
+  case "$BASTIOC" in /*) ;; *) BASTIOC="$PWD/$BASTIOC" ;; esac
+  {
+    echo '#!/usr/bin/env bash'
+    echo "b='$BASTIOC'"
+    echo 'for a in "$@"; do'
+    echo '  if [ "$a" = -o ]; then'
+    echo '    "$b" --backend native "$@"; s=$?'
+    echo '    [ $s = 4 ] || exit $s'
+    echo '    echo "native.sh: the C backend builds ${*: -1}" >&2'
+    echo '    exec "$b" "$@"'
+    echo '  fi'
+    echo 'done'
+    echo 'exec "$b" "$@"'
+  } >"$tmp/bastioc"
+  chmod +x "$tmp/bastioc"
+  BASTIOC="$tmp/bastioc" stage1/difftest.sh
+  exit
+fi
 pass=0; fail=0; skip=0
 for f in tests/pass/*.bastio bench/*.bastio; do
   n=$(basename "$f" .bastio)

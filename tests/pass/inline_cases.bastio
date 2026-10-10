@@ -1,0 +1,127 @@
+// expect-exit: 0
+// expect-stdout: 3
+// expect-stdout: 21
+// expect-stdout: 30
+// expect-stdout: 4
+// expect-stdout: 44
+// expect-stdout: 11
+// expect-stdout: 15
+// expect-stdout: 9
+// expect-stdout: 9
+// Small functions whose calls the native backend generates in the caller:
+// struct results written straight to their destination, parameters that
+// are the caller's variables (and ones that are not, because the callee
+// changes them), `&mut` parameters, nested and repeated calls, and a
+// `match` on a variable in place.
+
+struct P { x: u64, y: u64 }
+enum E { A(u64), B }
+
+fn pair(a: u64, b: u64) -> P
+  ensures result.x == a && result.y == b
+{
+  return P { x: a, y: b };
+}
+
+fn swap(p: P) -> P
+  ensures result.x == p.y && result.y == p.x
+{
+  return pair(p.y, p.x);
+}
+
+fn add3(a: u64, b: u64, c: u64) -> u64
+  requires a <= 1000 && b <= 1000 && c <= 1000
+  ensures result == a + b + c
+{
+  return a + b + c;
+}
+
+// Changes its parameter: the caller's variable must not change with it.
+fn last_digit(mut n: u64) -> u64
+  ensures result < 10
+{
+  while n >= 10
+    invariant true
+  {
+    n = n - 10;
+  }
+  return n;
+}
+
+fn push_twice(v: &mut Vec[u64], x: u64)
+  requires vlen(v) < 1000
+  ensures vlen(v) == vlen(old(v)) + 2
+{
+  vec_push(&mut v, x);
+  vec_push(&mut v, x);
+}
+
+fn count_in(v: &Vec[u64]) -> u64
+  ensures result == vlen(v)
+{
+  return vec_len(v);
+}
+
+fn bump(p: &mut P)
+  requires p.x < 1000
+  ensures p.x == old(p).x + 1 && p.y == old(p).y
+{
+  p.x = p.x + 1;
+}
+
+// Matches `e` twice; the first arm changes its own copy of the payload.
+fn twice(e: &E) -> u64 {
+  let mut t = 0;
+  match e {
+    E::A(mut v) => {
+      if v < 1000 {
+        v = v + 1;
+        t = v;
+      }
+    },
+    E::B => {},
+  }
+  match e {
+    E::A(v) => {
+      if v < 1000 && t < 1000 {
+        t = t + v;
+      }
+    },
+    E::B => {},
+  }
+  return t;
+}
+
+fn main() -> u64 {
+  let p = swap(pair(4, 3));
+  print(p.x);
+  print(add3(add3(1, 2, 3), add3(4, 5, 6), 0));
+  match E::A(add3(10, 10, 10)) {
+    E::A(v) => { print(v); },
+    E::B => {},
+  }
+  let n = 1234;
+  let d = last_digit(n);
+  print(d);
+  print(n / 28);
+  let mut v: Vec[u64] = vec_new[u64]();
+  push_twice(&mut v, 7);
+  push_twice(&mut v, 8);
+  let mut q = pair(10, 5);
+  bump(&mut q);
+  print(q.x);
+  print(q.y + count_in(v) + 6);
+  let e = E::A(4);
+  print(twice(e));
+  match e {
+    E::A(w) => { print(w + 5); },
+    E::B => {},
+  }
+  while vec_len(v) > 0
+    invariant true
+  {
+    let x = vec_pop(&mut v);
+  }
+  vec_free(v);
+  return 0;
+}
