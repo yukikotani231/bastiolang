@@ -30,6 +30,7 @@ const VT_APP: u64 = 3;        // operator a applied to targs[b .. b + c]
 const VT_FORALL: u64 = 4;     // (forall ((a Int)) b)
 const VT_LAMBDA: u64 = 5;     // (lambda ((a Int)) b)
 const VT_FORALLP: u64 = 6;    // (forall ((a Int)) (! b :pattern (p) :pattern (q))), p and q targs[c], targs[c + 1]
+const VT_FORALLP1: u64 = 7;   // (forall ((a Int)) (! b :pattern (c)))
 
 const OP_ADD: u64 = 1;
 const OP_SUB: u64 = 2;
@@ -51,6 +52,7 @@ const OP_STORE: u64 = 17;
 const OP_CNT: u64 = 18;       // vcount: (cnt elements length value)
 const OP_DEC: u64 = 19;       // bdec: (dec data from to)
 const OP_HEX: u64 = 20;       // bhex: (hex data from to)
+const OP_BIT: u64 = 21;       // has_bit: (bit x i)
 
 // Sorts: Int or Bool, under `depth` levels of (Array Int ..): base + 2 * depth.
 const SO_INT: u64 = 0;
@@ -184,6 +186,10 @@ struct Vr {
   dec_fns: Vec[u64],
   /// The same for `bhex`.
   hex_fns: Vec[u64],
+  /// The same for `has_bit`, and whether the one being verified is one of
+  /// them: only then is every bitwise operator described bit by bit.
+  bit_fns: Vec[u64],
+  bits: bool,
   /// Every function's summaries, grouped by instance: rows
   /// sum_start[x] .. sum_start[x] + sum_n[x] are instance x's.
   sums: Vec[SumRow],
@@ -236,7 +242,7 @@ fn vr_new(m: &mut Mono, p: &Parser) -> Vr {
   vec_push(&mut vals, Vl { kind: 0, ty: 0, a: 0, b: 0, c: 0, n: 0, d: 0, e: 0 });
   let mut v = Vr {
     pool: vec_new[u64](), tms: tms, targs: vec_new[u64](), vals: vals, kids: vec_new[u64](),
-    log: vec_new[Cmd](), counter: 0, obligations: 0, box_depth: 0, cur: 0, env: 0, cnt_fns: vec_new[u64](), counts: false, dec_fns: vec_new[u64](), hex_fns: vec_new[u64](),
+    log: vec_new[Cmd](), counter: 0, obligations: 0, box_depth: 0, cur: 0, env: 0, cnt_fns: vec_new[u64](), counts: false, dec_fns: vec_new[u64](), hex_fns: vec_new[u64](), bit_fns: vec_new[u64](), bits: false,
     sums: vec_new[SumRow](), obls: vec_new[Obl](), snaps: vec_new[Bind](), sum_start: vec_new[u64](), sum_n: vec_new[u64](),
     t_true: 0, t_false: 0, t_zero: 0, t_u64max: 0, t_allocmax: 0, t_flimit: 0, t_plimit: 0, t_mmio_lo: 0, t_mmio_hi: 0, t_poolsize: 0,
     t_zarr: 0, t_nobool: 0, t_k: 0, t_255: 0, unit: 0,
@@ -272,6 +278,7 @@ fn vr_free(v: Vr) {
   vec_free(v.cnt_fns);
   vec_free(v.dec_fns);
   vec_free(v.hex_fns);
+  vec_free(v.bit_fns);
   vec_free(v.sums);
   vec_free(v.sum_start);
   vec_free(v.sum_n);
@@ -585,6 +592,91 @@ fn targ(v: &Vr, t: u64, k: u64) -> u64 {
 /// (forall ((q Int)) body)
 fn forall_tm(v: &mut Vr, q: u64, body: u64) -> u64 {
   return new_tm(&mut v, VT_FORALL, q, body, 0);
+}
+
+// ---- Bits (`has_bit`) ----
+
+/// `has_bit(x, i)` is about `(bit x i)`: whether bit `i` of `x` is set.
+/// `bit` is uninterpreted; what the prover knows about it is that no bit
+/// of 0 is set, that bits 0 to w - 1 of the largest w-bit number are, and,
+/// for each bitwise operator a function evaluates, how each bit of the
+/// result follows from the bits of the operands (`bit_fact`). As stage0's
+/// BIT_AXIOMS.
+fn bit_axioms(v: &mut Vr) {
+  let l0 = atom_str(&mut v, "(declare-fun bit (Int Int) Bool)");
+  send(&mut v, CMD_RAW, l0, 0);
+  let a0 = atom_str(&mut v, "(assert (forall ((j Int)) (! (not (bit 0 j)) :pattern ((bit 0 j)))))");
+  send(&mut v, CMD_RAW, a0, 0);
+  let a1 = atom_str(&mut v, "(assert (forall ((j Int)) (! (= (bit 255 j) (and (<= 0 j) (< j 8))) :pattern ((bit 255 j)))))");
+  send(&mut v, CMD_RAW, a1, 0);
+  let a2 = atom_str(&mut v, "(assert (forall ((j Int)) (! (= (bit 65535 j) (and (<= 0 j) (< j 16))) :pattern ((bit 65535 j)))))");
+  send(&mut v, CMD_RAW, a2, 0);
+  let a3 = atom_str(&mut v, "(assert (forall ((j Int)) (! (= (bit 4294967295 j) (and (<= 0 j) (< j 32))) :pattern ((bit 4294967295 j)))))");
+  send(&mut v, CMD_RAW, a3, 0);
+  let a4 = atom_str(&mut v, "(assert (forall ((j Int)) (! (= (bit 18446744073709551615 j) (and (<= 0 j) (< j 64))) :pattern ((bit 18446744073709551615 j)))))");
+  send(&mut v, CMD_RAW, a4, 0);
+}
+
+/// Bit `j` of term `t`: `(bit t j)`, or for a number, which bits are set
+/// spelled out. As stage0's `bit_of`.
+fn bit_of(v: &mut Vr, t: u64, j: u64) -> u64 {
+  let x = tm_at(v, t);
+  if x.kind != VT_NUM {
+    return app2(&mut v, OP_BIT, t, j);
+  }
+  let c = x.a;
+  if c == 0 {
+    return v.t_false;
+  }
+  let k = low_mask(c);
+  if k > 0 {
+    let lo = app2(&mut v, OP_LE, v.t_zero, j);
+    let tk = num(&mut v, k - 1);
+    let hi = app2(&mut v, OP_LT, j, tk);
+    return app2(&mut v, OP_AND, lo, hi);
+  }
+  let mut set = vec_new[u64]();
+  let mut y = c;
+  let mut b = 0;
+  while b < 64 {
+    if y % 2 == 1 {
+      let tb = num(&mut v, b);
+      let e = app2(&mut v, OP_EQ, j, tb);
+      vec_push(&mut set, e);
+    }
+    y = y / 2;
+    b = b + 1;
+  }
+  let mut r = 0;
+  if vec_len(set) == 1 {
+    r = u_at(set, 0);
+  } else {
+    r = appv(&mut v, OP_OR, set);
+  }
+  vec_free(set);
+  return r;
+}
+
+/// Asserts that every bit `j` of `r` is `body` (a term over the atom `j`).
+/// As stage0's `bit_fact`.
+fn bit_fact(v: &mut Vr, r: u64, j: u64, body: u64) {
+  let b = app2(&mut v, OP_BIT, r, j);
+  let lo = app2(&mut v, OP_LE, v.t_zero, j);
+  let eq = app2(&mut v, OP_EQ, b, body);
+  let imp = app2(&mut v, OP_IMP, lo, eq);
+  let all = new_tm(&mut v, VT_FORALLP1, j, imp, b);
+  assert_tm(&mut v, all);
+}
+
+/// A fresh name for the value of `t`, so that facts about its bits can be
+/// triggered by it (a pattern cannot contain an `ite`). As stage0's `named`.
+fn bits_named(v: &mut Vr, t: u64) -> u64 {
+  let h = atom_str(&mut v, "bits");
+  let n = fresh_name(&mut v, h);
+  send(&mut v, CMD_DECL, n, SO_INT);
+  let e = app2(&mut v, OP_EQ, n, t);
+  assert_tm(&mut v, e);
+  return n;
 }
 
 // ---- Counting (`vcount`) ----
@@ -1121,6 +1213,7 @@ fn out_op(out: &mut Vec[u64], op: u64) {
   else if op == OP_CNT { out_str(&mut out, "cnt"); }
   else if op == OP_DEC { out_str(&mut out, "dec"); }
   else if op == OP_HEX { out_str(&mut out, "hex"); }
+  else if op == OP_BIT { out_str(&mut out, "bit"); }
 }
 
 fn out_tm(out: &mut Vec[u64], v: &Vr, t: u64) {
@@ -1162,6 +1255,14 @@ fn out_tm(out: &mut Vec[u64], v: &Vr, t: u64) {
     out_tm(&mut out, v, u_at(v.targs, x.c));
     out_str(&mut out, ") :pattern (");
     out_tm(&mut out, v, u_at(v.targs, vadd(x.c, 1)));
+    out_str(&mut out, ")))");
+  } else if x.kind == VT_FORALLP1 {
+    out_str(&mut out, "(forall ((");
+    out_tm(&mut out, v, x.a);
+    out_str(&mut out, " Int)) (! ");
+    out_tm(&mut out, v, x.b);
+    out_str(&mut out, " :pattern (");
+    out_tm(&mut out, v, x.c);
     out_str(&mut out, ")))");
   }
 }
@@ -2988,6 +3089,16 @@ fn vspec_builtin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env:
     let to = spec_tm(&mut v, c, &mut m, p, arg_node(p, i, 2), env, oenv, has_old, res, &mut bound);
     return app3(&mut v, OP_HEX, bv.b, from, to);
   }
+  if span_is(p, n.s, n.e, "has_bit") {
+    // Bits from 64 up are never set: every integer in a specification is
+    // at most a u64.
+    let x = spec_tm(&mut v, c, &mut m, p, n.a, env, oenv, has_old, res, &mut bound);
+    let ix = spec_tm(&mut v, c, &mut m, p, arg_node(p, i, 1), env, oenv, has_old, res, &mut bound);
+    let t64 = num(&mut v, 64);
+    let lt = app2(&mut v, OP_LT, ix, t64);
+    let b = app2(&mut v, OP_BIT, x, ix);
+    return app2(&mut v, OP_AND, lt, b);
+  }
   if span_is(p, n.s, n.e, "vget") {
     let x = spec_val(&mut v, c, &mut m, p, i, env, oenv, has_old, res, &mut bound);
     return term(v, x);
@@ -3163,8 +3274,20 @@ fn eval(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VSta
     let x = eval(&mut v, c, &mut m, p, n.a, &mut st, 0);
     // Bitwise not on an unsigned integer: max - x.
     if has_int_op(c, v.env, i) {
-      let max = int_max(&mut v, m, int_op_ty(c, m, v.env, i));
+      let ity = int_op_ty(c, m, v.env, i);
+      let max = int_max(&mut v, m, ity);
       let t = app2(&mut v, OP_SUB, max, term(v, x));
+      if v.bits {
+        let r = bits_named(&mut v, t);
+        let j = atom_str(&mut v, "j");
+        let tw = num(&mut v, int_bits(m, ity));
+        let lt = app2(&mut v, OP_LT, j, tw);
+        let bx = bit_of(&mut v, term(v, x), j);
+        let nb = t_not(&mut v, bx);
+        let body = app2(&mut v, OP_AND, lt, nb);
+        bit_fact(&mut v, r, j, body);
+        return mk_u(&mut v, r);
+      }
       return mk_u(&mut v, t);
     }
     let t = t_not(&mut v, term(v, x));
@@ -3392,6 +3515,14 @@ fn bitwise(v: &mut Vr, m: &Mono, p: &Parser, i: u64, op: u64, a: u64, b: u64, ta
     }
     if op == P_SHR {
       let t = app2(&mut v, OP_DIV, ta, pw);
+      if v.bits {
+        let r = bits_named(&mut v, t);
+        let j = atom_str(&mut v, "j");
+        let js = app2(&mut v, OP_ADD, j, tb);
+        let body = bit_of(&mut v, ta, js);
+        bit_fact(&mut v, r, j, body);
+        return mk_u(&mut v, r);
+      }
       return mk_u(&mut v, t);
     }
     let t = app2(&mut v, OP_MUL, ta, pw);
@@ -3401,6 +3532,16 @@ fn bitwise(v: &mut Vr, m: &Mono, p: &Parser, i: u64, op: u64, a: u64, b: u64, ta
     vm_s(&mut v, " loses no bits of ");
     vm_ty(&mut v, m, p, ity);
     prove(&mut v, st, g2, i, VC_OVERFLOW);
+    if v.bits {
+      let r = bits_named(&mut v, t);
+      let j = atom_str(&mut v, "j");
+      let ge = app2(&mut v, OP_LE, tb, j);
+      let js = app2(&mut v, OP_SUB, j, tb);
+      let bx = bit_of(&mut v, ta, js);
+      let body = app2(&mut v, OP_AND, ge, bx);
+      bit_fact(&mut v, r, j, body);
+      return mk_u(&mut v, r);
+    }
     return mk_u(&mut v, t);
   }
   // `x & (2^k - 1)` keeps the low k bits.
@@ -3419,6 +3560,24 @@ fn bitwise(v: &mut Vr, m: &Mono, p: &Parser, i: u64, op: u64, a: u64, b: u64, ta
     if k > 0 {
       let pk = pow2_num(&mut v, k - 1);
       let t = app2(&mut v, OP_MOD, other, pk);
+      if v.bits {
+        let r = bits_named(&mut v, t);
+        let j = atom_str(&mut v, "j");
+        let tk = num(&mut v, k - 1);
+        let lt = app2(&mut v, OP_LT, j, tk);
+        let bx = bit_of(&mut v, other, j);
+        let body = app2(&mut v, OP_AND, lt, bx);
+        bit_fact(&mut v, r, j, body);
+        if k == 2 {
+          // Bit 0 says what `x & 1` is.
+          let b0 = bit_of(&mut v, other, v.t_zero);
+          let one = num(&mut v, 1);
+          let is1 = app2(&mut v, OP_EQ, r, one);
+          let link = app2(&mut v, OP_EQ, b0, is1);
+          assert_tm(&mut v, link);
+        }
+        return mk_u(&mut v, r);
+      }
       return mk_u(&mut v, t);
     }
   }
@@ -3441,6 +3600,21 @@ fn bitwise(v: &mut Vr, m: &Mono, p: &Parser, i: u64, op: u64, a: u64, b: u64, ta
     fact = app2(&mut v, OP_LE, r, sum);
   }
   vec_push(&mut st.pc, fact);
+  if v.bits {
+    let j = atom_str(&mut v, "j");
+    let bx = bit_of(&mut v, ta, j);
+    let by = bit_of(&mut v, tb, j);
+    let mut body = 0;
+    if op == P_AMP {
+      body = app2(&mut v, OP_AND, bx, by);
+    } else if op == P_PIPE {
+      body = app2(&mut v, OP_OR, bx, by);
+    } else {
+      let eq = app2(&mut v, OP_EQ, bx, by);
+      body = t_not(&mut v, eq);
+    }
+    bit_fact(&mut v, r, j, body);
+  }
   return mk_u(&mut v, r);
 }
 
@@ -6051,6 +6225,10 @@ fn verify_fn(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
   if has_u(v.hex_fns, xi.def) {
     hex_axioms(&mut v);
   }
+  v.bits = has_u(v.bit_fns, xi.def);
+  if v.bits {
+    bit_axioms(&mut v);
+  }
   let mut env = vec_new[Bind]();
   let mut q = d.a;
   while q != 0 {
@@ -6167,6 +6345,7 @@ fn verify_program(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
   count_gate(m, p, "vcount", &mut v.cnt_fns);
   count_gate(m, p, "bdec", &mut v.dec_fns);
   count_gate(m, p, "bhex", &mut v.hex_fns);
+  count_gate(m, p, "has_bit", &mut v.bit_fns);
   // Each function gets its own solver scope: what is declared and assumed
   // while verifying one (some of it quantified) must not burden the queries
   // for all later ones. And every function after the first starts on a

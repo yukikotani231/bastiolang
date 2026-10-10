@@ -418,6 +418,11 @@ pub struct Verifier<'p> {
     decimal: &'p HashSet<String>,
     /// The same for `bhex` (HEX_AXIOMS).
     hexadecimal: &'p HashSet<String>,
+    /// The functions whose proofs can mention `has_bit` (gated the same
+    /// way), and whether the one being verified is one of them: only then
+    /// is `bit` declared and every bitwise operator described bit by bit.
+    bitwise: &'p HashSet<String>,
+    bits: bool,
 }
 
 /// Does `e` call the spec builtin `call` (`vcount`, `bdec`), or name one of
@@ -495,6 +500,42 @@ const HEX_AXIOMS: &[&str] = &[
     "(assert (forall ((a (Array Int Int)) (f Int) (t Int)) (! (= (hex a f t) (hex_l a f t)) :pattern ((hex a f t)))))",
     "(assert (forall ((a (Array Int Int)) (f Int) (t Int)) (! (=> (<= t f) (= (hex_l a f t) 0)) :pattern ((hex_l a f t)))))",
 ];
+
+/// `has_bit(x, i)` is `(bit x i)`: whether bit `i` of `x` is set. `bit` is
+/// uninterpreted; what the prover knows about it is that no bit of 0 is
+/// set, that bits 0 to w - 1 of the largest w-bit number are, and, for
+/// each bitwise operator a function evaluates, how each bit of the result
+/// follows from the bits of the operands (`bit_facts`). Each of these is a
+/// fact about the binary digits of the natural numbers.
+const BIT_AXIOMS: &[&str] = &[
+    "(declare-fun bit (Int Int) Bool)",
+    "(assert (forall ((j Int)) (! (not (bit 0 j)) :pattern ((bit 0 j)))))",
+    "(assert (forall ((j Int)) (! (= (bit 255 j) (and (<= 0 j) (< j 8))) :pattern ((bit 255 j)))))",
+    "(assert (forall ((j Int)) (! (= (bit 65535 j) (and (<= 0 j) (< j 16))) :pattern ((bit 65535 j)))))",
+    "(assert (forall ((j Int)) (! (= (bit 4294967295 j) (and (<= 0 j) (< j 32))) :pattern ((bit 4294967295 j)))))",
+    "(assert (forall ((j Int)) (! (= (bit 18446744073709551615 j) (and (<= 0 j) (< j 64))) :pattern ((bit 18446744073709551615 j)))))",
+];
+
+/// Bit `j` of the term `t`: `(bit t j)`, or for a literal, which bits are
+/// set spelled out.
+fn bit_of(t: &str, j: &str) -> String {
+    let Ok(c) = t.parse::<u64>() else {
+        return format!("(bit {} {})", t, j);
+    };
+    if c == 0 {
+        return "false".into();
+    }
+    if c.wrapping_add(1) & c == 0 {
+        return format!("(and (<= 0 {j}) (< {j} {}))", c.trailing_ones());
+    }
+    let set: Vec<String> = (0..64).filter(|k| c >> k & 1 == 1).map(|k| format!("(= {} {})", j, k)).collect();
+    if set.len() == 1 { set[0].clone() } else { format!("(or {})", set.join(" ")) }
+}
+
+/// Every bit `j` of `r` is `body` (a formula over `j`).
+fn bit_fact(r: &str, body: &str) -> String {
+    format!("(assert (forall ((j Int)) (! (=> (<= 0 j) (= (bit {r} j) {body})) :pattern ((bit {r} j)))))")
+}
 
 /// `vcount(v, x)` is `(cnt a n x)` over the vector's element array `a` and
 /// length `n`. These facts about it hold for every array and length; each is
@@ -615,6 +656,7 @@ pub fn verify_program(p: &Program, one_session: bool) -> Result<(usize, Vec<Stri
     let counting = counting_fns(p, "vcount");
     let decimal = counting_fns(p, "bdec");
     let hexadecimal = counting_fns(p, "bhex");
+    let bitwise = counting_fns(p, "has_bit");
     let n = p.fns.len();
     let jobs = std::env::var("BASTIO_JOBS")
         .ok()
@@ -626,7 +668,7 @@ pub fn verify_program(p: &Program, one_session: bool) -> Result<(usize, Vec<Stri
     // a function after it, since its result could not be reported anyway.
     let failed = AtomicUsize::new(usize::MAX);
     let workers: Vec<Worker> = std::thread::scope(|s| {
-        let hs: Vec<_> = (0..jobs).map(|_| s.spawn(|| verify_worker(p, &sums, &counting, &decimal, &hexadecimal, &next, &failed))).collect();
+        let hs: Vec<_> = (0..jobs).map(|_| s.spawn(|| verify_worker(p, &sums, &counting, &decimal, &hexadecimal, &bitwise, &next, &failed))).collect();
         hs.into_iter().map(|h| h.join().expect("a verifier thread panicked")).collect()
     });
     let mut obligations = 0;
@@ -667,7 +709,7 @@ struct Worker {
 
 /// Verifies functions, taking the next unverified index each time, on a
 /// solver of its own.
-fn verify_worker(p: &Program, sums: &Summaries, counting: &HashSet<String>, decimal: &HashSet<String>, hexadecimal: &HashSet<String>, next: &AtomicUsize, failed: &AtomicUsize) -> Worker {
+fn verify_worker(p: &Program, sums: &Summaries, counting: &HashSet<String>, decimal: &HashSet<String>, hexadecimal: &HashSet<String>, bitwise: &HashSet<String>, next: &AtomicUsize, failed: &AtomicUsize) -> Worker {
     let mut w = Worker { obligations: 0, log: Vec::new(), times: Vec::new(), err: None };
     let solver = match Solver::start() {
         Ok(s) => s,
@@ -676,7 +718,7 @@ fn verify_worker(p: &Program, sums: &Summaries, counting: &HashSet<String>, deci
             return w;
         }
     };
-    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, int_ops: HashMap::new(), sums, counting, decimal, hexadecimal, counts: false };
+    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, int_ops: HashMap::new(), sums, counting, decimal, hexadecimal, bitwise, counts: false, bits: false };
     let mut run = || -> Result<(), (usize, Diag)> {
         // Every function is verified on a solver in the same state, fresh
         // or reset: what Z3 answers near its work limit depends on what it
@@ -748,6 +790,15 @@ impl<'p> Verifier<'p> {
     fn fresh_name(&mut self, hint: &str) -> String {
         self.counter += 1;
         format!("{}!{}", sanitize(hint), self.counter)
+    }
+
+    /// A fresh name for the value of `t`, so that facts about the bits of
+    /// `t` can be triggered by it (a pattern cannot contain an `ite`).
+    fn named(&mut self, t: &str) -> Result<String, Diag> {
+        let n = self.fresh_name("bits");
+        self.smt(&format!("(declare-const {} Int)", n))?;
+        self.smt(&format!("(assert (= {} {}))", n, t))?;
+        Ok(n)
     }
 
     fn fresh_int(&mut self, hint: &str, lo: &str, hi_incl: &str) -> Result<String, Diag> {
@@ -990,6 +1041,12 @@ impl<'p> Verifier<'p> {
         }
         if self.hexadecimal.contains(&f.name) {
             for c in HEX_AXIOMS {
+                self.smt(c)?;
+            }
+        }
+        self.bits = self.bitwise.contains(&f.name);
+        if self.bits {
+            for c in BIT_AXIOMS {
                 self.smt(c)?;
             }
         }
@@ -1397,8 +1454,15 @@ impl<'p> Verifier<'p> {
             ExprKind::Not(x) => {
                 let v = self.eval(x, st)?;
                 // Bitwise not on an unsigned integer: max - x.
-                if let Some(ity) = self.int_ops.get(&e.pos) {
-                    return Ok(Val::U(format!("(- {} {})", ity.int_max(), v.term())));
+                if let Some(ity) = self.int_ops.get(&e.pos).cloned() {
+                    let t = format!("(- {} {})", ity.int_max(), v.term());
+                    if self.bits {
+                        let r = self.named(&t)?;
+                        let w = ity.int_bits().expect("checked: an integer");
+                        self.smt(&bit_fact(&r, &format!("(and (< j {}) (not {}))", w, bit_of(v.term(), "j"))))?;
+                        return Ok(Val::U(r));
+                    }
+                    return Ok(Val::U(t));
                 }
                 Ok(Val::B(format!("(not {})", v.term())))
             }
@@ -1521,10 +1585,21 @@ impl<'p> Verifier<'p> {
                 _ => pow2(tb, w),
             };
             if op == BinOp::Shr {
-                return Ok(Val::U(format!("(div {} {})", ta, p)));
+                let t = format!("(div {} {})", ta, p);
+                if self.bits {
+                    let r = self.named(&t)?;
+                    self.smt(&bit_fact(&r, &bit_of(ta, &format!("(+ j {})", tb))))?;
+                    return Ok(Val::U(r));
+                }
+                return Ok(Val::U(t));
             }
             let t = format!("(* {} {})", ta, p);
             self.prove(st, &format!("(<= {} {})", t, ity.int_max()), pos, "E-VERIFY-OVERFLOW", format!("that `{} << {}` loses no bits of {}", ra, rb, ity.name()))?;
+            if self.bits {
+                let r = self.named(&t)?;
+                self.smt(&bit_fact(&r, &format!("(and (<= {} j) {})", tb, bit_of(ta, &format!("(- j {})", tb)))))?;
+                return Ok(Val::U(r));
+            }
             return Ok(Val::U(t));
         }
         // `x & (2^k - 1)` keeps the low k bits.
@@ -1532,7 +1607,17 @@ impl<'p> Verifier<'p> {
             for (lit, other) in [(b, ta), (a, tb)] {
                 if let ExprKind::Int(m) = lit.kind {
                     if (m + 1).is_power_of_two() {
-                        return Ok(Val::U(format!("(mod {} {})", other, m + 1)));
+                        let t = format!("(mod {} {})", other, m + 1);
+                        if self.bits {
+                            let r = self.named(&t)?;
+                            self.smt(&bit_fact(&r, &format!("(and (< j {}) {})", (m + 1).trailing_zeros(), bit_of(other, "j"))))?;
+                            if m == 1 {
+                                // Bit 0 says what `x & 1` is.
+                                self.smt(&format!("(assert (= {} (= {} 1)))", bit_of(other, "0"), r))?;
+                            }
+                            return Ok(Val::U(r));
+                        }
+                        return Ok(Val::U(t));
                     }
                 }
             }
@@ -1543,6 +1628,14 @@ impl<'p> Verifier<'p> {
             BinOp::BitOr => format!("(and (<= {ta} {r}) (<= {tb} {r}) (<= {r} (+ {ta} {tb})))"),
             _ => format!("(<= {r} (+ {ta} {tb}))"),
         });
+        if self.bits {
+            let (x, y) = (bit_of(ta, "j"), bit_of(tb, "j"));
+            self.smt(&bit_fact(&r, &match op {
+                BinOp::BitAnd => format!("(and {} {})", x, y),
+                BinOp::BitOr => format!("(or {} {})", x, y),
+                _ => format!("(not (= {} {}))", x, y),
+            }))?;
+        }
         Ok(Val::U(r))
     }
 
@@ -2554,6 +2647,13 @@ impl<'p> Verifier<'p> {
                     let from = self.spec(&args[1], sc, bound)?;
                     let to = self.spec(&args[2], sc, bound)?;
                     return Ok(format!("({} {} {} {})", if name == "bdec" { "dec" } else { "hex" }, data, from, to));
+                }
+                if name == "has_bit" {
+                    let x = self.spec(&args[0], sc, bound)?;
+                    let i = self.spec(&args[1], sc, bound)?;
+                    // Bits from 64 up are never set: every integer in a
+                    // specification is at most a u64.
+                    return Ok(format!("(and (< {i} 64) (bit {x} {i}))"));
                 }
                 if name == "vcount" {
                     let Val::Vec { len, elems, .. } = self.spec_val(&args[0], sc, bound)? else { unreachable!("checked: a Vec") };

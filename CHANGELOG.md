@@ -36,6 +36,9 @@ What will be 0.2.0.
 - Generic `spec fn`s, and `vcount` for counting in specifications; local
   variables may share a function's name (#74).
 - `==` on structs and enums in specifications (#86).
+- `has_bit(x, i)` in specifications, and what every bitwise operator does
+  to each bit, so packed bitmaps are proved to change only the bit they
+  set or clear.
 - Imports are searched for in the library path (`--lib`), so
   `import "core/text.bastio"` works from anywhere (#85).
 

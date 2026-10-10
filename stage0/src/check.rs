@@ -1882,6 +1882,15 @@ impl<'a> Ctx<'a> {
                     }
                     return Ok(Type::U64);
                 }
+                if name == "has_bit" {
+                    // Whether bit `i` of an integer is set.
+                    arity(2)?;
+                    for (k, what) in [(0, "the value"), (1, "the bit number")] {
+                        let t = spec_norm(self.spec_expr(&args[k], in_ensures, bound)?);
+                        expect_ty(&t, &Type::U64, args[k].pos, what)?;
+                    }
+                    return Ok(Type::Bool);
+                }
                 if name == "vlen" || name == "vget" {
                     arity(if name == "vlen" { 1 } else { 2 })?;
                     let t = self.spec_expr(&args[0], in_ensures, bound)?;
@@ -1897,7 +1906,7 @@ impl<'a> Ctx<'a> {
                     return Ok((**el).clone());
                 }
                 if !matches!(name.as_str(), "len" | "get" | "slen" | "sget" | "blen" | "bget") {
-                    return Err(Diag::new("E-TYPE", e.pos, format!("`{}` cannot be called in a specification (allowed: len, get, slen, sget, blen, bget, bdec, bhex, vlen, vget, vcount, old, ghost accessors and spec fns)", name)));
+                    return Err(Diag::new("E-TYPE", e.pos, format!("`{}` cannot be called in a specification (allowed: len, get, slen, sget, blen, bget, bdec, bhex, has_bit, vlen, vget, vcount, old, ghost accessors and spec fns)", name)));
                 }
                 let sig = &self.sigs[name.as_str()];
                 arity(sig.params.len())?;
