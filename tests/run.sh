@@ -112,7 +112,10 @@ if echo 'int main(void){return 0;}' | ${CC:-cc} -fsanitize=address,undefined -x 
     want=$(sed -n 's|^// expect-exit: *||p' "$f" | head -1)
     "$BASTIOC" --emit-c -o "$tmp/$name.c" "$f" 2>/dev/null
     ${CC:-cc} -fsanitize=address,undefined -fno-sanitize-recover=all -g -o "$tmp/$name.san" "$tmp/$name.c"
-    "$tmp/$name.san" </dev/null >/dev/null 2>"$tmp/$name.san.err"; got=$?
+    # A failed allocation returns NULL, as calloc does without ASan, so the
+    # `try_alloc` path that handles it is the one checked.
+    ASAN_OPTIONS=allocator_may_return_null=1 \
+      "$tmp/$name.san" </dev/null >/dev/null 2>"$tmp/$name.san.err"; got=$?
     if [ "$got" = "$want" ]; then pass=$((pass+1)); else
       echo "FAIL $f under sanitizers: exit $got"; sed 's/^/    /' "$tmp/$name.san.err" | head -20; fail=$((fail+1)); fi
   done

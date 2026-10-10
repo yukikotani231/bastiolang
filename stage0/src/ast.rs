@@ -388,6 +388,10 @@ pub struct SpecFn {
     pub ret: Type,
     pub body: Expr,
     pub pos: Pos,
+    /// `opaque spec fn`: its body is seen only by functions in the file
+    /// that defines it; elsewhere it is an uninterpreted function, known
+    /// only through the contracts that mention it.
+    pub opaque: bool,
 }
 
 /// `struct Name { field: Type, .. }`

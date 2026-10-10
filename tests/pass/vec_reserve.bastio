@@ -1,0 +1,69 @@
+// expect-exit: 6
+// `vec_try_reserve` makes room for elements ahead of time, or reports that
+// memory ran out; `vec_push_within` then appends without allocating, so it
+// cannot stop the program. The prover tracks the room (`vcap`) through
+// pushes, pops, loops and calls.
+struct Page { b: Buf }
+
+/// Fills `v` with 0, 1, ..., n - 1, or leaves it empty when memory runs out.
+fn fill(v: &mut Vec[u64], n: u64) -> bool
+  requires vlen(v) == 0 && n <= 1000
+  ensures result ==> vlen(v) == n && vcap(v) >= n
+  ensures !result ==> vlen(v) == 0
+{
+  if !vec_try_reserve(&mut v, n) {
+    return false;
+  }
+  let mut i = 0;
+  while i < n
+    invariant i <= n && vlen(v) == i && vcap(v) >= n
+  {
+    vec_push_within(&mut v, i);
+    i = i + 1;
+  }
+  return true;
+}
+
+fn main() -> u64 {
+  let mut v = vec_new[u64]();
+  let mut s = 0;
+  if fill(&mut v, 4) {
+    if vec_get(v, 3) == 3 {
+      s = 3;
+    }
+    let x = vec_pop(&mut v);                   // popping keeps the room
+    vec_push_within(&mut v, x);
+    if vec_get(v, 2) == 2 {
+      s = s + 2;
+    }
+  }
+  while vec_len(v) > 0
+    invariant true
+  {
+    let x = vec_pop(&mut v);
+  }
+  vec_free(v);
+  // Linear elements: the room is made before the page is allocated, so
+  // nothing has to be given back when there is none.
+  let mut ps = vec_new[Page]();
+  if vec_try_reserve(&mut ps, 1) {
+    vec_push_within(&mut ps, Page { b: alloc(1) });
+  }
+  let mut n = 0;
+  if vec_len(ps) > 0 {
+    let p = vec_pop(&mut ps);
+    n = len(p.b);
+    free(p.b);
+  }
+  vec_free(ps);
+  // A request no allocator can meet fails and leaves the vector as it was.
+  let mut w = vec_new[u64]();
+  vec_push(&mut w, 9);
+  let big = vec_try_reserve(&mut w, 1152921504606846976);
+  let wl = vec_len(w);
+  vec_free(w);
+  if big || wl != 1 {
+    return 100;
+  }
+  return s + n;
+}

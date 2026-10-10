@@ -44,6 +44,7 @@
   "fn"
   "export"
   "spec"
+  "opaque"
   "struct"
   "enum"
   "const"

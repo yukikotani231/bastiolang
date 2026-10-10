@@ -1,0 +1,83 @@
+// expect-exit: 9
+// Packed bitmaps, 64 entries in a word: `has_bit(x, i)` says whether bit
+// `i` of `x` is set, and the prover knows what each bitwise operator does
+// to every bit, so setting, clearing or flipping one bit is proved to
+// leave the other 63 alone, and a search proves every bit it passed set.
+
+/// Every bit of `w` except bit `k` is the same in `o`.
+spec fn same_but(w: u64, o: u64, k: u64) -> bool {
+  forall j: u64 :: j != k ==> has_bit(w, j) == has_bit(o, j)
+}
+
+fn bit_test(w: u64, k: u64) -> bool
+  requires k < 64
+  ensures result == has_bit(w, k)
+{
+  return (w >> k) & 1 == 1;
+}
+
+fn bit_on(w: u64, k: u64) -> u64
+  requires k < 64
+  ensures has_bit(result, k)
+  ensures same_but(result, w, k)
+{
+  return w | (1 << k);
+}
+
+fn bit_off(w: u64, k: u64) -> u64
+  requires k < 64
+  ensures !has_bit(result, k)
+  ensures same_but(result, w, k)
+{
+  return w & !(1 << k);
+}
+
+fn flip(w: u64, k: u64) -> u64
+  requires k < 64
+  ensures has_bit(result, k) == !has_bit(w, k)
+  ensures same_but(result, w, k)
+{
+  return w ^ (1 << k);
+}
+
+/// The lowest clear bit, or 64 when every bit is set.
+fn first_clear(w: u64) -> u64
+  ensures result <= 64
+  ensures result < 64 ==> !has_bit(w, result)
+  ensures forall j: u64 :: j < result ==> has_bit(w, j)
+{
+  let mut i = 0;
+  while i < 64
+    invariant i <= 64
+    invariant forall j: u64 :: j < i ==> has_bit(w, j)
+  {
+    if (w >> i) & 1 == 0 {
+      return i;
+    }
+    i = i + 1;
+  }
+  return 64;
+}
+
+fn main() -> u64 {
+  let w = bit_on(0, 5);
+  let w2 = bit_on(w, 9);
+  let a = bit_test(w2, 5);
+  let b = bit_test(w2, 9);
+  let c = bit_test(w2, 6);
+  assert a && b && !c;
+  let w3 = bit_off(w2, 5);
+  let d = bit_test(w3, 5);
+  let e = bit_test(w3, 9);
+  assert !d && e;
+  let w4 = flip(w3, 0);
+  assert has_bit(w4, 0) && has_bit(w4, 9) && !has_bit(w4, 5);
+  let f = first_clear(18446744073709551615);
+  assert f == 64;
+  let g = first_clear(w4);
+  assert g == 1;
+  if w3 != 512 {
+    return 1;
+  }
+  return f - 64 + g + 8;
+}
