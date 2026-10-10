@@ -71,6 +71,9 @@ enum Val {
     /// A box: its contents, or (beyond the depth the verifier unfolds
     /// recursive data to) only their type.
     Box(BoxVal),
+    /// A vector: its length, and (for `Vec[u64]`) its elements as an SMT
+    /// array; for other element types, reads give fresh values.
+    Vec { elem: Type, len: String, data: String },
     Unit,
 }
 
@@ -135,6 +138,7 @@ fn merge_val(c: &str, a: &Val, b: &Val) -> Val {
         (Val::Obj(ty, f1), Val::Obj(_, f2)) => Val::Obj(ty.clone(), f1.iter().zip(f2).map(|(x, y)| ite(c, x, y)).collect()),
         (Val::Struct(n, f1), Val::Struct(_, f2)) => Val::Struct(n.clone(), f1.iter().zip(f2).map(|(x, y)| merge_val(c, x, y)).collect()),
         (Val::Enum(n, t1, p1), Val::Enum(_, t2, p2)) => Val::Enum(n.clone(), ite(c, t1, t2), p1.iter().zip(p2).map(|(x, y)| merge_val(c, x, y)).collect()),
+        (Val::Vec { elem, len: l1, data: d1 }, Val::Vec { len: l2, data: d2, .. }) => Val::Vec { elem: elem.clone(), len: ite(c, l1, l2), data: ite(c, d1, d2) },
         (Val::Box(BoxVal::Known(x)), Val::Box(BoxVal::Known(y))) => Val::Box(BoxVal::Known(Box::new(merge_val(c, x, y)))),
         // Forgetting what one side knew is sound.
         (Val::Box(BoxVal::Opaque(t)), Val::Box(_)) | (Val::Box(_), Val::Box(BoxVal::Opaque(t))) => Val::Box(BoxVal::Opaque(t.clone())),
@@ -177,7 +181,7 @@ fn kept_by_builtins(t: &Type, field: &str) -> bool {
 
 /// Builtins whose `&mut` argument keeps the fields above.
 const SHAPE_KEEPING: &[&str] =
-    &["bset", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pool_take", "pool_give", "frame_write", "frame_write8", "cpu_set", "cpu_run", "cpu_idle"];
+    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pool_take", "pool_give", "frame_write", "frame_write8", "cpu_set", "cpu_run", "cpu_idle"];
 
 #[derive(Clone)]
 struct State {
@@ -333,6 +337,7 @@ impl<'p> Verifier<'p> {
                 }
                 Ok(Val::Enum(n.clone(), tag, ps))
             }
+            Type::Vec(t) => Ok(Val::Vec { elem: (**t).clone(), len: self.fresh_len(hint)?, data: self.fresh_array(hint, "Int")? }),
             Type::Box(t) => {
                 if self.box_depth >= BOX_DEPTH {
                     return Ok(Val::Box(BoxVal::Opaque((**t).clone())));
@@ -373,6 +378,7 @@ impl<'p> Verifier<'p> {
                         Val::U(t) | Val::B(t) => shown.push((n.to_string(), t.clone())),
                         Val::Buf { len, .. } => shown.push((format!("len({})", n), len.clone())),
                         Val::Str { len, .. } => shown.push((format!("slen({})", n), len.clone())),
+                        Val::Vec { len, .. } => shown.push((format!("vlen({})", n), len.clone())),
                         Val::Obj(t, fs) => {
                             for ((_, arr, acc), term) in ghost_fields(t).iter().zip(fs) {
                                 if !arr {
@@ -720,6 +726,10 @@ impl<'p> Verifier<'p> {
                 }
                 Val::Enum(n.clone(), tag, np)
             }
+            Val::Vec { elem, len, .. } => {
+                let len = if keep { len.clone() } else { self.fresh_len(name)? };
+                Val::Vec { elem: elem.clone(), len, data: self.fresh_array(name, "Int")? }
+            }
             Val::Box(BoxVal::Known(i)) => Val::Box(BoxVal::Known(Box::new(self.havoc(i, false, name)?))),
             Val::Box(BoxVal::Opaque(t)) => Val::Box(BoxVal::Opaque(t.clone())),
             Val::Unit => Val::Unit,
@@ -729,7 +739,12 @@ impl<'p> Verifier<'p> {
     /// Evaluates a code expression, proving its safety obligations on the way.
     fn eval(&mut self, e: &Expr, st: &mut State) -> Result<Val, Diag> {
         match &e.kind {
-            ExprKind::TypeApp(..) => unreachable!("removed by monomorphization"),
+            ExprKind::TypeApp(targs, inner) => match &inner.kind {
+                ExprKind::Call(n, _) if n == "vec_new" => {
+                    Ok(Val::Vec { elem: targs[0].clone(), len: "0".into(), data: "((as const (Array Int Int)) 0)".into() })
+                }
+                _ => unreachable!("removed by monomorphization"),
+            },
             ExprKind::Int(v) => Ok(Val::U(v.to_string())),
             ExprKind::Bool(b) => Ok(Val::B(b.to_string())),
             ExprKind::Str(bytes) => Ok(str_val(bytes)),
@@ -899,6 +914,17 @@ impl<'p> Verifier<'p> {
         set_path(&mut st.env, n, v);
     }
 
+    /// The element at `i` of a vector: tracked for `Vec[u64]`, fresh otherwise.
+    fn vec_elem(&mut self, elem: &Type, data: &str, i: &str, st: &mut State) -> Result<Val, Diag> {
+        if *elem == Type::U64 {
+            let sel = format!("(select {} {})", data, i);
+            st.pc.push(format!("(and (<= 0 {s}) (<= {s} {}))", U64_MAX, s = sel));
+            Ok(Val::U(sel))
+        } else {
+            self.fresh_of(elem, "elem")
+        }
+    }
+
     fn need(&mut self, st: &State, goal: String, pos: Pos, code: &'static str, what: String) -> Result<(), Diag> {
         self.prove(st, &goal, pos, code, what)
     }
@@ -971,6 +997,48 @@ impl<'p> Verifier<'p> {
                 Ok(v)
             }
             "free" | "print" | "bfree" => Ok(Val::Unit),
+
+            // ---- vectors ----
+            "vec_len" => match &vals[0] {
+                Val::Vec { len, .. } => Ok(Val::U(len.clone())),
+                _ => unreachable!(),
+            },
+            "vec_push" => {
+                let Val::Vec { elem, len, data } = vals[0].clone() else { unreachable!() };
+                // A push that cannot grow the vector aborts (out of memory),
+                // so after it the length stayed below 2^60.
+                st.pc.push(format!("(< {} {})", len, ALLOC_MAX));
+                let data = if elem == Type::U64 { format!("(store {} {} {})", data, len, vals[1].term()) } else { data };
+                self.put_back(&args[0], Val::Vec { elem, len: format!("(+ {} 1)", len), data }, st);
+                Ok(Val::Unit)
+            }
+            "vec_pop" => {
+                let Val::Vec { elem, len, data } = vals[0].clone() else { unreachable!() };
+                self.need(st, format!("(> {} 0)", len), pos, "E-VERIFY-BOUNDS", format!("that `{}` is not empty (`vlen({}) > 0`)", ra(0), ra(0)))?;
+                let last = format!("(- {} 1)", len);
+                let v = self.vec_elem(&elem, &data, &last, st)?;
+                self.put_back(&args[0], Val::Vec { elem, len: last, data }, st);
+                Ok(v)
+            }
+            "vec_get" | "vec_set" | "vec_swap" => {
+                let Val::Vec { elem, len, data } = vals[0].clone() else { unreachable!() };
+                let i = vals[1].term().to_string();
+                self.need(st, format!("(< {} {})", i, len), pos, "E-VERIFY-BOUNDS", format!("that the index `{}` is within `{}` (`{} < vlen({})`)", ra(1), ra(0), ra(1), ra(0)))?;
+                let old = if name == "vec_set" { Val::Unit } else { self.vec_elem(&elem, &data, &i, st)? };
+                if name != "vec_get" {
+                    let data = if elem == Type::U64 { format!("(store {} {} {})", data, i, vals[2].term()) } else { data };
+                    self.put_back(&args[0], Val::Vec { elem, len, data }, st);
+                }
+                Ok(old)
+            }
+            "vec_free" => {
+                let Val::Vec { elem, len, .. } = &vals[0] else { unreachable!() };
+                if elem.is_linear() {
+                    // Freeing the storage would drop the elements still in it.
+                    self.need(st, format!("(= {} 0)", len), pos, "E-VERIFY-LEAK", format!("that `{}` is empty (`vlen({}) == 0`): its {} elements are linear and would be dropped", ra(0), ra(0), elem.name()))?;
+                }
+                Ok(Val::Unit)
+            }
 
             // ---- bytes ----
             "balloc" => {
@@ -1251,6 +1319,14 @@ impl<'p> Verifier<'p> {
                 }
                 let v = self.spec_val(&args[0], sc, bound)?;
                 match name.as_str() {
+                    "vlen" => match v {
+                        Val::Vec { len, .. } => len,
+                        _ => unreachable!(),
+                    },
+                    "vget" => match v {
+                        Val::Vec { data, .. } => format!("(select {} {})", data, self.spec(&args[1], sc, bound)?),
+                        _ => unreachable!(),
+                    },
                     "len" | "slen" | "blen" => match v {
                         Val::Buf { len, .. } | Val::Str { len, .. } => len,
                         _ => unreachable!(),

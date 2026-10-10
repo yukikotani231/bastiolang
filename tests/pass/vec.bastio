@@ -1,0 +1,89 @@
+// expect-exit: 68
+// Vec[T]: a growable array. Every slot below the length holds a value, so a
+// vector of linear values needs no per-slot bookkeeping: elements go in with
+// `vec_push`, come out with `vec_pop` or are exchanged with `vec_swap`, and
+// the vector can only be freed once it is empty (proved, not checked).
+
+struct Point { x: u64, y: u64 }
+
+// Contents of a Vec[u64] are known to the prover (`vget`).
+fn fill(v: &mut Vec[u64], n: u64)
+  requires vlen(v) == 0 && n <= 1000
+  ensures vlen(v) == n
+  ensures forall i: u64 :: i < n ==> vget(v, i) == i
+{
+  let mut i = 0;
+  while i < n
+    invariant i <= n && vlen(v) == i
+    invariant forall k: u64 :: k < i ==> vget(v, k) == k
+  {
+    vec_push(&mut v, i);
+    i = i + 1;
+  }
+}
+
+fn sum(v: &Vec[u64]) -> u64
+  requires vlen(v) <= 1000
+  ensures result <= vlen(v) * 1000
+{
+  let mut t = 0;
+  let mut i = 0;
+  while i < vec_len(v)
+    invariant i <= vlen(v) && t <= i * 1000
+  {
+    t = t + vec_get(v, i) % 1000;
+    i = i + 1;
+  }
+  return t;
+}
+
+// A vector of buffers: linear elements.
+fn drain(v: &mut Vec[Buf]) -> u64
+  ensures vlen(v) == 0
+{
+  let mut total = 0;
+  while vec_len(v) > 0
+    invariant total <= 1000000
+  {
+    let b = vec_pop(&mut v);
+    total = total + len(b) % 1000;
+    if total > 1000000 { total = 1000000; }
+    free(b);
+  }
+  return total;
+}
+
+// Generic code over vectors.
+fn last_or[T](v: &Vec[T], d: T) -> T {
+  if vec_len(v) == 0 { return d; }
+  return vec_get(v, vec_len(v) - 1);
+}
+
+fn main() -> u64 {
+  let mut v: Vec[u64] = vec_new[u64]();
+  fill(&mut v, 10);
+  assert vget(v, 3) == 3;
+  let s = sum(v);                                  // 0 + 1 + ... + 9 = 45
+  vec_set(&mut v, 0, 100);
+  let first = vec_get(v, 0);                       // 100, known exactly
+  assert first == 100;
+  let l = last_or[u64](v, 0);                      // 9
+  vec_free(v);
+
+  let mut bufs = vec_new[Buf]();
+  vec_push(&mut bufs, alloc(3));
+  vec_push(&mut bufs, alloc(4));
+  let prev = vec_swap(&mut bufs, 0, alloc(5));      // replaces the 3-element buffer
+  let o = len(prev);
+  free(prev);
+  let d = drain(&mut bufs);                        // 4 + 5 = 9
+  vec_free(bufs);                                  // proved empty
+
+  let mut pts = vec_new[Point]();
+  vec_push(&mut pts, Point { x: 1, y: 2 });
+  let p = vec_pop(&mut pts);
+  vec_free(pts);
+  // 45 + 9 + 3 + 9 + 2 (the prover tracks only Vec[u64] contents, so the
+  // other values are bounded with `%`)
+  return s % 100 + l % 100 + o % 100 + d % 100 + p.y % 100;
+}

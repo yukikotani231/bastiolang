@@ -24,6 +24,7 @@ The language as stage0 implements it today: the v0 proof pipeline, plus `&mut` b
 
 | `S` (a struct) | A user-defined record. Linear when any field is linear; otherwise a plain value that is copied |
 | `E` (an enum) | One of several variants, each with at most one payload. Linear when any payload is linear |
+| `Vec[T]` | A growable array of `T` on the heap. Always **linear** |
 | `Box[T]` | An owning pointer to a `T` on the heap. Always **linear** (it owns the allocation). The only way a type can contain itself |
 
 Borrowing at a call site is implicit: passing an owned `b` to a `&Buf` parameter lends it for the duration of the call. A `&mut` parameter needs an explicit `&mut b`, and `b` must be declared `mut` (or itself be a `&mut` parameter). One call cannot lend the same variable twice if one of the loans is `&mut`.
@@ -134,6 +135,37 @@ match o { Option::Some(v) => { .. }, Option::None => { .. } }
 - Specifications in a generic function are verified for every copy.
 - A definition that instantiates itself with ever larger arguments (`struct S[T] { next: Box[S[Box[T]]] }`) is rejected.
 
+## Vectors
+
+```
+let mut v = vec_new[u64]();
+vec_push(&mut v, 7);
+let x = vec_get(v, 0);           // proved: 0 < vlen(v)
+vec_free(v);
+
+let mut ps = vec_new[Proc]();    // linear elements
+vec_push(&mut ps, p);
+let q = vec_swap(&mut ps, 0, p2);   // exchange: the old element comes back
+let r = vec_pop(&mut ps);
+vec_free(ps);                    // proved: vlen(ps) == 0
+```
+
+| Builtin | Meaning |
+| --- | --- |
+| `vec_new[T]() -> Vec[T]` | An empty vector |
+| `vec_len(v: &Vec[T]) -> u64` | Its length (`vlen(v)` in specifications) |
+| `vec_push(v: &mut Vec[T], x: T)` | Appends `x`, growing the storage when full |
+| `vec_pop(v: &mut Vec[T]) -> T` | Removes and returns the last element. Requires `vlen(v) > 0` |
+| `vec_get(v: &Vec[T], i: u64) -> T` | A copy of element `i`. Requires `i < vlen(v)`; only for non-linear `T` |
+| `vec_set(v: &mut Vec[T], i: u64, x: T)` | Overwrites element `i`. Requires `i < vlen(v)`; only for non-linear `T` |
+| `vec_swap(v: &mut Vec[T], i: u64, x: T) -> T` | Puts `x` at `i` and returns what was there. Requires `i < vlen(v)` |
+| `vec_free(v: Vec[T])` | Frees the storage. For linear `T`, requires `vlen(v) == 0` (`E-VERIFY-LEAK`) |
+
+- Every slot below the length holds a value, so a vector of linear values needs no per-slot ownership: elements leave only through `vec_pop` and `vec_swap`, and freeing is allowed only when nothing is left.
+- Specifications: `vlen(v)` for any vector, and `vget(v, i)` for the elements of a `Vec[u64]`. The prover tracks the contents of `Vec[u64]` only; elements of other types read back as unknown values (still of the right type).
+- The storage doubles when full. A push that cannot get memory aborts, as `alloc` does; the prover takes this into account by assuming the length stays below 2^60 after a push.
+- In generated code a `Vec[T]` is `{ len, cap, data }` and element access is a plain array access, with no bounds checks.
+
 ## Built-in functions
 
 | Function | Precondition (proved) | Effect |
@@ -242,7 +274,8 @@ The compiler executes each function symbolically. At every point where the progr
 
 | Code | What is proved |
 | --- | --- |
-| `E-VERIFY-BOUNDS` | `get` / `set` / `sget` index < length |
+| `E-VERIFY-BOUNDS` | `get` / `set` / `sget` / `vec_get` / `vec_set` / `vec_swap` index < length; `vec_pop` on a non-empty vector |
+| `E-VERIFY-LEAK` | a vector of linear elements is empty when it is freed |
 | `E-VERIFY-OVERFLOW` | `+` and `*` results < 2^64 |
 | `E-VERIFY-UNDERFLOW` | `a - b` has a >= b |
 | `E-VERIFY-DIVZERO` | the divisor of `/` and `%` is not zero |

@@ -331,15 +331,15 @@ impl Parser {
             "Pool" => Ok(Type::Pool),
             "Mmu" => Ok(Type::Mmu),
             "Cpu" => Ok(Type::Cpu),
-            _ if *self.peek() == Tok::LBracket && n != "Box" => Ok(Type::Generic(n, self.targs()?)),
-            "Box" => {
-                self.expect(Tok::LBracket, "`[` after `Box`")?;
+            _ if *self.peek() == Tok::LBracket && n != "Box" && n != "Vec" => Ok(Type::Generic(n, self.targs()?)),
+            "Box" | "Vec" => {
+                self.expect(Tok::LBracket, "`[`")?;
                 let inner = self.ty()?;
                 self.expect(Tok::RBracket, "`]`")?;
                 if inner.is_ref() {
-                    return Err(Diag::new("E-PARSE", pos, "a box cannot hold a borrow"));
+                    return Err(Diag::new("E-PARSE", pos, format!("a {} cannot hold a borrow", n)));
                 }
-                Ok(Type::Box(Box::new(inner)))
+                Ok(if n == "Box" { Type::Box(Box::new(inner)) } else { Type::Vec(Box::new(inner)) })
             }
             _ => Ok(Type::Struct(n)),
         }

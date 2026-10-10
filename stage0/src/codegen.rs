@@ -40,12 +40,15 @@ struct Gen<'a> {
     sigs: &'a HashMap<String, crate::check::Sig>,
     /// Boxed types used anywhere: each gets a pair of helpers.
     boxed: &'a mut Vec<Type>,
+    /// Element types of vectors operated on: each gets a set of helpers.
+    vecs: &'a mut Vec<Type>,
 }
 
 pub fn emit(p: &Program, target: Target) -> String {
     let sigs = crate::check::signatures(p, target).expect("checked");
     let mut blobs = Vec::new();
     let mut boxed = Vec::new();
+    let mut vecs = Vec::new();
     let mut bodies = String::new();
     for f in &p.fns {
         let mut g = Gen {
@@ -55,6 +58,7 @@ pub fn emit(p: &Program, target: Target) -> String {
             types: f.params.iter().map(|p| (p.name.clone(), p.ty.base().clone())).collect(),
             sigs: &sigs,
             boxed: &mut boxed,
+            vecs: &mut vecs,
         };
         bodies.push_str(&format!("{} {{\n", proto(f)));
         for s in &f.body {
@@ -67,6 +71,15 @@ pub fn emit(p: &Program, target: Target) -> String {
         out.push_str(part);
     }
     out.push_str(&struct_decls(p));
+    for t in &vecs {
+        let (c, n) = (cty(t), box_helper(t));
+        out.push_str(&format!("static void bst_vec_push_{n}(bst_vec *v, {c} x) {{ if (v->len == v->cap) bst_vec_grow(v, sizeof({c})); (({c} *)v->data)[v->len++] = x; }}\n"));
+        out.push_str(&format!("static {c} bst_vec_pop_{n}(bst_vec *v) {{ return (({c} *)v->data)[--v->len]; }}\n"));
+        out.push_str(&format!("static {c} bst_vec_get_{n}(bst_vec v, uint64_t i) {{ return (({c} *)v.data)[i]; }}\n"));
+        out.push_str(&format!("static void bst_vec_set_{n}(bst_vec *v, uint64_t i, {c} x) {{ (({c} *)v->data)[i] = x; }}\n"));
+        out.push_str(&format!("static {c} bst_vec_swap_{n}(bst_vec *v, uint64_t i, {c} x) {{ {c} o = (({c} *)v->data)[i]; (({c} *)v->data)[i] = x; return o; }}\n"));
+        out.push_str(&format!("static void bst_vec_free_{n}(bst_vec v) {{ bst_vec_release(v, sizeof({c})); }}\n"));
+    }
     for t in &boxed {
         let (c, n) = (cty(t), box_helper(t));
         out.push_str(&format!("static {c} *bst_box_{n}({c} v) {{ {c} *p = ({c} *)bst_box_alloc(sizeof({c})); *p = v; return p; }}\n"));
@@ -400,6 +413,24 @@ const PRELUDE_BYTES: &str = r#"
 /* Box[T]: one allocation from the same allocator as Buf. */
 static void *bst_box_alloc(uint64_t n) { return bst_alloc((n + 7) / 8).data; }
 static void bst_box_free(void *p, uint64_t n) { bst_buf w = { (n + 7) / 8, (uint64_t *)p }; bst_free(w); }
+
+/* Vec[T]: elements in one allocation that doubles when full. A size past
+ * 2^60 bytes asks the allocator for more than it can give, so it aborts
+ * (out of memory), as `alloc` does. */
+typedef struct { uint64_t len, cap; void *data; } bst_vec;
+static void bst_vec_release(bst_vec v, uint64_t size) {
+    if (v.data) { bst_buf b = { (v.cap * size + 7) / 8, (uint64_t *)v.data }; bst_free(b); }
+}
+static void bst_vec_grow(bst_vec *v, uint64_t size) {
+    uint64_t ncap = v->cap ? v->cap * 2 : 4;
+    uint64_t bytes = ncap > (UINT64_C(1) << 60) / size ? ~UINT64_C(0) - 8 : ncap * size;
+    bst_buf nb = bst_alloc((bytes + 7) / 8);
+    unsigned char *d = (unsigned char *)nb.data, *s = (unsigned char *)v->data;
+    for (uint64_t i = 0; i < v->len * size; i++) d[i] = s[i];
+    bst_vec_release(*v, size);
+    v->data = nb.data;
+    v->cap = ncap;
+}
 static inline void bst_bset(bst_bytes *b, uint64_t i, uint64_t v) { b->data[i] = (unsigned char)v; }
 static bst_bytes bst_bfrom(bst_str s) {
     bst_bytes b = bst_balloc(s.len);
@@ -543,6 +574,7 @@ fn cty(t: &Type) -> String {
         Type::Enum(n) => format!("bst_e_{}", cid(n)),
         Type::Generic(..) => unreachable!("removed by monomorphization"),
         Type::Box(t) => format!("{} *", cty(t)),
+        Type::Vec(_) => "bst_vec".into(),
         Type::Ref(t) => cty(t),
         Type::MutRef(_) => unreachable!("written by proto"),
     }
@@ -662,10 +694,32 @@ impl<'a> Gen<'a> {
         s
     }
 
+    /// The element type of the vector a `vec_*` call's first argument names.
+    fn vec_elem(&self, a: &Expr) -> Type {
+        let t = match &a.kind {
+            ExprKind::MutBorrow(n) => self.place_type(n),
+            _ => self.type_of(a),
+        };
+        let Type::Vec(el) = t else { unreachable!("checked: a Vec") };
+        *el
+    }
+
+    fn place_type(&self, path: &str) -> Type {
+        let mut parts = path.split('.');
+        let mut t = self.types[parts.next().unwrap()].clone();
+        for f in parts {
+            while let Type::Box(i) = t {
+                t = *i;
+            }
+            t = struct_def(t.name().as_str()).unwrap().field(f).unwrap().clone();
+        }
+        t
+    }
+
     /// The type of a code expression (the checker has already accepted it).
     fn type_of(&self, e: &Expr) -> Type {
         match &e.kind {
-            ExprKind::TypeApp(..) => unreachable!("removed by monomorphization"),
+            ExprKind::TypeApp(targs, _) => Type::Vec(Box::new(targs[0].clone())), // vec_new[T]()
             ExprKind::Int(_) => Type::U64,
             ExprKind::Bool(_) | ExprKind::Not(_) | ExprKind::Is(..) => Type::Bool,
             ExprKind::Str(_) | ExprKind::Blob(_) => Type::Str,
@@ -687,6 +741,11 @@ impl<'a> Gen<'a> {
             ExprKind::Call(n, args) if n == "unbox" => match self.type_of(&args[0]) {
                 Type::Box(i) => *i,
                 _ => unreachable!("checked"),
+            },
+            ExprKind::Call(n, args) if n.starts_with("vec_") => match n.as_str() {
+                "vec_len" => Type::U64,
+                "vec_push" | "vec_set" | "vec_free" => Type::Unit,
+                _ => self.vec_elem(&args[0]),
             },
             ExprKind::Call(n, _) => self.sigs[n].ret.clone(),
             ExprKind::MutBorrow(_) | ExprKind::Forall(..) => unreachable!("not a value"),
@@ -782,7 +841,7 @@ impl<'a> Gen<'a> {
 
     fn expr(&mut self, e: &Expr) -> String {
         match &e.kind {
-            ExprKind::TypeApp(..) => unreachable!("removed by monomorphization"),
+            ExprKind::TypeApp(..) => "((bst_vec){ 0, 0, 0 })".to_string(), // vec_new[T]()
             ExprKind::Int(v) => format!("UINT64_C({})", v),
             ExprKind::Bool(b) => b.to_string(),
             ExprKind::Str(bytes) => {
@@ -816,6 +875,18 @@ impl<'a> Gen<'a> {
             ExprKind::Not(x) => format!("(!{})", self.expr(x)),
             ExprKind::Bin(op, a, b) => format!("({} {} {})", self.expr(a), op.text(), self.expr(b)),
             ExprKind::Forall(..) => unreachable!("specification only"),
+            ExprKind::Call(name, args) if name.starts_with("vec_") => {
+                let el = self.vec_elem(&args[0]);
+                if !self.vecs.contains(&el) {
+                    self.vecs.push(el.clone());
+                }
+                let a: Vec<String> = args.iter().map(|x| self.expr(x)).collect();
+                if name == "vec_len" {
+                    format!("{}.len", a[0])
+                } else {
+                    format!("bst_{}_{}({})", name, box_helper(&el), a.join(", "))
+                }
+            }
             ExprKind::Call(name, args) if name == "box" || name == "unbox" => {
                 let t = self.type_of(&args[0]);
                 let inner = if name == "box" { t } else { let Type::Box(i) = t else { unreachable!("checked") }; *i };

@@ -153,6 +153,7 @@ impl Mono {
                 Type::Struct(self.instance(n, a, arity, "type", pos)?)
             }
             Type::Box(i) => Type::Box(Box::new(self.ty(i, s, pos)?)),
+            Type::Vec(i) => Type::Vec(Box::new(self.ty(i, s, pos)?)),
             Type::Ref(i) => Type::Ref(Box::new(self.ty(i, s, pos)?)),
             Type::MutRef(i) => Type::MutRef(Box::new(self.ty(i, s, pos)?)),
             t => t.clone(),
@@ -212,6 +213,12 @@ impl Mono {
             let mut a = Vec::new();
             for t in targs.iter() {
                 a.push(self.ty(t, s, pos)?);
+            }
+            // A builtin that takes type arguments keeps them (they say what
+            // it makes), with type parameters replaced.
+            if matches!(&inner.kind, ExprKind::Call(n, _) if crate::check::TYPED_BUILTINS.contains(&n.as_str())) {
+                *targs = a;
+                return self.children(inner, s);
             }
             let mut inner = (**inner).clone();
             match &mut inner.kind {

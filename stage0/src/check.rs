@@ -128,8 +128,14 @@ pub fn builtin_sigs() -> HashMap<String, Sig> {
     builtin_table().into_iter().map(|(n, _, params, ret)| (n.to_string(), Sig { params, ret })).collect()
 }
 
+/// Builtins over `Vec[T]`: generic, so their signatures are built per call.
+pub const VEC_BUILTINS: &[&str] = &["vec_new", "vec_len", "vec_push", "vec_pop", "vec_get", "vec_set", "vec_swap", "vec_free"];
+
+/// Builtins written with type arguments (`vec_new[u64]()`).
+pub const TYPED_BUILTINS: &[&str] = &["vec_new"];
+
 pub fn is_builtin(name: &str) -> bool {
-    name == "box" || name == "unbox" || builtin_table().iter().any(|b| b.0 == name)
+    name == "box" || name == "unbox" || VEC_BUILTINS.contains(&name) || builtin_table().iter().any(|b| b.0 == name)
 }
 
 fn available(name: &str, target: Target) -> bool {
@@ -171,7 +177,7 @@ pub fn check_structs(p: &Program) -> Result<(), Diag> {
         }
         for t in held {
             let mut t = t;
-            while let Type::Box(i) = t {
+            while let Type::Box(i) | Type::Vec(i) = t {
                 t = i;
             }
             if let Type::Struct(n) | Type::Enum(n) = t {
@@ -219,7 +225,7 @@ fn known_type(t: &Type, pos: Pos) -> Result<(), Diag> {
     match t {
         Type::Struct(n) if struct_def(n).is_none() => Err(Diag::new("E-TYPE", pos, format!("unknown type `{}`", n))),
         Type::Enum(n) if enum_def(n).is_none() => Err(Diag::new("E-TYPE", pos, format!("unknown type `{}`", n))),
-        Type::Box(i) => known_type(i, pos),
+        Type::Box(i) | Type::Vec(i) => known_type(i, pos),
         // Any value can be borrowed; a borrowed plain value reads as a copy.
         // (Generic code borrows `&T` whatever `T` turns out to be.)
         Type::Ref(i) | Type::MutRef(i) => known_type(i, pos),
@@ -805,7 +811,17 @@ impl<'a> Ctx<'a> {
     /// Code expression: linear variables in value position are moved.
     fn expr(&mut self, e: &Expr) -> Result<Type, Diag> {
         match &e.kind {
-            ExprKind::TypeApp(..) => unreachable!("removed by monomorphization"),
+            ExprKind::TypeApp(targs, inner) => match &inner.kind {
+                // `vec_new[T]()`: the only builtin that needs its type written.
+                ExprKind::Call(n, args) if n == "vec_new" => {
+                    if targs.len() != 1 || !args.is_empty() {
+                        return Err(Diag::new("E-TYPE", e.pos, "write `vec_new[T]()`: one type argument, no arguments"));
+                    }
+                    known_type(&targs[0], e.pos)?;
+                    Ok(Type::Vec(Box::new(targs[0].clone())))
+                }
+                _ => unreachable!("removed by monomorphization"),
+            },
             ExprKind::Int(_) => Ok(Type::U64),
             ExprKind::Bool(_) => Ok(Type::Bool),
             ExprKind::Str(_) | ExprKind::Blob(_) => Ok(Type::Str),
@@ -896,6 +912,10 @@ impl<'a> Ctx<'a> {
                 if name == "result" || name == "old" || (is_ghost(name) && !self.sigs.contains_key(name)) || self.specs.iter().any(|s| &s.name == name) {
                     return Err(Diag::new("E-TYPE", e.pos, format!("`{}` is only allowed in specifications", name)));
                 }
+                if VEC_BUILTINS.contains(&name.as_str()) {
+                    let sig = self.vec_sig(name, args, e.pos)?;
+                    return self.call_with(name, sig, args, e.pos);
+                }
                 if name == "box" || name == "unbox" {
                     // Generic over the boxed type, so not in the builtin table.
                     if args.len() != 1 {
@@ -914,72 +934,111 @@ impl<'a> Ctx<'a> {
                 if !available(name, self.target) {
                     return Err(Diag::new("E-TARGET", e.pos, format!("`{}` is not available on this target", name)));
                 }
-                if sig.params.len() != args.len() {
-                    return Err(Diag::new("E-TYPE", e.pos, format!("`{}` takes {} argument(s), {} given", name, sig.params.len(), args.len())));
-                }
-                // Scalars first, then borrows, then moves: a scalar argument may
-                // read a value that a later argument consumes (`set(b, i, get(b, j))`).
-                for (pt, a) in sig.params.iter().zip(args) {
-                    if !pt.is_linear() && !pt.is_ref() {
-                        let t = self.expr(a)?;
-                        expect_ty(&t, pt, a.pos, &format!("argument of `{}`", name))?;
-                    }
-                }
-                // Borrows: a place lent as `&mut` may not overlap any other
-                // borrow in the same call (a place overlaps its fields).
-                let mut borrowed: Vec<(String, bool)> = Vec::new();
-                for (pt, a) in sig.params.iter().zip(args) {
-                    if !pt.is_ref() {
-                        continue;
-                    }
-                    let n = match (&a.kind, pt) {
-                        (ExprKind::MutBorrow(n), Type::MutRef(_)) => n.clone(),
-                        (_, Type::Ref(_)) if place(a).is_some() => place(a).unwrap(),
-                        (_, Type::MutRef(_)) => return Err(Diag::new("E-TYPE", a.pos, format!("argument of `{}` must be `&mut x` for a variable or field `x`", name))),
-                        _ => return Err(Diag::new("E-TYPE", a.pos, format!("argument of `{}` must name a value to borrow", name))),
-                    };
-                    let (t, info) = self.path_type(&n, a.pos)?;
-                    if t != *pt.base() {
-                        return Err(Diag::new("E-TYPE", a.pos, format!("argument of `{}` must be {}, found {}", name, pt.base().name(), t.name())));
-                    }
-                    if pt.is_mut_ref() {
-                        if matches!(info.ty, Type::Ref(_)) {
-                            return Err(Diag::new("E-LINEAR-USE", a.pos, format!("`{}` is a shared borrow and cannot be lent as `&mut`", path_root(&n))));
-                        }
-                        if !info.mutable {
-                            return Err(Diag::new("E-TYPE", a.pos, format!("`{}` is not mutable (declare it with `mut`)", path_root(&n))));
-                        }
-                    }
-                    if self.prefix_moved(&n).is_some() {
-                        return Err(Diag::new("E-LINEAR-USE", a.pos, format!("`{}` is borrowed after it was consumed", n)));
-                    }
-                    if let Some(m) = self.desc_moved(&n) {
-                        return Err(Diag::new("E-LINEAR-USE", a.pos, format!("`{}` is borrowed after its field `{}` was moved out", n, m)));
-                    }
-                    if let Some((q, _)) = borrowed.iter().find(|(q, qm)| overlaps(&n, q) && (*qm || pt.is_mut_ref())) {
-                        let msg = if *q == n {
-                            format!("`{}` is lent as `&mut` while also borrowed in this call", n)
-                        } else {
-                            format!("`{}` and `{}` overlap, and one of them is lent as `&mut` in this call", q, n)
-                        };
-                        return Err(Diag::new("E-LINEAR-USE", a.pos, msg));
-                    }
-                    borrowed.push((n, pt.is_mut_ref()));
-                }
-                for (pt, a) in sig.params.iter().zip(args) {
-                    if pt.is_linear() {
-                        if let Some(n) = place(a) {
-                            if borrowed.iter().any(|(q, _)| overlaps(&n, q)) {
-                                return Err(Diag::new("E-LINEAR-USE", a.pos, format!("`{}` is both borrowed and moved in this call", n)));
-                            }
-                        }
-                        let t = self.expr(a)?;
-                        expect_ty(&t, pt, a.pos, &format!("argument of `{}`", name))?;
-                    }
-                }
-                Ok(sig.ret)
+                self.call_with(name, sig, args, e.pos)
             }
         }
+    }
+
+    /// The signature of a `Vec` builtin, for the element type of the vector
+    /// its first argument names.
+    fn vec_sig(&mut self, name: &str, args: &[Expr], pos: Pos) -> Result<Sig, Diag> {
+        if name == "vec_new" {
+            return Err(Diag::new("E-TYPE", pos, "write the element type: `vec_new[T]()`"));
+        }
+        let p = match args.first().map(|a| &a.kind) {
+            Some(ExprKind::MutBorrow(n)) => Some(n.clone()),
+            Some(_) => place(&args[0]),
+            None => None,
+        };
+        let p = p.ok_or_else(|| Diag::new("E-TYPE", pos, format!("the first argument of `{}` must name a vector", name)))?;
+        let t = match self.path_type(&p, pos)?.0 {
+            Type::Vec(t) => *t,
+            t => return Err(Diag::new("E-TYPE", args[0].pos, format!("`{}` needs a Vec, found {}", name, t.name()))),
+        };
+        let v = Type::Vec(Box::new(t.clone()));
+        let (params, ret) = match name {
+            "vec_len" => (vec![r(v)], Type::U64),
+            "vec_push" => (vec![m(v), t.clone()], Type::Unit),
+            "vec_pop" => (vec![m(v)], t.clone()),
+            "vec_swap" => (vec![m(v), Type::U64, t.clone()], t.clone()),
+            "vec_free" => (vec![v], Type::Unit),
+            "vec_get" | "vec_set" if t.is_linear() => {
+                let (code, why) = if name == "vec_get" { ("E-LINEAR-USE", "would copy") } else { ("E-LINEAR-LEAK", "would drop") };
+                return Err(Diag::new(code, pos, format!("`{}` {} a linear {}", name, why, t.name())).note("use `vec_swap` to exchange an element, or `vec_pop`"));
+            }
+            "vec_get" => (vec![r(v), Type::U64], t.clone()),
+            "vec_set" => (vec![m(v), Type::U64, t.clone()], Type::Unit),
+            _ => unreachable!("a Vec builtin"),
+        };
+        Ok(Sig { params, ret })
+    }
+
+    /// Checks a call's arguments against `sig`: scalars, then borrows, then moves.
+    fn call_with(&mut self, name: &str, sig: Sig, args: &[Expr], pos: Pos) -> Result<Type, Diag> {
+        if sig.params.len() != args.len() {
+            return Err(Diag::new("E-TYPE", pos, format!("`{}` takes {} argument(s), {} given", name, sig.params.len(), args.len())));
+        }
+        // Scalars first, then borrows, then moves: a scalar argument may
+        // read a value that a later argument consumes (`set(b, i, get(b, j))`).
+        for (pt, a) in sig.params.iter().zip(args) {
+            if !pt.is_linear() && !pt.is_ref() {
+                let t = self.expr(a)?;
+                expect_ty(&t, pt, a.pos, &format!("argument of `{}`", name))?;
+            }
+        }
+        // Borrows: a place lent as `&mut` may not overlap any other
+        // borrow in the same call (a place overlaps its fields).
+        let mut borrowed: Vec<(String, bool)> = Vec::new();
+        for (pt, a) in sig.params.iter().zip(args) {
+            if !pt.is_ref() {
+                continue;
+            }
+            let n = match (&a.kind, pt) {
+                (ExprKind::MutBorrow(n), Type::MutRef(_)) => n.clone(),
+                (_, Type::Ref(_)) if place(a).is_some() => place(a).unwrap(),
+                (_, Type::MutRef(_)) => return Err(Diag::new("E-TYPE", a.pos, format!("argument of `{}` must be `&mut x` for a variable or field `x`", name))),
+                _ => return Err(Diag::new("E-TYPE", a.pos, format!("argument of `{}` must name a value to borrow", name))),
+            };
+            let (t, info) = self.path_type(&n, a.pos)?;
+            if t != *pt.base() {
+                return Err(Diag::new("E-TYPE", a.pos, format!("argument of `{}` must be {}, found {}", name, pt.base().name(), t.name())));
+            }
+            if pt.is_mut_ref() {
+                if matches!(info.ty, Type::Ref(_)) {
+                    return Err(Diag::new("E-LINEAR-USE", a.pos, format!("`{}` is a shared borrow and cannot be lent as `&mut`", path_root(&n))));
+                }
+                if !info.mutable {
+                    return Err(Diag::new("E-TYPE", a.pos, format!("`{}` is not mutable (declare it with `mut`)", path_root(&n))));
+                }
+            }
+            if self.prefix_moved(&n).is_some() {
+                return Err(Diag::new("E-LINEAR-USE", a.pos, format!("`{}` is borrowed after it was consumed", n)));
+            }
+            if let Some(m) = self.desc_moved(&n) {
+                return Err(Diag::new("E-LINEAR-USE", a.pos, format!("`{}` is borrowed after its field `{}` was moved out", n, m)));
+            }
+            if let Some((q, _)) = borrowed.iter().find(|(q, qm)| overlaps(&n, q) && (*qm || pt.is_mut_ref())) {
+                let msg = if *q == n {
+                    format!("`{}` is lent as `&mut` while also borrowed in this call", n)
+                } else {
+                    format!("`{}` and `{}` overlap, and one of them is lent as `&mut` in this call", q, n)
+                };
+                return Err(Diag::new("E-LINEAR-USE", a.pos, msg));
+            }
+            borrowed.push((n, pt.is_mut_ref()));
+        }
+        for (pt, a) in sig.params.iter().zip(args) {
+            if pt.is_linear() {
+                if let Some(n) = place(a) {
+                    if borrowed.iter().any(|(q, _)| overlaps(&n, q)) {
+                        return Err(Diag::new("E-LINEAR-USE", a.pos, format!("`{}` is both borrowed and moved in this call", n)));
+                    }
+                }
+                let t = self.expr(a)?;
+                expect_ty(&t, pt, a.pos, &format!("argument of `{}`", name))?;
+            }
+        }
+        Ok(sig.ret)
     }
 
     /// Specification expression: ghost, never consumes.
@@ -1101,8 +1160,26 @@ impl<'a> Ctx<'a> {
                     }
                     return Ok(g.3.clone());
                 }
+                if name == "vlen" || name == "vget" {
+                    arity(if name == "vlen" { 1 } else { 2 })?;
+                    let t = self.spec_expr(&args[0], in_ensures, bound)?;
+                    let ok = match &t {
+                        Type::Vec(el) => name == "vlen" || **el == Type::U64,
+                        _ => false,
+                    };
+                    if !ok {
+                        let want = if name == "vlen" { "a Vec" } else { "a Vec[u64]" };
+                        return Err(Diag::new("E-TYPE", args[0].pos, format!("argument of `{}` must be {}, found {}", name, want, t.name())));
+                    }
+                    check_lin(&args[0])?;
+                    if name == "vget" {
+                        let ti = self.spec_expr(&args[1], in_ensures, bound)?;
+                        expect_ty(&ti, &Type::U64, args[1].pos, "an index")?;
+                    }
+                    return Ok(Type::U64);
+                }
                 if !matches!(name.as_str(), "len" | "get" | "slen" | "sget" | "blen" | "bget") {
-                    return Err(Diag::new("E-TYPE", e.pos, format!("`{}` cannot be called in a specification (allowed: len, get, slen, sget, blen, bget, old, ghost accessors and spec fns)", name)));
+                    return Err(Diag::new("E-TYPE", e.pos, format!("`{}` cannot be called in a specification (allowed: len, get, slen, sget, blen, bget, vlen, vget, old, ghost accessors and spec fns)", name)));
                 }
                 let sig = &self.sigs[name.as_str()];
                 arity(sig.params.len())?;

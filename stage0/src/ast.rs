@@ -42,6 +42,9 @@ pub enum Type {
     /// An owning pointer to a heap value. Always linear (it owns the
     /// allocation), and the only way a type may refer to itself.
     Box(Box<Type>),
+    /// A growable array of `T` on the heap. Always linear. Every slot below
+    /// its length holds a value, so there is no per-slot ownership to track.
+    Vec(Box<Type>),
     /// `Name[T, ..]` as written: a generic struct or enum applied to type
     /// arguments. Only exists before monomorphization, which replaces it with
     /// the `Struct`/`Enum` instance named by `name()` (e.g. `Option[u64]`).
@@ -71,6 +74,7 @@ impl Type {
             Type::Cpu => "Cpu".into(),
             Type::Struct(n) | Type::Enum(n) => n.clone(),
             Type::Box(t) => format!("Box[{}]", t.name()),
+            Type::Vec(t) => format!("Vec[{}]", t.name()),
             Type::Generic(n, args) => format!("{}[{}]", n, args.iter().map(|a| a.name()).collect::<Vec<_>>().join(", ")),
             Type::Ref(t) => format!("&{}", t.name()),
             Type::MutRef(t) => format!("&mut {}", t.name()),
@@ -78,7 +82,7 @@ impl Type {
     }
     pub fn is_linear(&self) -> bool {
         match self {
-            Type::Buf | Type::Bytes | Type::Host | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu | Type::Box(_) => true,
+            Type::Buf | Type::Bytes | Type::Host | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu | Type::Box(_) | Type::Vec(_) => true,
             Type::Struct(n) => struct_def(n).map_or(false, |d| d.fields.iter().any(|f| f.1.is_linear())),
             Type::Enum(n) => enum_def(n).map_or(false, |d| d.variants.iter().any(|v| v.1.as_ref().map_or(false, |t| t.is_linear()))),
             _ => false,
@@ -310,7 +314,7 @@ pub fn resolve_enum_types(p: &mut Program) {
     fn fix(t: &mut Type, names: &[String]) {
         match t {
             Type::Struct(n) if names.contains(n) => *t = Type::Enum(n.clone()),
-            Type::Ref(i) | Type::MutRef(i) | Type::Box(i) => fix(i, names),
+            Type::Ref(i) | Type::MutRef(i) | Type::Box(i) | Type::Vec(i) => fix(i, names),
             Type::Generic(_, args) => args.iter_mut().for_each(|a| fix(a, names)),
             _ => {}
         }
