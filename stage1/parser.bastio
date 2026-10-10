@@ -1,0 +1,1399 @@
+// The parser of bastioc1, the self-hosted Bastio compiler.
+//
+// It turns the tokens from `lexer.bastio` into a syntax tree. The tree lives
+// in one vector of plain `Node`s (an arena): children are indices into it,
+// lists are chained through `next`, and index 0 is a null node that stands
+// for "none" and for the empty list. Names are not copied: a node records
+// where its name is in the source, as tokens do.
+//
+// It must agree with stage0's parser: the same tree, and the same position
+// for the first error. `difftest.sh` compares the two on every source file
+// in the repository through `--dump-ast` (see `astdump.bastio`).
+//
+// Errors: the first one is recorded in the parser (`failed`, `eline`,
+// `ecol`) and every parsing function returns at once after it, so nothing
+// later can overwrite it.
+import "lexer.bastio";
+
+// Types.
+const T_NAMED: u64 = 1;       // a built-in type or a struct/enum name: s..e
+const T_GENERIC: u64 = 2;     // `s..e[a, ..]`, including Box[..] and Vec[..]; a is a list of types
+const T_REF: u64 = 3;         // `&a`
+const T_MUTREF: u64 = 4;      // `&mut a`
+const T_UNIT: u64 = 5;        // no return type
+const N_NAME: u64 = 6;        // a name in a list (type parameters, path parts): s..e
+
+// Expressions.
+const E_INT: u64 = 10;        // v
+const E_BOOL: u64 = 11;       // v is 0 or 1
+const E_STR: u64 = 12;        // s..e, the token's text with escapes not decoded
+const E_BLOB: u64 = 13;       // include_bytes: s..e is the path token's text, v its file's length
+const E_MUTBORROW: u64 = 14;  // `&mut` of the path a (a list of N_NAME)
+const E_FIELD: u64 = 15;      // a.s..e
+const E_SLIT: u64 = 16;       // struct s..e, a is a list of E_FINIT
+const E_FINIT: u64 = 17;      // field s..e: a
+const E_VARIANT: u64 = 18;    // enum s..e, variant s2..e2, payload a (or 0)
+const E_IS: u64 = 19;         // a is enum s..e :: variant s2..e2
+const E_VAR: u64 = 20;        // s..e
+const E_NOT: u64 = 21;        // !a
+const E_BIN: u64 = 22;        // a op b; v is the operator's punctuation code
+const E_CALL: u64 = 23;       // s..e(a, ..)
+const E_FORALL: u64 = 24;     // forall s..e: u64 :: a
+const E_TAPP: u64 = 25;       // type arguments a (list) applied to b
+
+// Statements.
+const S_LET: u64 = 30;        // let (mut if v == 1) s..e: a (or 0) = b
+const S_ASSIGN: u64 = 31;     // path a (list of N_NAME) = b
+const S_IF: u64 = 32;         // if a { b } else { c }
+const S_WHILE: u64 = 33;      // while a, invariants b (list), body c
+const S_RETURN: u64 = 34;     // return a (or 0)
+const S_UNREACHABLE: u64 = 35;
+const S_ASSERT: u64 = 36;     // a
+const S_EXPR: u64 = 37;       // a
+const S_MATCH: u64 = 38;      // match a, arms b (list of S_ARM)
+const S_ARM: u64 = 39;        // pattern v (PAT_*), enum s..e, variant s2..e2, binding a (N_NAME); body c
+
+const PAT_WILD: u64 = 0;
+const PAT_VARIANT: u64 = 1;
+const PAT_BIND: u64 = 2;
+const PAT_BIND_MUT: u64 = 3;
+
+// Definitions.
+const D_STRUCT: u64 = 40;     // s..e, type parameters v (list of N_NAME), fields a (list of D_FIELD)
+const D_FIELD: u64 = 41;      // s..e: a
+const D_ENUM: u64 = 42;       // s..e, type parameters v, variants a (list of D_VARIANT)
+const D_VARIANT: u64 = 43;    // s..e, payload type a (or 0)
+const D_SPEC: u64 = 44;       // s..e, params a, return type b, body c
+const D_FN: u64 = 45;         // s..e, type parameters v, params a, return type b, requires c, ensures d, body x
+const D_PARAM: u64 = 46;      // (mut if v == 1) s..e: a
+
+struct Node {
+  kind: u64, line: u64, col: u64,
+  s: u64, e: u64, s2: u64, e2: u64,
+  v: u64, a: u64, b: u64, c: u64, d: u64, x: u64,
+  next: u64
+}
+
+/// A constant defined so far: its name and value.
+struct Const { s: u64, e: u64, v: u64 }
+
+/// A list being built: its first and last node.
+struct List { head: u64, tail: u64 }
+
+struct Parser {
+  src: Bytes,
+  toks: Vec[Tok],
+  i: u64,
+  nodes: Vec[Node],
+  consts: Vec[Const],
+  /// The E_BLOB nodes, in source order: the driver reads their files.
+  blobs: Vec[u64],
+  failed: bool,
+  eline: u64,
+  ecol: u64,
+  // The definitions, one list per kind.
+  structs: u64,
+  enums: u64,
+  specs: u64,
+  fns: u64
+}
+
+/// A parser over `toks` (the tokens of `src`), starting at token `i`.
+fn parser_new(src: Bytes, toks: Vec[Tok], i: u64) -> Parser {
+  let mut nodes = vec_new[Node]();
+  vec_push(&mut nodes, Node { kind: 0, line: 0, col: 0, s: 0, e: 0, s2: 0, e2: 0, v: 0, a: 0, b: 0, c: 0, d: 0, x: 0, next: 0 });
+  return Parser {
+    src: src, toks: toks, i: i, nodes: nodes, consts: vec_new[Const](), blobs: vec_new[u64](),
+    failed: false, eline: 0, ecol: 0, structs: 0, enums: 0, specs: 0, fns: 0
+  };
+}
+
+fn parser_free(p: Parser) -> Bytes {
+  vec_free(p.toks);
+  vec_free(p.nodes);
+  vec_free(p.consts);
+  vec_free(p.blobs);
+  return p.src;
+}
+
+// ---- Tokens ----
+
+fn eof_tok() -> Tok {
+  return Tok { kind: K_EOF, start: 0, end: 0, line: 0, col: 0, val: 0 };
+}
+
+/// Token `i`, or an EOF token past the end.
+fn tok_at(toks: &Vec[Tok], i: u64) -> Tok {
+  if i < vec_len(toks) {
+    return vec_get(toks, i);
+  }
+  return eof_tok();
+}
+
+fn peek(p: &Parser) -> Tok {
+  return tok_at(p.toks, p.i);
+}
+
+/// The token `k` places ahead.
+fn ahead(p: &Parser, k: u64) -> Tok
+  requires k <= 3
+{
+  if p.i < SRC_MAX {
+    return tok_at(p.toks, p.i + k);
+  }
+  return eof_tok();
+}
+
+/// Takes the current token. At the final (EOF) token it stays put.
+fn bump(p: &mut Parser) -> Tok {
+  let t = peek(p);
+  let n = vec_len(p.toks);
+  if n > 0 && p.i < n - 1 {
+    p.i = p.i + 1;
+  }
+  return t;
+}
+
+fn is_p(t: Tok, c: u64) -> bool {
+  return t.kind == K_PUNCT && t.val == c;
+}
+
+fn is_kw(t: Tok, c: u64) -> bool {
+  return t.kind == K_KEYWORD && t.val == c;
+}
+
+fn at_p(p: &Parser, c: u64) -> bool {
+  return is_p(peek(p), c);
+}
+
+fn at_kw(p: &Parser, c: u64) -> bool {
+  return is_kw(peek(p), c);
+}
+
+fn eat_p(p: &mut Parser, c: u64) -> bool {
+  if at_p(p, c) {
+    bump(&mut p);
+    return true;
+  }
+  return false;
+}
+
+fn eat_kw(p: &mut Parser, c: u64) -> bool {
+  if at_kw(p, c) {
+    bump(&mut p);
+    return true;
+  }
+  return false;
+}
+
+/// Records an error at `line:col`, unless one is recorded already.
+fn fail(p: &mut Parser, line: u64, col: u64) {
+  if !p.failed {
+    p.failed = true;
+    p.eline = line;
+    p.ecol = col;
+  }
+}
+
+fn fail_at(p: &mut Parser, t: Tok) {
+  fail(&mut p, t.line, t.col);
+}
+
+fn expect_p(p: &mut Parser, c: u64) -> Tok {
+  let t = peek(p);
+  if p.failed {
+    return t;
+  }
+  if is_p(t, c) {
+    return bump(&mut p);
+  }
+  fail_at(&mut p, t);
+  return t;
+}
+
+fn expect_kw(p: &mut Parser, c: u64) -> Tok {
+  let t = peek(p);
+  if p.failed {
+    return t;
+  }
+  if is_kw(t, c) {
+    return bump(&mut p);
+  }
+  fail_at(&mut p, t);
+  return t;
+}
+
+fn ident(p: &mut Parser) -> Tok {
+  let t = peek(p);
+  if p.failed {
+    return t;
+  }
+  if t.kind == K_IDENT {
+    return bump(&mut p);
+  }
+  fail_at(&mut p, t);
+  return t;
+}
+
+// ---- Text ----
+
+/// Does token `t` spell `w`?
+fn tok_is(src: &Bytes, t: Tok, w: Str) -> bool {
+  if t.start <= t.end && t.end <= blen(src) {
+    return spells(src, t.start, t.end, w);
+  }
+  return false;
+}
+
+/// Are `src[s1..e1]` and `src[s2..e2]` the same text?
+fn same(src: &Bytes, s1: u64, e1: u64, s2: u64, e2: u64) -> bool {
+  if !(s1 <= e1 && e1 <= blen(src) && s2 <= e2 && e2 <= blen(src)) {
+    return false;
+  }
+  if e1 - s1 != e2 - s2 {
+    return false;
+  }
+  let mut k = 0;
+  while k < e1 - s1
+    invariant k <= e1 - s1 && e1 - s1 == e2 - s2 && s1 <= e1 && e1 <= blen(src) && s2 <= e2 && e2 <= blen(src)
+  {
+    if bget(src, s1 + k) != bget(src, s2 + k) {
+      return false;
+    }
+    k = k + 1;
+  }
+  return true;
+}
+
+// ---- Nodes ----
+
+fn blank(kind: u64, t: Tok) -> Node {
+  return Node { kind: kind, line: t.line, col: t.col, s: 0, e: 0, s2: 0, e2: 0, v: 0, a: 0, b: 0, c: 0, d: 0, x: 0, next: 0 };
+}
+
+/// A node named by token `t`, at `t`.
+fn named(kind: u64, t: Tok) -> Node {
+  let mut n = blank(kind, t);
+  n.s = t.start;
+  n.e = t.end;
+  return n;
+}
+
+fn add(p: &mut Parser, n: Node) -> u64 {
+  let k = vec_len(p.nodes);
+  vec_push(&mut p.nodes, n);
+  return k;
+}
+
+/// Node `i`, or the null node if there is none.
+fn node_at(nodes: &Vec[Node], i: u64) -> Node {
+  if i < vec_len(nodes) {
+    return vec_get(nodes, i);
+  }
+  return blank(0, eof_tok());
+}
+
+fn kind_of(p: &Parser, i: u64) -> u64 {
+  let n = node_at(p.nodes, i);
+  return n.kind;
+}
+
+fn next_of(p: &Parser, i: u64) -> u64 {
+  let n = node_at(p.nodes, i);
+  return n.next;
+}
+
+fn list_new() -> List {
+  return List { head: 0, tail: 0 };
+}
+
+/// `l` with node `n` appended.
+fn append(p: &mut Parser, l: List, n: u64) -> List {
+  if l.head == 0 {
+    return List { head: n, tail: n };
+  }
+  if l.tail < vec_len(p.nodes) {
+    let mut t = vec_get(p.nodes, l.tail);
+    t.next = n;
+    vec_set(&mut p.nodes, l.tail, t);
+  }
+  return List { head: l.head, tail: n };
+}
+
+/// Does a node in the list starting at `i` have the name of token `t`?
+fn has_name(p: &Parser, i: u64, t: Tok) -> bool {
+  let mut k = i;
+  while k != 0 {
+    let n = node_at(p.nodes, k);
+    if same(p.src, n.s, n.e, t.start, t.end) {
+      return true;
+    }
+    k = n.next;
+  }
+  return false;
+}
+
+/// The value of the constant named by `t`: its index + 1 in `consts`, or 0.
+fn const_index(p: &Parser, t: Tok) -> u64 {
+  let mut k = 0;
+  while k < vec_len(p.consts)
+    invariant k <= vlen(p.consts)
+  {
+    let c = vec_get(p.consts, k);
+    if same(p.src, c.s, c.e, t.start, t.end) {
+      return k + 1;
+    }
+    k = k + 1;
+  }
+  return 0;
+}
+
+// ---- Types ----
+
+fn is_ref(p: &Parser, i: u64) -> bool {
+  let k = kind_of(p, i);
+  return k == T_REF || k == T_MUTREF;
+}
+
+fn is_u64(p: &Parser, i: u64) -> bool {
+  let n = node_at(p.nodes, i);
+  if n.kind != T_NAMED || !(n.s <= n.e && n.e <= blen(p.src)) {
+    return false;
+  }
+  return spells(p.src, n.s, n.e, "u64");
+}
+
+fn builtin_type(src: &Bytes, t: Tok) -> bool {
+  return tok_is(src, t, "u64") || tok_is(src, t, "bool") || tok_is(src, t, "Buf") || tok_is(src, t, "Bytes")
+    || tok_is(src, t, "Host") || tok_is(src, t, "Child") || tok_is(src, t, "Serial") || tok_is(src, t, "Str")
+    || tok_is(src, t, "Frame") || tok_is(src, t, "PageTable") || tok_is(src, t, "Pool") || tok_is(src, t, "Mmu")
+    || tok_is(src, t, "Cpu");
+}
+
+fn ty(p: &mut Parser) -> u64 {
+  if p.failed {
+    return 0;
+  }
+  let t = peek(p);
+  if eat_p(&mut p, P_AMP) {
+    let m = eat_kw(&mut p, KW_MUT);
+    let inner = ty(&mut p);
+    if p.failed {
+      return 0;
+    }
+    if is_ref(p, inner) {
+      fail_at(&mut p, t);           // a borrow of a borrow
+      return 0;
+    }
+    let mut r = blank(T_REF, t);
+    if m {
+      r.kind = T_MUTREF;
+    }
+    r.a = inner;
+    return add(&mut p, r);
+  }
+  let name = ident(&mut p);
+  if p.failed {
+    return 0;
+  }
+  let mut n = named(T_NAMED, name);
+  if builtin_type(p.src, name) {
+    return add(&mut p, n);
+  }
+  if tok_is(p.src, name, "Box") || tok_is(p.src, name, "Vec") {
+    expect_p(&mut p, P_LBRACKET);
+    let inner = ty(&mut p);
+    expect_p(&mut p, P_RBRACKET);
+    if p.failed {
+      return 0;
+    }
+    if is_ref(p, inner) {
+      fail_at(&mut p, t);           // a Box or Vec cannot hold a borrow
+      return 0;
+    }
+    n.kind = T_GENERIC;
+    n.a = inner;
+    return add(&mut p, n);
+  }
+  if at_p(p, P_LBRACKET) {
+    n.kind = T_GENERIC;
+    n.a = targs(&mut p);
+    if p.failed {
+      return 0;
+    }
+  }
+  return add(&mut p, n);
+}
+
+/// `[T, U]` after a name in a type or an expression: type arguments.
+fn targs(p: &mut Parser) -> u64 {
+  expect_p(&mut p, P_LBRACKET);
+  let mut l = list_new();
+  let mut more = true;
+  while more && !p.failed {
+    let t = peek(p);
+    let x = ty(&mut p);
+    if p.failed {
+      return 0;
+    }
+    if is_ref(p, x) {
+      fail_at(&mut p, t);           // a type argument cannot be a borrow
+      return 0;
+    }
+    l = append(&mut p, l, x);
+    more = eat_p(&mut p, P_COMMA);
+  }
+  expect_p(&mut p, P_RBRACKET);
+  return l.head;
+}
+
+/// `[T, U]` after a definition's name: its type parameters.
+fn tparams(p: &mut Parser) -> u64 {
+  let mut l = list_new();
+  if p.failed || !eat_p(&mut p, P_LBRACKET) {
+    return 0;
+  }
+  let mut more = true;
+  while more && !p.failed {
+    let t = ident(&mut p);
+    if p.failed {
+      return 0;
+    }
+    if has_name(p, l.head, t) {
+      fail_at(&mut p, t);           // declared twice
+      return 0;
+    }
+    let n = add(&mut p, named(N_NAME, t));
+    l = append(&mut p, l, n);
+    more = eat_p(&mut p, P_COMMA);
+  }
+  expect_p(&mut p, P_RBRACKET);
+  return l.head;
+}
+
+fn params(p: &mut Parser) -> u64 {
+  expect_p(&mut p, P_LPAREN);
+  let mut l = list_new();
+  let mut more = !at_p(p, P_RPAREN);
+  while more && !p.failed {
+    let t = peek(p);
+    let m = eat_kw(&mut p, KW_MUT);
+    let name = ident(&mut p);
+    expect_p(&mut p, P_COLON);
+    let x = ty(&mut p);
+    if p.failed {
+      return 0;
+    }
+    let mut n = named(D_PARAM, name);
+    n.line = t.line;
+    n.col = t.col;
+    if m {
+      n.v = 1;
+    }
+    n.a = x;
+    let k = add(&mut p, n);
+    l = append(&mut p, l, k);
+    more = eat_p(&mut p, P_COMMA);
+  }
+  expect_p(&mut p, P_RPAREN);
+  return l.head;
+}
+
+// ---- Expressions ----
+
+fn expr(p: &mut Parser) -> u64 {
+  return implies(&mut p);
+}
+
+fn bin(p: &mut Parser, op: Tok, a: u64, b: u64) -> u64 {
+  let mut n = blank(E_BIN, op);
+  n.v = op.val;
+  n.a = a;
+  n.b = b;
+  return add(&mut p, n);
+}
+
+fn implies(p: &mut Parser) -> u64 {
+  let lhs = or_expr(&mut p);
+  if p.failed {
+    return 0;
+  }
+  if at_p(p, P_IMPLIES) {
+    let op = bump(&mut p);
+    let rhs = implies(&mut p);
+    if p.failed {
+      return 0;
+    }
+    return bin(&mut p, op, lhs, rhs);
+  }
+  return lhs;
+}
+
+fn or_expr(p: &mut Parser) -> u64 {
+  let mut lhs = and_expr(&mut p);
+  while !p.failed && at_p(p, P_OROR) {
+    let op = bump(&mut p);
+    let rhs = and_expr(&mut p);
+    if p.failed {
+      return 0;
+    }
+    lhs = bin(&mut p, op, lhs, rhs);
+  }
+  return lhs;
+}
+
+fn and_expr(p: &mut Parser) -> u64 {
+  let mut lhs = cmp(&mut p);
+  while !p.failed && at_p(p, P_ANDAND) {
+    let op = bump(&mut p);
+    let rhs = cmp(&mut p);
+    if p.failed {
+      return 0;
+    }
+    lhs = bin(&mut p, op, lhs, rhs);
+  }
+  return lhs;
+}
+
+fn is_cmp(t: Tok) -> bool {
+  return is_p(t, P_EQEQ) || is_p(t, P_NE) || is_p(t, P_LT) || is_p(t, P_LE) || is_p(t, P_GT) || is_p(t, P_GE);
+}
+
+fn cmp(p: &mut Parser) -> u64 {
+  let lhs = add_expr(&mut p);
+  if p.failed {
+    return 0;
+  }
+  if at_kw(p, KW_IS) {
+    let op = bump(&mut p);
+    let en = ident(&mut p);
+    expect_p(&mut p, P_COLONCOLON);
+    let v = ident(&mut p);
+    if p.failed {
+      return 0;
+    }
+    let mut n = named(E_IS, en);
+    n.line = op.line;
+    n.col = op.col;
+    n.s2 = v.start;
+    n.e2 = v.end;
+    n.a = lhs;
+    return add(&mut p, n);
+  }
+  if !is_cmp(peek(p)) {
+    return lhs;
+  }
+  let op = bump(&mut p);
+  let rhs = add_expr(&mut p);
+  if p.failed {
+    return 0;
+  }
+  return bin(&mut p, op, lhs, rhs);
+}
+
+fn add_expr(p: &mut Parser) -> u64 {
+  let mut lhs = mul_expr(&mut p);
+  while !p.failed && (at_p(p, P_PLUS) || at_p(p, P_MINUS)) {
+    let op = bump(&mut p);
+    let rhs = mul_expr(&mut p);
+    if p.failed {
+      return 0;
+    }
+    lhs = bin(&mut p, op, lhs, rhs);
+  }
+  return lhs;
+}
+
+fn mul_expr(p: &mut Parser) -> u64 {
+  let mut lhs = unary(&mut p);
+  while !p.failed && (at_p(p, P_STAR) || at_p(p, P_SLASH) || at_p(p, P_PERCENT)) {
+    let op = bump(&mut p);
+    let rhs = unary(&mut p);
+    if p.failed {
+      return 0;
+    }
+    lhs = bin(&mut p, op, lhs, rhs);
+  }
+  return lhs;
+}
+
+fn unary(p: &mut Parser) -> u64 {
+  if p.failed {
+    return 0;
+  }
+  let t = peek(p);
+  if is_p(t, P_BANG) {
+    bump(&mut p);
+    let x = unary(&mut p);
+    if p.failed {
+      return 0;
+    }
+    let mut n = blank(E_NOT, t);
+    n.a = x;
+    return add(&mut p, n);
+  }
+  let mut e = primary(&mut p);
+  while !p.failed && at_p(p, P_DOT) {
+    let dot = bump(&mut p);
+    let f = ident(&mut p);
+    if p.failed {
+      return 0;
+    }
+    let mut n = named(E_FIELD, f);
+    n.line = dot.line;
+    n.col = dot.col;
+    n.a = e;
+    e = add(&mut p, n);
+  }
+  return e;
+}
+
+/// The rest of a dotted place after its first name.
+fn place_rest(p: &mut Parser, first: Tok) -> u64 {
+  let n0 = add(&mut p, named(N_NAME, first));
+  let mut l = append(&mut p, list_new(), n0);
+  while !p.failed && eat_p(&mut p, P_DOT) {
+    let f = ident(&mut p);
+    if p.failed {
+      return 0;
+    }
+    let n = add(&mut p, named(N_NAME, f));
+    l = append(&mut p, l, n);
+  }
+  return l.head;
+}
+
+fn call_args(p: &mut Parser) -> u64 {
+  expect_p(&mut p, P_LPAREN);
+  let mut l = list_new();
+  let mut more = !at_p(p, P_RPAREN);
+  while more && !p.failed {
+    let x = expr(&mut p);
+    if p.failed {
+      return 0;
+    }
+    l = append(&mut p, l, x);
+    more = eat_p(&mut p, P_COMMA);
+  }
+  expect_p(&mut p, P_RPAREN);
+  return l.head;
+}
+
+/// The `{ field: value, .. }` of a struct literal.
+fn slit_fields(p: &mut Parser) -> u64 {
+  expect_p(&mut p, P_LBRACE);
+  let mut l = list_new();
+  let mut more = true;
+  while more && !p.failed && !at_p(p, P_RBRACE) {
+    let f = ident(&mut p);
+    expect_p(&mut p, P_COLON);
+    let x = expr(&mut p);
+    if p.failed {
+      return 0;
+    }
+    if has_name(p, l.head, f) {
+      fail_at(&mut p, f);           // given twice
+      return 0;
+    }
+    let mut n = named(E_FINIT, f);
+    n.a = x;
+    let k = add(&mut p, n);
+    l = append(&mut p, l, k);
+    more = eat_p(&mut p, P_COMMA);
+  }
+  expect_p(&mut p, P_RBRACE);
+  return l.head;
+}
+
+/// `::Variant` and its optional `(payload)`, after the enum's name `en`.
+fn variant_rest(p: &mut Parser, en: Tok) -> u64 {
+  expect_p(&mut p, P_COLONCOLON);
+  let v = ident(&mut p);
+  let mut payload = 0;
+  if !p.failed && eat_p(&mut p, P_LPAREN) {
+    payload = expr(&mut p);
+    expect_p(&mut p, P_RPAREN);
+  }
+  if p.failed {
+    return 0;
+  }
+  let mut n = named(E_VARIANT, en);
+  n.s2 = v.start;
+  n.e2 = v.end;
+  n.a = payload;
+  return add(&mut p, n);
+}
+
+/// Is `IDENT {` here the start of a struct literal? Its braces open with
+/// `field:`, which no block does.
+fn is_struct_lit(p: &Parser) -> bool {
+  let t2 = ahead(p, 2);
+  return is_p(ahead(p, 1), P_LBRACE) && t2.kind == K_IDENT && is_p(ahead(p, 3), P_COLON);
+}
+
+fn primary(p: &mut Parser) -> u64 {
+  if p.failed {
+    return 0;
+  }
+  let t = peek(p);
+  if t.kind == K_INT {
+    bump(&mut p);
+    let mut n = blank(E_INT, t);
+    n.v = t.val;
+    return add(&mut p, n);
+  }
+  if is_kw(t, KW_TRUE) || is_kw(t, KW_FALSE) {
+    bump(&mut p);
+    let mut n = blank(E_BOOL, t);
+    if is_kw(t, KW_TRUE) {
+      n.v = 1;
+    }
+    return add(&mut p, n);
+  }
+  if t.kind == K_STR {
+    bump(&mut p);
+    return add(&mut p, named(E_STR, t));
+  }
+  if is_p(t, P_LPAREN) {
+    bump(&mut p);
+    let e = expr(&mut p);
+    expect_p(&mut p, P_RPAREN);
+    return e;
+  }
+  if is_kw(t, KW_FORALL) {
+    return forall_expr(&mut p);
+  }
+  if is_p(t, P_AMP) {
+    bump(&mut p);
+    expect_kw(&mut p, KW_MUT);
+    let name = ident(&mut p);
+    if p.failed {
+      return 0;
+    }
+    let mut n = blank(E_MUTBORROW, t);
+    n.a = place_rest(&mut p, name);
+    if p.failed {
+      return 0;
+    }
+    return add(&mut p, n);
+  }
+  if t.kind != K_IDENT {
+    fail_at(&mut p, t);             // expected an expression
+    return 0;
+  }
+  if tok_is(p.src, t, "include_bytes") {
+    return blob_expr(&mut p);
+  }
+  let t1 = ahead(p, 1);
+  if is_p(t1, P_LBRACKET) {
+    return type_app(&mut p);
+  }
+  if is_p(t1, P_COLONCOLON) {
+    bump(&mut p);
+    return variant_rest(&mut p, t);
+  }
+  if is_struct_lit(p) {
+    bump(&mut p);
+    let mut n = named(E_SLIT, t);
+    n.a = slit_fields(&mut p);
+    if p.failed {
+      return 0;
+    }
+    return add(&mut p, n);
+  }
+  let ci = const_index(p, t);
+  if ci != 0 && !is_p(t1, P_LPAREN) {
+    bump(&mut p);
+    let mut n = blank(E_INT, t);
+    if ci - 1 < vec_len(p.consts) {
+      let c = vec_get(p.consts, ci - 1);
+      n.v = c.v;
+    }
+    return add(&mut p, n);
+  }
+  bump(&mut p);
+  if at_p(p, P_LPAREN) {
+    let mut n = named(E_CALL, t);
+    n.a = call_args(&mut p);
+    if p.failed {
+      return 0;
+    }
+    return add(&mut p, n);
+  }
+  return add(&mut p, named(E_VAR, t));
+}
+
+fn forall_expr(p: &mut Parser) -> u64 {
+  let t = bump(&mut p);
+  let name = ident(&mut p);
+  expect_p(&mut p, P_COLON);
+  let x = ty(&mut p);
+  if p.failed {
+    return 0;
+  }
+  if !is_u64(p, x) {
+    fail_at(&mut p, t);             // forall only ranges over u64
+    return 0;
+  }
+  expect_p(&mut p, P_COLONCOLON);
+  let body = expr(&mut p);
+  if p.failed {
+    return 0;
+  }
+  let mut n = named(E_FORALL, name);
+  n.line = t.line;
+  n.col = t.col;
+  n.a = body;
+  return add(&mut p, n);
+}
+
+/// `include_bytes("path")`. The driver reads the file afterwards (see
+/// `blobs`), since the parser has no `Host`.
+fn blob_expr(p: &mut Parser) -> u64 {
+  let t = bump(&mut p);
+  expect_p(&mut p, P_LPAREN);
+  if p.failed {
+    return 0;
+  }
+  let s = bump(&mut p);
+  if s.kind != K_STR {
+    fail_at(&mut p, t);             // the path must be a string literal
+    return 0;
+  }
+  expect_p(&mut p, P_RPAREN);
+  if p.failed {
+    return 0;
+  }
+  let mut n = blank(E_BLOB, t);
+  n.s = s.start;
+  n.e = s.end;
+  let k = add(&mut p, n);
+  vec_push(&mut p.blobs, k);
+  return k;
+}
+
+/// `f[T](..)`, `S[T] { .. }` or `E[T]::V(..)`.
+fn type_app(p: &mut Parser) -> u64 {
+  let t = bump(&mut p);
+  let ts = targs(&mut p);
+  if p.failed {
+    return 0;
+  }
+  let c = peek(p);
+  let mut inner = 0;
+  if is_p(c, P_COLONCOLON) {
+    inner = variant_rest(&mut p, t);
+  } else if is_p(c, P_LBRACE) {
+    let mut n = named(E_SLIT, t);
+    n.a = slit_fields(&mut p);
+    inner = add(&mut p, n);
+  } else if is_p(c, P_LPAREN) {
+    let mut n = named(E_CALL, t);
+    n.a = call_args(&mut p);
+    inner = add(&mut p, n);
+  } else {
+    fail_at(&mut p, c);             // expected `(`, `{` or `::`
+    return 0;
+  }
+  if p.failed {
+    return 0;
+  }
+  let mut n = blank(E_TAPP, t);
+  n.a = ts;
+  n.b = inner;
+  return add(&mut p, n);
+}
+
+/// Folds a constant initializer: literals, earlier constants and
+/// arithmetic, with every step in the u64 range.
+fn const_eval(p: &mut Parser, i: u64) -> u64 {
+  if p.failed {
+    return 0;
+  }
+  let n = node_at(p.nodes, i);
+  if n.kind == E_INT {
+    return n.v;
+  }
+  if n.kind != E_BIN {
+    fail(&mut p, n.line, n.col);
+    return 0;
+  }
+  let x = const_eval(&mut p, n.a);
+  let y = const_eval(&mut p, n.b);
+  if p.failed {
+    return 0;
+  }
+  if n.v == P_PLUS && x <= U64_MAX - y {
+    return x + y;
+  }
+  if n.v == P_MINUS && y <= x {
+    return x - y;
+  }
+  if n.v == P_STAR && (y == 0 || x <= U64_MAX / y) {
+    return x * y;
+  }
+  if n.v == P_SLASH && y != 0 {
+    return x / y;
+  }
+  if n.v == P_PERCENT && y != 0 {
+    return x % y;
+  }
+  fail(&mut p, n.line, n.col);
+  return 0;
+}
+
+// ---- Statements ----
+
+fn block(p: &mut Parser) -> u64 {
+  expect_p(&mut p, P_LBRACE);
+  let mut l = list_new();
+  while !p.failed && !at_p(p, P_RBRACE) {
+    let t = peek(p);
+    if t.kind == K_EOF {
+      fail_at(&mut p, t);           // missing `}`
+      return 0;
+    }
+    let s = stmt(&mut p);
+    if p.failed {
+      return 0;
+    }
+    l = append(&mut p, l, s);
+  }
+  bump(&mut p);
+  return l.head;
+}
+
+/// Is the statement here `place = ...`?
+fn is_assignment(p: &Parser) -> bool {
+  if p.i >= SRC_MAX {
+    return false;
+  }
+  let mut j = p.i + 1;
+  while j < SRC_MAX
+    invariant j <= SRC_MAX + 1
+  {
+    let t = tok_at(p.toks, j);
+    if is_p(t, P_EQ) {
+      return true;
+    }
+    let u = tok_at(p.toks, j + 1);
+    if !(is_p(t, P_DOT) && u.kind == K_IDENT) {
+      return false;
+    }
+    j = j + 2;
+  }
+  return false;
+}
+
+/// A statement node of `kind` at `t` with expression `a`, ending in `;`.
+fn simple(p: &mut Parser, kind: u64, t: Tok, a: u64) -> u64 {
+  expect_p(&mut p, P_SEMI);
+  if p.failed {
+    return 0;
+  }
+  let mut n = blank(kind, t);
+  n.a = a;
+  return add(&mut p, n);
+}
+
+fn stmt(p: &mut Parser) -> u64 {
+  if p.failed {
+    return 0;
+  }
+  let t = peek(p);
+  if is_kw(t, KW_LET) {
+    return let_stmt(&mut p);
+  }
+  if is_kw(t, KW_IF) {
+    return if_stmt(&mut p);
+  }
+  if is_kw(t, KW_WHILE) {
+    return while_stmt(&mut p);
+  }
+  if is_kw(t, KW_RETURN) {
+    bump(&mut p);
+    let mut e = 0;
+    if !at_p(p, P_SEMI) {
+      e = expr(&mut p);
+    }
+    return simple(&mut p, S_RETURN, t, e);
+  }
+  if is_kw(t, KW_UNREACHABLE) {
+    bump(&mut p);
+    return simple(&mut p, S_UNREACHABLE, t, 0);
+  }
+  if is_kw(t, KW_ASSERT) {
+    bump(&mut p);
+    let e = expr(&mut p);
+    return simple(&mut p, S_ASSERT, t, e);
+  }
+  if is_kw(t, KW_MATCH) {
+    return match_stmt(&mut p);
+  }
+  if t.kind == K_IDENT && is_assignment(p) {
+    bump(&mut p);
+    let path = place_rest(&mut p, t);
+    expect_p(&mut p, P_EQ);
+    let value = expr(&mut p);
+    expect_p(&mut p, P_SEMI);
+    if p.failed {
+      return 0;
+    }
+    let mut n = blank(S_ASSIGN, t);
+    n.a = path;
+    n.b = value;
+    return add(&mut p, n);
+  }
+  let e = expr(&mut p);
+  return simple(&mut p, S_EXPR, t, e);
+}
+
+fn let_stmt(p: &mut Parser) -> u64 {
+  let t = bump(&mut p);
+  let m = eat_kw(&mut p, KW_MUT);
+  let name = ident(&mut p);
+  let mut x = 0;
+  if !p.failed && eat_p(&mut p, P_COLON) {
+    x = ty(&mut p);
+  }
+  expect_p(&mut p, P_EQ);
+  let init = expr(&mut p);
+  expect_p(&mut p, P_SEMI);
+  if p.failed {
+    return 0;
+  }
+  let mut n = named(S_LET, name);
+  n.line = t.line;
+  n.col = t.col;
+  if m {
+    n.v = 1;
+  }
+  n.a = x;
+  n.b = init;
+  return add(&mut p, n);
+}
+
+fn if_stmt(p: &mut Parser) -> u64 {
+  let t = expect_kw(&mut p, KW_IF);
+  let cond = expr(&mut p);
+  let then_b = block(&mut p);
+  let mut else_b = 0;
+  if !p.failed && eat_kw(&mut p, KW_ELSE) {
+    if at_kw(p, KW_IF) {
+      else_b = if_stmt(&mut p);
+    } else {
+      else_b = block(&mut p);
+    }
+  }
+  if p.failed {
+    return 0;
+  }
+  let mut n = blank(S_IF, t);
+  n.a = cond;
+  n.b = then_b;
+  n.c = else_b;
+  return add(&mut p, n);
+}
+
+fn while_stmt(p: &mut Parser) -> u64 {
+  let t = bump(&mut p);
+  let cond = expr(&mut p);
+  let mut invs = list_new();
+  while !p.failed && eat_kw(&mut p, KW_INVARIANT) {
+    let x = expr(&mut p);
+    if p.failed {
+      return 0;
+    }
+    invs = append(&mut p, invs, x);
+  }
+  let body = block(&mut p);
+  if p.failed {
+    return 0;
+  }
+  let mut n = blank(S_WHILE, t);
+  n.a = cond;
+  n.b = invs.head;
+  n.c = body;
+  return add(&mut p, n);
+}
+
+fn match_stmt(p: &mut Parser) -> u64 {
+  let t = bump(&mut p);
+  let scrut = expr(&mut p);
+  expect_p(&mut p, P_LBRACE);
+  let mut arms = list_new();
+  while !p.failed && !at_p(p, P_RBRACE) {
+    let a = match_arm(&mut p);
+    if p.failed {
+      return 0;
+    }
+    arms = append(&mut p, arms, a);
+  }
+  bump(&mut p);
+  if p.failed {
+    return 0;
+  }
+  let mut n = blank(S_MATCH, t);
+  n.a = scrut;
+  n.b = arms.head;
+  return add(&mut p, n);
+}
+
+fn match_arm(p: &mut Parser) -> u64 {
+  let t = peek(p);
+  let mut n = blank(S_ARM, t);
+  if t.kind != K_IDENT {
+    fail_at(&mut p, t);             // expected a pattern
+    return 0;
+  }
+  bump(&mut p);
+  if tok_is(p.src, t, "_") {
+    n.v = PAT_WILD;
+  } else {
+    // Type arguments in a pattern are redundant and are ignored.
+    if at_p(p, P_LBRACKET) {
+      targs(&mut p);
+    }
+    expect_p(&mut p, P_COLONCOLON);
+    let v = ident(&mut p);
+    n.v = PAT_VARIANT;
+    n.s = t.start;
+    n.e = t.end;
+    n.s2 = v.start;
+    n.e2 = v.end;
+    if !p.failed && eat_p(&mut p, P_LPAREN) {
+      n.v = PAT_BIND;
+      if eat_kw(&mut p, KW_MUT) {
+        n.v = PAT_BIND_MUT;
+      }
+      let b = ident(&mut p);
+      expect_p(&mut p, P_RPAREN);
+      if p.failed {
+        return 0;
+      }
+      n.a = add(&mut p, named(N_NAME, b));
+    }
+  }
+  expect_p(&mut p, P_FATARROW);
+  n.c = block(&mut p);
+  if p.failed {
+    return 0;
+  }
+  eat_p(&mut p, P_COMMA);
+  return add(&mut p, n);
+}
+
+// ---- Definitions ----
+
+fn struct_def(p: &mut Parser) -> u64 {
+  let t = expect_kw(&mut p, KW_STRUCT);
+  let name = ident(&mut p);
+  let tps = tparams(&mut p);
+  expect_p(&mut p, P_LBRACE);
+  let mut l = list_new();
+  let mut more = true;
+  while more && !p.failed && !at_p(p, P_RBRACE) {
+    let f = ident(&mut p);
+    expect_p(&mut p, P_COLON);
+    let x = ty(&mut p);
+    if p.failed {
+      return 0;
+    }
+    if is_ref(p, x) || has_name(p, l.head, f) {
+      fail_at(&mut p, f);           // a field holding a borrow, or declared twice
+      return 0;
+    }
+    let mut n = named(D_FIELD, f);
+    n.a = x;
+    let k = add(&mut p, n);
+    l = append(&mut p, l, k);
+    more = eat_p(&mut p, P_COMMA);
+  }
+  expect_p(&mut p, P_RBRACE);
+  if p.failed {
+    return 0;
+  }
+  if l.head == 0 {
+    fail_at(&mut p, t);             // no fields
+    return 0;
+  }
+  let mut n = named(D_STRUCT, name);
+  n.line = t.line;
+  n.col = t.col;
+  n.v = tps;
+  n.a = l.head;
+  return add(&mut p, n);
+}
+
+fn enum_def(p: &mut Parser) -> u64 {
+  let t = expect_kw(&mut p, KW_ENUM);
+  let name = ident(&mut p);
+  let tps = tparams(&mut p);
+  expect_p(&mut p, P_LBRACE);
+  let mut l = list_new();
+  let mut more = true;
+  while more && !p.failed && !at_p(p, P_RBRACE) {
+    let v = ident(&mut p);
+    let mut payload = 0;
+    if !p.failed && eat_p(&mut p, P_LPAREN) {
+      payload = ty(&mut p);
+      if p.failed {
+        return 0;
+      }
+      if is_ref(p, payload) {
+        fail_at(&mut p, v);         // a payload cannot be a borrow
+        return 0;
+      }
+      expect_p(&mut p, P_RPAREN);
+    }
+    if p.failed {
+      return 0;
+    }
+    if has_name(p, l.head, v) {
+      fail_at(&mut p, v);           // declared twice
+      return 0;
+    }
+    let mut n = named(D_VARIANT, v);
+    n.a = payload;
+    let k = add(&mut p, n);
+    l = append(&mut p, l, k);
+    more = eat_p(&mut p, P_COMMA);
+  }
+  expect_p(&mut p, P_RBRACE);
+  if p.failed {
+    return 0;
+  }
+  if l.head == 0 {
+    fail_at(&mut p, t);             // no variants
+    return 0;
+  }
+  let mut n = named(D_ENUM, name);
+  n.line = t.line;
+  n.col = t.col;
+  n.v = tps;
+  n.a = l.head;
+  return add(&mut p, n);
+}
+
+fn const_def(p: &mut Parser) {
+  expect_kw(&mut p, KW_CONST);
+  let name = ident(&mut p);
+  expect_p(&mut p, P_COLON);
+  let x = ty(&mut p);
+  if p.failed {
+    return;
+  }
+  if !is_u64(p, x) {
+    fail_at(&mut p, name);          // constants must be u64
+    return;
+  }
+  expect_p(&mut p, P_EQ);
+  let e = expr(&mut p);
+  expect_p(&mut p, P_SEMI);
+  let v = const_eval(&mut p, e);
+  if p.failed {
+    return;
+  }
+  if const_index(p, name) != 0 {
+    fail_at(&mut p, name);          // defined twice
+    return;
+  }
+  vec_push(&mut p.consts, Const { s: name.start, e: name.end, v: v });
+}
+
+fn spec_def(p: &mut Parser) -> u64 {
+  let t = expect_kw(&mut p, KW_SPEC);
+  expect_kw(&mut p, KW_FN);
+  let name = ident(&mut p);
+  let ps = params(&mut p);
+  expect_p(&mut p, P_ARROW);
+  let ret = ty(&mut p);
+  expect_p(&mut p, P_LBRACE);
+  let body = expr(&mut p);
+  expect_p(&mut p, P_RBRACE);
+  if p.failed {
+    return 0;
+  }
+  let mut n = named(D_SPEC, name);
+  n.line = t.line;
+  n.col = t.col;
+  n.a = ps;
+  n.b = ret;
+  n.c = body;
+  return add(&mut p, n);
+}
+
+fn fn_def(p: &mut Parser) -> u64 {
+  let t = expect_kw(&mut p, KW_FN);
+  let name = ident(&mut p);
+  let tps = tparams(&mut p);
+  let ps = params(&mut p);
+  let mut ret = 0;
+  if !p.failed && eat_p(&mut p, P_ARROW) {
+    ret = ty(&mut p);
+  } else {
+    ret = add(&mut p, blank(T_UNIT, t));
+  }
+  let mut req = list_new();
+  let mut ens = list_new();
+  let mut more = true;
+  while more && !p.failed {
+    if eat_kw(&mut p, KW_REQUIRES) {
+      let x = expr(&mut p);
+      req = append(&mut p, req, x);
+    } else if eat_kw(&mut p, KW_ENSURES) {
+      let x = expr(&mut p);
+      ens = append(&mut p, ens, x);
+    } else {
+      more = false;
+    }
+  }
+  let body = block(&mut p);
+  if p.failed {
+    return 0;
+  }
+  let mut n = named(D_FN, name);
+  n.line = t.line;
+  n.col = t.col;
+  n.v = tps;
+  n.a = ps;
+  n.b = ret;
+  n.c = req.head;
+  n.d = ens.head;
+  n.x = body;
+  return add(&mut p, n);
+}
+
+/// Parses definitions up to the end of the file into `structs`, `enums`,
+/// `specs` and `fns`.
+fn program(p: &mut Parser) {
+  let mut structs = list_new();
+  let mut enums = list_new();
+  let mut specs = list_new();
+  let mut fns = list_new();
+  let mut t = peek(p);
+  while !p.failed && t.kind != K_EOF {
+    if is_kw(t, KW_SPEC) {
+      let k = spec_def(&mut p);
+      specs = append(&mut p, specs, k);
+    } else if is_kw(t, KW_STRUCT) {
+      let k = struct_def(&mut p);
+      structs = append(&mut p, structs, k);
+    } else if is_kw(t, KW_ENUM) {
+      let k = enum_def(&mut p);
+      enums = append(&mut p, enums, k);
+    } else if is_kw(t, KW_CONST) {
+      const_def(&mut p);
+    } else if is_kw(t, KW_IMPORT) {
+      fail_at(&mut p, t);           // imports must come first
+    } else {
+      let k = fn_def(&mut p);
+      fns = append(&mut p, fns, k);
+    }
+    t = peek(p);
+  }
+  p.structs = structs.head;
+  p.enums = enums.head;
+  p.specs = specs.head;
+  p.fns = fns.head;
+}

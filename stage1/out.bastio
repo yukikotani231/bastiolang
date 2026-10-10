@@ -1,0 +1,87 @@
+// Output helpers shared by the stage1 dump drivers: text, numbers and hex
+// on the console.
+
+fn put(con: &Serial, s: Str) {
+  let mut k = 0;
+  while k < slen(s)
+    invariant k <= slen(s)
+  {
+    serial_write(con, sget(s, k));
+    k = k + 1;
+  }
+}
+
+fn put_num(con: &Serial, v: u64) {
+  // At most 20 digits; collect them in reverse.
+  let mut d = balloc(20);
+  let mut n = 0;
+  let mut x = v;
+  let mut first = true;
+  while (x > 0 || first) && n < 20
+    invariant n <= 20 && blen(d) == 20
+  {
+    bset(&mut d, n, 48 + x % 10);
+    x = x / 10;
+    n = n + 1;
+    first = false;
+  }
+  while n > 0
+    invariant n <= 20 && blen(d) == 20
+  {
+    n = n - 1;
+    serial_write(con, bget(d, n));
+  }
+  bfree(d);
+}
+
+/// `line:col`
+fn put_pos(con: &Serial, line: u64, col: u64) {
+  put_num(con, line);
+  put(con, ":");
+  put_num(con, col);
+}
+
+fn put_hex2(con: &Serial, b: u64)
+  requires b <= 255
+{
+  let hi = b / 16;
+  let lo = b % 16;
+  if hi < 10 { serial_write(con, 48 + hi); } else { serial_write(con, 87 + hi); }
+  if lo < 10 { serial_write(con, 48 + lo); } else { serial_write(con, 87 + lo); }
+}
+
+/// The bytes of a string token, escapes decoded, in hex.
+fn put_str_hex(con: &Serial, src: &Bytes, s: u64, e: u64)
+  requires s <= e && e <= blen(src)
+{
+  let mut i = s;
+  while i < e
+    invariant s <= i && i <= e && e <= blen(src)
+  {
+    let c = bget(src, i);
+    if c == 92 && i + 1 < e {
+      let x = bget(src, i + 1);
+      if x == 110 { put_hex2(con, 10); }
+      else if x == 114 { put_hex2(con, 13); }
+      else if x == 116 { put_hex2(con, 9); }
+      else if x == 48 { put_hex2(con, 0); }
+      else { put_hex2(con, x); }
+      i = i + 2;
+    } else {
+      put_hex2(con, c);
+      i = i + 1;
+    }
+  }
+}
+
+fn put_text(con: &Serial, src: &Bytes, s: u64, e: u64)
+  requires s <= e && e <= blen(src)
+{
+  let mut i = s;
+  while i < e
+    invariant s <= i && i <= e && e <= blen(src)
+  {
+    serial_write(con, bget(src, i));
+    i = i + 1;
+  }
+}
