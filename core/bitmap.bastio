@@ -1,0 +1,131 @@
+// core/bitmap.bastio: allocation maps, one byte per entry.
+//
+// An allocation map is a `Bytes` in which byte `i` says whether entry `i`
+// (a disk block, a page, a slot) is in use: 0 is free, anything else is
+// in use. The functions work on a range `lo..hi` of the map, so a map can
+// reserve its first entries (a disk's superblock and tables) and be longer
+// than the part in use. Searches start at a hint and wrap around, so that
+// allocation does not rescan the full prefix every time.
+//
+// One byte per entry costs eight times the memory of packed bits, but
+// every fact below is proved, including that a failed search means the
+// whole range is in use; packed bits would need bit-level reasoning the
+// prover does not do exactly for `|` (see docs/core.md, Gaps).
+//
+// What is proved: every index is in bounds; `map_find_free` returns a
+// free entry in `lo..hi`, or `hi` only when every entry in `lo..hi` is in
+// use; `map_take` marks exactly the entry it returns and changes no other
+// byte; `map_count_free` is at most the size of the range.
+
+/// Every entry in `lo..hi` of `m` is in use.
+spec fn map_full(m: &Bytes, lo: u64, hi: u64) -> bool {
+  forall k: u64 :: lo <= k && k < hi ==> bget(m, k) != 0
+}
+
+/// `m` and `o` have the same length and agree everywhere except at `at`.
+spec fn map_same_but(m: &Bytes, o: &Bytes, at: u64) -> bool {
+  blen(m) == blen(o) && (forall k: u64 :: k < blen(m) && k != at ==> bget(m, k) == bget(o, k))
+}
+
+/// Is entry `i` free?
+fn map_is_free(m: &Bytes, i: u64) -> bool
+  requires i < blen(m)
+  ensures result == (bget(m, i) == 0)
+{
+  return bget(m, i) == 0;
+}
+
+/// A free entry of `lo..hi`, searching from `hint` up to `hi` and then
+/// from `lo` up to `hint` (a hint outside the range starts at `lo`).
+/// Returns `hi` when every entry is in use.
+fn map_find_free(m: &Bytes, lo: u64, hi: u64, hint: u64) -> u64
+  requires lo <= hi && hi <= blen(m)
+  ensures result <= hi
+  ensures result < hi ==> lo <= result && bget(m, result) == 0
+  ensures result == hi ==> map_full(m, lo, hi)
+{
+  let mut start = hint;
+  if start < lo || start >= hi {
+    start = lo;
+  }
+  let mut i = start;
+  while i < hi
+    invariant lo <= start && start <= i && i <= hi && map_full(m, start, i)
+  {
+    if bget(m, i) == 0 {
+      return i;
+    }
+    i = i + 1;
+  }
+  i = lo;
+  while i < start
+    invariant lo <= i && i <= start && start <= hi && map_full(m, lo, i) && map_full(m, start, hi)
+  {
+    if bget(m, i) == 0 {
+      return i;
+    }
+    i = i + 1;
+  }
+  return hi;
+}
+
+/// Finds a free entry as `map_find_free` does and marks it in use (byte
+/// 1). Returns it, or `hi` when every entry is in use (then `m` is
+/// unchanged).
+fn map_take(m: &mut Bytes, lo: u64, hi: u64, hint: u64) -> u64
+  requires lo <= hi && hi <= blen(m)
+  ensures result <= hi
+  ensures result < hi ==> lo <= result && bget(old(m), result) == 0 && bget(m, result) == 1
+  ensures map_same_but(m, old(m), result)
+  ensures result == hi ==> map_full(m, lo, hi)
+{
+  let i = map_find_free(m, lo, hi, hint);
+  if i < hi {
+    bset(&mut m, i, 1);
+  }
+  return i;
+}
+
+/// Marks entry `i` free.
+fn map_give(m: &mut Bytes, i: u64)
+  requires i < blen(m)
+  ensures bget(m, i) == 0 && map_same_but(m, old(m), i)
+{
+  bset(&mut m, i, 0);
+}
+
+/// Marks entries `lo..hi` with `v` (0 free, anything else in use).
+fn map_fill(m: &mut Bytes, lo: u64, hi: u64, v: u8)
+  requires lo <= hi && hi <= blen(m)
+  ensures blen(m) == blen(old(m))
+  ensures forall k: u64 :: lo <= k && k < hi ==> bget(m, k) == v
+  ensures forall k: u64 :: k < blen(m) && (k < lo || hi <= k) ==> bget(m, k) == bget(old(m), k)
+{
+  let mut i = lo;
+  while i < hi
+    invariant lo <= i && i <= hi && blen(m) == blen(old(m))
+    invariant forall k: u64 :: lo <= k && k < i ==> bget(m, k) == v
+    invariant forall k: u64 :: k < blen(m) && (k < lo || i <= k) ==> bget(m, k) == bget(old(m), k)
+  {
+    bset(&mut m, i, v);
+    i = i + 1;
+  }
+}
+
+/// The number of free entries in `lo..hi`.
+fn map_count_free(m: &Bytes, lo: u64, hi: u64) -> u64
+  requires lo <= hi && hi <= blen(m)
+  ensures result <= hi - lo
+{
+  let mut n = 0;
+  let mut i = lo;
+  while i < hi
+    invariant lo <= i && i <= hi && n <= i - lo
+  {
+    if bget(m, i) == 0 {
+      n = n + 1;
+    }
+    i = i + 1;
+  }
+  return n;
+}

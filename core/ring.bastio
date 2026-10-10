@@ -1,0 +1,193 @@
+// core/ring.bastio: ring buffers and fixed-capacity FIFO queues.
+//
+// A `Ring` holds only the indices (head, count, capacity); the elements
+// live wherever the caller keeps them: a `Bytes` for a console or a pipe,
+// a `Buf` of records for a command queue, a slice of a larger buffer.
+// `ring_push` and `ring_pop` return the slot to write or read, so one ring
+// type serves every element type and layout. `Queue` puts a ring and a
+// `Buf` together for the common case of a FIFO of `u64` words.
+//
+// What is proved: every slot a function returns is below the capacity,
+// the count stays between 0 and the capacity, a push claims the slot just
+// after the last element and a pop the head, and a queue's `queue_pop`
+// returns the word at the head. Not proved: that the sequence of words
+// popped is the sequence pushed (that needs a ghost sequence).
+
+/// Head, count and capacity of a ring. Element `i` (0 is the oldest) is
+/// in slot `(h + i) % cap`.
+struct Ring {
+  h: u64,     // slot of the oldest element
+  n: u64,     // number of elements
+  cap: u64,   // number of slots
+}
+
+/// What every ring function needs and keeps.
+/// (The capacity bound keeps `h + i` from overflowing.)
+spec fn ring_ok(r: &Ring) -> bool {
+  0 < r.cap && r.cap <= 9223372036854775808 && r.h < r.cap && r.n <= r.cap
+}
+
+/// Slot `(h + i) % cap`, written without `%`: `h + i` is below `2 * cap`.
+spec fn ring_at(r: &Ring, i: u64, s: u64) -> bool {
+  (r.h + i < r.cap ==> s == r.h + i) && (r.cap <= r.h + i ==> s == r.h + i - r.cap)
+}
+
+/// An empty ring of `cap` slots.
+fn ring_new(cap: u64) -> Ring
+  requires 0 < cap && cap <= 9223372036854775808
+  ensures ring_ok(result) && result.h == 0 && result.n == 0 && result.cap == cap
+{
+  return Ring { h: 0, n: 0, cap: cap };
+}
+
+/// The number of free slots.
+fn ring_room(r: &Ring) -> u64
+  requires ring_ok(r)
+  ensures result == r.cap - r.n
+{
+  return r.cap - r.n;
+}
+
+/// Is the ring empty?
+fn ring_empty(r: &Ring) -> bool
+  ensures result == (r.n == 0)
+{
+  return r.n == 0;
+}
+
+/// Is the ring full?
+fn ring_full(r: &Ring) -> bool
+  ensures result == (r.n == r.cap)
+{
+  return r.n == r.cap;
+}
+
+/// The slot of element `i` (0 is the oldest).
+fn ring_slot(r: &Ring, i: u64) -> u64
+  requires ring_ok(r) && i < r.cap
+  ensures result < r.cap && ring_at(r, i, result)
+{
+  let s = r.h + i;
+  if s >= r.cap {
+    return s - r.cap;
+  }
+  return s;
+}
+
+/// Claims the slot after the last element and returns it: the caller
+/// writes the new element there.
+fn ring_push(r: &mut Ring) -> u64
+  requires ring_ok(r) && r.n < r.cap
+  ensures ring_ok(r) && result < r.cap && ring_at(old(r), old(r).n, result)
+  ensures r.h == old(r).h && r.n == old(r).n + 1 && r.cap == old(r).cap
+{
+  let s = ring_slot(r, r.n);
+  r.n = r.n + 1;
+  return s;
+}
+
+/// Releases the oldest element and returns its slot: the caller reads it
+/// there (before the slot is pushed again).
+fn ring_pop(r: &mut Ring) -> u64
+  requires ring_ok(r) && 0 < r.n
+  ensures ring_ok(r) && result == old(r).h
+  ensures r.n == old(r).n - 1 && r.cap == old(r).cap && ring_at(old(r), 1, r.h)
+{
+  let s = r.h;
+  if r.h + 1 == r.cap {
+    r.h = 0;
+  } else {
+    r.h = r.h + 1;
+  }
+  r.n = r.n - 1;
+  return s;
+}
+
+/// Claims `k` slots after the last element, for a caller that writes
+/// them itself (starting at `ring_slot(r, n)` before the call).
+fn ring_push_n(r: &mut Ring, k: u64)
+  requires ring_ok(r) && k <= r.cap - r.n
+  ensures ring_ok(r) && r.h == old(r).h && r.n == old(r).n + k && r.cap == old(r).cap
+{
+  r.n = r.n + k;
+}
+
+/// Releases the `k` oldest elements.
+fn ring_pop_n(r: &mut Ring, k: u64)
+  requires ring_ok(r) && k <= r.n
+  ensures ring_ok(r) && r.n == old(r).n - k && r.cap == old(r).cap
+  ensures k < old(r).cap ==> ring_at(old(r), k, r.h)
+{
+  if k == r.cap {
+    r.n = 0;
+    return;
+  }
+  r.h = ring_slot(r, k);
+  r.n = r.n - k;
+}
+
+/// Empties the ring.
+fn ring_clear(r: &mut Ring)
+  requires ring_ok(r)
+  ensures ring_ok(r) && r.n == 0 && r.cap == old(r).cap
+{
+  r.h = 0;
+  r.n = 0;
+}
+
+/// A FIFO of up to `cap` words: a ring over a `Buf` of `cap` words.
+struct Queue {
+  r: Ring,
+  q: Buf,
+}
+
+spec fn queue_ok(q: &Queue) -> bool {
+  ring_ok(q.r) && len(q.q) == q.r.cap
+}
+
+/// An empty queue of `cap` words.
+fn queue_new(cap: u64) -> Queue
+  requires 0 < cap && cap <= 1152921504606846976
+  ensures queue_ok(result) && result.r.n == 0 && result.r.cap == cap
+{
+  return Queue { r: ring_new(cap), q: alloc(cap) };
+}
+
+fn queue_free(q: Queue) {
+  free(q.q);
+}
+
+/// The number of words in the queue.
+fn queue_len(q: &Queue) -> u64
+  ensures result == q.r.n
+{
+  return q.r.n;
+}
+
+/// Appends `x`. A full queue is a precondition, not a run-time error:
+/// callers check `queue_len(q) < q.r.cap` (or drop, as a console does).
+fn queue_push(q: &mut Queue, x: u64)
+  requires queue_ok(q) && q.r.n < q.r.cap
+  ensures queue_ok(q) && q.r.n == old(q).r.n + 1 && q.r.cap == old(q).r.cap
+{
+  let s = ring_push(&mut q.r);
+  q.q = set(q.q, s, x);
+}
+
+/// The oldest word, without removing it.
+fn queue_peek(q: &Queue) -> u64
+  requires queue_ok(q) && 0 < q.r.n
+  ensures result == get(q.q, q.r.h)
+{
+  return get(q.q, q.r.h);
+}
+
+/// Removes and returns the oldest word.
+fn queue_pop(q: &mut Queue) -> u64
+  requires queue_ok(q) && 0 < q.r.n
+  ensures queue_ok(q) && q.r.n == old(q).r.n - 1 && q.r.cap == old(q).r.cap
+  ensures result == get(old(q).q, old(q).r.h)
+{
+  let s = ring_pop(&mut q.r);
+  return get(q.q, s);
+}

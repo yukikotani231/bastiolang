@@ -9,6 +9,15 @@ spec fn is_digit_spec(c: u8) -> bool {
   48 <= c && c <= 57
 }
 
+spec fn is_hex_spec(c: u8) -> bool {
+  (48 <= c && c <= 57) || (97 <= c && c <= 102) || (65 <= c && c <= 70)
+}
+
+/// Bytes `from..to` of `b` are all hexadecimal digits.
+spec fn all_hex(b: &Bytes, from: u64, to: u64) -> bool {
+  forall k: u64 :: from <= k && k < to ==> is_hex_spec(bget(b, k))
+}
+
 /// Bytes `from..to` of `b` are all decimal digits.
 spec fn all_digits(b: &Bytes, from: u64, to: u64) -> bool {
   forall k: u64 :: from <= k && k < to ==> is_digit_spec(bget(b, k))
@@ -26,6 +35,9 @@ fn is_digit(c: u8) -> bool
 fn hex_value(c: u8) -> u64
   ensures result <= 16
   ensures is_digit_spec(c) ==> result == c - 48
+  ensures result < 16 ==> is_hex_spec(c)
+  ensures 97 <= c && c <= 102 ==> result == c - 87
+  ensures 65 <= c && c <= 70 ==> result == c - 55
 {
   if 48 <= c && c <= 57 {
     return cast[u64](c) - 48;
@@ -77,7 +89,7 @@ fn parse_u64(b: &Bytes, from: u64, to: u64) -> Option[u64]
 /// `A-F`, no `0x` prefix): at least one digit, the value below 2^64.
 fn parse_hex_u64(b: &Bytes, from: u64, to: u64) -> Option[u64]
   requires from <= to && to <= blen(b)
-  ensures result is Option::Some ==> from < to
+  ensures result is Option::Some ==> from < to && all_hex(b, from, to) && result.Some == bhex(b, from, to)
 {
   if from == to {
     return Option[u64]::None;
@@ -85,7 +97,7 @@ fn parse_hex_u64(b: &Bytes, from: u64, to: u64) -> Option[u64]
   let mut v = 0;
   let mut i = from;
   while i < to
-    invariant from <= i && i <= to
+    invariant from <= i && i <= to && all_hex(b, from, i) && v == bhex(b, from, i)
   {
     let d = hex_value(bget(b, i));
     if d == 16 || v > (18446744073709551615 - d) / 16 {
