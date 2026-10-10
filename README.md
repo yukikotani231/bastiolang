@@ -8,6 +8,8 @@ Bastio is a systems language whose memory safety is **proved at compile time**, 
 - **Zero overhead.** Proofs are erased. The generated code has no bounds checks and no runtime checks of any kind.
 - **Opt-in functional correctness.** Functions that carry `requires` / `ensures` / `invariant` are proved to meet them.
 
+New here? Start with the [tutorial](docs/tutorial.md); the [language reference](docs/language.md) has every rule. Their examples are compiled by the test suite, so they match the compiler.
+
 ## Example
 
 ```
@@ -89,7 +91,9 @@ stage1/difftest.sh    # the self-hosted compiler's phases against stage0
 | `tests/pass/` | Programs that must verify and exit with a given code |
 | `tests/fail/` | Programs that must be rejected with a given error code |
 | `examples/` | Small programs to start from |
+| `docs/tutorial.md` | A tour of the language for newcomers |
 | `docs/language.md` | The language reference |
+| `docs/concurrency.md` | The concurrency design (not implemented yet) |
 | `ROADMAP.md` | The path to self-hosting and to a kernel |
 
 ## Status
