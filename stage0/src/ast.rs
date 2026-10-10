@@ -9,6 +9,11 @@ pub enum Type {
     Unit,
     /// An owned buffer of u64. Linear: must be consumed exactly once.
     Buf,
+    /// An owned buffer of bytes. Linear.
+    Bytes,
+    /// The host operating system: files and command-line arguments. Linear;
+    /// hosted programs only, and only `main` receives it.
+    Host,
     /// The console capability. Linear: whoever owns it may talk to the
     /// serial line, and nobody else can. Only `main` receives one.
     Serial,
@@ -45,6 +50,8 @@ impl Type {
             Type::Bool => "bool".into(),
             Type::Unit => "()".into(),
             Type::Buf => "Buf".into(),
+            Type::Bytes => "Bytes".into(),
+            Type::Host => "Host".into(),
             Type::Serial => "Serial".into(),
             Type::Str => "Str".into(),
             Type::Frame => "Frame".into(),
@@ -59,7 +66,7 @@ impl Type {
     }
     pub fn is_linear(&self) -> bool {
         match self {
-            Type::Buf | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu => true,
+            Type::Buf | Type::Bytes | Type::Host | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu => true,
             Type::Struct(n) => struct_def(n).map_or(false, |d| d.fields.iter().any(|f| f.1.is_linear())),
             _ => false,
         }
