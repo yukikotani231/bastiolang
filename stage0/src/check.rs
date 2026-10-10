@@ -139,6 +139,23 @@ pub const VEC_BUILTINS: &[&str] = &["vec_new", "vec_len", "vec_push", "vec_pop",
 /// Builtins written with type arguments (`vec_new[u64]()`).
 pub const TYPED_BUILTINS: &[&str] = &["vec_new"];
 
+/// Every builtin with where it is available, for `--trusted-base`.
+pub fn builtin_list() -> Vec<(String, &'static str)> {
+    let mut v: Vec<(String, &'static str)> = vec![("box".into(), "all"), ("unbox".into(), "all")];
+    v.extend(VEC_BUILTINS.iter().map(|n| (n.to_string(), "all")));
+    for (n, a, _, _) in builtin_table() {
+        let a = match a {
+            Avail::All => "all",
+            Avail::Hosted => "hosted",
+            Avail::Mem => "hosted, kernel",
+            Avail::Kernel => "kernel",
+            Avail::User => "user",
+        };
+        v.push((n.to_string(), a));
+    }
+    v
+}
+
 pub fn is_builtin(name: &str) -> bool {
     name == "box" || name == "unbox" || VEC_BUILTINS.contains(&name) || builtin_table().iter().any(|b| b.0 == name)
 }
