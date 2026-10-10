@@ -108,6 +108,11 @@ What will be 0.2.0.
 ### Documentation
 
 - The trusted base is listed and explained (`docs/trusted-base.md`, #66).
+- `examples/qoi`: a QOI image codec called from C. Its buffers are sized by
+  an untrusted header, and running out of memory is a result C sees, not an
+  abort. "Calling Bastio from C" in the book is now a guide: building,
+  vendoring the generated C, ownership, errors and out of memory, several
+  libraries in one program, and what the proofs assume of the C side.
 - The tutorial's section on calling Bastio from C walks through a new
   example, `examples/lines`, built on `export fn` and `--header` (#92).
 - `tests/run.sh` checks that error messages shown in `docs/` are what the
