@@ -1007,7 +1007,7 @@ Syntax, types and linearity:
 | `E-TYPE` | Type error: wrong argument or field types, an unknown name, a borrow used outside a parameter, shadowing, a bad `main` signature, a generic definition that cannot be instantiated, and so on |
 | `E-TARGET` | A builtin the target does not have (such as `host_read` in a kernel) |
 | `E-IMPORT` | An imported file cannot be read, or files import each other |
-| `E-EXPORT` | An `export fn` breaks a rule of the C boundary: it has a `requires`, takes or returns a type C cannot pass, is `main`, or is outside the hosted target |
+| `E-EXPORT` | An `export fn` breaks a rule of the C boundary: it has a `requires`, takes or returns a type C cannot pass, may free or replace a buffer C lends it, is `main`, or is outside the hosted target |
 | `E-MATCH` | A `match` misses a variant, matches one twice, or has an arm after `_` |
 | `E-LINEAR-USE` | A consumed value (or a moved-out field, or a struct with a field moved out) is used; one call both borrows and moves a value, or lends it twice with one loan `&mut`; a borrow is returned; a value is consumed where the code may run more than once or not at all (a `while` condition, the right side of `&&` / `\|\|`) |
 | `E-LINEAR-LEAK` | A linear value is still owned at the end of its scope or at a `return`, is overwritten, or is dropped by `_` |
@@ -1084,14 +1084,15 @@ bst_e_Found find(const uint8_t *b, size_t b_len, uint64_t c);
 ```
 
 What may cross the boundary (otherwise `E-EXPORT`):
-- **Parameters:** integers, `bool`, and `&Bytes`, which becomes a pointer and a length (`b`, `b_len`). C can only lend bytes for reading; `&mut` and owned values are not accepted yet.
+- **Parameters:** integers, `bool`, `&Bytes`, which becomes a `const` pointer and a length (`b`, `b_len`), and `&mut Bytes`, a buffer the caller owns and the function writes into (`uint8_t *b, size_t b_len`), so a library need not allocate. Owned values are not accepted.
+- **A lent `&mut Bytes` stays the caller's.** The function may write its bytes (`bset`, or by lending it to functions that only do that) but never free or replace it. The compiler proves this from the summary it already computes of what each function may change in its `&mut` arguments ([How verification works](#how-verification-works)), through any depth of calls; a function that might replace the buffer is `E-EXPORT`. So the buffer is the same allocation, of the same length, when the call returns, and there is nothing to copy back.
 - **Results:** integers, `bool`, nothing, `Bytes`, and structs and enums built only from those. The header defines the C types (`bst_bytes`, `bst_s_Name`, `bst_e_Name`, with a `bst_e_Name_Variant` constant for each enum tag) exactly as the generated C lays them out. Bytes handed back belong to the caller, who releases `data` with `free()`.
 - **No `requires`.** A C caller cannot be proved to meet a precondition, so an exported function has none: it checks the condition itself and returns an error value instead, which is then proved like any other code (`examples/base64/lib.bastio` does this for the encoder's length limit). This keeps the boundary free of generated checks. `ensures` clauses are allowed and are copied into the header as comments: they are proved, so the caller may rely on them.
 - Not generic (`E-TYPE`), not `main`, not a name starting with `bst_`, and only on the hosted target.
 
-The proof of an exported function assumes three things about its C caller that nothing checks (they are listed by `--trusted-base` and stated in the header): a `&Bytes` pointer is readable for its length and nothing writes those bytes during the call; that length is at most 2^60 (which follows from the first, since no x86-64 address space is that large); and every argument is a valid value of its C type. A C caller that breaks them can make the Bastio code misbehave, as with any C library.
+The proof of an exported function assumes these things about its C caller that nothing checks (they are listed by `--trusted-base` and stated in the header): a `&Bytes` pointer is readable for its length and nothing writes those bytes during the call; a `&mut Bytes` pointer is readable and writable for its length, overlaps no other buffer argument, and nothing else uses it during the call; such a length is at most 2^60 (which follows from the first two, since no x86-64 address space is that large); and every argument is a valid value of its C type. A C caller that breaks them can make the Bastio code misbehave, as with any C library.
 
-The C function is a thin wrapper that converts the pointer and length into the internal `bst_bytes` and calls the proved function; it does no other work. A worked example with a test harness and a benchmark is in `examples/base64`.
+The C function is a thin wrapper that converts each pointer and length into the internal `bst_bytes` and calls the proved function; it does no other work. A worked example with a test harness and a benchmark is in `examples/base64`.
 
 ## Soundness scope
 
@@ -1109,4 +1110,4 @@ What a program that `bastioc0` accepts is guaranteed: no out-of-bounds access, n
 
 ## Not in the language yet
 
-Planned, in [ROADMAP.md](../ROADMAP.md): concurrency (designed in [concurrency.md](concurrency.md)), signed integer types, C buffers lent for writing to an `export fn`, more hardware capabilities (`IrqOff`, DMA buffers), allocation failure in the type, and a native x86-64 backend. Inference of type arguments, modules with qualified names, and hand-written lemmas for proofs Z3 cannot find are open questions.
+Planned, in [ROADMAP.md](../ROADMAP.md): concurrency (designed in [concurrency.md](concurrency.md)), signed integer types, more hardware capabilities (`IrqOff`, DMA buffers), allocation failure in the type, and a native x86-64 backend. Inference of type arguments, modules with qualified names, and hand-written lemmas for proofs Z3 cannot find are open questions.

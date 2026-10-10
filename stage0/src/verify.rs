@@ -418,6 +418,9 @@ pub fn verify_program(p: &Program) -> Result<(usize, Vec<String>), Diag> {
     let timed = std::env::var("BASTIO_TIME").is_ok();
     for f in &p.fns {
         let t0 = std::time::Instant::now();
+        if f.export {
+            buffers_kept(f, &v.sums)?;
+        }
         v.smt("(push 1)")?;
         v.verify_fn(f).map_err(|d| crate::check::in_copy(d, &f.name))?;
         v.smt("(pop 1)")?;
@@ -427,6 +430,26 @@ pub fn verify_program(p: &Program) -> Result<(usize, Vec<String>), Diag> {
     }
     let log = std::mem::take(&mut v.solver.log);
     Ok((v.obligations, log))
+}
+
+/// A `&mut Bytes` that C lends to an `export fn` is the caller's memory:
+/// the function may write its bytes but must hand back the same buffer,
+/// never free or replace it. Its summary shows that: the parameter is
+/// changed only by shape-keeping builtins (`bset`), directly or through
+/// other functions' summaries, so it is the same allocation of the same
+/// length on return.
+fn buffers_kept(f: &FnDef, sums: &Summaries) -> Result<(), Diag> {
+    for (i, q) in f.params.iter().enumerate() {
+        if !matches!(&q.ty, Type::MutRef(t) if **t == Type::Bytes) {
+            continue;
+        }
+        let kept = sums[&f.name][i].as_ref().map_or(false, |s| s.iter().all(|(_, keep)| *keep));
+        if !kept {
+            return Err(Diag::new("E-EXPORT", q.pos, format!("`{}` belongs to the C caller, but `{}` may free or replace it", q.name, f.name))
+                .note("a buffer lent by C may only be written in place (`bset`, or lent to functions that do only that)"));
+        }
+    }
+    Ok(())
 }
 
 impl<'p> Verifier<'p> {
