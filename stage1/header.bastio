@@ -1,0 +1,360 @@
+// `--header` and `--trusted-base`: stage0's `codegen::header` and
+// `codegen::trusted_base`, written in Bastio. The differential test
+// (difftest.sh, driver) compares both with bastioc0's byte for byte.
+import "codegen.bastio";
+import "render.bastio";
+
+// ---- --trusted-base ----
+
+/// The number of lines of `text` that hold something other than white
+/// space, as stage0 counts them (`str::lines` and `trim`).
+fn hd_lines(text: &Vec[u64]) -> u64 {
+  let mut n = 0;
+  let mut full = false;
+  let mut k = 0;
+  while k < vec_len(text) {
+    let ch = vec_get(text, k);
+    if ch == 10 {
+      if full && n < 18446744073709551615 {
+        n = n + 1;
+      }
+      full = false;
+    } else if !(ch == 32 || ch == 9 || ch == 13 || ch == 11 || ch == 12) {
+      full = true;
+    }
+    k = k + 1;
+  }
+  if full && n < 18446744073709551615 {
+    n = n + 1;
+  }
+  return n;
+}
+
+fn hd_part_lines(id: u64) -> u64 {
+  let mut t = vec_new[u64]();
+  cg_part(&mut t, id);
+  let n = hd_lines(t);
+  vec_free(t);
+  return n;
+}
+
+/// The lines of assembly in the native backend's runtime
+/// (stage0/src/x86.rs, `RUNTIME`). bastioc1 has no native backend, so it
+/// cannot count them: this copies stage0's count, and the differential
+/// test and tests/trusted_base.txt catch it going stale.
+const NATIVE_RUNTIME_LINES: u64 = 306;
+
+fn hd_builtin(out: &mut Vec[u64], name: Str, avail: Str) {
+  out_str(&mut out, "builtin ");
+  out_str(&mut out, name);
+  out_str(&mut out, " (");
+  out_str(&mut out, avail);
+  out_str(&mut out, ")\n");
+}
+
+fn hd_avail(a: u64) -> Str {
+  if a == AV_HOSTED { return "hosted"; }
+  if a == AV_MEM { return "hosted, kernel"; }
+  if a == AV_KERNEL { return "kernel"; }
+  if a == AV_USER { return "user"; }
+  return "all";
+}
+
+/// The hand-written trusted base, listed and counted (ROADMAP invariant
+/// 3), as `bastioc0 --trusted-base` lists it.
+fn trusted_base(out: &mut Vec[u64]) {
+  out_str(&mut out, "# The trusted base of bastioc0 (ROADMAP invariant 3). Regenerate with\n# `bastioc0 --trusted-base > tests/trusted_base.txt` and review the diff.\n");
+  let mut seen = vec_new[u64]();
+  let mut t = 0;
+  while t < 3 {
+    let parts = cg_parts(t);
+    let mut total = 0;
+    let mut k = 0;
+    while k < vec_len(parts) {
+      total = cg_add(total, hd_part_lines(vec_get(parts, k)));
+      k = k + 1;
+    }
+    out_str(&mut out, "target ");
+    if t == TARGET_KERNEL {
+      out_str(&mut out, "kernel");
+    } else if t == TARGET_USER {
+      out_str(&mut out, "user");
+    } else {
+      out_str(&mut out, "hosted");
+    }
+    out_str(&mut out, ": ");
+    out_num(&mut out, total);
+    out_str(&mut out, " prelude lines (");
+    k = 0;
+    while k < vec_len(parts) {
+      if k > 0 {
+        out_str(&mut out, " ");
+      }
+      out_str(&mut out, cg_part_name(vec_get(parts, k)));
+      k = k + 1;
+    }
+    out_str(&mut out, ")\n");
+    k = 0;
+    while k < vec_len(parts) {
+      let id = vec_get(parts, k);
+      if !has_id(seen, id) {
+        vec_push(&mut seen, id);
+        out_str(&mut out, "  prelude ");
+        out_str(&mut out, cg_part_name(id));
+        out_str(&mut out, ": ");
+        out_num(&mut out, hd_part_lines(id));
+        out_str(&mut out, " lines\n");
+      }
+      k = k + 1;
+    }
+    vec_free(parts);
+    t = t + 1;
+  }
+  vec_free(seen);
+  out_str(&mut out, "native backend (--backend native, hosted): ");
+  out_num(&mut out, NATIVE_RUNTIME_LINES);
+  out_str(&mut out, " runtime lines of assembly\n");
+  // The generic builtins, checked by hand, then the table (check.bastio).
+  hd_builtin(&mut out, "box", "all");
+  hd_builtin(&mut out, "unbox", "all");
+  hd_builtin(&mut out, "lock_new", "all");
+  hd_builtin(&mut out, "lock_end", "all");
+  hd_builtin(&mut out, "locked", "all");
+  hd_builtin(&mut out, "atomic_new", "all");
+  hd_builtin(&mut out, "atomic_end", "all");
+  hd_builtin(&mut out, "atomic_load", "all");
+  hd_builtin(&mut out, "atomic_store", "all");
+  hd_builtin(&mut out, "atomic_swap", "all");
+  hd_builtin(&mut out, "atomic_cas", "all");
+  hd_builtin(&mut out, "atomic_wrap_add", "all");
+  hd_builtin(&mut out, "smp_run", "kernel");
+  hd_builtin(&mut out, "vec_new", "all");
+  hd_builtin(&mut out, "vec_len", "all");
+  hd_builtin(&mut out, "vec_push", "all");
+  hd_builtin(&mut out, "vec_pop", "all");
+  hd_builtin(&mut out, "vec_get", "all");
+  hd_builtin(&mut out, "vec_set", "all");
+  hd_builtin(&mut out, "vec_swap", "all");
+  hd_builtin(&mut out, "vec_free", "all");
+  let mut m = mono_new();
+  let p = parser_new(balloc(0), vec_new[Tok](), 0);
+  let c = checker_new(&mut m, p, TARGET_HOSTED);
+  let mut k = 0;
+  while k < vec_len(c.bs) {
+    let b = vec_get(c.bs, k);
+    hd_builtin(&mut out, b.name, hd_avail(b.avail));
+    k = k + 1;
+  }
+  checker_free(c);
+  mono_free(m);
+  bfree(parser_free(p));
+  out_str(&mut out, "export assumes a `&Bytes` parameter's pointer is readable for its length, and nothing writes the bytes during the call\n");
+  out_str(&mut out, "export assumes a `&mut Bytes` parameter's pointer is readable and writable for its length, overlaps no other buffer argument, and nothing else uses it during the call\n");
+  out_str(&mut out, "export assumes a `&Bytes` or `&mut Bytes` parameter's length is at most 2^60 (follows from the first two: no x86-64 address space is that large)\n");
+  out_str(&mut out, "export assumes every argument is a valid value of its C type (a `bool` is 0 or 1)\n");
+}
+
+// ---- --header ----
+
+/// Adds the struct or enum type `t` and the ones it holds by value to
+/// `types` (and whether each is an enum to `enums`), depth first.
+fn hd_collect(c: &Checker, m: &Mono, p: &Parser, t: u64, types: &mut Vec[u64], enums: &mut Vec[u64]) {
+  if t == 0 {
+    return;
+  }
+  let tk = kind_t(m, t);
+  if tk != TY_STRUCT && tk != TY_ENUM {
+    return;
+  }
+  let x = inner_t(m, t);
+  if has_id(types, x) {
+    return;
+  }
+  vec_push(&mut types, x);
+  if tk == TY_ENUM {
+    vec_push(&mut enums, 1);
+  } else {
+    vec_push(&mut enums, 0);
+  }
+  let dn = def_node(m, p, x);
+  let nf = list_len(p, dn.a);
+  let mut j = 0;
+  while j < nf && j < SRC_MAX {
+    hd_collect(c, m, p, fld_ty(c, x, j), &mut types, &mut enums);
+    j = j + 1;
+  }
+}
+
+/// The C header of a library: the types its exported functions return,
+/// and their prototypes, each with its postconditions as a comment.
+/// `guard` names the include guard. The text goes to `g.out`.
+fn header(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, guard: &Vec[u64]) {
+  let mut types = vec_new[u64]();
+  let mut enums = vec_new[u64]();
+  let mut k = 0;
+  while k < vec_len(m.fns) {
+    let x = vec_get(m.fns, k);
+    if exported_x(m, p, x) {
+      let ret = cg_ret_ty(&mut m, p, x);
+      hd_collect(c, m, p, ret, &mut types, &mut enums);
+    }
+    k = k + 1;
+  }
+  cg_out(&mut g, "/* generated by bastioc0 -- do not edit */\n#ifndef ");
+  k = 0;
+  while k < vec_len(guard) {
+    vec_push(&mut g.out, vec_get(guard, k));
+    k = k + 1;
+  }
+  cg_out(&mut g, "\n#define ");
+  k = 0;
+  while k < vec_len(guard) {
+    vec_push(&mut g.out, vec_get(guard, k));
+    k = k + 1;
+  }
+  cg_out(&mut g, "\n\n#include <stdbool.h>\n#include <stddef.h>\n#include <stdint.h>\n\n");
+  cg_out(&mut g, "/* The functions below are written in Bastio and proved memory safe. What\n");
+  cg_out(&mut g, " * they rely on from their C caller, which the proofs cannot check:\n");
+  cg_out(&mut g, " * - a `const uint8_t *p, size_t p_len` pair is readable for p_len bytes and\n");
+  cg_out(&mut g, " *   is not written (by any thread) during the call;\n");
+  cg_out(&mut g, " * - a `uint8_t *p, size_t p_len` pair (a buffer the function writes into) is\n");
+  cg_out(&mut g, " *   readable and writable for p_len bytes, overlaps no other buffer argument,\n");
+  cg_out(&mut g, " *   and is not used by anyone else during the call. The function writes\n");
+  cg_out(&mut g, " *   only inside it and never frees it;\n");
+  cg_out(&mut g, " * - every argument is a valid value of its C type.\n");
+  cg_out(&mut g, " * A returned `bst_bytes` (also inside a returned struct or enum) belongs to\n");
+  cg_out(&mut g, " * the caller: release its `data` with free(). An enum is a struct with a\n");
+  cg_out(&mut g, " * `tag` (the constants below) and a union `u` holding the payload of the\n");
+  cg_out(&mut g, " * variant named by the tag. */\n");
+  cg_out(&mut g, "#ifndef BST_BYTES_DEFINED\n#define BST_BYTES_DEFINED\ntypedef struct { uint64_t len; unsigned char *data; } bst_bytes;\n#endif\n\n");
+  if vec_len(types) > 0 {
+    // Declarations in the program's order, then definitions in `types`
+    // order, each after the types it holds (as cg_types does).
+    k = 0;
+    while k < vec_len(m.structs) {
+      let x = vec_get(m.structs, k);
+      if has_id(types, x) {
+        let start = cg_mark(g);
+        cg_t(&mut g, "typedef struct bst_s_");
+        cg_instname(&mut g, m, p, x, CG_CID);
+        cg_t(&mut g, " bst_s_");
+        cg_instname(&mut g, m, p, x, CG_CID);
+        cg_t(&mut g, ";\n");
+        cg_to_out(&mut g, start);
+      }
+      k = k + 1;
+    }
+    k = 0;
+    while k < vec_len(m.enums) {
+      let x = vec_get(m.enums, k);
+      if has_id(types, x) {
+        let start = cg_mark(g);
+        cg_t(&mut g, "typedef struct bst_e_");
+        cg_instname(&mut g, m, p, x, CG_CID);
+        cg_t(&mut g, " bst_e_");
+        cg_instname(&mut g, m, p, x, CG_CID);
+        cg_t(&mut g, ";\n");
+        cg_to_out(&mut g, start);
+      }
+      k = k + 1;
+    }
+    let mut done = vec_new[u64]();
+    k = 0;
+    while k < vec_len(types) && k < vec_len(enums) {
+      cg_typedef(&mut g, c, m, p, vec_get(types, k), &mut done, vec_get(enums, k) == 1);
+      k = k + 1;
+    }
+    vec_free(done);
+    // The tag constants of each enum.
+    k = 0;
+    while k < vec_len(types) && k < vec_len(enums) {
+      if vec_get(enums, k) == 1 {
+        let x = vec_get(types, k);
+        let start = cg_mark(g);
+        cg_t(&mut g, "enum { ");
+        let dn = def_node(m, p, x);
+        let mut v = dn.a;
+        let mut j = 0;
+        while v != 0 {
+          let vn = node_at(p.nodes, v);
+          if j > 0 {
+            cg_t(&mut g, ", ");
+          }
+          cg_t(&mut g, "bst_e_");
+          cg_instname(&mut g, m, p, x, CG_CID);
+          cg_t(&mut g, "_");
+          cg_src(&mut g, p, vn.s, vn.e);
+          cg_t(&mut g, " = ");
+          cg_n(&mut g, j);
+          v = vn.next;
+          j = cg_add(j, 1);
+        }
+        cg_t(&mut g, " };\n");
+        cg_to_out(&mut g, start);
+      }
+      k = k + 1;
+    }
+    cg_out(&mut g, "\n");
+  }
+  k = 0;
+  while k < vec_len(m.fns) {
+    let x = vec_get(m.fns, k);
+    if exported_x(m, p, x) {
+      let xi = inst_at(m, x);
+      let dn = node_at(p.nodes, xi.def);
+      let mut e = dn.d;
+      while e != 0 {
+        cg_out(&mut g, "/* ensures ");
+        render_expr(&mut g.out, p, e, true);
+        cg_out(&mut g, " */\n");
+        e = next_of(p, e);
+      }
+      let start = cg_mark(g);
+      cg_export_proto(&mut g, &mut m, p, x);
+      cg_t(&mut g, ";\n\n");
+      cg_to_out(&mut g, start);
+    }
+    k = k + 1;
+  }
+  cg_out(&mut g, "#endif\n");
+  vec_free(types);
+  vec_free(enums);
+}
+
+/// The include guard for a header written to `path`, as bastioc0 makes it:
+/// `BASTIO_<file stem>_H`, upper case, anything but a letter or digit
+/// turned into `_`.
+fn header_guard(path: &Bytes) -> Vec[u64] {
+  let mut from = 0;
+  let mut k = 0;
+  while k < blen(path) {
+    if bget(path, k) == 47 {
+      from = k + 1;
+    }
+    k = k + 1;
+  }
+  let mut to = blen(path);
+  k = from;
+  while k < blen(path) {
+    if bget(path, k) == 46 && k > from {
+      to = k;
+    }
+    k = k + 1;
+  }
+  let mut g = vec_new[u64]();
+  out_str(&mut g, "BASTIO_");
+  k = from;
+  while k < to && k < blen(path) {
+    let ch = cast[u64](bget(path, k));
+    if ch >= 97 && ch <= 122 {
+      vec_push(&mut g, ch - 32);
+    } else if (ch >= 65 && ch <= 90) || (ch >= 48 && ch <= 57) {
+      vec_push(&mut g, ch);
+    } else {
+      vec_push(&mut g, 95);
+    }
+    k = k + 1;
+  }
+  out_str(&mut g, "_H");
+  return g;
+}
