@@ -1,0 +1,40 @@
+// expect-exit: 42
+// core/ring: a byte ring over caller storage, and a Queue of words.
+import "core/ring.bastio";
+
+fn main() -> u64 {
+  // A 4-byte ring that wraps: push 1 2 3, pop 1, push 4 5 (5 wraps to slot 0).
+  let mut store = balloc(4);
+  let mut r = ring_new(4);
+  bset(&mut store, ring_push(&mut r), 1);
+  bset(&mut store, ring_push(&mut r), 2);
+  bset(&mut store, ring_push(&mut r), 3);
+  let a = bget(store, ring_pop(&mut r));
+  bset(&mut store, ring_push(&mut r), 4);
+  let s = ring_push(&mut r);
+  bset(&mut store, s, 5);
+  assert s == 0;                     // proved: the fifth push wraps around
+  assert r.n == r.cap;
+  let mut sum = cast[u64](a);
+  while !ring_empty(r)
+    invariant ring_ok(r) && r.cap == 4 && blen(store) == 4 && sum <= 1280 - 256 * r.n
+  {
+    sum = sum + cast[u64](bget(store, ring_pop(&mut r)));
+  }
+  bfree(store);
+  // sum == 1 + 2 + 3 + 4 + 5 == 15
+  let mut q = queue_new(3);
+  queue_push(&mut q, 20);
+  queue_push(&mut q, 7);
+  let x = queue_pop(&mut q);
+  queue_push(&mut q, 9);
+  queue_push(&mut q, 11);
+  let y = queue_peek(q);
+  assert q.r.n == 3;
+  let ql = queue_len(q);
+  queue_free(q);
+  if sum == 15 && x == 20 && y == 7 && ql == 3 {
+    return 42;
+  }
+  return 1;
+}
