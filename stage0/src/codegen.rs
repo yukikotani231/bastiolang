@@ -491,6 +491,25 @@ static inline uint64_t bst_pt_take(bst_pt *t, uint64_t i) {
     return a;
 }
 #define bst_pt_take_frame bst_pt_take
+/* Shared pages: how many references (Shared values and pt_dup_shared's
+ * reads) each page has, by page number, and a PTE bit the CPU ignores that
+ * marks a slot mapping one. The last shared_drop gives the page back. */
+#define BST_PTE_SHARED 0x200ull
+static uint32_t bst_shared_refs[65536];
+static inline bst_frame bst_shared_new(bst_frame f) { __atomic_store_n(&bst_shared_refs[bst_frame_id(f)], 1, __ATOMIC_RELEASE); return f; }
+static inline bst_frame bst_shared_dup(bst_frame s) { __atomic_fetch_add(&bst_shared_refs[bst_frame_id(s)], 1, __ATOMIC_RELAXED); return s; }
+static inline uint64_t bst_shared_drop(bst_pool *p, bst_frame s) {
+    uint64_t i = bst_frame_id(s);
+    (void)p;
+    return __atomic_sub_fetch(&bst_shared_refs[i], 1, __ATOMIC_ACQ_REL) == 0 ? i : ~0ull;
+}
+static inline uint64_t bst_shared_id(bst_frame s) { return bst_frame_id(s); }
+static inline bool bst_pt_shared(bst_pt t, uint64_t i) { return (((uint64_t *)t)[i] & BST_PTE_SHARED) != 0; }
+static inline void bst_pt_put_shared(bst_pt *t, uint64_t i, bst_frame s, bool w) {
+    __atomic_store_n(&((uint64_t *)*t)[i], s | BST_PTE_P | BST_PTE_U | BST_PTE_SHARED | (w ? BST_PTE_W : 0), __ATOMIC_RELEASE);
+}
+#define bst_pt_take_shared bst_pt_take
+static inline bst_frame bst_pt_dup_shared(bst_pt t, uint64_t i) { return bst_shared_dup(((uint64_t *)t)[i] & BST_PTE_ADDR); }
 "#;
 
 // The freestanding runtime. Part of the trusted base: the only code that
@@ -965,6 +984,11 @@ static uint64_t bst_boot_fb(bst_cpu c, uint64_t f) {
     if (f == 4) return mb[110] | (uint64_t)mb[112] << 8 | (uint64_t)mb[114] << 16;
     return 0;
 }
+/* Byte `off` of the ACPI table whose signature is `sig` (its four letters
+ * as a little-endian number; "DSDT" is the one the FADT points at), or 256
+ * past its end or without one. The platform finds the tables. */
+extern uint64_t bst_platform_acpi(uint64_t sig, uint64_t off);
+static inline uint64_t bst_boot_acpi(bst_cpu c, uint64_t sig, uint64_t off) { (void)c; return bst_platform_acpi(sig, off); }
 
 /* Called by the platform on a fault in kernel mode: that is a bug in the
  * trusted base or the compiler, never in verified code. */
@@ -1094,6 +1118,7 @@ fn cty(t: &Type) -> String {
         Type::Mmio => "bst_mmio".into(),
         Type::Dma => "bst_dma".into(),
         Type::Lease => "bst_lease".into(),
+        Type::Shared => "bst_frame".into(),
         Type::Struct(n) => format!("bst_s_{}", cid(n)),
         Type::Enum(n) => format!("bst_e_{}", cid(n)),
         Type::Generic(..) => unreachable!("removed by monomorphization"),

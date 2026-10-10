@@ -28,6 +28,8 @@ What will be 0.2.0.
   writable (#81).
 - `boot_fb`, the framebuffer the boot loader reported, and a device window
   from 2 GiB (#67) up to 2^46 (#77).
+- `boot_acpi`, a byte of one of the firmware's ACPI tables, so a kernel
+  parses them (and the AML it needs) in Bastio, proved in bounds.
 - `old(x)` in loop invariants (#73).
 - Generic `spec fn`s, and `vcount` for counting in specifications; local
   variables may share a function's name (#74).
@@ -84,6 +86,21 @@ What will be 0.2.0.
 - `tests/run.sh` checks that error messages shown in `docs/` are what the
   compiler prints, that file copies in `docs/` match the files, and that
   `examples/*.bastio` build and run (#92).
+
+### Added
+
+- Shared pages: `Shared`, one counted reference to a page several page
+  tables map at once (`MAP_SHARED` memory after `fork`), with `shared_new`,
+  `shared_dup`, `shared_drop`, `shared_id`, `pt_put_shared`,
+  `pt_take_shared`, `pt_dup_shared` and the ghost `pt_shared(t, i)`. The
+  proof keeps each reference used once; the count itself is in the runtime
+  prelude (trusted). Not in the native x86 backend yet.
+
+### Changed
+
+- `pt_take_frame` now needs `!pt_shared(t, i)` (`E-VERIFY-SHARED`). Code that
+  tears down a table it did not build itself tests `pt_shared` and takes
+  such slots with `pt_take_shared`.
 
 ## [0.1.0] - not yet tagged
 

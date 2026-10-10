@@ -1,0 +1,42 @@
+// expect-exit: 7
+// A page two page tables map at once (a MAP_SHARED page after fork). Each
+// mapping holds its own reference (a Shared); the page goes back to the
+// pool only with the last one, and only then can it be taken again.
+
+fn main(pool: &mut Pool) -> u64 {
+  if pool_size(pool) < 3 {
+    return 7;
+  }
+  let mut a = pt_new(pool_take(&mut pool, 0), 1);
+  let mut b = pt_new(pool_take(&mut pool, 1), 1);
+  let s = shared_new(pool_take(&mut pool, 2));
+  let id = shared_id(s);
+  let s2 = shared_dup(s);
+  pt_put_shared(&mut a, 3, s, true);
+  pt_put_shared(&mut b, 4, s2, false);
+  let mut r = 0;
+  if pt_shared(a, 3) && !pt_shared(a, 5) && pt_has(b, 4) && !pt_writable(b, 4) {
+    r = r + 1;
+  }
+  // A third reference, read from a table without taking the page out (how
+  // fork copies a mapping).
+  let s3 = pt_dup_shared(a, 3);
+  if shared_id(s3) == id {
+    r = r + 2;
+  }
+  let d1 = shared_drop(&mut pool, s3);
+  let d2 = shared_drop(&mut pool, pt_take_shared(&mut a, 3));
+  if d1 == 18446744073709551615 && d2 == 18446744073709551615 {
+    r = r + 4;
+  }
+  let d3 = shared_drop(&mut pool, pt_take_shared(&mut b, 4));
+  if d3 == id {
+    // The last reference: the pool has the page again.
+    pool_give(&mut pool, pool_take(&mut pool, d3));
+  } else {
+    r = 0;
+  }
+  pool_give(&mut pool, pt_free(a));
+  pool_give(&mut pool, pt_free(b));
+  return r;
+}
