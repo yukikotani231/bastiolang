@@ -116,6 +116,18 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("pio_out8", Avail::Mem, vec![m(PortIo), U64, U64], Unit),
         ("pio_out16", Avail::Mem, vec![m(PortIo), U64, U64], Unit),
         ("pio_out32", Avail::Mem, vec![m(PortIo), U64, U64], Unit),
+        ("mmio_claim", Avail::Mem, vec![m(MmioSpace), U64, U64], Mmio),
+        ("mmio_release", Avail::Mem, vec![m(MmioSpace), Mmio], Unit),
+        ("mmio_base", Avail::Mem, vec![r(Mmio)], U64),
+        ("mmio_len", Avail::Mem, vec![r(Mmio)], U64),
+        ("mmio_read8", Avail::Mem, vec![m(Mmio), U64], U64),
+        ("mmio_read16", Avail::Mem, vec![m(Mmio), U64], U64),
+        ("mmio_read32", Avail::Mem, vec![m(Mmio), U64], U64),
+        ("mmio_read64", Avail::Mem, vec![m(Mmio), U64], U64),
+        ("mmio_write8", Avail::Mem, vec![m(Mmio), U64, U64], Unit),
+        ("mmio_write16", Avail::Mem, vec![m(Mmio), U64, U64], Unit),
+        ("mmio_write32", Avail::Mem, vec![m(Mmio), U64, U64], Unit),
+        ("mmio_write64", Avail::Mem, vec![m(Mmio), U64, U64], Unit),
         ("sys_spawn", Avail::User, vec![r(Buf), U64, U64], U64),
         ("sys_wait", Avail::User, vec![U64], U64),
         ("sys_kill", Avail::User, vec![U64], U64),
@@ -142,6 +154,9 @@ pub const GHOSTS: &[(&str, Type, bool, Type)] = &[
     ("port_base", Type::PortIo, false, Type::U64),
     ("port_count", Type::PortIo, false, Type::U64),
     ("port_free", Type::Ports, true, Type::Bool),
+    ("mmio_base", Type::Mmio, false, Type::U64),
+    ("mmio_len", Type::Mmio, false, Type::U64),
+    ("mmio_free", Type::MmioSpace, true, Type::Bool),
 ];
 
 pub fn is_ghost(name: &str) -> bool {
@@ -155,8 +170,26 @@ pub fn builtin_sigs() -> HashMap<String, Sig> {
 /// Builtins over `Vec[T]`: generic, so their signatures are built per call.
 pub const VEC_BUILTINS: &[&str] = &["vec_new", "vec_len", "vec_push", "vec_pop", "vec_get", "vec_set", "vec_swap", "vec_free"];
 
-/// Builtins written with type arguments (`vec_new[u64]()`).
-pub const TYPED_BUILTINS: &[&str] = &["vec_new"];
+/// Builtins written with type arguments (`vec_new[u64]()`, `cast[u8](x)`).
+pub const TYPED_BUILTINS: &[&str] = &["vec_new", "cast", "wrap"];
+
+/// Wrapping arithmetic: both operands and the result have one integer type.
+pub const WRAP_BUILTINS: &[&str] = &["wrap_add", "wrap_sub", "wrap_mul"];
+
+/// An integer literal written directly (constants are folded into literals
+/// by the parser). It has no type of its own: it takes the integer type its
+/// position asks for (docs/integers.md).
+fn int_lit(e: &Expr) -> Option<u128> {
+    match e.kind {
+        ExprKind::Int(v) => Some(v),
+        _ => None,
+    }
+}
+
+/// In a specification every integer is just a number, whatever its type.
+fn spec_norm(t: Type) -> Type {
+    if t.is_int() { Type::U64 } else { t }
+}
 
 /// Every builtin with where it is available, for `--trusted-base`.
 pub fn builtin_list() -> Vec<(String, &'static str)> {
@@ -176,7 +209,7 @@ pub fn builtin_list() -> Vec<(String, &'static str)> {
 }
 
 pub fn is_builtin(name: &str) -> bool {
-    name == "box" || name == "unbox" || VEC_BUILTINS.contains(&name) || builtin_table().iter().any(|b| b.0 == name)
+    name == "box" || name == "unbox" || name == "cast" || name == "wrap" || VEC_BUILTINS.contains(&name) || WRAP_BUILTINS.contains(&name) || builtin_table().iter().any(|b| b.0 == name)
 }
 
 fn available(name: &str, target: Target) -> bool {
@@ -194,8 +227,8 @@ fn available(name: &str, target: Target) -> bool {
 /// The capabilities `main` may ask for on each target.
 fn main_caps(target: Target) -> &'static [Type] {
     match target {
-        Target::Hosted => &[Type::Serial, Type::Pool, Type::Host, Type::Ports],
-        Target::Kernel => &[Type::Serial, Type::Pool, Type::Mmu, Type::Cpu, Type::Ports],
+        Target::Hosted => &[Type::Serial, Type::Pool, Type::Host, Type::Ports, Type::MmioSpace],
+        Target::Kernel => &[Type::Serial, Type::Pool, Type::Mmu, Type::Cpu, Type::Ports, Type::MmioSpace],
         Target::User => &[Type::Serial],
     }
 }
@@ -203,7 +236,7 @@ fn main_caps(target: Target) -> &'static [Type] {
 /// Struct and enum definitions: unique names, known field and payload
 /// types, no type that contains itself.
 pub fn check_structs(p: &Program) -> Result<(), Diag> {
-    const RESERVED: &[&str] = &["u64", "bool", "Str", "Buf", "Bytes", "Host", "Child", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu", "Ports", "PortIo"];
+    const RESERVED: &[&str] = &["u64", "u8", "u16", "u32", "bool", "Str", "Buf", "Bytes", "Host", "Child", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu", "Ports", "PortIo", "MmioSpace", "Mmio"];
     // (name, position, the types it holds directly)
     let mut defs: Vec<(String, Pos, Vec<Type>)> = Vec::new();
     for d in &p.structs {
@@ -336,6 +369,8 @@ struct Ctx<'a> {
     /// Linear variables that have been consumed (or, for `&mut` parameters,
     /// moved out of and not yet put back).
     moved: HashSet<String>,
+    /// See `FnDef::int_ops`.
+    int_ops: HashMap<Pos, Type>,
 }
 
 pub fn check_program(p: &mut Program, target: Target) -> Result<HashMap<String, Sig>, Diag> {
@@ -351,7 +386,7 @@ pub fn check_program(p: &mut Program, target: Target) -> Result<HashMap<String, 
 }
 
 fn new_ctx<'a>(sigs: &'a HashMap<String, Sig>, specs: &'a [SpecFn], target: Target, ret: Type) -> Ctx<'a> {
-    Ctx { sigs, specs, target, ret, scopes: vec![Vec::new()], vars: HashMap::new(), moved: HashSet::new() }
+    Ctx { sigs, specs, target, ret, scopes: vec![Vec::new()], vars: HashMap::new(), moved: HashSet::new(), int_ops: HashMap::new() }
 }
 
 /// A spec fn may only call spec fns defined before it, so expansion terminates.
@@ -397,6 +432,15 @@ fn check_fn(f: &mut FnDef, sigs: &HashMap<String, Sig>, specs: &[SpecFn], target
             return Err(Diag::new("E-TYPE", f.pos, format!("function `{}` can reach its end without returning a {}", f.name, f.ret.name())));
         }
         cx.leak_check_all(f.pos, "at the end of the function")?;
+    }
+    f.int_ops = cx.int_ops;
+    Ok(())
+}
+
+/// Checks that the literal `v` fits in the integer type `t`.
+fn lit_fits(v: u128, t: &Type, pos: Pos) -> Result<(), Diag> {
+    if v > t.int_max() {
+        return Err(Diag::new("E-TYPE", pos, format!("{} does not fit in {}", v, t.name())));
     }
     Ok(())
 }
@@ -611,7 +655,10 @@ impl<'a> Ctx<'a> {
         let pos = s.pos;
         match &mut s.kind {
             StmtKind::Let { name, mutable, ty, init } => {
-                let t = self.expr(init)?;
+                let t = match ty {
+                    Some(want) => self.expr_as(init, &want.clone())?,
+                    None => self.expr(init)?,
+                };
                 if let Some(want) = ty {
                     known_type(want, pos)?;
                     if want.is_ref() {
@@ -633,7 +680,7 @@ impl<'a> Ctx<'a> {
                 if !info.mutable {
                     return Err(Diag::new("E-TYPE", pos, format!("`{}` is not mutable (declare it with `mut`)", root)));
                 }
-                let t = self.expr(value)?;
+                let t = self.expr_as(value, &want)?;
                 expect_ty(&t, &want, value.pos, &format!("the value assigned to `{}`", name))?;
                 if let Some(k) = name.rfind('.') {
                     if let Some(m) = self.prefix_moved(&name[..k]) {
@@ -701,11 +748,11 @@ impl<'a> Ctx<'a> {
                 Ok(false)
             }
             StmtKind::Return(e) => {
+                let ret = self.ret.clone();
                 let t = match e {
-                    Some(e) => self.expr(e)?,
+                    Some(e) => self.expr_as(e, &ret)?,
                     None => Type::Unit,
                 };
-                let ret = self.ret.clone();
                 expect_ty(&t, &ret, pos, "the returned value")?;
                 self.leak_check_all(pos, "at this `return`")?;
                 Ok(true)
@@ -851,6 +898,31 @@ impl<'a> Ctx<'a> {
         self.vars.get(name).cloned().ok_or_else(|| Diag::new("E-TYPE", pos, format!("unknown variable `{}`", name)))
     }
 
+    /// A code expression in a position that expects `want`: a literal takes
+    /// that type when it is an integer type.
+    fn expr_as(&mut self, e: &Expr, want: &Type) -> Result<Type, Diag> {
+        match int_lit(e) {
+            Some(v) if want.is_int() => {
+                lit_fits(v, want, e.pos)?;
+                Ok(want.clone())
+            }
+            _ => self.expr(e),
+        }
+    }
+
+    /// The two operands of a binary operator: a literal on one side takes
+    /// the type of the other side.
+    fn operands(&mut self, a: &Expr, b: &Expr) -> Result<(Type, Type), Diag> {
+        if int_lit(a).is_some() && int_lit(b).is_none() {
+            let tb = self.expr(b)?;
+            let ta = self.expr_as(a, &tb)?;
+            return Ok((ta, tb));
+        }
+        let ta = self.expr(a)?;
+        let tb = self.expr_as(b, &ta)?;
+        Ok((ta, tb))
+    }
+
     /// Code expression: linear variables in value position are moved.
     fn expr(&mut self, e: &Expr) -> Result<Type, Diag> {
         match &e.kind {
@@ -862,6 +934,20 @@ impl<'a> Ctx<'a> {
                     }
                     known_type(&targs[0], e.pos)?;
                     Ok(Type::Vec(Box::new(targs[0].clone())))
+                }
+                // `cast[T](x)` (proved to fit) and `wrap[T](x)` (modular).
+                ExprKind::Call(n, args) if n == "cast" || n == "wrap" => {
+                    if targs.len() != 1 || args.len() != 1 {
+                        return Err(Diag::new("E-TYPE", e.pos, format!("write `{}[T](x)`: one type argument, one argument", n)));
+                    }
+                    if !targs[0].is_int() {
+                        return Err(Diag::new("E-TYPE", e.pos, format!("`{}` converts to an integer type, not {}", n, targs[0].name())));
+                    }
+                    let t = self.expr(&args[0])?;
+                    if !t.is_int() {
+                        return Err(Diag::new("E-TYPE", args[0].pos, format!("`{}` converts an integer, found {}", n, t.name())));
+                    }
+                    Ok(targs[0].clone())
                 }
                 _ => unreachable!("removed by monomorphization"),
             },
@@ -885,7 +971,7 @@ impl<'a> Ctx<'a> {
                 match (&d.variants[k].1, payload) {
                     (None, None) => {}
                     (Some(pt), Some(x)) => {
-                        let t = self.expr(x)?;
+                        let t = self.expr_as(x, pt)?;
                         expect_ty(&t, pt, x.pos, &format!("the payload of `{}::{}`", en, v))?;
                     }
                     (None, Some(_)) => return Err(Diag::new("E-TYPE", e.pos, format!("`{}::{}` has no payload", en, v))),
@@ -928,7 +1014,7 @@ impl<'a> Ctx<'a> {
                 }
                 for (f, x) in fs {
                     let ft = d.field(f).ok_or_else(|| Diag::new("E-TYPE", x.pos, format!("`{}` has no field `{}`", n, f)))?;
-                    let t = self.expr(x)?;
+                    let t = self.expr_as(x, ft)?;
                     expect_ty(&t, ft, x.pos, &format!("field `{}`", f))?;
                 }
                 Ok(Type::Struct(n.clone()))
@@ -942,13 +1028,21 @@ impl<'a> Ctx<'a> {
                 if *op == BinOp::Implies {
                     return Err(Diag::new("E-TYPE", e.pos, "`==>` is only allowed in specifications"));
                 }
-                let ta = self.expr(a)?;
-                let before_rhs = self.moved.clone();
-                let tb = self.expr(b)?;
-                if matches!(op, BinOp::And | BinOp::Or) && self.moved != before_rhs {
-                    return Err(Diag::new("E-LINEAR-USE", b.pos, format!("the right side of `{}` may not run, so it cannot consume a linear value", op.text())));
+                if matches!(op, BinOp::And | BinOp::Or) {
+                    let ta = self.expr(a)?;
+                    let before_rhs = self.moved.clone();
+                    let tb = self.expr(b)?;
+                    if self.moved != before_rhs {
+                        return Err(Diag::new("E-LINEAR-USE", b.pos, format!("the right side of `{}` may not run, so it cannot consume a linear value", op.text())));
+                    }
+                    return bin_type(*op, &ta, &tb, e.pos);
                 }
-                bin_type(*op, &ta, &tb, e.pos)
+                let (ta, tb) = self.operands(a, b)?;
+                let t = bin_type(*op, &ta, &tb, e.pos)?;
+                if t.is_int() {
+                    self.int_ops.insert(e.pos, t.clone());
+                }
+                Ok(t)
             }
             ExprKind::Forall(..) => Err(Diag::new("E-TYPE", e.pos, "`forall` is only allowed in specifications")),
             ExprKind::Call(name, args) => {
@@ -958,6 +1052,17 @@ impl<'a> Ctx<'a> {
                 if VEC_BUILTINS.contains(&name.as_str()) {
                     let sig = self.vec_sig(name, args, e.pos)?;
                     return self.call_with(name, sig, args, e.pos);
+                }
+                if WRAP_BUILTINS.contains(&name.as_str()) {
+                    if args.len() != 2 {
+                        return Err(Diag::new("E-TYPE", e.pos, format!("`{}` takes 2 argument(s), {} given", name, args.len())));
+                    }
+                    let (ta, tb) = self.operands(&args[0], &args[1])?;
+                    if !ta.is_int() || ta != tb {
+                        return Err(Diag::new("E-TYPE", e.pos, format!("`{}` needs two integers of the same type, found {} and {}", name, ta.name(), tb.name())));
+                    }
+                    self.int_ops.insert(e.pos, ta.clone());
+                    return Ok(ta);
                 }
                 if name == "box" || name == "unbox" {
                     // Generic over the boxed type, so not in the builtin table.
@@ -1031,7 +1136,12 @@ impl<'a> Ctx<'a> {
         // read a value that a later argument consumes (`set(b, i, get(b, j))`).
         for (pt, a) in sig.params.iter().zip(args) {
             if !pt.is_linear() && !pt.is_ref() {
-                let t = self.expr(a)?;
+                let t = self.expr_as(a, pt)?;
+                // A builtin's u64 parameter (an index, a length, a value)
+                // takes any narrower unsigned value: widening is free.
+                if *pt == Type::U64 && t.is_int() && t != Type::U64 && is_builtin(name) {
+                    continue;
+                }
                 expect_ty(&t, pt, a.pos, &format!("argument of `{}`", name))?;
             }
         }
@@ -1144,8 +1254,8 @@ impl<'a> Ctx<'a> {
                 Ok(Type::Bool)
             }
             ExprKind::Bin(op, a, b) => {
-                let ta = self.spec_expr(a, in_ensures, bound)?;
-                let tb = self.spec_expr(b, in_ensures, bound)?;
+                let ta = spec_norm(self.spec_expr(a, in_ensures, bound)?);
+                let tb = spec_norm(self.spec_expr(b, in_ensures, bound)?);
                 bin_type(*op, &ta, &tb, e.pos)
             }
             ExprKind::Forall(v, body) => {
@@ -1189,8 +1299,8 @@ impl<'a> Ctx<'a> {
                 if let Some(sf) = self.specs.iter().find(|s| &s.name == name) {
                     arity(sf.params.len())?;
                     for (p, a) in sf.params.iter().zip(args) {
-                        let t = self.spec_expr(a, in_ensures, bound)?;
-                        if t != *p.ty.base() {
+                        let t = spec_norm(self.spec_expr(a, in_ensures, bound)?);
+                        if t != spec_norm(p.ty.base().clone()) {
                             return Err(Diag::new("E-TYPE", a.pos, format!("argument of `{}` must be {}, found {}", name, p.ty.base().name(), t.name())));
                         }
                         if p.ty.base().is_linear() {
@@ -1207,7 +1317,7 @@ impl<'a> Ctx<'a> {
                     }
                     check_lin(&args[0])?;
                     if g.2 {
-                        let ti = self.spec_expr(&args[1], in_ensures, bound)?;
+                        let ti = spec_norm(self.spec_expr(&args[1], in_ensures, bound)?);
                         expect_ty(&ti, &Type::U64, args[1].pos, "an index")?;
                     }
                     return Ok(g.3.clone());
@@ -1222,7 +1332,7 @@ impl<'a> Ctx<'a> {
                     if name == "vlen" {
                         return Ok(Type::U64);
                     }
-                    let ti = self.spec_expr(&args[1], in_ensures, bound)?;
+                    let ti = spec_norm(self.spec_expr(&args[1], in_ensures, bound)?);
                     expect_ty(&ti, &Type::U64, args[1].pos, "an index")?;
                     return Ok((**el).clone());
                 }
@@ -1237,7 +1347,7 @@ impl<'a> Ctx<'a> {
                 }
                 check_lin(&args[0])?;
                 if args.len() == 2 {
-                    let ti = self.spec_expr(&args[1], in_ensures, bound)?;
+                    let ti = spec_norm(self.spec_expr(&args[1], in_ensures, bound)?);
                     expect_ty(&ti, &Type::U64, args[1].pos, "an index")?;
                 }
                 Ok(Type::U64)
@@ -1249,18 +1359,15 @@ impl<'a> Ctx<'a> {
 fn bin_type(op: BinOp, a: &Type, b: &Type, pos: Pos) -> Result<Type, Diag> {
     use BinOp::*;
     match op {
-        Add | Sub | Mul | Div | Rem => {
-            expect_ty(a, &Type::U64, pos, &format!("the left operand of `{}`", op.text()))?;
-            expect_ty(b, &Type::U64, pos, &format!("the right operand of `{}`", op.text()))?;
-            Ok(Type::U64)
-        }
-        Lt | Le | Gt | Ge => {
-            expect_ty(a, &Type::U64, pos, &format!("the left operand of `{}`", op.text()))?;
-            expect_ty(b, &Type::U64, pos, &format!("the right operand of `{}`", op.text()))?;
-            Ok(Type::Bool)
+        Add | Sub | Mul | Div | Rem | Lt | Le | Gt | Ge => {
+            // Both operands have one integer type; there is no promotion.
+            let want = if a.is_int() { a.clone() } else { Type::U64 };
+            expect_ty(a, &want, pos, &format!("the left operand of `{}`", op.text()))?;
+            expect_ty(b, &want, pos, &format!("the right operand of `{}`", op.text()))?;
+            Ok(if matches!(op, Lt | Le | Gt | Ge) { Type::Bool } else { want })
         }
         Eq | Ne => {
-            if a != b || !(matches!(a, Type::U64 | Type::Bool)) {
+            if a != b || !(a.is_int() || *a == Type::Bool) {
                 return Err(Diag::new("E-TYPE", pos, format!("cannot compare {} with {}", a.name(), b.name())));
             }
             Ok(Type::Bool)

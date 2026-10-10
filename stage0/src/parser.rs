@@ -11,7 +11,7 @@
 //   const    := 'const' IDENT ':' 'u64' '=' expr ';'   (constant-folded; define before use)
 //   param    := 'mut'? IDENT ':' type
 //   type     := 'u64' | 'bool' | 'Str' | linear | IDENT (a struct) | '&' linear | '&' 'mut' linear
-//   linear   := 'Buf' | 'Bytes' | 'Host' | 'Child' | 'Serial' | 'Frame' | 'PageTable' | 'Pool' | 'Mmu' | 'Cpu' | 'Ports' | 'PortIo'
+//   linear   := 'Buf' | 'Bytes' | 'Host' | 'Child' | 'Serial' | 'Frame' | 'PageTable' | 'Pool' | 'Mmu' | 'Cpu' | 'Ports' | 'PortIo' | 'MmioSpace' | 'Mmio'
 //   place    := IDENT ('.' IDENT)*
 //   primary  := ... | '&' 'mut' place | 'include_bytes' '(' STRING ')' | 'old' '(' expr ')'
 //             | IDENT '{' (IDENT ':' expr (',' IDENT ':' expr)* ','?)? '}'   (a struct literal)
@@ -321,6 +321,9 @@ impl Parser {
         let (n, _) = self.ident()?;
         match n.as_str() {
             "u64" => Ok(Type::U64),
+            "u8" => Ok(Type::U8),
+            "u16" => Ok(Type::U16),
+            "u32" => Ok(Type::U32),
             "bool" => Ok(Type::Bool),
             "Buf" => Ok(Type::Buf),
             "Bytes" => Ok(Type::Bytes),
@@ -335,6 +338,8 @@ impl Parser {
             "Cpu" => Ok(Type::Cpu),
             "Ports" => Ok(Type::Ports),
             "PortIo" => Ok(Type::PortIo),
+            "MmioSpace" => Ok(Type::MmioSpace),
+            "Mmio" => Ok(Type::Mmio),
             _ if *self.peek() == Tok::LBracket && n != "Box" && n != "Vec" => Ok(Type::Generic(n, self.targs()?)),
             "Box" | "Vec" => {
                 self.expect(Tok::LBracket, "`[`")?;
@@ -387,7 +392,7 @@ impl Parser {
             }
         }
         let body = self.block()?;
-        Ok(FnDef { name, tparams, params, ret, requires, ensures, body, pos })
+        Ok(FnDef { name, tparams, params, ret, requires, ensures, body, pos, int_ops: Default::default() })
     }
 
     fn block(&mut self) -> PResult<Vec<Stmt>> {

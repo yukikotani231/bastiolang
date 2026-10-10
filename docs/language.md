@@ -120,8 +120,8 @@ All files share one namespace, as in C: a function, type or constant name must b
 
 | Target | `main` may take |
 | --- | --- |
-| `hosted` | `&mut Serial`, `&mut Pool`, `&mut Host`, `&mut Ports` |
-| `kernel` | `&mut Serial`, `&mut Pool`, `&mut Mmu`, `&mut Cpu`, `&mut Ports` |
+| `hosted` | `&mut Serial`, `&mut Pool`, `&mut Host`, `&mut Ports`, `&mut MmioSpace` |
+| `kernel` | `&mut Serial`, `&mut Pool`, `&mut Mmu`, `&mut Cpu`, `&mut Ports`, `&mut MmioSpace` |
 | `user` | `&mut Serial` (and must return `u64`) |
 
 The older form `fn main(con: Serial) -> Serial` is still accepted outside user programs.
@@ -142,7 +142,8 @@ fn main(con: &mut Serial) -> u64 {
 
 | Type | Meaning |
 | --- | --- |
-| `u64` | Unsigned 64-bit integer, the only integer type for now (narrower and signed ones are designed in [integers.md](integers.md)). Arithmetic is proved to stay in range; it never wraps |
+| `u64` | Unsigned 64-bit integer. Arithmetic is proved to stay in range; it never wraps |
+| `u8`, `u16`, `u32` | Narrower unsigned integers (C's `uint8_t` and so on), with the same proofs. See "Sized integers" below; signed types are designed in [integers.md](integers.md) |
 | `bool` | `true` or `false` |
 | `Str` | A string literal: immutable bytes whose length and contents are known at compile time. Never freed |
 | A struct or enum with no linear part | See [Structs](#structs) and [Enums](#enums-and-match) |
@@ -157,7 +158,7 @@ fn main(con: &mut Serial) -> u64 {
 | `Box[T]` | An owning pointer to a `T` on the heap; the only way a type can contain itself |
 | A struct with a linear field, an enum with a linear payload | |
 | `Host`, `Child` | The host system, and a child process (hosted target only) |
-| `Serial`, `Pool`, `Frame`, `PageTable`, `Mmu`, `Cpu`, `Ports`, `PortIo` | Capabilities: the console, physical pages, page tables, the MMU, the CPU's user context and I/O ports. See [Kernel capabilities](#kernel-capabilities) |
+| `Serial`, `Pool`, `Frame`, `PageTable`, `Mmu`, `Cpu`, `Ports`, `PortIo`, `MmioSpace`, `Mmio` | Capabilities: the console, physical pages, page tables, the MMU, the CPU's user context, I/O ports and memory-mapped device registers. See [Kernel capabilities](#kernel-capabilities) |
 
 **Borrows** are allowed only as parameter types, so a borrow can never be stored, returned or outlive the call:
 
@@ -338,6 +339,45 @@ fn main() -> u64 {
 ```
 
 Call arguments, the operands of an operator and the fields of a struct literal are evaluated left to right, and the proof assumes that order. (One exception: a linear value passed by name or lent as `&mut` is read after the other arguments have run, so `f(b, g(&mut b))` passes `b` as `g` left it.) C leaves this order unspecified, so when an operand has a side effect the generated C evaluates each operand into a temporary first; without side effects it emits the expression as written.
+
+**Sized integers.** `u8`, `u16` and `u32` follow the same rules at their own width: `+` and `*` must stay below 2^8, 2^16 or 2^32. Both operands of an arithmetic operator or a comparison have one integer type; there is no implicit promotion. A literal takes the integer type its position asks for (a typed `let`, an assignment, a `return`, a parameter, a field, a payload, the other operand of an operator) and is `u64` when nothing says otherwise; it must fit (`E-TYPE`). Conversions are written out:
+- `cast[T](x)` keeps the value and is proved to fit in `T` (`E-VERIFY-CAST`). Widening always fits, so it needs no annotation.
+- `wrap[T](x)` reduces `x` modulo 2^width of `T`, for code that means to drop bits.
+- `wrap_add(a, b)`, `wrap_sub(a, b)` and `wrap_mul(a, b)` are modular arithmetic on two operands of one type, for checksums and hashes.
+- A builtin's `u64` parameter (an index, a length, a value) accepts any narrower unsigned integer, since widening is free.
+
+```bastio
+// expect-exit: 42
+fn hex_digit(n: u64) -> u8
+  requires n < 16
+{
+  if n < 10 {
+    return cast[u8](n) + 48;     // '0' + n: proved to fit in u8
+  }
+  return cast[u8](n) + 87;       // 'a' + n - 10
+}
+
+fn main() -> u64 {
+  let x: u32 = 70000;
+  let low: u16 = wrap[u16](x);   // 70000 mod 65536 = 4464
+  let s: u8 = wrap_add(hex_digit(15), 200);   // 102 + 200 mod 256 = 46
+  if s != 46 || low != 4464 {
+    return 1;
+  }
+  return 42;
+}
+```
+
+```bastio
+// expect-error: E-VERIFY-CAST
+fn low_byte(n: u64) -> u8 {
+  return cast[u8](n);            // fails: n may be 256 or more; `wrap[u8](n)` drops the bits instead
+}
+
+fn main() -> u64 {
+  return cast[u64](low_byte(300));
+}
+```
 
 ## Structs
 
@@ -687,7 +727,7 @@ fn main(host: &mut Host) -> u64 {
 
 ## Kernel capabilities
 
-Hardware is reached only through capability types. There is no way to read or write memory through an integer address (ROADMAP invariant 1). Capabilities are linear, and `main` is handed the ones its target provides; they cannot be created. They carry **ghost state** that exists only in the proof: in the generated code a `Frame` or `PageTable` is a bare physical address, `Serial`, `Mmu`, `Cpu` and `Ports` are empty, and a `PortIo` is its base and count.
+Hardware is reached only through capability types. There is no way to read or write memory through an integer address (ROADMAP invariant 1). Capabilities are linear, and `main` is handed the ones its target provides; they cannot be created. They carry **ghost state** that exists only in the proof: in the generated code a `Frame` or `PageTable` is a bare physical address, `Serial`, `Mmu`, `Cpu`, `Ports` and `MmioSpace` are empty, and a `PortIo` or `Mmio` is its base and size.
 
 | Type | Meaning |
 | --- | --- |
@@ -699,6 +739,8 @@ Hardware is reached only through capability types. There is no way to read or wr
 | `Cpu` | The CPU's saved user context and the right to enter user mode (kernel only) |
 | `Ports` | The x86 I/O port space: the right to claim each of the 65536 ports, once |
 | `PortIo` | A claimed range of I/O ports, owned: the only way to read or write them |
+| `MmioSpace` | The device window (physical `0xC0000000` up to 4 GiB, which the kernel platform maps uncached): the right to claim each byte of it, once |
+| `Mmio` | A claimed block of memory-mapped device registers, owned: the only way to read or write them |
 
 Ghost accessors, usable in specifications:
 
@@ -709,6 +751,8 @@ Ghost accessors, usable in specifications:
 | `pt_used(t, i)` | Slot `i` owns something |
 | `pool_has(p, i)` | The pool can still hand out page `i` |
 | `pool_size(p)` | Number of pages in the pool (also callable at run time) |
+| `mmio_free(w, a)` | Nobody has claimed device-window address `a`; `main` receives the whole window free |
+| `mmio_base(r)`, `mmio_len(r)` | The registers `r` owns, `mmio_base(r)` up to `mmio_base(r) + mmio_len(r)`, always inside the device window (also callable at run time) |
 | `mmu_root(m)` | The id of the table in CR3; `0x10000` while the kernel's own map is loaded |
 | `port_free(p, k)` | Nobody has claimed port `k`; `main` receives every port free |
 | `port_base(io)`, `port_count(io)` | The ports `io` owns, `port_base(io)` up to `port_base(io) + port_count(io)`, always within the 65536 ports (also callable at run time) |
@@ -852,6 +896,29 @@ fn main(ports: &mut Ports) -> u64 {
 }
 ```
 
+**Memory-mapped registers** (kernel and hosted; hosted builds simulate the window with 1 MiB of memory indexed by the low 20 bits of the address):
+
+| Builtin | Requires (proved) | Effect |
+| --- | --- | --- |
+| `mmio_claim(w: &mut MmioSpace, base: u64, len: u64) -> Mmio` | `0xC0000000 <= base`, `base + len <= 2^32`; `mmio_free(w, a)` for every `a` in the block | Takes the block out of `w` |
+| `mmio_release(w: &mut MmioSpace, r: Mmio)` | | Gives it back |
+| `mmio_read8` / `16` / `32` / `64(r: &mut Mmio, off: u64) -> u64` | `off + width <= mmio_len(r)`; `mmio_base(r) + off` is a multiple of the width | One volatile load; the result fits the width |
+| `mmio_write8` / `16` / `32` / `64(r: &mut Mmio, off: u64, v: u64)` | the same, and `v` fits the width | One volatile store |
+
+The rules are those of ports: claiming compiles to nothing, two drivers never own the same register, and reads take `&mut`. Because claims must lie in the device window and the page pool stays below 256 MiB, a driver can never reach memory the allocator owns. What a device does with the values is not modelled; nor are DMA buffers yet.
+
+```bastio
+// expect-exit: 0
+// The local APIC's version register, read through a claimed block.
+fn main(win: &mut MmioSpace) -> u64 {
+  let mut apic = mmio_claim(&mut win, 0xFEE00000, 4096);
+  let v = mmio_read32(&mut apic, 0x30);
+  // mmio_read32(&mut apic, 0x32) would be E-VERIFY-BOUNDS (unaligned).
+  mmio_release(&mut win, apic);
+  return v % 1;
+}
+```
+
 **System calls** (user target only). Programs built with `--target user` run under BastiOS and have `sys_spawn(b: &Buf, from: u64, to: u64)` (start the program named by elements `from..to` of `b`, proved to be a range within `b`), `sys_wait(pid)`, `sys_kill(pid)`, `sys_yield()`, `sys_getpid()`, `sys_info(k)`, `sys_ps()` and `sys_poweroff()`.
 
 Calls the language does not know by name go through three generic builtins. The call number `n` and what the call does belong to the kernel (BastiOS defines its file system calls this way), so a new system call needs no compiler change:
@@ -870,7 +937,7 @@ Calling a builtin the target does not have is `E-TARGET`.
 
 Expressions in `requires`, `ensures`, `invariant` and `assert` (and the bodies of `spec fn`s) exist only at compile time and generate no code.
 
-- They are evaluated over **mathematical integers**: `a - b` may be negative and `a + b` cannot overflow.
+- They are evaluated over **mathematical integers**: `a - b` may be negative and `a + b` cannot overflow. Integers of different types mix freely there, with no conversions.
 - They may use `==>` (implication) and `forall x: u64 :: e`.
 - They may call `len`, `get`, `slen`, `sget`, `blen`, `bget`, `vlen`, `vget`, the ghost accessors of the capabilities, and `spec fn`s.
 - They may use `is` and enum payloads (`o.Some`), and see through boxes.
@@ -946,14 +1013,15 @@ Proofs:
 
 | Code | What is proved |
 | --- | --- |
-| `E-VERIFY-BOUNDS` | Every index is below its limit: buffer, byte, string and vector indices; I/O port offsets within the claimed range; `vec_pop` on a non-empty vector; page numbers below `pool_size`; words, bytes and slots of a page or table; `cpu_get` / `cpu_set` registers; the `sys_spawn` range; the `sys_send` length |
+| `E-VERIFY-BOUNDS` | Every index is below its limit: buffer, byte, string and vector indices; I/O port and register offsets within the claimed range, and register accesses aligned; `vec_pop` on a non-empty vector; page numbers below `pool_size`; words, bytes and slots of a page or table; `cpu_get` / `cpu_set` registers; the `sys_spawn` range; the `sys_send` length |
 | `E-VERIFY-LEAK` | A vector of linear elements is empty when it is freed |
-| `E-VERIFY-OVERFLOW` | `+` and `*` results < 2^64 |
+| `E-VERIFY-OVERFLOW` | `+` and `*` results fit the operation's type (< 2^64 for `u64`, < 2^8 for `u8`, ...) |
+| `E-VERIFY-CAST` | the argument of `cast[T]` fits in `T` |
 | `E-VERIFY-UNDERFLOW` | `a - b` has `a >= b` |
 | `E-VERIFY-DIVZERO` | The divisor of `/` and `%` is not zero |
 | `E-VERIFY-ALLOC` | Allocation size <= 2^60 elements |
-| `E-VERIFY-BYTE` | A value stored as a byte (`serial_write`, `bset`, `frame_write8`, `pio_out8`) is `<= 255`; `pio_out16` / `pio_out32` values fit 16 / 32 bits |
-| `E-VERIFY-OWN` | A page is taken from the pool at most once; an I/O port has at most one owner; a table slot is empty before `pt_put` and used before `pt_take`; a table is empty before it is freed |
+| `E-VERIFY-BYTE` | A value stored as a byte (`serial_write`, `bset`, `frame_write8`, `pio_out8`) is `<= 255`; `pio_out16` / `pio_out32` and `mmio_write*` values fit their width |
+| `E-VERIFY-OWN` | A page is taken from the pool at most once; an I/O port or device register has at most one owner; a table slot is empty before `pt_put` and used before `pt_take`; a table is empty before it is freed |
 | `E-VERIFY-PT` | Table levels line up; frames go only into level-1 tables; slot 0 of a top-level table (the kernel's map) is never touched |
 | `E-VERIFY-MMU` | The table in CR3 is never freed |
 | `E-VERIFY-REQUIRES` | The callee's `requires` |
@@ -991,4 +1059,4 @@ What a program that `bastioc0` accepts is guaranteed: no out-of-bounds access, n
 
 ## Not in the language yet
 
-Planned, in [ROADMAP.md](../ROADMAP.md): concurrency (designed in [concurrency.md](concurrency.md)), integer types narrower than `u64`, `export fn` for calling Bastio from C, more hardware capabilities (`Mmio`, `IrqOff`), allocation failure in the type, and a native x86-64 backend. Inference of type arguments, modules with qualified names, and hand-written lemmas for proofs Z3 cannot find are open questions.
+Planned, in [ROADMAP.md](../ROADMAP.md): concurrency (designed in [concurrency.md](concurrency.md)), integer types narrower than `u64`, `export fn` for calling Bastio from C, more hardware capabilities (`IrqOff`, DMA buffers), allocation failure in the type, and a native x86-64 backend. Inference of type arguments, modules with qualified names, and hand-written lemmas for proofs Z3 cannot find are open questions.

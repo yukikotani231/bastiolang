@@ -27,6 +27,9 @@
 //   Pool       has[i] (the page numbers it can still hand out), size
 //   Mmu        root (the id of the table in CR3; KROOT for the kernel's own)
 //   Ports      free[p] (the I/O ports nobody has claimed yet)
+//   MmioSpace  free[a] (the device-window addresses nobody has claimed)
+//   Mmio       base, len (the device registers base .. base+len it owns,
+//              always inside the device window)
 //   PortIo     base, count (the ports base .. base+count it owns; always
 //              within the 65536 ports)
 // A struct value is the values of its fields; places like `p.root` read and
@@ -61,6 +64,11 @@ const KROOT: &str = "65536";
 const POOLSIZE: &str = "POOLSIZE";
 /// The number of x86 I/O ports: a PortIo's ports are all below it.
 const PORT_LIMIT: &str = "65536";
+/// The device window a `Mmio` lies in: physical 0xC000_0000 up to 4 GiB,
+/// which the platform maps uncached (and which holds no pool page, since
+/// pages stay below FRAME_LIMIT).
+const MMIO_LO: &str = "3221225472";
+const MMIO_HI: &str = "4294967296";
 const NO_BOOL: &str = "((as const (Array Int Bool)) false)";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -262,6 +270,8 @@ fn ghost_fields(t: &Type) -> &'static [(&'static str, bool, &'static str)] {
         Type::Mmu => &[("root", false, "mmu_root")],
         Type::Ports => &[("free", true, "")],
         Type::PortIo => &[("base", false, "port_base"), ("count", false, "port_count")],
+        Type::MmioSpace => &[("free", true, "")],
+        Type::Mmio => &[("base", false, "mmio_base"), ("len", false, "mmio_len")],
         _ => &[],
     }
 }
@@ -269,13 +279,14 @@ fn ghost_fields(t: &Type) -> &'static [(&'static str, bool, &'static str)] {
 /// Ghost fields a loop keeps when the object is changed only by builtins
 /// that never change them (a page table keeps its id and level).
 fn kept_by_builtins(t: &Type, field: &str) -> bool {
-    matches!((t, field), (Type::Frame, "id") | (Type::PageTable, "id") | (Type::PageTable, "level") | (Type::Pool, "size") | (Type::PortIo, "base") | (Type::PortIo, "count"))
+    matches!((t, field), (Type::Frame, "id") | (Type::PageTable, "id") | (Type::PageTable, "level") | (Type::Pool, "size") | (Type::PortIo, "base") | (Type::PortIo, "count") | (Type::Mmio, "base") | (Type::Mmio, "len"))
 }
 
 /// Builtins whose `&mut` argument keeps the fields above.
 const SHAPE_KEEPING: &[&str] =
     &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pool_take", "pool_give", "frame_write", "frame_write8", "cpu_set", "cpu_run", "cpu_idle", "cpu_fpu_save", "cpu_fpu_load",
-      "pio_in8", "pio_in16", "pio_in32", "pio_out8", "pio_out16", "pio_out32"];
+      "pio_in8", "pio_in16", "pio_in32", "pio_out8", "pio_out16", "pio_out32",
+      "mmio_read8", "mmio_read16", "mmio_read32", "mmio_read64", "mmio_write8", "mmio_write16", "mmio_write32", "mmio_write64"];
 
 /// What a call may do to one `&mut` argument: the places under it that may
 /// change, as paths relative to the parameter (`""` is the parameter itself,
@@ -365,6 +376,9 @@ pub struct Verifier<'p> {
     pub obligations: usize,
     /// Boxes being unfolded by `fresh_of` right now.
     box_depth: usize,
+    /// The integer type of each arithmetic operator in the function being
+    /// verified (`FnDef::int_ops`).
+    int_ops: HashMap<Pos, Type>,
     sums: Summaries,
 }
 
@@ -394,7 +408,7 @@ fn ite(c: &str, a: &str, b: &str) -> String {
 
 pub fn verify_program(p: &Program) -> Result<(usize, Vec<String>), Diag> {
     let solver = Solver::start().map_err(|e| Diag::new("E-SOLVER", Pos::default(), e))?;
-    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, sums: summarize(p) };
+    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, sums: summarize(p), int_ops: HashMap::new() };
     v.smt(&format!("(declare-const {} Int)", POOLSIZE))?;
     v.smt(&format!("(assert (and (<= 0 {p}) (<= {p} {})))", FRAME_LIMIT, p = POOLSIZE))?;
     // Each function gets its own solver scope: what is declared and assumed
@@ -458,6 +472,8 @@ impl<'p> Verifier<'p> {
             (_, "used") | (_, "has") | (_, "free") => self.fresh_array(&h, "Bool"),
             (Type::PortIo, "base") => self.fresh_int(&h, "0", PORT_LIMIT),
             (Type::PortIo, "count") => self.fresh_int(&h, "0", PORT_LIMIT),
+            (Type::Mmio, "base") => self.fresh_int(&h, MMIO_LO, MMIO_HI),
+            (Type::Mmio, "len") => self.fresh_int(&h, "0", MMIO_HI),
             (Type::Frame, "id") | (Type::PageTable, "id") => {
                 let n = self.fresh_int(&h, "0", FRAME_LIMIT)?;
                 self.smt(&format!("(assert (< {} {}))", n, POOLSIZE))?;
@@ -473,6 +489,7 @@ impl<'p> Verifier<'p> {
     fn fresh_of(&mut self, ty: &Type, hint: &str) -> Result<Val, Diag> {
         match ty {
             Type::U64 => self.fresh_u64(hint),
+            Type::U8 | Type::U16 | Type::U32 => Ok(Val::U(self.fresh_int(hint, "0", &ty.int_max().to_string())?)),
             Type::Bool => self.fresh_bool(hint),
             Type::Buf => Ok(Val::Buf { len: self.fresh_len(hint)?, data: self.fresh_array(hint, "Int")? }),
             Type::Bytes => {
@@ -526,6 +543,9 @@ impl<'p> Verifier<'p> {
                 }
                 if *t == Type::PortIo {
                     self.smt(&format!("(assert (<= (+ {} {}) {}))", fs[0], fs[1], PORT_LIMIT))?;
+                }
+                if *t == Type::Mmio {
+                    self.smt(&format!("(assert (<= (+ {} {}) {}))", fs[0], fs[1], MMIO_HI))?;
                 }
                 Ok(Val::Obj(t.clone(), fs))
             }
@@ -626,6 +646,7 @@ impl<'p> Verifier<'p> {
     }
 
     fn verify_fn(&mut self, f: &FnDef) -> Result<(), Diag> {
+        self.int_ops = f.int_ops.clone();
         let mut env = HashMap::new();
         for p in &f.params {
             let v = self.fresh_of(&p.ty, &p.name)?;
@@ -646,6 +667,12 @@ impl<'p> Verifier<'p> {
                         "(forall ((k Int)) (= (select {} k) (and (<= 0 k) (< k {}))))",
                         v.field("free"),
                         PORT_LIMIT
+                    )),
+                    (Type::MmioSpace, v) => st.pc.push(format!(
+                        "(forall ((k Int)) (= (select {} k) (and (<= {} k) (< k {}))))",
+                        v.field("free"),
+                        MMIO_LO,
+                        MMIO_HI
                     )),
                     _ => {}
                 }
@@ -960,6 +987,18 @@ impl<'p> Verifier<'p> {
                 ExprKind::Call(n, _) if n == "vec_new" => {
                     Ok(Val::Vec { elem: targs[0].clone(), len: "0".into(), elems: Box::new(self.fresh_lifted(&targs[0], "vec")?) })
                 }
+                // `cast[T](x)` keeps the value and proves it fits; `wrap[T](x)`
+                // reduces it modulo 2^width.
+                ExprKind::Call(n, args) if n == "cast" || n == "wrap" => {
+                    let x = self.eval(&args[0], st)?.term().to_string();
+                    let t = &targs[0];
+                    if n == "wrap" {
+                        return Ok(Val::U(format!("(mod {} {})", x, t.int_max() + 1)));
+                    }
+                    let max = t.int_max().to_string();
+                    self.prove(st, &format!("(<= {} {})", x, max), e.pos, "E-VERIFY-CAST", format!("that `{}` fits in {} (`<= {}`)", render(&args[0]), t.name(), max))?;
+                    Ok(Val::U(x))
+                }
                 _ => unreachable!("removed by monomorphization"),
             },
             ExprKind::Int(v) => Ok(Val::U(v.to_string())),
@@ -1031,10 +1070,12 @@ impl<'p> Verifier<'p> {
                 let vb = self.eval(b, st)?;
                 let tb = vb.term().to_string();
                 let (ra, rb) = (render(a), render(b));
+                let ity = self.int_ops.get(&e.pos).cloned().unwrap_or(Type::U64);
+                let max = ity.int_max().to_string();
                 let v = match op {
                     BinOp::Add => {
                         let t = format!("(+ {} {})", ta, tb);
-                        self.prove(st, &format!("(<= {} {})", t, U64_MAX), e.pos, "E-VERIFY-OVERFLOW", format!("that `{} + {}` does not overflow u64", ra, rb))?;
+                        self.prove(st, &format!("(<= {} {})", t, max), e.pos, "E-VERIFY-OVERFLOW", format!("that `{} + {}` does not overflow {}", ra, rb, ity.name()))?;
                         Val::U(t)
                     }
                     BinOp::Sub => {
@@ -1043,7 +1084,7 @@ impl<'p> Verifier<'p> {
                     }
                     BinOp::Mul => {
                         let t = format!("(* {} {})", ta, tb);
-                        self.prove(st, &format!("(<= {} {})", t, U64_MAX), e.pos, "E-VERIFY-OVERFLOW", format!("that `{} * {}` does not overflow u64", ra, rb))?;
+                        self.prove(st, &format!("(<= {} {})", t, max), e.pos, "E-VERIFY-OVERFLOW", format!("that `{} * {}` does not overflow {}", ra, rb, ity.name()))?;
                         Val::U(t)
                     }
                     BinOp::Div | BinOp::Rem => {
@@ -1156,6 +1197,11 @@ impl<'p> Verifier<'p> {
         };
         match name {
             "box" => Ok(Val::Box(BoxVal::Known(Box::new(vals[0].clone())))),
+            "wrap_add" | "wrap_sub" | "wrap_mul" => {
+                let ity = self.int_ops.get(&pos).cloned().expect("typed by the checker");
+                let op = match name { "wrap_add" => "+", "wrap_sub" => "-", _ => "*" };
+                Ok(Val::U(format!("(mod ({} {} {}) {})", op, vals[0].term(), vals[1].term(), ity.int_max() + 1)))
+            }
             "unbox" => match &vals[0] {
                 Val::Box(BoxVal::Known(v)) => Ok((**v).clone()),
                 Val::Box(BoxVal::Opaque(t)) => self.fresh_of(t, "unboxed"),
@@ -1444,6 +1490,50 @@ impl<'p> Verifier<'p> {
                 self.put_back(&args[0], Val::Obj(Type::Ports, vec![nf]), st);
                 Ok(Val::Unit)
             }
+            // ---- memory-mapped device registers ----
+            "mmio_claim" => {
+                let (p, b, l) = (&vals[0], vals[1].term(), vals[2].term());
+                let inr = format!("(and (<= {b} k) (< k (+ {b} {l})))");
+                self.need(st, format!("(and (<= {} {}) (<= (+ {} {}) {}))", MMIO_LO, b, b, l, MMIO_HI), pos, "E-VERIFY-BOUNDS",
+                    format!("that `{}` .. `{} + {}` lies in the device window (0xC0000000 to 4 GiB)", ra(1), ra(1), ra(2)))?;
+                self.need(st, format!("(forall ((k Int)) (=> {} (select {} k)))", inr, p.field("free")), pos, "E-VERIFY-OWN",
+                    format!("that nobody has claimed any of these addresses (`mmio_free({}, a)` for each): two owners could drive one device", ra(0)))?;
+                let nf = format!("(lambda ((k Int)) (and (select {} k) (not {})))", p.field("free"), inr);
+                self.put_back(&args[0], Val::Obj(Type::MmioSpace, vec![nf]), st);
+                Ok(Val::Obj(Type::Mmio, vec![b.to_string(), l.to_string()]))
+            }
+            "mmio_release" => {
+                let (p, io) = (&vals[0], &vals[1]);
+                let inr = format!("(and (<= {b} k) (< k (+ {b} {l})))", b = io.field("base"), l = io.field("len"));
+                let nf = format!("(lambda ((k Int)) (or (select {} k) {}))", p.field("free"), inr);
+                self.put_back(&args[0], Val::Obj(Type::MmioSpace, vec![nf]), st);
+                Ok(Val::Unit)
+            }
+            "mmio_base" => Ok(Val::U(vals[0].field("base"))),
+            "mmio_len" => Ok(Val::U(vals[0].field("len"))),
+            "mmio_read8" | "mmio_read16" | "mmio_read32" | "mmio_read64" | "mmio_write8" | "mmio_write16" | "mmio_write32" | "mmio_write64" => {
+                let (bytes, max) = match name.trim_start_matches("mmio_read").trim_start_matches("mmio_write") {
+                    "8" => (1, "255"),
+                    "16" => (2, "65535"),
+                    "32" => (4, "4294967295"),
+                    _ => (8, U64_MAX),
+                };
+                let (io, off) = (&vals[0], vals[1].term());
+                self.need(st, format!("(<= (+ {} {}) {})", off, bytes, io.field("len")), pos, "E-VERIFY-BOUNDS",
+                    format!("that register offset `{}` is within `{}` (`{} + {} <= mmio_len({})`)", ra(1), ra(0), ra(1), bytes, ra(0)))?;
+                // Devices want naturally aligned accesses (and an unaligned
+                // one could straddle into the next register).
+                self.need(st, format!("(= (mod (+ {} {}) {}) 0)", io.field("base"), off, bytes), pos, "E-VERIFY-BOUNDS",
+                    format!("that the access at offset `{}` of `{}` is aligned to {} bytes", ra(1), ra(0), bytes))?;
+                if name.starts_with("mmio_write") {
+                    self.need(st, format!("(<= {} {})", vals[2].term(), max), pos, "E-VERIFY-BYTE",
+                        format!("that `{}` fits in {} bits (`<= {}`)", ra(2), bytes * 8, max))?;
+                    return Ok(Val::Unit);
+                }
+                let v = self.fresh_u64(name)?;
+                st.pc.push(format!("(<= {} {})", v.term(), max));
+                Ok(v)
+            }
             "port_base" => Ok(Val::U(vals[0].field("base"))),
             "port_count" => Ok(Val::U(vals[0].field("count"))),
             "pio_in8" | "pio_in16" | "pio_in32" | "pio_out8" | "pio_out16" | "pio_out32" => {
@@ -1619,7 +1709,7 @@ impl<'p> Verifier<'p> {
                     let mut env = HashMap::new();
                     for (p, a) in sf.params.iter().zip(args) {
                         let v = match p.ty.base() {
-                            Type::U64 => Val::U(self.spec(a, sc, bound)?),
+                            t if t.is_int() => Val::U(self.spec(a, sc, bound)?),
                             Type::Bool => Val::B(self.spec(a, sc, bound)?),
                             _ => self.spec_val(a, sc, bound)?,
                         };
@@ -1650,7 +1740,9 @@ impl<'p> Verifier<'p> {
                     "mmu_root" => v.field("root"),
                     "port_base" => v.field("base"),
                     "port_count" => v.field("count"),
-                    "port_free" => format!("(select {} {})", v.field("free"), self.spec(&args[1], sc, bound)?),
+                    "port_free" | "mmio_free" => format!("(select {} {})", v.field("free"), self.spec(&args[1], sc, bound)?),
+                    "mmio_base" => v.field("base"),
+                    "mmio_len" => v.field("len"),
                     "pt_used" => format!("(select {} {})", v.field("used"), self.spec(&args[1], sc, bound)?),
                     "pool_has" => format!("(select {} {})", v.field("has"), self.spec(&args[1], sc, bound)?),
                     _ => unreachable!("checked: {}", name),

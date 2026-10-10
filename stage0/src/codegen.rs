@@ -42,6 +42,8 @@ struct Gen<'a> {
     boxed: &'a mut Vec<Type>,
     /// Element types of vectors operated on: each gets a set of helpers.
     vecs: &'a mut Vec<Type>,
+    /// The integer type of each arithmetic operator (`FnDef::int_ops`).
+    int_ops: &'a HashMap<crate::diag::Pos, Type>,
 }
 
 pub fn emit(p: &Program, target: Target) -> String {
@@ -59,6 +61,7 @@ pub fn emit(p: &Program, target: Target) -> String {
             sigs: &sigs,
             boxed: &mut boxed,
             vecs: &mut vecs,
+            int_ops: &f.int_ops,
         };
         bodies.push_str(&format!("{} {{\n", proto(f)));
         for s in &f.body {
@@ -162,6 +165,8 @@ typedef uint64_t bst_frame, bst_pt;         /* a page's physical address */
 typedef struct { uint64_t base, size; } bst_pool;
 typedef int bst_ports;                      /* capability token: no data */
 typedef struct { uint64_t base, count; } bst_portio;
+typedef int bst_mmiospace;                  /* capability token: no data */
+typedef struct { uint64_t base, len; } bst_mmio;
 static inline bst_buf bst_set(bst_buf b, uint64_t i, uint64_t v) { b.data[i] = v; return b; }
 "#;
 
@@ -566,6 +571,33 @@ static inline uint64_t bst_port_base(bst_portio io) { return io.base; }
 static inline uint64_t bst_port_count(bst_portio io) { return io.count; }
 "#;
 
+// Memory-mapped registers: like ports, claiming is proof-only. The kernel
+// platform maps the device window (0xC000_0000 to 4 GiB) uncached at its
+// physical address, so an access is one volatile load or store there.
+const PRELUDE_MMIO: &str = r#"
+static inline bst_mmio bst_mmio_claim(bst_mmiospace *s, uint64_t b, uint64_t l) { (void)s; bst_mmio m = { b, l }; return m; }
+static inline void bst_mmio_release(bst_mmiospace *s, bst_mmio m) { (void)s; (void)m; }
+static inline uint64_t bst_mmio_base(bst_mmio m) { return m.base; }
+static inline uint64_t bst_mmio_len(bst_mmio m) { return m.len; }
+"#;
+
+const PRELUDE_MMIO_KERNEL: &str = r#"
+#define BST_MMIO_RW(w, t) \
+    static inline uint64_t bst_mmio_read##w(bst_mmio *m, uint64_t o) { return *(volatile t *)(uintptr_t)(m->base + o); } \
+    static inline void bst_mmio_write##w(bst_mmio *m, uint64_t o, uint64_t v) { *(volatile t *)(uintptr_t)(m->base + o) = (t)v; }
+BST_MMIO_RW(8, uint8_t) BST_MMIO_RW(16, uint16_t) BST_MMIO_RW(32, uint32_t) BST_MMIO_RW(64, uint64_t)
+"#;
+
+// Hosted programs simulate the window with 1 MiB of memory, indexed by the
+// low 20 bits of the address (so registers 1 MiB apart share storage).
+const PRELUDE_MMIO_HOSTED: &str = r#"
+static unsigned char bst_mmio_cell[1u << 20];
+#define BST_MMIO_RW(w, t) \
+    static inline uint64_t bst_mmio_read##w(bst_mmio *m, uint64_t o) { t v; memcpy(&v, &bst_mmio_cell[(m->base + o) & 0xFFFFF], sizeof v); return v; } \
+    static inline void bst_mmio_write##w(bst_mmio *m, uint64_t o, uint64_t v) { t x = (t)v; memcpy(&bst_mmio_cell[(m->base + o) & 0xFFFFF], &x, sizeof x); }
+BST_MMIO_RW(8, uint8_t) BST_MMIO_RW(16, uint16_t) BST_MMIO_RW(32, uint32_t) BST_MMIO_RW(64, uint64_t)
+"#;
+
 const PRELUDE_PORTS_KERNEL: &str = r#"
 static inline uint64_t bst_pio_in8(bst_portio *io, uint64_t o) { return bst_inb((uint16_t)(io->base + o)); }
 static inline uint64_t bst_pio_in16(bst_portio *io, uint64_t o) { uint16_t v; __asm__ volatile ("inw %1, %0" : "=a"(v) : "Nd"((uint16_t)(io->base + o))); return v; }
@@ -727,6 +759,9 @@ static inline uint64_t bst_sys_recv(uint64_t n, uint64_t a, bst_bytes *b) { bst_
 fn cty(t: &Type) -> String {
     match t {
         Type::U64 => "uint64_t".into(),
+        Type::U8 => "uint8_t".into(),
+        Type::U16 => "uint16_t".into(),
+        Type::U32 => "uint32_t".into(),
         Type::Bool => "bool".into(),
         Type::Unit => "void".into(),
         Type::Buf => "bst_buf".into(),
@@ -742,6 +777,8 @@ fn cty(t: &Type) -> String {
         Type::Cpu => "bst_cpu".into(),
         Type::Ports => "bst_ports".into(),
         Type::PortIo => "bst_portio".into(),
+        Type::MmioSpace => "bst_mmiospace".into(),
+        Type::Mmio => "bst_mmio".into(),
         Type::Struct(n) => format!("bst_s_{}", cid(n)),
         Type::Enum(n) => format!("bst_e_{}", cid(n)),
         Type::Generic(..) => unreachable!("removed by monomorphization"),
@@ -891,7 +928,10 @@ impl<'a> Gen<'a> {
     /// The type of a code expression (the checker has already accepted it).
     fn type_of(&self, e: &Expr) -> Type {
         match &e.kind {
-            ExprKind::TypeApp(targs, _) => Type::Vec(Box::new(targs[0].clone())), // vec_new[T]()
+            ExprKind::TypeApp(targs, inner) => match &inner.kind {
+                ExprKind::Call(n, _) if n == "cast" || n == "wrap" => targs[0].clone(),
+                _ => Type::Vec(Box::new(targs[0].clone())), // vec_new[T]()
+            },
             ExprKind::Int(_) => Type::U64,
             ExprKind::Bool(_) | ExprKind::Not(_) | ExprKind::Is(..) => Type::Bool,
             ExprKind::Str(_) | ExprKind::Blob(_) => Type::Str,
@@ -906,7 +946,7 @@ impl<'a> Gen<'a> {
             ExprKind::StructLit(n, _) => Type::Struct(n.clone()),
             ExprKind::Variant(n, ..) => Type::Enum(n.clone()),
             ExprKind::Bin(op, ..) => match op {
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => Type::U64,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => self.int_ops[&e.pos].clone(),
                 _ => Type::Bool,
             },
             ExprKind::Call(n, args) if n == "box" => Type::Box(Box::new(self.type_of(&args[0]))),
@@ -919,6 +959,7 @@ impl<'a> Gen<'a> {
                 "vec_push" | "vec_set" | "vec_free" => Type::Unit,
                 _ => self.vec_elem(&args[0]),
             },
+            ExprKind::Call(n, _) if crate::check::WRAP_BUILTINS.contains(&n.as_str()) => self.int_ops[&e.pos].clone(),
             ExprKind::Call(n, _) => self.sigs[n].ret.clone(),
             ExprKind::MutBorrow(_) | ExprKind::Forall(..) => unreachable!("not a value"),
         }
@@ -1014,7 +1055,12 @@ impl<'a> Gen<'a> {
 
     fn expr(&mut self, e: &Expr) -> String {
         match &e.kind {
-            ExprKind::TypeApp(..) => "((bst_vec){ 0, 0, 0 })".to_string(), // vec_new[T]()
+            // `cast` is proved not to change the value and `wrap` means C's
+            // modular conversion, so both are a plain C cast.
+            ExprKind::TypeApp(targs, inner) => match &inner.kind {
+                ExprKind::Call(n, args) if n == "cast" || n == "wrap" => format!("(({})({}))", cty(&targs[0]), self.expr(&args[0])),
+                _ => "((bst_vec){ 0, 0, 0 })".to_string(), // vec_new[T]()
+            },
             ExprKind::Int(v) => format!("UINT64_C({})", v),
             ExprKind::Bool(b) => b.to_string(),
             ExprKind::Str(bytes) => {
@@ -1084,6 +1130,12 @@ impl<'a> Gen<'a> {
                 let p = format!("bp_{}", self.tmps);
                 self.tmps += 1;
                 format!("({{ {c} *{p} = ({c} *)bst_box_alloc(sizeof({c})); *{p} = {}; {p}; }})", self.expr(&args[0]))
+            }
+            // Computed in uint64_t, where C's unsigned arithmetic is modular
+            // (narrower operands would be promoted to a signed int).
+            ExprKind::Call(name, args) if crate::check::WRAP_BUILTINS.contains(&name.as_str()) => {
+                let op = match name.as_str() { "wrap_add" => "+", "wrap_sub" => "-", _ => "*" };
+                format!("(({})((uint64_t)({}) {} (uint64_t)({})))", cty(&self.int_ops[&e.pos]), self.expr(&args[0]), op, self.expr(&args[1]))
             }
             ExprKind::Call(name, args) => {
                 let (pre, a) = self.operands(&args.iter().collect::<Vec<_>>(), true);
@@ -1176,6 +1228,8 @@ pub fn prelude_parts(target: Target) -> Vec<(&'static str, &'static str)> {
             ("child", PRELUDE_CHILD),
             ("ports", PRELUDE_PORTS),
             ("ports_hosted", PRELUDE_PORTS_HOSTED),
+            ("mmio", PRELUDE_MMIO),
+            ("mmio_hosted", PRELUDE_MMIO_HOSTED),
         ],
         Target::Kernel => vec![
             ("common", PRELUDE_COMMON),
@@ -1186,6 +1240,8 @@ pub fn prelude_parts(target: Target) -> Vec<(&'static str, &'static str)> {
             ("kernel_cpu", PRELUDE_KERNEL_CPU),
             ("ports", PRELUDE_PORTS),
             ("ports_kernel", PRELUDE_PORTS_KERNEL),
+            ("mmio", PRELUDE_MMIO),
+            ("mmio_kernel", PRELUDE_MMIO_KERNEL),
         ],
         Target::User => vec![("common", PRELUDE_COMMON), ("user", PRELUDE_USER), ("bytes_arena", PRELUDE_BYTES_ARENA), ("bytes", PRELUDE_BYTES)],
     }
