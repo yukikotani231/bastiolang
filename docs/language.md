@@ -307,10 +307,14 @@ f(a, b);            // a call whose result is not used
 | 2 | `\|\|` | Short-circuit |
 | 3 | `&&` | Short-circuit |
 | 4 | `== != < <= > >=`, `x is E::V` | Do not chain: `a < b < c` is a syntax error |
-| 5 | `+ -` | |
-| 6 | `* / %` | |
-| 7 | `!` | |
-| 8 | `.field` | Also `.Variant` on enums, in specifications |
+| 5 | `\|` | Bitwise or; unsigned integers, not in specifications |
+| 6 | `^` | Bitwise exclusive or |
+| 7 | `&` | Bitwise and (a prefix `&mut` is a borrow) |
+| 8 | `<< >>` | Shifts |
+| 9 | `+ -` | |
+| 10 | `* / %` | |
+| 11 | `! -` | Not (bitwise on unsigned integers), and negation (signed integers) |
+| 12 | `.field` | Also `.Variant` on enums, in specifications |
 
 Arithmetic is proved safe instead of wrapping or trapping: `+` and `*` must not exceed 2^64 − 1 (`E-VERIFY-OVERFLOW`), `a - b` needs `a >= b` (`E-VERIFY-UNDERFLOW`), and `/` and `%` need a nonzero divisor (`E-VERIFY-DIVZERO`). Facts the code has already tested are used by the proof:
 
@@ -380,6 +384,36 @@ fn low_byte(n: u64) -> u8 {
 
 fn main() -> u64 {
   return cast[u64](low_byte(300));
+}
+```
+
+**Bitwise operators.** `&`, `|`, `^`, `<<`, `>>` and `!x` (bitwise not; the same `!` as for `bool`) work on unsigned integers. Both operands of `&`, `|` and `^` have one type; a shift amount can be any unsigned type and must be proved less than the width (`E-VERIFY-SHIFT`), since C leaves larger shifts undefined. A left shift follows the never-wraps rule: it must lose no bits (`E-VERIFY-OVERFLOW`); mask first to drop them. They bind tighter than comparisons, as in Rust, so `e & 1 == 1` tests a bit. The prover knows a low mask (`x & 255` is `x % 256`) and shifts exactly, and only bounds for other masks, `|` and `^` (`x & y <= x`, `x | y >= x`, ...). They are not available in specifications yet: write `% 2^k` and `/ 2^k` there.
+
+```bastio
+// expect-exit: 42
+fn le16(lo: u8, hi: u8) -> u16 {
+  return (cast[u16](hi) << 8) | cast[u16](lo);
+}
+
+fn main() -> u64 {
+  let w = le16(52, 18);              // 0x1234
+  let lo: u8 = cast[u8](w & 255);    // proved to fit: a low mask is `% 256`
+  let hi: u8 = cast[u8](w >> 8);
+  if w != 4660 || lo != 52 || hi != 18 || w & 1 == 1 {
+    return 1;
+  }
+  return 42;
+}
+```
+
+```bastio
+// expect-error: E-VERIFY-SHIFT
+fn bit(n: u64) -> u64 {
+  return 1 << n;                     // fails: n may be 64 or more
+}
+
+fn main() -> u64 {
+  return bit(3);
 }
 ```
 
@@ -1089,6 +1123,7 @@ Proofs:
 | `E-VERIFY-LEAK` | A vector of linear elements is empty when it is freed |
 | `E-VERIFY-OVERFLOW` | `+` and `*` results fit the operation's type (< 2^64 for `u64`, < 2^8 for `u8`, ...) |
 | `E-VERIFY-CAST` | the argument of `cast[T]` fits in `T` |
+| `E-VERIFY-SHIFT` | a shift amount is less than the width of the shifted type |
 | `E-VERIFY-UNDERFLOW` | `a - b` has `a >= b` |
 | `E-VERIFY-DIVZERO` | The divisor of `/` and `%` is not zero |
 | `E-VERIFY-ALLOC` | Allocation size <= 2^60 elements |

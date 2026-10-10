@@ -1079,7 +1079,8 @@ impl<'a> Gen<'a> {
                 _ => Type::Vec(Box::new(targs[0].clone())), // vec_new[T]()
             },
             ExprKind::Int(_) => Type::U64,
-            ExprKind::Bool(_) | ExprKind::Not(_) | ExprKind::Is(..) => Type::Bool,
+            ExprKind::Not(_) => self.int_ops.get(&e.pos).cloned().unwrap_or(Type::Bool),
+            ExprKind::Bool(_) | ExprKind::Is(..) => Type::Bool,
             ExprKind::Neg(_) => self.int_ops.get(&e.pos).cloned().unwrap_or(Type::I64),
             ExprKind::Str(_) | ExprKind::Blob(_) => Type::Str,
             ExprKind::Var(n) => self.types[n].clone(),
@@ -1094,6 +1095,7 @@ impl<'a> Gen<'a> {
             ExprKind::Variant(n, ..) => Type::Enum(n.clone()),
             ExprKind::Bin(op, ..) => match op {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => self.int_ops[&e.pos].clone(),
+                op if op.is_bitwise() => self.int_ops[&e.pos].clone(),
                 _ => Type::Bool,
             },
             ExprKind::Call(n, args) if n == "box" => Type::Box(Box::new(self.type_of(&args[0]))),
@@ -1240,7 +1242,11 @@ impl<'a> Gen<'a> {
                 let n = self.type_of(x).name();
                 format!("({}.tag == {})", self.expr(x), enum_def(&n).unwrap().index(v).unwrap())
             }
-            ExprKind::Not(x) => format!("(!{})", self.expr(x)),
+            // C promotes a narrow operand to int, so `~` is cast back.
+            ExprKind::Not(x) => match self.int_ops.get(&e.pos) {
+                Some(t) => format!("(({})~{})", cty(t), self.expr(x)),
+                None => format!("(!{})", self.expr(x)),
+            },
             // A negated literal is a constant; `-x` is proved not to overflow.
             ExprKind::Neg(x) => match x.kind {
                 ExprKind::Int(v) if v == 1 << 63 => "INT64_MIN".to_string(),
@@ -1254,6 +1260,11 @@ impl<'a> Gen<'a> {
                 // Signed operands are computed in int64_t, so a literal
                 // (a uint64_t constant) cannot turn the operation unsigned.
                 // The proof keeps every result in range, so nothing overflows.
+                // A narrow operand is promoted to int; the proof keeps a left
+                // shift inside the type, and the cast brings the type back.
+                if op.is_bitwise() {
+                    return seq(pre, format!("(({})({} {} {}))", cty(&self.int_ops[&e.pos]), v[0], op.text(), v[1]));
+                }
                 if self.int_ops.get(&e.pos).map_or(false, |t| t.is_signed()) {
                     return seq(pre, format!("((int64_t)({}) {} (int64_t)({}))", v[0], op.text(), v[1]));
                 }

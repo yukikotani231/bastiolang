@@ -584,7 +584,7 @@ impl Parser {
     }
 
     fn cmp(&mut self) -> PResult<Expr> {
-        let lhs = self.add()?;
+        let lhs = self.bit_or()?;
         if *self.peek() == Tok::Is {
             let pos = self.bump().pos;
             let (en, _) = self.ident()?;
@@ -601,8 +601,36 @@ impl Parser {
             _ => return Ok(lhs),
         };
         let pos = self.bump().pos;
-        let rhs = self.add()?;
+        let rhs = self.bit_or()?;
         Ok(Expr { kind: ExprKind::Bin(op, Box::new(lhs), Box::new(rhs)), pos })
+    }
+
+    // Bitwise operators bind tighter than comparisons, as in Rust:
+    // `x & 1 == 0` is `(x & 1) == 0`.
+    fn bit_or(&mut self) -> PResult<Expr> {
+        self.left_assoc(&[(Tok::Pipe, BinOp::BitOr)], Self::bit_xor)
+    }
+
+    fn bit_xor(&mut self) -> PResult<Expr> {
+        self.left_assoc(&[(Tok::Caret, BinOp::BitXor)], Self::bit_and)
+    }
+
+    fn bit_and(&mut self) -> PResult<Expr> {
+        self.left_assoc(&[(Tok::Amp, BinOp::BitAnd)], Self::shift)
+    }
+
+    fn shift(&mut self) -> PResult<Expr> {
+        self.left_assoc(&[(Tok::Shl, BinOp::Shl), (Tok::Shr, BinOp::Shr)], Self::add)
+    }
+
+    fn left_assoc(&mut self, ops: &[(Tok, BinOp)], next: fn(&mut Self) -> PResult<Expr>) -> PResult<Expr> {
+        let mut lhs = next(self)?;
+        while let Some(op) = ops.iter().find(|(t, _)| t == self.peek()).map(|(_, o)| *o) {
+            let pos = self.bump().pos;
+            let rhs = next(self)?;
+            lhs = Expr { kind: ExprKind::Bin(op, Box::new(lhs), Box::new(rhs)), pos };
+        }
+        Ok(lhs)
     }
 
     fn add(&mut self) -> PResult<Expr> {

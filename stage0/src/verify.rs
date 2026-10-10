@@ -429,6 +429,15 @@ fn c_div(a: &str, b: &str) -> String {
     format!("(ite (= (>= {} 0) (>= {} 0)) {q} (- {q}))", a, b)
 }
 
+/// 2^k for a shift amount `k` already proved less than `w`.
+fn pow2(k: &str, w: u32) -> String {
+    let mut t = "1".to_string();
+    for i in (1..w).rev() {
+        t = format!("(ite (= {} {}) {} {})", k, i, 1u128 << i, t);
+    }
+    t
+}
+
 fn ite(c: &str, a: &str, b: &str) -> String {
     if a == b { a.to_string() } else { format!("(ite {} {} {})", c, a, b) }
 }
@@ -1094,6 +1103,10 @@ impl<'p> Verifier<'p> {
             ExprKind::MutBorrow(_) => unreachable!("only a call argument"),
             ExprKind::Not(x) => {
                 let v = self.eval(x, st)?;
+                // Bitwise not on an unsigned integer: max - x.
+                if let Some(ity) = self.int_ops.get(&e.pos) {
+                    return Ok(Val::U(format!("(- {} {})", ity.int_max(), v.term())));
+                }
                 Ok(Val::B(format!("(not {})", v.term())))
             }
             ExprKind::Neg(x) => {
@@ -1139,6 +1152,9 @@ impl<'p> Verifier<'p> {
                 if ity.is_signed() && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem) {
                     return self.signed_arith(*op, &ta, &tb, &ra, &rb, &ity, e.pos, st);
                 }
+                if op.is_bitwise() {
+                    return self.bitwise(*op, a, b, &ta, &tb, &ity, e.pos, st);
+                }
                 let v = match op {
                     BinOp::Add => {
                         let t = format!("(+ {} {})", ta, tb);
@@ -1165,7 +1181,7 @@ impl<'p> Verifier<'p> {
                     BinOp::Le => Val::B(format!("(<= {} {})", ta, tb)),
                     BinOp::Gt => Val::B(format!("(> {} {})", ta, tb)),
                     BinOp::Ge => Val::B(format!("(>= {} {})", ta, tb)),
-                    BinOp::And | BinOp::Or | BinOp::Implies => unreachable!(),
+                _ => unreachable!(),
                 };
                 Ok(v)
             }
@@ -1194,6 +1210,47 @@ impl<'p> Verifier<'p> {
         self.prove(st, &format!("(<= {} {})", t, max), pos, "E-VERIFY-OVERFLOW", format!("that `{}` does not overflow {} (`<= {}`)", text, ity.name(), ity.int_max()))?;
         self.prove(st, &format!("(<= {} {})", min, t), pos, "E-VERIFY-UNDERFLOW", format!("that `{}` does not go below the minimum of {} (`>= {}`)", text, ity.name(), ity.int_min()))?;
         Ok(Val::U(t))
+    }
+
+    /// Bitwise operators on an unsigned type. Z3's integers have no bitwise
+    /// operations and its bit-vector bridge is far too slow at 64 bits, so
+    /// the kernel cases are exact arithmetic (a low mask is `mod`, a shift
+    /// is a multiplication or division by a power of two) and the rest is a
+    /// fresh value with facts that always hold (`x & y <= x`, ...).
+    #[allow(clippy::too_many_arguments)]
+    fn bitwise(&mut self, op: BinOp, a: &Expr, b: &Expr, ta: &str, tb: &str, ity: &Type, pos: Pos, st: &mut State) -> Result<Val, Diag> {
+        let (ra, rb) = (render(a), render(b));
+        if matches!(op, BinOp::Shl | BinOp::Shr) {
+            let w = ity.int_bits().expect("checked: an integer");
+            self.prove(st, &format!("(< {} {})", tb, w), pos, "E-VERIFY-SHIFT", format!("that the shift amount `{}` is less than {}, the width of {}", rb, w, ity.name()))?;
+            let p = match b.kind {
+                ExprKind::Int(k) => (1u128 << k.min(127)).to_string(),
+                _ => pow2(tb, w),
+            };
+            if op == BinOp::Shr {
+                return Ok(Val::U(format!("(div {} {})", ta, p)));
+            }
+            let t = format!("(* {} {})", ta, p);
+            self.prove(st, &format!("(<= {} {})", t, ity.int_max()), pos, "E-VERIFY-OVERFLOW", format!("that `{} << {}` loses no bits of {}", ra, rb, ity.name()))?;
+            return Ok(Val::U(t));
+        }
+        // `x & (2^k - 1)` keeps the low k bits.
+        if op == BinOp::BitAnd {
+            for (lit, other) in [(b, ta), (a, tb)] {
+                if let ExprKind::Int(m) = lit.kind {
+                    if (m + 1).is_power_of_two() {
+                        return Ok(Val::U(format!("(mod {} {})", other, m + 1)));
+                    }
+                }
+            }
+        }
+        let r = self.fresh_int("bits", "0", &ity.int_max().to_string())?;
+        st.pc.push(match op {
+            BinOp::BitAnd => format!("(and (<= {r} {ta}) (<= {r} {tb}))"),
+            BinOp::BitOr => format!("(and (<= {ta} {r}) (<= {tb} {r}) (<= {r} (+ {ta} {tb})))"),
+            _ => format!("(<= {r} (+ {ta} {tb}))"),
+        });
+        Ok(Val::U(r))
     }
 
     fn call(&mut self, name: &str, args: &[Expr], pos: Pos, st: &mut State) -> Result<Val, Diag> {
@@ -1812,6 +1869,7 @@ impl<'p> Verifier<'p> {
                     BinOp::And => "and",
                     BinOp::Or => "or",
                     BinOp::Implies => "=>",
+                    _ => unreachable!("rejected by the checker"),
                 };
                 format!("({} {} {})", f, ta, tb)
             }

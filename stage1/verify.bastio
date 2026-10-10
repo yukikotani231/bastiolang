@@ -597,6 +597,91 @@ fn int_op_ty(c: &Checker, m: &Mono, x: u64, i: u64) -> u64 {
   return c.tu64;
 }
 
+/// Has the checker recorded an integer type for operator node `i` of
+/// instance `x`? (A `!` is bitwise exactly when it has.)
+fn has_int_op(c: &Checker, x: u64, i: u64) -> bool {
+  let mut k = 0;
+  while k < vec_len(c.int_ops) {
+    let o = vec_get(c.int_ops, k);
+    if o.x == x && o.node == i {
+      return true;
+    }
+    k = k + 1;
+  }
+  return false;
+}
+
+/// The width in bits of an integer type.
+fn int_bits(m: &Mono, t: u64) -> u64 {
+  let k = kind_t(m, t);
+  if k == TY_U8 || k == TY_I8 { return 8; }
+  if k == TY_U16 || k == TY_I16 { return 16; }
+  if k == TY_U32 || k == TY_I32 { return 32; }
+  return 64;
+}
+
+/// The number 2^k, which may not fit in a u64 (stage0 writes up to 2^127).
+fn pow2_num(v: &mut Vr, k: u64) -> u64 {
+  // Little-endian decimal digits, doubled k times.
+  let mut d = vec_new[u64]();
+  vec_push(&mut d, 1);
+  let mut j = 0;
+  while j < k {
+    let mut carry = 0;
+    let mut i = 0;
+    while i < vec_len(d)
+      invariant carry <= 1
+    {
+      let x = (vec_get(d, i) % 10) * 2 + carry;
+      vec_set(&mut d, i, x % 10);
+      carry = x / 10;
+      i = i + 1;
+    }
+    if carry > 0 {
+      vec_push(&mut d, carry);
+    }
+    j = j + 1;
+  }
+  let start = vec_len(v.pool);
+  let mut n = vec_len(d);
+  while n > 0 {
+    n = n - 1;
+    vec_push(&mut v.pool, 48 + u_at(d, n) % 10);
+  }
+  vec_free(d);
+  return seal(&mut v, start);
+}
+
+/// 2^k for a shift amount `k` already proved less than `w`.
+fn pow2_ite(v: &mut Vr, k: u64, w: u64) -> u64 {
+  let mut t = num(&mut v, 1);
+  let mut i = w;
+  while i > 1 {
+    i = i - 1;
+    let ti = num(&mut v, i);
+    let c = app2(&mut v, OP_EQ, k, ti);
+    let pi = pow2_num(&mut v, i);
+    t = app3(&mut v, OP_ITE, c, pi, t);
+  }
+  return t;
+}
+
+/// If `m` is 2^k - 1, k + 1; otherwise 0.
+fn low_mask(m: u64) -> u64 {
+  let mut y = m;
+  let mut k = 0;
+  while y % 2 == 1 && k < 64
+    invariant k <= 64
+  {
+    y = y / 2;
+    k = k + 1;
+  }
+  if y == 0 {
+    return k + 1;
+  }
+  return 0;
+}
+
 /// `(not x)`
 fn t_not(v: &mut Vr, x: u64) -> u64 {
   return app1(&mut v, OP_NOT, x);
@@ -2252,6 +2337,12 @@ fn eval(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VSta
   }
   if k == E_NOT {
     let x = eval(&mut v, c, &mut m, p, n.a, &mut st, 0);
+    // Bitwise not on an unsigned integer: max - x.
+    if has_int_op(c, v.env, i) {
+      let max = int_max(&mut v, m, int_op_ty(c, m, v.env, i));
+      let t = app2(&mut v, OP_SUB, max, term(v, x));
+      return mk_u(&mut v, t);
+    }
     let t = t_not(&mut v, term(v, x));
     return mk_b(&mut v, t);
   }
@@ -2401,6 +2492,9 @@ fn eval_bin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut 
   if is_signed(m, ity) && (op == P_PLUS || op == P_MINUS || op == P_STAR || op == P_SLASH || op == P_PERCENT) {
     return signed_arith(&mut v, m, op, ta, tb, ity, st);
   }
+  if op == P_AMP || op == P_PIPE || op == P_CARET || op == P_SHL || op == P_SHR {
+    return bitwise(&mut v, m, p, op, n.a, n.b, ta, tb, ity, &mut st);
+  }
   if op == P_PLUS || op == P_STAR {
     let t = app2(&mut v, bin_op(op), ta, tb);
     let max = int_max(&mut v, m, int_op_ty(c, m, v.env, i));
@@ -2428,6 +2522,77 @@ fn eval_bin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut 
   }
   let t = app2(&mut v, bin_op(op), ta, tb);
   return mk_b(&mut v, t);
+}
+
+/// Bitwise operators on an unsigned type, as stage0's `bitwise`: a low mask
+/// is `mod`, a shift is a multiplication or division by a power of two, and
+/// the rest is a fresh value with facts that always hold.
+fn bitwise(v: &mut Vr, m: &Mono, p: &Parser, op: u64, a: u64, b: u64, ta: u64, tb: u64, ity: u64, st: &mut VState) -> u64 {
+  if op == P_SHL || op == P_SHR {
+    let w = int_bits(m, ity);
+    let tw = num(&mut v, w);
+    let g = app2(&mut v, OP_LT, tb, tw);
+    prove(&mut v, st, g);
+    let bn = node_at(p.nodes, b);
+    let mut pw = 0;
+    if bn.kind == E_INT {
+      let mut kk = bn.v;
+      if kk > 127 {
+        kk = 127;
+      }
+      pw = pow2_num(&mut v, kk);
+    } else {
+      pw = pow2_ite(&mut v, tb, w);
+    }
+    if op == P_SHR {
+      let t = app2(&mut v, OP_DIV, ta, pw);
+      return mk_u(&mut v, t);
+    }
+    let t = app2(&mut v, OP_MUL, ta, pw);
+    let max = int_max(&mut v, m, ity);
+    let g2 = app2(&mut v, OP_LE, t, max);
+    prove(&mut v, st, g2);
+    return mk_u(&mut v, t);
+  }
+  // `x & (2^k - 1)` keeps the low k bits.
+  if op == P_AMP {
+    let bn = node_at(p.nodes, b);
+    let an = node_at(p.nodes, a);
+    let mut other = ta;
+    let mut k = 0;
+    if bn.kind == E_INT {
+      k = low_mask(bn.v);
+    }
+    if k == 0 && an.kind == E_INT {
+      other = tb;
+      k = low_mask(an.v);
+    }
+    if k > 0 {
+      let pk = pow2_num(&mut v, k - 1);
+      let t = app2(&mut v, OP_MOD, other, pk);
+      return mk_u(&mut v, t);
+    }
+  }
+  let h = atom_str(&mut v, "bits");
+  let max = int_max(&mut v, m, ity);
+  let r = fresh_int(&mut v, h, v.t_zero, max);
+  let mut fact = 0;
+  if op == P_AMP {
+    let x = app2(&mut v, OP_LE, r, ta);
+    let y = app2(&mut v, OP_LE, r, tb);
+    fact = app2(&mut v, OP_AND, x, y);
+  } else if op == P_PIPE {
+    let x = app2(&mut v, OP_LE, ta, r);
+    let y = app2(&mut v, OP_LE, tb, r);
+    let sum = app2(&mut v, OP_ADD, ta, tb);
+    let z = app2(&mut v, OP_LE, r, sum);
+    fact = app3(&mut v, OP_AND, x, y, z);
+  } else {
+    let sum = app2(&mut v, OP_ADD, ta, tb);
+    fact = app2(&mut v, OP_LE, r, sum);
+  }
+  vec_push(&mut st.pc, fact);
+  return mk_u(&mut v, r);
 }
 
 /// Arithmetic on a signed type: the result must stay between the type's
