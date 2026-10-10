@@ -407,7 +407,7 @@ fn ite(c: &str, a: &str, b: &str) -> String {
     if a == b { a.to_string() } else { format!("(ite {} {} {})", c, a, b) }
 }
 
-pub fn verify_program(p: &Program) -> Result<(usize, Vec<String>), Diag> {
+pub fn verify_program(p: &Program, one_session: bool) -> Result<(usize, Vec<String>), Diag> {
     // Each function gets its own solver scope: what is declared and assumed
     // while verifying one (some of it quantified, such as "every byte of a
     // Bytes is <= 255") must not burden the queries for all later ones.
@@ -416,13 +416,15 @@ pub fn verify_program(p: &Program) -> Result<(usize, Vec<String>), Diag> {
     // number of CPUs, at most 8). The error reported is the one sequential
     // verification would report: that of the first failing function in
     // program order. BASTIO_TIME=1 prints the time each function took.
+    // `one_session` (for --dump-smt, which stage1/difftest.sh compares with
+    // stage1's verifier) keeps everything on one solver, in program order.
     let sums = summarize(p);
     let n = p.fns.len();
     let jobs = std::env::var("BASTIO_JOBS")
         .ok()
         .and_then(|j| j.parse::<usize>().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |c| c.get()).min(8))
-        .clamp(1, n.max(1));
+        .clamp(1, if one_session { 1 } else { n.max(1) });
     let next = AtomicUsize::new(0);
     // The lowest index of a function that failed so far: no worker starts
     // a function after it, since its result could not be reported anyway.
@@ -458,7 +460,7 @@ pub fn verify_program(p: &Program) -> Result<(usize, Vec<String>), Diag> {
 }
 
 /// What one solver did: its obligation count, its session (for
-/// `--dump-smt`; with several jobs, the sessions follow each other), the
+/// `--dump-smt`, which uses a single worker), the
 /// time per function, and the first function it could not verify.
 struct Worker {
     obligations: usize,
