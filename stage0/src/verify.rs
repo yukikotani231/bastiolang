@@ -377,6 +377,9 @@ pub struct Verifier<'p> {
     pub obligations: usize,
     /// Boxes being unfolded by `fresh_of` right now.
     box_depth: usize,
+    /// The integer type of each arithmetic operator in the function being
+    /// verified (`FnDef::int_ops`).
+    int_ops: HashMap<Pos, Type>,
     sums: &'p Summaries,
 }
 
@@ -475,7 +478,7 @@ fn verify_worker(p: &Program, sums: &Summaries, next: &AtomicUsize, failed: &Ato
             return w;
         }
     };
-    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, sums };
+    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, int_ops: HashMap::new(), sums };
     let mut run = || -> Result<(), (usize, Diag)> {
         v.smt(&format!("(declare-const {} Int)", POOLSIZE)).map_err(|d| (0, d))?;
         v.smt(&format!("(assert (and (<= 0 {p}) (<= {p} {})))", FRAME_LIMIT, p = POOLSIZE)).map_err(|d| (0, d))?;
@@ -486,8 +489,9 @@ fn verify_worker(p: &Program, sums: &Summaries, next: &AtomicUsize, failed: &Ato
             }
             let f = &p.fns[i];
             let t0 = std::time::Instant::now();
-            let r = v
-                .smt("(push 1)")
+            let kept = if f.export { buffers_kept(f, sums) } else { Ok(()) };
+            let r = kept
+                .and_then(|_| v.smt("(push 1)"))
                 .and_then(|_| v.verify_fn(f).map_err(|d| crate::check::in_copy(d, &f.name)))
                 .and_then(|_| v.smt("(pop 1)"));
             if let Err(d) = r {
@@ -502,6 +506,26 @@ fn verify_worker(p: &Program, sums: &Summaries, next: &AtomicUsize, failed: &Ato
     w.obligations = v.obligations;
     w.log = std::mem::take(&mut v.solver.log);
     w
+}
+
+/// A `&mut Bytes` that C lends to an `export fn` is the caller's memory:
+/// the function may write its bytes but must hand back the same buffer,
+/// never free or replace it. Its summary shows that: the parameter is
+/// changed only by shape-keeping builtins (`bset`), directly or through
+/// other functions' summaries, so it is the same allocation of the same
+/// length on return.
+fn buffers_kept(f: &FnDef, sums: &Summaries) -> Result<(), Diag> {
+    for (i, q) in f.params.iter().enumerate() {
+        if !matches!(&q.ty, Type::MutRef(t) if **t == Type::Bytes) {
+            continue;
+        }
+        let kept = sums[&f.name][i].as_ref().map_or(false, |s| s.iter().all(|(_, keep)| *keep));
+        if !kept {
+            return Err(Diag::new("E-EXPORT", q.pos, format!("`{}` belongs to the C caller, but `{}` may free or replace it", q.name, f.name))
+                .note("a buffer lent by C may only be written in place (`bset`, or lent to functions that do only that)"));
+        }
+    }
+    Ok(())
 }
 
 impl<'p> Verifier<'p> {
@@ -564,6 +588,7 @@ impl<'p> Verifier<'p> {
     fn fresh_of(&mut self, ty: &Type, hint: &str) -> Result<Val, Diag> {
         match ty {
             Type::U64 => self.fresh_u64(hint),
+            Type::U8 | Type::U16 | Type::U32 => Ok(Val::U(self.fresh_int(hint, "0", &ty.int_max().to_string())?)),
             Type::Bool => self.fresh_bool(hint),
             Type::Buf => Ok(Val::Buf { len: self.fresh_len(hint)?, data: self.fresh_array(hint, "Int")? }),
             Type::Bytes => {
@@ -720,6 +745,7 @@ impl<'p> Verifier<'p> {
     }
 
     fn verify_fn(&mut self, f: &FnDef) -> Result<(), Diag> {
+        self.int_ops = f.int_ops.clone();
         let mut env = HashMap::new();
         for p in &f.params {
             let v = self.fresh_of(&p.ty, &p.name)?;
@@ -1060,6 +1086,18 @@ impl<'p> Verifier<'p> {
                 ExprKind::Call(n, _) if n == "vec_new" => {
                     Ok(Val::Vec { elem: targs[0].clone(), len: "0".into(), elems: Box::new(self.fresh_lifted(&targs[0], "vec")?) })
                 }
+                // `cast[T](x)` keeps the value and proves it fits; `wrap[T](x)`
+                // reduces it modulo 2^width.
+                ExprKind::Call(n, args) if n == "cast" || n == "wrap" => {
+                    let x = self.eval(&args[0], st)?.term().to_string();
+                    let t = &targs[0];
+                    if n == "wrap" {
+                        return Ok(Val::U(format!("(mod {} {})", x, t.int_max() + 1)));
+                    }
+                    let max = t.int_max().to_string();
+                    self.prove(st, &format!("(<= {} {})", x, max), e.pos, "E-VERIFY-CAST", format!("that `{}` fits in {} (`<= {}`)", render(&args[0]), t.name(), max))?;
+                    Ok(Val::U(x))
+                }
                 _ => unreachable!("removed by monomorphization"),
             },
             ExprKind::Int(v) => Ok(Val::U(v.to_string())),
@@ -1131,10 +1169,12 @@ impl<'p> Verifier<'p> {
                 let vb = self.eval(b, st)?;
                 let tb = vb.term().to_string();
                 let (ra, rb) = (render(a), render(b));
+                let ity = self.int_ops.get(&e.pos).cloned().unwrap_or(Type::U64);
+                let max = ity.int_max().to_string();
                 let v = match op {
                     BinOp::Add => {
                         let t = format!("(+ {} {})", ta, tb);
-                        self.prove(st, &format!("(<= {} {})", t, U64_MAX), e.pos, "E-VERIFY-OVERFLOW", format!("that `{} + {}` does not overflow u64", ra, rb))?;
+                        self.prove(st, &format!("(<= {} {})", t, max), e.pos, "E-VERIFY-OVERFLOW", format!("that `{} + {}` does not overflow {}", ra, rb, ity.name()))?;
                         Val::U(t)
                     }
                     BinOp::Sub => {
@@ -1143,7 +1183,7 @@ impl<'p> Verifier<'p> {
                     }
                     BinOp::Mul => {
                         let t = format!("(* {} {})", ta, tb);
-                        self.prove(st, &format!("(<= {} {})", t, U64_MAX), e.pos, "E-VERIFY-OVERFLOW", format!("that `{} * {}` does not overflow u64", ra, rb))?;
+                        self.prove(st, &format!("(<= {} {})", t, max), e.pos, "E-VERIFY-OVERFLOW", format!("that `{} * {}` does not overflow {}", ra, rb, ity.name()))?;
                         Val::U(t)
                     }
                     BinOp::Div | BinOp::Rem => {
@@ -1256,6 +1296,11 @@ impl<'p> Verifier<'p> {
         };
         match name {
             "box" => Ok(Val::Box(BoxVal::Known(Box::new(vals[0].clone())))),
+            "wrap_add" | "wrap_sub" | "wrap_mul" => {
+                let ity = self.int_ops.get(&pos).cloned().expect("typed by the checker");
+                let op = match name { "wrap_add" => "+", "wrap_sub" => "-", _ => "*" };
+                Ok(Val::U(format!("(mod ({} {} {}) {})", op, vals[0].term(), vals[1].term(), ity.int_max() + 1)))
+            }
             "unbox" => match &vals[0] {
                 Val::Box(BoxVal::Known(v)) => Ok((**v).clone()),
                 Val::Box(BoxVal::Opaque(t)) => self.fresh_of(t, "unboxed"),
@@ -1763,7 +1808,7 @@ impl<'p> Verifier<'p> {
                     let mut env = HashMap::new();
                     for (p, a) in sf.params.iter().zip(args) {
                         let v = match p.ty.base() {
-                            Type::U64 => Val::U(self.spec(a, sc, bound)?),
+                            t if t.is_int() => Val::U(self.spec(a, sc, bound)?),
                             Type::Bool => Val::B(self.spec(a, sc, bound)?),
                             _ => self.spec_val(a, sc, bound)?,
                         };

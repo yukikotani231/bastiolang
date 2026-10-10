@@ -3,7 +3,7 @@
 // Pipeline: lex -> parse -> check (types + linearity) -> verify (SMT) -> C.
 // The C output is compiled with the system C compiler.
 //
-// usage: bastioc0 [--check] [--emit-c] [--dump-smt] [--target T] [-o out] <file.bastio>...
+// usage: bastioc0 [--check] [--emit-c] [--dump-smt] [--target T] [--header F] [-o out] <file.bastio>...
 //   (default)   verify, then build a native executable `out` (default: a.out)
 //   --check     stop after verification
 //   --emit-c    write the generated C to `out` instead of building
@@ -18,6 +18,9 @@
 //               `error file:line:col CODE` and exits 1
 //   --dump-check  the same after type and linearity checking (so `let`
 //               types are filled in); an error prints `error file:line:col CODE`
+//   --header F  also write a C header for the program's `export fn`s to F
+//               (a program with an `export fn` is a library and needs no
+//               `main`; build it with --emit-c and link it into a C program)
 //   --trusted-base  list and count the hand-written trusted base, then exit
 //   --target    `hosted` (default): a normal program on the C library
 //               `kernel`: freestanding C for a bare-metal x86-64 kernel (implies --emit-c)
@@ -123,6 +126,7 @@ fn main() {
     let mut dump_check = false;
     let mut target = codegen::Target::Hosted;
     let mut out: Option<String> = None;
+    let mut header: Option<String> = None;
     let mut inputs: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -156,6 +160,10 @@ fn main() {
                     }
                 };
             }
+            "--header" => {
+                i += 1;
+                header = args.get(i).cloned();
+            }
             "-o" => {
                 i += 1;
                 out = args.get(i).cloned();
@@ -169,7 +177,7 @@ fn main() {
         i += 1;
     }
     if inputs.is_empty() {
-        eprintln!("usage: bastioc0 [--check] [--emit-c] [--dump-smt] [--target hosted|kernel|user] [-o out] <file.bastio>...");
+        eprintln!("usage: bastioc0 [--check] [--emit-c] [--dump-smt] [--target hosted|kernel|user] [--header F] [-o out] <file.bastio>...");
         exit(2);
     }
     if dump_tokens {
@@ -269,6 +277,18 @@ fn main() {
     eprintln!("bastioc0: {}: {} proof obligation(s) discharged", input, n);
     if check_only {
         return;
+    }
+    if let Some(path) = &header {
+        let stem = Path::new(path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let guard: String = format!("BASTIO_{}_H", stem).chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' }).collect();
+        std::fs::write(path, codegen::header(&prog, &guard)).unwrap_or_else(|e| {
+            eprintln!("bastioc0: cannot write {}: {}", path, e);
+            exit(2)
+        });
+    }
+    if !emit_c && !prog.fns.iter().any(|f| f.name == "main") {
+        eprintln!("bastioc0: {} is a library (it has no `main`): build it with --emit-c and link the C into a program", input);
+        exit(2);
     }
 
     let c = codegen::emit(&prog, target);

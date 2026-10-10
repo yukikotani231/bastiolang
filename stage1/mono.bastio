@@ -34,6 +34,10 @@ const TY_BOX: u64 = 23;        // a: the boxed type
 const TY_VEC: u64 = 24;
 const TY_REF: u64 = 25;
 const TY_MUTREF: u64 = 26;
+// Integers other than u64, outside the linear range TY_BUF..TY_MMIO.
+const TY_U8: u64 = 27;
+const TY_U16: u64 = 28;
+const TY_U32: u64 = 29;
 
 /// More instances than this means a definition instantiates itself with
 /// ever larger arguments.
@@ -146,6 +150,12 @@ fn same_name(p: &Parser, a: u64, b: u64) -> bool {
   return same(p.src, x.s, x.e, y.s, y.e);
 }
 
+/// Is function `a` an `export fn`?
+fn is_export(p: &Parser, a: u64) -> bool {
+  let x = node_at(p.nodes, a);
+  return x.e2 > x.s2;
+}
+
 /// Does node `a` have the name `w`?
 fn name_is(p: &Parser, a: u64, w: Str) -> bool {
   let x = node_at(p.nodes, a);
@@ -216,6 +226,9 @@ fn intern(m: &mut Mono, p: &Parser, kind: u64, a: u64) -> u64 {
 
 fn builtin_kind(p: &Parser, name: u64) -> u64 {
   if name_is(p, name, "u64") { return TY_U64; }
+  if name_is(p, name, "u8") { return TY_U8; }
+  if name_is(p, name, "u16") { return TY_U16; }
+  if name_is(p, name, "u32") { return TY_U32; }
   if name_is(p, name, "bool") { return TY_BOOL; }
   if name_is(p, name, "Str") { return TY_STR; }
   if name_is(p, name, "Buf") { return TY_BUF; }
@@ -486,7 +499,7 @@ fn monomorphize(m: &mut Mono, p: &Parser) {
 }
 
 /// Type names are unique among structs and enums, function names among
-/// functions, and `main` is not generic.
+/// functions, and neither `main` nor an `export fn` is generic.
 fn check_unique(m: &mut Mono, p: &Parser) {
   let mut k = p.structs.head;
   let mut in_enums = false;
@@ -510,8 +523,8 @@ fn check_unique(m: &mut Mono, p: &Parser) {
   }
   k = p.fns.head;
   while k != 0 && !m.failed {
-    if is_generic(p, k) && name_is(p, k, "main") {
-      mfail(&mut m, p, k);          // `main` cannot be generic
+    if is_generic(p, k) && (name_is(p, k, "main") || is_export(p, k)) {
+      mfail(&mut m, p, k);          // `main` or an `export fn` cannot be generic
     }
     k = next_of(p, k);
   }
@@ -616,10 +629,10 @@ fn mono_stmt(m: &mut Mono, p: &Parser, i: u64, env: u64) {
   }
 }
 
-/// Is node `i` a call of `vec_new` (the one builtin written with type
-/// arguments)?
+/// Is node `i` a call of a builtin written with type arguments
+/// (`vec_new[T]()`, `cast[T](x)`, `wrap[T](x)`)?
 fn is_typed_builtin(p: &Parser, i: u64) -> bool {
-  return kind_of(p, i) == E_CALL && name_is(p, i, "vec_new");
+  return kind_of(p, i) == E_CALL && (name_is(p, i, "vec_new") || name_is(p, i, "cast") || name_is(p, i, "wrap"));
 }
 
 /// The definition a type application `name[..]` instantiates: a generic

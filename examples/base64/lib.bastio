@@ -1,9 +1,58 @@
-// The base64 library as a C translation unit. stage0 requires every program
-// to have a `main`; this one is never called: base64_capi.c renames the C
-// `main` the compiler generates, and C programs call the functions through
-// base64.h. (See README.md, "The C boundary".)
+// The base64 library's C API. Each `export fn` becomes a C function of the
+// same name, declared in a header that `bastioc0 --header` generates (see
+// run.sh). A `&Bytes` parameter is a pointer and a length on the C side.
 import "base64.bastio";
 
-fn main() -> u64 {
-  return 0;
+enum Encoded {
+  Ok(Bytes),
+  // The input is longer than B64_MAX_RAW (2^59) bytes.
+  TooLong,
+}
+
+/// Decodes `src` (strict: only what base64_encode produces is accepted).
+export fn base64_decode(src: &Bytes) -> Decoded
+  ensures result is Decoded::Ok ==> blen(result.Ok) <= blen(src) / 4 * 3
+  ensures result is Decoded::Err ==> result.Err <= blen(src)
+{
+  return b64_decode(src);
+}
+
+/// Encodes `src`, with `=` padding. b64_encode requires its input to be at
+/// most B64_MAX_RAW bytes; an exported function cannot pass that duty on to
+/// C (it would be unchecked), so the condition is checked here, in Bastio.
+export fn base64_encode(src: &Bytes) -> Encoded
+  ensures result is Encoded::Ok ==> blen(result.Ok) == (blen(src) + 2) / 3 * 4
+{
+  if blen(src) > B64_MAX_RAW {
+    return Encoded::TooLong;
+  }
+  return Encoded::Ok(b64_encode(src));
+}
+
+enum Written {
+  // The number of bytes written at the start of `out`.
+  Ok(u64),
+  // `out` is too small: the encoding needs this many bytes.
+  TooSmall(u64),
+  // The input is longer than B64_MAX_RAW (2^59) bytes.
+  TooLong,
+}
+
+/// Encodes `src` into the caller's buffer `out`, so the library allocates
+/// nothing. C lends `out` as a pointer and a length; the compiler proves
+/// that this function writes only inside it and hands it back unfreed
+/// (E-EXPORT otherwise).
+export fn base64_encode_into(src: &Bytes, out: &mut Bytes) -> Written
+  ensures result is Written::Ok ==> result.Ok == (blen(src) + 2) / 3 * 4 && result.Ok <= blen(out)
+  ensures result is Written::TooSmall ==> result.TooSmall > blen(out)
+{
+  if blen(src) > B64_MAX_RAW {
+    return Written::TooLong;
+  }
+  let need = (blen(src) + 2) / 3 * 4;
+  if need > blen(out) {
+    return Written::TooSmall(need);
+  }
+  b64_encode_into(src, &mut out);
+  return Written::Ok(need);
 }

@@ -1,0 +1,95 @@
+// expect-exit: 42
+// `export fn`s are C functions as well as Bastio ones: a program can export
+// some and still call them itself. (examples/base64 calls them from C.)
+struct Range { lo: u64, hi: u64 }
+
+enum Found {
+  At(u64),
+  Missing,
+}
+
+/// The smallest and largest byte of `b`, or `lo > hi` when it is empty.
+export fn byte_range(b: &Bytes) -> Range
+  ensures result.lo <= 255 && result.hi <= 255
+  ensures blen(b) > 0 ==> result.lo <= result.hi
+{
+  let n = blen(b);
+  if n == 0 {
+    return Range { lo: 1, hi: 0 };
+  }
+  let mut r = Range { lo: bget(b, 0), hi: bget(b, 0) };
+  let mut i = 1;
+  while i < n
+    invariant i <= n && r.lo <= r.hi && r.hi <= 255
+  {
+    let c = bget(b, i);
+    if c < r.lo { r.lo = c; }
+    if c > r.hi { r.hi = c; }
+    i = i + 1;
+  }
+  return r;
+}
+
+/// Where `c` first occurs in `b`.
+export fn find(b: &Bytes, c: u64) -> Found
+  ensures result is Found::At ==> result.At < blen(b)
+{
+  let mut i = 0;
+  while i < blen(b)
+    invariant i <= blen(b)
+  {
+    if bget(b, i) == c {
+      return Found::At(i);
+    }
+    i = i + 1;
+  }
+  return Found::Missing;
+}
+
+/// Narrower integers cross as C's `uint8_t`, `uint16_t` and `uint32_t`.
+export fn low_byte(x: u16) -> u8 {
+  return cast[u8](x % 256);
+}
+
+/// Fills a buffer C lends with `v`. The compiler proves the buffer is only
+/// written in place, never freed or replaced.
+export fn fill(out: &mut Bytes, v: u8) {
+  let mut i = 0;
+  while i < blen(out)
+    invariant i <= blen(out)
+  {
+    bset(&mut out, i, v);
+    i = i + 1;
+  }
+}
+
+export fn is_even(x: u64) -> bool {
+  return x % 2 == 0;
+}
+
+fn main() -> u64 {
+  let mut b = balloc(3);
+  fill(&mut b, 5);
+  if bget(b, 2) != 5 {
+    bfree(b);
+    return 4;
+  }
+  bset(&mut b, 0, 7);
+  bset(&mut b, 1, 3);
+  bset(&mut b, 2, 9);
+  let r = byte_range(b);
+  let f = find(b, 9);
+  bfree(b);
+  let mut at = 0;
+  match f {
+    Found::At(i) => { at = i; }
+    Found::Missing => { return 1; }
+  }
+  if !is_even(r.lo + r.hi) {
+    return 2;
+  }
+  if low_byte(258) != 2 {
+    return 3;
+  }
+  return r.lo * 10 + r.hi + at + 1;
+}
