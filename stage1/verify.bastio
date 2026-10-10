@@ -3194,6 +3194,32 @@ fn all_unused(v: &mut Vr, used: u64, lo: u64, hi: u64) -> u64 {
   return forall_tm(&mut v, v.t_k, imp);
 }
 
+/// Proves the invariants of value `x`, written to an atomic at node `i`.
+fn prove_invariants(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64, i: u64, st: &mut VState) {
+  let mut invs = vec_new[u64]();
+  invariant_terms(&mut v, c, &mut m, p, x, &mut invs);
+  let mut k = 0;
+  while k < vec_len(invs) {
+    prove(&mut v, st, u_at(invs, k), i, VC_LOCKINV);
+    k = k + 1;
+  }
+  vec_free(invs);
+}
+
+/// A value read from an atomic of type `t`: fresh, with its invariants.
+fn atomic_read(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, t: u64, st: &mut VState) -> u64 {
+  let r = fresh_of_named(&mut v, c, m, p, t, "atomic");
+  let mut invs = vec_new[u64]();
+  invariant_terms(&mut v, c, &mut m, p, r, &mut invs);
+  let mut k = 0;
+  while k < vec_len(invs) {
+    vec_push(&mut st.pc, u_at(invs, k));
+    k = k + 1;
+  }
+  vec_free(invs);
+  return r;
+}
+
 fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Vec[u64], vals: &Vec[u64], st: &mut VState) -> u64 {
   let x0 = u_at(vals, 0);
   let x1 = u_at(vals, 1);
@@ -3225,6 +3251,33 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     let t = val_type(v, &mut m, p, x0);
     let lt = intern(&mut m, p, TY_LOCK, t);
     return mk_obj(&mut v, m, lt, 0, 0, 0);
+  }
+  // An atomic's value may change at any moment: only its invariants are
+  // known when it is read, and they are proved of every value written.
+  if name_is(p, i, "atomic_new") {
+    prove_invariants(&mut v, c, &mut m, p, x0, i, &mut st);
+    let mut t = 0;
+    if has_int_op(c, v.env, i) {
+      t = int_op_ty(c, m, v.env, i);
+    } else {
+      t = val_type(v, &mut m, p, x0);
+    }
+    let aty = intern(&mut m, p, TY_ATOMIC, t);
+    return mk_obj(&mut v, m, aty, 0, 0, 0);
+  }
+  if name_is(p, i, "atomic_store") || name_is(p, i, "atomic_swap") || name_is(p, i, "atomic_cas") {
+    if name_is(p, i, "atomic_cas") {
+      prove_invariants(&mut v, c, &mut m, p, x2, i, &mut st);
+      return fresh_bool_named(&mut v, "cas");
+    }
+    prove_invariants(&mut v, c, &mut m, p, x1, i, &mut st);
+    if name_is(p, i, "atomic_store") {
+      return v.unit;
+    }
+    return atomic_read(&mut v, c, &mut m, p, inner_t(m, a0.ty), &mut st);
+  }
+  if name_is(p, i, "atomic_end") || name_is(p, i, "atomic_load") || name_is(p, i, "atomic_wrap_add") {
+    return atomic_read(&mut v, c, &mut m, p, inner_t(m, a0.ty), &mut st);
   }
   if name_is(p, i, "lock_end") {
     let r = fresh_of_named(&mut v, c, m, p, inner_t(m, a0.ty), "unlocked");

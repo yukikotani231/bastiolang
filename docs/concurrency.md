@@ -36,7 +36,9 @@ Enough for BastiOS to run its scheduler on every core:
 - **Pinned types**: `Cpu` and `Mmu` (and anything holding one) cannot go in a lock or be shared by `smp_run` (`E-PIN`).
 - **Lock order by class**, instead of `Ctx` and ranks (`E-LOCK-ORDER`). Because `locked` is scoped, the locks held at any point are exactly the enclosing `locked` calls, so the checker can find the order from the call graph alone. A lock's class is the type of its contents. While a lock of class C is held, the function `locked` runs and everything it calls may take only other classes, and the classes form no cycle. Nothing is annotated and nothing is generated. It is stricter than ranks in one way: two locks with the same contents type cannot be nested (rank them by giving them different struct types). See "Lock ranks" below for the design it replaces.
 
-Not yet: `par`, `spawn`/`join`, `Share`, `Atomic`, `Ctx`, and `irq_lock_new`/`IrqSaved`. BastiOS does not need the interrupt rules yet because its kernel code runs with interrupts off: interrupts reach a processor only while it runs user code or waits in `cpu_idle`, never while it holds a lock.
+- **`Atomic[T]`** as designed below (load, store, swap, compare-and-swap, sequentially consistent), except that the in-place update is `atomic_wrap_add`, which wraps and so needs no proof, instead of a checked `atomic_add`. A checked add would have to preserve the invariant for every value it allows, which almost no invariant does for a nonzero `d`; a compare-and-swap loop does the checked version.
+
+Not yet: `par`, `spawn`/`join`, `Share`, `Ctx`, and `irq_lock_new`/`IrqSaved`. BastiOS does not need the interrupt rules yet because its kernel code runs with interrupts off: interrupts reach a processor only while it runs user code or waits in `cpu_idle`, never while it holds a lock.
 
 ## Layer 1: running code in parallel
 

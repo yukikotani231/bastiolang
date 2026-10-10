@@ -966,6 +966,8 @@ fn cty(t: &Type) -> String {
         Type::Vec(_) => "bst_vec".into(),
         // The lock word, followed by the contents (see bst_lock_acquire).
         Type::Lock(_) => "uint64_t *".into(),
+        // A word on the heap, so its address stays put while it is shared.
+        Type::Atomic(t) => format!("{} *", cty(t)),
         Type::Ref(t) => cty(t),
         Type::MutRef(_) => unreachable!("written by proto"),
     }
@@ -1146,6 +1148,15 @@ impl<'a> Gen<'a> {
             },
             ExprKind::Call(n, _) if crate::check::WRAP_BUILTINS.contains(&n.as_str()) => self.int_ops[&e.pos].clone(),
             ExprKind::Call(n, args) if n == "lock_new" => Type::Lock(Box::new(self.type_of(&args[0]))),
+            ExprKind::Call(n, args) if n == "atomic_new" => Type::Atomic(Box::new(self.type_of(&args[0]))),
+            ExprKind::Call(n, args) if crate::check::ATOMIC_BUILTINS.contains(&n.as_str()) => match n.as_str() {
+                "atomic_store" => Type::Unit,
+                "atomic_cas" => Type::Bool,
+                _ => match self.type_of(&args[0]) {
+                    Type::Atomic(i) => *i,
+                    _ => unreachable!("checked"),
+                },
+            },
             ExprKind::Call(n, args) if n == "lock_end" => match self.type_of(&args[0]) {
                 Type::Lock(i) => *i,
                 _ => unreachable!("checked"),
@@ -1364,6 +1375,30 @@ impl<'a> Gen<'a> {
                     let Type::Lock(inner) = self.type_of(&args[0]) else { unreachable!("checked") };
                     let t = cty(&inner);
                     format!("({{ uint64_t *{l} = {}; {t} {c} = *({t} *)({l} + 1); bst_box_free({l}, 8 + sizeof({t})); {c}; }})", self.expr(&args[0]))
+                }
+            }
+            ExprKind::Call(name, args) if crate::check::ATOMIC_BUILTINS.contains(&name.as_str()) => {
+                // Every access is sequentially consistent (docs/concurrency.md).
+                let k = self.tmps;
+                self.tmps += 1;
+                if name == "atomic_new" {
+                    let t = cty(&self.type_of(&args[0]));
+                    return format!("({{ {t} *at_{k} = ({t} *)bst_box_alloc(sizeof({t})); *at_{k} = {}; at_{k}; }})", self.expr(&args[0]));
+                }
+                let Type::Atomic(inner) = self.type_of(&args[0]) else { unreachable!("checked") };
+                let t = cty(&inner);
+                let a = self.expr(&args[0]);
+                const SC: &str = "__ATOMIC_SEQ_CST";
+                match name.as_str() {
+                    "atomic_end" => format!("({{ {t} *at_{k} = {a}; {t} av_{k} = *at_{k}; bst_box_free(at_{k}, sizeof({t})); av_{k}; }})"),
+                    "atomic_load" => format!("({{ {t} av_{k}; __atomic_load({a}, &av_{k}, {SC}); av_{k}; }})"),
+                    "atomic_store" => format!("({{ {t} *at_{k} = {a}; {t} av_{k} = {}; __atomic_store(at_{k}, &av_{k}, {SC}); }})", self.expr(&args[1])),
+                    "atomic_swap" => format!("({{ {t} *at_{k} = {a}; {t} av_{k} = {}, ao_{k}; __atomic_exchange(at_{k}, &av_{k}, &ao_{k}, {SC}); ao_{k}; }})", self.expr(&args[1])),
+                    "atomic_cas" => {
+                        let (x, y) = (self.expr(&args[1]), self.expr(&args[2]));
+                        format!("({{ {t} *at_{k} = {a}; {t} ae_{k} = {x}, av_{k} = {y}; (bool)__atomic_compare_exchange(at_{k}, &ae_{k}, &av_{k}, 0, {SC}, {SC}); }})")
+                    }
+                    _ => format!("({{ {t} *at_{k} = {a}; {t} av_{k} = {}; __atomic_fetch_add(at_{k}, av_{k}, {SC}); }})", self.expr(&args[1])),
                 }
             }
             ExprKind::Call(name, args) if name == "locked" => {
