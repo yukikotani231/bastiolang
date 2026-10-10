@@ -12,7 +12,7 @@
 (type_identifier) @type
 ((type_identifier) @type.builtin
   (#any-of? @type.builtin
-    "u64" "u32" "u16" "u8" "bool" "Str" "Buf" "Bytes" "Host" "Child" "Serial" "Frame"
+    "u64" "u32" "u16" "u8" "i64" "i32" "i16" "i8" "bool" "Str" "Buf" "Bytes" "Host" "Child" "Serial" "Frame"
     "PageTable" "Pool" "Mmu" "Cpu" "Vec" "Box"))
 (variant_identifier) @constructor
 (struct_expression name: (identifier) @type)

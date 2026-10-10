@@ -146,7 +146,8 @@ fn main(con: &mut Serial) -> u64 {
 | Type | Meaning |
 | --- | --- |
 | `u64` | Unsigned 64-bit integer. Arithmetic is proved to stay in range; it never wraps |
-| `u8`, `u16`, `u32` | Narrower unsigned integers (C's `uint8_t` and so on), with the same proofs. See "Sized integers" below; signed types are designed in [integers.md](integers.md) |
+| `u8`, `u16`, `u32` | Narrower unsigned integers (C's `uint8_t` and so on), with the same proofs. See "Sized integers" below |
+| `i8`, `i16`, `i32`, `i64` | Signed integers (C's `int8_t` and so on), proved to stay in range. See "Sized integers" below |
 | `bool` | `true` or `false` |
 | `Str` | A string literal: immutable bytes whose length and contents are known at compile time. Never freed |
 | A struct or enum with no linear part | See [Structs](#structs) and [Enums](#enums-and-match) |
@@ -379,6 +380,42 @@ fn low_byte(n: u64) -> u8 {
 
 fn main() -> u64 {
   return cast[u64](low_byte(300));
+}
+```
+
+**Signed integers.** `i8`, `i16`, `i32` and `i64` are proved to stay between their minimum and maximum: an operation that could go below the minimum is `E-VERIFY-UNDERFLOW`, above the maximum `E-VERIFY-OVERFLOW`. Unary minus `-x` works on signed types only (`E-TYPE` on unsigned ones) and is proved not to be applied to the minimum, whose negation does not fit. Division truncates toward zero and `%` takes the sign of the dividend, as in C; `MIN / -1` is `E-VERIFY-OVERFLOW`. `cast[u64](x)` on a signed `x` is proved non-negative; builtins that take `u64` do not accept a signed value without such a conversion. An expression made only of literals is `u64`, so a negative number needs a signed position (`let n: i8 = -7;`).
+
+```bastio
+// expect-exit: 42
+fn abs(x: i32) -> i32
+  requires x != -2147483648
+  ensures result >= 0 && (result == x || result == -x)
+{
+  if x < 0 {
+    return -x;
+  }
+  return x;
+}
+
+fn main() -> u64 {
+  let n: i8 = -7;
+  let q: i8 = n / 2;             // -3: truncates toward zero
+  let r: i8 = n % 2;             // -1: sign of the dividend
+  if q != -3 || r != -1 {
+    return 1;
+  }
+  return cast[u64](abs(-40)) + 2;
+}
+```
+
+```bastio
+// expect-error: E-VERIFY-OVERFLOW
+fn negate(x: i8) -> i8 {
+  return -x;                     // fails: x may be -128, and 128 does not fit in i8
+}
+
+fn main() -> u64 {
+  return cast[u64](negate(-5));
 }
 ```
 
