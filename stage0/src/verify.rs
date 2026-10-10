@@ -68,7 +68,30 @@ enum Val {
     /// variant (`Unit` for variants without one). Only the slot the tag
     /// names means anything.
     Enum(String, String, Vec<Val>),
+    /// A box: its contents, or (beyond the depth the verifier unfolds
+    /// recursive data to) only their type.
+    Box(BoxVal),
     Unit,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum BoxVal {
+    Known(Box<Val>),
+    /// Contents nothing is known about yet; they are given fresh values the
+    /// first time code looks inside.
+    Opaque(Type),
+}
+
+/// How many boxes deep a fresh value is unfolded.
+const BOX_DEPTH: usize = 2;
+
+/// Looks through boxes: the value a box holds (boxes on a place's path are
+/// opened by `open_path` before they are read).
+fn unbox_known(mut v: &Val) -> &Val {
+    while let Val::Box(BoxVal::Known(i)) = v {
+        v = i;
+    }
+    v
 }
 
 /// The value at a dotted path.
@@ -76,7 +99,7 @@ fn get_path(env: &HashMap<String, Val>, path: &str) -> Val {
     let mut parts = path.split('.');
     let mut v = &env[parts.next().unwrap()];
     for f in parts {
-        let Val::Struct(n, fs) = v else { unreachable!("checked: a field of a struct") };
+        let Val::Struct(n, fs) = unbox_known(v) else { unreachable!("checked: a field of a struct (boxes opened)") };
         let k = struct_def(n).unwrap().fields.iter().position(|x| x.0 == f).expect("checked field");
         v = &fs[k];
     }
@@ -90,7 +113,11 @@ fn set_path(env: &mut HashMap<String, Val>, path: &str, nv: Val) {
             *v = nv;
             return;
         }
-        let Val::Struct(n, fs) = v else { unreachable!("checked: a field of a struct") };
+        let mut v = v;
+        while let Val::Box(BoxVal::Known(i)) = v {
+            v = &mut **i;
+        }
+        let Val::Struct(n, fs) = v else { unreachable!("checked: a field of a struct (boxes opened)") };
         let k = struct_def(n).unwrap().fields.iter().position(|x| x.0 == rest[0]).expect("checked field");
         go(&mut fs[k], &rest[1..], nv);
     }
@@ -108,6 +135,9 @@ fn merge_val(c: &str, a: &Val, b: &Val) -> Val {
         (Val::Obj(ty, f1), Val::Obj(_, f2)) => Val::Obj(ty.clone(), f1.iter().zip(f2).map(|(x, y)| ite(c, x, y)).collect()),
         (Val::Struct(n, f1), Val::Struct(_, f2)) => Val::Struct(n.clone(), f1.iter().zip(f2).map(|(x, y)| merge_val(c, x, y)).collect()),
         (Val::Enum(n, t1, p1), Val::Enum(_, t2, p2)) => Val::Enum(n.clone(), ite(c, t1, t2), p1.iter().zip(p2).map(|(x, y)| merge_val(c, x, y)).collect()),
+        (Val::Box(BoxVal::Known(x)), Val::Box(BoxVal::Known(y))) => Val::Box(BoxVal::Known(Box::new(merge_val(c, x, y)))),
+        // Forgetting what one side knew is sound.
+        (Val::Box(BoxVal::Opaque(t)), Val::Box(_)) | (Val::Box(_), Val::Box(BoxVal::Opaque(t))) => Val::Box(BoxVal::Opaque(t.clone())),
         (Val::Unit, Val::Unit) => Val::Unit,
         _ => unreachable!("type checker guarantees matching kinds"),
     }
@@ -174,6 +204,8 @@ pub struct Verifier<'p> {
     solver: Solver,
     counter: usize,
     pub obligations: usize,
+    /// Boxes being unfolded by `fresh_of` right now.
+    box_depth: usize,
 }
 
 fn sanitize(n: &str) -> String {
@@ -202,7 +234,7 @@ fn ite(c: &str, a: &str, b: &str) -> String {
 
 pub fn verify_program(p: &Program) -> Result<(usize, Vec<String>), Diag> {
     let solver = Solver::start().map_err(|e| Diag::new("E-SOLVER", Pos::default(), e))?;
-    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0 };
+    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0 };
     v.smt(&format!("(declare-const {} Int)", POOLSIZE))?;
     v.smt(&format!("(assert (and (<= 0 {p}) (<= {p} {})))", FRAME_LIMIT, p = POOLSIZE))?;
     for f in &p.fns {
@@ -301,6 +333,15 @@ impl<'p> Verifier<'p> {
                 }
                 Ok(Val::Enum(n.clone(), tag, ps))
             }
+            Type::Box(t) => {
+                if self.box_depth >= BOX_DEPTH {
+                    return Ok(Val::Box(BoxVal::Opaque((**t).clone())));
+                }
+                self.box_depth += 1;
+                let inner = self.fresh_of(t, hint);
+                self.box_depth -= 1;
+                Ok(Val::Box(BoxVal::Known(Box::new(inner?))))
+            }
             t => {
                 let mut fs = Vec::new();
                 for (f, _, _) in ghost_fields(t) {
@@ -350,7 +391,8 @@ impl<'p> Verifier<'p> {
                                 show(&format!("{}.{}", n, v), pv, shown);
                             }
                         }
-                        Val::Unit => {}
+                        Val::Box(BoxVal::Known(i)) => show(n, i, shown),
+                        Val::Box(BoxVal::Opaque(_)) | Val::Unit => {}
                     }
                 }
                 let mut shown: Vec<(String, String)> = Vec::new();
@@ -450,6 +492,7 @@ impl<'p> Verifier<'p> {
             }
             StmtKind::Assign { name, value } => {
                 let v = self.eval(value, &mut st)?;
+                self.open_path(&mut st.env, name)?;
                 set_path(&mut st.env, name, v);
                 Ok(Some(st))
             }
@@ -572,6 +615,7 @@ impl<'p> Verifier<'p> {
                     if !st.env.contains_key(path_root(&name)) {
                         continue; // declared inside the loop
                     }
+                    self.open_path(&mut lst.env, &name)?;
                     let old = get_path(&lst.env, &name);
                     let nv = self.havoc(&old, keep, &name)?;
                     set_path(&mut lst.env, &name, nv);
@@ -594,6 +638,47 @@ impl<'p> Verifier<'p> {
                 lst.pc.push(format!("(not {})", c));
                 Ok(Some(lst))
             }
+        }
+    }
+
+    /// Gives every opaque box on `path` (before its last component) fresh
+    /// contents, so the path can be read and written. Sound: nothing was
+    /// known about them, and a box has one owner, so no other copy exists.
+    fn open_path(&mut self, env: &mut HashMap<String, Val>, path: &str) -> Result<(), Diag> {
+        let parts: Vec<&str> = path.split('.').collect();
+        for k in 1..parts.len() {
+            let prefix = parts[..k].join(".");
+            let v = get_path(env, &prefix);
+            let opened = self.open_val(v.clone(), &sanitize(&prefix))?;
+            if opened != v {
+                set_path(env, &prefix, opened);
+            }
+        }
+        Ok(())
+    }
+
+    fn open_val(&mut self, v: Val, hint: &str) -> Result<Val, Diag> {
+        Ok(match v {
+            Val::Box(BoxVal::Opaque(t)) => {
+                let inner = self.fresh_of(&t, hint)?;
+                Val::Box(BoxVal::Known(Box::new(self.open_val(inner, hint)?)))
+            }
+            Val::Box(BoxVal::Known(i)) => Val::Box(BoxVal::Known(Box::new(self.open_val(*i, hint)?))),
+            v => v,
+        })
+    }
+
+    /// What a specification sees inside a box. An opaque box reads as fresh
+    /// values each time: only incomplete (a fact about it cannot be used
+    /// later), never unsound.
+    fn look_inside(&mut self, v: Val) -> Result<Val, Diag> {
+        match v {
+            Val::Box(BoxVal::Known(i)) => self.look_inside(*i),
+            Val::Box(BoxVal::Opaque(t)) => {
+                let inner = self.fresh_of(&t, "opaque")?;
+                self.look_inside(inner)
+            }
+            v => Ok(v),
         }
     }
 
@@ -635,6 +720,8 @@ impl<'p> Verifier<'p> {
                 }
                 Val::Enum(n.clone(), tag, np)
             }
+            Val::Box(BoxVal::Known(i)) => Val::Box(BoxVal::Known(Box::new(self.havoc(i, false, name)?))),
+            Val::Box(BoxVal::Opaque(t)) => Val::Box(BoxVal::Opaque(t.clone())),
             Val::Unit => Val::Unit,
         })
     }
@@ -647,7 +734,11 @@ impl<'p> Verifier<'p> {
             ExprKind::Str(bytes) => Ok(str_val(bytes)),
             ExprKind::Blob(bytes) => Ok(Val::Str { len: bytes.len().to_string(), data: self.fresh_array("blob", "Int")? }),
             ExprKind::Var(n) => Ok(st.env[n].clone()),
-            ExprKind::Field(..) => Ok(get_path(&st.env, &place(e).expect("checked: a place"))),
+            ExprKind::Field(..) => {
+                let p = place(e).expect("checked: a place");
+                self.open_path(&mut st.env, &p)?;
+                Ok(get_path(&st.env, &p))
+            }
             ExprKind::StructLit(n, fs) => {
                 let mut vals = HashMap::new();
                 for (f, x) in fs {
@@ -742,6 +833,14 @@ impl<'p> Verifier<'p> {
     }
 
     fn call(&mut self, name: &str, args: &[Expr], pos: Pos, st: &mut State) -> Result<Val, Diag> {
+        for a in args {
+            if let Some(p) = match &a.kind {
+                ExprKind::MutBorrow(n) => Some(n.clone()),
+                _ => place(a),
+            } {
+                self.open_path(&mut st.env, &p)?;
+            }
+        }
         // Argument order mirrors the checker: scalars first, then linear values.
         let is_lin = |a: &Expr, st: &State| match &a.kind {
             ExprKind::MutBorrow(_) => true,
@@ -810,6 +909,12 @@ impl<'p> Verifier<'p> {
             this.need(st, format!("(< {} {})", i, lim), pos, "E-VERIFY-BOUNDS", format!("that the index `{}` is within {} (`{} < {}`)", render(&args[k]), of, render(&args[k]), lim))
         };
         match name {
+            "box" => Ok(Val::Box(BoxVal::Known(Box::new(vals[0].clone())))),
+            "unbox" => match &vals[0] {
+                Val::Box(BoxVal::Known(v)) => Ok((**v).clone()),
+                Val::Box(BoxVal::Opaque(t)) => self.fresh_of(t, "unboxed"),
+                _ => unreachable!("checked: a box"),
+            },
             "alloc" => {
                 let n = vals[0].term().to_string();
                 self.need(st, format!("(<= {} {})", n, ALLOC_MAX), pos, "E-VERIFY-ALLOC", format!("that the allocation size `{}` is at most 2^60 elements", ra(0)))?;
@@ -1068,7 +1173,7 @@ impl<'p> Verifier<'p> {
                 self.spec_val(&xs[0], Scope { env: old, old: None, result: None }, bound)
             }
             ExprKind::Str(bytes) => Ok(str_val(bytes)),
-            ExprKind::Field(b, f) => match self.spec_val(b, sc, bound)? {
+            ExprKind::Field(b, f) => match self.spec_val(b, sc, bound).and_then(|v| self.look_inside(v))? {
                 Val::Struct(n, fs) => {
                     let k = struct_def(&n).unwrap().fields.iter().position(|x| &x.0 == f).expect("checked field");
                     Ok(fs[k].clone())

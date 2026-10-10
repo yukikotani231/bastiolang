@@ -1,0 +1,32 @@
+// expect-error: E-VERIFY-BOUNDS
+// Deep inside a tree passed in, nothing is known about a buffer's length.
+struct Node { buf: Buf, next: List }
+enum List { Cons(Box[Node]), Nil }
+fn third(l: &List) -> u64 {
+  match l {
+    List::Cons(a) => {
+      match a.next {
+        List::Cons(b) => {
+          match b.next {
+            List::Cons(c) => { return get(c.buf, 0); },
+            List::Nil => { return 0; },
+          }
+        },
+        List::Nil => { return 0; },
+      }
+    },
+    List::Nil => { return 0; },
+  }
+}
+fn drop_list(l: List) {
+  match l {
+    List::Cons(n) => { let x = unbox(n); free(x.buf); drop_list(x.next); },
+    List::Nil => {},
+  }
+}
+fn main() -> u64 {
+  let l = List::Nil;
+  let r = third(l);
+  drop_list(l);
+  return r;
+}

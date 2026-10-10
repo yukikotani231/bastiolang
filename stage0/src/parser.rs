@@ -245,6 +245,15 @@ impl Parser {
             "Pool" => Ok(Type::Pool),
             "Mmu" => Ok(Type::Mmu),
             "Cpu" => Ok(Type::Cpu),
+            "Box" => {
+                self.expect(Tok::LBracket, "`[` after `Box`")?;
+                let inner = self.ty()?;
+                self.expect(Tok::RBracket, "`]`")?;
+                if inner.is_ref() {
+                    return Err(Diag::new("E-PARSE", pos, "a box cannot hold a borrow"));
+                }
+                Ok(Type::Box(Box::new(inner)))
+            }
             _ => Ok(Type::Struct(n)),
         }
     }

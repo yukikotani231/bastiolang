@@ -39,6 +39,9 @@ pub enum Type {
     /// A user-defined enum (a tagged union). Linear when any variant's
     /// payload is linear.
     Enum(String),
+    /// An owning pointer to a heap value. Always linear (it owns the
+    /// allocation), and the only way a type may refer to itself.
+    Box(Box<Type>),
     /// A read-only borrow of a linear value. Only allowed as a parameter type.
     Ref(Box<Type>),
     /// A mutable borrow of a linear value. Only allowed as a parameter type;
@@ -63,13 +66,14 @@ impl Type {
             Type::Mmu => "Mmu".into(),
             Type::Cpu => "Cpu".into(),
             Type::Struct(n) | Type::Enum(n) => n.clone(),
+            Type::Box(t) => format!("Box[{}]", t.name()),
             Type::Ref(t) => format!("&{}", t.name()),
             Type::MutRef(t) => format!("&mut {}", t.name()),
         }
     }
     pub fn is_linear(&self) -> bool {
         match self {
-            Type::Buf | Type::Bytes | Type::Host | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu => true,
+            Type::Buf | Type::Bytes | Type::Host | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu | Type::Box(_) => true,
             Type::Struct(n) => struct_def(n).map_or(false, |d| d.fields.iter().any(|f| f.1.is_linear())),
             Type::Enum(n) => enum_def(n).map_or(false, |d| d.variants.iter().any(|v| v.1.as_ref().map_or(false, |t| t.is_linear()))),
             _ => false,
@@ -294,7 +298,7 @@ pub fn resolve_enum_types(p: &mut Program) {
     fn fix(t: &mut Type, names: &[String]) {
         match t {
             Type::Struct(n) if names.contains(n) => *t = Type::Enum(n.clone()),
-            Type::Ref(i) | Type::MutRef(i) => fix(i, names),
+            Type::Ref(i) | Type::MutRef(i) | Type::Box(i) => fix(i, names),
             _ => {}
         }
     }
