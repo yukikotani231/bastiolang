@@ -66,10 +66,10 @@ const KROOT: &str = "65536";
 const POOLSIZE: &str = "POOLSIZE";
 /// The number of x86 I/O ports: a PortIo's ports are all below it.
 const PORT_LIMIT: &str = "65536";
-/// The device window a `Mmio` lies in: physical 0xC000_0000 up to 4 GiB,
+/// The device window a `Mmio` lies in: physical 0x8000_0000 up to 4 GiB,
 /// which the platform maps uncached (and which holds no pool page, since
 /// pages stay below FRAME_LIMIT).
-const MMIO_LO: &str = "3221225472";
+const MMIO_LO: &str = "2147483648";
 const MMIO_HI: &str = "4294967296";
 const NO_BOOL: &str = "((as const (Array Int Bool)) false)";
 
@@ -1867,7 +1867,7 @@ impl<'p> Verifier<'p> {
                 let (p, b, l) = (&vals[0], vals[1].term(), vals[2].term());
                 let inr = format!("(and (<= {b} k) (< k (+ {b} {l})))");
                 self.need(st, format!("(and (<= {} {}) (<= (+ {} {}) {}))", MMIO_LO, b, b, l, MMIO_HI), pos, "E-VERIFY-BOUNDS",
-                    format!("that `{}` .. `{} + {}` lies in the device window (0xC0000000 to 4 GiB)", ra(1), ra(1), ra(2)))?;
+                    format!("that `{}` .. `{} + {}` lies in the device window (0x80000000 to 4 GiB)", ra(1), ra(1), ra(2)))?;
                 self.need(st, format!("(forall ((k Int)) (=> {} (select {} k)))", inr, p.field("free")), pos, "E-VERIFY-OWN",
                     format!("that nobody has claimed any of these addresses (`mmio_free({}, a)` for each): two owners could drive one device", ra(0)))?;
                 let nf = format!("(lambda ((k Int)) (and (select {} k) (not {})))", p.field("free"), inr);
@@ -1971,6 +1971,13 @@ impl<'p> Verifier<'p> {
                 let v = self.fresh_u64("vector")?;
                 st.pc.push(format!("(<= {} 255)", v.term()));
                 Ok(v)
+            }
+            "boot_fb" => {
+                // The prelude reports a framebuffer only if it ends at or
+                // below 4 GiB, so every field fits in 32 bits.
+                let x = self.fresh_u64("fb")?;
+                st.pc.push(format!("(<= {} 4294967295)", x.term()));
+                Ok(x)
             }
             "cpu_count" => {
                 let n = self.fresh_u64("cpus")?;

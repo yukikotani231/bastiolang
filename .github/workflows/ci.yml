@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Z3
         run: sudo apt-get update && sudo apt-get install -y z3
       # rust-toolchain.toml pins the Rust release; rustup installs it here.
@@ -30,6 +30,8 @@ jobs:
         run: tests/run.sh
       - name: Native backend, differential test against the C backend
         run: tests/native.sh
+      - name: Native backend, the self-hosted compiler's tools built natively
+        run: tests/native.sh --stage1
       - name: Self-hosted compiler, differential tests
         run: stage1/difftest.sh
   editors:
@@ -38,8 +40,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
       - name: tree-sitter grammar
@@ -48,13 +50,28 @@ jobs:
           editors/tree-sitter-bastio/test/parse_all.sh
       - name: VS Code grammar
         run: cd editors/vscode && npm ci && npm test
+  site:
+    # The documentation website builds, and every link between its pages
+    # resolves. It is not deployed anywhere.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install mdBook
+        run: curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.52/mdbook-v0.4.52-x86_64-unknown-linux-gnu.tar.gz | tar xz -C /usr/local/bin
+      - name: Build the site
+        run: site/build.sh
+      - uses: actions/upload-artifact@v5
+        with:
+          name: site-${{ github.sha }}
+          path: site/build/html
   bench:
     # Timings are kept, not judged: a regression shows up in the artifact of
     # the change that caused it. The job fails only if a benchmark breaks
     # (rejected, crashes, or disagrees with its C twin).
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Z3
         run: sudo apt-get update && sudo apt-get install -y z3
       - name: Build stage0
@@ -63,7 +80,7 @@ jobs:
         run: |
           set -o pipefail
           bench/run.sh | tee bench.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: always()
         with:
           name: bench-${{ github.sha }}
