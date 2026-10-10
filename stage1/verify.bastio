@@ -1318,7 +1318,7 @@ fn term(v: &Vr, x: u64) -> u64 {
 fn obj_fields(k: u64) -> u64 {
   if k == TY_PT { return 4; }
   if k == TY_POOL { return 2; }
-  if k == TY_FRAME || k == TY_MMU || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA || k == TY_LEASE { return 1; }
+  if k == TY_FRAME || k == TY_MMU || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA { return 1; }
   if k == TY_PORTIO || k == TY_MMIO { return 2; }
   return 0;
 }
@@ -4158,22 +4158,20 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     put_back(&mut v, m, p, &mut st, u_at(args, 1), nt);
     return mk_obj(&mut v, m, kind_ty(m, p, TY_LEASE), id, 0, 0);
   }
-  // Always loads the kernel's tables. The count drops only when the lease
-  // is one for this table; otherwise it stays as it was, which overcounts
-  // and so is safe. The result says which.
+  // Loads the kernel's tables and gives the lease back. No table's count
+  // in the proof drops (none is named): they only ever overcount, which is
+  // safe. `pt_lease_count` reads the true one.
   if name_is(p, i, "mmu_exit") {
-    let r = fresh_bool_named(&mut v, "mmu_exit");
-    let same = app2(&mut v, OP_EQ, g_id(v, x2), g_id(v, x1));
-    let eq = app2(&mut v, OP_EQ, term(v, r), same);
-    vec_push(&mut st.pc, eq);
-    let l = g_leases(v, x1);
-    let one = num(&mut v, 1);
-    let down = app2(&mut v, OP_SUB, l, one);
-    let leases = app3(&mut v, OP_ITE, term(v, r), down, l);
     let nm = mk_obj(&mut v, m, kind_ty(m, p, TY_MMU), v.t_flimit, 0, 0);
     put_back(&mut v, m, p, &mut st, u_at(args, 0), nm);
-    let nt = mk_pt(&mut v, v.ty_pt, g_id(v, x1), g_level(v, x1), g_used(v, x1), leases);
-    put_back(&mut v, m, p, &mut st, u_at(args, 1), nt);
+    return v.unit;
+  }
+  // The number of leases outstanding on the table, which only its holder
+  // (this `&mut`) could raise: from here on that is what the proof knows.
+  if name_is(p, i, "pt_lease_count") {
+    let r = fresh_u64_named(&mut v, "pt_lease_count");
+    let nt = mk_pt(&mut v, v.ty_pt, g_id(v, x0), g_level(v, x0), g_used(v, x0), term(v, r));
+    put_back(&mut v, m, p, &mut st, u_at(args, 0), nt);
     return r;
   }
   if name_is(p, i, "mmu_kernel") {
@@ -4759,7 +4757,7 @@ fn changed_vars(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, head: u64, ou
 fn shape_keeping(p: &Parser, i: u64) -> bool {
   return name_is(p, i, "bset") || name_is(p, i, "vec_set") || name_is(p, i, "vec_swap") || name_is(p, i, "pt_put")
     || name_is(p, i, "pt_take") || name_is(p, i, "pt_put_frame") || name_is(p, i, "pt_take_frame")
-    || name_is(p, i, "pt_borrow") || name_is(p, i, "pt_borrow_frame") || name_is(p, i, "pool_take") || name_is(p, i, "pool_give") || name_is(p, i, "frame_write")
+    || name_is(p, i, "pt_borrow") || name_is(p, i, "pt_borrow_frame") || name_is(p, i, "pt_lease_count") || name_is(p, i, "pool_take") || name_is(p, i, "pool_give") || name_is(p, i, "frame_write")
     || name_is(p, i, "frame_write8") || name_is(p, i, "cpu_set") || name_is(p, i, "cpu_run") || name_is(p, i, "cpu_idle")
     || name_is(p, i, "cpu_fpu_save") || name_is(p, i, "cpu_fpu_load") || name_is(p, i, "pio_in8") || name_is(p, i, "pio_in16")
     || name_is(p, i, "pio_in32") || name_is(p, i, "pio_out8") || name_is(p, i, "pio_out16") || name_is(p, i, "pio_out32")
