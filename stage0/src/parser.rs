@@ -11,7 +11,7 @@
 //   const    := 'const' IDENT ':' 'u64' '=' expr ';'   (constant-folded; define before use)
 //   param    := 'mut'? IDENT ':' type
 //   type     := 'u64' | 'bool' | 'Str' | linear | IDENT (a struct) | '&' linear | '&' 'mut' linear
-//   linear   := 'Buf' | 'Bytes' | 'Host' | 'Child' | 'Serial' | 'Frame' | 'PageTable' | 'Pool' | 'Mmu' | 'Cpu'
+//   linear   := 'Buf' | 'Bytes' | 'Host' | 'Child' | 'Serial' | 'Frame' | 'PageTable' | 'Pool' | 'Mmu' | 'Cpu' | 'Ports' | 'PortIo' | 'MmioSpace' | 'Mmio'
 //   place    := IDENT ('.' IDENT)*
 //   primary  := ... | '&' 'mut' place | 'include_bytes' '(' STRING ')' | 'old' '(' expr ')'
 //             | IDENT '{' (IDENT ':' expr (',' IDENT ':' expr)* ','?)? '}'   (a struct literal)
@@ -336,6 +336,10 @@ impl Parser {
             "Pool" => Ok(Type::Pool),
             "Mmu" => Ok(Type::Mmu),
             "Cpu" => Ok(Type::Cpu),
+            "Ports" => Ok(Type::Ports),
+            "PortIo" => Ok(Type::PortIo),
+            "MmioSpace" => Ok(Type::MmioSpace),
+            "Mmio" => Ok(Type::Mmio),
             _ if *self.peek() == Tok::LBracket && n != "Box" && n != "Vec" => Ok(Type::Generic(n, self.targs()?)),
             "Box" | "Vec" => {
                 self.expect(Tok::LBracket, "`[`")?;

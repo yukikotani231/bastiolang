@@ -1,0 +1,41 @@
+// expect-exit: 9
+// A `&mut` argument keeps what is known about the parts the callee leaves
+// alone, or changes only in ways that keep their shape, with no `ensures`
+// and no loop invariant restating it: `put` and `bump` say nothing about
+// `len(r.buf)`, yet every call and loop below knows it is still 8.
+struct Ring { buf: Buf, head: u64, tag: u64 }
+
+// Only `set`s the buffer: its length is kept, and `head` and `tag` too.
+fn put(r: &mut Ring, i: u64, v: u64) requires i < len(r.buf) {
+  r.buf = set(r.buf, i, v);
+}
+
+// Changes `head` but not the buffer.
+fn bump(r: &mut Ring) requires r.head < 100 {
+  r.head = r.head + 1;
+}
+
+// Through another function, and through itself.
+fn fill(r: &mut Ring, i: u64, v: u64) requires i <= len(r.buf) {
+  if i < len(r.buf) {
+    put(&mut r, i, v);
+    fill(&mut r, i + 1, v);
+  }
+}
+
+fn main() -> u64 {
+  let mut r = Ring { buf: alloc(8), head: 0, tag: 7 };
+  let mut i = 0;
+  while i < 8 invariant i <= 8 {
+    put(&mut r, i, i);
+    i = i + 1;
+  }
+  fill(&mut r, 0, 1);
+  put(&mut r, 7, 2);
+  bump(&mut r);
+  assert len(r.buf) == 8;
+  assert r.tag == 7;
+  let out = get(r.buf, 7) % 3 + r.tag;   // the data is unknown after the calls; its shape is not
+  free(r.buf);
+  return out;
+}
