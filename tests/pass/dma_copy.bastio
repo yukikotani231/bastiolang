@@ -1,0 +1,41 @@
+// expect-exit: 42
+// Bulk copies to and from a page lent to a device: a driver fills a
+// transmit buffer with `bytes_to_dma` and reads a received one with
+// `dma_to_bytes`. The page's contents are the device's, so the proof does
+// not know what `dma_to_bytes` brings in, only that it stayed in bounds and
+// left the rest of the buffer alone.
+
+fn main(pool: &mut Pool) -> u64 {
+  if pool_size(pool) < 1 {
+    return 0;
+  }
+  let mut msg = balloc(100);
+  let mut k = 0;
+  while k < 100
+    invariant k <= 100 && blen(msg) == 100
+  {
+    bset(&mut msg, k, cast[u8](k + 1));
+    k = k + 1;
+  }
+  let mut d = dma_lend(pool_take(&mut pool, 0));
+  bytes_to_dma(&mut d, 4000, msg, 4, 96);    // ends at the page's last byte
+  assert dma_id(d) == 0;                     // still the same page
+  // The device would answer here; play its part.
+  dma_write8(&mut d, 3999, 200);
+  let mut got = balloc(98);
+  bset(&mut got, 0, 9);
+  bset(&mut got, 97, 9);
+  dma_to_bytes(&mut got, 1, &mut d, 3999, 96);
+  assert bget(got, 0) == 9 && bget(got, 97) == 9;   // outside the range: kept
+  let first = bget(got, 1);
+  let last = bget(got, 96);
+  let f = dma_take(d);
+  assert frame_id(f) == 0;
+  pool_give(&mut pool, f);
+  bfree(msg);
+  bfree(got);
+  if first == 200 && last == 99 {
+    return 42;
+  }
+  return 1;
+}

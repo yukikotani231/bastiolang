@@ -11,6 +11,13 @@ The version is the one in `stage0/Cargo.toml`. A release is a tag `vX.Y.Z` on
 
 ## [Unreleased]
 
+### Language
+
+- Bulk copies proved in bounds, with no run-time checks: `bcopy` and `bmove`
+  between and within `Bytes`, `frame_to_bytes` / `bytes_to_frame` for pages
+  and `dma_to_bytes` / `bytes_to_dma` for lent pages. The prover knows what
+  `bcopy` and `bmove` copy; page contents stay untracked.
+
 ### Added
 
 - Shared pages: `Shared`, one counted reference to a page several page

@@ -182,6 +182,12 @@ fn cg_prelude_pages(out: &mut Vec[u64]) {
   cg_s(&mut out, "static inline void bst_frame_write(bst_frame *f, uint64_t w, uint64_t v) { ((uint64_t *)*f)[w] = v; }\n");
   cg_s(&mut out, "static inline uint64_t bst_frame_read8(bst_frame f, uint64_t o) { return ((unsigned char *)f)[o]; }\n");
   cg_s(&mut out, "static inline void bst_frame_write8(bst_frame *f, uint64_t o, uint64_t v) { ((unsigned char *)*f)[o] = (unsigned char)v; }\n");
+  cg_s(&mut out, "static inline void bst_frame_to_bytes(bst_bytes *dst, uint64_t d, bst_frame f, uint64_t o, uint64_t n) {\n");
+  cg_s(&mut out, "    if (n) bst_copy_fwd(dst->data + d, (const unsigned char *)f + o, n);\n");
+  cg_s(&mut out, "}\n");
+  cg_s(&mut out, "static inline void bst_bytes_to_frame(bst_frame *f, uint64_t o, bst_bytes src, uint64_t s, uint64_t n) {\n");
+  cg_s(&mut out, "    if (n) bst_copy_fwd((unsigned char *)*f + o, src.data + s, n);\n");
+  cg_s(&mut out, "}\n");
   cg_s(&mut out, "static inline bst_pt bst_pt_new(bst_frame f, uint64_t level) {\n");
   cg_s(&mut out, "    uint64_t *e = (uint64_t *)f;\n");
   cg_s(&mut out, "    bst_zero_page(f);      /* f may be a page that held data, not a fresh one */\n");
@@ -514,6 +520,34 @@ fn cg_prelude_bytes(out: &mut Vec[u64]) {
   cg_s(&mut out, "    v->cap = ncap;\n");
   cg_s(&mut out, "}\n");
   cg_s(&mut out, "static inline void bst_bset(bst_bytes *b, uint64_t i, uint64_t v) { b->data[i] = (unsigned char)v; }\n");
+  cg_s(&mut out, "/* Bulk copies. The prover has shown both ranges in bounds, so there are no\n");
+  cg_s(&mut out, " * checks. Kernels are built with -mgeneral-regs-only and no libc, so on\n");
+  cg_s(&mut out, " * x86-64 a forward copy is rep movsq then rep movsb, and nothing here calls\n");
+  cg_s(&mut out, " * memcpy or memmove. */\n");
+  cg_s(&mut out, "static inline void bst_copy_fwd(unsigned char *d, const unsigned char *s, uint64_t n) {\n");
+  cg_s(&mut out, "#if defined(__x86_64__)\n");
+  cg_s(&mut out, "    uint64_t w = n >> 3, r = n & 7;\n");
+  cg_s(&mut out, "    __asm__ volatile (\"rep movsq\" : \"+D\"(d), \"+S\"(s), \"+c\"(w) : : \"memory\");\n");
+  cg_s(&mut out, "    __asm__ volatile (\"rep movsb\" : \"+D\"(d), \"+S\"(s), \"+c\"(r) : : \"memory\");\n");
+  cg_s(&mut out, "#else\n");
+  cg_s(&mut out, "    for (uint64_t k = 0; k < n; k++) d[k] = s[k];\n");
+  cg_s(&mut out, "#endif\n");
+  cg_s(&mut out, "}\n");
+  cg_s(&mut out, "/* Highest byte first, for an overlapping move to a higher address. Not\n");
+  cg_s(&mut out, " * std + rep movsb: an interrupt taken while the direction flag is set would\n");
+  cg_s(&mut out, " * run its handler with it set. The empty asm keeps the compiler from\n");
+  cg_s(&mut out, " * turning the loop into a call to memmove. */\n");
+  cg_s(&mut out, "static inline void bst_copy_back(unsigned char *d, const unsigned char *s, uint64_t n) {\n");
+  cg_s(&mut out, "    while (n > 0) { n--; d[n] = s[n]; __asm__ volatile (\"\" : : : \"memory\"); }\n");
+  cg_s(&mut out, "}\n");
+  cg_s(&mut out, "static inline void bst_bcopy(bst_bytes *dst, uint64_t d, bst_bytes src, uint64_t s, uint64_t n) {\n");
+  cg_s(&mut out, "    if (n) bst_copy_fwd(dst->data + d, src.data + s, n);\n");
+  cg_s(&mut out, "}\n");
+  cg_s(&mut out, "static inline void bst_bmove(bst_bytes *b, uint64_t d, uint64_t s, uint64_t n) {\n");
+  cg_s(&mut out, "    if (n == 0) return;\n");
+  cg_s(&mut out, "    if (d <= s || d - s >= n) bst_copy_fwd(b->data + d, b->data + s, n);\n");
+  cg_s(&mut out, "    else bst_copy_back(b->data + d, b->data + s, n);\n");
+  cg_s(&mut out, "}\n");
   cg_s(&mut out, "static bst_bytes bst_bfrom(bst_str s) {\n");
   cg_s(&mut out, "    bst_bytes b = bst_balloc(s.len);\n");
   cg_s(&mut out, "    for (uint64_t i = 0; i < s.len; i++) b.data[i] = s.data[i];\n");
@@ -555,6 +589,18 @@ fn cg_prelude_dma(out: &mut Vec[u64]) {
   cg_s(&mut out, "    static inline uint64_t bst_dma_read##w(bst_dma *d, uint64_t o) { return *(volatile t *)(uintptr_t)(*d + o); } \\\n");
   cg_s(&mut out, "    static inline void bst_dma_write##w(bst_dma *d, uint64_t o, uint64_t v) { *(volatile t *)(uintptr_t)(*d + o) = (t)v; }\n");
   cg_s(&mut out, "BST_DMA_RW(8, uint8_t) BST_DMA_RW(16, uint16_t) BST_DMA_RW(32, uint32_t) BST_DMA_RW(64, uint64_t)\n");
+  cg_s(&mut out, "/* A copy to or from a lent page is a compiler barrier on both sides, so it\n");
+  cg_s(&mut out, " * stays in order with the volatile accesses around it. */\n");
+  cg_s(&mut out, "static inline void bst_dma_to_bytes(bst_bytes *dst, uint64_t d, bst_dma *m, uint64_t o, uint64_t n) {\n");
+  cg_s(&mut out, "    __asm__ volatile (\"\" : : : \"memory\");\n");
+  cg_s(&mut out, "    if (n) bst_copy_fwd(dst->data + d, (const unsigned char *)(uintptr_t)(*m + o), n);\n");
+  cg_s(&mut out, "    __asm__ volatile (\"\" : : : \"memory\");\n");
+  cg_s(&mut out, "}\n");
+  cg_s(&mut out, "static inline void bst_bytes_to_dma(bst_dma *m, uint64_t o, bst_bytes src, uint64_t s, uint64_t n) {\n");
+  cg_s(&mut out, "    __asm__ volatile (\"\" : : : \"memory\");\n");
+  cg_s(&mut out, "    if (n) bst_copy_fwd((unsigned char *)(uintptr_t)(*m + o), src.data + s, n);\n");
+  cg_s(&mut out, "    __asm__ volatile (\"\" : : : \"memory\");\n");
+  cg_s(&mut out, "}\n");
 }
 
 fn cg_prelude_mmio_hosted(out: &mut Vec[u64]) {
