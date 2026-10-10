@@ -67,7 +67,7 @@ pub fn emit(p: &Program, target: Target) -> String {
         bodies.push_str("}\n\n");
     }
     let mut out = String::new();
-    for part in prelude_parts(target) {
+    for (_, part) in prelude_parts(target) {
         out.push_str(part);
     }
     out.push_str(&struct_decls(p));
@@ -1001,11 +1001,53 @@ impl<'a> Gen<'a> {
 
 /// The full prelude for a target (the page and CPU parts are spliced in here
 /// so each piece above stays readable on its own).
-pub fn prelude_parts(target: Target) -> Vec<&'static str> {
+/// Each part is named, so `--trusted-base` can list them.
+pub fn prelude_parts(target: Target) -> Vec<(&'static str, &'static str)> {
     match target {
-        // POSIX for the child-process functions; set before any header.
-        Target::Hosted => vec!["#define _POSIX_C_SOURCE 200809L\n", PRELUDE_COMMON, PRELUDE_HOSTED, PRELUDE_BYTES, "#define BST_PT_NEW_HOOK (void)level;\n", PRELUDE_PAGES, PRELUDE_CHILD],
-        Target::Kernel => vec![PRELUDE_COMMON, PRELUDE_KERNEL, PRELUDE_BYTES_ARENA, PRELUDE_BYTES, PRELUDE_PAGES, PRELUDE_KERNEL_CPU],
-        Target::User => vec![PRELUDE_COMMON, PRELUDE_USER, PRELUDE_BYTES_ARENA, PRELUDE_BYTES],
+        Target::Hosted => vec![
+            // POSIX for the child-process functions; set before any header.
+            ("posix", "#define _POSIX_C_SOURCE 200809L\n"),
+            ("common", PRELUDE_COMMON),
+            ("hosted", PRELUDE_HOSTED),
+            ("bytes", PRELUDE_BYTES),
+            ("pt_hook_hosted", "#define BST_PT_NEW_HOOK (void)level;\n"),
+            ("pages", PRELUDE_PAGES),
+            ("child", PRELUDE_CHILD),
+        ],
+        Target::Kernel => vec![
+            ("common", PRELUDE_COMMON),
+            ("kernel", PRELUDE_KERNEL),
+            ("bytes_arena", PRELUDE_BYTES_ARENA),
+            ("bytes", PRELUDE_BYTES),
+            ("pages", PRELUDE_PAGES),
+            ("kernel_cpu", PRELUDE_KERNEL_CPU),
+        ],
+        Target::User => vec![("common", PRELUDE_COMMON), ("user", PRELUDE_USER), ("bytes_arena", PRELUDE_BYTES_ARENA), ("bytes", PRELUDE_BYTES)],
     }
+}
+
+/// The hand-written trusted base, listed and counted (ROADMAP invariant 3):
+/// every prelude part with its count of non-blank lines, the parts each
+/// target links, and every builtin with where it is available. The output
+/// is checked into `tests/trusted_base.txt`, so any growth shows up in a
+/// diff for review.
+pub fn trusted_base() -> String {
+    let mut out = String::from("# The trusted base of bastioc0 (ROADMAP invariant 3). Regenerate with\n# `bastioc0 --trusted-base > tests/trusted_base.txt` and review the diff.\n");
+    let lines = |s: &str| s.lines().filter(|l| !l.trim().is_empty()).count();
+    let mut seen: Vec<&str> = Vec::new();
+    for (tn, t) in [("hosted", Target::Hosted), ("kernel", Target::Kernel), ("user", Target::User)] {
+        let parts = prelude_parts(t);
+        let total: usize = parts.iter().map(|p| lines(p.1)).sum();
+        out.push_str(&format!("target {}: {} prelude lines ({})\n", tn, total, parts.iter().map(|p| p.0).collect::<Vec<_>>().join(" ")));
+        for (n, s) in parts {
+            if !seen.contains(&n) {
+                seen.push(n);
+                out.push_str(&format!("  prelude {}: {} lines\n", n, lines(s)));
+            }
+        }
+    }
+    for (name, avail) in crate::check::builtin_list() {
+        out.push_str(&format!("builtin {} ({})\n", name, avail));
+    }
+    out
 }

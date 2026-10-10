@@ -42,6 +42,14 @@ if grep -q 'v_b.data\[v_i\]' "$tmp/z.c" && ! sed -n '/^static uint64_t f_sum/,/^
 else
   echo "FAIL zero-overhead: generated C for sum() is not a plain loop"; fail=$((fail+1))
 fi
+# The trusted base is listed and counted (ROADMAP invariant 3): a change to
+# it must come with an updated tests/trusted_base.txt, so it shows in review.
+if "$BASTIOC" --trusted-base | diff -u tests/trusted_base.txt - >"$tmp/tb.diff"; then
+  pass=$((pass+1))
+else
+  echo "FAIL trusted base changed; review it, then: $BASTIOC --trusted-base > tests/trusted_base.txt"
+  sed 's/^/    /' "$tmp/tb.diff"; fail=$((fail+1))
+fi
 # Runtime cross-check: every passing program also runs clean under
 # AddressSanitizer + UBSan (out-of-bounds, use-after-free, leaks, overflow).
 # This is a test of the prover, not part of the language: the shipped code

@@ -8,6 +8,7 @@
 //   --check     stop after verification
 //   --emit-c    write the generated C to `out` instead of building
 //   --dump-smt  print every query sent to the solver
+//   --trusted-base  list and count the hand-written trusted base, then exit
 //   --target    `hosted` (default): a normal program on the C library
 //               `kernel`: freestanding C for a bare-metal x86-64 kernel (implies --emit-c)
 //               `user`: freestanding C for a user program under BastiOS (implies --emit-c)
@@ -114,6 +115,10 @@ fn main() {
             "--check" => check_only = true,
             "--emit-c" => emit_c = true,
             "--dump-smt" => dump_smt = true,
+            "--trusted-base" => {
+                print!("{}", codegen::trusted_base());
+                return;
+            }
             "--target" => {
                 i += 1;
                 target = match args.get(i).map(|s| s.as_str()) {

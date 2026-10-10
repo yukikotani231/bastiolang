@@ -19,7 +19,7 @@ Never copy test counts into prose: they go stale (a lesson from fz). Count the r
 
 - When adding a guarantee, add a program to `tests/fail/` that breaks it and check that it is rejected with the right error code.
 - Never get safety by adding runtime checks to generated code (the zero-overhead rule). Get it from a proof.
-- Growing the trusted base (Z3, the C compiler, the runtime prelude) follows invariant 3 in ROADMAP.md.
+- Growing the trusted base (Z3, the C compiler, the runtime prelude) follows invariant 3 in ROADMAP.md: regenerate `tests/trusted_base.txt` with `bastioc0 --trusted-base` and say in the PR what grew and why.
 
 ## Commits
 
