@@ -58,6 +58,9 @@ struct Checker {
   /// The variables in scope, innermost last.
   vars: Vec[Var],
   moved: Vec[u64],
+  /// Where places were consumed, as pairs (place, node), latest last, for
+  /// the note under a later use (stage0's `moved_at`).
+  mlocs: Vec[u64],
   /// The variables bound by enclosing `forall`s (their nodes).
   bound: Vec[u64],
   target: u64,
@@ -119,6 +122,7 @@ fn checker_free(c: Checker) {
   vec_free(c.paths);
   vec_free(c.vars);
   vec_free(c.moved);
+  vec_free(c.mlocs);
   vec_free(c.bound);
   vec_free(c.int_ops);
   vec_free(c.calls);
@@ -162,7 +166,7 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   vec_push(&mut paths, Path { up: 0, s: 0, e: 0 });
   let mut c = Checker {
     bs: vec_new[Bsig](), ghosts: vec_new[Ghost](), fstart: vec_new[u64](), ftys: vec_new[u64](),
-    paths: paths, vars: vec_new[Var](), moved: vec_new[u64](), bound: vec_new[u64](),
+    paths: paths, vars: vec_new[Var](), moved: vec_new[u64](), mlocs: vec_new[u64](), bound: vec_new[u64](),
     target: target, ret: un, env: 0, spec_lim: 0, spec_pos: 0, tu64: u, tbool: b, tunit: un, tstr: st,
     failed: false, efile: 0, eline: 0, ecol: 0, ecode: 0, emsg: vec_new[u64](), enotes: vec_new[u64](), int_ops: vec_new[IntOp](),
     calls: vec_new[Edge](), lsites: vec_new[LockSite](), nparams: 0, inv: false, old_only: false
@@ -1272,6 +1276,7 @@ fn path_type(c: &mut Checker, m: &Mono, p: &Parser, k: u64, loc: u64) -> u64 {
         cm_s(&mut c, "unknown variable `");
         cm_src(&mut c, p, x.s, x.e);
         cm_s(&mut c, "`");
+        sg_var(&mut c, p, x.s, x.e);
       }
       return 0;
     }
@@ -1326,6 +1331,7 @@ fn use_place(c: &mut Checker, m: &Mono, p: &Parser, k: u64, loc: u64) -> u64 {
         cm_place(&mut c, p, pm);
         cm_s(&mut c, "` was consumed");
       }
+      cm_note_consumed(&mut c, p, pm);
     }
     return 0;
   }
@@ -1349,8 +1355,203 @@ fn use_place(c: &mut Checker, m: &Mono, p: &Parser, k: u64, loc: u64) -> u64 {
       return 0;
     }
     mark(&mut c, k);
+    vec_push(&mut c.mlocs, k);
+    vec_push(&mut c.mlocs, loc);
   }
   return t;
+}
+
+// ---- "did you mean" (stage0's `did_you_mean`) ----
+
+fn sg_span(out: &mut Vec[u64], p: &Parser, s: u64, e: u64) {
+  if s <= e && e <= blen(p.src) {
+    let mut k = s;
+    while k < e
+      invariant e <= blen(p.src)
+    {
+      vec_push(&mut out, cast[u64](bget(p.src, k)));
+      k = k + 1;
+    }
+  }
+}
+
+fn sg_str(out: &mut Vec[u64], w: Str) {
+  let mut k = 0;
+  while k < slen(w)
+    invariant k <= slen(w)
+  {
+    vec_push(&mut out, cast[u64](sget(w, k)));
+    k = k + 1;
+  }
+}
+
+/// The number of single-byte insertions, deletions and substitutions that
+/// turn `a` into `b`. Names are short, so the counts cannot wrap.
+fn sg_dist(a: &Vec[u64], b: &Vec[u64]) -> u64 {
+  let mut row = vec_new[u64]();
+  let mut j = 0;
+  while j <= vec_len(b)
+    invariant j <= vlen(b) + 1 && vlen(row) == j
+  {
+    vec_push(&mut row, j);
+    j = j + 1;
+  }
+  let mut i = 0;
+  while i < vec_len(a)
+    invariant vlen(row) == vlen(b) + 1
+  {
+    let mut diag = vec_get(row, 0);
+    vec_set(&mut row, 0, wrap_add(i, 1));
+    let mut k = 0;
+    while k < vec_len(b)
+      invariant vlen(row) == vlen(b) + 1 && i < vlen(a)
+    {
+      let up = vec_get(row, k + 1);
+      let mut best = diag;
+      if vec_get(a, i) != vec_get(b, k) {
+        best = wrap_add(diag, 1);
+      }
+      if wrap_add(up, 1) < best {
+        best = wrap_add(up, 1);
+      }
+      if wrap_add(vec_get(row, k), 1) < best {
+        best = wrap_add(vec_get(row, k), 1);
+      }
+      vec_set(&mut row, k + 1, best);
+      diag = up;
+      k = k + 1;
+    }
+    i = i + 1;
+  }
+  let d = vec_get(row, vec_len(b));
+  vec_free(row);
+  return d;
+}
+
+/// Is `a` before `b` in byte order?
+fn sg_less(a: &Vec[u64], b: &Vec[u64]) -> bool {
+  let mut k = 0;
+  while k < vec_len(a) && k < vec_len(b) {
+    if vec_get(a, k) != vec_get(b, k) {
+      return vec_get(a, k) < vec_get(b, k);
+    }
+    k = k + 1;
+  }
+  return vec_len(a) < vec_len(b);
+}
+
+/// Candidate `cand` for the unknown name `want`: kept in `best` when it is
+/// within the limit and closer, or as close and earlier, than the best so
+/// far, whose distance `bd` is returned updated (`U64_MAX`: none yet).
+fn sg_try(best: &mut Vec[u64], bd: u64, want: &Vec[u64], cand: Vec[u64]) -> u64 {
+  let mut limit = 2;
+  if vec_len(want) <= 4 {
+    limit = 1;
+  }
+  let d = sg_dist(want, cand);
+  if d <= limit && (d < bd || (d == bd && sg_less(cand, best))) {
+    while vec_len(best) > 0 {
+      vec_pop(&mut best);
+    }
+    let mut k = 0;
+    while k < vec_len(cand) {
+      vec_push(&mut best, vec_get(cand, k));
+      k = k + 1;
+    }
+    vec_free(cand);
+    return d;
+  }
+  vec_free(cand);
+  return bd;
+}
+
+/// The hint "did you mean `x`?" when a candidate was found.
+fn sg_note(c: &mut Checker, best: Vec[u64], bd: u64) {
+  if bd != U64_MAX {
+    let msg = c.emsg;
+    c.emsg = vec_new[u64]();
+    cm_s(&mut c, "  = did you mean `");
+    let mut k = 0;
+    while k < vec_len(best) {
+      vec_push(&mut c.emsg, vec_get(best, k));
+      k = k + 1;
+    }
+    cm_s(&mut c, "`?\n");
+    cm_take_note(&mut c, msg);
+  }
+  vec_free(best);
+}
+
+/// The hint under "unknown variable `s..e`": the closest variable in scope.
+fn sg_var(c: &mut Checker, p: &Parser, s: u64, e: u64) {
+  let mut want = vec_new[u64]();
+  sg_span(&mut want, p, s, e);
+  let mut best = vec_new[u64]();
+  let mut bd = U64_MAX;
+  let mut k = 0;
+  while k < vec_len(c.vars) {
+    let v = vec_get(c.vars, k);
+    let mut cand = vec_new[u64]();
+    sg_span(&mut cand, p, v.s, v.e);
+    bd = sg_try(&mut best, bd, want, cand);
+    k = k + 1;
+  }
+  vec_free(want);
+  sg_note(&mut c, best, bd);
+}
+
+/// The hint under "unknown function `s..e`": the closest builtin or
+/// function that is not generic.
+fn sg_fn(c: &mut Checker, p: &Parser, s: u64, e: u64) {
+  let mut want = vec_new[u64]();
+  sg_span(&mut want, p, s, e);
+  let mut best = vec_new[u64]();
+  let mut bd = U64_MAX;
+  let mut k = 0;
+  while k < vec_len(c.bs) {
+    let b = bs_at(c, k);
+    let mut cand = vec_new[u64]();
+    sg_str(&mut cand, b.name);
+    bd = sg_try(&mut best, bd, want, cand);
+    k = k + 1;
+  }
+  let mut f = p.fns.head;
+  while f != 0 {
+    let n = node_at(p.nodes, f);
+    if n.v == 0 {
+      let mut cand = vec_new[u64]();
+      sg_span(&mut cand, p, n.s, n.e);
+      bd = sg_try(&mut best, bd, want, cand);
+    }
+    f = n.next;
+  }
+  vec_free(want);
+  sg_note(&mut c, best, bd);
+}
+
+/// The hint under an error about using place `pm` after it was consumed:
+/// where it was (stage0's `consumed_note`).
+fn cm_note_consumed(c: &mut Checker, p: &Parser, pm: u64) {
+  let mut j = vec_len(c.mlocs);
+  while j >= 2
+    invariant j <= vlen(c.mlocs)
+  {
+    j = j - 2;
+    if vec_get(c.mlocs, j) == pm {
+      let n = node_at(p.nodes, vec_get(c.mlocs, j + 1));
+      let msg = c.emsg;
+      c.emsg = vec_new[u64]();
+      cm_s(&mut c, "  = `");
+      cm_place(&mut c, p, pm);
+      cm_s(&mut c, "` was consumed at ");
+      cm_num(&mut c, n.line);
+      cm_s(&mut c, ":");
+      cm_num(&mut c, n.col);
+      cm_s(&mut c, "\n");
+      cm_take_note(&mut c, msg);
+      return;
+    }
+  }
 }
 
 /// Is nothing left to own at place `k` (of type `t`)? It was moved, or
@@ -1547,6 +1748,7 @@ fn cm_used_after(c: &mut Checker, p: &Parser, loc: u64, k: u64, pm: u64) {
     cm_s(&mut c, "` is used after `");
     cm_place(&mut c, p, pm);
     cm_s(&mut c, "` was consumed");
+    cm_note_consumed(&mut c, p, pm);
   }
 }
 
@@ -1957,6 +2159,9 @@ fn reset(c: &mut Checker, ret: u64, env: u64) {
     vec_pop(&mut c.vars);
   }
   set_moved(&mut c, vec_new[u64]());
+  while vec_len(c.mlocs) > 0 {
+    vec_pop(&mut c.mlocs);
+  }
   while vec_len(c.bound) > 0 {
     vec_pop(&mut c.bound);
   }
@@ -2384,6 +2589,7 @@ fn ck_stmt(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> bool {
         cm_s(&mut c, "`: `");
         cm_place(&mut c, p, pm);
         cm_s(&mut c, "` was consumed");
+        cm_note_consumed(&mut c, p, pm);
       }
       return false;
     }
@@ -3081,6 +3287,8 @@ fn cm_unknown_var(c: &mut Checker, p: &Parser, i: u64) {
     cm_s(&mut c, "unknown variable `");
     cm_name(&mut c, p, i);
     cm_s(&mut c, "`");
+    let n = node_at(p.nodes, i);
+    sg_var(&mut c, p, n.s, n.e);
   }
 }
 
@@ -3489,6 +3697,7 @@ fn ck_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
       cm_s(&mut c, "unknown function `");
       cm_name(&mut c, p, i);
       cm_s(&mut c, "`");
+      sg_fn(&mut c, p, s, e);
     }
     return 0;
   }
@@ -4140,11 +4349,13 @@ fn borrow_arg(c: &mut Checker, m: &Mono, p: &Parser, pt: u64, a: u64, bp: &mut V
       return;
     }
   }
-  if prefix_moved(c, pk) != 0 {
+  let brw_moved = prefix_moved(c, pk);
+  if brw_moved != 0 {
     if cm_new(&mut c, p, a, C_USE) {
       cm_s(&mut c, "`");
       cm_place(&mut c, p, pk);
       cm_s(&mut c, "` is borrowed after it was consumed");
+      cm_note_consumed(&mut c, p, brw_moved);
     }
     return;
   }
