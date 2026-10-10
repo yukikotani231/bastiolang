@@ -309,7 +309,7 @@ fn kept_by_builtins(t: &Type, field: &str) -> bool {
 
 /// Builtins whose `&mut` argument keeps the fields above.
 const SHAPE_KEEPING: &[&str] =
-    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pt_borrow", "pt_borrow_frame", "pt_lease_count", "pool_take", "pool_give", "frame_write", "frame_write8", "cpu_set", "cpu_run", "cpu_idle", "cpu_fpu_save", "cpu_fpu_load",
+    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pt_borrow", "pt_borrow_frame", "pt_lease_count", "pool_take", "pool_give", "frame_write", "frame_write8", "bcopy", "bmove", "frame_to_bytes", "bytes_to_frame", "dma_to_bytes", "bytes_to_dma", "cpu_set", "cpu_run", "cpu_idle", "cpu_fpu_save", "cpu_fpu_load",
       "pio_in8", "pio_in16", "pio_in32", "pio_out8", "pio_out16", "pio_out32",
       "mmio_read8", "mmio_read16", "mmio_read32", "mmio_read64", "mmio_write8", "mmio_write16", "mmio_write32", "mmio_write64",
       "dma_read8", "dma_read16", "dma_read32", "dma_read64", "dma_write8", "dma_write16", "dma_write32", "dma_write64"];
@@ -1876,6 +1876,48 @@ impl<'p> Verifier<'p> {
                 }
                 _ => unreachable!(),
             },
+            // Bulk copies. A copied range is a lambda over the old arrays, so
+            // a read of it reduces to a read of the source or the old data.
+            "bcopy" | "bmove" => {
+                let Val::Buf { len, data } = &vals[0] else { unreachable!() };
+                let (src, d, s, n, sk) = if name == "bcopy" { (&vals[2], vals[1].term(), vals[3].term(), vals[4].term(), 2) } else { (&vals[0], vals[1].term(), vals[2].term(), vals[3].term(), 0) };
+                let Val::Buf { len: slen, data: sdata } = src else { unreachable!() };
+                let (rn, rs) = (ra(if name == "bcopy" { 4 } else { 3 }), ra(if name == "bcopy" { 3 } else { 2 }));
+                self.need(st, format!("(<= (+ {} {}) {})", d, n, len), pos, "E-VERIFY-BOUNDS",
+                    format!("that the destination `{}` .. `{} + {}` is within `{}` (`{} + {} <= blen({})`)", ra(1), ra(1), rn, ra(0), ra(1), rn, ra(0)))?;
+                self.need(st, format!("(<= (+ {} {}) {})", s, n, slen), pos, "E-VERIFY-BOUNDS",
+                    format!("that the source `{}` .. `{} + {}` is within `{}` (`{} + {} <= blen({})`)", rs, rs, rn, ra(sk), rs, rn, ra(sk)))?;
+                let inr = format!("(and (<= {d} k) (< k (+ {d} {n})))");
+                let nd = format!("(lambda ((k Int)) (ite {} (select {} (+ {} (- k {}))) (select {} k)))", inr, sdata, s, d, data);
+                self.put_back(&args[0], Val::Buf { len: len.clone(), data: nd }, st);
+                Ok(Val::Unit)
+            }
+            // From a page into bytes: what the page holds is not tracked, so
+            // the copied range of the destination becomes unknown.
+            "frame_to_bytes" | "dma_to_bytes" => {
+                let Val::Buf { len, data } = &vals[0] else { unreachable!() };
+                let (d, o, n) = (vals[1].term(), vals[3].term(), vals[4].term());
+                self.need(st, format!("(<= (+ {} {}) 4096)", o, n), pos, "E-VERIFY-BOUNDS",
+                    format!("that `{}` .. `{} + {}` is within the page (`{} + {} <= 4096`)", ra(3), ra(3), ra(4), ra(3), ra(4)))?;
+                self.need(st, format!("(<= (+ {} {}) {})", d, n, len), pos, "E-VERIFY-BOUNDS",
+                    format!("that the destination `{}` .. `{} + {}` is within `{}` (`{} + {} <= blen({})`)", ra(1), ra(1), ra(4), ra(0), ra(1), ra(4), ra(0)))?;
+                let fresh = self.fresh_array(name, "Int")?;
+                let inr = format!("(and (<= {d} k) (< k (+ {d} {n})))");
+                let nd = format!("(lambda ((k Int)) (ite {} (select {} k) (select {} k)))", inr, fresh, data);
+                self.put_back(&args[0], Val::Buf { len: len.clone(), data: nd }, st);
+                Ok(Val::Unit)
+            }
+            // From bytes into a page: the page's contents are not tracked,
+            // and it stays the same page.
+            "bytes_to_frame" | "bytes_to_dma" => {
+                let Val::Buf { len, .. } = &vals[2] else { unreachable!() };
+                let (o, s, n) = (vals[1].term(), vals[3].term(), vals[4].term());
+                self.need(st, format!("(<= (+ {} {}) 4096)", o, n), pos, "E-VERIFY-BOUNDS",
+                    format!("that `{}` .. `{} + {}` is within the page (`{} + {} <= 4096`)", ra(1), ra(1), ra(4), ra(1), ra(4)))?;
+                self.need(st, format!("(<= (+ {} {}) {})", s, n, len), pos, "E-VERIFY-BOUNDS",
+                    format!("that the source `{}` .. `{} + {}` is within `{}` (`{} + {} <= blen({})`)", ra(3), ra(3), ra(4), ra(2), ra(3), ra(4), ra(2)))?;
+                Ok(Val::Unit)
+            }
             "bfrom" => match &vals[0] {
                 Val::Str { len, data } => Ok(Val::Buf { len: len.clone(), data: data.clone() }),
                 _ => unreachable!(),

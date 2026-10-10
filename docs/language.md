@@ -827,6 +827,8 @@ fn main() -> u64 {
 | `blen(b: &Bytes) -> u64` | | Its length |
 | `bget(b: &Bytes, i: u64) -> u8` | `i < blen(b)` | Byte `i` |
 | `bset(b: &mut Bytes, i: u64, v: u8)` | `i < blen(b)` | Sets byte `i` in place |
+| `bcopy(dst: &mut Bytes, d: u64, src: &Bytes, s: u64, n: u64)` | `d + n <= blen(dst)` and `s + n <= blen(src)` | Copies bytes `s .. s+n` of `src` over bytes `d .. d+n` of `dst` in one go. The prover knows the result: byte `d + j` of `dst` is byte `s + j` of `src`, and the rest of `dst` is unchanged. `dst` and `src` are always different buffers (one buffer cannot be lent as `&mut` and `&` at once) |
+| `bmove(b: &mut Bytes, d: u64, s: u64, n: u64)` | `d + n <= blen(b)` and `s + n <= blen(b)` | The same within one buffer; the ranges may overlap (as if bytes `s .. s+n` were copied out first) |
 | `bfree(b: Bytes)` | | Frees `b` |
 | `bfrom(s: Str) -> Bytes` | | A copy of a string literal; the prover knows its bytes |
 | `slen(s: Str) -> u64` | | Length of a string literal |
@@ -958,6 +960,8 @@ Ghost accessors, usable in specifications:
 | `frame_id(f: &Frame) -> u64` | | The page number |
 | `frame_read(f: &Frame, w: u64) -> u64`, `frame_write(f: &mut Frame, w: u64, v: u64)` | `w < 512` | A 64-bit word of the page. Contents are not tracked by the proof |
 | `frame_read8(f: &Frame, o: u64) -> u8`, `frame_write8(f: &mut Frame, o: u64, b: u8)` | `o < 4096` | A byte of the page |
+| `frame_to_bytes(dst: &mut Bytes, d: u64, f: &Frame, o: u64, n: u64)` | `o + n <= 4096` and `d + n <= blen(dst)` | Copies bytes `o .. o+n` of the page over bytes `d .. d+n` of `dst` in one go. The page's contents are not tracked, so those bytes of `dst` become unknown to the proof; the rest stay as they were |
+| `bytes_to_frame(f: &mut Frame, o: u64, src: &Bytes, s: u64, n: u64)` | `o + n <= 4096` and `s + n <= blen(src)` | Copies bytes `s .. s+n` of `src` into the page at `o`. It stays the same page |
 | `pt_new(f: Frame, level: u64) -> PageTable` | `1 <= level <= 5` | Turns a page into an empty table. A level-4 table gets the kernel's map in slot 0 (not owned, never touched) |
 | `pt_free(t: PageTable) -> Frame` | level is not 4; every slot empty | Turns an empty table back into a page |
 | `pt_free_root(m: &Mmu, t: PageTable) -> Frame` | level 4; slots 1-255 empty; `pt_id(t) != mmu_root(m)`; `pt_leases(t) == 0` | Kernel only. The same for a top-level table, which must not be in CR3, here or on another processor |
@@ -1136,8 +1140,10 @@ fn main(win: &mut MmioSpace) -> u64 {
 | `dma_addr(d: &Dma) -> u64` | | The page's physical address, to program into a device. Only a lent page's address can be read |
 | `dma_read8` / `16` / `32` / `64(d: &mut Dma, off: u64) -> u8` / `u16` / `u32` / `u64` | `off + width <= 4096`; `off` is a multiple of the width | One volatile load |
 | `dma_write8` / `16` / `32` / `64(d: &mut Dma, off: u64, v: u8` / `u16` / `u32` / `u64)` | the same | One volatile store |
+| `dma_to_bytes(dst: &mut Bytes, d: u64, m: &mut Dma, o: u64, n: u64)` | `o + n <= 4096` and `d + n <= blen(dst)` | Copies bytes `o .. o+n` of the page over bytes `d .. d+n` of `dst`, as `frame_to_bytes`; those bytes become unknown to the proof. The copy is a compiler barrier on both sides |
+| `bytes_to_dma(m: &mut Dma, o: u64, src: &Bytes, s: u64, n: u64)` | `o + n <= 4096` and `s + n <= blen(src)` | Copies bytes `s .. s+n` of `src` into the page at `o`, as `bytes_to_frame`, with the same barriers |
 
-What is proved: while a page is lent it cannot go back to the pool, into a page table or into anything else that takes a `Frame`, so a device can never write a page that has been reused; the CPU reaches it only with volatile, aligned, in-bounds accesses, so the C compiler cannot cache or tear what the device sees; and a `Dma` must be taken back before the program ends (it is linear). What is trusted: that the driver has stopped the device using the page (for example, seen its completion) before `dma_take`, and that the addresses it programs into the device are those of pages it has lent. Devices are outside the proof.
+What is proved: while a page is lent it cannot go back to the pool, into a page table or into anything else that takes a `Frame`, so a device can never write a page that has been reused; the CPU reaches it only with volatile, aligned, in-bounds accesses or with in-bounds bulk copies that are compiler barriers on both sides, so the C compiler cannot cache what the device sees or move an access across a copy (a bulk copy itself may be done in any width, so it suits buffers, not device fields that must not tear); and a `Dma` must be taken back before the program ends (it is linear). What is trusted: that the driver has stopped the device using the page (for example, seen its completion) before `dma_take`, and that the addresses it programs into the device are those of pages it has lent. Devices are outside the proof.
 
 ```bastio
 // expect-exit: 0
