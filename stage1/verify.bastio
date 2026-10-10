@@ -126,6 +126,9 @@ struct Vr {
   t_flimit: u64,
   /// 65536: the number of x86 I/O ports.
   t_plimit: u64,
+  /// The device window a Mmio lies in: physical 0xC000_0000 up to 4 GiB.
+  t_mmio_lo: u64,
+  t_mmio_hi: u64,
   t_poolsize: u64,
   t_zarr: u64,
   t_nobool: u64,
@@ -148,7 +151,7 @@ fn vr_new(m: &mut Mono, p: &Parser) -> Vr {
     pool: vec_new[u64](), tms: tms, targs: vec_new[u64](), vals: vals, kids: vec_new[u64](),
     log: vec_new[Cmd](), counter: 0, obligations: 0, box_depth: 0, cur: 0, env: 0,
     sums: vec_new[SumRow](), sum_start: vec_new[u64](), sum_n: vec_new[u64](),
-    t_true: 0, t_false: 0, t_zero: 0, t_u64max: 0, t_allocmax: 0, t_flimit: 0, t_plimit: 0, t_poolsize: 0,
+    t_true: 0, t_false: 0, t_zero: 0, t_u64max: 0, t_allocmax: 0, t_flimit: 0, t_plimit: 0, t_mmio_lo: 0, t_mmio_hi: 0, t_poolsize: 0,
     t_zarr: 0, t_nobool: 0, t_k: 0, t_255: 0, unit: 0,
     ty_bytes: prim(&mut m, p, TY_BYTES), ty_child: prim(&mut m, p, TY_CHILD), ty_frame: prim(&mut m, p, TY_FRAME),
     ty_pt: prim(&mut m, p, TY_PT), ty_pool: prim(&mut m, p, TY_POOL)
@@ -160,6 +163,8 @@ fn vr_new(m: &mut Mono, p: &Parser) -> Vr {
   v.t_allocmax = num(&mut v, ALLOC_MAX);
   v.t_flimit = num(&mut v, FRAME_LIMIT);
   v.t_plimit = num(&mut v, 65536);
+  v.t_mmio_lo = num(&mut v, 3221225472);
+  v.t_mmio_hi = num(&mut v, 4294967296);
   v.t_poolsize = atom_str(&mut v, "POOLSIZE");
   v.t_zarr = atom_str(&mut v, "((as const (Array Int Int)) 0)");
   v.t_nobool = atom_str(&mut v, "((as const (Array Int Bool)) false)");
@@ -369,6 +374,13 @@ fn push_ty(v: &mut Vr, m: &Mono, p: &Parser, t: u64) {
   else if k == TY_POOL { push_str(&mut v, "Pool"); }
   else if k == TY_MMU { push_str(&mut v, "Mmu"); }
   else if k == TY_CPU { push_str(&mut v, "Cpu"); }
+  else if k == TY_PORTS { push_str(&mut v, "Ports"); }
+  else if k == TY_PORTIO { push_str(&mut v, "PortIo"); }
+  else if k == TY_MMIOSPACE { push_str(&mut v, "MmioSpace"); }
+  else if k == TY_MMIO { push_str(&mut v, "Mmio"); }
+  else if k == TY_U8 { push_str(&mut v, "u8"); }
+  else if k == TY_U16 { push_str(&mut v, "u16"); }
+  else if k == TY_U32 { push_str(&mut v, "u32"); }
   else if k == TY_STRUCT || k == TY_ENUM { push_inst(&mut v, m, p, x.a); }
   else if k == TY_BOX { push_str(&mut v, "Box["); push_ty(&mut v, m, p, x.a); push_str(&mut v, "]"); }
   else if k == TY_VEC { push_str(&mut v, "Vec["); push_ty(&mut v, m, p, x.a); push_str(&mut v, "]"); }
@@ -480,6 +492,37 @@ fn port_range(v: &mut Vr, b: u64, n: u64) -> u64 {
   let end = app2(&mut v, OP_ADD, b, n);
   let hi = app2(&mut v, OP_LT, v.t_k, end);
   return app2(&mut v, OP_AND, lo, hi);
+}
+
+/// The largest value of integer type `t`.
+fn int_max(v: &mut Vr, m: &Mono, t: u64) -> u64 {
+  let k = kind_t(m, t);
+  if k == TY_U8 { return num(&mut v, 255); }
+  if k == TY_U16 { return num(&mut v, 65535); }
+  if k == TY_U32 { return num(&mut v, 4294967295); }
+  return v.t_u64max;
+}
+
+/// 2^width of integer type `t` (2^64 does not fit in a u64, so it is text).
+fn int_mod(v: &mut Vr, m: &Mono, t: u64) -> u64 {
+  let k = kind_t(m, t);
+  if k == TY_U8 { return num(&mut v, 256); }
+  if k == TY_U16 { return num(&mut v, 65536); }
+  if k == TY_U32 { return num(&mut v, 4294967296); }
+  return atom_str(&mut v, "18446744073709551616");
+}
+
+/// The integer type operator node `i` of instance `x` works on.
+fn int_op_ty(c: &Checker, m: &Mono, x: u64, i: u64) -> u64 {
+  let mut k = 0;
+  while k < vec_len(c.int_ops) {
+    let o = vec_get(c.int_ops, k);
+    if o.x == x && o.node == i {
+      return o.ty;
+    }
+    k = k + 1;
+  }
+  return c.tu64;
 }
 
 /// `(not x)`
@@ -783,8 +826,8 @@ fn term(v: &Vr, x: u64) -> u64 {
 fn obj_fields(k: u64) -> u64 {
   if k == TY_PT { return 3; }
   if k == TY_POOL { return 2; }
-  if k == TY_FRAME || k == TY_MMU || k == TY_PORTS { return 1; }
-  if k == TY_PORTIO { return 2; }
+  if k == TY_FRAME || k == TY_MMU || k == TY_PORTS || k == TY_MMIOSPACE { return 1; }
+  if k == TY_PORTIO || k == TY_MMIO { return 2; }
   return 0;
 }
 
@@ -805,6 +848,7 @@ fn g_root(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 0); }     // Mmu
 fn g_free(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 0); }     // Ports
 fn g_base(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 0); }     // PortIo
 fn g_count(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 1); }    // PortIo
+fn g_len(v: &Vr, x: u64) -> u64 { return obj_field(v, x, 1); }      // Mmio
 
 fn mk_obj(v: &mut Vr, m: &Mono, tyx: u64, a: u64, b: u64, c: u64) -> u64 {
   return mk(&mut v, VV_OBJ, tyx, a, b, c, obj_fields(kind_t(m, tyx)));
@@ -813,7 +857,7 @@ fn mk_obj(v: &mut Vr, m: &Mono, tyx: u64, a: u64, b: u64, c: u64) -> u64 {
 /// The sort of ghost field `j` of an object of type kind `k`: an array of
 /// Bool for `used` and `has`, Int otherwise.
 fn obj_field_sort(k: u64, j: u64) -> u64 {
-  if (k == TY_PT && j == 2) || ((k == TY_POOL || k == TY_PORTS) && j == 0) {
+  if (k == TY_PT && j == 2) || ((k == TY_POOL || k == TY_PORTS || k == TY_MMIOSPACE) && j == 0) {
     return SO_BOOL + 2;
   }
   return SO_INT;
@@ -1365,6 +1409,18 @@ fn fresh_field(v: &mut Vr, tk: u64, j: u64, hint: u64) -> u64 {
     let h = cat_str(&mut v, hint, "_has");
     return fresh_array(&mut v, h, SO_BOOL);
   }
+  if tk == TY_MMIOSPACE {
+    let h = cat_str(&mut v, hint, "_free");
+    return fresh_array(&mut v, h, SO_BOOL);
+  }
+  if tk == TY_MMIO {
+    if j == 1 {
+      let h = cat_str(&mut v, hint, "_len");
+      return fresh_int(&mut v, h, v.t_zero, v.t_mmio_hi);
+    }
+    let h = cat_str(&mut v, hint, "_base");
+    return fresh_int(&mut v, h, v.t_mmio_lo, v.t_mmio_hi);
+  }
   if tk == TY_PORTS {
     let h = cat_str(&mut v, hint, "_free");
     return fresh_array(&mut v, h, SO_BOOL);
@@ -1400,7 +1456,7 @@ fn fresh_field(v: &mut Vr, tk: u64, j: u64, hint: u64) -> u64 {
 /// change the object (a page table keeps its id and level).
 fn kept_by_builtins(tk: u64, j: u64) -> bool {
   return ((tk == TY_FRAME || tk == TY_PT) && j == 0) || (tk == TY_PT && j == 1) || (tk == TY_POOL && j == 1)
-    || (tk == TY_PORTIO && j <= 1);
+    || ((tk == TY_PORTIO || tk == TY_MMIO) && j <= 1);
 }
 
 fn fresh_obj(v: &mut Vr, m: &Mono, tyx: u64, hint: u64) -> u64 {
@@ -1412,9 +1468,13 @@ fn fresh_obj(v: &mut Vr, m: &Mono, tyx: u64, hint: u64) -> u64 {
   if n > 0 { f0 = fresh_field(&mut v, tk, 0, hint); }
   if n > 1 { f1 = fresh_field(&mut v, tk, 1, hint); }
   if n > 2 { f2 = fresh_field(&mut v, tk, 2, hint); }
-  if tk == TY_PORTIO {
+  if tk == TY_PORTIO || tk == TY_MMIO {
     let sum = app2(&mut v, OP_ADD, f0, f1);
-    let le = app2(&mut v, OP_LE, sum, v.t_plimit);
+    let mut lim = v.t_plimit;
+    if tk == TY_MMIO {
+      lim = v.t_mmio_hi;
+    }
+    let le = app2(&mut v, OP_LE, sum, lim);
     assert_tm(&mut v, le);
   }
   return mk(&mut v, VV_OBJ, tyx, f0, f1, f2, n);
@@ -1425,6 +1485,11 @@ fn fresh_of(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, tyx: u64, hint: u64) 
   let k = kind_t(m, tyx);
   if k == TY_U64 {
     return fresh_u64(&mut v, hint);
+  }
+  if k == TY_U8 || k == TY_U16 || k == TY_U32 {
+    let max = int_max(&mut v, m, tyx);
+    let t = fresh_int(&mut v, hint, v.t_zero, max);
+    return mk_u(&mut v, t);
   }
   if k == TY_BOOL {
     return fresh_bool(&mut v, hint);
@@ -1946,7 +2011,7 @@ fn vspec_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env: &V
       let qn = node_at(p.nodes, q);
       let pt = base_t(m, conv(&mut m, p, qn.a, 0, q));
       let mut x = 0;
-      if kind_t(m, pt) == TY_U64 {
+      if is_int(m, pt) {
         let t = spec_tm(&mut v, c, &mut m, p, a, env, oenv, has_old, res, &mut bound);
         x = mk_u(&mut v, t);
       } else if kind_t(m, pt) == TY_BOOL {
@@ -1996,9 +2061,15 @@ fn vspec_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env: &V
   if span_is(p, n.s, n.e, "port_count") {
     return g_count(v, x);
   }
-  if span_is(p, n.s, n.e, "pt_used") || span_is(p, n.s, n.e, "pool_has") || span_is(p, n.s, n.e, "port_free") {
+  if span_is(p, n.s, n.e, "mmio_base") {
+    return g_base(v, x);
+  }
+  if span_is(p, n.s, n.e, "mmio_len") {
+    return g_len(v, x);
+  }
+  if span_is(p, n.s, n.e, "pt_used") || span_is(p, n.s, n.e, "pool_has") || span_is(p, n.s, n.e, "port_free") || span_is(p, n.s, n.e, "mmio_free") {
     let mut arr = g_used(v, x);
-    if span_is(p, n.s, n.e, "pool_has") || span_is(p, n.s, n.e, "port_free") {
+    if !span_is(p, n.s, n.e, "pt_used") {
       arr = g_has(v, x);
     }
     let ix = spec_tm(&mut v, c, &mut m, p, arg_node(p, i, 1), env, oenv, has_old, res, &mut bound);
@@ -2024,6 +2095,23 @@ fn eval(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VSta
   let n = node_at(p.nodes, i);
   let k = n.kind;
   if k == E_TAPP {
+    if is_typed_builtin(p, n.b) && !name_is(p, n.b, "vec_new") {
+      // `cast[T](x)` keeps the value and proves it fits; `wrap[T](x)`
+      // reduces it modulo 2^width.
+      let t = conv(&mut m, p, n.a, v.env, i);
+      let inner = node_at(p.nodes, n.b);
+      let xv = eval(&mut v, c, &mut m, p, inner.a, &mut st, 0);
+      let x = term(v, xv);
+      if name_is(p, n.b, "wrap") {
+        let md = int_mod(&mut v, m, t);
+        let r = app2(&mut v, OP_MOD, x, md);
+        return mk_u(&mut v, r);
+      }
+      let max = int_max(&mut v, m, t);
+      let g = app2(&mut v, OP_LE, x, max);
+      prove(&mut v, st, g);
+      return mk_u(&mut v, x);
+    }
     if is_typed_builtin(p, n.b) {
       let t = conv(&mut m, p, n.a, v.env, i);
       let h = atom_str(&mut v, "vec");
@@ -2212,7 +2300,8 @@ fn eval_bin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut 
   let tb = term(v, vb);
   if op == P_PLUS || op == P_STAR {
     let t = app2(&mut v, bin_op(op), ta, tb);
-    let g = app2(&mut v, OP_LE, t, v.t_u64max);
+    let max = int_max(&mut v, m, int_op_ty(c, m, v.env, i));
+    let g = app2(&mut v, OP_LE, t, max);
     prove(&mut v, st, g);
     return mk_u(&mut v, t);
   }
@@ -2320,7 +2409,7 @@ fn vcall(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VSt
   vec_free(lin);
   let mut r = 0;
   if inst == 0 && is_builtin_name(c, p, n.s, n.e) {
-    r = builtin(&mut v, c, &mut m, p, i, args, vals, &mut st);
+    r = vbuiltin(&mut v, c, &mut m, p, i, args, vals, &mut st);
   } else {
     let mut x = inst;
     if x == 0 {
@@ -2468,13 +2557,25 @@ fn all_unused(v: &mut Vr, used: u64, lo: u64, hi: u64) -> u64 {
   return forall_tm(&mut v, v.t_k, imp);
 }
 
-fn builtin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Vec[u64], vals: &Vec[u64], st: &mut VState) -> u64 {
+fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Vec[u64], vals: &Vec[u64], st: &mut VState) -> u64 {
   let x0 = u_at(vals, 0);
   let x1 = u_at(vals, 1);
   let x2 = u_at(vals, 2);
   let a0 = vl_at(v, x0);
   if name_is(p, i, "box") {
     return mk(&mut v, VV_BOXK, 0, x0, 0, 0, 0);
+  }
+  if name_is(p, i, "wrap_add") || name_is(p, i, "wrap_sub") || name_is(p, i, "wrap_mul") {
+    let mut op = OP_MUL;
+    if name_is(p, i, "wrap_add") {
+      op = OP_ADD;
+    } else if name_is(p, i, "wrap_sub") {
+      op = OP_SUB;
+    }
+    let t = app2(&mut v, op, term(v, x0), term(v, x1));
+    let md = int_mod(&mut v, m, int_op_ty(c, m, v.env, i));
+    let r = app2(&mut v, OP_MOD, t, md);
+    return mk_u(&mut v, r);
   }
   if name_is(p, i, "unbox") {
     if a0.kind == VV_BOXK {
@@ -2734,6 +2835,80 @@ fn builtin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Vec
     let np = mk_obj(&mut v, m, a0.ty, nf, 0, 0);
     put_back(&mut v, m, p, &mut st, u_at(args, 0), np);
     return v.unit;
+  }
+  // ---- memory-mapped device registers ----
+  if name_is(p, i, "mmio_claim") {
+    let b = term(v, x1);
+    let n = term(v, x2);
+    let lo = app2(&mut v, OP_LE, v.t_mmio_lo, b);
+    let end = app2(&mut v, OP_ADD, b, n);
+    let hi = app2(&mut v, OP_LE, end, v.t_mmio_hi);
+    let g = app2(&mut v, OP_AND, lo, hi);
+    prove(&mut v, st, g);
+    let inr = port_range(&mut v, b, n);
+    let sel = app2(&mut v, OP_SELECT, g_free(v, x0), v.t_k);
+    let imp = app2(&mut v, OP_IMP, inr, sel);
+    let g2 = forall_tm(&mut v, v.t_k, imp);
+    prove(&mut v, st, g2);
+    let ni = t_not(&mut v, inr);
+    let body = app2(&mut v, OP_AND, sel, ni);
+    let nf = lambda_tm(&mut v, v.t_k, body);
+    let np = mk_obj(&mut v, m, a0.ty, nf, 0, 0);
+    put_back(&mut v, m, p, &mut st, u_at(args, 0), np);
+    return mk_obj(&mut v, m, kind_ty(m, p, TY_MMIO), b, n, 0);
+  }
+  if name_is(p, i, "mmio_release") {
+    let inr = port_range(&mut v, g_base(v, x1), g_len(v, x1));
+    let sel = app2(&mut v, OP_SELECT, g_free(v, x0), v.t_k);
+    let body = app2(&mut v, OP_OR, sel, inr);
+    let nf = lambda_tm(&mut v, v.t_k, body);
+    let np = mk_obj(&mut v, m, a0.ty, nf, 0, 0);
+    put_back(&mut v, m, p, &mut st, u_at(args, 0), np);
+    return v.unit;
+  }
+  if name_is(p, i, "mmio_base") {
+    return mk_u(&mut v, g_base(v, x0));
+  }
+  if name_is(p, i, "mmio_len") {
+    return mk_u(&mut v, g_len(v, x0));
+  }
+  if name_is(p, i, "mmio_read8") || name_is(p, i, "mmio_read16") || name_is(p, i, "mmio_read32") || name_is(p, i, "mmio_read64")
+    || name_is(p, i, "mmio_write8") || name_is(p, i, "mmio_write16") || name_is(p, i, "mmio_write32") || name_is(p, i, "mmio_write64") {
+    let mut bytes = 8;
+    let mut max = U64_MAX;
+    if name_is(p, i, "mmio_read8") || name_is(p, i, "mmio_write8") {
+      bytes = 1;
+      max = 255;
+    } else if name_is(p, i, "mmio_read16") || name_is(p, i, "mmio_write16") {
+      bytes = 2;
+      max = 65535;
+    } else if name_is(p, i, "mmio_read32") || name_is(p, i, "mmio_write32") {
+      bytes = 4;
+      max = 4294967295;
+    }
+    let off = term(v, x1);
+    let tb = num(&mut v, bytes);
+    let end = app2(&mut v, OP_ADD, off, tb);
+    let g = app2(&mut v, OP_LE, end, g_len(v, x0));
+    prove(&mut v, st, g);
+    // Devices want naturally aligned accesses (and an unaligned one could
+    // straddle into the next register).
+    let addr = app2(&mut v, OP_ADD, g_base(v, x0), off);
+    let md = app2(&mut v, OP_MOD, addr, tb);
+    let g2 = app2(&mut v, OP_EQ, md, v.t_zero);
+    prove(&mut v, st, g2);
+    let tm = num(&mut v, max);
+    if name_is(p, i, "mmio_write8") || name_is(p, i, "mmio_write16") || name_is(p, i, "mmio_write32") || name_is(p, i, "mmio_write64") {
+      let g3 = app2(&mut v, OP_LE, term(v, x2), tm);
+      prove(&mut v, st, g3);
+      return v.unit;
+    }
+    let n = node_at(p.nodes, i);
+    let h = atom_src(&mut v, p, n.s, n.e);
+    let r = fresh_u64(&mut v, h);
+    let le = app2(&mut v, OP_LE, term(v, r), tm);
+    vec_push(&mut st.pc, le);
+    return r;
   }
   if name_is(p, i, "port_base") {
     return mk_u(&mut v, g_base(v, x0));
@@ -3359,7 +3534,9 @@ fn shape_keeping(p: &Parser, i: u64) -> bool {
     || name_is(p, i, "pool_take") || name_is(p, i, "pool_give") || name_is(p, i, "frame_write")
     || name_is(p, i, "frame_write8") || name_is(p, i, "cpu_set") || name_is(p, i, "cpu_run") || name_is(p, i, "cpu_idle")
     || name_is(p, i, "cpu_fpu_save") || name_is(p, i, "cpu_fpu_load") || name_is(p, i, "pio_in8") || name_is(p, i, "pio_in16")
-    || name_is(p, i, "pio_in32") || name_is(p, i, "pio_out8") || name_is(p, i, "pio_out16") || name_is(p, i, "pio_out32");
+    || name_is(p, i, "pio_in32") || name_is(p, i, "pio_out8") || name_is(p, i, "pio_out16") || name_is(p, i, "pio_out32")
+    || name_is(p, i, "mmio_read8") || name_is(p, i, "mmio_read16") || name_is(p, i, "mmio_read32") || name_is(p, i, "mmio_read64")
+    || name_is(p, i, "mmio_write8") || name_is(p, i, "mmio_write16") || name_is(p, i, "mmio_write32") || name_is(p, i, "mmio_write64");
 }
 
 /// Places deeper than this many parts are summarized by their prefix of
@@ -3671,9 +3848,14 @@ fn verify_fn(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
       } else if bk == TY_MMU {
         let eq = app2(&mut v, OP_EQ, g_root(v, y), v.t_flimit);
         vec_push(&mut st.pc, eq);
-      } else if bk == TY_PORTS {
+      } else if bk == TY_PORTS || bk == TY_MMIOSPACE {
         let sel = app2(&mut v, OP_SELECT, g_free(v, y), v.t_k);
-        let r = all_ports(&mut v);
+        let mut r = all_ports(&mut v);
+        if bk == TY_MMIOSPACE {
+          let a = app2(&mut v, OP_LE, v.t_mmio_lo, v.t_k);
+          let b = app2(&mut v, OP_LT, v.t_k, v.t_mmio_hi);
+          r = app2(&mut v, OP_AND, a, b);
+        }
         let eq = app2(&mut v, OP_EQ, sel, r);
         let all = forall_tm(&mut v, v.t_k, eq);
         vec_push(&mut st.pc, all);
