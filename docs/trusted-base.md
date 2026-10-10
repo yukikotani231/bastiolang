@@ -22,7 +22,7 @@ BastiOS has its own trusted base on top of this one (boot code, processor startu
 | The C compiler and linker | Translate the generated C as C11 says, including the memory model for `Lock` and `Atomic` | The default backend writes C. The generated C has no undefined behavior that the proofs do not rule out: no overflow, no out-of-bounds access, a fixed evaluation order (`operands()` in `stage0/src/codegen.rs` hoists side effects into temporaries). Converting an out-of-range value to a signed type is implementation-defined in C and modular in GCC and Clang; `wrap` to a signed type relies on that ([integers.md](integers.md)) |
 | The C library (hosted target only) | `calloc`, `stdio`, `fork`/`exec`/pipes for `Child`, and pthreads | Hosted programs run on an operating system anyway |
 
-The native backend (`--backend native`, hosted only, experimental) writes x86-64 assembly instead of C, which takes the C compiler out of the trusted base for the program's own code. The assembler and linker stay.
+The native backend (`--backend native`, hosted only, experimental) writes x86-64 assembly instead of C, which takes the C compiler out of the trusted base for the program's own code. The assembler and linker stay. stage1's port of it (`stage1/x86.bastio`) also builds BastiOS user programs, with no C at all: neither the compiler nor the C library.
 
 ## 2. Runtime preludes
 
@@ -43,7 +43,7 @@ Each target links in a hand-written C prelude, emitted at the top of every gener
 | `user` | user | System call stubs (`int 0x80`), buffered console, the 64 KiB arena | The kernel's ABI |
 | `posix` | hosted | `_POSIX_C_SOURCE` | Needed before any header |
 
-The native backend has its own runtime in assembly (`RUNTIME` in `stage0/src/x86.rs`), also listed and counted: printing, the console and the allocator, over the C library.
+The native backend has its own runtime in assembly (`RUNTIME` in `stage0/src/x86.rs`), also listed and counted: printing, the console and the allocator, over the C library. stage1's backend adds routines for `Child`, `host_env`, `host_cpus` and the simulated devices (`x86_runtime1`), and for user programs it replaces the whole runtime with one over the kernel's system calls (`x86_runtime_user`, about 200 lines: the `user` and `bytes_arena` parts in assembly).
 
 The compiler also generates small helpers for each `Box` and `Vec` element type and a thunk per `smp_run` call. Those are part of the compiler (section 1), not of the listing.
 
