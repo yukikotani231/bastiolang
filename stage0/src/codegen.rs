@@ -561,6 +561,20 @@ extern uint64_t bst_cpu_enter(void);   /* enter user mode; returns the trap vect
 extern uint64_t bst_cpu_wait(void);    /* sti; hlt; cli; returns the interrupt vector */
 static inline uint64_t bst_cpu_get(bst_cpu c, uint64_t r) { (void)c; return bst_cpu_ctx[r]; }
 static inline void bst_cpu_set(bst_cpu *c, uint64_t r, uint64_t v) { (void)c; bst_cpu_ctx[r] = v; }
+/* The user's x87/SSE state, in a page the kernel owns (the platform has
+ * enabled CR4.OSFXSR). fxrstor faults on reserved MXCSR bits, so the load
+ * works from a copy with only the defined bits (0-15) kept. */
+static inline void bst_cpu_fpu_save(bst_cpu *c, bst_frame *f) {
+    (void)c;
+    __asm__ volatile ("fxsave64 (%0)" : : "r"(*f) : "memory");
+}
+static inline void bst_cpu_fpu_load(bst_cpu *c, bst_frame f) {
+    (void)c;
+    uint64_t buf[64] __attribute__((aligned(16)));
+    for (int i = 0; i < 64; i++) buf[i] = ((uint64_t *)f)[i];
+    buf[3] &= 0xFFFF;                   /* bytes 24-27 are MXCSR, 28-31 its mask (ignored) */
+    __asm__ volatile ("fxrstor64 (%0)" : : "r"(buf) : "memory");
+}
 static inline uint64_t bst_cpu_run(bst_cpu *c, bst_mmu m) {
     (void)c; (void)m;
     uint64_t cr3;

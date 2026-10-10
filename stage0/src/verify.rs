@@ -262,7 +262,7 @@ fn kept_by_builtins(t: &Type, field: &str) -> bool {
 
 /// Builtins whose `&mut` argument keeps the fields above.
 const SHAPE_KEEPING: &[&str] =
-    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pool_take", "pool_give", "frame_write", "frame_write8", "cpu_set", "cpu_run", "cpu_idle"];
+    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pool_take", "pool_give", "frame_write", "frame_write8", "cpu_set", "cpu_run", "cpu_idle", "cpu_fpu_save", "cpu_fpu_load"];
 
 #[derive(Clone)]
 struct State {
@@ -1315,6 +1315,9 @@ impl<'p> Verifier<'p> {
                 self.put_back(&args[0], Val::Obj(Type::Mmu, vec![KROOT.into()]), st);
                 Ok(Val::Unit)
             }
+            // The page's contents are not tracked, so neither changes anything
+            // the proof knows about.
+            "cpu_fpu_save" | "cpu_fpu_load" => Ok(Val::Unit),
             "cpu_run" | "cpu_idle" => {
                 let v = self.fresh_u64("vector")?;
                 st.pc.push(format!("(<= {} 255)", v.term()));
