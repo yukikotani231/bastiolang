@@ -6,6 +6,7 @@
 //
 // usage: bastioc1 [--check] [--emit-c] [--target T] [--header F] [-o out] <file.bastio>...
 //   (default)   verify, then build a native executable `out` (default: a.out)
+//               with the C compiler `$CC` (default: cc)
 //   --check     stop after verification
 //   --emit-c    write the generated C to `out` (default: out.c) instead of
 //               building
@@ -329,7 +330,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
         let mut v = vr_new(&mut m, p);
         verify_program(&mut v, c, &mut m, p);
         let mut rep = vec_new[u64]();
-        if !solve(&mut v, m, p, host, &mut rep) {
+        if !solve_par(&mut v, m, p, host, &mut rep, solve_jobs(host)) {
           let n = node_at(p.nodes, v.fail_at);
           let mut code = "E-SOLVER";
           if v.fail_code != 0 {
@@ -411,8 +412,14 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
                 out_str(&mut out, "\n");
                 status = 2;
               } else {
+                // The C compiler: `CC`, as for bastioc0, or `cc`.
+                let mut cc = balloc(0);
+                if !host_env(host, "CC", &mut cc) {
+                  bfree(cc);
+                  cc = bfrom("cc");
+                }
                 let mut argv = vec_new[Bytes]();
-                push_arg(&mut argv, "cc");
+                vec_push(&mut argv, b1_concat(cc, ""));
                 push_arg(&mut argv, "-O2");
                 push_arg(&mut argv, "-std=c11");
                 push_arg(&mut argv, "-w");
@@ -426,12 +433,15 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
                 vec_push(&mut rm, b1_concat(cfile, ""));
                 b1_run(host, rm);
                 if st == 127 {
-                  out_str(&mut out, "bastioc1: cannot run `cc`\n");
+                  out_str(&mut out, "bastioc1: cannot run `");
+                  b1_bytes(&mut out, cc);
+                  out_str(&mut out, "`\n");
                   status = 3;
                 } else if st != 0 {
                   out_str(&mut out, "bastioc1: the C compiler failed (this is a compiler bug)\n");
                   status = 3;
                 }
+                bfree(cc);
               }
               bfree(cfile);
             }
