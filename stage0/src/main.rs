@@ -268,7 +268,7 @@ fn main() {
         print!("{}", dump::program(&prog));
         return;
     }
-    let (n, log) = verify::verify_program(&prog).unwrap_or_else(|d| fail(d));
+    let (n, log) = verify::verify_program(&prog, dump_smt).unwrap_or_else(|d| fail(d));
     if dump_smt {
         for l in &log {
             println!("{}", l);
