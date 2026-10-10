@@ -481,8 +481,8 @@ static inline void bst_pt_put_frame(bst_pt *t, uint64_t i, bst_frame f, bool w) 
 /* What slot i points to, left in place (pt_borrow). */
 static inline uint64_t bst_pt_child(bst_pt t, uint64_t i) { return ((uint64_t *)t)[i] & BST_PTE_ADDR; }
 /* Leases outstanding on each top-level table (mmu_enter, mmu_exit), by page
- * number: a pool has at most 65536 pages. */
-static uint32_t bst_pt_leases[65536];
+ * number: a pool has at most 262144 pages. */
+static uint32_t bst_pt_leases[262144];
 static inline uint64_t bst_pt_lease_count(bst_pt *t) { return __atomic_load_n(&bst_pt_leases[bst_frame_id(*t)], __ATOMIC_ACQUIRE); }
 static inline uint64_t bst_pt_take(bst_pt *t, uint64_t i) {
     uint64_t *e = &((uint64_t *)*t)[i];
@@ -495,7 +495,7 @@ static inline uint64_t bst_pt_take(bst_pt *t, uint64_t i) {
  * reads) each page has, by page number, and a PTE bit the CPU ignores that
  * marks a slot mapping one. The last shared_drop gives the page back. */
 #define BST_PTE_SHARED 0x200ull
-static uint32_t bst_shared_refs[65536];
+static uint32_t bst_shared_refs[262144];
 static inline bst_frame bst_shared_new(bst_frame f) { __atomic_store_n(&bst_shared_refs[bst_frame_id(f)], 1, __ATOMIC_RELEASE); return f; }
 static inline bst_frame bst_shared_dup(bst_frame s) { __atomic_fetch_add(&bst_shared_refs[bst_frame_id(s)], 1, __ATOMIC_RELAXED); return s; }
 static inline uint64_t bst_shared_drop(bst_pool *p, bst_frame s) {
@@ -599,7 +599,7 @@ static void bst_print(uint64_t v) {
 }
 
 /* Physical pages: everything from the end of the kernel image to the end of
- * the RAM that follows it, capped at 2^16 pages and at the 1 GiB the boot
+ * the RAM that follows it, capped at 2^18 pages and at the 1 GiB the boot
  * code identity-maps. With a Multiboot memory map (flags bit 6) that is the
  * run of available entries, merged where they touch, that holds the first
  * page after the kernel: UEFI firmware leaves holes low in memory, where
@@ -633,7 +633,7 @@ static bst_pool bst_pool_init(uint64_t mbi) {
     bst_pool p;
     p.base = base;
     p.size = ram_end > base ? (ram_end - base) / 4096 : 0;
-    if (p.size > 65536) p.size = 65536;
+    if (p.size > 262144) p.size = 262144;
     bst_pool_base = base;
     return p;
 }

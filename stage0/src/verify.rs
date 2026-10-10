@@ -59,10 +59,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 const U64_MAX: &str = "18446744073709551615";
 /// Largest element count `alloc` accepts (2^60): keeps `n * 8` far from overflow.
 const ALLOC_MAX: &str = "1152921504606846976";
-/// Page numbers are below this: 2^16 pages, 256 MiB of physical memory.
-const FRAME_LIMIT: &str = "65536";
+/// Page numbers are below this: 2^18 pages, 1 GiB of physical memory.
+const FRAME_LIMIT: &str = "262144";
 /// `mmu_root` while CR3 holds the kernel's own tables (no Frame has this id).
-const KROOT: &str = "65536";
+const KROOT: &str = "262144";
 /// There is one pool per program, so its size is one global ghost constant.
 /// Every page number is below it: pages only ever come from `pool_take`.
 const POOLSIZE: &str = "POOLSIZE";
