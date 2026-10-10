@@ -13,6 +13,7 @@ Thanks for your interest. Bastio is pre-release: the language changes often, and
 3. Safety comes from a proof, never from a runtime check in the generated code (the zero-overhead rule, ROADMAP invariant 2).
 4. If the trusted base grows (Z3, the C compiler, the runtime preludes), regenerate `tests/trusted_base.txt` with `bastioc0 --trusted-base` and say in the pull request what grew and why (ROADMAP invariant 3).
 5. A change that makes generated code, the compiler or BastiOS measurably slower says so, with numbers (ROADMAP invariant 5).
+6. A change a user would notice (the language, the compilers' options or output, the documentation site) gets a line under `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md).
 
 Don't copy counts (tests, lines, files) into prose; they go stale. Give the command that counts them instead.
 

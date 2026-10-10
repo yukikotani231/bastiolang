@@ -3,7 +3,7 @@
 # and stops at the first failure. Run it before every push: a failure here
 # costs seconds, the same failure in CI costs a run and a notification.
 #
-# Steps whose tools are missing (z3, the tree-sitter CLI, npm) are reported
+# Steps whose tools are missing (z3, the tree-sitter CLI, mdbook, npm) are reported
 # as SKIPPED, not passed; CI still runs them.
 #
 # usage: tests/ci.sh [--bench]    (--bench also runs bench/run.sh)
@@ -32,6 +32,12 @@ if command -v "$ts" >/dev/null; then
   step "tree-sitter grammar"; editors/tree-sitter-bastio/test/parse_all.sh
 else
   skipped+=("tree-sitter grammar (npm install -g tree-sitter-cli@0.25.10)")
+fi
+
+if command -v "${MDBOOK:-mdbook}" >/dev/null; then
+  step "documentation site"; site/build.sh
+else
+  skipped+=("documentation site (no mdbook; see site/README.md)")
 fi
 
 if command -v npm >/dev/null; then

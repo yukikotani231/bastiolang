@@ -891,7 +891,7 @@ Hardware is reached only through capability types. There is no way to read or wr
 | `Cpu` | The CPU's saved user context and the right to enter user mode (kernel only) |
 | `Ports` | The x86 I/O port space: the right to claim each of the 65536 ports, once |
 | `PortIo` | A claimed range of I/O ports, owned: the only way to read or write them |
-| `MmioSpace` | The device window (physical `0xC0000000` up to 4 GiB, which the kernel platform maps uncached): the right to claim each byte of it, once |
+| `MmioSpace` | The device window (physical `0x80000000` up to 4 GiB, which the kernel platform maps uncached; the page pool never reaches it, as it stops at 1 GiB): the right to claim each byte of it, once |
 | `Mmio` | A claimed block of memory-mapped device registers, owned: the only way to read or write them |
 | `Dma` | A page lent to devices for DMA: while lent it is not a `Frame`, so it cannot be freed, mapped or reused |
 
@@ -1000,6 +1000,7 @@ fn main(pool: &mut Pool) -> u64 {
 | `cpu_run(c: &mut Cpu, m: &Mmu) -> u64` | | Runs the saved context in user mode until the next trap; returns its vector (`<= 255`) |
 | `cpu_idle(c: &mut Cpu) -> u64` | | Waits for an interrupt; returns its vector |
 | `cpu_count(c: &Cpu) -> u64` | | Processors the platform has started, this one included: between 1 and 4096 |
+| `boot_fb(c: &Cpu, f: u64) -> u64` | | The linear framebuffer the boot loader set up (Multiboot), if it is 32-bit RGB and ends at or below 4 GiB: `f` 0 its address, 1 bytes per line, 2 width, 3 height, 4 the bit positions of red, green and blue (a byte each). Every field is 0 without one, and below 2^32. Drawing on it still needs an `Mmio` claim of its block |
 | `smp_run(f, args..)` | `f`'s `requires`, also for the other processors (below) | Runs `f(args..)` on every processor at once and returns when all have returned |
 
 `smp_run(f, args..)` is how kernel code runs on the other processors. `f` returns nothing, and each parameter is `&mut Cpu` or `&mut Mmu` (this processor passes its own; every other processor gets its own, with the kernel's tables in CR3) or a shared borrow `&T` of a value with no `Cpu` or `Mmu` in it (`E-PIN` otherwise). So the processors share only what cannot change, plus locks. `f`'s precondition is proved for this processor's arguments and again with `mmu_root` equal to the kernel's for the others. See [concurrency.md](concurrency.md).
@@ -1056,7 +1057,7 @@ fn main(ports: &mut Ports) -> u64 {
 
 | Builtin | Requires (proved) | Effect |
 | --- | --- | --- |
-| `mmio_claim(w: &mut MmioSpace, base: u64, len: u64) -> Mmio` | `0xC0000000 <= base`, `base + len <= 2^32`; `mmio_free(w, a)` for every `a` in the block | Takes the block out of `w` |
+| `mmio_claim(w: &mut MmioSpace, base: u64, len: u64) -> Mmio` | `0x80000000 <= base`, `base + len <= 2^32`; `mmio_free(w, a)` for every `a` in the block | Takes the block out of `w` |
 | `mmio_release(w: &mut MmioSpace, r: Mmio)` | | Gives it back |
 | `mmio_read8` / `16` / `32` / `64(r: &mut Mmio, off: u64) -> u8` / `u16` / `u32` / `u64` | `off + width <= mmio_len(r)`; `mmio_base(r) + off` is a multiple of the width | One volatile load |
 | `mmio_write8` / `16` / `32` / `64(r: &mut Mmio, off: u64, v: u8` / `u16` / `u32` / `u64)` | the same | One volatile store |
@@ -1290,7 +1291,7 @@ What a program that `bastioc0` accepts is guaranteed: no out-of-bounds access, n
 - **Running out of memory.** `alloc`, `box` and `vec_push` abort when memory runs out. Allocation failure is planned to be returned in the type instead.
 - **Stack depth.** Deep recursion can overflow the stack.
 - **Page contents.** The proof tracks who owns each page, not what is in it.
-- **The trusted base.** Z3, the stage0 compiler (Rust) and the C compiler are trusted, as is the hand-written C prelude each target links in (in `stage0/src/codegen.rs`), and the platform's boot and trap entry code. `bastioc0 --trusted-base` lists every prelude part with its size, the parts each target links, and every builtin; the listing is checked into `tests/trusted_base.txt` and `tests/run.sh` fails when it changes, so growth is reviewed (ROADMAP invariant 3). The small per-type helpers the compiler generates for `Box` and `Vec` are part of the compiler, not of this listing.
+- **The trusted base.** Z3, the stage0 compiler (Rust) and the C compiler are trusted, as is the hand-written C prelude each target links in (in `stage0/src/codegen.rs`), and the platform's boot and trap entry code. `bastioc0 --trusted-base` lists every prelude part with its size, the parts each target links, and every builtin; the listing is checked into `tests/trusted_base.txt` and `tests/run.sh` fails when it changes, so growth is reviewed (ROADMAP invariant 3). The small per-type helpers the compiler generates for `Box` and `Vec` are part of the compiler, not of this listing. [trusted-base.md](trusted-base.md) goes through every part and why it is there.
 - **C callers.** An `export fn` relies on its C caller for the assumptions listed in [Calling Bastio from C](#calling-bastio-from-c).
 - **Child processes and files.** What another program writes, or what a file contains, is unknown to the proof, beyond each byte being `<= 255`.
 
