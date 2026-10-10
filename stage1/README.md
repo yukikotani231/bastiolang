@@ -47,6 +47,14 @@ feeds the log to Z3, reading an answer after each `(check-sat)`, and at
 the first failed proof asks for the counterexample's values, as stage0
 does at that point.
 
+bastioc1 proves on several solvers at once, as stage0 does (`BASTIO_JOBS`,
+default: the number of processors, at most 8). Each function's commands
+form one solver scope, so the functions are dealt out to solvers, each
+reading its share from a script in a temporary directory; the answers are
+read in program order, and the first failing function is proved again on a
+solver of its own for the same report the sequential run gives
+(`solve_par`). verifydump keeps one solver, as `--dump-verify` does.
+
 The code generator builds text in a scratch pool and copies finished
 lines out, generating every sub-expression before the text around it in
 stage0's order, since that order numbers the temporaries. The runtime

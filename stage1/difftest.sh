@@ -266,15 +266,16 @@ for f in tests/pass/*.bastio; do
   fi
 done
 # `--backend native`: the same stderr and exit status as bastioc0 (an
-# unsupported program exits 4 with the same reason), and what it builds
-# must exit as tests/pass says.
+# unsupported program exits 4 with the same reason), except that stage1's
+# backend may build what stage0's does not support; what it builds must
+# exit as tests/pass says.
 nbuilt=0
 for f in tests/pass/*.bastio; do
-  "$BASTIOC" --backend native -o "$tmp/nwant" "$f" 2>"$tmp/want.err" >/dev/null; echo "exit $?" >>"$tmp/want.err"
+  "$BASTIOC" --backend native -o "$tmp/nwant" "$f" 2>"$tmp/want.err" >/dev/null; e0=$?; echo "exit $e0" >>"$tmp/want.err"
   "$tmp/bastioc1" --backend native -o "$tmp/ngot" "$f" 2>"$tmp/got.err" >/dev/null; e=$?; echo "exit $e" >>"$tmp/got.err"
   mask "$tmp/want.err" >"$tmp/want"
   ok=1
-  cmp -s "$tmp/want" "$tmp/got.err" || ok=0
+  [ "$e0" = 4 ] && [ "$e" = 0 ] || cmp -s "$tmp/want" "$tmp/got.err" || ok=0
   if [ $ok = 1 ] && [ "$e" = 0 ]; then
     want=$(sed -n 's|^// expect-exit: *||p' "$f" | head -1)
     "$tmp/ngot" </dev/null >/dev/null; got=$?

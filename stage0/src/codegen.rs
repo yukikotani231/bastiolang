@@ -628,6 +628,7 @@ static uint64_t *bst_regrow(uint64_t *p, uint64_t old, uint64_t n) {
 // Child processes (hosted only): fork and exec with a pipe each way.
 const PRELUDE_CHILD: &str = r#"
 #include <unistd.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
 typedef struct { int pid; int in; FILE *out; } bst_child;
@@ -640,6 +641,10 @@ static bst_child bst_host_spawn(bst_host h, bst_vec argv) {
     int to[2], from[2];
     if (argv.len == 0 || pipe(to) != 0) return c;
     if (pipe(from) != 0) { close(to[0]); close(to[1]); return c; }
+    /* The parent's ends are not inherited by later children, so closing a
+     * child's input reaches it as end of file. */
+    fcntl(to[1], F_SETFD, FD_CLOEXEC);
+    fcntl(from[0], F_SETFD, FD_CLOEXEC);
     char **av = (char **)malloc((argv.len + 1) * sizeof(char *));
     if (!av) { fputs("Bastio: out of memory\n", stderr); abort(); }
     for (uint64_t i = 0; i < argv.len; i++) av[i] = bst_cpath(((bst_bytes *)argv.data)[i]);
@@ -707,6 +712,26 @@ static uint64_t bst_child_wait(bst_child c) {
     if (WIFEXITED(st)) return (uint64_t)WEXITSTATUS(st);
     if (WIFSIGNALED(st)) return 128 + (uint64_t)WTERMSIG(st);
     return 255;
+}
+/* The environment variable `name`, if it is set. */
+static bool bst_host_env(bst_host h, bst_str name, bst_bytes *out) {
+    (void)h;
+    char *c = bst_cpath((bst_bytes){ name.len, (unsigned char *)name.data });
+    const char *v = getenv(c);
+    free(c);
+    if (!v) return false;
+    size_t n = strlen(v);
+    bst_bytes b = bst_balloc(n);
+    memcpy(b.data, v, n);
+    free(out->data);
+    *out = b;
+    return true;
+}
+/* The number of processors online (at least 1). */
+static uint64_t bst_host_cpus(bst_host h) {
+    (void)h;
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n < 1 ? 1 : (uint64_t)n;
 }
 "#;
 
