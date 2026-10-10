@@ -71,6 +71,11 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("host_arg", Avail::Hosted, vec![r(Host), U64], Bytes),
         ("host_read", Avail::Hosted, vec![r(Host), r(Bytes), m(Bytes)], Bool),
         ("host_write", Avail::Hosted, vec![r(Host), r(Bytes), r(Bytes)], Bool),
+        ("host_spawn", Avail::Hosted, vec![r(Host), r(Vec(std::boxed::Box::new(Bytes)))], Child),
+        ("child_write", Avail::Hosted, vec![m(Child), r(Bytes)], Bool),
+        ("child_close", Avail::Hosted, vec![m(Child)], Unit),
+        ("child_read_line", Avail::Hosted, vec![m(Child), m(Bytes)], Bool),
+        ("child_wait", Avail::Hosted, vec![Child], U64),
         ("slen", Avail::All, vec![Str], U64),
         ("sget", Avail::All, vec![Str, U64], U64),
         ("serial_write", Avail::All, vec![r(Serial), U64], Unit),
@@ -162,7 +167,7 @@ fn main_caps(target: Target) -> &'static [Type] {
 /// Struct and enum definitions: unique names, known field and payload
 /// types, no type that contains itself.
 pub fn check_structs(p: &Program) -> Result<(), Diag> {
-    const RESERVED: &[&str] = &["u64", "bool", "Str", "Buf", "Bytes", "Host", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu"];
+    const RESERVED: &[&str] = &["u64", "bool", "Str", "Buf", "Bytes", "Host", "Child", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu"];
     // (name, position, the types it holds directly)
     let mut defs: Vec<(String, Pos, Vec<Type>)> = Vec::new();
     for d in &p.structs {

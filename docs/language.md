@@ -11,6 +11,7 @@ The language as stage0 implements it today: the v0 proof pipeline, plus `&mut` b
 | `Buf` | An owned buffer of u64 elements. **Linear**: must be consumed exactly once |
 | `Bytes` | An owned buffer of bytes. **Linear**. Every element is proved to be `<= 255` |
 | `Host` | The host operating system: command-line arguments and files. **Linear**; hosted programs only, and only `main` is handed one |
+| `Child` | A child process started with `host_spawn`, with a pipe to its standard input and one from its standard output. **Linear**: it must be waited for. Hosted only |
 | `&T` | A read-only borrow of any `T`. Allowed **only as a parameter type**, so it can never be returned or stored, and never outlives the call. A borrowed plain value (`&u64`) reads as a copy |
 | `Str` | A string literal: immutable bytes with a length known at compile time. Copyable, never freed |
 | `Serial` | The capability to use the serial console. **Linear**: it cannot be created, only `main` is handed one, and `main` must return it |
@@ -192,6 +193,11 @@ vec_free(ps);                    // proved: vlen(ps) == 0
 | `host_arg(h: &Host, i: u64) -> Bytes` | none | Hosted only. Argument i (empty if there is none) |
 | `host_read(h: &Host, path: &Bytes, out: &mut Bytes) -> bool` | none | Hosted only. Replaces `out` with the whole file; false (and `out` unchanged) if it cannot be read |
 | `host_write(h: &Host, path: &Bytes, data: &Bytes) -> bool` | none | Hosted only. Creates or replaces the file |
+| `host_spawn(h: &Host, argv: &Vec[Bytes]) -> Child` | none | Hosted only. Starts `argv[0]` (looked up in `PATH`) with arguments `argv`. A program that cannot be started gives a child that exits with 127 and writes nothing |
+| `child_write(c: &mut Child, data: &Bytes) -> bool` | none | Hosted only. Writes to the child's standard input; false if it can no longer be written (the child has exited or the input is closed) |
+| `child_close(c: &mut Child)` | none | Hosted only. Closes the child's standard input, so a program that reads to the end of its input can finish |
+| `child_read_line(c: &mut Child, out: &mut Bytes) -> bool` | none | Hosted only. Replaces `out` with the next line of the child's output, without the newline; false at the end of the output |
+| `child_wait(c: Child) -> u64` | none | Hosted only. Closes the pipes, waits for the child and returns its exit status (128 + the signal number if a signal ended it); the prover knows the result is `<= 255` |
 
 Physical pages and page tables (hosted and kernel; hosted builds simulate the pages with ordinary memory, so tests run page code under the sanitizers):
 

@@ -408,6 +408,91 @@ static void bst_bfree(bst_bytes b) {
 }
 "#;
 
+// Child processes (hosted only): fork and exec with a pipe each way.
+const PRELUDE_CHILD: &str = r#"
+#include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
+typedef struct { int pid; int in; FILE *out; } bst_child;
+/* A child that cannot be started (no such program, no pipes or processes
+ * left) behaves like one that exited with 127 without output, which is
+ * what a failed exec in the child looks like anyway. */
+static bst_child bst_host_spawn(bst_host h, bst_vec argv) {
+    (void)h;
+    bst_child c = { -1, -1, NULL };
+    int to[2], from[2];
+    if (argv.len == 0 || pipe(to) != 0) return c;
+    if (pipe(from) != 0) { close(to[0]); close(to[1]); return c; }
+    char **av = (char **)malloc((argv.len + 1) * sizeof(char *));
+    if (!av) { fputs("Bastio: out of memory\n", stderr); abort(); }
+    for (uint64_t i = 0; i < argv.len; i++) av[i] = bst_cpath(((bst_bytes *)argv.data)[i]);
+    av[argv.len] = NULL;
+    fflush(NULL);
+    int pid = fork();
+    if (pid == 0) {
+        dup2(to[0], 0);
+        dup2(from[1], 1);
+        close(to[0]); close(to[1]); close(from[0]); close(from[1]);
+        execvp(av[0], av);
+        _exit(127);
+    }
+    for (uint64_t i = 0; i < argv.len; i++) free(av[i]);
+    free(av);
+    close(to[0]);
+    close(from[1]);
+    if (pid < 0) { close(to[1]); close(from[0]); return c; }
+    signal(SIGPIPE, SIG_IGN);   /* writing to a child that has exited fails instead */
+    c.pid = pid;
+    c.in = to[1];
+    c.out = fdopen(from[0], "rb");
+    if (!c.out) { fputs("Bastio: out of memory\n", stderr); abort(); }
+    return c;
+}
+static bool bst_child_write(bst_child *c, bst_bytes d) {
+    if (c->in < 0) return false;
+    uint64_t n = 0;
+    while (n < d.len) {
+        ssize_t w = write(c->in, d.data + n, d.len - n);
+        if (w <= 0) return false;
+        n += (uint64_t)w;
+    }
+    return true;
+}
+static void bst_child_close(bst_child *c) {
+    if (c->in >= 0) { close(c->in); c->in = -1; }
+}
+static bool bst_child_read_line(bst_child *c, bst_bytes *out) {
+    if (!c->out) return false;
+    size_t cap = 64, n = 0;
+    unsigned char *d = (unsigned char *)malloc(cap);
+    if (!d) { fputs("Bastio: out of memory\n", stderr); abort(); }
+    int ch;
+    while ((ch = getc(c->out)) != EOF && ch != '\n') {
+        if (n == cap) {
+            cap *= 2;
+            d = (unsigned char *)realloc(d, cap);
+            if (!d) { fputs("Bastio: out of memory\n", stderr); abort(); }
+        }
+        d[n++] = (unsigned char)ch;
+    }
+    if (ch == EOF && n == 0) { free(d); return false; }
+    free(out->data);
+    out->len = n;
+    out->data = d;
+    return true;
+}
+static uint64_t bst_child_wait(bst_child c) {
+    bst_child_close(&c);
+    if (c.out) fclose(c.out);
+    if (c.pid < 0) return 127;
+    int st;
+    while (waitpid(c.pid, &st, 0) < 0) {}
+    if (WIFEXITED(st)) return (uint64_t)WEXITSTATUS(st);
+    if (WIFSIGNALED(st)) return 128 + (uint64_t)WTERMSIG(st);
+    return 255;
+}
+"#;
+
 // Bytes operations shared by every target.
 const PRELUDE_BYTES: &str = r#"
 /* Box[T]: one allocation from the same allocator as Buf. */
@@ -563,6 +648,7 @@ fn cty(t: &Type) -> String {
         Type::Buf => "bst_buf".into(),
         Type::Bytes => "bst_bytes".into(),
         Type::Host => "bst_host".into(),
+        Type::Child => "bst_child".into(),
         Type::Str => "bst_str".into(),
         Type::Serial => "bst_serial".into(),
         Type::Frame => "bst_frame".into(),
@@ -917,7 +1003,8 @@ impl<'a> Gen<'a> {
 /// so each piece above stays readable on its own).
 pub fn prelude_parts(target: Target) -> Vec<&'static str> {
     match target {
-        Target::Hosted => vec![PRELUDE_COMMON, PRELUDE_HOSTED, PRELUDE_BYTES, "#define BST_PT_NEW_HOOK (void)level;\n", PRELUDE_PAGES],
+        // POSIX for the child-process functions; set before any header.
+        Target::Hosted => vec!["#define _POSIX_C_SOURCE 200809L\n", PRELUDE_COMMON, PRELUDE_HOSTED, PRELUDE_BYTES, "#define BST_PT_NEW_HOOK (void)level;\n", PRELUDE_PAGES, PRELUDE_CHILD],
         Target::Kernel => vec![PRELUDE_COMMON, PRELUDE_KERNEL, PRELUDE_BYTES_ARENA, PRELUDE_BYTES, PRELUDE_PAGES, PRELUDE_KERNEL_CPU],
         Target::User => vec![PRELUDE_COMMON, PRELUDE_USER, PRELUDE_BYTES_ARENA, PRELUDE_BYTES],
     }
