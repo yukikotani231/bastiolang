@@ -966,6 +966,7 @@ extern void bst_platform_smp_start(void (*fn)(void *), void *arg); /* run fn(arg
 extern void bst_platform_smp_join(void);                           /* wait until all of them have returned */
 extern uint64_t bst_platform_cpus(void); /* processors running, this one included; 1 to 4096 */
 static inline uint64_t bst_cpu_count(bst_cpu c) { (void)c; return bst_platform_cpus(); }
+static inline uint64_t bst_cpu_tsc(bst_cpu c) { (void)c; uint32_t lo, hi; __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi)); return (uint64_t)hi << 32 | lo; }
 /* The Multiboot information the loader passed (0: none), and field f of the
  * linear framebuffer it set up, if that is 32-bit RGB and lies below 4 GiB:
  * 0 its address, 1 bytes per line, 2 width and 3 height in pixels, 4 the
