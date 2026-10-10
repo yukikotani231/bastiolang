@@ -1049,6 +1049,7 @@ Every top-level table a processor loads is entered with a lease; there is no oth
 | `cpu_run(c: &mut Cpu, m: &Mmu) -> u64` | | Runs the saved context in user mode until the next trap; returns its vector (`<= 255`) |
 | `cpu_idle(c: &mut Cpu) -> u64` | | Waits for an interrupt; returns its vector |
 | `cpu_count(c: &Cpu) -> u64` | | Processors the platform has started, this one included: between 1 and 4096 |
+| `cpu_tsc(c: &Cpu) -> u64` | | This processor's time-stamp counter (`rdtsc`). The proof knows nothing about the value, not even that it goes up: how fast it counts and whether the processors' counters agree is the hardware's business |
 | `boot_fb(c: &Cpu, f: u64) -> u64` | | The linear framebuffer the boot loader set up (Multiboot), if it is 32-bit RGB and ends at or below 4 GiB: `f` 0 its address, 1 bytes per line, 2 width, 3 height, 4 the bit positions of red, green and blue (a byte each). Every field is 0 without one, and below 2^32. Drawing on it still needs an `Mmio` claim of its block |
 | `smp_run(f, args..)` | `f`'s `requires`, also for the other processors (below) | Runs `f(args..)` on every processor at once and returns when all have returned |
 
