@@ -1765,6 +1765,7 @@ pub fn trusted_base() -> String {
     for l in COUNT_FACTS {
         out.push_str(&format!("lemma vcount: {}\n", l));
     }
+    out.push_str("definition bdec: bdec(b, f, t) is 0 when t <= f, else 10 * bdec(b, f, t - 1) + (bget(b, t - 1) - 48)\n");
     out
 }
 

@@ -16,7 +16,7 @@ import "core/text.bastio";     // also brings in core/bytes.bastio and core/opti
 import "core/num.bastio";
 ```
 
-An import that does not start with `.` or `/` is looked for next to the importing file, then in each directory above it, then in each `--lib DIR` given to the compiler (see [Programs and files](language.md#programs-and-files)). Inside this repository the walk up finds `core/`; a program elsewhere, such as BastiOS, passes `--lib path/to/bastiolang`.
+An import that does not start with `.` or `/` is looked for next to the importing file, then in each directory above it, then in each `--lib DIR` given to the compiler and each directory of `BASTIO_LIB` (see [Programs and files](language.md#programs-and-files)). Inside this repository the walk up finds `core/`; a program elsewhere, such as BastiOS, passes `--lib path/to/bastiolang`.
 
 All files share one namespace (see [Programs and files](language.md#programs-and-files)), so every function is prefixed by its module (`bytes_`, `text_`, `hmap_`, ...) except the few whose names say what they are (`parse_u64`, `fmt_u64`, `print_str`, `sort_u64`). Two names are taken without a prefix: the types `Option[T]` and `Span`. A program that imports core must not define its own.
 
@@ -49,7 +49,7 @@ The tests are the worked examples: `tests/pass/core_*.bastio` and `tests/pass/st
 | `bytes_find_byte(b, c, from) -> u64` | The first index at or after `from` holding `c`, or `blen(b)`: every byte skipped differs from `c` |
 | `bytes_find(hay, needle, from) -> Option[u64]` | A `Some(i)` is a real occurrence at or after `from`. Not proved: that it is the first one, or that `None` means there is none |
 | `bytes_slice(b, from, to) -> Bytes` | A copy of exactly those bytes |
-| `bytes_concat(a, b) -> Bytes` | `a` then `b`. Needs `blen(a) + blen(b) <= 2^60`; for strings of unknown length, build a text instead |
+| `bytes_concat(a, b) -> Bytes` | `a` then `b`. Needs `blen(a) + blen(b) <= 2^60`: every `Bytes` is known to be at most 2^60 long, but two of them together are not, since nothing bounds the memory of all live values at once. For strings of unknown length, build a text instead |
 | `bytes_copy_into(dst, at, src)` | `src` lands at `at`, and the rest of `dst` is untouched |
 | `bytes_trim(b, s: Span) -> Span` | Only white space was cut, and the result does not start or end with white space |
 | `bytes_split(b, sep: u8) -> Vec[Span]` | At least one piece, every piece a span of `b` |
@@ -65,9 +65,9 @@ The tests are the worked examples: `tests/pass/core_*.bastio` and `tests/pass/st
 
 | Function | Proved |
 | --- | --- |
-| `parse_u64(b, from, to) -> Option[u64]` | Decimal. `Some` only if the range is non-empty and all digits (spec fn `all_digits`); never overflows |
-| `parse_u8`, `parse_u16`, `parse_u32` | The same, and the value fits the type |
-| `parse_i64` and `parse_i8` ... `parse_i32` | An optional `-`, then digits; the value fits the type, down to the minimum |
+| `parse_u64(b, from, to) -> Option[u64]` | Decimal. `Some` only if the range is non-empty and all digits (spec fn `all_digits`), and then its value is `bdec(b, from, to)`, the number the digits denote; never overflows |
+| `parse_u8`, `parse_u16`, `parse_u32` | The same (value included), and the value fits the type |
+| `parse_i64` and `parse_i8` ... `parse_i32` | An optional `-`, then digits; the value is `bdec` of the digits, negated after a `-` (spec fn `dec_signed`), and fits the type, down to the minimum |
 | `parse_hex_u64(b, from, to)` | Hexadecimal digits, either case, no `0x` |
 | `fmt_u64(t, x)` | Appends 1 to 20 bytes, every one a decimal digit |
 | `fmt_i64(t, x)` | A `-` when negative, then the digits; 1 to 21 bytes |
@@ -75,7 +75,7 @@ The tests are the worked examples: `tests/pass/core_*.bastio` and `tests/pass/st
 | `fmt_hex_u64(t, x, min)` | Lowercase hex, at least `min` and at most 16 digits |
 | `dec_digits(x)`, `is_digit(c)`, `hex_value(c)`, `hex_char(d)` | Helpers |
 
-Narrower integers format through `fmt_u64(t, cast[u64](x))`: widening needs no proof. The tests check that formatting and parsing are inverse on every power of two and its predecessor and on the extremes of `i64`; that is tested, not proved (see [Gaps](#gaps)).
+Narrower integers format through `fmt_u64(t, cast[u64](x))`: widening needs no proof. The tests check that formatting and parsing are inverse on every power of two and its predecessor and on the extremes of `i64`. Parsing is proved to return the digits' value; that `fmt_u64` writes the digits of `x` is tested, not proved (it writes into a `Vec[u8]`, and `bdec` reads `Bytes`).
 
 ### `core/print.bastio`
 
@@ -121,10 +121,9 @@ Insertion sort is quadratic in the worst case. It was chosen because its proof i
 
 ## Gaps
 
-What the library would say if the language let it. Each is a language or verifier change, not a library change. (Five earlier gaps are closed: `old(x)` is allowed in loop invariants, which the text functions and `bytes_copy_into` use; a local variable may share a function's name, so importing core no longer reserves its local names; a `spec fn` may be generic; `vcount` counts the elements of a vector, which proves the sort a permutation and the map's counters; and imports are searched for, so `import "core/text.bastio"` works from anywhere.)
+What the library would say if the language let it. Each is a language or verifier change, not a library change. (Earlier gaps, all closed: `old(x)` is allowed in loop invariants, which the text functions and `bytes_copy_into` use; a local variable may share a function's name, so importing core no longer reserves its local names; a `spec fn` may be generic; `vcount` counts the elements of a vector, which proves the sort a permutation and the map's counters; and imports are searched for, so `import "core/text.bastio"` works from anywhere.)
 
-1. **Values of digit strings.** Nothing says what number a run of digits denotes, so `parse_u64` is proved never to overflow but not to return the value of its digits. That needs a recursive spec fn or a value-of-prefix ghost function.
-2. **Length bounds on `Bytes`.** Nothing says an existing `Bytes` is at most 2^60 long (a `Vec` push gets such a fact), so `bytes_concat` must ask for it.
+None open. (The two closed last: `bdec` names the value of a digit string, so every `parse_*` is proved to return the value of its digits; and an existing `Bytes` is known to be at most 2^60 long, which is all a single value can say.)
 
 ## Where it came from
 

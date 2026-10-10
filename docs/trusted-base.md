@@ -59,6 +59,8 @@ Every builtin (the `builtin` lines of the listing, with the targets that have it
 
 `--trusted-base` lists them (the `lemma` lines). They are written out in `COUNT_LEMMAS` and `count_step` in `stage0/src/verify.rs` (`count_lemmas` and `count_step` in `stage1/verify.bastio`). They are sent only for functions whose specifications use `vcount`, or call one whose contract does, so a program that never counts is verified exactly as before.
 
+**The definition of `bdec`.** `bdec(b, from, to)` (specifications only) is an uninterpreted function `dec` of the bytes' data array and the range, defined by axioms: it is 0 for an empty range and `10 * dec(a, f, t - 1) + (a[t - 1] - 48)` otherwise. The recursive use is written with a copy, `dec_l`, which equals `dec` wherever `dec` is mentioned and is 0 on an empty range, but is never unfolded itself; that stops the solver from unfolding the definition forever. A definition by recursion on a decreasing range is consistent, but the solver does not check that, so it is listed (the `definition` line of `--trusted-base`). It is written out in `DEC_AXIOMS` in `stage0/src/verify.rs` (`dec_axioms` in `stage1/verify.bastio`) and sent only for functions whose specifications use `bdec`, the same way as the counting lemmas.
+
 ## 4. Assumptions at the boundaries
 
 **`export fn`.** A C caller cannot be proved to do anything, so the proof of an exported function assumes things about it. They are listed by `--trusted-base` (the `export assumes` lines) and written into the generated header: buffer pointers are valid for their lengths and not written during the call, `&mut Bytes` arguments do not overlap, and every argument is a valid value of its C type.

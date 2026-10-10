@@ -11,11 +11,24 @@ import "out.bastio";
 import "x86.bastio";
 
 fn main(con: &mut Serial, host: &mut Host) -> u64 {
-  let mut file_arg = 1;
+  // `--lib DIR` first, then an optional flag, then the file. asmdump does
+  // not read BASTIO_LIB: stage0's native backend, which builds it, has no
+  // `host_env`.
+  let mut ld = loader_new();
+  let mut base = 1;
+  if host_argc(host) > 3 {
+    let a = host_arg(host, 1);
+    if spells(a, 0, blen(a), "--lib") {
+      loader_lib(&mut ld, host_arg(host, 2));
+      base = 3;
+    }
+    bfree(a);
+  }
+  let mut file_arg = base;
   let mut compat = false;
   let mut target = TARGET_HOSTED;
-  if host_argc(host) > 2 {
-    let flag = host_arg(host, 1);
+  if host_argc(host) > base + 1 {
+    let flag = host_arg(host, base);
     compat = spells(flag, 0, blen(flag), "--stage0");
     if spells(flag, 0, blen(flag), "--user") {
       target = TARGET_USER;
@@ -24,11 +37,10 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
       target = TARGET_KERNEL;
     }
     bfree(flag);
-    file_arg = 2;
+    file_arg = base + 1;
   }
   let path = host_arg(host, file_arg);
   let mut p = parser_new(balloc(0), vec_new[Tok](), 0);
-  let mut ld = loader_new();
   let r = load(host, &mut p, &mut ld, path, 0, 0, 0, false);
   bfree(path);
   loader_free(ld);

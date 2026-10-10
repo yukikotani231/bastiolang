@@ -412,51 +412,74 @@ pub struct Verifier<'p> {
     /// the counting function and its lemmas declared, so programs that
     /// never count get the same queries as before counting existed.
     counts: bool,
+    /// The functions whose proofs can mention `bdec` (gated the same way):
+    /// only they get its definition (DEC_AXIOMS).
+    decimal: &'p HashSet<String>,
 }
 
-/// Does `e` call `vcount`, or name one of `names` (spec fns that count,
-/// functions whose contracts count)?
-fn mentions_count(e: &Expr, names: &HashSet<String>) -> bool {
+/// Does `e` call the spec builtin `call` (`vcount`, `bdec`), or name one of
+/// `names` (spec fns that use it, functions whose contracts do)?
+fn mentions_count(e: &Expr, call: &str, names: &HashSet<String>) -> bool {
+    let m = |x: &Expr| mentions_count(x, call, names);
     match &e.kind {
-        ExprKind::Call(n, xs) => n == "vcount" || names.contains(n) || xs.iter().any(|x| mentions_count(x, names)),
+        ExprKind::Call(n, xs) => n == call || names.contains(n) || xs.iter().any(m),
         ExprKind::Var(n) => names.contains(n),
-        ExprKind::Field(x, _) | ExprKind::Is(x, _, _) | ExprKind::Not(x) | ExprKind::Neg(x) | ExprKind::Forall(_, x) | ExprKind::TypeApp(_, x) => mentions_count(x, names),
-        ExprKind::Variant(_, _, Some(x)) => mentions_count(x, names),
-        ExprKind::StructLit(_, fs) => fs.iter().any(|(_, x)| mentions_count(x, names)),
-        ExprKind::Bin(_, a, b) => mentions_count(a, names) || mentions_count(b, names),
+        ExprKind::Field(x, _) | ExprKind::Is(x, _, _) | ExprKind::Not(x) | ExprKind::Neg(x) | ExprKind::Forall(_, x) | ExprKind::TypeApp(_, x) => m(x),
+        ExprKind::Variant(_, _, Some(x)) => m(x),
+        ExprKind::StructLit(_, fs) => fs.iter().any(|(_, x)| m(x)),
+        ExprKind::Bin(_, a, b) => m(a) || m(b),
         _ => false,
     }
 }
 
-fn stmts_mention_count(ss: &[Stmt], names: &HashSet<String>) -> bool {
+fn stmts_mention_count(ss: &[Stmt], call: &str, names: &HashSet<String>) -> bool {
+    let m = |x: &Expr| mentions_count(x, call, names);
     ss.iter().any(|st| match &st.kind {
-        StmtKind::Let { init: e, .. } | StmtKind::Assign { value: e, .. } | StmtKind::Assert(e) | StmtKind::Expr(e) | StmtKind::Return(Some(e)) => mentions_count(e, names),
-        StmtKind::If { cond, then_b, else_b } => mentions_count(cond, names) || stmts_mention_count(then_b, names) || stmts_mention_count(else_b, names),
-        StmtKind::While { cond, invariants, body } => mentions_count(cond, names) || invariants.iter().any(|i| mentions_count(i, names)) || stmts_mention_count(body, names),
-        StmtKind::Match { scrut, arms } => mentions_count(scrut, names) || arms.iter().any(|a| stmts_mention_count(&a.body, names)),
+        StmtKind::Let { init: e, .. } | StmtKind::Assign { value: e, .. } | StmtKind::Assert(e) | StmtKind::Expr(e) | StmtKind::Return(Some(e)) => m(e),
+        StmtKind::If { cond, then_b, else_b } => m(cond) || stmts_mention_count(then_b, call, names) || stmts_mention_count(else_b, call, names),
+        StmtKind::While { cond, invariants, body } => m(cond) || invariants.iter().any(m) || stmts_mention_count(body, call, names),
+        StmtKind::Match { scrut, arms } => m(scrut) || arms.iter().any(|a| stmts_mention_count(&a.body, call, names)),
         StmtKind::Return(None) | StmtKind::Unreachable => false,
     })
 }
 
-/// The functions whose verification needs the counting lemmas: those whose
-/// own contract, loop invariants or assertions use `vcount` (directly or
-/// through spec fns), or that call a function whose contract does. When a
-/// struct invariant counts, every function does.
-fn counting_fns(p: &Program) -> HashSet<String> {
+/// The functions whose verification needs the facts about the spec builtin
+/// `call` (`vcount`'s lemmas, `bdec`'s definition): those whose own
+/// contract, loop invariants or assertions use it (directly or through spec
+/// fns), or that call a function whose contract does. When a struct
+/// invariant uses it, every function does.
+fn counting_fns(p: &Program, call: &str) -> HashSet<String> {
     let mut names = HashSet::new();
     for sf in &p.specs {
-        if mentions_count(&sf.body, &names) {
+        if mentions_count(&sf.body, call, &names) {
             names.insert(sf.name.clone());
         }
     }
-    let all = p.structs.iter().any(|d| d.invariants.iter().any(|i| mentions_count(i, &names)));
+    let all = p.structs.iter().any(|d| d.invariants.iter().any(|i| mentions_count(i, call, &names)));
     for f in &p.fns {
-        if f.requires.iter().chain(&f.ensures).any(|e| mentions_count(e, &names)) {
+        if f.requires.iter().chain(&f.ensures).any(|e| mentions_count(e, call, &names)) {
             names.insert(f.name.clone());
         }
     }
-    p.fns.iter().filter(|f| all || names.contains(&f.name) || stmts_mention_count(&f.body, &names)).map(|f| f.name.clone()).collect()
+    p.fns.iter().filter(|f| all || names.contains(&f.name) || stmts_mention_count(&f.body, call, &names)).map(|f| f.name.clone()).collect()
 }
+
+/// `bdec(b, from, to)` is `(dec a from to)` over the bytes' data array `a`:
+/// the decimal value of `a[from..to]`, each element read as a digit
+/// (element - 48). These axioms are its definition, by recursion on `to`.
+/// The recursive use goes through `dec_l`, a copy that is equal to `dec`
+/// wherever `dec` is mentioned but is never unfolded itself, so the solver
+/// unfolds the definition one step per mentioned term instead of forever
+/// (the empty range is 0 for both).
+/// A definition by well-founded recursion is consistent; it is still part
+/// of the trusted base (docs/trusted-base.md).
+const DEC_AXIOMS: &[&str] = &[
+    "(declare-fun dec ((Array Int Int) Int Int) Int)",
+    "(declare-fun dec_l ((Array Int Int) Int Int) Int)",
+    "(assert (forall ((a (Array Int Int)) (f Int) (t Int)) (! (= (dec a f t) (ite (<= t f) 0 (+ (* 10 (dec_l a f (- t 1))) (- (select a (- t 1)) 48)))) :pattern ((dec a f t)))))",
+    "(assert (forall ((a (Array Int Int)) (f Int) (t Int)) (! (= (dec a f t) (dec_l a f t)) :pattern ((dec a f t)))))",
+    "(assert (forall ((a (Array Int Int)) (f Int) (t Int)) (! (=> (<= t f) (= (dec_l a f t) 0)) :pattern ((dec_l a f t)))))",
+];
 
 /// `vcount(v, x)` is `(cnt a n x)` over the vector's element array `a` and
 /// length `n`. These facts about it hold for every array and length; each is
@@ -574,7 +597,8 @@ pub fn verify_program(p: &Program, one_session: bool) -> Result<(usize, Vec<Stri
     // `one_session` (for --dump-smt, which stage1/difftest.sh compares with
     // stage1's verifier) keeps everything on one solver, in program order.
     let sums = summarize(p);
-    let counting = counting_fns(p);
+    let counting = counting_fns(p, "vcount");
+    let decimal = counting_fns(p, "bdec");
     let n = p.fns.len();
     let jobs = std::env::var("BASTIO_JOBS")
         .ok()
@@ -586,7 +610,7 @@ pub fn verify_program(p: &Program, one_session: bool) -> Result<(usize, Vec<Stri
     // a function after it, since its result could not be reported anyway.
     let failed = AtomicUsize::new(usize::MAX);
     let workers: Vec<Worker> = std::thread::scope(|s| {
-        let hs: Vec<_> = (0..jobs).map(|_| s.spawn(|| verify_worker(p, &sums, &counting, &next, &failed))).collect();
+        let hs: Vec<_> = (0..jobs).map(|_| s.spawn(|| verify_worker(p, &sums, &counting, &decimal, &next, &failed))).collect();
         hs.into_iter().map(|h| h.join().expect("a verifier thread panicked")).collect()
     });
     let mut obligations = 0;
@@ -627,7 +651,7 @@ struct Worker {
 
 /// Verifies functions, taking the next unverified index each time, on a
 /// solver of its own.
-fn verify_worker(p: &Program, sums: &Summaries, counting: &HashSet<String>, next: &AtomicUsize, failed: &AtomicUsize) -> Worker {
+fn verify_worker(p: &Program, sums: &Summaries, counting: &HashSet<String>, decimal: &HashSet<String>, next: &AtomicUsize, failed: &AtomicUsize) -> Worker {
     let mut w = Worker { obligations: 0, log: Vec::new(), times: Vec::new(), err: None };
     let solver = match Solver::start() {
         Ok(s) => s,
@@ -636,7 +660,7 @@ fn verify_worker(p: &Program, sums: &Summaries, counting: &HashSet<String>, next
             return w;
         }
     };
-    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, int_ops: HashMap::new(), sums, counting, counts: false };
+    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, int_ops: HashMap::new(), sums, counting, decimal, counts: false };
     let mut run = || -> Result<(), (usize, Diag)> {
         v.smt(&format!("(declare-const {} Int)", POOLSIZE)).map_err(|d| (0, d))?;
         v.smt(&format!("(assert (and (<= 0 {p}) (<= {p} {})))", FRAME_LIMIT, p = POOLSIZE)).map_err(|d| (0, d))?;
@@ -926,6 +950,11 @@ impl<'p> Verifier<'p> {
         self.counts = self.counting.contains(&f.name);
         if self.counts {
             for c in COUNT_LEMMAS {
+                self.smt(c)?;
+            }
+        }
+        if self.decimal.contains(&f.name) {
+            for c in DEC_AXIOMS {
                 self.smt(c)?;
             }
         }
@@ -2419,6 +2448,12 @@ impl<'p> Verifier<'p> {
                 }
                 if name == "vget" {
                     return Ok(self.spec_val(e, sc, bound)?.term().to_string());
+                }
+                if name == "bdec" {
+                    let Val::Buf { data, .. } = self.spec_val(&args[0], sc, bound)? else { unreachable!("checked: Bytes") };
+                    let from = self.spec(&args[1], sc, bound)?;
+                    let to = self.spec(&args[2], sc, bound)?;
+                    return Ok(format!("(dec {} {} {})", data, from, to));
                 }
                 if name == "vcount" {
                     let Val::Vec { len, elems, .. } = self.spec_val(&args[0], sc, bound)? else { unreachable!("checked: a Vec") };
