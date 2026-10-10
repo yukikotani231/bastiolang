@@ -102,7 +102,6 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("pt_put_frame", Avail::Mem, vec![m(PageTable), U64, Frame, Bool], Unit),
         ("pt_take_frame", Avail::Mem, vec![m(PageTable), U64], Frame),
         ("pt_lease_count", Avail::Mem, vec![m(PageTable)], U64),
-        ("mmu_switch", Avail::Kernel, vec![m(Mmu), r(PageTable)], Unit),
         ("mmu_enter", Avail::Kernel, vec![m(Mmu), m(PageTable)], Lease),
         ("mmu_exit", Avail::Kernel, vec![m(Mmu), Lease], Unit),
         ("mmu_kernel", Avail::Kernel, vec![m(Mmu)], Unit),
