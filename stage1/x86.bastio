@@ -656,6 +656,12 @@ fn x86_words(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, t: u64) -> u64 {
   if k == TY_BUF || k == TY_BYTES || k == TY_STR || k == TY_POOL {
     return 2;
   }
+  if (k == TY_LOCK || k == TY_ATOMIC || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA) && !g.stage0 {
+    return 1;     // a lock or atomic word's address; Ports and MmioSpace (0); a frame's address
+  }
+  if (k == TY_PORTIO || k == TY_MMIO) && !g.stage0 {
+    return 2;     // base, then count or length
+  }
   if k == TY_VEC || (k == TY_CHILD && !g.stage0) {
     return 3;     // a Child: process id, the pipe to its input, its output (FILE *)
   }
@@ -1855,6 +1861,27 @@ fn x86_ty_in(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u
       if name_is(p, i, "unbox") {
         let t = x86_ty(&mut g, c, &mut m, p, n.a);
         return inner_t(m, t);
+      }
+      if name_is(p, i, "lock_new") || name_is(p, i, "atomic_new") {
+        let t = x86_ty(&mut g, c, &mut m, p, n.a);
+        if name_is(p, i, "lock_new") {
+          return intern(&mut m, p, TY_LOCK, t);
+        }
+        return intern(&mut m, p, TY_ATOMIC, t);
+      }
+      if name_is(p, i, "locked") {
+        let fnode = node_at(p.nodes, cg_arg(p, i, 1));
+        let x = plain_inst(&mut m, plain_fn(p, fnode.s, fnode.e));
+        return cg_ret_ty(&mut m, p, x);
+      }
+      if name_is(p, i, "atomic_store") {
+        return c.tunit;
+      }
+      if name_is(p, i, "atomic_cas") {
+        return c.tbool;
+      }
+      if name_is(p, i, "lock_end") || is_atomic_builtin(p, n.s, n.e) {
+        return x86_cell_ty(&mut g, c, &mut m, p, n.a);
       }
       if is_vec_builtin(p, n.s, n.e) {
         if name_is(p, i, "vec_len") {
@@ -3543,9 +3570,260 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
   }
 }
 
+/// The type of the value in the lock or atomic `a` (or a borrow of one).
+fn x86_cell_ty(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, a: u64) -> u64 {
+  let mut t = x86_ty(&mut g, c, &mut m, p, a);
+  if kind_t(m, t) == TY_REF || kind_t(m, t) == TY_MUTREF {
+    t = inner_t(m, t);
+  }
+  return inner_t(m, t);
+}
+
+/// `locked(l, f, args..)`: `f(&mut <the value in l>, args..)` with `l`
+/// held, a spin lock as the C prelude's (`xchg` takes it, a store releases
+/// it). The arguments are evaluated before the lock is taken.
+fn x86_locked(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
+  let n = node_at(p.nodes, i);
+  let fnode = node_at(p.nodes, cg_arg(p, i, 1));
+  let x = plain_inst(&mut m, plain_fn(p, fnode.s, fnode.e));
+  let rt = cg_ret_ty(&mut m, p, x);
+  let rn = x86_words(&mut g, c, m, p, rt);
+  x86_push_val(&mut g, c, &mut m, p, n.a);
+  x86_pop(&mut g, x86_reg(XR_RAX));
+  x86_push(&mut g, x86_reg(XR_RAX));       // kept to release the lock
+  if rn > 1 {
+    x86_reserve(&mut g, rn);
+  }
+  x86_es(&mut g, "add $8, %rax");
+  x86_push(&mut g, x86_reg(XR_RAX));       // the first argument: the value
+  let mut aw = 1;
+  let mut a = cg_arg(p, i, 2);
+  while a != 0 {
+    if kind_of(p, a) == E_MUTBORROW {
+      aw = wrap_add(aw, 1);
+    } else {
+      aw = wrap_add(aw, x86_ewords(&mut g, c, &mut m, p, a));
+    }
+    x86_arg(&mut g, c, &mut m, p, a);
+    a = next_of(p, a);
+  }
+  let spin = x86_label(&mut g);
+  let got = x86_label(&mut g);
+  x86_es_off(&mut g, "mov ", wrap_sub(aw, 1), "(%rsp), %rdi");
+  x86_place_label(&mut g, spin);
+  x86_es(&mut g, "mov $1, %eax");
+  x86_es(&mut g, "xchg %rax, -8(%rdi)");
+  x86_es(&mut g, "test %rax, %rax");
+  x86_jump(&mut g, "jz", got);
+  x86_es(&mut g, "pause");
+  x86_jump(&mut g, "jmp", spin);
+  x86_place_label(&mut g, got);
+  let na = x86_regargs(&mut g, c, &mut m, p, x);
+  if na == aw {
+    let mut j = 0;
+    while j < na {
+      x86_pop(&mut g, x86_reg(x86_argreg(j)));
+      j = j + 1;
+    }
+    aw = 0;
+  }
+  x86_t(&mut g, "call ");
+  x86_sym(&mut g, m, p, x);
+  x86_e(&mut g);
+  x86_drop(&mut g, aw);
+  let mut keep = 0;
+  if rn > 1 {
+    keep = rn;
+  }
+  x86_es_off(&mut g, "mov ", keep, "(%rsp), %rdi");
+  x86_es(&mut g, "movq $0, (%rdi)");
+  if rn > 1 {
+    let mut j = rn;
+    while j > 0 {
+      j = j - 1;
+      x86_es_off(&mut g, "mov ", j, "(%rsp), %rdx");
+      x86_es_off(&mut g, "mov %rdx, ", wrap_add(j, 1), "(%rsp)");
+    }
+    x86_drop(&mut g, 1);
+  } else {
+    x86_pop(&mut g, x86_reg(XR_RCX));
+  }
+}
+
+/// The width in bytes of the device access call `i` names (`pio_in8`,
+/// `mmio_write32`, `dma_read64`, ..), or 0.
+fn x86_dev_access(p: &Parser, i: u64) -> u64 {
+  if name_is(p, i, "pio_in8") || name_is(p, i, "pio_out8") || name_is(p, i, "mmio_read8") || name_is(p, i, "mmio_write8")
+    || name_is(p, i, "dma_read8") || name_is(p, i, "dma_write8") {
+    return 1;
+  }
+  if name_is(p, i, "pio_in16") || name_is(p, i, "pio_out16") || name_is(p, i, "mmio_read16") || name_is(p, i, "mmio_write16")
+    || name_is(p, i, "dma_read16") || name_is(p, i, "dma_write16") {
+    return 2;
+  }
+  if name_is(p, i, "pio_in32") || name_is(p, i, "pio_out32") || name_is(p, i, "mmio_read32") || name_is(p, i, "mmio_write32")
+    || name_is(p, i, "dma_read32") || name_is(p, i, "dma_write32") {
+    return 4;
+  }
+  if name_is(p, i, "mmio_read64") || name_is(p, i, "mmio_write64") || name_is(p, i, "dma_read64") || name_is(p, i, "dma_write64") {
+    return 8;
+  }
+  return 0;
+}
+
+/// A device access on the hosted target, as the C prelude simulates it:
+/// ports are 65536 32-bit cells (a read is the last value written, cut to
+/// the width), the MMIO window 1 MiB of bytes (the address modulo 1 MiB),
+/// and DMA the frame itself. %rdi is the address of the claim (its base
+/// is word 0), %rsi the offset, %rdx the value written.
+fn x86_dev(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
+  let w = x86_dev_access(p, i);
+  let wr = name_is(p, i, "pio_out8") || name_is(p, i, "pio_out16") || name_is(p, i, "pio_out32")
+    || name_is(p, i, "mmio_write8") || name_is(p, i, "mmio_write16") || name_is(p, i, "mmio_write32") || name_is(p, i, "mmio_write64")
+    || name_is(p, i, "dma_write8") || name_is(p, i, "dma_write16") || name_is(p, i, "dma_write32") || name_is(p, i, "dma_write64");
+  if wr {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, XR_RSI, XR_RDX, 0, 0);
+  } else {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, XR_RSI, 0, 0, 0);
+  }
+  x86_es(&mut g, "mov (%rdi), %rax");
+  x86_es(&mut g, "add %rsi, %rax");
+  if name_is(p, i, "pio_in8") || name_is(p, i, "pio_in16") || name_is(p, i, "pio_in32")
+    || name_is(p, i, "pio_out8") || name_is(p, i, "pio_out16") || name_is(p, i, "pio_out32") {
+    x86_es(&mut g, "lea bst_rt_port_cell(%rip), %rcx");
+    if wr {
+      x86_es(&mut g, "mov %edx, (%rcx,%rax,4)");
+    } else {
+      x86_es(&mut g, "mov (%rcx,%rax,4), %eax");
+      if w == 1 { x86_es(&mut g, "movzbl %al, %eax"); }
+      if w == 2 { x86_es(&mut g, "movzwl %ax, %eax"); }
+    }
+    return;
+  }
+  if name_is(p, i, "dma_read8") || name_is(p, i, "dma_read16") || name_is(p, i, "dma_read32") || name_is(p, i, "dma_read64")
+    || name_is(p, i, "dma_write8") || name_is(p, i, "dma_write16") || name_is(p, i, "dma_write32") || name_is(p, i, "dma_write64") {
+    x86_es(&mut g, "mov %rax, %rcx");
+  } else {
+    x86_es(&mut g, "and $0xFFFFF, %eax");
+    x86_es(&mut g, "lea bst_rt_mmio_cell(%rip), %rcx");
+    x86_es(&mut g, "add %rax, %rcx");
+  }
+  if wr {
+    if w == 1 { x86_es(&mut g, "mov %dl, (%rcx)"); }
+    if w == 2 { x86_es(&mut g, "mov %dx, (%rcx)"); }
+    if w == 4 { x86_es(&mut g, "mov %edx, (%rcx)"); }
+    if w == 8 { x86_es(&mut g, "mov %rdx, (%rcx)"); }
+  } else {
+    if w == 1 { x86_es(&mut g, "movzbl (%rcx), %eax"); }
+    if w == 2 { x86_es(&mut g, "movzwl (%rcx), %eax"); }
+    if w == 4 { x86_es(&mut g, "mov (%rcx), %eax"); }
+    if w == 8 { x86_es(&mut g, "mov (%rcx), %rax"); }
+  }
+}
+
 /// The builtins only stage1's backend supports (see `x86_runtime1`).
 fn x86_builtin1(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
-  if name_is(p, i, "host_eprint") {
+  let n = node_at(p.nodes, i);
+  if name_is(p, i, "lock_new") {
+    let w = x86_ewords(&mut g, c, &mut m, p, n.a);
+    // Allocated first, then filled, as `box`; the lock word starts at 0.
+    x86_t(&mut g, "mov $");
+    x86_n(&mut g, wrap_add(w, 1));
+    x86_t(&mut g, ", %edi");
+    x86_e(&mut g);
+    x86_es(&mut g, "call bst_rt_alloc");
+    x86_push(&mut g, x86_reg(XR_RAX));
+    let mark0 = g.depth;
+    x86_val_into(&mut g, c, &mut m, p, n.a, x86_dst(XD_HEAP, mark0, 1));
+    x86_pop(&mut g, x86_reg(XR_RAX));
+  } else if name_is(p, i, "lock_end") {
+    let t = x86_ty(&mut g, c, &mut m, p, n.a);
+    let w = x86_words(&mut g, c, m, p, inner_t(m, t));
+    x86_push_val(&mut g, c, &mut m, p, n.a);
+    x86_pop(&mut g, x86_reg(XR_RAX));
+    x86_reserve(&mut g, w);
+    let mut j = 0;
+    while j < w {
+      x86_es_off(&mut g, "mov ", wrap_add(j, 1), "(%rax), %rdx");
+      x86_es_off(&mut g, "mov %rdx, ", j, "(%rsp)");
+      j = j + 1;
+    }
+    x86_es(&mut g, "mov %rax, %rdi");
+    x86_es(&mut g, "call bst_rt_free");
+    if w == 1 {
+      x86_pop(&mut g, x86_reg(XR_RAX));
+    }
+  } else if name_is(p, i, "locked") {
+    x86_locked(&mut g, c, &mut m, p, i);
+  } else if name_is(p, i, "atomic_new") {
+    // One word on the heap; every access is sequentially consistent
+    // (`xchg` and `lock cmpxchg` are full barriers, plain loads suffice).
+    x86_push_val(&mut g, c, &mut m, p, n.a);
+    x86_es(&mut g, "mov $1, %edi");
+    x86_es(&mut g, "call bst_rt_alloc");
+    x86_pop(&mut g, x86_reg(XR_RCX));
+    x86_es(&mut g, "mov %rcx, (%rax)");
+  } else if name_is(p, i, "atomic_end") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, 0, 0, 0, 0);
+    x86_es(&mut g, "mov (%rdi), %rax");
+    x86_push(&mut g, x86_reg(XR_RAX));
+    x86_es(&mut g, "call bst_rt_free");
+    x86_pop(&mut g, x86_reg(XR_RAX));
+  } else if name_is(p, i, "atomic_load") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, 0, 0, 0, 0);
+    x86_es(&mut g, "mov (%rdi), %rax");
+  } else if name_is(p, i, "atomic_store") || name_is(p, i, "atomic_swap") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, XR_RAX, 0, 0, 0);
+    x86_es(&mut g, "xchg %rax, (%rdi)");
+  } else if name_is(p, i, "atomic_cas") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, XR_RAX, XR_RCX, 0, 0);
+    x86_es(&mut g, "lock cmpxchg %rcx, (%rdi)");
+    x86_es(&mut g, "sete %al");
+    x86_es(&mut g, "movzbl %al, %eax");
+  } else if name_is(p, i, "atomic_wrap_add") {
+    // A compare-and-swap loop, so the sum wraps at the width of the type.
+    let t = x86_cell_ty(&mut g, c, &mut m, p, n.a);
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, XR_RSI, 0, 0, 0);
+    let again = x86_label(&mut g);
+    x86_place_label(&mut g, again);
+    x86_es(&mut g, "mov (%rdi), %rax");
+    x86_es(&mut g, "mov %rax, %rdx");
+    x86_es(&mut g, "add %rsi, %rax");
+    x86_norm(&mut g, m, t);
+    x86_es(&mut g, "mov %rax, %rcx");
+    x86_es(&mut g, "mov %rdx, %rax");
+    x86_es(&mut g, "lock cmpxchg %rcx, (%rdi)");
+    x86_jump(&mut g, "jne", again);
+  } else if name_is(p, i, "port_claim") || name_is(p, i, "mmio_claim") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, XR_RSI, XR_RDX, 0, 0);
+    x86_push(&mut g, x86_reg(XR_RDX));
+    x86_push(&mut g, x86_reg(XR_RSI));
+  } else if name_is(p, i, "port_release") || name_is(p, i, "mmio_release") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, XR_RSI, XR_RDX, 0, 0);
+  } else if name_is(p, i, "port_base") || name_is(p, i, "mmio_base") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RAX, 0, 0, 0);
+  } else if name_is(p, i, "port_count") || name_is(p, i, "mmio_len") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RAX, XR_RDX, 0, 0, 0);
+  } else if x86_dev_access(p, i) != 0 {
+    x86_dev(&mut g, c, &mut m, p, i);
+  } else if name_is(p, i, "dma_lend") || name_is(p, i, "dma_take") {
+    // A frame lent to a device stays where it is; the fence orders the
+    // accesses before and after, as the C prelude's does.
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RAX, 0, 0, 0, 0);
+    x86_es(&mut g, "mfence");
+  } else if name_is(p, i, "dma_addr") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RAX, 0, 0, 0, 0);
+  } else if name_is(p, i, "dma_id") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RAX, 0, 0, 0, 0);
+    x86_es(&mut g, "sub bst_rt_pool_base(%rip), %rax");
+    x86_es(&mut g, "shr $12, %rax");
+  } else if name_is(p, i, "host_env") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RCX, XR_RDI, XR_RSI, XR_RDX, 0);
+    x86_es(&mut g, "call bst_rt_host_env");
+  } else if name_is(p, i, "host_cpus") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, 0, 0, 0, 0);
+    x86_es(&mut g, "call bst_rt_host_cpus");
+  } else if name_is(p, i, "host_eprint") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RCX, XR_RDI, XR_RSI, 0, 0);
     x86_es(&mut g, "call bst_rt_eprint");
   } else if name_is(p, i, "host_spawn") {
@@ -4233,7 +4511,7 @@ fn x86_entry(g: &mut X86, m: &mut Mono, p: &Parser, x: u64) {
     let mut w = 1;
     if tk == TY_POOL {
       w = 2;
-    } else if tk != TY_SERIAL && tk != TY_HOST {
+    } else if tk != TY_SERIAL && tk != TY_HOST && (g.stage0 || (tk != TY_PORTS && tk != TY_MMIOSPACE)) {
       g.failed = true;
     }
     off = off + 8 * w;
@@ -4653,11 +4931,64 @@ fn x86_runtime(out: &mut Vec[u64]) {
   cg_s(&mut out, "\t.text\n");
 }
 
-/// The routines of the runtime that only stage1's backend uses (Child and
-/// host_eprint), after `x86_runtime`.
+/// The routines of the runtime that only stage1's backend uses (Child,
+/// host_env, host_cpus, host_eprint, the simulated devices), after
+/// `x86_runtime`.
 fn x86_runtime1(out: &mut Vec[u64]) {
   cg_s(&mut out, "# ---- runtime only stage1 writes (trusted base) ----\n");
   cg_s(&mut out, "\t.text\n");
+  cg_s(&mut out, "bst_rt_host_env:                # the variable named by the %rsi bytes at %rdi into the Bytes at (%rdx); %rax = 1 if it is set\n");
+  cg_s(&mut out, "\tpush %rbp\n");
+  cg_s(&mut out, "\tmov %rsp, %rbp\n");
+  cg_s(&mut out, "\tpush %rbx\n");
+  cg_s(&mut out, "\tpush %r12\n");
+  cg_s(&mut out, "\tpush %r13\n");
+  cg_s(&mut out, "\tpush %r14\n");
+  cg_s(&mut out, "\tand $-16, %rsp\n");
+  cg_s(&mut out, "\tmov %rdx, %rbx\n");
+  cg_s(&mut out, "\tcall bst_rt_cpath\n");
+  cg_s(&mut out, "\tmov %rax, %r12\n");
+  cg_s(&mut out, "\tmov %rax, %rdi\n");
+  cg_s(&mut out, "\tcall getenv@PLT\n");
+  cg_s(&mut out, "\tmov %rax, %r13\n");
+  cg_s(&mut out, "\tmov %r12, %rdi\n");
+  cg_s(&mut out, "\tcall free@PLT\n");
+  cg_s(&mut out, "\ttest %r13, %r13\n");
+  cg_s(&mut out, "\tjz 8f\n");
+  cg_s(&mut out, "\tmov %r13, %rdi\n");
+  cg_s(&mut out, "\tcall strlen@PLT\n");
+  cg_s(&mut out, "\tmov %rax, %r14\n");
+  cg_s(&mut out, "\tmov %rax, %rdi\n");
+  cg_s(&mut out, "\tcall bst_rt_balloc\n");
+  cg_s(&mut out, "\tmov %rax, %r12\n");
+  cg_s(&mut out, "\tmov %rax, %rdi\n");
+  cg_s(&mut out, "\tmov %r13, %rsi\n");
+  cg_s(&mut out, "\tmov %r14, %rcx\n");
+  cg_s(&mut out, "\trep movsb\n");
+  cg_s(&mut out, "\tmov 8(%rbx), %rdi           # replace the old contents\n");
+  cg_s(&mut out, "\tcall bst_rt_free\n");
+  cg_s(&mut out, "\tmov %r14, (%rbx)\n");
+  cg_s(&mut out, "\tmov %r12, 8(%rbx)\n");
+  cg_s(&mut out, "\tmov $1, %eax\n");
+  cg_s(&mut out, "\tjmp 9f\n");
+  cg_s(&mut out, "8:\txor %eax, %eax\n");
+  cg_s(&mut out, "9:\tmov -8(%rbp), %rbx\n");
+  cg_s(&mut out, "\tmov -16(%rbp), %r12\n");
+  cg_s(&mut out, "\tmov -24(%rbp), %r13\n");
+  cg_s(&mut out, "\tmov -32(%rbp), %r14\n");
+  cg_s(&mut out, "\tleave\n");
+  cg_s(&mut out, "\tret\n");
+  cg_s(&mut out, "bst_rt_host_cpus:               # %rax = the processors online (at least 1)\n");
+  cg_s(&mut out, "\tpush %rbp\n");
+  cg_s(&mut out, "\tmov %rsp, %rbp\n");
+  cg_s(&mut out, "\tand $-16, %rsp\n");
+  cg_s(&mut out, "\tmov $84, %edi               # _SC_NPROCESSORS_ONLN\n");
+  cg_s(&mut out, "\tcall sysconf@PLT\n");
+  cg_s(&mut out, "\tcmp $1, %rax\n");
+  cg_s(&mut out, "\tjge 1f\n");
+  cg_s(&mut out, "\tmov $1, %eax\n");
+  cg_s(&mut out, "1:\tleave\n");
+  cg_s(&mut out, "\tret\n");
   cg_s(&mut out, "bst_rt_eprint:                  # write the %rsi bytes at %rdi to stderr, after flushing stdout\n");
   cg_s(&mut out, "\tpush %rbp\n");
   cg_s(&mut out, "\tmov %rsp, %rbp\n");
@@ -4713,7 +5044,17 @@ fn x86_runtime1(out: &mut Vec[u64]) {
   cg_s(&mut out, "\tmovslq -52(%rbp), %rdi\n");
   cg_s(&mut out, "\tcall close@PLT\n");
   cg_s(&mut out, "\tjmp 9f\n");
-  cg_s(&mut out, "1:\tlea 8(,%r12,8), %rdi        # argv for execvp, NULL-terminated\n");
+  cg_s(&mut out, "1:\tmovslq -52(%rbp), %rdi      # the parent's ends are not inherited by later children,\n");
+  cg_s(&mut out, "\tmov $2, %esi                # so closing a child's input reaches it as end of file\n");
+  cg_s(&mut out, "\tmov $1, %edx                # (F_SETFD, FD_CLOEXEC)\n");
+  cg_s(&mut out, "\txor %eax, %eax\n");
+  cg_s(&mut out, "\tcall fcntl@PLT\n");
+  cg_s(&mut out, "\tmovslq -64(%rbp), %rdi\n");
+  cg_s(&mut out, "\tmov $2, %esi\n");
+  cg_s(&mut out, "\tmov $1, %edx\n");
+  cg_s(&mut out, "\txor %eax, %eax\n");
+  cg_s(&mut out, "\tcall fcntl@PLT\n");
+  cg_s(&mut out, "\tlea 8(,%r12,8), %rdi        # argv for execvp, NULL-terminated\n");
   cg_s(&mut out, "\tcall malloc@PLT\n");
   cg_s(&mut out, "\ttest %rax, %rax\n");
   cg_s(&mut out, "\tjz bst_rt_oom\n");
@@ -4947,4 +5288,8 @@ fn x86_runtime1(out: &mut Vec[u64]) {
   cg_s(&mut out, "\tret\n");
   cg_s(&mut out, "\t.section .rodata\n");
   cg_s(&mut out, ".Lrt_rb:\t.string \"rb\"\n");
+  cg_s(&mut out, "\t.bss\n");
+  cg_s(&mut out, "\t.p2align 4\n");
+  cg_s(&mut out, "bst_rt_port_cell:\t.zero 262144            # the simulated I/O ports\n");
+  cg_s(&mut out, "bst_rt_mmio_cell:\t.zero 1048576           # the simulated MMIO window\n");
 }
