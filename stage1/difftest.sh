@@ -18,8 +18,7 @@
 #   C       stage1/cdump.bastio     vs  bastioc0 --dump-c (the whole C file,
 #           runtime prelude included), on every program the checker accepts
 #   driver  stage1/bastioc1.bastio  vs  bastioc0 itself: what `--check`
-#           prints on stderr and its exit status (a failed proof's
-#           sentence masked, as bastioc1 does not print it yet), the
+#           prints on stderr and its exit status, the
 #           C file of `--emit-c`, the C header of `--header`, the list of
 #           `--trusted-base`, and the programs it builds, which must
 #           exit as tests/pass says; and bastioc1 built by itself must
@@ -132,19 +131,13 @@ for f in $files; do
 done
 echo "-- C: $match matched ($((match-errors)) of them C files), $differ differ"
 { [ "$differ" = 0 ] && [ "$match" -gt "$errors" ]; } || status=1
-# The driver. The sentence after `error[CODE]:` and the hints (`  = ..`)
-# of the errors before the verifier are being ported phase by phase: where
-# bastioc1 prints none, bastioc0's are left out of the comparison (a failed
-# proof's counterexample is always compared). The reason a file cannot be
-# read comes from the OS and is left out, and bastioc1 names itself.
-mask() {  # stage0's stderr, bastioc1's stderr
-  local keep_msg=1 keep_notes=1
-  grep -q 'error\[[A-Z-]*\]: ' "$2" || keep_msg=0
-  grep -q 'error\[E-\(VERIFY\|SOLVER\)' "$1" || grep -q '^  = ' "$2" || keep_notes=0
-  if [ $keep_notes = 1 ]; then cat "$1"; else grep -v '^  = ' "$1"; fi \
-    | if [ $keep_msg = 1 ]; then cat; else sed -e 's/^\(.*: error\[[A-Z-]*\]\): .*$/\1/'; fi \
-    | sed -e 's/^\(.*: error\[E-IMPORT\]: cannot read `[^`]*`\): .*$/\1/' \
-          -e 's/^\(.*: error\[E-PARSE\]: include_bytes: cannot read .*\): [^:]*$/\1/' -e 's/^bastioc0: /bastioc1: /'
+# The driver. Everything is compared except what bastioc1 cannot know:
+# the reason a file cannot be read and the solver's own words when it
+# fails (E-SOLVER) come from outside; and bastioc1 names itself.
+mask() {  # stage0's stderr
+  sed -e 's/^\(.*: error\[E-SOLVER\]\): .*$/\1/' \
+      -e 's/^\(.*: error\[E-IMPORT\]: cannot read `[^`]*`\): .*$/\1/' \
+      -e 's/^\(.*: error\[E-PARSE\]: include_bytes: cannot read .*\): [^:]*$/\1/' -e 's/^bastioc0: /bastioc1: /' "$1"
 }
 match=0 differ=0 errors=0
 for f in $files; do
@@ -152,7 +145,7 @@ for f in $files; do
   "$BASTIOC" --check --target "$t" "$f" 2>"$tmp/want.err" >/dev/null; echo "exit $?" >>"$tmp/want.err"
   "$tmp/bastioc1" --check --target "$t" "$f" 2>"$tmp/got.err" >/dev/null; echo "exit $?" >>"$tmp/got.err"
   grep -q 'error\[' "$tmp/want.err" && errors=$((errors+1))
-  mask "$tmp/want.err" "$tmp/got.err" >"$tmp/want"
+  mask "$tmp/want.err" >"$tmp/want"
   cp "$tmp/got.err" "$tmp/got"
   if cmp -s "$tmp/want" "$tmp/got"; then
     match=$((match+1))
