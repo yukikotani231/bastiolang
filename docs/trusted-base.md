@@ -57,7 +57,7 @@ Every builtin (the `builtin` lines of the listing, with the targets that have it
 - a value counted at least once is the element at some index below the length (`cnt_w` names that index);
 - a push of `y` adds one to the count of `y`; a pop removes one from the count of the last element; `vec_set` and `vec_swap` of `y` at `i` remove one from the count of the old element at `i` and add one to the count of `y`.
 
-They are written out in `COUNT_LEMMAS` and `count_step` in `stage0/src/verify.rs` (`count_lemmas` and `count_step` in `stage1/verify.bastio`). They are sent only for functions whose specifications use `vcount`, or call one whose contract does, so a program that never counts is verified exactly as before.
+`--trusted-base` lists them (the `lemma` lines). They are written out in `COUNT_LEMMAS` and `count_step` in `stage0/src/verify.rs` (`count_lemmas` and `count_step` in `stage1/verify.bastio`). They are sent only for functions whose specifications use `vcount`, or call one whose contract does, so a program that never counts is verified exactly as before.
 
 ## 4. Assumptions at the boundaries
 
