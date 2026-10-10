@@ -215,7 +215,10 @@ struct Vr {
   /// What the next obligation says when it fails, after "could not prove"
   /// (filled in before `prove`), and every obligation's sentence.
   msg: Vec[u64],
-  mpool: Vec[u64]
+  mpool: Vec[u64],
+  /// The type arguments of the instance whose source the sentences quote
+  /// (see `rd_sub`): stage0 quotes the copy made for the instance.
+  tsub: Vec[u64]
 }
 
 fn vr_new(m: &mut Mono, p: &Parser) -> Vr {
@@ -231,7 +234,7 @@ fn vr_new(m: &mut Mono, p: &Parser) -> Vr {
     t_zarr: 0, t_nobool: 0, t_k: 0, t_255: 0, unit: 0,
     ty_bytes: prim(&mut m, p, TY_BYTES), ty_child: prim(&mut m, p, TY_CHILD), ty_frame: prim(&mut m, p, TY_FRAME),
     ty_pt: prim(&mut m, p, TY_PT), ty_pool: prim(&mut m, p, TY_POOL), fail_at: 0, fail_code: 0,
-    fail_obl: 0, msg: vec_new[u64](), mpool: vec_new[u64]()
+    fail_obl: 0, msg: vec_new[u64](), mpool: vec_new[u64](), tsub: vec_new[u64]()
   };
   v.t_true = atom_str(&mut v, "true");
   v.t_false = atom_str(&mut v, "false");
@@ -266,6 +269,7 @@ fn vr_free(v: Vr) {
   vec_free(v.snaps);
   vec_free(v.msg);
   vec_free(v.mpool);
+  vec_free(v.tsub);
 }
 
 /// `a + b`, or the largest u64 if that overflows (indices that large are
@@ -2365,14 +2369,53 @@ fn vm_num(v: &mut Vr, x: u64) {
 
 /// Expression `i` as stage0's `render` writes it.
 fn vm_expr(v: &mut Vr, p: &Parser, i: u64) {
-  rd_expr(&mut v.msg, p, i, true);
+  let mut t = vec_new[u64]();
+  rd_expr_s(&mut t, p, i, true, v.tsub);
+  let mut k = 0;
+  while k < vec_len(t) {
+    vec_push(&mut v.msg, u_at(t, k));
+    k = k + 1;
+  }
+  vec_free(t);
+}
+
+/// What `rd_sub` needs for instance `x`: each type parameter's name and
+/// the name of the type it stands for.
+fn vm_tsub(m: &Mono, p: &Parser, x: u64) -> Vec[u64] {
+  let mut sub = vec_new[u64]();
+  let xi = inst_at(m, x);
+  if xi.n == 0 || xi.args >= SRC_MAX {
+    return sub;
+  }
+  let d = node_at(p.nodes, xi.def);
+  let mut k = d.v;
+  let mut j = 0;
+  while k != 0 && j < xi.n && j < SRC_MAX
+    invariant j <= SRC_MAX
+  {
+    let kn = node_at(p.nodes, k);
+    let mut name = vec_new[u64]();
+    tyn_to(&mut name, m, p, targ_at(m, xi.args + j));
+    vec_push(&mut sub, kn.s);
+    vec_push(&mut sub, kn.e);
+    vec_push(&mut sub, vec_len(name));
+    let mut q = 0;
+    while q < vec_len(name) {
+      vec_push(&mut sub, u_at(name, q));
+      q = q + 1;
+    }
+    vec_free(name);
+    k = kn.next;
+    j = j + 1;
+  }
+  return sub;
 }
 
 /// An argument: rendered, with a leading `&mut ` dropped (it reads as
 /// plain `x` in specifications).
 fn vm_arg(v: &mut Vr, p: &Parser, i: u64) {
   let mut t = vec_new[u64]();
-  rd_expr(&mut t, p, i, true);
+  rd_expr_s(&mut t, p, i, true, v.tsub);
   let mut k = 0;
   if vec_len(t) >= 5 && u_at(t, 0) == 38 && u_at(t, 1) == 109 && u_at(t, 2) == 117 && u_at(t, 3) == 116 && u_at(t, 4) == 32 {
     k = 5;
@@ -3777,6 +3820,9 @@ fn vuser_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64, loc: u6
   let nm = inst_name(&mut v, m, p, x);
   let mut b = vec_new[Bnd]();
   let mut r = d.c;
+  // The callee's precondition, quoted from its copy for instance `x`.
+  let mine = v.tsub;
+  v.tsub = vm_tsub(m, p, x);
   while r != 0 {
     let t = spec_tm(&mut v, c, &mut m, p, r, pre, pre, false, 0, &mut b);
     vm_s(&mut v, "the precondition `");
@@ -3787,6 +3833,9 @@ fn vuser_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64, loc: u6
     prove(&mut v, st, t, loc, VC_REQUIRES);
     r = next_of(p, r);
   }
+  let theirs = v.tsub;
+  v.tsub = mine;
+  vec_free(theirs);
   let rt = conv(&mut m, p, d.b, x, xi.def);
   let h = cat_str(&mut v, nm, "_ret");
   let res = fresh_of(&mut v, c, m, p, rt, h);
@@ -5663,6 +5712,9 @@ fn verify_fn(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
   let xi = inst_at(m, x);
   let d = node_at(p.nodes, xi.def);
   v.env = x;
+  let prev = v.tsub;
+  v.tsub = vm_tsub(m, p, x);
+  vec_free(prev);
   v.counts = has_u(v.cnt_fns, xi.def);
   if v.counts {
     count_lemmas(&mut v);
