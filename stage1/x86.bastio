@@ -21,6 +21,7 @@
 // are small (frame offsets, word counts), and stage0 would panic where they
 // could overflow, so the proofs this compiler would need buy nothing.
 import "codegen.bastio";
+import "render.bastio";
 
 // Registers. SAVED (callee-saved) and LEAF (caller-saved, for variables of
 // leaf functions first) are the ranges XR_RBX..XR_R15 and XR_R8..XR_R11.
@@ -151,8 +152,10 @@ struct X86 {
   decl: Vec[X86Decl],
   /// Whether `x86_two` swapped its operands.
   sw: bool,
-  /// Something the backend does not support yet was found.
+  /// Something the backend does not support yet was found, and what
+  /// (stage0's message for the first such thing).
   failed: bool,
+  fmsg: Vec[u64],
   /// Write exactly what stage0's backend writes: none of the improvements
   /// made only here (for the differential test against stage0).
   stage0: bool,
@@ -175,8 +178,8 @@ fn x86_new() -> X86 {
     saves: vec_new[X86Save](), stack: vec_new[u64](), bsize: vec_new[u64](),
     sdata: vec_new[u64](), sstart: vec_new[u64](), slens: vec_new[u64](),
     labels: 0, frame: 0, depth: 0, env: 0, pre: 0, retl: 0, retw: 0, reto: 0, rdk: 0, rda: 0, rdo: 0,
-    parent: vec_new[u64](), cur: 0, decl: vec_new[X86Decl](), sw: false, failed: false, stage0: false,
-    target: TARGET_HOSTED, smp: vec_new[u64](), nsmp: 0, snode: vec_new[u64]()
+    parent: vec_new[u64](), cur: 0, decl: vec_new[X86Decl](), sw: false, failed: false, fmsg: vec_new[u64](),
+    stage0: false, target: TARGET_HOSTED, smp: vec_new[u64](), nsmp: 0, snode: vec_new[u64]()
   };
 }
 
@@ -198,6 +201,16 @@ fn x86_free(g: X86) {
   vec_free(g.decl);
   vec_free(g.smp);
   vec_free(g.snode);
+  vec_free(g.fmsg);
+}
+
+/// Gives up on the program, saying why in `s` unless an earlier failure
+/// already did.
+fn x86_fail(g: &mut X86, s: Str) {
+  if !g.failed {
+    g.failed = true;
+    cg_s(&mut g.fmsg, s);
+  }
 }
 
 // ---- Small helpers ----
@@ -671,8 +684,8 @@ fn x86_words(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, t: u64) -> u64 {
   if k == TY_BUF || k == TY_BYTES || k == TY_STR || k == TY_POOL {
     return 2;
   }
-  if (k == TY_LOCK || k == TY_ATOMIC || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA || k == TY_MMU || k == TY_CPU || k == TY_LEASE) && !g.stage0 {
-    return 1;     // a lock or atomic word's address; Ports, MmioSpace, Mmu and Cpu (0); a frame's address (a Lease: its table)
+  if (k == TY_LOCK || k == TY_ATOMIC || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA || k == TY_MMU || k == TY_CPU || k == TY_LEASE || k == TY_SHARED) && !g.stage0 {
+    return 1;     // a lock or atomic word's address; Ports, MmioSpace, Mmu and Cpu (0); a frame's address (a Lease: its table; a Shared page)
   }
   if (k == TY_PORTIO || k == TY_MMIO) && !g.stage0 {
     return 2;     // base, then count or length
@@ -706,7 +719,12 @@ fn x86_words(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, t: u64) -> u64 {
     }
     return s;
   }
-  g.failed = true;
+  if !g.failed {
+    g.failed = true;
+    cg_s(&mut g.fmsg, "the native backend does not support ");
+    tyn_to(&mut g.fmsg, m, p, t);
+    cg_s(&mut g.fmsg, " yet");
+  }
   return 0;
 }
 
@@ -720,7 +738,7 @@ fn x86_field(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, t: u64, s: u64, e: 
   let dn = def_node(m, p, x);
   let j = index_in(p, dn.a, s, e);
   if j == 0 {
-    g.failed = true;
+    x86_fail(&mut g, "internal: not a field");
     return x86_mem_loc(0, 0, 0);
   }
   let mut off = 0;
@@ -775,7 +793,9 @@ fn x86_inline_builtin(p: &Parser, i: u64) -> bool {
     || name_is(p, i, "frame_read8") || name_is(p, i, "frame_write") || name_is(p, i, "frame_write8") || name_is(p, i, "pt_has") || name_is(p, i, "pt_writable")
     || name_is(p, i, "pt_put") || name_is(p, i, "pt_put_frame") || name_is(p, i, "pt_take") || name_is(p, i, "pt_take_frame")
     || name_is(p, i, "bcopy") || name_is(p, i, "bmove") || name_is(p, i, "frame_to_bytes") || name_is(p, i, "bytes_to_frame")
-    || name_is(p, i, "pt_lease_count");
+    || name_is(p, i, "pt_lease_count") || name_is(p, i, "shared_new") || name_is(p, i, "shared_dup") || name_is(p, i, "shared_drop")
+    || name_is(p, i, "shared_id") || name_is(p, i, "pt_shared") || name_is(p, i, "pt_put_shared") || name_is(p, i, "pt_take_shared")
+    || name_is(p, i, "pt_dup_shared");
 }
 
 /// The length builtins (stage0's LENS): word 0 of their argument.
@@ -1614,7 +1634,7 @@ fn x86_var(g: &mut X86, p: &Parser, i: u64) -> X86Var {
   let id = x86_nmn(&mut g, p, i);
   let k = x86_find(g, id);
   if k == 0 {
-    g.failed = true;
+    x86_fail(&mut g, "internal: not a variable");
   }
   return x86_var_at(g, wrap_sub(k, 1));
 }
@@ -1780,7 +1800,7 @@ fn x86_place(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, segs: &Vec[u64]) ->
     }
     let fl = x86_field(&mut g, c, m, p, t, f.s, f.e);
     if l.k != XL_MEM {
-      g.failed = true;
+      x86_fail(&mut g, "internal: a register holds no struct");
     }
     l = x86_mem_loc(l.b, wrap_add(l.o, wrap_mul(8, fl.o)), fl.ty);
     t = fl.ty;
@@ -2393,7 +2413,7 @@ fn x86_scalar(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     } else {
       let l = x86_place(&mut g, c, m, p, segs);
       if l.k != XL_MEM {
-        g.failed = true;
+        x86_fail(&mut g, "internal: a borrowed variable is in memory");
       }
       x86_t(&mut g, "lea ");
       x86_o(&mut g, x86_lop(l, 0));
@@ -2489,7 +2509,7 @@ fn x86_scalar(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     }
     let t = x86_ty(&mut g, c, &mut m, p, i);
     if x86_words(&mut g, c, m, p, t) != 1 {
-      g.failed = true;
+      x86_fail(&mut g, "internal: a call used as a scalar");
       return;
     }
     x86_call(&mut g, c, &mut m, p, ci, inst, t);
@@ -2501,7 +2521,7 @@ fn x86_scalar(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_pop(&mut g, x86_reg(XR_RAX));
     return;
   }
-  g.failed = true;
+  x86_fail(&mut g, "internal: not a scalar");
 }
 
 fn x86_bin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
@@ -2904,7 +2924,7 @@ fn x86_push_val(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     return;
   }
   if w != 1 {
-    g.failed = true;
+    x86_fail(&mut g, "internal: cannot push a value of several words");
     return;
   }
   if !g.stage0 && x86_simple(p, i) && t == base_t(m, t) {
@@ -3679,7 +3699,52 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     }
     x86_es(&mut g, "mov (%rdx), %rdx");
     x86_es(&mut g, "mov %rax, (%rdx,%rcx,8)");
-  } else if name_is(p, i, "pt_take") || name_is(p, i, "pt_take_frame") {
+  } else if name_is(p, i, "shared_new") || name_is(p, i, "shared_dup") || name_is(p, i, "pt_dup_shared") {
+    // Shared pages: a 32-bit reference count per pool frame, by page
+    // number. A new page starts at one (a plain store is a release on
+    // x86); a copy adds one atomically. pt_dup_shared copies the page a
+    // slot maps.
+    if name_is(p, i, "pt_dup_shared") {
+      x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RAX, 0, 0, 0);
+      x86_es(&mut g, "mov (%rdx,%rax,8), %rax");
+      x86_es(&mut g, "movabs $0x000FFFFFFFFFF000, %rcx");
+      x86_es(&mut g, "and %rcx, %rax");
+    } else {
+      x86_to_regs(&mut g, c, &mut m, p, i, XR_RAX, 0, 0, 0, 0);
+    }
+    x86_shared_ref(&mut g);
+    if name_is(p, i, "shared_new") {
+      x86_es(&mut g, "movl $1, (%rcx,%rdx,4)");
+    } else {
+      x86_es(&mut g, "lock incl (%rcx,%rdx,4)");
+    }
+  } else if name_is(p, i, "shared_drop") {
+    // Gives up one reference: the page number when it was the last, else
+    // all ones.
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RSI, XR_RAX, 0, 0, 0);
+    x86_shared_ref(&mut g);
+    x86_es(&mut g, "mov %rdx, %rax");
+    x86_es(&mut g, "mov $-1, %rsi");
+    x86_es(&mut g, "lock decl (%rcx,%rdx,4)");
+    x86_es(&mut g, "cmovnz %rsi, %rax");
+  } else if name_is(p, i, "shared_id") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RAX, 0, 0, 0, 0);
+    x86_es(&mut g, "sub bst_rt_pool_base(%rip), %rax");
+    x86_es(&mut g, "shr $12, %rax");
+  } else if name_is(p, i, "pt_shared") {
+    // Bit 9, one the processor ignores, marks a slot mapping a shared page.
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RAX, 0, 0, 0);
+    x86_es(&mut g, "mov (%rdx,%rax,8), %rax");
+    x86_es(&mut g, "shr $9, %rax");
+    x86_es(&mut g, "and $1, %eax");
+  } else if name_is(p, i, "pt_put_shared") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RCX, XR_RAX, XR_RSI, 0);
+    x86_es(&mut g, "shl $1, %rsi");
+    x86_es(&mut g, "or %rsi, %rax");
+    x86_es(&mut g, "or $0x205, %rax");
+    x86_es(&mut g, "mov (%rdx), %rdx");
+    x86_es(&mut g, "mov %rax, (%rdx,%rcx,8)");
+  } else if name_is(p, i, "pt_take") || name_is(p, i, "pt_take_frame") || name_is(p, i, "pt_take_shared") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RCX, 0, 0, 0);
     x86_es(&mut g, "mov (%rdx), %rdx");
     x86_es(&mut g, "lea (%rdx,%rcx,8), %rdx");
@@ -3899,7 +3964,18 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
   } else if !g.stage0 {
     x86_builtin1(&mut g, c, &mut m, p, i);
   } else {
+    x86_fail_builtin(&mut g, p, i);
+  }
+}
+
+/// Gives up on builtin call `i`, in stage0's words.
+fn x86_fail_builtin(g: &mut X86, p: &Parser, i: u64) {
+  if !g.failed {
     g.failed = true;
+    cg_s(&mut g.fmsg, "the native backend does not support `");
+    let n = node_at(p.nodes, i);
+    rd_src(&mut g.fmsg, p, n.s, n.e);
+    cg_s(&mut g.fmsg, "` yet");
   }
 }
 
@@ -4471,7 +4547,7 @@ fn x86_builtin1(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_es(&mut g, "mov (%rcx), %rdx");
     x86_es(&mut g, "call bst_rt_fsys");
   } else {
-    g.failed = true;
+    x86_fail_builtin(&mut g, p, i);
   }
 }
 
@@ -4481,6 +4557,15 @@ fn x86_take_pool(g: &mut X86) {
   g.cg.pool = vec_new[u64]();
   x86_append(&mut g.ln, b);
   vec_free(b);
+}
+
+/// Shared pages: %rdx the page number of the page at %rax, %rcx the
+/// reference counts.
+fn x86_shared_ref(g: &mut X86) {
+  x86_es(&mut g, "mov %rax, %rdx");
+  x86_es(&mut g, "sub bst_rt_pool_base(%rip), %rdx");
+  x86_es(&mut g, "shr $12, %rdx");
+  x86_es(&mut g, "lea bst_rt_shared_refs(%rip), %rcx");
 }
 
 /// The register of expression `i` if it is a variable kept in one (0: none).
@@ -5696,6 +5781,8 @@ fn x86_entry(g: &mut X86, m: &mut Mono, p: &Parser, x: u64) {
   // gets it by value or by address.
   let mut off = 8;
   let mut pool = 0;
+  // stage0 stops at the first parameter it cannot pass.
+  let mut bad = false;
   let mut q = dn.a;
   while q != 0 && off <= 64 {
     let qn = node_at(p.nodes, q);
@@ -5706,8 +5793,14 @@ fn x86_entry(g: &mut X86, m: &mut Mono, p: &Parser, x: u64) {
     if tk == TY_POOL {
       w = 2;
     } else if tk != TY_SERIAL && tk != TY_HOST && (g.stage0 || (tk != TY_PORTS && tk != TY_MMIOSPACE))
-      && !(g.target == TARGET_KERNEL && (tk == TY_MMU || tk == TY_CPU)) {
-      g.failed = true;
+      && !(g.target == TARGET_KERNEL && (tk == TY_MMU || tk == TY_CPU)) && !bad {
+      bad = true;
+      if !g.failed {
+        g.failed = true;
+        cg_s(&mut g.fmsg, "the native backend does not support a `main` parameter of type ");
+        tyn_to(&mut g.fmsg, m, p, t);
+        cg_s(&mut g.fmsg, " yet");
+      }
     }
     off = off + 8 * w;
     if tk == TY_POOL {
@@ -5740,8 +5833,8 @@ fn x86_entry(g: &mut X86, m: &mut Mono, p: &Parser, x: u64) {
     }
     q = qn.next;
   }
-  if off > 64 {
-    g.failed = true;
+  if off > 64 && !bad {
+    x86_fail(&mut g, "the native backend does not support so many `main` parameters yet");
   }
   cg_s(&mut g.out, "\tcall f_main\n");
   if kind_t(m, cg_ret_ty(&mut m, p, x)) != TY_U64 {
@@ -5775,8 +5868,10 @@ fn x86_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
     k = k + 1;
   }
   if main_x == 0 {
+    x86_fail(&mut g, "the native backend does not support libraries (`export fn` without `main`) yet");
     return false;
   }
+
   cg_s(&mut g.out, "# generated by bastioc0 --backend native -- do not edit\n\t.text\n");
   k = 0;
   while k < vec_len(m.fns) && !g.failed {
@@ -5797,6 +5892,7 @@ fn x86_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
     if !g.stage0 {
       x86_runtime1(&mut g.out);
       cg_s(&mut g.out, "\t.bss\n\t.p2align 3\nbst_rt_pt_leases:\t.zero 262144     # a 32-bit lease count per pool frame\n");
+      cg_s(&mut g.out, "bst_rt_shared_refs:\t.zero 262144   # a 32-bit reference count per shared pool frame\n");
     }
   }
   cg_s(&mut g.out, "\t.section .rodata\n");
@@ -7166,6 +7262,7 @@ fn x86_runtime_kernel(out: &mut Vec[u64]) {
   cg_s(&mut out, "bst_rt_mbi:\t.quad 0\n");
   cg_s(&mut out, "bst_rt_pool_base:\t.quad 0\n");
   cg_s(&mut out, "bst_rt_pt_leases:\t.zero 262144     # a 32-bit lease count per pool frame\n");
+  cg_s(&mut out, "bst_rt_shared_refs:\t.zero 262144   # a 32-bit reference count per shared pool frame\n");
   cg_s(&mut out, "bst_rt_arena_lock:\t.quad 0\n");
   cg_s(&mut out, "bst_rt_arena_top:\t.quad 0\n");
   cg_s(&mut out, "bst_rt_free_list:\t.quad 0\n");
