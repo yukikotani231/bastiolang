@@ -70,6 +70,7 @@ const CMD_ASSERT: u64 = 2;    // (assert a)
 const CMD_PUSH: u64 = 3;
 const CMD_POP: u64 = 4;
 const CMD_CHECK: u64 = 5;
+const CMD_FAIL: u64 = 6;      // not sent: a failure found without the solver (obls says which)
 
 /// Largest element count `alloc` accepts (2^60).
 const ALLOC_MAX: u64 = 1152921504606846976;
@@ -96,6 +97,53 @@ struct Chg { name: u64, keep: bool }
 /// keep its shape.
 struct SumRow { x: u64, j: u64, rel: u64, keep: bool }
 
+/// A proof obligation, for reporting it if it fails: the node an error
+/// points at, the error code (VC_*), the instance being verified, and the
+/// variables in scope (snaps[env .. env + n]).
+struct Obl { at: u64, code: u64, x: u64, env: u64, n: u64 }
+
+// Error codes of failed proofs.
+const VC_ALLOC: u64 = 1;
+const VC_ASSERT: u64 = 2;
+const VC_BOUNDS: u64 = 3;
+const VC_BYTE: u64 = 4;
+const VC_CAST: u64 = 5;
+const VC_DIVZERO: u64 = 6;
+const VC_ENSURES: u64 = 7;
+const VC_INVARIANT: u64 = 8;
+const VC_LEAK: u64 = 9;
+const VC_MMU: u64 = 10;
+const VC_OVERFLOW: u64 = 11;
+const VC_OWN: u64 = 12;
+const VC_PT: u64 = 13;
+const VC_REQUIRES: u64 = 14;
+const VC_UNDERFLOW: u64 = 15;
+const VC_UNREACHABLE: u64 = 16;
+/// Not a proof: an `export fn` may free or replace a buffer C lent it.
+const VC_EXPORT: u64 = 17;
+const VC_LOCKINV: u64 = 18;
+
+fn vc_name(code: u64) -> Str {
+  if code == VC_ALLOC { return "E-VERIFY-ALLOC"; }
+  if code == VC_ASSERT { return "E-VERIFY-ASSERT"; }
+  if code == VC_BOUNDS { return "E-VERIFY-BOUNDS"; }
+  if code == VC_BYTE { return "E-VERIFY-BYTE"; }
+  if code == VC_CAST { return "E-VERIFY-CAST"; }
+  if code == VC_DIVZERO { return "E-VERIFY-DIVZERO"; }
+  if code == VC_ENSURES { return "E-VERIFY-ENSURES"; }
+  if code == VC_INVARIANT { return "E-VERIFY-INVARIANT"; }
+  if code == VC_LEAK { return "E-VERIFY-LEAK"; }
+  if code == VC_MMU { return "E-VERIFY-MMU"; }
+  if code == VC_OVERFLOW { return "E-VERIFY-OVERFLOW"; }
+  if code == VC_OWN { return "E-VERIFY-OWN"; }
+  if code == VC_PT { return "E-VERIFY-PT"; }
+  if code == VC_REQUIRES { return "E-VERIFY-REQUIRES"; }
+  if code == VC_UNDERFLOW { return "E-VERIFY-UNDERFLOW"; }
+  if code == VC_EXPORT { return "E-EXPORT"; }
+  if code == VC_LOCKINV { return "E-VERIFY-LOCKINV"; }
+  return "E-VERIFY-UNREACHABLE";
+}
+
 /// The state on one path: the path condition and the variables' values.
 /// `live` is false once every path has returned.
 struct VState { pc: Vec[u64], env: Vec[Bind], live: bool }
@@ -118,6 +166,9 @@ struct Vr {
   /// Every function's summaries, grouped by instance: rows
   /// sum_start[x] .. sum_start[x] + sum_n[x] are instance x's.
   sums: Vec[SumRow],
+  /// Every proof obligation so far, and the variables in scope at each.
+  obls: Vec[Obl],
+  snaps: Vec[Bind],
   sum_start: Vec[u64],
   sum_n: Vec[u64],
   t_true: u64,
@@ -152,7 +203,7 @@ fn vr_new(m: &mut Mono, p: &Parser) -> Vr {
   let mut v = Vr {
     pool: vec_new[u64](), tms: tms, targs: vec_new[u64](), vals: vals, kids: vec_new[u64](),
     log: vec_new[Cmd](), counter: 0, obligations: 0, box_depth: 0, cur: 0, env: 0,
-    sums: vec_new[SumRow](), sum_start: vec_new[u64](), sum_n: vec_new[u64](),
+    sums: vec_new[SumRow](), obls: vec_new[Obl](), snaps: vec_new[Bind](), sum_start: vec_new[u64](), sum_n: vec_new[u64](),
     t_true: 0, t_false: 0, t_zero: 0, t_u64max: 0, t_allocmax: 0, t_flimit: 0, t_plimit: 0, t_mmio_lo: 0, t_mmio_hi: 0, t_poolsize: 0,
     t_zarr: 0, t_nobool: 0, t_k: 0, t_255: 0, unit: 0,
     ty_bytes: prim(&mut m, p, TY_BYTES), ty_child: prim(&mut m, p, TY_CHILD), ty_frame: prim(&mut m, p, TY_FRAME),
@@ -186,6 +237,8 @@ fn vr_free(v: Vr) {
   vec_free(v.sums);
   vec_free(v.sum_start);
   vec_free(v.sum_n);
+  vec_free(v.obls);
+  vec_free(v.snaps);
 }
 
 /// `a + b`, or the largest u64 if that overflows (indices that large are
@@ -670,102 +723,158 @@ fn or_all(v: &mut Vr, xs: &Vec[u64]) -> u64 {
   return appv(&mut v, OP_OR, xs);
 }
 
-fn put_op(con: &Serial, op: u64) {
-  if op == OP_ADD { put(con, "+"); }
-  else if op == OP_SUB { put(con, "-"); }
-  else if op == OP_MUL { put(con, "*"); }
-  else if op == OP_DIV { put(con, "div"); }
-  else if op == OP_MOD { put(con, "mod"); }
-  else if op == OP_EQ { put(con, "="); }
-  else if op == OP_LT { put(con, "<"); }
-  else if op == OP_LE { put(con, "<="); }
-  else if op == OP_GT { put(con, ">"); }
-  else if op == OP_GE { put(con, ">="); }
-  else if op == OP_AND { put(con, "and"); }
-  else if op == OP_OR { put(con, "or"); }
-  else if op == OP_NOT { put(con, "not"); }
-  else if op == OP_IMP { put(con, "=>"); }
-  else if op == OP_ITE { put(con, "ite"); }
-  else if op == OP_SELECT { put(con, "select"); }
-  else if op == OP_STORE { put(con, "store"); }
+// ---- Printing commands (into a text buffer of bytes) ----
+
+fn out_str(out: &mut Vec[u64], s: Str) {
+  let mut k = 0;
+  while k < slen(s)
+    invariant k <= slen(s)
+  {
+    vec_push(&mut out, sget(s, k));
+    k = k + 1;
+  }
 }
 
-fn put_tm(con: &Serial, v: &Vr, t: u64) {
+fn out_num(out: &mut Vec[u64], x: u64) {
+  let mut d = vec_new[u64]();
+  let mut y = x;
+  vec_push(&mut d, 48 + y % 10);
+  y = y / 10;
+  while y > 0 {
+    vec_push(&mut d, 48 + y % 10);
+    y = y / 10;
+  }
+  let mut k = vec_len(d);
+  while k > 0 {
+    k = k - 1;
+    vec_push(&mut out, u_at(d, k));
+  }
+  vec_free(d);
+}
+
+fn out_op(out: &mut Vec[u64], op: u64) {
+  if op == OP_ADD { out_str(&mut out, "+"); }
+  else if op == OP_SUB { out_str(&mut out, "-"); }
+  else if op == OP_MUL { out_str(&mut out, "*"); }
+  else if op == OP_DIV { out_str(&mut out, "div"); }
+  else if op == OP_MOD { out_str(&mut out, "mod"); }
+  else if op == OP_EQ { out_str(&mut out, "="); }
+  else if op == OP_LT { out_str(&mut out, "<"); }
+  else if op == OP_LE { out_str(&mut out, "<="); }
+  else if op == OP_GT { out_str(&mut out, ">"); }
+  else if op == OP_GE { out_str(&mut out, ">="); }
+  else if op == OP_AND { out_str(&mut out, "and"); }
+  else if op == OP_OR { out_str(&mut out, "or"); }
+  else if op == OP_NOT { out_str(&mut out, "not"); }
+  else if op == OP_IMP { out_str(&mut out, "=>"); }
+  else if op == OP_ITE { out_str(&mut out, "ite"); }
+  else if op == OP_SELECT { out_str(&mut out, "select"); }
+  else if op == OP_STORE { out_str(&mut out, "store"); }
+}
+
+fn out_tm(out: &mut Vec[u64], v: &Vr, t: u64) {
   let x = tm_at(v, t);
   if x.kind == VT_ATOM {
     let mut k = 0;
     while k < x.b {
-      let ch = pool_at(v, vadd(x.a, k));
-      if ch <= 255 {
-        serial_write(con, ch);
-      }
+      vec_push(&mut out, pool_at(v, vadd(x.a, k)));
       k = k + 1;
     }
   } else if x.kind == VT_NUM {
-    put_num(con, x.a);
+    out_num(&mut out, x.a);
   } else if x.kind == VT_APP {
-    put(con, "(");
-    put_op(con, x.a);
+    out_str(&mut out, "(");
+    out_op(&mut out, x.a);
     let mut k = 0;
     while k < x.c {
-      put(con, " ");
-      put_tm(con, v, targ(v, t, k));
+      out_str(&mut out, " ");
+      out_tm(&mut out, v, targ(v, t, k));
       k = k + 1;
     }
-    put(con, ")");
+    out_str(&mut out, ")");
   } else if x.kind == VT_FORALL || x.kind == VT_LAMBDA {
     if x.kind == VT_FORALL {
-      put(con, "(forall ((");
+      out_str(&mut out, "(forall ((");
     } else {
-      put(con, "(lambda ((");
+      out_str(&mut out, "(lambda ((");
     }
-    put_tm(con, v, x.a);
-    put(con, " Int)) ");
-    put_tm(con, v, x.b);
-    put(con, ")");
+    out_tm(&mut out, v, x.a);
+    out_str(&mut out, " Int)) ");
+    out_tm(&mut out, v, x.b);
+    out_str(&mut out, ")");
   }
 }
 
-fn put_sort(con: &Serial, so: u64) {
+fn out_sort(out: &mut Vec[u64], so: u64) {
   let mut d = so / 2;
   let depth = d;
   while d > 0 {
-    put(con, "(Array Int ");
+    out_str(&mut out, "(Array Int ");
     d = d - 1;
   }
-  if so % 2 == SO_BOOL { put(con, "Bool"); } else { put(con, "Int"); }
+  if so % 2 == SO_BOOL { out_str(&mut out, "Bool"); } else { out_str(&mut out, "Int"); }
   while d < depth {
-    put(con, ")");
+    out_str(&mut out, ")");
     d = d + 1;
+  }
+}
+
+/// The two commands every session starts with.
+fn out_header(out: &mut Vec[u64]) {
+  out_str(&mut out, "(set-option :produce-models true)\n");
+  out_str(&mut out, "(set-option :timeout 10000)\n");
+}
+
+/// Command `cmd`, with its newline.
+fn out_cmd(out: &mut Vec[u64], v: &Vr, cmd: Cmd) {
+  if cmd.kind == CMD_DECL {
+    out_str(&mut out, "(declare-const ");
+    out_tm(&mut out, v, cmd.a);
+    out_str(&mut out, " ");
+    out_sort(&mut out, cmd.b);
+    out_str(&mut out, ")\n");
+  } else if cmd.kind == CMD_ASSERT {
+    out_str(&mut out, "(assert ");
+    out_tm(&mut out, v, cmd.a);
+    out_str(&mut out, ")\n");
+  } else if cmd.kind == CMD_PUSH {
+    out_str(&mut out, "(push 1)\n");
+  } else if cmd.kind == CMD_POP {
+    out_str(&mut out, "(pop 1)\n");
+  } else if cmd.kind == CMD_CHECK {
+    out_str(&mut out, "(check-sat)\n");
+  }
+}
+
+/// Writes the bytes in `out` to the console and empties it.
+fn flush_out(con: &Serial, out: &mut Vec[u64]) {
+  let mut k = 0;
+  while k < vec_len(out) {
+    let ch = u_at(out, k);
+    if ch <= 255 {
+      serial_write(con, ch);
+    }
+    k = k + 1;
+  }
+  while vec_len(out) > 0 {
+    vec_pop(&mut out);
   }
 }
 
 /// Prints every command sent so far, one per line, as `--dump-smt` does.
 fn put_log(con: &Serial, v: &Vr) {
-  put(con, "(set-option :produce-models true)\n");
-  put(con, "(set-option :timeout 10000)\n");
+  let mut out = vec_new[u64]();
+  out_header(&mut out);
   let mut k = 0;
   while k < vec_len(v.log) {
-    let cmd = vec_get(v.log, k);
-    if cmd.kind == CMD_DECL {
-      put(con, "(declare-const ");
-      put_tm(con, v, cmd.a);
-      put(con, " ");
-      put_sort(con, cmd.b);
-      put(con, ")\n");
-    } else if cmd.kind == CMD_ASSERT {
-      put(con, "(assert ");
-      put_tm(con, v, cmd.a);
-      put(con, ")\n");
-    } else if cmd.kind == CMD_PUSH {
-      put(con, "(push 1)\n");
-    } else if cmd.kind == CMD_POP {
-      put(con, "(pop 1)\n");
-    } else if cmd.kind == CMD_CHECK {
-      put(con, "(check-sat)\n");
+    out_cmd(&mut out, v, vec_get(v.log, k));
+    if vec_len(out) > 65536 {
+      flush_out(con, &mut out);
     }
     k = k + 1;
   }
+  flush_out(con, &mut out);
+  vec_free(out);
 }
 
 fn send(v: &mut Vr, kind: u64, a: u64, b: u64) {
@@ -1885,14 +1994,24 @@ fn havoc(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, oenv: u64, keep: bool, n
   return oenv;             // opaque boxes and unit
 }
 
-/// Proves `goal` under the path condition. (For now the solver is not
-/// asked: the query is only recorded, and assumed to hold.)
-fn prove(v: &mut Vr, st: &VState, goal: u64) {
+/// Proves `goal` under the path condition. The query is only recorded
+/// here, with what an error would report (the node `loc`, error code `code`
+/// and the variables in scope); `solve` asks the solver afterwards. Nothing
+/// the verifier does depends on the answers, so the solver sees exactly the
+/// commands stage0 sends it, up to the first failed proof.
+fn prove(v: &mut Vr, st: &VState, goal: u64, loc: u64, code: u64) {
   if v.obligations < U64_MAX {
     v.obligations = v.obligations + 1;
   }
-  send(&mut v, CMD_PUSH, 0, 0);
+  let start = vec_len(v.snaps);
   let mut k = 0;
+  while k < vec_len(st.env) {
+    vec_push(&mut v.snaps, bind_at(st.env, k));
+    k = k + 1;
+  }
+  vec_push(&mut v.obls, Obl { at: loc, code: code, x: v.env, env: start, n: vec_len(st.env) });
+  send(&mut v, CMD_PUSH, 0, 0);
+  k = 0;
   while k < vec_len(st.pc) {
     assert_tm(&mut v, u_at(st.pc, k));
     k = k + 1;
@@ -2214,7 +2333,7 @@ fn eval(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VSta
         let min = int_min(&mut v, m, t);
         g = in_range(&mut v, min, x, max);
       }
-      prove(&mut v, st, g);
+      prove(&mut v, st, g, i, VC_CAST);
       return mk_u(&mut v, x);
     }
     if is_typed_builtin(p, n.b) {
@@ -2287,7 +2406,7 @@ fn eval(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VSta
     let min = int_min(&mut v, m, int_op_ty(c, m, v.env, i));
     let eq = app2(&mut v, OP_EQ, tx, min);
     let g = t_not(&mut v, eq);
-    prove(&mut v, st, g);
+    prove(&mut v, st, g, i, VC_OVERFLOW);
     let t = app1(&mut v, OP_SUB, tx);
     return mk_u(&mut v, t);
   }
@@ -2420,25 +2539,25 @@ fn eval_bin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut 
   let tb = term(v, vb);
   let ity = int_op_ty(c, m, v.env, i);
   if is_signed(m, ity) && (op == P_PLUS || op == P_MINUS || op == P_STAR || op == P_SLASH || op == P_PERCENT) {
-    return signed_arith(&mut v, m, op, ta, tb, ity, st);
+    return signed_arith(&mut v, m, op, ta, tb, ity, st, i);
   }
   if op == P_PLUS || op == P_STAR {
     let t = app2(&mut v, bin_op(op), ta, tb);
     let max = int_max(&mut v, m, int_op_ty(c, m, v.env, i));
     let g = app2(&mut v, OP_LE, t, max);
-    prove(&mut v, st, g);
+    prove(&mut v, st, g, i, VC_OVERFLOW);
     return mk_u(&mut v, t);
   }
   if op == P_MINUS {
     let g = app2(&mut v, OP_GE, ta, tb);
-    prove(&mut v, st, g);
+    prove(&mut v, st, g, i, VC_UNDERFLOW);
     let t = app2(&mut v, OP_SUB, ta, tb);
     return mk_u(&mut v, t);
   }
   if op == P_SLASH || op == P_PERCENT {
     let eq = app2(&mut v, OP_EQ, tb, v.t_zero);
     let g = t_not(&mut v, eq);
-    prove(&mut v, st, g);
+    prove(&mut v, st, g, i, VC_DIVZERO);
     let t = app2(&mut v, bin_op(op), ta, tb);
     return mk_u(&mut v, t);
   }
@@ -2454,19 +2573,19 @@ fn eval_bin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut 
 /// Arithmetic on a signed type: the result must stay between the type's
 /// minimum and maximum; `/` and `%` truncate toward zero, as in C, and
 /// `MIN / -1` overflows.
-fn signed_arith(v: &mut Vr, m: &Mono, op: u64, ta: u64, tb: u64, ity: u64, st: &VState) -> u64 {
+fn signed_arith(v: &mut Vr, m: &Mono, op: u64, ta: u64, tb: u64, ity: u64, st: &VState, i: u64) -> u64 {
   let min = int_min(&mut v, m, ity);
   let max = int_max(&mut v, m, ity);
   if op == P_SLASH || op == P_PERCENT {
     let eq = app2(&mut v, OP_EQ, tb, v.t_zero);
     let g = t_not(&mut v, eq);
-    prove(&mut v, st, g);
+    prove(&mut v, st, g, i, VC_DIVZERO);
     let am = app2(&mut v, OP_EQ, ta, min);
     let m1 = neg_num(&mut v, 1);
     let bm = app2(&mut v, OP_EQ, tb, m1);
     let both = app2(&mut v, OP_AND, am, bm);
     let g2 = t_not(&mut v, both);
-    prove(&mut v, st, g2);
+    prove(&mut v, st, g2, i, VC_OVERFLOW);
     let q = c_div(&mut v, ta, tb);
     if op == P_SLASH {
       return mk_u(&mut v, q);
@@ -2477,9 +2596,9 @@ fn signed_arith(v: &mut Vr, m: &Mono, op: u64, ta: u64, tb: u64, ity: u64, st: &
   }
   let t = app2(&mut v, bin_op(op), ta, tb);
   let hi = app2(&mut v, OP_LE, t, max);
-  prove(&mut v, st, hi);
+  prove(&mut v, st, hi, i, VC_OVERFLOW);
   let lo = app2(&mut v, OP_LE, min, t);
-  prove(&mut v, st, lo);
+  prove(&mut v, st, lo, i, VC_UNDERFLOW);
   return mk_u(&mut v, t);
 }
 
@@ -2596,7 +2715,7 @@ fn vcall_args(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &
     if x == 0 {
       x = plain_inst(&mut m, plain_fn(p, n.s, n.e));
     }
-    r = vuser_call(&mut v, c, &mut m, p, x, args, vals, hid, &mut st);
+    r = vuser_call(&mut v, c, &mut m, p, x, i, args, vals, hid, &mut st);
   }
   vec_free(vals);
   return r;
@@ -2715,7 +2834,7 @@ fn vlocked(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut V
   invariant_terms(&mut v, c, &mut m, p, after, &mut outs);
   k = 0;
   while k < vec_len(outs) {
-    prove(&mut v, st, u_at(outs, k));
+    prove(&mut v, st, u_at(outs, k), i, VC_LOCKINV);
     k = k + 1;
   }
   vec_free(outs);
@@ -2756,7 +2875,7 @@ fn vsmp_run(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut 
     let mut r = d.c;
     while r != 0 {
       let t = spec_tm(&mut v, c, &mut m, p, r, pre, pre, false, 0, &mut b);
-      prove(&mut v, st, t);
+      prove(&mut v, st, t, i, VC_REQUIRES);
       r = next_of(p, r);
     }
     vec_free(b);
@@ -2774,7 +2893,7 @@ fn vsmp_run(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut 
 }
 
 /// A call of a user function (instance `x`): only its contract is used.
-fn vuser_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64, args: &Vec[u64], vals: &Vec[u64], hid: u64, st: &mut VState) -> u64 {
+fn vuser_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64, loc: u64, args: &Vec[u64], vals: &Vec[u64], hid: u64, st: &mut VState) -> u64 {
   let xi = inst_at(m, x);
   let d = node_at(p.nodes, xi.def);
   let mut pre = vec_new[Bind]();
@@ -2790,7 +2909,7 @@ fn vuser_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64, args: &
   let mut r = d.c;
   while r != 0 {
     let t = spec_tm(&mut v, c, &mut m, p, r, pre, pre, false, 0, &mut b);
-    prove(&mut v, st, t);
+    prove(&mut v, st, t, loc, VC_REQUIRES);
     r = next_of(p, r);
   }
   let rt = conv(&mut m, p, d.b, x, xi.def);
@@ -2862,16 +2981,16 @@ fn put_back(v: &mut Vr, m: &Mono, p: &Parser, st: &mut VState, a: u64, nv: u64) 
 }
 
 /// `(< x lim)` proved.
-fn need_lt(v: &mut Vr, st: &VState, x: u64, lim: u64) {
+fn need_lt(v: &mut Vr, st: &VState, i: u64, x: u64, lim: u64) {
   let tl = num(&mut v, lim);
   let g = app2(&mut v, OP_LT, x, tl);
-  prove(&mut v, st, g);
+  prove(&mut v, st, g, i, VC_BOUNDS);
 }
 
 /// `(<= x 255)` proved.
-fn need_byte(v: &mut Vr, st: &VState, x: u64) {
+fn need_byte(v: &mut Vr, st: &VState, i: u64, x: u64) {
   let g = app2(&mut v, OP_LE, x, v.t_255);
-  prove(&mut v, st, g);
+  prove(&mut v, st, g, i, VC_BYTE);
 }
 
 /// A fresh u64 that is at most `hi`.
@@ -2936,7 +3055,7 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     invariant_terms(&mut v, c, &mut m, p, x0, &mut invs);
     let mut k = 0;
     while k < vec_len(invs) {
-      prove(&mut v, st, u_at(invs, k));
+      prove(&mut v, st, u_at(invs, k), i, VC_LOCKINV);
       k = k + 1;
     }
     vec_free(invs);
@@ -2964,7 +3083,7 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
   }
   if name_is(p, i, "alloc") || name_is(p, i, "balloc") {
     let g = app2(&mut v, OP_LE, a0.a, v.t_allocmax);
-    prove(&mut v, st, g);
+    prove(&mut v, st, g, i, VC_ALLOC);
     // alloc zero-fills.
     return mk(&mut v, VV_BUF, 0, a0.a, v.t_zarr, 0, 0);
   }
@@ -2974,7 +3093,7 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
   if name_is(p, i, "get") || name_is(p, i, "sget") || name_is(p, i, "bget") {
     let ix = term(v, x1);
     let g = app2(&mut v, OP_LT, ix, a0.a);
-    prove(&mut v, st, g);
+    prove(&mut v, st, g, i, VC_BOUNDS);
     let sel = app2(&mut v, OP_SELECT, a0.b, ix);
     let mut hi = v.t_255;
     if name_is(p, i, "get") {
@@ -2988,9 +3107,9 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
   if name_is(p, i, "set") || name_is(p, i, "bset") {
     let ix = term(v, x1);
     let g = app2(&mut v, OP_LT, ix, a0.a);
-    prove(&mut v, st, g);
+    prove(&mut v, st, g, i, VC_BOUNDS);
     if name_is(p, i, "bset") {
-      need_byte(&mut v, st, term(v, x2));
+      need_byte(&mut v, st, i, term(v, x2));
     }
     let d = app3(&mut v, OP_STORE, a0.b, ix, term(v, x2));
     let nb = mk(&mut v, VV_BUF, 0, a0.a, d, 0, 0);
@@ -3001,7 +3120,7 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     return v.unit;
   }
   if name_is(p, i, "serial_write") {
-    need_byte(&mut v, st, term(v, x1));
+    need_byte(&mut v, st, i, term(v, x1));
     return v.unit;
   }
   if name_is(p, i, "serial_read") {
@@ -3027,7 +3146,7 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
   }
   if name_is(p, i, "vec_pop") {
     let g = app2(&mut v, OP_GT, a0.a, v.t_zero);
-    prove(&mut v, st, g);
+    prove(&mut v, st, g, i, VC_BOUNDS);
     let one = num(&mut v, 1);
     let last = app2(&mut v, OP_SUB, a0.a, one);
     let r = vec_read(&mut v, c, m, p, a0.ty, a0.b, last, &mut st);
@@ -3038,7 +3157,7 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
   if name_is(p, i, "vec_get") || name_is(p, i, "vec_set") || name_is(p, i, "vec_swap") {
     let ix = term(v, x1);
     let g = app2(&mut v, OP_LT, ix, a0.a);
-    prove(&mut v, st, g);
+    prove(&mut v, st, g, i, VC_BOUNDS);
     let mut prev = v.unit;
     if !name_is(p, i, "vec_set") {
       prev = vec_read(&mut v, c, m, p, a0.ty, a0.b, ix, &mut st);
@@ -3054,7 +3173,7 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     if ck_linear(c, m, p, a0.ty) {
       // Freeing the storage would drop the elements still in it.
       let g = app2(&mut v, OP_EQ, a0.a, v.t_zero);
-      prove(&mut v, st, g);
+      prove(&mut v, st, g, i, VC_LEAK);
     }
     return v.unit;
   }
@@ -3102,9 +3221,9 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
   if name_is(p, i, "pool_take") {
     let ix = term(v, x1);
     let g = app2(&mut v, OP_LT, ix, g_size(v, x0));
-    prove(&mut v, st, g);
+    prove(&mut v, st, g, i, VC_BOUNDS);
     let g2 = app2(&mut v, OP_SELECT, g_has(v, x0), ix);
-    prove(&mut v, st, g2);
+    prove(&mut v, st, g2, i, VC_OWN);
     let has = app3(&mut v, OP_STORE, g_has(v, x0), ix, v.t_false);
     let np = mk_obj(&mut v, m, v.ty_pool, has, g_size(v, x0), 0);
     put_back(&mut v, m, p, &mut st, u_at(args, 0), np);
@@ -3120,16 +3239,16 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     return mk_u(&mut v, g_id(v, x0));
   }
   if name_is(p, i, "frame_read") || name_is(p, i, "frame_write") {
-    need_lt(&mut v, st, term(v, x1), 512);
+    need_lt(&mut v, st, i, term(v, x1), 512);
     if name_is(p, i, "frame_write") {
       return v.unit;
     }
     return fresh_u64_named(&mut v, "frame_read");
   }
   if name_is(p, i, "frame_read8") || name_is(p, i, "frame_write8") {
-    need_lt(&mut v, st, term(v, x1), 4096);
+    need_lt(&mut v, st, i, term(v, x1), 4096);
     if name_is(p, i, "frame_write8") {
-      need_byte(&mut v, st, term(v, x2));
+      need_byte(&mut v, st, i, term(v, x2));
       return v.unit;
     }
     return fresh_upto(&mut v, &mut st, "frame_read8", 255);
@@ -3141,7 +3260,7 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     let one = num(&mut v, 1);
     let five = num(&mut v, 5);
     let g = in_range(&mut v, one, lvl, five);
-    prove(&mut v, st, g);
+    prove(&mut v, st, g, i, VC_PT);
     return mk_obj(&mut v, m, v.ty_pt, g_id(v, x0), lvl, v.t_nobool);
   }
   if name_is(p, i, "pt_free") || name_is(p, i, "pt_free_root") {
@@ -3155,23 +3274,23 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     if name_is(p, i, "pt_free") {
       let eq = app2(&mut v, OP_EQ, lvl, four);
       let g = t_not(&mut v, eq);
-      prove(&mut v, st, g);
+      prove(&mut v, st, g, i, VC_PT);
       let g2 = all_unused(&mut v, used, 0, 512);
-      prove(&mut v, st, g2);
+      prove(&mut v, st, g2, i, VC_OWN);
     } else {
       let g = app2(&mut v, OP_EQ, lvl, four);
-      prove(&mut v, st, g);
+      prove(&mut v, st, g, i, VC_PT);
       let g2 = all_unused(&mut v, used, 1, 256);
-      prove(&mut v, st, g2);
+      prove(&mut v, st, g2, i, VC_OWN);
       let eq = app2(&mut v, OP_EQ, g_id(v, t), g_root(v, x0));
       let g3 = t_not(&mut v, eq);
-      prove(&mut v, st, g3);
+      prove(&mut v, st, g3, i, VC_MMU);
     }
     return mk_obj(&mut v, m, v.ty_frame, g_id(v, t), 0, 0);
   }
   if name_is(p, i, "pt_has") {
     let ix = term(v, x1);
-    need_lt(&mut v, st, ix, 512);
+    need_lt(&mut v, st, i, ix, 512);
     // Slot 0 of a top-level table maps the kernel on the kernel target: the
     // hardware entry is present although the table does not own it, so what
     // pt_has says there is unknown.
@@ -3191,12 +3310,12 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     let n = term(v, x2);
     let end = app2(&mut v, OP_ADD, b, n);
     let g = app2(&mut v, OP_LE, end, v.t_plimit);
-    prove(&mut v, st, g);
+    prove(&mut v, st, g, i, VC_BOUNDS);
     let inr = port_range(&mut v, b, n);
     let sel = app2(&mut v, OP_SELECT, g_free(v, x0), v.t_k);
     let imp = app2(&mut v, OP_IMP, inr, sel);
     let g2 = forall_tm(&mut v, v.t_k, imp);
-    prove(&mut v, st, g2);
+    prove(&mut v, st, g2, i, VC_OWN);
     // A lambda, not a fresh array with a quantified definition: reads of it
     // reduce directly, so chains of claims stay quantifier-free.
     let ni = t_not(&mut v, inr);
@@ -3223,12 +3342,12 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     let end = app2(&mut v, OP_ADD, b, n);
     let hi = app2(&mut v, OP_LE, end, v.t_mmio_hi);
     let g = app2(&mut v, OP_AND, lo, hi);
-    prove(&mut v, st, g);
+    prove(&mut v, st, g, i, VC_BOUNDS);
     let inr = port_range(&mut v, b, n);
     let sel = app2(&mut v, OP_SELECT, g_free(v, x0), v.t_k);
     let imp = app2(&mut v, OP_IMP, inr, sel);
     let g2 = forall_tm(&mut v, v.t_k, imp);
-    prove(&mut v, st, g2);
+    prove(&mut v, st, g2, i, VC_OWN);
     let ni = t_not(&mut v, inr);
     let body = app2(&mut v, OP_AND, sel, ni);
     let nf = lambda_tm(&mut v, v.t_k, body);
@@ -3269,17 +3388,17 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     let tb = num(&mut v, bytes);
     let end = app2(&mut v, OP_ADD, off, tb);
     let g = app2(&mut v, OP_LE, end, g_len(v, x0));
-    prove(&mut v, st, g);
+    prove(&mut v, st, g, i, VC_BOUNDS);
     // Devices want naturally aligned accesses (and an unaligned one could
     // straddle into the next register).
     let addr = app2(&mut v, OP_ADD, g_base(v, x0), off);
     let md = app2(&mut v, OP_MOD, addr, tb);
     let g2 = app2(&mut v, OP_EQ, md, v.t_zero);
-    prove(&mut v, st, g2);
+    prove(&mut v, st, g2, i, VC_BOUNDS);
     let tm = num(&mut v, max);
     if name_is(p, i, "mmio_write8") || name_is(p, i, "mmio_write16") || name_is(p, i, "mmio_write32") || name_is(p, i, "mmio_write64") {
       let g3 = app2(&mut v, OP_LE, term(v, x2), tm);
-      prove(&mut v, st, g3);
+      prove(&mut v, st, g3, i, VC_BYTE);
       return v.unit;
     }
     let n = node_at(p.nodes, i);
@@ -3321,15 +3440,15 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     let end = app2(&mut v, OP_ADD, off, tb);
     let page = num(&mut v, 4096);
     let g = app2(&mut v, OP_LE, end, page);
-    prove(&mut v, st, g);
+    prove(&mut v, st, g, i, VC_BOUNDS);
     // The page is page-aligned, so an aligned offset is an aligned address.
     let md = app2(&mut v, OP_MOD, off, tb);
     let g2 = app2(&mut v, OP_EQ, md, v.t_zero);
-    prove(&mut v, st, g2);
+    prove(&mut v, st, g2, i, VC_BOUNDS);
     let tm = num(&mut v, max);
     if name_is(p, i, "dma_write8") || name_is(p, i, "dma_write16") || name_is(p, i, "dma_write32") || name_is(p, i, "dma_write64") {
       let g3 = app2(&mut v, OP_LE, term(v, x2), tm);
-      prove(&mut v, st, g3);
+      prove(&mut v, st, g3, i, VC_BYTE);
       return v.unit;
     }
     let n = node_at(p.nodes, i);
@@ -3359,11 +3478,11 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     let tb = num(&mut v, bytes);
     let end = app2(&mut v, OP_ADD, term(v, x1), tb);
     let g = app2(&mut v, OP_LE, end, g_count(v, x0));
-    prove(&mut v, st, g);
+    prove(&mut v, st, g, i, VC_BOUNDS);
     if name_is(p, i, "pio_out8") || name_is(p, i, "pio_out16") || name_is(p, i, "pio_out32") {
       let tm = num(&mut v, max);
       let g2 = app2(&mut v, OP_LE, term(v, x2), tm);
-      prove(&mut v, st, g2);
+      prove(&mut v, st, g2, i, VC_BYTE);
       return v.unit;
     }
     let n = node_at(p.nodes, i);
@@ -3382,7 +3501,7 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
   if name_is(p, i, "mmu_switch") {
     let four = num(&mut v, 4);
     let g = app2(&mut v, OP_EQ, g_level(v, x1), four);
-    prove(&mut v, st, g);
+    prove(&mut v, st, g, i, VC_PT);
     let nm = mk_obj(&mut v, m, kind_ty(m, p, TY_MMU), g_id(v, x1), 0, 0);
     put_back(&mut v, m, p, &mut st, u_at(args, 0), nm);
     return v.unit;
@@ -3408,7 +3527,7 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     return x;
   }
   if name_is(p, i, "cpu_get") {
-    need_lt(&mut v, st, term(v, x1), 21);
+    need_lt(&mut v, st, i, term(v, x1), 21);
     return fresh_u64_named(&mut v, "reg");
   }
   if name_is(p, i, "cpu_set") {
@@ -3422,7 +3541,7 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     let b = app2(&mut v, OP_EQ, r, t20);
     let ab = app2(&mut v, OP_OR, a, b);
     let g = app2(&mut v, OP_AND, lo, ab);
-    prove(&mut v, st, g);
+    prove(&mut v, st, g, i, VC_BOUNDS);
     return v.unit;
   }
 
@@ -3433,13 +3552,13 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     let a = app2(&mut v, OP_LE, from, to);
     let b = app2(&mut v, OP_LE, to, a0.a);
     let g = app2(&mut v, OP_AND, a, b);
-    prove(&mut v, st, g);
+    prove(&mut v, st, g, i, VC_BOUNDS);
     return fresh_u64_named(&mut v, "spawn");
   }
   if name_is(p, i, "sys_send") {
     let a2 = vl_at(v, x2);
     let g = app2(&mut v, OP_LE, term(v, u_at(vals, 3)), a2.a);
-    prove(&mut v, st, g);
+    prove(&mut v, st, g, i, VC_BOUNDS);
   }
   if name_is(p, i, "sys_recv") {
     // The kernel may overwrite every byte of the buffer, but not its length.
@@ -3480,16 +3599,16 @@ fn pt_slot(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, i: u64, args: &Vec[u64
   let ix = term(v, u_at(vals, 1));
   let lvl = g_level(v, x0);
   let used = g_used(v, x0);
-  need_lt(&mut v, st, ix, 512);
+  need_lt(&mut v, st, i, ix, 512);
   let leaf = name_is(p, i, "pt_put_frame") || name_is(p, i, "pt_take_frame");
   if leaf {
     let one = num(&mut v, 1);
     let g = app2(&mut v, OP_EQ, lvl, one);
-    prove(&mut v, st, g);
+    prove(&mut v, st, g, i, VC_PT);
   } else {
     let two = num(&mut v, 2);
     let g = app2(&mut v, OP_GE, lvl, two);
-    prove(&mut v, st, g);
+    prove(&mut v, st, g, i, VC_PT);
     // Slot 0 of a top-level table maps the kernel; slots 256.. are never used.
     let four = num(&mut v, 4);
     let top = app2(&mut v, OP_EQ, lvl, four);
@@ -3499,22 +3618,22 @@ fn pt_slot(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, i: u64, args: &Vec[u64
     let b = app2(&mut v, OP_LT, ix, lim);
     let r = app2(&mut v, OP_AND, a, b);
     let g2 = app2(&mut v, OP_IMP, top, r);
-    prove(&mut v, st, g2);
+    prove(&mut v, st, g2, i, VC_PT);
   }
   let putting = name_is(p, i, "pt_put") || name_is(p, i, "pt_put_frame");
   if putting {
     let sel = app2(&mut v, OP_SELECT, used, ix);
     let g = t_not(&mut v, sel);
-    prove(&mut v, st, g);
+    prove(&mut v, st, g, i, VC_OWN);
     if !leaf {
       let one = num(&mut v, 1);
       let up = app2(&mut v, OP_ADD, g_level(v, u_at(vals, 2)), one);
       let g2 = app2(&mut v, OP_EQ, up, lvl);
-      prove(&mut v, st, g2);
+      prove(&mut v, st, g2, i, VC_PT);
     }
   } else {
     let g = app2(&mut v, OP_SELECT, used, ix);
-    prove(&mut v, st, g);
+    prove(&mut v, st, g, i, VC_OWN);
   }
   let mut mark_t = v.t_false;
   if putting {
@@ -3574,12 +3693,12 @@ fn vstmt(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: VState, 
   }
   if k == S_ASSERT {
     let t = here(&mut v, c, &mut m, p, n.a, s);
-    prove(&mut v, s, t);
+    prove(&mut v, s, t, i, VC_ASSERT);
     vec_push(&mut s.pc, t);
     return s;
   }
   if k == S_UNREACHABLE {
-    prove(&mut v, s, v.t_false);
+    prove(&mut v, s, v.t_false, i, VC_UNREACHABLE);
     st_free(s);
     return st_dead();
   }
@@ -3588,7 +3707,7 @@ fn vstmt(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: VState, 
     if n.a != 0 {
       x = eval(&mut v, c, &mut m, p, n.a, &mut s, 0);
     }
-    check_ensures(&mut v, c, &mut m, p, s, fdef, entry, x);
+    check_ensures(&mut v, c, &mut m, p, s, fdef, entry, x, i);
     st_free(s);
     return st_dead();
   }
@@ -3791,7 +3910,7 @@ fn stmt_while(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: VSt
   let mut inv = n.b;
   while inv != 0 {
     let t = here(&mut v, c, &mut m, p, inv, s);
-    prove(&mut v, s, t);
+    prove(&mut v, s, t, inv, VC_INVARIANT);
     inv = next_of(p, inv);
   }
   // 2. havoc what the body (or the condition) changes, enclosing places
@@ -3831,7 +3950,7 @@ fn stmt_while(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: VSt
     inv = n.b;
     while inv != 0 {
       let t = here(&mut v, c, &mut m, p, inv, end);
-      prove(&mut v, end, t);
+      prove(&mut v, end, t, inv, VC_INVARIANT);
       inv = next_of(p, inv);
     }
   }
@@ -4240,7 +4359,7 @@ fn same_rows(v: &Vr, rows: &Vec[SumRow]) -> bool {
 /// Proves the postconditions of function `fdef` at a return in state `st`.
 /// Parameters mean their entry values, except `&mut` ones, which mean the
 /// value handed back; `old(..)` reads the entry values.
-fn check_ensures(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, st: &VState, fdef: u64, entry: &Vec[Bind], res: u64) {
+fn check_ensures(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, st: &VState, fdef: u64, entry: &Vec[Bind], res: u64, loc: u64) {
   let d = node_at(p.nodes, fdef);
   let mut post = env_clone(entry);
   let mut q = d.a;
@@ -4256,7 +4375,7 @@ fn check_ensures(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, st: &VState,
   let mut e = d.d;
   while e != 0 {
     let t = spec_tm(&mut v, c, &mut m, p, e, post, entry, true, res, &mut b);
-    prove(&mut v, st, t);
+    prove(&mut v, st, t, loc, VC_ENSURES);
     e = next_of(p, e);
   }
   vec_free(b);
@@ -4323,7 +4442,7 @@ fn verify_fn(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
   let end = vblock(&mut v, c, &mut m, p, d.x, st, xi.def, env);
   if end.live {
     // Only unit functions can fall through (checked earlier).
-    check_ensures(&mut v, c, &mut m, p, end, xi.def, env, v.unit);
+    check_ensures(&mut v, c, &mut m, p, end, xi.def, env, v.unit, xi.def);
   }
   st_free(end);
   vec_free(env);
@@ -4331,6 +4450,46 @@ fn verify_fn(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
 
 /// Verifies every function of the program monomorphized into `m` and
 /// checked by `c`.
+/// A `&mut Bytes` that C lends to an `export fn` is the caller's memory:
+/// the function may write its bytes but must hand back the same buffer,
+/// never free or replace it. Its summary shows that: every place under the
+/// parameter is changed only in shape-keeping ways. A parameter that is not
+/// kept is recorded as a failure (CMD_FAIL) at this point of the log, which
+/// is where stage0 reports it.
+fn buffers_kept(v: &mut Vr, m: &mut Mono, p: &Parser, x: u64) {
+  let xi = inst_at(m, x);
+  let d = node_at(p.nodes, xi.def);
+  let mut q = d.a;
+  let mut j = 0;
+  let mut done = false;
+  while q != 0 && j < SRC_MAX && !done {
+    let qn = node_at(p.nodes, q);
+    let pt = conv(&mut m, p, qn.a, x, q);
+    if kind_t(m, pt) == TY_MUTREF && kind_t(m, inner_t(m, pt)) == TY_BYTES {
+      let start = u_at(v.sum_start, x);
+      let end = vadd(start, u_at(v.sum_n, x));
+      let mut any = false;
+      let mut all = true;
+      let mut k = start;
+      while k < end {
+        let r = sum_row(v, k);
+        if r.j == j {
+          any = true;
+          all = all && r.keep;
+        }
+        k = k + 1;
+      }
+      if !(any && all) {
+        vec_push(&mut v.obls, Obl { at: q, code: VC_EXPORT, x: x, env: 0, n: 0 });
+        send(&mut v, CMD_FAIL, 0, 0);
+        done = true;
+      }
+    }
+    q = qn.next;
+    j = j + 1;
+  }
+}
+
 fn verify_program(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
   summarize(&mut v, c, &mut m, p);
   send(&mut v, CMD_DECL, v.t_poolsize, SO_INT);
@@ -4342,6 +4501,9 @@ fn verify_program(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
   let mut k = 0;
   while k < vec_len(m.fns) {
     let x = u_at(m.fns, k);
+    if exported_x(m, p, x) {
+      buffers_kept(&mut v, &mut m, p, x);
+    }
     send(&mut v, CMD_PUSH, 0, 0);
     verify_fn(&mut v, c, &mut m, p, x);
     send(&mut v, CMD_POP, 0, 0);
