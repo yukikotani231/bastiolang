@@ -669,6 +669,8 @@ impl<'a> Ctx<'a> {
                 self.leak_check_all(pos, "at this `return`")?;
                 Ok(true)
             }
+            // Proved unreachable, so nothing owned here can leak.
+            StmtKind::Unreachable => Ok(true),
             StmtKind::Assert(e) => {
                 let t = self.spec_expr(e, false, &mut Vec::new())?;
                 expect_ty(&t, &Type::Bool, e.pos, "an `assert`")?;

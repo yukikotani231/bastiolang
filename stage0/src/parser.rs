@@ -429,6 +429,11 @@ impl Parser {
                 self.expect(Tok::Semi, "`;`")?;
                 Ok(Stmt { kind: StmtKind::Return(e), pos })
             }
+            Tok::Unreachable => {
+                self.bump();
+                self.expect(Tok::Semi, "`;`")?;
+                Ok(Stmt { kind: StmtKind::Unreachable, pos })
+            }
             Tok::Assert => {
                 self.bump();
                 let e = self.expr()?;

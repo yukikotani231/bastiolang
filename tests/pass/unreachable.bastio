@@ -1,0 +1,40 @@
+// expect-exit: 7
+// `unreachable;` marks a point the prover shows no execution reaches. The
+// path ends there, so a linear value in hand need not be consumed: the
+// typical use is the arm of a `match` that the specification rules out.
+
+enum Slot { Empty, Full(Buf) }
+
+spec fn slots_ok(v: &Vec[Slot]) -> bool {
+  forall i: u64 :: i < vlen(v) ==> (vget(v, i) is Slot::Full ==> len(vget(v, i).Full) == 8)
+}
+
+// Fills a slot known to be empty. The displaced value is `Slot::Empty`, so
+// the `Full` arm cannot run.
+fn fill(v: &mut Vec[Slot], i: u64, b: Buf)
+  requires i < vlen(v) && vget(v, i) is Slot::Empty && len(b) == 8 && slots_ok(v)
+  ensures vlen(v) == old(vlen(v)) && vget(v, i) is Slot::Full && slots_ok(v)
+{
+  match vec_swap(&mut v, i, Slot::Full(b)) {
+    Slot::Empty => {},
+    Slot::Full(_old) => { unreachable; },
+  }
+}
+
+fn main() -> u64 {
+  let mut v = vec_new[Slot]();
+  vec_push(&mut v, Slot::Empty);
+  vec_push(&mut v, Slot::Empty);
+  fill(&mut v, 1, alloc(8));
+  let mut n = 0;
+  while vec_len(v) > 0
+    invariant slots_ok(v) && vlen(v) <= 2 && n + 10 * vlen(v) <= 20
+  {
+    match vec_pop(&mut v) {
+      Slot::Empty => { n = n + 1; },
+      Slot::Full(b) => { n = n + len(b) - 2; free(b); },
+    }
+  }
+  vec_free(v);
+  return n;
+}
