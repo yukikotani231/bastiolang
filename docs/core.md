@@ -175,6 +175,30 @@ An allocation map is a `Bytes` with one byte per entry (a disk block, a page, a 
 | `bits_test(b, i)`, `bits_count_clear(b, lo, hi)` | Exactly whether entry `i` is in use; a count of at most `hi - lo` |
 | `bits_free(b)` | |
 
+### `core/slots.bastio`
+
+A growable table of numbered slots, for ids a program hands out and takes back: process ids, file descriptors, pipe and socket numbers. A `Slots[V]` is a `Vec[Option[V]]`; slot `i` is in use when it holds `Some`, and ids at or past the end are free. `V` must be a type that can be copied, as for `HashMap`; to number linear values, keep them in a `Vec[T]` and store the index.
+
+```text
+let mut fds = slots_new[u64]();
+let fd = slots_alloc[u64](&mut fds, 0, nofile, row);   // the lowest free descriptor below the limit
+if fd == nofile { /* EMFILE */ }
+let pid = slots_alloc[u64](&mut procs, last + 1, max, p); // search past the last id, so a dead one waits
+match slots_take[u64](&mut fds, fd) { Option::Some(row) => { ... }, Option::None => { /* EBADF */ } }
+slots_free[u64](fds);
+```
+
+| Function | Proved |
+| --- | --- |
+| `slots_alloc(s, from, limit, v)` | Puts `v` in the lowest free slot of `from..limit` and returns it, adding slots when it is past the end; every slot from `from` up to it was in use. Returns `limit` only when all of `from..limit` is in use (spec fn `slots_full`), and then changes nothing. No other slot changes (spec fn `slots_same_but`) |
+| `slots_find_free(s, from, limit)` | The same search, without taking the slot |
+| `slots_take(s, i)` | Frees slot `i` and returns what it held (`None` if free or past the end); nothing else changes |
+| `slots_set(s, i, v)` | Replaces the value of a slot in use (a free one is rejected, `E-VERIFY-REQUIRES`) |
+| `slots_get(s, i)`, `slots_used(s, i)` | Exactly what slot `i` holds, for any `i` (spec fns `slots_maps`, `slots_has`) |
+| `slots_cap(s)`, `slots_count(s)`, `slots_new()`, `slots_free(s)` | The number of slots; a count of those in use, at most the capacity |
+
+The table never shrinks: a closed descriptor's slot stays, free, for the next one.
+
 ### `core/csum.bastio`
 
 | Function | Proved |
@@ -224,4 +248,5 @@ A survey of the hand-written helpers in `stage1/`, BastiOS (`src/` and `user/`) 
 | Lookup by key: every table is a linear scan (`find_inst`, `env_find`, `find_file`, ...) | many | `HashMap`, `BytesMap` (for names and paths) |
 | Ring buffers: head and count over a fixed capacity (console output, tty input, pipes, AF_UNIX channels, the disk command queue) | 6 (BastiOS) | `Ring`, `Queue` |
 | Allocation maps, a byte or word per entry with a wrap-around search (disk blocks, pages) | 2 (BastiOS) | `core/bitmap.bastio` (`map_*` bytes, `Bits` packed) |
+| Fixed-size id tables: process table, descriptors per process, pipes, sockets (`NPROC`, `NFD`, ...) | several (BastiOS) | `Slots` |
 | The Internet checksum (`cadd`, `sum16`, `csum`, `l4_sum`) | 1 (BastiOS network) | `core/csum.bastio` |

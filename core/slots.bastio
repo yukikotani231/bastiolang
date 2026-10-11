@@ -1,0 +1,180 @@
+// core/slots.bastio: a growable table of numbered slots, for ids that a
+// program hands out and takes back (process ids, file descriptors, pipe
+// and socket numbers).
+//
+// A `Slots[V]` is a vector of `Option[V]`: slot `i` is in use when it holds
+// `Some`. `slots_alloc` puts a value in the lowest free slot at or above a
+// starting id, growing the vector when every slot is in use, up to a limit
+// the caller gives (a process's `RLIMIT_NOFILE`, say). File descriptors
+// start the search at 0 (POSIX wants the lowest free one); process ids
+// start after the last one handed out, so that a fresh id is not one that
+// just died. Like `HashMap[V]`, `V` must be a type that can be copied; to
+// number linear values, keep them in a `Vec[T]` and store the index.
+//
+// What is proved: every index is in bounds; `slots_alloc` returns a slot
+// that was free and now holds the value, at or above the starting id and
+// below the limit, and every slot between the starting id and it was in
+// use; a failed `slots_alloc` means every slot from the starting id up to
+// the limit is in use; every function changes no slot but the one it names.
+import "option.bastio";
+
+struct Slots[V] {
+  vals: Vec[Option[V]],
+}
+
+/// Slot `i` exists and is in use.
+spec fn slots_has[V](s: &Slots[V], i: u64) -> bool {
+  i < vlen(s.vals) && vget(s.vals, i) is Option::Some
+}
+
+/// Slot `i` is in use and holds `v`.
+spec fn slots_maps[V](s: &Slots[V], i: u64, v: V) -> bool {
+  slots_has[V](s, i) && vget(s.vals, i).Some == v
+}
+
+/// Every slot of `lo..hi` is in use (slots past the end count as free).
+spec fn slots_full[V](s: &Slots[V], lo: u64, hi: u64) -> bool {
+  forall k: u64 :: lo <= k && k < hi ==> slots_has[V](s, k)
+}
+
+/// `s` agrees with `o` on every slot but `at`: a slot of either that exists
+/// in the other holds the same thing, and the slots in use are the same.
+spec fn slots_same_but[V](s: &Slots[V], o: &Slots[V], at: u64) -> bool {
+  vlen(o.vals) <= vlen(s.vals)
+    && (forall k: u64 :: k < vlen(o.vals) && k != at ==> vget(s.vals, k) == vget(o.vals, k))
+    && (forall k: u64 :: vlen(o.vals) <= k && k < vlen(s.vals) && k != at ==> vget(s.vals, k) is Option::None)
+}
+
+/// A table with no slots.
+fn slots_new[V]() -> Slots[V]
+  ensures vlen(result.vals) == 0
+{
+  return Slots[V] { vals: vec_new[Option[V]]() };
+}
+
+/// The number of slots, used or free. Ids at or past it are free.
+fn slots_cap[V](s: &Slots[V]) -> u64
+  ensures result == vlen(s.vals)
+{
+  return vec_len(s.vals);
+}
+
+/// Is slot `i` in use? Any `i` may be asked.
+fn slots_used[V](s: &Slots[V], i: u64) -> bool
+  ensures result == slots_has[V](s, i)
+{
+  if i >= vec_len(s.vals) {
+    return false;
+  }
+  match vec_get(s.vals, i) {
+    Option::Some(v) => { return true; },
+    Option::None => { return false; },
+  }
+}
+
+/// The value in slot `i`, if it is in use. Any `i` may be asked.
+fn slots_get[V](s: &Slots[V], i: u64) -> Option[V]
+  ensures (result is Option::Some) == slots_has[V](s, i)
+  ensures result is Option::Some ==> slots_maps[V](s, i, result.Some)
+{
+  if i >= vec_len(s.vals) {
+    return Option[V]::None;
+  }
+  return vec_get(s.vals, i);
+}
+
+/// Replaces the value in slot `i`, which must be in use.
+fn slots_set[V](s: &mut Slots[V], i: u64, v: V)
+  requires slots_has[V](s, i)
+  ensures slots_maps[V](s, i, v) && vlen(s.vals) == vlen(old(s).vals)
+  ensures slots_same_but[V](s, old(s), i)
+{
+  vec_set(&mut s.vals, i, Option[V]::Some(v));
+}
+
+/// Frees slot `i` and returns what it held (`None` if it was free or past
+/// the end).
+fn slots_take[V](s: &mut Slots[V], i: u64) -> Option[V]
+  ensures !slots_has[V](s, i) && vlen(s.vals) == vlen(old(s).vals)
+  ensures slots_same_but[V](s, old(s), i)
+  ensures (result is Option::Some) == slots_has[V](old(s), i)
+  ensures result is Option::Some ==> slots_maps[V](old(s), i, result.Some)
+{
+  if i >= vec_len(s.vals) {
+    return Option[V]::None;
+  }
+  let prev = vec_get(s.vals, i);
+  vec_set(&mut s.vals, i, Option[V]::None);
+  return prev;
+}
+
+/// The lowest free slot of `from..limit`, or `limit` when every one is in
+/// use. It may be at or past the end of the table.
+fn slots_find_free[V](s: &Slots[V], from: u64, limit: u64) -> u64
+  requires from <= limit
+  ensures from <= result && result <= limit
+  ensures slots_full[V](s, from, result)
+  ensures result < limit ==> !slots_has[V](s, result)
+{
+  let mut i = from;
+  while i < limit && i < vec_len(s.vals)
+    invariant from <= i && i <= limit && slots_full[V](s, from, i)
+  {
+    match vec_get(s.vals, i) {
+      Option::Some(v) => {},
+      Option::None => { return i; },
+    }
+    i = i + 1;
+  }
+  return i;
+}
+
+/// Puts `v` in the lowest free slot of `from..limit`, adding slots to the
+/// table when that slot is past its end. Returns the slot, or `limit` when
+/// every slot of `from..limit` is in use (then `s` is unchanged).
+fn slots_alloc[V](s: &mut Slots[V], from: u64, limit: u64, v: V) -> u64
+  requires from <= limit && limit <= 1152921504606846976
+  ensures from <= result && result <= limit
+  ensures slots_full[V](old(s), from, result)
+  ensures result < limit ==> !slots_has[V](old(s), result) && slots_maps[V](s, result, v)
+  ensures result < limit && result < vlen(old(s).vals) ==> vlen(s.vals) == vlen(old(s).vals)
+  ensures result < limit && vlen(old(s).vals) <= result ==> vlen(s.vals) == result + 1
+  ensures result == limit ==> vlen(s.vals) == vlen(old(s).vals)
+  ensures slots_same_but[V](s, old(s), result)
+{
+  let i = slots_find_free[V](s, from, limit);
+  if i == limit {
+    return i;
+  }
+  while vec_len(s.vals) <= i
+    invariant vlen(old(s).vals) <= vlen(s.vals) && (vlen(s.vals) == vlen(old(s).vals) || vlen(s.vals) <= i + 1)
+    invariant forall k: u64 :: k < vlen(old(s).vals) ==> vget(s.vals, k) == vget(old(s).vals, k)
+    invariant forall k: u64 :: vlen(old(s).vals) <= k && k < vlen(s.vals) ==> vget(s.vals, k) is Option::None
+  {
+    vec_push(&mut s.vals, Option[V]::None);
+  }
+  vec_set(&mut s.vals, i, Option[V]::Some(v));
+  return i;
+}
+
+/// The number of slots in use.
+fn slots_count[V](s: &Slots[V]) -> u64
+  ensures result <= vlen(s.vals)
+{
+  let mut n = 0;
+  let mut i = 0;
+  while i < vec_len(s.vals)
+    invariant i <= vlen(s.vals) && n <= i
+  {
+    if slots_used[V](s, i) {
+      n = n + 1;
+    }
+    i = i + 1;
+  }
+  return n;
+}
+
+/// Frees the table. Values that own nothing are simply dropped.
+fn slots_free[V](s: Slots[V]) {
+  vec_free(s.vals);
+}
