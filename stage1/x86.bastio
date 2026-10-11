@@ -82,6 +82,8 @@ const X86_INLINE_SMALL: u64 = 20;
 // X86_INLINE_FEW calls name its function, so code grows little.
 const X86_INLINE_SHARED: u64 = 60;
 const X86_INLINE_FEW: u64 = 3;
+// stage1: values of this many words or more are copied with `rep movsq`.
+const X86_REP_COPY: u64 = 6;
 
 struct X86Op { k: u64, r: u64, v: u64 }
 
@@ -450,7 +452,9 @@ fn x86_e(g: &mut X86) {
     let mut k = 0;
     while k < vec_len(g.used) {
       let r = u_at(g.used, k);
-      if x86_is_leafreg(r) {
+      // stage1: only a register that a variable in scope holds (one out
+      // of scope, or not declared yet, holds nothing to keep).
+      if x86_is_leafreg(r) && (g.stage0 || x86_reg_bound(g, r)) {
         let o = x86_save_slot(&mut g, r);
         vec_push(&mut rs, r);
         vec_push(&mut os, o);
@@ -484,6 +488,19 @@ fn x86_e(g: &mut X86) {
   }
   vec_free(rs);
   vec_free(os);
+}
+
+/// Does a variable in scope live in register `r`?
+fn x86_reg_bound(g: &X86, r: u64) -> bool {
+  let mut k = 0;
+  while k < vec_len(g.vars) {
+    let v = vec_get(g.vars, k);
+    if (v.k == XS_REG || v.k == XS_REGS || v.k == XS_PREG) && (v.r0 == r || v.r1 == r || v.r2 == r) {
+      return true;
+    }
+    k = k + 1;
+  }
+  return false;
 }
 
 /// Emits the instruction `s`.
@@ -588,8 +605,40 @@ fn x86_use_reg(g: &mut X86, r: u64) {
   }
 }
 
-/// Pops `n` words into place `l`.
+/// `rep movsq` of `n` words, after the set-up lines `a` and `b` (either
+/// may be empty).
+fn x86_rep_copy(g: &mut X86, a: Str, b: Str, n: u64) {
+  if slen(a) > 0 {
+    x86_es(&mut g, a);
+  }
+  if slen(b) > 0 {
+    x86_es(&mut g, b);
+  }
+  x86_t(&mut g, "mov $");
+  x86_n(&mut g, n);
+  x86_t(&mut g, ", %ecx");
+  x86_e(&mut g);
+  x86_es(&mut g, "rep movsq");
+}
+
+/// Pops `n` words into place `l`. For stage1 and `n` of at least
+/// X86_REP_COPY words, it overwrites %rcx, %rsi and %rdi.
 fn x86_pop_to(g: &mut X86, l: X86Loc, n: u64) {
+  if !g.stage0 && n >= X86_REP_COPY && l.k == XL_MEM && l.b != XR_RSP {
+    // stage1: as the pops below, upward, with `rep movsq`.
+    x86_t(&mut g, "lea ");
+    x86_o(&mut g, x86_lop(l, 0));
+    x86_t(&mut g, ", %rdi");
+    x86_e(&mut g);
+    x86_es(&mut g, "mov %rsp, %rsi");
+    x86_t(&mut g, "mov $");
+    x86_n(&mut g, n);
+    x86_t(&mut g, ", %ecx");
+    x86_e(&mut g);
+    x86_es(&mut g, "rep movsq");
+    x86_drop(&mut g, n);
+    return;
+  }
   let mut i = 0;
   while i < n {
     x86_pop(&mut g, x86_reg(XR_RAX));
@@ -598,8 +647,24 @@ fn x86_pop_to(g: &mut X86, l: X86Loc, n: u64) {
   }
 }
 
-/// Pushes the `n` words at `l` (word 0 ends on top).
+/// Pushes the `n` words at `l` (word 0 ends on top). For stage1 and `n`
+/// of at least X86_REP_COPY words, it overwrites %rcx, %rsi and %rdi.
 fn x86_push_from(g: &mut X86, l: X86Loc, n: u64) {
+  if !g.stage0 && n >= X86_REP_COPY && l.k == XL_MEM && l.b != XR_RSP {
+    // stage1: the same words, copied below the stack with `rep movsq`.
+    x86_t(&mut g, "lea ");
+    x86_o(&mut g, x86_lop(l, 0));
+    x86_t(&mut g, ", %rsi");
+    x86_e(&mut g);
+    x86_reserve(&mut g, n);
+    x86_es(&mut g, "mov %rsp, %rdi");
+    x86_t(&mut g, "mov $");
+    x86_n(&mut g, n);
+    x86_t(&mut g, ", %ecx");
+    x86_e(&mut g);
+    x86_es(&mut g, "rep movsq");
+    return;
+  }
   let mut i = n;
   while i > 0 {
     i = i - 1;
@@ -3146,6 +3211,23 @@ fn x86_val_into(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, d: X
     x86_scalar(&mut g, c, &mut m, p, i);
     let dop = x86_dst_op(&mut g, d);
     x86_mov(&mut g, x86_reg(XR_RAX), dop);
+  } else if !g.stage0 && w >= X86_REP_COPY {
+    // stage1: a big value is copied from the stack with `rep movsq`
+    // (word by word upward, as the pops below), not a pop and a move per
+    // word.
+    x86_push_val(&mut g, c, &mut m, p, i);
+    let dop = x86_dst_op(&mut g, d);
+    x86_t(&mut g, "lea ");
+    x86_o(&mut g, dop);
+    x86_t(&mut g, ", %rdi");
+    x86_e(&mut g);
+    x86_es(&mut g, "mov %rsp, %rsi");
+    x86_t(&mut g, "mov $");
+    x86_n(&mut g, w);
+    x86_t(&mut g, ", %ecx");
+    x86_e(&mut g);
+    x86_es(&mut g, "rep movsq");
+    x86_drop(&mut g, w);
   } else {
     x86_push_val(&mut g, c, &mut m, p, i);
     let mut j = 0;
@@ -4200,6 +4282,10 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
       x86_place_label(&mut g, l);
       x86_elem_addr(&mut g, w);
       x86_pop_to(&mut g, x86_mem_loc(XR_RCX, XB, 0), w);
+      if !g.stage0 && w >= X86_REP_COPY {
+        // `rep movsq` used %rdi: the vector is on top again.
+        x86_es(&mut g, "mov (%rsp), %rdi");
+      }
       x86_es(&mut g, "incq (%rdi)");
       x86_drop(&mut g, 1);
     }
@@ -4259,6 +4345,24 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     if name_is(p, i, "vec_set") {
       x86_pop_to(&mut g, x86_mem_loc(XR_RCX, XB, 0), w);
       x86_drop(&mut g, 2);
+    } else if !g.stage0 && w >= X86_REP_COPY {
+      // stage1: the old value copied below the new one, the new one into
+      // the vector, the old one over the new one, vector and index; each
+      // with `rep movsq` (no copy overlaps its source).
+      x86_es(&mut g, "mov %rcx, %rdx");
+      x86_reserve(&mut g, w);
+      x86_rep_copy(&mut g, "mov %rdx, %rsi", "mov %rsp, %rdi", w);
+      x86_t(&mut g, "lea ");
+      x86_n(&mut g, wrap_mul(8, w));
+      x86_t(&mut g, "(%rsp), %rsi");
+      x86_e(&mut g);
+      x86_rep_copy(&mut g, "", "mov %rdx, %rdi", w);
+      x86_t(&mut g, "lea ");
+      x86_n(&mut g, wrap_mul(8, wrap_add(w, 2)));
+      x86_t(&mut g, "(%rsp), %rdi");
+      x86_e(&mut g);
+      x86_rep_copy(&mut g, "mov %rsp, %rsi", "", w);
+      x86_drop(&mut g, wrap_add(w, 2));
     } else {
       // Exchange the new value on the stack with the old one, then slide
       // it over the vector and index.
@@ -5644,6 +5748,31 @@ fn x86_acc_dead(code: &Vec[u64], s: u64, e: u64) -> bool {
   return false;
 }
 
+/// Is line `i`, `jmp L`, followed by labels and alignment only up to
+/// `L:`?
+fn x86_jumps_next(code: &Vec[u64], starts: &Vec[u64], i: u64) -> bool {
+  let nl = vec_len(starts);
+  let s = u_at(starts, i);
+  let e = x86_line_end(code, s);
+  let t = wrap_add(s, 5);
+  let mut j = wrap_add(i, 1);
+  while j < nl && wrap_sub(j, i) < 16 {
+    let ls = u_at(starts, j);
+    let le = x86_line_end(code, ls);
+    if x86_has_prefix(code, ls, "\t.p2align") {
+      j = j + 1;
+    } else if u_at(code, ls) == 46 && le > ls && u_at(code, wrap_sub(le, 1)) == 58 {
+      if x86_same_text(code, ls, wrap_sub(le, 1), t, e) {
+        return true;
+      }
+      j = j + 1;
+    } else {
+      return false;
+    }
+  }
+  return false;
+}
+
 /// Does the text from `s` to `e` address memory?
 fn x86_is_mem(code: &Vec[u64], s: u64, e: u64) -> bool {
   let mut k = s;
@@ -5690,6 +5819,11 @@ fn x86_peep_acc(code: &Vec[u64], out: &mut Vec[u64]) {
         i = i + 2;
         done = true;
       }
+    }
+    // A jump to a label among the labels right after it.
+    if !done && x86_has_prefix(code, s, "\tjmp .L") && x86_jumps_next(code, starts, i) {
+      i = i + 1;
+      done = true;
     }
     // `mov %rax, X` `mov X, %rax`, X a frame slot: the load is the value
     // just stored.
