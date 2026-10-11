@@ -1,0 +1,67 @@
+// expect-exit: 0
+// expect-stdout: 6765
+// expect-stdout: 1024
+// expect-stdout: 55
+// Small recursive functions, which the native backend inlines into
+// themselves once: two self-calls in one expression, a self-call through
+// a `&mut` parameter, and early returns from the inlined copy.
+
+struct Node { l: Tree, r: Tree }
+enum Tree { Leaf(u64), Branch(Box[Node]) }
+
+fn fib(n: u64) -> u64
+  requires n <= 30
+{
+  if n < 2 {
+    return n;
+  }
+  return wrap_add(fib(n - 1), fib(n - 2));
+}
+
+fn build(d: u64) -> Tree
+  requires d <= 20
+{
+  if d == 0 {
+    return Tree::Leaf(1);
+  }
+  return Tree::Branch(box(Node { l: build(d - 1), r: build(d - 1) }));
+}
+
+fn leaves(t: &Tree) -> u64 {
+  match t {
+    Tree::Leaf(v) => { return v; },
+    Tree::Branch(n) => { return wrap_add(leaves(n.l), leaves(n.r)); },
+  }
+}
+
+fn drop_tree(t: Tree) {
+  match t {
+    Tree::Leaf(_) => {},
+    Tree::Branch(b) => {
+      let n = unbox(b);
+      drop_tree(n.l);
+      drop_tree(n.r);
+    },
+  }
+}
+
+fn count_down(acc: &mut u64, n: u64)
+  requires n <= 100
+{
+  if n == 0 {
+    return;
+  }
+  acc = wrap_add(acc, n);
+  count_down(&mut acc, n - 1);
+}
+
+fn main() -> u64 {
+  print(fib(20));
+  let t = build(10);
+  print(leaves(t));
+  drop_tree(t);
+  let mut a = 0;
+  count_down(&mut a, 10);
+  print(a);
+  return 0;
+}
