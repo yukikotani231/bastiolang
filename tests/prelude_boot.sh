@@ -6,7 +6,10 @@
 # - a framebuffer address that would wrap `addr + pitch * h`, or one at
 #   4 GiB, must not be reported (the verifier takes each field as < 2^32);
 # - a memory-map entry whose size field is 0xFFFFFFFC must not make the
-#   pool's walk loop forever (in 32 bits, size + 4 is 0).
+#   pool's walk loop forever (in 32 bits, size + 4 is 0);
+# - with two runs of RAM, a page id in the second run must name a page in
+#   that run, whether taken zeroed or dirty (bst_page_at,
+#   bst_pool_take_dirty).
 # stage1's prelude (stage1/cprelude.bastio) is byte-identical (difftest),
 # so this covers both C backends.
 #
@@ -27,6 +30,10 @@ pool = func("static bst_pool bst_pool_init(uint64_t mbi) {")
 # The pool's own definitions: the runs, their limits and the bookkeeping.
 pool = s[s.index("extern uint64_t bst_ram_limit"):s.index("static bst_pool bst_pool_init(uint64_t mbi) {")] + pool
 pool = pool.replace("(uint64_t)_end", "0x200000ull")
+# Page ids to addresses: the page reader and the dirty take.
+pages = func("static inline uint64_t bst_page_at(uint64_t i) {")
+i = s.index("static inline bst_frame bst_pool_take_dirty(")
+pages += s[i:s.index("\n", i) + 1]
 open(sys.argv[1], "w").write(r'''
 #include <stdint.h>
 #include <stdio.h>
@@ -35,9 +42,10 @@ open(sys.argv[1], "w").write(r'''
 #include <sys/mman.h>
 typedef int bst_cpu;
 typedef struct { uint64_t base, size; } bst_pool;
+typedef uint64_t bst_frame;
 static uint64_t bst_mbi, bst_pool_base;
 static uint64_t *bst_arena2, bst_arena2_words;
-''' + fb + pool + r'''
+''' + fb + pool + pages + r'''
 static int bad;
 static void want(const char *what, uint64_t got, uint64_t expect) {
     if (got != expect) { printf("FAIL %s: got %#llx, want %#llx\n", what, (unsigned long long)got, (unsigned long long)expect); bad++; }
@@ -72,6 +80,18 @@ int main(void) {
     bst_pool p = bst_pool_init((uint64_t)info);
     /* 2048 pages, less 4 for the counters and 256 for the arena's extension */
     want("a map entry with a size of 0xFFFFFFFC ends the walk", p.size, 2048 - 4 - 256);
+
+    /* Two runs: 8 MiB at 512 MiB and 4 MiB at 768 MiB. The bookkeeping is
+     * carved from the front of the first (6 pages of counters and 384 of
+     * arena), so the first run holds ids 0 to 1657 and the second the rest. */
+    uint8_t *ram2 = mmap((void *)0x30000000, 4ull << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (ram2 != (uint8_t *)0x30000000) { printf("SKIP two runs (no low mapping)\n"); return bad != 0; }
+    *(uint32_t *)(m + 24) = 20; *(uint64_t *)(m + 28) = 0x30000000; *(uint64_t *)(m + 36) = 4ull << 20; *(uint32_t *)(m + 44) = 1;
+    p = bst_pool_init((uint64_t)info);
+    want("two runs: the pool holds both", p.size, 2048 + 1024 - 6 - 384);
+    want("two runs: the first id of the second run", bst_page_at(1658), 0x30000000);
+    want("two runs: a dirty page in the second run", bst_pool_take_dirty(&p, 1661), 0x30000000 + 3 * 4096);
+    want("two runs: a dirty page in the first run", bst_pool_take_dirty(&p, 1), 0x20000000 + 390 * 4096 + 4096);
     return bad != 0;
 }
 ''')
