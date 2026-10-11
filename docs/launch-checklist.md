@@ -15,10 +15,9 @@ repositories are public. It is not part of the documentation website.
       tagged".
 - [x] **Where the website lives:** GitHub Pages (decided 2026-10-11).
       Both ways to publish are ready ("Publishing" in `site/README.md`):
-      the `pages` workflow, off until `PAGES_ENABLED` is set, or
-      `site/publish.sh` to a `gh-pages` branch. Turn one on when the
-      repository goes public (Pages on a private repository needs a paid
-      plan). A custom domain, if any, is still open.
+      the `pages` workflow, which needs Settings > Pages > Source set to
+      GitHub Actions, or `site/publish.sh` to a `gh-pages` branch. A
+      custom domain, if any, is still open.
 - [ ] **The name.** Checked 2026-10-11: `bastio`, `bastios`, `bastioc`
       and `tree-sitter-bastio` are free on crates.io, npm and PyPI, and a
       web search finds no other language or OS by either name. One
