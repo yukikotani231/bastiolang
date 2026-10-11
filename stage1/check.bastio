@@ -1104,7 +1104,7 @@ fn is_pt_borrow_builtin(p: &Parser, s: u64, e: u64) -> bool {
 }
 
 fn is_builtin_name(c: &Checker, p: &Parser, s: u64, e: u64) -> bool {
-  return span_is(p, s, e, "box") || span_is(p, s, e, "unbox") || span_is(p, s, e, "cast") || span_is(p, s, e, "wrap")
+  return span_is(p, s, e, "box") || span_is(p, s, e, "try_box") || span_is(p, s, e, "unbox") || span_is(p, s, e, "cast") || span_is(p, s, e, "wrap")
     || span_is(p, s, e, "smp_run") || is_pt_borrow_builtin(p, s, e) || is_lock_builtin(p, s, e) || is_atomic_builtin(p, s, e)
     || is_vec_builtin(p, s, e) || is_wrap_builtin(p, s, e) || bs_index(c, p, s, e) != 0;
 }
@@ -3169,6 +3169,56 @@ fn operands(c: &mut Checker, m: &mut Mono, p: &Parser, a: u64, b: u64) -> Ops {
   return Ops { a: ta, b: tb };
 }
 
+/// `try_box[T](x)`: `Boxed[T]` from core/boxed.bastio, which
+/// monomorphization has already copied for `T`.
+fn ck_try_box(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
+  let n = node_at(p.nodes, i);
+  let call = node_at(p.nodes, n.b);
+  if list_len(p, n.a) != 1 || list_len(p, call.a) != 1 {
+    if cm_new(&mut c, p, i, C_TYPE) {
+      cm_s(&mut c, "write `try_box[T](x)`: one type argument, one argument");
+    }
+    return 0;
+  }
+  let t = conv(&mut m, p, n.a, c.env, i);
+  known_type(&mut c, m, p, t, i);
+  if c.failed {
+    return 0;
+  }
+  let ta = ck_expr_as(&mut c, &mut m, p, call.a, t);
+  if !c.failed && cm_mismatch(&mut c, p, ta, t, call.a) {
+    cm_s(&mut c, "`try_box[");
+    cm_ty(&mut c, m, p, t);
+    cm_s(&mut c, "]` boxes a ");
+    cm_ty(&mut c, m, p, t);
+    cm_s(&mut c, ", found ");
+    cm_ty(&mut c, m, p, ta);
+  }
+  if c.failed {
+    return 0;
+  }
+  let bt = boxed_t(&mut m, p, t);
+  if bt == 0 {
+    return 0;
+  }
+  // It must be core's shape: `Ok(Box[T])` then `Full(T)`.
+  let x = inner_t(m, bt);
+  let dn = def_node(m, p, x);
+  let mut ok = list_len(p, dn.a) == 2 && fld_ty(c, x, 0) == intern(&mut m, p, TY_BOX, t) && fld_ty(c, x, 1) == t;
+  if ok {
+    let f0 = node_at(p.nodes, dn.a);
+    let f1 = node_at(p.nodes, f0.next);
+    ok = span_is(p, f0.s, f0.e, "Ok") && span_is(p, f1.s, f1.e, "Full");
+  }
+  if !ok {
+    if cm_new(&mut c, p, i, C_TYPE) {
+      cm_s(&mut c, "`try_box` returns `enum Boxed[T] { Ok(Box[T]), Full(T) }` from core/boxed.bastio, but `Boxed` here is defined differently");
+    }
+    return 0;
+  }
+  return bt;
+}
+
 /// An expression; a call, struct literal or variant names instance `inst`
 /// instead of what is written when `inst` is not 0.
 fn ck_named(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 {
@@ -3194,6 +3244,9 @@ fn ck_named(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64
           return 0;
         }
         return intern(&mut m, p, TY_VEC, t);
+      }
+      if name_is(p, n.b, "try_box") {
+        return ck_try_box(&mut c, &mut m, p, i);
       }
       // `cast[T](x)` (proved to fit) and `wrap[T](x)` (modular).
       if list_len(p, n.a) != 1 || list_len(p, call.a) != 1 {

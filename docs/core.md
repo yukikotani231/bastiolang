@@ -39,6 +39,12 @@ The tests are the worked examples: `tests/pass/core_*.bastio` and `tests/pass/st
 | `opt_or[T](o, d) -> T` | The payload, or `d` (proved) |
 | `struct Span { start: u64, end: u64 }` | Bytes `start..end` of some byte string |
 
+### `core/boxed.bastio`
+
+| Item | Meaning |
+| --- | --- |
+| `enum Boxed[T] { Ok(Box[T]), Full(T) }` | What `try_box[T](x)` returns: `x` in a new box, or `x` itself when memory ran out (see [Boxes](language.md#boxes)) |
+
 ### `core/bytes.bastio`
 
 | Function | Proved |
