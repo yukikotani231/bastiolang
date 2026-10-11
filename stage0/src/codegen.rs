@@ -85,6 +85,8 @@ pub fn emit(p: &Program, target: Target) -> String {
     for t in &vecs {
         let (c, n) = (cty(t), box_helper(t));
         out.push_str(&format!("static void bst_vec_push_{n}(bst_vec *v, {c} x) {{ if (v->len == v->cap) bst_vec_grow(v, sizeof({c})); (({c} *)v->data)[v->len++] = x; }}\n"));
+        out.push_str(&format!("static void bst_vec_push_within_{n}(bst_vec *v, {c} x) {{ (({c} *)v->data)[v->len++] = x; }}\n"));
+        out.push_str(&format!("static bool bst_vec_try_reserve_{n}(bst_vec *v, uint64_t k) {{ return bst_vec_try_grow(v, k, sizeof({c})); }}\n"));
         out.push_str(&format!("static {c} bst_vec_pop_{n}(bst_vec *v) {{ return (({c} *)v->data)[--v->len]; }}\n"));
         out.push_str(&format!("static {c} bst_vec_get_{n}(bst_vec v, uint64_t i) {{ return (({c} *)v.data)[i]; }}\n"));
         out.push_str(&format!("static void bst_vec_set_{n}(bst_vec *v, uint64_t i, {c} x) {{ (({c} *)v->data)[i] = x; }}\n"));
@@ -330,12 +332,21 @@ static bst_buf bst_alloc(uint64_t n) {
     if (!b.data) { fputs("Bastio: out of memory\n", stderr); abort(); }
     return b;
 }
+static bst_buf bst_try_alloc(uint64_t n) {
+    bst_buf b;
+    b.data = (uint64_t *)calloc(n ? n : 1, sizeof(uint64_t));
+    b.len = b.data ? n : 0;
+    return b;
+}
 static inline void bst_free(bst_buf b) { free(b.data); }
 /* Grow a block of `old` words to `n` words, keeping its contents; the new
  * words are not zeroed (only Vec uses it, and never reads past its length). */
-static uint64_t *bst_regrow(uint64_t *p, uint64_t old, uint64_t n) {
+static uint64_t *bst_try_regrow(uint64_t *p, uint64_t old, uint64_t n) {
     (void)old;
-    uint64_t *q = (uint64_t *)realloc(p, (n ? n : 1) * sizeof(uint64_t));
+    return (uint64_t *)realloc(p, (n ? n : 1) * sizeof(uint64_t));
+}
+static uint64_t *bst_regrow(uint64_t *p, uint64_t old, uint64_t n) {
+    uint64_t *q = bst_try_regrow(p, old, n);
     if (!q) { fputs("Bastio: out of memory\n", stderr); abort(); }
     return q;
 }
@@ -346,6 +357,12 @@ static bst_bytes bst_balloc(uint64_t n) {
     b.len = n;
     b.data = (unsigned char *)calloc(n ? n : 1, 1);
     if (!b.data) { fputs("Bastio: out of memory\n", stderr); abort(); }
+    return b;
+}
+static bst_bytes bst_try_balloc(uint64_t n) {
+    bst_bytes b;
+    b.data = (unsigned char *)calloc(n ? n : 1, 1);
+    b.len = b.data ? n : 0;
     return b;
 }
 static inline void bst_bfree(bst_bytes b) { free(b.data); }
@@ -510,6 +527,15 @@ static inline void bst_pt_put_shared(bst_pt *t, uint64_t i, bst_frame s, bool w)
 }
 #define bst_pt_take_shared bst_pt_take
 static inline bst_frame bst_pt_dup_shared(bst_pt t, uint64_t i) { return bst_shared_dup(((uint64_t *)t)[i] & BST_PTE_ADDR); }
+/* Dirty pages: taken without zeroing, so whoever takes them (under a lock,
+ * say) does not pay for it; they become frames only by being overwritten
+ * whole, which can happen later and elsewhere. */
+static inline bst_frame bst_pool_take_dirty(bst_pool *p, uint64_t i) { return p->base + i * 4096; }
+static inline uint64_t bst_dirty_id(bst_frame d) { return bst_frame_id(d); }
+static inline bst_frame bst_dirty_zero(bst_frame d) { bst_zero_page(d); return d; }
+static inline bst_frame bst_frame_copy(bst_frame d, bst_frame src) { bst_copy_fwd((unsigned char *)d, (const unsigned char *)src, 4096); return d; }
+#define bst_shared_copy bst_frame_copy
+static inline bst_frame bst_dirty_fill(bst_frame d, bst_bytes src, uint64_t s) { bst_copy_fwd((unsigned char *)d, src.data + s, 4096); return d; }
 "#;
 
 // The freestanding runtime. Part of the trusted base: the only code that
@@ -558,7 +584,8 @@ static uint64_t bst_arena_top = 0;
 typedef struct bst_free { uint64_t words; struct bst_free *next; } bst_free_t;
 static bst_free_t *bst_free_list = 0;
 static uint64_t bst_arena_lock;              /* every processor allocates from the one arena */
-static bst_buf bst_alloc(uint64_t n) {
+/* An empty buffer with no memory when the arena is full. */
+static bst_buf bst_try_alloc(uint64_t n) {
     uint64_t words = (n ? n : 1) + 1;            /* one header word for the size */
     if (words < 2) words = 2;
     uint64_t *blk = 0;
@@ -571,18 +598,24 @@ static bst_buf bst_alloc(uint64_t n) {
             break;
         }
     }
-    if (!blk) {
-        if (bst_arena_top + words > BST_ARENA_WORDS) { bst_puts("bastio: out of memory\n"); bst_halt(); }
+    if (!blk && bst_arena_top + words <= BST_ARENA_WORDS) {
         blk = &bst_arena[bst_arena_top];
         bst_arena_top += words;
         blk[0] = words;
     }
     bst_lock_release(&bst_arena_lock);
+    if (!blk) { bst_buf none = { 0, 0 }; return none; }
     for (uint64_t i = 1; i < words; i++) blk[i] = 0;
     bst_buf b = { n, blk + 1 };
     return b;
 }
+static bst_buf bst_alloc(uint64_t n) {
+    bst_buf b = bst_try_alloc(n);
+    if (!b.data) { bst_puts("bastio: out of memory\n"); bst_halt(); }
+    return b;
+}
 static void bst_free(bst_buf b) {
+    if (!b.data) return;
     uint64_t *blk = b.data - 1;
     bst_free_t *f = (bst_free_t *)blk;
     bst_lock_acquire(&bst_arena_lock);
@@ -647,19 +680,29 @@ static bst_bytes bst_balloc(uint64_t n) {
     bst_bytes b = { n, (unsigned char *)w.data };
     return b;
 }
+static bst_bytes bst_try_balloc(uint64_t n) {
+    bst_buf w = bst_try_alloc((n + 7) / 8);
+    bst_bytes b = { w.data ? n : 0, (unsigned char *)w.data };
+    return b;
+}
 static void bst_bfree(bst_bytes b) {
     bst_buf w = { (b.len + 7) / 8, (uint64_t *)b.data };
     bst_free(w);
 }
 /* Grow a block of `old` words to `n` words, keeping its contents. */
-static uint64_t *bst_regrow(uint64_t *p, uint64_t old, uint64_t n) {
-    uint64_t *q = bst_alloc(n).data;
-    if (p) {
+static uint64_t *bst_copy_over(uint64_t *q, uint64_t *p, uint64_t old) {
+    if (q && p) {
         for (uint64_t i = 0; i < old; i++) q[i] = p[i];
         bst_buf b = { old, p };
         bst_free(b);
     }
     return q;
+}
+static uint64_t *bst_regrow(uint64_t *p, uint64_t old, uint64_t n) {
+    return bst_copy_over(bst_alloc(n).data, p, old);
+}
+static uint64_t *bst_try_regrow(uint64_t *p, uint64_t old, uint64_t n) {
+    return bst_copy_over(bst_try_alloc(n).data, p, old);
 }
 "#;
 
@@ -777,6 +820,8 @@ static uint64_t bst_host_cpus(bst_host h) {
 const PRELUDE_BYTES: &str = r#"
 /* Box[T]: one allocation from the same allocator as Buf. */
 static void *bst_box_alloc(uint64_t n) { return bst_alloc((n + 7) / 8).data; }
+/* The same, or 0 when out of memory (try_box). */
+static void *bst_box_try_alloc(uint64_t n) { return bst_try_alloc((n + 7) / 8).data; }
 static void bst_box_free(void *p, uint64_t n) { bst_buf w = { (n + 7) / 8, (uint64_t *)p }; bst_free(w); }
 
 /* Vec[T]: elements in one allocation that doubles when full. A size past
@@ -791,6 +836,21 @@ static void bst_vec_grow(bst_vec *v, uint64_t size) {
     uint64_t bytes = ncap > (UINT64_C(1) << 60) / size ? ~UINT64_C(0) - 8 : ncap * size;
     v->data = bst_regrow((uint64_t *)v->data, (v->cap * size + 7) / 8, (bytes + 7) / 8);
     v->cap = ncap;
+}
+/* vec_try_reserve: room for k more elements, or false with the vector
+ * unchanged. The capacity stays at most 2^60 elements, as the prover
+ * assumes. */
+static bool bst_vec_try_grow(bst_vec *v, uint64_t k, uint64_t size) {
+    uint64_t lim = (UINT64_C(1) << 60) / size;
+    if (k <= v->cap - v->len) return true;
+    if (v->len > lim || k > lim - v->len) return false;
+    uint64_t ncap = v->len + k;
+    if (v->cap <= lim / 2 && v->cap * 2 > ncap) ncap = v->cap * 2;
+    uint64_t *d = bst_try_regrow((uint64_t *)v->data, (v->cap * size + 7) / 8, (ncap * size + 7) / 8);
+    if (!d) return false;
+    v->data = d;
+    v->cap = ncap;
+    return true;
 }
 static inline void bst_bset(bst_bytes *b, uint64_t i, uint64_t v) { b->data[i] = (unsigned char)v; }
 /* Bulk copies. The prover has shown both ranges in bounds, so there are no
@@ -1035,7 +1095,8 @@ static uint64_t bst_arena[BST_ARENA_WORDS];
 static uint64_t bst_arena_top = 0;
 typedef struct bst_free { uint64_t words; struct bst_free *next; } bst_free_t;
 static bst_free_t *bst_free_list = 0;
-static bst_buf bst_alloc(uint64_t n) {
+/* An empty buffer with no memory when the arena is full. */
+static bst_buf bst_try_alloc(uint64_t n) {
     uint64_t words = (n ? n : 1) + 1;
     if (words < 2) words = 2;
     bst_free_t **pp = &bst_free_list;
@@ -1049,10 +1110,8 @@ static bst_buf bst_alloc(uint64_t n) {
         }
     }
     if (bst_arena_top + words > BST_ARENA_WORDS) {
-        static const char m[] = "bastio: out of memory\n";
-        bst_flush();
-        bst_sys(BST_SYS_WRITE, (uint64_t)m, sizeof m - 1, 0);
-        bst_sys(BST_SYS_EXIT, 255, 0, 0);
+        bst_buf none = { 0, 0 };
+        return none;
     }
     uint64_t *blk = &bst_arena[bst_arena_top];
     bst_arena_top += words;
@@ -1061,7 +1120,18 @@ static bst_buf bst_alloc(uint64_t n) {
     bst_buf b = { n, blk + 1 };
     return b;
 }
+static bst_buf bst_alloc(uint64_t n) {
+    bst_buf b = bst_try_alloc(n);
+    if (!b.data) {
+        static const char m[] = "bastio: out of memory\n";
+        bst_flush();
+        bst_sys(BST_SYS_WRITE, (uint64_t)m, sizeof m - 1, 0);
+        bst_sys(BST_SYS_EXIT, 255, 0, 0);
+    }
+    return b;
+}
 static void bst_free(bst_buf b) {
+    if (!b.data) return;
     uint64_t *blk = b.data - 1;
     bst_free_t *f = (bst_free_t *)blk;
     f->words = blk[0];
@@ -1125,6 +1195,7 @@ fn cty(t: &Type) -> String {
         Type::Dma => "bst_dma".into(),
         Type::Lease => "bst_lease".into(),
         Type::Shared => "bst_frame".into(),
+        Type::Dirty => "bst_frame".into(),
         Type::Struct(n) => format!("bst_s_{}", cid(n)),
         Type::Enum(n) => format!("bst_e_{}", cid(n)),
         Type::Generic(..) => unreachable!("removed by monomorphization"),
@@ -1280,6 +1351,7 @@ impl<'a> Gen<'a> {
         match &e.kind {
             ExprKind::TypeApp(targs, inner) => match &inner.kind {
                 ExprKind::Call(n, _) if n == "cast" || n == "wrap" => targs[0].clone(),
+                ExprKind::Call(n, _) if n == "try_box" => crate::check::boxed_type(&targs[0]),
                 _ => Type::Vec(Box::new(targs[0].clone())), // vec_new[T]()
             },
             ExprKind::Int(_) => Type::U64,
@@ -1309,7 +1381,8 @@ impl<'a> Gen<'a> {
             },
             ExprKind::Call(n, args) if crate::check::VEC_BUILTINS.contains(&n.as_str()) => match n.as_str() {
                 "vec_len" => Type::U64,
-                "vec_push" | "vec_set" | "vec_free" => Type::Unit,
+                "vec_try_reserve" => Type::Bool,
+                "vec_push" | "vec_push_within" | "vec_set" | "vec_free" => Type::Unit,
                 _ => self.vec_elem(&args[0]),
             },
             ExprKind::Call(n, _) if crate::check::WRAP_BUILTINS.contains(&n.as_str()) => self.int_ops[&e.pos].clone(),
@@ -1435,6 +1508,22 @@ impl<'a> Gen<'a> {
             // modular conversion, so both are a plain C cast.
             ExprKind::TypeApp(targs, inner) => match &inner.kind {
                 ExprKind::Call(n, args) if n == "cast" || n == "wrap" => format!("(({})({}))", cty(&targs[0]), self.expr(&args[0])),
+                // The value first, then the box; out of memory, the value
+                // goes back in `Full`.
+                ExprKind::Call(n, args) if n == "try_box" => {
+                    let inner = targs[0].clone();
+                    if !self.boxed.contains(&inner) {
+                        self.boxed.push(inner.clone());
+                    }
+                    let Type::Enum(bn) = crate::check::boxed_type(&inner) else { unreachable!("an enum") };
+                    let (c, en) = (cty(&inner), cid(&bn));
+                    let (x, p, r) = (format!("tx_{}", self.tmps), format!("tp_{}", self.tmps), format!("tr_{}", self.tmps));
+                    self.tmps += 1;
+                    format!(
+                        "({{ {c} {x} = {}; {c} *{p} = ({c} *)bst_box_try_alloc(sizeof({c})); bst_e_{en} {r}; if ({p}) {{ *{p} = {x}; {r} = (bst_e_{en}){{ .tag = 0, .u.Ok = {p} }}; }} else {{ {r} = (bst_e_{en}){{ .tag = 1, .u.Full = {x} }}; }} {r}; }})",
+                        self.expr(&args[0])
+                    )
+                }
                 _ => "((bst_vec){ 0, 0, 0 })".to_string(), // vec_new[T]()
             },
             ExprKind::Int(v) => format!("UINT64_C({})", v),
@@ -1798,6 +1887,7 @@ pub fn trusted_base() -> String {
     }
     out.push_str("definition bdec: bdec(b, f, t) is 0 when t <= f, else 10 * bdec(b, f, t - 1) + (bget(b, t - 1) - 48)\n");
     out.push_str("definition bhex: bhex(b, f, t) is 0 when t <= f, else 16 * bhex(b, f, t - 1) + the value of the hex digit bget(b, t - 1) (0-9, a-f, A-F)\n");
+    out.push_str("definition has_bit: has_bit(x, i) is bit i of x for i < 64 and false otherwise; no bit of 0 is set, bits 0 to w - 1 of 2^w - 1 are, and each of & | ^ ! << >> and a low mask sets bit j of its result from bits of its operands as binary arithmetic does\n");
     out
 }
 

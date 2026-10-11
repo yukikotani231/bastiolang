@@ -1,0 +1,129 @@
+// The QOI library's C API. Each `export fn` becomes a C function of the same
+// name, declared in a header that `bastioc0 --header` generates (see
+// run.sh). A `&Bytes` parameter is a pointer and a length on the C side, and
+// a `&mut Bytes` one a buffer the function writes into.
+import "qoi.bastio";
+
+enum QoiEncoded {
+  // The encoding, exactly as long as it is.
+  Ok(Bytes),
+  // The parameters do not describe an image: a width or height of 0 or
+  // above 2^32 - 1, channels not 3 or 4, colorspace above 1, or a pixel
+  // buffer whose length is not width * height * channels.
+  Bad,
+  // More than 400 million pixels, the limit of the format's reference
+  // implementation.
+  TooBig,
+  OutOfMemory,
+}
+
+enum QoiWritten {
+  // The length of the encoding at the start of `out`.
+  Ok(u64),
+  // `out` is too small: this many bytes always suffice.
+  TooSmall(u64),
+  Bad,
+  TooBig,
+  // The 256-byte table of recently seen colors could not be allocated.
+  OutOfMemory,
+}
+
+/// Decodes the QOI image in `src`, if it has at most `max_pixels` pixels.
+export fn qoi_decode(src: &Bytes, max_pixels: u64) -> QoiDecoded
+  ensures result is QoiDecoded::Ok ==> result.Ok.channels == 3 || result.Ok.channels == 4
+  ensures result is QoiDecoded::Ok ==> result.Ok.width * result.Ok.height <= max_pixels
+  ensures result is QoiDecoded::Ok ==> blen(result.Ok.pixels) == result.Ok.width * result.Ok.height * result.Ok.channels
+  ensures result is QoiDecoded::Err ==> result.Err <= blen(src)
+{
+  return qoi_decode_bytes(src, max_pixels);
+}
+
+/// 0 if the parameters describe an image, 1 (Bad) or 2 (TooBig) if not.
+fn qoi_check(pixels: &Bytes, w: u64, h: u64, ch: u64, cs: u64) -> u64
+  ensures result == 0 ==> w <= 4294967295 && h <= 4294967295 && cs <= 1 && w * h <= QOI_MAX_PIXELS
+  ensures result == 0 ==> (ch == 3 && blen(pixels) == w * h * 3) || (ch == 4 && blen(pixels) == w * h * 4)
+{
+  if w == 0 || h == 0 || w > 4294967295 || h > 4294967295 || cs > 1 || (ch != 3 && ch != 4) {
+    return 1;
+  }
+  if w * h > QOI_MAX_PIXELS {
+    return 2;
+  }
+  if blen(pixels) != w * h * ch {
+    return 1;
+  }
+  return 0;
+}
+
+/// The QOI encoding of the `w` by `h` image in `pixels` (row by row from the
+/// top left, `ch` bytes per pixel), byte for byte what the reference encoder
+/// writes.
+export fn qoi_encode(pixels: &Bytes, w: u64, h: u64, ch: u64, cs: u64) -> QoiEncoded
+  ensures result is QoiEncoded::Ok ==> blen(result.Ok) <= w * h * 5 + 22
+{
+  let bad = qoi_check(pixels, w, h, ch, cs);
+  if bad == 2 {
+    return QoiEncoded::TooBig;
+  }
+  if bad != 0 {
+    return QoiEncoded::Bad;
+  }
+  let px = w * h;
+  let mut max = px * 5 + QOI_HEADER + QOI_END;
+  if ch == 3 {
+    max = px * 4 + QOI_HEADER + QOI_END;
+  }
+  let mut out = try_balloc(max);
+  let mut idx = try_balloc(256);
+  if blen(out) != max || blen(idx) != 256 {
+    bfree(out);
+    bfree(idx);
+    return QoiEncoded::OutOfMemory;
+  }
+  let n = qoi_encode_bytes(pixels, w, h, px, ch, cs, &mut out, &mut idx);
+  bfree(idx);
+  // Hand back exactly `n` bytes, not the worst case.
+  let mut exact = try_balloc(n);
+  if blen(exact) != n {
+    bfree(out);
+    bfree(exact);
+    return QoiEncoded::OutOfMemory;
+  }
+  bcopy(&mut exact, 0, out, 0, n);
+  bfree(out);
+  return QoiEncoded::Ok(exact);
+}
+
+/// Like `qoi_encode`, but writes into `out` and returns the length written.
+/// If `out` is shorter than the longest possible encoding of such an image
+/// (`TooSmall` says how long), nothing is written, even if this image's
+/// encoding would have fit. Allocates only a 256-byte table, freed before it
+/// returns.
+export fn qoi_encode_into(pixels: &Bytes, w: u64, h: u64, ch: u64, cs: u64, out: &mut Bytes) -> QoiWritten
+  ensures result is QoiWritten::Ok ==> result.Ok <= blen(out)
+  ensures result is QoiWritten::TooSmall ==> result.TooSmall > blen(out)
+{
+  let bad = qoi_check(pixels, w, h, ch, cs);
+  if bad == 2 {
+    return QoiWritten::TooBig;
+  }
+  if bad != 0 {
+    return QoiWritten::Bad;
+  }
+  let px = w * h;
+  let mut max = px * 5 + QOI_HEADER + QOI_END;
+  if ch == 3 {
+    max = px * 4 + QOI_HEADER + QOI_END;
+  }
+  if blen(out) < max {
+    return QoiWritten::TooSmall(max);
+  }
+  let mut idx = try_balloc(256);
+  if blen(idx) != 256 {
+    bfree(idx);
+    return QoiWritten::OutOfMemory;
+  }
+  let n = qoi_encode_bytes(pixels, w, h, px, ch, cs, &mut out, &mut idx);
+  bfree(idx);
+  return QoiWritten::Ok(n);
+}

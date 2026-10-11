@@ -1,0 +1,30 @@
+// expect-exit: 7
+// A dirty page also becomes a frame by having a page's worth of bytes
+// copied over it (`dirty_fill`): how a page of a file is made without
+// zeroing it first.
+
+fn main(pool: &mut Pool) -> u64 {
+  if pool_size(pool) < 1 {
+    return 7;
+  }
+  let mut a = pool_take(&mut pool, 0);
+  frame_write(&mut a, 100, 99);
+  pool_give(&mut pool, a);
+  let mut b = balloc(8192);
+  bset(&mut b, 4096, 7);
+  bset(&mut b, 8191, 9);
+  let f = dirty_fill(pool_take_dirty(&mut pool, 0), b, 4096);
+  let mut r = 0;
+  if frame_id(f) == 0 && frame_read8(f, 0) == 7 {
+    r = r + 1;
+  }
+  if frame_read8(f, 4095) == 9 {
+    r = r + 2;
+  }
+  if frame_read(f, 100) == 0 {
+    r = r + 4;                          // every byte came from b, none from before
+  }
+  pool_give(&mut pool, f);
+  bfree(b);
+  return r;
+}

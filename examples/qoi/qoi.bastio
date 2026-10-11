@@ -1,0 +1,364 @@
+// QOI, the "Quite OK Image" format (https://qoiformat.org/qoi-specification.pdf),
+// decoded strictly and encoded exactly as the reference encoder does.
+//
+// What the compiler proves about this file, with no runtime checks in the
+// generated code:
+// - no out-of-bounds read or write, for every input (the input is untrusted);
+// - no integer overflow or underflow, no division by zero;
+// - every byte written is <= 255;
+// - no leak and no double free, on every path, including when memory runs
+//   out: allocation failure is a result, never an abort;
+// - the lengths in the `ensures` clauses.
+// Not proved: that decoding inverts encoding. The C harness checks that by
+// testing (see README.md).
+
+// The most pixels an image may have, as in the reference implementation.
+const QOI_MAX_PIXELS: u64 = 400000000;
+// The header and the end marker.
+const QOI_HEADER: u64 = 14;
+const QOI_END: u64 = 8;
+
+struct QoiImage {
+  width: u64,
+  height: u64,
+  // 3 (RGB) or 4 (RGBA): the bytes per pixel of `pixels`.
+  channels: u64,
+  // 0: sRGB with linear alpha, 1: all channels linear. Informative only.
+  colorspace: u64,
+  // Row by row from the top left, `channels` bytes per pixel.
+  pixels: Bytes,
+}
+
+enum QoiDecoded {
+  Ok(QoiImage),
+  // The offset of the first byte that makes the input invalid: in the
+  // header, a byte of the field that is wrong; in the data, the chunk that
+  // does not fit or the first byte after the last pixel that is not the end
+  // marker.
+  Err(u64),
+  // The image has more pixels than the caller allows.
+  TooBig,
+  // The pixels did not fit in memory.
+  OutOfMemory,
+}
+
+/// The big-endian 32-bit number at `i`.
+fn be32(b: &Bytes, i: u64) -> u64
+  requires i + 4 <= blen(b)
+  ensures result <= 4294967295
+{
+  return cast[u64](bget(b, i)) * 16777216 + cast[u64](bget(b, i + 1)) * 65536
+    + cast[u64](bget(b, i + 2)) * 256 + cast[u64](bget(b, i + 3));
+}
+
+/// The slot of a color in the table of recently seen colors.
+fn qoi_hash(r: u8, g: u8, b: u8, a: u8) -> u64
+  ensures result < 64
+{
+  return (cast[u64](r) * 3 + cast[u64](g) * 5 + cast[u64](b) * 7 + cast[u64](a) * 11) % 64;
+}
+
+/// `x + d - bias`, modulo 256.
+fn qoi_add(x: u8, d: u64, bias: u64) -> u8
+  requires d <= 255 && bias <= 255
+{
+  return cast[u8]((cast[u64](x) + d + 256 - bias) % 256);
+}
+
+/// Decodes `src`. The image may have at most `max_pixels` pixels (and never
+/// more than QOI_MAX_PIXELS), so a caller decides how much memory a hostile
+/// header can make it ask for.
+fn qoi_decode_bytes(src: &Bytes, max_pixels: u64) -> QoiDecoded
+  ensures result is QoiDecoded::Ok ==> result.Ok.channels == 3 || result.Ok.channels == 4
+  ensures result is QoiDecoded::Ok ==> result.Ok.width * result.Ok.height <= max_pixels
+  ensures result is QoiDecoded::Ok ==> blen(result.Ok.pixels) == result.Ok.width * result.Ok.height * result.Ok.channels
+  ensures result is QoiDecoded::Err ==> result.Err <= blen(src)
+{
+  let n = blen(src);
+  if n < QOI_HEADER + QOI_END {
+    return QoiDecoded::Err(n);
+  }
+  // "qoif"
+  if bget(src, 0) != 113 || bget(src, 1) != 111 || bget(src, 2) != 105 || bget(src, 3) != 102 {
+    return QoiDecoded::Err(0);
+  }
+  let w = be32(src, 4);
+  let h = be32(src, 8);
+  let ch = cast[u64](bget(src, 12));
+  let cs = cast[u64](bget(src, 13));
+  if w == 0 {
+    return QoiDecoded::Err(4);
+  }
+  if h == 0 {
+    return QoiDecoded::Err(8);
+  }
+  if ch != 3 && ch != 4 {
+    return QoiDecoded::Err(12);
+  }
+  if cs > 1 {
+    return QoiDecoded::Err(13);
+  }
+  let px = w * h;
+  if px > QOI_MAX_PIXELS || px > max_pixels {
+    return QoiDecoded::TooBig;
+  }
+  let mut total = px * 3;
+  if ch == 4 {
+    total = px * 4;
+  }
+  let mut out = try_balloc(total);
+  let mut seen = try_balloc(256);
+  if blen(out) != total || blen(seen) != 256 {
+    bfree(out);
+    bfree(seen);
+    return QoiDecoded::OutOfMemory;
+  }
+  // The chunks end where the end marker starts.
+  let end = n - QOI_END;
+  let mut p = QOI_HEADER;
+  let mut o = 0;
+  let mut r: u8 = 0;
+  let mut g: u8 = 0;
+  let mut b: u8 = 0;
+  let mut a: u8 = 255;
+  let mut run = 0;
+  let mut bad = n;
+  while o + ch <= total && bad == n
+    invariant o <= total && QOI_HEADER <= p && p <= end && run <= 62 && bad <= n
+    invariant blen(out) == total && blen(seen) == 256
+  {
+    if run > 0 {
+      run = run - 1;
+    } else if p >= end {
+      bad = p;
+    } else {
+      let op = cast[u64](bget(src, p));
+      if op == 254 {
+        if p + 4 > end {
+          bad = p;
+        } else {
+          r = bget(src, p + 1);
+          g = bget(src, p + 2);
+          b = bget(src, p + 3);
+          p = p + 4;
+        }
+      } else if op == 255 {
+        if p + 5 > end {
+          bad = p;
+        } else {
+          r = bget(src, p + 1);
+          g = bget(src, p + 2);
+          b = bget(src, p + 3);
+          a = bget(src, p + 4);
+          p = p + 5;
+        }
+      } else if op < 64 {
+        r = bget(seen, op * 4);
+        g = bget(seen, op * 4 + 1);
+        b = bget(seen, op * 4 + 2);
+        a = bget(seen, op * 4 + 3);
+        p = p + 1;
+      } else if op < 128 {
+        r = qoi_add(r, op / 16 % 4, 2);
+        g = qoi_add(g, op / 4 % 4, 2);
+        b = qoi_add(b, op % 4, 2);
+        p = p + 1;
+      } else if op < 192 {
+        if p + 2 > end {
+          bad = p;
+        } else {
+          let dg = op - 128;
+          let rb = cast[u64](bget(src, p + 1));
+          r = qoi_add(r, (dg + rb / 16) % 256, 40);
+          g = qoi_add(g, dg, 32);
+          b = qoi_add(b, (dg + rb % 16) % 256, 40);
+          p = p + 2;
+        }
+      } else {
+        // This pixel and `run` more of the same color.
+        run = op - 192;
+        p = p + 1;
+      }
+    }
+    if bad == n {
+      bset(&mut out, o, r);
+      bset(&mut out, o + 1, g);
+      bset(&mut out, o + 2, b);
+      if ch == 4 {
+        bset(&mut out, o + 3, a);
+      }
+      let k = qoi_hash(r, g, b, a) * 4;
+      bset(&mut seen, k, r);
+      bset(&mut seen, k + 1, g);
+      bset(&mut seen, k + 2, b);
+      bset(&mut seen, k + 3, a);
+      o = o + ch;
+    }
+  }
+  bfree(seen);
+  // A run may not go past the last pixel.
+  if bad == n && run > 0 {
+    bad = p - 1;
+  }
+  // The end marker: seven 0 bytes and a 1, right after the last chunk.
+  if bad == n && p != end {
+    bad = p;
+  }
+  let mut i = 0;
+  while bad == n && i < QOI_END
+    invariant i <= QOI_END && bad <= n
+  {
+    let mut want: u8 = 0;
+    if i == 7 {
+      want = 1;
+    }
+    if bget(src, end + i) != want {
+      bad = end + i;
+    }
+    i = i + 1;
+  }
+  if bad != n {
+    bfree(out);
+    return QoiDecoded::Err(bad);
+  }
+  return QoiDecoded::Ok(QoiImage { width: w, height: h, channels: ch, colorspace: cs, pixels: out });
+}
+
+/// The longest encoding of `px` pixels of `ch` channels: one chunk of at
+/// most `ch + 1` bytes per pixel (a 4-channel image may need RGBA chunks of
+/// 5 bytes; a 3-channel one never does), the header and the end marker.
+fn qoi_max_size(px: u64, ch: u64) -> u64
+  requires px <= QOI_MAX_PIXELS && (ch == 3 || ch == 4)
+{
+  if ch == 3 {
+    return px * 4 + QOI_HEADER + QOI_END;
+  }
+  return px * 5 + QOI_HEADER + QOI_END;
+}
+
+/// Writes the big-endian 32-bit `v` at `o`.
+fn put32(out: &mut Bytes, o: u64, v: u64)
+  requires o + 4 <= blen(out) && v <= 4294967295
+{
+  bset(&mut out, o, cast[u8](v / 16777216));
+  bset(&mut out, o + 1, cast[u8](v / 65536 % 256));
+  bset(&mut out, o + 2, cast[u8](v / 256 % 256));
+  bset(&mut out, o + 3, cast[u8](v % 256));
+}
+
+/// Encodes `px` pixels (`ch` bytes each, row by row) of a `w` by `h` image
+/// into the start of `out`, as the reference encoder does, and returns the
+/// length of the encoding. The rest of `out` is left as it was. `idx` is the
+/// table of recently seen colors, 64 slots of 4 bytes, all zero to start
+/// with: the caller allocates it, so that running out of memory is the
+/// caller's result to report, and this function allocates nothing.
+fn qoi_encode_bytes(pixels: &Bytes, w: u64, h: u64, px: u64, ch: u64, cs: u64, out: &mut Bytes, idx: &mut Bytes) -> u64
+  requires blen(idx) == 256
+  requires w <= 4294967295 && h <= 4294967295 && cs <= 1
+  requires px <= QOI_MAX_PIXELS
+  requires (ch == 3 && blen(pixels) == px * 3) || (ch == 4 && blen(pixels) == px * 4)
+  requires (ch == 3 && px * 4 + QOI_HEADER + QOI_END <= blen(out)) || (ch == 4 && px * 5 + QOI_HEADER + QOI_END <= blen(out))
+  ensures result <= blen(out)
+{
+  let total = blen(pixels);
+  bset(&mut out, 0, 113);
+  bset(&mut out, 1, 111);
+  bset(&mut out, 2, 105);
+  bset(&mut out, 3, 102);
+  put32(&mut out, 4, w);
+  put32(&mut out, 8, h);
+  bset(&mut out, 12, cast[u8](ch));
+  bset(&mut out, 13, cast[u8](cs));
+  let mut o = QOI_HEADER;
+  let mut i = 0;
+  let mut q = 0;
+  let mut pr: u8 = 0;
+  let mut pg: u8 = 0;
+  let mut pb: u8 = 0;
+  let mut pa: u8 = 255;
+  let mut run = 0;
+  while i + ch <= total
+    invariant i <= total && run <= 61
+    invariant (ch == 3 && i == q * 3) || (ch == 4 && i == q * 4)
+    invariant o <= QOI_HEADER + i + q
+    invariant run > 0 ==> o + 1 <= QOI_HEADER + i + q
+    invariant ch == 3 ==> pa == 255
+    invariant blen(idx) == 256
+  {
+    let r = bget(pixels, i);
+    let g = bget(pixels, i + 1);
+    let b = bget(pixels, i + 2);
+    let mut a: u8 = 255;
+    if ch == 4 {
+      a = bget(pixels, i + 3);
+    }
+    let last = i + ch == total;
+    if r == pr && g == pg && b == pb && a == pa {
+      run = run + 1;
+      if run == 62 || last {
+        bset(&mut out, o, cast[u8](191 + run));
+        o = o + 1;
+        run = 0;
+      }
+    } else {
+      if run > 0 {
+        bset(&mut out, o, cast[u8](191 + run));
+        o = o + 1;
+        run = 0;
+      }
+      let hsh = qoi_hash(r, g, b, a);
+      let k = hsh * 4;
+      if bget(idx, k) == r && bget(idx, k + 1) == g && bget(idx, k + 2) == b && bget(idx, k + 3) == a {
+        bset(&mut out, o, cast[u8](hsh));
+        o = o + 1;
+      } else {
+        bset(&mut idx, k, r);
+        bset(&mut idx, k + 1, g);
+        bset(&mut idx, k + 2, b);
+        bset(&mut idx, k + 3, a);
+        if a == pa {
+          // The signed differences, plus 128.
+          let xr = (cast[u64](r) + 384 - cast[u64](pr)) % 256;
+          let xg = (cast[u64](g) + 384 - cast[u64](pg)) % 256;
+          let xb = (cast[u64](b) + 384 - cast[u64](pb)) % 256;
+          if xr >= 126 && xr <= 129 && xg >= 126 && xg <= 129 && xb >= 126 && xb <= 129 {
+            bset(&mut out, o, cast[u8](64 + (xr - 126) * 16 + (xg - 126) * 4 + (xb - 126)));
+            o = o + 1;
+          } else if xg >= 96 && xg <= 159 && xr + 8 >= xg && xr + 8 <= xg + 15 && xb + 8 >= xg && xb + 8 <= xg + 15 {
+            bset(&mut out, o, cast[u8](128 + xg - 96));
+            bset(&mut out, o + 1, cast[u8]((xr + 8 - xg) * 16 + (xb + 8 - xg)));
+            o = o + 2;
+          } else {
+            bset(&mut out, o, 254);
+            bset(&mut out, o + 1, r);
+            bset(&mut out, o + 2, g);
+            bset(&mut out, o + 3, b);
+            o = o + 4;
+          }
+        } else {
+          bset(&mut out, o, 255);
+          bset(&mut out, o + 1, r);
+          bset(&mut out, o + 2, g);
+          bset(&mut out, o + 3, b);
+          bset(&mut out, o + 4, a);
+          o = o + 5;
+        }
+      }
+    }
+    pr = r;
+    pg = g;
+    pb = b;
+    pa = a;
+    i = i + ch;
+    q = q + 1;
+  }
+  let mut j = 0;
+  while j < 7
+    invariant j <= 7 && o + 8 <= blen(out)
+  {
+    bset(&mut out, o + j, 0);
+    j = j + 1;
+  }
+  bset(&mut out, o + 7, 1);
+  return o + 8;
+}
