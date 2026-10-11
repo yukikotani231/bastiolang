@@ -308,8 +308,11 @@ typedef uint64_t bst_lease;                 /* the address of the table it holds
 /* Lock[T]: a lock word followed by the T. A spin lock; acquire and release
  * order the accesses to the contents between processors. A processor that
  * has to wait first gives up a parked address space (bst_mmu_exit), as a
- * processor holding a lease never waits. */
+ * processor holding a lease never waits, and one that lets go of its last
+ * lock gives it up too, unless it entered the table again meanwhile
+ * (bst_lock_depth). */
 static inline void bst_mmu_settle(void);    /* defined per target */
+static inline void bst_lock_depth(int d);   /* defined per target */
 static inline void bst_lock_acquire(uint64_t *w) {
     while (__atomic_exchange_n(w, 1, __ATOMIC_ACQUIRE)) {
         bst_mmu_settle();
@@ -319,8 +322,9 @@ static inline void bst_lock_acquire(uint64_t *w) {
 #endif
         }
     }
+    bst_lock_depth(1);
 }
-static inline void bst_lock_release(uint64_t *w) { __atomic_store_n(w, 0, __ATOMIC_RELEASE); }
+static inline void bst_lock_release(uint64_t *w) { __atomic_store_n(w, 0, __ATOMIC_RELEASE); bst_lock_depth(-1); }
 static inline bst_buf bst_set(bst_buf b, uint64_t i, uint64_t v) { b.data[i] = v; return b; }
 "#;
 
@@ -330,6 +334,7 @@ const PRELUDE_HOSTED: &str = r#"#include <stdio.h>
 static inline void bst_serial_write(bst_serial s, uint64_t b) { (void)s; putchar((int)b); if (b == '\n') fflush(stdout); }
 static inline uint64_t bst_serial_read(bst_serial s) { (void)s; fflush(stdout); int c = getchar(); return c == EOF ? 4 : (uint64_t)c; }
 static inline void bst_mmu_settle(void) { }
+static inline void bst_lock_depth(int d) { (void)d; }
 
 static bst_buf bst_alloc(uint64_t n) {
     bst_buf b;
@@ -1000,9 +1005,10 @@ static inline void bst_pio_out32(bst_portio *io, uint64_t o, uint64_t v) { bst_p
 const PRELUDE_KERNEL_CPU: &str = r#"
 static inline void bst_load_cr3(uint64_t a) { __asm__ volatile ("mov %0, %%cr3" : : "r"(a) : "memory"); }
 static inline uint64_t bst_read_cr3(void) { uint64_t a; __asm__ volatile ("mov %%cr3, %0" : "=r"(a)); return a; }
-/* Two words per processor, zero at boot, if the platform keeps them: the
- * table this processor parked (0: none), and bst_pt_gen as of its last CR3
- * load. Without them every switch loads CR3 at once. */
+/* Three words per processor, zero at boot, if the platform keeps them: the
+ * table this processor parked (0: none), bst_pt_gen as of its last CR3
+ * load, and how many locks it holds. Without them every switch loads CR3
+ * at once. */
 extern uint64_t *bst_platform_mmu_state(void) __attribute__((weak));
 static inline uint64_t *bst_mmu_state(void) { return bst_platform_mmu_state ? bst_platform_mmu_state() : 0; }
 static inline void bst_cr3_load(uint64_t *s, uint64_t a) {
@@ -1022,6 +1028,12 @@ static inline void bst_mmu_settle(void) {
 static inline void bst_mmu_settle_on(uint64_t t) {
     uint64_t *s = bst_mmu_state();
     if (s && s[0] == t) bst_mmu_settle();
+}
+static inline void bst_lock_depth(int d) {
+    uint64_t *s = bst_mmu_state();
+    if (!s) return;
+    s[2] += (uint64_t)(int64_t)d;
+    if (s[2] == 0 && s[0]) bst_mmu_settle();
 }
 static inline void bst_mmu_kernel(bst_mmu *m) { (void)m; bst_mmu_settle(); bst_load_cr3((uint64_t)bst_kernel_pml4); }
 /* A table this processor parked becomes the new lease without a second
@@ -1047,9 +1059,11 @@ static inline bst_lease bst_mmu_enter(bst_mmu *m, bst_pt *t) {
  * memory the same way (pml4 entry 0, BST_PT_NEW_HOOK), and nothing proved
  * reaches the user window without a lease, so kernel code runs the same
  * either way. The lease goes back (bst_mmu_settle) when the processor
- * enters another table, waits for a lock or an interrupt, touches MMIO
- * above 512 GiB (mapped only in the kernel's tables), returns from its
- * smp_run function, or asks for that table's lease count. */
+ * enters another table, waits for a lock or an interrupt, lets go of its
+ * last lock without entering the table again, touches MMIO above 512 GiB
+ * (mapped only in the kernel's tables), returns from its smp_run function,
+ * or asks for that table's lease count. So other processors see the lease
+ * held no longer than if the process had trapped a moment later. */
 static inline void bst_mmu_exit(bst_mmu *m, bst_lease l) {
     (void)m;
     uint64_t *s = bst_mmu_state();
@@ -1140,6 +1154,7 @@ void bst_kernel_fault(uint64_t vec, uint64_t rip, uint64_t cr2, uint64_t err) {
 // BastiOS ABI.
 const PRELUDE_USER: &str = r#"
 static inline void bst_mmu_settle(void) { }
+static inline void bst_lock_depth(int d) { (void)d; }
 enum { BST_SYS_EXIT, BST_SYS_WRITE, BST_SYS_READ, BST_SYS_SPAWN, BST_SYS_WAIT, BST_SYS_YIELD,
        BST_SYS_GETPID, BST_SYS_INFO, BST_SYS_PS, BST_SYS_KILL, BST_SYS_POWEROFF };
 static inline uint64_t bst_sys(uint64_t n, uint64_t a, uint64_t b, uint64_t c) {
