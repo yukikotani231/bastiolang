@@ -66,44 +66,54 @@ fn wtext_push_u64(t: &mut Vec[u64], x: u64)
   ensures wtext_keeps(t, old(t), vlen(old(t)))
   ensures wtext_digits_from(t, vlen(old(t)))
 {
-  let n0 = vec_len(t);
-  let mut p: u64 = 10000000000000000000;
-  let mut i = 0;
-  let mut started = false;
-  while i < 20 && p > 0
-    invariant i <= 20 && n0 <= vlen(t) && vlen(t) <= n0 + i
-    invariant started ==> n0 < vlen(t)
-    invariant !started ==> vlen(t) == n0
-    invariant wtext_digits_from(t, n0)
-    invariant n0 == vlen(old(t)) && wtext_keeps(t, old(t), n0)
+  // The number of digits and the place value of the first, then one
+  // digit per step: every step pushes, so the vector's length never
+  // depends on a branch.
+  let mut n = 1;
+  let mut p: u64 = 1;
+  while n < 20 && x / p >= 10
+    invariant 1 <= n && n <= 20 && p >= 1
   {
-    let d = x / p % 10;
-    if d != 0 || started || p == 1 {
-      vec_push(&mut t, d + 48);
-      started = true;
+    if p <= 1844674407370955161 {
+      p = p * 10;
     }
-    p = p / 10;
-    i = i + 1;
+    n = n + 1;
   }
-  if !started {
-    vec_push(&mut t, 48);              // not reached: p == 1 always pushes
+  let n0 = vec_len(t);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && n <= 20 && p >= 1 && vlen(t) == n0 + i && n0 == vlen(old(t))
+    invariant wtext_keeps(t, old(t), n0) && wtext_digits_from(t, n0)
+  {
+    vec_push(&mut t, x / p % 10 + 48);
+    p = p / 10;
+    if p == 0 {
+      p = 1;
+    }
+    i = i + 1;
   }
 }
 
 /// Appends `x` in lower-case hexadecimal, with no `0x`, padded with zeros
-/// to at least `min` digits (at most 16 are ever written for the value).
+/// to at least `min` digits (the value itself takes 1 to 16).
 fn wtext_push_hex(t: &mut Vec[u64], x: u64, min: u64)
   ensures vlen(old(t)) < vlen(t)
   ensures wtext_keeps(t, old(t), vlen(old(t)))
   ensures wtext_hex_from(t, vlen(old(t)))
 {
-  let n0 = vec_len(t);
+  // As wtext_push_u64, in base 16: arithmetic rather than shifts and
+  // masks, and a push on every step.
   let mut n = 1;
-  while n < 16 && (x >> (4 * n)) != 0
-    invariant 1 <= n && n <= 16
+  let mut p: u64 = 1;
+  while n < 16 && x / p >= 16
+    invariant 1 <= n && n <= 16 && p >= 1
   {
+    if p <= 1152921504606846975 {
+      p = p * 16;
+    }
     n = n + 1;
   }
+  let n0 = vec_len(t);
   let mut w = n;
   while w < min
     invariant n <= w && n0 <= vlen(t) && n0 == vlen(old(t))
@@ -112,22 +122,18 @@ fn wtext_push_hex(t: &mut Vec[u64], x: u64, min: u64)
     vec_push(&mut t, 48);
     w = w + 1;
   }
-  let mut i = n;
-  let mut first = true;
-  while i > 0
-    invariant i <= n && n <= 16 && n0 <= vlen(t) && n0 == vlen(old(t))
-    invariant !first ==> n0 < vlen(t)
-    invariant first ==> i == n
+  let mut i = 0;
+  while i < n
+    invariant i <= n && n <= 16 && p >= 1 && n0 + i <= vlen(t) && n0 == vlen(old(t))
     invariant wtext_keeps(t, old(t), n0) && wtext_hex_from(t, n0)
   {
-    i = i - 1;
-    let d = (x >> (4 * i)) & 15;
-    if d < 10 {
-      vec_push(&mut t, 48 + d);
-    } else {
-      vec_push(&mut t, 87 + d);
+    let d = x / p % 16;
+    vec_push(&mut t, 48 + d + d / 10 * 39);   // 0-9, then a-f
+    p = p / 16;
+    if p == 0 {
+      p = 1;
     }
-    first = false;
+    i = i + 1;
   }
 }
 
