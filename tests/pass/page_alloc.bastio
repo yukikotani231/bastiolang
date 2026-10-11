@@ -5,11 +5,11 @@
 // Then a three-level page table is built from allocated pages, used, and
 // torn down, and every page goes back to the pool.
 
-const NPAGES: u64 = 0x10000;   // the most pages a pool can have
+// The bitmap has a word per page of the pool, however much RAM there is.
 
 spec fn tracks(bm: &Buf, pool: &Pool) -> bool {
-  len(bm) == NPAGES
-  && (forall i: u64 :: i < NPAGES ==> ((get(bm, i) == 1) == pool_has(pool, i)))
+  len(bm) == pool_size(pool)
+  && (forall i: u64 :: i < len(bm) ==> ((get(bm, i) == 1) == pool_has(pool, i)))
   && (forall i: u64 :: pool_has(pool, i) ==> i < pool_size(pool))
 }
 
@@ -17,12 +17,12 @@ fn bm_new(pool: &Pool) -> Buf
   requires forall i: u64 :: pool_has(pool, i) == (i < pool_size(pool))
   ensures tracks(result, pool)
 {
-  let mut bm = alloc(NPAGES);
   let n = pool_size(pool);
+  let mut bm = alloc(n);
   let mut i = 0;
   while i < n
-    invariant i <= n && n <= NPAGES
-    invariant forall j: u64 :: j < NPAGES ==> ((get(bm, j) == 1) == (j < i))
+    invariant i <= n && len(bm) == n
+    invariant forall j: u64 :: j < n ==> ((get(bm, j) == 1) == (j < i))
   {
     bm = set(bm, i, 1);
     i = i + 1;
@@ -30,15 +30,14 @@ fn bm_new(pool: &Pool) -> Buf
   return bm;
 }
 
-/// The first free page, or NPAGES when there is none.
+/// The first free page, or len(bm) when there is none.
 fn find_free(bm: &Buf) -> u64
-  requires len(bm) == NPAGES
-  ensures result <= NPAGES
-  ensures result < NPAGES ==> get(bm, result) == 1
+  ensures result <= len(bm)
+  ensures result < len(bm) ==> get(bm, result) == 1
 {
   let mut i = 0;
-  while i < NPAGES && get(bm, i) != 1
-    invariant i <= NPAGES
+  while i < len(bm) && get(bm, i) != 1
+    invariant i <= len(bm)
   {
     i = i + 1;
   }
@@ -46,7 +45,7 @@ fn find_free(bm: &Buf) -> u64
 }
 
 fn take_page(bm: &mut Buf, pool: &mut Pool, i: u64) -> Frame
-  requires tracks(bm, pool) && i < NPAGES && get(bm, i) == 1
+  requires tracks(bm, pool) && i < len(bm) && get(bm, i) == 1
   ensures tracks(bm, pool)
   ensures frame_id(result) == i
 {
@@ -77,7 +76,7 @@ fn free_l1(bm: &mut Buf, pool: &mut Pool, t: PageTable)
       if pt_shared(t1, i) {
         // A shared page goes back to the pool with its last reference.
         let r = shared_drop(&mut pool, pt_take_shared(&mut t1, i));
-        if r < NPAGES {
+        if r < len(bm) {
           bm = set(bm, r, 1);
         }
       } else {
@@ -93,13 +92,13 @@ fn main(pool: &mut Pool) -> u64 {
   let mut bm = bm_new(pool);
   let a = find_free(bm);
   let b = find_free(bm);   // same answer: nothing was taken yet
-  if a >= NPAGES || a != b {
+  if a >= len(bm) || a != b {
     free(bm);
     return 1;
   }
   let mut l1 = pt_new(take_page(&mut bm, &mut pool, a), 1);
   let c = find_free(bm);
-  if c >= NPAGES {
+  if c >= len(bm) {
     free_l1(&mut bm, &mut pool, l1);
     free(bm);
     return 2;
