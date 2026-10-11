@@ -703,6 +703,22 @@ fn main() -> u64 {
 - Specifications see through boxes the same way: `ensures result.n == 0` for a `Box[Stack]` result.
 - The prover unfolds a box that arrives from outside (a parameter, a function's result) two levels deep. Deeper contents are unknown until code looks inside them, and then nothing is known about them: a proof that needs a fact deeper down fails (it is never assumed). That is why `sum` above clamps what it gets back instead of proving a bound for the whole tree. Values a function builds itself are tracked to any depth.
 - `box` uses the same allocator as `alloc`. Running out of memory aborts, as for `alloc`.
+- `try_box[T](e)` is the box that reports running out of memory instead. It needs `import "core/boxed.bastio"`, which defines what it returns: `enum Boxed[T] { Ok(Box[T]), Full(T) }`. `Boxed::Ok` holds the new box, and `Boxed::Full` gives `e` back when there was no memory for it, so the value is never lost. The prover does not know which one comes back, so the program must handle both:
+
+```bastio
+// expect-exit: 5
+// A program imports this from core/boxed.bastio; written out here, it is
+// the same enum.
+enum Boxed[T] { Ok(Box[T]), Full(T) }
+
+fn main() -> u64 {
+  let r = try_box[u64](5);
+  match r {
+    Boxed::Ok(b) => { return unbox(b); },
+    Boxed::Full(x) => { return x; },
+  }
+}
+```
 - In generated code a `Box[T]` is a `T *`.
 
 ## Generics
@@ -962,6 +978,7 @@ Hardware is reached only through capability types. There is no way to read or wr
 | `Frame` | One physical page (4 KiB), owned by exactly one place at a time |
 | `PageTable` | A page-table page at level 1 to 5. It owns the tables and pages its slots point to |
 | `Shared` | One reference to a page that several page tables may map at once (`MAP_SHARED` memory): the page stays allocated while any reference is held, and the last `shared_drop` gives it back to the pool |
+| `Dirty` | A page taken out of the pool without being zeroed: it may still hold what its last owner wrote, so nothing can read it, map it or give it back until it is overwritten whole and becomes a `Frame` |
 | `Mmu` | The right to load CR3 (kernel only) |
 | `Cpu` | The CPU's saved user context and the right to enter user mode (kernel only) |
 | `Lease` | This processor's hold on the top-level table it loaded with `mmu_enter`: while any is outstanding, other processors may be running on the tree, so nothing is taken out of it (kernel only; pinned to its processor) |
@@ -1003,6 +1020,12 @@ Ghost accessors, usable in specifications:
 | --- | --- | --- |
 | `pool_take(p: &mut Pool, i: u64) -> Frame` | `i < pool_size(p)` and `pool_has(p, i)` | Takes page `i` out of the pool, zeroed |
 | `pool_give(p: &mut Pool, f: Frame)` | | Gives a page back |
+| `pool_take_dirty(p: &mut Pool, i: u64) -> Dirty` | as `pool_take` | Takes page `i` out of the pool without zeroing it (`dirty_id` is `i`). Cheap where pages are handed out under a lock: the page is overwritten later, outside it |
+| `dirty_id(d: &Dirty) -> u64` | | The page number |
+| `dirty_zero(d: Dirty) -> Frame` | | Zeroes the page; it is now a frame, the same page |
+| `frame_copy(d: Dirty, src: &Frame) -> Frame` | | Copies all of `src` over the page; it is now a frame, the same page. Contents are not tracked |
+| `dirty_fill(d: Dirty, src: &Bytes, s: u64) -> Frame` | `s + 4096 <= blen(src)` | Copies bytes `s .. s+4096` of `src` over the page; it is now a frame, the same page. Contents are not tracked |
+| `shared_copy(d: Dirty, s: &Shared) -> Frame` | | The same from a shared page: a private copy of it |
 | `frame_id(f: &Frame) -> u64` | | The page number |
 | `frame_read(f: &Frame, w: u64) -> u64`, `frame_write(f: &mut Frame, w: u64, v: u64)` | `w < 512` | A 64-bit word of the page. Contents are not tracked by the proof |
 | `frame_read8(f: &Frame, o: u64) -> u8`, `frame_write8(f: &mut Frame, o: u64, b: u8)` | `o < 4096` | A byte of the page |
@@ -1499,7 +1522,7 @@ The C function is a thin wrapper that converts each pointer and length into the 
 What a program that `bastioc0` accepts is guaranteed: no out-of-bounds access, no use after free, no double free, no leak, no integer overflow or underflow, no division by zero, and, in kernel code, no page owned twice, no malformed page table and no freeing of the active one. Plus every `requires`, `ensures`, `invariant` and `assert` the programmer wrote. What is not guaranteed:
 
 - **Termination.** Infinite loops and infinite recursion are not detected. This is independent of memory safety and a non-goal for now.
-- **Running out of memory.** `alloc`, `box` and `vec_push` abort when memory runs out. Allocation failure is planned to be returned in the type instead.
+- **Running out of memory.** `alloc`, `balloc`, `box` and `vec_push` abort when memory runs out. Each has a form that returns the failure instead, for code that must not stop: `try_alloc`, `try_balloc`, `try_box` and `vec_try_reserve` with `vec_push_within`.
 - **Stack depth.** Deep recursion can overflow the stack.
 - **Page contents.** The proof tracks who owns each page, not what is in it.
 - **The trusted base.** Z3, the stage0 compiler (Rust) and the C compiler are trusted, as is the hand-written C prelude each target links in (in `stage0/src/codegen.rs`), and the platform's boot and trap entry code. `bastioc0 --trusted-base` lists every prelude part with its size, the parts each target links, and every builtin; the listing is checked into `tests/trusted_base.txt` and `tests/run.sh` fails when it changes, so growth is reviewed (ROADMAP invariant 3). The small per-type helpers the compiler generates for `Box` and `Vec` are part of the compiler, not of this listing. [trusted-base.md](trusted-base.md) goes through every part and why it is there.

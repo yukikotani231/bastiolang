@@ -9,6 +9,7 @@
   - [base64](examples-base64.md)
   - [UTF-8](examples-utf8.md)
   - [DER](examples-der.md)
+  - [QOI](examples-qoi.md)
 
 # Reference
 

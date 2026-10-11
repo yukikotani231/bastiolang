@@ -253,6 +253,15 @@ fn cg_prelude_pages(out: &mut Vec[u64]) {
   cg_s(&mut out, "}\n");
   cg_s(&mut out, "#define bst_pt_take_shared bst_pt_take\n");
   cg_s(&mut out, "static inline bst_frame bst_pt_dup_shared(bst_pt t, uint64_t i) { return bst_shared_dup(((uint64_t *)t)[i] & BST_PTE_ADDR); }\n");
+  cg_s(&mut out, "/* Dirty pages: taken without zeroing, so whoever takes them (under a lock,\n");
+  cg_s(&mut out, " * say) does not pay for it; they become frames only by being overwritten\n");
+  cg_s(&mut out, " * whole, which can happen later and elsewhere. */\n");
+  cg_s(&mut out, "static inline bst_frame bst_pool_take_dirty(bst_pool *p, uint64_t i) { return p->base + i * 4096; }\n");
+  cg_s(&mut out, "static inline uint64_t bst_dirty_id(bst_frame d) { return bst_frame_id(d); }\n");
+  cg_s(&mut out, "static inline bst_frame bst_dirty_zero(bst_frame d) { bst_zero_page(d); return d; }\n");
+  cg_s(&mut out, "static inline bst_frame bst_frame_copy(bst_frame d, bst_frame src) { bst_copy_fwd((unsigned char *)d, (const unsigned char *)src, 4096); return d; }\n");
+  cg_s(&mut out, "#define bst_shared_copy bst_frame_copy\n");
+  cg_s(&mut out, "static inline bst_frame bst_dirty_fill(bst_frame d, bst_bytes src, uint64_t s) { bst_copy_fwd((unsigned char *)d, src.data + s, 4096); return d; }\n");
 }
 
 fn cg_prelude_kernel(out: &mut Vec[u64]) {
@@ -536,6 +545,8 @@ fn cg_prelude_bytes(out: &mut Vec[u64]) {
   cg_s(&mut out, "\n");
   cg_s(&mut out, "/* Box[T]: one allocation from the same allocator as Buf. */\n");
   cg_s(&mut out, "static void *bst_box_alloc(uint64_t n) { return bst_alloc((n + 7) / 8).data; }\n");
+  cg_s(&mut out, "/* The same, or 0 when out of memory (try_box). */\n");
+  cg_s(&mut out, "static void *bst_box_try_alloc(uint64_t n) { return bst_try_alloc((n + 7) / 8).data; }\n");
   cg_s(&mut out, "static void bst_box_free(void *p, uint64_t n) { bst_buf w = { (n + 7) / 8, (uint64_t *)p }; bst_free(w); }\n");
   cg_s(&mut out, "\n");
   cg_s(&mut out, "/* Vec[T]: elements in one allocation that doubles when full. A size past\n");

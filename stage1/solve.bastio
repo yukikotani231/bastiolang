@@ -185,6 +185,93 @@ fn out_value(out: &mut Vec[u64], resp: &Vec[u64]) {
     return;
   }
   out_rng(&mut out, resp, x);
+  out_readable(&mut out, resp, x);
+}
+
+/// What to do about a failed proof of kind `code`, as a `  = ` note
+/// (stage0's `proof_hint`).
+fn proof_hint(rep: &mut Vec[u64], code: u64) {
+  if code == VC_OVERFLOW {
+    out_str(&mut rep, "  = bound the operands with a `requires` or an `if`, or use `wrap_add`, `wrap_sub` or `wrap_mul` if wrapping around is meant\n");
+  } else if code == VC_UNDERFLOW {
+    out_str(&mut rep, "  = check the operands with an `if` or a `requires` first, or use `wrap_sub` if wrapping around is meant\n");
+  } else if code == VC_BOUNDS {
+    out_str(&mut rep, "  = check the index against the length first, with an `if` or a `requires`, or keep it in range with a loop `invariant`\n");
+  } else if code == VC_DIVZERO {
+    out_str(&mut rep, "  = check that the divisor is not zero first, with an `if` or a `requires`\n");
+  } else if code == VC_REQUIRES {
+    out_str(&mut rep, "  = the caller must make it hold: check it with an `if` before the call, or ask for it in the caller's own `requires`\n");
+  } else if code == VC_ENSURES {
+    out_str(&mut rep, "  = every `return` must make it hold for each input that meets the `requires`\n");
+  } else if code == VC_INVARIANT {
+    out_str(&mut rep, "  = an invariant must hold when the loop starts, and again after any iteration that begins with it and the loop condition true\n");
+  } else if code == VC_ASSERT {
+    out_str(&mut rep, "  = an `assert` must follow from what is known there: the `requires`, the conditions of the enclosing `if`s and loops, and loop invariants\n");
+  }
+}
+
+/// After a value of digits `t[r]` just written: its distance from the
+/// nearest power of two, when it is that close to one (stage0's
+/// `readable`), since such values are where integers overflow.
+fn out_readable(out: &mut Vec[u64], t: &Vec[u64], r: Rng) {
+  if r.s >= r.e || r.e - r.s > 20 {
+    return;
+  }
+  let mut x = 0;
+  let mut k = r.s;
+  while k < r.e {
+    let ch = u_at(t, k);
+    if ch < 48 || ch > 57 || x > 1844674407370955161 {
+      return;
+    }
+    let d = ch - 48;
+    if x * 10 > U64_MAX - d {
+      return;
+    }
+    x = x * 10 + d;
+    k = k + 1;
+  }
+  let mut n = 16;
+  let mut pw = 65536;
+  while n <= 64 {
+    // 2^64 does not fit a u64: compare from the other side.
+    if n == 64 {
+      if x >= U64_MAX - 15 {
+        out_str(&mut out, " (2^64 - ");
+        out_num(&mut out, U64_MAX - x + 1);
+        out_str(&mut out, ")");
+      }
+      return;
+    }
+    if x == pw {
+      out_str(&mut out, " (2^");
+      out_num(&mut out, n);
+      out_str(&mut out, ")");
+      return;
+    }
+    if x < pw && pw - x <= 16 {
+      out_str(&mut out, " (2^");
+      out_num(&mut out, n);
+      out_str(&mut out, " - ");
+      out_num(&mut out, pw - x);
+      out_str(&mut out, ")");
+      return;
+    }
+    if x > pw && x - pw <= 16 {
+      out_str(&mut out, " (2^");
+      out_num(&mut out, n);
+      out_str(&mut out, " + ");
+      out_num(&mut out, x - pw);
+      out_str(&mut out, ")");
+      return;
+    }
+    if pw > U64_MAX / 2 {
+      pw = U64_MAX;
+    } else {
+      pw = pw * 2;
+    }
+    n = n + 1;
+  }
 }
 
 fn trim_rng(t: &Vec[u64], r: Rng) -> Rng {
@@ -272,6 +359,7 @@ fn ghost_acc(k: u64, j: u64) -> Str {
   if k == TY_FRAME && j == 0 { return "frame_id"; }
   if k == TY_DMA && j == 0 { return "dma_id"; }
   if k == TY_SHARED && j == 0 { return "shared_id"; }
+  if k == TY_DIRTY && j == 0 { return "dirty_id"; }
   if k == TY_PT && j == 0 { return "pt_id"; }
   if k == TY_PT && j == 1 { return "pt_level"; }
   if k == TY_PT && j == 3 { return "pt_leases"; }
@@ -387,7 +475,7 @@ fn obl_at(v: &Vr, k: u64) -> Obl {
   if k < vec_len(v.obls) {
     return vec_get(v.obls, k);
   }
-  return Obl { at: 0, code: 0, x: 0, env: 0, n: 0, ms: 0, ml: 0 };
+  return Obl { at: 0, code: 0, x: 0, env: 0, n: 0, ms: 0, ml: 0, ns: 0, nl: 0 };
 }
 
 /// After `solve` fails on a proof: what the failed obligation says, as
@@ -495,6 +583,16 @@ fn solve_range(v: &mut Vr, m: &Mono, p: &Parser, z: &mut Child, rep: &mut Vec[u6
         v.fail_obl = vadd(ob, 1);
         if is_text(resp, r, "sat") {
           report_cex(&mut v, m, p, &mut z, o, &mut rep);
+          if o.nl > 0 {
+            out_str(&mut rep, "  = ");
+            let mut q = 0;
+            while q < o.nl {
+              vec_push(&mut rep, u_at(v.mpool, vadd(o.ns, q)));
+              q = q + 1;
+            }
+            out_str(&mut rep, "\n");
+          }
+          proof_hint(&mut rep, o.code);
         } else {
           out_str(&mut rep, "  = the solver gave up (its work limit, or quantifiers); add an `assert` or a stronger invariant as a hint\n");
         }
@@ -910,4 +1008,35 @@ fn report_cex(v: &mut Vr, m: &Mono, p: &Parser, z: &mut Child, o: Obl, rep: &mut
   vec_free(chars);
   vec_free(out);
   vec_free(resp);
+}
+
+/// Commands recorded before the solvers are run on them (see
+/// `verify_batched`).
+const SOLVE_BATCH: u64 = 200000;
+
+/// `verify_program` and `solve_par` in batches: once a batch of functions
+/// has recorded SOLVE_BATCH commands, they are proved, and everything made
+/// for them is dropped, so the verifier's memory is that of one batch, not
+/// of the whole program. The answer is the same: every function is proved
+/// in its own scope after the same preamble, and the first function that
+/// fails, in program order, is the one reported, since batches are proved
+/// in order and later ones are not started. The dumps keep one log for
+/// the whole program. True if every obligation holds.
+fn verify_batched(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, h: &Host, rep: &mut Vec[u64], jobs: u64) -> bool {
+  verify_begin(&mut v, c, &mut m, p);
+  let mark = vr_mark(v);
+  let n = vec_len(m.fns);
+  let mut ok = true;
+  let mut k = 0;
+  while ok && k < n {
+    verify_nth(&mut v, c, &mut m, p, k);
+    k = k + 1;
+    if k >= n || vec_len(v.log) >= vadd(mark.log, SOLVE_BATCH) {
+      ok = solve_par(&mut v, m, p, h, &mut rep, jobs);
+      if ok {
+        vr_cut(&mut v, mark);
+      }
+    }
+  }
+  return ok;
 }

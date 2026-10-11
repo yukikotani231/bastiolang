@@ -1,0 +1,82 @@
+// expect-exit: 6
+// `try_box[T](x)` gives back `Boxed::Ok` with `x` in a new box, or, when
+// memory runs out, `Boxed::Full` with `x` itself: the value is never lost,
+// and the program decides what to do. Here a stack of linear nodes is
+// built with it, and whatever does not fit is freed.
+import "core/boxed.bastio";
+
+struct Node { val: u64, data: Bytes, next: List }
+enum List { Nil, Cons(Box[Node]) }
+
+/// Pushes `v` on `l`, or hands `l` back unchanged when out of memory.
+fn push(l: List, v: u64) -> List
+  requires v <= 3
+{
+  let n = Node { val: v, data: balloc(1), next: l };
+  let r = try_box[Node](n);
+  match r {
+    Boxed::Ok(b) => { return List::Cons(b); },
+    Boxed::Full(m) => {
+      bfree(m.data);
+      return m.next;
+    },
+  }
+}
+
+/// The sum of the values, freeing the list.
+fn drain(l: List) -> u64 {
+  let mut sum = 0;
+  let mut cur = l;
+  let mut k = 0;
+  while k < 100 && cur is List::Cons
+    invariant sum <= k * 3
+  {
+    match cur {
+      List::Cons(b) => {
+        let n = unbox(b);
+        bfree(n.data);
+        let v = n.val;
+        if v <= 3 {
+          sum = sum + v;
+        }
+        cur = n.next;
+      },
+      List::Nil => { cur = List::Nil; },
+    }
+    k = k + 1;
+  }
+  match cur {
+    List::Cons(b) => {
+      let n = unbox(b);
+      bfree(n.data);
+      free_list(n.next);
+    },
+    List::Nil => {},
+  }
+  return sum;
+}
+
+fn free_list(l: List) {
+  match l {
+    List::Cons(b) => {
+      let n = unbox(b);
+      bfree(n.data);
+      free_list(n.next);
+    },
+    List::Nil => {},
+  }
+}
+
+fn main() -> u64 {
+  let mut l = List::Nil;
+  l = push(l, 1);
+  l = push(l, 2);
+  l = push(l, 3);
+  // A plain value too: an integer boxed or handed back.
+  let r = try_box[u8](7);
+  match r {
+    Boxed::Ok(b) => { let x = unbox(b); assert x == 7; },
+    Boxed::Full(x) => { assert x == 7; },
+  }
+  return drain(l);
+}
