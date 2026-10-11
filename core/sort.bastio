@@ -1,4 +1,5 @@
-// core/sort.bastio: sorting and searching vectors of `u64`.
+// core/sort.bastio: sorting and searching vectors of `u64`, and sorting
+// indices by a key.
 
 /// Elements `0..n` of `v` are in ascending order.
 spec fn sorted_upto(v: &Vec[u64], n: u64) -> bool {
@@ -45,6 +46,176 @@ fn sort_u64(v: &mut Vec[u64])
     }
     i = i + 1;
   }
+}
+
+/// `v` is in descending order.
+spec fn sorted_desc(v: &Vec[u64]) -> bool {
+  forall a: u64 :: forall b: u64 :: a < b && b < vlen(v) ==> vget(v, a) >= vget(v, b)
+}
+
+/// Every element of `v` is at most `x`.
+spec fn all_at_most(v: &Vec[u64], x: u64) -> bool {
+  forall k: u64 :: k < vlen(v) ==> vget(v, k) <= x
+}
+
+/// Sorts `v` in ascending order in O(n log n) time (merge sort, with
+/// insertion sort below 16 elements). Proved sorted and a permutation of
+/// the input, as `sort_u64` is. Uses `n` words of extra memory.
+fn merge_sort_u64(v: &mut Vec[u64])
+  ensures same_elems(v, old(v)) && sorted(v)
+{
+  let n = vec_len(v);
+  if n <= 16 {
+    sort_u64(&mut v);
+    return;
+  }
+  // Deal the elements out into two halves.
+  let mut a = vec_new[u64]();
+  let mut b = vec_new[u64]();
+  while vec_len(v) > 0
+    invariant vlen(v) + vlen(a) + vlen(b) == n
+    invariant forall x: u64 :: vcount(v, x) + vcount(a, x) + vcount(b, x) == vcount(old(v), x)
+  {
+    let x = vec_pop(&mut v);
+    if vec_len(a) <= vec_len(b) {
+      vec_push(&mut a, x);
+    } else {
+      vec_push(&mut b, x);
+    }
+  }
+  merge_sort_u64(&mut a);
+  merge_sort_u64(&mut b);
+  // Merge from the tails: the larger tail goes first, so `out` descends.
+  let mut out = vec_new[u64]();
+  while vec_len(a) > 0 || vec_len(b) > 0
+    invariant vlen(v) == 0 && vlen(out) + vlen(a) + vlen(b) == n
+    invariant forall x: u64 :: vcount(out, x) + vcount(a, x) + vcount(b, x) == vcount(old(v), x)
+    invariant sorted(a) && sorted(b) && sorted_desc(out)
+    invariant vlen(out) > 0 ==> all_at_most(a, vget(out, vlen(out) - 1)) && all_at_most(b, vget(out, vlen(out) - 1))
+  {
+    let la = vec_len(a);
+    let lb = vec_len(b);
+    if lb == 0 || (la > 0 && vec_get(a, la - 1) >= vec_get(b, lb - 1)) {
+      let x = vec_pop(&mut a);
+      vec_push(&mut out, x);
+    } else {
+      let x = vec_pop(&mut b);
+      vec_push(&mut out, x);
+    }
+  }
+  vec_free(a);
+  vec_free(b);
+  // Pour `out` back into `v`, smallest first.
+  while vec_len(out) > 0
+    invariant vlen(v) + vlen(out) == n
+    invariant forall x: u64 :: vcount(v, x) + vcount(out, x) == vcount(old(v), x)
+    invariant sorted(v) && sorted_desc(out)
+    invariant vlen(v) > 0 && vlen(out) > 0 ==> vget(v, vlen(v) - 1) <= vget(out, vlen(out) - 1)
+  {
+    let x = vec_pop(&mut out);
+    vec_push(&mut v, x);
+  }
+  vec_free(out);
+}
+
+/// Every element of `v` is less than `n` (an index into a vector of length `n`).
+spec fn all_indices_below(v: &Vec[u64], n: u64) -> bool {
+  forall k: u64 :: k < vlen(v) ==> vget(v, k) < n
+}
+
+/// Index `x` comes no later than index `y` when sorting by `keys`: a
+/// smaller key first, and on equal keys the smaller index.
+spec fn key_le(keys: &Vec[u64], x: u64, y: u64) -> bool {
+  vget(keys, x) < vget(keys, y) || (vget(keys, x) == vget(keys, y) && x <= y)
+}
+
+/// The elements of `v` are indices into `keys`, in ascending order of key,
+/// and indices with equal keys in ascending order.
+spec fn sorted_by_key(v: &Vec[u64], keys: &Vec[u64]) -> bool {
+  all_indices_below(v, vlen(keys)) &&
+  (forall a: u64 :: forall b: u64 :: a < b && b < vlen(v) ==> key_le(keys, vget(v, a), vget(v, b)))
+}
+
+/// The same, in descending order.
+spec fn sorted_by_key_desc(v: &Vec[u64], keys: &Vec[u64]) -> bool {
+  all_indices_below(v, vlen(keys)) &&
+  (forall a: u64 :: forall b: u64 :: a < b && b < vlen(v) ==> key_le(keys, vget(v, b), vget(v, a)))
+}
+
+/// Every element of `v` comes no later than index `x`.
+spec fn all_keys_at_most(v: &Vec[u64], keys: &Vec[u64], x: u64) -> bool {
+  forall k: u64 :: k < vlen(v) ==> key_le(keys, vget(v, k), x)
+}
+
+/// Sorts `v`, a vector of indices into `keys`, by key: afterwards
+/// `keys[v[0]] <= keys[v[1]] <= ...`, indices with equal keys ascend, and
+/// `v` holds the same indices. Sorting `0..n` this way is a stable sort of
+/// n records by a field. Merge sort, O(n log n).
+fn sort_by_key_u64(v: &mut Vec[u64], keys: &Vec[u64])
+  requires all_indices_below(v, vlen(keys))
+  ensures same_elems(v, old(v)) && sorted_by_key(v, keys)
+{
+  let n = vec_len(v);
+  if n <= 1 {
+    return;
+  }
+  // Deal the elements out into two halves.
+  let mut a = vec_new[u64]();
+  let mut b = vec_new[u64]();
+  while vec_len(v) > 0
+    invariant vlen(v) + vlen(a) + vlen(b) == n
+    invariant forall x: u64 :: vcount(v, x) + vcount(a, x) + vcount(b, x) == vcount(old(v), x)
+    invariant all_indices_below(v, vlen(keys)) && all_indices_below(a, vlen(keys)) && all_indices_below(b, vlen(keys))
+  {
+    let x = vec_pop(&mut v);
+    if vec_len(a) <= vec_len(b) {
+      vec_push(&mut a, x);
+    } else {
+      vec_push(&mut b, x);
+    }
+  }
+  sort_by_key_u64(&mut a, keys);
+  sort_by_key_u64(&mut b, keys);
+  // Merge from the tails: the later of the two tails (larger key, or equal
+  // key and larger index) goes first, so `out` descends.
+  let mut out = vec_new[u64]();
+  while vec_len(a) > 0 || vec_len(b) > 0
+    invariant vlen(v) == 0 && vlen(out) + vlen(a) + vlen(b) == n
+    invariant forall x: u64 :: vcount(out, x) + vcount(a, x) + vcount(b, x) == vcount(old(v), x)
+    invariant sorted_by_key(a, keys) && sorted_by_key(b, keys) && sorted_by_key_desc(out, keys)
+    invariant vlen(out) > 0 ==> all_keys_at_most(a, keys, vget(out, vlen(out) - 1)) && all_keys_at_most(b, keys, vget(out, vlen(out) - 1))
+  {
+    let la = vec_len(a);
+    let lb = vec_len(b);
+    let mut take_a = lb == 0;
+    if la > 0 && lb > 0 {
+      let x = vec_get(a, la - 1);
+      let y = vec_get(b, lb - 1);
+      let kx = vec_get(keys, x);
+      let ky = vec_get(keys, y);
+      take_a = kx > ky || (kx == ky && x >= y);
+    }
+    if take_a {
+      let x = vec_pop(&mut a);
+      vec_push(&mut out, x);
+    } else {
+      let x = vec_pop(&mut b);
+      vec_push(&mut out, x);
+    }
+  }
+  vec_free(a);
+  vec_free(b);
+  // Pour `out` back into `v`, smallest key first.
+  while vec_len(out) > 0
+    invariant vlen(v) + vlen(out) == n
+    invariant forall x: u64 :: vcount(v, x) + vcount(out, x) == vcount(old(v), x)
+    invariant sorted_by_key(v, keys) && sorted_by_key_desc(out, keys)
+    invariant vlen(v) > 0 && vlen(out) > 0 ==> key_le(keys, vget(v, vlen(v) - 1), vget(out, vlen(out) - 1))
+  {
+    let x = vec_pop(&mut out);
+    vec_push(&mut v, x);
+  }
+  vec_free(out);
 }
 
 /// The first index whose element is at least `x` (`vlen(v)` if none is):
@@ -95,4 +266,32 @@ fn vec_contains_u64(v: &Vec[u64], x: u64) -> bool
     i = i + 1;
   }
   return false;
+}
+
+/// Appends every element of `src` to `dst`.
+fn vec_extend_u64(dst: &mut Vec[u64], src: &Vec[u64])
+  ensures vlen(dst) == vlen(old(dst)) + vlen(src)
+  ensures forall k: u64 :: k < vlen(old(dst)) ==> vget(dst, k) == vget(old(dst), k)
+  ensures forall k: u64 :: k < vlen(src) ==> vget(dst, vlen(old(dst)) + k) == vget(src, k)
+{
+  let n0 = vec_len(dst);
+  let mut i = 0;
+  while i < vec_len(src)
+    invariant i <= vlen(src) && vlen(dst) == n0 + i && n0 == vlen(old(dst))
+    invariant forall k: u64 :: k < n0 ==> vget(dst, k) == vget(old(dst), k)
+    invariant forall k: u64 :: k < i ==> vget(dst, n0 + k) == vget(src, k)
+  {
+    vec_push(&mut dst, vec_get(src, i));
+    i = i + 1;
+  }
+}
+
+/// A copy of `v`.
+fn vec_clone_u64(v: &Vec[u64]) -> Vec[u64]
+  ensures vlen(result) == vlen(v)
+  ensures forall k: u64 :: k < vlen(v) ==> vget(result, k) == vget(v, k)
+{
+  let mut out = vec_new[u64]();
+  vec_extend_u64(&mut out, v);
+  return out;
 }

@@ -1,0 +1,211 @@
+// core/wtext.bastio: text kept as a `Vec[u64]`, one character a word.
+//
+// Programs that mix characters with other words in one vector (a
+// compiler's source and output buffers, say) keep text this way rather
+// than as the `Vec[u8]` of core/text.bastio. Every function here is total:
+// a span or position out of range is simply not a match, so callers need
+// no bounds facts of their own.
+//
+// What is proved: appends keep what was there and add exactly the
+// characters written (`wtext_push_str`), or only decimal or hexadecimal
+// digits (`wtext_push_u64`, `wtext_push_hex`); a comparison returns true
+// exactly when the characters are equal (spec fns `wtext_is_str_at`,
+// `wtext_same_at`).
+
+/// `t` from `at` holds the characters of `s`.
+spec fn wtext_is_str_at(t: &Vec[u64], at: u64, s: Str) -> bool {
+  at <= vlen(t) && slen(s) <= vlen(t) - at
+    && (forall k: u64 :: k < slen(s) ==> vget(t, at + k) == sget(s, k))
+}
+
+/// `t[i..i+n]` and `t[j..j+n]` are in range and equal. (Stated over
+/// positions `p` in the first span: with an offset into each, the proof
+/// needs instances Z3 does not always find; see bytes_span_eq.)
+spec fn wtext_same_at(t: &Vec[u64], i: u64, j: u64, n: u64) -> bool {
+  i <= vlen(t) && n <= vlen(t) - i && j <= vlen(t) && n <= vlen(t) - j
+    && (forall p: u64 :: i <= p && p < i + n ==> vget(t, p) == vget(t, p - i + j))
+}
+
+/// The first `n` words of `t` are those of `u`.
+spec fn wtext_keeps(t: &Vec[u64], u: &Vec[u64], n: u64) -> bool {
+  n <= vlen(t) && n <= vlen(u) && (forall k: u64 :: k < n ==> vget(t, k) == vget(u, k))
+}
+
+/// Words `from..` of `t` are decimal digit characters.
+spec fn wtext_digits_from(t: &Vec[u64], from: u64) -> bool {
+  forall k: u64 :: from <= k && k < vlen(t) ==> 48 <= vget(t, k) && vget(t, k) <= 57
+}
+
+/// Words `from..` of `t` are lower-case hexadecimal digit characters.
+spec fn wtext_hex_from(t: &Vec[u64], from: u64) -> bool {
+  forall k: u64 :: from <= k && k < vlen(t) ==>
+    (48 <= vget(t, k) && vget(t, k) <= 57) || (97 <= vget(t, k) && vget(t, k) <= 102)
+}
+
+/// Appends the characters of `s`.
+fn wtext_push_str(t: &mut Vec[u64], s: Str)
+  ensures vlen(t) == vlen(old(t)) + slen(s)
+  ensures wtext_keeps(t, old(t), vlen(old(t)))
+  ensures wtext_is_str_at(t, vlen(old(t)), s)
+{
+  let n0 = vec_len(t);
+  let mut k = 0;
+  while k < slen(s)
+    invariant k <= slen(s) && vlen(t) == n0 + k && n0 == vlen(old(t))
+    invariant wtext_keeps(t, old(t), n0)
+    invariant forall j: u64 :: j < k ==> vget(t, n0 + j) == sget(s, j)
+  {
+    vec_push(&mut t, cast[u64](sget(s, k)));
+    k = k + 1;
+  }
+}
+
+/// Appends `x` in decimal, with no leading zeros: between 1 and 20 digits.
+fn wtext_push_u64(t: &mut Vec[u64], x: u64)
+  ensures vlen(old(t)) < vlen(t) && vlen(t) <= vlen(old(t)) + 20
+  ensures wtext_keeps(t, old(t), vlen(old(t)))
+  ensures wtext_digits_from(t, vlen(old(t)))
+{
+  // The number of digits and the place value of the first, then one
+  // digit per step: every step pushes, so the vector's length never
+  // depends on a branch.
+  let mut n = 1;
+  let mut p: u64 = 1;
+  while n < 20 && x / p >= 10
+    invariant 1 <= n && n <= 20 && p >= 1
+  {
+    if p <= 1844674407370955161 {
+      p = p * 10;
+    }
+    n = n + 1;
+  }
+  let n0 = vec_len(t);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && n <= 20 && p >= 1 && vlen(t) == n0 + i && n0 == vlen(old(t))
+    invariant wtext_keeps(t, old(t), n0) && wtext_digits_from(t, n0)
+  {
+    vec_push(&mut t, x / p % 10 + 48);
+    p = p / 10;
+    if p == 0 {
+      p = 1;
+    }
+    i = i + 1;
+  }
+}
+
+/// Appends `x` in lower-case hexadecimal, with no `0x`, padded with zeros
+/// to at least `min` digits (the value itself takes 1 to 16).
+fn wtext_push_hex(t: &mut Vec[u64], x: u64, min: u64)
+  ensures vlen(old(t)) < vlen(t)
+  ensures wtext_keeps(t, old(t), vlen(old(t)))
+  ensures wtext_hex_from(t, vlen(old(t)))
+{
+  // As wtext_push_u64, in base 16: arithmetic rather than shifts and
+  // masks, and a push on every step.
+  let mut n = 1;
+  let mut p: u64 = 1;
+  while n < 16 && x / p >= 16
+    invariant 1 <= n && n <= 16 && p >= 1
+  {
+    if p <= 1152921504606846975 {
+      p = p * 16;
+    }
+    n = n + 1;
+  }
+  let n0 = vec_len(t);
+  let mut w = n;
+  while w < min
+    invariant n <= w && n0 <= vlen(t) && n0 == vlen(old(t))
+    invariant wtext_keeps(t, old(t), n0) && wtext_hex_from(t, n0)
+  {
+    vec_push(&mut t, 48);
+    w = w + 1;
+  }
+  let mut i = 0;
+  while i < n
+    invariant i <= n && n <= 16 && p >= 1 && n0 + i <= vlen(t) && n0 == vlen(old(t))
+    invariant wtext_keeps(t, old(t), n0) && wtext_hex_from(t, n0)
+  {
+    let d = x / p % 16;
+    vec_push(&mut t, 48 + d + d / 10 * 39);   // 0-9, then a-f
+    p = p / 16;
+    if p == 0 {
+      p = 1;
+    }
+    i = i + 1;
+  }
+}
+
+/// Appends `src[from..to]` (the part of it in range).
+fn wtext_push_span(t: &mut Vec[u64], src: &Vec[u64], from: u64, to: u64)
+  ensures wtext_keeps(t, old(t), vlen(old(t)))
+  ensures from <= to && to <= vlen(src) ==> vlen(t) == vlen(old(t)) + (to - from)
+  ensures from <= to && to <= vlen(src) ==> (forall k: u64 :: k < to - from ==> vget(t, vlen(old(t)) + k) == vget(src, from + k))
+{
+  let n0 = vec_len(t);
+  let mut end = to;
+  if end > vec_len(src) {
+    end = vec_len(src);
+  }
+  if from >= end {
+    return;
+  }
+  let mut k = from;
+  while k < end
+    invariant from <= k && k <= end && end <= vlen(src) && (to <= vlen(src) ==> end == to)
+    invariant vlen(t) == n0 + (k - from) && n0 == vlen(old(t)) && wtext_keeps(t, old(t), n0)
+    invariant forall j: u64 :: from <= j && j < k ==> vget(t, n0 + (j - from)) == vget(src, j)
+  {
+    vec_push(&mut t, vec_get(src, k));
+    k = k + 1;
+  }
+}
+
+/// Appends all of `src`.
+fn wtext_push_all(t: &mut Vec[u64], src: &Vec[u64])
+  ensures vlen(t) == vlen(old(t)) + vlen(src)
+  ensures wtext_keeps(t, old(t), vlen(old(t)))
+  ensures forall k: u64 :: k < vlen(src) ==> vget(t, vlen(old(t)) + k) == vget(src, k)
+{
+  wtext_push_span(&mut t, src, 0, vec_len(src));
+}
+
+/// `t` holds the characters of `s` from `at` (false if they would run
+/// past the end).
+fn wtext_has_str_at(t: &Vec[u64], at: u64, s: Str) -> bool
+  ensures result == wtext_is_str_at(t, at, s)
+{
+  if at > vec_len(t) || slen(s) > vec_len(t) - at {
+    return false;
+  }
+  let mut k = 0;
+  while k < slen(s)
+    invariant k <= slen(s) && (forall j: u64 :: j < k ==> vget(t, at + j) == sget(s, j))
+  {
+    if vec_get(t, at + k) != cast[u64](sget(s, k)) {
+      return false;
+    }
+    k = k + 1;
+  }
+  return true;
+}
+
+/// `t[i..i+n]` and `t[j..j+n]` are in range and hold the same words.
+fn wtext_same(t: &Vec[u64], i: u64, j: u64, n: u64) -> bool
+  ensures result == wtext_same_at(t, i, j, n)
+{
+  if i > vec_len(t) || n > vec_len(t) - i || j > vec_len(t) || n > vec_len(t) - j {
+    return false;
+  }
+  let mut k = 0;
+  while k < n
+    invariant k <= n && (forall p: u64 :: i <= p && p < i + k ==> vget(t, p) == vget(t, p - i + j))
+  {
+    if vec_get(t, i + k) != vec_get(t, j + k) {
+      return false;
+    }
+    k = k + 1;
+  }
+  return true;
+}

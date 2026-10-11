@@ -1,21 +1,26 @@
-// core/bitmap.bastio: allocation maps, one byte per entry.
+// core/bitmap.bastio: allocation maps.
 //
-// An allocation map is a `Bytes` in which byte `i` says whether entry `i`
-// (a disk block, a page, a slot) is in use: 0 is free, anything else is
-// in use. The functions work on a range `lo..hi` of the map, so a map can
-// reserve its first entries (a disk's superblock and tables) and be longer
-// than the part in use. Searches start at a hint and wrap around, so that
-// allocation does not rescan the full prefix every time.
+// An allocation map says for each entry (a disk block, a page, a slot)
+// whether it is in use. Two layouts, with the same operations and the
+// same guarantees:
 //
-// One byte per entry costs eight times the memory of packed bits, but
-// every fact below is proved, including that a failed search means the
-// whole range is in use; packed bits would need bit-level reasoning the
-// prover does not do exactly for `|` (see docs/core.md, Gaps).
+// - A `Bytes` with one byte per entry (`map_*`): 0 is free, anything else
+//   is in use. Handy when the map lives in a buffer that is also written
+//   to disk byte by byte.
+// - `Bits` (`bits_*`): 64 entries packed in each `u64` word, a set bit
+//   meaning in use. An eighth of the memory, and a search skips a word
+//   whose 64 entries are all taken in one comparison.
 //
-// What is proved: every index is in bounds; `map_find_free` returns a
-// free entry in `lo..hi`, or `hi` only when every entry in `lo..hi` is in
-// use; `map_take` marks exactly the entry it returns and changes no other
-// byte; `map_count_free` is at most the size of the range.
+// The functions work on a range `lo..hi`, so a map can reserve its first
+// entries (a disk's superblock and tables) and be longer than the part in
+// use. Searches start at a hint and wrap around, so that allocation does
+// not rescan the full prefix every time.
+//
+// What is proved: every index is in bounds; a search returns a free entry
+// in `lo..hi`, or `hi` only when every entry in `lo..hi` is in use; taking
+// an entry marks exactly that entry and changes no other (for `Bits`,
+// `has_bit` states this bit by bit); the free count is at most the size of
+// the range.
 
 /// Every entry in `lo..hi` of `m` is in use.
 spec fn map_full(m: &Bytes, lo: u64, hi: u64) -> bool {
@@ -123,6 +128,226 @@ fn map_count_free(m: &Bytes, lo: u64, hi: u64) -> u64
     invariant lo <= i && i <= hi && n <= i - lo
   {
     if bget(m, i) == 0 {
+      n = n + 1;
+    }
+    i = i + 1;
+  }
+  return n;
+}
+
+// Packed: 64 entries a word.
+
+/// A packed bitmap of `n` entries, 64 to a word: entry i is bit i % 64 of
+/// word i / 64. A set bit means taken.
+struct Bits { w: Vec[u64], n: u64 }
+
+spec fn bits_ok(b: &Bits) -> bool {
+  b.n <= 64 * vlen(b.w) && b.n <= 1152921504606846976
+}
+
+/// Entry i is set.
+spec fn bits_at(b: &Bits, i: u64) -> bool {
+  has_bit(vget(b.w, i / 64), i % 64)
+}
+
+/// Entries lo..hi are all set.
+spec fn bits_full(b: &Bits, lo: u64, hi: u64) -> bool {
+  forall k: u64 :: lo <= k && k < hi ==> bits_at(b, k)
+}
+
+/// `b` and `o` differ at most in entry `at`.
+spec fn bits_same_but(b: &Bits, o: &Bits, at: u64) -> bool {
+  b.n == o.n && vlen(b.w) == vlen(o.w) && (forall k: u64 :: k < b.n && k != at ==> bits_at(b, k) == bits_at(o, k))
+}
+
+/// Is entry `i` in use?
+fn bits_test(b: &Bits, i: u64) -> bool
+  requires bits_ok(b) && i < b.n
+  ensures result == bits_at(b, i)
+{
+  return (vec_get(b.w, i / 64) >> (i % 64)) & 1 == 1;
+}
+
+/// Marks entry `i` in use.
+fn bits_set(b: &mut Bits, i: u64)
+  requires bits_ok(b) && i < b.n
+  ensures bits_ok(b) && bits_at(b, i) && bits_same_but(b, old(b), i)
+{
+  let x = vec_get(b.w, i / 64);
+  vec_set(&mut b.w, i / 64, x | (1 << (i % 64)));
+}
+
+/// Marks entry `i` free.
+fn bits_clear(b: &mut Bits, i: u64)
+  requires bits_ok(b) && i < b.n
+  ensures bits_ok(b) && !bits_at(b, i) && bits_same_but(b, old(b), i)
+{
+  let x = vec_get(b.w, i / 64);
+  vec_set(&mut b.w, i / 64, x & !(1 << (i % 64)));
+}
+
+/// `n` entries, all clear.
+fn bits_new(n: u64) -> Bits
+  requires n <= 1152921504606846976
+  ensures bits_ok(result) && result.n == n
+  ensures forall k: u64 :: k < n ==> !bits_at(result, k)
+{
+  let words = (n + 63) / 64;
+  let mut w = vec_new[u64]();
+  let mut i = 0;
+  while i < words
+    invariant i <= words && vlen(w) == i
+    invariant forall k: u64 :: k < i ==> vget(w, k) == 0
+  {
+    vec_push(&mut w, 0);
+    i = i + 1;
+  }
+  let z: u64 = 0;
+  assert forall j: u64 :: !has_bit(z, j);
+  return Bits { w: w, n: n };
+}
+
+/// Grows the map to `n` entries, the new ones clear, keeping every old
+/// entry. Returns false, with the map unchanged, when memory runs out: it
+/// never stops the program.
+fn bits_grow(b: &mut Bits, n: u64) -> bool
+  requires bits_ok(b) && b.n <= n && n <= 1152921504606846976
+  ensures bits_ok(b)
+  ensures result ==> b.n == n
+  ensures !result ==> b.n == old(b).n && vlen(b.w) == vlen(old(b).w)
+  ensures forall k: u64 :: k < old(b).n ==> bits_at(b, k) == bits_at(old(b), k)
+  ensures result ==> (forall k: u64 :: old(b).n <= k && k < n ==> !bits_at(b, k))
+{
+  let start = b.n;
+  let had = vec_len(b.w);
+  let words = (n + 63) / 64;
+  if had < words {
+    if !vec_try_reserve(&mut b.w, words - had) {
+      return false;
+    }
+  }
+  let z: u64 = 0;
+  assert forall j: u64 :: !has_bit(z, j);
+  while vec_len(b.w) < words
+    invariant had <= vlen(b.w) && (vlen(b.w) == had || vlen(b.w) <= words)
+    invariant vlen(b.w) < words ==> vcap(b.w) >= words
+    invariant forall k: u64 :: k < had ==> vget(b.w, k) == vget(old(b).w, k)
+    invariant forall k: u64 :: had <= k && k < vlen(b.w) ==> vget(b.w, k) == 0
+  {
+    vec_push_within(&mut b.w, 0);
+  }
+  b.n = n;
+  // Entries from the old end to the end of its last word may hold bits
+  // nothing promised were clear; clear them.
+  let mut stop = n;
+  if had < words {
+    stop = 64 * had;
+  }
+  assert forall k: u64 :: 64 * had <= k && k < n ==> !bits_at(b, k);
+  let mut i = start;
+  while i < stop
+    invariant start <= i && i <= stop && stop <= n && b.n == n && bits_ok(b) && vlen(b.w) >= had
+    invariant vlen(b.w) == had || stop == 64 * had
+    invariant forall k: u64 :: k < start ==> bits_at(b, k) == bits_at(old(b), k)
+    invariant forall k: u64 :: start <= k && k < i ==> !bits_at(b, k)
+    invariant forall k: u64 :: 64 * had <= k && k < n ==> !bits_at(b, k)
+  {
+    bits_clear(&mut b, i);
+    i = i + 1;
+  }
+  return true;
+}
+
+/// Frees the map's storage.
+fn bits_free(b: Bits) {
+  vec_free(b.w);
+}
+
+/// The first clear entry in lo..hi, or hi if all are set.
+fn bits_find_clear_in(b: &Bits, lo: u64, hi: u64) -> u64
+  requires bits_ok(b) && lo <= hi && hi <= b.n
+  ensures result <= hi
+  ensures result < hi ==> lo <= result && !bits_at(b, result)
+  ensures forall k: u64 :: lo <= k && k < result ==> bits_at(b, k)
+{
+  let mut i = lo;
+  while i < hi
+    invariant lo <= i && i <= hi
+    invariant forall k: u64 :: lo <= k && k < i ==> bits_at(b, k)
+  {
+    let x = vec_get(b.w, i / 64);
+    if i % 64 == 0 && i + 64 <= hi && x == 18446744073709551615 {
+      // A whole word taken: skip it.
+      i = i + 64;
+    } else {
+      if (x >> (i % 64)) & 1 == 0 {
+        return i;
+      }
+      i = i + 1;
+    }
+  }
+  return hi;
+}
+
+/// The first clear entry in `lo..hi`, searching from `hint` and wrapping
+/// around to `lo`, as `map_find_free`. Returns `hi` only when every entry
+/// in `lo..hi` is set.
+fn bits_find_clear(b: &Bits, lo: u64, hi: u64, hint: u64) -> u64
+  requires bits_ok(b) && lo <= hi && hi <= b.n
+  ensures result <= hi
+  ensures result < hi ==> lo <= result && !bits_at(b, result)
+  ensures result == hi ==> bits_full(b, lo, hi)
+{
+  let mut start = hint;
+  if start < lo || start >= hi {
+    start = lo;
+  }
+  let i = bits_find_clear_in(b, start, hi);
+  if i < hi {
+    return i;
+  }
+  let j = bits_find_clear_in(b, lo, start);
+  if j < start {
+    return j;
+  }
+  return hi;
+}
+
+/// Finds a clear entry as `bits_find_clear` does and sets it. Returns it,
+/// or `hi` when every entry is set (then `b` is unchanged).
+fn bits_take(b: &mut Bits, lo: u64, hi: u64, hint: u64) -> u64
+  requires bits_ok(b) && lo <= hi && hi <= b.n
+  ensures bits_ok(b) && result <= hi
+  ensures result < hi ==> lo <= result && !bits_at(old(b), result) && bits_at(b, result)
+  ensures bits_same_but(b, old(b), result)
+  ensures result == hi ==> bits_full(b, lo, hi)
+{
+  let i = bits_find_clear(b, lo, hi, hint);
+  if i < hi {
+    bits_set(&mut b, i);
+  }
+  return i;
+}
+
+/// Clears entry `i`.
+fn bits_give(b: &mut Bits, i: u64)
+  requires bits_ok(b) && i < b.n
+  ensures bits_ok(b) && !bits_at(b, i) && bits_same_but(b, old(b), i)
+{
+  bits_clear(&mut b, i);
+}
+
+/// The number of clear entries in `lo..hi`.
+fn bits_count_clear(b: &Bits, lo: u64, hi: u64) -> u64
+  requires bits_ok(b) && lo <= hi && hi <= b.n
+  ensures result <= hi - lo
+{
+  let mut n = 0;
+  let mut i = lo;
+  while i < hi
+    invariant lo <= i && i <= hi && n <= i - lo
+  {
+    if (vec_get(b.w, i / 64) >> (i % 64)) & 1 == 0 {
       n = n + 1;
     }
     i = i + 1;

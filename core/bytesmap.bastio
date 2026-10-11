@@ -1,0 +1,385 @@
+// core/bytesmap.bastio: a hash map from byte strings to values of any type
+// `V` that can be copied, for symbol tables, paths and names.
+//
+// The map owns copies of its keys, packed into one byte arena: slot `i`'s
+// key is `arena[starts[i] .. starts[i] + lens[i]]`. Open addressing with
+// linear probing and tombstones, as `core/hashmap.bastio`; growing the
+// table also compacts the arena. Lookups take a `&Bytes` and never copy it.
+//
+// What is proved: every index is in bounds (each slot's key lies inside the
+// arena), `len` is the number of keys and `used` the number of slots that
+// are not empty, a slot a lookup returns holds exactly the bytes asked for,
+// and after `bmap_insert` the map holds the key with the new value. Not
+// proved, as for `HashMap`: that a lookup finds every key present.
+import "option.bastio";
+import "bytes.bastio";
+
+struct BytesMap[V] {
+  arena: Vec[u8],         // every key's bytes, back to back
+  starts: Vec[u64],       // where slot i's key starts in the arena
+  lens: Vec[u64],         // and its length
+  hashes: Vec[u64],       // bytes_hash of slot i's key
+  vals: Vec[Option[V]],   // None in a slot that has never held a key
+  tags: Vec[u8],          // 0 empty, 1 removed (a tombstone), 2 holds a key
+  len: u64,               // slots holding a key
+  used: u64,              // slots holding a key or a tombstone
+}
+
+/// What every map function needs and keeps: the slot vectors have one
+/// length, the capacity is in range, every tag is 0, 1 or 2, `len` and
+/// `used` count, some slot is still empty, and every slot holding a key
+/// names bytes inside the arena.
+spec fn bmap_ok[V](m: &BytesMap[V]) -> bool {
+  vlen(m.starts) == vlen(m.tags) && vlen(m.lens) == vlen(m.tags)
+    && vlen(m.hashes) == vlen(m.tags) && vlen(m.vals) == vlen(m.tags)
+    && 8 <= vlen(m.tags) && vlen(m.tags) <= 1152921504606846976
+    && vcount(m.tags, 0) + vcount(m.tags, 1) + vcount(m.tags, 2) == vlen(m.tags)
+    && m.len == vcount(m.tags, 2) && m.used + vcount(m.tags, 0) == vlen(m.tags)
+    && m.len <= m.used && m.used < vlen(m.tags)
+    && (forall i: u64 :: i < vlen(m.tags) && vget(m.tags, i) == 2 ==>
+          vget(m.starts, i) <= vlen(m.arena) && vget(m.lens, i) <= vlen(m.arena) - vget(m.starts, i))
+}
+
+/// Slot `i` holds a key with the same bytes as `k`.
+spec fn bmap_key_at[V](m: &BytesMap[V], i: u64, k: &Bytes) -> bool {
+  i < vlen(m.tags) && vget(m.tags, i) == 2 && vget(m.lens, i) == blen(k)
+    && (forall j: u64 :: j < blen(k) ==> vget(m.arena, vget(m.starts, i) + j) == bget(k, j))
+}
+
+/// The map holds key `k` with value `v`.
+spec fn bmap_maps[V](m: &BytesMap[V], k: &Bytes, v: V) -> bool {
+  !(forall i: u64 :: i < vlen(m.tags) ==>
+      !(bmap_key_at[V](m, i, k) && vget(m.vals, i) is Option::Some && vget(m.vals, i).Some == v))
+}
+
+/// The map holds key `k`.
+spec fn bmap_has[V](m: &BytesMap[V], k: &Bytes) -> bool {
+  !(forall i: u64 :: i < vlen(m.tags) ==> !bmap_key_at[V](m, i, k))
+}
+
+/// An empty map with room for `cap` slots (at least 8).
+fn bmap_with_cap[V](cap: u64) -> BytesMap[V]
+  requires 8 <= cap && cap <= 1152921504606846976
+  ensures bmap_ok[V](result) && result.len == 0 && vlen(result.tags) == cap
+{
+  let mut starts = vec_new[u64]();
+  let mut lens = vec_new[u64]();
+  let mut hashes = vec_new[u64]();
+  let mut vals = vec_new[Option[V]]();
+  let mut tags = vec_new[u8]();
+  let mut i = 0;
+  while i < cap
+    invariant i <= cap && vlen(starts) == i && vlen(lens) == i && vlen(hashes) == i
+    invariant vlen(vals) == i && vlen(tags) == i
+    invariant vcount(tags, 0) == i && vcount(tags, 1) == 0 && vcount(tags, 2) == 0
+  {
+    vec_push(&mut starts, 0);
+    vec_push(&mut lens, 0);
+    vec_push(&mut hashes, 0);
+    vec_push(&mut vals, Option[V]::None);
+    vec_push(&mut tags, 0);
+    i = i + 1;
+  }
+  return BytesMap[V] { arena: vec_new[u8](), starts: starts, lens: lens, hashes: hashes, vals: vals, tags: tags, len: 0, used: 0 };
+}
+
+fn bmap_new[V]() -> BytesMap[V]
+  ensures bmap_ok[V](result) && result.len == 0
+{
+  return bmap_with_cap[V](8);
+}
+
+/// The number of keys in the map.
+fn bmap_len[V](m: &BytesMap[V]) -> u64
+  ensures result == m.len
+{
+  return m.len;
+}
+
+/// Whether slot `i`, which holds a key, holds exactly the bytes of `k`.
+fn bmap_slot_is[V](m: &BytesMap[V], i: u64, k: &Bytes) -> bool
+  requires bmap_ok[V](m) && i < vlen(m.tags) && vget(m.tags, i) == 2
+  ensures result == bmap_key_at[V](m, i, k)
+{
+  let n = vec_get(m.lens, i);
+  if n != blen(k) {
+    return false;
+  }
+  let s = vec_get(m.starts, i);
+  let mut j = 0;
+  while j < n
+    invariant j <= n && n == blen(k) && s + n <= vlen(m.arena)
+    invariant forall q: u64 :: q < j ==> vget(m.arena, s + q) == bget(k, q)
+  {
+    if vec_get(m.arena, s + j) != bget(k, j) {
+      return false;
+    }
+    j = j + 1;
+  }
+  return true;
+}
+
+/// The slot holding `k`, or the capacity if `k` is not in the map.
+fn bmap_find[V](m: &BytesMap[V], k: &Bytes) -> u64
+  requires bmap_ok[V](m)
+  ensures result <= vlen(m.tags)
+  ensures result < vlen(m.tags) ==> bmap_key_at[V](m, result, k)
+{
+  let cap = vec_len(m.tags);
+  let h = bytes_hash(k);
+  let start = h % cap;
+  let mut n = 0;
+  while n < cap
+    invariant n <= cap
+  {
+    let i = (start + n) % cap;
+    let t = vec_get(m.tags, i);
+    if t == 0 {
+      return cap;
+    }
+    if t == 2 && vec_get(m.hashes, i) == h && bmap_slot_is[V](m, i, k) {
+      return i;
+    }
+    n = n + 1;
+  }
+  return cap;
+}
+
+/// `k` is in the map.
+fn bmap_contains[V](m: &BytesMap[V], k: &Bytes) -> bool
+  requires bmap_ok[V](m)
+  ensures result ==> bmap_has[V](m, k)
+{
+  return bmap_find[V](m, k) < vec_len(m.tags);
+}
+
+/// The value of `k`.
+fn bmap_get[V](m: &BytesMap[V], k: &Bytes) -> Option[V]
+  requires bmap_ok[V](m)
+  ensures result is Option::Some ==> bmap_maps[V](m, k, result.Some)
+{
+  let i = bmap_find[V](m, k);
+  if i < vec_len(m.tags) {
+    return vec_get(m.vals, i);
+  }
+  return Option[V]::None;
+}
+
+/// The value of `k`, or `d` if `k` is not in the map.
+fn bmap_get_or[V](m: &BytesMap[V], k: &Bytes, d: V) -> V
+  requires bmap_ok[V](m)
+  ensures result == d || bmap_maps[V](m, k, result)
+{
+  match bmap_get[V](m, k) {
+    Option::Some(v) => { return v; },
+    Option::None => { return d; },
+  }
+}
+
+/// Puts a key already in the arena (`s .. s + n`, hash `h`) into the first
+/// empty slot of its probe sequence. The caller has made sure there is
+/// room: `used + 1` stays below three quarters of the table.
+fn bmap_place[V](m: &mut BytesMap[V], h: u64, s: u64, n: u64, v: V) -> u64
+  requires bmap_ok[V](m) && (m.used + 1) * 4 <= vlen(m.tags) * 3
+  requires s <= vlen(m.arena) && n <= vlen(m.arena) - s
+  ensures bmap_ok[V](m) && result < vlen(m.tags) && vget(m.tags, result) == 2
+  ensures vget(m.starts, result) == s && vget(m.lens, result) == n
+  ensures vget(m.vals, result) is Option::Some && vget(m.vals, result).Some == v
+  ensures vlen(m.tags) == vlen(old(m).tags) && vlen(m.arena) == vlen(old(m).arena) && m.len == old(m).len + 1
+  ensures forall q: u64 :: q < vlen(m.arena) ==> vget(m.arena, q) == vget(old(m).arena, q)
+{
+  let cap = vec_len(m.tags);
+  let start = h % cap;
+  let mut k = 0;
+  while k < cap
+    invariant k <= cap && bmap_ok[V](m) && vlen(m.tags) == cap
+    invariant (m.used + 1) * 4 <= cap * 3 && m.len == old(m).len && m.used == old(m).used
+    invariant vlen(m.arena) == vlen(old(m).arena) && (forall q: u64 :: q < vlen(m.arena) ==> vget(m.arena, q) == vget(old(m).arena, q))
+  {
+    let i = (start + k) % cap;
+    if vec_get(m.tags, i) == 0 {
+      vec_set(&mut m.tags, i, 2);
+      vec_set(&mut m.starts, i, s);
+      vec_set(&mut m.lens, i, n);
+      vec_set(&mut m.hashes, i, h);
+      vec_set(&mut m.vals, i, Option[V]::Some(v));
+      m.used = m.used + 1;
+      m.len = m.len + 1;
+      return i;
+    }
+    k = k + 1;
+  }
+  // Not reached: as in `hmap_put_new`, the empty slot the probe sequence
+  // must meet is found again by a plain scan, whose failing is what is
+  // proved impossible.
+  let mut i = 0;
+  while i < cap
+    invariant i <= cap && bmap_ok[V](m) && vlen(m.tags) == cap
+    invariant (m.used + 1) * 4 <= cap * 3 && m.len == old(m).len && m.used == old(m).used
+    invariant vlen(m.arena) == vlen(old(m).arena) && (forall q: u64 :: q < vlen(m.arena) ==> vget(m.arena, q) == vget(old(m).arena, q))
+    invariant forall q: u64 :: q < i ==> vget(m.tags, q) != 0
+  {
+    if vec_get(m.tags, i) == 0 {
+      vec_set(&mut m.tags, i, 2);
+      vec_set(&mut m.starts, i, s);
+      vec_set(&mut m.lens, i, n);
+      vec_set(&mut m.hashes, i, h);
+      vec_set(&mut m.vals, i, Option[V]::Some(v));
+      m.used = m.used + 1;
+      m.len = m.len + 1;
+      return i;
+    }
+    i = i + 1;
+  }
+  unreachable;
+}
+
+/// Rebuilds the table without tombstones and with a compacted arena,
+/// doubling it when at least half of it holds keys.
+fn bmap_grow[V](m: &mut BytesMap[V])
+  requires bmap_ok[V](m)
+  ensures bmap_ok[V](m)
+{
+  let old_cap = vec_len(m.tags);
+  let mut cap = old_cap;
+  if m.len * 2 >= old_cap && old_cap <= 576460752303423488 {
+    cap = old_cap * 2;
+  }
+  let mut fresh = bmap_with_cap[V](cap);
+  let mut i = 0;
+  while i < old_cap
+    invariant i <= old_cap && bmap_ok[V](fresh) && bmap_ok[V](m) && vlen(m.tags) == old_cap
+  {
+    if vec_get(m.tags, i) == 2 {
+      match vec_get(m.vals, i) {
+        Option::Some(v) => {
+          bmap_reserve[V](&mut fresh);
+          let s = vec_get(m.starts, i);
+          let n = vec_get(m.lens, i);
+          let at = bmap_append[V](&mut fresh, m.arena, s, n);
+          bmap_place[V](&mut fresh, vec_get(m.hashes, i), at, n, v);
+        },
+        Option::None => {},
+      }
+    }
+    i = i + 1;
+  }
+  vec_free(m.arena);
+  vec_free(m.starts);
+  vec_free(m.lens);
+  vec_free(m.hashes);
+  vec_free(m.vals);
+  vec_free(m.tags);
+  m.arena = fresh.arena;
+  m.starts = fresh.starts;
+  m.lens = fresh.lens;
+  m.hashes = fresh.hashes;
+  m.vals = fresh.vals;
+  m.tags = fresh.tags;
+  m.len = fresh.len;
+  m.used = fresh.used;
+}
+
+/// Grows the table until one more key fits under three quarters.
+fn bmap_reserve[V](m: &mut BytesMap[V])
+  requires bmap_ok[V](m)
+  ensures bmap_ok[V](m) && (m.used + 1) * 4 <= vlen(m.tags) * 3
+{
+  while (m.used + 1) * 4 > vec_len(m.tags) * 3
+    invariant bmap_ok[V](m)
+  {
+    bmap_grow[V](&mut m);
+  }
+}
+
+/// Appends bytes `s .. s + n` of `src` to the arena; returns where they start.
+fn bmap_append[V](m: &mut BytesMap[V], src: &Vec[u8], s: u64, n: u64) -> u64
+  requires bmap_ok[V](m) && s <= vlen(src) && n <= vlen(src) - s
+  ensures bmap_ok[V](m) && result == vlen(old(m).arena) && vlen(m.arena) == result + n
+  ensures m.used == old(m).used && vlen(m.tags) == vlen(old(m).tags)
+  ensures forall q: u64 :: q < n ==> vget(m.arena, result + q) == vget(src, s + q)
+{
+  let at = vec_len(m.arena);
+  let mut j = 0;
+  while j < n
+    invariant j <= n && vlen(m.arena) == at + j && bmap_ok[V](m)
+    invariant m.used == old(m).used && vlen(m.tags) == vlen(old(m).tags)
+    invariant forall q: u64 :: at <= q && q < at + j ==> vget(m.arena, q) == vget(src, s + (q - at))
+  {
+    vec_push(&mut m.arena, vec_get(src, s + j));
+    j = j + 1;
+  }
+  return at;
+}
+
+/// Sets the value of `k` to `v`, copying `k` into the map if it is new.
+/// Returns the value it replaces, if `k` was already there.
+fn bmap_insert[V](m: &mut BytesMap[V], k: &Bytes, v: V) -> Option[V]
+  requires bmap_ok[V](m)
+  ensures bmap_ok[V](m) && bmap_maps[V](m, k, v)
+{
+  let i = bmap_find[V](m, k);
+  if i < vec_len(m.tags) {
+    let prev = vec_get(m.vals, i);
+    vec_set(&mut m.vals, i, Option[V]::Some(v));
+    return prev;
+  }
+  bmap_reserve[V](&mut m);
+  let s = vec_len(m.arena);
+  let mut j = 0;
+  while j < blen(k)
+    invariant j <= blen(k) && vlen(m.arena) == s + j && bmap_ok[V](m)
+    invariant (m.used + 1) * 4 <= vlen(m.tags) * 3
+    invariant forall q: u64 :: q < j ==> vget(m.arena, s + q) == bget(k, q)
+  {
+    vec_push(&mut m.arena, bget(k, j));
+    j = j + 1;
+  }
+  let at = bmap_place[V](&mut m, bytes_hash(k), s, blen(k), v);
+  assert bmap_key_at[V](m, at, k);
+  return Option[V]::None;
+}
+
+/// Takes `k` out of the map. Returns its value, if it was there. Its bytes
+/// stay in the arena until the table next grows.
+fn bmap_remove[V](m: &mut BytesMap[V], k: &Bytes) -> Option[V]
+  requires bmap_ok[V](m)
+  ensures bmap_ok[V](m)
+{
+  let i = bmap_find[V](m, k);
+  if i < vec_len(m.tags) {
+    vec_set(&mut m.tags, i, 1);
+    m.len = m.len - 1;
+    return vec_get(m.vals, i);
+  }
+  return Option[V]::None;
+}
+
+/// A copy of the key in slot `i`, which holds one: for walking the map in
+/// slot order (`i` from 0 to the capacity, where the tag is 2).
+fn bmap_key[V](m: &BytesMap[V], i: u64) -> Bytes
+  requires bmap_ok[V](m) && i < vlen(m.tags) && vget(m.tags, i) == 2
+  ensures bmap_key_at[V](m, i, result)
+{
+  let s = vec_get(m.starts, i);
+  let n = vec_get(m.lens, i);
+  let mut out = balloc(n);
+  let mut j = 0;
+  while j < n
+    invariant j <= n && blen(out) == n && s + n <= vlen(m.arena)
+    invariant forall q: u64 :: q < j ==> bget(out, q) == vget(m.arena, s + q)
+  {
+    bset(&mut out, j, vec_get(m.arena, s + j));
+    j = j + 1;
+  }
+  return out;
+}
+
+fn bmap_free[V](m: BytesMap[V]) {
+  vec_free(m.arena);
+  vec_free(m.starts);
+  vec_free(m.lens);
+  vec_free(m.hashes);
+  vec_free(m.vals);
+  vec_free(m.tags);
+}

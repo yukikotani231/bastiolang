@@ -1,0 +1,48 @@
+// expect-exit: 0
+// core/slots.bastio: a growable id table. Descriptors take the lowest
+// free slot, the table grows only when every slot is in use, a limit is
+// honoured, and a failed allocation is proved to mean the range is full
+// (or, as SLOTS_NOMEM, that memory ran out; the program never stops).
+import "core/slots.bastio";
+
+fn main() -> u64 {
+  let mut fds = slots_new[u64]();
+  let mut ok = true;
+  // 0, 1, 2 in order, each a fresh slot that now holds its value.
+  let mut k = 0;
+  while k < 3
+    invariant k <= 3
+  {
+    let fd = slots_alloc[u64](&mut fds, 0, 4, 100 + k);
+    if fd != k { ok = false; }
+    k = k + 1;
+  }
+  ok = ok && slots_cap[u64](fds) == 3;
+  // Close 1: the next descriptor reuses it, and slot 2 is untouched.
+  let prev = slots_take[u64](&mut fds, 1);
+  ok = ok && opt_or[u64](prev, 0) == 101;
+  let fd = slots_alloc[u64](&mut fds, 0, 4, 7);
+  if fd < 4 {
+    assert slots_maps[u64](fds, fd, 7);
+  }
+  ok = ok && fd == 1 && opt_or[u64](slots_get[u64](fds, 2), 0) == 102;
+  // Fill to the limit; one more fails, and says why.
+  let last = slots_alloc[u64](&mut fds, 0, 4, 9);
+  let none = slots_alloc[u64](&mut fds, 0, 4, 10);
+  if none == 4 {
+    assert slots_full[u64](fds, 0, 4);
+  } else {
+    ok = false;
+  }
+  ok = ok && last == 3 && slots_count[u64](fds) == 4 && slots_cap[u64](fds) == 4;
+  // Process ids: search from the last one handed out, so a dead id waits.
+  let pid = slots_alloc[u64](&mut fds, 10, 100, 1);
+  ok = ok && pid == 10 && slots_cap[u64](fds) == 11 && !slots_used[u64](fds, 7);
+  if pid == 10 {
+    slots_set[u64](&mut fds, 10, 2);
+    ok = ok && opt_or[u64](slots_get[u64](fds, 10), 0) == 2;
+  }
+  slots_free[u64](fds);
+  if ok { return 0; }
+  return 1;
+}

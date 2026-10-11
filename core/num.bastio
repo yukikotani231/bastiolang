@@ -23,6 +23,26 @@ spec fn all_digits(b: &Bytes, from: u64, to: u64) -> bool {
   forall k: u64 :: from <= k && k < to ==> is_digit_spec(bget(b, k))
 }
 
+/// The smaller of `a` and `b`.
+fn min_u64(a: u64, b: u64) -> u64
+  ensures result <= a && result <= b && (result == a || result == b)
+{
+  if a < b {
+    return a;
+  }
+  return b;
+}
+
+/// The larger of `a` and `b`.
+fn max_u64(a: u64, b: u64) -> u64
+  ensures result >= a && result >= b && (result == a || result == b)
+{
+  if a > b {
+    return a;
+  }
+  return b;
+}
+
 /// An ASCII decimal digit, `0` to `9`.
 fn is_digit(c: u8) -> bool
   ensures result == is_digit_spec(c)
@@ -336,4 +356,43 @@ fn fmt_hex_u64(t: &mut Vec[u8], x: u64, min: u64)
   if !started {
     vec_push(&mut t, 48);              // not reached: i == 15 always pushes
   }
+}
+
+/// Writes `x` in decimal at `at`, as many digits as fit (the leading ones
+/// first). Returns the position after what was written. For a reply built
+/// in a fixed buffer, as a kernel's /proc files are.
+fn bytes_put_u64(dst: &mut Bytes, at: u64, x: u64) -> u64
+  requires at <= blen(dst)
+  ensures blen(dst) == blen(old(dst)) && at <= result && result <= blen(dst)
+  ensures at < blen(dst) ==> at < result
+  ensures forall k: u64 :: at <= k && k < result ==> is_digit_spec(bget(dst, k))
+  ensures forall k: u64 :: k < blen(dst) && (k < at || k >= result) ==> bget(dst, k) == bget(old(dst), k)
+{
+  let n = dec_digits(x);
+  let mut p: u64 = 1;
+  let mut i = 1;
+  while i < n
+    invariant 1 <= i && i <= n && n <= 20 && p >= 1
+  {
+    if p <= 1844674407370955161 {
+      p = p * 10;
+    }
+    i = i + 1;
+  }
+  let mut a = at;
+  let mut j = 0;
+  while j < n && a < blen(dst)
+    invariant j <= n && a == at + j && a <= blen(dst) && blen(dst) == blen(old(dst)) && p >= 1
+    invariant forall k: u64 :: at <= k && k < a ==> is_digit_spec(bget(dst, k))
+    invariant forall k: u64 :: k < blen(dst) && (k < at || k >= a) ==> bget(dst, k) == bget(old(dst), k)
+  {
+    bset(&mut dst, a, cast[u8](x / p % 10) + 48);
+    p = p / 10;
+    if p == 0 {
+      p = 1;
+    }
+    a = a + 1;
+    j = j + 1;
+  }
+  return a;
 }

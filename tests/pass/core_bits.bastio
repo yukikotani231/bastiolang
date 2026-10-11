@@ -1,0 +1,33 @@
+// expect-exit: 0
+// core/bitmap.bastio's packed maps: 64 entries a word. Taking entries is
+// proved to give a different free entry each time and to touch no other
+// bit, and a failed take is proved to mean the range is full.
+import "core/bitmap.bastio";
+
+fn main() -> u64 {
+  let mut b = bits_new(1000);
+  assert !bits_at(b, 999);
+  let mut ok = bits_count_clear(b, 0, 1000) <= 1000;
+  // Take everything in 100..300; each take is a different entry.
+  let mut k = 0;
+  while k < 200
+    invariant bits_ok(b) && b.n == 1000 && k <= 200
+  {
+    let t = bits_take(&mut b, 100, 300, 250);
+    if t >= 300 { ok = false; }
+    k = k + 1;
+  }
+  // Now the range is full: the next take fails, and says why.
+  let f = bits_take(&mut b, 100, 300, 0);
+  if f == 300 {
+    assert bits_full(b, 100, 300);
+  } else {
+    ok = false;
+  }
+  ok = ok && bits_count_clear(b, 100, 300) == 0 && bits_count_clear(b, 0, 100) == 100;
+  bits_give(&mut b, 163);
+  ok = ok && bits_find_clear(b, 100, 300, 200) == 163 && !bits_test(b, 163) && bits_test(b, 164);
+  bits_free(b);
+  if ok { return 0; }
+  return 1;
+}

@@ -1,0 +1,39 @@
+// expect-exit: 0
+// Small helpers BastiOS and bastioc1 each wrote by hand: min and max,
+// span-against-span comparison, span copies, writes into a fixed buffer
+// that drop what does not fit, and vector extend and clone.
+import "core/num.bastio";
+import "core/sort.bastio";
+
+fn main() -> u64 {
+  let mut ok = min_u64(3, 9) == 3 && max_u64(3, 9) == 9 && min_u64(5, 5) == 5;
+  // A /proc-style reply in a fixed 16-byte buffer.
+  let mut o = balloc(16);
+  let mut a = bytes_put_str(&mut o, 0, "pid:");
+  a = bytes_put_byte(&mut o, a, 9);
+  a = bytes_put_u64(&mut o, a, 4096);
+  assert a <= 16;
+  ok = ok && a == 9 && bytes_span_eq(o, 5, o, 5, 4) && bget(o, 4) == 9;
+  a = bytes_put_str(&mut o, a, " truncated here");
+  ok = ok && a == 16;
+  let full = bytes_put_u64(&mut o, 16, 7);
+  ok = ok && full == 16;
+  // Copy "4096" to the front and compare spans.
+  let src = bytes_slice(o, 0, 16);
+  bytes_copy_span(&mut o, 0, src, 5, 9);
+  ok = ok && bytes_span_eq(o, 0, src, 5, 4) && !bytes_span_eq(o, 0, src, 0, 4);
+  // Vectors.
+  let mut v = vec_new[u64]();
+  vec_push(&mut v, 1);
+  vec_push(&mut v, 2);
+  let mut w = vec_clone_u64(v);
+  vec_extend_u64(&mut w, v);
+  assert vlen(w) == 4 && vget(w, 3) == 2;
+  ok = ok && vec_len(w) == 4 && vec_get(w, 2) == 1;
+  vec_free(w);
+  vec_free(v);
+  bfree(src);
+  bfree(o);
+  if ok { return 0; }
+  return 1;
+}

@@ -18,9 +18,9 @@ import "core/num.bastio";
 
 An import that does not start with `.` or `/` is looked for next to the importing file, then in each directory above it, then in each `--lib DIR` given to the compiler and each directory of `BASTIO_LIB` (see [Programs and files](language.md#programs-and-files)). Inside this repository the walk up finds `core/`; a program elsewhere, such as BastiOS, passes `--lib path/to/bastiolang`.
 
-All files share one namespace (see [Programs and files](language.md#programs-and-files)), so every function is prefixed by its module (`bytes_`, `text_`, `hmap_`, ...) except the few whose names say what they are (`parse_u64`, `fmt_u64`, `print_str`, `sort_u64`). Two names are taken without a prefix: the types `Option[T]` and `Span`. A program that imports core must not define its own.
+All files share one namespace (see [Programs and files](language.md#programs-and-files)), so every function is prefixed by its module (`bytes_`, `text_`, `hmap_`, `bmap_`, ...) except the few whose names say what they are (`parse_u64`, `fmt_u64`, `print_str`, `sort_u64`). Two names are taken without a prefix: the types `Option[T]` and `Span`. A program that imports core must not define its own.
 
-The tests are the worked examples: `tests/pass/core_*.bastio` and `tests/pass/std_host.bastio` use every function, and `tests/user/core_user.bastio` builds core for a BastiOS user program.
+For a whole program, see [`examples/wordfreq.bastio`](../examples/wordfreq.bastio): it splits a text, counts words in a `BytesMap`, sorts them by count and prints the top five, and every library proof it leans on is named in its comments. The tests are the worked examples of each function: `tests/pass/core_*.bastio` and `tests/pass/std_host.bastio` use every function, and `tests/user/core_user.bastio` builds core for a BastiOS user program.
 
 ## Conventions
 
@@ -57,6 +57,9 @@ The tests are the worked examples: `tests/pass/core_*.bastio` and `tests/pass/st
 | `bytes_slice(b, from, to) -> Bytes` | A copy of exactly those bytes |
 | `bytes_concat(a, b) -> Bytes` | `a` then `b`. Needs `blen(a) + blen(b) <= 2^60`: every `Bytes` is known to be at most 2^60 long, but two of them together are not, since nothing bounds the memory of all live values at once. For strings of unknown length, build a text instead |
 | `bytes_copy_into(dst, at, src)` | `src` lands at `at`, and the rest of `dst` is untouched |
+| `bytes_copy_span(dst, at, src, from, to)` | `src[from..to]` lands at `at` in one `bcopy`, and the rest of `dst` is untouched |
+| `bytes_span_eq(a, i, b, j, n)` | Exactly whether `a[i..i+n]` and `b[j..j+n]` are equal, stated over the positions `p` of the first span (`bget(a, p) == bget(b, p - i + j)`); `a` and `b` may be the same string |
+| `bytes_put_byte(dst, at, c)`, `bytes_put_str(dst, at, s)` | Write into a fixed buffer as much as fits and return the position after it, so writes chain and the overflow is dropped; nothing outside what was written changes |
 | `bytes_trim(b, s: Span) -> Span` | Only white space was cut, and the result does not start or end with white space |
 | `bytes_split(b, sep: u8) -> Vec[Span]` | At least one piece, every piece a span of `b` |
 | `bytes_hash(b) -> u64` | (FNV-1a; nothing to prove beyond safety) |
@@ -79,9 +82,23 @@ The tests are the worked examples: `tests/pass/core_*.bastio` and `tests/pass/st
 | `fmt_i64(t, x)` | A `-` when negative, then the digits; 1 to 21 bytes |
 | `fmt_u64_pad(t, x, width)` | Left-padded with spaces |
 | `fmt_hex_u64(t, x, min)` | Lowercase hex, at least `min` and at most 16 digits |
+| `bytes_put_u64(dst, at, x)` | Writes `x` in decimal into a fixed buffer, as many leading digits as fit (at least one when there is room), and returns the position after them; every byte written is a digit and nothing else changes |
+| `min_u64(a, b)`, `max_u64(a, b)` | The smaller or larger of the two |
 | `dec_digits(x)`, `is_digit(c)`, `hex_value(c)`, `hex_char(d)` | Helpers |
 
 Narrower integers format through `fmt_u64(t, cast[u64](x))`: widening needs no proof. The tests check that formatting and parsing are inverse on every power of two and its predecessor and on the extremes of `i64`. Parsing is proved to return the digits' value; that `fmt_u64` writes the digits of `x` is tested, not proved (it writes into a `Vec[u8]`, and `bdec` reads `Bytes`).
+
+### `core/wtext.bastio`
+
+Text kept one character a word, in a `Vec[u64]`, as a compiler keeps source and output it mixes with other words (bastioc1 does). Every function is total: a position or span out of range is no match, so a caller needs no bounds facts.
+
+| Function | Proved |
+| --- | --- |
+| `wtext_push_str(t, s)` | Appends exactly the characters of `s` (spec fn `wtext_is_str_at`) and keeps what was there (`wtext_keeps`) |
+| `wtext_push_u64(t, x)`, `wtext_push_hex(t, x, min)` | Append 1 to 20 decimal digits, or lower-case hex digits padded to `min`, keeping what was there |
+| `wtext_push_span(t, src, from, to)`, `wtext_push_all(t, src)` | Append `src[from..to]` (when in range) or all of `src`, word for word |
+| `wtext_has_str_at(t, at, s)` | Exactly whether `t` holds `s` from `at` |
+| `wtext_same(t, i, j, n)` | Exactly whether `t[i..i+n]` and `t[j..j+n]` are in range and equal |
 
 ### `core/print.bastio`
 
@@ -110,16 +127,40 @@ Proved, for every `V`: every index is in bounds and no counter overflows; `len` 
 
 **Linear values.** A `HashMap[Buf]` is rejected: `hmap_get` copies the value out. To map keys to buffers or other linear values, keep the values in a `Vec[T]` and map each key to its index (`tests/pass/core_hashmap.bastio` does this).
 
+### `core/bytesmap.bastio`
+
+A hash map from byte strings to values of a type `V` that can be copied, for symbol tables, paths and names. The map owns copies of its keys, packed into one byte arena (slot `i`'s key is `arena[starts[i] .. starts[i] + lens[i]]`), so a key costs no allocation of its own and lookups take a `&Bytes` without copying it. The table is managed as in `core/hashmap.bastio`. Growing it also compacts the arena, which drops the bytes of removed keys.
+
+```text
+let mut m = bmap_new[u64]();
+bmap_insert[u64](&mut m, name, 7);             // copies `name` into the map
+match bmap_get[u64](m, name) { Option::Some(v) => { ... }, Option::None => {} }
+bmap_free[u64](m);
+```
+
+`bmap_new`, `bmap_with_cap`, `bmap_len`, `bmap_insert` (returns the replaced value), `bmap_get`, `bmap_get_or`, `bmap_contains`, `bmap_remove`, `bmap_key` (a copy of the key in a slot that holds one, for walking the map), `bmap_free`.
+
+Proved, for every `V`:
+- Every index is in bounds; in particular every slot that holds a key names bytes inside the arena (part of `bmap_ok`), so comparing and copying keys needs no checks.
+- `len` and `used` count, as for `HashMap`.
+- A slot a lookup returns holds exactly the bytes asked for (spec fn `bmap_key_at`).
+- After `bmap_insert(m, k, v)` the map holds `k` with `v` (spec fn `bmap_maps`).
+
+Not proved: that a lookup finds every key present.
+
 ### `core/sort.bastio`
 
 | Function | Proved |
 | --- | --- |
 | `sort_u64(v)` | Insertion sort. Afterwards the vector is sorted (spec fn `sorted`) and a permutation of what it was (spec fn `same_elems`: same length, and each value as many times) |
+| `merge_sort_u64(v)` | The same guarantee as `sort_u64`, in O(n log n) time: merge sort, with insertion sort below 16 elements. Uses n words of extra memory |
+| `sort_by_key_u64(v, keys)` | Needs every element of `v` to be an index into `keys` (spec fn `all_indices_below`). Afterwards `v` is a permutation of what it was and ascends by key, indices with equal keys ascending too (spec fns `sorted_by_key` and `key_le`), so the indices it returns read `keys` with no further check. Sorting `0..n` this way is a stable sort of n records by a field. Merge sort |
 | `lower_bound_u64(v, x)` | Needs `sorted(v)`. The first index whose element is `>= x`: everything before it is smaller, everything from it on is not |
 | `sorted_contains_u64(v, x)` | Needs `sorted(v)`. Exactly whether `x` occurs |
 | `vec_contains_u64(v, x)` | A linear scan; exactly whether `x` occurs |
+| `vec_extend_u64(dst, src)`, `vec_clone_u64(v)` | Append every element of `src`, or copy `v`, element for element |
 
-Insertion sort is quadratic in the worst case. It was chosen because its proof is short; a heap sort or merge sort with the same guarantee is future work.
+Insertion sort is quadratic in the worst case; on 50,000 random words it takes 4.8 s where `merge_sort_u64` takes 0.02 s. The merge sort deals the vector out into two, sorts each, and merges them by popping the larger tail, so every step of its proof is about the ends of vectors and the counts in them (`vcount`); no lemma about index arithmetic is needed. To sort records by a field, put the field in `keys` and sort the indices 0..n.
 
 ### `core/ring.bastio`
 
@@ -148,6 +189,49 @@ An allocation map is a `Bytes` with one byte per entry (a disk block, a page, a 
 | `map_fill(m, lo, hi, v)` | Sets `lo..hi` to `v` and leaves the rest |
 | `map_is_free(m, i)`, `map_count_free(m, lo, hi)` | Exactly whether byte `i` is 0; a count of at most `hi - lo` |
 
+`Bits` packs 64 entries in each `u64` word (`bits_new(n)`, all free; a set bit is in use), an eighth of the memory, with the same operations and guarantees, stated per bit with `has_bit` (spec fn `bits_at(b, i)`):
+
+| Function | Proved |
+| --- | --- |
+| `bits_find_clear(b, lo, hi, hint)` | As `map_find_free`: a free entry in `lo..hi`, or `hi` only when all of `lo..hi` is in use (spec fn `bits_full`). A word whose 64 entries are all in use is skipped with one comparison |
+| `bits_take(b, lo, hi, hint)` | The same, and sets the entry it returns; no other bit of any word changes (spec fn `bits_same_but`) |
+| `bits_set(b, i)`, `bits_clear(b, i)`, `bits_give(b, i)` | Set or clear entry `i` and nothing else |
+| `bits_test(b, i)`, `bits_count_clear(b, lo, hi)` | Exactly whether entry `i` is in use; a count of at most `hi - lo` |
+| `bits_grow(b, n)` | Grows the map to `n` entries, keeping every old one; the new ones are clear. Returns false, with the map unchanged, when memory runs out |
+| `bits_free(b)` | |
+
+### `core/slots.bastio`
+
+A growable table of numbered slots, for ids a program hands out and takes back: process ids, file descriptors, pipe and socket numbers. A `Slots[V]` is a `Vec[Option[V]]`; slot `i` is in use when it holds `Some`, and ids at or past the end are free. `V` must be a type that can be copied, as for `HashMap`; to number linear values, keep them in a `Vec[T]` and store the index.
+
+```text
+let mut fds = slots_new[u64]();
+let fd = slots_alloc[u64](&mut fds, 0, nofile, row);   // the lowest free descriptor below the limit
+if fd == nofile { /* EMFILE */ } else if fd == SLOTS_NOMEM { /* ENOMEM */ }
+let pid = slots_alloc[u64](&mut procs, last + 1, max, p); // search past the last id, so a dead one waits
+match slots_take[u64](&mut fds, fd) { Option::Some(row) => { ... }, Option::None => { /* EBADF */ } }
+slots_free[u64](fds);
+```
+
+| Function | Proved |
+| --- | --- |
+| `slots_alloc(s, from, limit, v)` | Puts `v` in the lowest free slot of `from..limit` and returns it, adding slots when it is past the end; every slot from `from` up to it was in use. Returns `limit` only when all of `from..limit` is in use (spec fn `slots_full`), and `SLOTS_NOMEM` when the table had to grow and memory ran out; either way it changes nothing and never stops the program. No other slot changes (spec fn `slots_same_but`) |
+| `slots_find_free(s, from, limit)` | The same search, without taking the slot |
+| `slots_take(s, i)` | Frees slot `i` and returns what it held (`None` if free or past the end); nothing else changes |
+| `slots_set(s, i, v)` | Replaces the value of a slot in use (a free one is rejected, `E-VERIFY-REQUIRES`) |
+| `slots_get(s, i)`, `slots_used(s, i)` | Exactly what slot `i` holds, for any `i` (spec fns `slots_maps`, `slots_has`) |
+| `slots_cap(s)`, `slots_count(s)`, `slots_new()`, `slots_free(s)` | The number of slots; a count of those in use, at most the capacity |
+
+The table never shrinks: a closed descriptor's slot stays, free, for the next one.
+
+### `core/rows.bastio`
+
+A table kept as one `Buf` with a row of `stride` words per entry, indexed as `get(t, id * stride + field)`, is what a kernel's process table and descriptor rows look like. `rows_grow(t, stride, k)` makes it `k` rows longer without touching the code that indexes it.
+
+| Function | Proved |
+| --- | --- |
+| `rows_grow(t, stride, k)` | The length grows by `k * stride`; every old word is unchanged; every new word is 0 (so 0 should be the "free" value of the field that says a row is in use). Returns false, with `t` unchanged, when memory runs out, so a kernel can answer ENOMEM instead of stopping |
+
 ### `core/csum.bastio`
 
 | Function | Proved |
@@ -166,11 +250,15 @@ That the sums are the checksums the standards define is checked by the tests on 
 
 ## Gaps
 
+- **Proofs in a program that counts.** When a struct invariant uses `vcount` (BastiOS's kernel invariant does, through a `HashMap`), every function in the program gets the counting lemmas, and with them Z3 no longer instantiates some quantifiers by itself. Every core function is verified in that setting too (`tests/pass/core_all_counting.bastio`); a contract that relates two strings at two offsets is stated over the positions of one of them, and `rows_grow` fills new rows with zeros instead of copying a template row (the nested quantifier did not prove there).
+
 What the library would say if the language let it. Each is a language or verifier change, not a library change. (Earlier gaps, all closed: `old(x)` is allowed in loop invariants, which the text functions and `bytes_copy_into` use; a local variable may share a function's name, so importing core no longer reserves its local names; a `spec fn` may be generic; `vcount` counts the elements of a vector, which proves the sort a permutation and the map's counters; and imports are searched for, so `import "core/text.bastio"` works from anywhere.)
 
-- **Packed bitmaps.** `core/bitmap.bastio` spends a byte per entry. The language can now state and prove what packing needs (`has_bit`: setting, clearing or flipping a bit leaves the other 63 alone; `tests/pass/bits_packed.bastio`), so this is now a library change.
+No language gap is open at the moment. One library proof is missing:
 
-(Closed last: an `opaque spec fn` (`queue_at`) gives `Queue` an abstract view of its contents, so it is proved to be a FIFO; `bdec` and `bhex` name the value of a digit string, so every `parse_*` is proved to return the value of its digits; and an existing `Bytes` is known to be at most 2^60 long, which is all a single value can say.)
+- **A lookup finds every key present.** `HashMap` and `BytesMap` prove that a slot a lookup returns holds the key asked for, not that a lookup finds a key the map holds. That needs an invariant about runs of probed slots (no empty slot between a key's home and the key), which no one has written yet.
+
+(Closed last: `has_bit` states what each bitwise operator does to every bit, so `Bits` packs 64 entries in a word with the same guarantees as the byte maps; an `opaque spec fn` (`queue_at`) gives `Queue` an abstract view of its contents, so it is proved to be a FIFO; `bdec` and `bhex` name the value of a digit string, so every `parse_*` is proved to return the value of its digits; and an existing `Bytes` is known to be at most 2^60 long, which is all a single value can say.)
 
 ## Where it came from
 
@@ -191,8 +279,14 @@ A survey of the hand-written helpers in `stage1/`, BastiOS (`src/` and `user/`) 
 | Endian loads and stores (`be16`, `be32`, `put16`, `rd16`, `rd32`, `get_u64`, `put_u64`) | about 7 (BastiOS network, ELF and disk code) | `core/endian.bastio` |
 | Free a `Vec[Bytes]` (`drop_argv`, `drop_args`) | 2 | `bytes_vec_free` |
 | Vector contains (`has_id`, `has_u`) | 2 | `vec_contains_u64` |
-| Insertion sort | 2 (stage1's sort records by a key, which core cannot do yet) | `sort_u64` |
-| Lookup by key: every table is a linear scan (`find_inst`, `env_find`, `find_file`, ...) | many | `HashMap` |
+| Minimum (`smaller`) | 2 (121 uses in BastiOS) | `min_u64` |
+| Span against span (`same`, `same_name`, `name_is`, `x86_same_text`, ...) | about 9 | `bytes_span_eq`, `wtext_same` |
+| Writes into a fixed reply buffer that drop the overflow (`put_s`, `put_c`, `put_n` in /proc) | 1 (about 146 uses) | `bytes_put_str`, `bytes_put_byte`, `bytes_put_u64` |
+| Text as `Vec[u64]`: append a literal, a number, hex; prefix and span compare (`cm_s`, `out_str`, `x86_num`, `cm_num`, `x86_has_prefix`, ...) | about 20 (bastioc1, about 760 calls) | `core/wtext.bastio` |
+| Vector append and copy (`x86_append`, `copy_set`, `x86_copy_text`) | 3 | `vec_extend_u64`, `vec_clone_u64`, `wtext_push_span` |
+| Insertion sort | 2 (stage1's sorts compare records by a key) | `sort_u64`, `merge_sort_u64`, `sort_by_key_u64` (when the key is a number) |
+| Lookup by key: every table is a linear scan (`find_inst`, `env_find`, `find_file`, ...) | many | `HashMap`, `BytesMap` (for names and paths) |
 | Ring buffers: head and count over a fixed capacity (console output, tty input, pipes, AF_UNIX channels, the disk command queue) | 6 (BastiOS) | `Ring`, `Queue` |
-| Allocation maps, a byte or word per entry with a wrap-around search (disk blocks, pages) | 2 (BastiOS) | `core/bitmap.bastio` |
+| Allocation maps, a byte or word per entry with a wrap-around search (disk blocks, pages) | 2 (BastiOS) | `core/bitmap.bastio` (`map_*` bytes, `Bits` packed) |
+| Fixed-size id tables: process table, descriptors per process, pipes, sockets (`NPROC`, `NFD`, ...) | several (BastiOS) | `Slots`, `rows_grow`, `bits_grow` |
 | The Internet checksum (`cadd`, `sum16`, `csum`, `l4_sum`) | 1 (BastiOS network) | `core/csum.bastio` |

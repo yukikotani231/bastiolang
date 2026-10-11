@@ -75,6 +75,25 @@ What will be 0.2.0.
   every sized type; console printing; endian loads and stores; a hash map;
   insertion sort and binary search; host files and standard error (#69).
   The hash map is generic, `HashMap[V]` (#86).
+- Every `parse_*` is proved to return the value of its digits (`bdec`,
+  `bhex`) (#93, #98).
+- `core/ring` (`Ring`, `Queue`), `core/bitmap` (allocation maps) and
+  `core/csum` (Internet checksum, CRC-32) (#98). The bitmap also comes
+  packed, 64 entries a word (`Bits`).
+- `core/slots`: `Slots[V]`, a growable table of numbered slots for process
+  ids, file descriptors and the like, proved to hand out the lowest free
+  id at or above a starting point, under a limit; `core/rows`'s `rows_grow`
+  for tables of fixed-size rows in one `Buf` (new rows are zero); `bits_grow`. All three report
+  running out of memory instead of stopping the program.
+- Helpers BastiOS and bastioc1 each wrote by hand: `min_u64`, `max_u64`,
+  `bytes_span_eq`, `bytes_copy_span`, writes into a fixed buffer that drop
+  what does not fit (`bytes_put_byte`, `bytes_put_str`, `bytes_put_u64`),
+  `vec_extend_u64`, `vec_clone_u64`, and `core/wtext` for text kept one
+  character a word in a `Vec[u64]`.
+- `merge_sort_u64`, O(n log n) with the insertion sort's proof, and
+  `sort_by_key_u64`, a proved stable sort of indices by a key vector;
+  `BytesMap[V]`, a hash map from byte strings; `examples/wordfreq.bastio`
+  (#107).
 
 ### Compilers
 
