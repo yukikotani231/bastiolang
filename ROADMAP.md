@@ -137,7 +137,16 @@ Decided 2026-10-10: BastiOS should run existing Linux programs, not only program
 
 The layer is written in Bastio, so it is held to the same memory-safety proofs as the rest of the kernel. This is the opposite of fz, where the compatibility layer was assembly kept outside verification. User programs themselves are not trusted; page tables isolate them, so a misbehaving Linux binary can only fault itself. Only the small entry stub (saving registers on `syscall`) belongs to the trusted assembly base.
 
-## Performance
+## v5: a general-purpose OS
+
+Goal, set 2026-10-10: BastiOS usable as a general-purpose operating system, for the everyday work a Linux machine does, not only as a demonstration kernel. Public release as open source is a waypoint on the way. Each item below is a gap between BastiOS today and that goal:
+- [ ] Real hardware: boot, disks, network and keyboard on physical PCs, not only QEMU
+- [ ] Users, permissions and isolation between them
+- [ ] No toy limits: memory, processes, CPUs, files and descriptors scale with the machine. Physical memory (2026-10-11): the page pool spans every run of RAM in the memory map up to 512 GiB (2^27 pages), with page numbers dense across the holes; the kernel arena grows by a 32nd of the pool (at least 4 MiB). Still fixed: process count (NPROC), per-process tables, processors (MAX_CPUS 16), the user window
+- [ ] Software installation: a package manager, and dynamically linked glibc programs
+- [ ] Networking for the internet: DNS, TLS, IPv6, verified against real services
+- [ ] Desktop hardware: graphics, audio, Wi-Fi, power management
+
 
 Safety must not cost speed at run time; that is the point of proving it instead of checking it. Three things are tracked:
 1. **Generated code.** Compare Bastio programs with equivalent hand-written C (same algorithm, `-O2`). A first measurement (2026-10-10, array sum, sieve, binary tree, vector push) found tight loops on par with C, and two runtime gaps: `Vec` growth (`bst_vec_grow` used `calloc` plus a byte-by-byte copy, about 3x slower pushes; fixed with `realloc`, now 1.04x) and allocation order in tree building (about 1.4x; fixed by allocating a box before evaluating its contents, so trees are laid out parent first, now 0.97x). A native backend (v3) would lose the C compiler's optimizations, so it must be measured against the C backend before it replaces it. The first measurement of the stage0 prototype (2026-10-10, best of 3, time relative to the C backend): sieve 1.04x, vec 1.32x, sum 1.42x, tree 1.65x. The loops themselves are close to gcc's; what is missing is vectorization (sum), inlining one level of recursion (tree) and passing arguments in registers (tree, vec). After inlining and the register work (second round, same day), instructions executed relative to the C backend's binary (valgrind, which is steadier than time on a shared machine): der 1.83 -> 1.25, utf8 1.63 -> 1.27, vec 1.62 -> 1.42, sum 1.25 (the C loop is vectorized), tree 1.25 -> 1.19 (most of tree is the allocator, the same for both). The rest is mostly calls that remain (recursive ones, arguments on the stack) and values that stay in memory. `bench/run.sh` prints the native time next to the C time on every run.
