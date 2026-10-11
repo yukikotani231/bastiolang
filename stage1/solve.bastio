@@ -861,6 +861,150 @@ fn write_body(h: &Host, path: &Bytes, body: &Vec[u64]) -> bool {
   return ok;
 }
 
+// ---- The proof cache ----
+
+/// Four independent polynomial hashes of a text, each modulo a prime below
+/// 2^31, so every step fits in 64 bits: about 124 bits together.
+struct Hash4 { a: u64, b: u64, c: u64, d: u64 }
+
+fn mix(h: u64, c: u64, mul: u64, md: u64) -> u64
+  requires h < 2147483648 && mul < 2147483648 && c < 2147483648 && md > 0 && md <= 2147483648
+  ensures result < md
+{
+  return (h * mul + c) % md;
+}
+
+fn hash_new() -> Hash4 {
+  return Hash4 { a: 1, b: 2, c: 3, d: 5 };
+}
+
+fn hash_step(x: Hash4, ch: u64) -> Hash4 {
+  let c = ch % 2147483648;
+  return Hash4 {
+    a: mix(x.a % 2147483647, c, 16777619, 2147483647),
+    b: mix(x.b % 2147483629, c, 40503, 2147483629),
+    c: mix(x.c % 2147483587, c, 65599, 2147483587),
+    d: mix(x.d % 2147483579, c, 131071, 2147483579)
+  };
+}
+
+fn hash_text(x: Hash4, t: &Vec[u64]) -> Hash4 {
+  let mut r = x;
+  let mut k = 0;
+  while k < vec_len(t) {
+    r = hash_step(r, vec_get(t, k));
+    k = k + 1;
+  }
+  return r;
+}
+
+/// The text in `v` as bytes (characters above 255 are left out).
+fn text_bytes(v: &Vec[u64]) -> Bytes {
+  let mut b = balloc(vec_len(v));
+  let mut k = 0;
+  while k < vec_len(v) && k < blen(b) {
+    let ch = u_at(v, k);
+    if ch <= 255 {
+      bset(&mut b, k, cast[u8](ch));
+    }
+    k = k + 1;
+  }
+  return b;
+}
+
+/// The directory of the proof cache (`BASTIO_PROOF_CACHE`); empty if the
+/// cache is off. A function whose verification conditions have been
+/// proved before, to the byte and by the same solver, is not sent to the
+/// solver again. The cache is trusted like the solver: a file in it says
+/// "these conditions are unsat", so only a directory the user controls
+/// should be named.
+fn cache_dir(h: &Host) -> Bytes {
+  let mut d = balloc(0);
+  if !host_env(h, "BASTIO_PROOF_CACHE", &mut d) {
+    bfree(d);
+    return balloc(0);
+  }
+  return d;
+}
+
+/// `<dir>/<key>`, the file that records that the function whose text
+/// hashes to x (together with the preamble) was proved.
+fn cache_path(dir: &Bytes, x: Hash4) -> Bytes {
+  let mut t = vec_new[u64]();
+  let mut k = 0;
+  while k < blen(dir) {
+    vec_push(&mut t, cast[u64](bget(dir, k)));
+    k = k + 1;
+  }
+  w_s(&mut t, "/");
+  w_hex(&mut t, x.a);
+  w_s(&mut t, "-");
+  w_hex(&mut t, x.b);
+  w_s(&mut t, "-");
+  w_hex(&mut t, x.c);
+  w_s(&mut t, "-");
+  w_hex(&mut t, x.d);
+  let b = text_bytes(t);
+  vec_free(t);
+  return b;
+}
+
+fn cache_hit(h: &Host, path: &Bytes) -> bool {
+  let mut b = balloc(0);
+  let ok = host_read(h, path, &mut b);
+  bfree(b);
+  return ok;
+}
+
+/// Records that the functions behind paths[0..upto) were proved. A path
+/// that is empty (a function that is not cached) is skipped.
+fn cache_record(h: &Host, paths: &mut Vec[Bytes], upto: u64) {
+  let mut k = 0;
+  while k < upto && k < vec_len(paths) {
+    let p = vec_swap(&mut paths, k, balloc(0));
+    if blen(p) > 0 {
+      let mut body = vec_new[u64]();
+      w_s(&mut body, "unsat\n");
+      write_body(h, p, body);
+      vec_free(body);
+    }
+    bfree(vec_swap(&mut paths, k, p));
+    k = k + 1;
+  }
+}
+
+/// The hash of everything every function's proof starts from: the proof
+/// cache's format, the solver, the header and the preamble log[0..pre).
+fn cache_base(v: &Vr, h: &Host, pre: u64) -> Hash4 {
+  let mut t = vec_new[u64]();
+  w_s(&mut t, "bastio-proof-cache-1\n");
+  solver_name(h, &mut t);
+  w_s(&mut t, "\n");
+  // The solver's version: another Z3 may answer differently.
+  let mut argv = vec_new[Bytes]();
+  let mut cmd = balloc(0);
+  if host_env(h, "BASTIO_SOLVER", &mut cmd) {
+    vec_push(&mut argv, cmd);
+  } else {
+    bfree(cmd);
+    push_arg(&mut argv, "z3");
+  }
+  push_arg(&mut argv, "--version");
+  let ver = run_line(h, argv);
+  let mut k = 0;
+  while k < blen(ver) {
+    vec_push(&mut t, cast[u64](bget(ver, k)));
+    k = k + 1;
+  }
+  bfree(ver);
+  w_s(&mut t, "\n");
+  out_header(&mut t);
+  out_range(&mut t, v, 0, pre);
+  let r = hash_text(hash_new(), t);
+  vec_free(t);
+  return r;
+}
+
 /// As `solve`, with up to `jobs` solvers at once, as stage0 proves. Each
 /// function goes to the solver with the least work so far (counted in
 /// commands). A solver reads its functions from a file, so none waits for
@@ -871,8 +1015,53 @@ fn write_body(h: &Host, path: &Bytes, body: &Vec[u64]) -> bool {
 /// the same report as `solve` gives. Without a temporary directory
 /// (`mktemp -d`) the proofs run on one solver.
 fn solve_par(v: &mut Vr, m: &Mono, p: &Parser, h: &Host, rep: &mut Vec[u64], jobs: u64) -> bool {
+  let mut all = vec_new[Unit]();
+  let pre = units_of(v, &mut all);
+  // The functions that were proved before are left out. `paths` has, for
+  // each function that remains, the cache file to write once it is
+  // proved (empty if there is no cache or the function cannot be cached).
+  let cdir = cache_dir(h);
   let mut us = vec_new[Unit]();
-  let pre = units_of(v, &mut us);
+  let mut paths = vec_new[Bytes]();
+  if blen(cdir) > 0 {
+    let mut mk = vec_new[Bytes]();
+    push_arg(&mut mk, "mkdir");
+    push_arg(&mut mk, "-p");
+    vec_push(&mut mk, copy_bytes(cdir));
+    let c = host_spawn(h, mk);
+    drop_argv(mk);
+    child_wait(c);
+  }
+  let base = cache_base(v, h, pre);
+  let mut a = 0;
+  while a < vec_len(all) {
+    let u = unit_at(all, a);
+    let mut hit = false;
+    let mut path = balloc(0);
+    if blen(cdir) > 0 && !u.fail {
+      let mut t = vec_new[u64]();
+      out_range(&mut t, v, u.s, u.e);
+      bfree(path);
+      path = cache_path(cdir, hash_text(base, t));
+      vec_free(t);
+      hit = cache_hit(h, path);
+    }
+    if hit {
+      bfree(path);
+    } else {
+      vec_push(&mut us, u);
+      vec_push(&mut paths, path);
+    }
+    a = a + 1;
+  }
+  let had = vec_len(all);
+  vec_free(all);
+  bfree(cdir);
+  if had > 0 && vec_len(us) == 0 {
+    vec_free(us);
+    drop_argv(paths);
+    return true;
+  }
   let n = vec_len(us);
   let mut dir = balloc(0);
   if jobs > 1 && n > 1 {
@@ -885,7 +1074,12 @@ fn solve_par(v: &mut Vr, m: &Mono, p: &Parser, h: &Host, rep: &mut Vec[u64], job
   if blen(dir) == 0 {
     bfree(dir);
     vec_free(us);
-    return solve(&mut v, m, p, h, &mut rep);
+    let whole = solve(&mut v, m, p, h, &mut rep);
+    if whole {
+      cache_record(h, &mut paths, vec_len(paths));
+    }
+    drop_argv(paths);
+    return whole;
   }
   let mut nj = jobs;
   if nj > n {
@@ -990,6 +1184,9 @@ fn solve_par(v: &mut Vr, m: &Mono, p: &Parser, h: &Host, rep: &mut Vec[u64], job
     }
     r = r + 1;
   }
+  // The functions read as proved are recorded.
+  cache_record(h, &mut paths, failed);
+  drop_argv(paths);
   // Stop the solvers still working (after a failure), then wait for all.
   while vec_len(pids) > 0 {
     let pid = vec_pop(&mut pids);
