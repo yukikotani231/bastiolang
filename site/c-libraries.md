@@ -5,7 +5,7 @@ one parser or decoder that reads untrusted input with a proved one, and keep
 the rest. An `export fn` is a proved Bastio function with a plain C
 signature, and `bastioc0 --header` writes the C header for it. This page is
 the recipe; the [language reference](language.md#calling-bastio-from-c)
-has the exact rules, and the [tutorial](tutorial.md#8-calling-bastio-from-c)
+has the exact rules, and the [tutorial](tutorial.md#9-calling-bastio-from-c)
 builds the smallest library step by step.
 
 ## The examples

@@ -149,7 +149,8 @@ done
 # like a test: its first line is `// expect-exit: N` (built and run on the
 # hosted target), `// expect-error: CODE` (rejected with CODE), or
 # `// expect-ok` (accepted by --check; for kernel and user examples that
-# cannot run here), with an optional `// target: T` line after it. Sketches
+# cannot run here), with an optional `// target: T` line after it. They may
+# import the library (core/, std/). Sketches
 # that are not whole programs use ```text instead.
 mkdir -p "$tmp/doc"
 for md in docs/*.md; do
@@ -167,19 +168,19 @@ for f in "$tmp"/doc/*.bastio; do
   case "$head1" in
     "// expect-exit: "*)
       want=${head1#// expect-exit: }
-      if ! "$BASTIOC" -o "$tmp/docex" "$f" 2>"$tmp/doc.err"; then
+      if ! "$BASTIOC" --lib "$PWD" -o "$tmp/docex" "$f" 2>"$tmp/doc.err"; then
         echo "FAIL $at: rejected"; sed 's/^/    /' "$tmp/doc.err"; fail=$((fail+1)); continue
       fi
       "$tmp/docex" </dev/null >/dev/null; got=$?
       if [ "$got" = "$want" ]; then pass=$((pass+1)); else echo "FAIL $at: exit $got, want $want"; fail=$((fail+1)); fi ;;
     "// expect-error: "*)
       want=${head1#// expect-error: }
-      if "$BASTIOC" --check --target "${target:-hosted}" "$f" 2>"$tmp/doc.err"; then
+      if "$BASTIOC" --lib "$PWD" --check --target "${target:-hosted}" "$f" 2>"$tmp/doc.err"; then
         echo "FAIL $at: accepted, want $want"; fail=$((fail+1))
       elif grep -q "error\[$want\]" "$tmp/doc.err"; then pass=$((pass+1)); else
         echo "FAIL $at: wrong error, want $want"; sed 's/^/    /' "$tmp/doc.err"; fail=$((fail+1)); fi ;;
     "// expect-ok")
-      if "$BASTIOC" --check --target "${target:-hosted}" "$f" 2>"$tmp/doc.err"; then pass=$((pass+1)); else
+      if "$BASTIOC" --lib "$PWD" --check --target "${target:-hosted}" "$f" 2>"$tmp/doc.err"; then pass=$((pass+1)); else
         echo "FAIL $at: rejected"; sed 's/^/    /' "$tmp/doc.err"; fail=$((fail+1)); fi ;;
     *)
       echo "FAIL $at: a \`\`\`bastio block must start with // expect-exit:, // expect-error: or // expect-ok"; fail=$((fail+1)) ;;

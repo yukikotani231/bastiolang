@@ -432,7 +432,64 @@ fn main() -> u64 {
 
 `old(s)` in an `ensures` is the value `s` had when the function was called; `s` alone is the value handed back. Generic types (`Option[T]`), `Box[T]` for recursive data and `Vec[T]` are in the reference.
 
-## 7. Reading the compiler's errors
+## 7. Using the library
+
+You rarely write byte comparisons, parsers or tables by hand: the library in [`core/`](core.md) has them, proved like any other code. Each function's contract is on its reference page, and those contracts are what your proofs get to use. This program reads `width=80 height=25`, multiplies the two numbers and prints the result:
+
+```bastio
+// expect-exit: 0
+import "core/print.bastio";
+
+/// The number after `key=` in `line`, if the line has that key.
+fn field(line: &Bytes, sp: Span, key: Str) -> Option[u64]
+  requires span_in(sp, line)
+{
+  let eq = bytes_find_byte(line, 61, sp.start);      // '='
+  if eq >= sp.end || !bytes_span_eq_str(line, sp.start, eq, key) {
+    return Option[u64]::None;
+  }
+  return parse_u64(line, eq + 1, sp.end);
+}
+
+fn main(con: &mut Serial) -> u64 {
+  let line = bfrom("width=80 height=25");
+  let parts = bytes_split(line, 32);                 // ' '
+  let mut w = 0;
+  let mut h = 0;
+  let mut i = 0;
+  while i < vec_len(parts)
+    invariant i <= vlen(parts)
+    invariant forall k: u64 :: k < vlen(parts) ==> span_in(vget(parts, k), line)
+  {
+    let sp = vec_get(parts, i);
+    w = opt_or[u64](field(line, sp, "width"), w);
+    h = opt_or[u64](field(line, sp, "height"), h);
+    i = i + 1;
+  }
+  vec_free(parts);
+  bfree(line);
+  match checked_mul_u64(w, h) {
+    Option::Some(area) => {
+      print_str(con, "area ");
+      print_u64(con, area);
+      print_nl(con);
+      return 0;
+    },
+    Option::None => { return 1; },                  // too large for a u64
+  }
+}
+```
+
+The proofs lean on the library's contracts at every step:
+
+- `bytes_split` promises that every piece is a span of `line` (`span_in`), so `field` can read inside it with no bounds check. The loop's second invariant carries that promise from the call to each `vec_get`.
+- `bytes_find_byte` returns an index at or after `sp.start`, and at most the length. So `eq + 1` cannot overflow, and once `eq < sp.end` is checked the ranges passed to `bytes_span_eq_str` and `parse_u64` are in bounds.
+- `parse_u64` returns `None` for text that is not a number, so a missing or malformed field leaves `w` or `h` as it was. When it returns a value, it is the number the digits spell (`bdec`), not just some number.
+- `w * h` could overflow, and Bastio rejects arithmetic that might (`E-VERIFY-OVERFLOW`). `checked_mul_u64` returns `None` exactly when the product does not fit, and the program decides what that means.
+
+Every module also gives you facts about what it computed, not just safety. `sort_u64` proves the vector is sorted, so a later `sorted_find_u64` on it needs no proof of its own, and `hmap_insert` proves the map now holds the key with its value. The [library overview](core.md) lists the modules. Each module's reference page shows every contract with a worked example, and the build checks every example.
+
+## 8. Reading the compiler's errors
 
 Every error has the same shape: where, a code, a sentence, the source line, and either a counterexample or a hint. The code tells you what kind of problem it is:
 
@@ -453,7 +510,7 @@ Some errors have a hint instead of a counterexample. The one to know is `the sol
 
 `bastioc0 --dump-smt` prints the questions the compiler sends to Z3, if you want to see exactly what it was asked.
 
-## 8. Calling Bastio from C
+## 9. Calling Bastio from C
 
 Bastio compiles to C, so a proved Bastio function can replace one piece of a C program, such as a parser or decoder that reads untrusted input. This section builds the smallest such library, [`examples/lines`](../examples/lines). It is a line counter whose C side reads standard input and asks Bastio about it.
 
@@ -603,6 +660,7 @@ The header's opening comment lists what the proofs assume about the C caller and
 
 ## Where to go next
 
+- The [library overview](core.md) and its reference pages list every library function with its contract and an example.
 - The [language reference](language.md) has every type, builtin and error code, and the [soundness scope](language.md#soundness-scope): exactly what is and is not guaranteed.
 - `tests/pass/` has larger programs, and `tests/fail/` one program for each rule, each rejected with the error it breaks.
 - [ROADMAP.md](../ROADMAP.md) says where the language is going: a compiler written in Bastio, concurrency, and the BastiOS kernel.
