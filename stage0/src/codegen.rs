@@ -306,16 +306,25 @@ typedef struct { uint64_t base, len; } bst_mmio;
 typedef uint64_t bst_dma;                   /* a lent page's physical address */
 typedef uint64_t bst_lease;                 /* the address of the table it holds */
 /* Lock[T]: a lock word followed by the T. A spin lock; acquire and release
- * order the accesses to the contents between processors. */
+ * order the accesses to the contents between processors. A processor that
+ * has to wait first gives up a parked address space (bst_mmu_exit), as a
+ * processor holding a lease never waits, and one that lets go of its last
+ * lock gives it up too, unless it entered the table again meanwhile
+ * (bst_lock_depth). */
+static inline void bst_mmu_settle(void);    /* defined per target */
+static inline void bst_lock_depth(int d);   /* defined per target */
 static inline void bst_lock_acquire(uint64_t *w) {
-    while (__atomic_exchange_n(w, 1, __ATOMIC_ACQUIRE))
+    while (__atomic_exchange_n(w, 1, __ATOMIC_ACQUIRE)) {
+        bst_mmu_settle();
         while (__atomic_load_n(w, __ATOMIC_RELAXED)) {
 #if defined(__x86_64__) || defined(__i386__)
             __asm__ volatile ("pause");
 #endif
         }
+    }
+    bst_lock_depth(1);
 }
-static inline void bst_lock_release(uint64_t *w) { __atomic_store_n(w, 0, __ATOMIC_RELEASE); }
+static inline void bst_lock_release(uint64_t *w) { __atomic_store_n(w, 0, __ATOMIC_RELEASE); bst_lock_depth(-1); }
 static inline bst_buf bst_set(bst_buf b, uint64_t i, uint64_t v) { b.data[i] = v; return b; }
 "#;
 
@@ -324,6 +333,8 @@ const PRELUDE_HOSTED: &str = r#"#include <stdio.h>
 #include <string.h>
 static inline void bst_serial_write(bst_serial s, uint64_t b) { (void)s; putchar((int)b); if (b == '\n') fflush(stdout); }
 static inline uint64_t bst_serial_read(bst_serial s) { (void)s; fflush(stdout); int c = getchar(); return c == EOF ? 4 : (uint64_t)c; }
+static inline void bst_mmu_settle(void) { }
+static inline void bst_lock_depth(int d) { (void)d; }
 
 static bst_buf bst_alloc(uint64_t n) {
     bst_buf b;
@@ -526,12 +537,25 @@ static inline void bst_pt_put_frame(bst_pt *t, uint64_t i, bst_frame f, bool w) 
 /* What slot i points to, left in place (pt_borrow). */
 static inline uint64_t bst_pt_child(bst_pt t, uint64_t i) { return ((uint64_t *)t)[i] & BST_PTE_ADDR; }
 /* Leases outstanding on each top-level table (mmu_enter, mmu_exit), by page
- * number (bst_pt_leases, one per pool page, comes with the pool). */
-static inline uint64_t bst_pt_lease_count(bst_pt *t) { return __atomic_load_n(&bst_pt_leases[bst_frame_id(*t)], __ATOMIC_ACQUIRE); }
+ * number (bst_pt_leases, one per pool page, comes with the pool). A lease this processor parked
+ * (bst_mmu_exit) is given back first, so the count is what it would be had
+ * the table been left at once. */
+static inline void bst_mmu_settle_on(uint64_t t);   /* defined per target */
+static inline uint64_t bst_pt_lease_count(bst_pt *t) {
+    bst_mmu_settle_on(*t);
+    return __atomic_load_n(&bst_pt_leases[bst_frame_id(*t)], __ATOMIC_ACQUIRE);
+}
+/* Counts every entry taken out of any table: a processor whose TLB may
+ * still hold the entry reloads CR3 before it runs user code again if the
+ * count moved since its last load (bst_cpu_run, bst_mmu_enter). Putting an
+ * entry into an empty slot needs no reload: x86 caches no translation for
+ * a slot that was not present. */
+static uint64_t bst_pt_gen;
 static inline uint64_t bst_pt_take(bst_pt *t, uint64_t i) {
     uint64_t *e = &((uint64_t *)*t)[i];
     uint64_t a = *e & BST_PTE_ADDR;
     *e = 0;
+    __atomic_fetch_add(&bst_pt_gen, 1, __ATOMIC_SEQ_CST);
     return a;
 }
 #define bst_pt_take_frame bst_pt_take
@@ -1019,9 +1043,12 @@ static inline uint64_t bst_mmio_len(bst_mmio m) { return m.len; }
 "#;
 
 const PRELUDE_MMIO_KERNEL: &str = r#"
+/* Device memory above 512 GiB is mapped only in the kernel's tables, so a
+ * parked user table (bst_mmu_exit) goes back before it is touched. */
+#define BST_MMIO_HIGH(a) do { if ((a) >= (1ull << 39)) bst_mmu_settle(); } while (0)
 #define BST_MMIO_RW(w, t) \
-    static inline uint64_t bst_mmio_read##w(bst_mmio *m, uint64_t o) { return *(volatile t *)(uintptr_t)(m->base + o); } \
-    static inline void bst_mmio_write##w(bst_mmio *m, uint64_t o, uint64_t v) { *(volatile t *)(uintptr_t)(m->base + o) = (t)v; }
+    static inline uint64_t bst_mmio_read##w(bst_mmio *m, uint64_t o) { BST_MMIO_HIGH(m->base + o); return *(volatile t *)(uintptr_t)(m->base + o); } \
+    static inline void bst_mmio_write##w(bst_mmio *m, uint64_t o, uint64_t v) { BST_MMIO_HIGH(m->base + o); *(volatile t *)(uintptr_t)(m->base + o) = (t)v; }
 BST_MMIO_RW(8, uint8_t) BST_MMIO_RW(16, uint16_t) BST_MMIO_RW(32, uint32_t) BST_MMIO_RW(64, uint64_t)
 "#;
 
@@ -1086,17 +1113,73 @@ static inline void bst_pio_out32(bst_portio *io, uint64_t o, uint64_t v) { bst_p
 
 const PRELUDE_KERNEL_CPU: &str = r#"
 static inline void bst_load_cr3(uint64_t a) { __asm__ volatile ("mov %0, %%cr3" : : "r"(a) : "memory"); }
-static inline void bst_mmu_kernel(bst_mmu *m) { (void)m; bst_load_cr3((uint64_t)bst_kernel_pml4); }
+static inline uint64_t bst_read_cr3(void) { uint64_t a; __asm__ volatile ("mov %%cr3, %0" : "=r"(a)); return a; }
+/* Three words per processor, zero at boot, if the platform keeps them: the
+ * table this processor parked (0: none), bst_pt_gen as of its last CR3
+ * load, and how many locks it holds. Without them every switch loads CR3
+ * at once. */
+extern uint64_t *bst_platform_mmu_state(void) __attribute__((weak));
+static inline uint64_t *bst_mmu_state(void) { return bst_platform_mmu_state ? bst_platform_mmu_state() : 0; }
+static inline void bst_cr3_load(uint64_t *s, uint64_t a) {
+    if (s) s[1] = __atomic_load_n(&bst_pt_gen, __ATOMIC_SEQ_CST);
+    bst_load_cr3(a);
+}
+/* Gives a parked table back: the kernel's tables go into CR3 first, then
+ * the lease's count drops, as bst_mmu_exit does without parking. */
+static inline void bst_mmu_settle(void) {
+    uint64_t *s = bst_mmu_state();
+    if (!s || !s[0]) return;
+    uint64_t l = s[0];
+    s[0] = 0;
+    bst_cr3_load(s, (uint64_t)bst_kernel_pml4);
+    __atomic_fetch_sub(&bst_pt_leases[bst_frame_id(l)], 1, __ATOMIC_RELEASE);
+}
+static inline void bst_mmu_settle_on(uint64_t t) {
+    uint64_t *s = bst_mmu_state();
+    if (s && s[0] == t) bst_mmu_settle();
+}
+static inline void bst_lock_depth(int d) {
+    uint64_t *s = bst_mmu_state();
+    if (!s) return;
+    s[2] += (uint64_t)(int64_t)d;
+    if (s[2] == 0 && s[0]) bst_mmu_settle();
+}
+static inline void bst_mmu_kernel(bst_mmu *m) { (void)m; bst_mmu_settle(); bst_load_cr3((uint64_t)bst_kernel_pml4); }
+/* A table this processor parked becomes the new lease without a second
+ * count. CR3 is loaded only if it holds another table, or if an entry was
+ * taken out of some table since the last load (bst_pt_gen). */
 static inline bst_lease bst_mmu_enter(bst_mmu *m, bst_pt *t) {
     (void)m;
-    __atomic_fetch_add(&bst_pt_leases[bst_frame_id(*t)], 1, __ATOMIC_SEQ_CST);
-    bst_load_cr3(*t);
+    uint64_t *s = bst_mmu_state();
+    if (s && s[0] == *t) s[0] = 0;
+    else __atomic_fetch_add(&bst_pt_leases[bst_frame_id(*t)], 1, __ATOMIC_SEQ_CST);
+    if (!s || bst_read_cr3() != *t || s[1] != __atomic_load_n(&bst_pt_gen, __ATOMIC_SEQ_CST)) bst_cr3_load(s, *t);
+    if (s && s[0]) {                    /* another table was parked, and CR3 has left it */
+        uint64_t l = s[0];
+        s[0] = 0;
+        __atomic_fetch_sub(&bst_pt_leases[bst_frame_id(l)], 1, __ATOMIC_RELEASE);
+    }
     return *t;
 }
-/* The count drops only once this processor no longer uses the table (the
- * CR3 load also empties its TLB of the table's entries). */
+/* The count drops only once this processor no longer uses the table. Where
+ * the platform keeps bst_mmu_state, the table is parked instead: it stays
+ * in CR3 with its lease counted, so a process that runs again next (after
+ * a system call, say) costs no TLB flush. Every table maps the kernel's
+ * memory the same way (pml4 entry 0, BST_PT_NEW_HOOK), and nothing proved
+ * reaches the user window without a lease, so kernel code runs the same
+ * either way. The lease goes back (bst_mmu_settle) when the processor
+ * enters another table, waits for a lock or an interrupt, lets go of its
+ * last lock without entering the table again, touches MMIO above 512 GiB
+ * (mapped only in the kernel's tables), returns from its smp_run function,
+ * or asks for that table's lease count. So other processors see the lease
+ * held no longer than if the process had trapped a moment later. */
 static inline void bst_mmu_exit(bst_mmu *m, bst_lease l) {
     (void)m;
+    uint64_t *s = bst_mmu_state();
+    if (s) {
+        s[0] = l;
+        return;
+    }
     bst_load_cr3((uint64_t)bst_kernel_pml4);
     __atomic_fetch_sub(&bst_pt_leases[bst_frame_id(l)], 1, __ATOMIC_RELEASE);
 }
@@ -1125,12 +1208,12 @@ static inline void bst_cpu_fpu_load(bst_cpu *c, bst_frame f) {
 }
 static inline uint64_t bst_cpu_run(bst_cpu *c, bst_mmu m) {
     (void)c; (void)m;
-    uint64_t cr3;
-    __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
-    bst_load_cr3(cr3);                  /* flush the TLB: pages may have moved since the last run */
+    uint64_t *s = bst_mmu_state();
+    /* flush the TLB if pages may have moved since the last load */
+    if (!s || s[1] != __atomic_load_n(&bst_pt_gen, __ATOMIC_SEQ_CST)) bst_cr3_load(s, bst_read_cr3());
     return bst_cpu_enter();
 }
-static inline uint64_t bst_cpu_idle(bst_cpu *c) { (void)c; return bst_cpu_wait(); }
+static inline uint64_t bst_cpu_idle(bst_cpu *c) { (void)c; bst_mmu_settle(); return bst_cpu_wait(); }
 extern void bst_platform_smp_start(void (*fn)(void *), void *arg); /* run fn(arg) on every other processor */
 extern void bst_platform_smp_join(void);                           /* wait until all of them have returned */
 extern uint64_t bst_platform_cpus(void); /* processors running, this one included; 1 to 4096 */
@@ -1179,6 +1262,8 @@ void bst_kernel_fault(uint64_t vec, uint64_t rip, uint64_t cr2, uint64_t err) {
 // rax, arguments in rdi, rsi, rdx, result in rax). The numbers are the
 // BastiOS ABI.
 const PRELUDE_USER: &str = r#"
+static inline void bst_mmu_settle(void) { }
+static inline void bst_lock_depth(int d) { (void)d; }
 enum { BST_SYS_EXIT, BST_SYS_WRITE, BST_SYS_READ, BST_SYS_SPAWN, BST_SYS_WAIT, BST_SYS_YIELD,
        BST_SYS_GETPID, BST_SYS_INFO, BST_SYS_PS, BST_SYS_KILL, BST_SYS_POWEROFF };
 static inline uint64_t bst_sys(uint64_t n, uint64_t a, uint64_t b, uint64_t c) {
@@ -1841,12 +1926,12 @@ impl<'a> Gen<'a> {
                     fields.push_str(" uint64_t unused;");
                 }
                 self.smps.push(format!(
-                    "struct bst_smp_{k} {{{fields} }};\nstatic void bst_smp_thunk_{k}(void *p) {{ struct bst_smp_{k} *a = p; bst_cpu cpu = 0; bst_mmu mmu = 0; (void)a; (void)cpu; (void)mmu; f_{}({}); }}\n",
+                    "struct bst_smp_{k} {{{fields} }};\nstatic void bst_smp_thunk_{k}(void *p) {{ struct bst_smp_{k} *a = p; bst_cpu cpu = 0; bst_mmu mmu = 0; (void)a; (void)cpu; (void)mmu; f_{}({}); bst_mmu_settle(); }}\n",
                     cid(f),
                     there.join(", ")
                 ));
                 format!(
-                    "({{ struct bst_smp_{k} sa_{k} = {{ {} }}; bst_platform_smp_start(bst_smp_thunk_{k}, &sa_{k}); f_{}({}); bst_platform_smp_join(); }})",
+                    "({{ struct bst_smp_{k} sa_{k} = {{ {} }}; bst_platform_smp_start(bst_smp_thunk_{k}, &sa_{k}); f_{}({}); bst_mmu_settle(); bst_platform_smp_join(); }})",
                     inits.join(", "),
                     cid(f),
                     here.join(", ")
@@ -1938,7 +2023,7 @@ pub fn prelude_parts(target: Target) -> Vec<(&'static str, &'static str)> {
             ("common", PRELUDE_COMMON),
             ("hosted", PRELUDE_HOSTED),
             ("bytes", PRELUDE_BYTES),
-            ("pt_hook_hosted", "#define BST_PT_NEW_HOOK (void)level;\n"),
+            ("pt_hook_hosted", "#define BST_PT_NEW_HOOK (void)level;\nstatic inline void bst_mmu_settle_on(uint64_t t) { (void)t; }\n"),
             ("pages", PRELUDE_PAGES),
             ("child", PRELUDE_CHILD),
             ("ports", PRELUDE_PORTS),
