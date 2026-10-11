@@ -337,7 +337,7 @@ fn kept_by_builtins(t: &Type, field: &str) -> bool {
 
 /// Builtins whose `&mut` argument keeps the fields above.
 const SHAPE_KEEPING: &[&str] =
-    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pt_borrow", "pt_borrow_frame", "pt_lease_count", "pt_put_shared", "pt_take_shared", "shared_drop", "pool_take", "pool_take_dirty", "pool_give", "frame_write", "frame_write8", "bcopy", "bmove", "frame_to_bytes", "bytes_to_frame", "dma_to_bytes", "bytes_to_dma", "cpu_set", "cpu_run", "cpu_idle", "cpu_fpu_save", "cpu_fpu_load",
+    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pt_borrow", "pt_borrow_frame", "pt_lease_count", "pt_set_access", "pt_put_shared", "pt_take_shared", "shared_drop", "pool_take", "pool_take_dirty", "pool_give", "frame_write", "frame_write8", "bcopy", "bmove", "frame_to_bytes", "bytes_to_frame", "dma_to_bytes", "bytes_to_dma", "cpu_set", "cpu_run", "cpu_idle", "cpu_fpu_save", "cpu_fpu_load",
       "pio_in8", "pio_in16", "pio_in32", "pio_out8", "pio_out16", "pio_out32",
       "mmio_read8", "mmio_read16", "mmio_read32", "mmio_read64", "mmio_write8", "mmio_write16", "mmio_write32", "mmio_write64",
       "dma_read8", "dma_read16", "dma_read32", "dma_read64", "dma_write8", "dma_write16", "dma_write32", "dma_write64"];
@@ -2455,6 +2455,26 @@ impl<'p> Verifier<'p> {
                 self.need(st, format!("(= {} 1)", vals[0].field("level")), pos, "E-VERIFY-PT", format!("that `{}` is a last-level table (level 1), which maps pages", ra(0)))?;
                 let w = self.fresh_bool("pt_writable")?;
                 Ok(w)
+            }
+            "pt_accessible" => {
+                // Whether the program may touch the page in slot i at all
+                // (pt_set_access). Not tracked: the answer is unknown.
+                let i = vals[1].term().to_string();
+                index_ok(self, st, &i, "512", 1, "a page table (512 slots)")?;
+                self.need(st, format!("(= {} 1)", vals[0].field("level")), pos, "E-VERIFY-PT", format!("that `{}` is a last-level table (level 1), which maps pages", ra(0)))?;
+                self.fresh_bool("pt_accessible")
+            }
+            "pt_set_access" => {
+                // Changes only what the program may do with the page in slot
+                // i: the table still owns it, so nothing the proof tracks
+                // changes.
+                let t = &vals[0];
+                let i = vals[1].term().to_string();
+                index_ok(self, st, &i, "512", 1, "a page table (512 slots)")?;
+                self.need(st, format!("(= {} 1)", t.field("level")), pos, "E-VERIFY-PT", format!("that `{}` is a last-level table (level 1), which maps pages", ra(0)))?;
+                self.need(st, format!("(select {} {})", t.field("used"), i), pos, "E-VERIFY-OWN", format!("that slot `{}` of `{}` holds a page (`pt_used({}, {})`)", ra(1), ra(0), ra(0), ra(1)))?;
+                self.need(st, format!("(<= {} 2)", vals[2].term()), pos, "E-VERIFY-PT", format!("that `{}` is 0 (no access), 1 (read) or 2 (read and write)", ra(2)))?;
+                Ok(Val::Unit)
             }
             "pt_put" | "pt_take" | "pt_put_frame" | "pt_take_frame" => {
                 let t = &vals[0];
