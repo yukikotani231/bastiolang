@@ -21,18 +21,14 @@ artifact (`site-<sha>`).
 The site is meant for GitHub Pages, at
 <https://yukikotani231.github.io/bastiolang/> (`site-url` in `book.toml`
 must match the path if that changes, for example with a custom domain).
-GitHub Pages serves a private repository only on a paid plan, so this is
-normally switched on when the repository goes public. There are two ways;
-use one.
+There are two ways to publish; use one.
 
 **With GitHub Actions** (preferred: every push to `main` publishes):
 
 1. Settings > Pages > Build and deployment > Source: **GitHub Actions**.
-2. Settings > Secrets and variables > Actions > Variables: add
-   `PAGES_ENABLED` with the value `true`.
-3. Run the `pages` workflow once from the Actions tab (or push to `main`).
+2. Run the `pages` workflow once from the Actions tab (or push to `main`).
    `.github/workflows/pages.yml` builds the site with `site/build.sh` and
-   deploys it. Until step 2 its jobs are skipped, so it never fails.
+   deploys it.
 
 **Without GitHub Actions** (a branch that holds the built HTML):
 
