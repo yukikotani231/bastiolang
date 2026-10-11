@@ -82,6 +82,8 @@ const X86_INLINE_SMALL: u64 = 20;
 // X86_INLINE_FEW calls name its function, so code grows little.
 const X86_INLINE_SHARED: u64 = 60;
 const X86_INLINE_FEW: u64 = 3;
+// stage1: the largest body inlined into itself, once.
+const X86_INLINE_SELF: u64 = 60;
 // stage1: values of this many words or more are copied with `rep movsq`.
 const X86_REP_COPY: u64 = 6;
 
@@ -1060,8 +1062,17 @@ fn x86_inlinable(g: &mut X86, m: &Mono, p: &Parser, x: u64) -> bool {
 
 /// Is a call to instance `x` inlined at this point (stage0's `will_inline`)?
 fn x86_will_inline(g: &mut X86, m: &Mono, p: &Parser, x: u64) -> bool {
-  if x == 0 || !x86_inlinable(&mut g, m, p, x) || has_id(g.stack, x) {
+  if x == 0 || !x86_inlinable(&mut g, m, p, x) {
     return false;
+  }
+  if has_id(g.stack, x) {
+    // stage1: a small function calling itself from its own body has that
+    // call inlined once (one level of the recursion; the calls in the
+    // inlined copy stay calls).
+    if g.stage0 || vec_len(g.stack) != 1 || u_at(g.stack, 0) != x {
+      return false;
+    }
+    return x86_bsize(&mut g, m, p, x) <= X86_INLINE_SELF;
   }
   if !g.stage0 {
     // stage1: small bodies at any depth (node_at, kind_of and the like
