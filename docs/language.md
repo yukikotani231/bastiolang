@@ -962,6 +962,7 @@ Hardware is reached only through capability types. There is no way to read or wr
 | `Frame` | One physical page (4 KiB), owned by exactly one place at a time |
 | `PageTable` | A page-table page at level 1 to 5. It owns the tables and pages its slots point to |
 | `Shared` | One reference to a page that several page tables may map at once (`MAP_SHARED` memory): the page stays allocated while any reference is held, and the last `shared_drop` gives it back to the pool |
+| `Dirty` | A page taken out of the pool without being zeroed: it may still hold what its last owner wrote, so nothing can read it, map it or give it back until it is overwritten whole and becomes a `Frame` |
 | `Mmu` | The right to load CR3 (kernel only) |
 | `Cpu` | The CPU's saved user context and the right to enter user mode (kernel only) |
 | `Lease` | This processor's hold on the top-level table it loaded with `mmu_enter`: while any is outstanding, other processors may be running on the tree, so nothing is taken out of it (kernel only; pinned to its processor) |
@@ -1003,6 +1004,12 @@ Ghost accessors, usable in specifications:
 | --- | --- | --- |
 | `pool_take(p: &mut Pool, i: u64) -> Frame` | `i < pool_size(p)` and `pool_has(p, i)` | Takes page `i` out of the pool, zeroed |
 | `pool_give(p: &mut Pool, f: Frame)` | | Gives a page back |
+| `pool_take_dirty(p: &mut Pool, i: u64) -> Dirty` | as `pool_take` | Takes page `i` out of the pool without zeroing it (`dirty_id` is `i`). Cheap where pages are handed out under a lock: the page is overwritten later, outside it |
+| `dirty_id(d: &Dirty) -> u64` | | The page number |
+| `dirty_zero(d: Dirty) -> Frame` | | Zeroes the page; it is now a frame, the same page |
+| `frame_copy(d: Dirty, src: &Frame) -> Frame` | | Copies all of `src` over the page; it is now a frame, the same page. Contents are not tracked |
+| `dirty_fill(d: Dirty, src: &Bytes, s: u64) -> Frame` | `s + 4096 <= blen(src)` | Copies bytes `s .. s+4096` of `src` over the page; it is now a frame, the same page. Contents are not tracked |
+| `shared_copy(d: Dirty, s: &Shared) -> Frame` | | The same from a shared page: a private copy of it |
 | `frame_id(f: &Frame) -> u64` | | The page number |
 | `frame_read(f: &Frame, w: u64) -> u64`, `frame_write(f: &mut Frame, w: u64, v: u64)` | `w < 512` | A 64-bit word of the page. Contents are not tracked by the proof |
 | `frame_read8(f: &Frame, o: u64) -> u8`, `frame_write8(f: &mut Frame, o: u64, b: u8)` | `o < 4096` | A byte of the page |

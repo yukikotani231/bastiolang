@@ -33,6 +33,7 @@
 //   Mmio       base, len (the device registers base .. base+len it owns,
 //              always inside the device window)
 //   Dma        id (the page number of the page it lends to devices)
+//   Dirty      id (the page number of a page taken without being zeroed)
 //   PortIo     base, count (the ports base .. base+count it owns; always
 //              within the 65536 ports)
 // A struct value is the values of its fields; places like `p.root` read and
@@ -307,6 +308,7 @@ fn ghost_fields(t: &Type) -> &'static [(&'static str, bool, &'static str)] {
         Type::Mmio => &[("base", false, "mmio_base"), ("len", false, "mmio_len")],
         Type::Dma => &[("id", false, "dma_id")],
         Type::Shared => &[("id", false, "shared_id")],
+        Type::Dirty => &[("id", false, "dirty_id")],
         _ => &[],
     }
 }
@@ -314,12 +316,12 @@ fn ghost_fields(t: &Type) -> &'static [(&'static str, bool, &'static str)] {
 /// Ghost fields a loop keeps when the object is changed only by builtins
 /// that never change them (a page table keeps its id and level).
 fn kept_by_builtins(t: &Type, field: &str) -> bool {
-    matches!((t, field), (Type::Frame, "id") | (Type::PageTable, "id") | (Type::PageTable, "level") | (Type::PageTable, "leases") | (Type::Pool, "size") | (Type::PortIo, "base") | (Type::PortIo, "count") | (Type::Mmio, "base") | (Type::Mmio, "len") | (Type::Dma, "id") | (Type::Shared, "id"))
+    matches!((t, field), (Type::Frame, "id") | (Type::PageTable, "id") | (Type::PageTable, "level") | (Type::PageTable, "leases") | (Type::Pool, "size") | (Type::PortIo, "base") | (Type::PortIo, "count") | (Type::Mmio, "base") | (Type::Mmio, "len") | (Type::Dma, "id") | (Type::Shared, "id") | (Type::Dirty, "id"))
 }
 
 /// Builtins whose `&mut` argument keeps the fields above.
 const SHAPE_KEEPING: &[&str] =
-    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pt_borrow", "pt_borrow_frame", "pt_lease_count", "pt_put_shared", "pt_take_shared", "shared_drop", "pool_take", "pool_give", "frame_write", "frame_write8", "bcopy", "bmove", "frame_to_bytes", "bytes_to_frame", "dma_to_bytes", "bytes_to_dma", "cpu_set", "cpu_run", "cpu_idle", "cpu_fpu_save", "cpu_fpu_load",
+    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pt_borrow", "pt_borrow_frame", "pt_lease_count", "pt_put_shared", "pt_take_shared", "shared_drop", "pool_take", "pool_take_dirty", "pool_give", "frame_write", "frame_write8", "bcopy", "bmove", "frame_to_bytes", "bytes_to_frame", "dma_to_bytes", "bytes_to_dma", "cpu_set", "cpu_run", "cpu_idle", "cpu_fpu_save", "cpu_fpu_load",
       "pio_in8", "pio_in16", "pio_in32", "pio_out8", "pio_out16", "pio_out32",
       "mmio_read8", "mmio_read16", "mmio_read32", "mmio_read64", "mmio_write8", "mmio_write16", "mmio_write32", "mmio_write64",
       "dma_read8", "dma_read16", "dma_read32", "dma_read64", "dma_write8", "dma_write16", "dma_write32", "dma_write64"];
@@ -891,7 +893,7 @@ impl<'p> Verifier<'p> {
             (Type::PortIo, "count") => self.fresh_int(&h, "0", PORT_LIMIT),
             (Type::Mmio, "base") => self.fresh_int(&h, MMIO_LO, MMIO_HI),
             (Type::Mmio, "len") => self.fresh_int(&h, "0", MMIO_HI),
-            (Type::Frame, "id") | (Type::PageTable, "id") | (Type::Dma, "id") | (Type::Shared, "id") => {
+            (Type::Frame, "id") | (Type::PageTable, "id") | (Type::Dma, "id") | (Type::Shared, "id") | (Type::Dirty, "id") => {
                 let n = self.fresh_int(&h, "0", FRAME_LIMIT)?;
                 self.smt(&format!("(assert (< {} {}))", n, POOLSIZE))?;
                 Ok(n)
@@ -2248,13 +2250,26 @@ impl<'p> Verifier<'p> {
 
             // ---- physical pages ----
             "pool_size" => Ok(Val::U(vals[0].field("size"))),
-            "pool_take" => {
+            "pool_take" | "pool_take_dirty" => {
                 let (p, i) = (&vals[0], vals[1].term());
                 self.need(st, format!("(< {} {})", i, p.field("size")), pos, "E-VERIFY-BOUNDS", format!("that page `{}` is within the pool (`{} < pool_size({})`)", ra(1), ra(1), ra(0)))?;
                 self.need(st, format!("(select {} {})", p.field("has"), i), pos, "E-VERIFY-OWN", format!("that the pool still has page `{}` (`pool_has({}, {})`): it may already have been handed out", ra(1), ra(0), ra(1)))?;
                 let np = Val::Obj(Type::Pool, vec![format!("(store {} {} false)", p.field("has"), i), p.field("size")]);
                 self.put_back(&args[0], np, st);
-                Ok(Val::Obj(Type::Frame, vec![i.to_string()]))
+                let ty = if name == "pool_take" { Type::Frame } else { Type::Dirty };
+                Ok(Val::Obj(ty, vec![i.to_string()]))
+            }
+            // A dirty page becomes a frame, the same page, only by being
+            // overwritten whole: zeroed, or a copy of another page.
+            "dirty_id" => Ok(Val::U(vals[0].field("id"))),
+            "dirty_zero" | "frame_copy" | "shared_copy" => Ok(Val::Obj(Type::Frame, vec![vals[0].field("id")])),
+            // Or a page's worth of bytes copied over it.
+            "dirty_fill" => {
+                let Val::Buf { len, .. } = &vals[1] else { unreachable!() };
+                let s = vals[2].term();
+                self.need(st, format!("(<= (+ {} 4096) {})", s, len), pos, "E-VERIFY-BOUNDS",
+                    format!("that the source `{}` .. `{} + 4096` is within `{}` (`{} + 4096 <= blen({})`)", ra(2), ra(2), ra(1), ra(2), ra(1)))?;
+                Ok(Val::Obj(Type::Frame, vec![vals[0].field("id")]))
             }
             "pool_give" => {
                 let (p, f) = (&vals[0], &vals[1]);
@@ -2817,7 +2832,7 @@ impl<'p> Verifier<'p> {
                         Val::Buf { data, .. } | Val::Str { data, .. } => format!("(select {} {})", data, self.spec(&args[1], sc, bound)?),
                         _ => unreachable!(),
                     },
-                    "frame_id" | "pt_id" | "dma_id" | "shared_id" => v.field("id"),
+                    "frame_id" | "pt_id" | "dma_id" | "shared_id" | "dirty_id" => v.field("id"),
                     "pt_level" => v.field("level"),
                     "pt_leases" => v.field("leases"),
                     "pool_size" => v.field("size"),
