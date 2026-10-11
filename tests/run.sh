@@ -8,23 +8,41 @@
 # reason counts as a failure). diag/*.bastio must print exactly diag/*.err.
 # A program with a `// stage1-only: <feature>` header is skipped when
 # BASTIOC is stage0 (tests/stage1_only.sh).
+#
+# ARCH=aarch64 builds the programs that run (pass/*.bastio and the
+# single-file examples) with `--arch aarch64` instead, compiling the C with
+# AARCH64_CC (default: aarch64-linux-gnu-gcc), and runs them under
+# qemu-aarch64 unless this machine is an AArch64 one. The other checks do
+# not depend on the processor and are left to the default run.
 set -u
 cd "$(dirname "$0")/.."
 BASTIOC=${BASTIOC:-$(tests/bastioc1.sh)} || exit 1
+ARCH=${ARCH:-x86_64}
+case "$ARCH" in
+  x86_64) RUN= ;;
+  aarch64)
+    export CC=${AARCH64_CC:-aarch64-linux-gnu-gcc}
+    if [ "$(uname -m)" = aarch64 ]; then RUN=; else
+      RUN=qemu-aarch64
+      # The cross toolchain's libraries, for dynamically linked programs.
+      export QEMU_LD_PREFIX=${QEMU_LD_PREFIX:-/usr/aarch64-linux-gnu}
+    fi ;;
+  *) echo "tests/run.sh: unknown ARCH $ARCH (expected x86_64 or aarch64)"; exit 2 ;;
+esac
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 . tests/pfor.sh
 . tests/stage1_only.sh
-export BASTIOC
+export BASTIOC ARCH RUN
 # One check of the lists below; JOBS of them run at a time.
 pass_one() {
   local f=$1 want name got out
   want=$(sed -n 's|^// expect-exit: *||p' "$f" | head -1)
   name=$(basename "$f" .bastio)
-  if ! "$BASTIOC" -o "$w/$name" "$f" 2>"$w/$name.err"; then
+  if ! "$BASTIOC" --arch "$ARCH" -o "$w/$name" "$f" 2>"$w/$name.err"; then
     echo "FAIL $f: rejected"; sed 's/^/    /' "$w/$name.err"; echo =fail; return
   fi
-  "$w/$name" </dev/null >"$w/$name.out"; got=$?
+  $RUN "$w/$name" </dev/null >"$w/$name.out"; got=$?
   if [ "$got" != "$want" ]; then echo "FAIL $f: exit $got, want $want"; echo =fail; return; fi
   out=$(sed -n 's|^// expect-stdout: *||p' "$f" | head -1)
   if [ -n "$out" ] && [ "$(head -1 "$w/$name.out")" != "$out" ]; then
@@ -63,13 +81,29 @@ user_one() {
     echo "FAIL $f"; sed 's/^/    /' "$w/$name.err"; echo =fail
   fi
 }
-export -f pass_one fail_one user_one
+# Single-file examples (examples/*.bastio) build and run, exiting with 0.
+example_one() {
+  local f=$1 name
+  name=$(basename "$f" .bastio)
+  if ! "$BASTIOC" --arch "$ARCH" -o "$w/ex_$name" "$f" 2>"$w/ex.err"; then
+    echo "FAIL $f: rejected"; sed 's/^/    /' "$w/ex.err"; echo =fail; return
+  fi
+  if $RUN "$w/ex_$name" </dev/null >/dev/null; then echo =pass; else
+    echo "FAIL $f: exit $?, want 0"; echo =fail; fi
+}
+export -f pass_one fail_one user_one example_one
 pass=0
 fail=0
 tally() {  # after a pfor: add its tallies (a lost job is a failure)
   pass=$((pass + $(n pass))) fail=$((fail + $(n fail) + $1))
 }
 pfor pass_one $(s1files tests/pass/*.bastio); tally $?
+if [ "$ARCH" != x86_64 ]; then
+  pfor example_one examples/*.bastio; tally $?
+  echo "-- $pass passed, $fail failed (ARCH=$ARCH: the programs that run)"
+  [ "$fail" = 0 ]
+  exit
+fi
 pfor fail_one $(s1files tests/fail/*.bastio); tally $?
 pfor user_one $(s1files tests/user/*.bastio); tally $?
 # Diagnostics: what the compiler prints for diag/NAME.bastio, run from
@@ -228,15 +262,7 @@ while read -r mod prog names; do
   if [ "$got" = 0 ]; then pass=$((pass+1)); else
     echo "FAIL examples of $mod: the example of $(echo $names | cut -d' ' -f$got) failed"; fail=$((fail+1)); fi
 done <"$tmp/libref.list"
-# Single-file examples (examples/*.bastio) build and run, exiting with 0.
-for f in examples/*.bastio; do
-  name=$(basename "$f" .bastio)
-  if ! "$BASTIOC" -o "$tmp/ex_$name" "$f" 2>"$tmp/ex.err"; then
-    echo "FAIL $f: rejected"; sed 's/^/    /' "$tmp/ex.err"; fail=$((fail+1)); continue
-  fi
-  if "$tmp/ex_$name" </dev/null >/dev/null; then pass=$((pass+1)); else
-    echo "FAIL $f: exit $?, want 0"; fail=$((fail+1)); fi
-done
+pfor example_one examples/*.bastio; tally $?
 s1skip=$(s1left tests/pass/*.bastio tests/fail/*.bastio tests/user/*.bastio)
 if [ "$s1skip" -gt 0 ]; then
   echo "-- $pass passed, $fail failed, $s1skip skipped (stage1-only, and BASTIOC is stage0)"
