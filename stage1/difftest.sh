@@ -93,20 +93,30 @@ mask() {  # stage0's stderr
 export -f verdict target_of mask
 
 # The slow checks that are one program each start now, in the background;
-# their results are printed where they belong below.
+# their results are printed where they belong below. Each one leaves a
+# NAME.ok file when it passes: by the time the script asks, tens of
+# thousands of processes have run, and when one of them gets the PID of
+# a finished check, bash forgets that check's exit status ("wait: pid ...
+# is not a child of this shell").
+bg_ok() {  # pid, name
+  wait "$1" 2>/dev/null
+  [ -f "$tmp/$2.ok" ]
+}
 # asmdump built by the native backend must print the same assembly for itself.
 (
   "$BASTIOC" --backend native -o "$tmp/asmdump_n" stage1/asmdump.bastio 2>/dev/null \
     && "$tmp/asmdump_n" --stage0 stage1/asmdump.bastio >"$tmp/bg_n.got" 2>/dev/null \
     && "$tmp/asmdump" --stage0 stage1/asmdump.bastio >"$tmp/bg_n.want" 2>/dev/null \
-    && cmp -s "$tmp/bg_n.want" "$tmp/bg_n.got"
+    && cmp -s "$tmp/bg_n.want" "$tmp/bg_n.got" \
+    && touch "$tmp/native.ok"
 ) & bg_native=$!
 # asmdump built by itself must print the same assembly for itself.
 (
   "$tmp/asmdump" stage1/asmdump.bastio >"$tmp/self.s" 2>/dev/null \
     && as --64 -o "$tmp/self.o" "$tmp/self.s" && cc -o "$tmp/asmdump_s" "$tmp/self.o" \
     && "$tmp/asmdump_s" stage1/asmdump.bastio >"$tmp/bg_s.got" 2>/dev/null \
-    && cmp -s "$tmp/self.s" "$tmp/bg_s.got"
+    && cmp -s "$tmp/self.s" "$tmp/bg_s.got" \
+    && touch "$tmp/self.ok"
 ) & bg_self=$!
 # bastioc1 built by asmdump (it runs Z3 as a Child) must write the same C
 # for itself as stage0.
@@ -115,7 +125,8 @@ export -f verdict target_of mask
     && as --64 -o "$tmp/b1.o" "$tmp/b1.s" && cc -o "$tmp/bastioc1_n" "$tmp/b1.o" \
     && "$tmp/bastioc1_n" --emit-c -o "$tmp/b1n.c" stage1/bastioc1.bastio 2>/dev/null \
     && "$BASTIOC" --emit-c -o "$tmp/b1c.c" stage1/bastioc1.bastio 2>/dev/null \
-    && cmp -s "$tmp/b1c.c" "$tmp/b1n.c"
+    && cmp -s "$tmp/b1c.c" "$tmp/b1n.c" \
+    && touch "$tmp/b1.ok"
 ) & bg_b1=$!
 # The fixed point: bastioc1 (built by stage0) builds itself, and that
 # build writes the same C for bastioc1 as stage0 does.
@@ -123,7 +134,8 @@ export -f verdict target_of mask
   "$tmp/bastioc1" -o "$tmp/gen2" stage1/bastioc1.bastio 2>"$tmp/gen2.err" \
     && "$tmp/gen2" --emit-c -o "$tmp/gen2.c" stage1/bastioc1.bastio 2>>"$tmp/gen2.err" \
     && "$BASTIOC" --emit-c -o "$tmp/gen1.c" stage1/bastioc1.bastio 2>/dev/null \
-    && cmp -s "$tmp/gen1.c" "$tmp/gen2.c"
+    && cmp -s "$tmp/gen1.c" "$tmp/gen2.c" \
+    && touch "$tmp/fixed.ok"
 ) & bg_fixed=$!
 
 dump() {  # stage0 flag, stage1 tool, file
@@ -217,7 +229,7 @@ echo "-- C: $match matched ($((match-errors)) of them C files), $differ differ"
 
 pfor asm_one $files || status=1
 match=$(n match) differ=$(n differ) unsup=$(n unsupported)
-if wait $bg_native; then
+if bg_ok $bg_native native; then
   match=$((match+1))
 else
   differ=$((differ+1)); echo "DIFFER asmdump built by the native backend"
@@ -247,12 +259,12 @@ asm_run() {
 export -f asm_run
 pfor asm_run tests/pass/*.bastio || status=1
 built=$(n built) differ=$(n differ)
-if wait $bg_self; then
+if bg_ok $bg_self self; then
   built=$((built+1))
 else
   differ=$((differ+1)); echo "DIFFER asmdump built by itself"
 fi
-if wait $bg_b1; then
+if bg_ok $bg_b1 b1; then
   built=$((built+1))
 else
   differ=$((differ+1)); echo "DIFFER bastioc1 built by asmdump"
@@ -437,7 +449,7 @@ if [ -f ../bastios/build/user/sh.bin ] \
 fi
 echo "-- driver: $match matched ($errors rejected, $cfiles C files, $built programs built and run, $nbuilt built natively and run, $nuser BastiOS programs built natively), $differ differ"
 { [ "$differ" = 0 ] && [ "$built" -gt 0 ] && [ "$nbuilt" -gt 0 ] && [ "$nuser" -gt 0 ]; } || status=1
-if wait $bg_fixed; then
+if bg_ok $bg_fixed fixed; then
   echo "-- fixed point: bastioc1 built by itself writes the same C for itself as stage0 ($(wc -l <"$tmp/gen1.c") lines)"
 else
   echo "-- fixed point: FAILED"; sed 's/^/    /' "$tmp/gen2.err" | head -10; status=1

@@ -502,8 +502,18 @@ static inline bst_pt bst_pt_new(bst_frame f, uint64_t level) {
     return f;
 }
 static inline bst_frame bst_pt_free(bst_pt t) { return t; }
-static inline bool bst_pt_has(bst_pt t, uint64_t i) { return (((uint64_t *)t)[i] & BST_PTE_P) != 0; }
+/* A last-level slot the program may not touch (pt_set_access 0) keeps its
+ * page with the present bit clear, marked by a bit the CPU ignores in a
+ * non-present entry, so the table still owns it. */
+#define BST_PTE_HIDDEN 0x400ull
+static inline bool bst_pt_has(bst_pt t, uint64_t i) { return (((uint64_t *)t)[i] & (BST_PTE_P | BST_PTE_HIDDEN)) != 0; }
 static inline bool bst_pt_writable(bst_pt t, uint64_t i) { return (((uint64_t *)t)[i] & BST_PTE_W) != 0; }
+static inline bool bst_pt_accessible(bst_pt t, uint64_t i) { return (((uint64_t *)t)[i] & BST_PTE_P) != 0; }
+static inline void bst_pt_set_access(bst_pt *t, uint64_t i, uint64_t a) {
+    uint64_t e = ((uint64_t *)*t)[i] & ~(BST_PTE_P | BST_PTE_W | BST_PTE_HIDDEN);
+    e |= a == 0 ? BST_PTE_HIDDEN : (BST_PTE_P | (a == 2 ? BST_PTE_W : 0));
+    __atomic_store_n(&((uint64_t *)*t)[i], e, __ATOMIC_RELEASE);
+}
 /* Another processor may be walking the table (it holds a lease on the
  * tree), so an entry is written with one 64-bit store, present bit
  * included, after everything it points to (release order). */
@@ -695,7 +705,7 @@ static bst_pool bst_pool_init(uint64_t mbi) {
     uint64_t lo[BST_RUNS], hi[BST_RUNS], n = 0;
     if (info && (info[0] & 64) && (uint64_t)info[12] + info[11] <= (1ull << 30)) {
         uint8_t *e = (uint8_t *)(uint64_t)info[12], *stop = e + info[11];
-        while (e + 24 <= stop) {
+        while (e + 24 <= stop && *(uint32_t *)e >= 20) {
             uint64_t a = *(uint64_t *)(e + 4), len = *(uint64_t *)(e + 12), b = a + len;
             if (b < a) b = ~0ull;
             if (a < base) a = base;
@@ -705,7 +715,7 @@ static bst_pool bst_pool_init(uint64_t mbi) {
                 b &= ~4095ull;
                 if (a < b) n = bst_run_put(lo, hi, n, a, b);
             }
-            e += *(uint32_t *)e + 4;
+            e += (uint64_t)*(uint32_t *)e + 4;    /* not in 32 bits: 0xFFFFFFFC + 4 would stay put */
         }
     } else {
         uint64_t b = 64ull << 20;
@@ -1136,7 +1146,7 @@ static uint64_t bst_boot_fb(bst_cpu c, uint64_t f) {
     if (!mb || !(*(uint32_t *)mb & (1u << 12)) || mb[109] != 1 || mb[108] != 32) return 0;
     uint64_t addr = *(uint64_t *)(mb + 88), pitch = *(uint32_t *)(mb + 96);
     uint64_t w = *(uint32_t *)(mb + 100), h = *(uint32_t *)(mb + 104);
-    if (addr == 0 || pitch < w * 4 || addr + pitch * h > (1ull << 32)) return 0;
+    if (addr == 0 || addr >= (1ull << 32) || pitch < w * 4 || pitch * h > (1ull << 32) - addr) return 0;    /* no wrap: the verifier takes every field as below 2^32 */
     if (f == 0) return addr;
     if (f == 1) return pitch;
     if (f == 2) return w;
