@@ -78,7 +78,7 @@ What will be 0.2.0.
 - `core/slots`: `Slots[V]`, a growable table of numbered slots for process
   ids, file descriptors and the like, proved to hand out the lowest free
   id at or above a starting point, under a limit; `core/rows`'s `rows_grow`
-  for tables of fixed-size rows in one `Buf`; `bits_grow`. All three report
+  for tables of fixed-size rows in one `Buf` (new rows are zero); `bits_grow`. All three report
   running out of memory instead of stopping the program.
 - Helpers BastiOS and bastioc1 each wrote by hand: `min_u64`, `max_u64`,
   `bytes_span_eq`, `bytes_copy_span`, writes into a fixed buffer that drop

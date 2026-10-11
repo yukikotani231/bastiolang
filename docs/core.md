@@ -58,7 +58,7 @@ For a whole program, see [`examples/wordfreq.bastio`](../examples/wordfreq.basti
 | `bytes_concat(a, b) -> Bytes` | `a` then `b`. Needs `blen(a) + blen(b) <= 2^60`: every `Bytes` is known to be at most 2^60 long, but two of them together are not, since nothing bounds the memory of all live values at once. For strings of unknown length, build a text instead |
 | `bytes_copy_into(dst, at, src)` | `src` lands at `at`, and the rest of `dst` is untouched |
 | `bytes_copy_span(dst, at, src, from, to)` | `src[from..to]` lands at `at` in one `bcopy`, and the rest of `dst` is untouched |
-| `bytes_span_eq(a, i, b, j, n)` | Exactly whether `a[i..i+n]` and `b[j..j+n]` are equal (spec fn `bytes_same_at`); `a` and `b` may be the same string |
+| `bytes_span_eq(a, i, b, j, n)` | Exactly whether `a[i..i+n]` and `b[j..j+n]` are equal, stated over the positions `p` of the first span (`bget(a, p) == bget(b, p - i + j)`); `a` and `b` may be the same string |
 | `bytes_put_byte(dst, at, c)`, `bytes_put_str(dst, at, s)` | Write into a fixed buffer as much as fits and return the position after it, so writes chain and the overflow is dropped; nothing outside what was written changes |
 | `bytes_trim(b, s: Span) -> Span` | Only white space was cut, and the result does not start or end with white space |
 | `bytes_split(b, sep: u8) -> Vec[Span]` | At least one piece, every piece a span of `b` |
@@ -226,11 +226,11 @@ The table never shrinks: a closed descriptor's slot stays, free, for the next on
 
 ### `core/rows.bastio`
 
-A table kept as one `Buf` with a row of `stride` words per entry, indexed as `get(t, id * stride + field)`, is what a kernel's process table and descriptor rows look like. `rows_grow(t, row, k)` makes it `k` rows longer without touching the code that indexes it.
+A table kept as one `Buf` with a row of `stride` words per entry, indexed as `get(t, id * stride + field)`, is what a kernel's process table and descriptor rows look like. `rows_grow(t, stride, k)` makes it `k` rows longer without touching the code that indexes it.
 
 | Function | Proved |
 | --- | --- |
-| `rows_grow(t, row, k)` | The length grows by `k * len(row)`; every old word is unchanged; word `f` of every new row is word `f` of the template `row` (the "free" entry). Returns false, with `t` unchanged, when memory runs out, so a kernel can answer ENOMEM instead of stopping |
+| `rows_grow(t, stride, k)` | The length grows by `k * stride`; every old word is unchanged; every new word is 0 (so 0 should be the "free" value of the field that says a row is in use). Returns false, with `t` unchanged, when memory runs out, so a kernel can answer ENOMEM instead of stopping |
 
 ### `core/csum.bastio`
 
@@ -249,6 +249,8 @@ That the sums are the checksums the standards define is checked by the tests on 
 `eprint_str(h, s)`, `eprint_text(h, t)`, `host_arg_is(h, i, s)`, `read_file(h, path) -> Option[Bytes]`, `read_file_str(h, path: Str)`, `write_file_str(h, path: Str, data)`.
 
 ## Gaps
+
+- **Proofs in a program that counts.** When a struct invariant uses `vcount` (BastiOS's kernel invariant does, through a `HashMap`), every function in the program gets the counting lemmas, and with them Z3 no longer instantiates some quantifiers by itself. Every core function is verified in that setting too (`tests/pass/core_all_counting.bastio`); a contract that relates two strings at two offsets is stated over the positions of one of them, and `rows_grow` fills new rows with zeros instead of copying a template row (the nested quantifier did not prove there).
 
 What the library would say if the language let it. Each is a language or verifier change, not a library change. (Earlier gaps, all closed: `old(x)` is allowed in loop invariants, which the text functions and `bytes_copy_into` use; a local variable may share a function's name, so importing core no longer reserves its local names; a `spec fn` may be generic; `vcount` counts the elements of a vector, which proves the sort a permutation and the map's counters; and imports are searched for, so `import "core/text.bastio"` works from anywhere.)
 

@@ -1,0 +1,41 @@
+// expect-exit: 0
+// A struct invariant that uses `vcount` gives every function in the
+// program the counting lemmas, and with them Z3 stops finding some
+// quantifier instances on its own (its model-based instantiation gives
+// up on their array arguments). BastiOS is such a program: its kernel
+// invariant reaches a HashMap's. Every core function must still prove
+// there, so this program imports all of core: each module's functions
+// are verified in that setting. (Found when bytes_span_eq, stated with an
+// offset into each string, and a template-row rows_grow failed in the
+// kernel while their own tests passed.)
+import "core/bitmap.bastio";
+import "core/boxed.bastio";
+import "core/bytes.bastio";
+import "core/bytesmap.bastio";
+import "core/csum.bastio";
+import "core/endian.bastio";
+import "core/hashmap.bastio";
+import "core/num.bastio";
+import "core/option.bastio";
+import "core/print.bastio";
+import "core/ring.bastio";
+import "core/rows.bastio";
+import "core/slots.bastio";
+import "core/sort.bastio";
+import "core/text.bastio";
+import "core/wtext.bastio";
+
+struct Tally { v: Vec[u64] }
+  invariant vcount(v, 0) <= vlen(v);
+
+fn main() -> u64 {
+  let t = Tally { v: vec_new[u64]() };
+  let mut a = balloc(6);
+  bset(&mut a, 1, 7);
+  bset(&mut a, 4, 7);
+  let ok = bytes_span_eq(a, 0, a, 3, 3) && !bytes_span_eq(a, 0, a, 2, 3);
+  bfree(a);
+  vec_free(t.v);
+  if ok { return 0; }
+  return 1;
+}

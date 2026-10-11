@@ -4,60 +4,51 @@
 // `stride` words per entry (a process table, per-process descriptor
 // rows), and indexes it as `get(t, id * stride + field)`. `rows_grow`
 // makes such a table longer without touching the code that indexes it:
-// the old rows keep their place and contents, and every new row is a copy
-// of a template row (the "free" entry). When memory runs out it returns
-// false and leaves the table as it was, so a kernel can answer ENOMEM or
-// EAGAIN instead of stopping.
+// the old rows keep their place and contents, and every new row is all
+// zeros (make 0 the "free" value of the field that says whether a row is
+// in use). When memory runs out it returns false and leaves the table as
+// it was, so a kernel can answer ENOMEM or EAGAIN instead of stopping.
 //
 // What is proved: the new length is the old one plus `k` rows, every old
-// word is unchanged, and word `f` of every new row is word `f` of the
-// template.
+// word is unchanged, and every new word is 0. Each fact is one quantifier
+// over word positions, with no multiplication inside, so the proofs hold
+// in programs whose other invariants make Z3's job harder (see
+// tests/pass/core_span_eq_counting.bastio). A version that copied a
+// template row needed a nested quantifier over row and field, which did
+// not prove in such a program (BastiOS's kernel).
 
-/// Grows `t` by `k` rows of `len(row)` words, each a copy of `row`.
-/// Returns false, with `t` unchanged, when memory runs out (or when the
-/// new length would pass 2^60).
-fn rows_grow(t: &mut Buf, row: &Buf, k: u64) -> bool
-  requires 0 < len(row)
-  ensures result ==> len(t) == len(old(t)) + k * len(row)
+/// Grows `t` by `k` rows of `stride` words, all zero. Returns false, with
+/// `t` unchanged, when memory runs out (or when the new length would pass
+/// 2^60).
+fn rows_grow(t: &mut Buf, stride: u64, k: u64) -> bool
+  requires 0 < stride
+  ensures result ==> len(t) == len(old(t)) + k * stride
   ensures !result ==> len(t) == len(old(t))
   ensures forall j: u64 :: j < len(old(t)) ==> get(t, j) == get(old(t), j)
-  ensures result ==> (forall r: u64 :: forall f: u64 :: r < k && f < len(row) ==> get(t, len(old(t)) + r * len(row) + f) == get(row, f))
+  ensures result ==> (forall j: u64 :: len(old(t)) <= j && j < len(t) ==> get(t, j) == 0)
 {
-  let s = len(row);
   let base = len(t);
-  if base > 1152921504606846976 || k > (1152921504606846976 - base) / s {
+  if base > 1152921504606846976 || k > (1152921504606846976 - base) / stride {
     return false;
   }
-  let mut nt = try_alloc(base + k * s);
-  if len(nt) != base + k * s {
+  let n = base + k * stride;
+  let mut nt = try_alloc(n);
+  if len(nt) != n {
     free(nt);
     return false;
   }
   let mut i = 0;
-  while i < base
-    invariant i <= base && len(nt) == base + k * s && len(t) == base
-    invariant forall j: u64 :: j < i ==> get(nt, j) == get(t, j)
+  while i < n
+    invariant i <= n && len(nt) == n && len(t) == base && base <= n
+    invariant forall j: u64 :: j < i && j < base ==> get(nt, j) == get(t, j)
+    invariant forall j: u64 :: j < i && base <= j ==> get(nt, j) == 0
   {
-    nt = set(nt, i, get(t, i));
-    i = i + 1;
-  }
-  let mut r = 0;
-  while r < k
-    invariant r <= k && len(nt) == base + k * s
-    invariant forall j: u64 :: j < base ==> get(nt, j) == get(t, j)
-    invariant forall q: u64 :: forall f: u64 :: q < r && f < s ==> get(nt, base + q * s + f) == get(row, f)
-  {
-    let mut f = 0;
-    while f < s
-      invariant f <= s && r < k && len(nt) == base + k * s
-      invariant forall j: u64 :: j < base ==> get(nt, j) == get(t, j)
-      invariant forall q: u64 :: forall g: u64 :: q < r && g < s ==> get(nt, base + q * s + g) == get(row, g)
-      invariant forall g: u64 :: g < f ==> get(nt, base + r * s + g) == get(row, g)
-    {
-      nt = set(nt, base + r * s + f, get(row, f));
-      f = f + 1;
+    if i < base {
+      nt = set(nt, i, get(t, i));
+    } else {
+      nt = set(nt, i, 0);
     }
-    r = r + 1;
+    i = i + 1;
   }
   let prev = t;
   t = nt;
