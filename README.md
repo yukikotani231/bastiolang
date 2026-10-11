@@ -1,6 +1,6 @@
 # Bastio
 
-Bastio is a systems language whose memory safety is **proved at compile time**, not checked at run time. It is the successor to fz/fzl, and the language BastiOS (`bastios`) will be written in.
+Bastio is a systems language whose memory safety is **proved at compile time**, not checked at run time. It is the language BastiOS (`bastios`) is written in.
 
 - **No `unsafe`.** The language has no way to read memory through a raw integer address.
 - **Linear ownership.** Every buffer is consumed exactly once, so use-after-free, double free and **leaks** are compile errors.
@@ -8,7 +8,7 @@ Bastio is a systems language whose memory safety is **proved at compile time**, 
 - **Zero overhead.** Proofs are erased. The generated code has no bounds checks and no runtime checks of any kind.
 - **Opt-in functional correctness.** Functions that carry `requires` / `ensures` / `invariant` are proved to meet them.
 
-New here? Start with the [tutorial](docs/tutorial.md); the [language reference](docs/language.md) has every rule. Their examples are compiled by the test suite, so they match the compiler.
+New here? Start with the [tutorial](docs/tutorial.md), then keep [common proof failures](docs/proof-failures.md) at hand: it shows the errors people meet first and how to fix each. The [language reference](docs/language.md) has every rule. The examples in all three are compiled by the test suite, so they match the compiler.
 
 ## Example
 
@@ -77,7 +77,7 @@ tests/run.sh          # must-pass and must-fail programs, zero-overhead check, s
 stage1/difftest.sh    # the self-hosted compiler's phases against stage0
 ```
 
-`bastioc0` options:
+`bastioc0 --help` lists the options. The main ones:
 - `--check`: verify only
 - `--emit-c`: write the generated C
 - `--dump-smt`: print every query sent to the solver
@@ -95,6 +95,7 @@ stage1/difftest.sh    # the self-hosted compiler's phases against stage0
 | `core/`, `std/` | The library: byte strings, text, numbers, printing, a hash map, sorting (`core/`, every target) and host files (`std/`); see `docs/core.md` |
 | `examples/` | Small programs to start from (`hello.bastio`, `lines`; see `examples/README.md`), and proved libraries called from C through `export fn`: `base64`, `utf8` (validator and decoder) and `der` (ASN.1 structure checker), each with a differential fuzz against a C implementation |
 | `docs/tutorial.md` | A tour of the language for newcomers |
+| `docs/proof-failures.md` | The proof failures newcomers meet first, and how to fix each |
 | `docs/language.md` | The language reference |
 | `docs/core.md` | The core and std libraries: what each function does and what is proved |
 | `docs/concurrency.md` | The concurrency design (not implemented yet) |

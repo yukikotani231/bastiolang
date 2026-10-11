@@ -203,8 +203,14 @@ fn proof_hint(rep: &mut Vec[u64], code: u64) {
     out_str(&mut rep, "  = the caller must make it hold: check it with an `if` before the call, or ask for it in the caller's own `requires`\n");
   } else if code == VC_ENSURES {
     out_str(&mut rep, "  = every `return` must make it hold for each input that meets the `requires`\n");
-  } else if code == VC_INVARIANT {
+  } else if code == VC_INVARIANT || code == VC_INV_STEP {
     out_str(&mut rep, "  = an invariant must hold when the loop starts, and again after any iteration that begins with it and the loop condition true\n");
+  } else if code == VC_CAST {
+    out_str(&mut rep, "  = check the value first, with an `if` or a `requires`, or use `wrap[T](..)` if wrapping around is meant\n");
+  } else if code == VC_SHIFT {
+    out_str(&mut rep, "  = check the shift amount first, with an `if` or a `requires`\n");
+  } else if code == VC_ALLOC {
+    out_str(&mut rep, "  = bound the size first, with an `if` or a `requires`\n");
   } else if code == VC_ASSERT {
     out_str(&mut rep, "  = an `assert` must follow from what is known there: the `requires`, the conditions of the enclosing `if`s and loops, and loop invariants\n");
   }
@@ -537,6 +543,38 @@ fn z3_start(h: &Host) -> Child {
   z3_send(&mut z, &mut out);
   vec_free(out);
   return z;
+}
+
+/// The solver's name, as z3_start runs it: `BASTIO_SOLVER`, or `z3`.
+fn solver_name(h: &Host, out: &mut Vec[u64]) {
+  let mut cmd = balloc(0);
+  if host_env(h, "BASTIO_SOLVER", &mut cmd) {
+    let mut k = 0;
+    while k < blen(cmd) {
+      vec_push(&mut out, cast[u64](bget(cmd, k)));
+      k = k + 1;
+    }
+  } else {
+    out_str(&mut out, "z3");
+  }
+  bfree(cmd);
+}
+
+/// Whether the solver starts and answers at all: a program that cannot be
+/// started gives a child that writes nothing (`host_spawn`). The driver
+/// asks before verifying, so that a missing Z3 is one error about no line
+/// of the program, as stage0 reports it, rather than a failed proof.
+fn solver_starts(h: &Host) -> bool {
+  let mut z = z3_start(h);
+  let mut out = vec_new[u64]();
+  out_str(&mut out, "(check-sat)\n");
+  z3_send(&mut z, &mut out);
+  vec_free(out);
+  let mut line = balloc(0);
+  let got = child_read_line(&mut z, &mut line);
+  bfree(line);
+  z3_stop(z);
+  return got;
 }
 
 fn z3_stop(z: Child) {
@@ -991,7 +1029,9 @@ fn report_cex(v: &mut Vr, m: &Mono, p: &Parser, z: &mut Child, o: Obl, rep: &mut
     out_str(&mut out, "))\n");
     z3_send(&mut z, &mut out);
     z3_read(&mut z, &mut resp);
-    if k == 0 {
+    if k == 0 && o.code == VC_INV_STEP {
+      out_str(&mut rep, "  = counterexample after one iteration: ");
+    } else if k == 0 {
       out_str(&mut rep, "  = counterexample: ");
     } else {
       out_str(&mut rep, ", ");

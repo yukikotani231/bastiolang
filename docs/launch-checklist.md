@@ -13,16 +13,20 @@ repositories are public. It is not part of the documentation website.
       `stage0/Cargo.toml`) and BastiOS `v0.2.0` (the version the kernel
       prints). Both changelogs have their section ready, marked "not yet
       tagged".
-- [ ] **Where the website lives.** `site/` builds and is checked in CI but
-      is not deployed. GitHub Pages is the simplest home and needs the
-      repository public (or a paid plan); a deploy job is a few lines once
-      decided. A domain name, if any.
-- [ ] **The name.** Check that "Bastio" and "BastiOS" are free to use
-      (existing projects, trademarks, package names such as crates.io or
-      the VS Code marketplace if the extension is ever published).
-- [ ] **fz.** The README calls Bastio "the successor to fz/fzl"; fz is a
-      private repository. Either make it public (archived), link nothing,
-      or drop the mention.
+- [x] **Where the website lives:** GitHub Pages (decided 2026-10-11).
+      Both ways to publish are ready ("Publishing" in `site/README.md`):
+      the `pages` workflow, off until `PAGES_ENABLED` is set, or
+      `site/publish.sh` to a `gh-pages` branch. Turn one on when the
+      repository goes public (Pages on a private repository needs a paid
+      plan). A custom domain, if any, is still open.
+- [ ] **The name.** Checked 2026-10-11: `bastio`, `bastios`, `bastioc`
+      and `tree-sitter-bastio` are free on crates.io, npm and PyPI, and a
+      web search finds no other language or OS by either name. One
+      collision: **Bastio** (bastio.com, `bastio-ai` on GitHub) is an AI
+      security company with an open-source gateway. Different field, but
+      both are security software; whether it holds a registered trademark
+      was not checked (USPTO/EUIPO search by hand). "BastiOS" found no
+      match. Decide whether to keep the name.
 
 ## Licensing
 
@@ -30,28 +34,50 @@ repositories are public. It is not part of the documentation website.
       repositories.
 - [x] Commit authors use GitHub noreply addresses only (checked with
       `git log --format='%ae' | sort -u`).
-- [ ] **GPL in the BastiOS ISO.** The kernel image embeds a BusyBox binary
-      (GPL-2.0-only). The release workflow ships its source and
-      configuration next to the ISO. The ISO also contains GRUB
-      (GPL-3.0-or-later), whose source does not ship yet: add the GRUB
-      source matching the Ubuntu package the ISO was built with, or a
-      written offer, before the first ISO is published.
-- [ ] **musl** (MIT) is statically linked into BusyBox and the musl test
-      programs in the image; its copyright notice should ship with the
-      ISO (a `THIRD_PARTY.md` listing BusyBox, musl and GRUB would cover
-      all three).
+- [x] **GPL in the BastiOS ISO.** The kernel image embeds a BusyBox binary
+      (GPL-2.0-only); the release workflow ships its source and
+      configuration next to the ISO. The boot loader is Limine
+      (BSD-2-Clause) instead of GRUB (GPL-3.0) since 2026-10-11, so no
+      GRUB source has to ship: Limine's license is copied into the ISO and
+      the USB image as `boot/limine/LICENSE`.
+- [ ] **Third-party notices.** musl (MIT) is statically linked into
+      BusyBox and the musl test programs in the image, and Limine
+      (BSD-2-Clause) is in the ISO; their copyright notices should ship
+      with the release too (a `THIRD_PARTY.md` listing BusyBox, musl and
+      Limine would cover all three).
 
 ## Repository hygiene
 
 - [x] No credentials in the history of either repository (a search of
-      `git log -p --all` for common token and key formats found none).
-- [ ] `SECURITY.md`: how to report a soundness bug (a program the compiler
-      accepts that is not memory safe) privately. For a language whose
-      point is a safety proof, these are the security bugs.
+      `git log -p --all` for common token and key formats found none;
+      gitleaks 8.21.2 over every branch and pull request head of both
+      repositories found none on 2026-10-11).
+- [ ] **What becomes readable.** All commits and pull requests go public,
+      not just `main`. Authors are GitHub noreply addresses and
+      `noreply@anthropic.com`; no personal address appears. Most commit
+      messages end with a `Claude-Session: https://claude.ai/code/session_...`
+      line, and pull request bodies link the claude.ai project thread.
+      Both links need the maintainer's login, so they expose no content,
+      only that the work was done with Claude Code. One commit message in
+      bastios names a local path (`/mnt/project-files/...`), harmless.
+      Rewriting history to remove these is not proposed.
+- [x] `SECURITY.md` in both repositories (private reporting through
+      GitHub security advisories).
+- [ ] **Turn on private vulnerability reporting** in both repositories
+      once public (Settings → Security → Private vulnerability reporting →
+      Enable); `SECURITY.md` links to it.
+- [ ] **Actions on pull requests from outside contributors.** Once public,
+      Actions minutes are free and anyone can open a pull request that
+      runs our workflows. In each repository: Settings → Actions →
+      General → "Approval for running fork pull request workflows from
+      contributors" → **Require approval for all external contributors**.
+      On the same page keep "Workflow permissions" at **Read repository
+      contents** and leave "Allow GitHub Actions to create and approve pull
+      requests" off. Workflows use `pull_request`, not
+      `pull_request_target`, so fork runs get no secrets.
 - [ ] Issue and pull request templates; a `CODE_OF_CONDUCT.md` if wanted.
 - [ ] Repository description, topics and website link on GitHub.
 - [ ] Branch protection on `main`: require CI.
-- [ ] Re-enable or archive the CI of `fz` if it becomes public.
 
 ## Documentation drift
 

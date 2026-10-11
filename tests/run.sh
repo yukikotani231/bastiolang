@@ -83,6 +83,20 @@ for f in tests/diag/*.bastio; do
     echo "FAIL $f: the error output differs from $name.err"; diff "tests/diag/$name.err" "$tmp/diag.err" | sed 's/^/    /'; fail=$((fail+1))
   fi
 done
+# `--help` prints the options on standard output and succeeds; a solver
+# that cannot be started is one error about no line of the program.
+if "$BASTIOC" --help 2>/dev/null | grep -q '^usage: ' && [ "${PIPESTATUS[0]}" = 0 ]; then
+  pass=$((pass+1))
+else
+  echo "FAIL --help: no usage on standard output, or a nonzero exit"; fail=$((fail+1))
+fi
+want='examples/hello.bastio: error[E-SOLVER]: could not start the SMT solver `/nonexistent/z3` (install Z3 and put `z3` on PATH)'
+got=$(BASTIO_SOLVER=/nonexistent/z3 "$BASTIOC" --check examples/hello.bastio 2>&1)
+if [ "$got" = "$want" ]; then
+  pass=$((pass+1))
+else
+  echo "FAIL a missing solver: got"; printf '%s\n' "$got" | sed 's/^/    /'; fail=$((fail+1))
+fi
 # Zero overhead: the generated C must index buffers directly, with no checks.
 "$BASTIOC" --emit-c -o "$tmp/z.c" tests/pass/fill_sum.bastio 2>/dev/null
 if grep -q 'v_b.data\[v_i\]' "$tmp/z.c" && ! sed -n '/^static uint64_t f_sum/,/^}/p' "$tmp/z.c" | grep -q 'if ('; then

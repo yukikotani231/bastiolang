@@ -14,4 +14,35 @@ and to `SUMMARY.md`.
 
 After building, `linkcheck.py` fails the build if a link between pages points
 at a missing page or anchor. CI runs `site/build.sh` and keeps the HTML as an
-artifact (`site-<sha>`); the site is not deployed anywhere yet.
+artifact (`site-<sha>`).
+
+## Publishing
+
+The site is meant for GitHub Pages, at
+<https://yukikotani231.github.io/bastiolang/> (`site-url` in `book.toml`
+must match the path if that changes, for example with a custom domain).
+GitHub Pages serves a private repository only on a paid plan, so this is
+normally switched on when the repository goes public. There are two ways;
+use one.
+
+**With GitHub Actions** (preferred: every push to `main` publishes):
+
+1. Settings > Pages > Build and deployment > Source: **GitHub Actions**.
+2. Settings > Secrets and variables > Actions > Variables: add
+   `PAGES_ENABLED` with the value `true`.
+3. Run the `pages` workflow once from the Actions tab (or push to `main`).
+   `.github/workflows/pages.yml` builds the site with `site/build.sh` and
+   deploys it. Until step 2 its jobs are skipped, so it never fails.
+
+**Without GitHub Actions** (a branch that holds the built HTML):
+
+1. Run `site/publish.sh` from a clone that can push. It builds the site and
+   force-pushes the HTML, as a single commit with a `.nojekyll` file, to the
+   `gh-pages` branch. Nothing else is touched.
+2. Settings > Pages > Build and deployment > Source: **Deploy from a
+   branch**, branch `gh-pages`, folder `/ (root)`.
+3. Run `site/publish.sh` again whenever the site should be updated.
+
+To check the result locally first: `site/build.sh`, then
+`python3 -m http.server -d site/build/html` and open
+<http://localhost:8000/>.

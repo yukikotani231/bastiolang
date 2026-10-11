@@ -5,6 +5,7 @@
 # Learn
 
 - [Tutorial](tutorial.md)
+- [Common proof failures](proof-failures.md)
 - [Calling Bastio from C](c-libraries.md)
   - [base64](examples-base64.md)
   - [UTF-8](examples-utf8.md)

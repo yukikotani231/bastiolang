@@ -19,6 +19,7 @@ REPO_URL = "https://github.com/yukikotani231/bastiolang"
 PAGES = {
     "README.md": "introduction.md",
     "docs/tutorial.md": "tutorial.md",
+    "docs/proof-failures.md": "proof-failures.md",
     "docs/language.md": "language.md",
     "docs/integers.md": "integers.md",
     "docs/concurrency.md": "concurrency.md",
