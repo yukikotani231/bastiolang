@@ -77,7 +77,7 @@ tests/run.sh          # must-pass and must-fail programs, zero-overhead check, s
 stage1/difftest.sh    # the self-hosted compiler's phases against stage0
 ```
 
-`bastioc0` options:
+`bastioc0 --help` lists the options. The main ones:
 - `--check`: verify only
 - `--emit-c`: write the generated C
 - `--dump-smt`: print every query sent to the solver

@@ -73,6 +73,12 @@ What will be 0.2.0.
 
 ### Compilers
 
+- Clearer messages, the same in both compilers: `E-VERIFY-CAST`,
+  `E-VERIFY-SHIFT` and `E-VERIFY-ALLOC` end with a hint like the other
+  proof failures; a loop body that breaks an invariant shows its
+  counterexample as `counterexample after one iteration:`, since the values
+  are those after the iteration; a solver that cannot be started is one
+  line naming the file, with no source line; `--help` prints the options.
 - A native x86-64 backend in the self-hosted compiler (`stage1/x86.bastio`),
   ported from stage0's and checked byte for byte against it (#70). It
   passes up to four argument words in registers (#72) and covers `Child`
@@ -151,6 +157,9 @@ What will be 0.2.0.
 - `tests/run.sh` checks that error messages shown in `docs/` are what the
   compiler prints, that file copies in `docs/` match the files, and that
   `examples/*.bastio` build and run (#92).
+- `docs/proof-failures.md`, "Common proof failures": the errors newcomers
+  meet first, each with the program, the message, why, and a fix; on the
+  book's site after the tutorial.
 
 ### Added
 

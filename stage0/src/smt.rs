@@ -40,7 +40,7 @@ impl Solver {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .map_err(|e| format!("could not start the SMT solver `{}`: {} (install Z3 and put `z3` on PATH)", solver, e))?;
+            .map_err(|_| format!("could not start the SMT solver `{}` (install Z3 and put `z3` on PATH)", solver))?;
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let mut s = Solver { child, stdin, stdout, log: Vec::new() };

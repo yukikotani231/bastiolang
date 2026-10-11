@@ -156,11 +156,11 @@ fn main() -> u64 {
 evens.bastio:6:17: error[E-VERIFY-INVARIANT]: could not prove that the loop body preserves the invariant `i <= len(b)`
  6 |     invariant i <= len(b)
    |                 ^
-   = counterexample: len(b) = 1152921504606846976 (2^60), i = 1152921504606846977 (2^60 + 1)
+   = counterexample after one iteration: len(b) = 1152921504606846976 (2^60), i = 1152921504606846977 (2^60 + 1)
    = an invariant must hold when the loop starts, and again after any iteration that begins with it and the loop condition true
 ```
 
-The counterexample shows the state *after* the iteration: `i` was `len(b) - 1`, the condition held, and `i + 2` went one past the length. `i <= len(b)` is simply not true of this loop, which ends with `i` one past the end when the length is odd. Write what is true. Here the invariant is not needed at all: the index is in bounds because of the loop condition, and the length is kept because the buffer is changed only with `b = set(b, ...)`. Removing it is enough:
+The counterexample is the state after one iteration, as its label says: `i` was `len(b) - 1`, the condition held, and `i + 2` went one past the length. `i <= len(b)` is simply not true of this loop, which ends with `i` one past the end when the length is odd. Write what is true. Here the invariant is not needed at all: the index is in bounds because of the loop condition, and the length is kept because the buffer is changed only with `b = set(b, ...)`. Removing it is enough:
 
 ```bastio
 // expect-exit: 1
@@ -414,6 +414,7 @@ digit.bastio:2:10: error[E-VERIFY-CAST]: could not prove that `n` fits in u8 (`<
  2 |   return cast[u8](n) + 48;
    |          ^^^^
    = counterexample: n = 256
+   = check the value first, with an `if` or a `requires`, or use `wrap[T](..)` if wrapping around is meant
 ```
 
 `cast[T](x)` keeps the value, so it must be proved to fit. Here the right bound is tighter than the cast needs, since `n + 48` must also fit in a `u8` and only `0` to `9` are digits:

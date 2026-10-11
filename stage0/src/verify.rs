@@ -467,6 +467,10 @@ pub struct Verifier<'p> {
     /// A note for the next proof obligation if it fails (where its
     /// contract is written), set just before `prove`.
     where_note: Option<String>,
+    /// Set just before proving that a loop body preserves an invariant:
+    /// the counterexample is then the state after that iteration, and its
+    /// label says so (`prove` clears it).
+    cex_after: bool,
 }
 
 /// Where function `name` asks for a precondition, written at `at`, when
@@ -491,6 +495,9 @@ fn proof_hint(code: &str) -> Option<&'static str> {
         "E-VERIFY-REQUIRES" => "the caller must make it hold: check it with an `if` before the call, or ask for it in the caller's own `requires`",
         "E-VERIFY-ENSURES" => "every `return` must make it hold for each input that meets the `requires`",
         "E-VERIFY-INVARIANT" => "an invariant must hold when the loop starts, and again after any iteration that begins with it and the loop condition true",
+        "E-VERIFY-CAST" => "check the value first, with an `if` or a `requires`, or use `wrap[T](..)` if wrapping around is meant",
+        "E-VERIFY-SHIFT" => "check the shift amount first, with an `if` or a `requires`",
+        "E-VERIFY-ALLOC" => "bound the size first, with an `if` or a `requires`",
         "E-VERIFY-ASSERT" => "an `assert` must follow from what is known there: the `requires`, the conditions of the enclosing `if`s and loops, and loop invariants",
         _ => return None,
     })
@@ -829,7 +836,7 @@ fn verify_worker(p: &Program, sums: &Summaries, counting: &HashSet<String>, deci
             return w;
         }
     };
-    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, int_ops: HashMap::new(), sums, counting, decimal, hexadecimal, bitwise, capacity, counts: false, bits: false, caps: false, tys: HashMap::new(), file: 0, where_note: None };
+    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, int_ops: HashMap::new(), sums, counting, decimal, hexadecimal, bitwise, capacity, counts: false, bits: false, caps: false, tys: HashMap::new(), file: 0, where_note: None, cex_after: false };
     let mut run = || -> Result<(), (usize, Diag)> {
         // Every function is verified on a solver in the same state, fresh
         // or reset: what Z3 answers near its work limit depends on what it
@@ -1106,6 +1113,7 @@ impl<'p> Verifier<'p> {
     fn prove(&mut self, st: &State, goal: &str, pos: Pos, code: &'static str, what: String) -> Result<(), Diag> {
         self.obligations += 1;
         let where_note = self.where_note.take();
+        let cex_after = std::mem::take(&mut self.cex_after);
         self.smt("(push 1)")?;
         for c in &st.pc {
             self.smt(&format!("(assert {})", c))?;
@@ -1156,7 +1164,8 @@ impl<'p> Verifier<'p> {
                     cex.push(format!("{} = {}", label, readable(&v)));
                 }
                 if !cex.is_empty() {
-                    d = d.note(format!("counterexample: {}", cex.join(", ")));
+                    let label = if cex_after { "counterexample after one iteration" } else { "counterexample" };
+                    d = d.note(format!("{}: {}", label, cex.join(", ")));
                 }
                 if let Some(n) = where_note {
                     d = d.note(n);
@@ -1445,6 +1454,7 @@ impl<'p> Verifier<'p> {
                 if let Some(end) = self.block(body, bst, cx)? {
                     for inv in invariants {
                         let t = self.here_inv(inv, &end, cx)?;
+                        self.cex_after = true;
                         self.prove(&end, &t, inv.pos, "E-VERIFY-INVARIANT", format!("that the loop body preserves the invariant `{}`", render(inv)))?;
                     }
                 }

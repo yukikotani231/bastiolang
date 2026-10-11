@@ -14,7 +14,8 @@ Two kinds of check:
   The program, without its `// expect-...` and `// target: ...` header
   lines, is saved as NAME.bastio and checked, and the output must match
   line for line. Counterexample values depend on the Z3 version, so in a
-  `= counterexample:` note only the names must match.
+  `= counterexample:` note (or `= counterexample after one iteration:`)
+  only the names must match.
 
 - Copies of files. A block whose fence line comes right after a line
   `<!-- file: PATH -->` is a copy of PATH (relative to the repository root),
@@ -61,7 +62,7 @@ def strip_header(body):
     return body[k:], target
 
 
-CEX = re.compile(r"^( *= counterexample: )(.*)$")
+CEX = re.compile(r"^( *= counterexample(?: after one iteration)?: )(.*)$")
 
 
 def same_line(got, want):
