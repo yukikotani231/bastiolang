@@ -40,6 +40,12 @@
 #           itself as stage0 (the fixed point)
 # The parser, the monomorphizer and the checker are also compared on damaged
 # sources (stage1/mutate.py), so their error positions are checked too.
+#
+# Every comparison is independent of the others, so the files of a phase
+# are compared JOBS at a time (default: the number of CPUs; JOBS=1 runs one
+# at a time), and the slow single checks (the fixed point, the compiler
+# built by asmdump) run in the background from the start. Results are
+# printed in the same order whatever JOBS is.
 set -u
 cd "$(dirname "$0")/.."
 BASTIOC=${BASTIOC:-stage0/target/release/bastioc0}
@@ -47,9 +53,15 @@ BASTIOC=${BASTIOC:-stage0/target/release/bastioc0}
 export BASTIO_LIB="$PWD"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
+export BASTIOC
+pids=()
 for tool in lexdump astdump monodump checkdump smtdump verifydump cdump asmdump bastioc1; do
-  "$BASTIOC" -o "$tmp/$tool" "stage1/$tool.bastio" 2>"$tmp/build.err" || { cat "$tmp/build.err"; exit 1; }
+  "$BASTIOC" -o "$tmp/$tool" "stage1/$tool.bastio" 2>"$tmp/build.$tool.err" &
+  pids+=($!)
 done
+built=1
+for p in "${pids[@]}"; do wait "$p" || built=0; done
+[ $built = 1 ] || { cat "$tmp"/build.*.err; exit 1; }
 # Test programs marked `// stage1-only:` (tests/stage1_only.sh) use what
 # stage0 does not have, so stage0 has no answer to compare with: they stay
 # out of every corpus below. Each must still be one stage0 cannot handle,
@@ -74,25 +86,18 @@ for f in $(grep -l '^// stage1-only:' tests/pass/*.bastio tests/fail/*.bastio te
   fi
 done
 [ "$s1only" = 0 ] || echo "-- stage1-only: $s1only program(s) left out of the comparison"
-compare() {  # phase, stage0 flag, stage1 tool
-  local match=0 differ=0
-  for f in $files; do
-    "$BASTIOC" "$2" "$f" >"$tmp/want" 2>/dev/null
-    "$tmp/$3" "$f" >"$tmp/got" 2>/dev/null
-    if cmp -s "$tmp/want" "$tmp/got"; then
-      match=$((match+1))
-    else
-      differ=$((differ+1))
-      echo "DIFFER $f"
-      diff "$tmp/want" "$tmp/got" | head -5 | cut -c1-300 | sed 's/^/    /'
-    fi
-  done
-  echo "-- $1: $match matched, $differ differ"
-  { [ "$differ" = 0 ] && [ "$match" -gt 0 ]; } || status=1
+
+. tests/pfor.sh
+# want and got in $w: the same, or a difference labelled $1.
+verdict() {
+  if cmp -s "$w/want" "$w/got"; then
+    echo =match
+  else
+    echo =differ
+    echo "$1"
+    diff "$w/want" "$w/got" | head -5 | cut -c1-300 | sed 's/^/    /'
+  fi
 }
-compare lexer --dump-tokens lexdump
-compare parser --dump-ast astdump
-compare mono --dump-mono monodump
 target_of() {
   case "$1" in
     ../bastios/src/*) echo kernel ;;
@@ -100,136 +105,189 @@ target_of() {
     *) echo hosted ;;
   esac
 }
-match=0 differ=0
-for f in $files; do
-  t=$(target_of "$f")
-  "$BASTIOC" --dump-check --target "$t" "$f" >"$tmp/want" 2>/dev/null
-  "$tmp/checkdump" "$t" "$f" >"$tmp/got" 2>/dev/null
-  if cmp -s "$tmp/want" "$tmp/got"; then
-    match=$((match+1))
-  else
-    differ=$((differ+1))
-    echo "DIFFER $f ($t)"
-    diff "$tmp/want" "$tmp/got" | head -5 | cut -c1-300 | sed 's/^/    /'
+# The driver. Everything is compared except what bastioc1 cannot know:
+# the reason a file cannot be read and the solver's own words when it
+# fails (E-SOLVER) come from outside; and bastioc1 names itself.
+mask() {  # stage0's stderr
+  sed -e 's/^\(.*: error\[E-SOLVER\]\): .*$/\1/' \
+      -e 's/^\(.*: error\[E-IMPORT\]: cannot read `[^`]*`\): .*$/\1/' \
+      -e 's/^\(.*: error\[E-PARSE\]: include_bytes: cannot read .*\): [^:]*$/\1/' -e 's/^bastioc0: /bastioc1: /' "$1"
+}
+export -f verdict target_of mask
+
+# The slow checks that are one program each start now, in the background;
+# their results are printed where they belong below. Each one leaves a
+# NAME.ok file when it passes: by the time the script asks, tens of
+# thousands of processes have run, and when one of them gets the PID of
+# a finished check, bash forgets that check's exit status ("wait: pid ...
+# is not a child of this shell").
+bg_ok() {  # pid, name
+  wait "$1" 2>/dev/null
+  [ -f "$tmp/$2.ok" ]
+}
+# asmdump built by the native backend must print the same assembly for itself.
+(
+  "$BASTIOC" --backend native -o "$tmp/asmdump_n" stage1/asmdump.bastio 2>/dev/null \
+    && "$tmp/asmdump_n" --stage0 stage1/asmdump.bastio >"$tmp/bg_n.got" 2>/dev/null \
+    && "$tmp/asmdump" --stage0 stage1/asmdump.bastio >"$tmp/bg_n.want" 2>/dev/null \
+    && cmp -s "$tmp/bg_n.want" "$tmp/bg_n.got" \
+    && touch "$tmp/native.ok"
+) & bg_native=$!
+# asmdump built by itself must print the same assembly for itself.
+(
+  "$tmp/asmdump" stage1/asmdump.bastio >"$tmp/self.s" 2>/dev/null \
+    && as --64 -o "$tmp/self.o" "$tmp/self.s" && cc -o "$tmp/asmdump_s" "$tmp/self.o" \
+    && "$tmp/asmdump_s" stage1/asmdump.bastio >"$tmp/bg_s.got" 2>/dev/null \
+    && cmp -s "$tmp/self.s" "$tmp/bg_s.got" \
+    && touch "$tmp/self.ok"
+) & bg_self=$!
+# bastioc1 built by asmdump (it runs Z3 as a Child) must write the same C
+# for itself as stage0.
+(
+  "$tmp/asmdump" stage1/bastioc1.bastio >"$tmp/b1.s" 2>/dev/null \
+    && as --64 -o "$tmp/b1.o" "$tmp/b1.s" && cc -o "$tmp/bastioc1_n" "$tmp/b1.o" \
+    && "$tmp/bastioc1_n" --emit-c -o "$tmp/b1n.c" stage1/bastioc1.bastio 2>/dev/null \
+    && "$BASTIOC" --emit-c -o "$tmp/b1c.c" stage1/bastioc1.bastio 2>/dev/null \
+    && cmp -s "$tmp/b1c.c" "$tmp/b1n.c" \
+    && touch "$tmp/b1.ok"
+) & bg_b1=$!
+# The fixed point: bastioc1 (built by stage0) builds itself, and that
+# build writes the same C for bastioc1 as stage0 does.
+(
+  "$tmp/bastioc1" -o "$tmp/gen2" stage1/bastioc1.bastio 2>"$tmp/gen2.err" \
+    && "$tmp/gen2" --emit-c -o "$tmp/gen2.c" stage1/bastioc1.bastio 2>>"$tmp/gen2.err" \
+    && "$BASTIOC" --emit-c -o "$tmp/gen1.c" stage1/bastioc1.bastio 2>/dev/null \
+    && cmp -s "$tmp/gen1.c" "$tmp/gen2.c" \
+    && touch "$tmp/fixed.ok"
+) & bg_fixed=$!
+
+dump() {  # stage0 flag, stage1 tool, file
+  "$BASTIOC" "$1" "$3" >"$w/want" 2>/dev/null
+  "$tmp/$2" "$3" >"$w/got" 2>/dev/null
+  verdict "DIFFER $3"
+}
+export -f dump
+compare() {  # phase, stage0 flag, stage1 tool
+  pfor "dump $2 $3" $files || status=1
+  local match differ
+  match=$(n match) differ=$(n differ)
+  echo "-- $1: $match matched, $differ differ"
+  { [ "$differ" = 0 ] && [ "$match" -gt 0 ]; } || status=1
+}
+compare lexer --dump-tokens lexdump
+compare parser --dump-ast astdump
+compare mono --dump-mono monodump
+
+check_one() {
+  local t; t=$(target_of "$1")
+  "$BASTIOC" --dump-check --target "$t" "$1" >"$w/want" 2>/dev/null
+  "$tmp/checkdump" "$t" "$1" >"$w/got" 2>/dev/null
+  verdict "DIFFER $1 ($t)"
+}
+smt_one() {
+  local t; t=$(target_of "$1")
+  if ! "$BASTIOC" --check --dump-smt --target "$t" "$1" >"$w/want" 2>"$w/err"; then
+    echo =skipped
+    return
   fi
-done
+  sed -n 's/.*: \([0-9]*\) proof obligation.*/\1 proof obligation(s)/p' "$w/err" >>"$w/want"
+  "$tmp/smtdump" "$t" "$1" >"$w/got" 2>/dev/null
+  verdict "DIFFER $1 ($t)"
+}
+proof_one() {
+  local t; t=$(target_of "$1")
+  "$BASTIOC" --dump-verify --target "$t" "$1" >"$w/want" 2>/dev/null
+  if ! grep -q -e 'proof obligation' -e '^error [^ ]* E-VERIFY' -e '^error [^ ]* E-SOLVER' -e '^error [^ ]* E-EXPORT' "$w/want"; then
+    echo =skipped
+    return
+  fi
+  grep -q '^error' "$w/want" && echo =failed
+  "$tmp/verifydump" "$t" "$1" >"$w/got" 2>/dev/null
+  verdict "DIFFER $1 ($t)"
+}
+c_one() {
+  local t; t=$(target_of "$1")
+  "$BASTIOC" --dump-c --target "$t" "$1" >"$w/want" 2>/dev/null
+  grep -q '^error' "$w/want" && echo =error
+  "$tmp/cdump" "$t" "$1" >"$w/got" 2>/dev/null
+  verdict "DIFFER $1 ($t)"
+}
+asm_one() {
+  [ "$(target_of "$1")" = hosted ] || return
+  local e ge
+  "$BASTIOC" --backend native --emit-asm -o "$w/want" "$1" 2>/dev/null; e=$?
+  [ "$e" = 0 ] || [ "$e" = 4 ] || return
+  "$tmp/asmdump" --stage0 "$1" >"$w/got" 2>/dev/null; ge=$?
+  if [ "$e" = 4 ] && [ "$ge" = 4 ]; then
+    echo =unsupported; echo =match
+  elif [ "$e" = 0 ] && [ "$ge" = 0 ] && cmp -s "$w/want" "$w/got"; then
+    echo =match
+  else
+    echo =differ
+    echo "DIFFER $1 (native: stage0 exit $e, asmdump exit $ge)"
+    diff "$w/want" "$w/got" | head -5 | cut -c1-300 | sed 's/^/    /'
+  fi
+}
+export -f check_one smt_one proof_one c_one asm_one
+
+pfor check_one $files || status=1
+match=$(n match) differ=$(n differ)
 echo "-- checker: $match matched, $differ differ"
 { [ "$differ" = 0 ] && [ "$match" -gt 0 ]; } || status=1
-match=0 differ=0 skipped=0
-for f in $files; do
-  t=$(target_of "$f")
-  if ! "$BASTIOC" --check --dump-smt --target "$t" "$f" >"$tmp/want" 2>"$tmp/err"; then
-    skipped=$((skipped+1))
-    continue
-  fi
-  sed -n 's/.*: \([0-9]*\) proof obligation.*/\1 proof obligation(s)/p' "$tmp/err" >>"$tmp/want"
-  "$tmp/smtdump" "$t" "$f" >"$tmp/got" 2>/dev/null
-  if cmp -s "$tmp/want" "$tmp/got"; then
-    match=$((match+1))
-  else
-    differ=$((differ+1))
-    echo "DIFFER $f ($t)"
-    diff "$tmp/want" "$tmp/got" | head -5 | cut -c1-300 | sed 's/^/    /'
-  fi
-done
-echo "-- verifier: $match matched, $differ differ ($skipped not verified by stage0)"
+
+pfor smt_one $files || status=1
+match=$(n match) differ=$(n differ)
+echo "-- verifier: $match matched, $differ differ ($(n skipped) not verified by stage0)"
 { [ "$differ" = 0 ] && [ "$match" -gt 0 ]; } || status=1
-match=0 differ=0 skipped=0 failed=0
-for f in $files; do
-  t=$(target_of "$f")
-  "$BASTIOC" --dump-verify --target "$t" "$f" >"$tmp/want" 2>/dev/null
-  if ! grep -q -e 'proof obligation' -e '^error [^ ]* E-VERIFY' -e '^error [^ ]* E-SOLVER' -e '^error [^ ]* E-EXPORT' "$tmp/want"; then
-    skipped=$((skipped+1))
-    continue
-  fi
-  grep -q '^error' "$tmp/want" && failed=$((failed+1))
-  "$tmp/verifydump" "$t" "$f" >"$tmp/got" 2>/dev/null
-  if cmp -s "$tmp/want" "$tmp/got"; then
-    match=$((match+1))
-  else
-    differ=$((differ+1))
-    echo "DIFFER $f ($t)"
-    diff "$tmp/want" "$tmp/got" | head -5 | cut -c1-300 | sed 's/^/    /'
-  fi
-done
-echo "-- proofs: $match matched ($failed of them failed proofs), $differ differ ($skipped not reaching the verifier)"
+
+pfor proof_one $files || status=1
+match=$(n match) differ=$(n differ)
+echo "-- proofs: $match matched ($(n failed) of them failed proofs), $differ differ ($(n skipped) not reaching the verifier)"
 { [ "$differ" = 0 ] && [ "$match" -gt 0 ]; } || status=1
-match=0 differ=0 errors=0
-for f in $files; do
-  t=$(target_of "$f")
-  "$BASTIOC" --dump-c --target "$t" "$f" >"$tmp/want" 2>/dev/null
-  grep -q '^error' "$tmp/want" && errors=$((errors+1))
-  "$tmp/cdump" "$t" "$f" >"$tmp/got" 2>/dev/null
-  if cmp -s "$tmp/want" "$tmp/got"; then
-    match=$((match+1))
-  else
-    differ=$((differ+1))
-    echo "DIFFER $f ($t)"
-    diff "$tmp/want" "$tmp/got" | head -5 | cut -c1-300 | sed 's/^/    /'
-  fi
-done
+
+pfor c_one $files || status=1
+match=$(n match) differ=$(n differ) errors=$(n error)
 echo "-- C: $match matched ($((match-errors)) of them C files), $differ differ"
 { [ "$differ" = 0 ] && [ "$match" -gt "$errors" ]; } || status=1
-match=0 differ=0 unsup=0
-for f in $files; do
-  [ "$(target_of "$f")" = hosted ] || continue
-  "$BASTIOC" --backend native --emit-asm -o "$tmp/want" "$f" 2>/dev/null; e=$?
-  [ "$e" = 0 ] || [ "$e" = 4 ] || continue
-  "$tmp/asmdump" --stage0 "$f" >"$tmp/got" 2>/dev/null; ge=$?
-  if [ "$e" = 4 ] && [ "$ge" = 4 ]; then
-    unsup=$((unsup+1)); match=$((match+1))
-  elif [ "$e" = 0 ] && [ "$ge" = 0 ] && cmp -s "$tmp/want" "$tmp/got"; then
-    match=$((match+1))
-  else
-    differ=$((differ+1))
-    echo "DIFFER $f (native: stage0 exit $e, asmdump exit $ge)"
-    diff "$tmp/want" "$tmp/got" | head -5 | cut -c1-300 | sed 's/^/    /'
-  fi
-done
-if "$BASTIOC" --backend native -o "$tmp/asmdump_n" stage1/asmdump.bastio 2>/dev/null \
-   && "$tmp/asmdump_n" --stage0 stage1/asmdump.bastio >"$tmp/got" 2>/dev/null \
-   && "$tmp/asmdump" --stage0 stage1/asmdump.bastio >"$tmp/want" 2>/dev/null \
-   && cmp -s "$tmp/want" "$tmp/got"; then
+
+pfor asm_one $files || status=1
+match=$(n match) differ=$(n differ) unsup=$(n unsupported)
+if bg_ok $bg_native native; then
   match=$((match+1))
 else
   differ=$((differ+1)); echo "DIFFER asmdump built by the native backend"
 fi
 echo "-- native: $match matched ($unsup of them unsupported, plus asmdump built natively), $differ differ"
 { [ "$differ" = 0 ] && [ "$match" -gt "$unsup" ]; } || status=1
+
 # What only stage1's backend does (asmdump without --stage0) has no
 # oracle: the programs it builds must exit as tests/pass says, and asmdump
 # built that way must print the same assembly for itself.
-built=0 differ=0
-for f in $pass_files; do
-  want=$(sed -n 's|^// expect-exit: *||p' "$f" | head -1)
-  "$tmp/asmdump" "$f" >"$tmp/prog.s" 2>/dev/null; e=$?
-  [ "$e" = 4 ] && continue
-  if [ "$e" = 0 ] && as --64 -o "$tmp/prog.o" "$tmp/prog.s" && cc -o "$tmp/prog" "$tmp/prog.o"; then
-    "$tmp/prog" </dev/null >/dev/null; got=$?
+asm_run() {
+  local want e got
+  want=$(sed -n 's|^// expect-exit: *||p' "$1" | head -1)
+  "$tmp/asmdump" "$1" >"$w/prog.s" 2>/dev/null; e=$?
+  [ "$e" = 4 ] && return
+  if [ "$e" = 0 ] && as --64 -o "$w/prog.o" "$w/prog.s" && cc -o "$w/prog" "$w/prog.o"; then
+    "$w/prog" </dev/null >/dev/null; got=$?
   else
     got="not built"
   fi
   if [ "$got" = "$want" ]; then
-    built=$((built+1))
+    echo =built
   else
-    differ=$((differ+1)); echo "DIFFER $f (built by asmdump: exit $got, want $want)"
+    echo =differ; echo "DIFFER $1 (built by asmdump: exit $got, want $want)"
   fi
-done
-if "$tmp/asmdump" stage1/asmdump.bastio >"$tmp/self.s" 2>/dev/null \
-   && as --64 -o "$tmp/self.o" "$tmp/self.s" && cc -o "$tmp/asmdump_s" "$tmp/self.o" \
-   && "$tmp/asmdump_s" stage1/asmdump.bastio >"$tmp/got" 2>/dev/null \
-   && cmp -s "$tmp/self.s" "$tmp/got"; then
+}
+export -f asm_run
+pfor asm_run $pass_files || status=1
+built=$(n built) differ=$(n differ)
+if bg_ok $bg_self self; then
   built=$((built+1))
 else
   differ=$((differ+1)); echo "DIFFER asmdump built by itself"
 fi
-# bastioc1 built this way (it runs Z3 as a Child) must write the same C
-# for itself as stage0.
-if "$tmp/asmdump" stage1/bastioc1.bastio >"$tmp/b1.s" 2>/dev/null \
-   && as --64 -o "$tmp/b1.o" "$tmp/b1.s" && cc -o "$tmp/bastioc1_n" "$tmp/b1.o" \
-   && "$tmp/bastioc1_n" --emit-c -o "$tmp/b1n.c" stage1/bastioc1.bastio 2>/dev/null \
-   && "$BASTIOC" --emit-c -o "$tmp/b1c.c" stage1/bastioc1.bastio 2>/dev/null \
-   && cmp -s "$tmp/b1c.c" "$tmp/b1n.c"; then
+if bg_ok $bg_b1 b1; then
   built=$((built+1))
 else
   differ=$((differ+1)); echo "DIFFER bastioc1 built by asmdump"
@@ -263,56 +321,92 @@ if [ -f ../bastios/build/user/sh.bin ]; then
 fi
 echo "-- native (stage1 only): $built programs built and run (plus asmdump built by itself, and bastioc1), $users user programs built$kernel, $differ differ"
 { [ "$differ" = 0 ] && [ "$built" -gt 1 ] && [ "$users" -gt 0 ]; } || status=1
-# The driver. Everything is compared except what bastioc1 cannot know:
-# the reason a file cannot be read and the solver's own words when it
-# fails (E-SOLVER) come from outside; and bastioc1 names itself.
-mask() {  # stage0's stderr
-  sed -e 's/^\(.*: error\[E-SOLVER\]\): .*$/\1/' \
-      -e 's/^\(.*: error\[E-IMPORT\]: cannot read `[^`]*`\): .*$/\1/' \
-      -e 's/^\(.*: error\[E-PARSE\]: include_bytes: cannot read .*\): [^:]*$/\1/' -e 's/^bastioc0: /bastioc1: /' "$1"
+
+drv_check() {
+  local t; t=$(target_of "$1")
+  "$BASTIOC" --check --target "$t" "$1" 2>"$w/want.err" >/dev/null; echo "exit $?" >>"$w/want.err"
+  "$tmp/bastioc1" --check --target "$t" "$1" 2>"$w/got" >/dev/null; echo "exit $?" >>"$w/got"
+  grep -q 'error\[' "$w/want.err" && echo =error
+  mask "$w/want.err" >"$w/want"
+  verdict "DIFFER $1 ($t, --check)"
 }
-match=0 differ=0 errors=0
-for f in $files; do
-  t=$(target_of "$f")
-  "$BASTIOC" --check --target "$t" "$f" 2>"$tmp/want.err" >/dev/null; echo "exit $?" >>"$tmp/want.err"
-  "$tmp/bastioc1" --check --target "$t" "$f" 2>"$tmp/got.err" >/dev/null; echo "exit $?" >>"$tmp/got.err"
-  grep -q 'error\[' "$tmp/want.err" && errors=$((errors+1))
-  mask "$tmp/want.err" >"$tmp/want"
-  cp "$tmp/got.err" "$tmp/got"
-  if cmp -s "$tmp/want" "$tmp/got"; then
-    match=$((match+1))
+drv_emitc() {
+  local t
+  case "$1" in tests/user/*) t=user ;; *) t=$(target_of "$1") ;; esac
+  "$BASTIOC" --emit-c --target "$t" -o "$w/want.c" "$1" 2>/dev/null || return
+  echo =cfile
+  if "$tmp/bastioc1" --emit-c --target "$t" -o "$w/got.c" "$1" 2>/dev/null && cmp -s "$w/want.c" "$w/got.c"; then
+    echo =match
   else
-    differ=$((differ+1))
-    echo "DIFFER $f ($t, --check)"
-    diff "$tmp/want" "$tmp/got" | head -5 | cut -c1-300 | sed 's/^/    /'
+    echo =differ; echo "DIFFER $1 ($t, --emit-c)"
   fi
-done
+}
+# The C header of a library with an `export fn`.
+drv_header() {
+  mkdir -p "$w/hw" "$w/hg"
+  "$BASTIOC" --emit-c --header "$w/hw/lib.h" -o "$w/want.c" "$1" 2>/dev/null || return
+  echo =cfile
+  if "$tmp/bastioc1" --emit-c --header "$w/hg/lib.h" -o "$w/got.c" "$1" 2>/dev/null && cmp -s "$w/hw/lib.h" "$w/hg/lib.h"; then
+    echo =match
+  else
+    echo =differ; echo "DIFFER $1 (--header)"
+    diff "$w/hw/lib.h" "$w/hg/lib.h" | head -5 | cut -c1-300 | sed 's/^/    /'
+  fi
+}
+drv_run() {
+  local want got
+  want=$(sed -n 's|^// expect-exit: *||p' "$1" | head -1)
+  if "$tmp/bastioc1" -o "$w/prog" "$1" 2>/dev/null; then
+    "$w/prog" </dev/null >/dev/null; got=$?
+  else
+    got=rejected
+  fi
+  if [ "$got" = "$want" ]; then
+    echo =built; echo =match
+  else
+    echo =differ; echo "DIFFER $1 (built by bastioc1: exit $got, want $want)"
+  fi
+}
+# `--backend native`: the same stderr and exit status as bastioc0 (an
+# unsupported program exits 4 with the same reason), except that stage1's
+# backend may build what stage0's does not support, or stop at something
+# later; what it builds must exit as tests/pass says.
+drv_native() {
+  local e0 e ok want got
+  "$BASTIOC" --backend native -o "$w/nwant" "$1" 2>"$w/want.err" >/dev/null; e0=$?; echo "exit $e0" >>"$w/want.err"
+  "$tmp/bastioc1" --backend native -o "$w/ngot" "$1" 2>"$w/got.err" >/dev/null; e=$?; echo "exit $e" >>"$w/got.err"
+  mask "$w/want.err" >"$w/want"
+  ok=1
+  # Both unsupported: stage1's backend supports more, so it may stop at a
+  # later construct than stage0's, with its own reason.
+  [ "$e0" = 4 ] && { [ "$e" = 0 ] || { [ "$e" = 4 ] && grep -q '^bastioc1: the native backend does not support ' "$w/got.err"; }; } \
+    || cmp -s "$w/want" "$w/got.err" || ok=0
+  if [ $ok = 1 ] && [ "$e" = 0 ]; then
+    want=$(sed -n 's|^// expect-exit: *||p' "$1" | head -1)
+    "$w/ngot" </dev/null >/dev/null; got=$?
+    if [ "$got" = "$want" ]; then echo =nbuilt; else ok=0; fi
+  fi
+  if [ $ok = 1 ]; then
+    echo =match
+  else
+    echo =differ
+    echo "DIFFER $1 (--backend native)"
+    diff "$w/want" "$w/got.err" | head -5 | cut -c1-300 | sed 's/^/    /'
+  fi
+}
+export -f drv_check drv_emitc drv_header drv_run drv_native
+
+pfor drv_check $files || status=1
+match=$(n match) differ=$(n differ) errors=$(n error)
 cfiles=0
+cfs=()
 for f in $pass_files $user_files ../bastios/src/main.bastio ../bastios/user/*.bastio; do
-  [ -f "$f" ] || continue
-  case "$f" in tests/user/*) t=user ;; *) t=$(target_of "$f") ;; esac
-  "$BASTIOC" --emit-c --target "$t" -o "$tmp/want.c" "$f" 2>/dev/null || continue
-  cfiles=$((cfiles+1))
-  if "$tmp/bastioc1" --emit-c --target "$t" -o "$tmp/got.c" "$f" 2>/dev/null && cmp -s "$tmp/want.c" "$tmp/got.c"; then
-    match=$((match+1))
-  else
-    differ=$((differ+1))
-    echo "DIFFER $f ($t, --emit-c)"
-  fi
+  [ -f "$f" ] && cfs+=("$f")
 done
-# The C header of every library with an `export fn`, and the trusted base.
-mkdir -p "$tmp/hw" "$tmp/hg"
-for f in $(grep -l '^export fn' $pass_files examples/*/*.bastio); do
-  "$BASTIOC" --emit-c --header "$tmp/hw/lib.h" -o "$tmp/want.c" "$f" 2>/dev/null || continue
-  cfiles=$((cfiles+1))
-  if "$tmp/bastioc1" --emit-c --header "$tmp/hg/lib.h" -o "$tmp/got.c" "$f" 2>/dev/null && cmp -s "$tmp/hw/lib.h" "$tmp/hg/lib.h"; then
-    match=$((match+1))
-  else
-    differ=$((differ+1))
-    echo "DIFFER $f (--header)"
-    diff "$tmp/hw/lib.h" "$tmp/hg/lib.h" | head -5 | cut -c1-300 | sed 's/^/    /'
-  fi
-done
+pfor drv_emitc "${cfs[@]}" || status=1
+match=$((match + $(n match))) differ=$((differ + $(n differ))) cfiles=$((cfiles + $(n cfile)))
+pfor drv_header $(grep -l '^export fn' $pass_files examples/*/*.bastio) || status=1
+match=$((match + $(n match))) differ=$((differ + $(n differ))) cfiles=$((cfiles + $(n cfile)))
 # `--lib`: a program outside the repository, without and with it.
 mkdir -p "$tmp/away"
 printf 'import "core/option.bastio";\nfn main() -> u64 { return opt_or[u64](Option[u64]::Some(7), 0); }\n' >"$tmp/away/prog.bastio"
@@ -355,48 +449,10 @@ else
   differ=$((differ+1))
   echo "DIFFER --trusted-base"
 fi
-built=0
-for f in $pass_files; do
-  want=$(sed -n 's|^// expect-exit: *||p' "$f" | head -1)
-  if "$tmp/bastioc1" -o "$tmp/prog" "$f" 2>/dev/null; then
-    "$tmp/prog" </dev/null >/dev/null; got=$?
-  else
-    got=rejected
-  fi
-  if [ "$got" = "$want" ]; then
-    built=$((built+1)); match=$((match+1))
-  else
-    differ=$((differ+1))
-    echo "DIFFER $f (built by bastioc1: exit $got, want $want)"
-  fi
-done
-# `--backend native`: the same stderr and exit status as bastioc0 (an
-# unsupported program exits 4 with the same reason), except that stage1's
-# backend may build what stage0's does not support, or stop at something
-# later; what it builds must exit as tests/pass says.
-nbuilt=0
-for f in $pass_files; do
-  "$BASTIOC" --backend native -o "$tmp/nwant" "$f" 2>"$tmp/want.err" >/dev/null; e0=$?; echo "exit $e0" >>"$tmp/want.err"
-  "$tmp/bastioc1" --backend native -o "$tmp/ngot" "$f" 2>"$tmp/got.err" >/dev/null; e=$?; echo "exit $e" >>"$tmp/got.err"
-  mask "$tmp/want.err" >"$tmp/want"
-  ok=1
-  # Both unsupported: stage1's backend supports more, so it may stop at a
-  # later construct than stage0's, with its own reason.
-  [ "$e0" = 4 ] && { [ "$e" = 0 ] || { [ "$e" = 4 ] && grep -q '^bastioc1: the native backend does not support ' "$tmp/got.err"; }; } \
-    || cmp -s "$tmp/want" "$tmp/got.err" || ok=0
-  if [ $ok = 1 ] && [ "$e" = 0 ]; then
-    want=$(sed -n 's|^// expect-exit: *||p' "$f" | head -1)
-    "$tmp/ngot" </dev/null >/dev/null; got=$?
-    if [ "$got" = "$want" ]; then nbuilt=$((nbuilt+1)); else ok=0; fi
-  fi
-  if [ $ok = 1 ]; then
-    match=$((match+1))
-  else
-    differ=$((differ+1))
-    echo "DIFFER $f (--backend native)"
-    diff "$tmp/want" "$tmp/got.err" | head -5 | cut -c1-300 | sed 's/^/    /'
-  fi
-done
+pfor drv_run $pass_files || status=1
+match=$((match + $(n match))) differ=$((differ + $(n differ))) built=$(n built)
+pfor drv_native $pass_files || status=1
+match=$((match + $(n match))) differ=$((differ + $(n differ))) nbuilt=$(n nbuilt)
 # `--backend native --target user` (stage0 has no such backend): the
 # assembly asmdump --user writes, which links with no C library.
 nuser=0
@@ -424,16 +480,12 @@ if [ -f ../bastios/build/user/sh.bin ] \
 fi
 echo "-- driver: $match matched ($errors rejected, $cfiles C files, $built programs built and run, $nbuilt built natively and run, $nuser BastiOS programs built natively), $differ differ"
 { [ "$differ" = 0 ] && [ "$built" -gt 0 ] && [ "$nbuilt" -gt 0 ] && [ "$nuser" -gt 0 ]; } || status=1
-# The fixed point: bastioc1 (built by stage0) builds itself, and that
-# build writes the same C for bastioc1 as stage0 does.
-if "$tmp/bastioc1" -o "$tmp/gen2" stage1/bastioc1.bastio 2>"$tmp/gen2.err" \
-   && "$tmp/gen2" --emit-c -o "$tmp/gen2.c" stage1/bastioc1.bastio 2>>"$tmp/gen2.err" \
-   && "$BASTIOC" --emit-c -o "$tmp/gen1.c" stage1/bastioc1.bastio 2>/dev/null \
-   && cmp -s "$tmp/gen1.c" "$tmp/gen2.c"; then
+if bg_ok $bg_fixed fixed; then
   echo "-- fixed point: bastioc1 built by itself writes the same C for itself as stage0 ($(wc -l <"$tmp/gen1.c") lines)"
 else
   echo "-- fixed point: FAILED"; sed 's/^/    /' "$tmp/gen2.err" | head -10; status=1
 fi
+# The mutants (stage1/mutate.py runs JOBS of them at a time).
 python3 stage1/mutate.py "$BASTIOC" --dump-ast "$tmp/astdump" 1 ${MUTANTS:-5} $files || status=1
 python3 stage1/mutate.py "$BASTIOC" --dump-mono "$tmp/monodump" 2 ${MUTANTS:-5} $files || status=1
 for t in hosted kernel user; do

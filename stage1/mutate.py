@@ -22,7 +22,7 @@
 # --driver (TOOL is bastioc1 and FLAG `--check ..`), what both print on
 # stderr and their exit status are compared, masked as difftest.sh masks
 # them (the parts bastioc1 does not print yet).
-import os, random, re, subprocess, sys
+import concurrent.futures, os, queue, random, re, shutil, subprocess, sys
 
 args = sys.argv[1:]
 via = None
@@ -78,55 +78,100 @@ def mutate(src):
         return bytes(s)
     return b' '.join(w)
 
-runs = differ = errors = unverified = 0
-codes = {}
+# Every mutant is drawn first, in order, so the random sequence (and with
+# it the set of mutants) does not depend on how many run at once. They then
+# run JOBS at a time (default: the number of CPUs). A mutant is written to a
+# file of its own: next to its original, or with --via into a private copy
+# of the original's directory, made next to it (`.mutant_N_DIR`), so that
+# imports resolve as they do from the original and the original is never
+# touched.
+mutants = []
 for f in args[5:]:
     src = open(f, 'rb').read()
-    path = os.path.join(os.path.dirname(f), '.mutant_' + os.path.basename(f))
     for _ in range(per_file):
         m = mutate(src)
         try:
             m.decode('utf-8')
         except UnicodeDecodeError:
             continue
-        target = via or path
-        open(f if via else path, 'wb').write(m)
-        try:
-            w = subprocess.run([bastioc] + flag.split() + [target], capture_output=True)
-            want = w.stdout
-            if smt:
-                n = re.search(rb': (\d+) proof obligation', w.stderr)
-                if w.returncode != 0 or not n:
-                    unverified += 1
-                    continue
-                want += n.group(1) + b' proof obligation(s)\n'
-            if verify and not re.search(rb'proof obligation|^error \S+ E-(VERIFY|SOLVER|EXPORT)', want, re.M):
-                unverified += 1
-                continue
-            if driver:
-                g = subprocess.run(tool.split() + flag.split() + [target], capture_output=True)
-                got = g.stderr + b'exit %d\n' % g.returncode
-                want = mask(w.stderr + b'exit %d\n' % w.returncode)
-            else:
-                got = subprocess.run(tool.split() + [target], capture_output=True).stdout
-        finally:
-            if via:
-                open(f, 'wb').write(src)
-            else:
-                os.remove(path)
-        runs += 1
-        err = [l for l in want.split(b'\n') if l.startswith(b'error ')]
+        mutants.append((f, m))
+
+jobs = max(1, int(os.environ.get('JOBS') or os.cpu_count() or 1))
+copies = queue.Queue()
+made = []
+if via:
+    d = os.path.dirname(via) or '.'
+    if any(os.path.dirname(f) != os.path.dirname(via) for f, _ in mutants):
+        sys.exit('mutate.py: with --via, every FILE must be in the directory of DRIVER')
+    for k in range(jobs):
+        c = os.path.join(os.path.dirname(os.path.abspath(d)), '.mutant_%d_%d_%s' % (os.getpid(), k, os.path.basename(os.path.abspath(d))))
+        shutil.rmtree(c, ignore_errors=True)
+        shutil.copytree(d, c, symlinks=True)
+        made.append(c)
+        copies.put(c)
+
+def run(i):
+    f, m = mutants[i]
+    if via:
+        c = copies.get()
+        rel = os.path.relpath(c)
+        path = os.path.join(rel, os.path.basename(f))
+        target = os.path.join(rel, os.path.basename(via))
+    else:
+        path = os.path.join(os.path.dirname(f), '.mutant_%d_%s' % (i, os.path.basename(f)))
+        target = path
+    open(path, 'wb').write(m)
+    try:
+        w = subprocess.run([bastioc] + flag.split() + [target], capture_output=True)
+        want = w.stdout
+        if smt:
+            n = re.search(rb': (\d+) proof obligation', w.stderr)
+            if w.returncode != 0 or not n:
+                return None
+            want += n.group(1) + b' proof obligation(s)\n'
+        if verify and not re.search(rb'proof obligation|^error \S+ E-(VERIFY|SOLVER|EXPORT)', want, re.M):
+            return None
         if driver:
-            err = [re.search(rb'error\[([A-Z-]*)\]', l) for l in want.split(b'\n')]
-            err = [b'error x ' + e.group(1) for e in err if e]
-        if err:
-            errors += 1
-            for code in err[0].split()[2:3]:
-                codes[code.decode()] = codes.get(code.decode(), 0) + 1
-        if want != got:
-            differ += 1
-            print('DIFFER: a mutant of %s (%s):' % (f, flag))
-            print('    ' + m.decode('utf-8', 'replace').replace('\n', '\n    ')[:3000])
+            g = subprocess.run(tool.split() + flag.split() + [target], capture_output=True)
+            got = g.stderr + b'exit %d\n' % g.returncode
+            want = mask(w.stderr + b'exit %d\n' % w.returncode)
+        else:
+            got = subprocess.run(tool.split() + [target], capture_output=True).stdout
+    finally:
+        if via:
+            shutil.copyfile(f, path)
+            copies.put(c)
+        else:
+            os.remove(path)
+    return want, got
+
+try:
+    with concurrent.futures.ThreadPoolExecutor(jobs) as pool:
+        results = list(pool.map(run, range(len(mutants))))
+finally:
+    for c in made:
+        shutil.rmtree(c, ignore_errors=True)
+
+runs = differ = errors = unverified = 0
+codes = {}
+for (f, m), r in zip(mutants, results):
+    if r is None:
+        unverified += 1
+        continue
+    want, got = r
+    runs += 1
+    err = [l for l in want.split(b'\n') if l.startswith(b'error ')]
+    if driver:
+        err = [re.search(rb'error\[([A-Z-]*)\]', l) for l in want.split(b'\n')]
+        err = [b'error x ' + e.group(1) for e in err if e]
+    if err:
+        errors += 1
+        for code in err[0].split()[2:3]:
+            codes[code.decode()] = codes.get(code.decode(), 0) + 1
+    if want != got:
+        differ += 1
+        print('DIFFER: a mutant of %s (%s):' % (f, flag))
+        print('    ' + m.decode('utf-8', 'replace').replace('\n', '\n    ')[:3000])
 tally = ''.join(', %d %s' % (n, c) for c, n in sorted(codes.items()))
 if smt:
     tally += ', %d not verified by stage0 (skipped)' % unverified

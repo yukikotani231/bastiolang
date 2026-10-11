@@ -18,3 +18,21 @@ stage0_compiler=
 if "$BASTIOC" --no-such-option 2>&1 | grep -q '^bastioc0:'; then
   stage0_compiler=1
 fi
+
+# The files of "$@" to test: all of them, or when BASTIOC is stage0, those
+# not marked stage1-only.
+s1files() {
+  local f
+  for f in "$@"; do
+    [ -n "$stage0_compiler" ] && stage1_only "$f" || echo "$f"
+  done
+}
+
+# How many of "$@" s1files leaves out.
+s1left() {
+  local f n=0
+  for f in "$@"; do
+    [ -n "$stage0_compiler" ] && stage1_only "$f" && n=$((n+1))
+  done
+  echo $n
+}

@@ -36,27 +36,29 @@ if [ "${1:-}" = --stage1 ]; then
   exit
 fi
 BASTIOC=${BASTIOC:-$(tests/bastioc1.sh)} || exit 1
+. tests/pfor.sh
 . tests/stage1_only.sh
-pass=0; fail=0; skip=0
-for f in tests/pass/*.bastio bench/*.bastio; do
-  if [ -n "$stage0_compiler" ] && stage1_only "$f"; then
-    echo "skip $f: stage1-only, and BASTIOC is stage0"; skip=$((skip+1)); continue
+export BASTIOC
+# One program, built by both backends; JOBS of them at a time.
+both() {
+  local f=$1 cs xs
+  if ! "$BASTIOC" -o "$w/c.exe" "$f" 2>/dev/null; then
+    echo "FAIL $f: the C backend rejected it"; echo =fail; return
   fi
-  n=$(basename "$f" .bastio)
-  [ "${f#bench/}" != "$f" ] && n="bench_$n"
-  if ! "$BASTIOC" -o "$tmp/$n.c.exe" "$f" 2>/dev/null; then
-    echo "FAIL $f: the C backend rejected it"; fail=$((fail+1)); continue
+  "$BASTIOC" --backend native -o "$w/x.exe" "$f" 2>"$w/err"; rc=$?
+  if [ $rc = 4 ]; then echo "skip $f: $(grep -o 'does not support.*' "$w/err" | head -1)"; echo =skip; return; fi
+  if [ $rc != 0 ]; then echo "FAIL $f: native build failed"; sed 's/^/    /' "$w/err" | head -20; echo =fail; return; fi
+  "$w/c.exe" </dev/null >"$w/c.out" 2>/dev/null; cs=$?
+  "$w/x.exe" </dev/null >"$w/x.out" 2>/dev/null; xs=$?
+  if [ $cs != $xs ]; then echo "FAIL $f: exit $xs, C backend $cs"; echo =fail; return; fi
+  if ! cmp -s "$w/c.out" "$w/x.out"; then
+    echo "FAIL $f: output differs from the C backend"; diff "$w/c.out" "$w/x.out" | head -10 | sed 's/^/    /'; echo =fail; return
   fi
-  "$BASTIOC" --backend native -o "$tmp/$n.x.exe" "$f" 2>"$tmp/$n.err"; rc=$?
-  if [ $rc = 4 ]; then echo "skip $f: $(grep -o 'does not support.*' "$tmp/$n.err" | head -1)"; skip=$((skip+1)); continue; fi
-  if [ $rc != 0 ]; then echo "FAIL $f: native build failed"; sed 's/^/    /' "$tmp/$n.err" | head -20; fail=$((fail+1)); continue; fi
-  "$tmp/$n.c.exe" </dev/null >"$tmp/$n.c.out" 2>/dev/null; cs=$?
-  "$tmp/$n.x.exe" </dev/null >"$tmp/$n.x.out" 2>/dev/null; xs=$?
-  if [ $cs != $xs ]; then echo "FAIL $f: exit $xs, C backend $cs"; fail=$((fail+1)); continue; fi
-  if ! cmp -s "$tmp/$n.c.out" "$tmp/$n.x.out"; then
-    echo "FAIL $f: output differs from the C backend"; diff "$tmp/$n.c.out" "$tmp/$n.x.out" | head -10 | sed 's/^/    /'; fail=$((fail+1)); continue
-  fi
-  pass=$((pass+1))
-done
+  echo =pass
+}
+export -f both
+lost=0
+pfor both $(s1files tests/pass/*.bastio bench/*.bastio) || lost=1
+pass=$(n pass) skip=$(n skip) fail=$(($(n fail) + lost))
 echo "native: $pass same as the C backend, $skip skipped (unsupported), $fail failed"
 [ $fail = 0 ]
