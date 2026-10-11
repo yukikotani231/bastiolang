@@ -1458,7 +1458,14 @@ fn x86_acc_call(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst
       } else {
         x86_set_alias(&mut g, pid, 0);
         x86_declare(&mut g, pid);
-        if kind_t(m, pt) == TY_MUTREF {
+        let byaddr = kind_t(m, pt) == TY_MUTREF || x86_byaddr(&mut g, c, m, p, pt);
+        if !g.stage0 && byaddr && an.kind != E_MUTBORROW {
+          // stage1: an address that the body only reads, as for a
+          // parameter of the function itself (`x86_assign_regs`).
+          let mut nm = x86_name_at(g, pid);
+          nm.size = 1;
+          x86_name_set(&mut g, pid, nm);
+        } else if kind_t(m, pt) == TY_MUTREF {
           x86_set_bad(&mut g, pid);
         } else {
           x86_bind(&mut g, m, pid, pt);
@@ -3777,9 +3784,15 @@ fn x86_bind_params(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, i
     }
     if st.k == 0 {
       if kind_t(m, pt) == TY_MUTREF || x86_byaddr(&mut g, c, m, p, pt) {
-        let o = x86_slot(&mut g, 1);
-        x86_pop_to(&mut g, x86_mem_loc(XR_RBP, o, 0), 1);
-        st = x86_st(XS_PTR, o, 0, 0, 0);
+        let r = x86_preg_for(&mut g, pid);
+        if r != 0 {
+          x86_pop(&mut g, x86_reg(r));
+          st = x86_st(XS_PREG, 0, r, 0, 0);
+        } else {
+          let o = x86_slot(&mut g, 1);
+          x86_pop_to(&mut g, x86_mem_loc(XR_RBP, o, 0), 1);
+          st = x86_st(XS_PTR, o, 0, 0, 0);
+        }
       } else {
         let r = x86_reg_for(&mut g, m, pid, pt);
         if r != 0 {
@@ -5598,8 +5611,16 @@ fn x86_peephole(code: &Vec[u64], out: &mut Vec[u64], opt: bool) {
   // copies folded.
   let mut mid = vec_new[u64]();
   x86_peep_pairs(code, &mut mid, true);
-  x86_peep_acc(mid, &mut out);
+  let mut mid2 = vec_new[u64]();
+  x86_peep_acc(mid, &mut mid2);
+  // Again: the accumulator rules leave %rax alone in more places, so
+  // more pushes and pops pair up.
+  let mut mid3 = vec_new[u64]();
+  x86_peep_pairs(mid2, &mut mid3, true);
+  x86_peep_acc(mid3, &mut out);
   vec_free(mid);
+  vec_free(mid2);
+  vec_free(mid3);
 }
 
 /// The start of every line of `code`.
