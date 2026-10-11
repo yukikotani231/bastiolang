@@ -112,7 +112,7 @@ struct SumRow { x: u64, j: u64, rel: u64, keep: bool }
 /// A proof obligation: its node, code (VC_*), instance and the variables
 /// in scope (snaps[env .. env + n]); what a failure says is
 /// mpool[ms .. ms + ml].
-struct Obl { at: u64, code: u64, x: u64, env: u64, n: u64, ms: u64, ml: u64 }
+struct Obl { at: u64, code: u64, x: u64, env: u64, n: u64, ms: u64, ml: u64, ns: u64, nl: u64 }
 
 // Error codes of failed proofs.
 const VC_ALLOC: u64 = 1;
@@ -165,7 +165,8 @@ fn vc_name(code: u64) -> Str {
 struct VState { pc: Vec[u64], env: Vec[Bind], live: bool }
 
 struct Vr {
-  pool: Vec[u64],
+  /// The text of every atom, one byte per character.
+  pool: Vec[u8],
   tms: Vec[Tm],
   targs: Vec[u64],
   vals: Vec[Vl],
@@ -228,6 +229,11 @@ struct Vr {
   t_k: u64,
   t_255: u64,
   unit: u64,
+  /// What resets the solver between functions (see `verify_nth`).
+  t_reset: u64,
+  t_models: u64,
+  t_rlimit: u64,
+  t_timeout: u64,
   ty_bytes: u64,
   ty_child: u64,
   ty_frame: u64,
@@ -243,6 +249,9 @@ struct Vr {
   /// (filled in before `prove`), and every obligation's sentence.
   msg: Vec[u64],
   mpool: Vec[u64],
+  /// Where the next obligation's contract is written, said in a note if
+  /// it fails (filled in before `prove`, like `msg`).
+  wnote: Vec[u64],
   /// The type arguments of the instance whose source the sentences quote
   /// (see `rd_sub`): stage0 quotes the copy made for the instance.
   tsub: Vec[u64]
@@ -254,14 +263,14 @@ fn vr_new(m: &mut Mono, p: &Parser) -> Vr {
   let mut vals = vec_new[Vl]();
   vec_push(&mut vals, Vl { kind: 0, ty: 0, a: 0, b: 0, c: 0, n: 0, d: 0, e: 0 });
   let mut v = Vr {
-    pool: vec_new[u64](), tms: tms, targs: vec_new[u64](), vals: vals, kids: vec_new[u64](),
+    pool: vec_new[u8](), tms: tms, targs: vec_new[u64](), vals: vals, kids: vec_new[u64](),
     log: vec_new[Cmd](), counter: 0, obligations: 0, box_depth: 0, cur: 0, env: 0, cnt_fns: vec_new[u64](), counts: false, dec_fns: vec_new[u64](), hex_fns: vec_new[u64](), bit_fns: vec_new[u64](), bits: false, cap_fns: vec_new[u64](), caps: false, tys: vec_new[Bind](), file: 0,
     sums: vec_new[SumRow](), obls: vec_new[Obl](), snaps: vec_new[Bind](), sum_start: vec_new[u64](), sum_n: vec_new[u64](),
     t_true: 0, t_false: 0, t_zero: 0, t_u64max: 0, t_allocmax: 0, t_flimit: 0, t_plimit: 0, t_mmio_lo: 0, t_mmio_hi: 0, t_poolsize: 0,
-    t_zarr: 0, t_nobool: 0, t_k: 0, t_255: 0, unit: 0,
+    t_zarr: 0, t_nobool: 0, t_k: 0, t_255: 0, unit: 0, t_reset: 0, t_models: 0, t_rlimit: 0, t_timeout: 0,
     ty_bytes: prim(&mut m, p, TY_BYTES), ty_child: prim(&mut m, p, TY_CHILD), ty_frame: prim(&mut m, p, TY_FRAME),
     ty_pt: prim(&mut m, p, TY_PT), ty_pool: prim(&mut m, p, TY_POOL), fail_at: 0, fail_code: 0,
-    fail_obl: 0, msg: vec_new[u64](), mpool: vec_new[u64](), tsub: vec_new[u64]()
+    fail_obl: 0, msg: vec_new[u64](), mpool: vec_new[u64](), wnote: vec_new[u64](), tsub: vec_new[u64]()
   };
   v.t_true = atom_str(&mut v, "true");
   v.t_false = atom_str(&mut v, "false");
@@ -301,6 +310,7 @@ fn vr_free(v: Vr) {
   vec_free(v.snaps);
   vec_free(v.msg);
   vec_free(v.mpool);
+  vec_free(v.wnote);
   vec_free(v.tsub);
 }
 
@@ -316,7 +326,18 @@ fn vadd(a: u64, b: u64) -> u64 {
 // ---- Text ----
 
 fn pool_at(v: &Vr, i: u64) -> u64 {
-  return u_at(v.pool, i);
+  if i < vec_len(v.pool) {
+    return cast[u64](vec_get(v.pool, i));
+  }
+  return 0;
+}
+
+/// Byte `i` of the pool (0 past its end).
+fn pool_byte(v: &Vr, i: u64) -> u8 {
+  if i < vec_len(v.pool) {
+    return vec_get(v.pool, i);
+  }
+  return 0;
 }
 
 fn push_str(v: &mut Vr, s: Str) {
@@ -324,7 +345,7 @@ fn push_str(v: &mut Vr, s: Str) {
   while k < slen(s)
     invariant k <= slen(s)
   {
-    vec_push(&mut v.pool, cast[u64](sget(s, k)));
+    vec_push(&mut v.pool, sget(s, k));
     k = k + 1;
   }
 }
@@ -335,7 +356,7 @@ fn push_src(v: &mut Vr, p: &Parser, s: u64, e: u64) {
     while k < e
       invariant k <= e && e <= blen(p.src)
     {
-      vec_push(&mut v.pool, cast[u64](bget(p.src, k)));
+      vec_push(&mut v.pool, bget(p.src, k));
       k = k + 1;
     }
   }
@@ -346,25 +367,27 @@ fn push_text(v: &mut Vr, a: u64) {
   let t = tm_at(v, a);
   let mut k = 0;
   while k < t.b {
-    let ch = pool_at(v, vadd(t.a, k));
+    let ch = pool_byte(v, vadd(t.a, k));
     vec_push(&mut v.pool, ch);
     k = k + 1;
   }
 }
 
 fn push_num(v: &mut Vr, x: u64) {
-  let mut d = vec_new[u64]();
+  let mut d = vec_new[u8]();
   let mut y = x;
-  vec_push(&mut d, 48 + y % 10);
+  vec_push(&mut d, cast[u8](48 + y % 10));
   y = y / 10;
   while y > 0 {
-    vec_push(&mut d, 48 + y % 10);
+    vec_push(&mut d, cast[u8](48 + y % 10));
     y = y / 10;
   }
   let mut k = vec_len(d);
-  while k > 0 {
+  while k > 0
+    invariant k <= vlen(d)
+  {
     k = k - 1;
-    vec_push(&mut v.pool, u_at(d, k));
+    vec_push(&mut v.pool, vec_get(d, k));
   }
   vec_free(d);
 }
@@ -1072,7 +1095,7 @@ fn pow2_num(v: &mut Vr, k: u64) -> u64 {
   let mut n = vec_len(d);
   while n > 0 {
     n = n - 1;
-    vec_push(&mut v.pool, 48 + u_at(d, n) % 10);
+    vec_push(&mut v.pool, cast[u8](48 + u_at(d, n) % 10));
   }
   vec_free(d);
   return seal(&mut v, start);
@@ -1389,7 +1412,7 @@ fn fresh_name(v: &mut Vr, hint: u64) -> u64 {
   let h = tm_at(v, hint);
   let mut k = 0;
   while k < h.b {
-    let ch = pool_at(v, vadd(h.a, k));
+    let ch = pool_byte(v, vadd(h.a, k));
     if (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) {
       vec_push(&mut v.pool, ch);
     } else {
@@ -2773,6 +2796,46 @@ fn vm_text(v: &mut Vr, t: u64) {
   }
 }
 
+/// "`f` requires it on line N" for precondition `r` of `f` (the text of
+/// term `nm`, or else the name of node `nmi`), checked at node `loc`:
+/// only when both are in one file, as stage0's `requires_where` says.
+fn wn_requires(v: &mut Vr, p: &Parser, nm: u64, nmi: u64, r: u64, loc: u64) {
+  let rn = node_at(p.nodes, r);
+  let ln = node_at(p.nodes, loc);
+  if rn.file == ln.file {
+    rd_s(&mut v.wnote, "`");
+    if nm != 0 {
+      let tm = tm_at(v, nm);
+      let mut k = 0;
+      while k < tm.b {
+        let ch = pool_at(v, vadd(tm.a, k));
+        vec_push(&mut v.wnote, ch);
+        k = k + 1;
+      }
+    } else {
+      let n = node_at(p.nodes, nmi);
+      rd_src(&mut v.wnote, p, n.s, n.e);
+    }
+    rd_s(&mut v.wnote, "` requires it on line ");
+    rd_num(&mut v.wnote, rn.line);
+  }
+}
+
+/// "`f` promises it on line N" for postcondition `e` of `f` (term `nm`).
+fn wn_ensures(v: &mut Vr, p: &Parser, nm: u64, e: u64) {
+  let en = node_at(p.nodes, e);
+  rd_s(&mut v.wnote, "`");
+  let tm = tm_at(v, nm);
+  let mut k = 0;
+  while k < tm.b {
+    let ch = pool_at(v, vadd(tm.a, k));
+    vec_push(&mut v.wnote, ch);
+    k = k + 1;
+  }
+  rd_s(&mut v.wnote, "` promises it on line ");
+  rd_num(&mut v.wnote, en.line);
+}
+
 /// "that `a` is empty: ..." for a page table freed.
 fn vm_pt_empty(v: &mut Vr, p: &Parser, a: u64) {
   vm_s(&mut v, "that `");
@@ -2877,7 +2940,17 @@ fn prove(v: &mut Vr, st: &VState, goal: u64, loc: u64, code: u64) {
     }
   }
   let ml = vlen_since(v.mpool, ms);
-  vec_push(&mut v.obls, Obl { at: loc, code: code, x: v.env, env: start, n: vec_len(st.env), ms: ms, ml: ml });
+  let ns = vec_len(v.mpool);
+  k = 0;
+  while k < vec_len(v.wnote) {
+    vec_push(&mut v.mpool, u_at(v.wnote, k));
+    k = k + 1;
+  }
+  while vec_len(v.wnote) > 0 {
+    vec_pop(&mut v.wnote);
+  }
+  let nl = vlen_since(v.mpool, ns);
+  vec_push(&mut v.obls, Obl { at: loc, code: code, x: v.env, env: start, n: vec_len(st.env), ms: ms, ml: ml, ns: ns, nl: nl });
   send(&mut v, CMD_PUSH, 0, 0);
   k = 0;
   while k < vec_len(st.pc) {
@@ -4361,6 +4434,7 @@ fn vsmp_run(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut 
       vm_s(&mut v, "` of `");
       vm_name(&mut v, p, a0);
       vm_s(&mut v, "` on the other processors, which start with the kernel's own tables");
+      wn_requires(&mut v, p, 0, a0, r, i);
       prove(&mut v, st, t, i, VC_REQUIRES);
       r = next_of(p, r);
     }
@@ -4404,6 +4478,7 @@ fn vuser_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64, loc: u6
     vm_s(&mut v, "` of `");
     vm_text(&mut v, nm);
     vm_s(&mut v, "`");
+    wn_requires(&mut v, p, nm, 0, r, loc);
     prove(&mut v, st, t, loc, VC_REQUIRES);
     r = next_of(p, r);
   }
@@ -6582,6 +6657,7 @@ fn check_ensures(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, st: &VState,
     vm_s(&mut v, "` of `");
     vm_text(&mut v, nm);
     vm_s(&mut v, "` at this return");
+    wn_ensures(&mut v, p, nm, e);
     prove(&mut v, st, t, loc, VC_ENSURES);
 
     e = next_of(p, e);
@@ -6719,7 +6795,7 @@ fn buffers_kept(v: &mut Vr, m: &mut Mono, p: &Parser, x: u64) {
         rd_src(&mut v.mpool, p, d.s, d.e);
         rd_s(&mut v.mpool, "` may free or replace it");
         let ml = vlen_since(v.mpool, ms);
-        vec_push(&mut v.obls, Obl { at: q, code: VC_EXPORT, x: x, env: 0, n: 0, ms: ms, ml: ml });
+        vec_push(&mut v.obls, Obl { at: q, code: VC_EXPORT, x: x, env: 0, n: 0, ms: ms, ml: ml, ns: 0, nl: 0 });
         send(&mut v, CMD_FAIL, 0, 0);
         done = true;
       }
@@ -6729,7 +6805,9 @@ fn buffers_kept(v: &mut Vr, m: &mut Mono, p: &Parser, x: u64) {
   }
 }
 
-fn verify_program(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
+/// What comes before the first function: the summaries, and the solver
+/// preamble.
+fn verify_begin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
   summarize(&mut v, c, &mut m, p);
   count_gate(m, p, "vcount", &mut v.cnt_fns);
   count_gate(m, p, "bdec", &mut v.dec_fns);
@@ -6738,23 +6816,26 @@ fn verify_program(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
   count_gate(m, p, "vcap", &mut v.cap_fns);
   count_gate(m, p, "vec_try_reserve", &mut v.cap_fns);
   count_gate(m, p, "vec_push_within", &mut v.cap_fns);
-  // Each function gets its own solver scope: what is declared and assumed
-  // while verifying one (some of it quantified) must not burden the queries
-  // for all later ones. And every function after the first starts on a
-  // reset solver, so that what Z3 answers near its work limit does not
-  // depend on which functions shared its solver (stage0's verify_worker).
-  let r0 = atom_str(&mut v, "(reset)");
-  let r1 = atom_str(&mut v, "(set-option :produce-models true)");
-  let r2 = atom_str(&mut v, "(set-option :rlimit 40000000)");
-  let r3 = atom_str(&mut v, "(set-option :timeout 60000)");
-  let mut k = 0;
-  while k < vec_len(m.fns) {
+  v.t_reset = atom_str(&mut v, "(reset)");
+  v.t_models = atom_str(&mut v, "(set-option :produce-models true)");
+  v.t_rlimit = atom_str(&mut v, "(set-option :rlimit 40000000)");
+  v.t_timeout = atom_str(&mut v, "(set-option :timeout 60000)");
+}
+
+/// Verifies the k-th function. Each function gets its own solver scope:
+/// what is declared and assumed while verifying one (some of it
+/// quantified) must not burden the queries for all later ones. And every
+/// function after the first starts on a reset solver, so that what Z3
+/// answers near its work limit does not depend on which functions shared
+/// its solver (stage0's verify_worker).
+fn verify_nth(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, k: u64) {
+  if k < vec_len(m.fns) {
     let x = u_at(m.fns, k);
     if k > 0 {
-      send(&mut v, CMD_RAW, r0, 0);
-      send(&mut v, CMD_RAW, r1, 0);
-      send(&mut v, CMD_RAW, r2, 0);
-      send(&mut v, CMD_RAW, r3, 0);
+      send(&mut v, CMD_RAW, v.t_reset, 0);
+      send(&mut v, CMD_RAW, v.t_models, 0);
+      send(&mut v, CMD_RAW, v.t_rlimit, 0);
+      send(&mut v, CMD_RAW, v.t_timeout, 0);
     }
     send(&mut v, CMD_DECL, v.t_poolsize, SO_INT);
     let r = in_range(&mut v, v.t_zero, v.t_poolsize, v.t_flimit);
@@ -6767,6 +6848,39 @@ fn verify_program(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
     send(&mut v, CMD_PUSH, 0, 0);
     verify_fn(&mut v, c, &mut m, p, x);
     send(&mut v, CMD_POP, 0, 0);
+  }
+}
+
+fn verify_program(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
+  verify_begin(&mut v, c, &mut m, p);
+  let mut k = 0;
+  while k < vec_len(m.fns) {
+    verify_nth(&mut v, c, &mut m, p, k);
     k = k + 1;
   }
+}
+
+/// The lengths of the tables that grow while functions are verified.
+/// Nothing made while verifying one function is used once its scope is
+/// closed and its obligations are proved, so cutting the tables back to a
+/// mark taken after `verify_begin` frees all of it (see `b1_verify`).
+struct VMark { pool: u64, tms: u64, targs: u64, vals: u64, kids: u64, log: u64, obls: u64, snaps: u64, msg: u64, mpool: u64 }
+
+fn vr_mark(v: &Vr) -> VMark {
+  return VMark { pool: vec_len(v.pool), tms: vec_len(v.tms), targs: vec_len(v.targs), vals: vec_len(v.vals),
+    kids: vec_len(v.kids), log: vec_len(v.log), obls: vec_len(v.obls), snaps: vec_len(v.snaps),
+    msg: vec_len(v.msg), mpool: vec_len(v.mpool) };
+}
+
+fn vr_cut(v: &mut Vr, k: VMark) {
+  while vec_len(v.pool) > k.pool { vec_pop(&mut v.pool); }
+  while vec_len(v.tms) > k.tms { vec_pop(&mut v.tms); }
+  while vec_len(v.targs) > k.targs { vec_pop(&mut v.targs); }
+  while vec_len(v.vals) > k.vals { vec_pop(&mut v.vals); }
+  while vec_len(v.kids) > k.kids { vec_pop(&mut v.kids); }
+  while vec_len(v.log) > k.log { vec_pop(&mut v.log); }
+  while vec_len(v.obls) > k.obls { vec_pop(&mut v.obls); }
+  while vec_len(v.snaps) > k.snaps { vec_pop(&mut v.snaps); }
+  while vec_len(v.msg) > k.msg { vec_pop(&mut v.msg); }
+  while vec_len(v.mpool) > k.mpool { vec_pop(&mut v.mpool); }
 }

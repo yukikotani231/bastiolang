@@ -86,6 +86,13 @@ What will be 0.2.0.
 - Diagnostics name tokens as written, report a missing `;` at the end of the
   line, say where a linear value was consumed, and suggest a close name for
   an unknown variable or function (#87).
+- An error shows its source line with the line number, the whole token at
+  the error underlined, and its notes aligned under it; `tests/diag` holds
+  golden transcripts, checked with both compilers (#102).
+- bastioc1 checks its own source in 8.5 s instead of 11.5 s (hash indexes
+  instead of linear scans by name), and proves in batches, freeing each
+  batch's terms: 175 MB instead of 497 MB on its own source, 325 MB
+  instead of 953 MB on the BastiOS kernel (#102).
 - Z3 runs with a fixed work limit per query (`:rlimit`) instead of a 10 s
   timeout, so a proof no longer fails on a busy machine (#89).
 - Each function is verified on a reset solver, so whether a proof near

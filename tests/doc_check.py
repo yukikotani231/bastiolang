@@ -1,8 +1,10 @@
 """Checks the parts of docs/*.md that tests/run.sh's block loop does not.
 
-usage: doc_check.py BASTIOC DOC.md...
+usage: doc_check.py [--fix] BASTIOC DOC.md...
 
 Prints one FAIL line per problem and, last, "doc_check: P passed, F failed".
+With --fix, transcripts that differ are replaced by what the compiler
+prints (after a change to how errors are shown); review the diff.
 
 Two kinds of check:
 
@@ -12,7 +14,7 @@ Two kinds of check:
   The program, without its `// expect-...` and `// target: ...` header
   lines, is saved as NAME.bastio and checked, and the output must match
   line for line. Counterexample values depend on the Z3 version, so in a
-  `  = counterexample:` line only the names must match.
+  `= counterexample:` note only the names must match.
 
 - Copies of files. A block whose fence line comes right after a line
   `<!-- file: PATH -->` is a copy of PATH (relative to the repository root),
@@ -59,16 +61,21 @@ def strip_header(body):
     return body[k:], target
 
 
+CEX = re.compile(r"^( *= counterexample: )(.*)$")
+
+
 def same_line(got, want):
-    pre = "  = counterexample: "
-    if want.startswith(pre) and got.startswith(pre):
-        names = lambda s: [p.split(" = ")[0] for p in s[len(pre):].split(", ")]
-        return names(got) == names(want)
+    g, w = CEX.match(got), CEX.match(want)
+    if g and w and g.group(1) == w.group(1):
+        names = lambda s: [p.split(" = ")[0] for p in s.split(", ")]
+        return names(g.group(2)) == names(w.group(2))
     return got == want
 
 
 def main():
-    bastioc, docs = sys.argv[1], sys.argv[2:]
+    fix = len(sys.argv) > 1 and sys.argv[1] == "--fix"
+    args = sys.argv[2:] if fix else sys.argv[1:]
+    bastioc, docs = args[0], args[1:]
     if "/" in bastioc:
         bastioc = os.path.abspath(bastioc)
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -83,7 +90,9 @@ def main():
 
     tmp = tempfile.mkdtemp()
     for doc in docs:
-        bs = blocks(open(doc).read().split("\n"))
+        lines = open(doc).read().split("\n")
+        bs = blocks(lines)
+        edits = []
         for k, (lang, line, body, mark) in enumerate(bs):
             at = f"{doc}:{line}"
             if mark:
@@ -113,9 +122,19 @@ def main():
             got = r.stderr.rstrip("\n").split("\n")
             if len(got) == len(shown) and all(map(same_line, got, shown)):
                 passed += 1
+            elif fix:
+                start = line + (len(body) - len(shown))
+                edits.append((start, start + len(shown), got))
+                passed += 1
             else:
                 fail(at, f"the compiler's output for {name} differs from this transcript",
                      ["got:"] + got + ["shown:"] + shown)
+        if edits:
+            for a, b, got in reversed(edits):
+                lines[a:b] = got
+            with open(doc, "w") as f:
+                f.write("\n".join(lines))
+            print(f"doc_check: rewrote {len(edits)} transcript(s) in {doc}")
     print(f"doc_check: {passed} passed, {failed} failed")
     return 1 if failed else 0
 

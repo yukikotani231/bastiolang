@@ -35,7 +35,7 @@ bastioc0 is fuzzed.
 Deterministic for a given seed and --count. Exits 1 if anything was found;
 each finding is saved under --keep (default: fuzz-findings/) with a note.
 """
-import argparse, os, random, re, shutil, signal, subprocess, sys, tempfile, time
+import argparse, collections, concurrent.futures, os, random, re, shutil, signal, subprocess, sys, tempfile, threading, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASTIOC = os.path.abspath(os.environ.get("BASTIOC", os.path.join(ROOT, "stage0/target/release/bastioc0")))
@@ -527,14 +527,22 @@ class Fuzz:
         self.keep = os.path.abspath(a.keep)
         self.found = 0
         self.stats = {}
+        self.cur = threading.local()
         self.b1 = a.bastioc1
         self.san = subprocess.run([CC, "-fsanitize=address,undefined", "-x", "c", "-", "-o", os.path.join(self.tmp, "probe")],
                                   input=b"int main(void){return 0;}", capture_output=True).returncode == 0
 
+    # Inputs are checked JOBS at a time (default: the number of CPUs), each
+    # on a thread with its own scratch directory (`self.cur.tmp`). What one
+    # finds and counts is kept with it and reported in input order, so the
+    # output does not depend on JOBS.
     def stat(self, k):
-        self.stats[k] = self.stats.get(k, 0) + 1
+        self.cur.stats.append(k)
 
     def finding(self, kind, src, note):
+        self.cur.finds.append((kind, src, note))
+
+    def report(self, kind, src, note):
         self.found += 1
         os.makedirs(self.keep, exist_ok=True)
         path = os.path.join(self.keep, f"{kind}-{self.found}.bastio")
@@ -558,8 +566,8 @@ class Fuzz:
         if c0 != c1 or counterexample_free(mask(e0, e1)) != counterexample_free(e1):
             self.finding("differ", src, f"bastioc0 and bastioc1 disagree ({where})\n--- bastioc0 exit {c0}:\n{e0.decode(errors='replace')}--- bastioc1 exit {c1}:\n{e1.decode(errors='replace')}")
         elif c0 == 0:
-            o0 = os.path.join(self.tmp, "c0.c")
-            o1 = os.path.join(self.tmp, "c1.c")
+            o0 = os.path.join(self.cur.tmp, "c0.c")
+            o1 = os.path.join(self.cur.tmp, "c1.c")
             r0 = compile_([BASTIOC, "--emit-c", "-o", o0, path], cwd)[0]
             r1 = compile_([self.b1, "--emit-c", "-o", o1, path], cwd)[0]
             if r0 != 0 or r1 != 0 or open(o0, "rb").read() != open(o1, "rb").read():
@@ -583,7 +591,7 @@ class Fuzz:
                     bad = (x, str(v))
         checks = good[:4]
         src = p.source(checks)
-        d = os.path.join(self.tmp, "gen")
+        d = os.path.join(self.cur.tmp, "gen")
         os.makedirs(d, exist_ok=True)
         path = os.path.join(d, "f.bastio")
         with open(path, "w") as f:
@@ -671,7 +679,7 @@ class Fuzz:
             return
         # Next to the original, so its imports resolve.
         d = os.path.dirname(orig)
-        path = os.path.join(d, f".fuzz-{os.getpid()}.bastio")
+        path = os.path.join(d, f".fuzz-{os.getpid()}-{seed}.bastio")
         with open(path, "wb") as f:
             f.write(m)
         try:
@@ -684,8 +692,8 @@ class Fuzz:
             hosted = not re.search(rb'^// target:', m, re.M) and re.search(rb'^fn main\(\)', m, re.M) and b"Host" not in m and b"Serial" not in m
             if not (hosted and self.san):
                 return
-            c = os.path.join(self.tmp, "m.c")
-            exe = os.path.join(self.tmp, "m.san")
+            c = os.path.join(self.cur.tmp, "m.c")
+            exe = os.path.join(self.cur.tmp, "m.san")
             if compile_([BASTIOC, "--emit-c", "-o", c, path], d)[0] != 0:
                 return
             r = subprocess.run([CC, "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-g", "-w", "-o", exe, c], capture_output=True)
@@ -706,22 +714,43 @@ class Fuzz:
         finally:
             os.remove(path)
 
-    def go(self):
-        corpus = self.corpus()
-        modes = ["gen", "mutate"] if self.a.mode == "both" else [self.a.mode]
-        start = time.time()
-        n = 0
-        while True:
-            if self.a.seconds is not None and time.time() - start >= self.a.seconds:
-                break
-            if self.a.seconds is None and n >= self.a.count:
-                break
-            seed = self.a.seed * 1000003 + n
-            if modes[n % len(modes)] == "gen":
+    def one(self, n, mode, corpus):
+        """Checks input n on this thread: returns what it counted and found."""
+        self.cur.tmp = tempfile.mkdtemp(dir=self.tmp)
+        self.cur.stats, self.cur.finds = [], []
+        seed = self.a.seed * 1000003 + n
+        try:
+            if mode == "gen":
                 self.gen_one(seed)
             else:
                 self.mutate_one(seed, corpus)
-            n += 1
+        finally:
+            shutil.rmtree(self.cur.tmp, ignore_errors=True)
+        return self.cur.stats, self.cur.finds
+
+    def go(self):
+        corpus = self.corpus()
+        modes = ["gen", "mutate"] if self.a.mode == "both" else [self.a.mode]
+        jobs = max(1, int(os.environ.get("JOBS") or os.cpu_count() or 1))
+        start = time.time()
+        n = 0
+        pending = collections.deque()
+        with concurrent.futures.ThreadPoolExecutor(jobs) as pool:
+            while True:
+                while len(pending) < 2 * jobs:
+                    if self.a.seconds is not None and time.time() - start >= self.a.seconds:
+                        break
+                    if self.a.seconds is None and n >= self.a.count:
+                        break
+                    pending.append(pool.submit(self.one, n, modes[n % len(modes)], corpus))
+                    n += 1
+                if not pending:
+                    break
+                stats, finds = pending.popleft().result()
+                for k in stats:
+                    self.stats[k] = self.stats.get(k, 0) + 1
+                for f in finds:
+                    self.report(*f)
         shutil.rmtree(self.tmp, ignore_errors=True)
         print("fuzz: " + ", ".join(f"{v} {k}" for k, v in sorted(self.stats.items())))
         print(f"fuzz: {n} inputs, {self.found} finding(s), {time.time() - start:.0f} s")
