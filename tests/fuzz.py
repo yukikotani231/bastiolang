@@ -35,12 +35,12 @@ bastioc0 is fuzzed.
 Deterministic for a given seed and --count. Exits 1 if anything was found;
 each finding is saved under --keep (default: fuzz-findings/) with a note.
 """
-import argparse, os, random, re, shutil, subprocess, sys, tempfile, time
+import argparse, os, random, re, shutil, signal, subprocess, sys, tempfile, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASTIOC = os.path.abspath(os.environ.get("BASTIOC", os.path.join(ROOT, "stage0/target/release/bastioc0")))
 CC = os.environ.get("CC", "cc")
-LIMIT = 60           # seconds a compiler may take on one input
+LIMIT = 150          # seconds a compiler may take on one input (above Z3's 60 s backstop)
 
 # ---------------------------------------------------------------------------
 # Integer types
@@ -480,12 +480,18 @@ class Prog:
 
 
 def compile_(cmd, cwd, limit=LIMIT):
+    # In a session of its own, so a timeout kills the compiler's z3 too:
+    # killing only the compiler left z3 spinning, slowing every later input.
     t = time.time()
+    p = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, start_new_session=True)
     try:
-        r = subprocess.run(cmd, cwd=cwd, capture_output=True, timeout=limit)
+        _, err = p.communicate(timeout=limit)
     except subprocess.TimeoutExpired:
+        os.killpg(p.pid, signal.SIGKILL)
+        p.communicate()
         return None, b"", time.time() - t
-    return r.returncode, r.stderr, time.time() - t
+    return p.returncode, err, time.time() - t
 
 
 def crashed(code, err):

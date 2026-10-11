@@ -103,6 +103,17 @@ What will be 0.2.0.
   deterministic run.
 - A change to `stage0/src` needs its stage1 mirror, or a `Stage0-only:`
   reason in a commit message; CI checks this on every pull request (#78).
+- A 60 s wall-clock backstop on each Z3 query, on top of `:rlimit`: Z3 4.8.12
+  (Ubuntu's, and CI's) does not count its work on some nonlinear queries and
+  searched them forever, so `bastioc0 --check` hung on a 15-line function
+  (a guarded `x * x` on an `i16`). Such a query now gives up. The fuzzers
+  kill a timed-out compiler's z3 too, instead of leaving it spinning.
+- `tests/progfuzz.py`: random whole programs (helpers, recursion, `&mut`
+  calls, a struct, an enum, `Buf`, `Bytes` and `Vec` through bounded loops,
+  every integer type) run by an exact reference interpreter, then built by
+  bastioc0 and bastioc1 with both backends and by bastioc0's C under ASan
+  and UBSan; every build must print what the interpreter printed and exit
+  the same way, and a proof the interpreter's run breaks is a false proof.
 
 ### Fixed
 
