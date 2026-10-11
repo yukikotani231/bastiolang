@@ -15,6 +15,13 @@ pub const SOLVER_ARGS: &[&str] = &["-in", "-smt2"];
 /// `make -j` as alone. 40 million units take about 10 s; the hardest query
 /// in the BastiOS kernel and the compiler takes under 3 million.
 pub const RLIMIT: u64 = 40_000_000;
+/// A wall-clock backstop, in milliseconds, for queries on which Z3 does not
+/// count its work: Z3 4.8.12 (Ubuntu's) can search some nonlinear queries
+/// forever without reaching `:rlimit` (`x * x <= 32767` with `-181 <= x <=
+/// 181`; Z3 5.1 answers it at once), which hung the compiler. Far above
+/// what any query that `:rlimit` stops takes, so it decides nothing that
+/// `:rlimit` would have: it only turns a hang into "the solver gave up".
+pub const TIMEOUT_MS: u64 = 60_000;
 
 pub struct Solver {
     child: Child,
@@ -50,7 +57,8 @@ impl Solver {
 
     fn options(&mut self) -> Result<(), String> {
         self.send("(set-option :produce-models true)")?;
-        self.send(&format!("(set-option :rlimit {})", RLIMIT))
+        self.send(&format!("(set-option :rlimit {})", RLIMIT))?;
+        self.send(&format!("(set-option :timeout {})", TIMEOUT_MS))
     }
 
     /// Back to the state `start` leaves the solver in: no declarations, no
