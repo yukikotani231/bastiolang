@@ -252,6 +252,74 @@ fn bytes_copy_into(dst: &mut Bytes, at: u64, src: &Bytes)
   }
 }
 
+/// Bytes `a[i..i+n]` and `b[j..j+n]` are equal (`a` and `b` may be the
+/// same string).
+fn bytes_span_eq(a: &Bytes, i: u64, b: &Bytes, j: u64, n: u64) -> bool
+  requires i <= blen(a) && n <= blen(a) - i && j <= blen(b) && n <= blen(b) - j
+  ensures result == bytes_same_at(a, i, b, j, n)
+{
+  let mut k = 0;
+  while k < n
+    invariant k <= n && bytes_same_at(a, i, b, j, k)
+  {
+    if bget(a, i + k) != bget(b, j + k) {
+      return false;
+    }
+    k = k + 1;
+  }
+  return true;
+}
+
+/// Copies `src[from..to]` into `dst` at `at`, leaving the other bytes of
+/// `dst` alone. One `bcopy`: no per-byte loop.
+fn bytes_copy_span(dst: &mut Bytes, at: u64, src: &Bytes, from: u64, to: u64)
+  requires from <= to && to <= blen(src) && at <= blen(dst) && to - from <= blen(dst) - at
+  ensures blen(dst) == blen(old(dst))
+  ensures bytes_same_at(dst, at, src, from, to - from)
+  ensures forall k: u64 :: k < blen(dst) && (k < at || k >= at + (to - from)) ==> bget(dst, k) == bget(old(dst), k)
+{
+  bcopy(&mut dst, at, src, from, to - from);
+}
+
+/// Writes `c` at `at` if it fits. Returns the position after it, or `at`
+/// when `dst` is full there: a writer into a fixed buffer chains these and
+/// drops what does not fit.
+fn bytes_put_byte(dst: &mut Bytes, at: u64, c: u8) -> u64
+  requires at <= blen(dst)
+  ensures blen(dst) == blen(old(dst)) && at <= result && result <= blen(dst)
+  ensures at < blen(dst) ==> result == at + 1 && bget(dst, at) == c
+  ensures forall k: u64 :: k < blen(dst) && k != at ==> bget(dst, k) == bget(old(dst), k)
+{
+  if at >= blen(dst) {
+    return at;
+  }
+  bset(&mut dst, at, c);
+  return at + 1;
+}
+
+/// Writes the literal `s` at `at`, as much of it as fits. Returns the
+/// position after what was written.
+fn bytes_put_str(dst: &mut Bytes, at: u64, s: Str) -> u64
+  requires at <= blen(dst)
+  ensures blen(dst) == blen(old(dst)) && at <= result && result <= blen(dst)
+  ensures slen(s) <= blen(dst) - at ==> result == at + slen(s)
+  ensures forall k: u64 :: at <= k && k < result ==> bget(dst, k) == sget(s, k - at)
+  ensures forall k: u64 :: k < blen(dst) && (k < at || k >= result) ==> bget(dst, k) == bget(old(dst), k)
+{
+  let mut a = at;
+  let mut i = 0;
+  while i < slen(s) && a < blen(dst)
+    invariant i <= slen(s) && a == at + i && a <= blen(dst) && blen(dst) == blen(old(dst))
+    invariant forall k: u64 :: at <= k && k < a ==> bget(dst, k) == sget(s, k - at)
+    invariant forall k: u64 :: k < blen(dst) && (k < at || k >= a) ==> bget(dst, k) == bget(old(dst), k)
+  {
+    bset(&mut dst, a, sget(s, i));
+    a = a + 1;
+    i = i + 1;
+  }
+  return a;
+}
+
 /// Space, tab, newline or carriage return.
 fn is_space(c: u8) -> bool
   ensures result == (c == 32 || c == 9 || c == 10 || c == 13)

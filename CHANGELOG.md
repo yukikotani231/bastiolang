@@ -71,6 +71,11 @@ What will be 0.2.0.
   id at or above a starting point, under a limit; `core/rows`'s `rows_grow`
   for tables of fixed-size rows in one `Buf`; `bits_grow`. All three report
   running out of memory instead of stopping the program.
+- Helpers BastiOS and bastioc1 each wrote by hand: `min_u64`, `max_u64`,
+  `bytes_span_eq`, `bytes_copy_span`, writes into a fixed buffer that drop
+  what does not fit (`bytes_put_byte`, `bytes_put_str`, `bytes_put_u64`),
+  `vec_extend_u64`, `vec_clone_u64`, and `core/wtext` for text kept one
+  character a word in a `Vec[u64]`.
 - `merge_sort_u64`, O(n log n) with the insertion sort's proof, and
   `sort_by_key_u64`, a proved stable sort of indices by a key vector;
   `BytesMap[V]`, a hash map from byte strings; `examples/wordfreq.bastio`

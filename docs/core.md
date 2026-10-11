@@ -51,6 +51,9 @@ For a whole program, see [`examples/wordfreq.bastio`](../examples/wordfreq.basti
 | `bytes_slice(b, from, to) -> Bytes` | A copy of exactly those bytes |
 | `bytes_concat(a, b) -> Bytes` | `a` then `b`. Needs `blen(a) + blen(b) <= 2^60`: every `Bytes` is known to be at most 2^60 long, but two of them together are not, since nothing bounds the memory of all live values at once. For strings of unknown length, build a text instead |
 | `bytes_copy_into(dst, at, src)` | `src` lands at `at`, and the rest of `dst` is untouched |
+| `bytes_copy_span(dst, at, src, from, to)` | `src[from..to]` lands at `at` in one `bcopy`, and the rest of `dst` is untouched |
+| `bytes_span_eq(a, i, b, j, n)` | Exactly whether `a[i..i+n]` and `b[j..j+n]` are equal (spec fn `bytes_same_at`); `a` and `b` may be the same string |
+| `bytes_put_byte(dst, at, c)`, `bytes_put_str(dst, at, s)` | Write into a fixed buffer as much as fits and return the position after it, so writes chain and the overflow is dropped; nothing outside what was written changes |
 | `bytes_trim(b, s: Span) -> Span` | Only white space was cut, and the result does not start or end with white space |
 | `bytes_split(b, sep: u8) -> Vec[Span]` | At least one piece, every piece a span of `b` |
 | `bytes_hash(b) -> u64` | (FNV-1a; nothing to prove beyond safety) |
@@ -73,9 +76,23 @@ For a whole program, see [`examples/wordfreq.bastio`](../examples/wordfreq.basti
 | `fmt_i64(t, x)` | A `-` when negative, then the digits; 1 to 21 bytes |
 | `fmt_u64_pad(t, x, width)` | Left-padded with spaces |
 | `fmt_hex_u64(t, x, min)` | Lowercase hex, at least `min` and at most 16 digits |
+| `bytes_put_u64(dst, at, x)` | Writes `x` in decimal into a fixed buffer, as many leading digits as fit (at least one when there is room), and returns the position after them; every byte written is a digit and nothing else changes |
+| `min_u64(a, b)`, `max_u64(a, b)` | The smaller or larger of the two |
 | `dec_digits(x)`, `is_digit(c)`, `hex_value(c)`, `hex_char(d)` | Helpers |
 
 Narrower integers format through `fmt_u64(t, cast[u64](x))`: widening needs no proof. The tests check that formatting and parsing are inverse on every power of two and its predecessor and on the extremes of `i64`. Parsing is proved to return the digits' value; that `fmt_u64` writes the digits of `x` is tested, not proved (it writes into a `Vec[u8]`, and `bdec` reads `Bytes`).
+
+### `core/wtext.bastio`
+
+Text kept one character a word, in a `Vec[u64]`, as a compiler keeps source and output it mixes with other words (bastioc1 does). Every function is total: a position or span out of range is no match, so a caller needs no bounds facts.
+
+| Function | Proved |
+| --- | --- |
+| `wtext_push_str(t, s)` | Appends exactly the characters of `s` (spec fn `wtext_is_str_at`) and keeps what was there (`wtext_keeps`) |
+| `wtext_push_u64(t, x)`, `wtext_push_hex(t, x, min)` | Append 1 to 20 decimal digits, or lower-case hex digits padded to `min`, keeping what was there |
+| `wtext_push_span(t, src, from, to)`, `wtext_push_all(t, src)` | Append `src[from..to]` (when in range) or all of `src`, word for word |
+| `wtext_has_str_at(t, at, s)` | Exactly whether `t` holds `s` from `at` |
+| `wtext_same(t, i, j, n)` | Exactly whether `t[i..i+n]` and `t[j..j+n]` are in range and equal |
 
 ### `core/print.bastio`
 
@@ -135,6 +152,7 @@ Not proved: that a lookup finds every key present.
 | `lower_bound_u64(v, x)` | Needs `sorted(v)`. The first index whose element is `>= x`: everything before it is smaller, everything from it on is not |
 | `sorted_contains_u64(v, x)` | Needs `sorted(v)`. Exactly whether `x` occurs |
 | `vec_contains_u64(v, x)` | A linear scan; exactly whether `x` occurs |
+| `vec_extend_u64(dst, src)`, `vec_clone_u64(v)` | Append every element of `src`, or copy `v`, element for element |
 
 Insertion sort is quadratic in the worst case; on 50,000 random words it takes 4.8 s where `merge_sort_u64` takes 0.02 s. The merge sort deals the vector out into two, sorts each, and merges them by popping the larger tail, so every step of its proof is about the ends of vectors and the counts in them (`vcount`); no lemma about index arithmetic is needed. To sort records by a field, put the field in `keys` and sort the indices 0..n.
 
@@ -253,6 +271,11 @@ A survey of the hand-written helpers in `stage1/`, BastiOS (`src/` and `user/`) 
 | Endian loads and stores (`be16`, `be32`, `put16`, `rd16`, `rd32`, `get_u64`, `put_u64`) | about 7 (BastiOS network, ELF and disk code) | `core/endian.bastio` |
 | Free a `Vec[Bytes]` (`drop_argv`, `drop_args`) | 2 | `bytes_vec_free` |
 | Vector contains (`has_id`, `has_u`) | 2 | `vec_contains_u64` |
+| Minimum (`smaller`) | 2 (121 uses in BastiOS) | `min_u64` |
+| Span against span (`same`, `same_name`, `name_is`, `x86_same_text`, ...) | about 9 | `bytes_span_eq`, `wtext_same` |
+| Writes into a fixed reply buffer that drop the overflow (`put_s`, `put_c`, `put_n` in /proc) | 1 (about 146 uses) | `bytes_put_str`, `bytes_put_byte`, `bytes_put_u64` |
+| Text as `Vec[u64]`: append a literal, a number, hex; prefix and span compare (`cm_s`, `out_str`, `x86_num`, `cm_num`, `x86_has_prefix`, ...) | about 20 (bastioc1, about 760 calls) | `core/wtext.bastio` |
+| Vector append and copy (`x86_append`, `copy_set`, `x86_copy_text`) | 3 | `vec_extend_u64`, `vec_clone_u64`, `wtext_push_span` |
 | Insertion sort | 2 (stage1's sorts compare records by a key) | `sort_u64`, `merge_sort_u64`, `sort_by_key_u64` (when the key is a number) |
 | Lookup by key: every table is a linear scan (`find_inst`, `env_find`, `find_file`, ...) | many | `HashMap`, `BytesMap` (for names and paths) |
 | Ring buffers: head and count over a fixed capacity (console output, tty input, pipes, AF_UNIX channels, the disk command queue) | 6 (BastiOS) | `Ring`, `Queue` |
