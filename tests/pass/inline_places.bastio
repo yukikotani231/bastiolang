@@ -1,0 +1,67 @@
+// expect-exit: 0
+// expect-stdout: 18
+// expect-stdout: 6
+// expect-stdout: 7
+// expect-stdout: 1
+// expect-stdout: 12
+// expect-stdout: 16
+// Inlined calls whose arguments are fields of a `&mut` parameter: a
+// `&mut` of the field that the body writes through and lends on, and a
+// struct field the body only reads, which the native backend uses where
+// they are; and a call that also lends the field's owner, where the
+// read-only field must still be the value at the call.
+
+struct R { head: u64, len: u64, cap: u64 }
+struct C { x: u64, r: R }
+
+fn bump(r: &mut R) {
+  r.len = wrap_add(r.len, 1);
+}
+
+fn rpop(r: &mut R) -> u64 {
+  let h = r.head;
+  r.head = wrap_add(r.head, 1);
+  r.len = wrap_sub(r.len, 1);
+  bump(&mut r);
+  r.len = wrap_sub(r.len, 1);
+  return h;
+}
+
+fn rlen(r: R) -> u64 {
+  return r.len;
+}
+
+fn take(c: &mut C, n: u64) -> u64 {
+  let mut s = 0;
+  let mut i = 0;
+  while i < n {
+    s = wrap_add(s, rpop(&mut c.r));
+    i = i + 1;
+  }
+  return s;
+}
+
+fn len_of(c: &mut C) -> u64 {
+  return wrap_add(rlen(c.r), 1);
+}
+
+fn grow_then(c: &mut C, r: R) -> u64 {
+  c.r.len = wrap_add(c.r.len, 10);
+  return r.len;
+}
+
+fn both(c: &mut C) -> u64 {
+  let before = grow_then(&mut c, c.r);
+  return wrap_add(wrap_mul(before, 2), wrap_sub(c.r.len, 16));
+}
+
+fn main() -> u64 {
+  let mut c = C { x: 1, r: R { head: 3, len: 10, cap: 20 } };
+  print(take(&mut c, 4));
+  print(c.r.len);
+  print(len_of(&mut c));
+  print(c.x);
+  print(both(&mut c));
+  print(c.r.len);
+  return 0;
+}

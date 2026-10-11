@@ -3782,6 +3782,17 @@ fn x86_bind_params(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, i
   let xi = inst_at(m, x);
   let dn = node_at(p.nodes, xi.def);
   let n = node_at(p.nodes, i);
+  // stage1: whether any parameter is `&mut` (then no other argument may
+  // stand for the caller's memory, which the body could change).
+  let mut lends = false;
+  let mut q0 = dn.a;
+  while q0 != 0 {
+    let qn0 = node_at(p.nodes, q0);
+    if kind_t(m, conv(&mut m, p, qn0.a, x, q0)) == TY_MUTREF {
+      lends = true;
+    }
+    q0 = qn0.next;
+  }
   let mut qs = vec_new[u64]();
   let mut sts = vec_new[X86St]();
   let mut q = dn.a;
@@ -3807,6 +3818,15 @@ fn x86_bind_params(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, i
       }
     } else if an.kind == E_VAR && !mutp {
       st = x86_st_of(x86_var(&mut g, p, a));
+    } else if !g.stage0 && an.kind == E_FIELD && !mutp && !lends && kind_t(m, base_t(m, pt)) == TY_STRUCT && x86_is_place(p, a) {
+      // stage1: a struct field the body only reads is read where it is
+      // (in a frame slot, or at an address in a register).
+      let segs = x86_esegs(p, a);
+      let s2 = x86_store_of(&mut g, c, m, p, segs);
+      vec_free(segs);
+      if s2.k == XS_SLOT || s2.k == XS_PREG {
+        st = s2;
+      }
     } else if an.kind == E_MUTBORROW && mutp {
       let segs = x86_lsegs(p, an.a);
       st = x86_store_of(&mut g, c, m, p, segs);
