@@ -104,8 +104,15 @@ struct X86Name {
   x: u64, s: u64, e: u64,
   uses: u64, whole: bool, read: u64, size: u64, bad: bool, asg: bool, alias: u64,
   brw: bool,
-  rn: u64, r0: u64, r1: u64, r2: u64
+  rn: u64, r0: u64, r1: u64, r2: u64,
+  /// stage1: its latest live interval in `X86.ivs` (index + 1; 0: none).
+  iv: u64
 }
+
+/// stage1: name `nm` may be alive from position `s` to position `e` of the
+/// walk that counts uses (one interval per declaration); `prev` is the
+/// name's interval before this one (index + 1; 0: none).
+struct X86Iv { nm: u64, s: u64, e: u64, prev: u64 }
 
 /// Name `nm` is declared in scope `sc`.
 struct X86Decl { nm: u64, sc: u64 }
@@ -163,6 +170,13 @@ struct X86 {
   parent: Vec[u64],
   cur: u64,
   decl: Vec[X86Decl],
+  /// stage1: live intervals instead of scopes. The position of the walk,
+  /// each name's intervals, and each loop's first and last position.
+  ivs: Vec[X86Iv],
+  pos: u64,
+  loops: Vec[u64],
+  /// The names touched in the expressions being walked.
+  xt: Vec[u64],
   /// Whether `x86_two` swapped its operands.
   sw: bool,
   /// Something the backend does not support yet was found, and what
@@ -194,7 +208,7 @@ fn x86_new() -> X86 {
     saves: vec_new[X86Save](), stack: vec_new[u64](), bsize: vec_new[u64](), ncalls: vec_new[u64](),
     sdata: vec_new[u64](), sstart: vec_new[u64](), slens: vec_new[u64](),
     labels: 0, frame: 0, slots: vec_new[u64](), depth: 0, env: 0, pre: 0, retl: 0, retw: 0, reto: 0, rdk: 0, rda: 0, rdo: 0,
-    parent: vec_new[u64](), cur: 0, decl: vec_new[X86Decl](), sw: false, failed: false, fmsg: vec_new[u64](),
+    parent: vec_new[u64](), cur: 0, decl: vec_new[X86Decl](), ivs: vec_new[X86Iv](), pos: 0, loops: vec_new[u64](), xt: vec_new[u64](), sw: false, failed: false, fmsg: vec_new[u64](),
     stage0: false, target: TARGET_HOSTED, smp: vec_new[u64](), nsmp: 0, snode: vec_new[u64](),
     mk: 0, ma: 0, mmask: 0
   };
@@ -218,6 +232,9 @@ fn x86_free(g: X86) {
   vec_free(g.slens);
   vec_free(g.parent);
   vec_free(g.decl);
+  vec_free(g.ivs);
+  vec_free(g.loops);
+  vec_free(g.xt);
   vec_free(g.smp);
   vec_free(g.snode);
   vec_free(g.fmsg);
@@ -684,7 +701,7 @@ fn x86_name_at(g: &X86, id: u64) -> X86Name {
   if id > 0 && id - 1 < vec_len(g.names) {
     return vec_get(g.names, id - 1);
   }
-  return X86Name { x: 0, s: 0, e: 0, uses: 0, whole: false, read: 0, size: 0, bad: false, asg: false, alias: 0, brw: false, rn: 0, r0: 0, r1: 0, r2: 0 };
+  return X86Name { x: 0, s: 0, e: 0, uses: 0, whole: false, read: 0, size: 0, bad: false, asg: false, alias: 0, brw: false, rn: 0, r0: 0, r1: 0, r2: 0, iv: 0 };
 }
 
 fn x86_name_set(g: &mut X86, id: u64, n: X86Name) {
@@ -704,7 +721,7 @@ fn x86_nm(g: &mut X86, p: &Parser, x: u64, s: u64, e: u64) -> u64 {
     }
     k = k + 1;
   }
-  vec_push(&mut g.names, X86Name { x: x, s: s, e: e, uses: 0, whole: false, read: 0, size: 0, bad: false, asg: false, alias: 0, brw: false, rn: 0, r0: 0, r1: 0, r2: 0 });
+  vec_push(&mut g.names, X86Name { x: x, s: s, e: e, uses: 0, whole: false, read: 0, size: 0, bad: false, asg: false, alias: 0, brw: false, rn: 0, r0: 0, r1: 0, r2: 0, iv: 0 });
   return vec_len(g.names);
 }
 
@@ -1366,6 +1383,132 @@ fn x86_enter(g: &mut X86) -> u64 {
 
 fn x86_declare(g: &mut X86, id: u64) {
   vec_push(&mut g.decl, X86Decl { nm: id, sc: g.cur });
+  if !g.stage0 {
+    g.pos = wrap_add(g.pos, 1);
+    x86_iv_new(&mut g, id);
+  }
+}
+
+/// stage1: the index + 1 of name `id`'s latest interval (0: none).
+fn x86_iv_of(g: &X86, id: u64) -> u64 {
+  let n = x86_name_at(g, id);
+  if n.iv > 0 && n.iv - 1 < vec_len(g.ivs) {
+    let v = vec_get(g.ivs, n.iv - 1);
+    if v.nm == id {
+      return n.iv;
+    }
+  }
+  return 0;
+}
+
+/// stage1: starts a new interval of name `id` at the current position.
+fn x86_iv_new(g: &mut X86, id: u64) {
+  let prev = x86_iv_of(g, id);
+  vec_push(&mut g.ivs, X86Iv { nm: id, s: g.pos, e: g.pos, prev: prev });
+  let mut n = x86_name_at(g, id);
+  n.iv = vec_len(g.ivs);
+  x86_name_set(&mut g, id, n);
+}
+
+/// stage1: name `id` is read or written at the next position.
+fn x86_touch(g: &mut X86, id: u64) {
+  if g.stage0 {
+    return;
+  }
+  g.pos = wrap_add(g.pos, 1);
+  vec_push(&mut g.xt, id);
+  let k = x86_iv_of(g, id);
+  if k > 0 && k - 1 < vec_len(g.ivs) {
+    let mut v = vec_get(g.ivs, k - 1);
+    v.e = g.pos;
+    vec_set(&mut g.ivs, k - 1, v);
+  } else {
+    x86_iv_new(&mut g, id);
+  }
+}
+
+/// stage1: name `id` stays alive to the current position.
+fn x86_iv_extend(g: &mut X86, id: u64) {
+  let k = x86_iv_of(g, id);
+  if k > 0 && k - 1 < vec_len(g.ivs) {
+    let mut v = vec_get(g.ivs, k - 1);
+    if v.e < g.pos {
+      v.e = g.pos;
+      vec_set(&mut g.ivs, k - 1, v);
+    }
+  }
+}
+
+/// stage1: a name declared before a loop and used in it is alive to the
+/// loop's end (its value goes around). Loops are listed inner first.
+fn x86_iv_loops(g: &mut X86) {
+  let mut k = 0;
+  while k < vec_len(g.ivs) {
+    let mut v = vec_get(g.ivs, k);
+    let mut l = 0;
+    while wrap_add(l, 1) < vec_len(g.loops) {
+      let ls = u_at(g.loops, l);
+      let le = u_at(g.loops, wrap_add(l, 1));
+      if v.s <= ls && ls < v.e && v.e < le {
+        v.e = le;
+      }
+      l = wrap_add(l, 2);
+    }
+    vec_set(&mut g.ivs, k, v);
+    k = k + 1;
+  }
+}
+
+/// stage1: can names `x` and `y` be alive at the same time? When an
+/// interval of one meets an interval of the other (or either has none).
+fn x86_iv_overlap(g: &X86, x: u64, y: u64) -> bool {
+  let mut i = x86_iv_of(g, x);
+  let j0 = x86_iv_of(g, y);
+  if i == 0 || j0 == 0 {
+    return true;
+  }
+  while i > 0 && i - 1 < vec_len(g.ivs) {
+    let u = vec_get(g.ivs, i - 1);
+    let mut j = j0;
+    while j > 0 && j - 1 < vec_len(g.ivs) {
+      let v = vec_get(g.ivs, j - 1);
+      if u.s <= v.e && v.s <= u.e {
+        return true;
+      }
+      if v.prev >= j {
+        return true;
+      }
+      j = v.prev;
+    }
+    if u.prev >= i {
+      return true;
+    }
+    i = u.prev;
+  }
+  return false;
+}
+
+/// The variable at the root of place expression `i` (E_VAR under fields,
+/// or the first name of a `&mut` path), resolved; 0 if there is none.
+fn x86_root_nm(g: &mut X86, p: &Parser, i: u64, pre: u64) -> u64 {
+  let mut q = i;
+  let mut guard = 0;
+  while q != 0 && guard < 4096 {
+    let n = node_at(p.nodes, q);
+    if n.kind == E_VAR {
+      return x86_resolve(g, x86_nm(&mut g, p, pre, n.s, n.e));
+    }
+    if n.kind == E_MUTBORROW {
+      let r = node_at(p.nodes, n.a);
+      return x86_resolve(g, x86_nm(&mut g, p, pre, r.s, r.e));
+    }
+    if n.kind != E_FIELD {
+      return 0;
+    }
+    q = n.a;
+    guard = guard + 1;
+  }
+  return 0;
 }
 
 /// Is scope `a` scope `b` or one that encloses it?
@@ -1438,6 +1581,12 @@ fn x86_acc_expr(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, w: u
     v.uses = wrap_add(v.uses, w);
     v.whole = true;
     x86_name_set(&mut g, id, v);
+    x86_touch(&mut g, id);
+  } else if k == E_MUTBORROW {
+    if !g.stage0 {
+      let id = x86_root_nm(&mut g, p, i, pre);
+      x86_touch(&mut g, id);
+    }
   } else if k == E_FIELD || k == E_IS || k == E_NOT || k == E_NEG || k == E_VARIANT {
     x86_acc_expr(&mut g, c, &mut m, p, n.a, w, env, pre);
   } else if k == E_TAPP {
@@ -1466,8 +1615,27 @@ fn x86_acc_expr(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, w: u
 fn x86_acc_call(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64, w: u64, env: u64, pre: u64) {
   let n = node_at(p.nodes, i);
   let x = x86_callee(c, &mut m, p, i, inst);
+  let inl = x86_will_inline(&mut g, m, p, x);
+  // stage1: the arguments come first, as they are evaluated before any
+  // parameter is bound; an argument that is a place may be read where it
+  // is by the body, so its variable stays alive through the body.
+  let mut roots = vec_new[u64]();
+  if !g.stage0 && inl {
+    let mut a0 = n.a;
+    while a0 != 0 {
+      let k0 = kind_of(p, a0);
+      if k0 == E_FIELD || k0 == E_MUTBORROW {
+        let r = x86_root_nm(&mut g, p, a0, pre);
+        if r != 0 {
+          vec_push(&mut roots, r);
+        }
+      }
+      a0 = next_of(p, a0);
+    }
+    x86_acc_args(&mut g, c, &mut m, p, i, inst, w, env, pre);
+  }
   // An inlined body counts as part of the caller.
-  if x86_will_inline(&mut g, m, p, x) {
+  if inl {
     vec_push(&mut g.stack, x);
     let outer = x86_enter(&mut g);
     let changed = x86_changed(&mut g, m, p, x);
@@ -1480,7 +1648,11 @@ fn x86_acc_call(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst
       let an = node_at(p.nodes, a);
       let pid = x86_nm(&mut g, p, x, qn.s, qn.e);
       let pt = conv(&mut m, p, qn.a, x, q);
-      if an.kind == E_VAR && kind_t(m, pt) != TY_MUTREF && !has_id(changed, pid) {
+      let mut alias = an.kind == E_VAR && kind_t(m, pt) != TY_MUTREF && !has_id(changed, pid);
+      if alias && x86_own_regs(&mut g, c, &mut m, p, x, an, pt, pre) {
+        alias = false;
+      }
+      if alias {
         // As in `x86_bind_params`: the caller's variable.
         let v = x86_resolve(g, x86_nm(&mut g, p, pre, an.s, an.e));
         x86_set_alias(&mut g, pid, v);
@@ -1505,6 +1677,19 @@ fn x86_acc_call(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst
       a = an.next;
     }
     vec_free(changed);
+    // stage1: the parameters are bound together, so all are alive at once.
+    if !g.stage0 {
+      q = dn.a;
+      while q != 0 {
+        let qn = node_at(p.nodes, q);
+        let pid = x86_nm(&mut g, p, x, qn.s, qn.e);
+        let pn = x86_name_at(g, pid);
+        if pn.alias == 0 {
+          x86_touch(&mut g, pid);
+        }
+        q = qn.next;
+      }
+    }
     x86_acc_stmts(&mut g, c, &mut m, p, x86_body(m, p, x), w, x, x);
     q = dn.a;
     while q != 0 {
@@ -1513,9 +1698,48 @@ fn x86_acc_call(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst
       x86_set_alias(&mut g, pid, 0);
       q = qn.next;
     }
+    let mut r = 0;
+    while r < vec_len(roots) {
+      x86_iv_extend(&mut g, u_at(roots, r));
+      r = r + 1;
+    }
     g.cur = outer;
     x86_unstack(&mut g);
   }
+  vec_free(roots);
+  if g.stage0 || !inl {
+    x86_acc_args(&mut g, c, &mut m, p, i, inst, w, env, pre);
+  }
+}
+
+/// stage1: may a parameter of type `pt` given the caller's variable `an`
+/// (which the body does not change) have registers of its own? When the
+/// variable never has registers (it is lent mutably), its words are
+/// passed by value, and no parameter of `x` is `&mut` (through which the
+/// body could change the variable): the body reads a copy in registers.
+fn x86_own_regs(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, an: Node, pt: u64, pre: u64) -> bool {
+  if g.stage0 || x86_rsize(m, pt) < 2 || x86_byaddr(&mut g, c, m, p, pt) {
+    return false;
+  }
+  let xi = inst_at(m, x);
+  let dn = node_at(p.nodes, xi.def);
+  let mut q = dn.a;
+  while q != 0 {
+    let qn = node_at(p.nodes, q);
+    if kind_t(m, conv(&mut m, p, qn.a, x, q)) == TY_MUTREF {
+      return false;
+    }
+    q = qn.next;
+  }
+  // `brw` is known before any use is counted (`bad` may be set later).
+  let v = x86_resolve(g, x86_nm(&mut g, p, pre, an.s, an.e));
+  let n = x86_name_at(g, v);
+  return n.brw;
+}
+
+/// Counts the uses in the arguments of call `i` (see `x86_acc_call`).
+fn x86_acc_args(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64, w: u64, env: u64, pre: u64) {
+  let n = node_at(p.nodes, i);
   // A buffer or vector named only by the builtins that read one word of it
   // needs only that word in a register.
   let mut word = 0;
@@ -1538,11 +1762,38 @@ fn x86_acc_call(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst
       v.uses = wrap_add(v.uses, w);
       v.read = v.read | word;
       x86_name_set(&mut g, id, v);
+      x86_touch(&mut g, id);
     } else {
       x86_acc_expr(&mut g, c, &mut m, p, a, w, env, pre);
     }
     a = an.next;
     j = wrap_add(j, 1);
+  }
+}
+
+/// Counts the uses in expression `i` of a statement. stage1: an operand
+/// that is a variable may be read after the operands beside it are
+/// evaluated (`x86_two`), and those may be inlined bodies with variables of
+/// their own; so every variable alive before the expression and read in it
+/// stays alive to its end.
+fn x86_acc_top(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, w: u64, env: u64, pre: u64) {
+  let mark = vec_len(g.xt);
+  let pos0 = g.pos;
+  x86_acc_expr(&mut g, c, &mut m, p, i, w, env, pre);
+  let mut k = mark;
+  while k < vec_len(g.xt) {
+    let id = u_at(g.xt, k);
+    let j = x86_iv_of(g, id);
+    if j > 0 && j - 1 < vec_len(g.ivs) {
+      let v = vec_get(g.ivs, j - 1);
+      if v.s <= pos0 {
+        x86_iv_extend(&mut g, id);
+      }
+    }
+    k = k + 1;
+  }
+  while vec_len(g.xt) > mark {
+    vec_pop(&mut g.xt);
   }
 }
 
@@ -1554,9 +1805,20 @@ fn x86_acc_stmts(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, head: u64, 
     if k == S_LET {
       let id = x86_nm(&mut g, p, pre, n.s, n.e);
       x86_bind(&mut g, m, id, let_ty(m, env, i));
-      x86_declare(&mut g, id);
       x86_add_use(&mut g, id, w);
-      x86_acc_expr(&mut g, c, &mut m, p, n.b, w, env, pre);
+      if g.stage0 {
+        x86_declare(&mut g, id);
+        x86_acc_top(&mut g, c, &mut m, p, n.b, w, env, pre);
+      } else {
+        // stage1: the variable's register is written only once its value
+        // is computed (`x86_scalar_into` writes it early only from
+        // operands that are variables, and none of them in it), so its
+        // interval starts after the value.
+        vec_push(&mut g.decl, X86Decl { nm: id, sc: g.cur });
+        x86_acc_top(&mut g, c, &mut m, p, n.b, w, env, pre);
+        g.pos = wrap_add(g.pos, 1);
+        x86_iv_new(&mut g, id);
+      }
     } else if k == S_ASSIGN {
       let r = node_at(p.nodes, n.a);
       let id = x86_nm(&mut g, p, pre, r.s, r.e);
@@ -1568,11 +1830,13 @@ fn x86_acc_stmts(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, head: u64, 
         v.asg = true;
       }
       x86_name_set(&mut g, id, v);
-      x86_acc_expr(&mut g, c, &mut m, p, n.b, w, env, pre);
+      x86_touch(&mut g, id);
+      x86_acc_top(&mut g, c, &mut m, p, n.b, w, env, pre);
+      x86_touch(&mut g, id);
     } else if k == S_EXPR || k == S_RETURN {
-      x86_acc_expr(&mut g, c, &mut m, p, n.a, w, env, pre);
+      x86_acc_top(&mut g, c, &mut m, p, n.a, w, env, pre);
     } else if k == S_IF {
-      x86_acc_expr(&mut g, c, &mut m, p, n.a, w, env, pre);
+      x86_acc_top(&mut g, c, &mut m, p, n.a, w, env, pre);
       let outer = x86_enter(&mut g);
       x86_acc_stmts(&mut g, c, &mut m, p, n.b, w, env, pre);
       g.cur = outer;
@@ -1581,12 +1845,18 @@ fn x86_acc_stmts(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, head: u64, 
       g.cur = outer2;
     } else if k == S_WHILE {
       let w8 = x86_sat8(w);
-      x86_acc_expr(&mut g, c, &mut m, p, n.a, w8, env, pre);
+      let ls = g.pos;
+      x86_acc_top(&mut g, c, &mut m, p, n.a, w8, env, pre);
       let outer = x86_enter(&mut g);
       x86_acc_stmts(&mut g, c, &mut m, p, n.c, w8, env, pre);
       g.cur = outer;
+      if !g.stage0 {
+        g.pos = wrap_add(g.pos, 1);
+        vec_push(&mut g.loops, ls);
+        vec_push(&mut g.loops, g.pos);
+      }
     } else if k == S_MATCH {
-      x86_acc_expr(&mut g, c, &mut m, p, n.a, w, env, pre);
+      x86_acc_top(&mut g, c, &mut m, p, n.a, w, env, pre);
       let mut a = n.b;
       while a != 0 {
         let arm = node_at(p.nodes, a);
@@ -1621,6 +1891,12 @@ fn x86_assign_regs(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
   while vec_len(g.decl) > 0 {
     vec_pop(&mut g.decl);
   }
+  while vec_len(g.ivs) > 0 {
+    vec_pop(&mut g.ivs);
+  }
+  x86_clear(&mut g.loops);
+  x86_clear(&mut g.xt);
+  g.pos = 0;
   let xi = inst_at(m, x);
   let dn = node_at(p.nodes, xi.def);
   let mut q = dn.a;
@@ -1636,7 +1912,19 @@ fn x86_assign_regs(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
     }
     q = qn.next;
   }
+  // stage1: the parameters arrive together, so all are alive at once.
+  if !g.stage0 {
+    q = dn.a;
+    while q != 0 {
+      let qn = node_at(p.nodes, q);
+      x86_touch(&mut g, x86_nm(&mut g, p, 0, qn.s, qn.e));
+      q = qn.next;
+    }
+  }
   x86_acc_stmts(&mut g, c, &mut m, p, dn.x, 1, x, 0);
+  if !g.stage0 {
+    x86_iv_loops(&mut g);
+  }
   // A `&mut` parameter's address may live in a register too (stage1 only):
   // it never changes, and lending it on (`&mut v`) passes the address on.
   // No other name in the body can be spelled the same (no shadowing).
@@ -1690,7 +1978,13 @@ fn x86_assign_regs(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
     let mut j = 0;
     while j < vec_len(done) {
       let other = u_at(done, j);
-      if x86_overlap(g, id, other) {
+      let mut ov = false;
+      if g.stage0 {
+        ov = x86_overlap(g, id, other);
+      } else {
+        ov = x86_iv_overlap(g, id, other);
+      }
+      if ov {
         let o = x86_name_at(g, other);
         vec_push(&mut taken, o.r0);
         vec_push(&mut taken, o.r1);
@@ -3807,17 +4101,22 @@ fn x86_bind_params(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, i
     if has_id(changed, pid) {
       // stage1: a `&mut` parameter that the body writes through, but
       // never points elsewhere, is still the caller's address when that
-      // is a register (and an offset).
+      // is a register (and an offset) or a frame slot.
       if !g.stage0 && mutp && an.kind == E_MUTBORROW && !has_id(whole, pid) {
         let segs = x86_lsegs(p, an.a);
         let s2 = x86_store_of(&mut g, c, m, p, segs);
         vec_free(segs);
-        if s2.k == XS_PREG {
+        if s2.k == XS_PREG || s2.k == XS_SLOT {
           st = s2;
         }
       }
     } else if an.kind == E_VAR && !mutp {
-      st = x86_st_of(x86_var(&mut g, p, a));
+      // stage1: unless the parameter has registers of its own (see
+      // `x86_own_regs`; the same test as when uses were counted).
+      let pn = x86_name_at(g, pid);
+      if g.stage0 || pn.rn <= 1 || !x86_own_regs(&mut g, c, &mut m, p, x, an, pt, g.pre) {
+        st = x86_st_of(x86_var(&mut g, p, a));
+      }
     } else if !g.stage0 && an.kind == E_FIELD && !mutp && !lends && kind_t(m, base_t(m, pt)) == TY_STRUCT && x86_is_place(p, a) {
       // stage1: a struct field the body only reads is read where it is
       // (in a frame slot, or at an address in a register).
@@ -4428,10 +4727,24 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
   } else if name_is(p, i, "vec_push") {
     let w = x86_words(&mut g, c, m, p, x86_vec_elem(&mut g, c, &mut m, p, a0));
     let pr = x86_mutref_reg(&mut g, p, a0);
+    // stage1: the vector's header, in memory at an address in a register
+    // or in a frame slot.
+    let mut hd = x86_none();
     if w == 1 && pr != 0 {
-      // stage1: the vector's address is in register `pr`, which a call
-      // keeps (or `x86_e` saves around it); a register or small constant
-      // value is stored from where it is.
+      hd = x86_mem(pr, XB);
+    } else if w == 1 && !g.stage0 && kind_of(p, a0) == E_MUTBORROW {
+      let bn = node_at(p.nodes, a0);
+      let segs = x86_lsegs(p, bn.a);
+      let st = x86_store_of(&mut g, c, m, p, segs);
+      vec_free(segs);
+      if st.k == XS_SLOT {
+        hd = x86_frame_op(st.o);
+      }
+    }
+    if hd.k != 0 {
+      // stage1: the header stays where it is, which a call keeps (or
+      // `x86_e` saves its register around it); a register or small
+      // constant value is stored from where it is.
       let l = x86_label(&mut g);
       let mut v = x86_none();
       if x86_simple(p, a1) {
@@ -4445,43 +4758,40 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
         x86_es(&mut g, "mov %rax, %rdx");
         v = x86_reg(XR_RDX);
       }
-      x86_t(&mut g, "mov (");
-      x86_r(&mut g, pr);
-      x86_t(&mut g, "), %rax");
-      x86_e(&mut g);
-      x86_t(&mut g, "cmp 8(");
-      x86_r(&mut g, pr);
-      x86_t(&mut g, "), %rax");
+      x86_mov(&mut g, hd, x86_reg(XR_RAX));
+      x86_t(&mut g, "cmp ");
+      x86_o(&mut g, x86_mem(hd.r, wrap_add(hd.v, 8)));
+      x86_t(&mut g, ", %rax");
       x86_e(&mut g);
       x86_jump(&mut g, "jne", l);
       let keep = v.k == XO_REG && v.r == XR_RDX;
       if keep {
         x86_push(&mut g, v);
       }
-      x86_mov(&mut g, x86_reg(pr), x86_reg(XR_RDI));
+      if pr != 0 {
+        x86_mov(&mut g, x86_reg(pr), x86_reg(XR_RDI));
+      } else {
+        x86_t(&mut g, "lea ");
+        x86_o(&mut g, hd);
+        x86_t(&mut g, ", %rdi");
+        x86_e(&mut g);
+      }
       x86_es(&mut g, "mov $8, %esi");
       x86_es(&mut g, "call bst_rt_vec_grow");
       if keep {
         x86_pop(&mut g, v);
       }
-      x86_t(&mut g, "mov (");
-      x86_r(&mut g, pr);
-      x86_t(&mut g, "), %rax");
-      x86_e(&mut g);
+      x86_mov(&mut g, hd, x86_reg(XR_RAX));
       x86_place_label(&mut g, l);
-      x86_t(&mut g, "mov 16(");
-      x86_r(&mut g, pr);
-      x86_t(&mut g, "), %rcx");
-      x86_e(&mut g);
+      x86_mov(&mut g, x86_mem(hd.r, wrap_add(hd.v, 16)), x86_reg(XR_RCX));
       x86_t(&mut g, "mov");
       x86_q(&mut g, v);
       x86_t(&mut g, " ");
       x86_o(&mut g, v);
       x86_t(&mut g, ", (%rcx,%rax,8)");
       x86_e(&mut g);
-      x86_t(&mut g, "incq (");
-      x86_r(&mut g, pr);
-      x86_t(&mut g, ")");
+      x86_t(&mut g, "incq ");
+      x86_o(&mut g, hd);
       x86_e(&mut g);
     } else if w == 1 && kind_of(p, a0) == E_MUTBORROW {
       // The value cannot change the vector (it is lent), so it goes first,
