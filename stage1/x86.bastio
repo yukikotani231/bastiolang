@@ -3654,8 +3654,12 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     // it held before.
     if name_is(p, i, "pool_take") {
       x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RAX, 0, 0, 0);
-      x86_es(&mut g, "shl $12, %rax");
-      x86_es(&mut g, "add (%rdx), %rax");
+      if g.target == TARGET_KERNEL {
+        x86_es(&mut g, "call bst_rt_page_at");   // the runs of RAM (bst_rt_pool_init)
+      } else {
+        x86_es(&mut g, "shl $12, %rax");
+        x86_es(&mut g, "add (%rdx), %rax");
+      }
     } else if g.target == TARGET_KERNEL {
       x86_to_regs(&mut g, c, &mut m, p, i, XR_RAX, XR_RSI, 0, 0, 0);
     } else {
@@ -3686,8 +3690,7 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RAX, 0, 0, 0, 0);
   } else if name_is(p, i, "frame_id") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RAX, 0, 0, 0, 0);
-    x86_es(&mut g, "sub bst_rt_pool_base(%rip), %rax");
-    x86_es(&mut g, "shr $12, %rax");
+    x86_page_id(&mut g);
   } else if name_is(p, i, "frame_read") || name_is(p, i, "frame_read8") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RAX, 0, 0, 0);
     if name_is(p, i, "frame_read") {
@@ -3707,9 +3710,8 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     // A load is an acquire on x86.
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RAX, 0, 0, 0, 0);
     x86_es(&mut g, "mov (%rax), %rax");
-    x86_es(&mut g, "sub bst_rt_pool_base(%rip), %rax");
-    x86_es(&mut g, "shr $12, %rax");
-    x86_es(&mut g, "lea bst_rt_pt_leases(%rip), %rcx");
+    x86_page_id(&mut g);
+    x86_counts(&mut g, "bst_rt_pt_leases");
     x86_es(&mut g, "mov (%rcx,%rax,4), %eax");
   } else if name_is(p, i, "bcopy") || name_is(p, i, "bytes_to_frame") {
     // Bulk copies: %rdi the destination, %rsi the source, %rcx the count.
@@ -3846,8 +3848,7 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_es(&mut g, "rep movsq");
   } else if name_is(p, i, "shared_id") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RAX, 0, 0, 0, 0);
-    x86_es(&mut g, "sub bst_rt_pool_base(%rip), %rax");
-    x86_es(&mut g, "shr $12, %rax");
+    x86_page_id(&mut g);
   } else if name_is(p, i, "pt_shared") {
     // Bit 9, one the processor ignores, marks a slot mapping a shared page.
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RAX, 0, 0, 0);
@@ -4531,6 +4532,9 @@ fn x86_builtin1(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_jump(&mut g, "jne", again);
   } else if name_is(p, i, "port_claim") || name_is(p, i, "mmio_claim") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, XR_RSI, XR_RDX, 0, 0);
+    if name_is(p, i, "mmio_claim") && g.target == TARGET_KERNEL {
+      x86_es(&mut g, "call bst_rt_mmio_check");   // the window overlaps RAM above 2 GiB
+    }
     x86_push(&mut g, x86_reg(XR_RDX));
     x86_push(&mut g, x86_reg(XR_RSI));
   } else if name_is(p, i, "port_release") || name_is(p, i, "mmio_release") {
@@ -4564,8 +4568,7 @@ fn x86_builtin1(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RAX, 0, 0, 0, 0);
   } else if name_is(p, i, "dma_id") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RAX, 0, 0, 0, 0);
-    x86_es(&mut g, "sub bst_rt_pool_base(%rip), %rax");
-    x86_es(&mut g, "shr $12, %rax");
+    x86_page_id(&mut g);
   } else if name_is(p, i, "host_env") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RCX, XR_RDI, XR_RSI, XR_RDX, 0);
     x86_es(&mut g, "call bst_rt_host_env");
@@ -4603,10 +4606,8 @@ fn x86_builtin1(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     // barrier), as the C prelude's `bst_mmu_enter`.
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RAX, 0, 0, 0);
     x86_es(&mut g, "mov (%rax), %rax");
-    x86_es(&mut g, "mov %rax, %rdx");
-    x86_es(&mut g, "sub bst_rt_pool_base(%rip), %rdx");
-    x86_es(&mut g, "shr $12, %rdx");
-    x86_es(&mut g, "lea bst_rt_pt_leases(%rip), %rcx");
+    x86_page_id_rdx(&mut g);
+    x86_counts(&mut g, "bst_rt_pt_leases");
     x86_es(&mut g, "lock addl $1, (%rcx,%rdx,4)");
     x86_es(&mut g, "mov %rax, %cr3");
   } else if name_is(p, i, "mmu_exit") && !g.stage0 {
@@ -4614,9 +4615,8 @@ fn x86_builtin1(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RAX, 0, 0, 0);
     x86_es(&mut g, "lea bst_kernel_pml4(%rip), %rcx");
     x86_es(&mut g, "mov %rcx, %cr3");
-    x86_es(&mut g, "sub bst_rt_pool_base(%rip), %rax");
-    x86_es(&mut g, "shr $12, %rax");
-    x86_es(&mut g, "lea bst_rt_pt_leases(%rip), %rcx");
+    x86_page_id(&mut g);
+    x86_counts(&mut g, "bst_rt_pt_leases");
     x86_es(&mut g, "lock subl $1, (%rcx,%rax,4)");
   } else if name_is(p, i, "mmu_kernel") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, 0, 0, 0, 0);
@@ -4721,10 +4721,45 @@ fn x86_take_pool(g: &mut X86) {
 /// Shared pages: %rdx the page number of the page at %rax, %rcx the
 /// reference counts.
 fn x86_shared_ref(g: &mut X86) {
+  x86_page_id_rdx(&mut g);
+  x86_counts(&mut g, "bst_rt_shared_refs");
+}
+
+/// %rax = the page number of the page at %rax. A kernel's page numbers run
+/// over several runs of RAM (bst_rt_frame_id); a hosted pool is one run.
+fn x86_page_id(g: &mut X86) {
+  if g.target == TARGET_KERNEL {
+    x86_es(&mut g, "call bst_rt_frame_id");
+  } else {
+    x86_es(&mut g, "sub bst_rt_pool_base(%rip), %rax");
+    x86_es(&mut g, "shr $12, %rax");
+  }
+}
+
+/// %rdx = the page number of the page at %rax, which stays.
+fn x86_page_id_rdx(g: &mut X86) {
   x86_es(&mut g, "mov %rax, %rdx");
-  x86_es(&mut g, "sub bst_rt_pool_base(%rip), %rdx");
-  x86_es(&mut g, "shr $12, %rdx");
-  x86_es(&mut g, "lea bst_rt_shared_refs(%rip), %rcx");
+  if g.target == TARGET_KERNEL {
+    x86_es(&mut g, "xchg %rax, %rdx");
+    x86_es(&mut g, "call bst_rt_frame_id");
+    x86_es(&mut g, "xchg %rax, %rdx");
+  } else {
+    x86_es(&mut g, "sub bst_rt_pool_base(%rip), %rdx");
+    x86_es(&mut g, "shr $12, %rdx");
+  }
+}
+
+/// %rcx = the per-page counters `sym`: carved from RAM in a kernel (a
+/// pointer), static in a hosted program.
+fn x86_counts(g: &mut X86, sym: Str) {
+  if g.target == TARGET_KERNEL {
+    x86_t(&mut g, "mov ");
+  } else {
+    x86_t(&mut g, "lea ");
+  }
+  x86_t(&mut g, sym);
+  x86_t(&mut g, "(%rip), %rcx");
+  x86_e(&mut g);
 }
 
 /// The register of expression `i` if it is a variable kept in one (0: none).
@@ -7334,10 +7369,21 @@ fn x86_runtime_kernel(out: &mut Vec[u64]) {
   cg_s(&mut out, "\tmov $1048576, %ecx          # the arena's words: 8 MiB\n");
   cg_s(&mut out, "\tsub %rax, %rcx\n");
   cg_s(&mut out, "\tcmp %rcx, %rdi\n");
-  cg_s(&mut out, "\tja 6f\n");
+  cg_s(&mut out, "\tja 8f\n");
   cg_s(&mut out, "\tlea (%rax,%rdi), %rcx\n");
   cg_s(&mut out, "\tmov %rcx, bst_rt_arena_top(%rip)\n");
   cg_s(&mut out, "\tlea bst_rt_arena(%rip), %rcx\n");
+  cg_s(&mut out, "\tlea (%rcx,%rax,8), %rax\n");
+  cg_s(&mut out, "\tmov %rdi, (%rax)\n");
+  cg_s(&mut out, "\tjmp 5f\n");
+  cg_s(&mut out, "8:\tmov bst_rt_arena2_top(%rip), %rax   # then the extension bst_rt_pool_init carved from RAM\n");
+  cg_s(&mut out, "\tmov bst_rt_arena2_words(%rip), %rcx\n");
+  cg_s(&mut out, "\tsub %rax, %rcx\n");
+  cg_s(&mut out, "\tcmp %rcx, %rdi\n");
+  cg_s(&mut out, "\tja 6f\n");
+  cg_s(&mut out, "\tlea (%rax,%rdi), %rcx\n");
+  cg_s(&mut out, "\tmov %rcx, bst_rt_arena2_top(%rip)\n");
+  cg_s(&mut out, "\tmov bst_rt_arena2(%rip), %rcx\n");
   cg_s(&mut out, "\tlea (%rcx,%rax,8), %rax\n");
   cg_s(&mut out, "\tmov %rdi, (%rax)\n");
   cg_s(&mut out, "5:\tmovq $0, bst_rt_arena_lock(%rip)\n");
@@ -7495,70 +7541,321 @@ fn x86_runtime_kernel(out: &mut Vec[u64]) {
   cg_s(&mut out, "\tlea .Lrt_oom(%rip), %rdi\n");
   cg_s(&mut out, "\tcall bst_rt_puts\n");
   cg_s(&mut out, "\tjmp bst_rt_halt\n");
-  cg_s(&mut out, "bst_rt_pool_init:               # the page pool, from the Multiboot information at %rdi: %rax = base, %rdx = pages\n");
+  cg_s(&mut out, "\t.weak bst_ram_limit            # where the platform's map of RAM stops, if it says\n");
+  cg_s(&mut out, "bst_rt_pool_init:               # the page pool, from the Multiboot information at %rdi: %rax = first page, %rdx = pages (the C prelude's bst_pool_init)\n");
+  cg_s(&mut out, "\tpush %rbp\n");
+  cg_s(&mut out, "\tmov %rsp, %rbp\n");
   cg_s(&mut out, "\tpush %rbx\n");
   cg_s(&mut out, "\tpush %r12\n");
-  cg_s(&mut out, "\tlea _end(%rip), %r8         # base: the first page after the kernel image\n");
-  cg_s(&mut out, "\tadd $4095, %r8\n");
-  cg_s(&mut out, "\tand $-4096, %r8\n");
-  cg_s(&mut out, "\tmov $0x4000000, %r9d        # the end of RAM: 64 MiB unless told\n");
-  cg_s(&mut out, "\ttest %rdi, %rdi\n");
-  cg_s(&mut out, "\tjz 9f\n");
-  cg_s(&mut out, "\ttestl $1, (%rdi)            # mem_upper\n");
+  cg_s(&mut out, "\tpush %r13\n");
+  cg_s(&mut out, "\tpush %r14\n");
+  cg_s(&mut out, "\tpush %r15\n");
+  cg_s(&mut out, "\tsub $520, %rsp              # -560(%rbp): 32 run starts, then their 32 ends\n");
+  cg_s(&mut out, "\tmov %rdi, %rbx\n");
+  cg_s(&mut out, "\tlea _end(%rip), %r14        # base: the first page after the kernel image\n");
+  cg_s(&mut out, "\tadd $4095, %r14\n");
+  cg_s(&mut out, "\tand $-4096, %r14\n");
+  cg_s(&mut out, "\tmov $0x40000000, %r15d      # limit: where the platform's map of RAM stops (bst_ram_limit), else 1 GiB\n");
+  cg_s(&mut out, "\tlea bst_ram_limit(%rip), %rax\n");
+  cg_s(&mut out, "\ttest %rax, %rax\n");
   cg_s(&mut out, "\tjz 1f\n");
-  cg_s(&mut out, "\tmov 8(%rdi), %r9d\n");
-  cg_s(&mut out, "\tshl $10, %r9\n");
-  cg_s(&mut out, "\tadd $0x100000, %r9\n");
-  cg_s(&mut out, "1:\ttestl $64, (%rdi)           # a memory map, if it lies inside the first 1 GiB\n");
-  cg_s(&mut out, "\tjz 9f\n");
-  cg_s(&mut out, "\tmov 48(%rdi), %r10d\n");
-  cg_s(&mut out, "\tmov 44(%rdi), %r11d\n");
-  cg_s(&mut out, "\tlea (%r10,%r11), %rcx\n");
-  cg_s(&mut out, "\tcmp $0x40000000, %rcx\n");
-  cg_s(&mut out, "\tja 9f\n");
-  cg_s(&mut out, "\tadd %r10, %r11              # its end\n");
-  cg_s(&mut out, "\tmov %r8, %rbx               # the end of the run of available entries that holds base\n");
-  cg_s(&mut out, "2:\txor %r12d, %r12d            # grew\n");
-  cg_s(&mut out, "\tmov %r10, %rcx\n");
-  cg_s(&mut out, "3:\tlea 24(%rcx), %rax\n");
-  cg_s(&mut out, "\tcmp %r11, %rax\n");
+  cg_s(&mut out, "\tmov (%rax), %r15\n");
+  cg_s(&mut out, "1:\tmov $0x8000000000, %rax     # and at most 512 GiB\n");
+  cg_s(&mut out, "\tcmp %rax, %r15\n");
+  cg_s(&mut out, "\tjbe 1f\n");
+  cg_s(&mut out, "\tmov %rax, %r15\n");
+  cg_s(&mut out, "1:\txor %r12d, %r12d            # runs\n");
+  cg_s(&mut out, "\ttest %rbx, %rbx\n");
+  cg_s(&mut out, "\tjz 5f\n");
+  cg_s(&mut out, "\ttestl $64, (%rbx)           # a memory map, if it lies inside the first 1 GiB\n");
+  cg_s(&mut out, "\tjz 5f\n");
+  cg_s(&mut out, "\tmov 48(%rbx), %eax\n");
+  cg_s(&mut out, "\tmov 44(%rbx), %r13d\n");
+  cg_s(&mut out, "\tadd %rax, %r13              # its end\n");
+  cg_s(&mut out, "\tcmp $0x40000000, %r13\n");
   cg_s(&mut out, "\tja 5f\n");
-  cg_s(&mut out, "\tcmpl $20, (%rcx)            # an entry too short ends the map\n");
-  cg_s(&mut out, "\tjb 5f\n");
-  cg_s(&mut out, "\tcmpl $1, 20(%rcx)           # available\n");
+  cg_s(&mut out, "\tmov %rax, %rbx              # an entry\n");
+  cg_s(&mut out, "2:\tlea 24(%rbx), %rax\n");
+  cg_s(&mut out, "\tcmp %r13, %rax\n");
+  cg_s(&mut out, "\tja 7f\n");
+  cg_s(&mut out, "\tcmpl $20, (%rbx)            # an entry too short ends the map\n");
+  cg_s(&mut out, "\tjb 7f\n");
+  cg_s(&mut out, "\tmov 4(%rbx), %rsi           # [a, b)\n");
+  cg_s(&mut out, "\tmov 12(%rbx), %rdx\n");
+  cg_s(&mut out, "\tadd %rsi, %rdx\n");
+  cg_s(&mut out, "\tjnc 3f\n");
+  cg_s(&mut out, "\tmov $-1, %rdx\n");
+  cg_s(&mut out, "3:\tcmp %r14, %rsi\n");
+  cg_s(&mut out, "\tjae 3f\n");
+  cg_s(&mut out, "\tmov %r14, %rsi\n");
+  cg_s(&mut out, "3:\tcmp %r15, %rdx\n");
+  cg_s(&mut out, "\tjbe 3f\n");
+  cg_s(&mut out, "\tmov %r15, %rdx\n");
+  cg_s(&mut out, "3:\tcmpl $1, 20(%rbx)           # available\n");
   cg_s(&mut out, "\tjne 4f\n");
-  cg_s(&mut out, "\tmov 4(%rcx), %rax\n");
-  cg_s(&mut out, "\tcmp %rbx, %rax\n");
-  cg_s(&mut out, "\tja 4f\n");
-  cg_s(&mut out, "\tadd 12(%rcx), %rax\n");
-  cg_s(&mut out, "\tcmp %rax, %rbx\n");
+  cg_s(&mut out, "\tcmp %rdx, %rsi\n");
   cg_s(&mut out, "\tjae 4f\n");
-  cg_s(&mut out, "\tmov %rax, %rbx\n");
-  cg_s(&mut out, "\tmov $1, %r12d\n");
-  cg_s(&mut out, "4:\tmov (%rcx), %eax\n");
-  cg_s(&mut out, "\tlea 4(%rcx,%rax), %rcx\n");
-  cg_s(&mut out, "\tjmp 3b\n");
-  cg_s(&mut out, "5:\ttest %r12, %r12\n");
-  cg_s(&mut out, "\tjnz 2b\n");
-  cg_s(&mut out, "\tmov %rbx, %r9\n");
-  cg_s(&mut out, "9:\tmov $0x40000000, %eax       # at most the 1 GiB the boot code identity-maps\n");
-  cg_s(&mut out, "\tcmp %rax, %r9\n");
+  cg_s(&mut out, "\tadd $4095, %rsi\n");
+  cg_s(&mut out, "\tand $-4096, %rsi\n");
+  cg_s(&mut out, "\tand $-4096, %rdx\n");
+  cg_s(&mut out, "\tcmp %rdx, %rsi\n");
+  cg_s(&mut out, "\tjae 4f\n");
+  cg_s(&mut out, "\tlea -560(%rbp), %rdi\n");
+  cg_s(&mut out, "\tmov %r12, %rcx\n");
+  cg_s(&mut out, "\tcall bst_rt_run_put\n");
+  cg_s(&mut out, "\tmov %rax, %r12\n");
+  cg_s(&mut out, "4:\tmov (%rbx), %eax\n");
+  cg_s(&mut out, "\tlea 4(%rbx,%rax), %rbx\n");
+  cg_s(&mut out, "\tjmp 2b\n");
+  cg_s(&mut out, "5:\tmov $0x4000000, %edx        # no map: mem_upper's run, 64 MiB unless told\n");
+  cg_s(&mut out, "\ttest %rbx, %rbx\n");
+  cg_s(&mut out, "\tjz 6f\n");
+  cg_s(&mut out, "\ttestl $1, (%rbx)\n");
+  cg_s(&mut out, "\tjz 6f\n");
+  cg_s(&mut out, "\tmov 8(%rbx), %edx\n");
+  cg_s(&mut out, "\tshl $10, %rdx\n");
+  cg_s(&mut out, "\tadd $0x100000, %rdx\n");
+  cg_s(&mut out, "6:\tcmp %r15, %rdx\n");
   cg_s(&mut out, "\tjbe 6f\n");
-  cg_s(&mut out, "\tmov %rax, %r9\n");
-  cg_s(&mut out, "6:\txor %edx, %edx\n");
-  cg_s(&mut out, "\tcmp %r8, %r9\n");
-  cg_s(&mut out, "\tjbe 7f\n");
-  cg_s(&mut out, "\tmov %r9, %rdx\n");
-  cg_s(&mut out, "\tsub %r8, %rdx\n");
-  cg_s(&mut out, "\tshr $12, %rdx\n");
-  cg_s(&mut out, "\tcmp $262144, %rdx           # at most 2^18 pages\n");
-  cg_s(&mut out, "\tjbe 7f\n");
-  cg_s(&mut out, "\tmov $262144, %edx\n");
-  cg_s(&mut out, "7:\tmov %r8, bst_rt_pool_base(%rip)\n");
-  cg_s(&mut out, "\tmov %r8, %rax\n");
+  cg_s(&mut out, "\tmov %r15, %rdx\n");
+  cg_s(&mut out, "6:\tand $-4096, %rdx\n");
+  cg_s(&mut out, "\tcmp %rdx, %r14\n");
+  cg_s(&mut out, "\tjae 7f\n");
+  cg_s(&mut out, "\tlea -560(%rbp), %rdi\n");
+  cg_s(&mut out, "\tmov %r14, %rsi\n");
+  cg_s(&mut out, "\txor %ecx, %ecx\n");
+  cg_s(&mut out, "\tcall bst_rt_run_put\n");
+  cg_s(&mut out, "\tmov %rax, %r12\n");
+  cg_s(&mut out, "7:\tlea -560(%rbp), %rbx        # at most 2^27 pages: the top runs go first\n");
+  cg_s(&mut out, "\txor %r13d, %r13d            # pages\n");
+  cg_s(&mut out, "\txor %r9d, %r9d\n");
+  cg_s(&mut out, "1:\tcmp %r12, %r9\n");
+  cg_s(&mut out, "\tjae 3f\n");
+  cg_s(&mut out, "\tmov 256(%rbx,%r9,8), %rax\n");
+  cg_s(&mut out, "\tsub (%rbx,%r9,8), %rax\n");
+  cg_s(&mut out, "\tshr $12, %rax\n");
+  cg_s(&mut out, "\tmov $0x8000000, %ecx\n");
+  cg_s(&mut out, "\tsub %r13, %rcx\n");
+  cg_s(&mut out, "\tcmp %rcx, %rax\n");
+  cg_s(&mut out, "\tjbe 2f\n");
+  cg_s(&mut out, "\tmov %rcx, %rax\n");
+  cg_s(&mut out, "\tshl $12, %rcx\n");
+  cg_s(&mut out, "\tadd (%rbx,%r9,8), %rcx\n");
+  cg_s(&mut out, "\tmov %rcx, 256(%rbx,%r9,8)\n");
+  cg_s(&mut out, "2:\tadd %rax, %r13\n");
+  cg_s(&mut out, "\tinc %r9\n");
+  cg_s(&mut out, "\tjmp 1b\n");
+  cg_s(&mut out, "3:\tlea 4095(,%r13,8), %r15     # the bookkeeping: counter pages, then the arena's extension\n");
+  cg_s(&mut out, "\tshr $12, %r15\n");
+  cg_s(&mut out, "\tmov %r13, %r11\n");
+  cg_s(&mut out, "\tshr $5, %r11\n");
+  cg_s(&mut out, "\tcmp $1024, %r11               # at least 4 MiB, at most an eighth of the pages\n");
+  cg_s(&mut out, "\tjae 4f\n");
+  cg_s(&mut out, "\tmov %r13, %r11\n");
+  cg_s(&mut out, "\tshr $3, %r11\n");
+  cg_s(&mut out, "\tmov $1024, %ecx\n");
+  cg_s(&mut out, "\tcmp %rcx, %r11\n");
+  cg_s(&mut out, "\tcmova %rcx, %r11\n");
+  cg_s(&mut out, "4:\txor %r9d, %r9d              # the first run with room for it (more than its pages)\n");
+  cg_s(&mut out, "5:\tcmp %r12, %r9\n");
+  cg_s(&mut out, "\tjae 6f\n");
+  cg_s(&mut out, "\tmov 256(%rbx,%r9,8), %rax\n");
+  cg_s(&mut out, "\tsub (%rbx,%r9,8), %rax\n");
+  cg_s(&mut out, "\tshr $12, %rax\n");
+  cg_s(&mut out, "\tlea (%r15,%r11), %rcx\n");
+  cg_s(&mut out, "\tcmp %rcx, %rax\n");
+  cg_s(&mut out, "\tja 7f\n");
+  cg_s(&mut out, "\tinc %r9\n");
+  cg_s(&mut out, "\tjmp 5b\n");
+  cg_s(&mut out, "6:\ttest %r11, %r11             # none: try again without the extension\n");
+  cg_s(&mut out, "\tjz 9f\n");
+  cg_s(&mut out, "\txor %r11d, %r11d\n");
+  cg_s(&mut out, "\tjmp 4b\n");
+  cg_s(&mut out, "7:\tmov (%rbx,%r9,8), %rsi\n");
+  cg_s(&mut out, "\tmov %rsi, %rdi\n");
+  cg_s(&mut out, "\tmov %r15, %rcx\n");
+  cg_s(&mut out, "\tshl $9, %rcx\n");
+  cg_s(&mut out, "\txor %eax, %eax\n");
+  cg_s(&mut out, "\trep stosq\n");
+  cg_s(&mut out, "\tmov %rsi, bst_rt_pt_leases(%rip)\n");
+  cg_s(&mut out, "\tlea (%rsi,%r13,4), %rax\n");
+  cg_s(&mut out, "\tmov %rax, bst_rt_shared_refs(%rip)\n");
+  cg_s(&mut out, "\tmov %r15, %rax\n");
+  cg_s(&mut out, "\tshl $12, %rax\n");
+  cg_s(&mut out, "\tadd %rsi, %rax\n");
+  cg_s(&mut out, "\tmov %rax, bst_rt_arena2(%rip)\n");
+  cg_s(&mut out, "\tmov %r11, %rcx\n");
+  cg_s(&mut out, "\tshl $9, %rcx\n");
+  cg_s(&mut out, "\tmov %rcx, bst_rt_arena2_words(%rip)\n");
+  cg_s(&mut out, "\tmov %rsi, bst_rt_carved_lo(%rip)\n");
+  cg_s(&mut out, "\tlea (%r15,%r11), %rcx\n");
+  cg_s(&mut out, "\tshl $12, %rcx\n");
+  cg_s(&mut out, "\tadd %rsi, %rcx\n");
+  cg_s(&mut out, "\tmov %rcx, bst_rt_carved_hi(%rip)\n");
+  cg_s(&mut out, "\tmov %rcx, (%rbx,%r9,8)\n");
+  cg_s(&mut out, "\tlea bst_rt_run_at(%rip), %rdi    # dense page ids over the runs\n");
+  cg_s(&mut out, "\tlea bst_rt_run_id(%rip), %rsi\n");
+  cg_s(&mut out, "\txor %r9d, %r9d\n");
+  cg_s(&mut out, "\txor %edx, %edx\n");
+  cg_s(&mut out, "8:\tcmp %r12, %r9\n");
+  cg_s(&mut out, "\tjae 8f\n");
+  cg_s(&mut out, "\tmov (%rbx,%r9,8), %rax\n");
+  cg_s(&mut out, "\tmov %rax, (%rdi,%r9,8)\n");
+  cg_s(&mut out, "\tmov 256(%rbx,%r9,8), %rcx\n");
+  cg_s(&mut out, "\tsub %rax, %rcx\n");
+  cg_s(&mut out, "\tshr $12, %rcx\n");
+  cg_s(&mut out, "\tadd %rcx, %rdx\n");
+  cg_s(&mut out, "\tmov %rdx, 8(%rsi,%r9,8)\n");
+  cg_s(&mut out, "\tinc %r9\n");
+  cg_s(&mut out, "\tjmp 8b\n");
+  cg_s(&mut out, "8:\tmov %r12, bst_rt_runs(%rip)\n");
+  cg_s(&mut out, "\tmov (%rbx), %rax\n");
+  cg_s(&mut out, "\tjmp 0f\n");
+  cg_s(&mut out, "9:\tmov %r14, %rax              # no room even for the counters: no pages\n");
+  cg_s(&mut out, "\txor %edx, %edx\n");
+  cg_s(&mut out, "0:\tlea -40(%rbp), %rsp\n");
+  cg_s(&mut out, "\tpop %r15\n");
+  cg_s(&mut out, "\tpop %r14\n");
+  cg_s(&mut out, "\tpop %r13\n");
   cg_s(&mut out, "\tpop %r12\n");
   cg_s(&mut out, "\tpop %rbx\n");
+  cg_s(&mut out, "\tpop %rbp\n");
   cg_s(&mut out, "\tret\n");
+  cg_s(&mut out, "bst_rt_run_put:                 # add [%rsi, %rdx) to the %rcx sorted runs at %rdi (ends 256 bytes on), merging the ones it touches: %rax = runs\n");
+  cg_s(&mut out, "\txor %r8d, %r8d              # runs kept\n");
+  cg_s(&mut out, "\txor %r9d, %r9d\n");
+  cg_s(&mut out, "1:\tcmp %rcx, %r9\n");
+  cg_s(&mut out, "\tjae 4f\n");
+  cg_s(&mut out, "\tmov 256(%rdi,%r9,8), %r10\n");
+  cg_s(&mut out, "\tcmp %rsi, %r10\n");
+  cg_s(&mut out, "\tjb 2f\n");
+  cg_s(&mut out, "\tmov (%rdi,%r9,8), %r11\n");
+  cg_s(&mut out, "\tcmp %r11, %rdx\n");
+  cg_s(&mut out, "\tjb 2f\n");
+  cg_s(&mut out, "\tcmp %rsi, %r11              # it touches: take it in\n");
+  cg_s(&mut out, "\tjae 3f\n");
+  cg_s(&mut out, "\tmov %r11, %rsi\n");
+  cg_s(&mut out, "3:\tcmp %rdx, %r10\n");
+  cg_s(&mut out, "\tjbe 3f\n");
+  cg_s(&mut out, "\tmov %r10, %rdx\n");
+  cg_s(&mut out, "3:\tinc %r9\n");
+  cg_s(&mut out, "\tjmp 1b\n");
+  cg_s(&mut out, "2:\tmov (%rdi,%r9,8), %r11\n");
+  cg_s(&mut out, "\tmov %r11, (%rdi,%r8,8)\n");
+  cg_s(&mut out, "\tmov %r10, 256(%rdi,%r8,8)\n");
+  cg_s(&mut out, "\tinc %r8\n");
+  cg_s(&mut out, "\tinc %r9\n");
+  cg_s(&mut out, "\tjmp 1b\n");
+  cg_s(&mut out, "4:\tmov %r8, %rax\n");
+  cg_s(&mut out, "\tcmp $32, %r8                # full: the run is left out\n");
+  cg_s(&mut out, "\tje 6f\n");
+  cg_s(&mut out, "\tmov %r8, %r9\n");
+  cg_s(&mut out, "5:\ttest %r9, %r9\n");
+  cg_s(&mut out, "\tjz 5f\n");
+  cg_s(&mut out, "\tmov -8(%rdi,%r9,8), %r11\n");
+  cg_s(&mut out, "\tcmp %rsi, %r11\n");
+  cg_s(&mut out, "\tjbe 5f\n");
+  cg_s(&mut out, "\tmov %r11, (%rdi,%r9,8)\n");
+  cg_s(&mut out, "\tmov 248(%rdi,%r9,8), %r10\n");
+  cg_s(&mut out, "\tmov %r10, 256(%rdi,%r9,8)\n");
+  cg_s(&mut out, "\tdec %r9\n");
+  cg_s(&mut out, "\tjmp 5b\n");
+  cg_s(&mut out, "5:\tmov %rsi, (%rdi,%r9,8)\n");
+  cg_s(&mut out, "\tmov %rdx, 256(%rdi,%r9,8)\n");
+  cg_s(&mut out, "\tinc %rax\n");
+  cg_s(&mut out, "6:\tret\n");
+  cg_s(&mut out, "bst_rt_page_at:                 # %rax = the address of page %rax (the C prelude's bst_page_at); keeps every other register\n");
+  cg_s(&mut out, "\tpush %rcx\n");
+  cg_s(&mut out, "\tpush %rdx\n");
+  cg_s(&mut out, "\tpush %rsi\n");
+  cg_s(&mut out, "\tlea bst_rt_run_id(%rip), %rsi\n");
+  cg_s(&mut out, "\txor %ecx, %ecx\n");
+  cg_s(&mut out, "1:\tlea 1(%rcx), %rdx\n");
+  cg_s(&mut out, "\tcmp bst_rt_runs(%rip), %rdx\n");
+  cg_s(&mut out, "\tjae 2f\n");
+  cg_s(&mut out, "\tcmp 8(%rsi,%rcx,8), %rax\n");
+  cg_s(&mut out, "\tjb 2f\n");
+  cg_s(&mut out, "\tmov %rdx, %rcx\n");
+  cg_s(&mut out, "\tjmp 1b\n");
+  cg_s(&mut out, "2:\tsub (%rsi,%rcx,8), %rax\n");
+  cg_s(&mut out, "\tshl $12, %rax\n");
+  cg_s(&mut out, "\tlea bst_rt_run_at(%rip), %rsi\n");
+  cg_s(&mut out, "\tadd (%rsi,%rcx,8), %rax\n");
+  cg_s(&mut out, "\tpop %rsi\n");
+  cg_s(&mut out, "\tpop %rdx\n");
+  cg_s(&mut out, "\tpop %rcx\n");
+  cg_s(&mut out, "\tret\n");
+  cg_s(&mut out, "bst_rt_frame_id:                # %rax = the page number of the page at %rax (the C prelude's bst_frame_id); keeps every other register\n");
+  cg_s(&mut out, "\tpush %rcx\n");
+  cg_s(&mut out, "\tpush %rdx\n");
+  cg_s(&mut out, "\tpush %rsi\n");
+  cg_s(&mut out, "\tpush %rdi\n");
+  cg_s(&mut out, "\tpush %r8\n");
+  cg_s(&mut out, "\tlea bst_rt_run_at(%rip), %rsi\n");
+  cg_s(&mut out, "\tlea bst_rt_run_id(%rip), %rdi\n");
+  cg_s(&mut out, "\txor %ecx, %ecx\n");
+  cg_s(&mut out, "1:\tlea 1(%rcx), %rdx\n");
+  cg_s(&mut out, "\tcmp bst_rt_runs(%rip), %rdx\n");
+  cg_s(&mut out, "\tjae 2f\n");
+  cg_s(&mut out, "\tmov 8(%rdi,%rcx,8), %rdx\n");
+  cg_s(&mut out, "\tsub (%rdi,%rcx,8), %rdx\n");
+  cg_s(&mut out, "\tshl $12, %rdx\n");
+  cg_s(&mut out, "\tmov %rax, %r8\n");
+  cg_s(&mut out, "\tsub (%rsi,%rcx,8), %r8\n");
+  cg_s(&mut out, "\tcmp %rdx, %r8\n");
+  cg_s(&mut out, "\tjb 2f\n");
+  cg_s(&mut out, "\tinc %rcx\n");
+  cg_s(&mut out, "\tjmp 1b\n");
+  cg_s(&mut out, "2:\tsub (%rsi,%rcx,8), %rax\n");
+  cg_s(&mut out, "\tshr $12, %rax\n");
+  cg_s(&mut out, "\tadd (%rdi,%rcx,8), %rax\n");
+  cg_s(&mut out, "\tpop %r8\n");
+  cg_s(&mut out, "\tpop %rdi\n");
+  cg_s(&mut out, "\tpop %rsi\n");
+  cg_s(&mut out, "\tpop %rdx\n");
+  cg_s(&mut out, "\tpop %rcx\n");
+  cg_s(&mut out, "\tret\n");
+  cg_s(&mut out, "bst_rt_mmio_check:              # stop the machine if the block at %rsi, %rdx bytes, is pool RAM or its bookkeeping (the C prelude's bst_mmio_check); keeps every register\n");
+  cg_s(&mut out, "\ttest %rdx, %rdx\n");
+  cg_s(&mut out, "\tjz 9f\n");
+  cg_s(&mut out, "\tpush %rax\n");
+  cg_s(&mut out, "\tpush %rcx\n");
+  cg_s(&mut out, "\tpush %rdx\n");
+  cg_s(&mut out, "\tpush %r8\n");
+  cg_s(&mut out, "\tpush %r9\n");
+  cg_s(&mut out, "\tlea (%rsi,%rdx), %r8        # the block's end\n");
+  cg_s(&mut out, "\tcmp bst_rt_carved_hi(%rip), %rsi\n");
+  cg_s(&mut out, "\tjae 1f\n");
+  cg_s(&mut out, "\tcmp bst_rt_carved_lo(%rip), %r8\n");
+  cg_s(&mut out, "\tja 3f\n");
+  cg_s(&mut out, "1:\txor %r9d, %r9d\n");
+  cg_s(&mut out, "2:\tcmp bst_rt_runs(%rip), %r9\n");
+  cg_s(&mut out, "\tjae 8f\n");
+  cg_s(&mut out, "\tlea bst_rt_run_at(%rip), %rax\n");
+  cg_s(&mut out, "\tmov (%rax,%r9,8), %rax\n");
+  cg_s(&mut out, "\tlea bst_rt_run_id(%rip), %rcx\n");
+  cg_s(&mut out, "\tmov 8(%rcx,%r9,8), %rdx\n");
+  cg_s(&mut out, "\tsub (%rcx,%r9,8), %rdx\n");
+  cg_s(&mut out, "\tshl $12, %rdx\n");
+  cg_s(&mut out, "\tadd %rax, %rdx\n");
+  cg_s(&mut out, "\tinc %r9\n");
+  cg_s(&mut out, "\tcmp %rdx, %rsi\n");
+  cg_s(&mut out, "\tjae 2b\n");
+  cg_s(&mut out, "\tcmp %r8, %rax\n");
+  cg_s(&mut out, "\tjae 2b\n");
+  cg_s(&mut out, "3:\tlea .Lrt_mmio_ram(%rip), %rdi\n");
+  cg_s(&mut out, "\tcall bst_rt_puts\n");
+  cg_s(&mut out, "\tmov %rsi, %rdi\n");
+  cg_s(&mut out, "\tcall bst_rt_puthex\n");
+  cg_s(&mut out, "\tmov $10, %edi\n");
+  cg_s(&mut out, "\tcall bst_rt_putc\n");
+  cg_s(&mut out, "\tjmp bst_rt_halt\n");
+  cg_s(&mut out, "8:\tpop %r9\n");
+  cg_s(&mut out, "\tpop %r8\n");
+  cg_s(&mut out, "\tpop %rdx\n");
+  cg_s(&mut out, "\tpop %rcx\n");
+  cg_s(&mut out, "\tpop %rax\n");
+  cg_s(&mut out, "9:\tret\n");
   cg_s(&mut out, "bst_rt_boot_fb:                 # field %rdi of the boot framebuffer (the C prelude's bst_boot_fb); 0 without one\n");
   cg_s(&mut out, "\tmov bst_rt_mbi(%rip), %rsi\n");
   cg_s(&mut out, "\ttest %rsi, %rsi\n");
@@ -7663,9 +7960,16 @@ fn x86_runtime_kernel(out: &mut Vec[u64]) {
   cg_s(&mut out, "\t.bss\n");
   cg_s(&mut out, "\t.p2align 3\n");
   cg_s(&mut out, "bst_rt_mbi:\t.quad 0\n");
-  cg_s(&mut out, "bst_rt_pool_base:\t.quad 0\n");
-  cg_s(&mut out, "bst_rt_pt_leases:\t.zero 1048576    # a 32-bit lease count per pool frame\n");
-  cg_s(&mut out, "bst_rt_shared_refs:\t.zero 1048576  # a 32-bit reference count per shared pool frame\n");
+  cg_s(&mut out, "bst_rt_run_at:\t.zero 256        # where each run of RAM starts (bst_rt_pool_init)\n");
+  cg_s(&mut out, "bst_rt_run_id:\t.zero 264        # the page number each starts at, and the end\n");
+  cg_s(&mut out, "bst_rt_runs:\t.quad 0\n");
+  cg_s(&mut out, "bst_rt_pt_leases:\t.quad 0       # a 32-bit lease count per pool page, carved from RAM\n");
+  cg_s(&mut out, "bst_rt_shared_refs:\t.quad 0     # a 32-bit reference count per pool page, after them\n");
+  cg_s(&mut out, "bst_rt_carved_lo:\t.quad 0       # the RAM carved off for the counters and the arena's extension\n");
+  cg_s(&mut out, "bst_rt_carved_hi:\t.quad 0\n");
+  cg_s(&mut out, "bst_rt_arena2:\t.quad 0          # the arena's extension: a 32nd of the pool, at least 4 MiB\n");
+  cg_s(&mut out, "bst_rt_arena2_words:\t.quad 0\n");
+  cg_s(&mut out, "bst_rt_arena2_top:\t.quad 0\n");
   cg_s(&mut out, "bst_rt_arena_lock:\t.quad 0\n");
   cg_s(&mut out, "bst_rt_arena_top:\t.quad 0\n");
   cg_s(&mut out, "bst_rt_free_list:\t.quad 0\n");
@@ -7673,6 +7977,8 @@ fn x86_runtime_kernel(out: &mut Vec[u64]) {
   cg_s(&mut out, "\t.section .rodata\n");
   cg_s(&mut out, ".Lrt_oom:\n");
   cg_s(&mut out, "\t.string \"bastio: out of memory\\n\"\n");
+  cg_s(&mut out, ".Lrt_mmio_ram:\n");
+  cg_s(&mut out, "\t.string \"bastio: mmio_claim of RAM at \"\n");
   cg_s(&mut out, ".Lrt_fault:\n");
   cg_s(&mut out, "\t.string \"\\nbastio: kernel fault, vector \"\n");
   cg_s(&mut out, ".Lrt_rip:\n");

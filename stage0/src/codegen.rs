@@ -427,15 +427,20 @@ static void bst_host_eprint(bst_host h, bst_bytes b) {
     fwrite(b.data, 1, b.len, stderr);
 }
 
-/* Simulated physical memory: a pool of page-aligned pages from the heap. */
+/* Simulated physical memory: a pool of page-aligned pages from the heap,
+ * one run of RAM (see the kernel's bst_pool_init for several). */
 #define BST_HOSTED_PAGES 256
-static uint64_t bst_pool_base;
+static uint64_t bst_run_at[1], bst_run_id[2], bst_runs;
+static uint32_t bst_pt_leases[BST_HOSTED_PAGES], bst_shared_refs[BST_HOSTED_PAGES];
+#define BST_MMIO_CHECK(b, l) ((void)(b), (void)(l))
 static bst_pool bst_pool_init(void) {
     bst_pool p;
     p.size = BST_HOSTED_PAGES;
     p.base = (uint64_t)aligned_alloc(4096, BST_HOSTED_PAGES * 4096);
     if (!p.base) { fputs("Bastio: out of memory\n", stderr); abort(); }
-    bst_pool_base = p.base;
+    bst_run_at[0] = p.base;
+    bst_run_id[1] = BST_HOSTED_PAGES;
+    bst_runs = 1;
     return p;
 }
 static void bst_pool_fini(bst_pool p) { free((void *)p.base); }
@@ -460,13 +465,26 @@ static inline void bst_zero_page(uint64_t a) {
 #endif
 }
 static inline uint64_t bst_pool_size(bst_pool p) { return p.size; }
+/* Page ids are dense over the runs of RAM: run r holds ids bst_run_id[r] up
+ * to bst_run_id[r + 1], from address bst_run_at[r]. Most machines have one
+ * or two runs, so the loops stop at once. */
+static inline uint64_t bst_page_at(uint64_t i) {
+    uint64_t r = 0;
+    while (r + 1 < bst_runs && i >= bst_run_id[r + 1]) r++;
+    return bst_run_at[r] + (i - bst_run_id[r]) * 4096;
+}
+static inline uint64_t bst_frame_id(bst_frame f) {
+    uint64_t r = 0;
+    while (r + 1 < bst_runs && f - bst_run_at[r] >= (bst_run_id[r + 1] - bst_run_id[r]) * 4096) r++;
+    return bst_run_id[r] + (f - bst_run_at[r]) / 4096;
+}
 static inline bst_frame bst_pool_take(bst_pool *p, uint64_t i) {
-    uint64_t a = p->base + i * 4096;
+    uint64_t a = bst_page_at(i);
+    (void)p;
     bst_zero_page(a);      /* never leak a page's old contents */
     return a;
 }
 static inline void bst_pool_give(bst_pool *p, bst_frame f) { (void)p; (void)f; }
-static inline uint64_t bst_frame_id(bst_frame f) { return (f - bst_pool_base) / 4096; }
 static inline uint64_t bst_frame_read(bst_frame f, uint64_t w) { return ((uint64_t *)f)[w]; }
 static inline void bst_frame_write(bst_frame *f, uint64_t w, uint64_t v) { ((uint64_t *)*f)[w] = v; }
 static inline uint64_t bst_frame_read8(bst_frame f, uint64_t o) { return ((unsigned char *)f)[o]; }
@@ -508,8 +526,7 @@ static inline void bst_pt_put_frame(bst_pt *t, uint64_t i, bst_frame f, bool w) 
 /* What slot i points to, left in place (pt_borrow). */
 static inline uint64_t bst_pt_child(bst_pt t, uint64_t i) { return ((uint64_t *)t)[i] & BST_PTE_ADDR; }
 /* Leases outstanding on each top-level table (mmu_enter, mmu_exit), by page
- * number: a pool has at most 262144 pages. */
-static uint32_t bst_pt_leases[262144];
+ * number (bst_pt_leases, one per pool page, comes with the pool). */
 static inline uint64_t bst_pt_lease_count(bst_pt *t) { return __atomic_load_n(&bst_pt_leases[bst_frame_id(*t)], __ATOMIC_ACQUIRE); }
 static inline uint64_t bst_pt_take(bst_pt *t, uint64_t i) {
     uint64_t *e = &((uint64_t *)*t)[i];
@@ -522,7 +539,6 @@ static inline uint64_t bst_pt_take(bst_pt *t, uint64_t i) {
  * reads) each page has, by page number, and a PTE bit the CPU ignores that
  * marks a slot mapping one. The last shared_drop gives the page back. */
 #define BST_PTE_SHARED 0x200ull
-static uint32_t bst_shared_refs[262144];
 static inline bst_frame bst_shared_new(bst_frame f) { __atomic_store_n(&bst_shared_refs[bst_frame_id(f)], 1, __ATOMIC_RELEASE); return f; }
 static inline bst_frame bst_shared_dup(bst_frame s) { __atomic_fetch_add(&bst_shared_refs[bst_frame_id(s)], 1, __ATOMIC_RELAXED); return s; }
 static inline uint64_t bst_shared_drop(bst_pool *p, bst_frame s) {
@@ -587,10 +603,13 @@ static void bst_puthex(uint64_t v) {
     for (int i = 60; i >= 0; i -= 4) bst_serial_write(0, (unsigned char)"0123456789abcdef"[(v >> i) & 15]);
 }
 
-/* Memory for Buf: a fixed arena with an exact-size free list. */
+/* Memory for Buf: a fixed arena with an exact-size free list, then the
+ * extension bst_pool_init carves from RAM (a 32nd of the pool, at least 4 MiB), so
+ * the kernel's own tables can grow with the machine. */
 #define BST_ARENA_WORDS (1u << 20)   /* 8 MiB */
 static uint64_t bst_arena[BST_ARENA_WORDS];
 static uint64_t bst_arena_top = 0;
+static uint64_t *bst_arena2, bst_arena2_words, bst_arena2_top;
 typedef struct bst_free { uint64_t words; struct bst_free *next; } bst_free_t;
 static bst_free_t *bst_free_list = 0;
 static uint64_t bst_arena_lock;              /* every processor allocates from the one arena */
@@ -611,6 +630,10 @@ static bst_buf bst_try_alloc(uint64_t n) {
     if (!blk && bst_arena_top + words <= BST_ARENA_WORDS) {
         blk = &bst_arena[bst_arena_top];
         bst_arena_top += words;
+        blk[0] = words;
+    } else if (!blk && words <= bst_arena2_words - bst_arena2_top) {
+        blk = &bst_arena2[bst_arena2_top];
+        bst_arena2_top += words;
         blk[0] = words;
     }
     bst_lock_release(&bst_arena_lock);
@@ -641,45 +664,114 @@ static void bst_print(uint64_t v) {
     bst_serial_write(0, '\n');
 }
 
-/* Physical pages: everything from the end of the kernel image to the end of
- * the RAM that follows it, capped at 2^18 pages and at the 1 GiB the boot
- * code identity-maps. With a Multiboot memory map (flags bit 6) that is the
- * run of available entries, merged where they touch, that holds the first
- * page after the kernel: UEFI firmware leaves holes low in memory, where
- * mem_upper (bit 0, the fallback) stops. A map outside the 1 GiB is not read. */
+/* Physical pages: every available run of RAM in the Multiboot memory map
+ * (flags bit 6; without one, mem_upper's, bit 0) from the end of the kernel
+ * image up to bst_ram_limit, where the platform's identity map of RAM stops
+ * (1 GiB, the least the boot code maps, if the platform does not define
+ * it), at most 2^27 pages (512 GiB: the kernel's first top-level slot).
+ * Runs that touch are merged; past BST_RUNS the rest are left out. Page ids
+ * are dense over the runs (bst_page_at, bst_frame_id), so holes such as the
+ * PCI one below 4 GiB have none. A map outside the first 1 GiB is not read.
+ * The front of the run that holds them is carved off for the pool's
+ * bookkeeping: two 32-bit counters a page (leases, shared references) and
+ * the arena's extension of a 32nd of the pool (at least 4 MiB). */
 extern char _end[];
 extern uint64_t bst_kernel_pml4[512];
-static uint64_t bst_pool_base;
+extern uint64_t bst_ram_limit __attribute__((weak));
+#define BST_RUNS 32
+#define BST_FRAME_LIMIT (1ull << 27)
+static uint64_t bst_run_at[BST_RUNS], bst_run_id[BST_RUNS + 1], bst_runs;
+static uint32_t *bst_pt_leases, *bst_shared_refs;
+static uint64_t bst_carved_lo, bst_carved_hi;
 static uint64_t bst_mbi;
+/* Adds [a, b) to the n sorted runs lo/hi, merging the ones it touches. */
+static uint64_t bst_run_put(uint64_t *lo, uint64_t *hi, uint64_t n, uint64_t a, uint64_t b) {
+    uint64_t m = 0;
+    for (uint64_t k = 0; k < n; k++) {
+        if (hi[k] < a || b < lo[k]) { lo[m] = lo[k]; hi[m] = hi[k]; m++; }
+        else { if (lo[k] < a) a = lo[k]; if (hi[k] > b) b = hi[k]; }
+    }
+    if (m == BST_RUNS) return m;
+    uint64_t k = m;
+    while (k > 0 && lo[k - 1] > a) { lo[k] = lo[k - 1]; hi[k] = hi[k - 1]; k--; }
+    lo[k] = a; hi[k] = b;
+    return m + 1;
+}
 static bst_pool bst_pool_init(uint64_t mbi) {
     uint32_t *info = (uint32_t *)mbi;
     uint64_t base = ((uint64_t)_end + 4095) & ~4095ull;
-    uint64_t ram_end = 64ull << 20;
-    if (info && (info[0] & 1)) ram_end = (1ull << 20) + ((uint64_t)info[2] << 10);
+    uint64_t limit = &bst_ram_limit ? bst_ram_limit : (1ull << 30);
+    if (limit > (1ull << 39)) limit = 1ull << 39;
+    uint64_t lo[BST_RUNS], hi[BST_RUNS], n = 0;
     if (info && (info[0] & 64) && (uint64_t)info[12] + info[11] <= (1ull << 30)) {
-        uint64_t end = base;
-        for (int grew = 1; grew; ) {
-            grew = 0;
-            uint8_t *e = (uint8_t *)(uint64_t)info[12], *stop = e + info[11];
-            while (e + 24 <= stop && *(uint32_t *)e >= 20) {
-                uint64_t addr = *(uint64_t *)(e + 4), len = *(uint64_t *)(e + 12);
-                if (*(uint32_t *)(e + 20) == 1 && addr <= end && end < addr + len) {
-                    end = addr + len;
-                    grew = 1;
-                }
-                e += (uint64_t)*(uint32_t *)e + 4;    /* not in 32 bits: 0xFFFFFFFC + 4 would stay put */
+        uint8_t *e = (uint8_t *)(uint64_t)info[12], *stop = e + info[11];
+        while (e + 24 <= stop && *(uint32_t *)e >= 20) {
+            uint64_t a = *(uint64_t *)(e + 4), len = *(uint64_t *)(e + 12), b = a + len;
+            if (b < a) b = ~0ull;
+            if (a < base) a = base;
+            if (b > limit) b = limit;
+            if (*(uint32_t *)(e + 20) == 1 && a < b) {
+                a = (a + 4095) & ~4095ull;
+                b &= ~4095ull;
+                if (a < b) n = bst_run_put(lo, hi, n, a, b);
             }
+            e += (uint64_t)*(uint32_t *)e + 4;    /* not in 32 bits: 0xFFFFFFFC + 4 would stay put */
         }
-        ram_end = end;
+    } else {
+        uint64_t b = 64ull << 20;
+        if (info && (info[0] & 1)) b = (1ull << 20) + ((uint64_t)info[2] << 10);
+        if (b > limit) b = limit;
+        b &= ~4095ull;
+        if (base < b) n = bst_run_put(lo, hi, n, base, b);
     }
-    if (ram_end > (1ull << 30)) ram_end = 1ull << 30;
+    /* At most 2^27 pages: the top runs go first. */
+    uint64_t pages = 0;
+    for (uint64_t k = 0; k < n; k++) {
+        if (pages + (hi[k] - lo[k]) / 4096 > BST_FRAME_LIMIT) hi[k] = lo[k] + (BST_FRAME_LIMIT - pages) * 4096;
+        pages += (hi[k] - lo[k]) / 4096;
+    }
+    /* The bookkeeping, from the first run with room (the arena extension
+     * only if there is room for it too). */
+    uint64_t counters = (pages * 8 + 4095) / 4096, ext = pages / 32, r = n;
+    if (ext < 1024) ext = pages / 8 < 1024 ? pages / 8 : 1024;   /* at least 4 MiB, at most an eighth */
+    for (int tries = 0; tries < 2 && r == n; tries++) {
+        if (tries) ext = 0;
+        for (r = 0; r < n && (hi[r] - lo[r]) / 4096 <= counters + ext; r++) {}
+    }
     bst_pool p;
     p.base = base;
-    p.size = ram_end > base ? (ram_end - base) / 4096 : 0;
-    if (p.size > 262144) p.size = 262144;
-    bst_pool_base = base;
+    p.size = 0;
+    if (r == n) return p;          /* no room even for the counters: no pages */
+    uint64_t *w = (uint64_t *)lo[r];
+    for (uint64_t k = 0; k < counters * 512; k++) w[k] = 0;
+    bst_pt_leases = (uint32_t *)lo[r];
+    bst_shared_refs = (uint32_t *)lo[r] + pages;
+    bst_arena2 = (uint64_t *)(lo[r] + counters * 4096);
+    bst_arena2_words = ext * 512;
+    bst_carved_lo = lo[r];
+    bst_carved_hi = lo[r] + (counters + ext) * 4096;
+    lo[r] = bst_carved_hi;
+    for (uint64_t k = 0; k < n; k++) {
+        bst_run_at[k] = lo[k];
+        bst_run_id[k + 1] = bst_run_id[k] + (hi[k] - lo[k]) / 4096;
+    }
+    bst_runs = n;
+    p.base = lo[0];
+    p.size = bst_run_id[n];
     return p;
 }
+/* The device window overlaps RAM above 2 GiB: claiming pool RAM (or the
+ * pool's bookkeeping) as registers would alias pages the proofs hand out,
+ * so such a claim stops the machine. Firmware never puts a device there. */
+static void bst_mmio_check(uint64_t b, uint64_t l) {
+    int bad = l && b < bst_carved_hi && bst_carved_lo < b + l;
+    for (uint64_t k = 0; k < bst_runs; k++) {
+        uint64_t lo = bst_run_at[k], hi = lo + (bst_run_id[k + 1] - bst_run_id[k]) * 4096;
+        if (l && b < hi && lo < b + l) bad = 1;
+    }
+    if (bad) { bst_puts("bastio: mmio_claim of RAM at "); bst_puthex(b); bst_puts("\n"); bst_halt(); }
+}
+#define BST_MMIO_CHECK(b, l) bst_mmio_check(b, l)
 #define BST_PT_NEW_HOOK if (level == 4) e[0] = ((uint64_t)bst_kernel_pml4[0] & BST_PTE_ADDR) | BST_PTE_P | BST_PTE_W;
 "#;
 
@@ -920,7 +1012,7 @@ static inline uint64_t bst_port_count(bst_portio io) { return io.count; }
 // platform maps the device window (0x8000_0000 to 2^46) uncached at its
 // physical address, so an access is one volatile load or store there.
 const PRELUDE_MMIO: &str = r#"
-static inline bst_mmio bst_mmio_claim(bst_mmiospace *s, uint64_t b, uint64_t l) { (void)s; bst_mmio m = { b, l }; return m; }
+static inline bst_mmio bst_mmio_claim(bst_mmiospace *s, uint64_t b, uint64_t l) { (void)s; BST_MMIO_CHECK(b, l); bst_mmio m = { b, l }; return m; }
 static inline void bst_mmio_release(bst_mmiospace *s, bst_mmio m) { (void)s; (void)m; }
 static inline uint64_t bst_mmio_base(bst_mmio m) { return m.base; }
 static inline uint64_t bst_mmio_len(bst_mmio m) { return m.len; }
@@ -941,7 +1033,7 @@ BST_MMIO_RW(8, uint8_t) BST_MMIO_RW(16, uint16_t) BST_MMIO_RW(32, uint32_t) BST_
 const PRELUDE_DMA: &str = r#"
 static inline bst_dma bst_dma_lend(bst_frame f) { __atomic_thread_fence(__ATOMIC_SEQ_CST); return f; }
 static inline bst_frame bst_dma_take(bst_dma d) { __atomic_thread_fence(__ATOMIC_SEQ_CST); return d; }
-static inline uint64_t bst_dma_id(bst_dma d) { return (d - bst_pool_base) / 4096; }
+static inline uint64_t bst_dma_id(bst_dma d) { return bst_frame_id(d); }
 static inline uint64_t bst_dma_addr(bst_dma d) { return d; }
 #define BST_DMA_RW(w, t) \
     static inline uint64_t bst_dma_read##w(bst_dma *d, uint64_t o) { return *(volatile t *)(uintptr_t)(*d + o); } \

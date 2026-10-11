@@ -984,7 +984,7 @@ Hardware is reached only through capability types. There is no way to read or wr
 | `Lease` | This processor's hold on the top-level table it loaded with `mmu_enter`: while any is outstanding, other processors may be running on the tree, so nothing is taken out of it (kernel only; pinned to its processor) |
 | `Ports` | The x86 I/O port space: the right to claim each of the 65536 ports, once |
 | `PortIo` | A claimed range of I/O ports, owned: the only way to read or write them |
-| `MmioSpace` | The device window (physical `0x80000000` up to 2^46, which the kernel platform maps uncached, so 64-bit PCI BARs above 4 GiB fit; the page pool never reaches it, as it stops at 1 GiB): the right to claim each byte of it, once |
+| `MmioSpace` | The device window (physical `0x80000000` up to 2^46, which the kernel platform maps uncached, so 64-bit PCI BARs above 4 GiB fit): the right to claim each byte of it, once. RAM above 2 GiB lies inside it and belongs to the page pool instead: `mmio_claim` of a block that overlaps the pool's RAM stops the machine (firmware never puts a device there) |
 | `Mmio` | A claimed block of memory-mapped device registers, owned: the only way to read or write them |
 | `Dma` | A page lent to devices for DMA: while lent it is not a `Frame`, so it cannot be freed, mapped or reused |
 
@@ -1002,7 +1002,7 @@ Ghost accessors, usable in specifications:
 | `pool_size(p)` | Number of pages in the pool (also callable at run time) |
 | `mmio_free(w, a)` | Nobody has claimed device-window address `a`; `main` receives the whole window free |
 | `mmio_base(r)`, `mmio_len(r)` | The registers `r` owns, `mmio_base(r)` up to `mmio_base(r) + mmio_len(r)`, always inside the device window (also callable at run time) |
-| `mmu_root(m)` | The id of the table in CR3; `0x40000` while the kernel's own map is loaded |
+| `mmu_root(m)` | The id of the table in CR3; `0x8000000` while the kernel's own map is loaded |
 | `port_free(p, k)` | Nobody has claimed port `k`; `main` receives every port free |
 | `port_base(io)`, `port_count(io)` | The ports `io` owns, `port_base(io)` up to `port_base(io) + port_count(io)`, always within the 65536 ports (also callable at run time) |
 
@@ -1154,7 +1154,7 @@ Every top-level table a processor loads is entered with a lease; there is no oth
 | Builtin | Requires (proved) | Effect |
 | --- | --- | --- |
 | `mmu_kernel(m: &mut Mmu)` | | Loads the kernel's own map |
-| `mmu_enter(m: &mut Mmu, t: &mut PageTable) -> Lease` | level 4; `mmu_root(m)` is the kernel's (`0x40000`) | Takes a lease on `t` and loads it into CR3: `pt_leases(t)` goes up by one, `mmu_root(m)` becomes `pt_id(t)`. `t` can then go back where it came from (a lock, say) and other processors can enter it too |
+| `mmu_enter(m: &mut Mmu, t: &mut PageTable) -> Lease` | level 4; `mmu_root(m)` is the kernel's (`0x8000000`) | Takes a lease on `t` and loads it into CR3: `pt_leases(t)` goes up by one, `mmu_root(m)` becomes `pt_id(t)`. `t` can then go back where it came from (a lock, say) and other processors can enter it too |
 | `mmu_exit(m: &mut Mmu, l: Lease)` | | Loads the kernel's own map, then gives the lease back. No table's `pt_leases` drops in the proof (it does not name one): it stays an overcount until `pt_lease_count` reads the true count |
 | `cpu_get(c: &Cpu, r: u64) -> u64` | `r < 21` | Saved user register `r`: rax rbx rcx rdx rsi rdi rbp r8-r15 (0-14), rip (15), rsp (16), rflags (17), error code (18), fault address (19), FS base (20) |
 | `cpu_set(c: &mut Cpu, r: u64, v: u64)` | `r < 18` or `r == 20` | Sets a saved register or the FS base (the error code and fault address are only reported by a trap). Whatever is stored, user mode is entered in ring 3 with the user segments, IOPL 0 and interrupts on; the platform replaces a non-canonical address with 0 |
@@ -1464,7 +1464,7 @@ Proofs:
 The compiler emits C, which a C compiler turns into machine code. The C contains no runtime checks: every check was discharged by a proof, and `tests/run.sh` verifies this for a sample program by inspecting the C.
 
 - **`--target hosted`** (the default) builds an ordinary program against the C library. `alloc`, `box` and vectors use `malloc`; running out of memory aborts. `Serial` is standard input and output. `Pool` is simulated with ordinary memory.
-- **`--target kernel`** emits freestanding C for bare-metal x86-64 that needs no C library. It provides `bst_kmain`, which initialises COM1 (only when `main` takes `Serial`) and calls `main`. The boot code that calls `bst_kmain`, and the trap entry code behind `cpu_run` and `cpu_idle`, live in the kernel's own repository (BastiOS). The prelude implements the console with port I/O on COM1, `alloc` and `free` with a fixed 8 MiB arena and an exact-size free list, `print` on the serial port, the pool (every page from the end of the kernel image to the end of RAM, at most 2^16), page-table entry encoding and CR3 loads. Running out of arena memory halts the machine.
+- **`--target kernel`** emits freestanding C for bare-metal x86-64 that needs no C library. It provides `bst_kmain`, which initialises COM1 (only when `main` takes `Serial`) and calls `main`. The boot code that calls `bst_kmain`, and the trap entry code behind `cpu_run` and `cpu_idle`, live in the kernel's own repository (BastiOS). The prelude implements the console with port I/O on COM1, `alloc` and `free` with a fixed 8 MiB arena and an exact-size free list, then an extension of a 32nd of the pool, at least 4 MiB carved from RAM, `print` on the serial port, the pool (every run of RAM in the Multiboot memory map above the end of the kernel image, up to the platform's `bst_ram_limit` and at most 2^27 pages, numbered densely across the holes), page-table entry encoding and CR3 loads. Running out of arena memory halts the machine.
 - **`--target user`** emits freestanding C for a user program under BastiOS, entered at `bst_umain`. Its prelude implements the console and the `sys_*` builtins as `int 0x80` system calls, and `alloc` with a 64 KiB arena.
 
 On the freestanding targets `Bytes` come from the same arena as `Buf`.
