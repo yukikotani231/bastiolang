@@ -18,6 +18,23 @@
 - [Sized integers](integers.md)
 - [Concurrency](concurrency.md)
 - [The core and std libraries](core.md)
+  - [core/bitmap.bastio](lib-core-bitmap.md)
+  - [core/boxed.bastio](lib-core-boxed.md)
+  - [core/bytes.bastio](lib-core-bytes.md)
+  - [core/bytesmap.bastio](lib-core-bytesmap.md)
+  - [core/csum.bastio](lib-core-csum.md)
+  - [core/endian.bastio](lib-core-endian.md)
+  - [core/hashmap.bastio](lib-core-hashmap.md)
+  - [core/num.bastio](lib-core-num.md)
+  - [core/option.bastio](lib-core-option.md)
+  - [core/print.bastio](lib-core-print.md)
+  - [core/ring.bastio](lib-core-ring.md)
+  - [core/rows.bastio](lib-core-rows.md)
+  - [core/slots.bastio](lib-core-slots.md)
+  - [core/sort.bastio](lib-core-sort.md)
+  - [core/text.bastio](lib-core-text.md)
+  - [core/wtext.bastio](lib-core-wtext.md)
+  - [std/host.bastio](lib-std-host.md)
 
 # Project
 

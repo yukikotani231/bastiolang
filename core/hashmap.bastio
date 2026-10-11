@@ -58,6 +58,23 @@ fn hash_u64(k: u64) -> u64 {
 }
 
 /// An empty map with room for `cap` slots (at least 8).
+/// ```
+/// // A loop that changes a map says it stays well formed.
+/// let mut m = hmap_with_cap[u64](1024);
+/// let mut i = 0;
+/// while i < 1000
+///   invariant i <= 1000 && hmap_ok[u64](m)
+/// {
+///   let prev = hmap_insert[u64](&mut m, hash_u64(i), i);
+///   i = i + 1;
+/// }
+/// let gone = hmap_remove[u64](&mut m, hash_u64(5));
+/// let keys = hmap_keys[u64](m);   // every key in the map, in slot order
+/// let ok = gone is Option::Some && vec_len(keys) == 999 && hmap_len[u64](m) == 999;
+/// vec_free(keys);
+/// hmap_free[u64](m);
+/// if !ok { return 1; }
+/// ```
 fn hmap_with_cap[V](cap: u64) -> HashMap[V]
   requires 8 <= cap && cap <= 1152921504606846976
   ensures hmap_ok[V](result) && result.len == 0 && vlen(result.keys) == cap
@@ -78,6 +95,25 @@ fn hmap_with_cap[V](cap: u64) -> HashMap[V]
   return HashMap[V] { keys: keys, vals: vals, tags: tags, len: 0, used: 0 };
 }
 
+/// An empty map with room for 8 keys before it grows.
+/// ```
+/// // Process id to parent id.
+/// let mut m = hmap_new[u64]();
+/// let a = hmap_insert[u64](&mut m, 100, 1);
+/// let b = hmap_insert[u64](&mut m, 101, 100);
+/// let c = hmap_insert[u64](&mut m, 101, 1);   // replaces, and returns the old value
+/// assert hmap_maps[u64](m, 101, 1);            // proved: the map holds the new value
+/// let mut ok = a is Option::None && b is Option::None && opt_or[u64](c, 0) == 100;
+/// // A lookup that finds a key is proved to return its value; that it finds
+/// // every key is not proved, so the `None` arm stays.
+/// match hmap_get[u64](m, 100) {
+///   Option::Some(v) => { ok = ok && v == 1; },
+///   Option::None => { ok = false; },
+/// }
+/// ok = ok && hmap_len[u64](m) == 2 && hmap_contains[u64](m, 101) && hmap_get_or[u64](m, 7, 0) == 0;
+/// hmap_free[u64](m);
+/// if !ok { return 1; }
+/// ```
 fn hmap_new[V]() -> HashMap[V]
   ensures hmap_ok[V](result) && result.len == 0
 {
@@ -91,7 +127,7 @@ fn hmap_len[V](m: &HashMap[V]) -> u64
   return m.len;
 }
 
-/// The slot holding `k`, or the capacity if `k` is not in the map.
+/// Internal: The slot holding `k`, or the capacity if `k` is not in the map.
 fn hmap_find[V](m: &HashMap[V], k: u64) -> u64
   requires hmap_ok[V](m)
   ensures result <= vlen(m.keys)
@@ -147,7 +183,7 @@ fn hmap_get_or[V](m: &HashMap[V], k: u64, d: V) -> V
   }
 }
 
-/// Rebuilds the table without tombstones, doubling it when at least half
+/// Internal: Rebuilds the table without tombstones, doubling it when at least half
 /// of it holds keys.
 fn hmap_grow[V](m: &mut HashMap[V])
   requires hmap_ok[V](m)
@@ -182,7 +218,7 @@ fn hmap_grow[V](m: &mut HashMap[V])
   m.used = fresh.used;
 }
 
-/// Puts `k`, known not to be in the map, into the first empty slot of its
+/// Internal: Puts `k`, known not to be in the map, into the first empty slot of its
 /// probe sequence, growing the table first if it is three quarters used.
 fn hmap_put_new[V](m: &mut HashMap[V], k: u64, v: V)
   requires hmap_ok[V](m)
@@ -283,6 +319,7 @@ fn hmap_keys[V](m: &HashMap[V]) -> Vec[u64]
   return out;
 }
 
+/// Frees the map. Values that own nothing are simply dropped.
 fn hmap_free[V](m: HashMap[V]) {
   vec_free(m.keys);
   vec_free(m.vals);
