@@ -1,6 +1,6 @@
 # Bastio
 
-Bastio is a systems language whose memory safety is **proved at compile time**, not checked at run time. It is the successor to fz/fzl, and the language BastiOS (`bastios`) will be written in.
+Bastio is a systems language whose memory safety is **proved at compile time**, not checked at run time. It is the language BastiOS (`bastios`) is written in.
 
 - **No `unsafe`.** The language has no way to read memory through a raw integer address.
 - **Linear ownership.** Every buffer is consumed exactly once, so use-after-free, double free and **leaks** are compile errors.
