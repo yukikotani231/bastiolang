@@ -13,6 +13,16 @@ The version is the one in `stage0/Cargo.toml`. A release is a tag `vX.Y.Z` on
 
 What will be 0.2.0.
 
+### Compiler
+
+- `BASTIO_PROOF_CACHE=<dir>`: bastioc1 records each function it has proved
+  (by a hash of its verification conditions, the preamble, the solver and the
+  solver's version) and does not send it to the solver again. Checking
+  `stage1/bastioc1.bastio` takes about 3.3 s with a warm cache instead of
+  13.9 s; changing one function re-proves only that function. Off unless the
+  variable is set; the cache is trusted like the solver (see
+  docs/trusted-base.md).
+
 ### Language
 
 - `try_alloc` and `try_balloc`: allocation that returns an empty buffer when
