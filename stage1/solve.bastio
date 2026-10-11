@@ -10,8 +10,15 @@
 import "verify.bastio";
 
 /// A value shown in a counterexample: its label (lchars[s .. s + n]) and
-/// its term.
-struct Lab { s: u64, n: u64, tm: u64 }
+/// its term. For the length of a buffer or of a vector of scalars, seq is
+/// the length of the label's prefix (`len(`, `vlen(`), so the name follows
+/// it, and arr is the array of its elements, which are shown too when
+/// there are few (SHOW_ELEMS); seq is 0 for every other value.
+struct Lab { s: u64, n: u64, tm: u64, seq: u64, arr: u64 }
+
+/// Buffers and vectors at most this long have their elements shown in a
+/// counterexample, after their length (stage0's `SHOW_ELEMS`).
+const SHOW_ELEMS: u64 = 8;
 
 fn push_arg(argv: &mut Vec[Bytes], s: Str) {
   vec_push(&mut argv, bfrom(s));
@@ -355,7 +362,16 @@ fn add_lab(labs: &mut Vec[Lab], chars: &mut Vec[u64], pre: Str, name: &Vec[u64],
   out_str(&mut chars, post);
   let n = vec_len(chars);
   if n >= s {
-    vec_push(&mut labs, Lab { s: s, n: n - s, tm: tm });
+    vec_push(&mut labs, Lab { s: s, n: n - s, tm: tm, seq: 0, arr: 0 });
+  }
+}
+
+/// Marks the label just added as a sequence's length (see `Lab`).
+fn set_seq(labs: &mut Vec[Lab], seq: u64, arr: u64) {
+  let n = vec_len(labs);
+  if n > 0 {
+    let l = vec_get(labs, n - 1);
+    vec_set(&mut labs, n - 1, Lab { s: l.s, n: l.n, tm: l.tm, seq: seq, arr: arr });
   }
 }
 
@@ -394,10 +410,15 @@ fn show(v: &Vr, m: &Mono, p: &Parser, name: &mut Vec[u64], x: u64, labs: &mut Ve
     add_lab(&mut labs, &mut chars, "", name, "", xv.a);
   } else if k == VV_BUF {
     add_lab(&mut labs, &mut chars, "len(", name, ")", xv.a);
+    set_seq(&mut labs, 4, xv.b);
   } else if k == VV_STR {
     add_lab(&mut labs, &mut chars, "slen(", name, ")", xv.a);
   } else if k == VV_VEC {
     add_lab(&mut labs, &mut chars, "vlen(", name, ")", xv.a);
+    let ev = vl_at(v, xv.b);
+    if ev.kind == VV_U || ev.kind == VV_B {
+      set_seq(&mut labs, 5, ev.a);
+    }
   } else if k == VV_OBJ {
     let tk = kind_t(m, xv.ty);
     let mut j = 0;
@@ -415,7 +436,7 @@ fn show(v: &Vr, m: &Mono, p: &Parser, name: &mut Vec[u64], x: u64, labs: &mut Ve
         out_str(&mut chars, ")");
         let n = vec_len(chars);
         if n >= s {
-          vec_push(&mut labs, Lab { s: s, n: n - s, tm: obj_field(v, x, j) });
+          vec_push(&mut labs, Lab { s: s, n: n - s, tm: obj_field(v, x, j), seq: 0, arr: 0 });
         }
       }
       j = j + 1;
@@ -502,7 +523,7 @@ fn lab_at(xs: &Vec[Lab], k: u64) -> Lab {
   if k < vec_len(xs) {
     return vec_get(xs, k);
   }
-  return Lab { s: 0, n: 0, tm: 0 };
+  return Lab { s: 0, n: 0, tm: 0, seq: 0, arr: 0 };
 }
 
 /// `error F:L:C CODE` for the failed obligation, as the dumps print it.
@@ -1013,6 +1034,37 @@ fn solve_par(v: &mut Vr, m: &Mono, p: &Parser, h: &Host, rep: &mut Vec[u64], job
   return ok;
 }
 
+/// Whether a failed proof of kind code shows the elements of short buffers
+/// and vectors: a property that may be about them, not a bounds or
+/// arithmetic error (stage0's `SHOW_ELEMS_FOR`).
+fn shows_elems(code: u64) -> bool {
+  return code == VC_ASSERT || code == VC_ENSURES || code == VC_INVARIANT || code == VC_LOCKINV || code == VC_REQUIRES;
+}
+
+/// The number written in t, if t is all digits and at most SHOW_ELEMS;
+/// otherwise 0.
+fn small_num(t: &Vec[u64]) -> u64 {
+  if vec_len(t) == 0 || vec_len(t) > 2 {
+    return 0;
+  }
+  let mut x = 0;
+  let mut k = 0;
+  while k < vec_len(t)
+    invariant k <= 2 && x < 100 && (k == 0 ==> x == 0) && (k <= 1 ==> x < 10)
+  {
+    let ch = u_at(t, k);
+    if ch < 48 || ch > 57 {
+      return 0;
+    }
+    x = x * 10 + (ch - 48);
+    k = k + 1;
+  }
+  if x > SHOW_ELEMS {
+    return 0;
+  }
+  return x;
+}
+
 /// After a `sat`: asks for the value of each term shown and appends
 /// `  = counterexample: a = 1, len(b) = 0` (nothing if no value is shown).
 fn report_cex(v: &mut Vr, m: &Mono, p: &Parser, z: &mut Child, o: Obl, rep: &mut Vec[u64]) {
@@ -1038,7 +1090,32 @@ fn report_cex(v: &mut Vr, m: &Mono, p: &Parser, z: &mut Child, o: Obl, rep: &mut
     }
     out_rng(&mut rep, chars, Rng { s: l.s, e: vadd(l.s, l.n) });
     out_str(&mut rep, " = ");
-    out_value(&mut rep, resp);
+    let mut val = vec_new[u64]();
+    out_value(&mut val, resp);
+    let len = small_num(val);
+    out_rng(&mut rep, val, Rng { s: 0, e: vec_len(val) });
+    vec_free(val);
+    if l.seq > 0 && l.n > l.seq && len > 0 && len <= SHOW_ELEMS && shows_elems(o.code) {
+      out_str(&mut rep, ", ");
+      out_rng(&mut rep, chars, Rng { s: vadd(l.s, l.seq), e: vadd(l.s, l.n - 1) });
+      out_str(&mut rep, " = [");
+      let mut j = 0;
+      while j < len {
+        out_str(&mut out, "(get-value ((select ");
+        out_tm(&mut out, v, l.arr);
+        out_str(&mut out, " ");
+        out_num(&mut out, j);
+        out_str(&mut out, ")))\n");
+        z3_send(&mut z, &mut out);
+        z3_read(&mut z, &mut resp);
+        if j > 0 {
+          out_str(&mut rep, ", ");
+        }
+        out_value(&mut rep, resp);
+        j = j + 1;
+      }
+      out_str(&mut rep, "]");
+    }
     k = k + 1;
   }
   if vec_len(labs) > 0 {

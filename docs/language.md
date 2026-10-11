@@ -1399,7 +1399,7 @@ The facts the prover is given about counts (a count is at most the length, every
 
 ## How verification works
 
-After the type and linearity checks, the compiler executes each function symbolically. At every point where the program could go wrong it asks Z3 whether the bad case is reachable, and if it is, it rejects the program and shows a counterexample (values of the variables that lead there).
+After the type and linearity checks, the compiler executes each function symbolically. At every point where the program could go wrong it asks Z3 whether the bad case is reachable, and if it is, it rejects the program and shows a counterexample (values of the variables that lead there). A buffer or vector shows its length, and when the failed proof is an `assert`, `requires`, `ensures` or invariant, its elements too if there are at most 8 (`counterexample: vlen(v) = 2, v = [3, 1]`).
 
 - **Modular.** A call uses the callee's `requires` and `ensures`, and a summary of which parts of each `&mut` argument the callee may change (below), never the rest of its body.
 - **Loops** are cut with their invariants. After a loop, the variables the body assigns are known only through the invariants and the negated condition.

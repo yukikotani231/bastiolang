@@ -208,12 +208,12 @@ fn main() -> u64 {
 percent.bastio:10:11: error[E-VERIFY-REQUIRES]: could not prove the precondition `((whole > 0) && (part <= whole)) && (whole <= 1000000)` of `percent`
  10 |   let p = percent(get(b, 0), get(b, 1));
     |           ^^^^^^^
-    = counterexample: len(b) = 2
+    = counterexample: len(b) = 2, b = [3, 0]
     = `percent` requires it on line 2
     = the caller must make it hold: check it with an `if` before the call, or ask for it in the caller's own `requires`
 ```
 
-The error is at the call, not in `percent`: `percent` is fine for every input its `requires` allows, and this caller passes values read from a buffer, which could be anything (here, `0` for `whole`). **Check first**, at the call:
+The error is at the call, not in `percent`: `percent` is fine for every input its `requires` allows, and this caller passes values read from a buffer, which could be anything (here `b = [3, 0]`: `0` for `whole`). **Check first**, at the call:
 
 ```bastio
 // expect-exit: 0

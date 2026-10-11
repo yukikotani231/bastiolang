@@ -506,6 +506,13 @@ fn proof_hint(code: &str) -> Option<&'static str> {
 /// A counterexample value, with its distance from the nearest power of two
 /// when it is that close to one (`18446744073709551615 (2^64 - 1)`), since
 /// such values are where integers overflow.
+/// Buffers and vectors at most this long have their elements shown in a
+/// counterexample, after their length, when the failed proof is of a
+/// property (SHOW_ELEMS_FOR) that may be about the elements. A bounds or
+/// arithmetic error is not, so it shows only the length.
+const SHOW_ELEMS: u64 = 8;
+const SHOW_ELEMS_FOR: &[&str] = &["E-VERIFY-ASSERT", "E-VERIFY-ENSURES", "E-VERIFY-INVARIANT", "E-VERIFY-LOCKINV", "E-VERIFY-REQUIRES"];
+
 pub fn readable(v: &str) -> String {
     if v.is_empty() || !v.bytes().all(|c| c.is_ascii_digit()) {
         return v.to_string();
@@ -1136,16 +1143,26 @@ impl<'p> Verifier<'p> {
                 let mut d = Diag::new(code, pos, format!("could not prove {}", what));
                 let mut names: Vec<_> = st.env.keys().cloned().collect();
                 names.sort();
-                fn show(n: &str, v: &Val, shown: &mut Vec<(String, String)>) {
+                // Each shown value: its label, its term, and for a buffer or a
+                // vector of scalars, its name and the array of its elements,
+                // which are shown too when there are few (SHOW_ELEMS).
+                type Shown = (String, String, Option<(String, String)>);
+                fn show(n: &str, v: &Val, shown: &mut Vec<Shown>) {
                     match v {
-                        Val::U(t) | Val::B(t) => shown.push((n.to_string(), t.clone())),
-                        Val::Buf { len, .. } => shown.push((format!("len({})", n), len.clone())),
-                        Val::Str { len, .. } => shown.push((format!("slen({})", n), len.clone())),
-                        Val::Vec { len, .. } => shown.push((format!("vlen({})", n), len.clone())),
+                        Val::U(t) | Val::B(t) => shown.push((n.to_string(), t.clone(), None)),
+                        Val::Buf { len, data } => shown.push((format!("len({})", n), len.clone(), Some((n.to_string(), data.clone())))),
+                        Val::Str { len, .. } => shown.push((format!("slen({})", n), len.clone(), None)),
+                        Val::Vec { len, elems, .. } => {
+                            let arr = match elems.as_ref() {
+                                Val::U(a) | Val::B(a) => Some((n.to_string(), a.clone())),
+                                _ => None,
+                            };
+                            shown.push((format!("vlen({})", n), len.clone(), arr))
+                        }
                         Val::Obj(t, fs) => {
                             for ((_, arr, acc), term) in ghost_fields(t).iter().zip(fs) {
                                 if !arr {
-                                    shown.push((format!("{}({})", acc, n), term.clone()));
+                                    shown.push((format!("{}({})", acc, n), term.clone(), None));
                                 }
                             }
                         }
@@ -1155,7 +1172,7 @@ impl<'p> Verifier<'p> {
                             }
                         }
                         Val::Enum(en, tag, ps) => {
-                            shown.push((format!("tag({})", n), tag.clone()));
+                            shown.push((format!("tag({})", n), tag.clone(), None));
                             for ((v, _), pv) in enum_def(en).unwrap().variants.iter().zip(ps) {
                                 show(&format!("{}.{}", n, v), pv, shown);
                             }
@@ -1164,14 +1181,24 @@ impl<'p> Verifier<'p> {
                         Val::Box(BoxVal::Opaque(_)) | Val::Unit => {}
                     }
                 }
-                let mut shown: Vec<(String, String)> = Vec::new();
+                let mut shown: Vec<Shown> = Vec::new();
                 for n in names {
                     show(&n, &st.env[&n], &mut shown);
                 }
                 let mut cex = Vec::new();
-                for (label, term) in shown {
+                for (label, term, arr) in shown {
                     let v = self.solver.get_value(&term).map_err(|e| Diag::new("E-SOLVER", pos, e))?;
                     cex.push(format!("{} = {}", label, readable(&v)));
+                    if let (Some((name, arr)), Ok(len)) = (arr, v.parse::<u64>()) {
+                        if len > 0 && len <= SHOW_ELEMS && SHOW_ELEMS_FOR.contains(&code) {
+                            let mut elems = Vec::new();
+                            for k in 0..len {
+                                let e = self.solver.get_value(&format!("(select {} {})", arr, k)).map_err(|e| Diag::new("E-SOLVER", pos, e))?;
+                                elems.push(readable(&e));
+                            }
+                            cex.push(format!("{} = [{}]", name, elems.join(", ")));
+                        }
+                    }
                 }
                 if !cex.is_empty() {
                     let label = if cex_after { "counterexample after one iteration" } else { "counterexample" };

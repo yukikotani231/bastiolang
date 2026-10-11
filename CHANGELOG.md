@@ -103,6 +103,11 @@ What will be 0.2.0.
   counterexample as `counterexample after one iteration:`, since the values
   are those after the iteration; a solver that cannot be started is one
   line naming the file, with no source line; `--help` prints the options.
+- A counterexample shows the elements of a buffer or vector of at most 8
+  scalars, after its length, when the failed proof is an `assert`,
+  `requires`, `ensures` or invariant: `vlen(v) = 2, v = [3, 1]` says why a
+  vector is not sorted. Bounds and arithmetic errors still show only the
+  length.
 - bastioc1 is the compiler the tests and benchmarks use: `tests/bastioc1.sh`
   builds it with stage0 and rebuilds it only when stage0 or stage1 changes.
   `BASTIOC` still picks another compiler.
