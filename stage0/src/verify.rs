@@ -275,9 +275,11 @@ fn opaque_boxes(v: &Val, ty: &Type) -> Val {
     }
 }
 
-/// The type of a value, for `lock_new`. A `Bytes` reads as `Buf`: the
-/// lock then forgets that every byte is <= 255, which loses facts but never
-/// assumes a false one.
+/// The type of a value, when the checker has not recorded it. A `Bytes`
+/// reads as `Buf`, which loses facts but never assumes a false one. An
+/// integer reads as `u64`, which would assume a false one for a signed
+/// integer, so `lock_new` and `atomic_new` take the checker's type of
+/// their contents instead.
 fn val_type(v: &Val) -> Type {
     match v {
         Val::U(_) => Type::U64,
@@ -335,7 +337,7 @@ fn kept_by_builtins(t: &Type, field: &str) -> bool {
 
 /// Builtins whose `&mut` argument keeps the fields above.
 const SHAPE_KEEPING: &[&str] =
-    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pt_borrow", "pt_borrow_frame", "pt_lease_count", "pt_put_shared", "pt_take_shared", "shared_drop", "pool_take", "pool_take_dirty", "pool_give", "frame_write", "frame_write8", "bcopy", "bmove", "frame_to_bytes", "bytes_to_frame", "dma_to_bytes", "bytes_to_dma", "cpu_set", "cpu_run", "cpu_idle", "cpu_fpu_save", "cpu_fpu_load",
+    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pt_borrow", "pt_borrow_frame", "pt_lease_count", "pt_set_access", "pt_put_shared", "pt_take_shared", "shared_drop", "pool_take", "pool_take_dirty", "pool_give", "frame_write", "frame_write8", "bcopy", "bmove", "frame_to_bytes", "bytes_to_frame", "dma_to_bytes", "bytes_to_dma", "cpu_set", "cpu_run", "cpu_idle", "cpu_fpu_save", "cpu_fpu_load",
       "pio_in8", "pio_in16", "pio_in32", "pio_out8", "pio_out16", "pio_out32",
       "mmio_read8", "mmio_read16", "mmio_read32", "mmio_read64", "mmio_write8", "mmio_write16", "mmio_write32", "mmio_write64",
       "dma_read8", "dma_read16", "dma_read32", "dma_read64", "dma_write8", "dma_write16", "dma_write32", "dma_write64"];
@@ -728,17 +730,6 @@ fn num(v: i128) -> String {
     if v < 0 { format!("(- {})", -v) } else { v.to_string() }
 }
 
-/// `x` reduced to the range of the integer type `t`, as a C conversion to
-/// `t` does: modulo 2^width, two's complement for a signed type.
-fn wrap_term(t: &Type, x: &str) -> String {
-    if t.is_signed() {
-        let h = t.int_modulus() / 2;
-        format!("(- (mod (+ {} {}) {}) {})", x, h, t.int_modulus(), h)
-    } else {
-        format!("(mod {} {})", x, t.int_modulus())
-    }
-}
-
 /// C's division on signed operands, which truncates toward zero (SMT-LIB's
 /// `div` rounds so that the remainder is never negative).
 fn c_div(a: &str, b: &str) -> String {
@@ -918,6 +909,21 @@ impl<'p> Verifier<'p> {
         let n = self.fresh_name("bits");
         self.smt(&format!("(declare-const {} Int)", n))?;
         self.smt(&format!("(assert (= {} {}))", n, t))?;
+        Ok(n)
+    }
+
+    /// `x` reduced to the range of the integer type `t`, as a C conversion
+    /// to `t` does: modulo 2^width, two's complement for a signed type. It
+    /// is a fresh `n` in the range of `t` with `x = n + 2^width * k` for a
+    /// fresh integer `k`, which only one `n` satisfies. That is linear: Z3
+    /// 4.8.12 can run forever, past its resource limit, on a `mod` of such
+    /// a value under another `mod` or a product, and random programs found
+    /// many such queries (`tests/fuzz.py --seed 1`).
+    fn wrap_term(&mut self, t: &Type, x: &str) -> Result<String, Diag> {
+        let n = self.fresh_int("wrap", &num(t.int_min()), &num(t.int_max()))?;
+        let k = self.fresh_name("wrap_k");
+        self.smt(&format!("(declare-const {} Int)", k))?;
+        self.smt(&format!("(assert (= {} (+ {} (* {} {}))))", x, n, t.int_modulus(), k))?;
         Ok(n)
     }
 
@@ -1572,7 +1578,7 @@ impl<'p> Verifier<'p> {
                     let x = self.eval(&args[0], st)?.term().to_string();
                     let t = &targs[0];
                     if n == "wrap" {
-                        return Ok(Val::U(wrap_term(t, &x)));
+                        return Ok(Val::U(self.wrap_term(t, &x)?));
                     }
                     let from = self.int_ops.get(&e.pos).cloned().unwrap_or(Type::U64);
                     let max = num(t.int_max());
@@ -2055,13 +2061,15 @@ impl<'p> Verifier<'p> {
             "wrap_add" | "wrap_sub" | "wrap_mul" => {
                 let ity = self.int_ops.get(&pos).cloned().expect("typed by the checker");
                 let op = match name { "wrap_add" => "+", "wrap_sub" => "-", _ => "*" };
-                Ok(Val::U(wrap_term(&ity, &format!("({} {} {})", op, vals[0].term(), vals[1].term()))))
+                let t = format!("({} {} {})", op, vals[0].term(), vals[1].term());
+                Ok(Val::U(self.wrap_term(&ity, &t)?))
             }
             "lock_new" => {
                 for (what, i) in self.invariants_of(&vals[0])? {
                     self.need(st, i, pos, "E-VERIFY-LOCKINV", format!("that the value put in the lock satisfies the invariant {}", what))?;
                 }
-                Ok(Val::Obj(Type::Lock(Box::new(val_type(&vals[0]))), vec![]))
+                let t = self.int_ops.get(&pos).cloned().unwrap_or_else(|| val_type(&vals[0]));
+                Ok(Val::Obj(Type::Lock(Box::new(t)), vec![]))
             }
             // An atomic's value may change at any moment, so like a lock's
             // contents only its invariants are known when it is read, and
@@ -2447,6 +2455,26 @@ impl<'p> Verifier<'p> {
                 self.need(st, format!("(= {} 1)", vals[0].field("level")), pos, "E-VERIFY-PT", format!("that `{}` is a last-level table (level 1), which maps pages", ra(0)))?;
                 let w = self.fresh_bool("pt_writable")?;
                 Ok(w)
+            }
+            "pt_accessible" => {
+                // Whether the program may touch the page in slot i at all
+                // (pt_set_access). Not tracked: the answer is unknown.
+                let i = vals[1].term().to_string();
+                index_ok(self, st, &i, "512", 1, "a page table (512 slots)")?;
+                self.need(st, format!("(= {} 1)", vals[0].field("level")), pos, "E-VERIFY-PT", format!("that `{}` is a last-level table (level 1), which maps pages", ra(0)))?;
+                self.fresh_bool("pt_accessible")
+            }
+            "pt_set_access" => {
+                // Changes only what the program may do with the page in slot
+                // i: the table still owns it, so nothing the proof tracks
+                // changes.
+                let t = &vals[0];
+                let i = vals[1].term().to_string();
+                index_ok(self, st, &i, "512", 1, "a page table (512 slots)")?;
+                self.need(st, format!("(= {} 1)", t.field("level")), pos, "E-VERIFY-PT", format!("that `{}` is a last-level table (level 1), which maps pages", ra(0)))?;
+                self.need(st, format!("(select {} {})", t.field("used"), i), pos, "E-VERIFY-OWN", format!("that slot `{}` of `{}` holds a page (`pt_used({}, {})`)", ra(1), ra(0), ra(0), ra(1)))?;
+                self.need(st, format!("(<= {} 2)", vals[2].term()), pos, "E-VERIFY-PT", format!("that `{}` is 0 (no access), 1 (read) or 2 (read and write)", ra(2)))?;
+                Ok(Val::Unit)
             }
             "pt_put" | "pt_take" | "pt_put_frame" | "pt_take_frame" => {
                 let t = &vals[0];

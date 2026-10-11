@@ -103,6 +103,8 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("pt_free_root", Avail::Kernel, vec![r(Mmu), PageTable], Frame),
         ("pt_has", Avail::Mem, vec![r(PageTable), U64], Bool),
         ("pt_writable", Avail::Mem, vec![r(PageTable), U64], Bool),
+        ("pt_accessible", Avail::Mem, vec![r(PageTable), U64], Bool),
+        ("pt_set_access", Avail::Mem, vec![m(PageTable), U64, U64], Unit),
         ("pt_put", Avail::Mem, vec![m(PageTable), U64, PageTable], Unit),
         ("pt_take", Avail::Mem, vec![m(PageTable), U64], PageTable),
         ("pt_put_frame", Avail::Mem, vec![m(PageTable), U64, Frame, Bool], Unit),
@@ -1473,6 +1475,10 @@ impl<'a> Ctx<'a> {
                             return Err(Diag::new("E-PIN", args[0].pos, format!("a {} cannot be put in a lock: it holds a capability of this processor", t.name()))
                                 .note("`Cpu` and `Mmu` describe the processor that holds them, and a lock can be taken on any processor"));
                         }
+                        // The verifier's view of the value does not say
+                        // which integer type it has (an i64 reads as a
+                        // u64), so the contents' type is recorded here.
+                        self.int_ops.insert(e.pos, t.clone());
                         return Ok(Type::Lock(Box::new(t)));
                     }
                     return match t {
