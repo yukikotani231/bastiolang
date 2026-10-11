@@ -5,7 +5,7 @@
 # first line of `// expect-stdout: TEXT`, if given, with stdin empty); fail/*.bastio must be rejected with the error
 # code in their `// expect-error: CODE` header, checked for the target in an
 # optional `// target: T` header (a rejection for the wrong
-# reason counts as a failure).
+# reason counts as a failure). diag/*.bastio must print exactly diag/*.err.
 set -u
 cd "$(dirname "$0")/.."
 BASTIOC=${BASTIOC:-stage0/target/release/bastioc0}
@@ -44,6 +44,20 @@ for f in tests/fail/*.bastio; do
     echo "FAIL $f: error output lacks: $missing"; sed 's/^/    /' "$tmp/err"; fail=$((fail+1)); continue
   fi
   pass=$((pass+1))
+done
+# Diagnostics: what the compiler prints for diag/NAME.bastio, run from
+# tests/diag, must be diag/NAME.err exactly: the source line with its
+# number, the token underlined, the notes. To accept a deliberate change,
+# regenerate the .err files with bastioc0 and review the diff.
+case "$BASTIOC" in /*) abs=$BASTIOC ;; */*) abs=$PWD/$BASTIOC ;; *) abs=$BASTIOC ;; esac
+for f in tests/diag/*.bastio; do
+  name=$(basename "$f" .bastio)
+  (cd tests/diag && "$abs" --check "$name.bastio" 2>"$tmp/diag.err" >/dev/null)
+  if cmp -s "$tmp/diag.err" "tests/diag/$name.err"; then
+    pass=$((pass+1))
+  else
+    echo "FAIL $f: the error output differs from $name.err"; diff "tests/diag/$name.err" "$tmp/diag.err" | sed 's/^/    /'; fail=$((fail+1))
+  fi
 done
 # User programs (for a Bastio kernel such as BastiOS) cannot run here: they
 # must verify and their C must compile freestanding.
@@ -98,7 +112,10 @@ if echo 'int main(void){return 0;}' | ${CC:-cc} -fsanitize=address,undefined -x 
     want=$(sed -n 's|^// expect-exit: *||p' "$f" | head -1)
     "$BASTIOC" --emit-c -o "$tmp/$name.c" "$f" 2>/dev/null
     ${CC:-cc} -fsanitize=address,undefined -fno-sanitize-recover=all -g -o "$tmp/$name.san" "$tmp/$name.c"
-    "$tmp/$name.san" </dev/null >/dev/null 2>"$tmp/$name.san.err"; got=$?
+    # A failed allocation returns NULL, as calloc does without ASan, so the
+    # `try_alloc` path that handles it is the one checked.
+    ASAN_OPTIONS=allocator_may_return_null=1 \
+      "$tmp/$name.san" </dev/null >/dev/null 2>"$tmp/$name.san.err"; got=$?
     if [ "$got" = "$want" ]; then pass=$((pass+1)); else
       echo "FAIL $f under sanitizers: exit $got"; sed 's/^/    /' "$tmp/$name.san.err" | head -20; fail=$((fail+1)); fi
   done

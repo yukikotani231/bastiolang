@@ -1,0 +1,46 @@
+// expect-exit: 15
+// Pages taken without being zeroed (`Dirty`). A dirty page may still hold
+// what its last owner wrote, so it becomes a `Frame` only by being
+// overwritten whole: zeroed, or a copy of another page. Until then it
+// cannot be read, mapped or given back as a frame.
+
+fn main(pool: &mut Pool) -> u64 {
+  if pool_size(pool) < 4 {
+    return 15;
+  }
+  // Leave data behind in page 1, then take it back dirty and zero it.
+  let mut a = pool_take(&mut pool, 1);
+  frame_write(&mut a, 9, 77);
+  pool_give(&mut pool, a);
+  let d = pool_take_dirty(&mut pool, 1);
+  let mut r = 0;
+  if dirty_id(d) == 1 {
+    r = r + 1;
+  }
+  let z = dirty_zero(d);
+  if frame_id(z) == 1 && frame_read(z, 9) == 0 {
+    r = r + 2;
+  }
+  // A copy of a page: every byte of the source.
+  let mut src = pool_take(&mut pool, 0);
+  frame_write(&mut src, 0, 5);
+  frame_write(&mut src, 511, 6);
+  let c = frame_copy(pool_take_dirty(&mut pool, 2), src);
+  if frame_id(c) == 2 && frame_read(c, 0) == 5 && frame_read(c, 511) == 6 {
+    r = r + 4;
+  }
+  // A copy of a shared page (how a private copy of a shared mapping is made).
+  let s = shared_new(src);
+  let c2 = shared_copy(pool_take_dirty(&mut pool, 3), s);
+  if frame_read(c2, 511) == 6 {
+    r = r + 8;
+  }
+  let last = shared_drop(&mut pool, s);
+  if last == 0 {
+    pool_give(&mut pool, pool_take(&mut pool, last));
+  }
+  pool_give(&mut pool, z);
+  pool_give(&mut pool, c);
+  pool_give(&mut pool, c2);
+  return r;
+}

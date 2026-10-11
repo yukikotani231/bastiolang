@@ -191,7 +191,7 @@ const LEAF: [&str; 4] = ["%r8", "%r9", "%r10", "%r11"];
 
 /// Builtins generated inline, with no call to the runtime.
 const INLINE_BUILTINS: &[&str] = &[
-    "len", "get", "set", "blen", "bget", "bset", "slen", "sget", "vec_len", "vec_get", "vec_set", "vec_swap", "vec_pop", "wrap_add", "wrap_sub", "wrap_mul",
+    "len", "get", "set", "blen", "bget", "bset", "slen", "sget", "vec_len", "vec_get", "vec_set", "vec_swap", "vec_pop", "vec_push_within", "wrap_add", "wrap_sub", "wrap_mul",
     "cast", "wrap", "vec_new", "pool_size", "pool_take", "pool_give", "pt_new", "pt_free", "frame_id", "frame_read", "frame_read8", "frame_write", "frame_write8",
     "pt_has", "pt_writable", "pt_put", "pt_put_frame", "pt_take", "pt_take_frame", "bcopy", "bmove", "frame_to_bytes", "bytes_to_frame",
 ];
@@ -1090,6 +1090,7 @@ impl<'a> Gen<'a> {
         match &e.kind {
             ExprKind::TypeApp(targs, inner) => match &inner.kind {
                 ExprKind::Call(n, _) if n == "vec_new" => Type::Vec(Box::new(targs[0].clone())),
+                ExprKind::Call(n, _) if n == "try_box" => crate::check::boxed_type(&targs[0]),
                 _ => targs[0].clone(), // cast, wrap
             },
             ExprKind::Neg(_) => self.int_ops.get(&e.pos).cloned().unwrap_or(Type::I64),
@@ -1120,7 +1121,8 @@ impl<'a> Gen<'a> {
             },
             ExprKind::Call(n, args) if crate::check::VEC_BUILTINS.contains(&n.as_str()) => match n.as_str() {
                 "vec_len" => Type::U64,
-                "vec_push" | "vec_set" | "vec_free" => Type::Unit,
+                "vec_try_reserve" => Type::Bool,
+                "vec_push" | "vec_push_within" | "vec_set" | "vec_free" => Type::Unit,
                 _ => self.vec_elem(&args[0]),
             },
             ExprKind::Call(n, args) if crate::check::PT_BORROW_BUILTINS.contains(&n.as_str()) => match &args[2].kind {
@@ -1860,6 +1862,11 @@ impl<'a> Gen<'a> {
                 let mark = self.depth;
                 self.val_into(e, Dst::Stack(mark, 0))?;
             }
+            ExprKind::TypeApp(_, inner) if matches!(&inner.kind, ExprKind::Call(n, _) if n == "try_box") => {
+                self.reserve(n);
+                let mark = self.depth;
+                self.val_into(e, Dst::Stack(mark, 0))?;
+            }
             ExprKind::TypeApp(_, inner) if matches!(&inner.kind, ExprKind::Call(n, _) if n == "vec_new") => {
                 for _ in 0..3 {
                     self.push("$0");
@@ -1887,6 +1894,38 @@ impl<'a> Gen<'a> {
                     let (o, _) = field(&Type::Struct(sn.clone()), f);
                     self.val_into(x, d.at(o))?;
                 }
+            }
+            // `try_box[T](x)`: the value first, then the box. Out of memory
+            // (a null pointer), the value goes back in `Full` instead.
+            ExprKind::TypeApp(targs, inner) if matches!(&inner.kind, ExprKind::Call(n, _) if n == "try_box") => {
+                let ExprKind::Call(_, args) = &inner.kind else { unreachable!("a call") };
+                let n = words(&targs[0])?;
+                self.push_val(&args[0])?;
+                self.emit(&format!("mov ${}, %edi", n));
+                self.emit("call bst_rt_try_alloc");
+                let (l_full, l_end) = (self.label(), self.label());
+                self.emit("test %rax, %rax");
+                self.emit(&format!("jz {}", l_full));
+                for i in 0..n {
+                    self.emit(&format!("mov {}(%rsp), %rdx", 8 * i));
+                    self.emit(&format!("mov %rdx, {}(%rax)", 8 * i));
+                }
+                self.drop_words(n);
+                let at = self.dst_op(d.at(1));
+                self.emit(&format!("mov %rax, {}", at));
+                let at = self.dst_op(d);
+                self.emit(&format!("movq $0, {}", at));
+                self.emit(&format!("jmp {}", l_end));
+                self.place_label(&l_full);
+                self.depth += n as i64;
+                for i in 0..n {
+                    self.pop("%rax");
+                    let at = self.dst_op(d.at(1 + i));
+                    self.emit(&format!("mov %rax, {}", at));
+                }
+                let at = self.dst_op(d);
+                self.emit(&format!("movq $1, {}", at));
+                self.place_label(&l_end);
             }
             ExprKind::Variant(en, v, payload) => {
                 let k = enum_def(en).unwrap().index(v).unwrap();
@@ -2113,6 +2152,18 @@ impl<'a> Gen<'a> {
                 self.emit("mov %rax, %rdi");
                 self.emit(&format!("call bst_rt_{}", name));
                 self.pop("%rcx");
+                self.push("%rax");
+                self.push("%rcx");
+            }
+            // Out of memory: a null pointer, and the length becomes 0.
+            "try_alloc" | "try_balloc" => {
+                self.scalar(&args[0])?;
+                self.push("%rax");
+                self.emit("mov %rax, %rdi");
+                self.emit(&format!("call bst_rt_{}", name));
+                self.pop("%rcx");
+                self.emit("test %rax, %rax");
+                self.emit("cmovz %rax, %rcx");
                 self.push("%rax");
                 self.push("%rcx");
             }
@@ -2402,6 +2453,27 @@ impl<'a> Gen<'a> {
                 self.emit("incq (%rdi)");
                 self.drop_words(1);
             }
+            "vec_push_within" => {
+                // The proof reserved the room: no check, no growing.
+                let n = words(&self.vec_elem(&args[0]))?;
+                self.arg(&args[0])?;
+                self.push_val(&args[1])?;
+                self.emit(&format!("mov {}(%rsp), %rdi", 8 * n));
+                self.emit("mov (%rdi), %rax");
+                self.elem_addr(n);
+                self.pop_to(Loc::Mem("%rcx", 0), n);
+                self.emit("incq (%rdi)");
+                self.drop_words(1);
+            }
+            "vec_try_reserve" => {
+                let n = words(&self.vec_elem(&args[0]))?;
+                self.arg(&args[0])?;
+                self.scalar(&args[1])?;
+                self.emit("mov %rax, %rsi");
+                self.pop("%rdi");
+                self.emit(&format!("mov ${}, %edx", 8 * n));
+                self.emit("call bst_rt_vec_try_reserve");
+            }
             "vec_pop" => {
                 let n = words(&self.vec_elem(&args[0]))?;
                 self.scalar(&args[0])?;
@@ -2601,6 +2673,20 @@ bst_rt_balloc:                  # %rax = %rdi zeroed bytes (at least one)
 	jz bst_rt_oom
 	leave
 	ret
+bst_rt_try_alloc:               # the same, or 0 when out of memory
+	mov $8, %esi
+	jmp 1f
+bst_rt_try_balloc:
+	mov $1, %esi
+1:	push %rbp
+	mov %rsp, %rbp
+	and $-16, %rsp
+	test %rdi, %rdi
+	jnz 2f
+	mov $1, %edi
+2:	call calloc@PLT
+	leave
+	ret
 bst_rt_free:                    # free(%rdi)
 	push %rbp
 	mov %rsp, %rbp
@@ -2630,6 +2716,58 @@ bst_rt_vec_grow:                # grow the Vec at (%rdi), elements of %rsi bytes
 	mov %r12, 8(%rbx)
 	mov -8(%rbp), %rbx
 	mov -16(%rbp), %r12
+	leave
+	ret
+bst_rt_vec_try_reserve:         # room for %rsi more elements of %rdx bytes in the Vec at (%rdi): %eax = 1, or 0 and unchanged
+	mov 8(%rdi), %rax
+	sub (%rdi), %rax
+	cmp %rsi, %rax
+	jb 1f
+	mov $1, %eax
+	ret
+1:	push %rbp
+	mov %rsp, %rbp
+	push %rbx
+	push %r12
+	push %r13
+	sub $8, %rsp
+	mov %rdi, %rbx
+	mov %rdx, %r13
+	mov $1, %eax                # lim = 2^60 / size: the capacity stays at most 2^60
+	shl $60, %rax
+	xor %edx, %edx
+	div %r13
+	mov (%rbx), %rcx
+	cmp %rax, %rcx
+	ja 3f
+	mov %rax, %r8
+	sub %rcx, %r8
+	cmp %r8, %rsi
+	ja 3f
+	lea (%rcx,%rsi), %r12       # new capacity: len + k, or double when that is more and fits
+	mov 8(%rbx), %rdx
+	shr $1, %rax
+	cmp %rax, %rdx
+	ja 2f
+	add %rdx, %rdx
+	cmp %r12, %rdx
+	jbe 2f
+	mov %rdx, %r12
+2:	mov %r12, %rax
+	mul %r13
+	mov %rax, %rsi
+	mov 16(%rbx), %rdi
+	call realloc@PLT
+	test %rax, %rax
+	jz 3f
+	mov %rax, 16(%rbx)
+	mov %r12, 8(%rbx)
+	mov $1, %eax
+	jmp 4f
+3:	xor %eax, %eax
+4:	mov -8(%rbp), %rbx
+	mov -16(%rbp), %r12
+	mov -24(%rbp), %r13
 	leave
 	ret
 bst_rt_bfrom:                   # Bytes copied from the %rdi bytes at %rsi: %rax = data, %rdx = len

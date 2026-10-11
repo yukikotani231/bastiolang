@@ -15,6 +15,17 @@ What will be 0.2.0.
 
 ### Language
 
+- `try_alloc` and `try_balloc`: allocation that returns an empty buffer when
+  memory runs out instead of stopping the program. The prover makes the
+  program check the length before using it.
+- `vec_try_reserve` and `vec_push_within`: room for elements is reserved
+  ahead of time, or the reservation reports that memory ran out, and pushes
+  into reserved room never allocate. The prover tracks a vector's capacity
+  (`vcap` in specifications). `alloc`, `balloc`, `vec_push` and `box` still
+  stop the program on out of memory.
+- `try_box[T](x)`: a box that reports running out of memory. It returns
+  `Boxed::Ok` with the box, or `Boxed::Full` with `x` given back, from
+  `enum Boxed[T]` in the new `core/boxed.bastio`.
 - Page tables shared between processors: a processor takes a `Lease` on a
   top-level table with `mmu_enter` and gives it back with `mmu_exit`, and
   while a tree has leases nothing can be taken out of it, only added
@@ -24,6 +35,12 @@ What will be 0.2.0.
   between and within `Bytes`, `frame_to_bytes` / `bytes_to_frame` for pages
   and `dma_to_bytes` / `bytes_to_dma` for lent pages. The prover knows what
   `bcopy` and `bmove` copy; page contents stay untracked (#91).
+- `Dirty` pages: `pool_take_dirty` takes a page without zeroing it, and it
+  becomes a `Frame` only by being overwritten whole (`dirty_zero`,
+  `frame_copy`, `shared_copy`, or `dirty_fill` from a page's worth of
+  bytes), so a kernel can take pages under a lock and fill them outside it,
+  or fill a page from a file without zeroing it first, without ever
+  exposing what they held.
 - `pt_writable`: whether a level-1 page-table entry maps its frame
   writable (#81).
 - `boot_fb`, the framebuffer the boot loader reported, and a device window
@@ -36,6 +53,13 @@ What will be 0.2.0.
 - Generic `spec fn`s, and `vcount` for counting in specifications; local
   variables may share a function's name (#74).
 - `==` on structs and enums in specifications (#86).
+- `opaque spec fn`: a spec fn whose body is used only in its own file and
+  is an uninterpreted function everywhere else, so a library can describe
+  its data abstractly. `core/ring`'s `Queue` is now proved to be a FIFO
+  (`queue_at`).
+- `has_bit(x, i)` in specifications, and what every bitwise operator does
+  to each bit, so packed bitmaps are proved to change only the bit they
+  set or clear.
 - Imports are searched for in the library path (`--lib`), so
   `import "core/text.bastio"` works from anywhere (#85).
 
@@ -62,14 +86,53 @@ What will be 0.2.0.
 - Diagnostics name tokens as written, report a missing `;` at the end of the
   line, say where a linear value was consumed, and suggest a close name for
   an unknown variable or function (#87).
+- An error shows its source line with the line number, the whole token at
+  the error underlined, and its notes aligned under it; `tests/diag` holds
+  golden transcripts, checked with both compilers (#102).
+- bastioc1 checks its own source in 8.5 s instead of 11.5 s (hash indexes
+  instead of linear scans by name), and proves in batches, freeing each
+  batch's terms: 175 MB instead of 497 MB on its own source, 325 MB
+  instead of 953 MB on the BastiOS kernel (#102).
 - Z3 runs with a fixed work limit per query (`:rlimit`) instead of a 10 s
   timeout, so a proof no longer fails on a busy machine (#89).
+- Each function is verified on a reset solver, so whether a proof near
+  the work limit succeeds no longer depends on which functions shared its
+  solver: the same program could be
+  accepted with one `BASTIO_JOBS` and rejected with another. Found by the
+  fuzzer below.
+- `tests/fuzz.py`: random programs whose meaning the fuzzer computes
+  itself (a proof that holds while some input overflows, divides by zero,
+  shifts too far, indexes out of bounds or breaks an `assert` or `ensures`
+  is a false proof; proved programs are also run, through both backends,
+  against that meaning), and damaged copies of the tests (no compiler may
+  crash or hang; one that is still accepted runs under ASan and UBSan).
+  bastioc1 must agree with bastioc0 on every input. CI runs a short
+  deterministic run.
 - A change to `stage0/src` needs its stage1 mirror, or a `Stage0-only:`
   reason in a commit message; CI checks this on every pull request (#78).
+
+### Fixed
+
+- A false proof in both compilers. A loop or call that changes a signed
+  integer (also inside a struct, enum or box) forgot its value but gave the
+  new one the range of `u64`, which leaves out the negative numbers, so an
+  `i64` that went negative in a loop could be proved to be 0 after it
+  (`tests/fail/loop_signed_range.bastio`, `call_signed_range.bastio`). A
+  changed `u8`, `u16` or `u32` got the range of `u64` too, which only made
+  true facts about it unprovable. Each now keeps its type's range.
+- Another false proof in both compilers: a loop or call did not look
+  inside the argument of `cast[T](..)` or `wrap[T](..)`, so a variable
+  changed by a call written there kept its value from before
+  (`tests/fail/loop_cast_call.bastio`).
 
 ### Documentation
 
 - The trusted base is listed and explained (`docs/trusted-base.md`, #66).
+- `examples/qoi`: a QOI image codec called from C. Its buffers are sized by
+  an untrusted header, and running out of memory is a result C sees, not an
+  abort. "Calling Bastio from C" in the book is now a guide: building,
+  vendoring the generated C, ownership, errors and out of memory, several
+  libraries in one program, and what the proofs assume of the C side.
 - The tutorial's section on calling Bastio from C walks through a new
   example, `examples/lines`, built on `export fn` and `--header` (#92).
 - `tests/run.sh` checks that error messages shown in `docs/` are what the

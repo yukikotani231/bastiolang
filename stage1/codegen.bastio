@@ -298,6 +298,7 @@ fn cg_tyname(g: &mut Cg, m: &Mono, p: &Parser, t: u64, mode: u64) {
   else if k == TY_DMA { cg_tn(&mut g, "Dma", mode); }
   else if k == TY_LEASE { cg_tn(&mut g, "Lease", mode); }
   else if k == TY_SHARED { cg_tn(&mut g, "Shared", mode); }
+  else if k == TY_DIRTY { cg_tn(&mut g, "Dirty", mode); }
   else if k == TY_STRUCT || k == TY_ENUM { cg_instname(&mut g, m, p, x.a, mode); }
   else if k == TY_BOX { cg_tn(&mut g, "Box[", mode); cg_tyname(&mut g, m, p, x.a, mode); cg_tn(&mut g, "]", mode); }
   else if k == TY_VEC { cg_tn(&mut g, "Vec[", mode); cg_tyname(&mut g, m, p, x.a, mode); cg_tn(&mut g, "]", mode); }
@@ -360,6 +361,7 @@ fn cg_cty(g: &mut Cg, m: &Mono, p: &Parser, t: u64) {
   else if k == TY_DMA { cg_t(&mut g, "bst_dma"); }
   else if k == TY_LEASE { cg_t(&mut g, "bst_lease"); }
   else if k == TY_SHARED { cg_t(&mut g, "bst_frame"); }
+  else if k == TY_DIRTY { cg_t(&mut g, "bst_frame"); }
   else if k == TY_STRUCT { cg_t(&mut g, "bst_s_"); cg_instname(&mut g, m, p, x.a, CG_CID); }
   else if k == TY_ENUM { cg_t(&mut g, "bst_e_"); cg_instname(&mut g, m, p, x.a, CG_CID); }
   else if k == TY_BOX { cg_cty(&mut g, m, p, x.a); cg_t(&mut g, " *"); }
@@ -555,6 +557,9 @@ fn cg_type_of(g: &Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) 
       if name_is(p, n.b, "vec_new") {
         return intern(&mut m, p, TY_VEC, t);
       }
+      if name_is(p, n.b, "try_box") {
+        return boxed_t(&mut m, p, t);
+      }
       return t;
     }
     let x = tapp_inst(&mut m, p, i, g.env);
@@ -625,7 +630,10 @@ fn cg_type_of(g: &Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) 
         if name_is(p, i, "vec_len") {
           return c.tu64;
         }
-        if name_is(p, i, "vec_push") || name_is(p, i, "vec_set") || name_is(p, i, "vec_free") {
+        if name_is(p, i, "vec_try_reserve") {
+          return c.tbool;
+        }
+        if name_is(p, i, "vec_push") || name_is(p, i, "vec_push_within") || name_is(p, i, "vec_set") || name_is(p, i, "vec_free") {
           return c.tunit;
         }
         return cg_vec_elem(g, c, &mut m, p, a0);
@@ -910,6 +918,9 @@ fn cg_expr(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64)
     if is_typed_builtin(p, n.b) {
       if name_is(p, n.b, "vec_new") {
         return cg_lit(&mut g, "((bst_vec){ 0, 0, 0 })");
+      }
+      if name_is(p, n.b, "try_box") {
+        return cg_try_box(&mut g, c, &mut m, p, i);
       }
       // `cast` is proved not to change the value and `wrap` means C's
       // modular conversion, so both are a plain C cast.
@@ -1297,6 +1308,65 @@ fn cg_vec_call(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgS
   vec_free(vals);
   let e = cg_span(g, start);
   return cg_seq(&mut g, pre, e);
+}
+
+/// `try_box[T](x)`: the value first, then the box; out of memory, the
+/// value goes back in `Full`.
+fn cg_try_box(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp {
+  let n = node_at(p.nodes, i);
+  let call = node_at(p.nodes, n.b);
+  let inner = conv(&mut m, p, n.a, g.env, i);
+  cg_note(&mut g.boxed, inner);
+  let bt = boxed_t(&mut m, p, inner);
+  let s1 = cg_mark(g);
+  cg_cty(&mut g, m, p, inner);
+  let ct = cg_span(g, s1);
+  let s2 = cg_mark(g);
+  cg_cty(&mut g, m, p, bt);
+  let et = cg_span(g, s2);
+  let k = cg_tmp(&mut g);
+  let e = cg_expr(&mut g, c, &mut m, p, call.a, 0);
+  let start = cg_mark(g);
+  cg_t(&mut g, "({ ");
+  cg_sp(&mut g, ct);
+  cg_t(&mut g, " tx_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " = ");
+  cg_sp(&mut g, e);
+  cg_t(&mut g, "; ");
+  cg_sp(&mut g, ct);
+  cg_t(&mut g, " *tp_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " = (");
+  cg_sp(&mut g, ct);
+  cg_t(&mut g, " *)bst_box_try_alloc(sizeof(");
+  cg_sp(&mut g, ct);
+  cg_t(&mut g, ")); ");
+  cg_sp(&mut g, et);
+  cg_t(&mut g, " tr_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, "; if (tp_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, ") { *tp_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " = tx_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, "; tr_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " = (");
+  cg_sp(&mut g, et);
+  cg_t(&mut g, "){ .tag = 0, .u.Ok = tp_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " }; } else { tr_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " = (");
+  cg_sp(&mut g, et);
+  cg_t(&mut g, "){ .tag = 1, .u.Full = tx_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " }; } tr_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, "; })");
+  return cg_span(g, start);
 }
 
 fn cg_box(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp {
@@ -2185,6 +2255,13 @@ fn cg_helpers(g: &mut Cg, m: &Mono, p: &Parser) {
     cg_t(&mut g, " x) { if (v->len == v->cap) bst_vec_grow(v, sizeof("); cg_sp(&mut g, ct);
     cg_t(&mut g, ")); (("); cg_sp(&mut g, ct);
     cg_t(&mut g, " *)v->data)[v->len++] = x; }\n");
+    cg_t(&mut g, "static void bst_vec_push_within_"); cg_sp(&mut g, hn);
+    cg_t(&mut g, "(bst_vec *v, "); cg_sp(&mut g, ct);
+    cg_t(&mut g, " x) { (("); cg_sp(&mut g, ct);
+    cg_t(&mut g, " *)v->data)[v->len++] = x; }\n");
+    cg_t(&mut g, "static bool bst_vec_try_reserve_"); cg_sp(&mut g, hn);
+    cg_t(&mut g, "(bst_vec *v, uint64_t k) { return bst_vec_try_grow(v, k, sizeof("); cg_sp(&mut g, ct);
+    cg_t(&mut g, ")); }\n");
     cg_t(&mut g, "static "); cg_sp(&mut g, ct);
     cg_t(&mut g, " bst_vec_pop_"); cg_sp(&mut g, hn);
     cg_t(&mut g, "(bst_vec *v) { return (("); cg_sp(&mut g, ct);

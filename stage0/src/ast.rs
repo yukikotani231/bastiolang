@@ -74,6 +74,11 @@ pub enum Type {
     /// (`shared_new`): the page stays allocated while any reference is
     /// held, and the last `shared_drop` gives it back to the pool. Linear.
     Shared,
+    /// A page taken out of the pool without being zeroed (`pool_take_dirty`):
+    /// it may still hold what its last owner wrote, so it cannot be read,
+    /// mapped or given out as a `Frame` until it is overwritten whole
+    /// (`dirty_zero`, `frame_copy`, `shared_copy`, `dirty_fill`). Linear.
+    Dirty,
     /// A user-defined struct. Linear when any field is linear; otherwise a
     /// plain value that is copied.
     Struct(String),
@@ -134,6 +139,7 @@ impl Type {
             Type::Dma => "Dma".into(),
             Type::Lease => "Lease".into(),
             Type::Shared => "Shared".into(),
+            Type::Dirty => "Dirty".into(),
             Type::Struct(n) | Type::Enum(n) => n.clone(),
             Type::Box(t) => format!("Box[{}]", t.name()),
             Type::Vec(t) => format!("Vec[{}]", t.name()),
@@ -146,7 +152,7 @@ impl Type {
     }
     pub fn is_linear(&self) -> bool {
         match self {
-            Type::Buf | Type::Bytes | Type::Host | Type::Child | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu | Type::Ports | Type::PortIo | Type::MmioSpace | Type::Mmio | Type::Dma | Type::Lease | Type::Shared | Type::Box(_) | Type::Vec(_) | Type::Lock(_) | Type::Atomic(_) => true,
+            Type::Buf | Type::Bytes | Type::Host | Type::Child | Type::Serial | Type::Frame | Type::PageTable | Type::Pool | Type::Mmu | Type::Cpu | Type::Ports | Type::PortIo | Type::MmioSpace | Type::Mmio | Type::Dma | Type::Lease | Type::Shared | Type::Dirty | Type::Box(_) | Type::Vec(_) | Type::Lock(_) | Type::Atomic(_) => true,
             Type::Struct(n) => struct_def(n).map_or(false, |d| d.fields.iter().any(|f| f.1.is_linear())),
             Type::Enum(n) => enum_def(n).map_or(false, |d| d.variants.iter().any(|v| v.1.as_ref().map_or(false, |t| t.is_linear()))),
             _ => false,
@@ -388,6 +394,10 @@ pub struct SpecFn {
     pub ret: Type,
     pub body: Expr,
     pub pos: Pos,
+    /// `opaque spec fn`: its body is seen only by functions in the file
+    /// that defines it; elsewhere it is an uninterpreted function, known
+    /// only through the contracts that mention it.
+    pub opaque: bool,
 }
 
 /// `struct Name { field: Type, .. }`

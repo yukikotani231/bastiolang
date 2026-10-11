@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Builds the Bastio QOI library into C, links it with the C test harness
+# under AddressSanitizer + UBSan, and runs the round trips, the differential
+# fuzz and the out-of-memory test. `run.sh bench` builds with -O2 alone and
+# measures throughput.
+# Needs z3 and cc; BASTIOC overrides the compiler (default: stage0's build).
+set -eu
+here=$(cd "$(dirname "$0")" && pwd)
+BASTIOC=${BASTIOC:-$here/../../stage0/target/release/bastioc0}
+CC=${CC:-cc}
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+"$BASTIOC" --emit-c --header "$tmp/qoi.h" -o "$tmp/qoi.c" "$here/lib.bastio"
+# The generated C is compiled with -w: its prelude defines helpers this
+# library does not use. The harness gets -Wall.
+build() {  # C compiler flags...
+  "$CC" -std=c11 "$@" -w -c -o "$tmp/qoi.o" "$tmp/qoi.c"
+  "$CC" -std=c11 "$@" -Wall -I"$tmp" -o "$tmp/test" "$here/test.c" "$tmp/qoi.o"
+}
+if [ "${1:-}" = bench ]; then
+  build -O2
+  "$tmp/test" bench
+  exit
+fi
+build -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all
+# Allocations over 64 MiB fail (malloc returns NULL), so the test can check
+# that running out of memory is reported, not a crash.
+export ASAN_OPTIONS=allocator_may_return_null=1:max_allocation_size_mb=64
+"$tmp/test" "$@"

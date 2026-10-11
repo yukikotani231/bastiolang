@@ -11,7 +11,7 @@
 //   const    := 'const' IDENT ':' 'u64' '=' expr ';'   (constant-folded; define before use)
 //   param    := 'mut'? IDENT ':' type
 //   type     := 'u64' | 'bool' | 'Str' | linear | IDENT (a struct) | '&' linear | '&' 'mut' linear
-//   linear   := 'Buf' | 'Bytes' | 'Host' | 'Child' | 'Serial' | 'Frame' | 'PageTable' | 'Pool' | 'Mmu' | 'Cpu' | 'Ports' | 'PortIo' | 'MmioSpace' | 'Mmio' | 'Dma' | 'Lease' | 'Shared'
+//   linear   := 'Buf' | 'Bytes' | 'Host' | 'Child' | 'Serial' | 'Frame' | 'PageTable' | 'Pool' | 'Mmu' | 'Cpu' | 'Ports' | 'PortIo' | 'MmioSpace' | 'Mmio' | 'Dma' | 'Lease' | 'Shared' | 'Dirty'
 //   place    := IDENT ('.' IDENT)*
 //   primary  := ... | '&' 'mut' place | 'include_bytes' '(' STRING ')' | 'old' '(' expr ')'
 //             | IDENT '{' (IDENT ':' expr (',' IDENT ':' expr)* ','?)? '}'   (a struct literal)
@@ -119,7 +119,12 @@ impl Parser {
         let mut enums = Vec::new();
         while *self.peek() != Tok::Eof {
             match self.peek() {
-                Tok::Spec => specs.push(self.spec_def()?),
+                Tok::Spec => specs.push(self.spec_def(false)?),
+                // `opaque` is a keyword only here, before `spec fn`.
+                Tok::Ident(w) if w == "opaque" && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::Spec) => {
+                    self.bump();
+                    specs.push(self.spec_def(true)?)
+                }
                 Tok::Struct => structs.push(self.struct_def()?),
                 Tok::Enum => enums.push(self.enum_def()?),
                 Tok::Const => self.const_def()?,
@@ -321,18 +326,21 @@ impl Parser {
         Ok(())
     }
 
-    fn spec_def(&mut self) -> PResult<SpecFn> {
+    fn spec_def(&mut self, opaque: bool) -> PResult<SpecFn> {
         let pos = self.expect(Tok::Spec, "`spec`")?.pos;
         self.expect(Tok::Fn, "`fn` after `spec`")?;
         let (name, _) = self.ident()?;
         let tparams = self.tparams()?;
+        if opaque && !tparams.is_empty() {
+            return Err(Diag::new("E-PARSE", pos, "an opaque spec fn cannot be generic"));
+        }
         let params = self.params()?;
         self.expect(Tok::Arrow, "`->`")?;
         let ret = self.ty()?;
         self.expect(Tok::LBrace, "`{`")?;
         let body = self.expr()?;
         self.expect(Tok::RBrace, "`}`")?;
-        Ok(SpecFn { name, tparams, params, ret, body, pos })
+        Ok(SpecFn { name, tparams, params, ret, body, pos, opaque })
     }
 
     fn ty(&mut self) -> PResult<Type> {
@@ -374,6 +382,7 @@ impl Parser {
             "Dma" => Ok(Type::Dma),
             "Lease" => Ok(Type::Lease),
             "Shared" => Ok(Type::Shared),
+            "Dirty" => Ok(Type::Dirty),
             _ if *self.peek() == Tok::LBracket && n != "Box" && n != "Vec" && n != "Lock" && n != "Atomic" => Ok(Type::Generic(n, self.targs()?)),
             "Box" | "Vec" | "Lock" | "Atomic" => {
                 self.expect(Tok::LBracket, "`[`")?;
