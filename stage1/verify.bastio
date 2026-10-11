@@ -30,6 +30,7 @@ const VT_APP: u64 = 3;        // operator a applied to targs[b .. b + c]
 const VT_FORALL: u64 = 4;     // (forall ((a Int)) b)
 const VT_LAMBDA: u64 = 5;     // (lambda ((a Int)) b)
 const VT_FORALLP: u64 = 6;    // (forall ((a Int)) (! b :pattern (p) :pattern (q))), p and q targs[c], targs[c + 1]
+const VT_FORALLP1: u64 = 7;   // (forall ((a Int)) (! b :pattern (c)))
 
 const OP_ADD: u64 = 1;
 const OP_SUB: u64 = 2;
@@ -51,6 +52,8 @@ const OP_STORE: u64 = 17;
 const OP_CNT: u64 = 18;       // vcount: (cnt elements length value)
 const OP_DEC: u64 = 19;       // bdec: (dec data from to)
 const OP_HEX: u64 = 20;       // bhex: (hex data from to)
+const OP_BIT: u64 = 21;       // has_bit: (bit x i)
+const OP_CALL: u64 = 22;      // an opaque spec fn: (f x ..), f the first argument (an atom)
 
 // Sorts: Int or Bool, under `depth` levels of (Array Int ..): base + 2 * depth.
 const SO_INT: u64 = 0;
@@ -66,7 +69,7 @@ const VV_STRUCT: u64 = 6;     // type ty; fields kids[a .. a + n]
 const VV_ENUM: u64 = 7;       // type ty; tag a; payloads kids[b .. b + n] (unit for none)
 const VV_BOXK: u64 = 8;       // a box holding value a
 const VV_BOXO: u64 = 9;       // a box of type ty whose contents are not known yet
-const VV_VEC: u64 = 10;       // element type ty; length a; lifted elements b
+const VV_VEC: u64 = 10;       // element type ty; length a; lifted elements b; capacity c (0: unknown, see `fresh_cap`)
 const VV_UNIT: u64 = 11;
 
 // Commands.
@@ -184,6 +187,17 @@ struct Vr {
   dec_fns: Vec[u64],
   /// The same for `bhex`.
   hex_fns: Vec[u64],
+  /// The same for `has_bit`, and whether the one being verified is one of
+  /// them: only then is every bitwise operator described bit by bit.
+  bit_fns: Vec[u64],
+  bits: bool,
+  /// The same for a vector's capacity (`vcap`, `vec_try_reserve`,
+  /// `vec_push_within`): only those functions track capacities.
+  cap_fns: Vec[u64],
+  caps: bool,
+  /// The file of the function being verified: an opaque spec fn's body is
+  /// used only in its own file.
+  file: u64,
   /// Every function's summaries, grouped by instance: rows
   /// sum_start[x] .. sum_start[x] + sum_n[x] are instance x's.
   sums: Vec[SumRow],
@@ -236,7 +250,7 @@ fn vr_new(m: &mut Mono, p: &Parser) -> Vr {
   vec_push(&mut vals, Vl { kind: 0, ty: 0, a: 0, b: 0, c: 0, n: 0, d: 0, e: 0 });
   let mut v = Vr {
     pool: vec_new[u64](), tms: tms, targs: vec_new[u64](), vals: vals, kids: vec_new[u64](),
-    log: vec_new[Cmd](), counter: 0, obligations: 0, box_depth: 0, cur: 0, env: 0, cnt_fns: vec_new[u64](), counts: false, dec_fns: vec_new[u64](), hex_fns: vec_new[u64](),
+    log: vec_new[Cmd](), counter: 0, obligations: 0, box_depth: 0, cur: 0, env: 0, cnt_fns: vec_new[u64](), counts: false, dec_fns: vec_new[u64](), hex_fns: vec_new[u64](), bit_fns: vec_new[u64](), bits: false, cap_fns: vec_new[u64](), caps: false, file: 0,
     sums: vec_new[SumRow](), obls: vec_new[Obl](), snaps: vec_new[Bind](), sum_start: vec_new[u64](), sum_n: vec_new[u64](),
     t_true: 0, t_false: 0, t_zero: 0, t_u64max: 0, t_allocmax: 0, t_flimit: 0, t_plimit: 0, t_mmio_lo: 0, t_mmio_hi: 0, t_poolsize: 0,
     t_zarr: 0, t_nobool: 0, t_k: 0, t_255: 0, unit: 0,
@@ -272,6 +286,8 @@ fn vr_free(v: Vr) {
   vec_free(v.cnt_fns);
   vec_free(v.dec_fns);
   vec_free(v.hex_fns);
+  vec_free(v.bit_fns);
+  vec_free(v.cap_fns);
   vec_free(v.sums);
   vec_free(v.sum_start);
   vec_free(v.sum_n);
@@ -585,6 +601,91 @@ fn targ(v: &Vr, t: u64, k: u64) -> u64 {
 /// (forall ((q Int)) body)
 fn forall_tm(v: &mut Vr, q: u64, body: u64) -> u64 {
   return new_tm(&mut v, VT_FORALL, q, body, 0);
+}
+
+// ---- Bits (`has_bit`) ----
+
+/// `has_bit(x, i)` is about `(bit x i)`: whether bit `i` of `x` is set.
+/// `bit` is uninterpreted; what the prover knows about it is that no bit
+/// of 0 is set, that bits 0 to w - 1 of the largest w-bit number are, and,
+/// for each bitwise operator a function evaluates, how each bit of the
+/// result follows from the bits of the operands (`bit_fact`). As stage0's
+/// BIT_AXIOMS.
+fn bit_axioms(v: &mut Vr) {
+  let l0 = atom_str(&mut v, "(declare-fun bit (Int Int) Bool)");
+  send(&mut v, CMD_RAW, l0, 0);
+  let a0 = atom_str(&mut v, "(assert (forall ((j Int)) (! (not (bit 0 j)) :pattern ((bit 0 j)))))");
+  send(&mut v, CMD_RAW, a0, 0);
+  let a1 = atom_str(&mut v, "(assert (forall ((j Int)) (! (= (bit 255 j) (and (<= 0 j) (< j 8))) :pattern ((bit 255 j)))))");
+  send(&mut v, CMD_RAW, a1, 0);
+  let a2 = atom_str(&mut v, "(assert (forall ((j Int)) (! (= (bit 65535 j) (and (<= 0 j) (< j 16))) :pattern ((bit 65535 j)))))");
+  send(&mut v, CMD_RAW, a2, 0);
+  let a3 = atom_str(&mut v, "(assert (forall ((j Int)) (! (= (bit 4294967295 j) (and (<= 0 j) (< j 32))) :pattern ((bit 4294967295 j)))))");
+  send(&mut v, CMD_RAW, a3, 0);
+  let a4 = atom_str(&mut v, "(assert (forall ((j Int)) (! (= (bit 18446744073709551615 j) (and (<= 0 j) (< j 64))) :pattern ((bit 18446744073709551615 j)))))");
+  send(&mut v, CMD_RAW, a4, 0);
+}
+
+/// Bit `j` of term `t`: `(bit t j)`, or for a number, which bits are set
+/// spelled out. As stage0's `bit_of`.
+fn bit_of(v: &mut Vr, t: u64, j: u64) -> u64 {
+  let x = tm_at(v, t);
+  if x.kind != VT_NUM {
+    return app2(&mut v, OP_BIT, t, j);
+  }
+  let c = x.a;
+  if c == 0 {
+    return v.t_false;
+  }
+  let k = low_mask(c);
+  if k > 0 {
+    let lo = app2(&mut v, OP_LE, v.t_zero, j);
+    let tk = num(&mut v, k - 1);
+    let hi = app2(&mut v, OP_LT, j, tk);
+    return app2(&mut v, OP_AND, lo, hi);
+  }
+  let mut set = vec_new[u64]();
+  let mut y = c;
+  let mut b = 0;
+  while b < 64 {
+    if y % 2 == 1 {
+      let tb = num(&mut v, b);
+      let e = app2(&mut v, OP_EQ, j, tb);
+      vec_push(&mut set, e);
+    }
+    y = y / 2;
+    b = b + 1;
+  }
+  let mut r = 0;
+  if vec_len(set) == 1 {
+    r = u_at(set, 0);
+  } else {
+    r = appv(&mut v, OP_OR, set);
+  }
+  vec_free(set);
+  return r;
+}
+
+/// Asserts that every bit `j` of `r` is `body` (a term over the atom `j`).
+/// As stage0's `bit_fact`.
+fn bit_fact(v: &mut Vr, r: u64, j: u64, body: u64) {
+  let b = app2(&mut v, OP_BIT, r, j);
+  let lo = app2(&mut v, OP_LE, v.t_zero, j);
+  let eq = app2(&mut v, OP_EQ, b, body);
+  let imp = app2(&mut v, OP_IMP, lo, eq);
+  let all = new_tm(&mut v, VT_FORALLP1, j, imp, b);
+  assert_tm(&mut v, all);
+}
+
+/// A fresh name for the value of `t`, so that facts about its bits can be
+/// triggered by it (a pattern cannot contain an `ite`). As stage0's `named`.
+fn bits_named(v: &mut Vr, t: u64) -> u64 {
+  let h = atom_str(&mut v, "bits");
+  let n = fresh_name(&mut v, h);
+  send(&mut v, CMD_DECL, n, SO_INT);
+  let e = app2(&mut v, OP_EQ, n, t);
+  assert_tm(&mut v, e);
+  return n;
 }
 
 // ---- Counting (`vcount`) ----
@@ -1121,6 +1222,7 @@ fn out_op(out: &mut Vec[u64], op: u64) {
   else if op == OP_CNT { out_str(&mut out, "cnt"); }
   else if op == OP_DEC { out_str(&mut out, "dec"); }
   else if op == OP_HEX { out_str(&mut out, "hex"); }
+  else if op == OP_BIT { out_str(&mut out, "bit"); }
 }
 
 fn out_tm(out: &mut Vec[u64], v: &Vr, t: u64) {
@@ -1133,6 +1235,16 @@ fn out_tm(out: &mut Vec[u64], v: &Vr, t: u64) {
     }
   } else if x.kind == VT_NUM {
     out_num(&mut out, x.a);
+  } else if x.kind == VT_APP && x.a == OP_CALL {
+    out_str(&mut out, "(");
+    out_tm(&mut out, v, targ(v, t, 0));
+    let mut k = 1;
+    while k < x.c {
+      out_str(&mut out, " ");
+      out_tm(&mut out, v, targ(v, t, k));
+      k = k + 1;
+    }
+    out_str(&mut out, ")");
   } else if x.kind == VT_APP {
     out_str(&mut out, "(");
     out_op(&mut out, x.a);
@@ -1162,6 +1274,14 @@ fn out_tm(out: &mut Vec[u64], v: &Vr, t: u64) {
     out_tm(&mut out, v, u_at(v.targs, x.c));
     out_str(&mut out, ") :pattern (");
     out_tm(&mut out, v, u_at(v.targs, vadd(x.c, 1)));
+    out_str(&mut out, ")))");
+  } else if x.kind == VT_FORALLP1 {
+    out_str(&mut out, "(forall ((");
+    out_tm(&mut out, v, x.a);
+    out_str(&mut out, " Int)) (! ");
+    out_tm(&mut out, v, x.b);
+    out_str(&mut out, " :pattern (");
+    out_tm(&mut out, v, x.c);
     out_str(&mut out, ")))");
   }
 }
@@ -1296,6 +1416,31 @@ fn fresh_bool(v: &mut Vr, hint: u64) -> u64 {
 fn fresh_len(v: &mut Vr, hint: u64) -> u64 {
   let h = pre_str(&mut v, "len_", hint);
   return fresh_int(&mut v, h, v.t_zero, v.t_allocmax);
+}
+
+/// A vector's capacity, at least its length `l`, when the function tracks
+/// capacities (0 otherwise). The allocators never give a vector room for
+/// more than 2^60 elements (`bst_vec_grow`, `bst_vec_try_grow`).
+fn fresh_cap(v: &mut Vr, l: u64, hint: u64) -> u64 {
+  if !v.caps {
+    return 0;
+  }
+  let h = pre_str(&mut v, "cap_", hint);
+  let n = fresh_int(&mut v, h, v.t_zero, v.t_allocmax);
+  let le = app2(&mut v, OP_LE, l, n);
+  assert_tm(&mut v, le);
+  return n;
+}
+
+/// A capacity known only by its range: at least `l`, at most 2^60.
+fn fresh_cap_named(v: &mut Vr, hint: Str, l: u64) -> u64 {
+  let h = atom_str(&mut v, hint);
+  let n = fresh_int(&mut v, h, v.t_zero, v.t_allocmax);
+  if l != 0 {
+    let le = app2(&mut v, OP_LE, l, n);
+    assert_tm(&mut v, le);
+  }
+  return n;
 }
 
 /// A fresh array from Int to `so`.
@@ -1464,7 +1609,8 @@ fn val_eq(v: &Vr, a: u64, b: u64) -> bool {
     return val_eq(v, x.a, y.a);
   }
   if k == VV_VEC {
-    return tm_eq(v, x.a, y.a) && val_eq(v, x.b, y.b);
+    let same_cap = x.c == y.c || (x.c != 0 && y.c != 0 && tm_eq(v, x.c, y.c));
+    return tm_eq(v, x.a, y.a) && same_cap && val_eq(v, x.b, y.b);
   }
   return true;            // VV_BOXO (same type) and VV_UNIT
 }
@@ -1524,8 +1670,12 @@ fn merge(v: &mut Vr, c: u64, a: u64, b: u64) -> u64 {
   }
   if k == VV_VEC {
     let l = ite(&mut v, c, x.a, y.a);
+    let mut cap = 0;
+    if x.c != 0 && y.c != 0 {
+      cap = ite(&mut v, c, x.c, y.c);
+    }
     let el = merge(&mut v, c, x.b, y.b);
-    return mk(&mut v, VV_VEC, x.ty, l, el, 0, 0);
+    return mk(&mut v, VV_VEC, x.ty, l, el, cap, 0);
   }
   if k == VV_BOXK && y.kind == VV_BOXK {
     let inner = merge(&mut v, c, x.a, y.a);
@@ -2183,7 +2333,8 @@ fn fresh_of(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, tyx: u64, hint: u64) 
   if k == TY_VEC {
     let el = fresh_lifted(&mut v, c, m, p, inner_t(m, tyx), hint);
     let l = fresh_len(&mut v, hint);
-    return mk(&mut v, VV_VEC, inner_t(m, tyx), l, el, 0, 0);
+    let cap = fresh_cap(&mut v, l, hint);
+    return mk(&mut v, VV_VEC, inner_t(m, tyx), l, el, cap, 0);
   }
   if k == TY_BOX {
     if v.box_depth >= BOX_DEPTH {
@@ -2403,11 +2554,13 @@ fn havoc(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, oenv: u64, keep: bool, n
   }
   if k == VV_VEC {
     let mut l = xv.a;
+    let mut cap = xv.c;
     if !keep {
       l = fresh_len(&mut v, name);
+      cap = fresh_cap(&mut v, l, name);
     }
     let el = fresh_lifted(&mut v, c, m, p, xv.ty, name);
-    return mk(&mut v, VV_VEC, xv.ty, l, el, 0, 0);
+    return mk(&mut v, VV_VEC, xv.ty, l, el, cap, 0);
   }
   if k == VV_BOXK {
     let inner = havoc(&mut v, c, m, p, xv.a, keep, name);
@@ -2920,10 +3073,134 @@ fn vspec_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env: &V
     return spec_tm(&mut v, c, &mut m, p, n.a, oenv, oenv, false, 0, &mut bound);
   }
   let sf = vspec_def(p, n.s, n.e);
+  let sfn = node_at(p.nodes, sf);
+  if sf != 0 && sfn.x == 1 && sfn.file != v.file {
+    return vspec_opaque(&mut v, c, &mut m, p, i, sf, env, oenv, has_old, res, &mut bound);
+  }
   if sf != 0 {
     return vspec_expand(&mut v, c, &mut m, p, i, sf, 0, env, oenv, has_old, res, &mut bound);
   }
   return vspec_builtin(&mut v, c, &mut m, p, i, env, oenv, has_old, res, &mut bound);
+}
+
+/// Call `i` of opaque spec fn `sf` outside its file: an uninterpreted
+/// function of its arguments' terms. As stage0.
+fn vspec_opaque(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, sf: u64, env: &Vec[Bind], oenv: &Vec[Bind], has_old: bool, res: u64, bound: &mut Vec[Bnd]) -> u64 {
+  let n = node_at(p.nodes, i);
+  let sd = node_at(p.nodes, sf);
+  let nm = atom_src(&mut v, p, sd.s, sd.e);
+  let f = pre_str(&mut v, "o!", nm);
+  let mut ts = vec_new[u64]();
+  vec_push(&mut ts, f);
+  let mut q = sd.a;
+  let mut a = n.a;
+  while q != 0 && a != 0 {
+    let qn = node_at(p.nodes, q);
+    let pt = base_t(m, conv(&mut m, p, qn.a, 0, q));
+    if is_int(m, pt) || kind_t(m, pt) == TY_BOOL {
+      let t = spec_tm(&mut v, c, &mut m, p, a, env, oenv, has_old, res, &mut bound);
+      vec_push(&mut ts, t);
+    } else {
+      let y = spec_val(&mut v, c, &mut m, p, a, env, oenv, has_old, res, &mut bound);
+      opaque_terms(v, y, &mut ts, 0);
+    }
+    q = qn.next;
+    a = next_of(p, a);
+  }
+  let mut r = f;
+  if vec_len(ts) > 1 {
+    r = appv(&mut v, OP_CALL, ts);
+  }
+  vec_free(ts);
+  return r;
+}
+
+/// The terms of value `y` handed to an opaque spec fn, as stage0's
+/// `opaque_terms`.
+fn opaque_terms(v: &Vr, y: u64, out: &mut Vec[u64], depth: u64) {
+  let yv = vl_at(v, y);
+  if depth > 64 {
+    return;
+  }
+  if yv.kind == VV_U || yv.kind == VV_B {
+    vec_push(&mut out, yv.a);
+  } else if yv.kind == VV_BUF {
+    vec_push(&mut out, yv.a);
+    vec_push(&mut out, yv.b);
+  } else if yv.kind == VV_STRUCT {
+    let mut j = 0;
+    while j < yv.n {
+      opaque_terms(v, kid(v, y, j), &mut out, depth + 1);
+      j = j + 1;
+    }
+  }
+}
+
+/// The SMT sorts a parameter of type `t` is passed as, as stage0's
+/// `opaque_sorts`, separated by spaces (`first`: none written yet).
+fn opaque_sorts(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, t: u64, first: &mut bool, depth: u64) {
+  let k = kind_t(m, t);
+  if depth > 64 {
+    return;
+  }
+  if k == TY_REF {
+    opaque_sorts(&mut v, c, m, p, inner_t(m, t), &mut first, depth + 1);
+    return;
+  }
+  if k == TY_STRUCT {
+    let x = inner_t(m, t);
+    let dn = def_node(m, p, x);
+    let n = list_len(p, dn.a);
+    let mut j = 0;
+    while j < n {
+      opaque_sorts(&mut v, c, m, p, fld_ty(c, x, j), &mut first, depth + 1);
+      j = j + 1;
+    }
+    return;
+  }
+  if !first {
+    push_str(&mut v, " ");
+  }
+  first = false;
+  if k == TY_BOOL {
+    push_str(&mut v, "Bool");
+  } else if k == TY_BUF || k == TY_BYTES {
+    push_str(&mut v, "Int (Array Int Int)");
+  } else {
+    push_str(&mut v, "Int");
+  }
+}
+
+/// `(declare-fun o!f (sorts) ret)` for every opaque spec fn, as stage0
+/// sends them at the start of each function.
+fn opaque_decls(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
+  let mut k = p.specs.head;
+  while k != 0 {
+    let sd = node_at(p.nodes, k);
+    if sd.x == 1 {
+      let start = vec_len(v.pool);
+      push_str(&mut v, "(declare-fun o!");
+      push_src(&mut v, p, sd.s, sd.e);
+      push_str(&mut v, " (");
+      let mut q = sd.a;
+      let mut first = true;
+      while q != 0 {
+        let qn = node_at(p.nodes, q);
+        let pt = conv(&mut m, p, qn.a, 0, q);
+        opaque_sorts(&mut v, c, m, p, pt, &mut first, 0);
+        q = qn.next;
+      }
+      push_str(&mut v, ")");
+      if conv(&mut m, p, sd.b, 0, k) == c.tbool {
+        push_str(&mut v, " Bool)");
+      } else {
+        push_str(&mut v, " Int)");
+      }
+      let a = seal(&mut v, start);
+      send(&mut v, CMD_RAW, a, 0);
+    }
+    k = sd.next;
+  }
 }
 
 /// Call `i` of spec fn `sf` (instance `x` of it, or 0 for a plain one),
@@ -2988,6 +3265,16 @@ fn vspec_builtin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env:
     let to = spec_tm(&mut v, c, &mut m, p, arg_node(p, i, 2), env, oenv, has_old, res, &mut bound);
     return app3(&mut v, OP_HEX, bv.b, from, to);
   }
+  if span_is(p, n.s, n.e, "has_bit") {
+    // Bits from 64 up are never set: every integer in a specification is
+    // at most a u64.
+    let x = spec_tm(&mut v, c, &mut m, p, n.a, env, oenv, has_old, res, &mut bound);
+    let ix = spec_tm(&mut v, c, &mut m, p, arg_node(p, i, 1), env, oenv, has_old, res, &mut bound);
+    let t64 = num(&mut v, 64);
+    let lt = app2(&mut v, OP_LT, ix, t64);
+    let b = app2(&mut v, OP_BIT, x, ix);
+    return app2(&mut v, OP_AND, lt, b);
+  }
   if span_is(p, n.s, n.e, "vget") {
     let x = spec_val(&mut v, c, &mut m, p, i, env, oenv, has_old, res, &mut bound);
     return term(v, x);
@@ -2996,6 +3283,14 @@ fn vspec_builtin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env:
   let xv = vl_at(v, x);
   if span_is(p, n.s, n.e, "vlen") || span_is(p, n.s, n.e, "len") || span_is(p, n.s, n.e, "slen") || span_is(p, n.s, n.e, "blen") {
     return xv.a;
+  }
+  if span_is(p, n.s, n.e, "vcap") {
+    if xv.c != 0 {
+      return xv.c;
+    }
+    // The capacity of an element of a vector is not tracked: all that is
+    // known is its range.
+    return fresh_cap_named(&mut v, "cap", xv.a);
   }
   if span_is(p, n.s, n.e, "get") || span_is(p, n.s, n.e, "sget") || span_is(p, n.s, n.e, "bget") {
     let ix = spec_tm(&mut v, c, &mut m, p, arg_node(p, i, 1), env, oenv, has_old, res, &mut bound);
@@ -3109,7 +3404,11 @@ fn eval(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VSta
       let t = conv(&mut m, p, n.a, v.env, i);
       let h = atom_str(&mut v, "vec");
       let el = fresh_lifted(&mut v, c, m, p, t, h);
-      return mk(&mut v, VV_VEC, t, v.t_zero, el, 0, 0);
+      let mut cap = 0;
+      if v.caps {
+        cap = v.t_zero;
+      }
+      return mk(&mut v, VV_VEC, t, v.t_zero, el, cap, 0);
     }
     let x = tapp_inst(&mut m, p, i, v.env);
     return eval(&mut v, c, &mut m, p, n.b, &mut st, x);
@@ -3163,8 +3462,20 @@ fn eval(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VSta
     let x = eval(&mut v, c, &mut m, p, n.a, &mut st, 0);
     // Bitwise not on an unsigned integer: max - x.
     if has_int_op(c, v.env, i) {
-      let max = int_max(&mut v, m, int_op_ty(c, m, v.env, i));
+      let ity = int_op_ty(c, m, v.env, i);
+      let max = int_max(&mut v, m, ity);
       let t = app2(&mut v, OP_SUB, max, term(v, x));
+      if v.bits {
+        let r = bits_named(&mut v, t);
+        let j = atom_str(&mut v, "j");
+        let tw = num(&mut v, int_bits(m, ity));
+        let lt = app2(&mut v, OP_LT, j, tw);
+        let bx = bit_of(&mut v, term(v, x), j);
+        let nb = t_not(&mut v, bx);
+        let body = app2(&mut v, OP_AND, lt, nb);
+        bit_fact(&mut v, r, j, body);
+        return mk_u(&mut v, r);
+      }
       return mk_u(&mut v, t);
     }
     let t = t_not(&mut v, term(v, x));
@@ -3392,6 +3703,14 @@ fn bitwise(v: &mut Vr, m: &Mono, p: &Parser, i: u64, op: u64, a: u64, b: u64, ta
     }
     if op == P_SHR {
       let t = app2(&mut v, OP_DIV, ta, pw);
+      if v.bits {
+        let r = bits_named(&mut v, t);
+        let j = atom_str(&mut v, "j");
+        let js = app2(&mut v, OP_ADD, j, tb);
+        let body = bit_of(&mut v, ta, js);
+        bit_fact(&mut v, r, j, body);
+        return mk_u(&mut v, r);
+      }
       return mk_u(&mut v, t);
     }
     let t = app2(&mut v, OP_MUL, ta, pw);
@@ -3401,6 +3720,16 @@ fn bitwise(v: &mut Vr, m: &Mono, p: &Parser, i: u64, op: u64, a: u64, b: u64, ta
     vm_s(&mut v, " loses no bits of ");
     vm_ty(&mut v, m, p, ity);
     prove(&mut v, st, g2, i, VC_OVERFLOW);
+    if v.bits {
+      let r = bits_named(&mut v, t);
+      let j = atom_str(&mut v, "j");
+      let ge = app2(&mut v, OP_LE, tb, j);
+      let js = app2(&mut v, OP_SUB, j, tb);
+      let bx = bit_of(&mut v, ta, js);
+      let body = app2(&mut v, OP_AND, ge, bx);
+      bit_fact(&mut v, r, j, body);
+      return mk_u(&mut v, r);
+    }
     return mk_u(&mut v, t);
   }
   // `x & (2^k - 1)` keeps the low k bits.
@@ -3419,6 +3748,24 @@ fn bitwise(v: &mut Vr, m: &Mono, p: &Parser, i: u64, op: u64, a: u64, b: u64, ta
     if k > 0 {
       let pk = pow2_num(&mut v, k - 1);
       let t = app2(&mut v, OP_MOD, other, pk);
+      if v.bits {
+        let r = bits_named(&mut v, t);
+        let j = atom_str(&mut v, "j");
+        let tk = num(&mut v, k - 1);
+        let lt = app2(&mut v, OP_LT, j, tk);
+        let bx = bit_of(&mut v, other, j);
+        let body = app2(&mut v, OP_AND, lt, bx);
+        bit_fact(&mut v, r, j, body);
+        if k == 2 {
+          // Bit 0 says what `x & 1` is.
+          let b0 = bit_of(&mut v, other, v.t_zero);
+          let one = num(&mut v, 1);
+          let is1 = app2(&mut v, OP_EQ, r, one);
+          let link = app2(&mut v, OP_EQ, b0, is1);
+          assert_tm(&mut v, link);
+        }
+        return mk_u(&mut v, r);
+      }
       return mk_u(&mut v, t);
     }
   }
@@ -3441,6 +3788,21 @@ fn bitwise(v: &mut Vr, m: &Mono, p: &Parser, i: u64, op: u64, a: u64, b: u64, ta
     fact = app2(&mut v, OP_LE, r, sum);
   }
   vec_push(&mut st.pc, fact);
+  if v.bits {
+    let j = atom_str(&mut v, "j");
+    let bx = bit_of(&mut v, ta, j);
+    let by = bit_of(&mut v, tb, j);
+    let mut body = 0;
+    if op == P_AMP {
+      body = app2(&mut v, OP_AND, bx, by);
+    } else if op == P_PIPE {
+      body = app2(&mut v, OP_OR, bx, by);
+    } else {
+      let eq = app2(&mut v, OP_EQ, bx, by);
+      body = t_not(&mut v, eq);
+    }
+    bit_fact(&mut v, r, j, body);
+  }
   return mk_u(&mut v, r);
 }
 
@@ -4219,6 +4581,22 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     // alloc zero-fills.
     return mk(&mut v, VV_BUF, 0, a0.a, v.t_zarr, 0, 0);
   }
+  // Like alloc and balloc, but out of memory gives an empty buffer instead
+  // of stopping the program: the length is the size asked for, or 0.
+  if name_is(p, i, "try_alloc") || name_is(p, i, "try_balloc") {
+    let g = app2(&mut v, OP_LE, a0.a, v.t_allocmax);
+    vm_s(&mut v, "that the allocation size `");
+    vm_arg(&mut v, p, u_at(args, 0));
+    if name_is(p, i, "try_alloc") {
+      vm_s(&mut v, "` is at most 2^60 elements");
+    } else {
+      vm_s(&mut v, "` is at most 2^60 bytes");
+    }
+    prove(&mut v, st, g, i, VC_ALLOC);
+    let ok = fresh_bool_named(&mut v, "alloc_ok");
+    let len = app3(&mut v, OP_ITE, term(v, ok), a0.a, v.t_zero);
+    return mk(&mut v, VV_BUF, 0, len, v.t_zarr, 0, 0);
+  }
   if name_is(p, i, "len") || name_is(p, i, "slen") || name_is(p, i, "blen") || name_is(p, i, "vec_len") {
     return mk_u(&mut v, a0.a);
   }
@@ -4362,11 +4740,36 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
   }
 
   // ---- vectors ----
-  if name_is(p, i, "vec_push") {
-    // A push that cannot grow the vector aborts (out of memory), so after
-    // it the length stayed below 2^60.
-    let lt = app2(&mut v, OP_LT, a0.a, v.t_allocmax);
-    vec_push(&mut st.pc, lt);
+  if name_is(p, i, "vec_push") || name_is(p, i, "vec_push_within") {
+    let mut cap = a0.c;
+    if name_is(p, i, "vec_push") {
+      // A push that cannot grow the vector aborts (out of memory), so after
+      // it the length stayed below 2^60.
+      let lt = app2(&mut v, OP_LT, a0.a, v.t_allocmax);
+      vec_push(&mut st.pc, lt);
+      // It grows the storage only when it is full.
+      if cap != 0 {
+        let g = fresh_cap_named(&mut v, "cap_grown", 0);
+        let gl = app2(&mut v, OP_LT, a0.a, g);
+        vec_push(&mut st.pc, gl);
+        let room = app2(&mut v, OP_LT, a0.a, cap);
+        cap = app3(&mut v, OP_ITE, room, cap, g);
+      }
+    } else {
+      // Never allocates: the room was reserved.
+      if cap == 0 {
+        cap = fresh_cap_named(&mut v, "cap", 0);
+      }
+      let g = app2(&mut v, OP_LT, a0.a, cap);
+      vm_s(&mut v, "that `");
+      vm_arg(&mut v, p, u_at(args, 0));
+      vm_s(&mut v, "` has room for one more element (`vlen(");
+      vm_arg(&mut v, p, u_at(args, 0));
+      vm_s(&mut v, ") < vcap(");
+      vm_arg(&mut v, p, u_at(args, 0));
+      vm_s(&mut v, ")`)");
+      prove(&mut v, st, g, i, VC_BOUNDS);
+    }
     let el = vec_write(&mut v, m, a0.b, a0.a, x1);
     let one = num(&mut v, 1);
     let nl = app2(&mut v, OP_ADD, a0.a, one);
@@ -4377,9 +4780,30 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
       let f = count_step(&mut v, eb.a, nl, ea.a, a0.a, d);
       vec_push(&mut st.pc, f);
     }
-    let nv = mk(&mut v, VV_VEC, a0.ty, nl, el, 0, 0);
+    let nv = mk(&mut v, VV_VEC, a0.ty, nl, el, cap, 0);
     put_back(&mut v, m, p, &mut st, u_at(args, 0), nv);
     return v.unit;
+  }
+  if name_is(p, i, "vec_try_reserve") {
+    // On success there is room for `n` more elements; on failure the vector
+    // is unchanged. Either way the capacity stays within what the
+    // allocators give (`fresh_cap`).
+    let okv = fresh_bool_named(&mut v, "reserved");
+    let ok = term(v, okv);
+    let c2 = fresh_cap_named(&mut v, "cap_reserved", 0);
+    let le = app2(&mut v, OP_LE, a0.a, c2);
+    vec_push(&mut st.pc, le);
+    let want = app2(&mut v, OP_ADD, a0.a, term(v, x1));
+    let room = app2(&mut v, OP_LE, want, c2);
+    let imp = app2(&mut v, OP_IMP, ok, room);
+    vec_push(&mut st.pc, imp);
+    let mut cap = c2;
+    if a0.c != 0 {
+      cap = app3(&mut v, OP_ITE, ok, c2, a0.c);
+    }
+    let nv = mk(&mut v, VV_VEC, a0.ty, a0.a, a0.b, cap, 0);
+    put_back(&mut v, m, p, &mut st, u_at(args, 0), nv);
+    return okv;
   }
   if name_is(p, i, "vec_pop") {
     let g = app2(&mut v, OP_GT, a0.a, v.t_zero);
@@ -4400,7 +4824,7 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
       vec_push(&mut st.pc, f);
     }
     let r = vec_read(&mut v, c, m, p, a0.ty, a0.b, last, &mut st);
-    let nv = mk(&mut v, VV_VEC, a0.ty, last, a0.b, 0, 0);
+    let nv = mk(&mut v, VV_VEC, a0.ty, last, a0.b, a0.c, 0);
     put_back(&mut v, m, p, &mut st, u_at(args, 0), nv);
     return r;
   }
@@ -4425,7 +4849,7 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
         let f = count_step(&mut v, eb.a, a0.a, ea.a, a0.a, d);
         vec_push(&mut st.pc, f);
       }
-      let nv = mk(&mut v, VV_VEC, a0.ty, a0.a, el, 0, 0);
+      let nv = mk(&mut v, VV_VEC, a0.ty, a0.a, el, a0.c, 0);
       put_back(&mut v, m, p, &mut st, u_at(args, 0), nv);
     }
     return prev;
@@ -6042,6 +6466,7 @@ fn verify_fn(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
   v.tsub = vm_tsub(m, p, x);
   vec_free(prev);
   v.counts = has_u(v.cnt_fns, xi.def);
+  v.caps = has_u(v.cap_fns, xi.def);
   if v.counts {
     count_lemmas(&mut v);
   }
@@ -6050,6 +6475,12 @@ fn verify_fn(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
   }
   if has_u(v.hex_fns, xi.def) {
     hex_axioms(&mut v);
+  }
+  v.file = d.file;
+  opaque_decls(&mut v, c, &mut m, p);
+  v.bits = has_u(v.bit_fns, xi.def);
+  if v.bits {
+    bit_axioms(&mut v);
   }
   let mut env = vec_new[Bind]();
   let mut q = d.a;
@@ -6167,15 +6598,29 @@ fn verify_program(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
   count_gate(m, p, "vcount", &mut v.cnt_fns);
   count_gate(m, p, "bdec", &mut v.dec_fns);
   count_gate(m, p, "bhex", &mut v.hex_fns);
-  send(&mut v, CMD_DECL, v.t_poolsize, SO_INT);
-  let r = in_range(&mut v, v.t_zero, v.t_poolsize, v.t_flimit);
-  assert_tm(&mut v, r);
+  count_gate(m, p, "has_bit", &mut v.bit_fns);
+  count_gate(m, p, "vcap", &mut v.cap_fns);
+  count_gate(m, p, "vec_try_reserve", &mut v.cap_fns);
+  count_gate(m, p, "vec_push_within", &mut v.cap_fns);
   // Each function gets its own solver scope: what is declared and assumed
   // while verifying one (some of it quantified) must not burden the queries
-  // for all later ones.
+  // for all later ones. And every function after the first starts on a
+  // reset solver, so that what Z3 answers near its work limit does not
+  // depend on which functions shared its solver (stage0's verify_worker).
+  let r0 = atom_str(&mut v, "(reset)");
+  let r1 = atom_str(&mut v, "(set-option :produce-models true)");
+  let r2 = atom_str(&mut v, "(set-option :rlimit 40000000)");
   let mut k = 0;
   while k < vec_len(m.fns) {
     let x = u_at(m.fns, k);
+    if k > 0 {
+      send(&mut v, CMD_RAW, r0, 0);
+      send(&mut v, CMD_RAW, r1, 0);
+      send(&mut v, CMD_RAW, r2, 0);
+    }
+    send(&mut v, CMD_DECL, v.t_poolsize, SO_INT);
+    let r = in_range(&mut v, v.t_zero, v.t_poolsize, v.t_flimit);
+    assert_tm(&mut v, r);
     if exported_x(m, p, x) {
       buffers_kept(&mut v, &mut m, p, x);
     }

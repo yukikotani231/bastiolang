@@ -64,7 +64,7 @@ const D_STRUCT: u64 = 40;     // s..e, type parameters v (list of N_NAME), field
 const D_FIELD: u64 = 41;      // s..e: a
 const D_ENUM: u64 = 42;       // s..e, type parameters v, variants a (list of D_VARIANT)
 const D_VARIANT: u64 = 43;    // s..e, payload type a (or 0)
-const D_SPEC: u64 = 44;       // s..e, type parameters v, params a, return type b, body c
+const D_SPEC: u64 = 44;       // s..e, type parameters v, params a, return type b, body c; x 1 if opaque
 const D_FN: u64 = 45;         // s..e, type parameters v, params a, return type b, requires c, ensures d, body x;
                                // s2..e2 is the `export` keyword (empty if none)
 const D_PARAM: u64 = 46;      // (mut if v == 1) s..e: a
@@ -1644,11 +1644,14 @@ fn const_def(p: &mut Parser) {
   vec_push(&mut p.consts, Const { s: name.start, e: name.end, v: v });
 }
 
-fn spec_def(p: &mut Parser) -> u64 {
+fn spec_def(p: &mut Parser, opaque: bool) -> u64 {
   let t = expect_kw(&mut p, KW_SPEC);
   expect_kw_w(&mut p, KW_FN, "`fn` after `spec`");
   let name = ident(&mut p);
   let tps = tparams(&mut p);
+  if opaque && tps != 0 && !p.failed {
+    pm_fail(&mut p, t, "an opaque spec fn cannot be generic");
+  }
   let ps = params(&mut p);
   expect_p(&mut p, P_ARROW);
   let ret = ty(&mut p);
@@ -1665,6 +1668,9 @@ fn spec_def(p: &mut Parser) -> u64 {
   n.a = ps;
   n.b = ret;
   n.c = body;
+  if opaque {
+    n.x = 1;
+  }
   return add(&mut p, n);
 }
 
@@ -1721,7 +1727,13 @@ fn program(p: &mut Parser) {
   let mut t = peek(p);
   while !p.failed && t.kind != K_EOF {
     if is_kw(t, KW_SPEC) {
-      let k = spec_def(&mut p);
+      let k = spec_def(&mut p, false);
+      let l = p.specs;
+      p.specs = append(&mut p, l, k);
+    } else if t.kind == K_IDENT && tok_is(p.src, t, "opaque") && is_kw(ahead(p, 1), KW_SPEC) {
+      // `opaque` is a keyword only here, before `spec fn`.
+      bump(&mut p);
+      let k = spec_def(&mut p, true);
       let l = p.specs;
       p.specs = append(&mut p, l, k);
     } else if is_kw(t, KW_STRUCT) {
