@@ -499,7 +499,7 @@ Every error has the same shape: where, a code, a sentence, the source line, and 
 | `E-LINEAR-` | A value is leaked, used twice or used after it is gone | Find the path that leaks or reuses it; free, return or pass it on exactly once on every path |
 | `E-VERIFY-` | Something could go wrong for some input | Read the counterexample |
 
-For an `E-VERIFY-` error, the counterexample is a state the compiler believes the program can reach in which the operation fails. Ask whether that state is really possible:
+For an `E-VERIFY-` error, the counterexample is a state the compiler believes the program can reach in which the operation fails. Buffers and vectors appear by their length (`len(b)`, `vlen(v)`); when the failed proof is an `assert`, `requires`, `ensures` or invariant, a short one (at most 8 elements) is also shown in full, as in `v = [3, 1]`. Ask whether that state is really possible:
 
 - **Yes, it can happen.** It is a bug: an index one past the end, a missing check for zero. Fix the code. The counterexample is often the test case you would have written.
 - **No, the caller never does that.** Then say so with a `requires`, and the compiler will check that the callers really don't.

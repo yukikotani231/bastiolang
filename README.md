@@ -93,7 +93,7 @@ bastioc1 is the compiler written in Bastio (`stage1/`); stage0's `bastioc0` only
 
 | Path | Contents |
 | --- | --- |
-| `stage0/` | The bootstrap compiler in Rust: it builds bastioc1 and is the oracle for `stage1/difftest.sh`; being frozen (ROADMAP v2) |
+| `stage0/` | The bootstrap compiler in Rust: it builds bastioc1 and is the oracle for `stage1/difftest.sh`; frozen (see `docs/bootstrap.md`) |
 | `stage1/` | bastioc1, the compiler, written in Bastio (see `stage1/README.md`) |
 | `tests/pass/` | Programs that must verify and exit with a given code |
 | `tests/fail/` | Programs that must be rejected with a given error code |
@@ -104,11 +104,12 @@ bastioc1 is the compiler written in Bastio (`stage1/`); stage0's `bastioc0` only
 | `docs/language.md` | The language reference |
 | `docs/core.md` | The core and std libraries: what each function does and what is proved |
 | `docs/concurrency.md` | The concurrency design (not implemented yet) |
+| `docs/bootstrap.md` | How stage0 builds bastioc1, how to check the bootstrap, and what the stage0 freeze allows |
 | `ROADMAP.md` | The path to self-hosting and to a kernel |
 
 ## Status
 
-Pre-release. The language and the compiler change without notice, and nothing is stable yet. stage0 implements the language described in [docs/language.md](docs/language.md), whose "Soundness scope" section lists what is and is not guaranteed; the self-hosted compiler in `stage1/` is in progress. [ROADMAP.md](ROADMAP.md) has the plan.
+Pre-release. The language and the compiler change without notice, and nothing is stable yet. bastioc1 implements the language described in [docs/language.md](docs/language.md), whose "Soundness scope" section lists what is and is not guaranteed. stage0 is frozen ([docs/bootstrap.md](docs/bootstrap.md)): new features land in bastioc1 only. [ROADMAP.md](ROADMAP.md) has the plan.
 
 ## Contributing
 

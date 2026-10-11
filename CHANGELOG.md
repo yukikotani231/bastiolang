@@ -124,12 +124,23 @@ What will be 0.2.0.
   counterexample as `counterexample after one iteration:`, since the values
   are those after the iteration; a solver that cannot be started is one
   line naming the file, with no source line; `--help` prints the options.
+- A counterexample shows the elements of a buffer or vector of at most 8
+  scalars, after its length, when the failed proof is an `assert`,
+  `requires`, `ensures` or invariant: `vlen(v) = 2, v = [3, 1]` says why a
+  vector is not sorted. Bounds and arithmetic errors still show only the
+  length.
 - bastioc1 is the compiler the tests and benchmarks use: `tests/bastioc1.sh`
   builds it with stage0 and rebuilds it only when stage0 or stage1 changes.
   `BASTIOC` still picks another compiler.
 - `bastioc1 --dump-smt` prints every query sent to Z3, as bastioc0 does.
 - A test program marked `// stage1-only: <feature>` is skipped when the tests
   run with stage0, for features that land after the stage0 freeze.
+- stage0 is frozen: new features land in bastioc1 only. A branch that
+  changes `stage0/` must say why in a commit message, with `Stage0-only:`
+  (no stage1 counterpart) or `Stage0-shared:` (a bug fix made in both
+  compilers, mirror required); `tests/stage0_mirror.sh` checks it. The
+  `// stage1-only:` header in BastiOS's `src/main.bastio` leaves its kernel
+  out of difftest's comparisons with stage0.
 - A native x86-64 backend in the self-hosted compiler (`stage1/x86.bastio`),
   ported from stage0's and checked byte for byte against it (#70). It
   passes up to four argument words in registers (#72) and covers `Child`
@@ -214,6 +225,8 @@ What will be 0.2.0.
 
 ### Documentation
 
+- `docs/bootstrap.md`: how stage0 builds bastioc1, how to check the
+  bootstrap's fixed point, and what the stage0 freeze allows.
 - The trusted base is listed and explained (`docs/trusted-base.md`, #66).
 - `examples/qoi`: a QOI image codec called from C. Its buffers are sized by
   an untrusted header, and running out of memory is a result C sees, not an

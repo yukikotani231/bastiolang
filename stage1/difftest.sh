@@ -69,23 +69,37 @@ for p in "${pids[@]}"; do wait "$p" || built=0; done
 # reject a tests/pass program, and a tests/fail program with an error other
 # than the one it expects.
 keep() { for f in "$@"; do grep -q '^// stage1-only:' "$f" || echo "$f"; done; }
-files=$(keep $(find tests stage1 ../bastios/src ../bastios/user -name '*.bastio' 2>/dev/null | sort))
+# BastiOS's kernel is one program (src/main.bastio imports every module), so
+# the marker in src/main.bastio leaves the whole kernel out: its modules, the
+# driver's run on it, and the mutants checked through it. The comparisons of
+# two stage1 tools (asmdump --kernel against bastioc1) still run.
+kernel_main=
+if [ -f ../bastios/src/main.bastio ] && ! grep -q '^// stage1-only:' ../bastios/src/main.bastio; then
+  kernel_main=../bastios/src/main.bastio
+fi
+files=$(keep $(find tests stage1 ${kernel_main:+../bastios/src} ../bastios/user -name '*.bastio' 2>/dev/null | sort))
 pass_files=$(keep tests/pass/*.bastio)
 fail_files=$(keep tests/fail/*.bastio)
 user_files=$(keep tests/user/*.bastio)
 status=0
 s1only=0
-for f in $(grep -l '^// stage1-only:' tests/pass/*.bastio tests/fail/*.bastio tests/user/*.bastio); do
+for f in $(grep -l '^// stage1-only:' tests/pass/*.bastio tests/fail/*.bastio tests/user/*.bastio ../bastios/user/*.bastio 2>/dev/null); do
   s1only=$((s1only+1))
   want=$(sed -n 's|^// expect-error: *||p' "$f" | head -1)
   target=$(sed -n 's|^// target: *||p' "$f" | head -1)
   arch=$(sed -n 's|^// arch: *||p' "$f" | head -1)
-  case $f in tests/user/*) target=user ;; esac
+  case $f in tests/user/* | ../bastios/user/*) target=user ;; esac
   if "$BASTIOC" --check --target "${target:-hosted}" --arch "${arch:-x86_64}" "$f" 2>"$tmp/s1.err" \
      || { [ -n "$want" ] && grep -q "error\[$want\]" "$tmp/s1.err"; }; then
     echo "STALE $f is marked stage1-only, but stage0 handles it: remove the marker"; status=1
   fi
 done
+if [ -f ../bastios/src/main.bastio ] && [ -z "$kernel_main" ]; then
+  s1only=$((s1only+1))
+  if "$BASTIOC" --check --target kernel ../bastios/src/main.bastio >/dev/null 2>&1; then
+    echo "STALE ../bastios/src/main.bastio is marked stage1-only, but stage0 handles BastiOS's kernel: remove the marker"; status=1
+  fi
+fi
 [ "$s1only" = 0 ] || echo "-- stage1-only: $s1only program(s) left out of the comparison"
 
 . tests/pfor.sh
@@ -401,7 +415,7 @@ pfor drv_check $files || status=1
 match=$(n match) differ=$(n differ) errors=$(n error)
 cfiles=0
 cfs=()
-for f in $pass_files $user_files ../bastios/src/main.bastio ../bastios/user/*.bastio; do
+for f in $pass_files $user_files $kernel_main $(keep ../bastios/user/*.bastio 2>/dev/null); do
   [ -f "$f" ] && cfs+=("$f")
 done
 pfor drv_emitc "${cfs[@]}" || status=1
@@ -498,7 +512,7 @@ done
 # check their mutants through a program that imports them.
 python3 stage1/mutate.py --via stage1/checkdump.bastio "$BASTIOC" "--dump-check" "$tmp/checkdump" 4 ${MUTANTS:-5} \
   $(ls stage1/*.bastio | grep -v -e dump.bastio) || status=1
-if [ -f ../bastios/src/main.bastio ]; then
+if [ -n "$kernel_main" ]; then
   python3 stage1/mutate.py --via ../bastios/src/main.bastio "$BASTIOC" "--dump-check --target kernel" "$tmp/checkdump kernel" 5 ${MUTANTS:-5} \
     $(ls ../bastios/src/*.bastio | grep -v /main.bastio) || status=1
 fi
@@ -509,7 +523,7 @@ python3 stage1/mutate.py --verify "$BASTIOC" "--dump-verify" "$tmp/verifydump" 7
   $pass_files $fail_files stage1/verifycases/*.bastio || status=1
 # C, on the mutants that still type-check (the rest print the same error).
 python3 stage1/mutate.py "$BASTIOC" "--dump-c" "$tmp/cdump" 8 ${MUTANTS:-5} $pass_files || status=1
-if [ -f ../bastios/src/main.bastio ]; then
+if [ -n "$kernel_main" ]; then
   python3 stage1/mutate.py --via ../bastios/src/main.bastio "$BASTIOC" "--dump-c --target kernel" "$tmp/cdump kernel" 9 ${MUTANTS:-5} \
     $(ls ../bastios/src/*.bastio | grep -v /main.bastio) || status=1
 fi

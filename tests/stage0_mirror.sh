@@ -1,19 +1,29 @@
 #!/usr/bin/env bash
-# The stage0 freeze guard: a change to stage0's compiler (stage0/src/*.rs)
-# must come with a change to its stage1 counterpart, because stage1 is the
-# compiler that stays (ROADMAP v2, "stage0 is frozen"). stage1/difftest.sh
-# catches a mirror that behaves differently on the corpus; this catches the
-# mirror nobody wrote, including for behaviour the corpus does not reach.
-#
-# A change that has no stage1 counterpart (comments or formatting, a
-# bootstrap fix, the native backend, whose stage1 version deliberately
-# differs) says so with a line
+# The stage0 freeze guard (ROADMAP v2, "stage0 is frozen"; docs/bootstrap.md).
+# stage1 is the compiler that changes. stage0 stays only to bootstrap
+# bastioc1 and to be the oracle stage1/difftest.sh compares against, so every
+# change to stage0 (anything under stage0/ that git tracks) must say which
+# of the two kinds it is, in a line of one of the branch's commit messages
+# (any case):
 #
 #   Stage0-only: <why>
+#     The change has no stage1 counterpart: a bootstrap fix, the native
+#     backend (x86.rs, whose stage1 version deliberately differs), comments
+#     or formatting, a dependency.
 #
-# in one of the branch's commit messages (any case). Bug fixes and builtin
-# rows are not exempt: difftest compares what they change. The reason is for
-# reviewers; the guard only checks that it is there.
+#   Stage0-shared: <why>
+#     The same change is made in stage1 in the same branch, so the oracle
+#     keeps up: a fix to a bug both compilers share (soundness first), or a
+#     builtin row BastiOS needs while its kernel is still in difftest's
+#     corpus. Each changed stage0/src/*.rs must then come with a change to
+#     the stage1 file that mirrors it.
+#
+# A stage0 change with neither line is a new feature landing in stage0, and
+# fails: features land in stage1 only, with test programs marked
+# `// stage1-only: <feature>` (tests/stage1_only.sh). An unmirrored change
+# with only a Stage0-shared line fails too: its mirror is missing. The
+# reasons are for reviewers; the guard only checks that they are there.
+# stage1/difftest.sh still compares what the shared changes do.
 #
 # usage: tests/stage0_mirror.sh [BASE]
 #   Compares HEAD with its merge base with BASE (default: origin/main).
@@ -34,7 +44,7 @@ declare -A mirror=(
   [ast.rs]="parser.bastio print.bastio render.bastio mono.bastio"
   [mono.rs]="mono.bastio loader.bastio"
   [check.rs]="check.bastio loader.bastio"
-  [verify.rs]="verify.bastio"
+  [verify.rs]="verify.bastio solve.bastio"
   [smt.rs]="solve.bastio"
   [codegen.rs]="codegen.bastio cprelude.bastio header.bastio"
   [x86.rs]="x86.bastio"
@@ -44,9 +54,11 @@ declare -A mirror=(
 )
 
 changed=$(git diff --name-only "$from" HEAD)
+touched=()
 missing=()
 while IFS= read -r f; do
-  case $f in stage0/src/*.rs) ;; *) continue ;; esac
+  case $f in stage0/*) touched+=("$f") ;; *) continue ;; esac
+  case $f in stage0/src/*.rs) ;; *) missing+=("$f (outside the compiler's source)"); continue ;; esac
   name=${f#stage0/src/}
   if [ -z "${mirror[$name]+set}" ]; then
     missing+=("$f (new file: add it to the map in tests/stage0_mirror.sh)")
@@ -59,21 +71,41 @@ while IFS= read -r f; do
   [ -n "$ok" ] || missing+=("$f (mirror in stage1/: ${mirror[$name]// /, })")
 done <<<"$changed"
 
-if [ ${#missing[@]} -eq 0 ]; then
-  echo "stage0_mirror: every stage0 change has a stage1 counterpart"
+if [ ${#touched[@]} -eq 0 ]; then
+  echo "stage0_mirror: stage0 is unchanged"
   exit 0
 fi
-if git log --format=%B "$from..HEAD" | grep -qi '^Stage0-only: *[^ ]'; then
-  echo "stage0_mirror: stage0-only change, as a commit message says:"
-  git log --format=%B "$from..HEAD" | grep -i '^Stage0-only:' | sed 's/^/  /'
-  printf '  unmirrored: %s\n' "${missing[@]}"
+log=$(git log --format=%B "$from..HEAD")
+only=$(grep -i '^Stage0-only: *[^ ]' <<<"$log" || true)
+shared=$(grep -i '^Stage0-shared: *[^ ]' <<<"$log" || true)
+if [ -n "$only" ]; then
+  echo "stage0_mirror: stage0 changed, as a commit message says:"
+  { echo "$only"; [ -z "$shared" ] || echo "$shared"; } | sed 's/^/  /'
+  [ ${#missing[@]} -eq 0 ] || printf '  unmirrored: %s\n' "${missing[@]}"
   exit 0
 fi
-echo "stage0_mirror: stage0 changed without its stage1 counterpart:" >&2
-printf '  %s\n' "${missing[@]}" >&2
-cat >&2 <<'EOF'
-Mirror the change in stage1 (CLAUDE.md, ROADMAP v2 "stage0 is frozen"), or,
-if it has no stage1 counterpart, say why in a commit message line:
+if [ -n "$shared" ] && [ ${#missing[@]} -eq 0 ]; then
+  echo "stage0_mirror: stage0 changed together with stage1, as a commit message says:"
+  echo "$shared" | sed 's/^/  /'
+  exit 0
+fi
+if [ -n "$shared" ]; then
+  echo "stage0_mirror: a Stage0-shared change is missing its stage1 counterpart:" >&2
+  printf '  %s\n' "${missing[@]}" >&2
+  cat >&2 <<'EOT'
+Make the same change in stage1, or, for the parts that have no stage1
+counterpart, say why in a commit message line:
   Stage0-only: <why>
-EOF
+EOT
+  exit 1
+fi
+echo "stage0_mirror: stage0 is frozen, and this branch changes it without saying why:" >&2
+printf '  %s\n' "${touched[@]}" >&2
+cat >&2 <<'EOT'
+New features land in stage1 only, with their test programs marked
+`// stage1-only: <feature>` (ROADMAP v2, "stage0 is frozen"; docs/bootstrap.md).
+If this change belongs in stage0, say which kind it is in a commit message line:
+  Stage0-only: <why>      no stage1 counterpart (bootstrap fix, native backend, comments)
+  Stage0-shared: <why>    the same change is made in stage1 (a shared bug fix)
+EOT
 exit 1
