@@ -25,9 +25,6 @@ repositories are public. It is not part of the documentation website.
       both are security software; whether it holds a registered trademark
       was not checked (USPTO/EUIPO search by hand). "BastiOS" found no
       match. Decide whether to keep the name.
-- [ ] **fz.** The README calls Bastio "the successor to fz/fzl"; fz is a
-      private repository. Either make it public (archived), link nothing,
-      or drop the mention.
 
 ## Licensing
 
@@ -79,7 +76,6 @@ repositories are public. It is not part of the documentation website.
 - [ ] Issue and pull request templates; a `CODE_OF_CONDUCT.md` if wanted.
 - [ ] Repository description, topics and website link on GitHub.
 - [ ] Branch protection on `main`: require CI.
-- [ ] Re-enable or archive the CI of `fz` if it becomes public.
 
 ## Documentation drift
 

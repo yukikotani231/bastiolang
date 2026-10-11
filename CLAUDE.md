@@ -1,6 +1,6 @@
 # Bastio (the language)
 
-A systems language whose memory safety is proved at compile time. The successor to fz/fzl. This is an open-source project: write all code, comments, docs and commit messages in English.
+A systems language whose memory safety is proved at compile time. This is an open-source project: write all code, comments, docs and commit messages in English.
 
 - Direction and invariants: [ROADMAP.md](ROADMAP.md)
 - Language reference: [docs/language.md](docs/language.md)
@@ -15,7 +15,7 @@ tests/ci.sh                            # every CI check; run before each push
 
 Run `tests/ci.sh` after merging the latest `main` and before every push. Many branches land in parallel, so a stage0 change that is not mirrored in stage1, or new syntax the editor grammars do not know, fails CI on the next branch that merges `main`. Each failed run notifies the owner.
 
-Never copy test counts into prose: they go stale (a lesson from fz). Count the real thing instead:
+Never copy test counts into prose: they go stale. Count the real thing instead:
 `ls tests/pass tests/fail | grep -c bastio`
 
 ## Rules for new features
@@ -28,3 +28,5 @@ Never copy test counts into prose: they go stale (a lesson from fz). Count the r
 ## Commits
 
 `<area>: <summary>`, where area is `stage0` / `lang` / `test` / `docs` / `ci` and so on. The body says honestly what can now be proved and what still cannot.
+
+Pull request descriptions and GitHub comments are for outside readers: say what changed, how it was checked and what is left. Leave out how the work was divided between people or sessions, and the state of the account's CI quota.
