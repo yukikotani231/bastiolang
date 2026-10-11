@@ -32,7 +32,8 @@
 #   driver  stage1/bastioc1.bastio  vs  bastioc0 itself: what `--check`
 #           prints on stderr and its exit status, the C file of
 #           `--emit-c`, the C header of `--header`, the list of
-#           `--trusted-base`, what `--backend native` prints, and the
+#           `--trusted-base`, the queries of `--dump-smt`, what
+#           `--backend native` prints, and the
 #           programs it builds either way, which must exit as tests/pass
 #           says; with `--backend native --target user` (and `kernel`),
 #           the assembly of asmdump --user (--kernel); and bastioc1 built by itself must write the same C for
@@ -340,6 +341,14 @@ else
   differ=$((differ+1))
   echo "DIFFER BASTIO_LIB (--emit-c)"
 fi
+for f in tests/pass/fill_sum.bastio stage1/lexdump.bastio; do
+  if "$tmp/bastioc1" --check --dump-smt "$f" 2>/dev/null | cmp -s - <("$BASTIOC" --check --dump-smt "$f" 2>/dev/null); then
+    match=$((match+1))
+  else
+    differ=$((differ+1))
+    echo "DIFFER --dump-smt $f"
+  fi
+done
 if "$tmp/bastioc1" --trusted-base | cmp -s - <("$BASTIOC" --trusted-base); then
   match=$((match+1))
 else

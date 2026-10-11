@@ -10,7 +10,7 @@
 # BASTIOC is stage0 (tests/stage1_only.sh).
 set -u
 cd "$(dirname "$0")/.."
-BASTIOC=${BASTIOC:-stage0/target/release/bastioc0}
+BASTIOC=${BASTIOC:-$(tests/bastioc1.sh)} || exit 1
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 . tests/stage1_only.sh

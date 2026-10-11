@@ -25,6 +25,7 @@ step "build stage0 (warnings are errors)"
 (cd stage0 && RUSTFLAGS="-D warnings" cargo build --release --locked)
 
 if command -v z3 >/dev/null; then
+  step "build bastioc1 with stage0"; tests/bastioc1.sh
   step "tests/run.sh";       tests/run.sh
   step "tests/native.sh";    tests/native.sh
   step "stage1/difftest.sh"; stage1/difftest.sh

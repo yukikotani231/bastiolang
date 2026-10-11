@@ -11,10 +11,11 @@
 # against stage0's own.
 set -u
 cd "$(dirname "$0")/.."
-BASTIOC=${BASTIOC:-stage0/target/release/bastioc0}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 if [ "${1:-}" = --stage1 ]; then
+  # difftest's oracle is stage0, whatever compiles the other tests.
+  BASTIOC=${BASTIOC0:-stage0/target/release/bastioc0}
   case "$BASTIOC" in /*) ;; *) BASTIOC="$PWD/$BASTIOC" ;; esac
   {
     echo '#!/usr/bin/env bash'
@@ -34,6 +35,7 @@ if [ "${1:-}" = --stage1 ]; then
   BASTIOC="$tmp/bastioc" stage1/difftest.sh
   exit
 fi
+BASTIOC=${BASTIOC:-$(tests/bastioc1.sh)} || exit 1
 . tests/stage1_only.sh
 pass=0; fail=0; skip=0
 for f in tests/pass/*.bastio bench/*.bastio; do

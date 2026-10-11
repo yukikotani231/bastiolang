@@ -15,7 +15,7 @@
 # Usage: bench/run.sh [NAME...]   (default: every bench/*.bastio)
 set -u
 cd "$(dirname "$0")/.."
-BASTIOC=${BASTIOC:-stage0/target/release/bastioc0}
+BASTIOC=${BASTIOC:-$(tests/bastioc1.sh)} || exit 1
 CC=${CC:-cc}
 REPS=${REPS:-3}
 tmp=$(mktemp -d)
@@ -40,7 +40,7 @@ fi
 
 for n in "${names[@]}"; do
   if ! "$BASTIOC" -o "$tmp/$n" "bench/$n.bastio" 2>"$tmp/$n.err"; then
-    echo "run $n FAILED: bastioc0 rejected it"; sed 's/^/    /' "$tmp/$n.err"; status=1; continue
+    echo "run $n FAILED: $BASTIOC rejected it"; sed 's/^/    /' "$tmp/$n.err"; status=1; continue
   fi
   "$CC" -O2 -std=c11 -w -o "$tmp/$n.c.exe" "bench/$n.c" || { echo "run $n FAILED: C twin did not build"; status=1; continue; }
   if [ "$("$tmp/$n")" != "$("$tmp/$n.c.exe")" ]; then

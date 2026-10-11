@@ -73,6 +73,12 @@ What will be 0.2.0.
 
 ### Compilers
 
+- bastioc1 is the compiler the tests and benchmarks use: `tests/bastioc1.sh`
+  builds it with stage0 and rebuilds it only when stage0 or stage1 changes.
+  `BASTIOC` still picks another compiler.
+- `bastioc1 --dump-smt` prints every query sent to Z3, as bastioc0 does.
+- A test program marked `// stage1-only: <feature>` is skipped when the tests
+  run with stage0, for features that land after the stage0 freeze.
 - A native x86-64 backend in the self-hosted compiler (`stage1/x86.bastio`),
   ported from stage0's and checked byte for byte against it (#70). It
   passes up to four argument words in registers (#72) and covers `Child`
