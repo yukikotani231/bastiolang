@@ -3,6 +3,15 @@
 // Parsing reads a span `from..to` of a byte string, so a caller that has
 // split a line need not copy the pieces. Every parser rejects an empty span,
 // a byte that is not a digit, and a value that does not fit its type.
+//
+// What is proved: a parser returns `Some` only for a non-empty run of digits
+// (spec fns `all_digits`, `all_hex`), and then the value the digits denote
+// (`bdec`, `bhex`, and `dec_signed` for a leading `-`), so a parser never
+// overflows. Formatting appends only digits (and padding or a sign) and
+// keeps what was there. Not proved: that `fmt_u64` writes the digits of `x`
+// in particular; it writes a `Vec[u8]` and `bdec` reads `Bytes`, so the tests
+// check that formatting and parsing are inverse instead. Narrower integers
+// format through `fmt_u64(t, cast[u64](x))`: widening needs no proof.
 import "text.bastio";
 
 spec fn is_digit_spec(c: u8) -> bool {
@@ -24,6 +33,12 @@ spec fn all_digits(b: &Bytes, from: u64, to: u64) -> bool {
 }
 
 /// The smaller of `a` and `b`.
+/// ```
+/// let n = min_u64(4096, 100);
+/// let m = max_u64(4096, 100);
+/// assert n <= 100 && m >= 4096;
+/// if n != 100 || m != 4096 { return 1; }
+/// ```
 fn min_u64(a: u64, b: u64) -> u64
   ensures result <= a && result <= b && (result == a || result == b)
 {
@@ -43,7 +58,129 @@ fn max_u64(a: u64, b: u64) -> u64
   return b;
 }
 
+/// `a + b`, or `None` when it does not fit a `u64`.
+/// ```
+/// let s = checked_add_u64(18446744073709551614, 1);
+/// let t = checked_add_u64(18446744073709551615, 1);
+/// assert s is Option::Some && t is Option::None;   // proved, both ways
+/// let d = checked_sub_u64(3, 5);                   // would go below 0
+/// let m = checked_mul_u64(4294967296, 4294967296); // 2^64
+/// let ok = opt_or[u64](s, 0) == 18446744073709551615 && d is Option::None && m is Option::None
+///   && opt_or[u64](checked_mul_u64(4096, 512), 0) == 2097152 && opt_or[u64](checked_sub_u64(5, 3), 9) == 2;
+/// if !ok { return 1; }
+/// ```
+fn checked_add_u64(a: u64, b: u64) -> Option[u64]
+  ensures (result is Option::Some) == (a + b <= 18446744073709551615)
+  ensures result is Option::Some ==> result.Some == a + b
+{
+  if a > 18446744073709551615 - b {
+    return Option[u64]::None;
+  }
+  return Option[u64]::Some(a + b);
+}
+
+/// `a - b`, or `None` when `b` is larger.
+fn checked_sub_u64(a: u64, b: u64) -> Option[u64]
+  ensures (result is Option::Some) == (b <= a)
+  ensures result is Option::Some ==> result.Some == a - b
+{
+  if b > a {
+    return Option[u64]::None;
+  }
+  return Option[u64]::Some(a - b);
+}
+
+/// `a * b`, or `None` when it does not fit a `u64`.
+fn checked_mul_u64(a: u64, b: u64) -> Option[u64]
+  ensures (result is Option::Some) == (a * b <= 18446744073709551615)
+  ensures result is Option::Some ==> result.Some == a * b
+{
+  if b != 0 && a > 18446744073709551615 / b {
+    return Option[u64]::None;
+  }
+  return Option[u64]::Some(a * b);
+}
+
+/// `a + b`, or the largest `u64` when it does not fit.
+/// ```
+/// let a = sat_add_u64(18446744073709551000, 1000);
+/// let b = sat_sub_u64(3, 5);
+/// assert a == 18446744073709551615 && b == 0;
+/// ```
+fn sat_add_u64(a: u64, b: u64) -> u64
+  ensures a + b <= 18446744073709551615 ==> result == a + b
+  ensures a + b > 18446744073709551615 ==> result == 18446744073709551615
+{
+  if a > 18446744073709551615 - b {
+    return 18446744073709551615;
+  }
+  return a + b;
+}
+
+/// `a - b`, or 0 when `b` is larger.
+fn sat_sub_u64(a: u64, b: u64) -> u64
+  ensures b <= a ==> result == a - b
+  ensures b > a ==> result == 0
+{
+  if b > a {
+    return 0;
+  }
+  return a - b;
+}
+
+/// `a / b` rounded up: how many blocks of `b` hold `a` units.
+/// ```
+/// let pages = div_ceil_u64(10000, 4096);   // 3 pages hold 10000 bytes
+/// let exact = div_ceil_u64(8192, 4096);
+/// assert pages == 3 && exact == 2;
+/// ```
+fn div_ceil_u64(a: u64, b: u64) -> u64
+  requires 0 < b
+  ensures a % b == 0 ==> result == a / b
+  ensures a % b != 0 ==> result == a / b + 1
+  ensures a <= result * b && result * b < a + b
+{
+  if a % b == 0 {
+    return a / b;
+  }
+  return a / b + 1;
+}
+
+/// `x` rounded down to a multiple of `a` (a page or block size, say).
+/// ```
+/// let lo = align_down_u64(10000, 4096);
+/// let hi = align_up_u64(10000, 4096);
+/// assert lo == 8192 && hi == 12288;
+/// let same = align_up_u64(8192, 4096);   // already aligned
+/// assert same == 8192;
+/// ```
+fn align_down_u64(x: u64, a: u64) -> u64
+  requires 0 < a
+  ensures result == x / a * a
+  ensures result <= x && x - result < a
+{
+  return x - x % a;
+}
+
+/// `x` rounded up to a multiple of `a`. The caller shows that it fits: for
+/// an address from user space, check `x <= limit` first.
+fn align_up_u64(x: u64, a: u64) -> u64
+  requires 0 < a && x <= 18446744073709551615 - (a - 1)
+  ensures x % a == 0 ==> result == x
+  ensures x % a != 0 ==> result == (x / a + 1) * a
+  ensures x <= result && result - x < a
+{
+  if x % a == 0 {
+    return x;
+  }
+  return x - x % a + a;
+}
+
 /// An ASCII decimal digit, `0` to `9`.
+/// ```
+/// let ok = is_digit(55) && !is_digit(97) && hex_value(97) == 10 && hex_value(70) == 15 && hex_value(103) == 16;
+/// if !ok { return 1; }
+/// ```
 fn is_digit(c: u8) -> bool
   ensures result == is_digit_spec(c)
 {
@@ -79,6 +216,17 @@ spec fn dec_signed(b: &Bytes, from: u64, to: u64, x: i64) -> bool {
 
 /// Bytes `from..to` of `b` as a decimal `u64`: only digits, at least one,
 /// and the value below 2^64. Leading zeros are allowed.
+/// ```
+/// let b = bfrom("len=4096");
+/// let mut v = 0;
+/// match parse_u64(b, 4, blen(b)) {
+///   Option::Some(x) => { v = x; },
+///   Option::None => {},
+/// }
+/// let bad = parse_u64(b, 0, 3);   // "len" is not a number
+/// bfree(b);
+/// if v != 4096 || bad is Option::Some { return 1; }
+/// ```
 fn parse_u64(b: &Bytes, from: u64, to: u64) -> Option[u64]
   requires from <= to && to <= blen(b)
   ensures result is Option::Some ==> from < to && all_digits(b, from, to) && result.Some == bdec(b, from, to)
@@ -107,6 +255,13 @@ fn parse_u64(b: &Bytes, from: u64, to: u64) -> Option[u64]
 
 /// Bytes `from..to` of `b` as a hexadecimal `u64` (digits `0-9`, `a-f`,
 /// `A-F`, no `0x` prefix): at least one digit, the value below 2^64.
+/// ```
+/// let b = bfrom("dead BEEF");
+/// let a = opt_or[u64](parse_hex_u64(b, 0, 4), 0);
+/// let c = opt_or[u64](parse_hex_u64(b, 5, 9), 0);
+/// bfree(b);
+/// if a != 57005 || c != 48879 { return 1; }
+/// ```
 fn parse_hex_u64(b: &Bytes, from: u64, to: u64) -> Option[u64]
   requires from <= to && to <= blen(b)
   ensures result is Option::Some ==> from < to && all_hex(b, from, to) && result.Some == bhex(b, from, to)
@@ -130,6 +285,17 @@ fn parse_hex_u64(b: &Bytes, from: u64, to: u64) -> Option[u64]
 }
 
 /// Bytes `from..to` of `b` as a decimal `i64`: an optional `-`, then digits.
+/// ```
+/// let b = bfrom("-42 17");
+/// let mut v: i64 = 0;
+/// match parse_i64(b, 0, 3) {
+///   Option::Some(x) => { v = x; },
+///   Option::None => {},
+/// }
+/// let w = opt_or[i64](parse_i64(b, 4, 6), 0);
+/// bfree(b);
+/// if v != -42 || w != 17 { return 1; }
+/// ```
 fn parse_i64(b: &Bytes, from: u64, to: u64) -> Option[i64]
   requires from <= to && to <= blen(b)
   ensures result is Option::Some ==> from < to && dec_signed(b, from, to, result.Some)
@@ -158,6 +324,17 @@ fn parse_i64(b: &Bytes, from: u64, to: u64) -> Option[i64]
 }
 
 /// `parse_u64`, and the value fits in a `u32`.
+/// ```
+/// let b = bfrom("255 256 70000 5000000000");
+/// let a = parse_u8(b, 0, 3);       // fits
+/// let c = parse_u8(b, 4, 7);       // 256 does not fit a u8
+/// let d = parse_u16(b, 8, 13);     // 70000 does not fit a u16
+/// let e = parse_u32(b, 8, 13);     // but fits a u32
+/// let f = parse_u32(b, 14, 24);    // 5000000000 does not
+/// bfree(b);
+/// let ok = a is Option::Some && c is Option::None && d is Option::None && e is Option::Some && f is Option::None;
+/// if !ok { return 1; }
+/// ```
 fn parse_u32(b: &Bytes, from: u64, to: u64) -> Option[u32]
   requires from <= to && to <= blen(b)
   ensures result is Option::Some ==> from < to && all_digits(b, from, to) && result.Some == bdec(b, from, to)
@@ -200,6 +377,16 @@ fn parse_u8(b: &Bytes, from: u64, to: u64) -> Option[u8]
 }
 
 /// `parse_i64`, and the value fits in an `i32`.
+/// ```
+/// let b = bfrom("-128 -129 40000 -2147483648");
+/// let a = parse_i8(b, 0, 4);        // the smallest i8
+/// let c = parse_i8(b, 5, 9);        // one less does not fit
+/// let d = parse_i16(b, 10, 15);     // 40000 does not fit an i16
+/// let e = parse_i32(b, 16, 27);     // the smallest i32
+/// bfree(b);
+/// let ok = a is Option::Some && c is Option::None && d is Option::None && e is Option::Some;
+/// if !ok { return 1; }
+/// ```
 fn parse_i32(b: &Bytes, from: u64, to: u64) -> Option[i32]
   requires from <= to && to <= blen(b)
   ensures result is Option::Some ==> from < to && dec_signed(b, from, to, result.Some)
@@ -247,6 +434,10 @@ spec fn text_digits_from(t: &Vec[u8], from: u64) -> bool {
 }
 
 /// The number of decimal digits of `x`: 1 for 0 to 9, up to 20.
+/// ```
+/// let ok = dec_digits(0) == 1 && dec_digits(9) == 1 && dec_digits(10) == 2 && dec_digits(18446744073709551615) == 20;
+/// if !ok { return 1; }
+/// ```
 fn dec_digits(x: u64) -> u64
   ensures 1 <= result && result <= 20
 {
@@ -262,6 +453,20 @@ fn dec_digits(x: u64) -> u64
 }
 
 /// Appends `x` in decimal, with no leading zeros: between 1 and 20 digits.
+/// ```
+/// let mut t = text_new();
+/// text_push_str(&mut t, "pid ");
+/// fmt_u64(&mut t, 4096);
+/// assert vlen(t) > 4;   // at least one digit was appended
+/// text_push(&mut t, 32);
+/// fmt_i64(&mut t, -7);
+/// text_push(&mut t, 32);
+/// fmt_u64_pad(&mut t, 42, 5);
+/// let b = text_finish(t);
+/// let ok = bytes_eq_str(b, "pid 4096 -7    42");
+/// bfree(b);
+/// if !ok { return 1; }
+/// ```
 fn fmt_u64(t: &mut Vec[u8], x: u64)
   ensures vlen(old(t)) < vlen(t) && vlen(t) <= vlen(old(t)) + 20
   ensures text_digits_from(t, vlen(old(t)))
@@ -322,6 +527,17 @@ fn fmt_i64(t: &mut Vec[u8], x: i64)
 }
 
 /// The lowercase hexadecimal digit for `d`.
+/// ```
+/// let mut t = text_new();
+/// fmt_hex_u64(&mut t, 48879, 1);
+/// text_push(&mut t, 32);
+/// fmt_hex_u64(&mut t, 10, 4);   // padded with zeros
+/// text_push(&mut t, hex_char(15));
+/// let b = text_finish(t);
+/// let ok = bytes_eq_str(b, "beef 000af");
+/// bfree(b);
+/// if !ok { return 1; }
+/// ```
 fn hex_char(d: u64) -> u8
   requires d < 16
 {
@@ -361,6 +577,14 @@ fn fmt_hex_u64(t: &mut Vec[u8], x: u64, min: u64)
 /// Writes `x` in decimal at `at`, as many digits as fit (the leading ones
 /// first). Returns the position after what was written. For a reply built
 /// in a fixed buffer, as a kernel's /proc files are.
+/// ```
+/// let mut o = bfrom("size=......");
+/// let end = bytes_put_u64(&mut o, 5, 1234);
+/// let full = bytes_put_u64(&mut o, blen(o), 7);   // no room: nothing is written
+/// let ok = end == 9 && full == blen(o) && bytes_eq_str(o, "size=1234..");
+/// bfree(o);
+/// if !ok { return 1; }
+/// ```
 fn bytes_put_u64(dst: &mut Bytes, at: u64, x: u64) -> u64
   requires at <= blen(dst)
   ensures blen(dst) == blen(old(dst)) && at <= result && result <= blen(dst)

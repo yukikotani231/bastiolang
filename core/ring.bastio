@@ -36,6 +36,24 @@ spec fn ring_at(r: &Ring, i: u64, s: u64) -> bool {
 }
 
 /// An empty ring of `cap` slots.
+/// ```
+/// // A 4-byte console buffer: the ring says where, the bytes live elsewhere.
+/// let mut r = ring_new(4);
+/// let mut buf = balloc(4);
+/// let mut c: u8 = 97;   // 'a'
+/// while !ring_full(r)
+///   invariant ring_ok(r) && r.cap == 4 && blen(buf) == 4
+/// {
+///   let s = ring_push(&mut r);
+///   bset(&mut buf, s, c);
+///   if c < 200 { c = c + 1; }
+/// }
+/// let first = bget(buf, ring_pop(&mut r));   // the oldest: 'a'
+/// let s = ring_push(&mut r);                 // wraps around to slot 0
+/// let ok = first == 97 && s == 0 && ring_room(r) == 0 && !ring_empty(r);
+/// bfree(buf);
+/// if !ok { return 1; }
+/// ```
 fn ring_new(cap: u64) -> Ring
   requires 0 < cap && cap <= 9223372036854775808
   ensures ring_ok(result) && result.h == 0 && result.n == 0 && result.cap == cap
@@ -66,6 +84,18 @@ fn ring_full(r: &Ring) -> bool
 }
 
 /// The slot of element `i` (0 is the oldest).
+/// ```
+/// let mut r = ring_new(8);
+/// ring_push_n(&mut r, 6);   // claim six slots at once, as a copy of a run does
+/// ring_pop_n(&mut r, 5);
+/// let at = ring_slot(r, 0);  // the oldest element's slot
+/// assert r.n == 1;
+/// ring_push_n(&mut r, 4);   // runs past the end and wraps
+/// let last = ring_slot(r, 4);
+/// ring_clear(&mut r);
+/// let ok = at == 5 && last == 1 && ring_empty(r);
+/// if !ok { return 1; }
+/// ```
 fn ring_slot(r: &Ring, i: u64) -> u64
   requires ring_ok(r) && i < r.cap
   ensures result < r.cap && ring_at(r, i, result)
@@ -160,6 +190,19 @@ spec fn queue_from(q: &Queue, o: &Queue, k: u64) -> bool {
 }
 
 /// An empty queue of `cap` words.
+/// ```
+/// let mut q = queue_new(3);
+/// queue_push(&mut q, 10);
+/// queue_push(&mut q, 20);
+/// assert queue_at(q, 0) == 10 && queue_at(q, 1) == 20;   // proved FIFO order
+/// let a = queue_pop(&mut q);
+/// queue_push(&mut q, 30);
+/// let b = queue_peek(q);
+/// assert a == 10 && b == 20;
+/// let ok = queue_len(q) == 2;
+/// queue_free(q);
+/// if !ok { return 1; }
+/// ```
 fn queue_new(cap: u64) -> Queue
   requires 0 < cap && cap <= 1152921504606846976
   ensures queue_ok(result) && result.r.n == 0 && result.r.cap == cap
@@ -167,6 +210,7 @@ fn queue_new(cap: u64) -> Queue
   return Queue { r: ring_new(cap), q: alloc(cap) };
 }
 
+/// Frees the queue's storage.
 fn queue_free(q: Queue) {
   free(q.q);
 }

@@ -195,6 +195,21 @@ if [ -n "$dc" ]; then
 else
   echo "FAIL tests/doc_check.py did not finish"; sed 's/^/    /' "$tmp/doccheck.out"; fail=$((fail+1))
 fi
+# The library reference (docs/lib/*.md and the module table in
+# docs/core.md) is what tests/libref.py generates from core/ and std/, every
+# library function is documented and called by an example, and every
+# module's examples build, verify and run.
+if python3 tests/libref.py --check >"$tmp/libref.out" 2>&1; then pass=$((pass+1)); else
+  echo "FAIL tests/libref.py --check"; sed 's/^/    /' "$tmp/libref.out"; fail=$((fail+1)); fi
+python3 tests/libref.py --examples "$tmp/libref" >"$tmp/libref.list"
+while read -r mod prog names; do
+  if ! "$BASTIOC" --lib "$PWD" -o "${prog%.bastio}" "$prog" 2>"$tmp/libref.err"; then
+    echo "FAIL examples of $mod: rejected"; sed 's/^/    /' "$tmp/libref.err"; fail=$((fail+1)); continue
+  fi
+  "${prog%.bastio}" </dev/null >/dev/null 2>&1; got=$?
+  if [ "$got" = 0 ]; then pass=$((pass+1)); else
+    echo "FAIL examples of $mod: the example of $(echo $names | cut -d' ' -f$got) failed"; fail=$((fail+1)); fi
+done <"$tmp/libref.list"
 # Single-file examples (examples/*.bastio) build and run, exiting with 0.
 for f in examples/*.bastio; do
   name=$(basename "$f" .bastio)
