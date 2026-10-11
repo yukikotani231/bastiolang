@@ -1160,6 +1160,35 @@ fn x86_assigned(g: &mut X86, p: &Parser, head: u64, pre: u64, out: &mut Vec[u64]
   }
 }
 
+/// The variables assigned whole (not a field of) in statements from `head`.
+fn x86_reassigned(g: &mut X86, p: &Parser, head: u64, pre: u64, out: &mut Vec[u64]) {
+  let mut i = head;
+  while i != 0 {
+    let n = node_at(p.nodes, i);
+    let k = n.kind;
+    if k == S_ASSIGN {
+      let r = node_at(p.nodes, n.a);
+      if r.next == 0 {
+        let id = x86_nm(&mut g, p, pre, r.s, r.e);
+        add_id(&mut out, id);
+      }
+    } else if k == S_IF {
+      x86_reassigned(&mut g, p, n.b, pre, &mut out);
+      x86_reassigned(&mut g, p, n.c, pre, &mut out);
+    } else if k == S_WHILE {
+      x86_reassigned(&mut g, p, n.c, pre, &mut out);
+    } else if k == S_MATCH {
+      let mut a = n.b;
+      while a != 0 {
+        let arm = node_at(p.nodes, a);
+        x86_reassigned(&mut g, p, arm.c, pre, &mut out);
+        a = arm.next;
+      }
+    }
+    i = n.next;
+  }
+}
+
 /// Does expression `i` lend anything mutably?
 fn x86_lends(g: &mut X86, p: &Parser, i: u64) -> bool {
   let mut s = vec_new[u64]();
@@ -1458,7 +1487,14 @@ fn x86_acc_call(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst
       } else {
         x86_set_alias(&mut g, pid, 0);
         x86_declare(&mut g, pid);
-        if kind_t(m, pt) == TY_MUTREF {
+        let byaddr = kind_t(m, pt) == TY_MUTREF || x86_byaddr(&mut g, c, m, p, pt);
+        if !g.stage0 && byaddr && an.kind != E_MUTBORROW {
+          // stage1: an address that the body only reads, as for a
+          // parameter of the function itself (`x86_assign_regs`).
+          let mut nm = x86_name_at(g, pid);
+          nm.size = 1;
+          x86_name_set(&mut g, pid, nm);
+        } else if kind_t(m, pt) == TY_MUTREF {
           x86_set_bad(&mut g, pid);
         } else {
           x86_bind(&mut g, m, pid, pt);
@@ -1957,7 +1993,7 @@ fn x86_place(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, segs: &Vec[u64]) ->
     x86_mov(&mut g, x86_frame_op(v.o), x86_reg(XR_RCX));
     l = x86_mem_loc(XR_RCX, XB, t);
   } else if v.k == XS_PREG {
-    l = x86_mem_loc(v.r0, XB, t);
+    l = x86_mem_loc(v.r0, wrap_add(XB, v.o), t);
   }
   let mut k = 1;
   while k < vec_len(segs) {
@@ -1990,13 +2026,15 @@ fn x86_place_e(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, i: u64) -> X86Loc
 }
 
 /// The storage of a path as a variable's, if it has one: a frame slot, or
-/// the pointer of a `&mut` parameter (`k` is 0 otherwise).
+/// the pointer of a `&mut` parameter (`k` is 0 otherwise). stage1: a field
+/// path from an address in a register is that register and the field's
+/// offset (XS_PREG's `o`, in bytes).
 fn x86_store_of(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, segs: &Vec[u64]) -> X86St {
   let v = x86_var(&mut g, p, u_at(segs, 0));
   if (v.k == XS_PTR || v.k == XS_PREG) && vec_len(segs) == 1 {
     return x86_st_of(v);
   }
-  if v.k == XS_SLOT {
+  if v.k == XS_SLOT || (v.k == XS_PREG && !g.stage0) {
     let mut o = v.o;
     let mut t = v.ty;
     let mut k = 1;
@@ -2009,6 +2047,9 @@ fn x86_store_of(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, segs: &Vec[u64])
       o = wrap_add(o, wrap_mul(8, fl.o));
       t = fl.ty;
       k = k + 1;
+    }
+    if v.k == XS_PREG {
+      return x86_st(XS_PREG, o, v.r0, 0, 0);
     }
     return x86_st(XS_SLOT, o, 0, 0, 0);
   }
@@ -2585,8 +2626,15 @@ fn x86_scalar(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     let v = x86_var(&mut g, p, n.a);
     if v.k == XS_PTR && vec_len(segs) == 1 {
       x86_mov(&mut g, x86_frame_op(v.o), x86_reg(XR_RAX));
-    } else if v.k == XS_PREG && vec_len(segs) == 1 {
+    } else if v.k == XS_PREG && vec_len(segs) == 1 && v.o == 0 {
       x86_mov(&mut g, x86_reg(v.r0), x86_reg(XR_RAX));
+    } else if v.k == XS_PREG && vec_len(segs) == 1 {
+      x86_t(&mut g, "lea ");
+      x86_n(&mut g, v.o);
+      x86_t(&mut g, "(");
+      x86_r(&mut g, v.r0);
+      x86_t(&mut g, "), %rax");
+      x86_e(&mut g);
     } else {
       let l = x86_place(&mut g, c, m, p, segs);
       if l.k != XL_MEM {
@@ -3729,9 +3777,22 @@ fn x86_bind_params(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, i
   // A parameter that `x` never changes, given a variable of the caller (or
   // `&mut` of one), is that variable.
   let changed = x86_changed(&mut g, m, p, x);
+  let mut whole = vec_new[u64]();
+  x86_reassigned(&mut g, p, x86_body(m, p, x), x, &mut whole);
   let xi = inst_at(m, x);
   let dn = node_at(p.nodes, xi.def);
   let n = node_at(p.nodes, i);
+  // stage1: whether any parameter is `&mut` (then no other argument may
+  // stand for the caller's memory, which the body could change).
+  let mut lends = false;
+  let mut q0 = dn.a;
+  while q0 != 0 {
+    let qn0 = node_at(p.nodes, q0);
+    if kind_t(m, conv(&mut m, p, qn0.a, x, q0)) == TY_MUTREF {
+      lends = true;
+    }
+    q0 = qn0.next;
+  }
   let mut qs = vec_new[u64]();
   let mut sts = vec_new[X86St]();
   let mut q = dn.a;
@@ -3744,9 +3805,28 @@ fn x86_bind_params(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, i
     let mutp = kind_t(m, pt) == TY_MUTREF;
     let mut st = x86_st(0, 0, 0, 0, 0);
     if has_id(changed, pid) {
-      st = x86_st(0, 0, 0, 0, 0);
+      // stage1: a `&mut` parameter that the body writes through, but
+      // never points elsewhere, is still the caller's address when that
+      // is a register (and an offset).
+      if !g.stage0 && mutp && an.kind == E_MUTBORROW && !has_id(whole, pid) {
+        let segs = x86_lsegs(p, an.a);
+        let s2 = x86_store_of(&mut g, c, m, p, segs);
+        vec_free(segs);
+        if s2.k == XS_PREG {
+          st = s2;
+        }
+      }
     } else if an.kind == E_VAR && !mutp {
       st = x86_st_of(x86_var(&mut g, p, a));
+    } else if !g.stage0 && an.kind == E_FIELD && !mutp && !lends && kind_t(m, base_t(m, pt)) == TY_STRUCT && x86_is_place(p, a) {
+      // stage1: a struct field the body only reads is read where it is
+      // (in a frame slot, or at an address in a register).
+      let segs = x86_esegs(p, a);
+      let s2 = x86_store_of(&mut g, c, m, p, segs);
+      vec_free(segs);
+      if s2.k == XS_SLOT || s2.k == XS_PREG {
+        st = s2;
+      }
     } else if an.kind == E_MUTBORROW && mutp {
       let segs = x86_lsegs(p, an.a);
       st = x86_store_of(&mut g, c, m, p, segs);
@@ -3761,6 +3841,7 @@ fn x86_bind_params(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, i
     a = an.next;
   }
   vec_free(changed);
+  vec_free(whole);
   let saved = X86Saved { n: vec_len(g.vars), floor: g.vfloor };
   g.vfloor = vec_len(g.vars);
   let mut j = vec_len(qs);
@@ -3777,9 +3858,15 @@ fn x86_bind_params(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, i
     }
     if st.k == 0 {
       if kind_t(m, pt) == TY_MUTREF || x86_byaddr(&mut g, c, m, p, pt) {
-        let o = x86_slot(&mut g, 1);
-        x86_pop_to(&mut g, x86_mem_loc(XR_RBP, o, 0), 1);
-        st = x86_st(XS_PTR, o, 0, 0, 0);
+        let r = x86_preg_for(&mut g, pid);
+        if r != 0 {
+          x86_pop(&mut g, x86_reg(r));
+          st = x86_st(XS_PREG, 0, r, 0, 0);
+        } else {
+          let o = x86_slot(&mut g, 1);
+          x86_pop_to(&mut g, x86_mem_loc(XR_RBP, o, 0), 1);
+          st = x86_st(XS_PTR, o, 0, 0, 0);
+        }
       } else {
         let r = x86_reg_for(&mut g, m, pid, pt);
         if r != 0 {
@@ -5253,7 +5340,7 @@ fn x86_mutref_reg(g: &mut X86, p: &Parser, i: u64) -> u64 {
     let k = x86_find(g, id);
     if k != 0 {
       let v = x86_var_at(g, k - 1);
-      if v.k == XS_PREG {
+      if v.k == XS_PREG && v.o == 0 {
         r = v.r0;
       }
     }
@@ -5654,8 +5741,16 @@ fn x86_peephole(code: &Vec[u64], out: &mut Vec[u64], opt: bool) {
   // copies folded.
   let mut mid = vec_new[u64]();
   x86_peep_pairs(code, &mut mid, true);
-  x86_peep_acc(mid, &mut out);
+  let mut mid2 = vec_new[u64]();
+  x86_peep_acc(mid, &mut mid2);
+  // Again: the accumulator rules leave %rax alone in more places, so
+  // more pushes and pops pair up.
+  let mut mid3 = vec_new[u64]();
+  x86_peep_pairs(mid2, &mut mid3, true);
+  x86_peep_acc(mid3, &mut out);
   vec_free(mid);
+  vec_free(mid2);
+  vec_free(mid3);
 }
 
 /// The start of every line of `code`.
