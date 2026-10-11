@@ -9,6 +9,10 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
+  # The checks that need Z3 run as three jobs at once. Each builds stage0 and
+  # bastioc1 itself (about a minute); the two difftest jobs take about twelve
+  # minutes each, so the whole run takes as long as one of them and not the
+  # sum of all three.
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -32,10 +36,6 @@ jobs:
         run: tests/run.sh
       - name: Native backend, differential test against the C backend
         run: tests/native.sh
-      - name: Native backend, the self-hosted compiler's tools built natively
-        run: tests/native.sh --stage1
-      - name: Self-hosted compiler, differential tests
-        run: stage1/difftest.sh
       - name: Fuzzing, a short deterministic run (tests/fuzz.py)
         run: tests/fuzz.py --seed 1 --count 1000 --keep fuzz-findings
       - uses: actions/upload-artifact@v5
@@ -44,6 +44,35 @@ jobs:
           name: fuzz-findings-${{ github.sha }}
           path: fuzz-findings
           if-no-files-found: ignore
+  difftest:
+    # The self-hosted compiler against stage0, phase by phase.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Z3
+        run: sudo apt-get update && sudo apt-get install -y z3
+      - name: Build stage0
+        run: cd stage0 && RUSTFLAGS="-D warnings" cargo build --release --locked
+      - name: Build bastioc1 with stage0 (the compiler the tests use)
+        run: tests/bastioc1.sh
+      - name: Self-hosted compiler, differential tests
+        run: stage1/difftest.sh
+  difftest-native:
+    # The same tests, with the self-hosted compiler's tools built by the
+    # native backend.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Z3
+        run: sudo apt-get update && sudo apt-get install -y z3
+      - name: Build stage0
+        run: cd stage0 && RUSTFLAGS="-D warnings" cargo build --release --locked
+      - name: Build bastioc1 with stage0 (the compiler the tests use)
+        run: tests/bastioc1.sh
+      - name: Native backend, the self-hosted compiler's tools built natively
+        run: tests/native.sh --stage1
   stage0-mirror:
     # The stage0 freeze (ROADMAP v2): a change to stage0/src needs its
     # stage1 mirror, or a `Stage0-only: <why>` line in a commit message.
