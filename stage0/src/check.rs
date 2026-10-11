@@ -213,7 +213,7 @@ pub fn builtin_sigs() -> HashMap<String, Sig> {
 pub const VEC_BUILTINS: &[&str] = &["vec_new", "vec_len", "vec_push", "vec_push_within", "vec_try_reserve", "vec_pop", "vec_get", "vec_set", "vec_swap", "vec_free"];
 
 /// Builtins written with type arguments (`vec_new[u64]()`, `cast[u8](x)`).
-pub const TYPED_BUILTINS: &[&str] = &["vec_new", "cast", "wrap"];
+pub const TYPED_BUILTINS: &[&str] = &["vec_new", "cast", "wrap", "try_box"];
 
 /// Wrapping arithmetic: both operands and the result have one integer type.
 pub const WRAP_BUILTINS: &[&str] = &["wrap_add", "wrap_sub", "wrap_mul"];
@@ -239,7 +239,7 @@ fn spec_norm(t: Type) -> Type {
 
 /// Every builtin with where it is available, for `--trusted-base`.
 pub fn builtin_list() -> Vec<(String, &'static str)> {
-    let mut v: Vec<(String, &'static str)> = vec![("box".into(), "all"), ("unbox".into(), "all")];
+    let mut v: Vec<(String, &'static str)> = vec![("box".into(), "all"), ("try_box".into(), "all"), ("unbox".into(), "all")];
     v.extend(LOCK_BUILTINS.iter().map(|n| (n.to_string(), "all")));
     v.extend(ATOMIC_BUILTINS.iter().map(|n| (n.to_string(), "all")));
     v.push(("smp_run".into(), "kernel"));
@@ -281,7 +281,7 @@ pub fn atomic_word(t: &Type) -> bool {
 }
 
 pub fn is_builtin(name: &str) -> bool {
-    name == "box" || name == "unbox" || name == "cast" || name == "wrap" || name == "smp_run" || PT_BORROW_BUILTINS.contains(&name) || LOCK_BUILTINS.contains(&name) || ATOMIC_BUILTINS.contains(&name) || VEC_BUILTINS.contains(&name) || WRAP_BUILTINS.contains(&name) || builtin_table().iter().any(|b| b.0 == name)
+    name == "box" || name == "try_box" || name == "unbox" || name == "cast" || name == "wrap" || name == "smp_run" || PT_BORROW_BUILTINS.contains(&name) || LOCK_BUILTINS.contains(&name) || ATOMIC_BUILTINS.contains(&name) || VEC_BUILTINS.contains(&name) || WRAP_BUILTINS.contains(&name) || builtin_table().iter().any(|b| b.0 == name)
 }
 
 fn available(name: &str, target: Target) -> bool {
@@ -356,6 +356,11 @@ pub fn check_structs(p: &Program) -> Result<(), Diag> {
 /// Locates an error in a copy of a generic function (`dup[Buf]`).
 pub fn in_copy(d: Diag, f: &str) -> Diag {
     if f.contains('[') { d.note(format!("in `{}`, the copy of a generic function for these type arguments", f)) } else { d }
+}
+
+/// The type of `try_box[T](..)`: the copy of core's `Boxed[T]` for `T`.
+pub fn boxed_type(t: &Type) -> Type {
+    Type::Enum(Type::Generic("Boxed".to_string(), vec![t.clone()]).name())
 }
 
 /// Does the enum name written in a pattern or an `is` test name the enum
@@ -1277,6 +1282,26 @@ impl<'a> Ctx<'a> {
                     // matters to the proof.
                     self.int_ops.insert(e.pos, t);
                     Ok(targs[0].clone())
+                }
+                // `try_box[T](x)`: `Boxed[T]` from core/boxed.bastio, which
+                // monomorphization has already copied for `T`.
+                ExprKind::Call(n, args) if n == "try_box" => {
+                    if targs.len() != 1 || args.len() != 1 {
+                        return Err(Diag::new("E-TYPE", e.pos, "write `try_box[T](x)`: one type argument, one argument"));
+                    }
+                    known_type(&targs[0], e.pos)?;
+                    let t = self.expr_as(&args[0], &targs[0])?;
+                    if t != targs[0] {
+                        return Err(Diag::new("E-TYPE", args[0].pos, format!("`try_box[{}]` boxes a {}, found {}", targs[0].name(), targs[0].name(), t.name())));
+                    }
+                    let bt = boxed_type(&targs[0]);
+                    let Type::Enum(bn) = &bt else { unreachable!("an enum") };
+                    let want = [("Ok", Type::Box(Box::new(t.clone()))), ("Full", t)];
+                    let ok = enum_def(bn).is_some_and(|d| d.variants.len() == 2 && d.variants.iter().zip(&want).all(|((v, p), (w, wt))| v == w && p.as_ref() == Some(wt)));
+                    if !ok {
+                        return Err(Diag::new("E-TYPE", e.pos, "`try_box` returns `enum Boxed[T] { Ok(Box[T]), Full(T) }` from core/boxed.bastio, but `Boxed` here is defined differently"));
+                    }
+                    Ok(bt)
                 }
                 _ => unreachable!("removed by monomorphization"),
             },

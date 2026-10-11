@@ -796,9 +796,36 @@ fn mono_stmt(m: &mut Mono, p: &Parser, i: u64, env: u64) {
 }
 
 /// Is node `i` a call of a builtin written with type arguments
-/// (`vec_new[T]()`, `cast[T](x)`, `wrap[T](x)`)?
+/// (`vec_new[T]()`, `cast[T](x)`, `wrap[T](x)`, `try_box[T](x)`)?
 fn is_typed_builtin(p: &Parser, i: u64) -> bool {
-  return kind_of(p, i) == E_CALL && (name_is(p, i, "vec_new") || name_is(p, i, "cast") || name_is(p, i, "wrap"));
+  return kind_of(p, i) == E_CALL && (name_is(p, i, "vec_new") || name_is(p, i, "cast") || name_is(p, i, "wrap") || name_is(p, i, "try_box"));
+}
+
+/// The type `Boxed[t]` of `try_box[t](..)`, or 0 without core/boxed.bastio.
+fn boxed_t(m: &mut Mono, p: &Parser, t: u64) -> u64 {
+  let d = boxed_def(p);
+  if d == 0 {
+    return 0;
+  }
+  let mut a = vec_new[u64]();
+  vec_push(&mut a, t);
+  let x = instance(&mut m, d, a);
+  vec_free(a);
+  return intern(&mut m, p, TY_ENUM, x);
+}
+
+/// The generic enum `Boxed[T]` (core/boxed.bastio) that `try_box` returns,
+/// or 0 if the program has none.
+fn boxed_def(p: &Parser) -> u64 {
+  let mut k = p.enums.head;
+  while k != 0 {
+    let d = node_at(p.nodes, k);
+    if name_is(p, k, "Boxed") && list_len(p, d.v) == 1 {
+      return k;
+    }
+    k = next_of(p, k);
+  }
+  return 0;
 }
 
 /// The definition a type application `name[..]` instantiates: a generic
@@ -865,6 +892,16 @@ fn mono_expr(m: &mut Mono, p: &Parser, i: u64, env: u64) {
   if n.kind == E_TAPP {
     if is_typed_builtin(p, n.b) {
       let args = conv_list(&mut m, p, n.a, env, i);
+      // `try_box[T]` makes a `Boxed[T]`, so that copy is needed.
+      if !m.failed && name_is(p, n.b, "try_box") && vec_len(args) == 1 {
+        let d = boxed_def(p);
+        if d == 0 {
+          mfail(&mut m, p, i);
+          mm_s(&mut m, "`try_box` needs `import \"core/boxed.bastio\"`, which defines what it returns");
+        } else {
+          instance(&mut m, d, args);
+        }
+      }
       vec_free(args);
       mono_children(&mut m, p, n.b, env);
       return;

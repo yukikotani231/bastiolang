@@ -1517,6 +1517,14 @@ impl<'p> Verifier<'p> {
                     }
                     Ok(Val::U(x))
                 }
+                // Either the box holds the value or, out of memory, the
+                // value comes back as it was: which one is not known.
+                ExprKind::Call(n, args) if n == "try_box" => {
+                    let x = self.eval(&args[0], st)?;
+                    let Type::Enum(bn) = crate::check::boxed_type(&targs[0]) else { unreachable!("an enum") };
+                    let tag = self.fresh_int("boxed", "0", "1")?;
+                    Ok(Val::Enum(bn, tag, vec![Val::Box(BoxVal::Known(Box::new(x.clone()))), x]))
+                }
                 _ => unreachable!("removed by monomorphization"),
             },
             ExprKind::Int(v) => Ok(Val::U(v.to_string())),

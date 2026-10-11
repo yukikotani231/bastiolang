@@ -1855,6 +1855,9 @@ fn x86_ty(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
       if name_is(p, n.b, "vec_new") {
         return intern(&mut m, p, TY_VEC, t);
       }
+      if name_is(p, n.b, "try_box") {
+        return boxed_t(&mut m, p, t);
+      }
       return t;
     }
     let x = tapp_inst(&mut m, p, i, g.env);
@@ -2915,6 +2918,12 @@ fn x86_push_val(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_val_into(&mut g, c, &mut m, p, i, x86_dst(XD_STACK, mark0, 0));
     return;
   }
+  if k == E_TAPP && name_is(p, n.b, "try_box") {
+    x86_reserve(&mut g, w);
+    let mark0 = g.depth;
+    x86_val_into(&mut g, c, &mut m, p, i, x86_dst(XD_STACK, mark0, 0));
+    return;
+  }
   if k == E_TAPP && name_is(p, n.b, "vec_new") {
     x86_push(&mut g, x86_imm(0));
     x86_push(&mut g, x86_imm(0));
@@ -2969,6 +2978,52 @@ fn x86_val_into(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, d: X
       x86_val_into(&mut g, c, &mut m, p, fi.a, x86_dst_at(d, fl.o));
       f = fi.next;
     }
+    return;
+  }
+  // `try_box[T](x)`: the value first, then the box. Out of memory (a null
+  // pointer), the value goes back in `Full` instead.
+  if k == E_TAPP && name_is(p, n.b, "try_box") {
+    let call = node_at(p.nodes, n.b);
+    let t = conv(&mut m, p, n.a, g.env, i);
+    let w = x86_words(&mut g, c, m, p, t);
+    x86_push_val(&mut g, c, &mut m, p, call.a);
+    x86_t(&mut g, "mov $");
+    x86_n(&mut g, w);
+    x86_t(&mut g, ", %edi");
+    x86_e(&mut g);
+    x86_es(&mut g, "call bst_rt_try_alloc");
+    let l_full = x86_label(&mut g);
+    let l_end = x86_label(&mut g);
+    x86_es(&mut g, "test %rax, %rax");
+    x86_jump(&mut g, "jz", l_full);
+    let mut j = 0;
+    while j < w {
+      x86_es_off(&mut g, "mov ", j, "(%rsp), %rdx");
+      x86_es_off(&mut g, "mov %rdx, ", j, "(%rax)");
+      j = j + 1;
+    }
+    x86_drop(&mut g, w);
+    let d1 = x86_dst_op(&mut g, x86_dst_at(d, 1));
+    x86_mov(&mut g, x86_reg(XR_RAX), d1);
+    let d0 = x86_dst_op(&mut g, d);
+    x86_t(&mut g, "movq $0, ");
+    x86_o(&mut g, d0);
+    x86_e(&mut g);
+    x86_jump(&mut g, "jmp", l_end);
+    x86_place_label(&mut g, l_full);
+    g.depth = wrap_add(g.depth, w);
+    j = 0;
+    while j < w {
+      x86_pop(&mut g, x86_reg(XR_RAX));
+      let dj = x86_dst_op(&mut g, x86_dst_at(d, wrap_add(1, j)));
+      x86_mov(&mut g, x86_reg(XR_RAX), dj);
+      j = j + 1;
+    }
+    let d0b = x86_dst_op(&mut g, d);
+    x86_t(&mut g, "movq $1, ");
+    x86_o(&mut g, d0b);
+    x86_e(&mut g);
+    x86_place_label(&mut g, l_end);
     return;
   }
   if k == E_VARIANT {

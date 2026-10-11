@@ -23,6 +23,9 @@ What will be 0.2.0.
   into reserved room never allocate. The prover tracks a vector's capacity
   (`vcap` in specifications). `alloc`, `balloc`, `vec_push` and `box` still
   stop the program on out of memory.
+- `try_box[T](x)`: a box that reports running out of memory. It returns
+  `Boxed::Ok` with the box, or `Boxed::Full` with `x` given back, from
+  `enum Boxed[T]` in the new `core/boxed.bastio`.
 - Page tables shared between processors: a processor takes a `Lease` on a
   top-level table with `mmu_enter` and gives it back with `mmu_exit`, and
   while a tree has leases nothing can be taken out of it, only added

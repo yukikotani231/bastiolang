@@ -3425,6 +3425,24 @@ fn eval(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VSta
   let n = node_at(p.nodes, i);
   let k = n.kind;
   if k == E_TAPP {
+    if is_typed_builtin(p, n.b) && name_is(p, n.b, "try_box") {
+      // Either the box holds the value or, out of memory, the value comes
+      // back as it was: which one is not known.
+      let t = conv(&mut m, p, n.a, v.env, i);
+      let inner = node_at(p.nodes, n.b);
+      let xv = eval(&mut v, c, &mut m, p, inner.a, &mut st, 0);
+      let tyx = boxed_t(&mut m, p, t);
+      let h = atom_str(&mut v, "boxed");
+      let one = num(&mut v, 1);
+      let tag = fresh_int(&mut v, h, v.t_zero, one);
+      let bx = mk(&mut v, VV_BOXK, 0, xv, 0, 0, 0);
+      let mut xs = vec_new[u64]();
+      vec_push(&mut xs, bx);
+      vec_push(&mut xs, xv);
+      let r = mk_enum(&mut v, tyx, tag, xs);
+      vec_free(xs);
+      return r;
+    }
     if is_typed_builtin(p, n.b) && !name_is(p, n.b, "vec_new") {
       // `cast[T](x)` keeps the value and proves it fits; `wrap[T](x)`
       // reduces it modulo 2^width.

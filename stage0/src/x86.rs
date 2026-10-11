@@ -1090,6 +1090,7 @@ impl<'a> Gen<'a> {
         match &e.kind {
             ExprKind::TypeApp(targs, inner) => match &inner.kind {
                 ExprKind::Call(n, _) if n == "vec_new" => Type::Vec(Box::new(targs[0].clone())),
+                ExprKind::Call(n, _) if n == "try_box" => crate::check::boxed_type(&targs[0]),
                 _ => targs[0].clone(), // cast, wrap
             },
             ExprKind::Neg(_) => self.int_ops.get(&e.pos).cloned().unwrap_or(Type::I64),
@@ -1861,6 +1862,11 @@ impl<'a> Gen<'a> {
                 let mark = self.depth;
                 self.val_into(e, Dst::Stack(mark, 0))?;
             }
+            ExprKind::TypeApp(_, inner) if matches!(&inner.kind, ExprKind::Call(n, _) if n == "try_box") => {
+                self.reserve(n);
+                let mark = self.depth;
+                self.val_into(e, Dst::Stack(mark, 0))?;
+            }
             ExprKind::TypeApp(_, inner) if matches!(&inner.kind, ExprKind::Call(n, _) if n == "vec_new") => {
                 for _ in 0..3 {
                     self.push("$0");
@@ -1888,6 +1894,38 @@ impl<'a> Gen<'a> {
                     let (o, _) = field(&Type::Struct(sn.clone()), f);
                     self.val_into(x, d.at(o))?;
                 }
+            }
+            // `try_box[T](x)`: the value first, then the box. Out of memory
+            // (a null pointer), the value goes back in `Full` instead.
+            ExprKind::TypeApp(targs, inner) if matches!(&inner.kind, ExprKind::Call(n, _) if n == "try_box") => {
+                let ExprKind::Call(_, args) = &inner.kind else { unreachable!("a call") };
+                let n = words(&targs[0])?;
+                self.push_val(&args[0])?;
+                self.emit(&format!("mov ${}, %edi", n));
+                self.emit("call bst_rt_try_alloc");
+                let (l_full, l_end) = (self.label(), self.label());
+                self.emit("test %rax, %rax");
+                self.emit(&format!("jz {}", l_full));
+                for i in 0..n {
+                    self.emit(&format!("mov {}(%rsp), %rdx", 8 * i));
+                    self.emit(&format!("mov %rdx, {}(%rax)", 8 * i));
+                }
+                self.drop_words(n);
+                let at = self.dst_op(d.at(1));
+                self.emit(&format!("mov %rax, {}", at));
+                let at = self.dst_op(d);
+                self.emit(&format!("movq $0, {}", at));
+                self.emit(&format!("jmp {}", l_end));
+                self.place_label(&l_full);
+                self.depth += n as i64;
+                for i in 0..n {
+                    self.pop("%rax");
+                    let at = self.dst_op(d.at(1 + i));
+                    self.emit(&format!("mov %rax, {}", at));
+                }
+                let at = self.dst_op(d);
+                self.emit(&format!("movq $1, {}", at));
+                self.place_label(&l_end);
             }
             ExprKind::Variant(en, v, payload) => {
                 let k = enum_def(en).unwrap().index(v).unwrap();
