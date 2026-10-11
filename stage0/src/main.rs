@@ -207,6 +207,22 @@ impl Loader {
     }
 }
 
+/// What `--help` prints.
+const HELP: &str = "usage: bastioc0 [options] <file.bastio>...
+Proves the program memory safe with Z3, then compiles it with `cc`.
+
+  --check          verify only; write nothing
+  --emit-c         write the generated C instead of an executable
+  --target T       hosted (the default), or kernel or user for BastiOS (these write C, or assembly with --backend native)
+  --backend B      c (the default) or native (experimental: x86-64 assembly)
+  --emit-asm       with --backend native: write the assembly instead of an executable
+  --lib DIR        also look for imported files in DIR
+  --header FILE    also write a C header for the program's `export fn`s
+  -o FILE          the output file (default: a.out, or out.c for C and out.s for assembly)
+  --dump-smt       print every query sent to the solver
+  --trusted-base   print the trusted runtime code and exit
+  --help           print this and exit\n";
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut check_only = false;
@@ -228,6 +244,10 @@ fn main() {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--help" | "-h" => {
+                print!("{}", HELP);
+                return;
+            }
             "--check" => check_only = true,
             "--emit-c" => emit_c = true,
             "--dump-smt" => dump_smt = true,

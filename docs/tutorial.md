@@ -174,7 +174,7 @@ fn main() -> u64 {
 }
 ```
 
-`fill`'s `ensures` line is a promise to its callers that the length does not change; without it, `main` could not show that index 3 is in bounds. Section 5 explains why. Borrows exist only as parameters: you cannot store a borrow in a variable, return one or put one in a struct. That is what lets Bastio do without lifetime annotations. A borrow can never outlive the call it was made for.
+`fill`'s `ensures` line is a promise to its callers that the length does not change, and the compiler checks that `fill` keeps it. Here `main` would know it even without the promise: the compiler sees that `fill` changes `b` only with `set`, which keeps the length. For any other fact about what a function did, such as the value it returned, the caller knows only what an `ensures` says; section 5 explains why. Borrows exist only as parameters: you cannot store a borrow in a variable, return one or put one in a struct. That is what lets Bastio do without lifetime annotations. A borrow can never outlive the call it was made for.
 
 Other heap types follow the same rules: `Bytes` (byte buffers), `Vec[T]` (growable arrays), `Box[T]` (pointers to a single value), and any struct or enum that holds one of them.
 
@@ -451,7 +451,7 @@ For an `E-VERIFY-` error, the counterexample is a state the compiler believes th
 
 Some errors have a hint instead of a counterexample. The one to know is `the solver gave up (its work limit, or quantifiers)`: Z3 could neither prove the fact nor find a counterexample within its fixed budget of work. That is not a timeout, and running the compiler again will not change the answer. It usually means the fact needs a step Z3 does not find on its own, often one involving `forall`. Help it with an `assert` of an intermediate fact, or a stronger invariant.
 
-`bastioc0 --dump-smt` prints the questions the compiler sends to Z3, if you want to see exactly what it was asked.
+`bastioc0 --dump-smt` prints the questions the compiler sends to Z3, if you want to see exactly what it was asked. [Common proof failures](proof-failures.md) goes through the errors people meet first, one at a time, with a fix for each.
 
 ## 8. Calling Bastio from C
 
@@ -603,6 +603,7 @@ The header's opening comment lists what the proofs assume about the C caller and
 
 ## Where to go next
 
+- [Common proof failures](proof-failures.md) shows the errors you are likely to meet next and how to fix each.
 - The [language reference](language.md) has every type, builtin and error code, and the [soundness scope](language.md#soundness-scope): exactly what is and is not guaranteed.
 - `tests/pass/` has larger programs, and `tests/fail/` one program for each rule, each rejected with the error it breaks.
 - [ROADMAP.md](../ROADMAP.md) says where the language is going: a compiler written in Bastio, concurrency, and the BastiOS kernel.
