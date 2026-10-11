@@ -13,10 +13,12 @@ repositories are public. It is not part of the documentation website.
       `stage0/Cargo.toml`) and BastiOS `v0.2.0` (the version the kernel
       prints). Both changelogs have their section ready, marked "not yet
       tagged".
-- [ ] **Where the website lives.** `site/` builds and is checked in CI but
-      is not deployed. GitHub Pages is the simplest home and needs the
-      repository public (or a paid plan); a deploy job is a few lines once
-      decided. A domain name, if any.
+- [x] **Where the website lives:** GitHub Pages (decided 2026-10-11).
+      Both ways to publish are ready ("Publishing" in `site/README.md`):
+      the `pages` workflow, off until `PAGES_ENABLED` is set, or
+      `site/publish.sh` to a `gh-pages` branch. Turn one on when the
+      repository goes public (Pages on a private repository needs a paid
+      plan). A custom domain, if any, is still open.
 - [ ] **The name.** Check that "Bastio" and "BastiOS" are free to use
       (existing projects, trademarks, package names such as crates.io or
       the VS Code marketplace if the extension is ever published).
@@ -30,16 +32,17 @@ repositories are public. It is not part of the documentation website.
       repositories.
 - [x] Commit authors use GitHub noreply addresses only (checked with
       `git log --format='%ae' | sort -u`).
-- [ ] **GPL in the BastiOS ISO.** The kernel image embeds a BusyBox binary
-      (GPL-2.0-only). The release workflow ships its source and
-      configuration next to the ISO. The ISO also contains GRUB
-      (GPL-3.0-or-later), whose source does not ship yet: add the GRUB
-      source matching the Ubuntu package the ISO was built with, or a
-      written offer, before the first ISO is published.
-- [ ] **musl** (MIT) is statically linked into BusyBox and the musl test
-      programs in the image; its copyright notice should ship with the
-      ISO (a `THIRD_PARTY.md` listing BusyBox, musl and GRUB would cover
-      all three).
+- [x] **GPL in the BastiOS ISO.** The kernel image embeds a BusyBox binary
+      (GPL-2.0-only); the release workflow ships its source and
+      configuration next to the ISO. The boot loader is Limine
+      (BSD-2-Clause) instead of GRUB (GPL-3.0) since 2026-10-11, so no
+      GRUB source has to ship: Limine's license is copied into the ISO and
+      the USB image as `boot/limine/LICENSE`.
+- [ ] **Third-party notices.** musl (MIT) is statically linked into
+      BusyBox and the musl test programs in the image, and Limine
+      (BSD-2-Clause) is in the ISO; their copyright notices should ship
+      with the release too (a `THIRD_PARTY.md` listing BusyBox, musl and
+      Limine would cover all three).
 
 ## Repository hygiene
 
