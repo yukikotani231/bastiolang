@@ -4,7 +4,7 @@
 // Pipeline: load -> monomorphize -> check (types and linearity) -> verify
 // (Z3) -> C -> the system C compiler.
 //
-// usage: bastioc1 [--help] [--check] [--emit-c] [--target T] [--lib DIR] [--backend B] [--emit-asm] [--header F] [--dump-smt] [-o out] <file.bastio>...
+// usage: bastioc1 [--help] [--check] [--emit-c] [--target T] [--arch A] [--lib DIR] [--backend B] [--emit-asm] [--header F] [--dump-smt] [-o out] <file.bastio>...
 //   (default)   verify, then build a native executable `out` (default: a.out)
 //               with the C compiler `$CC` (default: cc)
 //   --check     stop after verification
@@ -13,6 +13,10 @@
 //   --target    `hosted` (default): a normal program on the C library
 //               `kernel`: freestanding C for a bare-metal x86-64 kernel (implies --emit-c)
 //               `user`: freestanding C for a user program under BastiOS (implies --emit-c)
+//   --arch      `x86_64` (default) or `aarch64`, as for bastioc0: aarch64
+//               changes the default C compiler to `aarch64-linux-gnu-gcc`
+//               (`CC` still overrides it), and is hosted-only with the C
+//               backend for now
 //   --lib DIR   also look for imported files in DIR (see `resolve` in
 //               loader.bastio); may be given more than once
 //   --backend native  generate x86-64 assembly directly instead of C, then
@@ -415,6 +419,7 @@ fn b1_help(out: &mut Vec[u64]) {
   w_s(&mut out, "  --check          verify only; write nothing\n");
   w_s(&mut out, "  --emit-c         write the generated C instead of an executable\n");
   w_s(&mut out, "  --target T       hosted (the default), or kernel or user for BastiOS (these write C, or assembly with --backend native)\n");
+  w_s(&mut out, "  --arch A         x86_64 (the default) or aarch64 (hosted, C backend; compiles with aarch64-linux-gnu-gcc)\n");
   w_s(&mut out, "  --backend B      c (the default) or native (experimental: x86-64 assembly)\n");
   w_s(&mut out, "  --emit-asm       with --backend native: write the assembly instead of an executable\n");
   w_s(&mut out, "  --lib DIR        also look for imported files in DIR\n");
@@ -434,6 +439,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
   let mut emit_asm = false;
   let mut dump_smt = false;
   let mut target = TARGET_HOSTED;
+  let mut aarch64 = false;
   let mut outp = balloc(0);
   let mut has_out = false;
   let mut hdr = balloc(0);
@@ -488,6 +494,21 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
         w_s(&mut out, "bastioc1: unknown target `");
         b1_bytes(&mut out, t);
         w_s(&mut out, "` (expected `hosted`, `kernel` or `user`)\n");
+        status = 2;
+      }
+      bfree(t);
+    } else if b1_is(a, "--arch") {
+      bfree(a);
+      i = cg_add(i, 1);
+      let t = host_arg(host, i);
+      if b1_is(t, "x86_64") {
+        aarch64 = false;
+      } else if b1_is(t, "aarch64") {
+        aarch64 = true;
+      } else {
+        w_s(&mut out, "bastioc1: unknown architecture `");
+        b1_bytes(&mut out, t);
+        w_s(&mut out, "` (expected `x86_64` or `aarch64`)\n");
         status = 2;
       }
       bfree(t);
@@ -558,7 +579,15 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
     return 0;
   }
   if status == 0 && vec_len(inputs) == 0 {
-    w_s(&mut out, "usage: bastioc1 [--check] [--emit-c] [--target hosted|kernel|user] [--lib DIR] [--backend c|native] [--emit-asm] [--header F] [-o out] <file.bastio>...\n");
+    w_s(&mut out, "usage: bastioc1 [--check] [--emit-c] [--target hosted|kernel|user] [--arch x86_64|aarch64] [--lib DIR] [--backend c|native] [--emit-asm] [--header F] [-o out] <file.bastio>...\n");
+    status = 2;
+  }
+  if status == 0 && aarch64 && native {
+    w_s(&mut out, "bastioc1: the native backend generates x86-64 only; use the C backend for --arch aarch64\n");
+    status = 2;
+  }
+  if status == 0 && aarch64 && target != TARGET_HOSTED {
+    w_s(&mut out, "bastioc1: --arch aarch64 supports only the hosted target so far\n");
     status = 2;
   }
   // The inputs, as one string for messages.
@@ -721,11 +750,16 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
                 w_s(&mut out, "\n");
                 status = 2;
               } else {
-                // The C compiler: `CC`, as for bastioc0, or `cc`.
+                // The C compiler: `CC`, as for bastioc0, or `cc`
+                // (`aarch64-linux-gnu-gcc` for --arch aarch64).
                 let mut cc = balloc(0);
                 if !host_env(host, "CC", &mut cc) {
                   bfree(cc);
-                  cc = bfrom("cc");
+                  if aarch64 {
+                    cc = bfrom("aarch64-linux-gnu-gcc");
+                  } else {
+                    cc = bfrom("cc");
+                  }
                 }
                 let mut argv = vec_new[Bytes]();
                 vec_push(&mut argv, b1_concat(cc, ""));

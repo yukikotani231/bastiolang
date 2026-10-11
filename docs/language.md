@@ -72,7 +72,7 @@ Take away `requires n <= len(b)` and the program is rejected with `E-VERIFY-BOUN
 ## Using the compiler
 
 ```text
-bastioc0 [--check] [--emit-c] [--backend c|native] [--target hosted|kernel|user] [--header F] [-o out] <file.bastio>...
+bastioc0 [--check] [--emit-c] [--backend c|native] [--target hosted|kernel|user] [--arch x86_64|aarch64] [--header F] [-o out] <file.bastio>...
 ```
 
 | Option | Effect |
@@ -81,6 +81,7 @@ bastioc0 [--check] [--emit-c] [--backend c|native] [--target hosted|kernel|user]
 | `--check` | Check and verify only |
 | `--emit-c` | Write the generated C (`out.c` unless `-o` is given) instead of an executable |
 | `--target T` | `hosted` (the default), `kernel` or `user`; see [Targets](#targets-and-generated-code). `kernel` and `user` imply `--emit-c` |
+| `--arch A` | `x86_64` (the default) or `aarch64`: the processor to build for. AArch64 works with the hosted target and the C backend so far; it compiles with `aarch64-linux-gnu-gcc` unless `$CC` is set. See [Targets](#targets-and-generated-code) |
 | `--backend native` | Experimental: generate x86-64 assembly directly instead of C, assemble it with `as` and link it with `cc`. Hosted target only, and not every builtin yet (`Child`, `Lock`, the device types and libraries without `main` are missing); see [Targets](#targets-and-generated-code) |
 | `--emit-asm` | With `--backend native`: write the assembly (`out.s` unless `-o` is given) instead of an executable |
 | `--header F` | Also write a C header declaring the program's `export fn`s to `F`; see [Calling Bastio from C](#calling-bastio-from-c) |
@@ -1468,6 +1469,8 @@ The compiler emits C, which a C compiler turns into machine code. The C contains
 - **`--target user`** emits freestanding C for a user program under BastiOS, entered at `bst_umain`. Its prelude implements the console and the `sys_*` builtins as `int 0x80` system calls, and `alloc` with a 64 KiB arena.
 
 On the freestanding targets `Bytes` come from the same arena as `Buf`.
+
+The hosted C is the same for every processor, so `--arch aarch64` changes only the C compiler: the program is built for AArch64 Linux with `aarch64-linux-gnu-gcc` (or `$CC`). `tests/aarch64.sh` builds every test program for AArch64, runs it under `qemu-aarch64` and requires the same exit status and output as on x86-64, and checks that the compiler built for AArch64 writes the same C for itself as the x86-64 build. The kernel and user targets and the native backend are x86-64 only for now.
 
 The native backend (`--backend native`, hosted only, experimental) skips C: it writes x86-64 assembly, so the C compiler leaves the trusted base for the program's own code, while its small runtime (printing, the console and the allocator, written in assembly over the C library) is listed by `--trusted-base`. `tests/native.sh` builds every test and benchmark with both backends and requires the same exit status and output. It loses the C compiler's optimizations (inlining, vectorization), so it is slower; `bench/run.sh` reports the gap.
 
