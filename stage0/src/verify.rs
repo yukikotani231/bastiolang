@@ -548,11 +548,19 @@ fn stmts_mention_count(ss: &[Stmt], call: &str, names: &HashSet<String>) -> bool
     })
 }
 
+/// The builtins whose verification states a struct's invariants (see
+/// `invariants_of`): nowhere else does an invariant reach a proof.
+const INVARIANT_BUILTINS: &[&str] = &["locked", "lock_new", "lock_end", "atomic_new", "atomic_load", "atomic_store", "atomic_swap", "atomic_cas", "atomic_wrap_add", "atomic_end"];
+
 /// The functions whose verification needs the facts about the spec builtin
 /// `call` (`vcount`'s lemmas, `bdec`'s definition): those whose own
 /// contract, loop invariants or assertions use it (directly or through spec
 /// fns), or that call a function whose contract does. When a struct
-/// invariant uses it, every function does.
+/// invariant uses it, so does every function that calls a builtin stating
+/// invariants (`INVARIANT_BUILTINS`). Giving the facts to every function
+/// instead put quantifiers over arrays into proofs that never mention the
+/// struct, and Z3 then gave up on some of them (unknown, "incomplete
+/// (theory array)").
 fn counting_fns(p: &Program, call: &str) -> HashSet<String> {
     let mut names = HashSet::new();
     for sf in &p.specs {
@@ -566,7 +574,9 @@ fn counting_fns(p: &Program, call: &str) -> HashSet<String> {
             names.insert(f.name.clone());
         }
     }
-    p.fns.iter().filter(|f| all || names.contains(&f.name) || stmts_mention_count(&f.body, call, &names)).map(|f| f.name.clone()).collect()
+    let none = HashSet::new();
+    let states_invariants = |f: &FnDef| INVARIANT_BUILTINS.iter().any(|b| stmts_mention_count(&f.body, b, &none));
+    p.fns.iter().filter(|f| (all && states_invariants(f)) || names.contains(&f.name) || stmts_mention_count(&f.body, call, &names)).map(|f| f.name.clone()).collect()
 }
 
 /// `bdec(b, from, to)` is `(dec a from to)` over the bytes' data array `a`:

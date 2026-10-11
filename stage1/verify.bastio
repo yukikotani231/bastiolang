@@ -897,7 +897,8 @@ fn block_mentions_count(m: &Mono, p: &Parser, head: u64, call: Str, defs: &Vec[u
 /// Fills `out` (`cnt_fns`, `dec_fns`): the functions whose own contract,
 /// loop invariants or assertions use the spec builtin `call` (directly or
 /// through spec fns), or that call a function whose contract does; every
-/// function when a struct invariant uses it. As stage0's `counting_fns`, by
+/// function that calls a builtin stating invariants when a struct invariant
+/// uses it. As stage0's `counting_fns`, by
 /// definition rather than instance (the instances of one definition all
 /// use it or all do not).
 fn count_gate(m: &Mono, p: &Parser, call: Str, out: &mut Vec[u64]) {
@@ -927,15 +928,27 @@ fn count_gate(m: &Mono, p: &Parser, call: Str, out: &mut Vec[u64]) {
     }
     k = n.next;
   }
+  let none = vec_new[u64]();
   k = p.fns.head;
   while k != 0 {
     let n = node_at(p.nodes, k);
-    if all || has_u(defs, k) || block_mentions_count(m, p, n.x, call, defs) {
+    if (all && states_invariants(m, p, n.x, none)) || has_u(defs, k) || block_mentions_count(m, p, n.x, call, defs) {
       vec_push(&mut out, k);
     }
     k = n.next;
   }
+  vec_free(none);
   vec_free(defs);
+}
+
+/// Does the block call a builtin whose verification states a struct's
+/// invariants? As stage0's `INVARIANT_BUILTINS`.
+fn states_invariants(m: &Mono, p: &Parser, b: u64, none: &Vec[u64]) -> bool {
+  return block_mentions_count(m, p, b, "locked", none) || block_mentions_count(m, p, b, "lock_new", none)
+    || block_mentions_count(m, p, b, "lock_end", none) || block_mentions_count(m, p, b, "atomic_new", none)
+    || block_mentions_count(m, p, b, "atomic_load", none) || block_mentions_count(m, p, b, "atomic_store", none)
+    || block_mentions_count(m, p, b, "atomic_swap", none) || block_mentions_count(m, p, b, "atomic_cas", none)
+    || block_mentions_count(m, p, b, "atomic_wrap_add", none) || block_mentions_count(m, p, b, "atomic_end", none);
 }
 
 /// (lambda ((q Int)) body)

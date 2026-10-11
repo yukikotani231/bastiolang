@@ -1,0 +1,38 @@
+// expect-exit: 1
+// A struct invariant that uses `vcount` (through `hmap_ok`) gives the
+// counting lemmas only to functions that state invariants (`lock_new`,
+// `locked`, ...). Before, every function got them, and their quantifiers
+// over arrays made Z3 give up on `same`, which never sees the struct.
+import "core/hashmap.bastio";
+
+struct Sys { m: HashMap[u64] } invariant hmap_ok[u64](m);
+
+fn same(a: &Bytes, i: u64, b: &Bytes, j: u64, n: u64) -> bool
+  requires i + n <= blen(a) && j + n <= blen(b)
+  ensures result ==> forall q: u64 :: q < n ==> bget(a, i + q) == bget(b, j + q)
+{
+  let mut k = 0;
+  while k < n
+    invariant k <= n
+    invariant forall q: u64 :: q < k ==> bget(a, i + q) == bget(b, j + q)
+  {
+    if bget(a, i + k) != bget(b, j + k) {
+      return false;
+    }
+    k = k + 1;
+  }
+  return true;
+}
+
+fn main() -> u64 {
+  let s = lock_new(Sys { m: hmap_new[u64]() });
+  let v = lock_end(s);
+  hmap_free[u64](v.m);
+  let a = balloc(4);
+  let b = balloc(4);
+  let r = same(a, 0, b, 1, 3);
+  bfree(a);
+  bfree(b);
+  if r { return 1; }
+  return 0;
+}
