@@ -2577,6 +2577,30 @@ fn x86_operand(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, i: u64) -> X86Op 
   return x86_none();
 }
 
+/// stage1: an expression with the same low byte as `i`: `i` without the
+/// casts, `wrap`s and `& 255` around it (a byte store keeps only that byte).
+fn x86_low8(p: &Parser, i: u64) -> u64 {
+  let mut e = i;
+  let mut guard = 0;
+  while guard < 64 {
+    let n = node_at(p.nodes, e);
+    if n.kind == E_TAPP && (name_is(p, n.b, "cast") || name_is(p, n.b, "wrap")) {
+      let inner = node_at(p.nodes, n.b);
+      e = inner.a;
+    } else if n.kind == E_BIN && n.v == P_AMP && kind_of(p, n.b) == E_INT {
+      let bn = node_at(p.nodes, n.b);
+      if bn.v % 256 != 255 {
+        return e;
+      }
+      e = n.a;
+    } else {
+      return e;
+    }
+    guard = guard + 1;
+  }
+  return e;
+}
+
 /// Might reading simple expression `i` read register operand `r`?
 fn x86_mentions(g: &mut X86, p: &Parser, i: u64, r: X86Op) -> bool {
   if r.k != XO_REG {
@@ -4342,10 +4366,24 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     // live in some.
     let mut base = XR_RCX;
     let mut index = XR_RAX;
+    let mut disp = 0;
     if x86_is_place(p, a0) {
       let r = x86_var_reg(&mut g, p, a1);
+      // stage1: an index `x + k`, x in a register, is an address offset.
+      let ixn = node_at(p.nodes, a1);
+      let sm = x86_small(p, ixn.b);
+      let mut r2 = 0;
+      if !g.stage0 && r == 0 && ixn.kind == E_BIN && ixn.v == P_PLUS && sm != 0 && sm - 1 <= 268435455 {
+        r2 = x86_var_reg(&mut g, p, ixn.a);
+      }
       if r != 0 {
         index = r;
+      } else if r2 != 0 {
+        index = r2;
+        disp = sm - 1;
+        if !byte {
+          disp = wrap_mul(disp, 8);
+        }
       } else {
         x86_scalar(&mut g, c, &mut m, p, a1);
       }
@@ -4362,13 +4400,21 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
       x86_drop(&mut g, 2);
     }
     if byte {
-      x86_t(&mut g, "movzbl (");
+      x86_t(&mut g, "movzbl ");
+      if disp != 0 {
+        x86_n(&mut g, disp);
+      }
+      x86_t(&mut g, "(");
       x86_r(&mut g, base);
       x86_t(&mut g, ",");
       x86_r(&mut g, index);
       x86_t(&mut g, "), %eax");
     } else {
-      x86_t(&mut g, "mov (");
+      x86_t(&mut g, "mov ");
+      if disp != 0 {
+        x86_n(&mut g, disp);
+      }
+      x86_t(&mut g, "(");
       x86_r(&mut g, base);
       x86_t(&mut g, ",");
       x86_r(&mut g, index);
@@ -4386,18 +4432,31 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
   } else if name_is(p, i, "bset") && !g.stage0 && kind_of(p, a0) == E_MUTBORROW {
     // stage1: the value first, then the borrow (a place's address, which
     // has no effects and needs no register but %rcx) and the index.
-    let simple = x86_simple(p, a1);
+    let mut simple = x86_simple(p, a1);
     // An index `x + y` or `x - y` of simple operands is computed after the
     // value, unless the value could change a variable it names (through a
-    // `&mut` borrow).
+    // `&mut` borrow); `x + k`, x in a register, is an address offset.
     let ixn = node_at(p.nodes, a1);
-    let late = !simple && ixn.kind == E_BIN && (ixn.v == P_PLUS || ixn.v == P_MINUS) && x86_simple(p, ixn.a)
-      && x86_simple(p, ixn.b) && !x86_has_kind(p, a2, E_MUTBORROW);
-    if !simple && !late {
+    let calm = !x86_has_kind(p, a2, E_MUTBORROW);
+    let mut ireg = 0;
+    let mut idisp = 0;
+    let sm = x86_small(p, ixn.b);
+    if calm && ixn.kind == E_BIN && ixn.v == P_PLUS && sm != 0 {
+      ireg = x86_var_reg(&mut g, p, ixn.a);
+      idisp = sm - 1;
+    }
+    if ireg != 0 {
+      simple = false;
+    }
+    let late = ireg == 0 && !simple && ixn.kind == E_BIN && (ixn.v == P_PLUS || ixn.v == P_MINUS) && x86_simple(p, ixn.a)
+      && x86_simple(p, ixn.b) && calm;
+    if !simple && !late && ireg == 0 {
       x86_scalar(&mut g, c, &mut m, p, a1);
       x86_push(&mut g, x86_reg(XR_RAX));
     }
-    x86_scalar(&mut g, c, &mut m, p, a2);
+    // Only the low byte is stored: casts and `& 255` around the value
+    // change nothing in it.
+    x86_scalar(&mut g, c, &mut m, p, x86_low8(p, a2));
     x86_es(&mut g, "mov %rax, %rdx");
     if late {
       let o1 = x86_operand(&mut g, c, m, p, ixn.a);
@@ -4411,7 +4470,7 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
       x86_o(&mut g, o2);
       x86_t(&mut g, ", %rsi");
       x86_e(&mut g);
-    } else if !simple {
+    } else if !simple && ireg == 0 {
       x86_pop(&mut g, x86_reg(XR_RSI));
     }
     let bn = node_at(p.nodes, a0);
@@ -4428,11 +4487,30 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
       x86_mov(&mut g, x86_lop(l, 1), x86_reg(XR_RAX));
     }
     vec_free(segs);
-    if simple {
-      let o = x86_operand(&mut g, c, m, p, a1);
-      x86_mov(&mut g, o, x86_reg(XR_RSI));
+    if ireg != 0 {
+      x86_t(&mut g, "mov %dl, ");
+      if idisp != 0 {
+        x86_n(&mut g, idisp);
+      }
+      x86_t(&mut g, "(%rax,");
+      x86_r(&mut g, ireg);
+      x86_t(&mut g, ")");
+      x86_e(&mut g);
+    } else {
+      let mut ix = x86_reg(XR_RSI);
+      if simple {
+        let o = x86_operand(&mut g, c, m, p, a1);
+        if o.k == XO_REG && o.r != XR_RAX && o.r != XR_RDX {
+          ix = o;
+        } else {
+          x86_mov(&mut g, o, x86_reg(XR_RSI));
+        }
+      }
+      x86_t(&mut g, "mov %dl, (%rax,");
+      x86_r(&mut g, ix.r);
+      x86_t(&mut g, ")");
+      x86_e(&mut g);
     }
-    x86_es(&mut g, "mov %dl, (%rax,%rsi)");
   } else if name_is(p, i, "bset") {
     x86_arg(&mut g, c, &mut m, p, a0);
     x86_scalar(&mut g, c, &mut m, p, a1);

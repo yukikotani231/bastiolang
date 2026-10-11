@@ -1,0 +1,73 @@
+// expect-exit: 0
+// expect-stdout: 2271560481
+// expect-stdout: 44
+// expect-stdout: 275
+// expect-stdout: 960
+// Byte and word reads and writes at `i + k`, which the native backend
+// turns into an address offset when `i` is in a register, and byte
+// stores of values under casts, `wrap` and `& 255` (only the low byte is
+// stored).
+
+fn put32(out: &mut Bytes, o: u64, v: u64)
+  requires o + 4 <= blen(out) && v < 4294967296
+  ensures blen(out) == old(blen(out))
+{
+  bset(&mut out, o, cast[u8](v & 255));
+  bset(&mut out, o + 1, cast[u8](v >> 8 & 255));
+  bset(&mut out, o + 2, cast[u8](v >> 16 & 255));
+  bset(&mut out, o + 3, cast[u8](v >> 24));
+}
+
+fn get32(b: &Bytes, o: u64) -> u64
+  requires o + 4 <= blen(b)
+{
+  let x0 = cast[u64](bget(b, o));
+  let x1 = cast[u64](bget(b, o + 1));
+  let x2 = cast[u64](bget(b, o + 2));
+  let x3 = cast[u64](bget(b, o + 3));
+  return x0 | x1 << 8 | x2 << 16 | x3 << 24;
+}
+
+fn main() -> u64 {
+  let mut b = balloc(16);
+  put32(&mut b, 4, 2271560481);
+  print(get32(b, 4));
+  // A store whose low byte comes from a wrap.
+  let mut i = 0;
+  while i + 2 <= 16
+    invariant blen(b) == 16 && i <= 16
+  {
+    bset(&mut b, i + 1, wrap[u8](i * 20 + 300));
+    i = i + 2;
+  }
+  print(cast[u64](bget(b, 1)));
+  let mut s = 0;
+  let mut k = 0;
+  while k + 1 < 16
+    invariant blen(b) == 16 && k <= 16
+  {
+    s = wrap_add(s, cast[u64](bget(b, k + 1)));
+    k = k + 2;
+  }
+  let mut w = alloc(8);
+  let mut j = 0;
+  while j < 8
+    invariant len(w) == 8 && j <= 8
+  {
+    w = set(w, j, j * 11);
+    j = j + 1;
+  }
+  let mut t = 0;
+  let mut q = 0;
+  while q + 3 < 8
+    invariant len(w) == 8 && q <= 8
+  {
+    t = wrap_add(t, get(w, q + 3));
+    q = q + 1;
+  }
+  print(t);
+  print(s);
+  free(w);
+  bfree(b);
+  return 0;
+}
