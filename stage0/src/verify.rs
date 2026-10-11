@@ -913,20 +913,18 @@ impl<'p> Verifier<'p> {
     }
 
     /// `x` reduced to the range of the integer type `t`, as a C conversion
-    /// to `t` does: modulo 2^width, two's complement for a signed type. The
-    /// signed case names `x mod 2^width` and subtracts 2^width from the
-    /// upper half. (It was `(x + 2^(width-1)) mod 2^width - 2^(width-1)`,
-    /// the same number, but Z3 4.8.12 can run forever on that form under
-    /// another `mod`, ignoring the resource limit.)
+    /// to `t` does: modulo 2^width, two's complement for a signed type. It
+    /// is a fresh `n` in the range of `t` with `x = n + 2^width * k` for a
+    /// fresh integer `k`, which only one `n` satisfies. That is linear: Z3
+    /// 4.8.12 can run forever, past its resource limit, on a `mod` of such
+    /// a value under another `mod` or a product, and random programs found
+    /// many such queries (`tests/fuzz.py --seed 1`).
     fn wrap_term(&mut self, t: &Type, x: &str) -> Result<String, Diag> {
-        let m = format!("(mod {} {})", x, t.int_modulus());
-        if !t.is_signed() {
-            return Ok(m);
-        }
-        let n = self.fresh_name("wrap");
-        self.smt(&format!("(declare-const {} Int)", n))?;
-        self.smt(&format!("(assert (= {} {}))", n, m))?;
-        Ok(format!("(ite (>= {n} {}) (- {n} {}) {n})", t.int_modulus() / 2, t.int_modulus()))
+        let n = self.fresh_int("wrap", &num(t.int_min()), &num(t.int_max()))?;
+        let k = self.fresh_name("wrap_k");
+        self.smt(&format!("(declare-const {} Int)", k))?;
+        self.smt(&format!("(assert (= {} (+ {} (* {} {}))))", x, n, t.int_modulus(), k))?;
+        Ok(n)
     }
 
     fn fresh_int(&mut self, hint: &str, lo: &str, hi_incl: &str) -> Result<String, Diag> {
