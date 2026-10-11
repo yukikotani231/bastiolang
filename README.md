@@ -72,24 +72,28 @@ Tested on x86-64 Linux (Ubuntu 24.04), which is what CI runs; other platforms ar
 ```sh
 git clone https://github.com/yukikotani231/bastiolang && cd bastiolang
 (cd stage0 && cargo build --release)
-stage0/target/release/bastioc0 -o hello examples/hello.bastio && ./hello
+tests/bastioc1.sh     # stage0 builds bastioc1, the compiler (once; about half a minute)
+stage0/target/release/bastioc1 -o hello examples/hello.bastio && ./hello
 tests/run.sh          # must-pass and must-fail programs, zero-overhead check, sanitizer cross-check
 stage1/difftest.sh    # the self-hosted compiler's phases against stage0
 ```
 
-`bastioc0 --help` lists the options. The main ones:
+bastioc1 is the compiler written in Bastio (`stage1/`); stage0's `bastioc0` only bootstraps it and is the oracle difftest compares it with. The tests use bastioc1 unless `BASTIOC` names another compiler. Options (bastioc0 takes the same; `--help` lists them):
 - `--check`: verify only
 - `--emit-c`: write the generated C
 - `--dump-smt`: print every query sent to the solver
-- `--target kernel`: emit freestanding C for bare-metal x86-64 (used by BastiOS)
-- `--backend native`: experimental, generate x86-64 assembly directly instead of C (hosted target only; `tests/native.sh` checks it against the C backend)
+- `--target kernel`, `--target user`: emit freestanding C for BastiOS's kernel or its programs
+- `--backend native`: generate x86-64 assembly directly instead of C (`tests/native.sh` checks it against the C backend); `--emit-asm` writes the assembly
+- `--header FILE`: write a C header for the `export fn`s of a library
+- `--lib DIR`: where `import "core/..."` looks (also `BASTIO_LIB`)
+- `--trusted-base`: list what the proofs trust
 
 ## Layout
 
 | Path | Contents |
 | --- | --- |
-| `stage0/` | Throwaway bootstrap compiler in Rust, frozen once the self-hosted compiler works |
-| `stage1/` | The self-hosted compiler, written in Bastio and grown one phase at a time (see `stage1/README.md`) |
+| `stage0/` | The bootstrap compiler in Rust: it builds bastioc1 and is the oracle for `stage1/difftest.sh`; being frozen (ROADMAP v2) |
+| `stage1/` | bastioc1, the compiler, written in Bastio (see `stage1/README.md`) |
 | `tests/pass/` | Programs that must verify and exit with a given code |
 | `tests/fail/` | Programs that must be rejected with a given error code |
 | `core/`, `std/` | The library: byte strings, text, numbers, printing, a hash map, sorting (`core/`, every target) and host files (`std/`); see `docs/core.md` |

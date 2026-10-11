@@ -4,7 +4,7 @@
 // Pipeline: load -> monomorphize -> check (types and linearity) -> verify
 // (Z3) -> C -> the system C compiler.
 //
-// usage: bastioc1 [--help] [--check] [--emit-c] [--target T] [--lib DIR] [--backend B] [--emit-asm] [--header F] [-o out] <file.bastio>...
+// usage: bastioc1 [--help] [--check] [--emit-c] [--target T] [--lib DIR] [--backend B] [--emit-asm] [--header F] [--dump-smt] [-o out] <file.bastio>...
 //   (default)   verify, then build a native executable `out` (default: a.out)
 //               with the C compiler `$CC` (default: cc)
 //   --check     stop after verification
@@ -22,6 +22,8 @@
 //   --emit-asm  with `--backend native`: write the assembly to `out`
 //               (default: out.s) instead of building
 //   --header F  also write a C header for the program's `export fn`s to F
+//   --dump-smt  once every proof succeeds, print every query sent to Z3 on
+//               standard output, as bastioc0 does
 //   --trusted-base  list and count the hand-written trusted base, then exit
 //   --help      print the options, then exit
 // Several input files form one program, as for bastioc0.
@@ -418,6 +420,7 @@ fn b1_help(out: &mut Vec[u64]) {
   out_str(&mut out, "  --lib DIR        also look for imported files in DIR\n");
   out_str(&mut out, "  --header FILE    also write a C header for the program's `export fn`s\n");
   out_str(&mut out, "  -o FILE          the output file (default: a.out, or out.c for C and out.s for assembly)\n");
+  out_str(&mut out, "  --dump-smt       print every query sent to the solver\n");
   out_str(&mut out, "  --trusted-base   print the trusted runtime code and exit\n");
   out_str(&mut out, "  --help           print this and exit\n");
 }
@@ -429,6 +432,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
   let mut emit_c = false;
   let mut native = false;
   let mut emit_asm = false;
+  let mut dump_smt = false;
   let mut target = TARGET_HOSTED;
   let mut outp = balloc(0);
   let mut has_out = false;
@@ -449,6 +453,9 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
       bfree(a);
     } else if b1_is(a, "--emit-asm") {
       emit_asm = true;
+      bfree(a);
+    } else if b1_is(a, "--dump-smt") {
+      dump_smt = true;
       bfree(a);
     } else if b1_is(a, "--backend") {
       bfree(a);
@@ -603,7 +610,22 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
       } else {
         let mut v = vr_new(&mut m, p);
         let mut rep = vec_new[u64]();
-        if !solver_starts(host) {
+        let starts = solver_starts(host);
+        // `--dump-smt` prints every query once all are proved, so it keeps
+        // the whole log instead of proving in batches.
+        let mut proved = false;
+        if starts {
+          if dump_smt {
+            verify_program(&mut v, c, &mut m, p);
+            proved = solve_par(&mut v, m, p, host, &mut rep, solve_jobs(host));
+            if proved {
+              put_log(con, v);
+            }
+          } else {
+            proved = verify_batched(&mut v, c, &mut m, p, host, &mut rep, solve_jobs(host));
+          }
+        }
+        if !starts {
           let mut msg = vec_new[u64]();
           out_str(&mut msg, "could not start the SMT solver `");
           solver_name(host, &mut msg);
@@ -611,7 +633,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
           b1_render(&mut out, p, ld, 0, 0, 0, "E-SOLVER", msg, rep);
           vec_free(msg);
           status = 1;
-        } else if !verify_batched(&mut v, c, &mut m, p, host, &mut rep, solve_jobs(host)) {
+        } else if !proved {
           let n = node_at(p.nodes, v.fail_at);
           let mut code = "E-SOLVER";
           if v.fail_code != 0 {

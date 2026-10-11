@@ -6,12 +6,15 @@
 # code in their `// expect-error: CODE` header, checked for the target in an
 # optional `// target: T` header (a rejection for the wrong
 # reason counts as a failure). diag/*.bastio must print exactly diag/*.err.
+# A program with a `// stage1-only: <feature>` header is skipped when
+# BASTIOC is stage0 (tests/stage1_only.sh).
 set -u
 cd "$(dirname "$0")/.."
-BASTIOC=${BASTIOC:-stage0/target/release/bastioc0}
+BASTIOC=${BASTIOC:-$(tests/bastioc1.sh)} || exit 1
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 . tests/pfor.sh
+. tests/stage1_only.sh
 export BASTIOC
 # One check of the lists below; JOBS of them run at a time.
 pass_one() {
@@ -66,9 +69,9 @@ fail=0
 tally() {  # after a pfor: add its tallies (a lost job is a failure)
   pass=$((pass + $(n pass))) fail=$((fail + $(n fail) + $1))
 }
-pfor pass_one tests/pass/*.bastio; tally $?
-pfor fail_one tests/fail/*.bastio; tally $?
-pfor user_one tests/user/*.bastio; tally $?
+pfor pass_one $(s1files tests/pass/*.bastio); tally $?
+pfor fail_one $(s1files tests/fail/*.bastio); tally $?
+pfor user_one $(s1files tests/user/*.bastio); tally $?
 # Diagnostics: what the compiler prints for diag/NAME.bastio, run from
 # tests/diag, must be diag/NAME.err exactly: the source line with its
 # number, the token underlined, the notes. To accept a deliberate change,
@@ -148,7 +151,7 @@ if echo 'int main(void){return 0;}' | ${CC:-cc} -fsanitize=address,undefined -x 
       echo "FAIL $f under sanitizers: exit $got"; sed 's/^/    /' "$w/$name.san.err" | head -20; echo =fail; fi
   }
   export -f san_one
-  pfor san_one tests/pass/*.bastio; tally $?
+  pfor san_one $(s1files tests/pass/*.bastio); tally $?
 else
   echo "(sanitizer cross-check skipped: no -fsanitize support)"
 fi
@@ -218,5 +221,10 @@ for f in examples/*.bastio; do
   if "$tmp/ex_$name" </dev/null >/dev/null; then pass=$((pass+1)); else
     echo "FAIL $f: exit $?, want 0"; fail=$((fail+1)); fi
 done
-echo "-- $pass passed, $fail failed"
+s1skip=$(s1left tests/pass/*.bastio tests/fail/*.bastio tests/user/*.bastio)
+if [ "$s1skip" -gt 0 ]; then
+  echo "-- $pass passed, $fail failed, $s1skip skipped (stage1-only, and BASTIOC is stage0)"
+else
+  echo "-- $pass passed, $fail failed"
+fi
 [ "$fail" = 0 ]
