@@ -77,6 +77,13 @@ const XD_HEAP: u64 = 3;
 const X86_INLINE_MAX: u64 = 160;
 const X86_INLINE_DEPTH: u64 = 3;
 const X86_INLINE_TINY: u64 = 10;
+const X86_INLINE_SMALL: u64 = 20;
+// stage1: a body bigger than this is inlined only where at most
+// X86_INLINE_FEW calls name its function, so code grows little.
+const X86_INLINE_SHARED: u64 = 60;
+const X86_INLINE_FEW: u64 = 3;
+// stage1: values of this many words or more are copied with `rep movsq`.
+const X86_REP_COPY: u64 = 6;
 
 struct X86Op { k: u64, r: u64, v: u64 }
 
@@ -126,6 +133,9 @@ struct X86 {
   stack: Vec[u64],
   /// Per instance: its body size + 1 (0: not computed yet).
   bsize: Vec[u64],
+  /// Per function definition (by node): how many calls name it, + 1 for
+  /// every entry once counted (empty: not counted yet).
+  ncalls: Vec[u64],
   /// String literals and blobs: string k is `sdata[sstart[k] .. + slens[k]]`.
   sdata: Vec[u64],
   sstart: Vec[u64],
@@ -133,6 +143,9 @@ struct X86 {
   labels: u64,
   /// Frame words used by locals; words pushed beyond the frame.
   frame: u64,
+  /// The frame's slots in order: for each, the frame words before it and
+  /// its size (stage1 moves the busiest ones next to %rbp).
+  slots: Vec[u64],
   depth: u64,
   /// The instance whose types and operators are being read, and the name
   /// prefix of its variables (0 in the function being generated).
@@ -168,18 +181,22 @@ struct X86 {
   nsmp: u64,
   /// The literal or blob node of each string (stage1 writes each one once,
   /// however often its function is inlined).
-  snode: Vec[u64]
+  snode: Vec[u64],
+  /// A `let` whose struct is only read through some of its fields: its
+  /// storage (as an X86Dst) and the words to fill (a bit each; stage1).
+  mk: u64, ma: u64, mmask: u64
 }
 
 fn x86_new() -> X86 {
   return X86 {
     out: vec_new[u64](), body: vec_new[u64](), ln: vec_new[u64](), cg: cg_new(TARGET_HOSTED),
     names: vec_new[X86Name](), vars: vec_new[X86Var](), vfloor: 0, used: vec_new[u64](),
-    saves: vec_new[X86Save](), stack: vec_new[u64](), bsize: vec_new[u64](),
+    saves: vec_new[X86Save](), stack: vec_new[u64](), bsize: vec_new[u64](), ncalls: vec_new[u64](),
     sdata: vec_new[u64](), sstart: vec_new[u64](), slens: vec_new[u64](),
-    labels: 0, frame: 0, depth: 0, env: 0, pre: 0, retl: 0, retw: 0, reto: 0, rdk: 0, rda: 0, rdo: 0,
+    labels: 0, frame: 0, slots: vec_new[u64](), depth: 0, env: 0, pre: 0, retl: 0, retw: 0, reto: 0, rdk: 0, rda: 0, rdo: 0,
     parent: vec_new[u64](), cur: 0, decl: vec_new[X86Decl](), sw: false, failed: false, fmsg: vec_new[u64](),
-    stage0: false, target: TARGET_HOSTED, smp: vec_new[u64](), nsmp: 0, snode: vec_new[u64]()
+    stage0: false, target: TARGET_HOSTED, smp: vec_new[u64](), nsmp: 0, snode: vec_new[u64](),
+    mk: 0, ma: 0, mmask: 0
   };
 }
 
@@ -194,6 +211,8 @@ fn x86_free(g: X86) {
   vec_free(g.saves);
   vec_free(g.stack);
   vec_free(g.bsize);
+  vec_free(g.ncalls);
+  vec_free(g.slots);
   vec_free(g.sdata);
   vec_free(g.sstart);
   vec_free(g.slens);
@@ -437,7 +456,9 @@ fn x86_e(g: &mut X86) {
     let mut k = 0;
     while k < vec_len(g.used) {
       let r = u_at(g.used, k);
-      if x86_is_leafreg(r) {
+      // stage1: only a register that a variable in scope holds (one out
+      // of scope, or not declared yet, holds nothing to keep).
+      if x86_is_leafreg(r) && (g.stage0 || x86_reg_bound(g, r)) {
         let o = x86_save_slot(&mut g, r);
         vec_push(&mut rs, r);
         vec_push(&mut os, o);
@@ -471,6 +492,19 @@ fn x86_e(g: &mut X86) {
   }
   vec_free(rs);
   vec_free(os);
+}
+
+/// Does a variable in scope live in register `r`?
+fn x86_reg_bound(g: &X86, r: u64) -> bool {
+  let mut k = 0;
+  while k < vec_len(g.vars) {
+    let v = vec_get(g.vars, k);
+    if (v.k == XS_REG || v.k == XS_REGS || v.k == XS_PREG) && (v.r0 == r || v.r1 == r || v.r2 == r) {
+      return true;
+    }
+    k = k + 1;
+  }
+  return false;
 }
 
 /// Emits the instruction `s`.
@@ -556,6 +590,8 @@ fn x86_drop(g: &mut X86, n: u64) {
 
 /// A frame slot of `n` words; the offset of word 0.
 fn x86_slot(g: &mut X86, n: u64) -> u64 {
+  vec_push(&mut g.slots, g.frame);
+  vec_push(&mut g.slots, n);
   g.frame = wrap_add(g.frame, n);
   return wrap_sub(XB, wrap_mul(8, g.frame));
 }
@@ -575,8 +611,40 @@ fn x86_use_reg(g: &mut X86, r: u64) {
   }
 }
 
-/// Pops `n` words into place `l`.
+/// `rep movsq` of `n` words, after the set-up lines `a` and `b` (either
+/// may be empty).
+fn x86_rep_copy(g: &mut X86, a: Str, b: Str, n: u64) {
+  if slen(a) > 0 {
+    x86_es(&mut g, a);
+  }
+  if slen(b) > 0 {
+    x86_es(&mut g, b);
+  }
+  x86_t(&mut g, "mov $");
+  x86_n(&mut g, n);
+  x86_t(&mut g, ", %ecx");
+  x86_e(&mut g);
+  x86_es(&mut g, "rep movsq");
+}
+
+/// Pops `n` words into place `l`. For stage1 and `n` of at least
+/// X86_REP_COPY words, it overwrites %rcx, %rsi and %rdi.
 fn x86_pop_to(g: &mut X86, l: X86Loc, n: u64) {
+  if !g.stage0 && n >= X86_REP_COPY && l.k == XL_MEM && l.b != XR_RSP {
+    // stage1: as the pops below, upward, with `rep movsq`.
+    x86_t(&mut g, "lea ");
+    x86_o(&mut g, x86_lop(l, 0));
+    x86_t(&mut g, ", %rdi");
+    x86_e(&mut g);
+    x86_es(&mut g, "mov %rsp, %rsi");
+    x86_t(&mut g, "mov $");
+    x86_n(&mut g, n);
+    x86_t(&mut g, ", %ecx");
+    x86_e(&mut g);
+    x86_es(&mut g, "rep movsq");
+    x86_drop(&mut g, n);
+    return;
+  }
   let mut i = 0;
   while i < n {
     x86_pop(&mut g, x86_reg(XR_RAX));
@@ -585,8 +653,24 @@ fn x86_pop_to(g: &mut X86, l: X86Loc, n: u64) {
   }
 }
 
-/// Pushes the `n` words at `l` (word 0 ends on top).
+/// Pushes the `n` words at `l` (word 0 ends on top). For stage1 and `n`
+/// of at least X86_REP_COPY words, it overwrites %rcx, %rsi and %rdi.
 fn x86_push_from(g: &mut X86, l: X86Loc, n: u64) {
+  if !g.stage0 && n >= X86_REP_COPY && l.k == XL_MEM && l.b != XR_RSP {
+    // stage1: the same words, copied below the stack with `rep movsq`.
+    x86_t(&mut g, "lea ");
+    x86_o(&mut g, x86_lop(l, 0));
+    x86_t(&mut g, ", %rsi");
+    x86_e(&mut g);
+    x86_reserve(&mut g, n);
+    x86_es(&mut g, "mov %rsp, %rdi");
+    x86_t(&mut g, "mov $");
+    x86_n(&mut g, n);
+    x86_t(&mut g, ", %ecx");
+    x86_e(&mut g);
+    x86_es(&mut g, "rep movsq");
+    return;
+  }
   let mut i = n;
   while i > 0 {
     i = i - 1;
@@ -908,6 +992,46 @@ fn x86_bsize(g: &mut X86, m: &Mono, p: &Parser, x: u64) -> u64 {
   return s;
 }
 
+/// The function definition named `s..e` (generic or not), or 0.
+fn x86_fn_named(p: &Parser, s: u64, e: u64) -> u64 {
+  let mut k = p.fns.head;
+  let mut steps = 0;
+  while k != 0 && steps < 10000000 {
+    let n = node_at(p.nodes, k);
+    if same(p.src, n.s, n.e, s, e) {
+      return k;
+    }
+    k = n.next;
+    steps = steps + 1;
+  }
+  return 0;
+}
+
+/// How many calls in the loaded program name function definition `def`
+/// (counted once for all definitions).
+fn x86_ncalls(g: &mut X86, p: &Parser, def: u64) -> u64 {
+  if vec_len(g.ncalls) == 0 {
+    let nn = vec_len(p.nodes);
+    let mut k = 0;
+    while k <= nn && vec_len(g.ncalls) <= nn {
+      vec_push(&mut g.ncalls, 0);
+      k = k + 1;
+    }
+    let mut i = 1;
+    while i < nn {
+      let n = node_at(p.nodes, i);
+      if n.kind == E_CALL {
+        let d = x86_fn_named(p, n.s, n.e);
+        if d != 0 && d < vec_len(g.ncalls) {
+          vec_set(&mut g.ncalls, d, wrap_add(vec_get(g.ncalls, d), 1));
+        }
+      }
+      i = i + 1;
+    }
+  }
+  return u_at(g.ncalls, def);
+}
+
 /// Can calls to instance `x` be inlined (stage0's `inlinable`)?
 fn x86_inlinable(g: &mut X86, m: &Mono, p: &Parser, x: u64) -> bool {
   let xi = inst_at(m, x);
@@ -921,6 +1045,20 @@ fn x86_inlinable(g: &mut X86, m: &Mono, p: &Parser, x: u64) -> bool {
 fn x86_will_inline(g: &mut X86, m: &Mono, p: &Parser, x: u64) -> bool {
   if x == 0 || !x86_inlinable(&mut g, m, p, x) || has_id(g.stack, x) {
     return false;
+  }
+  if !g.stage0 {
+    // stage1: small bodies at any depth (node_at, kind_of and the like
+    // are called everywhere, often from bodies already inlined); big ones
+    // only for a function called from few places.
+    let b = x86_bsize(&mut g, m, p, x);
+    if b <= X86_INLINE_SMALL {
+      return true;
+    }
+    if vec_len(g.stack) >= X86_INLINE_DEPTH {
+      return false;
+    }
+    let xi = inst_at(m, x);
+    return b <= X86_INLINE_SHARED || x86_ncalls(&mut g, p, xi.def) <= X86_INLINE_FEW;
   }
   return vec_len(g.stack) < X86_INLINE_DEPTH || x86_bsize(&mut g, m, p, x) <= X86_INLINE_TINY;
 }
@@ -1471,7 +1609,7 @@ fn x86_assign_regs(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
     while q != 0 {
       let qn = node_at(p.nodes, q);
       let pt = conv(&mut m, p, qn.a, x, q);
-      if kind_t(m, pt) == TY_MUTREF {
+      if kind_t(m, pt) == TY_MUTREF || x86_byaddr(&mut g, c, m, p, pt) {
         let id = x86_nm(&mut g, p, 0, qn.s, qn.e);
         let mut nm = x86_name_at(g, id);
         nm.bad = false;
@@ -1729,6 +1867,38 @@ fn x86_is_place(p: &Parser, i: u64) -> bool {
     return x86_is_place(p, n.a);
   }
   return false;
+}
+
+/// Does expression `i` hold a node of kind `k` (or is it too big to say)?
+fn x86_has_kind(p: &Parser, i: u64, k: u64) -> bool {
+  let mut todo = vec_new[u64]();
+  let n0 = node_at(p.nodes, i);
+  let mut found = n0.kind == k;
+  vec_push(&mut todo, n0.a);
+  vec_push(&mut todo, n0.b);
+  vec_push(&mut todo, n0.c);
+  vec_push(&mut todo, n0.d);
+  vec_push(&mut todo, n0.x);
+  let mut steps = 0;
+  while !found && vec_len(todo) > 0 && steps <= 10000 {
+    let j = u_at(todo, vec_len(todo) - 1);
+    vec_pop(&mut todo);
+    steps = steps + 1;
+    if steps > 10000 {
+      found = true;
+    } else if j != 0 {
+      let n = node_at(p.nodes, j);
+      found = n.kind == k;
+      vec_push(&mut todo, n.a);
+      vec_push(&mut todo, n.b);
+      vec_push(&mut todo, n.c);
+      vec_push(&mut todo, n.d);
+      vec_push(&mut todo, n.x);
+      vec_push(&mut todo, n.next);
+    }
+  }
+  vec_free(todo);
+  return found;
 }
 
 fn x86_esegs(p: &Parser, i: u64) -> Vec[u64] {
@@ -3052,6 +3222,38 @@ fn x86_val_into(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, d: X
     }
   }
   let w = x86_ewords(&mut g, c, &mut m, p, i);
+  // stage1: an element of a vector, or a place, copied word by word into
+  // the frame (only the words the `let` it fills reads).
+  if !g.stage0 && w > 1 && d.k == XD_FRAME && k == E_CALL && x86_inst_of(g, &mut m, p, i) == 0 && name_is(p, ci, "vec_get") {
+    let a0 = cg_arg(p, ci, 0);
+    x86_scalar(&mut g, c, &mut m, p, cg_arg(p, ci, 1));
+    let l = x86_place_e(&mut g, c, m, p, a0);
+    x86_mov(&mut g, x86_lop(l, 2), x86_reg(XR_RCX));
+    x86_t(&mut g, "imul $");
+    x86_n(&mut g, wrap_mul(8, w));
+    x86_t(&mut g, ", %rax, %rax");
+    x86_e(&mut g);
+    x86_es(&mut g, "add %rax, %rcx");
+    x86_copy_words(&mut g, x86_mem_loc(XR_RCX, XB, 0), d, w);
+    return;
+  }
+  // stage1: a box's contents copied straight into the frame, then freed.
+  if !g.stage0 && w > 1 && d.k == XD_FRAME && k == E_CALL && x86_inst_of(g, &mut m, p, i) == 0 && name_is(p, ci, "unbox") {
+    x86_scalar(&mut g, c, &mut m, p, cg_arg(p, ci, 0));
+    x86_es(&mut g, "mov %rax, %rcx");
+    x86_es(&mut g, "mov %rax, %rdx");
+    x86_copy_words(&mut g, x86_mem_loc(XR_RCX, XB, 0), d, w);
+    x86_es(&mut g, "mov %rdx, %rdi");
+    x86_es(&mut g, "call bst_rt_free");
+    return;
+  }
+  if !g.stage0 && w > 1 && d.k == XD_FRAME && x86_is_place(p, ci) {
+    let l = x86_place_e(&mut g, c, m, p, ci);
+    if l.k == XL_MEM {
+      x86_copy_words(&mut g, l, d, w);
+      return;
+    }
+  }
   // A two-word result in %rax:%rdx is stored where it goes (stage1).
   if !g.stage0 && k == E_CALL && w == 2 && !(x86_inst_of(g, &mut m, p, i) == 0 && is_builtin_name(c, p, n.s, n.e)) {
     let inst = x86_inst_of(g, &mut m, p, i);
@@ -3075,6 +3277,23 @@ fn x86_val_into(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, d: X
     x86_scalar(&mut g, c, &mut m, p, i);
     let dop = x86_dst_op(&mut g, d);
     x86_mov(&mut g, x86_reg(XR_RAX), dop);
+  } else if !g.stage0 && w >= X86_REP_COPY {
+    // stage1: a big value is copied from the stack with `rep movsq`
+    // (word by word upward, as the pops below), not a pop and a move per
+    // word.
+    x86_push_val(&mut g, c, &mut m, p, i);
+    let dop = x86_dst_op(&mut g, d);
+    x86_t(&mut g, "lea ");
+    x86_o(&mut g, dop);
+    x86_t(&mut g, ", %rdi");
+    x86_e(&mut g);
+    x86_es(&mut g, "mov %rsp, %rsi");
+    x86_t(&mut g, "mov $");
+    x86_n(&mut g, w);
+    x86_t(&mut g, ", %ecx");
+    x86_e(&mut g);
+    x86_es(&mut g, "rep movsq");
+    x86_drop(&mut g, w);
   } else {
     x86_push_val(&mut g, c, &mut m, p, i);
     let mut j = 0;
@@ -3087,6 +3306,120 @@ fn x86_val_into(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, d: X
   }
 }
 
+/// Copies the `w` words at `l` (not based on %rax) to frame destination
+/// `d`, through %rax: the words `g.mmask` names when `d` is the `let` it
+/// was set for, else all. stage1 copies all of X86_REP_COPY words or more
+/// with `rep movsq`, overwriting %rcx, %rsi and %rdi.
+fn x86_copy_words(g: &mut X86, l: X86Loc, d: X86Dst, w: u64) {
+  let mut mask = 18446744073709551615;
+  if g.mmask != 0 && g.mk == d.k && g.ma == d.a && d.o == 0 {
+    mask = g.mmask;
+  }
+  let mut j = 0;
+  let mut b = 1;
+  let mut all = true;
+  while j < w && j < 64 {
+    if (mask & b) == 0 {
+      all = false;
+    }
+    b = wrap_mul(b, 2);
+    j = j + 1;
+  }
+  if !g.stage0 && all && w >= X86_REP_COPY && l.k == XL_MEM {
+    // stage1: every word, with `rep movsq` (the source address first: the
+    // destination's may need %rcx).
+    x86_t(&mut g, "lea ");
+    x86_o(&mut g, x86_lop(l, 0));
+    x86_t(&mut g, ", %rsi");
+    x86_e(&mut g);
+    let dop = x86_dst_op(&mut g, d);
+    x86_t(&mut g, "lea ");
+    x86_o(&mut g, dop);
+    x86_t(&mut g, ", %rdi");
+    x86_e(&mut g);
+    x86_rep_copy(&mut g, "", "", w);
+    return;
+  }
+  j = 0;
+  b = 1;
+  while j < w {
+    if j >= 64 || (mask & b) != 0 {
+      x86_mov(&mut g, x86_lop(l, j), x86_reg(XR_RAX));
+      x86_mov(&mut g, x86_reg(XR_RAX), x86_dst_op(&mut g, x86_dst_at(d, j)));
+    }
+    b = wrap_mul(b, 2);
+    j = j + 1;
+  }
+}
+
+/// The words of struct `t` that the statements from `head` on read of the
+/// variable spelled `s..e` (a bit each), when they read it only through
+/// fields; 0 when they use it whole or name it otherwise.
+fn x86_let_mask(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, head: u64, s: u64, e: u64, t: u64) -> u64 {
+  let mut mask = 0;
+  let mut ok = true;
+  let mut todo = vec_new[u64]();
+  if head != 0 {
+    vec_push(&mut todo, head);
+  }
+  let mut steps = 0;
+  while vec_len(todo) > 0 && ok && steps < 1000000 {
+    steps = steps + 1;
+    let i = u_at(todo, vec_len(todo) - 1);
+    vec_pop(&mut todo);
+    let n = node_at(p.nodes, i);
+    if n.next != 0 {
+      vec_push(&mut todo, n.next);
+    }
+    if (n.kind == E_VAR || n.kind == N_NAME) && same(p.src, n.s, n.e, s, e) {
+      ok = false;
+    } else if n.kind == E_FIELD && kind_of(p, n.a) == E_VAR && same_name_span(p, n.a, s, e) {
+      let fl = x86_field(&mut g, c, m, p, t, n.s, n.e);
+      let fw = x86_words(&mut g, c, m, p, fl.ty);
+      let mut j = fl.o;
+      while j < wrap_add(fl.o, fw) && ok {
+        if j >= 64 {
+          ok = false;
+        } else {
+          mask = mask | x86_wbit(j);
+        }
+        j = j + 1;
+      }
+    } else if n.kind >= E_INT && n.kind < D_STRUCT {
+      if n.a != 0 { vec_push(&mut todo, n.a); }
+      if n.b != 0 { vec_push(&mut todo, n.b); }
+      if n.c != 0 { vec_push(&mut todo, n.c); }
+      if n.d != 0 { vec_push(&mut todo, n.d); }
+      if n.x != 0 { vec_push(&mut todo, n.x); }
+    }
+  }
+  if vec_len(todo) > 0 {
+    ok = false;
+  }
+  vec_free(todo);
+  if !ok || mask == 0 {
+    return 0;
+  }
+  return mask;
+}
+
+/// Does node `a` spell `s..e`?
+fn same_name_span(p: &Parser, a: u64, s: u64, e: u64) -> bool {
+  let x = node_at(p.nodes, a);
+  return same(p.src, x.s, x.e, s, e);
+}
+
+/// 2 to the power `j` (j < 64).
+fn x86_wbit(j: u64) -> u64 {
+  let mut b = 1;
+  let mut k = 0;
+  while k < j && k < 64 {
+    b = wrap_mul(b, 2);
+    k = k + 1;
+  }
+  return b;
+}
+
 /// Pushes a call argument: the address for `&mut`, else the value.
 fn x86_arg(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, a: u64) {
   if kind_of(p, a) == E_MUTBORROW {
@@ -3095,6 +3428,64 @@ fn x86_arg(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, a: u64) {
     return;
   }
   x86_push_val(&mut g, c, &mut m, p, a);
+}
+
+/// Is a parameter of type `pt` given the address of its value rather than
+/// a copy (stage1 only)? A shared borrow of four words or more: the callee
+/// only reads it, and nothing can change it while it is lent.
+fn x86_byaddr(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, pt: u64) -> bool {
+  if g.stage0 || pt == 0 || kind_t(m, pt) != TY_REF {
+    return false;
+  }
+  return x86_words(&mut g, c, m, p, inner_t(m, pt)) >= 4;
+}
+
+/// The words a parameter of type `pt` takes among the arguments.
+fn x86_pwords(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, pt: u64) -> u64 {
+  if kind_t(m, pt) == TY_MUTREF || x86_byaddr(&mut g, c, m, p, pt) {
+    return 1;
+  }
+  return x86_words(&mut g, c, m, p, pt);
+}
+
+/// The words argument `a` for a parameter of type `pt` (0: unknown) takes.
+fn x86_argw(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, a: u64, pt: u64) -> u64 {
+  if kind_of(p, a) == E_MUTBORROW || x86_byaddr(&mut g, c, m, p, pt) {
+    return 1;
+  }
+  return x86_ewords(&mut g, c, &mut m, p, a);
+}
+
+/// Pushes argument `a` for a parameter of type `pt` (0: unknown): the
+/// address of its value when `x86_byaddr`, a place's own or a copy's in
+/// the frame.
+fn x86_arg_for(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, a: u64, pt: u64) {
+  if !x86_byaddr(&mut g, c, m, p, pt) {
+    x86_arg(&mut g, c, &mut m, p, a);
+    return;
+  }
+  let mut l = x86_mem_loc(0, 0, 0);
+  if x86_is_place(p, a) {
+    l = x86_place_e(&mut g, c, m, p, a);
+  }
+  if l.k != XL_MEM || l.b == 0 {
+    let o = x86_slot(&mut g, x86_ewords(&mut g, c, &mut m, p, a));
+    x86_val_into(&mut g, c, &mut m, p, a, x86_dst(XD_FRAME, o, 0));
+    l = x86_mem_loc(XR_RBP, o, 0);
+  }
+  x86_t(&mut g, "lea ");
+  x86_o(&mut g, x86_lop(l, 0));
+  x86_t(&mut g, ", %rax");
+  x86_e(&mut g);
+  x86_push(&mut g, x86_reg(XR_RAX));
+}
+
+/// The type of parameter `j` in `ps` (0 past the end).
+fn x86_pt_at(ps: &Vec[u64], j: u64) -> u64 {
+  if j < vec_len(ps) {
+    return u_at(ps, j);
+  }
+  return 0;
 }
 
 /// The assembler symbol of function instance `x` (stage0's `sym`), in the
@@ -3180,11 +3571,7 @@ fn x86_regargs(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> u6
   while q != 0 {
     let qn = node_at(p.nodes, q);
     let pt = conv(&mut m, p, qn.a, x, q);
-    if kind_t(m, pt) == TY_MUTREF {
-      n = wrap_add(n, 1);
-    } else {
-      n = wrap_add(n, x86_words(&mut g, c, m, p, pt));
-    }
+    n = wrap_add(n, x86_pwords(&mut g, c, m, p, pt));
     q = qn.next;
   }
   if n > 4 {
@@ -3240,15 +3627,17 @@ fn x86_call_to(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst:
   }
   let mut aw = 0;
   let mut a = n.a;
+  let xd = inst_at(m, x);
+  let ps = fn_params(&mut m, p, xd.def, x);
+  let mut q = 0;
   while a != 0 {
-    if kind_of(p, a) == E_MUTBORROW {
-      aw = wrap_add(aw, 1);
-    } else {
-      aw = wrap_add(aw, x86_ewords(&mut g, c, &mut m, p, a));
-    }
-    x86_arg(&mut g, c, &mut m, p, a);
+    let pt = x86_pt_at(ps, q);
+    aw = wrap_add(aw, x86_argw(&mut g, c, &mut m, p, a, pt));
+    x86_arg_for(&mut g, c, &mut m, p, a, pt);
     a = next_of(p, a);
+    q = wrap_add(q, 1);
   }
+  vec_free(ps);
   let na = x86_regargs(&mut g, c, &mut m, p, x);
   if na == aw {
     let mut j = 0;
@@ -3366,7 +3755,7 @@ fn x86_bind_params(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, i
     vec_push(&mut qs, q);
     vec_push(&mut sts, st);
     if st.k == 0 {
-      x86_arg(&mut g, c, &mut m, p, a);
+      x86_arg_for(&mut g, c, &mut m, p, a, pt);
     }
     q = qn.next;
     a = an.next;
@@ -3387,7 +3776,7 @@ fn x86_bind_params(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, i
       st = vec_get(sts, j);
     }
     if st.k == 0 {
-      if kind_t(m, pt) == TY_MUTREF {
+      if kind_t(m, pt) == TY_MUTREF || x86_byaddr(&mut g, c, m, p, pt) {
         let o = x86_slot(&mut g, 1);
         x86_pop_to(&mut g, x86_mem_loc(XR_RBP, o, 0), 1);
         st = x86_st(XS_PTR, o, 0, 0, 0);
@@ -3608,6 +3997,56 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_pop(&mut g, x86_reg(XR_RCX));
     x86_es(&mut g, "mov 8(%rsp), %rdx");
     x86_es(&mut g, "mov %rax, (%rdx,%rcx,8)");
+  } else if name_is(p, i, "bset") && !g.stage0 && kind_of(p, a0) == E_MUTBORROW {
+    // stage1: the value first, then the borrow (a place's address, which
+    // has no effects and needs no register but %rcx) and the index.
+    let simple = x86_simple(p, a1);
+    // An index `x + y` or `x - y` of simple operands is computed after the
+    // value, unless the value could change a variable it names (through a
+    // `&mut` borrow).
+    let ixn = node_at(p.nodes, a1);
+    let late = !simple && ixn.kind == E_BIN && (ixn.v == P_PLUS || ixn.v == P_MINUS) && x86_simple(p, ixn.a)
+      && x86_simple(p, ixn.b) && !x86_has_kind(p, a2, E_MUTBORROW);
+    if !simple && !late {
+      x86_scalar(&mut g, c, &mut m, p, a1);
+      x86_push(&mut g, x86_reg(XR_RAX));
+    }
+    x86_scalar(&mut g, c, &mut m, p, a2);
+    x86_es(&mut g, "mov %rax, %rdx");
+    if late {
+      let o1 = x86_operand(&mut g, c, m, p, ixn.a);
+      x86_mov(&mut g, o1, x86_reg(XR_RSI));
+      let o2 = x86_operand(&mut g, c, m, p, ixn.b);
+      if ixn.v == P_PLUS {
+        x86_t(&mut g, "add ");
+      } else {
+        x86_t(&mut g, "sub ");
+      }
+      x86_o(&mut g, o2);
+      x86_t(&mut g, ", %rsi");
+      x86_e(&mut g);
+    } else if !simple {
+      x86_pop(&mut g, x86_reg(XR_RSI));
+    }
+    let bn = node_at(p.nodes, a0);
+    let segs = x86_lsegs(p, bn.a);
+    let v = x86_var(&mut g, p, bn.a);
+    if (v.k == XS_PTR || v.k == XS_PREG) && vec_len(segs) == 1 {
+      x86_scalar(&mut g, c, &mut m, p, a0);
+      x86_es(&mut g, "mov 8(%rax), %rax");
+    } else {
+      let l = x86_place(&mut g, c, m, p, segs);
+      if l.k != XL_MEM {
+        x86_fail(&mut g, "internal: a borrowed variable is in memory");
+      }
+      x86_mov(&mut g, x86_lop(l, 1), x86_reg(XR_RAX));
+    }
+    vec_free(segs);
+    if simple {
+      let o = x86_operand(&mut g, c, m, p, a1);
+      x86_mov(&mut g, o, x86_reg(XR_RSI));
+    }
+    x86_es(&mut g, "mov %dl, (%rax,%rsi)");
   } else if name_is(p, i, "bset") {
     x86_arg(&mut g, c, &mut m, p, a0);
     x86_scalar(&mut g, c, &mut m, p, a1);
@@ -3994,6 +4433,10 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
       x86_place_label(&mut g, l);
       x86_elem_addr(&mut g, w);
       x86_pop_to(&mut g, x86_mem_loc(XR_RCX, XB, 0), w);
+      if !g.stage0 && w >= X86_REP_COPY {
+        // `rep movsq` used %rdi: the vector is on top again.
+        x86_es(&mut g, "mov (%rsp), %rdi");
+      }
       x86_es(&mut g, "incq (%rdi)");
       x86_drop(&mut g, 1);
     }
@@ -4006,6 +4449,10 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_es(&mut g, "mov (%rdi), %rax");
     x86_elem_addr(&mut g, w);
     x86_pop_to(&mut g, x86_mem_loc(XR_RCX, XB, 0), w);
+    if !g.stage0 && w >= X86_REP_COPY {
+      // `rep movsq` used %rdi: the vector is on top again.
+      x86_es(&mut g, "mov (%rsp), %rdi");
+    }
     x86_es(&mut g, "incq (%rdi)");
     x86_drop(&mut g, 1);
   } else if name_is(p, i, "vec_try_reserve") {
@@ -4072,6 +4519,24 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     if name_is(p, i, "vec_set") {
       x86_pop_to(&mut g, x86_mem_loc(XR_RCX, XB, 0), w);
       x86_drop(&mut g, 2);
+    } else if !g.stage0 && w >= X86_REP_COPY {
+      // stage1: the old value copied below the new one, the new one into
+      // the vector, the old one over the new one, vector and index; each
+      // with `rep movsq` (no copy overlaps its source).
+      x86_es(&mut g, "mov %rcx, %rdx");
+      x86_reserve(&mut g, w);
+      x86_rep_copy(&mut g, "mov %rdx, %rsi", "mov %rsp, %rdi", w);
+      x86_t(&mut g, "lea ");
+      x86_n(&mut g, wrap_mul(8, w));
+      x86_t(&mut g, "(%rsp), %rsi");
+      x86_e(&mut g);
+      x86_rep_copy(&mut g, "", "mov %rdx, %rdi", w);
+      x86_t(&mut g, "lea ");
+      x86_n(&mut g, wrap_mul(8, wrap_add(w, 2)));
+      x86_t(&mut g, "(%rsp), %rdi");
+      x86_e(&mut g);
+      x86_rep_copy(&mut g, "mov %rsp, %rsi", "", w);
+      x86_drop(&mut g, wrap_add(w, 2));
     } else {
       // Exchange the new value on the stack with the old one, then slide
       // it over the vector and index.
@@ -4144,15 +4609,17 @@ fn x86_locked(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
   x86_push(&mut g, x86_reg(XR_RAX));       // the first argument: the value
   let mut aw = 1;
   let mut a = cg_arg(p, i, 2);
+  let xd = inst_at(m, x);
+  let ps = fn_params(&mut m, p, xd.def, x);
+  let mut q = 1;
   while a != 0 {
-    if kind_of(p, a) == E_MUTBORROW {
-      aw = wrap_add(aw, 1);
-    } else {
-      aw = wrap_add(aw, x86_ewords(&mut g, c, &mut m, p, a));
-    }
-    x86_arg(&mut g, c, &mut m, p, a);
+    let pt = x86_pt_at(ps, q);
+    aw = wrap_add(aw, x86_argw(&mut g, c, &mut m, p, a, pt));
+    x86_arg_for(&mut g, c, &mut m, p, a, pt);
     a = next_of(p, a);
+    q = wrap_add(q, 1);
   }
+  vec_free(ps);
   let spin = x86_label(&mut g);
   let got = x86_label(&mut g);
   x86_es_off(&mut g, "mov ", wrap_sub(aw, 1), "(%rsp), %rdi");
@@ -4224,15 +4691,17 @@ fn x86_pt_borrow(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
   x86_push(&mut g, x86_reg(XR_RAX));       // the first argument: its address
   let mut aw = 1;
   let mut a = cg_arg(p, i, 3);
+  let xd = inst_at(m, x);
+  let ps = fn_params(&mut m, p, xd.def, x);
+  let mut q = 1;
   while a != 0 {
-    if kind_of(p, a) == E_MUTBORROW {
-      aw = wrap_add(aw, 1);
-    } else {
-      aw = wrap_add(aw, x86_ewords(&mut g, c, &mut m, p, a));
-    }
-    x86_arg(&mut g, c, &mut m, p, a);
+    let pt = x86_pt_at(ps, q);
+    aw = wrap_add(aw, x86_argw(&mut g, c, &mut m, p, a, pt));
+    x86_arg_for(&mut g, c, &mut m, p, a, pt);
     a = next_of(p, a);
+    q = wrap_add(q, 1);
   }
+  vec_free(ps);
   let na = x86_regargs(&mut g, c, &mut m, p, x);
   if na == aw {
     let mut j = 0;
@@ -4304,6 +4773,13 @@ fn x86_smp_run(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     let w = u_at(ws, j);
     if kind_t(m, u_at(ps, j)) == TY_MUTREF {
       cg_s(&mut g.smp, "\tlea -16(%rbp), %rax\n\tpush %rax\n");
+      words = wrap_add(words, 1);
+    } else if x86_byaddr(&mut g, c, m, p, u_at(ps, j)) {
+      // The callee gets the address of the copy in the block.
+      off = wrap_sub(off, w);
+      cg_s(&mut g.smp, "\tlea ");
+      x86_num(&mut g.smp, wrap_mul(8, off));
+      cg_s(&mut g.smp, "(%rbx), %rax\n\tpush %rax\n");
       words = wrap_add(words, 1);
     } else {
       off = wrap_sub(off, w);
@@ -4846,7 +5322,18 @@ fn x86_stmt(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
         return;
       }
       let o = x86_slot(&mut g, w);
+      // stage1: a struct read only through some fields gets only those.
+      let mut mask = 0;
+      if !g.stage0 && n.v != 1 && w >= 4 && kind_t(m, t) == TY_STRUCT {
+        mask = x86_let_mask(&mut g, c, m, p, n.next, n.s, n.e, t);
+      }
+      if mask != 0 {
+        g.mk = XD_FRAME;
+        g.ma = o;
+        g.mmask = mask;
+      }
       x86_val_into(&mut g, c, &mut m, p, n.b, x86_dst(XD_FRAME, o, 0));
+      g.mmask = 0;
       x86_bindv(&mut g, id, x86_st(XS_SLOT, o, 0, 0, 0), t);
       return;
     }
@@ -5487,6 +5974,232 @@ fn x86_acc_dead(code: &Vec[u64], s: u64, e: u64) -> bool {
   return false;
 }
 
+/// Is line `i`, `jmp L`, followed by labels and alignment only up to
+/// `L:`?
+fn x86_jumps_next(code: &Vec[u64], starts: &Vec[u64], i: u64) -> bool {
+  let nl = vec_len(starts);
+  let s = u_at(starts, i);
+  let e = x86_line_end(code, s);
+  let t = wrap_add(s, 5);
+  let mut j = wrap_add(i, 1);
+  while j < nl && wrap_sub(j, i) < 16 {
+    let ls = u_at(starts, j);
+    let le = x86_line_end(code, ls);
+    if x86_has_prefix(code, ls, "\t.p2align") {
+      j = j + 1;
+    } else if u_at(code, ls) == 46 && le > ls && u_at(code, wrap_sub(le, 1)) == 58 {
+      if x86_same_text(code, ls, wrap_sub(le, 1), t, e) {
+        return true;
+      }
+      j = j + 1;
+    } else {
+      return false;
+    }
+  }
+  return false;
+}
+
+/// The frame word that byte offset `-n(%rbp)` falls in (word q spans
+/// -8q .. -8q+7).
+fn x86_frame_word(n: u64) -> u64 {
+  return wrap_add(n, 7) / 8;
+}
+
+/// Where the number of a `-N(%rbp)` operand starting at `i` (its `-`)
+/// ends, or 0 when there is none at `i`.
+fn x86_rbp_neg(code: &Vec[u64], i: u64) -> u64 {
+  let n = vec_len(code);
+  if i >= n || u_at(code, i) != 45 {
+    return 0;
+  }
+  let mut j = wrap_add(i, 1);
+  while j < n && u_at(code, j) >= 48 && u_at(code, j) <= 57
+    invariant j <= n
+  {
+    j = j + 1;
+  }
+  if j == wrap_add(i, 1) || !x86_has_prefix(code, j, "(%rbp)") {
+    return 0;
+  }
+  return j;
+}
+
+/// The value of the decimal digits from `s` to `e`.
+fn x86_digits(code: &Vec[u64], s: u64, e: u64) -> u64 {
+  let mut v = 0;
+  let mut k = s;
+  while k < e {
+    v = wrap_add(wrap_mul(v, 10), wrap_sub(u_at(code, k), 48));
+    k = k + 1;
+  }
+  return v;
+}
+
+/// Sets `v[i]` to `x`, if there is such an element.
+fn x86_put(v: &mut Vec[u64], i: u64, x: u64) {
+  if i < vec_len(v) {
+    vec_set(&mut v, i, x);
+  }
+}
+
+/// Copies function text `code` to `out`, with its frame laid out anew:
+/// the slots (`slots`, see X86) used most per word come first, next to
+/// %rbp, as long as they fit in the 16 words a one-byte displacement
+/// reaches; the others follow in their order. Words in no slot (the saved
+/// registers) are slots of one word. Every `-N(%rbp)` moves with its slot.
+fn x86_frame_remap(code: &Vec[u64], slots: &Vec[u64], words: u64, out: &mut Vec[u64]) {
+  if words > 1048576 {
+    x86_append(&mut out, code);
+    return;
+  }
+  // The first word of each word's slot (words count from 1).
+  let mut first = vec_new[u64]();
+  let mut q = 0;
+  while q <= words {
+    vec_push(&mut first, q);
+    q = wrap_add(q, 1);
+  }
+  let mut k = 0;
+  while wrap_add(k, 1) < vec_len(slots) && k < vec_len(slots) {
+    let a = u_at(slots, k);
+    let n = u_at(slots, wrap_add(k, 1));
+    let mut j = 1;
+    while j <= n && wrap_add(a, j) < vec_len(first)
+      invariant j <= n + 1
+    {
+      x86_put(&mut first, wrap_add(a, j), wrap_add(a, 1));
+      j = wrap_add(j, 1);
+    }
+    k = wrap_add(k, 2);
+  }
+  // Uses per slot, counted at its first word.
+  let mut uses = vec_new[u64]();
+  q = 0;
+  while q <= words {
+    vec_push(&mut uses, 0);
+    q = wrap_add(q, 1);
+  }
+  let nc = vec_len(code);
+  let mut i = 0;
+  while i < nc {
+    let j = x86_rbp_neg(code, i);
+    if j > i {
+      let w = x86_frame_word(x86_digits(code, wrap_add(i, 1), j));
+      if w >= 1 && w <= words && w < vec_len(uses) {
+        let f = u_at(first, w);
+        if f < vec_len(uses) {
+          x86_put(&mut uses, f, wrap_add(u_at(uses, f), 1));
+        }
+      }
+      i = j;
+    } else {
+      i = wrap_add(i, 1);
+    }
+  }
+  // The slots that move next to %rbp: the most uses per word first.
+  let mut start = vec_new[u64]();
+  q = 0;
+  while q <= words {
+    vec_push(&mut start, 0);
+    q = wrap_add(q, 1);
+  }
+  let mut near = vec_new[u64]();
+  let mut room = 16;
+  let mut steps = 0;
+  while room > 0 && steps < 16 {
+    steps = steps + 1;
+    let mut best = 0;
+    let mut bu = 0;
+    let mut bs = 1;
+    q = 1;
+    while q <= words && q < vec_len(uses) {
+      if u_at(first, q) == q && u_at(uses, q) > 0 && !has_id(near, q) {
+        let mut e = q;
+        while wrap_add(e, 1) <= words && u_at(first, wrap_add(e, 1)) == q && e < words {
+          e = wrap_add(e, 1);
+        }
+        let sz = wrap_add(wrap_sub(e, q), 1);
+        // uses / sz > bu / bs
+        if sz <= room && wrap_mul(u_at(uses, q), bs) > wrap_mul(bu, sz) {
+          best = q;
+          bu = u_at(uses, q);
+          bs = sz;
+        }
+        q = wrap_add(e, 1);
+      } else {
+        q = wrap_add(q, 1);
+      }
+    }
+    if best == 0 {
+      room = 0;
+    } else {
+      vec_push(&mut near, best);
+      room = wrap_sub(room, bs);
+    }
+  }
+  // New first words: the near slots, then the rest in order.
+  let mut next = 1;
+  k = 0;
+  while k < vec_len(near) {
+    let f = u_at(near, k);
+    x86_put(&mut start, f, next);
+    let mut e = f;
+    while wrap_add(e, 1) <= words && u_at(first, wrap_add(e, 1)) == f && e < words {
+      e = wrap_add(e, 1);
+    }
+    next = wrap_add(next, wrap_add(wrap_sub(e, f), 1));
+    k = wrap_add(k, 1);
+  }
+  q = 1;
+  while q <= words && q < vec_len(first) {
+    if u_at(first, q) == q && !has_id(near, q) {
+      x86_put(&mut start, q, next);
+      let mut e = q;
+      while wrap_add(e, 1) <= words && u_at(first, wrap_add(e, 1)) == q && e < words {
+        e = wrap_add(e, 1);
+      }
+      next = wrap_add(next, wrap_add(wrap_sub(e, q), 1));
+      q = wrap_add(e, 1);
+    } else {
+      q = wrap_add(q, 1);
+    }
+  }
+  // The text, each `-N(%rbp)` at the same place in its slot's new home.
+  i = 0;
+  while i < nc {
+    let j = x86_rbp_neg(code, i);
+    if j > i {
+      let n = x86_digits(code, wrap_add(i, 1), j);
+      let w = x86_frame_word(n);
+      let mut n2 = n;
+      if w >= 1 && w <= words {
+        let f = u_at(first, w);
+        let w2 = wrap_add(u_at(start, f), wrap_sub(w, f));
+        n2 = wrap_sub(wrap_mul(8, w2), wrap_sub(wrap_mul(8, w), n));
+      }
+      vec_push(&mut out, 45);
+      x86_num(&mut out, n2);
+      i = j;
+    } else {
+      vec_push(&mut out, u_at(code, i));
+      i = wrap_add(i, 1);
+    }
+  }
+  vec_free(near);
+  vec_free(uses);
+  vec_free(start);
+  vec_free(first);
+}
+
+/// Is the line at `s` an instruction (not a label or a directive)?
+fn x86_is_insn(code: &Vec[u64], s: u64) -> bool {
+  if s >= vec_len(code) || wrap_add(s, 1) >= vec_len(code) || u_at(code, s) != 9 {
+    return false;
+  }
+  let c = u_at(code, wrap_add(s, 1));
+  return c >= 97 && c <= 122;
+}
+
 /// Does the text from `s` to `e` address memory?
 fn x86_is_mem(code: &Vec[u64], s: u64, e: u64) -> bool {
   let mut k = s;
@@ -5499,11 +6212,14 @@ fn x86_is_mem(code: &Vec[u64], s: u64, e: u64) -> bool {
   return false;
 }
 
-/// The accumulator pass: `mov A, %rax` `mov %rax, B` before a line that
-/// sets %rax without reading it is `mov A, B` (unless that would move
-/// memory to memory or a constant to memory).
+/// The accumulator pass: `mov A, %rax` `mov %rax, B` with %rax dead after
+/// (`x86_rax_free`) is `mov A, B` (unless that would move memory to memory
+/// or a constant to memory); a frame slot loaded right after it is stored
+/// is not loaded; and the rules `x86_peep_spill`, `x86_peep_fold`,
+/// `x86_peep_copy` and `x86_peep_chain`.
 fn x86_peep_acc(code: &Vec[u64], out: &mut Vec[u64]) {
   let starts = x86_line_starts(code);
+  let labs = x86_label_index(code, starts);
   let nl = vec_len(starts);
   let mut i = 0;
   while i < nl
@@ -5515,13 +6231,11 @@ fn x86_peep_acc(code: &Vec[u64], out: &mut Vec[u64]) {
     if i + 2 < nl && x86_has_prefix(code, s, "\tmov ") && x86_has_prefix(code, u_at(starts, i + 1), "\tmov %rax, ") {
       let s2 = u_at(starts, i + 1);
       let e2 = x86_line_end(code, s2);
-      let s3 = u_at(starts, i + 2);
-      let e3 = x86_line_end(code, s3);
       let d1 = x86_last_op(code, s, e);
       let a = wrap_add(s, 5);
       let ae = wrap_sub(d1, 2);
       let b = wrap_add(s2, 11);
-      if d1 != e && d1 > a && x86_txt(code, d1, e, "%rax") && x86_acc_dead(code, s3, e3)
+      if d1 != e && d1 > a && x86_txt(code, d1, e, "%rax") && x86_rax_free(code, starts, labs, i + 2)
         && !x86_has_rsp(code, s, e) && !x86_has_rsp(code, s2, e2) && (x86_fams(code, b, e2) & 2) == 0
         && !(x86_is_mem(code, b, e2) && (x86_is_mem(code, a, ae) || u_at(code, a) == 36)) {
         cg_s(&mut out, "\tmov ");
@@ -5533,8 +6247,61 @@ fn x86_peep_acc(code: &Vec[u64], out: &mut Vec[u64]) {
         done = true;
       }
     }
+    // A jump to a label among the labels right after it.
+    if !done && x86_has_prefix(code, s, "\tjmp .L") && x86_jumps_next(code, starts, i) {
+      i = i + 1;
+      done = true;
+    }
+    // Instructions after a jump, up to the next label, never run.
+    if !done && x86_has_prefix(code, s, "\tjmp ") {
+      x86_copy_text(code, s, e, &mut out);
+      cg_s(&mut out, "\n");
+      i = i + 1;
+      while i < nl && x86_is_insn(code, u_at(starts, i))
+        invariant i <= nl
+      {
+        i = i + 1;
+      }
+      done = true;
+    }
+    // `mov %rax, X` `mov X, %rax`, X a frame slot: the load is the value
+    // just stored.
+    if !done && i + 1 < nl && x86_has_prefix(code, s, "\tmov %rax, ") && x86_has_prefix(code, u_at(starts, i + 1), "\tmov ") {
+      let s2 = u_at(starts, i + 1);
+      let e2 = x86_line_end(code, s2);
+      let d2 = x86_last_op(code, s2, e2);
+      let x = wrap_add(s, 11);
+      if d2 != e2 && x86_txt(code, d2, e2, "%rax") && x86_same_text(code, x, e, wrap_add(s2, 5), wrap_sub(d2, 2))
+        && wrap_sub(e, x) > 6 && x86_has_prefix(code, wrap_sub(e, 6), "(%rbp)") {
+        x86_copy_text(code, s, e, &mut out);
+        cg_s(&mut out, "\n");
+        i = i + 2;
+        done = true;
+      }
+    }
     if !done {
-      let nx = x86_peep_chain(code, starts, i, &mut out);
+      let nx = x86_peep_spill(code, starts, i, &mut out);
+      if nx > i && nx <= nl {
+        i = nx;
+        done = true;
+      }
+    }
+    if !done {
+      let nx = x86_peep_fold(code, starts, labs, i, &mut out);
+      if nx > i && nx <= nl {
+        i = nx;
+        done = true;
+      }
+    }
+    if !done {
+      let nx = x86_peep_copy(code, starts, i, &mut out);
+      if nx > i && nx <= nl {
+        i = nx;
+        done = true;
+      }
+    }
+    if !done {
+      let nx = x86_peep_chain(code, starts, labs, i, &mut out);
       if nx > i && nx <= nl {
         i = nx;
         done = true;
@@ -5547,6 +6314,85 @@ fn x86_peep_acc(code: &Vec[u64], out: &mut Vec[u64]) {
     }
   }
   vec_free(starts);
+  vec_free(labs);
+}
+
+/// Does the text from `s` to `e` name a register of a family in `bad`
+/// (a bit per family, as `x86_fams`), or %rsp?
+fn x86_names_any(code: &Vec[u64], s: u64, e: u64, bad: u64) -> bool {
+  return (x86_fams(code, s, e) & (bad | 256)) != 0;
+}
+
+/// A copy through the stack: `push` of words at %rcx, maybe word 0 moved
+/// through %rax, then as many `pop %rax` each stored somewhere that does not
+/// name %rax, %rcx or %rsp. The same as word by word moves through %rax:
+/// the stores cannot overlap the words read (a value never overlaps part of
+/// itself) and nothing changes %rcx. Returns the line after it, or 0.
+fn x86_peep_copy(code: &Vec[u64], starts: &Vec[u64], i: u64, out: &mut Vec[u64]) -> u64 {
+  let nl = vec_len(starts);
+  let mut k = 0;
+  let mut j = i;
+  while j < nl && k < 64 && x86_has_prefix(code, u_at(starts, j), "\tpush ") {
+    let s = u_at(starts, j);
+    let e = x86_line_end(code, s);
+    let a = wrap_add(s, 6);
+    if !x86_is_mem(code, a, e) || x86_fams(code, a, e) != 4 {
+      return 0;
+    }
+    k = k + 1;
+    j = j + 1;
+  }
+  if k == 0 {
+    return 0;
+  }
+  // Word 0, moved through %rax.
+  let mut mid = 0;
+  if wrap_add(j, 1) < nl && x86_has_prefix(code, u_at(starts, j), "\tmov ") && x86_has_prefix(code, u_at(starts, wrap_add(j, 1)), "\tmov %rax, ") {
+    let s = u_at(starts, j);
+    let e = x86_line_end(code, s);
+    let d1 = x86_last_op(code, s, e);
+    let s2 = u_at(starts, wrap_add(j, 1));
+    let e2 = x86_line_end(code, s2);
+    if d1 != e && d1 > wrap_add(s, 7) && x86_txt(code, d1, e, "%rax") && (x86_fams(code, wrap_add(s, 5), wrap_sub(d1, 2)) & 0x1FFFB) == 0
+      && !x86_names_any(code, wrap_add(s2, 11), e2, 6) {
+      mid = 2;
+    }
+  }
+  let p0 = wrap_add(j, mid);
+  let mut q = 0;
+  while q < k {
+    let ps = wrap_add(p0, wrap_mul(2, q));
+    if wrap_add(ps, 1) >= nl {
+      return 0;
+    }
+    let s = u_at(starts, ps);
+    let s2 = u_at(starts, wrap_add(ps, 1));
+    let e2 = x86_line_end(code, s2);
+    if !x86_txt(code, s, x86_line_end(code, s), "\tpop %rax") || !x86_has_prefix(code, s2, "\tmov %rax, ")
+      || x86_names_any(code, wrap_add(s2, 11), e2, 6) {
+      return 0;
+    }
+    q = q + 1;
+  }
+  q = j;
+  while q < p0 {
+    let s = u_at(starts, q);
+    x86_copy_text(code, s, x86_line_end(code, s), &mut out);
+    cg_s(&mut out, "\n");
+    q = q + 1;
+  }
+  q = 0;
+  while q < k {
+    let src = u_at(starts, wrap_sub(wrap_add(i, k), wrap_add(q, 1)));
+    cg_s(&mut out, "\tmov ");
+    x86_copy_text(code, wrap_add(src, 6), x86_line_end(code, src), &mut out);
+    cg_s(&mut out, ", %rax\n");
+    let s2 = u_at(starts, wrap_add(wrap_add(p0, wrap_mul(2, q)), 1));
+    x86_copy_text(code, s2, x86_line_end(code, s2), &mut out);
+    cg_s(&mut out, "\n");
+    q = q + 1;
+  }
+  return wrap_add(p0, wrap_mul(2, k));
 }
 
 /// Does every register the line from `s` to `e` names in %rax's family
@@ -5598,10 +6444,9 @@ fn x86_is_r64(code: &Vec[u64], s: u64, e: u64) -> bool {
 }
 
 /// `mov A, %rax`, arithmetic into %rax that does not name B, `mov %rax, B`
-/// (B a register), before a line that sets %rax without reading it or a
-/// call of a Bastio function (which reads no %rax): the same computed in
-/// B. Returns the line after the move, or 0.
-fn x86_peep_chain(code: &Vec[u64], starts: &Vec[u64], i: u64, out: &mut Vec[u64]) -> u64 {
+/// (B a register), with %rax dead after (`x86_rax_free`): the same
+/// computed in B. Returns the line after the move, or 0.
+fn x86_peep_chain(code: &Vec[u64], starts: &Vec[u64], labs: &Vec[u64], i: u64, out: &mut Vec[u64]) -> u64 {
   let nl = vec_len(starts);
   let s = u_at(starts, i);
   let e = x86_line_end(code, s);
@@ -5637,9 +6482,7 @@ fn x86_peep_chain(code: &Vec[u64], starts: &Vec[u64], i: u64, out: &mut Vec[u64]
     }
     k = k + 1;
   }
-  let ns = u_at(starts, wrap_add(j, 1));
-  let ne = x86_line_end(code, ns);
-  if !x86_acc_dead(code, ns, ne) && !x86_has_prefix(code, ns, "\tcall f_") {
+  if !x86_rax_free(code, starts, labs, wrap_add(j, 1)) {
     return 0;
   }
   cg_s(&mut out, "\tmov ");
@@ -5665,6 +6508,328 @@ fn x86_peep_chain(code: &Vec[u64], starts: &Vec[u64], i: u64, out: &mut Vec[u64]
     k = k + 1;
   }
   return wrap_add(j, 1);
+}
+
+/// Does the line at `s` (to `e`) read no register it does not name and
+/// write no register but its last operand: an instruction with explicit
+/// operands only (not `div`, `cqo`, `rep`, `ret`, `call`, one-operand
+/// `imul`, ..)?
+fn x86_explicit_op(code: &Vec[u64], s: u64, e: u64) -> bool {
+  if x86_has_prefix(code, s, "\tmov") || x86_has_prefix(code, s, "\tlea ") || x86_has_prefix(code, s, "\tadd")
+    || x86_has_prefix(code, s, "\tsub") || x86_has_prefix(code, s, "\tand") || x86_has_prefix(code, s, "\tor")
+    || x86_has_prefix(code, s, "\txor") || x86_has_prefix(code, s, "\tshl") || x86_has_prefix(code, s, "\tshr")
+    || x86_has_prefix(code, s, "\tsar") || x86_has_prefix(code, s, "\tcmp") || x86_has_prefix(code, s, "\ttest")
+    || x86_has_prefix(code, s, "\tinc") || x86_has_prefix(code, s, "\tdec") || x86_has_prefix(code, s, "\tneg")
+    || x86_has_prefix(code, s, "\tnot") || x86_has_prefix(code, s, "\tset") || x86_has_prefix(code, s, "\tpush ")
+    || x86_has_prefix(code, s, "\tpop ") {
+    return !x86_has_prefix(code, s, "\tmovs") || x86_has_prefix(code, s, "\tmovsbq ") || x86_has_prefix(code, s, "\tmovswq ")
+      || x86_has_prefix(code, s, "\tmovslq ");
+  }
+  return x86_has_prefix(code, s, "\timul") && x86_last_op(code, s, e) != e;
+}
+
+/// The number of the `.L` label from `s` to `e` (which may end in `:`),
+/// or 2^64 - 1.
+fn x86_label_num(code: &Vec[u64], s: u64, e: u64) -> u64 {
+  if !x86_has_prefix(code, s, ".L") {
+    return 18446744073709551615;
+  }
+  let mut k = wrap_add(s, 2);
+  let mut v = 0;
+  let mut nd = 0;
+  while k < e && nd < 18 && u_at(code, k) >= 48 && u_at(code, k) <= 57 {
+    v = wrap_add(wrap_mul(v, 10), wrap_sub(u_at(code, k), 48));
+    nd = nd + 1;
+    k = k + 1;
+  }
+  if nd == 0 || !(k == e || (u_at(code, k) == 58 && wrap_add(k, 1) == e)) {
+    return 18446744073709551615;
+  }
+  return v;
+}
+
+/// Where the `.L` labels of a function are: the lowest label number, then
+/// for each number from it the line of that label (or the number of
+/// lines). Empty when there is no label.
+fn x86_label_index(code: &Vec[u64], starts: &Vec[u64]) -> Vec[u64] {
+  let nl = vec_len(starts);
+  let none = 18446744073709551615;
+  let mut lo = none;
+  let mut hi = 0;
+  let mut j = 0;
+  while j < nl {
+    let s = u_at(starts, j);
+    let v = x86_label_num(code, s, x86_line_end(code, s));
+    if v != none && u_at(code, wrap_sub(x86_line_end(code, s), 1)) == 58 {
+      if v < lo {
+        lo = v;
+      }
+      if v > hi {
+        hi = v;
+      }
+    }
+    j = j + 1;
+  }
+  let mut ix = vec_new[u64]();
+  if lo == none || wrap_sub(hi, lo) > 4194304 {
+    return ix;
+  }
+  vec_push(&mut ix, lo);
+  let mut k = lo;
+  while k <= hi && vec_len(ix) <= 4194305 {
+    vec_push(&mut ix, nl);
+    k = wrap_add(k, 1);
+  }
+  j = 0;
+  while j < nl {
+    let s = u_at(starts, j);
+    let v = x86_label_num(code, s, x86_line_end(code, s));
+    if v != none && v >= lo && u_at(code, wrap_sub(x86_line_end(code, s), 1)) == 58 && wrap_add(wrap_sub(v, lo), 1) < vec_len(ix) {
+      vec_set(&mut ix, wrap_add(wrap_sub(v, lo), 1), j);
+    }
+    j = j + 1;
+  }
+  return ix;
+}
+
+/// The line of the jump target from `s` to `e` (a `.L` label), or the
+/// number of lines.
+fn x86_label_line(starts: &Vec[u64], labs: &Vec[u64], code: &Vec[u64], s: u64, e: u64) -> u64 {
+  let nl = vec_len(starts);
+  let v = x86_label_num(code, s, e);
+  if vec_len(labs) == 0 || v < u_at(labs, 0) {
+    return nl;
+  }
+  let k = wrap_add(wrap_sub(v, u_at(labs, 0)), 1);
+  if k >= vec_len(labs) || u_at(labs, k) > nl {
+    return nl;
+  }
+  return u_at(labs, k);
+}
+
+/// Is %rax dead at line `j0`: on every path from it (following jumps to
+/// `.L` labels) something sets %rax before anything could read it? A
+/// call of a Bastio function reads no %rax and sets it. Any line it
+/// cannot follow (a return, another call, an instruction with implicit
+/// operands, too long a walk) counts as a read.
+fn x86_rax_free(code: &Vec[u64], starts: &Vec[u64], labs: &Vec[u64], j0: u64) -> bool {
+  let nl = vec_len(starts);
+  let mut work = vec_new[u64]();
+  let mut seen = vec_new[u64]();
+  vec_push(&mut work, j0);
+  let mut steps = 0;
+  let mut ok = true;
+  while ok && vec_len(work) > 0 {
+    let mut j = u_at(work, vec_len(work) - 1);
+    vec_pop(&mut work);
+    let mut go = true;
+    while ok && go {
+      steps = wrap_add(steps, 1);
+      if j >= nl || steps > 96 {
+        ok = false;
+      } else {
+        let s = u_at(starts, j);
+        let e = x86_line_end(code, s);
+        if u_at(code, s) != 9 || x86_has_prefix(code, s, "\t.") {
+          // A label or a directive.
+          j = j + 1;
+        } else if x86_acc_dead(code, s, e) || (x86_has_prefix(code, s, "\tcall f_") && (x86_fams(code, s, e) & 2) == 0) {
+          go = false;
+        } else if x86_has_prefix(code, s, "\tj") {
+          let mut t = wrap_add(s, 2);
+          while t < e && u_at(code, t) != 32 {
+            t = t + 1;
+          }
+          t = wrap_add(t, 1);
+          let lj = x86_label_line(starts, labs, code, t, e);
+          if lj >= nl {
+            ok = false;
+          } else {
+            if !has_id(seen, lj) {
+              vec_push(&mut seen, lj);
+              vec_push(&mut work, lj);
+            }
+            if x86_has_prefix(code, s, "\tjmp ") {
+              go = false;
+            } else {
+              j = j + 1;
+            }
+          }
+        } else if !x86_explicit_op(code, s, e) || (x86_fams(code, s, e) & 2) != 0 {
+          ok = false;
+        } else {
+          j = j + 1;
+        }
+      }
+    }
+  }
+  vec_free(work);
+  vec_free(seen);
+  return ok;
+}
+
+/// `mov A, %rax` then `OP %rax, R` (OP add, sub, and, or, xor, imul or
+/// cmp; R a 64-bit register) or `cmp R, %rax` or `test %rax, %rax`, with
+/// %rax dead after: the same without %rax, `OP A, R`, `cmp R, A`,
+/// `test A, A` or `cmpq $0, A`. A is a register or memory not naming
+/// %rsp. Returns the line after the pair, or 0.
+fn x86_peep_fold(code: &Vec[u64], starts: &Vec[u64], labs: &Vec[u64], i: u64, out: &mut Vec[u64]) -> u64 {
+  let nl = vec_len(starts);
+  if wrap_add(i, 2) >= nl {
+    return 0;
+  }
+  let s = u_at(starts, i);
+  let e = x86_line_end(code, s);
+  if !x86_has_prefix(code, s, "\tmov ") || x86_has_rsp(code, s, e) {
+    return 0;
+  }
+  let d1 = x86_last_op(code, s, e);
+  let a = wrap_add(s, 5);
+  let ae = wrap_sub(d1, 2);
+  if d1 == e || d1 <= wrap_add(a, 2) || !x86_txt(code, d1, e, "%rax") || u_at(code, a) == 36 || (x86_fams(code, a, ae) & 2) != 0 {
+    return 0;
+  }
+  let areg = u_at(code, a) == 37;
+  if areg && !x86_is_r64(code, a, ae) {
+    return 0;
+  }
+  let s2 = u_at(starts, wrap_add(i, 1));
+  let e2 = x86_line_end(code, s2);
+  let mut kind = 0;
+  let mut ol = 0;
+  if x86_has_prefix(code, s2, "\tadd %rax, ") || x86_has_prefix(code, s2, "\tsub %rax, ") || x86_has_prefix(code, s2, "\tand %rax, ")
+    || x86_has_prefix(code, s2, "\txor %rax, ") || x86_has_prefix(code, s2, "\tcmp %rax, ") {
+    kind = 1;
+    ol = 4;
+  } else if x86_has_prefix(code, s2, "\tor %rax, ") {
+    kind = 1;
+    ol = 3;
+  } else if x86_has_prefix(code, s2, "\timul %rax, ") {
+    kind = 1;
+    ol = 5;
+  } else if x86_has_prefix(code, s2, "\tcmp %") && x86_txt(code, x86_last_op(code, s2, e2), e2, "%rax") {
+    kind = 2;
+  } else if x86_txt(code, s2, e2, "\ttest %rax, %rax") {
+    kind = 3;
+  }
+  if kind == 0 {
+    return 0;
+  }
+  let r = x86_last_op(code, s2, e2);
+  let mut rs = r;
+  let mut re = e2;
+  if kind == 1 {
+    rs = wrap_add(s2, wrap_add(ol, 7));
+    if rs != r {
+      return 0;
+    }
+  } else if kind == 2 {
+    rs = wrap_add(s2, 5);
+    re = wrap_sub(r, 2);
+  }
+  if kind != 3 {
+    let rf = x86_fams(code, rs, re);
+    if !x86_is_r64(code, rs, re) || (rf & 2) != 0 || (rf & 256) != 0 {
+      return 0;
+    }
+  }
+  if !x86_rax_free(code, starts, labs, wrap_add(i, 2)) {
+    return 0;
+  }
+  if kind == 1 {
+    x86_copy_text(code, s2, wrap_add(s2, ol), &mut out);
+    cg_s(&mut out, " ");
+    x86_copy_text(code, a, ae, &mut out);
+    cg_s(&mut out, ", ");
+    x86_copy_text(code, rs, re, &mut out);
+  } else if kind == 2 {
+    cg_s(&mut out, "\tcmp ");
+    x86_copy_text(code, rs, re, &mut out);
+    cg_s(&mut out, ", ");
+    x86_copy_text(code, a, ae, &mut out);
+  } else if areg {
+    cg_s(&mut out, "\ttest ");
+    x86_copy_text(code, a, ae, &mut out);
+    cg_s(&mut out, ", ");
+    x86_copy_text(code, a, ae, &mut out);
+  } else {
+    cg_s(&mut out, "\tcmpq $0, ");
+    x86_copy_text(code, a, ae, &mut out);
+  }
+  cg_s(&mut out, "\n");
+  return wrap_add(i, 2);
+}
+
+/// `push %rax`, lines that compute a value in %rax from scratch (the first
+/// sets %rax without reading it; none names %rcx, the stack or %rax but as
+/// `%rax` or `%eax`), `mov %rax, %rcx`, `pop %rax`: the same lines
+/// computing in %rcx, which leaves %rax alone. Returns the line after the
+/// `pop`, or 0.
+fn x86_peep_spill(code: &Vec[u64], starts: &Vec[u64], i: u64, out: &mut Vec[u64]) -> u64 {
+  let nl = vec_len(starts);
+  let s0 = u_at(starts, i);
+  if !x86_txt(code, s0, x86_line_end(code, s0), "\tpush %rax") {
+    return 0;
+  }
+  let mut j = wrap_add(i, 1);
+  let mut fin = false;
+  while !fin && j < nl && wrap_sub(j, i) < 10 {
+    let s = u_at(starts, j);
+    let e = x86_line_end(code, s);
+    if x86_txt(code, s, e, "\tmov %rax, %rcx") {
+      fin = true;
+    } else {
+      if u_at(code, s) != 9 || x86_has_prefix(code, s, "\t.") || !x86_explicit_op(code, s, e) || x86_has_prefix(code, s, "\tpush ")
+        || x86_has_prefix(code, s, "\tpop ") || (x86_fams(code, s, e) & 260) != 0 || !x86_rax_names_ok(code, s, e) {
+        return 0;
+      }
+      if j == wrap_add(i, 1) && !x86_acc_dead(code, s, e) {
+        return 0;
+      }
+      j = j + 1;
+    }
+  }
+  if !fin || j == wrap_add(i, 1) || wrap_add(j, 1) >= nl {
+    return 0;
+  }
+  let sp = u_at(starts, wrap_add(j, 1));
+  if !x86_txt(code, sp, x86_line_end(code, sp), "\tpop %rax") {
+    return 0;
+  }
+  let mut k = wrap_add(i, 1);
+  while k < j {
+    let ks = u_at(starts, k);
+    let ke = x86_line_end(code, ks);
+    let mut q = ks;
+    while q < ke && q < vec_len(code) {
+      if x86_has_prefix(code, q, "%rax") {
+        cg_s(&mut out, "%rcx");
+        q = wrap_add(q, 4);
+      } else if x86_has_prefix(code, q, "%eax") {
+        cg_s(&mut out, "%ecx");
+        q = wrap_add(q, 4);
+      } else {
+        vec_push(&mut out, vec_get(code, q));
+        q = q + 1;
+      }
+    }
+    cg_s(&mut out, "\n");
+    k = k + 1;
+  }
+  return wrap_add(j, 2);
+}
+
+/// Does the line from `s` to `e` name %rax's family only as `%rax` or
+/// `%eax`?
+fn x86_rax_names_ok(code: &Vec[u64], s: u64, e: u64) -> bool {
+  let mut k = s;
+  while k < e && k < vec_len(code) {
+    if vec_get(code, k) == 37 && x86_fam_at(code, k + 1) == 1 && !x86_has_prefix(code, k, "%rax") && !x86_has_prefix(code, k, "%eax") {
+      return false;
+    }
+    k = k + 1;
+  }
+  return true;
 }
 
 /// The end of the line starting at `s` (its newline, or the end).
@@ -5748,6 +6913,7 @@ fn x86_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
   x86_clear(&mut g.stack);
   vec_push(&mut g.stack, x);
   g.frame = 0;
+  x86_clear(&mut g.slots);
   g.depth = 0;
   g.env = x;
   g.pre = 0;
@@ -5786,7 +6952,7 @@ fn x86_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
     let qn = node_at(p.nodes, q);
     vec_push(&mut qs, q);
     let pt = conv(&mut m, p, qn.a, x, q);
-    let w = x86_words(&mut g, c, m, p, pt);
+    let w = x86_pwords(&mut g, c, m, p, pt);
     vec_push(&mut sizes, w);
     q = qn.next;
   }
@@ -5806,7 +6972,7 @@ fn x86_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
     let qn = node_at(p.nodes, q2);
     let pt = conv(&mut m, p, qn.a, x, q2);
     let id = x86_nm(&mut g, p, 0, qn.s, qn.e);
-    if kind_t(m, pt) == TY_MUTREF {
+    if kind_t(m, pt) == TY_MUTREF || x86_byaddr(&mut g, c, m, p, pt) {
       x86_bindv(&mut g, id, x86_st(XS_PTR, off, 0, 0, 0), base_t(m, pt));
     } else {
       x86_bindv(&mut g, id, x86_st(XS_SLOT, off, 0, 0, 0), base_t(m, pt));
@@ -5916,19 +7082,26 @@ fn x86_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
   cg_s(&mut g.out, ":\n\tpush %rbp\n\tmov %rsp, %rbp\n\tsub $");
   x86_num(&mut g.out, wrap_mul(8, frame));
   cg_s(&mut g.out, ", %rsp\n");
-  x86_append(&mut g.out, saves);
-  x86_peephole(g.body, &mut g.out, !g.stage0);
-  cg_s(&mut g.out, ".L");
-  x86_num(&mut g.out, g.retl);
-  cg_s(&mut g.out, ":\n");
+  let mut fb = vec_new[u64]();
+  x86_append(&mut fb, saves);
+  x86_peephole(g.body, &mut fb, !g.stage0);
+  cg_s(&mut fb, ".L");
+  x86_num(&mut fb, g.retl);
+  cg_s(&mut fb, ":\n");
   if regret {
-    cg_s(&mut g.out, "\tmov ");
-    x86_snum(&mut g.out, g.reto);
-    cg_s(&mut g.out, "(%rbp), %rax\n\tmov ");
-    x86_snum(&mut g.out, wrap_add(g.reto, 8));
-    cg_s(&mut g.out, "(%rbp), %rdx\n");
+    cg_s(&mut fb, "\tmov ");
+    x86_snum(&mut fb, g.reto);
+    cg_s(&mut fb, "(%rbp), %rax\n\tmov ");
+    x86_snum(&mut fb, wrap_add(g.reto, 8));
+    cg_s(&mut fb, "(%rbp), %rdx\n");
   }
-  x86_append(&mut g.out, restores);
+  x86_append(&mut fb, restores);
+  if g.stage0 {
+    x86_append(&mut g.out, fb);
+  } else {
+    x86_frame_remap(fb, g.slots, g.frame, &mut g.out);
+  }
+  vec_free(fb);
   cg_s(&mut g.out, "\tleave\n\tret\n\t.size ");
   x86_append(&mut g.out, sym);
   cg_s(&mut g.out, ", .-");
