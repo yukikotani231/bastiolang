@@ -1475,6 +1475,10 @@ impl<'a> Ctx<'a> {
                             return Err(Diag::new("E-PIN", args[0].pos, format!("a {} cannot be put in a lock: it holds a capability of this processor", t.name()))
                                 .note("`Cpu` and `Mmu` describe the processor that holds them, and a lock can be taken on any processor"));
                         }
+                        // The verifier's view of the value does not say
+                        // which integer type it has (an i64 reads as a
+                        // u64), so the contents' type is recorded here.
+                        self.int_ops.insert(e.pos, t.clone());
                         return Ok(Type::Lock(Box::new(t)));
                     }
                     return match t {

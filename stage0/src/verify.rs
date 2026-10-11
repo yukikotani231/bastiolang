@@ -275,9 +275,11 @@ fn opaque_boxes(v: &Val, ty: &Type) -> Val {
     }
 }
 
-/// The type of a value, for `lock_new`. A `Bytes` reads as `Buf`: the
-/// lock then forgets that every byte is <= 255, which loses facts but never
-/// assumes a false one.
+/// The type of a value, when the checker has not recorded it. A `Bytes`
+/// reads as `Buf`, which loses facts but never assumes a false one. An
+/// integer reads as `u64`, which would assume a false one for a signed
+/// integer, so `lock_new` and `atomic_new` take the checker's type of
+/// their contents instead.
 fn val_type(v: &Val) -> Type {
     match v {
         Val::U(_) => Type::U64,
@@ -728,17 +730,6 @@ fn num(v: i128) -> String {
     if v < 0 { format!("(- {})", -v) } else { v.to_string() }
 }
 
-/// `x` reduced to the range of the integer type `t`, as a C conversion to
-/// `t` does: modulo 2^width, two's complement for a signed type.
-fn wrap_term(t: &Type, x: &str) -> String {
-    if t.is_signed() {
-        let h = t.int_modulus() / 2;
-        format!("(- (mod (+ {} {}) {}) {})", x, h, t.int_modulus(), h)
-    } else {
-        format!("(mod {} {})", x, t.int_modulus())
-    }
-}
-
 /// C's division on signed operands, which truncates toward zero (SMT-LIB's
 /// `div` rounds so that the remainder is never negative).
 fn c_div(a: &str, b: &str) -> String {
@@ -918,6 +909,21 @@ impl<'p> Verifier<'p> {
         let n = self.fresh_name("bits");
         self.smt(&format!("(declare-const {} Int)", n))?;
         self.smt(&format!("(assert (= {} {}))", n, t))?;
+        Ok(n)
+    }
+
+    /// `x` reduced to the range of the integer type `t`, as a C conversion
+    /// to `t` does: modulo 2^width, two's complement for a signed type. It
+    /// is a fresh `n` in the range of `t` with `x = n + 2^width * k` for a
+    /// fresh integer `k`, which only one `n` satisfies. That is linear: Z3
+    /// 4.8.12 can run forever, past its resource limit, on a `mod` of such
+    /// a value under another `mod` or a product, and random programs found
+    /// many such queries (`tests/fuzz.py --seed 1`).
+    fn wrap_term(&mut self, t: &Type, x: &str) -> Result<String, Diag> {
+        let n = self.fresh_int("wrap", &num(t.int_min()), &num(t.int_max()))?;
+        let k = self.fresh_name("wrap_k");
+        self.smt(&format!("(declare-const {} Int)", k))?;
+        self.smt(&format!("(assert (= {} (+ {} (* {} {}))))", x, n, t.int_modulus(), k))?;
         Ok(n)
     }
 
@@ -1572,7 +1578,7 @@ impl<'p> Verifier<'p> {
                     let x = self.eval(&args[0], st)?.term().to_string();
                     let t = &targs[0];
                     if n == "wrap" {
-                        return Ok(Val::U(wrap_term(t, &x)));
+                        return Ok(Val::U(self.wrap_term(t, &x)?));
                     }
                     let from = self.int_ops.get(&e.pos).cloned().unwrap_or(Type::U64);
                     let max = num(t.int_max());
@@ -2055,13 +2061,15 @@ impl<'p> Verifier<'p> {
             "wrap_add" | "wrap_sub" | "wrap_mul" => {
                 let ity = self.int_ops.get(&pos).cloned().expect("typed by the checker");
                 let op = match name { "wrap_add" => "+", "wrap_sub" => "-", _ => "*" };
-                Ok(Val::U(wrap_term(&ity, &format!("({} {} {})", op, vals[0].term(), vals[1].term()))))
+                let t = format!("({} {} {})", op, vals[0].term(), vals[1].term());
+                Ok(Val::U(self.wrap_term(&ity, &t)?))
             }
             "lock_new" => {
                 for (what, i) in self.invariants_of(&vals[0])? {
                     self.need(st, i, pos, "E-VERIFY-LOCKINV", format!("that the value put in the lock satisfies the invariant {}", what))?;
                 }
-                Ok(Val::Obj(Type::Lock(Box::new(val_type(&vals[0]))), vec![]))
+                let t = self.int_ops.get(&pos).cloned().unwrap_or_else(|| val_type(&vals[0]));
+                Ok(Val::Obj(Type::Lock(Box::new(t)), vec![]))
             }
             // An atomic's value may change at any moment, so like a lock's
             // contents only its invariants are known when it is read, and
