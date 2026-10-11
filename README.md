@@ -33,9 +33,10 @@ A classic off-by-one (`while i <= len(a)`) is rejected with a counterexample:
 
 ```
 tests/fail/oob_loop.bastio:9:9: error[E-VERIFY-BOUNDS]: could not prove that the index `i` is within `a` (`i < len(a)`)
-  |     a = set(a, i, 1);
-  |         ^
-  = counterexample: len(a) = 4, i = 4
+ 9 |     a = set(a, i, 1);
+   |         ^^^
+   = counterexample: len(a) = 4, i = 4
+   = check the index against the length first, with an `if` or a `requires`, or keep it in range with a loop `invariant`
 ```
 
 ## How Bastio differs
