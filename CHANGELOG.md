@@ -113,6 +113,13 @@ What will be 0.2.0.
 
 ### Fixed
 
+- `wrap[T](..)`, `wrap_add`, `wrap_sub` and `wrap_mul` are written for the
+  solver without `mod`: the result is a fresh value in the type's range
+  that differs from the exact one by a multiple of 2^width. Z3 4.8.12 (the
+  version Ubuntu ships, which CI installs) searched past its resource
+  limit, forever, on a `mod` of a wrapped value under another `mod` or a
+  product; `tests/fuzz.py --seed 1` hit 9 such inputs and every one now
+  takes under a second (`tests/fail/wrap_twice_overflow.bastio`).
 - A false proof in both compilers. A loop or call that changes a signed
   integer (also inside a struct, enum or box) forgot its value but gave the
   new one the range of `u64`, which leaves out the negative numbers, so an
@@ -124,6 +131,12 @@ What will be 0.2.0.
   inside the argument of `cast[T](..)` or `wrap[T](..)`, so a variable
   changed by a call written there kept its value from before
   (`tests/fail/loop_cast_call.bastio`).
+- Another false proof in both compilers: what came out of a lock built by
+  `lock_new` from an integer was taken for a `u64` whatever its type, so an
+  `i64` that a `locked` call made negative could be proved to be at least 0
+  after `lock_end` (`tests/fail/lock_signed_contents.bastio`,
+  `lock_signed_box.bastio`). The lock now keeps the checker's type of its
+  contents, which also makes a `u8` that comes out known to be at most 255.
 
 ### Documentation
 
