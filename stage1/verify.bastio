@@ -1001,16 +1001,24 @@ fn int_mod(v: &mut Vr, m: &Mono, t: u64) -> u64 {
 }
 
 /// `x` reduced to the range of integer type `t`, as a C conversion to `t`
-/// does: modulo 2^width, two's complement for a signed type.
+/// does: modulo 2^width, two's complement for a signed type. It is a fresh
+/// `n` in the range of `t` with `x = n + 2^width * k` for a fresh integer
+/// `k`, which only one `n` satisfies; linear, as stage0's `wrap_term` (Z3
+/// 4.8.12 can run forever on a `mod` of such a value under another `mod`).
 fn wrap_term(v: &mut Vr, m: &Mono, t: u64, x: u64) -> u64 {
+  let lo = int_min(&mut v, m, t);
+  let hi = int_max(&mut v, m, t);
+  let hn = atom_str(&mut v, "wrap");
+  let n = fresh_int(&mut v, hn, lo, hi);
+  let hk = atom_str(&mut v, "wrap_k");
+  let k = fresh_name(&mut v, hk);
+  send(&mut v, CMD_DECL, k, SO_INT);
   let md = int_mod(&mut v, m, t);
-  if is_signed(m, t) {
-    let h = num(&mut v, int_half(m, t));
-    let a = app2(&mut v, OP_ADD, x, h);
-    let r = app2(&mut v, OP_MOD, a, md);
-    return app2(&mut v, OP_SUB, r, h);
-  }
-  return app2(&mut v, OP_MOD, x, md);
+  let mk = app2(&mut v, OP_MUL, md, k);
+  let sum = app2(&mut v, OP_ADD, n, mk);
+  let e = app2(&mut v, OP_EQ, x, sum);
+  assert_tm(&mut v, e);
+  return n;
 }
 
 /// `(ite (>= x 0) x (- x))`
@@ -4187,9 +4195,11 @@ fn invariant_terms(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64, ou
   }
 }
 
-/// The type of value `x`, for `lock_new`. A Bytes value reads as a Buf:
-/// the lock then forgets that every byte is <= 255, which loses facts but
-/// never assumes a false one.
+/// The type of value `x`, when the checker has not recorded it. A Bytes
+/// value reads as a Buf, which loses facts but never assumes a false one.
+/// An integer reads as a u64, which would assume a false one for a signed
+/// integer, so `lock_new` and `atomic_new` take the checker's type of
+/// their contents instead.
 fn val_type(v: &Vr, m: &mut Mono, p: &Parser, x: u64) -> u64 {
   let xv = vl_at(v, x);
   let k = xv.kind;
@@ -4692,7 +4702,12 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
       k = vadd(k, 3);
     }
     vec_free(invs);
-    let t = val_type(v, &mut m, p, x0);
+    let mut t = 0;
+    if has_int_op(c, v.env, i) {
+      t = int_op_ty(c, m, v.env, i);
+    } else {
+      t = val_type(v, &mut m, p, x0);
+    }
     let lt = intern(&mut m, p, TY_LOCK, t);
     return mk_obj(&mut v, m, lt, 0, 0, 0);
   }
