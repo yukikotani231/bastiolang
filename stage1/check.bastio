@@ -24,12 +24,17 @@ const TARGET_HOSTED: u64 = 0;
 const TARGET_KERNEL: u64 = 1;
 const TARGET_USER: u64 = 2;
 
+/// The architectures (`--arch`).
+const ARCH_X86_64: u64 = 0;
+const ARCH_AARCH64: u64 = 1;
+
 // Where a builtin is available.
 const AV_ALL: u64 = 0;
 const AV_HOSTED: u64 = 1;
 const AV_MEM: u64 = 2;       // hosted and kernel
 const AV_KERNEL: u64 = 3;
 const AV_USER: u64 = 4;
+const AV_PORTS: u64 = 5;     // hosted (simulated) and the x86-64 kernel: AArch64 has no I/O ports
 
 /// A builtin's signature: up to five parameter types.
 struct Bsig { name: Str, avail: u64, np: u64, p0: u64, p1: u64, p2: u64, p3: u64, p4: u64, ret: u64 }
@@ -68,6 +73,8 @@ struct Checker {
   /// The variables bound by enclosing `forall`s (their nodes).
   bound: Vec[u64],
   target: u64,
+  /// The architecture (`ARCH_*`), set by the driver after `checker_new`.
+  arch: u64,
   /// The return type of the function being checked.
   ret: u64,
   /// The instance being checked (0 for a plain spec fn).
@@ -176,7 +183,7 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   let mut c = Checker {
     bs: vec_new[Bsig](), ghosts: vec_new[Ghost](), fstart: vec_new[u64](), ftys: vec_new[u64](),
     paths: paths, pix: ix_new(), cix: ix_new(), bix: ix_new(), vars: vec_new[Var](), moved: vec_new[u64](), mlocs: vec_new[u64](), bound: vec_new[u64](),
-    target: target, ret: un, env: 0, spec_lim: 0, spec_pos: 0, tu64: u, tbool: b, tunit: un, tstr: st,
+    target: target, arch: ARCH_X86_64, ret: un, env: 0, spec_lim: 0, spec_pos: 0, tu64: u, tbool: b, tunit: un, tstr: st,
     failed: false, efile: 0, eline: 0, ecol: 0, ecode: 0, emsg: vec_new[u64](), enotes: vec_new[u64](), int_ops: vec_new[IntOp](),
     calls: vec_new[Edge](), lsites: vec_new[LockSite](), nparams: 0, inv: false, old_only: false
   };
@@ -312,16 +319,16 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   bsig(&mut c, "boot_fb", AV_KERNEL, 2, rcpu, u, 0, 0, u);
   bsig(&mut c, "boot_acpi", AV_KERNEL, 3, rcpu, u, u, 0, u);
   bsig(&mut c, "boot_info", AV_KERNEL, 3, rcpu, u, u, 0, u);
-  bsig(&mut c, "port_claim", AV_MEM, 3, mprt, u, u, 0, pio);
-  bsig(&mut c, "port_release", AV_MEM, 2, mprt, pio, 0, 0, un);
-  bsig(&mut c, "port_base", AV_MEM, 1, rpio, 0, 0, 0, u);
-  bsig(&mut c, "port_count", AV_MEM, 1, rpio, 0, 0, 0, u);
-  bsig(&mut c, "pio_in8", AV_MEM, 2, mpio, u, 0, 0, u8t);
-  bsig(&mut c, "pio_in16", AV_MEM, 2, mpio, u, 0, 0, u16t);
-  bsig(&mut c, "pio_in32", AV_MEM, 2, mpio, u, 0, 0, u32t);
-  bsig(&mut c, "pio_out8", AV_MEM, 3, mpio, u, u8t, 0, un);
-  bsig(&mut c, "pio_out16", AV_MEM, 3, mpio, u, u16t, 0, un);
-  bsig(&mut c, "pio_out32", AV_MEM, 3, mpio, u, u32t, 0, un);
+  bsig(&mut c, "port_claim", AV_PORTS, 3, mprt, u, u, 0, pio);
+  bsig(&mut c, "port_release", AV_PORTS, 2, mprt, pio, 0, 0, un);
+  bsig(&mut c, "port_base", AV_PORTS, 1, rpio, 0, 0, 0, u);
+  bsig(&mut c, "port_count", AV_PORTS, 1, rpio, 0, 0, 0, u);
+  bsig(&mut c, "pio_in8", AV_PORTS, 2, mpio, u, 0, 0, u8t);
+  bsig(&mut c, "pio_in16", AV_PORTS, 2, mpio, u, 0, 0, u16t);
+  bsig(&mut c, "pio_in32", AV_PORTS, 2, mpio, u, 0, 0, u32t);
+  bsig(&mut c, "pio_out8", AV_PORTS, 3, mpio, u, u8t, 0, un);
+  bsig(&mut c, "pio_out16", AV_PORTS, 3, mpio, u, u16t, 0, un);
+  bsig(&mut c, "pio_out32", AV_PORTS, 3, mpio, u, u32t, 0, un);
   bsig(&mut c, "mmio_claim", AV_MEM, 3, mmsp, u, u, 0, mio);
   bsig(&mut c, "mmio_release", AV_MEM, 2, mmsp, mio, 0, 0, un);
   bsig(&mut c, "mmio_base", AV_MEM, 1, rmio, 0, 0, 0, u);
@@ -1870,9 +1877,13 @@ fn reaches(c: &Checker, m: &Mono, p: &Parser, from: u64, target: u64, seen: &mut
 }
 
 /// May `main` ask for a capability of kind `k` on this target?
-fn is_cap(target: u64, k: u64) -> bool {
+fn is_cap(target: u64, arch: u64, k: u64) -> bool {
   if target == TARGET_USER {
     return k == TY_SERIAL;
+  }
+  if target == TARGET_KERNEL && arch == ARCH_AARCH64 {
+    // AArch64 has no I/O ports: devices are memory-mapped.
+    return k == TY_SERIAL || k == TY_POOL || k == TY_MMU || k == TY_CPU || k == TY_MMIOSPACE;
   }
   if target == TARGET_KERNEL {
     return k == TY_SERIAL || k == TY_POOL || k == TY_MMU || k == TY_CPU || k == TY_PORTS || k == TY_MMIOSPACE;
@@ -1880,9 +1891,12 @@ fn is_cap(target: u64, k: u64) -> bool {
   return k == TY_SERIAL || k == TY_POOL || k == TY_HOST || k == TY_PORTS || k == TY_MMIOSPACE;
 }
 
-fn available(avail: u64, target: u64) -> bool {
+fn available(avail: u64, target: u64, arch: u64) -> bool {
   if avail == AV_ALL {
     return true;
+  }
+  if avail == AV_PORTS {
+    return target == TARGET_HOSTED || (target == TARGET_KERNEL && arch == ARCH_X86_64);
   }
   if avail == AV_HOSTED {
     return target == TARGET_HOSTED;
@@ -2132,7 +2146,7 @@ fn check_main(c: &mut Checker, m: &mut Mono, p: &Parser, x: u64) {
     let qn = node_at(p.nodes, q);
     let t = conv(&mut m, p, qn.a, x, q);
     let ik = kind_t(m, inner_t(m, t));
-    if kind_t(m, t) == TY_MUTREF && is_cap(c.target, ik) && !has_id(seen, ik) {
+    if kind_t(m, t) == TY_MUTREF && is_cap(c.target, c.arch, ik) && !has_id(seen, ik) {
       vec_push(&mut seen, ik);
     } else {
       caps_ok = false;
@@ -2145,6 +2159,8 @@ fn check_main(c: &mut Checker, m: &mut Mono, p: &Parser, x: u64) {
       cm_s(&mut c, "on this target `main` must take some of ");
       if c.target == TARGET_USER {
         cm_s(&mut c, "&mut Serial");
+      } else if c.target == TARGET_KERNEL && c.arch == ARCH_AARCH64 {
+        cm_s(&mut c, "&mut Serial, &mut Pool, &mut Mmu, &mut Cpu, &mut MmioSpace");
       } else if c.target == TARGET_KERNEL {
         cm_s(&mut c, "&mut Serial, &mut Pool, &mut Mmu, &mut Cpu, &mut Ports, &mut MmioSpace");
       } else {
@@ -3722,7 +3738,7 @@ fn ck_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
   let b = bs_index(c, p, s, e);
   if b != 0 {
     let bs = bs_at(c, b - 1);
-    if !available(bs.avail, c.target) {
+    if !available(bs.avail, c.target, c.arch) {
       if cm_new(&mut c, p, i, C_TARGET) {
         cm_s(&mut c, "`");
         cm_name(&mut c, p, i);

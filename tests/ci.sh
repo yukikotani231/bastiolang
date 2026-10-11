@@ -4,7 +4,7 @@
 # costs seconds, the same failure in CI costs a run and a notification.
 #
 # Steps whose tools are missing (z3, the tree-sitter CLI, mdbook, npm, an
-# AArch64 cross compiler and qemu-aarch64) are reported as SKIPPED, not
+# AArch64 cross compiler and QEMU) are reported as SKIPPED, not
 # passed; CI still runs them.
 #
 # usage: tests/ci.sh [--bench]    (--bench also runs bench/run.sh)
@@ -33,10 +33,11 @@ if command -v z3 >/dev/null; then
   step "stage1/difftest.sh"; stage1/difftest.sh
   step "tests/fuzz.py (short run)"; tests/fuzz.py --seed 1 --count 1000
   if command -v "${AARCH64_CC:-aarch64-linux-gnu-gcc}" >/dev/null \
+     && command -v qemu-system-aarch64 >/dev/null \
      && { [ "$(uname -m)" = aarch64 ] || command -v qemu-aarch64 >/dev/null; }; then
     step "tests/aarch64.sh"; tests/aarch64.sh
   else
-    skipped+=("tests/aarch64.sh (needs aarch64-linux-gnu-gcc and qemu-aarch64: apt install gcc-aarch64-linux-gnu qemu-user)")
+    skipped+=("tests/aarch64.sh (needs aarch64-linux-gnu-gcc, qemu-aarch64 and qemu-system-aarch64: apt install gcc-aarch64-linux-gnu qemu-user qemu-system-arm)")
   fi
   if [ "${1:-}" = --bench ]; then
     step "bench/run.sh"; bench/run.sh

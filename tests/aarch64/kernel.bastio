@@ -1,0 +1,121 @@
+// stage1-only: the AArch64 kernel target
+// The AArch64 boot test's kernel (tests/aarch64.sh). Built with
+// `--target kernel --arch aarch64` and booted on QEMU's virt machine with
+// the test platform beside it, it checks the AArch64 prelude end to end:
+// the PL011 console, the page pool, page tables loaded into TTBR0, a user
+// program at EL0 making system calls with `svc`, an abort reported with
+// its address, the FP/SIMD save, and a device register read through MMIO.
+import "core/print.bastio";
+
+// The user program, at the start of the user window (top-level slot 1,
+// 512 GiB): write 'U' and 'S' (system call 1), exit with 7 (system call 2).
+// The kernel then restarts it at 0x20, which stores to address 0.
+const USER_BASE: u64 = 0x8000000000;
+
+fn put_code(f: &mut Frame) {
+  frame_write(&mut f, 0, 0xD2800028D2800AA0);   // movz x0, #'U'; movz x8, #1
+  frame_write(&mut f, 1, 0xD2800A60D4000001);   // svc #0; movz x0, #'S'
+  frame_write(&mut f, 2, 0xD28000E0D4000001);   // svc #0; movz x0, #7
+  frame_write(&mut f, 3, 0xD4000001D2800048);   // movz x8, #2; svc #0
+  frame_write(&mut f, 4, 0xF9000020D2800001);   // movz x1, #0; str x0, [x1]
+}
+
+// Frees a table below the top level and everything under it.
+fn free_table(pool: &mut Pool, t: PageTable, lv: u64)
+  requires 1 <= lv && lv <= 3 && pt_level(t) == lv && pt_leases(t) == 0
+{
+  let mut t1 = t;
+  let mut i = 0;
+  while i < 512
+    invariant i <= 512 && pt_level(t1) == lv && pt_leases(t1) == 0
+    invariant forall j: u64 :: j < i ==> !pt_used(t1, j)
+  {
+    if pt_has(t1, i) {
+      if lv > 1 {
+        free_table(&mut pool, pt_take(&mut t1, i), lv - 1);
+      } else if pt_shared(t1, i) {
+        shared_drop(&mut pool, pt_take_shared(&mut t1, i));
+      } else {
+        pool_give(&mut pool, pt_take_frame(&mut t1, i));
+      }
+    }
+    i = i + 1;
+  }
+  pool_give(&mut pool, pt_free(t1));
+}
+
+fn main(con: &mut Serial, pool: &mut Pool, mmu: &mut Mmu, cpu: &mut Cpu, win: &mut MmioSpace) -> u64 {
+  print_str(con, "aarch64: kernel up, ");
+  print_u64(con, pool_size(pool));
+  print_str(con, " pages\n");
+  if pool_size(pool) < 6 {
+    return 1;
+  }
+  // The console's flag register, read through a claim of the PL011.
+  let mut uart = mmio_claim(&mut win, 0x09000000, 4096);
+  let fr = mmio_read32(&mut uart, 24);
+  mmio_release(&mut win, uart);
+  print_str(con, "aarch64: uart flags ");
+  print_hex(con, cast[u64](fr));
+  print_nl(con);
+
+  let mut code = pool_take(&mut pool, 0);
+  put_code(&mut code);
+  let mut l1 = pt_new(pool_take(&mut pool, 1), 1);
+  pt_put_frame(&mut l1, 0, code, false);
+  let mut l2 = pt_new(pool_take(&mut pool, 2), 2);
+  pt_put(&mut l2, 0, l1);
+  let mut l3 = pt_new(pool_take(&mut pool, 3), 3);
+  pt_put(&mut l3, 0, l2);
+  let mut root = pt_new(pool_take(&mut pool, 4), 4);
+  pt_put(&mut root, 1, l3);
+  let mut fp = pool_take(&mut pool, 5);
+
+  cpu_set(&mut cpu, 32, USER_BASE);
+  let lease = mmu_enter(&mut mmu, &mut root);
+  let mut traps = 0;
+  let mut done = false;
+  while !done && traps < 16 {
+    let v = cpu_run(&mut cpu, mmu);
+    cpu_fpu_save(&mut cpu, &mut fp);
+    cpu_fpu_load(&mut cpu, fp);
+    traps = traps + 1;
+    if v == 128 && cpu_get(cpu, 8) == 1 {
+      serial_write(con, wrap[u8](cpu_get(cpu, 0)));
+    } else if v == 128 && cpu_get(cpu, 8) == 2 {
+      print_str(con, "\naarch64: exit ");
+      print_u64(con, cpu_get(cpu, 0));
+      print_nl(con);
+      cpu_set(&mut cpu, 32, USER_BASE + 32);
+    } else if v == 14 {
+      print_str(con, "aarch64: abort at ");
+      print_hex(con, cpu_get(cpu, 35));
+      print_str(con, " pc ");
+      print_hex(con, cpu_get(cpu, 32));
+      print_nl(con);
+      done = true;
+    } else {
+      print_str(con, "aarch64: unexpected trap ");
+      print_u64(con, v);
+      print_nl(con);
+      done = true;
+    }
+  }
+  mmu_exit(&mut mmu, lease);
+  pool_give(&mut pool, fp);
+
+  // Tear the address space down once no processor runs on it.
+  let mut n = pt_lease_count(&mut root);
+  while n != 0
+    invariant pt_level(root) == 4 && pt_leases(root) == n && pt_used(root, 1)
+    invariant forall j: u64 :: 1 < j && j < 256 ==> !pt_used(root, j)
+  {
+    n = pt_lease_count(&mut root);
+  }
+  free_table(&mut pool, pt_take(&mut root, 1), 3);
+  pool_give(&mut pool, pt_free_root(mmu, root));
+  print_str(con, "aarch64: done after ");
+  print_u64(con, traps);
+  print_str(con, " traps\n");
+  return 0;
+}

@@ -223,7 +223,8 @@ struct Vr {
   t_flimit: u64,
   /// 65536: the number of x86 I/O ports.
   t_plimit: u64,
-  /// The device window a Mmio lies in: physical 0x8000_0000 up to 2^46.
+  /// The device window a Mmio lies in: physical 0x8000_0000 up to 2^46
+  /// (from 0 on AArch64, where devices sit below RAM).
   t_mmio_lo: u64,
   t_mmio_hi: u64,
   t_poolsize: u64,
@@ -257,7 +258,20 @@ struct Vr {
   wnote: Vec[u64],
   /// The type arguments of the instance whose source the sentences quote
   /// (see `rd_sub`): stage0 quotes the copy made for the instance.
-  tsub: Vec[u64]
+  tsub: Vec[u64],
+  /// The architecture (`ARCH_*`); set it with `vr_set_arch`.
+  arch: u64
+}
+
+/// Sets the architecture the program is verified for. On AArch64 the device
+/// window starts at 0 (QEMU's virt machine and most SoCs put devices below
+/// RAM; the platform refuses a claim that overlaps RAM, as on x86-64), and
+/// the saved user context has AArch64's registers.
+fn vr_set_arch(v: &mut Vr, arch: u64) {
+  v.arch = arch;
+  if arch == ARCH_AARCH64 {
+    v.t_mmio_lo = v.t_zero;
+  }
 }
 
 fn vr_new(m: &mut Mono, p: &Parser) -> Vr {
@@ -273,7 +287,7 @@ fn vr_new(m: &mut Mono, p: &Parser) -> Vr {
     t_zarr: 0, t_nobool: 0, t_k: 0, t_255: 0, unit: 0, t_reset: 0, t_models: 0, t_rlimit: 0, t_timeout: 0,
     ty_bytes: prim(&mut m, p, TY_BYTES), ty_child: prim(&mut m, p, TY_CHILD), ty_frame: prim(&mut m, p, TY_FRAME),
     ty_pt: prim(&mut m, p, TY_PT), ty_pool: prim(&mut m, p, TY_POOL), fail_at: 0, fail_code: 0,
-    fail_obl: 0, msg: vec_new[u64](), mpool: vec_new[u64](), wnote: vec_new[u64](), tsub: vec_new[u64]()
+    fail_obl: 0, msg: vec_new[u64](), mpool: vec_new[u64](), wnote: vec_new[u64](), tsub: vec_new[u64](), arch: ARCH_X86_64
   };
   v.t_true = atom_str(&mut v, "true");
   v.t_false = atom_str(&mut v, "false");
@@ -5357,7 +5371,11 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     vm_arg(&mut v, p, u_at(args, 1));
     vm_s(&mut v, " + ");
     vm_arg(&mut v, p, u_at(args, 2));
-    vm_s(&mut v, "` lies in the device window (0x80000000 to 2^46)");
+    if v.arch == ARCH_AARCH64 {
+      vm_s(&mut v, "` lies in the device window (below 2^46)");
+    } else {
+      vm_s(&mut v, "` lies in the device window (0x80000000 to 2^46)");
+    }
     prove(&mut v, st, g, i, VC_BOUNDS);
     let inr = port_range(&mut v, b, n);
     let sel = app2(&mut v, OP_SELECT, g_free(v, x0), v.t_k);
@@ -5727,9 +5745,28 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     // it goes up.
     return fresh_u64_named(&mut v, "tsc");
   }
+  if name_is(p, i, "cpu_get") && v.arch == ARCH_AARCH64 {
+    need_lt(&mut v, p, st, i, term(v, x1), 37, u_at(args, 1), "the saved registers");
+    return fresh_u64_named(&mut v, "reg");
+  }
   if name_is(p, i, "cpu_get") {
     need_lt(&mut v, p, st, i, term(v, x1), 21, u_at(args, 1), "the saved registers");
     return fresh_u64_named(&mut v, "reg");
+  }
+  if name_is(p, i, "cpu_set") && v.arch == ARCH_AARCH64 {
+    // x0-x30, SP_EL0, ELR_EL1 and SPSR_EL1 (0-33) and TPIDR_EL0 (36); the
+    // syndrome and fault address (34, 35) are only reported by a trap.
+    let r = term(v, x1);
+    let t34 = num(&mut v, 34);
+    let t36 = num(&mut v, 36);
+    let a = app2(&mut v, OP_LT, r, t34);
+    let b = app2(&mut v, OP_EQ, r, t36);
+    let g = app2(&mut v, OP_OR, a, b);
+    vm_s(&mut v, "that register `");
+    vm_arg(&mut v, p, u_at(args, 1));
+    vm_s(&mut v, "` can be set (0-33 or 36)");
+    prove(&mut v, st, g, i, VC_BOUNDS);
+    return v.unit;
   }
   if name_is(p, i, "cpu_set") {
     // Registers 0-17 and the FS base (20); the error code and fault address

@@ -4,7 +4,8 @@
 # their `// expect-exit: N` header (and print the
 # first line of `// expect-stdout: TEXT`, if given, with stdin empty); fail/*.bastio must be rejected with the error
 # code in their `// expect-error: CODE` header, checked for the target in an
-# optional `// target: T` header (a rejection for the wrong
+# optional `// target: T` header and the architecture in an optional
+# `// arch: A` header (a rejection for the wrong
 # reason counts as a failure). diag/*.bastio must print exactly diag/*.err.
 # A program with a `// stage1-only: <feature>` header is skipped when
 # BASTIOC is stage0 (tests/stage1_only.sh).
@@ -51,10 +52,11 @@ pass_one() {
   echo =pass
 }
 fail_one() {
-  local f=$1 want target missing
+  local f=$1 want target arch missing
   want=$(sed -n 's|^// expect-error: *||p' "$f" | head -1)
   target=$(sed -n 's|^// target: *||p' "$f" | head -1)
-  if "$BASTIOC" --check --target "${target:-hosted}" "$f" 2>"$w/err"; then
+  arch=$(sed -n 's|^// arch: *||p' "$f" | head -1)
+  if "$BASTIOC" --check --target "${target:-hosted}" --arch "${arch:-x86_64}" "$f" 2>"$w/err"; then
     echo "FAIL $f: accepted, want $want"; echo =fail; return
   fi
   if ! grep -q "error\[$want\]" "$w/err"; then
@@ -148,6 +150,16 @@ if "$BASTIOC" --trusted-base | diff -u tests/trusted_base.txt - >"$tmp/tb.diff";
 else
   echo "FAIL trusted base changed; review it, then: $BASTIOC --trusted-base > tests/trusted_base.txt"
   sed 's/^/    /' "$tmp/tb.diff"; fail=$((fail+1))
+fi
+# The same for AArch64's preludes (stage1 only: stage0 has no AArch64 kernel
+# or user target).
+if [ -z "$stage0_compiler" ]; then
+  if "$BASTIOC" --arch aarch64 --trusted-base | diff -u tests/trusted_base_aarch64.txt - >"$tmp/tb.diff"; then
+    pass=$((pass+1))
+  else
+    echo "FAIL AArch64 trusted base changed; review it, then: $BASTIOC --arch aarch64 --trusted-base > tests/trusted_base_aarch64.txt"
+    sed 's/^/    /' "$tmp/tb.diff"; fail=$((fail+1))
+  fi
 fi
 # Library search: a program outside the repository finds core only with
 # `--lib` or BASTIO_LIB (docs/language.md, "Several files").
