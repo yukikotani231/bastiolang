@@ -104,6 +104,10 @@ What will be 0.2.0.
   (`tests/fail/loop_signed_range.bastio`, `call_signed_range.bastio`). A
   changed `u8`, `u16` or `u32` got the range of `u64` too, which only made
   true facts about it unprovable. Each now keeps its type's range.
+- Another false proof in both compilers: a loop or call did not look
+  inside the argument of `cast[T](..)` or `wrap[T](..)`, so a variable
+  changed by a call written there kept its value from before
+  (`tests/fail/loop_cast_call.bastio`).
 
 ### Documentation
 

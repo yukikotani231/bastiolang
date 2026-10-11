@@ -2958,7 +2958,8 @@ fn changed_in_expr(e: &Expr, out: &mut HashMap<String, bool>, sums: &Summaries) 
                 changed_in_expr(x, out, sums);
             }
         }
-        ExprKind::Variant(_, _, Some(x)) | ExprKind::Is(x, _, _) => changed_in_expr(x, out, sums),
+        // The argument of `cast[T](..)`, `wrap[T](..)` or `try_box[T](..)`.
+        ExprKind::Variant(_, _, Some(x)) | ExprKind::Is(x, _, _) | ExprKind::TypeApp(_, x) => changed_in_expr(x, out, sums),
         _ => {}
     }
 }
