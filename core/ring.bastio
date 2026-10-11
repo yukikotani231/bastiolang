@@ -9,9 +9,12 @@
 //
 // What is proved: every slot a function returns is below the capacity,
 // the count stays between 0 and the capacity, a push claims the slot just
-// after the last element and a pop the head, and a queue's `queue_pop`
-// returns the word at the head. Not proved: that the sequence of words
-// popped is the sequence pushed (that needs a ghost sequence).
+// after the last element and a pop the head, and a `Queue` is a FIFO:
+// `queue_at(q, i)` is its i-th oldest word, `queue_push` appends to that
+// sequence and `queue_pop` returns its first word and shifts the rest, so
+// words come out in the order they went in. `queue_at` is opaque: outside
+// this file a proof sees only those contracts, never the slot arithmetic,
+// which keeps loops over a queue quick to prove.
 
 /// Head, count and capacity of a ring. Element `i` (0 is the oldest) is
 /// in slot `(h + i) % cap`.
@@ -145,6 +148,17 @@ spec fn queue_ok(q: &Queue) -> bool {
   ring_ok(q.r) && len(q.q) == q.r.cap
 }
 
+/// Word `i` of the queue, 0 being the oldest (meaningful for `i < q.r.n`).
+opaque spec fn queue_at(q: &Queue, i: u64) -> u64 {
+  get(q.q, (q.r.h + i) % q.r.cap)
+}
+
+/// Word `i` of `q` is word `i + k` of `o`, for every word `o` has from
+/// `k` on.
+spec fn queue_from(q: &Queue, o: &Queue, k: u64) -> bool {
+  forall i: u64 :: i + k < o.r.n ==> queue_at(q, i) == queue_at(o, i + k)
+}
+
 /// An empty queue of `cap` words.
 fn queue_new(cap: u64) -> Queue
   requires 0 < cap && cap <= 1152921504606846976
@@ -169,6 +183,7 @@ fn queue_len(q: &Queue) -> u64
 fn queue_push(q: &mut Queue, x: u64)
   requires queue_ok(q) && q.r.n < q.r.cap
   ensures queue_ok(q) && q.r.n == old(q).r.n + 1 && q.r.cap == old(q).r.cap
+  ensures queue_from(q, old(q), 0) && queue_at(q, old(q).r.n) == x
 {
   let s = ring_push(&mut q.r);
   q.q = set(q.q, s, x);
@@ -177,7 +192,7 @@ fn queue_push(q: &mut Queue, x: u64)
 /// The oldest word, without removing it.
 fn queue_peek(q: &Queue) -> u64
   requires queue_ok(q) && 0 < q.r.n
-  ensures result == get(q.q, q.r.h)
+  ensures result == get(q.q, q.r.h) && result == queue_at(q, 0)
 {
   return get(q.q, q.r.h);
 }
@@ -187,6 +202,7 @@ fn queue_pop(q: &mut Queue) -> u64
   requires queue_ok(q) && 0 < q.r.n
   ensures queue_ok(q) && q.r.n == old(q).r.n - 1 && q.r.cap == old(q).r.cap
   ensures result == get(old(q).q, old(q).r.h)
+  ensures result == queue_at(old(q), 0) && queue_from(q, old(q), 1)
 {
   let s = ring_pop(&mut q.r);
   return get(q.q, s);

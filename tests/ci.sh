@@ -29,11 +29,12 @@ if command -v z3 >/dev/null; then
   step "tests/run.sh";       tests/run.sh
   step "tests/native.sh";    tests/native.sh
   step "stage1/difftest.sh"; stage1/difftest.sh
+  step "tests/fuzz.py (short run)"; tests/fuzz.py --seed 1 --count 1000
   if [ "${1:-}" = --bench ]; then
     step "bench/run.sh"; bench/run.sh
   fi
 else
-  skipped+=("tests/run.sh, tests/native.sh, stage1/difftest.sh (no z3)")
+  skipped+=("tests/run.sh, tests/native.sh, stage1/difftest.sh, tests/fuzz.py (no z3)")
 fi
 
 ts=${TREE_SITTER:-tree-sitter}

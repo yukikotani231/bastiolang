@@ -77,6 +77,7 @@ module.exports = grammar({
 
     spec_function_definition: ($) =>
       seq(
+        optional('opaque'),
         'spec',
         'fn',
         field('name', $.identifier),

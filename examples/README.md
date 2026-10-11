@@ -9,6 +9,7 @@ Every example here is built and run by `tests/run.sh`, so CI keeps them working.
 | [`base64`](base64) | A strict base64 codec for untrusted input, with a differential fuzz against a C decoder and a benchmark |
 | [`utf8`](utf8) | A strict UTF-8 validator and decoder, fuzzed the same way |
 | [`der`](der) | A DER (ASN.1) structure checker: the parser shape behind X.509 certificates |
+| [`qoi`](qoi) | A QOI image codec: buffers sized by an untrusted header, and out of memory reported to C instead of aborting |
 
 A single-file example builds with `bastioc0 -o NAME NAME.bastio` and must exit
 with 0. An example in a directory has a `run.sh` that builds it, links it with

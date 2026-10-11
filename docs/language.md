@@ -96,7 +96,7 @@ bastioc0 [--check] [--emit-c] [--backend c|native] [--target hosted|kernel|user]
 - **Identifiers** are ASCII letters, digits and `_`, not starting with a digit.
 - **Integer literals** are decimal (`4096`) or hexadecimal (`0x1000`, `0X1000`). `_` may separate digits (`1_000_000`, `0xffff_0000`). A literal must fit in 64 bits, and in the integer type its position gives it. A negative number is unary minus on a literal, where a signed type is expected.
 - **String literals** are written in double quotes and cannot span lines. Escapes: `\n`, `\r`, `\t`, `\0`, `\\`, `\"`.
-- **Keywords:** `assert` `const` `else` `ensures` `enum` `export` `false` `fn` `forall` `if` `import` `invariant` `is` `let` `match` `mut` `requires` `return` `spec` `struct` `true` `unreachable` `while`. The names `result`, `old` and `include_bytes`, and the names of builtins, have special meanings described below.
+- **Keywords:** `assert` `const` `else` `ensures` `enum` `export` `false` `fn` `forall` `if` `import` `invariant` `is` `let` `match` `mut` `requires` `return` `spec` `struct` `true` `unreachable` `while`. `opaque` is a keyword only before `spec fn`. The names `result`, `old` and `include_bytes`, and the names of builtins, have special meanings described below.
 
 ## Programs and files
 
@@ -416,7 +416,7 @@ fn main() -> u64 {
 }
 ```
 
-**Bitwise operators.** `&`, `|`, `^`, `<<`, `>>` and `!x` (bitwise not; the same `!` as for `bool`) work on unsigned integers. Both operands of `&`, `|` and `^` have one type; a shift amount can be any unsigned type and must be proved less than the width (`E-VERIFY-SHIFT`), since C leaves larger shifts undefined. A left shift follows the never-wraps rule: it must lose no bits (`E-VERIFY-OVERFLOW`); mask first to drop them. They bind tighter than comparisons, as in Rust, so `e & 1 == 1` tests a bit. The prover knows a low mask (`x & 255` is `x % 256`) and shifts exactly, and only bounds for other masks, `|` and `^` (`x & y <= x`, `x | y >= x`, ...). They are not available in specifications yet: write `% 2^k` and `/ 2^k` there.
+**Bitwise operators.** `&`, `|`, `^`, `<<`, `>>` and `!x` (bitwise not; the same `!` as for `bool`) work on unsigned integers. Both operands of `&`, `|` and `^` have one type; a shift amount can be any unsigned type and must be proved less than the width (`E-VERIFY-SHIFT`), since C leaves larger shifts undefined. A left shift follows the never-wraps rule: it must lose no bits (`E-VERIFY-OVERFLOW`); mask first to drop them. They bind tighter than comparisons, as in Rust, so `e & 1 == 1` tests a bit. The prover knows a low mask (`x & 255` is `x % 256`) and shifts exactly, and only bounds for the value of other masks, `|` and `^` (`x & y <= x`, `x | y >= x`, ...); what they do to each bit is stated with `has_bit` (see Specifications). They are not available in specifications: write `% 2^k` and `/ 2^k`, or `has_bit`, there.
 
 ```bastio
 // expect-exit: 42
@@ -703,6 +703,22 @@ fn main() -> u64 {
 - Specifications see through boxes the same way: `ensures result.n == 0` for a `Box[Stack]` result.
 - The prover unfolds a box that arrives from outside (a parameter, a function's result) two levels deep. Deeper contents are unknown until code looks inside them, and then nothing is known about them: a proof that needs a fact deeper down fails (it is never assumed). That is why `sum` above clamps what it gets back instead of proving a bound for the whole tree. Values a function builds itself are tracked to any depth.
 - `box` uses the same allocator as `alloc`. Running out of memory aborts, as for `alloc`.
+- `try_box[T](e)` is the box that reports running out of memory instead. It needs `import "core/boxed.bastio"`, which defines what it returns: `enum Boxed[T] { Ok(Box[T]), Full(T) }`. `Boxed::Ok` holds the new box, and `Boxed::Full` gives `e` back when there was no memory for it, so the value is never lost. The prover does not know which one comes back, so the program must handle both:
+
+```bastio
+// expect-exit: 5
+// A program imports this from core/boxed.bastio; written out here, it is
+// the same enum.
+enum Boxed[T] { Ok(Box[T]), Full(T) }
+
+fn main() -> u64 {
+  let r = try_box[u64](5);
+  match r {
+    Boxed::Ok(b) => { return unbox(b); },
+    Boxed::Full(x) => { return x; },
+  }
+}
+```
 - In generated code a `Box[T]` is a `T *`.
 
 ## Generics
@@ -802,6 +818,8 @@ fn main() -> u64 {
 | `vec_new[T]() -> Vec[T]` | | An empty vector |
 | `vec_len(v: &Vec[T]) -> u64` | | Its length (`vlen(v)` in specifications) |
 | `vec_push(v: &mut Vec[T], x: T)` | | Appends `x`, growing the storage when full |
+| `vec_try_reserve(v: &mut Vec[T], n: u64) -> bool` | | Makes room for `n` more elements without a push having to allocate, and returns `true`; or returns `false`, with `v` unchanged, when memory runs out. On `true`, `vcap(v) >= vlen(v) + n` |
+| `vec_push_within(v: &mut Vec[T], x: T)` | `vlen(v) < vcap(v)` | Appends `x` into room already reserved: never allocates, so it cannot stop the program |
 | `vec_pop(v: &mut Vec[T]) -> T` | `vlen(v) > 0` | Removes and returns the last element |
 | `vec_get(v: &Vec[T], i: u64) -> T` | `i < vlen(v)`; `T` not linear | A copy of element `i` |
 | `vec_set(v: &mut Vec[T], i: u64, x: T)` | `i < vlen(v)`; `T` not linear | Overwrites element `i` |
@@ -812,6 +830,45 @@ fn main() -> u64 {
 - In specifications, `vlen(v)` is the length and `vget(v, i)` is element `i`, of the element type, for any element type. So `vget(v, i).page`, `len(vget(v, i).page)`, `vget(v, i) is State::Used` and `vlen(vget(grid, i))` all work, typically under `forall i: u64 :: i < vlen(v) ==> ...`.
 - The prover tracks every element's contents: scalars, struct fields, enum tags and payloads, buffer lengths and contents, ghost state of capabilities, nested vectors. A read gives back what was last written at that index. The exception is boxes inside elements: what a box in an element holds is unknown once the element is in the vector.
 - The storage doubles when full. A push that cannot get memory aborts; the prover takes this into account by assuming the length stays below 2^60 after a push.
+- Code that must not abort when memory runs out reserves first and then pushes within the room:
+
+```bastio
+// expect-exit: 3
+fn fill(v: &mut Vec[u64], n: u64) -> bool
+  requires vlen(v) == 0 && n <= 1000
+  ensures result ==> vlen(v) == n
+  ensures !result ==> vlen(v) == 0
+{
+  if !vec_try_reserve(&mut v, n) {
+    return false;                      // out of memory: nothing was lost
+  }
+  let mut i = 0;
+  while i < n
+    invariant i <= n && vlen(v) == i && vcap(v) >= n
+  {
+    vec_push_within(&mut v, i);        // proved: vlen(v) < vcap(v)
+    i = i + 1;
+  }
+  return true;
+}
+
+fn main() -> u64 {
+  let mut v = vec_new[u64]();
+  let mut n = 0;
+  if fill(&mut v, 3) {
+    n = vec_len(v);
+  }
+  while vec_len(v) > 0
+    invariant true
+  {
+    let x = vec_pop(&mut v);
+  }
+  vec_free(v);
+  return n;
+}
+```
+
+`vcap(v)` is the capacity, in specifications. The prover tracks it through `vec_push` (which keeps it while there is room), `vec_pop`, `vec_set` and `vec_swap` (which keep it), loops and calls. What it knows across a call is what the callee's contract says. The capacity of a vector stored inside another vector is not tracked. Room is reserved before the element exists, so a vector of linear values works the same way: nothing has to be given back when there is no room.
 - In generated code a `Vec[T]` is `{ len, cap, data }` and element access is a plain array access, with no bounds check.
 
 ## Buffers, bytes and strings
@@ -824,6 +881,8 @@ fn main() -> u64 {
 | `set(b: Buf, i: u64, v: u64) -> Buf` | `i < len(b)` | Consumes `b` and returns it with element `i` set to `v`, updated in place |
 | `free(b: Buf)` | | Frees `b` |
 | `balloc(n: u64) -> Bytes` | `n <= 2^60` | `n` zero bytes |
+| `try_alloc(n: u64) -> Buf` | `n <= 2^60` | Like `alloc`, but when memory runs out it returns an empty buffer instead of stopping the program. The prover knows only that the length is `n` or `0`, so a program must test `len` before indexing |
+| `try_balloc(n: u64) -> Bytes` | `n <= 2^60` | Like `balloc`, but returns empty `Bytes` when memory runs out |
 | `blen(b: &Bytes) -> u64` | | Its length |
 | `bget(b: &Bytes, i: u64) -> u8` | `i < blen(b)` | Byte `i` |
 | `bset(b: &mut Bytes, i: u64, v: u8)` | `i < blen(b)` | Sets byte `i` in place |
@@ -919,6 +978,7 @@ Hardware is reached only through capability types. There is no way to read or wr
 | `Frame` | One physical page (4 KiB), owned by exactly one place at a time |
 | `PageTable` | A page-table page at level 1 to 5. It owns the tables and pages its slots point to |
 | `Shared` | One reference to a page that several page tables may map at once (`MAP_SHARED` memory): the page stays allocated while any reference is held, and the last `shared_drop` gives it back to the pool |
+| `Dirty` | A page taken out of the pool without being zeroed: it may still hold what its last owner wrote, so nothing can read it, map it or give it back until it is overwritten whole and becomes a `Frame` |
 | `Mmu` | The right to load CR3 (kernel only) |
 | `Cpu` | The CPU's saved user context and the right to enter user mode (kernel only) |
 | `Lease` | This processor's hold on the top-level table it loaded with `mmu_enter`: while any is outstanding, other processors may be running on the tree, so nothing is taken out of it (kernel only; pinned to its processor) |
@@ -960,6 +1020,12 @@ Ghost accessors, usable in specifications:
 | --- | --- | --- |
 | `pool_take(p: &mut Pool, i: u64) -> Frame` | `i < pool_size(p)` and `pool_has(p, i)` | Takes page `i` out of the pool, zeroed |
 | `pool_give(p: &mut Pool, f: Frame)` | | Gives a page back |
+| `pool_take_dirty(p: &mut Pool, i: u64) -> Dirty` | as `pool_take` | Takes page `i` out of the pool without zeroing it (`dirty_id` is `i`). Cheap where pages are handed out under a lock: the page is overwritten later, outside it |
+| `dirty_id(d: &Dirty) -> u64` | | The page number |
+| `dirty_zero(d: Dirty) -> Frame` | | Zeroes the page; it is now a frame, the same page |
+| `frame_copy(d: Dirty, src: &Frame) -> Frame` | | Copies all of `src` over the page; it is now a frame, the same page. Contents are not tracked |
+| `dirty_fill(d: Dirty, src: &Bytes, s: u64) -> Frame` | `s + 4096 <= blen(src)` | Copies bytes `s .. s+4096` of `src` over the page; it is now a frame, the same page. Contents are not tracked |
+| `shared_copy(d: Dirty, s: &Shared) -> Frame` | | The same from a shared page: a private copy of it |
 | `frame_id(f: &Frame) -> u64` | | The page number |
 | `frame_read(f: &Frame, w: u64) -> u64`, `frame_write(f: &mut Frame, w: u64, v: u64)` | `w < 512` | A 64-bit word of the page. Contents are not tracked by the proof |
 | `frame_read8(f: &Frame, o: u64) -> u8`, `frame_write8(f: &mut Frame, o: u64, b: u8)` | `o < 4096` | A byte of the page |
@@ -1228,10 +1294,11 @@ Expressions in `requires`, `ensures`, `invariant` and `assert` (and the bodies o
 
 - They are evaluated over **mathematical integers**: `a - b` may be negative and `a + b` cannot overflow. Integers of different types mix freely there, with no conversions.
 - They may use `==>` (implication) and `forall x: u64 :: e`.
-- They may call `len`, `get`, `slen`, `sget`, `blen`, `bget`, `bdec`, `bhex`, `vlen`, `vget`, `vcount`, the ghost accessors of the capabilities, and `spec fn`s.
+- They may call `len`, `get`, `slen`, `sget`, `blen`, `bget`, `bdec`, `bhex`, `has_bit`, `vlen`, `vcap`, `vget`, `vcount`, the ghost accessors of the capabilities, and `spec fn`s.
 - `vcount(v, x)` is the number of elements of `v` equal to `x`, for a vector of integers. It states what `forall` cannot: that a vector is a permutation of another, or that a counter counts something.
 - `bdec(b, from, to)` is the decimal value of bytes `from..to` of `b`, each byte read as a digit (byte - 48): 0 for an empty range, and `10 * bdec(b, from, to - 1) + (bget(b, to - 1) - 48)` otherwise. The prover unfolds that definition one digit for each `bdec` term a proof mentions, so a loop that parses digits states `v == bdec(b, from, i)` as its invariant, and a constant is evaluated by asserting each prefix in turn (`tests/pass/bdec.bastio`).
 - `bhex(b, from, to)` is the same in base 16: `16 * bhex(b, from, to - 1)` plus the value of the hex digit `bget(b, to - 1)` (`0-9`, `a-f`, `A-F`; another byte has no meaningful value, so a spec says the bytes are hex digits separately, as `core/num.bastio`'s `all_hex` does).
+- `has_bit(x, i)` says whether bit `i` of the integer `x` is set (bit 0 is the lowest; from bit 64 up, never). The prover knows, for every bitwise operator the code evaluates (`&`, `|`, `^`, `!`, shifts and low masks), how each bit of the result follows from the bits of the operands, and that `x & 1` is 1 exactly when bit 0 is set. So a function that sets one bit can promise that the other 63 are unchanged (`forall j: u64 :: j != k ==> has_bit(result, j) == has_bit(w, j)`), and a loop that tests `(w >> i) & 1` can carry `forall j: u64 :: j < i ==> has_bit(w, j)` (`tests/pass/bits_packed.bastio`). Only the bits of values the code computed with these operators are known: a variable's bits are whatever the proof is told about them, and the prover does not turn a statement about every bit back into one about the value (that `x` is 0 when no bit is set, say).
 - They may use `is` and enum payloads (`o.Some`), and see through boxes.
 - `==` and `!=` also compare structs and enums made of integers and booleans (no buffers, boxes or vectors inside): field by field, and for an enum the variant and then that variant's payload. Both sides must name a value (a variable, a field, `vget(..)` or `old(..)`), since specifications cannot build one. Ordinary code still compares only integers and `bool`.
 - They may mention values that have already been consumed. In `ensures`, a by-value parameter means its value on entry, a `&mut` parameter the value handed back, and `old(x)` its value at the call. `result` is the returned value. `old(x)` is also allowed in loop invariants, for parameters only.
@@ -1269,6 +1336,8 @@ fn main() -> u64 {
   return 0;
 }
 ```
+
+An `opaque spec fn` is inlined only in its own file. Everywhere else it is an uninterpreted function of its arguments: a proof there knows only what contracts say about it, not its body. This lets a library describe its data abstractly and keeps the details out of its users' proofs. `core/ring.bastio` says what a queue holds as `queue_at(q, i)`, its i-th oldest word, computed from the ring's slot arithmetic. Its push and pop are proved against that body, inside the file. A user of the queue sees only that `queue_push` appends to the sequence and `queue_pop` returns its first word and shifts the rest, so a loop that fills and drains a queue proves the order of the words in milliseconds (`tests/pass/queue_fifo.bastio`), where the inlined arithmetic took the solver minutes. This hides nothing that matters for soundness: what a proof concludes about an unknown function also holds for the real one. An opaque spec fn cannot be generic (`E-PARSE`), and its parameters are integers, `bool`, `Buf`, `Bytes`, and structs of those or borrows of one (`E-TYPE`). `opaque` is a keyword only before `spec fn`.
 
 A `spec fn` can be generic. Like a generic function, it is copied once per list of type arguments, which are written at every call (`grew_by[u64](v, w, 1)`), and a generic function's specifications can pass its own type parameters on:
 
@@ -1340,6 +1409,7 @@ After the type and linearity checks, the compiler executes each function symboli
   - For each `&mut` parameter, the compiler works out from the function's body which places under it the function may change, and how: by assigning them, or only through the shape-keeping updates above. Lending a place to another function counts as that function's summary applied to it, so this goes through any depth of calls, and through recursion. At a call, and in a loop that makes the call, every other part of the argument (scalar fields, enum tags, lengths, capability ids) keeps its value. So a driver function that takes `&mut Dev` and only ever uses `d.page` through builtins needs no `ensures` restating `frame_id(d.page)`, and the loops of its callers no `invariant` either.
   - The contents of buffers and vectors, and capability state such as which slots of a page table are used, are still forgotten when changed: say what is kept of them in `ensures` or `invariant`.
 - **Boxes and vectors.** The prover unfolds unknown recursive data two levels deep, and tracks vector contents element by element (see [Boxes](#boxes) and [Vectors](#vectors)).
+- **The same answer every time.** Z3 gets a fixed amount of work per query (a resource limit, not a timeout), and each function is verified on a solver in the same fresh state, whichever functions were verified before it and however many run at once (`BASTIO_JOBS`). So whether a program is accepted depends only on the program and the Z3 version, not on the machine's load or the number of processors. A query that runs out of work is reported as "the solver gave up". The limit is counted in Z3's own units, which track time only roughly: on some hard queries (arithmetic modulo a large number) using it up takes minutes rather than seconds.
 
 What is proved, by error code, is listed in the next section.
 
@@ -1454,7 +1524,7 @@ The C function is a thin wrapper that converts each pointer and length into the 
 What a program that `bastioc0` accepts is guaranteed: no out-of-bounds access, no use after free, no double free, no leak, no integer overflow or underflow, no division by zero, and, in kernel code, no page owned twice, no malformed page table and no freeing of the active one. Plus every `requires`, `ensures`, `invariant` and `assert` the programmer wrote. What is not guaranteed:
 
 - **Termination.** Infinite loops and infinite recursion are not detected. This is independent of memory safety and a non-goal for now.
-- **Running out of memory.** `alloc`, `box` and `vec_push` abort when memory runs out. Allocation failure is planned to be returned in the type instead.
+- **Running out of memory.** `alloc`, `balloc`, `box` and `vec_push` abort when memory runs out. Each has a form that returns the failure instead, for code that must not stop: `try_alloc`, `try_balloc`, `try_box` and `vec_try_reserve` with `vec_push_within`.
 - **Stack depth.** Deep recursion can overflow the stack.
 - **Page contents.** The proof tracks who owns each page, not what is in it.
 - **The trusted base.** Z3, the stage0 compiler (Rust) and the C compiler are trusted, as is the hand-written C prelude each target links in (in `stage0/src/codegen.rs`), and the platform's boot and trap entry code. `bastioc0 --trusted-base` lists every prelude part with its size, the parts each target links, and every builtin; the listing is checked into `tests/trusted_base.txt` and `tests/run.sh` fails when it changes, so growth is reviewed (ROADMAP invariant 3). The small per-type helpers the compiler generates for `Box` and `Vec` are part of the compiler, not of this listing. [trusted-base.md](trusted-base.md) goes through every part and why it is there.

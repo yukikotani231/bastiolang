@@ -62,6 +62,8 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("free", Avail::All, vec![Buf], Unit),
         ("print", Avail::All, vec![U64], Unit),
         ("balloc", Avail::All, vec![U64], Bytes),
+        ("try_alloc", Avail::All, vec![U64], Buf),
+        ("try_balloc", Avail::All, vec![U64], Bytes),
         ("blen", Avail::All, vec![r(Bytes)], U64),
         ("bget", Avail::All, vec![r(Bytes), U64], U8),
         ("bset", Avail::All, vec![m(Bytes), U64, U8], Unit),
@@ -116,6 +118,12 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("pt_put_shared", Avail::Mem, vec![m(PageTable), U64, Shared, Bool], Unit),
         ("pt_take_shared", Avail::Mem, vec![m(PageTable), U64], Shared),
         ("pt_dup_shared", Avail::Mem, vec![r(PageTable), U64], Shared),
+        ("pool_take_dirty", Avail::Mem, vec![m(Pool), U64], Dirty),
+        ("dirty_id", Avail::Mem, vec![r(Dirty)], U64),
+        ("dirty_zero", Avail::Mem, vec![Dirty], Frame),
+        ("frame_copy", Avail::Mem, vec![Dirty, r(Frame)], Frame),
+        ("shared_copy", Avail::Mem, vec![Dirty, r(Shared)], Frame),
+        ("dirty_fill", Avail::Mem, vec![Dirty, r(Bytes), U64], Frame),
         ("mmu_enter", Avail::Kernel, vec![m(Mmu), m(PageTable)], Lease),
         ("mmu_exit", Avail::Kernel, vec![m(Mmu), Lease], Unit),
         ("mmu_kernel", Avail::Kernel, vec![m(Mmu)], Unit),
@@ -189,6 +197,7 @@ pub const GHOSTS: &[(&str, Type, bool, Type)] = &[
     ("pt_leases", Type::PageTable, false, Type::U64),
     ("pt_shared", Type::PageTable, true, Type::Bool),
     ("shared_id", Type::Shared, false, Type::U64),
+    ("dirty_id", Type::Dirty, false, Type::U64),
     ("pool_has", Type::Pool, true, Type::Bool),
     ("pool_size", Type::Pool, false, Type::U64),
     ("mmu_root", Type::Mmu, false, Type::U64),
@@ -210,10 +219,10 @@ pub fn builtin_sigs() -> HashMap<String, Sig> {
 }
 
 /// Builtins over `Vec[T]`: generic, so their signatures are built per call.
-pub const VEC_BUILTINS: &[&str] = &["vec_new", "vec_len", "vec_push", "vec_pop", "vec_get", "vec_set", "vec_swap", "vec_free"];
+pub const VEC_BUILTINS: &[&str] = &["vec_new", "vec_len", "vec_push", "vec_push_within", "vec_try_reserve", "vec_pop", "vec_get", "vec_set", "vec_swap", "vec_free"];
 
 /// Builtins written with type arguments (`vec_new[u64]()`, `cast[u8](x)`).
-pub const TYPED_BUILTINS: &[&str] = &["vec_new", "cast", "wrap"];
+pub const TYPED_BUILTINS: &[&str] = &["vec_new", "cast", "wrap", "try_box"];
 
 /// Wrapping arithmetic: both operands and the result have one integer type.
 pub const WRAP_BUILTINS: &[&str] = &["wrap_add", "wrap_sub", "wrap_mul"];
@@ -239,7 +248,7 @@ fn spec_norm(t: Type) -> Type {
 
 /// Every builtin with where it is available, for `--trusted-base`.
 pub fn builtin_list() -> Vec<(String, &'static str)> {
-    let mut v: Vec<(String, &'static str)> = vec![("box".into(), "all"), ("unbox".into(), "all")];
+    let mut v: Vec<(String, &'static str)> = vec![("box".into(), "all"), ("try_box".into(), "all"), ("unbox".into(), "all")];
     v.extend(LOCK_BUILTINS.iter().map(|n| (n.to_string(), "all")));
     v.extend(ATOMIC_BUILTINS.iter().map(|n| (n.to_string(), "all")));
     v.push(("smp_run".into(), "kernel"));
@@ -281,7 +290,7 @@ pub fn atomic_word(t: &Type) -> bool {
 }
 
 pub fn is_builtin(name: &str) -> bool {
-    name == "box" || name == "unbox" || name == "cast" || name == "wrap" || name == "smp_run" || PT_BORROW_BUILTINS.contains(&name) || LOCK_BUILTINS.contains(&name) || ATOMIC_BUILTINS.contains(&name) || VEC_BUILTINS.contains(&name) || WRAP_BUILTINS.contains(&name) || builtin_table().iter().any(|b| b.0 == name)
+    name == "box" || name == "try_box" || name == "unbox" || name == "cast" || name == "wrap" || name == "smp_run" || PT_BORROW_BUILTINS.contains(&name) || LOCK_BUILTINS.contains(&name) || ATOMIC_BUILTINS.contains(&name) || VEC_BUILTINS.contains(&name) || WRAP_BUILTINS.contains(&name) || builtin_table().iter().any(|b| b.0 == name)
 }
 
 fn available(name: &str, target: Target) -> bool {
@@ -308,7 +317,7 @@ fn main_caps(target: Target) -> &'static [Type] {
 /// Struct and enum definitions: unique names, known field and payload
 /// types, no type that contains itself.
 pub fn check_structs(p: &Program) -> Result<(), Diag> {
-    const RESERVED: &[&str] = &["u64", "u8", "u16", "u32", "i8", "i16", "i32", "i64", "bool", "Str", "Buf", "Bytes", "Host", "Child", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu", "Ports", "PortIo", "MmioSpace", "Mmio", "Dma", "Lease", "Shared", "Lock", "Atomic"];
+    const RESERVED: &[&str] = &["u64", "u8", "u16", "u32", "i8", "i16", "i32", "i64", "bool", "Str", "Buf", "Bytes", "Host", "Child", "Serial", "Frame", "PageTable", "Pool", "Mmu", "Cpu", "Ports", "PortIo", "MmioSpace", "Mmio", "Dma", "Lease", "Shared", "Dirty", "Lock", "Atomic"];
     // (name, position, the types it holds directly)
     let mut defs: Vec<(String, Pos, Vec<Type>)> = Vec::new();
     for d in &p.structs {
@@ -356,6 +365,11 @@ pub fn check_structs(p: &Program) -> Result<(), Diag> {
 /// Locates an error in a copy of a generic function (`dup[Buf]`).
 pub fn in_copy(d: Diag, f: &str) -> Diag {
     if f.contains('[') { d.note(format!("in `{}`, the copy of a generic function for these type arguments", f)) } else { d }
+}
+
+/// The type of `try_box[T](..)`: the copy of core's `Boxed[T]` for `T`.
+pub fn boxed_type(t: &Type) -> Type {
+    Type::Enum(Type::Generic("Boxed".to_string(), vec![t.clone()]).name())
 }
 
 /// Does the enum name written in a pattern or an `is` test name the enum
@@ -667,6 +681,17 @@ fn new_ctx<'a>(sigs: &'a HashMap<String, Sig>, specs: &'a [SpecFn], target: Targ
     Ctx { sigs, specs, target, ret, scopes: vec![Vec::new()], vars: HashMap::new(), moved: HashSet::new(), moved_at: HashMap::new(), int_ops: HashMap::new(), calls: Vec::new(), lock_sites: Vec::new(), params: Vec::new(), in_inv: std::cell::Cell::new(false), old_only: std::cell::Cell::new(false) }
 }
 
+/// What an opaque spec fn can take: values the verifier can hand to an
+/// uninterpreted function as a fixed list of terms.
+pub fn opaque_arg(t: &Type) -> bool {
+    match t {
+        Type::Ref(x) => opaque_arg(x),
+        Type::Bool | Type::Buf | Type::Bytes => true,
+        Type::Struct(n) => crate::ast::struct_def(n).map_or(false, |d| d.fields.iter().all(|(_, ft)| opaque_arg(ft))),
+        t => t.is_int(),
+    }
+}
+
 /// A spec fn may only call spec fns defined before it, so expansion terminates.
 fn check_spec_fn(sf: &SpecFn, earlier: &[SpecFn], sigs: &HashMap<String, Sig>, target: Target) -> Result<(), Diag> {
     if sigs.contains_key(&sf.name) || is_ghost(&sf.name) || earlier.iter().any(|e| e.name == sf.name) {
@@ -678,6 +703,9 @@ fn check_spec_fn(sf: &SpecFn, earlier: &[SpecFn], sigs: &HashMap<String, Sig>, t
     let mut cx = new_ctx(sigs, earlier, target, Type::Unit);
     for p in &sf.params {
         known_type(&p.ty, p.pos)?;
+        if sf.opaque && !opaque_arg(&p.ty) {
+            return Err(Diag::new("E-TYPE", p.pos, format!("a parameter of an opaque spec fn is an integer, bool, Buf or Bytes, or a struct of those (or a borrow of one), not {}", p.ty.name())));
+        }
         if p.ty.is_linear() || p.ty.is_mut_ref() {
             return Err(Diag::new("E-TYPE", p.pos, "spec fn parameters are values (`u64`, `bool`) or shared borrows (`&T`)"));
         }
@@ -1264,6 +1292,26 @@ impl<'a> Ctx<'a> {
                     self.int_ops.insert(e.pos, t);
                     Ok(targs[0].clone())
                 }
+                // `try_box[T](x)`: `Boxed[T]` from core/boxed.bastio, which
+                // monomorphization has already copied for `T`.
+                ExprKind::Call(n, args) if n == "try_box" => {
+                    if targs.len() != 1 || args.len() != 1 {
+                        return Err(Diag::new("E-TYPE", e.pos, "write `try_box[T](x)`: one type argument, one argument"));
+                    }
+                    known_type(&targs[0], e.pos)?;
+                    let t = self.expr_as(&args[0], &targs[0])?;
+                    if t != targs[0] {
+                        return Err(Diag::new("E-TYPE", args[0].pos, format!("`try_box[{}]` boxes a {}, found {}", targs[0].name(), targs[0].name(), t.name())));
+                    }
+                    let bt = boxed_type(&targs[0]);
+                    let Type::Enum(bn) = &bt else { unreachable!("an enum") };
+                    let want = [("Ok", Type::Box(Box::new(t.clone()))), ("Full", t)];
+                    let ok = enum_def(bn).is_some_and(|d| d.variants.len() == 2 && d.variants.iter().zip(&want).all(|((v, p), (w, wt))| v == w && p.as_ref() == Some(wt)));
+                    if !ok {
+                        return Err(Diag::new("E-TYPE", e.pos, "`try_box` returns `enum Boxed[T] { Ok(Box[T]), Full(T) }` from core/boxed.bastio, but `Boxed` here is defined differently"));
+                    }
+                    Ok(bt)
+                }
                 _ => unreachable!("removed by monomorphization"),
             },
             ExprKind::Int(_) => Ok(Type::U64),
@@ -1608,7 +1656,8 @@ impl<'a> Ctx<'a> {
         let v = Type::Vec(Box::new(t.clone()));
         let (params, ret) = match name {
             "vec_len" => (vec![r(v)], Type::U64),
-            "vec_push" => (vec![m(v), t.clone()], Type::Unit),
+            "vec_push" | "vec_push_within" => (vec![m(v), t.clone()], Type::Unit),
+            "vec_try_reserve" => (vec![m(v), Type::U64], Type::Bool),
             "vec_pop" => (vec![m(v)], t.clone()),
             "vec_swap" => (vec![m(v), Type::U64, t.clone()], t.clone()),
             "vec_free" => (vec![v], Type::Unit),
@@ -1884,14 +1933,23 @@ impl<'a> Ctx<'a> {
                     }
                     return Ok(Type::U64);
                 }
-                if name == "vlen" || name == "vget" {
-                    arity(if name == "vlen" { 1 } else { 2 })?;
+                if name == "has_bit" {
+                    // Whether bit `i` of an integer is set.
+                    arity(2)?;
+                    for (k, what) in [(0, "the value"), (1, "the bit number")] {
+                        let t = spec_norm(self.spec_expr(&args[k], in_ensures, bound)?);
+                        expect_ty(&t, &Type::U64, args[k].pos, what)?;
+                    }
+                    return Ok(Type::Bool);
+                }
+                if name == "vlen" || name == "vcap" || name == "vget" {
+                    arity(if name == "vget" { 2 } else { 1 })?;
                     let t = self.spec_expr(&args[0], in_ensures, bound)?;
                     let Type::Vec(el) = &t else {
                         return Err(Diag::new("E-TYPE", args[0].pos, format!("argument of `{}` must be a Vec, found {}", name, t.name())));
                     };
                     check_lin(&args[0])?;
-                    if name == "vlen" {
+                    if name != "vget" {
                         return Ok(Type::U64);
                     }
                     let ti = spec_norm(self.spec_expr(&args[1], in_ensures, bound)?);
@@ -1899,7 +1957,7 @@ impl<'a> Ctx<'a> {
                     return Ok((**el).clone());
                 }
                 if !matches!(name.as_str(), "len" | "get" | "slen" | "sget" | "blen" | "bget") {
-                    return Err(Diag::new("E-TYPE", e.pos, format!("`{}` cannot be called in a specification (allowed: len, get, slen, sget, blen, bget, bdec, bhex, vlen, vget, vcount, old, ghost accessors and spec fns)", name)));
+                    return Err(Diag::new("E-TYPE", e.pos, format!("`{}` cannot be called in a specification (allowed: len, get, slen, sget, blen, bget, bdec, bhex, has_bit, vlen, vcap, vget, vcount, old, ghost accessors and spec fns)", name)));
                 }
                 let sig = &self.sigs[name.as_str()];
                 arity(sig.params.len())?;
