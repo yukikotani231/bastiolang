@@ -978,16 +978,25 @@ fn int_mod(v: &mut Vr, m: &Mono, t: u64) -> u64 {
 }
 
 /// `x` reduced to the range of integer type `t`, as a C conversion to `t`
-/// does: modulo 2^width, two's complement for a signed type.
+/// does: modulo 2^width, two's complement for a signed type. The signed
+/// case names `x mod 2^width` and subtracts 2^width from the upper half,
+/// as stage0's `wrap_term` (Z3 4.8.12 can run forever on the shorter
+/// `(x + 2^(width-1)) mod 2^width - 2^(width-1)` under another `mod`).
 fn wrap_term(v: &mut Vr, m: &Mono, t: u64, x: u64) -> u64 {
   let md = int_mod(&mut v, m, t);
-  if is_signed(m, t) {
-    let h = num(&mut v, int_half(m, t));
-    let a = app2(&mut v, OP_ADD, x, h);
-    let r = app2(&mut v, OP_MOD, a, md);
-    return app2(&mut v, OP_SUB, r, h);
+  let r = app2(&mut v, OP_MOD, x, md);
+  if !is_signed(m, t) {
+    return r;
   }
-  return app2(&mut v, OP_MOD, x, md);
+  let hint = atom_str(&mut v, "wrap");
+  let n = fresh_name(&mut v, hint);
+  send(&mut v, CMD_DECL, n, SO_INT);
+  let e = app2(&mut v, OP_EQ, n, r);
+  assert_tm(&mut v, e);
+  let h = num(&mut v, int_half(m, t));
+  let ge = app2(&mut v, OP_GE, n, h);
+  let lo = app2(&mut v, OP_SUB, n, md);
+  return app3(&mut v, OP_ITE, ge, lo, n);
 }
 
 /// `(ite (>= x 0) x (- x))`

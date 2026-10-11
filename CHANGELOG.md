@@ -106,6 +106,11 @@ What will be 0.2.0.
 
 ### Fixed
 
+- A signed `wrap[T](..)` inside another `mod` is written for the solver in
+  a form Z3 4.8.12 (the version Ubuntu ships, which CI installs) answers at
+  once, with the same meaning. The old form made that Z3 search past its
+  resource limit, forever (`tests/fail/wrap_twice_overflow.bastio`, found
+  by `tests/fuzz.py`).
 - A false proof in both compilers. A loop or call that changes a signed
   integer (also inside a struct, enum or box) forgot its value but gave the
   new one the range of `u64`, which leaves out the negative numbers, so an

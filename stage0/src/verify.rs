@@ -674,17 +674,6 @@ fn num(v: i128) -> String {
     if v < 0 { format!("(- {})", -v) } else { v.to_string() }
 }
 
-/// `x` reduced to the range of the integer type `t`, as a C conversion to
-/// `t` does: modulo 2^width, two's complement for a signed type.
-fn wrap_term(t: &Type, x: &str) -> String {
-    if t.is_signed() {
-        let h = t.int_modulus() / 2;
-        format!("(- (mod (+ {} {}) {}) {})", x, h, t.int_modulus(), h)
-    } else {
-        format!("(mod {} {})", x, t.int_modulus())
-    }
-}
-
 /// C's division on signed operands, which truncates toward zero (SMT-LIB's
 /// `div` rounds so that the remainder is never negative).
 fn c_div(a: &str, b: &str) -> String {
@@ -865,6 +854,23 @@ impl<'p> Verifier<'p> {
         self.smt(&format!("(declare-const {} Int)", n))?;
         self.smt(&format!("(assert (= {} {}))", n, t))?;
         Ok(n)
+    }
+
+    /// `x` reduced to the range of the integer type `t`, as a C conversion
+    /// to `t` does: modulo 2^width, two's complement for a signed type. The
+    /// signed case names `x mod 2^width` and subtracts 2^width from the
+    /// upper half. (It was `(x + 2^(width-1)) mod 2^width - 2^(width-1)`,
+    /// the same number, but Z3 4.8.12 can run forever on that form under
+    /// another `mod`, ignoring the resource limit.)
+    fn wrap_term(&mut self, t: &Type, x: &str) -> Result<String, Diag> {
+        let m = format!("(mod {} {})", x, t.int_modulus());
+        if !t.is_signed() {
+            return Ok(m);
+        }
+        let n = self.fresh_name("wrap");
+        self.smt(&format!("(declare-const {} Int)", n))?;
+        self.smt(&format!("(assert (= {} {}))", n, m))?;
+        Ok(format!("(ite (>= {n} {}) (- {n} {}) {n})", t.int_modulus() / 2, t.int_modulus()))
     }
 
     fn fresh_int(&mut self, hint: &str, lo: &str, hi_incl: &str) -> Result<String, Diag> {
@@ -1510,7 +1516,7 @@ impl<'p> Verifier<'p> {
                     let x = self.eval(&args[0], st)?.term().to_string();
                     let t = &targs[0];
                     if n == "wrap" {
-                        return Ok(Val::U(wrap_term(t, &x)));
+                        return Ok(Val::U(self.wrap_term(t, &x)?));
                     }
                     let from = self.int_ops.get(&e.pos).cloned().unwrap_or(Type::U64);
                     let max = num(t.int_max());
@@ -1991,7 +1997,8 @@ impl<'p> Verifier<'p> {
             "wrap_add" | "wrap_sub" | "wrap_mul" => {
                 let ity = self.int_ops.get(&pos).cloned().expect("typed by the checker");
                 let op = match name { "wrap_add" => "+", "wrap_sub" => "-", _ => "*" };
-                Ok(Val::U(wrap_term(&ity, &format!("({} {} {})", op, vals[0].term(), vals[1].term()))))
+                let t = format!("({} {} {})", op, vals[0].term(), vals[1].term());
+                Ok(Val::U(self.wrap_term(&ity, &t)?))
             }
             "lock_new" => {
                 for (what, i) in self.invariants_of(&vals[0])? {
