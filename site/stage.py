@@ -26,6 +26,7 @@ PAGES = {
     "examples/base64/README.md": "examples-base64.md",
     "examples/utf8/README.md": "examples-utf8.md",
     "examples/der/README.md": "examples-der.md",
+    "examples/qoi/README.md": "examples-qoi.md",
     "ROADMAP.md": "roadmap.md",
     "CONTRIBUTING.md": "contributing.md",
     "CHANGELOG.md": "changelog.md",

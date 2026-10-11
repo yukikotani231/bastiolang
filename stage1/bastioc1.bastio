@@ -104,8 +104,18 @@ fn b1_render(out: &mut Vec[u64], p: &Parser, ld: &Loader, file: u64, line: u64, 
     }
     i = i + 1;
   }
+  // The gutter: " 12 | " before the source line, as wide before the
+  // caret line and the notes.
+  let mut digits = vec_new[u64]();
+  out_num(&mut digits, line);
   if l >= line && i < end {
-    out_str(&mut out, "  | ");
+    out_str(&mut out, " ");
+    k = 0;
+    while k < vec_len(digits) {
+      vec_push(&mut out, u_at(digits, k));
+      k = k + 1;
+    }
+    out_str(&mut out, " | ");
     let mut j = i;
     while j < end && src_at(p, j) != 10 {
       j = j + 1;
@@ -114,23 +124,112 @@ fn b1_render(out: &mut Vec[u64], p: &Parser, ld: &Loader, file: u64, line: u64, 
     if e > i && src_at(p, e - 1) == 13 {
       e = e - 1;
     }
+    let ls = i;
     while i < e {
       vec_push(&mut out, src_at(p, i));
       i = i + 1;
     }
-    out_str(&mut out, "\n  | ");
+    out_str(&mut out, "\n");
+    b1_pad(&mut out, vec_len(digits));
+    out_str(&mut out, " | ");
+    // Columns count characters (a UTF-8 continuation byte is not one);
+    // tabs before the error stay tabs, so the caret lines up.
+    let mut q = ls;
     let mut c = 1;
     while c < col {
-      out_str(&mut out, " ");
+      if q < e {
+        if src_at(p, q) == 9 {
+          out_str(&mut out, "\t");
+        } else {
+          out_str(&mut out, " ");
+        }
+        q = q + 1;
+        while q < e && src_at(p, q) >= 128 && src_at(p, q) < 192 {
+          q = q + 1;
+        }
+      } else {
+        out_str(&mut out, " ");
+      }
       c = c + 1;
     }
-    out_str(&mut out, "^\n");
+    let mut n = b1_token_len(p, q, e);
+    while n > 0 {
+      out_str(&mut out, "^");
+      n = n - 1;
+    }
+    out_str(&mut out, "\n");
   }
+  // Each note line comes as "  = ...": its "=" goes under the gutter's "|".
   k = 0;
+  let mut bol = true;
   while k < vec_len(notes) {
-    vec_push(&mut out, u_at(notes, k));
+    if bol && k + 2 < vec_len(notes) && u_at(notes, k) == 32 && u_at(notes, k + 1) == 32 && u_at(notes, k + 2) == 61 {
+      b1_pad(&mut out, vec_len(digits));
+      out_str(&mut out, " ");
+      k = k + 2;
+    }
+    let ch = u_at(notes, k);
+    vec_push(&mut out, ch);
+    bol = ch == 10;
     k = k + 1;
   }
+  vec_free(digits);
+}
+
+/// `n + 1` spaces: the gutter of a line number of `n` digits.
+fn b1_pad(out: &mut Vec[u64], n: u64) {
+  out_str(&mut out, " ");
+  let mut k = 0;
+  while k < n {
+    out_str(&mut out, " ");
+    k = k + 1;
+  }
+}
+
+fn b1_word(ch: u64) -> bool {
+  return (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || ch == 95;
+}
+
+/// The length in characters of the token at byte `q` of a line ending at
+/// byte `e`: a word (a name or a number), a string literal, or else one
+/// character (diag.rs's `token_len`).
+fn b1_token_len(p: &Parser, q: u64, e: u64) -> u64 {
+  if q >= e {
+    return 1;
+  }
+  let ch = src_at(p, q);
+  if b1_word(ch) {
+    let mut j = q;
+    while j < e && b1_word(src_at(p, j))
+      invariant q <= j
+    {
+      j = j + 1;
+    }
+    return j - q;
+  }
+  if ch == 34 {
+    // Characters up to the closing quote, or to the end of the line.
+    let mut n = 1;
+    let mut j = q + 1;
+    while j < e && src_at(p, j) != 34 {
+      let step = src_at(p, j) == 92;
+      if src_at(p, j) < 128 || src_at(p, j) >= 192 {
+        n = cg_add(n, 1);
+      }
+      j = j + 1;
+      if step && j < e {
+        if src_at(p, j) < 128 || src_at(p, j) >= 192 {
+          n = cg_add(n, 1);
+        }
+        j = j + 1;
+      }
+    }
+    if j < e {
+      return cg_add(n, 1);
+    }
+    return n;
+  }
+  return 1;
 }
 
 /// Writes the bytes in `out` to standard error and empties it.
@@ -465,9 +564,8 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
         status = 1;
       } else {
         let mut v = vr_new(&mut m, p);
-        verify_program(&mut v, c, &mut m, p);
         let mut rep = vec_new[u64]();
-        if !solve_par(&mut v, m, p, host, &mut rep, solve_jobs(host)) {
+        if !verify_batched(&mut v, c, &mut m, p, host, &mut rep, solve_jobs(host)) {
           let n = node_at(p.nodes, v.fail_at);
           let mut code = "E-SOLVER";
           if v.fail_code != 0 {
