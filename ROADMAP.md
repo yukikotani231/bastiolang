@@ -147,6 +147,36 @@ Goal, set 2026-10-10: BastiOS usable as a general-purpose operating system, for 
 - [ ] Networking for the internet: DNS, TLS, IPv6, verified against real services
 - [ ] Desktop hardware: graphics, audio, Wi-Fi, power management
 
+## v6: containers
+
+Goal, set 2026-10-11: an unmodified OCI runtime runs container images on BastiOS. The bar is crun (then runc) running an Alpine image in its own namespaces, under cgroup limits and a seccomp filter, with `apk add` working over a bridged network. Tracked in [bastios#184](https://github.com/yukikotani231/bastios/issues/184).
+- [ ] Mount namespaces, bind mounts, mount propagation and `pivot_root` ([bastios#185](https://github.com/yukikotani231/bastios/issues/185))
+- [ ] PID, UTS and IPC namespaces, `setns` ([bastios#186](https://github.com/yukikotani231/bastios/issues/186))
+- [ ] User namespaces and uid/gid maps, for rootless containers ([bastios#187](https://github.com/yukikotani231/bastios/issues/187))
+- [ ] overlayfs ([bastios#188](https://github.com/yukikotani231/bastios/issues/188))
+- [ ] cgroup v2 with the pids, memory and cpu controllers ([bastios#189](https://github.com/yukikotani231/bastios/issues/189))
+- [ ] seccomp-BPF, with the BPF interpreter's reads proved in bounds ([bastios#190](https://github.com/yukikotani231/bastios/issues/190))
+- [ ] Network namespaces, veth pairs, a bridge and masquerade ([bastios#191](https://github.com/yukikotani231/bastios/issues/191))
+- [ ] The remaining system calls crun and runc make (`clone3`, `openat2`, the new mount API, `memfd_create` sealing) ([bastios#192](https://github.com/yukikotani231/bastios/issues/192))
+- [ ] crun runs an Alpine image, rootful and rootless, then runc and images pulled from a registry ([bastios#193](https://github.com/yukikotani231/bastios/issues/193))
+
+As with v4, all of it is in Bastio under the same proofs. Container isolation is only as strong as the kernel under it, which is the argument for writing that kernel in a language whose memory safety is proved.
+
+## v7: arm64
+
+Goal, set 2026-10-11: Bastio and BastiOS run on AArch64 as well as x86-64, on QEMU's `virt` machine first and then on physical boards. Tracked in [#119](https://github.com/yukikotani231/bastiolang/issues/119).
+- [ ] Hosted AArch64 through the C backend, tested under `qemu-aarch64` ([#121](https://github.com/yukikotani231/bastiolang/issues/121))
+- [ ] Capabilities parameterized by architecture: VMSAv8-64 translation tables, the EL0 context, system registers, no port I/O ([#122](https://github.com/yukikotani231/bastiolang/issues/122))
+- [ ] Kernel and user targets for AArch64, with the barriers its weaker memory model needs in `Atomic`, `Lock` and `Shared` ([#123](https://github.com/yukikotani231/bastiolang/issues/123))
+- [ ] BastiOS boots on `virt`: exception vectors, MMU, GICv3, generic timer, PL011 ([bastios#194](https://github.com/yukikotani231/bastios/issues/194))
+- [ ] virtio drivers and multi-core start with PSCI ([bastios#195](https://github.com/yukikotani231/bastios/issues/195))
+- [ ] The Linux arm64 system-call ABI and AArch64 ELF binaries ([bastios#196](https://github.com/yukikotani231/bastios/issues/196))
+- [ ] A native AArch64 backend in stage1, so the C compiler leaves the trusted base on arm64 too ([#124](https://github.com/yukikotani231/bastiolang/issues/124))
+- [ ] Real hardware: a UEFI arm64 machine, then Raspberry Pi 5 ([bastios#197](https://github.com/yukikotani231/bastios/issues/197))
+
+Invariant 1 holds on arm64: system registers and device memory are reached only through capability types. What the port adds to the trusted base (the exception vectors, early boot) is listed and reviewed under invariant 3.
+
+## Performance
 
 Safety must not cost speed at run time; that is the point of proving it instead of checking it. Three things are tracked:
 1. **Generated code.** Compare Bastio programs with equivalent hand-written C (same algorithm, `-O2`). A first measurement (2026-10-10, array sum, sieve, binary tree, vector push) found tight loops on par with C, and two runtime gaps: `Vec` growth (`bst_vec_grow` used `calloc` plus a byte-by-byte copy, about 3x slower pushes; fixed with `realloc`, now 1.04x) and allocation order in tree building (about 1.4x; fixed by allocating a box before evaluating its contents, so trees are laid out parent first, now 0.97x). A native backend (v3) would lose the C compiler's optimizations, so it must be measured against the C backend before it replaces it. The first measurement of the stage0 prototype (2026-10-10, best of 3, time relative to the C backend): sieve 1.04x, vec 1.32x, sum 1.42x, tree 1.65x. The loops themselves are close to gcc's; what is missing is vectorization (sum), inlining one level of recursion (tree) and passing arguments in registers (tree, vec). After inlining and the register work (second round, same day), instructions executed relative to the C backend's binary (valgrind, which is steadier than time on a shared machine): der 1.83 -> 1.25, utf8 1.63 -> 1.27, vec 1.62 -> 1.42, sum 1.25 (the C loop is vectorized), tree 1.25 -> 1.19 (most of tree is the allocator, the same for both). The rest is mostly calls that remain (recursive ones, arguments on the stack) and values that stay in memory. `bench/run.sh` prints the native time next to the C time on every run.
@@ -161,6 +191,14 @@ Safety must not cost speed at run time; that is the point of proving it instead 
 - [x] Functions proved in parallel (2026-10-10): since each function has its own scope, the functions are shared out among several Z3 processes (`BASTIO_JOBS`, default the CPU count, at most 8). The error reported is still that of the first failing function in program order. The kernel had grown back to 4.3 s; on 4 CPUs it now takes 1.4 s
 - [ ] stage1 data structures: the phases written so far use linear searches (types, instances, places, variables). Fine for today's sources (checking all of stage1, about 6,000 lines, takes 47 ms, the same as stage0); replace with hashing or indexed lookups before self-compilation if measurements show they dominate
 - [ ] BastiOS: a `bench` shell command (or test mode) that times the kernel paths above in QEMU (relative numbers only; QEMU timing is not hardware timing)
+- [ ] Optimization, tracked in [#120](https://github.com/yukikotani231/bastiolang/issues/120). The targets: the native backend at or below the C backend on every `bench/` program, then made the default; every row of BastiOS's `make bench` within 2x of Linux.
+  - [ ] An IR between the checker and the backends, with scalar replacement of structs ([#125](https://github.com/yukikotani231/bastiolang/issues/125))
+  - [ ] Register allocation over the IR, all argument registers ([#126](https://github.com/yukikotani231/bastiolang/issues/126))
+  - [ ] Inlining by heuristic, constant propagation, dead code, loop-invariant code motion, and facts from the proofs (bounds, ranges, no aliasing) given to the optimizer ([#127](https://github.com/yukikotani231/bastiolang/issues/127))
+  - [ ] Vectorization of simple loops ([#128](https://github.com/yukikotani231/bastiolang/issues/128))
+  - [ ] The native backend as the default, BastiOS built with it ([#129](https://github.com/yukikotani231/bastiolang/issues/129))
+  - [ ] Compile and proof time: a proof cache per function ([#130](https://github.com/yukikotani231/bastiolang/issues/130))
+  - [ ] BastiOS: system calls without CR3 reloads ([bastios#198](https://github.com/yukikotani231/bastios/issues/198)), disk writes and reads ([bastios#199](https://github.com/yukikotani231/bastios/issues/199)), copy-on-write fork and per-page user copies ([bastios#200](https://github.com/yukikotani231/bastios/issues/200)), TCP bulk ([bastios#201](https://github.com/yukikotani231/bastios/issues/201)), `make bench` kept per release ([bastios#202](https://github.com/yukikotani231/bastios/issues/202))
 
 **Review cadence.** Performance is reviewed at every roadmap milestone (each checked item in v2 to v4) and whenever a phase of the self-hosted compiler lands: run `bench/`, compare with the previous numbers, and note anything that got slower in the PR.
 
