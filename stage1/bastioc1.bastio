@@ -4,15 +4,20 @@
 // Pipeline: load -> monomorphize -> check (types and linearity) -> verify
 // (Z3) -> C -> the system C compiler.
 //
-// usage: bastioc1 [--help] [--check] [--emit-c] [--target T] [--lib DIR] [--backend B] [--emit-asm] [--header F] [--dump-smt] [-o out] <file.bastio>...
+// usage: bastioc1 [--help] [--check] [--emit-c] [--target T] [--arch A] [--lib DIR] [--backend B] [--emit-asm] [--header F] [--dump-smt] [-o out] <file.bastio>...
 //   (default)   verify, then build a native executable `out` (default: a.out)
 //               with the C compiler `$CC` (default: cc)
 //   --check     stop after verification
 //   --emit-c    write the generated C to `out` (default: out.c) instead of
 //               building
 //   --target    `hosted` (default): a normal program on the C library
-//               `kernel`: freestanding C for a bare-metal x86-64 kernel (implies --emit-c)
+//               `kernel`: freestanding C for a bare-metal kernel (implies --emit-c)
 //               `user`: freestanding C for a user program under BastiOS (implies --emit-c)
+//   --arch      `x86_64` (default) or `aarch64`, as for bastioc0: aarch64
+//               changes the default C compiler to `aarch64-linux-gnu-gcc`
+//               (`CC` still overrides it); C backend only. With `--target
+//               kernel` or `user` it selects the AArch64 prelude (stage1
+//               only: bastioc0 knows only x86-64 bare metal)
 //   --lib DIR   also look for imported files in DIR (see `resolve` in
 //               loader.bastio); may be given more than once
 //   --backend native  generate x86-64 assembly directly instead of C, then
@@ -25,6 +30,7 @@
 //   --dump-smt  once every proof succeeds, print every query sent to Z3 on
 //               standard output, as bastioc0 does
 //   --trusted-base  list and count the hand-written trusted base, then exit
+//               (for AArch64's preludes after `--arch aarch64`)
 //   --help      print the options, then exit
 // Several input files form one program, as for bastioc0.
 //
@@ -77,23 +83,23 @@ fn b1_render(out: &mut Vec[u64], p: &Parser, ld: &Loader, file: u64, line: u64, 
   // Line 0 is no line of the program (the solver failed to start, say):
   // the file name alone, and no source line (stage0's `Diag::render`).
   if line > 0 {
-    out_str(&mut out, ":");
-    out_num(&mut out, line);
-    out_str(&mut out, ":");
-    out_num(&mut out, col);
+    w_s(&mut out, ":");
+    w_num(&mut out, line);
+    w_s(&mut out, ":");
+    w_num(&mut out, col);
   }
-  out_str(&mut out, ": error[");
-  out_str(&mut out, code);
-  out_str(&mut out, "]");
+  w_s(&mut out, ": error[");
+  w_s(&mut out, code);
+  w_s(&mut out, "]");
   if vec_len(msg) > 0 {
-    out_str(&mut out, ": ");
+    w_s(&mut out, ": ");
     k = 0;
     while k < vec_len(msg) {
       vec_push(&mut out, u_at(msg, k));
       k = k + 1;
     }
   }
-  out_str(&mut out, "\n");
+  w_s(&mut out, "\n");
   // The source line: the file's text runs to where the next file's starts.
   let mut end = blen(p.src);
   let nf = cg_add(file, 1);
@@ -114,15 +120,15 @@ fn b1_render(out: &mut Vec[u64], p: &Parser, ld: &Loader, file: u64, line: u64, 
   // The gutter: " 12 | " before the source line, as wide before the
   // caret line and the notes.
   let mut digits = vec_new[u64]();
-  out_num(&mut digits, line);
+  w_num(&mut digits, line);
   if line > 0 && l >= line && i < end {
-    out_str(&mut out, " ");
+    w_s(&mut out, " ");
     k = 0;
     while k < vec_len(digits) {
       vec_push(&mut out, u_at(digits, k));
       k = k + 1;
     }
-    out_str(&mut out, " | ");
+    w_s(&mut out, " | ");
     let mut j = i;
     while j < end && src_at(p, j) != 10 {
       j = j + 1;
@@ -136,9 +142,9 @@ fn b1_render(out: &mut Vec[u64], p: &Parser, ld: &Loader, file: u64, line: u64, 
       vec_push(&mut out, src_at(p, i));
       i = i + 1;
     }
-    out_str(&mut out, "\n");
+    w_s(&mut out, "\n");
     b1_pad(&mut out, vec_len(digits));
-    out_str(&mut out, " | ");
+    w_s(&mut out, " | ");
     // Columns count characters (a UTF-8 continuation byte is not one);
     // tabs before the error stay tabs, so the caret lines up.
     let mut q = ls;
@@ -146,25 +152,25 @@ fn b1_render(out: &mut Vec[u64], p: &Parser, ld: &Loader, file: u64, line: u64, 
     while c < col {
       if q < e {
         if src_at(p, q) == 9 {
-          out_str(&mut out, "\t");
+          w_s(&mut out, "\t");
         } else {
-          out_str(&mut out, " ");
+          w_s(&mut out, " ");
         }
         q = q + 1;
         while q < e && src_at(p, q) >= 128 && src_at(p, q) < 192 {
           q = q + 1;
         }
       } else {
-        out_str(&mut out, " ");
+        w_s(&mut out, " ");
       }
       c = c + 1;
     }
     let mut n = b1_token_len(p, q, e);
     while n > 0 {
-      out_str(&mut out, "^");
+      w_s(&mut out, "^");
       n = n - 1;
     }
-    out_str(&mut out, "\n");
+    w_s(&mut out, "\n");
   }
   // Each note line comes as "  = ...": its "=" goes under the gutter's "|".
   k = 0;
@@ -172,7 +178,7 @@ fn b1_render(out: &mut Vec[u64], p: &Parser, ld: &Loader, file: u64, line: u64, 
   while k < vec_len(notes) {
     if bol && k + 2 < vec_len(notes) && u_at(notes, k) == 32 && u_at(notes, k + 1) == 32 && u_at(notes, k + 2) == 61 {
       b1_pad(&mut out, vec_len(digits));
-      out_str(&mut out, " ");
+      w_s(&mut out, " ");
       k = k + 2;
     }
     let ch = u_at(notes, k);
@@ -185,10 +191,10 @@ fn b1_render(out: &mut Vec[u64], p: &Parser, ld: &Loader, file: u64, line: u64, 
 
 /// `n + 1` spaces: the gutter of a line number of `n` digits.
 fn b1_pad(out: &mut Vec[u64], n: u64) {
-  out_str(&mut out, " ");
+  w_s(&mut out, " ");
   let mut k = 0;
   while k < n {
-    out_str(&mut out, " ");
+    w_s(&mut out, " ");
     k = k + 1;
   }
 }
@@ -312,13 +318,13 @@ fn b1_tool(host: &Host, argv: Vec[Bytes], what: Str, out: &mut Vec[u64]) -> u64 
     return 0;
   }
   if st == 127 {
-    out_str(&mut out, "bastioc1: cannot run ");
-    out_str(&mut out, what);
-    out_str(&mut out, "\n");
+    w_s(&mut out, "bastioc1: cannot run ");
+    w_s(&mut out, what);
+    w_s(&mut out, "\n");
   } else {
-    out_str(&mut out, "bastioc1: ");
-    out_str(&mut out, what);
-    out_str(&mut out, " failed (this is a compiler bug)\n");
+    w_s(&mut out, "bastioc1: ");
+    w_s(&mut out, what);
+    w_s(&mut out, " failed (this is a compiler bug)\n");
   }
   return 3;
 }
@@ -333,13 +339,13 @@ fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, em
   g.target = target;
   let mut status = 0;
   if !x86_program(&mut g, c, &mut m, p) {
-    out_str(&mut out, "bastioc1: ");
+    w_s(&mut out, "bastioc1: ");
     let mut k = 0;
     while k < vec_len(g.fmsg) {
       vec_push(&mut out, u_at(g.fmsg, k));
       k = k + 1;
     }
-    out_str(&mut out, "\n");
+    w_s(&mut out, "\n");
     status = 4;
   } else if emit_asm || target != TARGET_HOSTED {
     let mut path = b1_concat(outp, "");
@@ -348,9 +354,9 @@ fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, em
       path = bfrom("out.s");
     }
     if !b1_write(host, path, g.out) {
-      out_str(&mut out, "bastioc1: cannot write ");
+      w_s(&mut out, "bastioc1: cannot write ");
       b1_bytes(&mut out, path);
-      out_str(&mut out, "\n");
+      w_s(&mut out, "\n");
       status = 2;
     }
     bfree(path);
@@ -363,9 +369,9 @@ fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, em
     let sfile = b1_concat(exe, ".s");
     let ofile = b1_concat(exe, ".o");
     if !b1_write(host, sfile, g.out) {
-      out_str(&mut out, "bastioc1: cannot write ");
+      w_s(&mut out, "bastioc1: cannot write ");
       b1_bytes(&mut out, sfile);
-      out_str(&mut out, "\n");
+      w_s(&mut out, "\n");
       status = 2;
     } else {
       let mut asm = vec_new[Bytes]();
@@ -409,20 +415,21 @@ fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, em
 /// What `--help` prints (stage0's `HELP`, with this compiler's name and
 /// options).
 fn b1_help(out: &mut Vec[u64]) {
-  out_str(&mut out, "usage: bastioc1 [options] <file.bastio>...\n");
-  out_str(&mut out, "Proves the program memory safe with Z3, then compiles it with `cc`.\n");
-  out_str(&mut out, "\n");
-  out_str(&mut out, "  --check          verify only; write nothing\n");
-  out_str(&mut out, "  --emit-c         write the generated C instead of an executable\n");
-  out_str(&mut out, "  --target T       hosted (the default), or kernel or user for BastiOS (these write C, or assembly with --backend native)\n");
-  out_str(&mut out, "  --backend B      c (the default) or native (experimental: x86-64 assembly)\n");
-  out_str(&mut out, "  --emit-asm       with --backend native: write the assembly instead of an executable\n");
-  out_str(&mut out, "  --lib DIR        also look for imported files in DIR\n");
-  out_str(&mut out, "  --header FILE    also write a C header for the program's `export fn`s\n");
-  out_str(&mut out, "  -o FILE          the output file (default: a.out, or out.c for C and out.s for assembly)\n");
-  out_str(&mut out, "  --dump-smt       print every query sent to the solver\n");
-  out_str(&mut out, "  --trusted-base   print the trusted runtime code and exit\n");
-  out_str(&mut out, "  --help           print this and exit\n");
+  w_s(&mut out, "usage: bastioc1 [options] <file.bastio>...\n");
+  w_s(&mut out, "Proves the program memory safe with Z3, then compiles it with `cc`.\n");
+  w_s(&mut out, "\n");
+  w_s(&mut out, "  --check          verify only; write nothing\n");
+  w_s(&mut out, "  --emit-c         write the generated C instead of an executable\n");
+  w_s(&mut out, "  --target T       hosted (the default), or kernel or user for BastiOS (these write C, or assembly with --backend native)\n");
+  w_s(&mut out, "  --arch A         x86_64 (the default) or aarch64 (C backend; hosted programs compile with aarch64-linux-gnu-gcc)\n");
+  w_s(&mut out, "  --backend B      c (the default) or native (experimental: x86-64 assembly)\n");
+  w_s(&mut out, "  --emit-asm       with --backend native: write the assembly instead of an executable\n");
+  w_s(&mut out, "  --lib DIR        also look for imported files in DIR\n");
+  w_s(&mut out, "  --header FILE    also write a C header for the program's `export fn`s\n");
+  w_s(&mut out, "  -o FILE          the output file (default: a.out, or out.c for C and out.s for assembly)\n");
+  w_s(&mut out, "  --dump-smt       print every query sent to the solver\n");
+  w_s(&mut out, "  --trusted-base   print the trusted runtime code and exit\n");
+  w_s(&mut out, "  --help           print this and exit\n");
 }
 
 fn main(con: &mut Serial, host: &mut Host) -> u64 {
@@ -434,6 +441,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
   let mut emit_asm = false;
   let mut dump_smt = false;
   let mut target = TARGET_HOSTED;
+  let mut aarch64 = false;
   let mut outp = balloc(0);
   let mut has_out = false;
   let mut hdr = balloc(0);
@@ -466,9 +474,9 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
       } else if b1_is(b, "native") {
         native = true;
       } else {
-        out_str(&mut out, "bastioc1: unknown backend `");
+        w_s(&mut out, "bastioc1: unknown backend `");
         b1_bytes(&mut out, b);
-        out_str(&mut out, "` (expected `c` or `native`)\n");
+        w_s(&mut out, "` (expected `c` or `native`)\n");
         status = 2;
       }
       bfree(b);
@@ -485,9 +493,24 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
         target = TARGET_USER;
         emit_c = true;
       } else {
-        out_str(&mut out, "bastioc1: unknown target `");
+        w_s(&mut out, "bastioc1: unknown target `");
         b1_bytes(&mut out, t);
-        out_str(&mut out, "` (expected `hosted`, `kernel` or `user`)\n");
+        w_s(&mut out, "` (expected `hosted`, `kernel` or `user`)\n");
+        status = 2;
+      }
+      bfree(t);
+    } else if b1_is(a, "--arch") {
+      bfree(a);
+      i = cg_add(i, 1);
+      let t = host_arg(host, i);
+      if b1_is(t, "x86_64") {
+        aarch64 = false;
+      } else if b1_is(t, "aarch64") {
+        aarch64 = true;
+      } else {
+        w_s(&mut out, "bastioc1: unknown architecture `");
+        b1_bytes(&mut out, t);
+        w_s(&mut out, "` (expected `x86_64` or `aarch64`)\n");
         status = 2;
       }
       bfree(t);
@@ -509,7 +532,11 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
     } else if b1_is(a, "--trusted-base") {
       bfree(a);
       let mut tb = vec_new[u64]();
-      trusted_base(&mut tb);
+      let mut tb_arch = ARCH_X86_64;
+      if aarch64 {
+        tb_arch = ARCH_AARCH64;
+      }
+      trusted_base(&mut tb, tb_arch);
       let mut j = 0;
       while j < vec_len(tb) {
         let ch = vec_get(tb, j);
@@ -538,9 +565,9 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
       outp = host_arg(host, i);
       has_out = true;
     } else if blen(a) > 0 && bget(a, 0) == 45 {
-      out_str(&mut out, "bastioc1: unknown option `");
+      w_s(&mut out, "bastioc1: unknown option `");
       b1_bytes(&mut out, a);
-      out_str(&mut out, "`\n");
+      w_s(&mut out, "`\n");
       bfree(a);
       status = 2;
     } else {
@@ -558,7 +585,11 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
     return 0;
   }
   if status == 0 && vec_len(inputs) == 0 {
-    out_str(&mut out, "usage: bastioc1 [--check] [--emit-c] [--target hosted|kernel|user] [--lib DIR] [--backend c|native] [--emit-asm] [--header F] [-o out] <file.bastio>...\n");
+    w_s(&mut out, "usage: bastioc1 [--check] [--emit-c] [--target hosted|kernel|user] [--arch x86_64|aarch64] [--lib DIR] [--backend c|native] [--emit-asm] [--header F] [-o out] <file.bastio>...\n");
+    status = 2;
+  }
+  if status == 0 && aarch64 && native {
+    w_s(&mut out, "bastioc1: the native backend generates x86-64 only; use the C backend for --arch aarch64\n");
     status = 2;
   }
   // The inputs, as one string for messages.
@@ -566,7 +597,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
   let mut k = 0;
   while k < vec_len(inputs) {
     if k > 0 {
-      out_str(&mut input, " ");
+      w_s(&mut input, " ");
     }
     let b = vec_swap(&mut inputs, k, balloc(0));
     b1_bytes(&mut input, b);
@@ -580,9 +611,9 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
     let path = vec_swap(&mut inputs, k, balloc(0));
     let r = load(host, &mut p, &mut ld, path, 0, 0, 0, false);
     if r == 2 {
-      out_str(&mut out, "bastioc1: cannot read ");
+      w_s(&mut out, "bastioc1: cannot read ");
       b1_bytes(&mut out, path);
-      out_str(&mut out, "\n");
+      w_s(&mut out, "\n");
       status = 2;
     } else if r != 0 {
       if p.ecode == CODE_IMPORT {
@@ -603,12 +634,16 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
       status = 1;
     } else {
       let mut c = checker_new(&mut m, p, target);
+      if aarch64 {
+        c.arch = ARCH_AARCH64;
+      }
       check_program(&mut c, &mut m, p);
       if c.failed {
         b1_render(&mut out, p, ld, c.efile, c.eline, c.ecol, b1_code(c.ecode), c.emsg, c.enotes);
         status = 1;
       } else {
         let mut v = vr_new(&mut m, p);
+        vr_set_arch(&mut v, c.arch);
         let mut rep = vec_new[u64]();
         let starts = solver_starts(host);
         // `--dump-smt` prints every query once all are proved, so it keeps
@@ -627,9 +662,9 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
         }
         if !starts {
           let mut msg = vec_new[u64]();
-          out_str(&mut msg, "could not start the SMT solver `");
+          w_s(&mut msg, "could not start the SMT solver `");
           solver_name(host, &mut msg);
-          out_str(&mut msg, "` (install Z3 and put `z3` on PATH)");
+          w_s(&mut msg, "` (install Z3 and put `z3` on PATH)");
           b1_render(&mut out, p, ld, 0, 0, 0, "E-SOLVER", msg, rep);
           vec_free(msg);
           status = 1;
@@ -645,26 +680,27 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
           vec_free(msg);
           status = 1;
         } else {
-          out_str(&mut out, "bastioc1: ");
+          w_s(&mut out, "bastioc1: ");
           k = 0;
           while k < vec_len(input) {
             vec_push(&mut out, u_at(input, k));
             k = k + 1;
           }
-          out_str(&mut out, ": ");
-          out_num(&mut out, v.obligations);
-          out_str(&mut out, " proof obligation(s) discharged\n");
+          w_s(&mut out, ": ");
+          w_num(&mut out, v.obligations);
+          w_s(&mut out, " proof obligation(s) discharged\n");
         }
         vec_free(rep);
         vr_free(v);
         if status == 0 && !check_only && has_hdr {
           let guard = header_guard(hdr);
           let mut h = cg_new(target);
+          h.arch = c.arch;
           header(&mut h, c, &mut m, p, guard);
           if !b1_write(host, hdr, h.out) {
-            out_str(&mut out, "bastioc1: cannot write ");
+            w_s(&mut out, "bastioc1: cannot write ");
             b1_bytes(&mut out, hdr);
-            out_str(&mut out, "\n");
+            w_s(&mut out, "\n");
             status = 2;
           }
           cg_free(h);
@@ -683,19 +719,20 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
             k = k + 1;
           }
           if !emit_c && !has_main {
-            out_str(&mut out, "bastioc1: ");
+            w_s(&mut out, "bastioc1: ");
             k = 0;
             while k < vec_len(input) {
               vec_push(&mut out, u_at(input, k));
               k = k + 1;
             }
-            out_str(&mut out, " is a library (it has no `main`): build it with --emit-c and link the C into a program\n");
+            w_s(&mut out, " is a library (it has no `main`): build it with --emit-c and link the C into a program\n");
             status = 2;
           } else if native {
             b1_flush(host, &mut out);
             status = b1_native(host, c, &mut m, p, target, emit_asm, outp, has_out, &mut out);
           } else {
             let mut g = cg_new(target);
+            g.arch = c.arch;
             cg_program(&mut g, c, &mut m, p);
             b1_flush(host, &mut out);
             if emit_c {
@@ -704,9 +741,9 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
                 outp = bfrom("out.c");
               }
               if !b1_write(host, outp, g.out) {
-                out_str(&mut out, "bastioc1: cannot write ");
+                w_s(&mut out, "bastioc1: cannot write ");
                 b1_bytes(&mut out, outp);
-                out_str(&mut out, "\n");
+                w_s(&mut out, "\n");
                 status = 2;
               }
             } else {
@@ -716,16 +753,21 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
               }
               let cfile = b1_concat(outp, ".c");
               if !b1_write(host, cfile, g.out) {
-                out_str(&mut out, "bastioc1: cannot write ");
+                w_s(&mut out, "bastioc1: cannot write ");
                 b1_bytes(&mut out, cfile);
-                out_str(&mut out, "\n");
+                w_s(&mut out, "\n");
                 status = 2;
               } else {
-                // The C compiler: `CC`, as for bastioc0, or `cc`.
+                // The C compiler: `CC`, as for bastioc0, or `cc`
+                // (`aarch64-linux-gnu-gcc` for --arch aarch64).
                 let mut cc = balloc(0);
                 if !host_env(host, "CC", &mut cc) {
                   bfree(cc);
-                  cc = bfrom("cc");
+                  if aarch64 {
+                    cc = bfrom("aarch64-linux-gnu-gcc");
+                  } else {
+                    cc = bfrom("cc");
+                  }
                 }
                 let mut argv = vec_new[Bytes]();
                 vec_push(&mut argv, b1_concat(cc, ""));
@@ -742,12 +784,12 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
                 vec_push(&mut rm, b1_concat(cfile, ""));
                 b1_run(host, rm);
                 if st == 127 {
-                  out_str(&mut out, "bastioc1: cannot run `");
+                  w_s(&mut out, "bastioc1: cannot run `");
                   b1_bytes(&mut out, cc);
-                  out_str(&mut out, "`\n");
+                  w_s(&mut out, "`\n");
                   status = 3;
                 } else if st != 0 {
-                  out_str(&mut out, "bastioc1: the C compiler failed (this is a compiler bug)\n");
+                  w_s(&mut out, "bastioc1: the C compiler failed (this is a compiler bug)\n");
                   status = 3;
                 }
                 bfree(cc);

@@ -3,7 +3,7 @@
 // Pipeline: lex -> parse -> check (types + linearity) -> verify (SMT) -> C.
 // The C output is compiled with the system C compiler.
 //
-// usage: bastioc0 [--check] [--emit-c] [--dump-smt] [--target T] [--lib DIR] [--header F] [-o out] <file.bastio>...
+// usage: bastioc0 [--check] [--emit-c] [--dump-smt] [--target T] [--arch A] [--lib DIR] [--header F] [-o out] <file.bastio>...
 //   (default)   verify, then build a native executable `out` (default: a.out)
 //   --check     stop after verification
 //   --emit-c    write the generated C to `out` instead of building
@@ -38,6 +38,11 @@
 //   --target    `hosted` (default): a normal program on the C library
 //               `kernel`: freestanding C for a bare-metal x86-64 kernel (implies --emit-c)
 //               `user`: freestanding C for a user program under BastiOS (implies --emit-c)
+//   --arch      `x86_64` (default) or `aarch64`: the processor the program
+//               is built for. The hosted C is the same for both; aarch64
+//               changes the default C compiler to `aarch64-linux-gnu-gcc`
+//               (`CC` still overrides it), and is hosted-only with the C
+//               backend for now
 // Several input files form one program; constants must be defined before use,
 // in command-line order. A file can also pull others in with `import "path";`
 // lines at its top (see `Loader`).
@@ -214,6 +219,7 @@ Proves the program memory safe with Z3, then compiles it with `cc`.
   --check          verify only; write nothing
   --emit-c         write the generated C instead of an executable
   --target T       hosted (the default), or kernel or user for BastiOS (these write C, or assembly with --backend native)
+  --arch A         x86_64 (the default) or aarch64 (hosted, C backend; compiles with aarch64-linux-gnu-gcc)
   --backend B      c (the default) or native (experimental: x86-64 assembly)
   --emit-asm       with --backend native: write the assembly instead of an executable
   --lib DIR        also look for imported files in DIR
@@ -237,6 +243,7 @@ fn main() {
     let mut dump_verify = false;
     let mut dump_c = false;
     let mut target = codegen::Target::Hosted;
+    let mut aarch64 = false;
     let mut out: Option<String> = None;
     let mut header: Option<String> = None;
     let mut inputs: Vec<String> = Vec::new();
@@ -291,6 +298,17 @@ fn main() {
                     }
                 };
             }
+            "--arch" => {
+                i += 1;
+                aarch64 = match args.get(i).map(|s| s.as_str()) {
+                    Some("x86_64") => false,
+                    Some("aarch64") => true,
+                    other => {
+                        eprintln!("bastioc0: unknown architecture {:?} (expected `x86_64` or `aarch64`)", other);
+                        exit(2);
+                    }
+                };
+            }
             "--header" => {
                 i += 1;
                 header = args.get(i).cloned();
@@ -312,7 +330,15 @@ fn main() {
         i += 1;
     }
     if inputs.is_empty() {
-        eprintln!("usage: bastioc0 [--check] [--emit-c] [--dump-smt] [--target hosted|kernel|user] [--lib DIR] [--header F] [-o out] <file.bastio>...");
+        eprintln!("usage: bastioc0 [--check] [--emit-c] [--dump-smt] [--target hosted|kernel|user] [--arch x86_64|aarch64] [--lib DIR] [--header F] [-o out] <file.bastio>...");
+        exit(2);
+    }
+    if aarch64 && native {
+        eprintln!("bastioc0: the native backend generates x86-64 only; use the C backend for --arch aarch64");
+        exit(2);
+    }
+    if aarch64 && target != codegen::Target::Hosted {
+        eprintln!("bastioc0: --arch aarch64 supports only the hosted target so far");
         exit(2);
     }
     if dump_tokens {
@@ -464,7 +490,7 @@ fn main() {
         eprintln!("bastioc0: cannot write {}: {}", cfile, e);
         exit(2)
     });
-    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
+    let cc = std::env::var("CC").unwrap_or_else(|_| if aarch64 { "aarch64-linux-gnu-gcc" } else { "cc" }.into());
     let status = Command::new(&cc).args(["-O2", "-std=c11", "-w", "-o", &exe, &cfile]).status();
     let _ = std::fs::remove_file(&cfile);
     match status {

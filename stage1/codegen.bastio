@@ -46,14 +46,16 @@ struct Cg {
   tmps: u64,
   /// The instance being generated.
   env: u64,
-  target: u64
+  target: u64,
+  /// The architecture (`ARCH_*`), set by the driver after `cg_new`.
+  arch: u64
 }
 
 fn cg_new(target: u64) -> Cg {
   return Cg {
     out: vec_new[u64](), body: vec_new[u64](), pool: vec_new[u64](), smp: vec_new[u64](), nsmp: 0,
     vecs: vec_new[u64](), boxed: vec_new[u64](), blobs: vec_new[u64](),
-    vars: vec_new[CgVar](), mutp: vec_new[CgVar](), tmps: 0, env: 0, target: target
+    vars: vec_new[CgVar](), mutp: vec_new[CgVar](), tmps: 0, env: 0, target: target, arch: ARCH_X86_64
   };
 }
 
@@ -104,7 +106,7 @@ fn cg_cut(g: &mut Cg, start: u64) {
 }
 
 fn cg_t(g: &mut Cg, s: Str) {
-  cg_s(&mut g.pool, s);
+  w_s(&mut g.pool, s);
 }
 
 fn cg_sp(g: &mut Cg, x: CgSp) {
@@ -118,20 +120,7 @@ fn cg_sp(g: &mut Cg, x: CgSp) {
 }
 
 fn cg_n(g: &mut Cg, x: u64) {
-  let mut d = vec_new[u64]();
-  let mut y = x;
-  vec_push(&mut d, 48 + y % 10);
-  y = y / 10;
-  while y > 0 {
-    vec_push(&mut d, 48 + y % 10);
-    y = y / 10;
-  }
-  let mut k = vec_len(d);
-  while k > 0 {
-    k = k - 1;
-    vec_push(&mut g.pool, u_at(d, k));
-  }
-  vec_free(d);
+  w_num(&mut g.pool, x);
 }
 
 fn cg_src(g: &mut Cg, p: &Parser, s: u64, e: u64) {
@@ -2196,7 +2185,7 @@ fn cg_typedef(g: &mut Cg, c: &Checker, m: &Mono, p: &Parser, x: u64, done: &mut 
 }
 
 fn cg_out(g: &mut Cg, s: Str) {
-  cg_s(&mut g.out, s);
+  w_s(&mut g.out, s);
 }
 
 /// The C types for the program's structs and enums. All are declared first,
@@ -2558,7 +2547,7 @@ fn cg_program(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser) {
     cg_fn(&mut g, c, &mut m, p, u_at(m.fns, k));
     k = k + 1;
   }
-  cg_prelude(&mut g.out, g.target);
+  cg_prelude(&mut g.out, g.target, g.arch);
   cg_types(&mut g, c, m, p);
   cg_helpers(&mut g, m, p);
   cg_blobs(&mut g, p);

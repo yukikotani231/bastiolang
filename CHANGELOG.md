@@ -109,6 +109,15 @@ What will be 0.2.0.
 
 ### Compilers
 
+- `--arch aarch64` builds for AArch64 with the C backend. Hosted programs
+  build for AArch64 Linux in both compilers (#121). In bastioc1, the kernel
+  and user targets get AArch64 preludes too: a PL011 console, VMSAv8-64
+  page tables in TTBR0, EL0 entry through the platform, `svc` system calls,
+  and the barriers AArch64's weaker ordering needs around MMIO and DMA. An
+  AArch64 kernel has no `Ports`, its device window starts at 0, and
+  `cpu_get`/`cpu_set` use AArch64's saved registers (#122, #123).
+  `tests/aarch64.sh` runs the tests under `qemu-aarch64` and boots a small
+  kernel on QEMU's virt machine.
 - Clearer messages, the same in both compilers: `E-VERIFY-CAST`,
   `E-VERIFY-SHIFT` and `E-VERIFY-ALLOC` end with a hint like the other
   proof failures; a loop body that breaks an invariant shows its

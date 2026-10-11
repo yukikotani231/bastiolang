@@ -97,3 +97,5 @@ A survey of the hand-written helpers in `stage1/`, BastiOS (`src/` and `user/`) 
 | Allocation maps, a byte or word per entry with a wrap-around search (disk blocks, pages) | 2 (BastiOS) | `core/bitmap.bastio` (`map_*` bytes, `Bits` packed) |
 | Fixed-size id tables: process table, descriptors per process, pipes, sockets (`NPROC`, `NFD`, ...) | several (BastiOS) | `Slots`, `rows_grow`, `bits_grow` |
 | The Internet checksum (`cadd`, `sum16`, `csum`, `l4_sum`) | 1 (BastiOS network) | `core/csum.bastio` |
+
+stage1 does not import core, so its copies were merged inside stage1 instead: `stage1/wtext.bastio` holds the single copy of each `Vec[u64]` text helper (`w_s`, `w_num`, `w_hex`, `w_append`, `u_at`, `has_id`, `copy_set`), and each phase's own `*_s` and `*_num` functions on its message buffer call them.

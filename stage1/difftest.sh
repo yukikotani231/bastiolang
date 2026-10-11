@@ -87,8 +87,9 @@ for f in $(grep -l '^// stage1-only:' tests/pass/*.bastio tests/fail/*.bastio te
   s1only=$((s1only+1))
   want=$(sed -n 's|^// expect-error: *||p' "$f" | head -1)
   target=$(sed -n 's|^// target: *||p' "$f" | head -1)
+  arch=$(sed -n 's|^// arch: *||p' "$f" | head -1)
   case $f in tests/user/* | ../bastios/user/*) target=user ;; esac
-  if "$BASTIOC" --check --target "${target:-hosted}" "$f" 2>"$tmp/s1.err" \
+  if "$BASTIOC" --check --target "${target:-hosted}" --arch "${arch:-x86_64}" "$f" 2>"$tmp/s1.err" \
      || { [ -n "$want" ] && grep -q "error\[$want\]" "$tmp/s1.err"; }; then
     echo "STALE $f is marked stage1-only, but stage0 handles it: remove the marker"; status=1
   fi

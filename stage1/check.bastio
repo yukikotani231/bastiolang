@@ -24,12 +24,17 @@ const TARGET_HOSTED: u64 = 0;
 const TARGET_KERNEL: u64 = 1;
 const TARGET_USER: u64 = 2;
 
+/// The architectures (`--arch`).
+const ARCH_X86_64: u64 = 0;
+const ARCH_AARCH64: u64 = 1;
+
 // Where a builtin is available.
 const AV_ALL: u64 = 0;
 const AV_HOSTED: u64 = 1;
 const AV_MEM: u64 = 2;       // hosted and kernel
 const AV_KERNEL: u64 = 3;
 const AV_USER: u64 = 4;
+const AV_PORTS: u64 = 5;     // hosted (simulated) and the x86-64 kernel: AArch64 has no I/O ports
 
 /// A builtin's signature: up to five parameter types.
 struct Bsig { name: Str, avail: u64, np: u64, p0: u64, p1: u64, p2: u64, p3: u64, p4: u64, ret: u64 }
@@ -68,6 +73,8 @@ struct Checker {
   /// The variables bound by enclosing `forall`s (their nodes).
   bound: Vec[u64],
   target: u64,
+  /// The architecture (`ARCH_*`), set by the driver after `checker_new`.
+  arch: u64,
   /// The return type of the function being checked.
   ret: u64,
   /// The instance being checked (0 for a plain spec fn).
@@ -176,7 +183,7 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   let mut c = Checker {
     bs: vec_new[Bsig](), ghosts: vec_new[Ghost](), fstart: vec_new[u64](), ftys: vec_new[u64](),
     paths: paths, pix: ix_new(), cix: ix_new(), bix: ix_new(), vars: vec_new[Var](), moved: vec_new[u64](), mlocs: vec_new[u64](), bound: vec_new[u64](),
-    target: target, ret: un, env: 0, spec_lim: 0, spec_pos: 0, tu64: u, tbool: b, tunit: un, tstr: st,
+    target: target, arch: ARCH_X86_64, ret: un, env: 0, spec_lim: 0, spec_pos: 0, tu64: u, tbool: b, tunit: un, tstr: st,
     failed: false, efile: 0, eline: 0, ecol: 0, ecode: 0, emsg: vec_new[u64](), enotes: vec_new[u64](), int_ops: vec_new[IntOp](),
     calls: vec_new[Edge](), lsites: vec_new[LockSite](), nparams: 0, inv: false, old_only: false
   };
@@ -312,16 +319,16 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   bsig(&mut c, "boot_fb", AV_KERNEL, 2, rcpu, u, 0, 0, u);
   bsig(&mut c, "boot_acpi", AV_KERNEL, 3, rcpu, u, u, 0, u);
   bsig(&mut c, "boot_info", AV_KERNEL, 3, rcpu, u, u, 0, u);
-  bsig(&mut c, "port_claim", AV_MEM, 3, mprt, u, u, 0, pio);
-  bsig(&mut c, "port_release", AV_MEM, 2, mprt, pio, 0, 0, un);
-  bsig(&mut c, "port_base", AV_MEM, 1, rpio, 0, 0, 0, u);
-  bsig(&mut c, "port_count", AV_MEM, 1, rpio, 0, 0, 0, u);
-  bsig(&mut c, "pio_in8", AV_MEM, 2, mpio, u, 0, 0, u8t);
-  bsig(&mut c, "pio_in16", AV_MEM, 2, mpio, u, 0, 0, u16t);
-  bsig(&mut c, "pio_in32", AV_MEM, 2, mpio, u, 0, 0, u32t);
-  bsig(&mut c, "pio_out8", AV_MEM, 3, mpio, u, u8t, 0, un);
-  bsig(&mut c, "pio_out16", AV_MEM, 3, mpio, u, u16t, 0, un);
-  bsig(&mut c, "pio_out32", AV_MEM, 3, mpio, u, u32t, 0, un);
+  bsig(&mut c, "port_claim", AV_PORTS, 3, mprt, u, u, 0, pio);
+  bsig(&mut c, "port_release", AV_PORTS, 2, mprt, pio, 0, 0, un);
+  bsig(&mut c, "port_base", AV_PORTS, 1, rpio, 0, 0, 0, u);
+  bsig(&mut c, "port_count", AV_PORTS, 1, rpio, 0, 0, 0, u);
+  bsig(&mut c, "pio_in8", AV_PORTS, 2, mpio, u, 0, 0, u8t);
+  bsig(&mut c, "pio_in16", AV_PORTS, 2, mpio, u, 0, 0, u16t);
+  bsig(&mut c, "pio_in32", AV_PORTS, 2, mpio, u, 0, 0, u32t);
+  bsig(&mut c, "pio_out8", AV_PORTS, 3, mpio, u, u8t, 0, un);
+  bsig(&mut c, "pio_out16", AV_PORTS, 3, mpio, u, u16t, 0, un);
+  bsig(&mut c, "pio_out32", AV_PORTS, 3, mpio, u, u32t, 0, un);
   bsig(&mut c, "mmio_claim", AV_MEM, 3, mmsp, u, u, 0, mio);
   bsig(&mut c, "mmio_release", AV_MEM, 2, mmsp, mio, 0, 0, un);
   bsig(&mut c, "mmio_base", AV_MEM, 1, rmio, 0, 0, 0, u);
@@ -431,34 +438,6 @@ fn def_at(m: &Mono, k: u64) -> u64 {
 }
 
 // ---- Small helpers ----
-
-fn u_at(v: &Vec[u64], i: u64) -> u64 {
-  if i < vec_len(v) {
-    return vec_get(v, i);
-  }
-  return 0;
-}
-
-fn has_id(v: &Vec[u64], x: u64) -> bool {
-  let mut k = 0;
-  while k < vec_len(v) {
-    if vec_get(v, k) == x {
-      return true;
-    }
-    k = k + 1;
-  }
-  return false;
-}
-
-fn copy_set(v: &Vec[u64]) -> Vec[u64] {
-  let mut out = vec_new[u64]();
-  let mut k = 0;
-  while k < vec_len(v) {
-    vec_push(&mut out, vec_get(v, k));
-    k = k + 1;
-  }
-  return out;
-}
 
 /// Do `a` and `b` (vectors without repeats) hold the same elements?
 fn same_set(a: &Vec[u64], b: &Vec[u64]) -> bool {
@@ -672,13 +651,7 @@ fn cm_new(c: &mut Checker, p: &Parser, loc: u64, code: u64) -> bool {
 
 /// Appends `s` to the sentence.
 fn cm_s(c: &mut Checker, s: Str) {
-  let mut k = 0;
-  while k < slen(s)
-    invariant k <= slen(s)
-  {
-    vec_push(&mut c.emsg, cast[u64](sget(s, k)));
-    k = k + 1;
-  }
+  w_s(&mut c.emsg, s);
 }
 
 /// Appends the source text `s..e`.
@@ -703,30 +676,7 @@ fn cm_name2(c: &mut Checker, p: &Parser, i: u64) {
 }
 
 fn cm_num(c: &mut Checker, x: u64) {
-  let mut digs = vec_new[u64]();
-  let mut y = x;
-  vec_push(&mut digs, 48 + y % 10);
-  y = y / 10;
-  while y > 0 {
-    vec_push(&mut digs, 48 + y % 10);
-    y = y / 10;
-  }
-  let mut k = vec_len(digs);
-  while k > 0 {
-    k = k - 1;
-    vec_push(&mut c.emsg, u_at(digs, k));
-  }
-  vec_free(digs);
-}
-
-fn tyn_s(out: &mut Vec[u64], s: Str) {
-  let mut k = 0;
-  while k < slen(s)
-    invariant k <= slen(s)
-  {
-    vec_push(&mut out, cast[u64](sget(s, k)));
-    k = k + 1;
-  }
+  w_num(&mut c.emsg, x);
 }
 
 fn tyn_name(out: &mut Vec[u64], p: &Parser, i: u64) {
@@ -742,43 +692,43 @@ fn tyn_name(out: &mut Vec[u64], p: &Parser, i: u64) {
 fn tyn_to(out: &mut Vec[u64], m: &Mono, p: &Parser, t: u64) {
   let x = ty_at(m, t);
   let k = x.kind;
-  if k == TY_U64 { tyn_s(&mut out, "u64"); }
-  else if k == TY_U8 { tyn_s(&mut out, "u8"); }
-  else if k == TY_U16 { tyn_s(&mut out, "u16"); }
-  else if k == TY_U32 { tyn_s(&mut out, "u32"); }
-  else if k == TY_I8 { tyn_s(&mut out, "i8"); }
-  else if k == TY_I16 { tyn_s(&mut out, "i16"); }
-  else if k == TY_I32 { tyn_s(&mut out, "i32"); }
-  else if k == TY_I64 { tyn_s(&mut out, "i64"); }
-  else if k == TY_BOOL { tyn_s(&mut out, "bool"); }
-  else if k == TY_UNIT { tyn_s(&mut out, "()"); }
-  else if k == TY_STR { tyn_s(&mut out, "Str"); }
-  else if k == TY_BUF { tyn_s(&mut out, "Buf"); }
-  else if k == TY_BYTES { tyn_s(&mut out, "Bytes"); }
-  else if k == TY_HOST { tyn_s(&mut out, "Host"); }
-  else if k == TY_CHILD { tyn_s(&mut out, "Child"); }
-  else if k == TY_SERIAL { tyn_s(&mut out, "Serial"); }
-  else if k == TY_FRAME { tyn_s(&mut out, "Frame"); }
-  else if k == TY_PT { tyn_s(&mut out, "PageTable"); }
-  else if k == TY_POOL { tyn_s(&mut out, "Pool"); }
-  else if k == TY_MMU { tyn_s(&mut out, "Mmu"); }
-  else if k == TY_CPU { tyn_s(&mut out, "Cpu"); }
-  else if k == TY_PORTS { tyn_s(&mut out, "Ports"); }
-  else if k == TY_PORTIO { tyn_s(&mut out, "PortIo"); }
-  else if k == TY_MMIOSPACE { tyn_s(&mut out, "MmioSpace"); }
-  else if k == TY_MMIO { tyn_s(&mut out, "Mmio"); }
-  else if k == TY_DMA { tyn_s(&mut out, "Dma"); }
-  else if k == TY_LEASE { tyn_s(&mut out, "Lease"); }
-  else if k == TY_SHARED { tyn_s(&mut out, "Shared"); }
-  else if k == TY_DIRTY { tyn_s(&mut out, "Dirty"); }
+  if k == TY_U64 { w_s(&mut out, "u64"); }
+  else if k == TY_U8 { w_s(&mut out, "u8"); }
+  else if k == TY_U16 { w_s(&mut out, "u16"); }
+  else if k == TY_U32 { w_s(&mut out, "u32"); }
+  else if k == TY_I8 { w_s(&mut out, "i8"); }
+  else if k == TY_I16 { w_s(&mut out, "i16"); }
+  else if k == TY_I32 { w_s(&mut out, "i32"); }
+  else if k == TY_I64 { w_s(&mut out, "i64"); }
+  else if k == TY_BOOL { w_s(&mut out, "bool"); }
+  else if k == TY_UNIT { w_s(&mut out, "()"); }
+  else if k == TY_STR { w_s(&mut out, "Str"); }
+  else if k == TY_BUF { w_s(&mut out, "Buf"); }
+  else if k == TY_BYTES { w_s(&mut out, "Bytes"); }
+  else if k == TY_HOST { w_s(&mut out, "Host"); }
+  else if k == TY_CHILD { w_s(&mut out, "Child"); }
+  else if k == TY_SERIAL { w_s(&mut out, "Serial"); }
+  else if k == TY_FRAME { w_s(&mut out, "Frame"); }
+  else if k == TY_PT { w_s(&mut out, "PageTable"); }
+  else if k == TY_POOL { w_s(&mut out, "Pool"); }
+  else if k == TY_MMU { w_s(&mut out, "Mmu"); }
+  else if k == TY_CPU { w_s(&mut out, "Cpu"); }
+  else if k == TY_PORTS { w_s(&mut out, "Ports"); }
+  else if k == TY_PORTIO { w_s(&mut out, "PortIo"); }
+  else if k == TY_MMIOSPACE { w_s(&mut out, "MmioSpace"); }
+  else if k == TY_MMIO { w_s(&mut out, "Mmio"); }
+  else if k == TY_DMA { w_s(&mut out, "Dma"); }
+  else if k == TY_LEASE { w_s(&mut out, "Lease"); }
+  else if k == TY_SHARED { w_s(&mut out, "Shared"); }
+  else if k == TY_DIRTY { w_s(&mut out, "Dirty"); }
   else if k == TY_STRUCT || k == TY_ENUM { tyn_inst_to(&mut out, m, p, x.a); }
   else if k == TY_UNKNOWN { tyn_name(&mut out, p, x.a); }
-  else if k == TY_BOX { tyn_s(&mut out, "Box["); tyn_to(&mut out, m, p, x.a); tyn_s(&mut out, "]"); }
-  else if k == TY_VEC { tyn_s(&mut out, "Vec["); tyn_to(&mut out, m, p, x.a); tyn_s(&mut out, "]"); }
-  else if k == TY_LOCK { tyn_s(&mut out, "Lock["); tyn_to(&mut out, m, p, x.a); tyn_s(&mut out, "]"); }
-  else if k == TY_ATOMIC { tyn_s(&mut out, "Atomic["); tyn_to(&mut out, m, p, x.a); tyn_s(&mut out, "]"); }
-  else if k == TY_REF { tyn_s(&mut out, "&"); tyn_to(&mut out, m, p, x.a); }
-  else if k == TY_MUTREF { tyn_s(&mut out, "&mut "); tyn_to(&mut out, m, p, x.a); }
+  else if k == TY_BOX { w_s(&mut out, "Box["); tyn_to(&mut out, m, p, x.a); w_s(&mut out, "]"); }
+  else if k == TY_VEC { w_s(&mut out, "Vec["); tyn_to(&mut out, m, p, x.a); w_s(&mut out, "]"); }
+  else if k == TY_LOCK { w_s(&mut out, "Lock["); tyn_to(&mut out, m, p, x.a); w_s(&mut out, "]"); }
+  else if k == TY_ATOMIC { w_s(&mut out, "Atomic["); tyn_to(&mut out, m, p, x.a); w_s(&mut out, "]"); }
+  else if k == TY_REF { w_s(&mut out, "&"); tyn_to(&mut out, m, p, x.a); }
+  else if k == TY_MUTREF { w_s(&mut out, "&mut "); tyn_to(&mut out, m, p, x.a); }
 }
 
 /// Appends the name of instance `x`: `Pair[u64, Buf]`, or `Rect`.
@@ -786,18 +736,18 @@ fn tyn_inst_to(out: &mut Vec[u64], m: &Mono, p: &Parser, x: u64) {
   let xi = inst_at(m, x);
   tyn_name(&mut out, p, xi.def);
   if xi.n > 0 && xi.args < SRC_MAX {
-    tyn_s(&mut out, "[");
+    w_s(&mut out, "[");
     let mut j = 0;
     while j < xi.n && j < SRC_MAX
       invariant j <= SRC_MAX
     {
       if j > 0 {
-        tyn_s(&mut out, ", ");
+        w_s(&mut out, ", ");
       }
       tyn_to(&mut out, m, p, targ_at(m, xi.args + j));
       j = j + 1;
     }
-    tyn_s(&mut out, "]");
+    w_s(&mut out, "]");
   }
 }
 
@@ -1449,16 +1399,6 @@ fn sg_span(out: &mut Vec[u64], p: &Parser, s: u64, e: u64) {
   }
 }
 
-fn sg_str(out: &mut Vec[u64], w: Str) {
-  let mut k = 0;
-  while k < slen(w)
-    invariant k <= slen(w)
-  {
-    vec_push(&mut out, cast[u64](sget(w, k)));
-    k = k + 1;
-  }
-}
-
 /// The number of single-byte insertions, deletions and substitutions that
 /// turn `a` into `b`. Names are short, so the counts cannot wrap.
 fn sg_dist(a: &Vec[u64], b: &Vec[u64]) -> u64 {
@@ -1585,7 +1525,7 @@ fn sg_fn(c: &mut Checker, p: &Parser, s: u64, e: u64) {
   while k < vec_len(c.bs) {
     let b = bs_at(c, k);
     let mut cand = vec_new[u64]();
-    sg_str(&mut cand, b.name);
+    w_s(&mut cand, b.name);
     bd = sg_try(&mut best, bd, want, cand);
     k = k + 1;
   }
@@ -1937,9 +1877,13 @@ fn reaches(c: &Checker, m: &Mono, p: &Parser, from: u64, target: u64, seen: &mut
 }
 
 /// May `main` ask for a capability of kind `k` on this target?
-fn is_cap(target: u64, k: u64) -> bool {
+fn is_cap(target: u64, arch: u64, k: u64) -> bool {
   if target == TARGET_USER {
     return k == TY_SERIAL;
+  }
+  if target == TARGET_KERNEL && arch == ARCH_AARCH64 {
+    // AArch64 has no I/O ports: devices are memory-mapped.
+    return k == TY_SERIAL || k == TY_POOL || k == TY_MMU || k == TY_CPU || k == TY_MMIOSPACE;
   }
   if target == TARGET_KERNEL {
     return k == TY_SERIAL || k == TY_POOL || k == TY_MMU || k == TY_CPU || k == TY_PORTS || k == TY_MMIOSPACE;
@@ -1947,9 +1891,12 @@ fn is_cap(target: u64, k: u64) -> bool {
   return k == TY_SERIAL || k == TY_POOL || k == TY_HOST || k == TY_PORTS || k == TY_MMIOSPACE;
 }
 
-fn available(avail: u64, target: u64) -> bool {
+fn available(avail: u64, target: u64, arch: u64) -> bool {
   if avail == AV_ALL {
     return true;
+  }
+  if avail == AV_PORTS {
+    return target == TARGET_HOSTED || (target == TARGET_KERNEL && arch == ARCH_X86_64);
   }
   if avail == AV_HOSTED {
     return target == TARGET_HOSTED;
@@ -2199,7 +2146,7 @@ fn check_main(c: &mut Checker, m: &mut Mono, p: &Parser, x: u64) {
     let qn = node_at(p.nodes, q);
     let t = conv(&mut m, p, qn.a, x, q);
     let ik = kind_t(m, inner_t(m, t));
-    if kind_t(m, t) == TY_MUTREF && is_cap(c.target, ik) && !has_id(seen, ik) {
+    if kind_t(m, t) == TY_MUTREF && is_cap(c.target, c.arch, ik) && !has_id(seen, ik) {
       vec_push(&mut seen, ik);
     } else {
       caps_ok = false;
@@ -2212,6 +2159,8 @@ fn check_main(c: &mut Checker, m: &mut Mono, p: &Parser, x: u64) {
       cm_s(&mut c, "on this target `main` must take some of ");
       if c.target == TARGET_USER {
         cm_s(&mut c, "&mut Serial");
+      } else if c.target == TARGET_KERNEL && c.arch == ARCH_AARCH64 {
+        cm_s(&mut c, "&mut Serial, &mut Pool, &mut Mmu, &mut Cpu, &mut MmioSpace");
       } else if c.target == TARGET_KERNEL {
         cm_s(&mut c, "&mut Serial, &mut Pool, &mut Mmu, &mut Cpu, &mut Ports, &mut MmioSpace");
       } else {
@@ -2324,7 +2273,7 @@ fn class_reaches(order: &Vec[Edge], from: u64, to: u64) -> bool {
     let mut j = 0;
     while j < vec_len(order) {
       let e = vec_get(order, j);
-      if e.from == a && !has_u(seen, e.to) {
+      if e.from == a && !has_id(seen, e.to) {
         vec_push(&mut seen, e.to);
       }
       j = j + 1;
@@ -2333,17 +2282,6 @@ fn class_reaches(order: &Vec[Edge], from: u64, to: u64) -> bool {
   }
   vec_free(seen);
   return found;
-}
-
-fn has_u(v: &Vec[u64], x: u64) -> bool {
-  let mut j = 0;
-  while j < vec_len(v) {
-    if vec_get(v, j) == x {
-      return true;
-    }
-    j = j + 1;
-  }
-  return false;
 }
 
 /// Rules out deadlock through locks, as stage0's `lock_order` does: a
@@ -3800,7 +3738,7 @@ fn ck_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
   let b = bs_index(c, p, s, e);
   if b != 0 {
     let bs = bs_at(c, b - 1);
-    if !available(bs.avail, c.target) {
+    if !available(bs.avail, c.target, c.arch) {
       if cm_new(&mut c, p, i, C_TARGET) {
         cm_s(&mut c, "`");
         cm_name(&mut c, p, i);

@@ -83,6 +83,7 @@ bastioc1 is the compiler written in Bastio (`stage1/`); stage0's `bastioc0` only
 - `--emit-c`: write the generated C
 - `--dump-smt`: print every query sent to the solver
 - `--target kernel`, `--target user`: emit freestanding C for BastiOS's kernel or its programs
+- `--arch aarch64`: build for AArch64 (C backend): hosted programs for AArch64 Linux, and with bastioc1 kernel and user programs too (`tests/aarch64.sh` runs the tests under `qemu-aarch64` and boots a small kernel on QEMU's virt machine)
 - `--backend native`: generate x86-64 assembly directly instead of C (`tests/native.sh` checks it against the C backend); `--emit-asm` writes the assembly
 - `--header FILE`: write a C header for the `export fn`s of a library
 - `--lib DIR`: where `import "core/..."` looks (also `BASTIO_LIB`)

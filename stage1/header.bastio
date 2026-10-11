@@ -45,65 +45,72 @@ fn hd_part_lines(id: u64) -> u64 {
 const NATIVE_RUNTIME_LINES: u64 = 372;
 
 fn hd_builtin(out: &mut Vec[u64], name: Str, avail: Str) {
-  out_str(&mut out, "builtin ");
-  out_str(&mut out, name);
-  out_str(&mut out, " (");
-  out_str(&mut out, avail);
-  out_str(&mut out, ")\n");
+  w_s(&mut out, "builtin ");
+  w_s(&mut out, name);
+  w_s(&mut out, " (");
+  w_s(&mut out, avail);
+  w_s(&mut out, ")\n");
 }
 
 fn hd_avail(a: u64) -> Str {
   if a == AV_HOSTED { return "hosted"; }
   if a == AV_MEM { return "hosted, kernel"; }
+  if a == AV_PORTS { return "hosted, kernel"; }
   if a == AV_KERNEL { return "kernel"; }
   if a == AV_USER { return "user"; }
   return "all";
 }
 
 /// The hand-written trusted base, listed and counted (ROADMAP invariant
-/// 3), as `bastioc0 --trusted-base` lists it.
-fn trusted_base(out: &mut Vec[u64]) {
-  out_str(&mut out, "# The trusted base of bastioc0 (ROADMAP invariant 3). Regenerate with\n# `bastioc0 --trusted-base > tests/trusted_base.txt` and review the diff.\n");
+/// 3), as `bastioc0 --trusted-base` lists it. For AArch64 (`--arch aarch64
+/// --trusted-base`, stage1 only) the preludes are AArch64's and there is
+/// no native backend.
+fn trusted_base(out: &mut Vec[u64], arch: u64) {
+  if arch == ARCH_AARCH64 {
+    w_s(&mut out, "# The trusted base for AArch64 (ROADMAP invariant 3). Regenerate with\n# `bastioc1 --arch aarch64 --trusted-base > tests/trusted_base_aarch64.txt` and review the diff.\n");
+  } else {
+    w_s(&mut out, "# The trusted base of bastioc0 (ROADMAP invariant 3). Regenerate with\n# `bastioc0 --trusted-base > tests/trusted_base.txt` and review the diff.\n");
+  }
   let mut seen = vec_new[u64]();
   let mut t = 0;
   while t < 3 {
-    let parts = cg_parts(t);
+    let parts = cg_parts(t, arch);
     let mut total = 0;
     let mut k = 0;
     while k < vec_len(parts) {
       total = cg_add(total, hd_part_lines(vec_get(parts, k)));
       k = k + 1;
     }
-    out_str(&mut out, "target ");
+    w_s(&mut out, "target ");
     if t == TARGET_KERNEL {
-      out_str(&mut out, "kernel");
+      w_s(&mut out, "kernel");
     } else if t == TARGET_USER {
-      out_str(&mut out, "user");
+      w_s(&mut out, "user");
     } else {
-      out_str(&mut out, "hosted");
+      w_s(&mut out, "hosted");
     }
-    out_str(&mut out, ": ");
-    out_num(&mut out, total);
-    out_str(&mut out, " prelude lines (");
+    w_s(&mut out, ": ");
+    w_num(&mut out, total);
+    w_s(&mut out, " prelude lines (");
     k = 0;
     while k < vec_len(parts) {
       if k > 0 {
-        out_str(&mut out, " ");
+        w_s(&mut out, " ");
       }
-      out_str(&mut out, cg_part_name(vec_get(parts, k)));
+      w_s(&mut out, cg_part_name(vec_get(parts, k)));
       k = k + 1;
     }
-    out_str(&mut out, ")\n");
+    w_s(&mut out, ")\n");
     k = 0;
     while k < vec_len(parts) {
       let id = vec_get(parts, k);
       if !has_id(seen, id) {
         vec_push(&mut seen, id);
-        out_str(&mut out, "  prelude ");
-        out_str(&mut out, cg_part_name(id));
-        out_str(&mut out, ": ");
-        out_num(&mut out, hd_part_lines(id));
-        out_str(&mut out, " lines\n");
+        w_s(&mut out, "  prelude ");
+        w_s(&mut out, cg_part_name(id));
+        w_s(&mut out, ": ");
+        w_num(&mut out, hd_part_lines(id));
+        w_s(&mut out, " lines\n");
       }
       k = k + 1;
     }
@@ -111,9 +118,11 @@ fn trusted_base(out: &mut Vec[u64]) {
     t = t + 1;
   }
   vec_free(seen);
-  out_str(&mut out, "native backend (--backend native, hosted): ");
-  out_num(&mut out, NATIVE_RUNTIME_LINES);
-  out_str(&mut out, " runtime lines of assembly\n");
+  if arch != ARCH_AARCH64 {
+    w_s(&mut out, "native backend (--backend native, hosted): ");
+    w_num(&mut out, NATIVE_RUNTIME_LINES);
+    w_s(&mut out, " runtime lines of assembly\n");
+  }
   // The generic builtins, checked by hand, then the table (check.bastio).
   hd_builtin(&mut out, "box", "all");
   hd_builtin(&mut out, "try_box", "all");
@@ -153,19 +162,19 @@ fn trusted_base(out: &mut Vec[u64]) {
   checker_free(c);
   mono_free(m);
   bfree(parser_free(p));
-  out_str(&mut out, "export assumes a `&Bytes` parameter's pointer is readable for its length, and nothing writes the bytes during the call\n");
-  out_str(&mut out, "export assumes a `&mut Bytes` parameter's pointer is readable and writable for its length, overlaps no other buffer argument, and nothing else uses it during the call\n");
-  out_str(&mut out, "export assumes a `&Bytes` or `&mut Bytes` parameter's length is at most 2^60 (follows from the first two: no x86-64 address space is that large)\n");
-  out_str(&mut out, "export assumes every argument is a valid value of its C type (a `bool` is 0 or 1)\n");
+  w_s(&mut out, "export assumes a `&Bytes` parameter's pointer is readable for its length, and nothing writes the bytes during the call\n");
+  w_s(&mut out, "export assumes a `&mut Bytes` parameter's pointer is readable and writable for its length, overlaps no other buffer argument, and nothing else uses it during the call\n");
+  w_s(&mut out, "export assumes a `&Bytes` or `&mut Bytes` parameter's length is at most 2^60 (follows from the first two: no x86-64 address space is that large)\n");
+  w_s(&mut out, "export assumes every argument is a valid value of its C type (a `bool` is 0 or 1)\n");
   // The counting lemmas (COUNT_FACTS in stage0/src/codegen.rs).
-  out_str(&mut out, "lemma vcount: a count is between 0 and the length\n");
-  out_str(&mut out, "lemma vcount: an element at an index below the length is counted at least once\n");
-  out_str(&mut out, "lemma vcount: a value counted at least once is the element at some index below the length\n");
-  out_str(&mut out, "lemma vcount: vec_push of y adds one to the count of y; vec_pop takes one from the count of the last element\n");
-  out_str(&mut out, "lemma vcount: vec_set and vec_swap of y at i take one from the count of the element at i and add one to the count of y\n");
-  out_str(&mut out, "definition bdec: bdec(b, f, t) is 0 when t <= f, else 10 * bdec(b, f, t - 1) + (bget(b, t - 1) - 48)\n");
-  out_str(&mut out, "definition bhex: bhex(b, f, t) is 0 when t <= f, else 16 * bhex(b, f, t - 1) + the value of the hex digit bget(b, t - 1) (0-9, a-f, A-F)\n");
-  out_str(&mut out, "definition has_bit: has_bit(x, i) is bit i of x for i < 64 and false otherwise; no bit of 0 is set, bits 0 to w - 1 of 2^w - 1 are, and each of & | ^ ! << >> and a low mask sets bit j of its result from bits of its operands as binary arithmetic does\n");
+  w_s(&mut out, "lemma vcount: a count is between 0 and the length\n");
+  w_s(&mut out, "lemma vcount: an element at an index below the length is counted at least once\n");
+  w_s(&mut out, "lemma vcount: a value counted at least once is the element at some index below the length\n");
+  w_s(&mut out, "lemma vcount: vec_push of y adds one to the count of y; vec_pop takes one from the count of the last element\n");
+  w_s(&mut out, "lemma vcount: vec_set and vec_swap of y at i take one from the count of the element at i and add one to the count of y\n");
+  w_s(&mut out, "definition bdec: bdec(b, f, t) is 0 when t <= f, else 10 * bdec(b, f, t - 1) + (bget(b, t - 1) - 48)\n");
+  w_s(&mut out, "definition bhex: bhex(b, f, t) is 0 when t <= f, else 16 * bhex(b, f, t - 1) + the value of the hex digit bget(b, t - 1) (0-9, a-f, A-F)\n");
+  w_s(&mut out, "definition has_bit: has_bit(x, i) is bit i of x for i < 64 and false otherwise; no bit of 0 is set, bits 0 to w - 1 of 2^w - 1 are, and each of & | ^ ! << >> and a low mask sets bit j of its result from bits of its operands as binary arithmetic does\n");
 }
 
 // ---- --header ----
@@ -356,7 +365,7 @@ fn header_guard(path: &Bytes) -> Vec[u64] {
     k = k + 1;
   }
   let mut g = vec_new[u64]();
-  out_str(&mut g, "BASTIO_");
+  w_s(&mut g, "BASTIO_");
   k = from;
   while k < to && k < blen(path) {
     let ch = cast[u64](bget(path, k));
@@ -369,6 +378,6 @@ fn header_guard(path: &Bytes) -> Vec[u64] {
     }
     k = k + 1;
   }
-  out_str(&mut g, "_H");
+  w_s(&mut g, "_H");
   return g;
 }

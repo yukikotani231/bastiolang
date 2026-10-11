@@ -223,7 +223,8 @@ struct Vr {
   t_flimit: u64,
   /// 65536: the number of x86 I/O ports.
   t_plimit: u64,
-  /// The device window a Mmio lies in: physical 0x8000_0000 up to 2^46.
+  /// The device window a Mmio lies in: physical 0x8000_0000 up to 2^46
+  /// (from 0 on AArch64, where devices sit below RAM).
   t_mmio_lo: u64,
   t_mmio_hi: u64,
   t_poolsize: u64,
@@ -257,7 +258,20 @@ struct Vr {
   wnote: Vec[u64],
   /// The type arguments of the instance whose source the sentences quote
   /// (see `rd_sub`): stage0 quotes the copy made for the instance.
-  tsub: Vec[u64]
+  tsub: Vec[u64],
+  /// The architecture (`ARCH_*`); set it with `vr_set_arch`.
+  arch: u64
+}
+
+/// Sets the architecture the program is verified for. On AArch64 the device
+/// window starts at 0 (QEMU's virt machine and most SoCs put devices below
+/// RAM; the platform refuses a claim that overlaps RAM, as on x86-64), and
+/// the saved user context has AArch64's registers.
+fn vr_set_arch(v: &mut Vr, arch: u64) {
+  v.arch = arch;
+  if arch == ARCH_AARCH64 {
+    v.t_mmio_lo = v.t_zero;
+  }
 }
 
 fn vr_new(m: &mut Mono, p: &Parser) -> Vr {
@@ -273,7 +287,7 @@ fn vr_new(m: &mut Mono, p: &Parser) -> Vr {
     t_zarr: 0, t_nobool: 0, t_k: 0, t_255: 0, unit: 0, t_reset: 0, t_models: 0, t_rlimit: 0, t_timeout: 0,
     ty_bytes: prim(&mut m, p, TY_BYTES), ty_child: prim(&mut m, p, TY_CHILD), ty_frame: prim(&mut m, p, TY_FRAME),
     ty_pt: prim(&mut m, p, TY_PT), ty_pool: prim(&mut m, p, TY_POOL), fail_at: 0, fail_code: 0,
-    fail_obl: 0, msg: vec_new[u64](), mpool: vec_new[u64](), wnote: vec_new[u64](), tsub: vec_new[u64]()
+    fail_obl: 0, msg: vec_new[u64](), mpool: vec_new[u64](), wnote: vec_new[u64](), tsub: vec_new[u64](), arch: ARCH_X86_64
   };
   v.t_true = atom_str(&mut v, "true");
   v.t_false = atom_str(&mut v, "false");
@@ -808,18 +822,18 @@ fn mentions_count(m: &Mono, p: &Parser, i: u64, call: Str, defs: &Vec[u64]) -> b
   let n = node_at(p.nodes, i);
   let k = n.kind;
   if k == E_CALL {
-    if name_is(p, i, call) || has_u(defs, find_in(p, p.specs.head, i)) || has_u(defs, find_fn(p, i)) {
+    if name_is(p, i, call) || has_id(defs, find_in(p, p.specs.head, i)) || has_id(defs, find_fn(p, i)) {
       return true;
     }
     return mentions_list(m, p, n.a, call, defs);
   }
   if k == E_VAR {
-    return has_u(defs, find_in(p, p.specs.head, i)) || has_u(defs, find_fn(p, i));
+    return has_id(defs, find_in(p, p.specs.head, i)) || has_id(defs, find_fn(p, i));
   }
   if k == E_TAPP {
     // A generic instance: it counts when its definition does.
     if kind_of(p, n.b) == E_CALL {
-      if !is_typed_builtin(p, n.b) && has_u(defs, tapp_def(p, n.b)) {
+      if !is_typed_builtin(p, n.b) && has_id(defs, tapp_def(p, n.b)) {
         return true;
       }
       let inner = node_at(p.nodes, n.b);
@@ -935,7 +949,7 @@ fn count_gate(m: &Mono, p: &Parser, call: Str, out: &mut Vec[u64]) {
   k = p.fns.head;
   while k != 0 {
     let n = node_at(p.nodes, k);
-    if (all && states_invariants(m, p, n.x, none)) || has_u(defs, k) || block_mentions_count(m, p, n.x, call, defs) {
+    if (all && states_invariants(m, p, n.x, none)) || has_id(defs, k) || block_mentions_count(m, p, n.x, call, defs) {
       vec_push(&mut out, k);
     }
     k = n.next;
@@ -1228,55 +1242,28 @@ fn or_all(v: &mut Vr, xs: &Vec[u64]) -> u64 {
 
 // ---- Printing commands (into a text buffer of bytes) ----
 
-fn out_str(out: &mut Vec[u64], s: Str) {
-  let mut k = 0;
-  while k < slen(s)
-    invariant k <= slen(s)
-  {
-    vec_push(&mut out, cast[u64](sget(s, k)));
-    k = k + 1;
-  }
-}
-
-fn out_num(out: &mut Vec[u64], x: u64) {
-  let mut d = vec_new[u64]();
-  let mut y = x;
-  vec_push(&mut d, 48 + y % 10);
-  y = y / 10;
-  while y > 0 {
-    vec_push(&mut d, 48 + y % 10);
-    y = y / 10;
-  }
-  let mut k = vec_len(d);
-  while k > 0 {
-    k = k - 1;
-    vec_push(&mut out, u_at(d, k));
-  }
-  vec_free(d);
-}
-
 fn out_op(out: &mut Vec[u64], op: u64) {
-  if op == OP_ADD { out_str(&mut out, "+"); }
-  else if op == OP_SUB { out_str(&mut out, "-"); }
-  else if op == OP_MUL { out_str(&mut out, "*"); }
-  else if op == OP_DIV { out_str(&mut out, "div"); }
-  else if op == OP_MOD { out_str(&mut out, "mod"); }
-  else if op == OP_EQ { out_str(&mut out, "="); }
-  else if op == OP_LT { out_str(&mut out, "<"); }
-  else if op == OP_LE { out_str(&mut out, "<="); }
-  else if op == OP_GT { out_str(&mut out, ">"); }
-  else if op == OP_GE { out_str(&mut out, ">="); }
-  else if op == OP_AND { out_str(&mut out, "and"); }
-  else if op == OP_OR { out_str(&mut out, "or"); }
-  else if op == OP_NOT { out_str(&mut out, "not"); }
-  else if op == OP_IMP { out_str(&mut out, "=>"); }
-  else if op == OP_ITE { out_str(&mut out, "ite"); }
-  else if op == OP_SELECT { out_str(&mut out, "select"); }
-  else if op == OP_STORE { out_str(&mut out, "store"); }
-  else if op == OP_CNT { out_str(&mut out, "cnt"); }
-  else if op == OP_DEC { out_str(&mut out, "dec"); }
-  else if op == OP_HEX { out_str(&mut out, "hex"); }
-  else if op == OP_BIT { out_str(&mut out, "bit"); }
+  if op == OP_ADD { w_s(&mut out, "+"); }
+  else if op == OP_SUB { w_s(&mut out, "-"); }
+  else if op == OP_MUL { w_s(&mut out, "*"); }
+  else if op == OP_DIV { w_s(&mut out, "div"); }
+  else if op == OP_MOD { w_s(&mut out, "mod"); }
+  else if op == OP_EQ { w_s(&mut out, "="); }
+  else if op == OP_LT { w_s(&mut out, "<"); }
+  else if op == OP_LE { w_s(&mut out, "<="); }
+  else if op == OP_GT { w_s(&mut out, ">"); }
+  else if op == OP_GE { w_s(&mut out, ">="); }
+  else if op == OP_AND { w_s(&mut out, "and"); }
+  else if op == OP_OR { w_s(&mut out, "or"); }
+  else if op == OP_NOT { w_s(&mut out, "not"); }
+  else if op == OP_IMP { w_s(&mut out, "=>"); }
+  else if op == OP_ITE { w_s(&mut out, "ite"); }
+  else if op == OP_SELECT { w_s(&mut out, "select"); }
+  else if op == OP_STORE { w_s(&mut out, "store"); }
+  else if op == OP_CNT { w_s(&mut out, "cnt"); }
+  else if op == OP_DEC { w_s(&mut out, "dec"); }
+  else if op == OP_HEX { w_s(&mut out, "hex"); }
+  else if op == OP_BIT { w_s(&mut out, "bit"); }
 }
 
 fn out_tm(out: &mut Vec[u64], v: &Vr, t: u64) {
@@ -1288,55 +1275,55 @@ fn out_tm(out: &mut Vec[u64], v: &Vr, t: u64) {
       k = k + 1;
     }
   } else if x.kind == VT_NUM {
-    out_num(&mut out, x.a);
+    w_num(&mut out, x.a);
   } else if x.kind == VT_APP && x.a == OP_CALL {
-    out_str(&mut out, "(");
+    w_s(&mut out, "(");
     out_tm(&mut out, v, targ(v, t, 0));
     let mut k = 1;
     while k < x.c {
-      out_str(&mut out, " ");
+      w_s(&mut out, " ");
       out_tm(&mut out, v, targ(v, t, k));
       k = k + 1;
     }
-    out_str(&mut out, ")");
+    w_s(&mut out, ")");
   } else if x.kind == VT_APP {
-    out_str(&mut out, "(");
+    w_s(&mut out, "(");
     out_op(&mut out, x.a);
     let mut k = 0;
     while k < x.c {
-      out_str(&mut out, " ");
+      w_s(&mut out, " ");
       out_tm(&mut out, v, targ(v, t, k));
       k = k + 1;
     }
-    out_str(&mut out, ")");
+    w_s(&mut out, ")");
   } else if x.kind == VT_FORALL || x.kind == VT_LAMBDA {
     if x.kind == VT_FORALL {
-      out_str(&mut out, "(forall ((");
+      w_s(&mut out, "(forall ((");
     } else {
-      out_str(&mut out, "(lambda ((");
+      w_s(&mut out, "(lambda ((");
     }
     out_tm(&mut out, v, x.a);
-    out_str(&mut out, " Int)) ");
+    w_s(&mut out, " Int)) ");
     out_tm(&mut out, v, x.b);
-    out_str(&mut out, ")");
+    w_s(&mut out, ")");
   } else if x.kind == VT_FORALLP {
-    out_str(&mut out, "(forall ((");
+    w_s(&mut out, "(forall ((");
     out_tm(&mut out, v, x.a);
-    out_str(&mut out, " Int)) (! ");
+    w_s(&mut out, " Int)) (! ");
     out_tm(&mut out, v, x.b);
-    out_str(&mut out, " :pattern (");
+    w_s(&mut out, " :pattern (");
     out_tm(&mut out, v, u_at(v.targs, x.c));
-    out_str(&mut out, ") :pattern (");
+    w_s(&mut out, ") :pattern (");
     out_tm(&mut out, v, u_at(v.targs, vadd(x.c, 1)));
-    out_str(&mut out, ")))");
+    w_s(&mut out, ")))");
   } else if x.kind == VT_FORALLP1 {
-    out_str(&mut out, "(forall ((");
+    w_s(&mut out, "(forall ((");
     out_tm(&mut out, v, x.a);
-    out_str(&mut out, " Int)) (! ");
+    w_s(&mut out, " Int)) (! ");
     out_tm(&mut out, v, x.b);
-    out_str(&mut out, " :pattern (");
+    w_s(&mut out, " :pattern (");
     out_tm(&mut out, v, x.c);
-    out_str(&mut out, ")))");
+    w_s(&mut out, ")))");
   }
 }
 
@@ -1344,44 +1331,44 @@ fn out_sort(out: &mut Vec[u64], so: u64) {
   let mut d = so / 2;
   let depth = d;
   while d > 0 {
-    out_str(&mut out, "(Array Int ");
+    w_s(&mut out, "(Array Int ");
     d = d - 1;
   }
-  if so % 2 == SO_BOOL { out_str(&mut out, "Bool"); } else { out_str(&mut out, "Int"); }
+  if so % 2 == SO_BOOL { w_s(&mut out, "Bool"); } else { w_s(&mut out, "Int"); }
   while d < depth {
-    out_str(&mut out, ")");
+    w_s(&mut out, ")");
     d = d + 1;
   }
 }
 
 /// The three commands every session starts with.
 fn out_header(out: &mut Vec[u64]) {
-  out_str(&mut out, "(set-option :produce-models true)\n");
-  out_str(&mut out, "(set-option :rlimit 40000000)\n");
-  out_str(&mut out, "(set-option :timeout 60000)\n");
+  w_s(&mut out, "(set-option :produce-models true)\n");
+  w_s(&mut out, "(set-option :rlimit 40000000)\n");
+  w_s(&mut out, "(set-option :timeout 60000)\n");
 }
 
 /// Command `cmd`, with its newline.
 fn out_cmd(out: &mut Vec[u64], v: &Vr, cmd: Cmd) {
   if cmd.kind == CMD_DECL {
-    out_str(&mut out, "(declare-const ");
+    w_s(&mut out, "(declare-const ");
     out_tm(&mut out, v, cmd.a);
-    out_str(&mut out, " ");
+    w_s(&mut out, " ");
     out_sort(&mut out, cmd.b);
-    out_str(&mut out, ")\n");
+    w_s(&mut out, ")\n");
   } else if cmd.kind == CMD_ASSERT {
-    out_str(&mut out, "(assert ");
+    w_s(&mut out, "(assert ");
     out_tm(&mut out, v, cmd.a);
-    out_str(&mut out, ")\n");
+    w_s(&mut out, ")\n");
   } else if cmd.kind == CMD_RAW {
     out_tm(&mut out, v, cmd.a);
-    out_str(&mut out, "\n");
+    w_s(&mut out, "\n");
   } else if cmd.kind == CMD_PUSH {
-    out_str(&mut out, "(push 1)\n");
+    w_s(&mut out, "(push 1)\n");
   } else if cmd.kind == CMD_POP {
-    out_str(&mut out, "(pop 1)\n");
+    w_s(&mut out, "(pop 1)\n");
   } else if cmd.kind == CMD_CHECK {
-    out_str(&mut out, "(check-sat)\n");
+    w_s(&mut out, "(check-sat)\n");
   }
 }
 
@@ -2682,11 +2669,11 @@ fn havoc(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, oenv: u64, ty0: u64, kee
 // ---- What a failed proof says (after "could not prove") ----
 
 fn vm_s(v: &mut Vr, s: Str) {
-  rd_s(&mut v.msg, s);
+  w_s(&mut v.msg, s);
 }
 
 fn vm_num(v: &mut Vr, x: u64) {
-  rd_num(&mut v.msg, x);
+  w_num(&mut v.msg, x);
 }
 
 /// Expression `i` as stage0's `render` writes it.
@@ -2827,7 +2814,7 @@ fn wn_requires(v: &mut Vr, p: &Parser, nm: u64, nmi: u64, r: u64, loc: u64) {
   let rn = node_at(p.nodes, r);
   let ln = node_at(p.nodes, loc);
   if rn.file == ln.file {
-    rd_s(&mut v.wnote, "`");
+    w_s(&mut v.wnote, "`");
     if nm != 0 {
       let tm = tm_at(v, nm);
       let mut k = 0;
@@ -2840,15 +2827,15 @@ fn wn_requires(v: &mut Vr, p: &Parser, nm: u64, nmi: u64, r: u64, loc: u64) {
       let n = node_at(p.nodes, nmi);
       rd_src(&mut v.wnote, p, n.s, n.e);
     }
-    rd_s(&mut v.wnote, "` requires it on line ");
-    rd_num(&mut v.wnote, rn.line);
+    w_s(&mut v.wnote, "` requires it on line ");
+    w_num(&mut v.wnote, rn.line);
   }
 }
 
 /// "`f` promises it on line N" for postcondition `e` of `f` (term `nm`).
 fn wn_ensures(v: &mut Vr, p: &Parser, nm: u64, e: u64) {
   let en = node_at(p.nodes, e);
-  rd_s(&mut v.wnote, "`");
+  w_s(&mut v.wnote, "`");
   let tm = tm_at(v, nm);
   let mut k = 0;
   while k < tm.b {
@@ -2856,8 +2843,8 @@ fn wn_ensures(v: &mut Vr, p: &Parser, nm: u64, e: u64) {
     vec_push(&mut v.wnote, ch);
     k = k + 1;
   }
-  rd_s(&mut v.wnote, "` promises it on line ");
-  rd_num(&mut v.wnote, en.line);
+  w_s(&mut v.wnote, "` promises it on line ");
+  w_num(&mut v.wnote, en.line);
 }
 
 /// "that `a` is empty: ..." for a page table freed.
@@ -2953,7 +2940,7 @@ fn prove(v: &mut Vr, st: &VState, goal: u64, loc: u64, code: u64) {
   }
   let ms = vec_len(v.mpool);
   if vec_len(v.msg) > 0 {
-    rd_s(&mut v.mpool, "could not prove ");
+    w_s(&mut v.mpool, "could not prove ");
     k = 0;
     while k < vec_len(v.msg) {
       vec_push(&mut v.mpool, u_at(v.msg, k));
@@ -5384,7 +5371,11 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     vm_arg(&mut v, p, u_at(args, 1));
     vm_s(&mut v, " + ");
     vm_arg(&mut v, p, u_at(args, 2));
-    vm_s(&mut v, "` lies in the device window (0x80000000 to 2^46)");
+    if v.arch == ARCH_AARCH64 {
+      vm_s(&mut v, "` lies in the device window (below 2^46)");
+    } else {
+      vm_s(&mut v, "` lies in the device window (0x80000000 to 2^46)");
+    }
     prove(&mut v, st, g, i, VC_BOUNDS);
     let inr = port_range(&mut v, b, n);
     let sel = app2(&mut v, OP_SELECT, g_free(v, x0), v.t_k);
@@ -5754,9 +5745,28 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     // it goes up.
     return fresh_u64_named(&mut v, "tsc");
   }
+  if name_is(p, i, "cpu_get") && v.arch == ARCH_AARCH64 {
+    need_lt(&mut v, p, st, i, term(v, x1), 37, u_at(args, 1), "the saved registers");
+    return fresh_u64_named(&mut v, "reg");
+  }
   if name_is(p, i, "cpu_get") {
     need_lt(&mut v, p, st, i, term(v, x1), 21, u_at(args, 1), "the saved registers");
     return fresh_u64_named(&mut v, "reg");
+  }
+  if name_is(p, i, "cpu_set") && v.arch == ARCH_AARCH64 {
+    // x0-x30, SP_EL0, ELR_EL1 and SPSR_EL1 (0-33) and TPIDR_EL0 (36); the
+    // syndrome and fault address (34, 35) are only reported by a trap.
+    let r = term(v, x1);
+    let t34 = num(&mut v, 34);
+    let t36 = num(&mut v, 36);
+    let a = app2(&mut v, OP_LT, r, t34);
+    let b = app2(&mut v, OP_EQ, r, t36);
+    let g = app2(&mut v, OP_OR, a, b);
+    vm_s(&mut v, "that register `");
+    vm_arg(&mut v, p, u_at(args, 1));
+    vm_s(&mut v, "` can be set (0-33 or 36)");
+    prove(&mut v, st, g, i, VC_BOUNDS);
+    return v.unit;
   }
   if name_is(p, i, "cpu_set") {
     // Registers 0-17 and the FS base (20); the error code and fault address
@@ -6747,20 +6757,20 @@ fn verify_fn(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
   let prev = v.tsub;
   v.tsub = vm_tsub(m, p, x);
   vec_free(prev);
-  v.counts = has_u(v.cnt_fns, xi.def);
-  v.caps = has_u(v.cap_fns, xi.def);
+  v.counts = has_id(v.cnt_fns, xi.def);
+  v.caps = has_id(v.cap_fns, xi.def);
   if v.counts {
     count_lemmas(&mut v);
   }
-  if has_u(v.dec_fns, xi.def) {
+  if has_id(v.dec_fns, xi.def) {
     dec_axioms(&mut v);
   }
-  if has_u(v.hex_fns, xi.def) {
+  if has_id(v.hex_fns, xi.def) {
     hex_axioms(&mut v);
   }
   v.file = d.file;
   opaque_decls(&mut v, c, &mut m, p);
-  v.bits = has_u(v.bit_fns, xi.def);
+  v.bits = has_id(v.bit_fns, xi.def);
   if v.bits {
     bit_axioms(&mut v);
   }
@@ -6863,11 +6873,11 @@ fn buffers_kept(v: &mut Vr, m: &mut Mono, p: &Parser, x: u64) {
       }
       if !(any && all) {
         let ms = vec_len(v.mpool);
-        rd_s(&mut v.mpool, "`");
+        w_s(&mut v.mpool, "`");
         rd_src(&mut v.mpool, p, qn.s, qn.e);
-        rd_s(&mut v.mpool, "` belongs to the C caller, but `");
+        w_s(&mut v.mpool, "` belongs to the C caller, but `");
         rd_src(&mut v.mpool, p, d.s, d.e);
-        rd_s(&mut v.mpool, "` may free or replace it");
+        w_s(&mut v.mpool, "` may free or replace it");
         let ml = vlen_since(v.mpool, ms);
         vec_push(&mut v.obls, Obl { at: q, code: VC_EXPORT, x: x, env: 0, n: 0, ms: ms, ml: ml, ns: 0, nl: 0 });
         send(&mut v, CMD_FAIL, 0, 0);
