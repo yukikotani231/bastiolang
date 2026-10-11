@@ -1,14 +1,14 @@
 # Launch checklist
 
-What remains before bastiolang and BastiOS go public. Written 2026-10-10;
-tick items off here as they land, and delete this file once both
-repositories are public. It is not part of the documentation website.
+What remained before bastiolang and BastiOS went public, and what is
+still open now that they are (both public since 2026-10-11). Tick items
+off here as they land, and delete this file once nothing is open. It is not part of the documentation website.
 
 ## Decisions for the maintainer
 
-- [ ] **Make the repositories public**, bastiolang first: BastiOS CI checks
-      bastiolang out, and the `BASTIOLANG_TOKEN` gate in bastios'
-      `ci.yml` and `release.yml` can go once bastiolang is public.
+- [x] **Make the repositories public** (2026-10-11), bastiolang first.
+      The `BASTIOLANG_TOKEN` gate in bastios' CI and release workflows
+      goes in bastios #207.
 - [ ] **The first versions.** Proposed: bastiolang `v0.1.0` (the version in
       `stage0/Cargo.toml`) and BastiOS `v0.2.0` (the version the kernel
       prints). Both changelogs have their section ready, marked "not yet
@@ -18,14 +18,14 @@ repositories are public. It is not part of the documentation website.
       the `pages` workflow, which needs Settings > Pages > Source set to
       GitHub Actions, or `site/publish.sh` to a `gh-pages` branch. A
       custom domain, if any, is still open.
-- [ ] **The name.** Checked 2026-10-11: `bastio`, `bastios`, `bastioc`
+- [x] **The name.** Checked 2026-10-11: `bastio`, `bastios`, `bastioc`
       and `tree-sitter-bastio` are free on crates.io, npm and PyPI, and a
       web search finds no other language or OS by either name. One
       collision: **Bastio** (bastio.com, `bastio-ai` on GitHub) is an AI
       security company with an open-source gateway. Different field, but
       both are security software; whether it holds a registered trademark
       was not checked (USPTO/EUIPO search by hand). "BastiOS" found no
-      match. Decide whether to keep the name.
+      match. Kept (2026-10-11).
 
 ## Licensing
 
@@ -62,10 +62,10 @@ repositories are public. It is not part of the documentation website.
       Rewriting history to remove these is not proposed.
 - [x] `SECURITY.md` in both repositories (private reporting through
       GitHub security advisories).
-- [ ] **Turn on private vulnerability reporting** in both repositories
+- [x] **Turn on private vulnerability reporting** in both repositories
       once public (Settings → Security → Private vulnerability reporting →
       Enable); `SECURITY.md` links to it.
-- [ ] **Actions on pull requests from outside contributors.** Once public,
+- [x] **Actions on pull requests from outside contributors.** Once public,
       Actions minutes are free and anyone can open a pull request that
       runs our workflows. In each repository: Settings → Actions →
       General → "Approval for running fork pull request workflows from
@@ -100,7 +100,7 @@ Statements that were true when written and are not any more:
 - [x] Release workflows that build from a tag and create a draft release
       (`docs/releasing.md` in both repositories). Not run yet.
 - [ ] Dry run: start each release workflow by hand on a throwaway tag and
-      check the artifacts (bastios needs `BASTIOLANG_TOKEN` for this).
+      check the artifacts.
 - [ ] `bastioc0 --version` does not exist; add it (stage0, owned by the
       compiler work) so bug reports can say which compiler they used.
 - [ ] Binaries are built against Ubuntu 24.04's glibc. A static musl

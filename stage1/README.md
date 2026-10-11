@@ -64,6 +64,10 @@ keeps them identical.
 `print.bastio` prints the tree for both dumps, and `out.bastio` holds the
 output helpers the drivers share.
 
+Every phase writes its text into a `Vec[u64]`, one character per element;
+`wtext.bastio` holds the helpers for that (append a literal, a decimal or
+hex number, another buffer), once for all phases.
+
 `lexcases/` and `monocases/` hold sources that exercise lexical and
 monomorphization errors, `verifycases/` programs that exercise corners of
 the verifier the tests do not reach (matches where only some arms fall
