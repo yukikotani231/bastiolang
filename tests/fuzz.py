@@ -517,7 +517,7 @@ def mask(want, got):
 
 def counterexample_free(err):
     # Counterexample values depend on the solver's search; compare the rest.
-    return re.sub(rb'(  = counterexample: ).*', rb'\1...', err)
+    return re.sub(rb'(  = counterexample(?: after one iteration)?: ).*', rb'\1...', err)
 
 
 class Fuzz:

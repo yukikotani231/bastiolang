@@ -37,12 +37,19 @@ impl Diag {
     ///      2 |   return foo(1);
     ///        |          ^^^
     ///        = a note
+    ///
+    /// An error about no line of the program (line 0, such as the solver
+    /// failing to start) has only the file name and no source line.
     pub fn render(&self, files: &[(String, String)]) -> String {
         let (file, src) = files.get(self.pos.file).map(|(f, s)| (f.as_str(), s.as_str())).unwrap_or(("?", ""));
-        let mut s = format!("{}:{}:{}: error[{}]: {}\n", file, self.pos.line, self.pos.col, self.code, self.msg);
+        let mut s = if self.pos.line == 0 {
+            format!("{}: error[{}]: {}\n", file, self.code, self.msg)
+        } else {
+            format!("{}:{}:{}: error[{}]: {}\n", file, self.pos.line, self.pos.col, self.code, self.msg)
+        };
         let num = self.pos.line.to_string();
         let pad = " ".repeat(num.len() + 1);
-        if let Some(line) = src.lines().nth(self.pos.line.saturating_sub(1)) {
+        if let Some(line) = src.lines().nth(self.pos.line.saturating_sub(1)).filter(|_| self.pos.line > 0) {
             s.push_str(&format!(" {} | {}\n", num, line));
             // Columns count characters, as the lexer counts them.
             let cs: Vec<char> = line.chars().collect();

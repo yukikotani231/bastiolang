@@ -4,7 +4,7 @@
 // Pipeline: load -> monomorphize -> check (types and linearity) -> verify
 // (Z3) -> C -> the system C compiler.
 //
-// usage: bastioc1 [--check] [--emit-c] [--target T] [--lib DIR] [--backend B] [--emit-asm] [--header F] [-o out] <file.bastio>...
+// usage: bastioc1 [--help] [--check] [--emit-c] [--target T] [--lib DIR] [--backend B] [--emit-asm] [--header F] [-o out] <file.bastio>...
 //   (default)   verify, then build a native executable `out` (default: a.out)
 //               with the C compiler `$CC` (default: cc)
 //   --check     stop after verification
@@ -23,6 +23,7 @@
 //               (default: out.s) instead of building
 //   --header F  also write a C header for the program's `export fn`s to F
 //   --trusted-base  list and count the hand-written trusted base, then exit
+//   --help      print the options, then exit
 // Several input files form one program, as for bastioc0.
 //
 // Errors are reported on standard error as bastioc0 reports them:
@@ -71,10 +72,14 @@ fn b1_render(out: &mut Vec[u64], p: &Parser, ld: &Loader, file: u64, line: u64, 
     vec_push(&mut out, u_at(ld.paths, k));
     k = k + 1;
   }
-  out_str(&mut out, ":");
-  out_num(&mut out, line);
-  out_str(&mut out, ":");
-  out_num(&mut out, col);
+  // Line 0 is no line of the program (the solver failed to start, say):
+  // the file name alone, and no source line (stage0's `Diag::render`).
+  if line > 0 {
+    out_str(&mut out, ":");
+    out_num(&mut out, line);
+    out_str(&mut out, ":");
+    out_num(&mut out, col);
+  }
   out_str(&mut out, ": error[");
   out_str(&mut out, code);
   out_str(&mut out, "]");
@@ -108,7 +113,7 @@ fn b1_render(out: &mut Vec[u64], p: &Parser, ld: &Loader, file: u64, line: u64, 
   // caret line and the notes.
   let mut digits = vec_new[u64]();
   out_num(&mut digits, line);
-  if l >= line && i < end {
+  if line > 0 && l >= line && i < end {
     out_str(&mut out, " ");
     k = 0;
     while k < vec_len(digits) {
@@ -399,6 +404,24 @@ fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, em
   return status;
 }
 
+/// What `--help` prints (stage0's `HELP`, with this compiler's name and
+/// options).
+fn b1_help(out: &mut Vec[u64]) {
+  out_str(&mut out, "usage: bastioc1 [options] <file.bastio>...\n");
+  out_str(&mut out, "Proves the program memory safe with Z3, then compiles it with `cc`.\n");
+  out_str(&mut out, "\n");
+  out_str(&mut out, "  --check          verify only; write nothing\n");
+  out_str(&mut out, "  --emit-c         write the generated C instead of an executable\n");
+  out_str(&mut out, "  --target T       hosted (the default), or kernel or user for BastiOS (these write C, or assembly with --backend native)\n");
+  out_str(&mut out, "  --backend B      c (the default) or native (experimental: x86-64 assembly)\n");
+  out_str(&mut out, "  --emit-asm       with --backend native: write the assembly instead of an executable\n");
+  out_str(&mut out, "  --lib DIR        also look for imported files in DIR\n");
+  out_str(&mut out, "  --header FILE    also write a C header for the program's `export fn`s\n");
+  out_str(&mut out, "  -o FILE          the output file (default: a.out, or out.c for C and out.s for assembly)\n");
+  out_str(&mut out, "  --trusted-base   print the trusted runtime code and exit\n");
+  out_str(&mut out, "  --help           print this and exit\n");
+}
+
 fn main(con: &mut Serial, host: &mut Host) -> u64 {
 
   let mut out = vec_new[u64]();
@@ -461,6 +484,21 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
         status = 2;
       }
       bfree(t);
+    } else if b1_is(a, "--help") || b1_is(a, "-h") {
+      bfree(a);
+      let mut hl = vec_new[u64]();
+      b1_help(&mut hl);
+      let mut j = 0;
+      while j < vec_len(hl) {
+        let ch = vec_get(hl, j);
+        if ch <= 255 {
+          serial_write(con, cast[u8](ch));
+        }
+        j = j + 1;
+      }
+      vec_free(hl);
+      listed = true;
+      i = host_argc(host);
     } else if b1_is(a, "--trusted-base") {
       bfree(a);
       let mut tb = vec_new[u64]();
@@ -565,7 +603,15 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
       } else {
         let mut v = vr_new(&mut m, p);
         let mut rep = vec_new[u64]();
-        if !verify_batched(&mut v, c, &mut m, p, host, &mut rep, solve_jobs(host)) {
+        if !solver_starts(host) {
+          let mut msg = vec_new[u64]();
+          out_str(&mut msg, "could not start the SMT solver `");
+          solver_name(host, &mut msg);
+          out_str(&mut msg, "` (install Z3 and put `z3` on PATH)");
+          b1_render(&mut out, p, ld, 0, 0, 0, "E-SOLVER", msg, rep);
+          vec_free(msg);
+          status = 1;
+        } else if !verify_batched(&mut v, c, &mut m, p, host, &mut rep, solve_jobs(host)) {
           let n = node_at(p.nodes, v.fail_at);
           let mut code = "E-SOLVER";
           if v.fail_code != 0 {
