@@ -952,6 +952,25 @@ def check(found, src, name, res, want_out, want_code, where):
         found.append(("miscompile", src, f"{name}: exit {'timeout' if code is None else code}, expected {want_code}; {diff or 'same output'} ({where})"))
 
 
+def stale_stage0():
+    """A stage0 source file newer than the default bastioc0, or None.
+
+    bastioc1 is built from stage1/ as it is now, so an old bastioc0 makes
+    the two write different C for every program."""
+    if "BASTIOC" in os.environ:
+        return None
+    try:
+        built = os.path.getmtime(BASTIOC)
+    except OSError:
+        return None
+    for d, _, files in os.walk(os.path.join(ROOT, "stage0/src")):
+        for f in files:
+            path = os.path.join(d, f)
+            if os.path.getmtime(path) > built:
+                return os.path.relpath(path, ROOT)
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seed", type=int, default=1)
@@ -972,6 +991,10 @@ def main():
         except Violation as v:
             sys.stdout.write(f"// running it: {v}\n")
         return 0
+    stale = stale_stage0()
+    if stale:
+        sys.exit(f"progfuzz: {stale} is newer than {BASTIOC}; run `cargo build --release` in stage0 first,\n"
+                 "or every program will look like a stage0/stage1 mismatch")
     b1 = None
     if a.bastioc1:
         b1 = os.path.abspath(a.bastioc1)
