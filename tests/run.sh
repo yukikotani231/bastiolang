@@ -166,7 +166,8 @@ done
 # like a test: its first line is `// expect-exit: N` (built and run on the
 # hosted target), `// expect-error: CODE` (rejected with CODE), or
 # `// expect-ok` (accepted by --check; for kernel and user examples that
-# cannot run here), with an optional `// target: T` line after it. Sketches
+# cannot run here), with an optional `// target: T` line after it. They may
+# import the library (core/, std/). Sketches
 # that are not whole programs use ```text instead.
 mkdir -p "$tmp/doc"
 for md in docs/*.md; do
@@ -184,19 +185,19 @@ for f in "$tmp"/doc/*.bastio; do
   case "$head1" in
     "// expect-exit: "*)
       want=${head1#// expect-exit: }
-      if ! "$BASTIOC" -o "$tmp/docex" "$f" 2>"$tmp/doc.err"; then
+      if ! "$BASTIOC" --lib "$PWD" -o "$tmp/docex" "$f" 2>"$tmp/doc.err"; then
         echo "FAIL $at: rejected"; sed 's/^/    /' "$tmp/doc.err"; fail=$((fail+1)); continue
       fi
       "$tmp/docex" </dev/null >/dev/null; got=$?
       if [ "$got" = "$want" ]; then pass=$((pass+1)); else echo "FAIL $at: exit $got, want $want"; fail=$((fail+1)); fi ;;
     "// expect-error: "*)
       want=${head1#// expect-error: }
-      if "$BASTIOC" --check --target "${target:-hosted}" "$f" 2>"$tmp/doc.err"; then
+      if "$BASTIOC" --lib "$PWD" --check --target "${target:-hosted}" "$f" 2>"$tmp/doc.err"; then
         echo "FAIL $at: accepted, want $want"; fail=$((fail+1))
       elif grep -q "error\[$want\]" "$tmp/doc.err"; then pass=$((pass+1)); else
         echo "FAIL $at: wrong error, want $want"; sed 's/^/    /' "$tmp/doc.err"; fail=$((fail+1)); fi ;;
     "// expect-ok")
-      if "$BASTIOC" --check --target "${target:-hosted}" "$f" 2>"$tmp/doc.err"; then pass=$((pass+1)); else
+      if "$BASTIOC" --lib "$PWD" --check --target "${target:-hosted}" "$f" 2>"$tmp/doc.err"; then pass=$((pass+1)); else
         echo "FAIL $at: rejected"; sed 's/^/    /' "$tmp/doc.err"; fail=$((fail+1)); fi ;;
     *)
       echo "FAIL $at: a \`\`\`bastio block must start with // expect-exit:, // expect-error: or // expect-ok"; fail=$((fail+1)) ;;
@@ -212,6 +213,21 @@ if [ -n "$dc" ]; then
 else
   echo "FAIL tests/doc_check.py did not finish"; sed 's/^/    /' "$tmp/doccheck.out"; fail=$((fail+1))
 fi
+# The library reference (docs/lib/*.md and the module table in
+# docs/core.md) is what tests/libref.py generates from core/ and std/, every
+# library function is documented and called by an example, and every
+# module's examples build, verify and run.
+if python3 tests/libref.py --check >"$tmp/libref.out" 2>&1; then pass=$((pass+1)); else
+  echo "FAIL tests/libref.py --check"; sed 's/^/    /' "$tmp/libref.out"; fail=$((fail+1)); fi
+python3 tests/libref.py --examples "$tmp/libref" >"$tmp/libref.list"
+while read -r mod prog names; do
+  if ! "$BASTIOC" --lib "$PWD" -o "${prog%.bastio}" "$prog" 2>"$tmp/libref.err"; then
+    echo "FAIL examples of $mod: rejected"; sed 's/^/    /' "$tmp/libref.err"; fail=$((fail+1)); continue
+  fi
+  "${prog%.bastio}" </dev/null >/dev/null 2>&1; got=$?
+  if [ "$got" = 0 ]; then pass=$((pass+1)); else
+    echo "FAIL examples of $mod: the example of $(echo $names | cut -d' ' -f$got) failed"; fail=$((fail+1)); fi
+done <"$tmp/libref.list"
 # Single-file examples (examples/*.bastio) build and run, exiting with 0.
 for f in examples/*.bastio; do
   name=$(basename "$f" .bastio)

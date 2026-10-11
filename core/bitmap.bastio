@@ -77,6 +77,19 @@ fn map_find_free(m: &Bytes, lo: u64, hi: u64, hint: u64) -> u64
 /// Finds a free entry as `map_find_free` does and marks it in use (byte
 /// 1). Returns it, or `hi` when every entry is in use (then `m` is
 /// unchanged).
+/// ```
+/// // A map of 16 disk blocks, one byte each; blocks 0 and 1 are reserved.
+/// let mut m = balloc(16);
+/// map_fill(&mut m, 0, 2, 1);
+/// let a = map_take(&mut m, 2, 16, 0);   // the hint is outside 2..16: start at 2
+/// let b = map_take(&mut m, 2, 16, a);
+/// if a == 16 || b == 16 { bfree(m); return 1; }   // full
+/// assert bget(m, a) != 0 && 2 <= a;               // proved from the contracts
+/// map_give(&mut m, a);
+/// let ok = a == 2 && b == 3 && map_is_free(m, 2) && map_count_free(m, 0, 16) == 13 && map_find_free(m, 2, 16, 3) == 4;
+/// bfree(m);
+/// if !ok { return 1; }
+/// ```
 fn map_take(m: &mut Bytes, lo: u64, hi: u64, hint: u64) -> u64
   requires lo <= hi && hi <= blen(m)
   ensures result <= hi
@@ -187,6 +200,20 @@ fn bits_clear(b: &mut Bits, i: u64)
 }
 
 /// `n` entries, all clear.
+/// ```
+/// // 100 pages, 64 to a word.
+/// let mut b = bits_new(100);
+/// bits_set(&mut b, 0);                       // page 0 is reserved
+/// let p = bits_take(&mut b, 1, 100, 1);      // the first free page from 1
+/// let q = bits_find_clear(b, 1, 100, 1);     // the next free one, not taken
+/// if p == 100 { bits_free(b); return 1; }
+/// assert bits_at(b, p);                      // proved: taking set it
+/// bits_give(&mut b, p);
+/// bits_clear(&mut b, 0);
+/// let ok = p == 1 && q == 2 && !bits_test(b, 1) && bits_count_clear(b, 0, 100) == 100;
+/// bits_free(b);
+/// if !ok { return 1; }
+/// ```
 fn bits_new(n: u64) -> Bits
   requires n <= 1152921504606846976
   ensures bits_ok(result) && result.n == n
@@ -210,6 +237,18 @@ fn bits_new(n: u64) -> Bits
 /// Grows the map to `n` entries, the new ones clear, keeping every old
 /// entry. Returns false, with the map unchanged, when memory runs out: it
 /// never stops the program.
+/// ```
+/// let mut b = bits_new(10);
+/// bits_set(&mut b, 3);
+/// if !bits_grow(&mut b, 1000) {
+///   bits_free(b);
+///   return 1;   // out of memory: the map is unchanged
+/// }
+/// assert b.n == 1000;
+/// let ok = bits_test(b, 3) && !bits_test(b, 999) && bits_count_clear(b, 0, 1000) == 999;
+/// bits_free(b);
+/// if !ok { return 1; }
+/// ```
 fn bits_grow(b: &mut Bits, n: u64) -> bool
   requires bits_ok(b) && b.n <= n && n <= 1152921504606846976
   ensures bits_ok(b)
@@ -263,7 +302,7 @@ fn bits_free(b: Bits) {
   vec_free(b.w);
 }
 
-/// The first clear entry in lo..hi, or hi if all are set.
+/// Internal: The first clear entry in lo..hi, or hi if all are set.
 fn bits_find_clear_in(b: &Bits, lo: u64, hi: u64) -> u64
   requires bits_ok(b) && lo <= hi && hi <= b.n
   ensures result <= hi

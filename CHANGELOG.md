@@ -70,6 +70,18 @@ What will be 0.2.0.
 
 ### Library
 
+- A reference page for every library module (docs/lib/, and in the site):
+  each function with its contract as the compiler checks it, what it is for,
+  and an example. `tests/libref.py` generates the pages from the doc
+  comments in core/ and std/, and `tests/run.sh` checks that they are up to
+  date, that every function has a doc comment and an example, and that
+  every example builds, verifies and runs.
+- `checked_add_u64`, `checked_sub_u64`, `checked_mul_u64` (`None` when the
+  result does not fit), `sat_add_u64`, `sat_sub_u64`, `div_ceil_u64`,
+  `align_down_u64` and `align_up_u64`, each proved to compute exactly that.
+- `vec_find_u64` and `sorted_find_u64`: the first index of a value, with
+  `None` proved to mean it does not occur; `vec_min_u64`, `vec_max_u64` and
+  `vec_reverse_u64`; `bytes_rfind_byte`, the last index of a byte.
 - A first `core/` and `std/`: byte-string comparison, search, trimming and
   splitting; text building on `Vec[u8]`; integer parsing and formatting for
   every sized type; console printing; endian loads and stores; a hash map;

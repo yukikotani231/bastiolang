@@ -48,6 +48,19 @@ spec fn slots_same_but[V](s: &Slots[V], o: &Slots[V], at: u64) -> bool {
 }
 
 /// A table with no slots.
+/// ```
+/// // File descriptors: the lowest free one below a limit of 16.
+/// let mut fds = slots_new[u64]();
+/// let a = slots_alloc[u64](&mut fds, 0, 16, 100);   // 0
+/// let b = slots_alloc[u64](&mut fds, 0, 16, 200);   // 1
+/// if a >= 16 || b >= 16 { slots_free[u64](fds); return 1; }   // full or out of memory
+/// assert slots_maps[u64](fds, b, 200);   // proved: slot b holds 200
+/// let closed = slots_take[u64](&mut fds, a);   // close fd 0
+/// let c = slots_alloc[u64](&mut fds, 0, 16, 300);   // reuses 0
+/// let ok = a == 0 && b == 1 && c == 0 && opt_or[u64](closed, 0) == 100 && slots_count[u64](fds) == 2;
+/// slots_free[u64](fds);
+/// if !ok { return 1; }
+/// ```
 fn slots_new[V]() -> Slots[V]
   ensures vlen(result.vals) == 0
 {
@@ -75,6 +88,20 @@ fn slots_used[V](s: &Slots[V], i: u64) -> bool
 }
 
 /// The value in slot `i`, if it is in use. Any `i` may be asked.
+/// ```
+/// let mut s = slots_new[u64]();
+/// let i = slots_alloc[u64](&mut s, 0, 8, 42);
+/// let mut ok = i == 0;
+/// if i < 8 {
+///   slots_set[u64](&mut s, i, 43);   // allowed: slot i is in use
+///   ok = ok && opt_or[u64](slots_get[u64](s, i), 0) == 43 && slots_used[u64](s, i);
+/// }
+/// // Any id may be asked: one past the end is simply free.
+/// ok = ok && !slots_used[u64](s, 1000) && slots_get[u64](s, 1000) is Option::None;
+/// ok = ok && slots_find_free[u64](s, 0, 8) == 1;
+/// slots_free[u64](s);
+/// if !ok { return 1; }
+/// ```
 fn slots_get[V](s: &Slots[V], i: u64) -> Option[V]
   ensures (result is Option::Some) == slots_has[V](s, i)
   ensures result is Option::Some ==> slots_maps[V](s, i, result.Some)
@@ -140,6 +167,18 @@ const SLOTS_NOMEM: u64 = 18446744073709551615;
 /// every slot of `from..limit` is in use; or `SLOTS_NOMEM` when the table
 /// had to grow and memory ran out. It never stops the program, and on
 /// either failure `s` is unchanged.
+/// ```
+/// // A full range and the two failures, which change nothing.
+/// let mut s = slots_new[u64]();
+/// let x = slots_alloc[u64](&mut s, 0, 2, 1);
+/// let y = slots_alloc[u64](&mut s, 0, 2, 2);
+/// let z = slots_alloc[u64](&mut s, 0, 2, 3);   // 0 and 1 are in use: the limit, 2
+/// // Process ids: search from just past the last one handed out.
+/// let p = slots_alloc[u64](&mut s, 5, 32, 9);   // 5: slots 2..4 are added free
+/// let ok = x == 0 && y == 1 && z == 2 && p == 5 && slots_cap[u64](s) == 6 && z != SLOTS_NOMEM;
+/// slots_free[u64](s);
+/// if !ok { return 1; }
+/// ```
 fn slots_alloc[V](s: &mut Slots[V], from: u64, limit: u64, v: V) -> u64
   requires from <= limit && limit <= 1152921504606846976
   ensures result == SLOTS_NOMEM || (from <= result && result <= limit)

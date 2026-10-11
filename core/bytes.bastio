@@ -1,4 +1,17 @@
 // core/bytes.bastio: comparing, searching, slicing and hashing byte strings.
+//
+// Byte strings are compared and searched in place: functions take positions
+// or a `Span` (bytes `start..end`) instead of copies, and copy only when
+// asked (`bytes_slice`). A scan for one byte returns the length of the string
+// when the byte is absent, so a scan loop needs no `match`.
+//
+// What is proved: each comparison returns exactly the relation its spec fn
+// names (`bytes_equal`, `bytes_equal_str`, `bytes_same_at`); a search result
+// is a real occurrence, and every byte a search skipped differs; copies and
+// writes change only the bytes they name. Not proved: that `bytes_find`
+// finds the first occurrence, or any. A precondition such as
+// `to <= blen(b)` is proved at each call: `bytes_slice(b, 2, 9)` on five
+// bytes is rejected at compile time.
 import "option.bastio";
 
 /// Bytes `a[i..i+n]` and `b[j..j+n]` are equal.
@@ -21,6 +34,18 @@ spec fn span_in(s: Span, b: &Bytes) -> bool {
   s.start <= s.end && s.end <= blen(b)
 }
 
+/// `a` and `b` hold the same bytes.
+/// ```
+/// let a = bfrom("abc");
+/// let b = bfrom("abc");
+/// let c = bfrom("abd");
+/// let same = bytes_eq(a, b);
+/// let differ = bytes_eq(a, c);
+/// bfree(a);
+/// bfree(b);
+/// bfree(c);
+/// if !same || differ { return 1; }
+/// ```
 fn bytes_eq(a: &Bytes, b: &Bytes) -> bool
   ensures result == bytes_equal(a, b)
 {
@@ -39,6 +64,16 @@ fn bytes_eq(a: &Bytes, b: &Bytes) -> bool
   return true;
 }
 
+/// `a` holds exactly the bytes of the literal `s`.
+/// ```
+/// let cmd = bfrom("exit");
+/// if !bytes_eq_str(cmd, "exit") {
+///   bfree(cmd);
+///   return 1;
+/// }
+/// assert blen(cmd) == 4;   // known from the contract: equal means the same length
+/// bfree(cmd);
+/// ```
 fn bytes_eq_str(a: &Bytes, s: Str) -> bool
   ensures result == bytes_equal_str(a, s)
 {
@@ -58,6 +93,13 @@ fn bytes_eq_str(a: &Bytes, s: Str) -> bool
 }
 
 /// Bytes `from..to` of `a` are the bytes of `s`.
+/// ```
+/// let line = bfrom("GET /index.html");
+/// let get = bytes_span_eq_str(line, 0, 3, "GET");   // the method is bytes 0..3
+/// let put = bytes_span_eq_str(line, 0, 3, "PUT");
+/// bfree(line);
+/// if !get || put { return 1; }
+/// ```
 fn bytes_span_eq_str(a: &Bytes, from: u64, to: u64, s: Str) -> bool
   requires from <= to && to <= blen(a)
   ensures result == (to - from == slen(s) && (forall k: u64 :: k < slen(s) ==> bget(a, from + k) == sget(s, k)))
@@ -78,6 +120,16 @@ fn bytes_span_eq_str(a: &Bytes, from: u64, to: u64, s: Str) -> bool
 }
 
 /// `a` begins with `p`.
+/// ```
+/// let path = bfrom("/proc/1/status");
+/// let pre = bfrom("/proc/");
+/// let suf = bfrom("/status");
+/// let ok = bytes_starts_with(path, pre) && bytes_ends_with(path, suf) && !bytes_starts_with(pre, path);
+/// bfree(path);
+/// bfree(pre);
+/// bfree(suf);
+/// if !ok { return 1; }
+/// ```
 fn bytes_starts_with(a: &Bytes, p: &Bytes) -> bool
   ensures result == (blen(p) <= blen(a) && bytes_same_at(a, 0, p, 0, blen(p)))
 {
@@ -118,6 +170,18 @@ fn bytes_ends_with(a: &Bytes, p: &Bytes) -> bool
 
 /// Lexicographic order: -1 if `a` sorts before `b`, 0 if they are equal,
 /// 1 if after. A proper prefix sorts first.
+/// ```
+/// let a = bfrom("apple");
+/// let b = bfrom("apricot");
+/// let c = bfrom("app");
+/// let r1 = bytes_cmp(a, b);   // 'p' sorts before 'r'
+/// let r2 = bytes_cmp(c, a);   // a proper prefix sorts first
+/// let r3 = bytes_cmp(b, b);
+/// bfree(a);
+/// bfree(b);
+/// bfree(c);
+/// if r1 != -1 || r2 != -1 || r3 != 0 { return 1; }
+/// ```
 fn bytes_cmp(a: &Bytes, b: &Bytes) -> i8
   ensures result == -1 || result == 0 || result == 1
   ensures (result == 0) == bytes_equal(a, b)
@@ -144,6 +208,14 @@ fn bytes_cmp(a: &Bytes, b: &Bytes) -> i8
 }
 
 /// The first index at or after `from` holding `c`, or `blen(b)` if there is none.
+/// ```
+/// let line = bfrom("name=bastio");
+/// let eq = bytes_find_byte(line, 61, 0);     // '='
+/// let hash = bytes_find_byte(line, 35, 0);   // no '#': the length
+/// let n = blen(line);
+/// bfree(line);
+/// if eq != 4 || hash != n { return 1; }
+/// ```
 fn bytes_find_byte(b: &Bytes, c: u8, from: u64) -> u64
   requires from <= blen(b)
   ensures from <= result && result <= blen(b)
@@ -163,7 +235,59 @@ fn bytes_find_byte(b: &Bytes, c: u8, from: u64) -> u64
   return i;
 }
 
-/// The first index at or after `from` where `needle` occurs in `hay`, if any.
+/// The last index below `to` holding `c`, if any: where the last `/` of a
+/// path is, say.
+/// ```
+/// let path = bfrom("/usr/lib/libc.so");
+/// let mut base = 0;
+/// match bytes_rfind_byte(path, 47, blen(path)) {   // the last '/'
+///   Option::Some(i) => { base = i + 1; },
+///   Option::None => {},
+/// }
+/// let ok = bytes_span_eq_str(path, base, blen(path), "libc.so");
+/// let none = bytes_rfind_byte(path, 47, 0);   // nothing below 0
+/// bfree(path);
+/// if !ok || none is Option::Some { return 1; }
+/// ```
+fn bytes_rfind_byte(b: &Bytes, c: u8, to: u64) -> Option[u64]
+  requires to <= blen(b)
+  ensures result is Option::Some ==> result.Some < to && bget(b, result.Some) == c
+  ensures result is Option::Some ==> (forall k: u64 :: result.Some < k && k < to ==> bget(b, k) != c)
+  ensures result is Option::None ==> (forall k: u64 :: k < to ==> bget(b, k) != c)
+{
+  let mut i = to;
+  while i > 0
+    invariant i <= to && (forall k: u64 :: i <= k && k < to ==> bget(b, k) != c)
+  {
+    if bget(b, i - 1) == c {
+      return Option[u64]::Some(i - 1);
+    }
+    i = i - 1;
+  }
+  return Option[u64]::None;
+}
+
+/// The first index at or after `from` where `needle` occurs in `hay`, if
+/// any. Proved: a `Some` is a real occurrence. Not proved: that it is the
+/// first, or that `None` means there is none (the statement needs a
+/// quantifier Z3 cannot instantiate in every program).
+/// ```
+/// let hay = bfrom("a needle in a haystack");
+/// let needle = bfrom("needle");
+/// let mut at = 0;
+/// match bytes_find(hay, needle, 0) {
+///   Option::Some(i) => {
+///     // The contract says the needle is there, so this slice needs no check.
+///     let found = bytes_slice(hay, i, i + blen(needle));
+///     if !bytes_eq(found, needle) { at = 99; } else { at = i; }
+///     bfree(found);
+///   },
+///   Option::None => { at = 99; },
+/// }
+/// bfree(hay);
+/// bfree(needle);
+/// if at != 2 { return 1; }
+/// ```
 fn bytes_find(hay: &Bytes, needle: &Bytes, from: u64) -> Option[u64]
   requires from <= blen(hay)
   ensures result is Option::Some ==> from <= result.Some && result.Some + blen(needle) <= blen(hay)
@@ -192,6 +316,15 @@ fn bytes_find(hay: &Bytes, needle: &Bytes, from: u64) -> Option[u64]
 }
 
 /// A copy of bytes `from..to` of `b`.
+/// ```
+/// let b = bfrom("hello, world");
+/// let w = bytes_slice(b, 7, 12);
+/// assert blen(w) == 5;
+/// let ok = bytes_eq_str(w, "world");
+/// bfree(w);
+/// bfree(b);
+/// if !ok { return 1; }
+/// ```
 fn bytes_slice(b: &Bytes, from: u64, to: u64) -> Bytes
   requires from <= to && to <= blen(b)
   ensures blen(result) == to - from && bytes_same_at(result, 0, b, from, to - from)
@@ -208,7 +341,21 @@ fn bytes_slice(b: &Bytes, from: u64, to: u64) -> Bytes
   return r;
 }
 
-/// A new byte string holding `a` followed by `b`.
+/// A new byte string holding `a` followed by `b`. Every `Bytes` is known to
+/// be at most 2^60 long, but two together are not (nothing bounds the memory
+/// of all live values at once), so for strings of unknown length build a
+/// text instead (core/text.bastio).
+/// ```
+/// let a = bfrom("foo");
+/// let b = bfrom("bar");
+/// let ab = bytes_concat(a, b);
+/// assert blen(ab) == 6;
+/// let ok = bytes_eq_str(ab, "foobar");
+/// bfree(ab);
+/// bfree(a);
+/// bfree(b);
+/// if !ok { return 1; }
+/// ```
 fn bytes_concat(a: &Bytes, b: &Bytes) -> Bytes
   requires blen(a) + blen(b) <= 1152921504606846976
   ensures blen(result) == blen(a) + blen(b)
@@ -235,6 +382,15 @@ fn bytes_concat(a: &Bytes, b: &Bytes) -> Bytes
 }
 
 /// Copies `src` into `dst` at `at`, leaving the other bytes of `dst` alone.
+/// ```
+/// let mut buf = bfrom("........");
+/// let src = bfrom("abc");
+/// bytes_copy_into(&mut buf, 2, src);
+/// let ok = bytes_eq_str(buf, "..abc...");
+/// bfree(buf);
+/// bfree(src);
+/// if !ok { return 1; }
+/// ```
 fn bytes_copy_into(dst: &mut Bytes, at: u64, src: &Bytes)
   requires at + blen(src) <= blen(dst)
   ensures blen(dst) == blen(old(dst))
@@ -257,6 +413,14 @@ fn bytes_copy_into(dst: &mut Bytes, at: u64, src: &Bytes)
 /// same distance into `b`): stated with one offset into each string, the
 /// proof needs Z3's model-based instantiation, which a program whose
 /// struct invariants bring in `vcount`'s lemmas does not get.
+/// ```
+/// let a = bfrom("xxabcxx");
+/// let b = bfrom("abc");
+/// let ok = bytes_span_eq(a, 2, b, 0, 3) && !bytes_span_eq(a, 0, b, 0, 3) && bytes_span_eq(a, 0, a, 5, 2);
+/// bfree(a);
+/// bfree(b);
+/// if !ok { return 1; }
+/// ```
 fn bytes_span_eq(a: &Bytes, i: u64, b: &Bytes, j: u64, n: u64) -> bool
   requires i <= blen(a) && n <= blen(a) - i && j <= blen(b) && n <= blen(b) - j
   ensures result == (forall p: u64 :: i <= p && p < i + n ==> bget(a, p) == bget(b, p - i + j))
@@ -275,6 +439,15 @@ fn bytes_span_eq(a: &Bytes, i: u64, b: &Bytes, j: u64, n: u64) -> bool
 
 /// Copies `src[from..to]` into `dst` at `at`, leaving the other bytes of
 /// `dst` alone. One `bcopy`: no per-byte loop.
+/// ```
+/// let mut dst = bfrom("....");
+/// let src = bfrom("0123456789");
+/// bytes_copy_span(&mut dst, 0, src, 3, 7);
+/// let ok = bytes_eq_str(dst, "3456");
+/// bfree(dst);
+/// bfree(src);
+/// if !ok { return 1; }
+/// ```
 fn bytes_copy_span(dst: &mut Bytes, at: u64, src: &Bytes, from: u64, to: u64)
   requires from <= to && to <= blen(src) && at <= blen(dst) && to - from <= blen(dst) - at
   ensures blen(dst) == blen(old(dst))
@@ -287,6 +460,17 @@ fn bytes_copy_span(dst: &mut Bytes, at: u64, src: &Bytes, from: u64, to: u64)
 /// Writes `c` at `at` if it fits. Returns the position after it, or `at`
 /// when `dst` is full there: a writer into a fixed buffer chains these and
 /// drops what does not fit.
+/// ```
+/// // A reply built in a fixed 8-byte buffer: what does not fit is dropped.
+/// let mut o = balloc(8);
+/// let mut at = bytes_put_str(&mut o, 0, "pid:");
+/// at = bytes_put_byte(&mut o, at, 32);
+/// at = bytes_put_str(&mut o, at, "1234567");   // only "123" fits
+/// assert at <= 8;
+/// let ok = at == 8 && bytes_eq_str(o, "pid: 123");
+/// bfree(o);
+/// if !ok { return 1; }
+/// ```
 fn bytes_put_byte(dst: &mut Bytes, at: u64, c: u8) -> u64
   requires at <= blen(dst)
   ensures blen(dst) == blen(old(dst)) && at <= result && result <= blen(dst)
@@ -331,6 +515,14 @@ fn is_space(c: u8) -> bool
 }
 
 /// `s` without the white space (`is_space`) at either end.
+/// ```
+/// let b = bfrom("  key = value \n");
+/// let s = bytes_trim(b, Span { start: 0, end: blen(b) });
+/// // The result is a span of `b`, so it can be compared without a check.
+/// let ok = bytes_span_eq_str(b, s.start, s.end, "key = value") && is_space(9) && !is_space(65);
+/// bfree(b);
+/// if !ok { return 1; }
+/// ```
 fn bytes_trim(b: &Bytes, s: Span) -> Span
   requires span_in(s, b)
   ensures s.start <= result.start && result.start <= result.end && result.end <= s.end
@@ -355,12 +547,27 @@ fn bytes_trim(b: &Bytes, s: Span) -> Span
   return Span { start: i, end: e };
 }
 
+/// Space, tab, newline or carriage return.
 spec fn is_space_spec(c: u8) -> bool {
   c == 32 || c == 9 || c == 10 || c == 13
 }
 
 /// The pieces of `b` between occurrences of `sep`, in order. There is one
 /// more piece than there are separators, so an empty `b` gives one empty span.
+/// ```
+/// let b = bfrom("a,bc,,d");
+/// let parts = bytes_split(b, 44);   // ','
+/// let mut ok = vec_len(parts) == 4;
+/// if ok {
+///   // Every piece is a span of `b`, so reading it needs no check.
+///   let p = vec_get(parts, 1);
+///   let q = vec_get(parts, 2);
+///   ok = bytes_span_eq_str(b, p.start, p.end, "bc") && q.start == q.end;
+/// }
+/// vec_free(parts);
+/// bfree(b);
+/// if !ok { return 1; }
+/// ```
 fn bytes_split(b: &Bytes, sep: u8) -> Vec[Span]
   ensures vlen(result) >= 1
   ensures forall i: u64 :: i < vlen(result) ==> span_in(vget(result, i), b)
@@ -385,6 +592,16 @@ fn bytes_split(b: &Bytes, sep: u8) -> Vec[Span]
 }
 
 /// The 64-bit FNV-1a hash of `b`.
+/// ```
+/// let a = bfrom("key");
+/// let b = bfrom("key");
+/// let e = balloc(0);
+/// let ok = bytes_hash(a) == bytes_hash(b) && bytes_hash(e) == 14695981039346656037;
+/// bfree(a);
+/// bfree(b);
+/// bfree(e);
+/// if !ok { return 1; }
+/// ```
 fn bytes_hash(b: &Bytes) -> u64 {
   let mut h: u64 = 14695981039346656037;
   let mut i = 0;
@@ -398,6 +615,12 @@ fn bytes_hash(b: &Bytes) -> u64 {
 }
 
 /// Frees a vector of byte strings and every string in it.
+/// ```
+/// let mut argv = vec_new[Bytes]();
+/// vec_push(&mut argv, bfrom("echo"));
+/// vec_push(&mut argv, bfrom("hi"));
+/// bytes_vec_free(argv);
+/// ```
 fn bytes_vec_free(v: Vec[Bytes]) {
   let mut w = v;
   while vec_len(w) > 0 {

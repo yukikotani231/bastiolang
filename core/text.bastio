@@ -1,6 +1,11 @@
 // core/text.bastio: building byte strings. A text under construction is a
 // `Vec[u8]`, which grows as bytes are pushed; `text_finish` turns it into
 // `Bytes`.
+//
+// What is proved: each push adds exactly the given bytes at the end and
+// leaves the earlier ones alone (spec fn `text_keeps`), and `text_to_bytes`
+// copies every byte. The `fmt_*` functions of core/num.bastio keep the
+// earlier bytes too.
 import "bytes.bastio";
 
 /// `t[i..i+n]` holds the bytes `b[j..j+n]`.
@@ -13,12 +18,24 @@ spec fn text_keeps(t: &Vec[u8], u: &Vec[u8], n: u64) -> bool {
   forall k: u64 :: k < n ==> vget(t, k) == vget(u, k)
 }
 
+/// An empty text.
+/// ```
+/// let mut t = text_new();
+/// text_push_str(&mut t, "id=");
+/// text_push(&mut t, 55);   // '7'
+/// assert vlen(t) == 4 && vget(t, 3) == 55;
+/// let b = text_finish(t);
+/// let ok = bytes_eq_str(b, "id=7");
+/// bfree(b);
+/// if !ok { return 1; }
+/// ```
 fn text_new() -> Vec[u8]
   ensures vlen(result) == 0
 {
   return vec_new[u8]();
 }
 
+/// Appends one byte.
 fn text_push(t: &mut Vec[u8], c: u8)
   ensures vlen(t) == vlen(old(t)) + 1 && vget(t, vlen(old(t))) == c
   ensures text_keeps(t, old(t), vlen(old(t)))
@@ -45,6 +62,20 @@ fn text_push_str(t: &mut Vec[u8], s: Str)
 }
 
 /// Appends bytes `from..to` of `b`.
+/// ```
+/// let line = bfrom("user: yuki");
+/// let mut t = text_new();
+/// text_push_str(&mut t, "hello, ");
+/// text_push_span(&mut t, line, 6, 10);
+/// text_push_bytes(&mut t, line);
+/// assert vlen(t) == 7 + 4 + 10;
+/// let b = text_to_bytes(t);
+/// let ok = bytes_eq_str(b, "hello, yukiuser: yuki");
+/// bfree(b);
+/// vec_free(t);
+/// bfree(line);
+/// if !ok { return 1; }
+/// ```
 fn text_push_span(t: &mut Vec[u8], b: &Bytes, from: u64, to: u64)
   requires from <= to && to <= blen(b)
   ensures vlen(t) == vlen(old(t)) + (to - from)
