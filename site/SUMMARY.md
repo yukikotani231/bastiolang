@@ -24,5 +24,6 @@
 - [BastiOS](bastios.md)
 - [Roadmap](roadmap.md)
 - [Contributing](contributing.md)
+- [Bootstrapping](bootstrap.md)
 - [Changelog](changelog.md)
 - [Releasing](releasing.md)

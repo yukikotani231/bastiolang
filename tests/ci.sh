@@ -14,7 +14,7 @@ skipped=()
 step() { printf '\n== %s\n' "$1"; }
 
 if git rev-parse -q --verify origin/main >/dev/null; then
-  step "stage0 changes have stage1 mirrors"; tests/stage0_mirror.sh origin/main
+  step "stage0 is frozen: changes say why"; tests/stage0_mirror.sh origin/main
 else
   skipped+=("stage0 mirror check (no origin/main to compare with)")
 fi

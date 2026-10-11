@@ -20,7 +20,7 @@ Never copy test counts into prose: they go stale. Count the real thing instead:
 
 ## Rules for new features
 
-- stage0 is being frozen (ROADMAP v2): a change to `stage0/src` needs the same change in its stage1 mirror, in the same PR. CI checks this with `tests/stage0_mirror.sh`. If a change has no stage1 counterpart, write `Stage0-only: <why>` in a commit message.
+- stage0 is frozen ([docs/bootstrap.md](docs/bootstrap.md)): new features go into stage1 only, and their test programs start with `// stage1-only: <feature>`. A branch that touches `stage0/` must say why in a commit message line, which `tests/stage0_mirror.sh` checks: `Stage0-only: <why>` (no stage1 counterpart: a bootstrap fix, the native backend, comments) or `Stage0-shared: <why>` (a bug fix made in both compilers, with its stage1 mirror in the same PR).
 - When adding a guarantee, add a program to `tests/fail/` that breaks it and check that it is rejected with the right error code.
 - Never get safety by adding runtime checks to generated code (the zero-overhead rule). Get it from a proof.
 - Growing the trusted base (Z3, the C compiler, the runtime prelude) follows invariant 3 in ROADMAP.md: regenerate `tests/trusted_base.txt` with `bastioc0 --trusted-base` and say in the PR what grew and why.
