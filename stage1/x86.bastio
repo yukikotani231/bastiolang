@@ -4277,9 +4277,12 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_jump(&mut g, "jnz", back);
     x86_place_label(&mut g, done);
   } else if name_is(p, i, "pt_has") {
+    // Present, or hidden (bit 10: pt_set_access 0) and still owned.
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RAX, 0, 0, 0);
     x86_es(&mut g, "mov (%rdx,%rax,8), %rax");
-    x86_es(&mut g, "and $1, %eax");
+    x86_es(&mut g, "test $0x401, %eax");
+    x86_es(&mut g, "setnz %al");
+    x86_es(&mut g, "movzbl %al, %eax");
   } else if name_is(p, i, "pt_writable") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RAX, 0, 0, 0);
     x86_es(&mut g, "mov (%rdx,%rax,8), %rax");
@@ -5046,6 +5049,24 @@ fn x86_builtin1(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_push(&mut g, x86_reg(XR_RAX));
     x86_es(&mut g, "call bst_rt_free");
     x86_pop(&mut g, x86_reg(XR_RAX));
+  } else if name_is(p, i, "pt_accessible") {
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RAX, 0, 0, 0);
+    x86_es(&mut g, "mov (%rdx,%rax,8), %rax");
+    x86_es(&mut g, "and $1, %eax");
+  } else if name_is(p, i, "pt_set_access") {
+    // Clears present, writable and hidden (bit 10), then sets hidden for
+    // 0, present for 1, present and writable for 2 (2a - 1 for a > 0).
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RCX, XR_RAX, 0, 0);
+    x86_es(&mut g, "mov (%rdx), %rdx");
+    x86_es(&mut g, "lea (%rdx,%rcx,8), %rdx");
+    x86_es(&mut g, "mov (%rdx), %rcx");
+    x86_es(&mut g, "and $-1028, %rcx");
+    x86_es(&mut g, "lea -1(%rax,%rax), %rsi");
+    x86_es(&mut g, "mov $0x400, %edi");
+    x86_es(&mut g, "test %rax, %rax");
+    x86_es(&mut g, "cmovz %rdi, %rsi");
+    x86_es(&mut g, "or %rsi, %rcx");
+    x86_es(&mut g, "mov %rcx, (%rdx)");
   } else if name_is(p, i, "atomic_load") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, 0, 0, 0, 0);
     x86_es(&mut g, "mov (%rdi), %rax");
@@ -8755,6 +8776,8 @@ fn x86_runtime_kernel(out: &mut Vec[u64]) {
   cg_s(&mut out, "3:\tlea 24(%rcx), %rax\n");
   cg_s(&mut out, "\tcmp %r11, %rax\n");
   cg_s(&mut out, "\tja 5f\n");
+  cg_s(&mut out, "\tcmpl $20, (%rcx)            # an entry too short ends the map\n");
+  cg_s(&mut out, "\tjb 5f\n");
   cg_s(&mut out, "\tcmpl $1, 20(%rcx)           # available\n");
   cg_s(&mut out, "\tjne 4f\n");
   cg_s(&mut out, "\tmov 4(%rcx), %rax\n");
@@ -8805,14 +8828,16 @@ fn x86_runtime_kernel(out: &mut Vec[u64]) {
   cg_s(&mut out, "\tmov 104(%rsi), %r8d         # height\n");
   cg_s(&mut out, "\ttest %rax, %rax\n");
   cg_s(&mut out, "\tjz 0f\n");
+  cg_s(&mut out, "\tmov $1, %r10d\n");
+  cg_s(&mut out, "\tshl $32, %r10\n");
+  cg_s(&mut out, "\tcmp %r10, %rax              # below 4 GiB, and with no wrap below: the verifier takes every field as below 2^32\n");
+  cg_s(&mut out, "\tjae 0f\n");
   cg_s(&mut out, "\tlea (,%rdx,4), %r9\n");
   cg_s(&mut out, "\tcmp %r9, %rcx\n");
   cg_s(&mut out, "\tjb 0f\n");
   cg_s(&mut out, "\tmov %rcx, %r9\n");
-  cg_s(&mut out, "\timul %r8, %r9\n");
-  cg_s(&mut out, "\tadd %rax, %r9\n");
-  cg_s(&mut out, "\tmov $1, %r10d\n");
-  cg_s(&mut out, "\tshl $32, %r10\n");
+  cg_s(&mut out, "\timul %r8, %r9               # both below 2^32: no overflow\n");
+  cg_s(&mut out, "\tsub %rax, %r10\n");
   cg_s(&mut out, "\tcmp %r10, %r9\n");
   cg_s(&mut out, "\tja 0f\n");
   cg_s(&mut out, "\ttest %rdi, %rdi\n");

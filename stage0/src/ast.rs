@@ -374,7 +374,8 @@ pub struct FnDef {
     pub pos: Pos,
     /// Filled in by the checker: the integer type of the operands of each
     /// arithmetic operator, comparison, unary minus and wrapping builtin in
-    /// the body, by its position. The
+    /// the body, by its position, and the type of the contents of each
+    /// `lock_new` and integer `atomic_new`. The
     /// verifier and the code generator need it, since literals take their
     /// type from context.
     pub int_ops: std::collections::HashMap<Pos, Type>,

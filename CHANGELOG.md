@@ -43,6 +43,11 @@ What will be 0.2.0.
   exposing what they held.
 - `pt_writable`: whether a level-1 page-table entry maps its frame
   writable (#81).
+- `pt_set_access` and `pt_accessible`: a level-1 slot can keep its page
+  while the program may not touch it (`PROT_NONE`), or only read it. The
+  table still owns the page (`pt_has` stays true), so it is taken out and
+  freed as before. The present bit is cleared and PTE bit 10 marks the
+  slot, in the runtime prelude (trusted). Not in the native x86 backend.
 - `boot_fb`, the framebuffer the boot loader reported, and a device window
   from 2 GiB (#67) up to 2^46 (#77).
 - `boot_acpi`, a byte of one of the firmware's ACPI tables, so a kernel
@@ -110,9 +115,33 @@ What will be 0.2.0.
   deterministic run.
 - A change to `stage0/src` needs its stage1 mirror, or a `Stage0-only:`
   reason in a commit message; CI checks this on every pull request (#78).
+- The kernel prelude (C and native) reads the boot loader's information
+  defensively: a framebuffer whose address would wrap `addr + pitch * h`,
+  or lies at 4 GiB, is not reported (the verifier takes each `boot_fb`
+  field as below 2^32, which such an address broke), and a memory-map entry
+  whose size is 0xFFFFFFFC no longer makes the page pool's walk loop forever
+  at boot. `tests/prelude_boot.sh` feeds both.
+- A 60 s wall-clock backstop on each Z3 query, on top of `:rlimit`: Z3 4.8.12
+  (Ubuntu's, and CI's) does not count its work on some nonlinear queries and
+  searched them forever, so `bastioc0 --check` hung on a 15-line function
+  (a guarded `x * x` on an `i16`). Such a query now gives up. The fuzzers
+  kill a timed-out compiler's z3 too, instead of leaving it spinning.
+- `tests/progfuzz.py`: random whole programs (helpers, recursion, `&mut`
+  calls, a struct, an enum, `Buf`, `Bytes` and `Vec` through bounded loops,
+  every integer type) run by an exact reference interpreter, then built by
+  bastioc0 and bastioc1 with both backends and by bastioc0's C under ASan
+  and UBSan; every build must print what the interpreter printed and exit
+  the same way, and a proof the interpreter's run breaks is a false proof.
 
 ### Fixed
 
+- `wrap[T](..)`, `wrap_add`, `wrap_sub` and `wrap_mul` are written for the
+  solver without `mod`: the result is a fresh value in the type's range
+  that differs from the exact one by a multiple of 2^width. Z3 4.8.12 (the
+  version Ubuntu ships, which CI installs) searched past its resource
+  limit, forever, on a `mod` of a wrapped value under another `mod` or a
+  product; `tests/fuzz.py --seed 1` hit 9 such inputs and every one now
+  takes under a second (`tests/fail/wrap_twice_overflow.bastio`).
 - A false proof in both compilers. A loop or call that changes a signed
   integer (also inside a struct, enum or box) forgot its value but gave the
   new one the range of `u64`, which leaves out the negative numbers, so an
@@ -124,6 +153,12 @@ What will be 0.2.0.
   inside the argument of `cast[T](..)` or `wrap[T](..)`, so a variable
   changed by a call written there kept its value from before
   (`tests/fail/loop_cast_call.bastio`).
+- Another false proof in both compilers: what came out of a lock built by
+  `lock_new` from an integer was taken for a `u64` whatever its type, so an
+  `i64` that a `locked` call made negative could be proved to be at least 0
+  after `lock_end` (`tests/fail/lock_signed_contents.bastio`,
+  `lock_signed_box.bastio`). The lock now keeps the checker's type of its
+  contents, which also makes a `u8` that comes out known to be at most 255.
 
 ### Documentation
 
