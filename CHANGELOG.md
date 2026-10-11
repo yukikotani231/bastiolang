@@ -117,6 +117,12 @@ What will be 0.2.0.
   inside the argument of `cast[T](..)` or `wrap[T](..)`, so a variable
   changed by a call written there kept its value from before
   (`tests/fail/loop_cast_call.bastio`).
+- Another false proof in both compilers: what came out of a lock built by
+  `lock_new` from an integer was taken for a `u64` whatever its type, so an
+  `i64` that a `locked` call made negative could be proved to be at least 0
+  after `lock_end` (`tests/fail/lock_signed_contents.bastio`,
+  `lock_signed_box.bastio`). The lock now keeps the checker's type of its
+  contents, which also makes a `u8` that comes out known to be at most 255.
 
 ### Documentation
 

@@ -4113,9 +4113,11 @@ fn invariant_terms(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64, ou
   }
 }
 
-/// The type of value `x`, for `lock_new`. A Bytes value reads as a Buf:
-/// the lock then forgets that every byte is <= 255, which loses facts but
-/// never assumes a false one.
+/// The type of value `x`, when the checker has not recorded it. A Bytes
+/// value reads as a Buf, which loses facts but never assumes a false one.
+/// An integer reads as a u64, which would assume a false one for a signed
+/// integer, so `lock_new` and `atomic_new` take the checker's type of
+/// their contents instead.
 fn val_type(v: &Vr, m: &mut Mono, p: &Parser, x: u64) -> u64 {
   let xv = vl_at(v, x);
   let k = xv.kind;
@@ -4616,7 +4618,12 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
       k = vadd(k, 3);
     }
     vec_free(invs);
-    let t = val_type(v, &mut m, p, x0);
+    let mut t = 0;
+    if has_int_op(c, v.env, i) {
+      t = int_op_ty(c, m, v.env, i);
+    } else {
+      t = val_type(v, &mut m, p, x0);
+    }
     let lt = intern(&mut m, p, TY_LOCK, t);
     return mk_obj(&mut v, m, lt, 0, 0, 0);
   }

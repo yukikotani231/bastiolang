@@ -275,9 +275,11 @@ fn opaque_boxes(v: &Val, ty: &Type) -> Val {
     }
 }
 
-/// The type of a value, for `lock_new`. A `Bytes` reads as `Buf`: the
-/// lock then forgets that every byte is <= 255, which loses facts but never
-/// assumes a false one.
+/// The type of a value, when the checker has not recorded it. A `Bytes`
+/// reads as `Buf`, which loses facts but never assumes a false one. An
+/// integer reads as `u64`, which would assume a false one for a signed
+/// integer, so `lock_new` and `atomic_new` take the checker's type of
+/// their contents instead.
 fn val_type(v: &Val) -> Type {
     match v {
         Val::U(_) => Type::U64,
@@ -1995,7 +1997,8 @@ impl<'p> Verifier<'p> {
                 for (what, i) in self.invariants_of(&vals[0])? {
                     self.need(st, i, pos, "E-VERIFY-LOCKINV", format!("that the value put in the lock satisfies the invariant {}", what))?;
                 }
-                Ok(Val::Obj(Type::Lock(Box::new(val_type(&vals[0]))), vec![]))
+                let t = self.int_ops.get(&pos).cloned().unwrap_or_else(|| val_type(&vals[0]));
+                Ok(Val::Obj(Type::Lock(Box::new(t)), vec![]))
             }
             // An atomic's value may change at any moment, so like a lock's
             // contents only its invariants are known when it is read, and
