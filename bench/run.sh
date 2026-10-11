@@ -8,6 +8,11 @@
 #                                         `--backend native` (no C compiler)
 #   compile FILE obligations=N check=SECONDS build=SECONDS
 #                                         proof time; proof + C build (one run)
+#   slow FILE fn=NAME proof_ms=N          the three functions of FILE that took
+#                                         the solver longest (stage0's
+#                                         BASTIO_TIME=1), so a specification
+#                                         that makes the solver crawl is seen
+#                                         when it lands
 #
 # Each bench/NAME.bastio has a twin bench/NAME.c with the same algorithm,
 # built with the same compiler and -O2. Both must print the same output.
@@ -23,6 +28,7 @@ set -u
 cd "$(dirname "$0")/.."
 BASTIOC=${BASTIOC:-$(tests/bastioc1.sh)} || exit 1
 ARCH=${ARCH:-x86_64}
+B0=${BASTIOC0:-stage0/target/release/bastioc0}
 case "$ARCH" in
   x86_64) CC=${CC:-cc} RUN= ;;
   aarch64)
@@ -94,5 +100,9 @@ for f in "${files[@]}"; do
   s=$(now); "$BASTIOC" --arch "$ARCH" -o "$tmp/out" "$f" 2>/dev/null || { echo "compile $f FAILED: build"; status=1; continue; }; e=$(now)
   tbu=$(awk -v s="$s" -v e="$e" 'BEGIN { printf "%.3f", e - s }')
   echo "compile $f obligations=${ob:-0} check=$tch build=$tbu"
+  if [ -x "$B0" ]; then
+    BASTIO_TIME=1 "$B0" --check "$f" 2>&1 >/dev/null | awk '$2 == "ms" { print $1, $3 }' | sort -rn | head -3 |
+      while read -r ms fn; do echo "slow $f fn=$fn proof_ms=$ms"; done
+  fi
 done
 exit $status
