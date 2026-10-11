@@ -23,6 +23,9 @@ What will be 0.2.0.
   into reserved room never allocate. The prover tracks a vector's capacity
   (`vcap` in specifications). `alloc`, `balloc`, `vec_push` and `box` still
   stop the program on out of memory.
+- `try_box[T](x)`: a box that reports running out of memory. It returns
+  `Boxed::Ok` with the box, or `Boxed::Full` with `x` given back, from
+  `enum Boxed[T]` in the new `core/boxed.bastio`.
 - Page tables shared between processors: a processor takes a `Lease` on a
   top-level table with `mmu_enter` and gives it back with `mmu_exit`, and
   while a tree has leases nothing can be taken out of it, only added
@@ -32,6 +35,12 @@ What will be 0.2.0.
   between and within `Bytes`, `frame_to_bytes` / `bytes_to_frame` for pages
   and `dma_to_bytes` / `bytes_to_dma` for lent pages. The prover knows what
   `bcopy` and `bmove` copy; page contents stay untracked (#91).
+- `Dirty` pages: `pool_take_dirty` takes a page without zeroing it, and it
+  becomes a `Frame` only by being overwritten whole (`dirty_zero`,
+  `frame_copy`, `shared_copy`, or `dirty_fill` from a page's worth of
+  bytes), so a kernel can take pages under a lock and fill them outside it,
+  or fill a page from a file without zeroing it first, without ever
+  exposing what they held.
 - `pt_writable`: whether a level-1 page-table entry maps its frame
   writable (#81).
 - `boot_fb`, the framebuffer the boot loader reported, and a device window
@@ -102,9 +111,28 @@ What will be 0.2.0.
 - A change to `stage0/src` needs its stage1 mirror, or a `Stage0-only:`
   reason in a commit message; CI checks this on every pull request (#78).
 
+### Fixed
+
+- A false proof in both compilers. A loop or call that changes a signed
+  integer (also inside a struct, enum or box) forgot its value but gave the
+  new one the range of `u64`, which leaves out the negative numbers, so an
+  `i64` that went negative in a loop could be proved to be 0 after it
+  (`tests/fail/loop_signed_range.bastio`, `call_signed_range.bastio`). A
+  changed `u8`, `u16` or `u32` got the range of `u64` too, which only made
+  true facts about it unprovable. Each now keeps its type's range.
+- Another false proof in both compilers: a loop or call did not look
+  inside the argument of `cast[T](..)` or `wrap[T](..)`, so a variable
+  changed by a call written there kept its value from before
+  (`tests/fail/loop_cast_call.bastio`).
+
 ### Documentation
 
 - The trusted base is listed and explained (`docs/trusted-base.md`, #66).
+- `examples/qoi`: a QOI image codec called from C. Its buffers are sized by
+  an untrusted header, and running out of memory is a result C sees, not an
+  abort. "Calling Bastio from C" in the book is now a guide: building,
+  vendoring the generated C, ownership, errors and out of memory, several
+  libraries in one program, and what the proofs assume of the C side.
 - The tutorial's section on calling Bastio from C walks through a new
   example, `examples/lines`, built on `export fn` and `--header` (#92).
 - `tests/run.sh` checks that error messages shown in `docs/` are what the

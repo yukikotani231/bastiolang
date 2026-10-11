@@ -196,6 +196,11 @@ struct Vr {
   /// `vec_push_within`): only those functions track capacities.
   cap_fns: Vec[u64],
   caps: bool,
+  /// The declared type of each variable of the function being verified
+  /// (`val` is the type), so that a loop or a call that changes one forgets
+  /// its value but not its type's range. Shadowing is not allowed, so the
+  /// latest binding of a name seen in program order is the one in scope.
+  tys: Vec[Bind],
   /// The file of the function being verified: an opaque spec fn's body is
   /// used only in its own file.
   file: u64,
@@ -258,7 +263,7 @@ fn vr_new(m: &mut Mono, p: &Parser) -> Vr {
   vec_push(&mut vals, Vl { kind: 0, ty: 0, a: 0, b: 0, c: 0, n: 0, d: 0, e: 0 });
   let mut v = Vr {
     pool: vec_new[u8](), tms: tms, targs: vec_new[u64](), vals: vals, kids: vec_new[u64](),
-    log: vec_new[Cmd](), counter: 0, obligations: 0, box_depth: 0, cur: 0, env: 0, cnt_fns: vec_new[u64](), counts: false, dec_fns: vec_new[u64](), hex_fns: vec_new[u64](), bit_fns: vec_new[u64](), bits: false, cap_fns: vec_new[u64](), caps: false, file: 0,
+    log: vec_new[Cmd](), counter: 0, obligations: 0, box_depth: 0, cur: 0, env: 0, cnt_fns: vec_new[u64](), counts: false, dec_fns: vec_new[u64](), hex_fns: vec_new[u64](), bit_fns: vec_new[u64](), bits: false, cap_fns: vec_new[u64](), caps: false, tys: vec_new[Bind](), file: 0,
     sums: vec_new[SumRow](), obls: vec_new[Obl](), snaps: vec_new[Bind](), sum_start: vec_new[u64](), sum_n: vec_new[u64](),
     t_true: 0, t_false: 0, t_zero: 0, t_u64max: 0, t_allocmax: 0, t_flimit: 0, t_plimit: 0, t_mmio_lo: 0, t_mmio_hi: 0, t_poolsize: 0,
     t_zarr: 0, t_nobool: 0, t_k: 0, t_255: 0, unit: 0, t_reset: 0, t_models: 0, t_rlimit: 0,
@@ -296,6 +301,7 @@ fn vr_free(v: Vr) {
   vec_free(v.hex_fns);
   vec_free(v.bit_fns);
   vec_free(v.cap_fns);
+  vec_free(v.tys);
   vec_free(v.sums);
   vec_free(v.sum_start);
   vec_free(v.sum_n);
@@ -515,6 +521,7 @@ fn push_ty(v: &mut Vr, m: &Mono, p: &Parser, t: u64) {
   else if k == TY_DMA { push_str(&mut v, "Dma"); }
   else if k == TY_LEASE { push_str(&mut v, "Lease"); }
   else if k == TY_SHARED { push_str(&mut v, "Shared"); }
+  else if k == TY_DIRTY { push_str(&mut v, "Dirty"); }
   else if k == TY_U8 { push_str(&mut v, "u8"); }
   else if k == TY_U16 { push_str(&mut v, "u16"); }
   else if k == TY_U32 { push_str(&mut v, "u32"); }
@@ -1547,7 +1554,7 @@ fn term(v: &Vr, x: u64) -> u64 {
 fn obj_fields(k: u64) -> u64 {
   if k == TY_PT { return 5; }
   if k == TY_POOL { return 2; }
-  if k == TY_FRAME || k == TY_MMU || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA || k == TY_SHARED { return 1; }
+  if k == TY_FRAME || k == TY_MMU || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA || k == TY_SHARED || k == TY_DIRTY { return 1; }
   if k == TY_PORTIO || k == TY_MMIO { return 2; }
   return 0;
 }
@@ -1936,6 +1943,20 @@ fn bind_named(v: &Vr, p: &Parser, b: Bind, rs: u64, rl: u64) -> bool {
   return rng_is_src(v, rs, rl, p, b.s, b.e);
 }
 
+/// The declared type of the variable named pool[rs .. rs + rl] (the
+/// latest declaration, as later ones shadow earlier ones), or 0.
+fn ty_find(v: &Vr, p: &Parser, rs: u64, rl: u64) -> u64 {
+  let mut k = vec_len(v.tys);
+  while k > 0 {
+    k = k - 1;
+    let b = bind_at(v.tys, k);
+    if bind_named(v, p, b, rs, rl) {
+      return b.val;
+    }
+  }
+  return 0;
+}
+
 /// The value of the variable named pool[rs .. rs + rl], or 0.
 fn env_find_rng(env: &Vec[Bind], v: &Vr, p: &Parser, rs: u64, rl: u64) -> u64 {
   let mut k = 0;
@@ -2226,7 +2247,7 @@ fn fresh_field(v: &mut Vr, tk: u64, j: u64, hint: u64) -> u64 {
 /// Ghost fields a loop keeps when only builtins that never change them
 /// change the object (a page table keeps its id and level).
 fn kept_by_builtins(tk: u64, j: u64) -> bool {
-  return ((tk == TY_FRAME || tk == TY_PT || tk == TY_DMA || tk == TY_SHARED) && j == 0) || (tk == TY_PT && (j == 1 || j == 3)) || (tk == TY_POOL && j == 1)
+  return ((tk == TY_FRAME || tk == TY_PT || tk == TY_DMA || tk == TY_SHARED || tk == TY_DIRTY) && j == 0) || (tk == TY_PT && (j == 1 || j == 3)) || (tk == TY_POOL && j == 1)
     || ((tk == TY_PORTIO || tk == TY_MMIO) && j <= 1);
 }
 
@@ -2506,7 +2527,44 @@ fn look_inside(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, x: u64) -> u64 {
 /// scalars, enum tags and the fields of structs stay as they were: no
 /// shape-keeping builtin changes them, and any other change to a place
 /// inside is havocked separately, after this.
-fn havoc(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, oenv: u64, keep: bool, name: u64) -> u64 {
+/// The type of the dotted path `path` from position `i` on (where its root
+/// ends), under a root of type `t`: through borrows, boxes and fields.
+fn path_ty(v: &Vr, c: &Checker, m: &Mono, p: &Parser, t: u64, path: u64, i: u64) -> u64 {
+  let pt = tm_at(v, path);
+  let mut ty = base_t(m, t);
+  let mut at = i;
+  while at < pt.b {
+    let fs = at + 1;
+    let j = seg_end(v, path, fs);
+    while kind_t(m, ty) == TY_BOX {
+      ty = inner_t(m, ty);
+    }
+    let dn = def_node(m, p, inner_t(m, ty));
+    let mut f = dn.a;
+    let mut x = 0;
+    let mut fl = 0;
+    if j >= fs {
+      fl = j - fs;
+    }
+    while f != 0 && x < SRC_MAX {
+      let fd = node_at(p.nodes, f);
+      if rng_is_src(v, vadd(pt.a, fs), fl, p, fd.s, fd.e) {
+        f = 0;
+      } else {
+        f = fd.next;
+        x = x + 1;
+      }
+    }
+    ty = part_ty(c, m, ty, x);
+    at = j;
+  }
+  return ty;
+}
+
+/// `v` forgets the value `oenv` (of type `ty`) but keeps its shape, and
+/// with `keep`, what only shape-changing operations change.
+fn havoc(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, oenv: u64, ty0: u64, keep: bool, name: u64) -> u64 {
+  let ty = base_t(m, ty0);
   let xv = vl_at(v, oenv);
   let k = xv.kind;
   if keep && (k == VV_U || k == VV_B || k == VV_STR) {
@@ -2526,6 +2584,10 @@ fn havoc(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, oenv: u64, keep: bool, n
     return mk(&mut v, VV_STR, 0, l, d, 0, 0);
   }
   if k == VV_U {
+    // Within the range of its type: a signed variable may be negative.
+    if is_int(m, ty) {
+      return fresh_of(&mut v, c, m, p, ty, name);
+    }
     return fresh_u64(&mut v, name);
   }
   if k == VV_B {
@@ -2561,7 +2623,7 @@ fn havoc(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, oenv: u64, keep: bool, n
     while j < xv.n {
       let fd = part_node(m, p, xv.ty, j);
       let h = cat_src(&mut v, p, name, fd.s, fd.e);
-      let y = havoc(&mut v, c, m, p, kid(v, oenv, j), keep, h);
+      let y = havoc(&mut v, c, m, p, kid(v, oenv, j), part_ty(c, m, xv.ty, j), keep, h);
       vec_push(&mut xs, y);
       j = j + 1;
     }
@@ -2585,7 +2647,7 @@ fn havoc(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, oenv: u64, keep: bool, n
     return mk(&mut v, VV_VEC, xv.ty, l, el, cap, 0);
   }
   if k == VV_BOXK {
-    let inner = havoc(&mut v, c, m, p, xv.a, keep, name);
+    let inner = havoc(&mut v, c, m, p, xv.a, inner_t(m, ty), keep, name);
     return mk(&mut v, VV_BOXK, 0, inner, 0, 0, 0);
   }
   return oenv;             // opaque boxes and unit
@@ -2633,6 +2695,22 @@ fn vm_brange(v: &mut Vr, p: &Parser, args: &Vec[u64], which: Str, d: u64, n: u64
   vm_arg(&mut v, p, u_at(args, n));
   vm_s(&mut v, " <= blen(");
   vm_arg(&mut v, p, u_at(args, b));
+  vm_s(&mut v, ")`)");
+}
+
+/// dirty_fill's: "that the source `s` .. `s + 4096` is within `src`
+/// (`s + 4096 <= blen(src)`)".
+fn vm_fill_range(v: &mut Vr, p: &Parser, args: &Vec[u64]) {
+  vm_s(&mut v, "that the source `");
+  vm_arg(&mut v, p, u_at(args, 2));
+  vm_s(&mut v, "` .. `");
+  vm_arg(&mut v, p, u_at(args, 2));
+  vm_s(&mut v, " + 4096` is within `");
+  vm_arg(&mut v, p, u_at(args, 1));
+  vm_s(&mut v, "` (`");
+  vm_arg(&mut v, p, u_at(args, 2));
+  vm_s(&mut v, " + 4096 <= blen(");
+  vm_arg(&mut v, p, u_at(args, 1));
   vm_s(&mut v, ")`)");
 }
 
@@ -3368,7 +3446,7 @@ fn vspec_builtin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env:
     let ix = spec_tm(&mut v, c, &mut m, p, arg_node(p, i, 1), env, oenv, has_old, res, &mut bound);
     return app2(&mut v, OP_SELECT, xv.b, ix);
   }
-  if span_is(p, n.s, n.e, "frame_id") || span_is(p, n.s, n.e, "pt_id") || span_is(p, n.s, n.e, "dma_id") || span_is(p, n.s, n.e, "shared_id") {
+  if span_is(p, n.s, n.e, "frame_id") || span_is(p, n.s, n.e, "pt_id") || span_is(p, n.s, n.e, "dma_id") || span_is(p, n.s, n.e, "shared_id") || span_is(p, n.s, n.e, "dirty_id") {
     return g_id(v, x);
   }
   if span_is(p, n.s, n.e, "pt_level") {
@@ -3436,6 +3514,24 @@ fn eval(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VSta
   let n = node_at(p.nodes, i);
   let k = n.kind;
   if k == E_TAPP {
+    if is_typed_builtin(p, n.b) && name_is(p, n.b, "try_box") {
+      // Either the box holds the value or, out of memory, the value comes
+      // back as it was: which one is not known.
+      let t = conv(&mut m, p, n.a, v.env, i);
+      let inner = node_at(p.nodes, n.b);
+      let xv = eval(&mut v, c, &mut m, p, inner.a, &mut st, 0);
+      let tyx = boxed_t(&mut m, p, t);
+      let h = atom_str(&mut v, "boxed");
+      let one = num(&mut v, 1);
+      let tag = fresh_int(&mut v, h, v.t_zero, one);
+      let bx = mk(&mut v, VV_BOXK, 0, xv, 0, 0, 0);
+      let mut xs = vec_new[u64]();
+      vec_push(&mut xs, bx);
+      vec_push(&mut xs, xv);
+      let r = mk_enum(&mut v, tyx, tag, xs);
+      vec_free(xs);
+      return r;
+    }
     if is_typed_builtin(p, n.b) && !name_is(p, n.b, "vec_new") {
       // `cast[T](x)` keeps the value and proves it fits; `wrap[T](x)`
       // reduces it modulo 2^width.
@@ -4419,7 +4515,8 @@ fn vuser_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64, loc: u6
             let place = cat_text(&mut v, path, row.rel);
             open_path(&mut v, c, m, p, &mut st.env, place);
             let prev = get_path(v, m, p, st.env, place);
-            let nv = havoc(&mut v, c, m, p, prev, row.keep, place);
+            let ty = path_ty(v, c, m, p, pt, place, seg_end(v, place, 0));
+            let nv = havoc(&mut v, c, m, p, prev, ty, row.keep, place);
             set_path(&mut v, m, p, &mut st.env, place, nv);
           }
           k = k + 1;
@@ -4992,7 +5089,7 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
   if name_is(p, i, "pool_size") {
     return mk_u(&mut v, g_size(v, x0));
   }
-  if name_is(p, i, "pool_take") {
+  if name_is(p, i, "pool_take") || name_is(p, i, "pool_take_dirty") {
     let ix = term(v, x1);
     let g = app2(&mut v, OP_LT, ix, g_size(v, x0));
     vm_s(&mut v, "that page `");
@@ -5015,7 +5112,29 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     let has = app3(&mut v, OP_STORE, g_has(v, x0), ix, v.t_false);
     let np = mk_obj(&mut v, m, v.ty_pool, has, g_size(v, x0), 0);
     put_back(&mut v, m, p, &mut st, u_at(args, 0), np);
+    if name_is(p, i, "pool_take_dirty") {
+      return mk_obj(&mut v, m, kind_ty(m, p, TY_DIRTY), ix, 0, 0);
+    }
     return mk_obj(&mut v, m, v.ty_frame, ix, 0, 0);
+  }
+  // A dirty page becomes a frame, the same page, only by being overwritten
+  // whole: zeroed, or a copy of another page.
+  if name_is(p, i, "dirty_id") {
+    return mk_u(&mut v, g_id(v, x0));
+  }
+  if name_is(p, i, "dirty_zero") || name_is(p, i, "frame_copy") || name_is(p, i, "shared_copy") {
+    return mk_obj(&mut v, m, v.ty_frame, g_id(v, x0), 0, 0);
+  }
+  // Or a page's worth of bytes copied over it.
+  if name_is(p, i, "dirty_fill") {
+    let src = vl_at(v, x1);
+    let s = term(v, x2);
+    let page = num(&mut v, 4096);
+    let se = app2(&mut v, OP_ADD, s, page);
+    let g = app2(&mut v, OP_LE, se, src.a);
+    vm_fill_range(&mut v, p, args);
+    prove(&mut v, st, g, i, VC_BOUNDS);
+    return mk_obj(&mut v, m, v.ty_frame, g_id(v, x0), 0, 0);
   }
   if name_is(p, i, "pool_give") {
     let has = app3(&mut v, OP_STORE, g_has(v, x0), g_id(v, x1), v.t_true);
@@ -5799,6 +5918,7 @@ fn vstmt(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: VState, 
   if k == S_LET {
     let x = eval(&mut v, c, &mut m, p, n.b, &mut s, 0);
     env_put(&mut s.env, p, n.s, n.e, x);
+    vec_push(&mut v.tys, Bind { s: n.s, e: n.e, val: let_ty(m, v.env, i) });
     return s;
   }
   if k == S_ASSIGN {
@@ -5940,6 +6060,7 @@ fn stmt_match(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: VSt
       if (an.v == PAT_BIND || an.v == PAT_BIND_MUT) && !name_is(p, an.a, "_") {
         let bn = node_at(p.nodes, an.a);
         env_put(&mut ast.env, p, bn.s, bn.e, kid(v, sv, kx));
+        vec_push(&mut v.tys, Bind { s: bn.s, e: bn.e, val: part_ty(c, m, x.ty, kx) });
       }
       let tk2 = num(&mut v, kx);
       cond = app2(&mut v, OP_EQ, x.a, tk2);
@@ -6056,7 +6177,9 @@ fn stmt_while(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: VSt
     if env_find_rng(s.env, v, p, pt.a, root) != 0 {
       open_path(&mut v, c, m, p, &mut l.env, ch.name);
       let prev = get_path(v, m, p, l.env, ch.name);
-      let nv = havoc(&mut v, c, m, p, prev, ch.keep, ch.name);
+      let rt = ty_find(v, p, pt.a, root);
+      let ty = path_ty(v, c, m, p, rt, ch.name, root);
+      let nv = havoc(&mut v, c, m, p, prev, ty, ch.keep, ch.name);
       set_path(&mut v, m, p, &mut l.env, ch.name, nv);
     }
     k = k + 1;
@@ -6211,7 +6334,7 @@ fn shape_keeping(p: &Parser, i: u64) -> bool {
   return name_is(p, i, "bset") || name_is(p, i, "vec_set") || name_is(p, i, "vec_swap") || name_is(p, i, "pt_put")
     || name_is(p, i, "pt_take") || name_is(p, i, "pt_put_frame") || name_is(p, i, "pt_take_frame")
     || name_is(p, i, "pt_borrow") || name_is(p, i, "pt_borrow_frame") || name_is(p, i, "pt_lease_count")
-    || name_is(p, i, "pt_put_shared") || name_is(p, i, "pt_take_shared") || name_is(p, i, "shared_drop") || name_is(p, i, "pool_take") || name_is(p, i, "pool_give") || name_is(p, i, "frame_write")
+    || name_is(p, i, "pt_put_shared") || name_is(p, i, "pt_take_shared") || name_is(p, i, "shared_drop") || name_is(p, i, "pool_take") || name_is(p, i, "pool_take_dirty") || name_is(p, i, "pool_give") || name_is(p, i, "frame_write")
     || name_is(p, i, "frame_write8") || name_is(p, i, "bcopy") || name_is(p, i, "bmove") || name_is(p, i, "frame_to_bytes")
     || name_is(p, i, "bytes_to_frame") || name_is(p, i, "dma_to_bytes") || name_is(p, i, "bytes_to_dma") || name_is(p, i, "cpu_set") || name_is(p, i, "cpu_run") || name_is(p, i, "cpu_idle")
     || name_is(p, i, "cpu_fpu_save") || name_is(p, i, "cpu_fpu_load") || name_is(p, i, "pio_in8") || name_is(p, i, "pio_in16")
@@ -6263,6 +6386,14 @@ fn changed_in_expr(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, ou
     if !is_typed_builtin(p, n.b) {
       let x = tapp_inst(&mut m, p, i, v.env);
       call_changes(&mut v, c, &mut m, p, n.b, x, &mut out);
+    } else {
+      // The argument of `cast[T](..)`, `wrap[T](..)` or `try_box[T](..)`.
+      let inner = node_at(p.nodes, n.b);
+      let mut a = inner.a;
+      while a != 0 {
+        changed_in_expr(&mut v, c, &mut m, p, a, &mut out);
+        a = next_of(p, a);
+      }
     }
   } else if k == E_NOT || k == E_NEG || k == E_IS || (k == E_VARIANT && n.a != 0) {
     changed_in_expr(&mut v, c, &mut m, p, n.a, &mut out);
@@ -6558,6 +6689,9 @@ fn verify_fn(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
     bit_axioms(&mut v);
   }
   let mut env = vec_new[Bind]();
+  while vec_len(v.tys) > 0 {
+    let gone = vec_pop(&mut v.tys);
+  }
   let mut q = d.a;
   while q != 0 {
     let qn = node_at(p.nodes, q);
@@ -6565,6 +6699,7 @@ fn verify_fn(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
     let h = atom_src(&mut v, p, qn.s, qn.e);
     let y = fresh_of(&mut v, c, m, p, pt, h);
     env_put(&mut env, p, qn.s, qn.e, y);
+    vec_push(&mut v.tys, Bind { s: qn.s, e: qn.e, val: pt });
     q = qn.next;
   }
   let mut st = VState { pc: vec_new[u64](), env: env_clone(env), live: true };

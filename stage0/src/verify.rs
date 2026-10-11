@@ -33,6 +33,7 @@
 //   Mmio       base, len (the device registers base .. base+len it owns,
 //              always inside the device window)
 //   Dma        id (the page number of the page it lends to devices)
+//   Dirty      id (the page number of a page taken without being zeroed)
 //   PortIo     base, count (the ports base .. base+count it owns; always
 //              within the 65536 ports)
 // A struct value is the values of its fields; places like `p.root` read and
@@ -234,6 +235,20 @@ fn map_leaves(v: &Val, f: &mut dyn FnMut(&str) -> String) -> Val {
     }
 }
 
+/// The type of the place `rel` (`""`, or `.f.g`) under a value of type `t`,
+/// through borrows and boxes.
+fn path_ty(t: &Type, rel: &str) -> Type {
+    let mut t = t.base().clone();
+    for f in rel.split('.').filter(|f| !f.is_empty()) {
+        while let Type::Box(i) = t {
+            t = *i;
+        }
+        let Type::Struct(n) = &t else { unreachable!("a field of a struct") };
+        t = struct_def(n).unwrap().fields.iter().find(|(g, _)| g == f).expect("checked: a field").1.clone();
+    }
+    t
+}
+
 /// `elems` with `x` stored at index `i`.
 fn vec_write(elems: &Val, i: &str, x: &Val) -> Val {
     let mut xs = Vec::new();
@@ -307,6 +322,7 @@ fn ghost_fields(t: &Type) -> &'static [(&'static str, bool, &'static str)] {
         Type::Mmio => &[("base", false, "mmio_base"), ("len", false, "mmio_len")],
         Type::Dma => &[("id", false, "dma_id")],
         Type::Shared => &[("id", false, "shared_id")],
+        Type::Dirty => &[("id", false, "dirty_id")],
         _ => &[],
     }
 }
@@ -314,12 +330,12 @@ fn ghost_fields(t: &Type) -> &'static [(&'static str, bool, &'static str)] {
 /// Ghost fields a loop keeps when the object is changed only by builtins
 /// that never change them (a page table keeps its id and level).
 fn kept_by_builtins(t: &Type, field: &str) -> bool {
-    matches!((t, field), (Type::Frame, "id") | (Type::PageTable, "id") | (Type::PageTable, "level") | (Type::PageTable, "leases") | (Type::Pool, "size") | (Type::PortIo, "base") | (Type::PortIo, "count") | (Type::Mmio, "base") | (Type::Mmio, "len") | (Type::Dma, "id") | (Type::Shared, "id"))
+    matches!((t, field), (Type::Frame, "id") | (Type::PageTable, "id") | (Type::PageTable, "level") | (Type::PageTable, "leases") | (Type::Pool, "size") | (Type::PortIo, "base") | (Type::PortIo, "count") | (Type::Mmio, "base") | (Type::Mmio, "len") | (Type::Dma, "id") | (Type::Shared, "id") | (Type::Dirty, "id"))
 }
 
 /// Builtins whose `&mut` argument keeps the fields above.
 const SHAPE_KEEPING: &[&str] =
-    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pt_borrow", "pt_borrow_frame", "pt_lease_count", "pt_put_shared", "pt_take_shared", "shared_drop", "pool_take", "pool_give", "frame_write", "frame_write8", "bcopy", "bmove", "frame_to_bytes", "bytes_to_frame", "dma_to_bytes", "bytes_to_dma", "cpu_set", "cpu_run", "cpu_idle", "cpu_fpu_save", "cpu_fpu_load",
+    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pt_borrow", "pt_borrow_frame", "pt_lease_count", "pt_put_shared", "pt_take_shared", "shared_drop", "pool_take", "pool_take_dirty", "pool_give", "frame_write", "frame_write8", "bcopy", "bmove", "frame_to_bytes", "bytes_to_frame", "dma_to_bytes", "bytes_to_dma", "cpu_set", "cpu_run", "cpu_idle", "cpu_fpu_save", "cpu_fpu_load",
       "pio_in8", "pio_in16", "pio_in32", "pio_out8", "pio_out16", "pio_out32",
       "mmio_read8", "mmio_read16", "mmio_read32", "mmio_read64", "mmio_write8", "mmio_write16", "mmio_write32", "mmio_write64",
       "dma_read8", "dma_read16", "dma_read32", "dma_read64", "dma_write8", "dma_write16", "dma_write32", "dma_write64"];
@@ -438,6 +454,11 @@ pub struct Verifier<'p> {
     /// programs get the same queries as before.
     capacity: &'p HashSet<String>,
     caps: bool,
+    /// The declared type of each variable of the function being verified,
+    /// so that a loop or a call that changes one forgets its value but not
+    /// its type's range. Shadowing is not allowed, so the latest binding of a
+    /// name seen in program order is the one in scope.
+    tys: HashMap<String, Type>,
     /// The file of the function being verified: an opaque spec fn's body
     /// is used only in its own file.
     file: usize,
@@ -817,7 +838,7 @@ fn verify_worker(p: &Program, sums: &Summaries, counting: &HashSet<String>, deci
             return w;
         }
     };
-    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, int_ops: HashMap::new(), sums, counting, decimal, hexadecimal, bitwise, capacity, counts: false, bits: false, caps: false, file: 0, where_note: None };
+    let mut v = Verifier { prog: p, solver, counter: 0, obligations: 0, box_depth: 0, int_ops: HashMap::new(), sums, counting, decimal, hexadecimal, bitwise, capacity, counts: false, bits: false, caps: false, tys: HashMap::new(), file: 0, where_note: None };
     let mut run = || -> Result<(), (usize, Diag)> {
         // Every function is verified on a solver in the same state, fresh
         // or reset: what Z3 answers near its work limit depends on what it
@@ -947,7 +968,7 @@ impl<'p> Verifier<'p> {
             (Type::PortIo, "count") => self.fresh_int(&h, "0", PORT_LIMIT),
             (Type::Mmio, "base") => self.fresh_int(&h, MMIO_LO, MMIO_HI),
             (Type::Mmio, "len") => self.fresh_int(&h, "0", MMIO_HI),
-            (Type::Frame, "id") | (Type::PageTable, "id") | (Type::Dma, "id") | (Type::Shared, "id") => {
+            (Type::Frame, "id") | (Type::PageTable, "id") | (Type::Dma, "id") | (Type::Shared, "id") | (Type::Dirty, "id") => {
                 let n = self.fresh_int(&h, "0", FRAME_LIMIT)?;
                 self.smt(&format!("(assert (< {} {}))", n, POOLSIZE))?;
                 Ok(n)
@@ -1178,9 +1199,11 @@ impl<'p> Verifier<'p> {
             }
         }
         let mut env = HashMap::new();
+        self.tys.clear();
         for p in &f.params {
             let v = self.fresh_of(&p.ty, &p.name)?;
             env.insert(p.name.clone(), v);
+            self.tys.insert(p.name.clone(), p.ty.clone());
         }
         let mut st = State { pc: Vec::new(), env: env.clone() };
         if f.name == "main" {
@@ -1263,9 +1286,10 @@ impl<'p> Verifier<'p> {
 
     fn stmt(&mut self, s: &Stmt, mut st: State, cx: &FnCtx) -> Result<Option<State>, Diag> {
         match &s.kind {
-            StmtKind::Let { name, init, .. } => {
+            StmtKind::Let { name, ty, init, .. } => {
                 let v = self.eval(init, &mut st)?;
                 st.env.insert(name.clone(), v);
+                self.tys.insert(name.clone(), ty.clone().expect("typed by checker"));
                 Ok(Some(st))
             }
             StmtKind::Assign { name, value } => {
@@ -1341,6 +1365,7 @@ impl<'p> Verifier<'p> {
                             if let Some(b) = b {
                                 if b != "_" {
                                     ast.env.insert(b.clone(), ps[k].clone());
+                                    self.tys.insert(b.clone(), d.variants[k].1.clone().expect("a variant with a payload"));
                                 }
                             }
                             format!("(= {} {})", tag, k)
@@ -1399,7 +1424,8 @@ impl<'p> Verifier<'p> {
                     }
                     self.open_path(&mut lst.env, &name)?;
                     let old = get_path(&lst.env, &name);
-                    let nv = self.havoc(&old, keep, &name)?;
+                    let ty = path_ty(&self.tys[path_root(&name)], &name[path_root(&name).len()..]);
+                    let nv = self.havoc(&old, &ty, keep, &name)?;
                     set_path(&mut lst.env, &name, nv);
                 }
                 for inv in invariants {
@@ -1470,7 +1496,8 @@ impl<'p> Verifier<'p> {
     /// change, and scalars, enum tags and the fields of structs stay as they
     /// were: no shape-keeping builtin changes them, and any other change to a
     /// place inside is havocked separately, after this.
-    fn havoc(&mut self, old: &Val, keep: bool, name: &str) -> Result<Val, Diag> {
+    fn havoc(&mut self, old: &Val, ty: &Type, keep: bool, name: &str) -> Result<Val, Diag> {
+        let ty = ty.base();
         Ok(match old {
             Val::U(_) | Val::B(_) | Val::Str { .. } if keep => old.clone(),
             Val::Buf { len, .. } => {
@@ -1478,6 +1505,8 @@ impl<'p> Verifier<'p> {
                 Val::Buf { len, data: self.fresh_array(name, "Int")? }
             }
             Val::Str { .. } => Val::Str { len: self.fresh_len(name)?, data: self.fresh_array(name, "Int")? },
+            // Within the range of its type: a signed variable may be negative.
+            Val::U(_) if ty.is_int() => self.fresh_of(ty, name)?,
             Val::U(_) => self.fresh_u64(name)?,
             Val::B(_) => self.fresh_bool(name)?,
             Val::Obj(t, fs) => {
@@ -1493,8 +1522,8 @@ impl<'p> Verifier<'p> {
             }
             Val::Struct(n, fs) => {
                 let mut nf = Vec::new();
-                for ((f, _), fv) in struct_def(n).unwrap().fields.iter().zip(fs) {
-                    nf.push(self.havoc(fv, keep, &format!("{}_{}", name, f))?);
+                for ((f, ft), fv) in struct_def(n).unwrap().fields.iter().zip(fs) {
+                    nf.push(self.havoc(fv, ft, keep, &format!("{}_{}", name, f))?);
                 }
                 Val::Struct(n.clone(), nf)
             }
@@ -1502,8 +1531,11 @@ impl<'p> Verifier<'p> {
                 let d = enum_def(n).unwrap();
                 let tag = if keep { tag.clone() } else { self.fresh_int(&format!("{}_tag", name), "0", &(d.variants.len() - 1).to_string())? };
                 let mut np = Vec::new();
-                for ((v, _), pv) in d.variants.iter().zip(ps) {
-                    np.push(self.havoc(pv, keep, &format!("{}_{}", name, v))?);
+                for ((v, pt), pv) in d.variants.iter().zip(ps) {
+                    np.push(match pt {
+                        Some(pt) => self.havoc(pv, pt, keep, &format!("{}_{}", name, v))?,
+                        None => pv.clone(),
+                    });
                 }
                 Val::Enum(n.clone(), tag, np)
             }
@@ -1517,7 +1549,10 @@ impl<'p> Verifier<'p> {
                 };
                 Val::Vec { elem: elem.clone(), len, cap, elems: Box::new(self.fresh_lifted(elem, name)?) }
             }
-            Val::Box(BoxVal::Known(i)) => Val::Box(BoxVal::Known(Box::new(self.havoc(i, keep, name)?))),
+            Val::Box(BoxVal::Known(i)) => {
+                let Type::Box(it) = ty else { unreachable!("a box value has a box type") };
+                Val::Box(BoxVal::Known(Box::new(self.havoc(i, it, keep, name)?)))
+            }
             Val::Box(BoxVal::Opaque(t)) => Val::Box(BoxVal::Opaque(t.clone())),
             Val::Unit => Val::Unit,
         })
@@ -1547,6 +1582,14 @@ impl<'p> Verifier<'p> {
                         self.prove(st, &format!("(and (<= {} {}) (<= {} {}))", num(t.int_min()), x, x, max), e.pos, "E-VERIFY-CAST", format!("that `{}` fits in {} ({} to {})", render(&args[0]), t.name(), t.int_min(), t.int_max()))?;
                     }
                     Ok(Val::U(x))
+                }
+                // Either the box holds the value or, out of memory, the
+                // value comes back as it was: which one is not known.
+                ExprKind::Call(n, args) if n == "try_box" => {
+                    let x = self.eval(&args[0], st)?;
+                    let Type::Enum(bn) = crate::check::boxed_type(&targs[0]) else { unreachable!("an enum") };
+                    let tag = self.fresh_int("boxed", "0", "1")?;
+                    Ok(Val::Enum(bn, tag, vec![Val::Box(BoxVal::Known(Box::new(x.clone()))), x]))
                 }
                 _ => unreachable!("removed by monomorphization"),
             },
@@ -1840,7 +1883,8 @@ impl<'p> Verifier<'p> {
                         let path = format!("{}{}", var, rel);
                         self.open_path(&mut st.env, &path)?;
                         let old = get_path(&st.env, &path);
-                        let nv = self.havoc(&old, *keep, &path.replace('.', "_"))?;
+                        let ty = path_ty(&p.ty, rel);
+                        let nv = self.havoc(&old, &ty, *keep, &path.replace('.', "_"))?;
                         set_path(&mut st.env, &path, nv);
                     }
                 } else {
@@ -2314,13 +2358,26 @@ impl<'p> Verifier<'p> {
 
             // ---- physical pages ----
             "pool_size" => Ok(Val::U(vals[0].field("size"))),
-            "pool_take" => {
+            "pool_take" | "pool_take_dirty" => {
                 let (p, i) = (&vals[0], vals[1].term());
                 self.need(st, format!("(< {} {})", i, p.field("size")), pos, "E-VERIFY-BOUNDS", format!("that page `{}` is within the pool (`{} < pool_size({})`)", ra(1), ra(1), ra(0)))?;
                 self.need(st, format!("(select {} {})", p.field("has"), i), pos, "E-VERIFY-OWN", format!("that the pool still has page `{}` (`pool_has({}, {})`): it may already have been handed out", ra(1), ra(0), ra(1)))?;
                 let np = Val::Obj(Type::Pool, vec![format!("(store {} {} false)", p.field("has"), i), p.field("size")]);
                 self.put_back(&args[0], np, st);
-                Ok(Val::Obj(Type::Frame, vec![i.to_string()]))
+                let ty = if name == "pool_take" { Type::Frame } else { Type::Dirty };
+                Ok(Val::Obj(ty, vec![i.to_string()]))
+            }
+            // A dirty page becomes a frame, the same page, only by being
+            // overwritten whole: zeroed, or a copy of another page.
+            "dirty_id" => Ok(Val::U(vals[0].field("id"))),
+            "dirty_zero" | "frame_copy" | "shared_copy" => Ok(Val::Obj(Type::Frame, vec![vals[0].field("id")])),
+            // Or a page's worth of bytes copied over it.
+            "dirty_fill" => {
+                let Val::Buf { len, .. } = &vals[1] else { unreachable!() };
+                let s = vals[2].term();
+                self.need(st, format!("(<= (+ {} 4096) {})", s, len), pos, "E-VERIFY-BOUNDS",
+                    format!("that the source `{}` .. `{} + 4096` is within `{}` (`{} + 4096 <= blen({})`)", ra(2), ra(2), ra(1), ra(2), ra(1)))?;
+                Ok(Val::Obj(Type::Frame, vec![vals[0].field("id")]))
             }
             "pool_give" => {
                 let (p, f) = (&vals[0], &vals[1]);
@@ -2883,7 +2940,7 @@ impl<'p> Verifier<'p> {
                         Val::Buf { data, .. } | Val::Str { data, .. } => format!("(select {} {})", data, self.spec(&args[1], sc, bound)?),
                         _ => unreachable!(),
                     },
-                    "frame_id" | "pt_id" | "dma_id" | "shared_id" => v.field("id"),
+                    "frame_id" | "pt_id" | "dma_id" | "shared_id" | "dirty_id" => v.field("id"),
                     "pt_level" => v.field("level"),
                     "pt_leases" => v.field("leases"),
                     "pool_size" => v.field("size"),
@@ -2990,7 +3047,8 @@ fn changed_in_expr(e: &Expr, out: &mut HashMap<String, bool>, sums: &Summaries) 
                 changed_in_expr(x, out, sums);
             }
         }
-        ExprKind::Variant(_, _, Some(x)) | ExprKind::Is(x, _, _) => changed_in_expr(x, out, sums),
+        // The argument of `cast[T](..)`, `wrap[T](..)` or `try_box[T](..)`.
+        ExprKind::Variant(_, _, Some(x)) | ExprKind::Is(x, _, _) | ExprKind::TypeApp(_, x) => changed_in_expr(x, out, sums),
         _ => {}
     }
 }
