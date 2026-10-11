@@ -508,8 +508,8 @@ static inline void bst_pt_put_frame(bst_pt *t, uint64_t i, bst_frame f, bool w) 
 /* What slot i points to, left in place (pt_borrow). */
 static inline uint64_t bst_pt_child(bst_pt t, uint64_t i) { return ((uint64_t *)t)[i] & BST_PTE_ADDR; }
 /* Leases outstanding on each top-level table (mmu_enter, mmu_exit), by page
- * number: a pool has at most 65536 pages. */
-static uint32_t bst_pt_leases[65536];
+ * number: a pool has at most 262144 pages. */
+static uint32_t bst_pt_leases[262144];
 static inline uint64_t bst_pt_lease_count(bst_pt *t) { return __atomic_load_n(&bst_pt_leases[bst_frame_id(*t)], __ATOMIC_ACQUIRE); }
 static inline uint64_t bst_pt_take(bst_pt *t, uint64_t i) {
     uint64_t *e = &((uint64_t *)*t)[i];
@@ -522,7 +522,7 @@ static inline uint64_t bst_pt_take(bst_pt *t, uint64_t i) {
  * reads) each page has, by page number, and a PTE bit the CPU ignores that
  * marks a slot mapping one. The last shared_drop gives the page back. */
 #define BST_PTE_SHARED 0x200ull
-static uint32_t bst_shared_refs[65536];
+static uint32_t bst_shared_refs[262144];
 static inline bst_frame bst_shared_new(bst_frame f) { __atomic_store_n(&bst_shared_refs[bst_frame_id(f)], 1, __ATOMIC_RELEASE); return f; }
 static inline bst_frame bst_shared_dup(bst_frame s) { __atomic_fetch_add(&bst_shared_refs[bst_frame_id(s)], 1, __ATOMIC_RELAXED); return s; }
 static inline uint64_t bst_shared_drop(bst_pool *p, bst_frame s) {
@@ -642,7 +642,7 @@ static void bst_print(uint64_t v) {
 }
 
 /* Physical pages: everything from the end of the kernel image to the end of
- * the RAM that follows it, capped at 2^16 pages and at the 1 GiB the boot
+ * the RAM that follows it, capped at 2^18 pages and at the 1 GiB the boot
  * code identity-maps. With a Multiboot memory map (flags bit 6) that is the
  * run of available entries, merged where they touch, that holds the first
  * page after the kernel: UEFI firmware leaves holes low in memory, where
@@ -676,7 +676,7 @@ static bst_pool bst_pool_init(uint64_t mbi) {
     bst_pool p;
     p.base = base;
     p.size = ram_end > base ? (ram_end - base) / 4096 : 0;
-    if (p.size > 65536) p.size = 65536;
+    if (p.size > 262144) p.size = 262144;
     bst_pool_base = base;
     return p;
 }
@@ -716,12 +716,14 @@ static uint64_t *bst_try_regrow(uint64_t *p, uint64_t old, uint64_t n) {
 }
 "#;
 
-// Child processes (hosted only): fork and exec with a pipe each way.
+// Child processes (hosted only): posix_spawn with a pipe each way.
 const PRELUDE_CHILD: &str = r#"
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <spawn.h>
+extern char **environ;
 typedef struct { int pid; int in; FILE *out; } bst_child;
 /* A child that cannot be started (no such program, no pipes or processes
  * left) behaves like one that exited with 127 without output, which is
@@ -741,13 +743,18 @@ static bst_child bst_host_spawn(bst_host h, bst_vec argv) {
     for (uint64_t i = 0; i < argv.len; i++) av[i] = bst_cpath(((bst_bytes *)argv.data)[i]);
     av[argv.len] = NULL;
     fflush(NULL);
-    int pid = fork();
-    if (pid == 0) {
-        dup2(to[0], 0);
-        dup2(from[1], 1);
-        close(to[0]); close(to[1]); close(from[0]); close(from[1]);
-        execvp(av[0], av);
-        _exit(127);
+    /* posix_spawn, not fork: the parent's memory is never copied, which a
+     * kernel without copy-on-write (BastiOS) cannot do for a large one.
+     * The parent's ends are close-on-exec already. */
+    int pid = -1;
+    posix_spawn_file_actions_t fa;
+    if (posix_spawn_file_actions_init(&fa) == 0) {
+        if (posix_spawn_file_actions_adddup2(&fa, to[0], 0) != 0 ||
+            posix_spawn_file_actions_adddup2(&fa, from[1], 1) != 0 ||
+            posix_spawn_file_actions_addclose(&fa, to[0]) != 0 ||
+            posix_spawn_file_actions_addclose(&fa, from[1]) != 0 ||
+            posix_spawnp(&pid, av[0], &fa, NULL, av, environ) != 0) pid = -1;
+        posix_spawn_file_actions_destroy(&fa);
     }
     for (uint64_t i = 0; i < argv.len; i++) free(av[i]);
     free(av);

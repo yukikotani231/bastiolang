@@ -1002,7 +1002,7 @@ Ghost accessors, usable in specifications:
 | `pool_size(p)` | Number of pages in the pool (also callable at run time) |
 | `mmio_free(w, a)` | Nobody has claimed device-window address `a`; `main` receives the whole window free |
 | `mmio_base(r)`, `mmio_len(r)` | The registers `r` owns, `mmio_base(r)` up to `mmio_base(r) + mmio_len(r)`, always inside the device window (also callable at run time) |
-| `mmu_root(m)` | The id of the table in CR3; `0x10000` while the kernel's own map is loaded |
+| `mmu_root(m)` | The id of the table in CR3; `0x40000` while the kernel's own map is loaded |
 | `port_free(p, k)` | Nobody has claimed port `k`; `main` receives every port free |
 | `port_base(io)`, `port_count(io)` | The ports `io` owns, `port_base(io)` up to `port_base(io) + port_count(io)`, always within the 65536 ports (also callable at run time) |
 
@@ -1154,7 +1154,7 @@ Every top-level table a processor loads is entered with a lease; there is no oth
 | Builtin | Requires (proved) | Effect |
 | --- | --- | --- |
 | `mmu_kernel(m: &mut Mmu)` | | Loads the kernel's own map |
-| `mmu_enter(m: &mut Mmu, t: &mut PageTable) -> Lease` | level 4; `mmu_root(m)` is the kernel's (`0x10000`) | Takes a lease on `t` and loads it into CR3: `pt_leases(t)` goes up by one, `mmu_root(m)` becomes `pt_id(t)`. `t` can then go back where it came from (a lock, say) and other processors can enter it too |
+| `mmu_enter(m: &mut Mmu, t: &mut PageTable) -> Lease` | level 4; `mmu_root(m)` is the kernel's (`0x40000`) | Takes a lease on `t` and loads it into CR3: `pt_leases(t)` goes up by one, `mmu_root(m)` becomes `pt_id(t)`. `t` can then go back where it came from (a lock, say) and other processors can enter it too |
 | `mmu_exit(m: &mut Mmu, l: Lease)` | | Loads the kernel's own map, then gives the lease back. No table's `pt_leases` drops in the proof (it does not name one): it stays an overcount until `pt_lease_count` reads the true count |
 | `cpu_get(c: &Cpu, r: u64) -> u64` | `r < 21` | Saved user register `r`: rax rbx rcx rdx rsi rdi rbp r8-r15 (0-14), rip (15), rsp (16), rflags (17), error code (18), fault address (19), FS base (20) |
 | `cpu_set(c: &mut Cpu, r: u64, v: u64)` | `r < 18` or `r == 20` | Sets a saved register or the FS base (the error code and fault address are only reported by a trap). Whatever is stored, user mode is entered in ring 3 with the user segments, IOPL 0 and interrupts on; the platform replaces a non-canonical address with 0 |
