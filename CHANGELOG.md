@@ -35,6 +35,12 @@ What will be 0.2.0.
   between and within `Bytes`, `frame_to_bytes` / `bytes_to_frame` for pages
   and `dma_to_bytes` / `bytes_to_dma` for lent pages. The prover knows what
   `bcopy` and `bmove` copy; page contents stay untracked (#91).
+- `Dirty` pages: `pool_take_dirty` takes a page without zeroing it, and it
+  becomes a `Frame` only by being overwritten whole (`dirty_zero`,
+  `frame_copy`, `shared_copy`, or `dirty_fill` from a page's worth of
+  bytes), so a kernel can take pages under a lock and fill them outside it,
+  or fill a page from a file without zeroing it first, without ever
+  exposing what they held.
 - `pt_writable`: whether a level-1 page-table entry maps its frame
   writable (#81).
 - `boot_fb`, the framebuffer the boot loader reported, and a device window
