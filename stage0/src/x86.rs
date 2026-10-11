@@ -2350,9 +2350,12 @@ impl<'a> Gen<'a> {
                 self.place_label(&done);
             }
             "pt_has" => {
+                // Present, or hidden (bit 10: pt_set_access 0) and still owned.
                 self.to_regs(args, &["%rdx", "%rax"])?;
                 self.emit("mov (%rdx,%rax,8), %rax");
-                self.emit("and $1, %eax");
+                self.emit("test $0x401, %eax");
+                self.emit("setnz %al");
+                self.emit("movzbl %al, %eax");
             }
             "pt_writable" => {
                 self.to_regs(args, &["%rdx", "%rax"])?;

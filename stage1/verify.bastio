@@ -233,6 +233,7 @@ struct Vr {
   t_reset: u64,
   t_models: u64,
   t_rlimit: u64,
+  t_timeout: u64,
   ty_bytes: u64,
   ty_child: u64,
   ty_frame: u64,
@@ -266,7 +267,7 @@ fn vr_new(m: &mut Mono, p: &Parser) -> Vr {
     log: vec_new[Cmd](), counter: 0, obligations: 0, box_depth: 0, cur: 0, env: 0, cnt_fns: vec_new[u64](), counts: false, dec_fns: vec_new[u64](), hex_fns: vec_new[u64](), bit_fns: vec_new[u64](), bits: false, cap_fns: vec_new[u64](), caps: false, tys: vec_new[Bind](), file: 0,
     sums: vec_new[SumRow](), obls: vec_new[Obl](), snaps: vec_new[Bind](), sum_start: vec_new[u64](), sum_n: vec_new[u64](),
     t_true: 0, t_false: 0, t_zero: 0, t_u64max: 0, t_allocmax: 0, t_flimit: 0, t_plimit: 0, t_mmio_lo: 0, t_mmio_hi: 0, t_poolsize: 0,
-    t_zarr: 0, t_nobool: 0, t_k: 0, t_255: 0, unit: 0, t_reset: 0, t_models: 0, t_rlimit: 0,
+    t_zarr: 0, t_nobool: 0, t_k: 0, t_255: 0, unit: 0, t_reset: 0, t_models: 0, t_rlimit: 0, t_timeout: 0,
     ty_bytes: prim(&mut m, p, TY_BYTES), ty_child: prim(&mut m, p, TY_CHILD), ty_frame: prim(&mut m, p, TY_FRAME),
     ty_pt: prim(&mut m, p, TY_PT), ty_pool: prim(&mut m, p, TY_POOL), fail_at: 0, fail_code: 0,
     fail_obl: 0, msg: vec_new[u64](), mpool: vec_new[u64](), wnote: vec_new[u64](), tsub: vec_new[u64]()
@@ -1337,10 +1338,11 @@ fn out_sort(out: &mut Vec[u64], so: u64) {
   }
 }
 
-/// The two commands every session starts with.
+/// The three commands every session starts with.
 fn out_header(out: &mut Vec[u64]) {
   out_str(&mut out, "(set-option :produce-models true)\n");
   out_str(&mut out, "(set-option :rlimit 40000000)\n");
+  out_str(&mut out, "(set-option :timeout 60000)\n");
 }
 
 /// Command `cmd`, with its newline.
@@ -5264,6 +5266,49 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     prove(&mut v, st, g, i, VC_PT);
     return fresh_bool_named(&mut v, "pt_writable");
   }
+  if name_is(p, i, "pt_accessible") {
+    // Whether the program may touch the page in slot i at all
+    // (pt_set_access). Not tracked: the answer is unknown.
+    let ix = term(v, x1);
+    need_lt(&mut v, p, st, i, ix, 512, u_at(args, 1), "a page table (512 slots)");
+    let one = num(&mut v, 1);
+    let g = app2(&mut v, OP_EQ, g_level(v, x0), one);
+    vm_s(&mut v, "that `");
+    vm_arg(&mut v, p, u_at(args, 0));
+    vm_s(&mut v, "` is a last-level table (level 1), which maps pages");
+    prove(&mut v, st, g, i, VC_PT);
+    return fresh_bool_named(&mut v, "pt_accessible");
+  }
+  if name_is(p, i, "pt_set_access") {
+    // Changes only what the program may do with the page in slot i: the
+    // table still owns it, so nothing the proof tracks changes.
+    let ix = term(v, x1);
+    need_lt(&mut v, p, st, i, ix, 512, u_at(args, 1), "a page table (512 slots)");
+    let one = num(&mut v, 1);
+    let g = app2(&mut v, OP_EQ, g_level(v, x0), one);
+    vm_s(&mut v, "that `");
+    vm_arg(&mut v, p, u_at(args, 0));
+    vm_s(&mut v, "` is a last-level table (level 1), which maps pages");
+    prove(&mut v, st, g, i, VC_PT);
+    let sel = app2(&mut v, OP_SELECT, g_used(v, x0), ix);
+    vm_s(&mut v, "that slot `");
+    vm_arg(&mut v, p, u_at(args, 1));
+    vm_s(&mut v, "` of `");
+    vm_arg(&mut v, p, u_at(args, 0));
+    vm_s(&mut v, "` holds a page (`pt_used(");
+    vm_arg(&mut v, p, u_at(args, 0));
+    vm_s(&mut v, ", ");
+    vm_arg(&mut v, p, u_at(args, 1));
+    vm_s(&mut v, ")`)");
+    prove(&mut v, st, sel, i, VC_OWN);
+    let two = num(&mut v, 2);
+    let g2 = app2(&mut v, OP_LE, term(v, x2), two);
+    vm_s(&mut v, "that `");
+    vm_arg(&mut v, p, u_at(args, 2));
+    vm_s(&mut v, "` is 0 (no access), 1 (read) or 2 (read and write)");
+    prove(&mut v, st, g2, i, VC_PT);
+    return v.unit;
+  }
 
   // ---- I/O ports ----
   if name_is(p, i, "port_claim") {
@@ -6348,7 +6393,7 @@ fn changed_vars(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, head: u64, ou
 fn shape_keeping(p: &Parser, i: u64) -> bool {
   return name_is(p, i, "bset") || name_is(p, i, "vec_set") || name_is(p, i, "vec_swap") || name_is(p, i, "pt_put")
     || name_is(p, i, "pt_take") || name_is(p, i, "pt_put_frame") || name_is(p, i, "pt_take_frame")
-    || name_is(p, i, "pt_borrow") || name_is(p, i, "pt_borrow_frame") || name_is(p, i, "pt_lease_count")
+    || name_is(p, i, "pt_borrow") || name_is(p, i, "pt_borrow_frame") || name_is(p, i, "pt_lease_count") || name_is(p, i, "pt_set_access")
     || name_is(p, i, "pt_put_shared") || name_is(p, i, "pt_take_shared") || name_is(p, i, "shared_drop") || name_is(p, i, "pool_take") || name_is(p, i, "pool_take_dirty") || name_is(p, i, "pool_give") || name_is(p, i, "frame_write")
     || name_is(p, i, "frame_write8") || name_is(p, i, "bcopy") || name_is(p, i, "bmove") || name_is(p, i, "frame_to_bytes")
     || name_is(p, i, "bytes_to_frame") || name_is(p, i, "dma_to_bytes") || name_is(p, i, "bytes_to_dma") || name_is(p, i, "cpu_set") || name_is(p, i, "cpu_run") || name_is(p, i, "cpu_idle")
@@ -6832,6 +6877,7 @@ fn verify_begin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser) {
   v.t_reset = atom_str(&mut v, "(reset)");
   v.t_models = atom_str(&mut v, "(set-option :produce-models true)");
   v.t_rlimit = atom_str(&mut v, "(set-option :rlimit 40000000)");
+  v.t_timeout = atom_str(&mut v, "(set-option :timeout 60000)");
 }
 
 /// Verifies the k-th function. Each function gets its own solver scope:
@@ -6847,6 +6893,7 @@ fn verify_nth(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, k: u64) {
       send(&mut v, CMD_RAW, v.t_reset, 0);
       send(&mut v, CMD_RAW, v.t_models, 0);
       send(&mut v, CMD_RAW, v.t_rlimit, 0);
+      send(&mut v, CMD_RAW, v.t_timeout, 0);
     }
     send(&mut v, CMD_DECL, v.t_poolsize, SO_INT);
     let r = in_range(&mut v, v.t_zero, v.t_poolsize, v.t_flimit);
