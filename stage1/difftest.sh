@@ -32,7 +32,8 @@
 #   driver  stage1/bastioc1.bastio  vs  bastioc0 itself: what `--check`
 #           prints on stderr and its exit status, the C file of
 #           `--emit-c`, the C header of `--header`, the list of
-#           `--trusted-base`, what `--backend native` prints, and the
+#           `--trusted-base`, the queries of `--dump-smt`, what
+#           `--backend native` prints, and the
 #           programs it builds either way, which must exit as tests/pass
 #           says; with `--backend native --target user` (and `kernel`),
 #           the assembly of asmdump --user (--kernel); and bastioc1 built by itself must write the same C for
@@ -61,8 +62,30 @@ done
 built=1
 for p in "${pids[@]}"; do wait "$p" || built=0; done
 [ $built = 1 ] || { cat "$tmp"/build.*.err; exit 1; }
-files=$(find tests stage1 ../bastios/src ../bastios/user -name '*.bastio' 2>/dev/null | sort)
+# Test programs marked `// stage1-only:` (tests/stage1_only.sh) use what
+# stage0 does not have, so stage0 has no answer to compare with: they stay
+# out of every corpus below. Each must still be one stage0 cannot handle,
+# or the marker is stale and hides a program from the oracle: stage0 must
+# reject a tests/pass program, and a tests/fail program with an error other
+# than the one it expects.
+keep() { for f in "$@"; do grep -q '^// stage1-only:' "$f" || echo "$f"; done; }
+files=$(keep $(find tests stage1 ../bastios/src ../bastios/user -name '*.bastio' 2>/dev/null | sort))
+pass_files=$(keep tests/pass/*.bastio)
+fail_files=$(keep tests/fail/*.bastio)
+user_files=$(keep tests/user/*.bastio)
 status=0
+s1only=0
+for f in $(grep -l '^// stage1-only:' tests/pass/*.bastio tests/fail/*.bastio tests/user/*.bastio); do
+  s1only=$((s1only+1))
+  want=$(sed -n 's|^// expect-error: *||p' "$f" | head -1)
+  target=$(sed -n 's|^// target: *||p' "$f" | head -1)
+  case $f in tests/user/*) target=user ;; esac
+  if "$BASTIOC" --check --target "${target:-hosted}" "$f" 2>"$tmp/s1.err" \
+     || { [ -n "$want" ] && grep -q "error\[$want\]" "$tmp/s1.err"; }; then
+    echo "STALE $f is marked stage1-only, but stage0 handles it: remove the marker"; status=1
+  fi
+done
+[ "$s1only" = 0 ] || echo "-- stage1-only: $s1only program(s) left out of the comparison"
 
 . tests/pfor.sh
 # want and got in $w: the same, or a difference labelled $1.
@@ -257,7 +280,7 @@ asm_run() {
   fi
 }
 export -f asm_run
-pfor asm_run tests/pass/*.bastio || status=1
+pfor asm_run $pass_files || status=1
 built=$(n built) differ=$(n differ)
 if bg_ok $bg_self self; then
   built=$((built+1))
@@ -272,7 +295,7 @@ fi
 # User programs (BastiOS) cannot run here: they must assemble and link on
 # their own, with no C library (bastios's make test runs them).
 users=0
-for f in tests/user/*.bastio; do
+for f in $user_files; do
   if "$tmp/asmdump" --user "$f" >"$tmp/user.s" 2>/dev/null \
      && as --64 -o "$tmp/user.o" "$tmp/user.s" \
      && ld -static -nostdlib --no-undefined -e bst_umain -o "$tmp/user" "$tmp/user.o"; then
@@ -377,12 +400,12 @@ pfor drv_check $files || status=1
 match=$(n match) differ=$(n differ) errors=$(n error)
 cfiles=0
 cfs=()
-for f in tests/pass/*.bastio tests/user/*.bastio ../bastios/src/main.bastio ../bastios/user/*.bastio; do
+for f in $pass_files $user_files ../bastios/src/main.bastio ../bastios/user/*.bastio; do
   [ -f "$f" ] && cfs+=("$f")
 done
 pfor drv_emitc "${cfs[@]}" || status=1
 match=$((match + $(n match))) differ=$((differ + $(n differ))) cfiles=$((cfiles + $(n cfile)))
-pfor drv_header $(grep -l '^export fn' tests/pass/*.bastio examples/*/*.bastio) || status=1
+pfor drv_header $(grep -l '^export fn' $pass_files examples/*/*.bastio) || status=1
 match=$((match + $(n match))) differ=$((differ + $(n differ))) cfiles=$((cfiles + $(n cfile)))
 # `--lib`: a program outside the repository, without and with it.
 mkdir -p "$tmp/away"
@@ -412,20 +435,28 @@ else
   differ=$((differ+1))
   echo "DIFFER BASTIO_LIB (--emit-c)"
 fi
+for f in tests/pass/fill_sum.bastio stage1/lexdump.bastio; do
+  if "$tmp/bastioc1" --check --dump-smt "$f" 2>/dev/null | cmp -s - <("$BASTIOC" --check --dump-smt "$f" 2>/dev/null); then
+    match=$((match+1))
+  else
+    differ=$((differ+1))
+    echo "DIFFER --dump-smt $f"
+  fi
+done
 if "$tmp/bastioc1" --trusted-base | cmp -s - <("$BASTIOC" --trusted-base); then
   match=$((match+1))
 else
   differ=$((differ+1))
   echo "DIFFER --trusted-base"
 fi
-pfor drv_run tests/pass/*.bastio || status=1
+pfor drv_run $pass_files || status=1
 match=$((match + $(n match))) differ=$((differ + $(n differ))) built=$(n built)
-pfor drv_native tests/pass/*.bastio || status=1
+pfor drv_native $pass_files || status=1
 match=$((match + $(n match))) differ=$((differ + $(n differ))) nbuilt=$(n nbuilt)
 # `--backend native --target user` (stage0 has no such backend): the
 # assembly asmdump --user writes, which links with no C library.
 nuser=0
-for f in tests/user/*.bastio; do
+for f in $user_files; do
   if "$tmp/bastioc1" --backend native --target user -o "$tmp/nuser.s" "$f" 2>/dev/null \
      && "$tmp/asmdump" --user "$f" >"$tmp/nuser_want.s" 2>/dev/null \
      && cmp -s "$tmp/nuser.s" "$tmp/nuser_want.s" \
@@ -471,17 +502,17 @@ if [ -f ../bastios/src/main.bastio ]; then
     $(ls ../bastios/src/*.bastio | grep -v /main.bastio) || status=1
 fi
 # The verifier, on the mutants that still verify (most do not).
-python3 stage1/mutate.py --smt "$BASTIOC" "--check --dump-smt" "$tmp/smtdump" 6 $((${MUTANTS:-5} * 4)) tests/pass/*.bastio || status=1
+python3 stage1/mutate.py --smt "$BASTIOC" "--check --dump-smt" "$tmp/smtdump" 6 $((${MUTANTS:-5} * 4)) $pass_files || status=1
 # Proofs, on the mutants that reach the verifier: most of those fail a proof.
 python3 stage1/mutate.py --verify "$BASTIOC" "--dump-verify" "$tmp/verifydump" 7 $((${MUTANTS:-5} * 2)) \
-  tests/pass/*.bastio tests/fail/*.bastio stage1/verifycases/*.bastio || status=1
+  $pass_files $fail_files stage1/verifycases/*.bastio || status=1
 # C, on the mutants that still type-check (the rest print the same error).
-python3 stage1/mutate.py "$BASTIOC" "--dump-c" "$tmp/cdump" 8 ${MUTANTS:-5} tests/pass/*.bastio || status=1
+python3 stage1/mutate.py "$BASTIOC" "--dump-c" "$tmp/cdump" 8 ${MUTANTS:-5} $pass_files || status=1
 if [ -f ../bastios/src/main.bastio ]; then
   python3 stage1/mutate.py --via ../bastios/src/main.bastio "$BASTIOC" "--dump-c --target kernel" "$tmp/cdump kernel" 9 ${MUTANTS:-5} \
     $(ls ../bastios/src/*.bastio | grep -v /main.bastio) || status=1
 fi
 # The driver's error output, on damaged copies of every test program.
 python3 stage1/mutate.py --driver "$BASTIOC" "--check" "$tmp/bastioc1" 10 ${MUTANTS:-5} \
-  tests/pass/*.bastio tests/fail/*.bastio || status=1
+  $pass_files $fail_files || status=1
 exit $status
