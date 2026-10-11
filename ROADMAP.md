@@ -171,8 +171,8 @@ As with v4, all of it is in Bastio under the same proofs. Container isolation is
 
 Goal, set 2026-10-11: Bastio and BastiOS run on AArch64 as well as x86-64, on QEMU's `virt` machine first and then on physical boards. Tracked in [#119](https://github.com/yukikotani231/bastiolang/issues/119).
 - [x] Hosted AArch64 through the C backend, tested under `qemu-aarch64` ([#121](https://github.com/yukikotani231/bastiolang/issues/121))
-- [ ] Capabilities parameterized by architecture: VMSAv8-64 translation tables, the EL0 context, system registers, no port I/O ([#122](https://github.com/yukikotani231/bastiolang/issues/122))
-- [ ] Kernel and user targets for AArch64, with the barriers its weaker memory model needs in `Atomic`, `Lock` and `Shared` ([#123](https://github.com/yukikotani231/bastiolang/issues/123))
+- [x] Capabilities parameterized by architecture: VMSAv8-64 translation tables, the EL0 context, system registers, no port I/O ([#122](https://github.com/yukikotani231/bastiolang/issues/122))
+- [x] Kernel and user targets for AArch64, with the barriers its weaker memory model needs in `Atomic`, `Lock` and `Shared` ([#123](https://github.com/yukikotani231/bastiolang/issues/123))
 - [ ] BastiOS boots on `virt`: exception vectors, MMU, GICv3, generic timer, PL011 ([bastios#194](https://github.com/yukikotani231/bastios/issues/194))
 - [ ] virtio drivers and multi-core start with PSCI ([bastios#195](https://github.com/yukikotani231/bastios/issues/195))
 - [ ] The Linux arm64 system-call ABI and AArch64 ELF binaries ([bastios#196](https://github.com/yukikotani231/bastios/issues/196))

@@ -81,7 +81,7 @@ bastioc0 [--check] [--emit-c] [--backend c|native] [--target hosted|kernel|user]
 | `--check` | Check and verify only |
 | `--emit-c` | Write the generated C (`out.c` unless `-o` is given) instead of an executable |
 | `--target T` | `hosted` (the default), `kernel` or `user`; see [Targets](#targets-and-generated-code). `kernel` and `user` imply `--emit-c` |
-| `--arch A` | `x86_64` (the default) or `aarch64`: the processor to build for. AArch64 works with the hosted target and the C backend so far; it compiles with `aarch64-linux-gnu-gcc` unless `$CC` is set. See [Targets](#targets-and-generated-code) |
+| `--arch A` | `x86_64` (the default) or `aarch64`: the processor to build for. AArch64 works with the C backend; hosted programs compile with `aarch64-linux-gnu-gcc` unless `$CC` is set. The kernel and user targets for AArch64 are bastioc1's only. See [Targets](#targets-and-generated-code) |
 | `--backend native` | Experimental: generate x86-64 assembly directly instead of C, assemble it with `as` and link it with `cc`. Hosted target only, and not every builtin yet (`Child`, `Lock`, the device types and libraries without `main` are missing); see [Targets](#targets-and-generated-code) |
 | `--emit-asm` | With `--backend native`: write the assembly (`out.s` unless `-o` is given) instead of an executable |
 | `--header F` | Also write a C header declaring the program's `export fn`s to `F`; see [Calling Bastio from C](#calling-bastio-from-c) |
@@ -127,7 +127,7 @@ All files share one namespace, as in C: a function, type or constant name must b
 | Target | `main` may take |
 | --- | --- |
 | `hosted` | `&mut Serial`, `&mut Pool`, `&mut Host`, `&mut Ports`, `&mut MmioSpace` |
-| `kernel` | `&mut Serial`, `&mut Pool`, `&mut Mmu`, `&mut Cpu`, `&mut Ports`, `&mut MmioSpace` |
+| `kernel` | `&mut Serial`, `&mut Pool`, `&mut Mmu`, `&mut Cpu`, `&mut Ports` (x86-64 only), `&mut MmioSpace` |
 | `user` | `&mut Serial` (and must return `u64`) |
 
 The older form `fn main(con: Serial) -> Serial` is still accepted outside user programs.
@@ -983,9 +983,9 @@ Hardware is reached only through capability types. There is no way to read or wr
 | `Mmu` | The right to load CR3 (kernel only) |
 | `Cpu` | The CPU's saved user context and the right to enter user mode (kernel only) |
 | `Lease` | This processor's hold on the top-level table it loaded with `mmu_enter`: while any is outstanding, other processors may be running on the tree, so nothing is taken out of it (kernel only; pinned to its processor) |
-| `Ports` | The x86 I/O port space: the right to claim each of the 65536 ports, once |
+| `Ports` | The x86 I/O port space: the right to claim each of the 65536 ports, once. AArch64 has no port I/O, so an AArch64 kernel is never handed `Ports` and the port builtins are `E-TARGET` there |
 | `PortIo` | A claimed range of I/O ports, owned: the only way to read or write them |
-| `MmioSpace` | The device window (physical `0x80000000` up to 2^46, which the kernel platform maps uncached, so 64-bit PCI BARs above 4 GiB fit): the right to claim each byte of it, once. RAM above 2 GiB lies inside it and belongs to the page pool instead: `mmio_claim` of a block that overlaps the pool's RAM stops the machine (firmware never puts a device there) |
+| `MmioSpace` | The device window (physical `0x80000000` up to 2^46, which the kernel platform maps uncached, so 64-bit PCI BARs above 4 GiB fit): the right to claim each byte of it, once. RAM above 2 GiB lies inside it and belongs to the page pool instead: `mmio_claim` of a block that overlaps the pool's RAM stops the machine (firmware never puts a device there). On AArch64 the window starts at 0, since devices usually sit below RAM there (QEMU's virt machine has its UART at `0x09000000`); a claim that overlaps any RAM the platform listed, the kernel image's included, stops the machine |
 | `Mmio` | A claimed block of memory-mapped device registers, owned: the only way to read or write them |
 | `Dma` | A page lent to devices for DMA: while lent it is not a `Frame`, so it cannot be freed, mapped or reused |
 
@@ -1157,8 +1157,8 @@ Every top-level table a processor loads is entered with a lease; there is no oth
 | `mmu_kernel(m: &mut Mmu)` | | Loads the kernel's own map |
 | `mmu_enter(m: &mut Mmu, t: &mut PageTable) -> Lease` | level 4; `mmu_root(m)` is the kernel's (`0x8000000`) | Takes a lease on `t` and loads it into CR3: `pt_leases(t)` goes up by one, `mmu_root(m)` becomes `pt_id(t)`. `t` can then go back where it came from (a lock, say) and other processors can enter it too |
 | `mmu_exit(m: &mut Mmu, l: Lease)` | | Loads the kernel's own map, then gives the lease back. No table's `pt_leases` drops in the proof (it does not name one): it stays an overcount until `pt_lease_count` reads the true count |
-| `cpu_get(c: &Cpu, r: u64) -> u64` | `r < 21` | Saved user register `r`: rax rbx rcx rdx rsi rdi rbp r8-r15 (0-14), rip (15), rsp (16), rflags (17), error code (18), fault address (19), FS base (20) |
-| `cpu_set(c: &mut Cpu, r: u64, v: u64)` | `r < 18` or `r == 20` | Sets a saved register or the FS base (the error code and fault address are only reported by a trap). Whatever is stored, user mode is entered in ring 3 with the user segments, IOPL 0 and interrupts on; the platform replaces a non-canonical address with 0 |
+| `cpu_get(c: &Cpu, r: u64) -> u64` | `r < 21` (AArch64: `r < 37`) | Saved user register `r`: rax rbx rcx rdx rsi rdi rbp r8-r15 (0-14), rip (15), rsp (16), rflags (17), error code (18), fault address (19), FS base (20). On AArch64: x0-x30 (0-30), SP_EL0 (31), the return address ELR_EL1 (32), SPSR_EL1 (33), the syndrome ESR_EL1 (34), the fault address FAR_EL1 (35), TPIDR_EL0 (36) |
+| `cpu_set(c: &mut Cpu, r: u64, v: u64)` | `r < 18` or `r == 20` (AArch64: `r < 34` or `r == 36`) | Sets a saved register or the FS base (the error code and fault address are only reported by a trap). Whatever is stored, user mode is entered in ring 3 with the user segments, IOPL 0 and interrupts on; the platform replaces a non-canonical address with 0. On AArch64 the platform enters EL0 with interrupts unmasked whatever SPSR holds: only its condition flags are kept |
 | `cpu_fpu_save(c: &mut Cpu, f: &mut Frame)` | | Saves the user's x87/SSE registers into the page (`fxsave64`) |
 | `cpu_fpu_load(c: &mut Cpu, f: &Frame)` | | Loads them from the page (`fxrstor64`); reserved MXCSR bits are cleared first, so any contents are safe to load. A kernel that runs several user contexts keeps one page per context and swaps them around `cpu_run` |
 | `cpu_run(c: &mut Cpu, m: &Mmu) -> u64` | | Runs the saved context in user mode until the next trap; returns its vector (`<= 255`) |
@@ -1470,7 +1470,11 @@ The compiler emits C, which a C compiler turns into machine code. The C contains
 
 On the freestanding targets `Bytes` come from the same arena as `Buf`.
 
-The hosted C is the same for every processor, so `--arch aarch64` changes only the C compiler: the program is built for AArch64 Linux with `aarch64-linux-gnu-gcc` (or `$CC`). `tests/aarch64.sh` builds every test program for AArch64, runs it under `qemu-aarch64` and requires the same exit status and output as on x86-64, and checks that the compiler built for AArch64 writes the same C for itself as the x86-64 build. The kernel and user targets and the native backend are x86-64 only for now.
+The hosted C is the same for every processor, so for a hosted program `--arch aarch64` changes only the C compiler: the program is built for AArch64 Linux with `aarch64-linux-gnu-gcc` (or `$CC`).
+
+With `--target kernel` or `--target user`, `--arch aarch64` (bastioc1 only) selects AArch64 preludes. The kernel's console is a PL011 UART at the platform's `bst_uart_base` (QEMU virt's `0x09000000` by default); `bst_kmain`'s argument points to a count of RAM runs followed by each one's base and length, which the platform takes from the device tree; page tables are VMSAv8-64 with a 4 KiB granule, user pages normal memory (MAIR index 0) that EL0 may reach and EL1 may never execute, loaded into TTBR0 (the kernel's map is in top-level slot 0 of every table, as on x86-64); a page mapped for user mode has its data cache cleaned and the instruction cache invalidated, since AArch64's caches are not coherent with each other; MMIO and DMA accesses carry the `dmb` barriers Linux's `readl`/`writel` and `dma_rmb`/`dma_wmb` do, since AArch64 reorders memory accesses that x86-64 keeps in order; `cpu_run` enters EL0 through the platform's `bst_cpu_enter`, which returns 128 for an `svc`, 14 for an abort, 32 + n for interrupt n and 6 for anything else; the kernel's C is built with `-mgeneral-regs-only`, so the FP/SIMD registers keep the user's values until `cpu_fpu_save` stores q0-q31, FPSR and FPCR. A user program makes system calls with `svc #0`, the number in x8 and the arguments in x0-x2. `bastioc1 --arch aarch64 --trusted-base` lists these preludes (`tests/trusted_base_aarch64.txt`).
+
+`tests/aarch64.sh` builds every test program for AArch64, runs it under `qemu-aarch64` and requires the same exit status and output as on x86-64; checks that the compiler built for AArch64 writes the same C for itself as the x86-64 build; builds the user programs for AArch64; and boots a small kernel (`tests/aarch64/`) on QEMU's virt machine that maps a user program, runs it at EL0 through system calls and an abort, and reads a device register. The native backend is x86-64 only.
 
 The native backend (`--backend native`, hosted only, experimental) skips C: it writes x86-64 assembly, so the C compiler leaves the trusted base for the program's own code, while its small runtime (printing, the console and the allocator, written in assembly over the C library) is listed by `--trusted-base`. `tests/native.sh` builds every test and benchmark with both backends and requires the same exit status and output. It loses the C compiler's optimizations (inlining, vectorization), so it is slower; `bench/run.sh` reports the gap.
 
