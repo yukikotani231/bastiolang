@@ -55,6 +55,10 @@ struct Checker {
   ftys: Vec[u64],
   /// Places; index 0 is unused.
   paths: Vec[Path],
+  /// Hash indexes over `paths`, `calls` and the builtins in `bs`.
+  pix: Ix,
+  cix: Ix,
+  bix: Ix,
   /// The variables in scope, innermost last.
   vars: Vec[Var],
   moved: Vec[u64],
@@ -120,6 +124,9 @@ fn checker_free(c: Checker) {
   vec_free(c.fstart);
   vec_free(c.ftys);
   vec_free(c.paths);
+  ix_free(c.pix);
+  ix_free(c.cix);
+  ix_free(c.bix);
   vec_free(c.vars);
   vec_free(c.moved);
   vec_free(c.mlocs);
@@ -132,11 +139,13 @@ fn checker_free(c: Checker) {
 }
 
 fn bsig(c: &mut Checker, name: Str, avail: u64, np: u64, p0: u64, p1: u64, p2: u64, p3: u64, ret: u64) {
+  ix_add(&mut c.bix, str_hash(name), vec_len(c.bs));
   vec_push(&mut c.bs, Bsig { name: name, avail: avail, np: np, p0: p0, p1: p1, p2: p2, p3: p3, p4: 0, ret: ret });
 }
 
 /// A builtin with five parameters (the bulk copies).
 fn bsig5(c: &mut Checker, name: Str, avail: u64, p0: u64, p1: u64, p2: u64, p3: u64, p4: u64, ret: u64) {
+  ix_add(&mut c.bix, str_hash(name), vec_len(c.bs));
   vec_push(&mut c.bs, Bsig { name: name, avail: avail, np: 5, p0: p0, p1: p1, p2: p2, p3: p3, p4: p4, ret: ret });
 }
 
@@ -166,7 +175,7 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   vec_push(&mut paths, Path { up: 0, s: 0, e: 0 });
   let mut c = Checker {
     bs: vec_new[Bsig](), ghosts: vec_new[Ghost](), fstart: vec_new[u64](), ftys: vec_new[u64](),
-    paths: paths, vars: vec_new[Var](), moved: vec_new[u64](), mlocs: vec_new[u64](), bound: vec_new[u64](),
+    paths: paths, pix: ix_new(), cix: ix_new(), bix: ix_new(), vars: vec_new[Var](), moved: vec_new[u64](), mlocs: vec_new[u64](), bound: vec_new[u64](),
     target: target, ret: un, env: 0, spec_lim: 0, spec_pos: 0, tu64: u, tbool: b, tunit: un, tstr: st,
     failed: false, efile: 0, eline: 0, ecol: 0, ecode: 0, emsg: vec_new[u64](), enotes: vec_new[u64](), int_ops: vec_new[IntOp](),
     calls: vec_new[Edge](), lsites: vec_new[LockSite](), nparams: 0, inv: false, old_only: false
@@ -188,6 +197,7 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   let dma = prim(&mut m, p, TY_DMA);
   let lse = prim(&mut m, p, TY_LEASE);
   let shr = prim(&mut m, p, TY_SHARED);
+  let drt = prim(&mut m, p, TY_DIRTY);
   let u8t = prim(&mut m, p, TY_U8);
   let u16t = prim(&mut m, p, TY_U16);
   let u32t = prim(&mut m, p, TY_U32);
@@ -205,6 +215,7 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   let mfrm = mut_to(&mut m, p, frm);
   let rptb = ref_to(&mut m, p, ptb);
   let rshr = ref_to(&mut m, p, shr);
+  let rdrt = ref_to(&mut m, p, drt);
   let mptb = mut_to(&mut m, p, ptb);
   let rmmu = ref_to(&mut m, p, mmu);
   let mmmu = mut_to(&mut m, p, mmu);
@@ -279,6 +290,12 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   bsig(&mut c, "pt_put_shared", AV_MEM, 4, mptb, u, shr, b, un);
   bsig(&mut c, "pt_take_shared", AV_MEM, 2, mptb, u, 0, 0, shr);
   bsig(&mut c, "pt_dup_shared", AV_MEM, 2, rptb, u, 0, 0, shr);
+  bsig(&mut c, "pool_take_dirty", AV_MEM, 2, mpol, u, 0, 0, drt);
+  bsig(&mut c, "dirty_id", AV_MEM, 1, rdrt, 0, 0, 0, u);
+  bsig(&mut c, "dirty_zero", AV_MEM, 1, drt, 0, 0, 0, frm);
+  bsig(&mut c, "frame_copy", AV_MEM, 2, drt, rfrm, 0, 0, frm);
+  bsig(&mut c, "shared_copy", AV_MEM, 2, drt, rshr, 0, 0, frm);
+  bsig(&mut c, "dirty_fill", AV_MEM, 3, drt, rbyt, u, 0, frm);
   bsig(&mut c, "mmu_enter", AV_KERNEL, 2, mmmu, mptb, 0, 0, lse);
   bsig(&mut c, "mmu_exit", AV_KERNEL, 2, mmmu, lse, 0, 0, un);
   bsig(&mut c, "mmu_kernel", AV_KERNEL, 1, mmmu, 0, 0, 0, un);
@@ -347,6 +364,7 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   ghost(&mut c, "pt_leases", ptb, false, u);
   ghost(&mut c, "pt_shared", ptb, true, b);
   ghost(&mut c, "shared_id", shr, false, u);
+  ghost(&mut c, "dirty_id", drt, false, u);
   ghost(&mut c, "pool_has", pol, true, b);
   ghost(&mut c, "pool_size", pol, false, u);
   ghost(&mut c, "mmu_root", mmu, false, u);
@@ -577,7 +595,7 @@ fn def_node(m: &Mono, p: &Parser, x: u64) -> Node {
 /// Is a value of type `t` linear (must it be consumed exactly once)?
 fn ck_linear(c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
   let k = kind_t(m, t);
-  if (k >= TY_BUF && k <= TY_DMA) || k == TY_LEASE || k == TY_SHARED || k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_ATOMIC {
+  if (k >= TY_BUF && k <= TY_DMA) || k == TY_LEASE || k == TY_SHARED || k == TY_DIRTY || k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_ATOMIC {
     return true;
   }
   if k == TY_STRUCT || k == TY_ENUM {
@@ -750,6 +768,7 @@ fn tyn_to(out: &mut Vec[u64], m: &Mono, p: &Parser, t: u64) {
   else if k == TY_DMA { tyn_s(&mut out, "Dma"); }
   else if k == TY_LEASE { tyn_s(&mut out, "Lease"); }
   else if k == TY_SHARED { tyn_s(&mut out, "Shared"); }
+  else if k == TY_DIRTY { tyn_s(&mut out, "Dirty"); }
   else if k == TY_STRUCT || k == TY_ENUM { tyn_inst_to(&mut out, m, p, x.a); }
   else if k == TY_UNKNOWN { tyn_name(&mut out, p, x.a); }
   else if k == TY_BOX { tyn_s(&mut out, "Box["); tyn_to(&mut out, m, p, x.a); tyn_s(&mut out, "]"); }
@@ -1040,15 +1059,21 @@ fn ghost_at(c: &Checker, k: u64) -> Ghost {
 
 /// The builtin named `s..e` in the table: its index + 1, or 0.
 fn bs_index(c: &Checker, p: &Parser, s: u64, e: u64) -> u64 {
-  let mut k = 0;
-  while k < vec_len(c.bs) {
-    let b = vec_get(c.bs, k);
-    if span_is(p, s, e, b.name) {
-      return k + 1;
+  // The first row of that name, as a scan of the table finds it.
+  let h = text_hash(p.src, s, e);
+  let mut best = 0;
+  let mut j = ix_first(c.bix, h);
+  while j != 0 {
+    let k = ix_val(c.bix, j);
+    if k < vec_len(c.bs) && (best == 0 || k < best - 1) {
+      let b = vec_get(c.bs, k);
+      if span_is(p, s, e, b.name) {
+        best = k + 1;
+      }
     }
-    k = k + 1;
+    j = ix_next(c.bix, h, j);
   }
-  return 0;
+  return best;
 }
 
 fn ghost_index(c: &Checker, p: &Parser, s: u64, e: u64) -> u64 {
@@ -1094,7 +1119,7 @@ fn is_pt_borrow_builtin(p: &Parser, s: u64, e: u64) -> bool {
 }
 
 fn is_builtin_name(c: &Checker, p: &Parser, s: u64, e: u64) -> bool {
-  return span_is(p, s, e, "box") || span_is(p, s, e, "unbox") || span_is(p, s, e, "cast") || span_is(p, s, e, "wrap")
+  return span_is(p, s, e, "box") || span_is(p, s, e, "try_box") || span_is(p, s, e, "unbox") || span_is(p, s, e, "cast") || span_is(p, s, e, "wrap")
     || span_is(p, s, e, "smp_run") || is_pt_borrow_builtin(p, s, e) || is_lock_builtin(p, s, e) || is_atomic_builtin(p, s, e)
     || is_vec_builtin(p, s, e) || is_wrap_builtin(p, s, e) || bs_index(c, p, s, e) != 0;
 }
@@ -1106,18 +1131,12 @@ fn is_spec_word(p: &Parser, s: u64, e: u64) -> bool {
 
 /// The first function named `s..e`, when it is not generic; otherwise 0.
 fn plain_fn(p: &Parser, s: u64, e: u64) -> u64 {
-  let mut k = p.fns.head;
-  while k != 0 {
-    let n = node_at(p.nodes, k);
-    if same(p.src, n.s, n.e, s, e) {
-      if n.v != 0 {
-        return 0;
-      }
-      return k;
-    }
-    k = n.next;
+  let k = ix_node(p, p.ix_fns, s, e);
+  let n = node_at(p.nodes, k);
+  if n.v != 0 {
+    return 0;
   }
-  return 0;
+  return k;
 }
 
 /// Is `s..e` the name of a function with a signature (a builtin in the
@@ -1140,7 +1159,7 @@ fn find_spec(c: &Checker, p: &Parser, s: u64, e: u64) -> u64 {
 }
 
 fn any_spec(p: &Parser, s: u64, e: u64) -> bool {
-  return index_in(p, p.specs.head, s, e) != 0;
+  return ix_node(p, p.ix_specs, s, e) != 0;
 }
 
 fn var_at(c: &Checker, j: u64) -> Var {
@@ -1193,16 +1212,21 @@ fn path_at(c: &Checker, k: u64) -> Path {
 
 /// The place `up.s..e` (the variable `s..e` when `up` is 0).
 fn ck_path(c: &mut Checker, p: &Parser, up: u64, s: u64, e: u64) -> u64 {
-  let mut k = 1;
-  while k < vec_len(c.paths) {
-    let x = vec_get(c.paths, k);
-    if x.up == up && same(p.src, x.s, x.e, s, e) {
-      return k;
+  let h = hash_mix(text_hash(p.src, s, e), up);
+  let mut j = ix_first(c.pix, h);
+  while j != 0 {
+    let k = ix_val(c.pix, j);
+    if k < vec_len(c.paths) {
+      let x = vec_get(c.paths, k);
+      if x.up == up && same(p.src, x.s, x.e, s, e) {
+        return k;
+      }
     }
-    k = k + 1;
+    j = ix_next(c.pix, h, j);
   }
   let n = vec_len(c.paths);
   vec_push(&mut c.paths, Path { up: up, s: s, e: e });
+  ix_add(&mut c.pix, h, n);
   return n;
 }
 
@@ -1830,7 +1854,7 @@ fn is_reserved_type(p: &Parser, s: u64, e: u64) -> bool {
     || span_is(p, s, e, "PageTable") || span_is(p, s, e, "Pool") || span_is(p, s, e, "Mmu")
     || span_is(p, s, e, "Cpu") || span_is(p, s, e, "Ports") || span_is(p, s, e, "PortIo")
     || span_is(p, s, e, "MmioSpace") || span_is(p, s, e, "Mmio") || span_is(p, s, e, "Dma")
-    || span_is(p, s, e, "Lease") || span_is(p, s, e, "Shared") || span_is(p, s, e, "Lock") || span_is(p, s, e, "Atomic");
+    || span_is(p, s, e, "Lease") || span_is(p, s, e, "Shared") || span_is(p, s, e, "Dirty") || span_is(p, s, e, "Lock") || span_is(p, s, e, "Atomic");
 }
 
 /// Struct and enum instances: no reserved names, known field and payload
@@ -2254,14 +2278,19 @@ fn check_program(c: &mut Checker, m: &mut Mono, p: &Parser) {
 
 /// Records that the instance being checked calls instance `x`.
 fn note_call(c: &mut Checker, x: u64) {
-  let mut j = 0;
-  while j < vec_len(c.calls) {
-    let e = vec_get(c.calls, j);
-    if e.from == c.env && e.to == x {
-      return;
+  let h = hash_mix(hash_mix(14695981039346656037, c.env), x);
+  let mut j = ix_first(c.cix, h);
+  while j != 0 {
+    let k = ix_val(c.cix, j);
+    if k < vec_len(c.calls) {
+      let e = vec_get(c.calls, k);
+      if e.from == c.env && e.to == x {
+        return;
+      }
     }
-    j = j + 1;
+    j = ix_next(c.cix, h, j);
   }
+  ix_add(&mut c.cix, h, vec_len(c.calls));
   vec_push(&mut c.calls, Edge { from: c.env, to: x });
 }
 
@@ -3159,6 +3188,56 @@ fn operands(c: &mut Checker, m: &mut Mono, p: &Parser, a: u64, b: u64) -> Ops {
   return Ops { a: ta, b: tb };
 }
 
+/// `try_box[T](x)`: `Boxed[T]` from core/boxed.bastio, which
+/// monomorphization has already copied for `T`.
+fn ck_try_box(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
+  let n = node_at(p.nodes, i);
+  let call = node_at(p.nodes, n.b);
+  if list_len(p, n.a) != 1 || list_len(p, call.a) != 1 {
+    if cm_new(&mut c, p, i, C_TYPE) {
+      cm_s(&mut c, "write `try_box[T](x)`: one type argument, one argument");
+    }
+    return 0;
+  }
+  let t = conv(&mut m, p, n.a, c.env, i);
+  known_type(&mut c, m, p, t, i);
+  if c.failed {
+    return 0;
+  }
+  let ta = ck_expr_as(&mut c, &mut m, p, call.a, t);
+  if !c.failed && cm_mismatch(&mut c, p, ta, t, call.a) {
+    cm_s(&mut c, "`try_box[");
+    cm_ty(&mut c, m, p, t);
+    cm_s(&mut c, "]` boxes a ");
+    cm_ty(&mut c, m, p, t);
+    cm_s(&mut c, ", found ");
+    cm_ty(&mut c, m, p, ta);
+  }
+  if c.failed {
+    return 0;
+  }
+  let bt = boxed_t(&mut m, p, t);
+  if bt == 0 {
+    return 0;
+  }
+  // It must be core's shape: `Ok(Box[T])` then `Full(T)`.
+  let x = inner_t(m, bt);
+  let dn = def_node(m, p, x);
+  let mut ok = list_len(p, dn.a) == 2 && fld_ty(c, x, 0) == intern(&mut m, p, TY_BOX, t) && fld_ty(c, x, 1) == t;
+  if ok {
+    let f0 = node_at(p.nodes, dn.a);
+    let f1 = node_at(p.nodes, f0.next);
+    ok = span_is(p, f0.s, f0.e, "Ok") && span_is(p, f1.s, f1.e, "Full");
+  }
+  if !ok {
+    if cm_new(&mut c, p, i, C_TYPE) {
+      cm_s(&mut c, "`try_box` returns `enum Boxed[T] { Ok(Box[T]), Full(T) }` from core/boxed.bastio, but `Boxed` here is defined differently");
+    }
+    return 0;
+  }
+  return bt;
+}
+
 /// An expression; a call, struct literal or variant names instance `inst`
 /// instead of what is written when `inst` is not 0.
 fn ck_named(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 {
@@ -3184,6 +3263,9 @@ fn ck_named(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64
           return 0;
         }
         return intern(&mut m, p, TY_VEC, t);
+      }
+      if name_is(p, n.b, "try_box") {
+        return ck_try_box(&mut c, &mut m, p, i);
       }
       // `cast[T](x)` (proved to fit) and `wrap[T](x)` (modular).
       if list_len(p, n.a) != 1 || list_len(p, call.a) != 1 {

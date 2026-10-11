@@ -5,55 +5,82 @@
 # first line of `// expect-stdout: TEXT`, if given, with stdin empty); fail/*.bastio must be rejected with the error
 # code in their `// expect-error: CODE` header, checked for the target in an
 # optional `// target: T` header (a rejection for the wrong
-# reason counts as a failure).
+# reason counts as a failure). diag/*.bastio must print exactly diag/*.err.
 set -u
 cd "$(dirname "$0")/.."
 BASTIOC=${BASTIOC:-stage0/target/release/bastioc0}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-pass=0
-fail=0
-for f in tests/pass/*.bastio; do
+. tests/pfor.sh
+export BASTIOC
+# One check of the lists below; JOBS of them run at a time.
+pass_one() {
+  local f=$1 want name got out
   want=$(sed -n 's|^// expect-exit: *||p' "$f" | head -1)
   name=$(basename "$f" .bastio)
-  if ! "$BASTIOC" -o "$tmp/$name" "$f" 2>"$tmp/$name.err"; then
-    echo "FAIL $f: rejected"; sed 's/^/    /' "$tmp/$name.err"; fail=$((fail+1)); continue
+  if ! "$BASTIOC" -o "$w/$name" "$f" 2>"$w/$name.err"; then
+    echo "FAIL $f: rejected"; sed 's/^/    /' "$w/$name.err"; echo =fail; return
   fi
-  "$tmp/$name" </dev/null >"$tmp/$name.out"; got=$?
-  if [ "$got" != "$want" ]; then echo "FAIL $f: exit $got, want $want"; fail=$((fail+1)); continue; fi
+  "$w/$name" </dev/null >"$w/$name.out"; got=$?
+  if [ "$got" != "$want" ]; then echo "FAIL $f: exit $got, want $want"; echo =fail; return; fi
   out=$(sed -n 's|^// expect-stdout: *||p' "$f" | head -1)
-  if [ -n "$out" ] && [ "$(head -1 "$tmp/$name.out")" != "$out" ]; then
-    echo "FAIL $f: stdout $(head -1 "$tmp/$name.out" | od -c | head -2), want '$out'"; fail=$((fail+1)); continue
+  if [ -n "$out" ] && [ "$(head -1 "$w/$name.out")" != "$out" ]; then
+    echo "FAIL $f: stdout $(head -1 "$w/$name.out" | od -c | head -2), want '$out'"; echo =fail; return
   fi
-  pass=$((pass+1))
-done
-for f in tests/fail/*.bastio; do
+  echo =pass
+}
+fail_one() {
+  local f=$1 want target missing
   want=$(sed -n 's|^// expect-error: *||p' "$f" | head -1)
   target=$(sed -n 's|^// target: *||p' "$f" | head -1)
-  if "$BASTIOC" --check --target "${target:-hosted}" "$f" 2>"$tmp/err"; then
-    echo "FAIL $f: accepted, want $want"; fail=$((fail+1)); continue
+  if "$BASTIOC" --check --target "${target:-hosted}" "$f" 2>"$w/err"; then
+    echo "FAIL $f: accepted, want $want"; echo =fail; return
   fi
-  if ! grep -q "error\[$want\]" "$tmp/err"; then
-    echo "FAIL $f: wrong error, want $want"; sed 's/^/    /' "$tmp/err"; fail=$((fail+1)); continue
+  if ! grep -q "error\[$want\]" "$w/err"; then
+    echo "FAIL $f: wrong error, want $want"; sed 's/^/    /' "$w/err"; echo =fail; return
   fi
   # `// expect-text: T` lines: each T must appear in the error output (the
   # sentence or a `  = ` hint), so the wording of diagnostics is tested too.
   missing=$(sed -n 's|^// expect-text: *||p' "$f" | while IFS= read -r t; do
-    grep -qF -- "$t" "$tmp/err" || echo "$t"; done)
+    grep -qF -- "$t" "$w/err" || echo "$t"; done)
   if [ -n "$missing" ]; then
-    echo "FAIL $f: error output lacks: $missing"; sed 's/^/    /' "$tmp/err"; fail=$((fail+1)); continue
+    echo "FAIL $f: error output lacks: $missing"; sed 's/^/    /' "$w/err"; echo =fail; return
   fi
-  pass=$((pass+1))
-done
+  echo =pass
+}
 # User programs (for a Bastio kernel such as BastiOS) cannot run here: they
 # must verify and their C must compile freestanding.
-for f in tests/user/*.bastio; do
+user_one() {
+  local f=$1 name
   name=$(basename "$f" .bastio)
-  if "$BASTIOC" --target user -o "$tmp/$name.u.c" "$f" 2>"$tmp/$name.err" \
-     && ${CC:-cc} -c -ffreestanding -fpie -o "$tmp/$name.u.o" "$tmp/$name.u.c" 2>>"$tmp/$name.err"; then
+  if "$BASTIOC" --target user -o "$w/$name.u.c" "$f" 2>"$w/$name.err" \
+     && ${CC:-cc} -c -ffreestanding -fpie -o "$w/$name.u.o" "$w/$name.u.c" 2>>"$w/$name.err"; then
+    echo =pass
+  else
+    echo "FAIL $f"; sed 's/^/    /' "$w/$name.err"; echo =fail
+  fi
+}
+export -f pass_one fail_one user_one
+pass=0
+fail=0
+tally() {  # after a pfor: add its tallies (a lost job is a failure)
+  pass=$((pass + $(n pass))) fail=$((fail + $(n fail) + $1))
+}
+pfor pass_one tests/pass/*.bastio; tally $?
+pfor fail_one tests/fail/*.bastio; tally $?
+pfor user_one tests/user/*.bastio; tally $?
+# Diagnostics: what the compiler prints for diag/NAME.bastio, run from
+# tests/diag, must be diag/NAME.err exactly: the source line with its
+# number, the token underlined, the notes. To accept a deliberate change,
+# regenerate the .err files with bastioc0 and review the diff.
+case "$BASTIOC" in /*) abs=$BASTIOC ;; */*) abs=$PWD/$BASTIOC ;; *) abs=$BASTIOC ;; esac
+for f in tests/diag/*.bastio; do
+  name=$(basename "$f" .bastio)
+  (cd tests/diag && "$abs" --check "$name.bastio" 2>"$tmp/diag.err" >/dev/null)
+  if cmp -s "$tmp/diag.err" "tests/diag/$name.err"; then
     pass=$((pass+1))
   else
-    echo "FAIL $f"; sed 's/^/    /' "$tmp/$name.err"; fail=$((fail+1))
+    echo "FAIL $f: the error output differs from $name.err"; diff "tests/diag/$name.err" "$tmp/diag.err" | sed 's/^/    /'; fail=$((fail+1))
   fi
 done
 # Zero overhead: the generated C must index buffers directly, with no checks.
@@ -93,18 +120,21 @@ fi
 # This is a test of the prover, not part of the language: the shipped code
 # has no checks. Skipped when the C compiler lacks sanitizer support.
 if echo 'int main(void){return 0;}' | ${CC:-cc} -fsanitize=address,undefined -x c - -o "$tmp/probe" 2>/dev/null; then
-  for f in tests/pass/*.bastio; do
+  san_one() {
+    local f=$1 name want got
     name=$(basename "$f" .bastio)
     want=$(sed -n 's|^// expect-exit: *||p' "$f" | head -1)
-    "$BASTIOC" --emit-c -o "$tmp/$name.c" "$f" 2>/dev/null
-    ${CC:-cc} -fsanitize=address,undefined -fno-sanitize-recover=all -g -o "$tmp/$name.san" "$tmp/$name.c"
+    "$BASTIOC" --emit-c -o "$w/$name.c" "$f" 2>/dev/null
+    ${CC:-cc} -fsanitize=address,undefined -fno-sanitize-recover=all -g -o "$w/$name.san" "$w/$name.c"
     # A failed allocation returns NULL, as calloc does without ASan, so the
     # `try_alloc` path that handles it is the one checked.
     ASAN_OPTIONS=allocator_may_return_null=1 \
-      "$tmp/$name.san" </dev/null >/dev/null 2>"$tmp/$name.san.err"; got=$?
-    if [ "$got" = "$want" ]; then pass=$((pass+1)); else
-      echo "FAIL $f under sanitizers: exit $got"; sed 's/^/    /' "$tmp/$name.san.err" | head -20; fail=$((fail+1)); fi
-  done
+      "$w/$name.san" </dev/null >/dev/null 2>"$w/$name.san.err"; got=$?
+    if [ "$got" = "$want" ]; then echo =pass; else
+      echo "FAIL $f under sanitizers: exit $got"; sed 's/^/    /' "$w/$name.san.err" | head -20; echo =fail; fi
+  }
+  export -f san_one
+  pfor san_one tests/pass/*.bastio; tally $?
 else
   echo "(sanitizer cross-check skipped: no -fsanitize support)"
 fi

@@ -271,6 +271,13 @@ impl Mono {
             // A builtin that takes type arguments keeps them (they say what
             // it makes), with type parameters replaced.
             if matches!(&inner.kind, ExprKind::Call(n, _) if crate::check::TYPED_BUILTINS.contains(&n.as_str())) {
+                // `try_box[T]` makes a `Boxed[T]`, so that copy is needed.
+                if matches!(&inner.kind, ExprKind::Call(n, _) if n == "try_box") && a.len() == 1 {
+                    if self.enums.get("Boxed").map(|d| d.tparams.len()) != Some(1) {
+                        return Err(Diag::new("E-TYPE", pos, "`try_box` needs `import \"core/boxed.bastio\"`, which defines what it returns"));
+                    }
+                    self.instance("Boxed", a.clone(), 1, "type", pos)?;
+                }
                 *targs = a;
                 return self.children(inner, s);
             }

@@ -110,7 +110,13 @@ struct Parser {
   structs: List,
   enums: List,
   specs: List,
-  fns: List
+  fns: List,
+  /// Name indexes over the lists above, and over `consts`.
+  ix_structs: Ix,
+  ix_enums: Ix,
+  ix_specs: Ix,
+  ix_fns: Ix,
+  ix_consts: Ix
 }
 
 /// A parser over `toks` (the tokens of `src`), starting at token `i`.
@@ -120,7 +126,8 @@ fn parser_new(src: Bytes, toks: Vec[Tok], i: u64) -> Parser {
   return Parser {
     src: src, toks: toks, i: i, nodes: nodes, consts: vec_new[Const](), blobs: vec_new[u64](),
     bstart: vec_new[u64](), bdata: vec_new[u64](), file: 0, failed: false, efile: 0, eline: 0, ecol: 0, ecode: 0, emsg: vec_new[u64](),
-    structs: list_new(), enums: list_new(), specs: list_new(), fns: list_new()
+    structs: list_new(), enums: list_new(), specs: list_new(), fns: list_new(),
+    ix_structs: ix_new(), ix_enums: ix_new(), ix_specs: ix_new(), ix_fns: ix_new(), ix_consts: ix_new()
   };
 }
 
@@ -132,6 +139,11 @@ fn parser_free(p: Parser) -> Bytes {
   vec_free(p.bstart);
   vec_free(p.bdata);
   vec_free(p.emsg);
+  ix_free(p.ix_structs);
+  ix_free(p.ix_enums);
+  ix_free(p.ix_specs);
+  ix_free(p.ix_fns);
+  ix_free(p.ix_consts);
   return p.src;
 }
 
@@ -509,6 +521,194 @@ fn same(src: &Bytes, s1: u64, e1: u64, s2: u64, e2: u64) -> bool {
   return true;
 }
 
+// ---- Hash indexes ----
+
+/// A hash index over a table that only grows: entry k (its hash hs[k] and
+/// its value vals[k], an index into the table) is on the chain of bucket
+/// hs[k] % len(heads), linked through nexts (id + 1, 0 ends a chain).
+/// Lookups walk a chain and compare the table's own entries, so a hash
+/// collision costs time, never a wrong answer. Replaces linear scans over
+/// names, which were most of the front end's time.
+struct Ix { heads: Vec[u64], nexts: Vec[u64], hs: Vec[u64], vals: Vec[u64] }
+
+fn ix_new() -> Ix {
+  let mut heads = vec_new[u64]();
+  let mut k = 0;
+  while k < 64 {
+    vec_push(&mut heads, 0);
+    k = k + 1;
+  }
+  return Ix { heads: heads, nexts: vec_new[u64](), hs: vec_new[u64](), vals: vec_new[u64]() };
+}
+
+fn ix_free(x: Ix) {
+  vec_free(x.heads);
+  vec_free(x.nexts);
+  vec_free(x.hs);
+  vec_free(x.vals);
+}
+
+fn ix_u(v: &Vec[u64], i: u64) -> u64 {
+  if i < vec_len(v) {
+    return vec_get(v, i);
+  }
+  return 0;
+}
+
+/// Links entry `id` into its bucket.
+fn ix_link(x: &mut Ix, id: u64) {
+  let nb = vec_len(x.heads);
+  if nb > 0 && id < vec_len(x.nexts) {
+    let b = ix_u(x.hs, id) % nb;
+    let h = vec_get(x.heads, b);
+    vec_set(&mut x.nexts, id, h);
+    if id < 18446744073709551615 {
+      vec_set(&mut x.heads, b, id + 1);
+    }
+  }
+}
+
+/// Adds the entry with hash `h` for table index `val`.
+fn ix_add(x: &mut Ix, h: u64, val: u64) {
+  vec_push(&mut x.hs, h);
+  vec_push(&mut x.vals, val);
+  vec_push(&mut x.nexts, 0);
+  let n = vec_len(x.hs);
+  if n > 0 && n / 2 > vec_len(x.heads) {
+    // Twice the buckets, every chain relinked.
+    let nb = vec_len(x.heads);
+    let mut k = 0;
+    while k < nb {
+      vec_push(&mut x.heads, 0);
+      k = k + 1;
+    }
+    k = 0;
+    while k < vec_len(x.heads)
+      invariant k <= vlen(x.heads)
+    {
+      vec_set(&mut x.heads, k, 0);
+      k = k + 1;
+    }
+    k = 0;
+    while k < n {
+      ix_link(&mut x, k);
+      k = k + 1;
+    }
+  } else {
+    ix_link(&mut x, n - 1);
+  }
+}
+
+/// The first entry with hash `h`: its id + 1, or 0.
+fn ix_first(x: &Ix, h: u64) -> u64 {
+  let nb = vec_len(x.heads);
+  if nb == 0 {
+    return 0;
+  }
+  return ix_skip(x, h, vec_get(x.heads, h % nb));
+}
+
+/// The entry with hash `h` after entry j - 1 on its chain, or 0.
+fn ix_next(x: &Ix, h: u64, j: u64) -> u64 {
+  if j == 0 {
+    return 0;
+  }
+  return ix_skip(x, h, ix_u(x.nexts, j - 1));
+}
+
+fn ix_skip(x: &Ix, h: u64, j: u64) -> u64 {
+  let mut q = j;
+  let mut steps = 0;
+  while q != 0 && ix_u(x.hs, q - 1) != h && steps < vec_len(x.hs) {
+    q = ix_u(x.nexts, q - 1);
+    steps = steps + 1;
+  }
+  if q != 0 && ix_u(x.hs, q - 1) == h {
+    return q;
+  }
+  return 0;
+}
+
+/// The table index of entry j - 1.
+fn ix_val(x: &Ix, j: u64) -> u64 {
+  if j == 0 {
+    return 0;
+  }
+  return ix_u(x.vals, j - 1);
+}
+
+/// FNV-1a over `src[s..e]`.
+fn text_hash(src: &Bytes, s: u64, e: u64) -> u64 {
+  let mut h = 14695981039346656037;
+  let mut k = s;
+  while k < e && k < blen(src) {
+    h = wrap_mul(h ^ cast[u64](bget(src, k)), 1099511628211);
+    k = k + 1;
+  }
+  return h;
+}
+
+/// FNV-1a over `s`, the same as `text_hash` of the same text.
+fn str_hash(s: Str) -> u64 {
+  let mut h = 14695981039346656037;
+  let mut k = 0;
+  while k < slen(s) {
+    h = wrap_mul(h ^ cast[u64](sget(s, k)), 1099511628211);
+    k = k + 1;
+  }
+  return h;
+}
+
+/// Mixes `x` into hash `h`.
+fn hash_mix(h: u64, x: u64) -> u64 {
+  return wrap_mul(h ^ x, 1099511628211);
+}
+
+/// The node named `s..e` indexed in `x` (the first such in its list), or 0.
+fn ix_node(p: &Parser, x: &Ix, s: u64, e: u64) -> u64 {
+  let h = text_hash(p.src, s, e);
+  let mut j = ix_first(x, h);
+  while j != 0 {
+    let k = ix_val(x, j);
+    let n = node_at(p.nodes, k);
+    if same(p.src, n.s, n.e, s, e) {
+      return k;
+    }
+    j = ix_next(x, h, j);
+  }
+  return 0;
+}
+
+const DEF_SPEC: u64 = 0;
+const DEF_STRUCT: u64 = 1;
+const DEF_ENUM: u64 = 2;
+const DEF_FN: u64 = 3;
+
+/// Appends definition `k` to its list (`which`: DEF_*), and to the list's
+/// index unless a node of that name is there already (lookups give the
+/// first in the list).
+fn append_def(p: &mut Parser, which: u64, k: u64) {
+  let n = node_at(p.nodes, k);
+  let h = text_hash(p.src, n.s, n.e);
+  if which == DEF_SPEC {
+    if ix_node(p, p.ix_specs, n.s, n.e) == 0 { ix_add(&mut p.ix_specs, h, k); }
+    let l = p.specs;
+    p.specs = append(&mut p, l, k);
+  } else if which == DEF_STRUCT {
+    if ix_node(p, p.ix_structs, n.s, n.e) == 0 { ix_add(&mut p.ix_structs, h, k); }
+    let l = p.structs;
+    p.structs = append(&mut p, l, k);
+  } else if which == DEF_ENUM {
+    if ix_node(p, p.ix_enums, n.s, n.e) == 0 { ix_add(&mut p.ix_enums, h, k); }
+    let l = p.enums;
+    p.enums = append(&mut p, l, k);
+  } else {
+    if ix_node(p, p.ix_fns, n.s, n.e) == 0 { ix_add(&mut p.ix_fns, h, k); }
+    let l = p.fns;
+    p.fns = append(&mut p, l, k);
+  }
+}
+
 // ---- Nodes ----
 
 fn blank(kind: u64, t: Tok) -> Node {
@@ -581,15 +781,17 @@ fn has_name(p: &Parser, i: u64, t: Tok) -> bool {
 
 /// The value of the constant named by `t`: its index + 1 in `consts`, or 0.
 fn const_index(p: &Parser, t: Tok) -> u64 {
-  let mut k = 0;
-  while k < vec_len(p.consts)
-    invariant k <= vlen(p.consts)
-  {
-    let c = vec_get(p.consts, k);
-    if same(p.src, c.s, c.e, t.start, t.end) {
-      return k + 1;
+  let h = text_hash(p.src, t.start, t.end);
+  let mut j = ix_first(p.ix_consts, h);
+  while j != 0 {
+    let k = ix_val(p.ix_consts, j);
+    if k < vec_len(p.consts) {
+      let c = vec_get(p.consts, k);
+      if same(p.src, c.s, c.e, t.start, t.end) {
+        return k + 1;
+      }
     }
-    k = k + 1;
+    j = ix_next(p.ix_consts, h, j);
   }
   return 0;
 }
@@ -616,7 +818,7 @@ fn builtin_type(src: &Bytes, t: Tok) -> bool {
     || tok_is(src, t, "Host") || tok_is(src, t, "Child") || tok_is(src, t, "Serial") || tok_is(src, t, "Str")
     || tok_is(src, t, "Frame") || tok_is(src, t, "PageTable") || tok_is(src, t, "Pool") || tok_is(src, t, "Mmu")
     || tok_is(src, t, "Cpu") || tok_is(src, t, "Ports") || tok_is(src, t, "PortIo")
-    || tok_is(src, t, "MmioSpace") || tok_is(src, t, "Mmio") || tok_is(src, t, "Dma") || tok_is(src, t, "Lease") || tok_is(src, t, "Shared");
+    || tok_is(src, t, "MmioSpace") || tok_is(src, t, "Mmio") || tok_is(src, t, "Dma") || tok_is(src, t, "Lease") || tok_is(src, t, "Shared") || tok_is(src, t, "Dirty");
 }
 
 fn ty(p: &mut Parser) -> u64 {
@@ -1641,6 +1843,7 @@ fn const_def(p: &mut Parser) {
     pm_fail_named(&mut p, name, "constant `", name, "` is defined twice");
     return;
   }
+  ix_add(&mut p.ix_consts, text_hash(p.src, name.start, name.end), vec_len(p.consts));
   vec_push(&mut p.consts, Const { s: name.start, e: name.end, v: v });
 }
 
@@ -1728,30 +1931,25 @@ fn program(p: &mut Parser) {
   while !p.failed && t.kind != K_EOF {
     if is_kw(t, KW_SPEC) {
       let k = spec_def(&mut p, false);
-      let l = p.specs;
-      p.specs = append(&mut p, l, k);
+      append_def(&mut p, DEF_SPEC, k);
     } else if t.kind == K_IDENT && tok_is(p.src, t, "opaque") && is_kw(ahead(p, 1), KW_SPEC) {
       // `opaque` is a keyword only here, before `spec fn`.
       bump(&mut p);
       let k = spec_def(&mut p, true);
-      let l = p.specs;
-      p.specs = append(&mut p, l, k);
+      append_def(&mut p, DEF_SPEC, k);
     } else if is_kw(t, KW_STRUCT) {
       let k = struct_def(&mut p);
-      let l = p.structs;
-      p.structs = append(&mut p, l, k);
+      append_def(&mut p, DEF_STRUCT, k);
     } else if is_kw(t, KW_ENUM) {
       let k = enum_def(&mut p);
-      let l = p.enums;
-      p.enums = append(&mut p, l, k);
+      append_def(&mut p, DEF_ENUM, k);
     } else if is_kw(t, KW_CONST) {
       const_def(&mut p);
     } else if is_kw(t, KW_IMPORT) {
       pm_fail(&mut p, t, "`import` lines must come first in a file, before any definition");
     } else {
       let k = fn_def(&mut p);
-      let l = p.fns;
-      p.fns = append(&mut p, l, k);
+      append_def(&mut p, DEF_FN, k);
     }
     t = peek(p);
   }

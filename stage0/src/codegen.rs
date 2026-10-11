@@ -543,6 +543,15 @@ static inline void bst_pt_put_shared(bst_pt *t, uint64_t i, bst_frame s, bool w)
 }
 #define bst_pt_take_shared bst_pt_take
 static inline bst_frame bst_pt_dup_shared(bst_pt t, uint64_t i) { return bst_shared_dup(((uint64_t *)t)[i] & BST_PTE_ADDR); }
+/* Dirty pages: taken without zeroing, so whoever takes them (under a lock,
+ * say) does not pay for it; they become frames only by being overwritten
+ * whole, which can happen later and elsewhere. */
+static inline bst_frame bst_pool_take_dirty(bst_pool *p, uint64_t i) { return p->base + i * 4096; }
+static inline uint64_t bst_dirty_id(bst_frame d) { return bst_frame_id(d); }
+static inline bst_frame bst_dirty_zero(bst_frame d) { bst_zero_page(d); return d; }
+static inline bst_frame bst_frame_copy(bst_frame d, bst_frame src) { bst_copy_fwd((unsigned char *)d, (const unsigned char *)src, 4096); return d; }
+#define bst_shared_copy bst_frame_copy
+static inline bst_frame bst_dirty_fill(bst_frame d, bst_bytes src, uint64_t s) { bst_copy_fwd((unsigned char *)d, src.data + s, 4096); return d; }
 "#;
 
 // The freestanding runtime. Part of the trusted base: the only code that
@@ -910,6 +919,8 @@ static uint64_t bst_host_cpus(bst_host h) {
 const PRELUDE_BYTES: &str = r#"
 /* Box[T]: one allocation from the same allocator as Buf. */
 static void *bst_box_alloc(uint64_t n) { return bst_alloc((n + 7) / 8).data; }
+/* The same, or 0 when out of memory (try_box). */
+static void *bst_box_try_alloc(uint64_t n) { return bst_try_alloc((n + 7) / 8).data; }
 static void bst_box_free(void *p, uint64_t n) { bst_buf w = { (n + 7) / 8, (uint64_t *)p }; bst_free(w); }
 
 /* Vec[T]: elements in one allocation that doubles when full. A size past
@@ -1283,6 +1294,7 @@ fn cty(t: &Type) -> String {
         Type::Dma => "bst_dma".into(),
         Type::Lease => "bst_lease".into(),
         Type::Shared => "bst_frame".into(),
+        Type::Dirty => "bst_frame".into(),
         Type::Struct(n) => format!("bst_s_{}", cid(n)),
         Type::Enum(n) => format!("bst_e_{}", cid(n)),
         Type::Generic(..) => unreachable!("removed by monomorphization"),
@@ -1438,6 +1450,7 @@ impl<'a> Gen<'a> {
         match &e.kind {
             ExprKind::TypeApp(targs, inner) => match &inner.kind {
                 ExprKind::Call(n, _) if n == "cast" || n == "wrap" => targs[0].clone(),
+                ExprKind::Call(n, _) if n == "try_box" => crate::check::boxed_type(&targs[0]),
                 _ => Type::Vec(Box::new(targs[0].clone())), // vec_new[T]()
             },
             ExprKind::Int(_) => Type::U64,
@@ -1594,6 +1607,22 @@ impl<'a> Gen<'a> {
             // modular conversion, so both are a plain C cast.
             ExprKind::TypeApp(targs, inner) => match &inner.kind {
                 ExprKind::Call(n, args) if n == "cast" || n == "wrap" => format!("(({})({}))", cty(&targs[0]), self.expr(&args[0])),
+                // The value first, then the box; out of memory, the value
+                // goes back in `Full`.
+                ExprKind::Call(n, args) if n == "try_box" => {
+                    let inner = targs[0].clone();
+                    if !self.boxed.contains(&inner) {
+                        self.boxed.push(inner.clone());
+                    }
+                    let Type::Enum(bn) = crate::check::boxed_type(&inner) else { unreachable!("an enum") };
+                    let (c, en) = (cty(&inner), cid(&bn));
+                    let (x, p, r) = (format!("tx_{}", self.tmps), format!("tp_{}", self.tmps), format!("tr_{}", self.tmps));
+                    self.tmps += 1;
+                    format!(
+                        "({{ {c} {x} = {}; {c} *{p} = ({c} *)bst_box_try_alloc(sizeof({c})); bst_e_{en} {r}; if ({p}) {{ *{p} = {x}; {r} = (bst_e_{en}){{ .tag = 0, .u.Ok = {p} }}; }} else {{ {r} = (bst_e_{en}){{ .tag = 1, .u.Full = {x} }}; }} {r}; }})",
+                        self.expr(&args[0])
+                    )
+                }
                 _ => "((bst_vec){ 0, 0, 0 })".to_string(), // vec_new[T]()
             },
             ExprKind::Int(v) => format!("UINT64_C({})", v),
