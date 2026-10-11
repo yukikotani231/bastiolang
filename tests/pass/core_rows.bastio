@@ -1,0 +1,23 @@
+// expect-exit: 0
+// core/rows.bastio: a table of 4-word rows grows by 3 rows. The old rows
+// keep their words, and every new row is a copy of the template, which is
+// what lets a kernel grow its process table without touching the code
+// that indexes it.
+import "core/rows.bastio";
+
+fn main() -> u64 {
+  let mut t = alloc(8);                 // two rows
+  t = set(t, 5, 42);                    // row 1, field 1
+  let mut free_row = alloc(4);
+  free_row = set(free_row, 0, 7);       // field 0: the state of a free entry
+  let mut ok = false;
+  if rows_grow(&mut t, free_row, 3) {
+    assert len(t) == 20 && get(t, 5) == 42;
+    assert get(t, 8 + 2 * 4 + 0) == 7 && get(t, 8 + 2 * 4 + 1) == 0;
+    ok = get(t, 12) == 7 && get(t, 13) == 0 && get(t, 5) == 42;
+  }
+  free(free_row);
+  free(t);
+  if ok { return 0; }
+  return 1;
+}

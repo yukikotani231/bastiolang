@@ -207,6 +207,57 @@ fn bits_new(n: u64) -> Bits
   return Bits { w: w, n: n };
 }
 
+/// Grows the map to `n` entries, the new ones clear, keeping every old
+/// entry. Returns false, with the map unchanged, when memory runs out: it
+/// never stops the program.
+fn bits_grow(b: &mut Bits, n: u64) -> bool
+  requires bits_ok(b) && b.n <= n && n <= 1152921504606846976
+  ensures bits_ok(b)
+  ensures result ==> b.n == n
+  ensures !result ==> b.n == old(b).n && vlen(b.w) == vlen(old(b).w)
+  ensures forall k: u64 :: k < old(b).n ==> bits_at(b, k) == bits_at(old(b), k)
+  ensures result ==> (forall k: u64 :: old(b).n <= k && k < n ==> !bits_at(b, k))
+{
+  let start = b.n;
+  let had = vec_len(b.w);
+  let words = (n + 63) / 64;
+  if had < words {
+    if !vec_try_reserve(&mut b.w, words - had) {
+      return false;
+    }
+  }
+  let z: u64 = 0;
+  assert forall j: u64 :: !has_bit(z, j);
+  while vec_len(b.w) < words
+    invariant had <= vlen(b.w) && (vlen(b.w) == had || vlen(b.w) <= words)
+    invariant vlen(b.w) < words ==> vcap(b.w) >= words
+    invariant forall k: u64 :: k < had ==> vget(b.w, k) == vget(old(b).w, k)
+    invariant forall k: u64 :: had <= k && k < vlen(b.w) ==> vget(b.w, k) == 0
+  {
+    vec_push_within(&mut b.w, 0);
+  }
+  b.n = n;
+  // Entries from the old end to the end of its last word may hold bits
+  // nothing promised were clear; clear them.
+  let mut stop = n;
+  if had < words {
+    stop = 64 * had;
+  }
+  assert forall k: u64 :: 64 * had <= k && k < n ==> !bits_at(b, k);
+  let mut i = start;
+  while i < stop
+    invariant start <= i && i <= stop && stop <= n && b.n == n && bits_ok(b) && vlen(b.w) >= had
+    invariant vlen(b.w) == had || stop == 64 * had
+    invariant forall k: u64 :: k < start ==> bits_at(b, k) == bits_at(old(b), k)
+    invariant forall k: u64 :: start <= k && k < i ==> !bits_at(b, k)
+    invariant forall k: u64 :: 64 * had <= k && k < n ==> !bits_at(b, k)
+  {
+    bits_clear(&mut b, i);
+    i = i + 1;
+  }
+  return true;
+}
+
 /// Frees the map's storage.
 fn bits_free(b: Bits) {
   vec_free(b.w);

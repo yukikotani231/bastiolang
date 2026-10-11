@@ -15,7 +15,9 @@
 // that was free and now holds the value, at or above the starting id and
 // below the limit, and every slot between the starting id and it was in
 // use; a failed `slots_alloc` means every slot from the starting id up to
-// the limit is in use; every function changes no slot but the one it names.
+// the limit is in use; growing never stops the program (when memory runs
+// out, `slots_alloc` says so and changes nothing); every function changes
+// no slot but the one it names.
 import "option.bastio";
 
 struct Slots[V] {
@@ -129,29 +131,41 @@ fn slots_find_free[V](s: &Slots[V], from: u64, limit: u64) -> u64
   return i;
 }
 
+/// What `slots_alloc` returns when the table had to grow and memory ran
+/// out. It is above every limit, so it is never a slot.
+const SLOTS_NOMEM: u64 = 18446744073709551615;
+
 /// Puts `v` in the lowest free slot of `from..limit`, adding slots to the
-/// table when that slot is past its end. Returns the slot, or `limit` when
-/// every slot of `from..limit` is in use (then `s` is unchanged).
+/// table when that slot is past its end. Returns the slot; `limit` when
+/// every slot of `from..limit` is in use; or `SLOTS_NOMEM` when the table
+/// had to grow and memory ran out. It never stops the program, and on
+/// either failure `s` is unchanged.
 fn slots_alloc[V](s: &mut Slots[V], from: u64, limit: u64, v: V) -> u64
   requires from <= limit && limit <= 1152921504606846976
-  ensures from <= result && result <= limit
-  ensures slots_full[V](old(s), from, result)
+  ensures result == SLOTS_NOMEM || (from <= result && result <= limit)
+  ensures result != SLOTS_NOMEM ==> slots_full[V](old(s), from, result)
   ensures result < limit ==> !slots_has[V](old(s), result) && slots_maps[V](s, result, v)
   ensures result < limit && result < vlen(old(s).vals) ==> vlen(s.vals) == vlen(old(s).vals)
   ensures result < limit && vlen(old(s).vals) <= result ==> vlen(s.vals) == result + 1
-  ensures result == limit ==> vlen(s.vals) == vlen(old(s).vals)
+  ensures result >= limit ==> vlen(s.vals) == vlen(old(s).vals)
   ensures slots_same_but[V](s, old(s), result)
 {
   let i = slots_find_free[V](s, from, limit);
   if i == limit {
     return i;
   }
+  if vec_len(s.vals) <= i {
+    if !vec_try_reserve(&mut s.vals, i + 1 - vec_len(s.vals)) {
+      return SLOTS_NOMEM;
+    }
+  }
   while vec_len(s.vals) <= i
     invariant vlen(old(s).vals) <= vlen(s.vals) && (vlen(s.vals) == vlen(old(s).vals) || vlen(s.vals) <= i + 1)
+    invariant vlen(s.vals) <= i ==> vcap(s.vals) >= i + 1
     invariant forall k: u64 :: k < vlen(old(s).vals) ==> vget(s.vals, k) == vget(old(s).vals, k)
     invariant forall k: u64 :: vlen(old(s).vals) <= k && k < vlen(s.vals) ==> vget(s.vals, k) is Option::None
   {
-    vec_push(&mut s.vals, Option[V]::None);
+    vec_push_within(&mut s.vals, Option[V]::None);
   }
   vec_set(&mut s.vals, i, Option[V]::Some(v));
   return i;

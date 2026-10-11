@@ -1,0 +1,66 @@
+// core/rows.bastio: tables of fixed-size rows in one `Buf`.
+//
+// A kernel often keeps a table as one buffer of words with a row of
+// `stride` words per entry (a process table, per-process descriptor
+// rows), and indexes it as `get(t, id * stride + field)`. `rows_grow`
+// makes such a table longer without touching the code that indexes it:
+// the old rows keep their place and contents, and every new row is a copy
+// of a template row (the "free" entry). When memory runs out it returns
+// false and leaves the table as it was, so a kernel can answer ENOMEM or
+// EAGAIN instead of stopping.
+//
+// What is proved: the new length is the old one plus `k` rows, every old
+// word is unchanged, and word `f` of every new row is word `f` of the
+// template.
+
+/// Grows `t` by `k` rows of `len(row)` words, each a copy of `row`.
+/// Returns false, with `t` unchanged, when memory runs out (or when the
+/// new length would pass 2^60).
+fn rows_grow(t: &mut Buf, row: &Buf, k: u64) -> bool
+  requires 0 < len(row)
+  ensures result ==> len(t) == len(old(t)) + k * len(row)
+  ensures !result ==> len(t) == len(old(t))
+  ensures forall j: u64 :: j < len(old(t)) ==> get(t, j) == get(old(t), j)
+  ensures result ==> (forall r: u64 :: forall f: u64 :: r < k && f < len(row) ==> get(t, len(old(t)) + r * len(row) + f) == get(row, f))
+{
+  let s = len(row);
+  let base = len(t);
+  if base > 1152921504606846976 || k > (1152921504606846976 - base) / s {
+    return false;
+  }
+  let mut nt = try_alloc(base + k * s);
+  if len(nt) != base + k * s {
+    free(nt);
+    return false;
+  }
+  let mut i = 0;
+  while i < base
+    invariant i <= base && len(nt) == base + k * s && len(t) == base
+    invariant forall j: u64 :: j < i ==> get(nt, j) == get(t, j)
+  {
+    nt = set(nt, i, get(t, i));
+    i = i + 1;
+  }
+  let mut r = 0;
+  while r < k
+    invariant r <= k && len(nt) == base + k * s
+    invariant forall j: u64 :: j < base ==> get(nt, j) == get(t, j)
+    invariant forall q: u64 :: forall f: u64 :: q < r && f < s ==> get(nt, base + q * s + f) == get(row, f)
+  {
+    let mut f = 0;
+    while f < s
+      invariant f <= s && r < k && len(nt) == base + k * s
+      invariant forall j: u64 :: j < base ==> get(nt, j) == get(t, j)
+      invariant forall q: u64 :: forall g: u64 :: q < r && g < s ==> get(nt, base + q * s + g) == get(row, g)
+      invariant forall g: u64 :: g < f ==> get(nt, base + r * s + g) == get(row, g)
+    {
+      nt = set(nt, base + r * s + f, get(row, f));
+      f = f + 1;
+    }
+    r = r + 1;
+  }
+  let prev = t;
+  t = nt;
+  free(prev);
+  return true;
+}

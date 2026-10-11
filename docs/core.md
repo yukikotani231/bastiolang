@@ -173,6 +173,7 @@ An allocation map is a `Bytes` with one byte per entry (a disk block, a page, a 
 | `bits_take(b, lo, hi, hint)` | The same, and sets the entry it returns; no other bit of any word changes (spec fn `bits_same_but`) |
 | `bits_set(b, i)`, `bits_clear(b, i)`, `bits_give(b, i)` | Set or clear entry `i` and nothing else |
 | `bits_test(b, i)`, `bits_count_clear(b, lo, hi)` | Exactly whether entry `i` is in use; a count of at most `hi - lo` |
+| `bits_grow(b, n)` | Grows the map to `n` entries, keeping every old one; the new ones are clear. Returns false, with the map unchanged, when memory runs out |
 | `bits_free(b)` | |
 
 ### `core/slots.bastio`
@@ -182,7 +183,7 @@ A growable table of numbered slots, for ids a program hands out and takes back: 
 ```text
 let mut fds = slots_new[u64]();
 let fd = slots_alloc[u64](&mut fds, 0, nofile, row);   // the lowest free descriptor below the limit
-if fd == nofile { /* EMFILE */ }
+if fd == nofile { /* EMFILE */ } else if fd == SLOTS_NOMEM { /* ENOMEM */ }
 let pid = slots_alloc[u64](&mut procs, last + 1, max, p); // search past the last id, so a dead one waits
 match slots_take[u64](&mut fds, fd) { Option::Some(row) => { ... }, Option::None => { /* EBADF */ } }
 slots_free[u64](fds);
@@ -190,7 +191,7 @@ slots_free[u64](fds);
 
 | Function | Proved |
 | --- | --- |
-| `slots_alloc(s, from, limit, v)` | Puts `v` in the lowest free slot of `from..limit` and returns it, adding slots when it is past the end; every slot from `from` up to it was in use. Returns `limit` only when all of `from..limit` is in use (spec fn `slots_full`), and then changes nothing. No other slot changes (spec fn `slots_same_but`) |
+| `slots_alloc(s, from, limit, v)` | Puts `v` in the lowest free slot of `from..limit` and returns it, adding slots when it is past the end; every slot from `from` up to it was in use. Returns `limit` only when all of `from..limit` is in use (spec fn `slots_full`), and `SLOTS_NOMEM` when the table had to grow and memory ran out; either way it changes nothing and never stops the program. No other slot changes (spec fn `slots_same_but`) |
 | `slots_find_free(s, from, limit)` | The same search, without taking the slot |
 | `slots_take(s, i)` | Frees slot `i` and returns what it held (`None` if free or past the end); nothing else changes |
 | `slots_set(s, i, v)` | Replaces the value of a slot in use (a free one is rejected, `E-VERIFY-REQUIRES`) |
@@ -198,6 +199,14 @@ slots_free[u64](fds);
 | `slots_cap(s)`, `slots_count(s)`, `slots_new()`, `slots_free(s)` | The number of slots; a count of those in use, at most the capacity |
 
 The table never shrinks: a closed descriptor's slot stays, free, for the next one.
+
+### `core/rows.bastio`
+
+A table kept as one `Buf` with a row of `stride` words per entry, indexed as `get(t, id * stride + field)`, is what a kernel's process table and descriptor rows look like. `rows_grow(t, row, k)` makes it `k` rows longer without touching the code that indexes it.
+
+| Function | Proved |
+| --- | --- |
+| `rows_grow(t, row, k)` | The length grows by `k * len(row)`; every old word is unchanged; word `f` of every new row is word `f` of the template `row` (the "free" entry). Returns false, with `t` unchanged, when memory runs out, so a kernel can answer ENOMEM instead of stopping |
 
 ### `core/csum.bastio`
 
@@ -248,5 +257,5 @@ A survey of the hand-written helpers in `stage1/`, BastiOS (`src/` and `user/`) 
 | Lookup by key: every table is a linear scan (`find_inst`, `env_find`, `find_file`, ...) | many | `HashMap`, `BytesMap` (for names and paths) |
 | Ring buffers: head and count over a fixed capacity (console output, tty input, pipes, AF_UNIX channels, the disk command queue) | 6 (BastiOS) | `Ring`, `Queue` |
 | Allocation maps, a byte or word per entry with a wrap-around search (disk blocks, pages) | 2 (BastiOS) | `core/bitmap.bastio` (`map_*` bytes, `Bits` packed) |
-| Fixed-size id tables: process table, descriptors per process, pipes, sockets (`NPROC`, `NFD`, ...) | several (BastiOS) | `Slots` |
+| Fixed-size id tables: process table, descriptors per process, pipes, sockets (`NPROC`, `NFD`, ...) | several (BastiOS) | `Slots`, `rows_grow`, `bits_grow` |
 | The Internet checksum (`cadd`, `sum16`, `csum`, `l4_sum`) | 1 (BastiOS network) | `core/csum.bastio` |

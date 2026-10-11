@@ -68,7 +68,9 @@ What will be 0.2.0.
   packed, 64 entries a word (`Bits`).
 - `core/slots`: `Slots[V]`, a growable table of numbered slots for process
   ids, file descriptors and the like, proved to hand out the lowest free
-  id at or above a starting point, under a limit.
+  id at or above a starting point, under a limit; `core/rows`'s `rows_grow`
+  for tables of fixed-size rows in one `Buf`; `bits_grow`. All three report
+  running out of memory instead of stopping the program.
 - `merge_sort_u64`, O(n log n) with the insertion sort's proof, and
   `sort_by_key_u64`, a proved stable sort of indices by a key vector;
   `BytesMap[V]`, a hash map from byte strings; `examples/wordfreq.bastio`
