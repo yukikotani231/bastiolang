@@ -136,7 +136,7 @@ Decided 2026-10-10: BastiOS should run existing Linux programs, not only program
 - [ ] Signals (none are delivered yet: `rt_sigaction` is accepted and ignored), so Ctrl-C and `kill` reach Linux programs
 - [ ] Subdirectories, once the file layer has them (Linux paths are one flat directory plus `/bin`)
 
-The layer is written in Bastio, so it is held to the same memory-safety proofs as the rest of the kernel. This is the opposite of fz, where the compatibility layer was assembly kept outside verification. User programs themselves are not trusted; page tables isolate them, so a misbehaving Linux binary can only fault itself. Only the small entry stub (saving registers on `syscall`) belongs to the trusted assembly base.
+The layer is written in Bastio, so it is held to the same memory-safety proofs as the rest of the kernel. User programs themselves are not trusted; page tables isolate them, so a misbehaving Linux binary can only fault itself. Only the small entry stub (saving registers on `syscall`) belongs to the trusted assembly base.
 
 ## v5: a general-purpose OS
 
