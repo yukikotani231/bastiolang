@@ -348,6 +348,22 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     ir_emit(&mut f, IR_LOAD, d, e.r0, e.r1, size, 0);
     return IrVal { k: IRK_INT, r0: d, r1: IR_NONE };
   }
+  if is_wrap_builtin(p, n.s, n.e) {
+    // Modular arithmetic: the same operation as `+`, `-`, `*`, whose
+    // result the emitter truncates to the type in `ty`. (The plain
+    // operators are proved not to overflow, so the two agree there.)
+    let mut op = IR_MUL;
+    if name_is(p, i, "wrap_add") {
+      op = IR_ADD;
+    } else if name_is(p, i, "wrap_sub") {
+      op = IR_SUB;
+    }
+    let a = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 0));
+    let b = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    let d = ir_reg(&mut f);
+    ir_emit(&mut f, op, d, a, b, 0, cg_int_ty(c, f.x, i));
+    return IrVal { k: IRK_INT, r0: d, r1: IR_NONE };
+  }
   if is_builtin_name(c, p, n.s, n.e) {
     ir_fail(&mut f, "a builtin outside the first subset");
     return ir_none();
