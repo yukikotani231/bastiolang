@@ -54,6 +54,10 @@ const IR_CALL: u64 = 44;     // d (and ty if a buffer) = instance a called with 
 const IR_UNREACH: u64 = 45;
 const IR_LOAD: u64 = 46;     // d = the c-byte element a[b] (c is 1 or 8; a the data address, b the index)
 const IR_STORE: u64 = 47;    // a[b] = d, c bytes (d is read here, not written)
+const IR_ALLOC: u64 = 48;    // d = a new buffer's data address, n = a elements of c bytes (1 or 8); the length register is set by a separate mov
+const IR_FREE: u64 = 49;     // frees the buffer whose data address is a
+const IR_PRINT: u64 = 50;    // prints the number a
+const IR_WRAP: u64 = 51;     // d = a truncated to the integer type ty
 
 const IR_NONE: u64 = 18446744073709551615;
 
@@ -304,6 +308,20 @@ fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
   if k == E_CALL {
     return ir_call(&mut f, c, &mut m, p, i);
   }
+  // `cast[T](x)` is proved to fit, so the value is unchanged; `wrap[T](x)`
+  // keeps the low bits.
+  if k == E_TAPP && (name_is(p, n.b, "cast") || name_is(p, n.b, "wrap")) {
+    let inner = node_at(p.nodes, n.b);
+    let a = ir_int(&mut f, c, &mut m, p, inner.a);
+    let d = ir_reg(&mut f);
+    if name_is(p, n.b, "wrap") {
+      let t = conv(&mut m, p, n.a, f.x, i);
+      ir_emit(&mut f, IR_WRAP, d, a, 0, 0, t);
+    } else {
+      ir_emit(&mut f, IR_MOV, d, a, 0, 0, 0);
+    }
+    return IrVal { k: IRK_INT, r0: d, r1: IR_NONE };
+  }
   ir_fail(&mut f, "an expression outside the first subset");
   return ir_none();
 }
@@ -363,6 +381,34 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let d = ir_reg(&mut f);
     ir_emit(&mut f, op, d, a, b, 0, cg_int_ty(c, f.x, i));
     return IrVal { k: IRK_INT, r0: d, r1: IR_NONE };
+  }
+  if name_is(p, i, "alloc") || name_is(p, i, "balloc") {
+    let mut kind = IRK_BUF;
+    let mut size = 8;
+    if name_is(p, i, "balloc") {
+      kind = IRK_BYTES;
+      size = 1;
+    }
+    let cnt = ir_int(&mut f, c, &mut m, p, n.a);
+    let d = ir_fresh(&mut f, kind);
+    // The length register is the request: a buffer is exactly n long.
+    ir_emit(&mut f, IR_ALLOC, d.r0, cnt, 0, size, 0);
+    ir_emit(&mut f, IR_MOV, d.r1, cnt, 0, 0, 0);
+    return d;
+  }
+  if name_is(p, i, "free") || name_is(p, i, "bfree") {
+    let mut kind = IRK_BUF;
+    if name_is(p, i, "bfree") {
+      kind = IRK_BYTES;
+    }
+    let b = ir_buf(&mut f, c, &mut m, p, n.a, kind);
+    ir_emit(&mut f, IR_FREE, IR_NONE, b.r0, 0, 0, 0);
+    return ir_none();
+  }
+  if name_is(p, i, "print") {
+    let a = ir_int(&mut f, c, &mut m, p, n.a);
+    ir_emit(&mut f, IR_PRINT, IR_NONE, a, 0, 0, 0);
+    return ir_none();
   }
   if is_builtin_name(c, p, n.s, n.e) {
     ir_fail(&mut f, "a builtin outside the first subset");
@@ -747,6 +793,22 @@ fn ir_print(out: &mut Vec[u64], f: &IrFn, m: &Mono, p: &Parser) {
       ir_w_reg(&mut out, q.b);
       w_s(&mut out, "], ");
       ir_w_reg(&mut out, q.d);
+    } else if q.op == IR_ALLOC {
+      ir_w_reg(&mut out, q.d);
+      w_s(&mut out, " = alloc");
+      w_num(&mut out, wrap_mul(q.c, 8));
+      w_s(&mut out, " ");
+      ir_w_reg(&mut out, q.a);
+    } else if q.op == IR_FREE {
+      w_s(&mut out, "free ");
+      ir_w_reg(&mut out, q.a);
+    } else if q.op == IR_PRINT {
+      w_s(&mut out, "print ");
+      ir_w_reg(&mut out, q.a);
+    } else if q.op == IR_WRAP {
+      ir_w_reg(&mut out, q.d);
+      w_s(&mut out, " = wrap ");
+      ir_w_reg(&mut out, q.a);
     } else if q.op == IR_UNREACH {
       w_s(&mut out, "unreachable");
     } else if q.op == IR_CALL {
