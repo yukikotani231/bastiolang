@@ -85,12 +85,14 @@ struct IrFn {
   vars: Vec[IrVar],
   /// What stopped the lowering: set at the first thing not handled.
   failed: bool,
-  why: Vec[u64]
+  why: Vec[u64],
+  /// The `&mut Buf` / `&mut Bytes` parameters: per parameter its address, data and length registers.
+  lent: Vec[u64]
 }
 
 fn ir_new(x: u64) -> IrFn {
   return IrFn { x: x, params: vec_new[u64](), ins: vec_new[IrIns](), args: vec_new[u64](), nreg: 0, nlabel: 0,
-    vars: vec_new[IrVar](), failed: false, why: vec_new[u64]() };
+    vars: vec_new[IrVar](), failed: false, why: vec_new[u64](), lent: vec_new[u64]() };
 }
 
 fn ir_free(f: IrFn) {
@@ -99,6 +101,7 @@ fn ir_free(f: IrFn) {
   vec_free(f.args);
   vec_free(f.vars);
   vec_free(f.why);
+  vec_free(f.lent);
 }
 
 fn ir_fail(f: &mut IrFn, why: Str) {
@@ -615,6 +618,11 @@ fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       }
       v = ir_rv(&mut f, c, m, p, v);
     }
+    if seg == 0 && (v.k == IRK_BUF || v.k == IRK_BYTES) {
+      // A lent buffer stays the caller's: it is never freed or replaced
+      // while lent, so its registers stay valid.
+      return v;
+    }
     if seg != 0 || v.k != IRK_VEC {
       ir_fail(&mut f, "a borrow of something that is not a vector or a struct in memory");
       return ir_none();
@@ -1119,6 +1127,24 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     ir_hdr_store(&mut f, v.r0, 0, len1);
     return ir_none();
   }
+  if name_is(p, i, "set") || name_is(p, i, "bset") {
+    // `bset(&mut b, i, v)` changes the buffer in place.
+    let mut kind = IRK_BUF;
+    let mut size = 8;
+    if name_is(p, i, "bset") {
+      kind = IRK_BYTES;
+      size = 1;
+    }
+    let a1 = next_of(p, n.a);
+    let a2 = next_of(p, a1);
+    let b = ir_buf(&mut f, c, &mut m, p, n.a, kind);
+    let ix = ir_int(&mut f, c, &mut m, p, a1);
+    let v = ir_int(&mut f, c, &mut m, p, a2);
+    if !f.failed {
+      ir_emit(&mut f, IR_STORE, v, b.r0, ix, size, 0);
+    }
+    return ir_none();
+  }
   if name_is(p, i, "vec_free") {
     let v = ir_vec_arg(&mut f, c, &mut m, p, n.a);
     if f.failed {
@@ -1167,6 +1193,7 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
   }
   let callee = plain_inst(&mut m, def);
   let mut regs = vec_new[u64]();
+  let mut lent = vec_new[u64]();
   let mut a = n.a;
   let cdef = inst_at(m, callee);
   let cdn = node_at(p.nodes, cdef.def);
@@ -1230,6 +1257,17 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
           w = w + 1;
         }
       }
+    } else if pt_kind == TY_MUTREF && (v.k == IRK_BUF || v.k == IRK_BYTES) {
+      // A lent buffer goes by address of its two words (length, then data);
+      // the callee cannot replace it, so nothing is copied back.
+      let slot = ir_reg(&mut f);
+      ir_emit(&mut f, IR_SLOT, slot, 0, 0, 2, 0);
+      ir_hdr_store(&mut f, slot, 0, v.r1);
+      ir_hdr_store(&mut f, slot, 1, v.r0);
+      vec_push(&mut regs, slot);
+      vec_push(&mut lent, slot);
+      vec_push(&mut lent, v.r0);
+      vec_push(&mut lent, v.r1);
     } else if ir_multi(v.k) {
       let mut w = 0;
       while w < v.r1 && w < 64 {
@@ -1253,12 +1291,14 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
   let count = vec_len(regs);
   vec_free(regs);
   if f.failed {
+    vec_free(lent);
     return ir_none();
   }
   let rt = cg_ret_ty(&mut m, p, callee);
   let rk = ir_kind(c, m, p, rt);
   if rk == 0 && kind_t(m, rt) != TY_UNIT {
     ir_fail(&mut f, "a call with a result that is not an integer or a buffer");
+    vec_free(lent);
     return ir_none();
   }
   let mut d = IrVal { k: 0, r0: IR_NONE, r1: IR_NONE, t: 0 };
@@ -1274,6 +1314,8 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     }
     let slot = ir_reg(&mut f);
     ir_emit(&mut f, IR_CALLM, slot, callee, first, count, w);
+    ir_take_back(&mut f, lent);
+    vec_free(lent);
     if rk == IRK_VEC {
       return IrVal { k: IRK_VEC, r0: slot, r1: IR_NONE, t: ir_vt(inner_t(m, base_t(m, rt)), 0) };
     }
@@ -1289,7 +1331,41 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
   } else {
     ir_emit(&mut f, IR_CALL, d.r0, callee, first, count, d.r1);
   }
+  ir_take_back(&mut f, lent);
+  vec_free(lent);
   return d;
+}
+
+/// Before a return: the lent buffers go back to their callers' words, since
+/// the function may have replaced them.
+fn ir_give_back(f: &mut IrFn) {
+  let mut j = 0;
+  while wrap_add(j, 2) < vec_len(f.lent) && j < 1000000 {
+    let a = vec_get(f.lent, j);
+    let data = vec_get(f.lent, wrap_add(j, 1));
+    let len = vec_get(f.lent, wrap_add(j, 2));
+    ir_hdr_store(&mut f, a, 0, len);
+    ir_hdr_store(&mut f, a, 1, data);
+    j = j + 3;
+  }
+}
+
+/// After a call: the lent buffers (slot, data, length registers of the
+/// caller's variable) are read back, since the callee may have replaced them.
+fn ir_take_back(f: &mut IrFn, lent: &Vec[u64]) {
+  let mut j = 0;
+  while wrap_add(j, 2) < vec_len(lent) && j < 1000000 {
+    let slot = vec_get(lent, j);
+    let data = vec_get(lent, wrap_add(j, 1));
+    let len = vec_get(lent, wrap_add(j, 2));
+    let k1 = ir_reg(&mut f);
+    ir_emit(&mut f, IR_CONST, k1, 1, 0, 0, 0);
+    ir_emit(&mut f, IR_LOAD, data, slot, k1, 8, 0);
+    let k0 = ir_reg(&mut f);
+    ir_emit(&mut f, IR_CONST, k0, 0, 0, 0, 0);
+    ir_emit(&mut f, IR_LOAD, len, slot, k0, 8, 0);
+    j = j + 3;
+  }
 }
 
 fn ir_block(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, head: u64) {
@@ -1400,12 +1476,14 @@ fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     ir_place(&mut f, l_end);
   } else if k == S_RETURN {
     if n.a == 0 {
+      ir_give_back(&mut f);
       ir_emit(&mut f, IR_RET, IR_NONE, IR_NONE, IR_NONE, 0, 0);
     } else {
       let v = ir_vexpr(&mut f, c, &mut m, p, n.a);
       if f.failed {
         return;
       }
+      ir_give_back(&mut f);
       if v.k == IRK_VEC {
         ir_emit(&mut f, IR_RET, IR_NONE, v.r0, IR_NONE, 3, 0);
       } else if ir_multi(v.k) && v.r1 > 2 {
@@ -1576,8 +1654,18 @@ fn ir_lower(c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> IrFn {
       if first {
         tyn_to(&mut f.why, m, p, pt);
       }
+    } else if kind_t(m, pt) == TY_MUTREF && (pk == IRK_BUF || pk == IRK_BYTES) {
+      // Lent by the address of its two words (length, then data).
+      let a = ir_reg(&mut f);
+      vec_push(&mut f.params, a);
+      let data = ir_hdr_load(&mut f, a, 1);
+      let len = ir_hdr_load(&mut f, a, 0);
+      ir_bind(&mut f, qn.s, qn.e, IrVal { k: pk, r0: data, r1: len, t: 0 });
+      vec_push(&mut f.lent, a);
+      vec_push(&mut f.lent, data);
+      vec_push(&mut f.lent, len);
     } else if kind_t(m, pt) == TY_MUTREF && pk != IRK_VEC {
-      ir_fail(&mut f, "a `&mut` parameter that is not a Vec");
+      ir_fail(&mut f, "a `&mut` parameter that is not a Vec, a Buf or a Bytes");
     } else {
       let mut r = ir_new_val(&mut f, pk, ir_words(c, m, p, pt, 0), base_t(m, pt));
       if pk == IRK_VEC {
@@ -1619,6 +1707,7 @@ fn ir_lower(c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> IrFn {
   }
   if !f.failed {
     ir_block(&mut f, c, &mut m, p, dn.x);
+    ir_give_back(&mut f);
     ir_emit(&mut f, IR_RET, IR_NONE, IR_NONE, IR_NONE, 0, 0);
     ir_trim(&mut f);
   }
