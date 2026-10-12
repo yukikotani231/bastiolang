@@ -21,7 +21,7 @@ import "render.bastio";
 // Operations. `d` is the register written, `a`, `b`, `c` the operands.
 const IR_CONST: u64 = 1;     // d = a (an immediate)
 const IR_MOV: u64 = 2;       // d = a
-const IR_ADD: u64 = 3;
+const IR_ADD: u64 = 3;      // (ADD, SUB and MUL with c = 1 wrap: the result is truncated to the integer type ty)
 const IR_SUB: u64 = 4;
 const IR_MUL: u64 = 5;
 const IR_DIV: u64 = 6;       // unsigned
@@ -666,9 +666,10 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
   }
   if is_wrap_builtin(p, n.s, n.e) {
-    // Modular arithmetic: the same operation as `+`, `-`, `*`, whose
-    // result the emitter truncates to the type in `ty`. (The plain
-    // operators are proved not to overflow, so the two agree there.)
+    // Modular arithmetic: the same operation as `+`, `-`, `*`, marked by
+    // `c` = 1, whose result the emitter truncates to the type in `ty`. (The
+    // plain operators are proved not to overflow, so they need no
+    // truncation and have `c` = 0.)
     let mut op = IR_MUL;
     if name_is(p, i, "wrap_add") {
       op = IR_ADD;
@@ -678,7 +679,7 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let a = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 0));
     let b = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
     let d = ir_reg(&mut f);
-    ir_emit(&mut f, op, d, a, b, 0, cg_int_ty(c, f.x, i));
+    ir_emit(&mut f, op, d, a, b, 1, cg_int_ty(c, f.x, i));
     return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
   }
   if name_is(p, i, "vec_len") {
@@ -1097,6 +1098,8 @@ fn ir_lower(c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> IrFn {
     let pk = ir_kind(c, m, p, pt);
     if pk == 0 {
       ir_fail(&mut f, "a parameter that is not an integer, bool, buffer, struct, enum or Vec");
+    } else if kind_t(m, pt) == TY_MUTREF && pk != IRK_VEC {
+      ir_fail(&mut f, "a `&mut` parameter that is not a Vec");
     } else {
       let mut r = ir_new_val(&mut f, pk, ir_words(c, m, p, pt, 0), base_t(m, pt));
       if pk == IRK_VEC && kind_t(m, pt) != TY_MUTREF {
@@ -1330,6 +1333,9 @@ fn ir_print(out: &mut Vec[u64], f: &IrFn, m: &Mono, p: &Parser) {
     } else {
       ir_w_reg(&mut out, q.d);
       w_s(&mut out, " = ");
+      if q.c == 1 {
+        w_s(&mut out, "w");
+      }
       w_s(&mut out, ir_op_name(q.op));
       w_s(&mut out, " ");
       ir_w_reg(&mut out, q.a);

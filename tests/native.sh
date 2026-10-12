@@ -5,6 +5,10 @@
 # output (stdin empty). A program using something the native backend does
 # not support yet is reported as skipped; anything else that differs fails.
 #
+# BACKEND=native-ir tests/native.sh builds the native side with
+# `--backend native-ir` instead (the functions the IR covers are written from
+# it, stage1/irx86.bastio); the C backend stays the reference.
+#
 # tests/native.sh --stage1 instead runs stage1/difftest.sh with the tools of
 # the self-hosted compiler built by the native backend (by the C backend
 # when it does not support one yet): large programs whose output is checked
@@ -45,7 +49,7 @@ both() {
   if ! "$BASTIOC" -o "$w/c.exe" "$f" 2>/dev/null; then
     echo "FAIL $f: the C backend rejected it"; echo =fail; return
   fi
-  "$BASTIOC" --backend native -o "$w/x.exe" "$f" 2>"$w/err"; rc=$?
+  "$BASTIOC" --backend "${BACKEND:-native}" -o "$w/x.exe" "$f" 2>"$w/err"; rc=$?
   if [ $rc = 4 ]; then echo "skip $f: $(grep -o 'does not support.*' "$w/err" | head -1)"; echo =skip; return; fi
   if [ $rc != 0 ]; then echo "FAIL $f: native build failed"; sed 's/^/    /' "$w/err" | head -20; echo =fail; return; fi
   "$w/c.exe" </dev/null >"$w/c.out" 2>/dev/null; cs=$?
