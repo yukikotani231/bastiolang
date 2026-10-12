@@ -802,7 +802,7 @@ fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let path = node_at(p.nodes, n.a);
     let mut v = ir_find(f, p, path.s, path.e);
     let mut seg = path.next;
-    while seg != 0 && v.k == IRK_PLACE && !f.failed {
+    while seg != 0 && (v.k == IRK_PLACE || v.k == IRK_BOX || v.k == IRK_STRUCT) && !f.failed {
       let sn = node_at(p.nodes, seg);
       v = ir_field(&mut f, c, m, p, v, sn.s, sn.e);
       seg = sn.next;
@@ -815,13 +815,14 @@ fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       if uk == TY_STRUCT || uk == TY_ENUM {
         return v;
       }
-      if ir_kind(c, m, p, base_t(m, v.t)) == IRK_INT {
-        // A scalar field in memory: lent by its address.
+      let fk = ir_kind(c, m, p, base_t(m, v.t));
+      if fk == IRK_INT || fk == IRK_BOX {
+        // A scalar or Box field in memory: lent by its address.
         return v;
       }
       v = ir_rv(&mut f, c, m, p, v);
     }
-    if seg == 0 && (v.k == IRK_INT || v.k == IRK_BUF || v.k == IRK_BYTES || ir_multi(v.k)) {
+    if seg == 0 && (v.k == IRK_INT || v.k == IRK_BOX || v.k == IRK_BUF || v.k == IRK_BYTES || ir_multi(v.k)) {
       // A lent buffer stays the caller's: it is never freed or replaced
       // while lent, so its registers stay valid.
       return v;
@@ -1391,6 +1392,10 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     if !f.failed {
       ir_emit(&mut f, IR_STORE, v, b.r0, ix, size, 0);
     }
+    if kind == IRK_BUF && !f.failed {
+      // `set` gives the buffer back (its argument is consumed).
+      return b;
+    }
     return ir_none();
   }
   if name_is(p, i, "bcopy") {
@@ -1601,10 +1606,10 @@ fn ir_call_to(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, calle
       } else {
         ir_fail(&mut f, "a borrowed argument of another kind");
       }
-    } else if pt_kind == TY_MUTREF && v.k == IRK_PLACE && ir_kind(c, m, p, pu) == IRK_INT {
+    } else if pt_kind == TY_MUTREF && v.k == IRK_PLACE && (ir_kind(c, m, p, pu) == IRK_INT || ir_kind(c, m, p, pu) == IRK_BOX) {
       // A scalar in memory (a field): its address.
       vec_push(&mut regs, ir_paddr(&mut f, v));
-    } else if pt_kind == TY_MUTREF && v.k == IRK_INT {
+    } else if pt_kind == TY_MUTREF && (v.k == IRK_INT || v.k == IRK_BOX) {
       // A scalar variable: its word goes to a slot, the callee gets the
       // address, and the word is read back after the call.
       let slot = ir_reg(&mut f);
@@ -2023,6 +2028,9 @@ fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     let e = node_at(p.nodes, n.a);
     if e.kind == E_CALL {
       ir_call(&mut f, c, &mut m, p, n.a);
+    } else if e.kind == E_TAPP {
+      // `f[T](..)` as a statement: the result, if any, is dropped.
+      ir_expr(&mut f, c, &mut m, p, n.a);
     } else {
       ir_fail(&mut f, "an expression statement that is not a call");
     }
@@ -2123,11 +2131,12 @@ fn ir_lower(c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> IrFn {
       vec_push(&mut f.lent, a);
       vec_push(&mut f.lent, data);
       vec_push(&mut f.lent, len);
-    } else if kind_t(m, pt) == TY_MUTREF && pk == IRK_INT {
-      // A scalar lent by address: its word is ours until the function returns.
+    } else if kind_t(m, pt) == TY_MUTREF && (pk == IRK_INT || pk == IRK_BOX) {
+      // A scalar or Box lent by address: its word is ours until the function
+      // returns.
       let a = ir_reg(&mut f);
       vec_push(&mut f.params, a);
-      let w = ir_new_val(&mut f, IRK_INT, 1, 0);
+      let w = ir_new_val(&mut f, pk, 1, base_t(m, pt));
       ir_load_words(&mut f, a, 0, w.r0, 1);
       ir_bind(&mut f, qn.s, qn.e, w);
       vec_push(&mut f.lent, a);
