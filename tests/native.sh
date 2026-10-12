@@ -74,6 +74,19 @@ for r in examples/*/run.sh; do
     echo "FAIL $r with the native backend"; sed 's/^/    /' "$tmp/lib.out" | tail -20; lost=1
   fi
 done
+# With the IR emitter, bastioc1 built through it compiles itself to the very
+# assembly that the C-built bastioc1 writes with the same backend (a fixed
+# point): the code the IR path writes for the compiler is the compiler's.
+if [ "${BACKEND:-native}" = native-ir ]; then
+  if "$BASTIOC" --backend native-ir -o "$tmp/b1" stage1/bastioc1.bastio >/dev/null 2>&1 \
+     && "$BASTIOC" --backend native-ir --emit-asm -o "$tmp/a.s" stage1/bastioc1.bastio >/dev/null 2>&1 \
+     && "$tmp/b1" --backend native-ir --emit-asm -o "$tmp/b.s" stage1/bastioc1.bastio >/dev/null 2>&1 \
+     && cmp -s "$tmp/a.s" "$tmp/b.s"; then
+    echo "ok   bastioc1 built through the IR compiles itself to the same assembly"
+  else
+    echo "FAIL bastioc1 built through the IR does not reproduce its own assembly"; lost=1
+  fi
+fi
 pass=$(n pass) skip=$(n skip) fail=$(($(n fail) + lost))
 echo "native: $pass same as the C backend, $skip skipped (unsupported), $fail failed; $libs libraries pass their C harnesses"
 [ $fail = 0 ]
