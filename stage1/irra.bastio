@@ -31,6 +31,10 @@ const RA_SPILL: u64 = 3;     // frame spill slot `idx`
 struct IrAlloc {
   cls: Vec[u64],
   idx: Vec[u64],
+  /// With `ra_alloc_const`: 1 for a register that is a constant (written
+  /// once, by an `IR_CONST`), which takes no machine register; its value.
+  cst: Vec[u64],
+  cv: Vec[u64],
   /// Spill slots used.
   nspill: u64,
   /// Callee-saved registers used (the first `ncallee_used` of the pool).
@@ -40,6 +44,8 @@ struct IrAlloc {
 fn ra_free(a: IrAlloc) {
   vec_free(a.cls);
   vec_free(a.idx);
+  vec_free(a.cst);
+  vec_free(a.cv);
 }
 
 fn ra_set(v: &mut Vec[u64], i: u64, x: u64) {
@@ -351,6 +357,17 @@ fn ra_intervals(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> IrIntervals {
 /// Allocates the registers of `f` with `ncallee` callee-saved and `ncaller`
 /// caller-saved machine registers.
 fn ra_alloc(f: &IrFn, ncallee: u64, ncaller: u64) -> IrAlloc {
+  return ra_alloc_with(f, ncallee, ncaller, false);
+}
+
+/// `ra_alloc`, except that a register written once, by a constant, is left
+/// out and recorded in `cst` and `cv` for the emitter to use as an
+/// immediate.
+fn ra_alloc_const(f: &IrFn, ncallee: u64, ncaller: u64) -> IrAlloc {
+  return ra_alloc_with(f, ncallee, ncaller, true);
+}
+
+fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc {
   let bl = ra_blocks(f);
   let lv = ra_live(f, bl);
   let iv = ra_intervals(f, bl, lv);
@@ -365,12 +382,52 @@ fn ra_alloc(f: &IrFn, ncallee: u64, ncaller: u64) -> IrAlloc {
     }
     i = i + 1;
   }
-  let mut al = IrAlloc { cls: vec_new[u64](), idx: vec_new[u64](), nspill: 0, ncallee_used: 0 };
+  let mut al = IrAlloc { cls: vec_new[u64](), idx: vec_new[u64](), cst: vec_new[u64](), cv: vec_new[u64](), nspill: 0, ncallee_used: 0 };
   let mut r = 0;
   while r < nr && r < 1000000000 {
     vec_push(&mut al.cls, RA_NONE);
     vec_push(&mut al.idx, 0);
+    vec_push(&mut al.cst, 0);
+    vec_push(&mut al.cv, 0);
     r = r + 1;
+  }
+  if consts {
+    // Registers written once, by a constant (a parameter is a write too).
+    let mut ndef = vec_new[u64]();
+    r = 0;
+    while r < nr && r < 1000000000 {
+      vec_push(&mut ndef, 0);
+      r = r + 1;
+    }
+    let mut j = 0;
+    while j < vec_len(f.params) {
+      let pr = vec_get(f.params, j);
+      ra_set(&mut ndef, pr, wrap_add(u_at(ndef, pr), 1));
+      j = j + 1;
+    }
+    j = 0;
+    while j < n {
+      let mut ws = vec_new[u64]();
+      ra_writes(vec_get(f.ins, j), &mut ws);
+      let mut w = 0;
+      while w < vec_len(ws) {
+        let wr = vec_get(ws, w);
+        ra_set(&mut ndef, wr, wrap_add(u_at(ndef, wr), 1));
+        w = w + 1;
+      }
+      vec_free(ws);
+      j = j + 1;
+    }
+    j = 0;
+    while j < n {
+      let q = vec_get(f.ins, j);
+      if q.op == IR_CONST && u_at(ndef, q.d) == 1 {
+        ra_set(&mut al.cst, q.d, 1);
+        ra_set(&mut al.cv, q.d, q.a);
+      }
+      j = j + 1;
+    }
+    vec_free(ndef);
   }
   // Registers by order of interval start.
   let mut order = vec_new[u64]();
@@ -378,7 +435,7 @@ fn ra_alloc(f: &IrFn, ncallee: u64, ncaller: u64) -> IrAlloc {
   while pos <= n && pos < 1000000000 {
     let mut v = 0;
     while v < nr {
-      if u_at(iv.lo, v) == pos {
+      if u_at(iv.lo, v) == pos && u_at(al.cst, v) == 0 {
         vec_push(&mut order, v);
       }
       v = v + 1;
@@ -398,6 +455,10 @@ fn ra_alloc(f: &IrFn, ncallee: u64, ncaller: u64) -> IrAlloc {
     vec_push(&mut busy_caller, 0);
     k = k + 1;
   }
+  // For the emitter (`consts`): a register may take the machine register of
+  // one whose last use is the instruction that writes it, as the emitter
+  // reads every operand of an instruction before it writes the result.
+  let touch = consts;
   let mut o = 0;
   while o < vec_len(order) {
     let v = vec_get(order, o);
@@ -419,7 +480,7 @@ fn ra_alloc(f: &IrFn, ncallee: u64, ncaller: u64) -> IrAlloc {
       let mut m = 0;
       while m < vec_len(busy_caller) && !placed {
         let until = vec_get(busy_caller, m);
-        if until == 0 || until <= lo {
+        if until == 0 || until <= lo || (touch && lo > 0 && until <= lo + 1) {
           vec_set(&mut busy_caller, m, wrap_add(hi, 1));
           ra_set(&mut al.cls, v, RA_CALLER);
           ra_set(&mut al.idx, v, m);
@@ -432,7 +493,7 @@ fn ra_alloc(f: &IrFn, ncallee: u64, ncaller: u64) -> IrAlloc {
       let mut m = 0;
       while m < vec_len(busy_callee) && !placed {
         let until = vec_get(busy_callee, m);
-        if until == 0 || until <= lo {
+        if until == 0 || until <= lo || (touch && lo > 0 && until <= lo + 1) {
           vec_set(&mut busy_callee, m, wrap_add(hi, 1));
           ra_set(&mut al.cls, v, RA_CALLEE);
           ra_set(&mut al.idx, v, m);
