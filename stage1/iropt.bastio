@@ -10,6 +10,8 @@
 // in a slot so the `vec_*` forms can address the header) costs today: every
 // `vec_len` and every element access reads the header from the frame.
 //
+// `iropt_copies` (copy propagation) follows it; see docs/ir.md.
+//
 // A slot whose address is read in any other way (passed to a call, handed to
 // `vgrow`, returned from, added to, stored) stays in memory. A word that is
 // read before the first instruction that writes it (the lowering does not
@@ -185,4 +187,197 @@ fn iropt_first_is_load(f: &IrFn, j: u64, s: u64, k: u64, cv: &Vec[u64]) -> bool 
     n = n + 1;
   }
   return false;
+}
+
+/// `q` with every read of register `from` replaced by `to` (the argument
+/// registers of a call are renamed by the caller).
+fn iropt_rename(q: IrIns, from: u64, to: u64) -> IrIns {
+  let mut r = q;
+  let op = q.op;
+  if ra_is_binary(op) || op == IR_LOAD {
+    if r.a == from {
+      r.a = to;
+    }
+    if r.b == from {
+      r.b = to;
+    }
+  } else if op == IR_MOV || op == IR_NOT || op == IR_NEG || op == IR_WRAP || op == IR_ALLOC || op == IR_FREE
+    || op == IR_PRINT || op == IR_VGROW || op == IR_BR {
+    if r.a == from {
+      r.a = to;
+    }
+  } else if op == IR_RET {
+    if r.a == from {
+      r.a = to;
+    }
+    if r.b == from {
+      r.b = to;
+    }
+  } else if op == IR_STORE {
+    if r.d == from {
+      r.d = to;
+    }
+    if r.a == from {
+      r.a = to;
+    }
+    if r.b == from {
+      r.b = to;
+    }
+  }
+  return r;
+}
+
+/// Copy propagation: `d = mov a`, where `d` and `a` are each written once
+/// (a parameter counts as a write), makes `d` a second name for `a`. Every
+/// read of `d` becomes a read of `a` and the `mov` goes. `a` must keep the
+/// value it had at the `mov` until the last read of `d`: `a` is a
+/// parameter, or its definition comes before the `mov` and no label (so no
+/// jump that could skip the `mov` or re-run the definition) lies between
+/// that definition and the last read of `d`; and `d` is not read before the
+/// `mov`. Returns how many copies it removed.
+fn iropt_copies(f: &mut IrFn) -> u64 {
+  let mut total = 0;
+  let mut again = true;
+  let mut rounds = 0;
+  while again && rounds < 64 {
+    again = false;
+    rounds = rounds + 1;
+    let n = vec_len(f.ins);
+    let ndef = iropt_ndef(f);
+    // Per register: where it is written (IR_NONE: not by an instruction),
+    // and its first and last read (IR_NONE: never).
+    let mut defpos = vec_new[u64]();
+    let mut first = vec_new[u64]();
+    let mut last = vec_new[u64]();
+    let mut r = 0;
+    while r < f.nreg && r < 1000000000 {
+      vec_push(&mut defpos, IR_NONE);
+      vec_push(&mut first, IR_NONE);
+      vec_push(&mut last, IR_NONE);
+      r = r + 1;
+    }
+    // labels[i]: how many labels lie in instructions 0 .. i - 1.
+    let mut labels = vec_new[u64]();
+    let mut i = 0;
+    while i < n {
+      let q = vec_get(f.ins, i);
+      vec_push(&mut labels, 0);
+      let mut ws = vec_new[u64]();
+      ra_writes(q, &mut ws);
+      let mut j = 0;
+      while j < vec_len(ws) {
+        ra_set(&mut defpos, vec_get(ws, j), i);
+        j = j + 1;
+      }
+      vec_free(ws);
+      let mut rs = vec_new[u64]();
+      ra_reads(f, q, &mut rs);
+      j = 0;
+      while j < vec_len(rs) {
+        let rr = vec_get(rs, j);
+        if u_at(first, rr) == IR_NONE {
+          ra_set(&mut first, rr, i);
+        }
+        ra_set(&mut last, rr, i);
+        j = j + 1;
+      }
+      vec_free(rs);
+      i = i + 1;
+    }
+    vec_push(&mut labels, 0);
+    i = 0;
+    while i <= n {
+      let mut prev = 0;
+      if i > 0 {
+        prev = u_at(labels, wrap_sub(i, 1));
+      }
+      let mut isl = 0;
+      if i > 0 {
+        let pq = vec_get(f.ins, wrap_sub(i, 1));
+        if pq.op == IR_LABEL {
+          isl = 1;
+        }
+      }
+      ra_set(&mut labels, i, wrap_add(prev, isl));
+      i = i + 1;
+    }
+    // Pick the copies to remove in this round: no source is itself a
+    // copy removed in the same round (the next round takes those).
+    let mut isdst = vec_new[u64]();
+    r = 0;
+    while r < f.nreg && r < 1000000000 {
+      vec_push(&mut isdst, 0);
+      r = r + 1;
+    }
+    let mut pick = vec_new[u64]();
+    i = 0;
+    while i < n {
+      let q = vec_get(f.ins, i);
+      if q.op == IR_MOV && q.d != q.a && q.d < f.nreg && q.a < f.nreg && u_at(ndef, q.d) == 1 && u_at(ndef, q.a) == 1
+        && u_at(isdst, q.a) == 0 && u_at(first, q.d) != IR_NONE && u_at(first, q.d) > i {
+        let pa = u_at(defpos, q.a);
+        let lu = u_at(last, q.d);
+        let mut ok = false;
+        if pa == IR_NONE {
+          ok = true;
+        } else if pa < i && lu >= i {
+          // No label among instructions pa + 1 .. lu.
+          let upto = wrap_add(lu, 1);
+          ok = u_at(labels, upto) == u_at(labels, wrap_add(pa, 1));
+        }
+        if ok {
+          ra_set(&mut isdst, q.d, 1);
+          vec_push(&mut pick, i);
+        }
+      }
+      i = i + 1;
+    }
+    if vec_len(pick) > 0 {
+      again = true;
+      total = wrap_add(total, vec_len(pick));
+      let mut out = vec_new[IrIns]();
+      i = 0;
+      while i < n {
+        let mut q = vec_get(f.ins, i);
+        let mut drop = false;
+        let mut k = 0;
+        while k < vec_len(pick) {
+          let pi = vec_get(pick, k);
+          if pi < vec_len(f.ins) {
+            let m = vec_get(f.ins, pi);
+            if pi == i {
+              drop = true;
+            } else {
+              q = iropt_rename(q, m.d, m.a);
+              if q.op == IR_CALL || q.op == IR_CALLM {
+                let mut j = 0;
+                while j < q.c && j < 4096 {
+                  let ai = wrap_add(q.b, j);
+                  if u_at(f.args, ai) == m.d {
+                    ra_set(&mut f.args, ai, m.a);
+                  }
+                  j = j + 1;
+                }
+              }
+            }
+          }
+          k = k + 1;
+        }
+        if !drop {
+          vec_push(&mut out, q);
+        }
+        i = i + 1;
+      }
+      vec_free(f.ins);
+      f.ins = out;
+    }
+    vec_free(pick);
+    vec_free(isdst);
+    vec_free(labels);
+    vec_free(last);
+    vec_free(first);
+    vec_free(defpos);
+    vec_free(ndef);
+  }
+  return total;
 }
