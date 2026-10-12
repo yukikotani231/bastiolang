@@ -1,0 +1,69 @@
+// Vectors of elements of several words: reading, writing, pushing, popping
+// and swapping them in place, through a local, a `&mut Vec` and a field.
+// `main` stays with the old generator (it holds a `Bag` by value), so the
+// vectors cross between it and the functions lowered from the IR.
+struct Pt { x: u64, y: u64 }
+
+struct Bag { pts: Vec[Pt], n: u64 }
+
+fn fill(v: &mut Vec[Pt], k: u64)
+  requires k < 50 && vlen(v) == 0
+  ensures vlen(v) == k
+{
+  let mut i = 0;
+  while i < k
+    invariant i <= k && vlen(v) == i
+  {
+    vec_push(&mut v, Pt { x: i, y: i * 2 });
+    i = i + 1;
+  }
+}
+
+fn sum_y(v: &Vec[Pt]) -> u64 {
+  let mut t = 0;
+  let mut i = 0;
+  while i < vec_len(v)
+    invariant i <= vlen(v)
+  {
+    let e = vec_get(v, i);
+    t = wrap_add(t, e.y);
+    i = i + 1;
+  }
+  return t;
+}
+
+fn bump_last(v: &mut Vec[Pt])
+  requires vlen(v) > 0
+  ensures vlen(v) == old(vlen(v)) + 1
+{
+  let last = vec_pop(&mut v);
+  vec_push(&mut v, Pt { x: wrap_add(last.x, 100), y: last.y });
+  let prev = vec_swap(&mut v, 0, Pt { x: 1, y: 1 });
+  vec_push(&mut v, prev);
+}
+
+fn grow_bag(b: &mut Bag) {
+  vec_push(&mut b.pts, Pt { x: 5, y: 7 });
+  b.n = wrap_add(b.n, 1);
+}
+
+fn gen_sum(v: &Vec[Pt]) -> u64 {
+  let s = "g";
+  return wrap_add(sum_y(v), slen(s));
+}
+
+fn main() -> u64 {
+  let mut v = vec_new[Pt]();
+  fill(&mut v, 5);                 // y: 0 2 4 6 8
+  bump_last(&mut v);               // [ (104,8), y 2 4 6 -> (x 4,y 6) at end ]
+  let a = gen_sum(v);              // 0+... see below
+  let first = vec_get(v, 0);
+  vec_set(&mut v, 1, Pt { x: 9, y: 9 });
+  let b = wrap_add(first.x, sum_y(v));
+  let mut bag = Bag { pts: v, n: 0 };
+  grow_bag(&mut bag);
+  grow_bag(&mut bag);
+  let c = wrap_add(sum_y(bag.pts), bag.n);
+  vec_free(bag.pts);
+  return wrap_add(wrap_add(a, b), c) % 256;
+}

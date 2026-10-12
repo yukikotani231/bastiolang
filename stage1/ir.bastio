@@ -299,8 +299,11 @@ fn ir_kind(c: &Checker, m: &Mono, p: &Parser, t: u64) -> u64 {
   if kind_t(m, u) == TY_ENUM && ir_words(c, m, p, u, 0) != IR_NONE {
     return IRK_ENUM;
   }
-  if kind_t(m, u) == TY_VEC && ir_words(c, m, p, inner_t(m, u), 1) == 1 {
-    return IRK_VEC;
+  if kind_t(m, u) == TY_VEC {
+    let ew = ir_mw(c, m, p, inner_t(m, u), 0);
+    if ew != IR_NONE && ew > 0 && ew < 64 {
+      return IRK_VEC;
+    }
   }
   return 0;
 }
@@ -338,12 +341,27 @@ fn ir_truncate(f: &mut IrFn, n: u64) {
   }
 }
 
+/// The `t` of a Vec value: the element type, and whether the address is part
+/// of a place (a Vec read out of a place is the place's own header).
+fn ir_vt(et: u64, alias: u64) -> u64 {
+  return wrap_add(wrap_mul(et, 2), alias);
+}
+
+/// The element type of Vec value `v`.
+fn ir_velem(v: IrVal) -> u64 {
+  return v.t / 2;
+}
+
 /// New registers for a value of kind `k`; a struct of `w` words and type
 /// `t` takes `w` consecutive ones.
 fn ir_new_val(f: &mut IrFn, k: u64, w: u64, t: u64) -> IrVal {
   let r0 = ir_reg(&mut f);
-  if k == IRK_INT || k == IRK_VEC {
+  if k == IRK_INT {
     return IrVal { k: k, r0: r0, r1: IR_NONE, t: 0 };
+  }
+  if k == IRK_VEC {
+    // The element type stays; the alias mark does not.
+    return IrVal { k: k, r0: r0, r1: IR_NONE, t: wrap_mul(t / 2, 2) };
   }
   if ir_multi(k) {
     let mut j = 1;
@@ -564,8 +582,9 @@ fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
   }
   if k == E_TAPP && name_is(p, n.b, "vec_new") {
     let et = conv(&mut m, p, n.a, f.x, i);
-    if ir_words(c, m, p, et, 1) != 1 {
-      ir_fail(&mut f, "a vector of something other than one-word elements");
+    let ew = ir_mw(c, m, p, et, 0);
+    if ew == IR_NONE || ew == 0 || ew >= 64 {
+      ir_fail(&mut f, "a vector of elements the IR does not know");
       return ir_none();
     }
     let d = ir_reg(&mut f);
@@ -575,7 +594,7 @@ fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     ir_hdr_store(&mut f, d, 0, zero);
     ir_hdr_store(&mut f, d, 1, zero);
     ir_hdr_store(&mut f, d, 2, zero);
-    return IrVal { k: IRK_VEC, r0: d, r1: IR_NONE, t: 0 };
+    return IrVal { k: IRK_VEC, r0: d, r1: IR_NONE, t: ir_vt(et, 0) };
   }
   if k == E_MUTBORROW {
     let path = node_at(p.nodes, n.a);
@@ -829,7 +848,7 @@ fn ir_rv(f: &mut IrFn, c: &Checker, m: &Mono, p: &Parser, v: IrVal) -> IrVal {
     return IrVal { k: k, r0: data, r1: len, t: 0 };
   }
   if k == IRK_VEC {
-    return IrVal { k: IRK_VEC, r0: ir_paddr(&mut f, v), r1: IR_NONE, t: 1 };
+    return IrVal { k: IRK_VEC, r0: ir_paddr(&mut f, v), r1: IR_NONE, t: ir_vt(inner_t(m, base_t(m, v.t)), 1) };
   }
   return v;
 }
@@ -891,7 +910,7 @@ fn ir_store_val(f: &mut IrFn, c: &Checker, m: &Mono, p: &Parser, d: IrVal, v: Ir
 /// A Vec read out of a place is the place's own header; a Vec that is kept
 /// (bound, assigned) is a copy of it in a slot of ours.
 fn ir_own(f: &mut IrFn, v: IrVal) -> IrVal {
-  if v.k != IRK_VEC || v.t != 1 {
+  if v.k != IRK_VEC || v.t % 2 != 1 {
     return v;
   }
   let slot = ir_reg(&mut f);
@@ -902,7 +921,7 @@ fn ir_own(f: &mut IrFn, v: IrVal) -> IrVal {
     ir_hdr_store(&mut f, slot, j, w);
     j = j + 1;
   }
-  return IrVal { k: IRK_VEC, r0: slot, r1: IR_NONE, t: 0 };
+  return IrVal { k: IRK_VEC, r0: slot, r1: IR_NONE, t: wrap_mul(v.t / 2, 2) };
 }
 
 /// Word `k` of the Vec header at address `a`.
@@ -928,6 +947,25 @@ fn ir_vec_arg(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> Ir
     return ir_none();
   }
   return v;
+}
+
+/// The place of element `ix` (a register) of the Vec `v`: its data address
+/// plus `ix` elements of `w` words.
+fn ir_vel(f: &mut IrFn, c: &Checker, m: &Mono, p: &Parser, v: IrVal, ix: u64, w: u64) -> IrVal {
+  let data = ir_hdr_load(&mut f, v.r0, 2);
+  let k = ir_reg(&mut f);
+  ir_emit(&mut f, IR_CONST, k, wrap_mul(8, w), 0, 0, 0);
+  let off = ir_reg(&mut f);
+  ir_emit(&mut f, IR_MUL, off, ix, k, 0, 0);
+  let ea = ir_reg(&mut f);
+  ir_emit(&mut f, IR_ADD, ea, data, off, 0, 0);
+  return IrVal { k: IRK_PLACE, r0: ea, r1: 0, t: ir_velem(v) };
+}
+
+/// Is the element of Vec `v` one integer word (so that it is loaded and
+/// stored directly)?
+fn ir_vsimple(c: &Checker, m: &Mono, p: &Parser, v: IrVal) -> bool {
+  return ir_kind(c, m, p, ir_velem(v)) == IRK_INT;
 }
 
 /// A call: a builtin of the subset (`len`, `blen`, `get`, `bget`) or a
@@ -982,28 +1020,81 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
   if name_is(p, i, "vec_get") || name_is(p, i, "vec_set") {
     let v = ir_vec_arg(&mut f, c, &mut m, p, n.a);
     let ix = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
-    let mut x = IR_NONE;
+    let mut xv = ir_none();
     if name_is(p, i, "vec_set") {
-      x = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 2));
+      xv = ir_vexpr(&mut f, c, &mut m, p, cg_arg(p, i, 2));
     }
     if f.failed {
       return ir_none();
     }
-    let data = ir_hdr_load(&mut f, v.r0, 2);
-    if x == IR_NONE {
+    let setting = name_is(p, i, "vec_set");
+    if ir_vsimple(c, m, p, v) {
+      let data = ir_hdr_load(&mut f, v.r0, 2);
+      if !setting {
+        let d = ir_reg(&mut f);
+        ir_emit(&mut f, IR_LOAD, d, data, ix, 8, 0);
+        return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+      }
+      ir_emit(&mut f, IR_STORE, xv.r0, data, ix, 8, 0);
+      return ir_none();
+    }
+    let el = ir_vel(&mut f, c, m, p, v, ix, ir_mw(c, m, p, ir_velem(v), 0));
+    if !setting {
+      return ir_rv(&mut f, c, m, p, el);
+    }
+    ir_store_val(&mut f, c, m, p, el, xv);
+    return ir_none();
+  }
+  if name_is(p, i, "vec_pop") {
+    let v = ir_vec_arg(&mut f, c, &mut m, p, n.a);
+    if f.failed {
+      return ir_none();
+    }
+    let len = ir_hdr_load(&mut f, v.r0, 0);
+    let one = ir_reg(&mut f);
+    ir_emit(&mut f, IR_CONST, one, 1, 0, 0, 0);
+    let len1 = ir_reg(&mut f);
+    ir_emit(&mut f, IR_SUB, len1, len, one, 0, c.tu64);
+    ir_hdr_store(&mut f, v.r0, 0, len1);
+    if ir_vsimple(c, m, p, v) {
+      let data = ir_hdr_load(&mut f, v.r0, 2);
       let d = ir_reg(&mut f);
-      ir_emit(&mut f, IR_LOAD, d, data, ix, 8, 0);
+      ir_emit(&mut f, IR_LOAD, d, data, len1, 8, 0);
       return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
     }
-    ir_emit(&mut f, IR_STORE, x, data, ix, 8, 0);
-    return ir_none();
+    let el = ir_vel(&mut f, c, m, p, v, len1, ir_mw(c, m, p, ir_velem(v), 0));
+    return ir_rv(&mut f, c, m, p, el);
+  }
+  if name_is(p, i, "vec_swap") {
+    // Puts `x` at `i` and returns what was there.
+    let v = ir_vec_arg(&mut f, c, &mut m, p, n.a);
+    let ix = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    let x = ir_vexpr(&mut f, c, &mut m, p, cg_arg(p, i, 2));
+    if f.failed {
+      return ir_none();
+    }
+    if ir_vsimple(c, m, p, v) {
+      let data = ir_hdr_load(&mut f, v.r0, 2);
+      let d = ir_reg(&mut f);
+      ir_emit(&mut f, IR_LOAD, d, data, ix, 8, 0);
+      ir_emit(&mut f, IR_STORE, x.r0, data, ix, 8, 0);
+      return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+    }
+    let el = ir_vel(&mut f, c, m, p, v, ix, ir_mw(c, m, p, ir_velem(v), 0));
+    let prev = ir_val(&mut f, c, m, p, ir_rv(&mut f, c, m, p, el));
+    if f.failed {
+      return ir_none();
+    }
+    ir_store_val(&mut f, c, m, p, el, x);
+    return ir_own(&mut f, prev);
   }
   if name_is(p, i, "vec_push") {
     let v = ir_vec_arg(&mut f, c, &mut m, p, n.a);
-    let x = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    let x = ir_vexpr(&mut f, c, &mut m, p, cg_arg(p, i, 1));
     if f.failed {
       return ir_none();
     }
+    let w = ir_mw(c, m, p, ir_velem(v), 0);
     let len = ir_hdr_load(&mut f, v.r0, 0);
     let cap = ir_hdr_load(&mut f, v.r0, 1);
     let full = ir_reg(&mut f);
@@ -1012,10 +1103,15 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let l_room = ir_label(&mut f);
     ir_emit(&mut f, IR_BR, IR_NONE, full, l_grow, l_room, 0);
     ir_place(&mut f, l_grow);
-    ir_emit(&mut f, IR_VGROW, IR_NONE, v.r0, 0, 1, 0);
+    ir_emit(&mut f, IR_VGROW, IR_NONE, v.r0, 0, w, 0);
     ir_place(&mut f, l_room);
-    let data = ir_hdr_load(&mut f, v.r0, 2);
-    ir_emit(&mut f, IR_STORE, x, data, len, 8, 0);
+    if ir_vsimple(c, m, p, v) {
+      let data = ir_hdr_load(&mut f, v.r0, 2);
+      ir_emit(&mut f, IR_STORE, x.r0, data, len, 8, 0);
+    } else {
+      let el = ir_vel(&mut f, c, m, p, v, len, w);
+      ir_store_val(&mut f, c, m, p, el, x);
+    }
     let one = ir_reg(&mut f);
     ir_emit(&mut f, IR_CONST, one, 1, 0, 0, 0);
     let len1 = ir_reg(&mut f);
@@ -1179,7 +1275,7 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let slot = ir_reg(&mut f);
     ir_emit(&mut f, IR_CALLM, slot, callee, first, count, w);
     if rk == IRK_VEC {
-      return IrVal { k: IRK_VEC, r0: slot, r1: IR_NONE, t: 0 };
+      return IrVal { k: IRK_VEC, r0: slot, r1: IR_NONE, t: ir_vt(inner_t(m, base_t(m, rt)), 0) };
     }
     ir_load_words(&mut f, slot, 0, d.r0, w);
     return d;
@@ -1481,6 +1577,9 @@ fn ir_lower(c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> IrFn {
       ir_fail(&mut f, "a `&mut` parameter that is not a Vec");
     } else {
       let mut r = ir_new_val(&mut f, pk, ir_words(c, m, p, pt, 0), base_t(m, pt));
+      if pk == IRK_VEC {
+        r.t = ir_vt(inner_t(m, pu), 0);
+      }
       if pk == IRK_VEC && kind_t(m, pt) != TY_MUTREF {
         // Passed as three words: put them in a slot of ours.
         let w0 = r.r0;
@@ -1494,7 +1593,7 @@ fn ir_lower(c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> IrFn {
         ir_hdr_store(&mut f, slot, 0, w0);
         ir_hdr_store(&mut f, slot, 1, w1);
         ir_hdr_store(&mut f, slot, 2, w2);
-        r = IrVal { k: IRK_VEC, r0: slot, r1: IR_NONE, t: 0 };
+        r = IrVal { k: IRK_VEC, r0: slot, r1: IR_NONE, t: ir_vt(inner_t(m, pu), 0) };
       } else if ir_multi(pk) {
         let mut w = 0;
         while w < r.r1 && w < 64 {
