@@ -530,6 +530,30 @@ fn ir_binop(op: u64, signed: bool) -> u64 {
   return 0;
 }
 
+/// Condition `i` as control flow: goes to `lt` when it holds and `lf` when
+/// it does not, without materialising `&&`, `||` and `!` of booleans in a
+/// register.
+fn ir_branch(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, lt: u64, lf: u64) {
+  let n = node_at(p.nodes, i);
+  if n.kind == E_BIN && (n.v == P_ANDAND || n.v == P_OROR) {
+    let mid = ir_label(&mut f);
+    if n.v == P_ANDAND {
+      ir_branch(&mut f, c, &mut m, p, n.a, mid, lf);
+    } else {
+      ir_branch(&mut f, c, &mut m, p, n.a, lt, mid);
+    }
+    ir_place(&mut f, mid);
+    ir_branch(&mut f, c, &mut m, p, n.b, lt, lf);
+    return;
+  }
+  if n.kind == E_NOT && cg_int_op(c, f.x, i) == 0 {
+    ir_branch(&mut f, c, &mut m, p, n.a, lf, lt);
+    return;
+  }
+  let cond = ir_int(&mut f, c, &mut m, p, i);
+  ir_emit(&mut f, IR_BR, IR_NONE, cond, lt, lf, 0);
+}
+
 /// An integer expression: its register.
 fn ir_int(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
   let v = ir_expr(&mut f, c, &mut m, p, i);
@@ -1834,11 +1858,10 @@ fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
       }
     }
   } else if k == S_IF {
-    let cond = ir_int(&mut f, c, &mut m, p, n.a);
     let l_then = ir_label(&mut f);
     let l_else = ir_label(&mut f);
     let l_end = ir_label(&mut f);
-    ir_emit(&mut f, IR_BR, IR_NONE, cond, l_then, l_else, 0);
+    ir_branch(&mut f, c, &mut m, p, n.a, l_then, l_else);
     ir_place(&mut f, l_then);
     ir_block(&mut f, c, &mut m, p, n.b);
     ir_jump(&mut f, l_end);
@@ -1852,8 +1875,7 @@ fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     let l_body = ir_label(&mut f);
     let l_end = ir_label(&mut f);
     ir_place(&mut f, l_head);
-    let cond = ir_int(&mut f, c, &mut m, p, n.a);
-    ir_emit(&mut f, IR_BR, IR_NONE, cond, l_body, l_end, 0);
+    ir_branch(&mut f, c, &mut m, p, n.a, l_body, l_end);
     ir_place(&mut f, l_body);
     ir_block(&mut f, c, &mut m, p, n.c);
     ir_jump(&mut f, l_head);
