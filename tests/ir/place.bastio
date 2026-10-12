@@ -1,0 +1,99 @@
+// Structs lent by `&mut`, or by `&` when they are large, stay in memory:
+// the IR reads and writes their fields in place (scalars, a Vec, a Buf, a
+// nested struct) and lends fields on. `peek_gen` and `bump_gen` have a `Str`
+// local, which keeps them with the old generator, so both kinds of function
+// pass the same memory to each other.
+struct Pt { x: u64, y: u64 }
+
+enum Mode { Idle, Busy(Pt) }
+
+struct State { n: u64, items: Vec[u64], buf: Buf, pos: Pt, on: bool, mode: Mode }
+
+fn bump(s: &mut State)
+  requires s.n < 1000
+  ensures s.n == old(s.n) + 1
+{
+  s.n = s.n + 1;
+}
+
+fn move_pt(p: &mut Pt)
+  requires p.x < 1000 && p.y < 1000
+  ensures p.x == old(p.x) + 1 && p.y == old(p.y) + 2
+{
+  p.x = p.x + 1;
+  p.y = p.y + 2;
+}
+
+fn bump_gen(s: &mut State)
+  requires s.n < 1000
+  ensures s.n == old(s.n) + 1
+{
+  let t = "bump";
+  s.n = s.n + slen(t) - 3;
+}
+
+fn step(s: &mut State)
+  requires s.n < 900 && s.pos.x < 1000 && s.pos.y < 1000
+  ensures s.n == old(s.n) + 2 && s.pos.x == old(s.pos.x) + 1 && s.pos.y == old(s.pos.y) + 2
+{
+  bump(&mut s);
+  bump_gen(&mut s);
+  move_pt(&mut s.pos);
+  vec_push(&mut s.items, s.n);
+  s.on = !s.on;
+  if s.n > 4 {
+    s.mode = Mode::Busy(Pt { x: s.n, y: 1 });
+  }
+}
+
+fn first(s: &State) -> u64 {
+  if vec_len(s.items) > 0 {
+    return vec_get(s.items, 0);
+  }
+  return 0;
+}
+
+fn weigh(s: &State) -> u64
+  requires s.n < 900 && s.pos.x < 1000 && s.pos.y < 1000
+{
+  let mut w = s.n + s.pos.x * 2 + s.pos.y;
+  if s.on {
+    w = w + 1;
+  }
+  match s.mode {
+    Mode::Idle => { w = w + 0; },
+    Mode::Busy(p) => { w = wrap_add(w, wrap_add(p.x % 8, p.y)); },
+  }
+  return w;
+}
+
+fn weigh_gen(s: &State) -> u64
+  requires s.n < 900 && s.pos.x < 1000 && s.pos.y < 1000
+{
+  let t = "w";
+  return wrap_add(weigh(s), slen(t));
+}
+
+fn moved(s: &State) -> Pt
+  ensures result.x == s.pos.x && result.y == s.pos.y
+{
+  return s.pos;
+}
+
+fn main() -> u64 {
+  let mut s = State { n: 0, items: vec_new[u64](), buf: alloc(4), pos: Pt { x: 1, y: 1 }, on: false, mode: Mode::Idle };
+  let mut i = 0;
+  while i < 5
+    invariant i <= 5 && s.n == i * 2 && s.pos.x == 1 + i && s.pos.y == 1 + i * 2
+  {
+    step(&mut s);
+    i = i + 1;
+  }
+  let a = first(s);
+  let b = weigh_gen(s);
+  let p = moved(s);
+  let c = wrap_add(p.x, p.y);
+  vec_free(s.items);
+  free(s.buf);
+  return wrap_add(wrap_add(a, b), c);
+}

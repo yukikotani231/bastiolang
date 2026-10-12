@@ -1,0 +1,84 @@
+// Results of more than two words (a `Vec`, a struct of three words, an enum
+// with a two-word payload) go through space the caller reserves. A function
+// with a `Str` local stays with the old generator, so the results cross in
+// both directions between it and the functions lowered from the IR.
+struct Tri { a: u64, b: u64, c: u64 }
+
+enum Cell { Empty, Pair(Tri) }
+
+fn tri(x: u64) -> Tri
+  requires x < 1000
+  ensures result.a == x && result.b == x + 1 && result.c == x + 2
+{
+  return Tri { a: x, b: x + 1, c: x + 2 };
+}
+
+// Generator: takes and returns the wide values too.
+fn tri_gen(x: u64) -> Tri
+  requires x < 1000
+  ensures result.a == x + 1 && result.b == x + 2 && result.c == x + 3
+{
+  let s = "tri";
+  let t = tri(x + slen(s) - 3);
+  return Tri { a: t.a + 1, b: t.b + 1, c: t.c + 1 };
+}
+
+fn cell(x: u64) -> Cell
+  requires x < 1000
+{
+  if x == 0 { return Cell::Empty; }
+  return Cell::Pair(tri_gen(x));
+}
+
+fn cell_sum(c: Cell) -> u64 {
+  match c {
+    Cell::Empty => { return 0; },
+    Cell::Pair(t) => { return wrap_add(t.a, wrap_add(t.b, t.c)); },
+  }
+}
+
+fn make(n: u64) -> Vec[u64]
+  requires n < 100
+{
+  let mut v = vec_new[u64]();
+  let mut i = 0;
+  while i < n
+    invariant i <= n && vlen(v) == i
+  {
+    vec_push(&mut v, i * 2);
+    i = i + 1;
+  }
+  return v;
+}
+
+fn make_gen(n: u64) -> Vec[u64]
+  requires n < 100
+{
+  let s = "vec";
+  let mut v = make(n + slen(s) - 3);
+  vec_push(&mut v, 100);
+  return v;
+}
+
+fn total(v: Vec[u64]) -> u64 {
+  let mut t = 0;
+  let mut i = 0;
+  while i < vec_len(v)
+    invariant i <= vlen(v)
+  {
+    t = wrap_add(t, vec_get(v, i));
+    i = i + 1;
+  }
+  vec_free(v);
+  return t;
+}
+
+fn main() -> u64 {
+  let t = tri(3);
+  let u = tri_gen(5);
+  let a = wrap_add(wrap_add(t.a, t.b), t.c);            // 12
+  let b = wrap_add(wrap_add(u.a, u.b), u.c);            // 21
+  let c = wrap_add(cell_sum(cell(0)), cell_sum(cell(2))); // 0 + 12 = 12
+  let d = total(make_gen(4));                            // 0+2+4+6+100 = 112 (kept apart below)
+  return wrap_add(wrap_add(a, b), wrap_add(c, d % 100)) % 256;
+}
