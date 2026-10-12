@@ -1,0 +1,188 @@
+// Passes over the IR (stage1/ir.bastio, docs/ir.md), run between the
+// lowering and the register allocator.
+//
+// `iropt_slots` (scalar replacement of frame slots): a `slot` whose address
+// is only ever the base of a one-word `load` or `store` at a constant word
+// index never needs to be in memory. Each of its words becomes a virtual
+// register of its own, a `store` becomes a `mov` into it and a `load` a
+// `mov` out of it, so the allocator can keep the word in a machine
+// register. This is what a `Vec` parameter (passed as three words, stored
+// in a slot so the `vec_*` forms can address the header) costs today: every
+// `vec_len` and every element access reads the header from the frame.
+//
+// A slot whose address is read in any other way (passed to a call, handed to
+// `vgrow`, returned from, added to, stored) stays in memory. A word that is
+// read before the first instruction that writes it (the lowering does not
+// do this, but the IR allows it) starts as 0, so the register is never read
+// without being written; the memory it replaces would have held garbage.
+import "irra.bastio";
+
+/// How many times each register is written (a parameter counts as one).
+fn iropt_ndef(f: &IrFn) -> Vec[u64] {
+  let mut ndef = vec_new[u64]();
+  let mut r = 0;
+  while r < f.nreg && r < 1000000000 {
+    vec_push(&mut ndef, 0);
+    r = r + 1;
+  }
+  let mut j = 0;
+  while j < vec_len(f.params) {
+    let pr = vec_get(f.params, j);
+    ra_set(&mut ndef, pr, wrap_add(u_at(ndef, pr), 1));
+    j = j + 1;
+  }
+  let mut i = 0;
+  while i < vec_len(f.ins) {
+    let mut ws = vec_new[u64]();
+    ra_writes(vec_get(f.ins, i), &mut ws);
+    j = 0;
+    while j < vec_len(ws) {
+      let wr = vec_get(ws, j);
+      ra_set(&mut ndef, wr, wrap_add(u_at(ndef, wr), 1));
+      j = j + 1;
+    }
+    vec_free(ws);
+    i = i + 1;
+  }
+  return ndef;
+}
+
+/// For each register that is written once, by a `const`, that constant;
+/// IR_NONE for any other.
+fn iropt_consts(f: &IrFn, ndef: &Vec[u64]) -> Vec[u64] {
+  let mut cv = vec_new[u64]();
+  let mut r = 0;
+  while r < f.nreg && r < 1000000000 {
+    vec_push(&mut cv, IR_NONE);
+    r = r + 1;
+  }
+  let mut i = 0;
+  while i < vec_len(f.ins) {
+    let q = vec_get(f.ins, i);
+    if q.op == IR_CONST && u_at(ndef, q.d) == 1 {
+      ra_set(&mut cv, q.d, q.a);
+    }
+    i = i + 1;
+  }
+  return cv;
+}
+
+/// Is the slot register `s` (of `words` words) used only as the base of
+/// one-word loads and stores at constant indices below `words`?
+fn iropt_slot_ok(f: &IrFn, s: u64, words: u64, cv: &Vec[u64]) -> bool {
+  let mut ok = true;
+  let mut i = 0;
+  while ok && i < vec_len(f.ins) {
+    let q = vec_get(f.ins, i);
+    let mut rs = vec_new[u64]();
+    ra_reads(f, q, &mut rs);
+    let mut uses = false;
+    let mut j = 0;
+    while j < vec_len(rs) {
+      if vec_get(rs, j) == s {
+        uses = true;
+      }
+      j = j + 1;
+    }
+    vec_free(rs);
+    if uses {
+      if (q.op == IR_LOAD || q.op == IR_STORE) && q.a == s && q.b != s && q.c == 8 {
+        let k = u_at(cv, q.b);
+        if k >= words {
+          ok = false;
+        }
+        if q.op == IR_STORE && q.d == s {
+          ok = false;
+        }
+      } else {
+        ok = false;
+      }
+    }
+    i = i + 1;
+  }
+  return ok;
+}
+
+/// Replaces the promotable slots of `f` by registers. Returns how many.
+fn iropt_slots(f: &mut IrFn) -> u64 {
+  let ndef = iropt_ndef(f);
+  let cv = iropt_consts(f, ndef);
+  // The register of word k of the slot defined by instruction i: base[i] + k.
+  let mut base = vec_new[u64]();
+  let mut promoted = 0;
+  let mut i = 0;
+  while i < vec_len(f.ins) {
+    let q = vec_get(f.ins, i);
+    let mut b = IR_NONE;
+    if q.op == IR_SLOT && u_at(ndef, q.d) == 1 && q.c > 0 && q.c <= 64 && iropt_slot_ok(f, q.d, q.c, cv) {
+      b = f.nreg;
+      f.nreg = wrap_add(f.nreg, q.c);
+      promoted = wrap_add(promoted, 1);
+    }
+    vec_push(&mut base, b);
+    i = i + 1;
+  }
+  if promoted == 0 {
+    vec_free(base);
+    vec_free(cv);
+    vec_free(ndef);
+    return 0;
+  }
+  // Slot register -> instruction that defines it.
+  let mut out = vec_new[IrIns]();
+  i = 0;
+  while i < vec_len(f.ins) {
+    let q = vec_get(f.ins, i);
+    let mut keep = true;
+    if q.op == IR_SLOT && u_at(base, i) != IR_NONE {
+      keep = false;
+      let mut k = 0;
+      while k < q.c {
+        if iropt_first_is_load(f, i, q.d, k, cv) {
+          vec_push(&mut out, IrIns { op: IR_CONST, d: wrap_add(u_at(base, i), k), a: 0, b: 0, c: 0, ty: 0 });
+        }
+        k = k + 1;
+      }
+    } else if q.op == IR_LOAD || q.op == IR_STORE {
+      // Which promoted slot is `a`, if any?
+      let mut j = 0;
+      while j < vec_len(f.ins) {
+        let sq = vec_get(f.ins, j);
+        if sq.op == IR_SLOT && sq.d == q.a && u_at(base, j) != IR_NONE {
+          let w = wrap_add(u_at(base, j), u_at(cv, q.b));
+          if q.op == IR_LOAD {
+            vec_push(&mut out, IrIns { op: IR_MOV, d: q.d, a: w, b: 0, c: 0, ty: 0 });
+          } else {
+            vec_push(&mut out, IrIns { op: IR_MOV, d: w, a: q.d, b: 0, c: 0, ty: 0 });
+          }
+          keep = false;
+        }
+        j = j + 1;
+      }
+    }
+    if keep {
+      vec_push(&mut out, q);
+    }
+    i = i + 1;
+  }
+  vec_free(f.ins);
+  f.ins = out;
+  vec_free(base);
+  vec_free(cv);
+  vec_free(ndef);
+  return promoted;
+}
+
+/// Is the first instruction after position `j` (the `slot` of register `s`)
+/// that touches word `k` a `load`?
+fn iropt_first_is_load(f: &IrFn, j: u64, s: u64, k: u64, cv: &Vec[u64]) -> bool {
+  let mut n = wrap_add(j, 1);
+  while n < vec_len(f.ins) {
+    let q = vec_get(f.ins, n);
+    if (q.op == IR_LOAD || q.op == IR_STORE) && q.a == s && u_at(cv, q.b) == k {
+      return q.op == IR_LOAD;
+    }
+    n = n + 1;
+  }
+  return false;
+}

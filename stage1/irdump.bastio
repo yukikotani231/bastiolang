@@ -2,14 +2,25 @@
 // the first subset; a function outside it gets a comment line with the first
 // thing that stopped the lowering. Type and linearity checking run first, as
 // for asmdump; nothing is verified or generated.
-//   usage: irdump [--lib DIR] FILE
+//   usage: irdump [--lib DIR] FILE   or   irdump --opt FILE
+// With --opt, the passes of iropt.bastio have run first.
 import "loader.bastio";
 import "out.bastio";
 import "ir.bastio";
+import "iropt.bastio";
 
 fn main(con: &mut Serial, host: &mut Host) -> u64 {
   let mut ld = loader_new();
   let mut base = 1;
+  let mut opt = false;
+  if host_argc(host) == 3 {
+    let a = host_arg(host, 1);
+    if spells(a, 0, blen(a), "--opt") {
+      opt = true;
+      base = 2;
+    }
+    bfree(a);
+  }
   if host_argc(host) > 3 {
     let a = host_arg(host, 1);
     if spells(a, 0, blen(a), "--lib") {
@@ -43,7 +54,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
         let mut k = 0;
         while k < vec_len(m.fns) {
           let x = u_at(m.fns, k);
-          let f = ir_lower(c, &mut m, p, x);
+          let mut f = ir_lower(c, &mut m, p, x);
           let mut text = vec_new[u64]();
           if f.failed {
             w_s(&mut text, "# ");
@@ -52,6 +63,9 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
             w_append(&mut text, f.why);
             w_s(&mut text, "\n");
           } else {
+            if opt {
+              iropt_slots(&mut f);
+            }
             ir_print(&mut text, f, m, p);
           }
           let mut j = 0;
