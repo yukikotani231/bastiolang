@@ -1,0 +1,46 @@
+// expect-exit: 66
+// A `&mut` scalar parameter (stage1/ir.bastio) is lent by address: the
+// callee loads the word on entry, works on it as a register and stores it
+// back before it returns. A caller's variable goes to a slot for the call
+// and is read back; a scalar field in memory goes by its own address.
+struct Counter { n: u64, items: Vec[u64], hits: u8 }
+
+fn bump(x: &mut u64)
+  requires x < 100
+  ensures x == old(x) + 1
+{
+  x = x + 1;
+}
+
+fn inc(r: &mut u8) {
+  if r < 255 {
+    r = r + 1;
+  }
+}
+
+fn count_down(acc: &mut u64, n: u64)
+  requires n <= 100
+{
+  if n == 0 {
+    return;
+  }
+  acc = wrap_add(acc, n);
+  count_down(&mut acc, n - 1);
+}
+
+fn main() -> u64 {
+  let mut a = 5;
+  bump(&mut a);
+  bump(&mut a);
+  let mut b: u8 = 254;
+  inc(&mut b);
+  inc(&mut b);
+  let mut c = 0;
+  count_down(&mut c, 10);
+  let mut k = Counter { n: 40, items: vec_new[u64](), hits: 7 };
+  bump(&mut k.n);
+  inc(&mut k.hits);
+  let r = wrap_add(wrap_add(wrap_add(wrap_add(a, cast[u64](b)), c), k.n), cast[u64](k.hits));
+  vec_free(k.items);
+  return wrap_sub(r, 300);
+}
