@@ -1120,6 +1120,14 @@ static inline uint64_t bst_read_cr3(void) { uint64_t a; __asm__ volatile ("mov %
  * at once. */
 extern uint64_t *bst_platform_mmu_state(void) __attribute__((weak));
 static inline uint64_t *bst_mmu_state(void) { return bst_platform_mmu_state ? bst_platform_mmu_state() : 0; }
+/* A platform that gives user code a table of its own, with none of the
+ * kernel's memory in it (BastiOS: boot/boot.S loads it in bst_cpu_enter and
+ * leaves it at the next trap), defines this symbol and keeps a fourth word
+ * with the state. The kernel's tables then stay in CR3 whenever Bastio code
+ * runs: entering a table only records it in word 3, for bst_cpu_enter, and
+ * the lease is dropped as soon as the processor is done with the table. */
+extern const char bst_platform_deferred_cr3 __attribute__((weak));
+#define BST_DEFERRED (&bst_platform_deferred_cr3 != 0)
 static inline void bst_cr3_load(uint64_t *s, uint64_t a) {
     if (s) s[1] = __atomic_load_n(&bst_pt_gen, __ATOMIC_SEQ_CST);
     bst_load_cr3(a);
@@ -1144,13 +1152,18 @@ static inline void bst_lock_depth(int d) {
     s[2] += (uint64_t)(int64_t)d;
     if (s[2] == 0 && s[0]) bst_mmu_settle();
 }
-static inline void bst_mmu_kernel(bst_mmu *m) { (void)m; bst_mmu_settle(); bst_load_cr3((uint64_t)bst_kernel_pml4); }
+static inline void bst_mmu_kernel(bst_mmu *m) { (void)m; bst_mmu_settle(); if (!BST_DEFERRED) bst_load_cr3((uint64_t)bst_kernel_pml4); }
 /* A table this processor parked becomes the new lease without a second
  * count. CR3 is loaded only if it holds another table, or if an entry was
  * taken out of some table since the last load (bst_pt_gen). */
 static inline bst_lease bst_mmu_enter(bst_mmu *m, bst_pt *t) {
     (void)m;
     uint64_t *s = bst_mmu_state();
+    if (BST_DEFERRED) {
+        __atomic_fetch_add(&bst_pt_leases[bst_frame_id(*t)], 1, __ATOMIC_SEQ_CST);
+        s[3] = *t;
+        return *t;
+    }
     if (s && s[0] == *t) s[0] = 0;
     else __atomic_fetch_add(&bst_pt_leases[bst_frame_id(*t)], 1, __ATOMIC_SEQ_CST);
     if (!s || bst_read_cr3() != *t || s[1] != __atomic_load_n(&bst_pt_gen, __ATOMIC_SEQ_CST)) bst_cr3_load(s, *t);
@@ -1176,6 +1189,11 @@ static inline bst_lease bst_mmu_enter(bst_mmu *m, bst_pt *t) {
 static inline void bst_mmu_exit(bst_mmu *m, bst_lease l) {
     (void)m;
     uint64_t *s = bst_mmu_state();
+    if (BST_DEFERRED) {
+        s[3] = 0;
+        __atomic_fetch_sub(&bst_pt_leases[bst_frame_id(l)], 1, __ATOMIC_RELEASE);
+        return;
+    }
     if (s) {
         s[0] = l;
         return;
@@ -1208,6 +1226,7 @@ static inline void bst_cpu_fpu_load(bst_cpu *c, bst_frame f) {
 }
 static inline uint64_t bst_cpu_run(bst_cpu *c, bst_mmu m) {
     (void)c; (void)m;
+    if (BST_DEFERRED) return bst_cpu_enter();    /* it loads the table, which flushes the TLB */
     uint64_t *s = bst_mmu_state();
     /* flush the TLB if pages may have moved since the last load */
     if (!s || s[1] != __atomic_load_n(&bst_pt_gen, __ATOMIC_SEQ_CST)) bst_cr3_load(s, bst_read_cr3());
