@@ -1,0 +1,997 @@
+// IR to AArch64 (docs/ir.md): the emitter for the IR of stage1/ir.bastio and
+// the registers chosen by stage1/irra.bastio, behind `--arch aarch64
+// --backend native`. The same IR and allocator as irx86.bastio with an
+// emitter of their own; there is no older generator to fall back on, so a
+// function the IR does not cover stops the build and says which and why.
+//
+// Hosted target only, as a program with a `main` that takes no parameters.
+//
+// The calling convention is the platform's (AAPCS64) as far as words go:
+// the argument words (at most eight) in x0-x7 in the order of the IR (a
+// buffer is its data address, then its length), a result of one or two
+// words in x0 and x1, a result of more words through the address in x8
+// (the caller's frame slot, `IR_CALLM`). x19-x28 are preserved, x9-x17 and
+// x0-x8 are not.
+//
+// Registers. The allocator is given x19-x27 (callee-saved) and x12-x15
+// (caller-saved); the emitter keeps x0-x8, x9-x11, x16 and x17 to itself, so
+// no value shares a register with an argument of a call.
+//
+// The frame, from the stack pointer up: the saved callee-saved registers,
+// the saved x8 when the function returns more than two words, the spilled
+// values, the slots of `IR_SLOT` and `IR_CALLM`; the frame pointer and the
+// return address are saved above it.
+import "irx86.bastio";
+
+/// Calls with more words than this, or functions with more parameter
+/// words, are not covered.
+const A64_MAX_ARGS: u64 = 8;
+
+const A64K_REG: u64 = 1;
+const A64K_MEM: u64 = 2;
+const A64K_IMM: u64 = 3;
+
+/// Where a value is: machine register `reg`, the frame word `off` words
+/// above the stack pointer, or the constant `imm`.
+struct A64L { k: u64, reg: u64, off: u64, imm: u64 }
+
+fn a64_rl(r: u64) -> A64L {
+  return A64L { k: A64K_REG, reg: r, off: 0, imm: 0 };
+}
+
+fn a64_ml(off: u64) -> A64L {
+  return A64L { k: A64K_MEM, reg: 0, off: off, imm: 0 };
+}
+
+fn a64_il(v: u64) -> A64L {
+  return A64L { k: A64K_IMM, reg: 0, off: 0, imm: v };
+}
+
+/// Frame words before the spill area: the saved registers, and x8.
+struct A64F { nsave: u64, retp: u64 }
+
+fn a64_callee(i: u64) -> u64 {
+  return wrap_add(19, i);
+}
+
+fn a64_caller(i: u64) -> u64 {
+  return wrap_add(12, i);
+}
+
+fn a64_loc(al: &IrAlloc, fr: A64F, r: u64) -> A64L {
+  if u_at(al.cst, r) == 1 {
+    return a64_il(u_at(al.cv, r));
+  }
+  let cls = u_at(al.cls, r);
+  let idx = u_at(al.idx, r);
+  if cls == RA_CALLEE {
+    return a64_rl(a64_callee(idx));
+  }
+  if cls == RA_CALLER {
+    return a64_rl(a64_caller(idx));
+  }
+  return a64_ml(wrap_add(wrap_add(fr.nsave, fr.retp), idx));
+}
+
+// ---- Writing instructions ----
+
+/// `x<r>`, or `sp` for 31.
+fn a64_x(out: &mut Vec[u64], r: u64) {
+  if r == 31 {
+    w_s(&mut out, "sp");
+  } else {
+    w_s(&mut out, "x");
+    w_num(&mut out, r);
+  }
+}
+
+fn a64_w(out: &mut Vec[u64], r: u64) {
+  w_s(&mut out, "w");
+  w_num(&mut out, r);
+}
+
+/// The constant `v` in `x<r>`: `mov`, or `movz` and `movk` by 16 bits.
+fn a64_movi(out: &mut Vec[u64], r: u64, v: u64) {
+  if v < 65536 {
+    w_s(&mut out, "\tmov ");
+    a64_x(&mut out, r);
+    w_s(&mut out, ", #");
+    w_num(&mut out, v);
+    w_s(&mut out, "\n");
+    return;
+  }
+  if v >= 18446744073709486080 {
+    w_s(&mut out, "\tmov ");
+    a64_x(&mut out, r);
+    w_s(&mut out, ", #-");
+    w_num(&mut out, wrap_sub(0, v));
+    w_s(&mut out, "\n");
+    return;
+  }
+  let mut first = true;
+  let mut sh = 0;
+  while sh < 64 {
+    let part = (v >> sh) & 65535;
+    if part != 0 {
+      if first {
+        w_s(&mut out, "\tmovz ");
+      } else {
+        w_s(&mut out, "\tmovk ");
+      }
+      a64_x(&mut out, r);
+      w_s(&mut out, ", #");
+      w_num(&mut out, part);
+      if sh > 0 {
+        w_s(&mut out, ", lsl #");
+        w_num(&mut out, sh);
+      }
+      w_s(&mut out, "\n");
+      first = false;
+    }
+    sh = sh + 16;
+  }
+}
+
+/// `ldr x<r>, [sp, #off]` for the frame word `w` (a longer offset goes
+/// through x16).
+fn a64_ldr_w(out: &mut Vec[u64], r: u64, w: u64) {
+  let off = wrap_mul(8, w);
+  if off <= 32760 {
+    w_s(&mut out, "\tldr ");
+    a64_x(&mut out, r);
+    w_s(&mut out, ", [sp, #");
+    w_num(&mut out, off);
+    w_s(&mut out, "]\n");
+  } else {
+    a64_movi(&mut out, 16, off);
+    w_s(&mut out, "\tldr ");
+    a64_x(&mut out, r);
+    w_s(&mut out, ", [sp, x16]\n");
+  }
+}
+
+fn a64_str_w(out: &mut Vec[u64], r: u64, w: u64) {
+  let off = wrap_mul(8, w);
+  if off <= 32760 {
+    w_s(&mut out, "\tstr ");
+    a64_x(&mut out, r);
+    w_s(&mut out, ", [sp, #");
+    w_num(&mut out, off);
+    w_s(&mut out, "]\n");
+  } else {
+    a64_movi(&mut out, 16, off);
+    w_s(&mut out, "\tstr ");
+    a64_x(&mut out, r);
+    w_s(&mut out, ", [sp, x16]\n");
+  }
+}
+
+/// `x<r> = sp + 8 * w`.
+fn a64_addr_w(out: &mut Vec[u64], r: u64, w: u64) {
+  let off = wrap_mul(8, w);
+  if off <= 4095 {
+    w_s(&mut out, "\tadd ");
+    a64_x(&mut out, r);
+    w_s(&mut out, ", sp, #");
+    w_num(&mut out, off);
+    w_s(&mut out, "\n");
+  } else {
+    a64_movi(&mut out, 16, off);
+    w_s(&mut out, "\tadd ");
+    a64_x(&mut out, r);
+    w_s(&mut out, ", sp, x16\n");
+  }
+}
+
+/// `to = from`; through x11 when both are in memory.
+fn a64_mov(out: &mut Vec[u64], from: A64L, to: A64L) {
+  if to.k == A64K_IMM {
+    return;
+  }
+  if from.k == A64K_REG && to.k == A64K_REG {
+    if from.reg != to.reg {
+      w_s(&mut out, "\tmov ");
+      a64_x(&mut out, to.reg);
+      w_s(&mut out, ", ");
+      a64_x(&mut out, from.reg);
+      w_s(&mut out, "\n");
+    }
+  } else if from.k == A64K_REG {
+    a64_str_w(&mut out, from.reg, to.off);
+  } else if from.k == A64K_IMM {
+    if to.k == A64K_REG {
+      a64_movi(&mut out, to.reg, from.imm);
+    } else {
+      a64_movi(&mut out, 11, from.imm);
+      a64_str_w(&mut out, 11, to.off);
+    }
+  } else if to.k == A64K_REG {
+    a64_ldr_w(&mut out, to.reg, from.off);
+  } else {
+    a64_ldr_w(&mut out, 11, from.off);
+    a64_str_w(&mut out, 11, to.off);
+  }
+}
+
+/// The register that holds virtual register `r`: its own, or `scratch` after
+/// loading it.
+fn a64_use(out: &mut Vec[u64], al: &IrAlloc, fr: A64F, r: u64, scratch: u64) -> u64 {
+  let l = a64_loc(al, fr, r);
+  if l.k == A64K_REG {
+    return l.reg;
+  }
+  a64_mov(&mut out, l, a64_rl(scratch));
+  return scratch;
+}
+
+/// `d = x<t>`.
+fn a64_finish(out: &mut Vec[u64], al: &IrAlloc, fr: A64F, d: u64, t: u64) {
+  a64_mov(&mut out, a64_rl(t), a64_loc(al, fr, d));
+}
+
+/// The register to compute the result `d` in: its own, or x11.
+fn a64_dest(al: &IrAlloc, fr: A64F, d: u64) -> u64 {
+  let l = a64_loc(al, fr, d);
+  if l.k == A64K_REG {
+    return l.reg;
+  }
+  return 11;
+}
+
+/// `name x<d>, x<a>, x<b>`.
+fn a64_ins3(out: &mut Vec[u64], name: Str, d: u64, a: u64, b: u64) {
+  w_s(&mut out, "\t");
+  w_s(&mut out, name);
+  w_s(&mut out, " ");
+  a64_x(&mut out, d);
+  w_s(&mut out, ", ");
+  a64_x(&mut out, a);
+  w_s(&mut out, ", ");
+  a64_x(&mut out, b);
+  w_s(&mut out, "\n");
+}
+
+/// `name x<d>, x<a>, #v`.
+fn a64_ins3i(out: &mut Vec[u64], name: Str, d: u64, a: u64, v: u64) {
+  w_s(&mut out, "\t");
+  w_s(&mut out, name);
+  w_s(&mut out, " ");
+  a64_x(&mut out, d);
+  w_s(&mut out, ", ");
+  a64_x(&mut out, a);
+  w_s(&mut out, ", #");
+  w_num(&mut out, v);
+  w_s(&mut out, "\n");
+}
+
+/// The operand `l` of a comparison or an arithmetic instruction as a
+/// register, loaded into `scratch` when it is not in one.
+fn a64_reg(out: &mut Vec[u64], l: A64L, scratch: u64) -> u64 {
+  if l.k == A64K_REG {
+    return l.reg;
+  }
+  a64_mov(&mut out, l, a64_rl(scratch));
+  return scratch;
+}
+
+/// Truncates x<r> to the integer type `t` (and sign-extends a signed one).
+fn a64_norm(out: &mut Vec[u64], m: &Mono, t: u64, r: u64) {
+  let k = kind_t(m, t);
+  if k == TY_U8 {
+    w_s(&mut out, "\tuxtb ");
+    a64_w(&mut out, r);
+    w_s(&mut out, ", ");
+    a64_w(&mut out, r);
+    w_s(&mut out, "\n");
+  } else if k == TY_U16 {
+    w_s(&mut out, "\tuxth ");
+    a64_w(&mut out, r);
+    w_s(&mut out, ", ");
+    a64_w(&mut out, r);
+    w_s(&mut out, "\n");
+  } else if k == TY_U32 {
+    w_s(&mut out, "\tmov ");
+    a64_w(&mut out, r);
+    w_s(&mut out, ", ");
+    a64_w(&mut out, r);
+    w_s(&mut out, "\n");
+  } else if k == TY_I8 {
+    w_s(&mut out, "\tsxtb ");
+    a64_x(&mut out, r);
+    w_s(&mut out, ", ");
+    a64_w(&mut out, r);
+    w_s(&mut out, "\n");
+  } else if k == TY_I16 {
+    w_s(&mut out, "\tsxth ");
+    a64_x(&mut out, r);
+    w_s(&mut out, ", ");
+    a64_w(&mut out, r);
+    w_s(&mut out, "\n");
+  } else if k == TY_I32 {
+    w_s(&mut out, "\tsxtw ");
+    a64_x(&mut out, r);
+    w_s(&mut out, ", ");
+    a64_w(&mut out, r);
+    w_s(&mut out, "\n");
+  }
+}
+
+/// Does `ty` need a truncation after an operation that can wrap?
+fn a64_wraps(m: &Mono, t: u64) -> bool {
+  if t == 0 {
+    return false;
+  }
+  let k = kind_t(m, t);
+  return k == TY_U8 || k == TY_U16 || k == TY_U32 || k == TY_I8 || k == TY_I16 || k == TY_I32;
+}
+
+/// The condition-code suffix of comparison `op`.
+fn a64_cc(op: u64) -> Str {
+  if op == IR_EQ { return "eq"; }
+  if op == IR_NE { return "ne"; }
+  if op == IR_LT { return "lo"; }
+  if op == IR_LE { return "ls"; }
+  if op == IR_GT { return "hi"; }
+  if op == IR_GE { return "hs"; }
+  if op == IR_SLT { return "lt"; }
+  if op == IR_SLE { return "le"; }
+  if op == IR_SGT { return "gt"; }
+  return "ge";
+}
+
+/// Writes the comparison of `a` with `b` (the flags for `a ? b`).
+fn a64_cmp(out: &mut Vec[u64], al: &IrAlloc, fr: A64F, a: u64, b: u64) {
+  let ra = a64_use(&mut out, al, fr, a, 9);
+  let lb = a64_loc(al, fr, b);
+  let mut rb = 0;
+  if lb.k != A64K_IMM || lb.imm > 4095 {
+    rb = a64_reg(&mut out, lb, 10);
+  }
+  w_s(&mut out, "\tcmp ");
+  a64_x(&mut out, ra);
+  w_s(&mut out, ", ");
+  if lb.k == A64K_IMM && lb.imm <= 4095 {
+    w_s(&mut out, "#");
+    w_num(&mut out, lb.imm);
+  } else {
+    a64_x(&mut out, rb);
+  }
+  w_s(&mut out, "\n");
+}
+
+fn a64_branch(out: &mut Vec[u64], cc: Str, x: u64, l: u64) {
+  w_s(&mut out, "\tb.");
+  w_s(&mut out, cc);
+  w_s(&mut out, " ");
+  ix_lbl(&mut out, x, l);
+  w_s(&mut out, "\n");
+}
+
+fn a64_jump(out: &mut Vec[u64], x: u64, l: u64) {
+  w_s(&mut out, "\tb ");
+  ix_lbl(&mut out, x, l);
+  w_s(&mut out, "\n");
+}
+
+/// The jumps of a branch whose condition `op` is already in the flags.
+fn a64_br_flags(out: &mut Vec[u64], x: u64, op: u64, then: u64, els: u64, next: u64) {
+  if next == then {
+    a64_branch(&mut out, a64_cc(ix_not(op)), x, els);
+  } else {
+    a64_branch(&mut out, a64_cc(op), x, then);
+    if next != els {
+      a64_jump(&mut out, x, els);
+    }
+  }
+}
+
+/// A branch on the register `r` being nonzero.
+fn a64_br_reg(out: &mut Vec[u64], r: u64, x: u64, then: u64, els: u64, next: u64) {
+  if next == then {
+    w_s(&mut out, "\tcbz ");
+    a64_x(&mut out, r);
+    w_s(&mut out, ", ");
+    ix_lbl(&mut out, x, els);
+    w_s(&mut out, "\n");
+  } else {
+    w_s(&mut out, "\tcbnz ");
+    a64_x(&mut out, r);
+    w_s(&mut out, ", ");
+    ix_lbl(&mut out, x, then);
+    w_s(&mut out, "\n");
+    if next != els {
+      a64_jump(&mut out, x, els);
+    }
+  }
+}
+
+/// `name`, the 12-bit-immediate form when `b` is a constant that fits.
+fn a64_arith(out: &mut Vec[u64], al: &IrAlloc, fr: A64F, name: Str, imm_ok: bool, d: u64, a: u64, b: u64) -> u64 {
+  let t = a64_dest(al, fr, d);
+  let ra = a64_use(&mut out, al, fr, a, 9);
+  let lb = a64_loc(al, fr, b);
+  if imm_ok && lb.k == A64K_IMM && lb.imm <= 4095 {
+    a64_ins3i(&mut out, name, t, ra, lb.imm);
+  } else {
+    a64_ins3(&mut out, name, t, ra, a64_reg(&mut out, lb, 10));
+  }
+  return t;
+}
+
+/// The address `a[b]` of a `size`-byte element, as the text of the memory
+/// operand.
+fn a64_mem(out: &mut Vec[u64], al: &IrAlloc, fr: A64F, a: u64, b: u64, size: u64) {
+  let ra = a64_use(&mut out, al, fr, a, 9);
+  let lb = a64_loc(al, fr, b);
+  if lb.k == A64K_IMM && lb.imm <= 4095 {
+    w_s(&mut out, "[");
+    a64_x(&mut out, ra);
+    w_s(&mut out, ", #");
+    w_num(&mut out, wrap_mul(lb.imm, size));
+    w_s(&mut out, "]");
+  } else {
+    let rb = a64_reg(&mut out, lb, 10);
+    w_s(&mut out, "[");
+    a64_x(&mut out, ra);
+    w_s(&mut out, ", ");
+    a64_x(&mut out, rb);
+    if size == 8 {
+      w_s(&mut out, ", lsl #3");
+    }
+    w_s(&mut out, "]");
+  }
+}
+
+/// A call: the argument words in x0-x7, then the result from x0 and x1.
+fn a64_call(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, fr: A64F, g: &mut X86, m: &mut Mono, p: &Parser, q: IrIns, slotw: u64) {
+  if q.op == IR_CALLM {
+    a64_addr_w(&mut out, 8, slotw);
+  }
+  let mut j = 0;
+  while j < q.c && j < 8 {
+    let a = u_at(f.args, wrap_add(q.b, j));
+    a64_mov(&mut out, a64_loc(al, fr, a), a64_rl(j));
+    j = j + 1;
+  }
+  w_s(&mut out, "\tbl ");
+  ix_sym(&mut out, &mut g, m, p, q.a);
+  w_s(&mut out, "\n");
+  if q.op == IR_CALLM {
+    let t = a64_dest(al, fr, q.d);
+    a64_addr_w(&mut out, t, slotw);
+    a64_finish(&mut out, al, fr, q.d, t);
+    return;
+  }
+  if q.d != IR_NONE {
+    a64_mov(&mut out, a64_rl(0), a64_loc(al, fr, q.d));
+    if q.ty != IR_NONE && q.ty != 0 {
+      a64_mov(&mut out, a64_rl(1), a64_loc(al, fr, q.ty));
+    }
+  }
+}
+
+/// One instruction other than control flow and calls. `slotw` is the frame
+/// word of the slot this instruction opens, if it is an `IR_SLOT`.
+fn a64_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, fr: A64F, g: &mut X86, m: &Mono, p: &Parser, q: IrIns, slotw: u64) {
+  let op = q.op;
+  if op == IR_ADD || op == IR_SUB || op == IR_MUL || op == IR_AND || op == IR_OR || op == IR_XOR {
+    let mut name = "add";
+    let mut imm_ok = true;
+    if op == IR_SUB {
+      name = "sub";
+    } else if op == IR_MUL {
+      name = "mul";
+      imm_ok = false;
+    } else if op == IR_AND {
+      name = "and";
+      imm_ok = false;
+    } else if op == IR_OR {
+      name = "orr";
+      imm_ok = false;
+    } else if op == IR_XOR {
+      name = "eor";
+      imm_ok = false;
+    }
+    let t = a64_arith(&mut out, al, fr, name, imm_ok, q.d, q.a, q.b);
+    if q.c == 1 && a64_wraps(m, q.ty) {
+      a64_norm(&mut out, m, q.ty, t);
+    }
+    a64_finish(&mut out, al, fr, q.d, t);
+  } else if ix_is_cmp(op) {
+    a64_cmp(&mut out, al, fr, q.a, q.b);
+    let t = a64_dest(al, fr, q.d);
+    w_s(&mut out, "\tcset ");
+    a64_x(&mut out, t);
+    w_s(&mut out, ", ");
+    w_s(&mut out, a64_cc(op));
+    w_s(&mut out, "\n");
+    a64_finish(&mut out, al, fr, q.d, t);
+  } else if op == IR_CONST {
+    if u_at(al.cst, q.d) == 0 {
+      a64_mov(&mut out, a64_il(q.a), a64_loc(al, fr, q.d));
+    }
+  } else if op == IR_MOV {
+    a64_mov(&mut out, a64_loc(al, fr, q.a), a64_loc(al, fr, q.d));
+  } else if op == IR_DIV || op == IR_SDIV {
+    let mut name = "udiv";
+    if op == IR_SDIV {
+      name = "sdiv";
+    }
+    let t = a64_arith(&mut out, al, fr, name, false, q.d, q.a, q.b);
+    a64_finish(&mut out, al, fr, q.d, t);
+  } else if op == IR_REM || op == IR_SREM {
+    let mut name = "udiv";
+    if op == IR_SREM {
+      name = "sdiv";
+    }
+    let ra = a64_use(&mut out, al, fr, q.a, 9);
+    let rb = a64_use(&mut out, al, fr, q.b, 10);
+    a64_ins3(&mut out, name, 16, ra, rb);
+    let t = a64_dest(al, fr, q.d);
+    w_s(&mut out, "\tmsub ");
+    a64_x(&mut out, t);
+    w_s(&mut out, ", x16, ");
+    a64_x(&mut out, rb);
+    w_s(&mut out, ", ");
+    a64_x(&mut out, ra);
+    w_s(&mut out, "\n");
+    a64_finish(&mut out, al, fr, q.d, t);
+  } else if op == IR_SHL || op == IR_SHR || op == IR_SAR {
+    let mut name = "asr";
+    if op == IR_SHL {
+      name = "lsl";
+    } else if op == IR_SHR {
+      name = "lsr";
+    }
+    let t = a64_dest(al, fr, q.d);
+    let ra = a64_use(&mut out, al, fr, q.a, 9);
+    let lb = a64_loc(al, fr, q.b);
+    if lb.k == A64K_IMM && lb.imm < 64 {
+      a64_ins3i(&mut out, name, t, ra, lb.imm);
+    } else {
+      a64_ins3(&mut out, name, t, ra, a64_reg(&mut out, lb, 10));
+    }
+    a64_finish(&mut out, al, fr, q.d, t);
+  } else if op == IR_NOT {
+    let t = a64_dest(al, fr, q.d);
+    let ra = a64_use(&mut out, al, fr, q.a, 9);
+    if q.ty != 0 {
+      w_s(&mut out, "\tmvn ");
+      a64_x(&mut out, t);
+      w_s(&mut out, ", ");
+      a64_x(&mut out, ra);
+      w_s(&mut out, "\n");
+      if a64_wraps(m, q.ty) {
+        a64_norm(&mut out, m, q.ty, t);
+      }
+    } else {
+      a64_ins3i(&mut out, "eor", t, ra, 1);
+    }
+    a64_finish(&mut out, al, fr, q.d, t);
+  } else if op == IR_NEG {
+    let t = a64_dest(al, fr, q.d);
+    let ra = a64_use(&mut out, al, fr, q.a, 9);
+    w_s(&mut out, "\tneg ");
+    a64_x(&mut out, t);
+    w_s(&mut out, ", ");
+    a64_x(&mut out, ra);
+    w_s(&mut out, "\n");
+    a64_finish(&mut out, al, fr, q.d, t);
+  } else if op == IR_WRAP {
+    let t = a64_dest(al, fr, q.d);
+    a64_mov(&mut out, a64_loc(al, fr, q.a), a64_rl(t));
+    a64_norm(&mut out, m, q.ty, t);
+    a64_finish(&mut out, al, fr, q.d, t);
+  } else if op == IR_LOAD {
+    let t = a64_dest(al, fr, q.d);
+    if q.c == 1 {
+      w_s(&mut out, "\tldrb ");
+      a64_w(&mut out, t);
+    } else {
+      w_s(&mut out, "\tldr ");
+      a64_x(&mut out, t);
+    }
+    w_s(&mut out, ", ");
+    a64_mem(&mut out, al, fr, q.a, q.b, q.c);
+    w_s(&mut out, "\n");
+    a64_finish(&mut out, al, fr, q.d, t);
+  } else if op == IR_STORE {
+    let rv = a64_reg(&mut out, a64_loc(al, fr, q.d), 11);
+    if q.c == 1 {
+      w_s(&mut out, "\tstrb ");
+      a64_w(&mut out, rv);
+    } else {
+      w_s(&mut out, "\tstr ");
+      a64_x(&mut out, rv);
+    }
+    w_s(&mut out, ", ");
+    a64_mem(&mut out, al, fr, q.a, q.b, q.c);
+    w_s(&mut out, "\n");
+  } else if op == IR_ALLOC {
+    a64_mov(&mut out, a64_loc(al, fr, q.a), a64_rl(0));
+    if q.c == 1 {
+      w_s(&mut out, "\tbl bst_rt_balloc\n");
+    } else {
+      w_s(&mut out, "\tbl bst_rt_alloc\n");
+    }
+    a64_finish(&mut out, al, fr, q.d, 0);
+  } else if op == IR_FREE {
+    a64_mov(&mut out, a64_loc(al, fr, q.a), a64_rl(0));
+    w_s(&mut out, "\tbl bst_rt_free\n");
+  } else if op == IR_PRINT {
+    a64_mov(&mut out, a64_loc(al, fr, q.a), a64_rl(0));
+    w_s(&mut out, "\tbl bst_rt_print\n");
+  } else if op == IR_VGROW {
+    a64_mov(&mut out, a64_loc(al, fr, q.a), a64_rl(0));
+    a64_movi(&mut out, 1, wrap_mul(8, q.c));
+    w_s(&mut out, "\tbl bst_rt_vec_grow\n");
+  } else if op == IR_STRLIT {
+    // The bytes are in the data of the program; the literal of a syntax
+    // node is added once.
+    let mut s = 0;
+    while s < vec_len(g.snode) && u_at(g.snode, s) != q.a {
+      s = s + 1;
+    }
+    if s == vec_len(g.snode) {
+      let b = x86_lit_bytes(p, q.a);
+      s = x86_add_string(&mut g, b);
+      vec_push(&mut g.snode, q.a);
+      vec_free(b);
+    }
+    let t = a64_dest(al, fr, q.d);
+    w_s(&mut out, "\tadrp ");
+    a64_x(&mut out, t);
+    w_s(&mut out, ", .Lstr");
+    w_num(&mut out, s);
+    w_s(&mut out, "\n\tadd ");
+    a64_x(&mut out, t);
+    w_s(&mut out, ", ");
+    a64_x(&mut out, t);
+    w_s(&mut out, ", :lo12:.Lstr");
+    w_num(&mut out, s);
+    w_s(&mut out, "\n");
+    a64_finish(&mut out, al, fr, q.d, t);
+  } else if op == IR_SLOT {
+    let t = a64_dest(al, fr, q.d);
+    a64_addr_w(&mut out, t, slotw);
+    a64_finish(&mut out, al, fr, q.d, t);
+  }
+}
+
+/// The body of the function: its instructions.
+fn a64_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, fr: A64F, g: &mut X86, m: &mut Mono, p: &Parser, nuse: &Vec[u64], base: u64) {
+  let n = vec_len(f.ins);
+  let mut slotw = base;
+  let mut i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    let nq = ix_at(f, i + 1);
+    let nq2 = ix_at(f, i + 2);
+    let mut next = IR_NONE;
+    if nq.op == IR_LABEL {
+      next = nq.a;
+    }
+    if q.op == IR_LABEL {
+      ix_lbl(&mut out, f.x, q.a);
+      w_s(&mut out, ":\n");
+    } else if q.op == IR_JMP {
+      if next != q.a {
+        a64_jump(&mut out, f.x, q.a);
+      }
+    } else if q.op == IR_BR {
+      let r = a64_use(&mut out, al, fr, q.a, 9);
+      a64_br_reg(&mut out, r, f.x, q.b, q.c, next);
+    } else if ix_is_cmp(q.op) && nq.op == IR_BR && nq.a == q.d && u_at(nuse, q.d) == 1 {
+      // A comparison that only the branch after it reads: no boolean.
+      let mut next2 = IR_NONE;
+      if nq2.op == IR_LABEL {
+        next2 = nq2.a;
+      }
+      a64_cmp(&mut out, al, fr, q.a, q.b);
+      a64_br_flags(&mut out, f.x, q.op, nq.b, nq.c, next2);
+      i = i + 1;
+    } else if q.op == IR_RET && q.c > 0 {
+      // A result of more than two words goes to the space the caller
+      // reserved, whose address came in x8.
+      let rb = a64_use(&mut out, al, fr, q.a, 9);
+      a64_ldr_w(&mut out, 16, fr.nsave);
+      let mut j = 0;
+      while j < q.c && j < 4095 {
+        w_s(&mut out, "\tldr x17, [");
+        a64_x(&mut out, rb);
+        w_s(&mut out, ", #");
+        w_num(&mut out, wrap_mul(8, j));
+        w_s(&mut out, "]\n\tstr x17, [x16, #");
+        w_num(&mut out, wrap_mul(8, j));
+        w_s(&mut out, "]\n");
+        j = j + 1;
+      }
+      if i + 1 < n {
+        a64_jump(&mut out, f.x, IR_NONE);
+      }
+    } else if q.op == IR_RET {
+      if q.a != IR_NONE {
+        a64_mov(&mut out, a64_loc(al, fr, q.a), a64_rl(0));
+      }
+      if q.b != IR_NONE {
+        a64_mov(&mut out, a64_loc(al, fr, q.b), a64_rl(1));
+      }
+      if i + 1 < n {
+        a64_jump(&mut out, f.x, IR_NONE);
+      }
+    } else if q.op == IR_UNREACH {
+      w_s(&mut out, "\tbrk #0\n");
+    } else if q.op == IR_CALL || q.op == IR_CALLM {
+      let at = slotw;
+      if q.op == IR_CALLM {
+        slotw = wrap_add(slotw, q.ty);
+      }
+      a64_call(&mut out, f, al, fr, &mut g, &mut m, p, q, at);
+    } else {
+      let at = slotw;
+      if q.op == IR_SLOT {
+        slotw = wrap_add(slotw, q.c);
+      }
+      a64_ins(&mut out, f, al, fr, &mut g, m, p, q, at);
+    }
+    i = i + 1;
+  }
+}
+
+/// Writes function instance `x` from its IR, to `g.out`. False, with the
+/// reason in `g`, when the IR does not cover it.
+fn a64_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> bool {
+  let mut f = ir_lower(c, &mut m, p, x);
+  let xi = inst_at(m, x);
+  if f.failed {
+    x86_sym(&mut g, m, p, x);
+    if !g.failed {
+      g.failed = true;
+      w_s(&mut g.fmsg, "the AArch64 backend does not cover `");
+      w_append(&mut g.fmsg, g.ln);
+      w_s(&mut g.fmsg, "` yet: ");
+      w_append(&mut g.fmsg, f.why);
+    }
+    while vec_len(g.ln) > 0 {
+      vec_pop(&mut g.ln);
+    }
+    ir_free(f);
+    return false;
+  }
+  let mut ok = vec_len(f.params) <= A64_MAX_ARGS;
+  if ok && name_is(p, xi.def, "main") && vec_len(f.params) > 0 {
+    ok = false;
+  }
+  if vec_len(f.ins) > IX_MAX_INS {
+    ok = false;
+  }
+  let mut k = 0;
+  while ok && k < vec_len(f.ins) {
+    let q = vec_get(f.ins, k);
+    if q.op == IR_CALL || q.op == IR_CALLM {
+      if q.c > A64_MAX_ARGS || !ix_call_ok(f, &mut g, c, &mut m, p, q) {
+        ok = false;
+      }
+    }
+    k = k + 1;
+  }
+  if !ok {
+    x86_sym(&mut g, m, p, x);
+    if !g.failed {
+      g.failed = true;
+      w_s(&mut g.fmsg, "the AArch64 backend does not cover `");
+      w_append(&mut g.fmsg, g.ln);
+      w_s(&mut g.fmsg, "` yet: more than 8 argument words, a main with parameters, or too many instructions");
+    }
+    while vec_len(g.ln) > 0 {
+      vec_pop(&mut g.ln);
+    }
+    ir_free(f);
+    return false;
+  }
+  ix_coalesce(&mut f);
+  let al = ra_alloc_const(f, 9, 4);
+  let nuse = ix_uses(f);
+  // Does it return more than two words?
+  let mut retmem = 0;
+  let mut slots = 0;
+  k = 0;
+  while k < vec_len(f.ins) {
+    let q = vec_get(f.ins, k);
+    if q.op == IR_SLOT {
+      slots = wrap_add(slots, q.c);
+    } else if q.op == IR_CALLM {
+      slots = wrap_add(slots, q.ty);
+    } else if q.op == IR_RET && q.c > 0 {
+      retmem = 1;
+    }
+    k = k + 1;
+  }
+  let fr = A64F { nsave: al.ncallee_used, retp: retmem };
+  let base = wrap_add(wrap_add(fr.nsave, fr.retp), al.nspill);
+  let mut words = wrap_add(base, slots);
+  if words % 2 == 1 {
+    words = wrap_add(words, 1);
+  }
+  let mut out = vec_new[u64]();
+  w_s(&mut out, "\t.type ");
+  ix_sym(&mut out, &mut g, m, p, x);
+  w_s(&mut out, ", %function\n");
+  ix_sym(&mut out, &mut g, m, p, x);
+  w_s(&mut out, ":                  // from the IR\n\tstp x29, x30, [sp, #-16]!\n\tmov x29, sp\n");
+  if words > 0 {
+    let bytes = wrap_mul(8, words);
+    if bytes <= 4095 {
+      w_s(&mut out, "\tsub sp, sp, #");
+      w_num(&mut out, bytes);
+      w_s(&mut out, "\n");
+    } else {
+      a64_movi(&mut out, 16, bytes);
+      w_s(&mut out, "\tsub sp, sp, x16\n");
+    }
+  }
+  k = 0;
+  while k < al.ncallee_used {
+    a64_str_w(&mut out, a64_callee(k), k);
+    k = k + 1;
+  }
+  if retmem == 1 {
+    a64_str_w(&mut out, 8, fr.nsave);
+  }
+  // The parameters, from their argument registers.
+  k = 0;
+  while k < vec_len(f.params) && k < 8 {
+    let r = vec_get(f.params, k);
+    if u_at(al.cls, r) != RA_NONE {
+      a64_mov(&mut out, a64_rl(k), a64_loc(al, fr, r));
+    }
+    k = k + 1;
+  }
+  a64_body(&mut out, f, al, fr, &mut g, &mut m, p, nuse, base);
+  ix_lbl(&mut out, x, IR_NONE);
+  w_s(&mut out, ":\n");
+  k = 0;
+  while k < al.ncallee_used {
+    a64_ldr_w(&mut out, a64_callee(k), k);
+    k = k + 1;
+  }
+  w_s(&mut out, "\tmov sp, x29\n\tldp x29, x30, [sp], #16\n\tret\n\t.size ");
+  ix_sym(&mut out, &mut g, m, p, x);
+  w_s(&mut out, ", .-");
+  ix_sym(&mut out, &mut g, m, p, x);
+  w_s(&mut out, "\n\n");
+  w_append(&mut g.out, out);
+  vec_free(out);
+  vec_free(nuse);
+  ra_free(al);
+  ir_free(f);
+  return true;
+}
+
+/// The runtime of the hosted target: assembly over the C library, part of
+/// the trusted base (as `x86_runtime` is for x86-64).
+fn a64_runtime(out: &mut Vec[u64]) {
+  w_s(&mut out, "\n// ---- runtime (trusted base) ----\n");
+  w_s(&mut out, "bst_rt_print:                   // print(x0) as a decimal line\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-16]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tmov x1, x0\n");
+  w_s(&mut out, "\tadrp x0, .Lrt_fmt\n");
+  w_s(&mut out, "\tadd x0, x0, :lo12:.Lrt_fmt\n");
+  w_s(&mut out, "\tbl printf\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #16\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_alloc:                   // x0 = x0 zeroed words (at least one)\n");
+  w_s(&mut out, "\tmov x1, #8\n");
+  w_s(&mut out, "\tb 1f\n");
+  w_s(&mut out, "bst_rt_balloc:                  // x0 = x0 zeroed bytes (at least one)\n");
+  w_s(&mut out, "\tmov x1, #1\n");
+  w_s(&mut out, "1:\tstp x29, x30, [sp, #-16]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tcbnz x0, 2f\n");
+  w_s(&mut out, "\tmov x0, #1\n");
+  w_s(&mut out, "2:\tbl calloc\n");
+  w_s(&mut out, "\tcbz x0, bst_rt_oom\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #16\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_free:                    // free(x0)\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-16]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tbl free\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #16\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_vec_grow:                // grow the Vec at (x0), elements of x1 bytes\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-32]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tstp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tmov x19, x0\n");
+  w_s(&mut out, "\tldr x20, [x19, #8]             // new capacity: double, or 4 when empty\n");
+  w_s(&mut out, "\tadd x20, x20, x20\n");
+  w_s(&mut out, "\tcbnz x20, 1f\n");
+  w_s(&mut out, "\tmov x20, #4\n");
+  w_s(&mut out, "1:\tumulh x2, x20, x1            // bytes; past 64 bits the request cannot be met\n");
+  w_s(&mut out, "\tcbnz x2, bst_rt_oom\n");
+  w_s(&mut out, "\tmul x1, x20, x1\n");
+  w_s(&mut out, "\tldr x0, [x19, #16]\n");
+  w_s(&mut out, "\tbl realloc\n");
+  w_s(&mut out, "\tcbz x0, bst_rt_oom\n");
+  w_s(&mut out, "\tstr x0, [x19, #16]\n");
+  w_s(&mut out, "\tstr x20, [x19, #8]\n");
+  w_s(&mut out, "\tldp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #32\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_oom:\n");
+  w_s(&mut out, "\tmov x0, #2\n");
+  w_s(&mut out, "\tadrp x1, .Lrt_oom\n");
+  w_s(&mut out, "\tadd x1, x1, :lo12:.Lrt_oom\n");
+  w_s(&mut out, "\tmov x2, #22\n");
+  w_s(&mut out, "\tbl write\n");
+  w_s(&mut out, "\tbl abort\n");
+  w_s(&mut out, "\t.section .rodata\n");
+  w_s(&mut out, ".Lrt_fmt:\n");
+  w_s(&mut out, "\t.string \"%llu\\n\"\n");
+  w_s(&mut out, ".Lrt_oom:\n");
+  w_s(&mut out, "\t.string \"Bastio: out of memory\\n\"\n");
+  w_s(&mut out, "\t.text\n");
+}
+
+/// A program for AArch64: every function from its IR, then `main` as the
+/// C library's entry point, the runtime and the string data. False, with
+/// the reason in `g`, when something is not covered yet.
+fn a64_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
+  let mut main_x = 0;
+  let mut k = 0;
+  while k < vec_len(m.fns) {
+    let x = u_at(m.fns, k);
+    let xi = inst_at(m, x);
+    if name_is(p, xi.def, "main") {
+      main_x = x;
+    }
+    k = k + 1;
+  }
+  if main_x == 0 || g.target != TARGET_HOSTED {
+    x86_fail(&mut g, "the AArch64 backend builds hosted programs with a `main` only so far");
+    return false;
+  }
+  w_s(&mut g.out, "// generated by bastioc1 --arch aarch64 --backend native -- do not edit\n\t.text\n");
+  k = 0;
+  while k < vec_len(m.fns) {
+    let x = u_at(m.fns, k);
+    if !a64_function(&mut g, c, &mut m, p, x) {
+      return false;
+    }
+    k = k + 1;
+  }
+  w_s(&mut g.out, "\t.globl main\n\t.type main, %function\nmain:\n\tstp x29, x30, [sp, #-16]!\n\tmov x29, sp\n\tbl ");
+  let mut ms = vec_new[u64]();
+  ix_sym(&mut ms, &mut g, m, p, main_x);
+  w_append(&mut g.out, ms);
+  vec_free(ms);
+  w_s(&mut g.out, "\n\tldp x29, x30, [sp], #16\n\tret\n");
+  a64_runtime(&mut g.out);
+  w_s(&mut g.out, "\t.section .rodata\n");
+  k = 0;
+  while k < vec_len(g.slens) {
+    w_s(&mut g.out, ".Lstr");
+    w_num(&mut g.out, k);
+    w_s(&mut g.out, ":\n");
+    let from = u_at(g.sstart, k);
+    let n = u_at(g.slens, k);
+    let mut j = 0;
+    while j < n {
+      if j % 24 == 0 {
+        w_s(&mut g.out, "\t.byte ");
+      } else {
+        w_s(&mut g.out, ",");
+      }
+      w_num(&mut g.out, u_at(g.sdata, wrap_add(from, j)));
+      j = j + 1;
+      if j % 24 == 0 || j == n {
+        w_s(&mut g.out, "\n");
+      }
+    }
+    k = k + 1;
+  }
+  w_s(&mut g.out, "\t.section .note.GNU-stack,\"\",%progbits\n");
+  return true;
+}
