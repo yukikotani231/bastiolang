@@ -49,7 +49,7 @@ const IR_SGE: u64 = 29;
 const IR_LABEL: u64 = 40;    // label a starts here
 const IR_JMP: u64 = 41;      // goto label a
 const IR_BR: u64 = 42;       // if a goto label b else label c
-const IR_RET: u64 = 43;      // return a, and b if a buffer (IR_NONE: nothing)
+const IR_RET: u64 = 43;      // return a, and b if a buffer (IR_NONE: nothing); with c > 0, the c words at address a (a result of more than two words)
 const IR_CALL: u64 = 44;     // d (and ty if a buffer) = instance a called with the c registers of args[b ..] (d = IR_NONE: no result)
 const IR_UNREACH: u64 = 45;
 const IR_LOAD: u64 = 46;     // d = the c-byte element a[b] (c is 1 or 8; a the data address, b the index)
@@ -60,6 +60,7 @@ const IR_PRINT: u64 = 50;    // prints the number a
 const IR_WRAP: u64 = 51;     // d = a truncated to the integer type ty
 
 const IR_SLOT: u64 = 52;     // d = the address of a frame slot of c words (one per instruction, allocated once per function however often it runs)
+const IR_CALLM: u64 = 54;    // d = the address of a frame slot of ty words that instance a, called with the c registers of args[b ..], fills with its result (a result of more than two words)
 const IR_VGROW: u64 = 53;    // makes room in the Vec whose 3-word header is at address a (c = words per element): a runtime call that may change the header
 
 const IR_NONE: u64 = 18446744073709551615;
@@ -619,6 +620,28 @@ fn ir_elem(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
   return IrVal { k: kind, r0: b.r0, r1: ix, t: 0 };
 }
 
+/// Stores the `w` words in the consecutive registers from `r` at the memory
+/// at address register `a`.
+fn ir_store_words(f: &mut IrFn, a: u64, r: u64, w: u64) {
+  let mut j = 0;
+  while j < w && j < 64 {
+    ir_hdr_store(&mut f, a, j, wrap_add(r, j));
+    j = j + 1;
+  }
+}
+
+/// Loads `w` words from address register `a` into the consecutive registers
+/// from `r`.
+fn ir_load_words(f: &mut IrFn, a: u64, r: u64, w: u64) {
+  let mut j = 0;
+  while j < w && j < 64 {
+    let kr = ir_reg(&mut f);
+    ir_emit(&mut f, IR_CONST, kr, j, 0, 0, 0);
+    ir_emit(&mut f, IR_LOAD, wrap_add(r, j), a, kr, 8, 0);
+    j = j + 1;
+  }
+}
+
 /// Word `k` of the Vec header at address `a`.
 fn ir_hdr_load(f: &mut IrFn, a: u64, k: u64) -> u64 {
   let kr = ir_reg(&mut f);
@@ -842,9 +865,20 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
   if rk != 0 {
     d = ir_new_val(&mut f, rk, ir_words(c, m, p, rt, 0), base_t(m, rt));
   }
-  if ir_multi(rk) && d.r1 > 2 {
-    ir_fail(&mut f, "a call with a result of more than two words");
-    return ir_none();
+  if rk == IRK_VEC || (ir_multi(rk) && d.r1 > 2) {
+    // The callee writes its result to the space the call reserves; it is
+    // in a frame slot after the call.
+    let mut w = 3;
+    if rk != IRK_VEC {
+      w = d.r1;
+    }
+    let slot = ir_reg(&mut f);
+    ir_emit(&mut f, IR_CALLM, slot, callee, first, count, w);
+    if rk == IRK_VEC {
+      return IrVal { k: IRK_VEC, r0: slot, r1: IR_NONE, t: 0 };
+    }
+    ir_load_words(&mut f, slot, d.r0, w);
+    return d;
   }
   if ir_multi(d.k) {
     let mut second = IR_NONE;
@@ -967,7 +1001,14 @@ fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
       ir_emit(&mut f, IR_RET, IR_NONE, IR_NONE, IR_NONE, 0, 0);
     } else {
       let v = ir_expr(&mut f, c, &mut m, p, n.a);
-      if ir_multi(v.k) {
+      if v.k == IRK_VEC {
+        ir_emit(&mut f, IR_RET, IR_NONE, v.r0, IR_NONE, 3, 0);
+      } else if ir_multi(v.k) && v.r1 > 2 {
+        let slot = ir_reg(&mut f);
+        ir_emit(&mut f, IR_SLOT, slot, 0, 0, v.r1, 0);
+        ir_store_words(&mut f, slot, v.r0, v.r1);
+        ir_emit(&mut f, IR_RET, IR_NONE, slot, IR_NONE, v.r1, 0);
+      } else if ir_multi(v.k) {
         let mut second = IR_NONE;
         if v.r1 == 2 {
           second = wrap_add(v.r0, 1);
@@ -1142,9 +1183,6 @@ fn ir_lower(c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> IrFn {
   if !f.failed && ir_kind(c, m, p, rt) == 0 && kind_t(m, rt) != TY_UNIT {
     ir_fail(&mut f, "a result that is not an integer, bool, buffer, struct or enum");
   }
-  if !f.failed && ir_multi(ir_kind(c, m, p, rt)) && ir_words(c, m, p, rt, 0) > 2 {
-    ir_fail(&mut f, "a result of more than two words");
-  }
   if !f.failed {
     ir_block(&mut f, c, &mut m, p, dn.x);
     ir_emit(&mut f, IR_RET, IR_NONE, IR_NONE, IR_NONE, 0, 0);
@@ -1262,6 +1300,11 @@ fn ir_print(out: &mut Vec[u64], f: &IrFn, m: &Mono, p: &Parser) {
       ir_w_label(&mut out, q.b);
       w_s(&mut out, ", ");
       ir_w_label(&mut out, q.c);
+    } else if q.op == IR_RET && q.c > 0 {
+      w_s(&mut out, "ret mem ");
+      ir_w_reg(&mut out, q.a);
+      w_s(&mut out, ", ");
+      w_num(&mut out, q.c);
     } else if q.op == IR_RET {
       w_s(&mut out, "ret");
       if q.a != IR_NONE {
@@ -1315,8 +1358,11 @@ fn ir_print(out: &mut Vec[u64], f: &IrFn, m: &Mono, p: &Parser) {
       ir_w_reg(&mut out, q.a);
     } else if q.op == IR_UNREACH {
       w_s(&mut out, "unreachable");
-    } else if q.op == IR_CALL {
-      if q.d != IR_NONE {
+    } else if q.op == IR_CALL || q.op == IR_CALLM {
+      if q.op == IR_CALLM {
+        ir_w_reg(&mut out, q.d);
+        w_s(&mut out, " = ");
+      } else if q.d != IR_NONE {
         ir_w_reg(&mut out, q.d);
         if q.ty != IR_NONE && q.ty != 0 {
           w_s(&mut out, ", ");
@@ -1324,7 +1370,11 @@ fn ir_print(out: &mut Vec[u64], f: &IrFn, m: &Mono, p: &Parser) {
         }
         w_s(&mut out, " = ");
       }
-      w_s(&mut out, "call ");
+      if q.op == IR_CALLM {
+        w_s(&mut out, "callm ");
+      } else {
+        w_s(&mut out, "call ");
+      }
       ir_w_name(&mut out, m, p, q.a);
       w_s(&mut out, "(");
       let mut j = 0;
