@@ -30,6 +30,7 @@ if command -v z3 >/dev/null; then
   step "build bastioc1 with stage0"; tests/bastioc1.sh
   step "tests/run.sh";       tests/run.sh
   step "tests/ir.sh";        tests/ir.sh
+  step "tests/ra.sh";        tests/ra.sh
   step "tests/native.sh";    tests/native.sh
   step "tests/proof_cache.sh"; tests/proof_cache.sh
   step "stage1/difftest.sh"; stage1/difftest.sh

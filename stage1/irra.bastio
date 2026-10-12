@@ -1,0 +1,558 @@
+// Register allocation over the IR (stage1/ir.bastio, docs/ir.md): which
+// virtual registers share a machine register, which live in the frame.
+//
+// Liveness is computed on basic blocks (a block starts at a label or after
+// a jump, branch or return) by the usual backward dataflow; the virtual
+// registers are not in SSA form, so a register that is assigned in a loop is
+// simply live all around it. Each register gets one interval, from its
+// first position to its last (extended to whole blocks where it is live
+// into or out of them), and a linear scan hands out machine registers in
+// order of interval start.
+//
+// Two pools are modelled: callee-saved registers, which survive a call, and
+// caller-saved ones, which do not. An interval that is live across a call
+// (`call`, or one of the runtime operations that call the runtime: `alloc`,
+// `free`, `print`, `vgrow`) can only take a callee-saved register; any other
+// takes a caller-saved register first. When the pools are empty the new
+// interval goes to the frame. The emitter keeps a few registers for itself
+// (the accumulator, the division and shift registers), so the pools given
+// here are the rest.
+//
+// The allocation is target independent; `ra_print` writes it with the names
+// of the x86-64 registers the first emitter will use.
+import "ir.bastio";
+
+// Where a virtual register lives.
+const RA_NONE: u64 = 0;      // never written or read
+const RA_CALLEE: u64 = 1;    // callee-saved register number `idx`
+const RA_CALLER: u64 = 2;    // caller-saved register number `idx`
+const RA_SPILL: u64 = 3;     // frame spill slot `idx`
+
+struct IrAlloc {
+  cls: Vec[u64],
+  idx: Vec[u64],
+  /// Spill slots used.
+  nspill: u64,
+  /// Callee-saved registers used (the first `ncallee_used` of the pool).
+  ncallee_used: u64
+}
+
+fn ra_free(a: IrAlloc) {
+  vec_free(a.cls);
+  vec_free(a.idx);
+}
+
+fn ra_set(v: &mut Vec[u64], i: u64, x: u64) {
+  if i < vec_len(v) {
+    vec_set(&mut v, i, x);
+  }
+}
+
+// ---- What an instruction reads and writes ----
+
+fn ra_is_binary(op: u64) -> bool {
+  return (op >= IR_ADD && op <= IR_SAR) || (op >= IR_EQ && op <= IR_SGE);
+}
+
+/// The registers instruction `q` reads, appended to `out`.
+fn ra_reads(f: &IrFn, q: IrIns, out: &mut Vec[u64]) {
+  let op = q.op;
+  if ra_is_binary(op) {
+    vec_push(&mut out, q.a);
+    vec_push(&mut out, q.b);
+  } else if op == IR_MOV || op == IR_NOT || op == IR_NEG || op == IR_WRAP || op == IR_ALLOC || op == IR_FREE || op == IR_PRINT || op == IR_VGROW {
+    vec_push(&mut out, q.a);
+  } else if op == IR_BR {
+    vec_push(&mut out, q.a);
+  } else if op == IR_RET {
+    if q.a != IR_NONE {
+      vec_push(&mut out, q.a);
+    }
+    if q.b != IR_NONE {
+      vec_push(&mut out, q.b);
+    }
+  } else if op == IR_LOAD {
+    vec_push(&mut out, q.a);
+    vec_push(&mut out, q.b);
+  } else if op == IR_STORE {
+    vec_push(&mut out, q.d);
+    vec_push(&mut out, q.a);
+    vec_push(&mut out, q.b);
+  } else if op == IR_CALL {
+    let mut j = 0;
+    while j < q.c && j < 4096 {
+      vec_push(&mut out, u_at(f.args, wrap_add(q.b, j)));
+      j = j + 1;
+    }
+  }
+}
+
+/// The registers instruction `q` writes, appended to `out`.
+fn ra_writes(q: IrIns, out: &mut Vec[u64]) {
+  let op = q.op;
+  if ra_is_binary(op) || op == IR_CONST || op == IR_MOV || op == IR_NOT || op == IR_NEG || op == IR_WRAP
+    || op == IR_LOAD || op == IR_ALLOC || op == IR_SLOT {
+    vec_push(&mut out, q.d);
+  } else if op == IR_CALL {
+    if q.d != IR_NONE {
+      vec_push(&mut out, q.d);
+    }
+    if q.ty != IR_NONE && q.ty != 0 && q.d != IR_NONE {
+      vec_push(&mut out, q.ty);
+    }
+  }
+}
+
+/// Does instruction `q` call the runtime or another function (so that
+/// caller-saved registers do not survive it)?
+fn ra_calls(q: IrIns) -> bool {
+  let op = q.op;
+  return op == IR_CALL || op == IR_ALLOC || op == IR_FREE || op == IR_PRINT || op == IR_VGROW;
+}
+
+// ---- Blocks ----
+
+/// A basic block: instructions `s .. e`, and the blocks that can follow it
+/// (block number + 1; 0: none).
+struct IrBlock { s: u64, e: u64, n1: u64, n2: u64 }
+
+fn ra_is_end(op: u64) -> bool {
+  return op == IR_JMP || op == IR_BR || op == IR_RET || op == IR_UNREACH;
+}
+
+/// The block that starts at label `l` (number + 1), from `lb`.
+fn ra_label_block(lb: &Vec[u64], l: u64) -> u64 {
+  return u_at(lb, l);
+}
+
+fn ra_blocks(f: &IrFn) -> Vec[IrBlock] {
+  let n = vec_len(f.ins);
+  let mut bl = vec_new[IrBlock]();
+  let mut lb = vec_new[u64]();
+  let mut k = 0;
+  while k < f.nlabel && k < 100000000 {
+    vec_push(&mut lb, 0);
+    k = k + 1;
+  }
+  // Leaders: the first instruction, labels, and what follows an end.
+  let mut s = 0;
+  let mut i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    if q.op == IR_LABEL && i > s {
+      vec_push(&mut bl, IrBlock { s: s, e: i, n1: 0, n2: 0 });
+      s = i;
+    }
+    if q.op == IR_LABEL {
+      ra_set(&mut lb, q.a, vec_len(bl) + 1);
+    }
+    if ra_is_end(q.op) {
+      vec_push(&mut bl, IrBlock { s: s, e: i + 1, n1: 0, n2: 0 });
+      s = i + 1;
+    }
+    i = i + 1;
+  }
+  if s < n {
+    vec_push(&mut bl, IrBlock { s: s, e: n, n1: 0, n2: 0 });
+  }
+  // A label opens a block, so the label table above pointed at the block
+  // about to be pushed; fix up the successors now that all exist.
+  let mut b = 0;
+  while b < vec_len(bl) {
+    let blk = vec_get(bl, b);
+    let mut n1 = 0;
+    let mut n2 = 0;
+    if blk.e > blk.s && blk.e <= n {
+      let last = vec_get(f.ins, blk.e - 1);
+      if last.op == IR_JMP {
+        n1 = ra_label_block(lb, last.a);
+      } else if last.op == IR_BR {
+        n1 = ra_label_block(lb, last.b);
+        n2 = ra_label_block(lb, last.c);
+      } else if last.op != IR_RET && last.op != IR_UNREACH {
+        if b + 1 < vec_len(bl) {
+          n1 = b + 2;
+        }
+      }
+    }
+    vec_set(&mut bl, b, IrBlock { s: blk.s, e: blk.e, n1: n1, n2: n2 });
+    b = b + 1;
+  }
+  vec_free(lb);
+  return bl;
+}
+
+// ---- Liveness ----
+
+/// Live-in sets of every block, as one flag per register (`b * nreg + r`).
+struct IrLive { inn: Vec[u64], out: Vec[u64] }
+
+fn ra_live(f: &IrFn, bl: &Vec[IrBlock]) -> IrLive {
+  let nb = vec_len(bl);
+  let nr = f.nreg;
+  let total = wrap_mul(nb, nr);
+  let mut use_ = vec_new[u64]();
+  let mut def_ = vec_new[u64]();
+  let mut inn = vec_new[u64]();
+  let mut out = vec_new[u64]();
+  let mut z = 0;
+  while z < total && z < 1000000000 {
+    vec_push(&mut use_, 0);
+    vec_push(&mut def_, 0);
+    vec_push(&mut inn, 0);
+    vec_push(&mut out, 0);
+    z = z + 1;
+  }
+  // use: read before written in the block; def: written in the block.
+  let mut b = 0;
+  while b < nb {
+    let blk = vec_get(bl, b);
+    let mut i = blk.s;
+    while i < blk.e && i < vec_len(f.ins) {
+      let q = vec_get(f.ins, i);
+      let mut rs = vec_new[u64]();
+      ra_reads(f, q, &mut rs);
+      let mut j = 0;
+      while j < vec_len(rs) {
+        let r = vec_get(rs, j);
+        if r < nr && u_at(def_, wrap_add(wrap_mul(b, nr), r)) == 0 {
+          ra_set(&mut use_, wrap_add(wrap_mul(b, nr), r), 1);
+        }
+        j = j + 1;
+      }
+      vec_free(rs);
+      let mut ws = vec_new[u64]();
+      ra_writes(q, &mut ws);
+      j = 0;
+      while j < vec_len(ws) {
+        let r = vec_get(ws, j);
+        if r < nr {
+          ra_set(&mut def_, wrap_add(wrap_mul(b, nr), r), 1);
+        }
+        j = j + 1;
+      }
+      vec_free(ws);
+      i = i + 1;
+    }
+    b = b + 1;
+  }
+  // Backward to a fixed point: out = union of the successors' in;
+  // in = use + (out - def).
+  let mut changed = true;
+  let mut rounds = 0;
+  while changed && rounds < 100000 {
+    changed = false;
+    let mut bb = nb;
+    while bb > 0
+      invariant bb <= vlen(bl) && nb == vlen(bl)
+    {
+      bb = bb - 1;
+      let blk = vec_get(bl, bb);
+      let mut r = 0;
+      while r < nr {
+        let at = wrap_add(wrap_mul(bb, nr), r);
+        let mut o = 0;
+        if blk.n1 != 0 && u_at(inn, wrap_add(wrap_mul(blk.n1 - 1, nr), r)) != 0 {
+          o = 1;
+        }
+        if blk.n2 != 0 && u_at(inn, wrap_add(wrap_mul(blk.n2 - 1, nr), r)) != 0 {
+          o = 1;
+        }
+        let mut iv = 0;
+        if u_at(use_, at) != 0 || (o != 0 && u_at(def_, at) == 0) {
+          iv = 1;
+        }
+        if o != u_at(out, at) {
+          ra_set(&mut out, at, o);
+          changed = true;
+        }
+        if iv != u_at(inn, at) {
+          ra_set(&mut inn, at, iv);
+          changed = true;
+        }
+        r = r + 1;
+      }
+    }
+    rounds = rounds + 1;
+  }
+  vec_free(use_);
+  vec_free(def_);
+  return IrLive { inn: inn, out: out };
+}
+
+// ---- Intervals ----
+
+/// The interval of every register: first and last instruction position
+/// (`lo` is IR_NONE for a register that never appears).
+struct IrIntervals { lo: Vec[u64], hi: Vec[u64] }
+
+fn ra_touch(iv: &mut IrIntervals, r: u64, pos: u64) {
+  let lo = u_at(iv.lo, r);
+  if r < vec_len(iv.lo) && (lo == IR_NONE || pos < lo) {
+    vec_set(&mut iv.lo, r, pos);
+  }
+  let hi = u_at(iv.hi, r);
+  if r < vec_len(iv.hi) && (hi == IR_NONE || pos > hi) {
+    vec_set(&mut iv.hi, r, pos);
+  }
+}
+
+fn ra_intervals(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> IrIntervals {
+  let nr = f.nreg;
+  let mut iv = IrIntervals { lo: vec_new[u64](), hi: vec_new[u64]() };
+  let mut r = 0;
+  while r < nr && r < 1000000000 {
+    vec_push(&mut iv.lo, IR_NONE);
+    vec_push(&mut iv.hi, IR_NONE);
+    r = r + 1;
+  }
+  let mut p = 0;
+  while p < vec_len(f.params) {
+    ra_touch(&mut iv, vec_get(f.params, p), 0);
+    p = p + 1;
+  }
+  let mut b = 0;
+  while b < vec_len(bl) {
+    let blk = vec_get(bl, b);
+    let mut i = blk.s;
+    while i < blk.e && i < vec_len(f.ins) {
+      let q = vec_get(f.ins, i);
+      let mut rs = vec_new[u64]();
+      ra_reads(f, q, &mut rs);
+      ra_writes(q, &mut rs);
+      let mut j = 0;
+      while j < vec_len(rs) {
+        ra_touch(&mut iv, vec_get(rs, j), i);
+        j = j + 1;
+      }
+      vec_free(rs);
+      i = i + 1;
+    }
+    // Live into the block: from its first instruction; live out: to its
+    // last.
+    let mut rr = 0;
+    while rr < nr {
+      let at = wrap_add(wrap_mul(b, nr), rr);
+      if u_at(lv.inn, at) != 0 {
+        ra_touch(&mut iv, rr, blk.s);
+      }
+      if u_at(lv.out, at) != 0 && blk.e > 0 {
+        ra_touch(&mut iv, rr, blk.e - 1);
+      }
+      rr = rr + 1;
+    }
+    b = b + 1;
+  }
+  return iv;
+}
+
+// ---- Linear scan ----
+
+/// Allocates the registers of `f` with `ncallee` callee-saved and `ncaller`
+/// caller-saved machine registers.
+fn ra_alloc(f: &IrFn, ncallee: u64, ncaller: u64) -> IrAlloc {
+  let bl = ra_blocks(f);
+  let lv = ra_live(f, bl);
+  let iv = ra_intervals(f, bl, lv);
+  let nr = f.nreg;
+  let n = vec_len(f.ins);
+  // Call positions, to tell which intervals cross a call.
+  let mut calls = vec_new[u64]();
+  let mut i = 0;
+  while i < n {
+    if ra_calls(vec_get(f.ins, i)) {
+      vec_push(&mut calls, i);
+    }
+    i = i + 1;
+  }
+  let mut al = IrAlloc { cls: vec_new[u64](), idx: vec_new[u64](), nspill: 0, ncallee_used: 0 };
+  let mut r = 0;
+  while r < nr && r < 1000000000 {
+    vec_push(&mut al.cls, RA_NONE);
+    vec_push(&mut al.idx, 0);
+    r = r + 1;
+  }
+  // Registers by order of interval start.
+  let mut order = vec_new[u64]();
+  let mut pos = 0;
+  while pos <= n && pos < 1000000000 {
+    let mut v = 0;
+    while v < nr {
+      if u_at(iv.lo, v) == pos {
+        vec_push(&mut order, v);
+      }
+      v = v + 1;
+    }
+    pos = pos + 1;
+  }
+  // Machine registers in use: the end of the interval holding each (0: free).
+  let mut busy_callee = vec_new[u64]();
+  let mut busy_caller = vec_new[u64]();
+  let mut k = 0;
+  while k < ncallee && k < 64 {
+    vec_push(&mut busy_callee, 0);
+    k = k + 1;
+  }
+  k = 0;
+  while k < ncaller && k < 64 {
+    vec_push(&mut busy_caller, 0);
+    k = k + 1;
+  }
+  let mut o = 0;
+  while o < vec_len(order) {
+    let v = vec_get(order, o);
+    let lo = u_at(iv.lo, v);
+    let hi = u_at(iv.hi, v);
+    // Does it live across a call?
+    let mut crosses = false;
+    let mut c = 0;
+    while c < vec_len(calls) {
+      let cp = vec_get(calls, c);
+      if lo < cp && cp < hi {
+        crosses = true;
+      }
+      c = c + 1;
+    }
+    // Registers whose interval ended before this one starts are free.
+    let mut placed = false;
+    if !crosses {
+      let mut m = 0;
+      while m < vec_len(busy_caller) && !placed {
+        let until = vec_get(busy_caller, m);
+        if until == 0 || until <= lo {
+          vec_set(&mut busy_caller, m, wrap_add(hi, 1));
+          ra_set(&mut al.cls, v, RA_CALLER);
+          ra_set(&mut al.idx, v, m);
+          placed = true;
+        }
+        m = m + 1;
+      }
+    }
+    if !placed {
+      let mut m = 0;
+      while m < vec_len(busy_callee) && !placed {
+        let until = vec_get(busy_callee, m);
+        if until == 0 || until <= lo {
+          vec_set(&mut busy_callee, m, wrap_add(hi, 1));
+          ra_set(&mut al.cls, v, RA_CALLEE);
+          ra_set(&mut al.idx, v, m);
+          if m + 1 > al.ncallee_used {
+            al.ncallee_used = m + 1;
+          }
+          placed = true;
+        }
+        m = m + 1;
+      }
+    }
+    if !placed {
+      ra_set(&mut al.cls, v, RA_SPILL);
+      ra_set(&mut al.idx, v, al.nspill);
+      al.nspill = wrap_add(al.nspill, 1);
+    }
+    o = o + 1;
+  }
+  vec_free(order);
+  vec_free(busy_callee);
+  vec_free(busy_caller);
+  vec_free(calls);
+  vec_free(iv.lo);
+  vec_free(iv.hi);
+  vec_free(lv.inn);
+  vec_free(lv.out);
+  vec_free(bl);
+  return al;
+}
+
+// ---- A check of the result ----
+
+/// Do two registers that share a machine register ever live together, or
+/// does a register that lives across a call sit in a caller-saved one?
+/// Recomputed from the instructions, so it is independent of the scan.
+fn ra_valid(f: &IrFn, a: &IrAlloc) -> bool {
+  let bl = ra_blocks(f);
+  let lv = ra_live(f, bl);
+  let iv = ra_intervals(f, bl, lv);
+  let nr = f.nreg;
+  let n = vec_len(f.ins);
+  let mut ok = true;
+  let mut x = 0;
+  while x < nr && x < 100000 {
+    let cx = u_at(a.cls, x);
+    if cx == RA_CALLER {
+      let mut p = 0;
+      while p < n {
+        if ra_calls(vec_get(f.ins, p)) && u_at(iv.lo, x) < p && p < u_at(iv.hi, x) {
+          ok = false;
+        }
+        p = p + 1;
+      }
+    }
+    if cx == RA_CALLEE || cx == RA_CALLER || cx == RA_SPILL {
+      let mut y = x + 1;
+      while y < nr && y < 100000 {
+        if u_at(a.cls, y) == cx && u_at(a.idx, y) == u_at(a.idx, x) {
+          // Both intervals closed: they overlap unless one ends before the
+          // other starts.
+          if !(u_at(iv.hi, x) <= u_at(iv.lo, y) && u_at(iv.hi, x) != u_at(iv.lo, y)) && !(u_at(iv.hi, y) <= u_at(iv.lo, x) && u_at(iv.hi, y) != u_at(iv.lo, x)) {
+            ok = false;
+          }
+        }
+        y = y + 1;
+      }
+    }
+    x = x + 1;
+  }
+  vec_free(iv.lo);
+  vec_free(iv.hi);
+  vec_free(lv.inn);
+  vec_free(lv.out);
+  vec_free(bl);
+  return ok;
+}
+
+// ---- The text form ----
+
+/// The x86-64 names of the pools: callee-saved %rbx, %r12-%r15; caller-saved
+/// %r8-%r11, %rsi, %rdi.
+fn ra_callee_name(i: u64) -> Str {
+  if i == 0 { return "%rbx"; }
+  if i == 1 { return "%r12"; }
+  if i == 2 { return "%r13"; }
+  if i == 3 { return "%r14"; }
+  return "%r15";
+}
+
+fn ra_caller_name(i: u64) -> Str {
+  if i == 0 { return "%r8"; }
+  if i == 1 { return "%r9"; }
+  if i == 2 { return "%r10"; }
+  if i == 3 { return "%r11"; }
+  if i == 4 { return "%rsi"; }
+  return "%rdi";
+}
+
+fn ra_print(out: &mut Vec[u64], f: &IrFn, a: &IrAlloc, m: &Mono, p: &Parser) {
+  w_s(&mut out, "alloc ");
+  ir_w_name(&mut out, m, p, f.x);
+  w_s(&mut out, " {\n");
+  let mut r = 0;
+  while r < f.nreg {
+    let cls = u_at(a.cls, r);
+    if cls != RA_NONE {
+      w_s(&mut out, "  ");
+      ir_w_reg(&mut out, r);
+      w_s(&mut out, " -> ");
+      if cls == RA_CALLEE {
+        w_s(&mut out, ra_callee_name(u_at(a.idx, r)));
+      } else if cls == RA_CALLER {
+        w_s(&mut out, ra_caller_name(u_at(a.idx, r)));
+      } else {
+        w_s(&mut out, "slot");
+        w_num(&mut out, u_at(a.idx, r));
+      }
+      w_s(&mut out, "\n");
+    }
+    r = r + 1;
+  }
+  w_s(&mut out, "}\n");
+}
