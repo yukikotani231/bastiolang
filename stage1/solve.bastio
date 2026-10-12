@@ -863,39 +863,27 @@ fn write_body(h: &Host, path: &Bytes, body: &Vec[u64]) -> bool {
 
 // ---- The proof cache ----
 
-/// Four independent polynomial hashes of a text, each modulo a prime below
-/// 2^31, so every step fits in 64 bits: about 124 bits together.
-struct Hash4 { a: u64, b: u64, c: u64, d: u64 }
+/// Two independent 64-bit hashes of a text, 128 bits together. Each step
+/// is an FNV-style xor and wrapping multiply, the second lane with a
+/// shift-xor between steps so that its bits mix both ways.
+struct Hash2 { a: u64, b: u64 }
 
-fn mix(h: u64, c: u64, mul: u64, md: u64) -> u64
-  requires h < 2147483648 && mul < 2147483648 && c < 2147483648 && md > 0 && md <= 2147483648
-  ensures result < md
-{
-  return (h * mul + c) % md;
+fn hash_new() -> Hash2 {
+  return Hash2 { a: 14695981039346656037, b: 11400714819323198485 };
 }
 
-fn hash_new() -> Hash4 {
-  return Hash4 { a: 1, b: 2, c: 3, d: 5 };
-}
-
-fn hash_step(x: Hash4, ch: u64) -> Hash4 {
-  let c = ch % 2147483648;
-  return Hash4 {
-    a: mix(x.a % 2147483647, c, 16777619, 2147483647),
-    b: mix(x.b % 2147483629, c, 40503, 2147483629),
-    c: mix(x.c % 2147483587, c, 65599, 2147483587),
-    d: mix(x.d % 2147483579, c, 131071, 2147483579)
-  };
-}
-
-fn hash_text(x: Hash4, t: &Vec[u64]) -> Hash4 {
-  let mut r = x;
+fn hash_text(x: Hash2, t: &Vec[u64]) -> Hash2 {
+  let mut a = x.a;
+  let mut b = x.b;
   let mut k = 0;
   while k < vec_len(t) {
-    r = hash_step(r, vec_get(t, k));
+    let ch = vec_get(t, k);
+    a = wrap_mul(a ^ ch, 1099511628211);
+    let m = wrap_mul(b ^ ch, 11400714819323198485);
+    b = m ^ (m >> 29);
     k = k + 1;
   }
-  return r;
+  return Hash2 { a: a, b: b };
 }
 
 /// The text in `v` as bytes (characters above 255 are left out).
@@ -929,7 +917,7 @@ fn cache_dir(h: &Host) -> Bytes {
 
 /// `<dir>/<key>`, the file that records that the function whose text
 /// hashes to x (together with the preamble) was proved.
-fn cache_path(dir: &Bytes, x: Hash4) -> Bytes {
+fn cache_path(dir: &Bytes, x: Hash2) -> Bytes {
   let mut t = vec_new[u64]();
   let mut k = 0;
   while k < blen(dir) {
@@ -940,10 +928,6 @@ fn cache_path(dir: &Bytes, x: Hash4) -> Bytes {
   w_hex(&mut t, x.a);
   w_s(&mut t, "-");
   w_hex(&mut t, x.b);
-  w_s(&mut t, "-");
-  w_hex(&mut t, x.c);
-  w_s(&mut t, "-");
-  w_hex(&mut t, x.d);
   let b = text_bytes(t);
   vec_free(t);
   return b;
@@ -975,7 +959,7 @@ fn cache_record(h: &Host, paths: &mut Vec[Bytes], upto: u64) {
 
 /// The hash of everything every function's proof starts from: the proof
 /// cache's format, the solver, the header and the preamble log[0..pre).
-fn cache_base(v: &Vr, h: &Host, pre: u64) -> Hash4 {
+fn cache_base(v: &Vr, h: &Host, pre: u64) -> Hash2 {
   let mut t = vec_new[u64]();
   w_s(&mut t, "bastio-proof-cache-1\n");
   solver_name(h, &mut t);
