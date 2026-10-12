@@ -32,6 +32,7 @@ if command -v z3 >/dev/null; then
   step "tests/ir.sh";        tests/ir.sh
   step "tests/ra.sh";        tests/ra.sh
   step "tests/native.sh";    tests/native.sh
+  step "tests/native.sh (IR emitter)"; BACKEND=native-ir tests/native.sh
   step "tests/proof_cache.sh"; tests/proof_cache.sh
   step "stage1/difftest.sh"; stage1/difftest.sh
   step "tests/fuzz.py (short run)"; tests/fuzz.py --seed 1 --count 1000
