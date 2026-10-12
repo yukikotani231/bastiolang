@@ -10,7 +10,10 @@
 #  4. tests/aarch64/kernel.bastio, built for `--target kernel --arch
 #     aarch64` with the small platform beside it, boots on QEMU's virt
 #     machine and prints what it should: page tables, a user program at EL0
-#     making system calls, an abort, MMIO.
+#     making system calls, an abort, MMIO;
+#  5. the programs the native AArch64 backend (`--arch aarch64 --backend
+#     native`, no C compiler on the proved code) covers behave as under the C
+#     backend (tests/aarch64_native.sh).
 # The programs run under qemu-aarch64 unless this machine is an AArch64 one
 # (where step 2 compares two native builds and proves less).
 # Needs z3, an AArch64 C compiler (AARCH64_CC, default aarch64-linux-gnu-gcc)
@@ -81,4 +84,5 @@ if grep -q '^aarch64: kernel up, [0-9]* pages$' "$tmp/boot.txt" \
 else
   echo "FAIL aarch64: the kernel's output on QEMU virt:"; sed 's/^/    /' "$tmp/boot.txt"; fails=$((fails+1))
 fi
+BASTIOC="$BASTIOC" tests/aarch64_native.sh || fails=$((fails+1))
 [ "$fails" = 0 ]

@@ -186,7 +186,7 @@ Goal, set 2026-10-11: Bastio and BastiOS run on AArch64 as well as x86-64, on QE
 - [ ] BastiOS boots on `virt`: exception vectors, MMU, GICv3, generic timer, PL011 ([bastios#194](https://github.com/yukikotani231/bastios/issues/194))
 - [ ] virtio drivers and multi-core start with PSCI ([bastios#195](https://github.com/yukikotani231/bastios/issues/195))
 - [ ] The Linux arm64 system-call ABI and AArch64 ELF binaries ([bastios#196](https://github.com/yukikotani231/bastios/issues/196))
-- [ ] A native AArch64 backend in stage1, so the C compiler leaves the trusted base on arm64 too ([#124](https://github.com/yukikotani231/bastiolang/issues/124))
+- [ ] A native AArch64 backend in stage1, so the C compiler leaves the trusted base on arm64 too ([#124](https://github.com/yukikotani231/bastiolang/issues/124)). Started: `--arch aarch64 --backend native` writes the functions the IR covers (`stage1/irarm64.bastio`), for hosted programs with a `main`; it grows as the IR's coverage does, and `tests/aarch64_native.sh` checks it against the C backend under `qemu-aarch64`
 - [ ] Real hardware: a UEFI arm64 machine, then Raspberry Pi 5 ([bastios#197](https://github.com/yukikotani231/bastios/issues/197))
 
 Invariant 1 holds on arm64: system registers and device memory are reached only through capability types. What the port adds to the trusted base (the exception vectors, early boot) is listed and reviewed under invariant 3.
