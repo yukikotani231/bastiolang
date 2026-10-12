@@ -15,12 +15,15 @@
 //               `user`: freestanding C for a user program under BastiOS (implies --emit-c)
 //   --arch      `x86_64` (default) or `aarch64`, as for bastioc0: aarch64
 //               changes the default C compiler to `aarch64-linux-gnu-gcc`
-//               (`CC` still overrides it); C backend only. With `--target
+//               (`CC` still overrides it); with `--backend native` it writes
+//               AArch64 assembly (hosted, programs with a `main`, the
+//               functions the IR covers: stage1/irarm64.bastio). With `--target
 //               kernel` or `user` it selects the AArch64 prelude (stage1
 //               only: bastioc0 knows only x86-64 bare metal)
 //   --lib DIR   also look for imported files in DIR (see `resolve` in
 //               loader.bastio); may be given more than once
-//   --backend native  generate x86-64 assembly directly instead of C, then
+//   --backend native  generate x86-64 (or, with `--arch aarch64`, AArch64)
+//               assembly directly instead of C, then
 //               assemble and link it (hosted); with `--target user` or
 //               `kernel`, write the assembly to `out` (default: out.s), to
 //               be linked with BastiOS's start code or platform
@@ -43,6 +46,7 @@ import "solve.bastio";
 import "header.bastio";
 import "x86.bastio";
 import "irx86.bastio";
+import "irarm64.bastio";
 
 fn b1_code(code: u64) -> Str {
   if code == C_USE { return "E-LINEAR-USE"; }
@@ -333,14 +337,16 @@ fn b1_tool(host: &Host, argv: Vec[Bytes], what: Str, out: &mut Vec[u64]) -> u64 
 /// `--backend native`, as stage0's x86::build: the assembly is written to
 /// `outp` (`--emit-asm`), or assembled and linked into the executable
 /// `outp`. Returns the exit status.
-fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, ir: bool, emit_asm: bool, lib: bool, outp: &Bytes, has_out: bool, out: &mut Vec[u64]) -> u64 {
+fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, aarch64: bool, ir: bool, emit_asm: bool, lib: bool, outp: &Bytes, has_out: bool, out: &mut Vec[u64]) -> u64 {
   let mut g = x86_new();
   // A BastiOS user program or kernel: the assembly is the output (as the C
   // is with the C backend), to be linked with BastiOS's start code.
   g.target = target;
   let mut status = 0;
   let mut built = false;
-  if ir {
+  if aarch64 {
+    built = a64_program(&mut g, c, &mut m, p);
+  } else if ir {
     built = x86_program_ir(&mut g, c, &mut m, p);
   } else {
     built = x86_program(&mut g, c, &mut m, p);
@@ -382,8 +388,12 @@ fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, ir
       status = 2;
     } else {
       let mut asm = vec_new[Bytes]();
-      push_arg(&mut asm, "as");
-      push_arg(&mut asm, "--64");
+      if aarch64 {
+        push_arg(&mut asm, "aarch64-linux-gnu-as");
+      } else {
+        push_arg(&mut asm, "as");
+        push_arg(&mut asm, "--64");
+      }
       push_arg(&mut asm, "-o");
       vec_push(&mut asm, b1_concat(ofile, ""));
       vec_push(&mut asm, b1_concat(sfile, ""));
@@ -401,7 +411,11 @@ fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, ir
         let mut cc = balloc(0);
         if !host_env(host, "CC", &mut cc) {
           bfree(cc);
-          cc = bfrom("cc");
+          if aarch64 {
+            cc = bfrom("aarch64-linux-gnu-gcc");
+          } else {
+            cc = bfrom("cc");
+          }
         }
         let mut ld = vec_new[Bytes]();
         vec_push(&mut ld, cc);
@@ -436,8 +450,8 @@ fn b1_help(out: &mut Vec[u64]) {
   w_s(&mut out, "  --check          verify only; write nothing\n");
   w_s(&mut out, "  --emit-c         write the generated C instead of an executable\n");
   w_s(&mut out, "  --target T       hosted (the default), or kernel or user for BastiOS (these write C, or assembly with --backend native)\n");
-  w_s(&mut out, "  --arch A         x86_64 (the default) or aarch64 (C backend; hosted programs compile with aarch64-linux-gnu-gcc)\n");
-  w_s(&mut out, "  --backend B      c (the default) or native (experimental: x86-64 assembly)\n");
+  w_s(&mut out, "  --arch A         x86_64 (the default) or aarch64 (hosted programs compile with aarch64-linux-gnu-gcc; --backend native: partial)\n");
+  w_s(&mut out, "  --backend B      c (the default) or native (experimental: x86-64 assembly, or AArch64 with --arch aarch64)\n");
   w_s(&mut out, "  --emit-asm       with --backend native: write the assembly instead of an executable\n");
   w_s(&mut out, "  --lib DIR        also look for imported files in DIR\n");
   w_s(&mut out, "  --header FILE    also write a C header for the program's `export fn`s\n");
@@ -609,8 +623,8 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
     w_s(&mut out, "usage: bastioc1 [--check] [--emit-c] [--target hosted|kernel|user] [--arch x86_64|aarch64] [--lib DIR] [--backend c|native] [--emit-asm] [--header F] [-o out] <file.bastio>...\n");
     status = 2;
   }
-  if status == 0 && aarch64 && native {
-    w_s(&mut out, "bastioc1: the native backend generates x86-64 only; use the C backend for --arch aarch64\n");
+  if status == 0 && aarch64 && native_ir {
+    w_s(&mut out, "bastioc1: --backend native-ir is for x86-64\n");
     status = 2;
   }
   // The inputs, as one string for messages.
@@ -750,7 +764,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
             status = 2;
           } else if native {
             b1_flush(host, &mut out);
-            status = b1_native(host, c, &mut m, p, target, native_ir, emit_asm, !has_main, outp, has_out, &mut out);
+            status = b1_native(host, c, &mut m, p, target, aarch64, native_ir, emit_asm, !has_main, outp, has_out, &mut out);
           } else {
             let mut g = cg_new(target);
             g.arch = c.arch;
