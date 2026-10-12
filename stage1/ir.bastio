@@ -311,6 +311,20 @@ fn ir_kind(c: &Checker, m: &Mono, p: &Parser, t: u64) -> u64 {
   return 0;
 }
 
+/// The words of a struct that the IR cannot hold in registers (a Vec or a
+/// handle is in it) but keeps in memory, in a frame slot, or 0 for any other
+/// type. At least three words: a smaller one travels in registers.
+fn ir_ms(c: &Checker, m: &Mono, p: &Parser, t: u64) -> u64 {
+  let u = base_t(m, t);
+  if kind_t(m, u) == TY_STRUCT && ir_kind(c, m, p, u) == 0 {
+    let w = ir_mw(c, m, p, u, 0);
+    if w != IR_NONE && w >= 3 && w <= 16 {
+      return w;
+    }
+  }
+  return 0;
+}
+
 /// A value: its register, and the second one of a Buf or Bytes (IR_NONE
 /// for an integer); `k` is its kind (0 after a failure).
 struct IrVal { k: u64, r0: u64, r1: u64, t: u64 }
@@ -539,6 +553,24 @@ fn ir_variant(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, x: u6
 fn ir_slit(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, x: u64) -> IrVal {
   let n = node_at(p.nodes, i);
   let t = intern(&mut m, p, TY_STRUCT, x);
+  let mw = ir_ms(c, m, p, t);
+  if mw > 0 {
+    // Built in place in a frame slot of ours.
+    let slot = ir_reg(&mut f);
+    ir_emit(&mut f, IR_SLOT, slot, 0, 0, mw, 0);
+    let out = IrVal { k: IRK_PLACE, r0: slot, r1: 0, t: base_t(m, t) };
+    let mut q = n.a;
+    while q != 0 && !f.failed {
+      let fi = node_at(p.nodes, q);
+      let dst = ir_pfield(&mut f, c, m, p, out, fi.s, fi.e);
+      let v = ir_vexpr(&mut f, c, &mut m, p, fi.a);
+      if !f.failed {
+        ir_store_val(&mut f, c, m, p, dst, v);
+      }
+      q = fi.next;
+    }
+    return out;
+  }
   if ir_kind(c, m, p, t) != IRK_STRUCT {
     ir_fail(&mut f, "a struct outside the subset");
     return ir_none();
@@ -917,6 +949,9 @@ fn ir_val(f: &mut IrFn, c: &Checker, m: &Mono, p: &Parser, v: IrVal) -> IrVal {
     ir_load_words(&mut f, v.r0, v.r1, d.r0, w);
     return d;
   }
+  if ir_ms(c, m, p, v.t) > 0 {
+    return v;
+  }
   ir_fail(&mut f, "a struct or enum held in memory used as a value");
   return ir_none();
 }
@@ -933,6 +968,20 @@ fn ir_vexpr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVa
 /// `v` stored to place `d`.
 fn ir_store_val(f: &mut IrFn, c: &Checker, m: &Mono, p: &Parser, d: IrVal, v: IrVal) {
   let k = ir_kind(c, m, p, d.t);
+  let mw = ir_ms(c, m, p, d.t);
+  if k == 0 && mw > 0 && v.k == IRK_PLACE {
+    // A struct held in memory: its words, one by one.
+    let mut j = 0;
+    while j < mw {
+      let kr = ir_reg(&mut f);
+      ir_emit(&mut f, IR_CONST, kr, wrap_add(v.r1, j), 0, 0, 0);
+      let w = ir_reg(&mut f);
+      ir_emit(&mut f, IR_LOAD, w, v.r0, kr, 8, 0);
+      ir_hdr_store(&mut f, d.r0, wrap_add(d.r1, j), w);
+      j = j + 1;
+    }
+    return;
+  }
   if k == 0 || v.k != k {
     ir_fail(&mut f, "a store between kinds");
     return;
@@ -1401,6 +1450,16 @@ fn ir_call_to(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, calle
   }
   let rt = cg_ret_ty(&mut m, p, callee);
   let rk = ir_kind(c, m, p, rt);
+  let rmw = ir_ms(c, m, p, rt);
+  if rk == 0 && rmw > 0 {
+    // A struct with a Vec in it: the callee writes it to the space the call
+    // reserves, and it stays there as a place.
+    let slot = ir_reg(&mut f);
+    ir_emit(&mut f, IR_CALLM, slot, callee, first, count, rmw);
+    ir_take_back(&mut f, lent);
+    vec_free(lent);
+    return IrVal { k: IRK_PLACE, r0: slot, r1: 0, t: base_t(m, rt) };
+  }
   if rk == 0 && kind_t(m, rt) != TY_UNIT {
     ir_fail(&mut f, "a call with a result that is not an integer or a buffer");
     vec_free(lent);
@@ -1489,6 +1548,24 @@ fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
   if k == S_LET {
     let t = let_ty(m, f.x, i);
     let kind = ir_kind(c, m, p, t);
+    let mw = ir_ms(c, m, p, t);
+    if kind == 0 && mw > 0 {
+      // A struct with a Vec in it: a frame slot of its own.
+      let v = ir_vexpr(&mut f, c, &mut m, p, n.b);
+      if f.failed {
+        return;
+      }
+      if v.k != IRK_PLACE {
+        ir_fail(&mut f, "an initializer of another kind");
+        return;
+      }
+      let slot = ir_reg(&mut f);
+      ir_emit(&mut f, IR_SLOT, slot, 0, 0, mw, 0);
+      let r = IrVal { k: IRK_PLACE, r0: slot, r1: 0, t: base_t(m, t) };
+      ir_store_val(&mut f, c, m, p, r, v);
+      ir_bind(&mut f, n.s, n.e, r);
+      return;
+    }
     if kind == 0 {
       ir_fail(&mut f, "a variable that is not an integer, bool, buffer, struct, enum or Vec");
       return;
@@ -1591,6 +1668,9 @@ fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
       ir_give_back(&mut f);
       if v.k == IRK_VEC {
         ir_emit(&mut f, IR_RET, IR_NONE, v.r0, IR_NONE, 3, 0);
+      } else if v.k == IRK_PLACE && ir_ms(c, m, p, v.t) > 0 {
+        let a = ir_paddr(&mut f, v);
+        ir_emit(&mut f, IR_RET, IR_NONE, a, IR_NONE, ir_ms(c, m, p, v.t), 0);
       } else if ir_multi(v.k) && v.r1 > 2 {
         let first = vec_len(f.args);
         let mut w = 0;
@@ -1807,7 +1887,7 @@ fn ir_lower(c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> IrFn {
     q = qn.next;
   }
   let rt = cg_ret_ty(&mut m, p, x);
-  if !f.failed && ir_kind(c, m, p, rt) == 0 && kind_t(m, rt) != TY_UNIT {
+  if !f.failed && ir_kind(c, m, p, rt) == 0 && ir_ms(c, m, p, rt) == 0 && kind_t(m, rt) != TY_UNIT {
     ir_fail(&mut f, "a result that is not an integer, bool, buffer, struct or enum");
   }
   if !f.failed {
