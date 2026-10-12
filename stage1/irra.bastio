@@ -109,6 +109,20 @@ fn ra_writes(q: IrIns, out: &mut Vec[u64]) {
   }
 }
 
+/// A parameter is defined before the first instruction, so a call at
+/// position 0 is crossed by a parameter that is used after it.
+fn ra_is_param(f: &IrFn, r: u64) -> bool {
+  let mut p = 0;
+  let mut found = false;
+  while p < vec_len(f.params) {
+    if vec_get(f.params, p) == r {
+      found = true;
+    }
+    p = p + 1;
+  }
+  return found;
+}
+
 /// Does instruction `q` call the runtime or another function (so that
 /// caller-saved registers do not survive it)?
 fn ra_calls(q: IrIns) -> bool {
@@ -469,7 +483,7 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
     let mut c = 0;
     while c < vec_len(calls) {
       let cp = vec_get(calls, c);
-      if lo < cp && cp < hi {
+      if (lo < cp || (cp == 0 && ra_is_param(f, v))) && cp < hi {
         crosses = true;
       }
       c = c + 1;
@@ -542,7 +556,7 @@ fn ra_valid(f: &IrFn, a: &IrAlloc) -> bool {
     if cx == RA_CALLER {
       let mut p = 0;
       while p < n {
-        if ra_calls(vec_get(f.ins, p)) && u_at(iv.lo, x) < p && p < u_at(iv.hi, x) {
+        if ra_calls(vec_get(f.ins, p)) && (u_at(iv.lo, x) < p || (p == 0 && ra_is_param(f, x))) && p < u_at(iv.hi, x) {
           ok = false;
         }
         p = p + 1;
