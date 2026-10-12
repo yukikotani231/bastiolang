@@ -796,14 +796,22 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       i = i + 1;
     } else if q.op == IR_RET && q.c > 0 {
       // A result of more than two words goes to the space the caller reserved.
-      let rb = ix_use(&mut out, al, q.a, XR_RSI);
+      let mut rb = XR_RSI;
+      if q.a != IR_NONE {
+        rb = ix_use(&mut out, al, q.a, XR_RSI);
+      }
       let mut j = 0;
       while j < q.c && j < 4096 {
-        w_s(&mut out, "\tmov ");
-        w_num(&mut out, wrap_mul(8, j));
-        w_s(&mut out, "(");
-        w_s(&mut out, x86_rname(rb));
-        w_s(&mut out, "), %rax\n\tmov %rax, ");
+        if q.a == IR_NONE {
+          ix_mov(&mut out, ix_loc(al, u_at(f.args, wrap_add(q.b, j))), ix_rl(XR_RAX));
+          w_s(&mut out, "\tmov %rax, ");
+        } else {
+          w_s(&mut out, "\tmov ");
+          w_num(&mut out, wrap_mul(8, j));
+          w_s(&mut out, "(");
+          w_s(&mut out, x86_rname(rb));
+          w_s(&mut out, "), %rax\n\tmov %rax, ");
+        }
         w_num(&mut out, wrap_add(retoff, wrap_mul(8, j)));
         w_s(&mut out, "(%rbp)\n");
         j = j + 1;
