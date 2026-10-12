@@ -1015,6 +1015,35 @@ fn ir_vsimple(c: &Checker, m: &Mono, p: &Parser, v: IrVal) -> bool {
   return ir_kind(c, m, p, ir_velem(v)) == IRK_INT;
 }
 
+/// Copies `cnt` bytes from `src[so ..]` to `dst[do ..]` (address and offset
+/// registers) with a forward loop; the two ranges do not overlap.
+fn ir_copy_bytes(f: &mut IrFn, c: &Checker, dst: u64, doff: u64, src: u64, soff: u64, cnt: u64) {
+  let k = ir_reg(&mut f);
+  ir_emit(&mut f, IR_CONST, k, 0, 0, 0, 0);
+  let one = ir_reg(&mut f);
+  ir_emit(&mut f, IR_CONST, one, 1, 0, 0, 0);
+  let l_head = ir_label(&mut f);
+  let l_body = ir_label(&mut f);
+  let l_end = ir_label(&mut f);
+  ir_place(&mut f, l_head);
+  let more = ir_reg(&mut f);
+  ir_emit(&mut f, IR_LT, more, k, cnt, 0, 0);
+  ir_emit(&mut f, IR_BR, IR_NONE, more, l_body, l_end, 0);
+  ir_place(&mut f, l_body);
+  let si = ir_reg(&mut f);
+  ir_emit(&mut f, IR_ADD, si, soff, k, 0, c.tu64);
+  let di = ir_reg(&mut f);
+  ir_emit(&mut f, IR_ADD, di, doff, k, 0, c.tu64);
+  let x = ir_reg(&mut f);
+  ir_emit(&mut f, IR_LOAD, x, src, si, 1, 0);
+  ir_emit(&mut f, IR_STORE, x, dst, di, 1, 0);
+  let k1 = ir_reg(&mut f);
+  ir_emit(&mut f, IR_ADD, k1, k, one, 0, c.tu64);
+  ir_emit(&mut f, IR_MOV, k, k1, 0, 0, 0);
+  ir_jump(&mut f, l_head);
+  ir_place(&mut f, l_end);
+}
+
 /// A call: a builtin of the subset (`len`, `blen`, `get`, `bget`) or a
 /// function that is not generic and not a builtin, whose arguments and
 /// result are integers or buffers (or no result).
@@ -1183,6 +1212,36 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       ir_emit(&mut f, IR_STORE, v, b.r0, ix, size, 0);
     }
     return ir_none();
+  }
+  if name_is(p, i, "bcopy") {
+    // `bcopy(&mut dst, d, src, s, n)`: a byte loop.
+    let a1 = next_of(p, n.a);
+    let a2 = next_of(p, a1);
+    let a3 = next_of(p, a2);
+    let a4 = next_of(p, a3);
+    let dst = ir_buf(&mut f, c, &mut m, p, n.a, IRK_BYTES);
+    let doff = ir_int(&mut f, c, &mut m, p, a1);
+    let src = ir_buf(&mut f, c, &mut m, p, a2, IRK_BYTES);
+    let soff = ir_int(&mut f, c, &mut m, p, a3);
+    let cnt = ir_int(&mut f, c, &mut m, p, a4);
+    if !f.failed {
+      ir_copy_bytes(&mut f, c, dst.r0, doff, src.r0, soff, cnt);
+    }
+    return ir_none();
+  }
+  if name_is(p, i, "bfrom") {
+    // A copy of a string literal.
+    let s = ir_buf(&mut f, c, &mut m, p, n.a, IRK_STR);
+    if f.failed {
+      return ir_none();
+    }
+    let d = ir_fresh(&mut f, IRK_BYTES);
+    ir_emit(&mut f, IR_ALLOC, d.r0, s.r1, 0, 1, 0);
+    ir_emit(&mut f, IR_MOV, d.r1, s.r1, 0, 0, 0);
+    let zero = ir_reg(&mut f);
+    ir_emit(&mut f, IR_CONST, zero, 0, 0, 0, 0);
+    ir_copy_bytes(&mut f, c, d.r0, zero, s.r0, zero, s.r1);
+    return d;
   }
   if name_is(p, i, "vec_free") {
     let v = ir_vec_arg(&mut f, c, &mut m, p, n.a);
