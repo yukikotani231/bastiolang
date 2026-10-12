@@ -57,6 +57,8 @@ const IR_STORE: u64 = 47;    // a[b] = d, c bytes (d is read here, not written)
 const IR_ALLOC: u64 = 48;    // d = a new buffer's data address, n = a elements of c bytes (1 or 8); the length register is set by a separate mov
 const IR_FREE: u64 = 49;     // frees the buffer whose data address is a
 const IR_PRINT: u64 = 50;    // prints the number a
+const IR_PUTC: u64 = 56;     // writes the byte a to the console (`serial_write`): a runtime call
+const IR_GETC: u64 = 57;     // d = the next byte from the console (`serial_read`): a runtime call
 const IR_WRAP: u64 = 51;     // d = a truncated to the integer type ty
 
 const IR_SLOT: u64 = 52;     // d = the address of a frame slot of c words (one per instruction, allocated once per function however often it runs)
@@ -284,7 +286,7 @@ fn ir_mw(c: &Checker, m: &Mono, p: &Parser, t: u64, depth: u64) -> u64 {
 /// The kind of values of type `t` in the subset, or 0.
 fn ir_kind(c: &Checker, m: &Mono, p: &Parser, t: u64) -> u64 {
   let u = base_t(m, t);
-  if is_int(m, u) || kind_t(m, u) == TY_BOOL {
+  if is_int(m, u) || kind_t(m, u) == TY_BOOL || kind_t(m, u) == TY_SERIAL {
     return IRK_INT;
   }
   if kind_t(m, u) == TY_BUF {
@@ -1324,6 +1326,19 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     ir_emit(&mut f, IR_FREE, IR_NONE, b.r0, 0, 0, 0);
     return ir_none();
   }
+  if name_is(p, i, "serial_write") {
+    // `serial_write(con, byte)`: the capability is only a name for the right
+    // to call it.
+    let a1 = next_of(p, n.a);
+    let b = ir_int(&mut f, c, &mut m, p, a1);
+    ir_emit(&mut f, IR_PUTC, IR_NONE, b, 0, 0, 0);
+    return ir_none();
+  }
+  if name_is(p, i, "serial_read") {
+    let d = ir_reg(&mut f);
+    ir_emit(&mut f, IR_GETC, d, 0, 0, 0, 0);
+    return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+  }
   if name_is(p, i, "print") {
     let a = ir_int(&mut f, c, &mut m, p, n.a);
     ir_emit(&mut f, IR_PRINT, IR_NONE, a, 0, 0, 0);
@@ -2075,6 +2090,12 @@ fn ir_print(out: &mut Vec[u64], f: &IrFn, m: &Mono, p: &Parser) {
     } else if q.op == IR_PRINT {
       w_s(&mut out, "print ");
       ir_w_reg(&mut out, q.a);
+    } else if q.op == IR_PUTC {
+      w_s(&mut out, "putc ");
+      ir_w_reg(&mut out, q.a);
+    } else if q.op == IR_GETC {
+      ir_w_reg(&mut out, q.d);
+      w_s(&mut out, " = getc");
     } else if q.op == IR_WRAP {
       ir_w_reg(&mut out, q.d);
       w_s(&mut out, " = wrap ");
