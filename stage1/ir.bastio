@@ -60,6 +60,7 @@ const IR_PRINT: u64 = 50;    // prints the number a
 const IR_WRAP: u64 = 51;     // d = a truncated to the integer type ty
 
 const IR_SLOT: u64 = 52;     // d = the address of a frame slot of c words (one per instruction, allocated once per function however often it runs)
+const IR_STRLIT: u64 = 55;   // d = the address of the bytes of the string literal or blob at syntax node a
 const IR_CALLM: u64 = 54;    // d = the address of a frame slot of ty words that instance a, called with the c registers of args[b ..], fills with its result (a result of more than two words)
 const IR_VGROW: u64 = 53;    // makes room in the Vec whose 3-word header is at address a (c = words per element): a runtime call that may change the header
 
@@ -140,6 +141,8 @@ fn ir_jump(f: &mut IrFn, l: u64) {
 const IRK_INT: u64 = 1;
 const IRK_BUF: u64 = 2;
 const IRK_BYTES: u64 = 3;
+// A `Str`: like a Bytes (data address, length), read-only.
+const IRK_STR: u64 = 8;
 const IRK_STRUCT: u64 = 4;
 // An enum: its tag in `r0`, then the words of the largest payload, in
 // consecutive registers like a struct (`r1` the count, `t` the type).
@@ -169,7 +172,7 @@ fn ir_words(c: &Checker, m: &Mono, p: &Parser, t: u64, depth: u64) -> u64 {
   if is_int(m, u) || k == TY_BOOL {
     return 1;
   }
-  if k == TY_BUF || k == TY_BYTES {
+  if k == TY_BUF || k == TY_BYTES || k == TY_STR {
     return 2;
   }
   if k == TY_STRUCT && depth < 4 {
@@ -287,6 +290,9 @@ fn ir_kind(c: &Checker, m: &Mono, p: &Parser, t: u64) -> u64 {
   if kind_t(m, u) == TY_BYTES {
     return IRK_BYTES;
   }
+  if kind_t(m, u) == TY_STR {
+    return IRK_STR;
+  }
   if kind_t(m, u) == TY_STRUCT && ir_words(c, m, p, u, 0) != IR_NONE {
     return IRK_STRUCT;
   }
@@ -385,7 +391,7 @@ fn ir_payload(f: &mut IrFn, c: &Checker, m: &Mono, p: &Parser, e: IrVal, v: u64)
   if fk == IRK_INT {
     return IrVal { k: fk, r0: r, r1: IR_NONE, t: 0 };
   }
-  if fk == IRK_BUF || fk == IRK_BYTES {
+  if fk == IRK_BUF || fk == IRK_BYTES || fk == IRK_STR {
     return IrVal { k: fk, r0: wrap_add(r, 1), r1: r, t: 0 };
   }
   if ir_multi(fk) {
@@ -422,7 +428,7 @@ fn ir_field(f: &mut IrFn, c: &Checker, m: &Mono, p: &Parser, v: IrVal, s: u64, e
   if fk == IRK_INT {
     return IrVal { k: fk, r0: wrap_add(v.r0, off), r1: IR_NONE, t: 0 };
   }
-  if fk == IRK_BUF || fk == IRK_BYTES {
+  if fk == IRK_BUF || fk == IRK_BYTES || fk == IRK_STR {
     // In memory, and so in the registers of a struct, a buffer is its
     // length then its data address.
     return IrVal { k: fk, r0: wrap_add(v.r0, wrap_add(off, 1)), r1: wrap_add(v.r0, off), t: 0 };
@@ -495,6 +501,22 @@ fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       ir_fail(&mut f, "a name that is not a scalar or buffer variable");
     }
     return ir_rv(&mut f, c, m, p, v);
+  }
+  if k == E_STR || k == E_BLOB {
+    let mut len = n.v;
+    if k == E_STR {
+      len = 0;
+      if n.s <= n.e && n.e <= blen(p.src) {
+        let bytes = decode(p.src, n.s, n.e);
+        len = blen(bytes);
+        bfree(bytes);
+      }
+    }
+    let a = ir_reg(&mut f);
+    ir_emit(&mut f, IR_STRLIT, a, i, 0, 0, 0);
+    let l = ir_reg(&mut f);
+    ir_emit(&mut f, IR_CONST, l, len, 0, 0, 0);
+    return IrVal { k: IRK_STR, r0: a, r1: l, t: 0 };
   }
   if k == E_NEG || k == E_NOT {
     let a = ir_int(&mut f, c, &mut m, p, n.a);
@@ -699,7 +721,13 @@ fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     }
     return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
   }
+  let first = !f.failed;
   ir_fail(&mut f, "an expression outside the first subset");
+  if first {
+    w_s(&mut f.why, " (node kind ");
+    w_num(&mut f.why, k);
+    w_s(&mut f.why, ")");
+  }
   return ir_none();
 }
 
@@ -714,6 +742,8 @@ fn ir_elem(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
   let mut kind = IRK_BUF;
   if name_is(p, i, "bget") || name_is(p, i, "bset") {
     kind = IRK_BYTES;
+  } else if name_is(p, i, "sget") {
+    kind = IRK_STR;
   }
   let b = ir_buf(&mut f, c, &mut m, p, a0, kind);
   let ix = ir_int(&mut f, c, &mut m, p, a1);
@@ -793,7 +823,7 @@ fn ir_rv(f: &mut IrFn, c: &Checker, m: &Mono, p: &Parser, v: IrVal) -> IrVal {
   if k == IRK_INT {
     return IrVal { k: IRK_INT, r0: ir_hdr_load(&mut f, v.r0, v.r1), r1: IR_NONE, t: 0 };
   }
-  if k == IRK_BUF || k == IRK_BYTES {
+  if k == IRK_BUF || k == IRK_BYTES || k == IRK_STR {
     let len = ir_hdr_load(&mut f, v.r0, v.r1);
     let data = ir_hdr_load(&mut f, v.r0, wrap_add(v.r1, 1));
     return IrVal { k: k, r0: data, r1: len, t: 0 };
@@ -843,7 +873,7 @@ fn ir_store_val(f: &mut IrFn, c: &Checker, m: &Mono, p: &Parser, d: IrVal, v: Ir
   }
   if k == IRK_INT {
     ir_hdr_store(&mut f, d.r0, d.r1, v.r0);
-  } else if k == IRK_BUF || k == IRK_BYTES {
+  } else if k == IRK_BUF || k == IRK_BYTES || k == IRK_STR {
     ir_hdr_store(&mut f, d.r0, d.r1, v.r1);
     ir_hdr_store(&mut f, d.r0, wrap_add(d.r1, 1), v.r0);
   } else if k == IRK_VEC {
@@ -905,19 +935,21 @@ fn ir_vec_arg(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> Ir
 /// result are integers or buffers (or no result).
 fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal {
   let n = node_at(p.nodes, i);
-  if name_is(p, i, "len") || name_is(p, i, "blen") {
+  if name_is(p, i, "len") || name_is(p, i, "blen") || name_is(p, i, "slen") {
     let mut kind = IRK_BUF;
     if name_is(p, i, "blen") {
       kind = IRK_BYTES;
+    } else if name_is(p, i, "slen") {
+      kind = IRK_STR;
     }
     let b = ir_buf(&mut f, c, &mut m, p, n.a, kind);
     return IrVal { k: IRK_INT, r0: b.r1, r1: IR_NONE, t: 0 };
   }
-  if name_is(p, i, "get") || name_is(p, i, "bget") {
+  if name_is(p, i, "get") || name_is(p, i, "bget") || name_is(p, i, "sget") {
     let e = ir_elem(&mut f, c, &mut m, p, i);
     let d = ir_reg(&mut f);
     let mut size = 8;
-    if e.k == IRK_BYTES {
+    if e.k == IRK_BYTES || e.k == IRK_STR {
       size = 1;
     }
     ir_emit(&mut f, IR_LOAD, d, e.r0, e.r1, size, 0);
@@ -1639,6 +1671,10 @@ fn ir_print(out: &mut Vec[u64], f: &IrFn, m: &Mono, p: &Parser) {
       w_num(&mut out, wrap_mul(q.c, 8));
       w_s(&mut out, " ");
       ir_w_reg(&mut out, q.a);
+    } else if q.op == IR_STRLIT {
+      ir_w_reg(&mut out, q.d);
+      w_s(&mut out, " = str ");
+      w_num(&mut out, q.a);
     } else if q.op == IR_SLOT {
       ir_w_reg(&mut out, q.d);
       w_s(&mut out, " = slot ");

@@ -313,7 +313,12 @@ fn ix_cmp(out: &mut Vec[u64], al: &IrAlloc, a: u64, b: u64) {
     ix_mov(&mut out, la, ix_rl(XR_RAX));
     la = ix_rl(XR_RAX);
   }
-  ix_ins2(&mut out, "cmp", lb, la);
+  if la.k == IXK_MEM && lb.k == IXK_IMM {
+    // An immediate against memory needs its width (`cmp` alone is 32 bits).
+    ix_ins2(&mut out, "cmpq", lb, la);
+  } else {
+    ix_ins2(&mut out, "cmp", lb, la);
+  }
 }
 
 /// The symbol of function instance `x`.
@@ -330,7 +335,7 @@ fn ix_sym(out: &mut Vec[u64], g: &mut X86, m: &Mono, p: &Parser, x: u64) {
 /// word at the lower address, in %rax or the first argument register.
 fn ix_buffer(c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
   let k = ir_kind(c, m, p, t);
-  return k == IRK_BUF || k == IRK_BYTES;
+  return k == IRK_BUF || k == IRK_BYTES || k == IRK_STR;
 }
 
 /// For each word of the parameters of `x` in the order of the IR (the
@@ -519,7 +524,7 @@ fn ix_norm(out: &mut Vec[u64], m: &Mono, t: u64) {
 }
 
 /// One instruction other than control flow and calls.
-fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, q: IrIns, slotw: u64) {
+fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: &Parser, q: IrIns, slotw: u64) {
   let op = q.op;
   let alu = ix_alu(op);
   let lbq = ix_loc(al, q.b);
@@ -676,6 +681,23 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, q: 
     w_s(&mut out, "\tmov $");
     w_num(&mut out, wrap_mul(8, q.c));
     w_s(&mut out, ", %esi\n\tcall bst_rt_vec_grow\n");
+  } else if op == IR_STRLIT {
+    // The bytes are in the data of the program; the literal of a syntax
+    // node is added once (`x86_push_val`).
+    let mut s = 0;
+    while s < vec_len(g.snode) && u_at(g.snode, s) != q.a {
+      s = s + 1;
+    }
+    if s == vec_len(g.snode) {
+      let b = x86_lit_bytes(p, q.a);
+      s = x86_add_string(&mut g, b);
+      vec_push(&mut g.snode, q.a);
+      vec_free(b);
+    }
+    w_s(&mut out, "\tlea .Lstr");
+    w_num(&mut out, s);
+    w_s(&mut out, "(%rip), %rax\n");
+    ix_finish(&mut out, al, q.d, XR_RAX);
   } else if op == IR_SLOT {
     // The address of the slot whose lowest word is `slotw` words below %rbp.
     w_s(&mut out, "\tlea -");
@@ -818,7 +840,7 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       if q.op == IR_SLOT {
         slotw = wrap_add(slotw, q.c);
       }
-      ix_ins(&mut out, f, al, &mut g, m, q, slotw);
+      ix_ins(&mut out, f, al, &mut g, m, p, q, slotw);
     }
     i = i + 1;
   }
