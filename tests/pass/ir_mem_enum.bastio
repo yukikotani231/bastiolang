@@ -1,0 +1,61 @@
+// expect-exit: 108
+// An enum with a Vec in it is kept in memory by the IR: a variant is built
+// in a frame slot, `match` reads the tag and the payload where they lie, and
+// `q.b = set(q.b, i, v)` stores into the buffer a field holds.
+struct Q { b: Buf, n: u64 }
+
+enum Slot { Empty, Full(Vec[u64]) }
+
+fn fill(s: &mut Slot, x: u64) {
+  match s {
+    Slot::Empty => {
+      let mut v = vec_new[u64]();
+      vec_push(&mut v, x);
+      s = Slot::Full(v);
+    },
+    Slot::Full(v) => {
+      let mut w = v;
+      vec_push(&mut w, x);
+      s = Slot::Full(w);
+    },
+  }
+}
+
+fn total(s: &Slot) -> u64 {
+  match s {
+    Slot::Empty => { return 0; },
+    Slot::Full(v) => {
+      let mut t = 0;
+      let mut i = 0;
+      while i < vec_len(v) invariant i <= vlen(v) {
+        t = wrap_add(t, vec_get(v, i));
+        i = i + 1;
+      }
+      return t;
+    },
+  }
+}
+
+fn poke(q: &mut Q, i: u64, v: u64)
+  requires i < len(q.b)
+  ensures len(q.b) == len(old(q).b)
+{
+  q.b = set(q.b, i, v);
+  q.n = wrap_add(q.n, 1);
+}
+
+fn main() -> u64 {
+  let mut s = Slot::Empty;
+  fill(&mut s, 40);
+  fill(&mut s, 60);
+  let t = total(s);
+  let mut q = Q { b: alloc(4), n: 0 };
+  poke(&mut q, 2, 7);
+  let r = wrap_add(wrap_add(t, get(q.b, 2)), q.n);
+  match s {
+    Slot::Empty => {},
+    Slot::Full(v) => { vec_free(v); },
+  }
+  free(q.b);
+  return r;
+}
