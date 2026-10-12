@@ -154,11 +154,11 @@ Goal, set 2026-10-10: BastiOS usable as a general-purpose operating system, for 
 ### Milestone: develop on BastiOS with Neovim
 
 Goal, set 2026-10-12: sit at a BastiOS shell (console or SSH) and do an ordinary edit-build-commit loop without leaving it. The bar, all inside BastiOS with packages from Alpine's repositories:
-- [ ] `apk add neovim git build-base` succeeds on a disk large enough to hold them (gcc, g++ and Python needed more than the old 1024-entry disk allowed)
+- [x] `apk add neovim git build-base` succeeds on a disk large enough to hold them (gcc, g++ and Python needed more than the old 1024-entry disk allowed)
 - [ ] `nvim` runs in the console and in an SSH pseudo-terminal: raw mode and window-size changes (`termios`, `TIOCGWINSZ`, `SIGWINCH`), colours, the cursor keys, `poll`/`epoll` event loops, job control for `:!`, and plugin hosts started with `fork`/`exec`
-- [ ] `nvim` opens, edits and saves a Bastio or C source file, with its swap and undo files, on the disk file system
-- [ ] `git clone`, `commit`, `diff` and `log` work in a work tree, and `gcc` or `make` builds a small C program from the editor with `:make`
-- [ ] A test (`make compat`) drives that session so it stays working
+- [x] `nvim` opens, edits and saves a Bastio or C source file, with its swap and undo files, on the disk file system
+- [ ] `git clone`, `commit`, `diff` and `log` work in a work tree (they do), and a compiler builds a small C program from the editor with `:make` (it does with tcc and with the Bastio compiler; Alpine's gcc is a non-PIE executable linked at 0x400000, which the loader cannot place yet: [bastios#259](https://github.com/yukikotani231/bastios/issues/259))
+- [x] A test (`make compat`) drives that session so it stays working (`test/compat/alpine_tty.txt` in bastios: edit, save, `:make`, `:!`, undo file, commit, and edit-prove-build-run with the Bastio compiler)
 
 The gaps this finds are filed and fixed as ordinary Linux-compatibility work under v4 and v5.
 
