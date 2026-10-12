@@ -59,6 +59,9 @@ const IR_FREE: u64 = 49;     // frees the buffer whose data address is a
 const IR_PRINT: u64 = 50;    // prints the number a
 const IR_WRAP: u64 = 51;     // d = a truncated to the integer type ty
 
+const IR_SLOT: u64 = 52;     // d = the address of a frame slot of c words (one per instruction, allocated once per function however often it runs)
+const IR_VGROW: u64 = 53;    // makes room in the Vec whose 3-word header is at address a (c = words per element): a runtime call that may change the header
+
 const IR_NONE: u64 = 18446744073709551615;
 
 struct IrIns { op: u64, d: u64, a: u64, b: u64, c: u64, ty: u64 }
@@ -137,6 +140,9 @@ const IRK_INT: u64 = 1;
 const IRK_BUF: u64 = 2;
 const IRK_BYTES: u64 = 3;
 const IRK_STRUCT: u64 = 4;
+// A Vec: `r0` is the address of its three-word header (length, capacity,
+// data address), in a frame slot or in the caller's, never in registers.
+const IRK_VEC: u64 = 5;
 
 /// The registers a value of type `t` takes in the subset, or IR_NONE when
 /// it is outside it: one for an integer or bool, two for a `Buf` or `Bytes`,
@@ -188,6 +194,9 @@ fn ir_kind(c: &Checker, m: &Mono, p: &Parser, t: u64) -> u64 {
   if kind_t(m, u) == TY_STRUCT && ir_words(c, m, p, u, 0) != IR_NONE {
     return IRK_STRUCT;
   }
+  if kind_t(m, u) == TY_VEC && ir_words(c, m, p, inner_t(m, u), 1) == 1 {
+    return IRK_VEC;
+  }
   return 0;
 }
 
@@ -228,7 +237,7 @@ fn ir_truncate(f: &mut IrFn, n: u64) {
 /// `t` takes `w` consecutive ones.
 fn ir_new_val(f: &mut IrFn, k: u64, w: u64, t: u64) -> IrVal {
   let r0 = ir_reg(&mut f);
-  if k == IRK_INT {
+  if k == IRK_INT || k == IRK_VEC {
     return IrVal { k: k, r0: r0, r1: IR_NONE, t: 0 };
   }
   if k == IRK_STRUCT {
@@ -408,6 +417,30 @@ fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
   if k == E_CALL {
     return ir_call(&mut f, c, &mut m, p, i);
   }
+  if k == E_TAPP && name_is(p, n.b, "vec_new") {
+    let et = conv(&mut m, p, n.a, f.x, i);
+    if ir_words(c, m, p, et, 1) != 1 {
+      ir_fail(&mut f, "a vector of something other than one-word elements");
+      return ir_none();
+    }
+    let d = ir_reg(&mut f);
+    ir_emit(&mut f, IR_SLOT, d, 0, 0, 3, 0);
+    let zero = ir_reg(&mut f);
+    ir_emit(&mut f, IR_CONST, zero, 0, 0, 0, 0);
+    ir_hdr_store(&mut f, d, 0, zero);
+    ir_hdr_store(&mut f, d, 1, zero);
+    ir_hdr_store(&mut f, d, 2, zero);
+    return IrVal { k: IRK_VEC, r0: d, r1: IR_NONE, t: 0 };
+  }
+  if k == E_MUTBORROW {
+    let path = node_at(p.nodes, n.a);
+    let v = ir_find(f, p, path.s, path.e);
+    if path.next != 0 || v.k != IRK_VEC {
+      ir_fail(&mut f, "a borrow of something that is not a vector variable");
+      return ir_none();
+    }
+    return v;
+  }
   if k == E_FIELD {
     let b = ir_expr(&mut f, c, &mut m, p, n.a);
     if f.failed {
@@ -479,6 +512,31 @@ fn ir_elem(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
   return IrVal { k: kind, r0: b.r0, r1: ix, t: 0 };
 }
 
+/// Word `k` of the Vec header at address `a`.
+fn ir_hdr_load(f: &mut IrFn, a: u64, k: u64) -> u64 {
+  let kr = ir_reg(&mut f);
+  ir_emit(&mut f, IR_CONST, kr, k, 0, 0, 0);
+  let d = ir_reg(&mut f);
+  ir_emit(&mut f, IR_LOAD, d, a, kr, 8, 0);
+  return d;
+}
+
+fn ir_hdr_store(f: &mut IrFn, a: u64, k: u64, v: u64) {
+  let kr = ir_reg(&mut f);
+  ir_emit(&mut f, IR_CONST, kr, k, 0, 0, 0);
+  ir_emit(&mut f, IR_STORE, v, a, kr, 8, 0);
+}
+
+/// The Vec a `vec_*` builtin works on: a variable, or `&mut` of one.
+fn ir_vec_arg(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal {
+  let v = ir_expr(&mut f, c, &mut m, p, i);
+  if !f.failed && v.k != IRK_VEC {
+    ir_fail(&mut f, "a vector builtin on something that is not a vector variable");
+    return ir_none();
+  }
+  return v;
+}
+
 /// A call: a builtin of the subset (`len`, `blen`, `get`, `bget`) or a
 /// function that is not generic and not a builtin, whose arguments and
 /// result are integers or buffers (or no result).
@@ -517,6 +575,66 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let d = ir_reg(&mut f);
     ir_emit(&mut f, op, d, a, b, 0, cg_int_ty(c, f.x, i));
     return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+  }
+  if name_is(p, i, "vec_len") {
+    let v = ir_vec_arg(&mut f, c, &mut m, p, n.a);
+    if f.failed {
+      return ir_none();
+    }
+    return IrVal { k: IRK_INT, r0: ir_hdr_load(&mut f, v.r0, 0), r1: IR_NONE, t: 0 };
+  }
+  if name_is(p, i, "vec_get") || name_is(p, i, "vec_set") {
+    let v = ir_vec_arg(&mut f, c, &mut m, p, n.a);
+    let ix = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    let mut x = IR_NONE;
+    if name_is(p, i, "vec_set") {
+      x = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 2));
+    }
+    if f.failed {
+      return ir_none();
+    }
+    let data = ir_hdr_load(&mut f, v.r0, 2);
+    if x == IR_NONE {
+      let d = ir_reg(&mut f);
+      ir_emit(&mut f, IR_LOAD, d, data, ix, 8, 0);
+      return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+    }
+    ir_emit(&mut f, IR_STORE, x, data, ix, 8, 0);
+    return ir_none();
+  }
+  if name_is(p, i, "vec_push") {
+    let v = ir_vec_arg(&mut f, c, &mut m, p, n.a);
+    let x = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    if f.failed {
+      return ir_none();
+    }
+    let len = ir_hdr_load(&mut f, v.r0, 0);
+    let cap = ir_hdr_load(&mut f, v.r0, 1);
+    let full = ir_reg(&mut f);
+    ir_emit(&mut f, IR_EQ, full, len, cap, 0, 0);
+    let l_grow = ir_label(&mut f);
+    let l_room = ir_label(&mut f);
+    ir_emit(&mut f, IR_BR, IR_NONE, full, l_grow, l_room, 0);
+    ir_place(&mut f, l_grow);
+    ir_emit(&mut f, IR_VGROW, IR_NONE, v.r0, 0, 1, 0);
+    ir_place(&mut f, l_room);
+    let data = ir_hdr_load(&mut f, v.r0, 2);
+    ir_emit(&mut f, IR_STORE, x, data, len, 8, 0);
+    let one = ir_reg(&mut f);
+    ir_emit(&mut f, IR_CONST, one, 1, 0, 0, 0);
+    let len1 = ir_reg(&mut f);
+    ir_emit(&mut f, IR_ADD, len1, len, one, 0, c.tu64);
+    ir_hdr_store(&mut f, v.r0, 0, len1);
+    return ir_none();
+  }
+  if name_is(p, i, "vec_free") {
+    let v = ir_vec_arg(&mut f, c, &mut m, p, n.a);
+    if f.failed {
+      return ir_none();
+    }
+    let data = ir_hdr_load(&mut f, v.r0, 2);
+    ir_emit(&mut f, IR_FREE, IR_NONE, data, 0, 0, 0);
+    return ir_none();
   }
   if name_is(p, i, "alloc") || name_is(p, i, "balloc") {
     let mut kind = IRK_BUF;
@@ -558,9 +676,30 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
   let callee = plain_inst(&mut m, def);
   let mut regs = vec_new[u64]();
   let mut a = n.a;
+  let cdef = inst_at(m, callee);
+  let cdn = node_at(p.nodes, cdef.def);
+  let mut cq = cdn.a;
   while a != 0 && !f.failed {
     let v = ir_expr(&mut f, c, &mut m, p, a);
-    if v.k == IRK_STRUCT {
+    let mut pt_kind = 0;
+    if cq != 0 {
+      let cqn = node_at(p.nodes, cq);
+      pt_kind = kind_t(m, conv(&mut m, p, cqn.a, callee, cq));
+      cq = cqn.next;
+    }
+    if v.k == IRK_VEC {
+      if pt_kind == TY_MUTREF {
+        vec_push(&mut regs, v.r0);
+      } else {
+        // By value or shared: the three header words, as the existing
+        // calling convention passes them.
+        let mut w = 0;
+        while w < 3 {
+          vec_push(&mut regs, ir_hdr_load(&mut f, v.r0, w));
+          w = w + 1;
+        }
+      }
+    } else if v.k == IRK_STRUCT {
       let mut w = 0;
       while w < v.r1 && w < 64 {
         vec_push(&mut regs, wrap_add(v.r0, w));
@@ -805,8 +944,22 @@ fn ir_lower(c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> IrFn {
     if pk == 0 {
       ir_fail(&mut f, "a parameter that is not an integer, bool, buffer or struct");
     } else {
-      let r = ir_new_val(&mut f, pk, ir_words(c, m, p, pt, 0), base_t(m, pt));
-      if pk == IRK_STRUCT {
+      let mut r = ir_new_val(&mut f, pk, ir_words(c, m, p, pt, 0), base_t(m, pt));
+      if pk == IRK_VEC && kind_t(m, pt) != TY_MUTREF {
+        // Passed as three words: put them in a slot of ours.
+        let w0 = r.r0;
+        let w1 = ir_reg(&mut f);
+        let w2 = ir_reg(&mut f);
+        vec_push(&mut f.params, w0);
+        vec_push(&mut f.params, w1);
+        vec_push(&mut f.params, w2);
+        let slot = ir_reg(&mut f);
+        ir_emit(&mut f, IR_SLOT, slot, 0, 0, 3, 0);
+        ir_hdr_store(&mut f, slot, 0, w0);
+        ir_hdr_store(&mut f, slot, 1, w1);
+        ir_hdr_store(&mut f, slot, 2, w2);
+        r = IrVal { k: IRK_VEC, r0: slot, r1: IR_NONE, t: 0 };
+      } else if pk == IRK_STRUCT {
         let mut w = 0;
         while w < r.r1 && w < 64 {
           vec_push(&mut f.params, wrap_add(r.r0, w));
@@ -979,6 +1132,13 @@ fn ir_print(out: &mut Vec[u64], f: &IrFn, m: &Mono, p: &Parser) {
       w_s(&mut out, " = alloc");
       w_num(&mut out, wrap_mul(q.c, 8));
       w_s(&mut out, " ");
+      ir_w_reg(&mut out, q.a);
+    } else if q.op == IR_SLOT {
+      ir_w_reg(&mut out, q.d);
+      w_s(&mut out, " = slot ");
+      w_num(&mut out, q.c);
+    } else if q.op == IR_VGROW {
+      w_s(&mut out, "vgrow ");
       ir_w_reg(&mut out, q.a);
     } else if q.op == IR_FREE {
       w_s(&mut out, "free ");
