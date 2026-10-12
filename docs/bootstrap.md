@@ -33,7 +33,7 @@ $b0 --emit-c -o /tmp/gen1.c stage1/bastioc1.bastio
 cmp /tmp/gen1.c /tmp/gen2.c && echo "fixed point"
 ```
 
-`stage1/difftest.sh` runs this check on every run (the line "fixed point"). It also runs the same check for the native backend: bastioc1 assembled by `asmdump` must write the same C as stage0. CI runs difftest on every pull request.
+`stage1/difftest.sh` runs this check on every run (the line "fixed point"). It also runs the same check for the native backend: bastioc1 assembled by `asmdump` must write the same C as stage0. CI runs difftest on every pull request, split into independent parts (`DIFFTEST_PARTS`, see the script's header) that run on separate machines, with the tools built by stage0 and by the native backend.
 
 The fixed point shows that the two compilers agree on bastioc1's own source. It does not show that either compiler is correct. That is what the rest of difftest is for: it compares each phase of bastioc1 with bastioc0 on every Bastio source in the repository and in a BastiOS checkout next to it, and on damaged copies of those sources.
 

@@ -41,6 +41,13 @@
 # The parser, the monomorphizer and the checker are also compared on damaged
 # sources (stage1/mutate.py), so their error positions are checked too.
 #
+# DIFFTEST_PARTS (default: all) names the parts to run, so CI can run them
+# on separate machines: dumps (lexer, parser, mono, checker, verifier,
+# proofs), backends (C, native), driver (bastioc1 against stage0, and the
+# fixed point), mutants-front (parser, mono and checker mutants) and
+# mutants-back (verifier, proof, C and driver mutants). Each part builds
+# only the tools it uses.
+#
 # Every comparison is independent of the others, so the files of a phase
 # are compared JOBS at a time (default: the number of CPUs; JOBS=1 runs one
 # at a time), and the slow single checks (the fixed point, the compiler
@@ -54,8 +61,18 @@ export BASTIO_LIB="$PWD"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 export BASTIOC
+PARTS=${DIFFTEST_PARTS:-dumps backends driver mutants-front mutants-back}
+part() { case " $PARTS " in *" $1 "*) return 0 ;; esac; return 1; }
+tools=
+part dumps && tools="$tools lexdump astdump monodump checkdump smtdump verifydump"
+part backends && tools="$tools cdump asmdump"
+part driver && tools="$tools bastioc1 asmdump"
+part mutants-front && tools="$tools astdump monodump checkdump"
+part mutants-back && tools="$tools smtdump verifydump cdump bastioc1"
+[ -n "$tools" ] || { echo "difftest: no known part in DIFFTEST_PARTS=$PARTS"; exit 1; }
+tools=$(printf '%s\n' $tools | sort -u)
 pids=()
-for tool in lexdump astdump monodump checkdump smtdump verifydump cdump asmdump bastioc1; do
+for tool in $tools; do
   "$BASTIOC" -o "$tmp/$tool" "stage1/$tool.bastio" 2>"$tmp/build.$tool.err" &
   pids+=($!)
 done
@@ -82,6 +99,7 @@ pass_files=$(keep tests/pass/*.bastio)
 fail_files=$(keep tests/fail/*.bastio)
 user_files=$(keep tests/user/*.bastio)
 status=0
+if part dumps; then
 s1only=0
 for f in $(grep -l '^// stage1-only:' tests/pass/*.bastio tests/fail/*.bastio tests/user/*.bastio ../bastios/user/*.bastio 2>/dev/null); do
   s1only=$((s1only+1))
@@ -101,6 +119,7 @@ if [ -f ../bastios/src/main.bastio ] && [ -z "$kernel_main" ]; then
   fi
 fi
 [ "$s1only" = 0 ] || echo "-- stage1-only: $s1only program(s) left out of the comparison"
+fi
 
 . tests/pfor.sh
 # want and got in $w: the same, or a difference labelled $1.
@@ -140,6 +159,7 @@ bg_ok() {  # pid, name
   wait "$1" 2>/dev/null
   [ -f "$tmp/$2.ok" ]
 }
+if part backends; then
 # asmdump built by the native backend must print the same assembly for itself.
 (
   "$BASTIOC" --backend native -o "$tmp/asmdump_n" stage1/asmdump.bastio 2>/dev/null \
@@ -166,6 +186,8 @@ bg_ok() {  # pid, name
     && cmp -s "$tmp/b1c.c" "$tmp/b1n.c" \
     && touch "$tmp/b1.ok"
 ) & bg_b1=$!
+fi
+if part driver; then
 # The fixed point: bastioc1 (built by stage0) builds itself, and that
 # build writes the same C for bastioc1 as stage0 does.
 (
@@ -176,6 +198,7 @@ bg_ok() {  # pid, name
     && touch "$tmp/fixed.ok"
 ) & bg_fixed=$!
 
+fi
 dump() {  # stage0 flag, stage1 tool, file
   "$BASTIOC" "$1" "$3" >"$w/want" 2>/dev/null
   "$tmp/$2" "$3" >"$w/got" 2>/dev/null
@@ -189,9 +212,11 @@ compare() {  # phase, stage0 flag, stage1 tool
   echo "-- $1: $match matched, $differ differ"
   { [ "$differ" = 0 ] && [ "$match" -gt 0 ]; } || status=1
 }
+if part dumps; then
 compare lexer --dump-tokens lexdump
 compare parser --dump-ast astdump
 compare mono --dump-mono monodump
+fi
 
 check_one() {
   local t; t=$(target_of "$1")
@@ -245,6 +270,7 @@ asm_one() {
 }
 export -f check_one smt_one proof_one c_one asm_one
 
+if part dumps; then
 pfor check_one $files || status=1
 match=$(n match) differ=$(n differ)
 echo "-- checker: $match matched, $differ differ"
@@ -260,6 +286,8 @@ match=$(n match) differ=$(n differ)
 echo "-- proofs: $match matched ($(n failed) of them failed proofs), $differ differ ($(n skipped) not reaching the verifier)"
 { [ "$differ" = 0 ] && [ "$match" -gt 0 ]; } || status=1
 
+fi
+if part backends; then
 pfor c_one $files || status=1
 match=$(n match) differ=$(n differ) errors=$(n error)
 echo "-- C: $match matched ($((match-errors)) of them C files), $differ differ"
@@ -337,6 +365,7 @@ fi
 echo "-- native (stage1 only): $built programs built and run (plus asmdump built by itself, and bastioc1), $users user programs built$kernel, $differ differ"
 { [ "$differ" = 0 ] && [ "$built" -gt 1 ] && [ "$users" -gt 0 ]; } || status=1
 
+fi
 drv_check() {
   local t; t=$(target_of "$1")
   "$BASTIOC" --check --target "$t" "$1" 2>"$w/want.err" >/dev/null; echo "exit $?" >>"$w/want.err"
@@ -411,6 +440,7 @@ drv_native() {
 }
 export -f drv_check drv_emitc drv_header drv_run drv_native
 
+if part driver; then
 pfor drv_check $files || status=1
 match=$(n match) differ=$(n differ) errors=$(n error)
 cfiles=0
@@ -500,7 +530,9 @@ if bg_ok $bg_fixed fixed; then
 else
   echo "-- fixed point: FAILED"; sed 's/^/    /' "$tmp/gen2.err" | head -10; status=1
 fi
+fi
 # The mutants (stage1/mutate.py runs JOBS of them at a time).
+if part mutants-front; then
 python3 stage1/mutate.py "$BASTIOC" --dump-ast "$tmp/astdump" 1 ${MUTANTS:-5} $files || status=1
 python3 stage1/mutate.py "$BASTIOC" --dump-mono "$tmp/monodump" 2 ${MUTANTS:-5} $files || status=1
 for t in hosted kernel user; do
@@ -516,6 +548,8 @@ if [ -n "$kernel_main" ]; then
   python3 stage1/mutate.py --via ../bastios/src/main.bastio "$BASTIOC" "--dump-check --target kernel" "$tmp/checkdump kernel" 5 ${MUTANTS:-5} \
     $(ls ../bastios/src/*.bastio | grep -v /main.bastio) || status=1
 fi
+fi
+if part mutants-back; then
 # The verifier, on the mutants that still verify (most do not).
 python3 stage1/mutate.py --smt "$BASTIOC" "--check --dump-smt" "$tmp/smtdump" 6 $((${MUTANTS:-5} * 4)) $pass_files || status=1
 # Proofs, on the mutants that reach the verifier: most of those fail a proof.
@@ -530,4 +564,5 @@ fi
 # The driver's error output, on damaged copies of every test program.
 python3 stage1/mutate.py --driver "$BASTIOC" "--check" "$tmp/bastioc1" 10 ${MUTANTS:-5} \
   $pass_files $fail_files || status=1
+fi
 exit $status
