@@ -32,12 +32,8 @@ jobs:
         run: tests/run.sh
       - name: Native backend, differential test against the C backend
         run: tests/native.sh
-      - name: Native backend, the self-hosted compiler's tools built natively
-        run: tests/native.sh --stage1
       - name: Proof cache
         run: tests/proof_cache.sh
-      - name: Self-hosted compiler, differential tests
-        run: stage1/difftest.sh
       - name: Fuzzing, a short deterministic run (tests/fuzz.py)
         run: tests/fuzz.py --seed 1 --count 1000 --keep fuzz-findings
       - uses: actions/upload-artifact@v5
@@ -46,6 +42,34 @@ jobs:
           name: fuzz-findings-${{ github.sha }}
           path: fuzz-findings
           if-no-files-found: ignore
+  difftest:
+    # stage1/difftest.sh compares every phase of the self-hosted compiler with
+    # stage0's. Its parts (DIFFTEST_PARTS) are independent, so each runs on a
+    # machine of its own: once with the tools built by stage0 and once with
+    # the tools built by the native backend (tests/native.sh --stage1).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [dumps, backends mutants-front, driver, mutants-back]
+        tools: [stage0, native]
+    name: difftest (${{ matrix.part }}, tools built by ${{ matrix.tools }})
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Z3
+        run: sudo apt-get update && sudo apt-get install -y z3
+      - name: Build stage0
+        run: cd stage0 && RUSTFLAGS="-D warnings" cargo build --release --locked
+      - name: Differential tests
+        env:
+          DIFFTEST_PARTS: ${{ matrix.part }}
+        run: |
+          if [ "${{ matrix.tools }}" = native ]; then
+            tests/native.sh --stage1
+          else
+            stage1/difftest.sh
+          fi
   aarch64:
     # AArch64 through the C backend: every test program built for AArch64
     # runs under qemu-aarch64 as on x86-64, the compiler built for AArch64
