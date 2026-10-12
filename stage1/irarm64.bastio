@@ -418,28 +418,36 @@ fn a64_arith(out: &mut Vec[u64], al: &IrAlloc, fr: A64F, name: Str, imm_ok: bool
   return t;
 }
 
-/// The address `a[b]` of a `size`-byte element, as the text of the memory
-/// operand.
-fn a64_mem(out: &mut Vec[u64], al: &IrAlloc, fr: A64F, a: u64, b: u64, size: u64) {
+/// The registers of the memory operand `a[b]`: loads of spilled values into
+/// x9 and x10 are written now, so that the instruction that uses the
+/// operand is written whole afterwards (`a64_mwrite`).
+struct A64M { ra: u64, rb: u64, imm: bool, v: u64 }
+
+fn a64_mprep(out: &mut Vec[u64], al: &IrAlloc, fr: A64F, a: u64, b: u64) -> A64M {
   let ra = a64_use(&mut out, al, fr, a, 9);
   let lb = a64_loc(al, fr, b);
   if lb.k == A64K_IMM && lb.imm <= 4095 {
-    w_s(&mut out, "[");
-    a64_x(&mut out, ra);
+    return A64M { ra: ra, rb: 0, imm: true, v: lb.imm };
+  }
+  let rb = a64_reg(&mut out, lb, 10);
+  return A64M { ra: ra, rb: rb, imm: false, v: 0 };
+}
+
+/// The text of the memory operand for a `size`-byte element.
+fn a64_mwrite(out: &mut Vec[u64], mo: A64M, size: u64) {
+  w_s(&mut out, "[");
+  a64_x(&mut out, mo.ra);
+  if mo.imm {
     w_s(&mut out, ", #");
-    w_num(&mut out, wrap_mul(lb.imm, size));
-    w_s(&mut out, "]");
+    w_num(&mut out, wrap_mul(mo.v, size));
   } else {
-    let rb = a64_reg(&mut out, lb, 10);
-    w_s(&mut out, "[");
-    a64_x(&mut out, ra);
     w_s(&mut out, ", ");
-    a64_x(&mut out, rb);
+    a64_x(&mut out, mo.rb);
     if size == 8 {
       w_s(&mut out, ", lsl #3");
     }
-    w_s(&mut out, "]");
   }
+  w_s(&mut out, "]");
 }
 
 /// A call: the argument words in x0-x7, then the result from x0 and x1.
@@ -584,6 +592,7 @@ fn a64_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, fr: A64F, g: &mut X86, m:
     a64_finish(&mut out, al, fr, q.d, t);
   } else if op == IR_LOAD {
     let t = a64_dest(al, fr, q.d);
+    let mo = a64_mprep(&mut out, al, fr, q.a, q.b);
     if q.c == 1 {
       w_s(&mut out, "\tldrb ");
       a64_w(&mut out, t);
@@ -592,11 +601,12 @@ fn a64_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, fr: A64F, g: &mut X86, m:
       a64_x(&mut out, t);
     }
     w_s(&mut out, ", ");
-    a64_mem(&mut out, al, fr, q.a, q.b, q.c);
+    a64_mwrite(&mut out, mo, q.c);
     w_s(&mut out, "\n");
     a64_finish(&mut out, al, fr, q.d, t);
   } else if op == IR_STORE {
     let rv = a64_reg(&mut out, a64_loc(al, fr, q.d), 11);
+    let mo = a64_mprep(&mut out, al, fr, q.a, q.b);
     if q.c == 1 {
       w_s(&mut out, "\tstrb ");
       a64_w(&mut out, rv);
@@ -605,7 +615,7 @@ fn a64_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, fr: A64F, g: &mut X86, m:
       a64_x(&mut out, rv);
     }
     w_s(&mut out, ", ");
-    a64_mem(&mut out, al, fr, q.a, q.b, q.c);
+    a64_mwrite(&mut out, mo, q.c);
     w_s(&mut out, "\n");
   } else if op == IR_ALLOC {
     a64_mov(&mut out, a64_loc(al, fr, q.a), a64_rl(0));
@@ -766,6 +776,10 @@ fn a64_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
     ir_free(f);
     return false;
   }
+  iropt_inline(&mut f, c, &mut m, p);
+  iropt_slots(&mut f);
+  iropt_copies(&mut f);
+  iropt_thread(&mut f);
   let mut ok = vec_len(f.params) <= A64_MAX_ARGS;
   if ok && name_is(p, xi.def, "main") && vec_len(f.params) > 0 {
     ok = false;
