@@ -68,6 +68,10 @@ const IR_VGROW: u64 = 53;    // makes room in the Vec whose 3-word header is at 
 
 const IR_NONE: u64 = 18446744073709551615;
 
+/// In a `lent` entry, the third word at least this is a struct or enum of
+/// that many words less this, held in registers.
+const IR_LENT_WORDS: u64 = 1099511627776;
+
 struct IrIns { op: u64, d: u64, a: u64, b: u64, c: u64, ty: u64 }
 
 /// A variable in scope: its name in the source and its register.
@@ -89,12 +93,15 @@ struct IrFn {
   failed: bool,
   why: Vec[u64],
   /// The `&mut Buf` / `&mut Bytes` parameters: per parameter its address, data and length registers.
-  lent: Vec[u64]
+  lent: Vec[u64],
+  /// The line of the statement being lowered, and where the lowering failed.
+  cur: u64,
+  at: u64
 }
 
 fn ir_new(x: u64) -> IrFn {
   return IrFn { x: x, params: vec_new[u64](), ins: vec_new[IrIns](), args: vec_new[u64](), nreg: 0, nlabel: 0,
-    vars: vec_new[IrVar](), failed: false, why: vec_new[u64](), lent: vec_new[u64]() };
+    vars: vec_new[IrVar](), failed: false, why: vec_new[u64](), lent: vec_new[u64](), cur: 0, at: 0 };
 }
 
 fn ir_free(f: IrFn) {
@@ -109,6 +116,7 @@ fn ir_free(f: IrFn) {
 fn ir_fail(f: &mut IrFn, why: Str) {
   if !f.failed {
     f.failed = true;
+    f.at = f.cur;
     w_s(&mut f.why, why);
   }
 }
@@ -318,9 +326,9 @@ fn ir_kind(c: &Checker, m: &Mono, p: &Parser, t: u64) -> u64 {
 /// type. At least three words: a smaller one travels in registers.
 fn ir_ms(c: &Checker, m: &Mono, p: &Parser, t: u64) -> u64 {
   let u = base_t(m, t);
-  if kind_t(m, u) == TY_STRUCT && ir_kind(c, m, p, u) == 0 {
+  if (kind_t(m, u) == TY_STRUCT || kind_t(m, u) == TY_ENUM) && ir_kind(c, m, p, u) == 0 {
     let w = ir_mw(c, m, p, u, 0);
-    if w != IR_NONE && w >= 3 && w <= 16 {
+    if w != IR_NONE && w >= 3 && w <= 512 {
       return w;
     }
   }
@@ -524,6 +532,27 @@ fn ir_buf(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, k: u64) -
 fn ir_variant(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, x: u64) -> IrVal {
   let n = node_at(p.nodes, i);
   let t = intern(&mut m, p, TY_ENUM, x);
+  let mw = ir_ms(c, m, p, t);
+  if mw > 0 {
+    // An enum the IR keeps in memory: the tag, then the payload, in a frame
+    // slot of ours.
+    let slot = ir_reg(&mut f);
+    ir_emit(&mut f, IR_SLOT, slot, 0, 0, mw, 0);
+    let out = IrVal { k: IRK_PLACE, r0: slot, r1: 0, t: base_t(m, t) };
+    let v = cg_variant(m, p, x, n.s2, n.e2);
+    let tag = ir_reg(&mut f);
+    ir_emit(&mut f, IR_CONST, tag, v, 0, 0, 0);
+    ir_hdr_store(&mut f, slot, 0, tag);
+    if n.a != 0 {
+      let pv = ir_vexpr(&mut f, c, &mut m, p, n.a);
+      let ft = fld_ty(c, x, v);
+      if !f.failed && ft != 0 {
+        let dst = IrVal { k: IRK_PLACE, r0: slot, r1: 1, t: base_t(m, ft) };
+        ir_store_val(&mut f, c, m, p, dst, pv);
+      }
+    }
+    return out;
+  }
   if ir_kind(c, m, p, t) != IRK_ENUM {
     ir_fail(&mut f, "an enum outside the subset");
     return ir_none();
@@ -593,6 +622,39 @@ fn ir_slit(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, x: u64) 
     q = fi.next;
   }
   return out;
+}
+
+/// Is expression `e` the place that assignment path `path` names (`q.st` in
+/// `q.st = set(q.st, i, v)`)?
+fn ir_is_path(p: &Parser, e: u64, path: Node) -> bool {
+  let mut segs = vec_new[u64]();
+  let mut seg = path.next;
+  while seg != 0 && vec_len(segs) < 64 {
+    vec_push(&mut segs, seg);
+    let sn = node_at(p.nodes, seg);
+    seg = sn.next;
+  }
+  let mut cur = e;
+  let mut ok = e != 0;
+  let mut j = vec_len(segs);
+  while j > 0 && ok
+    invariant j <= vlen(segs)
+  {
+    j = j - 1;
+    let en = node_at(p.nodes, cur);
+    let sn = node_at(p.nodes, u_at(segs, j));
+    if en.kind != E_FIELD || !same(p.src, en.s, en.e, sn.s, sn.e) {
+      ok = false;
+    } else {
+      cur = en.a;
+    }
+  }
+  if ok {
+    let en = node_at(p.nodes, cur);
+    ok = en.kind == E_VAR && same(p.src, en.s, en.e, path.s, path.e);
+  }
+  vec_free(segs);
+  return ok;
 }
 
 /// Lowers expression `i`; returns the registers that hold its value.
@@ -709,7 +771,7 @@ fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       }
       v = ir_rv(&mut f, c, m, p, v);
     }
-    if seg == 0 && (v.k == IRK_BUF || v.k == IRK_BYTES) {
+    if seg == 0 && (v.k == IRK_BUF || v.k == IRK_BYTES || ir_multi(v.k)) {
       // A lent buffer stays the caller's: it is never freed or replaced
       // while lent, so its registers stay valid.
       return v;
@@ -1383,7 +1445,17 @@ fn ir_call_to(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, calle
       // Nothing more to lower.
     } else if aggr && pt_kind == TY_MUTREF {
       // Lent by address.
-      if v.k != IRK_PLACE {
+      if ir_multi(v.k) && v.r1 <= 64 {
+        // A struct held in registers: its words go to a slot, the callee gets
+        // the address, and they are read back after the call.
+        let slot = ir_reg(&mut f);
+        ir_emit(&mut f, IR_SLOT, slot, 0, 0, v.r1, 0);
+        ir_store_words(&mut f, slot, 0, v.r0, v.r1);
+        vec_push(&mut regs, slot);
+        vec_push(&mut lent, slot);
+        vec_push(&mut lent, v.r0);
+        vec_push(&mut lent, wrap_add(IR_LENT_WORDS, v.r1));
+      } else if v.k != IRK_PLACE {
         ir_fail(&mut f, "a `&mut` argument that is not a struct in memory");
       } else {
         vec_push(&mut regs, ir_paddr(&mut f, v));
@@ -1537,12 +1609,17 @@ fn ir_take_back(f: &mut IrFn, lent: &Vec[u64]) {
     let slot = vec_get(lent, j);
     let data = vec_get(lent, wrap_add(j, 1));
     let len = vec_get(lent, wrap_add(j, 2));
-    let k1 = ir_reg(&mut f);
-    ir_emit(&mut f, IR_CONST, k1, 1, 0, 0, 0);
-    ir_emit(&mut f, IR_LOAD, data, slot, k1, 8, 0);
-    let k0 = ir_reg(&mut f);
-    ir_emit(&mut f, IR_CONST, k0, 0, 0, 0, 0);
-    ir_emit(&mut f, IR_LOAD, len, slot, k0, 8, 0);
+    if len >= IR_LENT_WORDS {
+      // A struct or enum held in registers: its words, from `data` on.
+      ir_load_words(&mut f, slot, 0, data, len - IR_LENT_WORDS);
+    } else {
+      let k1 = ir_reg(&mut f);
+      ir_emit(&mut f, IR_CONST, k1, 1, 0, 0, 0);
+      ir_emit(&mut f, IR_LOAD, data, slot, k1, 8, 0);
+      let k0 = ir_reg(&mut f);
+      ir_emit(&mut f, IR_CONST, k0, 0, 0, 0, 0);
+      ir_emit(&mut f, IR_LOAD, len, slot, k0, 8, 0);
+    }
     j = j + 3;
   }
 }
@@ -1559,6 +1636,7 @@ fn ir_block(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, head: u64) {
 
 fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
   let n = node_at(p.nodes, i);
+  f.cur = n.line;
   let k = n.kind;
   if k == S_LET {
     let t = let_ty(m, f.x, i);
@@ -1611,17 +1689,18 @@ fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
       return;
     }
     let rhs = node_at(p.nodes, n.b);
-    if path.next == 0 && rhs.kind == E_CALL && (name_is(p, n.b, "set") || name_is(p, n.b, "bset")) {
-      // `b = set(b, i, v)` changes the buffer in place.
+    if rhs.kind == E_CALL && (name_is(p, n.b, "set") || name_is(p, n.b, "bset")) && ir_is_path(p, rhs.a, path) {
+      // `b = set(b, i, v)` (or `q.b = set(q.b, i, v)`) changes the buffer in
+      // place.
       let a0 = rhs.a;
       let a1 = next_of(p, a0);
       let a2 = next_of(p, a1);
-      let a0n = node_at(p.nodes, a0);
       let mut kind = IRK_BUF;
       if name_is(p, n.b, "bset") {
         kind = IRK_BYTES;
       }
-      if a0n.kind != E_VAR || !same(p.src, a0n.s, a0n.e, path.s, path.e) || target.k != kind {
+      target = ir_rv(&mut f, c, m, p, target);
+      if target.k != kind {
         ir_fail(&mut f, "a set that does not assign to its own buffer");
         return;
       }
@@ -1712,17 +1791,34 @@ fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     let dead = ir_label(&mut f);
     ir_place(&mut f, dead);
   } else if k == S_MATCH {
-    let scrut = ir_vexpr(&mut f, c, &mut m, p, n.a);
+    let scrut0 = ir_expr(&mut f, c, &mut m, p, n.a);
     if f.failed {
       return;
     }
-    if scrut.k != IRK_ENUM {
+    // An enum the IR cannot hold in registers is matched where it is: its
+    // tag is the first word, the payload of a variant the words after it.
+    let inplace = scrut0.k == IRK_PLACE && ir_kind(c, m, p, scrut0.t) == 0 && kind_t(m, base_t(m, scrut0.t)) == TY_ENUM;
+    let mut scrut = scrut0;
+    if !inplace {
+      scrut = ir_val(&mut f, c, m, p, scrut0);
+    }
+    if f.failed {
+      return;
+    }
+    if scrut.k != IRK_ENUM && !inplace {
       ir_fail(&mut f, "a match on something that is not an enum");
       return;
     }
     // The scrutinee is copied, so an arm may change what it was read from.
-    let e = ir_like(&mut f, scrut);
-    ir_copy(&mut f, e, scrut);
+    let mut e = scrut;
+    let mut tagr = IR_NONE;
+    if inplace {
+      tagr = ir_hdr_load(&mut f, scrut.r0, scrut.r1);
+    } else {
+      e = ir_like(&mut f, scrut);
+      ir_copy(&mut f, e, scrut);
+      tagr = e.r0;
+    }
     let x = inner_t(m, e.t);
     let l_end = ir_label(&mut f);
     let mut a = n.b;
@@ -1736,7 +1832,7 @@ fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
           let kr = ir_reg(&mut f);
           ir_emit(&mut f, IR_CONST, kr, v, 0, 0, 0);
           let hit = ir_reg(&mut f);
-          ir_emit(&mut f, IR_EQ, hit, e.r0, kr, 0, 0);
+          ir_emit(&mut f, IR_EQ, hit, tagr, kr, 0, 0);
           let l_arm = ir_label(&mut f);
           ir_emit(&mut f, IR_BR, IR_NONE, hit, l_arm, l_next, 0);
           ir_place(&mut f, l_arm);
@@ -1744,11 +1840,22 @@ fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
         if arm.a != 0 {
           let b = node_at(p.nodes, arm.a);
           if !span_is(p, b.s, b.e, "_") {
-            let view = ir_payload(&mut f, c, m, p, e, v);
-            if !f.failed {
-              let r = ir_like(&mut f, view);
-              ir_copy(&mut f, r, view);
-              ir_bind(&mut f, b.s, b.e, r);
+            if inplace {
+              let ft = fld_ty(c, x, v);
+              if ft == 0 {
+                ir_fail(&mut f, "a binding of a variant without a payload");
+              } else {
+                let view = IrVal { k: IRK_PLACE, r0: e.r0, r1: wrap_add(e.r1, 1), t: base_t(m, ft) };
+                let r = ir_own(&mut f, ir_rv(&mut f, c, m, p, view));
+                ir_bind(&mut f, b.s, b.e, r);
+              }
+            } else {
+              let view = ir_payload(&mut f, c, m, p, e, v);
+              if !f.failed {
+                let r = ir_like(&mut f, view);
+                ir_copy(&mut f, r, view);
+                ir_bind(&mut f, b.s, b.e, r);
+              }
             }
           }
         }
