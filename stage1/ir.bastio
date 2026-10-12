@@ -1,0 +1,603 @@
+// The IR between the checker and the native backend (docs/ir.md): one
+// function at a time, three-address code on virtual registers, with labels
+// and jumps. This file is the first step of #125: the data, the lowering
+// of the first subset (functions of integer and bool values: locals,
+// arithmetic, comparisons, `if`, `while`, `return`, calls of such
+// functions) and a text form for it (`irdump`). Nothing generates code from
+// it yet; `x86.bastio` is unchanged.
+//
+// A function outside the subset is not an error: `ir_lower` reports it
+// with the first thing it met that it does not handle yet, and the caller
+// keeps using the old generator for it (docs/ir.md, "Getting there without
+// a flag day").
+//
+// Values are 64-bit virtual registers; an operation that can wrap or
+// depends on the width or sign of its operands carries the type in `ty`
+// (as the checker recorded it for the operator node). Plain `+`, `-` and
+// `*` are proved not to overflow, so they have no width.
+import "codegen.bastio";
+import "render.bastio";
+
+// Operations. `d` is the register written, `a`, `b`, `c` the operands.
+const IR_CONST: u64 = 1;     // d = a (an immediate)
+const IR_MOV: u64 = 2;       // d = a
+const IR_ADD: u64 = 3;
+const IR_SUB: u64 = 4;
+const IR_MUL: u64 = 5;
+const IR_DIV: u64 = 6;       // unsigned
+const IR_SDIV: u64 = 7;
+const IR_REM: u64 = 8;
+const IR_SREM: u64 = 9;
+const IR_AND: u64 = 10;
+const IR_OR: u64 = 11;
+const IR_XOR: u64 = 12;
+const IR_SHL: u64 = 13;
+const IR_SHR: u64 = 14;      // logical
+const IR_SAR: u64 = 15;      // arithmetic
+const IR_NOT: u64 = 16;      // d = !a: the bits of a within the width of `ty`, or a bool
+const IR_NEG: u64 = 17;
+const IR_EQ: u64 = 20;
+const IR_NE: u64 = 21;
+const IR_LT: u64 = 22;       // unsigned
+const IR_LE: u64 = 23;
+const IR_GT: u64 = 24;
+const IR_GE: u64 = 25;
+const IR_SLT: u64 = 26;      // signed
+const IR_SLE: u64 = 27;
+const IR_SGT: u64 = 28;
+const IR_SGE: u64 = 29;
+const IR_LABEL: u64 = 40;    // label a starts here
+const IR_JMP: u64 = 41;      // goto label a
+const IR_BR: u64 = 42;       // if a goto label b else label c
+const IR_RET: u64 = 43;      // return a (IR_NONE: nothing)
+const IR_CALL: u64 = 44;     // d = instance a called with the c registers of args[b ..] (d = IR_NONE: no result)
+const IR_UNREACH: u64 = 45;
+
+const IR_NONE: u64 = 18446744073709551615;
+
+struct IrIns { op: u64, d: u64, a: u64, b: u64, c: u64, ty: u64 }
+
+/// A variable in scope: its name in the source and its register.
+struct IrVar { s: u64, e: u64, r: u64 }
+
+/// One function being lowered, and then lowered.
+struct IrFn {
+  /// The function instance.
+  x: u64,
+  /// Registers of the parameters, in order.
+  params: Vec[u64],
+  ins: Vec[IrIns],
+  /// The argument registers of the calls.
+  args: Vec[u64],
+  nreg: u64,
+  nlabel: u64,
+  vars: Vec[IrVar],
+  /// What stopped the lowering: set at the first thing not handled.
+  failed: bool,
+  why: Vec[u64]
+}
+
+fn ir_new(x: u64) -> IrFn {
+  return IrFn { x: x, params: vec_new[u64](), ins: vec_new[IrIns](), args: vec_new[u64](), nreg: 0, nlabel: 0,
+    vars: vec_new[IrVar](), failed: false, why: vec_new[u64]() };
+}
+
+fn ir_free(f: IrFn) {
+  vec_free(f.params);
+  vec_free(f.ins);
+  vec_free(f.args);
+  vec_free(f.vars);
+  vec_free(f.why);
+}
+
+fn ir_fail(f: &mut IrFn, why: Str) {
+  if !f.failed {
+    f.failed = true;
+    w_s(&mut f.why, why);
+  }
+}
+
+fn ir_reg(f: &mut IrFn) -> u64 {
+  let r = f.nreg;
+  f.nreg = wrap_add(f.nreg, 1);
+  return r;
+}
+
+fn ir_label(f: &mut IrFn) -> u64 {
+  let l = f.nlabel;
+  f.nlabel = wrap_add(f.nlabel, 1);
+  return l;
+}
+
+fn ir_emit(f: &mut IrFn, op: u64, d: u64, a: u64, b: u64, c: u64, ty: u64) {
+  vec_push(&mut f.ins, IrIns { op: op, d: d, a: a, b: b, c: c, ty: ty });
+}
+
+fn ir_place(f: &mut IrFn, l: u64) {
+  ir_emit(&mut f, IR_LABEL, IR_NONE, l, 0, 0, 0);
+}
+
+fn ir_jump(f: &mut IrFn, l: u64) {
+  ir_emit(&mut f, IR_JMP, IR_NONE, l, 0, 0, 0);
+}
+
+// ---- Lowering ----
+
+/// Is `t` a type the first subset handles: an integer or a bool?
+fn ir_scalar(m: &Mono, t: u64) -> bool {
+  return is_int(m, t) || kind_t(m, t) == TY_BOOL;
+}
+
+fn ir_bind(f: &mut IrFn, s: u64, e: u64, r: u64) {
+  vec_push(&mut f.vars, IrVar { s: s, e: e, r: r });
+}
+
+/// The register of the variable named `s..e`, the innermost one, or IR_NONE.
+fn ir_find(f: &IrFn, p: &Parser, s: u64, e: u64) -> u64 {
+  let mut k = vec_len(f.vars);
+  while k > 0
+    invariant k <= vlen(f.vars)
+  {
+    k = k - 1;
+    let v = vec_get(f.vars, k);
+    if same(p.src, v.s, v.e, s, e) {
+      return v.r;
+    }
+  }
+  return IR_NONE;
+}
+
+fn ir_truncate(f: &mut IrFn, n: u64) {
+  while vec_len(f.vars) > n {
+    vec_pop(&mut f.vars);
+  }
+}
+
+/// The IR operation of binary operator `op` on operands of the type kind
+/// `signed` says, or 0 for one outside the subset.
+fn ir_binop(op: u64, signed: bool) -> u64 {
+  if op == P_PLUS { return IR_ADD; }
+  if op == P_MINUS { return IR_SUB; }
+  if op == P_STAR { return IR_MUL; }
+  if op == P_SLASH { if signed { return IR_SDIV; } return IR_DIV; }
+  if op == P_PERCENT { if signed { return IR_SREM; } return IR_REM; }
+  if op == P_AMP { return IR_AND; }
+  if op == P_PIPE { return IR_OR; }
+  if op == P_CARET { return IR_XOR; }
+  if op == P_SHL { return IR_SHL; }
+  if op == P_SHR { if signed { return IR_SAR; } return IR_SHR; }
+  if op == P_EQEQ { return IR_EQ; }
+  if op == P_NE { return IR_NE; }
+  if op == P_LT { if signed { return IR_SLT; } return IR_LT; }
+  if op == P_LE { if signed { return IR_SLE; } return IR_LE; }
+  if op == P_GT { if signed { return IR_SGT; } return IR_GT; }
+  if op == P_GE { if signed { return IR_SGE; } return IR_GE; }
+  return 0;
+}
+
+/// Lowers expression `i` of the scalar kind; returns the register that
+/// holds its value (IR_NONE after a failure).
+fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
+  if f.failed {
+    return IR_NONE;
+  }
+  let n = node_at(p.nodes, i);
+  let k = n.kind;
+  if k == E_INT || k == E_BOOL {
+    let d = ir_reg(&mut f);
+    ir_emit(&mut f, IR_CONST, d, n.v, 0, 0, 0);
+    return d;
+  }
+  if k == E_VAR {
+    let r = ir_find(f, p, n.s, n.e);
+    if r == IR_NONE {
+      ir_fail(&mut f, "a name that is not a scalar variable");
+    }
+    return r;
+  }
+  if k == E_NEG {
+    let a = ir_expr(&mut f, c, &mut m, p, n.a);
+    let d = ir_reg(&mut f);
+    ir_emit(&mut f, IR_NEG, d, a, 0, 0, cg_int_op(c, f.x, i));
+    return d;
+  }
+  if k == E_NOT {
+    let a = ir_expr(&mut f, c, &mut m, p, n.a);
+    let d = ir_reg(&mut f);
+    ir_emit(&mut f, IR_NOT, d, a, 0, 0, cg_int_op(c, f.x, i));
+    return d;
+  }
+  if k == E_BIN && (n.v == P_ANDAND || n.v == P_OROR) {
+    // The right operand runs only if the left does not decide the result.
+    let d = ir_reg(&mut f);
+    let a = ir_expr(&mut f, c, &mut m, p, n.a);
+    ir_emit(&mut f, IR_MOV, d, a, 0, 0, 0);
+    let rhs = ir_label(&mut f);
+    let end = ir_label(&mut f);
+    if n.v == P_ANDAND {
+      ir_emit(&mut f, IR_BR, IR_NONE, d, rhs, end, 0);
+    } else {
+      ir_emit(&mut f, IR_BR, IR_NONE, d, end, rhs, 0);
+    }
+    ir_place(&mut f, rhs);
+    let b = ir_expr(&mut f, c, &mut m, p, n.b);
+    ir_emit(&mut f, IR_MOV, d, b, 0, 0, 0);
+    ir_place(&mut f, end);
+    return d;
+  }
+  if k == E_BIN {
+    let t = cg_int_op(c, f.x, i);
+    let op = ir_binop(n.v, t != 0 && is_signed(m, t));
+    if op == 0 {
+      ir_fail(&mut f, "an operator outside the first subset");
+      return IR_NONE;
+    }
+    let a = ir_expr(&mut f, c, &mut m, p, n.a);
+    let b = ir_expr(&mut f, c, &mut m, p, n.b);
+    let d = ir_reg(&mut f);
+    ir_emit(&mut f, op, d, a, b, 0, t);
+    return d;
+  }
+  if k == E_CALL {
+    return ir_call(&mut f, c, &mut m, p, i);
+  }
+  ir_fail(&mut f, "an expression outside the first subset");
+  return IR_NONE;
+}
+
+/// A call of a function that is not generic and not a builtin; its
+/// arguments and result must be scalars (or no result).
+fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
+  let n = node_at(p.nodes, i);
+  if is_builtin_name(c, p, n.s, n.e) {
+    ir_fail(&mut f, "a builtin");
+    return IR_NONE;
+  }
+  let def = plain_fn(p, n.s, n.e);
+  if def == 0 {
+    ir_fail(&mut f, "a call of a generic function");
+    return IR_NONE;
+  }
+  let callee = plain_inst(&mut m, def);
+  let mut regs = vec_new[u64]();
+  let mut a = n.a;
+  while a != 0 && !f.failed {
+    vec_push(&mut regs, ir_expr(&mut f, c, &mut m, p, a));
+    a = next_of(p, a);
+  }
+  let first = vec_len(f.args);
+  let mut j = 0;
+  while j < vec_len(regs) {
+    vec_push(&mut f.args, vec_get(regs, j));
+    j = j + 1;
+  }
+  let count = vec_len(regs);
+  vec_free(regs);
+  if f.failed {
+    return IR_NONE;
+  }
+  let rt = cg_ret_ty(&mut m, p, callee);
+  let mut d = IR_NONE;
+  if ir_scalar(m, rt) {
+    d = ir_reg(&mut f);
+  } else if kind_t(m, rt) != TY_UNIT {
+    ir_fail(&mut f, "a call with a result that is not a scalar");
+    return IR_NONE;
+  }
+  ir_emit(&mut f, IR_CALL, d, callee, first, count, 0);
+  return d;
+}
+
+fn ir_block(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, head: u64) {
+  let saved = vec_len(f.vars);
+  let mut i = head;
+  while i != 0 && !f.failed {
+    ir_stmt(&mut f, c, &mut m, p, i);
+    i = next_of(p, i);
+  }
+  ir_truncate(&mut f, saved);
+}
+
+fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
+  let n = node_at(p.nodes, i);
+  let k = n.kind;
+  if k == S_LET {
+    let t = let_ty(m, f.x, i);
+    if !ir_scalar(m, t) {
+      ir_fail(&mut f, "a variable that is not a scalar");
+      return;
+    }
+    let v = ir_expr(&mut f, c, &mut m, p, n.b);
+    if f.failed {
+      return;
+    }
+    // A fresh register: the initializer's may be another variable's.
+    let r = ir_reg(&mut f);
+    ir_emit(&mut f, IR_MOV, r, v, 0, 0, 0);
+    ir_bind(&mut f, n.s, n.e, r);
+  } else if k == S_ASSIGN {
+    let path = node_at(p.nodes, n.a);
+    if path.next != 0 {
+      ir_fail(&mut f, "an assignment to a field");
+      return;
+    }
+    let r = ir_find(f, p, path.s, path.e);
+    if r == IR_NONE {
+      ir_fail(&mut f, "an assignment to something that is not a scalar variable");
+      return;
+    }
+    let v = ir_expr(&mut f, c, &mut m, p, n.b);
+    if !f.failed {
+      ir_emit(&mut f, IR_MOV, r, v, 0, 0, 0);
+    }
+  } else if k == S_IF {
+    let cond = ir_expr(&mut f, c, &mut m, p, n.a);
+    let l_then = ir_label(&mut f);
+    let l_else = ir_label(&mut f);
+    let l_end = ir_label(&mut f);
+    ir_emit(&mut f, IR_BR, IR_NONE, cond, l_then, l_else, 0);
+    ir_place(&mut f, l_then);
+    ir_block(&mut f, c, &mut m, p, n.b);
+    ir_jump(&mut f, l_end);
+    ir_place(&mut f, l_else);
+    if n.c != 0 {
+      ir_block(&mut f, c, &mut m, p, n.c);
+    }
+    ir_place(&mut f, l_end);
+  } else if k == S_WHILE {
+    let l_head = ir_label(&mut f);
+    let l_body = ir_label(&mut f);
+    let l_end = ir_label(&mut f);
+    ir_place(&mut f, l_head);
+    let cond = ir_expr(&mut f, c, &mut m, p, n.a);
+    ir_emit(&mut f, IR_BR, IR_NONE, cond, l_body, l_end, 0);
+    ir_place(&mut f, l_body);
+    ir_block(&mut f, c, &mut m, p, n.c);
+    ir_jump(&mut f, l_head);
+    ir_place(&mut f, l_end);
+  } else if k == S_RETURN {
+    if n.a == 0 {
+      ir_emit(&mut f, IR_RET, IR_NONE, IR_NONE, 0, 0, 0);
+    } else {
+      let v = ir_expr(&mut f, c, &mut m, p, n.a);
+      ir_emit(&mut f, IR_RET, IR_NONE, v, 0, 0, 0);
+    }
+    // Code after a return is unreachable but must still sit in a block.
+    let dead = ir_label(&mut f);
+    ir_place(&mut f, dead);
+  } else if k == S_UNREACHABLE {
+    ir_emit(&mut f, IR_UNREACH, IR_NONE, 0, 0, 0, 0);
+    let dead = ir_label(&mut f);
+    ir_place(&mut f, dead);
+  } else if k == S_EXPR {
+    let e = node_at(p.nodes, n.a);
+    if e.kind == E_CALL {
+      ir_call(&mut f, c, &mut m, p, n.a);
+    } else {
+      ir_fail(&mut f, "an expression statement that is not a call");
+    }
+  } else if k == S_ASSERT {
+    // Ghost code is erased before lowering, as before C generation.
+  } else {
+    ir_fail(&mut f, "a statement outside the first subset");
+  }
+}
+
+/// Drops the code no jump reaches: what follows a `ret`, `jmp`, `br` or
+/// `unreachable` up to the next label something jumps to, and the labels
+/// nothing jumps to.
+fn ir_trim(f: &mut IrFn) {
+  let mut used = vec_new[u64]();
+  let mut k = 0;
+  while k < vec_len(f.ins) {
+    let q = vec_get(f.ins, k);
+    if q.op == IR_JMP {
+      vec_push(&mut used, q.a);
+    } else if q.op == IR_BR {
+      vec_push(&mut used, q.b);
+      vec_push(&mut used, q.c);
+    }
+    k = k + 1;
+  }
+  let mut out = vec_new[IrIns]();
+  let mut live = true;
+  k = 0;
+  while k < vec_len(f.ins) {
+    let q = vec_get(f.ins, k);
+    k = k + 1;
+    if q.op == IR_LABEL {
+      if has_id(used, q.a) {
+        vec_push(&mut out, q);
+        live = true;
+      }
+    } else if live {
+      vec_push(&mut out, q);
+      if q.op == IR_RET || q.op == IR_JMP || q.op == IR_BR || q.op == IR_UNREACH {
+        live = false;
+      }
+    }
+  }
+  vec_free(used);
+  vec_free(f.ins);
+  f.ins = out;
+}
+
+/// Lowers function instance `x`: parameters, then the body, and a `return`
+/// at the end for a body that falls off it. `f.failed` says whether the
+/// function is outside the subset.
+fn ir_lower(c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> IrFn {
+  let mut f = ir_new(x);
+  let xi = inst_at(m, x);
+  let dn = node_at(p.nodes, xi.def);
+  let mut q = dn.a;
+  while q != 0 && !f.failed {
+    let qn = node_at(p.nodes, q);
+    let pt = conv(&mut m, p, qn.a, x, q);
+    if !ir_scalar(m, pt) {
+      ir_fail(&mut f, "a parameter that is not a scalar");
+    } else {
+      let r = ir_reg(&mut f);
+      vec_push(&mut f.params, r);
+      ir_bind(&mut f, qn.s, qn.e, r);
+    }
+    q = qn.next;
+  }
+  let rt = cg_ret_ty(&mut m, p, x);
+  if !f.failed && !ir_scalar(m, rt) && kind_t(m, rt) != TY_UNIT {
+    ir_fail(&mut f, "a result that is not a scalar");
+  }
+  if !f.failed {
+    ir_block(&mut f, c, &mut m, p, dn.x);
+    ir_emit(&mut f, IR_RET, IR_NONE, IR_NONE, 0, 0, 0);
+    ir_trim(&mut f);
+  }
+  return f;
+}
+
+// ---- The text form ----
+
+fn ir_op_name(op: u64) -> Str {
+  if op == IR_CONST { return "const"; }
+  if op == IR_MOV { return "mov"; }
+  if op == IR_ADD { return "add"; }
+  if op == IR_SUB { return "sub"; }
+  if op == IR_MUL { return "mul"; }
+  if op == IR_DIV { return "div"; }
+  if op == IR_SDIV { return "sdiv"; }
+  if op == IR_REM { return "rem"; }
+  if op == IR_SREM { return "srem"; }
+  if op == IR_AND { return "and"; }
+  if op == IR_OR { return "or"; }
+  if op == IR_XOR { return "xor"; }
+  if op == IR_SHL { return "shl"; }
+  if op == IR_SHR { return "shr"; }
+  if op == IR_SAR { return "sar"; }
+  if op == IR_NOT { return "not"; }
+  if op == IR_NEG { return "neg"; }
+  if op == IR_EQ { return "eq"; }
+  if op == IR_NE { return "ne"; }
+  if op == IR_LT { return "lt"; }
+  if op == IR_LE { return "le"; }
+  if op == IR_GT { return "gt"; }
+  if op == IR_GE { return "ge"; }
+  if op == IR_SLT { return "slt"; }
+  if op == IR_SLE { return "sle"; }
+  if op == IR_SGT { return "sgt"; }
+  if op == IR_SGE { return "sge"; }
+  return "?";
+}
+
+fn ir_w_reg(out: &mut Vec[u64], r: u64) {
+  w_s(&mut out, "v");
+  w_num(&mut out, r);
+}
+
+fn ir_w_label(out: &mut Vec[u64], l: u64) {
+  w_s(&mut out, "L");
+  w_num(&mut out, l);
+}
+
+/// The name of instance `x` as the source spells it, with its number when
+/// it is generic.
+fn ir_w_name(out: &mut Vec[u64], m: &Mono, p: &Parser, x: u64) {
+  let xi = inst_at(m, x);
+  let dn = node_at(p.nodes, xi.def);
+  if dn.s <= dn.e && dn.e <= blen(p.src) {
+    let mut k = dn.s;
+    while k < dn.e
+      invariant dn.e <= blen(p.src)
+    {
+      vec_push(&mut out, cast[u64](bget(p.src, k)));
+      k = k + 1;
+    }
+  }
+}
+
+/// The text of a lowered function:
+///   fn name(v0, v1) {
+///     v2 = add v0, v1
+///   L0:
+///     br v2, L1, L2
+///     ret v2
+///   }
+fn ir_print(out: &mut Vec[u64], f: &IrFn, m: &Mono, p: &Parser) {
+  w_s(&mut out, "fn ");
+  ir_w_name(&mut out, m, p, f.x);
+  w_s(&mut out, "(");
+  let mut k = 0;
+  while k < vec_len(f.params) {
+    if k > 0 {
+      w_s(&mut out, ", ");
+    }
+    ir_w_reg(&mut out, vec_get(f.params, k));
+    k = k + 1;
+  }
+  w_s(&mut out, ") {\n");
+  k = 0;
+  while k < vec_len(f.ins) {
+    let q = vec_get(f.ins, k);
+    k = k + 1;
+    if q.op != IR_LABEL {
+      w_s(&mut out, "  ");
+    }
+    if q.op == IR_LABEL {
+      ir_w_label(&mut out, q.a);
+      w_s(&mut out, ":");
+    } else if q.op == IR_CONST {
+      ir_w_reg(&mut out, q.d);
+      w_s(&mut out, " = const ");
+      w_num(&mut out, q.a);
+    } else if q.op == IR_MOV || q.op == IR_NOT || q.op == IR_NEG {
+      ir_w_reg(&mut out, q.d);
+      w_s(&mut out, " = ");
+      w_s(&mut out, ir_op_name(q.op));
+      w_s(&mut out, " ");
+      ir_w_reg(&mut out, q.a);
+    } else if q.op == IR_JMP {
+      w_s(&mut out, "jmp ");
+      ir_w_label(&mut out, q.a);
+    } else if q.op == IR_BR {
+      w_s(&mut out, "br ");
+      ir_w_reg(&mut out, q.a);
+      w_s(&mut out, ", ");
+      ir_w_label(&mut out, q.b);
+      w_s(&mut out, ", ");
+      ir_w_label(&mut out, q.c);
+    } else if q.op == IR_RET {
+      w_s(&mut out, "ret");
+      if q.a != IR_NONE {
+        w_s(&mut out, " ");
+        ir_w_reg(&mut out, q.a);
+      }
+    } else if q.op == IR_UNREACH {
+      w_s(&mut out, "unreachable");
+    } else if q.op == IR_CALL {
+      if q.d != IR_NONE {
+        ir_w_reg(&mut out, q.d);
+        w_s(&mut out, " = ");
+      }
+      w_s(&mut out, "call ");
+      ir_w_name(&mut out, m, p, q.a);
+      w_s(&mut out, "(");
+      let mut j = 0;
+      while j < q.c {
+        if j > 0 {
+          w_s(&mut out, ", ");
+        }
+        ir_w_reg(&mut out, u_at(f.args, wrap_add(q.b, j)));
+        j = j + 1;
+      }
+      w_s(&mut out, ")");
+    } else {
+      ir_w_reg(&mut out, q.d);
+      w_s(&mut out, " = ");
+      w_s(&mut out, ir_op_name(q.op));
+      w_s(&mut out, " ");
+      ir_w_reg(&mut out, q.a);
+      w_s(&mut out, ", ");
+      ir_w_reg(&mut out, q.b);
+    }
+    w_s(&mut out, "\n");
+  }
+  w_s(&mut out, "}\n");
+}

@@ -1,0 +1,76 @@
+// Prints the IR (stage1/ir.bastio) of every function of a program that is in
+// the first subset; a function outside it gets a comment line with the first
+// thing that stopped the lowering. Type and linearity checking run first, as
+// for asmdump; nothing is verified or generated.
+//   usage: irdump [--lib DIR] FILE
+import "loader.bastio";
+import "out.bastio";
+import "ir.bastio";
+
+fn main(con: &mut Serial, host: &mut Host) -> u64 {
+  let mut ld = loader_new();
+  let mut base = 1;
+  if host_argc(host) > 3 {
+    let a = host_arg(host, 1);
+    if spells(a, 0, blen(a), "--lib") {
+      loader_lib(&mut ld, host_arg(host, 2));
+      base = 3;
+    }
+    bfree(a);
+  }
+  let path = host_arg(host, base);
+  let mut p = parser_new(balloc(0), vec_new[Tok](), 0);
+  let r = load(host, &mut p, &mut ld, path, 0, 0, 0, false);
+  bfree(path);
+  loader_free(ld);
+  let mut code = 0;
+  if r != 0 {
+    put(con, "error\n");
+    code = 1;
+  } else {
+    let mut m = mono_new();
+    monomorphize(&mut m, p);
+    if m.failed {
+      put(con, "error\n");
+      code = 1;
+    } else {
+      let mut c = checker_new(&mut m, p, TARGET_HOSTED);
+      check_program(&mut c, &mut m, p);
+      if c.failed {
+        put(con, "error\n");
+        code = 1;
+      } else {
+        let mut k = 0;
+        while k < vec_len(m.fns) {
+          let x = u_at(m.fns, k);
+          let f = ir_lower(c, &mut m, p, x);
+          let mut text = vec_new[u64]();
+          if f.failed {
+            w_s(&mut text, "# ");
+            ir_w_name(&mut text, m, p, x);
+            w_s(&mut text, ": not in the first subset: ");
+            w_append(&mut text, f.why);
+            w_s(&mut text, "\n");
+          } else {
+            ir_print(&mut text, f, m, p);
+          }
+          let mut j = 0;
+          while j < vec_len(text) {
+            let ch = u_at(text, j);
+            if ch <= 255 {
+              serial_write(con, cast[u8](ch));
+            }
+            j = j + 1;
+          }
+          vec_free(text);
+          ir_free(f);
+          k = k + 1;
+        }
+      }
+      checker_free(c);
+    }
+    mono_free(m);
+  }
+  bfree(parser_free(p));
+  return code;
+}
