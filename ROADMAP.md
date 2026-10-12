@@ -134,10 +134,10 @@ Decided 2026-10-10: BastiOS should run existing Linux programs, not only program
 - [x] Load static x86-64 Linux ELF binaries into a user address space (BastiOS, 2026-10-10): fixed-address executables inside the user window and static PIEs, started with the Linux initial stack (argc, argv, envp, auxv). Every header field is untrusted and every read and copy is proved in bounds. No dynamic linking
 - [x] Accept the Linux system-call ABI (`syscall` instruction, Linux numbers and argument registers) next to the native one (BastiOS, 2026-10-10). The entry stub is the only new trusted assembly
 - [x] Translate the common calls onto BastiOS services until a static busybox shell runs (BastiOS, 2026-10-10): BusyBox 1.36.1 `ash`, built unmodified against musl, runs interactively on the console with fork/execve/wait4, pipes, redirection and the environment, and BusyBox `ls`, `cat`, `wc`, `head`, `rm` and `cp` work. The calls are listed in the bastios README. They include a terminal line discipline, refcounted open file descriptions shared by dup and fork, pipes, getdents64, stat/fstat, brk/mmap, per-process FPU state, and UDP sockets over the kernel's own
-- [ ] A user window larger than 2 MiB (one level-1 table today), so bigger programs and heaps fit
-- [ ] Copy-on-write fork (fork copies the whole window today) and real blocking in poll, pipes and sockets (they wait by restarting the call)
-- [ ] Signals (none are delivered yet: `rt_sigaction` is accepted and ignored), so Ctrl-C and `kill` reach Linux programs
-- [ ] Subdirectories, once the file layer has them (Linux paths are one flat directory plus `/bin`)
+- [x] A user window larger than 2 MiB, so bigger programs and heaps fit (BastiOS, 2026-10-11: 512 GiB per process, pages mapped on first touch)
+- [x] Copy-on-write fork (a single-threaded process's pages are shared until written) and real blocking in `poll`, `epoll`, `select`, pipes and sockets (a waiting process sleeps until a frame, a clock tick or a signal)
+- [x] Signals, so Ctrl-C and `kill` reach Linux programs: handlers, masks, `SA_RESTART`, `signalfd`, POSIX timers
+- [x] Subdirectories, in memory and on the disk
 
 The layer is written in Bastio, so it is held to the same memory-safety proofs as the rest of the kernel. User programs themselves are not trusted; page tables isolate them, so a misbehaving Linux binary can only fault itself. Only the small entry stub (saving registers on `syscall`) belongs to the trusted assembly base.
 
@@ -145,11 +145,22 @@ The layer is written in Bastio, so it is held to the same memory-safety proofs a
 
 Goal, set 2026-10-10: BastiOS usable as a general-purpose operating system, for the everyday work a Linux machine does, not only as a demonstration kernel. Public release as open source is a waypoint on the way. Each item below is a gap between BastiOS today and that goal:
 - [ ] Real hardware: boot, disks, network and keyboard on physical PCs, not only QEMU
-- [ ] Users, permissions and isolation between them
+- [x] Users, permissions and isolation between them: `login`, `su`, file modes, setuid, persistent `/etc`
 - [ ] No toy limits: memory, processes, CPUs, files and descriptors scale with the machine. Physical memory (2026-10-11): the page pool spans every run of RAM in the memory map up to 512 GiB (2^27 pages), with page numbers dense across the holes; the kernel arena grows by a 32nd of the pool (at least 4 MiB). Still fixed: process count (NPROC), per-process tables, processors (MAX_CPUS 16), the user window
-- [ ] Software installation: a package manager, and dynamically linked glibc programs
-- [ ] Networking for the internet: DNS, TLS, IPv6, verified against real services
+- [x] Software installation: Alpine's `apk` installs dynamically linked musl packages (git, curl, make, binutils and dozens more), and static or dynamic glibc programs run from a Debian root
+- [x] Networking for the internet: DHCP, DNS, TLS, IPv4 and IPv6, SSH server. Verified against local services and the QEMU user network; not yet against a physical network
 - [ ] Desktop hardware: graphics, audio, Wi-Fi, power management
+
+### Milestone: develop on BastiOS with Neovim
+
+Goal, set 2026-10-12: sit at a BastiOS shell (console or SSH) and do an ordinary edit-build-commit loop without leaving it. The bar, all inside BastiOS with packages from Alpine's repositories:
+- [ ] `apk add neovim git build-base` succeeds on a disk large enough to hold them (gcc, g++ and Python needed more than the old 1024-entry disk allowed)
+- [ ] `nvim` runs in the console and in an SSH pseudo-terminal: raw mode and window-size changes (`termios`, `TIOCGWINSZ`, `SIGWINCH`), colours, the cursor keys, `poll`/`epoll` event loops, job control for `:!`, and plugin hosts started with `fork`/`exec`
+- [ ] `nvim` opens, edits and saves a Bastio or C source file, with its swap and undo files, on the disk file system
+- [ ] `git clone`, `commit`, `diff` and `log` work in a work tree, and `gcc` or `make` builds a small C program from the editor with `:make`
+- [ ] A test (`make compat`) drives that session so it stays working
+
+The gaps this finds are filed and fixed as ordinary Linux-compatibility work under v4 and v5.
 
 ## v6: containers
 
