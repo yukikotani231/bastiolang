@@ -504,6 +504,63 @@ fn ir_buf(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, k: u64) -
   return v;
 }
 
+/// The enum value built by variant node `i` of enum instance `x`.
+fn ir_variant(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, x: u64) -> IrVal {
+  let n = node_at(p.nodes, i);
+  let t = intern(&mut m, p, TY_ENUM, x);
+  if ir_kind(c, m, p, t) != IRK_ENUM {
+    ir_fail(&mut f, "an enum outside the subset");
+    return ir_none();
+  }
+  let out = ir_new_val(&mut f, IRK_ENUM, ir_words(c, m, p, t, 0), t);
+  let v = cg_variant(m, p, x, n.s2, n.e2);
+  ir_emit(&mut f, IR_CONST, out.r0, v, 0, 0, 0);
+  // The payload words no variant uses are defined too.
+  let mut z = 1;
+  while z < out.r1 && z < 64 {
+    ir_emit(&mut f, IR_CONST, wrap_add(out.r0, z), 0, 0, 0, 0);
+    z = z + 1;
+  }
+  if n.a != 0 {
+    let pv = ir_vexpr(&mut f, c, &mut m, p, n.a);
+    let dst = ir_payload(&mut f, c, m, p, out, v);
+    if !f.failed {
+      if pv.k != dst.k {
+        ir_fail(&mut f, "a payload of another kind");
+      } else {
+        ir_copy(&mut f, dst, pv);
+      }
+    }
+  }
+  return out;
+}
+
+/// The struct value built by literal node `i` of struct instance `x`.
+fn ir_slit(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, x: u64) -> IrVal {
+  let n = node_at(p.nodes, i);
+  let t = intern(&mut m, p, TY_STRUCT, x);
+  if ir_kind(c, m, p, t) != IRK_STRUCT {
+    ir_fail(&mut f, "a struct outside the subset");
+    return ir_none();
+  }
+  let out = ir_new_val(&mut f, IRK_STRUCT, ir_words(c, m, p, t, 0), t);
+  let mut q = n.a;
+  while q != 0 && !f.failed {
+    let fi = node_at(p.nodes, q);
+    let dst = ir_field(&mut f, c, m, p, out, fi.s, fi.e);
+    let v = ir_vexpr(&mut f, c, &mut m, p, fi.a);
+    if !f.failed {
+      if v.k != dst.k {
+        ir_fail(&mut f, "a field initializer of another kind");
+      } else {
+        ir_copy(&mut f, dst, v);
+      }
+    }
+    q = fi.next;
+  }
+  return out;
+}
+
 /// Lowers expression `i`; returns the registers that hold its value.
 fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal {
   if f.failed {
@@ -637,32 +694,25 @@ fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       return ir_none();
     }
     let x = plain_inst(&mut m, def);
-    let t = intern(&mut m, p, TY_ENUM, x);
-    if ir_kind(c, m, p, t) != IRK_ENUM {
-      ir_fail(&mut f, "an enum outside the subset");
+    return ir_variant(&mut f, c, &mut m, p, i, x);
+  }
+  if k == E_TAPP && kind_of(p, n.b) == E_CALL && !is_typed_builtin(p, n.b) {
+    // `f[T](args)`: the instance the monomorphizer made.
+    let callee = tapp_inst(&mut m, p, i, f.x);
+    if callee == 0 {
+      ir_fail(&mut f, "a call of a generic function");
       return ir_none();
     }
-    let out = ir_new_val(&mut f, IRK_ENUM, ir_words(c, m, p, t, 0), t);
-    let v = cg_variant(m, p, x, n.s2, n.e2);
-    ir_emit(&mut f, IR_CONST, out.r0, v, 0, 0, 0);
-    // The payload words no variant uses are defined too.
-    let mut z = 1;
-    while z < out.r1 && z < 64 {
-      ir_emit(&mut f, IR_CONST, wrap_add(out.r0, z), 0, 0, 0, 0);
-      z = z + 1;
+    return ir_call_to(&mut f, c, &mut m, p, n.b, callee);
+  }
+  if k == E_TAPP && kind_of(p, n.b) == E_VARIANT {
+    // `Option[u64]::Some(x)`: the instance the monomorphizer made.
+    let x = tapp_inst(&mut m, p, i, f.x);
+    if x == 0 {
+      ir_fail(&mut f, "a variant of a generic enum");
+      return ir_none();
     }
-    if n.a != 0 {
-      let pv = ir_vexpr(&mut f, c, &mut m, p, n.a);
-      let dst = ir_payload(&mut f, c, m, p, out, v);
-      if !f.failed {
-        if pv.k != dst.k {
-          ir_fail(&mut f, "a payload of another kind");
-        } else {
-          ir_copy(&mut f, dst, pv);
-        }
-      }
-    }
-    return out;
+    return ir_variant(&mut f, c, &mut m, p, n.b, x);
   }
   if k == E_IS {
     let e0 = ir_expr(&mut f, c, &mut m, p, n.a);
@@ -712,27 +762,16 @@ fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       ir_fail(&mut f, "a literal of a generic struct");
       return ir_none();
     }
-    let t = intern(&mut m, p, TY_STRUCT, plain_inst(&mut m, def));
-    if ir_kind(c, m, p, t) != IRK_STRUCT {
-      ir_fail(&mut f, "a struct outside the subset");
+    return ir_slit(&mut f, c, &mut m, p, i, plain_inst(&mut m, def));
+  }
+  if k == E_TAPP && kind_of(p, n.b) == E_SLIT {
+    // `Pair[u64, bool] { .. }`: the instance the monomorphizer made.
+    let x = tapp_inst(&mut m, p, i, f.x);
+    if x == 0 {
+      ir_fail(&mut f, "a literal of a generic struct");
       return ir_none();
     }
-    let out = ir_new_val(&mut f, IRK_STRUCT, ir_words(c, m, p, t, 0), t);
-    let mut q = n.a;
-    while q != 0 && !f.failed {
-      let fi = node_at(p.nodes, q);
-      let dst = ir_field(&mut f, c, m, p, out, fi.s, fi.e);
-      let v = ir_vexpr(&mut f, c, &mut m, p, fi.a);
-      if !f.failed {
-        if v.k != dst.k {
-          ir_fail(&mut f, "a field initializer of another kind");
-        } else {
-          ir_copy(&mut f, dst, v);
-        }
-      }
-      q = fi.next;
-    }
-    return out;
+    return ir_slit(&mut f, c, &mut m, p, n.b, x);
   }
   // `cast[T](x)` is proved to fit, so the value is unchanged; `wrap[T](x)`
   // keeps the low bits.
@@ -1192,6 +1231,13 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     return ir_none();
   }
   let callee = plain_inst(&mut m, def);
+  return ir_call_to(&mut f, c, &mut m, p, i, callee);
+}
+
+/// The call node `i` of function instance `callee`: the arguments, the
+/// call, and the lent buffers read back.
+fn ir_call_to(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, callee: u64) -> IrVal {
+  let n = node_at(p.nodes, i);
   let mut regs = vec_new[u64]();
   let mut lent = vec_new[u64]();
   let mut a = n.a;
