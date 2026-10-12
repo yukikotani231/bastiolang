@@ -155,6 +155,11 @@ struct X86 {
   /// The frame's slots in order: for each, the frame words before it and
   /// its size (stage1 moves the busiest ones next to %rbp).
   slots: Vec[u64],
+  /// Slots of the blocks being generated, as (first word, size) pairs
+  /// (`x86_block` frees them at its end), and the freed ones, which a
+  /// later slot of the same size takes over.
+  live: Vec[u64],
+  freed: Vec[u64],
   depth: u64,
   /// The instance whose types and operators are being read, and the name
   /// prefix of its variables (0 in the function being generated).
@@ -209,7 +214,7 @@ fn x86_new() -> X86 {
     names: vec_new[X86Name](), vars: vec_new[X86Var](), vfloor: 0, used: vec_new[u64](),
     saves: vec_new[X86Save](), stack: vec_new[u64](), bsize: vec_new[u64](), ncalls: vec_new[u64](),
     sdata: vec_new[u64](), sstart: vec_new[u64](), slens: vec_new[u64](),
-    labels: 0, frame: 0, slots: vec_new[u64](), depth: 0, env: 0, pre: 0, retl: 0, retw: 0, reto: 0, rdk: 0, rda: 0, rdo: 0,
+    labels: 0, frame: 0, slots: vec_new[u64](), live: vec_new[u64](), freed: vec_new[u64](), depth: 0, env: 0, pre: 0, retl: 0, retw: 0, reto: 0, rdk: 0, rda: 0, rdo: 0,
     parent: vec_new[u64](), cur: 0, decl: vec_new[X86Decl](), ivs: vec_new[X86Iv](), pos: 0, loops: vec_new[u64](), xt: vec_new[u64](), sw: false, failed: false, fmsg: vec_new[u64](),
     stage0: false, target: TARGET_HOSTED, smp: vec_new[u64](), nsmp: 0, snode: vec_new[u64](),
     mk: 0, ma: 0, mmask: 0
@@ -229,6 +234,8 @@ fn x86_free(g: X86) {
   vec_free(g.bsize);
   vec_free(g.ncalls);
   vec_free(g.slots);
+  vec_free(g.live);
+  vec_free(g.freed);
   vec_free(g.sdata);
   vec_free(g.sstart);
   vec_free(g.slens);
@@ -517,7 +524,7 @@ fn x86_save_slot(g: &mut X86, r: u64) -> u64 {
     }
     k = k + 1;
   }
-  let o = x86_slot(&mut g, 1);
+  let o = x86_slot_perm(&mut g, 1);
   vec_push(&mut g.saves, X86Save { r: r, o: o });
   return o;
 }
@@ -584,6 +591,29 @@ fn x86_drop(g: &mut X86, n: u64) {
 
 /// A frame slot of `n` words; the offset of word 0.
 fn x86_slot(g: &mut X86, n: u64) -> u64 {
+  let mut k = 0;
+  while wrap_add(k, 1) < vec_len(g.freed) && k < vec_len(g.freed) {
+    let a = u_at(g.freed, k);
+    if n > 0 && u_at(g.freed, wrap_add(k, 1)) == n {
+      let ln = vec_pop(&mut g.freed);
+      let la = vec_pop(&mut g.freed);
+      if wrap_add(k, 1) < vec_len(g.freed) {
+        vec_set(&mut g.freed, k, la);
+        vec_set(&mut g.freed, wrap_add(k, 1), ln);
+      }
+      vec_push(&mut g.live, a);
+      vec_push(&mut g.live, n);
+      return wrap_sub(XB, wrap_mul(8, wrap_add(a, n)));
+    }
+    k = wrap_add(k, 2);
+  }
+  vec_push(&mut g.live, g.frame);
+  vec_push(&mut g.live, n);
+  return x86_slot_perm(&mut g, n);
+}
+
+/// A slot that stays for the whole function.
+fn x86_slot_perm(g: &mut X86, n: u64) -> u64 {
   vec_push(&mut g.slots, g.frame);
   vec_push(&mut g.slots, n);
   g.frame = wrap_add(g.frame, n);
@@ -5717,15 +5747,23 @@ fn x86_var_reg(g: &mut X86, p: &Parser, i: u64) -> u64 {
 // ---- Statements ----
 
 /// A block: variables declared inside go out of scope at its end (their
-/// registers are reused; frame slots are not).
+/// registers and frame slots are reused).
 fn x86_block(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, head: u64) {
   let saved = vec_len(g.vars);
+  let mark = vec_len(g.live);
   let mut i = head;
   while i != 0 {
     x86_stmt(&mut g, c, &mut m, p, i);
     i = next_of(p, i);
   }
   x86_truncate(&mut g, saved);
+  // stage1: the block's slots go back (stage0 never reuses them).
+  while !g.stage0 && vec_len(g.live) > mark && vec_len(g.live) >= 2 {
+    let n = vec_pop(&mut g.live);
+    let a = vec_pop(&mut g.live);
+    vec_push(&mut g.freed, a);
+    vec_push(&mut g.freed, n);
+  }
 }
 
 /// Pops a multi-word value into the registers of `rs` (0: a word dropped).
@@ -7358,6 +7396,8 @@ fn x86_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
   vec_push(&mut g.stack, x);
   g.frame = 0;
   x86_clear(&mut g.slots);
+  x86_clear(&mut g.live);
+  x86_clear(&mut g.freed);
   g.depth = 0;
   g.env = x;
   g.pre = 0;
