@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # The IR (docs/ir.md, stage1/ir.bastio): irdump must print, for every
 # program in tests/ir, exactly the IR in the .expected file next to it.
+# Where NAME.opt.expected exists, `irdump --opt` (the passes of
+# stage1/iropt.bastio have run) must print that for NAME.bastio too.
 # usage: tests/ir.sh [--update]    (--update rewrites the .expected files)
 set -eu
 cd "$(dirname "$0")/.."
@@ -17,6 +19,17 @@ for f in tests/ir/*.bastio; do
     echo "ok   $f"
   else
     echo "FAIL $f"; cat "$tmp/diff"; fail=1
+  fi
+done
+for f in tests/ir/*.bastio; do
+  want="${f%.bastio}.opt.expected"
+  [ -e "$want" ] || continue
+  if [ "${1:-}" = --update ]; then
+    "$tmp/irdump" --opt "$f" > "$want"
+  elif "$tmp/irdump" --opt "$f" | diff -u "$want" - > "$tmp/diff"; then
+    echo "ok   $f (--opt)"
+  else
+    echo "FAIL $f (--opt)"; cat "$tmp/diff"; fail=1
   fi
 done
 exit $fail
