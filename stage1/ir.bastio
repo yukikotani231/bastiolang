@@ -49,16 +49,18 @@ const IR_SGE: u64 = 29;
 const IR_LABEL: u64 = 40;    // label a starts here
 const IR_JMP: u64 = 41;      // goto label a
 const IR_BR: u64 = 42;       // if a goto label b else label c
-const IR_RET: u64 = 43;      // return a (IR_NONE: nothing)
-const IR_CALL: u64 = 44;     // d = instance a called with the c registers of args[b ..] (d = IR_NONE: no result)
+const IR_RET: u64 = 43;      // return a, and b if a buffer (IR_NONE: nothing)
+const IR_CALL: u64 = 44;     // d (and ty if a buffer) = instance a called with the c registers of args[b ..] (d = IR_NONE: no result)
 const IR_UNREACH: u64 = 45;
+const IR_LOAD: u64 = 46;     // d = the c-byte element a[b] (c is 1 or 8; a the data address, b the index)
+const IR_STORE: u64 = 47;    // a[b] = d, c bytes (d is read here, not written)
 
 const IR_NONE: u64 = 18446744073709551615;
 
 struct IrIns { op: u64, d: u64, a: u64, b: u64, c: u64, ty: u64 }
 
 /// A variable in scope: its name in the source and its register.
-struct IrVar { s: u64, e: u64, r: u64 }
+struct IrVar { s: u64, e: u64, k: u64, r0: u64, r1: u64 }
 
 /// One function being lowered, and then lowered.
 struct IrFn {
@@ -123,17 +125,43 @@ fn ir_jump(f: &mut IrFn, l: u64) {
 
 // ---- Lowering ----
 
-/// Is `t` a type the first subset handles: an integer or a bool?
-fn ir_scalar(m: &Mono, t: u64) -> bool {
-  return is_int(m, t) || kind_t(m, t) == TY_BOOL;
+// What a variable or value holds. A Buf or Bytes is two registers: the
+// address of its data, then its length (the elements of a Buf are 8 bytes,
+// those of Bytes one byte). A borrowed `&Buf` is the same two registers: the
+// buffer cannot change under a shared borrow.
+const IRK_INT: u64 = 1;
+const IRK_BUF: u64 = 2;
+const IRK_BYTES: u64 = 3;
+
+/// The kind of values of type `t` in the subset, or 0.
+fn ir_kind(m: &Mono, t: u64) -> u64 {
+  let u = base_t(m, t);
+  if is_int(m, u) || kind_t(m, u) == TY_BOOL {
+    return IRK_INT;
+  }
+  if kind_t(m, u) == TY_BUF {
+    return IRK_BUF;
+  }
+  if kind_t(m, u) == TY_BYTES {
+    return IRK_BYTES;
+  }
+  return 0;
 }
 
-fn ir_bind(f: &mut IrFn, s: u64, e: u64, r: u64) {
-  vec_push(&mut f.vars, IrVar { s: s, e: e, r: r });
+/// A value: its register, and the second one of a Buf or Bytes (IR_NONE
+/// for an integer); `k` is its kind (0 after a failure).
+struct IrVal { k: u64, r0: u64, r1: u64 }
+
+fn ir_none() -> IrVal {
+  return IrVal { k: 0, r0: IR_NONE, r1: IR_NONE };
 }
 
-/// The register of the variable named `s..e`, the innermost one, or IR_NONE.
-fn ir_find(f: &IrFn, p: &Parser, s: u64, e: u64) -> u64 {
+fn ir_bind(f: &mut IrFn, s: u64, e: u64, v: IrVal) {
+  vec_push(&mut f.vars, IrVar { s: s, e: e, k: v.k, r0: v.r0, r1: v.r1 });
+}
+
+/// The variable named `s..e`, the innermost one (k == 0: none).
+fn ir_find(f: &IrFn, p: &Parser, s: u64, e: u64) -> IrVal {
   let mut k = vec_len(f.vars);
   while k > 0
     invariant k <= vlen(f.vars)
@@ -141,15 +169,33 @@ fn ir_find(f: &IrFn, p: &Parser, s: u64, e: u64) -> u64 {
     k = k - 1;
     let v = vec_get(f.vars, k);
     if same(p.src, v.s, v.e, s, e) {
-      return v.r;
+      return IrVal { k: v.k, r0: v.r0, r1: v.r1 };
     }
   }
-  return IR_NONE;
+  return ir_none();
 }
 
 fn ir_truncate(f: &mut IrFn, n: u64) {
   while vec_len(f.vars) > n {
     vec_pop(&mut f.vars);
+  }
+}
+
+/// New registers for a value of kind `k`.
+fn ir_fresh(f: &mut IrFn, k: u64) -> IrVal {
+  let r0 = ir_reg(&mut f);
+  if k == IRK_INT {
+    return IrVal { k: k, r0: r0, r1: IR_NONE };
+  }
+  let r1 = ir_reg(&mut f);
+  return IrVal { k: k, r0: r0, r1: r1 };
+}
+
+/// dst = src, word by word.
+fn ir_copy(f: &mut IrFn, dst: IrVal, src: IrVal) {
+  ir_emit(&mut f, IR_MOV, dst.r0, src.r0, 0, 0, 0);
+  if dst.r1 != IR_NONE {
+    ir_emit(&mut f, IR_MOV, dst.r1, src.r1, 0, 0, 0);
   }
 }
 
@@ -175,42 +221,59 @@ fn ir_binop(op: u64, signed: bool) -> u64 {
   return 0;
 }
 
-/// Lowers expression `i` of the scalar kind; returns the register that
-/// holds its value (IR_NONE after a failure).
-fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
-  if f.failed {
+/// An integer expression: its register.
+fn ir_int(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
+  let v = ir_expr(&mut f, c, &mut m, p, i);
+  if !f.failed && v.k != IRK_INT {
+    ir_fail(&mut f, "a buffer where an integer is expected");
     return IR_NONE;
+  }
+  return v.r0;
+}
+
+/// A Buf or Bytes expression: a variable (or a call that returns one).
+fn ir_buf(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, k: u64) -> IrVal {
+  let v = ir_expr(&mut f, c, &mut m, p, i);
+  if !f.failed && v.k != k {
+    ir_fail(&mut f, "a buffer of another kind");
+    return ir_none();
+  }
+  return v;
+}
+
+/// Lowers expression `i`; returns the registers that hold its value.
+fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal {
+  if f.failed {
+    return ir_none();
   }
   let n = node_at(p.nodes, i);
   let k = n.kind;
   if k == E_INT || k == E_BOOL {
     let d = ir_reg(&mut f);
     ir_emit(&mut f, IR_CONST, d, n.v, 0, 0, 0);
-    return d;
+    return IrVal { k: IRK_INT, r0: d, r1: IR_NONE };
   }
   if k == E_VAR {
-    let r = ir_find(f, p, n.s, n.e);
-    if r == IR_NONE {
-      ir_fail(&mut f, "a name that is not a scalar variable");
+    let v = ir_find(f, p, n.s, n.e);
+    if v.k == 0 {
+      ir_fail(&mut f, "a name that is not a scalar or buffer variable");
     }
-    return r;
+    return v;
   }
-  if k == E_NEG {
-    let a = ir_expr(&mut f, c, &mut m, p, n.a);
+  if k == E_NEG || k == E_NOT {
+    let a = ir_int(&mut f, c, &mut m, p, n.a);
     let d = ir_reg(&mut f);
-    ir_emit(&mut f, IR_NEG, d, a, 0, 0, cg_int_op(c, f.x, i));
-    return d;
-  }
-  if k == E_NOT {
-    let a = ir_expr(&mut f, c, &mut m, p, n.a);
-    let d = ir_reg(&mut f);
-    ir_emit(&mut f, IR_NOT, d, a, 0, 0, cg_int_op(c, f.x, i));
-    return d;
+    let mut op = IR_NOT;
+    if k == E_NEG {
+      op = IR_NEG;
+    }
+    ir_emit(&mut f, op, d, a, 0, 0, cg_int_op(c, f.x, i));
+    return IrVal { k: IRK_INT, r0: d, r1: IR_NONE };
   }
   if k == E_BIN && (n.v == P_ANDAND || n.v == P_OROR) {
     // The right operand runs only if the left does not decide the result.
     let d = ir_reg(&mut f);
-    let a = ir_expr(&mut f, c, &mut m, p, n.a);
+    let a = ir_int(&mut f, c, &mut m, p, n.a);
     ir_emit(&mut f, IR_MOV, d, a, 0, 0, 0);
     let rhs = ir_label(&mut f);
     let end = ir_label(&mut f);
@@ -220,49 +283,89 @@ fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
       ir_emit(&mut f, IR_BR, IR_NONE, d, end, rhs, 0);
     }
     ir_place(&mut f, rhs);
-    let b = ir_expr(&mut f, c, &mut m, p, n.b);
+    let b = ir_int(&mut f, c, &mut m, p, n.b);
     ir_emit(&mut f, IR_MOV, d, b, 0, 0, 0);
     ir_place(&mut f, end);
-    return d;
+    return IrVal { k: IRK_INT, r0: d, r1: IR_NONE };
   }
   if k == E_BIN {
     let t = cg_int_op(c, f.x, i);
     let op = ir_binop(n.v, t != 0 && is_signed(m, t));
     if op == 0 {
       ir_fail(&mut f, "an operator outside the first subset");
-      return IR_NONE;
+      return ir_none();
     }
-    let a = ir_expr(&mut f, c, &mut m, p, n.a);
-    let b = ir_expr(&mut f, c, &mut m, p, n.b);
+    let a = ir_int(&mut f, c, &mut m, p, n.a);
+    let b = ir_int(&mut f, c, &mut m, p, n.b);
     let d = ir_reg(&mut f);
     ir_emit(&mut f, op, d, a, b, 0, t);
-    return d;
+    return IrVal { k: IRK_INT, r0: d, r1: IR_NONE };
   }
   if k == E_CALL {
     return ir_call(&mut f, c, &mut m, p, i);
   }
   ir_fail(&mut f, "an expression outside the first subset");
-  return IR_NONE;
+  return ir_none();
 }
 
-/// A call of a function that is not generic and not a builtin; its
-/// arguments and result must be scalars (or no result).
-fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
+/// The data address of buffer `v` plus index register `ix`, scaled by the
+/// element size, is the element: loads and stores name both registers.
+fn ir_elem(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal {
+  // get(b, ix) / bget(b, ix): the buffer, then the index in r1... see the
+  // callers: the buffer's data register is returned in r0, the index in r1.
   let n = node_at(p.nodes, i);
+  let a0 = n.a;
+  let a1 = next_of(p, a0);
+  let mut kind = IRK_BUF;
+  if name_is(p, i, "bget") || name_is(p, i, "bset") {
+    kind = IRK_BYTES;
+  }
+  let b = ir_buf(&mut f, c, &mut m, p, a0, kind);
+  let ix = ir_int(&mut f, c, &mut m, p, a1);
+  return IrVal { k: kind, r0: b.r0, r1: ix };
+}
+
+/// A call: a builtin of the subset (`len`, `blen`, `get`, `bget`) or a
+/// function that is not generic and not a builtin, whose arguments and
+/// result are integers or buffers (or no result).
+fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal {
+  let n = node_at(p.nodes, i);
+  if name_is(p, i, "len") || name_is(p, i, "blen") {
+    let mut kind = IRK_BUF;
+    if name_is(p, i, "blen") {
+      kind = IRK_BYTES;
+    }
+    let b = ir_buf(&mut f, c, &mut m, p, n.a, kind);
+    return IrVal { k: IRK_INT, r0: b.r1, r1: IR_NONE };
+  }
+  if name_is(p, i, "get") || name_is(p, i, "bget") {
+    let e = ir_elem(&mut f, c, &mut m, p, i);
+    let d = ir_reg(&mut f);
+    let mut size = 8;
+    if e.k == IRK_BYTES {
+      size = 1;
+    }
+    ir_emit(&mut f, IR_LOAD, d, e.r0, e.r1, size, 0);
+    return IrVal { k: IRK_INT, r0: d, r1: IR_NONE };
+  }
   if is_builtin_name(c, p, n.s, n.e) {
-    ir_fail(&mut f, "a builtin");
-    return IR_NONE;
+    ir_fail(&mut f, "a builtin outside the first subset");
+    return ir_none();
   }
   let def = plain_fn(p, n.s, n.e);
   if def == 0 {
     ir_fail(&mut f, "a call of a generic function");
-    return IR_NONE;
+    return ir_none();
   }
   let callee = plain_inst(&mut m, def);
   let mut regs = vec_new[u64]();
   let mut a = n.a;
   while a != 0 && !f.failed {
-    vec_push(&mut regs, ir_expr(&mut f, c, &mut m, p, a));
+    let v = ir_expr(&mut f, c, &mut m, p, a);
+    vec_push(&mut regs, v.r0);
+    if v.r1 != IR_NONE {
+      vec_push(&mut regs, v.r1);
+    }
     a = next_of(p, a);
   }
   let first = vec_len(f.args);
@@ -274,17 +377,19 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
   let count = vec_len(regs);
   vec_free(regs);
   if f.failed {
-    return IR_NONE;
+    return ir_none();
   }
   let rt = cg_ret_ty(&mut m, p, callee);
-  let mut d = IR_NONE;
-  if ir_scalar(m, rt) {
-    d = ir_reg(&mut f);
-  } else if kind_t(m, rt) != TY_UNIT {
-    ir_fail(&mut f, "a call with a result that is not a scalar");
-    return IR_NONE;
+  let rk = ir_kind(m, rt);
+  if rk == 0 && kind_t(m, rt) != TY_UNIT {
+    ir_fail(&mut f, "a call with a result that is not an integer or a buffer");
+    return ir_none();
   }
-  ir_emit(&mut f, IR_CALL, d, callee, first, count, 0);
+  let mut d = IrVal { k: 0, r0: IR_NONE, r1: IR_NONE };
+  if rk != 0 {
+    d = ir_fresh(&mut f, rk);
+  }
+  ir_emit(&mut f, IR_CALL, d.r0, callee, first, count, d.r1);
   return d;
 }
 
@@ -303,17 +408,18 @@ fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
   let k = n.kind;
   if k == S_LET {
     let t = let_ty(m, f.x, i);
-    if !ir_scalar(m, t) {
-      ir_fail(&mut f, "a variable that is not a scalar");
+    let kind = ir_kind(m, t);
+    if kind == 0 {
+      ir_fail(&mut f, "a variable that is not an integer or a buffer");
       return;
     }
     let v = ir_expr(&mut f, c, &mut m, p, n.b);
     if f.failed {
       return;
     }
-    // A fresh register: the initializer's may be another variable's.
-    let r = ir_reg(&mut f);
-    ir_emit(&mut f, IR_MOV, r, v, 0, 0, 0);
+    // Fresh registers: the initializer's may be another variable's.
+    let r = ir_fresh(&mut f, kind);
+    ir_copy(&mut f, r, v);
     ir_bind(&mut f, n.s, n.e, r);
   } else if k == S_ASSIGN {
     let path = node_at(p.nodes, n.a);
@@ -321,17 +427,47 @@ fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
       ir_fail(&mut f, "an assignment to a field");
       return;
     }
-    let r = ir_find(f, p, path.s, path.e);
-    if r == IR_NONE {
-      ir_fail(&mut f, "an assignment to something that is not a scalar variable");
+    let target = ir_find(f, p, path.s, path.e);
+    if target.k == 0 {
+      ir_fail(&mut f, "an assignment to something that is not a variable of the subset");
+      return;
+    }
+    let rhs = node_at(p.nodes, n.b);
+    if rhs.kind == E_CALL && (name_is(p, n.b, "set") || name_is(p, n.b, "bset")) {
+      // `b = set(b, i, v)` changes the buffer in place.
+      let a0 = rhs.a;
+      let a1 = next_of(p, a0);
+      let a2 = next_of(p, a1);
+      let a0n = node_at(p.nodes, a0);
+      let mut kind = IRK_BUF;
+      if name_is(p, n.b, "bset") {
+        kind = IRK_BYTES;
+      }
+      if a0n.kind != E_VAR || !same(p.src, a0n.s, a0n.e, path.s, path.e) || target.k != kind {
+        ir_fail(&mut f, "a set that does not assign to its own buffer");
+        return;
+      }
+      let ix = ir_int(&mut f, c, &mut m, p, a1);
+      let v = ir_int(&mut f, c, &mut m, p, a2);
+      if !f.failed {
+        let mut size = 8;
+        if kind == IRK_BYTES {
+          size = 1;
+        }
+        ir_emit(&mut f, IR_STORE, v, target.r0, ix, size, 0);
+      }
       return;
     }
     let v = ir_expr(&mut f, c, &mut m, p, n.b);
     if !f.failed {
-      ir_emit(&mut f, IR_MOV, r, v, 0, 0, 0);
+      if v.k != target.k {
+        ir_fail(&mut f, "an assignment between kinds");
+      } else {
+        ir_copy(&mut f, target, v);
+      }
     }
   } else if k == S_IF {
-    let cond = ir_expr(&mut f, c, &mut m, p, n.a);
+    let cond = ir_int(&mut f, c, &mut m, p, n.a);
     let l_then = ir_label(&mut f);
     let l_else = ir_label(&mut f);
     let l_end = ir_label(&mut f);
@@ -349,7 +485,7 @@ fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     let l_body = ir_label(&mut f);
     let l_end = ir_label(&mut f);
     ir_place(&mut f, l_head);
-    let cond = ir_expr(&mut f, c, &mut m, p, n.a);
+    let cond = ir_int(&mut f, c, &mut m, p, n.a);
     ir_emit(&mut f, IR_BR, IR_NONE, cond, l_body, l_end, 0);
     ir_place(&mut f, l_body);
     ir_block(&mut f, c, &mut m, p, n.c);
@@ -357,10 +493,10 @@ fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     ir_place(&mut f, l_end);
   } else if k == S_RETURN {
     if n.a == 0 {
-      ir_emit(&mut f, IR_RET, IR_NONE, IR_NONE, 0, 0, 0);
+      ir_emit(&mut f, IR_RET, IR_NONE, IR_NONE, IR_NONE, 0, 0);
     } else {
       let v = ir_expr(&mut f, c, &mut m, p, n.a);
-      ir_emit(&mut f, IR_RET, IR_NONE, v, 0, 0, 0);
+      ir_emit(&mut f, IR_RET, IR_NONE, v.r0, v.r1, 0, 0);
     }
     // Code after a return is unreachable but must still sit in a block.
     let dead = ir_label(&mut f);
@@ -433,22 +569,26 @@ fn ir_lower(c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> IrFn {
   while q != 0 && !f.failed {
     let qn = node_at(p.nodes, q);
     let pt = conv(&mut m, p, qn.a, x, q);
-    if !ir_scalar(m, pt) {
-      ir_fail(&mut f, "a parameter that is not a scalar");
+    let pk = ir_kind(m, pt);
+    if pk == 0 {
+      ir_fail(&mut f, "a parameter that is not an integer, bool, Buf or Bytes");
     } else {
-      let r = ir_reg(&mut f);
-      vec_push(&mut f.params, r);
+      let r = ir_fresh(&mut f, pk);
+      vec_push(&mut f.params, r.r0);
+      if r.r1 != IR_NONE {
+        vec_push(&mut f.params, r.r1);
+      }
       ir_bind(&mut f, qn.s, qn.e, r);
     }
     q = qn.next;
   }
   let rt = cg_ret_ty(&mut m, p, x);
-  if !f.failed && !ir_scalar(m, rt) && kind_t(m, rt) != TY_UNIT {
-    ir_fail(&mut f, "a result that is not a scalar");
+  if !f.failed && ir_kind(m, rt) == 0 && kind_t(m, rt) != TY_UNIT {
+    ir_fail(&mut f, "a result that is not an integer, bool, Buf or Bytes");
   }
   if !f.failed {
     ir_block(&mut f, c, &mut m, p, dn.x);
-    ir_emit(&mut f, IR_RET, IR_NONE, IR_NONE, 0, 0, 0);
+    ir_emit(&mut f, IR_RET, IR_NONE, IR_NONE, IR_NONE, 0, 0);
     ir_trim(&mut f);
   }
   return f;
@@ -569,11 +709,37 @@ fn ir_print(out: &mut Vec[u64], f: &IrFn, m: &Mono, p: &Parser) {
         w_s(&mut out, " ");
         ir_w_reg(&mut out, q.a);
       }
+      if q.b != IR_NONE {
+        w_s(&mut out, ", ");
+        ir_w_reg(&mut out, q.b);
+      }
+    } else if q.op == IR_LOAD {
+      ir_w_reg(&mut out, q.d);
+      w_s(&mut out, " = load");
+      w_num(&mut out, wrap_mul(q.c, 8));
+      w_s(&mut out, " ");
+      ir_w_reg(&mut out, q.a);
+      w_s(&mut out, "[");
+      ir_w_reg(&mut out, q.b);
+      w_s(&mut out, "]");
+    } else if q.op == IR_STORE {
+      w_s(&mut out, "store");
+      w_num(&mut out, wrap_mul(q.c, 8));
+      w_s(&mut out, " ");
+      ir_w_reg(&mut out, q.a);
+      w_s(&mut out, "[");
+      ir_w_reg(&mut out, q.b);
+      w_s(&mut out, "], ");
+      ir_w_reg(&mut out, q.d);
     } else if q.op == IR_UNREACH {
       w_s(&mut out, "unreachable");
     } else if q.op == IR_CALL {
       if q.d != IR_NONE {
         ir_w_reg(&mut out, q.d);
+        if q.ty != IR_NONE && q.ty != 0 {
+          w_s(&mut out, ", ");
+          ir_w_reg(&mut out, q.ty);
+        }
         w_s(&mut out, " = ");
       }
       w_s(&mut out, "call ");
