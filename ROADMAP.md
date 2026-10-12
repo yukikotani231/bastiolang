@@ -157,7 +157,7 @@ Goal, set 2026-10-12: sit at a BastiOS shell (console or SSH) and do an ordinary
 - [x] `apk add neovim git build-base` succeeds on a disk large enough to hold them (gcc, g++ and Python needed more than the old 1024-entry disk allowed)
 - [x] `nvim` runs in the console and in an SSH pseudo-terminal (tested: size and colours, editing over `ssh -t`, `:!`; plugin hosts are not exercised yet): raw mode and window-size changes (`termios`, `TIOCGWINSZ`, `SIGWINCH`), colours, the cursor keys, `poll`/`epoll` event loops, job control for `:!`, and plugin hosts started with `fork`/`exec`
 - [x] `nvim` opens, edits and saves a Bastio or C source file, with its swap and undo files, on the disk file system
-- [ ] `git clone`, `commit`, `diff` and `log` work in a work tree (they do), and a compiler builds a small C program from the editor with `:make` (it does with tcc and with the Bastio compiler; Alpine's gcc is a non-PIE executable linked at 0x400000, which the loader cannot place yet: [bastios#259](https://github.com/yukikotani231/bastios/issues/259))
+- [x] `git clone`, `commit`, `diff` and `log` work in a work tree, and a compiler builds a small C program from the editor with `:make`: tcc, the Bastio compiler and Alpine's gcc (a non-PIE executable linked at 0x400000, which needed user code to run on a table that holds none of the kernel: [bastios#259](https://github.com/yukikotani231/bastios/issues/259))
 - [x] A test (`make compat`) drives that session so it stays working (`test/compat/alpine_tty.txt` in bastios: edit, save, `:make`, `:!`, undo file, commit, and edit-prove-build-run with the Bastio compiler)
 
 The gaps this finds are filed and fixed as ordinary Linux-compatibility work under v4 and v5.
