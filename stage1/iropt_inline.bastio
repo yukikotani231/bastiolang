@@ -1,0 +1,236 @@
+// Inlining at the IR (docs/ir.md, "Passes"): a call of a small function is
+// replaced by the callee's own instructions, so the allocator sees the
+// callee's values next to the caller's and a result that would travel
+// through memory (a struct of more than two words) stays in registers.
+//
+// The callee is lowered (and run through the other passes) on its own, then
+// copied into the caller with its registers, labels and argument positions
+// shifted past the caller's. Its parameters become `mov`s from the call's
+// argument registers; each `ret` becomes moves into the call's result
+// registers (or, for a `callm`, stores into the frame slot that call named)
+// and a jump to a label placed after the copy.
+//
+// A callee that does not lower, that is bigger than the limits below, that
+// is the function itself, or whose parameters do not match the call word for
+// word, stays a call. A call inside a loop may be bigger (it runs often); one
+// outside takes only a small body. Bodies copied in are scanned again for
+// calls, up to IRI_ROUNDS deep.
+import "iropt.bastio";
+
+/// The largest callee, in instructions, that is inlined at a call outside a
+/// loop, and at one inside a loop.
+const IRI_SMALL: u64 = 40;
+const IRI_LOOP: u64 = 160;
+/// A caller that has grown past this many instructions inlines no more.
+const IRI_GROWN: u64 = 1500;
+const IRI_ROUNDS: u64 = 3;
+
+fn iri_r(r: u64, rb: u64) -> u64 {
+  if r == IR_NONE {
+    return r;
+  }
+  return wrap_add(r, rb);
+}
+
+/// Instruction `q` of a callee with its registers moved up by `rb`, its
+/// labels by `lb` and its positions in `args` by `ab`. (`ret` is rewritten
+/// by the caller of this.)
+fn iri_shift(q: IrIns, rb: u64, lb: u64, ab: u64) -> IrIns {
+  let mut r = q;
+  let op = q.op;
+  if ra_is_binary(op) || op == IR_LOAD || op == IR_STORE {
+    r.d = iri_r(q.d, rb);
+    r.a = iri_r(q.a, rb);
+    r.b = iri_r(q.b, rb);
+  } else if op == IR_CONST || op == IR_SLOT || op == IR_STRLIT {
+    r.d = iri_r(q.d, rb);
+  } else if op == IR_MOV || op == IR_NOT || op == IR_NEG || op == IR_WRAP || op == IR_ALLOC {
+    r.d = iri_r(q.d, rb);
+    r.a = iri_r(q.a, rb);
+  } else if op == IR_FREE || op == IR_PRINT || op == IR_VGROW {
+    r.a = iri_r(q.a, rb);
+  } else if op == IR_LABEL || op == IR_JMP {
+    r.a = wrap_add(q.a, lb);
+  } else if op == IR_BR {
+    r.a = iri_r(q.a, rb);
+    r.b = wrap_add(q.b, lb);
+    r.c = wrap_add(q.c, lb);
+  } else if op == IR_CALL {
+    r.d = iri_r(q.d, rb);
+    if q.ty != 0 && q.ty != IR_NONE {
+      r.ty = wrap_add(q.ty, rb);
+    }
+    r.b = wrap_add(q.b, ab);
+  } else if op == IR_CALLM {
+    r.d = iri_r(q.d, rb);
+    r.b = wrap_add(q.b, ab);
+  }
+  return r;
+}
+
+/// Is position `pos` of `f` inside a loop: after a label that a later
+/// instruction jumps back to?
+fn iri_in_loop(f: &IrFn, pos: u64) -> bool {
+  let n = vec_len(f.ins);
+  let mut i = 0;
+  while i < pos && i < n {
+    let q = vec_get(f.ins, i);
+    if q.op == IR_LABEL {
+      let mut j = pos;
+      while j < n {
+        let t = vec_get(f.ins, j);
+        if (t.op == IR_JMP && t.a == q.a) || (t.op == IR_BR && (t.b == q.a || t.c == q.a)) {
+          return true;
+        }
+        j = j + 1;
+      }
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+/// Can the body of `g` stand in for the call `q`? Every `ret` must fit the
+/// call: one or two words for a `call`, a wide result for a `callm`.
+fn iri_fits(g: &IrFn, q: IrIns) -> bool {
+  if q.c != vec_len(g.params) {
+    return false;
+  }
+  let mut ok = true;
+  let mut i = 0;
+  while i < vec_len(g.ins) {
+    let t = vec_get(g.ins, i);
+    if t.op == IR_RET {
+      if q.op == IR_CALL && t.c > 0 {
+        ok = false;
+      }
+      if q.op == IR_CALLM && (t.c == 0 || t.c > q.ty) {
+        ok = false;
+      }
+    }
+    i = i + 1;
+  }
+  return ok;
+}
+
+/// One word `j` of a wide result: `store q.d[j] = v`.
+fn iri_store_word(f: &mut IrFn, out: &mut Vec[IrIns], slot: u64, j: u64, v: u64) {
+  let t = ir_reg(&mut f);
+  vec_push(&mut out, IrIns { op: IR_CONST, d: t, a: j, b: 0, c: 0, ty: 0 });
+  vec_push(&mut out, IrIns { op: IR_STORE, d: v, a: slot, b: t, c: 8, ty: 0 });
+}
+
+/// Copies the body of `g` into `out` in place of the call `q` of `f`.
+fn iri_splice(f: &mut IrFn, out: &mut Vec[IrIns], g: &IrFn, q: IrIns) {
+  let rb = wrap_add(f.nreg, 1);
+  f.nreg = wrap_add(rb, g.nreg);
+  let lb = f.nlabel;
+  f.nlabel = wrap_add(lb, g.nlabel);
+  let end = ir_label(&mut f);
+  let ab = vec_len(f.args);
+  let mut k = 0;
+  while k < vec_len(g.args) {
+    vec_push(&mut f.args, iri_r(vec_get(g.args, k), rb));
+    k = k + 1;
+  }
+  if q.op == IR_CALLM {
+    vec_push(&mut out, IrIns { op: IR_SLOT, d: q.d, a: 0, b: 0, c: q.ty, ty: 0 });
+  }
+  k = 0;
+  while k < vec_len(g.params) {
+    vec_push(&mut out, IrIns { op: IR_MOV, d: wrap_add(vec_get(g.params, k), rb), a: u_at(f.args, wrap_add(q.b, k)), b: 0, c: 0, ty: 0 });
+    k = k + 1;
+  }
+  k = 0;
+  while k < vec_len(g.ins) {
+    let t = vec_get(g.ins, k);
+    if t.op == IR_RET {
+      if q.op == IR_CALL {
+        if t.a != IR_NONE && q.d != IR_NONE {
+          vec_push(&mut out, IrIns { op: IR_MOV, d: q.d, a: iri_r(t.a, rb), b: 0, c: 0, ty: 0 });
+        }
+        if t.b != IR_NONE && q.ty != 0 && q.ty != IR_NONE && q.d != IR_NONE {
+          vec_push(&mut out, IrIns { op: IR_MOV, d: q.ty, a: iri_r(t.b, rb), b: 0, c: 0, ty: 0 });
+        }
+      } else if t.a == IR_NONE {
+        // `ret regs`: the words are held in registers.
+        let mut j = 0;
+        while j < t.c && j < 4096 {
+          let v = iri_r(u_at(g.args, wrap_add(t.b, j)), rb);
+          iri_store_word(&mut f, &mut out, q.d, j, v);
+          j = j + 1;
+        }
+      } else {
+        // `ret mem`: the words are at address a.
+        let mut j = 0;
+        while j < t.c && j < 4096 {
+          let ix = ir_reg(&mut f);
+          let v = ir_reg(&mut f);
+          vec_push(&mut out, IrIns { op: IR_CONST, d: ix, a: j, b: 0, c: 0, ty: 0 });
+          vec_push(&mut out, IrIns { op: IR_LOAD, d: v, a: iri_r(t.a, rb), b: ix, c: 8, ty: 0 });
+          vec_push(&mut out, IrIns { op: IR_STORE, d: v, a: q.d, b: ix, c: 8, ty: 0 });
+          j = j + 1;
+        }
+      }
+      vec_push(&mut out, IrIns { op: IR_JMP, d: IR_NONE, a: end, b: 0, c: 0, ty: 0 });
+    } else {
+      vec_push(&mut out, iri_shift(t, rb, lb, ab));
+    }
+    k = k + 1;
+  }
+  vec_push(&mut out, IrIns { op: IR_LABEL, d: IR_NONE, a: end, b: 0, c: 0, ty: 0 });
+}
+
+/// One round: every call that can be inlined is. Returns how many were.
+fn iri_round(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser) -> u64 {
+  let mut out = vec_new[IrIns]();
+  let n = vec_len(f.ins);
+  let mut done = 0;
+  let mut i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    let mut spliced = false;
+    if (q.op == IR_CALL || q.op == IR_CALLM) && q.a != f.x && vec_len(out) < IRI_GROWN {
+      let mut g = ir_lower(c, &mut m, p, q.a);
+      if !g.failed && vec_len(g.ins) <= IRI_LOOP {
+        iropt_slots(&mut g);
+        iropt_copies(&mut g);
+        iropt_thread(&mut g);
+        let mut limit = IRI_SMALL;
+        if iri_in_loop(f, i) {
+          limit = IRI_LOOP;
+        }
+        if vec_len(g.ins) <= limit && iri_fits(g, q) {
+          iri_splice(&mut f, &mut out, g, q);
+          spliced = true;
+          done = wrap_add(done, 1);
+        }
+      }
+      ir_free(g);
+    }
+    if !spliced {
+      vec_push(&mut out, q);
+    }
+    i = i + 1;
+  }
+  vec_free(f.ins);
+  f.ins = out;
+  return done;
+}
+
+/// Inlines the calls of `f` that qualify, up to IRI_ROUNDS deep (a body
+/// copied in is searched for calls in the next round). Returns how many.
+fn iropt_inline(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser) -> u64 {
+  let mut total = 0;
+  let mut round = 0;
+  while round < IRI_ROUNDS {
+    let k = iri_round(&mut f, c, &mut m, p);
+    total = wrap_add(total, k);
+    if k == 0 {
+      round = IRI_ROUNDS;
+    } else {
+      round = round + 1;
+    }
+  }
+  return total;
+}

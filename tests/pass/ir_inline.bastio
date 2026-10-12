@@ -1,0 +1,92 @@
+// expect-exit: 0
+// expect-stdout: 40351
+// Calls inlined at the IR (iropt_inline): results of one, two
+// and more words, a parameter the callee changes, a callee with several
+// returns, a call in a loop and calls nested three deep
+struct Wide { a: u64, b: u64, c: u64, d: u64 }
+enum Pick { None, Some(u64) }
+
+fn bump(x: u64) -> u64
+  requires x < 1000000
+  ensures result == x + 1
+{
+  return x + 1;
+}
+
+fn twice(x: u64) -> u64
+  requires x < 900000
+  ensures result == x + 2
+{
+  let y = bump(x);
+  return bump(y);
+}
+
+fn thrice(x: u64) -> u64
+  requires x < 800000
+{
+  return bump(twice(x));
+}
+
+fn clamp(x: u64, hi: u64) -> u64
+  requires hi > 0
+  ensures result <= hi
+{
+  if x > hi { return hi; }
+  if x == 0 { return 1; }
+  return x;
+}
+
+fn wide(i: u64) -> Wide
+  requires i < 1000000
+{
+  if i % 2 == 0 { return Wide { a: i, b: i + 1, c: i + 2, d: i + 3 }; }
+  return Wide { a: 1, b: 2, c: 3, d: i };
+}
+
+fn pick(i: u64) -> Pick
+  requires i < 1000000
+{
+  if i % 3 == 0 { return Pick::None; }
+  return Pick::Some(i * 2);
+}
+
+fn edit(x: u64) -> u64
+  requires x < 1000
+{
+  let mut y = x;
+  y = y + 10;
+  y = y * 2;
+  return y;
+}
+
+fn first_byte(b: Bytes) -> Bytes
+  requires blen(b) > 0
+  ensures blen(result) == blen(b)
+{
+  let mut c = b;
+  bset(&mut c, 0, 7);
+  return c;
+}
+
+fn main() -> u64 {
+  let mut total = 0;
+  let mut i = 0;
+  while i < 100
+    invariant i <= 100
+  {
+    let w = wide(i);
+    total = wrap_add(total, wrap_add(wrap_add(w.a, w.b), wrap_add(w.c, w.d)) % 1000);
+    total = wrap_add(total, wrap_add(thrice(i), wrap_add(clamp(i, 50), edit(i))));
+    match pick(i) {
+      Pick::None => { total = wrap_add(total, 1); },
+      Pick::Some(v) => { total = wrap_add(total, v); },
+    }
+    i = i + 1;
+  }
+  let mut b = balloc(4);
+  b = first_byte(b);
+  total = wrap_add(total, cast[u64](bget(b, 0)));
+  bfree(b);
+  print(total);
+  return 0;
+}
