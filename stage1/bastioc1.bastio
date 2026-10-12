@@ -42,6 +42,7 @@ import "libenv.bastio";
 import "solve.bastio";
 import "header.bastio";
 import "x86.bastio";
+import "irx86.bastio";
 
 fn b1_code(code: u64) -> Str {
   if code == C_USE { return "E-LINEAR-USE"; }
@@ -332,13 +333,19 @@ fn b1_tool(host: &Host, argv: Vec[Bytes], what: Str, out: &mut Vec[u64]) -> u64 
 /// `--backend native`, as stage0's x86::build: the assembly is written to
 /// `outp` (`--emit-asm`), or assembled and linked into the executable
 /// `outp`. Returns the exit status.
-fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, emit_asm: bool, lib: bool, outp: &Bytes, has_out: bool, out: &mut Vec[u64]) -> u64 {
+fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, ir: bool, emit_asm: bool, lib: bool, outp: &Bytes, has_out: bool, out: &mut Vec[u64]) -> u64 {
   let mut g = x86_new();
   // A BastiOS user program or kernel: the assembly is the output (as the C
   // is with the C backend), to be linked with BastiOS's start code.
   g.target = target;
   let mut status = 0;
-  if !x86_program(&mut g, c, &mut m, p) {
+  let mut built = false;
+  if ir {
+    built = x86_program_ir(&mut g, c, &mut m, p);
+  } else {
+    built = x86_program(&mut g, c, &mut m, p);
+  }
+  if !built {
     w_s(&mut out, "bastioc1: ");
     let mut k = 0;
     while k < vec_len(g.fmsg) {
@@ -446,6 +453,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
   let mut check_only = false;
   let mut emit_c = false;
   let mut native = false;
+  let mut native_ir = false;
   let mut emit_asm = false;
   let mut dump_smt = false;
   let mut target = TARGET_HOSTED;
@@ -481,6 +489,11 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
         native = false;
       } else if b1_is(b, "native") {
         native = true;
+      } else if b1_is(b, "native-ir") {
+        // Not in --help: the native backend writing the functions the IR
+        // covers from the IR (stage1/irx86.bastio), for the tests.
+        native = true;
+        native_ir = true;
       } else {
         w_s(&mut out, "bastioc1: unknown backend `");
         b1_bytes(&mut out, b);
@@ -737,7 +750,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
             status = 2;
           } else if native {
             b1_flush(host, &mut out);
-            status = b1_native(host, c, &mut m, p, target, emit_asm, !has_main, outp, has_out, &mut out);
+            status = b1_native(host, c, &mut m, p, target, native_ir, emit_asm, !has_main, outp, has_out, &mut out);
           } else {
             let mut g = cg_new(target);
             g.arch = c.arch;
