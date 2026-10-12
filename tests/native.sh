@@ -7,7 +7,8 @@
 #
 # BACKEND=native-ir tests/native.sh builds the native side with
 # `--backend native-ir` instead (the functions the IR covers are written from
-# it, stage1/irx86.bastio); the C backend stays the reference.
+# it, stage1/irx86.bastio); the C backend stays the reference. (The example
+# libraries are built by `native` only.)
 #
 # tests/native.sh --stage1 instead runs stage1/difftest.sh with the tools of
 # the self-hosted compiler built by the native backend (by the C backend
@@ -68,6 +69,7 @@ pfor both $(s1files tests/pass/*.bastio bench/*.bastio) || lost=1
 libs=0
 for r in examples/*/run.sh; do
   [ -e "$r" ] || continue
+  [ "${BACKEND:-native}" = native ] || continue
   if BACKEND=native BASTIOC="$BASTIOC" "$r" >"$tmp/lib.out" 2>&1; then libs=$((libs+1)); else
     echo "FAIL $r with the native backend"; sed 's/^/    /' "$tmp/lib.out" | tail -20; lost=1
   fi
