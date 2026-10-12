@@ -10,7 +10,8 @@
 // in a slot so the `vec_*` forms can address the header) costs today: every
 // `vec_len` and every element access reads the header from the frame.
 //
-// `iropt_copies` (copy propagation) follows it; see docs/ir.md.
+// `iropt_copies` (copy propagation) and `iropt_thread` (jump threading)
+// follow it; see docs/ir.md.
 //
 // A slot whose address is read in any other way (passed to a call, handed to
 // `vgrow`, returned from, added to, stored) stays in memory. A word that is
@@ -380,4 +381,90 @@ fn iropt_copies(f: &mut IrFn) -> u64 {
     vec_free(ndef);
   }
   return total;
+}
+
+/// The instruction after label `l` and any labels that follow it
+/// (IR_NONE: there is none, or `l` is not placed).
+fn iropt_after_label(f: &IrFn, lpos: &Vec[u64], l: u64) -> u64 {
+  let mut p = u_at(lpos, l);
+  if p == IR_NONE {
+    return IR_NONE;
+  }
+  p = wrap_add(p, 1);
+  let mut going = true;
+  while going && p < vec_len(f.ins) {
+    let q = vec_get(f.ins, p);
+    if q.op == IR_LABEL {
+      p = wrap_add(p, 1);
+    } else {
+      going = false;
+    }
+  }
+  if going {
+    return IR_NONE;
+  }
+  return p;
+}
+
+/// Jump threading: when `br r, T, F` leads to a label whose first
+/// instruction is another `br r, T2, F2` on the same register (nothing
+/// between can change `r`), the outcome is already known on that edge, so
+/// the edge goes straight to T2 or F2. This is what `&&` and `||` leave
+/// behind: the result is materialised in a register, then tested again.
+/// Returns how many edges it redirected.
+fn iropt_thread(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  let mut lpos = vec_new[u64]();
+  let mut l = 0;
+  while l < f.nlabel && l < 1000000000 {
+    vec_push(&mut lpos, IR_NONE);
+    l = l + 1;
+  }
+  let mut i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    if q.op == IR_LABEL {
+      ra_set(&mut lpos, q.a, i);
+    }
+    i = i + 1;
+  }
+  let mut changed = 0;
+  i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    if q.op == IR_BR {
+      let mut tt = q.b;
+      let mut ff = q.c;
+      let mut k = 0;
+      while k < 8 {
+        let p = iropt_after_label(f, lpos, tt);
+        if p < vec_len(f.ins) {
+          let t = vec_get(f.ins, p);
+          if t.op == IR_BR && t.a == q.a && t.b != tt {
+            tt = t.b;
+            changed = wrap_add(changed, 1);
+          }
+        }
+        k = k + 1;
+      }
+      k = 0;
+      while k < 8 {
+        let p = iropt_after_label(f, lpos, ff);
+        if p < vec_len(f.ins) {
+          let t = vec_get(f.ins, p);
+          if t.op == IR_BR && t.a == q.a && t.c != ff {
+            ff = t.c;
+            changed = wrap_add(changed, 1);
+          }
+        }
+        k = k + 1;
+      }
+      if (tt != q.b || ff != q.c) && i < vec_len(f.ins) {
+        vec_set(&mut f.ins, i, IrIns { op: IR_BR, d: q.d, a: q.a, b: tt, c: ff, ty: q.ty });
+      }
+    }
+    i = i + 1;
+  }
+  vec_free(lpos);
+  return changed;
 }
