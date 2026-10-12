@@ -22,8 +22,8 @@
 # ARCH=aarch64 builds both sides for AArch64 with AARCH64_CC (default:
 # aarch64-linux-gnu-gcc) and runs them under qemu-aarch64
 # unless this machine is an AArch64 one. Under emulation the times say
-# little; the ratios still compare like with like. There is no native
-# backend for AArch64, so `native` is n/a.
+# little; the ratios still compare like with like. `native` is the AArch64
+# native backend, `unsupported` for a program the IR does not cover yet.
 set -u
 cd "$(dirname "$0")/.."
 BASTIOC=${BASTIOC:-$(tests/bastioc1.sh)} || exit 1
@@ -71,16 +71,10 @@ for n in "${names[@]}"; do
   fi
   tb=$(best "$tmp/$n") && tc=$(best "$tmp/$n.c.exe") || { echo "run $n FAILED: nonzero exit"; status=1; continue; }
   # Exit status 4: the native backend does not support the program yet.
-  if [ "$ARCH" != x86_64 ]; then
-    rc=n/a
-  else
-    "$BASTIOC" --backend native -o "$tmp/$n.x" "bench/$n.bastio" 2>/dev/null; rc=$?
-  fi
-  if [ $rc = n/a ]; then
-    native=" native=n/a"
-  elif [ $rc = 4 ]; then
+  "$BASTIOC" --arch "$ARCH" --backend native -o "$tmp/$n.x" "bench/$n.bastio" 2>/dev/null; rc=$?
+  if [ $rc = 4 ]; then
     native=" native=unsupported"
-  elif [ $rc = 0 ] && [ "$("$tmp/$n.x")" = "$("$tmp/$n.c.exe")" ] && tx=$(best "$tmp/$n.x"); then
+  elif [ $rc = 0 ] && [ "$($RUN "$tmp/$n.x")" = "$($RUN "$tmp/$n.c.exe")" ] && tx=$(best "$tmp/$n.x"); then
     native=" native=$tx native_ratio=$(awk -v b="$tx" -v c="$tc" 'BEGIN { printf "%.2f", (c > 0 ? b / c : 0) }')"
   else
     echo "run $n FAILED: the native build failed or its output differs"; status=1; native=""
