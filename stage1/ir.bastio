@@ -49,7 +49,7 @@ const IR_SGE: u64 = 29;
 const IR_LABEL: u64 = 40;    // label a starts here
 const IR_JMP: u64 = 41;      // goto label a
 const IR_BR: u64 = 42;       // if a goto label b else label c
-const IR_RET: u64 = 43;      // return a, and b if a buffer (IR_NONE: nothing); with c > 0, the c words at address a (a result of more than two words)
+const IR_RET: u64 = 43;      // return a, and b if a buffer (IR_NONE: nothing); with c > 0, a result of more than two words: the c words at address a, or, with a = IR_NONE, the c registers of args[b ..]
 const IR_CALL: u64 = 44;     // d (and ty if a buffer) = instance a called with the c registers of args[b ..] (d = IR_NONE: no result)
 const IR_UNREACH: u64 = 45;
 const IR_LOAD: u64 = 46;     // d = the c-byte element a[b] (c is 1 or 8; a the data address, b the index)
@@ -1409,10 +1409,13 @@ fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
       if v.k == IRK_VEC {
         ir_emit(&mut f, IR_RET, IR_NONE, v.r0, IR_NONE, 3, 0);
       } else if ir_multi(v.k) && v.r1 > 2 {
-        let slot = ir_reg(&mut f);
-        ir_emit(&mut f, IR_SLOT, slot, 0, 0, v.r1, 0);
-        ir_store_words(&mut f, slot, 0, v.r0, v.r1);
-        ir_emit(&mut f, IR_RET, IR_NONE, slot, IR_NONE, v.r1, 0);
+        let first = vec_len(f.args);
+        let mut w = 0;
+        while w < v.r1 && w < 4096 {
+          vec_push(&mut f.args, wrap_add(v.r0, w));
+          w = w + 1;
+        }
+        ir_emit(&mut f, IR_RET, IR_NONE, IR_NONE, first, v.r1, 0);
       } else if ir_multi(v.k) {
         let mut second = IR_NONE;
         if v.r1 == 2 {
@@ -1731,6 +1734,17 @@ fn ir_print(out: &mut Vec[u64], f: &IrFn, m: &Mono, p: &Parser) {
       ir_w_label(&mut out, q.b);
       w_s(&mut out, ", ");
       ir_w_label(&mut out, q.c);
+    } else if q.op == IR_RET && q.c > 0 && q.a == IR_NONE {
+      w_s(&mut out, "ret regs");
+      let mut j = 0;
+      while j < q.c && j < 4096 {
+        if j > 0 {
+          w_s(&mut out, ",");
+        }
+        w_s(&mut out, " ");
+        ir_w_reg(&mut out, u_at(f.args, wrap_add(q.b, j)));
+        j = j + 1;
+      }
     } else if q.op == IR_RET && q.c > 0 {
       w_s(&mut out, "ret mem ");
       ir_w_reg(&mut out, q.a);
