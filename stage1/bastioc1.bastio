@@ -332,7 +332,7 @@ fn b1_tool(host: &Host, argv: Vec[Bytes], what: Str, out: &mut Vec[u64]) -> u64 
 /// `--backend native`, as stage0's x86::build: the assembly is written to
 /// `outp` (`--emit-asm`), or assembled and linked into the executable
 /// `outp`. Returns the exit status.
-fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, emit_asm: bool, outp: &Bytes, has_out: bool, out: &mut Vec[u64]) -> u64 {
+fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, emit_asm: bool, lib: bool, outp: &Bytes, has_out: bool, out: &mut Vec[u64]) -> u64 {
   let mut g = x86_new();
   // A BastiOS user program or kernel: the assembly is the output (as the C
   // is with the C backend), to be linked with BastiOS's start code.
@@ -381,7 +381,15 @@ fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, em
       vec_push(&mut asm, b1_concat(ofile, ""));
       vec_push(&mut asm, b1_concat(sfile, ""));
       status = b1_tool(host, asm, "the assembler", &mut out);
-      if status == 0 {
+      if status == 0 && lib {
+        // A library is an object file for the C program that calls it.
+        let mut mv = vec_new[Bytes]();
+        push_arg(&mut mv, "mv");
+        push_arg(&mut mv, "-f");
+        vec_push(&mut mv, b1_concat(ofile, ""));
+        vec_push(&mut mv, b1_concat(exe, ""));
+        b1_run(host, mv);
+      } else if status == 0 {
         // The linker: `CC`, as for bastioc0, or `cc`.
         let mut cc = balloc(0);
         if !host_env(host, "CC", &mut cc) {
@@ -718,18 +726,18 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
             }
             k = k + 1;
           }
-          if !emit_c && !has_main {
+          if !emit_c && !has_main && !native {
             w_s(&mut out, "bastioc1: ");
             k = 0;
             while k < vec_len(input) {
               vec_push(&mut out, u_at(input, k));
               k = k + 1;
             }
-            w_s(&mut out, " is a library (it has no `main`): build it with --emit-c and link the C into a program\n");
+            w_s(&mut out, " is a library (it has no `main`): build it with --emit-c (or --backend native) and link the result into a program\n");
             status = 2;
           } else if native {
             b1_flush(host, &mut out);
-            status = b1_native(host, c, &mut m, p, target, emit_asm, outp, has_out, &mut out);
+            status = b1_native(host, c, &mut m, p, target, emit_asm, !has_main, outp, has_out, &mut out);
           } else {
             let mut g = cg_new(target);
             g.arch = c.arch;
