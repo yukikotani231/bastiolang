@@ -1,6 +1,6 @@
 # The IR between the checker and the native backend
 
-Status: design, not implemented. Tracks [#125](https://github.com/yukikotani231/bastiolang/issues/125), and is the base of #126 (register allocation), #127 (optimizations), #128 (vectorization), #124 (AArch64) and #129 (native as default).
+Status: the data, the lowering of the first subset and a text form exist (`stage1/ir.bastio`, `stage1/irdump.bastio`, golden tests in `tests/ir`); nothing generates code from it yet. Tracks [#125](https://github.com/yukikotani231/bastiolang/issues/125), and is the base of #126 (register allocation), #127 (optimizations), #128 (vectorization), #124 (AArch64) and #129 (native as default).
 
 ## Why
 
@@ -36,6 +36,10 @@ The backend is the compiler's largest file, covers the kernel and user targets (
 2. **First subset:** integer and bool locals, control flow, calls of up to four words, `Buf`/`Vec` element access, structs of scalars. That is the code `bench/` measures and the part of the kernel that is not a builtin.
 3. **Measure before widening.** `bench/run.sh` prints native against C; a step lands only if no `bench/` program is slower and the instruction counts do not rise. The done condition of #125 is exactly this, for all programs, with no function left on the old path.
 4. **Then** builtins, `Lock`/device/SMP forms, and the removal of the old generator; stage0's native backend stays as the reference for the part it covers.
+
+## Where it stands
+
+`stage1/ir.bastio` has the operations, `ir_lower` (one function instance to IR, or the first reason it is outside the subset), a pass that drops code no jump reaches, and `ir_print`. `irdump FILE` prints the IR of every function of a program; `tests/ir.sh` compares it with `tests/ir/*.expected`. The subset so far is integer and bool parameters, locals and results; arithmetic, comparisons, `&&`, `||`, `!`, unary `-`; `let`, assignment to a variable, `if`, `while`, `return`, and calls of non-generic functions of the same kind. Not yet: the `wrap_*` builtins, `match`, structs and enums, `Buf`/`Bytes`/`Vec`, borrowed parameters. The IR is not in SSA form and has no blocks as such, only labels; the register allocator and the emitter come next.
 
 ## What this does not change
 
