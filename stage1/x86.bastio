@@ -7662,13 +7662,286 @@ fn x86_entry(g: &mut X86, m: &mut Mono, p: &Parser, x: u64) {
   w_s(&mut g.out, "\tmov -8(%rbp), %rbx\n\tleave\n\tret\n\n");
 }
 
+/// Is a value of type `t` aligned to 8 bytes in C (so a struct holding it
+/// is, and pads to a multiple of 8)?
+fn x86_cabi_al8(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
+  let k = kind_t(m, t);
+  if k == TY_U64 || k == TY_I64 || k == TY_BYTES || k == TY_ENUM {
+    return true;
+  }
+  if k != TY_STRUCT {
+    return false;
+  }
+  let x = inner_t(m, t);
+  let dn = def_node(m, p, x);
+  let nf = list_len(p, dn.a);
+  let mut j = 0;
+  while j < nf && j < SRC_MAX {
+    let ft = fld_ty(c, x, j);
+    if ft != 0 && x86_cabi_al8(&mut g, c, m, p, ft) {
+      return true;
+    }
+    j = j + 1;
+  }
+  return false;
+}
+
+/// Can a value of type `t` be laid out as C does, inside a struct or enum
+/// that an `export fn` returns? The backend stores every field in a word of
+/// its own, so a narrower integer must be followed by padding in C: a field
+/// of an 8-byte alignment next to it, or the end of a struct that has one.
+fn x86_cabi_ok(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
+  let k = kind_t(m, t);
+  if k != TY_STRUCT && k != TY_ENUM {
+    return k == TY_U64 || k == TY_I64 || k == TY_BYTES || (is_int(m, t) && k != TY_BOOL) || k == TY_BOOL;
+  }
+  let x = inner_t(m, t);
+  let dn = def_node(m, p, x);
+  let nf = list_len(p, dn.a);
+  let al8 = x86_cabi_al8(&mut g, c, m, p, t);
+  let mut j = 0;
+  while j < nf && j < SRC_MAX {
+    let ft = fld_ty(c, x, j);
+    if ft != 0 {
+      if !x86_cabi_ok(&mut g, c, m, p, ft) {
+        return false;
+      }
+      let fk = kind_t(m, ft);
+      let narrow = fk != TY_STRUCT && fk != TY_ENUM && fk != TY_U64 && fk != TY_I64 && fk != TY_BYTES;
+      if narrow && k == TY_STRUCT {
+        let mut padded = al8;
+        if j + 1 < nf {
+          let nt = fld_ty(c, x, j + 1);
+          padded = nt != 0 && x86_cabi_al8(&mut g, c, m, p, nt);
+        }
+        if !padded {
+          return false;
+        }
+      }
+    }
+    j = j + 1;
+  }
+  return true;
+}
+
+/// The C-callable wrapper of `export fn` `x` (System V AMD64): it moves the
+/// arguments to where `x`'s own code takes them (a `&Bytes` is a pointer and
+/// a length in C, and a length and a pointer here; a `&mut Bytes` is the
+/// address of a `bst_bytes` the wrapper makes) and returns the result as C
+/// does (a result of three words or more through the pointer in %rdi).
+fn x86_export(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
+  let xi = inst_at(m, x);
+  let dn = node_at(p.nodes, xi.def);
+  let rt = cg_ret_ty(&mut m, p, x);
+  let rw = x86_words(&mut g, c, m, p, rt);
+  if rw > 1 && !x86_cabi_ok(&mut g, c, m, p, rt) {
+    x86_fail(&mut g, "the native backend supports only word-sized fields (64-bit integers, `Bytes`, or narrower ones followed by padding) inside the result of an `export fn` yet");
+    return;
+  }
+  // The System V sources: a hidden result pointer, then one register per
+  // scalar and two (pointer, length) per buffer.
+  let mut nsrc = 0;
+  if rw > 2 {
+    nsrc = 1;
+  }
+  let mut nmut = 0;
+  let mut tw = 0;
+  let mut q = dn.a;
+  while q != 0 {
+    let qn = node_at(p.nodes, q);
+    let pt = conv(&mut m, p, qn.a, x, q);
+    let bk = kind_t(m, base_t(m, pt));
+    if bk == TY_BYTES {
+      nsrc = wrap_add(nsrc, 2);
+      if kind_t(m, pt) == TY_MUTREF {
+        nmut = wrap_add(nmut, 1);
+        tw = wrap_add(tw, 1);
+      } else {
+        tw = wrap_add(tw, 2);
+      }
+    } else if kind_t(m, pt) == TY_REF || kind_t(m, pt) == TY_MUTREF || x86_words(&mut g, c, m, p, pt) != 1 {
+      x86_fail(&mut g, "the native backend supports only integers, `bool` and buffers as `export fn` parameters yet");
+      return;
+    } else {
+      nsrc = wrap_add(nsrc, 1);
+      tw = wrap_add(tw, 1);
+    }
+    q = qn.next;
+  }
+  let mut nspill = nsrc;
+  if nspill > 6 {
+    nspill = 6;
+  }
+  let fs = wrap_add(wrap_add(wrap_mul(nspill, 8), wrap_mul(nmut, 16)), 15) / 16 * 16;
+  w_s(&mut g.out, "\t.globl ");
+  rd_src(&mut g.out, p, dn.s, dn.e);
+  w_s(&mut g.out, "\n\t.type ");
+  rd_src(&mut g.out, p, dn.s, dn.e);
+  w_s(&mut g.out, ", @function\n");
+  rd_src(&mut g.out, p, dn.s, dn.e);
+  w_s(&mut g.out, ":\n\tpush %rbp\n\tmov %rsp, %rbp\n");
+  if fs > 0 {
+    w_s(&mut g.out, "\tsub $");
+    w_num(&mut g.out, fs);
+    w_s(&mut g.out, ", %rsp\n");
+  }
+  let mut i = 0;
+  while i < nspill {
+    w_s(&mut g.out, "\tmov ");
+    w_s(&mut g.out, x86_sysv_reg(i));
+    w_s(&mut g.out, ", ");
+    x86_src(&mut g.out, i);
+    w_s(&mut g.out, "(%rbp)\n");
+    i = wrap_add(i, 1);
+  }
+  // A lent `&mut Bytes` becomes a `bst_bytes` (length, pointer) in the frame.
+  let mut s = 0;
+  if rw > 2 {
+    s = 1;
+  }
+  let mut mi = 0;
+  q = dn.a;
+  while q != 0 {
+    let qn = node_at(p.nodes, q);
+    let pt = conv(&mut m, p, qn.a, x, q);
+    if kind_t(m, base_t(m, pt)) == TY_BYTES {
+      if kind_t(m, pt) == TY_MUTREF {
+        let lo = wrap_add(wrap_mul(nspill, 8), wrap_mul(16, wrap_add(mi, 1)));
+        w_s(&mut g.out, "\tmov ");
+        x86_src(&mut g.out, wrap_add(s, 1));
+        w_s(&mut g.out, "(%rbp), %rax\n\tmov %rax, -");
+        w_num(&mut g.out, lo);
+        w_s(&mut g.out, "(%rbp)\n\tmov ");
+        x86_src(&mut g.out, s);
+        w_s(&mut g.out, "(%rbp), %rax\n\tmov %rax, -");
+        w_num(&mut g.out, wrap_sub(lo, 8));
+        w_s(&mut g.out, "(%rbp)\n");
+        mi = wrap_add(mi, 1);
+      }
+      s = wrap_add(s, 2);
+    } else {
+      s = wrap_add(s, 1);
+    }
+    q = qn.next;
+  }
+  if rw > 2 {
+    w_s(&mut g.out, "\tsub $");
+    w_num(&mut g.out, wrap_mul(8, rw));
+    w_s(&mut g.out, ", %rsp\n");
+  }
+  // The arguments, first parameter deepest; a buffer's length on top.
+  s = 0;
+  if rw > 2 {
+    s = 1;
+  }
+  mi = 0;
+  q = dn.a;
+  while q != 0 {
+    let qn = node_at(p.nodes, q);
+    let pt = conv(&mut m, p, qn.a, x, q);
+    if kind_t(m, base_t(m, pt)) == TY_BYTES {
+      if kind_t(m, pt) == TY_MUTREF {
+        w_s(&mut g.out, "\tlea -");
+        w_num(&mut g.out, wrap_add(wrap_mul(nspill, 8), wrap_mul(16, wrap_add(mi, 1))));
+        w_s(&mut g.out, "(%rbp), %rax\n\tpush %rax\n");
+        mi = wrap_add(mi, 1);
+      } else {
+        w_s(&mut g.out, "\tpush ");
+        x86_src(&mut g.out, s);
+        w_s(&mut g.out, "(%rbp)\n\tpush ");
+        x86_src(&mut g.out, wrap_add(s, 1));
+        w_s(&mut g.out, "(%rbp)\n");
+      }
+      s = wrap_add(s, 2);
+    } else {
+      // C does not extend a narrow argument.
+      w_s(&mut g.out, "\tmov ");
+      x86_src(&mut g.out, s);
+      w_s(&mut g.out, "(%rbp), %rax\n");
+      let nz = x86_normalize(m, pt);
+      if slen(nz) > 0 {
+        w_s(&mut g.out, "\t");
+        w_s(&mut g.out, nz);
+        w_s(&mut g.out, "\n");
+      } else if kind_t(m, pt) == TY_BOOL {
+        w_s(&mut g.out, "\tmovzbl %al, %eax\n");
+      }
+      w_s(&mut g.out, "\tpush %rax\n");
+      s = wrap_add(s, 1);
+    }
+    q = qn.next;
+  }
+  if x86_regargs(&mut g, c, &mut m, p, x) == tw && tw > 0 {
+    let mut j = 0;
+    while j < tw {
+      w_s(&mut g.out, "\tpop ");
+      w_s(&mut g.out, x86_rname(x86_argreg(j)));
+      w_s(&mut g.out, "\n");
+      j = wrap_add(j, 1);
+    }
+  }
+  x86_clear(&mut g.ln);
+  x86_sym(&mut g, m, p, x);
+  w_s(&mut g.out, "\tcall ");
+  w_append(&mut g.out, g.ln);
+  w_s(&mut g.out, "\n");
+  x86_clear(&mut g.ln);
+  if tw > 0 && x86_regargs(&mut g, c, &mut m, p, x) != tw {
+    // The arguments stayed on the stack; the result area is below them.
+    w_s(&mut g.out, "\tadd $");
+    w_num(&mut g.out, wrap_mul(8, tw));
+    w_s(&mut g.out, ", %rsp\n");
+  }
+  if rw > 2 {
+    w_s(&mut g.out, "\tmov -8(%rbp), %rcx\n");
+    let mut j = 0;
+    while j < rw {
+      w_s(&mut g.out, "\tmov ");
+      w_num(&mut g.out, wrap_mul(8, j));
+      w_s(&mut g.out, "(%rsp), %rax\n\tmov %rax, ");
+      w_num(&mut g.out, wrap_mul(8, j));
+      w_s(&mut g.out, "(%rcx)\n");
+      j = wrap_add(j, 1);
+    }
+    w_s(&mut g.out, "\tmov %rcx, %rax\n");
+  }
+  w_s(&mut g.out, "\tleave\n\tret\n\t.size ");
+  rd_src(&mut g.out, p, dn.s, dn.e);
+  w_s(&mut g.out, ", .-");
+  rd_src(&mut g.out, p, dn.s, dn.e);
+  w_s(&mut g.out, "\n\n");
+}
+
+/// The frame operand of System V source `i` (without the `(%rbp)`): the
+/// register it arrived in, spilled, or its place among the caller's stack
+/// arguments.
+fn x86_src(out: &mut Vec[u64], i: u64) {
+  if i < 6 {
+    w_s(&mut out, "-");
+    w_num(&mut out, wrap_mul(8, wrap_add(i, 1)));
+  } else {
+    w_num(&mut out, wrap_add(16, wrap_mul(8, wrap_sub(i, 6))));
+  }
+}
+
+/// The System V integer argument register `i` (without the `%`).
+fn x86_sysv_reg(i: u64) -> Str {
+  if i == 0 { return "%rdi"; }
+  if i == 1 { return "%rsi"; }
+  if i == 2 { return "%rdx"; }
+  if i == 3 { return "%rcx"; }
+  if i == 4 { return "%r8"; }
+  return "%r9";
+}
+
 /// Generates the assembly for the program monomorphized into `m` and
 /// checked by `c` (hosted target), into `g.out`. False when the program
 /// uses something the native backend does not support yet.
 fn x86_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
-  // `export fn` only matters to C callers; a program is still built around
-  // its `main` (a library without one is not supported yet).
+  // A program is built around its `main`. Without one it is a library (stage1
+  // only, hosted): each `export fn` gets a C-callable wrapper.
   let mut main_x = 0;
+  let mut nexp = 0;
   let mut k = 0;
   while k < vec_len(m.fns) {
     let x = u_at(m.fns, k);
@@ -7676,9 +7949,12 @@ fn x86_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
     if name_is(p, xi.def, "main") {
       main_x = x;
     }
+    if exported_x(m, p, x) {
+      nexp = wrap_add(nexp, 1);
+    }
     k = k + 1;
   }
-  if main_x == 0 {
+  if main_x == 0 && (g.stage0 || g.target != TARGET_HOSTED || nexp == 0) {
     x86_fail(&mut g, "the native backend does not support libraries (`export fn` without `main`) yet");
     return false;
   }
@@ -7689,7 +7965,17 @@ fn x86_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
     x86_function(&mut g, c, &mut m, p, u_at(m.fns, k));
     k = k + 1;
   }
-  x86_entry(&mut g, &mut m, p, main_x);
+  if main_x != 0 {
+    x86_entry(&mut g, &mut m, p, main_x);
+  }
+  k = 0;
+  while k < vec_len(m.fns) && !g.failed {
+    let x = u_at(m.fns, k);
+    if main_x == 0 && exported_x(m, p, x) {
+      x86_export(&mut g, c, &mut m, p, x);
+    }
+    k = k + 1;
+  }
   if g.failed {
     return false;
   }

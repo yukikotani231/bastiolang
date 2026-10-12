@@ -9,11 +9,18 @@ BASTIOC=${BASTIOC:-$here/../../stage0/target/release/bastioc0}
 CC=${CC:-cc}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-"$BASTIOC" --emit-c --header "$tmp/der.h" -o "$tmp/der.c" "$here/der.bastio"
+# BACKEND=native builds the library with bastioc1's native backend (no C
+# compiler for the library itself) instead of translating it to C.
+BACKEND=${BACKEND:-c}
+if [ "$BACKEND" = native ]; then
+  "$BASTIOC" --backend native --header "$tmp/der.h" -o "$tmp/der.o" "$here/der.bastio"
+else
+  "$BASTIOC" --emit-c --header "$tmp/der.h" -o "$tmp/der.c" "$here/der.bastio"
+fi
 # The generated C is compiled with -w: its prelude defines helpers this
 # library does not use. The harness gets -Wall.
 build() {  # C compiler flags...
-  "$CC" -std=c11 "$@" -w -c -o "$tmp/der.o" "$tmp/der.c"
+  [ "$BACKEND" = native ] || "$CC" -std=c11 "$@" -w -c -o "$tmp/der.o" "$tmp/der.c"
   "$CC" -std=c11 "$@" -Wall -I"$tmp" -o "$tmp/test" "$here/test.c" "$tmp/der.o"
 }
 if [ "${1:-}" = bench ]; then

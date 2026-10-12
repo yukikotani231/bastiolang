@@ -9,8 +9,15 @@ BASTIOC=${BASTIOC:-$here/../../stage0/target/release/bastioc0}
 CC=${CC:-cc}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-"$BASTIOC" --emit-c --header "$tmp/lines.h" -o "$tmp/lines.c" "$here/lines.bastio"
-"$CC" -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+# BACKEND=native builds the library with bastioc1's native backend (no C
+# compiler for the library itself) instead of translating it to C.
+BACKEND=${BACKEND:-c}
+if [ "$BACKEND" = native ]; then
+  "$BASTIOC" --backend native --header "$tmp/lines.h" -o "$tmp/lines.o" "$here/lines.bastio"
+else
+  "$BASTIOC" --emit-c --header "$tmp/lines.h" -o "$tmp/lines.c" "$here/lines.bastio"
+fi
+[ "$BACKEND" = native ] || "$CC" -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
   -w -c -o "$tmp/lines.o" "$tmp/lines.c"
 "$CC" -std=c11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
   -Wall -Werror -I"$tmp" -o "$tmp/lines" "$here/main.c" "$tmp/lines.o"

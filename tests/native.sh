@@ -59,6 +59,15 @@ both() {
 export -f both
 lost=0
 pfor both $(s1files tests/pass/*.bastio bench/*.bastio) || lost=1
+# The example libraries (`export fn`, no `main`) built by the native backend
+# pass the same C harnesses as their C builds.
+libs=0
+for r in examples/*/run.sh; do
+  [ -e "$r" ] || continue
+  if BACKEND=native BASTIOC="$BASTIOC" "$r" >"$tmp/lib.out" 2>&1; then libs=$((libs+1)); else
+    echo "FAIL $r with the native backend"; sed 's/^/    /' "$tmp/lib.out" | tail -20; lost=1
+  fi
+done
 pass=$(n pass) skip=$(n skip) fail=$(($(n fail) + lost))
-echo "native: $pass same as the C backend, $skip skipped (unsupported), $fail failed"
+echo "native: $pass same as the C backend, $skip skipped (unsupported), $fail failed; $libs libraries pass their C harnesses"
 [ $fail = 0 ]
