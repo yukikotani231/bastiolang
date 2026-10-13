@@ -184,7 +184,7 @@ fn ir_multi(k: u64) -> bool {
 fn ir_words(c: &Checker, m: &Mono, p: &Parser, t: u64, depth: u64) -> u64 {
   let u = base_t(m, t);
   let k = kind_t(m, u);
-  if is_int(m, u) || k == TY_BOOL {
+  if is_int(m, u) || k == TY_BOOL || ir_is_handle(k) {
     return 1;
   }
   if k == TY_BUF || k == TY_BYTES || k == TY_STR {
@@ -562,6 +562,13 @@ fn ir_branch(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, lt: u6
   ir_emit(&mut f, IR_BR, IR_NONE, cond, lt, lf, 0);
 }
 
+/// A register holding the constant `v`.
+fn ir_k(f: &mut IrFn, v: u64) -> u64 {
+  let r = ir_reg(&mut f);
+  ir_emit(&mut f, IR_CONST, r, v, 0, 0, 0);
+  return r;
+}
+
 /// An integer expression: its register.
 fn ir_int(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
   let v = ir_expr(&mut f, c, &mut m, p, i);
@@ -858,7 +865,7 @@ fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       ir_fail(&mut f, "a call of a generic function");
       return ir_none();
     }
-    return ir_call_to(&mut f, c, &mut m, p, n.b, callee);
+    return ir_call_to(&mut f, c, &mut m, p, n.b, callee, ir_none(), IR_NONE);
   }
   if k == E_TAPP && kind_of(p, n.b) == E_VARIANT {
     // `Option[u64]::Some(x)`: the instance the monomorphizer made.
@@ -1549,6 +1556,95 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     }
     return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
   }
+  if name_is(p, i, "pt_put") || name_is(p, i, "pt_put_frame") || name_is(p, i, "pt_put_shared") {
+    // A slot: the page's address with the flag bits (1 present, 2 writable,
+    // 4 user, 0x200 shared). `pt_put` maps a writable user page.
+    let t = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 0));
+    let ix = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    let fr = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 2));
+    let mut e = fr;
+    if name_is(p, i, "pt_put") {
+      let k = ir_k(&mut f, 7);
+      e = ir_reg(&mut f);
+      ir_emit(&mut f, IR_OR, e, fr, k, 0, 0);
+    } else {
+      let w = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 3));
+      let one = ir_k(&mut f, 1);
+      let w2 = ir_reg(&mut f);
+      ir_emit(&mut f, IR_SHL, w2, w, one, 0, 0);
+      let o1 = ir_reg(&mut f);
+      ir_emit(&mut f, IR_OR, o1, fr, w2, 0, 0);
+      let mut bits = 5;
+      if name_is(p, i, "pt_put_shared") {
+        bits = 517;
+      }
+      let k = ir_k(&mut f, bits);
+      e = ir_reg(&mut f);
+      ir_emit(&mut f, IR_OR, e, o1, k, 0, 0);
+    }
+    ir_emit(&mut f, IR_STORE, e, t, ix, 8, 0);
+    return ir_none();
+  }
+  if name_is(p, i, "pt_take") || name_is(p, i, "pt_take_frame") || name_is(p, i, "pt_take_shared") {
+    // Empties a slot and returns the page it held.
+    let t = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 0));
+    let ix = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    let e = ir_reg(&mut f);
+    ir_emit(&mut f, IR_LOAD, e, t, ix, 8, 0);
+    let z = ir_k(&mut f, 0);
+    ir_emit(&mut f, IR_STORE, z, t, ix, 8, 0);
+    let mask = ir_k(&mut f, 4503599627366400);
+    let d = ir_reg(&mut f);
+    ir_emit(&mut f, IR_AND, d, e, mask, 0, 0);
+    return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+  }
+  if name_is(p, i, "pt_set_access") {
+    // Clears present, writable and hidden (bit 10), then sets hidden for 0,
+    // present for 1, present and writable for 2 (2a - 1 for a > 0).
+    let t = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 0));
+    let ix = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    let acc = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 2));
+    let e = ir_reg(&mut f);
+    ir_emit(&mut f, IR_LOAD, e, t, ix, 8, 0);
+    let keep = ir_k(&mut f, 18446744073709550588);
+    let base = ir_reg(&mut f);
+    ir_emit(&mut f, IR_AND, base, e, keep, 0, 0);
+    let one = ir_k(&mut f, 1);
+    let a2 = ir_reg(&mut f);
+    ir_emit(&mut f, IR_SHL, a2, acc, one, 0, 0);
+    let m1 = ir_reg(&mut f);
+    ir_emit(&mut f, IR_SUB, m1, a2, one, 0, 0);
+    let zero = ir_k(&mut f, 0);
+    let z = ir_reg(&mut f);
+    ir_emit(&mut f, IR_EQ, z, acc, zero, 0, 0);
+    let zm = ir_reg(&mut f);
+    ir_emit(&mut f, IR_SUB, zm, z, one, 0, 0);
+    let lo = ir_reg(&mut f);
+    ir_emit(&mut f, IR_AND, lo, m1, zm, 0, 0);
+    let ten = ir_k(&mut f, 10);
+    let hid = ir_reg(&mut f);
+    ir_emit(&mut f, IR_SHL, hid, z, ten, 0, 0);
+    let bits = ir_reg(&mut f);
+    ir_emit(&mut f, IR_OR, bits, lo, hid, 0, 0);
+    let out = ir_reg(&mut f);
+    ir_emit(&mut f, IR_OR, out, base, bits, 0, 0);
+    ir_emit(&mut f, IR_STORE, out, t, ix, 8, 0);
+    return ir_none();
+  }
+  if name_is(p, i, "pt_shared") {
+    // Bit 9, which the processor ignores, marks a slot mapping a shared page.
+    let t = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 0));
+    let ix = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    let e = ir_reg(&mut f);
+    ir_emit(&mut f, IR_LOAD, e, t, ix, 8, 0);
+    let nine = ir_k(&mut f, 9);
+    let sh = ir_reg(&mut f);
+    ir_emit(&mut f, IR_SHR, sh, e, nine, 0, 0);
+    let one = ir_k(&mut f, 1);
+    let d = ir_reg(&mut f);
+    ir_emit(&mut f, IR_AND, d, sh, one, 0, 0);
+    return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+  }
   if name_is(p, i, "frame_read") || name_is(p, i, "frame_read8") {
     // A frame is the address of its page.
     let fr = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 0));
@@ -1571,6 +1667,27 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     }
     ir_emit(&mut f, IR_STORE, v, fr, ix, size, 0);
     return ir_none();
+  }
+  if is_pt_borrow_builtin(p, n.s, n.e) {
+    // `pt_borrow(&mut t, i, f, args..)` (`pt_borrow_frame` alike): `f` gets
+    // the address of a copy of the child in slot `i`, which it may change
+    // only in its contents (proved), so nothing is written back.
+    let t = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 0));
+    let ix = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    let fnode = node_at(p.nodes, cg_arg(p, i, 2));
+    let def = plain_fn(p, fnode.s, fnode.e);
+    if def == 0 {
+      ir_fail(&mut f, "a pt_borrow of a generic function");
+      return ir_none();
+    }
+    let e = ir_reg(&mut f);
+    ir_emit(&mut f, IR_LOAD, e, t, ix, 8, 0);
+    let mask = ir_reg(&mut f);
+    ir_emit(&mut f, IR_CONST, mask, 4503599627366400, 0, 0, 0);
+    let child = ir_reg(&mut f);
+    ir_emit(&mut f, IR_AND, child, e, mask, 0, 0);
+    let callee = plain_inst(&mut m, def);
+    return ir_call_to(&mut f, c, &mut m, p, i, callee, IrVal { k: IRK_INT, r0: child, r1: IR_NONE, t: 0 }, cg_arg(p, i, 3));
   }
   if name_is(p, i, "serial_write") {
     // `serial_write(con, byte)`: the capability is only a name for the right
@@ -1610,21 +1727,34 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     return ir_none();
   }
   let callee = plain_inst(&mut m, def);
-  return ir_call_to(&mut f, c, &mut m, p, i, callee);
+  return ir_call_to(&mut f, c, &mut m, p, i, callee, ir_none(), IR_NONE);
 }
 
 /// The call node `i` of function instance `callee`: the arguments, the
-/// call, and the lent buffers read back.
-fn ir_call_to(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, callee: u64) -> IrVal {
+/// call, and the lent buffers read back. With `pre.k != 0`, the first
+/// argument is the value `pre` and the argument nodes start at `a0` (as for
+/// `pt_borrow`, whose first argument the call makes up); otherwise they start
+/// at the call's own, and `a0` is ignored.
+fn ir_call_to(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, callee: u64, pre: IrVal, a0: u64) -> IrVal {
   let n = node_at(p.nodes, i);
   let mut regs = vec_new[u64]();
   let mut lent = vec_new[u64]();
   let mut a = n.a;
+  let mut havepre = pre.k != 0;
+  if havepre {
+    a = a0;
+  }
   let cdef = inst_at(m, callee);
   let cdn = node_at(p.nodes, cdef.def);
   let mut cq = cdn.a;
-  while a != 0 && !f.failed {
-    let v = ir_expr(&mut f, c, &mut m, p, a);
+  while (a != 0 || havepre) && !f.failed {
+    let mut v = pre;
+    let from_pre = havepre;
+    if havepre {
+      havepre = false;
+    } else {
+      v = ir_expr(&mut f, c, &mut m, p, a);
+    }
     let mut pt_kind = 0;
     let mut pt = 0;
     if cq != 0 {
@@ -1728,7 +1858,9 @@ fn ir_call_to(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, calle
         vec_push(&mut regs, v.r1);
       }
     }
-    a = next_of(p, a);
+    if !from_pre {
+      a = next_of(p, a);
+    }
   }
   let first = vec_len(f.args);
   let mut j = 0;
