@@ -8113,8 +8113,14 @@ fn x86_program_end(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, main_x: u
   w_append(&mut g.out, g.smp);
   if g.target == TARGET_USER {
     x86_runtime_user(&mut g.out);
+    if !g.stage0 {
+      w_s(&mut g.out, "\t.set bst_rt_alloc_raw, bst_rt_alloc    # the arena hands out zeroed words either way\n");
+    }
   } else if g.target == TARGET_KERNEL {
     x86_runtime_kernel(&mut g.out);
+    if !g.stage0 {
+      w_s(&mut g.out, "\t.set bst_rt_alloc_raw, bst_rt_alloc    # the arena hands out zeroed words either way\n");
+    }
   } else {
     x86_runtime(&mut g.out);
     if !g.stage0 {
@@ -8536,6 +8542,19 @@ fn x86_runtime(out: &mut Vec[u64]) {
 fn x86_runtime1(out: &mut Vec[u64]) {
   w_s(&mut out, "# ---- runtime only stage1 writes (trusted base) ----\n");
   w_s(&mut out, "\t.text\n");
+  w_s(&mut out, "bst_rt_alloc_raw:               # %rax = %rdi words (at least one), not zeroed: the caller writes all of them\n");
+  w_s(&mut out, "\tpush %rbp\n");
+  w_s(&mut out, "\tmov %rsp, %rbp\n");
+  w_s(&mut out, "\tand $-16, %rsp\n");
+  w_s(&mut out, "\ttest %rdi, %rdi\n");
+  w_s(&mut out, "\tjnz 2f\n");
+  w_s(&mut out, "\tmov $1, %edi\n");
+  w_s(&mut out, "2:\tshl $3, %rdi\n");
+  w_s(&mut out, "\tcall malloc@PLT\n");
+  w_s(&mut out, "\ttest %rax, %rax\n");
+  w_s(&mut out, "\tjz bst_rt_oom\n");
+  w_s(&mut out, "\tleave\n");
+  w_s(&mut out, "\tret\n");
   w_s(&mut out, "bst_rt_host_env:                # the variable named by the %rsi bytes at %rdi into the Bytes at (%rdx); %rax = 1 if it is set\n");
   w_s(&mut out, "\tpush %rbp\n");
   w_s(&mut out, "\tmov %rsp, %rbp\n");

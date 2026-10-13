@@ -1750,7 +1750,8 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let cnt = ir_reg(&mut f);
     ir_emit(&mut f, IR_CONST, cnt, w, 0, 0, 0);
     let ptr = ir_reg(&mut f);
-    ir_emit(&mut f, IR_ALLOC, ptr, cnt, 0, 8, 0);
+    // Every word is written next: no need to zero them.
+    ir_emit(&mut f, IR_ALLOC, ptr, cnt, 0, 8, 2);
     let dst = IrVal { k: IRK_PLACE, r0: ptr, r1: 0, t: base_t(m, t0) };
     if v.k == IRK_INT || v.k == IRK_BOX {
       ir_hdr_store(&mut f, ptr, 0, v.r0);
@@ -1788,7 +1789,12 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let cnt = ir_reg(&mut f);
     ir_emit(&mut f, IR_CONST, cnt, wrap_add(w, skip), 0, 0, 0);
     let ptr = ir_reg(&mut f);
-    ir_emit(&mut f, IR_ALLOC, ptr, cnt, 0, 8, 0);
+    // An atomic is written whole next; a lock keeps its zero lock word.
+    let mut zeroed = 2;
+    if lock {
+      zeroed = 0;
+    }
+    ir_emit(&mut f, IR_ALLOC, ptr, cnt, 0, 8, zeroed);
     let dst = IrVal { k: IRK_PLACE, r0: ptr, r1: skip, t: base_t(m, t0) };
     if v.k == IRK_INT || v.k == IRK_BOX {
       ir_hdr_store(&mut f, ptr, skip, v.r0);
@@ -3442,6 +3448,8 @@ fn ir_print(out: &mut Vec[u64], f: &IrFn, m: &Mono, p: &Parser) {
       w_s(&mut out, " = alloc");
       if q.ty == 1 {
         w_s(&mut out, "?");
+      } else if q.ty == 2 {
+        w_s(&mut out, "~");
       }
       w_num(&mut out, wrap_mul(q.c, 8));
       w_s(&mut out, " ");
