@@ -73,6 +73,16 @@ const IRS_PAGE_AT: u64 = 0;
 const IRS_FRAME_ID: u64 = 1;
 const IRS_POOL_BASE: u64 = 2;
 const IRS_KERNEL_PML4: u64 = 3;
+const IRS_PORT_CELL: u64 = 4;
+const IRS_MMIO_CELL: u64 = 5;
+const IRS_PT_LEASES: u64 = 6;
+
+const IR_DEVR: u64 = 61;     // d = the c-byte (1, 2, 4 or 8) value at address a, zero-extended: a volatile load, never dropped or reordered
+const IR_DEVW: u64 = 62;     // the low c bytes of b are stored at address a: a volatile store
+const IR_PIN: u64 = 63;      // d = the c-byte value read from I/O port a (`in`)
+const IR_FENCE: u64 = 65;    // a full memory fence (`dma_lend`, `dma_take`)
+const IR_MMCHK: u64 = 66;    // stops the machine if the block at address a, b bytes, is RAM (`mmio_claim` in the kernel): a runtime call that keeps every register
+const IR_POUT: u64 = 64;     // the low c bytes of b are written to I/O port a (`out`)
 
 const IR_NONE: u64 = 18446744073709551615;
 
@@ -195,7 +205,7 @@ fn ir_words(c: &Checker, m: &Mono, p: &Parser, t: u64, depth: u64) -> u64 {
   if is_int(m, u) || k == TY_BOOL || ir_is_handle(k) {
     return 1;
   }
-  if k == TY_BUF || k == TY_BYTES || k == TY_STR {
+  if k == TY_BUF || k == TY_BYTES || k == TY_STR || k == TY_POOL || k == TY_PORTIO || k == TY_MMIO {
     return 2;
   }
   if k == TY_BOX && ir_mw(c, m, p, inner_t(m, u), 0) != IR_NONE {
@@ -259,7 +269,7 @@ fn ir_mw(c: &Checker, m: &Mono, p: &Parser, t: u64, depth: u64) -> u64 {
   if is_int(m, u) || k == TY_BOOL || k == TY_SERIAL || k == TY_HOST || k == TY_FRAME || k == TY_PT || k == TY_BOX || k == TY_MUTREF {
     return 1;
   }
-  if k == TY_BUF || k == TY_BYTES || k == TY_STR || k == TY_POOL {
+  if k == TY_BUF || k == TY_BYTES || k == TY_STR || k == TY_POOL || k == TY_PORTIO || k == TY_MMIO {
     return 2;
   }
   if k == TY_LOCK || k == TY_ATOMIC || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA || k == TY_MMU || k == TY_CPU || k == TY_LEASE || k == TY_SHARED || k == TY_DIRTY {
@@ -304,6 +314,64 @@ fn ir_mw(c: &Checker, m: &Mono, p: &Parser, t: u64, depth: u64) -> u64 {
   return IR_NONE;
 }
 
+/// The index of the page at address register `fr`: the runtime's lookup in
+/// the kernel, the offset into the pool when hosted.
+fn ir_page_id(f: &mut IrFn, c: &Checker, fr: u64) -> u64 {
+  let d = ir_reg(&mut f);
+  if c.target == TARGET_KERNEL {
+    ir_emit(&mut f, IR_RT, d, fr, 0, IRS_FRAME_ID, 0);
+  } else {
+    let base = ir_reg(&mut f);
+    ir_emit(&mut f, IR_GLOBAL, base, IRS_POOL_BASE, 0, 0, 0);
+    let off = ir_reg(&mut f);
+    ir_emit(&mut f, IR_SUB, off, fr, base, 0, 0);
+    let sh = ir_k(&mut f, 12);
+    ir_emit(&mut f, IR_SHR, d, off, sh, 0, 0);
+  }
+  return d;
+}
+
+/// The width in bytes of the device access that call `i` names (`pio_in8`,
+/// `mmio_write32`, `dma_read64`, ..), or 0.
+fn ir_dev_width(p: &Parser, i: u64) -> u64 {
+  if name_is(p, i, "pio_in8") || name_is(p, i, "pio_out8") || name_is(p, i, "mmio_read8") || name_is(p, i, "mmio_write8")
+    || name_is(p, i, "dma_read8") || name_is(p, i, "dma_write8") {
+    return 1;
+  }
+  if name_is(p, i, "pio_in16") || name_is(p, i, "pio_out16") || name_is(p, i, "mmio_read16") || name_is(p, i, "mmio_write16")
+    || name_is(p, i, "dma_read16") || name_is(p, i, "dma_write16") {
+    return 2;
+  }
+  if name_is(p, i, "pio_in32") || name_is(p, i, "pio_out32") || name_is(p, i, "mmio_read32") || name_is(p, i, "mmio_write32")
+    || name_is(p, i, "dma_read32") || name_is(p, i, "dma_write32") {
+    return 4;
+  }
+  if name_is(p, i, "mmio_read64") || name_is(p, i, "mmio_write64") || name_is(p, i, "dma_read64") || name_is(p, i, "dma_write64") {
+    return 8;
+  }
+  return 0;
+}
+
+/// Does device access `i` write? (Otherwise it reads.)
+fn ir_dev_writes(p: &Parser, i: u64) -> bool {
+  return name_is(p, i, "pio_out8") || name_is(p, i, "pio_out16") || name_is(p, i, "pio_out32")
+    || name_is(p, i, "mmio_write8") || name_is(p, i, "mmio_write16") || name_is(p, i, "mmio_write32") || name_is(p, i, "mmio_write64")
+    || name_is(p, i, "dma_write8") || name_is(p, i, "dma_write16") || name_is(p, i, "dma_write32") || name_is(p, i, "dma_write64");
+}
+
+/// 1 for a port access, 2 for MMIO, 3 for a DMA page.
+fn ir_dev_kind(p: &Parser, i: u64) -> u64 {
+  if name_is(p, i, "pio_in8") || name_is(p, i, "pio_in16") || name_is(p, i, "pio_in32")
+    || name_is(p, i, "pio_out8") || name_is(p, i, "pio_out16") || name_is(p, i, "pio_out32") {
+    return 1;
+  }
+  if name_is(p, i, "dma_read8") || name_is(p, i, "dma_read16") || name_is(p, i, "dma_read32") || name_is(p, i, "dma_read64")
+    || name_is(p, i, "dma_write8") || name_is(p, i, "dma_write16") || name_is(p, i, "dma_write32") || name_is(p, i, "dma_write64") {
+    return 3;
+  }
+  return 2;
+}
+
 /// Is a value of this kind of type one word that nothing but a builtin looks
 /// into? The console, the zero-sized capabilities of the kernel (ports, MMIO
 /// space, MMU, CPU) and the words that name a frame, a table, a DMA window or a
@@ -324,7 +392,7 @@ fn ir_kind(c: &Checker, m: &Mono, p: &Parser, t: u64) -> u64 {
   if kind_t(m, u) == TY_BUF {
     return IRK_BUF;
   }
-  if kind_t(m, u) == TY_BYTES || kind_t(m, u) == TY_POOL {
+  if kind_t(m, u) == TY_BYTES || kind_t(m, u) == TY_POOL || kind_t(m, u) == TY_PORTIO || kind_t(m, u) == TY_MMIO {
     // A Pool is two words in memory, the base address and then the page
     // count; held like a Bytes (data = word 1 = the count, length = word 0
     // = the base), though only the pool builtins look into it.
@@ -1251,6 +1319,63 @@ fn ir_copy_bytes(f: &mut IrFn, c: &Checker, dst: u64, doff: u64, src: u64, soff:
   ir_place(&mut f, l_end);
 }
 
+/// `bmove`: a copy within one buffer whose ranges may overlap, as memmove:
+/// backward when the destination starts inside the source.
+fn ir_move_bytes(f: &mut IrFn, c: &Checker, buf: u64, doff: u64, soff: u64, cnt: u64) {
+  let diff = ir_reg(&mut f);
+  ir_emit(&mut f, IR_SUB, diff, doff, soff, 0, c.tu64);
+  let back = ir_reg(&mut f);
+  ir_emit(&mut f, IR_LT, back, diff, cnt, 0, 0);
+  let l_back = ir_label(&mut f);
+  let l_fwd = ir_label(&mut f);
+  let l_end = ir_label(&mut f);
+  ir_emit(&mut f, IR_BR, IR_NONE, back, l_back, l_fwd, 0);
+  ir_place(&mut f, l_fwd);
+  ir_copy_bytes(&mut f, c, buf, doff, buf, soff, cnt);
+  ir_jump(&mut f, l_end);
+  ir_place(&mut f, l_back);
+  let k = ir_reg(&mut f);
+  ir_emit(&mut f, IR_MOV, k, cnt, 0, 0, 0);
+  let one = ir_reg(&mut f);
+  ir_emit(&mut f, IR_CONST, one, 1, 0, 0, 0);
+  let l_head = ir_label(&mut f);
+  let l_body = ir_label(&mut f);
+  ir_place(&mut f, l_head);
+  let zero = ir_reg(&mut f);
+  ir_emit(&mut f, IR_CONST, zero, 0, 0, 0, 0);
+  let more = ir_reg(&mut f);
+  ir_emit(&mut f, IR_GT, more, k, zero, 0, 0);
+  ir_emit(&mut f, IR_BR, IR_NONE, more, l_body, l_end, 0);
+  ir_place(&mut f, l_body);
+  let k1 = ir_reg(&mut f);
+  ir_emit(&mut f, IR_SUB, k1, k, one, 0, c.tu64);
+  ir_emit(&mut f, IR_MOV, k, k1, 0, 0, 0);
+  let si = ir_reg(&mut f);
+  ir_emit(&mut f, IR_ADD, si, soff, k, 0, c.tu64);
+  let di = ir_reg(&mut f);
+  ir_emit(&mut f, IR_ADD, di, doff, k, 0, c.tu64);
+  let x = ir_reg(&mut f);
+  ir_emit(&mut f, IR_LOAD, x, buf, si, 1, 0);
+  ir_emit(&mut f, IR_STORE, x, buf, di, 1, 0);
+  ir_jump(&mut f, l_head);
+  ir_place(&mut f, l_end);
+}
+
+/// The one-word value of a page handle argument (`Frame`, `Dma`) that is
+/// lent: a handle held in a field of a struct in memory comes as that field's
+/// place.
+fn ir_handle_arg(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
+  let mut v = ir_expr(&mut f, c, &mut m, p, i);
+  if !f.failed && v.k == IRK_PLACE {
+    v = ir_rv(&mut f, c, m, p, v);
+  }
+  if !f.failed && v.k != IRK_INT {
+    ir_fail(&mut f, "a page handle that is not one word");
+    return IR_NONE;
+  }
+  return v.r0;
+}
+
 /// A call: a builtin of the subset (`len`, `blen`, `get`, `bget`) or a
 /// function that is not generic and not a builtin, whose arguments and
 /// result are integers or buffers (or no result).
@@ -1440,6 +1565,52 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     }
     return ir_none();
   }
+  if name_is(p, i, "bmove") {
+    // `bmove(&mut b, d, s, n)`
+    let a1 = next_of(p, n.a);
+    let a2 = next_of(p, a1);
+    let a3 = next_of(p, a2);
+    let b = ir_buf(&mut f, c, &mut m, p, n.a, IRK_BYTES);
+    let d = ir_int(&mut f, c, &mut m, p, a1);
+    let s = ir_int(&mut f, c, &mut m, p, a2);
+    let cnt = ir_int(&mut f, c, &mut m, p, a3);
+    if !f.failed {
+      ir_move_bytes(&mut f, c, b.r0, d, s, cnt);
+    }
+    return ir_none();
+  }
+  if name_is(p, i, "bytes_to_frame") || name_is(p, i, "bytes_to_dma") {
+    // `bytes_to_frame(&mut page, o, &src, s, n)`: a byte loop into the page.
+    let a1 = next_of(p, n.a);
+    let a2 = next_of(p, a1);
+    let a3 = next_of(p, a2);
+    let a4 = next_of(p, a3);
+    let pg = ir_handle_arg(&mut f, c, &mut m, p, n.a);
+    let o = ir_int(&mut f, c, &mut m, p, a1);
+    let src = ir_buf(&mut f, c, &mut m, p, a2, IRK_BYTES);
+    let s = ir_int(&mut f, c, &mut m, p, a3);
+    let cnt = ir_int(&mut f, c, &mut m, p, a4);
+    if !f.failed {
+      ir_copy_bytes(&mut f, c, pg, o, src.r0, s, cnt);
+    }
+    return ir_none();
+  }
+  if name_is(p, i, "frame_to_bytes") || name_is(p, i, "dma_to_bytes") {
+    // `frame_to_bytes(&mut dst, d, &page, o, n)`
+    let a1 = next_of(p, n.a);
+    let a2 = next_of(p, a1);
+    let a3 = next_of(p, a2);
+    let a4 = next_of(p, a3);
+    let dst = ir_buf(&mut f, c, &mut m, p, n.a, IRK_BYTES);
+    let d = ir_int(&mut f, c, &mut m, p, a1);
+    let pg = ir_handle_arg(&mut f, c, &mut m, p, a2);
+    let o = ir_int(&mut f, c, &mut m, p, a3);
+    let cnt = ir_int(&mut f, c, &mut m, p, a4);
+    if !f.failed {
+      ir_copy_bytes(&mut f, c, dst.r0, d, pg, o, cnt);
+    }
+    return ir_none();
+  }
   if name_is(p, i, "bfrom") {
     // A copy of a string literal.
     let s = ir_buf(&mut f, c, &mut m, p, n.a, IRK_STR);
@@ -1538,6 +1709,116 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     }
     return out;
   }
+  let dw = ir_dev_width(p, i);
+  if dw != 0 {
+    // Device accesses (docs/language.md, "Kernel capabilities"). A `PortIo`
+    // or `Mmio` is held like a `Bytes`: its base is the second register. A
+    // `Dma` is the address of its page. The hosted target simulates ports as
+    // 32-bit cells and the MMIO window as 1 MiB of bytes, as the C prelude does.
+    let dk = ir_dev_kind(p, i);
+    let wr = ir_dev_writes(p, i);
+    let mut base = IR_NONE;
+    if dk == 3 {
+      base = ir_handle_arg(&mut f, c, &mut m, p, cg_arg(p, i, 0));
+    } else {
+      let v = ir_buf(&mut f, c, &mut m, p, cg_arg(p, i, 0), IRK_BYTES);
+      base = v.r1;
+    }
+    let off = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    let mut val = IR_NONE;
+    if wr {
+      val = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 2));
+    }
+    if f.failed {
+      return ir_none();
+    }
+    let addr = ir_reg(&mut f);
+    ir_emit(&mut f, IR_ADD, addr, base, off, 0, 0);
+    if dk == 1 && c.target == TARGET_KERNEL {
+      if wr {
+        ir_emit(&mut f, IR_POUT, IR_NONE, addr, val, dw, 0);
+        return ir_none();
+      }
+      let d = ir_reg(&mut f);
+      ir_emit(&mut f, IR_PIN, d, addr, 0, dw, 0);
+      return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+    }
+    let mut at = addr;
+    let mut cw = dw;
+    if dk == 1 {
+      // Port `n` is the 32-bit cell `n` of bst_rt_port_cell.
+      let cells = ir_reg(&mut f);
+      ir_emit(&mut f, IR_GLOBAL, cells, IRS_PORT_CELL, 1, 0, 0);
+      let two = ir_k(&mut f, 2);
+      let scaled = ir_reg(&mut f);
+      ir_emit(&mut f, IR_SHL, scaled, addr, two, 0, 0);
+      at = ir_reg(&mut f);
+      ir_emit(&mut f, IR_ADD, at, cells, scaled, 0, 0);
+      cw = 4;
+    } else if dk == 2 && c.target != TARGET_KERNEL {
+      let cells = ir_reg(&mut f);
+      ir_emit(&mut f, IR_GLOBAL, cells, IRS_MMIO_CELL, 1, 0, 0);
+      let mask = ir_k(&mut f, 1048575);
+      let low = ir_reg(&mut f);
+      ir_emit(&mut f, IR_AND, low, addr, mask, 0, 0);
+      at = ir_reg(&mut f);
+      ir_emit(&mut f, IR_ADD, at, cells, low, 0, 0);
+    }
+    if wr {
+      ir_emit(&mut f, IR_DEVW, IR_NONE, at, val, cw, 0);
+      return ir_none();
+    }
+    let d = ir_reg(&mut f);
+    ir_emit(&mut f, IR_DEVR, d, at, 0, cw, 0);
+    if cw > dw {
+      // A port cell is read cut to the width of the access.
+      let mut mv = 255;
+      if dw == 2 {
+        mv = 65535;
+      }
+      let mk = ir_k(&mut f, mv);
+      let cut = ir_reg(&mut f);
+      ir_emit(&mut f, IR_AND, cut, d, mk, 0, 0);
+      return IrVal { k: IRK_INT, r0: cut, r1: IR_NONE, t: 0 };
+    }
+    return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+  }
+  if name_is(p, i, "port_claim") || name_is(p, i, "mmio_claim") {
+    // The claim is its base and size (words 0 and 1); the capability it is
+    // taken from is empty, so only the two numbers matter.
+    let h = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 0));
+    let b = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    let cnt = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 2));
+    if f.failed || h == IR_NONE {
+      return ir_none();
+    }
+    if name_is(p, i, "mmio_claim") && c.target == TARGET_KERNEL {
+      // The window must not overlap RAM above 2 GiB.
+      ir_emit(&mut f, IR_MMCHK, IR_NONE, b, cnt, 0, 0);
+    }
+    let out = ir_new_val(&mut f, IRK_BYTES, 0, 0);
+    ir_emit(&mut f, IR_MOV, out.r0, cnt, 0, 0, 0);
+    ir_emit(&mut f, IR_MOV, out.r1, b, 0, 0, 0);
+    return out;
+  }
+  if name_is(p, i, "port_release") || name_is(p, i, "mmio_release") {
+    let h = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 0));
+    let v = ir_buf(&mut f, c, &mut m, p, cg_arg(p, i, 1), IRK_BYTES);
+    if f.failed || h == IR_NONE || v.k == 0 {
+      return ir_none();
+    }
+    return ir_none();
+  }
+  if name_is(p, i, "port_base") || name_is(p, i, "mmio_base") || name_is(p, i, "port_count") || name_is(p, i, "mmio_len") {
+    let v = ir_buf(&mut f, c, &mut m, p, cg_arg(p, i, 0), IRK_BYTES);
+    if f.failed {
+      return ir_none();
+    }
+    if name_is(p, i, "port_base") || name_is(p, i, "mmio_base") {
+      return IrVal { k: IRK_INT, r0: v.r1, r1: IR_NONE, t: 0 };
+    }
+    return IrVal { k: IRK_INT, r0: v.r0, r1: IR_NONE, t: 0 };
+  }
   if name_is(p, i, "pool_size") {
     let v = ir_buf(&mut f, c, &mut m, p, n.a, IRK_BYTES);
     return IrVal { k: IRK_INT, r0: v.r0, r1: IR_NONE, t: 0 };
@@ -1611,19 +1892,46 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let t = ir_int(&mut f, c, &mut m, p, n.a);
     return IrVal { k: IRK_INT, r0: t, r1: IR_NONE, t: 0 };
   }
-  if name_is(p, i, "frame_id") {
+  if name_is(p, i, "dma_lend") || name_is(p, i, "dma_take") || name_is(p, i, "dma_addr") {
+    // A page lent to a device stays where it is; the fence orders the
+    // accesses before and after.
     let fr = ir_int(&mut f, c, &mut m, p, n.a);
-    let d = ir_reg(&mut f);
-    if c.target == TARGET_KERNEL {
-      ir_emit(&mut f, IR_RT, d, fr, 0, IRS_FRAME_ID, 0);
-    } else {
-      let base = ir_reg(&mut f);
-      ir_emit(&mut f, IR_GLOBAL, base, IRS_POOL_BASE, 0, 0, 0);
-      let off = ir_reg(&mut f);
-      ir_emit(&mut f, IR_SUB, off, fr, base, 0, 0);
-      let sh = ir_k(&mut f, 12);
-      ir_emit(&mut f, IR_SHR, d, off, sh, 0, 0);
+    if f.failed {
+      return ir_none();
     }
+    if !name_is(p, i, "dma_addr") {
+      ir_emit(&mut f, IR_FENCE, IR_NONE, 0, 0, 0, 0);
+    }
+    let d = ir_reg(&mut f);
+    ir_emit(&mut f, IR_MOV, d, fr, 0, 0, 0);
+    return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+  }
+  if name_is(p, i, "frame_id") || name_is(p, i, "dma_id") {
+    let fr = ir_int(&mut f, c, &mut m, p, n.a);
+    let d = ir_page_id(&mut f, c, fr);
+    return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+  }
+  if name_is(p, i, "pt_lease_count") {
+    // The count of the table's page, read from the runtime's array of 32-bit
+    // counts (a load is an acquire on x86).
+    let t = ir_int(&mut f, c, &mut m, p, n.a);
+    if f.failed {
+      return ir_none();
+    }
+    let id = ir_page_id(&mut f, c, t);
+    let arr = ir_reg(&mut f);
+    if c.target == TARGET_KERNEL {
+      ir_emit(&mut f, IR_GLOBAL, arr, IRS_PT_LEASES, 0, 0, 0);
+    } else {
+      ir_emit(&mut f, IR_GLOBAL, arr, IRS_PT_LEASES, 1, 0, 0);
+    }
+    let two = ir_k(&mut f, 2);
+    let sc = ir_reg(&mut f);
+    ir_emit(&mut f, IR_SHL, sc, id, two, 0, 0);
+    let at = ir_reg(&mut f);
+    ir_emit(&mut f, IR_ADD, at, arr, sc, 0, 0);
+    let d = ir_reg(&mut f);
+    ir_emit(&mut f, IR_DEVR, d, at, 0, 4, 0);
     return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
   }
   if name_is(p, i, "pt_has") || name_is(p, i, "pt_writable") || name_is(p, i, "pt_accessible") {
@@ -2492,6 +2800,9 @@ fn ir_sym(i: u64) -> Str {
   if i == IRS_PAGE_AT { return "bst_rt_page_at"; }
   if i == IRS_FRAME_ID { return "bst_rt_frame_id"; }
   if i == IRS_POOL_BASE { return "bst_rt_pool_base"; }
+  if i == IRS_PORT_CELL { return "bst_rt_port_cell"; }
+  if i == IRS_MMIO_CELL { return "bst_rt_mmio_cell"; }
+  if i == IRS_PT_LEASES { return "bst_rt_pt_leases"; }
   return "bst_kernel_pml4";
 }
 
@@ -2692,6 +3003,34 @@ fn ir_print(out: &mut Vec[u64], f: &IrFn, m: &Mono, p: &Parser) {
     } else if q.op == IR_ZERO {
       w_s(&mut out, "zero ");
       ir_w_reg(&mut out, q.a);
+    } else if q.op == IR_FENCE {
+      w_s(&mut out, "fence");
+    } else if q.op == IR_DEVR || q.op == IR_PIN {
+      ir_w_reg(&mut out, q.d);
+      if q.op == IR_DEVR {
+        w_s(&mut out, " = devr");
+      } else {
+        w_s(&mut out, " = in");
+      }
+      w_num(&mut out, wrap_mul(8, q.c));
+      w_s(&mut out, " ");
+      ir_w_reg(&mut out, q.a);
+    } else if q.op == IR_MMCHK {
+      w_s(&mut out, "mmchk ");
+      ir_w_reg(&mut out, q.a);
+      w_s(&mut out, ", ");
+      ir_w_reg(&mut out, q.b);
+    } else if q.op == IR_DEVW || q.op == IR_POUT {
+      if q.op == IR_DEVW {
+        w_s(&mut out, "devw");
+      } else {
+        w_s(&mut out, "out");
+      }
+      w_num(&mut out, wrap_mul(8, q.c));
+      w_s(&mut out, " ");
+      ir_w_reg(&mut out, q.a);
+      w_s(&mut out, ", ");
+      ir_w_reg(&mut out, q.b);
     } else if q.op == IR_WRAP {
       ir_w_reg(&mut out, q.d);
       w_s(&mut out, " = wrap ");

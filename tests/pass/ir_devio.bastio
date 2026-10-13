@@ -1,0 +1,71 @@
+// expect-exit: 5
+// Device accesses through the IR: port, MMIO and DMA reads and writes of every
+// width, a claim and its release, and the fences around a lent page.
+struct Dev { io: PortIo, regs: Mmio }
+
+fn open(ports: &mut Ports, win: &mut MmioSpace, base: u64) -> Dev
+  requires base + 8 <= 65536
+  requires forall k: u64 :: base <= k && k < base + 8 ==> port_free(ports, k)
+  requires forall k: u64 :: 0xFED00000 <= k && k < 0xFED00000 + 1024 ==> mmio_free(win, k)
+  ensures port_count(result.io) == 8 && port_base(result.io) == base
+  ensures mmio_len(result.regs) == 1024 && mmio_base(result.regs) == 0xFED00000
+{
+  return Dev { io: port_claim(&mut ports, base, 8), regs: mmio_claim(&mut win, 0xFED00000, 1024) };
+}
+
+fn poke(d: &mut Dev, v: u8, w: u32)
+  requires port_count(d.io) == 8 && mmio_len(d.regs) == 1024 && mmio_base(d.regs) % 8 == 0
+{
+  pio_out8(&mut d.io, 3, v);
+  pio_out16(&mut d.io, 4, 0xBEEF);
+  mmio_write32(&mut d.regs, 0x10, w);
+  mmio_write64(&mut d.regs, 0x18, 7);
+}
+
+fn peek(d: &mut Dev) -> u64
+  requires port_count(d.io) == 8 && mmio_len(d.regs) == 1024 && mmio_base(d.regs) % 8 == 0
+{
+  let a = cast[u64](pio_in8(&mut d.io, 3));
+  let b = cast[u64](pio_in16(&mut d.io, 4));
+  let c = cast[u64](mmio_read32(&mut d.regs, 0x10));
+  let e = mmio_read64(&mut d.regs, 0x18);
+  return wrap_add(wrap_add(a, b), wrap_add(c, e));
+}
+
+fn dma_word(d: &mut Dma, v: u64) -> u64
+{
+  dma_write64(&mut d, 8, v);
+  dma_write8(&mut d, 1, 1);
+  return wrap_add(dma_read64(&mut d, 8), cast[u64](dma_read8(&mut d, 1)));
+}
+
+fn quiet(pool: &mut Pool) -> bool
+  requires pool_size(pool) > 5 && pool_has(pool, 5)
+  ensures forall k: u64 :: pool_has(pool, k) == pool_has(old(pool), k)
+{
+  let mut t = pt_new(pool_take(&mut pool, 5), 1);
+  let q = pt_lease_count(&mut t) == 0;
+  pool_give(&mut pool, pt_free(t));
+  return q;
+}
+
+fn main(ports: &mut Ports, win: &mut MmioSpace, pool: &mut Pool) -> u64 {
+  let mut d = open(&mut ports, &mut win, 0x3F8);
+  poke(&mut d, 3, 1);
+  let x = peek(&mut d);
+  port_release(&mut ports, d.io);
+  mmio_release(&mut win, d.regs);
+  if pool_size(pool) < 8 {
+    return 0;
+  }
+  let q = quiet(&mut pool);
+  let f = pool_take(&mut pool, 0);
+  let mut page = dma_lend(f);
+  let y = dma_word(&mut page, 4);
+  let back = dma_take(page);
+  pool_give(&mut pool, back);
+  if q && x == 0xBEEF + 11 && y == 5 {
+    return 5;
+  }
+  return 1;
+}
