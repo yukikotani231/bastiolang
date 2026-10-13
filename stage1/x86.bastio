@@ -5780,6 +5780,78 @@ fn x86_pop_regs(g: &mut X86, rs: X86St, w: u64) {
   }
 }
 
+/// stage1: `if a < b { x = 5; }` (no `else`, one assignment of a constant or
+/// of another register variable to a register variable, a plain comparison
+/// as the condition) becomes a compare and a `cmov`: the branch is
+/// unpredictable on text-like data and a conditional move is not.
+fn x86_try_cmov(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> bool {
+  let n = node_at(p.nodes, i);
+  if g.stage0 || n.c != 0 || n.b == 0 || next_of(p, n.b) != 0 {
+    return false;
+  }
+  let cn = node_at(p.nodes, x86_core(p, n.a));
+  if cn.kind != E_BIN || !x86_is_cmp(cn.v) {
+    return false;
+  }
+  let s = node_at(p.nodes, n.b);
+  if s.kind != S_ASSIGN {
+    return false;
+  }
+  let path = x86_lsegs(p, s.a);
+  let ok = vec_len(path) == 1;
+  let mut dst = 0;
+  if ok {
+    let root = x86_nmn(&mut g, p, u_at(path, 0));
+    let rk = x86_find(g, root);
+    if rk != 0 {
+      let rv = x86_var_at(g, wrap_sub(rk, 1));
+      if rv.k == XS_REG {
+        dst = rv.r0;
+      }
+    }
+  }
+  vec_free(path);
+  if dst == 0 {
+    return false;
+  }
+  let vn = node_at(p.nodes, s.b);
+  let mut src = 0;
+  let mut imm = false;
+  if vn.kind == E_INT && vn.v <= 2147483647 {
+    imm = true;
+  } else if vn.kind == E_BOOL {
+    imm = true;
+  } else if vn.kind == E_VAR && !x86_lends(&mut g, p, s.b) {
+    src = x86_var_reg(&mut g, p, s.b);
+    if src == 0 {
+      return false;
+    }
+  } else {
+    return false;
+  }
+  // The comparison must not involve a call or a place that needs the
+  // value computed first; `x86_compare` handles the operands as it does
+  // for a branch.
+  let ci = x86_core(p, n.a);
+  let signed = x86_signed(g, c, m, ci);
+  let op = x86_compare(&mut g, c, &mut m, p, cn.v, cn.a, cn.b);
+  if imm {
+    x86_t(&mut g, "mov $");
+    x86_n(&mut g, vn.v);
+    x86_t(&mut g, ", %eax");
+    x86_e(&mut g);
+    src = XR_RAX;
+  }
+  x86_t(&mut g, "cmov");
+  x86_t(&mut g, x86_cc(op, signed, true));
+  x86_t(&mut g, " ");
+  x86_r(&mut g, src);
+  x86_t(&mut g, ", ");
+  x86_r(&mut g, dst);
+  x86_e(&mut g);
+  return true;
+}
+
 fn x86_stmt(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
   let n = node_at(p.nodes, i);
   let k = n.kind;
@@ -5830,6 +5902,9 @@ fn x86_stmt(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
   } else if k == S_ASSIGN {
     x86_assign(&mut g, c, &mut m, p, i);
   } else if k == S_IF {
+    if x86_try_cmov(&mut g, c, &mut m, p, i) {
+      return;
+    }
     let l_else = x86_label(&mut g);
     let l_end = x86_label(&mut g);
     x86_branch(&mut g, c, &mut m, p, n.a, l_else, false);
