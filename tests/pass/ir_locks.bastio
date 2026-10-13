@@ -1,0 +1,75 @@
+// expect-exit: 102
+// Locks and atomics through the IR: the functions that take them by borrow are
+// lowered (`main` is not: it creates them).
+// A lock guards a buffer and an index into it. The struct invariant says the
+// index is in bounds; `locked` assumes it when the lock is taken and proves it
+// again before the lock is released. A function the lock calls sees only its
+// own precondition, so it states what it needs (here, through a spec fn).
+struct Ring { buf: Buf, at: u64 } invariant at < len(buf) invariant len(buf) == 4;
+
+spec fn ring_ok(r: &Ring) -> bool { r.at < len(r.buf) && len(r.buf) == 4 }
+
+fn bump(r: &mut Ring, by: u64) -> u64
+  requires ring_ok(r) && by < 10
+  ensures ring_ok(r) && result < 1000
+{
+  let x = get(r.buf, r.at);
+  if x <= 1000 {
+    r.buf = set(r.buf, r.at, x + by);
+  }
+  r.at = (r.at + 1) % 4;
+  return x % 1000;
+}
+
+fn read_all(r: &mut Ring) -> u64
+  requires ring_ok(r)
+  ensures ring_ok(r)
+{
+  return get(r.buf, 0) % 100 + get(r.buf, 1) % 100;
+}
+
+fn work(l: &Lock[Ring]) -> u64 ensures result < 2000 {
+  let a = locked(l, bump, 5);
+  let b = locked(l, bump, 7);
+  return a + b;
+}
+
+fn tick(a: &Atomic[u32]) -> u32 {
+  return atomic_wrap_add(a, 10);
+}
+
+fn flip(a: &Atomic[bool]) -> bool {
+  let was = atomic_swap(a, true);
+  atomic_store(a, false);
+  return was;
+}
+
+fn claim(a: &Atomic[u64], n: u64) -> bool {
+  let x = atomic_load(a);
+  return atomic_cas(a, x, n);
+}
+
+fn main() -> u64 {
+  let l = lock_new(Ring { buf: alloc(4), at: 0 });
+  let z = work(l);
+  assert z < 2000;
+  let s = locked(l, read_all);
+  let r = lock_end(l);
+  assert r.at < 4;
+  free(r.buf);
+  let ids = atomic_new(cast[u32](4294967290));
+  let first = tick(ids);
+  let next = atomic_load(ids);
+  let last = atomic_end(ids);
+  let flag = atomic_new(false);
+  let was = flip(flag);
+  let f = atomic_end(flag);
+  let cell = atomic_new(5);
+  let ok = claim(cell, 9);
+  let seen = atomic_end(cell);
+  let mut out = s % 100;
+  if first == 4294967290 && next == 4 && last == 4 { out = out + 20; }
+  if !was && !f { out = out + 30; }
+  if ok && seen == 9 { out = out + 40; }
+  return out;
+}
