@@ -1,0 +1,43 @@
+// expect-exit: 7
+// `try_alloc` and `try_balloc` hand back an empty buffer instead of
+// stopping the program when memory runs out, so a library called from C
+// can report the failure. A size the allocator cannot give (2^60 words
+// is 8 EiB) fails here on every machine.
+fn sum_or_zero(n: u64) -> u64
+  requires n <= 1152921504606846976
+  ensures result <= 3
+{
+  let b = try_alloc(n);
+  if len(b) != n {
+    free(b);
+    return 0;
+  }
+  let mut s = 0;
+  if n > 0 {
+    let c = set(b, 0, 3);
+    s = get(c, 0);
+    free(c);
+  } else {
+    free(b);
+  }
+  return s;
+}
+
+fn main() -> u64 {
+  let a = sum_or_zero(4);                      // 3
+  let z = sum_or_zero(1152921504606846976);    // out of memory: 0
+  let mut t = try_balloc(16);
+  let mut r = 0;
+  if blen(t) == 16 {
+    bset(&mut t, 15, 4);
+    r = cast[u64](bget(t, 15));
+  }
+  bfree(t);
+  let big = try_balloc(1152921504606846976);
+  let got = blen(big);
+  bfree(big);
+  if got != 0 {
+    return 100;
+  }
+  return a + z + r;
+}
