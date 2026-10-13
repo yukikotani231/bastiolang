@@ -24,7 +24,7 @@ import "iropt_inline.bastio";
 /// A frame holds the saved registers, the spilled values and the slots; an
 /// instruction count past this goes to the old generator (the allocator is
 /// quadratic).
-const IX_MAX_INS: u64 = 3000;
+const IX_MAX_INS: u64 = 40000;
 
 /// Where a value is: machine register `reg` (an XR_ number; k = IXK_REG),
 /// the frame word `off` words below %rbp (IXK_MEM) or a constant `imm`
@@ -959,6 +959,57 @@ fn ix_at(f: &IrFn, i: u64) -> IrIns {
   return IrIns { op: 0, d: IR_NONE, a: IR_NONE, b: IR_NONE, c: 0, ty: 0 };
 }
 
+/// `smp_run` (a PCALL with c == 13; q.ty packs the callee instance, the
+/// parameter count and which parameters are `&mut`): the block of shared
+/// words is at register `q.a`. The thunk (C calling convention, the block's
+/// address in %rdi) calls the function with the block's words and a token
+/// for each `&mut` parameter; the other processors run it, this one too, and
+/// it waits for them.
+fn ix_smp(out: &mut Vec[u64], g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, al: &IrAlloc, q: IrIns) {
+  let x = q.ty / 65536;
+  let np = (q.ty / 4096) % 16;
+  let mask = q.ty % 4096;
+  let k = g.nsmp;
+  g.nsmp = wrap_add(k, 1);
+  x86_sym(&mut g, m, p, x);
+  let fname = g.ln;
+  g.ln = vec_new[u64]();
+  w_s(&mut g.smp, "bst_rt_smp_thunk");
+  w_num(&mut g.smp, k);
+  w_s(&mut g.smp, ":\n\tpush %rbp\n\tmov %rsp, %rbp\n\tpush %rbx\n\tpush $0\n\tmov %rdi, %rbx\n");
+  let mut j = 0;
+  while j < np && j < 16 {
+    if (mask >> j) & 1 == 1 {
+      w_s(&mut g.smp, "\tlea -16(%rbp), %rax\n\tpush %rax\n");
+    } else {
+      w_s(&mut g.smp, "\tpush ");
+      w_num(&mut g.smp, wrap_mul(8, j));
+      w_s(&mut g.smp, "(%rbx)\n");
+    }
+    j = j + 1;
+  }
+  let na = x86_regargs(&mut g, c, &mut m, p, x);
+  if na == np {
+    j = 0;
+    while j < na {
+      w_s(&mut g.smp, "\tpop ");
+      w_s(&mut g.smp, x86_rname(x86_argreg(j)));
+      w_s(&mut g.smp, "\n");
+      j = j + 1;
+    }
+  }
+  w_s(&mut g.smp, "\tcall ");
+  w_append(&mut g.smp, fname);
+  w_s(&mut g.smp, "\n\tmov -8(%rbp), %rbx\n\tleave\n\tret\n\n");
+  vec_free(fname);
+  ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RDI));
+  w_s(&mut out, "\tpush %rdi\n\tpush %rdi\n\tmov %rdi, %rsi\n\tlea bst_rt_smp_thunk");
+  w_num(&mut out, k);
+  w_s(&mut out, "(%rip), %rdi\n\tcall bst_rt_smp_start\n\tmov (%rsp), %rdi\n\tcall bst_rt_smp_thunk");
+  w_num(&mut out, k);
+  w_s(&mut out, "\n\tcall bst_rt_smp_join\n\tadd $16, %rsp\n");
+}
+
 /// The body of the function: its instructions.
 fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, nuse: &Vec[u64], base: u64, rswap: bool, retoff: u64) {
   let n = vec_len(f.ins);
@@ -1079,6 +1130,8 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
         slotw = wrap_add(slotw, q.ty);
       }
       ix_call(&mut out, f, al, &mut g, c, &mut m, p, q, slotw);
+    } else if q.op == IR_PCALL && q.c == 13 {
+      ix_smp(&mut out, &mut g, c, &mut m, p, al, q);
     } else {
       let mut sw = slotw;
       if q.op == IR_SLOT {
@@ -1389,7 +1442,7 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   let xi = inst_at(m, x);
   let pos = ix_positions(&mut g, c, &mut m, p, x);
   let mut ok = vec_len(pos) == vec_len(f.params);
-  if ok && name_is(p, xi.def, "main") && vec_len(pos) > 0 {
+  if ok && name_is(p, xi.def, "main") && vec_len(pos) > 0 && g.target != TARGET_KERNEL {
     ok = false;
   }
   let rt = cg_ret_ty(&mut m, p, x);
