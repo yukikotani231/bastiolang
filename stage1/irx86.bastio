@@ -525,6 +525,25 @@ fn ix_norm(out: &mut Vec[u64], m: &Mono, t: u64) {
   }
 }
 
+/// Does `v` (bytes) end with `s`? If so, `cut` drops it.
+fn ix_ends_with(v: &Vec[u64], s: Str) -> bool {
+  let n = vec_len(v);
+  let l = slen(s);
+  if l > n {
+    return false;
+  }
+  let mut k = 0;
+  while k < l
+    invariant k <= slen(s) && slen(s) <= vlen(v)
+  {
+    if vec_get(v, n - l + k) != cast[u64](sget(s, k)) {
+      return false;
+    }
+    k = k + 1;
+  }
+  return true;
+}
+
 /// One instruction other than control flow and calls.
 fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: &Parser, q: IrIns, slotw: u64) {
   let op = q.op;
@@ -538,6 +557,22 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     let lb0 = ix_loc(al, q.b);
     if ld.k == IXK_REG && !wrap && !(lb0.k == IXK_REG && lb0.reg == ld.reg) {
       t = ld.reg;
+    }
+    if op == IR_ADD && !wrap && ld.k == IXK_REG && la.k == IXK_REG && lb0.k == IXK_IMM && ix_fits(lb0.imm) && la.reg != ld.reg {
+      // `d = a + imm` into another register: one lea instead of a move and an add.
+      w_s(&mut out, "\tlea ");
+      if lb0.imm <= 2147483647 {
+        w_num(&mut out, lb0.imm);
+      } else {
+        w_s(&mut out, "-");
+        w_num(&mut out, wrap_sub(0, lb0.imm));
+      }
+      w_s(&mut out, "(");
+      w_s(&mut out, x86_rname(la.reg));
+      w_s(&mut out, "), ");
+      w_s(&mut out, x86_rname(ld.reg));
+      w_s(&mut out, "\n");
+      return;
     }
     ix_mov(&mut out, la, ix_rl(t));
     let lb = ix_src(&mut out, lb0);
@@ -564,9 +599,21 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RAX));
     x86_clear(&mut g.body);
     x86_div_const(&mut g, lbq.imm, op == IR_REM);
+    // A remainder ends with its result in %rsi moved to %rax: take it from
+    // %rsi directly.
+    let tail = "\tmov %rsi, %rax\n";
+    let mut res = XR_RAX;
+    if ix_ends_with(g.body, tail) {
+      let mut k = 0;
+      while k < slen(tail) && vec_len(g.body) > 0 {
+        vec_pop(&mut g.body);
+        k = k + 1;
+      }
+      res = XR_RSI;
+    }
     w_append(&mut out, g.body);
     x86_clear(&mut g.body);
-    ix_finish(&mut out, al, q.d, XR_RAX);
+    ix_finish(&mut out, al, q.d, res);
   } else if op == IR_DIV || op == IR_REM || op == IR_SDIV || op == IR_SREM {
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RAX));
     ix_mov(&mut out, ix_loc(al, q.b), ix_rl(XR_RCX));
