@@ -1314,6 +1314,142 @@ fn ir_own(f: &mut IrFn, v: IrVal) -> IrVal {
   return IrVal { k: IRK_VEC, r0: slot, r1: IR_NONE, t: wrap_mul(v.t / 2, 2) };
 }
 
+/// Does expression `i` (or the list it heads, through `next`) mention the
+/// name `s..e`? An expression of a kind not known here counts as a mention.
+fn ir_mentions(p: &Parser, i: u64, s: u64, e: u64) -> bool {
+  let mut j = i;
+  while j != 0 {
+    let n = node_at(p.nodes, j);
+    let k = n.kind;
+    if k == E_VAR {
+      if same(p.src, n.s, n.e, s, e) {
+        return true;
+      }
+    } else if k == E_MUTBORROW {
+      let mut q = n.a;
+      while q != 0 {
+        let qn = node_at(p.nodes, q);
+        if same(p.src, qn.s, qn.e, s, e) {
+          return true;
+        }
+        q = qn.next;
+      }
+    } else if k == E_FIELD || k == E_IS || k == E_NOT || k == E_NEG || k == E_VARIANT {
+      if ir_mentions(p, n.a, s, e) {
+        return true;
+      }
+    } else if k == E_CALL {
+      if ir_mentions(p, n.a, s, e) {
+        return true;
+      }
+    } else if k == E_TAPP {
+      if ir_mentions(p, n.b, s, e) {
+        return true;
+      }
+    } else if k == E_BIN {
+      if ir_mentions(p, n.a, s, e) || ir_mentions(p, n.b, s, e) {
+        return true;
+      }
+    } else if k == E_SLIT {
+      let mut f = n.a;
+      while f != 0 {
+        let fi = node_at(p.nodes, f);
+        if ir_mentions(p, fi.a, s, e) {
+          return true;
+        }
+        f = fi.next;
+      }
+    } else if k != E_INT && k != E_BOOL && k != E_STR && k != E_BLOB {
+      return true;
+    }
+    j = n.next;
+  }
+  return false;
+}
+
+/// Does the statement list from `head` end in a `return` (or `unreachable`),
+/// so that nothing it did reaches what follows it?
+fn ir_ends_in_exit(p: &Parser, head: u64) -> bool {
+  let mut i = head;
+  let mut last = 0;
+  while i != 0 {
+    let n = node_at(p.nodes, i);
+    last = n.kind;
+    i = n.next;
+  }
+  return last == S_RETURN || last == S_UNREACHABLE;
+}
+
+/// Does the statement list from `head` use the name `bs..be` after
+/// assigning to something spelled with the name `rs..re` (its root)? `st`
+/// is 1 once an assignment to the root has run. A conservative scan: both
+/// branches count, a loop body is scanned twice.
+fn ir_use_after_assign(p: &Parser, head: u64, rs: u64, re: u64, bs: u64, be: u64, st: &mut u64) -> bool {
+  let mut i = head;
+  while i != 0 {
+    let n = node_at(p.nodes, i);
+    let k = n.kind;
+    if k == S_ASSIGN {
+      let r = node_at(p.nodes, n.a);
+      if st == 1 && (ir_mentions(p, n.b, bs, be) || same(p.src, r.s, r.e, bs, be)) {
+        return true;
+      }
+      if re >= rs && r.e >= r.s && r.e - r.s >= re - rs && same(p.src, r.s, wrap_add(r.s, re - rs), rs, re) {
+        st = 1;
+      }
+    } else if k == S_LET {
+      if st == 1 && ir_mentions(p, n.b, bs, be) {
+        return true;
+      }
+    } else if k == S_RETURN || k == S_ASSERT || k == S_EXPR {
+      if st == 1 && n.a != 0 && ir_mentions(p, n.a, bs, be) {
+        return true;
+      }
+    } else if k == S_IF {
+      if st == 1 && ir_mentions(p, n.a, bs, be) {
+        return true;
+      }
+      let mut s1 = st;
+      let mut s2 = st;
+      if ir_use_after_assign(p, n.b, rs, re, bs, be, &mut s1) || ir_use_after_assign(p, n.c, rs, re, bs, be, &mut s2) {
+        return true;
+      }
+      if (s1 == 1 && !ir_ends_in_exit(p, n.b)) || (s2 == 1 && !ir_ends_in_exit(p, n.c)) {
+        st = 1;
+      }
+    } else if k == S_WHILE {
+      if st == 1 && ir_mentions(p, n.a, bs, be) {
+        return true;
+      }
+      if ir_use_after_assign(p, n.c, rs, re, bs, be, &mut st) || ir_use_after_assign(p, n.c, rs, re, bs, be, &mut st) {
+        return true;
+      }
+    } else if k == S_MATCH {
+      if st == 1 && ir_mentions(p, n.a, bs, be) {
+        return true;
+      }
+      let mut out = st;
+      let mut a = n.b;
+      while a != 0 {
+        let arm = node_at(p.nodes, a);
+        let mut sa = st;
+        if ir_use_after_assign(p, arm.c, rs, re, bs, be, &mut sa) {
+          return true;
+        }
+        if sa == 1 && !ir_ends_in_exit(p, arm.c) {
+          out = 1;
+        }
+        a = arm.next;
+      }
+      st = out;
+    } else if st == 1 {
+      return true;
+    }
+    i = n.next;
+  }
+  return false;
+}
+
 /// A struct or enum held in memory, copied to a frame slot of ours.
 fn ir_own_place(f: &mut IrFn, c: &Checker, m: &Mono, p: &Parser, v: IrVal) -> IrVal {
   let mw = ir_ms(c, m, p, v.t);
@@ -3441,7 +3577,14 @@ fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
                 ir_fail(&mut f, "a binding of a variant without a payload");
               } else {
                 let view = IrVal { k: IRK_PLACE, r0: e.r0, r1: wrap_add(e.r1, 1), t: base_t(m, ft) };
-                let r = ir_own(&mut f, ir_rv(&mut f, c, m, p, view));
+                let mut r = ir_own(&mut f, ir_rv(&mut f, c, m, p, view));
+                let sc = node_at(p.nodes, n.a);
+                let mut st = 0;
+                if r.k == IRK_PLACE && ir_ms(c, m, p, r.t) > 0 && ir_use_after_assign(p, arm.c, sc.s, sc.e, b.s, b.e, &mut st) {
+                  // Still where the scrutinee is: an arm may assign to the
+                  // scrutinee, so the payload gets a slot of its own.
+                  r = ir_own_place(&mut f, c, m, p, r);
+                }
                 ir_bind(&mut f, b.s, b.e, r);
               }
             } else {
