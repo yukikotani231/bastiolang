@@ -7644,6 +7644,24 @@ fn x86_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
   let mut fb = vec_new[u64]();
   w_append(&mut fb, saves);
   x86_peephole(g.body, &mut fb, !g.stage0);
+  // stage1: a `jmp` to the return label right before it goes.
+  if !g.stage0 {
+    let mut jr = vec_new[u64]();
+    w_s(&mut jr, "\tjmp .L");
+    w_num(&mut jr, g.retl);
+    w_s(&mut jr, "\n");
+    let nj = vec_len(jr);
+    if vec_len(fb) >= nj && x86_tail_is(fb, jr) {
+      let mut cut = 0;
+      while cut < nj {
+        if vec_len(fb) > 0 {
+          vec_pop(&mut fb);
+        }
+        cut = cut + 1;
+      }
+    }
+    vec_free(jr);
+  }
   w_s(&mut fb, ".L");
   w_num(&mut fb, g.retl);
   w_s(&mut fb, ":\n");
@@ -7676,6 +7694,23 @@ fn x86_set_var(g: &mut X86, k: u64, s: X86St) {
     let v = vec_get(g.vars, k);
     vec_set(&mut g.vars, k, X86Var { nm: v.nm, k: s.k, o: s.o, r0: s.r0, r1: s.r1, r2: s.r2, ty: v.ty });
   }
+}
+
+/// Does `code` end with `tail`?
+fn x86_tail_is(code: &Vec[u64], tail: &Vec[u64]) -> bool {
+  let n = vec_len(tail);
+  let l = vec_len(code);
+  if l < n {
+    return false;
+  }
+  let mut k = 0;
+  while k < n {
+    if u_at(code, wrap_add(wrap_sub(l, n), k)) != u_at(tail, k) {
+      return false;
+    }
+    k = k + 1;
+  }
+  return true;
 }
 
 /// `main` with the System V ABI: builds the capability tokens `main` asks
