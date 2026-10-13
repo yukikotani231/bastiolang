@@ -372,6 +372,103 @@ fn ra_intervals(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> IrIntervals {
   return iv;
 }
 
+// ---- Spill costs ----
+
+/// 8 to the power `d` (at most 4).
+fn ra_pow8(d: u64) -> u64 {
+  if d == 0 { return 1; }
+  if d == 1 { return 8; }
+  if d == 2 { return 64; }
+  if d == 3 { return 512; }
+  return 4096;
+}
+
+/// How many loops contain each instruction (at most 4), where a loop is the
+/// stretch from a label to a jump or branch back to it.
+fn ra_depths(f: &IrFn) -> Vec[u64] {
+  let n = vec_len(f.ins);
+  let mut lpos = vec_new[u64]();
+  let mut k = 0;
+  while k < f.nlabel && k < 100000000 {
+    vec_push(&mut lpos, IR_NONE);
+    k = k + 1;
+  }
+  let mut depth = vec_new[u64]();
+  let mut i = 0;
+  while i < n {
+    vec_push(&mut depth, 0);
+    let q = vec_get(f.ins, i);
+    if q.op == IR_LABEL {
+      ra_set(&mut lpos, q.a, i);
+    }
+    i = i + 1;
+  }
+  let mut j = 0;
+  while j < n {
+    let q = vec_get(f.ins, j);
+    let mut t1 = IR_NONE;
+    let mut t2 = IR_NONE;
+    if q.op == IR_JMP {
+      t1 = q.a;
+    } else if q.op == IR_BR {
+      t1 = q.b;
+      t2 = q.c;
+    }
+    let mut w = 0;
+    while w < 2 {
+      let mut t = t1;
+      if w == 1 {
+        t = t2;
+      }
+      if t != IR_NONE && t < vec_len(lpos) {
+        let at = vec_get(lpos, t);
+        if at != IR_NONE && at < j {
+          let mut x = at;
+          while x <= j && x < n {
+            let dd = u_at(depth, x);
+            if dd < 4 {
+              ra_set(&mut depth, x, dd + 1);
+            }
+            x = x + 1;
+          }
+        }
+      }
+      w = w + 1;
+    }
+    j = j + 1;
+  }
+  vec_free(lpos);
+  return depth;
+}
+
+/// What it costs to keep each register in the frame: its reads and writes,
+/// each counted 8 times more for every loop around it.
+fn ra_costs(f: &IrFn, depth: &Vec[u64]) -> Vec[u64] {
+  let mut cost = vec_new[u64]();
+  let mut r = 0;
+  while r < f.nreg && r < 1000000000 {
+    vec_push(&mut cost, 0);
+    r = r + 1;
+  }
+  let mut i = 0;
+  while i < vec_len(f.ins) {
+    let q = vec_get(f.ins, i);
+    let mut rs = vec_new[u64]();
+    ra_reads(f, q, &mut rs);
+    ra_writes(q, &mut rs);
+    let w = ra_pow8(u_at(depth, i));
+    let mut j = 0;
+    while j < vec_len(rs) {
+      let x = vec_get(rs, j);
+      ra_set(&mut cost, x, wrap_add(u_at(cost, x), w));
+      j = j + 1;
+    }
+    vec_free(rs);
+    i = i + 1;
+  }
+  return cost;
+}
+
 // ---- Linear scan ----
 
 /// Allocates the registers of `f` with `ncallee` callee-saved and `ncaller`
@@ -449,6 +546,12 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
     }
     vec_free(ndef);
   }
+  let depth = ra_depths(f);
+  let cost = ra_costs(f, depth);
+  vec_free(depth);
+  // The register each machine register holds now (IR_NONE: none yet).
+  let mut occ_callee = vec_new[u64]();
+  let mut occ_caller = vec_new[u64]();
   // Registers by order of interval start.
   let mut order = vec_new[u64]();
   let mut pos = 0;
@@ -473,6 +576,16 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
   k = 0;
   while k < ncaller && k < 64 {
     vec_push(&mut busy_caller, 0);
+    k = k + 1;
+  }
+  k = 0;
+  while k < ncallee && k < 64 {
+    vec_push(&mut occ_callee, IR_NONE);
+    k = k + 1;
+  }
+  k = 0;
+  while k < ncaller && k < 64 {
+    vec_push(&mut occ_caller, IR_NONE);
     k = k + 1;
   }
   // For the emitter (`consts`): a register may take the machine register of
@@ -502,6 +615,7 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
         let until = vec_get(busy_caller, m);
         if until == 0 || until <= lo || (touch && lo > 0 && until <= lo + 1) {
           vec_set(&mut busy_caller, m, wrap_add(hi, 1));
+          ra_set(&mut occ_caller, m, v);
           ra_set(&mut al.cls, v, RA_CALLER);
           ra_set(&mut al.idx, v, m);
           placed = true;
@@ -515,6 +629,7 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
         let until = vec_get(busy_callee, m);
         if until == 0 || until <= lo || (touch && lo > 0 && until <= lo + 1) {
           vec_set(&mut busy_callee, m, wrap_add(hi, 1));
+          ra_set(&mut occ_callee, m, v);
           ra_set(&mut al.cls, v, RA_CALLEE);
           ra_set(&mut al.idx, v, m);
           if m + 1 > al.ncallee_used {
@@ -526,6 +641,55 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
       }
     }
     if !placed {
+      // Every register is taken: the cheapest register to keep in the frame
+      // gives up its machine register if it costs less than this one.
+      let cv = u_at(cost, v);
+      let mut best = IR_NONE;
+      let mut best_cost = cv;
+      let mut best_callee = true;
+      let mut best_m = 0;
+      let mut m = 0;
+      while m < vec_len(occ_callee) {
+        let o2 = u_at(occ_callee, m);
+        if o2 != IR_NONE && u_at(cost, o2) < best_cost && u_at(iv.hi, o2) > lo {
+          best = o2;
+          best_cost = u_at(cost, o2);
+          best_callee = true;
+          best_m = m;
+        }
+        m = m + 1;
+      }
+      if !crosses {
+        m = 0;
+        while m < vec_len(occ_caller) {
+          let o2 = u_at(occ_caller, m);
+          if o2 != IR_NONE && u_at(cost, o2) < best_cost && u_at(iv.hi, o2) > lo {
+            best = o2;
+            best_cost = u_at(cost, o2);
+            best_callee = false;
+            best_m = m;
+          }
+          m = m + 1;
+        }
+      }
+      if best != IR_NONE {
+        ra_set(&mut al.cls, best, RA_SPILL);
+        ra_set(&mut al.idx, best, al.nspill);
+        al.nspill = wrap_add(al.nspill, 1);
+        if best_callee {
+          ra_set(&mut busy_callee, best_m, wrap_add(hi, 1));
+          ra_set(&mut occ_callee, best_m, v);
+          ra_set(&mut al.cls, v, RA_CALLEE);
+        } else {
+          ra_set(&mut busy_caller, best_m, wrap_add(hi, 1));
+          ra_set(&mut occ_caller, best_m, v);
+          ra_set(&mut al.cls, v, RA_CALLER);
+        }
+        ra_set(&mut al.idx, v, best_m);
+        placed = true;
+      }
+    }
+    if !placed {
       ra_set(&mut al.cls, v, RA_SPILL);
       ra_set(&mut al.idx, v, al.nspill);
       al.nspill = wrap_add(al.nspill, 1);
@@ -533,6 +697,9 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
     o = o + 1;
   }
   vec_free(order);
+  vec_free(cost);
+  vec_free(occ_callee);
+  vec_free(occ_caller);
   vec_free(busy_callee);
   vec_free(busy_caller);
   vec_free(calls);
