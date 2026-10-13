@@ -1,0 +1,47 @@
+// expect-exit: 0
+// A buffer held in a field of a struct in memory, lent as `&mut` to a
+// function that replaces it: the struct must see the new buffer.
+struct Tabs { a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, h: u64, i: u64, j: u64, tab: Buf, other: Buf }
+
+fn grow(t: &mut Buf, n: u64) -> bool
+  requires n <= 1152921504606846976
+  ensures len(t) == len(old(t)) || len(t) == n
+{
+  if len(t) >= n {
+    return true;
+  }
+  let mut nt = try_alloc(n);
+  if len(nt) != n {
+    free(nt);
+    return false;
+  }
+  let mut i = 0;
+  while i < len(t)
+    invariant i <= len(t) && len(t) <= n && len(nt) == n
+  {
+    nt = set(nt, i, get(t, i));
+    i = i + 1;
+  }
+  let prev = t;
+  t = nt;
+  free(prev);
+  return true;
+}
+
+fn widen(s: &mut Tabs, n: u64) -> u64
+  requires n <= 1000 && len(s.tab) <= 1000
+{
+  if !grow(&mut s.tab, n) || !grow(&mut s.other, n) {
+    return 0;
+  }
+  return len(s.tab) + len(s.other);
+}
+
+fn main() -> u64 {
+  let mut s = Tabs { a: 0, b: 0, c: 0, d: 0, e: 0, f: 0, g: 0, h: 0, i: 0, j: 0, tab: alloc(2), other: alloc(3) };
+  let got = widen(&mut s, 40);
+  free(s.tab);
+  free(s.other);
+  if got == 80 { return 0; }
+  return 1;
+}
