@@ -88,6 +88,9 @@ const IR_BOOTINFO: u64 = 68; // d = the platform's boot_info answer to (a, b): a
 const IR_LOCKINC: u64 = 69;  // atomically adds one to the 32-bit count at address a
 const IR_LOCKDEC: u64 = 70;  // atomically subtracts one from the 32-bit count at address a; d = 1 if it reached zero, else 0
 const IR_COPYPAGE: u64 = 71; // copies the 4096 bytes at address b to address a
+const IR_XCHG: u64 = 72;     // d = the 64-bit word at address a, which b replaces (atomically)
+const IR_CAS: u64 = 73;      // d = 1 if the 64-bit word at address a was b and is now the register c, else 0 (atomically)
+const IR_LOCKACQ: u64 = 74;  // spins until it takes the lock word at address a (0 free, 1 held)
 const IR_POUT: u64 = 64;     // the low c bytes of b are written to I/O port a (`out`)
 
 const IR_NONE: u64 = 18446744073709551615;
@@ -320,6 +323,35 @@ fn ir_mw(c: &Checker, m: &Mono, p: &Parser, t: u64, depth: u64) -> u64 {
   return IR_NONE;
 }
 
+/// The word type of the atomic that argument `a` names, when `a` is a
+/// parameter of the function being lowered (0 otherwise, or when it is not
+/// an integer or bool).
+fn ir_atomic_ty(f: &IrFn, c: &Checker, m: &mut Mono, p: &Parser, a: u64) -> u64 {
+  let an = node_at(p.nodes, a);
+  if an.kind != E_VAR {
+    return 0;
+  }
+  let xd = inst_at(m, f.x);
+  let dn = node_at(p.nodes, xd.def);
+  let mut q = dn.a;
+  while q != 0 {
+    let qn = node_at(p.nodes, q);
+    if same(p.src, qn.s, qn.e, an.s, an.e) {
+      let pt = base_t(m, conv(&mut m, p, qn.a, f.x, q));
+      if kind_t(m, pt) != TY_ATOMIC {
+        return 0;
+      }
+      let t = base_t(m, inner_t(m, pt));
+      if is_int(m, t) || kind_t(m, t) == TY_BOOL {
+        return t;
+      }
+      return 0;
+    }
+    q = qn.next;
+  }
+  return 0;
+}
+
 /// The index of the page at address register `fr`: the runtime's lookup in
 /// the kernel, the offset into the pool when hosted.
 fn ir_page_id(f: &mut IrFn, c: &Checker, fr: u64) -> u64 {
@@ -402,7 +434,7 @@ fn ir_dev_kind(p: &Parser, i: u64) -> u64 {
 /// space, MMU, CPU) and the words that name a frame, a table, a DMA window or a
 /// page are carried around like integers.
 fn ir_is_handle(k: u64) -> bool {
-  return k == TY_SERIAL || k == TY_FRAME || k == TY_PT || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA || k == TY_MMU || k == TY_CPU || k == TY_LEASE || k == TY_SHARED || k == TY_DIRTY;
+  return k == TY_SERIAL || k == TY_FRAME || k == TY_PT || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA || k == TY_MMU || k == TY_CPU || k == TY_LEASE || k == TY_SHARED || k == TY_DIRTY || k == TY_LOCK || k == TY_ATOMIC;
 }
 
 /// The kind of values of type `t` in the subset, or 0.
@@ -1950,6 +1982,85 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let d = ir_page_id(&mut f, c, fr);
     return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
   }
+  if name_is(p, i, "atomic_load") || name_is(p, i, "atomic_store") || name_is(p, i, "atomic_swap")
+    || name_is(p, i, "atomic_cas") || name_is(p, i, "atomic_wrap_add") {
+    // An atomic is the address of one word on the heap; every access is
+    // sequentially consistent (`xchg` and `lock cmpxchg` are full barriers,
+    // a plain load suffices).
+    let t = ir_atomic_ty(f, c, &mut m, p, n.a);
+    if t == 0 {
+      ir_fail(&mut f, "an atomic that is not a parameter holding an integer or bool");
+      return ir_none();
+    }
+    let at = ir_handle_arg(&mut f, c, &mut m, p, n.a);
+    if f.failed {
+      return ir_none();
+    }
+    if name_is(p, i, "atomic_load") {
+      let zero = ir_k(&mut f, 0);
+      let d = ir_reg(&mut f);
+      ir_emit(&mut f, IR_LOAD, d, at, zero, 8, 0);
+      return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+    }
+    let v = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    if f.failed {
+      return ir_none();
+    }
+    if name_is(p, i, "atomic_store") || name_is(p, i, "atomic_swap") {
+      let d = ir_reg(&mut f);
+      ir_emit(&mut f, IR_XCHG, d, at, v, 0, 0);
+      if name_is(p, i, "atomic_store") {
+        return ir_none();
+      }
+      return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+    }
+    if name_is(p, i, "atomic_cas") {
+      let nw = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 2));
+      if f.failed {
+        return ir_none();
+      }
+      let d = ir_reg(&mut f);
+      ir_emit(&mut f, IR_CAS, d, at, v, nw, 0);
+      return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+    }
+    // wrap_add: a compare-and-swap loop, so the sum wraps at the width of
+    // the type.
+    let l_again = ir_label(&mut f);
+    let l_done = ir_label(&mut f);
+    let prev = ir_reg(&mut f);
+    let zero = ir_k(&mut f, 0);
+    ir_place(&mut f, l_again);
+    ir_emit(&mut f, IR_LOAD, prev, at, zero, 8, 0);
+    let sum = ir_reg(&mut f);
+    ir_emit(&mut f, IR_ADD, sum, prev, v, 1, t);
+    let ok = ir_reg(&mut f);
+    ir_emit(&mut f, IR_CAS, ok, at, prev, sum, 0);
+    ir_emit(&mut f, IR_BR, IR_NONE, ok, l_done, l_again, 0);
+    ir_place(&mut f, l_done);
+    return IrVal { k: IRK_INT, r0: prev, r1: IR_NONE, t: 0 };
+  }
+  if name_is(p, i, "locked") {
+    // `locked(l, f, args..)`: `f(&mut <the value in l>, args..)` with `l`
+    // held, a spin lock (`xchg` takes it, a store releases it). The lock is
+    // taken once the arguments are evaluated.
+    let l = ir_handle_arg(&mut f, c, &mut m, p, n.a);
+    let fnode = node_at(p.nodes, cg_arg(p, i, 1));
+    let def = plain_fn(p, fnode.s, fnode.e);
+    if def == 0 {
+      ir_fail(&mut f, "a locked call of a generic function");
+      return ir_none();
+    }
+    if f.failed {
+      return ir_none();
+    }
+    let callee = plain_inst(&mut m, def);
+    let r = ir_call_to(&mut f, c, &mut m, p, i, callee, IrVal { k: IRK_PLACE, r0: l, r1: 1, t: IR_NONE }, cg_arg(p, i, 2));
+    if !f.failed {
+      let zero = ir_k(&mut f, 0);
+      ir_emit(&mut f, IR_DEVW, IR_NONE, l, zero, 8, 0);
+    }
+    return r;
+  }
   if name_is(p, i, "cpu_tsc") {
     let h = ir_handle_arg(&mut f, c, &mut m, p, n.a);
     if f.failed || h == IR_NONE {
@@ -2305,6 +2416,12 @@ fn ir_call_to(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, calle
   if havepre {
     a = a0;
   }
+  // A `locked` call: the lock word is the place's base (its payload is the
+  // place), taken once the arguments are evaluated.
+  let mut lockreg = IR_NONE;
+  if pre.k == IRK_PLACE && pre.t == IR_NONE {
+    lockreg = pre.r0;
+  }
   let cdef = inst_at(m, callee);
   let cdn = node_at(p.nodes, cdef.def);
   let mut cq = cdn.a;
@@ -2442,6 +2559,7 @@ fn ir_call_to(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, calle
     // A struct with a Vec in it: the callee writes it to the space the call
     // reserves, and it stays there as a place.
     let slot = ir_reg(&mut f);
+    ir_lock_acquire(&mut f, lockreg);
     ir_emit(&mut f, IR_CALLM, slot, callee, first, count, rmw);
     ir_take_back(&mut f, lent);
     vec_free(lent);
@@ -2464,6 +2582,7 @@ fn ir_call_to(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, calle
       w = d.r1;
     }
     let slot = ir_reg(&mut f);
+    ir_lock_acquire(&mut f, lockreg);
     ir_emit(&mut f, IR_CALLM, slot, callee, first, count, w);
     ir_take_back(&mut f, lent);
     vec_free(lent);
@@ -2473,6 +2592,7 @@ fn ir_call_to(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, calle
     ir_load_words(&mut f, slot, 0, d.r0, w);
     return d;
   }
+  ir_lock_acquire(&mut f, lockreg);
   if ir_multi(d.k) {
     let mut second = IR_NONE;
     if d.r1 == 2 {
@@ -2485,6 +2605,13 @@ fn ir_call_to(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, calle
   ir_take_back(&mut f, lent);
   vec_free(lent);
   return d;
+}
+
+/// Takes the lock whose word is at address register `l` (IR_NONE: none).
+fn ir_lock_acquire(f: &mut IrFn, l: u64) {
+  if l != IR_NONE {
+    ir_emit(&mut f, IR_LOCKACQ, IR_NONE, l, 0, 0, 0);
+  }
 }
 
 /// Before a return: the lent buffers go back to their callers' words, since
@@ -3179,6 +3306,23 @@ fn ir_print(out: &mut Vec[u64], f: &IrFn, m: &Mono, p: &Parser) {
       ir_w_reg(&mut out, q.a);
       w_s(&mut out, ", ");
       ir_w_reg(&mut out, q.b);
+    } else if q.op == IR_XCHG {
+      ir_w_reg(&mut out, q.d);
+      w_s(&mut out, " = xchg ");
+      ir_w_reg(&mut out, q.a);
+      w_s(&mut out, ", ");
+      ir_w_reg(&mut out, q.b);
+    } else if q.op == IR_CAS {
+      ir_w_reg(&mut out, q.d);
+      w_s(&mut out, " = cas ");
+      ir_w_reg(&mut out, q.a);
+      w_s(&mut out, ", ");
+      ir_w_reg(&mut out, q.b);
+      w_s(&mut out, ", ");
+      ir_w_reg(&mut out, q.c);
+    } else if q.op == IR_LOCKACQ {
+      w_s(&mut out, "lockacq ");
+      ir_w_reg(&mut out, q.a);
     } else if q.op == IR_FENCE {
       w_s(&mut out, "fence");
     } else if q.op == IR_DEVR || q.op == IR_PIN {
