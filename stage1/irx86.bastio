@@ -930,7 +930,18 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
     }
     z = z + 1;
   }
-  let mut slotw = base;
+  // The slot area (`ix_share_slots`) is followed by the result areas of
+  // the calls that return into the frame.
+  let mut sarea = 0;
+  let mut si = 0;
+  while si < n {
+    let sq = vec_get(f.ins, si);
+    if sq.op == IR_SLOT && wrap_add(sq.a, sq.c) > sarea {
+      sarea = wrap_add(sq.a, sq.c);
+    }
+    si = si + 1;
+  }
+  let mut slotw = wrap_add(base, sarea);
   let mut i = 0;
   while i < n {
     let q = vec_get(f.ins, i);
@@ -1022,10 +1033,11 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       }
       ix_call(&mut out, f, al, &mut g, c, &mut m, p, q, slotw);
     } else {
+      let mut sw = slotw;
       if q.op == IR_SLOT {
-        slotw = wrap_add(slotw, q.c);
+        sw = wrap_add(base, wrap_add(q.a, q.c));
       }
-      ix_ins(&mut out, f, al, &mut g, m, p, q, slotw);
+      ix_ins(&mut out, f, al, &mut g, m, p, q, sw);
     }
     i = i + 1;
   }
@@ -1133,6 +1145,183 @@ fn ix_coalesce(f: &mut IrFn) {
   f.ins = out;
 }
 
+/// Gives the frame slots of `IR_SLOT` instructions their places in the
+/// slot area: `a` of each is its offset in words, and slots whose addresses
+/// are never live together share words. The result is the area's size. A slot
+/// is live from its first to its last use over its address and every copy of
+/// it (`MOV` and arithmetic); a slot whose address is stored or reaches any
+/// other instruction stays live for the whole function.
+fn ix_share_slots(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  let nr = f.nreg;
+  let bl = ra_blocks(f);
+  let lv = ra_live(f, bl);
+  let iv = ra_intervals(f, bl, lv);
+  // Slot number + 1 that each register may hold the address of (0: none).
+  let mut root = vec_new[u64]();
+  let mut r = 0;
+  while r < nr && r < 1000000000 {
+    vec_push(&mut root, 0);
+    r = r + 1;
+  }
+  let mut spos = vec_new[u64]();
+  let mut pinned = vec_new[u64]();
+  let mut i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    if q.op == IR_SLOT {
+      vec_push(&mut spos, i);
+      vec_push(&mut pinned, 0);
+      ra_set(&mut root, q.d, vec_len(spos));
+    }
+    i = i + 1;
+  }
+  let ns = vec_len(spos);
+  let mut round = 0;
+  let mut changed = true;
+  while changed && round < 64 {
+    changed = false;
+    i = 0;
+    while i < n {
+      let q = vec_get(f.ins, i);
+      let mut rs = vec_new[u64]();
+      ra_reads(f, q, &mut rs);
+      let mut j = 0;
+      while j < vec_len(rs) {
+        let x = vec_get(rs, j);
+        let sl = u_at(root, x);
+        if x < nr && sl != 0 {
+          if ra_is_binary(q.op) || q.op == IR_MOV {
+            let w = q.d;
+            if w < nr && w != IR_NONE {
+              let prev = u_at(root, w);
+              if prev == 0 {
+                ra_set(&mut root, w, sl);
+                changed = true;
+              } else if prev != sl {
+                ra_set(&mut pinned, wrap_sub(prev, 1), 1);
+                ra_set(&mut pinned, wrap_sub(sl, 1), 1);
+              }
+            }
+          } else if q.op == IR_STORE {
+            if x == q.d {
+              ra_set(&mut pinned, wrap_sub(sl, 1), 1);
+            }
+          } else if q.op != IR_LOAD && q.op != IR_CALL && q.op != IR_CALLM && q.op != IR_PCALL && q.op != IR_ZERO {
+            ra_set(&mut pinned, wrap_sub(sl, 1), 1);
+          }
+        }
+        j = j + 1;
+      }
+      vec_free(rs);
+      i = i + 1;
+    }
+    round = round + 1;
+  }
+  if changed {
+    // No fixed point: keep every slot to itself.
+    let mut k = 0;
+    while k < ns {
+      ra_set(&mut pinned, k, 1);
+      k = k + 1;
+    }
+  }
+  let mut lo = vec_new[u64]();
+  let mut hi = vec_new[u64]();
+  let mut k = 0;
+  while k < ns {
+    if u_at(pinned, k) != 0 {
+      vec_push(&mut lo, 0);
+      vec_push(&mut hi, n);
+    } else {
+      vec_push(&mut lo, n);
+      vec_push(&mut hi, 0);
+    }
+    k = k + 1;
+  }
+  r = 0;
+  while r < nr && r < 1000000000 {
+    let sl = u_at(root, r);
+    if sl != 0 && u_at(iv.lo, r) != IR_NONE && u_at(pinned, wrap_sub(sl, 1)) == 0 {
+      let t = wrap_sub(sl, 1);
+      if u_at(iv.lo, r) < u_at(lo, t) {
+        ra_set(&mut lo, t, u_at(iv.lo, r));
+      }
+      if u_at(iv.hi, r) > u_at(hi, t) {
+        ra_set(&mut hi, t, u_at(iv.hi, r));
+      }
+    }
+    r = r + 1;
+  }
+  // First fit: the lowest offset where no slot live at the same time
+  // overlaps.
+  let mut off = vec_new[u64]();
+  let mut size = vec_new[u64]();
+  k = 0;
+  while k < ns {
+    let sq = ix_at(f, u_at(spos, k));
+    vec_push(&mut size, sq.c);
+    vec_push(&mut off, 0);
+    k = k + 1;
+  }
+  let mut area = 0;
+  k = 0;
+  while k < ns {
+    // Candidates: 0 and the end of every slot placed before.
+    let mut best = IR_NONE;
+    let mut cand = 0;
+    let mut cn = 0;
+    while cn <= k && cn < 100000 {
+      if cn > 0 {
+        let pj = wrap_sub(cn, 1);
+        cand = wrap_add(u_at(off, pj), u_at(size, pj));
+      }
+      let mut fits = true;
+      let mut t = 0;
+      while t < k {
+        if u_at(lo, k) <= u_at(hi, t) && u_at(lo, t) <= u_at(hi, k) {
+          let a0 = u_at(off, t);
+          let a1 = wrap_add(a0, u_at(size, t));
+          let b1 = wrap_add(cand, u_at(size, k));
+          if cand < a1 && a0 < b1 {
+            fits = false;
+          }
+        }
+        t = t + 1;
+      }
+      if fits && cand < best {
+        best = cand;
+      }
+      cn = cn + 1;
+    }
+    ra_set(&mut off, k, best);
+    let e = wrap_add(best, u_at(size, k));
+    if e > area {
+      area = e;
+    }
+    let pos = u_at(spos, k);
+    if pos < vec_len(f.ins) {
+      let mut q = vec_get(f.ins, pos);
+      q.a = best;
+      vec_set(&mut f.ins, pos, q);
+    }
+    k = k + 1;
+  }
+  vec_free(off);
+  vec_free(size);
+  vec_free(lo);
+  vec_free(hi);
+  vec_free(spos);
+  vec_free(pinned);
+  vec_free(root);
+  vec_free(iv.lo);
+  vec_free(iv.hi);
+  vec_free(lv.inn);
+  vec_free(lv.out);
+  vec_free(bl);
+  return area;
+}
+
 /// Writes function instance `x` from its IR, to `g.out`. False (nothing
 /// written) when the IR does not cover it or the convention does not match.
 fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> bool {
@@ -1174,13 +1363,12 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   let al = ra_alloc_const(f, 5, 4);
   let nuse = ix_uses(f);
   // The frame: saved registers, spills, slots.
-  let mut slots = 0;
+  let area = ix_share_slots(&mut f);
+  let mut slots = area;
   k = 0;
   while k < vec_len(f.ins) {
     let q = vec_get(f.ins, k);
-    if q.op == IR_SLOT {
-      slots = wrap_add(slots, q.c);
-    } else if q.op == IR_CALLM {
+    if q.op == IR_CALLM {
       slots = wrap_add(slots, q.ty);
     }
     k = k + 1;

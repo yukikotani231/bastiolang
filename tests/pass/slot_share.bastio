@@ -1,0 +1,37 @@
+// expect-exit: 0
+// Struct values that live in frame slots one after another and in a loop:
+// the native IR backend lets slots whose addresses are never live together
+// share frame words, so each phase must see only its own values.
+struct Pair { a: u64, b: u64, c: u64, d: u64 }
+
+fn make(x: u64) -> Pair {
+  return Pair { a: x, b: wrap_add(x, 1), c: wrap_add(x, 2), d: wrap_add(x, 3) };
+}
+
+fn sum(p: Pair) -> u64 {
+  return wrap_add(wrap_add(p.a, p.b), wrap_add(p.c, p.d));
+}
+
+fn main() -> u64 {
+  let first = make(10);
+  let s1 = sum(first);
+  let second = make(100);
+  let s2 = sum(second);
+  let mut total = 0;
+  let mut i = 0;
+  while i < 20
+    invariant i <= 20
+  {
+    let mid = make(i);
+    let t = make(wrap_add(i, 1));
+    total = wrap_add(total, wrap_add(sum(mid), sum(t)));
+    i = i + 1;
+  }
+  if s1 != 46 || s2 != 406 {
+    return 1;
+  }
+  if total != 1840 {
+    return 2;
+  }
+  return 0;
+}
