@@ -2350,6 +2350,62 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     }
     return out;
   }
+  if name_is(p, i, "smp_run") {
+    // `smp_run(f, args..)`: the shared arguments go one word each into a
+    // block in the frame; the emitter writes the thunk that calls `f` with
+    // them (and a token for each `&mut` parameter) on every processor. Only
+    // one-word arguments (locks, atomics) are handled. `ty` packs the
+    // instance, the parameter count and which parameters are `&mut`.
+    if c.target != TARGET_KERNEL {
+      ir_fail(&mut f, "an smp_run outside the kernel");
+      return ir_none();
+    }
+    let fnode = node_at(p.nodes, cg_arg(p, i, 0));
+    let fd = plain_fn(p, fnode.s, fnode.e);
+    if fd == 0 {
+      ir_fail(&mut f, "an smp_run of something that is not a plain function");
+      return ir_none();
+    }
+    let x = plain_inst(&mut m, fd);
+    let xi = inst_at(m, x);
+    let ps = fn_params(&mut m, p, xi.def, x);
+    let np = vec_len(ps);
+    if np > 12 {
+      ir_fail(&mut f, "an smp_run with many parameters");
+      vec_free(ps);
+      return ir_none();
+    }
+    let slot = ir_reg(&mut f);
+    ir_emit(&mut f, IR_SLOT, slot, 0, 0, wrap_add(np, 1), 0);
+    let mut mask = 0;
+    let mut a = cg_arg(p, i, 1);
+    let mut j = 0;
+    while a != 0 && j < np && !f.failed {
+      let pt = u_at(ps, j);
+      if kind_t(m, pt) == TY_MUTREF {
+        mask = wrap_add(mask, 1 << j);
+      } else {
+        let w = ir_mw(c, m, p, pt, 0);
+        let v = ir_vexpr(&mut f, c, &mut m, p, a);
+        if !f.failed {
+          if w != 1 || (v.k != IRK_INT && v.k != IRK_BOX) {
+            ir_fail(&mut f, "an smp_run argument of more than one word");
+          } else {
+            ir_hdr_store(&mut f, slot, j, v.r0);
+          }
+        }
+      }
+      a = next_of(p, a);
+      j = j + 1;
+    }
+    vec_free(ps);
+    if f.failed {
+      return ir_none();
+    }
+    let d = ir_reg(&mut f);
+    ir_emit(&mut f, IR_PCALL, d, slot, slot, 13, wrap_add(wrap_mul(x, 65536), wrap_add(wrap_mul(np, 4096), mask)));
+    return ir_none();
+  }
   if name_is(p, i, "mmu_exit") {
     // Drops the count only once this processor no longer uses the table.
     if c.target != TARGET_KERNEL {
