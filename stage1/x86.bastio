@@ -4774,7 +4774,17 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_n(&mut g, w);
     x86_t(&mut g, ", %edi");
     x86_e(&mut g);
-    x86_es(&mut g, "call bst_rt_alloc");
+    if !g.stage0 && g.target == TARGET_HOSTED && w >= 1 && w <= 8 {
+      // `malloc` and a few stores of zero cost far less than `calloc`.
+      x86_es(&mut g, "call bst_rt_alloc_raw");
+      let mut z = 0;
+      while z < w {
+        x86_es_off(&mut g, "movq $0, ", z, "(%rax)");
+        z = z + 1;
+      }
+    } else {
+      x86_es(&mut g, "call bst_rt_alloc");
+    }
     x86_push(&mut g, x86_reg(XR_RAX));
     let mark0 = g.depth;
     x86_val_into(&mut g, c, &mut m, p, a0, x86_dst(XD_HEAP, mark0, 0));
