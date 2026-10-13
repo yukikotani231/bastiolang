@@ -1565,8 +1565,30 @@ fn x86_overlap(g: &X86, x: u64, y: u64) -> bool {
   return false;
 }
 
-fn x86_bind(g: &mut X86, m: &Mono, id: u64, t: u64) {
-  let sz = x86_rsize(m, t);
+/// stage1: a value of type `t` (or a reference to one) that takes two
+/// words, the tag and a one-word payload, is held in two registers.
+fn x86_enum2(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
+  if g.stage0 || t == 0 {
+    return false;
+  }
+  let mut u = t;
+  if kind_t(m, u) == TY_REF {
+    u = inner_t(m, u);
+  }
+  return kind_t(m, u) == TY_ENUM && x86_words(&mut g, c, m, p, u) == 2;
+}
+
+/// `x86_rsize`, and two for what `x86_enum2` says.
+fn x86_rsize2(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, t: u64) -> u64 {
+  let s = x86_rsize(m, t);
+  if s == 0 && x86_enum2(&mut g, c, m, p, t) {
+    return 2;
+  }
+  return s;
+}
+
+fn x86_bind(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, id: u64, t: u64) {
+  let sz = x86_rsize2(&mut g, c, m, p, t);
   let mut n = x86_name_at(g, id);
   if sz != 0 && n.size == 0 {
     n.size = sz;
@@ -1685,7 +1707,7 @@ fn x86_acc_call(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst
         } else if kind_t(m, pt) == TY_MUTREF {
           x86_set_bad(&mut g, pid);
         } else {
-          x86_bind(&mut g, m, pid, pt);
+          x86_bind(&mut g, c, m, p, pid, pt);
         }
         x86_add_use(&mut g, pid, w);
       }
@@ -1734,7 +1756,7 @@ fn x86_acc_call(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst
 /// passed by value, and no parameter of `x` is `&mut` (through which the
 /// body could change the variable): the body reads a copy in registers.
 fn x86_own_regs(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, an: Node, pt: u64, pre: u64) -> bool {
-  if g.stage0 || x86_rsize(m, pt) < 2 || x86_byaddr(&mut g, c, m, p, pt) {
+  if g.stage0 || x86_rsize2(&mut g, c, m, p, pt) < 2 || x86_byaddr(&mut g, c, m, p, pt) {
     return false;
   }
   let xi = inst_at(m, x);
@@ -1820,7 +1842,7 @@ fn x86_acc_stmts(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, head: u64, 
     let k = n.kind;
     if k == S_LET {
       let id = x86_nm(&mut g, p, pre, n.s, n.e);
-      x86_bind(&mut g, m, id, let_ty(m, env, i));
+      x86_bind(&mut g, c, m, p, id, let_ty(m, env, i));
       x86_add_use(&mut g, id, w);
       if g.stage0 {
         x86_declare(&mut g, id);
@@ -1873,14 +1895,25 @@ fn x86_acc_stmts(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, head: u64, 
       }
     } else if k == S_MATCH {
       x86_acc_top(&mut g, c, &mut m, p, n.a, w, env, pre);
+      // stage1: a payload may be read from the registers of a variable
+      // scrutinee, which then stay taken as long as the payload is used.
+      let sn = node_at(p.nodes, n.a);
+      let mut sid = 0;
+      if !g.stage0 && sn.kind == E_VAR {
+        sid = x86_resolve(g, x86_nm(&mut g, p, pre, sn.s, sn.e));
+      }
       let mut a = n.b;
       while a != 0 {
         let arm = node_at(p.nodes, a);
-        // A payload is bound in place, never in a register.
+        // A payload is bound in place, or in the scrutinee's registers.
         if arm.a != 0 {
           let b = node_at(p.nodes, arm.a);
           let id = x86_nm(&mut g, p, pre, b.s, b.e);
-          x86_set_bad(&mut g, id);
+          if sid != 0 && sid != id && !span_is(p, b.s, b.e, "_") {
+            x86_set_alias(&mut g, id, sid);
+          } else {
+            x86_set_bad(&mut g, id);
+          }
         }
         let outer = x86_enter(&mut g);
         x86_acc_stmts(&mut g, c, &mut m, p, arm.c, w, env, pre);
@@ -1924,7 +1957,7 @@ fn x86_assign_regs(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
     if kind_t(m, pt) == TY_MUTREF {
       x86_set_bad(&mut g, id);
     } else {
-      x86_bind(&mut g, m, id, pt);
+      x86_bind(&mut g, c, m, p, id, pt);
     }
     q = qn.next;
   }
@@ -6128,6 +6161,11 @@ fn x86_match(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
   // binding, is matched where it is.
   let mut o = 0;
   let mut in_place = false;
+  // stage1: a scrutinee held in two registers is matched in them, and a
+  // scalar payload is read from the second.
+  let mut rg = false;
+  let mut rr0 = 0;
+  let mut rr1 = 0;
   if x86_is_place(p, n.a) {
     let mut changed = vec_new[u64]();
     let mut a = n.b;
@@ -6154,9 +6192,31 @@ fn x86_match(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
       o = st.o;
       in_place = true;
     }
+    if !g.stage0 && w == 2 && kind_of(p, n.a) == E_VAR && !has_id(changed, root) && !payload_changed {
+      let sv = x86_var(&mut g, p, n.a);
+      if sv.k == XS_REGS {
+        rg = true;
+        rr0 = sv.r0;
+        rr1 = sv.r1;
+        let mut ra = n.b;
+        while ra != 0 {
+          let arm = node_at(p.nodes, ra);
+          if arm.v != PAT_WILD && arm.a != 0 {
+            let v = cg_variant(m, p, x, arm.s2, arm.e2);
+            let ft = fld_ty(c, x, v);
+            if !x86_is_scalar_t(m, ft) && kind_t(m, ft) != TY_BOX {
+              rg = false;
+            }
+          }
+          ra = arm.next;
+        }
+      }
+    }
     vec_free(changed);
   }
-  if !in_place {
+  if rg {
+    in_place = true;
+  } else if !in_place {
     o = x86_slot(&mut g, w);
     x86_val_into(&mut g, c, &mut m, p, n.a, x86_dst(XD_FRAME, o, 0));
   }
@@ -6175,7 +6235,11 @@ fn x86_match(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
         x86_t(&mut g, "cmpq $");
         x86_n(&mut g, v);
         x86_t(&mut g, ", ");
-        x86_o(&mut g, x86_frame_op(o));
+        if rg {
+          x86_o(&mut g, x86_reg(rr0));
+        } else {
+          x86_o(&mut g, x86_frame_op(o));
+        }
         x86_e(&mut g);
         x86_jump(&mut g, "jne", l_next);
       }
@@ -6184,7 +6248,11 @@ fn x86_match(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
         if !span_is(p, b.s, b.e, "_") {
           // The payload is bound where it lies in the copy.
           let id = x86_nm(&mut g, p, g.pre, b.s, b.e);
-          x86_bindv(&mut g, id, x86_st(XS_SLOT, wrap_add(o, 8), 0, 0, 0), fld_ty(c, x, v));
+          if rg {
+            x86_bindv(&mut g, id, x86_st(XS_REG, 0, rr1, 0, 0), fld_ty(c, x, v));
+          } else {
+            x86_bindv(&mut g, id, x86_st(XS_SLOT, wrap_add(o, 8), 0, 0, 0), fld_ty(c, x, v));
+          }
         }
       }
     }
