@@ -1,0 +1,87 @@
+// expect-exit: 6
+// Page-table edits in functions the IR path writes (`main` holds the Pool).
+fn map(t: &mut PageTable, i: u64, f: Frame, w: bool)
+  requires pt_level(t) == 1 && i < 512 && !pt_used(t, i) && pt_leases(t) == 0 && !pt_shared(t, i)
+  ensures pt_level(t) == 1 && pt_leases(t) == 0 && pt_used(t, i) && !pt_shared(t, i)
+{
+  pt_put_frame(&mut t, i, f, w);
+}
+
+fn unmap(t: &mut PageTable, i: u64) -> Frame
+  requires pt_level(t) == 1 && i < 512 && pt_used(t, i) && pt_leases(t) == 0 && !pt_shared(t, i)
+  ensures pt_level(t) == 1 && !pt_used(t, i) && pt_leases(t) == 0 && !pt_shared(t, i)
+{
+  return pt_take_frame(&mut t, i);
+}
+
+fn show(t: &mut PageTable, i: u64, a: u64)
+  requires pt_level(t) == 1 && i < 512 && a <= 2 && pt_used(t, i) && pt_leases(t) == 0 && !pt_shared(t, i)
+  ensures pt_level(t) == 1 && pt_used(t, i) && pt_leases(t) == 0 && !pt_shared(t, i)
+{
+  pt_set_access(&mut t, i, a);
+}
+
+fn flags(t: &PageTable, i: u64) -> u64
+  requires pt_level(t) == 1 && i < 512
+{
+  let mut r = 0;
+  if pt_has(t, i) {
+    r = r + 1;
+  }
+  if pt_accessible(t, i) {
+    r = r + 2;
+  }
+  if pt_writable(t, i) {
+    r = r + 4;
+  }
+  return r;
+}
+
+fn main(pool: &mut Pool) -> u64 {
+  if pool_size(pool) < 2 {
+    return 99;
+  }
+  let mut t = pt_new(pool_take(&mut pool, 0), 1);
+  map(&mut t, 7, pool_take(&mut pool, 1), true);
+  let mut r = 0;
+  if flags(t, 7) == 7 && flags(t, 9) == 0 {
+    r = r + 1;
+  }
+  show(&mut t, 7, 0);
+  if flags(t, 7) == 1 {
+    r = r + 1;
+  }
+  show(&mut t, 7, 1);
+  if flags(t, 7) == 3 {
+    r = r + 1;
+  }
+  show(&mut t, 7, 2);
+  if flags(t, 7) == 7 {
+    r = r + 1;
+  }
+  show(&mut t, 7, 0);
+  let f = unmap(&mut t, 7);
+  if flags(t, 7) == 0 {
+    r = r + 1;
+  }
+  map(&mut t, 7, f, false);
+  if flags(t, 7) == 3 {
+    r = r + 1;
+  }
+  let mut i = 0;
+  while i < 512
+    invariant i <= 512 && pt_level(t) == 1
+    invariant forall j: u64 :: j < i ==> !pt_used(t, j)
+  {
+    if pt_has(t, i) {
+      if pt_shared(t, i) {
+        shared_drop(&mut pool, pt_take_shared(&mut t, i));
+      } else {
+        pool_give(&mut pool, pt_take_frame(&mut t, i));
+      }
+    }
+    i = i + 1;
+  }
+  pool_give(&mut pool, pt_free(t));
+  return r;
+}
