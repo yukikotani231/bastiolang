@@ -1011,7 +1011,7 @@ fn ix_smp(out: &mut Vec[u64], g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser
 }
 
 /// The body of the function: its instructions.
-fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, nuse: &Vec[u64], base: u64, rswap: bool, retoff: u64) {
+fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, nuse: &Vec[u64], moff: &Vec[u64], base: u64, rswap: bool, retoff: u64) {
   let n = vec_len(f.ins);
   // The position after each label (0: no such label).
   let mut lpos = vec_new[u64]();
@@ -1069,18 +1069,9 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
     }
     z = z + 1;
   }
-  // The slot area (`ix_share_slots`) is followed by the result areas of
-  // the calls that return into the frame.
-  let mut sarea = 0;
-  let mut si = 0;
-  while si < n {
-    let sq = vec_get(f.ins, si);
-    if sq.op == IR_SLOT && wrap_add(sq.a, sq.c) > sarea {
-      sarea = wrap_add(sq.a, sq.c);
-    }
-    si = si + 1;
-  }
-  let mut slotw = wrap_add(base, sarea);
+  // Slots and the result areas of calls that return into the frame share
+  // one area (`ix_share_slots`).
+  let slotw = base;
   let mut i = 0;
   while i < n {
     let q = vec_get(f.ins, i);
@@ -1182,10 +1173,11 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
     } else if q.op == IR_UNREACH {
       w_s(&mut out, "\tud2\n");
     } else if q.op == IR_CALL || q.op == IR_CALLM {
+      let mut sw = slotw;
       if q.op == IR_CALLM {
-        slotw = wrap_add(slotw, q.ty);
+        sw = wrap_add(base, wrap_add(u_at(moff, i), q.ty));
       }
-      ix_call(&mut out, f, al, &mut g, c, &mut m, p, q, slotw);
+      ix_call(&mut out, f, al, &mut g, c, &mut m, p, q, sw);
     } else if q.op == IR_PCALL && q.c == 13 {
       ix_smp(&mut out, &mut g, c, &mut m, p, al, q);
     } else {
@@ -1308,7 +1300,7 @@ fn ix_coalesce(f: &mut IrFn) {
 /// is live from its first to its last use over its address and every copy of
 /// it (`MOV` and arithmetic); a slot whose address is stored or reaches any
 /// other instruction stays live for the whole function.
-fn ix_share_slots(f: &mut IrFn) -> u64 {
+fn ix_share_slots(f: &mut IrFn, moff: &mut Vec[u64]) -> u64 {
   let n = vec_len(f.ins);
   let nr = f.nreg;
   let bl = ra_blocks(f);
@@ -1321,15 +1313,47 @@ fn ix_share_slots(f: &mut IrFn) -> u64 {
     vec_push(&mut root, 0);
     r = r + 1;
   }
+  // How many instructions write each register: the result area of a call
+  // is shared only when its register holds nothing else.
+  let mut ndefs = vec_new[u64]();
+  r = 0;
+  while r < nr && r < 1000000000 {
+    vec_push(&mut ndefs, 0);
+    r = r + 1;
+  }
   let mut spos = vec_new[u64]();
   let mut pinned = vec_new[u64]();
   let mut i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    let mut ws = vec_new[u64]();
+    ra_writes(q, &mut ws);
+    let mut j = 0;
+    while j < vec_len(ws) {
+      let w = vec_get(ws, j);
+      if w < nr {
+        ra_set(&mut ndefs, w, wrap_add(u_at(ndefs, w), 1));
+      }
+      j = j + 1;
+    }
+    vec_free(ws);
+    i = i + 1;
+  }
+  i = 0;
   while i < n {
     let q = vec_get(f.ins, i);
     if q.op == IR_SLOT {
       vec_push(&mut spos, i);
       vec_push(&mut pinned, 0);
       ra_set(&mut root, q.d, vec_len(spos));
+    } else if q.op == IR_CALLM {
+      vec_push(&mut spos, i);
+      if q.d < nr && u_at(ndefs, q.d) == 1 {
+        vec_push(&mut pinned, 0);
+        ra_set(&mut root, q.d, vec_len(spos));
+      } else {
+        vec_push(&mut pinned, 1);
+      }
     }
     i = i + 1;
   }
@@ -1417,7 +1441,11 @@ fn ix_share_slots(f: &mut IrFn) -> u64 {
   k = 0;
   while k < ns {
     let sq = ix_at(f, u_at(spos, k));
-    vec_push(&mut size, sq.c);
+    if sq.op == IR_CALLM {
+      vec_push(&mut size, sq.ty);
+    } else {
+      vec_push(&mut size, sq.c);
+    }
     vec_push(&mut off, 0);
     k = k + 1;
   }
@@ -1459,11 +1487,16 @@ fn ix_share_slots(f: &mut IrFn) -> u64 {
     let pos = u_at(spos, k);
     if pos < vec_len(f.ins) {
       let mut q = vec_get(f.ins, pos);
-      q.a = best;
-      vec_set(&mut f.ins, pos, q);
+      if q.op == IR_SLOT {
+        q.a = best;
+        vec_set(&mut f.ins, pos, q);
+      } else {
+        ra_set(&mut moff, pos, best);
+      }
     }
     k = k + 1;
   }
+  vec_free(ndefs);
   vec_free(off);
   vec_free(size);
   vec_free(lo);
@@ -1520,16 +1553,13 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   let al = ra_alloc_const(f, 5, 4);
   let nuse = ix_uses(f);
   // The frame: saved registers, spills, slots.
-  let area = ix_share_slots(&mut f);
-  let mut slots = area;
+  let mut moff = vec_new[u64]();
   k = 0;
   while k < vec_len(f.ins) {
-    let q = vec_get(f.ins, k);
-    if q.op == IR_CALLM {
-      slots = wrap_add(slots, q.ty);
-    }
+    vec_push(&mut moff, 0);
     k = k + 1;
   }
+  let slots = ix_share_slots(&mut f, &mut moff);
   let base = wrap_add(al.ncallee_used, al.nspill);
   let mut words = wrap_add(base, slots);
   if words % 2 == 1 {
@@ -1579,7 +1609,7 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   if na == 0 {
     retoff = wrap_add(16, wrap_mul(8, vec_len(pos)));
   }
-  ix_body(&mut out, f, al, &mut g, c, &mut m, p, nuse, base, ix_buffer(c, m, p, rt), retoff);
+  ix_body(&mut out, f, al, &mut g, c, &mut m, p, nuse, moff, base, ix_buffer(c, m, p, rt), retoff);
   ix_lbl(&mut out, x, IR_NONE);
   w_s(&mut out, ":\n");
   k = 0;
@@ -1595,6 +1625,7 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   w_append(&mut g.out, out);
   vec_free(out);
   vec_free(nuse);
+  vec_free(moff);
   vec_free(pos);
   ra_free(al);
   ir_free(f);
