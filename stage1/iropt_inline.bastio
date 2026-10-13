@@ -24,6 +24,8 @@ const IRI_LOOP: u64 = 160;
 /// A caller that has grown past this many instructions inlines no more.
 const IRI_GROWN: u64 = 1500;
 const IRI_ROUNDS: u64 = 3;
+/// A function inlined into itself (once, in the first round) is at most this big.
+const IRI_SELF: u64 = 80;
 
 fn iri_r(r: u64, rb: u64) -> u64 {
   if r == IR_NONE {
@@ -182,7 +184,7 @@ fn iri_splice(f: &mut IrFn, out: &mut Vec[IrIns], g: &IrFn, q: IrIns) {
 }
 
 /// One round: every call that can be inlined is. Returns how many were.
-fn iri_round(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser) -> u64 {
+fn iri_round(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, selfok: bool) -> u64 {
   let mut out = vec_new[IrIns]();
   let n = vec_len(f.ins);
   let mut done = 0;
@@ -190,7 +192,7 @@ fn iri_round(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser) -> u64 {
   while i < n {
     let q = vec_get(f.ins, i);
     let mut spliced = false;
-    if (q.op == IR_CALL || q.op == IR_CALLM) && q.a != f.x && vec_len(out) < IRI_GROWN {
+    if (q.op == IR_CALL || q.op == IR_CALLM) && (q.a != f.x || selfok) && vec_len(out) < IRI_GROWN {
       let mut g = ir_lower(c, &mut m, p, q.a);
       if !g.failed && vec_len(g.ins) <= IRI_LOOP {
         iropt_slots(&mut g);
@@ -199,6 +201,9 @@ fn iri_round(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser) -> u64 {
         let mut limit = IRI_SMALL;
         if iri_in_loop(f, i) {
           limit = IRI_LOOP;
+        }
+        if q.a == f.x && limit > IRI_SELF {
+          limit = IRI_SELF;
         }
         if vec_len(g.ins) <= limit && iri_fits(g, q) {
           iri_splice(&mut f, &mut out, g, q);
@@ -224,7 +229,7 @@ fn iropt_inline(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser) -> u64 {
   let mut total = 0;
   let mut round = 0;
   while round < IRI_ROUNDS {
-    let k = iri_round(&mut f, c, &mut m, p);
+    let k = iri_round(&mut f, c, &mut m, p, round == 0);
     total = wrap_add(total, k);
     if k == 0 {
       round = IRI_ROUNDS;
