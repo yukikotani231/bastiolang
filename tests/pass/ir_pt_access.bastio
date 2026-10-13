@@ -1,0 +1,48 @@
+// expect-exit: 5
+// The checks run in functions that take the table by borrow, so the IR path
+// (which does not take `main`: it holds a Pool) writes them.
+fn present(t: &PageTable, i: u64) -> bool
+  requires i < 512 && pt_level(t) == 1
+{
+  return pt_has(t, i);
+}
+
+fn open(t: &PageTable, i: u64) -> bool
+  requires i < 512 && pt_level(t) == 1
+{
+  return pt_accessible(t, i);
+}
+
+fn rw(t: &PageTable, i: u64) -> bool
+  requires i < 512 && pt_level(t) == 1
+{
+  return pt_writable(t, i);
+}
+
+fn main(pool: &mut Pool) -> u64 {
+  if pool_size(pool) < 2 {
+    return 99;
+  }
+  let mut t = pt_new(pool_take(&mut pool, 0), 1);
+  pt_put_frame(&mut t, 3, pool_take(&mut pool, 1), true);
+  let mut r = 0;
+  if present(t, 3) && open(t, 3) && rw(t, 3) && !present(t, 4) {
+    r = r + 1;
+  }
+  pt_set_access(&mut t, 3, 0);
+  if present(t, 3) && !open(t, 3) && !rw(t, 3) {
+    r = r + 1;
+  }
+  pt_set_access(&mut t, 3, 1);
+  if present(t, 3) && open(t, 3) && !rw(t, 3) {
+    r = r + 1;
+  }
+  pt_set_access(&mut t, 3, 2);
+  if rw(t, 3) {
+    r = r + 2;
+  }
+  pt_set_access(&mut t, 3, 0);
+  pool_give(&mut pool, pt_take_frame(&mut t, 3));
+  pool_give(&mut pool, pt_free(t));
+  return r;
+}

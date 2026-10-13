@@ -296,10 +296,18 @@ fn ir_mw(c: &Checker, m: &Mono, p: &Parser, t: u64, depth: u64) -> u64 {
   return IR_NONE;
 }
 
+/// Is a value of this kind of type one word that nothing but a builtin looks
+/// into? The console, the zero-sized capabilities of the kernel (ports, MMIO
+/// space, MMU, CPU) and the words that name a frame, a table, a DMA window or a
+/// page are carried around like integers.
+fn ir_is_handle(k: u64) -> bool {
+  return k == TY_SERIAL || k == TY_FRAME || k == TY_PT || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA || k == TY_MMU || k == TY_CPU || k == TY_LEASE || k == TY_SHARED || k == TY_DIRTY;
+}
+
 /// The kind of values of type `t` in the subset, or 0.
 fn ir_kind(c: &Checker, m: &Mono, p: &Parser, t: u64) -> u64 {
   let u = base_t(m, t);
-  if is_int(m, u) || kind_t(m, u) == TY_BOOL || kind_t(m, u) == TY_SERIAL {
+  if is_int(m, u) || kind_t(m, u) == TY_BOOL || ir_is_handle(kind_t(m, u)) {
     return IRK_INT;
   }
   if kind_t(m, u) == TY_BOX && ir_mw(c, m, p, inner_t(m, u), 0) != IR_NONE {
@@ -1511,6 +1519,58 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       ir_emit(&mut f, IR_FREE, IR_NONE, b.r0, 0, 0, 0);
     }
     return out;
+  }
+  if name_is(p, i, "pt_has") || name_is(p, i, "pt_writable") || name_is(p, i, "pt_accessible") {
+    // An entry of a page table: bit 0 is present, bit 1 writable, bit 10
+    // marks an entry that is hidden (`pt_set_access` 0) and still owned.
+    let t = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 0));
+    let ix = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    let e = ir_reg(&mut f);
+    ir_emit(&mut f, IR_LOAD, e, t, ix, 8, 0);
+    let d = ir_reg(&mut f);
+    if name_is(p, i, "pt_has") {
+      let k = ir_reg(&mut f);
+      ir_emit(&mut f, IR_CONST, k, 1025, 0, 0, 0);
+      let a = ir_reg(&mut f);
+      ir_emit(&mut f, IR_AND, a, e, k, 0, 0);
+      let z = ir_reg(&mut f);
+      ir_emit(&mut f, IR_CONST, z, 0, 0, 0, 0);
+      ir_emit(&mut f, IR_NE, d, a, z, 0, 0);
+    } else if name_is(p, i, "pt_writable") {
+      let one = ir_reg(&mut f);
+      ir_emit(&mut f, IR_CONST, one, 1, 0, 0, 0);
+      let a = ir_reg(&mut f);
+      ir_emit(&mut f, IR_SHR, a, e, one, 0, 0);
+      ir_emit(&mut f, IR_AND, d, a, one, 0, 0);
+    } else {
+      let one = ir_reg(&mut f);
+      ir_emit(&mut f, IR_CONST, one, 1, 0, 0, 0);
+      ir_emit(&mut f, IR_AND, d, e, one, 0, 0);
+    }
+    return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+  }
+  if name_is(p, i, "frame_read") || name_is(p, i, "frame_read8") {
+    // A frame is the address of its page.
+    let fr = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 0));
+    let ix = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    let d = ir_reg(&mut f);
+    let mut size = 8;
+    if name_is(p, i, "frame_read8") {
+      size = 1;
+    }
+    ir_emit(&mut f, IR_LOAD, d, fr, ix, size, 0);
+    return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+  }
+  if name_is(p, i, "frame_write") || name_is(p, i, "frame_write8") {
+    let fr = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 0));
+    let ix = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    let v = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 2));
+    let mut size = 8;
+    if name_is(p, i, "frame_write8") {
+      size = 1;
+    }
+    ir_emit(&mut f, IR_STORE, v, fr, ix, size, 0);
+    return ir_none();
   }
   if name_is(p, i, "serial_write") {
     // `serial_write(con, byte)`: the capability is only a name for the right
