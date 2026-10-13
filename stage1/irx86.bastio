@@ -666,7 +666,11 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     w_s(&mut out, "\n");
   } else if op == IR_ALLOC {
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RDI));
-    if q.c == 1 {
+    if q.ty == 1 && q.c == 1 {
+      w_s(&mut out, "\tcall bst_rt_try_balloc\n");
+    } else if q.ty == 1 {
+      w_s(&mut out, "\tcall bst_rt_try_alloc\n");
+    } else if q.c == 1 {
       w_s(&mut out, "\tcall bst_rt_balloc\n");
     } else {
       w_s(&mut out, "\tcall bst_rt_alloc\n");
@@ -699,10 +703,32 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
   } else if op == IR_TSC {
     w_s(&mut out, "\trdtsc\n\tshl $32, %rdx\n\tor %rdx, %rax\n");
     ix_finish(&mut out, al, q.d, XR_RAX);
-  } else if op == IR_BOOTINFO {
+  } else if op == IR_PCALL {
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RDI));
     ix_mov(&mut out, ix_loc(al, q.b), ix_rl(XR_RSI));
-    w_s(&mut out, "\tlea bst_platform_info(%rip), %rax\n\tcall bst_rt_ccall\n");
+    if q.c == 0 {
+      w_s(&mut out, "\tlea bst_platform_info(%rip), %rax\n\tcall bst_rt_ccall\n");
+    } else if q.c == 1 {
+      w_s(&mut out, "\tlea bst_platform_acpi(%rip), %rax\n\tcall bst_rt_ccall\n");
+    } else if q.c == 2 {
+      w_s(&mut out, "\tlea bst_platform_cpus(%rip), %rax\n\tcall bst_rt_ccall\n");
+    } else if q.c == 3 {
+      w_s(&mut out, "\tpush %rdi\n\tlea bst_platform_ctx(%rip), %rax\n\tcall bst_rt_ccall\n\tpop %rdx\n\tmov (%rax,%rdx,8), %rax\n");
+    } else if q.c == 6 {
+      w_s(&mut out, "\tpush %rsi\n\tpush %rdi\n\tlea bst_platform_ctx(%rip), %rax\n\tcall bst_rt_ccall\n\tpop %rdx\n\tpop %rcx\n\tmov %rcx, (%rax,%rdx,8)\n");
+    } else if q.c == 7 {
+      w_s(&mut out, "\tcall bst_rt_fpu_load\n");
+    } else if q.c == 9 {
+      w_s(&mut out, "\tcall bst_rt_cpu_run\n");
+    } else if q.c == 8 {
+      w_s(&mut out, "\tfxsave64 (%rdi)\n");
+    } else if q.c == 5 {
+      w_s(&mut out, "\tmov $");
+      w_num(&mut out, wrap_mul(8, q.ty));
+      w_s(&mut out, ", %edx\n\tcall bst_rt_vec_try_reserve\n");
+    } else {
+      w_s(&mut out, "\tlea bst_cpu_wait(%rip), %rax\n\tcall bst_rt_ccall\n");
+    }
     ix_finish(&mut out, al, q.d, XR_RAX);
   } else if op == IR_LOCKINC {
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RCX));
