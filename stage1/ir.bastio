@@ -908,19 +908,18 @@ fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
   }
   if k == E_BIN && (n.v == P_ANDAND || n.v == P_OROR) {
     // The right operand runs only if the left does not decide the result.
+    // The chain branches straight to the two outcomes (`ir_branch`), and
+    // the value is made once at the end, not carried from test to test.
     let d = ir_reg(&mut f);
-    let a = ir_int(&mut f, c, &mut m, p, n.a);
-    ir_emit(&mut f, IR_MOV, d, a, 0, 0, 0);
-    let rhs = ir_label(&mut f);
+    let l_true = ir_label(&mut f);
+    let l_false = ir_label(&mut f);
     let end = ir_label(&mut f);
-    if n.v == P_ANDAND {
-      ir_emit(&mut f, IR_BR, IR_NONE, d, rhs, end, 0);
-    } else {
-      ir_emit(&mut f, IR_BR, IR_NONE, d, end, rhs, 0);
-    }
-    ir_place(&mut f, rhs);
-    let b = ir_int(&mut f, c, &mut m, p, n.b);
-    ir_emit(&mut f, IR_MOV, d, b, 0, 0, 0);
+    ir_branch(&mut f, c, &mut m, p, i, l_true, l_false);
+    ir_place(&mut f, l_true);
+    ir_emit(&mut f, IR_CONST, d, 1, 0, 0, 0);
+    ir_emit(&mut f, IR_JMP, IR_NONE, end, 0, 0, 0);
+    ir_place(&mut f, l_false);
+    ir_emit(&mut f, IR_CONST, d, 0, 0, 0, 0);
     ir_place(&mut f, end);
     return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
   }
