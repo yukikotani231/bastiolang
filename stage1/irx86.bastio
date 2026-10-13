@@ -1110,7 +1110,15 @@ fn ix_coalesce(f: &mut IrFn) {
   while i < vec_len(f.ins) {
     let q = vec_get(f.ins, i);
     let nq = ix_at(f, i + 1);
-    if ix_defines(q) && q.d != IR_NONE && nq.op == IR_MOV && nq.a == q.d && nq.d != q.d
+    // A call with two results writes a second register that may be dead
+    // (`v1, v2 = call f; s = mov v1`): the allocator can give that dead
+    // result the register `s` would now share, and its move (written after
+    // the first) would overwrite the first result.
+    let mut other = false;
+    if q.op == IR_CALL && q.ty != IR_NONE && q.ty != 0 {
+      other = true;
+    }
+    if !other && ix_defines(q) && q.d != IR_NONE && nq.op == IR_MOV && nq.a == q.d && nq.d != q.d
       && u_at(ndef, q.d) == 1 && u_at(nuse, q.d) == 1 {
       vec_push(&mut out, IrIns { op: q.op, d: nq.d, a: q.a, b: q.b, c: q.c, ty: q.ty });
       i = i + 2;
