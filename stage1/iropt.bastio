@@ -203,7 +203,7 @@ fn iropt_rename(q: IrIns, from: u64, to: u64) -> IrIns {
       r.b = to;
     }
   } else if op == IR_MOV || op == IR_NOT || op == IR_NEG || op == IR_WRAP || op == IR_ALLOC || op == IR_FREE
-    || op == IR_PRINT || op == IR_VGROW || op == IR_BR {
+    || op == IR_PRINT || op == IR_PUTC || op == IR_VGROW || op == IR_BR {
     if r.a == from {
       r.a = to;
     }
@@ -468,4 +468,113 @@ fn iropt_thread(f: &mut IrFn) -> u64 {
   }
   vec_free(lpos);
   return changed;
+}
+
+/// Does `q` only compute a register (no effect, no trap)? Division is left
+/// out: removing it would be sound (the verifier proved the divisor), but a
+/// `div` that the allocator keeps costs nothing against one it never saw.
+fn iropt_pure(q: IrIns) -> bool {
+  let op = q.op;
+  return op == IR_CONST || op == IR_MOV || op == IR_NOT || op == IR_NEG || op == IR_WRAP || op == IR_LOAD
+    || op == IR_SLOT || op == IR_STRLIT || (ra_is_binary(op) && op != IR_DIV && op != IR_SDIV && op != IR_REM && op != IR_SREM);
+}
+
+/// Dead code elimination. Two kinds of pure instruction go: one whose result
+/// no instruction reads (repeated until nothing changes, for chains), and
+/// one whose result is overwritten later in the same straight-line run of
+/// instructions with no read between (the lowering leaves `v = const 0` then
+/// `v = mov x` behind when it fills a result tuple). Returns how many
+/// instructions it removed.
+fn iropt_dce(f: &mut IrFn) -> u64 {
+  let mut total = 0;
+  let mut again = true;
+  let mut rounds = 0;
+  while again && rounds < 16 {
+    again = false;
+    rounds = rounds + 1;
+    let n = vec_len(f.ins);
+    let mut nread = vec_new[u64]();
+    let mut r = 0;
+    while r < f.nreg && r < 1000000000 {
+      vec_push(&mut nread, 0);
+      r = r + 1;
+    }
+    let mut dead = vec_new[u64]();
+    // pend[r]: the pure instruction that wrote r with no read since (IR_NONE: none).
+    let mut pend = vec_new[u64]();
+    r = 0;
+    while r < f.nreg && r < 1000000000 {
+      vec_push(&mut pend, IR_NONE);
+      r = r + 1;
+    }
+    let mut touched = vec_new[u64]();
+    let mut i = 0;
+    while i < n {
+      let q = vec_get(f.ins, i);
+      vec_push(&mut dead, 0);
+      let mut rs = vec_new[u64]();
+      ra_reads(f, q, &mut rs);
+      let mut j = 0;
+      while j < vec_len(rs) {
+        let rr = vec_get(rs, j);
+        ra_set(&mut nread, rr, wrap_add(u_at(nread, rr), 1));
+        ra_set(&mut pend, rr, IR_NONE);
+        j = j + 1;
+      }
+      vec_free(rs);
+      let mut ws = vec_new[u64]();
+      ra_writes(q, &mut ws);
+      j = 0;
+      while j < vec_len(ws) {
+        let wr = vec_get(ws, j);
+        let pp = u_at(pend, wr);
+        if pp != IR_NONE && pp < vec_len(dead) {
+          vec_set(&mut dead, pp, 1);
+        }
+        if iropt_pure(q) && wr < f.nreg {
+          ra_set(&mut pend, wr, i);
+          vec_push(&mut touched, wr);
+        } else {
+          ra_set(&mut pend, wr, IR_NONE);
+        }
+        j = j + 1;
+      }
+      vec_free(ws);
+      if q.op == IR_LABEL || q.op == IR_JMP || q.op == IR_BR || q.op == IR_RET || q.op == IR_UNREACH {
+        while vec_len(touched) > 0 {
+          let tr = vec_pop(&mut touched);
+          ra_set(&mut pend, tr, IR_NONE);
+        }
+      }
+      i = i + 1;
+    }
+    // A pure instruction whose result is never read.
+    i = 0;
+    while i < n {
+      let q = vec_get(f.ins, i);
+      if iropt_pure(q) && q.d < f.nreg && u_at(nread, q.d) == 0 {
+        ra_set(&mut dead, i, 1);
+      }
+      i = i + 1;
+    }
+    let mut out = vec_new[IrIns]();
+    i = 0;
+    while i < n {
+      let q = vec_get(f.ins, i);
+      if u_at(dead, i) == 1 {
+        total = wrap_add(total, 1);
+        again = true;
+      } else {
+        vec_push(&mut out, q);
+      }
+      i = i + 1;
+    }
+    vec_free(f.ins);
+    f.ins = out;
+    vec_free(touched);
+    vec_free(pend);
+    vec_free(dead);
+    vec_free(nread);
+  }
+  return total;
 }

@@ -1,0 +1,43 @@
+// expect-exit: 107
+// Borrows reach further (stage1/ir.bastio): `&mut` of a Box variable, of a
+// field of a struct held in registers and of a field through a Box; `set` as
+// the initializer of a `let` (it gives the buffer back); a generic call whose
+// result is dropped.
+struct Pair { a: u64, b: u64 }
+struct Cell { p: Box[Pair], tag: u64 }
+struct Two { x: Pair, y: Pair }
+struct Node { l: Pair, t: u64 }
+
+fn swap_box(c: &mut Box[Pair], v: u64) {
+  c.a = v;
+}
+
+fn bump(p: &mut Pair) {
+  p.a = wrap_add(p.a, 1);
+  p.b = wrap_add(p.b, 10);
+}
+
+fn id[T](x: T) -> T {
+  return x;
+}
+
+fn main() -> u64 {
+  let a = alloc(3);
+  let a1 = set(a, 0, 5);
+  let a2 = set(a1, 2, 7);
+  let mut c = box(Pair { a: 1, b: 2 });
+  swap_box(&mut c, 20);
+  let mut t = Two { x: Pair { a: 1, b: 1 }, y: Pair { a: 2, b: 2 } };
+  bump(&mut t.y);
+  let mut cell = Cell { p: box(Pair { a: 3, b: 4 }), tag: 1 };
+  swap_box(&mut cell.p, 30);
+  let mut nb = box(Node { l: Pair { a: 6, b: 7 }, t: 0 });
+  bump(&mut nb.l);
+  id[u64](9);
+  let r = wrap_add(wrap_add(get(a2, 0), get(a2, 2)), wrap_add(c.a, wrap_add(t.y.a, wrap_add(t.y.b, wrap_add(cell.p.a, nb.l.b)))));
+  free(a2);
+  let pr = unbox(c);
+  let cp = unbox(cell.p);
+  let n = unbox(nb);
+  return wrap_add(wrap_add(r, wrap_add(pr.b, cp.b)), n.l.a);
+}

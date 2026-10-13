@@ -708,6 +708,9 @@ class Fuzz:
                 return                      # termination is not proved
             if b"stack-overflow" in r.stderr:
                 return                      # nor is the depth of recursion
+            # A request the allocator cannot give is a warning here, and
+            # `try_alloc` and `try_balloc` are meant to ask for one and see it fail.
+            r.stderr = b"\n".join(l for l in r.stderr.split(b"\n") if b"AddressSanitizer failed to allocate" not in l)
             if b"Sanitizer" in r.stderr or b"runtime error" in r.stderr:
                 self.finding("falseproof", text, f"accepted, but the sanitizers report ({where})\n{r.stderr.decode(errors='replace')[:3000]}")
             self.stat("mutant run")

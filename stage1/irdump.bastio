@@ -2,8 +2,9 @@
 // the first subset; a function outside it gets a comment line with the first
 // thing that stopped the lowering. Type and linearity checking run first, as
 // for asmdump; nothing is verified or generated.
-//   usage: irdump [--lib DIR] FILE   or   irdump --opt FILE
-// With --opt, the passes of iropt.bastio have run first.
+//   usage: irdump [--lib DIR] [--opt | --where | --user | --kernel] FILE
+// With --opt, the passes of iropt.bastio have run first; --user and --kernel
+// check for that target (hosted otherwise).
 import "loader.bastio";
 import "out.bastio";
 import "ir.bastio";
@@ -13,23 +14,43 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
   let mut ld = loader_new();
   let mut base = 1;
   let mut opt = false;
-  if host_argc(host) == 3 {
-    let a = host_arg(host, 1);
-    if spells(a, 0, blen(a), "--opt") {
+  let mut where = false;
+  let mut target = TARGET_HOSTED;
+  let mut more = true;
+  while more && base < 990 && base + 2 < host_argc(host)
+    invariant base <= 1000
+  {
+    let a = host_arg(host, base);
+    more = spells(a, 0, blen(a), "--lib");
+    if more {
+      loader_lib(&mut ld, host_arg(host, base + 1));
+      base = base + 2;
+    }
+    bfree(a);
+  }
+  // Flags up to the last argument, which is the file.
+  let last = wrap_sub(host_argc(host), 1);
+  while base < last && base < 999
+    invariant base <= 1000
+  {
+    let flag = host_arg(host, base);
+    if spells(flag, 0, blen(flag), "--opt") {
       opt = true;
-      base = 2;
     }
-    bfree(a);
-  }
-  if host_argc(host) > 3 {
-    let a = host_arg(host, 1);
-    if spells(a, 0, blen(a), "--lib") {
-      loader_lib(&mut ld, host_arg(host, 2));
-      base = 3;
+    if spells(flag, 0, blen(flag), "--where") {
+      where = true;
     }
-    bfree(a);
+    if spells(flag, 0, blen(flag), "--user") {
+      target = TARGET_USER;
+    }
+    if spells(flag, 0, blen(flag), "--kernel") {
+      target = TARGET_KERNEL;
+    }
+    bfree(flag);
+    base = base + 1;
   }
-  let path = host_arg(host, base);
+  let file_arg = last;
+  let path = host_arg(host, file_arg);
   let mut p = parser_new(balloc(0), vec_new[Tok](), 0);
   let r = load(host, &mut p, &mut ld, path, 0, 0, 0, false);
   bfree(path);
@@ -45,7 +66,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
       put(con, "error\n");
       code = 1;
     } else {
-      let mut c = checker_new(&mut m, p, TARGET_HOSTED);
+      let mut c = checker_new(&mut m, p, target);
       check_program(&mut c, &mut m, p);
       if c.failed {
         put(con, "error\n");
@@ -61,11 +82,16 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
             ir_w_name(&mut text, m, p, x);
             w_s(&mut text, ": not in the first subset: ");
             w_append(&mut text, f.why);
+            if where {
+              w_s(&mut text, " @");
+              w_num(&mut text, f.at);
+            }
             w_s(&mut text, "\n");
           } else {
             if opt {
               iropt_slots(&mut f);
               iropt_copies(&mut f);
+              iropt_dce(&mut f);
               iropt_thread(&mut f);
             }
             ir_print(&mut text, f, m, p);
