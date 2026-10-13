@@ -23,6 +23,8 @@ const IRI_SMALL: u64 = 40;
 const IRI_LOOP: u64 = 160;
 /// A caller that has grown past this many instructions inlines no more.
 const IRI_GROWN: u64 = 1500;
+/// Bodies this small are inlined whatever the size of the caller.
+const IRI_TINY: u64 = 12;
 const IRI_ROUNDS: u64 = 3;
 /// A function inlined into itself (once, in the first round) is at most this big.
 const IRI_SELF: u64 = 80;
@@ -200,9 +202,13 @@ fn iri_round(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, selfok: bool) 
   while i < n {
     let q = vec_get(f.ins, i);
     let mut spliced = false;
-    if (q.op == IR_CALL || q.op == IR_CALLM) && (q.a != f.x || selfok) && vec_len(out) < IRI_GROWN {
+    if (q.op == IR_CALL || q.op == IR_CALLM) && (q.a != f.x || selfok) {
       let mut g = ir_lower(c, &mut m, p, q.a);
-      if !g.failed && vec_len(g.ins) <= IRI_LOOP {
+      // A caller that has grown past IRI_GROWN still takes the bodies of a
+      // few instructions (a state getter and the like): they cost less
+      // than the call.
+      let room = vec_len(out) < IRI_GROWN || vec_len(g.ins) <= IRI_TINY;
+      if room && !g.failed && vec_len(g.ins) <= IRI_LOOP {
         iropt_slots(&mut g);
         iropt_copies(&mut g);
         iropt_thread(&mut g);
