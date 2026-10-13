@@ -86,7 +86,7 @@ const IR_PIN: u64 = 63;      // d = the c-byte value read from I/O port a (`in`)
 const IR_FENCE: u64 = 65;    // a full memory fence (`dma_lend`, `dma_take`)
 const IR_MMCHK: u64 = 66;    // stops the machine if the block at address a, b bytes, is RAM (`mmio_claim` in the kernel): a runtime call that keeps every register
 const IR_TSC: u64 = 67;      // d = the processor's time-stamp counter (`cpu_tsc`)
-const IR_PCALL: u64 = 68;    // d = a call of one runtime or platform function, which c names, on (a, b) (ty: a constant for the callee): a call for the allocator
+const IR_PCALL: u64 = 68;    // d = a call of one runtime or platform function, which c names, on (a, b) (ty: a constant for the callee; for c 10 and 11, a is a system call number and b the address of three argument words, for 12 a is a Buf's data address and b the address of two bounds): a call for the allocator
 const IR_LOCKINC: u64 = 69;  // atomically adds one to the 32-bit count at address a
 const IR_LOCKDEC: u64 = 70;  // atomically subtracts one from the 32-bit count at address a; d = 1 if it reached zero, else 0
 const IR_COPYPAGE: u64 = 71; // copies the 4096 bytes at address b to address a
@@ -1435,6 +1435,107 @@ fn ir_handle_arg(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) ->
   return v.r0;
 }
 
+/// Is call node `i` one of a user program's system calls?
+fn ir_is_sys(p: &Parser, i: u64) -> bool {
+  return name_is(p, i, "sys_spawn") || name_is(p, i, "sys_wait") || name_is(p, i, "sys_kill") || name_is(p, i, "sys_info")
+    || name_is(p, i, "sys_yield") || name_is(p, i, "sys_getpid") || name_is(p, i, "sys_ps") || name_is(p, i, "sys_poweroff")
+    || name_is(p, i, "sys_call") || name_is(p, i, "sys_send") || name_is(p, i, "sys_recv");
+}
+
+/// A system call of a user program. It is a `pcall` whose first register
+/// is the system call number (for 10 and 11) and whose second is the address
+/// of a frame slot of three words, the arguments for %rdi, %rsi and %rdx;
+/// `c` 10 makes the call as it is, 11 writes out the console buffer first
+/// (every call that can block or hand a buffer to the kernel), and 12 is
+/// `sys_spawn`: the first register is the data address of the name's Buf, the
+/// slot holds the two bounds.
+fn ir_syscall(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal {
+  if c.target != TARGET_USER {
+    ir_fail(&mut f, "a system call outside a user program");
+    return ir_none();
+  }
+  let mut num = IR_NONE;
+  let mut w0 = IR_NONE;
+  let mut w1 = IR_NONE;
+  let mut w2 = IR_NONE;
+  let mut which = 10;
+  let mut unit = false;
+  if name_is(p, i, "sys_spawn") {
+    let b = ir_buf(&mut f, c, &mut m, p, cg_arg(p, i, 0), IRK_BUF);
+    w0 = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    w1 = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 2));
+    num = b.r0;
+    which = 12;
+  } else if name_is(p, i, "sys_wait") || name_is(p, i, "sys_kill") || name_is(p, i, "sys_info") {
+    w0 = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 0));
+    let mut nr = 7;
+    if name_is(p, i, "sys_wait") {
+      nr = 4;
+    } else if name_is(p, i, "sys_kill") {
+      nr = 9;
+    }
+    num = ir_k(&mut f, nr);
+  } else if name_is(p, i, "sys_yield") || name_is(p, i, "sys_getpid") {
+    let mut nr = 6;
+    if name_is(p, i, "sys_yield") {
+      nr = 5;
+      unit = true;
+    }
+    num = ir_k(&mut f, nr);
+  } else if name_is(p, i, "sys_ps") || name_is(p, i, "sys_poweroff") {
+    let mut nr = 10;
+    if name_is(p, i, "sys_ps") {
+      nr = 8;
+    }
+    num = ir_k(&mut f, nr);
+    which = 11;
+    unit = true;
+  } else if name_is(p, i, "sys_call") {
+    num = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 0));
+    w0 = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    w1 = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 2));
+    which = 11;
+  } else if name_is(p, i, "sys_send") {
+    num = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 0));
+    w0 = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    let b = ir_buf(&mut f, c, &mut m, p, cg_arg(p, i, 2), IRK_BYTES);
+    w1 = b.r0;
+    w2 = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 3));
+    which = 11;
+  } else {
+    // sys_recv: the kernel may fill all of the buffer.
+    num = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 0));
+    w0 = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    let b = ir_buf(&mut f, c, &mut m, p, cg_arg(p, i, 2), IRK_BYTES);
+    w1 = b.r0;
+    w2 = b.r1;
+    which = 11;
+  }
+  if f.failed {
+    return ir_none();
+  }
+  if w0 == IR_NONE {
+    w0 = ir_k(&mut f, 0);
+  }
+  if w1 == IR_NONE {
+    w1 = ir_k(&mut f, 0);
+  }
+  if w2 == IR_NONE {
+    w2 = ir_k(&mut f, 0);
+  }
+  let slot = ir_reg(&mut f);
+  ir_emit(&mut f, IR_SLOT, slot, 0, 0, 3, 0);
+  ir_hdr_store(&mut f, slot, 0, w0);
+  ir_hdr_store(&mut f, slot, 1, w1);
+  ir_hdr_store(&mut f, slot, 2, w2);
+  let d = ir_reg(&mut f);
+  ir_emit(&mut f, IR_PCALL, d, num, slot, which, 0);
+  if unit {
+    return ir_none();
+  }
+  return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+}
+
 /// A call: a builtin of the subset (`len`, `blen`, `get`, `bget`) or a
 /// function that is not generic and not a builtin, whose arguments and
 /// result are integers or buffers (or no result).
@@ -2186,6 +2287,9 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let d = ir_reg(&mut f);
     ir_emit(&mut f, IR_TSC, d, 0, 0, 0, 0);
     return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+  }
+  if ir_is_sys(p, i) {
+    return ir_syscall(&mut f, c, &mut m, p, i);
   }
   if name_is(p, i, "vec_try_reserve") {
     // Room for k more elements: the runtime routine says whether it got it.
