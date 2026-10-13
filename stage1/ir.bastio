@@ -58,6 +58,9 @@ const IR_ALLOC: u64 = 48;    // d = a new buffer's data address, n = a elements 
 const IR_FREE: u64 = 49;     // frees the buffer whose data address is a
 const IR_PRINT: u64 = 50;    // prints the number a
 const IR_PUTC: u64 = 56;     // writes the byte a to the console (`serial_write`): a runtime call
+const IR_RT: u64 = 58;       // d = the runtime routine ir_sym(c) applied to a (argument and result in %rax; no other register changes)
+const IR_GLOBAL: u64 = 59;   // d = the value of the global symbol ir_sym(a), or with c = 1 its address
+const IR_ZERO: u64 = 60;     // zeroes the 4096 bytes at address a
 const IR_GETC: u64 = 57;     // d = the next byte from the console (`serial_read`): a runtime call
 const IR_WRAP: u64 = 51;     // d = a truncated to the integer type ty
 
@@ -65,6 +68,11 @@ const IR_SLOT: u64 = 52;     // d = the address of a frame slot of c words (one 
 const IR_STRLIT: u64 = 55;   // d = the address of the bytes of the string literal or blob at syntax node a
 const IR_CALLM: u64 = 54;    // d = the address of a frame slot of ty words that instance a, called with the c registers of args[b ..], fills with its result (a result of more than two words)
 const IR_VGROW: u64 = 53;    // makes room in the Vec whose 3-word header is at address a (c = words per element): a runtime call that may change the header
+
+const IRS_PAGE_AT: u64 = 0;
+const IRS_FRAME_ID: u64 = 1;
+const IRS_POOL_BASE: u64 = 2;
+const IRS_KERNEL_PML4: u64 = 3;
 
 const IR_NONE: u64 = 18446744073709551615;
 
@@ -316,7 +324,10 @@ fn ir_kind(c: &Checker, m: &Mono, p: &Parser, t: u64) -> u64 {
   if kind_t(m, u) == TY_BUF {
     return IRK_BUF;
   }
-  if kind_t(m, u) == TY_BYTES {
+  if kind_t(m, u) == TY_BYTES || kind_t(m, u) == TY_POOL {
+    // A Pool is two words in memory, the base address and then the page
+    // count; held like a Bytes (data = word 1 = the count, length = word 0
+    // = the base), though only the pool builtins look into it.
     return IRK_BYTES;
   }
   if kind_t(m, u) == TY_STR {
@@ -1527,6 +1538,94 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     }
     return out;
   }
+  if name_is(p, i, "pool_size") {
+    let v = ir_buf(&mut f, c, &mut m, p, n.a, IRK_BYTES);
+    return IrVal { k: IRK_INT, r0: v.r0, r1: IR_NONE, t: 0 };
+  }
+  if name_is(p, i, "pool_take") || name_is(p, i, "pt_new") {
+    // A page is zeroed whenever it is handed out, so it never leaks what it
+    // held before.
+    let mut pg = IR_NONE;
+    if name_is(p, i, "pool_take") {
+      let v = ir_buf(&mut f, c, &mut m, p, n.a, IRK_BYTES);
+      let k = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+      pg = ir_reg(&mut f);
+      if c.target == TARGET_KERNEL {
+        // The runs of RAM (bst_rt_pool_init).
+        ir_emit(&mut f, IR_RT, pg, k, 0, IRS_PAGE_AT, 0);
+      } else {
+        let sh = ir_k(&mut f, 12);
+        let off = ir_reg(&mut f);
+        ir_emit(&mut f, IR_SHL, off, k, sh, 0, 0);
+        ir_emit(&mut f, IR_ADD, pg, v.r1, off, 0, 0);
+      }
+    } else {
+      pg = ir_int(&mut f, c, &mut m, p, n.a);
+    }
+    if f.failed {
+      return ir_none();
+    }
+    ir_emit(&mut f, IR_ZERO, IR_NONE, pg, 0, 0, 0);
+    if name_is(p, i, "pt_new") && c.target == TARGET_KERNEL {
+      // A new top-level table maps the kernel's first 512 GiB, as the
+      // kernel's own table does (the C prelude's BST_PT_NEW_HOOK).
+      let lv = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+      let l_hook = f.nlabel;
+      f.nlabel = wrap_add(f.nlabel, 1);
+      let l_done = f.nlabel;
+      f.nlabel = wrap_add(f.nlabel, 1);
+      let four = ir_k(&mut f, 4);
+      let is4 = ir_reg(&mut f);
+      ir_emit(&mut f, IR_EQ, is4, lv, four, 0, 0);
+      ir_emit(&mut f, IR_BR, IR_NONE, is4, l_hook, l_done, 0);
+      ir_emit(&mut f, IR_LABEL, IR_NONE, l_hook, 0, 0, 0);
+      let gv = ir_reg(&mut f);
+      ir_emit(&mut f, IR_GLOBAL, gv, IRS_KERNEL_PML4, 0, 0, 0);
+      let mask = ir_k(&mut f, 4503599627366400);
+      let hi = ir_reg(&mut f);
+      ir_emit(&mut f, IR_AND, hi, gv, mask, 0, 0);
+      let three = ir_k(&mut f, 3);
+      let ent = ir_reg(&mut f);
+      ir_emit(&mut f, IR_OR, ent, hi, three, 0, 0);
+      let z = ir_k(&mut f, 0);
+      ir_emit(&mut f, IR_STORE, ent, pg, z, 8, 0);
+      ir_emit(&mut f, IR_LABEL, IR_NONE, l_done, 0, 0, 0);
+    } else if name_is(p, i, "pt_new") {
+      // (The level is only for the proof.)
+      let lv = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+      if lv == IR_NONE {
+        return ir_none();
+      }
+    }
+    return IrVal { k: IRK_INT, r0: pg, r1: IR_NONE, t: 0 };
+  }
+  if name_is(p, i, "pool_give") {
+    let v = ir_buf(&mut f, c, &mut m, p, n.a, IRK_BYTES);
+    let fr = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    if v.k == 0 || fr == IR_NONE {
+      return ir_none();
+    }
+    return ir_none();
+  }
+  if name_is(p, i, "pt_free") {
+    let t = ir_int(&mut f, c, &mut m, p, n.a);
+    return IrVal { k: IRK_INT, r0: t, r1: IR_NONE, t: 0 };
+  }
+  if name_is(p, i, "frame_id") {
+    let fr = ir_int(&mut f, c, &mut m, p, n.a);
+    let d = ir_reg(&mut f);
+    if c.target == TARGET_KERNEL {
+      ir_emit(&mut f, IR_RT, d, fr, 0, IRS_FRAME_ID, 0);
+    } else {
+      let base = ir_reg(&mut f);
+      ir_emit(&mut f, IR_GLOBAL, base, IRS_POOL_BASE, 0, 0, 0);
+      let off = ir_reg(&mut f);
+      ir_emit(&mut f, IR_SUB, off, fr, base, 0, 0);
+      let sh = ir_k(&mut f, 12);
+      ir_emit(&mut f, IR_SHR, d, off, sh, 0, 0);
+    }
+    return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+  }
   if name_is(p, i, "pt_has") || name_is(p, i, "pt_writable") || name_is(p, i, "pt_accessible") {
     // An entry of a page table: bit 0 is present, bit 1 writable, bit 10
     // marks an entry that is hidden (`pt_set_access` 0) and still owned.
@@ -2386,6 +2485,16 @@ fn ir_lower(c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> IrFn {
 
 // ---- The text form ----
 
+/// The symbols `IR_RT` and `IR_GLOBAL` name: the runtime's page routines
+/// (kernel) and the pool's globals.
+
+fn ir_sym(i: u64) -> Str {
+  if i == IRS_PAGE_AT { return "bst_rt_page_at"; }
+  if i == IRS_FRAME_ID { return "bst_rt_frame_id"; }
+  if i == IRS_POOL_BASE { return "bst_rt_pool_base"; }
+  return "bst_kernel_pml4";
+}
+
 fn ir_op_name(op: u64) -> Str {
   if op == IR_CONST { return "const"; }
   if op == IR_MOV { return "mov"; }
@@ -2566,6 +2675,23 @@ fn ir_print(out: &mut Vec[u64], f: &IrFn, m: &Mono, p: &Parser) {
     } else if q.op == IR_GETC {
       ir_w_reg(&mut out, q.d);
       w_s(&mut out, " = getc");
+    } else if q.op == IR_RT {
+      ir_w_reg(&mut out, q.d);
+      w_s(&mut out, " = rt ");
+      w_s(&mut out, ir_sym(q.c));
+      w_s(&mut out, " ");
+      ir_w_reg(&mut out, q.a);
+    } else if q.op == IR_GLOBAL {
+      ir_w_reg(&mut out, q.d);
+      if q.c == 1 {
+        w_s(&mut out, " = addr ");
+      } else {
+        w_s(&mut out, " = global ");
+      }
+      w_s(&mut out, ir_sym(q.a));
+    } else if q.op == IR_ZERO {
+      w_s(&mut out, "zero ");
+      ir_w_reg(&mut out, q.a);
     } else if q.op == IR_WRAP {
       ir_w_reg(&mut out, q.d);
       w_s(&mut out, " = wrap ");
