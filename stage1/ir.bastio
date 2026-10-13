@@ -2208,7 +2208,40 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     return ir_none();
   }
   if name_is(p, i, "box") {
-    // The contents first, then the allocation they are copied into.
+    // The allocation first when the contents are a struct literal (their
+    // type is known): a tree built by recursion then lays out its nodes
+    // parents first, in the order it is walked. Otherwise the contents
+    // first, then the allocation they are copied into.
+    let an = node_at(p.nodes, n.a);
+    if an.kind == E_SLIT {
+      let def = find_in(p, p.structs.head, n.a);
+      let dnode = node_at(p.nodes, def);
+      if def != 0 && dnode.v == 0 {
+        let st = intern(&mut m, p, TY_STRUCT, plain_inst(&mut m, def));
+        let sw = ir_mw(c, m, p, st, 0);
+        if sw != IR_NONE && sw != 0 && sw <= 512 {
+          let cnt = ir_reg(&mut f);
+          ir_emit(&mut f, IR_CONST, cnt, sw, 0, 0, 0);
+          let ptr = ir_reg(&mut f);
+          // Every word is written next: no need to zero them.
+          ir_emit(&mut f, IR_ALLOC, ptr, cnt, 0, 8, 2);
+          let v = ir_vexpr(&mut f, c, &mut m, p, n.a);
+          if f.failed {
+            return ir_none();
+          }
+          let dst = IrVal { k: IRK_PLACE, r0: ptr, r1: 0, t: base_t(m, st) };
+          if v.k == IRK_PLACE {
+            ir_store_val(&mut f, c, m, p, dst, v);
+          } else if v.k == IRK_STRUCT {
+            ir_store_words(&mut f, ptr, 0, v.r0, v.r1);
+          } else {
+            ir_fail(&mut f, "a box of a struct literal of another kind");
+            return ir_none();
+          }
+          return IrVal { k: IRK_BOX, r0: ptr, r1: IR_NONE, t: intern(&mut m, p, TY_BOX, st) };
+        }
+      }
+    }
     let v = ir_vexpr(&mut f, c, &mut m, p, n.a);
     if f.failed {
       return ir_none();
