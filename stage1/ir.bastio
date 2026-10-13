@@ -76,12 +76,18 @@ const IRS_KERNEL_PML4: u64 = 3;
 const IRS_PORT_CELL: u64 = 4;
 const IRS_MMIO_CELL: u64 = 5;
 const IRS_PT_LEASES: u64 = 6;
+const IRS_SHARED_REFS: u64 = 7;
 
 const IR_DEVR: u64 = 61;     // d = the c-byte (1, 2, 4 or 8) value at address a, zero-extended: a volatile load, never dropped or reordered
 const IR_DEVW: u64 = 62;     // the low c bytes of b are stored at address a: a volatile store
 const IR_PIN: u64 = 63;      // d = the c-byte value read from I/O port a (`in`)
 const IR_FENCE: u64 = 65;    // a full memory fence (`dma_lend`, `dma_take`)
 const IR_MMCHK: u64 = 66;    // stops the machine if the block at address a, b bytes, is RAM (`mmio_claim` in the kernel): a runtime call that keeps every register
+const IR_TSC: u64 = 67;      // d = the processor's time-stamp counter (`cpu_tsc`)
+const IR_BOOTINFO: u64 = 68; // d = the platform's boot_info answer to (a, b): a call of a C function, so a call for the allocator
+const IR_LOCKINC: u64 = 69;  // atomically adds one to the 32-bit count at address a
+const IR_LOCKDEC: u64 = 70;  // atomically subtracts one from the 32-bit count at address a; d = 1 if it reached zero, else 0
+const IR_COPYPAGE: u64 = 71; // copies the 4096 bytes at address b to address a
 const IR_POUT: u64 = 64;     // the low c bytes of b are written to I/O port a (`out`)
 
 const IR_NONE: u64 = 18446744073709551615;
@@ -329,6 +335,25 @@ fn ir_page_id(f: &mut IrFn, c: &Checker, fr: u64) -> u64 {
     ir_emit(&mut f, IR_SHR, d, off, sh, 0, 0);
   }
   return d;
+}
+
+/// The address of the 32-bit count of the page at address register `pg` in
+/// the runtime's array `sym` (a pointer in the kernel, the array itself when
+/// hosted).
+fn ir_count_addr(f: &mut IrFn, c: &Checker, sym: u64, pg: u64) -> u64 {
+  let id = ir_page_id(&mut f, c, pg);
+  let arr = ir_reg(&mut f);
+  if c.target == TARGET_KERNEL {
+    ir_emit(&mut f, IR_GLOBAL, arr, sym, 0, 0, 0);
+  } else {
+    ir_emit(&mut f, IR_GLOBAL, arr, sym, 1, 0, 0);
+  }
+  let two = ir_k(&mut f, 2);
+  let sc = ir_reg(&mut f);
+  ir_emit(&mut f, IR_SHL, sc, id, two, 0, 0);
+  let at = ir_reg(&mut f);
+  ir_emit(&mut f, IR_ADD, at, arr, sc, 0, 0);
+  return at;
 }
 
 /// The width in bytes of the device access that call `i` names (`pio_in8`,
@@ -1823,6 +1848,20 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let v = ir_buf(&mut f, c, &mut m, p, n.a, IRK_BYTES);
     return IrVal { k: IRK_INT, r0: v.r0, r1: IR_NONE, t: 0 };
   }
+  if name_is(p, i, "pool_take_dirty") {
+    // pool_take without the zeroing: the page is not a frame yet.
+    let v = ir_buf(&mut f, c, &mut m, p, n.a, IRK_BYTES);
+    let k = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    if f.failed {
+      return ir_none();
+    }
+    let sh = ir_k(&mut f, 12);
+    let off = ir_reg(&mut f);
+    ir_emit(&mut f, IR_SHL, off, k, sh, 0, 0);
+    let pg = ir_reg(&mut f);
+    ir_emit(&mut f, IR_ADD, pg, v.r1, off, 0, 0);
+    return IrVal { k: IRK_INT, r0: pg, r1: IR_NONE, t: 0 };
+  }
   if name_is(p, i, "pool_take") || name_is(p, i, "pt_new") {
     // A page is zeroed whenever it is handed out, so it never leaks what it
     // held before.
@@ -1911,6 +1950,132 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let d = ir_page_id(&mut f, c, fr);
     return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
   }
+  if name_is(p, i, "cpu_tsc") {
+    let h = ir_handle_arg(&mut f, c, &mut m, p, n.a);
+    if f.failed || h == IR_NONE {
+      return ir_none();
+    }
+    let d = ir_reg(&mut f);
+    ir_emit(&mut f, IR_TSC, d, 0, 0, 0, 0);
+    return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+  }
+  if name_is(p, i, "boot_info") {
+    if c.target != TARGET_KERNEL {
+      ir_fail(&mut f, "a boot_info outside the kernel");
+      return ir_none();
+    }
+    let h = ir_handle_arg(&mut f, c, &mut m, p, cg_arg(p, i, 0));
+    let w = ir_handle_arg(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    let x = ir_handle_arg(&mut f, c, &mut m, p, cg_arg(p, i, 2));
+    if f.failed || h == IR_NONE {
+      return ir_none();
+    }
+    let d = ir_reg(&mut f);
+    ir_emit(&mut f, IR_BOOTINFO, d, w, x, 0, 0);
+    return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+  }
+  if name_is(p, i, "shared_new") || name_is(p, i, "shared_dup") || name_is(p, i, "pt_dup_shared") {
+    // A shared page has a 32-bit reference count per page number: a new one
+    // starts at one, a copy adds one atomically. `pt_dup_shared` copies the
+    // page a slot maps.
+    let mut pg = IR_NONE;
+    if name_is(p, i, "pt_dup_shared") {
+      let t = ir_handle_arg(&mut f, c, &mut m, p, cg_arg(p, i, 0));
+      let ix = ir_handle_arg(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+      if f.failed {
+        return ir_none();
+      }
+      let e = ir_reg(&mut f);
+      ir_emit(&mut f, IR_LOAD, e, t, ix, 8, 0);
+      let mask = ir_k(&mut f, 4503599627366400);
+      pg = ir_reg(&mut f);
+      ir_emit(&mut f, IR_AND, pg, e, mask, 0, 0);
+    } else {
+      pg = ir_handle_arg(&mut f, c, &mut m, p, n.a);
+    }
+    if f.failed {
+      return ir_none();
+    }
+    let at = ir_count_addr(&mut f, c, IRS_SHARED_REFS, pg);
+    if name_is(p, i, "shared_new") {
+      let one = ir_k(&mut f, 1);
+      ir_emit(&mut f, IR_DEVW, IR_NONE, at, one, 4, 0);
+    } else {
+      ir_emit(&mut f, IR_LOCKINC, IR_NONE, at, 0, 0, 0);
+    }
+    return IrVal { k: IRK_INT, r0: pg, r1: IR_NONE, t: 0 };
+  }
+  if name_is(p, i, "shared_drop") {
+    // Gives up one reference: the page number when it was the last, else
+    // all ones.
+    let pool = ir_buf(&mut f, c, &mut m, p, n.a, IRK_BYTES);
+    let pg = ir_handle_arg(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    if f.failed || pool.k == 0 {
+      return ir_none();
+    }
+    let at = ir_count_addr(&mut f, c, IRS_SHARED_REFS, pg);
+    let id = ir_page_id(&mut f, c, pg);
+    let last = ir_reg(&mut f);
+    ir_emit(&mut f, IR_LOCKDEC, last, at, 0, 0, 0);
+    let zero = ir_k(&mut f, 0);
+    let mask = ir_reg(&mut f);
+    ir_emit(&mut f, IR_SUB, mask, zero, last, 0, c.tu64);
+    let kept = ir_reg(&mut f);
+    ir_emit(&mut f, IR_AND, kept, id, mask, 0, 0);
+    let ones = ir_k(&mut f, 18446744073709551615);
+    let inv = ir_reg(&mut f);
+    ir_emit(&mut f, IR_XOR, inv, mask, ones, 0, 0);
+    let d = ir_reg(&mut f);
+    ir_emit(&mut f, IR_OR, d, kept, inv, 0, 0);
+    return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+  }
+  if name_is(p, i, "shared_id") {
+    let pg = ir_handle_arg(&mut f, c, &mut m, p, n.a);
+    let d = ir_page_id(&mut f, c, pg);
+    return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+  }
+  if name_is(p, i, "dirty_id") {
+    let pg = ir_handle_arg(&mut f, c, &mut m, p, n.a);
+    let base = ir_reg(&mut f);
+    ir_emit(&mut f, IR_GLOBAL, base, IRS_POOL_BASE, 0, 0, 0);
+    let off = ir_reg(&mut f);
+    ir_emit(&mut f, IR_SUB, off, pg, base, 0, 0);
+    let sh = ir_k(&mut f, 12);
+    let d = ir_reg(&mut f);
+    ir_emit(&mut f, IR_SHR, d, off, sh, 0, 0);
+    return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+  }
+  if name_is(p, i, "dirty_zero") {
+    let pg = ir_handle_arg(&mut f, c, &mut m, p, n.a);
+    if f.failed {
+      return ir_none();
+    }
+    ir_emit(&mut f, IR_ZERO, IR_NONE, pg, 0, 0, 0);
+    return IrVal { k: IRK_INT, r0: pg, r1: IR_NONE, t: 0 };
+  }
+  if name_is(p, i, "frame_copy") || name_is(p, i, "shared_copy") {
+    // The whole page, a word at a time; the result is the dirty page.
+    let dst = ir_handle_arg(&mut f, c, &mut m, p, cg_arg(p, i, 0));
+    let src = ir_handle_arg(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    if f.failed {
+      return ir_none();
+    }
+    ir_emit(&mut f, IR_COPYPAGE, IR_NONE, dst, src, 0, 0);
+    return IrVal { k: IRK_INT, r0: dst, r1: IR_NONE, t: 0 };
+  }
+  if name_is(p, i, "dirty_fill") {
+    // dirty_fill(d, src, s): the page from the source's data + s.
+    let dst = ir_handle_arg(&mut f, c, &mut m, p, cg_arg(p, i, 0));
+    let src = ir_buf(&mut f, c, &mut m, p, cg_arg(p, i, 1), IRK_BYTES);
+    let s = ir_handle_arg(&mut f, c, &mut m, p, cg_arg(p, i, 2));
+    if f.failed {
+      return ir_none();
+    }
+    let from = ir_reg(&mut f);
+    ir_emit(&mut f, IR_ADD, from, src.r0, s, 0, c.tu64);
+    ir_emit(&mut f, IR_COPYPAGE, IR_NONE, dst, from, 0, 0);
+    return IrVal { k: IRK_INT, r0: dst, r1: IR_NONE, t: 0 };
+  }
   if name_is(p, i, "pt_lease_count") {
     // The count of the table's page, read from the runtime's array of 32-bit
     // counts (a load is an acquire on x86).
@@ -1918,18 +2083,7 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     if f.failed {
       return ir_none();
     }
-    let id = ir_page_id(&mut f, c, t);
-    let arr = ir_reg(&mut f);
-    if c.target == TARGET_KERNEL {
-      ir_emit(&mut f, IR_GLOBAL, arr, IRS_PT_LEASES, 0, 0, 0);
-    } else {
-      ir_emit(&mut f, IR_GLOBAL, arr, IRS_PT_LEASES, 1, 0, 0);
-    }
-    let two = ir_k(&mut f, 2);
-    let sc = ir_reg(&mut f);
-    ir_emit(&mut f, IR_SHL, sc, id, two, 0, 0);
-    let at = ir_reg(&mut f);
-    ir_emit(&mut f, IR_ADD, at, arr, sc, 0, 0);
+    let at = ir_count_addr(&mut f, c, IRS_PT_LEASES, t);
     let d = ir_reg(&mut f);
     ir_emit(&mut f, IR_DEVR, d, at, 0, 4, 0);
     return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
@@ -2803,6 +2957,7 @@ fn ir_sym(i: u64) -> Str {
   if i == IRS_PORT_CELL { return "bst_rt_port_cell"; }
   if i == IRS_MMIO_CELL { return "bst_rt_mmio_cell"; }
   if i == IRS_PT_LEASES { return "bst_rt_pt_leases"; }
+  if i == IRS_SHARED_REFS { return "bst_rt_shared_refs"; }
   return "bst_kernel_pml4";
 }
 
@@ -3003,6 +3158,27 @@ fn ir_print(out: &mut Vec[u64], f: &IrFn, m: &Mono, p: &Parser) {
     } else if q.op == IR_ZERO {
       w_s(&mut out, "zero ");
       ir_w_reg(&mut out, q.a);
+    } else if q.op == IR_TSC {
+      ir_w_reg(&mut out, q.d);
+      w_s(&mut out, " = tsc");
+    } else if q.op == IR_BOOTINFO {
+      ir_w_reg(&mut out, q.d);
+      w_s(&mut out, " = bootinfo ");
+      ir_w_reg(&mut out, q.a);
+      w_s(&mut out, ", ");
+      ir_w_reg(&mut out, q.b);
+    } else if q.op == IR_LOCKINC {
+      w_s(&mut out, "lockinc ");
+      ir_w_reg(&mut out, q.a);
+    } else if q.op == IR_LOCKDEC {
+      ir_w_reg(&mut out, q.d);
+      w_s(&mut out, " = lockdec ");
+      ir_w_reg(&mut out, q.a);
+    } else if q.op == IR_COPYPAGE {
+      w_s(&mut out, "copypage ");
+      ir_w_reg(&mut out, q.a);
+      w_s(&mut out, ", ");
+      ir_w_reg(&mut out, q.b);
     } else if q.op == IR_FENCE {
       w_s(&mut out, "fence");
     } else if q.op == IR_DEVR || q.op == IR_PIN {
