@@ -1028,6 +1028,47 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
     }
     z = z + 1;
   }
+  // The labels a branch comes back to (loop heads), which get aligned: a
+  // jump (or branch) to a label placed before it, and the targets of the
+  // test that a jump to a test block repeats.
+  let mut heads = vec_new[u64]();
+  z = 0;
+  while z < f.nlabel && z < 100000000 {
+    vec_push(&mut heads, 0);
+    z = z + 1;
+  }
+  z = 0;
+  while z < n {
+    let hq = vec_get(f.ins, z);
+    if hq.op == IR_JMP {
+      let lp = u_at(lpos, hq.a);
+      if lp != 0 && lp <= z {
+        ra_set(&mut heads, hq.a, 1);
+      }
+      let t1 = ix_at(f, lp);
+      let t2 = ix_at(f, wrap_add(lp, 1));
+      let mut tb = t1;
+      if lp != 0 && ix_is_cmp(t1.op) && t2.op == IR_BR && t2.a == t1.d {
+        tb = t2;
+      }
+      if lp != 0 && tb.op == IR_BR {
+        if u_at(lpos, tb.b) != 0 && u_at(lpos, tb.b) <= z {
+          ra_set(&mut heads, tb.b, 1);
+        }
+        if u_at(lpos, tb.c) != 0 && u_at(lpos, tb.c) <= z {
+          ra_set(&mut heads, tb.c, 1);
+        }
+      }
+    } else if hq.op == IR_BR {
+      if u_at(lpos, hq.b) != 0 && u_at(lpos, hq.b) <= z {
+        ra_set(&mut heads, hq.b, 1);
+      }
+      if u_at(lpos, hq.c) != 0 && u_at(lpos, hq.c) <= z {
+        ra_set(&mut heads, hq.c, 1);
+      }
+    }
+    z = z + 1;
+  }
   // The slot area (`ix_share_slots`) is followed by the result areas of
   // the calls that return into the frame.
   let mut sarea = 0;
@@ -1050,6 +1091,9 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       next = nq.a;
     }
     if q.op == IR_LABEL {
+      if u_at(heads, q.a) == 1 {
+        w_s(&mut out, "\t.p2align 4\n");
+      }
       ix_lbl(&mut out, f.x, q.a);
       w_s(&mut out, ":\n");
     } else if q.op == IR_JMP {
@@ -1088,8 +1132,20 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       let mut j = 0;
       while j < q.c && j < 4096 {
         if q.a == IR_NONE {
-          ix_mov(&mut out, ix_loc(al, u_at(f.args, wrap_add(q.b, j))), ix_rl(XR_RAX));
-          w_s(&mut out, "\tmov %rax, ");
+          // A register or a small constant is stored as it is.
+          let src = ix_loc(al, u_at(f.args, wrap_add(q.b, j)));
+          if src.k == IXK_REG {
+            w_s(&mut out, "\tmov ");
+            w_s(&mut out, x86_rname(src.reg));
+            w_s(&mut out, ", ");
+          } else if src.k == IXK_IMM && ix_fits(src.imm) {
+            w_s(&mut out, "\tmovq ");
+            ix_w_imm(&mut out, src.imm);
+            w_s(&mut out, ", ");
+          } else {
+            ix_mov(&mut out, src, ix_rl(XR_RAX));
+            w_s(&mut out, "\tmov %rax, ");
+          }
         } else {
           w_s(&mut out, "\tmov ");
           w_num(&mut out, wrap_mul(8, j));
@@ -1142,6 +1198,7 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
     i = i + 1;
   }
   vec_free(lpos);
+  vec_free(heads);
 }
 
 fn ix_cmp_zero(out: &mut Vec[u64], al: &IrAlloc, r: u64) {
