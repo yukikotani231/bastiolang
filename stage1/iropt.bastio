@@ -487,6 +487,83 @@ fn iropt_thread(f: &mut IrFn) -> u64 {
   return changed;
 }
 
+/// Label clean-up: a `jmp L` whose target follows it (with only labels in
+/// between) goes, and so does every label that no `jmp` or `br` names. The
+/// lowering of `a && b` and of an inlined `return` leaves both behind, and a
+/// label that nothing jumps to still stops copy propagation from looking
+/// past it. Returns how many instructions it removed.
+fn iropt_labels(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  let mut dead = vec_new[u64]();
+  let mut i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    vec_push(&mut dead, 0);
+    if q.op == IR_JMP {
+      let mut p = wrap_add(i, 1);
+      let mut going = true;
+      while going && p < n {
+        let t = vec_get(f.ins, p);
+        if t.op == IR_LABEL {
+          if t.a == q.a {
+            ra_set(&mut dead, i, 1);
+            going = false;
+          }
+          p = wrap_add(p, 1);
+        } else {
+          going = false;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  let mut refs = vec_new[u64]();
+  let mut l = 0;
+  while l < f.nlabel && l < 1000000000 {
+    vec_push(&mut refs, 0);
+    l = l + 1;
+  }
+  i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    if u_at(dead, i) == 0 {
+      if q.op == IR_JMP && q.a < f.nlabel {
+        ra_set(&mut refs, q.a, 1);
+      }
+      if q.op == IR_BR {
+        if q.b < f.nlabel {
+          ra_set(&mut refs, q.b, 1);
+        }
+        if q.c < f.nlabel {
+          ra_set(&mut refs, q.c, 1);
+        }
+      }
+    }
+    i = i + 1;
+  }
+  let mut out = vec_new[IrIns]();
+  let mut total = 0;
+  i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    let mut drop = u_at(dead, i) == 1;
+    if q.op == IR_LABEL && q.a < f.nlabel && u_at(refs, q.a) == 0 {
+      drop = true;
+    }
+    if drop {
+      total = wrap_add(total, 1);
+    } else {
+      vec_push(&mut out, q);
+    }
+    i = i + 1;
+  }
+  vec_free(dead);
+  vec_free(refs);
+  vec_free(f.ins);
+  f.ins = out;
+  return total;
+}
+
 /// The value that the register `r` is known to hold: `kv` at the position
 /// where `kr` has it (IR_NONE: not known).
 fn iropt_known(kr: &Vec[u64], kv: &Vec[u64], r: u64) -> u64 {
