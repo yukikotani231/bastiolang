@@ -672,7 +672,8 @@ static bst_buf bst_try_alloc(uint64_t n) {
     }
     bst_lock_release(&bst_arena_lock);
     if (!blk) { bst_buf none = { 0, 0 }; return none; }
-    for (uint64_t i = 1; i < words; i++) blk[i] = 0;
+    uint64_t *z = blk + 1, zc = words - 1;       /* rep stosq: one string store, not a word at a time */
+    __asm__ volatile ("rep stosq" : "+D"(z), "+c"(zc) : "a"(0) : "memory");
     bst_buf b = { n, blk + 1 };
     return b;
 }
