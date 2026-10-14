@@ -2902,6 +2902,27 @@ fn x86_branch(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, target
       x86_branch_inline(&mut g, c, &mut m, p, x, ci, target, when);
       return;
     }
+    // A bit of a page-table slot: test it in place, no 0/1 value.
+    if x == 0 && is_builtin_name(c, p, n.s, n.e)
+      && (name_is(p, ci, "pt_has") || name_is(p, ci, "pt_writable") || name_is(p, ci, "pt_shared") || name_is(p, ci, "pt_accessible")) {
+      x86_to_regs(&mut g, c, &mut m, p, ci, XR_RDX, XR_RAX, 0, 0, 0);
+      x86_es(&mut g, "mov (%rdx,%rax,8), %rax");
+      if name_is(p, ci, "pt_has") {
+        x86_es(&mut g, "test $0x401, %eax");
+      } else if name_is(p, ci, "pt_writable") {
+        x86_es(&mut g, "test $2, %al");
+      } else if name_is(p, ci, "pt_shared") {
+        x86_es(&mut g, "test $0x200, %eax");
+      } else {
+        x86_es(&mut g, "test $1, %al");
+      }
+      if when {
+        x86_jump(&mut g, "jnz", target);
+      } else {
+        x86_jump(&mut g, "jz", target);
+      }
+      return;
+    }
   }
   if k == E_BIN && (n.v == P_ANDAND || n.v == P_OROR || n.v == P_IMPLIES) {
     // `a` decides the whole when it is `stop`: false for `&&`, true for
