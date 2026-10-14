@@ -3594,6 +3594,17 @@ fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
         ir_store_val(&mut f, c, m, p, target, v);
       } else if v.k != target.k {
         ir_fail(&mut f, "an assignment between kinds");
+      } else if v.k == IRK_VEC && rhs.kind == E_VAR {
+        // A vector taken from another variable moves its header words: both
+        // names stand for headers in the frame, and the source's header is
+        // written again when the code that made it runs again (a loop), so
+        // the target must not keep pointing at it.
+        let mut j = 0;
+        while j < 3 {
+          let w = ir_hdr_load(&mut f, v.r0, j);
+          ir_hdr_store(&mut f, target.r0, j, w);
+          j = j + 1;
+        }
       } else {
         ir_copy(&mut f, target, v);
       }
