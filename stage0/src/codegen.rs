@@ -1205,7 +1205,7 @@ static inline bst_frame bst_pt_free_root(bst_mmu m, bst_pt t) { (void)m; return 
 
 /* Saved user registers: rax rbx rcx rdx rsi rdi rbp r8-r15 (0-14), rip (15),
  * rsp (16), rflags (17), error code (18), fault address (19), FS base (20). */
-extern uint64_t *bst_platform_ctx(void); /* this processor's saved context, 21 words */
+extern uint64_t *bst_platform_ctx(void) __attribute__((const)); /* this processor's saved context, 21 words; the same for the whole of a call, so loops over it call once */
 extern uint64_t bst_cpu_enter(void);   /* enter user mode; returns the trap vector */
 extern uint64_t bst_cpu_wait(void);    /* sti; hlt; cli; returns the interrupt vector */
 static inline uint64_t bst_cpu_get(bst_cpu c, uint64_t r) { (void)c; return bst_platform_ctx()[r]; }
