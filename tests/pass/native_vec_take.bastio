@@ -1,0 +1,49 @@
+// native backend: taking a wide element out of a vector and leaving a
+// payload-less variant in its place (`vec_swap` of a unit variant)
+// expect-exit: 0
+struct Wide { a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64 }
+
+enum Slot { Free, Full(Wide) }
+
+fn take(v: &mut Vec[Slot], i: u64) -> Slot
+  requires i < vlen(v)
+{
+  return vec_swap(&mut v, i, Slot::Free);
+}
+
+fn main() -> u64 {
+  let mut v = vec_new[Slot]();
+  let mut i = 0;
+  while i < 5
+    invariant i <= 5 && vlen(v) == i
+  {
+    vec_push(&mut v, Slot::Full(Wide { a: i, b: i + 1, c: i + 2, d: i + 3, e: i + 4, f: i + 5, g: i + 6 }));
+    i = i + 1;
+  }
+  let mut bad = 0;
+  match take(&mut v, 3) {
+    Slot::Free => { bad = 1; },
+    Slot::Full(w) => {
+      if w.a != 3 || w.d != 6 || w.g != 9 { bad = 2; }
+    },
+  }
+  // The slot is free now, and its neighbours are untouched.
+  match take(&mut v, 3) {
+    Slot::Free => {},
+    Slot::Full(w) => { bad = 3; },
+  }
+  match take(&mut v, 4) {
+    Slot::Free => { bad = 4; },
+    Slot::Full(w) => {
+      if w.a != 4 || w.g != 10 { bad = 5; }
+    },
+  }
+  match take(&mut v, 0) {
+    Slot::Free => { bad = 6; },
+    Slot::Full(w) => {
+      if w.b != 1 || w.f != 5 { bad = 7; }
+    },
+  }
+  vec_free(v);
+  return bad;
+}

@@ -544,6 +544,24 @@ fn ix_ends_with(v: &Vec[u64], s: Str) -> bool {
   return true;
 }
 
+/// Whether the text `v` contains `pat`.
+fn ix_mentions(v: &Vec[u64], pat: Str) -> bool {
+  let n = vec_len(v);
+  let m = slen(pat);
+  let mut i = 0;
+  while i < n {
+    let mut j = 0;
+    while j < m && i + j < n && vec_get(v, i + j) == cast[u64](sget(pat, j)) {
+      j = j + 1;
+    }
+    if j == m {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
 /// One instruction other than control flow and calls.
 fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: &Parser, q: IrIns, slotw: u64) {
   let op = q.op;
@@ -551,12 +569,49 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
   let lbq = ix_loc(al, q.b);
   if slen(alu) > 0 {
     let ld = ix_loc(al, q.d);
-    let la = ix_loc(al, q.a);
+    let mut la = ix_loc(al, q.a);
     let wrap = q.c == 1 && q.ty != 0 && slen(x86_normalize(m, q.ty)) > 0;
     let mut t = XR_RAX;
-    let lb0 = ix_loc(al, q.b);
+    let mut lb0 = ix_loc(al, q.b);
+    // `d = a op d` of a commutative operation is `d = d op a`.
+    if (op == IR_ADD || op == IR_MUL || op == IR_AND || op == IR_OR || op == IR_XOR) && ld.k == IXK_REG && lb0.k == IXK_REG && lb0.reg == ld.reg && !(la.k == IXK_REG && la.reg == ld.reg) {
+      let sw = la;
+      la = lb0;
+      lb0 = sw;
+    }
     if ld.k == IXK_REG && !wrap && !(lb0.k == IXK_REG && lb0.reg == ld.reg) {
       t = ld.reg;
+    }
+    if op == IR_MUL && !wrap && ld.k == IXK_REG && lb0.k == IXK_IMM && ix_fits(lb0.imm) && la.k != IXK_IMM {
+      // `d = a * imm`: the three-operand form, with no move first.
+      w_s(&mut out, "\timul ");
+      ix_op(&mut out, lb0);
+      w_s(&mut out, ", ");
+      ix_op(&mut out, la);
+      w_s(&mut out, ", ");
+      ix_op(&mut out, ld);
+      w_s(&mut out, "\n");
+      return;
+    }
+    if op == IR_AND && ld.k == IXK_REG && la.k == IXK_REG && lb0.k == IXK_IMM && lb0.imm == 4294967295 {
+      // `d = a & 0xffffffff`: a 32-bit move zero-extends.
+      w_s(&mut out, "\tmovl ");
+      w_s(&mut out, ix_name32(la.reg));
+      w_s(&mut out, ", ");
+      w_s(&mut out, ix_name32(ld.reg));
+      w_s(&mut out, "\n");
+      return;
+    }
+    if op == IR_ADD && !wrap && ld.k == IXK_REG && la.k == IXK_REG && lb0.k == IXK_REG && la.reg != ld.reg && lb0.reg != ld.reg {
+      // `d = a + b` into a third register: one lea.
+      w_s(&mut out, "\tlea (");
+      w_s(&mut out, x86_rname(la.reg));
+      w_s(&mut out, ", ");
+      w_s(&mut out, x86_rname(lb0.reg));
+      w_s(&mut out, "), ");
+      w_s(&mut out, x86_rname(ld.reg));
+      w_s(&mut out, "\n");
+      return;
     }
     if op == IR_ADD && !wrap && ld.k == IXK_REG && la.k == IXK_REG && lb0.k == IXK_IMM && ix_fits(lb0.imm) && la.reg != ld.reg {
       // `d = a + imm` into another register: one lea instead of a move and an add.
@@ -593,6 +648,49 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     }
   } else if op == IR_MOV {
     ix_mov(&mut out, ix_loc(al, q.a), ix_loc(al, q.d));
+  } else if (op == IR_DIV || op == IR_REM) && lbq.k == IXK_IMM && lbq.imm > 1 && lbq.imm & wrap_sub(lbq.imm, 1) == 0 && (op == IR_DIV || lbq.imm <= 2147483648 || lbq.imm == 4294967296) {
+    // A power of two: a shift or a mask, in the result's own register.
+    let ld = ix_loc(al, q.d);
+    let mut t = XR_RAX;
+    if ld.k == IXK_REG {
+      t = ld.reg;
+    }
+    if op == IR_REM && lbq.imm == 4294967296 {
+      // The low 32 bits: a 32-bit move zero-extends.
+      let la = ix_loc(al, q.a);
+      if la.k == IXK_REG {
+        w_s(&mut out, "\tmovl ");
+        w_s(&mut out, ix_name32(la.reg));
+      } else {
+        ix_mov(&mut out, la, ix_rl(t));
+        w_s(&mut out, "\tmovl ");
+        w_s(&mut out, ix_name32(t));
+      }
+      w_s(&mut out, ", ");
+      w_s(&mut out, ix_name32(t));
+      w_s(&mut out, "\n");
+      ix_finish(&mut out, al, q.d, t);
+      return;
+    }
+    ix_mov(&mut out, ix_loc(al, q.a), ix_rl(t));
+    if op == IR_DIV {
+      let mut sh = 0;
+      let mut v = lbq.imm;
+      while v > 1 && sh < 64 {
+        v = v / 2;
+        sh = sh + 1;
+      }
+      w_s(&mut out, "\tshr $");
+      w_num(&mut out, sh);
+      w_s(&mut out, ", ");
+    } else {
+      w_s(&mut out, "\tand $");
+      w_num(&mut out, wrap_sub(lbq.imm, 1));
+      w_s(&mut out, ", ");
+    }
+    w_s(&mut out, x86_rname(t));
+    w_s(&mut out, "\n");
+    ix_finish(&mut out, al, q.d, t);
   } else if (op == IR_DIV || op == IR_REM) && lbq.k == IXK_IMM && lbq.imm != 0 {
     // A constant divisor: shifts and a multiplication, as the generator
     // of x86.bastio does it (the code is written into its line buffer).
@@ -628,8 +726,13 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
       ix_finish(&mut out, al, q.d, XR_RAX);
     }
   } else if op == IR_SHL || op == IR_SHR || op == IR_SAR {
-    ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RAX));
     let lb = ix_loc(al, q.b);
+    let ld = ix_loc(al, q.d);
+    let mut t = XR_RAX;
+    if lb.k == IXK_IMM && lb.imm < 64 && ld.k == IXK_REG {
+      t = ld.reg;
+    }
+    ix_mov(&mut out, ix_loc(al, q.a), ix_rl(t));
     let mut ins = "sar";
     if op == IR_SHL {
       ins = "shl";
@@ -637,14 +740,14 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
       ins = "shr";
     }
     if lb.k == IXK_IMM && lb.imm < 64 {
-      ix_ins2(&mut out, ins, lb, ix_rl(XR_RAX));
+      ix_ins2(&mut out, ins, lb, ix_rl(t));
     } else {
       ix_mov(&mut out, lb, ix_rl(XR_RCX));
       w_s(&mut out, "\t");
       w_s(&mut out, ins);
       w_s(&mut out, " %cl, %rax\n");
     }
-    ix_finish(&mut out, al, q.d, XR_RAX);
+    ix_finish(&mut out, al, q.d, t);
   } else if op == IR_NOT {
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RAX));
     if q.ty != 0 {
@@ -752,19 +855,73 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
   } else if op == IR_TSC {
     w_s(&mut out, "\trdtsc\n\tshl $32, %rdx\n\tor %rdx, %rax\n");
     ix_finish(&mut out, al, q.d, XR_RAX);
+  } else if op == IR_PCALL && (q.c == 3 || q.c == 6) {
+    // `cpu_get` / `cpu_set`: the saved context is the start of the processor's
+    // block, which is %rsp rounded down (bst_platform_ctx_mask, from the
+    // platform). No call; a constant word index is a displacement.
+    let la = ix_loc(al, q.a);
+    let mut disp = false;
+    let mut ix = XR_RDI;
+    if la.k == IXK_IMM && la.imm < 268435456 {
+      disp = true;
+    } else if la.k == IXK_REG {
+      ix = la.reg;
+    } else {
+      ix_mov(&mut out, la, ix_rl(XR_RDI));
+    }
+    w_s(&mut out, "\tmov %rsp, %rax\n\tand $bst_platform_ctx_mask, %rax\n");
+    let mut addr = vec_new[u64]();
+    if disp {
+      w_num(&mut addr, wrap_mul(8, la.imm));
+      w_s(&mut addr, "(%rax)");
+    } else {
+      w_s(&mut addr, "(%rax,");
+      w_s(&mut addr, x86_rname(ix));
+      w_s(&mut addr, ",8)");
+    }
+    if q.c == 3 {
+      let ld = ix_loc(al, q.d);
+      let mut t = XR_RAX;
+      if ld.k == IXK_REG {
+        t = ld.reg;
+      }
+      w_s(&mut out, "\tmov ");
+      w_append(&mut out, addr);
+      w_s(&mut out, ", ");
+      w_s(&mut out, x86_rname(t));
+      w_s(&mut out, "\n");
+      ix_finish(&mut out, al, q.d, t);
+    } else {
+      let lv = ix_loc(al, q.b);
+      if lv.k == IXK_IMM && ix_fits(lv.imm) {
+        w_s(&mut out, "\tmovq ");
+        ix_w_imm(&mut out, lv.imm);
+      } else {
+        let mut v = XR_RSI;
+        if lv.k == IXK_REG {
+          v = lv.reg;
+        } else {
+          ix_mov(&mut out, lv, ix_rl(XR_RSI));
+        }
+        w_s(&mut out, "\tmov ");
+        w_s(&mut out, x86_rname(v));
+      }
+      w_s(&mut out, ", ");
+      w_append(&mut out, addr);
+      w_s(&mut out, "\n");
+    }
+    vec_free(addr);
   } else if op == IR_PCALL {
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RDI));
-    ix_mov(&mut out, ix_loc(al, q.b), ix_rl(XR_RSI));
+    if q.c != 3 {
+      ix_mov(&mut out, ix_loc(al, q.b), ix_rl(XR_RSI));
+    }
     if q.c == 0 {
       w_s(&mut out, "\tlea bst_platform_info(%rip), %rax\n\tcall bst_rt_ccall\n");
     } else if q.c == 1 {
       w_s(&mut out, "\tlea bst_platform_acpi(%rip), %rax\n\tcall bst_rt_ccall\n");
     } else if q.c == 2 {
       w_s(&mut out, "\tlea bst_platform_cpus(%rip), %rax\n\tcall bst_rt_ccall\n");
-    } else if q.c == 3 {
-      w_s(&mut out, "\tcall bst_rt_cpu_get\n");
-    } else if q.c == 6 {
-      w_s(&mut out, "\tcall bst_rt_cpu_set\n");
     } else if q.c == 7 {
       w_s(&mut out, "\tcall bst_rt_fpu_load\n");
     } else if q.c == 9 {
@@ -830,6 +987,12 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RDI));
     ix_mov(&mut out, ix_loc(al, q.b), ix_rl(XR_RSI));
     w_s(&mut out, "\tmov $512, %ecx\n\trep movsq\n");
+  } else if op == IR_COPY {
+    // Whole words with rep movsq, then the rest with rep movsb.
+    ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RDI));
+    ix_mov(&mut out, ix_loc(al, q.b), ix_rl(XR_RSI));
+    ix_mov(&mut out, ix_loc(al, q.c), ix_rl(XR_RCX));
+    w_s(&mut out, "\tmov %rcx, %rax\n\tshr $3, %rcx\n\trep movsq\n\tmov %eax, %ecx\n\tand $7, %ecx\n\trep movsb\n");
   } else if op == IR_XCHG {
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RCX));
     ix_mov(&mut out, ix_loc(al, q.b), ix_rl(XR_RAX));
@@ -1508,6 +1671,7 @@ fn ix_share_slots(f: &mut IrFn, moff: &mut Vec[u64]) -> u64 {
   vec_free(iv.hi);
   vec_free(lv.inn);
   vec_free(lv.out);
+  vec_free(lv.bit);
   vec_free(bl);
   return area;
 }
@@ -1525,8 +1689,15 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   }
   iropt_inline(&mut f, c, &mut m, p);
   iropt_slots(&mut f);
+  iropt_fold(&mut f);
   iropt_copies(&mut f);
   iropt_dce(&mut f);
+  if iropt_unroll(&mut f) > 0 {
+    iropt_fold(&mut f);
+    iropt_copies(&mut f);
+    iropt_dce(&mut f);
+  }
+  iropt_switch(&mut f);
   iropt_thread(&mut f);
   if iropt_merge(&mut f) > 0 {
     iropt_copies(&mut f);
@@ -1549,6 +1720,7 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   }
   iropt_dead_live(&mut f);
   iropt_copies(&mut f);
+  iropt_fold(&mut f);
   iropt_dce(&mut f);
   ix_coalesce(&mut f);
   let xi = inst_at(m, x);
@@ -1592,12 +1764,11 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   ix_sym(&mut out, &mut g, m, p, x);
   w_s(&mut out, ", @function\n");
   ix_sym(&mut out, &mut g, m, p, x);
-  w_s(&mut out, ":                  # from the IR\n\tpush %rbp\n\tmov %rsp, %rbp\n\tsub $");
-  w_num(&mut out, wrap_mul(8, words));
-  w_s(&mut out, ", %rsp\n");
+  w_s(&mut out, ":                  # from the IR\n");
+  let mut inner = vec_new[u64]();
   k = 0;
   while k < al.ncallee_used {
-    ix_ins2(&mut out, "mov", ix_rl(ix_callee(k)), ix_ml(wrap_add(k, 1)));
+    ix_ins2(&mut inner, "mov", ix_rl(ix_callee(k)), ix_ml(wrap_add(k, 1)));
     k = k + 1;
   }
   // The parameters, from their argument registers or stack words.
@@ -1608,19 +1779,19 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
       let dst = ix_loc(al, r);
       let ps = u_at(pos, k);
       if na > 0 {
-        ix_mov(&mut out, ix_rl(x86_argreg(ps)), dst);
+        ix_mov(&mut inner, ix_rl(x86_argreg(ps)), dst);
       } else {
         let mut t = dst.reg;
         if dst.k != IXK_REG {
           t = XR_RAX;
         }
-        w_s(&mut out, "\tmov ");
-        w_num(&mut out, wrap_add(16, wrap_mul(8, ps)));
-        w_s(&mut out, "(%rbp), ");
-        w_s(&mut out, x86_rname(t));
-        w_s(&mut out, "\n");
+        w_s(&mut inner, "\tmov ");
+        w_num(&mut inner, wrap_add(16, wrap_mul(8, ps)));
+        w_s(&mut inner, "(%rbp), ");
+        w_s(&mut inner, x86_rname(t));
+        w_s(&mut inner, "\n");
         if dst.k != IXK_REG {
-          ix_mov(&mut out, ix_rl(XR_RAX), dst);
+          ix_mov(&mut inner, ix_rl(XR_RAX), dst);
         }
       }
     }
@@ -1631,20 +1802,34 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   if na == 0 {
     retoff = wrap_add(16, wrap_mul(8, vec_len(pos)));
   }
-  ix_body(&mut out, f, al, &mut g, c, &mut m, p, nuse, moff, base, ix_buffer(c, m, p, rt), retoff);
-  ix_lbl(&mut out, x, IR_NONE);
-  w_s(&mut out, ":\n");
+  ix_body(&mut inner, f, al, &mut g, c, &mut m, p, nuse, moff, base, ix_buffer(c, m, p, rt), retoff);
+  ix_lbl(&mut inner, x, IR_NONE);
+  w_s(&mut inner, ":\n");
   k = 0;
   while k < al.ncallee_used {
-    ix_ins2(&mut out, "mov", ix_ml(wrap_add(k, 1)), ix_rl(ix_callee(k)));
+    ix_ins2(&mut inner, "mov", ix_ml(wrap_add(k, 1)), ix_rl(ix_callee(k)));
     k = k + 1;
   }
-  w_s(&mut out, "\tleave\n\tret\n\t.size ");
-  ix_sym(&mut out, &mut g, m, p, x);
-  w_s(&mut out, ", .-");
-  ix_sym(&mut out, &mut g, m, p, x);
-  w_s(&mut out, "\n\n");
+  // A function with no frame, no calls and no use of the frame pointer
+  // needs none of it: no push, no leave.
+  let bare = words == 0 && !ix_mentions(inner, "%rbp") && !ix_mentions(inner, "%rsp") && !ix_mentions(inner, "call");
+  if bare {
+    w_s(&mut inner, "\tret\n\t.size ");
+  } else {
+    w_s(&mut inner, "\tleave\n\tret\n\t.size ");
+  }
+  ix_sym(&mut inner, &mut g, m, p, x);
+  w_s(&mut inner, ", .-");
+  ix_sym(&mut inner, &mut g, m, p, x);
+  w_s(&mut inner, "\n\n");
+  if !bare {
+    w_s(&mut out, "\tpush %rbp\n\tmov %rsp, %rbp\n\tsub $");
+    w_num(&mut out, wrap_mul(8, words));
+    w_s(&mut out, ", %rsp\n");
+  }
+  w_append(&mut out, inner);
   w_append(&mut g.out, out);
+  vec_free(inner);
   vec_free(out);
   vec_free(nuse);
   vec_free(moff);

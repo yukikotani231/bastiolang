@@ -2902,6 +2902,27 @@ fn x86_branch(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, target
       x86_branch_inline(&mut g, c, &mut m, p, x, ci, target, when);
       return;
     }
+    // A bit of a page-table slot: test it in place, no 0/1 value.
+    if !g.stage0 && x == 0 && is_builtin_name(c, p, n.s, n.e)
+      && (name_is(p, ci, "pt_has") || name_is(p, ci, "pt_writable") || name_is(p, ci, "pt_shared") || name_is(p, ci, "pt_accessible")) {
+      x86_to_regs(&mut g, c, &mut m, p, ci, XR_RDX, XR_RAX, 0, 0, 0);
+      x86_es(&mut g, "mov (%rdx,%rax,8), %rax");
+      if name_is(p, ci, "pt_has") {
+        x86_es(&mut g, "test $0x401, %eax");
+      } else if name_is(p, ci, "pt_writable") {
+        x86_es(&mut g, "test $2, %al");
+      } else if name_is(p, ci, "pt_shared") {
+        x86_es(&mut g, "test $0x200, %eax");
+      } else {
+        x86_es(&mut g, "test $1, %al");
+      }
+      if when {
+        x86_jump(&mut g, "jnz", target);
+      } else {
+        x86_jump(&mut g, "jz", target);
+      }
+      return;
+    }
   }
   if k == E_BIN && (n.v == P_ANDAND || n.v == P_OROR || n.v == P_IMPLIES) {
     // `a` decides the whole when it is `stop`: false for `&&`, true for
@@ -4270,6 +4291,32 @@ fn x86_to_regs(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, r1: u
   if r1 != 0 { x86_pop(&mut g, x86_reg(r1)); }
 }
 
+/// Like x86_to_regs for a call whose argument 0 is a processor capability
+/// (`cpu_get(cpu, r)`, `cpu_set(&mut cpu, r, v)`): it has no run-time
+/// contents, so a variable or a `&mut` of one is not evaluated. The other
+/// arguments land in `r2` and `r3`.
+fn x86_to_regs_cpu(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, r2: u64, r3: u64) {
+  let n = node_at(p.nodes, i);
+  let mut a = n.a;
+  if a != 0 {
+    let an = node_at(p.nodes, a);
+    let k = an.kind;
+    if k == E_VAR || k == E_MUTBORROW {
+      a = next_of(p, a);
+    } else {
+      x86_arg(&mut g, c, &mut m, p, a);
+      x86_drop(&mut g, 1);
+      a = next_of(p, a);
+    }
+  }
+  while a != 0 {
+    x86_arg(&mut g, c, &mut m, p, a);
+    a = next_of(p, a);
+  }
+  if r3 != 0 { x86_pop(&mut g, x86_reg(r3)); }
+  if r2 != 0 { x86_pop(&mut g, x86_reg(r2)); }
+}
+
 /// Copies %rcx bytes from (%rsi) to (%rdi), lowest first: whole words with
 /// rep movsq, then the rest with rep movsb (the C prelude's bst_copy_fwd).
 fn x86_copy_fwd(g: &mut X86) {
@@ -4299,6 +4346,17 @@ fn x86_copy_bytes_src(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64
   x86_es(&mut g, "add %rax, %rsi");
   x86_pop(&mut g, x86_reg(XR_RAX));
   x86_pop(&mut g, x86_reg(XR_RDI));
+}
+
+/// Is `a2` a variant without a payload, and the elements of vector `a0`
+/// wide enough that `vec_swap` copies them with `rep movsq`?
+fn x86_unit_swap(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, a0: u64, a2: u64) -> bool {
+  let vn = node_at(p.nodes, x86_core(p, a2));
+  if vn.kind != E_VARIANT || vn.a != 0 {
+    return false;
+  }
+  let w = x86_words(&mut g, c, m, p, x86_vec_elem(&mut g, c, &mut m, p, a0));
+  return w >= X86_REP_COPY;
 }
 
 /// %rcx = the address of element %rax of the vector at (%rdi), for
@@ -5018,6 +5076,28 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_e(&mut g);
     x86_es(&mut g, "add %rax, %rcx");
     x86_push_from(&mut g, x86_mem_loc(XR_RCX, XB, 0), w);
+  } else if !g.stage0 && name_is(p, i, "vec_swap") && x86_unit_swap(&mut g, c, &mut m, p, a0, a2) {
+    // stage1: taking an element out and leaving a payload-less variant
+    // (`Free`) in its place: the old value is copied once, to the result,
+    // and only the tag of the new one is stored.
+    let w = x86_words(&mut g, c, m, p, x86_vec_elem(&mut g, c, &mut m, p, a0));
+    let vn = node_at(p.nodes, x86_core(p, a2));
+    let vt = x86_ty(&mut g, c, &mut m, p, a2);
+    let tag = cg_variant(m, p, inner_t(m, vt), vn.s2, vn.e2);
+    x86_arg(&mut g, c, &mut m, p, a0);
+    x86_scalar(&mut g, c, &mut m, p, a1);
+    x86_push(&mut g, x86_reg(XR_RAX));
+    x86_es(&mut g, "mov (%rsp), %rax");
+    x86_es(&mut g, "mov 8(%rsp), %rdi");
+    x86_elem_addr(&mut g, w);
+    x86_es(&mut g, "mov %rcx, %rdx");
+    x86_drop(&mut g, 2);
+    x86_reserve(&mut g, w);
+    x86_rep_copy(&mut g, "mov %rdx, %rsi", "mov %rsp, %rdi", w);
+    x86_t(&mut g, "movq $");
+    x86_n(&mut g, tag);
+    x86_t(&mut g, ", (%rdx)");
+    x86_e(&mut g);
   } else if name_is(p, i, "vec_set") || name_is(p, i, "vec_swap") {
     let w = x86_words(&mut g, c, m, p, x86_vec_elem(&mut g, c, &mut m, p, a0));
     x86_arg(&mut g, c, &mut m, p, a0);
@@ -5624,11 +5704,17 @@ fn x86_builtin1(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_es(&mut g, "shl $32, %rdx");
     x86_es(&mut g, "or %rdx, %rax");
   } else if name_is(p, i, "cpu_get") {
-    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RDI, 0, 0, 0);
-    x86_es(&mut g, "call bst_rt_cpu_get");
+    x86_to_regs_cpu(&mut g, c, &mut m, p, i, XR_RDI, 0);
+    // The saved context is the start of the processor's block, which is %rsp rounded down
+    // (bst_platform_ctx_mask, from the platform): no call, so nothing around it is spilled.
+    x86_es(&mut g, "mov %rsp, %rax");
+    x86_es(&mut g, "and $bst_platform_ctx_mask, %rax");
+    x86_es(&mut g, "mov (%rax,%rdi,8), %rax");
   } else if name_is(p, i, "cpu_set") {
-    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RDI, XR_RSI, 0, 0);
-    x86_es(&mut g, "call bst_rt_cpu_set");
+    x86_to_regs_cpu(&mut g, c, &mut m, p, i, XR_RDI, XR_RSI);
+    x86_es(&mut g, "mov %rsp, %rax");
+    x86_es(&mut g, "and $bst_platform_ctx_mask, %rax");
+    x86_es(&mut g, "mov %rsi, (%rax,%rdi,8)");
   } else if name_is(p, i, "cpu_fpu_save") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RAX, 0, 0, 0);
     x86_es(&mut g, "mov (%rax), %rax");
@@ -6287,10 +6373,13 @@ fn x86_peephole(code: &Vec[u64], out: &mut Vec[u64], opt: bool) {
   // more pushes and pops pair up.
   let mut mid3 = vec_new[u64]();
   x86_peep_pairs(mid2, &mut mid3, true);
-  x86_peep_acc(mid3, &mut out);
+  let mut mid4 = vec_new[u64]();
+  x86_peep_acc(mid3, &mut mid4);
+  x86_cmp_chain(mid4, &mut out);
   vec_free(mid);
   vec_free(mid2);
   vec_free(mid3);
+  vec_free(mid4);
 }
 
 /// The start of every line of `code`.
@@ -7473,6 +7562,199 @@ fn x86_rax_names_ok(code: &Vec[u64], s: u64, e: u64) -> bool {
     k = k + 1;
   }
   return true;
+}
+
+/// The number N of a line `\tcmpq $N, %reg` when N is a decimal below 2^31;
+/// ~0 for a line of any other shape.
+fn x86_cc_value(code: &Vec[u64], s: u64, e: u64) -> u64 {
+  if !x86_has_prefix(code, s, "\tcmpq $") {
+    return wrap_sub(0, 1);
+  }
+  let mut k = wrap_add(s, 7);
+  let mut v = 0;
+  let mut n = 0;
+  while k < e && n < 10 && u_at(code, k) >= 48 && u_at(code, k) <= 57
+    invariant n <= 10
+  {
+    v = wrap_add(wrap_mul(v, 10), wrap_sub(u_at(code, k), 48));
+    k = wrap_add(k, 1);
+    n = n + 1;
+  }
+  if n == 0 || u_at(code, k) != 44 || v >= 2147483648 {
+    return wrap_sub(0, 1);
+  }
+  return v;
+}
+
+/// Writes the label of one node of a comparison tree: the chain's target
+/// (text `ts` to `te`), the line the chain starts at and the range of values.
+fn x86_cc_label(out: &mut Vec[u64], code: &Vec[u64], ts: u64, te: u64, at: u64, lo: u64, hi: u64) {
+  x86_copy_text(code, ts, te, &mut out);
+  w_s(&mut out, "_c");
+  w_num(&mut out, at);
+  w_s(&mut out, "_");
+  w_num(&mut out, lo);
+  w_s(&mut out, "_");
+  w_num(&mut out, hi);
+}
+
+/// Does the instruction at line `q` or after (labels and directives skipped)
+/// read the flags a compare left? Then a chain of `cmpq $N, %reg` / `je L`
+/// cannot be rewritten: its last compare leaves different flags behind.
+fn x86_cc_flags_read(code: &Vec[u64], starts: &Vec[u64], q0: u64) -> bool
+  requires q0 <= vlen(starts)
+{
+  let nl = vec_len(starts);
+  let mut q = q0;
+  while q < nl
+    invariant q <= nl
+  {
+    let s = u_at(starts, q);
+    let e = x86_line_end(code, s);
+    if e > s && u_at(code, wrap_sub(e, 1)) == 58 {
+      q = q + 1;
+    } else if x86_has_prefix(code, s, "\t.") {
+      q = q + 1;
+    } else {
+      if x86_has_prefix(code, s, "\tj") && !x86_has_prefix(code, s, "\tjmp") {
+        return true;
+      }
+      return x86_has_prefix(code, s, "\tset") || x86_has_prefix(code, s, "\tcmov") || x86_has_prefix(code, s, "\tadc")
+        || x86_has_prefix(code, s, "\tsbb") || x86_has_prefix(code, s, "\tpushf") || x86_has_prefix(code, s, "\tlahf")
+        || x86_has_prefix(code, s, "\trcl") || x86_has_prefix(code, s, "\trcr");
+    }
+  }
+  return false;
+}
+
+/// A run of `cmpq $N, %reg` / `je L` pairs with one register and one target
+/// (a long `a == 3 || a == 9 || ..`, or the arms of a `match` on integers)
+/// becomes a binary search, which takes about 2 * log2(n) instructions
+/// where the chain takes 2 * n/2 on average. Only when the code after the
+/// chain does not read the flags (see x86_cc_flags_read).
+fn x86_cmp_chain(code: &Vec[u64], out: &mut Vec[u64]) {
+  let starts = x86_line_starts(code);
+  let nl = vec_len(starts);
+  let none = wrap_sub(0, 1);
+  let mut i = 0;
+  while i < nl
+    invariant i <= nl
+  {
+    let s = u_at(starts, i);
+    let e = x86_line_end(code, s);
+    let mut done = false;
+    if x86_cc_value(code, s, e) != none && i + 1 < nl && x86_has_prefix(code, u_at(starts, i + 1), "\tje ") {
+      let rs = x86_last_op(code, s, e);
+      let s1 = u_at(starts, i + 1);
+      let e1 = x86_line_end(code, s1);
+      let ts = wrap_add(s1, 4);
+      let mut vals = vec_new[u64]();
+      let mut j = i;
+      let mut more = true;
+      while more && j + 1 < nl
+        invariant j <= nl
+      {
+        let a = u_at(starts, j);
+        let ae = x86_line_end(code, a);
+        let b = u_at(starts, j + 1);
+        let be = x86_line_end(code, b);
+        let v = x86_cc_value(code, a, ae);
+        if v != none && x86_has_prefix(code, b, "\tje ") && x86_same_text(code, x86_last_op(code, a, ae), ae, rs, e)
+          && x86_same_text(code, wrap_add(b, 4), be, ts, e1)
+        {
+          vec_push(&mut vals, v);
+          j = j + 2;
+        } else {
+          more = false;
+        }
+      }
+      if vec_len(vals) >= 6 && !x86_cc_flags_read(code, starts, j) {
+        // Sorted, without repeats.
+        let mut k = 1;
+        while k < vec_len(vals)
+          invariant k >= 1 && k <= vlen(vals)
+        {
+          let x = vec_get(vals, k);
+          let mut m = k;
+          while m > 0 && vec_get(vals, m - 1) > x
+            invariant m <= k && k < vlen(vals)
+          {
+            vec_set(&mut vals, m, vec_get(vals, m - 1));
+            m = m - 1;
+          }
+          vec_set(&mut vals, m, x);
+          k = k + 1;
+        }
+        let mut arr = vec_new[u64]();
+        let mut k2 = 0;
+        while k2 < vec_len(vals)
+          invariant k2 <= vlen(vals)
+        {
+          let x = vec_get(vals, k2);
+          if vec_len(arr) == 0 || vec_get(arr, vec_len(arr) - 1) != x {
+            vec_push(&mut arr, x);
+          }
+          k2 = k2 + 1;
+        }
+        let n = vec_len(arr);
+        // A node is the range [lo, hi) of the sorted values; the right half
+        // follows its parent, the left half waits on a stack.
+        let mut st = vec_new[u64]();
+        vec_push(&mut st, 0);
+        vec_push(&mut st, n);
+        while vec_len(st) >= 2
+          invariant vlen(st) >= 0
+        {
+          let hi0 = vec_pop(&mut st);
+          let mut lo = vec_pop(&mut st);
+          let hi = hi0;
+          if lo > hi {
+            lo = hi;
+          }
+          if lo != 0 || hi != n {
+            x86_cc_label(&mut out, code, ts, e1, i, lo, hi);
+            w_s(&mut out, ":\n");
+          }
+          while lo < hi && hi <= n
+            invariant lo <= hi
+          {
+            let m = lo + (hi - lo) / 2;
+            w_s(&mut out, "\tcmpq $");
+            w_num(&mut out, vec_get(arr, m));
+            w_s(&mut out, ", ");
+            x86_copy_text(code, rs, e, &mut out);
+            w_s(&mut out, "\n\tje ");
+            x86_copy_text(code, ts, e1, &mut out);
+            w_s(&mut out, "\n");
+            if lo < m {
+              w_s(&mut out, "\tjb ");
+              x86_cc_label(&mut out, code, ts, e1, i, lo, m);
+              w_s(&mut out, "\n");
+              vec_push(&mut st, lo);
+              vec_push(&mut st, m);
+            }
+            lo = m + 1;
+          }
+          w_s(&mut out, "\tjmp ");
+          x86_cc_label(&mut out, code, ts, e1, i, 0, 0);
+          w_s(&mut out, "_n\n");
+        }
+        x86_cc_label(&mut out, code, ts, e1, i, 0, 0);
+        w_s(&mut out, "_n:\n");
+        vec_free(st);
+        vec_free(arr);
+        i = j;
+        done = true;
+      }
+      vec_free(vals);
+    }
+    if !done {
+      x86_copy_text(code, s, e, &mut out);
+      w_s(&mut out, "\n");
+      i = i + 1;
+    }
+  }
+  vec_free(starts);
 }
 
 /// The end of the line starting at `s` (its newline, or the end).
@@ -10089,29 +10371,12 @@ fn x86_runtime_kernel(out: &mut Vec[u64]) {
   w_s(&mut out, "\tleave\n");
   w_s(&mut out, "\tret\n");
   w_s(&mut out, "bst_rt_cpu_get:                 # %rax = saved user register %rdi of this processor\n");
-  w_s(&mut out, "\tpush %rbp\n");
-  w_s(&mut out, "\tmov %rsp, %rbp\n");
-  w_s(&mut out, "\tpush %rbx\n");
-  w_s(&mut out, "\tmov %rdi, %rbx\n");
-  w_s(&mut out, "\tand $-16, %rsp\n");
   w_s(&mut out, "\tcall bst_platform_ctx\n");
-  w_s(&mut out, "\tmov (%rax,%rbx,8), %rax\n");
-  w_s(&mut out, "\tmov -8(%rbp), %rbx\n");
-  w_s(&mut out, "\tleave\n");
+  w_s(&mut out, "\tmov (%rax,%rdi,8), %rax\n");
   w_s(&mut out, "\tret\n");
   w_s(&mut out, "bst_rt_cpu_set:                 # saved user register %rdi of this processor = %rsi\n");
-  w_s(&mut out, "\tpush %rbp\n");
-  w_s(&mut out, "\tmov %rsp, %rbp\n");
-  w_s(&mut out, "\tpush %rbx\n");
-  w_s(&mut out, "\tpush %r12\n");
-  w_s(&mut out, "\tmov %rdi, %rbx\n");
-  w_s(&mut out, "\tmov %rsi, %r12\n");
-  w_s(&mut out, "\tand $-16, %rsp\n");
   w_s(&mut out, "\tcall bst_platform_ctx\n");
-  w_s(&mut out, "\tmov %r12, (%rax,%rbx,8)\n");
-  w_s(&mut out, "\tmov -16(%rbp), %r12\n");
-  w_s(&mut out, "\tmov -8(%rbp), %rbx\n");
-  w_s(&mut out, "\tleave\n");
+  w_s(&mut out, "\tmov %rsi, (%rax,%rdi,8)\n");
   w_s(&mut out, "\tret\n");
   w_s(&mut out, "\t.weak bst_platform_deferred_cr3\n");
   w_s(&mut out, "bst_rt_user_table:               # %rax = a user table: CR3 takes it, or (a platform that defines\n");
@@ -10179,17 +10444,11 @@ fn x86_runtime_kernel(out: &mut Vec[u64]) {
   w_s(&mut out, "\tlea bst_cpu_enter(%rip), %rax\n");
   w_s(&mut out, "\tjmp bst_rt_ccall\n");
   w_s(&mut out, "bst_rt_fpu_load:                # load the user's x87/SSE state from the page at %rdi\n");
-  w_s(&mut out, "\tpush %rbp\n");
-  w_s(&mut out, "\tmov %rsp, %rbp\n");
-  w_s(&mut out, "\tsub $512, %rsp\n");
-  w_s(&mut out, "\tand $-16, %rsp\n");
-  w_s(&mut out, "\tmov %rdi, %rsi\n");
-  w_s(&mut out, "\tmov %rsp, %rdi\n");
-  w_s(&mut out, "\tmov $64, %ecx\n");
-  w_s(&mut out, "\trep movsq\n");
-  w_s(&mut out, "\tandq $0xFFFF, 24(%rsp)      # MXCSR: only the defined bits (fxrstor faults on the others)\n");
-  w_s(&mut out, "\tfxrstor64 (%rsp)\n");
-  w_s(&mut out, "\tleave\n");
+  w_s(&mut out, "\tmov 24(%rdi), %rax\n");
+  w_s(&mut out, "\tmovzwl %ax, %edx               # MXCSR: only the defined bits (fxrstor faults on the others)\n");
+  w_s(&mut out, "\tmov %rdx, 24(%rdi)\n");
+  w_s(&mut out, "\tfxrstor64 (%rdi)\n");
+  w_s(&mut out, "\tmov %rax, 24(%rdi)              # the page reads as it did\n");
   w_s(&mut out, "\tret\n");
   w_s(&mut out, "bst_rt_smp_start:               # run the thunk %rdi with %rsi on every other processor\n");
   w_s(&mut out, "\tlea bst_platform_smp_start(%rip), %rax\n");

@@ -70,6 +70,350 @@ fn iropt_consts(f: &IrFn, ndef: &Vec[u64]) -> Vec[u64] {
   return cv;
 }
 
+/// `iropt_fold`: an arithmetic instruction on two registers that are written
+/// once, each by a `const`, becomes a `const`, which `iropt_dce` then makes
+/// the operands' definitions dead for. The lowering leaves `8 + 5` of a named
+/// offset as two constants and an `add`. Only instructions that do not wrap
+/// to a narrower type are folded (`c == 1` marks the others), and a division
+/// only by a nonzero constant.
+fn iropt_fold(f: &mut IrFn) -> u64 {
+  let ndef = iropt_ndef(f);
+  let mut cv = iropt_consts(f, ndef);
+  let mut n = 0;
+  let mut i = 0;
+  while i < vec_len(f.ins) {
+    let q = vec_get(f.ins, i);
+    let op = q.op;
+    if (op == IR_ADD || op == IR_SUB || op == IR_MUL || op == IR_AND || op == IR_OR || op == IR_XOR || op == IR_DIV || op == IR_REM) && q.c != 1 && q.d != IR_NONE {
+      let x = iropt_cval(cv, q.a);
+      let y = iropt_cval(cv, q.b);
+      if x != IR_NONE && y != IR_NONE && (y != 0 || (op != IR_DIV && op != IR_REM)) {
+        let mut v = 0;
+        if op == IR_ADD {
+          v = wrap_add(x, y);
+        } else if op == IR_SUB {
+          v = wrap_sub(x, y);
+        } else if op == IR_MUL {
+          v = wrap_mul(x, y);
+        } else if op == IR_AND {
+          v = x & y;
+        } else if op == IR_OR {
+          v = x | y;
+        } else if op == IR_XOR {
+          v = x ^ y;
+        } else if op == IR_DIV {
+          v = x / y;
+        } else {
+          v = x % y;
+        }
+        if v != IR_NONE {
+          vec_set(&mut f.ins, i, IrIns { op: IR_CONST, d: q.d, a: v, b: 0, c: 0, ty: 0 });
+          if u_at(ndef, q.d) == 1 {
+            ra_set(&mut cv, q.d, v);
+          }
+          n = wrap_add(n, 1);
+        }
+      }
+    }
+    i = i + 1;
+  }
+  vec_free(ndef);
+  vec_free(cv);
+  return n;
+}
+
+/// The constant that register `r` holds (IR_NONE: not known to be one).
+fn iropt_cval(cv: &Vec[u64], r: u64) -> u64 {
+  if r == IR_NONE {
+    return IR_NONE;
+  }
+  return u_at(cv, r);
+}
+
+/// How many instructions read each register.
+fn iropt_nuse(f: &IrFn) -> Vec[u64] {
+  let mut nuse = vec_new[u64]();
+  let mut r = 0;
+  while r < f.nreg && r < 1000000000 {
+    vec_push(&mut nuse, 0);
+    r = r + 1;
+  }
+  let mut i = 0;
+  while i < vec_len(f.ins) {
+    let mut rs = vec_new[u64]();
+    ra_reads(f, vec_get(f.ins, i), &mut rs);
+    let mut j = 0;
+    while j < vec_len(rs) {
+      let x = vec_get(rs, j);
+      ra_set(&mut nuse, x, wrap_add(u_at(nuse, x), 1));
+      j = j + 1;
+    }
+    vec_free(rs);
+    i = i + 1;
+  }
+  return nuse;
+}
+
+/// The test `k = const K; c = eq x, k; br c, lt, lf` at `p`, where `k` and
+/// `c` are used nowhere else: `ok`, `x`, `kv` (K), `lt` and `lf`.
+struct IrTest { ok: bool, x: u64, kv: u64, lt: u64, lf: u64 }
+
+fn iropt_test_at(f: &IrFn, p: u64, nuse: &Vec[u64], ndef: &Vec[u64]) -> IrTest {
+  let none = IrTest { ok: false, x: 0, kv: 0, lt: 0, lf: 0 };
+  if p >= vec_len(f.ins) || vec_len(f.ins) - p < 3 {
+    return none;
+  }
+  let q0 = vec_get(f.ins, p);
+  let q1 = vec_get(f.ins, p + 1);
+  let q2 = vec_get(f.ins, p + 2);
+  if q0.op != IR_CONST || q0.a == IR_NONE || q1.op != IR_EQ || q2.op != IR_BR || q2.a != q1.d {
+    return none;
+  }
+  if u_at(nuse, q0.d) != 1 || u_at(ndef, q0.d) != 1 || u_at(nuse, q1.d) != 1 || u_at(ndef, q1.d) != 1 {
+    return none;
+  }
+  if q1.b == q0.d && q1.a != q0.d && q1.a != IR_NONE {
+    return IrTest { ok: true, x: q1.a, kv: q0.a, lt: q2.b, lf: q2.c };
+  }
+  if q1.a == q0.d && q1.b != q0.d && q1.b != IR_NONE {
+    return IrTest { ok: true, x: q1.b, kv: q0.a, lt: q2.b, lf: q2.c };
+  }
+  return none;
+}
+
+/// A chain of six or more tests of one register against constants
+/// (`if x == 1 {..} else if x == 2 {..}`, `x == 1 || x == 2 || ..`) becomes a
+/// binary search: `lt` compares halve the sorted constants, and runs of
+/// three or fewer are tested one by one. The first of equal constants wins,
+/// as in the chain. The tests after the first go, with their labels, which
+/// only the test before them named. Returns how many chains it replaced.
+fn iropt_switch(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  let ndef = iropt_ndef(f);
+  let nuse = iropt_nuse(f);
+  let mut lpos = vec_new[u64]();
+  let mut refs = vec_new[u64]();
+  let mut l = 0;
+  while l < f.nlabel && l < 1000000000 {
+    vec_push(&mut lpos, IR_NONE);
+    vec_push(&mut refs, 0);
+    l = l + 1;
+  }
+  let mut i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    if q.op == IR_LABEL {
+      ra_set(&mut lpos, q.a, i);
+    } else if q.op == IR_JMP {
+      ra_set(&mut refs, q.a, wrap_add(u_at(refs, q.a), 1));
+    } else if q.op == IR_BR {
+      ra_set(&mut refs, q.b, wrap_add(u_at(refs, q.b), 1));
+      ra_set(&mut refs, q.c, wrap_add(u_at(refs, q.c), 1));
+    }
+    i = i + 1;
+  }
+  // What replaces the instruction at each position: 0 keep, 1 drop, 2 the
+  // tree of chain number `rep_at[i]`.
+  let mut act = vec_new[u64]();
+  i = 0;
+  while i < n {
+    vec_push(&mut act, 0);
+    i = i + 1;
+  }
+  let mut all = vec_new[u64]();
+  let mut tstart = vec_new[u64]();
+  let mut tend = vec_new[u64]();
+  let mut tree_at = vec_new[u64]();
+  let mut found = 0;
+  i = 0;
+  while i < n {
+    let t0 = iropt_test_at(f, i, nuse, ndef);
+    if t0.ok && u_at(act, i) == 0 {
+      // The chain from here: constants, targets, and the test positions.
+      let mut ks = vec_new[u64]();
+      let mut ts = vec_new[u64]();
+      let mut ps = vec_new[u64]();
+      vec_push(&mut ks, t0.kv);
+      vec_push(&mut ts, t0.lt);
+      vec_push(&mut ps, i);
+      let mut lf = t0.lf;
+      let mut going = true;
+      while going && vec_len(ks) < 100000 {
+        let lp = u_at(lpos, lf);
+        going = false;
+        if lf < vec_len(lpos) && lp != IR_NONE && u_at(refs, lf) == 1 {
+          let t = iropt_test_at(f, wrap_add(lp, 1), nuse, ndef);
+          if t.ok && t.x == t0.x && u_at(act, wrap_add(lp, 1)) == 0 {
+            vec_push(&mut ks, t.kv);
+            vec_push(&mut ts, t.lt);
+            vec_push(&mut ps, lp);
+            lf = t.lf;
+            going = true;
+          }
+        }
+      }
+      if vec_len(ks) >= 6 {
+        // The first test is replaced by the tree; the others, from their
+        // label on, are dropped.
+        let mut k = 0;
+        while k < vec_len(ps) {
+          let at = u_at(ps, k);
+          if k == 0 {
+            ra_set(&mut act, at, 2);
+            ra_set(&mut act, wrap_add(at, 1), 1);
+            ra_set(&mut act, wrap_add(at, 2), 1);
+          } else {
+            ra_set(&mut act, at, 1);
+            ra_set(&mut act, wrap_add(at, 1), 1);
+            ra_set(&mut act, wrap_add(at, 2), 1);
+            ra_set(&mut act, wrap_add(at, 3), 1);
+          }
+          k = k + 1;
+        }
+        // The tree: a sorted copy of the constants without repeats.
+        let mut sk = vec_new[u64]();
+        let mut st = vec_new[u64]();
+        k = 0;
+        while k < vec_len(ks) {
+          let kv = u_at(ks, k);
+          let mut at = 0;
+          let mut dup = false;
+          while at < vec_len(sk) && u_at(sk, at) < kv {
+            at = at + 1;
+          }
+          if at < vec_len(sk) && u_at(sk, at) == kv {
+            dup = true;
+          }
+          if !dup {
+            // Insert at `at`.
+            vec_push(&mut sk, kv);
+            vec_push(&mut st, u_at(ts, k));
+            let mut m = vec_len(sk) - 1;
+            while m > at {
+              ra_set(&mut sk, m, u_at(sk, m - 1));
+              ra_set(&mut st, m, u_at(st, m - 1));
+              m = m - 1;
+            }
+            ra_set(&mut sk, at, kv);
+            ra_set(&mut st, at, u_at(ts, k));
+          }
+          k = k + 1;
+        }
+        let mut code = vec_new[u64]();
+        // Packed as groups of six words: op, d, a, b, c, ty.
+        let mut work = vec_new[u64]();
+        // A range to emit: low, high (inclusive), and the label before it.
+        vec_push(&mut work, 0);
+        vec_push(&mut work, wrap_sub(vec_len(sk), 1));
+        vec_push(&mut work, IR_NONE);
+        while vec_len(work) >= 3 {
+          let lab = vec_pop(&mut work);
+          let hi = vec_pop(&mut work);
+          let lo = vec_pop(&mut work);
+          if lab != IR_NONE {
+            iropt_push6(&mut code, IR_LABEL, 0, lab, 0, 0, 0);
+          }
+          if wrap_sub(hi, lo) < 3 {
+            let mut j = lo;
+            while j <= hi && j < vec_len(sk) {
+              let kr = ir_reg(&mut f);
+              let cr = ir_reg(&mut f);
+              iropt_push6(&mut code, IR_CONST, kr, u_at(sk, j), 0, 0, 0);
+              iropt_push6(&mut code, IR_EQ, cr, t0.x, kr, 0, 0);
+              if j == hi {
+                let lnext = ir_label(&mut f);
+                iropt_push6(&mut code, IR_BR, 0, cr, u_at(st, j), lnext, 0);
+                iropt_push6(&mut code, IR_LABEL, 0, lnext, 0, 0, 0);
+                iropt_push6(&mut code, IR_JMP, 0, lf, 0, 0, 0);
+              } else {
+                let lnext = ir_label(&mut f);
+                iropt_push6(&mut code, IR_BR, 0, cr, u_at(st, j), lnext, 0);
+                iropt_push6(&mut code, IR_LABEL, 0, lnext, 0, 0, 0);
+              }
+              j = j + 1;
+            }
+          } else {
+            let mid = wrap_add(wrap_add(lo, wrap_sub(hi, lo) / 2), 1);
+            let kr = ir_reg(&mut f);
+            let cr = ir_reg(&mut f);
+            let lleft = ir_label(&mut f);
+            let lright = ir_label(&mut f);
+            iropt_push6(&mut code, IR_CONST, kr, u_at(sk, mid), 0, 0, 0);
+            iropt_push6(&mut code, IR_LT, cr, t0.x, kr, 0, 0);
+            iropt_push6(&mut code, IR_BR, 0, cr, lleft, lright, 0);
+            // The right half is emitted after the left one: push it first.
+            vec_push(&mut work, mid);
+            vec_push(&mut work, hi);
+            vec_push(&mut work, lright);
+            vec_push(&mut work, lo);
+            vec_push(&mut work, wrap_sub(mid, 1));
+            vec_push(&mut work, lleft);
+          }
+        }
+        vec_free(work);
+        vec_push(&mut tstart, vec_len(all));
+        let mut cw = 0;
+        while cw < vec_len(code) {
+          vec_push(&mut all, u_at(code, cw));
+          cw = cw + 1;
+        }
+        vec_push(&mut tend, vec_len(all));
+        vec_free(code);
+        vec_push(&mut tree_at, i);
+        found = wrap_add(found, 1);
+        vec_free(sk);
+        vec_free(st);
+      }
+      vec_free(ks);
+      vec_free(ts);
+      vec_free(ps);
+    }
+    i = i + 1;
+  }
+  if found > 0 {
+    let mut out = vec_new[IrIns]();
+    let mut ti = 0;
+    i = 0;
+    while i < n {
+      let q = vec_get(f.ins, i);
+      let a = u_at(act, i);
+      if a == 0 {
+        vec_push(&mut out, q);
+      } else if a == 2 {
+        let mut w = u_at(tstart, ti);
+        let e = u_at(tend, ti);
+        while wrap_add(w, 5) < e && e <= vec_len(all) {
+          vec_push(&mut out, IrIns { op: u_at(all, w), d: u_at(all, wrap_add(w, 1)), a: u_at(all, wrap_add(w, 2)), b: u_at(all, wrap_add(w, 3)), c: u_at(all, wrap_add(w, 4)), ty: u_at(all, wrap_add(w, 5)) });
+          w = wrap_add(w, 6);
+        }
+        ti = wrap_add(ti, 1);
+      }
+      i = i + 1;
+    }
+    vec_free(f.ins);
+    f.ins = out;
+  }
+  vec_free(all);
+  vec_free(tstart);
+  vec_free(tend);
+  vec_free(tree_at);
+  vec_free(act);
+  vec_free(lpos);
+  vec_free(refs);
+  vec_free(ndef);
+  vec_free(nuse);
+  return found;
+}
+
+fn iropt_push6(v: &mut Vec[u64], op: u64, d: u64, a: u64, b: u64, c: u64, ty: u64) {
+  vec_push(&mut v, op);
+  vec_push(&mut v, d);
+  vec_push(&mut v, a);
+  vec_push(&mut v, b);
+  vec_push(&mut v, c);
+  vec_push(&mut v, ty);
+}
+
 /// Is the slot register `s` (of `words` words) used only as the base of
 /// one-word loads and stores at constant indices below `words`?
 fn iropt_slot_ok(f: &IrFn, s: u64, words: u64, cv: &Vec[u64]) -> bool {
@@ -215,7 +559,7 @@ fn iropt_rename(q: IrIns, from: u64, to: u64) -> IrIns {
     if r.b == from && !(q.c > 0 && q.a == IR_NONE) {
       r.b = to;
     }
-  } else if op == IR_CAS {
+  } else if op == IR_CAS || op == IR_COPY {
     if r.a == from {
       r.a = to;
     }
@@ -244,6 +588,292 @@ fn iropt_rename(q: IrIns, from: u64, to: u64) -> IrIns {
     }
   }
   return r;
+}
+
+/// Instruction `i` of `f` (an instruction of op 0 past the end).
+fn iropt_at(f: &IrFn, i: u64) -> IrIns {
+  if i < vec_len(f.ins) {
+    return vec_get(f.ins, i);
+  }
+  return IrIns { op: 0, d: IR_NONE, a: IR_NONE, b: IR_NONE, c: 0, ty: 0 };
+}
+
+/// A body instruction `iropt_unroll` can copy: straight-line, one result in
+/// `d` (a store's `d` is the value it reads), no slot and no call.
+fn iropt_unroll_ok(q: IrIns) -> bool {
+  let op = q.op;
+  if op == IR_PCALL {
+    return q.c == 3 || q.c == 6;
+  }
+  return op == IR_CONST || op == IR_MOV || op == IR_NOT || op == IR_NEG || op == IR_WRAP || op == IR_LOAD || op == IR_STORE || ra_is_binary(op);
+}
+
+/// `q` with the register `from` renamed to `to`, read or written.
+fn iropt_unroll_ren(q: IrIns, from: u64, to: u64) -> IrIns {
+  let mut r = iropt_rename(q, from, to);
+  if q.op != IR_STORE && q.op != IR_PCALL && r.d == from {
+    r.d = to;
+  }
+  if q.op == IR_PCALL && q.d == from {
+    r.d = to;
+  }
+  return r;
+}
+
+/// Full unrolling of a loop that runs a small, known number of times:
+///
+///     i = const c0
+///   L3: t = lt i, bound      (bound a constant)
+///     br t, L4, L5
+///   L4: body                 (straight-line)
+///     i = mov x              (x = add i, step, the last instruction)
+///     jmp L3
+///   L5:
+///
+/// becomes the body written out once per trip, with `i` a constant in each
+/// copy and the registers the body only uses privately renamed per copy, so
+/// the constants fold into the instructions that read them. The 21-word
+/// register save of a system call is such a loop. Returns 1 if it unrolled
+/// one loop, else 0.
+fn iropt_unroll1(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  let ndef = iropt_ndef(f);
+  let cv = iropt_consts(f, ndef);
+  let nuse = iropt_nuse(f);
+  let mut lpos = vec_new[u64]();
+  let mut refs = vec_new[u64]();
+  let mut l = 0;
+  while l < f.nlabel && l < 1000000000 {
+    vec_push(&mut lpos, IR_NONE);
+    vec_push(&mut refs, 0);
+    l = wrap_add(l, 1);
+  }
+  let mut i = 0;
+  while i < n {
+    let q = iropt_at(f, i);
+    if q.op == IR_LABEL {
+      ra_set(&mut lpos, q.a, i);
+    } else if q.op == IR_JMP {
+      ra_set(&mut refs, q.a, wrap_add(u_at(refs, q.a), 1));
+    } else if q.op == IR_BR {
+      ra_set(&mut refs, q.b, wrap_add(u_at(refs, q.b), 1));
+      ra_set(&mut refs, q.c, wrap_add(u_at(refs, q.c), 1));
+    }
+    i = wrap_add(i, 1);
+  }
+  let mut done = 0;
+  let mut p = 1;
+  while done == 0 && p < n
+    invariant p >= 1
+  {
+    let q0 = iropt_at(f, p - 1);
+    let ql = iropt_at(f, p);
+    // Constants at the head of the test (the bound) are written once per trip.
+    let mut hq = wrap_add(p, 1);
+    let mut scanning = true;
+    while scanning && hq < n {
+      let qh = iropt_at(f, hq);
+      if qh.op == IR_CONST {
+        hq = wrap_add(hq, 1);
+      } else {
+        scanning = false;
+      }
+    }
+    let q1 = iropt_at(f, hq);
+    let q2 = iropt_at(f, wrap_add(hq, 1));
+    let q3 = iropt_at(f, wrap_add(hq, 2));
+    // The header: `i = const c0; L3: t = lt i, bound; br t, L4, L5; L4:`.
+    let mut shape = q0.op == IR_CONST && ql.op == IR_LABEL && q1.op == IR_LT && q2.op == IR_BR && q3.op == IR_LABEL;
+    if shape {
+      shape = q1.a == q0.d && q2.a == q1.d && q2.b == q3.a && u_at(refs, ql.a) == 1 && u_at(refs, q3.a) == 1 && u_at(ndef, q0.d) == 2 && u_at(ndef, q1.d) == 1 && u_at(nuse, q1.d) == 1;
+    }
+    let bound = iropt_cval(cv, q1.b);
+    let c0 = q0.a;
+    if shape && bound != IR_NONE && c0 != IR_NONE && c0 < bound && bound < 1000 {
+      // The end of the body: the jump back to L3.
+      let mut e = wrap_add(hq, 3);
+      let mut straight = true;
+      while straight && e < n {
+        let qe = iropt_at(f, e);
+        if qe.op == IR_JMP {
+          straight = false;
+        } else if !iropt_unroll_ok(qe) {
+          e = n;
+        } else {
+          e = wrap_add(e, 1);
+        }
+      }
+      let mut qj = IrIns { op: 0, d: IR_NONE, a: IR_NONE, b: IR_NONE, c: 0, ty: 0 };
+      if e < n {
+        qj = iropt_at(f, e);
+      }
+      let bs = wrap_add(hq, 3);
+      if e < n && qj.op == IR_JMP && qj.a == ql.a && e > bs && wrap_add(e, 1) < n {
+        let qm = iropt_at(f, e - 1);
+        // The last body instruction is `i = mov x`, x = i + step.
+        let mut step = IR_NONE;
+        if qm.op == IR_MOV && qm.d == q0.d && u_at(ndef, qm.a) == 1 && u_at(nuse, qm.a) == 1 {
+          let mut k = bs;
+          while wrap_add(k, 1) < e {
+            let qk = iropt_at(f, k);
+            if qk.op == IR_ADD && qk.d == qm.a && qk.c != 1 {
+              if qk.a == q0.d && iropt_cval(cv, qk.b) != IR_NONE {
+                step = iropt_cval(cv, qk.b);
+              } else if qk.b == q0.d && iropt_cval(cv, qk.a) != IR_NONE {
+                step = iropt_cval(cv, qk.a);
+              }
+            }
+            k = wrap_add(k, 1);
+          }
+        }
+        let span = bound - c0;
+        if step != IR_NONE && step > 0 && step <= span {
+          let trips = wrap_add(span, step - 1) / step;
+          let blen = e - 1 - bs;
+          if trips >= 2 && trips <= 64 && wrap_mul(trips, blen) <= 400 {
+            // Which registers does the body write, and which of those does
+            // it read before writing or leave to code outside it?
+            let mut inb = vec_new[u64]();
+            let mut seen = vec_new[u64]();
+            let mut bad = vec_new[u64]();
+            let mut nin = vec_new[u64]();
+            let mut r = 0;
+            while r < f.nreg && r < 1000000000 {
+              vec_push(&mut inb, 0);
+              vec_push(&mut seen, 0);
+              vec_push(&mut bad, 0);
+              vec_push(&mut nin, 0);
+              r = wrap_add(r, 1);
+            }
+            let mut k = bs;
+            while wrap_add(k, 1) < e {
+              let qk = iropt_at(f, k);
+              let mut ws = vec_new[u64]();
+              ra_writes(qk, &mut ws);
+              let mut j = 0;
+              while j < vec_len(ws) {
+                ra_set(&mut inb, vec_get(ws, j), 1);
+                j = wrap_add(j, 1);
+              }
+              vec_free(ws);
+              k = wrap_add(k, 1);
+            }
+            k = bs;
+            while wrap_add(k, 1) < e {
+              let qk = iropt_at(f, k);
+              let mut rs = vec_new[u64]();
+              ra_reads(f, qk, &mut rs);
+              let mut j = 0;
+              while j < vec_len(rs) {
+                let x = vec_get(rs, j);
+                ra_set(&mut nin, x, wrap_add(u_at(nin, x), 1));
+                if u_at(inb, x) == 1 && u_at(seen, x) == 0 {
+                  ra_set(&mut bad, x, 1);
+                }
+                j = wrap_add(j, 1);
+              }
+              vec_free(rs);
+              let mut ws = vec_new[u64]();
+              ra_writes(qk, &mut ws);
+              j = 0;
+              while j < vec_len(ws) {
+                ra_set(&mut seen, vec_get(ws, j), 1);
+                j = wrap_add(j, 1);
+              }
+              vec_free(ws);
+              k = wrap_add(k, 1);
+            }
+            // The privately used registers get a fresh name per copy.
+            let mut priv = vec_new[u64]();
+            r = 0;
+            while r < f.nreg && r < 1000000000 {
+              if u_at(inb, r) == 1 && u_at(bad, r) == 0 && r != q0.d && u_at(nuse, r) == u_at(nin, r) {
+                vec_push(&mut priv, r);
+              }
+              r = wrap_add(r, 1);
+            }
+            let mut out = vec_new[IrIns]();
+            k = 0;
+            while k < p {
+              vec_push(&mut out, iropt_at(f, k));
+              k = wrap_add(k, 1);
+            }
+            k = wrap_add(p, 1);
+            while k < hq {
+              vec_push(&mut out, iropt_at(f, k));
+              k = wrap_add(k, 1);
+            }
+            let mut t = 0;
+            while t < trips {
+              let ck = ir_reg(&mut f);
+              vec_push(&mut out, IrIns { op: IR_CONST, d: ck, a: wrap_add(c0, wrap_mul(t, step)), b: 0, c: 0, ty: 0 });
+              let mut mt = vec_new[u64]();
+              let mut j = 0;
+              while j < vec_len(priv) {
+                vec_push(&mut mt, ir_reg(&mut f));
+                j = wrap_add(j, 1);
+              }
+              k = bs;
+              while wrap_add(k, 1) < e {
+                let mut qk = iropt_unroll_ren(iropt_at(f, k), q0.d, ck);
+                j = 0;
+                while j < vec_len(priv) && j < vec_len(mt) {
+                  qk = iropt_unroll_ren(qk, vec_get(priv, j), vec_get(mt, j));
+                  j = wrap_add(j, 1);
+                }
+                vec_push(&mut out, qk);
+                k = wrap_add(k, 1);
+              }
+              vec_free(mt);
+              t = wrap_add(t, 1);
+            }
+            // `i` ends where the loop left it.
+            vec_push(&mut out, IrIns { op: IR_CONST, d: q0.d, a: wrap_add(c0, wrap_mul(trips, step)), b: 0, c: 0, ty: 0 });
+            // The code after the loop is reached by falling through; it
+            // starts with L5 unless something else sits between.
+            let qa = iropt_at(f, wrap_add(e, 1));
+            if !(qa.op == IR_LABEL && qa.a == q2.c) {
+              vec_push(&mut out, IrIns { op: IR_JMP, d: IR_NONE, a: q2.c, b: 0, c: 0, ty: 0 });
+            }
+            k = wrap_add(e, 1);
+            while k < n {
+              vec_push(&mut out, iropt_at(f, k));
+              k = wrap_add(k, 1);
+            }
+            vec_free(f.ins);
+            f.ins = out;
+            done = 1;
+            vec_free(inb);
+            vec_free(seen);
+            vec_free(bad);
+            vec_free(nin);
+            vec_free(priv);
+          }
+        }
+      }
+    }
+    p = wrap_add(p, 1);
+  }
+  vec_free(ndef);
+  vec_free(cv);
+  vec_free(nuse);
+  vec_free(lpos);
+  vec_free(refs);
+  return done;
+}
+
+/// `iropt_unroll1` until no loop is left to unroll (at most eight).
+fn iropt_unroll(f: &mut IrFn) -> u64 {
+  let mut total = 0;
+  let mut again = true;
+  while again && total < 8 {
+    again = false;
+    if iropt_unroll1(&mut f) > 0 {
+      total = wrap_add(total, 1);
+      again = true;
+    }
+  }
+  return total;
 }
 
 /// Copy propagation: `d = mov a`, where `d` and `a` are each written once
@@ -336,8 +966,12 @@ fn iropt_copies(f: &mut IrFn) -> u64 {
         && u_at(isdst, q.a) == 0 && u_at(first, q.d) != IR_NONE && u_at(first, q.d) > i {
         let pa = u_at(defpos, q.a);
         let lu = u_at(last, q.d);
+        let qa = iropt_at(f, pa);
         let mut ok = false;
         if pa == IR_NONE {
+          ok = true;
+        } else if pa < i && qa.op == IR_CONST {
+          // A constant is the same wherever the copy of it is read.
           ok = true;
         } else if pa < i && lu >= i {
           // No label among instructions pa + 1 .. lu.
@@ -1148,7 +1782,11 @@ fn iropt_dead_live(f: &mut IrFn) -> u64 {
       let blk = vec_get(bl, b);
       r = 0;
       while r < nr && r < 1000000000 {
-        ra_set(&mut live, r, u_at(lv.out, wrap_add(wrap_mul(b, nr), r)));
+        if ra_out(lv, b, r) {
+          ra_set(&mut live, r, 1);
+        } else {
+          ra_set(&mut live, r, 0);
+        }
         r = r + 1;
       }
       let mut k = blk.e;
@@ -1202,6 +1840,7 @@ fn iropt_dead_live(f: &mut IrFn) -> u64 {
     vec_free(bl);
     vec_free(lv.inn);
     vec_free(lv.out);
+    vec_free(lv.bit);
   }
   return total;
 }
