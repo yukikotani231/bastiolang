@@ -733,8 +733,9 @@ fn iropt_reach(f: &mut IrFn) -> u64 {
 }
 
 /// Collapses chains of moves inside a straight-line run: after `b = mov a`,
-/// a later `c = mov b` in the same run (neither written between) reads `a`.
-/// Only the source of a move is rewritten. Returns how many it changed.
+/// a later `c = mov b` in the same run (neither written between) reads `a`,
+/// and so does a later binary operation, load, store or branch that reads
+/// `b`. Returns how many instructions it changed.
 fn iropt_chain(f: &mut IrFn) -> u64 {
   let n = vec_len(f.ins);
   let mut cd = vec_new[u64]();
@@ -761,6 +762,18 @@ fn iropt_chain(f: &mut IrFn) -> u64 {
           }
         }
         if u.a != q.a {
+          vec_set(&mut f.ins, i, u);
+          changed = wrap_add(changed, 1);
+        }
+      } else if q.op == IR_BR {
+        // A read of the copy reads its source, so that a comparison feeds
+        // the branch that tests it and the copy can go.
+        let mut k = 0;
+        while k < vec_len(cd) {
+          u = iropt_rename(u, vec_get(cd, k), u_at(cs, k));
+          k = k + 1;
+        }
+        if u.a != q.a || u.b != q.b || u.d != q.d {
           vec_set(&mut f.ins, i, u);
           changed = wrap_add(changed, 1);
         }
@@ -970,7 +983,7 @@ fn iropt_merge(f: &mut IrFn) -> u64 {
 /// take the `jmp`'s place: what was a join of a few paths with one entry
 /// becomes straight-line code, where copies can be followed. Returns how many
 /// blocks it moved.
-fn iropt_hoist(f: &mut IrFn) -> u64 {
+fn iropt_hoist1(f: &mut IrFn) -> u64 {
   let n = vec_len(f.ins);
   let mut refs = vec_new[u64]();
   let mut lpos = vec_new[u64]();
@@ -1086,6 +1099,21 @@ fn iropt_hoist(f: &mut IrFn) -> u64 {
   vec_free(bs);
   vec_free(be);
   return moved;
+}
+
+/// `iropt_hoist1` until nothing moves: a block that took another block's
+/// `jmp` has a `jmp` of its own that can then take its target.
+fn iropt_hoist(f: &mut IrFn) -> u64 {
+  let mut total = 0;
+  let mut rounds = 0;
+  let mut again = true;
+  while again && rounds < 6 {
+    rounds = rounds + 1;
+    let k = iropt_hoist1(&mut f);
+    total = wrap_add(total, k);
+    again = k > 0;
+  }
+  return total;
 }
 
 /// Dead stores by liveness: a pure instruction whose result is live on no
