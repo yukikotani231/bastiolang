@@ -838,6 +838,62 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
   } else if op == IR_TSC {
     w_s(&mut out, "\trdtsc\n\tshl $32, %rdx\n\tor %rdx, %rax\n");
     ix_finish(&mut out, al, q.d, XR_RAX);
+  } else if op == IR_PCALL && (q.c == 3 || q.c == 6) {
+    // `cpu_get` / `cpu_set`: the saved context is the start of the processor's
+    // block, which is %rsp rounded down (bst_platform_ctx_mask, from the
+    // platform). No call; a constant word index is a displacement.
+    let la = ix_loc(al, q.a);
+    let mut disp = false;
+    let mut ix = XR_RDI;
+    if la.k == IXK_IMM && la.imm < 268435456 {
+      disp = true;
+    } else if la.k == IXK_REG {
+      ix = la.reg;
+    } else {
+      ix_mov(&mut out, la, ix_rl(XR_RDI));
+    }
+    w_s(&mut out, "\tmov %rsp, %rax\n\tand $bst_platform_ctx_mask, %rax\n");
+    let mut addr = vec_new[u64]();
+    if disp {
+      w_num(&mut addr, wrap_mul(8, la.imm));
+      w_s(&mut addr, "(%rax)");
+    } else {
+      w_s(&mut addr, "(%rax,");
+      w_s(&mut addr, x86_rname(ix));
+      w_s(&mut addr, ",8)");
+    }
+    if q.c == 3 {
+      let ld = ix_loc(al, q.d);
+      let mut t = XR_RAX;
+      if ld.k == IXK_REG {
+        t = ld.reg;
+      }
+      w_s(&mut out, "\tmov ");
+      w_append(&mut out, addr);
+      w_s(&mut out, ", ");
+      w_s(&mut out, x86_rname(t));
+      w_s(&mut out, "\n");
+      ix_finish(&mut out, al, q.d, t);
+    } else {
+      let lv = ix_loc(al, q.b);
+      if lv.k == IXK_IMM && ix_fits(lv.imm) {
+        w_s(&mut out, "\tmovq ");
+        ix_w_imm(&mut out, lv.imm);
+      } else {
+        let mut v = XR_RSI;
+        if lv.k == IXK_REG {
+          v = lv.reg;
+        } else {
+          ix_mov(&mut out, lv, ix_rl(XR_RSI));
+        }
+        w_s(&mut out, "\tmov ");
+        w_s(&mut out, x86_rname(v));
+      }
+      w_s(&mut out, ", ");
+      w_append(&mut out, addr);
+      w_s(&mut out, "\n");
+    }
+    vec_free(addr);
   } else if op == IR_PCALL {
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RDI));
     if q.c != 3 {
@@ -849,12 +905,6 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
       w_s(&mut out, "\tlea bst_platform_acpi(%rip), %rax\n\tcall bst_rt_ccall\n");
     } else if q.c == 2 {
       w_s(&mut out, "\tlea bst_platform_cpus(%rip), %rax\n\tcall bst_rt_ccall\n");
-    } else if q.c == 3 {
-      // The saved context is the start of the processor's block, which is %rsp
-      // rounded down (bst_platform_ctx_mask, from the platform): no call.
-      w_s(&mut out, "\tmov %rsp, %rax\n\tand $bst_platform_ctx_mask, %rax\n\tmov (%rax,%rdi,8), %rax\n");
-    } else if q.c == 6 {
-      w_s(&mut out, "\tmov %rsp, %rax\n\tand $bst_platform_ctx_mask, %rax\n\tmov %rsi, (%rax,%rdi,8)\n");
     } else if q.c == 7 {
       w_s(&mut out, "\tcall bst_rt_fpu_load\n");
     } else if q.c == 9 {
@@ -1619,6 +1669,11 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   iropt_fold(&mut f);
   iropt_copies(&mut f);
   iropt_dce(&mut f);
+  if iropt_unroll(&mut f) > 0 {
+    iropt_fold(&mut f);
+    iropt_copies(&mut f);
+    iropt_dce(&mut f);
+  }
   iropt_switch(&mut f);
   iropt_thread(&mut f);
   if iropt_merge(&mut f) > 0 {
