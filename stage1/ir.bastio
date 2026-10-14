@@ -784,6 +784,22 @@ fn ir_variant(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, x: u6
   return out;
 }
 
+/// Writes the fields of struct literal `i` into the place `out` (a struct
+/// that lives in memory).
+fn ir_slit_fill(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, out: IrVal) {
+  let n = node_at(p.nodes, i);
+  let mut q = n.a;
+  while q != 0 && !f.failed {
+    let fi = node_at(p.nodes, q);
+    let dst = ir_pfield(&mut f, c, m, p, out, fi.s, fi.e);
+    let v = ir_vexpr(&mut f, c, &mut m, p, fi.a);
+    if !f.failed {
+      ir_store_val(&mut f, c, m, p, dst, v);
+    }
+    q = fi.next;
+  }
+}
+
 /// The struct value built by literal node `i` of struct instance `x`.
 fn ir_slit(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, x: u64) -> IrVal {
   let n = node_at(p.nodes, i);
@@ -794,16 +810,7 @@ fn ir_slit(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, x: u64) 
     let slot = ir_reg(&mut f);
     ir_emit(&mut f, IR_SLOT, slot, 0, 0, mw, 0);
     let out = IrVal { k: IRK_PLACE, r0: slot, r1: 0, t: base_t(m, t) };
-    let mut q = n.a;
-    while q != 0 && !f.failed {
-      let fi = node_at(p.nodes, q);
-      let dst = ir_pfield(&mut f, c, m, p, out, fi.s, fi.e);
-      let v = ir_vexpr(&mut f, c, &mut m, p, fi.a);
-      if !f.failed {
-        ir_store_val(&mut f, c, m, p, dst, v);
-      }
-      q = fi.next;
-    }
+    ir_slit_fill(&mut f, c, &mut m, p, i, out);
     return out;
   }
   if ir_kind(c, m, p, t) != IRK_STRUCT {
@@ -1312,6 +1319,142 @@ fn ir_own(f: &mut IrFn, v: IrVal) -> IrVal {
     j = j + 1;
   }
   return IrVal { k: IRK_VEC, r0: slot, r1: IR_NONE, t: wrap_mul(v.t / 2, 2) };
+}
+
+/// Does expression `i` (or the list it heads, through `next`) mention the
+/// name `s..e`? An expression of a kind not known here counts as a mention.
+fn ir_mentions(p: &Parser, i: u64, s: u64, e: u64) -> bool {
+  let mut j = i;
+  while j != 0 {
+    let n = node_at(p.nodes, j);
+    let k = n.kind;
+    if k == E_VAR {
+      if same(p.src, n.s, n.e, s, e) {
+        return true;
+      }
+    } else if k == E_MUTBORROW {
+      let mut q = n.a;
+      while q != 0 {
+        let qn = node_at(p.nodes, q);
+        if same(p.src, qn.s, qn.e, s, e) {
+          return true;
+        }
+        q = qn.next;
+      }
+    } else if k == E_FIELD || k == E_IS || k == E_NOT || k == E_NEG || k == E_VARIANT {
+      if ir_mentions(p, n.a, s, e) {
+        return true;
+      }
+    } else if k == E_CALL {
+      if ir_mentions(p, n.a, s, e) {
+        return true;
+      }
+    } else if k == E_TAPP {
+      if ir_mentions(p, n.b, s, e) {
+        return true;
+      }
+    } else if k == E_BIN {
+      if ir_mentions(p, n.a, s, e) || ir_mentions(p, n.b, s, e) {
+        return true;
+      }
+    } else if k == E_SLIT {
+      let mut f = n.a;
+      while f != 0 {
+        let fi = node_at(p.nodes, f);
+        if ir_mentions(p, fi.a, s, e) {
+          return true;
+        }
+        f = fi.next;
+      }
+    } else if k != E_INT && k != E_BOOL && k != E_STR && k != E_BLOB {
+      return true;
+    }
+    j = n.next;
+  }
+  return false;
+}
+
+/// Does the statement list from `head` end in a `return` (or `unreachable`),
+/// so that nothing it did reaches what follows it?
+fn ir_ends_in_exit(p: &Parser, head: u64) -> bool {
+  let mut i = head;
+  let mut last = 0;
+  while i != 0 {
+    let n = node_at(p.nodes, i);
+    last = n.kind;
+    i = n.next;
+  }
+  return last == S_RETURN || last == S_UNREACHABLE;
+}
+
+/// Does the statement list from `head` use the name `bs..be` after
+/// assigning to something spelled with the name `rs..re` (its root)? `st`
+/// is 1 once an assignment to the root has run. A conservative scan: both
+/// branches count, a loop body is scanned twice.
+fn ir_use_after_assign(p: &Parser, head: u64, rs: u64, re: u64, bs: u64, be: u64, st: &mut u64) -> bool {
+  let mut i = head;
+  while i != 0 {
+    let n = node_at(p.nodes, i);
+    let k = n.kind;
+    if k == S_ASSIGN {
+      let r = node_at(p.nodes, n.a);
+      if st == 1 && (ir_mentions(p, n.b, bs, be) || same(p.src, r.s, r.e, bs, be)) {
+        return true;
+      }
+      if re >= rs && r.e >= r.s && r.e - r.s >= re - rs && same(p.src, r.s, wrap_add(r.s, re - rs), rs, re) {
+        st = 1;
+      }
+    } else if k == S_LET {
+      if st == 1 && ir_mentions(p, n.b, bs, be) {
+        return true;
+      }
+    } else if k == S_RETURN || k == S_ASSERT || k == S_EXPR {
+      if st == 1 && n.a != 0 && ir_mentions(p, n.a, bs, be) {
+        return true;
+      }
+    } else if k == S_IF {
+      if st == 1 && ir_mentions(p, n.a, bs, be) {
+        return true;
+      }
+      let mut s1 = st;
+      let mut s2 = st;
+      if ir_use_after_assign(p, n.b, rs, re, bs, be, &mut s1) || ir_use_after_assign(p, n.c, rs, re, bs, be, &mut s2) {
+        return true;
+      }
+      if (s1 == 1 && !ir_ends_in_exit(p, n.b)) || (s2 == 1 && !ir_ends_in_exit(p, n.c)) {
+        st = 1;
+      }
+    } else if k == S_WHILE {
+      if st == 1 && ir_mentions(p, n.a, bs, be) {
+        return true;
+      }
+      if ir_use_after_assign(p, n.c, rs, re, bs, be, &mut st) || ir_use_after_assign(p, n.c, rs, re, bs, be, &mut st) {
+        return true;
+      }
+    } else if k == S_MATCH {
+      if st == 1 && ir_mentions(p, n.a, bs, be) {
+        return true;
+      }
+      let mut out = st;
+      let mut a = n.b;
+      while a != 0 {
+        let arm = node_at(p.nodes, a);
+        let mut sa = st;
+        if ir_use_after_assign(p, arm.c, rs, re, bs, be, &mut sa) {
+          return true;
+        }
+        if sa == 1 && !ir_ends_in_exit(p, arm.c) {
+          out = 1;
+        }
+        a = arm.next;
+      }
+      st = out;
+    } else if st == 1 {
+      return true;
+    }
+    i = n.next;
+  }
+  return false;
 }
 
 /// A struct or enum held in memory, copied to a frame slot of ours.
@@ -2072,7 +2215,48 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     return ir_none();
   }
   if name_is(p, i, "box") {
-    // The contents first, then the allocation they are copied into.
+    // The allocation first when the contents are a struct literal (their
+    // type is known): a tree built by recursion then lays out its nodes
+    // parents first, in the order it is walked. Otherwise the contents
+    // first, then the allocation they are copied into.
+    let an = node_at(p.nodes, n.a);
+    if an.kind == E_SLIT {
+      let def = find_in(p, p.structs.head, n.a);
+      let dnode = node_at(p.nodes, def);
+      if def != 0 && dnode.v == 0 {
+        let st = intern(&mut m, p, TY_STRUCT, plain_inst(&mut m, def));
+        let sw = ir_mw(c, m, p, st, 0);
+        if sw != IR_NONE && sw != 0 && sw <= 512 {
+          let cnt = ir_reg(&mut f);
+          ir_emit(&mut f, IR_CONST, cnt, sw, 0, 0, 0);
+          let ptr = ir_reg(&mut f);
+          // Every word is written next: no need to zero them.
+          ir_emit(&mut f, IR_ALLOC, ptr, cnt, 0, 8, 2);
+          let dst = IrVal { k: IRK_PLACE, r0: ptr, r1: 0, t: base_t(m, st) };
+          if ir_ms(c, m, p, st) > 0 {
+            // Built in the allocation itself.
+            ir_slit_fill(&mut f, c, &mut m, p, n.a, dst);
+            if f.failed {
+              return ir_none();
+            }
+            return IrVal { k: IRK_BOX, r0: ptr, r1: IR_NONE, t: intern(&mut m, p, TY_BOX, st) };
+          }
+          let v = ir_vexpr(&mut f, c, &mut m, p, n.a);
+          if f.failed {
+            return ir_none();
+          }
+          if v.k == IRK_PLACE {
+            ir_store_val(&mut f, c, m, p, dst, v);
+          } else if v.k == IRK_STRUCT {
+            ir_store_words(&mut f, ptr, 0, v.r0, v.r1);
+          } else {
+            ir_fail(&mut f, "a box of a struct literal of another kind");
+            return ir_none();
+          }
+          return IrVal { k: IRK_BOX, r0: ptr, r1: IR_NONE, t: intern(&mut m, p, TY_BOX, st) };
+        }
+      }
+    }
     let v = ir_vexpr(&mut f, c, &mut m, p, n.a);
     if f.failed {
       return ir_none();
@@ -2105,6 +2289,25 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     // A lock is the allocation `box` makes, behind a lock word that starts
     // at 0 (the allocation is zeroed); an atomic is one word.
     let lock = name_is(p, i, "lock_new");
+    let an = node_at(p.nodes, n.a);
+    if lock && an.kind == E_SLIT {
+      // A struct literal that lives in memory is built in the lock itself,
+      // not in a slot and then copied.
+      let def = find_in(p, p.structs.head, n.a);
+      let dnode = node_at(p.nodes, def);
+      if def != 0 && dnode.v == 0 {
+        let st = intern(&mut m, p, TY_STRUCT, plain_inst(&mut m, def));
+        let sw = ir_ms(c, m, p, st);
+        if sw != IR_NONE && sw > 0 && sw <= 8192 {
+          let cnt = ir_reg(&mut f);
+          ir_emit(&mut f, IR_CONST, cnt, wrap_add(sw, 1), 0, 0, 0);
+          let ptr = ir_reg(&mut f);
+          ir_emit(&mut f, IR_ALLOC, ptr, cnt, 0, 8, 0);
+          ir_slit_fill(&mut f, c, &mut m, p, n.a, IrVal { k: IRK_PLACE, r0: ptr, r1: 1, t: base_t(m, st) });
+          return IrVal { k: IRK_INT, r0: ptr, r1: IR_NONE, t: intern(&mut m, p, TY_LOCK, st) };
+        }
+      }
+    }
     let v = ir_vexpr(&mut f, c, &mut m, p, n.a);
     if f.failed {
       return ir_none();
@@ -2180,6 +2383,62 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       ir_emit(&mut f, IR_FREE, IR_NONE, b.r0, 0, 0, 0);
     }
     return out;
+  }
+  if name_is(p, i, "smp_run") {
+    // `smp_run(f, args..)`: the shared arguments go one word each into a
+    // block in the frame; the emitter writes the thunk that calls `f` with
+    // them (and a token for each `&mut` parameter) on every processor. Only
+    // one-word arguments (locks, atomics) are handled. `ty` packs the
+    // instance, the parameter count and which parameters are `&mut`.
+    if c.target != TARGET_KERNEL {
+      ir_fail(&mut f, "an smp_run outside the kernel");
+      return ir_none();
+    }
+    let fnode = node_at(p.nodes, cg_arg(p, i, 0));
+    let fd = plain_fn(p, fnode.s, fnode.e);
+    if fd == 0 {
+      ir_fail(&mut f, "an smp_run of something that is not a plain function");
+      return ir_none();
+    }
+    let x = plain_inst(&mut m, fd);
+    let xi = inst_at(m, x);
+    let ps = fn_params(&mut m, p, xi.def, x);
+    let np = vec_len(ps);
+    if np > 12 {
+      ir_fail(&mut f, "an smp_run with many parameters");
+      vec_free(ps);
+      return ir_none();
+    }
+    let slot = ir_reg(&mut f);
+    ir_emit(&mut f, IR_SLOT, slot, 0, 0, wrap_add(np, 1), 0);
+    let mut mask = 0;
+    let mut a = cg_arg(p, i, 1);
+    let mut j = 0;
+    while a != 0 && j < np && !f.failed {
+      let pt = u_at(ps, j);
+      if kind_t(m, pt) == TY_MUTREF {
+        mask = wrap_add(mask, 1 << j);
+      } else {
+        let w = ir_mw(c, m, p, pt, 0);
+        let v = ir_vexpr(&mut f, c, &mut m, p, a);
+        if !f.failed {
+          if w != 1 || (v.k != IRK_INT && v.k != IRK_BOX) {
+            ir_fail(&mut f, "an smp_run argument of more than one word");
+          } else {
+            ir_hdr_store(&mut f, slot, j, v.r0);
+          }
+        }
+      }
+      a = next_of(p, a);
+      j = j + 1;
+    }
+    vec_free(ps);
+    if f.failed {
+      return ir_none();
+    }
+    let d = ir_reg(&mut f);
+    ir_emit(&mut f, IR_PCALL, d, slot, slot, 13, wrap_add(wrap_mul(x, 65536), wrap_add(wrap_mul(np, 4096), mask)));
+    return ir_none();
   }
   if name_is(p, i, "mmu_exit") {
     // Drops the count only once this processor no longer uses the table.
@@ -3242,6 +3501,23 @@ fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
         ir_fail(&mut f, "an initializer of another kind");
         return;
       }
+      let initn = node_at(p.nodes, n.b);
+      let initk = initn.kind;
+      if initk == E_SLIT || (initk == E_TAPP && kind_of(p, initn.b) == E_SLIT) {
+        // A struct literal was just built in a slot of its own: the
+        // variable is that slot, not a copy of it.
+        ir_bind(&mut f, n.s, n.e, IrVal { k: IRK_PLACE, r0: v.r0, r1: v.r1, t: base_t(m, t) });
+        return;
+      }
+      if initk == E_CALL && vec_len(f.ins) > 0 && v.r1 == 0 {
+        // The result of a call is in the space the call reserved in this
+        // frame, used by this call alone: the variable is that space.
+        let last = vec_get(f.ins, wrap_sub(vec_len(f.ins), 1));
+        if last.op == IR_CALLM && last.d == v.r0 {
+          ir_bind(&mut f, n.s, n.e, IrVal { k: IRK_PLACE, r0: v.r0, r1: 0, t: base_t(m, t) });
+          return;
+        }
+      }
       let slot = ir_reg(&mut f);
       ir_emit(&mut f, IR_SLOT, slot, 0, 0, mw, 0);
       let r = IrVal { k: IRK_PLACE, r0: slot, r1: 0, t: base_t(m, t) };
@@ -3318,6 +3594,17 @@ fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
         ir_store_val(&mut f, c, m, p, target, v);
       } else if v.k != target.k {
         ir_fail(&mut f, "an assignment between kinds");
+      } else if v.k == IRK_VEC && rhs.kind == E_VAR {
+        // A vector taken from another variable moves its header words: both
+        // names stand for headers in the frame, and the source's header is
+        // written again when the code that made it runs again (a loop), so
+        // the target must not keep pointing at it.
+        let mut j = 0;
+        while j < 3 {
+          let w = ir_hdr_load(&mut f, v.r0, j);
+          ir_hdr_store(&mut f, target.r0, j, w);
+          j = j + 1;
+        }
       } else {
         ir_copy(&mut f, target, v);
       }
@@ -3441,7 +3728,14 @@ fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
                 ir_fail(&mut f, "a binding of a variant without a payload");
               } else {
                 let view = IrVal { k: IRK_PLACE, r0: e.r0, r1: wrap_add(e.r1, 1), t: base_t(m, ft) };
-                let r = ir_own(&mut f, ir_rv(&mut f, c, m, p, view));
+                let mut r = ir_own(&mut f, ir_rv(&mut f, c, m, p, view));
+                let sc = node_at(p.nodes, n.a);
+                let mut st = 0;
+                if r.k == IRK_PLACE && ir_ms(c, m, p, r.t) > 0 && ir_use_after_assign(p, arm.c, sc.s, sc.e, b.s, b.e, &mut st) {
+                  // Still where the scrutinee is: an arm may assign to the
+                  // scrutinee, so the payload gets a slot of its own.
+                  r = ir_own_place(&mut f, c, m, p, r);
+                }
                 ir_bind(&mut f, b.s, b.e, r);
               }
             } else {

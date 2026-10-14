@@ -24,7 +24,7 @@ import "iropt_inline.bastio";
 /// A frame holds the saved registers, the spilled values and the slots; an
 /// instruction count past this goes to the old generator (the allocator is
 /// quadratic).
-const IX_MAX_INS: u64 = 3000;
+const IX_MAX_INS: u64 = 40000;
 
 /// Where a value is: machine register `reg` (an XR_ number; k = IXK_REG),
 /// the frame word `off` words below %rbp (IXK_MEM) or a constant `imm`
@@ -525,6 +525,25 @@ fn ix_norm(out: &mut Vec[u64], m: &Mono, t: u64) {
   }
 }
 
+/// Does `v` (bytes) end with `s`? If so, `cut` drops it.
+fn ix_ends_with(v: &Vec[u64], s: Str) -> bool {
+  let n = vec_len(v);
+  let l = slen(s);
+  if l > n {
+    return false;
+  }
+  let mut k = 0;
+  while k < l
+    invariant k <= slen(s) && slen(s) <= vlen(v)
+  {
+    if vec_get(v, n - l + k) != cast[u64](sget(s, k)) {
+      return false;
+    }
+    k = k + 1;
+  }
+  return true;
+}
+
 /// One instruction other than control flow and calls.
 fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: &Parser, q: IrIns, slotw: u64) {
   let op = q.op;
@@ -538,6 +557,22 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     let lb0 = ix_loc(al, q.b);
     if ld.k == IXK_REG && !wrap && !(lb0.k == IXK_REG && lb0.reg == ld.reg) {
       t = ld.reg;
+    }
+    if op == IR_ADD && !wrap && ld.k == IXK_REG && la.k == IXK_REG && lb0.k == IXK_IMM && ix_fits(lb0.imm) && la.reg != ld.reg {
+      // `d = a + imm` into another register: one lea instead of a move and an add.
+      w_s(&mut out, "\tlea ");
+      if lb0.imm <= 2147483647 {
+        w_num(&mut out, lb0.imm);
+      } else {
+        w_s(&mut out, "-");
+        w_num(&mut out, wrap_sub(0, lb0.imm));
+      }
+      w_s(&mut out, "(");
+      w_s(&mut out, x86_rname(la.reg));
+      w_s(&mut out, "), ");
+      w_s(&mut out, x86_rname(ld.reg));
+      w_s(&mut out, "\n");
+      return;
     }
     ix_mov(&mut out, la, ix_rl(t));
     let lb = ix_src(&mut out, lb0);
@@ -564,9 +599,21 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RAX));
     x86_clear(&mut g.body);
     x86_div_const(&mut g, lbq.imm, op == IR_REM);
+    // A remainder ends with its result in %rsi moved to %rax: take it from
+    // %rsi directly.
+    let tail = "\tmov %rsi, %rax\n";
+    let mut res = XR_RAX;
+    if ix_ends_with(g.body, tail) {
+      let mut k = 0;
+      while k < slen(tail) && vec_len(g.body) > 0 {
+        vec_pop(&mut g.body);
+        k = k + 1;
+      }
+      res = XR_RSI;
+    }
     w_append(&mut out, g.body);
     x86_clear(&mut g.body);
-    ix_finish(&mut out, al, q.d, XR_RAX);
+    ix_finish(&mut out, al, q.d, res);
   } else if op == IR_DIV || op == IR_REM || op == IR_SDIV || op == IR_SREM {
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RAX));
     ix_mov(&mut out, ix_loc(al, q.b), ix_rl(XR_RCX));
@@ -912,8 +959,59 @@ fn ix_at(f: &IrFn, i: u64) -> IrIns {
   return IrIns { op: 0, d: IR_NONE, a: IR_NONE, b: IR_NONE, c: 0, ty: 0 };
 }
 
+/// `smp_run` (a PCALL with c == 13; q.ty packs the callee instance, the
+/// parameter count and which parameters are `&mut`): the block of shared
+/// words is at register `q.a`. The thunk (C calling convention, the block's
+/// address in %rdi) calls the function with the block's words and a token
+/// for each `&mut` parameter; the other processors run it, this one too, and
+/// it waits for them.
+fn ix_smp(out: &mut Vec[u64], g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, al: &IrAlloc, q: IrIns) {
+  let x = q.ty / 65536;
+  let np = (q.ty / 4096) % 16;
+  let mask = q.ty % 4096;
+  let k = g.nsmp;
+  g.nsmp = wrap_add(k, 1);
+  x86_sym(&mut g, m, p, x);
+  let fname = g.ln;
+  g.ln = vec_new[u64]();
+  w_s(&mut g.smp, "bst_rt_smp_thunk");
+  w_num(&mut g.smp, k);
+  w_s(&mut g.smp, ":\n\tpush %rbp\n\tmov %rsp, %rbp\n\tpush %rbx\n\tpush $0\n\tmov %rdi, %rbx\n");
+  let mut j = 0;
+  while j < np && j < 16 {
+    if (mask >> j) & 1 == 1 {
+      w_s(&mut g.smp, "\tlea -16(%rbp), %rax\n\tpush %rax\n");
+    } else {
+      w_s(&mut g.smp, "\tpush ");
+      w_num(&mut g.smp, wrap_mul(8, j));
+      w_s(&mut g.smp, "(%rbx)\n");
+    }
+    j = j + 1;
+  }
+  let na = x86_regargs(&mut g, c, &mut m, p, x);
+  if na == np {
+    j = 0;
+    while j < na {
+      w_s(&mut g.smp, "\tpop ");
+      w_s(&mut g.smp, x86_rname(x86_argreg(j)));
+      w_s(&mut g.smp, "\n");
+      j = j + 1;
+    }
+  }
+  w_s(&mut g.smp, "\tcall ");
+  w_append(&mut g.smp, fname);
+  w_s(&mut g.smp, "\n\tmov -8(%rbp), %rbx\n\tleave\n\tret\n\n");
+  vec_free(fname);
+  ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RDI));
+  w_s(&mut out, "\tpush %rdi\n\tpush %rdi\n\tmov %rdi, %rsi\n\tlea bst_rt_smp_thunk");
+  w_num(&mut out, k);
+  w_s(&mut out, "(%rip), %rdi\n\tcall bst_rt_smp_start\n\tmov (%rsp), %rdi\n\tcall bst_rt_smp_thunk");
+  w_num(&mut out, k);
+  w_s(&mut out, "\n\tcall bst_rt_smp_join\n\tadd $16, %rsp\n");
+}
+
 /// The body of the function: its instructions.
-fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, nuse: &Vec[u64], base: u64, rswap: bool, retoff: u64) {
+fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, nuse: &Vec[u64], moff: &Vec[u64], base: u64, rswap: bool, retoff: u64) {
   let n = vec_len(f.ins);
   // The position after each label (0: no such label).
   let mut lpos = vec_new[u64]();
@@ -930,18 +1028,50 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
     }
     z = z + 1;
   }
-  // The slot area (`ix_share_slots`) is followed by the result areas of
-  // the calls that return into the frame.
-  let mut sarea = 0;
-  let mut si = 0;
-  while si < n {
-    let sq = vec_get(f.ins, si);
-    if sq.op == IR_SLOT && wrap_add(sq.a, sq.c) > sarea {
-      sarea = wrap_add(sq.a, sq.c);
-    }
-    si = si + 1;
+  // The labels a branch comes back to (loop heads), which get aligned: a
+  // jump (or branch) to a label placed before it, and the targets of the
+  // test that a jump to a test block repeats.
+  let mut heads = vec_new[u64]();
+  z = 0;
+  while z < f.nlabel && z < 100000000 {
+    vec_push(&mut heads, 0);
+    z = z + 1;
   }
-  let mut slotw = wrap_add(base, sarea);
+  z = 0;
+  while z < n {
+    let hq = vec_get(f.ins, z);
+    if hq.op == IR_JMP {
+      let lp = u_at(lpos, hq.a);
+      if lp != 0 && lp <= z {
+        ra_set(&mut heads, hq.a, 1);
+      }
+      let t1 = ix_at(f, lp);
+      let t2 = ix_at(f, wrap_add(lp, 1));
+      let mut tb = t1;
+      if lp != 0 && ix_is_cmp(t1.op) && t2.op == IR_BR && t2.a == t1.d {
+        tb = t2;
+      }
+      if lp != 0 && tb.op == IR_BR {
+        if u_at(lpos, tb.b) != 0 && u_at(lpos, tb.b) <= z {
+          ra_set(&mut heads, tb.b, 1);
+        }
+        if u_at(lpos, tb.c) != 0 && u_at(lpos, tb.c) <= z {
+          ra_set(&mut heads, tb.c, 1);
+        }
+      }
+    } else if hq.op == IR_BR {
+      if u_at(lpos, hq.b) != 0 && u_at(lpos, hq.b) <= z {
+        ra_set(&mut heads, hq.b, 1);
+      }
+      if u_at(lpos, hq.c) != 0 && u_at(lpos, hq.c) <= z {
+        ra_set(&mut heads, hq.c, 1);
+      }
+    }
+    z = z + 1;
+  }
+  // Slots and the result areas of calls that return into the frame share
+  // one area (`ix_share_slots`).
+  let slotw = base;
   let mut i = 0;
   while i < n {
     let q = vec_get(f.ins, i);
@@ -952,6 +1082,9 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       next = nq.a;
     }
     if q.op == IR_LABEL {
+      if u_at(heads, q.a) == 1 {
+        w_s(&mut out, "\t.p2align 4\n");
+      }
       ix_lbl(&mut out, f.x, q.a);
       w_s(&mut out, ":\n");
     } else if q.op == IR_JMP {
@@ -990,8 +1123,20 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       let mut j = 0;
       while j < q.c && j < 4096 {
         if q.a == IR_NONE {
-          ix_mov(&mut out, ix_loc(al, u_at(f.args, wrap_add(q.b, j))), ix_rl(XR_RAX));
-          w_s(&mut out, "\tmov %rax, ");
+          // A register or a small constant is stored as it is.
+          let src = ix_loc(al, u_at(f.args, wrap_add(q.b, j)));
+          if src.k == IXK_REG {
+            w_s(&mut out, "\tmov ");
+            w_s(&mut out, x86_rname(src.reg));
+            w_s(&mut out, ", ");
+          } else if src.k == IXK_IMM && ix_fits(src.imm) {
+            w_s(&mut out, "\tmovq ");
+            ix_w_imm(&mut out, src.imm);
+            w_s(&mut out, ", ");
+          } else {
+            ix_mov(&mut out, src, ix_rl(XR_RAX));
+            w_s(&mut out, "\tmov %rax, ");
+          }
         } else {
           w_s(&mut out, "\tmov ");
           w_num(&mut out, wrap_mul(8, j));
@@ -1028,10 +1173,13 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
     } else if q.op == IR_UNREACH {
       w_s(&mut out, "\tud2\n");
     } else if q.op == IR_CALL || q.op == IR_CALLM {
+      let mut sw = slotw;
       if q.op == IR_CALLM {
-        slotw = wrap_add(slotw, q.ty);
+        sw = wrap_add(base, wrap_add(u_at(moff, i), q.ty));
       }
-      ix_call(&mut out, f, al, &mut g, c, &mut m, p, q, slotw);
+      ix_call(&mut out, f, al, &mut g, c, &mut m, p, q, sw);
+    } else if q.op == IR_PCALL && q.c == 13 {
+      ix_smp(&mut out, &mut g, c, &mut m, p, al, q);
     } else {
       let mut sw = slotw;
       if q.op == IR_SLOT {
@@ -1042,6 +1190,7 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
     i = i + 1;
   }
   vec_free(lpos);
+  vec_free(heads);
 }
 
 fn ix_cmp_zero(out: &mut Vec[u64], al: &IrAlloc, r: u64) {
@@ -1151,7 +1300,7 @@ fn ix_coalesce(f: &mut IrFn) {
 /// is live from its first to its last use over its address and every copy of
 /// it (`MOV` and arithmetic); a slot whose address is stored or reaches any
 /// other instruction stays live for the whole function.
-fn ix_share_slots(f: &mut IrFn) -> u64 {
+fn ix_share_slots(f: &mut IrFn, moff: &mut Vec[u64]) -> u64 {
   let n = vec_len(f.ins);
   let nr = f.nreg;
   let bl = ra_blocks(f);
@@ -1164,15 +1313,47 @@ fn ix_share_slots(f: &mut IrFn) -> u64 {
     vec_push(&mut root, 0);
     r = r + 1;
   }
+  // How many instructions write each register: the result area of a call
+  // is shared only when its register holds nothing else.
+  let mut ndefs = vec_new[u64]();
+  r = 0;
+  while r < nr && r < 1000000000 {
+    vec_push(&mut ndefs, 0);
+    r = r + 1;
+  }
   let mut spos = vec_new[u64]();
   let mut pinned = vec_new[u64]();
   let mut i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    let mut ws = vec_new[u64]();
+    ra_writes(q, &mut ws);
+    let mut j = 0;
+    while j < vec_len(ws) {
+      let w = vec_get(ws, j);
+      if w < nr {
+        ra_set(&mut ndefs, w, wrap_add(u_at(ndefs, w), 1));
+      }
+      j = j + 1;
+    }
+    vec_free(ws);
+    i = i + 1;
+  }
+  i = 0;
   while i < n {
     let q = vec_get(f.ins, i);
     if q.op == IR_SLOT {
       vec_push(&mut spos, i);
       vec_push(&mut pinned, 0);
       ra_set(&mut root, q.d, vec_len(spos));
+    } else if q.op == IR_CALLM {
+      vec_push(&mut spos, i);
+      if q.d < nr && u_at(ndefs, q.d) == 1 {
+        vec_push(&mut pinned, 0);
+        ra_set(&mut root, q.d, vec_len(spos));
+      } else {
+        vec_push(&mut pinned, 1);
+      }
     }
     i = i + 1;
   }
@@ -1260,7 +1441,11 @@ fn ix_share_slots(f: &mut IrFn) -> u64 {
   k = 0;
   while k < ns {
     let sq = ix_at(f, u_at(spos, k));
-    vec_push(&mut size, sq.c);
+    if sq.op == IR_CALLM {
+      vec_push(&mut size, sq.ty);
+    } else {
+      vec_push(&mut size, sq.c);
+    }
     vec_push(&mut off, 0);
     k = k + 1;
   }
@@ -1302,11 +1487,16 @@ fn ix_share_slots(f: &mut IrFn) -> u64 {
     let pos = u_at(spos, k);
     if pos < vec_len(f.ins) {
       let mut q = vec_get(f.ins, pos);
-      q.a = best;
-      vec_set(&mut f.ins, pos, q);
+      if q.op == IR_SLOT {
+        q.a = best;
+        vec_set(&mut f.ins, pos, q);
+      } else {
+        ra_set(&mut moff, pos, best);
+      }
     }
     k = k + 1;
   }
+  vec_free(ndefs);
   vec_free(off);
   vec_free(size);
   vec_free(lo);
@@ -1338,11 +1528,16 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   iropt_copies(&mut f);
   iropt_dce(&mut f);
   iropt_thread(&mut f);
+  if iropt_merge(&mut f) > 0 {
+    iropt_copies(&mut f);
+    iropt_dce(&mut f);
+    iropt_thread(&mut f);
+  }
   ix_coalesce(&mut f);
   let xi = inst_at(m, x);
   let pos = ix_positions(&mut g, c, &mut m, p, x);
   let mut ok = vec_len(pos) == vec_len(f.params);
-  if ok && name_is(p, xi.def, "main") && vec_len(pos) > 0 {
+  if ok && name_is(p, xi.def, "main") && vec_len(pos) > 0 && g.target != TARGET_KERNEL {
     ok = false;
   }
   let rt = cg_ret_ty(&mut m, p, x);
@@ -1363,16 +1558,13 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   let al = ra_alloc_const(f, 5, 4);
   let nuse = ix_uses(f);
   // The frame: saved registers, spills, slots.
-  let area = ix_share_slots(&mut f);
-  let mut slots = area;
+  let mut moff = vec_new[u64]();
   k = 0;
   while k < vec_len(f.ins) {
-    let q = vec_get(f.ins, k);
-    if q.op == IR_CALLM {
-      slots = wrap_add(slots, q.ty);
-    }
+    vec_push(&mut moff, 0);
     k = k + 1;
   }
+  let slots = ix_share_slots(&mut f, &mut moff);
   let base = wrap_add(al.ncallee_used, al.nspill);
   let mut words = wrap_add(base, slots);
   if words % 2 == 1 {
@@ -1422,7 +1614,7 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   if na == 0 {
     retoff = wrap_add(16, wrap_mul(8, vec_len(pos)));
   }
-  ix_body(&mut out, f, al, &mut g, c, &mut m, p, nuse, base, ix_buffer(c, m, p, rt), retoff);
+  ix_body(&mut out, f, al, &mut g, c, &mut m, p, nuse, moff, base, ix_buffer(c, m, p, rt), retoff);
   ix_lbl(&mut out, x, IR_NONE);
   w_s(&mut out, ":\n");
   k = 0;
@@ -1438,6 +1630,7 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   w_append(&mut g.out, out);
   vec_free(out);
   vec_free(nuse);
+  vec_free(moff);
   vec_free(pos);
   ra_free(al);
   ir_free(f);
