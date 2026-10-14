@@ -487,6 +487,405 @@ fn iropt_thread(f: &mut IrFn) -> u64 {
   return changed;
 }
 
+/// The value that the register `r` is known to hold: `kv` at the position
+/// where `kr` has it (IR_NONE: not known).
+fn iropt_known(kr: &Vec[u64], kv: &Vec[u64], r: u64) -> u64 {
+  let mut k = 0;
+  while k < vec_len(kr) {
+    if vec_get(kr, k) == r {
+      return u_at(kv, k);
+    }
+    k = k + 1;
+  }
+  return IR_NONE;
+}
+
+/// Notes that `r` now holds `v` (IR_NONE: something unknown).
+fn iropt_note(kr: &mut Vec[u64], kv: &mut Vec[u64], r: u64, v: u64) {
+  let mut k = 0;
+  while k < vec_len(kr) {
+    if vec_get(kr, k) == r {
+      ra_set(&mut kv, k, v);
+      return;
+    }
+    k = k + 1;
+  }
+  vec_push(&mut kr, r);
+  vec_push(&mut kv, v);
+}
+
+/// What the registers known to hold constants hold after `t`.
+fn iropt_step(kr: &mut Vec[u64], kv: &mut Vec[u64], t: IrIns) {
+  if t.op == IR_CONST && t.a != IR_NONE {
+    iropt_note(&mut kr, &mut kv, t.d, t.a);
+  } else if t.op == IR_MOV && iropt_known(kr, kv, t.a) != IR_NONE {
+    iropt_note(&mut kr, &mut kv, t.d, iropt_known(kr, kv, t.a));
+  } else if (t.op == IR_EQ || t.op == IR_NE) && iropt_known(kr, kv, t.a) != IR_NONE && iropt_known(kr, kv, t.b) != IR_NONE {
+    let same = iropt_known(kr, kv, t.a) == iropt_known(kr, kv, t.b);
+    let mut v = 0;
+    if same == (t.op == IR_EQ) {
+      v = 1;
+    }
+    iropt_note(&mut kr, &mut kv, t.d, v);
+  } else {
+    let mut ws = vec_new[u64]();
+    ra_writes(t, &mut ws);
+    let mut j = 0;
+    while j < vec_len(ws) {
+      iropt_note(&mut kr, &mut kv, vec_get(ws, j), IR_NONE);
+      j = j + 1;
+    }
+    vec_free(ws);
+  }
+}
+
+/// The register that stands for `r` in the copy of a block: its entry in
+/// `mr`/`mn` (the last one written), or `r`.
+fn iropt_renamed(mr: &Vec[u64], mn: &Vec[u64], r: u64) -> u64 {
+  let mut k = vec_len(mr);
+  while k > 0 {
+    k = k - 1;
+    if u_at(mr, k) == r {
+      return u_at(mn, k);
+    }
+  }
+  return r;
+}
+
+/// Do all the reads of `r` in `f` sit in the instructions after the label
+/// of position `from` up to position `to` (the `br` ending the block), each
+/// after an instruction of the block wrote `r`? (`nread` counts the reads of
+/// each register over the whole function.)
+fn iropt_local(f: &IrFn, nread: &Vec[u64], lpos: &Vec[u64], l: u64, to: u64, r: u64) -> bool {
+  if r == IR_NONE {
+    return false;
+  }
+  let mut e = wrap_add(u_at(lpos, l), 1);
+  let mut written = false;
+  let mut inside = 0;
+  while e <= to && e < vec_len(f.ins) {
+    let t = vec_get(f.ins, e);
+    let mut rs = vec_new[u64]();
+    ra_reads(f, t, &mut rs);
+    let mut k = 0;
+    while k < vec_len(rs) {
+      if vec_get(rs, k) == r {
+        if !written {
+          vec_free(rs);
+          return false;
+        }
+        inside = wrap_add(inside, 1);
+      }
+      k = k + 1;
+    }
+    vec_free(rs);
+    if t.d == r && t.op != IR_BR {
+      written = true;
+    }
+    e = e + 1;
+  }
+  return written && inside == u_at(nread, r);
+}
+
+/// Drops the instructions that control cannot reach: those after a jump,
+/// branch or return up to a label that nothing jumps to, and so on. Returns
+/// how many it dropped.
+fn iropt_reach(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  let mut lpos = vec_new[u64]();
+  let mut l = 0;
+  while l < f.nlabel && l < 1000000000 {
+    vec_push(&mut lpos, IR_NONE);
+    l = l + 1;
+  }
+  let mut reach = vec_new[u64]();
+  let mut i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    vec_push(&mut reach, 0);
+    if q.op == IR_LABEL {
+      ra_set(&mut lpos, q.a, i);
+    }
+    i = i + 1;
+  }
+  let mut work = vec_new[u64]();
+  vec_push(&mut work, 0);
+  while vec_len(work) > 0 {
+    let mut p = vec_pop(&mut work);
+    let mut going = true;
+    while going && p < n {
+      if u_at(reach, p) != 0 {
+        going = false;
+      } else {
+        ra_set(&mut reach, p, 1);
+        let q = vec_get(f.ins, p);
+        if q.op == IR_JMP {
+          vec_push(&mut work, u_at(lpos, q.a));
+          going = false;
+        } else if q.op == IR_BR {
+          vec_push(&mut work, u_at(lpos, q.b));
+          vec_push(&mut work, u_at(lpos, q.c));
+          going = false;
+        } else if q.op == IR_RET || q.op == IR_UNREACH {
+          going = false;
+        } else {
+          p = p + 1;
+        }
+      }
+    }
+  }
+  let mut out = vec_new[IrIns]();
+  i = 0;
+  while i < n {
+    if u_at(reach, i) != 0 {
+      vec_push(&mut out, vec_get(f.ins, i));
+    }
+    i = i + 1;
+  }
+  let dropped = wrap_sub(n, vec_len(out));
+  vec_free(work);
+  vec_free(reach);
+  vec_free(lpos);
+  if dropped > 0 {
+    vec_free(f.ins);
+    f.ins = out;
+  } else {
+    vec_free(out);
+  }
+  return dropped;
+}
+
+/// Collapses chains of moves inside a straight-line run: after `b = mov a`,
+/// a later `c = mov b` in the same run (neither written between) reads `a`.
+/// Only the source of a move is rewritten. Returns how many it changed.
+fn iropt_chain(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  let mut cd = vec_new[u64]();
+  let mut cs = vec_new[u64]();
+  let mut changed = 0;
+  let mut i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    if q.op == IR_LABEL || q.op == IR_JMP || q.op == IR_BR || q.op == IR_RET || q.op == IR_UNREACH {
+      vec_free(cd);
+      vec_free(cs);
+      cd = vec_new[u64]();
+      cs = vec_new[u64]();
+    } else {
+      let mut u = q;
+      if q.op == IR_MOV {
+        let mut k = 0;
+        while k < vec_len(cd) {
+          if vec_get(cd, k) == u.a {
+            u.a = u_at(cs, k);
+            k = vec_len(cd);
+          } else {
+            k = k + 1;
+          }
+        }
+        if u.a != q.a {
+          vec_set(&mut f.ins, i, u);
+          changed = wrap_add(changed, 1);
+        }
+      }
+      let mut ws = vec_new[u64]();
+      ra_writes(u, &mut ws);
+      let mut j = 0;
+      while j < vec_len(ws) {
+        let w = vec_get(ws, j);
+        let mut keepd = vec_new[u64]();
+        let mut keeps = vec_new[u64]();
+        let mut k = 0;
+        while k < vec_len(cd) {
+          if vec_get(cd, k) != w && u_at(cs, k) != w {
+            vec_push(&mut keepd, vec_get(cd, k));
+            vec_push(&mut keeps, u_at(cs, k));
+          }
+          k = k + 1;
+        }
+        vec_free(cd);
+        vec_free(cs);
+        cd = keepd;
+        cs = keeps;
+        j = j + 1;
+      }
+      vec_free(ws);
+      if u.op == IR_MOV && u.a != u.d && u.a != IR_NONE {
+        vec_push(&mut cd, u.d);
+        vec_push(&mut cs, u.a);
+      }
+    }
+    i = i + 1;
+  }
+  vec_free(cd);
+  vec_free(cs);
+  return changed;
+}
+
+/// Jump threading through a merge block. When `jmp L` is reached with some
+/// registers known to hold constants, and the block at `L` is a few moves,
+/// constants and comparisons followed by a `br` whose condition those make
+/// known, the `jmp` takes a copy of the block and goes straight to the
+/// branch's target. (A label inside the block, after its first instruction,
+/// ends the search: another path may enter there.) This is what an inlined function that returns an enum
+/// leaves behind: each return writes the tag and the fields into a few
+/// registers and jumps to one block that tests the tag. Returns how many
+/// jumps it redirected.
+fn iropt_merge(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  let mut lpos = vec_new[u64]();
+  let mut l = 0;
+  while l < f.nlabel && l < 1000000000 {
+    vec_push(&mut lpos, IR_NONE);
+    l = l + 1;
+  }
+  let mut i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    if q.op == IR_LABEL {
+      ra_set(&mut lpos, q.a, i);
+    }
+    i = i + 1;
+  }
+  let mut nread = vec_new[u64]();
+  l = 0;
+  while l < f.nreg && l < 1000000000 {
+    vec_push(&mut nread, 0);
+    l = l + 1;
+  }
+  i = 0;
+  while i < n {
+    let mut rs = vec_new[u64]();
+    ra_reads(f, vec_get(f.ins, i), &mut rs);
+    let mut k = 0;
+    while k < vec_len(rs) {
+      let r = vec_get(rs, k);
+      ra_set(&mut nread, r, wrap_add(u_at(nread, r), 1));
+      k = k + 1;
+    }
+    vec_free(rs);
+    i = i + 1;
+  }
+  let mut out = vec_new[IrIns]();
+  let mut kr = vec_new[u64]();
+  let mut kv = vec_new[u64]();
+  let mut changed = 0;
+  i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    let mut threaded = false;
+    if q.op == IR_JMP && q.a < f.nlabel && vec_len(out) < 1000000 {
+      let mut sr = vec_new[u64]();
+      let mut sv = vec_new[u64]();
+      let mut k = 0;
+      while k < vec_len(kr) {
+        vec_push(&mut sr, vec_get(kr, k));
+        vec_push(&mut sv, u_at(kv, k));
+        k = k + 1;
+      }
+      let mut j = u_at(lpos, q.a);
+      let mut target = IR_NONE;
+      let mut len = 0;
+      let mut going = j != IR_NONE;
+      if going {
+        j = j + 1;
+      }
+      while going && j < n && len < 24 {
+        let t = vec_get(f.ins, j);
+        if t.op == IR_LABEL && len == 0 {
+          j = j + 1;
+        } else if t.op == IR_BR {
+          let v = iropt_known(sr, sv, t.a);
+          if v != IR_NONE {
+            if v != 0 {
+              target = t.b;
+            } else {
+              target = t.c;
+            }
+          }
+          going = false;
+        } else if t.op == IR_CONST || t.op == IR_MOV || t.op == IR_EQ || t.op == IR_NE {
+          iropt_step(&mut sr, &mut sv, t);
+          j = j + 1;
+          len = len + 1;
+        } else {
+          going = false;
+        }
+      }
+      if target != IR_NONE {
+        // The copy of the block. A register that only the block reads, after
+        // the block wrote it, is a temporary: the copy writes a new one, which
+        // nothing reads and `iropt_dce` removes. A move from a register that
+        // holds a known constant becomes a constant.
+        let mut cr = vec_new[u64]();
+        let mut cv = vec_new[u64]();
+        let mut mr = vec_new[u64]();
+        let mut mn = vec_new[u64]();
+        let mut e = wrap_add(u_at(lpos, q.a), 1);
+        while e < j && e < n {
+          let t = vec_get(f.ins, e);
+          if t.op != IR_LABEL {
+            let mut u = t;
+            // Reads go through the renaming made so far.
+            if t.op == IR_MOV || t.op == IR_EQ || t.op == IR_NE {
+              u.a = iropt_renamed(mr, mn, t.a);
+              if t.op != IR_MOV {
+                u.b = iropt_renamed(mr, mn, t.b);
+              }
+            }
+            if t.op == IR_MOV && iropt_known(cr, cv, u.a) != IR_NONE {
+              u = IrIns { op: IR_CONST, d: t.d, a: iropt_known(cr, cv, u.a), b: 0, c: 0, ty: 0 };
+            }
+            iropt_step(&mut cr, &mut cv, u);
+            if iropt_local(f, nread, lpos, q.a, j, t.d) {
+              let fresh = ir_reg(&mut f);
+              u.d = fresh;
+              vec_push(&mut mr, t.d);
+              vec_push(&mut mn, fresh);
+            }
+            vec_push(&mut out, u);
+          }
+          e = e + 1;
+        }
+        vec_free(cr);
+        vec_free(cv);
+        vec_free(mr);
+        vec_free(mn);
+        vec_push(&mut out, IrIns { op: IR_JMP, d: q.d, a: target, b: q.b, c: q.c, ty: q.ty });
+        changed = wrap_add(changed, 1);
+        threaded = true;
+      }
+      vec_free(sr);
+      vec_free(sv);
+    }
+    if !threaded {
+      vec_push(&mut out, q);
+    }
+    if q.op == IR_LABEL {
+      vec_free(kr);
+      vec_free(kv);
+      kr = vec_new[u64]();
+      kv = vec_new[u64]();
+    } else {
+      iropt_step(&mut kr, &mut kv, q);
+    }
+    i = i + 1;
+  }
+  vec_free(lpos);
+  vec_free(nread);
+  vec_free(kr);
+  vec_free(kv);
+  if changed > 0 {
+    vec_free(f.ins);
+    f.ins = out;
+    iropt_reach(&mut f);
+    iropt_chain(&mut f);
+  } else {
+    vec_free(out);
+  }
+  return changed;
+}
+
 /// Does `q` only compute a register (no effect, no trap)? Division is left
 /// out: removing it would be sound (the verifier proved the divisor), but a
 /// `div` that the allocator keeps costs nothing against one it never saw.

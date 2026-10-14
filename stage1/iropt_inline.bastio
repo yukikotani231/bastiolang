@@ -193,8 +193,21 @@ fn iri_splice(f: &mut IrFn, out: &mut Vec[IrIns], g: &IrFn, q: IrIns) {
   vec_push(&mut out, IrIns { op: IR_LABEL, d: IR_NONE, a: end, b: 0, c: 0, ty: 0 });
 }
 
+/// Does the body of `g`, the instance `x`, call `x` itself?
+fn iri_recursive(g: &IrFn, x: u64) -> bool {
+  let mut i = 0;
+  while i < vec_len(g.ins) {
+    let t = vec_get(g.ins, i);
+    if (t.op == IR_CALL || t.op == IR_CALLM) && t.a == x {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
 /// One round: every call that can be inlined is. Returns how many were.
-fn iri_round(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, selfok: bool) -> u64 {
+fn iri_round(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, selfok: bool, norec: bool) -> u64 {
   let mut out = vec_new[IrIns]();
   let n = vec_len(f.ins);
   let mut done = 0;
@@ -208,7 +221,7 @@ fn iri_round(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, selfok: bool) 
       // few instructions (a state getter and the like): they cost less
       // than the call.
       let room = vec_len(out) < IRI_GROWN || vec_len(g.ins) <= IRI_TINY;
-      if room && !g.failed && vec_len(g.ins) <= IRI_LOOP {
+      if room && !g.failed && vec_len(g.ins) <= IRI_LOOP && !(norec && (iri_recursive(g, q.a) || !iri_in_loop(f, i))) {
         iropt_slots(&mut g);
         iropt_copies(&mut g);
         iropt_thread(&mut g);
@@ -243,7 +256,20 @@ fn iropt_inline(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser) -> u64 {
   let mut total = 0;
   let mut round = 0;
   while round < IRI_ROUNDS {
-    let k = iri_round(&mut f, c, &mut m, p, round == 0);
+    let k = iri_round(&mut f, c, &mut m, p, round == 0, false);
+    total = wrap_add(total, k);
+    if k == 0 {
+      round = IRI_ROUNDS;
+    } else {
+      round = round + 1;
+    }
+  }
+  // A recursive callee copied in by the last rounds brings calls that no
+  // round is left to inline: take the calls in loops of those copies, never
+  // a recursive callee again.
+  round = 0;
+  while round < IRI_ROUNDS {
+    let k = iri_round(&mut f, c, &mut m, p, false, true);
     total = wrap_add(total, k);
     if k == 0 {
       round = IRI_ROUNDS;
