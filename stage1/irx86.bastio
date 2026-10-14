@@ -544,6 +544,43 @@ fn ix_ends_with(v: &Vec[u64], s: Str) -> bool {
   return true;
 }
 
+/// Whether the text `v` contains `pat`.
+fn ix_mentions(v: &Vec[u64], pat: Str) -> bool {
+  let n = vec_len(v);
+  let m = slen(pat);
+  let mut i = 0;
+  while i < n {
+    let mut j = 0;
+    while j < m && i + j < n && vec_get(v, i + j) == cast[u64](sget(pat, j)) {
+      j = j + 1;
+    }
+    if j == m {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+/// The 32-bit name of an allocatable or scratch register.
+fn ix_r32(r: u64) -> Str {
+  if r == XR_RAX { return "%eax"; }
+  if r == XR_RCX { return "%ecx"; }
+  if r == XR_RDX { return "%edx"; }
+  if r == XR_RSI { return "%esi"; }
+  if r == XR_RDI { return "%edi"; }
+  if r == XR_RBX { return "%ebx"; }
+  if r == XR_R12 { return "%r12d"; }
+  if r == XR_R13 { return "%r13d"; }
+  if r == XR_R14 { return "%r14d"; }
+  if r == XR_R15 { return "%r15d"; }
+  if r == XR_R8 { return "%r8d"; }
+  if r == XR_R9 { return "%r9d"; }
+  if r == XR_R10 { return "%r10d"; }
+  if r == XR_R11 { return "%r11d"; }
+  return "";
+}
+
 /// One instruction other than control flow and calls.
 fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: &Parser, q: IrIns, slotw: u64) {
   let op = q.op;
@@ -572,6 +609,15 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
       ix_op(&mut out, la);
       w_s(&mut out, ", ");
       ix_op(&mut out, ld);
+      w_s(&mut out, "\n");
+      return;
+    }
+    if op == IR_AND && ld.k == IXK_REG && la.k == IXK_REG && lb0.k == IXK_IMM && lb0.imm == 4294967295 && slen(ix_r32(la.reg)) > 0 && slen(ix_r32(ld.reg)) > 0 {
+      // `d = a & 0xffffffff`: a 32-bit move zero-extends.
+      w_s(&mut out, "\tmovl ");
+      w_s(&mut out, ix_r32(la.reg));
+      w_s(&mut out, ", ");
+      w_s(&mut out, ix_r32(ld.reg));
       w_s(&mut out, "\n");
       return;
     }
@@ -1628,12 +1674,11 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   ix_sym(&mut out, &mut g, m, p, x);
   w_s(&mut out, ", @function\n");
   ix_sym(&mut out, &mut g, m, p, x);
-  w_s(&mut out, ":                  # from the IR\n\tpush %rbp\n\tmov %rsp, %rbp\n\tsub $");
-  w_num(&mut out, wrap_mul(8, words));
-  w_s(&mut out, ", %rsp\n");
+  w_s(&mut out, ":                  # from the IR\n");
+  let mut inner = vec_new[u64]();
   k = 0;
   while k < al.ncallee_used {
-    ix_ins2(&mut out, "mov", ix_rl(ix_callee(k)), ix_ml(wrap_add(k, 1)));
+    ix_ins2(&mut inner, "mov", ix_rl(ix_callee(k)), ix_ml(wrap_add(k, 1)));
     k = k + 1;
   }
   // The parameters, from their argument registers or stack words.
@@ -1644,19 +1689,19 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
       let dst = ix_loc(al, r);
       let ps = u_at(pos, k);
       if na > 0 {
-        ix_mov(&mut out, ix_rl(x86_argreg(ps)), dst);
+        ix_mov(&mut inner, ix_rl(x86_argreg(ps)), dst);
       } else {
         let mut t = dst.reg;
         if dst.k != IXK_REG {
           t = XR_RAX;
         }
-        w_s(&mut out, "\tmov ");
-        w_num(&mut out, wrap_add(16, wrap_mul(8, ps)));
-        w_s(&mut out, "(%rbp), ");
-        w_s(&mut out, x86_rname(t));
-        w_s(&mut out, "\n");
+        w_s(&mut inner, "\tmov ");
+        w_num(&mut inner, wrap_add(16, wrap_mul(8, ps)));
+        w_s(&mut inner, "(%rbp), ");
+        w_s(&mut inner, x86_rname(t));
+        w_s(&mut inner, "\n");
         if dst.k != IXK_REG {
-          ix_mov(&mut out, ix_rl(XR_RAX), dst);
+          ix_mov(&mut inner, ix_rl(XR_RAX), dst);
         }
       }
     }
@@ -1667,20 +1712,34 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   if na == 0 {
     retoff = wrap_add(16, wrap_mul(8, vec_len(pos)));
   }
-  ix_body(&mut out, f, al, &mut g, c, &mut m, p, nuse, moff, base, ix_buffer(c, m, p, rt), retoff);
-  ix_lbl(&mut out, x, IR_NONE);
-  w_s(&mut out, ":\n");
+  ix_body(&mut inner, f, al, &mut g, c, &mut m, p, nuse, moff, base, ix_buffer(c, m, p, rt), retoff);
+  ix_lbl(&mut inner, x, IR_NONE);
+  w_s(&mut inner, ":\n");
   k = 0;
   while k < al.ncallee_used {
-    ix_ins2(&mut out, "mov", ix_ml(wrap_add(k, 1)), ix_rl(ix_callee(k)));
+    ix_ins2(&mut inner, "mov", ix_ml(wrap_add(k, 1)), ix_rl(ix_callee(k)));
     k = k + 1;
   }
-  w_s(&mut out, "\tleave\n\tret\n\t.size ");
-  ix_sym(&mut out, &mut g, m, p, x);
-  w_s(&mut out, ", .-");
-  ix_sym(&mut out, &mut g, m, p, x);
-  w_s(&mut out, "\n\n");
+  // A function with no frame, no calls and no use of the frame pointer
+  // needs none of it: no push, no leave.
+  let bare = words == 0 && !ix_mentions(inner, "%rbp") && !ix_mentions(inner, "%rsp") && !ix_mentions(inner, "call");
+  if bare {
+    w_s(&mut inner, "\tret\n\t.size ");
+  } else {
+    w_s(&mut inner, "\tleave\n\tret\n\t.size ");
+  }
+  ix_sym(&mut inner, &mut g, m, p, x);
+  w_s(&mut inner, ", .-");
+  ix_sym(&mut inner, &mut g, m, p, x);
+  w_s(&mut inner, "\n\n");
+  if !bare {
+    w_s(&mut out, "\tpush %rbp\n\tmov %rsp, %rbp\n\tsub $");
+    w_num(&mut out, wrap_mul(8, words));
+    w_s(&mut out, ", %rsp\n");
+  }
+  w_append(&mut out, inner);
   w_append(&mut g.out, out);
+  vec_free(inner);
   vec_free(out);
   vec_free(nuse);
   vec_free(moff);
