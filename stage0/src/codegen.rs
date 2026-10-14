@@ -635,7 +635,9 @@ static uint64_t bst_arena[BST_ARENA_WORDS];
 static uint64_t bst_arena_top = 0;
 static uint64_t *bst_arena2, bst_arena2_words, bst_arena2_top;
 typedef struct bst_free { uint64_t words; struct bst_free *next; } bst_free_t;
-static bst_free_t *bst_free_list = 0;
+static bst_free_t *bst_free_list = 0;           /* blocks of BST_BINS words or more */
+#define BST_BINS 1024
+static bst_free_t *bst_bin[BST_BINS];        /* exact-size free lists: pop in O(1) */
 static uint64_t bst_arena_lock;              /* every processor allocates from the one arena */
 /* An empty buffer with no memory when the arena is full. */
 static bst_buf bst_try_alloc(uint64_t n) {
@@ -643,12 +645,20 @@ static bst_buf bst_try_alloc(uint64_t n) {
     if (words < 2) words = 2;
     uint64_t *blk = 0;
     bst_lock_acquire(&bst_arena_lock);
-    bst_free_t **pp = &bst_free_list;
-    for (bst_free_t *f = bst_free_list; f; pp = &f->next, f = f->next) {
-        if (f->words == words) {
-            *pp = f->next;
+    if (words < BST_BINS) {
+        bst_free_t *f = bst_bin[words];
+        if (f) {
+            bst_bin[words] = f->next;
             blk = (uint64_t *)f;
-            break;
+        }
+    } else {
+        bst_free_t **pp = &bst_free_list;
+        for (bst_free_t *f = bst_free_list; f; pp = &f->next, f = f->next) {
+            if (f->words == words) {
+                *pp = f->next;
+                blk = (uint64_t *)f;
+                break;
+            }
         }
     }
     if (!blk && bst_arena_top + words <= BST_ARENA_WORDS) {
@@ -677,8 +687,13 @@ static void bst_free(bst_buf b) {
     bst_free_t *f = (bst_free_t *)blk;
     bst_lock_acquire(&bst_arena_lock);
     f->words = blk[0];
-    f->next = bst_free_list;
-    bst_free_list = f;
+    if (f->words < BST_BINS) {
+        f->next = bst_bin[f->words];
+        bst_bin[f->words] = f;
+    } else {
+        f->next = bst_free_list;
+        bst_free_list = f;
+    }
     bst_lock_release(&bst_arena_lock);
 }
 static void bst_print(uint64_t v) {
