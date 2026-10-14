@@ -1,0 +1,112 @@
+// native backend: a vector's length kept in a register across a push loop
+// expect-exit: 0
+// expect-stdout: 399995
+// expect-stdout: 54000
+// expect-stdout: 37492500
+// expect-stdout: 499500
+// A loop that only pushes onto a `&mut Vec` holds the length in a register,
+// stores it before the call that grows the vector and after the loop. The
+// vector grows several times here (so the call is taken), the pushes are
+// nested in an outer loop, and `both` pushes onto two vectors; `mixed` also
+// reads the length inside the loop, which keeps the length in memory.
+fn fill(v: &mut Vec[u64], n: u64)
+  requires vlen(v) == 0 && n <= 100000
+  ensures vlen(v) == n
+{
+  let mut i = 0;
+  while i < n
+    invariant i <= n && vlen(v) == i
+  {
+    vec_push(&mut v, i % 7 + 1);
+    i = i + 1;
+  }
+}
+
+fn nested(v: &mut Vec[u64], rows: u64)
+  requires vlen(v) == 0 && rows <= 100
+  ensures vlen(v) == rows * 10
+{
+  let mut r = 0;
+  while r < rows
+    invariant r <= rows && vlen(v) == r * 10
+  {
+    let mut c = 0;
+    while c < 10
+      invariant c <= 10 && vlen(v) == r * 10 + c
+    {
+      vec_push(&mut v, r + c);
+      c = c + 1;
+    }
+    r = r + 1;
+  }
+}
+
+fn both(a: &mut Vec[u64], b: &mut Vec[u64], n: u64)
+  requires vlen(a) == 0 && vlen(b) == 0 && n <= 5000
+  ensures vlen(a) == n && vlen(b) == n
+{
+  let mut i = 0;
+  while i < n
+    invariant i <= n && vlen(a) == i && vlen(b) == i
+  {
+    vec_push(&mut a, i);
+    vec_push(&mut b, 2 * i);
+    i = i + 1;
+  }
+}
+
+fn mixed(v: &mut Vec[u64], n: u64) -> u64
+  requires vlen(v) == 0 && n <= 1000
+  ensures vlen(v) == n
+{
+  let mut t = 0;
+  let mut i = 0;
+  while i < n
+    invariant i <= n && vlen(v) == i && t <= i * 1000
+  {
+    vec_push(&mut v, 1);
+    t = t + vec_len(v) % 1000;
+    i = i + 1;
+  }
+  return t;
+}
+
+fn total(v: &Vec[u64]) -> u64
+  requires vlen(v) <= 100000
+  ensures result <= vlen(v) * 100000
+{
+  let mut t = 0;
+  let mut i = 0;
+  while i < vec_len(v)
+    invariant i <= vlen(v) && t <= i * 100000
+  {
+    t = t + vec_get(v, i) % 100000;
+    i = i + 1;
+  }
+  return t;
+}
+
+fn main() -> u64 {
+  let mut v: Vec[u64] = vec_new[u64]();
+  fill(&mut v, 100000);
+  let t1 = total(v);
+  vec_free(v);
+  let mut w: Vec[u64] = vec_new[u64]();
+  nested(&mut w, 100);
+  let t2 = total(w);
+  vec_free(w);
+  let mut a: Vec[u64] = vec_new[u64]();
+  let mut b: Vec[u64] = vec_new[u64]();
+  both(&mut a, &mut b, 5000);
+  let t3 = total(a) + total(b);
+  vec_free(a);
+  vec_free(b);
+  let mut x: Vec[u64] = vec_new[u64]();
+  let t4 = mixed(&mut x, 1000);
+  vec_free(x);
+  print(t1);
+  print(t2);
+  print(t3);
+  print(t4);
+  return 0;
+}
