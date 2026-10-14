@@ -551,12 +551,40 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
   let lbq = ix_loc(al, q.b);
   if slen(alu) > 0 {
     let ld = ix_loc(al, q.d);
-    let la = ix_loc(al, q.a);
+    let mut la = ix_loc(al, q.a);
     let wrap = q.c == 1 && q.ty != 0 && slen(x86_normalize(m, q.ty)) > 0;
     let mut t = XR_RAX;
-    let lb0 = ix_loc(al, q.b);
+    let mut lb0 = ix_loc(al, q.b);
+    // `d = a op d` of a commutative operation is `d = d op a`.
+    if (op == IR_ADD || op == IR_MUL || op == IR_AND || op == IR_OR || op == IR_XOR) && ld.k == IXK_REG && lb0.k == IXK_REG && lb0.reg == ld.reg && !(la.k == IXK_REG && la.reg == ld.reg) {
+      let sw = la;
+      la = lb0;
+      lb0 = sw;
+    }
     if ld.k == IXK_REG && !wrap && !(lb0.k == IXK_REG && lb0.reg == ld.reg) {
       t = ld.reg;
+    }
+    if op == IR_MUL && !wrap && ld.k == IXK_REG && lb0.k == IXK_IMM && ix_fits(lb0.imm) && la.k != IXK_IMM {
+      // `d = a * imm`: the three-operand form, with no move first.
+      w_s(&mut out, "\timul ");
+      ix_op(&mut out, lb0);
+      w_s(&mut out, ", ");
+      ix_op(&mut out, la);
+      w_s(&mut out, ", ");
+      ix_op(&mut out, ld);
+      w_s(&mut out, "\n");
+      return;
+    }
+    if op == IR_ADD && !wrap && ld.k == IXK_REG && la.k == IXK_REG && lb0.k == IXK_REG && la.reg != ld.reg && lb0.reg != ld.reg {
+      // `d = a + b` into a third register: one lea.
+      w_s(&mut out, "\tlea (");
+      w_s(&mut out, x86_rname(la.reg));
+      w_s(&mut out, ", ");
+      w_s(&mut out, x86_rname(lb0.reg));
+      w_s(&mut out, "), ");
+      w_s(&mut out, x86_rname(ld.reg));
+      w_s(&mut out, "\n");
+      return;
     }
     if op == IR_ADD && !wrap && ld.k == IXK_REG && la.k == IXK_REG && lb0.k == IXK_IMM && ix_fits(lb0.imm) && la.reg != ld.reg {
       // `d = a + imm` into another register: one lea instead of a move and an add.
@@ -754,7 +782,9 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     ix_finish(&mut out, al, q.d, XR_RAX);
   } else if op == IR_PCALL {
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RDI));
-    ix_mov(&mut out, ix_loc(al, q.b), ix_rl(XR_RSI));
+    if q.c != 3 {
+      ix_mov(&mut out, ix_loc(al, q.b), ix_rl(XR_RSI));
+    }
     if q.c == 0 {
       w_s(&mut out, "\tlea bst_platform_info(%rip), %rax\n\tcall bst_rt_ccall\n");
     } else if q.c == 1 {
@@ -762,9 +792,11 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     } else if q.c == 2 {
       w_s(&mut out, "\tlea bst_platform_cpus(%rip), %rax\n\tcall bst_rt_ccall\n");
     } else if q.c == 3 {
-      w_s(&mut out, "\tcall bst_rt_cpu_get\n");
+      // The saved context is the start of the processor's block, which is %rsp
+      // rounded down (bst_platform_ctx_mask, from the platform): no call.
+      w_s(&mut out, "\tmov %rsp, %rax\n\tand $bst_platform_ctx_mask, %rax\n\tmov (%rax,%rdi,8), %rax\n");
     } else if q.c == 6 {
-      w_s(&mut out, "\tcall bst_rt_cpu_set\n");
+      w_s(&mut out, "\tmov %rsp, %rax\n\tand $bst_platform_ctx_mask, %rax\n\tmov %rsi, (%rax,%rdi,8)\n");
     } else if q.c == 7 {
       w_s(&mut out, "\tcall bst_rt_fpu_load\n");
     } else if q.c == 9 {
@@ -1526,8 +1558,10 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   }
   iropt_inline(&mut f, c, &mut m, p);
   iropt_slots(&mut f);
+  iropt_fold(&mut f);
   iropt_copies(&mut f);
   iropt_dce(&mut f);
+  iropt_switch(&mut f);
   iropt_thread(&mut f);
   if iropt_merge(&mut f) > 0 {
     iropt_copies(&mut f);
@@ -1550,6 +1584,7 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   }
   iropt_dead_live(&mut f);
   iropt_copies(&mut f);
+  iropt_fold(&mut f);
   iropt_dce(&mut f);
   ix_coalesce(&mut f);
   let xi = inst_at(m, x);
