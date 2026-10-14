@@ -1972,6 +1972,25 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     ir_store_val(&mut f, c, m, p, el, xv);
     return ir_none();
   }
+  if name_is(p, i, "vec_with") {
+    // `vec_with(v, i, f, args..)`: `f` gets the element's place as its
+    // first argument (by address when large, as any `&T`); the arguments
+    // after `f` have no effect, so they can be evaluated after it.
+    let v = ir_vec_arg(&mut f, c, &mut m, p, n.a);
+    let ix = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    let fnode = node_at(p.nodes, cg_arg(p, i, 2));
+    let def = plain_fn(p, fnode.s, fnode.e);
+    if f.failed {
+      return ir_none();
+    }
+    if def == 0 {
+      ir_fail(&mut f, "a vec_with of a generic function");
+      return ir_none();
+    }
+    let el = ir_vel(&mut f, c, m, p, v, ix, ir_mw(c, m, p, ir_velem(v), 0));
+    let callee = plain_inst(&mut m, def);
+    return ir_call_to(&mut f, c, &mut m, p, i, callee, el, cg_arg(p, i, 3));
+  }
   if name_is(p, i, "vec_pop") {
     let v = ir_vec_arg(&mut f, c, &mut m, p, n.a);
     if f.failed {

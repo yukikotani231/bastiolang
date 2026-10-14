@@ -615,6 +615,11 @@ fn cg_type_of(g: &Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) 
         let t = cg_type_of(g, c, &mut m, p, a0, 0);
         return inner_t(m, t);
       }
+      if name_is(p, i, "vec_with") {
+        let fnode = node_at(p.nodes, cg_arg(p, i, 2));
+        let x = plain_inst(&mut m, plain_fn(p, fnode.s, fnode.e));
+        return cg_ret_ty(&mut m, p, x);
+      }
       if is_vec_builtin(p, n.s, n.e) {
         if name_is(p, i, "vec_len") {
           return c.tu64;
@@ -1190,6 +1195,9 @@ fn cg_args_of(p: &Parser, i: u64) -> Vec[u64] {
 fn cg_call(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> CgSp {
   let n = node_at(p.nodes, i);
   if inst == 0 {
+    if name_is(p, i, "vec_with") {
+      return cg_vec_with(&mut g, c, &mut m, p, i);
+    }
     if is_vec_builtin(p, n.s, n.e) {
       return cg_vec_call(&mut g, c, &mut m, p, i);
     }
@@ -1268,6 +1276,46 @@ fn cg_call(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64)
     cg_list(&mut g, vals);
     cg_t(&mut g, ")");
   }
+  vec_free(vals);
+  let e = cg_span(g, start);
+  return cg_seq(&mut g, pre, e);
+}
+
+/// `vec_with(v, i, f, args..)`: `f` gets the element (a shared borrow is a
+/// C value; the copy is never written back, as `f` cannot change it).
+fn cg_vec_with(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp {
+  let n = node_at(p.nodes, i);
+  let fnode = node_at(p.nodes, cg_arg(p, i, 2));
+  let x = plain_inst(&mut m, plain_fn(p, fnode.s, fnode.e));
+  let el = cg_vec_elem(g, c, &mut m, p, n.a);
+  cg_note(&mut g.vecs, el);
+  let mut xs = vec_new[u64]();
+  vec_push(&mut xs, n.a);
+  vec_push(&mut xs, cg_arg(p, i, 1));
+  let mut a = cg_arg(p, i, 3);
+  while a != 0 {
+    vec_push(&mut xs, a);
+    a = next_of(p, a);
+  }
+  let mut vals = vec_new[CgSp]();
+  let pre = cg_operands(&mut g, c, &mut m, p, xs, true, &mut vals);
+  vec_free(xs);
+  let start = cg_mark(g);
+  cg_fname(&mut g, m, p, x);
+  cg_t(&mut g, "(bst_vec_get_");
+  cg_tyname(&mut g, m, p, el, CG_HELPER);
+  cg_t(&mut g, "(");
+  cg_sp(&mut g, sp_at(vals, 0));
+  cg_t(&mut g, ", ");
+  cg_sp(&mut g, sp_at(vals, 1));
+  cg_t(&mut g, ")");
+  let mut j = 2;
+  while j < vec_len(vals) {
+    cg_t(&mut g, ", ");
+    cg_sp(&mut g, sp_at(vals, j));
+    j = j + 1;
+  }
+  cg_t(&mut g, ")");
   vec_free(vals);
   let e = cg_span(g, start);
   return cg_seq(&mut g, pre, e);

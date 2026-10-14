@@ -4077,6 +4077,9 @@ fn vcall(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VSt
   if inst == 0 && (name_is(p, i, "pt_borrow") || name_is(p, i, "pt_borrow_frame")) {
     return vpt_borrow(&mut v, c, &mut m, p, i, &mut st);
   }
+  if inst == 0 && name_is(p, i, "vec_with") {
+    return vvec_with(&mut v, c, &mut m, p, i, &mut st);
+  }
   let n = node_at(p.nodes, i);
   let mut args = vec_new[u64]();
   let mut a = n.a;
@@ -4089,11 +4092,10 @@ fn vcall(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VSt
   return r;
 }
 
-/// The call node `i` with the argument nodes `args`, calling instance
-/// `inst` (0: what `i` names). An argument node 0 stands for `&mut` of the
-/// hidden variable named by atom `hid`.
-fn vcall_args(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Vec[u64], hid: u64, st: &mut VState, inst: u64) -> u64 {
-  let n = node_at(p.nodes, i);
+/// The values of the arguments `args` of a call, in the order the checker
+/// reads them: scalars first, then linear values. An argument node 0 stands
+/// for the hidden variable named by atom `hid`.
+fn vcall_vals(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, args: &Vec[u64], hid: u64, st: &mut VState) -> Vec[u64] {
   let mut j = 0;
   while j < vec_len(args) {
     let a = u_at(args, j);
@@ -4148,6 +4150,15 @@ fn vcall_args(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &
     j = j + 1;
   }
   vec_free(lin);
+  return vals;
+}
+
+/// The call node `i` with the argument nodes `args`, calling instance
+/// `inst` (0: what `i` names). An argument node 0 stands for `&mut` of the
+/// hidden variable named by atom `hid`.
+fn vcall_args(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Vec[u64], hid: u64, st: &mut VState, inst: u64) -> u64 {
+  let n = node_at(p.nodes, i);
+  let vals = vcall_vals(&mut v, c, &mut m, p, args, hid, &mut st);
   let mut r = 0;
   if inst == 0 && is_builtin_name(c, p, n.s, n.e) {
     r = vbuiltin(&mut v, c, &mut m, p, i, args, vals, &mut st);
@@ -4405,6 +4416,50 @@ fn vpt_borrow(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mu
     vm_s(&mut v, "` hands back what `pt_borrow_frame` lent it, unchanged but for its contents");
   }
   prove(&mut v, st, same, i, VC_OWN);
+  return res;
+}
+
+/// `vec_with(v, i, f, args..)`: an ordinary call of `f` whose first argument
+/// is element `i` of `v` (its value as the vector holds it), which must be in
+/// bounds. The vector is only read, so nothing about it changes.
+fn vvec_with(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VState) -> u64 {
+  let n = node_at(p.nodes, i);
+  let a0 = n.a;
+  let a1 = next_of(p, a0);
+  let a2 = next_of(p, a1);
+  let mut args = vec_new[u64]();
+  vec_push(&mut args, a0);
+  vec_push(&mut args, a1);
+  let mut a = next_of(p, a2);
+  while a != 0 {
+    vec_push(&mut args, a);
+    a = next_of(p, a);
+  }
+  let vals = vcall_vals(&mut v, c, &mut m, p, args, 0, &mut st);
+  let vv = vl_at(v, u_at(vals, 0));
+  let ix = term(v, u_at(vals, 1));
+  let g = app2(&mut v, OP_LT, ix, vv.a);
+  vm_index(&mut v, p, args, "vlen", false);
+  prove(&mut v, st, g, i, VC_BOUNDS);
+  let el = vec_read(&mut v, c, m, p, vv.ty, vv.b, ix, &mut st);
+  // `f`'s arguments: the element, then the others, by value or borrowed.
+  let mut args2 = vec_new[u64]();
+  let mut vals2 = vec_new[u64]();
+  vec_push(&mut args2, 0);
+  vec_push(&mut vals2, el);
+  let mut k = 2;
+  while k < vec_len(args) {
+    vec_push(&mut args2, u_at(args, k));
+    vec_push(&mut vals2, u_at(vals, k));
+    k = k + 1;
+  }
+  let an = node_at(p.nodes, a2);
+  let x = plain_inst(&mut m, plain_fn(p, an.s, an.e));
+  let res = vuser_call(&mut v, c, &mut m, p, x, i, args2, vals2, 0, &mut st);
+  vec_free(args);
+  vec_free(vals);
+  vec_free(args2);
+  vec_free(vals2);
   return res;
 }
 
@@ -6518,6 +6573,13 @@ fn call_changes(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst:
     let tn = node_at(p.nodes, n.a);
     let tname = list_text(&mut v, p, tn.a);
     note(&mut v, &mut out, tname, true);
+    changed_in_expr(&mut v, c, &mut m, p, next_of(p, n.a), &mut out);
+    fnode = next_of(p, next_of(p, n.a));
+    skip = 3;
+    j = 1;
+  } else if inst == 0 && name_is(p, i, "vec_with") && n.a != 0 && next_of(p, n.a) != 0
+    && kind_of(p, next_of(p, next_of(p, n.a))) == E_VAR {
+    // `vec_with(v, i, f, ..)` only reads `v` and lends the rest to `f`.
     changed_in_expr(&mut v, c, &mut m, p, next_of(p, n.a), &mut out);
     fnode = next_of(p, next_of(p, n.a));
     skip = 3;

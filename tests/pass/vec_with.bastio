@@ -1,0 +1,86 @@
+// stage1-only: vec_with
+// expect-exit: 0
+// `vec_with(v, i, f, args..)` lends element `i` of a vector to `f` in place,
+// as `f`'s `&T` first argument: a linear element (here one holding a `Bytes`)
+// is read without being taken out and put back. The prover knows which
+// element `f` sees, so what `f` returns is known to the caller.
+struct Wide { a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64 }
+struct Named { name: Bytes, size: u64 }
+enum Slot { Free, Full(Named) }
+
+fn slot_size(s: &Slot) -> u64 {
+  match s {
+    Slot::Free => { return 0; },
+    Slot::Full(f) => { return f.size; },
+  }
+}
+
+fn slot_byte(s: &Slot, k: u64) -> u64 {
+  match s {
+    Slot::Free => { return 0; },
+    Slot::Full(f) => {
+      if k < blen(f.name) {
+        return cast[u64](bget(f.name, k));
+      }
+      return 0;
+    },
+  }
+}
+
+fn wide_sum(w: &Wide, extra: u64) -> u64 {
+  return wrap_add(w.a, wrap_add(w.g, extra));
+}
+
+fn word_plus(x: &u64, k: u64) -> u64 {
+  return wrap_add(x, k);
+}
+
+fn named(text: Str, size: u64) -> Slot {
+  let b = bfrom(text);
+  return Slot::Full(Named { name: b, size: size });
+}
+
+fn main() -> u64 {
+  let mut slots = vec_new[Slot]();
+  vec_push(&mut slots, named("abc", 3));
+  vec_push(&mut slots, Slot::Free);
+  vec_push(&mut slots, named("hello world", 11));
+  let mut bad = 0;
+  if vec_with(slots, 0, slot_size) != 3 { bad = 1; }
+  if vec_with(slots, 1, slot_size) != 0 { bad = 2; }
+  if vec_with(slots, 2, slot_size) != 11 { bad = 3; }
+  if vec_with(slots, 2, slot_byte, 4) != 111 { bad = 4; }        // 'o'
+  if vec_with(slots, 0, slot_byte, 1) != 98 { bad = 5; }         // 'b'
+  if vec_with(slots, 0, slot_byte, 3) != 0 { bad = 6; }
+  // Still all there: nothing was taken out.
+  let s2 = vec_pop(&mut slots);
+  let s1 = vec_pop(&mut slots);
+  let s0 = vec_pop(&mut slots);
+  match s2 {
+    Slot::Free => { bad = 7; },
+    Slot::Full(f) => { bfree(f.name); },
+  }
+  match s1 {
+    Slot::Free => {},
+    Slot::Full(f) => { bad = 8; bfree(f.name); },
+  }
+  match s0 {
+    Slot::Free => { bad = 9; },
+    Slot::Full(f) => { bfree(f.name); },
+  }
+  vec_free(slots);
+
+  let mut ws = vec_new[Wide]();
+  vec_push(&mut ws, Wide { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7 });
+  vec_push(&mut ws, Wide { a: 10, b: 20, c: 30, d: 40, e: 50, f: 60, g: 70 });
+  if vec_with(ws, 1, wide_sum, 100) != 180 { bad = 10; }
+  if vec_with(ws, 0, wide_sum, 0) != 8 { bad = 11; }
+  vec_free(ws);
+
+  let mut xs = vec_new[u64]();
+  vec_push(&mut xs, 5);
+  vec_push(&mut xs, 6);
+  if vec_with(xs, 1, word_plus, 40) != 46 { bad = 12; }
+  vec_free(xs);
+  return bad;
+}

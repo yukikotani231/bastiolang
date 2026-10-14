@@ -2516,6 +2516,11 @@ fn x86_ty_in(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u
       if name_is(p, i, "lock_end") || is_atomic_builtin(p, n.s, n.e) {
         return x86_cell_ty(&mut g, c, &mut m, p, n.a);
       }
+      if name_is(p, i, "vec_with") {
+        let fnode = node_at(p.nodes, cg_arg(p, i, 2));
+        let x = plain_inst(&mut m, plain_fn(p, fnode.s, fnode.e));
+        return cg_ret_ty(&mut m, p, x);
+      }
       if is_vec_builtin(p, n.s, n.e) {
         if name_is(p, i, "vec_len") {
           return c.tu64;
@@ -5255,6 +5260,77 @@ fn x86_locked(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
   }
 }
 
+/// `vec_with(v, i, f, args..)`: `f` gets element `i` of `v` where it lies: its
+/// address when it is large (`x86_byaddr`), else a copy of its words. The
+/// first argument's place is reserved before the others, which are pushed
+/// in order (none of them has an effect, so none can change `v`); then the
+/// element is found and put in it.
+fn x86_vec_with(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
+  let n = node_at(p.nodes, i);
+  let a0 = n.a;
+  let fnode = node_at(p.nodes, cg_arg(p, i, 2));
+  let x = plain_inst(&mut m, plain_fn(p, fnode.s, fnode.e));
+  let rt = cg_ret_ty(&mut m, p, x);
+  let rn = x86_words(&mut g, c, m, p, rt);
+  let xd = inst_at(m, x);
+  let ps = fn_params(&mut m, p, xd.def, x);
+  let w = x86_words(&mut g, c, m, p, x86_vec_elem(&mut g, c, &mut m, p, a0));
+  let mut wph = w;
+  if x86_byaddr(&mut g, c, m, p, x86_pt_at(ps, 0)) {
+    wph = 1;
+  }
+  if rn > 1 && !x86_regret(&mut g, c, &mut m, p, x) {
+    x86_reserve(&mut g, rn);
+  }
+  x86_scalar(&mut g, c, &mut m, p, cg_arg(p, i, 1));
+  x86_reserve(&mut g, wph);
+  x86_es(&mut g, "mov %rax, (%rsp)");          // the index, until the element replaces it
+  let mut aw = wph;
+  let mut a = cg_arg(p, i, 3);
+  let mut q = 1;
+  while a != 0 {
+    let pt = x86_pt_at(ps, q);
+    aw = wrap_add(aw, x86_argw(&mut g, c, &mut m, p, a, pt));
+    x86_arg_for(&mut g, c, &mut m, p, a, pt);
+    a = next_of(p, a);
+    q = wrap_add(q, 1);
+  }
+  vec_free(ps);
+  let off = wrap_sub(aw, wph);
+  x86_es_off(&mut g, "mov ", off, "(%rsp), %rax");
+  let l = x86_place_e(&mut g, c, m, p, a0);
+  x86_mov(&mut g, x86_lop(l, 2), x86_reg(XR_RCX));
+  x86_t(&mut g, "imul $");
+  x86_n(&mut g, wrap_mul(8, w));
+  x86_t(&mut g, ", %rax, %rax");
+  x86_e(&mut g);
+  x86_es(&mut g, "add %rax, %rcx");
+  if wph == 1 && w != 1 {
+    x86_es_off(&mut g, "mov %rcx, ", off, "(%rsp)");
+  } else {
+    let mut j = 0;
+    while j < w {
+      x86_es_off(&mut g, "mov ", j, "(%rcx), %rax");
+      x86_es_off(&mut g, "mov %rax, ", wrap_add(off, j), "(%rsp)");
+      j = j + 1;
+    }
+  }
+  let na = x86_regargs(&mut g, c, &mut m, p, x);
+  if na == aw {
+    let mut j = 0;
+    while j < na {
+      x86_pop(&mut g, x86_reg(x86_argreg(j)));
+      j = j + 1;
+    }
+    aw = 0;
+  }
+  x86_t(&mut g, "call ");
+  x86_sym(&mut g, m, p, x);
+  x86_e(&mut g);
+  x86_drop(&mut g, aw);
+  x86_push_regret(&mut g, c, &mut m, p, x);
+}
+
 /// `pt_borrow(&mut t, i, f, args..)` (`pt_borrow_frame` alike): `f` gets the
 /// address of a copy of the child in slot `i`, which it may change only in
 /// its contents (proved), so nothing is written back.
@@ -5536,6 +5612,8 @@ fn x86_builtin1(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     if w == 1 {
       x86_pop(&mut g, x86_reg(XR_RAX));
     }
+  } else if name_is(p, i, "vec_with") && !g.stage0 {
+    x86_vec_with(&mut g, c, &mut m, p, i);
   } else if name_is(p, i, "locked") {
     x86_locked(&mut g, c, &mut m, p, i);
   } else if is_pt_borrow_builtin(p, n.s, n.e) && !g.stage0 {
