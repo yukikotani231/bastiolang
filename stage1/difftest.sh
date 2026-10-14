@@ -488,7 +488,8 @@ for f in tests/pass/fill_sum.bastio stage1/lexdump.bastio; do
     echo "DIFFER --dump-smt $f"
   fi
 done
-if "$tmp/bastioc1" --trusted-base | cmp -s - <("$BASTIOC" --trusted-base); then
+# (stage1's list also names its own builtins, marked "stage1 only".)
+if "$tmp/bastioc1" --trusted-base | grep -v 'stage1 only' | cmp -s - <("$BASTIOC" --trusted-base); then
   match=$((match+1))
 else
   differ=$((differ+1))
