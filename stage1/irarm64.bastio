@@ -673,6 +673,61 @@ fn a64_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, fr: A64F, g: &mut X86, m:
     let t = a64_dest(al, fr, q.d);
     a64_addr_w(&mut out, t, slotw);
     a64_finish(&mut out, al, fr, q.d, t);
+  } else if op == IR_DEVR {
+    // Load-acquire: volatile, and ordered after earlier accesses.
+    a64_mov(&mut out, a64_loc(al, fr, q.a), a64_rl(9));
+    if q.c == 1 {
+      w_s(&mut out, "\tldarb w11, [x9]\n");
+    } else if q.c == 2 {
+      w_s(&mut out, "\tldarh w11, [x9]\n");
+    } else if q.c == 4 {
+      w_s(&mut out, "\tldar w11, [x9]\n");
+    } else {
+      w_s(&mut out, "\tldar x11, [x9]\n");
+    }
+    a64_finish(&mut out, al, fr, q.d, 11);
+  } else if op == IR_DEVW {
+    // Store-release: volatile, and the release of a lock word.
+    a64_mov(&mut out, a64_loc(al, fr, q.a), a64_rl(9));
+    a64_mov(&mut out, a64_loc(al, fr, q.b), a64_rl(10));
+    if q.c == 1 {
+      w_s(&mut out, "\tstlrb w10, [x9]\n");
+    } else if q.c == 2 {
+      w_s(&mut out, "\tstlrh w10, [x9]\n");
+    } else if q.c == 4 {
+      w_s(&mut out, "\tstlr w10, [x9]\n");
+    } else {
+      w_s(&mut out, "\tstlr x10, [x9]\n");
+    }
+  } else if op == IR_FENCE {
+    w_s(&mut out, "\tdmb ish\n");
+  } else if op == IR_XCHG {
+    // Load-acquire and store-release exclusive pair on x9 (address), x10
+    // (new value); the old value is left in x11.
+    a64_mov(&mut out, a64_loc(al, fr, q.a), a64_rl(9));
+    a64_mov(&mut out, a64_loc(al, fr, q.b), a64_rl(10));
+    w_s(&mut out, "1:\tldaxr x11, [x9]\n\tstlxr w16, x10, [x9]\n\tcbnz w16, 1b\n");
+    a64_finish(&mut out, al, fr, q.d, 11);
+  } else if op == IR_CAS {
+    // x9 address, x10 expected, x11 new; the result (1 when swapped) is
+    // built in x16. The comparison flags survive the store-exclusive check.
+    a64_mov(&mut out, a64_loc(al, fr, q.a), a64_rl(9));
+    a64_mov(&mut out, a64_loc(al, fr, q.b), a64_rl(10));
+    a64_mov(&mut out, a64_loc(al, fr, q.c), a64_rl(11));
+    w_s(&mut out, "1:\tldaxr x16, [x9]\n\tcmp x16, x10\n\tb.ne 2f\n\tstlxr w17, x11, [x9]\n\tcbnz w17, 1b\n2:\tcset x16, eq\n");
+    a64_finish(&mut out, al, fr, q.d, 16);
+  } else if op == IR_LOCKACQ {
+    // Spin until the word reads zero, then claim it with a store-exclusive.
+    a64_mov(&mut out, a64_loc(al, fr, q.a), a64_rl(9));
+    w_s(&mut out, "\tmov x10, #1\n1:\tldaxr x11, [x9]\n\tcbz x11, 2f\n\tclrex\n\tyield\n\tb 1b\n2:\tstxr w16, x10, [x9]\n\tcbnz w16, 1b\n");
+  } else if op == IR_LOCKINC {
+    a64_mov(&mut out, a64_loc(al, fr, q.a), a64_rl(9));
+    w_s(&mut out, "1:\tldaxr w10, [x9]\n\tadd w10, w10, #1\n\tstlxr w16, w10, [x9]\n\tcbnz w16, 1b\n\tdmb ish\n");
+  } else if op == IR_LOCKDEC {
+    // The result is 1 when the counter reached zero.
+    a64_mov(&mut out, a64_loc(al, fr, q.a), a64_rl(9));
+    w_s(&mut out, "1:\tldaxr w10, [x9]\n\tsub w10, w10, #1\n\tstlxr w16, w10, [x9]\n\tcbnz w16, 1b\n\tdmb ish\n\tcmp w10, #0\n\tcset x11, eq\n");
+    a64_finish(&mut out, al, fr, q.d, 11);
   }
 }
 
@@ -814,7 +869,7 @@ fn a64_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
       why = 4;
       bad_op = q.op;
     }
-    if q.op == IR_PUTC || q.op == IR_GETC || q.op == IR_RT || q.op == IR_GLOBAL || q.op == IR_ZERO || q.op == IR_FENCE || q.op == IR_XCHG || q.op == IR_CAS || q.op == IR_LOCKACQ || q.op == IR_TSC || q.op == IR_PCALL || q.op == IR_LOCKINC || q.op == IR_LOCKDEC || q.op == IR_COPYPAGE || q.op == IR_MMCHK || q.op == IR_PIN || q.op == IR_POUT || q.op == IR_DEVR || q.op == IR_DEVW {
+    if q.op == IR_PUTC || q.op == IR_GETC || q.op == IR_RT || q.op == IR_GLOBAL || q.op == IR_ZERO || q.op == IR_TSC || q.op == IR_PCALL || q.op == IR_COPYPAGE || q.op == IR_MMCHK || q.op == IR_PIN || q.op == IR_POUT {
       ok = false;
       why = 4;
       bad_op = q.op;
