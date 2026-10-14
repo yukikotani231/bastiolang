@@ -790,11 +790,14 @@ fn a64_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   iropt_dce(&mut f);
   iropt_thread(&mut f);
   let mut ok = vec_len(f.params) <= A64_MAX_ARGS;
+  let mut why = 1;                          // 1: parameters, 2: instructions, 3: a call, 4: an operation
+  let mut bad_op = 0;
   if ok && name_is(p, xi.def, "main") && vec_len(f.params) > 0 {
     ok = false;
   }
   if vec_len(f.ins) > IX_MAX_INS {
     ok = false;
+    why = 2;
   }
   let mut k = 0;
   while ok && k < vec_len(f.ins) {
@@ -802,14 +805,19 @@ fn a64_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
     if q.op == IR_CALL || q.op == IR_CALLM {
       if q.c > A64_MAX_ARGS || !ix_call_ok(f, &mut g, c, &mut m, p, q) {
         ok = false;
+        why = 3;
       }
     }
     // The console is not in the AArch64 runtime.
     if q.op == IR_ALLOC && q.ty == 1 {
       ok = false;
+      why = 4;
+      bad_op = q.op;
     }
     if q.op == IR_PUTC || q.op == IR_GETC || q.op == IR_RT || q.op == IR_GLOBAL || q.op == IR_ZERO || q.op == IR_FENCE || q.op == IR_XCHG || q.op == IR_CAS || q.op == IR_LOCKACQ || q.op == IR_TSC || q.op == IR_PCALL || q.op == IR_LOCKINC || q.op == IR_LOCKDEC || q.op == IR_COPYPAGE || q.op == IR_MMCHK || q.op == IR_PIN || q.op == IR_POUT || q.op == IR_DEVR || q.op == IR_DEVW {
       ok = false;
+      why = 4;
+      bad_op = q.op;
     }
     k = k + 1;
   }
@@ -819,7 +827,18 @@ fn a64_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
       g.failed = true;
       w_s(&mut g.fmsg, "the AArch64 backend does not cover `");
       w_append(&mut g.fmsg, g.ln);
-      w_s(&mut g.fmsg, "` yet: more than 8 argument words, a main with parameters, or too many instructions");
+      w_s(&mut g.fmsg, "` yet: ");
+      if why == 1 {
+        w_s(&mut g.fmsg, "more than 8 argument words, or a main with parameters");
+      } else if why == 2 {
+        w_s(&mut g.fmsg, "too many instructions");
+      } else if why == 3 {
+        w_s(&mut g.fmsg, "a call it cannot make");
+      } else {
+        w_s(&mut g.fmsg, "an operation outside the first subset (IR op ");
+        w_num(&mut g.fmsg, bad_op);
+        w_s(&mut g.fmsg, ")");
+      }
     }
     while vec_len(g.ln) > 0 {
       vec_pop(&mut g.ln);
