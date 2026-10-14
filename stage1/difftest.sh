@@ -355,7 +355,7 @@ if [ -f ../bastios/build/user/sh.bin ]; then
   if "$tmp/asmdump" --lib "$PWD" --kernel ../bastios/src/main.bastio >"$tmp/kernel.s" 2>/dev/null \
      && as --64 -o "$tmp/kernel.o" "$tmp/kernel.s" \
      && ! nm -u "$tmp/kernel.o" | awk '{print $2}' \
-          | grep -v -x -e _end -e bst_kernel_pml4 -e bst_cpu_enter -e bst_cpu_wait -e bst_platform_ctx \
+          | grep -v -x -e _end -e bst_kernel_pml4 -e bst_cpu_enter -e bst_cpu_wait -e bst_platform_ctx -e bst_platform_ctx_mask \
                     -e bst_platform_cpus -e bst_platform_smp_start -e bst_platform_smp_join -e bst_platform_acpi -e bst_platform_info -e bst_platform_deferred_cr3 -e bst_platform_mmu_state -e bst_ram_limit | grep -q .; then
     kernel=", and BastiOS's kernel"
   else
