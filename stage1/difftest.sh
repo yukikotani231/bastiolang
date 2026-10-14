@@ -108,7 +108,7 @@ for f in $(grep -l '^// stage1-only:' tests/pass/*.bastio tests/fail/*.bastio te
   arch=$(sed -n 's|^// arch: *||p' "$f" | head -1)
   case $f in tests/user/* | ../bastios/user/*) target=user ;; esac
   if "$BASTIOC" --check --target "${target:-hosted}" --arch "${arch:-x86_64}" "$f" 2>"$tmp/s1.err" \
-     || { [ -n "$want" ] && grep -q "error\[$want\]" "$tmp/s1.err"; }; then
+     || { [ -n "$want" ] && grep -q "error\[$want\]" "$tmp/s1.err" && ! grep -q "unknown function" "$tmp/s1.err"; }; then
     echo "STALE $f is marked stage1-only, but stage0 handles it: remove the marker"; status=1
   fi
 done
