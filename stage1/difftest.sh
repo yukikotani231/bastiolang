@@ -108,7 +108,7 @@ for f in $(grep -l '^// stage1-only:' tests/pass/*.bastio tests/fail/*.bastio te
   arch=$(sed -n 's|^// arch: *||p' "$f" | head -1)
   case $f in tests/user/* | ../bastios/user/*) target=user ;; esac
   if "$BASTIOC" --check --target "${target:-hosted}" --arch "${arch:-x86_64}" "$f" 2>"$tmp/s1.err" \
-     || { [ -n "$want" ] && grep -q "error\[$want\]" "$tmp/s1.err"; }; then
+     || { [ -n "$want" ] && grep -q "error\[$want\]" "$tmp/s1.err" && ! grep -q "unknown function" "$tmp/s1.err"; }; then
     echo "STALE $f is marked stage1-only, but stage0 handles it: remove the marker"; status=1
   fi
 done
@@ -488,7 +488,8 @@ for f in tests/pass/fill_sum.bastio stage1/lexdump.bastio; do
     echo "DIFFER --dump-smt $f"
   fi
 done
-if "$tmp/bastioc1" --trusted-base | cmp -s - <("$BASTIOC" --trusted-base); then
+# (stage1's list also names its own builtins, marked "stage1 only".)
+if "$tmp/bastioc1" --trusted-base | grep -v 'stage1 only' | cmp -s - <("$BASTIOC" --trusted-base); then
   match=$((match+1))
 else
   differ=$((differ+1))

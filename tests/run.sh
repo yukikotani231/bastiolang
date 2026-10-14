@@ -145,7 +145,13 @@ else
 fi
 # The trusted base is listed and counted (ROADMAP invariant 3): a change to
 # it must come with an updated tests/trusted_base.txt, so it shows in review.
-if "$BASTIOC" --trusted-base | diff -u tests/trusted_base.txt - >"$tmp/tb.diff"; then
+# (A builtin marked "stage1 only" is not in bastioc0's list.)
+if [ -n "$stage0_compiler" ]; then
+  grep -v 'stage1 only' tests/trusted_base.txt >"$tmp/tb.expect"
+else
+  cp tests/trusted_base.txt "$tmp/tb.expect"
+fi
+if "$BASTIOC" --trusted-base | diff -u "$tmp/tb.expect" - >"$tmp/tb.diff"; then
   pass=$((pass+1))
 else
   echo "FAIL trusted base changed; review it, then: $BASTIOC --trusted-base > tests/trusted_base.txt"

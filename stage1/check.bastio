@@ -1044,7 +1044,7 @@ fn is_vec_builtin(p: &Parser, s: u64, e: u64) -> bool {
   return span_is(p, s, e, "vec_new") || span_is(p, s, e, "vec_len") || span_is(p, s, e, "vec_push")
     || span_is(p, s, e, "vec_push_within") || span_is(p, s, e, "vec_try_reserve")
     || span_is(p, s, e, "vec_pop") || span_is(p, s, e, "vec_get") || span_is(p, s, e, "vec_set")
-    || span_is(p, s, e, "vec_swap") || span_is(p, s, e, "vec_free");
+    || span_is(p, s, e, "vec_swap") || span_is(p, s, e, "vec_free") || span_is(p, s, e, "vec_with");
 }
 
 /// Wrapping arithmetic: both operands and the result have one integer type.
@@ -4235,6 +4235,9 @@ fn vec_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
   let el = inner_t(m, vt);
   let rv = ref_to(&mut m, p, vt);
   let mv = mut_to(&mut m, p, vt);
+  if span_is(p, s, e, "vec_with") {
+    return vec_with_call(&mut c, &mut m, p, i, el, rv);
+  }
   let mut ps = vec_new[u64]();
   let mut r = c.tunit;
   if span_is(p, s, e, "vec_len") {
@@ -4287,6 +4290,133 @@ fn vec_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
   }
   let t = call_with(&mut c, &mut m, p, ps, r, a0, i, 0);
   vec_free(ps);
+  return t;
+}
+
+/// Could evaluating expression `i` change anything? Only calls can, and not
+/// the plain reads `len`, `get`, `slen`, `sget`, `blen`, `bget` and `vec_len`.
+fn ck_has_effect(p: &Parser, i: u64) -> bool {
+  if i == 0 {
+    return false;
+  }
+  let n = node_at(p.nodes, i);
+  let k = n.kind;
+  if k == E_CALL {
+    if !(name_is(p, i, "len") || name_is(p, i, "get") || name_is(p, i, "slen") || name_is(p, i, "sget")
+      || name_is(p, i, "blen") || name_is(p, i, "bget") || name_is(p, i, "vec_len")) {
+      return true;
+    }
+    let mut a = n.a;
+    while a != 0 {
+      if ck_has_effect(p, a) {
+        return true;
+      }
+      a = next_of(p, a);
+    }
+    return false;
+  }
+  if k == E_SLIT {
+    let mut f = n.a;
+    while f != 0 {
+      let fnode = node_at(p.nodes, f);
+      if ck_has_effect(p, fnode.a) {
+        return true;
+      }
+      f = fnode.next;
+    }
+    return false;
+  }
+  if k == E_VARIANT || k == E_IS || k == E_NOT || k == E_NEG {
+    return ck_has_effect(p, n.a);
+  }
+  if k == E_TAPP {
+    return ck_has_effect(p, n.b);
+  }
+  if k == E_BIN {
+    return ck_has_effect(p, n.a) || ck_has_effect(p, n.b);
+  }
+  return false;
+}
+
+/// `vec_with(v, i, f, args..)`: calls `f(&element, args..)` with element `i`
+/// of `v` left in place, for a vector whose elements are linear (they cannot
+/// be copied out) or wide. `v` is only read for the call, and `f` gets a
+/// shared borrow of one element and values or borrows of other places, so
+/// the element cannot change or leave while `f` looks at it.
+fn vec_with_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, el: u64, rv: u64) -> u64 {
+  let n = node_at(p.nodes, i);
+  let a0 = n.a;
+  let mut a1 = 0;
+  let mut a2 = 0;
+  if a0 != 0 {
+    a1 = next_of(p, a0);
+  }
+  if a1 != 0 {
+    a2 = next_of(p, a1);
+  }
+  let x = named_fn(&mut c, &mut m, p, i, a2);
+  if c.failed {
+    return 0;
+  }
+  let xi = inst_at(m, x);
+  let fps = fn_params(&mut m, p, xi.def, x);
+  let dn = node_at(p.nodes, xi.def);
+  let r = conv(&mut m, p, dn.b, x, xi.def);
+  if vec_len(fps) == 0 || u_at(fps, 0) != ref_to(&mut m, p, el) {
+    vec_free(fps);
+    if cm_new(&mut c, p, i, C_TYPE) {
+      cm_s(&mut c, "`");
+      cm_inst(&mut c, m, p, x);
+      cm_s(&mut c, "` must take `&");
+      cm_ty(&mut c, m, p, el);
+      cm_s(&mut c, "` first, to receive the element `vec_with` lends");
+    }
+    return 0;
+  }
+  // The element is read after the arguments are evaluated, so none of them
+  // may change the vector: no calls, except plain reads.
+  let mut b = 0;
+  if a2 != 0 {
+    b = next_of(p, a2);
+  }
+  while b != 0 {
+    if ck_has_effect(p, b) {
+      vec_free(fps);
+      if cm_new(&mut c, p, b, C_USE) {
+        cm_s(&mut c, "an argument of `vec_with` after the function must not call anything");
+        cm_note(&mut c, "the element is lent after the arguments are evaluated, and a call could change the vector; compute the value into a variable first");
+      }
+      return 0;
+    }
+    b = next_of(p, b);
+  }
+  note_call(&mut c, x);
+  // `f`'s signature with the vector and the index in place of the element.
+  let mut ps = vec_new[u64]();
+  vec_push(&mut ps, rv);
+  vec_push(&mut ps, c.tu64);
+  let mut j = 1;
+  while j < vec_len(fps) {
+    vec_push(&mut ps, vec_get(fps, j));
+    j = j + 1;
+  }
+  vec_free(fps);
+  let mut args = vec_new[u64]();
+  vec_push(&mut args, a0);
+  if a1 != 0 {
+    vec_push(&mut args, a1);
+  }
+  let mut a = 0;
+  if a2 != 0 {
+    a = next_of(p, a2);
+  }
+  while a != 0 {
+    vec_push(&mut args, a);
+    a = next_of(p, a);
+  }
+  let t = call_with_v(&mut c, &mut m, p, ps, r, args, i, x);
+  vec_free(ps);
+  vec_free(args);
   return t;
 }
 

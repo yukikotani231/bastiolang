@@ -826,8 +826,9 @@ fn main() -> u64 {
 | `vec_set(v: &mut Vec[T], i: u64, x: T)` | `i < vlen(v)`; `T` not linear | Overwrites element `i` |
 | `vec_swap(v: &mut Vec[T], i: u64, x: T) -> T` | `i < vlen(v)` | Puts `x` at `i` and returns what was there |
 | `vec_free(v: Vec[T])` | for linear `T`, `vlen(v) == 0` (`E-VERIFY-LEAK`) | Frees the storage |
+| `vec_with(v: &Vec[T], i: u64, f, args..) -> R` | `i < vlen(v)` | Calls `f(&element, args..)` with element `i` left where it is, and returns what `f` returns (stage1 only). `f` is the name of a function whose first parameter is `&T` and whose others take `args..`; the arguments after `f` may not call anything (the element is lent once they are evaluated), and `v` cannot be lent as `&mut` in the same call. The prover knows the element's value, so `f`'s contract applies to `vget(v, i)` |
 
-- Elements of a vector of linear values leave only through `vec_pop` and `vec_swap`, and the vector can be freed only when nothing is left, so no per-slot ownership is needed.
+- Elements of a vector of linear values leave only through `vec_pop` and `vec_swap`, and `vec_with` lets a function read one in place without taking it out and putting it back (`f` gets a shared borrow of it, so it can look at the element and lend it on but not move it), and the vector can be freed only when nothing is left, so no per-slot ownership is needed.
 - In specifications, `vlen(v)` is the length and `vget(v, i)` is element `i`, of the element type, for any element type. So `vget(v, i).page`, `len(vget(v, i).page)`, `vget(v, i) is State::Used` and `vlen(vget(grid, i))` all work, typically under `forall i: u64 :: i < vlen(v) ==> ...`.
 - The prover tracks every element's contents: scalars, struct fields, enum tags and payloads, buffer lengths and contents, ghost state of capabilities, nested vectors. A read gives back what was last written at that index. The exception is boxes inside elements: what a box in an element holds is unknown once the element is in the vector.
 - The storage doubles when full. A push that cannot get memory aborts; the prover takes this into account by assuming the length stays below 2^60 after a push.
