@@ -4348,6 +4348,17 @@ fn x86_copy_bytes_src(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64
   x86_pop(&mut g, x86_reg(XR_RDI));
 }
 
+/// Is `a2` a variant without a payload, and the elements of vector `a0`
+/// wide enough that `vec_swap` copies them with `rep movsq`?
+fn x86_unit_swap(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, a0: u64, a2: u64) -> bool {
+  let vn = node_at(p.nodes, x86_core(p, a2));
+  if vn.kind != E_VARIANT || vn.a != 0 {
+    return false;
+  }
+  let w = x86_words(&mut g, c, m, p, x86_vec_elem(&mut g, c, &mut m, p, a0));
+  return w >= X86_REP_COPY;
+}
+
 /// %rcx = the address of element %rax of the vector at (%rdi), for
 /// elements of `n` words.
 fn x86_elem_addr(g: &mut X86, n: u64) {
@@ -5065,6 +5076,28 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_e(&mut g);
     x86_es(&mut g, "add %rax, %rcx");
     x86_push_from(&mut g, x86_mem_loc(XR_RCX, XB, 0), w);
+  } else if !g.stage0 && name_is(p, i, "vec_swap") && x86_unit_swap(&mut g, c, &mut m, p, a0, a2) {
+    // stage1: taking an element out and leaving a payload-less variant
+    // (`Free`) in its place: the old value is copied once, to the result,
+    // and only the tag of the new one is stored.
+    let w = x86_words(&mut g, c, m, p, x86_vec_elem(&mut g, c, &mut m, p, a0));
+    let vn = node_at(p.nodes, x86_core(p, a2));
+    let vt = x86_ty(&mut g, c, &mut m, p, a2);
+    let tag = cg_variant(m, p, inner_t(m, vt), vn.s2, vn.e2);
+    x86_arg(&mut g, c, &mut m, p, a0);
+    x86_scalar(&mut g, c, &mut m, p, a1);
+    x86_push(&mut g, x86_reg(XR_RAX));
+    x86_es(&mut g, "mov (%rsp), %rax");
+    x86_es(&mut g, "mov 8(%rsp), %rdi");
+    x86_elem_addr(&mut g, w);
+    x86_es(&mut g, "mov %rcx, %rdx");
+    x86_drop(&mut g, 2);
+    x86_reserve(&mut g, w);
+    x86_rep_copy(&mut g, "mov %rdx, %rsi", "mov %rsp, %rdi", w);
+    x86_t(&mut g, "movq $");
+    x86_n(&mut g, tag);
+    x86_t(&mut g, ", (%rdx)");
+    x86_e(&mut g);
   } else if name_is(p, i, "vec_set") || name_is(p, i, "vec_swap") {
     let w = x86_words(&mut g, c, m, p, x86_vec_elem(&mut g, c, &mut m, p, a0));
     x86_arg(&mut g, c, &mut m, p, a0);
