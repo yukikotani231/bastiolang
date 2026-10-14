@@ -1,0 +1,46 @@
+// A loop that sets each byte of a range to one value, as the native backends
+// lower it (one `fill`): from the start, from the middle, an empty range and
+// a counter that is read after the loop
+// expect-exit: 0
+fn fill_from(b: &mut Bytes, from: u64, v: u64, n: u64) -> u64
+  requires from <= n && n <= blen(b) && v <= 255
+  ensures result == n
+{
+  let mut i = from;
+  while i < n
+    invariant i <= n && n <= blen(b)
+  {
+    bset(&mut b, i, cast[u8](v));
+    i = i + 1;
+  }
+  return i;
+}
+
+fn sum(b: &Bytes, n: u64) -> u64
+  requires n <= blen(b)
+{
+  let mut s = 0;
+  let mut i = 0;
+  while i < n
+    invariant i <= n && n <= blen(b)
+  {
+    s = wrap_add(s, cast[u64](bget(b, i)));
+    i = i + 1;
+  }
+  return s;
+}
+
+fn main() -> u64 {
+  let mut b = balloc(40);
+  let end0 = fill_from(&mut b, 0, 3, 40);
+  let end1 = fill_from(&mut b, 10, 5, 30);
+  let end2 = fill_from(&mut b, 35, 9, 35);
+  let end3 = fill_from(&mut b, 4, 1, 4);
+  // bytes 0..10 are 3, 10..30 are 5, 30..40 are 3
+  let want = 10 * 3 + 20 * 5 + 10 * 3;
+  let got = sum(b, 40);
+  let ok = end0 == 40 && end1 == 30 && end2 == 35 && end3 == 4 && got == want;
+  bfree(b);
+  if ok { return 0; }
+  return 1;
+}

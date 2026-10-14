@@ -92,6 +92,7 @@ const IR_LOCKDEC: u64 = 70;  // atomically subtracts one from the 32-bit count a
 const IR_COPYPAGE: u64 = 71; // copies the 4096 bytes at address b to address a
 const IR_XCHG: u64 = 72;     // d = the 64-bit word at address a, which b replaces (atomically)
 const IR_CAS: u64 = 73;      // d = 1 if the 64-bit word at address a was b and is now the register c, else 0 (atomically)
+const IR_FILL: u64 = 76;     // stores the low byte of b in the c bytes from address a (a `while` that sets each byte of a range to one value)
 const IR_COPY: u64 = 75;     // copies c bytes from address b to address a, lowest address first (`bcopy` and the frame and DMA copies)
 const IR_LOCKACQ: u64 = 74;  // spins until it takes the lock word at address a (0 free, 1 held)
 const IR_POUT: u64 = 64;     // the low c bytes of b are written to I/O port a (`out`)
@@ -3485,6 +3486,95 @@ fn ir_block(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, head: u64) {
   ir_truncate(&mut f, saved);
 }
 
+/// Is `e` a value a loop can compute once: a variable other than the one
+/// named `s..e` (the counter), a literal, or a `cast` / `wrap` of one?
+fn ir_invariant(p: &Parser, e: u64, s: u64, en: u64) -> bool {
+  let x = node_at(p.nodes, e);
+  if x.kind == E_INT {
+    return true;
+  }
+  if x.kind == E_VAR {
+    return !same(p.src, x.s, x.e, s, en);
+  }
+  if x.kind == E_TAPP && (name_is(p, x.b, "cast") || name_is(p, x.b, "wrap")) {
+    let inner = node_at(p.nodes, x.b);
+    let y = node_at(p.nodes, inner.a);
+    return y.kind == E_INT || (y.kind == E_VAR && !same(p.src, y.s, y.e, s, en));
+  }
+  return false;
+}
+
+/// A loop `while i < n { bset(&mut b, i, v); i = i + 1; }` (the body is just
+/// those two statements, `n` and `v` are variables or literals that the loop
+/// does not change) is one `fill` of the bytes `i .. n` of `b` and `i = n`,
+/// when `i < n` holds on entry. Returns whether it was lowered that way.
+fn ir_fill_loop(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, w: u64) -> bool {
+  let n = node_at(p.nodes, w);
+  let cond = node_at(p.nodes, n.a);
+  if cond.kind != E_BIN || cond.v != P_LT || n.c == 0 {
+    return false;
+  }
+  let ci = node_at(p.nodes, cond.a);
+  let cb = node_at(p.nodes, cond.b);
+  if ci.kind != E_VAR || !(cb.kind == E_VAR || cb.kind == E_INT) {
+    return false;
+  }
+  let s1 = node_at(p.nodes, n.c);
+  if s1.kind != S_EXPR || s1.next == 0 {
+    return false;
+  }
+  let s2 = node_at(p.nodes, s1.next);
+  if s2.kind != S_ASSIGN || s2.next != 0 {
+    return false;
+  }
+  let call = node_at(p.nodes, s1.a);
+  if call.kind != E_CALL || !name_is(p, s1.a, "bset") {
+    return false;
+  }
+  let a1 = next_of(p, call.a);
+  let a2 = next_of(p, a1);
+  if a1 == 0 || a2 == 0 || next_of(p, a2) != 0 {
+    return false;
+  }
+  let ix = node_at(p.nodes, a1);
+  if ix.kind != E_VAR || !same(p.src, ix.s, ix.e, ci.s, ci.e) || !ir_invariant(p, a2, ci.s, ci.e) {
+    return false;
+  }
+  // `i = i + 1`
+  let path = node_at(p.nodes, s2.a);
+  let rhs = node_at(p.nodes, s2.b);
+  if path.next != 0 || !same(p.src, path.s, path.e, ci.s, ci.e) || rhs.kind != E_BIN || rhs.v != P_PLUS {
+    return false;
+  }
+  let ra = node_at(p.nodes, rhs.a);
+  let rb = node_at(p.nodes, rhs.b);
+  if ra.kind != E_VAR || !same(p.src, ra.s, ra.e, ci.s, ci.e) || rb.kind != E_INT || rb.v != 1 {
+    return false;
+  }
+  let target = ir_find(f, p, ci.s, ci.e);
+  if target.k != IRK_INT {
+    return false;
+  }
+  let l_body = ir_label(&mut f);
+  let l_end = ir_label(&mut f);
+  ir_branch(&mut f, c, &mut m, p, n.a, l_body, l_end);
+  ir_place(&mut f, l_body);
+  let b = ir_buf(&mut f, c, &mut m, p, call.a, IRK_BYTES);
+  let iv = ir_int(&mut f, c, &mut m, p, a1);
+  let nv = ir_int(&mut f, c, &mut m, p, cond.b);
+  let v = ir_int(&mut f, c, &mut m, p, a2);
+  if !f.failed {
+    let da = ir_reg(&mut f);
+    ir_emit(&mut f, IR_ADD, da, b.r0, iv, 0, c.tu64);
+    let cnt = ir_reg(&mut f);
+    ir_emit(&mut f, IR_SUB, cnt, nv, iv, 0, c.tu64);
+    ir_emit(&mut f, IR_FILL, IR_NONE, da, v, cnt, 0);
+    ir_emit(&mut f, IR_MOV, target.r0, nv, 0, 0, 0);
+  }
+  ir_place(&mut f, l_end);
+  return true;
+}
+
 fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
   let n = node_at(p.nodes, i);
   f.cur = n.line;
@@ -3625,6 +3715,9 @@ fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     }
     ir_place(&mut f, l_end);
   } else if k == S_WHILE {
+    if ir_fill_loop(&mut f, c, &mut m, p, i) {
+      return;
+    }
     let l_head = ir_label(&mut f);
     let l_body = ir_label(&mut f);
     let l_end = ir_label(&mut f);
@@ -4169,6 +4262,13 @@ fn ir_print(out: &mut Vec[u64], f: &IrFn, m: &Mono, p: &Parser) {
       ir_w_reg(&mut out, q.a);
       w_s(&mut out, ", ");
       ir_w_reg(&mut out, q.b);
+    } else if q.op == IR_FILL {
+      w_s(&mut out, "fill ");
+      ir_w_reg(&mut out, q.a);
+      w_s(&mut out, ", ");
+      ir_w_reg(&mut out, q.b);
+      w_s(&mut out, ", ");
+      ir_w_reg(&mut out, q.c);
     } else if q.op == IR_COPY {
       w_s(&mut out, "copy ");
       ir_w_reg(&mut out, q.a);
