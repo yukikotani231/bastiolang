@@ -92,6 +92,7 @@ const IR_LOCKDEC: u64 = 70;  // atomically subtracts one from the 32-bit count a
 const IR_COPYPAGE: u64 = 71; // copies the 4096 bytes at address b to address a
 const IR_XCHG: u64 = 72;     // d = the 64-bit word at address a, which b replaces (atomically)
 const IR_CAS: u64 = 73;      // d = 1 if the 64-bit word at address a was b and is now the register c, else 0 (atomically)
+const IR_COPY: u64 = 75;     // copies c bytes from address b to address a, lowest address first (`bcopy` and the frame and DMA copies)
 const IR_LOCKACQ: u64 = 74;  // spins until it takes the lock word at address a (0 free, 1 held)
 const IR_POUT: u64 = 64;     // the low c bytes of b are written to I/O port a (`out`)
 
@@ -1516,32 +1517,14 @@ fn ir_vsimple(c: &Checker, m: &Mono, p: &Parser, v: IrVal) -> bool {
 }
 
 /// Copies `cnt` bytes from `src[so ..]` to `dst[do ..]` (address and offset
-/// registers) with a forward loop; the two ranges do not overlap.
+/// registers), lowest address first, in one `copy`; the destination does not
+/// start inside the source.
 fn ir_copy_bytes(f: &mut IrFn, c: &Checker, dst: u64, doff: u64, src: u64, soff: u64, cnt: u64) {
-  let k = ir_reg(&mut f);
-  ir_emit(&mut f, IR_CONST, k, 0, 0, 0, 0);
-  let one = ir_reg(&mut f);
-  ir_emit(&mut f, IR_CONST, one, 1, 0, 0, 0);
-  let l_head = ir_label(&mut f);
-  let l_body = ir_label(&mut f);
-  let l_end = ir_label(&mut f);
-  ir_place(&mut f, l_head);
-  let more = ir_reg(&mut f);
-  ir_emit(&mut f, IR_LT, more, k, cnt, 0, 0);
-  ir_emit(&mut f, IR_BR, IR_NONE, more, l_body, l_end, 0);
-  ir_place(&mut f, l_body);
-  let si = ir_reg(&mut f);
-  ir_emit(&mut f, IR_ADD, si, soff, k, 0, c.tu64);
-  let di = ir_reg(&mut f);
-  ir_emit(&mut f, IR_ADD, di, doff, k, 0, c.tu64);
-  let x = ir_reg(&mut f);
-  ir_emit(&mut f, IR_LOAD, x, src, si, 1, 0);
-  ir_emit(&mut f, IR_STORE, x, dst, di, 1, 0);
-  let k1 = ir_reg(&mut f);
-  ir_emit(&mut f, IR_ADD, k1, k, one, 0, c.tu64);
-  ir_emit(&mut f, IR_MOV, k, k1, 0, 0, 0);
-  ir_jump(&mut f, l_head);
-  ir_place(&mut f, l_end);
+  let da = ir_reg(&mut f);
+  ir_emit(&mut f, IR_ADD, da, dst, doff, 0, c.tu64);
+  let sa = ir_reg(&mut f);
+  ir_emit(&mut f, IR_ADD, sa, src, soff, 0, c.tu64);
+  ir_emit(&mut f, IR_COPY, IR_NONE, da, sa, cnt, 0);
 }
 
 /// `bmove`: a copy within one buffer whose ranges may overlap, as memmove:
@@ -2094,7 +2077,7 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     return ir_none();
   }
   if name_is(p, i, "bcopy") {
-    // `bcopy(&mut dst, d, src, s, n)`: a byte loop.
+    // `bcopy(&mut dst, d, src, s, n)`: one `copy`.
     let a1 = next_of(p, n.a);
     let a2 = next_of(p, a1);
     let a3 = next_of(p, a2);
@@ -2124,7 +2107,7 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     return ir_none();
   }
   if name_is(p, i, "bytes_to_frame") || name_is(p, i, "bytes_to_dma") {
-    // `bytes_to_frame(&mut page, o, &src, s, n)`: a byte loop into the page.
+    // `bytes_to_frame(&mut page, o, &src, s, n)`: one `copy` into the page.
     let a1 = next_of(p, n.a);
     let a2 = next_of(p, a1);
     let a3 = next_of(p, a2);
@@ -4167,6 +4150,13 @@ fn ir_print(out: &mut Vec[u64], f: &IrFn, m: &Mono, p: &Parser) {
       ir_w_reg(&mut out, q.a);
       w_s(&mut out, ", ");
       ir_w_reg(&mut out, q.b);
+    } else if q.op == IR_COPY {
+      w_s(&mut out, "copy ");
+      ir_w_reg(&mut out, q.a);
+      w_s(&mut out, ", ");
+      ir_w_reg(&mut out, q.b);
+      w_s(&mut out, ", ");
+      ir_w_reg(&mut out, q.c);
     } else if q.op == IR_XCHG {
       ir_w_reg(&mut out, q.d);
       w_s(&mut out, " = xchg ");
