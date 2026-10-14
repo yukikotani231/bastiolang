@@ -648,12 +648,29 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     }
   } else if op == IR_MOV {
     ix_mov(&mut out, ix_loc(al, q.a), ix_loc(al, q.d));
-  } else if (op == IR_DIV || op == IR_REM) && lbq.k == IXK_IMM && lbq.imm > 1 && lbq.imm <= 2147483648 && lbq.imm & wrap_sub(lbq.imm, 1) == 0 {
+  } else if (op == IR_DIV || op == IR_REM) && lbq.k == IXK_IMM && lbq.imm > 1 && lbq.imm & wrap_sub(lbq.imm, 1) == 0 && (op == IR_DIV || lbq.imm <= 2147483648 || lbq.imm == 4294967296) {
     // A power of two: a shift or a mask, in the result's own register.
     let ld = ix_loc(al, q.d);
     let mut t = XR_RAX;
     if ld.k == IXK_REG {
       t = ld.reg;
+    }
+    if op == IR_REM && lbq.imm == 4294967296 {
+      // The low 32 bits: a 32-bit move zero-extends.
+      let la = ix_loc(al, q.a);
+      if la.k == IXK_REG {
+        w_s(&mut out, "\tmovl ");
+        w_s(&mut out, ix_name32(la.reg));
+      } else {
+        ix_mov(&mut out, la, ix_rl(t));
+        w_s(&mut out, "\tmovl ");
+        w_s(&mut out, ix_name32(t));
+      }
+      w_s(&mut out, ", ");
+      w_s(&mut out, ix_name32(t));
+      w_s(&mut out, "\n");
+      ix_finish(&mut out, al, q.d, t);
+      return;
     }
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(t));
     if op == IR_DIV {
@@ -970,6 +987,12 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RDI));
     ix_mov(&mut out, ix_loc(al, q.b), ix_rl(XR_RSI));
     w_s(&mut out, "\tmov $512, %ecx\n\trep movsq\n");
+  } else if op == IR_COPY {
+    // Whole words with rep movsq, then the rest with rep movsb.
+    ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RDI));
+    ix_mov(&mut out, ix_loc(al, q.b), ix_rl(XR_RSI));
+    ix_mov(&mut out, ix_loc(al, q.c), ix_rl(XR_RCX));
+    w_s(&mut out, "\tmov %rcx, %rax\n\tshr $3, %rcx\n\trep movsq\n\tmov %eax, %ecx\n\tand $7, %ecx\n\trep movsb\n");
   } else if op == IR_XCHG {
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RCX));
     ix_mov(&mut out, ix_loc(al, q.b), ix_rl(XR_RAX));
