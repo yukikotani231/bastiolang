@@ -217,13 +217,36 @@ fn ra_blocks(f: &IrFn) -> Vec[IrBlock] {
 
 // ---- Liveness ----
 
-/// Live-in sets of every block, as one flag per register (`b * nreg + r`).
-struct IrLive { inn: Vec[u64], out: Vec[u64] }
+/// Live-in and live-out sets of every block, as bit sets: register `r` of
+/// block `b` is bit `r % 64` of word `b * nw + r / 64`. `bit` holds the 64
+/// single-bit masks.
+struct IrLive { inn: Vec[u64], out: Vec[u64], nw: u64, bit: Vec[u64] }
+
+fn ra_has(lv: &IrLive, set: &Vec[u64], b: u64, r: u64) -> bool {
+  return (u_at(set, wrap_add(wrap_mul(b, lv.nw), r / 64)) & u_at(lv.bit, r % 64)) != 0;
+}
+
+fn ra_in(lv: &IrLive, b: u64, r: u64) -> bool {
+  return ra_has(lv, lv.inn, b, r);
+}
+
+fn ra_out(lv: &IrLive, b: u64, r: u64) -> bool {
+  return ra_has(lv, lv.out, b, r);
+}
 
 fn ra_live(f: &IrFn, bl: &Vec[IrBlock]) -> IrLive {
   let nb = vec_len(bl);
   let nr = f.nreg;
-  let total = wrap_mul(nb, nr);
+  let nw = wrap_add(nr / 64, 1);
+  let total = wrap_mul(nb, nw);
+  let mut bit = vec_new[u64]();
+  let mut m = 1;
+  let mut k = 0;
+  while k < 64 {
+    vec_push(&mut bit, m);
+    m = wrap_add(m, m);
+    k = k + 1;
+  }
   let mut use_ = vec_new[u64]();
   let mut def_ = vec_new[u64]();
   let mut inn = vec_new[u64]();
@@ -248,8 +271,12 @@ fn ra_live(f: &IrFn, bl: &Vec[IrBlock]) -> IrLive {
       let mut j = 0;
       while j < vec_len(rs) {
         let r = vec_get(rs, j);
-        if r < nr && u_at(def_, wrap_add(wrap_mul(b, nr), r)) == 0 {
-          ra_set(&mut use_, wrap_add(wrap_mul(b, nr), r), 1);
+        if r < nr {
+          let at = wrap_add(wrap_mul(b, nw), r / 64);
+          let mask = u_at(bit, r % 64);
+          if (u_at(def_, at) & mask) == 0 {
+            ra_set(&mut use_, at, u_at(use_, at) | mask);
+          }
         }
         j = j + 1;
       }
@@ -260,7 +287,8 @@ fn ra_live(f: &IrFn, bl: &Vec[IrBlock]) -> IrLive {
       while j < vec_len(ws) {
         let r = vec_get(ws, j);
         if r < nr {
-          ra_set(&mut def_, wrap_add(wrap_mul(b, nr), r), 1);
+          let at = wrap_add(wrap_mul(b, nw), r / 64);
+          ra_set(&mut def_, at, u_at(def_, at) | u_at(bit, r % 64));
         }
         j = j + 1;
       }
@@ -281,20 +309,17 @@ fn ra_live(f: &IrFn, bl: &Vec[IrBlock]) -> IrLive {
     {
       bb = bb - 1;
       let blk = vec_get(bl, bb);
-      let mut r = 0;
-      while r < nr {
-        let at = wrap_add(wrap_mul(bb, nr), r);
+      let mut w = 0;
+      while w < nw {
+        let at = wrap_add(wrap_mul(bb, nw), w);
         let mut o = 0;
-        if blk.n1 != 0 && u_at(inn, wrap_add(wrap_mul(blk.n1 - 1, nr), r)) != 0 {
-          o = 1;
+        if blk.n1 != 0 {
+          o = o | u_at(inn, wrap_add(wrap_mul(blk.n1 - 1, nw), w));
         }
-        if blk.n2 != 0 && u_at(inn, wrap_add(wrap_mul(blk.n2 - 1, nr), r)) != 0 {
-          o = 1;
+        if blk.n2 != 0 {
+          o = o | u_at(inn, wrap_add(wrap_mul(blk.n2 - 1, nw), w));
         }
-        let mut iv = 0;
-        if u_at(use_, at) != 0 || (o != 0 && u_at(def_, at) == 0) {
-          iv = 1;
-        }
+        let iv = u_at(use_, at) | (o & !u_at(def_, at));
         if o != u_at(out, at) {
           ra_set(&mut out, at, o);
           changed = true;
@@ -303,14 +328,14 @@ fn ra_live(f: &IrFn, bl: &Vec[IrBlock]) -> IrLive {
           ra_set(&mut inn, at, iv);
           changed = true;
         }
-        r = r + 1;
+        w = w + 1;
       }
     }
     rounds = rounds + 1;
   }
   vec_free(use_);
   vec_free(def_);
-  return IrLive { inn: inn, out: out };
+  return IrLive { inn: inn, out: out, nw: nw, bit: bit };
 }
 
 // ---- Intervals ----
@@ -365,11 +390,10 @@ fn ra_intervals(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> IrIntervals {
     // last.
     let mut rr = 0;
     while rr < nr {
-      let at = wrap_add(wrap_mul(b, nr), rr);
-      if u_at(lv.inn, at) != 0 {
+      if ra_in(lv, b, rr) {
         ra_touch(&mut iv, rr, blk.s);
       }
-      if u_at(lv.out, at) != 0 && blk.e > 0 {
+      if ra_out(lv, b, rr) && blk.e > 0 {
         ra_touch(&mut iv, rr, blk.e - 1);
       }
       rr = rr + 1;
@@ -765,6 +789,7 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
   vec_free(iv.hi);
   vec_free(lv.inn);
   vec_free(lv.out);
+  vec_free(lv.bit);
   vec_free(bl);
   return al;
 }
@@ -812,6 +837,7 @@ fn ra_valid(f: &IrFn, a: &IrAlloc) -> bool {
   vec_free(iv.hi);
   vec_free(lv.inn);
   vec_free(lv.out);
+  vec_free(lv.bit);
   vec_free(bl);
   return ok;
 }
