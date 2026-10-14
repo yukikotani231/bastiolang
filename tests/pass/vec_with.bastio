@@ -35,6 +35,38 @@ fn word_plus(x: &u64, k: u64) -> u64 {
   return wrap_add(x, k);
 }
 
+struct Meta { size: u64, kind: u64, mode: u64 }
+
+// The element's name compared with a name the caller holds (a `&Bytes`
+// argument), then a wide result.
+fn slot_named(s: &Slot, name: &Bytes, n: u64) -> bool {
+  match s {
+    Slot::Free => { return false; },
+    Slot::Full(f) => {
+      if blen(f.name) != n || n > blen(name) {
+        return false;
+      }
+      let mut k = 0;
+      while k < n
+        invariant k <= n && n <= blen(name) && n == blen(f.name)
+      {
+        if bget(f.name, k) != bget(name, k) {
+          return false;
+        }
+        k = k + 1;
+      }
+      return true;
+    },
+  }
+}
+
+fn slot_meta(s: &Slot, kind: u64) -> Meta {
+  match s {
+    Slot::Free => { return Meta { size: 0, kind: kind, mode: 1 }; },
+    Slot::Full(f) => { return Meta { size: f.size, kind: kind, mode: 2 }; },
+  }
+}
+
 fn named(text: Str, size: u64) -> Slot {
   let b = bfrom(text);
   return Slot::Full(Named { name: b, size: size });
@@ -52,6 +84,18 @@ fn main() -> u64 {
   if vec_with(slots, 2, slot_byte, 4) != 111 { bad = 4; }        // 'o'
   if vec_with(slots, 0, slot_byte, 1) != 98 { bad = 5; }         // 'b'
   if vec_with(slots, 0, slot_byte, 3) != 0 { bad = 6; }
+  let probe = bfrom("hello world");
+  let other = bfrom("hello worle");
+  if !vec_with(slots, 2, slot_named, probe, 11) { bad = 13; }
+  if vec_with(slots, 2, slot_named, other, 11) { bad = 14; }
+  if vec_with(slots, 0, slot_named, probe, 11) { bad = 15; }
+  if vec_with(slots, 1, slot_named, probe, 11) { bad = 16; }
+  bfree(probe);
+  bfree(other);
+  let m2 = vec_with(slots, 2, slot_meta, 7);
+  let m1 = vec_with(slots, 1, slot_meta, 8);
+  if m2.size != 11 || m2.kind != 7 || m2.mode != 2 { bad = 17; }
+  if m1.size != 0 || m1.kind != 8 || m1.mode != 1 { bad = 18; }
   // Still all there: nothing was taken out.
   let s2 = vec_pop(&mut slots);
   let s1 = vec_pop(&mut slots);
