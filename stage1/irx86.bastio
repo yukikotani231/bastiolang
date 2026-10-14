@@ -562,25 +562,6 @@ fn ix_mentions(v: &Vec[u64], pat: Str) -> bool {
   return false;
 }
 
-/// The 32-bit name of an allocatable or scratch register.
-fn ix_r32(r: u64) -> Str {
-  if r == XR_RAX { return "%eax"; }
-  if r == XR_RCX { return "%ecx"; }
-  if r == XR_RDX { return "%edx"; }
-  if r == XR_RSI { return "%esi"; }
-  if r == XR_RDI { return "%edi"; }
-  if r == XR_RBX { return "%ebx"; }
-  if r == XR_R12 { return "%r12d"; }
-  if r == XR_R13 { return "%r13d"; }
-  if r == XR_R14 { return "%r14d"; }
-  if r == XR_R15 { return "%r15d"; }
-  if r == XR_R8 { return "%r8d"; }
-  if r == XR_R9 { return "%r9d"; }
-  if r == XR_R10 { return "%r10d"; }
-  if r == XR_R11 { return "%r11d"; }
-  return "";
-}
-
 /// One instruction other than control flow and calls.
 fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: &Parser, q: IrIns, slotw: u64) {
   let op = q.op;
@@ -612,12 +593,12 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
       w_s(&mut out, "\n");
       return;
     }
-    if op == IR_AND && ld.k == IXK_REG && la.k == IXK_REG && lb0.k == IXK_IMM && lb0.imm == 4294967295 && slen(ix_r32(la.reg)) > 0 && slen(ix_r32(ld.reg)) > 0 {
+    if op == IR_AND && ld.k == IXK_REG && la.k == IXK_REG && lb0.k == IXK_IMM && lb0.imm == 4294967295 {
       // `d = a & 0xffffffff`: a 32-bit move zero-extends.
       w_s(&mut out, "\tmovl ");
-      w_s(&mut out, ix_r32(la.reg));
+      w_s(&mut out, ix_name32(la.reg));
       w_s(&mut out, ", ");
-      w_s(&mut out, ix_r32(ld.reg));
+      w_s(&mut out, ix_name32(ld.reg));
       w_s(&mut out, "\n");
       return;
     }
@@ -667,6 +648,32 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     }
   } else if op == IR_MOV {
     ix_mov(&mut out, ix_loc(al, q.a), ix_loc(al, q.d));
+  } else if (op == IR_DIV || op == IR_REM) && lbq.k == IXK_IMM && lbq.imm > 1 && lbq.imm <= 2147483648 && lbq.imm & wrap_sub(lbq.imm, 1) == 0 {
+    // A power of two: a shift or a mask, in the result's own register.
+    let ld = ix_loc(al, q.d);
+    let mut t = XR_RAX;
+    if ld.k == IXK_REG {
+      t = ld.reg;
+    }
+    ix_mov(&mut out, ix_loc(al, q.a), ix_rl(t));
+    if op == IR_DIV {
+      let mut sh = 0;
+      let mut v = lbq.imm;
+      while v > 1 && sh < 64 {
+        v = v / 2;
+        sh = sh + 1;
+      }
+      w_s(&mut out, "\tshr $");
+      w_num(&mut out, sh);
+      w_s(&mut out, ", ");
+    } else {
+      w_s(&mut out, "\tand $");
+      w_num(&mut out, wrap_sub(lbq.imm, 1));
+      w_s(&mut out, ", ");
+    }
+    w_s(&mut out, x86_rname(t));
+    w_s(&mut out, "\n");
+    ix_finish(&mut out, al, q.d, t);
   } else if (op == IR_DIV || op == IR_REM) && lbq.k == IXK_IMM && lbq.imm != 0 {
     // A constant divisor: shifts and a multiplication, as the generator
     // of x86.bastio does it (the code is written into its line buffer).
@@ -702,8 +709,13 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
       ix_finish(&mut out, al, q.d, XR_RAX);
     }
   } else if op == IR_SHL || op == IR_SHR || op == IR_SAR {
-    ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RAX));
     let lb = ix_loc(al, q.b);
+    let ld = ix_loc(al, q.d);
+    let mut t = XR_RAX;
+    if lb.k == IXK_IMM && lb.imm < 64 && ld.k == IXK_REG {
+      t = ld.reg;
+    }
+    ix_mov(&mut out, ix_loc(al, q.a), ix_rl(t));
     let mut ins = "sar";
     if op == IR_SHL {
       ins = "shl";
@@ -711,14 +723,14 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
       ins = "shr";
     }
     if lb.k == IXK_IMM && lb.imm < 64 {
-      ix_ins2(&mut out, ins, lb, ix_rl(XR_RAX));
+      ix_ins2(&mut out, ins, lb, ix_rl(t));
     } else {
       ix_mov(&mut out, lb, ix_rl(XR_RCX));
       w_s(&mut out, "\t");
       w_s(&mut out, ins);
       w_s(&mut out, " %cl, %rax\n");
     }
-    ix_finish(&mut out, al, q.d, XR_RAX);
+    ix_finish(&mut out, al, q.d, t);
   } else if op == IR_NOT {
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RAX));
     if q.ty != 0 {
