@@ -4270,6 +4270,32 @@ fn x86_to_regs(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, r1: u
   if r1 != 0 { x86_pop(&mut g, x86_reg(r1)); }
 }
 
+/// Like x86_to_regs for a call whose argument 0 is a processor capability
+/// (`cpu_get(cpu, r)`, `cpu_set(&mut cpu, r, v)`): it has no run-time
+/// contents, so a variable or a `&mut` of one is not evaluated. The other
+/// arguments land in `r2` and `r3`.
+fn x86_to_regs_cpu(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, r2: u64, r3: u64) {
+  let n = node_at(p.nodes, i);
+  let mut a = n.a;
+  if a != 0 {
+    let an = node_at(p.nodes, a);
+    let k = an.kind;
+    if k == E_VAR || k == E_MUTBORROW {
+      a = next_of(p, a);
+    } else {
+      x86_arg(&mut g, c, &mut m, p, a);
+      x86_drop(&mut g, 1);
+      a = next_of(p, a);
+    }
+  }
+  while a != 0 {
+    x86_arg(&mut g, c, &mut m, p, a);
+    a = next_of(p, a);
+  }
+  if r3 != 0 { x86_pop(&mut g, x86_reg(r3)); }
+  if r2 != 0 { x86_pop(&mut g, x86_reg(r2)); }
+}
+
 /// Copies %rcx bytes from (%rsi) to (%rdi), lowest first: whole words with
 /// rep movsq, then the rest with rep movsb (the C prelude's bst_copy_fwd).
 fn x86_copy_fwd(g: &mut X86) {
@@ -5624,14 +5650,14 @@ fn x86_builtin1(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_es(&mut g, "shl $32, %rdx");
     x86_es(&mut g, "or %rdx, %rax");
   } else if name_is(p, i, "cpu_get") {
-    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RDI, 0, 0, 0);
+    x86_to_regs_cpu(&mut g, c, &mut m, p, i, XR_RDI, 0);
     // The saved context is the start of the processor's block, which is %rsp rounded down
     // (bst_platform_ctx_mask, from the platform): no call, so nothing around it is spilled.
     x86_es(&mut g, "mov %rsp, %rax");
     x86_es(&mut g, "and $bst_platform_ctx_mask, %rax");
     x86_es(&mut g, "mov (%rax,%rdi,8), %rax");
   } else if name_is(p, i, "cpu_set") {
-    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RDI, XR_RSI, 0, 0);
+    x86_to_regs_cpu(&mut g, c, &mut m, p, i, XR_RDI, XR_RSI);
     x86_es(&mut g, "mov %rsp, %rax");
     x86_es(&mut g, "and $bst_platform_ctx_mask, %rax");
     x86_es(&mut g, "mov %rsi, (%rax,%rdi,8)");
