@@ -6279,8 +6279,11 @@ fn x86_peephole(code: &Vec[u64], out: &mut Vec[u64], opt: bool) {
   }
   // stage1 only: argument set-up without the stack, then accumulator
   // copies folded.
+  let mut pre = vec_new[u64]();
+  x86_fvec(code, &mut pre);
   let mut mid = vec_new[u64]();
-  x86_peep_pairs(code, &mut mid, true);
+  x86_peep_pairs(pre, &mut mid, true);
+  vec_free(pre);
   let mut mid2 = vec_new[u64]();
   x86_peep_acc(mid, &mut mid2);
   // Again: the accumulator rules leave %rax alone in more places, so
@@ -7473,6 +7476,427 @@ fn x86_rax_names_ok(code: &Vec[u64], s: u64, e: u64) -> bool {
     k = k + 1;
   }
   return true;
+}
+
+// ---- A frame vector's length and data pointer in registers across a loop ----
+
+/// Does the line from `s` to `e` read exactly `t`?
+fn x86_eqv(code: &Vec[u64], s: u64, e: u64, t: &Vec[u64]) -> bool {
+  if wrap_sub(e, s) != vec_len(t) {
+    return false;
+  }
+  let mut k = 0;
+  while k < vec_len(t) {
+    if u_at(code, wrap_add(s, k)) != u_at(t, k) {
+      return false;
+    }
+    k = k + 1;
+  }
+  return true;
+}
+
+/// `a`, the text `r`, `b`.
+fn x86_cat(a: Str, r: &Vec[u64], b: Str) -> Vec[u64] {
+  let mut v = vec_new[u64]();
+  w_s(&mut v, a);
+  w_append(&mut v, r);
+  w_s(&mut v, b);
+  return v;
+}
+
+/// Is line `i` exactly `a` `r` `b`?
+fn x86_line_cat(code: &Vec[u64], starts: &Vec[u64], i: u64, a: Str, r: &Vec[u64], b: Str) -> bool {
+  let t = x86_cat(a, r, b);
+  let s = u_at(starts, i);
+  let ok = i < vec_len(starts) && x86_eqv(code, s, x86_line_end(code, s), t);
+  vec_free(t);
+  return ok;
+}
+
+/// Does line `i` mention a register of the family set `fm`?
+fn x86_line_fams(code: &Vec[u64], starts: &Vec[u64], i: u64) -> u64 {
+  let s = u_at(starts, i);
+  return x86_fams(code, s, x86_line_end(code, s));
+}
+
+/// The index + 1 of the line from `lo` to `hi` (inclusive) that is the label
+/// `tv` followed by a colon, or 0.
+fn x86_label_idx(code: &Vec[u64], starts: &Vec[u64], tv: &Vec[u64], lo: u64, hi: u64) -> u64 {
+  let n = vec_len(tv);
+  let mut i = lo;
+  while i <= hi && i < vec_len(starts) {
+    let s = u_at(starts, i);
+    let e = x86_line_end(code, s);
+    if wrap_sub(e, s) == wrap_add(n, 1) && u_at(code, wrap_add(s, n)) == 58 && x86_eqv(code, s, wrap_add(s, n), tv) {
+      return i + 1;
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+/// The jump target of line `i` (the text after the first space), when the
+/// line is a jump to a label; empty otherwise.
+fn x86_jump_target(code: &Vec[u64], starts: &Vec[u64], i: u64) -> Vec[u64] {
+  let mut tv = vec_new[u64]();
+  let s = u_at(starts, i);
+  let e = x86_line_end(code, s);
+  if u_at(code, wrap_add(s, 1)) != 106 {
+    return tv;
+  }
+  let mut k = wrap_add(s, 1);
+  while k < e && u_at(code, k) != 32 {
+    k = k + 1;
+  }
+  k = wrap_add(k, 1);
+  if u_at(code, k) != 46 {
+    return tv;
+  }
+  while k < e {
+    vec_push(&mut tv, u_at(code, k));
+    k = k + 1;
+  }
+  return tv;
+}
+
+
+/// `-m(%rbp)`.
+fn x86_fo(m: u64) -> Vec[u64] {
+  let mut v = vec_new[u64]();
+  w_s(&mut v, "-");
+  w_num(&mut v, m);
+  w_s(&mut v, "(%rbp)");
+  return v;
+}
+
+/// Does the line from `s` to `e` name a frame operand `-N(%rbp)` with N equal
+/// to `a`, `b` or `c`?
+fn x86_names_frame(code: &Vec[u64], s: u64, e: u64, a: u64, b: u64, c: u64) -> bool {
+  let mut k = s;
+  while k < e {
+    if u_at(code, k) == 45 {
+      let mut j = wrap_add(k, 1);
+      let mut n = 0;
+      let mut nd = 0;
+      while j < e && u_at(code, j) >= 48 && u_at(code, j) <= 57 && nd < 12 {
+        n = wrap_add(wrap_mul(n, 10), wrap_sub(u_at(code, j), 48));
+        j = wrap_add(j, 1);
+        nd = nd + 1;
+      }
+      if nd > 0 && x86_has_prefix(code, j, "(%rbp)") && (n == a || n == b || n == c) {
+        return true;
+      }
+    }
+    k = k + 1;
+  }
+  return false;
+}
+
+/// The magnitude M of the frame operand `-M(%rbp)` in `\tmov -M(%rbp), %rax`
+/// at line `i`, or 0.
+fn x86_fv_mag(code: &Vec[u64], starts: &Vec[u64], i: u64) -> u64 {
+  let s = u_at(starts, i);
+  if i >= vec_len(starts) || !x86_has_prefix(code, s, "\tmov -") {
+    return 0;
+  }
+  let mut k = wrap_add(s, 6);
+  let mut n = 0;
+  let mut nd = 0;
+  while u_at(code, k) >= 48 && u_at(code, k) <= 57 && nd < 9 {
+    n = wrap_add(wrap_mul(n, 10), wrap_sub(u_at(code, k), 48));
+    k = wrap_add(k, 1);
+    nd = nd + 1;
+  }
+  if nd == 0 || n <= 16 || !x86_has_prefix(code, k, "(%rbp), %rax") {
+    return 0;
+  }
+  return n;
+}
+
+/// The push of a vector held in the frame at `-m(%rbp)` (length), `-(m-8)`
+/// (capacity), `-(m-16)` (data) that `x86_val` writes, starting at line `i`:
+///   mov L, %rax / cmp C, %rax / jne .Lk / lines that keep clear of the three
+///   words, one `lea L, %rdi` and one `call bst_rt_vec_grow` among them /
+///   mov L, %rax / .Lk: / mov D, %rcx / mov V, (%rcx,%rax,8) / incq L
+/// Returns how many lines that is, or 0.
+fn x86_fv_seq(code: &Vec[u64], starts: &Vec[u64], i: u64, m: u64) -> u64 {
+  let nl = vec_len(starts);
+  if wrap_add(i, 12) > nl {
+    return 0;
+  }
+  let lo = x86_fo(m);
+  let co = x86_fo(wrap_sub(m, 8));
+  let dop = x86_fo(wrap_sub(m, 16));
+  let mut res = 0;
+  if x86_line_cat(code, starts, i, "\tmov ", lo, ", %rax") && x86_line_cat(code, starts, wrap_add(i, 1), "\tcmp ", co, ", %rax") {
+    let jt = x86_jump_target(code, starts, wrap_add(i, 2));
+    let s2 = u_at(starts, wrap_add(i, 2));
+    let mut lj = 0;
+    if vec_len(jt) > 0 && x86_has_prefix(code, s2, "\tjne ") {
+      lj = x86_label_idx(code, starts, jt, wrap_add(i, 6), wrap_add(i, 16));
+    }
+    vec_free(jt);
+    if lj != 0 {
+      let e = wrap_sub(lj, 1);
+      let last = wrap_sub(e, 1);
+      let mut ok = wrap_add(e, 3) < nl;
+      let mut calls = 0;
+      let mut leas = 0;
+      let mut k = wrap_add(i, 3);
+      while ok && k < last {
+        let s = u_at(starts, k);
+        let le = x86_line_end(code, s);
+        if x86_txt(code, s, le, "\tcall bst_rt_vec_grow") {
+          calls = wrap_add(calls, 1);
+        } else if x86_line_cat(code, starts, k, "\tlea ", lo, ", %rdi") {
+          leas = wrap_add(leas, 1);
+        } else if x86_has_prefix(code, s, "\tcall") || x86_has_prefix(code, s, "\tj") || x86_names_frame(code, s, le, m, wrap_sub(m, 8), wrap_sub(m, 16)) {
+          ok = false;
+        }
+        k = wrap_add(k, 1);
+      }
+      if ok && calls == 1 && leas == 1 && x86_line_cat(code, starts, last, "\tmov ", lo, ", %rax")
+        && x86_line_cat(code, starts, wrap_add(e, 1), "\tmov ", dop, ", %rcx") && x86_line_cat(code, starts, wrap_add(e, 3), "\tincq ", lo, "") {
+        let st = u_at(starts, wrap_add(e, 2));
+        let se = x86_line_end(code, st);
+        if se >= 15 && x86_has_prefix(code, st, "\tmov") && x86_txt(code, wrap_sub(se, 15), se, ", (%rcx,%rax,8)")
+          && (x86_fams(code, st, wrap_sub(se, 15)) & 4) == 0 && !x86_names_frame(code, st, se, m, wrap_sub(m, 8), wrap_sub(m, 16)) {
+          res = wrap_add(wrap_sub(e, i), 4);
+        }
+      }
+    }
+  }
+  vec_free(lo);
+  vec_free(co);
+  vec_free(dop);
+  return res;
+}
+
+fn x86_copy_line(code: &Vec[u64], starts: &Vec[u64], i: u64, out: &mut Vec[u64]) {
+  let s = u_at(starts, i);
+  x86_copy_text(code, s, x86_line_end(code, s), &mut out);
+  w_s(&mut out, "\n");
+}
+
+/// `\tmov A, B\n` for operand texts.
+fn x86_mov_t(out: &mut Vec[u64], a: &Vec[u64], b: &Vec[u64]) {
+  w_s(&mut out, "\tmov ");
+  w_append(&mut out, a);
+  w_s(&mut out, ", ");
+  w_append(&mut out, b);
+  w_s(&mut out, "\n");
+}
+
+/// A loop that pushes onto a vector held in the frame (an inlined callee's
+/// `&mut`, or a local) and does nothing else with that vector: its length
+/// and its data pointer live in two caller-saved registers the function does
+/// not use. They are loaded before the loop; the length is stored before the
+/// call that grows the vector, both are loaded again after it, and the length
+/// is stored after the loop. (A `&mut` or a local is unique, so nothing else
+/// reads the vector meanwhile.) Writes the function to `out` and returns true,
+/// or returns false having changed nothing.
+fn x86_fvec_once(code: &Vec[u64], out: &mut Vec[u64]) -> bool {
+  let starts = x86_line_starts(code);
+  let nl = vec_len(starts);
+  let mut used = x86_fams(code, 0, vec_len(code));
+  // `syscall` clobbers %r11.
+  let mut sk = 0;
+  while sk < nl {
+    if x86_has_prefix(code, u_at(starts, sk), "\tsyscall") {
+      used = used | 4096;
+    }
+    sk = sk + 1;
+  }
+  let mut lg = 0;
+  let mut ld = 0;
+  let mut f = 8;
+  while f < 12 {
+    let mut bit = 512;
+    if f == 9 {
+      bit = 1024;
+    } else if f == 10 {
+      bit = 2048;
+    } else if f == 11 {
+      bit = 4096;
+    }
+    if (used & bit) == 0 {
+      if lg == 0 {
+        lg = f;
+      } else if ld == 0 {
+        ld = f;
+      }
+    }
+    f = f + 1;
+  }
+  let mut done = false;
+  let mut i = 0;
+  while ld != 0 && !done && i < nl {
+    let m = x86_fv_mag(code, starts, i);
+    let mut ln = 0;
+    if m != 0 {
+      ln = x86_fv_seq(code, starts, i, m);
+    }
+    if ln != 0 {
+      // The innermost loop around the sequence: the nearest later jump back
+      // to a label before it.
+      let mut t = 0;
+      let mut b = 0;
+      let mut j = wrap_add(i, ln);
+      while j < nl {
+        let tv = x86_jump_target(code, starts, j);
+        if vec_len(tv) > 0 {
+          let li = x86_label_idx(code, starts, tv, 0, wrap_sub(i, 1));
+          if li != 0 {
+            let tl = wrap_sub(li, 1);
+            if b == 0 || tl > t || (tl == t && j > b) {
+              t = tl;
+              b = j;
+            }
+          }
+        }
+        vec_free(tv);
+        j = j + 1;
+      }
+      if b != 0 && t >= 2 {
+        let mut ok = x86_has_prefix(code, u_at(starts, wrap_sub(t, 1)), "\t.p2align 4") && x86_has_prefix(code, u_at(starts, wrap_sub(t, 2)), "\tjmp .L");
+        // Every other line of the loop: nothing of the vector, no call, and
+        // jumps that stay inside.
+        let mut seqs = vec_new[u64]();
+        let mut lens = vec_new[u64]();
+        let mut u = t;
+        while ok && u <= b {
+          let su = u_at(starts, u);
+          let eu = x86_line_end(code, su);
+          let mut ql = 0;
+          if x86_fv_mag(code, starts, u) == m {
+            ql = x86_fv_seq(code, starts, u, m);
+          }
+          if ql != 0 {
+            vec_push(&mut seqs, u);
+            vec_push(&mut lens, ql);
+            u = wrap_add(u, ql);
+          } else {
+            if x86_names_frame(code, su, eu, m, wrap_sub(m, 8), wrap_sub(m, 16)) || x86_has_prefix(code, su, "\tcall") || x86_has_prefix(code, su, "\tret") || x86_has_prefix(code, su, "\tleave") {
+              ok = false;
+            }
+            if x86_has_prefix(code, su, "\tj") {
+              let tv = x86_jump_target(code, starts, u);
+              if vec_len(tv) == 0 || x86_label_idx(code, starts, tv, t, b) == 0 {
+                ok = false;
+              }
+              vec_free(tv);
+            }
+            u = wrap_add(u, 1);
+          }
+        }
+        // The entry jump goes to a label of the loop.
+        if ok {
+          let tv = x86_jump_target(code, starts, wrap_sub(t, 2));
+          if vec_len(tv) == 0 || x86_label_idx(code, starts, tv, t, b) == 0 {
+            ok = false;
+          }
+          vec_free(tv);
+        }
+        if ok && vec_len(seqs) > 0 {
+          let mut rg = vec_new[u64]();
+          w_s(&mut rg, "%r");
+          w_num(&mut rg, lg);
+          let mut rd = vec_new[u64]();
+          w_s(&mut rd, "%r");
+          w_num(&mut rd, ld);
+          let lo = x86_fo(m);
+          let dop = x86_fo(wrap_sub(m, 16));
+          let mut rax = vec_new[u64]();
+          w_s(&mut rax, "%rax");
+          let mut u2 = 0;
+          let mut si = 0;
+          while u2 < nl {
+            if u2 == wrap_sub(t, 2) {
+              x86_mov_t(&mut out, lo, rg);
+              x86_mov_t(&mut out, dop, rd);
+            }
+            if si < vec_len(seqs) && u2 == u_at(seqs, si) {
+              let q = u_at(seqs, si);
+              let ql = u_at(lens, si);
+              let e = wrap_sub(wrap_add(q, ql), 4);
+              let mut x = q;
+              while x < wrap_add(q, ql) {
+                if x == q {
+                  x86_mov_t(&mut out, rg, rax);
+                } else if x == wrap_add(q, 3) {
+                  x86_mov_t(&mut out, rg, lo);
+                  x86_copy_line(code, starts, x, &mut out);
+                } else if x == wrap_sub(e, 1) {
+                  x86_mov_t(&mut out, lo, rg);
+                  x86_mov_t(&mut out, dop, rd);
+                  x86_mov_t(&mut out, rg, rax);
+                } else if x == wrap_add(e, 1) {
+                  // The data pointer is already in a register.
+                } else if x == wrap_add(e, 2) {
+                  let sx = u_at(starts, x);
+                  let ex = x86_line_end(code, sx);
+                  x86_copy_text(code, sx, wrap_sub(ex, 15), &mut out);
+                  w_s(&mut out, ", (");
+                  w_append(&mut out, rd);
+                  w_s(&mut out, ",%rax,8)\n");
+                } else if x == wrap_sub(wrap_add(q, ql), 1) {
+                  w_s(&mut out, "\tadd $1, ");
+                  w_append(&mut out, rg);
+                  w_s(&mut out, "\n");
+                } else {
+                  x86_copy_line(code, starts, x, &mut out);
+                }
+                x = wrap_add(x, 1);
+              }
+              u2 = wrap_add(q, ql);
+              si = wrap_add(si, 1);
+            } else {
+              x86_copy_line(code, starts, u2, &mut out);
+              u2 = wrap_add(u2, 1);
+            }
+            if wrap_sub(u2, 1) == b && u2 > 0 {
+              x86_mov_t(&mut out, rg, lo);
+            }
+          }
+          vec_free(rg);
+          vec_free(rd);
+          vec_free(lo);
+          vec_free(dop);
+          vec_free(rax);
+          done = true;
+        }
+        vec_free(seqs);
+        vec_free(lens);
+      }
+    }
+    if ln != 0 {
+      i = wrap_add(i, ln);
+    } else {
+      i = i + 1;
+    }
+  }
+  vec_free(starts);
+  return done;
+}
+
+/// `x86_fvec_once` until it finds nothing more (each pass takes one loop).
+fn x86_fvec(code: &Vec[u64], out: &mut Vec[u64]) {
+  let mut cur = vec_new[u64]();
+  w_append(&mut cur, code);
+  let mut round = 0;
+  while round < 4 {
+    let mut nx = vec_new[u64]();
+    if x86_fvec_once(cur, &mut nx) {
+      vec_free(cur);
+      cur = nx;
+      round = round + 1;
+    } else {
+      vec_free(nx);
+      round = 4;
+    }
+  }
+  w_append(&mut out, cur);
+  vec_free(cur);
 }
 
 /// The end of the line starting at `s` (its newline, or the end).
