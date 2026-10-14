@@ -6293,10 +6293,13 @@ fn x86_peephole(code: &Vec[u64], out: &mut Vec[u64], opt: bool) {
   // more pushes and pops pair up.
   let mut mid3 = vec_new[u64]();
   x86_peep_pairs(mid2, &mut mid3, true);
-  x86_peep_acc(mid3, &mut out);
+  let mut mid4 = vec_new[u64]();
+  x86_peep_acc(mid3, &mut mid4);
+  x86_cmp_chain(mid4, &mut out);
   vec_free(mid);
   vec_free(mid2);
   vec_free(mid3);
+  vec_free(mid4);
 }
 
 /// The start of every line of `code`.
@@ -7479,6 +7482,199 @@ fn x86_rax_names_ok(code: &Vec[u64], s: u64, e: u64) -> bool {
     k = k + 1;
   }
   return true;
+}
+
+/// The number N of a line `\tcmpq $N, %reg` when N is a decimal below 2^31;
+/// ~0 for a line of any other shape.
+fn x86_cc_value(code: &Vec[u64], s: u64, e: u64) -> u64 {
+  if !x86_has_prefix(code, s, "\tcmpq $") {
+    return wrap_sub(0, 1);
+  }
+  let mut k = wrap_add(s, 7);
+  let mut v = 0;
+  let mut n = 0;
+  while k < e && n < 10 && u_at(code, k) >= 48 && u_at(code, k) <= 57
+    invariant n <= 10
+  {
+    v = wrap_add(wrap_mul(v, 10), wrap_sub(u_at(code, k), 48));
+    k = wrap_add(k, 1);
+    n = n + 1;
+  }
+  if n == 0 || u_at(code, k) != 44 || v >= 2147483648 {
+    return wrap_sub(0, 1);
+  }
+  return v;
+}
+
+/// Writes the label of one node of a comparison tree: the chain's target
+/// (text `ts` to `te`), the line the chain starts at and the range of values.
+fn x86_cc_label(out: &mut Vec[u64], code: &Vec[u64], ts: u64, te: u64, at: u64, lo: u64, hi: u64) {
+  x86_copy_text(code, ts, te, &mut out);
+  w_s(&mut out, "_c");
+  w_num(&mut out, at);
+  w_s(&mut out, "_");
+  w_num(&mut out, lo);
+  w_s(&mut out, "_");
+  w_num(&mut out, hi);
+}
+
+/// Does the instruction at line `q` or after (labels and directives skipped)
+/// read the flags a compare left? Then a chain of `cmpq $N, %reg` / `je L`
+/// cannot be rewritten: its last compare leaves different flags behind.
+fn x86_cc_flags_read(code: &Vec[u64], starts: &Vec[u64], q0: u64) -> bool
+  requires q0 <= vlen(starts)
+{
+  let nl = vec_len(starts);
+  let mut q = q0;
+  while q < nl
+    invariant q <= nl
+  {
+    let s = u_at(starts, q);
+    let e = x86_line_end(code, s);
+    if e > s && u_at(code, wrap_sub(e, 1)) == 58 {
+      q = q + 1;
+    } else if x86_has_prefix(code, s, "\t.") {
+      q = q + 1;
+    } else {
+      if x86_has_prefix(code, s, "\tj") && !x86_has_prefix(code, s, "\tjmp") {
+        return true;
+      }
+      return x86_has_prefix(code, s, "\tset") || x86_has_prefix(code, s, "\tcmov") || x86_has_prefix(code, s, "\tadc")
+        || x86_has_prefix(code, s, "\tsbb") || x86_has_prefix(code, s, "\tpushf") || x86_has_prefix(code, s, "\tlahf")
+        || x86_has_prefix(code, s, "\trcl") || x86_has_prefix(code, s, "\trcr");
+    }
+  }
+  return false;
+}
+
+/// A run of `cmpq $N, %reg` / `je L` pairs with one register and one target
+/// (a long `a == 3 || a == 9 || ..`, or the arms of a `match` on integers)
+/// becomes a binary search, which takes about 2 * log2(n) instructions
+/// where the chain takes 2 * n/2 on average. Only when the code after the
+/// chain does not read the flags (see x86_cc_flags_read).
+fn x86_cmp_chain(code: &Vec[u64], out: &mut Vec[u64]) {
+  let starts = x86_line_starts(code);
+  let nl = vec_len(starts);
+  let none = wrap_sub(0, 1);
+  let mut i = 0;
+  while i < nl
+    invariant i <= nl
+  {
+    let s = u_at(starts, i);
+    let e = x86_line_end(code, s);
+    let mut done = false;
+    if x86_cc_value(code, s, e) != none && i + 1 < nl && x86_has_prefix(code, u_at(starts, i + 1), "\tje ") {
+      let rs = x86_last_op(code, s, e);
+      let s1 = u_at(starts, i + 1);
+      let e1 = x86_line_end(code, s1);
+      let ts = wrap_add(s1, 4);
+      let mut vals = vec_new[u64]();
+      let mut j = i;
+      let mut more = true;
+      while more && j + 1 < nl
+        invariant j <= nl
+      {
+        let a = u_at(starts, j);
+        let ae = x86_line_end(code, a);
+        let b = u_at(starts, j + 1);
+        let be = x86_line_end(code, b);
+        let v = x86_cc_value(code, a, ae);
+        if v != none && x86_has_prefix(code, b, "\tje ") && x86_same_text(code, x86_last_op(code, a, ae), ae, rs, e)
+          && x86_same_text(code, wrap_add(b, 4), be, ts, e1)
+        {
+          vec_push(&mut vals, v);
+          j = j + 2;
+        } else {
+          more = false;
+        }
+      }
+      if vec_len(vals) >= 6 && !x86_cc_flags_read(code, starts, j) {
+        // Sorted, without repeats.
+        let mut k = 1;
+        while k < vec_len(vals)
+          invariant k >= 1 && k <= vlen(vals)
+        {
+          let x = vec_get(vals, k);
+          let mut m = k;
+          while m > 0 && vec_get(vals, m - 1) > x
+            invariant m <= k && k < vlen(vals)
+          {
+            vec_set(&mut vals, m, vec_get(vals, m - 1));
+            m = m - 1;
+          }
+          vec_set(&mut vals, m, x);
+          k = k + 1;
+        }
+        let mut arr = vec_new[u64]();
+        let mut k2 = 0;
+        while k2 < vec_len(vals)
+          invariant k2 <= vlen(vals)
+        {
+          let x = vec_get(vals, k2);
+          if vec_len(arr) == 0 || vec_get(arr, vec_len(arr) - 1) != x {
+            vec_push(&mut arr, x);
+          }
+          k2 = k2 + 1;
+        }
+        let n = vec_len(arr);
+        // A node is the range [lo, hi) of the sorted values; the right half
+        // follows its parent, the left half waits on a stack.
+        let mut st = vec_new[u64]();
+        vec_push(&mut st, 0);
+        vec_push(&mut st, n);
+        while vec_len(st) >= 2
+          invariant vlen(st) >= 0
+        {
+          let hi0 = vec_pop(&mut st);
+          let mut lo = vec_pop(&mut st);
+          let hi = hi0;
+          if lo > hi {
+            lo = hi;
+          }
+          if lo != 0 || hi != n {
+            x86_cc_label(&mut out, code, ts, e1, i, lo, hi);
+            w_s(&mut out, ":\n");
+          }
+          while lo < hi && hi <= n
+            invariant lo <= hi
+          {
+            let m = lo + (hi - lo) / 2;
+            w_s(&mut out, "\tcmpq $");
+            w_num(&mut out, vec_get(arr, m));
+            w_s(&mut out, ", ");
+            x86_copy_text(code, rs, e, &mut out);
+            w_s(&mut out, "\n\tje ");
+            x86_copy_text(code, ts, e1, &mut out);
+            w_s(&mut out, "\n");
+            if lo < m {
+              w_s(&mut out, "\tjb ");
+              x86_cc_label(&mut out, code, ts, e1, i, lo, m);
+              w_s(&mut out, "\n");
+              vec_push(&mut st, lo);
+              vec_push(&mut st, m);
+            }
+            lo = m + 1;
+          }
+          w_s(&mut out, "\tjmp ");
+          x86_cc_label(&mut out, code, ts, e1, i, 0, 0);
+          w_s(&mut out, "_n\n");
+        }
+        x86_cc_label(&mut out, code, ts, e1, i, 0, 0);
+        w_s(&mut out, "_n:\n");
+        vec_free(st);
+        vec_free(arr);
+        i = j;
+        done = true;
+      }
+      vec_free(vals);
+    }
+    if !done {
+      x86_copy_text(code, s, e, &mut out);
+      w_s(&mut out, "\n");
+      i = i + 1;
+    }
+  }
+  vec_free(starts);
 }
 
 /// The end of the line starting at `s` (its newline, or the end).
