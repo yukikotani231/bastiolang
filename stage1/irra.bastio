@@ -448,8 +448,16 @@ fn ra_depths(f: &IrFn) -> Vec[u64] {
   return depth;
 }
 
+/// Number of instructions an interval spans.
+fn ra_len(iv: &IrIntervals, v: u64) -> u64 {
+  let l = wrap_add(wrap_sub(u_at(iv.hi, v), u_at(iv.lo, v)), 1);
+  if l > 16 { return 16; }
+  return l;
+}
+
 /// What it costs to keep each register in the frame: its reads and writes,
 /// each counted 8 times more for every loop around it.
+
 fn ra_costs(f: &IrFn, depth: &Vec[u64]) -> Vec[u64] {
   let mut cost = vec_new[u64]();
   let mut r = 0;
@@ -653,14 +661,17 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
       let cv = u_at(cost, v);
       let mut best = IR_NONE;
       let mut best_cost = cv;
+      let mut best_len = wrap_add(wrap_sub(hi, lo), 1);
+      if best_len > 16 { best_len = 16; }
       let mut best_callee = true;
       let mut best_m = 0;
       let mut m = 0;
       while m < vec_len(occ_callee) {
         let o2 = u_at(occ_callee, m);
-        if o2 != IR_NONE && u_at(cost, o2) < best_cost && u_at(iv.hi, o2) > lo {
+        if o2 != IR_NONE && wrap_mul(u_at(cost, o2), best_len) < wrap_mul(best_cost, ra_len(iv, o2)) && u_at(iv.hi, o2) > lo {
           best = o2;
           best_cost = u_at(cost, o2);
+          best_len = ra_len(iv, o2);
           best_callee = true;
           best_m = m;
         }
@@ -670,9 +681,10 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
         m = 0;
         while m < vec_len(occ_caller) {
           let o2 = u_at(occ_caller, m);
-          if o2 != IR_NONE && u_at(cost, o2) < best_cost && u_at(iv.hi, o2) > lo {
+          if o2 != IR_NONE && wrap_mul(u_at(cost, o2), best_len) < wrap_mul(best_cost, ra_len(iv, o2)) && u_at(iv.hi, o2) > lo {
             best = o2;
             best_cost = u_at(cost, o2);
+            best_len = ra_len(iv, o2);
             best_callee = false;
             best_m = m;
           }
