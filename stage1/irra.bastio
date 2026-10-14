@@ -499,6 +499,22 @@ fn ra_alloc_const(f: &IrFn, ncallee: u64, ncaller: u64) -> IrAlloc {
   return ra_alloc_with(f, ncallee, ncaller, true);
 }
 
+/// The frame slot for `x`, which stays in the frame: the slot of `u` when
+/// `x = mov u` is the last use of `u`, which `ra_alloc_with` has put in the
+/// frame, else a new one.
+fn ra_spill_slot(f: &IrFn, iv: &IrIntervals, al: &mut IrAlloc, x: u64, share: bool) -> u64 {
+  let lo = u_at(iv.lo, x);
+  if share && lo > 0 && lo < vec_len(f.ins) {
+    let q = vec_get(f.ins, lo);
+    if q.op == IR_MOV && q.d == x && q.a != x && q.a < vec_len(al.cls) && u_at(iv.hi, q.a) <= lo && u_at(al.cst, q.a) == 0 && u_at(al.cls, q.a) == RA_SPILL {
+      return u_at(al.idx, q.a);
+    }
+  }
+  let s = al.nspill;
+  al.nspill = wrap_add(al.nspill, 1);
+  return s;
+}
+
 fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc {
   let bl = ra_blocks(f);
   let lv = ra_live(f, bl);
@@ -624,7 +640,30 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
     }
     // Registers whose interval ended before this one starts are free.
     let mut placed = false;
-    if !crosses {
+    // `v = mov u` where `u` dies there: `v` takes the place of `u`, and the
+    // emitter drops the move.
+    if touch && lo > 0 && lo < n {
+      let q0 = vec_get(f.ins, lo);
+      if q0.op == IR_MOV && q0.d == v && q0.a != v && q0.a < nr && u_at(iv.hi, q0.a) <= lo && u_at(al.cst, q0.a) == 0 {
+        let u = q0.a;
+        let cu = u_at(al.cls, u);
+        let iu = u_at(al.idx, u);
+        if cu == RA_CALLER && !crosses && iu < vec_len(busy_caller) && vec_get(busy_caller, iu) <= lo + 1 {
+          vec_set(&mut busy_caller, iu, wrap_add(hi, 1));
+          ra_set(&mut occ_caller, iu, v);
+          ra_set(&mut al.cls, v, RA_CALLER);
+          ra_set(&mut al.idx, v, iu);
+          placed = true;
+        } else if cu == RA_CALLEE && iu < vec_len(busy_callee) && vec_get(busy_callee, iu) <= lo + 1 {
+          vec_set(&mut busy_callee, iu, wrap_add(hi, 1));
+          ra_set(&mut occ_callee, iu, v);
+          ra_set(&mut al.cls, v, RA_CALLEE);
+          ra_set(&mut al.idx, v, iu);
+          placed = true;
+        }
+      }
+    }
+    if !crosses && !placed {
       let mut m = 0;
       while m < vec_len(busy_caller) && !placed {
         let until = vec_get(busy_caller, m);
@@ -692,9 +731,9 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
         }
       }
       if best != IR_NONE {
+        let slot = ra_spill_slot(f, iv, &mut al, best, touch);
         ra_set(&mut al.cls, best, RA_SPILL);
-        ra_set(&mut al.idx, best, al.nspill);
-        al.nspill = wrap_add(al.nspill, 1);
+        ra_set(&mut al.idx, best, slot);
         if best_callee {
           ra_set(&mut busy_callee, best_m, wrap_add(hi, 1));
           ra_set(&mut occ_callee, best_m, v);
@@ -709,9 +748,9 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
       }
     }
     if !placed {
+      let slot = ra_spill_slot(f, iv, &mut al, v, touch);
       ra_set(&mut al.cls, v, RA_SPILL);
-      ra_set(&mut al.idx, v, al.nspill);
-      al.nspill = wrap_add(al.nspill, 1);
+      ra_set(&mut al.idx, v, slot);
     }
     o = o + 1;
   }
