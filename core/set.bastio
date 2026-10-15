@@ -1,0 +1,99 @@
+// core/set.bastio: a set of `u64`, built on core/hashmap.bastio.
+//
+// What is proved is what the map proves: every index is in bounds, nothing
+// overflows, `set_len` is the number of members, and after `set_insert` the
+// set holds the element. A `set_contains` that says yes is a real member.
+// Not proved: that it says yes for every member (see core/hashmap.bastio).
+import "hashmap.bastio";
+
+/// Members are the keys of a map whose values carry no information.
+struct HashSet { m: HashMap[u8] }
+
+/// The set is well formed (what every function needs and keeps).
+spec fn set_ok(s: &HashSet) -> bool {
+  hmap_ok[u8](s.m)
+}
+
+/// `x` is a member.
+spec fn set_has(s: &HashSet, x: u64) -> bool {
+  hmap_has[u8](s.m, x)
+}
+
+/// An empty set.
+/// ```
+/// let mut s = set_new();
+/// assert s.m.len == 0;
+/// let fresh = set_insert(&mut s, 7);
+/// let again = set_insert(&mut s, 7);
+/// let ok = fresh && !again && set_len(s) == 1 && set_contains(s, 7) && !set_contains(s, 8);
+/// set_free(s);
+/// if !ok { return 1; }
+/// ```
+fn set_new() -> HashSet
+  ensures set_ok(result) && result.m.len == 0
+{
+  return HashSet { m: hmap_new[u8]() };
+}
+
+/// The number of members.
+fn set_len(s: &HashSet) -> u64
+  requires set_ok(s)
+  ensures result == s.m.len
+{
+  return hmap_len[u8](s.m);
+}
+
+/// `x` is a member.
+fn set_contains(s: &HashSet, x: u64) -> bool
+  requires set_ok(s)
+  ensures result ==> set_has(s, x)
+{
+  return hmap_contains[u8](s.m, x);
+}
+
+/// Adds `x`. Returns true if it was not a member before.
+fn set_insert(s: &mut HashSet, x: u64) -> bool
+  requires set_ok(s)
+  ensures set_ok(s) && set_has(s, x)
+{
+  match hmap_insert[u8](&mut s.m, x, 1) {
+    Option::Some(prev) => { return false; },
+    Option::None => { return true; },
+  }
+}
+
+/// Removes `x`. Returns true if it was a member.
+/// ```
+/// let mut s = set_new();
+/// let a = set_insert(&mut s, 1);
+/// let b = set_insert(&mut s, 2);
+/// let had = set_remove(&mut s, 1);
+/// let hadnt = set_remove(&mut s, 9);
+/// let items = set_items(s);
+/// let ok = a && b && had && !hadnt && set_len(s) == 1 && vec_len(items) == 1 && vec_get(items, 0) == 2;
+/// vec_free(items);
+/// set_free(s);
+/// if !ok { return 1; }
+/// ```
+fn set_remove(s: &mut HashSet, x: u64) -> bool
+  requires set_ok(s)
+  ensures set_ok(s)
+{
+  match hmap_remove[u8](&mut s.m, x) {
+    Option::Some(prev) => { return true; },
+    Option::None => { return false; },
+  }
+}
+
+/// The members, in no particular order.
+fn set_items(s: &HashSet) -> Vec[u64]
+  requires set_ok(s)
+  ensures forall j: u64 :: j < vlen(result) ==> set_has(s, vget(result, j))
+{
+  return hmap_keys[u8](s.m);
+}
+
+/// Frees the set.
+fn set_free(s: HashSet) {
+  hmap_free[u8](s.m);
+}

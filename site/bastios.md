@@ -4,12 +4,16 @@
 written in Bastio. It is the language's main user and the reason most of the
 kernel features in the [language reference](language.md) exist.
 
-It boots under QEMU, from a bootable ISO under BIOS or UEFI, and runs a shell
-on the serial console. User programs run in ring 3 in their own address spaces,
-on every processor. It has a file system on a virtio or ATA disk that survives
-power cuts, virtio-net and e1000 network drivers with IPv4, UDP, TCP and DHCP,
-and a Linux system call layer that runs static musl programs, BusyBox `ash`
-among them, unmodified.
+It boots under QEMU, from a bootable ISO or USB image under BIOS or UEFI, and
+runs a shell on the serial line or the screen. User programs run in ring 3 in
+their own address spaces, on every processor. Its disk file system survives
+power cuts; drivers cover USB sticks, NVMe, virtio, SATA and ATA disks and
+virtio, Intel, Realtek and AWS network cards, under a TCP/IP stack with IPv4,
+IPv6, DHCP and DNS. A Linux system call layer runs unmodified Linux programs:
+BusyBox, Alpine Linux's binaries and `apk`, Python, Node.js, Go, gcc, Neovim,
+`gdb`, and the container runtimes `runc` and `crun`. It also builds for
+AArch64 and boots on QEMU's `virt` machine. It is experimental and has only
+run in QEMU so far.
 
 None of its Bastio code has runtime checks. Bounds, overflow, page ownership,
 page-table structure, exclusive device access and lock order are proved when
