@@ -28,35 +28,63 @@ Formatting cannot change a program. `bastiofmt` lexes its own output and compare
 
 `tests/tools.sh` formats every Bastio source in the repository twice and checks that the second pass changes nothing, and that the sources in `tools/` are themselves formatted.
 
-### In Neovim
+### In Neovim and Vim
 
-`bastiofmt -` reads standard input, so it works as a filter. With the tree-sitter grammar from [`editors/`](../editors/README.md) installed:
+`bastiofmt -` reads standard input, so it works as a filter. The files in [`editors/vim/`](../editors/vim/README.md) set it as `formatprg` (`gq`), and with the language server below, `vim.lsp.buf.format()` does the same through the server. With [conform.nvim](https://github.com/stevearc/conform.nvim): `formatters = { bastiofmt = { command = "bastiofmt", args = { "-" } } }` and `formatters_by_ft = { bastio = { "bastiofmt" } }`.
+
+A file that does not lex makes `bastiofmt -` fail with no output and a message on standard error, and the editor keeps the buffer.
+
+## bastio-lsp, the language server
+
+```sh
+bastioc1 -o bastio-lsp tools/bastio-lsp/lsp.bastio
+```
+
+A [Language Server Protocol](https://microsoft.github.io/language-server-protocol/) server over standard input and output, written in Bastio, so it is proved memory safe like the compiler. What it does:
+
+| Feature | How |
+| --- | --- |
+| Diagnostics | The lexical error of the buffer as you type. When a file is opened or saved, the first error of `bastioc1 --check`: syntax, types, linearity and failed proofs, with the counterexample, at the position and width the compiler gives. A library file (no `main`) is checked through a program that only imports it |
+| Go to definition | Functions, `spec fn`s, structs, enums, constants, variants (`E::V`), fields (`x.f`), and local variables (`let`, parameters, `match` bindings, `forall` variables), in the file and in every file it imports (found as the compiler finds them, with `--lib` directories and `BASTIO_LIB`) |
+| Hover | The signature (the whole definition for a type) and the `///` doc comment above it; for a local variable, its `let` or parameter |
+| Document symbols | Top-level definitions, with variants and fields as children |
+| Formatting | The whole document, with `bastiofmt`'s rules |
+
+Definitions are found from tokens, not from a syntax tree, so they work while a file is half typed; the cost is that scopes are approximate (a local is the nearest declaration before the use in the same function) and a name that two files define is resolved to the one in the current file first. Types are not inferred, so hover on `p.a` finds a field by name, not by the type of `p`. Diagnostics from the compiler show only its first error, because the compiler stops there.
+
+Options go in `initializationOptions`: `bastioc` (the compiler: default `$BASTIOC`, else `bastioc1` on `PATH`), `target` (`hosted`, `kernel` or `user`), `lib` (a list of directories). The compiler runs on the saved file, so a buffer that differs from the file on disk is checked as saved.
+
+### Neovim
+
+Add `editors/vim` to the runtime path; it detects `*.bastio`, sets two-space indentation, adds a syntax file and starts the server:
 
 ```lua
-vim.filetype.add({ extension = { bastio = "bastio" } })
-vim.api.nvim_create_autocmd("FileType", {
-  pattern = "bastio",
-  callback = function()
-    vim.bo.formatprg = "bastiofmt -"      -- gq formats a selection or the file
-    vim.bo.shiftwidth = 2
-    vim.bo.expandtab = true
-  end,
+vim.opt.runtimepath:append('/path/to/bastiolang/editors/vim')
+require('bastio').setup({
+  cmd = { '/path/to/bastio-lsp' },
+  bastioc = '/path/to/bastioc1',
+  format_on_save = true,
 })
--- format on save; the buffer is replaced only if bastiofmt succeeds
-vim.api.nvim_create_autocmd("BufWritePre", {
-  pattern = "*.bastio",
+```
+
+Without the plugin, any client works, for example in Neovim 0.8 or later:
+
+```lua
+vim.api.nvim_create_autocmd('FileType', {
+  pattern = 'bastio',
   callback = function(args)
-    local text = table.concat(vim.api.nvim_buf_get_lines(args.buf, 0, -1, false), "\n") .. "\n"
-    local r = vim.system({ "bastiofmt", "-" }, { stdin = text }):wait()
-    if r.code == 0 and r.stdout ~= text then
-      local view = vim.fn.winsaveview()
-      vim.api.nvim_buf_set_lines(args.buf, 0, -1, false, vim.split((r.stdout:gsub("\n$", "")), "\n"))
-      vim.fn.winrestview(view)
-    end
+    vim.lsp.start({
+      name = 'bastio-lsp',
+      cmd = { '/path/to/bastio-lsp' },
+      root_dir = vim.fs.dirname(vim.fs.find('.git', { upward = true, path = vim.api.nvim_buf_get_name(args.buf) })[1]),
+      init_options = { bastioc = '/path/to/bastioc1' },
+    })
   end,
 })
 ```
 
-With [conform.nvim](https://github.com/stevearc/conform.nvim): `formatters = { bastiofmt = { command = "bastiofmt", args = { "-" } } }` and `formatters_by_ft = { bastio = { "bastiofmt" } }`.
+Then `vim.lsp.buf.hover()`, `vim.lsp.buf.definition()` (`<C-]>` works through `tagfunc`), `vim.lsp.buf.document_symbol()` and `vim.lsp.buf.format()` are the usual Neovim calls (Neovim 0.10 maps `K` to hover by default), and the diagnostics appear as for any server.
 
-A file that does not lex makes `bastiofmt -` fail with no output and a message on standard error, and the editor keeps the buffer.
+### Tests
+
+`tests/tools.sh` runs `tools/bastio-lsp/test/lsp_test.py`, which speaks the protocol to the server (hover, definitions in the file and in an imported one, symbols, formatting, diagnostics with their ranges, malformed input), and, when `nvim` is installed, `editors/vim/test/nvim_test.lua`, which does the same from headless Neovim through the plugin.

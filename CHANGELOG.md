@@ -19,6 +19,11 @@ What will be 0.2.0.
   `--write`, `--check`, `-` for standard input). It lays a file out from its
   tokens and refuses to print anything that does not lex to the same tokens as
   its input. See [tools/README.md](tools/README.md).
+- `tools/bastio-lsp`: a language server written in Bastio. Diagnostics from
+  `bastioc1 --check` (and the lexer while typing), go to definition and hover
+  in the file and its imports, document symbols and formatting.
+- `editors/vim`: file type, syntax, indentation and a Neovim plugin that
+  starts the language server.
 
 ### Compiler
 

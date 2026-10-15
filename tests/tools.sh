@@ -8,6 +8,14 @@
 #   input (bastiofmt refuses to print anything else, exit status 3);
 # - the sources of the tools themselves are formatted (--check).
 #
+# bastio-lsp (tools/bastio-lsp), the language server:
+# - test/lsp_test.py drives it over standard input and output: hover,
+#   go to definition (in the file and in an imported one), document symbols,
+#   formatting, the compiler's diagnostics with their ranges, lexical errors as
+#   the text changes, malformed input;
+# - editors/vim/test/nvim_test.lua does the same from headless Neovim, through
+#   the plugin in editors/vim (skipped when there is no nvim).
+#
 # usage: tests/tools.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -40,5 +48,20 @@ echo "bastiofmt: $n sources formatted twice"
 
 # The tools' own sources are formatted.
 "$fmt" --check $(find tools -name '*.bastio' | sort) || bad "tools/ has sources that bastiofmt would change"
+
+"$BASTIOC" -o "$tmp/bastio-lsp" tools/bastio-lsp/lsp.bastio 2>"$tmp/err" \
+  || { cat "$tmp/err"; exit 1; }
+python3 tools/bastio-lsp/test/lsp_test.py "$tmp/bastio-lsp" "$BASTIOC" || bad "tools/bastio-lsp/test/lsp_test.py"
+echo "bastio-lsp: protocol tests done"
+
+if command -v nvim >/dev/null; then
+  BASTIO_TEST_DIR="$PWD/tools/bastio-lsp/test" BASTIO_LSP="$tmp/bastio-lsp" BASTIOC="$BASTIOC" \
+    timeout 300 nvim --headless -u NONE -i NONE --cmd "set rtp^=$PWD/editors/vim" \
+    --cmd 'filetype plugin indent on' --cmd 'syntax on' \
+    -c 'luafile editors/vim/test/nvim_test.lua' || bad "editors/vim/test/nvim_test.lua"
+  echo "bastio-lsp: Neovim test done"
+else
+  echo "bastio-lsp: Neovim test SKIPPED (no nvim)"
+fi
 
 if [ "$fail" = 0 ]; then echo "tools: ok"; else exit 1; fi
