@@ -1,6 +1,6 @@
 # Sized integers
 
-Status: implemented (all four steps of the "Implementation plan" below were done on 2026-10-10, in stage0 and stage1); ROADMAP.md v1 item 8 has the history. This page is the design; [language.md](language.md) is the reference for what the compilers accept.
+Status: implemented (all four steps of the "Implementation plan" below were done on 2026-10-10, in stage0 and stage1); ROADMAP.md v1 item 8 has the history. This page is the design; [language.md](language.md) is the reference for what the compilers accept, and [Bytes, bits and sized integers](tutorial-bits.md) is a hands-on introduction.
 
 Bastio has one integer type, `u64`, left over from v0. Anything narrower is a `u64` plus a range fact: `Bytes` elements are proved `<= 255`, `serial_write` and `frame_write8` have their own error code (`E-VERIFY-BYTE`) for "fits in a byte", and the kernel cannot express a 16-bit I/O port or a 32-bit device register at all, which is one reason the PIC, PIT and UART code still lives in C (`boot/platform.c` in BastiOS). This document adds `u8`, `u16`, `u32`, `i8`, `i16`, `i32` and `i64`, the conversions between them, and (in a later step) bitwise operators.
 
