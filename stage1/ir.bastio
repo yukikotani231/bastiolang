@@ -53,7 +53,7 @@ const IR_RET: u64 = 43;      // return a, and b if a buffer (IR_NONE: nothing); 
 const IR_CALL: u64 = 44;     // d (and ty if a buffer) = instance a called with the c registers of args[b ..] (d = IR_NONE: no result)
 const IR_UNREACH: u64 = 45;
 const IR_LOAD: u64 = 46;     // d = the c-byte element a[b] (c is 1 or 8; a the data address, b the index)
-const IR_STORE: u64 = 47;    // a[b] = d, c bytes (d is read here, not written)
+const IR_STORE: u64 = 47;    // a[b] = d, c bytes (d is read here, not written); c is 1 or 8, or 2 or 4 with b = 0 (the byte address a)
 const IR_ALLOC: u64 = 48;    // d = a new buffer's data address, n = a elements of c bytes (1 or 8); the length register is set by a separate mov
 const IR_FREE: u64 = 49;     // frees the buffer whose data address is a
 const IR_PRINT: u64 = 50;    // prints the number a
@@ -3575,6 +3575,387 @@ fn ir_fill_loop(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, w: u64) -> 
   return true;
 }
 
+// ---- Little-endian stores of the core library ----
+//
+// `store_le16`, `store_le32` and `store_le64` of core/endian.bastio put a
+// value into a Bytes one byte at a time (two, four or eight `bset`s with a
+// shift and a mask each). On a little-endian machine that is one store. A
+// function is recognised by what its body does, not by its name alone:
+// `store_le16` must be two `bset`s of the low and the high byte of its value
+// at `at` and `at + 1`, and `store_le32` / `store_le64` two calls of the
+// next narrower function for the low and the high half, at `at` and at the
+// half's width on. Anything else with these names is lowered as written.
+
+/// Is `t` the named type `w`?
+fn ir_ty_is(p: &Parser, t: u64, w: Str) -> bool {
+  let x = node_at(p.nodes, t);
+  return t != 0 && x.kind == T_NAMED && span_is(p, x.s, x.e, w);
+}
+
+/// Is `e` the variable spelled `s..en`?
+fn ir_is_var(p: &Parser, e: u64, s: u64, en: u64) -> bool {
+  let x = node_at(p.nodes, e);
+  return e != 0 && x.kind == E_VAR && same(p.src, x.s, x.e, s, en);
+}
+
+/// Is `e` `var op k` (`op` the punctuation code, `k` a literal)?
+fn ir_is_var_op_int(p: &Parser, e: u64, s: u64, en: u64, op: u64, k: u64) -> bool {
+  let x = node_at(p.nodes, e);
+  if e == 0 || x.kind != E_BIN || x.v != op {
+    return false;
+  }
+  let y = node_at(p.nodes, x.b);
+  return ir_is_var(p, x.a, s, en) && x.b != 0 && y.kind == E_INT && y.v == k;
+}
+
+/// The argument of `cast[ty](arg)` when `e` is that, else 0.
+fn ir_cast_arg(p: &Parser, e: u64, ty: Str) -> u64 {
+  let x = node_at(p.nodes, e);
+  if e == 0 || x.kind != E_TAPP || !name_is(p, x.b, "cast") || !ir_ty_is(p, x.a, ty) {
+    return 0;
+  }
+  let t = node_at(p.nodes, x.a);
+  let inner = node_at(p.nodes, x.b);
+  if t.next != 0 || inner.a == 0 || next_of(p, inner.a) != 0 {
+    return 0;
+  }
+  return inner.a;
+}
+
+/// Is `e` `&mut b` for the parameter spelled `s..en`?
+fn ir_is_mutborrow_of(p: &Parser, e: u64, s: u64, en: u64) -> bool {
+  let x = node_at(p.nodes, e);
+  if e == 0 || x.kind != E_MUTBORROW || x.a == 0 {
+    return false;
+  }
+  let seg = node_at(p.nodes, x.a);
+  return seg.next == 0 && same(p.src, seg.s, seg.e, s, en);
+}
+
+/// Is statement `st` a call of `callee` (a name) with the three arguments
+/// `&mut b`, `at + off` (`at` alone when `off` is 0) and a `cast[ty]` of
+/// `v op k`? `b`, `at` and `v` are the parameters at `q1`, `q2`, `q3`.
+fn ir_le_part(p: &Parser, st: u64, callee: Str, q1: u64, q2: u64, q3: u64, off: u64, ty: Str, op: u64, k: u64) -> bool {
+  let sn = node_at(p.nodes, st);
+  if st == 0 || sn.kind != S_EXPR || sn.a == 0 {
+    return false;
+  }
+  let call = node_at(p.nodes, sn.a);
+  if call.kind != E_CALL || !name_is(p, sn.a, callee) {
+    return false;
+  }
+  let a1 = next_of(p, call.a);
+  let a2 = next_of(p, a1);
+  if call.a == 0 || a1 == 0 || a2 == 0 || next_of(p, a2) != 0 {
+    return false;
+  }
+  let pb = node_at(p.nodes, q1);
+  let pa = node_at(p.nodes, q2);
+  let pv = node_at(p.nodes, q3);
+  if !ir_is_mutborrow_of(p, call.a, pb.s, pb.e) {
+    return false;
+  }
+  if off == 0 {
+    if !ir_is_var(p, a1, pa.s, pa.e) {
+      return false;
+    }
+  } else if !ir_is_var_op_int(p, a1, pa.s, pa.e, P_PLUS, off) {
+    return false;
+  }
+  let inner = ir_cast_arg(p, a2, ty);
+  return inner != 0 && ir_is_var_op_int(p, inner, pv.s, pv.e, op, k);
+}
+
+/// The three parameters of `dn` when it has exactly `b: &mut Bytes`, `at:
+/// u64` and `v: <vt>`, and no result: their nodes in `ps` (else it is empty).
+fn ir_le_params(p: &Parser, dn: Node, vt: Str, ps: &mut Vec[u64]) {
+  let q1 = dn.a;
+  let n1 = node_at(p.nodes, q1);
+  let q2 = n1.next;
+  let n2 = node_at(p.nodes, q2);
+  let q3 = n2.next;
+  let n3 = node_at(p.nodes, q3);
+  if q1 == 0 || q2 == 0 || q3 == 0 || n3.next != 0 || dn.v != 0 {
+    return;
+  }
+  let t1 = node_at(p.nodes, n1.a);
+  if n1.a == 0 || t1.kind != T_MUTREF || !ir_ty_is(p, t1.a, "Bytes") {
+    return;
+  }
+  if !ir_ty_is(p, n2.a, "u64") || !ir_ty_is(p, n3.a, vt) {
+    return;
+  }
+  let rt = node_at(p.nodes, dn.b);
+  if dn.b != 0 && rt.kind != T_UNIT {
+    return;
+  }
+  vec_push(&mut ps, q1);
+  vec_push(&mut ps, q2);
+  vec_push(&mut ps, q3);
+}
+
+/// 2, 4 or 8 when `dn` is `store_le16`, `store_le32` or `store_le64` as
+/// core/endian.bastio writes them (see above), else 0. `half` is what the
+/// function it calls is (`ir_le_store_size` of that definition).
+fn ir_le_store_shape(p: &Parser, dn: Node, half: u64) -> u64 {
+  let mut ps = vec_new[u64]();
+  let mut r = 0;
+  let mut w = 2;
+  let mut vt = "u16";
+  let mut callee = "bset";
+  let mut cty = "u8";
+  if half == 2 {
+    w = 4;
+    vt = "u32";
+    callee = "store_le16";
+    cty = "u16";
+  } else if half == 4 {
+    w = 8;
+    vt = "u64";
+    callee = "store_le32";
+    cty = "u32";
+  }
+  if (w == 2 && half == 0) || (w != 2 && half == w / 2) {
+    ir_le_params(p, dn, vt, &mut ps);
+  }
+  if vec_len(ps) == 3 {
+    let s1 = dn.x;
+    let n1 = node_at(p.nodes, s1);
+    let s2 = n1.next;
+    let n2 = node_at(p.nodes, s2);
+    let bits = w * 4;                 // the half's width in bits
+    if s1 != 0 && s2 != 0 && n2.next == 0 {
+      let q1 = vec_get(ps, 0);
+      let q2 = vec_get(ps, 1);
+      let q3 = vec_get(ps, 2);
+      if w == 2 {
+        if ir_le_part(p, s1, callee, q1, q2, q3, 0, cty, P_AMP, 255) && ir_le_part(p, s2, callee, q1, q2, q3, 1, cty, P_SHR, 8) {
+          r = w;
+        }
+      } else {
+        let mut lim = 65535;
+        if w == 8 {
+          lim = 4294967295;
+        }
+        if ir_le_part(p, s1, callee, q1, q2, q3, 0, cty, P_AMP, lim) && ir_le_part(p, s2, callee, q1, q2, q3, w / 2, cty, P_SHR, bits) {
+          r = w;
+        }
+      }
+    }
+  }
+  vec_free(ps);
+  return r;
+}
+
+/// The definition of the function the first statement of `d` calls, or 0.
+fn ir_le_callee(p: &Parser, d: u64) -> u64 {
+  let dn = node_at(p.nodes, d);
+  let s1 = node_at(p.nodes, dn.x);
+  if dn.x == 0 || s1.kind != S_EXPR || s1.a == 0 {
+    return 0;
+  }
+  return find_fn(p, s1.a);
+}
+
+/// 2, 4 or 8 when the function definition `d` is a recognised
+/// `store_le16`, `store_le32` or `store_le64`, else 0.
+fn ir_le_store_size(p: &Parser, d: u64) -> u64 {
+  if d == 0 {
+    return 0;
+  }
+  let dn = node_at(p.nodes, d);
+  if dn.kind != D_FN {
+    return 0;
+  }
+  if name_is(p, d, "store_le16") {
+    return ir_le_store_shape(p, dn, 0);
+  }
+  if name_is(p, d, "store_le32") {
+    let c16 = ir_le_callee(p, d);
+    if c16 != 0 && name_is(p, c16, "store_le16") && ir_le_store_shape(p, node_at(p.nodes, c16), 0) == 2 {
+      return ir_le_store_shape(p, dn, 2);
+    }
+    return 0;
+  }
+  if name_is(p, d, "store_le64") {
+    let c32 = ir_le_callee(p, d);
+    if c32 != 0 && name_is(p, c32, "store_le32") {
+      let c16 = ir_le_callee(p, c32);
+      if c16 != 0 && name_is(p, c16, "store_le16") && ir_le_store_shape(p, node_at(p.nodes, c16), 0) == 2 && ir_le_store_shape(p, node_at(p.nodes, c32), 2) == 4 {
+        return ir_le_store_shape(p, dn, 4);
+      }
+    }
+    return 0;
+  }
+  return 0;
+}
+
+/// Is `e` `bget(b, at + off)` (`at` alone when `off` is 0) for the
+/// parameters spelled `bs..be` and `as..ae`?
+fn ir_is_bget(p: &Parser, e: u64, bs: u64, be: u64, as_: u64, ae: u64, off: u64) -> bool {
+  let x = node_at(p.nodes, e);
+  if e == 0 || x.kind != E_CALL || !name_is(p, e, "bget") {
+    return false;
+  }
+  let a1 = next_of(p, x.a);
+  if x.a == 0 || a1 == 0 || next_of(p, a1) != 0 || !ir_is_var(p, x.a, bs, be) {
+    return false;
+  }
+  if off == 0 {
+    return ir_is_var(p, a1, as_, ae);
+  }
+  return ir_is_var_op_int(p, a1, as_, ae, P_PLUS, off);
+}
+
+/// Is `e` `cast[ty](bget(b, at + off))`?
+fn ir_is_cast_bget(p: &Parser, e: u64, ty: Str, bs: u64, be: u64, as_: u64, ae: u64, off: u64) -> bool {
+  let inner = ir_cast_arg(p, e, ty);
+  return inner != 0 && ir_is_bget(p, inner, bs, be, as_, ae, off);
+}
+
+/// Is `e` `cast[ty](callee(b, at + off))`?
+fn ir_is_cast_load(p: &Parser, e: u64, ty: Str, callee: Str, bs: u64, be: u64, as_: u64, ae: u64, off: u64) -> bool {
+  let inner = ir_cast_arg(p, e, ty);
+  let x = node_at(p.nodes, inner);
+  if inner == 0 || x.kind != E_CALL || !name_is(p, inner, callee) {
+    return false;
+  }
+  let a1 = next_of(p, x.a);
+  if x.a == 0 || a1 == 0 || next_of(p, a1) != 0 || !ir_is_var(p, x.a, bs, be) {
+    return false;
+  }
+  if off == 0 {
+    return ir_is_var(p, a1, as_, ae);
+  }
+  return ir_is_var_op_int(p, a1, as_, ae, P_PLUS, off);
+}
+
+/// Is `dn` `fn NAME(b: &Bytes, at: u64) -> <rt>`? Then its parameters are in
+/// `ps`.
+fn ir_le_load_params(p: &Parser, dn: Node, rt: Str, ps: &mut Vec[u64]) {
+  let q1 = dn.a;
+  let n1 = node_at(p.nodes, q1);
+  let q2 = n1.next;
+  let n2 = node_at(p.nodes, q2);
+  if q1 == 0 || q2 == 0 || n2.next != 0 || dn.v != 0 || n1.a == 0 {
+    return;
+  }
+  let t1 = node_at(p.nodes, n1.a);
+  if t1.kind != T_REF || !ir_ty_is(p, t1.a, "Bytes") || !ir_ty_is(p, n2.a, "u64") || !ir_ty_is(p, dn.b, rt) {
+    return;
+  }
+  vec_push(&mut ps, q1);
+  vec_push(&mut ps, q2);
+}
+
+/// 2, 4 or 8 when `dn` is `load_le16`, `load_le32` or `load_le64` as
+/// core/endian.bastio writes them: the low and the high half added, the high
+/// one shifted up (`half` is what the function it calls is, 0 for 16).
+fn ir_le_load_shape(p: &Parser, dn: Node, half: u64) -> u64 {
+  let mut ps = vec_new[u64]();
+  let mut r = 0;
+  let mut w = 2;
+  let mut rt = "u16";
+  let mut callee = "bget";
+  if half == 2 {
+    w = 4;
+    rt = "u32";
+    callee = "load_le16";
+  } else if half == 4 {
+    w = 8;
+    rt = "u64";
+    callee = "load_le32";
+  }
+  if (w == 2 && half == 0) || (w != 2 && half == w / 2) {
+    ir_le_load_params(p, dn, rt, &mut ps);
+  }
+  if vec_len(ps) == 2 {
+    let pb = node_at(p.nodes, vec_get(ps, 0));
+    let pa = node_at(p.nodes, vec_get(ps, 1));
+    let bits = w * 4;
+    if w == 2 {
+      // return cast[u16](bget(b, at)) + (cast[u16](bget(b, at + 1)) << 8);
+      let s1 = node_at(p.nodes, dn.x);
+      let e = node_at(p.nodes, s1.a);
+      let sh = node_at(p.nodes, e.b);
+      let k = node_at(p.nodes, sh.b);
+      if dn.x != 0 && s1.kind == S_RETURN && s1.next == 0 && e.kind == E_BIN && e.v == P_PLUS && sh.kind == E_BIN && sh.v == P_SHL && k.kind == E_INT && k.v == 8 {
+        if ir_is_cast_bget(p, e.a, "u16", pb.s, pb.e, pa.s, pa.e, 0) && ir_is_cast_bget(p, sh.a, "u16", pb.s, pb.e, pa.s, pa.e, 1) {
+          r = w;
+        }
+      }
+    } else {
+      // let lo = cast[uN](load_leH(b, at)); let hi = cast[uN](load_leH(b, at + H/8));
+      // return lo + (hi << H);
+      let s1 = node_at(p.nodes, dn.x);
+      let s2i = s1.next;
+      let s2 = node_at(p.nodes, s2i);
+      let s3i = s2.next;
+      let s3 = node_at(p.nodes, s3i);
+      if dn.x != 0 && s2i != 0 && s3i != 0 && s3.next == 0 && s1.kind == S_LET && s2.kind == S_LET && s3.kind == S_RETURN {
+        let e = node_at(p.nodes, s3.a);
+        let sh = node_at(p.nodes, e.b);
+        let k = node_at(p.nodes, sh.b);
+        if e.kind == E_BIN && e.v == P_PLUS && sh.kind == E_BIN && sh.v == P_SHL && k.kind == E_INT && k.v == bits {
+          if ir_is_var(p, e.a, s1.s, s1.e) && ir_is_var(p, sh.a, s2.s, s2.e) && ir_is_cast_load(p, s1.b, rt, callee, pb.s, pb.e, pa.s, pa.e, 0) && ir_is_cast_load(p, s2.b, rt, callee, pb.s, pb.e, pa.s, pa.e, w / 2) {
+            r = w;
+          }
+        }
+      }
+    }
+  }
+  vec_free(ps);
+  return r;
+}
+
+/// 2, 4 or 8 when the function definition `d` is a recognised `load_le16`,
+/// `load_le32` or `load_le64`, else 0.
+fn ir_le_load_size(p: &Parser, d: u64) -> u64 {
+  if d == 0 {
+    return 0;
+  }
+  let dn = node_at(p.nodes, d);
+  if dn.kind != D_FN {
+    return 0;
+  }
+  if name_is(p, d, "load_le16") {
+    return ir_le_load_shape(p, dn, 0);
+  }
+  if name_is(p, d, "load_le32") {
+    let c16 = ir_le_load_callee(p, d);
+    if c16 != 0 && name_is(p, c16, "load_le16") && ir_le_load_shape(p, node_at(p.nodes, c16), 0) == 2 {
+      return ir_le_load_shape(p, dn, 2);
+    }
+    return 0;
+  }
+  if name_is(p, d, "load_le64") {
+    let c32 = ir_le_load_callee(p, d);
+    if c32 != 0 && name_is(p, c32, "load_le32") {
+      let c16 = ir_le_load_callee(p, c32);
+      if c16 != 0 && name_is(p, c16, "load_le16") && ir_le_load_shape(p, node_at(p.nodes, c16), 0) == 2 && ir_le_load_shape(p, node_at(p.nodes, c32), 2) == 4 {
+        return ir_le_load_shape(p, dn, 4);
+      }
+    }
+    return 0;
+  }
+  return 0;
+}
+
+/// The definition of the function called in the first `let` of `d`'s body.
+fn ir_le_load_callee(p: &Parser, d: u64) -> u64 {
+  let dn = node_at(p.nodes, d);
+  let s1 = node_at(p.nodes, dn.x);
+  let init = ir_cast_arg(p, s1.b, "u32");
+  let mut e = init;
+  if e == 0 {
+    e = ir_cast_arg(p, s1.b, "u64");
+  }
+  if dn.x == 0 || s1.kind != S_LET || e == 0 {
+    return 0;
+  }
+  return find_fn(p, e);
+}
+
 fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
   let n = node_at(p.nodes, i);
   f.cur = n.line;
@@ -4010,7 +4391,38 @@ fn ir_lower(c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> IrFn {
   if !f.failed && ir_kind(c, m, p, rt) == 0 && ir_ms(c, m, p, rt) == 0 && kind_t(m, rt) != TY_UNIT {
     ir_fail(&mut f, "a result that is not an integer, bool, buffer, struct or enum");
   }
-  if !f.failed {
+  let le = ir_le_store_size(p, xi.def);
+  if !f.failed && le != 0 {
+    // A little-endian store of 2, 4 or 8 bytes: one store (see above).
+    let q1 = node_at(p.nodes, dn.a);
+    let q2 = node_at(p.nodes, q1.next);
+    let q3 = node_at(p.nodes, q2.next);
+    let bv = ir_find(f, p, q1.s, q1.e);
+    let av = ir_find(f, p, q2.s, q2.e);
+    let vv = ir_find(f, p, q3.s, q3.e);
+    let da = ir_reg(&mut f);
+    ir_emit(&mut f, IR_ADD, da, bv.r0, av.r0, 0, c.tu64);
+    let z = ir_reg(&mut f);
+    ir_emit(&mut f, IR_CONST, z, 0, 0, 0, 0);
+    ir_emit(&mut f, IR_STORE, vv.r0, da, z, le, 0);
+    ir_emit(&mut f, IR_RET, IR_NONE, IR_NONE, IR_NONE, 0, 0);
+    ir_trim(&mut f);
+  } else if !f.failed && ir_le_load_size(p, xi.def) != 0 {
+    // A little-endian load of 2, 4 or 8 bytes: one load.
+    let lw = ir_le_load_size(p, xi.def);
+    let q1 = node_at(p.nodes, dn.a);
+    let q2 = node_at(p.nodes, q1.next);
+    let bv = ir_find(f, p, q1.s, q1.e);
+    let av = ir_find(f, p, q2.s, q2.e);
+    let da = ir_reg(&mut f);
+    ir_emit(&mut f, IR_ADD, da, bv.r0, av.r0, 0, c.tu64);
+    let z = ir_reg(&mut f);
+    ir_emit(&mut f, IR_CONST, z, 0, 0, 0, 0);
+    let d = ir_reg(&mut f);
+    ir_emit(&mut f, IR_LOAD, d, da, z, lw, 0);
+    ir_emit(&mut f, IR_RET, IR_NONE, d, IR_NONE, 0, 0);
+    ir_trim(&mut f);
+  } else if !f.failed {
     ir_block(&mut f, c, &mut m, p, dn.x);
     ir_give_back(&mut f);
     ir_emit(&mut f, IR_RET, IR_NONE, IR_NONE, IR_NONE, 0, 0);
