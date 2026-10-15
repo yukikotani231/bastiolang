@@ -4,7 +4,8 @@
 //   - diagnostics: the lexical error of the buffer as you type, and the
 //     first error of `bastioc1 --check` (syntax, types, linearity and the
 //     proofs, with a failed proof's counterexample) when a file is opened
-//     or saved;
+//     or saved, on the text of the buffer (with `checkOnChange`, on every
+//     edit too);
 //   - go to definition and hover for functions, `spec fn`s, structs, enums,
 //     constants, variants, fields and local variables, in the file and in
 //     the files it imports (hover shows the signature and the `///` doc
@@ -14,7 +15,8 @@
 //
 // Options (`initializationOptions`): `bastioc` (the compiler, default
 // `$BASTIOC` or `bastioc1`), `target` (`hosted`, `kernel` or `user`), `lib`
-// (a list of library directories, for imports and for the compiler).
+// (a list of library directories, for imports and for the compiler),
+// `checkOnChange` (run the compiler on every edit).
 //
 // It reads the buffer text the editor sends (full-text synchronization), and
 // everything it reports about other files comes from the files on disk, or
@@ -28,6 +30,7 @@ struct State {
   cmd: Bytes,
   target: Bytes,
   libs: Vec[Bytes],
+  on_change: bool,
   shutdown: bool
 }
 
@@ -708,14 +711,45 @@ fn wrapper_path(path: &Bytes) -> Bytes {
   return b;
 }
 
-/// Runs the compiler on `path` and appends its first error as a diagnostic.
-/// `all` is the buffer's text, which positions are in. Returns false if the
-/// compiler found nothing wrong.
+/// A file beside `path` (so that its imports resolve the same way) named
+/// after it: where the text of the buffer is written to be checked.
+fn shadow_path(path: &Bytes) -> Bytes {
+  let mut slash = 0;
+  let mut k = 0;
+  while k < blen(path)
+  {
+    if bget(path, k) == 47 {
+      slash = vadd(k, 1);
+    }
+    k = vadd(k, 1);
+  }
+  let mut v = vec_new[u64]();
+  let mut q = 0;
+  while q < slash && q < blen(path)
+  {
+    vec_push(&mut v, cast[u64](bget(path, q)));
+    q = vadd(q, 1);
+  }
+  w_s(&mut v, ".bastio-lsp-");
+  let mut r = slash;
+  while r < blen(path)
+  {
+    vec_push(&mut v, cast[u64](bget(path, r)));
+    r = vadd(r, 1);
+  }
+  let b = to_bytes(v);
+  vec_free(v);
+  return b;
+}
+
+/// Runs the compiler on the file `path` and appends its first error as a
+/// diagnostic. `all` is the buffer's text, which positions are in. Returns
+/// false if the compiler found nothing wrong.
 ///
 /// A library has no `main`, so the compiler stops at that. It is then
 /// checked through a program that only imports it, written to the
 /// temporary directory.
-fn compiler_diags(host: &mut Host, st: &mut State, path: &Bytes, all: &Bytes, out: &mut Vec[u64]) -> bool {
+fn check_diags(host: &mut Host, st: &mut State, path: &Bytes, all: &Bytes, out: &mut Vec[u64]) -> bool {
   let mut lines = vec_new[Vec[u64]]();
   let mut status = run_check(&mut host, &mut st, path, &mut lines);
   if lines_have(&mut lines, "no `main` function") {
@@ -896,6 +930,22 @@ fn compiler_diags(host: &mut Host, st: &mut State, path: &Bytes, all: &Bytes, ou
     found = true;
   }
   free_lines(lines);
+  return found;
+}
+
+/// The compiler checks what is in the buffer, not what is on disk: the text
+/// is written to a file beside `real` (`shadow_path`), checked, and removed.
+/// If that file cannot be written, `real` itself is checked.
+fn compiler_diags(host: &mut Host, st: &mut State, real: &Bytes, all: &Bytes, out: &mut Vec[u64]) -> bool {
+  let sp = shadow_path(real);
+  let mut found = false;
+  if host_write(host, sp, all) {
+    found = check_diags(&mut host, &mut st, sp, all, &mut out);
+    remove_file(&mut host, sp);
+  } else {
+    found = check_diags(&mut host, &mut st, real, all, &mut out);
+  }
+  bfree(sp);
   return found;
 }
 
@@ -1263,6 +1313,9 @@ fn on_initialize(con: &mut Serial, st: &mut State, j: &Json, root: u64, id: &Vec
     bfree(st.target);
     st.target = str_of(j, target);
   }
+  if jis_true(j, jget(j, opts, "checkOnChange")) {
+    st.on_change = true;
+  }
   let libs = jget(j, opts, "lib");
   let n = jcount(j, libs);
   let mut k = 0;
@@ -1321,7 +1374,7 @@ fn handle(con: &mut Serial, host: &mut Host, st: &mut State, msg: Bytes) -> u64 
       if n > 0 {
         let text = str_of(p.j, jget(p.j, jelem(p.j, changes, n - 1), "text"));
         set_doc(&mut st, uri, text);
-        publish(&mut con, &mut host, &mut st, uri, false);
+        publish(&mut con, &mut host, &mut st, uri, st.on_change);
       }
       bfree(uri);
     } else if vec_is(method, "textDocument/didSave") {
@@ -1365,6 +1418,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
     cmd: cmd,
     target: balloc(0),
     libs: vec_new[Bytes](),
+    on_change: false,
     shutdown: false
   };
   let mut status = 1;

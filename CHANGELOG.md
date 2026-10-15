@@ -22,6 +22,8 @@ What will be 0.2.0.
 - `tools/bastio-lsp`: a language server written in Bastio. Diagnostics from
   `bastioc1 --check` (and the lexer while typing), go to definition and hover
   in the file and its imports, document symbols and formatting.
+  The compiler checks the text of the buffer, not the saved file; with the
+  option `checkOnChange` it runs on every edit.
 - `editors/vim`: file type, syntax, indentation and a Neovim plugin that
   starts the language server.
 
