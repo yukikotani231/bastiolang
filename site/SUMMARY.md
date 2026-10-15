@@ -5,6 +5,9 @@
 # Learn
 
 - [Tutorial](tutorial.md)
+  - [Bytes, bits and sized integers](tutorial-bits.md)
+  - [Capabilities](tutorial-capabilities.md)
+- [The toolchain](toolchain.md)
 - [Common proof failures](proof-failures.md)
 - [Calling Bastio from C](c-libraries.md)
   - [base64](examples-base64.md)
@@ -42,5 +45,7 @@
 - [Roadmap](roadmap.md)
 - [Contributing](contributing.md)
 - [Bootstrapping](bootstrap.md)
+- [The trusted base](trusted-base.md)
+- [The IR](ir.md)
 - [Changelog](changelog.md)
 - [Releasing](releasing.md)
