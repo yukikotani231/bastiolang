@@ -672,6 +672,9 @@ class Fuzz:
         rnd = random.Random(seed)
         orig = rnd.choice(corpus)
         src = open(orig, "rb").read()
+        if re.search(rb'^// stage1-only:', src, re.M):
+            self.stat("stage1-only seed skipped")      # bastioc0 is meant to reject it
+            return
         m = self.mutate(rnd, src)
         try:
             text = m.decode()
