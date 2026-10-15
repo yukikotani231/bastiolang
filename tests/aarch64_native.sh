@@ -43,6 +43,21 @@ both() {
 export -f both
 lost=0
 pfor both $(s1files tests/pass/*.bastio bench/*.bastio) || lost=1
+# The compiler itself, built for AArch64 with no C compiler on its code, must
+# compile itself to the same C as the build that runs here. It needs z3 on
+# the machine (qemu-aarch64 runs it as a host program).
+if [ "${SELFHOST:-1}" = 1 ]; then
+  if ! "$BASTIOC" --arch aarch64 --backend native -o "$tmp/bastioc1.a64" stage1/bastioc1.bastio 2>"$tmp/self.err"; then
+    echo "FAIL stage1/bastioc1.bastio: AArch64 native build failed"; sed 's/^/    /' "$tmp/self.err" | head -20; lost=1
+  elif ! "$BASTIOC" --emit-c -o "$tmp/self.here.c" stage1/bastioc1.bastio 2>/dev/null \
+       || ! $RUN "$tmp/bastioc1.a64" --emit-c -o "$tmp/self.a64.c" stage1/bastioc1.bastio 2>"$tmp/self.err"; then
+    echo "FAIL the AArch64 bastioc1 did not compile itself"; sed 's/^/    /' "$tmp/self.err" | head -20; lost=1
+  elif ! cmp -s "$tmp/self.here.c" "$tmp/self.a64.c"; then
+    echo "FAIL the AArch64 bastioc1 wrote different C for itself"; lost=1
+  else
+    echo "aarch64 native: bastioc1 built for AArch64 writes the same C for itself ($(wc -l <"$tmp/self.a64.c") lines)"
+  fi
+fi
 pass=$(n pass) skip=$(n skip) fail=$(($(n fail) + lost))
 echo "aarch64 native: $pass same as the C backend, $skip skipped (not covered yet), $fail failed"
 [ $fail = 0 ]
