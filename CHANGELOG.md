@@ -21,7 +21,9 @@ What will be 0.2.0.
   `stage1/bastioc1.bastio` takes about 3.3 s with a warm cache instead of
   13.9 s; changing one function re-proves only that function. Off unless the
   variable is set; the cache is trusted like the solver (see
-  docs/trusted-base.md).
+  docs/trusted-base.md). The key is a hash of the conditions' term structure,
+  each shared term hashed once, so a warm check of the BastiOS kernel takes
+  about 14 s instead of 27 s.
 
 ### Language
 
