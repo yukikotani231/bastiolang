@@ -38,6 +38,7 @@ if command -v z3 >/dev/null; then
   step "stage1/difftest.sh"; stage1/difftest.sh
   if command -v cvc5 >/dev/null; then
     step "tests/crosscheck.py (cvc5 confirms the proofs)"; tests/crosscheck.py --selftest; tests/crosscheck.py --min-agree 90
+    CROSSCHECK_BASTIOC=$PWD/stage0/target/release/bastioc1 tests/crosscheck.py --min-agree 90 stage1/bastioc1.bastio
   else
     skipped+=("tests/crosscheck.py (no cvc5: apt install cvc5)")
   fi

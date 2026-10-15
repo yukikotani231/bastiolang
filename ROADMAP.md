@@ -52,7 +52,7 @@ What the compiler needs in order to be written in Bastio. Structs come first (re
 
 ## v2: self-hosting
 
-- [ ] bastioc1, written in Bastio, produces the same output as stage0 (differential testing)
+- [x] bastioc1, written in Bastio, produces the same output as stage0 (differential testing)
   - [x] Lexer (`stage1/lexer.bastio`, done 2026-10-10): the same tokens and lexical errors as stage0 on every source in this repository and in BastiOS (`stage1/difftest.sh`, run in CI)
   - [x] Parser (`stage1/parser.bastio`, done 2026-10-10): the same syntax tree as stage0 (`--dump-ast`) on every source, and the same first-error position on damaged copies of them (`stage1/mutate.py`)
   - [x] Checker (`stage1/loader.bastio`, `mono.bastio`, `check.bastio`, done 2026-10-10): imports, monomorphization, types and linearity, with the same result as stage0 (`--dump-mono`, `--dump-check`, including the type of every `let`) on every source and on damaged copies, library files included
@@ -165,15 +165,15 @@ The gaps this finds are filed and fixed as ordinary Linux-compatibility work und
 ## v6: containers
 
 Goal, set 2026-10-11: an unmodified OCI runtime runs container images on BastiOS. The bar is crun (then runc) running an Alpine image in its own namespaces, under cgroup limits and a seccomp filter, with `apk add` working over a bridged network. Tracked in [bastios#184](https://github.com/yukikotani231/bastios/issues/184).
-- [ ] Mount namespaces, bind mounts, mount propagation and `pivot_root` ([bastios#185](https://github.com/yukikotani231/bastios/issues/185))
-- [ ] PID, UTS and IPC namespaces, `setns` ([bastios#186](https://github.com/yukikotani231/bastios/issues/186))
-- [ ] User namespaces and uid/gid maps, for rootless containers ([bastios#187](https://github.com/yukikotani231/bastios/issues/187))
-- [ ] overlayfs ([bastios#188](https://github.com/yukikotani231/bastios/issues/188))
-- [ ] cgroup v2 with the pids, memory and cpu controllers ([bastios#189](https://github.com/yukikotani231/bastios/issues/189))
-- [ ] seccomp-BPF, with the BPF interpreter's reads proved in bounds ([bastios#190](https://github.com/yukikotani231/bastios/issues/190))
-- [ ] Network namespaces, veth pairs, a bridge and masquerade ([bastios#191](https://github.com/yukikotani231/bastios/issues/191))
-- [ ] The remaining system calls crun and runc make (`clone3`, `openat2`, the new mount API, `memfd_create` sealing) ([bastios#192](https://github.com/yukikotani231/bastios/issues/192))
-- [ ] crun runs an Alpine image, rootful and rootless, then runc and images pulled from a registry ([bastios#193](https://github.com/yukikotani231/bastios/issues/193))
+- [x] Mount namespaces, bind mounts, mount propagation and `pivot_root` ([bastios#185](https://github.com/yukikotani231/bastios/issues/185))
+- [x] PID, UTS and IPC namespaces, `setns` ([bastios#186](https://github.com/yukikotani231/bastios/issues/186))
+- [x] User namespaces and uid/gid maps, for rootless containers ([bastios#187](https://github.com/yukikotani231/bastios/issues/187))
+- [x] overlayfs ([bastios#188](https://github.com/yukikotani231/bastios/issues/188))
+- [x] cgroup v2 with the pids, memory and cpu controllers ([bastios#189](https://github.com/yukikotani231/bastios/issues/189))
+- [x] seccomp-BPF, with the BPF interpreter's reads proved in bounds ([bastios#190](https://github.com/yukikotani231/bastios/issues/190))
+- [x] Network namespaces, veth pairs, a bridge and masquerade ([bastios#191](https://github.com/yukikotani231/bastios/issues/191))
+- [x] The remaining system calls crun and runc make (`clone3`, `openat2`, the new mount API, `memfd_create` sealing) ([bastios#192](https://github.com/yukikotani231/bastios/issues/192))
+- [x] crun runs an Alpine image, rootful and rootless, then runc and images pulled from a registry (checked by the `container:` cases of BastiOS's `test/compat/alpine.txt`; [bastios#193](https://github.com/yukikotani231/bastios/issues/193))
 
 As with v4, all of it is in Bastio under the same proofs. Container isolation is only as strong as the kernel under it, which is the argument for writing that kernel in a language whose memory safety is proved.
 

@@ -37,11 +37,11 @@ def parse(out):
     return msgs
 
 
-def session(steps, raw=None):
+def session(steps, raw=None, opts=None):
     """Runs the requests in `steps` (a list of (method, params, is_request));
     returns the responses by id, the notifications and the exit status."""
     msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize",
-             "params": {"initializationOptions": {"bastioc": BASTIOC}}}]
+             "params": {"initializationOptions": dict({"bastioc": BASTIOC}, **(opts or {}))}}]
     for k, (method, params, req) in enumerate(steps):
         m = {"jsonrpc": "2.0", "method": method, "params": params}
         if req:
@@ -173,6 +173,37 @@ check(len(ds) == 3 and ds[0] == [] and ds[2] == [], "open and close publish no d
 check(len(ds[1]) == 1 and "unexpected character `#`" in ds[1][0]["message"]
       and ds[1][0]["range"]["start"] == {"line": 0, "character": broken.index("#")},
       "a lexical error while typing: %r" % ds[1])
+
+# The compiler checks the buffer, not the file on disk: this file does not
+# exist, and the text is what has the error. Nothing is left behind.
+ghost = "ghost.bastio"
+fresh = "fn main() -> u64 {\n  return true;\n}\n"
+resp, notes, rc = session([("textDocument/didOpen", {"textDocument": {"uri": uri(ghost), "text": fresh}}, False)])
+d = notes[0]["params"]["diagnostics"]
+check(len(d) == 1 and d[0]["code"] == "E-TYPE" and d[0]["range"]["start"] == {"line": 1, "character": 2},
+      "the buffer of a file that is not on disk is checked: %r" % d)
+check(sorted(f for f in os.listdir(HERE) if f.startswith(".")) == [], "the checked copy of the buffer is removed")
+
+# A buffer that differs from the saved file: the file is fine, the text is not.
+resp, notes, rc = session([open_doc("main.bastio"),
+    ("textDocument/didSave", {"textDocument": {"uri": uri("main.bastio")}}, False)])
+check(all(n["params"]["diagnostics"] == [] for n in notes), "a file that is fine has no diagnostics")
+edited = text("main.bastio").replace("return 2;", "return true;")
+resp, notes, rc = session([
+    ("textDocument/didOpen", {"textDocument": {"uri": uri("main.bastio"), "text": edited}}, False)])
+d = notes[0]["params"]["diagnostics"]
+check(len(d) == 1 and d[0]["code"] == "E-TYPE", "an unsaved change is checked when the document is opened: %r" % d)
+
+# checkOnChange: the compiler also runs as the text changes.
+change = ("textDocument/didChange", {"textDocument": {"uri": uri("main.bastio")},
+                                     "contentChanges": [{"text": edited}]}, False)
+resp, notes, rc = session([open_doc("main.bastio"), change], opts={"checkOnChange": True})
+ds = [n["params"]["diagnostics"] for n in notes]
+check(len(ds) == 2 and ds[0] == [] and len(ds[1]) == 1 and ds[1][0]["code"] == "E-TYPE",
+      "with checkOnChange an edit is checked at once: %r" % ds)
+resp, notes, rc = session([open_doc("main.bastio"), change])
+ds = [n["params"]["diagnostics"] for n in notes]
+check(len(ds) == 2 and ds[1] == [], "without it an edit only gets the lexer's diagnostics: %r" % ds)
 
 # ---- Formatting ----
 messy = "fn main()->u64{\nreturn   1 ;\n}\n"

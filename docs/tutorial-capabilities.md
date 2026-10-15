@@ -239,4 +239,4 @@ The boot code that calls `main` (a few hundred lines of assembly and C) is the o
 - Ghost state in a capability (which pages the pool holds, which ports are free, how many registers a claim covers) is what the proofs are about, and it costs nothing at run time.
 - Devices are modelled only as far as their addresses go. The proofs say a driver stays in its own ports, registers and pages; they do not say the device behaves.
 
-Where next: the [toolchain page](toolchain.md) explains the targets and backends, and the [concurrency chapter](concurrency.md) shows how locks, atomics and interrupts extend the same ideas to several processors.
+Where next: the [toolchain page](toolchain.md) explains the targets and backends, and [part 4](tutorial-shared.md) shows how locks, atomics and interrupts extend the same ideas to several processors.
