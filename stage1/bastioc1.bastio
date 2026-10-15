@@ -77,6 +77,47 @@ fn loaded_at(ld: &Loader, k: u64) -> Loaded {
 
 /// The error at `file:line:col` with code `code`, as bastioc0 renders it
 /// (diag.rs), followed by the notes in `notes`.
+/// Renders the parse errors after the first one, each after a blank line.
+fn b1_render_more(out: &mut Vec[u64], p: &mut Parser, ld: &Loader) {
+  let mut at = p.xoff;
+  while vec_len(p.extra) >= 5 && at <= vec_len(p.extra) - 5 {
+    // (a chunk is at least five words)
+    let file = vec_get(p.extra, at);
+    let line = vec_get(p.extra, at + 1);
+    let col = vec_get(p.extra, at + 2);
+    let mut msg = vec_new[u64]();
+    let mut notes = vec_new[u64]();
+    let ml = vec_get(p.extra, at + 3);
+    let mut k = at + 4;
+    let mut j = 0;
+    while j < ml && k < vec_len(p.extra)
+      invariant k <= vlen(p.extra)
+    {
+      vec_push(&mut msg, vec_get(p.extra, k));
+      k = k + 1;
+      j = j + 1;
+    }
+    let mut nl = 0;
+    if k < vec_len(p.extra) {
+      nl = vec_get(p.extra, k);
+      k = k + 1;
+    }
+    j = 0;
+    while j < nl && k < vec_len(p.extra)
+      invariant k <= vlen(p.extra)
+    {
+      vec_push(&mut notes, vec_get(p.extra, k));
+      k = k + 1;
+      j = j + 1;
+    }
+    w_s(&mut out, "\n");
+    b1_render(&mut out, p, ld, file, line, col, "E-PARSE", msg, notes);
+    vec_free(msg);
+    vec_free(notes);
+    at = k;
+  }
+}
+
 fn b1_render(out: &mut Vec[u64], p: &Parser, ld: &Loader, file: u64, line: u64, col: u64, code: Str, msg: &Vec[u64], notes: &Vec[u64]) {
   let f = loaded_at(ld, file);
   let mut k = f.raw;
@@ -655,6 +696,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
         b1_render(&mut out, p, ld, p.efile, p.eline, p.ecol, "E-IMPORT", p.emsg, none);
       } else {
         b1_render(&mut out, p, ld, p.efile, p.eline, p.ecol, "E-PARSE", p.emsg, p.enotes);
+        b1_render_more(&mut out, &mut p, ld);
       }
       status = 1;
     }

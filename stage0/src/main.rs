@@ -76,6 +76,8 @@ struct Loader {
     consts: HashMap<String, u128>,
     /// The `--lib` directories, in command-line order.
     libs: Vec<String>,
+    /// The parse errors after the first one, when a file has several.
+    more: Vec<diag::Diag>,
 }
 
 /// `path` with empty and `.` parts dropped and `..` taken back where it can
@@ -201,7 +203,13 @@ impl Loader {
         }
         let consts = std::mem::take(&mut self.consts);
         let mut parser = parser::Parser::new(toks[i..].to_vec(), dir, consts);
-        let part = parser.program().map_err(Some)?;
+        let part = match parser.program() {
+            Ok(part) => part,
+            Err(d) => {
+                self.more = parser.more;
+                return Err(Some(d));
+            }
+        };
         self.consts = parser.consts;
         self.prog.fns.extend(part.fns);
         self.prog.specs.extend(part.specs);
@@ -388,13 +396,19 @@ fn main() {
         prog: ast::Program { fns: Vec::new(), specs: Vec::new(), structs: Vec::new(), enums: Vec::new() },
         consts: HashMap::new(),
         libs,
+        more: Vec::new(),
     };
     let short = |d: &diag::Diag| println!("error {}:{}:{} {}", d.pos.file, d.pos.line, d.pos.col, d.code);
     for input in &inputs {
         if let Err(d) = ld.load(Path::new(input), None) {
             match d {
                 Some(d) if dump_mono || dump_check || dump_verify || dump_c => short(&d),
-                Some(d) => eprint!("{}", d.render(&ld.files)),
+                Some(d) => {
+                    eprint!("{}", d.render(&ld.files));
+                    for d in &ld.more {
+                        eprint!("\n{}", d.render(&ld.files));
+                    }
+                }
                 None => {}
             }
             exit(if ld.files.is_empty() { 2 } else { 1 });

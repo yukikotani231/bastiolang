@@ -108,6 +108,12 @@ struct Parser {
   emsg: Vec[u64],
   /// The hint lines under the error, each "  = ...\n".
   enotes: Vec[u64],
+  /// The errors after the first one, as chunks `file, line, col, msg length,
+  /// msg bytes, notes length, notes bytes`; `xoff` is where the unread ones
+  /// start, and `nerr` counts the errors found so far.
+  extra: Vec[u64],
+  xoff: u64,
+  nerr: u64,
   // The definitions of every file parsed so far, one list per kind.
   structs: List,
   enums: List,
@@ -127,7 +133,7 @@ fn parser_new(src: Bytes, toks: Vec[Tok], i: u64) -> Parser {
   vec_push(&mut nodes, Node { kind: 0, line: 0, col: 0, s: 0, e: 0, s2: 0, e2: 0, v: 0, a: 0, b: 0, c: 0, d: 0, x: 0, next: 0, file: 0 });
   return Parser {
     src: src, toks: toks, i: i, nodes: nodes, consts: vec_new[Const](), blobs: vec_new[u64](),
-    bstart: vec_new[u64](), bdata: vec_new[u64](), file: 0, failed: false, efile: 0, eline: 0, ecol: 0, ecode: 0, emsg: vec_new[u64](), enotes: vec_new[u64](),
+    bstart: vec_new[u64](), bdata: vec_new[u64](), file: 0, failed: false, efile: 0, eline: 0, ecol: 0, ecode: 0, emsg: vec_new[u64](), enotes: vec_new[u64](), extra: vec_new[u64](), xoff: 0, nerr: 0,
     structs: list_new(), enums: list_new(), specs: list_new(), fns: list_new(),
     ix_structs: ix_new(), ix_enums: ix_new(), ix_specs: ix_new(), ix_fns: ix_new(), ix_consts: ix_new()
   };
@@ -142,6 +148,7 @@ fn parser_free(p: Parser) -> Bytes {
   vec_free(p.bdata);
   vec_free(p.emsg);
   vec_free(p.enotes);
+  vec_free(p.extra);
   ix_free(p.ix_structs);
   ix_free(p.ix_enums);
   ix_free(p.ix_specs);
@@ -1948,9 +1955,105 @@ fn fn_def(p: &mut Parser) -> u64 {
 
 /// Parses definitions up to the end of the file, appending them to
 /// `structs`, `enums`, `specs` and `fns`.
+/// Does token `t` start a definition? Definitions begin at column 1.
+fn is_item_start(p: &Parser, t: Tok) -> bool {
+  if t.col != 1 {
+    return false;
+  }
+  if t.kind == K_KEYWORD {
+    return t.val == KW_FN || t.val == KW_STRUCT || t.val == KW_ENUM || t.val == KW_SPEC || t.val == KW_CONST || t.val == KW_EXPORT;
+  }
+  return t.kind == K_IDENT && tok_is(p.src, t, "opaque");
+}
+
+/// Moves the recorded error to `extra` and forgets it, so that parsing can go
+/// on with the next definition.
+fn pe_stash(p: &mut Parser) {
+  vec_push(&mut p.extra, p.efile);
+  vec_push(&mut p.extra, p.eline);
+  vec_push(&mut p.extra, p.ecol);
+  vec_push(&mut p.extra, vec_len(p.emsg));
+  let mut k = 0;
+  while k < vec_len(p.emsg)
+    invariant k <= vlen(p.emsg)
+  {
+    vec_push(&mut p.extra, vec_get(p.emsg, k));
+    k = k + 1;
+  }
+  vec_push(&mut p.extra, vec_len(p.enotes));
+  k = 0;
+  while k < vec_len(p.enotes)
+    invariant k <= vlen(p.enotes)
+  {
+    vec_push(&mut p.extra, vec_get(p.enotes, k));
+    k = k + 1;
+  }
+  while vec_len(p.emsg) > 0 {
+    vec_pop(&mut p.emsg);
+  }
+  while vec_len(p.enotes) > 0 {
+    vec_pop(&mut p.enotes);
+  }
+  if p.nerr < 1000 {
+    p.nerr = p.nerr + 1;
+  }
+  p.failed = false;
+}
+
+/// Makes the oldest stashed error the recorded one again.
+fn pe_first(p: &mut Parser) {
+  let n = vec_len(p.extra);
+  if n < 5 {
+    return;
+  }
+  p.failed = true;
+  p.efile = vec_get(p.extra, 0);
+  p.eline = vec_get(p.extra, 1);
+  p.ecol = vec_get(p.extra, 2);
+  p.xoff = pe_load(&mut p);
+}
+
+/// Copies the message and notes of the first chunk into the recorded error;
+/// returns where the next chunk starts.
+fn pe_load(p: &mut Parser) -> u64 {
+  let n = vec_len(p.extra);
+  let mut k = 3;
+  if k >= n {
+    return n;
+  }
+  let ml = vec_get(p.extra, k);
+  k = k + 1;
+  let mut j = 0;
+  while j < ml && k < n
+    invariant k <= vlen(p.extra)
+  {
+    vec_push(&mut p.emsg, vec_get(p.extra, k));
+    k = k + 1;
+    j = j + 1;
+  }
+  if k >= n {
+    return n;
+  }
+  let nl = vec_get(p.extra, k);
+  k = k + 1;
+  j = 0;
+  while j < nl && k < n
+    invariant k <= vlen(p.extra)
+  {
+    vec_push(&mut p.enotes, vec_get(p.extra, k));
+    k = k + 1;
+    j = j + 1;
+  }
+  return k;
+}
+
+/// The definitions are parsed one by one; an error skips to the next
+/// definition (the next keyword at column 1) so that more than one can be
+/// reported. At most ten are.
 fn program(p: &mut Parser) {
   let mut t = peek(p);
-  while !p.failed && t.kind != K_EOF {
+  while t.kind != K_EOF && p.nerr < 10 {
+    let start = p.i;
     if is_kw(t, KW_SPEC) {
       let k = spec_def(&mut p, false);
       append_def(&mut p, DEF_SPEC, k);
@@ -1973,6 +2076,18 @@ fn program(p: &mut Parser) {
       let k = fn_def(&mut p);
       append_def(&mut p, DEF_FN, k);
     }
+    if p.failed {
+      pe_stash(&mut p);
+      if p.i == start {
+        bump(&mut p);
+      }
+      let mut u = peek(p);
+      while u.kind != K_EOF && !is_item_start(p, u) {
+        bump(&mut p);
+        u = peek(p);
+      }
+    }
     t = peek(p);
   }
+  pe_first(&mut p);
 }

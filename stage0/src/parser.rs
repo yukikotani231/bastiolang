@@ -44,13 +44,15 @@ pub struct Parser {
     dir: PathBuf,
     /// Constants defined so far (in this and earlier files).
     pub consts: HashMap<String, u128>,
+    /// The errors after the first one, when `program` found more than one.
+    pub more: Vec<Diag>,
 }
 
 type PResult<T> = Result<T, Diag>;
 
 impl Parser {
     pub fn new(toks: Vec<Token>, dir: PathBuf, consts: HashMap<String, u128>) -> Parser {
-        Parser { toks, i: 0, dir, consts }
+        Parser { toks, i: 0, dir, consts, more: Vec::new() }
     }
 
     fn peek(&self) -> &Tok {
@@ -124,31 +126,66 @@ impl Parser {
         }
     }
 
+    /// Does the token here start a definition? Definitions begin at column 1.
+    fn at_item_start(&self) -> bool {
+        let t = &self.toks[self.i];
+        t.pos.col == 1
+            && match &t.tok {
+                Tok::Spec | Tok::Struct | Tok::Enum | Tok::Const | Tok::Fn | Tok::Export => true,
+                Tok::Ident(w) => w == "opaque",
+                _ => false,
+            }
+    }
+
+    /// The definitions are parsed one by one; an error skips to the next
+    /// definition (the next keyword at column 1) so that more than one can be
+    /// reported. At most ten are. The first is returned and the rest are left
+    /// in `more`.
     pub fn program(&mut self) -> PResult<Program> {
         let mut fns = Vec::new();
         let mut specs = Vec::new();
         let mut structs = Vec::new();
         let mut enums = Vec::new();
-        while *self.peek() != Tok::Eof {
-            match self.peek() {
-                Tok::Spec => specs.push(self.spec_def(false)?),
-                // `opaque` is a keyword only here, before `spec fn`.
-                Tok::Ident(w) if w == "opaque" && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::Spec) => {
+        let mut errs: Vec<Diag> = Vec::new();
+        while *self.peek() != Tok::Eof && errs.len() < 10 {
+            let start = self.i;
+            if let Err(d) = self.item(&mut fns, &mut specs, &mut structs, &mut enums) {
+                errs.push(d);
+                if self.i == start {
                     self.bump();
-                    specs.push(self.spec_def(true)?)
                 }
-                Tok::Struct => structs.push(self.struct_def()?),
-                Tok::Enum => enums.push(self.enum_def()?),
-                Tok::Const => self.const_def()?,
-                Tok::Import => return Err(Diag::new("E-PARSE", self.pos(), "`import` lines must come first in a file, before any definition")),
-                Tok::Export => {
+                while *self.peek() != Tok::Eof && !self.at_item_start() {
                     self.bump();
-                    fns.push(self.fn_def(true)?)
                 }
-                _ => fns.push(self.fn_def(false)?),
             }
         }
-        Ok(Program { fns, specs, structs, enums })
+        if errs.is_empty() {
+            return Ok(Program { fns, specs, structs, enums });
+        }
+        let first = errs.remove(0);
+        self.more = errs;
+        Err(first)
+    }
+
+    fn item(&mut self, fns: &mut Vec<FnDef>, specs: &mut Vec<SpecFn>, structs: &mut Vec<StructDef>, enums: &mut Vec<EnumDef>) -> PResult<()> {
+        match self.peek() {
+            Tok::Spec => specs.push(self.spec_def(false)?),
+            // `opaque` is a keyword only here, before `spec fn`.
+            Tok::Ident(w) if w == "opaque" && self.toks.get(self.i + 1).map(|t| &t.tok) == Some(&Tok::Spec) => {
+                self.bump();
+                specs.push(self.spec_def(true)?)
+            }
+            Tok::Struct => structs.push(self.struct_def()?),
+            Tok::Enum => enums.push(self.enum_def()?),
+            Tok::Const => self.const_def()?,
+            Tok::Import => return Err(Diag::new("E-PARSE", self.pos(), "`import` lines must come first in a file, before any definition")),
+            Tok::Export => {
+                self.bump();
+                fns.push(self.fn_def(true)?)
+            }
+            _ => fns.push(self.fn_def(false)?),
+        }
+        Ok(())
     }
 
     fn enum_def(&mut self) -> PResult<EnumDef> {
