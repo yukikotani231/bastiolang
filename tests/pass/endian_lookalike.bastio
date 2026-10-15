@@ -1,0 +1,27 @@
+// Functions with the names of the core library's little-endian stores that do
+// something else are lowered as written: a big-endian store_le16 under a
+// store_le32 of the usual shape
+// expect-exit: 0
+fn store_le16(b: &mut Bytes, at: u64, v: u16)
+  requires at + 2 <= blen(b)
+{
+  bset(&mut b, at, cast[u8](v >> 8));
+  bset(&mut b, at + 1, cast[u8](v & 255));
+}
+
+fn store_le32(b: &mut Bytes, at: u64, v: u32)
+  requires at + 4 <= blen(b)
+{
+  store_le16(&mut b, at, cast[u16](v & 65535));
+  store_le16(&mut b, at + 2, cast[u16](v >> 16));
+}
+
+fn main() -> u64 {
+  let mut b = balloc(8);
+  store_le32(&mut b, 1, 287454020);                // 0x11223344
+  // low half 0x3344 then high half 0x1122, each written big-endian
+  let ok = bget(b, 1) == 51 && bget(b, 2) == 68 && bget(b, 3) == 17 && bget(b, 4) == 34;
+  bfree(b);
+  if ok { return 0; }
+  return 1;
+}

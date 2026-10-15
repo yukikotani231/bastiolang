@@ -1,0 +1,51 @@
+// A loop that copies each byte of a range from one buffer to another, as the
+// native backends lower it (one `copy`): from the start, from the middle, an
+// empty range and a counter that is read after the loop
+// expect-exit: 0
+fn copy_from(d: &mut Bytes, s: &Bytes, from: u64, n: u64) -> u64
+  requires from <= n && n <= blen(d) && n <= blen(s)
+  ensures result == n
+{
+  let mut i = from;
+  while i < n
+    invariant i <= n && n <= blen(d) && n <= blen(s)
+  {
+    bset(&mut d, i, bget(s, i));
+    i = i + 1;
+  }
+  return i;
+}
+
+fn main() -> u64 {
+  let mut s = balloc(20);
+  let mut d = balloc(20);
+  let mut i = 0;
+  while i < 20
+    invariant i <= 20 && blen(s) == 20 && blen(d) == 20
+  {
+    bset(&mut s, i, cast[u8](i + 1));
+    bset(&mut d, i, 100);
+    i = i + 1;
+  }
+  let e0 = copy_from(&mut d, s, 2, 9);
+  let e1 = copy_from(&mut d, s, 15, 20);
+  let e2 = copy_from(&mut d, s, 12, 12);
+  let mut ok = e0 == 9 && e1 == 20 && e2 == 12;
+  i = 0;
+  while i < 20
+    invariant i <= 20 && blen(d) == 20
+  {
+    let mut want = 100;
+    if (i >= 2 && i < 9) || i >= 15 {
+      want = i + 1;
+    }
+    if cast[u64](bget(d, i)) != want {
+      ok = false;
+    }
+    i = i + 1;
+  }
+  bfree(s);
+  bfree(d);
+  if ok { return 0; }
+  return 1;
+}
