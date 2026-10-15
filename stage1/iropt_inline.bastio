@@ -26,6 +26,19 @@ const IRI_GROWN: u64 = 1500;
 /// Bodies this small are inlined whatever the size of the caller.
 const IRI_TINY: u64 = 20;
 const IRI_ROUNDS: u64 = 3;
+/// A body that only compares and branches (a predicate over constants, like
+/// `n == 3 || n == 7`) is inlined up to this size whatever the size of the
+/// caller: it is a few compares after the switch pass, and the call, the
+/// frame and the materialised `bool` cost more.
+const IRI_PRED: u64 = 120;
+/// A callee with exactly one call site in the whole program (`iri_count`) is
+/// inlined up to this size, into a caller of fewer than IRI_ONCE_CALLER
+/// instructions: the program gains the call's cost and the body is not copied
+/// to a second place. Much larger bodies made the later passes, whose cost
+/// grows faster than the size of a function, take ten times as long on the
+/// BastiOS kernel.
+const IRI_ONCE: u64 = 150;
+const IRI_ONCE_CALLER: u64 = 3000;
 /// A function inlined into itself (once, in the first round) is at most this big.
 const IRI_SELF: u64 = 80;
 
@@ -193,6 +206,49 @@ fn iri_splice(f: &mut IrFn, out: &mut Vec[IrIns], g: &IrFn, q: IrIns) {
   vec_push(&mut out, IrIns { op: IR_LABEL, d: IR_NONE, a: end, b: 0, c: 0, ty: 0 });
 }
 
+/// Fills `m.ncall` with the number of call sites of each instance, by
+/// lowering every function once (before any pass, so a body inlined
+/// elsewhere does not count twice).
+fn iri_count(c: &Checker, m: &mut Mono, p: &Parser) {
+  vec_free(m.ncall);
+  m.ncall = vec_new[u64]();
+  let mut i = 0;
+  while i < vec_len(m.insts) && i < 1000000000 {
+    vec_push(&mut m.ncall, 0);
+    i = i + 1;
+  }
+  let mut k = 0;
+  while k < vec_len(m.fns) {
+    let x = u_at(m.fns, k);
+    let g = ir_lower(c, &mut m, p, x);
+    let mut j = 0;
+    while !g.failed && j < vec_len(g.ins) {
+      let t = vec_get(g.ins, j);
+      if (t.op == IR_CALL || t.op == IR_CALLM) && t.a < vec_len(m.ncall) {
+        ra_set(&mut m.ncall, t.a, wrap_add(u_at(m.ncall, t.a), 1));
+      }
+      j = j + 1;
+    }
+    ir_free(g);
+    k = k + 1;
+  }
+}
+
+/// Does `g` only compute with registers: no call, memory access or other
+/// effect, only constants, moves, arithmetic, comparisons and branches?
+fn iri_predicate(g: &IrFn) -> bool {
+  let mut i = 0;
+  while i < vec_len(g.ins) {
+    let t = vec_get(g.ins, i);
+    let op = t.op;
+    if !(op == IR_CONST || op == IR_MOV || op == IR_LABEL || op == IR_JMP || op == IR_BR || op == IR_RET || (op >= IR_EQ && op <= IR_SGE) || op == IR_AND || op == IR_OR || op == IR_NOT) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
 /// Does the body of `g`, the instance `x`, call `x` itself?
 fn iri_recursive(g: &IrFn, x: u64) -> bool {
   let mut i = 0;
@@ -220,14 +276,21 @@ fn iri_round(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, selfok: bool, 
       // A caller that has grown past IRI_GROWN still takes the bodies of a
       // few instructions (a state getter and the like): they cost less
       // than the call.
-      let room = vec_len(out) < IRI_GROWN || vec_len(g.ins) <= IRI_TINY;
-      if room && !g.failed && vec_len(g.ins) <= IRI_LOOP && !(norec && (iri_recursive(g, q.a) || !iri_in_loop(f, i))) {
+      let once = vec_len(out) < IRI_ONCE_CALLER && q.a < vec_len(m.ncall) && u_at(m.ncall, q.a) == 1 && q.a != f.x && vec_len(g.ins) <= IRI_ONCE;
+      let room = once || vec_len(out) < IRI_GROWN || vec_len(g.ins) <= IRI_TINY || (vec_len(g.ins) <= IRI_PRED && iri_predicate(g));
+      if room && !g.failed && (once || vec_len(g.ins) <= IRI_LOOP) && !(norec && (iri_recursive(g, q.a) || !iri_in_loop(f, i))) {
         iropt_slots(&mut g);
         iropt_copies(&mut g);
         iropt_thread(&mut g);
         let mut limit = IRI_SMALL;
         if iri_in_loop(f, i) {
           limit = IRI_LOOP;
+        }
+        if limit < IRI_PRED && iri_predicate(g) {
+          limit = IRI_PRED;
+        }
+        if once {
+          limit = IRI_ONCE;
         }
         if q.a == f.x && limit > IRI_SELF {
           limit = IRI_SELF;
