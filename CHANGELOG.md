@@ -102,6 +102,17 @@ What will be 0.2.0.
 
 ### Library
 
+- Six new modules. `core/path` splits file names (`path_split`,
+  `path_ext`), joins them (`path_join`) and cleans them lexically
+  (`path_clean`); every span it returns is proved to lie inside the path.
+  `core/set` is a `HashSet` of `u64`. `core/ascii` has character classes and
+  case conversion, proved byte for byte. `core/lines` splits text into
+  lines (`\n` and `\r\n`), proved to give spans with no newline in them.
+  `core/format` pads columns, joins, replaces, quotes and prints sizes
+  (`fmt_pad_left`, `fmt_join`, `fmt_replace_all`, `fmt_quoted`, `fmt_size`).
+  `core/scan` splits at white space (`scan_words`), at a separator string
+  (`scan_split_str`) and once at a byte (`scan_split_once`, for `key=value`).
+  `std/host` gained `write_file`, `file_exists`, `env_get` and `host_args`.
 - A reference page for every library module (docs/lib/, and in the site):
   each function with its contract as the compiler checks it, what it is for,
   and an example. `tests/libref.py` generates the pages from the doc
@@ -257,6 +268,7 @@ What will be 0.2.0.
 
 ### Documentation
 
+- Releases: the release workflow also builds for AArch64 Linux (on an arm64 runner, tested there), makes the archives byte-for-byte repeatable, records build provenance attestations, and `docs/releasing.md` says how to verify a download and rebuild a release.
 - A documentation index (`docs/README.md`), linked from the README, and a README layout table that lists every document. `docs/integers.md` says the sized integers are implemented. CONTRIBUTING.md has a "Getting oriented" section.
 
 - `docs/bootstrap.md`: how stage0 builds bastioc1, how to check the
