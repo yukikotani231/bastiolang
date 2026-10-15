@@ -50,11 +50,13 @@ Example:
 let b = bfrom("pear apple fig apple");
 let words = bytes_split(b, 32);   // at each space
 let order = spans_order(b, words);
-let w0 = vec_get(words, vec_get(order, 0));
-let w3 = vec_get(words, vec_get(order, 3));
-let ok = vec_len(order) == 4
-  && bytes_span_eq_str(b, w0.start, w0.end, "apple")
-  && bytes_span_eq_str(b, w3.start, w3.end, "pear");
+let mut ok = vec_len(order) == 4;
+if ok {
+  let w0 = vec_get(words, vec_get(order, 0));
+  let w3 = vec_get(words, vec_get(order, 3));
+  ok = bytes_span_eq_str(b, w0.start, w0.end, "apple")
+    && bytes_span_eq_str(b, w3.start, w3.end, "pear");
+}
 vec_free(order);
 vec_free(words);
 bfree(b);
