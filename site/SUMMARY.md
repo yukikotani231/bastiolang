@@ -41,6 +41,7 @@
 - [BastiOS](bastios.md)
 - [Roadmap](roadmap.md)
 - [Contributing](contributing.md)
+- [How the compiler is put together](architecture.md)
 - [Bootstrapping](bootstrap.md)
 - [Changelog](changelog.md)
 - [Releasing](releasing.md)

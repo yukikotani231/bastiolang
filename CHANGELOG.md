@@ -235,6 +235,7 @@ What will be 0.2.0.
 
 ### Documentation
 
+- For contributors: `tools/setup-dev.sh` sets up a Debian or Ubuntu machine in one command (and a dev container runs it), `docs/architecture.md` maps the compiler's phases to files, and CONTRIBUTING.md explains the issue labels and where to find a first issue. A feature-request issue template and `.github/labels.yml` (synced by a workflow) were added.
 - A documentation index (`docs/README.md`), linked from the README, and a README layout table that lists every document. `docs/integers.md` says the sized integers are implemented. CONTRIBUTING.md has a "Getting oriented" section.
 
 - `docs/bootstrap.md`: how stage0 builds bastioc1, how to check the
