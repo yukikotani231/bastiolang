@@ -36,6 +36,11 @@ if command -v z3 >/dev/null; then
   step "tests/proof_cache.sh"; tests/proof_cache.sh
   step "tests/tools.sh";     tests/tools.sh
   step "stage1/difftest.sh"; stage1/difftest.sh
+  if command -v cvc5 >/dev/null; then
+    step "tests/crosscheck.py (cvc5 confirms the proofs)"; tests/crosscheck.py --selftest; tests/crosscheck.py --min-agree 90
+  else
+    skipped+=("tests/crosscheck.py (no cvc5: apt install cvc5)")
+  fi
   step "tests/fuzz.py (short run)"; tests/fuzz.py --seed 1 --count 1000
   if command -v "${AARCH64_CC:-aarch64-linux-gnu-gcc}" >/dev/null \
      && command -v qemu-system-aarch64 >/dev/null \
