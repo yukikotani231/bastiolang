@@ -78,10 +78,24 @@ fn z3_read(z: &mut Child, resp: &mut Vec[u64]) -> bool {
       }
       vec_push(&mut resp, 10);
       let r = trim(resp);
-      done = close >= open && r.e > r.s;
+      // Z3 4.8.12 answers a `get-value` it cannot finish with `((error "..")`,
+      // one parenthesis short: that line is the whole reply (as in stage0).
+      done = (close >= open && r.e > r.s) || starts_text(resp, r, "((error");
     }
   }
   bfree(line);
+  return ok;
+}
+
+/// Reads the answer to a `(get-value ..)`: `?` where Z3 gave up on it.
+fn z3_read_value(z: &mut Child, resp: &mut Vec[u64]) -> bool {
+  let ok = z3_read(&mut z, &mut resp);
+  if starts_text(resp, trim(resp), "((error") {
+    while vec_len(resp) > 0 {
+      vec_pop(&mut resp);
+    }
+    vec_push(&mut resp, 63);
+  }
   return ok;
 }
 
@@ -1261,7 +1275,7 @@ fn report_cex(v: &mut Vr, m: &Mono, p: &Parser, z: &mut Child, o: Obl, rep: &mut
     out_tm(&mut out, v, l.tm);
     w_s(&mut out, "))\n");
     z3_send(&mut z, &mut out);
-    z3_read(&mut z, &mut resp);
+    z3_read_value(&mut z, &mut resp);
     if k == 0 && o.code == VC_INV_STEP {
       w_s(&mut rep, "  = counterexample after one iteration: ");
     } else if k == 0 {
@@ -1288,7 +1302,7 @@ fn report_cex(v: &mut Vr, m: &Mono, p: &Parser, z: &mut Child, o: Obl, rep: &mut
         w_num(&mut out, j);
         w_s(&mut out, ")))\n");
         z3_send(&mut z, &mut out);
-        z3_read(&mut z, &mut resp);
+        z3_read_value(&mut z, &mut resp);
         if j > 0 {
           w_s(&mut rep, ", ");
         }
