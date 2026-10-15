@@ -97,10 +97,10 @@ fn iropt_fold(f: &mut IrFn) -> u64 {
     let q = vec_get(f.ins, i);
     let op = q.op;
     let mut folded = false;
-    if (op == IR_ADD || op == IR_SUB || op == IR_MUL || op == IR_AND || op == IR_OR || op == IR_XOR || op == IR_DIV || op == IR_REM) && q.c != 1 && q.d != IR_NONE {
+    if (op == IR_ADD || op == IR_SUB || op == IR_MUL || op == IR_AND || op == IR_OR || op == IR_XOR || op == IR_DIV || op == IR_REM || op == IR_SHL || op == IR_SHR) && q.c != 1 && q.d != IR_NONE {
       let x = iropt_cval2(cv, kr, kv, q.a);
       let y = iropt_cval2(cv, kr, kv, q.b);
-      if x != IR_NONE && y != IR_NONE && (y != 0 || (op != IR_DIV && op != IR_REM)) {
+      if x != IR_NONE && y != IR_NONE && (y != 0 || (op != IR_DIV && op != IR_REM)) && (y < 64 || (op != IR_SHL && op != IR_SHR)) {
         let mut v = 0;
         if op == IR_ADD {
           v = wrap_add(x, y);
@@ -116,6 +116,15 @@ fn iropt_fold(f: &mut IrFn) -> u64 {
           v = x ^ y;
         } else if op == IR_DIV {
           v = x / y;
+        } else if op == IR_SHL {
+          // (A shift that would lose bits is left for the program to do.)
+          if x <= (0xFFFFFFFFFFFFFFFF >> y) {
+            v = x << y;
+          } else {
+            v = IR_NONE;
+          }
+        } else if op == IR_SHR {
+          v = x >> y;
         } else {
           v = x % y;
         }
@@ -1176,7 +1185,8 @@ fn iropt_after_label(f: &IrFn, lpos: &Vec[u64], l: u64) -> u64 {
 /// between can change `r`), the outcome is already known on that edge, so
 /// the edge goes straight to T2 or F2. This is what `&&` and `||` leave
 /// behind: the result is materialised in a register, then tested again.
-/// Returns how many edges it redirected.
+/// An edge to a label whose first instruction is a `jmp` goes to the target
+/// of that `jmp`. Returns how many edges it redirected.
 fn iropt_thread(f: &mut IrFn) -> u64 {
   let n = vec_len(f.ins);
   let mut lpos = vec_new[u64]();
@@ -1208,6 +1218,10 @@ fn iropt_thread(f: &mut IrFn) -> u64 {
           if t.op == IR_BR && t.a == q.a && t.b != tt {
             tt = t.b;
             changed = wrap_add(changed, 1);
+          } else if t.op == IR_JMP && t.a != tt {
+            // A label that only jumps on: go there directly.
+            tt = t.a;
+            changed = wrap_add(changed, 1);
           }
         }
         k = k + 1;
@@ -1219,6 +1233,9 @@ fn iropt_thread(f: &mut IrFn) -> u64 {
           let t = vec_get(f.ins, p);
           if t.op == IR_BR && t.a == q.a && t.c != ff {
             ff = t.c;
+            changed = wrap_add(changed, 1);
+          } else if t.op == IR_JMP && t.a != ff {
+            ff = t.a;
             changed = wrap_add(changed, 1);
           }
         }
