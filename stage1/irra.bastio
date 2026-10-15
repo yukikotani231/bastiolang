@@ -879,6 +879,36 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
     vec_free(hm);
     hv = keep_v;
     hm = keep_m;
+    // The register may take the machine register of one whose last use is
+    // the instruction that first writes it, if that instruction does not
+    // read it too.
+    let mut tv = false;
+    if touch && lo > 0 && lo < n {
+      let qt = vec_get(f.ins, lo);
+      let mut wsv = vec_new[u64]();
+      ra_writes(qt, &mut wsv);
+      let mut rsv = vec_new[u64]();
+      ra_reads(f, qt, &mut rsv);
+      let mut iw = false;
+      let mut ir = false;
+      let mut e = 0;
+      while e < vec_len(wsv) {
+        if vec_get(wsv, e) == v {
+          iw = true;
+        }
+        e = e + 1;
+      }
+      e = 0;
+      while e < vec_len(rsv) {
+        if vec_get(rsv, e) == v {
+          ir = true;
+        }
+        e = e + 1;
+      }
+      vec_free(wsv);
+      vec_free(rsv);
+      tv = iw && !ir;
+    }
     // Which machine registers v can have, in order of preference: the one
     // of `u` in `v = mov u` where `u` dies, the caller-saved ones, the
     // callee-saved ones (not across a call: caller-saved only).
@@ -912,7 +942,7 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
           let mut clash = false;
           let mut h2 = 0;
           while h2 < vec_len(hv) && !clash {
-            if u_at(hm, h2) == m && ra_overlap(sg, v, vec_get(hv, h2), touch && lo > 0) {
+            if u_at(hm, h2) == m && ra_overlap(sg, v, vec_get(hv, h2), tv) {
               clash = true;
             }
             h2 = h2 + 1;
@@ -954,7 +984,7 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
           let mut who = IR_NONE;
           let mut h2 = 0;
           while h2 < vec_len(hv) {
-            if u_at(hm, h2) == m && ra_overlap(sg, v, vec_get(hv, h2), touch && lo > 0) {
+            if u_at(hm, h2) == m && ra_overlap(sg, v, vec_get(hv, h2), tv) {
               nclash = wrap_add(nclash, 1);
               who = vec_get(hv, h2);
             }
