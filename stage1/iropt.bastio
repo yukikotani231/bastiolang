@@ -80,6 +80,7 @@ fn iropt_fold(f: &mut IrFn) -> u64 {
   let ndef = iropt_ndef(f);
   let mut cv = iropt_consts(f, ndef);
   let mut n = 0;
+  let mut nbr = 0;
   let mut i = 0;
   while i < vec_len(f.ins) {
     let q = vec_get(f.ins, i);
@@ -179,10 +180,26 @@ fn iropt_fold(f: &mut IrFn) -> u64 {
         n = wrap_add(n, 1);
       }
     }
+    // A branch on a constant is a jump; what it skips is dropped below.
+    if q.op == IR_BR {
+      let x = iropt_cval(cv, q.a);
+      if x != IR_NONE {
+        let mut t = q.c;
+        if x != 0 {
+          t = q.b;
+        }
+        vec_set(&mut f.ins, i, IrIns { op: IR_JMP, d: q.d, a: t, b: 0, c: 0, ty: 0 });
+        nbr = wrap_add(nbr, 1);
+        n = wrap_add(n, 1);
+      }
+    }
     i = i + 1;
   }
   vec_free(ndef);
   vec_free(cv);
+  if nbr > 0 {
+    iropt_reach(&mut f);
+  }
   return n;
 }
 
