@@ -81,14 +81,25 @@ fn iropt_fold(f: &mut IrFn) -> u64 {
   let mut cv = iropt_consts(f, ndef);
   let mut n = 0;
   let mut nbr = 0;
+  // What a register holds at this point of the block, where it is written
+  // more than once (a loop counter set to 0 just before the loop's test).
+  let mut kr = vec_new[u64]();
+  let mut kv = vec_new[u64]();
   let mut i = 0;
   while i < vec_len(f.ins) {
+    let q0 = vec_get(f.ins, i);
+    if q0.op == IR_LABEL {
+      vec_free(kr);
+      vec_free(kv);
+      kr = vec_new[u64]();
+      kv = vec_new[u64]();
+    }
     let q = vec_get(f.ins, i);
     let op = q.op;
     let mut folded = false;
     if (op == IR_ADD || op == IR_SUB || op == IR_MUL || op == IR_AND || op == IR_OR || op == IR_XOR || op == IR_DIV || op == IR_REM) && q.c != 1 && q.d != IR_NONE {
-      let x = iropt_cval(cv, q.a);
-      let y = iropt_cval(cv, q.b);
+      let x = iropt_cval2(cv, kr, kv, q.a);
+      let y = iropt_cval2(cv, kr, kv, q.b);
       if x != IR_NONE && y != IR_NONE && (y != 0 || (op != IR_DIV && op != IR_REM)) {
         let mut v = 0;
         if op == IR_ADD {
@@ -122,8 +133,8 @@ fn iropt_fold(f: &mut IrFn) -> u64 {
     // operand as it was (`x + 0`, `x * 1`, `x << 0`) or give a constant
     // whatever the other operand is (`x * 0`, `x & 0`).
     if q.d != IR_NONE && q.c != 1 && !folded {
-      let x = iropt_cval(cv, q.a);
-      let y = iropt_cval(cv, q.b);
+      let x = iropt_cval2(cv, kr, kv, q.a);
+      let y = iropt_cval2(cv, kr, kv, q.b);
       let mut r = IrIns { op: 0, d: q.d, a: 0, b: 0, c: 0, ty: 0 };
       if (op >= IR_EQ && op <= IR_SGE) && x != IR_NONE && y != IR_NONE {
         let mut t = false;
@@ -182,7 +193,7 @@ fn iropt_fold(f: &mut IrFn) -> u64 {
     }
     // A branch on a constant is a jump; what it skips is dropped below.
     if q.op == IR_BR {
-      let x = iropt_cval(cv, q.a);
+      let x = iropt_cval2(cv, kr, kv, q.a);
       if x != IR_NONE {
         let mut t = q.c;
         if x != 0 {
@@ -193,14 +204,35 @@ fn iropt_fold(f: &mut IrFn) -> u64 {
         n = wrap_add(n, 1);
       }
     }
+    let cur = vec_get(f.ins, i);
+    if cur.op == IR_JMP || cur.op == IR_BR || cur.op == IR_RET {
+      vec_free(kr);
+      vec_free(kv);
+      kr = vec_new[u64]();
+      kv = vec_new[u64]();
+    } else {
+      iropt_step(&mut kr, &mut kv, cur);
+    }
     i = i + 1;
   }
+  vec_free(kr);
+  vec_free(kv);
   vec_free(ndef);
   vec_free(cv);
   if nbr > 0 {
     iropt_reach(&mut f);
   }
   return n;
+}
+
+/// The constant that register `r` holds here: its constant if it is written
+/// once, else what the block has set it to (IR_NONE: not known).
+fn iropt_cval2(cv: &Vec[u64], kr: &Vec[u64], kv: &Vec[u64], r: u64) -> u64 {
+  let x = iropt_cval(cv, r);
+  if x != IR_NONE || r == IR_NONE {
+    return x;
+  }
+  return iropt_known(kr, kv, r);
 }
 
 /// The constant that register `r` holds (IR_NONE: not known to be one).
