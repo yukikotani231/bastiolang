@@ -709,6 +709,9 @@ static void bst_print(uint64_t v) {
  * image up to bst_ram_limit, where the platform's identity map of RAM stops
  * (1 GiB, the least the boot code maps, if the platform does not define
  * it), at most 2^27 pages (512 GiB: the kernel's first top-level slot).
+ * Where the linker script names the image's start (_image_start), the runs
+ * from 1 MiB up to it are in the pool as well. The pages the information,
+ * the map and the command line sit in are left out of every run.
  * Runs that touch are merged; past BST_RUNS the rest are left out. Page ids
  * are dense over the runs (bst_page_at, bst_frame_id), so holes such as the
  * PCI one below 4 GiB have none. A map outside the first 1 GiB is not read.
@@ -716,6 +719,9 @@ static void bst_print(uint64_t v) {
  * bookkeeping: two 32-bit counters a page (leases, shared references) and
  * the arena's extension of a 16th of the pool (at least 4 MiB). */
 extern char _end[];
+/* Where the image starts, if the linker script says: the runs of RAM from
+ * 1 MiB up to it join the pool, since nothing else uses them. */
+extern char _image_start[] __attribute__((weak));
 extern uint64_t bst_kernel_pml4[512];
 extern uint64_t bst_ram_limit __attribute__((weak));
 #define BST_RUNS 32
@@ -737,6 +743,33 @@ static uint64_t bst_run_put(uint64_t *lo, uint64_t *hi, uint64_t n, uint64_t a, 
     lo[k] = a; hi[k] = b;
     return m + 1;
 }
+/* Takes [a, b) (to whole pages) out of the n runs lo/hi, splitting one if the
+ * hole is inside it (the lower part only, when the table is full). */
+static uint64_t bst_run_cut(uint64_t *lo, uint64_t *hi, uint64_t n, uint64_t a, uint64_t b) {
+    a &= ~4095ull;
+    b = (b + 4095) & ~4095ull;
+    for (uint64_t k = 0; k < n; k++) {
+        if (b <= lo[k] || hi[k] <= a) continue;
+        if (a <= lo[k] && hi[k] <= b) {
+            for (uint64_t j = k + 1; j < n; j++) { lo[j - 1] = lo[j]; hi[j - 1] = hi[j]; }
+            n--;
+            k--;
+        } else if (a <= lo[k]) {
+            lo[k] = b;
+        } else if (b >= hi[k]) {
+            hi[k] = a;
+        } else {
+            if (n < BST_RUNS) {
+                for (uint64_t j = n; j > k + 1; j--) { lo[j] = lo[j - 1]; hi[j] = hi[j - 1]; }
+                lo[k + 1] = b;
+                hi[k + 1] = hi[k];
+                n++;
+            }
+            hi[k] = a;
+        }
+    }
+    return n;
+}
 static bst_pool bst_pool_init(uint64_t mbi) {
     uint32_t *info = (uint32_t *)mbi;
     uint64_t base = ((uint64_t)_end + 4095) & ~4095ull;
@@ -748,14 +781,31 @@ static bst_pool bst_pool_init(uint64_t mbi) {
         while (e + 24 <= stop && *(uint32_t *)e >= 20) {
             uint64_t a = *(uint64_t *)(e + 4), len = *(uint64_t *)(e + 12), b = a + len;
             if (b < a) b = ~0ull;
-            if (a < base) a = base;
             if (b > limit) b = limit;
+            if (&_image_start && *(uint32_t *)(e + 20) == 1 && a < (uint64_t)_image_start) {
+                /* Below the image: from 1 MiB (the first holds the BIOS data and the
+                 * processors' start-up code) to the image. */
+                uint64_t la = a < (1ull << 20) ? (1ull << 20) : a, lb = b < (uint64_t)_image_start ? b : (uint64_t)_image_start;
+                la = (la + 4095) & ~4095ull;
+                lb &= ~4095ull;
+                if (la < lb) n = bst_run_put(lo, hi, n, la, lb);
+            }
+            if (a < base) a = base;
             if (*(uint32_t *)(e + 20) == 1 && a < b) {
                 a = (a + 4095) & ~4095ull;
                 b &= ~4095ull;
                 if (a < b) n = bst_run_put(lo, hi, n, a, b);
             }
             e += (uint64_t)*(uint32_t *)e + 4;    /* not in 32 bits: 0xFFFFFFFC + 4 would stay put */
+        }
+        /* What the loader left in RAM and the kernel reads later: the information,
+         * the map and the command line. */
+        n = bst_run_cut(lo, hi, n, mbi, mbi + 128);
+        n = bst_run_cut(lo, hi, n, info[12], (uint64_t)info[12] + info[11]);
+        if ((info[0] & 4) && info[4] && info[4] < (1ull << 30)) {
+            uint64_t cl = 0;
+            while (cl < 4096 && ((uint8_t *)(uint64_t)info[4])[cl]) cl++;
+            n = bst_run_cut(lo, hi, n, info[4], (uint64_t)info[4] + cl + 1);
         }
     } else {
         uint64_t b = 64ull << 20;
