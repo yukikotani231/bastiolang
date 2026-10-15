@@ -685,11 +685,65 @@ fn a64_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, fr: A64F, g: &mut X86, m:
     w_s(&mut out, "1:\n\tcbz x11, 2f\n\tldrb w17, [x10], #1\n\tstrb w17, [x9], #1\n\tsub x11, x11, #1\n\tb 1b\n2:\n");
   } else if op == IR_ALLOC {
     a64_mov(&mut out, a64_loc(al, fr, q.a), a64_rl(0));
-    if q.c == 1 {
+    if q.ty == 1 && q.c == 1 {
+      w_s(&mut out, "\tbl bst_rt_try_balloc\n");
+    } else if q.ty == 1 {
+      w_s(&mut out, "\tbl bst_rt_try_alloc\n");
+    } else if q.ty == 2 && q.c == 8 {
+      w_s(&mut out, "\tbl bst_rt_alloc_raw\n");
+    } else if q.c == 1 {
       w_s(&mut out, "\tbl bst_rt_balloc\n");
     } else {
       w_s(&mut out, "\tbl bst_rt_alloc\n");
     }
+    a64_finish(&mut out, al, fr, q.d, 0);
+  } else if op == IR_PUTC {
+    a64_mov(&mut out, a64_loc(al, fr, q.a), a64_rl(0));
+    w_s(&mut out, "\tbl bst_rt_putc\n");
+  } else if op == IR_GETC {
+    w_s(&mut out, "\tbl bst_rt_getc\n");
+    a64_finish(&mut out, al, fr, q.d, 0);
+  } else if op == IR_PCALL && q.c == 31 {
+    // argc
+    w_s(&mut out, "\tadrp x0, bst_rt_argc\n\tldrsw x0, [x0, :lo12:bst_rt_argc]\n");
+    a64_finish(&mut out, al, fr, q.d, 0);
+  } else if op == IR_PCALL && q.c == 5 {
+    // room for b more elements of ty words in the Vec at a
+    a64_mov(&mut out, a64_loc(al, fr, q.a), a64_rl(0));
+    a64_mov(&mut out, a64_loc(al, fr, q.b), a64_rl(1));
+    a64_movi(&mut out, 2, wrap_mul(8, q.ty));
+    w_s(&mut out, "\tbl bst_rt_vec_try_reserve\n");
+    a64_finish(&mut out, al, fr, q.d, 0);
+  } else if op == IR_PCALL {
+    // A hosted runtime routine on the four words at address a; what it leaves
+    // in x0, x1 and x2 goes back to the block's first three, and x0 is the
+    // result.
+    a64_mov(&mut out, a64_loc(al, fr, q.a), a64_rl(9));
+    w_s(&mut out, "\tstp x9, xzr, [sp, #-16]!\n\tldr x3, [x9, #24]\n\tldr x2, [x9, #16]\n\tldr x1, [x9, #8]\n\tldr x0, [x9]\n\tbl ");
+    if q.c == 20 {
+      w_s(&mut out, "bst_rt_host_arg");
+    } else if q.c == 21 {
+      w_s(&mut out, "bst_rt_host_read");
+    } else if q.c == 22 {
+      w_s(&mut out, "bst_rt_host_write");
+    } else if q.c == 23 {
+      w_s(&mut out, "bst_rt_host_env");
+    } else if q.c == 24 {
+      w_s(&mut out, "bst_rt_host_cpus");
+    } else if q.c == 25 {
+      w_s(&mut out, "bst_rt_eprint");
+    } else if q.c == 26 {
+      w_s(&mut out, "bst_rt_spawn");
+    } else if q.c == 27 {
+      w_s(&mut out, "bst_rt_child_write");
+    } else if q.c == 28 {
+      w_s(&mut out, "bst_rt_child_close");
+    } else if q.c == 29 {
+      w_s(&mut out, "bst_rt_child_read_line");
+    } else {
+      w_s(&mut out, "bst_rt_child_wait");
+    }
+    w_s(&mut out, "\n\tldp x9, xzr, [sp], #16\n\tstr x0, [x9]\n\tstr x1, [x9, #8]\n\tstr x2, [x9, #16]\n");
     a64_finish(&mut out, al, fr, q.d, 0);
   } else if op == IR_FREE {
     a64_mov(&mut out, a64_loc(al, fr, q.a), a64_rl(0));
@@ -905,7 +959,7 @@ fn a64_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   let mut ok = vec_len(f.params) <= A64_MAX_ARGS;
   let mut why = 1;                          // 1: parameters, 2: instructions, 3: a call, 4: an operation
   let mut bad_op = 0;
-  if ok && name_is(p, xi.def, "main") && vec_len(f.params) > 0 {
+  if ok && name_is(p, xi.def, "main") && vec_len(f.params) > 0 && vec_len(f.params) != a64_main_words(&mut m, p, x) {
     ok = false;
   }
   if vec_len(f.ins) > IX_MAX_INS {
@@ -921,13 +975,15 @@ fn a64_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
         why = 3;
       }
     }
-    // The console is not in the AArch64 runtime.
-    if q.op == IR_ALLOC && q.ty == 1 {
+    // The console, the page pool and the platform are not in the AArch64
+    // runtime; of the runtime calls it has the Vec reserve (5), the
+    // hosted program's files and processes (20 to 30) and its arguments (31).
+    if q.op == IR_PCALL && q.c != 5 && (q.c < 20 || q.c > 31) {
       ok = false;
       why = 4;
       bad_op = q.op;
     }
-    if q.op == IR_PUTC || q.op == IR_GETC || q.op == IR_RT || q.op == IR_GLOBAL || q.op == IR_ZERO || q.op == IR_TSC || q.op == IR_PCALL || q.op == IR_COPYPAGE || q.op == IR_MMCHK || q.op == IR_PIN || q.op == IR_POUT {
+    if q.op == IR_RT || q.op == IR_GLOBAL || q.op == IR_ZERO || q.op == IR_TSC || q.op == IR_COPYPAGE || q.op == IR_MMCHK || q.op == IR_PIN || q.op == IR_POUT {
       ok = false;
       why = 4;
       bad_op = q.op;
@@ -1111,6 +1167,619 @@ fn a64_runtime(out: &mut Vec[u64]) {
   w_s(&mut out, ".Lrt_oom:\n");
   w_s(&mut out, "\t.string \"Bastio: out of memory\\n\"\n");
   w_s(&mut out, "\t.text\n");
+  a64_runtime_alloc(&mut out);
+  a64_runtime_host(&mut out);
+  a64_runtime_child(&mut out);
+}
+
+/// The allocator's fallible calls, the Vec reserve and the console, over the C library.
+fn a64_runtime_alloc(out: &mut Vec[u64]) {
+  w_s(&mut out, "\t.text\n");
+  w_s(&mut out, "bst_rt_try_alloc:               // x0 = x0 zeroed words, or 0 when out of memory\n");
+  w_s(&mut out, "\tmov x1, #8\n");
+  w_s(&mut out, "\tb 1f\n");
+  w_s(&mut out, "bst_rt_try_balloc:              // x0 = x0 zeroed bytes, or 0 when out of memory\n");
+  w_s(&mut out, "\tmov x1, #1\n");
+  w_s(&mut out, "1:\tstp x29, x30, [sp, #-16]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tcbnz x0, 2f\n");
+  w_s(&mut out, "\tmov x0, #1\n");
+  w_s(&mut out, "2:\tbl calloc\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #16\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_alloc_raw:               // x0 = x0 words (at least one), not zeroed: the caller writes all of them\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-16]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tcbnz x0, 1f\n");
+  w_s(&mut out, "\tmov x0, #1\n");
+  w_s(&mut out, "1:\tlsl x0, x0, #3\n");
+  w_s(&mut out, "\tbl malloc\n");
+  w_s(&mut out, "\tcbz x0, bst_rt_oom\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #16\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_vec_try_reserve:         // room for x1 more elements of x2 bytes in the Vec at (x0): w0 = 1, or 0 and unchanged\n");
+  w_s(&mut out, "\tldr x3, [x0, #8]\n");
+  w_s(&mut out, "\tldr x4, [x0]\n");
+  w_s(&mut out, "\tsub x3, x3, x4\n");
+  w_s(&mut out, "\tcmp x3, x1\n");
+  w_s(&mut out, "\tb.lo 1f\n");
+  w_s(&mut out, "\tmov w0, #1\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "1:\tstp x29, x30, [sp, #-48]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tstp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tstp x21, x22, [sp, #32]\n");
+  w_s(&mut out, "\tmov x19, x0\n");
+  w_s(&mut out, "\tmov x20, x2\n");
+  w_s(&mut out, "\tmov x21, x1\n");
+  w_s(&mut out, "\tmov x3, #1                  // lim = 2^60 / size: the capacity stays at most 2^60\n");
+  w_s(&mut out, "\tlsl x3, x3, #60\n");
+  w_s(&mut out, "\tudiv x3, x3, x20\n");
+  w_s(&mut out, "\tldr x4, [x19]\n");
+  w_s(&mut out, "\tcmp x4, x3\n");
+  w_s(&mut out, "\tb.hi 3f\n");
+  w_s(&mut out, "\tsub x5, x3, x4\n");
+  w_s(&mut out, "\tcmp x21, x5\n");
+  w_s(&mut out, "\tb.hi 3f\n");
+  w_s(&mut out, "\tadd x22, x4, x21            // new capacity: len + k, or double when that is more and fits\n");
+  w_s(&mut out, "\tldr x6, [x19, #8]\n");
+  w_s(&mut out, "\tlsr x3, x3, #1\n");
+  w_s(&mut out, "\tcmp x6, x3\n");
+  w_s(&mut out, "\tb.hi 2f\n");
+  w_s(&mut out, "\tadd x6, x6, x6\n");
+  w_s(&mut out, "\tcmp x6, x22\n");
+  w_s(&mut out, "\tb.ls 2f\n");
+  w_s(&mut out, "\tmov x22, x6\n");
+  w_s(&mut out, "2:\tmul x1, x22, x20\n");
+  w_s(&mut out, "\tldr x0, [x19, #16]\n");
+  w_s(&mut out, "\tbl realloc\n");
+  w_s(&mut out, "\tcbz x0, 3f\n");
+  w_s(&mut out, "\tstr x0, [x19, #16]\n");
+  w_s(&mut out, "\tstr x22, [x19, #8]\n");
+  w_s(&mut out, "\tmov w0, #1\n");
+  w_s(&mut out, "\tb 4f\n");
+  w_s(&mut out, "3:\tmov w0, #0\n");
+  w_s(&mut out, "4:\tldp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tldp x21, x22, [sp, #32]\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #48\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_putc:                    // write byte x0 to stdout; flush at a newline\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-32]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tstr x19, [sp, #16]\n");
+  w_s(&mut out, "\tmov x19, x0\n");
+  w_s(&mut out, "\tand w0, w0, #0xff\n");
+  w_s(&mut out, "\tbl putchar\n");
+  w_s(&mut out, "\tcmp x19, #10\n");
+  w_s(&mut out, "\tb.ne 1f\n");
+  w_s(&mut out, "\tadrp x1, :got:stdout\n");
+  w_s(&mut out, "\tldr x1, [x1, :got_lo12:stdout]\n");
+  w_s(&mut out, "\tldr x0, [x1]\n");
+  w_s(&mut out, "\tbl fflush\n");
+  w_s(&mut out, "1:\tldr x19, [sp, #16]\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #32\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_getc:                    // x0 = next byte of stdin, 4 at the end\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-16]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tadrp x1, :got:stdout\n");
+  w_s(&mut out, "\tldr x1, [x1, :got_lo12:stdout]\n");
+  w_s(&mut out, "\tldr x0, [x1]\n");
+  w_s(&mut out, "\tbl fflush\n");
+  w_s(&mut out, "\tbl getchar\n");
+  w_s(&mut out, "\tcmn w0, #1\n");
+  w_s(&mut out, "\tb.ne 1f\n");
+  w_s(&mut out, "\tmov w0, #4\n");
+  w_s(&mut out, "1:\tsxtw x0, w0\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #16\n");
+  w_s(&mut out, "\tret\n");
+}
+
+/// The hosted target's files, environment and arguments, over the C library.
+fn a64_runtime_host(out: &mut Vec[u64]) {
+  w_s(&mut out, "\t.text\n");
+  w_s(&mut out, "bst_rt_host_arg:                // argument x0 as Bytes: x0 = data, x1 = len\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-32]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tstp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tadrp x2, bst_rt_argc\n");
+  w_s(&mut out, "\tldrsw x2, [x2, :lo12:bst_rt_argc]\n");
+  w_s(&mut out, "\tcmp x0, x2\n");
+  w_s(&mut out, "\tb.lo 1f\n");
+  w_s(&mut out, "\tmov x0, #0                  // past the end: empty\n");
+  w_s(&mut out, "\tbl bst_rt_balloc\n");
+  w_s(&mut out, "\tmov x1, #0\n");
+  w_s(&mut out, "\tb 2f\n");
+  w_s(&mut out, "1:\tadrp x2, bst_rt_argv\n");
+  w_s(&mut out, "\tldr x2, [x2, :lo12:bst_rt_argv]\n");
+  w_s(&mut out, "\tldr x19, [x2, x0, lsl #3]\n");
+  w_s(&mut out, "\tmov x0, x19\n");
+  w_s(&mut out, "\tbl strlen\n");
+  w_s(&mut out, "\tmov x20, x0\n");
+  w_s(&mut out, "\tbl bst_rt_balloc\n");
+  w_s(&mut out, "\tmov x1, x19\n");
+  w_s(&mut out, "\tmov x2, x20\n");
+  w_s(&mut out, "\tmov x19, x0\n");
+  w_s(&mut out, "\tbl memcpy\n");
+  w_s(&mut out, "\tmov x0, x19\n");
+  w_s(&mut out, "\tmov x1, x20\n");
+  w_s(&mut out, "2:\tldp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #32\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_cpath:                   // x0 = a NUL-terminated copy of the x1 bytes at x0 (a NUL inside ends the path)\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-32]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tstp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tmov x19, x0\n");
+  w_s(&mut out, "\tmov x20, x1\n");
+  w_s(&mut out, "\tadd x0, x1, #1\n");
+  w_s(&mut out, "\tbl malloc\n");
+  w_s(&mut out, "\tcbz x0, bst_rt_oom\n");
+  w_s(&mut out, "\tmov x1, x19\n");
+  w_s(&mut out, "\tmov x2, x20\n");
+  w_s(&mut out, "\tmov x19, x0\n");
+  w_s(&mut out, "\tbl memcpy\n");
+  w_s(&mut out, "\tstrb wzr, [x19, x20]\n");
+  w_s(&mut out, "\tmov x0, x19\n");
+  w_s(&mut out, "\tldp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #32\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_host_read:               // read the file named by x0/x1 into the Bytes at (x2); x0 = 1 if it worked\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-64]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tstp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tstp x21, x22, [sp, #32]\n");
+  w_s(&mut out, "\tstp x23, x24, [sp, #48]\n");
+  w_s(&mut out, "\tmov x19, x2\n");
+  w_s(&mut out, "\tbl bst_rt_cpath\n");
+  w_s(&mut out, "\tmov x21, x0\n");
+  w_s(&mut out, "\tmov x1, #0                  // O_RDONLY\n");
+  w_s(&mut out, "\tbl open\n");
+  w_s(&mut out, "\tsxtw x20, w0\n");
+  w_s(&mut out, "\tmov x0, x21\n");
+  w_s(&mut out, "\tbl free\n");
+  w_s(&mut out, "\ttbnz x20, #63, 8f\n");
+  w_s(&mut out, "\tmov x23, #4096              // capacity, doubled when full\n");
+  w_s(&mut out, "\tmov x0, x23\n");
+  w_s(&mut out, "\tbl malloc\n");
+  w_s(&mut out, "\tcbz x0, bst_rt_oom\n");
+  w_s(&mut out, "\tmov x22, x0\n");
+  w_s(&mut out, "\tmov x24, #0                 // bytes read\n");
+  w_s(&mut out, "1:\tmov x0, x20\n");
+  w_s(&mut out, "\tadd x1, x22, x24\n");
+  w_s(&mut out, "\tsub x2, x23, x24\n");
+  w_s(&mut out, "\tbl read\n");
+  w_s(&mut out, "\tcmp x0, #0\n");
+  w_s(&mut out, "\tb.lt 3f\n");
+  w_s(&mut out, "\tb.eq 4f\n");
+  w_s(&mut out, "\tadd x24, x24, x0\n");
+  w_s(&mut out, "\tcmp x24, x23\n");
+  w_s(&mut out, "\tb.ne 1b\n");
+  w_s(&mut out, "\tadd x23, x23, x23\n");
+  w_s(&mut out, "\tmov x0, x22\n");
+  w_s(&mut out, "\tmov x1, x23\n");
+  w_s(&mut out, "\tbl realloc\n");
+  w_s(&mut out, "\tcbz x0, bst_rt_oom\n");
+  w_s(&mut out, "\tmov x22, x0\n");
+  w_s(&mut out, "\tb 1b\n");
+  w_s(&mut out, "3:\tmov x0, x20                 // a read error: nothing changes\n");
+  w_s(&mut out, "\tbl close\n");
+  w_s(&mut out, "\tmov x0, x22\n");
+  w_s(&mut out, "\tbl free\n");
+  w_s(&mut out, "\tb 8f\n");
+  w_s(&mut out, "4:\tmov x0, x20\n");
+  w_s(&mut out, "\tbl close\n");
+  w_s(&mut out, "\tldr x0, [x19, #8]           // replace the old contents\n");
+  w_s(&mut out, "\tbl free\n");
+  w_s(&mut out, "\tstr x24, [x19]\n");
+  w_s(&mut out, "\tstr x22, [x19, #8]\n");
+  w_s(&mut out, "\tmov x0, #1\n");
+  w_s(&mut out, "\tb 9f\n");
+  w_s(&mut out, "8:\tmov x0, #0\n");
+  w_s(&mut out, "9:\tldp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tldp x21, x22, [sp, #32]\n");
+  w_s(&mut out, "\tldp x23, x24, [sp, #48]\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #64\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_host_write:              // write the x3 bytes at x2 to the file named by x0/x1; x0 = 1 if it worked\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-64]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tstp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tstp x21, x22, [sp, #32]\n");
+  w_s(&mut out, "\tstr x23, [sp, #48]\n");
+  w_s(&mut out, "\tmov x19, x2\n");
+  w_s(&mut out, "\tmov x22, x3\n");
+  w_s(&mut out, "\tbl bst_rt_cpath\n");
+  w_s(&mut out, "\tmov x21, x0\n");
+  w_s(&mut out, "\tmov w1, #0x241              // O_WRONLY | O_CREAT | O_TRUNC\n");
+  w_s(&mut out, "\tmov w2, #0x1b6              // 0666\n");
+  w_s(&mut out, "\tbl open\n");
+  w_s(&mut out, "\tsxtw x20, w0\n");
+  w_s(&mut out, "\tmov x0, x21\n");
+  w_s(&mut out, "\tbl free\n");
+  w_s(&mut out, "\ttbnz x20, #63, 8f\n");
+  w_s(&mut out, "\tmov x23, #0                 // bytes written\n");
+  w_s(&mut out, "1:\tcmp x23, x22\n");
+  w_s(&mut out, "\tb.hs 4f\n");
+  w_s(&mut out, "\tmov x0, x20\n");
+  w_s(&mut out, "\tadd x1, x19, x23\n");
+  w_s(&mut out, "\tsub x2, x22, x23\n");
+  w_s(&mut out, "\tbl write\n");
+  w_s(&mut out, "\tcmp x0, #0\n");
+  w_s(&mut out, "\tb.le 3f\n");
+  w_s(&mut out, "\tadd x23, x23, x0\n");
+  w_s(&mut out, "\tb 1b\n");
+  w_s(&mut out, "3:\tmov x0, x20\n");
+  w_s(&mut out, "\tbl close\n");
+  w_s(&mut out, "\tb 8f\n");
+  w_s(&mut out, "4:\tmov x0, x20\n");
+  w_s(&mut out, "\tbl close\n");
+  w_s(&mut out, "\tcbnz w0, 8f\n");
+  w_s(&mut out, "\tmov x0, #1\n");
+  w_s(&mut out, "\tb 9f\n");
+  w_s(&mut out, "8:\tmov x0, #0\n");
+  w_s(&mut out, "9:\tldp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tldp x21, x22, [sp, #32]\n");
+  w_s(&mut out, "\tldr x23, [sp, #48]\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #64\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_host_env:                // the variable named by the x1 bytes at x0 into the Bytes at (x2); x0 = 1 if it is set\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-64]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tstp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tstp x21, x22, [sp, #32]\n");
+  w_s(&mut out, "\tstr x23, [sp, #48]\n");
+  w_s(&mut out, "\tmov x19, x2\n");
+  w_s(&mut out, "\tbl bst_rt_cpath\n");
+  w_s(&mut out, "\tmov x20, x0\n");
+  w_s(&mut out, "\tbl getenv\n");
+  w_s(&mut out, "\tmov x21, x0\n");
+  w_s(&mut out, "\tmov x0, x20\n");
+  w_s(&mut out, "\tbl free\n");
+  w_s(&mut out, "\tcbz x21, 8f\n");
+  w_s(&mut out, "\tmov x0, x21\n");
+  w_s(&mut out, "\tbl strlen\n");
+  w_s(&mut out, "\tmov x22, x0\n");
+  w_s(&mut out, "\tbl bst_rt_balloc\n");
+  w_s(&mut out, "\tmov x23, x0\n");
+  w_s(&mut out, "\tmov x1, x21\n");
+  w_s(&mut out, "\tmov x2, x22\n");
+  w_s(&mut out, "\tbl memcpy\n");
+  w_s(&mut out, "\tldr x0, [x19, #8]           // replace the old contents\n");
+  w_s(&mut out, "\tbl bst_rt_free\n");
+  w_s(&mut out, "\tstr x22, [x19]\n");
+  w_s(&mut out, "\tstr x23, [x19, #8]\n");
+  w_s(&mut out, "\tmov x0, #1\n");
+  w_s(&mut out, "\tb 9f\n");
+  w_s(&mut out, "8:\tmov x0, #0\n");
+  w_s(&mut out, "9:\tldp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tldp x21, x22, [sp, #32]\n");
+  w_s(&mut out, "\tldr x23, [sp, #48]\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #64\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_host_cpus:               // x0 = the processors online (at least 1)\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-16]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tmov x0, #84                 // _SC_NPROCESSORS_ONLN\n");
+  w_s(&mut out, "\tbl sysconf\n");
+  w_s(&mut out, "\tcmp x0, #1\n");
+  w_s(&mut out, "\tb.ge 1f\n");
+  w_s(&mut out, "\tmov x0, #1\n");
+  w_s(&mut out, "1:\tldp x29, x30, [sp], #16\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_eprint:                  // write the x1 bytes at x0 to stderr, after flushing stdout\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-32]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tstp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tmov x19, x0\n");
+  w_s(&mut out, "\tmov x20, x1\n");
+  w_s(&mut out, "\tadrp x2, :got:stdout\n");
+  w_s(&mut out, "\tldr x2, [x2, :got_lo12:stdout]\n");
+  w_s(&mut out, "\tldr x0, [x2]\n");
+  w_s(&mut out, "\tbl fflush\n");
+  w_s(&mut out, "\tmov x0, x19\n");
+  w_s(&mut out, "\tmov x1, #1\n");
+  w_s(&mut out, "\tmov x2, x20\n");
+  w_s(&mut out, "\tadrp x3, :got:stderr\n");
+  w_s(&mut out, "\tldr x3, [x3, :got_lo12:stderr]\n");
+  w_s(&mut out, "\tldr x3, [x3]\n");
+  w_s(&mut out, "\tbl fwrite\n");
+  w_s(&mut out, "\tldp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #32\n");
+  w_s(&mut out, "\tret\n");
+}
+
+/// The hosted target's child processes, over the C library.
+fn a64_runtime_child(out: &mut Vec[u64]) {
+  w_s(&mut out, "\t.text\n");
+  w_s(&mut out, "// A Child is three words: process id, the pipe to its input, and its output\n");
+  w_s(&mut out, "// (a FILE *). One that cannot be started is -1, -1, 0, and behaves like one\n");
+  w_s(&mut out, "// that exited with 127 without output.\n");
+  w_s(&mut out, "bst_rt_spawn:                   // run the x2 Bytes at x0 (argv): x0 = output, x1 = input, x2 = pid\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-192]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tstp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tstp x21, x22, [sp, #32]\n");
+  w_s(&mut out, "\tstp x23, x24, [sp, #48]\n");
+  w_s(&mut out, "\tstr x25, [sp, #64]          // sp+80: to[2]; sp+88: from[2]; sp+96: pid; sp+104: file actions\n");
+  w_s(&mut out, "\tmov x19, x0\n");
+  w_s(&mut out, "\tmov x20, x2\n");
+  w_s(&mut out, "\tmov x21, #-1\n");
+  w_s(&mut out, "\tmov x22, #-1\n");
+  w_s(&mut out, "\tmov x23, #0\n");
+  w_s(&mut out, "\tcbz x20, 9f\n");
+  w_s(&mut out, "\tadd x0, sp, #80\n");
+  w_s(&mut out, "\tbl pipe\n");
+  w_s(&mut out, "\tcbnz w0, 9f\n");
+  w_s(&mut out, "\tadd x0, sp, #88\n");
+  w_s(&mut out, "\tbl pipe\n");
+  w_s(&mut out, "\tcbz w0, 1f\n");
+  w_s(&mut out, "\tldrsw x0, [sp, #80]\n");
+  w_s(&mut out, "\tbl close\n");
+  w_s(&mut out, "\tldrsw x0, [sp, #84]\n");
+  w_s(&mut out, "\tbl close\n");
+  w_s(&mut out, "\tb 9f\n");
+  w_s(&mut out, "1:\tldrsw x0, [sp, #84]         // the parent's ends are not inherited by later children,\n");
+  w_s(&mut out, "\tmov x1, #2                  // so closing a child's input reaches it as end of file\n");
+  w_s(&mut out, "\tmov x2, #1                  // (F_SETFD, FD_CLOEXEC)\n");
+  w_s(&mut out, "\tbl fcntl\n");
+  w_s(&mut out, "\tldrsw x0, [sp, #88]\n");
+  w_s(&mut out, "\tmov x1, #2\n");
+  w_s(&mut out, "\tmov x2, #1\n");
+  w_s(&mut out, "\tbl fcntl\n");
+  w_s(&mut out, "\tlsl x0, x20, #3             // argv for execvp, NULL-terminated\n");
+  w_s(&mut out, "\tadd x0, x0, #8\n");
+  w_s(&mut out, "\tbl malloc\n");
+  w_s(&mut out, "\tcbz x0, bst_rt_oom\n");
+  w_s(&mut out, "\tmov x24, x0\n");
+  w_s(&mut out, "\tmov x25, #0\n");
+  w_s(&mut out, "2:\tcmp x25, x20\n");
+  w_s(&mut out, "\tb.hs 3f\n");
+  w_s(&mut out, "\tlsl x2, x25, #4\n");
+  w_s(&mut out, "\tadd x2, x19, x2\n");
+  w_s(&mut out, "\tldr x0, [x2, #8]\n");
+  w_s(&mut out, "\tldr x1, [x2]\n");
+  w_s(&mut out, "\tbl bst_rt_cpath\n");
+  w_s(&mut out, "\tstr x0, [x24, x25, lsl #3]\n");
+  w_s(&mut out, "\tadd x25, x25, #1\n");
+  w_s(&mut out, "\tb 2b\n");
+  w_s(&mut out, "3:\tstr xzr, [x24, x20, lsl #3]\n");
+  w_s(&mut out, "\tmov x0, #0\n");
+  w_s(&mut out, "\tbl fflush\n");
+  w_s(&mut out, "\tmov w0, #-1                 // posix_spawnp, not fork: the parent's memory is never copied\n");
+  w_s(&mut out, "\tstr w0, [sp, #96]\n");
+  w_s(&mut out, "\tadd x0, sp, #104\n");
+  w_s(&mut out, "\tbl posix_spawn_file_actions_init\n");
+  w_s(&mut out, "\tcbnz w0, 4f\n");
+  w_s(&mut out, "\tadd x0, sp, #104            // to[0] becomes 0, from[1] becomes 1\n");
+  w_s(&mut out, "\tldr w1, [sp, #80]\n");
+  w_s(&mut out, "\tmov w2, #0\n");
+  w_s(&mut out, "\tbl posix_spawn_file_actions_adddup2\n");
+  w_s(&mut out, "\tmov w25, w0\n");
+  w_s(&mut out, "\tadd x0, sp, #104\n");
+  w_s(&mut out, "\tldr w1, [sp, #92]\n");
+  w_s(&mut out, "\tmov w2, #1\n");
+  w_s(&mut out, "\tbl posix_spawn_file_actions_adddup2\n");
+  w_s(&mut out, "\torr w25, w25, w0\n");
+  w_s(&mut out, "\tadd x0, sp, #104\n");
+  w_s(&mut out, "\tldr w1, [sp, #80]\n");
+  w_s(&mut out, "\tbl posix_spawn_file_actions_addclose\n");
+  w_s(&mut out, "\torr w25, w25, w0\n");
+  w_s(&mut out, "\tadd x0, sp, #104\n");
+  w_s(&mut out, "\tldr w1, [sp, #92]\n");
+  w_s(&mut out, "\tbl posix_spawn_file_actions_addclose\n");
+  w_s(&mut out, "\torr w25, w25, w0\n");
+  w_s(&mut out, "\tcbnz w25, 10f\n");
+  w_s(&mut out, "\tadd x0, sp, #96\n");
+  w_s(&mut out, "\tldr x1, [x24]\n");
+  w_s(&mut out, "\tadd x2, sp, #104\n");
+  w_s(&mut out, "\tmov x3, #0\n");
+  w_s(&mut out, "\tmov x4, x24\n");
+  w_s(&mut out, "\tadrp x5, :got:environ\n");
+  w_s(&mut out, "\tldr x5, [x5, :got_lo12:environ]\n");
+  w_s(&mut out, "\tldr x5, [x5]\n");
+  w_s(&mut out, "\tbl posix_spawnp\n");
+  w_s(&mut out, "\tcbz w0, 10f\n");
+  w_s(&mut out, "\tmov w0, #-1                 // not started\n");
+  w_s(&mut out, "\tstr w0, [sp, #96]\n");
+  w_s(&mut out, "10:\tadd x0, sp, #104\n");
+  w_s(&mut out, "\tbl posix_spawn_file_actions_destroy\n");
+  w_s(&mut out, "4:\tldrsw x21, [sp, #96]\n");
+  w_s(&mut out, "\tmov x25, #0\n");
+  w_s(&mut out, "5:\tcmp x25, x20\n");
+  w_s(&mut out, "\tb.hs 6f\n");
+  w_s(&mut out, "\tldr x0, [x24, x25, lsl #3]\n");
+  w_s(&mut out, "\tbl free\n");
+  w_s(&mut out, "\tadd x25, x25, #1\n");
+  w_s(&mut out, "\tb 5b\n");
+  w_s(&mut out, "6:\tmov x0, x24\n");
+  w_s(&mut out, "\tbl free\n");
+  w_s(&mut out, "\tldrsw x0, [sp, #80]\n");
+  w_s(&mut out, "\tbl close\n");
+  w_s(&mut out, "\tldrsw x0, [sp, #92]\n");
+  w_s(&mut out, "\tbl close\n");
+  w_s(&mut out, "\tmov x22, #-1\n");
+  w_s(&mut out, "\tmov x23, #0\n");
+  w_s(&mut out, "\ttbz x21, #63, 7f\n");
+  w_s(&mut out, "\tldrsw x0, [sp, #84]         // no process\n");
+  w_s(&mut out, "\tbl close\n");
+  w_s(&mut out, "\tldrsw x0, [sp, #88]\n");
+  w_s(&mut out, "\tbl close\n");
+  w_s(&mut out, "\tmov x21, #-1\n");
+  w_s(&mut out, "\tb 9f\n");
+  w_s(&mut out, "7:\tmov w0, #13                 // SIGPIPE ignored: writing to a child that has exited fails instead\n");
+  w_s(&mut out, "\tmov x1, #1\n");
+  w_s(&mut out, "\tbl signal\n");
+  w_s(&mut out, "\tldrsw x22, [sp, #84]\n");
+  w_s(&mut out, "\tldrsw x0, [sp, #88]\n");
+  w_s(&mut out, "\tadrp x1, .Lrt_rb\n");
+  w_s(&mut out, "\tadd x1, x1, :lo12:.Lrt_rb\n");
+  w_s(&mut out, "\tbl fdopen\n");
+  w_s(&mut out, "\tcbz x0, bst_rt_oom\n");
+  w_s(&mut out, "\tmov x23, x0\n");
+  w_s(&mut out, "9:\tmov x0, x23\n");
+  w_s(&mut out, "\tmov x1, x22\n");
+  w_s(&mut out, "\tmov x2, x21\n");
+  w_s(&mut out, "\tldp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tldp x21, x22, [sp, #32]\n");
+  w_s(&mut out, "\tldp x23, x24, [sp, #48]\n");
+  w_s(&mut out, "\tldr x25, [sp, #64]\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #192\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_child_write:             // write the x1 bytes at x0 to the Child at (x2); x0 = 1 if it worked\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-48]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tstp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tstp x21, x22, [sp, #32]\n");
+  w_s(&mut out, "\tldr x19, [x2, #8]\n");
+  w_s(&mut out, "\tmov x20, x0\n");
+  w_s(&mut out, "\tmov x21, x1\n");
+  w_s(&mut out, "\tmov x22, #0\n");
+  w_s(&mut out, "\ttbnz x19, #63, 8f\n");
+  w_s(&mut out, "1:\tcmp x22, x21\n");
+  w_s(&mut out, "\tb.hs 4f\n");
+  w_s(&mut out, "\tmov x0, x19\n");
+  w_s(&mut out, "\tadd x1, x20, x22\n");
+  w_s(&mut out, "\tsub x2, x21, x22\n");
+  w_s(&mut out, "\tbl write\n");
+  w_s(&mut out, "\tcmp x0, #0\n");
+  w_s(&mut out, "\tb.le 8f\n");
+  w_s(&mut out, "\tadd x22, x22, x0\n");
+  w_s(&mut out, "\tb 1b\n");
+  w_s(&mut out, "4:\tmov x0, #1\n");
+  w_s(&mut out, "\tb 9f\n");
+  w_s(&mut out, "8:\tmov x0, #0\n");
+  w_s(&mut out, "9:\tldp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tldp x21, x22, [sp, #32]\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #48\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_child_close:             // close the input of the Child at (x0)\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-32]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tstr x19, [sp, #16]\n");
+  w_s(&mut out, "\tmov x19, x0\n");
+  w_s(&mut out, "\tldr x0, [x19, #8]\n");
+  w_s(&mut out, "\ttbnz x0, #63, 1f\n");
+  w_s(&mut out, "\tbl close\n");
+  w_s(&mut out, "\tmov x0, #-1\n");
+  w_s(&mut out, "\tstr x0, [x19, #8]\n");
+  w_s(&mut out, "1:\tldr x19, [sp, #16]\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #32\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_child_read_line:         // the next line of the Child at (x0) into the Bytes at (x1); x0 = 1 if there was one\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-64]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tstp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tstp x21, x22, [sp, #32]\n");
+  w_s(&mut out, "\tstr x23, [sp, #48]\n");
+  w_s(&mut out, "\tldr x19, [x0, #16]\n");
+  w_s(&mut out, "\tmov x20, x1\n");
+  w_s(&mut out, "\tcbz x19, 8f\n");
+  w_s(&mut out, "\tmov x22, #64                // capacity, doubled when full\n");
+  w_s(&mut out, "\tmov x0, x22\n");
+  w_s(&mut out, "\tbl malloc\n");
+  w_s(&mut out, "\tcbz x0, bst_rt_oom\n");
+  w_s(&mut out, "\tmov x21, x0\n");
+  w_s(&mut out, "\tmov x23, #0                 // bytes in the line\n");
+  w_s(&mut out, "1:\tcmp x22, x23\n");
+  w_s(&mut out, "\tb.ne 2f\n");
+  w_s(&mut out, "\tadd x22, x22, x22\n");
+  w_s(&mut out, "\tmov x0, x21\n");
+  w_s(&mut out, "\tmov x1, x22\n");
+  w_s(&mut out, "\tbl realloc\n");
+  w_s(&mut out, "\tcbz x0, bst_rt_oom\n");
+  w_s(&mut out, "\tmov x21, x0\n");
+  w_s(&mut out, "2:\tmov x0, x19\n");
+  w_s(&mut out, "\tbl getc\n");
+  w_s(&mut out, "\tcmn w0, #1\n");
+  w_s(&mut out, "\tb.eq 3f\n");
+  w_s(&mut out, "\tcmp w0, #10\n");
+  w_s(&mut out, "\tb.eq 4f\n");
+  w_s(&mut out, "\tstrb w0, [x21, x23]\n");
+  w_s(&mut out, "\tadd x23, x23, #1\n");
+  w_s(&mut out, "\tb 1b\n");
+  w_s(&mut out, "3:\tcbnz x23, 4f                // the end: a last line without a newline, or none\n");
+  w_s(&mut out, "\tmov x0, x21\n");
+  w_s(&mut out, "\tbl free\n");
+  w_s(&mut out, "\tb 8f\n");
+  w_s(&mut out, "4:\tldr x0, [x20, #8]           // replace the old contents\n");
+  w_s(&mut out, "\tbl free\n");
+  w_s(&mut out, "\tstr x23, [x20]\n");
+  w_s(&mut out, "\tstr x21, [x20, #8]\n");
+  w_s(&mut out, "\tmov x0, #1\n");
+  w_s(&mut out, "\tb 9f\n");
+  w_s(&mut out, "8:\tmov x0, #0\n");
+  w_s(&mut out, "9:\tldp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tldp x21, x22, [sp, #32]\n");
+  w_s(&mut out, "\tldr x23, [sp, #48]\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #64\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_child_wait:              // wait for the Child x2 (pid), x1 (input), x0 (output): x0 = its exit status\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-48]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tstp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tmov x19, x2\n");
+  w_s(&mut out, "\tmov x20, x0\n");
+  w_s(&mut out, "\ttbnz x1, #63, 1f\n");
+  w_s(&mut out, "\tmov x0, x1\n");
+  w_s(&mut out, "\tbl close\n");
+  w_s(&mut out, "1:\tcbz x20, 2f\n");
+  w_s(&mut out, "\tmov x0, x20\n");
+  w_s(&mut out, "\tbl fclose\n");
+  w_s(&mut out, "2:\ttbz x19, #63, 3f\n");
+  w_s(&mut out, "\tmov x0, #127\n");
+  w_s(&mut out, "\tb 9f\n");
+  w_s(&mut out, "3:\tmov w0, w19\n");
+  w_s(&mut out, "\tadd x1, sp, #32\n");
+  w_s(&mut out, "\tmov w2, #0\n");
+  w_s(&mut out, "\tbl waitpid\n");
+  w_s(&mut out, "\tcmp w0, #0\n");
+  w_s(&mut out, "\tb.lt 3b\n");
+  w_s(&mut out, "\tldr w0, [sp, #32]\n");
+  w_s(&mut out, "\tand w1, w0, #0x7f\n");
+  w_s(&mut out, "\tcbnz w1, 4f\n");
+  w_s(&mut out, "\tlsr w0, w0, #8              // exited: its status\n");
+  w_s(&mut out, "\tand w0, w0, #0xff\n");
+  w_s(&mut out, "\tb 9f\n");
+  w_s(&mut out, "4:\tcmp w1, #0x7f\n");
+  w_s(&mut out, "\tb.eq 5f\n");
+  w_s(&mut out, "\tadd w0, w1, #128            // killed by a signal: 128 + the signal\n");
+  w_s(&mut out, "\tb 9f\n");
+  w_s(&mut out, "5:\tmov w0, #255\n");
+  w_s(&mut out, "9:\tldp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #48\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "\t.section .rodata\n");
+  w_s(&mut out, ".Lrt_rb:\n");
+  w_s(&mut out, "\t.string \"rb\"\n");
+  w_s(&mut out, "\t.bss\n");
+  w_s(&mut out, "\t.p2align 3\n");
+  w_s(&mut out, "bst_rt_argc:\n");
+  w_s(&mut out, "\t.zero 8\n");
+  w_s(&mut out, "bst_rt_argv:\n");
+  w_s(&mut out, "\t.zero 8\n");
+  w_s(&mut out, "\t.text\n");
+}
+
+/// The number of parameters of the hosted `main` x when they are all `Host`s or `Serial`s
+/// (by value, or by `&mut`: the address of a frame word), which the entry
+/// passes as zero words; 1000 for any other kind.
+fn a64_main_words(m: &mut Mono, p: &Parser, x: u64) -> u64 {
+  let xi = inst_at(m, x);
+  let dn = node_at(p.nodes, xi.def);
+  let mut n = 0;
+  let mut q = dn.a;
+  while q != 0 {
+    let qn = node_at(p.nodes, q);
+    let pt = conv(&mut m, p, qn.a, x, q);
+    let tk = kind_t(m, base_t(m, pt));
+    if tk != TY_HOST && tk != TY_SERIAL {
+      return 1000;
+    }
+    n = wrap_add(n, 1);
+    q = qn.next;
+  }
+  return n;
 }
 
 /// A program for AArch64: every function from its IR, then `main` as the
@@ -1140,12 +1809,42 @@ fn a64_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
     }
     k = k + 1;
   }
-  w_s(&mut g.out, "\t.globl main\n\t.type main, %function\nmain:\n\tstp x29, x30, [sp, #-16]!\n\tmov x29, sp\n\tbl ");
+  w_s(&mut g.out, "\t.globl main\n\t.type main, %function\nmain:\n\tstp x29, x30, [sp, #-16]!\n\tmov x29, sp\n\tadrp x2, bst_rt_argc\n\tstr w0, [x2, :lo12:bst_rt_argc]\n\tadrp x2, bst_rt_argv\n\tstr x1, [x2, :lo12:bst_rt_argv]\n");
+  // The capabilities of `main` are zero words; one lent by `&mut` is the
+  // address of its word on the frame.
+  let mxi = inst_at(m, main_x);
+  let mdn = node_at(p.nodes, mxi.def);
+  let mut np = 0;
+  let mut mq = mdn.a;
+  while mq != 0 && np < 8 {
+    let mqn = node_at(p.nodes, mq);
+    let mpt = conv(&mut m, p, mqn.a, main_x, mq);
+    if np == 0 {
+      w_s(&mut g.out, "\tsub sp, sp, #64\n");
+    }
+    w_s(&mut g.out, "\tstr xzr, [sp, #");
+    w_num(&mut g.out, wrap_mul(8, np));
+    w_s(&mut g.out, "]\n");
+    if kind_t(m, mpt) == TY_MUTREF {
+      w_s(&mut g.out, "\tadd x");
+      w_num(&mut g.out, np);
+      w_s(&mut g.out, ", sp, #");
+      w_num(&mut g.out, wrap_mul(8, np));
+      w_s(&mut g.out, "\n");
+    } else {
+      w_s(&mut g.out, "\tmov x");
+      w_num(&mut g.out, np);
+      w_s(&mut g.out, ", #0\n");
+    }
+    np = np + 1;
+    mq = mqn.next;
+  }
+  w_s(&mut g.out, "\tbl ");
   let mut ms = vec_new[u64]();
   ix_sym(&mut ms, &mut g, m, p, main_x);
   w_append(&mut g.out, ms);
   vec_free(ms);
-  w_s(&mut g.out, "\n\tldp x29, x30, [sp], #16\n\tret\n");
+  w_s(&mut g.out, "\n\tmov sp, x29\n\tldp x29, x30, [sp], #16\n\tret\n");
   a64_runtime(&mut g.out);
   w_s(&mut g.out, "\t.section .rodata\n");
   k = 0;
