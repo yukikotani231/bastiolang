@@ -83,12 +83,31 @@ once is where BastiOS is behind: its block cache holds 256 slots, so `scan`,
 which walks the whole root, goes back to the disk on every pass. The
 [roadmap](roadmap.md) tracks the gaps.
 
+## Over a network card
+
+The same TCP echo program runs in each guest, and the host drives it through
+QEMU's user-mode network: the average round trip of 200 messages of 32 bytes,
+and the rate of echoing 2 MiB. QEMU's own stack is on both paths and caps the
+rate, so compare the two systems with each other.
+
+| Card | Test | Unit | BastiOS | Linux | BastiOS / Linux |
+|---|---|---|---:|---:|---:|
+| virtio-net | round trip, 32 bytes | us | 263.6 | 316.3 | 0.83x |
+| virtio-net | echo 2 MiB | MiB/s | 13.3 | 11.9 | 1.12x |
+| e1000 | round trip, 32 bytes | us | 143.8 | n/a | |
+| e1000 | echo 2 MiB | MiB/s | 0.2 | n/a | |
+
+Over virtio-net BastiOS keeps up with Linux. Its e1000 driver echoes bulk
+data at a fiftieth of that rate, and the cause is not known yet. Ubuntu's
+kernel builds e1000 as a module that the test machine does not load, so
+there is no Linux figure for it.
+
 ## What is not here
 
 - Real hardware and KVM: the numbers are emulator figures. Once BastiOS runs
   on a physical machine, that table belongs next to Linux's on the same
   machine.
-- Network beyond loopback: `tcplat` and `tcpbw` are over 127.0.0.1. A
-  comparison over a real virtio-net or e1000 link is not measured yet.
+- A real network: the card tests go through QEMU's user-mode network, not a
+  physical link.
 - Native-code backend: the kernel in these tables is built through C. The
   native backend is still slower than that build.
