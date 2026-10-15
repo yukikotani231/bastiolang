@@ -325,6 +325,48 @@ fn ix_not(op: u64) -> u64 {
 }
 
 /// Writes the comparison of `a` with `b` (the flags for `a ? b`).
+/// Does the last line written to `out` start with `pre` and end with `, suf`
+/// (and its newline)?
+fn ix_last_line(out: &Vec[u64], pre: Str, suf: Str) -> bool {
+  let n = vec_len(out);
+  if n == 0 || vec_get(out, n - 1) != 10 {
+    return false;
+  }
+  let mut s = n - 1;                 // the start of the line
+  while s > 0 && vec_get(out, s - 1) != 10
+    invariant s <= n - 1 && n == vlen(out)
+  {
+    s = s - 1;
+  }
+  let len = n - 1 - s;               // without the newline
+  if len < slen(pre) + slen(suf) + 2 {
+    return false;
+  }
+  // the register stands after a comma and a space
+  if vec_get(out, n - 1 - slen(suf) - 2) != 44 || vec_get(out, n - 1 - slen(suf) - 1) != 32 {
+    return false;
+  }
+  let mut k = 0;
+  while k < slen(pre)
+    invariant k <= slen(pre) && s + slen(pre) <= n - 1 && n == vlen(out)
+  {
+    if vec_get(out, s + k) != cast[u64](sget(pre, k)) {
+      return false;
+    }
+    k = k + 1;
+  }
+  let mut j = 0;
+  while j < slen(suf)
+    invariant j <= slen(suf) && slen(suf) <= len && n == vlen(out)
+  {
+    if vec_get(out, n - 1 - slen(suf) + j) != cast[u64](sget(suf, j)) {
+      return false;
+    }
+    j = j + 1;
+  }
+  return true;
+}
+
 fn ix_cmp(out: &mut Vec[u64], al: &IrAlloc, a: u64, b: u64) {
   let mut la = ix_loc(al, a);
   let lb = ix_src(&mut out, ix_loc(al, b));
@@ -332,7 +374,9 @@ fn ix_cmp(out: &mut Vec[u64], al: &IrAlloc, a: u64, b: u64) {
     ix_mov(&mut out, la, ix_rl(XR_RAX));
     la = ix_rl(XR_RAX);
   }
-  if la.k == IXK_MEM && lb.k == IXK_IMM {
+  if lb.k == IXK_IMM && lb.imm == 0 && la.k == IXK_REG && (ix_last_line(out, "\tand ", x86_rname(la.reg)) || ix_last_line(out, "\tor ", x86_rname(la.reg))) {
+    // `and` and `or` set the flags as a comparison with zero does.
+  } else if la.k == IXK_MEM && lb.k == IXK_IMM {
     // An immediate against memory needs its width (`cmp` alone is 32 bits).
     ix_ins2(&mut out, "cmpq", lb, la);
   } else {
@@ -1297,13 +1341,28 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
     } else if q.op == IR_JMP {
       // A jump to a block that is only a test repeats the test here
       // (the loop is entered at its test and tested again at its end).
-      let lp = u_at(lpos, q.a);
+      let lp0 = u_at(lpos, q.a);
+      // Constants that stand as immediates cost nothing, so a test that
+      // starts with them (`v = const 512; c = lt i, v`) is still just a test.
+      let mut lp = lp0;
+      let mut skipped = 0;
+      let mut more = lp != 0;
+      while more && skipped < 8 {
+        let cq = ix_at(f, lp);
+        let cl = ix_loc(al, cq.d);
+        if cq.op == IR_CONST && cl.k == IXK_IMM {
+          lp = wrap_add(lp, 1);
+          skipped = skipped + 1;
+        } else {
+          more = false;
+        }
+      }
       let h1 = ix_at(f, lp);
       let h2 = ix_at(f, wrap_add(lp, 1));
-      if lp != 0 && h1.op == IR_BR && next != q.a {
+      if lp0 != 0 && h1.op == IR_BR && next != q.a {
         ix_cmp_zero(&mut out, al, h1.a);
         ix_br_flags(&mut out, f.x, IR_NE, h1.b, h1.c, next);
-      } else if lp != 0 && ix_is_cmp(h1.op) && h2.op == IR_BR && h2.a == h1.d && u_at(nuse, h1.d) == 1 && next != q.a {
+      } else if lp0 != 0 && ix_is_cmp(h1.op) && h2.op == IR_BR && h2.a == h1.d && u_at(nuse, h1.d) == 1 && next != q.a {
         ix_cmp(&mut out, al, h1.a, h1.b);
         ix_br_flags(&mut out, f.x, h1.op, h2.b, h2.c, next);
       } else if next != q.a {
@@ -1405,6 +1464,9 @@ fn ix_cmp_zero(out: &mut Vec[u64], al: &IrAlloc, r: u64) {
   if l.k == IXK_IMM {
     ix_mov(&mut out, l, ix_rl(XR_RAX));
     l = ix_rl(XR_RAX);
+  }
+  if l.k == IXK_REG && (ix_last_line(out, "\tand ", x86_rname(l.reg)) || ix_last_line(out, "\tor ", x86_rname(l.reg))) {
+    return;                          // `and` and `or` set the flags as a comparison with zero does
   }
   w_s(&mut out, "\tcmpq $0, ");
   ix_op(&mut out, l);

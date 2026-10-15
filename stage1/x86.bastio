@@ -8598,7 +8598,7 @@ fn x86_program_end(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, main_x: u
       w_s(&mut g.out, "\t.set bst_rt_alloc_raw, bst_rt_alloc    # the arena hands out zeroed words either way\n");
     }
   } else if g.target == TARGET_KERNEL {
-    x86_runtime_kernel(&mut g.out);
+    x86_runtime_kernel(&mut g.out, !g.stage0);
     if !g.stage0 {
       w_s(&mut g.out, "\t.set bst_rt_alloc_raw, bst_rt_alloc    # the arena hands out zeroed words either way\n");
     }
@@ -9717,7 +9717,7 @@ fn x86_runtime_user(out: &mut Vec[u64]) {
 /// 8 MiB arena, the page pool from the Multiboot information, the fault
 /// report), calling the platform's C only where the C prelude does. Part of
 /// the trusted base.
-fn x86_runtime_kernel(out: &mut Vec[u64]) {
+fn x86_runtime_kernel(out: &mut Vec[u64], fast: bool) {
   w_s(&mut out, "\n");
   w_s(&mut out, "# ---- runtime: BastiOS kernel (trusted base) ----\n");
   w_s(&mut out, "bst_rt_putc:                    # write byte %rdi to COM1, waiting for room\n");
@@ -10320,6 +10320,15 @@ fn x86_runtime_kernel(out: &mut Vec[u64]) {
   w_s(&mut out, "\tpop %rcx\n");
   w_s(&mut out, "\tret\n");
   w_s(&mut out, "bst_rt_frame_id:                # %rax = the page number of the page at %rax (the C prelude's bst_frame_id); keeps every other register\n");
+  if fast {
+    w_s(&mut out, "\tcmpq $1, bst_rt_runs(%rip)       # one run (the usual case): no search, no saved registers\n");
+    w_s(&mut out, "\tja 3f\n");
+    w_s(&mut out, "\tsub bst_rt_run_at(%rip), %rax\n");
+    w_s(&mut out, "\tshr $12, %rax\n");
+    w_s(&mut out, "\tadd bst_rt_run_id(%rip), %rax\n");
+    w_s(&mut out, "\tret\n");
+    w_s(&mut out, "3:\n");
+  }
   w_s(&mut out, "\tpush %rcx\n");
   w_s(&mut out, "\tpush %rdx\n");
   w_s(&mut out, "\tpush %rsi\n");
