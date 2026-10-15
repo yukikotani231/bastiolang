@@ -7,6 +7,9 @@ Bastio is a systems language whose memory safety is proved at compile time. The 
 | Page | What it covers |
 | --- | --- |
 | [Tutorial](tutorial.md) | A tour for newcomers: ownership, indices and arithmetic proved by Z3, specifications, calling Bastio from C. Every example is compiled by the tests |
+| [Tutorial part 2: bytes, bits and sized integers](tutorial-bits.md) | `u8` to `i64`, `cast` and `wrap`, bit operators, parsing a binary format |
+| [Tutorial part 3: capabilities](tutorial-capabilities.md) | The console, pages, page tables, ports, device registers and DMA, and what is proved about each |
+| [The toolchain](toolchain.md) | The two compilers, options, targets, backends and what each trusts |
 | [Common proof failures](proof-failures.md) | The errors people meet first, with the counterexample the compiler prints and how to fix each |
 | [Examples](../examples/README.md) | Small programs and proved libraries (base64, UTF-8, DER, QOI) to read and build |
 
@@ -23,6 +26,7 @@ Bastio is a systems language whose memory safety is proved at compile time. The 
 
 | Page | What it covers |
 | --- | --- |
+| [How the compiler is put together](architecture.md) | A map for newcomers: the phases, where each lives, and where to look for a given kind of change |
 | [Bootstrapping](bootstrap.md) | How the Rust compiler `bastioc0` builds `bastioc1`, how to check the fixed point, and what the stage0 freeze allows |
 | [Stage 1](../stage1/README.md) | The structure of `bastioc1`, the compiler written in Bastio |
 | [The IR](ir.md) | The intermediate representation behind the native backend |
