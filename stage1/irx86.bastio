@@ -1297,13 +1297,28 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
     } else if q.op == IR_JMP {
       // A jump to a block that is only a test repeats the test here
       // (the loop is entered at its test and tested again at its end).
-      let lp = u_at(lpos, q.a);
+      let lp0 = u_at(lpos, q.a);
+      // Constants that stand as immediates cost nothing, so a test that
+      // starts with them (`v = const 512; c = lt i, v`) is still just a test.
+      let mut lp = lp0;
+      let mut skipped = 0;
+      let mut more = lp != 0;
+      while more && skipped < 8 {
+        let cq = ix_at(f, lp);
+        let cl = ix_loc(al, cq.d);
+        if cq.op == IR_CONST && cl.k == IXK_IMM {
+          lp = wrap_add(lp, 1);
+          skipped = skipped + 1;
+        } else {
+          more = false;
+        }
+      }
       let h1 = ix_at(f, lp);
       let h2 = ix_at(f, wrap_add(lp, 1));
-      if lp != 0 && h1.op == IR_BR && next != q.a {
+      if lp0 != 0 && h1.op == IR_BR && next != q.a {
         ix_cmp_zero(&mut out, al, h1.a);
         ix_br_flags(&mut out, f.x, IR_NE, h1.b, h1.c, next);
-      } else if lp != 0 && ix_is_cmp(h1.op) && h2.op == IR_BR && h2.a == h1.d && u_at(nuse, h1.d) == 1 && next != q.a {
+      } else if lp0 != 0 && ix_is_cmp(h1.op) && h2.op == IR_BR && h2.a == h1.d && u_at(nuse, h1.d) == 1 && next != q.a {
         ix_cmp(&mut out, al, h1.a, h1.b);
         ix_br_flags(&mut out, f.x, h1.op, h2.b, h2.c, next);
       } else if next != q.a {
