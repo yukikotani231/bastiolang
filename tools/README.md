@@ -44,7 +44,7 @@ A [Language Server Protocol](https://microsoft.github.io/language-server-protoco
 
 | Feature | How |
 | --- | --- |
-| Diagnostics | The lexical error of the buffer as you type. When a file is opened or saved, the first error of `bastioc1 --check`: syntax, types, linearity and failed proofs, with the counterexample, at the position and width the compiler gives. A library file (no `main`) is checked through a program that only imports it |
+| Diagnostics | The lexical error of the buffer as you type. When a file is opened or saved (with `checkOnChange`, on every edit too), the first error of `bastioc1 --check` on the text of the buffer: syntax, types, linearity and failed proofs, with the counterexample, at the position and width the compiler gives. A library file (no `main`) is checked through a program that only imports it |
 | Go to definition | Functions, `spec fn`s, structs, enums, constants, variants (`E::V`), fields (`x.f`), and local variables (`let`, parameters, `match` bindings, `forall` variables), in the file and in every file it imports (found as the compiler finds them, with `--lib` directories and `BASTIO_LIB`) |
 | Hover | The signature (the whole definition for a type) and the `///` doc comment above it; for a local variable, its `let` or parameter |
 | Document symbols | Top-level definitions, with variants and fields as children |
@@ -52,7 +52,7 @@ A [Language Server Protocol](https://microsoft.github.io/language-server-protoco
 
 Definitions are found from tokens, not from a syntax tree, so they work while a file is half typed; the cost is that scopes are approximate (a local is the nearest declaration before the use in the same function) and a name that two files define is resolved to the one in the current file first. Types are not inferred, so hover on `p.a` finds a field by name, not by the type of `p`. Diagnostics from the compiler show only its first error, because the compiler stops there.
 
-Options go in `initializationOptions`: `bastioc` (the compiler: default `$BASTIOC`, else `bastioc1` on `PATH`), `target` (`hosted`, `kernel` or `user`), `lib` (a list of directories). The compiler runs on the saved file, so a buffer that differs from the file on disk is checked as saved.
+Options go in `initializationOptions`: `bastioc` (the compiler: default `$BASTIOC`, else `bastioc1` on `PATH`), `target` (`hosted`, `kernel` or `user`), `lib` (a list of directories), `checkOnChange` (run the compiler on every edit; off by default, as a program with many proofs takes a while to check). The compiler checks the text of the buffer, not the file on disk: the text is written to a file beside the document (`.bastio-lsp-NAME`, so that its imports resolve the same way) for the run and removed after, and the saved file is checked only if that directory cannot be written.
 
 ### Neovim
 

@@ -6,9 +6,18 @@ Thanks for your interest. Bastio is pre-release: the language changes often, and
 
 - [README.md](README.md) says what Bastio is and how to build and test it; [docs/README.md](docs/README.md) indexes the rest.
 - [ROADMAP.md](ROADMAP.md) has the invariants (no raw memory access, zero overhead, a counted trusted base) that every change keeps.
+- [docs/architecture.md](docs/architecture.md) maps the compiler's phases to files and says where to look for a given kind of change.
 - [docs/bootstrap.md](docs/bootstrap.md) explains why new features go into `stage1/` and not `stage0/`, and [stage1/README.md](stage1/README.md) how the compiler is laid out.
 
+To set up a machine in one command (Debian or Ubuntu), run `tools/setup-dev.sh`: it installs Z3, a C compiler and rustup, builds stage0 and bastioc1, and compiles and runs `examples/hello.bastio`. The repository also has a [dev container](.devcontainer/devcontainer.json) that runs it for you, in VS Code or GitHub Codespaces.
+
 Bugs and ideas go in the issue tracker. A program the compiler accepts but should not (a soundness bug) goes through [SECURITY.md](SECURITY.md). A bug report with the smallest program that shows it and the compiler's output is the most useful kind.
+
+## Finding something to work on
+
+Issues labelled [`good first issue`](https://github.com/yukikotani231/bastiolang/labels/good%20first%20issue) are small and say where to start and how to know you are done. [`help wanted`](https://github.com/yukikotani231/bastiolang/labels/help%20wanted) marks larger work that is open to anyone. Comment on the issue before you start, so two people do not do the same thing. The other labels name the area (`area/compiler`, `area/library`, `area/tests`, ...) or the kind of change (`bug`, `enhancement`, `documentation`, `performance`, `proofs`); `.github/labels.yml` is the list.
+
+A change that is not tied to an issue is welcome too, when it is small. For anything that changes the language or adds to the trusted base, open an issue first.
 
 ## Before you send a pull request
 

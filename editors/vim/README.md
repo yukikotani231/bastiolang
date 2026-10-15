@@ -16,6 +16,7 @@ require('bastio').setup({
   cmd = { '/path/to/bastio-lsp' },       -- built from tools/bastio-lsp/lsp.bastio
   bastioc = '/path/to/bastioc1',         -- default: $BASTIOC, else bastioc1 on PATH
   -- target = 'user', lib = { '/path/to/std' },
+  -- check_on_change = true,              -- run the compiler on every edit, not only on open and save
   format_on_save = true,
 })
 ```
