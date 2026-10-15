@@ -34,6 +34,7 @@ if command -v z3 >/dev/null; then
   step "tests/native.sh";    tests/native.sh
   step "tests/native.sh (IR emitter)"; BACKEND=native-ir tests/native.sh
   step "tests/proof_cache.sh"; tests/proof_cache.sh
+  step "tests/tools.sh";     tests/tools.sh
   step "stage1/difftest.sh"; stage1/difftest.sh
   step "tests/fuzz.py (short run)"; tests/fuzz.py --seed 1 --count 1000
   if command -v "${AARCH64_CC:-aarch64-linux-gnu-gcc}" >/dev/null \

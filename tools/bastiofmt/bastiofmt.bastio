@@ -1,0 +1,178 @@
+// bastiofmt: the Bastio source formatter. See fmt.bastio for what it does.
+//
+// usage: bastiofmt [--check | --write] <file.bastio>...
+//        bastiofmt -            (standard input to standard output)
+//   (default)  print the formatted file on standard output
+//   --write    replace each file with its formatted text
+//   --check    change nothing; print the name of each file that is not
+//              formatted, and exit with status 1 if there is one
+// Exit status: 0 on success, 1 for `--check` on an unformatted file, 2 if a
+// file cannot be read or does not lex, 3 if the formatter's output would
+// not lex to the tokens of its input (a bug in the formatter: the file is
+// left alone).
+import "fmt.bastio";
+
+fn to_bytes(v: &Vec[u64]) -> Bytes {
+  let n = vec_len(v);
+  let mut b = balloc(n);
+  let mut k = 0;
+  while k < n && k < blen(b)
+    invariant k <= n && n == vlen(v) && blen(b) == n
+  {
+    let c = vec_get(v, k);
+    if c <= 255 {
+      bset(&mut b, k, cast[u8](c));
+    }
+    k = k + 1;
+  }
+  return b;
+}
+
+fn eprint_str(h: &Host, s: Str) {
+  let b = bfrom(s);
+  host_eprint(h, b);
+  bfree(b);
+}
+
+/// Is `b` the literal `s`?
+fn is_str(b: &Bytes, s: Str) -> bool {
+  if blen(b) != slen(s) {
+    return false;
+  }
+  return spells(b, 0, blen(b), s);
+}
+
+fn host_arg_is(h: &Host, i: u64, s: Str) -> bool {
+  let a = host_arg(h, i);
+  let r = is_str(a, s);
+  bfree(a);
+  return r;
+}
+
+fn put_bytes(con: &mut Serial, b: &Bytes) {
+  let mut k = 0;
+  while k < blen(b)
+    invariant k <= blen(b)
+  {
+    serial_write(con, bget(b, k));
+    k = k + 1;
+  }
+}
+
+/// Reads standard input up to its end.
+fn read_stdin(con: &mut Serial) -> Bytes {
+  let mut v = vec_new[u64]();
+  let mut done = false;
+  while !done {
+    let c = serial_read(con);
+    if c == 4 || vec_len(v) >= SRC_MAX {
+      done = true;
+    } else {
+      vec_push(&mut v, cast[u64](c));
+    }
+  }
+  let b = to_bytes(v);
+  vec_free(v);
+  return b;
+}
+
+fn same_bytes(a: &Bytes, b: &Bytes) -> bool {
+  if blen(a) != blen(b) {
+    return false;
+  }
+  return bytes_span_same(a, 0, b, 0, blen(a));
+}
+
+/// Formats `src`: 0 if `res` now holds the text, else the exit status.
+fn format_one(src: &Bytes, res: &mut Bytes) -> u64 {
+  if blen(src) > SRC_MAX {
+    return 2;
+  }
+  let mut out = vec_new[u64]();
+  if !fmt_source(src, &mut out) {
+    vec_free(out);
+    return 2;
+  }
+  let b = to_bytes(out);
+  vec_free(out);
+  if blen(b) > SRC_MAX || !fmt_same_tokens(src, b) {
+    bfree(b);
+    return 3;
+  }
+  bfree(res);
+  res = b;
+  return 0;
+}
+
+fn main(con: &mut Serial, host: &mut Host) -> u64 {
+  let argc = host_argc(host);
+  let mut check = false;
+  let mut write = false;
+  let mut status = 0;
+  let mut first = 1;
+  if host_arg_is(host, 1, "--check") {
+    check = true;
+    first = 2;
+  } else if host_arg_is(host, 1, "--write") {
+    write = true;
+    first = 2;
+  }
+  if first >= argc {
+    eprint_str(host, "usage: bastiofmt [--check | --write] <file.bastio>... | -\n");
+    return 2;
+  }
+  let mut a = first;
+  while a < argc
+    invariant a <= argc
+  {
+    let path = host_arg(host, a);
+    let mut src = balloc(0);
+    let mut ok = true;
+    if is_str(path, "-") {
+      bfree(src);
+      src = read_stdin(&mut con);
+    } else if !host_read(host, path, &mut src) {
+      eprint_str(host, "bastiofmt: cannot read ");
+      host_eprint(host, path);
+      eprint_str(host, "\n");
+      ok = false;
+      status = 2;
+    }
+    if ok {
+      let mut res = balloc(0);
+      let code = format_one(src, &mut res);
+      if code != 0 {
+        eprint_str(host, "bastiofmt: ");
+        host_eprint(host, path);
+        if code == 2 {
+          eprint_str(host, ": does not lex (run bastioc1 --check for the error)\n");
+        } else {
+          eprint_str(host, ": internal error, the formatted text would change the program\n");
+        }
+        status = code;
+      } else if check {
+        if !same_bytes(src, res) {
+          host_eprint(host, path);
+          eprint_str(host, "\n");
+          if status == 0 {
+            status = 1;
+          }
+        }
+      } else if write && !is_str(path, "-") {
+        if !same_bytes(src, res) && !host_write(host, path, res) {
+          eprint_str(host, "bastiofmt: cannot write ");
+          host_eprint(host, path);
+          eprint_str(host, "\n");
+          status = 2;
+        }
+      } else {
+        put_bytes(&mut con, res);
+      }
+      bfree(res);
+    }
+    bfree(src);
+    bfree(path);
+    a = a + 1;
+  }
+  return status;
+}

@@ -13,6 +13,13 @@ The version is the one in `stage0/Cargo.toml`. A release is a tag `vX.Y.Z` on
 
 What will be 0.2.0.
 
+### Tools
+
+- `tools/bastiofmt`: a source formatter written in Bastio (`bastiofmt file.bastio`,
+  `--write`, `--check`, `-` for standard input). It lays a file out from its
+  tokens and refuses to print anything that does not lex to the same tokens as
+  its input. See [tools/README.md](tools/README.md).
+
 ### Compiler
 
 - `BASTIO_PROOF_CACHE=<dir>`: bastioc1 records each function it has proved
