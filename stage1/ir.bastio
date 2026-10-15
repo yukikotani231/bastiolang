@@ -3507,7 +3507,9 @@ fn ir_invariant(p: &Parser, e: u64, s: u64, en: u64) -> bool {
 /// A loop `while i < n { bset(&mut b, i, v); i = i + 1; }` (the body is just
 /// those two statements, `n` and `v` are variables or literals that the loop
 /// does not change) is one `fill` of the bytes `i .. n` of `b` and `i = n`,
-/// when `i < n` holds on entry. Returns whether it was lowered that way.
+/// when `i < n` holds on entry. With `bget(s, i)` for `v` it is one `copy`
+/// of the bytes `i .. n` of `s` (another buffer). Returns whether it was
+/// lowered that way.
 fn ir_fill_loop(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, w: u64) -> bool {
   let n = node_at(p.nodes, w);
   let cond = node_at(p.nodes, n.a);
@@ -3537,7 +3539,27 @@ fn ir_fill_loop(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, w: u64) -> 
     return false;
   }
   let ix = node_at(p.nodes, a1);
-  if ix.kind != E_VAR || !same(p.src, ix.s, ix.e, ci.s, ci.e) || !ir_invariant(p, a2, ci.s, ci.e) {
+  if ix.kind != E_VAR || !same(p.src, ix.s, ix.e, ci.s, ci.e) {
+    return false;
+  }
+  let vn = node_at(p.nodes, a2);
+  let mut src = 0;
+  if vn.kind == E_CALL && name_is(p, a2, "bget") {
+    // `bset(&mut b, i, bget(s, i))`: a copy from `s`, a different buffer
+    // (a variable `s` spelled like `b` would be the same one).
+    let sa1 = next_of(p, vn.a);
+    let sx = node_at(p.nodes, sa1);
+    let dst = node_at(p.nodes, call.a);
+    let dseg = node_at(p.nodes, dst.a);
+    let sv = node_at(p.nodes, vn.a);
+    if vn.a == 0 || sa1 == 0 || next_of(p, sa1) != 0 || sx.kind != E_VAR || !same(p.src, sx.s, sx.e, ci.s, ci.e) {
+      return false;
+    }
+    if dst.kind != E_MUTBORROW || (sv.kind == E_VAR && dseg.next == 0 && same(p.src, dseg.s, dseg.e, sv.s, sv.e)) {
+      return false;
+    }
+    src = vn.a;
+  } else if !ir_invariant(p, a2, ci.s, ci.e) {
     return false;
   }
   // `i = i + 1`
@@ -3562,14 +3584,24 @@ fn ir_fill_loop(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, w: u64) -> 
   let b = ir_buf(&mut f, c, &mut m, p, call.a, IRK_BYTES);
   let iv = ir_int(&mut f, c, &mut m, p, a1);
   let nv = ir_int(&mut f, c, &mut m, p, cond.b);
-  let v = ir_int(&mut f, c, &mut m, p, a2);
-  if !f.failed {
-    let da = ir_reg(&mut f);
-    ir_emit(&mut f, IR_ADD, da, b.r0, iv, 0, c.tu64);
-    let cnt = ir_reg(&mut f);
-    ir_emit(&mut f, IR_SUB, cnt, nv, iv, 0, c.tu64);
-    ir_emit(&mut f, IR_FILL, IR_NONE, da, v, cnt, 0);
-    ir_emit(&mut f, IR_MOV, target.r0, nv, 0, 0, 0);
+  if src != 0 {
+    let sb = ir_buf(&mut f, c, &mut m, p, src, IRK_BYTES);
+    if !f.failed {
+      let cnt = ir_reg(&mut f);
+      ir_emit(&mut f, IR_SUB, cnt, nv, iv, 0, c.tu64);
+      ir_copy_bytes(&mut f, c, b.r0, iv, sb.r0, iv, cnt);
+      ir_emit(&mut f, IR_MOV, target.r0, nv, 0, 0, 0);
+    }
+  } else {
+    let v = ir_int(&mut f, c, &mut m, p, a2);
+    if !f.failed {
+      let da = ir_reg(&mut f);
+      ir_emit(&mut f, IR_ADD, da, b.r0, iv, 0, c.tu64);
+      let cnt = ir_reg(&mut f);
+      ir_emit(&mut f, IR_SUB, cnt, nv, iv, 0, c.tu64);
+      ir_emit(&mut f, IR_FILL, IR_NONE, da, v, cnt, 0);
+      ir_emit(&mut f, IR_MOV, target.r0, nv, 0, 0, 0);
+    }
   }
   ir_place(&mut f, l_end);
   return true;
