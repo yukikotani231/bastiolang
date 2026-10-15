@@ -15,6 +15,12 @@ What will be 0.2.0.
 
 ### Compiler
 
+- `bastio`, a project tool (`stage1/bastio.bastio`), and `bastioc1 --pkg NAME=DIR`.
+  A directory with a `bastio.toml` is a project; its `[dependencies]` are
+  local directories or git repositories (checked out at a tag or commit and
+  pinned in `bastio.lock`), imported by name: `import "util/math.bastio"`.
+  `bastio build`, `check` and `update`. See docs/packages.md.
+
 - `BASTIO_PROOF_CACHE=<dir>`: bastioc1 records each function it has proved
   (by a hash of its verification conditions, the preamble, the solver and the
   solver's version) and does not send it to the solver again. Checking

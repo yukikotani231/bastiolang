@@ -109,6 +109,7 @@ Started early, alongside v1, because the kernel is the primary target and it sha
 
 `core` and `std` (design consequence 1), in [docs/core.md](docs/core.md).
 - [x] A first `core/` and `std/` (2026-10-10), from the helpers that `stage1/`, BastiOS and the tests wrote again and again: byte-string comparison, search, trimming and splitting by spans; text building on `Vec[u8]`; integer parsing and formatting for every sized type; console printing; endian loads and stores; a `u64` hash map; insertion sort and binary search; host files and standard error. Memory safety is proved, and most functions state what they compute (equality, sortedness, digit-only parses, found keys). `core/` builds for every target
+- [x] Packages (2026-10-15): `bastio.toml`, the `bastio` tool and `bastioc1 --pkg NAME=DIR`: path and git dependencies, versions checked, git pins in `bastio.lock` ([docs/packages.md](docs/packages.md)). Still open: a registry, version solving, a versioned `core`/`std`
 - [ ] Move `stage1/` and BastiOS onto core where it fits (candidates listed in docs/core.md)
 - [x] `old(x)` in loop invariants (2026-10-10, stage0 and stage1), so a loop can say what it leaves alone
 - [x] Local variables may share a function's name (2026-10-10, stage0 and stage1): a call always means the function, so a library's local names no longer leak into its users

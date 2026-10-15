@@ -34,6 +34,7 @@ if command -v z3 >/dev/null; then
   step "tests/native.sh";    tests/native.sh
   step "tests/native.sh (IR emitter)"; BACKEND=native-ir tests/native.sh
   step "tests/proof_cache.sh"; tests/proof_cache.sh
+  step "tests/package.sh";     tests/package.sh
   step "stage1/difftest.sh"; stage1/difftest.sh
   if command -v cvc5 >/dev/null; then
     step "tests/crosscheck.py (cvc5 confirms the proofs)"; tests/crosscheck.py --selftest; tests/crosscheck.py --min-agree 90
