@@ -52,6 +52,7 @@ Each module has a reference page, generated from its source: every function with
 | [`core/print.bastio`](lib/core-print.md) | Writing text and numbers to the serial console. |
 | [`core/ring.bastio`](lib/core-ring.md) | Ring buffers and fixed-capacity FIFO queues. |
 | [`core/rows.bastio`](lib/core-rows.md) | Tables of fixed-size rows in one `Buf`. |
+| [`core/scan.bastio`](lib/core-scan.md) | Cutting a byte string into pieces. |
 | [`core/set.bastio`](lib/core-set.md) | A set of `u64`, built on core/hashmap.bastio. |
 | [`core/slots.bastio`](lib/core-slots.md) | A growable table of numbered slots, for ids that a program hands out and takes back (process ids, file descriptors, pipe and socket numbers). |
 | [`core/sort.bastio`](lib/core-sort.md) | Sorting and searching vectors of `u64`, and sorting indices by a key. |
