@@ -253,21 +253,38 @@ fn ix_w_addr(out: &mut Vec[u64], rb: u64, ri: u64, size: u64) {
 
 /// The address `a[b]` once its parts are in registers (`ri` is 0 for a
 /// constant index `imm`).
-struct IxA { rb: u64, ri: u64, imm: u64 }
+struct IxA { rb: u64, ri: u64, imm: u64, sw: u64 }
 
 /// Loads what the address `a[b]` needs into %rsi and %rdi when it is not in
-/// registers.
+/// registers. The address of a frame slot (`al.cst` 2 or 3, see
+/// `ix_fold_slots`) needs no register: it is written off %rbp.
 fn ix_aprep(out: &mut Vec[u64], al: &IrAlloc, a: u64, b: u64) -> IxA {
-  let rb = ix_use(&mut out, al, a, XR_RSI);
+  let mut rb = XR_RBP;
+  let mut sw = 0;
+  if u_at(al.cst, a) >= 2 {
+    sw = u_at(al.cv, a);
+  } else {
+    rb = ix_use(&mut out, al, a, XR_RSI);
+  }
   let lb = ix_loc(al, b);
   if lb.k == IXK_IMM && lb.imm < 268435456 {
-    return IxA { rb: rb, ri: 0, imm: lb.imm };
+    return IxA { rb: rb, ri: 0, imm: lb.imm, sw: sw };
   }
-  return IxA { rb: rb, ri: ix_use(&mut out, al, b, XR_RDI), imm: 0 };
+  return IxA { rb: rb, ri: ix_use(&mut out, al, b, XR_RDI), imm: 0, sw: sw };
 }
 
 fn ix_awrite(out: &mut Vec[u64], ap: IxA, size: u64) {
-  if ap.ri == 0 {
+  if ap.sw != 0 {
+    w_s(&mut out, "-");
+    w_num(&mut out, wrap_mul(8, ap.sw));
+    if ap.ri == 0 {
+      w_s(&mut out, "+");
+      w_num(&mut out, wrap_mul(ap.imm, size));
+      w_s(&mut out, "(%rbp)");
+    } else {
+      ix_w_addr(&mut out, ap.rb, ap.ri, size);
+    }
+  } else if ap.ri == 0 {
     w_num(&mut out, wrap_mul(ap.imm, size));
     w_s(&mut out, "(");
     w_s(&mut out, x86_rname(ap.rb));
@@ -729,7 +746,9 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
       ix_mov(&mut out, ix_il(q.a), ix_loc(al, q.d));
     }
   } else if op == IR_MOV {
-    ix_mov(&mut out, ix_loc(al, q.a), ix_loc(al, q.d));
+    if u_at(al.cst, q.d) != 3 {
+      ix_mov(&mut out, ix_loc(al, q.a), ix_loc(al, q.d));
+    }
   } else if (op == IR_DIV || op == IR_REM) && lbq.k == IXK_IMM && lbq.imm > 1 && lbq.imm & wrap_sub(lbq.imm, 1) == 0 && (op == IR_DIV || lbq.imm <= 2147483648 || lbq.imm == 4294967296) {
     // A power of two: a shift or a mask, in the result's own register.
     let ld = ix_loc(al, q.d);
@@ -1206,11 +1225,14 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     w_s(&mut out, "(%rip), %rax\n");
     ix_finish(&mut out, al, q.d, XR_RAX);
   } else if op == IR_SLOT {
-    // The address of the slot whose lowest word is `slotw` words below %rbp.
-    w_s(&mut out, "\tlea -");
-    w_num(&mut out, wrap_mul(8, slotw));
-    w_s(&mut out, "(%rbp), %rax\n");
-    ix_finish(&mut out, al, q.d, XR_RAX);
+    // The address of the slot whose lowest word is `slotw` words below %rbp;
+    // nothing to write when every use of it is written off %rbp.
+    if u_at(al.cst, q.d) != 3 {
+      w_s(&mut out, "\tlea -");
+      w_num(&mut out, wrap_mul(8, slotw));
+      w_s(&mut out, "(%rbp), %rax\n");
+      ix_finish(&mut out, al, q.d, XR_RAX);
+    }
   }
 }
 
@@ -1814,6 +1836,141 @@ fn ix_share_slots(f: &mut IrFn, moff: &mut Vec[u64]) -> u64 {
   return area;
 }
 
+/// Can an instruction read slot-address register `r` without it being in a
+/// register: as the base of a load or a store (not as the stored value or
+/// the index), or as the source of a copy `cand` says need not be written?
+fn ix_fold_read(q: IrIns, r: u64, al: &IrAlloc, cand: &Vec[u64]) -> bool {
+  if q.op == IR_LOAD {
+    return q.a == r && q.b != r;
+  }
+  if q.op == IR_STORE {
+    return q.a == r && q.b != r && q.d != r;
+  }
+  if q.op == IR_MOV {
+    return q.a == r && q.d != r && u_at(al.cst, q.d) == 2 && u_at(cand, q.d) == 1;
+  }
+  return false;
+}
+
+/// Marks the registers that hold the address of a frame slot (written once,
+/// by `IR_SLOT` or by a copy of one): `al.cst` is 2 and `al.cv` the slot's
+/// lowest word below %rbp. A load or store through one is written off %rbp
+/// (`ix_aprep`), and where every use is of that kind (`al.cst` 3) the
+/// address itself is never computed.
+fn ix_fold_slots(f: &IrFn, al: &mut IrAlloc, base: u64) {
+  let n = vec_len(f.ins);
+  let nr = f.nreg;
+  let mut ndef = vec_new[u64]();
+  let mut r = 0;
+  while r < nr && r < 1000000000 {
+    vec_push(&mut ndef, 0);
+    r = r + 1;
+  }
+  let mut j = 0;
+  while j < vec_len(f.params) {
+    let pr = vec_get(f.params, j);
+    ra_set(&mut ndef, pr, wrap_add(u_at(ndef, pr), 1));
+    j = j + 1;
+  }
+  let mut i = 0;
+  while i < n {
+    let mut ws = vec_new[u64]();
+    ra_writes(vec_get(f.ins, i), &mut ws);
+    j = 0;
+    while j < vec_len(ws) {
+      let w = vec_get(ws, j);
+      if w < nr {
+        ra_set(&mut ndef, w, wrap_add(u_at(ndef, w), 1));
+      }
+      j = j + 1;
+    }
+    vec_free(ws);
+    i = i + 1;
+  }
+  let mut found = 0;
+  i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    if q.op == IR_SLOT && q.d < nr && u_at(ndef, q.d) == 1 && u_at(al.cst, q.d) == 0 {
+      ra_set(&mut al.cst, q.d, 2);
+      ra_set(&mut al.cv, q.d, wrap_add(base, wrap_add(q.a, q.c)));
+      found = wrap_add(found, 1);
+    }
+    i = i + 1;
+  }
+  if found == 0 {
+    vec_free(ndef);
+    return;
+  }
+  // Copies of those addresses, in a few rounds (a copy of a copy).
+  let mut round = 0;
+  let mut grew = true;
+  while grew && round < 4 {
+    grew = false;
+    i = 0;
+    while i < n {
+      let q = vec_get(f.ins, i);
+      if q.op == IR_MOV && q.d < nr && q.a < nr && q.d != q.a && u_at(ndef, q.d) == 1 && u_at(al.cst, q.d) == 0 && u_at(al.cst, q.a) == 2 {
+        ra_set(&mut al.cst, q.d, 2);
+        ra_set(&mut al.cv, q.d, u_at(al.cv, q.a));
+        grew = true;
+      }
+      i = i + 1;
+    }
+    round = round + 1;
+  }
+  // Which of them are only ever read in a way that needs no register.
+  let mut cand = vec_new[u64]();
+  r = 0;
+  while r < nr && r < 1000000000 {
+    if u_at(al.cst, r) == 2 {
+      vec_push(&mut cand, 1);
+    } else {
+      vec_push(&mut cand, 0);
+    }
+    r = r + 1;
+  }
+  let mut changed = true;
+  while changed {
+    changed = false;
+    i = 0;
+    while i < n {
+      let q = vec_get(f.ins, i);
+      let mut rs = vec_new[u64]();
+      ra_reads(f, q, &mut rs);
+      j = 0;
+      while j < vec_len(rs) {
+        let x = vec_get(rs, j);
+        if x < nr && u_at(cand, x) == 1 && !ix_fold_read(q, x, al, cand) {
+          ra_set(&mut cand, x, 0);
+          changed = true;
+        }
+        j = j + 1;
+      }
+      vec_free(rs);
+      i = i + 1;
+    }
+  }
+  // A parameter or a live-out register is read by no instruction of its own.
+  j = 0;
+  while j < vec_len(f.params) {
+    let pr = vec_get(f.params, j);
+    if pr < nr {
+      ra_set(&mut cand, pr, 0);
+    }
+    j = j + 1;
+  }
+  r = 0;
+  while r < nr && r < 1000000000 {
+    if u_at(cand, r) == 1 {
+      ra_set(&mut al.cst, r, 3);
+    }
+    r = r + 1;
+  }
+  vec_free(cand);
+  vec_free(ndef);
+}
+
 /// Writes function instance `x` from its IR, to `g.out`. False (nothing
 /// written) when the IR does not cover it or the convention does not match.
 fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> bool {
@@ -1885,7 +2042,7 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
     return false;
   }
   let na = x86_regargs(&mut g, c, &mut m, p, x);
-  let al = ra_alloc_const(f, 5, 4);
+  let mut al = ra_alloc_const(f, 5, 4);
   let nuse = ix_uses(f);
   // The frame: saved registers, spills, slots.
   let mut moff = vec_new[u64]();
@@ -1896,6 +2053,7 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   }
   let slots = ix_share_slots(&mut f, &mut moff);
   let base = wrap_add(al.ncallee_used, al.nspill);
+  ix_fold_slots(f, &mut al, base);
   let mut words = wrap_add(base, slots);
   if words % 2 == 1 {
     words = wrap_add(words, 1);
