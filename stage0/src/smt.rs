@@ -92,6 +92,11 @@ impl Solver {
                 }
             }
             out.push_str(&line);
+            // Z3 4.8.12 answers a `get-value` it cannot finish with
+            // `((error "..")`, one parenthesis short: that line is the whole reply.
+            if out.trim_start().starts_with("((error") {
+                break;
+            }
             if depth <= 0 && !out.trim().is_empty() {
                 break;
             }
@@ -116,6 +121,9 @@ impl Solver {
     pub fn get_value(&mut self, term: &str) -> Result<String, String> {
         self.send(&format!("(get-value ({}))", term))?;
         let r = self.read_response()?;
+        if r.starts_with("((error") {
+            return Ok("?".to_string());
+        }
         // r looks like `((term value))`: drop the two outer parens, then take
         // the last balanced s-expression or atom.
         let inner = r.trim();
