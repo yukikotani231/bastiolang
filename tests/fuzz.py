@@ -637,7 +637,8 @@ class Fuzz:
         for d in ("tests/pass", "tests/fail", "examples", "core"):
             for root, _, names in os.walk(os.path.join(ROOT, d)):
                 fs += [os.path.join(root, n) for n in names if n.endswith(".bastio")]
-        return sorted(fs)
+        # bastioc0 cannot compile a stage1-only program, so it would always disagree.
+        return sorted(f for f in fs if not re.search(rb'^// stage1-only:', open(f, "rb").read(), re.M))
 
     TOKEN = re.compile(rb'[A-Za-z_][A-Za-z0-9_]*|0[xX][0-9a-fA-F_]+|[0-9][0-9_]*|"(?:[^"\\\n]|\\.)*"|==>|::|->|=>|==|!=|<=|>=|&&|\|\||<<|>>|//[^\n]*|\s+|.', re.S)
 
@@ -672,6 +673,9 @@ class Fuzz:
         rnd = random.Random(seed)
         orig = rnd.choice(corpus)
         src = open(orig, "rb").read()
+        if re.search(rb'^// stage1-only:', src, re.M):
+            self.stat("stage1-only seed skipped")      # bastioc0 is meant to reject it
+            return
         m = self.mutate(rnd, src)
         try:
             text = m.decode()

@@ -7,6 +7,9 @@ Bastio is a systems language whose memory safety is proved at compile time. The 
 | Page | What it covers |
 | --- | --- |
 | [Tutorial](tutorial.md) | A tour for newcomers: ownership, indices and arithmetic proved by Z3, specifications, calling Bastio from C. Every example is compiled by the tests |
+| [Tutorial part 2: bytes, bits and sized integers](tutorial-bits.md) | `u8` to `i64`, `cast` and `wrap`, bit operators, parsing a binary format |
+| [Tutorial part 3: capabilities](tutorial-capabilities.md) | The console, pages, page tables, ports, device registers and DMA, and what is proved about each |
+| [The toolchain](toolchain.md) | The two compilers, options, targets, backends and what each trusts |
 | [Common proof failures](proof-failures.md) | The errors people meet first, with the counterexample the compiler prints and how to fix each |
 | [Examples](../examples/README.md) | Small programs and proved libraries (base64, UTF-8, DER, QOI) to read and build |
 
@@ -37,7 +40,8 @@ Bastio is a systems language whose memory safety is proved at compile time. The 
 | [Releasing](releasing.md) | How a version is cut |
 | [CHANGELOG.md](../CHANGELOG.md) | What changed, by version |
 | [SECURITY.md](../SECURITY.md) | How to report a soundness or security bug |
-| [Editor support](../editors/README.md) | The tree-sitter grammar and the VS Code extension |
+| [Editor support](../editors/README.md) | The tree-sitter grammar, the VS Code extension and the Vim/Neovim files |
+| [Developer tools](../tools/README.md) | The formatter `bastiofmt` and the language server `bastio-lsp`, with Neovim setup |
 
 ## The kernel written in Bastio
 
