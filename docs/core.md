@@ -56,6 +56,8 @@ Each module has a reference page, generated from its source: every function with
 | [`core/set.bastio`](lib/core-set.md) | A set of `u64`, built on core/hashmap.bastio. |
 | [`core/slots.bastio`](lib/core-slots.md) | A growable table of numbered slots, for ids that a program hands out and takes back (process ids, file descriptors, pipe and socket numbers). |
 | [`core/sort.bastio`](lib/core-sort.md) | Sorting and searching vectors of `u64`, and sorting indices by a key. |
+| [`core/spancmp.bastio`](lib/core-spancmp.md) | Comparing two pieces of a text in byte order. |
+| [`core/strsort.bastio`](lib/core-strsort.md) | Sorting pieces of a text in dictionary order (byte order), for sorted word lists, directory listings and `sort | uniq`. |
 | [`core/text.bastio`](lib/core-text.md) | Building byte strings. |
 | [`core/wtext.bastio`](lib/core-wtext.md) | Text kept as a `Vec[u64]`, one character a word. |
 | [`std/host.bastio`](lib/std-host.md) | The command line, files and standard error, for programs on the hosted target. |

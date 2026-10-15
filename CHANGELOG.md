@@ -102,6 +102,9 @@ What will be 0.2.0.
 
 ### Library
 
+- `core/strsort`: `spans_order` sorts pieces of a text in byte order by
+  returning the indices `0..n` in order, proved a permutation with every
+  neighbouring pair in order; `core/spancmp` has `span_cmp` for one pair.
 - Six new modules. `core/path` splits file names (`path_split`,
   `path_ext`), joins them (`path_join`) and cleans them lexically
   (`path_clean`); every span it returns is proved to lie inside the path.

@@ -40,6 +40,8 @@
   - [core/set.bastio](lib-core-set.md)
   - [core/slots.bastio](lib-core-slots.md)
   - [core/scan.bastio](lib-core-scan.md)
+  - [core/spancmp.bastio](lib-core-spancmp.md)
+  - [core/strsort.bastio](lib-core-strsort.md)
   - [core/sort.bastio](lib-core-sort.md)
   - [core/text.bastio](lib-core-text.md)
   - [core/wtext.bastio](lib-core-wtext.md)
