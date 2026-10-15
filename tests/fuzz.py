@@ -668,6 +668,27 @@ class Fuzz:
                 toks[i], toks[j] = toks[j], toks[i]
         return b"".join(toks)
 
+    def backends_agree(self, text, path, d, where):
+        """An accepted hosted mutant must do the same through the C backend and the native one."""
+        res = {}
+        for backend in ("c", "native"):
+            exe = os.path.join(self.cur.tmp, f"m.{backend}")
+            code, err, _ = compile_([BASTIOC, "--backend", backend, "-o", exe, path], d)
+            if code is None or (code == 4 and backend == "native"):
+                return                      # too slow to prove, or not supported natively yet
+            if code != 0:
+                self.finding("build", text, f"bastioc0 --backend {backend} fails on an accepted mutant: exit {code} ({where})\n{err.decode(errors='replace')[-2000:]}")
+                return
+            try:
+                r = subprocess.run([exe], capture_output=True, timeout=10, stdin=subprocess.DEVNULL)
+            except subprocess.TimeoutExpired:
+                return                      # termination is not proved
+            res[backend] = (r.returncode, r.stdout)
+        self.stat("mutant run on both backends")
+        if res["c"] != res["native"]:
+            self.finding("miscompile", text, f"the C and native backends disagree: C exit {res['c'][0]}, native exit {res['native'][0]}"
+                         + ("" if res["c"][1] == res["native"][1] else ", and their output differs") + f" ({where})")
+
     def mutate_one(self, seed, corpus):
         rnd = random.Random(seed)
         orig = rnd.choice(corpus)
@@ -693,6 +714,8 @@ class Fuzz:
                 return
             self.stat("mutant accepted")
             hosted = not re.search(rb'^// target:', m, re.M) and re.search(rb'^fn main\(\)', m, re.M) and b"Host" not in m and b"Serial" not in m
+            if hosted:
+                self.backends_agree(text, path, d, where)
             if not (hosted and self.san):
                 return
             c = os.path.join(self.cur.tmp, "m.c")
