@@ -84,6 +84,7 @@ fn iropt_fold(f: &mut IrFn) -> u64 {
   while i < vec_len(f.ins) {
     let q = vec_get(f.ins, i);
     let op = q.op;
+    let mut folded = false;
     if (op == IR_ADD || op == IR_SUB || op == IR_MUL || op == IR_AND || op == IR_OR || op == IR_XOR || op == IR_DIV || op == IR_REM) && q.c != 1 && q.d != IR_NONE {
       let x = iropt_cval(cv, q.a);
       let y = iropt_cval(cv, q.b);
@@ -112,7 +113,70 @@ fn iropt_fold(f: &mut IrFn) -> u64 {
             ra_set(&mut cv, q.d, v);
           }
           n = wrap_add(n, 1);
+          folded = true;
         }
+      }
+    }
+    // Compares and negation of constants, and the operations that leave an
+    // operand as it was (`x + 0`, `x * 1`, `x << 0`) or give a constant
+    // whatever the other operand is (`x * 0`, `x & 0`).
+    if q.d != IR_NONE && q.c != 1 && !folded {
+      let x = iropt_cval(cv, q.a);
+      let y = iropt_cval(cv, q.b);
+      let mut r = IrIns { op: 0, d: q.d, a: 0, b: 0, c: 0, ty: 0 };
+      if (op >= IR_EQ && op <= IR_SGE) && x != IR_NONE && y != IR_NONE {
+        let mut t = false;
+        if op == IR_EQ {
+          t = x == y;
+        } else if op == IR_NE {
+          t = x != y;
+        } else if op == IR_LT {
+          t = x < y;
+        } else if op == IR_LE {
+          t = x <= y;
+        } else if op == IR_GT {
+          t = x > y;
+        } else if op == IR_GE {
+          t = x >= y;
+        } else {
+          // Signed: flip the sign bit and compare as unsigned.
+          let xs = x ^ 0x8000000000000000;
+          let ys = y ^ 0x8000000000000000;
+          if op == IR_SLT {
+            t = xs < ys;
+          } else if op == IR_SLE {
+            t = xs <= ys;
+          } else if op == IR_SGT {
+            t = xs > ys;
+          } else {
+            t = xs >= ys;
+          }
+        }
+        r = IrIns { op: IR_CONST, d: q.d, a: 0, b: 0, c: 0, ty: 0 };
+        if t {
+          r.a = 1;
+        }
+      } else if op == IR_NEG && x != IR_NONE {
+        r = IrIns { op: IR_CONST, d: q.d, a: wrap_sub(0, x), b: 0, c: 0, ty: 0 };
+      } else if (op == IR_ADD || op == IR_SUB || op == IR_OR || op == IR_XOR || op == IR_SHL || op == IR_SHR || op == IR_SAR) && y == 0 {
+        r = IrIns { op: IR_MOV, d: q.d, a: q.a, b: 0, c: 0, ty: 0 };
+      } else if (op == IR_MUL || op == IR_DIV) && y == 1 {
+        r = IrIns { op: IR_MOV, d: q.d, a: q.a, b: 0, c: 0, ty: 0 };
+      } else if (op == IR_ADD || op == IR_OR || op == IR_XOR) && x == 0 {
+        r = IrIns { op: IR_MOV, d: q.d, a: q.b, b: 0, c: 0, ty: 0 };
+      } else if op == IR_MUL && x == 1 {
+        r = IrIns { op: IR_MOV, d: q.d, a: q.b, b: 0, c: 0, ty: 0 };
+      } else if (op == IR_MUL || op == IR_AND) && (x == 0 || y == 0) {
+        r = IrIns { op: IR_CONST, d: q.d, a: 0, b: 0, c: 0, ty: 0 };
+      } else if op == IR_REM && y == 1 {
+        r = IrIns { op: IR_CONST, d: q.d, a: 0, b: 0, c: 0, ty: 0 };
+      }
+      if r.op != 0 && !(r.op == IR_MOV && r.a == q.d) {
+        vec_set(&mut f.ins, i, r);
+        if r.op == IR_CONST && u_at(ndef, q.d) == 1 {
+          ra_set(&mut cv, q.d, r.a);
+        }
+        n = wrap_add(n, 1);
       }
     }
     i = i + 1;
