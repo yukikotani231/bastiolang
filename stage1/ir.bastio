@@ -2359,8 +2359,9 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     if f.failed || a == IR_NONE {
       return ir_none();
     }
+    let zero = ir_k(&mut f, 0);
     let d = ir_reg(&mut f);
-    ir_emit(&mut f, IR_LOAD, d, a, 0, 8, 0);
+    ir_emit(&mut f, IR_LOAD, d, a, zero, 8, 0);
     ir_emit(&mut f, IR_FREE, IR_NONE, a, 0, 0, 0);
     return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
   }
@@ -2705,13 +2706,31 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     // An atomic is the address of one word on the heap; every access is
     // sequentially consistent (`xchg` and `lock cmpxchg` are full barriers,
     // a plain load suffices).
-    let t = ir_atomic_ty(f, c, &mut m, p, n.a);
-    if t == 0 {
-      ir_fail(&mut f, "an atomic that is not a parameter holding an integer or bool");
+    let mut t = ir_atomic_ty(f, c, &mut m, p, n.a);
+    let mut hv = ir_expr(&mut f, c, &mut m, p, n.a);
+    if f.failed {
       return ir_none();
     }
-    let at = ir_handle_arg(&mut f, c, &mut m, p, n.a);
-    if f.failed {
+    if hv.k == IRK_PLACE {
+      hv = ir_rv(&mut f, c, m, p, hv);
+    }
+    if f.failed || hv.k != IRK_INT {
+      ir_fail(&mut f, "a page handle that is not one word");
+      return ir_none();
+    }
+    let at = hv.r0;
+    if t == 0 && hv.t != 0 && hv.t != IR_NONE {
+      // Not a parameter: the type the handle was given where it was made.
+      let ht = base_t(m, hv.t);
+      if kind_t(m, ht) == TY_ATOMIC {
+        let it = base_t(m, inner_t(m, ht));
+        if is_int(m, it) || kind_t(m, it) == TY_BOOL {
+          t = it;
+        }
+      }
+    }
+    if t == 0 {
+      ir_fail(&mut f, "an atomic that does not hold an integer or bool");
       return ir_none();
     }
     if name_is(p, i, "atomic_load") {
