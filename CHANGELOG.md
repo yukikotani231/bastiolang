@@ -33,7 +33,7 @@ What will be 0.2.0.
   returning, an integer of the wrong type (with the `cast` and `wrap`
   spelling for the type wanted), a `return` of a value from a function with
   no return type, a linear value consumed in one branch of an `if`, a variant
-  matched twice, and a failed proof of `vec_free` or `unreachable`. Each
+  matched twice, a call with the wrong number of arguments (the parameter types are listed), and a failed proof of `vec_free` or `unreachable`. Each
   message has a golden test in `tests/diag`.
 - `BASTIO_PROOF_CACHE=<dir>`: bastioc1 records each function it has proved
   (by a hash of its verification conditions, the preamble, the solver and the
