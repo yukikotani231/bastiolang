@@ -48,7 +48,7 @@ Example:
 
 ```bastio
 let b = bfrom("pear apple fig apple");
-let words = scan_words(b);
+let words = bytes_split(b, 32);   // at each space
 let order = spans_order(b, words);
 let w0 = vec_get(words, vec_get(order, 0));
 let w3 = vec_get(words, vec_get(order, 3));
