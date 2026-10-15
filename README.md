@@ -109,7 +109,8 @@ bastioc1 is the compiler written in Bastio (`stage1/`); stage0's `bastioc0` only
 | `docs/trusted-base.md` | What the proofs trust, and how that list is kept from growing unnoticed |
 | `docs/ir.md` | The intermediate representation behind the native backend |
 | `docs/README.md` | The index of all documentation |
-| `editors/` | A tree-sitter grammar and a VS Code extension; new syntax must be added there |
+| `editors/` | A tree-sitter grammar, a VS Code extension and Vim/Neovim files; new syntax must be added to the grammars |
+| `tools/` | Developer tools written in Bastio: the formatter `bastiofmt` and the language server `bastio-lsp` |
 | `bench/` | Benchmarks of generated code against C |
 | `site/` | Sources of the documentation website, built with mdBook |
 | `docs/bootstrap.md` | How stage0 builds bastioc1, how to check the bootstrap, and what the stage0 freeze allows |

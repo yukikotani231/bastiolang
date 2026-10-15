@@ -313,18 +313,53 @@ typedef uint64_t bst_lease;                 /* the address of the table it holds
  * (bst_lock_depth). */
 static inline void bst_mmu_settle(void);    /* defined per target */
 static inline void bst_lock_depth(int d);   /* defined per target */
+#ifndef BST_SPIN_PLAIN
+#define BST_SPIN_PLAIN 4096u
+#endif
+#ifdef BST_LOCKSTAT
+/* Diagnostic build (-DBST_LOCKSTAT): per lock, how many times it was taken,
+ * how many of those had to wait, and the time spent waiting and holding,
+ * in TSC ticks. Read bst_lockstat from a debugger. */
+struct bst_ls { uint64_t *w; uint64_t acq, contended, wait, hold, t0; };
+struct bst_ls bst_lockstat[8];
+static inline struct bst_ls *bst_ls_of(uint64_t *w) {
+    for (int i = 0; i < 8; i++) {
+        uint64_t *o = 0;
+        if (__atomic_load_n(&bst_lockstat[i].w, __ATOMIC_ACQUIRE) == w) return &bst_lockstat[i];
+        if (__atomic_compare_exchange_n(&bst_lockstat[i].w, &o, w, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return &bst_lockstat[i];
+    }
+    return &bst_lockstat[7];
+}
+#endif
 static inline void bst_lock_acquire(uint64_t *w) {
+#ifdef BST_LOCKSTAT
+    uint64_t bst_t0 = __builtin_ia32_rdtsc();
+    int bst_waited = 0;
+#endif
     while (__atomic_exchange_n(w, 1, __ATOMIC_ACQUIRE)) {
+#ifdef BST_LOCKSTAT
+        bst_waited = 1;
+#endif
         bst_mmu_settle();
+        unsigned bst_spins = 0;
         while (__atomic_load_n(w, __ATOMIC_RELAXED)) {
 #if defined(__x86_64__) || defined(__i386__)
-            __asm__ volatile ("pause");
+            if (++bst_spins > BST_SPIN_PLAIN) __asm__ volatile ("pause");
 #endif
         }
     }
+#ifdef BST_LOCKSTAT
+    { struct bst_ls *l = bst_ls_of(w); uint64_t t = __builtin_ia32_rdtsc();
+      l->acq++; l->contended += bst_waited; l->wait += t - bst_t0; l->t0 = t; }
+#endif
     bst_lock_depth(1);
 }
-static inline void bst_lock_release(uint64_t *w) { __atomic_store_n(w, 0, __ATOMIC_RELEASE); bst_lock_depth(-1); }
+static inline void bst_lock_release(uint64_t *w) {
+#ifdef BST_LOCKSTAT
+    { struct bst_ls *l = bst_ls_of(w); l->hold += __builtin_ia32_rdtsc() - l->t0; }
+#endif
+    __atomic_store_n(w, 0, __ATOMIC_RELEASE); bst_lock_depth(-1);
+}
 static inline bst_buf bst_set(bst_buf b, uint64_t i, uint64_t v) { b.data[i] = v; return b; }
 "#;
 

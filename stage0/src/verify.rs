@@ -498,6 +498,8 @@ fn proof_hint(code: &str) -> Option<&'static str> {
         "E-VERIFY-CAST" => "check the value first, with an `if` or a `requires`, or use `wrap[T](..)` if wrapping around is meant",
         "E-VERIFY-SHIFT" => "check the shift amount first, with an `if` or a `requires`",
         "E-VERIFY-ALLOC" => "bound the size first, with an `if` or a `requires`",
+        "E-VERIFY-LEAK" => "pop and consume every element first, or show with a `requires` or an `if` that the vector is empty before freeing it",
+        "E-VERIFY-UNREACHABLE" => "an `unreachable` must follow from what is known there: look at the conditions of the enclosing `if`s and the `requires`",
         "E-VERIFY-ASSERT" => "an `assert` must follow from what is known there: the `requires`, the conditions of the enclosing `if`s and loops, and loop invariants",
         _ => return None,
     })

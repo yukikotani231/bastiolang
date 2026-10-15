@@ -13,15 +13,37 @@ The version is the one in `stage0/Cargo.toml`. A release is a tag `vX.Y.Z` on
 
 What will be 0.2.0.
 
+### Tools
+
+- `tools/bastiofmt`: a source formatter written in Bastio (`bastiofmt file.bastio`,
+  `--write`, `--check`, `-` for standard input). It lays a file out from its
+  tokens and refuses to print anything that does not lex to the same tokens as
+  its input. See [tools/README.md](tools/README.md).
+- `tools/bastio-lsp`: a language server written in Bastio. Diagnostics from
+  `bastioc1 --check` (and the lexer while typing), go to definition and hover
+  in the file and its imports, document symbols and formatting.
+- `editors/vim`: file type, syntax, indentation and a Neovim plugin that
+  starts the language server.
+
 ### Compiler
 
+- Diagnostics say what to do about the slips a newcomer meets first: `=`
+  where `==` is meant, `+=`, `var` and `for`, a parameter without its type, a
+  block that is never closed, a function that can reach its end without
+  returning, an integer of the wrong type (with the `cast` and `wrap`
+  spelling for the type wanted), a `return` of a value from a function with
+  no return type, a linear value consumed in one branch of an `if`, a variant
+  matched twice, and a failed proof of `vec_free` or `unreachable`. Each
+  message has a golden test in `tests/diag`.
 - `BASTIO_PROOF_CACHE=<dir>`: bastioc1 records each function it has proved
   (by a hash of its verification conditions, the preamble, the solver and the
   solver's version) and does not send it to the solver again. Checking
   `stage1/bastioc1.bastio` takes about 3.3 s with a warm cache instead of
   13.9 s; changing one function re-proves only that function. Off unless the
   variable is set; the cache is trusted like the solver (see
-  docs/trusted-base.md).
+  docs/trusted-base.md). The key is a hash of the conditions' term structure,
+  each shared term hashed once, so a warm check of the BastiOS kernel takes
+  about 14 s instead of 27 s.
 
 ### Language
 
@@ -80,6 +102,17 @@ What will be 0.2.0.
 
 ### Library
 
+- Six new modules. `core/path` splits file names (`path_split`,
+  `path_ext`), joins them (`path_join`) and cleans them lexically
+  (`path_clean`); every span it returns is proved to lie inside the path.
+  `core/set` is a `HashSet` of `u64`. `core/ascii` has character classes and
+  case conversion, proved byte for byte. `core/lines` splits text into
+  lines (`\n` and `\r\n`), proved to give spans with no newline in them.
+  `core/format` pads columns, joins, replaces, quotes and prints sizes
+  (`fmt_pad_left`, `fmt_join`, `fmt_replace_all`, `fmt_quoted`, `fmt_size`).
+  `core/scan` splits at white space (`scan_words`), at a separator string
+  (`scan_split_str`) and once at a byte (`scan_split_once`, for `key=value`).
+  `std/host` gained `write_file`, `file_exists`, `env_get` and `host_args`.
 - A reference page for every library module (docs/lib/, and in the site):
   each function with its contract as the compiler checks it, what it is for,
   and an example. `tests/libref.py` generates the pages from the doc
