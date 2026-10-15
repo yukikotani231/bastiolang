@@ -456,12 +456,13 @@ impl Parser {
     }
 
     fn block(&mut self) -> PResult<Vec<Stmt>> {
+        let open = self.pos();
         self.expect(Tok::LBrace, "`{`")?;
         let mut out = Vec::new();
         while *self.peek() != Tok::RBrace {
             if *self.peek() == Tok::Eof {
                 return Err(Diag::new("E-PARSE", self.pos(), "unexpected end of file, missing `}`")
-                    .note("a `{` opened earlier is never closed: every `{` needs a matching `}`"));
+                    .note(format!("the `{{` opened at line {} is never closed: every `{{` needs a matching `}}`", open.line)));
             }
             out.push(self.stmt()?);
         }

@@ -1,6 +1,7 @@
 ---
 name: Bug report
 about: The compiler rejects a correct program, crashes, or generates wrong code
+labels: bug
 ---
 
 **The smallest program that shows it**
