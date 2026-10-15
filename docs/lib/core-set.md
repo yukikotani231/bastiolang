@@ -48,7 +48,7 @@ Example:
 
 ```bastio
 let mut s = set_new();
-assert set_len(s) == 0;
+assert s.m.len == 0;
 let fresh = set_insert(&mut s, 7);
 let again = set_insert(&mut s, 7);
 let ok = fresh && !again && set_len(s) == 1 && set_contains(s, 7) && !set_contains(s, 8);
