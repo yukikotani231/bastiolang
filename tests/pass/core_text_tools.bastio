@@ -1,0 +1,124 @@
+// expect-exit: 0
+// ASCII helpers, line splitting and the text formatters on edge cases.
+import "core/ascii.bastio";
+import "core/lines.bastio";
+import "core/format.bastio";
+
+fn nlines(s: Str) -> u64 {
+  let b = bfrom(s);
+  let ls = lines_split(b);
+  let n = vec_len(ls);
+  vec_free(ls);
+  bfree(b);
+  return n;
+}
+
+fn quoted_is(s: Str, want: Str) -> bool {
+  let b = bfrom(s);
+  let mut t = text_new();
+  fmt_quoted(&mut t, b);
+  let q = text_finish(t);
+  let ok = bytes_eq_str(q, want);
+  bfree(q);
+  bfree(b);
+  return ok;
+}
+
+// Bytes 1, 127 and 255 come out as \x01, \x7f and \xff.
+fn quoted_high() -> bool {
+  let mut raw = text_new();
+  text_push(&mut raw, 1);
+  text_push(&mut raw, 127);
+  text_push(&mut raw, 255);
+  let b = text_finish(raw);
+  let mut t = text_new();
+  fmt_quoted(&mut t, b);
+  let q = text_finish(t);
+  let ok = bytes_eq_str(q, "\"\\x01\\x7f\\xff\"");
+  bfree(q);
+  bfree(b);
+  return ok;
+}
+
+fn size_is(n: u64, want: Str) -> bool {
+  let mut t = text_new();
+  fmt_size(&mut t, n);
+  let b = text_finish(t);
+  let ok = bytes_eq_str(b, want);
+  bfree(b);
+  return ok;
+}
+
+fn replace_is(hay: Str, needle: Str, with: Str, want: Str) -> bool
+  requires slen(needle) > 0
+{
+  let h = bfrom(hay);
+  let n = bfrom(needle);
+  let w = bfrom(with);
+  let mut t = text_new();
+  fmt_replace_all(&mut t, h, n, w);
+  let b = text_finish(t);
+  let ok = bytes_eq_str(b, want);
+  bfree(b);
+  bfree(w);
+  bfree(n);
+  bfree(h);
+  return ok;
+}
+
+fn main() -> u64 {
+  // ASCII: only the letters change, and the bytes above 127 are left alone.
+  let mut ok = ascii_to_lower(64) == 64 && ascii_to_lower(65) == 97 && ascii_to_lower(90) == 122
+    && ascii_to_lower(91) == 91 && ascii_to_upper(96) == 96 && ascii_to_upper(97) == 65
+    && ascii_to_upper(122) == 90 && ascii_to_upper(123) == 123 && ascii_to_lower(200) == 200
+    && ascii_to_upper(200) == 200;
+  ok = ok && ascii_is_alpha(65) && !ascii_is_alpha(64) && ascii_is_alnum(57) && !ascii_is_alnum(58)
+    && ascii_is_upper(90) && !ascii_is_upper(91) && ascii_is_lower(97) && !ascii_is_lower(96);
+  // "Caf", the two bytes of an e with an acute accent, a NUL, " ZZ".
+  let mut mt = text_new();
+  text_push_str(&mut mt, "Caf");
+  text_push(&mut mt, 195);
+  text_push(&mut mt, 169);
+  text_push_str(&mut mt, "\0 ZZ");
+  let mixed = text_finish(mt);
+  let low = bytes_to_lower(mixed);
+  let up = bytes_to_upper(mixed);
+  ok = ok && blen(low) == 9 && bget(low, 0) == 99 && bget(low, 3) == 195 && bget(low, 4) == 169
+    && bget(low, 5) == 0 && bget(low, 7) == 122;
+  ok = ok && blen(up) == 9 && bget(up, 1) == 65 && bget(up, 3) == 195 && bget(up, 4) == 169 && bget(up, 7) == 90;
+  bfree(low);
+  bfree(up);
+  bfree(mixed);
+  let e1 = balloc(0);
+  let e2 = balloc(0);
+  let x = bfrom("[");
+  let y = bfrom("{");
+  ok = ok && bytes_eq_nocase(e1, e2) && !bytes_eq_nocase(x, y) && !bytes_eq_nocase(e1, x);
+  bfree(e1);
+  bfree(e2);
+  bfree(x);
+  bfree(y);
+  // Lines.
+  ok = ok && nlines("") == 0 && nlines("\n") == 1 && nlines("a") == 1 && nlines("a\n") == 1
+    && nlines("a\nb") == 2 && nlines("a\nb\n") == 2 && nlines("a\n\nb") == 3 && nlines("\r\n") == 1
+    && nlines("a\r\nb\r\n") == 2 && nlines("\n\n\n") == 3;
+  let crlf = bfrom("a\r\n\rb\n");
+  let ls = lines_split(crlf);
+  ok = ok && vec_len(ls) == 2;
+  if vec_len(ls) == 2 {
+    let l0 = vec_get(ls, 0);
+    let l1 = vec_get(ls, 1);
+    ok = ok && bytes_span_eq_str(crlf, l0.start, l0.end, "a") && bytes_span_eq_str(crlf, l1.start, l1.end, "\rb");
+  }
+  vec_free(ls);
+  bfree(crlf);
+  // Formatting.
+  ok = ok && quoted_is("", "\"\"") && quoted_is("a\\b", "\"a\\\\b\"") && quoted_high()
+    && quoted_is("t\tr\r", "\"t\\tr\\r\"");
+  ok = ok && size_is(0, "0 B") && size_is(1023, "1023 B") && size_is(1024, "1.0 KiB") && size_is(1500, "1.4 KiB")
+    && size_is(1048575, "1023.9 KiB") && size_is(1073741824, "1.0 GiB") && size_is(0xffffffffffffffff, "15.9 EiB");
+  ok = ok && replace_is("", "a", "b", "") && replace_is("aaa", "aa", "X", "Xa") && replace_is("abc", "abc", "", "")
+    && replace_is("xax", "a", "aa", "xaax") && replace_is("abab", "ab", "ba", "baba");
+  if ok { return 0; }
+  return 1;
+}

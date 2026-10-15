@@ -82,3 +82,77 @@ fn write_file_str(h: &Host, path: Str, data: &Bytes) -> bool {
   bfree(p);
   return ok;
 }
+
+/// Creates or replaces the file at `path`.
+/// ```
+/// let p = bfrom("/dev/null");
+/// let data = bfrom("discarded");
+/// let ok = write_file(host, p, data);
+/// bfree(data);
+/// bfree(p);
+/// if !ok { return 1; }
+/// ```
+fn write_file(h: &Host, path: &Bytes, data: &Bytes) -> bool {
+  return host_write(h, path, data);
+}
+
+/// The file at `path` can be read. The whole file is read to find out, so
+/// this is for small files and for checking before a write, not for a path
+/// that is a large file or a device.
+/// ```
+/// let me = host_arg(host, 0);
+/// let there = file_exists(host, me);
+/// bfree(me);
+/// let nowhere = bfrom("/nonexistent/bastio-example");
+/// let missing = file_exists(host, nowhere);
+/// bfree(nowhere);
+/// if !there || missing { return 1; }
+/// ```
+fn file_exists(h: &Host, path: &Bytes) -> bool {
+  match read_file(h, path) {
+    Option::Some(b) => {
+      bfree(b);
+      return true;
+    },
+    Option::None => { return false; },
+  }
+}
+
+/// The value of the environment variable `name`, if it is set.
+/// ```
+/// let mut ok = true;
+/// match env_get(host, "BASTIO_SURELY_UNSET_VARIABLE") {
+///   Option::Some(v) => { bfree(v); ok = false; },
+///   Option::None => {},
+/// }
+/// if !ok { return 1; }
+/// ```
+fn env_get(h: &Host, name: Str) -> Option[Bytes] {
+  let mut out = balloc(0);
+  if host_env(h, name, &mut out) {
+    return Option[Bytes]::Some(out);
+  }
+  bfree(out);
+  return Option[Bytes]::None;
+}
+
+/// All command-line arguments, the program's own name first. Free the result
+/// with `bytes_vec_free`.
+/// ```
+/// let args = host_args(host);
+/// let ok = vec_len(args) >= 1;
+/// bytes_vec_free(args);
+/// if !ok { return 1; }
+/// ```
+fn host_args(h: &Host) -> Vec[Bytes] {
+  let mut v = vec_new[Bytes]();
+  let n = host_argc(h);
+  let mut i = 0;
+  while i < n
+    invariant i <= n
+  {
+    vec_push(&mut v, host_arg(h, i));
+    i = i + 1;
+  }
+  return v;
+}
