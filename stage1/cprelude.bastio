@@ -182,6 +182,14 @@ fn cg_prelude_pages(out: &mut Vec[u64]) {
   w_s(&mut out, "#define BST_PTE_P 1ull\n");
   w_s(&mut out, "#define BST_PTE_W 2ull\n");
   w_s(&mut out, "#define BST_PTE_U 4ull\n");
+  w_s(&mut out, "/* A page the program may write is never one it may run (W^X): the entry\n");
+  w_s(&mut out, " * has the no-execute bit when it is made writable (pt_put_frame and\n");
+  w_s(&mut out, " * pt_put_shared with w), and has not when made read-only, so a page is\n");
+  w_s(&mut out, " * executable if it was mapped read-only (program text) or if the kernel\n");
+  w_s(&mut out, " * made it so by mapping it again read-only. pt_set_access leaves the bit\n");
+  w_s(&mut out, " * alone: a page that becomes writable for a copy-on-write fault keeps what\n");
+  w_s(&mut out, " * its mapping chose. Needs EFER.NXE (boot.S). */\n");
+  w_s(&mut out, "#define BST_PTE_NX (1ull << 63)\n");
   w_s(&mut out, "#define BST_PTE_ADDR 0x000FFFFFFFFFF000ull\n");
   w_s(&mut out, "static inline void bst_zero_page(uint64_t a) {\n");
   w_s(&mut out, "#if defined(__x86_64__)\n");
@@ -250,7 +258,7 @@ fn cg_prelude_pages(out: &mut Vec[u64]) {
   w_s(&mut out, "    __atomic_store_n(&((uint64_t *)*t)[i], c | BST_PTE_P | BST_PTE_W | BST_PTE_U, __ATOMIC_RELEASE);\n");
   w_s(&mut out, "}\n");
   w_s(&mut out, "static inline void bst_pt_put_frame(bst_pt *t, uint64_t i, bst_frame f, bool w) {\n");
-  w_s(&mut out, "    __atomic_store_n(&((uint64_t *)*t)[i], f | BST_PTE_P | BST_PTE_U | (w ? BST_PTE_W : 0), __ATOMIC_RELEASE);\n");
+  w_s(&mut out, "    __atomic_store_n(&((uint64_t *)*t)[i], f | BST_PTE_P | BST_PTE_U | (w ? BST_PTE_W | BST_PTE_NX : 0), __ATOMIC_RELEASE);\n");
   w_s(&mut out, "}\n");
   w_s(&mut out, "/* What slot i points to, left in place (pt_borrow). */\n");
   w_s(&mut out, "static inline uint64_t bst_pt_child(bst_pt t, uint64_t i) { return ((uint64_t *)t)[i] & BST_PTE_ADDR; }\n");
@@ -291,7 +299,7 @@ fn cg_prelude_pages(out: &mut Vec[u64]) {
   w_s(&mut out, "static inline uint64_t bst_shared_id(bst_frame s) { return bst_frame_id(s); }\n");
   w_s(&mut out, "static inline bool bst_pt_shared(bst_pt t, uint64_t i) { return (((uint64_t *)t)[i] & BST_PTE_SHARED) != 0; }\n");
   w_s(&mut out, "static inline void bst_pt_put_shared(bst_pt *t, uint64_t i, bst_frame s, bool w) {\n");
-  w_s(&mut out, "    __atomic_store_n(&((uint64_t *)*t)[i], s | BST_PTE_P | BST_PTE_U | BST_PTE_SHARED | (w ? BST_PTE_W : 0), __ATOMIC_RELEASE);\n");
+  w_s(&mut out, "    __atomic_store_n(&((uint64_t *)*t)[i], s | BST_PTE_P | BST_PTE_U | BST_PTE_SHARED | (w ? BST_PTE_W | BST_PTE_NX : 0), __ATOMIC_RELEASE);\n");
   w_s(&mut out, "}\n");
   w_s(&mut out, "#define bst_pt_take_shared bst_pt_take\n");
   w_s(&mut out, "static inline bst_frame bst_pt_dup_shared(bst_pt t, uint64_t i) { return bst_shared_dup(((uint64_t *)t)[i] & BST_PTE_ADDR); }\n");

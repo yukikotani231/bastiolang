@@ -15,6 +15,11 @@ What will be 0.2.0.
 
 ### Compiler
 
+- The page-table prelude marks a page mapped writable (`pt_put_frame`,
+  `pt_put_shared` with `writable`) no-execute on x86-64, and leaves a
+  read-only one executable, so a kernel that sets `EFER.NXE` gets W^X from
+  how it maps pages. `pt_set_access` leaves the bit alone.
+
 - `BASTIO_PROOF_CACHE=<dir>`: bastioc1 records each function it has proved
   (by a hash of its verification conditions, the preamble, the solver and the
   solver's version) and does not send it to the solver again. Checking
