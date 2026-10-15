@@ -1,0 +1,59 @@
+// expect-exit: 0
+// Word splitting, string separators and key=value cutting on edge cases.
+import "core/scan.bastio";
+
+fn words(s: Str) -> u64 {
+  let b = bfrom(s);
+  let w = scan_words(b);
+  let n = vec_len(w);
+  vec_free(w);
+  bfree(b);
+  return n;
+}
+
+fn pieces(s: Str, sep: Str) -> u64
+  requires slen(sep) > 0
+{
+  let b = bfrom(s);
+  let p = bfrom(sep);
+  let v = scan_split_str(b, p);
+  let n = vec_len(v);
+  vec_free(v);
+  bfree(p);
+  bfree(b);
+  return n;
+}
+
+fn cut_is(s: Str, sep: u8, left: Str, right: Str) -> bool {
+  let b = bfrom(s);
+  let mut ok = false;
+  match scan_split_once(b, Span { start: 0, end: blen(b) }, sep) {
+    Option::Some(p) => {
+      ok = bytes_span_eq_str(b, p.left.start, p.left.end, left)
+        && bytes_span_eq_str(b, p.right.start, p.right.end, right);
+    },
+    Option::None => {},
+  }
+  bfree(b);
+  return ok;
+}
+
+fn main() -> u64 {
+  let mut ok = words("") == 0 && words("   ") == 0 && words("a") == 1 && words(" a ") == 1
+    && words("a b") == 2 && words("a  \t b\n") == 2 && words("\n\na\n\nb\n\nc") == 3;
+  ok = ok && pieces("", ",") == 1 && pieces("a", ",") == 1 && pieces(",", ",") == 2 && pieces("a,,b", ",") == 3
+    && pieces("aaa", "aa") == 2 && pieces("abab", "ab") == 3 && pieces("x", "xyz") == 1;
+  ok = ok && cut_is("k=v", 61, "k", "v") && cut_is("=", 61, "", "") && cut_is("a=b=c", 61, "a", "b=c")
+    && cut_is("k=", 61, "k", "") && !cut_is("kv", 61, "", "");
+  let b = bfrom("a,b,,c");
+  let part = Span { start: 2, end: 6 };
+  ok = ok && scan_count_byte(b, part, 44) == 2 && scan_count_byte(b, Span { start: 3, end: 3 }, 44) == 0;
+  // Cutting only the second half of a string.
+  match scan_split_once(b, part, 44) {
+    Option::Some(p) => { ok = ok && p.left.start == 2 && p.left.end == 3 && p.right.start == 4 && p.right.end == 6; },
+    Option::None => { ok = false; },
+  }
+  bfree(b);
+  if ok { return 0; }
+  return 1;
+}

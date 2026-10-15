@@ -1,0 +1,254 @@
+// core/path.bastio: file names. Paths are byte strings with `/` as the
+// separator, as on the hosted target and BastiOS; splitting returns spans of
+// the path, so no copy is made until a new path is built (`path_join`,
+// `path_clean`).
+//
+// What is proved: every span a function returns lies inside the path it was
+// given; a base name holds no `/`; a joined path ends with the part that was
+// joined; a cleaned path is never empty and is rooted when the
+// input was. Not proved: that `path_clean` removes every `.` and `..` it can,
+// or that two paths a person would call equal clean to equal bytes.
+import "text.bastio";
+
+/// The directory part and the last name of a path (see `path_split`).
+struct PathParts { dir: Span, base: Span }
+
+/// The path starts with `/`.
+spec fn path_rooted(b: &Bytes) -> bool {
+  blen(b) > 0 && bget(b, 0) == 47
+}
+
+/// The path starts with `/`.
+/// ```
+/// let a = bfrom("/etc/passwd");
+/// let r = bfrom("etc/passwd");
+/// let e = balloc(0);
+/// let ok = path_is_absolute(a) && !path_is_absolute(r) && !path_is_absolute(e);
+/// bfree(a);
+/// bfree(r);
+/// bfree(e);
+/// if !ok { return 1; }
+/// ```
+fn path_is_absolute(b: &Bytes) -> bool
+  ensures result == path_rooted(b)
+{
+  return blen(b) > 0 && bget(b, 0) == 47;
+}
+
+/// Splits a path into its directory and its last name, ignoring trailing
+/// slashes: `/usr/lib/` gives `/usr` and `lib`. The directory is empty for a
+/// path with one name (`file`), and `/` for a name directly under the root
+/// (`/file`) or for the root itself, whose base is empty. A directory never
+/// ends with a slash unless it is the root.
+/// ```
+/// let p = bfrom("/usr/lib//libc.so/");
+/// let parts = path_split(p);
+/// let ok = bytes_span_eq_str(p, parts.dir.start, parts.dir.end, "/usr/lib")
+///   && bytes_span_eq_str(p, parts.base.start, parts.base.end, "libc.so");
+/// let q = bfrom("/tmp");
+/// let under_root = path_split(q);
+/// let ok2 = bytes_span_eq_str(q, under_root.dir.start, under_root.dir.end, "/")
+///   && bytes_span_eq_str(q, under_root.base.start, under_root.base.end, "tmp");
+/// bfree(p);
+/// bfree(q);
+/// if !ok || !ok2 { return 1; }
+/// ```
+fn path_split(b: &Bytes) -> PathParts
+  ensures span_in(result.dir, b) && span_in(result.base, b)
+  ensures forall k: u64 :: result.base.start <= k && k < result.base.end ==> bget(b, k) != 47
+  ensures result.base.start < result.base.end ==> result.dir.end <= result.base.start
+{
+  let mut e = blen(b);
+  while e > 0 && bget(b, e - 1) == 47
+    invariant e <= blen(b)
+  {
+    e = e - 1;
+  }
+  let mut s = e;
+  while s > 0 && bget(b, s - 1) != 47
+    invariant s <= e && e <= blen(b)
+    invariant forall k: u64 :: s <= k && k < e ==> bget(b, k) != 47
+  {
+    s = s - 1;
+  }
+  let mut d = s;
+  while d > 0 && bget(b, d - 1) == 47
+    invariant d <= s && s <= e
+  {
+    d = d - 1;
+  }
+  if d == 0 && blen(b) > 0 && bget(b, 0) == 47 {
+    return PathParts { dir: Span { start: 0, end: 1 }, base: Span { start: s, end: e } };
+  }
+  return PathParts { dir: Span { start: 0, end: d }, base: Span { start: s, end: e } };
+}
+
+/// The extension of the name `base` (a span of `b`, usually from
+/// `path_split`): the bytes after its last `.`, if that dot is not the first
+/// byte of the name and something follows it. `.bashrc` and `name.` have none.
+/// ```
+/// let p = bfrom("/src/main.tar.gz");
+/// let parts = path_split(p);
+/// let mut ok = false;
+/// match path_ext(p, parts.base) {
+///   Option::Some(e) => { ok = bytes_span_eq_str(p, e.start, e.end, "gz"); },
+///   Option::None => {},
+/// }
+/// let h = bfrom("/home/.bashrc");
+/// let hp = path_split(h);
+/// let hidden = path_ext(h, hp.base);
+/// let bad = hidden is Option::Some;
+/// bfree(p);
+/// bfree(h);
+/// if !ok || bad { return 1; }
+/// ```
+fn path_ext(b: &Bytes, base: Span) -> Option[Span]
+  requires span_in(base, b)
+  ensures result is Option::Some ==> base.start + 1 < result.Some.start && result.Some.start < result.Some.end
+  ensures result is Option::Some ==> result.Some.end == base.end && bget(b, result.Some.start - 1) == 46
+{
+  match bytes_rfind_byte(b, 46, base.end) {
+    Option::Some(i) => {
+      if i > base.start && i + 1 < base.end {
+        return Option[Span]::Some(Span { start: i + 1, end: base.end });
+      }
+      return Option[Span]::None;
+    },
+    Option::None => { return Option[Span]::None; },
+  }
+}
+
+/// The path `a/b`. A rooted `b` replaces `a`, an empty `b` gives `a`, and a
+/// slash is added only if `a` is not empty and does not end with one.
+/// ```
+/// let a = bfrom("/usr/lib");
+/// let b = bfrom("libc.so");
+/// let r = bfrom("/etc");
+/// let j = path_join(a, b);
+/// let k = path_join(a, r);
+/// // The joined path ends with the part that was joined.
+/// assert blen(j) >= blen(b);
+/// let ok = bytes_eq_str(j, "/usr/lib/libc.so") && bytes_eq_str(k, "/etc");
+/// bfree(j);
+/// bfree(k);
+/// bfree(a);
+/// bfree(b);
+/// bfree(r);
+/// if !ok { return 1; }
+/// ```
+fn path_join(a: &Bytes, b: &Bytes) -> Bytes
+  ensures blen(result) >= blen(b) && blen(result) <= blen(a) + blen(b) + 1
+  ensures bytes_same_at(result, blen(result) - blen(b), b, 0, blen(b))
+{
+  let mut t = text_new();
+  if blen(b) == 0 {
+    text_push_bytes(&mut t, a);
+    let r0 = text_finish(t);
+    return r0;
+  }
+  if bget(b, 0) != 47 && blen(a) > 0 {
+    text_push_bytes(&mut t, a);
+    if bget(a, blen(a) - 1) != 47 {
+      text_push(&mut t, 47);
+    }
+  }
+  text_push_bytes(&mut t, b);
+  let r = text_finish(t);
+  return r;
+}
+
+/// The span is the name `..`.
+spec fn name_is_dotdot(b: &Bytes, s: Span) -> bool {
+  s.end == s.start + 2 && bget(b, s.start) == 46 && bget(b, s.start + 1) == 46
+}
+
+/// Internal: whether the span `s` of `b` is the name `..`.
+fn span_is_dotdot(b: &Bytes, s: Span) -> bool
+  requires span_in(s, b)
+  ensures result == name_is_dotdot(b, s)
+{
+  return s.end - s.start == 2 && bget(b, s.start) == 46 && bget(b, s.start + 1) == 46;
+}
+
+/// A lexically simplified copy of the path: repeated and trailing slashes,
+/// `.` names, and a name followed by `..` are removed. A `..` that has
+/// nothing before it to cancel is dropped in a rooted path and kept in a
+/// relative one. No file is looked at, so a symbolic link is not followed.
+/// The result is never empty (an empty result is written `.`) and it is
+/// rooted if the input is.
+/// ```
+/// let p = bfrom("/usr//lib/./x/../libc.so/");
+/// let c = path_clean(p);
+/// assert blen(c) >= 1;
+/// let ok = bytes_eq_str(c, "/usr/lib/libc.so");
+/// let up = bfrom("../a/../../b");
+/// let u = path_clean(up);
+/// let ok2 = bytes_eq_str(u, "../../b");
+/// let above = bfrom("/../..");
+/// let r = path_clean(above);
+/// let ok3 = bytes_eq_str(r, "/");
+/// let nothing = bfrom("a/..");
+/// let n = path_clean(nothing);
+/// let ok4 = bytes_eq_str(n, ".");
+/// bfree(p);
+/// bfree(c);
+/// bfree(up);
+/// bfree(u);
+/// bfree(above);
+/// bfree(r);
+/// bfree(nothing);
+/// bfree(n);
+/// if !ok || !ok2 || !ok3 || !ok4 { return 1; }
+/// ```
+fn path_clean(b: &Bytes) -> Bytes
+  ensures blen(result) >= 1
+  ensures path_rooted(b) ==> path_rooted(result)
+{
+  let rooted = blen(b) > 0 && bget(b, 0) == 47;
+  let parts = bytes_split(b, 47);
+  let mut stack = vec_new[Span]();
+  let mut i = 0;
+  while i < vec_len(parts)
+    invariant i <= vlen(parts)
+    invariant forall k: u64 :: k < vlen(parts) ==> span_in(vget(parts, k), b)
+    invariant forall k: u64 :: k < vlen(stack) ==> span_in(vget(stack, k), b)
+  {
+    let p = vec_get(parts, i);
+    let n = p.end - p.start;
+    if n == 0 {
+    } else if n == 1 && bget(b, p.start) == 46 {
+    } else if span_is_dotdot(b, p) {
+      if vec_len(stack) > 0 && !span_is_dotdot(b, vec_get(stack, vec_len(stack) - 1)) {
+        let dropped = vec_pop(&mut stack);
+      } else if !rooted {
+        vec_push(&mut stack, p);
+      }
+    } else {
+      vec_push(&mut stack, p);
+    }
+    i = i + 1;
+  }
+  let mut t = text_new();
+  if rooted {
+    text_push(&mut t, 47);
+  }
+  let mut j = 0;
+  while j < vec_len(stack)
+    invariant j <= vlen(stack)
+    invariant forall k: u64 :: k < vlen(stack) ==> span_in(vget(stack, k), b)
+    invariant rooted ==> vlen(t) >= 1 && vget(t, 0) == 47
+  {
+    if j > 0 {
+      text_push(&mut t, 47);
+    }
+    let q = vec_get(stack, j);
+    text_push_span(&mut t, b, q.start, q.end);
+    j = j + 1;
+  }
+  if vec_len(t) == 0 {
+    text_push(&mut t, 46);
+  }
+  vec_free(parts);
+  vec_free(stack);
+  return text_finish(t);
+}

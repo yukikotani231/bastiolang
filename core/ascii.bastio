@@ -1,0 +1,186 @@
+// core/ascii.bastio: ASCII character classes and case conversion. Bytes at
+// 128 and above are never changed or classified, so UTF-8 text passes
+// through untouched.
+//
+// What is proved: each classifier returns exactly the range test its spec fn
+// names, and the case conversions change exactly the letters of the other
+// case and nothing else, byte for byte, keeping the length.
+import "bytes.bastio";
+
+/// `c` is `A`..`Z`.
+spec fn ascii_upper_spec(c: u8) -> bool {
+  65 <= c && c <= 90
+}
+
+/// `c` is `a`..`z`.
+spec fn ascii_lower_spec(c: u8) -> bool {
+  97 <= c && c <= 122
+}
+
+/// `x` and `y` are the same letter in the same or a different case, or the
+/// same byte.
+spec fn ascii_fold_eq(x: u8, y: u8) -> bool {
+  x == y || (ascii_upper_spec(x) && y == x + 32) || (ascii_upper_spec(y) && x == y + 32)
+}
+
+/// `c` is `A`..`Z`.
+/// ```
+/// if !ascii_is_upper(65) || ascii_is_upper(97) || ascii_is_upper(64) { return 1; }
+/// ```
+fn ascii_is_upper(c: u8) -> bool
+  ensures result == ascii_upper_spec(c)
+{
+  return 65 <= c && c <= 90;
+}
+
+/// `c` is `a`..`z`.
+/// ```
+/// if !ascii_is_lower(122) || ascii_is_lower(65) || ascii_is_lower(123) { return 1; }
+/// ```
+fn ascii_is_lower(c: u8) -> bool
+  ensures result == ascii_lower_spec(c)
+{
+  return 97 <= c && c <= 122;
+}
+
+/// `c` is a letter.
+/// ```
+/// if !ascii_is_alpha(90) || !ascii_is_alpha(97) || ascii_is_alpha(48) || ascii_is_alpha(233) { return 1; }
+/// ```
+fn ascii_is_alpha(c: u8) -> bool
+  ensures result == (ascii_upper_spec(c) || ascii_lower_spec(c))
+{
+  return (65 <= c && c <= 90) || (97 <= c && c <= 122);
+}
+
+/// `c` is a letter or a decimal digit.
+/// ```
+/// if !ascii_is_alnum(48) || !ascii_is_alnum(65) || ascii_is_alnum(95) || ascii_is_alnum(32) { return 1; }
+/// ```
+fn ascii_is_alnum(c: u8) -> bool
+  ensures result == (ascii_upper_spec(c) || ascii_lower_spec(c) || (48 <= c && c <= 57))
+{
+  return (65 <= c && c <= 90) || (97 <= c && c <= 122) || (48 <= c && c <= 57);
+}
+
+/// `c` in lower case if it is a capital letter, else `c`.
+/// ```
+/// let a = ascii_to_lower(72);   // 'H'
+/// let b = ascii_to_lower(104);  // 'h'
+/// let c = ascii_to_lower(49);   // '1'
+/// assert a == 104 && b == 104 && c == 49;
+/// ```
+fn ascii_to_lower(c: u8) -> u8
+  ensures ascii_upper_spec(c) ==> result == c + 32
+  ensures !ascii_upper_spec(c) ==> result == c
+{
+  if 65 <= c && c <= 90 {
+    return c + 32;
+  }
+  return c;
+}
+
+/// `c` in upper case if it is a small letter, else `c`.
+/// ```
+/// let a = ascii_to_upper(104);  // 'h'
+/// let c = ascii_to_upper(49);   // '1'
+/// assert a == 72 && c == 49;
+/// ```
+fn ascii_to_upper(c: u8) -> u8
+  ensures ascii_lower_spec(c) ==> result == c - 32
+  ensures !ascii_lower_spec(c) ==> result == c
+{
+  if 97 <= c && c <= 122 {
+    return c - 32;
+  }
+  return c;
+}
+
+/// A copy of `b` with every capital letter made small.
+/// ```
+/// let b = bfrom("Content-Type: Text/HTML");
+/// let l = bytes_to_lower(b);
+/// assert blen(l) == blen(b);
+/// let ok = bytes_eq_str(l, "content-type: text/html");
+/// bfree(l);
+/// bfree(b);
+/// if !ok { return 1; }
+/// ```
+fn bytes_to_lower(b: &Bytes) -> Bytes
+  ensures blen(result) == blen(b)
+  ensures forall k: u64 :: k < blen(b) ==> (ascii_upper_spec(bget(b, k)) ==> bget(result, k) == bget(b, k) + 32)
+  ensures forall k: u64 :: k < blen(b) ==> (!ascii_upper_spec(bget(b, k)) ==> bget(result, k) == bget(b, k))
+{
+  let mut r = balloc(blen(b));
+  let mut i = 0;
+  while i < blen(b)
+    invariant i <= blen(b) && blen(r) == blen(b)
+    invariant forall k: u64 :: k < i ==> (ascii_upper_spec(bget(b, k)) ==> bget(r, k) == bget(b, k) + 32)
+    invariant forall k: u64 :: k < i ==> (!ascii_upper_spec(bget(b, k)) ==> bget(r, k) == bget(b, k))
+  {
+    bset(&mut r, i, ascii_to_lower(bget(b, i)));
+    i = i + 1;
+  }
+  return r;
+}
+
+/// A copy of `b` with every small letter made a capital.
+/// ```
+/// let b = bfrom("Mixed Case 42");
+/// let u = bytes_to_upper(b);
+/// let ok = bytes_eq_str(u, "MIXED CASE 42");
+/// bfree(u);
+/// bfree(b);
+/// if !ok { return 1; }
+/// ```
+fn bytes_to_upper(b: &Bytes) -> Bytes
+  ensures blen(result) == blen(b)
+  ensures forall k: u64 :: k < blen(b) ==> (ascii_lower_spec(bget(b, k)) ==> bget(result, k) == bget(b, k) - 32)
+  ensures forall k: u64 :: k < blen(b) ==> (!ascii_lower_spec(bget(b, k)) ==> bget(result, k) == bget(b, k))
+{
+  let mut r = balloc(blen(b));
+  let mut i = 0;
+  while i < blen(b)
+    invariant i <= blen(b) && blen(r) == blen(b)
+    invariant forall k: u64 :: k < i ==> (ascii_lower_spec(bget(b, k)) ==> bget(r, k) == bget(b, k) - 32)
+    invariant forall k: u64 :: k < i ==> (!ascii_lower_spec(bget(b, k)) ==> bget(r, k) == bget(b, k))
+  {
+    bset(&mut r, i, ascii_to_upper(bget(b, i)));
+    i = i + 1;
+  }
+  return r;
+}
+
+/// `a` and `b` are the same length and equal apart from the case of letters
+/// (header names, command names, file extensions).
+/// ```
+/// let a = bfrom("Content-Length");
+/// let b = bfrom("content-LENGTH");
+/// let c = bfrom("content-width");
+/// let same = bytes_eq_nocase(a, b);
+/// let differ = bytes_eq_nocase(a, c);
+/// bfree(a);
+/// bfree(b);
+/// bfree(c);
+/// if !same || differ { return 1; }
+/// ```
+fn bytes_eq_nocase(a: &Bytes, b: &Bytes) -> bool
+  ensures result ==> blen(a) == blen(b) && (forall k: u64 :: k < blen(a) ==> ascii_fold_eq(bget(a, k), bget(b, k)))
+{
+  if blen(a) != blen(b) {
+    return false;
+  }
+  let mut i = 0;
+  while i < blen(a)
+    invariant i <= blen(a) && blen(a) == blen(b)
+    invariant forall k: u64 :: k < i ==> ascii_fold_eq(bget(a, k), bget(b, k))
+  {
+    let x = bget(a, i);
+    let y = bget(b, i);
+    if x != y && ascii_to_lower(x) != ascii_to_lower(y) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
