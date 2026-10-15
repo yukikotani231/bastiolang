@@ -351,7 +351,7 @@ fn ir_atomic_ty(f: &IrFn, c: &Checker, m: &mut Mono, p: &Parser, a: u64) -> u64 
         return 0;
       }
       let t = base_t(m, inner_t(m, pt));
-      if is_int(m, t) || kind_t(m, t) == TY_BOOL {
+      if is_int(m, t) || kind_t(m, t) == TY_BOOL || ir_word_struct(c, m, p, t) {
         return t;
       }
       return 0;
@@ -359,6 +359,29 @@ fn ir_atomic_ty(f: &IrFn, c: &Checker, m: &mut Mono, p: &Parser, a: u64) -> u64 
     q = qn.next;
   }
   return 0;
+}
+
+/// Is `t` a struct the IR keeps in one register (an atomic can hold it)?
+fn ir_word_struct(c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
+  let u = base_t(m, t);
+  return kind_t(m, u) == TY_STRUCT && ir_kind(c, m, p, u) == IRK_STRUCT && ir_words(c, m, p, u, 0) == 1;
+}
+
+/// The one word that argument `a` of an atomic operation is: an integer, or
+/// the register of a one-word struct (`sw`).
+fn ir_atomic_arg(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, a: u64, sw: bool) -> u64 {
+  if !sw {
+    return ir_int(&mut f, c, &mut m, p, a);
+  }
+  let v = ir_vexpr(&mut f, c, &mut m, p, a);
+  if f.failed {
+    return IR_NONE;
+  }
+  if v.k != IRK_STRUCT {
+    ir_fail(&mut f, "an atomic operand of another kind");
+    return IR_NONE;
+  }
+  return v.r0;
 }
 
 /// The index of the page at address register `fr`: the runtime's lookup in
@@ -2355,14 +2378,29 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     return IrVal { k: IRK_INT, r0: ptr, r1: IR_NONE, t: intern(&mut m, p, kind, t0) };
   }
   if name_is(p, i, "atomic_end") {
-    let a = ir_handle_arg(&mut f, c, &mut m, p, n.a);
-    if f.failed || a == IR_NONE {
+    let mut hv = ir_expr(&mut f, c, &mut m, p, n.a);
+    if f.failed {
       return ir_none();
+    }
+    if hv.k == IRK_PLACE {
+      hv = ir_rv(&mut f, c, m, p, hv);
+    }
+    if f.failed || hv.k != IRK_INT || hv.r0 == IR_NONE {
+      ir_fail(&mut f, "a page handle that is not one word");
+      return ir_none();
+    }
+    let a = hv.r0;
+    let mut et = 0;
+    if hv.t != 0 && hv.t != IR_NONE && kind_t(m, base_t(m, hv.t)) == TY_ATOMIC {
+      et = base_t(m, inner_t(m, base_t(m, hv.t)));
     }
     let zero = ir_k(&mut f, 0);
     let d = ir_reg(&mut f);
     ir_emit(&mut f, IR_LOAD, d, a, zero, 8, 0);
     ir_emit(&mut f, IR_FREE, IR_NONE, a, 0, 0, 0);
+    if et != 0 && ir_word_struct(c, m, p, et) {
+      return IrVal { k: IRK_STRUCT, r0: d, r1: 1, t: et };
+    }
     return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
   }
   if name_is(p, i, "lock_end") {
@@ -2707,6 +2745,7 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     // sequentially consistent (`xchg` and `lock cmpxchg` are full barriers,
     // a plain load suffices).
     let mut t = ir_atomic_ty(f, c, &mut m, p, n.a);
+    let declared = t != 0;
     let mut hv = ir_expr(&mut f, c, &mut m, p, n.a);
     if f.failed {
       return ir_none();
@@ -2724,22 +2763,26 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       let ht = base_t(m, hv.t);
       if kind_t(m, ht) == TY_ATOMIC {
         let it = base_t(m, inner_t(m, ht));
-        if is_int(m, it) || kind_t(m, it) == TY_BOOL {
+        if is_int(m, it) || kind_t(m, it) == TY_BOOL || ir_word_struct(c, m, p, it) {
           t = it;
         }
       }
     }
     if t == 0 {
-      ir_fail(&mut f, "an atomic that does not hold an integer or bool");
+      ir_fail(&mut f, "an atomic that does not hold an integer, a bool or a one-word struct");
       return ir_none();
     }
+    let sw = ir_word_struct(c, m, p, t);
     if name_is(p, i, "atomic_load") {
       let zero = ir_k(&mut f, 0);
       let d = ir_reg(&mut f);
       ir_emit(&mut f, IR_LOAD, d, at, zero, 8, 0);
+      if sw {
+        return IrVal { k: IRK_STRUCT, r0: d, r1: 1, t: t };
+      }
       return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
     }
-    let v = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    let v = ir_atomic_arg(&mut f, c, &mut m, p, cg_arg(p, i, 1), sw);
     if f.failed {
       return ir_none();
     }
@@ -2749,10 +2792,13 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       if name_is(p, i, "atomic_store") {
         return ir_none();
       }
+      if sw {
+        return IrVal { k: IRK_STRUCT, r0: d, r1: 1, t: t };
+      }
       return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
     }
     if name_is(p, i, "atomic_cas") {
-      let nw = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 2));
+      let nw = ir_atomic_arg(&mut f, c, &mut m, p, cg_arg(p, i, 2), sw);
       if f.failed {
         return ir_none();
       }
@@ -2761,7 +2807,12 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
     }
     // wrap_add: a compare-and-swap loop, so the sum wraps at the width of
-    // the type.
+    // the type. The width is only known for a parameter, where the type is
+    // written down: an atomic made here records its contents as a u64.
+    if !declared || sw {
+      ir_fail(&mut f, "an atomic_wrap_add on an atomic that is not a parameter");
+      return ir_none();
+    }
     let l_again = ir_label(&mut f);
     let l_done = ir_label(&mut f);
     let prev = ir_reg(&mut f);
