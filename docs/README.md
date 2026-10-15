@@ -26,6 +26,7 @@ Bastio is a systems language whose memory safety is proved at compile time. The 
 
 | Page | What it covers |
 | --- | --- |
+| [How the compiler is put together](architecture.md) | A map for newcomers: the phases, where each lives, and where to look for a given kind of change |
 | [Bootstrapping](bootstrap.md) | How the Rust compiler `bastioc0` builds `bastioc1`, how to check the fixed point, and what the stage0 freeze allows |
 | [Stage 1](../stage1/README.md) | The structure of `bastioc1`, the compiler written in Bastio |
 | [The IR](ir.md) | The intermediate representation behind the native backend |

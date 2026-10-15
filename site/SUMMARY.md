@@ -53,6 +53,7 @@
   - [BastiOS against Linux](bastios-performance.md)
 - [Roadmap](roadmap.md)
 - [Contributing](contributing.md)
+- [How the compiler is put together](architecture.md)
 - [Bootstrapping](bootstrap.md)
 - [The trusted base](trusted-base.md)
 - [The IR](ir.md)
