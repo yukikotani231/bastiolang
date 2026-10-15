@@ -50,7 +50,7 @@ For every program in `tests/pass`, the script takes the exact session the compil
 
 The percentage of confirmed queries is printed on every run. It is the number to raise: lowering the unchecked share (option C first, then a longer cvc5 limit) is how this step grows into A's coverage.
 
-The script uses stage0's dump because the two compilers produce the same commands (`stage1/difftest.sh`), and it needs `z3` and `cvc5` on the path (`apt install z3 cvc5`). Run it with `tests/ci.sh`. It also takes other programs and compiler flags: `CROSSCHECK_BASTIOC=stage0/target/release/bastioc1 tests/crosscheck.py stage1/bastioc1.bastio` (the compiler itself, which CI checks) or BastiOS's kernel (`--args "--lib ... --target kernel" src/main.bastio`).
+The script uses stage0's dump because the two compilers produce the same commands (`stage1/difftest.sh`), and it needs `z3` and `cvc5` on the path (`apt install z3 cvc5`). Run it with `tests/ci.sh`. It also takes other programs and compiler flags: `CROSSCHECK_BASTIOC=stage0/target/release/bastioc1 tests/crosscheck.py stage1/bastioc1.bastio` (the compiler itself, which CI checks) or BastiOS's kernel (`--args "--lib ... --target kernel" src/main.bastio` with `--tlimit 1000`). Long sessions are cut at `(reset)` into pieces that run in parallel. The kernel has about 46,700 proofs: on 4 cores the check takes 20 minutes (cvc5 confirms 98.4%, none disagree), so it is run by hand before a release, not on every push.
 
 ## What is not covered
 
