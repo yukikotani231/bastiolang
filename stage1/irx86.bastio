@@ -661,8 +661,47 @@ fn ix_mentions(v: &Vec[u64], pat: Str) -> bool {
   return false;
 }
 
+/// Does the code `ix_ins` writes for `q` leave %rax as it was? Only the
+/// shapes that need no scratch register: a store of a register or a small
+/// constant, and an add into another register (one `lea`).
+fn ix_keeps_rax(al: &IrAlloc, m: &Mono, q: IrIns) -> bool {
+  if q.op == IR_STORE {
+    let lv = ix_loc(al, q.d);
+    return (lv.k == IXK_IMM && ix_fits(lv.imm)) || lv.k == IXK_REG;
+  }
+  if q.op == IR_CONST {
+    let ld = ix_loc(al, q.d);
+    return u_at(al.cst, q.d) != 0 || ld.k == IXK_REG;
+  }
+  if q.op == IR_MOV {
+    let ld = ix_loc(al, q.d);
+    let la = ix_loc(al, q.a);
+    return u_at(al.cst, q.d) == 3 || (ld.k == IXK_REG && (la.k == IXK_REG || la.k == IXK_IMM));
+  }
+  let wrap = q.c == 1 && q.ty != 0 && slen(x86_normalize(m, q.ty)) > 0;
+  if q.op == IR_ADD && !wrap {
+    let ld = ix_loc(al, q.d);
+    let la = ix_loc(al, q.a);
+    let lb = ix_loc(al, q.b);
+    if ld.k == IXK_REG && la.k == IXK_REG && la.reg != ld.reg {
+      return (lb.k == IXK_IMM && ix_fits(lb.imm)) || (lb.k == IXK_REG && lb.reg != ld.reg);
+    }
+  }
+  return false;
+}
+
+/// Does `ix_ins` leave the processor's context block in %rax for `q`? A
+/// `cpu_set` does; a `cpu_get` does unless its result is loaded through %rax.
+fn ix_sets_ctx(al: &IrAlloc, q: IrIns) -> bool {
+  if q.op == IR_PCALL && q.c == 6 {
+    return true;
+  }
+  let ld = ix_loc(al, q.d);
+  return q.op == IR_PCALL && q.c == 3 && ld.k == IXK_REG;
+}
+
 /// One instruction other than control flow and calls.
-fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: &Parser, q: IrIns, slotw: u64) {
+fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: &Parser, q: IrIns, slotw: u64, ctxlive: bool) {
   let op = q.op;
   let alu = ix_alu(op);
   let lbq = ix_loc(al, q.b);
@@ -992,7 +1031,9 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     } else {
       ix_mov(&mut out, la, ix_rl(XR_RDI));
     }
-    w_s(&mut out, "\tmov %rsp, %rax\n\tand $bst_platform_ctx_mask, %rax\n");
+    if !ctxlive {
+      w_s(&mut out, "\tmov %rsp, %rax\n\tand $bst_platform_ctx_mask, %rax\n");
+    }
     let mut addr = vec_new[u64]();
     if disp {
       w_num(&mut addr, wrap_mul(8, la.imm));
@@ -1377,8 +1418,14 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
   // Slots and the result areas of calls that return into the frame share
   // one area (`ix_share_slots`).
   let slotw = base;
+  // %rax holds the processor's context block (cpu_get and cpu_set write it)
+  // from the last of those instructions, if only instructions that keep
+  // %rax came since.
+  let mut ctx = false;
   let mut i = 0;
   while i < n {
+    let live = ctx;
+    ctx = false;
     let q = vec_get(f.ins, i);
     let nq = ix_at(f, i + 1);
     let nq2 = ix_at(f, i + 2);
@@ -1505,7 +1552,8 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       if q.op == IR_SLOT {
         sw = wrap_add(base, wrap_add(q.a, q.c));
       }
-      ix_ins(&mut out, f, al, &mut g, m, p, q, sw);
+      ix_ins(&mut out, f, al, &mut g, m, p, q, sw, live);
+      ctx = ix_sets_ctx(al, q) || (live && ix_keeps_rax(al, m, q));
     }
     i = i + 1;
   }
