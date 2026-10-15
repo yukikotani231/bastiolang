@@ -16,6 +16,10 @@ kernel or user program that imports this file is rejected (`E-TARGET`).
 | [`read_file`](#read_file) | The whole file at `path`, if it can be read. |
 | [`read_file_str`](#read_file_str) | `read_file` with the path given as a literal. |
 | [`write_file_str`](#write_file_str) | Creates or replaces the file at `path`, given as a literal. |
+| [`write_file`](#write_file) | Creates or replaces the file at `path`. |
+| [`file_exists`](#file_exists) | The file at `path` can be read. |
+| [`env_get`](#env_get) | The value of the environment variable `name`, if it is set. |
+| [`host_args`](#host_args) | All command-line arguments, the program's own name first. |
 
 Every example below is built, verified and run by `tests/run.sh`. An `assert` in one is proved at compile time from the contracts above it.
 
@@ -109,3 +113,81 @@ fn write_file_str(h: &Host, path: Str, data: &Bytes) -> bool
 ```
 
 Creates or replaces the file at `path`, given as a literal.
+
+### `write_file`
+
+```bastio
+fn write_file(h: &Host, path: &Bytes, data: &Bytes) -> bool
+```
+
+Creates or replaces the file at `path`.
+
+Example:
+
+```bastio
+let p = bfrom("/dev/null");
+let data = bfrom("discarded");
+let ok = write_file(host, p, data);
+bfree(data);
+bfree(p);
+if !ok { return 1; }
+```
+
+### `file_exists`
+
+```bastio
+fn file_exists(h: &Host, path: &Bytes) -> bool
+```
+
+The file at `path` can be read. The whole file is read to find out, so
+this is for small files and for checking before a write, not for a path
+that is a large file or a device.
+
+Example:
+
+```bastio
+let me = host_arg(host, 0);
+let there = file_exists(host, me);
+bfree(me);
+let nowhere = bfrom("/nonexistent/bastio-example");
+let missing = file_exists(host, nowhere);
+bfree(nowhere);
+if !there || missing { return 1; }
+```
+
+### `env_get`
+
+```bastio
+fn env_get(h: &Host, name: Str) -> Option[Bytes]
+```
+
+The value of the environment variable `name`, if it is set.
+
+Example:
+
+```bastio
+let mut ok = true;
+match env_get(host, "BASTIO_SURELY_UNSET_VARIABLE") {
+  Option::Some(v) => { bfree(v); ok = false; },
+  Option::None => {},
+}
+if !ok { return 1; }
+```
+
+### `host_args`
+
+```bastio
+fn host_args(h: &Host) -> Vec[Bytes]
+```
+
+All command-line arguments, the program's own name first. Free the result
+with `bytes_vec_free`.
+
+Example:
+
+```bastio
+let args = host_args(host);
+let ok = vec_len(args) >= 1;
+bytes_vec_free(args);
+if !ok { return 1; }
+```

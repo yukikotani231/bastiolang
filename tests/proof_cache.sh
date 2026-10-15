@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The proof cache (BASTIO_PROOF_CACHE): a function whose verification
-# conditions were proved before, to the byte and by the same solver, is not
+# conditions were proved before, with the same conditions and by the same solver, is not
 # sent to the solver again.
 # - a cold run proves everything and fills the cache;
 # - a warm run starts the solver only to ask its version and check that it

@@ -98,7 +98,19 @@ impl Parser {
                 return Diag::new("E-PARSE", pos, "expected `;` at the end of this line");
             }
         }
-        Diag::new("E-PARSE", t.pos, format!("expected {}, found {}", what, describe(&t.tok)))
+        let d = Diag::new("E-PARSE", t.pos, format!("expected {}, found {}", what, describe(&t.tok)));
+        // What a newcomer most likely meant, for the slips seen most often.
+        let prev = if self.i > 0 { Some(&self.toks[self.i - 1].tok) } else { None };
+        match (what, &t.tok) {
+            ("`{`", Tok::Eq) => d.note("`=` assigns; use `==` to compare"),
+            ("`:`", _) => d.note("a name is followed by `:` and its type, as in `n: u64`"),
+            ("`;`", _) => match prev {
+                Some(Tok::Ident(w)) if w == "var" => d.note("declare a variable with `let` (`let mut` if it changes later)"),
+                Some(Tok::Ident(w)) if w == "for" => d.note("Bastio has no `for` loop: use `while` with a counter variable"),
+                _ => d,
+            },
+            _ => d,
+        }
     }
 
     fn ident(&mut self) -> PResult<(String, Pos)> {
@@ -448,7 +460,8 @@ impl Parser {
         let mut out = Vec::new();
         while *self.peek() != Tok::RBrace {
             if *self.peek() == Tok::Eof {
-                return Err(Diag::new("E-PARSE", self.pos(), "unexpected end of file, missing `}`"));
+                return Err(Diag::new("E-PARSE", self.pos(), "unexpected end of file, missing `}`")
+                    .note("a `{` opened earlier is never closed: every `{` needs a matching `}`"));
             }
             out.push(self.stmt()?);
         }
@@ -814,7 +827,16 @@ impl Parser {
                     Ok(Expr { kind: ExprKind::Var(name), pos })
                 }
             }
-            t => Err(Diag::new("E-PARSE", pos, format!("expected expression, found {}", describe(&t)))),
+            t => {
+                let d = Diag::new("E-PARSE", pos, format!("expected expression, found {}", describe(&t)));
+                let after_op = self.i > 0
+                    && matches!(self.toks[self.i - 1].tok, Tok::Plus | Tok::Minus | Tok::Star | Tok::Slash | Tok::Percent | Tok::Amp | Tok::Pipe | Tok::Caret);
+                if t == Tok::Eq && after_op {
+                    Err(d.note("there are no compound assignments such as `+=`: write `x = x + 1;`"))
+                } else {
+                    Err(d)
+                }
+            }
         }
     }
 }

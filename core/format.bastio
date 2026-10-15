@@ -1,0 +1,284 @@
+// core/format.bastio: building text out of pieces: padding into columns,
+// joining, replacing, quoting, and sizes a person can read. Every function
+// appends to a text (`Vec[u8]`, see core/text.bastio); numbers come from
+// core/num.bastio.
+//
+// What is proved: each function keeps the bytes already in the text, and the
+// ones that repeat, pad or copy say exactly how many bytes they add and what
+// they are. Not proved: the exact bytes of `fmt_join`, `fmt_replace_all`,
+// `fmt_quoted` and `fmt_size` (tests check them).
+import "num.bastio";
+
+/// Appends `n` copies of the byte `c`.
+/// ```
+/// let mut t = text_new();
+/// fmt_repeat(&mut t, 45, 5);   // '-'
+/// assert vlen(t) == 5 && vget(t, 4) == 45;
+/// let b = text_finish(t);
+/// let ok = bytes_eq_str(b, "-----");
+/// bfree(b);
+/// if !ok { return 1; }
+/// ```
+fn fmt_repeat(t: &mut Vec[u8], c: u8, n: u64)
+  ensures vlen(t) == vlen(old(t)) + n
+  ensures text_keeps(t, old(t), vlen(old(t)))
+  ensures forall k: u64 :: k < n ==> vget(t, vlen(old(t)) + k) == c
+{
+  let n0 = vec_len(t);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && vlen(t) == n0 + i && n0 == vlen(old(t))
+    invariant text_keeps(t, old(t), n0)
+    invariant forall k: u64 :: k < i ==> vget(t, n0 + k) == c
+  {
+    vec_push(&mut t, c);
+    i = i + 1;
+  }
+}
+
+/// Appends `b`, preceded by spaces so that at least `width` bytes are added:
+/// a right-aligned column.
+/// ```
+/// let name = bfrom("ab");
+/// let mut t = text_new();
+/// fmt_pad_left(&mut t, name, 5);
+/// fmt_pad_left(&mut t, name, 1);   // already wider than 1: no padding
+/// assert vlen(t) == 7;
+/// let b = text_finish(t);
+/// let ok = bytes_eq_str(b, "   abab");
+/// bfree(b);
+/// bfree(name);
+/// if !ok { return 1; }
+/// ```
+fn fmt_pad_left(t: &mut Vec[u8], b: &Bytes, width: u64)
+  ensures blen(b) >= width ==> vlen(t) == vlen(old(t)) + blen(b)
+  ensures blen(b) < width ==> vlen(t) == vlen(old(t)) + width
+  ensures text_keeps(t, old(t), vlen(old(t)))
+{
+  if blen(b) < width {
+    fmt_repeat(&mut t, 32, width - blen(b));
+  }
+  text_push_bytes(&mut t, b);
+}
+
+/// Appends `b`, followed by spaces so that at least `width` bytes are added:
+/// a left-aligned column.
+/// ```
+/// let name = bfrom("ab");
+/// let mut t = text_new();
+/// fmt_pad_right(&mut t, name, 4);
+/// text_push(&mut t, 124);   // '|'
+/// let b = text_finish(t);
+/// let ok = bytes_eq_str(b, "ab  |");
+/// bfree(b);
+/// bfree(name);
+/// if !ok { return 1; }
+/// ```
+fn fmt_pad_right(t: &mut Vec[u8], b: &Bytes, width: u64)
+  ensures blen(b) >= width ==> vlen(t) == vlen(old(t)) + blen(b)
+  ensures blen(b) < width ==> vlen(t) == vlen(old(t)) + width
+  ensures text_keeps(t, old(t), vlen(old(t)))
+{
+  text_push_bytes(&mut t, b);
+  if blen(b) < width {
+    fmt_repeat(&mut t, 32, width - blen(b));
+  }
+}
+
+/// Appends `true` or `false`.
+/// ```
+/// let mut t = text_new();
+/// fmt_bool(&mut t, true);
+/// text_push(&mut t, 47);   // '/'
+/// fmt_bool(&mut t, false);
+/// let b = text_finish(t);
+/// let ok = bytes_eq_str(b, "true/false");
+/// bfree(b);
+/// if !ok { return 1; }
+/// ```
+fn fmt_bool(t: &mut Vec[u8], v: bool)
+  ensures text_keeps(t, old(t), vlen(old(t)))
+{
+  if v {
+    text_push_str(&mut t, "true");
+  } else {
+    text_push_str(&mut t, "false");
+  }
+}
+
+/// Appends the pieces `parts` of `src` (what `bytes_split` and
+/// `lines_split` return) with `sep` between them.
+/// ```
+/// let src = bfrom("usr:local:bin");
+/// let parts = bytes_split(src, 58);   // ':'
+/// let sep = bfrom("/");
+/// let mut t = text_new();
+/// fmt_join(&mut t, src, parts, sep);
+/// let b = text_finish(t);
+/// let ok = bytes_eq_str(b, "usr/local/bin");
+/// bfree(b);
+/// bfree(sep);
+/// vec_free(parts);
+/// bfree(src);
+/// if !ok { return 1; }
+/// ```
+fn fmt_join(t: &mut Vec[u8], src: &Bytes, parts: &Vec[Span], sep: &Bytes)
+  requires forall k: u64 :: k < vlen(parts) ==> span_in(vget(parts, k), src)
+  ensures vlen(t) >= vlen(old(t))
+  ensures text_keeps(t, old(t), vlen(old(t)))
+{
+  let n0 = vec_len(t);
+  let mut i = 0;
+  while i < vec_len(parts)
+    invariant i <= vlen(parts) && n0 == vlen(old(t)) && vlen(t) >= n0
+    invariant text_keeps(t, old(t), n0)
+  {
+    if i > 0 {
+      text_push_bytes(&mut t, sep);
+    }
+    let p = vec_get(parts, i);
+    text_push_span(&mut t, src, p.start, p.end);
+    i = i + 1;
+  }
+}
+
+/// Appends `hay` with every occurrence of `needle` replaced by `with`.
+/// Occurrences do not overlap and are found from the left, so replacing `aa`
+/// in `aaa` leaves one `a` after the replacement.
+/// ```
+/// let hay = bfrom("a-b-c");
+/// let needle = bfrom("-");
+/// let with = bfrom(" -- ");
+/// let mut t = text_new();
+/// fmt_replace_all(&mut t, hay, needle, with);
+/// let b = text_finish(t);
+/// let ok = bytes_eq_str(b, "a -- b -- c");
+/// bfree(b);
+/// bfree(with);
+/// bfree(needle);
+/// bfree(hay);
+/// if !ok { return 1; }
+/// ```
+fn fmt_replace_all(t: &mut Vec[u8], hay: &Bytes, needle: &Bytes, with: &Bytes)
+  requires blen(needle) > 0
+  ensures vlen(t) >= vlen(old(t))
+  ensures text_keeps(t, old(t), vlen(old(t)))
+{
+  let n0 = vec_len(t);
+  let mut i = 0;
+  let mut done = false;
+  while !done
+    invariant i <= blen(hay) && n0 == vlen(old(t)) && vlen(t) >= n0
+    invariant text_keeps(t, old(t), n0)
+  {
+    match bytes_find(hay, needle, i) {
+      Option::Some(j) => {
+        text_push_span(&mut t, hay, i, j);
+        text_push_bytes(&mut t, with);
+        i = j + blen(needle);
+      },
+      Option::None => {
+        text_push_span(&mut t, hay, i, blen(hay));
+        done = true;
+      },
+    }
+  }
+}
+
+/// Appends `b` in double quotes, with `"` and `\` escaped by a backslash,
+/// newline, return and tab as `\n`, `\r` and `\t`, and any other byte outside
+/// the printable ASCII range as `\xHH`.
+/// ```
+/// let raw = bfrom("say \"hi\"\n");
+/// let mut t = text_new();
+/// fmt_quoted(&mut t, raw);
+/// let b = text_finish(t);
+/// let ok = bytes_eq_str(b, "\"say \\\"hi\\\"\\n\"");
+/// bfree(b);
+/// bfree(raw);
+/// if !ok { return 1; }
+/// ```
+fn fmt_quoted(t: &mut Vec[u8], b: &Bytes)
+  ensures vlen(t) >= vlen(old(t)) + 2
+  ensures text_keeps(t, old(t), vlen(old(t)))
+{
+  let n0 = vec_len(t);
+  text_push(&mut t, 34);
+  let mut i = 0;
+  while i < blen(b)
+    invariant i <= blen(b) && n0 == vlen(old(t)) && vlen(t) > n0
+    invariant text_keeps(t, old(t), n0)
+  {
+    let c = bget(b, i);
+    if c == 34 || c == 92 {
+      text_push(&mut t, 92);
+      text_push(&mut t, c);
+    } else if c == 10 {
+      text_push_str(&mut t, "\\n");
+    } else if c == 13 {
+      text_push_str(&mut t, "\\r");
+    } else if c == 9 {
+      text_push_str(&mut t, "\\t");
+    } else if c < 32 || c > 126 {
+      text_push_str(&mut t, "\\x");
+      text_push(&mut t, hex_char(cast[u64](c >> 4)));
+      text_push(&mut t, hex_char(cast[u64](c & 15)));
+    } else {
+      text_push(&mut t, c);
+    }
+    i = i + 1;
+  }
+  text_push(&mut t, 34);
+}
+
+/// Appends a byte count a person can read: `512 B`, `1.5 KiB`, `3.0 MiB`,
+/// up to `EiB`. One digit follows the point, rounded down.
+/// ```
+/// let mut t = text_new();
+/// fmt_size(&mut t, 512);
+/// text_push(&mut t, 44);
+/// fmt_size(&mut t, 1536);
+/// text_push(&mut t, 44);
+/// fmt_size(&mut t, 3 * 1048576);
+/// let b = text_finish(t);
+/// let ok = bytes_eq_str(b, "512 B,1.5 KiB,3.0 MiB");
+/// bfree(b);
+/// if !ok { return 1; }
+/// ```
+fn fmt_size(t: &mut Vec[u8], n: u64)
+  ensures vlen(t) > vlen(old(t))
+  ensures text_keeps(t, old(t), vlen(old(t)))
+{
+  let n0 = vec_len(t);
+  let mut whole = n;
+  let mut rem = 0;
+  let mut unit = 0;
+  while whole >= 1024 && unit < 6
+    invariant unit <= 6 && rem < 1024
+  {
+    rem = whole % 1024;
+    whole = whole / 1024;
+    unit = unit + 1;
+  }
+  fmt_u64(&mut t, whole);
+  if unit > 0 {
+    text_push(&mut t, 46);
+    fmt_u64(&mut t, rem * 10 / 1024);
+  }
+  text_push(&mut t, 32);
+  if unit == 0 {
+    text_push_str(&mut t, "B");
+  } else if unit == 1 {
+    text_push_str(&mut t, "KiB");
+  } else if unit == 2 {
+    text_push_str(&mut t, "MiB");
+  } else if unit == 3 {
+    text_push_str(&mut t, "GiB");
+  } else if unit == 4 {
+    text_push_str(&mut t, "TiB");
+  } else if unit == 5 {
+    text_push_str(&mut t, "PiB");
+  } else {
+    text_push_str(&mut t, "EiB");
+  }
+}
