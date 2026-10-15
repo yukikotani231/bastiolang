@@ -39,6 +39,7 @@
 # Project
 
 - [BastiOS](bastios.md)
+  - [BastiOS against Linux](bastios-performance.md)
 - [Roadmap](roadmap.md)
 - [Contributing](contributing.md)
 - [How the compiler is put together](architecture.md)
