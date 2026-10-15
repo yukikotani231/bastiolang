@@ -13,6 +13,18 @@ it.
 
 BastiOS is versioned separately, in its own repository.
 
+## Before tagging
+
+- The README's "Status" section is true: the release notes copy it, so it is
+  what readers learn about the limits of this version. Update it, and the
+  "Soundness scope" section of `docs/language.md`, if the release changes
+  what is and is not guaranteed.
+- `docs/trusted-base.md` and `tests/trusted_base.txt` match what the release
+  trusts (`tests/run.sh` checks the second).
+- `CHANGELOG.md` says which changes are incompatible, under their own
+  heading, since 0.x minors may break programs.
+- `docs/launch-checklist.md` has nothing open that the release depends on.
+
 ## Cutting a release
 
 1. On `main`, move the entries under `## [Unreleased]` in `CHANGELOG.md` into
