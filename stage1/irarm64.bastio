@@ -7,8 +7,9 @@
 // Hosted target only, as a program with a `main` that takes no parameters.
 //
 // The calling convention is the platform's (AAPCS64) as far as words go:
-// the argument words (at most eight) in x0-x7 in the order of the IR (a
-// buffer is its data address, then its length), a result of one or two
+// the first eight argument words in x0-x7 in the order of the IR (a buffer
+// is its data address, then its length), the rest in eight-byte words at the
+// stack pointer at the call (the callee finds word 8 at x29 + 16), a result of one or two
 // words in x0 and x1, a result of more words through the address in x8
 // (the caller's frame slot, `IR_CALLM`). x19-x28 are preserved, x9-x17 and
 // x0-x8 are not.
@@ -23,9 +24,12 @@
 // return address are saved above it.
 import "irx86.bastio";
 
+/// Argument words that travel in registers.
+const A64_REG_ARGS: u64 = 8;
+
 /// Calls with more words than this, or functions with more parameter
 /// words, are not covered.
-const A64_MAX_ARGS: u64 = 8;
+const A64_MAX_ARGS: u64 = 4000;
 
 const A64K_REG: u64 = 1;
 const A64K_MEM: u64 = 2;
@@ -47,8 +51,10 @@ fn a64_il(v: u64) -> A64L {
   return A64L { k: A64K_IMM, reg: 0, off: 0, imm: v };
 }
 
-/// Frame words before the spill area: the saved registers, and x8.
-struct A64F { nsave: u64, retp: u64 }
+/// Frame words before the spill area: the saved registers, and x8. `sh` is
+/// the number of words the stack pointer is below the frame while a call's
+/// stack arguments are being stored.
+struct A64F { nsave: u64, retp: u64, sh: u64 }
 
 fn a64_callee(i: u64) -> u64 {
   return wrap_add(19, i);
@@ -70,7 +76,7 @@ fn a64_loc(al: &IrAlloc, fr: A64F, r: u64) -> A64L {
   if cls == RA_CALLER {
     return a64_rl(a64_caller(idx));
   }
-  return a64_ml(wrap_add(wrap_add(fr.nsave, fr.retp), idx));
+  return a64_ml(wrap_add(wrap_add(wrap_add(fr.nsave, fr.retp), idx), fr.sh));
 }
 
 // ---- Writing instructions ----
@@ -452,20 +458,54 @@ fn a64_mem_text(out: &mut Vec[u64], mm: A64M, size: u64) {
   w_s(&mut out, "]");
 }
 
+/// `sp = sp - bytes` (`name` is "sub") or `sp + bytes` ("add").
+fn a64_spadj(out: &mut Vec[u64], name: Str, bytes: u64) {
+  if bytes <= 4095 {
+    w_s(&mut out, "\t");
+    w_s(&mut out, name);
+    w_s(&mut out, " sp, sp, #");
+    w_num(&mut out, bytes);
+    w_s(&mut out, "\n");
+  } else {
+    a64_movi(&mut out, 16, bytes);
+    w_s(&mut out, "\t");
+    w_s(&mut out, name);
+    w_s(&mut out, " sp, sp, x16\n");
+  }
+}
+
 /// A call: the argument words in x0-x7, then the result from x0 and x1.
 fn a64_call(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, fr: A64F, g: &mut X86, m: &mut Mono, p: &Parser, q: IrIns, slotw: u64) {
   if q.op == IR_CALLM {
     a64_addr_w(&mut out, 8, slotw);
   }
+  // The words past the eighth go to the bottom of a block made below the
+  // frame, an even number of words so that sp stays 16-aligned.
+  let mut ew = 0;
+  if q.c > A64_REG_ARGS {
+    ew = q.c - A64_REG_ARGS;
+    if ew % 2 == 1 {
+      ew = ew + 1;
+    }
+    a64_spadj(&mut out, "sub", wrap_mul(8, ew));
+  }
+  let fr2 = A64F { nsave: fr.nsave, retp: fr.retp, sh: ew };
   let mut j = 0;
-  while j < q.c && j < 8 {
+  while j < q.c {
     let a = u_at(f.args, wrap_add(q.b, j));
-    a64_mov(&mut out, a64_loc(al, fr, a), a64_rl(j));
+    if j < A64_REG_ARGS {
+      a64_mov(&mut out, a64_loc(al, fr2, a), a64_rl(j));
+    } else {
+      a64_mov(&mut out, a64_loc(al, fr2, a), a64_ml(j - A64_REG_ARGS));
+    }
     j = j + 1;
   }
   w_s(&mut out, "\tbl ");
   ix_sym(&mut out, &mut g, m, p, q.a);
   w_s(&mut out, "\n");
+  if ew > 0 {
+    a64_spadj(&mut out, "add", wrap_mul(8, ew));
+  }
   if q.op == IR_CALLM {
     let t = a64_dest(al, fr, q.d);
     a64_addr_w(&mut out, t, slotw);
@@ -902,7 +942,7 @@ fn a64_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
       w_append(&mut g.fmsg, g.ln);
       w_s(&mut g.fmsg, "` yet: ");
       if why == 1 {
-        w_s(&mut g.fmsg, "more than 8 argument words, or a main with parameters");
+        w_s(&mut g.fmsg, "more than 4000 argument words, or a main with parameters");
       } else if why == 2 {
         w_s(&mut g.fmsg, "too many instructions");
       } else if why == 3 {
@@ -937,7 +977,7 @@ fn a64_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
     }
     k = k + 1;
   }
-  let fr = A64F { nsave: al.ncallee_used, retp: retmem };
+  let fr = A64F { nsave: al.ncallee_used, retp: retmem, sh: 0 };
   let base = wrap_add(wrap_add(fr.nsave, fr.retp), al.nspill);
   let mut words = wrap_add(base, slots);
   if words % 2 == 1 {
@@ -968,12 +1008,20 @@ fn a64_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   if retmem == 1 {
     a64_str_w(&mut out, 8, fr.nsave);
   }
-  // The parameters, from their argument registers.
+  // The parameters, from their argument registers and the caller's stack
+  // words (the ninth is at x29 + 16, above the saved x29 and x30).
   k = 0;
-  while k < vec_len(f.params) && k < 8 {
+  while k < vec_len(f.params) {
     let r = vec_get(f.params, k);
     if u_at(al.cls, r) != RA_NONE {
-      a64_mov(&mut out, a64_rl(k), a64_loc(al, fr, r));
+      if k < A64_REG_ARGS {
+        a64_mov(&mut out, a64_rl(k), a64_loc(al, fr, r));
+      } else {
+        w_s(&mut out, "\tldr x9, [x29, #");
+        w_num(&mut out, wrap_add(16, wrap_mul(8, k - A64_REG_ARGS)));
+        w_s(&mut out, "]\n");
+        a64_mov(&mut out, a64_rl(9), a64_loc(al, fr, r));
+      }
     }
     k = k + 1;
   }
