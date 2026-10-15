@@ -663,6 +663,7 @@ The header's opening comment lists what the proofs assume about the C caller and
 - Part 2, [bytes, bits and sized integers](tutorial-bits.md): `u8` to `i64`, `cast` and `wrap`, bit operators, parsing a binary format.
 - Part 3, [capabilities](tutorial-capabilities.md): console, pages, page tables, ports, device registers and DMA, and what is proved about each.
 - Part 4, [sharing state](tutorial-shared.md): locks with invariants, deadlock freedom, atomics and running on every processor.
+- The [cookbook](cookbook.md) has short proved programs for common tasks: binary search, checked sums, state machines, stacks and ring buffers.
 - The [toolchain page](toolchain.md) explains the two compilers, the targets and the backends, and what you trust.
 - The [library overview](core.md) and its reference pages list every library function with its contract and an example.
 - [Common proof failures](proof-failures.md) shows the errors you are likely to meet next and how to fix each.
