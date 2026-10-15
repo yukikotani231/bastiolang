@@ -1,0 +1,147 @@
+// core/strsort.bastio: sorting pieces of a text in dictionary order (byte
+// order), for sorted word lists, directory listings and `sort | uniq`.
+//
+// `spans_order` does not move the spans: it returns the indices `0..n` in
+// the order of the texts they name, so the same order can be applied to
+// several parallel vectors. It is insertion sort, quadratic in the worst
+// case and fast on short or nearly sorted lists; for a large list, compute
+// a number for each string and use `sort_by_key_u64`.
+//
+// What is proved: the result is a permutation of `0..n` (`same_elems`
+// against the identity, so no index is lost or repeated), and neighbours in
+// the result are in order (`span_le`, which reads the bytes of both spans:
+// at the first byte where they differ the earlier one is smaller, and a
+// span that is a proper prefix of another comes first). `span_cmp` proves
+// the same relation for one pair. Not proved: that the order holds between
+// elements that are not neighbours (that needs `span_le` to be transitive,
+// which no proof here has shown).
+import "sort.bastio";
+import "spancmp.bastio";
+
+/// Elements `a` and `c` of the vectors `cs` and `ce` (the starts and ends of
+/// a list of spans) are in order.
+spec fn le_at(b: &Bytes, cs: &Vec[u64], ce: &Vec[u64], a: u64, c: u64) -> bool {
+  span_le(b, vget(cs, a), vget(ce, a), vget(cs, c), vget(ce, c))
+}
+
+/// Internal: moves element `i` of the three parallel vectors (an index, and
+/// the start and end of the span it names) down past every neighbour whose
+/// span is larger, so that the first `i + 1` are in order if the first `i`
+/// were. The spans are carried along with their indices, so that every
+/// quantifier here is about plain vectors of numbers: the solver does not
+/// cope with the span of `v[k]` looked up through `v`.
+fn spans_insert(b: &Bytes, ss: &Vec[u64], es: &Vec[u64], v: &mut Vec[u64], cs: &mut Vec[u64], ce: &mut Vec[u64], i: u64)
+  requires i < vlen(v) && vlen(cs) == vlen(v) && vlen(ce) == vlen(v) && vlen(ss) == vlen(es)
+  requires forall k: u64 :: k < vlen(v) ==> vget(v, k) < vlen(ss) && vget(cs, k) == vget(ss, vget(v, k)) && vget(ce, k) == vget(es, vget(v, k))
+  requires forall k: u64 :: k < vlen(v) ==> vget(cs, k) <= vget(ce, k) && vget(ce, k) <= blen(b) && (k + 1 < i ==> le_at(b, cs, ce, k, k + 1))
+  ensures vlen(v) == vlen(old(v)) && vlen(cs) == vlen(v) && vlen(ce) == vlen(v)
+  ensures forall k: u64 :: k < vlen(v) ==> vget(v, k) < vlen(ss) && vget(cs, k) == vget(ss, vget(v, k)) && vget(ce, k) == vget(es, vget(v, k))
+  ensures forall x: u64 :: vcount(v, x) == vcount(old(v), x)
+  ensures forall x: u64 :: vcount(cs, x) == vcount(old(cs), x)
+  ensures forall x: u64 :: vcount(ce, x) == vcount(old(ce), x)
+  ensures forall k: u64 :: k < vlen(v) ==> vget(cs, k) <= vget(ce, k) && vget(ce, k) <= blen(b) && (k < i ==> le_at(b, cs, ce, k, k + 1))
+{
+  let mut j = i;
+  while j > 0 && span_cmp(b, Span { start: vec_get(cs, j - 1), end: vec_get(ce, j - 1) }, Span { start: vec_get(cs, j), end: vec_get(ce, j) }) > 0
+    invariant j <= i && i < vlen(v) && vlen(v) == vlen(old(v)) && vlen(cs) == vlen(v) && vlen(ce) == vlen(v) && vlen(ss) == vlen(es)
+    invariant forall k: u64 :: k < vlen(v) ==> vget(v, k) < vlen(ss) && vget(cs, k) == vget(ss, vget(v, k)) && vget(ce, k) == vget(es, vget(v, k))
+    invariant forall x: u64 :: vcount(v, x) == vcount(old(v), x)
+    invariant forall x: u64 :: vcount(cs, x) == vcount(old(cs), x)
+    invariant forall x: u64 :: vcount(ce, x) == vcount(old(ce), x)
+    invariant forall k: u64 :: k < vlen(v) ==> vget(cs, k) <= vget(ce, k) && vget(ce, k) <= blen(b) && (k + 1 < j ==> le_at(b, cs, ce, k, k + 1))
+    invariant forall k: u64 :: j < k && k < i ==> le_at(b, cs, ce, k, k + 1)
+    invariant j < i ==> le_at(b, cs, ce, j, j + 1)
+    invariant j > 0 && j < i ==> le_at(b, cs, ce, j - 1, j + 1)
+  {
+    let a = vec_get(v, j - 1);
+    let a2 = vec_swap(&mut v, j, a);
+    vec_set(&mut v, j - 1, a2);
+    let s1 = vec_get(cs, j - 1);
+    let s2 = vec_swap(&mut cs, j, s1);
+    vec_set(&mut cs, j - 1, s2);
+    let e1 = vec_get(ce, j - 1);
+    let e2 = vec_swap(&mut ce, j, e1);
+    vec_set(&mut ce, j - 1, e2);
+    j = j - 1;
+  }
+}
+
+/// The indices `0..n` of `spans`, so that each span's text is at or after
+/// the previous one's. Equal texts keep their order.
+/// ```
+/// let b = bfrom("pear apple fig apple");
+/// let words = scan_words(b);
+/// let order = spans_order(b, words);
+/// let w0 = vec_get(words, vec_get(order, 0));
+/// let w3 = vec_get(words, vec_get(order, 3));
+/// let ok = vec_len(order) == 4
+///   && bytes_span_eq_str(b, w0.start, w0.end, "apple")
+///   && bytes_span_eq_str(b, w3.start, w3.end, "pear");
+/// vec_free(order);
+/// vec_free(words);
+/// bfree(b);
+/// if !ok { return 1; }
+/// ```
+fn spans_order(b: &Bytes, spans: &Vec[Span]) -> Vec[u64]
+  requires forall k: u64 :: k < vlen(spans) ==> span_in(vget(spans, k), b)
+  ensures vlen(result) == vlen(spans)
+  ensures forall k: u64 :: k < vlen(result) ==> vget(result, k) < vlen(spans)
+  ensures forall x: u64 :: x < vlen(spans) ==> vcount(result, x) == 1
+  ensures forall k: u64 :: k + 1 < vlen(result) ==> span_le(b, vget(spans, vget(result, k)).start, vget(spans, vget(result, k)).end, vget(spans, vget(result, k + 1)).start, vget(spans, vget(result, k + 1)).end)
+{
+  let n = vec_len(spans);
+  let mut ss = vec_new[u64]();
+  let mut es = vec_new[u64]();
+  let mut v = vec_new[u64]();
+  let mut cs = vec_new[u64]();
+  let mut ce = vec_new[u64]();
+  let mut i = 0;
+  while i < n
+    invariant i <= n && n == vlen(spans) && vlen(v) == i && vlen(ss) == i && vlen(es) == i && vlen(cs) == i && vlen(ce) == i
+    invariant forall k: u64 :: k < i ==> vget(v, k) == k && vget(ss, k) == vget(spans, k).start && vget(es, k) == vget(spans, k).end
+    invariant forall k: u64 :: k < i ==> vget(cs, k) == vget(ss, k) && vget(ce, k) == vget(es, k)
+    invariant forall k: u64 :: k < i ==> vget(cs, k) <= vget(ce, k) && vget(ce, k) <= blen(b)
+    invariant forall x: u64 :: x < i ==> vcount(v, x) == 1
+    invariant forall x: u64 :: x >= i ==> vcount(v, x) == 0
+  {
+    let sp = vec_get(spans, i);
+    vec_push(&mut ss, sp.start);
+    vec_push(&mut es, sp.end);
+    vec_push(&mut cs, sp.start);
+    vec_push(&mut ce, sp.end);
+    vec_push(&mut v, i);
+    i = i + 1;
+  }
+  i = 1;
+  while i < n
+    invariant 1 <= i && n == vlen(spans) && vlen(v) == n && vlen(ss) == n && vlen(es) == n && vlen(cs) == n && vlen(ce) == n && (n > 0 ==> i <= n)
+    invariant forall k: u64 :: k < n ==> vget(ss, k) == vget(spans, k).start && vget(es, k) == vget(spans, k).end
+    invariant forall k: u64 :: k < n ==> vget(v, k) < n && vget(cs, k) == vget(ss, vget(v, k)) && vget(ce, k) == vget(es, vget(v, k))
+    invariant forall x: u64 :: x < n ==> vcount(v, x) == 1
+    invariant forall x: u64 :: x >= n ==> vcount(v, x) == 0
+    invariant forall k: u64 :: k < n ==> vget(cs, k) <= vget(ce, k) && vget(ce, k) <= blen(b) && (k + 1 < i ==> le_at(b, cs, ce, k, k + 1))
+  {
+    spans_insert(b, ss, es, &mut v, &mut cs, &mut ce, i);
+    i = i + 1;
+  }
+  assert forall k: u64 :: k + 1 < n ==> le_at(b, cs, ce, k, k + 1);
+  assert forall k: u64 :: k + 1 < n ==> span_le(b, vget(ss, vget(v, k)), vget(es, vget(v, k)), vget(ss, vget(v, k + 1)), vget(es, vget(v, k + 1)));
+  // The spans through `v`, one at a time, so that each lookup is a concrete term.
+  let mut m = 0;
+  while m < n
+    invariant m <= n && n == vlen(spans) && vlen(v) == n && vlen(ss) == n && vlen(es) == n
+    invariant forall k: u64 :: k < n ==> vget(v, k) < n && vget(ss, k) == vget(spans, k).start && vget(es, k) == vget(spans, k).end
+    invariant forall k: u64 :: k < m ==> vget(ss, vget(v, k)) == vget(spans, vget(v, k)).start && vget(es, vget(v, k)) == vget(spans, vget(v, k)).end
+  {
+    let x = vec_get(v, m);
+    assert vget(ss, x) == vget(spans, x).start && vget(es, x) == vget(spans, x).end;
+    m = m + 1;
+  }
+  assert forall k: u64 :: k + 1 < n ==> le_at(b, cs, ce, k, k + 1);
+  assert forall k: u64 :: k + 1 < n ==> span_le(b, vget(ss, vget(v, k)), vget(es, vget(v, k)), vget(ss, vget(v, k + 1)), vget(es, vget(v, k + 1)));
+  vec_free(ss);
+  vec_free(es);
+  vec_free(cs);
+  vec_free(ce);
+  return v;
+}
