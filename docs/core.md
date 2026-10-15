@@ -45,6 +45,7 @@ Each module has a reference page, generated from its source: every function with
 | [`core/hashmap.bastio`](lib/core-hashmap.md) | A hash map from `u64` keys to values of any type `V` that can be copied (`u64`, `Span`, a struct of numbers, ...). |
 | [`core/num.bastio`](lib/core-num.md) | Parsing integers from bytes and formatting them as text. |
 | [`core/option.bastio`](lib/core-option.md) | An optional value, and a span of a byte string. |
+| [`core/path.bastio`](lib/core-path.md) | File names. |
 | [`core/print.bastio`](lib/core-print.md) | Writing text and numbers to the serial console. |
 | [`core/ring.bastio`](lib/core-ring.md) | Ring buffers and fixed-capacity FIFO queues. |
 | [`core/rows.bastio`](lib/core-rows.md) | Tables of fixed-size rows in one `Buf`. |

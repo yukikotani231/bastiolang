@@ -26,6 +26,7 @@
   - [core/endian.bastio](lib-core-endian.md)
   - [core/hashmap.bastio](lib-core-hashmap.md)
   - [core/num.bastio](lib-core-num.md)
+  - [core/path.bastio](lib-core-path.md)
   - [core/option.bastio](lib-core-option.md)
   - [core/print.bastio](lib-core-print.md)
   - [core/ring.bastio](lib-core-ring.md)
