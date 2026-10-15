@@ -2,6 +2,14 @@
 
 Thanks for your interest. Bastio is pre-release: the language changes often, and large changes are best discussed in an issue first.
 
+## Getting oriented
+
+- [README.md](README.md) says what Bastio is and how to build and test it; [docs/README.md](docs/README.md) indexes the rest.
+- [ROADMAP.md](ROADMAP.md) has the invariants (no raw memory access, zero overhead, a counted trusted base) that every change keeps.
+- [docs/bootstrap.md](docs/bootstrap.md) explains why new features go into `stage1/` and not `stage0/`, and [stage1/README.md](stage1/README.md) how the compiler is laid out.
+
+Bugs and ideas go in the issue tracker. A program the compiler accepts but should not (a soundness bug) goes through [SECURITY.md](SECURITY.md). A bug report with the smallest program that shows it and the compiler's output is the most useful kind.
+
 ## Before you send a pull request
 
 1. Merge the latest `main`, then run every check CI runs:
