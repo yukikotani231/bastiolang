@@ -131,6 +131,13 @@ struct X86 {
   /// For instance names (`cg_instname`) and sort keys.
   cg: Cg,
   names: Vec[X86Name],
+  /// A hash index over `names` (see `x86_nm`).
+  nix: Ix,
+  /// For each function instance (by position in `Mono.fns`), the nodes of
+  /// the variables its body lends mutably: start and count in `bnodes`, or
+  /// a count of X86_NODES until they are computed.
+  bspan: Vec[u64],
+  bnodes: Vec[u64],
   vars: Vec[X86Var],
   /// Variables below this index are not visible (an inlined body sees
   /// only its parameters and its own variables).
@@ -211,7 +218,7 @@ struct X86 {
 fn x86_new() -> X86 {
   return X86 {
     out: vec_new[u64](), body: vec_new[u64](), ln: vec_new[u64](), cg: cg_new(TARGET_HOSTED),
-    names: vec_new[X86Name](), vars: vec_new[X86Var](), vfloor: 0, used: vec_new[u64](),
+    names: vec_new[X86Name](), nix: ix_new(), bspan: vec_new[u64](), bnodes: vec_new[u64](), vars: vec_new[X86Var](), vfloor: 0, used: vec_new[u64](),
     saves: vec_new[X86Save](), stack: vec_new[u64](), bsize: vec_new[u64](), ncalls: vec_new[u64](),
     sdata: vec_new[u64](), sstart: vec_new[u64](), slens: vec_new[u64](),
     labels: 0, frame: 0, slots: vec_new[u64](), live: vec_new[u64](), freed: vec_new[u64](), depth: 0, env: 0, pre: 0, retl: 0, retw: 0, reto: 0, rdk: 0, rda: 0, rdo: 0,
@@ -227,6 +234,9 @@ fn x86_free(g: X86) {
   vec_free(g.ln);
   cg_free(g.cg);
   vec_free(g.names);
+  ix_free(g.nix);
+  vec_free(g.bspan);
+  vec_free(g.bnodes);
   vec_free(g.vars);
   vec_free(g.used);
   vec_free(g.saves);
@@ -717,17 +727,41 @@ fn x86_name_set(g: &mut X86, id: u64, n: X86Name) {
   }
 }
 
+/// Empties the name index, with `names` emptied.
+fn x86_nix_clear(g: &mut X86) {
+  while vec_len(g.nix.hs) > 0 {
+    vec_pop(&mut g.nix.hs);
+  }
+  while vec_len(g.nix.nexts) > 0 {
+    vec_pop(&mut g.nix.nexts);
+  }
+  while vec_len(g.nix.vals) > 0 {
+    vec_pop(&mut g.nix.vals);
+  }
+  while vec_len(g.nix.heads) > 64 {
+    vec_pop(&mut g.nix.heads);
+  }
+  let mut k = 0;
+  while k < vec_len(g.nix.heads) {
+    vec_set(&mut g.nix.heads, k, 0);
+    k = k + 1;
+  }
+}
+
 /// The name `s..e` declared in the body of instance `x` (0: the function
 /// being generated).
 fn x86_nm(g: &mut X86, p: &Parser, x: u64, s: u64, e: u64) -> u64 {
-  let mut k = 0;
-  while k < vec_len(g.names) {
-    let n = vec_get(g.names, k);
+  let h = wrap_mul(text_hash(p.src, s, e) ^ x, 1099511628211);
+  let mut j = ix_first(g.nix, h);
+  while j != 0 {
+    let k = ix_val(g.nix, j);
+    let n = x86_name_at(g, wrap_add(k, 1));
     if n.x == x && same(p.src, n.s, n.e, s, e) {
-      return k + 1;
+      return wrap_add(k, 1);
     }
-    k = k + 1;
+    j = ix_next(g.nix, h, j);
   }
+  ix_add(&mut g.nix, h, vec_len(g.names));
   vec_push(&mut g.names, X86Name { x: x, s: s, e: e, uses: 0, whole: false, read: 0, size: 0, bad: false, asg: false, alias: 0, brw: false, rn: 0, r0: 0, r1: 0, r2: 0, iv: 0 });
   return vec_len(g.names);
 }
@@ -1102,7 +1136,11 @@ fn x86_list_root(p: &Parser, head: u64) -> u64 {
 }
 
 /// The variables lent mutably (`&mut x`) in an expression, as names of
-/// body `pre` (stage0's `stmts_borrows`).
+/// body `pre` (stage0's `stmts_borrows`). With `pre` = X86_NODES the
+/// variables' nodes are collected instead, in the same order, to be named
+/// later (see `x86_borrow_nodes`).
+const X86_NODES: u64 = 18446744073709551615;
+
 fn x86_eborrows(g: &mut X86, p: &Parser, i: u64, pre: u64, out: &mut Vec[u64]) {
   if i == 0 {
     return;
@@ -1110,9 +1148,13 @@ fn x86_eborrows(g: &mut X86, p: &Parser, i: u64, pre: u64, out: &mut Vec[u64]) {
   let n = node_at(p.nodes, i);
   let k = n.kind;
   if k == E_MUTBORROW {
-    let r = node_at(p.nodes, n.a);
-    let id = x86_nm(&mut g, p, pre, r.s, r.e);
-    add_id(&mut out, id);
+    if pre == X86_NODES {
+      vec_push(&mut out, n.a);
+    } else {
+      let r = node_at(p.nodes, n.a);
+      let id = x86_nm(&mut g, p, pre, r.s, r.e);
+      add_id(&mut out, id);
+    }
   } else if k == E_FIELD || k == E_IS || k == E_NOT || k == E_NEG || k == E_VARIANT {
     x86_eborrows(&mut g, p, n.a, pre, &mut out);
   } else if k == E_TAPP {
@@ -1162,6 +1204,45 @@ fn x86_borrows(g: &mut X86, p: &Parser, head: u64, pre: u64, out: &mut Vec[u64])
       }
     }
     i = n.next;
+  }
+}
+
+/// Marks the variables the body of instance `y` (the k-th of `m.fns`) lends
+/// mutably as borrowed (never in a register), as the names of the current
+/// function: what `x86_borrows` and the marking after it would do, but the
+/// walk of the body is made once.
+fn x86_borrow_names(g: &mut X86, m: &Mono, p: &Parser, k: u64, y: u64) {
+  while vec_len(g.bspan) < wrap_mul(vec_len(m.fns), 2) {
+    vec_push(&mut g.bspan, 0);
+    vec_push(&mut g.bspan, X86_NODES);
+  }
+  let at = wrap_mul(k, 2);
+  if at + 1 < vec_len(g.bspan) {
+    if vec_get(g.bspan, at + 1) == X86_NODES {
+      let start = vec_len(g.bnodes);
+      let mut found = vec_new[u64]();
+      x86_borrows(&mut g, p, x86_body(m, p, y), X86_NODES, &mut found);
+      let mut q = 0;
+      while q < vec_len(found) {
+        vec_push(&mut g.bnodes, vec_get(found, q));
+        q = q + 1;
+      }
+      vec_set(&mut g.bspan, at, start);
+      vec_set(&mut g.bspan, at + 1, vec_len(found));
+      vec_free(found);
+    }
+    let start = vec_get(g.bspan, at);
+    let cnt = vec_get(g.bspan, at + 1);
+    let mut q = 0;
+    while q < cnt && wrap_add(start, q) < vec_len(g.bnodes) {
+      let r = node_at(p.nodes, vec_get(g.bnodes, wrap_add(start, q)));
+      let id = x86_nm(&mut g, p, y, r.s, r.e);
+      let mut nm = x86_name_at(g, id);
+      nm.brw = true;
+      nm.bad = true;
+      x86_name_set(&mut g, id, nm);
+      q = q + 1;
+    }
   }
 }
 
@@ -7906,6 +7987,7 @@ fn x86_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
   while vec_len(g.names) > 0 {
     vec_pop(&mut g.names);
   }
+  x86_nix_clear(&mut g);
   x86_truncate(&mut g, 0);
   g.vfloor = 0;
   x86_clear(&mut g.used);
@@ -7931,7 +8013,7 @@ fn x86_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
   while k < vec_len(m.fns) {
     let y = u_at(m.fns, k);
     if x86_inlinable(&mut g, m, p, y) {
-      x86_borrows(&mut g, p, x86_body(m, p, y), y, &mut brw);
+      x86_borrow_names(&mut g, m, p, k, y);
     }
     k = k + 1;
   }
