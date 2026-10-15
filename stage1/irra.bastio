@@ -516,6 +516,78 @@ fn ra_costs(f: &IrFn, depth: &Vec[u64]) -> Vec[u64] {
 
 /// Allocates the registers of `f` with `ncallee` callee-saved and `ncaller`
 /// caller-saved machine registers.
+// ---- Which registers live across a call ----
+
+/// For every register, 1 when it is live just after some call instruction
+/// and is not written by it, 0 otherwise. Unlike the interval, this ignores
+/// a call in a stretch of the interval where the register is dead.
+fn ra_cross(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> Vec[u64] {
+  let nr = f.nreg;
+  let nw = lv.nw;
+  let mut mark = vec_new[u64]();
+  let mut r = 0;
+  while r < nr && r < 1000000000 {
+    vec_push(&mut mark, 0);
+    r = r + 1;
+  }
+  let mut b = 0;
+  while b < vec_len(bl) {
+    let blk = vec_get(bl, b);
+    let mut cur = vec_new[u64]();
+    let mut w = 0;
+    while w < nw && w < 1000000000 {
+      vec_push(&mut cur, u_at(lv.out, wrap_add(wrap_mul(b, nw), w)));
+      w = w + 1;
+    }
+    let mut p = blk.e;
+    while p > blk.s && p <= vec_len(f.ins) {
+      p = p - 1;
+      let q = vec_get(f.ins, p);
+      let mut ws = vec_new[u64]();
+      ra_writes(q, &mut ws);
+      let mut k = 0;
+      while k < vec_len(ws) {
+        let x = vec_get(ws, k);
+        if x < nr {
+          ra_set(&mut cur, x / 64, u_at(cur, x / 64) & wrap_sub(18446744073709551615, u_at(lv.bit, x % 64)));
+        }
+        k = k + 1;
+      }
+      vec_free(ws);
+      if ra_calls(q) {
+        let mut wi = 0;
+        while wi < nw && wi < vec_len(cur) {
+          let word = vec_get(cur, wi);
+          if word != 0 {
+            let mut bi = 0;
+            while bi < 64 {
+              if (word & u_at(lv.bit, bi)) != 0 {
+                ra_set(&mut mark, wrap_add(wrap_mul(wi, 64), bi), 1);
+              }
+              bi = bi + 1;
+            }
+          }
+          wi = wi + 1;
+        }
+      }
+      let mut rs = vec_new[u64]();
+      ra_reads(f, q, &mut rs);
+      k = 0;
+      while k < vec_len(rs) {
+        let x = vec_get(rs, k);
+        if x < nr {
+          ra_set(&mut cur, x / 64, u_at(cur, x / 64) | u_at(lv.bit, x % 64));
+        }
+        k = k + 1;
+      }
+      vec_free(rs);
+    }
+    vec_free(cur);
+    b = b + 1;
+  }
+  return mark;
+}
+
 fn ra_alloc(f: &IrFn, ncallee: u64, ncaller: u64) -> IrAlloc {
   return ra_alloc_with(f, ncallee, ncaller, false);
 }
@@ -547,6 +619,7 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
   let bl = ra_blocks(f);
   let lv = ra_live(f, bl);
   let iv = ra_intervals(f, bl, lv);
+  let xmark = ra_cross(f, bl, lv);
   let nr = f.nreg;
   let n = vec_len(f.ins);
   // Call positions, to tell which intervals cross a call.
@@ -657,15 +730,7 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
     let lo = u_at(iv.lo, v);
     let hi = u_at(iv.hi, v);
     // Does it live across a call?
-    let mut crosses = false;
-    let mut c = 0;
-    while c < vec_len(calls) {
-      let cp = vec_get(calls, c);
-      if (lo < cp || (cp == 0 && ra_is_param(f, v))) && cp < hi {
-        crosses = true;
-      }
-      c = c + 1;
-    }
+    let crosses = u_at(xmark, v) != 0;
     // Registers whose interval ended before this one starts are free.
     let mut placed = false;
     // `v = mov u` where `u` dies there: `v` takes the place of `u`, and the
@@ -789,6 +854,7 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
   vec_free(busy_callee);
   vec_free(busy_caller);
   vec_free(calls);
+  vec_free(xmark);
   vec_free(iv.lo);
   vec_free(iv.hi);
   vec_free(lv.inn);
@@ -807,20 +873,15 @@ fn ra_valid(f: &IrFn, a: &IrAlloc) -> bool {
   let bl = ra_blocks(f);
   let lv = ra_live(f, bl);
   let iv = ra_intervals(f, bl, lv);
+  let xmark = ra_cross(f, bl, lv);
   let nr = f.nreg;
   let n = vec_len(f.ins);
   let mut ok = true;
   let mut x = 0;
   while x < nr && x < 100000 {
     let cx = u_at(a.cls, x);
-    if cx == RA_CALLER {
-      let mut p = 0;
-      while p < n {
-        if ra_calls(vec_get(f.ins, p)) && (u_at(iv.lo, x) < p || (p == 0 && ra_is_param(f, x))) && p < u_at(iv.hi, x) {
-          ok = false;
-        }
-        p = p + 1;
-      }
+    if cx == RA_CALLER && u_at(xmark, x) != 0 {
+      ok = false;
     }
     if cx == RA_CALLEE || cx == RA_CALLER || cx == RA_SPILL {
       let mut y = x + 1;
@@ -837,6 +898,7 @@ fn ra_valid(f: &IrFn, a: &IrAlloc) -> bool {
     }
     x = x + 1;
   }
+  vec_free(xmark);
   vec_free(iv.lo);
   vec_free(iv.hi);
   vec_free(lv.inn);
