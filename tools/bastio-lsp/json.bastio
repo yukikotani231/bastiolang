@@ -1,0 +1,485 @@
+// A small JSON reader and writer for the language server.
+//
+// The reader turns a text into an arena of nodes, as the parser of bastioc1
+// does for Bastio: children are chained through `next`, a string's text is
+// not copied (it is `s..e` of the source, escapes not yet decoded) and node
+// 0 means "none". It is meant for the messages an editor sends, so it
+// accepts exactly JSON, nests at most JSON_DEPTH deep, and gives up with
+// `ok == false` on anything else.
+import "../../stage1/lexer.bastio";
+import "../../stage1/wtext.bastio";
+
+const J_OBJ: u64 = 1;
+const J_ARR: u64 = 2;
+const J_STR: u64 = 3;     // s..e is the text between the quotes
+const J_NUM: u64 = 4;     // s..e is the literal
+const J_TRUE: u64 = 5;
+const J_FALSE: u64 = 6;
+const J_NULL: u64 = 7;
+
+const JSON_DEPTH: u64 = 64;
+
+/// A value. `first` is the first child of an object or array, `next` the
+/// next sibling; a member of an object has its key at `ks..ke`.
+struct JNode { kind: u64, s: u64, e: u64, first: u64, next: u64, ks: u64, ke: u64 }
+
+struct Json { src: Bytes, nodes: Vec[JNode], pos: u64, ok: bool }
+
+fn jnode(kind: u64, s: u64, e: u64) -> JNode {
+  return JNode { kind: kind, s: s, e: e, first: 0, next: 0, ks: 0, ke: 0 };
+}
+
+fn jn(j: &Json, i: u64) -> JNode {
+  if i < vec_len(j.nodes) {
+    return vec_get(j.nodes, i);
+  }
+  return jnode(0, 0, 0);
+}
+
+fn jset(j: &mut Json, i: u64, n: JNode) {
+  if i < vec_len(j.nodes) {
+    vec_set(&mut j.nodes, i, n);
+  }
+}
+
+fn jat(j: &Json, i: u64) -> u64 {
+  return at(j.src, i);
+}
+
+fn jws(j: &mut Json) {
+  while j.pos < blen(j.src) && is_space(jat(j, j.pos)) {
+    j.pos = j.pos + 1;
+  }
+}
+
+/// Reads the string whose opening quote is at `pos`; its node is `s..e`
+/// between the quotes. Returns the node, or 0 (and clears `ok`).
+fn jstring(j: &mut Json) -> u64 {
+  let n = blen(j.src);
+  if j.pos >= n || jat(j, j.pos) != 34 {
+    j.ok = false;
+    return 0;
+  }
+  j.pos = j.pos + 1;
+  let s = j.pos;
+  while j.pos < n && jat(j, j.pos) != 34
+    invariant s <= j.pos
+  {
+    if jat(j, j.pos) == 92 {
+      j.pos = j.pos + 1;
+    }
+    if j.pos < n {
+      j.pos = j.pos + 1;
+    }
+  }
+  if j.pos >= n {
+    j.ok = false;
+    return 0;
+  }
+  let e = j.pos;
+  j.pos = j.pos + 1;
+  vec_push(&mut j.nodes, jnode(J_STR, s, e));
+  return vec_len(j.nodes) - 1;
+}
+
+fn jword(j: &mut Json, w: Str, kind: u64) -> u64 {
+  let s = j.pos;
+  if s <= blen(j.src) && slen(w) <= blen(j.src) - s && spells(j.src, s, s + slen(w), w) {
+    j.pos = s + slen(w);
+    vec_push(&mut j.nodes, jnode(kind, s, j.pos));
+    return vec_len(j.nodes) - 1;
+  }
+  j.ok = false;
+  return 0;
+}
+
+fn jnumber(j: &mut Json) -> u64 {
+  let s = j.pos;
+  let n = blen(j.src);
+  while j.pos < n && (is_digit(jat(j, j.pos)) || jat(j, j.pos) == 45 || jat(j, j.pos) == 43 || jat(j, j.pos) == 46 || jat(j, j.pos) == 101 || jat(j, j.pos) == 69)
+    invariant s <= j.pos
+  {
+    j.pos = j.pos + 1;
+  }
+  if j.pos == s {
+    j.ok = false;
+    return 0;
+  }
+  vec_push(&mut j.nodes, jnode(J_NUM, s, j.pos));
+  return vec_len(j.nodes) - 1;
+}
+
+/// Reads a value at `pos`: its node, or 0 (and `ok` is false).
+fn jvalue(j: &mut Json, depth: u64) -> u64 {
+  jws(&mut j);
+  if depth > JSON_DEPTH || j.pos >= blen(j.src) {
+    j.ok = false;
+    return 0;
+  }
+  let c = jat(j, j.pos);
+  if c == 34 {
+    return jstring(&mut j);
+  }
+  if c == 116 {
+    return jword(&mut j, "true", J_TRUE);
+  }
+  if c == 102 {
+    return jword(&mut j, "false", J_FALSE);
+  }
+  if c == 110 {
+    return jword(&mut j, "null", J_NULL);
+  }
+  if c == 123 || c == 91 {
+    let obj = c == 123;
+    let mut close = 93;
+    let mut kind = J_ARR;
+    if obj {
+      close = 125;
+      kind = J_OBJ;
+    }
+    let start = j.pos;
+    j.pos = j.pos + 1;
+    vec_push(&mut j.nodes, jnode(kind, start, start));
+    let me = vec_len(j.nodes) - 1;
+    let mut last = 0;
+    jws(&mut j);
+    if j.pos < blen(j.src) && jat(j, j.pos) == close {
+      j.pos = j.pos + 1;
+    } else {
+      let mut more = true;
+      while more && j.ok {
+        let mut ks = 0;
+        let mut ke = 0;
+        if obj {
+          jws(&mut j);
+          let k = jstring(&mut j);
+          let kn = jn(j, k);
+          ks = kn.s;
+          ke = kn.e;
+          jws(&mut j);
+          if j.pos < blen(j.src) && jat(j, j.pos) == 58 {
+            j.pos = j.pos + 1;
+          } else {
+            j.ok = false;
+          }
+        }
+        if j.ok {
+          let v = jvalue(&mut j, depth + 1);
+          if j.ok {
+            let mut vn = jn(j, v);
+            vn.ks = ks;
+            vn.ke = ke;
+            jset(&mut j, v, vn);
+            if last == 0 {
+              let mut mn = jn(j, me);
+              mn.first = v;
+              jset(&mut j, me, mn);
+            } else {
+              let mut ln = jn(j, last);
+              ln.next = v;
+              jset(&mut j, last, ln);
+            }
+            last = v;
+          }
+        }
+        jws(&mut j);
+        if j.ok && j.pos < blen(j.src) && jat(j, j.pos) == 44 {
+          j.pos = j.pos + 1;
+        } else if j.ok && j.pos < blen(j.src) && jat(j, j.pos) == close {
+          j.pos = j.pos + 1;
+          more = false;
+        } else {
+          j.ok = false;
+        }
+      }
+    }
+    let mut mn = jn(j, me);
+    mn.e = j.pos;
+    jset(&mut j, me, mn);
+    return me;
+  }
+  return jnumber(&mut j);
+}
+
+/// Parses `src` as one JSON value (the whole text). `ok` tells whether it
+/// was; the root is node `root`.
+struct Parsed { j: Json, root: u64 }
+
+fn json_parse(src: Bytes) -> Parsed {
+  let mut nodes = vec_new[JNode]();
+  vec_push(&mut nodes, jnode(0, 0, 0));
+  let mut j = Json { src: src, nodes: nodes, pos: 0, ok: true };
+  let root = jvalue(&mut j, 0);
+  jws(&mut j);
+  if j.pos != blen(j.src) {
+    j.ok = false;
+  }
+  return Parsed { j: j, root: root };
+}
+
+/// Frees the nodes and gives the source back.
+fn json_free(p: Parsed) -> Bytes {
+  vec_free(p.j.nodes);
+  return p.j.src;
+}
+
+/// Does the key of member `m` spell `w`?
+fn jkey_is(j: &Json, m: JNode, w: Str) -> bool {
+  if m.ke < m.ks || m.ke > blen(j.src) || m.ke - m.ks != slen(w) {
+    return false;
+  }
+  return spells(j.src, m.ks, m.ke, w);
+}
+
+/// The member `key` of the object `obj`, or 0.
+fn jget(j: &Json, obj: u64, key: Str) -> u64 {
+  let o = jn(j, obj);
+  if o.kind != J_OBJ {
+    return 0;
+  }
+  let mut c = o.first;
+  let mut steps = 0;
+  while c != 0 && steps < vec_len(j.nodes)
+    invariant steps <= vlen(j.nodes)
+  {
+    let m = jn(j, c);
+    if jkey_is(j, m, key) {
+      return c;
+    }
+    c = m.next;
+    steps = steps + 1;
+  }
+  return 0;
+}
+
+/// `a.b` as `jget` calls.
+fn jpath2(j: &Json, obj: u64, a: Str, b: Str) -> u64 {
+  let x = jget(j, obj, a);
+  return jget(j, x, b);
+}
+
+/// `a.b.c` as `jget` calls.
+fn jpath3(j: &Json, obj: u64, a: Str, b: Str, c: Str) -> u64 {
+  let x = jget(j, obj, a);
+  let y = jget(j, x, b);
+  return jget(j, y, c);
+}
+
+/// Element `k` of the array `arr`, or 0.
+fn jelem(j: &Json, arr: u64, k: u64) -> u64 {
+  let o = jn(j, arr);
+  if o.kind != J_ARR {
+    return 0;
+  }
+  let mut c = o.first;
+  let mut i = 0;
+  while c != 0 && i < k && i < vec_len(j.nodes)
+    invariant i <= k
+  {
+    let cn = jn(j, c);
+    c = cn.next;
+    i = i + 1;
+  }
+  if i == k {
+    return c;
+  }
+  return 0;
+}
+
+fn jcount(j: &Json, arr: u64) -> u64 {
+  let o = jn(j, arr);
+  let mut c = o.first;
+  let mut n = 0;
+  while c != 0 && n < vec_len(j.nodes)
+    invariant n <= vlen(j.nodes)
+  {
+    let cn = jn(j, c);
+    c = cn.next;
+    n = n + 1;
+  }
+  return n;
+}
+
+/// The value of a non-negative integer node (0 for anything else; large
+/// values stop at U64_MAX).
+fn jnum(j: &Json, node: u64) -> u64 {
+  let n = jn(j, node);
+  if n.kind != J_NUM || n.e > blen(j.src) {
+    return 0;
+  }
+  let mut v = 0;
+  let mut k = n.s;
+  while k < n.e
+  {
+    let c = jat(j, k);
+    if !is_digit(c) {
+      return v;
+    }
+    if v > (U64_MAX - (c - 48)) / 10 {
+      return U64_MAX;
+    }
+    v = v * 10 + (c - 48);
+    k = k + 1;
+  }
+  return v;
+}
+
+fn jis_str(j: &Json, node: u64) -> bool {
+  let n = jn(j, node);
+  return n.kind == J_STR;
+}
+
+/// The raw text of a node (a number as written; a string without quotes and
+/// with its escapes), as bytes.
+fn jraw(j: &Json, node: u64, out: &mut Vec[u64]) {
+  let n = jn(j, node);
+  let mut k = n.s;
+  while k < n.e && k < blen(j.src)
+  {
+    vec_push(&mut out, jat(j, k));
+    k = k + 1;
+  }
+}
+
+fn put_utf8(out: &mut Vec[u64], cp: u64) {
+  if cp < 128 {
+    vec_push(&mut out, cp);
+  } else if cp < 2048 {
+    vec_push(&mut out, 192 + cp / 64);
+    vec_push(&mut out, 128 + cp % 64);
+  } else if cp < 65536 {
+    vec_push(&mut out, 224 + cp / 4096);
+    vec_push(&mut out, 128 + (cp / 64) % 64);
+    vec_push(&mut out, 128 + cp % 64);
+  } else {
+    vec_push(&mut out, 240 + (cp / 262144) % 8);
+    vec_push(&mut out, 128 + (cp / 4096) % 64);
+    vec_push(&mut out, 128 + (cp / 64) % 64);
+    vec_push(&mut out, 128 + cp % 64);
+  }
+}
+
+/// Four hex digits at `i`, or 65536 if they are not.
+fn hex4(j: &Json, i: u64) -> u64 {
+  let mut v = 0;
+  let mut k = 0;
+  while k < 4
+    invariant k <= 4 && (k == 0 ==> v == 0) && (k <= 1 ==> v < 16) && (k <= 2 ==> v < 256) && (k <= 3 ==> v < 4096) && v < 65536
+  {
+    let h = hex_val(jat(j, vadd(i, k)));
+    if h >= 16 {
+      return 65536;
+    }
+    v = v * 16 + h;
+    k = k + 1;
+  }
+  return v;
+}
+
+fn vadd(a: u64, b: u64) -> u64
+  ensures result >= a && (b <= U64_MAX - a ==> result == a + b)
+{
+  if b > U64_MAX - a {
+    return U64_MAX;
+  }
+  return a + b;
+}
+
+/// Appends the decoded text of the string node (UTF-8, escapes resolved).
+fn jdecode(j: &Json, node: u64, out: &mut Vec[u64]) {
+  let n = jn(j, node);
+  if n.kind != J_STR {
+    return;
+  }
+  let mut k = n.s;
+  while k < n.e && k < blen(j.src)
+  {
+    let c = jat(j, k);
+    if c != 92 {
+      vec_push(&mut out, c);
+      k = k + 1;
+    } else {
+      let d = jat(j, vadd(k, 1));
+      k = vadd(k, 2);
+      if d == 110 {
+        vec_push(&mut out, 10);
+      } else if d == 116 {
+        vec_push(&mut out, 9);
+      } else if d == 114 {
+        vec_push(&mut out, 13);
+      } else if d == 98 {
+        vec_push(&mut out, 8);
+      } else if d == 102 {
+        vec_push(&mut out, 12);
+      } else if d == 117 {
+        let mut cp = hex4(j, k);
+        k = vadd(k, 4);
+        if cp >= 55296 && cp < 56320 && jat(j, k) == 92 && jat(j, vadd(k, 1)) == 117 {
+          let lo = hex4(j, vadd(k, 2));
+          if lo >= 56320 && lo < 57344 {
+            cp = 65536 + (cp - 55296) * 1024 + (lo - 56320);
+            k = vadd(k, 6);
+          }
+        }
+        if cp >= 65536 && cp < 1114112 {
+          put_utf8(&mut out, cp);
+        } else if cp < 65536 && !(cp >= 55296 && cp < 57344) {
+          put_utf8(&mut out, cp);
+        } else {
+          put_utf8(&mut out, 65533);
+        }
+      } else {
+        vec_push(&mut out, d);
+      }
+    }
+  }
+}
+
+// ---- Writing ----
+
+/// Appends `s` as the content of a JSON string (no quotes).
+fn jesc_bytes(out: &mut Vec[u64], src: &Bytes, s: u64, e: u64) {
+  let mut k = s;
+  while k < e && k < blen(src)
+  {
+    let c = at(src, k);
+    jesc_char(&mut out, c);
+    k = k + 1;
+  }
+}
+
+fn jesc_char(out: &mut Vec[u64], c: u64) {
+  if c == 34 {
+    w_s(&mut out, "\\\"");
+  } else if c == 92 {
+    w_s(&mut out, "\\\\");
+  } else if c == 10 {
+    w_s(&mut out, "\\n");
+  } else if c == 13 {
+    w_s(&mut out, "\\r");
+  } else if c == 9 {
+    w_s(&mut out, "\\t");
+  } else if c < 32 {
+    w_s(&mut out, "\\u00");
+    vec_push(&mut out, 48 + c / 16);
+    let lo = c % 16;
+    if lo < 10 {
+      vec_push(&mut out, 48 + lo);
+    } else {
+      vec_push(&mut out, 87 + lo);
+    }
+  } else {
+    vec_push(&mut out, c);
+  }
+}
+
+/// Appends the elements of `v` as the content of a JSON string.
+fn jesc_vec(out: &mut Vec[u64], v: &Vec[u64]) {
+  let mut k = 0;
+  while k < vec_len(v)
+    invariant k <= vlen(v)
+  {
+    jesc_char(&mut out, vec_get(v, k) % 256);
+    k = k + 1;
+  }
+}

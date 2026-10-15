@@ -1,0 +1,576 @@
+// What the language server knows about a program: the top-level
+// definitions of a file and of the files it imports, found from the tokens
+// (not the syntax tree, so a file that is half typed still has its
+// definitions), and the name under the cursor.
+//
+// The files of a program are read into one buffer, one after the other, as
+// the loader of bastioc1 does, so a byte offset names a place in any file.
+import "../../stage1/libenv.bastio";
+import "../bastiofmt/fmt.bastio";
+import "json.bastio";
+
+const DK_FN: u64 = 1;
+const DK_STRUCT: u64 = 2;
+const DK_ENUM: u64 = 3;
+const DK_CONST: u64 = 4;
+const DK_SPEC: u64 = 5;
+const DK_VARIANT: u64 = 6;
+const DK_FIELD: u64 = 7;
+
+/// A definition. `ns..ne` is its name, `ss..se` the text that says what it
+/// is (the signature of a function; the whole definition of a type) and
+/// `ss..ie` the whole definition. `parent` is 1 + the index of the type a
+/// variant or field belongs to (0 for a top-level definition).
+struct Def { kind: u64, file: u64, ns: u64, ne: u64, ss: u64, se: u64, ie: u64, parent: u64 }
+
+/// A program: the text of all its files, their tokens and definitions.
+struct Prog {
+  all: Bytes,
+  ld: Loader,
+  /// Where file k's text starts in `all`, and where its tokens start in `toks`.
+  fstart: Vec[u64],
+  tstart: Vec[u64],
+  toks: Vec[Tok],
+  defs: Vec[Def]
+}
+
+fn pg_free(ix: Prog) {
+  bfree(ix.all);
+  loader_free(ix.ld);
+  vec_free(ix.fstart);
+  vec_free(ix.tstart);
+  vec_free(ix.toks);
+  vec_free(ix.defs);
+}
+
+fn def_at(ix: &Prog, i: u64) -> Def {
+  if i < vec_len(ix.defs) {
+    return vec_get(ix.defs, i);
+  }
+  return Def { kind: 0, file: 0, ns: 0, ne: 0, ss: 0, se: 0, ie: 0, parent: 0 };
+}
+
+fn u_get(v: &Vec[u64], i: u64) -> u64 {
+  return u_at(v, i);
+}
+
+/// The index of the token that matches the opening bracket at token `i`
+/// (`{`, `(` or `[`), or `tend - 1` if there is none.
+fn match_close(toks: &Vec[Tok], i: u64, tend: u64) -> u64 {
+  let mut depth = 0;
+  let mut j = i;
+  while j < tend && j < vec_len(toks)
+  {
+    let t = vec_get(toks, j);
+    if is_opener(t) {
+      depth = sadd(depth, 1);
+    } else if is_closer(t) {
+      if depth <= 1 {
+        return j;
+      }
+      depth = depth - 1;
+    }
+    j = vadd(j, 1);
+  }
+  if tend > 0 {
+    return tend - 1;
+  }
+  return 0;
+}
+
+/// The offset after the text of token `t`, which for a string includes the
+/// closing quote.
+fn tok_at_start(toks: &Vec[Tok], i: u64) -> u64 {
+  let t = tok_at(toks, i);
+  return t.start;
+}
+
+fn tok_at_end(toks: &Vec[Tok], i: u64) -> u64 {
+  let t = tok_at(toks, i);
+  return t.end;
+}
+
+fn tok_at_kind(toks: &Vec[Tok], i: u64) -> u64 {
+  let t = tok_at(toks, i);
+  return t.kind;
+}
+
+fn tok_end(t: Tok) -> u64 {
+  if t.kind == K_STR {
+    return vadd(t.end, 1);
+  }
+  return t.end;
+}
+
+/// The offset where the text of token `t` starts (a string's opening quote).
+fn tok_start(t: Tok) -> u64 {
+  if t.kind == K_STR && t.start > 0 {
+    return t.start - 1;
+  }
+  return t.start;
+}
+
+/// `s`, with the white space just before it taken off.
+fn trim_back(all: &Bytes, from: u64, e: u64) -> u64 {
+  let mut k = e;
+  if k > blen(all) {
+    k = blen(all);
+  }
+  while k > from && is_space(at(all, k - 1))
+  {
+    k = k - 1;
+  }
+  return k;
+}
+
+/// Adds the definitions in tokens `ts..te` of file `file`.
+fn scan_defs(ix: &mut Prog, ts: u64, te: u64, file: u64) {
+  let mut depth = 0;
+  let mut i = ts;
+  while i < te && i < vec_len(ix.toks)
+  {
+    let t = vec_get(ix.toks, i);
+    if is_p(t, P_LBRACE) {
+      depth = sadd(depth, 1);
+    } else if is_p(t, P_RBRACE) {
+      if depth > 0 {
+        depth = depth - 1;
+      }
+    } else if depth == 0 && t.kind == K_KEYWORD && (t.val == KW_FN || t.val == KW_STRUCT || t.val == KW_ENUM || t.val == KW_CONST || t.val == KW_SPEC) {
+      let mut kind = DK_FN;
+      let mut ni = vadd(i, 1);
+      if t.val == KW_STRUCT {
+        kind = DK_STRUCT;
+      } else if t.val == KW_ENUM {
+        kind = DK_ENUM;
+      } else if t.val == KW_CONST {
+        kind = DK_CONST;
+      } else if t.val == KW_SPEC {
+        kind = DK_SPEC;
+        ni = vadd(i, 2);
+      }
+      let nt = tok_at(ix.toks, ni);
+      if nt.kind == K_IDENT && (t.val != KW_SPEC || is_kw(tok_at(ix.toks, vadd(i, 1)), KW_FN)) {
+        let mut ss = t.start;
+        if i > ts && is_kw(tok_at(ix.toks, i - 1), KW_EXPORT) {
+          ss = tok_at_start(ix.toks, i - 1);
+        }
+        // The end of the signature: the first `{` or `;` outside brackets.
+        let mut j = vadd(ni, 1);
+        let mut pd = 0;
+        let mut found = false;
+        while j < te && !found && j < vec_len(ix.toks)
+        {
+          let tj = vec_get(ix.toks, j);
+          if tj.kind == K_PUNCT && (tj.val == P_LPAREN || tj.val == P_LBRACKET) {
+            pd = sadd(pd, 1);
+          } else if tj.kind == K_PUNCT && (tj.val == P_RPAREN || tj.val == P_RBRACKET) {
+            if pd > 0 {
+              pd = pd - 1;
+            }
+          } else if pd == 0 && (is_p(tj, P_LBRACE) || is_p(tj, P_SEMI)) {
+            found = true;
+          }
+          if !found {
+            j = vadd(j, 1);
+          }
+        }
+        let tj = tok_at(ix.toks, j);
+        let mut se = trim_back(ix.all, ss, tj.start);
+        let mut ie = tok_end(tj);
+        if found && is_p(tj, P_LBRACE) {
+          let c = match_close(ix.toks, j, te);
+          ie = tok_at_end(ix.toks, c);
+          if kind == DK_STRUCT || kind == DK_ENUM {
+            se = ie;
+          }
+        }
+        if !found {
+          se = tok_end(nt);
+          ie = se;
+        }
+        vec_push(&mut ix.defs, Def { kind: kind, file: file, ns: nt.start, ne: nt.end, ss: ss, se: se, ie: ie, parent: 0 });
+        if (kind == DK_STRUCT || kind == DK_ENUM) && found && is_p(tj, P_LBRACE) {
+          let me = vec_len(ix.defs);
+          scan_members(&mut ix, j, match_close(ix.toks, j, te), file, kind, me);
+        }
+      }
+    }
+    i = vadd(i, 1);
+  }
+}
+
+/// The variants of an enum or the fields of a struct: tokens `open..close`.
+fn scan_members(ix: &mut Prog, open: u64, close: u64, file: u64, parent_kind: u64, parent: u64) {
+  let mut depth = 0;
+  let mut j = open;
+  while j <= close && j < vec_len(ix.toks)
+  {
+    let t = vec_get(ix.toks, j);
+    if is_opener(t) {
+      depth = sadd(depth, 1);
+    } else if is_closer(t) {
+      if depth > 0 {
+        depth = depth - 1;
+      }
+    }
+    let prev = tok_at(ix.toks, vsub(j, 1));
+    if depth == 1 && t.kind == K_IDENT && (is_p(prev, P_LBRACE) || is_p(prev, P_COMMA)) && j > open {
+      // The member ends at the next `,` or the closing `}` at this depth.
+      let mut e = j;
+      let mut d = 0;
+      let mut stop = false;
+      while e < close && !stop && e < vec_len(ix.toks)
+      {
+        let te = vec_get(ix.toks, e);
+        if is_opener(te) {
+          d = sadd(d, 1);
+        } else if is_closer(te) {
+          if d > 0 {
+            d = d - 1;
+          }
+        } else if d == 0 && is_p(te, P_COMMA) {
+          stop = true;
+        }
+        if !stop {
+          e = vadd(e, 1);
+        }
+      }
+      let last = tok_at(ix.toks, vsub(e, 1));
+      let mut kind = DK_FIELD;
+      if parent_kind == DK_ENUM {
+        kind = DK_VARIANT;
+      }
+      let se = last.end;
+      vec_push(&mut ix.defs, Def { kind: kind, file: file, ns: t.start, ne: t.end, ss: t.start, se: se, ie: se, parent: parent });
+    }
+    j = vadd(j, 1);
+  }
+}
+
+fn vsub(a: u64, b: u64) -> u64 {
+  if a < b {
+    return 0;
+  }
+  return a - b;
+}
+
+/// `path` with `.`, `..` and repeated slashes taken out. (The loader's
+/// `normalize` leaves a NUL at the end, which is harmless as a key and
+/// wrong as text.)
+fn canon_path(path: &Bytes) -> Bytes {
+  let c = normalize(path);
+  let mut n = blen(c);
+  while n > 0 && n <= blen(c) && bget(c, n - 1) == 0 {
+    n = n - 1;
+  }
+  if n > blen(c) {
+    n = blen(c);
+  }
+  let r = byte_range(c, 0, n);
+  bfree(c);
+  return r;
+}
+
+/// Is file `canon` already in the program? Its index + 1, or 0.
+fn pg_find(ix: &Prog, canon: &Bytes) -> u64 {
+  return find_file(ix.ld, canon);
+}
+
+/// The text of `path`: an open document's if there is one (`dpaths[k]` is its
+/// path, `dtexts[k]` its text), else the file's.
+fn read_text(host: &Host, dpaths: &mut Vec[Bytes], dtexts: &mut Vec[Bytes], canon: &Bytes, path: &Bytes, out: &mut Bytes) -> bool {
+  let mut k = 0;
+  while k < vec_len(dpaths) && k < vec_len(dtexts)
+  {
+    let p = vec_swap(&mut dpaths, k, balloc(0));
+    let same = bytes_same(p, canon);
+    bfree(vec_swap(&mut dpaths, k, p));
+    if same {
+      let t = vec_swap(&mut dtexts, k, balloc(0));
+      let copy = byte_range(t, 0, blen(t));
+      bfree(vec_swap(&mut dtexts, k, t));
+      bfree(out);
+      out = copy;
+      return true;
+    }
+    k = vadd(k, 1);
+  }
+  return host_read(host, path, &mut out);
+}
+
+fn bytes_same(a: &Bytes, b: &Bytes) -> bool {
+  if blen(a) != blen(b) {
+    return false;
+  }
+  let mut k = 0;
+  while k < blen(a)
+    invariant k <= blen(a) && blen(a) == blen(b)
+  {
+    if bget(a, k) != bget(b, k) {
+      return false;
+    }
+    k = vadd(k, 1);
+  }
+  return true;
+}
+
+/// Loads `path` and what it imports into `ix` (file indices are in load order).
+fn pg_load(host: &Host, ix: &mut Prog, dpaths: &mut Vec[Bytes], dtexts: &mut Vec[Bytes], path: &Bytes, depth: u64) {
+  if depth > 64 {
+    return;
+  }
+  let canon = canon_path(path);
+  if pg_find(ix, canon) != 0 {
+    bfree(canon);
+    return;
+  }
+  let mut data = balloc(0);
+  if !read_text(host, &mut dpaths, &mut dtexts, canon, path, &mut data) || blen(data) > SRC_MAX || blen(ix.all) > SRC_MAX - blen(data) {
+    bfree(data);
+    bfree(canon);
+    return;
+  }
+  let start = blen(ix.all);
+  let k = vec_len(ix.fstart);
+  add_file(&mut ix.ld, canon, path, start);
+  bfree(canon);
+  let before = ix.all;
+  ix.all = concat(before, data);
+  bfree(before);
+  bfree(data);
+  vec_push(&mut ix.fstart, start);
+  let ts = vec_len(ix.toks);
+  vec_push(&mut ix.tstart, ts);
+  // A file that does not lex has no tokens past the error; its definitions
+  // before it still count.
+  if blen(ix.all) <= SRC_MAX {
+    lex(ix.all, start, &mut ix.toks);
+  }
+  let te = vec_len(ix.toks);
+  // The leading imports.
+  let dir = parent(path);
+  let mut imports = vec_new[Bytes]();
+  let mut i = ts;
+  while i < te && te - i > 2 && is_kw(tok_at(ix.toks, i), KW_IMPORT) {
+    let name = tok_at(ix.toks, vadd(i, 1));
+    if name.kind == K_STR && name.start <= name.end && name.end <= blen(ix.all) && is_p(tok_at(ix.toks, vadd(i, 2)), P_SEMI) {
+      let rel = decode(ix.all, name.start, name.end);
+      vec_push(&mut imports, resolve(host, &mut ix.ld, dir, rel));
+      bfree(rel);
+    }
+    i = vadd(i, 3);
+  }
+  bfree(dir);
+  scan_defs(&mut ix, ts, te, k);
+  while vec_len(imports) > 0 {
+    let p = vec_pop(&mut imports);
+    pg_load(host, &mut ix, &mut dpaths, &mut dtexts, p, vadd(depth, 1));
+    bfree(p);
+  }
+  vec_free(imports);
+}
+
+fn pg_new() -> Prog {
+  return Prog { all: balloc(0), ld: loader_new(), fstart: vec_new[u64](), tstart: vec_new[u64](), toks: vec_new[Tok](), defs: vec_new[Def]() };
+}
+
+/// The token range of file `k`.
+fn file_toks_end(ix: &Prog, k: u64) -> u64 {
+  if vadd(k, 1) < vec_len(ix.tstart) {
+    return u_at(ix.tstart, vadd(k, 1));
+  }
+  return vec_len(ix.toks);
+}
+
+/// Does `all[s..e]` spell the same as `all[s2..e2]`?
+fn same_text(all: &Bytes, s: u64, e: u64, s2: u64, e2: u64) -> bool {
+  if e < s || e2 < s2 || e - s != e2 - s2 || e > blen(all) || e2 > blen(all) {
+    return false;
+  }
+  let mut k = 0;
+  while k < e - s
+    invariant k <= e - s && e <= blen(all) && e2 <= blen(all) && e - s == e2 - s2
+  {
+    if bget(all, s + k) != bget(all, s2 + k) {
+      return false;
+    }
+    k = vadd(k, 1);
+  }
+  return true;
+}
+
+/// Which definition does token `ti` (of file `file`) name? The result is a
+/// token index of a local binding (`local`), or a definition index; `found`
+/// says whether there is one.
+struct Res { found: bool, local: bool, idx: u64 }
+
+fn no_res() -> Res {
+  return Res { found: false, local: false, idx: 0 };
+}
+
+fn resolve_at(ix: &Prog, file: u64, ti: u64) -> Res {
+  let t = tok_at(ix.toks, ti);
+  if t.kind != K_IDENT {
+    return no_res();
+  }
+  let prev = tok_at(ix.toks, vsub(ti, 1));
+  let is_field = ti > 0 && is_p(prev, P_DOT);
+  let is_path = ti > 1 && is_p(prev, P_COLONCOLON);
+  let ts = u_at(ix.tstart, file);
+  if !is_field && !is_path {
+    let l = find_local(ix, file, ti, ts);
+    if l.found {
+      return l;
+    }
+  }
+  // Definitions: the file's own first, then the others.
+  let mut pass = 0;
+  while pass < 2
+  {
+    let mut d = 0;
+    while d < vec_len(ix.defs)
+    {
+      let df = vec_get(ix.defs, d);
+      let own = df.file == file;
+      let kind_ok = (is_field && df.kind == DK_FIELD) || (is_path && df.kind == DK_VARIANT) || (!is_field && !is_path && df.kind != DK_FIELD && df.kind != DK_VARIANT);
+      if kind_ok && ((pass == 0) == own) && same_text(ix.all, df.ns, df.ne, t.start, t.end) {
+        return Res { found: true, local: false, idx: d };
+      }
+      d = vadd(d, 1);
+    }
+    pass = vadd(pass, 1);
+  }
+  return no_res();
+}
+
+/// A parameter, `let`, match binding or quantified variable named like
+/// token `ti`, declared before it inside the function that holds it.
+fn find_local(ix: &Prog, file: u64, ti: u64, ts: u64) -> Res {
+  let t = tok_at(ix.toks, ti);
+  // The function: the last definition of the file that starts before the token.
+  let mut fn_start = 0;
+  let mut have = false;
+  let mut d = 0;
+  while d < vec_len(ix.defs)
+  {
+    let df = vec_get(ix.defs, d);
+    if df.file == file && (df.kind == DK_FN || df.kind == DK_SPEC) && df.ss <= t.start && t.start <= df.ie {
+      fn_start = df.ss;
+      have = true;
+    }
+    d = vadd(d, 1);
+  }
+  if !have {
+    return no_res();
+  }
+  let mut j = ti;
+  while j > ts
+  {
+    j = j - 1;
+    let c = tok_at(ix.toks, j);
+    if c.start < fn_start {
+      return no_res();
+    }
+    if c.kind == K_IDENT && same_text(ix.all, c.start, c.end, t.start, t.end) {
+      let p = tok_at(ix.toks, vsub(j, 1));
+      let p2 = tok_at(ix.toks, vsub(j, 2));
+      let n = tok_at(ix.toks, vadd(j, 1));
+      let n2 = tok_at(ix.toks, vadd(j, 2));
+      let let_binding = is_kw(p, KW_LET) || (is_kw(p, KW_MUT) && is_kw(p2, KW_LET));
+      let param = (is_p(p, P_LPAREN) || is_p(p, P_COMMA) || is_kw(p, KW_MUT)) && is_p(n, P_COLON);
+      let arm = (is_p(p, P_LPAREN) || is_kw(p, KW_MUT)) && is_p(n, P_RPAREN) && is_p(n2, P_FATARROW);
+      let quant = is_kw(p, KW_FORALL);
+      if (let_binding || param || arm || quant) && j != ti {
+        return Res { found: true, local: true, idx: j };
+      }
+    }
+  }
+  return no_res();
+}
+
+/// The index of the token that holds byte offset `off` of file `file`, or
+/// the last token before it, if `off` is inside a token. `found` is false
+/// if the offset is not in one.
+fn tok_at_offset(ix: &Prog, file: u64, off: u64) -> Res {
+  let ts = u_at(ix.tstart, file);
+  let te = file_toks_end(ix, file);
+  let mut i = ts;
+  while i < te && i < vec_len(ix.toks)
+  {
+    let t = vec_get(ix.toks, i);
+    if t.kind != K_EOF && tok_start(t) <= off && off <= tok_end(t) {
+      // Prefer an identifier that ends exactly at the cursor, if the next
+      // token does not start there.
+      if off == tok_end(t) && tok_start(tok_at(ix.toks, vadd(i, 1))) == off && tok_at_kind(ix.toks, vadd(i, 1)) == K_IDENT {
+        return Res { found: true, local: false, idx: vadd(i, 1) };
+      }
+      return Res { found: true, local: false, idx: i };
+    }
+    i = vadd(i, 1);
+  }
+  return no_res();
+}
+
+/// The doc comment lines (`///`) directly above offset `off`, joined with
+/// newlines and without their `///`.
+fn doc_comment(all: &Bytes, fstart: u64, off: u64, out: &mut Vec[u64]) {
+  // Find the start of the line, then walk up over `///` lines.
+  let mut ls = off;
+  if ls > blen(all) {
+    ls = blen(all);
+  }
+  while ls > fstart && at(all, ls - 1) != 10
+  {
+    ls = ls - 1;
+  }
+  let mut lines = vec_new[u64]();
+  let mut cur = ls;
+  let mut steps = 0;
+  while cur > fstart && steps < 200
+  {
+    // The line above ends at cur - 1 (the newline).
+    let mut s = cur - 1;
+    while s > fstart && at(all, s - 1) != 10
+    {
+      s = s - 1;
+    }
+    let mut p = s;
+    while p < cur && (at(all, p) == 32 || at(all, p) == 9)
+    {
+      p = vadd(p, 1);
+    }
+    if at(all, p) == 47 && at(all, vadd(p, 1)) == 47 && at(all, vadd(p, 2)) == 47 && vadd(p, 2) < cur {
+      vec_push(&mut lines, s);
+      vec_push(&mut lines, cur - 1);
+      cur = s;
+      steps = vadd(steps, 1);
+    } else {
+      steps = 200;
+    }
+  }
+  // The lines were found bottom to top.
+  let mut k = vec_len(lines);
+  while k >= 2
+  {
+    k = k - 2;
+    let s = u_at(lines, k);
+    let e = u_at(lines, vadd(k, 1));
+    let mut p = s;
+    while p < e && (at(all, p) == 32 || at(all, p) == 9)
+    {
+      p = vadd(p, 1);
+    }
+    p = vadd(p, 3);
+    if p < e && at(all, p) == 32 {
+      p = vadd(p, 1);
+    }
+    while p < e
+    {
+      vec_push(&mut out, at(all, p));
+      p = vadd(p, 1);
+    }
+    vec_push(&mut out, 10);
+  }
+  vec_free(lines);
+}
