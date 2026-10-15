@@ -80,6 +80,15 @@ What will be 0.2.0.
 
 ### Library
 
+- Five new modules. `core/path` splits file names (`path_split`,
+  `path_ext`), joins them (`path_join`) and cleans them lexically
+  (`path_clean`); every span it returns is proved to lie inside the path.
+  `core/set` is a `HashSet` of `u64`. `core/ascii` has character classes and
+  case conversion, proved byte for byte. `core/lines` splits text into
+  lines (`\n` and `\r\n`), proved to give spans with no newline in them.
+  `core/format` pads columns, joins, replaces, quotes and prints sizes
+  (`fmt_pad_left`, `fmt_join`, `fmt_replace_all`, `fmt_quoted`, `fmt_size`).
+  `std/host` gained `write_file`, `file_exists`, `env_get` and `host_args`.
 - A reference page for every library module (docs/lib/, and in the site):
   each function with its contract as the compiler checks it, what it is for,
   and an example. `tests/libref.py` generates the pages from the doc
