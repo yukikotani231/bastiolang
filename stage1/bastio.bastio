@@ -1,0 +1,1226 @@
+// bastio -- the project tool: reads `bastio.toml`, finds the packages a
+// project depends on (local directories and git repositories), pins the git
+// ones in `bastio.lock`, and runs bastioc1 with one `--pkg NAME=DIR` per
+// package. See docs/packages.md.
+//
+// usage: bastio build [DIR] [-o OUT] [-- bastioc1 options...]
+//        bastio check [DIR] [-- bastioc1 options...]
+//        bastio update [DIR]
+//
+// The tool is a hosted program built by bastioc1 (it is not part of the
+// bootstrap, so it may use core/). The compiler is `$BASTIOC1`, the file
+// `bastioc1` next to this program, or `bastioc1` on `PATH`.
+import "core/option.bastio";
+import "core/bytes.bastio";
+import "core/text.bastio";
+import "core/num.bastio";
+import "core/print.bastio";
+
+// ---------------------------------------------------------------------------
+// The manifest.
+//
+//   [package]
+//   name = "app"
+//   version = "0.1.0"
+//   entry = "src/main.bastio"       # optional
+//
+//   [dependencies]
+//   util = { path = "../util" }
+//   mathx = { git = "https://example.org/mathx.git", rev = "v1.2.0", version = "1.2" }
+//
+// A TOML subset: `#` comments, sections, `key = "string"` and inline tables
+// of strings. A spans-only parse: every string is a `Span` of the file text.
+// ---------------------------------------------------------------------------
+
+struct Dep { name: Span, path: Span, git: Span, rev: Span, version: Span, line: u64 }
+
+struct Manifest {
+  name: Span,
+  version: Span,
+  entry: Span,
+  deps: Vec[Dep],
+  err: Vec[u8],
+  eline: u64
+}
+
+fn empty_span() -> Span
+  ensures result.start == 0 && result.end == 0
+{
+  return Span { start: 0, end: 0 };
+}
+
+fn manifest_new() -> Manifest {
+  return Manifest {
+    name: empty_span(), version: empty_span(), entry: empty_span(),
+    deps: vec_new[Dep](), err: text_new(), eline: 0
+  };
+}
+
+fn manifest_free(m: Manifest) {
+  vec_free(m.deps);
+  vec_free(m.err);
+}
+
+fn fail(m: &mut Manifest, line: u64, msg: Str) {
+  if vec_len(m.err) == 0 {
+    text_push_str(&mut m.err, msg);
+    m.eline = line;
+  }
+}
+
+fn failed(m: &Manifest) -> bool {
+  return vec_len(m.err) > 0;
+}
+
+fn is_ws(c: u8) -> bool {
+  return c == 32 || c == 9 || c == 13;
+}
+
+/// The first position in `i..e` that is not blank.
+fn skip_ws(b: &Bytes, i: u64, e: u64) -> u64
+  requires i <= e && e <= blen(b)
+  ensures i <= result && result <= e
+{
+  let mut k = i;
+  while k < e && is_ws(bget(b, k))
+    invariant i <= k && k <= e && e <= blen(b)
+  {
+    k = k + 1;
+  }
+  return k;
+}
+
+fn is_key_char(c: u8) -> bool {
+  return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95 || c == 45;
+}
+
+/// The end of the key that starts at `i`.
+fn key_end(b: &Bytes, i: u64, e: u64) -> u64
+  requires i <= e && e <= blen(b)
+  ensures i <= result && result <= e
+{
+  let mut k = i;
+  while k < e && is_key_char(bget(b, k))
+    invariant i <= k && k <= e && e <= blen(b)
+  {
+    k = k + 1;
+  }
+  return k;
+}
+
+/// The closing quote at or after `i`, or `e` when there is none.
+fn quote_end(b: &Bytes, i: u64, e: u64) -> u64
+  requires i <= e && e <= blen(b)
+  ensures i <= result && result <= e
+{
+  let mut k = i;
+  while k < e && bget(b, k) != 34
+    invariant i <= k && k <= e && e <= blen(b)
+  {
+    k = k + 1;
+  }
+  return k;
+}
+
+/// A `"string"` that starts at `i` (which must be a quote): the span inside
+/// the quotes, and the position after the closing quote in `after`. On a
+/// missing quote or an escape the manifest fails.
+struct Str1 { sp: Span, after: u64 }
+
+fn read_string(b: &Bytes, i: u64, e: u64, line: u64, m: &mut Manifest) -> Str1
+  requires i < e && e <= blen(b)
+  ensures result.sp.start <= result.sp.end && result.sp.end <= e && result.after <= e
+{
+  let q = quote_end(b, i + 1, e);
+  if q >= e {
+    fail(&mut m, line, "unterminated string");
+    return Str1 { sp: Span { start: 0, end: 0 }, after: e };
+  }
+  let mut k = i + 1;
+  while k < q
+    invariant i + 1 <= k && k <= q && q < e && e <= blen(b)
+  {
+    if bget(b, k) == 92 {
+      fail(&mut m, line, "a string cannot contain a backslash");
+    }
+    k = k + 1;
+  }
+  return Str1 { sp: Span { start: i + 1, end: q }, after: q + 1 };
+}
+
+/// Sets field `key` (the span `ks..ke`) of a dependency to `v`.
+fn set_dep_field(b: &Bytes, ks: u64, ke: u64, v: Span, d: &mut Dep, m: &mut Manifest, line: u64)
+  requires ks <= ke && ke <= blen(b)
+{
+  if bytes_span_eq_str(b, ks, ke, "path") {
+    d.path = v;
+  } else if bytes_span_eq_str(b, ks, ke, "git") {
+    d.git = v;
+  } else if bytes_span_eq_str(b, ks, ke, "rev") {
+    d.rev = v;
+  } else if bytes_span_eq_str(b, ks, ke, "version") {
+    d.version = v;
+  } else {
+    fail(&mut m, line, "unknown key in a dependency (expected path, git, rev or version)");
+  }
+}
+
+/// The inline table `{ k = "v", ... }` of a dependency, from `i` (a `{`).
+fn read_dep_table(b: &Bytes, i: u64, e: u64, line: u64, d: &mut Dep, m: &mut Manifest)
+  requires i < e && e <= blen(b)
+{
+  let mut k = skip_ws(b, i + 1, e);
+  let mut done = false;
+  let mut steps = 0;
+  while !done && !failed(m) && steps < 16
+    invariant k <= e && e <= blen(b) && steps <= 16
+  {
+    steps = steps + 1;
+    if k >= e {
+      fail(&mut m, line, "expected `}` to close the dependency");
+    } else if bget(b, k) == 125 {
+      done = true;
+    } else {
+      let ke = key_end(b, k, e);
+      let eq = skip_ws(b, ke, e);
+      if ke == k || eq >= e || bget(b, eq) != 61 {
+        fail(&mut m, line, "expected `key = \"value\"` in the dependency");
+      } else {
+        let vs = skip_ws(b, eq + 1, e);
+        if vs >= e || bget(b, vs) != 34 {
+          fail(&mut m, line, "expected a string value");
+        } else {
+          let sv = read_string(b, vs, e, line, &mut m);
+          set_dep_field(b, k, ke, sv.sp, &mut d, &mut m, line);
+          let nx = skip_ws(b, sv.after, e);
+          if nx < e && bget(b, nx) == 44 {
+            k = skip_ws(b, nx + 1, e);
+          } else if nx < e && bget(b, nx) == 125 {
+            k = nx;
+          } else {
+            fail(&mut m, line, "expected `,` or `}` after the value");
+          }
+        }
+      }
+    }
+  }
+  if !done && !failed(m) {
+    fail(&mut m, line, "too many keys in a dependency");
+  }
+}
+
+// Sections.
+const SEC_NONE: u64 = 0;
+const SEC_PACKAGE: u64 = 1;
+const SEC_DEPS: u64 = 2;
+
+/// One line `s..e` of the manifest; returns the section it leaves.
+fn parse_line(b: &Bytes, s: u64, e: u64, line: u64, section: u64, m: &mut Manifest) -> u64
+  requires s <= e && e <= blen(b)
+{
+  let i = skip_ws(b, s, e);
+  if i >= e || bget(b, i) == 35 {
+    return section;
+  }
+  if bget(b, i) == 91 {
+    let close = bytes_find_byte(b, 93, i);
+    if close >= e {
+      fail(&mut m, line, "expected `]` to close the section name");
+      return section;
+    }
+    if bytes_span_eq_str(b, i, close + 1, "[package]") {
+      return SEC_PACKAGE;
+    }
+    if bytes_span_eq_str(b, i, close + 1, "[dependencies]") {
+      return SEC_DEPS;
+    }
+    fail(&mut m, line, "unknown section (expected [package] or [dependencies])");
+    return section;
+  }
+  let ke = key_end(b, i, e);
+  let eq = skip_ws(b, ke, e);
+  if ke == i || eq >= e || bget(b, eq) != 61 {
+    fail(&mut m, line, "expected `key = value`");
+    return section;
+  }
+  let vs = skip_ws(b, eq + 1, e);
+  if vs >= e {
+    fail(&mut m, line, "expected a value");
+    return section;
+  }
+  if section == SEC_NONE {
+    fail(&mut m, line, "a key before any [section]");
+  } else if section == SEC_PACKAGE {
+    if bget(b, vs) != 34 {
+      fail(&mut m, line, "expected a string value");
+      return section;
+    }
+    let sv = read_string(b, vs, e, line, &mut m);
+    if bytes_span_eq_str(b, i, ke, "name") {
+      m.name = sv.sp;
+    } else if bytes_span_eq_str(b, i, ke, "version") {
+      m.version = sv.sp;
+    } else if bytes_span_eq_str(b, i, ke, "entry") {
+      m.entry = sv.sp;
+    } else {
+      fail(&mut m, line, "unknown key in [package] (expected name, version or entry)");
+    }
+  } else {
+    if bget(b, vs) != 123 {
+      fail(&mut m, line, "a dependency is a table: `name = { path = \"..\" }` or `{ git = \"..\", rev = \"..\" }`");
+      return section;
+    }
+    let mut d = Dep {
+      name: Span { start: i, end: ke }, path: empty_span(), git: empty_span(),
+      rev: empty_span(), version: empty_span(), line: line
+    };
+    read_dep_table(b, vs, e, line, &mut d, &mut m);
+    vec_push(&mut m.deps, d);
+  }
+  return section;
+}
+
+/// Parses the manifest text `b`; look at `failed` and `err` for the result.
+fn parse_manifest(b: &Bytes) -> Manifest {
+  let mut m = manifest_new();
+  let lines = bytes_split(b, 10);
+  let mut section = SEC_NONE;
+  let mut k = 0;
+  while k < vec_len(lines) && !failed(m)
+    invariant k <= vlen(lines) && forall i: u64 :: i < vlen(lines) ==> span_in(vget(lines, i), b)
+  {
+    let sp = vec_get(lines, k);
+    section = parse_line(b, sp.start, sp.end, k + 1, section, &mut m);
+    k = k + 1;
+  }
+  vec_free(lines);
+  return m;
+}
+
+// ---------------------------------------------------------------------------
+// Versions: `MAJOR.MINOR.PATCH`, with minor and patch optional.
+// A package satisfies a requirement when it has the same major version
+// (the same minor one while the major version is 0) and is not older.
+// ---------------------------------------------------------------------------
+
+struct Ver { ok: bool, major: u64, minor: u64, patch: u64 }
+
+/// The numbers of `b[s..e]`.
+fn parse_ver(b: &Bytes, s: u64, e: u64) -> Ver
+  requires s <= e && e <= blen(b)
+{
+  let a = bytes_find_byte(b, 46, s);
+  let mut hi = a;
+  if hi > e {
+    hi = e;
+  }
+  let major = parse_u64(b, s, hi);
+  let mut minor: u64 = 0;
+  let mut patch: u64 = 0;
+  let mut ok = major is Option::Some;
+  if ok && hi < e {
+    let c0 = hi + 1;
+    let c = bytes_find_byte(b, 46, c0);
+    let mut mid = c;
+    if mid > e {
+      mid = e;
+    }
+    match parse_u64(b, c0, mid) {
+      Option::Some(v) => { minor = v; },
+      Option::None => { ok = false; },
+    }
+    if ok && mid < e {
+      match parse_u64(b, mid + 1, e) {
+        Option::Some(v) => { patch = v; },
+        Option::None => { ok = false; },
+      }
+    }
+  }
+  return Ver { ok: ok, major: opt_or[u64](major, 0), minor: minor, patch: patch };
+}
+
+fn ver_satisfies(have: Ver, need: Ver) -> bool {
+  if have.major != need.major {
+    return false;
+  }
+  if have.major == 0 && have.minor != need.minor {
+    return false;
+  }
+  if have.minor != need.minor {
+    return have.minor > need.minor;
+  }
+  return have.patch >= need.patch;
+}
+
+// ---------------------------------------------------------------------------
+// Paths as text.
+// ---------------------------------------------------------------------------
+
+/// `a/b`, or `b` when it is absolute or `a` is empty.
+fn path_join(a: &Bytes, b: &Bytes) -> Bytes {
+  let mut t = text_new();
+  if blen(a) == 0 || (blen(b) > 0 && bget(b, 0) == 47) {
+    text_push_bytes(&mut t, b);
+  } else {
+    text_push_bytes(&mut t, a);
+    if bget(a, blen(a) - 1) != 47 {
+      text_push(&mut t, 47);
+    }
+    text_push_bytes(&mut t, b);
+  }
+  return text_finish(t);
+}
+
+/// `p` without empty and `.` parts, with `x/..` taken out where `x` is not
+/// itself `..` (a leading `/..` is `/`). The empty result is `.`.
+fn path_norm(p: &Bytes) -> Bytes {
+  let n = blen(p);
+  let abs = n > 0 && bget(p, 0) == 47;
+  let parts = bytes_split(p, 47);
+  // The kept parts, as pairs of positions.
+  let mut kept = vec_new[Span]();
+  let mut k = 0;
+  while k < vec_len(parts)
+    invariant k <= vlen(parts) && forall i: u64 :: i < vlen(parts) ==> span_in(vget(parts, i), p)
+    invariant forall i: u64 :: i < vlen(kept) ==> span_in(vget(kept, i), p)
+  {
+    let sp = vec_get(parts, k);
+    let len = sp.end - sp.start;
+    let dot = bytes_span_eq_str(p, sp.start, sp.end, ".");
+    let dotdot = bytes_span_eq_str(p, sp.start, sp.end, "..");
+    if len == 0 || dot {
+      // dropped
+    } else if dotdot {
+      let mut pop = false;
+      if vec_len(kept) > 0 {
+        let last = vec_get(kept, vec_len(kept) - 1);
+        pop = !bytes_span_eq_str(p, last.start, last.end, "..");
+      }
+      if pop {
+        vec_pop(&mut kept);
+      } else if !abs {
+        vec_push(&mut kept, sp);
+      }
+    } else {
+      vec_push(&mut kept, sp);
+    }
+    k = k + 1;
+  }
+  let mut t = text_new();
+  if abs {
+    text_push(&mut t, 47);
+  }
+  let mut j = 0;
+  while j < vec_len(kept)
+    invariant j <= vlen(kept) && forall i: u64 :: i < vlen(kept) ==> span_in(vget(kept, i), p)
+  {
+    let sp = vec_get(kept, j);
+    if j > 0 {
+      text_push(&mut t, 47);
+    }
+    text_push_span(&mut t, p, sp.start, sp.end);
+    j = j + 1;
+  }
+  if vec_len(t) == 0 {
+    text_push(&mut t, 46);
+  }
+  vec_free(kept);
+  vec_free(parts);
+  return text_finish(t);
+}
+
+// ---------------------------------------------------------------------------
+// Running programs.
+// ---------------------------------------------------------------------------
+
+fn drop_args(v: Vec[Bytes]) {
+  let mut w = v;
+  while vec_len(w) > 0 {
+    bfree(vec_pop(&mut w));
+  }
+  vec_free(w);
+}
+
+fn arg_str(v: &mut Vec[Bytes], s: Str) {
+  vec_push(&mut v, bfrom(s));
+}
+
+fn arg_bytes(v: &mut Vec[Bytes], b: &Bytes) {
+  vec_push(&mut v, bytes_slice(b, 0, blen(b)));
+}
+
+/// Runs `argv`, replaces `first` with its first line of output (empty when
+/// there is none) and returns the exit status.
+fn run_first(host: &Host, argv: Vec[Bytes], first: &mut Bytes) -> u64
+  ensures result <= 255
+{
+  let mut c = host_spawn(host, argv);
+  drop_args(argv);
+  let mut line = balloc(0);
+  let mut have = false;
+  let mut guard = 0;
+  while child_read_line(&mut c, &mut line)
+    invariant guard <= 1000000
+  {
+    if !have {
+      bfree(first);
+      first = bytes_slice(line, 0, blen(line));
+      have = true;
+    }
+    if guard < 1000000 {
+      guard = guard + 1;
+    }
+  }
+  bfree(line);
+  return child_wait(c);
+}
+
+fn run_quiet(host: &Host, argv: Vec[Bytes]) -> u64
+  ensures result <= 255
+{
+  let mut sink = balloc(0);
+  let st = run_first(host, argv, &mut sink);
+  bfree(sink);
+  return st;
+}
+
+// ---------------------------------------------------------------------------
+// Messages.
+// ---------------------------------------------------------------------------
+
+fn say(host: &Host, parts: &Vec[u8]) {
+  let b = text_to_bytes(parts);
+  host_eprint(host, b);
+  bfree(b);
+}
+
+fn error_text(host: &Host, msg: &Vec[u8]) {
+  let mut t = text_new();
+  text_push_str(&mut t, "bastio: error: ");
+  text_push_bytes_v(&mut t, msg);
+  text_push(&mut t, 10);
+  say(host, t);
+  vec_free(t);
+}
+
+fn text_push_bytes_v(t: &mut Vec[u8], src: &Vec[u8]) {
+  let mut i = 0;
+  while i < vec_len(src) {
+    text_push(&mut t, vec_get(src, i));
+    i = i + 1;
+  }
+}
+
+fn error_str(host: &Host, msg: Str) {
+  let mut t = text_new();
+  text_push_str(&mut t, msg);
+  error_text(host, t);
+  vec_free(t);
+}
+
+// ---------------------------------------------------------------------------
+// The packages of a project.
+// ---------------------------------------------------------------------------
+
+/// The state of a resolution.
+///   reg:      one line `NAME=DIR` per package found
+///   lock:     the old bastio.lock (a copy of the file, or empty)
+///   newlock:  the lock being written
+///   home:     where git checkouts live
+///   fresh:    ignore the old lock (`bastio update`)
+struct Ws { reg: Vec[u8], lock: Bytes, newlock: Vec[u8], home: Bytes, fresh: bool }
+
+fn ws_free(w: Ws) {
+  vec_free(w.reg);
+  bfree(w.lock);
+  vec_free(w.newlock);
+  bfree(w.home);
+}
+
+/// The directory registered for `name`, if any.
+fn reg_find(w: &Ws, name: &Bytes) -> Option[Bytes] {
+  let rb = text_to_bytes(w.reg);
+  let lines = bytes_split(rb, 10);
+  let mut out = Option[Bytes]::None;
+  let mut k = 0;
+  while k < vec_len(lines)
+    invariant k <= vlen(lines) && forall i: u64 :: i < vlen(lines) ==> span_in(vget(lines, i), rb)
+  {
+    let sp = vec_get(lines, k);
+    let n = blen(name);
+    if sp.end - sp.start > n && bget(rb, sp.start + n) == 61 && bytes_span_eq(rb, sp.start, name, 0, n) {
+      match out {
+        Option::Some(prev) => { bfree(prev); },
+        Option::None => {},
+      }
+      out = Option[Bytes]::Some(bytes_slice(rb, sp.start + n + 1, sp.end));
+    }
+    k = k + 1;
+  }
+  vec_free(lines);
+  bfree(rb);
+  return out;
+}
+
+/// The commit pinned for the line `git NAME URL REV ` (the prefix), if the
+/// old lock has one.
+fn lock_find(w: &Ws, prefix: &Bytes) -> Option[Bytes] {
+  let mut out = Option[Bytes]::None;
+  if w.fresh {
+    return out;
+  }
+  let lines = bytes_split(w.lock, 10);
+  let mut k = 0;
+  let n = blen(prefix);
+  while k < vec_len(lines)
+    invariant k <= vlen(lines) && forall i: u64 :: i < vlen(lines) ==> span_in(vget(lines, i), w.lock)
+  {
+    let sp = vec_get(lines, k);
+    if sp.end - sp.start > n && bytes_span_eq(w.lock, sp.start, prefix, 0, n) {
+      match out {
+        Option::Some(prev) => { bfree(prev); },
+        Option::None => {},
+      }
+      out = Option[Bytes]::Some(bytes_slice(w.lock, sp.start + n, sp.end));
+    }
+    k = k + 1;
+  }
+  vec_free(lines);
+  return out;
+}
+
+fn hex16(x: u64) -> Bytes {
+  let mut t = text_new();
+  fmt_hex_u64(&mut t, x, 16);
+  return text_finish(t);
+}
+
+fn has_space_or_newline(b: &Bytes) -> bool {
+  let mut i = 0;
+  while i < blen(b)
+    invariant i <= blen(b)
+  {
+    let c = bget(b, i);
+    if c == 32 || c == 10 || c == 9 {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+/// Makes `name`'s git checkout current: the commit `target` (a tag, a
+/// commit or, from the lock, a full commit id) of `url`, in the cache.
+/// Returns the directory and sets `commit`; an empty directory means failure.
+fn git_checkout(host: &Host, w: &Ws, name: &Bytes, url: &Bytes, target: &Bytes, commit: &mut Bytes) -> Bytes {
+  let mut sub = text_new();
+  text_push_str(&mut sub, "git/");
+  text_push_bytes(&mut sub, name);
+  text_push(&mut sub, 45);
+  let h = hex16(bytes_hash(url));
+  text_push_bytes(&mut sub, h);
+  bfree(h);
+  let subb = text_finish(sub);
+  let dir = path_join(w.home, subb);
+  bfree(subb);
+
+  // Cloned already when `.git/HEAD` can be read.
+  let headrel = bfrom(".git/HEAD");
+  let head = path_join(dir, headrel);
+  bfree(headrel);
+  let mut probe = balloc(0);
+  let cloned = host_read(host, head, &mut probe);
+  bfree(probe);
+  bfree(head);
+  if !cloned {
+    let mut cl = vec_new[Bytes]();
+    arg_str(&mut cl, "git");
+    arg_str(&mut cl, "clone");
+    arg_str(&mut cl, "-q");
+    arg_str(&mut cl, "--");
+    arg_bytes(&mut cl, url);
+    arg_bytes(&mut cl, dir);
+    if run_quiet(host, cl) != 0 {
+      bfree(dir);
+      return balloc(0);
+    }
+  }
+  if cloned && w.fresh {
+    // `bastio update` wants what the address has now, tags moved included.
+    let mut fe0 = vec_new[Bytes]();
+    arg_str(&mut fe0, "git");
+    arg_str(&mut fe0, "-C");
+    arg_bytes(&mut fe0, dir);
+    arg_str(&mut fe0, "fetch");
+    arg_str(&mut fe0, "-q");
+    arg_str(&mut fe0, "--tags");
+    arg_str(&mut fe0, "--force");
+    arg_str(&mut fe0, "origin");
+    run_quiet(host, fe0);
+  }
+  let mut co = vec_new[Bytes]();
+  arg_str(&mut co, "git");
+  arg_str(&mut co, "-C");
+  arg_bytes(&mut co, dir);
+  arg_str(&mut co, "checkout");
+  arg_str(&mut co, "-q");
+  arg_str(&mut co, "--detach");
+  arg_bytes(&mut co, target);
+  arg_str(&mut co, "--");
+  if run_quiet(host, co) != 0 {
+    // Not here yet: fetch, then try again.
+    let mut fe = vec_new[Bytes]();
+    arg_str(&mut fe, "git");
+    arg_str(&mut fe, "-C");
+    arg_bytes(&mut fe, dir);
+    arg_str(&mut fe, "fetch");
+    arg_str(&mut fe, "-q");
+    arg_str(&mut fe, "--tags");
+    arg_str(&mut fe, "--force");
+    arg_str(&mut fe, "origin");
+    run_quiet(host, fe);
+    let mut co2 = vec_new[Bytes]();
+    arg_str(&mut co2, "git");
+    arg_str(&mut co2, "-C");
+    arg_bytes(&mut co2, dir);
+    arg_str(&mut co2, "checkout");
+    arg_str(&mut co2, "-q");
+    arg_str(&mut co2, "--detach");
+    arg_bytes(&mut co2, target);
+    arg_str(&mut co2, "--");
+    if run_quiet(host, co2) != 0 {
+      bfree(dir);
+      return balloc(0);
+    }
+  }
+  let mut rp = vec_new[Bytes]();
+  arg_str(&mut rp, "git");
+  arg_str(&mut rp, "-C");
+  arg_bytes(&mut rp, dir);
+  arg_str(&mut rp, "rev-parse");
+  arg_str(&mut rp, "HEAD");
+  let st = run_first(host, rp, &mut commit);
+  if st != 0 || blen(commit) == 0 {
+    bfree(dir);
+    return balloc(0);
+  }
+  return dir;
+}
+
+/// The bytes of `sp`, or none when it is not inside `b`.
+fn span_bytes(b: &Bytes, sp: Span) -> Bytes {
+  if sp.start <= sp.end && sp.end <= blen(b) {
+    return bytes_slice(b, sp.start, sp.end);
+  }
+  return balloc(0);
+}
+
+fn span_ok(b: &Bytes, sp: Span) -> bool
+  ensures result ==> sp.start <= sp.end && sp.end <= blen(b)
+{
+  return sp.start <= sp.end && sp.end <= blen(b);
+}
+
+fn msg_dep(host: &Host, file: &Bytes, line: u64, what: Str) {
+  let mut t = text_new();
+  text_push_bytes(&mut t, file);
+  text_push(&mut t, 58);
+  fmt_u64(&mut t, line);
+  text_push_str(&mut t, ": ");
+  text_push_str(&mut t, what);
+  error_text(host, t);
+  vec_free(t);
+}
+
+
+/// Checks the package's own manifest against what its dependent expects.
+fn check_manifest(host: &Host, file: &Bytes, text: &Bytes, m: &Manifest, expect: &Bytes, need: Ver) -> bool {
+  if !span_ok(text, m.name) || m.name.start == m.name.end {
+    msg_dep(host, file, 1, "[package] needs a name");
+    return false;
+  }
+  if blen(expect) > 0 {
+    let name = span_bytes(text, m.name);
+    let same = bytes_eq(name, expect);
+    bfree(name);
+    if !same {
+      msg_dep(host, file, 1, "the package is not named what its dependent calls it");
+      return false;
+    }
+  }
+  if need.ok {
+    if !span_ok(text, m.version) || m.version.start == m.version.end {
+      msg_dep(host, file, 1, "the package has no version but one is required");
+      return false;
+    }
+    let have = parse_ver(text, m.version.start, m.version.end);
+    if !have.ok || !ver_satisfies(have, need) {
+      msg_dep(host, file, 1, "the package's version does not satisfy the requirement");
+      return false;
+    }
+  }
+  return true;
+}
+
+/// Records `name` at `dir`: 0 when it is new, 1 when it was there already,
+/// 2 (after printing why) when another directory has the name.
+fn register_pkg(host: &Host, w: &mut Ws, name: &Bytes, dir: &Bytes) -> u64
+  ensures result <= 2
+{
+  match reg_find(w, name) {
+    Option::Some(prev) => {
+      let same = bytes_eq(prev, dir);
+      if !same {
+        let mut t = text_new();
+        text_push_str(&mut t, "two different packages are called ");
+        text_push_bytes(&mut t, name);
+        text_push_str(&mut t, ": ");
+        text_push_bytes(&mut t, prev);
+        text_push_str(&mut t, " and ");
+        text_push_bytes(&mut t, dir);
+        error_text(host, t);
+        vec_free(t);
+      }
+      bfree(prev);
+      if same {
+        return 1;
+      }
+      return 2;
+    },
+    Option::None => {
+      text_push_bytes(&mut w.reg, name);
+      text_push(&mut w.reg, 61);
+      text_push_bytes(&mut w.reg, dir);
+      text_push(&mut w.reg, 10);
+      return 0;
+    },
+  }
+}
+
+/// Resolves the package in `dir` and, first, everything it needs. `expect`
+/// is the name its dependent calls it (empty for the root) and `need` the
+/// version it asks for (`ok == false` for none). Returns false after
+/// printing why not.
+fn resolve_pkg(host: &Host, w: &mut Ws, dir: &Bytes, expect: &Bytes, need: Ver, depth: u64) -> bool
+  requires depth <= 32
+{
+  let mpath = bfrom("bastio.toml");
+  let file = path_join(dir, mpath);
+  bfree(mpath);
+  let mut text = balloc(0);
+  if !host_read(host, file, &mut text) {
+    let mut t = text_new();
+    text_push_str(&mut t, "cannot read ");
+    text_push_bytes(&mut t, file);
+    error_text(host, t);
+    vec_free(t);
+    bfree(text);
+    bfree(file);
+    return false;
+  }
+  let m = parse_manifest(text);
+  if failed(m) {
+    let mut t = text_new();
+    text_push_bytes(&mut t, file);
+    text_push(&mut t, 58);
+    fmt_u64(&mut t, m.eline);
+    text_push_str(&mut t, ": ");
+    text_push_bytes_v(&mut t, m.err);
+    error_text(host, t);
+    vec_free(t);
+    manifest_free(m);
+    bfree(text);
+    bfree(file);
+    return false;
+  }
+  let mut ok = check_manifest(host, file, text, m, expect, need);
+  let name = span_bytes(text, m.name);
+  if ok {
+    let r = register_pkg(host, &mut w, name, dir);
+    if r == 1 {
+      // Already resolved: a shared dependency, or a cycle.
+      bfree(name);
+      manifest_free(m);
+      bfree(text);
+      bfree(file);
+      return true;
+    }
+    if r == 2 {
+      ok = false;
+    }
+  }
+  bfree(name);
+  if ok && depth >= 32 {
+    msg_dep(host, file, 1, "dependencies are nested too deeply");
+    ok = false;
+  }
+  let mut k = 0;
+  while ok && depth < 32 && k < vec_len(m.deps)
+    invariant k <= vlen(m.deps)
+  {
+    let d = vec_get(m.deps, k);
+    k = k + 1;
+    ok = resolve_dep(host, &mut w, text, file, dir, d, depth);
+  }
+  manifest_free(m);
+  bfree(text);
+  bfree(file);
+  return ok;
+}
+
+/// One dependency `d` of the package in `dir`.
+fn resolve_dep(host: &Host, w: &mut Ws, text: &Bytes, file: &Bytes, dir: &Bytes, d: Dep, depth: u64) -> bool
+  requires depth < 32
+{
+  if !span_ok(text, d.name) || !span_ok(text, d.path) || !span_ok(text, d.git)
+    || !span_ok(text, d.rev) || !span_ok(text, d.version) {
+    return false;
+  }
+  let has_path = d.path.start < d.path.end;
+  let has_git = d.git.start < d.git.end;
+  if has_path == has_git {
+    msg_dep(host, file, d.line, "a dependency has exactly one of `path` and `git`");
+    return false;
+  }
+  let mut need = Ver { ok: false, major: 0, minor: 0, patch: 0 };
+  if d.version.start < d.version.end {
+    need = parse_ver(text, d.version.start, d.version.end);
+    if !need.ok {
+      msg_dep(host, file, d.line, "the version must be numbers separated by dots");
+      return false;
+    }
+  }
+  let name = span_bytes(text, d.name);
+  let mut ok = true;
+  if has_path {
+    let rel = span_bytes(text, d.path);
+    let joined = path_join(dir, rel);
+    let sub = path_norm(joined);
+    ok = resolve_pkg(host, &mut w, sub, name, need, depth + 1);
+    bfree(sub);
+    bfree(joined);
+    bfree(rel);
+  } else {
+    if d.rev.start >= d.rev.end {
+      msg_dep(host, file, d.line, "a git dependency needs `rev` (a tag or a commit)");
+      ok = false;
+    } else {
+      let url = span_bytes(text, d.git);
+      let rev = span_bytes(text, d.rev);
+      if has_space_or_newline(url) || has_space_or_newline(rev) {
+        msg_dep(host, file, d.line, "a git address and a rev cannot contain spaces");
+        ok = false;
+      } else {
+        // The lock line starts `git NAME URL REV `; the commit follows.
+        let mut pre = text_new();
+        text_push_str(&mut pre, "git ");
+        text_push_bytes(&mut pre, name);
+        text_push(&mut pre, 32);
+        text_push_bytes(&mut pre, url);
+        text_push(&mut pre, 32);
+        text_push_bytes(&mut pre, rev);
+        text_push(&mut pre, 32);
+        let preb = text_to_bytes(pre);
+        let mut target = bytes_slice(rev, 0, blen(rev));
+        match lock_find(w, preb) {
+          Option::Some(c) => {
+            bfree(target);
+            target = c;
+          },
+          Option::None => {},
+        }
+        let mut commit = balloc(0);
+        let gdir = git_checkout(host, w, name, url, target, &mut commit);
+        if blen(gdir) == 0 {
+          msg_dep(host, file, d.line, "cannot fetch the git dependency (is the address right, and the rev a tag or commit of it?)");
+          ok = false;
+        } else {
+          text_push_bytes(&mut w.newlock, preb);
+          text_push_bytes(&mut w.newlock, commit);
+          text_push(&mut w.newlock, 10);
+          ok = resolve_pkg(host, &mut w, gdir, name, need, depth + 1);
+        }
+        bfree(gdir);
+        bfree(commit);
+        bfree(target);
+        bfree(preb);
+        vec_free(pre);
+      }
+      bfree(rev);
+      bfree(url);
+    }
+  }
+  bfree(name);
+  return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Commands.
+// ---------------------------------------------------------------------------
+
+fn usage(con: &Serial) {
+  print_str(con, "usage: bastio build [DIR] [-o OUT] [-- bastioc1 options...]\n");
+  print_str(con, "       bastio check [DIR] [-- bastioc1 options...]\n");
+  print_str(con, "       bastio update [DIR]\n");
+  print_str(con, "\n");
+  print_str(con, "  build   resolve the project's packages, then build its entry file\n");
+  print_str(con, "  check   resolve and verify, without building\n");
+  print_str(con, "  update  resolve again ignoring bastio.lock, and rewrite it\n");
+}
+
+/// Where git checkouts live: `$BASTIO_HOME`, else `$HOME/.bastio`.
+fn find_home(host: &Host) -> Bytes {
+  let mut v = balloc(0);
+  if host_env(host, "BASTIO_HOME", &mut v) && blen(v) > 0 {
+    return v;
+  }
+  if host_env(host, "HOME", &mut v) && blen(v) > 0 {
+    let dot = bfrom(".bastio");
+    let h = path_join(v, dot);
+    bfree(dot);
+    bfree(v);
+    return h;
+  }
+  bfree(v);
+  return bfrom(".bastio");
+}
+
+/// The compiler: `$BASTIOC1`, the `bastioc1` beside this program, or `bastioc1`.
+fn find_compiler(host: &Host) -> Bytes {
+  let mut v = balloc(0);
+  if host_env(host, "BASTIOC1", &mut v) && blen(v) > 0 {
+    return v;
+  }
+  bfree(v);
+  let me = host_arg(host, 0);
+  let slash = bytes_rfind_byte(me, 47, blen(me));
+  match slash {
+    Option::Some(s) => {
+      if s < blen(me) {
+        let mut t = text_new();
+        text_push_span(&mut t, me, 0, s + 1);
+        text_push_str(&mut t, "bastioc1");
+        let cand = text_finish(t);
+        let mut probe = balloc(0);
+        let ok = host_read(host, cand, &mut probe);
+        bfree(probe);
+        bfree(me);
+        if ok {
+          return cand;
+        }
+        bfree(cand);
+        return bfrom("bastioc1");
+      }
+    },
+    Option::None => {},
+  }
+  bfree(me);
+  return bfrom("bastioc1");
+}
+
+/// The text of `b`'s `name=dir` lines as `--pkg name=dir/src` arguments.
+fn push_pkg_args(argv: &mut Vec[Bytes], reg: &Vec[u8]) {
+  let rb = text_to_bytes(reg);
+  let lines = bytes_split(rb, 10);
+  let mut k = 0;
+  while k < vec_len(lines)
+    invariant k <= vlen(lines) && forall i: u64 :: i < vlen(lines) ==> span_in(vget(lines, i), rb)
+  {
+    let sp = vec_get(lines, k);
+    if sp.start < sp.end {
+      arg_str(&mut argv, "--pkg");
+      let mut t = text_new();
+      text_push_span(&mut t, rb, sp.start, sp.end);
+      text_push_str(&mut t, "/src");
+      vec_push(&mut argv, text_finish(t));
+    }
+    k = k + 1;
+  }
+  vec_free(lines);
+  bfree(rb);
+}
+
+/// The value of the `[package]` entry, or `src/main.bastio`.
+fn entry_of(host: &Host, dir: &Bytes) -> Bytes {
+  let mpath = bfrom("bastio.toml");
+  let file = path_join(dir, mpath);
+  bfree(mpath);
+  let mut text = balloc(0);
+  let mut out = bfrom("src/main.bastio");
+  if host_read(host, file, &mut text) {
+    let m = parse_manifest(text);
+    if !failed(m) && span_ok(text, m.entry) && m.entry.start < m.entry.end {
+      bfree(out);
+      out = span_bytes(text, m.entry);
+    }
+    manifest_free(m);
+  }
+  bfree(text);
+  bfree(file);
+  return out;
+}
+
+/// The `[package] name` of the root.
+fn name_of(host: &Host, dir: &Bytes) -> Bytes {
+  let mpath = bfrom("bastio.toml");
+  let file = path_join(dir, mpath);
+  bfree(mpath);
+  let mut text = balloc(0);
+  let mut out = bfrom("a.out");
+  if host_read(host, file, &mut text) {
+    let m = parse_manifest(text);
+    if !failed(m) && span_ok(text, m.name) && m.name.start < m.name.end {
+      bfree(out);
+      out = span_bytes(text, m.name);
+    }
+    manifest_free(m);
+  }
+  bfree(text);
+  bfree(file);
+  return out;
+}
+
+fn main(con: &mut Serial, host: &mut Host) -> u64 {
+  let mut argc = host_argc(host);
+  if argc > 100000 {
+    argc = 100000;
+  }
+  if argc < 2 {
+    usage(con);
+    return 2;
+  }
+  let cmd = host_arg(host, 1);
+  let is_build = bytes_eq_str(cmd, "build");
+  let is_check = bytes_eq_str(cmd, "check");
+  let is_update = bytes_eq_str(cmd, "update");
+  bfree(cmd);
+  if !is_build && !is_check && !is_update {
+    usage(con);
+    return 2;
+  }
+  // The project directory, `-o`, and what follows `--`.
+  let mut dir = bfrom(".");
+  let mut outp = balloc(0);
+  let mut rest = vec_new[Bytes]();
+  let mut i = 2;
+  let mut bad = false;
+  let mut passthru = false;
+  while i < argc
+    invariant i <= argc + 1 && argc <= 100000
+  {
+    let a = host_arg(host, i);
+    if passthru {
+      vec_push(&mut rest, a);
+    } else if bytes_eq_str(a, "--") {
+      passthru = true;
+      bfree(a);
+    } else if bytes_eq_str(a, "-o") {
+      bfree(a);
+      i = i + 1;
+      bfree(outp);
+      outp = host_arg(host, i);
+      if blen(outp) == 0 {
+        bad = true;
+      }
+    } else if blen(a) > 0 && bget(a, 0) == 45 {
+      error_str(host, "unknown option (options for the compiler go after `--`)");
+      bad = true;
+      bfree(a);
+    } else {
+      bfree(dir);
+      dir = a;
+    }
+    i = i + 1;
+  }
+  if bad {
+    bfree(dir);
+    bfree(outp);
+    drop_args(rest);
+    return 2;
+  }
+  let rdir = path_norm(dir);
+  bfree(dir);
+
+  // The old lock, if any.
+  let lpath = bfrom("bastio.lock");
+  let lockfile = path_join(rdir, lpath);
+  bfree(lpath);
+  let mut oldlock = balloc(0);
+  if !host_read(host, lockfile, &mut oldlock) {
+    bfree(oldlock);
+    oldlock = balloc(0);
+  }
+  let mut w = Ws { reg: text_new(), lock: oldlock, newlock: text_new(), home: find_home(host), fresh: is_update };
+  let none = Ver { ok: false, major: 0, minor: 0, patch: 0 };
+  let nobody = balloc(0);
+  let ok = resolve_pkg(host, &mut w, rdir, nobody, none, 0);
+  bfree(nobody);
+  if !ok {
+    ws_free(w);
+    bfree(lockfile);
+    bfree(rdir);
+    bfree(outp);
+    drop_args(rest);
+    return 1;
+  }
+  // Write the lock when there is something to pin and it changed.
+  let nl = text_to_bytes(w.newlock);
+  let mut status = 0;
+  if blen(nl) > 0 && !bytes_eq(nl, w.lock) {
+    if !host_write(host, lockfile, nl) {
+      error_str(host, "cannot write bastio.lock");
+      status = 1;
+    }
+  }
+  bfree(nl);
+  if status == 0 && !is_update {
+    let entry = entry_of(host, rdir);
+    // `entry` is relative to the package directory.
+    let entryfull = path_join(rdir, entry);
+    bfree(entry);
+    let mut argv = vec_new[Bytes]();
+    vec_push(&mut argv, find_compiler(host));
+    push_pkg_args(&mut argv, w.reg);
+    if is_check {
+      arg_str(&mut argv, "--check");
+    } else {
+      arg_str(&mut argv, "-o");
+      if blen(outp) > 0 {
+        arg_bytes(&mut argv, outp);
+      } else {
+        let td = bfrom("target");
+        let tdir = path_join(rdir, td);
+        bfree(td);
+        let mut mk = vec_new[Bytes]();
+        arg_str(&mut mk, "mkdir");
+        arg_str(&mut mk, "-p");
+        arg_bytes(&mut mk, tdir);
+        run_quiet(host, mk);
+        let nm = name_of(host, rdir);
+        let o = path_join(tdir, nm);
+        bfree(nm);
+        bfree(tdir);
+        vec_push(&mut argv, o);
+      }
+    }
+    while vec_len(rest) > 0 {
+      vec_push(&mut argv, vec_pop(&mut rest));
+    }
+    vec_push(&mut argv, entryfull);
+    let mut c = host_spawn(host, argv);
+    drop_args(argv);
+    let mut line = balloc(0);
+    while child_read_line(&mut c, &mut line) {
+      print_bytes(con, line);
+      print_nl(con);
+    }
+    bfree(line);
+    status = child_wait(c);
+  }
+  ws_free(w);
+  bfree(lockfile);
+  bfree(rdir);
+  bfree(outp);
+  drop_args(rest);
+  return status;
+}

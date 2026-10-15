@@ -24,11 +24,13 @@ struct Loaded { start: u64, len: u64, done: bool, raw: u64, rawlen: u64, src: u6
 struct Loader {
   paths: Vec[u64],
   files: Vec[Loaded],
-  libs: Vec[Bytes]
+  libs: Vec[Bytes],
+  pkg_names: Vec[Bytes],
+  pkg_dirs: Vec[Bytes]
 }
 
 fn loader_new() -> Loader {
-  return Loader { paths: vec_new[u64](), files: vec_new[Loaded](), libs: vec_new[Bytes]() };
+  return Loader { paths: vec_new[u64](), files: vec_new[Loaded](), libs: vec_new[Bytes](), pkg_names: vec_new[Bytes](), pkg_dirs: vec_new[Bytes]() };
 }
 
 fn loader_free(ld: Loader) {
@@ -39,11 +41,87 @@ fn loader_free(ld: Loader) {
     bfree(vec_pop(&mut libs));
   }
   vec_free(libs);
+  let mut names = ld.pkg_names;
+  while vec_len(names) > 0 {
+    bfree(vec_pop(&mut names));
+  }
+  vec_free(names);
+  let mut dirs = ld.pkg_dirs;
+  while vec_len(dirs) > 0 {
+    bfree(vec_pop(&mut dirs));
+  }
+  vec_free(dirs);
 }
 
 /// Adds a `--lib` directory.
 fn loader_lib(ld: &mut Loader, dir: Bytes) {
   vec_push(&mut ld.libs, dir);
+}
+
+/// Adds a package (`--pkg NAME=DIR`): `import "NAME/rest"` is the file
+/// `rest` in `DIR`, before any other place is looked at.
+fn loader_pkg(ld: &mut Loader, name: Bytes, dir: Bytes) {
+  vec_push(&mut ld.pkg_names, name);
+  vec_push(&mut ld.pkg_dirs, dir);
+}
+
+/// The index of the package that `name` (`pkg/rest`) starts with, or the
+/// number of packages when none matches.
+fn pkg_find(ld: &mut Loader, name: &Bytes) -> u64 {
+  let n = blen(name);
+  let mut slash = 0;
+  while slash < n && bget(name, slash) != 47
+    invariant slash <= n && n == blen(name)
+  {
+    slash = slash + 1;
+  }
+  let none = vec_len(ld.pkg_names);
+  let mut hit = none;
+  let mut k = 0;
+  while slash < n && hit == none && k < none
+    invariant k <= none && hit <= none && none == vlen(ld.pkg_names)
+  {
+    let pn = vec_swap(&mut ld.pkg_names, k, balloc(0));
+    let mut same = blen(pn) == slash;
+    let mut i = 0;
+    while same && i < slash
+      invariant i <= slash && slash < n && n == blen(name) && (!same || blen(pn) == slash)
+    {
+      if bget(pn, i) != bget(name, i) {
+        same = false;
+      }
+      i = i + 1;
+    }
+    if same {
+      hit = k;
+    }
+    bfree(vec_swap(&mut ld.pkg_names, k, pn));
+    k = k + 1;
+  }
+  return hit;
+}
+
+/// `name` from just after its first `/`.
+fn after_slash(name: &Bytes) -> Bytes {
+  let n = blen(name);
+  let mut s = 0;
+  while s < n && bget(name, s) != 47
+    invariant s <= n && n == blen(name)
+  {
+    s = s + 1;
+  }
+  if s < n {
+    s = s + 1;
+  }
+  let mut out = balloc(n - s);
+  let mut i = 0;
+  while i < n - s
+    invariant i <= n - s && s <= n && blen(out) == n - s && n == blen(name)
+  {
+    bset(&mut out, i, bget(name, s + i));
+    i = i + 1;
+  }
+  return out;
 }
 
 /// Can `path` be read?
@@ -95,6 +173,15 @@ fn dir_above(dir: &Bytes) -> Bytes {
 /// BASTIO_LIB's after them, libenv.bastio); the first that has it wins. When none has
 /// it, the name next to the file is returned, for the error message.
 fn resolve(host: &Host, ld: &mut Loader, dir: &Bytes, name: &Bytes) -> Bytes {
+  let pk = pkg_find(&mut ld, name);
+  if pk < vec_len(ld.pkg_names) && pk < vec_len(ld.pkg_dirs) {
+    let rest = after_slash(name);
+    let pd = vec_swap(&mut ld.pkg_dirs, pk, balloc(0));
+    let out = join(pd, rest);
+    bfree(vec_swap(&mut ld.pkg_dirs, pk, pd));
+    bfree(rest);
+    return out;
+  }
   let first = join(dir, name);
   if blen(name) == 0 || bget(name, 0) == 46 || bget(name, 0) == 47 || readable(host, first) {
     return first;
