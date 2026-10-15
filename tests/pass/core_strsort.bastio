@@ -1,0 +1,86 @@
+// expect-exit: 0
+// Sorting pieces of a text in byte order: duplicates, prefixes, empty
+// pieces, one piece, none, and a few hundred words.
+import "core/strsort.bastio";
+import "core/scan.bastio";
+import "core/lines.bastio";
+import "core/num.bastio";
+
+// The words of `s`, sorted, joined with single spaces.
+fn sorted_is(s: Str, want: Str) -> bool {
+  let b = bfrom(s);
+  let ws = scan_words(b);
+  let order = spans_order(b, ws);
+  let mut t = text_new();
+  let mut i = 0;
+  while i < vec_len(order)
+    invariant i <= vlen(order) && vlen(order) == vlen(ws)
+    invariant forall k: u64 :: k < vlen(order) ==> vget(order, k) < vlen(ws)
+    invariant forall k: u64 :: k < vlen(ws) ==> span_in(vget(ws, k), b)
+  {
+    if i > 0 {
+      text_push(&mut t, 32);
+    }
+    let w = vec_get(ws, vec_get(order, i));
+    text_push_span(&mut t, b, w.start, w.end);
+    i = i + 1;
+  }
+  let out = text_finish(t);
+  let ok = bytes_eq_str(out, want);
+  bfree(out);
+  vec_free(order);
+  vec_free(ws);
+  bfree(b);
+  return ok;
+}
+
+fn main() -> u64 {
+  let mut ok = sorted_is("", "") && sorted_is("one", "one") && sorted_is("b a", "a b")
+    && sorted_is("pear apple fig apple", "apple apple fig pear")
+    && sorted_is("ab a abc b", "a ab abc b") && sorted_is("Zed alpha Beta", "Beta Zed alpha")
+    && sorted_is("c b a c b a", "a a b b c c");
+  // Empty pieces sort first: split "b,,a" at commas.
+  let line = bfrom("b,,a");
+  let parts = bytes_split(line, 44);
+  let order = spans_order(line, parts);
+  ok = ok && vec_len(order) == 3;
+  if vec_len(order) == 3 {
+    let first = vec_get(parts, vec_get(order, 0));
+    ok = ok && first.start == first.end;
+  }
+  vec_free(order);
+  vec_free(parts);
+  bfree(line);
+  // Several hundred words, generated; the result must be ordered all the way.
+  let mut t = text_new();
+  let mut x: u64 = 12345;
+  let mut i = 0;
+  while i < 400
+    invariant i <= 400 && x < 2147483648
+  {
+    x = (x * 1103515245 + 12345) % 2147483648;
+    fmt_u64(&mut t, x % 5000);
+    text_push(&mut t, 10);
+    i = i + 1;
+  }
+  let big = text_finish(t);
+  let ls = lines_split(big);
+  let ord = spans_order(big, ls);
+  ok = ok && vec_len(ord) == 400;
+  let mut k = 1;
+  while k < vec_len(ord)
+    invariant 1 <= k && vlen(ord) == vlen(ls)
+    invariant forall q: u64 :: q < vlen(ord) ==> vget(ord, q) < vlen(ls)
+    invariant forall q: u64 :: q < vlen(ls) ==> span_in(vget(ls, q), big)
+  {
+    let a = vec_get(ls, vec_get(ord, k - 1));
+    let c = vec_get(ls, vec_get(ord, k));
+    ok = ok && span_cmp(big, a, c) <= 0;
+    k = k + 1;
+  }
+  vec_free(ord);
+  vec_free(ls);
+  bfree(big);
+  if ok { return 0; }
+  return 1;
+}

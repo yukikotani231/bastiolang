@@ -32,7 +32,7 @@ Send every query also to cvc5, which shares no code with Z3, and require the sam
 
 Everything the encoding adds beyond the program is trusted twice: the axioms, and the lambda-style array updates. Shrinking it helps both A and B.
 
-- Replace the `lambda` array terms used for bulk copies (`bcopy`, `bmove`) with standard SMT-LIB (`store` chains, or a quantified equality), so that cvc5 can read them and a certificate checker does not need Z3 extensions.
+- Replace the `lambda` array terms used for bulk copies (`bcopy`, `bmove`) and the page bitmaps with standard SMT-LIB. `tests/crosscheck.py` already reads them away for cvc5, so this matters for a certificate checker, which should not need Z3 extensions, more than for the cross-check.
 - Prove each axiom (counting lemmas, `bdec`, `bhex`, bit facts) once, outside the solver, in a proof assistant, and keep it as a checked lemma file.
 - Verdict: next. It is mostly work in `stage1/verify.bastio`, which the compiler IR work owns, so it is coordinated separately.
 
@@ -45,12 +45,12 @@ Re-asking the solver only the assumptions its unsat core names, with a second co
 For every program in `tests/pass`, the script takes the exact session the compiler sends (`bastioc0 --check --dump-smt`), replays it through Z3 and through cvc5, and compares the answers query by query. The result for each query is one of:
 
 - **confirmed**: both say `unsat`.
-- **unchecked**: cvc5 gave up (its per-query time limit) or the query contains Z3-only syntax (`lambda`). The script drops the offending assertion for cvc5 and marks every query that could be affected as unchecked, so a weaker session can never turn into a false disagreement or a false confirmation.
+- **unchecked**: cvc5 gave up (its per-query time limit) or the query still contains Z3-only syntax. Z3 array terms written as `lambda` are read where they are selected (`(select (lambda ((k Int)) B) i)` becomes `B` with `i` for `k`), which is plain rewriting. If a `lambda` remains, the script drops that assertion for cvc5 and marks every query it could affect as unchecked, so a weakened session can never turn into a false disagreement or a false confirmation.
 - **disagreement**: Z3 does not say `unsat` for a program the compiler accepts, or cvc5 says `sat` where Z3 says `unsat`. Either one fails the run, and the query is named.
 
 The percentage of confirmed queries is printed on every run. It is the number to raise: lowering the unchecked share (option C first, then a longer cvc5 limit) is how this step grows into A's coverage.
 
-The script uses stage0's dump because the two compilers produce the same commands (`stage1/difftest.sh`), and it needs `z3` and `cvc5` on the path (`apt install z3 cvc5`). Run it with `tests/ci.sh`.
+The script uses stage0's dump because the two compilers produce the same commands (`stage1/difftest.sh`), and it needs `z3` and `cvc5` on the path (`apt install z3 cvc5`). Run it with `tests/ci.sh`. It also takes other programs and compiler flags: `CROSSCHECK_BASTIOC=stage0/target/release/bastioc1 tests/crosscheck.py stage1/bastioc1.bastio` (the compiler itself, which CI checks) or BastiOS's kernel (`--args "--lib ... --target kernel" src/main.bastio` with `--tlimit 1000`). Long sessions are cut at `(reset)` into pieces that run in parallel. The kernel has about 46,700 proofs: on 4 cores the check takes 20 minutes (cvc5 confirms 98.4%, none disagree), so it is run by hand before a release, not on every push.
 
 ## What is not covered
 

@@ -1696,7 +1696,9 @@ impl<'a> Ctx<'a> {
             self.calls.push(name.to_string());
         }
         if sig.params.len() != args.len() {
-            return Err(Diag::new("E-TYPE", pos, format!("`{}` takes {} argument(s), {} given", name, sig.params.len(), args.len())));
+            let types: Vec<String> = sig.params.iter().map(|t| t.name()).collect();
+            return Err(Diag::new("E-TYPE", pos, format!("`{}` takes {} argument(s), {} given", name, sig.params.len(), args.len()))
+                .note(format!("the parameter types are ({})", types.join(", "))));
         }
         // Scalars first, then borrows, then moves: a scalar argument may
         // read a value that a later argument consumes (`set(b, i, get(b, j))`).
