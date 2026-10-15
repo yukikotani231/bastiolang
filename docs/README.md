@@ -37,7 +37,8 @@ Bastio is a systems language whose memory safety is proved at compile time. The 
 | [Releasing](releasing.md) | How a version is cut |
 | [CHANGELOG.md](../CHANGELOG.md) | What changed, by version |
 | [SECURITY.md](../SECURITY.md) | How to report a soundness or security bug |
-| [Editor support](../editors/README.md) | The tree-sitter grammar and the VS Code extension |
+| [Editor support](../editors/README.md) | The tree-sitter grammar, the VS Code extension and the Vim/Neovim files |
+| [Developer tools](../tools/README.md) | The formatter `bastiofmt` and the language server `bastio-lsp`, with Neovim setup |
 
 ## The kernel written in Bastio
 

@@ -13,6 +13,18 @@ The version is the one in `stage0/Cargo.toml`. A release is a tag `vX.Y.Z` on
 
 What will be 0.2.0.
 
+### Tools
+
+- `tools/bastiofmt`: a source formatter written in Bastio (`bastiofmt file.bastio`,
+  `--write`, `--check`, `-` for standard input). It lays a file out from its
+  tokens and refuses to print anything that does not lex to the same tokens as
+  its input. See [tools/README.md](tools/README.md).
+- `tools/bastio-lsp`: a language server written in Bastio. Diagnostics from
+  `bastioc1 --check` (and the lexer while typing), go to definition and hover
+  in the file and its imports, document symbols and formatting.
+- `editors/vim`: file type, syntax, indentation and a Neovim plugin that
+  starts the language server.
+
 ### Compiler
 
 - Diagnostics say what to do about the slips a newcomer meets first: `=`

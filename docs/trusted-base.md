@@ -86,6 +86,7 @@ These are not trusted parts so much as properties nobody claims:
 
 ## 6. How it shrinks
 
+- **Z3**, by a second solver that must agree (`tests/crosscheck.py`: cvc5 replays the compiler's queries in CI) and, later, by checked proof certificates. [trusted-base-reduction.md](trusted-base-reduction.md) compares the options.
 - **The C compiler**, by the native backend (ROADMAP v3, "Native x86-64 backend"). It covers the hosted target, and in stage1 also the kernel and user targets (their preludes rewritten in assembly), though BastiOS still builds with the C backend until bastioc1 offers the native one for them.
 - **Preludes into Bastio**, as capabilities appear that can express them. This has already happened once: BastiOS's UART driver used to be C in the kernel prelude, and now only the one `in` or `out` instruction behind each port access is trusted. The `kernel` prelude's COM1 code is still there for kernels that use `Serial` and for the prelude's own messages.
 - **The Multiboot memory map** is parsed in trusted C because Bastio cannot read memory at an address it was not given as a capability (ROADMAP invariant 1). A read-only capability for boot-time firmware memory would move this, and BastiOS's ACPI parsing, into Bastio.
