@@ -232,6 +232,10 @@ fn proof_hint(rep: &mut Vec[u64], code: u64) {
     w_s(&mut rep, "  = check the shift amount first, with an `if` or a `requires`\n");
   } else if code == VC_ALLOC {
     w_s(&mut rep, "  = bound the size first, with an `if` or a `requires`\n");
+  } else if code == VC_LEAK {
+    w_s(&mut rep, "  = pop and consume every element first, or show with a `requires` or an `if` that the vector is empty before freeing it\n");
+  } else if code == VC_UNREACHABLE {
+    w_s(&mut rep, "  = an `unreachable` must follow from what is known there: look at the conditions of the enclosing `if`s and the `requires`\n");
   } else if code == VC_ASSERT {
     w_s(&mut rep, "  = an `assert` must follow from what is known there: the `requires`, the conditions of the enclosing `if`s and loops, and loop invariants\n");
   }
@@ -900,6 +904,92 @@ fn hash_text(x: Hash2, t: &Vec[u64]) -> Hash2 {
   return Hash2 { a: a, b: b };
 }
 
+/// One step of the hash: `x` mixed into both lanes, as `hash_text` does
+/// for each character.
+fn hmix(h: Hash2, x: u64) -> Hash2 {
+  let a = wrap_mul(h.a ^ x, 1099511628211);
+  let m = wrap_mul(h.b ^ x, 11400714819323198485);
+  return Hash2 { a: a, b: m ^ (m >> 29) };
+}
+
+/// The hash of term `t`, computed from its structure and not from its
+/// text: the same term writes the same text, and a term shared by many
+/// others is hashed once (the hash is kept in the term). The terms are the verifier's, so what
+/// `out_tm` would write is what is hashed, without writing it.
+fn tm_hash(v: &mut Vr, t: u64) -> Hash2 {
+  let x = tm_at(v, t);
+  if x.ha != 0 || x.hb != 0 {
+    return Hash2 { a: x.ha, b: x.hb };
+  }
+  let mut h = hmix(hash_new(), x.kind);
+  if x.kind == VT_ATOM {
+    h = hmix(h, x.b);
+    let mut k = 0;
+    while k < x.b {
+      h = hmix(h, pool_at(v, vadd(x.a, k)));
+      k = k + 1;
+    }
+  } else if x.kind == VT_NUM {
+    h = hmix(h, x.a);
+  } else if x.kind == VT_APP {
+    h = hmix(h, x.a);
+    h = hmix(h, x.c);
+    let mut k = 0;
+    while k < x.c {
+      let c = tm_hash(&mut v, targ(v, t, k));
+      h = hmix(hmix(h, c.a), c.b);
+      k = k + 1;
+    }
+  } else if x.kind == VT_FORALL || x.kind == VT_LAMBDA {
+    let c = tm_hash(&mut v, x.a);
+    let d = tm_hash(&mut v, x.b);
+    h = hmix(hmix(hmix(hmix(h, c.a), c.b), d.a), d.b);
+  } else if x.kind == VT_FORALLP {
+    let c = tm_hash(&mut v, x.a);
+    let d = tm_hash(&mut v, x.b);
+    let e = tm_hash(&mut v, u_at(v.targs, x.c));
+    let f = tm_hash(&mut v, u_at(v.targs, vadd(x.c, 1)));
+    h = hmix(hmix(hmix(hmix(h, c.a), c.b), d.a), d.b);
+    h = hmix(hmix(hmix(hmix(h, e.a), e.b), f.a), f.b);
+  } else if x.kind == VT_FORALLP1 {
+    let c = tm_hash(&mut v, x.a);
+    let d = tm_hash(&mut v, x.b);
+    let e = tm_hash(&mut v, x.c);
+    h = hmix(hmix(hmix(hmix(h, c.a), c.b), d.a), d.b);
+    h = hmix(hmix(h, e.a), e.b);
+  }
+  // Never both 0, which marks a term not yet hashed.
+  h.a = h.a | 1;
+  if t < vec_len(v.tms) {
+    let mut y = x;
+    y.ha = h.a;
+    y.hb = h.b;
+    vec_set(&mut v.tms, t, y);
+  }
+  return h;
+}
+
+/// `x` followed by the commands log[s..e), hashed by structure (see
+/// `tm_hash`): two functions get the same hash only if `out_range` would
+/// write the same text for them.
+fn hash_range(x: Hash2, v: &mut Vr, s: u64, e: u64) -> Hash2 {
+  let mut h = x;
+  let mut k = s;
+  while k < e && k < vec_len(v.log) {
+    let cmd = vec_get(v.log, k);
+    h = hmix(h, cmd.kind);
+    if cmd.kind == CMD_DECL {
+      let c = tm_hash(&mut v, cmd.a);
+      h = hmix(hmix(hmix(h, c.a), c.b), cmd.b);
+    } else if cmd.kind == CMD_ASSERT || cmd.kind == CMD_RAW {
+      let c = tm_hash(&mut v, cmd.a);
+      h = hmix(hmix(h, c.a), c.b);
+    }
+    k = k + 1;
+  }
+  return h;
+}
+
 /// The text in `v` as bytes (characters above 255 are left out).
 fn text_bytes(v: &Vec[u64]) -> Bytes {
   let mut b = balloc(vec_len(v));
@@ -916,7 +1006,7 @@ fn text_bytes(v: &Vec[u64]) -> Bytes {
 
 /// The directory of the proof cache (`BASTIO_PROOF_CACHE`); empty if the
 /// cache is off. A function whose verification conditions have been
-/// proved before, to the byte and by the same solver, is not sent to the
+/// proved before, with the same conditions and by the same solver, is not sent to the
 /// solver again. The cache is trusted like the solver: a file in it says
 /// "these conditions are unsat", so only a directory the user controls
 /// should be named.
@@ -975,7 +1065,7 @@ fn cache_record(h: &Host, paths: &mut Vec[Bytes], upto: u64) {
 /// cache's format, the solver, the header and the preamble log[0..pre).
 fn cache_base(v: &Vr, h: &Host, pre: u64) -> Hash2 {
   let mut t = vec_new[u64]();
-  w_s(&mut t, "bastio-proof-cache-1\n");
+  w_s(&mut t, "bastio-proof-cache-2\n");
   solver_name(h, &mut t);
   w_s(&mut t, "\n");
   // The solver's version: another Z3 may answer differently.
@@ -1037,11 +1127,8 @@ fn solve_par(v: &mut Vr, m: &Mono, p: &Parser, h: &Host, rep: &mut Vec[u64], job
     let mut hit = false;
     let mut path = balloc(0);
     if blen(cdir) > 0 && !u.fail {
-      let mut t = vec_new[u64]();
-      out_range(&mut t, v, u.s, u.e);
       bfree(path);
-      path = cache_path(cdir, hash_text(base, t));
-      vec_free(t);
+      path = cache_path(cdir, hash_range(base, &mut v, u.s, u.e));
       hit = cache_hit(h, path);
     }
     if hit {
