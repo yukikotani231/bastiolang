@@ -14,7 +14,7 @@ MDBOOK=${MDBOOK:-mdbook}
 
 rm -rf build
 mkdir -p build/src
-cp SUMMARY.md bastios.md c-libraries.md build/src/
+cp SUMMARY.md bastios.md bastios-performance.md c-libraries.md build/src/
 python3 stage.py .. build/src
 "$MDBOOK" build
 python3 linkcheck.py build/html
