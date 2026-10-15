@@ -1,0 +1,485 @@
+// The formatter behind `bastiofmt`: it lays out a Bastio source file from
+// its tokens, without a syntax tree.
+//
+// What it decides:
+//   - indentation, two spaces per level, from the nesting of `{`, `(` and
+//     `[`; a line that continues a statement is indented two more, and the
+//     lines of a `requires`, `ensures` or `invariant` clause four;
+//   - the space between two tokens on a line (`a + b`, `f(x)`, `&mut x`,
+//     `Vec[u8]`, `S { a: 1 }`, no space before `,` or `;`);
+//   - blank lines: at most one in a row, none after `{` or before `}`;
+//   - no trailing white space, and exactly one newline at the end.
+//
+// What it leaves alone: where the lines break (it never joins or splits
+// lines, so it does not wrap), the text of comments, strings and numbers,
+// and the number of spaces in front of a comment that follows code on its
+// line (so a column of aligned comments stays aligned).
+//
+// The lexer drops comments, so they are recovered from the text between
+// two tokens. `fmt_same_tokens` checks that the output lexes to exactly the
+// tokens of the input; the driver refuses to print anything else.
+import "../../stage1/parser.bastio";
+
+const FMT_INDENT_MAX: u64 = 4096;
+
+fn is_opener(t: Tok) -> bool {
+  return is_p(t, P_LPAREN) || is_p(t, P_LBRACKET) || is_p(t, P_LBRACE);
+}
+
+fn is_closer(t: Tok) -> bool {
+  return is_p(t, P_RPAREN) || is_p(t, P_RBRACKET) || is_p(t, P_RBRACE);
+}
+
+fn is_clause(t: Tok) -> bool {
+  return is_kw(t, KW_REQUIRES) || is_kw(t, KW_ENSURES) || is_kw(t, KW_INVARIANT);
+}
+
+/// Can `t` be followed by a binary operator, that is, does it end an operand?
+fn operand_end(t: Tok) -> bool {
+  if t.kind == K_IDENT || t.kind == K_INT || t.kind == K_STR {
+    return true;
+  }
+  if t.kind == K_KEYWORD {
+    return t.val == KW_TRUE || t.val == KW_FALSE;
+  }
+  return is_p(t, P_RPAREN) || is_p(t, P_RBRACKET);
+}
+
+/// Is `t` the kind of token that is prefix or binary by context?
+fn prefixable(t: Tok) -> bool {
+  return is_p(t, P_MINUS) || is_p(t, P_AMP) || is_p(t, P_STAR) || is_p(t, P_BANG);
+}
+
+/// Does a new statement (or item, or match arm) start after `t`?
+fn ends_stmt(t: Tok) -> bool {
+  return is_p(t, P_SEMI) || is_p(t, P_LBRACE) || is_p(t, P_RBRACE) || is_p(t, P_COMMA);
+}
+
+/// `a`, or `b` if `a` is above it.
+fn clamp(a: u64, b: u64) -> u64
+  ensures result <= b && (a <= b ==> result == a)
+{
+  if a > b {
+    return b;
+  }
+  return a;
+}
+
+fn sadd(a: u64, b: u64) -> u64 {
+  if a > FMT_INDENT_MAX {
+    return FMT_INDENT_MAX;
+  }
+  if b > FMT_INDENT_MAX {
+    return FMT_INDENT_MAX;
+  }
+  return a + b;
+}
+
+fn ssub(a: u64, b: u64) -> u64 {
+  if a < b {
+    return 0;
+  }
+  return a - b;
+}
+
+/// Is there a space between `a` and `b` when they are on the same line?
+/// `a_unary`: `a` is a prefix operator. `a_sep`: `a` is a `::` that
+/// separates the variable from the body of a `forall`. `gap_ws`: the source
+/// has white space between the two.
+fn want_space(a: Tok, b: Tok, a_unary: bool, a_sep: bool, gap_ws: bool) -> bool {
+  if a.kind == K_PUNCT {
+    if a.val == P_LPAREN || a.val == P_LBRACKET || a.val == P_DOT {
+      return false;
+    }
+    if a.val == P_COLONCOLON {
+      return a_sep;
+    }
+    if a_unary {
+      return false;
+    }
+    if a.val == P_LBRACE {
+      return !is_p(b, P_RBRACE);
+    }
+  }
+  if b.kind == K_PUNCT {
+    if b.val == P_RPAREN || b.val == P_RBRACKET || b.val == P_COMMA || b.val == P_SEMI {
+      return false;
+    }
+    if b.val == P_DOT || b.val == P_COLON {
+      return false;
+    }
+    if b.val == P_COLONCOLON {
+      return gap_ws;
+    }
+    if b.val == P_LBRACKET || b.val == P_LPAREN {
+      return !(a.kind == K_IDENT || is_p(a, P_RBRACKET) || is_p(a, P_RPAREN));
+    }
+  }
+  return true;
+}
+
+/// Pushes `n` newlines and then `ind` spaces.
+fn put_line(out: &mut Vec[u64], n: u64, ind: u64) {
+  let mut k = 0;
+  while k < n && k < 2 {
+    vec_push(&mut out, 10);
+    k = k + 1;
+  }
+  let mut s = 0;
+  while s < ind && s < FMT_INDENT_MAX {
+    vec_push(&mut out, 32);
+    s = s + 1;
+  }
+}
+
+fn put_span(out: &mut Vec[u64], src: &Bytes, s: u64, e: u64) {
+  let mut k = s;
+  while k < e && k < blen(src) {
+    vec_push(&mut out, cast[u64](bget(src, k)));
+    k = k + 1;
+  }
+}
+
+fn put_tok(out: &mut Vec[u64], src: &Bytes, t: Tok) {
+  if t.kind == K_STR {
+    vec_push(&mut out, 34);
+    put_span(&mut out, src, t.start, t.end);
+    vec_push(&mut out, 34);
+  } else {
+    put_span(&mut out, src, t.start, t.end);
+  }
+}
+
+/// The indentation of a line that starts with `t`, when it comes after `prev`
+/// (`have_prev`: there is one). `top_kind` is 0 with no bracket open, 1 for
+/// `{` and 2 for `(` or `[`; `base` and `inner` are the indentation of the
+/// innermost open bracket's closer and contents.
+fn line_indent(t: Tok, prev: Tok, have_prev: bool, top_kind: u64, base: u64, inner: u64, stmt: u64, clause: bool) -> u64 {
+  if is_closer(t) {
+    return base;
+  }
+  if top_kind == 2 {
+    return inner;
+  }
+  if !have_prev || ends_stmt(prev) {
+    return inner;
+  }
+  if is_p(t, P_LBRACE) || is_kw(t, KW_ELSE) {
+    return stmt;
+  }
+  if is_clause(t) {
+    return sadd(stmt, 2);
+  }
+  if clause {
+    return sadd(stmt, 4);
+  }
+  return sadd(stmt, 2);
+}
+
+/// The last element of `v`, or 0.
+fn last_of(v: &Vec[u64]) -> u64 {
+  let n = vec_len(v);
+  if n > 0 {
+    return vec_get(v, n - 1);
+  }
+  return 0;
+}
+
+fn pop_of(v: &mut Vec[u64]) -> u64 {
+  if vec_len(v) > 0 {
+    return vec_pop(&mut v);
+  }
+  return 0;
+}
+
+/// Formats `src` into `out` (which should be empty). False if `src` does
+/// not lex: nothing is produced then.
+fn fmt_source(src: &Bytes, out: &mut Vec[u64]) -> bool
+  requires blen(src) <= SRC_MAX
+{
+  let mut toks = vec_new[Tok]();
+  let last = lex(src, 0, &mut toks);
+  if last.kind == K_ERROR {
+    vec_free(toks);
+    return false;
+  }
+  // The open brackets: kind (1: `{`, 2: `(` or `[`), where the closer goes,
+  // where the contents go, and the statement indentation to go back to.
+  let mut kinds = vec_new[u64]();
+  let mut bases = vec_new[u64]();
+  let mut inners = vec_new[u64]();
+  let mut saved = vec_new[u64]();
+  let mut stmt = 0;      // indentation of the line the current statement started on
+  let mut line_ind = 0;  // indentation of the current line
+  let mut clause = false;
+  let mut started = false;
+  let mut prev = Tok { kind: K_EOF, start: 0, end: 0, line: 0, col: 0, val: 0, ecol: 0 };
+  let mut prev_unary = false;
+  let mut prev_sep = false;
+  let mut prev_open = false;   // the last thing written is a `{`
+  let mut gs = 0;
+  let n = vec_len(toks);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && n == vlen(toks) && gs <= blen(src)
+  {
+    let t = tok_at(toks, i);
+    let mut ge = t.start;
+    if t.kind == K_STR && ge > 0 {
+      ge = ge - 1;   // the opening quote belongs to the token
+    }
+    ge = clamp(ge, blen(src));
+    let mut j = clamp(gs, ge);
+    let top_kind = last_of(kinds);
+    let base = last_of(bases);
+    let inner = last_of(inners);
+    // The indentation for the token itself, and for a comment in front of it.
+    let at_ind = line_indent(t, prev, started, top_kind, base, inner, stmt, clause);
+    let mut cind = at_ind;
+    if is_closer(t) {
+      cind = inner;
+    }
+    if vec_len(kinds) == 0 && is_closer(t) {
+      cind = 0;
+    }
+    let mut nl = 0;
+    let gap_start = j;
+    while j < ge
+      invariant j <= ge && ge <= blen(src) && gap_start <= j
+    {
+      let c = at(src, j);
+      if c == 10 {
+        nl = sadd(nl, 1);
+        j = j + 1;
+      } else if c == 47 && at(src, j + 1) == 47 {
+        let mut e = j;
+        while e < ge && at(src, e) != 10
+          invariant j <= e && e <= ge
+        {
+          e = e + 1;
+        }
+        let mut e2 = e;
+        while e2 > j + 2 && is_space(at(src, e2 - 1))
+          invariant j <= e2 && e2 <= e
+        {
+          e2 = e2 - 1;
+        }
+        if nl == 0 && started {
+          // A comment after code on the same line keeps its distance.
+          let mut k = j;
+          while k > gap_start && (at(src, k - 1) == 32 || at(src, k - 1) == 9)
+            invariant gap_start <= k && k <= j
+          {
+            k = k - 1;
+          }
+          let mut sp = j - k;
+          if sp == 0 {
+            sp = 1;
+          }
+          if sp > 256 {
+            sp = 256;
+          }
+          let mut s = 0;
+          while s < sp
+            invariant s <= sp
+          {
+            vec_push(&mut out, 32);
+            s = s + 1;
+          }
+        } else if started {
+          let mut want = nl;
+          if want > 2 {
+            want = 2;
+          }
+          if prev_open && want > 1 {
+            want = 1;
+          }
+          put_line(&mut out, want, cind);
+        } else {
+          put_line(&mut out, 0, 0);
+        }
+        put_span(&mut out, src, j, e2);
+        started = true;
+        prev_open = false;
+        nl = 0;
+        j = e;
+      } else {
+        j = j + 1;
+      }
+    }
+    if t.kind == K_EOF {
+      i = n;
+    } else {
+      let mut unary = false;
+      if prefixable(t) {
+        unary = is_p(t, P_BANG) || !(started && operand_end(prev));
+      }
+      let mut sep = false;
+      if is_p(t, P_COLONCOLON) {
+        sep = gap_start < ge && started;
+        // A path (`E::V`) has no space in front of its `::`.
+        if sep {
+          let mut k = gap_start;
+          let mut any = false;
+          while k < ge && k < blen(src)
+            invariant k <= ge
+          {
+            if is_space(at(src, k)) {
+              any = true;
+            }
+            k = k + 1;
+          }
+          sep = any;
+        }
+      }
+      let mut ind = line_ind;
+      if started {
+        if nl > 0 {
+          let mut want = nl;
+          if want > 2 {
+            want = 2;
+          }
+          if prev_open && want > 1 {
+            want = 1;
+          }
+          if is_p(t, P_RBRACE) && want > 1 {
+            want = 1;
+          }
+          ind = at_ind;
+          put_line(&mut out, want, ind);
+          // A line that starts a statement sets the statement's indentation.
+          let new_stmt = (top_kind != 2) && (!started || ends_stmt(prev)) && !is_closer(t);
+          if new_stmt {
+            stmt = ind;
+          }
+          line_ind = ind;
+        } else {
+          // Same line: either a gap with only white space or none at all.
+          let mut gap_ws = false;
+          let mut k = gap_start;
+          while k < ge && k < blen(src)
+            invariant k <= ge
+          {
+            if is_space(at(src, k)) {
+              gap_ws = true;
+            }
+            k = k + 1;
+          }
+          if want_space(prev, t, prev_unary, prev_sep, gap_ws) {
+            vec_push(&mut out, 32);
+          }
+        }
+      } else {
+        stmt = 0;
+        line_ind = 0;
+      }
+      put_tok(&mut out, src, t);
+      started = true;
+      prev_open = is_p(t, P_LBRACE);
+      // Track brackets and clauses.
+      if is_closer(t) {
+        if vec_len(kinds) > 0 {
+          let k = pop_of(&mut kinds);
+          pop_of(&mut bases);
+          pop_of(&mut inners);
+          let s = pop_of(&mut saved);
+          if k == 1 {
+            stmt = s;
+          }
+        }
+      } else if is_opener(t) {
+        let in_paren = top_kind == 2;
+        if is_p(t, P_LBRACE) {
+          let mut inn = sadd(stmt, 2);
+          let mut bs = stmt;
+          if in_paren {
+            inn = sadd(line_ind, 2);
+            bs = line_ind;
+          }
+          vec_push(&mut kinds, 1);
+          vec_push(&mut bases, bs);
+          vec_push(&mut inners, inn);
+          vec_push(&mut saved, stmt);
+          clause = false;
+        } else {
+          vec_push(&mut kinds, 2);
+          vec_push(&mut bases, line_ind);
+          vec_push(&mut inners, sadd(line_ind, 2));
+          vec_push(&mut saved, stmt);
+        }
+      } else if is_clause(t) {
+        clause = true;
+      } else if is_p(t, P_SEMI) {
+        clause = false;
+      }
+      prev = t;
+      prev_unary = unary;
+      prev_sep = sep;
+      gs = clamp(t.end, blen(src));
+      if t.kind == K_STR && gs < blen(src) {
+        gs = gs + 1;
+      }
+      i = i + 1;
+    }
+  }
+  // One newline ends the file.
+  while vec_len(out) > 0 && last_of(out) == 32 {
+    vec_pop(&mut out);
+  }
+  if vec_len(out) > 0 {
+    while vec_len(out) > 0 && last_of(out) == 10 {
+      vec_pop(&mut out);
+    }
+    vec_push(&mut out, 10);
+  }
+  vec_free(toks);
+  vec_free(kinds);
+  vec_free(bases);
+  vec_free(inners);
+  vec_free(saved);
+  return true;
+}
+
+/// Do `a` and `b` lex to the same tokens (comments and white space aside)?
+fn fmt_same_tokens(a: &Bytes, b: &Bytes) -> bool
+  requires blen(a) <= SRC_MAX && blen(b) <= SRC_MAX
+{
+  let mut ta = vec_new[Tok]();
+  let mut tb = vec_new[Tok]();
+  let la = lex(a, 0, &mut ta);
+  let lb = lex(b, 0, &mut tb);
+  let mut same = la.kind != K_ERROR && lb.kind != K_ERROR && vec_len(ta) == vec_len(tb);
+  let mut i = 0;
+  while same && i < vec_len(ta) && i < vec_len(tb)
+    invariant i <= vlen(ta)
+  {
+    let x = vec_get(ta, i);
+    let y = vec_get(tb, i);
+    if x.kind != y.kind || x.val != y.val || x.end < x.start || y.end < y.start {
+      same = false;
+    } else if x.end - x.start != y.end - y.start || x.end > blen(a) || y.end > blen(b) {
+      same = false;
+    } else if !bytes_span_same(a, x.start, b, y.start, x.end - x.start) {
+      same = false;
+    }
+    i = i + 1;
+  }
+  vec_free(ta);
+  vec_free(tb);
+  return same;
+}
+
+fn bytes_span_same(a: &Bytes, s: u64, b: &Bytes, t: u64, len: u64) -> bool
+  requires s + len <= blen(a) && t + len <= blen(b)
+{
+  let mut k = 0;
+  while k < len
+    invariant k <= len && s + len <= blen(a) && t + len <= blen(b)
+  {
+    if bget(a, s + k) != bget(b, t + k) {
+      return false;
+    }
+    k = k + 1;
+  }
+  return true;
+}
