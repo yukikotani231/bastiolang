@@ -563,7 +563,9 @@ class Fuzz:
         if crashed(c1, e1):
             self.finding("crash1", src, f"bastioc1 --check: {'timeout' if c1 is None else f'exit {c1}'} ({where})\n{e1.decode(errors='replace')[-2000:]}")
             return c0, e0
-        if c0 != c1 or counterexample_free(mask(e0, e1)) != counterexample_free(e1):
+        if c0 == 1 and c1 != c0 and b"error[E-TYPE]: unknown function `" in e0:
+            self.stat("stage0 lacks a stage1-only function")     # stage0 is frozen: it knows less by design
+        elif c0 != c1 or counterexample_free(mask(e0, e1)) != counterexample_free(e1):
             self.finding("differ", src, f"bastioc0 and bastioc1 disagree ({where})\n--- bastioc0 exit {c0}:\n{e0.decode(errors='replace')}--- bastioc1 exit {c1}:\n{e1.decode(errors='replace')}")
         elif c0 == 0:
             o0 = os.path.join(self.cur.tmp, "c0.c")
