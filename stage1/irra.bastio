@@ -516,6 +516,157 @@ fn ra_costs(f: &IrFn, depth: &Vec[u64]) -> Vec[u64] {
 
 /// Allocates the registers of `f` with `ncallee` callee-saved and `ncaller`
 /// caller-saved machine registers.
+
+// ---- Live segments ----
+
+/// The stretches of instructions where each register is live, as sorted
+/// lists: register `v` has the segments `head[v]`, `nxt[head[v]]`, ... (a
+/// segment is positions `sa ..= sb`; IR_NONE ends a list). Unlike the
+/// interval (first to last position) these have holes, where the register
+/// is dead and its machine register can serve another.
+struct IrSegs { head: Vec[u64], tail: Vec[u64], nxt: Vec[u64], sa: Vec[u64], sb: Vec[u64] }
+
+fn ra_seg_add(sg: &mut IrSegs, v: u64, a: u64, b: u64) {
+  if v >= vec_len(sg.head) {
+    return;
+  }
+  let t = u_at(sg.tail, v);
+  if t != IR_NONE && wrap_add(u_at(sg.sb, t), 1) >= a {
+    if b > u_at(sg.sb, t) {
+      ra_set(&mut sg.sb, t, b);
+    }
+  } else {
+    let k = vec_len(sg.sa);
+    vec_push(&mut sg.sa, a);
+    vec_push(&mut sg.sb, b);
+    vec_push(&mut sg.nxt, IR_NONE);
+    if t == IR_NONE {
+      ra_set(&mut sg.head, v, k);
+    } else {
+      ra_set(&mut sg.nxt, t, k);
+    }
+    ra_set(&mut sg.tail, v, k);
+  }
+}
+
+fn ra_segments(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> IrSegs {
+  let nr = f.nreg;
+  let mut sg = IrSegs { head: vec_new[u64](), tail: vec_new[u64](), nxt: vec_new[u64](), sa: vec_new[u64](), sb: vec_new[u64]() };
+  let mut bf = vec_new[u64]();
+  let mut bs = vec_new[u64]();
+  let mut r = 0;
+  while r < nr && r < 1000000000 {
+    vec_push(&mut sg.head, IR_NONE);
+    vec_push(&mut sg.tail, IR_NONE);
+    vec_push(&mut bf, IR_NONE);
+    vec_push(&mut bs, IR_NONE);
+    r = r + 1;
+  }
+  let mut p = 0;
+  while p < vec_len(f.params) {
+    ra_seg_add(&mut sg, vec_get(f.params, p), 0, 0);
+    p = p + 1;
+  }
+  let mut b = 0;
+  while b < vec_len(bl) {
+    let blk = vec_get(bl, b);
+    let mut touched = vec_new[u64]();
+    let mut i = blk.s;
+    while i < blk.e && i < vec_len(f.ins) {
+      let q = vec_get(f.ins, i);
+      let mut rs = vec_new[u64]();
+      ra_reads(f, q, &mut rs);
+      ra_writes(q, &mut rs);
+      let mut j = 0;
+      while j < vec_len(rs) {
+        let x = vec_get(rs, j);
+        if x < nr {
+          if u_at(bf, x) == IR_NONE {
+            ra_set(&mut bf, x, i);
+            vec_push(&mut touched, x);
+          }
+          ra_set(&mut bs, x, i);
+        }
+        j = j + 1;
+      }
+      vec_free(rs);
+      i = i + 1;
+    }
+    let mut rr = 0;
+    while rr < nr {
+      let li = ra_in(lv, b, rr);
+      let lo = ra_out(lv, b, rr) && blk.e > 0;
+      if li || lo {
+        if u_at(bf, rr) == IR_NONE {
+          ra_set(&mut bf, rr, blk.s);
+          ra_set(&mut bs, rr, blk.s);
+          vec_push(&mut touched, rr);
+        }
+        if li {
+          ra_set(&mut bf, rr, blk.s);
+        }
+        if lo {
+          ra_set(&mut bs, rr, blk.e - 1);
+        }
+      }
+      rr = rr + 1;
+    }
+    let mut k = 0;
+    while k < vec_len(touched) {
+      let x = vec_get(touched, k);
+      ra_seg_add(&mut sg, x, u_at(bf, x), u_at(bs, x));
+      ra_set(&mut bf, x, IR_NONE);
+      ra_set(&mut bs, x, IR_NONE);
+      k = k + 1;
+    }
+    vec_free(touched);
+    b = b + 1;
+  }
+  vec_free(bf);
+  vec_free(bs);
+  return sg;
+}
+
+fn ra_segs_free(sg: IrSegs) {
+  vec_free(sg.head);
+  vec_free(sg.tail);
+  vec_free(sg.nxt);
+  vec_free(sg.sa);
+  vec_free(sg.sb);
+}
+
+/// Do registers `v` and `w` ever live together? With `touch`, `w` may end
+/// where `v` begins (the emitter reads every operand before it writes the
+/// result).
+fn ra_overlap(sg: &IrSegs, v: u64, w: u64, touch: bool) -> bool {
+  if v >= vec_len(sg.head) || w >= vec_len(sg.head) {
+    return false;
+  }
+  let hv = u_at(sg.head, v);
+  let mut i = hv;
+  let mut j = u_at(sg.head, w);
+  let mut hit = false;
+  let mut steps = 0;
+  while i != IR_NONE && j != IR_NONE && !hit && steps < 1000000 {
+    let a1 = u_at(sg.sa, i);
+    let b1 = u_at(sg.sb, i);
+    let a2 = u_at(sg.sa, j);
+    let b2 = u_at(sg.sb, j);
+    if a1 <= b2 && a2 <= b1 {
+      if !(touch && i == hv && b2 == a1) {
+        hit = true;
+      }
+    }
+    if b1 < b2 {
+      i = u_at(sg.nxt, i);
+    } else {
+      j = u_at(sg.nxt, j);
+    }
+    steps = steps + 1;
+  }
+  return hit;
+}
+
 // ---- Which registers live across a call ----
 
 /// For every register, 1 when it is live just after some call instruction
@@ -681,9 +832,6 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
   let depth = ra_depths(f);
   let cost = ra_costs(f, depth);
   vec_free(depth);
-  // The register each machine register holds now (IR_NONE: none yet).
-  let mut occ_callee = vec_new[u64]();
-  let mut occ_caller = vec_new[u64]();
   // Registers by order of interval start.
   let mut order = vec_new[u64]();
   let mut pos = 0;
@@ -697,29 +845,14 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
     }
     pos = pos + 1;
   }
-  // Machine registers in use: the end of the interval holding each (0: free).
-  let mut busy_callee = vec_new[u64]();
-  let mut busy_caller = vec_new[u64]();
-  let mut k = 0;
-  while k < ncallee && k < 64 {
-    vec_push(&mut busy_callee, 0);
-    k = k + 1;
-  }
-  k = 0;
-  while k < ncaller && k < 64 {
-    vec_push(&mut busy_caller, 0);
-    k = k + 1;
-  }
-  k = 0;
-  while k < ncallee && k < 64 {
-    vec_push(&mut occ_callee, IR_NONE);
-    k = k + 1;
-  }
-  k = 0;
-  while k < ncaller && k < 64 {
-    vec_push(&mut occ_caller, IR_NONE);
-    k = k + 1;
-  }
+  // The registers that hold a machine register now or may again (those whose
+  // interval has not ended): `hv[k]` holds machine register `hm[k]`, numbered
+  // from 0 for the first callee-saved one, `ncallee` for the first
+  // caller-saved (IR_NONE: given up).
+  let mut hv = vec_new[u64]();
+  let mut hm = vec_new[u64]();
+  let sg = ra_segments(f, bl, lv);
+  let nm = wrap_add(ncallee, ncaller);
   // For the emitter (`consts`): a register may take the machine register of
   // one whose last use is the instruction that writes it, as the emitter
   // reads every operand of an instruction before it writes the result.
@@ -729,114 +862,135 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
     let v = vec_get(order, o);
     let lo = u_at(iv.lo, v);
     let hi = u_at(iv.hi, v);
-    // Does it live across a call?
     let crosses = u_at(xmark, v) != 0;
-    // Registers whose interval ended before this one starts are free.
+    // Forget what has ended.
+    let mut keep_v = vec_new[u64]();
+    let mut keep_m = vec_new[u64]();
+    let mut h = 0;
+    while h < vec_len(hv) && h < vec_len(hm) {
+      let w = vec_get(hv, h);
+      if u_at(hm, h) != IR_NONE && u_at(iv.hi, w) >= lo {
+        vec_push(&mut keep_v, w);
+        vec_push(&mut keep_m, u_at(hm, h));
+      }
+      h = wrap_add(h, 1);
+    }
+    vec_free(hv);
+    vec_free(hm);
+    hv = keep_v;
+    hm = keep_m;
+    // Which machine registers v can have, in order of preference: the one
+    // of `u` in `v = mov u` where `u` dies, the caller-saved ones, the
+    // callee-saved ones (not across a call: caller-saved only).
     let mut placed = false;
-    // `v = mov u` where `u` dies there: `v` takes the place of `u`, and the
-    // emitter drops the move.
+    let mut want = IR_NONE;
     if touch && lo > 0 && lo < n {
       let q0 = vec_get(f.ins, lo);
       if q0.op == IR_MOV && q0.d == v && q0.a != v && q0.a < nr && u_at(iv.hi, q0.a) <= lo && u_at(al.cst, q0.a) == 0 {
-        let u = q0.a;
-        let cu = u_at(al.cls, u);
-        let iu = u_at(al.idx, u);
-        if cu == RA_CALLER && !crosses && iu < vec_len(busy_caller) && vec_get(busy_caller, iu) <= lo + 1 {
-          vec_set(&mut busy_caller, iu, wrap_add(hi, 1));
-          ra_set(&mut occ_caller, iu, v);
-          ra_set(&mut al.cls, v, RA_CALLER);
-          ra_set(&mut al.idx, v, iu);
-          placed = true;
-        } else if cu == RA_CALLEE && iu < vec_len(busy_callee) && vec_get(busy_callee, iu) <= lo + 1 {
-          vec_set(&mut busy_callee, iu, wrap_add(hi, 1));
-          ra_set(&mut occ_callee, iu, v);
-          ra_set(&mut al.cls, v, RA_CALLEE);
-          ra_set(&mut al.idx, v, iu);
-          placed = true;
+        let cu = u_at(al.cls, q0.a);
+        let iu = u_at(al.idx, q0.a);
+        if cu == RA_CALLER && !crosses {
+          want = wrap_add(ncallee, iu);
+        } else if cu == RA_CALLEE {
+          want = iu;
         }
       }
     }
-    if !crosses && !placed {
+    let mut pass = 0;
+    while pass < 3 && !placed {
       let mut m = 0;
-      while m < vec_len(busy_caller) && !placed {
-        let until = vec_get(busy_caller, m);
-        if until == 0 || until <= lo || (touch && lo > 0 && until <= lo + 1) {
-          vec_set(&mut busy_caller, m, wrap_add(hi, 1));
-          ra_set(&mut occ_caller, m, v);
-          ra_set(&mut al.cls, v, RA_CALLER);
-          ra_set(&mut al.idx, v, m);
-          placed = true;
+      while m < nm && !placed {
+        let mut cand = false;
+        if pass == 0 {
+          cand = want != IR_NONE && m == want;
+        } else if pass == 1 {
+          cand = m >= ncallee && !crosses;
+        } else {
+          cand = m < ncallee;
         }
-        m = m + 1;
-      }
-    }
-    if !placed {
-      let mut m = 0;
-      while m < vec_len(busy_callee) && !placed {
-        let until = vec_get(busy_callee, m);
-        if until == 0 || until <= lo || (touch && lo > 0 && until <= lo + 1) {
-          vec_set(&mut busy_callee, m, wrap_add(hi, 1));
-          ra_set(&mut occ_callee, m, v);
-          ra_set(&mut al.cls, v, RA_CALLEE);
-          ra_set(&mut al.idx, v, m);
-          if m + 1 > al.ncallee_used {
-            al.ncallee_used = m + 1;
+        if cand {
+          let mut clash = false;
+          let mut h2 = 0;
+          while h2 < vec_len(hv) && !clash {
+            if u_at(hm, h2) == m && ra_overlap(sg, v, vec_get(hv, h2), touch && lo > 0) {
+              clash = true;
+            }
+            h2 = h2 + 1;
           }
-          placed = true;
+          if !clash {
+            vec_push(&mut hv, v);
+            vec_push(&mut hm, m);
+            if m < ncallee {
+              ra_set(&mut al.cls, v, RA_CALLEE);
+              ra_set(&mut al.idx, v, m);
+              if m + 1 > al.ncallee_used {
+                al.ncallee_used = m + 1;
+              }
+            } else {
+              ra_set(&mut al.cls, v, RA_CALLER);
+              ra_set(&mut al.idx, v, m - ncallee);
+            }
+            placed = true;
+          }
         }
         m = m + 1;
       }
+      pass = pass + 1;
     }
     if !placed {
       // Every register is taken: the cheapest register to keep in the frame
-      // gives up its machine register if it costs less than this one.
+      // gives up its machine register if it costs less than this one. Only
+      // a machine register with a single register in v's way can be freed.
       let cv = u_at(cost, v);
       let mut best = IR_NONE;
       let mut best_cost = cv;
       let mut best_len = wrap_add(wrap_sub(hi, lo), 1);
       if best_len > 16 { best_len = 16; }
-      let mut best_callee = true;
       let mut best_m = 0;
       let mut m = 0;
-      while m < vec_len(occ_callee) {
-        let o2 = u_at(occ_callee, m);
-        if o2 != IR_NONE && wrap_mul(u_at(cost, o2), best_len) < wrap_mul(best_cost, ra_len(iv, o2)) && u_at(iv.hi, o2) > lo {
-          best = o2;
-          best_cost = u_at(cost, o2);
-          best_len = ra_len(iv, o2);
-          best_callee = true;
-          best_m = m;
+      while m < nm {
+        if m < ncallee || !crosses {
+          let mut nclash = 0;
+          let mut who = IR_NONE;
+          let mut h2 = 0;
+          while h2 < vec_len(hv) {
+            if u_at(hm, h2) == m && ra_overlap(sg, v, vec_get(hv, h2), touch && lo > 0) {
+              nclash = wrap_add(nclash, 1);
+              who = vec_get(hv, h2);
+            }
+            h2 = h2 + 1;
+          }
+          if nclash == 1 && who != IR_NONE {
+            if wrap_mul(u_at(cost, who), best_len) < wrap_mul(best_cost, ra_len(iv, who)) {
+              best = who;
+              best_cost = u_at(cost, who);
+              best_len = ra_len(iv, who);
+              best_m = m;
+            }
+          }
         }
         m = m + 1;
-      }
-      if !crosses {
-        m = 0;
-        while m < vec_len(occ_caller) {
-          let o2 = u_at(occ_caller, m);
-          if o2 != IR_NONE && wrap_mul(u_at(cost, o2), best_len) < wrap_mul(best_cost, ra_len(iv, o2)) && u_at(iv.hi, o2) > lo {
-            best = o2;
-            best_cost = u_at(cost, o2);
-            best_len = ra_len(iv, o2);
-            best_callee = false;
-            best_m = m;
-          }
-          m = m + 1;
-        }
       }
       if best != IR_NONE {
         let slot = ra_spill_slot(f, iv, &mut al, best, touch);
         ra_set(&mut al.cls, best, RA_SPILL);
         ra_set(&mut al.idx, best, slot);
-        if best_callee {
-          ra_set(&mut busy_callee, best_m, wrap_add(hi, 1));
-          ra_set(&mut occ_callee, best_m, v);
-          ra_set(&mut al.cls, v, RA_CALLEE);
-        } else {
-          ra_set(&mut busy_caller, best_m, wrap_add(hi, 1));
-          ra_set(&mut occ_caller, best_m, v);
-          ra_set(&mut al.cls, v, RA_CALLER);
+        let mut h2 = 0;
+        while h2 < vec_len(hv) {
+          if vec_get(hv, h2) == best {
+            ra_set(&mut hm, h2, IR_NONE);
+          }
+          h2 = h2 + 1;
         }
-        ra_set(&mut al.idx, v, best_m);
+        vec_push(&mut hv, v);
+        vec_push(&mut hm, best_m);
+        if best_m < ncallee {
+          ra_set(&mut al.cls, v, RA_CALLEE);
+          ra_set(&mut al.idx, v, best_m);
+        } else {
+          ra_set(&mut al.cls, v, RA_CALLER);
+          ra_set(&mut al.idx, v, best_m - ncallee);
+        }
         placed = true;
       }
     }
@@ -847,12 +1001,11 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
     }
     o = o + 1;
   }
+  ra_segs_free(sg);
+  vec_free(hv);
+  vec_free(hm);
   vec_free(order);
   vec_free(cost);
-  vec_free(occ_callee);
-  vec_free(occ_caller);
-  vec_free(busy_callee);
-  vec_free(busy_caller);
   vec_free(calls);
   vec_free(xmark);
   vec_free(iv.lo);
@@ -874,6 +1027,7 @@ fn ra_valid(f: &IrFn, a: &IrAlloc) -> bool {
   let lv = ra_live(f, bl);
   let iv = ra_intervals(f, bl, lv);
   let xmark = ra_cross(f, bl, lv);
+  let sg = ra_segments(f, bl, lv);
   let nr = f.nreg;
   let n = vec_len(f.ins);
   let mut ok = true;
@@ -887,9 +1041,7 @@ fn ra_valid(f: &IrFn, a: &IrAlloc) -> bool {
       let mut y = x + 1;
       while y < nr && y < 100000 {
         if u_at(a.cls, y) == cx && u_at(a.idx, y) == u_at(a.idx, x) {
-          // Both intervals closed: they overlap unless one ends before the
-          // other starts.
-          if !(u_at(iv.hi, x) <= u_at(iv.lo, y) && u_at(iv.hi, x) != u_at(iv.lo, y)) && !(u_at(iv.hi, y) <= u_at(iv.lo, x) && u_at(iv.hi, y) != u_at(iv.lo, x)) {
+          if ra_overlap(sg, x, y, false) {
             ok = false;
           }
         }
@@ -899,6 +1051,7 @@ fn ra_valid(f: &IrFn, a: &IrAlloc) -> bool {
     x = x + 1;
   }
   vec_free(xmark);
+  ra_segs_free(sg);
   vec_free(iv.lo);
   vec_free(iv.hi);
   vec_free(lv.inn);
