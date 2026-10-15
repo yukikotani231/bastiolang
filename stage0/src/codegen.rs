@@ -499,6 +499,14 @@ const PRELUDE_PAGES: &str = r#"
 #define BST_PTE_P 1ull
 #define BST_PTE_W 2ull
 #define BST_PTE_U 4ull
+/* A page the program may write is never one it may run (W^X): the entry
+ * has the no-execute bit when it is made writable (pt_put_frame and
+ * pt_put_shared with w), and has not when made read-only, so a page is
+ * executable if it was mapped read-only (program text) or if the kernel
+ * made it so by mapping it again read-only. pt_set_access leaves the bit
+ * alone: a page that becomes writable for a copy-on-write fault keeps what
+ * its mapping chose. Needs EFER.NXE (boot.S). */
+#define BST_PTE_NX (1ull << 63)
 #define BST_PTE_ADDR 0x000FFFFFFFFFF000ull
 static inline void bst_zero_page(uint64_t a) {
 #if defined(__x86_64__)
@@ -567,7 +575,7 @@ static inline void bst_pt_put(bst_pt *t, uint64_t i, bst_pt c) {
     __atomic_store_n(&((uint64_t *)*t)[i], c | BST_PTE_P | BST_PTE_W | BST_PTE_U, __ATOMIC_RELEASE);
 }
 static inline void bst_pt_put_frame(bst_pt *t, uint64_t i, bst_frame f, bool w) {
-    __atomic_store_n(&((uint64_t *)*t)[i], f | BST_PTE_P | BST_PTE_U | (w ? BST_PTE_W : 0), __ATOMIC_RELEASE);
+    __atomic_store_n(&((uint64_t *)*t)[i], f | BST_PTE_P | BST_PTE_U | (w ? BST_PTE_W | BST_PTE_NX : 0), __ATOMIC_RELEASE);
 }
 /* What slot i points to, left in place (pt_borrow). */
 static inline uint64_t bst_pt_child(bst_pt t, uint64_t i) { return ((uint64_t *)t)[i] & BST_PTE_ADDR; }
@@ -608,7 +616,7 @@ static inline uint64_t bst_shared_drop(bst_pool *p, bst_frame s) {
 static inline uint64_t bst_shared_id(bst_frame s) { return bst_frame_id(s); }
 static inline bool bst_pt_shared(bst_pt t, uint64_t i) { return (((uint64_t *)t)[i] & BST_PTE_SHARED) != 0; }
 static inline void bst_pt_put_shared(bst_pt *t, uint64_t i, bst_frame s, bool w) {
-    __atomic_store_n(&((uint64_t *)*t)[i], s | BST_PTE_P | BST_PTE_U | BST_PTE_SHARED | (w ? BST_PTE_W : 0), __ATOMIC_RELEASE);
+    __atomic_store_n(&((uint64_t *)*t)[i], s | BST_PTE_P | BST_PTE_U | BST_PTE_SHARED | (w ? BST_PTE_W | BST_PTE_NX : 0), __ATOMIC_RELEASE);
 }
 #define bst_pt_take_shared bst_pt_take
 static inline bst_frame bst_pt_dup_shared(bst_pt t, uint64_t i) { return bst_shared_dup(((uint64_t *)t)[i] & BST_PTE_ADDR); }

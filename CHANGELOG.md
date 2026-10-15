@@ -29,6 +29,11 @@ What will be 0.2.0.
 
 ### Compiler
 
+- The page-table prelude marks a page mapped writable (`pt_put_frame`,
+  `pt_put_shared` with `writable`) no-execute on x86-64, and leaves a
+  read-only one executable, so a kernel that sets `EFER.NXE` gets W^X from
+  how it maps pages. `pt_set_access` leaves the bit alone.
+
 - Diagnostics say what to do about the slips a newcomer meets first: `=`
   where `==` is meant, `+=`, `var` and `for`, a parameter without its type, a
   block that is never closed, a function that can reach its end without
