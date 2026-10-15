@@ -1,0 +1,63 @@
+// core/lines.bastio: splitting text into lines.
+//
+// A line ends at `\n`, and a `\r` just before it belongs to the terminator.
+// The last line needs no terminator, but a terminator at the very end of the
+// text does not start another, empty line, so `a\nb\n` and `a\nb` are both
+// two lines and an empty text has none. A blank line in the middle is an
+// empty span. Lines are spans of the text, so nothing is copied.
+//
+// What is proved: every span lies inside the text, and none holds a `\n`.
+import "bytes.bastio";
+
+/// Every span in `v` lies inside `b` and holds no newline.
+spec fn lines_ok(v: &Vec[Span], b: &Bytes) -> bool {
+  forall i: u64 :: i < vlen(v) ==> span_in(vget(v, i), b)
+    && (forall k: u64 :: vget(v, i).start <= k && k < vget(v, i).end ==> bget(b, k) != 10)
+}
+
+/// The lines of `b`, in order.
+/// ```
+/// let b = bfrom("one\r\ntwo\n\nfour");
+/// let ls = lines_split(b);
+/// let mut ok = vec_len(ls) == 4;
+/// if ok {
+///   let l0 = vec_get(ls, 0);
+///   let l1 = vec_get(ls, 1);
+///   let l2 = vec_get(ls, 2);
+///   let l3 = vec_get(ls, 3);
+///   ok = bytes_span_eq_str(b, l0.start, l0.end, "one")
+///     && bytes_span_eq_str(b, l1.start, l1.end, "two")
+///     && l2.start == l2.end
+///     && bytes_span_eq_str(b, l3.start, l3.end, "four");
+/// }
+/// vec_free(ls);
+/// let e = balloc(0);
+/// let none = lines_split(e);
+/// let zero = vec_len(none) == 0;
+/// vec_free(none);
+/// bfree(e);
+/// bfree(b);
+/// if !ok || !zero { return 1; }
+/// ```
+fn lines_split(b: &Bytes) -> Vec[Span]
+  ensures lines_ok(result, b)
+{
+  let mut out = vec_new[Span]();
+  let mut s = 0;
+  while s < blen(b)
+    invariant s <= blen(b) && lines_ok(out, b)
+  {
+    let e = bytes_find_byte(b, 10, s);
+    let mut t = e;
+    if t > s && bget(b, t - 1) == 13 {
+      t = t - 1;
+    }
+    vec_push(&mut out, Span { start: s, end: t });
+    if e == blen(b) {
+      s = e;
+    } else {
+      s = e + 1;
+    }
+  }
+  return out;
+}

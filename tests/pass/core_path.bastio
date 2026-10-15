@@ -1,0 +1,65 @@
+// expect-exit: 0
+// Path splitting, extensions, joining and lexical cleaning, including the
+// odd inputs: empty, root, doubled and trailing slashes, hidden files.
+import "core/path.bastio";
+
+fn split_is(p: Str, dir: Str, base: Str) -> bool {
+  let b = bfrom(p);
+  let parts = path_split(b);
+  let ok = bytes_span_eq_str(b, parts.dir.start, parts.dir.end, dir)
+    && bytes_span_eq_str(b, parts.base.start, parts.base.end, base);
+  bfree(b);
+  return ok;
+}
+
+fn ext_is(p: Str, want: Str, has: bool) -> bool {
+  let b = bfrom(p);
+  let parts = path_split(b);
+  let mut ok = !has;
+  match path_ext(b, parts.base) {
+    Option::Some(e) => { ok = has && bytes_span_eq_str(b, e.start, e.end, want); },
+    Option::None => {},
+  }
+  bfree(b);
+  return ok;
+}
+
+fn join_is(a: Str, b: Str, want: Str) -> bool {
+  let x = bfrom(a);
+  let y = bfrom(b);
+  let j = path_join(x, y);
+  let ok = bytes_eq_str(j, want);
+  bfree(j);
+  bfree(y);
+  bfree(x);
+  return ok;
+}
+
+fn clean_is(p: Str, want: Str) -> bool {
+  let b = bfrom(p);
+  let c = path_clean(b);
+  let ok = bytes_eq_str(c, want);
+  bfree(c);
+  bfree(b);
+  return ok;
+}
+
+fn main() -> u64 {
+  let mut ok = split_is("", "", "") && split_is("/", "/", "") && split_is("//", "/", "")
+    && split_is("a", "", "a") && split_is("/a", "/", "a") && split_is("a/b", "a", "b")
+    && split_is("a//b//", "a", "b") && split_is("/usr/lib/", "/usr", "lib")
+    && split_is("///x", "/", "x") && split_is("./f", ".", "f");
+  ok = ok && ext_is("a.c", "c", true) && ext_is("a.tar.gz", "gz", true)
+    && ext_is(".bashrc", "", false) && ext_is("name.", "", false) && ext_is("dir.d/file", "", false)
+    && ext_is("x/.y.z", "z", true) && ext_is("", "", false);
+  ok = ok && join_is("a", "b", "a/b") && join_is("a/", "b", "a/b") && join_is("", "b", "b")
+    && join_is("a", "", "a") && join_is("a", "/b", "/b") && join_is("/", "x", "/x")
+    && join_is("", "", "") && join_is("a//", "b", "a//b");
+  ok = ok && clean_is("", ".") && clean_is(".", ".") && clean_is("/", "/") && clean_is("//", "/")
+    && clean_is("a/b/", "a/b") && clean_is("a//b", "a/b") && clean_is("a/./b", "a/b")
+    && clean_is("a/../b", "b") && clean_is("a/b/../..", ".") && clean_is("../a", "../a")
+    && clean_is("../../a/..", "../..") && clean_is("/..", "/") && clean_is("/a/../..", "/")
+    && clean_is("a/b/../../..", "..") && clean_is("/a/b/./../c", "/a/c");
+  if ok { return 0; }
+  return 1;
+}
