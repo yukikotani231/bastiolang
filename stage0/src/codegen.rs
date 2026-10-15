@@ -663,7 +663,7 @@ static void bst_puthex(uint64_t v) {
 }
 
 /* Memory for Buf: a fixed arena with an exact-size free list, then the
- * extension bst_pool_init carves from RAM (a 16th of the pool, at least 4 MiB), so
+ * extension bst_pool_init carves from RAM (an eighth of the pool, at least 4 MiB), so
  * the kernel's own tables can grow with the machine. */
 #define BST_ARENA_WORDS (1u << 20)   /* 8 MiB */
 static uint64_t bst_arena[BST_ARENA_WORDS];
@@ -749,7 +749,7 @@ static void bst_print(uint64_t v) {
  * PCI one below 4 GiB have none. A map outside the first 1 GiB is not read.
  * The front of the run that holds them is carved off for the pool's
  * bookkeeping: two 32-bit counters a page (leases, shared references) and
- * the arena's extension of a 16th of the pool (at least 4 MiB). */
+ * the arena's extension of an eighth of the pool (at least 4 MiB). */
 extern char _end[];
 extern uint64_t bst_kernel_pml4[512];
 extern uint64_t bst_ram_limit __attribute__((weak));
@@ -807,7 +807,7 @@ static bst_pool bst_pool_init(uint64_t mbi) {
     }
     /* The bookkeeping, from the first run with room (the arena extension
      * only if there is room for it too). */
-    uint64_t counters = (pages * 8 + 4095) / 4096, ext = pages / 16, r = n;
+    uint64_t counters = (pages * 8 + 4095) / 4096, ext = pages / 8, r = n;
     if (ext < 1024) ext = pages / 8 < 1024 ? pages / 8 : 1024;   /* at least 4 MiB, at most an eighth */
     for (int tries = 0; tries < 2 && r == n; tries++) {
         if (tries) ext = 0;
