@@ -367,6 +367,27 @@ fn ix_last_line(out: &Vec[u64], pre: Str, suf: Str) -> bool {
   return true;
 }
 
+/// Is the text from `mark` to the end of `out` the same as the text of the
+/// same length just before `mark`? (The same instructions written twice in
+/// a row.)
+fn ix_repeats(out: &Vec[u64], mark: u64) -> bool {
+  let n = vec_len(out);
+  if mark > n || n - mark > mark || mark == n {
+    return false;
+  }
+  let len = n - mark;
+  let mut k = 0;
+  while k < len
+    invariant k <= len && len <= mark && mark < n && n == vlen(out)
+  {
+    if vec_get(out, mark + k) != vec_get(out, mark - len + k) {
+      return false;
+    }
+    k = k + 1;
+  }
+  return true;
+}
+
 fn ix_cmp(out: &mut Vec[u64], al: &IrAlloc, a: u64, b: u64) {
   let mut la = ix_loc(al, a);
   let lb = ix_src(&mut out, ix_loc(al, b));
@@ -1146,8 +1167,19 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
       w_s(&mut out, "\toutl %eax, %dx\n");
     }
   } else if op == IR_ZERO {
+    let mark = vec_len(out);
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RDI));
+    let moved = vec_len(out) > mark;
     w_s(&mut out, "\tmov $512, %ecx\n\txor %eax, %eax\n\trep stosq\n");
+    // (Without the move the address is in %rdi, which the first `rep stosq`
+    // advanced: that is not the same page.)
+    if !g.stage0 && moved && ix_repeats(out, mark) {
+      // The same page was zeroed by the instructions just before (a page
+      // table made from a page that was cleared already).
+      while vec_len(out) > mark {
+        vec_pop(&mut out);
+      }
+    }
   } else if op == IR_GETC {
     w_s(&mut out, "\tcall bst_rt_getc\n");
     ix_finish(&mut out, al, q.d, XR_RAX);
