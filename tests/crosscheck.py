@@ -128,19 +128,49 @@ def run(solver_cmd, cmds):
     return [l for l in p.stdout.splitlines() if ANSWER.match(l)]
 
 
+CHUNK = 300  # check-sats per piece of a long session
+LEAVES = None  # the pool that runs the pieces, set by main
+
+
+def pieces(cmds):
+    """A session cut at `(reset)`, which forgets every declaration, so the
+    pieces are independent; each holds about CHUNK queries."""
+    out, cur, n = [], [], 0
+    for c in cmds:
+        if c.startswith("(reset") and n >= CHUNK:
+            out.append(cur)
+            cur, n = [], 0
+        cur.append(c)
+        n += c.startswith("(check-sat")
+    out.append(cur)
+    return out
+
+
+def answers(cmds, tlimit):
+    z3 = run(["z3", "-smt2", "-T:600"], cmds)
+    view, skip = cvc5_view(reduce_lambdas(cmds))
+    cv = run(["cvc5", "--lang", "smt2", "--incremental", f"--tlimit-per={tlimit}"], view)
+    return z3, cv, skip
+
+
 def check(path, tlimit, cmds=None):
     cmds = cmds or session(path)
     if cmds is None:
         return None
-    z3 = run(["z3", "-smt2", "-T:600"], cmds)
-    view, skip = cvc5_view(reduce_lambdas(cmds))
-    cv = run(["cvc5", "--lang", "smt2", "--incremental", f"--tlimit-per={tlimit}"], view)
-    n = sum(1 for c in cmds if c.startswith("(check-sat"))
+    ps = pieces(cmds)
+    parts = list(LEAVES.map(lambda p: answers(p, tlimit), ps)) if LEAVES else [answers(p, tlimit) for p in ps]
+    z3, cv, skip = [], [], []
+    for (zz, cc, ss), p in zip(parts, ps):
+        k = sum(1 for c in p if c.startswith("(check-sat"))
+        z3 += (zz + ["missing"] * k)[:k]
+        cv += (cc + ["missing"] * k)[:k]
+        skip += ss
+    n = len(skip)
     agree = unchecked = 0
     bad = []
     for i in range(n):
         a = z3[i] if i < len(z3) else "missing"
-        b = cv[i] if i < len(cv) else "missing"
+        b = cv[i]
         if a != "unsat":
             bad.append((i, a, b))
         elif skip[i] or b in ("unknown", "missing"):
@@ -172,7 +202,9 @@ def main():
     files = a.files or sorted(
         os.path.join(ROOT, "tests/pass", f) for f in os.listdir(os.path.join(ROOT, "tests/pass"))
         if f.endswith(".bastio"))
-    with ThreadPoolExecutor(a.j) as ex:
+    global LEAVES
+    LEAVES = ThreadPoolExecutor(a.j)
+    with ThreadPoolExecutor(max(1, a.j // 2)) as ex:
         results = list(ex.map(lambda f: check(f, a.tlimit), files))
     tot_a = tot_u = 0
     failed = False
