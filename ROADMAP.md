@@ -12,7 +12,7 @@ Direction, decided 2026-10-09:
 
 - **Primary target:** OS kernels and drivers (BastiOS, in a separate repository once kernel work starts).
 - **Also targeted:** embedded firmware, hypervisors, and safe libraries callable from C (parsers and codecs that read untrusted input).
-- **Not targeted:** web apps, scripting, GUI applications.
+- **Not targeted yet, to be reached after the above (set 2026-10-16):** applications beyond systems programming: web services, WebAssembly, command-line tools on macOS and Windows. See "Beyond systems programming". Scripting and GUI applications stay out of scope.
 
 Design consequences:
 1. The standard library splits into `core` (no OS required) and `std` (uses OS services).
@@ -216,6 +216,17 @@ Safety must not cost speed at run time; that is the point of proving it instead 
   - [ ] BastiOS: system calls without CR3 reloads ([bastios#198](https://github.com/yukikotani231/bastios/issues/198)), disk writes and reads ([bastios#199](https://github.com/yukikotani231/bastios/issues/199)), copy-on-write fork and per-page user copies ([bastios#200](https://github.com/yukikotani231/bastios/issues/200)), TCP bulk ([bastios#201](https://github.com/yukikotani231/bastios/issues/201)), `make bench` kept per release ([bastios#202](https://github.com/yukikotani231/bastios/issues/202))
 
 **Review cadence.** Performance is reviewed at every roadmap milestone (each checked item in v2 to v4) and whenever a phase of the self-hosted compiler lands: run `bench/`, compare with the previous numbers, and note anything that got slower in the PR.
+
+## Beyond systems programming
+
+Goal, set 2026-10-16: Bastio is useful outside kernels and firmware too, wherever a program should be proved memory-safe: network services, tools that run on any desktop OS, and libraries in the browser. The systems targets above keep priority; none of this may add a runtime or a runtime check to generated code.
+- [ ] Proved libraries in the browser: build the `export fn` examples (base64, utf8, der, qoi) to WebAssembly through the C output and call them from JavaScript, checked in CI
+- [ ] A WebAssembly target for whole programs, not only exported libraries
+- [ ] The C backend on macOS, with a CI job
+- [ ] The C backend on Windows (the host calls, including `host_spawn`, on Win32)
+- [ ] Sockets in the `Host` capability, and a `std` HTTP/1.1 server and client whose parsers are proved in bounds
+- [ ] Native backend output for macOS (Mach-O) and Windows (PE), after the native backend is the default on Linux
+- [ ] Calling C libraries from Bastio (a foreign-function declaration whose assumptions are listed in the trusted base)
 
 ## Open design questions
 
