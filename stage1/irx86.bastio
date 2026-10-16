@@ -670,7 +670,8 @@ fn ix_mentions(v: &Vec[u64], pat: Str) -> bool {
 
 /// Does the code `ix_ins` writes for `q` leave %rax as it was? Only the
 /// shapes that need no scratch register: a store of a register or a small
-/// constant, and an add into another register (one `lea`).
+/// constant, a load into a register, and an add into another register (one
+/// `lea`).
 fn ix_keeps_rax(al: &IrAlloc, m: &Mono, q: IrIns) -> bool {
   if q.op == IR_STORE {
     let lv = ix_loc(al, q.d);
@@ -684,6 +685,12 @@ fn ix_keeps_rax(al: &IrAlloc, m: &Mono, q: IrIns) -> bool {
     let ld = ix_loc(al, q.d);
     let la = ix_loc(al, q.a);
     return u_at(al.cst, q.d) == 3 || (ld.k == IXK_REG && (la.k == IXK_REG || la.k == IXK_IMM));
+  }
+  if q.op == IR_LOAD {
+    // The address is built in %rsi and %rdi, and a load into a register
+    // goes straight there.
+    let ld = ix_loc(al, q.d);
+    return ld.k == IXK_REG;
   }
   let wrap = q.c == 1 && q.ty != 0 && slen(x86_normalize(m, q.ty)) > 0;
   if q.op == IR_ADD && !wrap {
