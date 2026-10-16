@@ -667,6 +667,96 @@ fn ra_overlap(sg: &IrSegs, v: u64, w: u64, touch: bool) -> bool {
   return hit;
 }
 
+// ---- Copies that may share a machine register ----
+
+/// Where each register is written: `nd[r]` writes in all (a parameter
+/// counts as one), `dpos[r]` the instruction of the last one, and for the
+/// instructions that write `r`, `wh[r]` the first of a chain through `wn`
+/// of positions in `wp`.
+struct IrDefs { nd: Vec[u64], dpos: Vec[u64], wh: Vec[u64], wn: Vec[u64], wp: Vec[u64] }
+
+fn ra_defs(f: &IrFn) -> IrDefs {
+  let nr = f.nreg;
+  let mut ds = IrDefs { nd: vec_new[u64](), dpos: vec_new[u64](), wh: vec_new[u64](), wn: vec_new[u64](), wp: vec_new[u64]() };
+  let mut r = 0;
+  while r < nr && r < 1000000000 {
+    vec_push(&mut ds.nd, 0);
+    vec_push(&mut ds.dpos, IR_NONE);
+    vec_push(&mut ds.wh, IR_NONE);
+    r = r + 1;
+  }
+  let mut j = 0;
+  while j < vec_len(f.params) {
+    let pr = vec_get(f.params, j);
+    ra_set(&mut ds.nd, pr, wrap_add(u_at(ds.nd, pr), 1));
+    j = j + 1;
+  }
+  let n = vec_len(f.ins);
+  let mut i = 0;
+  while i < n {
+    let mut ws = vec_new[u64]();
+    ra_writes(vec_get(f.ins, i), &mut ws);
+    let mut w = 0;
+    while w < vec_len(ws) {
+      let wr = vec_get(ws, w);
+      if wr < nr {
+        ra_set(&mut ds.nd, wr, wrap_add(u_at(ds.nd, wr), 1));
+        ra_set(&mut ds.dpos, wr, i);
+        let k = vec_len(ds.wp);
+        vec_push(&mut ds.wp, i);
+        vec_push(&mut ds.wn, u_at(ds.wh, wr));
+        ra_set(&mut ds.wh, wr, k);
+      }
+      w = w + 1;
+    }
+    vec_free(ws);
+    i = i + 1;
+  }
+  return ds;
+}
+
+fn ra_defs_free(ds: IrDefs) {
+  vec_free(ds.nd);
+  vec_free(ds.dpos);
+  vec_free(ds.wh);
+  vec_free(ds.wn);
+  vec_free(ds.wp);
+}
+
+/// Is `v` a copy of `u` that can stay in `u`'s machine register? `v` is
+/// written once, by `v = mov u`, and `u` is not written anywhere `v` is live,
+/// so the two hold one value for as long as `v` lives.
+fn ra_copy_ok(f: &IrFn, ds: &IrDefs, sg: &IrSegs, v: u64, u: u64) -> bool {
+  if v >= f.nreg || u >= f.nreg || v == u || u_at(ds.nd, v) != 1 {
+    return false;
+  }
+  let p0 = u_at(ds.dpos, v);
+  if p0 >= vec_len(f.ins) {
+    return false;
+  }
+  let q = vec_get(f.ins, p0);
+  if q.op != IR_MOV || q.d != v || q.a != u {
+    return false;
+  }
+  let mut k = u_at(ds.wh, u);
+  let mut steps = 0;
+  while k != IR_NONE && steps < 1000000 {
+    let p = u_at(ds.wp, k);
+    let mut sgi = u_at(sg.head, v);
+    let mut ns = 0;
+    while sgi != IR_NONE && ns < 1000000 {
+      if u_at(sg.sa, sgi) <= p && p <= u_at(sg.sb, sgi) {
+        return false;
+      }
+      sgi = u_at(sg.nxt, sgi);
+      ns = ns + 1;
+    }
+    k = u_at(ds.wn, k);
+    steps = steps + 1;
+  }
+  return true;
+}
+
 // ---- Which registers live across a call ----
 
 /// For every register, 1 when it is live just after some call instruction
@@ -852,6 +942,7 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
   let mut hv = vec_new[u64]();
   let mut hm = vec_new[u64]();
   let sg = ra_segments(f, bl, lv);
+  let ds = ra_defs(f);
   let nm = wrap_add(ncallee, ncaller);
   // For the emitter (`consts`): a register may take the machine register of
   // one whose last use is the instruction that writes it, as the emitter
@@ -883,7 +974,7 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
     // the instruction that first writes it, if that instruction does not
     // read it too.
     let mut tv = false;
-    if touch && lo > 0 && lo < n {
+    if touch && (lo > 0 || !ra_is_param(f, v)) && lo < n {
       let qt = vec_get(f.ins, lo);
       let mut wsv = vec_new[u64]();
       ra_writes(qt, &mut wsv);
@@ -914,7 +1005,7 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
     // callee-saved ones (not across a call: caller-saved only).
     let mut placed = false;
     let mut want = IR_NONE;
-    if touch && lo > 0 && lo < n {
+    if touch && (lo > 0 || !ra_is_param(f, v)) && lo < n {
       let q0 = vec_get(f.ins, lo);
       if q0.op == IR_MOV && q0.d == v && q0.a != v && q0.a < nr && u_at(iv.hi, q0.a) <= lo && u_at(al.cst, q0.a) == 0 {
         let cu = u_at(al.cls, q0.a);
@@ -923,6 +1014,23 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
           want = wrap_add(ncallee, iu);
         } else if cu == RA_CALLEE {
           want = iu;
+        }
+      }
+    }
+    // A copy of a register that stays live beside it takes its machine
+    // register too, when nothing writes that register while the copy lives.
+    let mut cpu = IR_NONE;
+    if want == IR_NONE && touch && (lo > 0 || !ra_is_param(f, v)) && lo < n {
+      let q1 = vec_get(f.ins, lo);
+      if q1.op == IR_MOV && q1.d == v && q1.a < nr && u_at(al.cst, q1.a) == 0 && ra_copy_ok(f, ds, sg, v, q1.a) {
+        let cu1 = u_at(al.cls, q1.a);
+        let iu1 = u_at(al.idx, q1.a);
+        if cu1 == RA_CALLER && !crosses {
+          want = wrap_add(ncallee, iu1);
+          cpu = q1.a;
+        } else if cu1 == RA_CALLEE {
+          want = iu1;
+          cpu = q1.a;
         }
       }
     }
@@ -945,7 +1053,7 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
           let mut clash = false;
           let mut h2 = 0;
           while h2 < vec_len(hv) && !clash {
-            if u_at(hm, h2) == m && ra_overlap(sg, v, vec_get(hv, h2), tv) {
+            if u_at(hm, h2) == m && vec_get(hv, h2) != cpu && ra_overlap(sg, v, vec_get(hv, h2), tv) {
               clash = true;
             }
             h2 = h2 + 1;
@@ -1035,6 +1143,7 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
     o = o + 1;
   }
   ra_segs_free(sg);
+  ra_defs_free(ds);
   vec_free(hv);
   vec_free(hm);
   vec_free(order);
@@ -1061,6 +1170,7 @@ fn ra_valid(f: &IrFn, a: &IrAlloc) -> bool {
   let iv = ra_intervals(f, bl, lv);
   let xmark = ra_cross(f, bl, lv);
   let sg = ra_segments(f, bl, lv);
+  let ds = ra_defs(f);
   let nr = f.nreg;
   let n = vec_len(f.ins);
   let mut ok = true;
@@ -1074,7 +1184,7 @@ fn ra_valid(f: &IrFn, a: &IrAlloc) -> bool {
       let mut y = x + 1;
       while y < nr && y < 100000 {
         if u_at(a.cls, y) == cx && u_at(a.idx, y) == u_at(a.idx, x) {
-          if ra_overlap(sg, x, y, false) {
+          if ra_overlap(sg, x, y, false) && !ra_copy_ok(f, ds, sg, x, y) && !ra_copy_ok(f, ds, sg, y, x) {
             ok = false;
           }
         }
@@ -1085,6 +1195,7 @@ fn ra_valid(f: &IrFn, a: &IrAlloc) -> bool {
   }
   vec_free(xmark);
   ra_segs_free(sg);
+  ra_defs_free(ds);
   vec_free(iv.lo);
   vec_free(iv.hi);
   vec_free(lv.inn);
