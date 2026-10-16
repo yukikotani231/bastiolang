@@ -1297,6 +1297,98 @@ fn ix_br_flags(out: &mut Vec[u64], x: u64, op: u64, then: u64, els: u64, next: u
   }
 }
 
+/// Whether the load at `i` is read only by a comparison with a constant that
+/// stands as an immediate (constants that cost nothing may stand between)
+/// and then the branch on it, or directly by the branch: the index of that
+/// comparison (`i` for the branch alone), or 0 if the load is not such.
+fn ix_load_cmp(f: &IrFn, al: &IrAlloc, nuse: &Vec[u64], i: u64) -> u64 {
+  let q = ix_at(f, i);
+  if u_at(nuse, q.d) != 1 {
+    return 0;
+  }
+  if q.c != 1 && q.c != 2 && q.c != 4 && q.c != 8 {
+    return 0;
+  }
+  let nq = ix_at(f, wrap_add(i, 1));
+  if nq.op == IR_BR && nq.a == q.d {
+    return i;
+  }
+  let mut j = wrap_add(i, 1);
+  let mut cm = nq;
+  let mut skipped = 0;
+  let mut more = true;
+  while more && skipped < 4 {
+    more = false;
+    if cm.op == IR_CONST {
+      let cl = ix_loc(al, cm.d);
+      if cl.k == IXK_IMM {
+        j = wrap_add(j, 1);
+        skipped = skipped + 1;
+        cm = ix_at(f, j);
+        more = true;
+      }
+    }
+  }
+  let br = ix_at(f, wrap_add(j, 1));
+  if !ix_is_cmp(cm.op) || cm.a != q.d || br.op != IR_BR || br.a != cm.d || u_at(nuse, cm.d) != 1 {
+    return 0;
+  }
+  let lb = ix_loc(al, cm.b);
+  if lb.k != IXK_IMM || !ix_fits(lb.imm) {
+    return 0;
+  }
+  if q.c == 8 {
+    return j;
+  }
+  // A narrow load is zero-extended: the comparison is the same in the
+  // narrow width when it is unsigned and the constant fits that width.
+  let mut lim = 256;
+  if q.c == 2 {
+    lim = 65536;
+  } else if q.c == 4 {
+    lim = 4294967296;
+  }
+  if cm.op >= IR_SLT || lb.imm >= lim {
+    return 0;
+  }
+  return j;
+}
+
+/// Whether label `t` is among the labels that stand in a row from
+/// instruction `i` on: they are all at one address, so a branch to any of
+/// them is a branch to the next instruction.
+fn ix_label_run_has(f: &IrFn, i: u64, t: u64) -> bool {
+  let mut j = i;
+  while j < wrap_add(i, 64) {
+    let q = ix_at(f, j);
+    if q.op != IR_LABEL {
+      return false;
+    }
+    if q.a == t {
+      return true;
+    }
+    j = wrap_add(j, 1);
+  }
+  return false;
+}
+
+/// The label a branch to `then` or `els` falls through to when the labels
+/// from instruction `i` on include one of them (`then` first), else the
+/// first of them, else IR_NONE.
+fn ix_pick_next(f: &IrFn, i: u64, then: u64, els: u64) -> u64 {
+  if ix_label_run_has(f, i, then) {
+    return then;
+  }
+  if ix_label_run_has(f, i, els) {
+    return els;
+  }
+  let q = ix_at(f, i);
+  if q.op == IR_LABEL {
+    return q.a;
+  }
+  return IR_NONE;
+}
+
 /// Instruction `i` of `f` (an instruction of op 0 past the end).
 fn ix_at(f: &IrFn, i: u64) -> IrIns {
   if i < vec_len(f.ins) {
@@ -1428,11 +1520,6 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
     ctx = false;
     let q = vec_get(f.ins, i);
     let nq = ix_at(f, i + 1);
-    let nq2 = ix_at(f, i + 2);
-    let mut next = IR_NONE;
-    if nq.op == IR_LABEL {
-      next = nq.a;
-    }
     if q.op == IR_LABEL {
       if u_at(heads, q.a) == 1 {
         w_s(&mut out, "\t.p2align 4\n");
@@ -1460,26 +1547,56 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       }
       let h1 = ix_at(f, lp);
       let h2 = ix_at(f, wrap_add(lp, 1));
-      if lp0 != 0 && h1.op == IR_BR && next != q.a {
+      let falls = ix_label_run_has(f, i + 1, q.a);
+      if lp0 != 0 && h1.op == IR_BR && !falls {
         ix_cmp_zero(&mut out, al, h1.a);
-        ix_br_flags(&mut out, f.x, IR_NE, h1.b, h1.c, next);
-      } else if lp0 != 0 && ix_is_cmp(h1.op) && h2.op == IR_BR && h2.a == h1.d && u_at(nuse, h1.d) == 1 && next != q.a {
+        ix_br_flags(&mut out, f.x, IR_NE, h1.b, h1.c, ix_pick_next(f, i + 1, h1.b, h1.c));
+      } else if lp0 != 0 && ix_is_cmp(h1.op) && h2.op == IR_BR && h2.a == h1.d && u_at(nuse, h1.d) == 1 && !falls {
         ix_cmp(&mut out, al, h1.a, h1.b);
-        ix_br_flags(&mut out, f.x, h1.op, h2.b, h2.c, next);
-      } else if next != q.a {
+        ix_br_flags(&mut out, f.x, h1.op, h2.b, h2.c, ix_pick_next(f, i + 1, h2.b, h2.c));
+      } else if !falls {
         ix_jump(&mut out, "jmp", f.x, q.a);
       }
     } else if q.op == IR_BR {
       ix_cmp_zero(&mut out, al, q.a);
-      ix_br_flags(&mut out, f.x, IR_NE, q.b, q.c, next);
+      ix_br_flags(&mut out, f.x, IR_NE, q.b, q.c, ix_pick_next(f, i + 1, q.b, q.c));
+    } else if q.op == IR_LOAD && ix_load_cmp(f, al, nuse, i) != 0 {
+      // A load that only a comparison with a constant (or the branch) reads:
+      // the comparison reads memory, no register is loaded.
+      let j = ix_load_cmp(f, al, nuse, i);
+      let cm = ix_at(f, j);
+      let br = ix_at(f, wrap_add(j, 1));
+      let ap = ix_aprep(&mut out, al, q.a, q.b);
+      let mut sz = 1;
+      if q.c == 8 {
+        sz = 8;
+      }
+      let mut op = IR_NE;
+      let mut imm = 0;
+      if j != i {
+        op = cm.op;
+        let lb = ix_loc(al, cm.b);
+        imm = lb.imm;
+      }
+      if q.c == 1 {
+        w_s(&mut out, "\tcmpb ");
+      } else if q.c == 2 {
+        w_s(&mut out, "\tcmpw ");
+      } else if q.c == 4 {
+        w_s(&mut out, "\tcmpl ");
+      } else {
+        w_s(&mut out, "\tcmpq ");
+      }
+      ix_w_imm(&mut out, imm);
+      w_s(&mut out, ", ");
+      ix_awrite(&mut out, ap, sz);
+      w_s(&mut out, "\n");
+      ix_br_flags(&mut out, f.x, op, br.b, br.c, ix_pick_next(f, wrap_add(j, 2), br.b, br.c));
+      i = wrap_add(j, 1);
     } else if ix_is_cmp(q.op) && nq.op == IR_BR && nq.a == q.d && u_at(nuse, q.d) == 1 {
       // A comparison that only the branch after it reads: no boolean.
-      let mut next2 = IR_NONE;
-      if nq2.op == IR_LABEL {
-        next2 = nq2.a;
-      }
       ix_cmp(&mut out, al, q.a, q.b);
-      ix_br_flags(&mut out, f.x, q.op, nq.b, nq.c, next2);
+      ix_br_flags(&mut out, f.x, q.op, nq.b, nq.c, ix_pick_next(f, i + 2, nq.b, nq.c));
       i = i + 1;
     } else if q.op == IR_RET && q.c > 0 {
       // A result of more than two words goes to the space the caller reserved.
@@ -1555,7 +1672,7 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       ix_ins(&mut out, f, al, &mut g, m, p, q, sw, live);
       ctx = ix_sets_ctx(al, q) || (live && ix_keeps_rax(al, m, q));
     }
-    i = i + 1;
+    i = wrap_add(i, 1);
   }
   vec_free(lpos);
   vec_free(heads);
