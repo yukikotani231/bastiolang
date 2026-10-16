@@ -894,6 +894,12 @@ fn ir_is_path(p: &Parser, e: u64, path: Node) -> bool {
 }
 
 /// Lowers expression `i`; returns the registers that hold its value.
+/// Whether an integer type fills the 64-bit register (no narrowing after an operation).
+fn ir_full_width(m: &Mono, t: u64) -> bool {
+  let k = kind_t(m, t);
+  return k != TY_U8 && k != TY_U16 && k != TY_U32 && k != TY_I8 && k != TY_I16 && k != TY_I32;
+}
+
 fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal {
   if f.failed {
     return ir_none();
@@ -935,7 +941,16 @@ fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     if k == E_NEG {
       op = IR_NEG;
     }
-    ir_emit(&mut f, op, d, a, 0, 0, cg_int_op(c, f.x, i));
+    let nty = cg_int_op(c, f.x, i);
+    if op == IR_NOT && nty != 0 && ir_full_width(m, nty) {
+      // `!x` on a full-width integer is `x ^ all ones`, which the constant
+      // folder and the immediate forms of the backends understand.
+      let ones = ir_reg(&mut f);
+      ir_emit(&mut f, IR_CONST, ones, 0xFFFFFFFFFFFFFFFF, 0, 0, 0);
+      ir_emit(&mut f, IR_XOR, d, a, ones, 0, 0);
+      return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+    }
+    ir_emit(&mut f, op, d, a, 0, 0, nty);
     return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
   }
   if k == E_BIN && (n.v == P_ANDAND || n.v == P_OROR) {
