@@ -2149,3 +2149,829 @@ fn iropt_dce(f: &mut IrFn) -> u64 {
   }
   return total;
 }
+
+// ---- Common subexpressions ----
+
+fn iropt_pop(v: &mut Vec[u64]) -> u64 {
+  if vec_len(v) > 0 {
+    return vec_pop(&mut v);
+  }
+  return 0;
+}
+
+fn iropt_blk(bl: &Vec[IrBlock], b: u64) -> IrBlock {
+  if b < vec_len(bl) {
+    return vec_get(bl, b);
+  }
+  return IrBlock { s: 0, e: 0, n1: 0, n2: 0 };
+}
+
+/// Is `op` commutative among the pure binary operations?
+fn iropt_commutes(op: u64) -> bool {
+  return op == IR_ADD || op == IR_MUL || op == IR_AND || op == IR_OR || op == IR_XOR || op == IR_EQ || op == IR_NE;
+}
+
+/// An operand of a key: a register that is written once stands for what it
+/// copies, and one that holds a constant for the constant itself. `kind` is
+/// 1 for a constant, 0 for a register.
+struct IrKey { v: u64, kind: u64 }
+
+fn iropt_keyed(ndef: &Vec[u64], cv: &Vec[u64], rep: &Vec[u64], r: u64) -> IrKey {
+  let mut x = r;
+  let rx = u_at(rep, x);
+  if rx != IR_NONE {
+    x = rx;
+  }
+  let k = u_at(cv, x);
+  if k != IR_NONE {
+    return IrKey { v: k, kind: 1 };
+  }
+  return IrKey { v: x, kind: 0 };
+}
+
+/// Does `op` possibly write memory, or depend on anything but registers and
+/// memory it reads? Everything not listed does.
+fn iropt_kills(op: u64) -> bool {
+  if ra_is_binary(op) {
+    return false;
+  }
+  return !(op == IR_CONST || op == IR_MOV || op == IR_NOT || op == IR_NEG || op == IR_WRAP || op == IR_LABEL || op == IR_JMP || op == IR_BR || op == IR_RET || op == IR_UNREACH || op == IR_LOAD || op == IR_SLOT || op == IR_GLOBAL || op == IR_STRLIT);
+}
+
+/// A load whose address registers and result register are written once.
+fn iropt_lelig(q: IrIns, nr: u64, ndef: &Vec[u64]) -> bool {
+  return q.op == IR_LOAD && q.d < nr && q.a < nr && q.b < nr && q.d != q.a && q.d != q.b && u_at(ndef, q.d) == 1 && u_at(ndef, q.a) == 1 && u_at(ndef, q.b) == 1;
+}
+
+fn iropt_lhash(q: IrIns, ndef: &Vec[u64], cv: &Vec[u64], rep: &Vec[u64]) -> u64 {
+  let ka = iropt_keyed(ndef, cv, rep, q.a);
+  let kb = iropt_keyed(ndef, cv, rep, q.b);
+  return wrap_add(wrap_mul(ka.v, 7919), wrap_add(wrap_mul(kb.v, 104729), wrap_add(wrap_mul(wrap_add(ka.kind, wrap_mul(2, kb.kind)), 31), wrap_add(wrap_mul(q.c, 17), wrap_mul(q.ty, 131))))) % 4096;
+}
+
+fn iropt_lsame(p: IrIns, q: IrIns, ndef: &Vec[u64], cv: &Vec[u64], rep: &Vec[u64]) -> bool {
+  if p.c != q.c || p.ty != q.ty {
+    return false;
+  }
+  let pa = iropt_keyed(ndef, cv, rep, p.a);
+  let pb = iropt_keyed(ndef, cv, rep, p.b);
+  let qa = iropt_keyed(ndef, cv, rep, q.a);
+  let qb = iropt_keyed(ndef, cv, rep, q.b);
+  return pa.v == qa.v && pa.kind == qa.kind && pb.v == qb.v && pb.kind == qb.kind;
+}
+
+fn iropt_bit(set: &Vec[u64], w: u64, id: u64) -> bool {
+  return (u_at(set, w) & (1 << (id % 64))) != 0;
+}
+
+/// Redundant loads. A load is available at a point when, on every path to
+/// it, the same load ran and no instruction that may write memory ran after
+/// it. Its result register (written once, like the address registers) still
+/// holds the value, so a second load of the same address is a copy of it.
+/// A forward dataflow over the blocks; the sets are bit sets of the loads.
+/// Returns how many loads it turned into copies.
+fn iropt_loads(f: &mut IrFn, bl: &Vec[IrBlock], nb: u64, pstart: &Vec[u64], plist: &Vec[u64], seen: &Vec[u64], rpo: &Vec[u64], ndef: &Vec[u64], cv: &Vec[u64], rep: &Vec[u64]) -> u64 {
+  let n = vec_len(f.ins);
+  let nr = f.nreg;
+  // Number the eligible loads.
+  let mut lid = vec_new[u64]();
+  let mut lins = vec_new[u64]();
+  let mut lh = vec_new[u64]();
+  let mut head = vec_new[u64]();
+  let mut lnext = vec_new[u64]();
+  let mut k = 0;
+  while k < 4096 {
+    vec_push(&mut head, IR_NONE);
+    k = wrap_add(k, 1);
+  }
+  let mut i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    if iropt_lelig(q, nr, ndef) {
+      let id = vec_len(lins);
+      let h = iropt_lhash(q, ndef, cv, rep);
+      vec_push(&mut lid, id);
+      vec_push(&mut lins, i);
+      vec_push(&mut lh, h);
+      vec_push(&mut lnext, u_at(head, h));
+      ra_set(&mut head, h, id);
+    } else {
+      vec_push(&mut lid, IR_NONE);
+    }
+    i = wrap_add(i, 1);
+  }
+  let ni = vec_len(lins);
+  let nw = wrap_add(ni / 64, 1);
+  let mut found = 0;
+  if ni > 1 && ni <= 16384 && wrap_mul(nb, nw) <= 4000000 {
+    // Per block: whether it holds a write, and the loads after its last one.
+    let tot = wrap_mul(nb, nw);
+    let mut gen = vec_new[u64]();
+    let mut inn = vec_new[u64]();
+    let mut out = vec_new[u64]();
+    let mut hk = vec_new[u64]();
+    k = 0;
+    while k < tot {
+      vec_push(&mut gen, 0);
+      vec_push(&mut inn, 0);
+      vec_push(&mut out, 18446744073709551615);
+      k = wrap_add(k, 1);
+    }
+    let mut b = 0;
+    while b < nb {
+      let blk = iropt_blk(bl, b);
+      let mut kill = 0;
+      let mut j = blk.s;
+      while j < blk.e && j < n {
+        let q = vec_get(f.ins, j);
+        if iropt_kills(q.op) {
+          kill = 1;
+          let mut w = 0;
+          while w < nw {
+            ra_set(&mut gen, wrap_add(wrap_mul(b, nw), w), 0);
+            w = wrap_add(w, 1);
+          }
+        } else if q.op == IR_LOAD {
+          let id = u_at(lid, j);
+          if id != IR_NONE {
+            let wi = wrap_add(wrap_mul(b, nw), id / 64);
+            ra_set(&mut gen, wi, u_at(gen, wi) | (1 << (id % 64)));
+          }
+        }
+        j = wrap_add(j, 1);
+      }
+      vec_push(&mut hk, kill);
+      b = wrap_add(b, 1);
+    }
+    // Iterate to a fixed point, blocks in reverse postorder.
+    let mut changed = true;
+    let mut rounds = 0;
+    while changed && rounds < 50 {
+      changed = false;
+      rounds = wrap_add(rounds, 1);
+      let mut ri = vec_len(rpo);
+      while ri > 0 {
+        ri = wrap_sub(ri, 1);
+        let bb = u_at(rpo, ri);
+        let mut w = 0;
+        while w < nw {
+          let wo = wrap_add(wrap_mul(bb, nw), w);
+          let mut acc = 18446744073709551615;
+          if bb == 0 {
+            acc = 0;
+          } else {
+            let mut pi = u_at(pstart, bb);
+            let pe = u_at(pstart, wrap_add(bb, 1));
+            while pi < pe {
+              let pp = u_at(plist, pi);
+              if u_at(seen, pp) != 0 {
+                acc = acc & u_at(out, wrap_add(wrap_mul(pp, nw), w));
+              }
+              pi = wrap_add(pi, 1);
+            }
+          }
+          ra_set(&mut inn, wo, acc);
+          let mut o = u_at(gen, wo);
+          if u_at(hk, bb) == 0 {
+            o = o | acc;
+          }
+          if o != u_at(out, wo) {
+            ra_set(&mut out, wo, o);
+            changed = true;
+          }
+          w = wrap_add(w, 1);
+        }
+      }
+    }
+    if !changed {
+      // Rewrite.
+      let mut cur = vec_new[u64]();
+      k = 0;
+      while k < nw {
+        vec_push(&mut cur, 0);
+        k = wrap_add(k, 1);
+      }
+      b = 0;
+      while b < nb {
+        if u_at(seen, b) != 0 {
+          let blk = iropt_blk(bl, b);
+          let mut w = 0;
+          while w < nw {
+            ra_set(&mut cur, w, u_at(inn, wrap_add(wrap_mul(b, nw), w)));
+            w = wrap_add(w, 1);
+          }
+          let mut j = blk.s;
+          while j < blk.e && j < n {
+            let q = vec_get(f.ins, j);
+            if iropt_kills(q.op) {
+              w = 0;
+              while w < nw {
+                ra_set(&mut cur, w, 0);
+                w = wrap_add(w, 1);
+              }
+            } else if q.op == IR_LOAD {
+              let id = u_at(lid, j);
+              if id != IR_NONE {
+                let mut e = u_at(head, u_at(lh, id));
+                let mut hit = IR_NONE;
+                let mut guard = 0;
+                while e != IR_NONE && hit == IR_NONE && guard < 100000 {
+                  if e != id && iropt_bit(cur, e / 64, e) {
+                    let p = iropt_at(f, u_at(lins, e));
+                    if iropt_lsame(p, q, ndef, cv, rep) {
+                      hit = p.d;
+                    }
+                  }
+                  e = u_at(lnext, e);
+                  guard = wrap_add(guard, 1);
+                }
+                if hit != IR_NONE {
+                  vec_set(&mut f.ins, j, IrIns { op: IR_MOV, d: q.d, a: hit, b: 0, c: 0, ty: 0 });
+                  found = wrap_add(found, 1);
+                }
+                ra_set(&mut cur, id / 64, u_at(cur, id / 64) | (1 << (id % 64)));
+              }
+            }
+            j = wrap_add(j, 1);
+          }
+        }
+        b = wrap_add(b, 1);
+      }
+      vec_free(cur);
+    }
+    vec_free(gen);
+    vec_free(inn);
+    vec_free(out);
+    vec_free(hk);
+  }
+  vec_free(lid);
+  vec_free(lins);
+  vec_free(lh);
+  vec_free(head);
+  vec_free(lnext);
+  return found;
+}
+
+/// The table of the walk: entries are expressions (op, two keyed operands, c
+/// and ty), each with the register that holds its result, or with a known
+/// value (`val` not IR_NONE). Entries with op 0 say a register is known;
+/// ops 1000 and 1001 say a register equals / differs from a constant.
+struct IrTab { op: Vec[u64], av: Vec[u64], ak: Vec[u64], bv: Vec[u64], bk: Vec[u64], cc: Vec[u64], ty: Vec[u64], res: Vec[u64], val: Vec[u64], next: Vec[u64], buck: Vec[u64], head: Vec[u64] }
+
+fn iropt_tab_new() -> IrTab {
+  let mut head = vec_new[u64]();
+  let mut k = 0;
+  while k < 16384 {
+    vec_push(&mut head, IR_NONE);
+    k = wrap_add(k, 1);
+  }
+  return IrTab { op: vec_new[u64](), av: vec_new[u64](), ak: vec_new[u64](), bv: vec_new[u64](), bk: vec_new[u64](), cc: vec_new[u64](), ty: vec_new[u64](), res: vec_new[u64](), val: vec_new[u64](), next: vec_new[u64](), buck: vec_new[u64](), head: head };
+}
+
+fn iropt_tab_free(t: IrTab) {
+  vec_free(t.op);
+  vec_free(t.av);
+  vec_free(t.ak);
+  vec_free(t.bv);
+  vec_free(t.bk);
+  vec_free(t.cc);
+  vec_free(t.ty);
+  vec_free(t.res);
+  vec_free(t.val);
+  vec_free(t.next);
+  vec_free(t.buck);
+  vec_free(t.head);
+}
+
+fn iropt_tab_hash(op: u64, av: u64, ak: u64, bv: u64, bk: u64, cc: u64, ty: u64) -> u64 {
+  if op >= 1000 || op == 0 {
+    return wrap_add(wrap_mul(op, 1000003), wrap_mul(av, 7919)) % 16384;
+  }
+  return wrap_add(wrap_mul(op, 1000003), wrap_add(wrap_mul(av, 7919), wrap_add(wrap_mul(bv, 104729), wrap_add(wrap_mul(wrap_add(ak, wrap_mul(2, bk)), 31), wrap_add(wrap_mul(cc, 17), wrap_mul(ty, 131)))))) % 16384;
+}
+
+/// The newest entry with exactly this key, or IR_NONE.
+fn iropt_tab_find(t: &IrTab, op: u64, av: u64, ak: u64, bv: u64, bk: u64, cc: u64, ty: u64) -> u64 {
+  let h = iropt_tab_hash(op, av, ak, bv, bk, cc, ty);
+  let mut e = u_at(t.head, h);
+  let mut guard = 0;
+  while e != IR_NONE && guard < 100000 {
+    if u_at(t.op, e) == op && u_at(t.av, e) == av && u_at(t.ak, e) == ak && u_at(t.bv, e) == bv && u_at(t.bk, e) == bk && u_at(t.cc, e) == cc && u_at(t.ty, e) == ty {
+      return e;
+    }
+    e = u_at(t.next, e);
+    guard = wrap_add(guard, 1);
+  }
+  return IR_NONE;
+}
+
+/// The newest entry of op `op` (1000 or 1001) for register `x`, any constant.
+fn iropt_tab_findx(t: &IrTab, op: u64, x: u64) -> u64 {
+  let h = iropt_tab_hash(op, x, 0, 0, 0, 0, 0);
+  let mut e = u_at(t.head, h);
+  let mut guard = 0;
+  while e != IR_NONE && guard < 100000 {
+    if u_at(t.op, e) == op && u_at(t.av, e) == x {
+      return e;
+    }
+    e = u_at(t.next, e);
+    guard = wrap_add(guard, 1);
+  }
+  return IR_NONE;
+}
+
+fn iropt_tab_add(t: &mut IrTab, op: u64, av: u64, ak: u64, bv: u64, bk: u64, cc: u64, ty: u64, res: u64, val: u64) {
+  let id = vec_len(t.op);
+  let h = iropt_tab_hash(op, av, ak, bv, bk, cc, ty);
+  vec_push(&mut t.op, op);
+  vec_push(&mut t.av, av);
+  vec_push(&mut t.ak, ak);
+  vec_push(&mut t.bv, bv);
+  vec_push(&mut t.bk, bk);
+  vec_push(&mut t.cc, cc);
+  vec_push(&mut t.ty, ty);
+  vec_push(&mut t.res, res);
+  vec_push(&mut t.val, val);
+  vec_push(&mut t.next, u_at(t.head, h));
+  vec_push(&mut t.buck, h);
+  ra_set(&mut t.head, h, id);
+}
+
+/// Drop the entries added since the table had `mark` of them.
+fn iropt_tab_trim(t: &mut IrTab, mark: u64) {
+  while vec_len(t.op) > mark {
+    let id = wrap_sub(vec_len(t.op), 1);
+    ra_set(&mut t.head, u_at(t.buck, id), u_at(t.next, id));
+    iropt_pop(&mut t.op);
+    iropt_pop(&mut t.av);
+    iropt_pop(&mut t.ak);
+    iropt_pop(&mut t.bv);
+    iropt_pop(&mut t.bk);
+    iropt_pop(&mut t.cc);
+    iropt_pop(&mut t.ty);
+    iropt_pop(&mut t.res);
+    iropt_pop(&mut t.val);
+    iropt_pop(&mut t.next);
+    iropt_pop(&mut t.buck);
+  }
+}
+
+fn iropt_is_cmp(op: u64) -> bool {
+  return op >= IR_EQ && op <= IR_SGE;
+}
+
+/// The comparison that is true exactly when `op` is false.
+fn iropt_cmp_neg(op: u64) -> u64 {
+  if op == IR_EQ { return IR_NE; }
+  if op == IR_NE { return IR_EQ; }
+  if op == IR_LT { return IR_GE; }
+  if op == IR_GE { return IR_LT; }
+  if op == IR_LE { return IR_GT; }
+  if op == IR_GT { return IR_LE; }
+  if op == IR_SLT { return IR_SGE; }
+  if op == IR_SGE { return IR_SLT; }
+  if op == IR_SLE { return IR_SGT; }
+  return IR_SLE;
+}
+
+/// The comparison with its operands exchanged.
+fn iropt_cmp_swap(op: u64) -> u64 {
+  if op == IR_LT { return IR_GT; }
+  if op == IR_GT { return IR_LT; }
+  if op == IR_LE { return IR_GE; }
+  if op == IR_GE { return IR_LE; }
+  if op == IR_SLT { return IR_SGT; }
+  if op == IR_SGT { return IR_SLT; }
+  if op == IR_SLE { return IR_SGE; }
+  if op == IR_SGE { return IR_SLE; }
+  return op;
+}
+
+/// Record that register `c`, a comparison written once, is `v` (0 or 1):
+/// the comparison itself and its negation and mirror images, and, for a
+/// comparison with a constant, what that says about the other operand.
+fn iropt_fact(f: &IrFn, ndef: &Vec[u64], cv: &Vec[u64], rep: &Vec[u64], defi: &Vec[u64], t: &mut IrTab, c: u64, v: u64) {
+  iropt_tab_add(&mut t, 0, c, 0, 0, 0, 0, 0, IR_NONE, v);
+  let di = u_at(defi, c);
+  if di == IR_NONE {
+    return;
+  }
+  let d = iropt_at(f, di);
+  if !iropt_is_cmp(d.op) || d.d != c || d.a >= f.nreg || d.b >= f.nreg || u_at(ndef, d.a) != 1 || u_at(ndef, d.b) != 1 {
+    return;
+  }
+  let ka = iropt_keyed(ndef, cv, rep, d.a);
+  let kb = iropt_keyed(ndef, cv, rep, d.b);
+  let nv = wrap_sub(1, v);
+  let sw = iropt_cmp_swap(d.op);
+  let ng = iropt_cmp_neg(d.op);
+  let ns = iropt_cmp_neg(sw);
+  iropt_tab_add(&mut t, d.op, ka.v, ka.kind, kb.v, kb.kind, d.c, d.ty, IR_NONE, v);
+  iropt_tab_add(&mut t, ng, ka.v, ka.kind, kb.v, kb.kind, d.c, d.ty, IR_NONE, nv);
+  iropt_tab_add(&mut t, sw, kb.v, kb.kind, ka.v, ka.kind, d.c, d.ty, IR_NONE, v);
+  iropt_tab_add(&mut t, ns, kb.v, kb.kind, ka.v, ka.kind, d.c, d.ty, IR_NONE, nv);
+  if d.op == IR_EQ || d.op == IR_NE {
+    let mut x = ka;
+    let mut k = kb;
+    if ka.kind == 1 {
+      x = kb;
+      k = ka;
+    }
+    if x.kind == 0 && k.kind == 1 {
+      let mut same = 0;
+      if d.op == IR_EQ && v == 1 {
+        same = 1;
+      }
+      if d.op == IR_NE && v == 0 {
+        same = 1;
+      }
+      if same == 1 {
+        iropt_tab_add(&mut t, 1000, x.v, 0, k.v, 1, 0, 0, IR_NONE, 1);
+      } else {
+        iropt_tab_add(&mut t, 1001, x.v, 0, k.v, 1, 0, 0, IR_NONE, 1);
+      }
+    }
+  }
+}
+
+/// What the table says the comparison `q` evaluates to: 0, 1 or IR_NONE.
+fn iropt_decide(t: &IrTab, ndef: &Vec[u64], cv: &Vec[u64], rep: &Vec[u64], q: IrIns) -> u64 {
+  let ka = iropt_keyed(ndef, cv, rep, q.a);
+  let kb = iropt_keyed(ndef, cv, rep, q.b);
+  let e = iropt_tab_find(t, q.op, ka.v, ka.kind, kb.v, kb.kind, q.c, q.ty);
+  if e != IR_NONE {
+    let v = u_at(t.val, e);
+    if v != IR_NONE {
+      return v;
+    }
+  }
+  if q.op == IR_EQ || q.op == IR_NE {
+    let mut x = ka;
+    let mut k = kb;
+    if ka.kind == 1 {
+      x = kb;
+      k = ka;
+    }
+    if x.kind == 0 && k.kind == 1 {
+      let mut eq = IR_NONE;
+      let ee = iropt_tab_findx(t, 1000, x.v);
+      if ee != IR_NONE {
+        if u_at(t.bv, ee) == k.v {
+          eq = 1;
+        } else {
+          eq = 0;
+        }
+      } else if iropt_tab_find(t, 1001, x.v, 0, k.v, 1, 0, 0) != IR_NONE {
+        eq = 0;
+      }
+      if eq != IR_NONE {
+        if q.op == IR_EQ {
+          return eq;
+        }
+        return wrap_sub(1, eq);
+      }
+    }
+  }
+  return IR_NONE;
+}
+
+/// Common subexpression elimination over the dominator tree. A binary
+/// operation whose operands are registers written once (or constants), and
+/// whose result lands in a register written once, is remembered while the
+/// walk is inside the blocks its block dominates. The same operation on the
+/// same operands there becomes a copy of the first result: the first one has
+/// run on every path to the second, and nothing can have changed the
+/// operands. `pid * 72` after `pid * 72` inlined from two table reads is the
+/// case this is for. Returns how many operations it turned into copies.
+fn iropt_cse(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  let bl = ra_blocks(f);
+  let nb = vec_len(bl);
+  let nr = f.nreg;
+  if nb < 2 || nb > 200000 || n > 4000000 {
+    vec_free(bl);
+    return 0;
+  }
+  // Predecessors, as lists in one vector: pstart[b] .. pstart[b + 1].
+  let mut pcount = vec_new[u64]();
+  let mut b = 0;
+  while b <= nb {
+    vec_push(&mut pcount, 0);
+    b = wrap_add(b, 1);
+  }
+  b = 0;
+  while b < nb {
+    let blk = iropt_blk(bl, b);
+    if blk.n1 != 0 {
+      ra_set(&mut pcount, wrap_sub(blk.n1, 1), wrap_add(u_at(pcount, wrap_sub(blk.n1, 1)), 1));
+    }
+    if blk.n2 != 0 && blk.n2 != blk.n1 {
+      ra_set(&mut pcount, wrap_sub(blk.n2, 1), wrap_add(u_at(pcount, wrap_sub(blk.n2, 1)), 1));
+    }
+    b = wrap_add(b, 1);
+  }
+  let mut pstart = vec_new[u64]();
+  let mut acc = 0;
+  b = 0;
+  while b <= nb {
+    vec_push(&mut pstart, acc);
+    acc = wrap_add(acc, u_at(pcount, b));
+    b = wrap_add(b, 1);
+  }
+  let mut pfill = vec_new[u64]();
+  let mut plist = vec_new[u64]();
+  b = 0;
+  while b < nb {
+    vec_push(&mut pfill, u_at(pstart, b));
+    b = wrap_add(b, 1);
+  }
+  let mut k = 0;
+  while k < acc && k < 400000 {
+    vec_push(&mut plist, 0);
+    k = wrap_add(k, 1);
+  }
+  b = 0;
+  while b < nb {
+    let blk = iropt_blk(bl, b);
+    if blk.n1 != 0 {
+      let t = wrap_sub(blk.n1, 1);
+      ra_set(&mut plist, u_at(pfill, t), b);
+      ra_set(&mut pfill, t, wrap_add(u_at(pfill, t), 1));
+    }
+    if blk.n2 != 0 && blk.n2 != blk.n1 {
+      let t = wrap_sub(blk.n2, 1);
+      ra_set(&mut plist, u_at(pfill, t), b);
+      ra_set(&mut pfill, t, wrap_add(u_at(pfill, t), 1));
+    }
+    b = wrap_add(b, 1);
+  }
+  // Postorder numbers by an iterative depth-first search from block 0.
+  let mut po = vec_new[u64]();
+  let mut seen = vec_new[u64]();
+  let mut cursor = vec_new[u64]();
+  b = 0;
+  while b < nb {
+    vec_push(&mut po, IR_NONE);
+    vec_push(&mut seen, 0);
+    vec_push(&mut cursor, 0);
+    b = wrap_add(b, 1);
+  }
+  let mut rpo = vec_new[u64]();
+  let mut stack = vec_new[u64]();
+  let mut npo = 0;
+  vec_push(&mut stack, 0);
+  ra_set(&mut seen, 0, 1);
+  while vec_len(stack) > 0 {
+    let top = u_at(stack, wrap_sub(vec_len(stack), 1));
+    let blk = iropt_blk(bl, top);
+    let c = u_at(cursor, top);
+    ra_set(&mut cursor, top, wrap_add(c, 1));
+    let mut nxt = 0;
+    if c == 0 {
+      nxt = blk.n1;
+    } else if c == 1 {
+      nxt = blk.n2;
+    } else {
+      ra_set(&mut po, top, npo);
+      npo = wrap_add(npo, 1);
+      vec_push(&mut rpo, top);
+      iropt_pop(&mut stack);
+    }
+    if nxt != 0 && c < 2 {
+      let t = wrap_sub(nxt, 1);
+      if u_at(seen, t) == 0 {
+        ra_set(&mut seen, t, 1);
+        vec_push(&mut stack, t);
+      }
+    }
+  }
+  let ndef = iropt_ndef(f);
+  let cv = iropt_consts(f, ndef);
+  let mut rep = vec_new[u64]();
+  let mut r = 0;
+  while r < nr && r < 1000000000 {
+    vec_push(&mut rep, IR_NONE);
+    r = wrap_add(r, 1);
+  }
+  let nload = iropt_loads(&mut f, bl, nb, pstart, plist, seen, rpo, ndef, cv, rep);
+  // Immediate dominators (Cooper, Harvey and Kennedy), blocks in reverse
+  // postorder; rpo holds the postorder, so walk it backwards.
+  let mut idom = vec_new[u64]();
+  b = 0;
+  while b < nb {
+    vec_push(&mut idom, IR_NONE);
+    b = wrap_add(b, 1);
+  }
+  ra_set(&mut idom, 0, 0);
+  let mut changed = true;
+  let mut rounds = 0;
+  while changed && rounds < 100 {
+    changed = false;
+    rounds = wrap_add(rounds, 1);
+    let mut ri = vec_len(rpo);
+    while ri > 0 {
+      ri = wrap_sub(ri, 1);
+      let bb = u_at(rpo, ri);
+      if bb != 0 {
+        let mut nd = IR_NONE;
+        let mut pi = u_at(pstart, bb);
+        let pe = u_at(pstart, wrap_add(bb, 1));
+        while pi < pe {
+          let p = u_at(plist, pi);
+          if u_at(idom, p) != IR_NONE && u_at(seen, p) != 0 {
+            if nd == IR_NONE {
+              nd = p;
+            } else {
+              let mut x = p;
+              let mut y = nd;
+              let mut guard = 0;
+              while x != y && guard < 1000000 {
+                while u_at(po, x) < u_at(po, y) && guard < 1000000 {
+                  x = u_at(idom, x);
+                  guard = wrap_add(guard, 1);
+                }
+                while u_at(po, y) < u_at(po, x) && guard < 1000000 {
+                  y = u_at(idom, y);
+                  guard = wrap_add(guard, 1);
+                }
+              }
+              nd = x;
+            }
+          }
+          pi = wrap_add(pi, 1);
+        }
+        if nd != IR_NONE && nd != u_at(idom, bb) {
+          ra_set(&mut idom, bb, nd);
+          changed = true;
+        }
+      }
+    }
+  }
+  // The dominator tree: first child and next sibling.
+  let mut child = vec_new[u64]();
+  let mut sib = vec_new[u64]();
+  b = 0;
+  while b < nb {
+    vec_push(&mut child, IR_NONE);
+    vec_push(&mut sib, IR_NONE);
+    b = wrap_add(b, 1);
+  }
+  b = nb;
+  while b > 1 {
+    b = wrap_sub(b, 1);
+    let id = u_at(idom, b);
+    if id != IR_NONE && u_at(seen, b) != 0 && id < nb {
+      ra_set(&mut sib, b, u_at(child, id));
+      ra_set(&mut child, id, b);
+    }
+  }
+  // The walk.
+  let mut defi = vec_new[u64]();
+  r = 0;
+  while r < nr && r < 1000000000 {
+    vec_push(&mut defi, IR_NONE);
+    r = wrap_add(r, 1);
+  }
+  let mut ii = 0;
+  while ii < n {
+    let q = vec_get(f.ins, ii);
+    if iropt_is_cmp(q.op) && q.d < nr && u_at(ndef, q.d) == 1 {
+      ra_set(&mut defi, q.d, ii);
+    }
+    ii = wrap_add(ii, 1);
+  }
+  let mut tab = iropt_tab_new();
+  let mut found = nload;
+  let mut work = vec_new[u64]();
+  let mut wtop = vec_new[u64]();
+  vec_push(&mut work, 0);
+  vec_push(&mut wtop, 0);
+  // Each frame: block, and (in `cursor`) the next child to visit; the first
+  // visit processes the block.
+  b = 0;
+  while b < nb {
+    ra_set(&mut cursor, b, IR_NONE);
+    b = wrap_add(b, 1);
+  }
+  let mut steps = 0;
+  while vec_len(work) > 0 && steps < 4000000 {
+    steps = wrap_add(steps, 1);
+    let top = u_at(work, wrap_sub(vec_len(work), 1));
+    if u_at(cursor, top) == IR_NONE {
+      // Enter: process the block.
+      let mut c0 = u_at(child, top);
+      if c0 == IR_NONE {
+        c0 = nb;
+      }
+      ra_set(&mut cursor, top, c0);
+      // What the edge into the block says about the branch before it, when
+      // that edge is the only way in.
+      if top != 0 {
+        let id = u_at(idom, top);
+        if id < nb && wrap_sub(u_at(pstart, wrap_add(top, 1)), u_at(pstart, top)) == 1 {
+          let pb = iropt_blk(bl, id);
+          if pb.e > 0 {
+            let last = iropt_at(f, wrap_sub(pb.e, 1));
+            if last.op == IR_BR && last.a < nr && u_at(ndef, last.a) == 1 {
+              let tn = wrap_add(top, 1);
+              if pb.n1 == tn && pb.n2 != tn {
+                iropt_fact(f, ndef, cv, rep, defi, &mut tab, last.a, 1);
+              } else if pb.n2 == tn && pb.n1 != tn {
+                iropt_fact(f, ndef, cv, rep, defi, &mut tab, last.a, 0);
+              }
+            }
+          }
+        }
+      }
+      let blk = iropt_blk(bl, top);
+      let mut i = blk.s;
+      while i < blk.e && i < n {
+        let q = vec_get(f.ins, i);
+        if q.op == IR_MOV && q.d < nr && q.a < nr && u_at(ndef, q.d) == 1 && u_at(ndef, q.a) == 1 && q.d != q.a {
+          let ra = u_at(rep, q.a);
+          if ra != IR_NONE {
+            ra_set(&mut rep, q.d, ra);
+          } else {
+            ra_set(&mut rep, q.d, q.a);
+          }
+        } else if q.op == IR_MUL && q.d < nr && q.a < nr && q.b < nr && q.d != q.a && q.d != q.b {
+          if u_at(ndef, q.a) == 1 && u_at(ndef, q.b) == 1 {
+            let mut ka = iropt_keyed(ndef, cv, rep, q.a);
+            let mut kb = iropt_keyed(ndef, cv, rep, q.b);
+            if iropt_commutes(q.op) && (kb.kind < ka.kind || (kb.kind == ka.kind && kb.v < ka.v)) {
+              let tk = ka;
+              ka = kb;
+              kb = tk;
+            }
+            let e = iropt_tab_find(tab, q.op, ka.v, ka.kind, kb.v, kb.kind, q.c, q.ty);
+            if e != IR_NONE {
+              let hit = u_at(tab.res, e);
+              vec_set(&mut f.ins, i, IrIns { op: IR_MOV, d: q.d, a: hit, b: 0, c: 0, ty: 0 });
+              found = wrap_add(found, 1);
+              if u_at(ndef, q.d) == 1 {
+                ra_set(&mut rep, q.d, hit);
+              }
+            } else if u_at(ndef, q.d) == 1 {
+              iropt_tab_add(&mut tab, q.op, ka.v, ka.kind, kb.v, kb.kind, q.c, q.ty, q.d, IR_NONE);
+            }
+          }
+        } else if iropt_is_cmp(q.op) && q.d < nr && q.a < nr && q.b < nr && q.d != q.a && q.d != q.b && u_at(ndef, q.a) == 1 && u_at(ndef, q.b) == 1 {
+          let v = iropt_decide(tab, ndef, cv, rep, q);
+          if v != IR_NONE {
+            vec_set(&mut f.ins, i, IrIns { op: IR_CONST, d: q.d, a: v, b: 0, c: 0, ty: 0 });
+            found = wrap_add(found, 1);
+          }
+        } else if q.op == IR_BR && q.a < nr && u_at(ndef, q.a) == 1 {
+          let e = iropt_tab_find(tab, 0, q.a, 0, 0, 0, 0, 0);
+          if e != IR_NONE {
+            let v = u_at(tab.val, e);
+            if v == 1 {
+              vec_set(&mut f.ins, i, IrIns { op: IR_JMP, d: q.d, a: q.b, b: 0, c: 0, ty: 0 });
+              found = wrap_add(found, 1);
+            } else if v == 0 {
+              vec_set(&mut f.ins, i, IrIns { op: IR_JMP, d: q.d, a: q.c, b: 0, c: 0, ty: 0 });
+              found = wrap_add(found, 1);
+            }
+          }
+        }
+        i = wrap_add(i, 1);
+      }
+    }
+    // Next child, or leave.
+    let cur = u_at(cursor, top);
+    if cur != IR_NONE && cur < nb {
+      let mut nx = u_at(sib, cur);
+      if nx == IR_NONE {
+        nx = nb;
+      }
+      ra_set(&mut cursor, top, nx);
+      vec_push(&mut work, cur);
+      vec_push(&mut wtop, vec_len(tab.op));
+    } else {
+      let mark = iropt_pop(&mut wtop);
+      iropt_pop(&mut work);
+      iropt_tab_trim(&mut tab, mark);
+    }
+  }
+  iropt_tab_free(tab);
+  vec_free(defi);
+  vec_free(work);
+  vec_free(wtop);
+  vec_free(rep);
+  vec_free(cv);
+  vec_free(ndef);
+  vec_free(child);
+  vec_free(sib);
+  vec_free(idom);
+  vec_free(stack);
+  vec_free(rpo);
+  vec_free(cursor);
+  vec_free(seen);
+  vec_free(po);
+  vec_free(plist);
+  vec_free(pfill);
+  vec_free(pstart);
+  vec_free(pcount);
+  vec_free(bl);
+  return found;
+}
