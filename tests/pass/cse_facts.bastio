@@ -1,0 +1,122 @@
+// expect-exit: 0
+// expect-stdout: 107
+// expect-stdout: 107
+// expect-stdout: 107
+// expect-stdout: 1008
+// expect-stdout: 117
+// expect-stdout: 1107
+// expect-stdout: 107
+// expect-stdout: 107
+// expect-stdout: 107
+// expect-stdout: 107
+// expect-stdout: 20100
+// expect-stdout: 20100
+// expect-stdout: 35
+// expect-stdout: 34
+// expect-stdout: 16
+// expect-stdout: 3457
+// expect-stdout: 3388
+// expect-stdout: 3407
+// expect-stdout: 3333
+// A load repeated with no write between is shared; one after a store, a call
+// or a join with a path that wrote is not. A comparison that a branch on the
+// way here already decided is folded, but only inside the branch's own arm.
+fn classify(x: u64) -> u64 {
+  let mut r = 0;
+  if x == 3 {
+    r = r + 1;
+  }
+  if x == 4 {
+    r = r + 10;
+  }
+  if x != 3 {
+    r = r + 100;
+  }
+  if x == 3 || x == 5 {
+    r = r + 1000;
+  }
+  if x < 10 {
+    if x < 10 {
+      r = r + 7;
+    } else {
+      r = r + 5000;
+    }
+  }
+  if x >= 10 {
+    r = r + 20000;
+  }
+  return r;
+}
+
+fn nest(x: u64, y: u64) -> u64 {
+  let mut r = 0;
+  if x == 3 {
+    if y == 3 {
+      r = r + 1;
+    }
+    if x == 3 {
+      r = r + 2;
+    }
+    if x == 4 {
+      r = r + 4000;
+    }
+  } else {
+    if x == 3 {
+      r = r + 8000;
+    }
+    if x != 3 {
+      r = r + 16;
+    }
+  }
+  if x == 3 {
+    r = r + 32;
+  }
+  return r;
+}
+
+fn loads(b: Buf, i: u64, j: u64, w: bool) -> u64
+  requires len(b) == 8 && i < 8 && j < 8
+{
+  let a = get(b, i);
+  let c = get(b, i);
+  let mut t = set(b, j, wrap_add(a, 5));
+  let d = get(t, i);
+  let mut e = 0;
+  if w {
+    t = set(t, i, 77);
+  }
+  e = get(t, i);
+  let s = wrap_add(wrap_add(wrap_mul(a, 1000), wrap_mul(c, 100)), wrap_add(wrap_mul(d, 10), e));
+  free(t);
+  return s;
+}
+
+fn fresh() -> Buf
+  ensures len(result) == 8
+{
+  let mut b = alloc(8);
+  let mut k = 0;
+  while k < 8
+    invariant k <= 8 && len(b) == 8
+  {
+    b = set(b, k, wrap_add(k, 1));
+    k = k + 1;
+  }
+  return b;
+}
+
+fn main() -> u64 {
+  let mut x = 0;
+  while x < 12 {
+    print(classify(x));
+    x = x + 1;
+  }
+  print(nest(3, 3));
+  print(nest(3, 2));
+  print(nest(5, 3));
+  print(loads(fresh(), 2, 2, true));
+  print(loads(fresh(), 2, 2, false));
+  print(loads(fresh(), 2, 5, true));
+  print(loads(fresh(), 2, 5, false));
+  return 0;
+}
