@@ -253,12 +253,12 @@ fn ix_w_addr(out: &mut Vec[u64], rb: u64, ri: u64, size: u64) {
 
 /// The address `a[b]` once its parts are in registers (`ri` is 0 for a
 /// constant index `imm`).
-struct IxA { rb: u64, ri: u64, imm: u64, sw: u64 }
+struct IxA { rb: u64, ri: u64, imm: u64, sw: u64, disp: u64 }
 
 /// Loads what the address `a[b]` needs into %rsi and %rdi when it is not in
 /// registers. The address of a frame slot (`al.cst` 2 or 3, see
 /// `ix_fold_slots`) needs no register: it is written off %rbp.
-fn ix_aprep(out: &mut Vec[u64], al: &IrAlloc, a: u64, b: u64) -> IxA {
+fn ix_aprep(out: &mut Vec[u64], al: &IrAlloc, a: u64, b: u64, disp: u64) -> IxA {
   let mut rb = XR_RBP;
   let mut sw = 0;
   if u_at(al.cst, a) >= 2 {
@@ -267,10 +267,10 @@ fn ix_aprep(out: &mut Vec[u64], al: &IrAlloc, a: u64, b: u64) -> IxA {
     rb = ix_use(&mut out, al, a, XR_RSI);
   }
   let lb = ix_loc(al, b);
-  if lb.k == IXK_IMM && lb.imm < 268435456 {
-    return IxA { rb: rb, ri: 0, imm: lb.imm, sw: sw };
+  if lb.k == IXK_IMM && wrap_add(lb.imm, disp) < 268435456 {
+    return IxA { rb: rb, ri: 0, imm: wrap_add(lb.imm, disp), sw: sw, disp: 0 };
   }
-  return IxA { rb: rb, ri: ix_use(&mut out, al, b, XR_RDI), imm: 0, sw: sw };
+  return IxA { rb: rb, ri: ix_use(&mut out, al, b, XR_RDI), imm: 0, sw: sw, disp: disp };
 }
 
 fn ix_awrite(out: &mut Vec[u64], ap: IxA, size: u64) {
@@ -282,6 +282,10 @@ fn ix_awrite(out: &mut Vec[u64], ap: IxA, size: u64) {
       w_num(&mut out, wrap_mul(ap.imm, size));
       w_s(&mut out, "(%rbp)");
     } else {
+      if ap.disp != 0 {
+        w_s(&mut out, "+");
+        w_num(&mut out, wrap_mul(ap.disp, size));
+      }
       ix_w_addr(&mut out, ap.rb, ap.ri, size);
     }
   } else if ap.ri == 0 {
@@ -290,6 +294,9 @@ fn ix_awrite(out: &mut Vec[u64], ap: IxA, size: u64) {
     w_s(&mut out, x86_rname(ap.rb));
     w_s(&mut out, ")");
   } else {
+    if ap.disp != 0 {
+      w_num(&mut out, wrap_mul(ap.disp, size));
+    }
     ix_w_addr(&mut out, ap.rb, ap.ri, size);
   }
 }
@@ -914,7 +921,7 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     ix_finish(&mut out, al, q.d, XR_RAX);
   } else if op == IR_LOAD {
     let ld = ix_loc(al, q.d);
-    let ap = ix_aprep(&mut out, al, q.a, q.b);
+    let ap = ix_aprep(&mut out, al, q.a, q.b, q.ty);
     let mut t = XR_RAX;
     if ld.k == IXK_REG {
       t = ld.reg;
@@ -943,7 +950,7 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     w_s(&mut out, "\n");
     ix_finish(&mut out, al, q.d, t);
   } else if op == IR_STORE {
-    let ap = ix_aprep(&mut out, al, q.a, q.b);
+    let ap = ix_aprep(&mut out, al, q.a, q.b, q.ty);
     let lv = ix_loc(al, q.d);
     if lv.k == IXK_IMM && ix_fits(lv.imm) {
       if q.c == 1 {
@@ -1573,7 +1580,7 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       let j = ix_load_cmp(f, al, nuse, i);
       let cm = ix_at(f, j);
       let br = ix_at(f, wrap_add(j, 1));
-      let ap = ix_aprep(&mut out, al, q.a, q.b);
+      let ap = ix_aprep(&mut out, al, q.a, q.b, q.ty);
       let mut sz = 1;
       if q.c == 8 {
         sz = 8;
@@ -1729,6 +1736,83 @@ fn ix_defines(q: IrIns) -> bool {
   let op = q.op;
   return ra_is_binary(op) || op == IR_CONST || op == IR_MOV || op == IR_NOT || op == IR_NEG || op == IR_WRAP
     || op == IR_LOAD || op == IR_ALLOC || op == IR_CALL || op == IR_RT || op == IR_GLOBAL;
+}
+
+/// A load or store whose index is `x + K` (K a constant, the sum used by
+/// nothing else) reads `x` and carries K in its `ty` field, which the
+/// backend writes as a displacement: `mov 8(%rax,%rcx,8)` for the element
+/// after `x`. The add is then dead. Only within a few instructions of the
+/// add and with no write to `x` in between, so `x` still holds the value.
+fn ix_addr_fold(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  let ndef = iropt_ndef(f);
+  let nuse = iropt_nuse(f);
+  let cv = iropt_consts(f, ndef);
+  let mut found = 0;
+  let mut i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    if q.op == IR_ADD && q.c != 1 && q.ty == 0 && q.d != IR_NONE && q.d < f.nreg && u_at(ndef, q.d) == 1 && u_at(nuse, q.d) == 1 {
+      let ka = u_at(cv, q.a);
+      let kb = u_at(cv, q.b);
+      let mut x = IR_NONE;
+      let mut k = IR_NONE;
+      if ka == IR_NONE && kb != IR_NONE {
+        x = q.a;
+        k = kb;
+      } else if ka != IR_NONE && kb == IR_NONE {
+        x = q.b;
+        k = ka;
+      }
+      if x != IR_NONE && x != q.d && k != 0 && k < 134217728 {
+        let mut j = wrap_add(i, 1);
+        let mut going = true;
+        while going && j < n && j < wrap_add(i, 8) {
+          let r = vec_get(f.ins, j);
+          let mut reads = vec_new[u64]();
+          ra_reads(f, r, &mut reads);
+          let mut uses = false;
+          let mut w = 0;
+          while w < vec_len(reads) {
+            if vec_get(reads, w) == q.d {
+              uses = true;
+            }
+            w = w + 1;
+          }
+          vec_free(reads);
+          if uses {
+            if (r.op == IR_LOAD || r.op == IR_STORE) && r.b == q.d && r.a != q.d && r.d != q.d && r.ty == 0 {
+              let mut r2 = r;
+              r2.b = x;
+              r2.ty = k;
+              vec_set(&mut f.ins, j, r2);
+              found = wrap_add(found, 1);
+            }
+            going = false;
+          } else if r.op == IR_LABEL || r.op == IR_JMP || r.op == IR_BR || r.op == IR_RET {
+            going = false;
+          } else {
+            let mut ws = vec_new[u64]();
+            ra_writes(r, &mut ws);
+            w = 0;
+            while w < vec_len(ws) {
+              if vec_get(ws, w) == x {
+                going = false;
+              }
+              w = w + 1;
+            }
+            vec_free(ws);
+            j = wrap_add(j, 1);
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  vec_free(ndef);
+  vec_free(nuse);
+  vec_free(cv);
+  return found;
 }
 
 /// `t = op ...; s = mov t`, where `t` is written and read only there,
@@ -2189,6 +2273,7 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   iropt_dead_live(&mut f);
   iropt_copies(&mut f);
   iropt_fold(&mut f);
+  ix_addr_fold(&mut f);
   iropt_dce(&mut f);
   iropt_reach(&mut f);
   iropt_labels(&mut f);

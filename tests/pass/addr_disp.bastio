@@ -1,0 +1,74 @@
+// expect-exit: 0
+// expect-stdout: 410493
+// expect-stdout: 47
+// expect-stdout: 82
+// A load or store at `x + K` is addressed off `x` with a displacement. The
+// index must still be `x + K` where the sum was made: `late` changes the
+// index before the access, and `twice` uses one sum for two accesses.
+fn walk(b: Buf, n: u64) -> u64
+  requires len(b) == 16 && n <= 12
+{
+  let mut t = b;
+  let mut i = 0;
+  while i < n
+    invariant i <= n && n <= 12 && len(t) == 16
+  {
+    t = set(t, i + 3, wrap_add(wrap_add(get(t, i), i), 1));
+    t = set(t, i + 2, wrap_add(get(t, i + 1), 7));
+    i = i + 1;
+  }
+  let mut s = 0;
+  i = 0;
+  while i < 16
+    invariant i <= 16 && len(t) == 16
+  {
+    s = wrap_add(wrap_mul(s, 31), get(t, i)) % 1000003;
+    i = i + 1;
+  }
+  free(t);
+  return s;
+}
+
+fn late(b: Buf, k: u64) -> u64
+  requires len(b) == 16 && k < 8
+{
+  let mut i = k;
+  let j = i + 4;
+  i = i + 1;
+  let v = wrap_add(get(b, j), get(b, i));
+  free(b);
+  return v;
+}
+
+fn twice(b: Buf, k: u64) -> u64
+  requires len(b) == 16 && k < 8
+{
+  let j = k + 5;
+  let a = get(b, j);
+  let c = get(b, j);
+  free(b);
+  return wrap_add(a, c);
+}
+
+fn fresh() -> Buf
+  ensures len(result) == 16
+{
+  let mut t = alloc(16);
+  let mut i = 0;
+  while i < 16
+    invariant i <= 16 && len(t) == 16
+  {
+    t = set(t, i, wrap_add(wrap_mul(i, 5), 1));
+    i = i + 1;
+  }
+  return t;
+}
+
+fn main() -> u64 {
+  let mut r = 0;
+  r = wrap_add(r, walk(fresh(), 12));
+  print(r);
+  print(late(fresh(), 2));
+  print(twice(fresh(), 3));
+  return 0;
+}
