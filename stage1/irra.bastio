@@ -635,6 +635,40 @@ fn ra_segs_free(sg: IrSegs) {
   vec_free(sg.sb);
 }
 
+/// `ra_overlap`, except that the two may meet at the single position `okp`
+/// (a copy between them: the value is read there and written there).
+fn ra_overlap_at(sg: &IrSegs, v: u64, w: u64, okp: u64) -> bool {
+  if v >= vec_len(sg.head) || w >= vec_len(sg.head) {
+    return false;
+  }
+  let mut i = u_at(sg.head, v);
+  let mut j = u_at(sg.head, w);
+  let mut hit = false;
+  let mut steps = 0;
+  while i != IR_NONE && j != IR_NONE && !hit && steps < 1000000 {
+    let a1 = u_at(sg.sa, i);
+    let b1 = u_at(sg.sb, i);
+    let a2 = u_at(sg.sa, j);
+    let b2 = u_at(sg.sb, j);
+    if a1 <= b2 && a2 <= b1 {
+      let mut lo = a1;
+      if a2 > lo { lo = a2; }
+      let mut hi = b1;
+      if b2 < hi { hi = b2; }
+      if !(lo == okp && hi == okp) {
+        hit = true;
+      }
+    }
+    if b1 < b2 {
+      i = u_at(sg.nxt, i);
+    } else {
+      j = u_at(sg.nxt, j);
+    }
+    steps = steps + 1;
+  }
+  return hit;
+}
+
 /// Do registers `v` and `w` ever live together? With `touch`, `w` may end
 /// where `v` begins (the emitter reads every operand before it writes the
 /// result).
@@ -840,10 +874,86 @@ fn ra_alloc_const(f: &IrFn, ncallee: u64, ncaller: u64) -> IrAlloc {
   return ra_alloc_with(f, ncallee, ncaller, true);
 }
 
-/// The frame slot for `x`, which stays in the frame: the slot of `u` when
-/// `x = mov u` is the last use of `u`, which `ra_alloc_with` has put in the
-/// frame, else a new one.
-fn ra_spill_slot(f: &IrFn, iv: &IrIntervals, al: &mut IrAlloc, x: u64, share: bool) -> u64 {
+/// Copies between registers: `cph[r]` heads a chain through `cpn` of the
+/// copies that read or write `r`, each with the other register in `cpr` and
+/// its instruction in `cpp`.
+struct IrCopies { cph: Vec[u64], cpn: Vec[u64], cpr: Vec[u64], cpp: Vec[u64] }
+
+fn ra_copies(f: &IrFn) -> IrCopies {
+  let mut cp = IrCopies { cph: vec_new[u64](), cpn: vec_new[u64](), cpr: vec_new[u64](), cpp: vec_new[u64]() };
+  let mut r = 0;
+  while r < f.nreg && r < 1000000000 {
+    vec_push(&mut cp.cph, IR_NONE);
+    r = r + 1;
+  }
+  let n = vec_len(f.ins);
+  let mut i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    if q.op == IR_MOV && q.a != q.d && q.a < f.nreg && q.d < f.nreg {
+      vec_push(&mut cp.cpr, q.a);
+      vec_push(&mut cp.cpp, i);
+      vec_push(&mut cp.cpn, u_at(cp.cph, q.d));
+      ra_set(&mut cp.cph, q.d, wrap_sub(vec_len(cp.cpr), 1));
+      vec_push(&mut cp.cpr, q.d);
+      vec_push(&mut cp.cpp, i);
+      vec_push(&mut cp.cpn, u_at(cp.cph, q.a));
+      ra_set(&mut cp.cph, q.a, wrap_sub(vec_len(cp.cpr), 1));
+    }
+    i = i + 1;
+  }
+  return cp;
+}
+
+fn ra_copies_free(cp: IrCopies) {
+  vec_free(cp.cph);
+  vec_free(cp.cpn);
+  vec_free(cp.cpr);
+  vec_free(cp.cpp);
+}
+
+/// Can `x` use frame slot `s`? It can when no register already there lives
+/// with it, except at the position `okp` of a copy between it and `w`.
+fn ra_slot_free(sg: &IrSegs, al: &IrAlloc, x: u64, s: u64, w: u64, okp: u64) -> bool {
+  let mut ok = true;
+  let mut m = 0;
+  while m < vec_len(al.cls) && ok {
+    if m != x && u_at(al.cls, m) == RA_SPILL && u_at(al.idx, m) == s {
+      let mut clash = false;
+      if m == w {
+        clash = ra_overlap_at(sg, x, m, okp);
+      } else {
+        clash = ra_overlap(sg, x, m, false);
+      }
+      if clash {
+        ok = false;
+      }
+    }
+    m = m + 1;
+  }
+  return ok;
+}
+
+/// The frame slot for `x`, which stays in the frame: the slot of a register
+/// `w` that has one and is copied to or from `x` when the two never live
+/// together (apart from the copy), which makes the copy a no-op; else the
+/// slot of `u` when `x = mov u` is the last use of `u`, else a new one.
+fn ra_spill_slot(f: &IrFn, iv: &IrIntervals, sg: &IrSegs, cp: &IrCopies, al: &mut IrAlloc, x: u64, share: bool) -> u64 {
+  if share && x < vec_len(cp.cph) {
+    let mut c = u_at(cp.cph, x);
+    let mut steps = 0;
+    while c != IR_NONE && steps < 64 {
+      let w = u_at(cp.cpr, c);
+      if w < vec_len(al.cls) && u_at(al.cst, w) == 0 && u_at(al.cls, w) == RA_SPILL {
+        let s = u_at(al.idx, w);
+        if ra_slot_free(sg, al, x, s, w, u_at(cp.cpp, c)) {
+          return s;
+        }
+      }
+      c = u_at(cp.cpn, c);
+      steps = steps + 1;
+    }
+  }
   let lo = u_at(iv.lo, x);
   if share && lo > 0 && lo < vec_len(f.ins) {
     let q = vec_get(f.ins, lo);
@@ -943,6 +1053,7 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
   let mut hm = vec_new[u64]();
   let sg = ra_segments(f, bl, lv);
   let ds = ra_defs(f);
+  let cp = ra_copies(f);
   let nm = wrap_add(ncallee, ncaller);
   // For the emitter (`consts`): a register may take the machine register of
   // one whose last use is the instruction that writes it, as the emitter
@@ -1113,7 +1224,7 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
         m = m + 1;
       }
       if best != IR_NONE {
-        let slot = ra_spill_slot(f, iv, &mut al, best, touch);
+        let slot = ra_spill_slot(f, iv, sg, cp, &mut al, best, touch);
         ra_set(&mut al.cls, best, RA_SPILL);
         ra_set(&mut al.idx, best, slot);
         let mut h2 = 0;
@@ -1136,7 +1247,7 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
       }
     }
     if !placed {
-      let slot = ra_spill_slot(f, iv, &mut al, v, touch);
+      let slot = ra_spill_slot(f, iv, sg, cp, &mut al, v, touch);
       ra_set(&mut al.cls, v, RA_SPILL);
       ra_set(&mut al.idx, v, slot);
     }
@@ -1144,6 +1255,7 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
   }
   ra_segs_free(sg);
   ra_defs_free(ds);
+  ra_copies_free(cp);
   vec_free(hv);
   vec_free(hm);
   vec_free(order);
