@@ -355,20 +355,42 @@ fn iropt_switch(f: &mut IrFn) -> u64 {
       let mut ks = vec_new[u64]();
       let mut ts = vec_new[u64]();
       let mut ps = vec_new[u64]();
+      // Where each test's last instruction (the `br`) is.
+      let mut es = vec_new[u64]();
       vec_push(&mut ks, t0.kv);
       vec_push(&mut ts, t0.lt);
       vec_push(&mut ps, i);
+      vec_push(&mut es, wrap_add(i, 2));
       let mut lf = t0.lf;
       let mut going = true;
       while going && vec_len(ks) < 100000 {
         let lp = u_at(lpos, lf);
         going = false;
-        if lf < vec_len(lpos) && lp != IR_NONE && u_at(refs, lf) == 1 {
-          let t = iropt_test_at(f, wrap_add(lp, 1), nuse, ndef);
-          if t.ok && t.x == t0.x && u_at(act, wrap_add(lp, 1)) == 0 {
+        if lf < vec_len(lpos) && lp != IR_NONE && lp > 0 && u_at(refs, lf) == 1 {
+          // The label is entered by the branch alone (a terminator before
+          // it), and the labels after it, up to the test, by nothing.
+          let pq = iropt_at(f, wrap_sub(lp, 1));
+          let mut tp = wrap_add(lp, 1);
+          let mut clean = pq.op == IR_BR || pq.op == IR_JMP || pq.op == IR_RET;
+          let mut more = clean;
+          while more && tp < vec_len(f.ins) {
+            let lq = iropt_at(f, tp);
+            if lq.op == IR_LABEL {
+              if u_at(refs, lq.a) != 0 {
+                clean = false;
+                more = false;
+              }
+              tp = wrap_add(tp, 1);
+            } else {
+              more = false;
+            }
+          }
+          let t = iropt_test_at(f, tp, nuse, ndef);
+          if clean && t.ok && t.x == t0.x && u_at(act, tp) == 0 {
             vec_push(&mut ks, t.kv);
             vec_push(&mut ts, t.lt);
             vec_push(&mut ps, lp);
+            vec_push(&mut es, wrap_add(tp, 2));
             lf = t.lf;
             going = true;
           }
@@ -385,10 +407,11 @@ fn iropt_switch(f: &mut IrFn) -> u64 {
             ra_set(&mut act, wrap_add(at, 1), 1);
             ra_set(&mut act, wrap_add(at, 2), 1);
           } else {
-            ra_set(&mut act, at, 1);
-            ra_set(&mut act, wrap_add(at, 1), 1);
-            ra_set(&mut act, wrap_add(at, 2), 1);
-            ra_set(&mut act, wrap_add(at, 3), 1);
+            let mut d = at;
+            while d <= u_at(es, k) {
+              ra_set(&mut act, d, 1);
+              d = wrap_add(d, 1);
+            }
           }
           k = k + 1;
         }
@@ -526,6 +549,7 @@ fn iropt_switch(f: &mut IrFn) -> u64 {
       vec_free(ks);
       vec_free(ts);
       vec_free(ps);
+      vec_free(es);
     }
     i = i + 1;
   }
