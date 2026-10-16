@@ -2149,3 +2149,391 @@ fn iropt_dce(f: &mut IrFn) -> u64 {
   }
   return total;
 }
+
+// ---- Common subexpressions ----
+
+fn iropt_pop(v: &mut Vec[u64]) -> u64 {
+  if vec_len(v) > 0 {
+    return vec_pop(&mut v);
+  }
+  return 0;
+}
+
+fn iropt_blk(bl: &Vec[IrBlock], b: u64) -> IrBlock {
+  if b < vec_len(bl) {
+    return vec_get(bl, b);
+  }
+  return IrBlock { s: 0, e: 0, n1: 0, n2: 0 };
+}
+
+/// Is `op` commutative among the pure binary operations?
+fn iropt_commutes(op: u64) -> bool {
+  return op == IR_ADD || op == IR_MUL || op == IR_AND || op == IR_OR || op == IR_XOR || op == IR_EQ || op == IR_NE;
+}
+
+/// An operand of a key: a register that is written once stands for what it
+/// copies, and one that holds a constant for the constant itself. `kind` is
+/// 1 for a constant, 0 for a register.
+struct IrKey { v: u64, kind: u64 }
+
+fn iropt_keyed(ndef: &Vec[u64], cv: &Vec[u64], rep: &Vec[u64], r: u64) -> IrKey {
+  let mut x = r;
+  let rx = u_at(rep, x);
+  if rx != IR_NONE {
+    x = rx;
+  }
+  let k = u_at(cv, x);
+  if k != IR_NONE {
+    return IrKey { v: k, kind: 1 };
+  }
+  return IrKey { v: x, kind: 0 };
+}
+
+/// Common subexpression elimination over the dominator tree. A binary
+/// operation whose operands are registers written once (or constants), and
+/// whose result lands in a register written once, is remembered while the
+/// walk is inside the blocks its block dominates. The same operation on the
+/// same operands there becomes a copy of the first result: the first one has
+/// run on every path to the second, and nothing can have changed the
+/// operands. `pid * 72` after `pid * 72` inlined from two table reads is the
+/// case this is for. Returns how many operations it turned into copies.
+fn iropt_cse(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  let bl = ra_blocks(f);
+  let nb = vec_len(bl);
+  let nr = f.nreg;
+  if nb < 2 || nb > 200000 || n > 4000000 {
+    vec_free(bl);
+    return 0;
+  }
+  // Predecessors, as lists in one vector: pstart[b] .. pstart[b + 1].
+  let mut pcount = vec_new[u64]();
+  let mut b = 0;
+  while b <= nb {
+    vec_push(&mut pcount, 0);
+    b = wrap_add(b, 1);
+  }
+  b = 0;
+  while b < nb {
+    let blk = iropt_blk(bl, b);
+    if blk.n1 != 0 {
+      ra_set(&mut pcount, wrap_sub(blk.n1, 1), wrap_add(u_at(pcount, wrap_sub(blk.n1, 1)), 1));
+    }
+    if blk.n2 != 0 && blk.n2 != blk.n1 {
+      ra_set(&mut pcount, wrap_sub(blk.n2, 1), wrap_add(u_at(pcount, wrap_sub(blk.n2, 1)), 1));
+    }
+    b = wrap_add(b, 1);
+  }
+  let mut pstart = vec_new[u64]();
+  let mut acc = 0;
+  b = 0;
+  while b <= nb {
+    vec_push(&mut pstart, acc);
+    acc = wrap_add(acc, u_at(pcount, b));
+    b = wrap_add(b, 1);
+  }
+  let mut pfill = vec_new[u64]();
+  let mut plist = vec_new[u64]();
+  b = 0;
+  while b < nb {
+    vec_push(&mut pfill, u_at(pstart, b));
+    b = wrap_add(b, 1);
+  }
+  let mut k = 0;
+  while k < acc && k < 400000 {
+    vec_push(&mut plist, 0);
+    k = wrap_add(k, 1);
+  }
+  b = 0;
+  while b < nb {
+    let blk = iropt_blk(bl, b);
+    if blk.n1 != 0 {
+      let t = wrap_sub(blk.n1, 1);
+      ra_set(&mut plist, u_at(pfill, t), b);
+      ra_set(&mut pfill, t, wrap_add(u_at(pfill, t), 1));
+    }
+    if blk.n2 != 0 && blk.n2 != blk.n1 {
+      let t = wrap_sub(blk.n2, 1);
+      ra_set(&mut plist, u_at(pfill, t), b);
+      ra_set(&mut pfill, t, wrap_add(u_at(pfill, t), 1));
+    }
+    b = wrap_add(b, 1);
+  }
+  // Postorder numbers by an iterative depth-first search from block 0.
+  let mut po = vec_new[u64]();
+  let mut seen = vec_new[u64]();
+  let mut cursor = vec_new[u64]();
+  b = 0;
+  while b < nb {
+    vec_push(&mut po, IR_NONE);
+    vec_push(&mut seen, 0);
+    vec_push(&mut cursor, 0);
+    b = wrap_add(b, 1);
+  }
+  let mut rpo = vec_new[u64]();
+  let mut stack = vec_new[u64]();
+  let mut npo = 0;
+  vec_push(&mut stack, 0);
+  ra_set(&mut seen, 0, 1);
+  while vec_len(stack) > 0 {
+    let top = u_at(stack, wrap_sub(vec_len(stack), 1));
+    let blk = iropt_blk(bl, top);
+    let c = u_at(cursor, top);
+    ra_set(&mut cursor, top, wrap_add(c, 1));
+    let mut nxt = 0;
+    if c == 0 {
+      nxt = blk.n1;
+    } else if c == 1 {
+      nxt = blk.n2;
+    } else {
+      ra_set(&mut po, top, npo);
+      npo = wrap_add(npo, 1);
+      vec_push(&mut rpo, top);
+      iropt_pop(&mut stack);
+    }
+    if nxt != 0 && c < 2 {
+      let t = wrap_sub(nxt, 1);
+      if u_at(seen, t) == 0 {
+        ra_set(&mut seen, t, 1);
+        vec_push(&mut stack, t);
+      }
+    }
+  }
+  // Immediate dominators (Cooper, Harvey and Kennedy), blocks in reverse
+  // postorder; rpo holds the postorder, so walk it backwards.
+  let mut idom = vec_new[u64]();
+  b = 0;
+  while b < nb {
+    vec_push(&mut idom, IR_NONE);
+    b = wrap_add(b, 1);
+  }
+  ra_set(&mut idom, 0, 0);
+  let mut changed = true;
+  let mut rounds = 0;
+  while changed && rounds < 100 {
+    changed = false;
+    rounds = wrap_add(rounds, 1);
+    let mut ri = vec_len(rpo);
+    while ri > 0 {
+      ri = wrap_sub(ri, 1);
+      let bb = u_at(rpo, ri);
+      if bb != 0 {
+        let mut nd = IR_NONE;
+        let mut pi = u_at(pstart, bb);
+        let pe = u_at(pstart, wrap_add(bb, 1));
+        while pi < pe {
+          let p = u_at(plist, pi);
+          if u_at(idom, p) != IR_NONE && u_at(seen, p) != 0 {
+            if nd == IR_NONE {
+              nd = p;
+            } else {
+              let mut x = p;
+              let mut y = nd;
+              let mut guard = 0;
+              while x != y && guard < 1000000 {
+                while u_at(po, x) < u_at(po, y) && guard < 1000000 {
+                  x = u_at(idom, x);
+                  guard = wrap_add(guard, 1);
+                }
+                while u_at(po, y) < u_at(po, x) && guard < 1000000 {
+                  y = u_at(idom, y);
+                  guard = wrap_add(guard, 1);
+                }
+              }
+              nd = x;
+            }
+          }
+          pi = wrap_add(pi, 1);
+        }
+        if nd != IR_NONE && nd != u_at(idom, bb) {
+          ra_set(&mut idom, bb, nd);
+          changed = true;
+        }
+      }
+    }
+  }
+  // The dominator tree: first child and next sibling.
+  let mut child = vec_new[u64]();
+  let mut sib = vec_new[u64]();
+  b = 0;
+  while b < nb {
+    vec_push(&mut child, IR_NONE);
+    vec_push(&mut sib, IR_NONE);
+    b = wrap_add(b, 1);
+  }
+  b = nb;
+  while b > 1 {
+    b = wrap_sub(b, 1);
+    let id = u_at(idom, b);
+    if id != IR_NONE && u_at(seen, b) != 0 && id < nb {
+      ra_set(&mut sib, b, u_at(child, id));
+      ra_set(&mut child, id, b);
+    }
+  }
+  // The walk.
+  let ndef = iropt_ndef(f);
+  let cv = iropt_consts(f, ndef);
+  let mut rep = vec_new[u64]();
+  let mut r = 0;
+  while r < nr && r < 1000000000 {
+    vec_push(&mut rep, IR_NONE);
+    r = wrap_add(r, 1);
+  }
+  let nbuck = 16384;
+  let mut head = vec_new[u64]();
+  k = 0;
+  while k < nbuck {
+    vec_push(&mut head, IR_NONE);
+    k = wrap_add(k, 1);
+  }
+  // Entries: op, operand a (value, kind), operand b (value, kind), c, ty,
+  // the register that holds the result, next in the bucket, the bucket.
+  let mut eop = vec_new[u64]();
+  let mut eav = vec_new[u64]();
+  let mut eak = vec_new[u64]();
+  let mut ebv = vec_new[u64]();
+  let mut ebk = vec_new[u64]();
+  let mut ecc = vec_new[u64]();
+  let mut ety = vec_new[u64]();
+  let mut eres = vec_new[u64]();
+  let mut enext = vec_new[u64]();
+  let mut ebuck = vec_new[u64]();
+  let mut found = 0;
+  let mut work = vec_new[u64]();
+  let mut wtop = vec_new[u64]();
+  vec_push(&mut work, 0);
+  vec_push(&mut wtop, 0);
+  // Each frame: block, and (in `cursor`) the next child to visit; the first
+  // visit processes the block.
+  b = 0;
+  while b < nb {
+    ra_set(&mut cursor, b, IR_NONE);
+    b = wrap_add(b, 1);
+  }
+  let mut steps = 0;
+  while vec_len(work) > 0 && steps < 4000000 {
+    steps = wrap_add(steps, 1);
+    let top = u_at(work, wrap_sub(vec_len(work), 1));
+    if u_at(cursor, top) == IR_NONE {
+      // Enter: process the block.
+      let mut c0 = u_at(child, top);
+      if c0 == IR_NONE {
+        c0 = nb;
+      }
+      ra_set(&mut cursor, top, c0);
+      let blk = iropt_blk(bl, top);
+      let mut i = blk.s;
+      while i < blk.e && i < n {
+        let q = vec_get(f.ins, i);
+        if q.op == IR_MOV && q.d < nr && q.a < nr && u_at(ndef, q.d) == 1 && u_at(ndef, q.a) == 1 && q.d != q.a {
+          let ra = u_at(rep, q.a);
+          if ra != IR_NONE {
+            ra_set(&mut rep, q.d, ra);
+          } else {
+            ra_set(&mut rep, q.d, q.a);
+          }
+        } else if q.op == IR_MUL && ra_is_binary(q.op) && q.op != IR_DIV && q.op != IR_SDIV && q.op != IR_REM && q.op != IR_SREM && q.d < nr && q.a < nr && q.b < nr && q.d != q.a && q.d != q.b {
+          if u_at(ndef, q.a) == 1 && u_at(ndef, q.b) == 1 {
+            let mut ka = iropt_keyed(ndef, cv, rep, q.a);
+            let mut kb = iropt_keyed(ndef, cv, rep, q.b);
+            if iropt_commutes(q.op) && (kb.kind < ka.kind || (kb.kind == ka.kind && kb.v < ka.v)) {
+              let tk = ka;
+              ka = kb;
+              kb = tk;
+            }
+            let h = wrap_add(wrap_mul(q.op, 1000003), wrap_add(wrap_mul(ka.v, 7919), wrap_add(wrap_mul(kb.v, 104729), wrap_add(wrap_mul(wrap_add(ka.kind, wrap_mul(2, kb.kind)), 31), wrap_add(wrap_mul(q.c, 17), wrap_mul(q.ty, 131)))))) % nbuck;
+            let mut e = u_at(head, h);
+            let mut hit = IR_NONE;
+            let mut guard = 0;
+            while e != IR_NONE && hit == IR_NONE && guard < 100000 {
+              if u_at(eop, e) == q.op && u_at(eav, e) == ka.v && u_at(eak, e) == ka.kind && u_at(ebv, e) == kb.v && u_at(ebk, e) == kb.kind && u_at(ecc, e) == q.c && u_at(ety, e) == q.ty {
+                hit = u_at(eres, e);
+              }
+              e = u_at(enext, e);
+              guard = wrap_add(guard, 1);
+            }
+            if hit != IR_NONE {
+              vec_set(&mut f.ins, i, IrIns { op: IR_MOV, d: q.d, a: hit, b: 0, c: 0, ty: 0 });
+              found = wrap_add(found, 1);
+              if u_at(ndef, q.d) == 1 {
+                ra_set(&mut rep, q.d, hit);
+              }
+            } else if u_at(ndef, q.d) == 1 {
+              let id = vec_len(eop);
+              vec_push(&mut eop, q.op);
+              vec_push(&mut eav, ka.v);
+              vec_push(&mut eak, ka.kind);
+              vec_push(&mut ebv, kb.v);
+              vec_push(&mut ebk, kb.kind);
+              vec_push(&mut ecc, q.c);
+              vec_push(&mut ety, q.ty);
+              vec_push(&mut eres, q.d);
+              vec_push(&mut enext, u_at(head, h));
+              vec_push(&mut ebuck, h);
+              ra_set(&mut head, h, id);
+            }
+          }
+        }
+        i = wrap_add(i, 1);
+      }
+    }
+    // Next child, or leave.
+    let cur = u_at(cursor, top);
+    if cur != IR_NONE && cur < nb {
+      let mut nx = u_at(sib, cur);
+      if nx == IR_NONE {
+        nx = nb;
+      }
+      ra_set(&mut cursor, top, nx);
+      vec_push(&mut work, cur);
+      vec_push(&mut wtop, vec_len(eop));
+    } else {
+      let mark = iropt_pop(&mut wtop);
+      iropt_pop(&mut work);
+      while vec_len(eop) > mark {
+        let id = wrap_sub(vec_len(eop), 1);
+        ra_set(&mut head, u_at(ebuck, id), u_at(enext, id));
+        iropt_pop(&mut eop);
+        iropt_pop(&mut eav);
+        iropt_pop(&mut eak);
+        iropt_pop(&mut ebv);
+        iropt_pop(&mut ebk);
+        iropt_pop(&mut ecc);
+        iropt_pop(&mut ety);
+        iropt_pop(&mut eres);
+        iropt_pop(&mut enext);
+        iropt_pop(&mut ebuck);
+      }
+    }
+  }
+  vec_free(eop);
+  vec_free(eav);
+  vec_free(eak);
+  vec_free(ebv);
+  vec_free(ebk);
+  vec_free(ecc);
+  vec_free(ety);
+  vec_free(eres);
+  vec_free(enext);
+  vec_free(ebuck);
+  vec_free(head);
+  vec_free(work);
+  vec_free(wtop);
+  vec_free(rep);
+  vec_free(cv);
+  vec_free(ndef);
+  vec_free(child);
+  vec_free(sib);
+  vec_free(idom);
+  vec_free(stack);
+  vec_free(rpo);
+  vec_free(cursor);
+  vec_free(seen);
+  vec_free(po);
+  vec_free(plist);
+  vec_free(pfill);
+  vec_free(pstart);
+  vec_free(pcount);
+  vec_free(bl);
+  return found;
+}
