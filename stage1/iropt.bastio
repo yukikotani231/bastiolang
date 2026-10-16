@@ -421,6 +421,34 @@ fn iropt_switch(f: &mut IrFn) -> u64 {
           }
           k = k + 1;
         }
+        // Runs of three or more consecutive constants with one target
+        // become one interval, tested as `x - lo < len`: sk[j]..sh[j].
+        let mut mk = vec_new[u64]();
+        let mut mh = vec_new[u64]();
+        let mut mt = vec_new[u64]();
+        let mut j0 = 0;
+        while j0 < vec_len(sk) {
+          let mut e = j0;
+          while wrap_add(e, 1) < vec_len(sk) && u_at(sk, wrap_add(e, 1)) == wrap_add(u_at(sk, e), 1) && u_at(st, wrap_add(e, 1)) == u_at(st, j0) {
+            e = wrap_add(e, 1);
+          }
+          if wrap_sub(e, j0) >= 2 {
+            vec_push(&mut mk, u_at(sk, j0));
+            vec_push(&mut mh, u_at(sk, e));
+            vec_push(&mut mt, u_at(st, j0));
+            j0 = wrap_add(e, 1);
+          } else {
+            vec_push(&mut mk, u_at(sk, j0));
+            vec_push(&mut mh, u_at(sk, j0));
+            vec_push(&mut mt, u_at(st, j0));
+            j0 = wrap_add(j0, 1);
+          }
+        }
+        vec_free(sk);
+        vec_free(st);
+        sk = mk;
+        st = mt;
+        let sh = mh;
         let mut code = vec_new[u64]();
         // Packed as groups of six words: op, d, a, b, c, ty.
         let mut work = vec_new[u64]();
@@ -441,7 +469,15 @@ fn iropt_switch(f: &mut IrFn) -> u64 {
               let kr = ir_reg(&mut f);
               let cr = ir_reg(&mut f);
               iropt_push6(&mut code, IR_CONST, kr, u_at(sk, j), 0, 0, 0);
-              iropt_push6(&mut code, IR_EQ, cr, t0.x, kr, 0, 0);
+              if u_at(sh, j) == u_at(sk, j) {
+                iropt_push6(&mut code, IR_EQ, cr, t0.x, kr, 0, 0);
+              } else {
+                let dr = ir_reg(&mut f);
+                let nr = ir_reg(&mut f);
+                iropt_push6(&mut code, IR_SUB, dr, t0.x, kr, 0, 0);
+                iropt_push6(&mut code, IR_CONST, nr, wrap_add(wrap_sub(u_at(sh, j), u_at(sk, j)), 1), 0, 0, 0);
+                iropt_push6(&mut code, IR_LT, cr, dr, nr, 0, 0);
+              }
               if j == hi {
                 let lnext = ir_label(&mut f);
                 iropt_push6(&mut code, IR_BR, 0, cr, u_at(st, j), lnext, 0);
@@ -485,6 +521,7 @@ fn iropt_switch(f: &mut IrFn) -> u64 {
         found = wrap_add(found, 1);
         vec_free(sk);
         vec_free(st);
+        vec_free(sh);
       }
       vec_free(ks);
       vec_free(ts);
