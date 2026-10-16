@@ -2547,17 +2547,174 @@ fn iropt_cmp_swap(op: u64) -> u64 {
   return op;
 }
 
+/// A comparison of a register with a constant, as "x op k" (op unsigned),
+/// from the keyed operands of a comparison.
+struct IrCmpX { ok: bool, x: u64, k: u64, op: u64 }
+
+fn iropt_cmpx(op: u64, ka: IrKey, kb: IrKey) -> IrCmpX {
+  if op < IR_EQ || op > IR_GE {
+    return IrCmpX { ok: false, x: 0, k: 0, op: 0 };
+  }
+  if ka.kind == 0 && kb.kind == 1 {
+    return IrCmpX { ok: true, x: ka.v, k: kb.v, op: op };
+  }
+  if ka.kind == 1 && kb.kind == 0 {
+    return IrCmpX { ok: true, x: kb.v, k: ka.v, op: iropt_cmp_swap(op) };
+  }
+  return IrCmpX { ok: false, x: 0, k: 0, op: 0 };
+}
+
+/// The tightest bound the table has for register `x`: its lowest (op 1002)
+/// or highest (op 1003) value; IR_NONE when it has none.
+fn iropt_bound(t: &IrTab, x: u64, op: u64) -> u64 {
+  let h = iropt_tab_hash(op, x, 0, 0, 0, 0, 0);
+  let mut e = u_at(t.head, h);
+  let mut best = IR_NONE;
+  let mut guard = 0;
+  while e != IR_NONE && guard < 100000 {
+    if u_at(t.op, e) == op && u_at(t.av, e) == x {
+      let v = u_at(t.bv, e);
+      if best == IR_NONE || (op == 1002 && v > best) || (op == 1003 && v < best) {
+        best = v;
+      }
+    }
+    e = u_at(t.next, e);
+    guard = wrap_add(guard, 1);
+  }
+  return best;
+}
+
+/// What "x op k = v" says about the range of x, recorded as bounds.
+fn iropt_bounds(t: &mut IrTab, c: IrCmpX, v: u64) {
+  let mut op = c.op;
+  if v == 0 {
+    op = iropt_cmp_neg(op);
+  }
+  let k = c.k;
+  if op == IR_LT && k > 0 {
+    iropt_tab_add(&mut t, 1003, c.x, 0, wrap_sub(k, 1), 1, 0, 0, IR_NONE, 1);
+  } else if op == IR_LE {
+    iropt_tab_add(&mut t, 1003, c.x, 0, k, 1, 0, 0, IR_NONE, 1);
+  } else if op == IR_GT && k < 18446744073709551615 {
+    iropt_tab_add(&mut t, 1002, c.x, 0, wrap_add(k, 1), 1, 0, 0, IR_NONE, 1);
+  } else if op == IR_GE {
+    iropt_tab_add(&mut t, 1002, c.x, 0, k, 1, 0, 0, IR_NONE, 1);
+  } else if op == IR_EQ {
+    iropt_tab_add(&mut t, 1002, c.x, 0, k, 1, 0, 0, IR_NONE, 1);
+    iropt_tab_add(&mut t, 1003, c.x, 0, k, 1, 0, 0, IR_NONE, 1);
+  }
+}
+
+/// Whether the range of c.x the table knows decides "x op k": 0, 1 or IR_NONE.
+fn iropt_by_range(t: &IrTab, c: IrCmpX) -> u64 {
+  let mut lo = iropt_bound(t, c.x, 1002);
+  let mut hi = iropt_bound(t, c.x, 1003);
+  if lo == IR_NONE {
+    lo = 0;
+  }
+  if hi == IR_NONE {
+    hi = 18446744073709551615;
+  }
+  let k = c.k;
+  let op = c.op;
+  if op == IR_LT {
+    if hi < k { return 1; }
+    if lo >= k { return 0; }
+  } else if op == IR_LE {
+    if hi <= k { return 1; }
+    if lo > k { return 0; }
+  } else if op == IR_GT {
+    if lo > k { return 1; }
+    if hi <= k { return 0; }
+  } else if op == IR_GE {
+    if lo >= k { return 1; }
+    if hi < k { return 0; }
+  } else if op == IR_EQ {
+    if lo > k || hi < k { return 0; }
+    if lo == k && hi == k { return 1; }
+  } else if op == IR_NE {
+    if lo > k || hi < k { return 1; }
+    if lo == k && hi == k { return 0; }
+  }
+  return IR_NONE;
+}
+
+
+/// Where a branch fact holds: the branch is the instruction `bri` of the
+/// block that starts at `ps`; `lo`..`hi` are the dominator-tree numbers of
+/// the blocks that learn it, and `chk` says whether a register written more
+/// than once must have no write among them.
+struct IrEdge { bri: u64, ps: u64, lo: u64, hi: u64, chk: bool }
+
+/// Does register `x` have no write in a block numbered `lo`..`hi`?
+fn iropt_nodef(dstart: &Vec[u64], dlist: &Vec[u64], x: u64, lo: u64, hi: u64) -> bool {
+  let mut p = u_at(dstart, x);
+  let e = u_at(dstart, wrap_add(x, 1));
+  while p < e {
+    let b = u_at(dlist, p);
+    if b >= lo && b <= hi {
+      return false;
+    }
+    p = wrap_add(p, 1);
+  }
+  return true;
+}
+
+/// Do the operands of comparison `d` (instruction `di`), whose result the
+/// branch `e.bri` tests, still mean the same where the fact holds? A
+/// register written once always does. One written more often must not change
+/// between the comparison and the branch (the comparison is in the branch's
+/// block), and with `e.chk` must not be written in the blocks that learn it.
+fn iropt_stable(f: &IrFn, ndef: &Vec[u64], dstart: &Vec[u64], dlist: &Vec[u64], d: IrIns, di: u64, e: IrEdge) -> bool {
+  let am = u_at(ndef, d.a) != 1;
+  let bm = u_at(ndef, d.b) != 1;
+  if !am && !bm {
+    return true;
+  }
+  if di < e.ps || di >= e.bri {
+    return false;
+  }
+  let mut ok = true;
+  let mut j = wrap_add(di, 1);
+  while j < e.bri {
+    let mut ws = vec_new[u64]();
+    ra_writes(iropt_at(f, j), &mut ws);
+    let mut k = 0;
+    while k < vec_len(ws) {
+      let w = vec_get(ws, k);
+      if (am && w == d.a) || (bm && w == d.b) {
+        ok = false;
+      }
+      k = wrap_add(k, 1);
+    }
+    vec_free(ws);
+    j = wrap_add(j, 1);
+  }
+  if e.chk {
+    if am && !iropt_nodef(dstart, dlist, d.a, e.lo, e.hi) {
+      ok = false;
+    }
+    if bm && !iropt_nodef(dstart, dlist, d.b, e.lo, e.hi) {
+      ok = false;
+    }
+  }
+  return ok;
+}
+
 /// Record that register `c`, a comparison written once, is `v` (0 or 1):
 /// the comparison itself and its negation and mirror images, and, for a
 /// comparison with a constant, what that says about the other operand.
-fn iropt_fact(f: &IrFn, ndef: &Vec[u64], cv: &Vec[u64], rep: &Vec[u64], defi: &Vec[u64], t: &mut IrTab, c: u64, v: u64) {
+fn iropt_fact(f: &IrFn, ndef: &Vec[u64], cv: &Vec[u64], rep: &Vec[u64], defi: &Vec[u64], dstart: &Vec[u64], dlist: &Vec[u64], t: &mut IrTab, c: u64, v: u64, e: IrEdge) {
   iropt_tab_add(&mut t, 0, c, 0, 0, 0, 0, 0, IR_NONE, v);
   let di = u_at(defi, c);
   if di == IR_NONE {
     return;
   }
   let d = iropt_at(f, di);
-  if !iropt_is_cmp(d.op) || d.d != c || d.a >= f.nreg || d.b >= f.nreg || u_at(ndef, d.a) != 1 || u_at(ndef, d.b) != 1 {
+  if !iropt_is_cmp(d.op) || d.d != c || d.a >= f.nreg || d.b >= f.nreg || d.a == d.d || d.b == d.d {
+    return;
+  }
+  if !iropt_stable(f, ndef, dstart, dlist, d, di, e) {
     return;
   }
   let ka = iropt_keyed(ndef, cv, rep, d.a);
@@ -2570,6 +2727,10 @@ fn iropt_fact(f: &IrFn, ndef: &Vec[u64], cv: &Vec[u64], rep: &Vec[u64], defi: &V
   iropt_tab_add(&mut t, ng, ka.v, ka.kind, kb.v, kb.kind, d.c, d.ty, IR_NONE, nv);
   iropt_tab_add(&mut t, sw, kb.v, kb.kind, ka.v, ka.kind, d.c, d.ty, IR_NONE, v);
   iropt_tab_add(&mut t, ns, kb.v, kb.kind, ka.v, ka.kind, d.c, d.ty, IR_NONE, nv);
+  let cx = iropt_cmpx(d.op, ka, kb);
+  if cx.ok {
+    iropt_bounds(&mut t, cx, v);
+  }
   if d.op == IR_EQ || d.op == IR_NE {
     let mut x = ka;
     let mut k = kb;
@@ -2631,6 +2792,72 @@ fn iropt_decide(t: &IrTab, ndef: &Vec[u64], cv: &Vec[u64], rep: &Vec[u64], q: Ir
         return wrap_sub(1, eq);
       }
     }
+  }
+  let cx = iropt_cmpx(q.op, ka, kb);
+  if cx.ok {
+    return iropt_by_range(t, cx);
+  }
+  return IR_NONE;
+}
+
+/// An edge into block `sb` (a block number plus one, as `ra_blocks` has it)
+/// that holds only a label, constants read once and a comparison with its
+/// branch. When the table (and the branch `c` = `v` the edge itself makes,
+/// unless `c` is IR_NONE) decides the comparison, the label the edge should
+/// go to instead; IR_NONE when it is not decided or `sb` has another shape.
+fn iropt_jt_edge(f: &IrFn, bl: &Vec[IrBlock], ndef: &Vec[u64], cv: &Vec[u64], rep: &Vec[u64], nuse: &Vec[u64], defi: &Vec[u64], dstart: &Vec[u64], dlist: &Vec[u64], t: &mut IrTab, sb: u64, from: u64, ps: u64, bri: u64, c: u64, v: u64) -> u64 {
+  let nr = f.nreg;
+  if sb == 0 {
+    return IR_NONE;
+  }
+  let mut s = wrap_sub(sb, 1);
+  let mut blk = iropt_blk(bl, s);
+  // Past blocks that only hold labels, or a label and a jump.
+  let mut hop = 0;
+  let mut going = true;
+  while going && hop < 8 && blk.n1 != 0 {
+    let h0 = iropt_at(f, blk.s);
+    let h1 = iropt_at(f, wrap_add(blk.s, 1));
+    if h0.op == IR_LABEL && (blk.e == wrap_add(blk.s, 1) || (blk.e == wrap_add(blk.s, 2) && h1.op == IR_JMP)) {
+      s = wrap_sub(blk.n1, 1);
+      blk = iropt_blk(bl, s);
+      hop = wrap_add(hop, 1);
+    } else {
+      going = false;
+    }
+  }
+  if s == from || blk.e < wrap_add(blk.s, 3) {
+    return IR_NONE;
+  }
+  let first = iropt_at(f, blk.s);
+  let cm = iropt_at(f, wrap_sub(blk.e, 2));
+  let br = iropt_at(f, wrap_sub(blk.e, 1));
+  if first.op != IR_LABEL || br.op != IR_BR || !iropt_is_cmp(cm.op) || cm.d != br.a {
+    return IR_NONE;
+  }
+  if cm.d >= nr || cm.a >= nr || cm.b >= nr || u_at(ndef, cm.d) != 1 || u_at(nuse, cm.d) != 1 {
+    return IR_NONE;
+  }
+  let mut p = wrap_add(blk.s, 1);
+  let stop = wrap_sub(blk.e, 2);
+  while p < stop {
+    let q = iropt_at(f, p);
+    if q.op != IR_CONST || q.d >= nr || u_at(ndef, q.d) != 1 || u_at(nuse, q.d) != 1 {
+      return IR_NONE;
+    }
+    p = wrap_add(p, 1);
+  }
+  let mark = vec_len(t.op);
+  if c != IR_NONE {
+    iropt_fact(f, ndef, cv, rep, defi, dstart, dlist, &mut t, c, v, IrEdge { bri: bri, ps: ps, lo: 1, hi: 0, chk: false });
+  }
+  let r = iropt_decide(t, ndef, cv, rep, cm);
+  iropt_tab_trim(&mut t, mark);
+  if r == 1 {
+    return br.b;
+  }
+  if r == 0 {
+    return br.c;
   }
   return IR_NONE;
 }
@@ -2825,6 +3052,108 @@ fn iropt_cse(f: &mut IrFn) -> u64 {
       ra_set(&mut child, id, b);
     }
   }
+  // Preorder numbers of the dominator tree; a block's subtree is the numbers
+  // from its own for `size` of them.
+  let mut pre = vec_new[u64]();
+  let mut size = vec_new[u64]();
+  b = 0;
+  while b < nb {
+    vec_push(&mut pre, IR_NONE);
+    vec_push(&mut size, 1);
+    b = wrap_add(b, 1);
+  }
+  let mut ord = vec_new[u64]();
+  let mut st2 = vec_new[u64]();
+  vec_push(&mut st2, 0);
+  while vec_len(st2) > 0 {
+    let bb = iropt_pop(&mut st2);
+    if bb < nb && u_at(pre, bb) == IR_NONE {
+      ra_set(&mut pre, bb, vec_len(ord));
+      vec_push(&mut ord, bb);
+      let mut ch = u_at(child, bb);
+      while ch != IR_NONE && ch < nb {
+        vec_push(&mut st2, ch);
+        ch = u_at(sib, ch);
+      }
+    }
+  }
+  let mut oi = vec_len(ord);
+  while oi > 1 {
+    oi = wrap_sub(oi, 1);
+    let bb = u_at(ord, oi);
+    let id = u_at(idom, bb);
+    if id < nb {
+      ra_set(&mut size, id, wrap_add(u_at(size, id), u_at(size, bb)));
+    }
+  }
+  // The blocks (by number) that write each register written more than once.
+  let mut dstart = vec_new[u64]();
+  let mut dfill = vec_new[u64]();
+  r = 0;
+  while r <= nr && r < 1000000000 {
+    vec_push(&mut dstart, 0);
+    vec_push(&mut dfill, 0);
+    r = wrap_add(r, 1);
+  }
+  b = 0;
+  while b < nb {
+    if u_at(pre, b) != IR_NONE {
+      let blk = iropt_blk(bl, b);
+      let mut j = blk.s;
+      while j < blk.e && j < n {
+        let mut ws = vec_new[u64]();
+        ra_writes(vec_get(f.ins, j), &mut ws);
+        let mut k2 = 0;
+        while k2 < vec_len(ws) {
+          let w = vec_get(ws, k2);
+          if w < nr && u_at(ndef, w) > 1 {
+            ra_set(&mut dstart, wrap_add(w, 1), wrap_add(u_at(dstart, wrap_add(w, 1)), 1));
+          }
+          k2 = wrap_add(k2, 1);
+        }
+        vec_free(ws);
+        j = wrap_add(j, 1);
+      }
+    }
+    b = wrap_add(b, 1);
+  }
+  r = 0;
+  let mut dtot = 0;
+  while r < nr && r < 1000000000 {
+    dtot = wrap_add(dtot, u_at(dstart, wrap_add(r, 1)));
+    ra_set(&mut dstart, wrap_add(r, 1), dtot);
+    ra_set(&mut dfill, r, u_at(dstart, r));
+    r = wrap_add(r, 1);
+  }
+  let mut dlist = vec_new[u64]();
+  k = 0;
+  while k < dtot && k < 8000000 {
+    vec_push(&mut dlist, IR_NONE);
+    k = wrap_add(k, 1);
+  }
+  b = 0;
+  while b < nb {
+    if u_at(pre, b) != IR_NONE {
+      let blk = iropt_blk(bl, b);
+      let mut j = blk.s;
+      while j < blk.e && j < n {
+        let mut ws = vec_new[u64]();
+        ra_writes(vec_get(f.ins, j), &mut ws);
+        let mut k2 = 0;
+        while k2 < vec_len(ws) {
+          let w = vec_get(ws, k2);
+          if w < nr && u_at(ndef, w) > 1 {
+            ra_set(&mut dlist, u_at(dfill, w), u_at(pre, b));
+            ra_set(&mut dfill, w, wrap_add(u_at(dfill, w), 1));
+          }
+          k2 = wrap_add(k2, 1);
+        }
+        vec_free(ws);
+        j = wrap_add(j, 1);
+      }
+    }
+    b = wrap_add(b, 1);
+  }
   // The walk.
   let mut defi = vec_new[u64]();
   r = 0;
@@ -2840,6 +3169,7 @@ fn iropt_cse(f: &mut IrFn) -> u64 {
     }
     ii = wrap_add(ii, 1);
   }
+  let nuse = iropt_nuse(f);
   let mut tab = iropt_tab_new();
   let mut found = nload;
   let mut work = vec_new[u64]();
@@ -2874,10 +3204,13 @@ fn iropt_cse(f: &mut IrFn) -> u64 {
             let last = iropt_at(f, wrap_sub(pb.e, 1));
             if last.op == IR_BR && last.a < nr && u_at(ndef, last.a) == 1 {
               let tn = wrap_add(top, 1);
+              let lo = u_at(pre, top);
+              let hi = wrap_sub(wrap_add(lo, u_at(size, top)), 1);
+              let ed = IrEdge { bri: wrap_sub(pb.e, 1), ps: pb.s, lo: lo, hi: hi, chk: true };
               if pb.n1 == tn && pb.n2 != tn {
-                iropt_fact(f, ndef, cv, rep, defi, &mut tab, last.a, 1);
+                iropt_fact(f, ndef, cv, rep, defi, dstart, dlist, &mut tab, last.a, 1, ed);
               } else if pb.n2 == tn && pb.n1 != tn {
-                iropt_fact(f, ndef, cv, rep, defi, &mut tab, last.a, 0);
+                iropt_fact(f, ndef, cv, rep, defi, dstart, dlist, &mut tab, last.a, 0, ed);
               }
             }
           }
@@ -2915,7 +3248,7 @@ fn iropt_cse(f: &mut IrFn) -> u64 {
               iropt_tab_add(&mut tab, q.op, ka.v, ka.kind, kb.v, kb.kind, q.c, q.ty, q.d, IR_NONE);
             }
           }
-        } else if iropt_is_cmp(q.op) && q.d < nr && q.a < nr && q.b < nr && q.d != q.a && q.d != q.b && u_at(ndef, q.a) == 1 && u_at(ndef, q.b) == 1 {
+        } else if iropt_is_cmp(q.op) && q.d < nr && q.a < nr && q.b < nr && q.d != q.a && q.d != q.b {
           let v = iropt_decide(tab, ndef, cv, rep, q);
           if v != IR_NONE {
             vec_set(&mut f.ins, i, IrIns { op: IR_CONST, d: q.d, a: v, b: 0, c: 0, ty: 0 });
@@ -2936,6 +3269,33 @@ fn iropt_cse(f: &mut IrFn) -> u64 {
         }
         i = wrap_add(i, 1);
       }
+      // Edges out of the block into a test the block has decided.
+      if blk.e > blk.s && blk.e <= n {
+        let li = wrap_sub(blk.e, 1);
+        let last = vec_get(f.ins, li);
+        if last.op == IR_JMP {
+          let nl = iropt_jt_edge(f, bl, ndef, cv, rep, nuse, defi, dstart, dlist, &mut tab, blk.n1, top, blk.s, li, IR_NONE, 0);
+          if nl != IR_NONE && nl != last.a {
+            vec_set(&mut f.ins, li, IrIns { op: IR_JMP, d: last.d, a: nl, b: 0, c: 0, ty: 0 });
+            found = wrap_add(found, 1);
+          }
+        } else if last.op == IR_BR && last.b != last.c && last.a < nr && u_at(ndef, last.a) == 1 {
+          let nt = iropt_jt_edge(f, bl, ndef, cv, rep, nuse, defi, dstart, dlist, &mut tab, blk.n1, top, blk.s, li, last.a, 1);
+          let nf = iropt_jt_edge(f, bl, ndef, cv, rep, nuse, defi, dstart, dlist, &mut tab, blk.n2, top, blk.s, li, last.a, 0);
+          let mut tl = last.b;
+          let mut fl = last.c;
+          if nt != IR_NONE {
+            tl = nt;
+          }
+          if nf != IR_NONE {
+            fl = nf;
+          }
+          if tl != last.b || fl != last.c {
+            vec_set(&mut f.ins, li, IrIns { op: IR_BR, d: last.d, a: last.a, b: tl, c: fl, ty: last.ty });
+            found = wrap_add(found, 1);
+          }
+        }
+      }
     }
     // Next child, or leave.
     let cur = u_at(cursor, top);
@@ -2955,6 +3315,14 @@ fn iropt_cse(f: &mut IrFn) -> u64 {
   }
   iropt_tab_free(tab);
   vec_free(defi);
+  vec_free(nuse);
+  vec_free(pre);
+  vec_free(size);
+  vec_free(ord);
+  vec_free(st2);
+  vec_free(dstart);
+  vec_free(dfill);
+  vec_free(dlist);
   vec_free(work);
   vec_free(wtop);
   vec_free(rep);
