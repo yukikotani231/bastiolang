@@ -499,6 +499,14 @@ const PRELUDE_PAGES: &str = r#"
 #define BST_PTE_P 1ull
 #define BST_PTE_W 2ull
 #define BST_PTE_U 4ull
+/* A page the program may write is never one it may run (W^X): the entry
+ * has the no-execute bit when it is made writable (pt_put_frame and
+ * pt_put_shared with w), and has not when made read-only, so a page is
+ * executable if it was mapped read-only (program text) or if the kernel
+ * made it so by mapping it again read-only. pt_set_access leaves the bit
+ * alone: a page that becomes writable for a copy-on-write fault keeps what
+ * its mapping chose. Needs EFER.NXE (boot.S). */
+#define BST_PTE_NX (1ull << 63)
 #define BST_PTE_ADDR 0x000FFFFFFFFFF000ull
 static inline void bst_zero_page(uint64_t a) {
 #if defined(__x86_64__)
@@ -567,7 +575,7 @@ static inline void bst_pt_put(bst_pt *t, uint64_t i, bst_pt c) {
     __atomic_store_n(&((uint64_t *)*t)[i], c | BST_PTE_P | BST_PTE_W | BST_PTE_U, __ATOMIC_RELEASE);
 }
 static inline void bst_pt_put_frame(bst_pt *t, uint64_t i, bst_frame f, bool w) {
-    __atomic_store_n(&((uint64_t *)*t)[i], f | BST_PTE_P | BST_PTE_U | (w ? BST_PTE_W : 0), __ATOMIC_RELEASE);
+    __atomic_store_n(&((uint64_t *)*t)[i], f | BST_PTE_P | BST_PTE_U | (w ? BST_PTE_W | BST_PTE_NX : 0), __ATOMIC_RELEASE);
 }
 /* What slot i points to, left in place (pt_borrow). */
 static inline uint64_t bst_pt_child(bst_pt t, uint64_t i) { return ((uint64_t *)t)[i] & BST_PTE_ADDR; }
@@ -608,7 +616,7 @@ static inline uint64_t bst_shared_drop(bst_pool *p, bst_frame s) {
 static inline uint64_t bst_shared_id(bst_frame s) { return bst_frame_id(s); }
 static inline bool bst_pt_shared(bst_pt t, uint64_t i) { return (((uint64_t *)t)[i] & BST_PTE_SHARED) != 0; }
 static inline void bst_pt_put_shared(bst_pt *t, uint64_t i, bst_frame s, bool w) {
-    __atomic_store_n(&((uint64_t *)*t)[i], s | BST_PTE_P | BST_PTE_U | BST_PTE_SHARED | (w ? BST_PTE_W : 0), __ATOMIC_RELEASE);
+    __atomic_store_n(&((uint64_t *)*t)[i], s | BST_PTE_P | BST_PTE_U | BST_PTE_SHARED | (w ? BST_PTE_W | BST_PTE_NX : 0), __ATOMIC_RELEASE);
 }
 #define bst_pt_take_shared bst_pt_take
 static inline bst_frame bst_pt_dup_shared(bst_pt t, uint64_t i) { return bst_shared_dup(((uint64_t *)t)[i] & BST_PTE_ADDR); }
@@ -663,7 +671,7 @@ static void bst_puthex(uint64_t v) {
 }
 
 /* Memory for Buf: a fixed arena with an exact-size free list, then the
- * extension bst_pool_init carves from RAM (a 16th of the pool, at least 4 MiB), so
+ * extension bst_pool_init carves from RAM (an eighth of the pool, at least 4 MiB), so
  * the kernel's own tables can grow with the machine. */
 #define BST_ARENA_WORDS (1u << 20)   /* 8 MiB */
 static uint64_t bst_arena[BST_ARENA_WORDS];
@@ -749,7 +757,7 @@ static void bst_print(uint64_t v) {
  * PCI one below 4 GiB have none. A map outside the first 1 GiB is not read.
  * The front of the run that holds them is carved off for the pool's
  * bookkeeping: two 32-bit counters a page (leases, shared references) and
- * the arena's extension of a 16th of the pool (at least 4 MiB). */
+ * the arena's extension of an eighth of the pool (at least 4 MiB). */
 extern char _end[];
 extern uint64_t bst_kernel_pml4[512];
 extern uint64_t bst_ram_limit __attribute__((weak));
@@ -807,7 +815,7 @@ static bst_pool bst_pool_init(uint64_t mbi) {
     }
     /* The bookkeeping, from the first run with room (the arena extension
      * only if there is room for it too). */
-    uint64_t counters = (pages * 8 + 4095) / 4096, ext = pages / 16, r = n;
+    uint64_t counters = (pages * 8 + 4095) / 4096, ext = pages / 8, r = n;
     if (ext < 1024) ext = pages / 8 < 1024 ? pages / 8 : 1024;   /* at least 4 MiB, at most an eighth */
     for (int tries = 0; tries < 2 && r == n; tries++) {
         if (tries) ext = 0;
