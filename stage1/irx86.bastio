@@ -103,6 +103,10 @@ fn ix_op(out: &mut Vec[u64], l: IxL) {
     w_s(&mut out, x86_rname(l.reg));
   } else if l.k == IXK_IMM {
     ix_w_imm(&mut out, l.imm);
+  } else if l.off >= 9223372036854775808 {
+    // Above the frame pointer: an argument's own stack word.
+    w_num(&mut out, wrap_mul(8, wrap_sub(0, l.off)));
+    w_s(&mut out, "(%fp)");
   } else {
     vec_push(&mut out, 45);
     w_num(&mut out, wrap_mul(8, l.off));
@@ -2638,11 +2642,16 @@ fn irx_function_n(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, nc
     ix_ins2(&mut inner, "mov", ix_rl(ix_callee(k)), ix_ml(wrap_add(k, 1)));
     k = k + 1;
   }
-  // The parameters, from their argument registers or stack words.
+  // The parameters, from their argument registers or stack words. A
+  // parameter the allocator left in the frame stays in the stack word it
+  // came in (the callee owns its arguments).
   k = 0;
   while k < vec_len(f.params) {
     let r = vec_get(f.params, k);
-    if u_at(al.cls, r) != RA_NONE && u_at(nuse, r) != 0 {
+    if na == 0 && u_at(al.cls, r) == RA_SPILL && u_at(al.cst, r) == 0 && u_at(nuse, r) != 0 {
+      let home = wrap_add(2, u_at(pos, k));
+      ra_set(&mut al.idx, r, wrap_sub(0, wrap_add(wrap_add(al.ncallee_used, 1), home)));
+    } else if u_at(al.cls, r) != RA_NONE && u_at(nuse, r) != 0 {
       let dst = ix_loc(al, r);
       let ps = u_at(pos, k);
       if na > 0 {
