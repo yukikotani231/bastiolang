@@ -554,11 +554,14 @@ fn ix_call_ok(f: &IrFn, g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, q: I
 
 /// A call: the arguments in registers (up to four words) or pushed on the
 /// stack, as `x86_call_to` does it, then the result from %rax and %rdx.
-fn ix_call(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, q: IrIns, slotw: u64) {
+fn ix_call(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, q: IrIns, slotw: u64, inplace: bool) {
   let pos = ix_positions(&mut g, c, &mut m, p, q.a);
   let total = vec_len(pos);
   let na = x86_regargs(&mut g, c, &mut m, p, q.a);
-  if q.op == IR_CALLM {
+  // With the result area at the bottom of the frame, the callee writes the
+  // result straight into the slot: it is just above the arguments.
+  let direct = q.op == IR_CALLM && inplace;
+  if q.op == IR_CALLM && !direct {
     // The space for the result, above the arguments (`x86_call_to`).
     w_s(&mut out, "\tsub $");
     w_num(&mut out, wrap_mul(8, q.ty));
@@ -598,7 +601,7 @@ fn ix_call(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
     // The result words go to the frame slot, whose lowest word is `slotw`
     // words below %rbp; the slot's address is the value of the call.
     let mut j = 0;
-    while j < q.ty && j < 4096 {
+    while j < q.ty && j < 4096 && !direct {
       w_s(&mut out, "\tmov ");
       w_num(&mut out, wrap_mul(8, j));
       w_s(&mut out, "(%rsp), %rax\n\tmov %rax, -");
@@ -606,9 +609,12 @@ fn ix_call(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       w_s(&mut out, "(%fp)\n");
       j = j + 1;
     }
-    w_s(&mut out, "\tadd $");
-    w_num(&mut out, wrap_mul(8, q.ty));
-    w_s(&mut out, ", %rsp\n\tlea -");
+    if !direct {
+      w_s(&mut out, "\tadd $");
+      w_num(&mut out, wrap_mul(8, q.ty));
+      w_s(&mut out, ", %rsp\n");
+    }
+    w_s(&mut out, "\tlea -");
     w_num(&mut out, wrap_mul(8, slotw));
     w_s(&mut out, "(%fp), %rax\n");
     ix_finish(&mut out, al, q.d, XR_RAX);
@@ -1110,8 +1116,20 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     ix_cmp(&mut out, al, q.a, q.b);
     w_s(&mut out, "\tset");
     w_s(&mut out, ix_cc(op));
-    w_s(&mut out, " %al\n\tmovzbl %al, %eax\n");
-    ix_finish(&mut out, al, q.d, XR_RAX);
+    let ld = ix_loc(al, q.d);
+    if ld.k == IXK_REG {
+      // The flag goes straight into the result's register.
+      w_s(&mut out, " ");
+      w_s(&mut out, ix_name8(ld.reg));
+      w_s(&mut out, "\n\tmovzbl ");
+      w_s(&mut out, ix_name8(ld.reg));
+      w_s(&mut out, ", ");
+      w_s(&mut out, ix_name32(ld.reg));
+      w_s(&mut out, "\n");
+    } else {
+      w_s(&mut out, " %al\n\tmovzbl %al, %eax\n");
+      ix_finish(&mut out, al, q.d, XR_RAX);
+    }
   } else if op == IR_CONST {
     if u_at(al.cst, q.d) == 0 {
       ix_mov(&mut out, ix_il(q.a), ix_loc(al, q.d));
@@ -1601,10 +1619,17 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     // The address of the slot whose lowest word is `slotw` words below %rbp;
     // nothing to write when every use of it is written off %rbp.
     if u_at(al.cst, q.d) != 3 {
+      let ld = ix_loc(al, q.d);
       w_s(&mut out, "\tlea -");
       w_num(&mut out, wrap_mul(8, slotw));
-      w_s(&mut out, "(%fp), %rax\n");
-      ix_finish(&mut out, al, q.d, XR_RAX);
+      if ld.k == IXK_REG {
+        w_s(&mut out, "(%fp), ");
+        w_s(&mut out, x86_rname(ld.reg));
+        w_s(&mut out, "\n");
+      } else {
+        w_s(&mut out, "(%fp), %rax\n");
+        ix_finish(&mut out, al, q.d, XR_RAX);
+      }
     }
   }
 }
@@ -1781,7 +1806,7 @@ fn ix_smp(out: &mut Vec[u64], g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser
 }
 
 /// The body of the function: its instructions.
-fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, nuse: &Vec[u64], moff: &Vec[u64], base: u64, rswap: bool, retoff: u64) {
+fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, nuse: &Vec[u64], moff: &Vec[u64], base: u64, words: u64, rswap: bool, retoff: u64) {
   let n = vec_len(f.ins);
   // The position after each label (0: no such label).
   let mut lpos = vec_new[u64]();
@@ -1993,7 +2018,7 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       if q.op == IR_CALLM {
         sw = wrap_add(base, wrap_add(u_at(moff, i), q.ty));
       }
-      ix_call(&mut out, f, al, &mut g, c, &mut m, p, q, sw);
+      ix_call(&mut out, f, al, &mut g, c, &mut m, p, q, sw, sw == words);
     } else if q.op == IR_PCALL && q.c == 13 {
       ix_smp(&mut out, &mut g, c, &mut m, p, al, q);
     } else {
@@ -2502,6 +2527,35 @@ fn ix_share_slots(f: &mut IrFn, moff: &mut Vec[u64]) -> u64 {
     }
     k = k + 1;
   }
+  // A result area moves to the bottom of the frame when nothing live at the
+  // same time is there: the call then returns into the slot itself.
+  k = 0;
+  while k < ns {
+    let pos = u_at(spos, k);
+    let mut is_callm = false;
+    if pos < vec_len(f.ins) {
+      let cq = vec_get(f.ins, pos);
+      is_callm = cq.op == IR_CALLM;
+    }
+    if is_callm && u_at(size, k) <= area {
+      let cand = wrap_sub(area, u_at(size, k));
+      let mut fits = true;
+      let mut t = 0;
+      while t < ns {
+        if t != k && u_at(lo, k) <= u_at(hi, t) && u_at(lo, t) <= u_at(hi, k) {
+          if cand < wrap_add(u_at(off, t), u_at(size, t)) {
+            fits = false;
+          }
+        }
+        t = t + 1;
+      }
+      if fits {
+        ra_set(&mut off, k, cand);
+        ra_set(&mut moff, pos, cand);
+      }
+    }
+    k = k + 1;
+  }
   vec_free(ndefs);
   vec_free(off);
   vec_free(size);
@@ -2748,12 +2802,14 @@ fn irx_function_n(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, nc
     k = k + 1;
   }
   let slots = ix_share_slots(&mut f, &mut moff);
-  let base = wrap_add(al.ncallee_used, al.nspill);
-  ix_fold_slots(f, &mut al, base);
-  let mut words = wrap_add(base, slots);
-  if words % 2 == 1 {
-    words = wrap_add(words, 1);
+  let mut base = wrap_add(al.ncallee_used, al.nspill);
+  // The padding word that keeps the frame even sits above the slots, so a
+  // result area at the bottom of the slots is at %rsp.
+  if wrap_add(base, slots) % 2 == 1 {
+    base = wrap_add(base, 1);
   }
+  ix_fold_slots(f, &mut al, base);
+  let words = wrap_add(base, slots);
   let mut out = vec_new[u64]();
   w_s(&mut out, "\t.type ");
   ix_sym(&mut out, &mut g, m, p, x);
@@ -2802,7 +2858,7 @@ fn irx_function_n(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, nc
   if na == 0 {
     retoff = wrap_add(16, wrap_mul(8, vec_len(pos)));
   }
-  ix_body(&mut inner, f, al, &mut g, c, &mut m, p, nuse, moff, base, ix_buffer(c, m, p, rt), retoff);
+  ix_body(&mut inner, f, al, &mut g, c, &mut m, p, nuse, moff, base, words, ix_buffer(c, m, p, rt), retoff);
   ix_lbl(&mut inner, x, IR_NONE);
   w_s(&mut inner, ":\n");
   k = 0;

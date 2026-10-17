@@ -1,0 +1,37 @@
+// expect-exit: 0
+// A call that returns a struct of more than two words writes it into the
+// caller's frame slot, with the arguments in registers or on the stack and
+// with other slots live across the call.
+struct Q { a: u64, b: u64, c: u64, d: u64 }
+
+fn mkq(x: u64) -> Q
+  requires x < 1000
+{
+  return Q { a: x, b: x + 1, c: x + 2, d: x + 3 };
+}
+
+fn mkq6(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) -> Q
+  requires a < 1000 && b < 1000 && c < 1000 && d < 1000 && e < 1000 && f < 1000
+{
+  return Q { a: a + f, b: b + e, c: c + d, d: a + b + c };
+}
+
+fn sum(q: Q) -> u64 {
+  return wrap_add(wrap_add(q.a, q.b), wrap_add(q.c, q.d));
+}
+
+fn drive(k: u64) -> u64
+  requires k < 100
+{
+  let p = mkq(k);
+  let r = mkq6(k, 1, 2, 3, 4, 5);
+  let q = mkq(sum(p) % 1000);
+  return wrap_add(wrap_add(sum(p), sum(r)), wrap_add(sum(q), q.d));
+}
+
+fn main() -> u64 {
+  // p = 10 +1.. : 10,11,12,13 = 46; r = 15, 5, 5, 13 = 38;
+  // q = mkq(46): 46,47,48,49 = 190; q.d = 49.
+  if drive(10) == 46 + 38 + 190 + 49 { return 0; }
+  return 1;
+}
