@@ -9,7 +9,9 @@
 // (docs: `x86_regargs`, `x86_regret`), so the two kinds of function call
 // each other. Hosted target only.
 //
-// Registers. The allocator is given the five callee-saved registers and
+// Registers. The allocator is given the six callee-saved registers (%rbp
+// among them: the frame is addressed from %rsp, see `ix_fpo`, and the
+// function is written again with five when that cannot be done) and
 // four of the caller-saved ones (%r8-%r11); the emitter keeps %rax, %rcx,
 // %rdx, %rsi and %rdi to itself, so no value shares a register with an
 // argument of a call. Spilled values and the slots of `IR_SLOT` live in the
@@ -58,7 +60,8 @@ fn ix_callee(i: u64) -> u64 {
   if i == 1 { return XR_R12; }
   if i == 2 { return XR_R13; }
   if i == 3 { return XR_R14; }
-  return XR_R15;
+  if i == 4 { return XR_R15; }
+  return XR_RBP;
 }
 
 fn ix_caller(i: u64) -> u64 {
@@ -103,7 +106,7 @@ fn ix_op(out: &mut Vec[u64], l: IxL) {
   } else {
     vec_push(&mut out, 45);
     w_num(&mut out, wrap_mul(8, l.off));
-    w_s(&mut out, "(%rbp)");
+    w_s(&mut out, "(%fp)");
   }
 }
 
@@ -202,6 +205,7 @@ fn ix_name32(r: u64) -> Str {
   if r == XR_R8 { return "%r8d"; }
   if r == XR_R9 { return "%r9d"; }
   if r == XR_R10 { return "%r10d"; }
+  if r == XR_RBP { return "%ebp"; }
   return "%r11d";
 }
 
@@ -219,6 +223,7 @@ fn ix_name16(r: u64) -> Str {
   if r == XR_R8 { return "%r8w"; }
   if r == XR_R9 { return "%r9w"; }
   if r == XR_R10 { return "%r10w"; }
+  if r == XR_RBP { return "%bp"; }
   return "%r11w";
 }
 
@@ -236,6 +241,7 @@ fn ix_name8(r: u64) -> Str {
   if r == XR_R8 { return "%r8b"; }
   if r == XR_R9 { return "%r9b"; }
   if r == XR_R10 { return "%r10b"; }
+  if r == XR_RBP { return "%bpl"; }
   return "%r11b";
 }
 
@@ -275,18 +281,27 @@ fn ix_aprep(out: &mut Vec[u64], al: &IrAlloc, a: u64, b: u64, disp: u64) -> IxA 
 
 fn ix_awrite(out: &mut Vec[u64], ap: IxA, size: u64) {
   if ap.sw != 0 {
-    w_s(&mut out, "-");
-    w_num(&mut out, wrap_mul(8, ap.sw));
-    if ap.ri == 0 {
-      w_s(&mut out, "+");
-      w_num(&mut out, wrap_mul(ap.imm, size));
-      w_s(&mut out, "(%rbp)");
+    // A frame slot: one signed displacement off the frame register.
+    let mut up = wrap_mul(ap.imm, size);
+    if ap.ri != 0 {
+      up = wrap_mul(ap.disp, size);
+    }
+    let down = wrap_mul(8, ap.sw);
+    if up >= down {
+      w_num(&mut out, wrap_sub(up, down));
     } else {
-      if ap.disp != 0 {
-        w_s(&mut out, "+");
-        w_num(&mut out, wrap_mul(ap.disp, size));
+      w_s(&mut out, "-");
+      w_num(&mut out, wrap_sub(down, up));
+    }
+    if ap.ri == 0 {
+      w_s(&mut out, "(%fp)");
+    } else {
+      w_s(&mut out, "(%fp,");
+      w_s(&mut out, x86_rname(ap.ri));
+      if size == 8 {
+        w_s(&mut out, ",8");
       }
-      ix_w_addr(&mut out, ap.rb, ap.ri, size);
+      w_s(&mut out, ")");
     }
   } else if ap.ri == 0 {
     w_num(&mut out, wrap_mul(ap.imm, size));
@@ -584,14 +599,14 @@ fn ix_call(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       w_num(&mut out, wrap_mul(8, j));
       w_s(&mut out, "(%rsp), %rax\n\tmov %rax, -");
       w_num(&mut out, wrap_sub(wrap_mul(8, slotw), wrap_mul(8, j)));
-      w_s(&mut out, "(%rbp)\n");
+      w_s(&mut out, "(%fp)\n");
       j = j + 1;
     }
     w_s(&mut out, "\tadd $");
     w_num(&mut out, wrap_mul(8, q.ty));
     w_s(&mut out, ", %rsp\n\tlea -");
     w_num(&mut out, wrap_mul(8, slotw));
-    w_s(&mut out, "(%rbp), %rax\n");
+    w_s(&mut out, "(%fp), %rax\n");
     ix_finish(&mut out, al, q.d, XR_RAX);
     return;
   }
@@ -666,6 +681,174 @@ fn ix_mentions(v: &Vec[u64], pat: Str) -> bool {
     i = i + 1;
   }
   return false;
+}
+
+/// Whether the text `v` has `pat` at position `i`.
+fn ix_has_at(v: &Vec[u64], i: u64, pat: Str) -> bool {
+  let m = slen(pat);
+  let mut j = 0;
+  while j < m && i < 1000000000 && j < 100 && i + j < vec_len(v) && vec_get(v, i + j) == cast[u64](sget(pat, j)) {
+    j = j + 1;
+  }
+  return j == m;
+}
+
+/// The end of the decimal number at `i` in `v`, and the number in `ix_fpo_val`.
+fn ix_digits_end(v: &Vec[u64], i: u64) -> u64 {
+  let mut k = i;
+  while k < vec_len(v) && vec_get(v, k) >= 48 && vec_get(v, k) <= 57 && i < 1000000000 && k < i + 12 {
+    k = k + 1;
+  }
+  return k;
+}
+
+fn ix_digits_val(v: &Vec[u64], i: u64, e: u64) -> u64 {
+  let mut x = 0;
+  let mut k = i;
+  while k < e && i < 1000000000 && k < i + 12 && x < 1000000000000 {
+    x = wrap_add(wrap_mul(x, 10), wrap_sub(u_at(v, k), 48));
+    k = k + 1;
+  }
+  return x;
+}
+
+/// `inner` with the frame register `%fp` written as %rbp.
+fn ix_fp_classic(inner: &Vec[u64]) -> Vec[u64] {
+  let n = vec_len(inner);
+  let mut out = vec_new[u64]();
+  let mut c = 0;
+  while c < n {
+    if ix_has_at(inner, c, "%fp") {
+      w_s(&mut out, "%rbp");
+      c = wrap_add(c, 3);
+    } else {
+      vec_push(&mut out, u_at(inner, c));
+      c = c + 1;
+    }
+  }
+  return out;
+}
+
+/// The text of a function body (`inner`) written for a frame of `fsz` bytes
+/// of locals below a frame pointer, rewritten to address the frame from
+/// %rsp instead: `N(%rbp)` becomes `N+fsz+depth(%rsp)`, where `depth` is
+/// what the body has pushed so far, and `leave` becomes the `add` that drops
+/// the frame. The caller opens the frame with `sub $fsz+8, %rsp` (the extra
+/// word stands where the saved %rbp was, so %rsp is aligned as it was).
+/// Empty when the body does anything this does not follow: a use of %rbp
+/// other than a plain memory operand, a change of %rsp other than push, pop,
+/// and `sub`/`add` of a constant, or a label, jump or return with something
+/// pushed.
+fn ix_fpo(inner: &Vec[u64], fsz: u64) -> Vec[u64] {
+  let n = vec_len(inner);
+  let mut out = vec_new[u64]();
+  let mut d = 0;
+  let mut ok = true;
+  let mut s = 0;
+  while s < n && ok {
+    let mut e = s;
+    while e < n && u_at(inner, e) != 10 {
+      e = wrap_add(e, 1);
+    }
+    if u_at(inner, s) != 9 {
+      if d != 0 {
+        ok = false;
+      }
+      let mut c = s;
+      while c < e {
+        vec_push(&mut out, u_at(inner, c));
+        c = wrap_add(c, 1);
+      }
+    } else if ix_has_at(inner, wrap_add(s, 1), "leave") {
+      if d != 0 {
+        ok = false;
+      }
+      w_s(&mut out, "\tadd $");
+      w_num(&mut out, wrap_add(fsz, 8));
+      w_s(&mut out, ", %rsp");
+    } else {
+      let a = wrap_add(s, 1);
+      let isrsp = e >= 6 && ix_has_at(inner, wrap_sub(e, 6), ", %rsp");
+      let isadd = isrsp && ix_has_at(inner, a, "add $");
+      let issub = isrsp && ix_has_at(inner, a, "sub $");
+      let ispush = ix_has_at(inner, a, "push ");
+      let ispop = ix_has_at(inner, a, "pop ");
+      if ix_has_at(inner, a, "j") || ix_has_at(inner, a, "ret") {
+        if d != 0 {
+          ok = false;
+        }
+      }
+      if !isadd && !issub && e >= 4 && ix_has_at(inner, wrap_sub(e, 4), "%rsp") {
+        ok = false;
+      }
+      // The line, with each `N(%rbp)` made `N'(%rsp)`.
+      let mut c = s;
+      let mut found = 0;
+      while c < e && ok {
+        if ix_has_at(inner, c, "%fp") {
+          found = wrap_add(found, 1);
+        }
+        let neg = u_at(inner, c) == 45;
+        let mut b = c;
+        if neg {
+          b = wrap_add(c, 1);
+        }
+        let de = ix_digits_end(inner, b);
+        let prevd = c > s && u_at(inner, wrap_sub(c, 1)) >= 48 && u_at(inner, wrap_sub(c, 1)) <= 57;
+        let fpend = ix_has_at(inner, de, "(%fp)") || ix_has_at(inner, de, "(%fp,");
+        if !prevd && fpend && (de > b || (!neg && de == c)) {
+          let x = ix_digits_val(inner, b, de);
+          let mut v = 0;
+          if neg {
+            if x > wrap_add(fsz, d) {
+              ok = false;
+            } else {
+              v = wrap_sub(wrap_add(fsz, d), x);
+            }
+          } else {
+            v = wrap_add(wrap_add(x, fsz), d);
+          }
+          w_num(&mut out, v);
+          w_s(&mut out, "(%rsp");
+          c = wrap_add(de, 4);
+        } else {
+          vec_push(&mut out, u_at(inner, c));
+          c = wrap_add(c, 1);
+        }
+      }
+      if found != 0 {
+        ok = false;
+      }
+      if ispush {
+        d = wrap_add(d, 8);
+      } else if ispop {
+        if d < 8 || ix_has_at(inner, wrap_add(a, 4), "(") || ix_digits_end(inner, wrap_add(a, 4)) != wrap_add(a, 4) {
+          ok = false;
+        } else {
+          d = wrap_sub(d, 8);
+        }
+      } else if isadd || issub {
+        let de = ix_digits_end(inner, wrap_add(a, 5));
+        let x = ix_digits_val(inner, wrap_add(a, 5), de);
+        if issub {
+          d = wrap_add(d, x);
+        } else if x > d {
+          ok = false;
+        } else {
+          d = wrap_sub(d, x);
+        }
+      }
+    }
+    if s < n {
+      vec_push(&mut out, 10);
+    }
+    s = wrap_add(e, 1);
+  }
+  if !ok {
+    vec_free(out);
+    return vec_new[u64]();
+  }
+  return out;
 }
 
 /// Does the code `ix_ins` writes for `q` leave %rax as it was? Only the
@@ -1292,7 +1475,7 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     if u_at(al.cst, q.d) != 3 {
       w_s(&mut out, "\tlea -");
       w_num(&mut out, wrap_mul(8, slotw));
-      w_s(&mut out, "(%rbp), %rax\n");
+      w_s(&mut out, "(%fp), %rax\n");
       ix_finish(&mut out, al, q.d, XR_RAX);
     }
   }
@@ -1650,7 +1833,7 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
           w_s(&mut out, "), %rax\n\tmov %rax, ");
         }
         w_num(&mut out, wrap_add(retoff, wrap_mul(8, j)));
-        w_s(&mut out, "(%rbp)\n");
+        w_s(&mut out, "(%fp)\n");
         j = j + 1;
       }
       if i + 1 < n {
@@ -2345,14 +2528,14 @@ fn ix_fold_slots(f: &IrFn, al: &mut IrAlloc, base: u64) {
 
 /// Writes function instance `x` from its IR, to `g.out`. False (nothing
 /// written) when the IR does not cover it or the convention does not match.
-fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> bool {
+fn irx_function_n(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, ncallee: u64) -> u64 {
   if g.stage0 {
-    return false;
+    return 0;
   }
   let mut f = ir_lower(c, &mut m, p, x);
   if f.failed || vec_len(f.ins) > IX_MAX_INS {
     ir_free(f);
-    return false;
+    return 0;
   }
   iropt_inline(&mut f, c, &mut m, p);
   iropt_slots(&mut f);
@@ -2419,14 +2602,14 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   if !ok {
     vec_free(pos);
     ir_free(f);
-    return false;
+    return 0;
   }
   let na = x86_regargs(&mut g, c, &mut m, p, x);
-  let mut al = ra_alloc_const(f, 5, 4);
+  let mut al = ra_alloc_const(f, ncallee, 4);
   // A register kept in the frame is copied to a register around a loop that uses it.
   if ra_split_loops(&mut f, al, 6) > 0 {
     ra_free(al);
-    al = ra_alloc_const(f, 5, 4);
+    al = ra_alloc_const(f, ncallee, 4);
   }
   let nuse = ix_uses(f);
   // The frame: saved registers, spills, slots.
@@ -2471,7 +2654,7 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
         }
         w_s(&mut inner, "\tmov ");
         w_num(&mut inner, wrap_add(16, wrap_mul(8, ps)));
-        w_s(&mut inner, "(%rbp), ");
+        w_s(&mut inner, "(%fp), ");
         w_s(&mut inner, x86_rname(t));
         w_s(&mut inner, "\n");
         if dst.k != IXK_REG {
@@ -2496,7 +2679,7 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   }
   // A function with no frame, no calls and no use of the frame pointer
   // needs none of it: no push, no leave.
-  let bare = words == 0 && !ix_mentions(inner, "%rbp") && !ix_mentions(inner, "%rsp") && !ix_mentions(inner, "call");
+  let bare = words == 0 && !ix_mentions(inner, "%fp") && !ix_mentions(inner, "%rsp") && !ix_mentions(inner, "call");
   if bare {
     w_s(&mut inner, "\tret\n\t.size ");
   } else {
@@ -2506,21 +2689,57 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   w_s(&mut inner, ", .-");
   ix_sym(&mut inner, &mut g, m, p, x);
   w_s(&mut inner, "\n\n");
+  let mut framed = inner;
   if !bare {
-    w_s(&mut out, "\tpush %rbp\n\tmov %rsp, %rbp\n\tsub $");
-    w_num(&mut out, wrap_mul(8, words));
-    w_s(&mut out, ", %rsp\n");
+    // The frame is addressed from %rsp when the body allows it.
+    let fp = ix_fpo(framed, wrap_mul(8, words));
+    if vec_len(fp) > 0 {
+      w_s(&mut out, "\tsub $");
+      w_num(&mut out, wrap_add(wrap_mul(8, words), 8));
+      w_s(&mut out, ", %rsp\n");
+      vec_free(framed);
+      framed = fp;
+    } else {
+      vec_free(fp);
+      if al.ncallee_used > 5 {
+        // %rbp holds a value: there is no frame pointer to fall back to.
+        vec_free(framed);
+        vec_free(out);
+        vec_free(nuse);
+        vec_free(moff);
+        vec_free(pos);
+        ra_free(al);
+        ir_free(f);
+        return 2;
+      }
+      let cl = ix_fp_classic(framed);
+      vec_free(framed);
+      framed = cl;
+      w_s(&mut out, "\tpush %rbp\n\tmov %rsp, %rbp\n\tsub $");
+      w_num(&mut out, wrap_mul(8, words));
+      w_s(&mut out, ", %rsp\n");
+    }
   }
-  w_append(&mut out, inner);
+  w_append(&mut out, framed);
   w_append(&mut g.out, out);
-  vec_free(inner);
+  vec_free(framed);
   vec_free(out);
   vec_free(nuse);
   vec_free(moff);
   vec_free(pos);
   ra_free(al);
   ir_free(f);
-  return true;
+  return 1;
+}
+
+/// `irx_function_n` with %rbp among the registers, and without it when the
+/// frame cannot be addressed from %rsp.
+fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> bool {
+  let r = irx_function_n(&mut g, c, &mut m, p, x, 6);
+  if r == 2 {
+    return irx_function_n(&mut g, c, &mut m, p, x, 5) == 1;
+  }
+  return r == 1;
 }
 
 /// `x86_program`, with the functions the IR covers written from it.
