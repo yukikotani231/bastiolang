@@ -6,7 +6,8 @@
 #  2. bastioc1 built for AArch64 writes byte for byte the same C for itself
 #     as bastioc1 built for x86-64;
 #  3. every tests/user program verifies and its C compiles freestanding for
-#     `--target user --arch aarch64`;
+#     `--target user --arch aarch64`, and its native assembly (`--backend
+#     native`) assembles and links on its own;
 #  4. tests/aarch64/kernel.bastio, built for `--target kernel --arch
 #     aarch64` with the small platform beside it, boots on QEMU's virt
 #     machine and prints what it should: page tables, a user program at EL0
@@ -61,6 +62,20 @@ for f in tests/user/*.bastio; do
   fi
 done
 [ "$fails" = 0 ] && echo "aarch64: every user program builds for AArch64"
+# The same programs through the native backend: assembly with no C compiler
+# on the proved code, which must assemble and link on its own (the entry
+# `bst_umain` and the runtime are all it needs).
+nfails=0
+for f in tests/user/*.bastio; do
+  n=$(basename "$f" .bastio)
+  if ! "$BASTIOC" --target user --arch aarch64 --backend native --emit-asm -o "$tmp/$n.s" "$f" 2>"$tmp/$n.err" \
+     || ! ${AARCH64_CC%gcc}as -o "$tmp/$n.s.o" "$tmp/$n.s" 2>>"$tmp/$n.err" \
+     || ! ${AARCH64_CC%gcc}ld -nostdlib -static -e bst_umain -o "$tmp/$n.s.elf" "$tmp/$n.s.o" 2>>"$tmp/$n.err"; then
+    echo "FAIL $f for --target user --arch aarch64 --backend native"; sed 's/^/    /' "$tmp/$n.err"; nfails=$((nfails+1))
+  fi
+done
+[ "$nfails" = 0 ] && echo "aarch64: every user program builds natively for AArch64"
+fails=$((fails+nfails))
 
 k=tests/aarch64
 "$BASTIOC" --target kernel --arch aarch64 -o "$tmp/kernel.c" $k/kernel.bastio 2>/dev/null
