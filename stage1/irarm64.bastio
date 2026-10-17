@@ -714,6 +714,24 @@ fn a64_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, fr: A64F, g: &mut X86, m:
     a64_movi(&mut out, 2, wrap_mul(8, q.ty));
     w_s(&mut out, "\tbl bst_rt_vec_try_reserve\n");
     a64_finish(&mut out, al, fr, q.d, 0);
+  } else if op == IR_PCALL && (q.c == 10 || q.c == 11) {
+    // A system call of a user program: the number in a, its three arguments
+    // at the address in b. x0 is the result.
+    a64_mov(&mut out, a64_loc(al, fr, q.a), a64_rl(9));
+    a64_mov(&mut out, a64_loc(al, fr, q.b), a64_rl(10));
+    w_s(&mut out, "\tldr x0, [x10]\n\tldr x1, [x10, #8]\n\tldr x2, [x10, #16]\n\tmov x8, x9\n");
+    if q.c == 10 {
+      w_s(&mut out, "\tbl bst_rt_sys\n");
+    } else {
+      w_s(&mut out, "\tbl bst_rt_fsys\n");
+    }
+    a64_finish(&mut out, al, fr, q.d, 0);
+  } else if op == IR_PCALL && q.c == 12 {
+    // Start the program named by the words from [b] to [b + 8] of the Buf data at a.
+    a64_mov(&mut out, a64_loc(al, fr, q.a), a64_rl(0));
+    a64_mov(&mut out, a64_loc(al, fr, q.b), a64_rl(9));
+    w_s(&mut out, "\tldr x2, [x9, #8]\n\tldr x1, [x9]\n\tbl bst_rt_sys_spawn\n");
+    a64_finish(&mut out, al, fr, q.d, 0);
   } else if op == IR_PCALL {
     // A hosted runtime routine on the four words at address a; what it leaves
     // in x0, x1 and x2 goes back to the block's first three, and x0 is the
@@ -1007,7 +1025,7 @@ fn a64_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
     // The console, the page pool and the platform are not in the AArch64
     // runtime; of the runtime calls it has the Vec reserve (5), the
     // hosted program's files and processes (20 to 30) and its arguments (31).
-    if q.op == IR_PCALL && q.c != 5 && (q.c < 20 || q.c > 31) {
+    if q.op == IR_PCALL && q.c != 5 && (q.c < 20 || q.c > 31) && !(g.target == TARGET_USER && q.c >= 10 && q.c <= 12) {
       ok = false;
       why = 4;
       bad_op = q.op;
@@ -1211,6 +1229,302 @@ fn a64_runtime(out: &mut Vec[u64]) {
   a64_runtime_alloc(&mut out);
   a64_runtime_host(&mut out);
   a64_runtime_child(&mut out);
+}
+
+/// The runtime of a BastiOS user program: the C prelude's `user` and
+/// `bytes_arena` parts in assembly (`svc` system calls, the console buffer,
+/// a 64 KiB arena with a free list), with no C library. Part of the trusted
+/// base; the same routines as `x86_runtime_user`.
+fn a64_runtime_user(out: &mut Vec[u64]) {
+  w_s(&mut out, "\n// ---- runtime: BastiOS user programs (trusted base) ----\n");
+  w_s(&mut out, "\t.text\n");
+  w_s(&mut out, "bst_rt_sys:                     // system call x8 with x0, x1, x2: x0 = its result\n");
+  w_s(&mut out, "\tsvc #0\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_fsys:                    // the same, after the console output so far\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-48]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tstp x0, x1, [sp, #16]\n");
+  w_s(&mut out, "\tstp x2, x8, [sp, #32]\n");
+  w_s(&mut out, "\tbl bst_rt_flush\n");
+  w_s(&mut out, "\tldp x0, x1, [sp, #16]\n");
+  w_s(&mut out, "\tldp x2, x8, [sp, #32]\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #48\n");
+  w_s(&mut out, "\tsvc #0\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_flush:                   // write out the console buffer\n");
+  w_s(&mut out, "\tadrp x9, bst_rt_out_n\n");
+  w_s(&mut out, "\tadd x9, x9, :lo12:bst_rt_out_n\n");
+  w_s(&mut out, "\tldr x1, [x9]\n");
+  w_s(&mut out, "\tcbz x1, 1f\n");
+  w_s(&mut out, "\tmov x8, #1                  // SYS_WRITE\n");
+  w_s(&mut out, "\tadrp x0, bst_rt_out\n");
+  w_s(&mut out, "\tadd x0, x0, :lo12:bst_rt_out\n");
+  w_s(&mut out, "\tmov x2, #0\n");
+  w_s(&mut out, "\tsvc #0\n");
+  w_s(&mut out, "\tstr xzr, [x9]\n");
+  w_s(&mut out, "1:\tret\n");
+  w_s(&mut out, "bst_rt_putc:                    // write byte x0 to the console; flush at a newline or when full\n");
+  w_s(&mut out, "\tadrp x9, bst_rt_out_n\n");
+  w_s(&mut out, "\tadd x9, x9, :lo12:bst_rt_out_n\n");
+  w_s(&mut out, "\tldr x1, [x9]\n");
+  w_s(&mut out, "\tadrp x2, bst_rt_out\n");
+  w_s(&mut out, "\tadd x2, x2, :lo12:bst_rt_out\n");
+  w_s(&mut out, "\tstrb w0, [x2, x1]\n");
+  w_s(&mut out, "\tadd x1, x1, #1\n");
+  w_s(&mut out, "\tstr x1, [x9]\n");
+  w_s(&mut out, "\tand w0, w0, #0xff\n");
+  w_s(&mut out, "\tcmp w0, #10\n");
+  w_s(&mut out, "\tb.eq bst_rt_flush\n");
+  w_s(&mut out, "\tcmp x1, #256\n");
+  w_s(&mut out, "\tb.eq bst_rt_flush\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_print:                   // print(x0) as a decimal line\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-64]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tstr x19, [sp, #16]\n");
+  w_s(&mut out, "\tmov x19, #0                 // digits, last first\n");
+  w_s(&mut out, "\tmov x1, #10\n");
+  w_s(&mut out, "1:\tudiv x2, x0, x1\n");
+  w_s(&mut out, "\tmsub x3, x2, x1, x0\n");
+  w_s(&mut out, "\tadd w3, w3, #48\n");
+  w_s(&mut out, "\tadd x4, sp, #32\n");
+  w_s(&mut out, "\tstrb w3, [x4, x19]\n");
+  w_s(&mut out, "\tadd x19, x19, #1\n");
+  w_s(&mut out, "\tmov x0, x2\n");
+  w_s(&mut out, "\tcbnz x0, 1b\n");
+  w_s(&mut out, "2:\tsub x19, x19, #1\n");
+  w_s(&mut out, "\tadd x4, sp, #32\n");
+  w_s(&mut out, "\tldrb w0, [x4, x19]\n");
+  w_s(&mut out, "\tbl bst_rt_putc\n");
+  w_s(&mut out, "\tcbnz x19, 2b\n");
+  w_s(&mut out, "\tmov x0, #10\n");
+  w_s(&mut out, "\tbl bst_rt_putc\n");
+  w_s(&mut out, "\tldr x19, [sp, #16]\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #64\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_getc:                    // x0 = the next byte of console input\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-16]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tbl bst_rt_flush\n");
+  w_s(&mut out, "\tmov x8, #2                  // SYS_READ\n");
+  w_s(&mut out, "\tmov x0, #0\n");
+  w_s(&mut out, "\tmov x1, #0\n");
+  w_s(&mut out, "\tmov x2, #0\n");
+  w_s(&mut out, "\tsvc #0\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #16\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_try_balloc:              // as bst_rt_balloc, but x0 = 0 when out of memory\n");
+  w_s(&mut out, "\tadd x0, x0, #7\n");
+  w_s(&mut out, "\tlsr x0, x0, #3\n");
+  w_s(&mut out, "bst_rt_try_alloc:\n");
+  w_s(&mut out, "\tmov x9, #1\n");
+  w_s(&mut out, "\tb 0f\n");
+  w_s(&mut out, "bst_rt_balloc:                  // x0 = x0 zeroed bytes (at least one)\n");
+  w_s(&mut out, "\tadd x0, x0, #7\n");
+  w_s(&mut out, "\tlsr x0, x0, #3\n");
+  w_s(&mut out, "bst_rt_alloc:                   // x0 = x0 zeroed words (at least one), after a header word\n");
+  w_s(&mut out, "\tmov x9, #0                  // out of memory stops the program\n");
+  w_s(&mut out, "0:\tcbnz x0, 1f\n");
+  w_s(&mut out, "\tmov x0, #1\n");
+  w_s(&mut out, "1:\tadds x0, x0, #1             // the block's words, header included\n");
+  w_s(&mut out, "\tb.cs 6f\n");
+  w_s(&mut out, "\tadrp x10, bst_rt_free_list\n");
+  w_s(&mut out, "\tadd x10, x10, :lo12:bst_rt_free_list\n");
+  w_s(&mut out, "2:\tldr x11, [x10]            // a free block of exactly that size first\n");
+  w_s(&mut out, "\tcbz x11, 4f\n");
+  w_s(&mut out, "\tldr x12, [x11]\n");
+  w_s(&mut out, "\tcmp x12, x0\n");
+  w_s(&mut out, "\tb.eq 3f\n");
+  w_s(&mut out, "\tadd x10, x11, #8\n");
+  w_s(&mut out, "\tb 2b\n");
+  w_s(&mut out, "3:\tldr x12, [x11, #8]\n");
+  w_s(&mut out, "\tstr x12, [x10]\n");
+  w_s(&mut out, "\tmov x13, x11\n");
+  w_s(&mut out, "\tb 5f\n");
+  w_s(&mut out, "4:\tadrp x14, bst_rt_arena_top\n");
+  w_s(&mut out, "\tadd x14, x14, :lo12:bst_rt_arena_top\n");
+  w_s(&mut out, "\tldr x11, [x14]\n");
+  w_s(&mut out, "\tmov x12, #8192              // the arena's words\n");
+  w_s(&mut out, "\tsub x12, x12, x11\n");
+  w_s(&mut out, "\tcmp x0, x12\n");
+  w_s(&mut out, "\tb.hi 6f\n");
+  w_s(&mut out, "\tadd x12, x11, x0\n");
+  w_s(&mut out, "\tstr x12, [x14]\n");
+  w_s(&mut out, "\tadrp x13, bst_rt_arena\n");
+  w_s(&mut out, "\tadd x13, x13, :lo12:bst_rt_arena\n");
+  w_s(&mut out, "\tadd x13, x13, x11, lsl #3\n");
+  w_s(&mut out, "\tstr x0, [x13]\n");
+  w_s(&mut out, "5:\tadd x1, x13, #8             // the payload, zeroed\n");
+  w_s(&mut out, "\tmov x14, x1\n");
+  w_s(&mut out, "\tsub x15, x0, #1\n");
+  w_s(&mut out, "7:\tcbz x15, 8f\n");
+  w_s(&mut out, "\tstr xzr, [x14], #8\n");
+  w_s(&mut out, "\tsub x15, x15, #1\n");
+  w_s(&mut out, "\tb 7b\n");
+  w_s(&mut out, "8:\tmov x0, x1\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "6:\tcbz x9, bst_rt_oom\n");
+  w_s(&mut out, "\tmov x0, #0\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_free:                    // give the block at x0 back to the free list (0: none)\n");
+  w_s(&mut out, "\tcbz x0, 1f\n");
+  w_s(&mut out, "\tadrp x9, bst_rt_free_list\n");
+  w_s(&mut out, "\tadd x9, x9, :lo12:bst_rt_free_list\n");
+  w_s(&mut out, "\tldr x1, [x9]\n");
+  w_s(&mut out, "\tstr x1, [x0]\n");
+  w_s(&mut out, "\tsub x0, x0, #8\n");
+  w_s(&mut out, "\tstr x0, [x9]\n");
+  w_s(&mut out, "1:\tret\n");
+  w_s(&mut out, "bst_rt_vec_grow:                // grow the Vec at (x0), elements of x1 bytes\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-48]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tstp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tstp x21, x22, [sp, #32]\n");
+  w_s(&mut out, "\tmov x19, x0\n");
+  w_s(&mut out, "\tmov x21, x1\n");
+  w_s(&mut out, "\tldr x9, [x19, #8]            // the old words\n");
+  w_s(&mut out, "\tmul x10, x9, x21\n");
+  w_s(&mut out, "\tadd x10, x10, #7\n");
+  w_s(&mut out, "\tlsr x22, x10, #3\n");
+  w_s(&mut out, "\tadd x20, x9, x9              // new capacity: double, or 4 when empty\n");
+  w_s(&mut out, "\tcbnz x20, 1f\n");
+  w_s(&mut out, "\tmov x20, #4\n");
+  w_s(&mut out, "1:\tumulh x9, x20, x21         // bytes; past 64 bits the request cannot be met\n");
+  w_s(&mut out, "\tcbnz x9, bst_rt_oom\n");
+  w_s(&mut out, "\tmul x0, x20, x21\n");
+  w_s(&mut out, "\tadds x0, x0, #7\n");
+  w_s(&mut out, "\tb.cs bst_rt_oom\n");
+  w_s(&mut out, "\tlsr x0, x0, #3\n");
+  w_s(&mut out, "\tbl bst_rt_alloc\n");
+  w_s(&mut out, "\tmov x21, x0\n");
+  w_s(&mut out, "\tldr x1, [x19, #16]\n");
+  w_s(&mut out, "\tcbz x1, 3f\n");
+  w_s(&mut out, "\tmov x2, x21\n");
+  w_s(&mut out, "\tmov x3, x22\n");
+  w_s(&mut out, "2:\tcbz x3, 4f\n");
+  w_s(&mut out, "\tldr x4, [x1], #8\n");
+  w_s(&mut out, "\tstr x4, [x2], #8\n");
+  w_s(&mut out, "\tsub x3, x3, #1\n");
+  w_s(&mut out, "\tb 2b\n");
+  w_s(&mut out, "4:\tldr x0, [x19, #16]\n");
+  w_s(&mut out, "\tbl bst_rt_free\n");
+  w_s(&mut out, "3:\tstr x21, [x19, #16]\n");
+  w_s(&mut out, "\tstr x20, [x19, #8]\n");
+  w_s(&mut out, "\tldp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tldp x21, x22, [sp, #32]\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #48\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_vec_try_reserve:         // room for x1 more elements of x2 bytes in the Vec at (x0): w0 = 1, or 0 and unchanged\n");
+  w_s(&mut out, "\tldr x3, [x0, #8]\n");
+  w_s(&mut out, "\tldr x4, [x0]\n");
+  w_s(&mut out, "\tsub x3, x3, x4\n");
+  w_s(&mut out, "\tcmp x3, x1\n");
+  w_s(&mut out, "\tb.lo 1f\n");
+  w_s(&mut out, "\tmov w0, #1\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "1:\tstp x29, x30, [sp, #-64]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tstp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tstp x21, x22, [sp, #32]\n");
+  w_s(&mut out, "\tstp x23, x24, [sp, #48]\n");
+  w_s(&mut out, "\tmov x19, x0\n");
+  w_s(&mut out, "\tmov x20, x2\n");
+  w_s(&mut out, "\tmov x21, x1\n");
+  w_s(&mut out, "\tmov x3, #1                  // lim = 2^60 / size: the capacity stays at most 2^60\n");
+  w_s(&mut out, "\tlsl x3, x3, #60\n");
+  w_s(&mut out, "\tudiv x3, x3, x20\n");
+  w_s(&mut out, "\tldr x4, [x19]\n");
+  w_s(&mut out, "\tcmp x4, x3\n");
+  w_s(&mut out, "\tb.hi 3f\n");
+  w_s(&mut out, "\tsub x5, x3, x4\n");
+  w_s(&mut out, "\tcmp x21, x5\n");
+  w_s(&mut out, "\tb.hi 3f\n");
+  w_s(&mut out, "\tadd x22, x4, x21            // new capacity: len + k, or double when that is more and fits\n");
+  w_s(&mut out, "\tldr x6, [x19, #8]\n");
+  w_s(&mut out, "\tlsr x3, x3, #1\n");
+  w_s(&mut out, "\tcmp x6, x3\n");
+  w_s(&mut out, "\tb.hi 2f\n");
+  w_s(&mut out, "\tadd x6, x6, x6\n");
+  w_s(&mut out, "\tcmp x6, x22\n");
+  w_s(&mut out, "\tb.ls 2f\n");
+  w_s(&mut out, "\tmov x22, x6\n");
+  w_s(&mut out, "2:\tldr x7, [x19, #8]            // the old words\n");
+  w_s(&mut out, "\tmul x7, x7, x20\n");
+  w_s(&mut out, "\tadd x7, x7, #7\n");
+  w_s(&mut out, "\tlsr x23, x7, #3\n");
+  w_s(&mut out, "\tmul x0, x22, x20             // the new words\n");
+  w_s(&mut out, "\tadd x0, x0, #7\n");
+  w_s(&mut out, "\tlsr x0, x0, #3\n");
+  w_s(&mut out, "\tbl bst_rt_try_alloc\n");
+  w_s(&mut out, "\tcbz x0, 3f\n");
+  w_s(&mut out, "\tmov x24, x0\n");
+  w_s(&mut out, "\tldr x1, [x19, #16]\n");
+  w_s(&mut out, "\tcbz x1, 4f\n");
+  w_s(&mut out, "\tmov x2, x24\n");
+  w_s(&mut out, "\tmov x3, x23\n");
+  w_s(&mut out, "6:\tcbz x3, 7f\n");
+  w_s(&mut out, "\tldr x4, [x1], #8\n");
+  w_s(&mut out, "\tstr x4, [x2], #8\n");
+  w_s(&mut out, "\tsub x3, x3, #1\n");
+  w_s(&mut out, "\tb 6b\n");
+  w_s(&mut out, "7:\tldr x0, [x19, #16]\n");
+  w_s(&mut out, "\tbl bst_rt_free\n");
+  w_s(&mut out, "4:\tstr x24, [x19, #16]\n");
+  w_s(&mut out, "\tstr x22, [x19, #8]\n");
+  w_s(&mut out, "\tmov w0, #1\n");
+  w_s(&mut out, "\tb 5f\n");
+  w_s(&mut out, "3:\tmov w0, #0\n");
+  w_s(&mut out, "5:\tldp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tldp x21, x22, [sp, #32]\n");
+  w_s(&mut out, "\tldp x23, x24, [sp, #48]\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #64\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_sys_spawn:               // start the program named by words x1..x2 of the Buf data at x0\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-80]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tmov x3, #0                  // the name's bytes, at most 64\n");
+  w_s(&mut out, "\tadd x4, sp, #16\n");
+  w_s(&mut out, "1:\tcmp x1, x2\n");
+  w_s(&mut out, "\tb.hs 2f\n");
+  w_s(&mut out, "\tcmp x3, #64\n");
+  w_s(&mut out, "\tb.hs 2f\n");
+  w_s(&mut out, "\tldr x5, [x0, x1, lsl #3]\n");
+  w_s(&mut out, "\tstrb w5, [x4, x3]\n");
+  w_s(&mut out, "\tadd x3, x3, #1\n");
+  w_s(&mut out, "\tadd x1, x1, #1\n");
+  w_s(&mut out, "\tb 1b\n");
+  w_s(&mut out, "2:\tmov x8, #3                 // SYS_SPAWN\n");
+  w_s(&mut out, "\tmov x0, x4\n");
+  w_s(&mut out, "\tmov x1, x3\n");
+  w_s(&mut out, "\tmov x2, #0\n");
+  w_s(&mut out, "\tsvc #0\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #80\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_oom:\n");
+  w_s(&mut out, "\tbl bst_rt_flush\n");
+  w_s(&mut out, "\tmov x8, #1\n");
+  w_s(&mut out, "\tadrp x0, .Lrt_oom\n");
+  w_s(&mut out, "\tadd x0, x0, :lo12:.Lrt_oom\n");
+  w_s(&mut out, "\tmov x1, #22\n");
+  w_s(&mut out, "\tmov x2, #0\n");
+  w_s(&mut out, "\tsvc #0\n");
+  w_s(&mut out, "\tmov x8, #0                  // SYS_EXIT\n");
+  w_s(&mut out, "\tmov x0, #255\n");
+  w_s(&mut out, "\tsvc #0\n");
+  w_s(&mut out, "\tbrk #0\n");
+  w_s(&mut out, "\t.set bst_rt_alloc_raw, bst_rt_alloc    // the arena hands out zeroed words either way\n");
+  w_s(&mut out, "\t.bss\n");
+  w_s(&mut out, "\t.p2align 3\n");
+  w_s(&mut out, "bst_rt_out_n:\t.quad 0\n");
+  w_s(&mut out, "bst_rt_arena_top:\t.quad 0\n");
+  w_s(&mut out, "bst_rt_free_list:\t.quad 0\n");
+  w_s(&mut out, "bst_rt_out:\t.zero 256\n");
+  w_s(&mut out, "bst_rt_arena:\t.zero 65536\n");
+  w_s(&mut out, "\t.section .rodata\n");
+  w_s(&mut out, ".Lrt_oom:\n");
+  w_s(&mut out, "\t.string \"bastio: out of memory\\n\"\n");
+  w_s(&mut out, "\t.text\n");
 }
 
 /// The allocator's fallible calls, the Vec reserve and the console, over the C library.
@@ -1851,8 +2165,8 @@ fn a64_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
     }
     k = k + 1;
   }
-  if main_x == 0 || g.target != TARGET_HOSTED {
-    x86_fail(&mut g, "the AArch64 backend builds hosted programs with a `main` only so far");
+  if main_x == 0 || (g.target != TARGET_HOSTED && g.target != TARGET_USER) {
+    x86_fail(&mut g, "the AArch64 backend builds hosted and user programs with a `main` only so far");
     return false;
   }
   w_s(&mut g.out, "// generated by bastioc1 --arch aarch64 --backend native -- do not edit\n\t.text\n");
@@ -1864,7 +2178,12 @@ fn a64_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
     }
     k = k + 1;
   }
-  w_s(&mut g.out, "\t.globl main\n\t.type main, %function\nmain:\n\tstp x29, x30, [sp, #-16]!\n\tmov x29, sp\n\tadrp x2, bst_rt_argc\n\tstr w0, [x2, :lo12:bst_rt_argc]\n\tadrp x2, bst_rt_argv\n\tstr x1, [x2, :lo12:bst_rt_argv]\n");
+  if g.target == TARGET_USER {
+    // Called by user/start-aarch64.S; its result is the exit code.
+    w_s(&mut g.out, "\t.globl bst_umain\n\t.type bst_umain, %function\nbst_umain:\n\tstp x29, x30, [sp, #-32]!\n\tmov x29, sp\n\tstr x19, [sp, #16]\n");
+  } else {
+    w_s(&mut g.out, "\t.globl main\n\t.type main, %function\nmain:\n\tstp x29, x30, [sp, #-16]!\n\tmov x29, sp\n\tadrp x2, bst_rt_argc\n\tstr w0, [x2, :lo12:bst_rt_argc]\n\tadrp x2, bst_rt_argv\n\tstr x1, [x2, :lo12:bst_rt_argv]\n");
+  }
   // The capabilities of `main` are zero words; one lent by `&mut` is the
   // address of its word on the frame.
   let mxi = inst_at(m, main_x);
@@ -1932,8 +2251,13 @@ fn a64_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
   ix_sym(&mut ms, &mut g, m, p, main_x);
   w_append(&mut g.out, ms);
   vec_free(ms);
-  w_s(&mut g.out, "\n\tmov sp, x29\n\tldp x29, x30, [sp], #16\n\tret\n");
-  a64_runtime(&mut g.out);
+  if g.target == TARGET_USER {
+    w_s(&mut g.out, "\n\tmov x19, x0\n\tbl bst_rt_flush\n\tmov x0, x19\n\tmov sp, x29\n\tldr x19, [sp, #16]\n\tldp x29, x30, [sp], #32\n\tret\n");
+    a64_runtime_user(&mut g.out);
+  } else {
+    w_s(&mut g.out, "\n\tmov sp, x29\n\tldp x29, x30, [sp], #16\n\tret\n");
+    a64_runtime(&mut g.out);
+  }
   w_s(&mut g.out, "\t.section .rodata\n");
   k = 0;
   while k < vec_len(g.slens) {
