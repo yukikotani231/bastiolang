@@ -1110,8 +1110,20 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     ix_cmp(&mut out, al, q.a, q.b);
     w_s(&mut out, "\tset");
     w_s(&mut out, ix_cc(op));
-    w_s(&mut out, " %al\n\tmovzbl %al, %eax\n");
-    ix_finish(&mut out, al, q.d, XR_RAX);
+    let ld = ix_loc(al, q.d);
+    if ld.k == IXK_REG {
+      // The flag goes straight into the result's register.
+      w_s(&mut out, " ");
+      w_s(&mut out, ix_name8(ld.reg));
+      w_s(&mut out, "\n\tmovzbl ");
+      w_s(&mut out, ix_name8(ld.reg));
+      w_s(&mut out, ", ");
+      w_s(&mut out, ix_name32(ld.reg));
+      w_s(&mut out, "\n");
+    } else {
+      w_s(&mut out, " %al\n\tmovzbl %al, %eax\n");
+      ix_finish(&mut out, al, q.d, XR_RAX);
+    }
   } else if op == IR_CONST {
     if u_at(al.cst, q.d) == 0 {
       ix_mov(&mut out, ix_il(q.a), ix_loc(al, q.d));
@@ -1601,10 +1613,17 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     // The address of the slot whose lowest word is `slotw` words below %rbp;
     // nothing to write when every use of it is written off %rbp.
     if u_at(al.cst, q.d) != 3 {
+      let ld = ix_loc(al, q.d);
       w_s(&mut out, "\tlea -");
       w_num(&mut out, wrap_mul(8, slotw));
-      w_s(&mut out, "(%fp), %rax\n");
-      ix_finish(&mut out, al, q.d, XR_RAX);
+      if ld.k == IXK_REG {
+        w_s(&mut out, "(%fp), ");
+        w_s(&mut out, x86_rname(ld.reg));
+        w_s(&mut out, "\n");
+      } else {
+        w_s(&mut out, "(%fp), %rax\n");
+        ix_finish(&mut out, al, q.d, XR_RAX);
+      }
     }
   }
 }
