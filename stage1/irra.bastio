@@ -1273,6 +1273,330 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
 
 // ---- A check of the result ----
 
+// ---- Splitting a register in the frame around a loop ----
+
+/// Can the reads of `op` be rewritten by `ra_subst`?
+fn ra_substable(op: u64) -> bool {
+  return ra_is_binary(op) || op == IR_LOAD || op == IR_STORE || op == IR_BR || op == IR_MOV || op == IR_NOT || op == IR_NEG || op == IR_WRAP || op == IR_CAS || op == IR_COPY || op == IR_FILL || op == IR_DEVW || op == IR_POUT || op == IR_MMCHK || op == IR_COPYPAGE || op == IR_PCALL || op == IR_XCHG || op == IR_ZERO || op == IR_PIN || op == IR_DEVR || op == IR_LOCKINC || op == IR_LOCKDEC || op == IR_LOCKACQ || op == IR_RT;
+}
+
+/// Instruction `q` with every read of `v` replaced by `t`.
+fn ra_subst(q: IrIns, v: u64, t: u64) -> IrIns {
+  let mut r = q;
+  let op = q.op;
+  if ra_is_binary(op) || op == IR_LOAD || op == IR_DEVW || op == IR_POUT || op == IR_MMCHK || op == IR_COPYPAGE || op == IR_PCALL || op == IR_XCHG {
+    if r.a == v { r.a = t; }
+    if r.b == v { r.b = t; }
+  } else if op == IR_MOV || op == IR_NOT || op == IR_NEG || op == IR_WRAP || op == IR_BR || op == IR_ZERO || op == IR_PIN || op == IR_DEVR || op == IR_LOCKINC || op == IR_LOCKDEC || op == IR_LOCKACQ || op == IR_RT {
+    if r.a == v { r.a = t; }
+  } else if op == IR_STORE {
+    if r.a == v { r.a = t; }
+    if r.b == v { r.b = t; }
+    if r.d == v { r.d = t; }
+  } else if op == IR_CAS || op == IR_COPY || op == IR_FILL {
+    if r.a == v { r.a = t; }
+    if r.b == v { r.b = t; }
+    if r.c == v { r.c = t; }
+  }
+  return r;
+}
+
+fn ra_in_list(xs: &Vec[u64], v: u64) -> bool {
+  let mut hit = false;
+  let mut k = 0;
+  while k < vec_len(xs) {
+    if vec_get(xs, k) == v {
+      hit = true;
+    }
+    k = k + 1;
+  }
+  return hit;
+}
+
+fn ra_reads_has(f: &IrFn, q: IrIns, v: u64) -> bool {
+  let mut rs = vec_new[u64]();
+  ra_reads(f, q, &mut rs);
+  let hit = ra_in_list(rs, v);
+  vec_free(rs);
+  return hit;
+}
+
+fn ra_writes_has(q: IrIns, v: u64) -> bool {
+  let mut ws = vec_new[u64]();
+  ra_writes(q, &mut ws);
+  let hit = ra_in_list(ws, v);
+  vec_free(ws);
+  return hit;
+}
+
+/// `q` with `t` for `v` in what it reads and what it writes.
+fn ra_rename(q: IrIns, v: u64, t: u64) -> IrIns {
+  let mut r = ra_subst(q, v, t);
+  if q.op != IR_STORE && q.d == v && ra_writes_has(q, v) {
+    r.d = t;
+  }
+  return r;
+}
+
+/// The position of each label (IR_NONE: not placed).
+fn ra_lpos(f: &IrFn) -> Vec[u64] {
+  let mut lp = vec_new[u64]();
+  let mut l = 0;
+  while l < f.nlabel && l < 1000000000 {
+    vec_push(&mut lp, IR_NONE);
+    l = l + 1;
+  }
+  let mut i = 0;
+  while i < vec_len(f.ins) && i < 1000000000 {
+    let q = vec_get(f.ins, i);
+    if q.op == IR_LABEL && q.a < f.nlabel {
+      ra_set(&mut lp, q.a, i);
+    }
+    i = i + 1;
+  }
+  return lp;
+}
+
+/// How many times positions `h ..= e` read or write `v`, or 0 when they
+/// cannot be rewritten (a call, or a read in an operand `ra_subst` cannot
+/// reach).
+fn ra_loop_refs(f: &IrFn, h: u64, e: u64, v: u64) -> u64 {
+  let mut refs = 0;
+  let mut p = h;
+  while p <= e && p < vec_len(f.ins) && p < 1000000000 {
+    let q = vec_get(f.ins, p);
+    if ra_calls(q) {
+      return 0;
+    }
+    if ra_reads_has(f, q, v) {
+      if !ra_substable(q.op) {
+        return 0;
+      }
+      refs = wrap_add(refs, 1);
+    }
+    if ra_writes_has(q, v) {
+      refs = wrap_add(refs, 1);
+    }
+    p = p + 1;
+  }
+  return refs;
+}
+
+/// A loop `h ..= e` (its first label to its last jump back) that reads or
+/// writes `v` often and has no call: its references go to a copy `t`, made
+/// where the loop is entered and written back where it is left.
+fn ra_split_once(f: &mut IrFn, v: u64, minrefs: u64) -> bool {
+  let n = vec_len(f.ins);
+  let lp = ra_lpos(f);
+  let mut lh = vec_new[u64]();
+  let mut le = vec_new[u64]();
+  let mut e = 0;
+  while e < n && e < vec_len(f.ins) && e < 1000000000 {
+    let q = vec_get(f.ins, e);
+    let mut k = 0;
+    while k < 2 {
+      let mut tgt = IR_NONE;
+      if q.op == IR_JMP && k == 0 {
+        tgt = q.a;
+      }
+      if q.op == IR_BR {
+        if k == 0 {
+          tgt = q.b;
+        } else {
+          tgt = q.c;
+        }
+      }
+      if tgt < f.nlabel && tgt < vec_len(lp) {
+        let hp = vec_get(lp, tgt);
+        if hp < e {
+          let mut found = IR_NONE;
+          let mut x = 0;
+          while x < vec_len(lh) {
+            if vec_get(lh, x) == hp {
+              found = x;
+            }
+            x = x + 1;
+          }
+          if found == IR_NONE {
+            vec_push(&mut lh, hp);
+            vec_push(&mut le, e);
+          } else if e > u_at(le, found) {
+            ra_set(&mut le, found, e);
+          }
+        }
+      }
+      k = k + 1;
+    }
+    e = e + 1;
+  }
+  // The smallest loop that qualifies.
+  let mut best = IR_NONE;
+  let mut best_size = 400;
+  let mut x = 0;
+  while x < vec_len(lh) {
+    let h = vec_get(lh, x);
+    let e2 = u_at(le, x);
+    if e2 >= h {
+      let size = wrap_sub(e2, h);
+      if size < best_size && ra_loop_refs(f, h, e2, v) >= minrefs {
+        best = x;
+        best_size = size;
+      }
+    }
+    x = x + 1;
+  }
+  if best == IR_NONE {
+    vec_free(lp);
+    vec_free(lh);
+    vec_free(le);
+    return false;
+  }
+  let h = u_at(lh, best);
+  let e2 = u_at(le, best);
+  vec_free(lh);
+  vec_free(le);
+  let mut wrote = false;
+  let mut p = h;
+  while p <= e2 && p < vec_len(f.ins) && p < 1000000000 {
+    if ra_writes_has(vec_get(f.ins, p), v) {
+      wrote = true;
+    }
+    p = p + 1;
+  }
+  let t = ir_reg(&mut f);
+  let mut out = vec_new[IrIns]();
+  let mut i = 0;
+  while i < n && i < vec_len(f.ins) && i < 1000000000 {
+    let q0 = vec_get(f.ins, i);
+    let inside = i >= h && i <= e2;
+    if i == h {
+      let mut falls = true;
+      if i > 0 {
+        let pr = vec_get(f.ins, i - 1);
+        falls = !ra_is_end(pr.op);
+      }
+      if falls {
+        vec_push(&mut out, IrIns { op: IR_MOV, d: t, a: v, b: 0, c: 0, ty: 0 });
+      }
+    }
+    let mut q = q0;
+    if inside {
+      q = ra_rename(q0, v, t);
+    }
+    if q.op == IR_JMP && q.a < vec_len(lp) {
+      let tp = vec_get(lp, q.a);
+      let tin = tp >= h && tp <= e2;
+      if inside && !tin && wrote {
+        vec_push(&mut out, IrIns { op: IR_MOV, d: v, a: t, b: 0, c: 0, ty: 0 });
+      }
+      if !inside && tin {
+        vec_push(&mut out, IrIns { op: IR_MOV, d: t, a: v, b: 0, c: 0, ty: 0 });
+      }
+    }
+    // A branch into or out of the loop goes through a block of its own,
+    // placed right after it (so no jump of it goes back).
+    let mut tl = vec_new[u64]();
+    let mut tt = vec_new[u64]();
+    let mut tk = vec_new[u64]();
+    if q.op == IR_BR {
+      let mut k = 0;
+      while k < 2 {
+        let mut lab = q.b;
+        if k == 1 {
+          lab = q.c;
+        }
+        if lab < vec_len(lp) {
+          let tp = vec_get(lp, lab);
+          let tin = tp >= h && tp <= e2;
+          let mut kind = 0;
+          if inside && !tin && wrote {
+            kind = 2;
+          }
+          if !inside && tin {
+            kind = 1;
+          }
+          if kind != 0 {
+            let nl = ir_label(&mut f);
+            vec_push(&mut tl, nl);
+            vec_push(&mut tt, lab);
+            vec_push(&mut tk, kind);
+            if k == 0 {
+              q.b = nl;
+            } else {
+              q.c = nl;
+            }
+          }
+        }
+        k = k + 1;
+      }
+    }
+    vec_push(&mut out, q);
+    let mut y = 0;
+    while y < vec_len(tl) {
+      vec_push(&mut out, IrIns { op: IR_LABEL, d: IR_NONE, a: vec_get(tl, y), b: 0, c: 0, ty: 0 });
+      if u_at(tk, y) == 1 {
+        vec_push(&mut out, IrIns { op: IR_MOV, d: t, a: v, b: 0, c: 0, ty: 0 });
+      } else {
+        vec_push(&mut out, IrIns { op: IR_MOV, d: v, a: t, b: 0, c: 0, ty: 0 });
+      }
+      vec_push(&mut out, IrIns { op: IR_JMP, d: IR_NONE, a: u_at(tt, y), b: 0, c: 0, ty: 0 });
+      y = y + 1;
+    }
+    vec_free(tl);
+    vec_free(tt);
+    vec_free(tk);
+    i = i + 1;
+  }
+  vec_free(lp);
+  vec_free(f.ins);
+  f.ins = out;
+  return true;
+}
+
+/// Splits every register `al` keeps in the frame around the loops that use
+/// it `minrefs` times or more. Returns how many splits were made.
+fn ra_split_loops(f: &mut IrFn, al: &IrAlloc, minrefs: u64) -> u64 {
+  let nr = f.nreg;
+  let n = vec_len(f.ins);
+  // Registers that hold a frame slot's address stay as they are: the
+  // emitter follows them through their copies.
+  let mut sl = vec_new[u64]();
+  let mut r = 0;
+  while r < nr && r < 1000000000 {
+    vec_push(&mut sl, 0);
+    r = r + 1;
+  }
+  let mut again = true;
+  while again {
+    again = false;
+    let mut k = 0;
+    while k < n && k < vec_len(f.ins) {
+      let q = vec_get(f.ins, k);
+      if q.d < nr && u_at(sl, q.d) == 0 {
+        if q.op == IR_SLOT || (q.op == IR_MOV && q.a < nr && u_at(sl, q.a) == 1) {
+          ra_set(&mut sl, q.d, 1);
+          again = true;
+        }
+      }
+      k = k + 1;
+    }
+  }
+  let mut made = 0;
+  let mut v = 0;
+  while v < nr && v < vec_len(al.cls) && v < 1000000000 {
+    if u_at(al.cls, v) == RA_SPILL && u_at(al.cst, v) == 0 && u_at(sl, v) == 0 {
+      let mut tries = 0;
+      while tries < 8 && ra_split_once(&mut f, v, minrefs) {
+        made = wrap_add(made, 1);
+        tries = tries + 1;
+      }
+    }
+    v = v + 1;
+  }
+  vec_free(sl);
+  return made;
+}
+
 /// Do two registers that share a machine register ever live together, or
 /// does a register that lives across a call sit in a caller-saved one?
 /// Recomputed from the instructions, so it is independent of the scan.
