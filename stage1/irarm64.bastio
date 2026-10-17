@@ -1010,7 +1010,7 @@ fn a64_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   let mut ok = vec_len(f.params) <= A64_MAX_ARGS;
   let mut why = 1;                          // 1: parameters, 2: instructions, 3: a call, 4: an operation
   let mut bad_op = 0;
-  if ok && name_is(p, xi.def, "main") && vec_len(f.params) > 0 && vec_len(f.params) != a64_main_words(&mut m, p, x) {
+  if ok && name_is(p, xi.def, "main") && vec_len(f.params) > 0 && vec_len(f.params) != a64_main_words(&mut m, p, x, g.target == TARGET_KERNEL) {
     ok = false;
   }
   if vec_len(f.ins) > IX_MAX_INS {
@@ -1235,54 +1235,8 @@ fn a64_runtime(out: &mut Vec[u64]) {
   a64_runtime_child(&mut out);
 }
 
-/// The runtime of a BastiOS user program: the C prelude's `user` and
-/// `bytes_arena` parts in assembly (`svc` system calls, the console buffer,
-/// a 64 KiB arena with a free list), with no C library. Part of the trusted
-/// base; the same routines as `x86_runtime_user`.
-fn a64_runtime_user(out: &mut Vec[u64]) {
-  w_s(&mut out, "\n// ---- runtime: BastiOS user programs (trusted base) ----\n");
-  w_s(&mut out, "\t.text\n");
-  w_s(&mut out, "bst_rt_sys:                     // system call x8 with x0, x1, x2: x0 = its result\n");
-  w_s(&mut out, "\tsvc #0\n");
-  w_s(&mut out, "\tret\n");
-  w_s(&mut out, "bst_rt_fsys:                    // the same, after the console output so far\n");
-  w_s(&mut out, "\tstp x29, x30, [sp, #-48]!\n");
-  w_s(&mut out, "\tmov x29, sp\n");
-  w_s(&mut out, "\tstp x0, x1, [sp, #16]\n");
-  w_s(&mut out, "\tstp x2, x8, [sp, #32]\n");
-  w_s(&mut out, "\tbl bst_rt_flush\n");
-  w_s(&mut out, "\tldp x0, x1, [sp, #16]\n");
-  w_s(&mut out, "\tldp x2, x8, [sp, #32]\n");
-  w_s(&mut out, "\tldp x29, x30, [sp], #48\n");
-  w_s(&mut out, "\tsvc #0\n");
-  w_s(&mut out, "\tret\n");
-  w_s(&mut out, "bst_rt_flush:                   // write out the console buffer\n");
-  w_s(&mut out, "\tadrp x9, bst_rt_out_n\n");
-  w_s(&mut out, "\tadd x9, x9, :lo12:bst_rt_out_n\n");
-  w_s(&mut out, "\tldr x1, [x9]\n");
-  w_s(&mut out, "\tcbz x1, 1f\n");
-  w_s(&mut out, "\tmov x8, #1                  // SYS_WRITE\n");
-  w_s(&mut out, "\tadrp x0, bst_rt_out\n");
-  w_s(&mut out, "\tadd x0, x0, :lo12:bst_rt_out\n");
-  w_s(&mut out, "\tmov x2, #0\n");
-  w_s(&mut out, "\tsvc #0\n");
-  w_s(&mut out, "\tstr xzr, [x9]\n");
-  w_s(&mut out, "1:\tret\n");
-  w_s(&mut out, "bst_rt_putc:                    // write byte x0 to the console; flush at a newline or when full\n");
-  w_s(&mut out, "\tadrp x9, bst_rt_out_n\n");
-  w_s(&mut out, "\tadd x9, x9, :lo12:bst_rt_out_n\n");
-  w_s(&mut out, "\tldr x1, [x9]\n");
-  w_s(&mut out, "\tadrp x2, bst_rt_out\n");
-  w_s(&mut out, "\tadd x2, x2, :lo12:bst_rt_out\n");
-  w_s(&mut out, "\tstrb w0, [x2, x1]\n");
-  w_s(&mut out, "\tadd x1, x1, #1\n");
-  w_s(&mut out, "\tstr x1, [x9]\n");
-  w_s(&mut out, "\tand w0, w0, #0xff\n");
-  w_s(&mut out, "\tcmp w0, #10\n");
-  w_s(&mut out, "\tb.eq bst_rt_flush\n");
-  w_s(&mut out, "\tcmp x1, #256\n");
-  w_s(&mut out, "\tb.eq bst_rt_flush\n");
-  w_s(&mut out, "\tret\n");
+/// `print`: x0 as a decimal line, over `bst_rt_putc`.
+fn a64_rt_print(out: &mut Vec[u64]) {
   w_s(&mut out, "bst_rt_print:                   // print(x0) as a decimal line\n");
   w_s(&mut out, "\tstp x29, x30, [sp, #-64]!\n");
   w_s(&mut out, "\tmov x29, sp\n");
@@ -1307,17 +1261,11 @@ fn a64_runtime_user(out: &mut Vec[u64]) {
   w_s(&mut out, "\tldr x19, [sp, #16]\n");
   w_s(&mut out, "\tldp x29, x30, [sp], #64\n");
   w_s(&mut out, "\tret\n");
-  w_s(&mut out, "bst_rt_getc:                    // x0 = the next byte of console input\n");
-  w_s(&mut out, "\tstp x29, x30, [sp, #-16]!\n");
-  w_s(&mut out, "\tmov x29, sp\n");
-  w_s(&mut out, "\tbl bst_rt_flush\n");
-  w_s(&mut out, "\tmov x8, #2                  // SYS_READ\n");
-  w_s(&mut out, "\tmov x0, #0\n");
-  w_s(&mut out, "\tmov x1, #0\n");
-  w_s(&mut out, "\tmov x2, #0\n");
-  w_s(&mut out, "\tsvc #0\n");
-  w_s(&mut out, "\tldp x29, x30, [sp], #16\n");
-  w_s(&mut out, "\tret\n");
+}
+
+/// The allocator over a fixed arena of `words` words (`bst_rt_arena`, with `bst_rt_arena_top` and
+/// `bst_rt_free_list` beside it in the .bss) and the Vec growth built on it.
+fn a64_rt_arena(out: &mut Vec[u64], words: u64) {
   w_s(&mut out, "bst_rt_try_balloc:              // as bst_rt_balloc, but x0 = 0 when out of memory\n");
   w_s(&mut out, "\tadd x0, x0, #7\n");
   w_s(&mut out, "\tlsr x0, x0, #3\n");
@@ -1349,7 +1297,9 @@ fn a64_runtime_user(out: &mut Vec[u64]) {
   w_s(&mut out, "4:\tadrp x14, bst_rt_arena_top\n");
   w_s(&mut out, "\tadd x14, x14, :lo12:bst_rt_arena_top\n");
   w_s(&mut out, "\tldr x11, [x14]\n");
-  w_s(&mut out, "\tmov x12, #8192              // the arena's words\n");
+  w_s(&mut out, "\tmov x12, #");
+  w_num(&mut out, words);
+  w_s(&mut out, "              // the arena's words\n");
   w_s(&mut out, "\tsub x12, x12, x11\n");
   w_s(&mut out, "\tcmp x0, x12\n");
   w_s(&mut out, "\tb.hi 6f\n");
@@ -1484,6 +1434,69 @@ fn a64_runtime_user(out: &mut Vec[u64]) {
   w_s(&mut out, "\tldp x23, x24, [sp, #48]\n");
   w_s(&mut out, "\tldp x29, x30, [sp], #64\n");
   w_s(&mut out, "\tret\n");
+}
+
+/// The runtime of a BastiOS user program: the C prelude's `user` and
+/// `bytes_arena` parts in assembly (`svc` system calls, the console buffer,
+/// a 64 KiB arena with a free list), with no C library. Part of the trusted
+/// base; the same routines as `x86_runtime_user`.
+fn a64_runtime_user(out: &mut Vec[u64]) {
+  w_s(&mut out, "\n// ---- runtime: BastiOS user programs (trusted base) ----\n");
+  w_s(&mut out, "\t.text\n");
+  w_s(&mut out, "bst_rt_sys:                     // system call x8 with x0, x1, x2: x0 = its result\n");
+  w_s(&mut out, "\tsvc #0\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_fsys:                    // the same, after the console output so far\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-48]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tstp x0, x1, [sp, #16]\n");
+  w_s(&mut out, "\tstp x2, x8, [sp, #32]\n");
+  w_s(&mut out, "\tbl bst_rt_flush\n");
+  w_s(&mut out, "\tldp x0, x1, [sp, #16]\n");
+  w_s(&mut out, "\tldp x2, x8, [sp, #32]\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #48\n");
+  w_s(&mut out, "\tsvc #0\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_flush:                   // write out the console buffer\n");
+  w_s(&mut out, "\tadrp x9, bst_rt_out_n\n");
+  w_s(&mut out, "\tadd x9, x9, :lo12:bst_rt_out_n\n");
+  w_s(&mut out, "\tldr x1, [x9]\n");
+  w_s(&mut out, "\tcbz x1, 1f\n");
+  w_s(&mut out, "\tmov x8, #1                  // SYS_WRITE\n");
+  w_s(&mut out, "\tadrp x0, bst_rt_out\n");
+  w_s(&mut out, "\tadd x0, x0, :lo12:bst_rt_out\n");
+  w_s(&mut out, "\tmov x2, #0\n");
+  w_s(&mut out, "\tsvc #0\n");
+  w_s(&mut out, "\tstr xzr, [x9]\n");
+  w_s(&mut out, "1:\tret\n");
+  w_s(&mut out, "bst_rt_putc:                    // write byte x0 to the console; flush at a newline or when full\n");
+  w_s(&mut out, "\tadrp x9, bst_rt_out_n\n");
+  w_s(&mut out, "\tadd x9, x9, :lo12:bst_rt_out_n\n");
+  w_s(&mut out, "\tldr x1, [x9]\n");
+  w_s(&mut out, "\tadrp x2, bst_rt_out\n");
+  w_s(&mut out, "\tadd x2, x2, :lo12:bst_rt_out\n");
+  w_s(&mut out, "\tstrb w0, [x2, x1]\n");
+  w_s(&mut out, "\tadd x1, x1, #1\n");
+  w_s(&mut out, "\tstr x1, [x9]\n");
+  w_s(&mut out, "\tand w0, w0, #0xff\n");
+  w_s(&mut out, "\tcmp w0, #10\n");
+  w_s(&mut out, "\tb.eq bst_rt_flush\n");
+  w_s(&mut out, "\tcmp x1, #256\n");
+  w_s(&mut out, "\tb.eq bst_rt_flush\n");
+  w_s(&mut out, "\tret\n");
+  a64_rt_print(&mut out);
+  w_s(&mut out, "bst_rt_getc:                    // x0 = the next byte of console input\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-16]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tbl bst_rt_flush\n");
+  w_s(&mut out, "\tmov x8, #2                  // SYS_READ\n");
+  w_s(&mut out, "\tmov x0, #0\n");
+  w_s(&mut out, "\tmov x1, #0\n");
+  w_s(&mut out, "\tmov x2, #0\n");
+  w_s(&mut out, "\tsvc #0\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #16\n");
+  w_s(&mut out, "\tret\n");
+  a64_rt_arena(&mut out, 8192);
   w_s(&mut out, "bst_rt_sys_spawn:               // start the program named by words x1..x2 of the Buf data at x0\n");
   w_s(&mut out, "\tstp x29, x30, [sp, #-80]!\n");
   w_s(&mut out, "\tmov x29, sp\n");
@@ -1528,6 +1541,157 @@ fn a64_runtime_user(out: &mut Vec[u64]) {
   w_s(&mut out, "\t.section .rodata\n");
   w_s(&mut out, ".Lrt_oom:\n");
   w_s(&mut out, "\t.string \"bastio: out of memory\\n\"\n");
+  w_s(&mut out, "\t.text\n");
+}
+
+/// The runtime of an AArch64 kernel: the console on a PL011 UART (at the
+/// address of `bst_uart_base` when the platform defines one, else QEMU virt's
+/// 0x09000000; the baud rate is left as the firmware set it) and a 1 MiB
+/// arena for `Buf`. Part of the trusted base; the C prelude's
+/// `bst_serial_*` and `bst_arena` are what it replaces.
+fn a64_runtime_kernel(out: &mut Vec[u64]) {
+  w_s(&mut out, "\n// ---- runtime: AArch64 kernel (trusted base) ----\n");
+  w_s(&mut out, "\t.text\n");
+  // x9 = the UART's base.
+  w_s(&mut out, "bst_rt_serial_init:\n");
+  w_s(&mut out, "\tadrp x9, bst_uart_base\n");
+  w_s(&mut out, "\tldr x9, [x9, :lo12:bst_uart_base]\n");
+  w_s(&mut out, "\tcbnz x9, 1f\n");
+  w_s(&mut out, "\tmov x9, #0x9000000\n");
+  w_s(&mut out, "1:\tstr wzr, [x9, #0x30]       // off while configuring\n");
+  w_s(&mut out, "\tmov w10, #0x70\n");
+  w_s(&mut out, "\tstr w10, [x9, #0x2c]         // 8N1, FIFOs on\n");
+  w_s(&mut out, "\tmov w10, #0x10\n");
+  w_s(&mut out, "\tstr w10, [x9, #0x38]         // interrupt on received data\n");
+  w_s(&mut out, "\tmov w10, #0x301\n");
+  w_s(&mut out, "\tstr w10, [x9, #0x30]         // on: transmit and receive\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_flush:                   // nothing is buffered\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_putc:                    // write byte x0 to the UART once its FIFO has room\n");
+  w_s(&mut out, "\tadrp x9, bst_uart_base\n");
+  w_s(&mut out, "\tldr x9, [x9, :lo12:bst_uart_base]\n");
+  w_s(&mut out, "\tcbnz x9, 1f\n");
+  w_s(&mut out, "\tmov x9, #0x9000000\n");
+  w_s(&mut out, "1:\tldr w10, [x9, #0x18]\n");
+  w_s(&mut out, "\ttbnz w10, #5, 1b              // transmit FIFO full\n");
+  w_s(&mut out, "\tand w0, w0, #0xff\n");
+  w_s(&mut out, "\tstr w0, [x9]\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_getc:                    // x0 = the next byte received\n");
+  w_s(&mut out, "\tadrp x9, bst_uart_base\n");
+  w_s(&mut out, "\tldr x9, [x9, :lo12:bst_uart_base]\n");
+  w_s(&mut out, "\tcbnz x9, 1f\n");
+  w_s(&mut out, "\tmov x9, #0x9000000\n");
+  w_s(&mut out, "1:\tldr w10, [x9, #0x18]\n");
+  w_s(&mut out, "\ttbz w10, #4, 2f               // receive FIFO empty: wait\n");
+  w_s(&mut out, "\tyield\n");
+  w_s(&mut out, "\tb 1b\n");
+  w_s(&mut out, "2:\tldr w0, [x9]\n");
+  w_s(&mut out, "\tand w0, w0, #0xff\n");
+  w_s(&mut out, "\tret\n");
+  a64_rt_print(&mut out);
+  a64_rt_arena(&mut out, 131072);
+  w_s(&mut out, "bst_rt_oom:\n");
+  w_s(&mut out, "\tadrp x1, .Lrt_oom\n");
+  w_s(&mut out, "\tadd x1, x1, :lo12:.Lrt_oom\n");
+  w_s(&mut out, "\tmov x2, #22\n");
+  w_s(&mut out, "\tbl bst_rt_puts\n");
+  w_s(&mut out, "bst_rt_halt:\n");
+  w_s(&mut out, "\tmsr daifset, #0xf\n");
+  w_s(&mut out, "\twfe\n");
+  w_s(&mut out, "\tb bst_rt_halt\n");
+  w_s(&mut out, "bst_rt_puts:                    // write the x2 bytes at x1\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-32]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tstp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tmov x19, x1\n");
+  w_s(&mut out, "\tmov x20, x2\n");
+  w_s(&mut out, "1:\tcbz x20, 2f\n");
+  w_s(&mut out, "\tldrb w0, [x19], #1\n");
+  w_s(&mut out, "\tbl bst_rt_putc\n");
+  w_s(&mut out, "\tsub x20, x20, #1\n");
+  w_s(&mut out, "\tb 1b\n");
+  w_s(&mut out, "2:\tldp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #32\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_puthex:                  // write \"0x\" and x0 as 16 hex digits\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-32]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tstp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tmov x19, x0\n");
+  w_s(&mut out, "\tmov w0, #48\n");
+  w_s(&mut out, "\tbl bst_rt_putc\n");
+  w_s(&mut out, "\tmov w0, #120\n");
+  w_s(&mut out, "\tbl bst_rt_putc\n");
+  w_s(&mut out, "\tmov x20, #60\n");
+  w_s(&mut out, "1:\tlsr x0, x19, x20\n");
+  w_s(&mut out, "\tand w0, w0, #15\n");
+  w_s(&mut out, "\tcmp w0, #10\n");
+  w_s(&mut out, "\tb.lo 2f\n");
+  w_s(&mut out, "\tadd w0, w0, #39               // 'a' - '0' - 10\n");
+  w_s(&mut out, "2:\tadd w0, w0, #48\n");
+  w_s(&mut out, "\tbl bst_rt_putc\n");
+  w_s(&mut out, "\tsubs x20, x20, #4\n");
+  w_s(&mut out, "\tb.ge 1b\n");
+  w_s(&mut out, "\tldp x19, x20, [sp, #16]\n");
+  w_s(&mut out, "\tldp x29, x30, [sp], #32\n");
+  w_s(&mut out, "\tret\n");
+  w_s(&mut out, "\t.globl bst_kernel_fault       // called by the platform on a fault in kernel mode (x0 vector, x1 pc, x2 far, x3 esr)\n");
+  w_s(&mut out, "bst_kernel_fault:\n");
+  w_s(&mut out, "\tstp x29, x30, [sp, #-48]!\n");
+  w_s(&mut out, "\tmov x29, sp\n");
+  w_s(&mut out, "\tstp x0, x1, [sp, #16]\n");
+  w_s(&mut out, "\tstp x2, x3, [sp, #32]\n");
+  w_s(&mut out, "\tadrp x1, .Lrt_fault1\n");
+  w_s(&mut out, "\tadd x1, x1, :lo12:.Lrt_fault1\n");
+  w_s(&mut out, "\tmov x2, #30\n");
+  w_s(&mut out, "\tbl bst_rt_puts\n");
+  w_s(&mut out, "\tldr x0, [sp, #16]\n");
+  w_s(&mut out, "\tbl bst_rt_puthex\n");
+  w_s(&mut out, "\tadrp x1, .Lrt_fault2\n");
+  w_s(&mut out, "\tadd x1, x1, :lo12:.Lrt_fault2\n");
+  w_s(&mut out, "\tmov x2, #4\n");
+  w_s(&mut out, "\tbl bst_rt_puts\n");
+  w_s(&mut out, "\tldr x0, [sp, #24]\n");
+  w_s(&mut out, "\tbl bst_rt_puthex\n");
+  w_s(&mut out, "\tadrp x1, .Lrt_fault3\n");
+  w_s(&mut out, "\tadd x1, x1, :lo12:.Lrt_fault3\n");
+  w_s(&mut out, "\tmov x2, #5\n");
+  w_s(&mut out, "\tbl bst_rt_puts\n");
+  w_s(&mut out, "\tldr x0, [sp, #32]\n");
+  w_s(&mut out, "\tbl bst_rt_puthex\n");
+  w_s(&mut out, "\tadrp x1, .Lrt_fault4\n");
+  w_s(&mut out, "\tadd x1, x1, :lo12:.Lrt_fault4\n");
+  w_s(&mut out, "\tmov x2, #5\n");
+  w_s(&mut out, "\tbl bst_rt_puts\n");
+  w_s(&mut out, "\tldr x0, [sp, #40]\n");
+  w_s(&mut out, "\tbl bst_rt_puthex\n");
+  w_s(&mut out, "\tmov w0, #10\n");
+  w_s(&mut out, "\tbl bst_rt_putc\n");
+  w_s(&mut out, "\tb bst_rt_halt\n");
+  w_s(&mut out, "\t.set bst_rt_alloc_raw, bst_rt_alloc    // the arena hands out zeroed words either way\n");
+  w_s(&mut out, "\t.data\n");
+  w_s(&mut out, "\t.p2align 3\n");
+  w_s(&mut out, "\t.weak bst_uart_base           // a platform with the UART elsewhere defines its own\n");
+  w_s(&mut out, "bst_uart_base:\t.quad 0x9000000\n");
+  w_s(&mut out, "\t.bss\n");
+  w_s(&mut out, "\t.p2align 3\n");
+  w_s(&mut out, "bst_rt_mbi:\t.quad 0\n");
+  w_s(&mut out, "bst_rt_arena_top:\t.quad 0\n");
+  w_s(&mut out, "bst_rt_free_list:\t.quad 0\n");
+  w_s(&mut out, "bst_rt_arena:\t.zero 1048576\n");
+  w_s(&mut out, "\t.section .rodata\n");
+  w_s(&mut out, ".Lrt_oom:\n");
+  w_s(&mut out, "\t.string \"bastio: out of memory\\n\"\n");
+  w_s(&mut out, ".Lrt_fault1:\n");
+  w_s(&mut out, "\t.ascii \"\\nbastio: kernel fault, vector \"\n");
+  w_s(&mut out, ".Lrt_fault2:\n");
+  w_s(&mut out, "\t.ascii \" pc \"\n");
+  w_s(&mut out, ".Lrt_fault3:\n");
+  w_s(&mut out, "\t.ascii \" far \"\n");
+  w_s(&mut out, ".Lrt_fault4:\n");
+  w_s(&mut out, "\t.ascii \" esr \"\n");
   w_s(&mut out, "\t.text\n");
 }
 
@@ -2130,10 +2294,10 @@ fn a64_runtime_child(out: &mut Vec[u64]) {
   w_s(&mut out, "\t.text\n");
 }
 
-/// The number of parameters of the hosted `main` x when they are all `Host`s or `Serial`s
+/// The number of parameters of the hosted `main` x (a kernel's: `Serial`s only) when they are all `Host`s or `Serial`s
 /// (by value, or by `&mut`: the address of a frame word), which the entry
 /// passes as zero words; 1000 for any other kind.
-fn a64_main_words(m: &mut Mono, p: &Parser, x: u64) -> u64 {
+fn a64_main_words(m: &mut Mono, p: &Parser, x: u64, kernel: bool) -> u64 {
   let xi = inst_at(m, x);
   let dn = node_at(p.nodes, xi.def);
   let mut n = 0;
@@ -2142,6 +2306,9 @@ fn a64_main_words(m: &mut Mono, p: &Parser, x: u64) -> u64 {
     let qn = node_at(p.nodes, q);
     let pt = conv(&mut m, p, qn.a, x, q);
     let tk = kind_t(m, base_t(m, pt));
+    if kernel && tk != TY_SERIAL {
+      return 1000;                      // the kernel's pool, tables and processor are not covered yet
+    }
     if tk == TY_POOL {
       if kind_t(m, pt) == TY_POOL {
         n = wrap_add(n, 1);
@@ -2169,8 +2336,8 @@ fn a64_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
     }
     k = k + 1;
   }
-  if main_x == 0 || (g.target != TARGET_HOSTED && g.target != TARGET_USER) {
-    x86_fail(&mut g, "the AArch64 backend builds hosted and user programs with a `main` only so far");
+  if main_x == 0 || (g.target != TARGET_HOSTED && g.target != TARGET_USER && g.target != TARGET_KERNEL) {
+    x86_fail(&mut g, "the AArch64 backend builds hosted, user and kernel programs with a `main` only so far");
     return false;
   }
   w_s(&mut g.out, "// generated by bastioc1 --arch aarch64 --backend native -- do not edit\n\t.text\n");
@@ -2182,7 +2349,22 @@ fn a64_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
     }
     k = k + 1;
   }
-  if g.target == TARGET_USER {
+  if g.target == TARGET_KERNEL {
+    // Called by the platform's boot code with the memory map; what it
+    // returns is ignored (the platform powers off). The UART is set up only
+    // for a kernel that uses `Serial`.
+    w_s(&mut g.out, "\t.globl bst_kmain\n\t.type bst_kmain, %function\nbst_kmain:\n\tstp x29, x30, [sp, #-16]!\n\tmov x29, sp\n\tadrp x2, bst_rt_mbi\n\tstr x0, [x2, :lo12:bst_rt_mbi]\n");
+    let kxi = inst_at(m, main_x);
+    let kdn = node_at(p.nodes, kxi.def);
+    let mut kq = kdn.a;
+    while kq != 0 {
+      let kqn = node_at(p.nodes, kq);
+      if kind_t(m, base_t(m, conv(&mut m, p, kqn.a, main_x, kq))) == TY_SERIAL {
+        w_s(&mut g.out, "\tbl bst_rt_serial_init\n");
+      }
+      kq = kqn.next;
+    }
+  } else if g.target == TARGET_USER {
     // Called by user/start-aarch64.S; its result is the exit code.
     w_s(&mut g.out, "\t.globl bst_umain\n\t.type bst_umain, %function\nbst_umain:\n\tstp x29, x30, [sp, #-32]!\n\tmov x29, sp\n\tstr x19, [sp, #16]\n");
   } else {
@@ -2255,7 +2437,10 @@ fn a64_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
   ix_sym(&mut ms, &mut g, m, p, main_x);
   w_append(&mut g.out, ms);
   vec_free(ms);
-  if g.target == TARGET_USER {
+  if g.target == TARGET_KERNEL {
+    w_s(&mut g.out, "\n\tmov sp, x29\n\tldp x29, x30, [sp], #16\n\tret\n");
+    a64_runtime_kernel(&mut g.out);
+  } else if g.target == TARGET_USER {
     w_s(&mut g.out, "\n\tmov x19, x0\n\tbl bst_rt_flush\n\tmov x0, x19\n\tmov sp, x29\n\tldr x19, [sp, #16]\n\tldp x29, x30, [sp], #32\n\tret\n");
     a64_runtime_user(&mut g.out);
   } else {
