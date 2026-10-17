@@ -12,7 +12,9 @@
 #     aarch64` with the small platform beside it, boots on QEMU's virt
 #     machine and prints what it should: page tables, a user program at EL0
 #     making system calls, an abort, MMIO;
-#  5. the programs the native AArch64 backend (`--arch aarch64 --backend
+#  5. a kernel built by the native AArch64 backend (tests/aarch64/hello_kernel.bastio)
+#     boots the same way and prints what it should;
+#  6. the programs the native AArch64 backend (`--arch aarch64 --backend
 #     native`, no C compiler on the proved code) covers behave as under the C
 #     backend (tests/aarch64_native.sh).
 # The programs run under qemu-aarch64 unless this machine is an AArch64 one
@@ -98,6 +100,25 @@ if grep -q '^aarch64: kernel up, [0-9]* pages$' "$tmp/boot.txt" \
   echo "aarch64: the kernel boots on QEMU virt, runs a user program at EL0 and powers off"
 else
   echo "FAIL aarch64: the kernel's output on QEMU virt:"; sed 's/^/    /' "$tmp/boot.txt"; fails=$((fails+1))
+fi
+# The same platform boots a kernel built by the native backend (`--backend
+# native`, no C compiler on the proved code): the UART console and the
+# allocator in its own runtime so far (stage1/irarm64.bastio).
+"$BASTIOC" --target kernel --arch aarch64 --backend native --emit-asm -o "$tmp/hello.s" $k/hello_kernel.bastio 2>/dev/null
+${AARCH64_CC%gcc}as -o "$tmp/hello.o" "$tmp/hello.s"
+${AARCH64_CC%gcc}ld -nostdlib -static --no-warn-rwx-segments -T $k/linker.ld \
+  -o "$tmp/hello.elf" "$tmp/boot.o" "$tmp/hello.o" "$tmp/platform.o"
+timeout 60 qemu-system-aarch64 -M virt -cpu cortex-a57 -m 128M -nographic -no-reboot \
+  -kernel "$tmp/hello.elf" </dev/null >"$tmp/hello.out" 2>&1 || true
+tr -d '\r' <"$tmp/hello.out" >"$tmp/hello.txt"
+want="hello from the native AArch64 kernel
+sum of squares: 332833500
+ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMN
+0xdeadbeef"
+if [ "$(cat "$tmp/hello.txt")" = "$want" ]; then
+  echo "aarch64: a kernel built by the native backend boots on QEMU virt and prints"
+else
+  echo "FAIL aarch64: the native kernel's output on QEMU virt:"; sed 's/^/    /' "$tmp/hello.txt"; fails=$((fails+1))
 fi
 BASTIOC="$BASTIOC" tests/aarch64_native.sh || fails=$((fails+1))
 [ "$fails" = 0 ]
