@@ -716,6 +716,130 @@ fn ix_digits_val(v: &Vec[u64], i: u64, e: u64) -> u64 {
   return x;
 }
 
+/// The mnemonic of the jump that holds exactly when the one `inner` has at
+/// `i` (`je `, `jb `, ...) does not; empty when it is not one of those.
+fn ix_jcc_inv(inner: &Vec[u64], i: u64) -> Str {
+  if ix_has_at(inner, i, "je ") { return "jne"; }
+  if ix_has_at(inner, i, "jne ") { return "je"; }
+  if ix_has_at(inner, i, "jb ") { return "jae"; }
+  if ix_has_at(inner, i, "jae ") { return "jb"; }
+  if ix_has_at(inner, i, "jbe ") { return "ja"; }
+  if ix_has_at(inner, i, "ja ") { return "jbe"; }
+  if ix_has_at(inner, i, "jl ") { return "jge"; }
+  if ix_has_at(inner, i, "jge ") { return "jl"; }
+  if ix_has_at(inner, i, "jle ") { return "jg"; }
+  if ix_has_at(inner, i, "jg ") { return "jle"; }
+  return "";
+}
+
+/// The end of the line that starts at `s` (the position of its newline).
+fn ix_eol(v: &Vec[u64], s: u64) -> u64 {
+  let mut e = s;
+  while e < vec_len(v) && u_at(v, e) != 10 {
+    e = wrap_add(e, 1);
+  }
+  return e;
+}
+
+/// Whether the lines at `a` and `b` name the same label: the text of the
+/// jump's operand (after its mnemonic) against a label line without its colon.
+fn ix_same_label(v: &Vec[u64], a: u64, ae: u64, b: u64, be: u64) -> bool {
+  let mut x = a;
+  while x < ae && u_at(v, x) != 32 {
+    x = wrap_add(x, 1);
+  }
+  x = wrap_add(x, 1);
+  if be == 0 || wrap_sub(ae, x) != wrap_sub(wrap_sub(be, b), 1) {
+    return false;
+  }
+  let mut k = 0;
+  let n = wrap_sub(ae, x);
+  while k < n && k < 200 {
+    if u_at(v, wrap_add(x, k)) != u_at(v, wrap_add(b, k)) {
+      return false;
+    }
+    k = wrap_add(k, 1);
+  }
+  return true;
+}
+
+/// Whether a jump of `v` names the label on the line [b, be) (which ends
+/// with its colon).
+fn ix_label_used(v: &Vec[u64], b: u64, be: u64) -> bool {
+  let n = vec_len(v);
+  let mut s = 0;
+  while s < n {
+    let e = ix_eol(v, s);
+    if u_at(v, s) == 9 && u_at(v, wrap_add(s, 1)) == 106 && ix_same_label(v, wrap_add(s, 1), e, b, be) {
+      return true;
+    }
+    s = wrap_add(e, 1);
+  }
+  return false;
+}
+
+/// `jCC .La; [unused labels] jmp .Lb; .La:` (the branch around a jump)
+/// becomes `jNCC .Lb; [unused labels] .La:`.
+fn ix_flip_jumps(inner: &Vec[u64]) -> Vec[u64] {
+  let n = vec_len(inner);
+  let mut out = vec_new[u64]();
+  let mut s = 0;
+  while s < n {
+    let e = ix_eol(inner, s);
+    let mut done = false;
+    let inv = ix_jcc_inv(inner, wrap_add(s, 1));
+    if u_at(inner, s) == 9 && slen(inv) > 0 {
+      // The labels no jump reaches, then the jump.
+      let mut s2 = wrap_add(e, 1);
+      let mut e2 = ix_eol(inner, s2);
+      let mut more = true;
+      while more {
+        more = false;
+        if u_at(inner, s2) == 46 && e2 > s2 && u_at(inner, wrap_sub(e2, 1)) == 58 && !ix_label_used(inner, s2, e2) {
+          s2 = wrap_add(e2, 1);
+          e2 = ix_eol(inner, s2);
+          more = true;
+        }
+      }
+      if u_at(inner, s2) == 9 && ix_has_at(inner, wrap_add(s2, 1), "jmp .Lir") {
+        let s3 = wrap_add(e2, 1);
+        let e3 = ix_eol(inner, s3);
+        if e3 > s3 && u_at(inner, wrap_sub(e3, 1)) == 58 && ix_same_label(inner, wrap_add(s, 1), e, s3, e3) {
+          w_s(&mut out, "\t");
+          w_s(&mut out, inv);
+          w_s(&mut out, " ");
+          let mut x = wrap_add(s2, 5);
+          while x < e2 {
+            vec_push(&mut out, u_at(inner, x));
+            x = wrap_add(x, 1);
+          }
+          vec_push(&mut out, 10);
+          // The unused labels stay; the jump is gone.
+          let mut c = wrap_add(e, 1);
+          while c < s2 {
+            vec_push(&mut out, u_at(inner, c));
+            c = wrap_add(c, 1);
+          }
+          s = s3;
+          done = true;
+        }
+      }
+    }
+    if !done {
+      let mut c = s;
+      while c < e {
+        vec_push(&mut out, u_at(inner, c));
+        c = wrap_add(c, 1);
+      }
+      if e < n {
+        vec_push(&mut out, 10);
+      }
+      s = wrap_add(e, 1);
+    }
+  }
+  return out;
+}
+
 /// `inner` with the frame register `%fp` written as %rbp.
 fn ix_fp_classic(inner: &Vec[u64]) -> Vec[u64] {
   let n = vec_len(inner);
@@ -2698,7 +2822,8 @@ fn irx_function_n(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, nc
   w_s(&mut inner, ", .-");
   ix_sym(&mut inner, &mut g, m, p, x);
   w_s(&mut inner, "\n\n");
-  let mut framed = inner;
+  let mut framed = ix_flip_jumps(inner);
+  vec_free(inner);
   if !bare {
     // The frame is addressed from %rsp when the body allows it.
     let fp = ix_fpo(framed, wrap_mul(8, words));
