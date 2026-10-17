@@ -43,6 +43,15 @@ both() {
 export -f both
 lost=0
 pfor both $(s1files tests/pass/*.bastio bench/*.bastio) || lost=1
+# A copy to or from a page lent to a device is ordered both ways (`dmb osh`,
+# as the C prelude's bytes_to_dma and dma_to_bytes are): two copies, four
+# barriers, besides the two full ones of dma_lend and dma_take.
+"$BASTIOC" --arch aarch64 --backend native --emit-asm -o "$tmp/dma.s" tests/ir_a64/dma_copy.bastio 2>/dev/null
+if [ "$(grep -c 'dmb osh' "$tmp/dma.s")" = 4 ] && [ "$(grep -c 'dmb ish' "$tmp/dma.s")" = 2 ]; then
+  echo "aarch64 native: DMA copies carry dmb osh before and after"
+else
+  echo "FAIL tests/ir_a64/dma_copy.bastio: the DMA copies are not bracketed by dmb osh"; lost=1
+fi
 # The compiler itself, built for AArch64 with no C compiler on its code, must
 # compile itself to the same C as the build that runs here. It needs z3 on
 # the machine (qemu-aarch64 runs it as a host program).

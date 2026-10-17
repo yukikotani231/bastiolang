@@ -83,7 +83,7 @@ const IRS_KERNEL_TABLE: u64 = 9;
 const IR_DEVR: u64 = 61;     // d = the c-byte (1, 2, 4 or 8) value at address a, zero-extended: a volatile load, never dropped or reordered
 const IR_DEVW: u64 = 62;     // the low c bytes of b are stored at address a: a volatile store
 const IR_PIN: u64 = 63;      // d = the c-byte value read from I/O port a (`in`)
-const IR_FENCE: u64 = 65;    // a full memory fence (`dma_lend`, `dma_take`)
+const IR_FENCE: u64 = 65;    // a full memory fence (`dma_lend`, `dma_take`); with a = 1 the fence around a copy to or from a lent page, which only the AArch64 target emits (`dmb osh`; x86-64 DMA is coherent)
 const IR_MMCHK: u64 = 66;    // stops the machine if the block at address a, b bytes, is RAM (`mmio_claim` in the kernel): a runtime call that keeps every register
 const IR_TSC: u64 = 67;      // d = the processor's time-stamp counter (`cpu_tsc`)
 const IR_PCALL: u64 = 68;    // d = a call of one runtime or platform function, which c names, on (a, b) (ty: a constant for the callee; for c 20 to 31, a hosted runtime routine called with the four words at address a; for c 10 and 11, a is a system call number and b the address of three argument words, for 12 a is a Buf's data address and b the address of two bounds): a call for the allocator
@@ -2176,7 +2176,13 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let s = ir_int(&mut f, c, &mut m, p, a3);
     let cnt = ir_int(&mut f, c, &mut m, p, a4);
     if !f.failed {
+      if name_is(p, i, "bytes_to_dma") && c.arch == ARCH_AARCH64 {
+        ir_emit(&mut f, IR_FENCE, IR_NONE, 1, 0, 0, 0);
+      }
       ir_copy_bytes(&mut f, c, pg, o, src.r0, s, cnt);
+      if name_is(p, i, "bytes_to_dma") && c.arch == ARCH_AARCH64 {
+        ir_emit(&mut f, IR_FENCE, IR_NONE, 1, 0, 0, 0);
+      }
     }
     return ir_none();
   }
@@ -2192,7 +2198,13 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let o = ir_int(&mut f, c, &mut m, p, a3);
     let cnt = ir_int(&mut f, c, &mut m, p, a4);
     if !f.failed {
+      if name_is(p, i, "dma_to_bytes") && c.arch == ARCH_AARCH64 {
+        ir_emit(&mut f, IR_FENCE, IR_NONE, 1, 0, 0, 0);
+      }
       ir_copy_bytes(&mut f, c, dst.r0, d, pg, o, cnt);
+      if name_is(p, i, "dma_to_bytes") && c.arch == ARCH_AARCH64 {
+        ir_emit(&mut f, IR_FENCE, IR_NONE, 1, 0, 0, 0);
+      }
     }
     return ir_none();
   }
@@ -4825,6 +4837,9 @@ fn ir_print(out: &mut Vec[u64], f: &IrFn, m: &Mono, p: &Parser) {
       ir_w_reg(&mut out, q.a);
     } else if q.op == IR_FENCE {
       w_s(&mut out, "fence");
+      if q.a == 1 {
+        w_s(&mut out, " dma");
+      }
     } else if q.op == IR_DEVR || q.op == IR_PIN {
       ir_w_reg(&mut out, q.d);
       if q.op == IR_DEVR {
