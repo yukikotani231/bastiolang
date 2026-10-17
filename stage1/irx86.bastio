@@ -1822,6 +1822,115 @@ fn ix_addr_fold(f: &mut IrFn) -> u64 {
   return found;
 }
 
+/// Where an if/else has a straight run of instructions with a load for its
+/// then-arm and a few instructions for its else-arm, as the bounds test of a
+/// vector read inlined from `get`, the then-arm goes last and falls into the
+/// join: the common path then runs no `jmp` over the else-arm.
+fn ix_arms(f: &mut IrFn) {
+  let n = vec_len(f.ins);
+  let mut refs = vec_new[u64]();
+  let mut l = 0;
+  while l < f.nlabel && l < 1000000000 {
+    vec_push(&mut refs, 0);
+    l = l + 1;
+  }
+  let mut i = 0;
+  while i < n {
+    let q = ix_at(f, i);
+    if q.op == IR_JMP && q.a < f.nlabel {
+      ra_set(&mut refs, q.a, wrap_add(u_at(refs, q.a), 1));
+    }
+    if q.op == IR_BR {
+      if q.b < f.nlabel {
+        ra_set(&mut refs, q.b, wrap_add(u_at(refs, q.b), 1));
+      }
+      if q.c < f.nlabel {
+        ra_set(&mut refs, q.c, wrap_add(u_at(refs, q.c), 1));
+      }
+    }
+    i = i + 1;
+  }
+  let mut out = vec_new[IrIns]();
+  i = 0;
+  while i < n {
+    let q = ix_at(f, i);
+    let mut next = wrap_add(i, 1);
+    let mut swapped = false;
+    if q.op == IR_BR && q.b != q.c && q.b < f.nlabel && q.c < f.nlabel && u_at(refs, q.b) == 1 && u_at(refs, q.c) == 1 {
+      let t0 = ix_at(f, wrap_add(i, 1));
+      if t0.op == IR_LABEL && t0.a == q.b {
+        // The then-arm: a straight run to a jump.
+        let mut k = wrap_add(i, 2);
+        let mut going = true;
+        let mut ok = true;
+        let mut load = false;
+        while going && k < n && k < wrap_add(i, 16) {
+          let r = ix_at(f, k);
+          if r.op == IR_JMP {
+            going = false;
+          } else {
+            if r.op == IR_LABEL || r.op == IR_BR || r.op == IR_RET || r.op == IR_UNREACH {
+              ok = false;
+              going = false;
+            }
+            if r.op == IR_LOAD {
+              load = true;
+            }
+            k = wrap_add(k, 1);
+          }
+        }
+        let jm = ix_at(f, k);
+        let e0 = ix_at(f, wrap_add(k, 1));
+        if ok && load && !going && k < n && jm.op == IR_JMP && e0.op == IR_LABEL && e0.a == q.c {
+          // The else-arm: a few instructions that run into the join.
+          let mut m = wrap_add(k, 2);
+          let mut g2 = true;
+          let mut ok2 = true;
+          while g2 && m < n && m < wrap_add(k, 7) {
+            let r = ix_at(f, m);
+            if r.op == IR_LABEL {
+              if r.a != jm.a {
+                ok2 = false;
+              }
+              g2 = false;
+            } else {
+              if r.op == IR_JMP || r.op == IR_BR || r.op == IR_RET || r.op == IR_UNREACH || r.op == IR_LOAD || r.op == IR_CALL || r.op == IR_CALLM {
+                ok2 = false;
+                g2 = false;
+              }
+              m = wrap_add(m, 1);
+            }
+          }
+          if ok2 && !g2 && m < n {
+            // Branch, then the else-arm with its jump, then the then-arm.
+            vec_push(&mut out, q);
+            let mut e = wrap_add(k, 1);
+            while e < m {
+              vec_push(&mut out, ix_at(f, e));
+              e = wrap_add(e, 1);
+            }
+            vec_push(&mut out, jm);
+            let mut t = wrap_add(i, 1);
+            while t < k {
+              vec_push(&mut out, ix_at(f, t));
+              t = wrap_add(t, 1);
+            }
+            next = m;
+            swapped = true;
+          }
+        }
+      }
+    }
+    if !swapped {
+      vec_push(&mut out, q);
+    }
+    i = next;
+  }
+  vec_free(f.ins);
+  f.ins = out;
+  vec_free(refs);
+}
+
 /// `t = op ...; s = mov t`, where `t` is written and read only there,
 /// becomes `s = op ...`: the copies the lowering makes for `s = s + 1` and
 /// `let s = 0`.
@@ -2291,6 +2400,7 @@ fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   iropt_reach(&mut f);
   iropt_labels(&mut f);
   ix_coalesce(&mut f);
+  ix_arms(&mut f);
   let xi = inst_at(m, x);
   let pos = ix_positions(&mut g, c, &mut m, p, x);
   let mut ok = vec_len(pos) == vec_len(f.params);
