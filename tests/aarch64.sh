@@ -120,5 +120,25 @@ if [ "$(cat "$tmp/hello.txt")" = "$want" ]; then
 else
   echo "FAIL aarch64: the native kernel's output on QEMU virt:"; sed 's/^/    /' "$tmp/hello.txt"; fails=$((fails+1))
 fi
+# With a pool: the runs of RAM the platform lists, pages taken and given back, and the
+# allocator's second arena (carved from the pool) once the first is full.
+"$BASTIOC" --target kernel --arch aarch64 --backend native --emit-asm -o "$tmp/pool.s" $k/hello_pool.bastio 2>/dev/null
+${AARCH64_CC%gcc}as -o "$tmp/pool.o" "$tmp/pool.s"
+${AARCH64_CC%gcc}ld -nostdlib -static --no-warn-rwx-segments -T $k/linker.ld \
+  -o "$tmp/pool.elf" "$tmp/boot.o" "$tmp/pool.o" "$tmp/platform.o"
+timeout 60 qemu-system-aarch64 -M virt -cpu cortex-a57 -m 128M -nographic -no-reboot \
+  -kernel "$tmp/pool.elf" </dev/null >"$tmp/pool.out" 2>&1 || true
+tr -d '\r' <"$tmp/pool.out" >"$tmp/pool.txt"
+want="more than 1000 pages: yes
+ids 0 7
+zeroed 0
+words 0x1234 0x5678
+distinct yes
+big 199999"
+if [ "$(cat "$tmp/pool.txt")" = "$want" ]; then
+  echo "aarch64: a native kernel takes pages from the pool and grows past its first arena"
+else
+  echo "FAIL aarch64: the native pool kernel's output on QEMU virt:"; sed 's/^/    /' "$tmp/pool.txt"; fails=$((fails+1))
+fi
 BASTIOC="$BASTIOC" tests/aarch64_native.sh || fails=$((fails+1))
 [ "$fails" = 0 ]
