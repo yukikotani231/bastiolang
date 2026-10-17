@@ -3251,6 +3251,20 @@ fn iropt_cse(f: &mut IrFn) -> u64 {
               iropt_tab_add(&mut tab, q.op, ka.v, ka.kind, kb.v, kb.kind, q.c, q.ty, q.d, IR_NONE);
             }
           }
+        } else if q.op == IR_RT && (q.c == IRS_FRAME_ID || q.c == IRS_PAGE_AT) && q.d < nr && q.a < nr && q.d != q.a && u_at(ndef, q.a) == 1 && u_at(ndef, q.d) == 1 {
+          // The runs of RAM are fixed once the pool is set up, so the page
+          // number of an address (and the address of a page) is a function
+          // of the register alone.
+          let ka = iropt_keyed(ndef, cv, rep, q.a);
+          let e = iropt_tab_find(tab, q.op, ka.v, ka.kind, 0, 2, q.c, 0);
+          if e != IR_NONE {
+            let hit = u_at(tab.res, e);
+            vec_set(&mut f.ins, i, IrIns { op: IR_MOV, d: q.d, a: hit, b: 0, c: 0, ty: 0 });
+            found = wrap_add(found, 1);
+            ra_set(&mut rep, q.d, hit);
+          } else {
+            iropt_tab_add(&mut tab, q.op, ka.v, ka.kind, 0, 2, q.c, 0, q.d, IR_NONE);
+          }
         } else if iropt_is_cmp(q.op) && q.d < nr && q.a < nr && q.b < nr && q.d != q.a && q.d != q.b {
           let v = iropt_decide(tab, ndef, cv, rep, q);
           if v != IR_NONE {
