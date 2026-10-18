@@ -79,6 +79,10 @@ const IRS_PT_LEASES: u64 = 6;
 const IRS_SHARED_REFS: u64 = 7;
 const IRS_USER_TABLE: u64 = 8;
 const IRS_KERNEL_TABLE: u64 = 9;
+const IRS_SYNC_ICACHE: u64 = 10;   // AArch64: cleans a page to the point of unification and invalidates the instruction cache over it; the result is the argument
+const IRS_PT_GEN: u64 = 11;        // AArch64: the count of entries taken out of any table
+const IRS_KERNEL_ROOT: u64 = 12;   // AArch64: the platform's top-level table
+const IRS_DEFERRED: u64 = 13;      // AArch64: defined by a platform that loads user tables from a trampoline
 
 const IR_DEVR: u64 = 61;     // d = the c-byte (1, 2, 4 or 8) value at address a, zero-extended: a volatile load, never dropped or reordered
 const IR_DEVW: u64 = 62;     // the low c bytes of b are stored at address a: a volatile store
@@ -399,6 +403,32 @@ fn ir_page_id(f: &mut IrFn, c: &Checker, fr: u64) -> u64 {
     ir_emit(&mut f, IR_SHR, d, off, sh, 0, 0);
   }
   return d;
+}
+
+/// The mask of the address bits of a page table entry: x86-64's (bits 12 to 51)
+/// or AArch64's (bits 12 to 47).
+fn ir_pte_mask(c: &Checker) -> u64 {
+  if c.arch == ARCH_AARCH64 {
+    return 281474976706560;
+  }
+  return 4503599627366400;
+}
+
+/// The address of slot `ix` of the table at address register `t`.
+fn ir_slot_addr(f: &mut IrFn, t: u64, ix: u64) -> u64 {
+  let three = ir_k(&mut f, 3);
+  let off = ir_reg(&mut f);
+  ir_emit(&mut f, IR_SHL, off, ix, three, 0, 0);
+  let at = ir_reg(&mut f);
+  ir_emit(&mut f, IR_ADD, at, t, off, 0, 0);
+  return at;
+}
+
+/// A page table entry written with one 64-bit store-release: another
+/// processor may be walking the table (the C prelude's `__atomic_store_n`).
+fn ir_pte_release(f: &mut IrFn, t: u64, ix: u64, e: u64) {
+  let at = ir_slot_addr(&mut f, t, ix);
+  ir_emit(&mut f, IR_DEVW, IR_NONE, at, e, 8, 0);
 }
 
 /// The address of the 32-bit count of the page at address register `pg` in
@@ -2711,13 +2741,27 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       let l_done = f.nlabel;
       f.nlabel = wrap_add(f.nlabel, 1);
       let four = ir_k(&mut f, 4);
-      let is4 = ir_reg(&mut f);
+      let mut is4 = ir_reg(&mut f);
       ir_emit(&mut f, IR_EQ, is4, lv, four, 0, 0);
+      let mut ksym = IRS_KERNEL_PML4;
+      if c.arch == ARCH_AARCH64 {
+        // Not on a platform that loads the user's table from a trampoline of
+        // its own (BST_DEFERRED): the weak symbol it defines is then non-zero.
+        let dv = ir_reg(&mut f);
+        ir_emit(&mut f, IR_GLOBAL, dv, IRS_DEFERRED, 0, 1, 0);
+        let zero = ir_k(&mut f, 0);
+        let nd = ir_reg(&mut f);
+        ir_emit(&mut f, IR_EQ, nd, dv, zero, 0, 0);
+        let both = ir_reg(&mut f);
+        ir_emit(&mut f, IR_AND, both, is4, nd, 0, 0);
+        is4 = both;
+        ksym = IRS_KERNEL_ROOT;
+      }
       ir_emit(&mut f, IR_BR, IR_NONE, is4, l_hook, l_done, 0);
       ir_emit(&mut f, IR_LABEL, IR_NONE, l_hook, 0, 0, 0);
       let gv = ir_reg(&mut f);
-      ir_emit(&mut f, IR_GLOBAL, gv, IRS_KERNEL_PML4, 0, 0, 0);
-      let mask = ir_k(&mut f, 4503599627366400);
+      ir_emit(&mut f, IR_GLOBAL, gv, ksym, 0, 0, 0);
+      let mask = ir_k(&mut f, ir_pte_mask(c));
       let hi = ir_reg(&mut f);
       ir_emit(&mut f, IR_AND, hi, gv, mask, 0, 0);
       let three = ir_k(&mut f, 3);
@@ -2977,7 +3021,7 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       }
       let e = ir_reg(&mut f);
       ir_emit(&mut f, IR_LOAD, e, t, ix, 8, 0);
-      let mask = ir_k(&mut f, 4503599627366400);
+      let mask = ir_k(&mut f, ir_pte_mask(c));
       pg = ir_reg(&mut f);
       ir_emit(&mut f, IR_AND, pg, e, mask, 0, 0);
     } else {
@@ -3113,7 +3157,31 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let e = ir_reg(&mut f);
     ir_emit(&mut f, IR_LOAD, e, t, ix, 8, 0);
     let d = ir_reg(&mut f);
-    if name_is(p, i, "pt_has") {
+    if c.arch == ARCH_AARCH64 {
+      // Bit 0 is valid, bit 7 read-only (AP[2]), bit 55 the software bit that
+      // marks a hidden entry that is still owned.
+      let one = ir_reg(&mut f);
+      ir_emit(&mut f, IR_CONST, one, 1, 0, 0, 0);
+      if name_is(p, i, "pt_has") {
+        let k = ir_reg(&mut f);
+        ir_emit(&mut f, IR_CONST, k, 36028797018963969, 0, 0, 0);
+        let a = ir_reg(&mut f);
+        ir_emit(&mut f, IR_AND, a, e, k, 0, 0);
+        let z = ir_reg(&mut f);
+        ir_emit(&mut f, IR_CONST, z, 0, 0, 0, 0);
+        ir_emit(&mut f, IR_NE, d, a, z, 0, 0);
+      } else if name_is(p, i, "pt_writable") {
+        let seven = ir_reg(&mut f);
+        ir_emit(&mut f, IR_CONST, seven, 7, 0, 0, 0);
+        let a = ir_reg(&mut f);
+        ir_emit(&mut f, IR_SHR, a, e, seven, 0, 0);
+        let b = ir_reg(&mut f);
+        ir_emit(&mut f, IR_AND, b, a, one, 0, 0);
+        ir_emit(&mut f, IR_XOR, d, b, one, 0, 0);
+      } else {
+        ir_emit(&mut f, IR_AND, d, e, one, 0, 0);
+      }
+    } else if name_is(p, i, "pt_has") {
       let k = ir_reg(&mut f);
       ir_emit(&mut f, IR_CONST, k, 1025, 0, 0, 0);
       let a = ir_reg(&mut f);
@@ -3141,6 +3209,41 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let ix = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
     let fr = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 2));
     let mut e = fr;
+    if c.arch == ARCH_AARCH64 {
+      // A table entry is valid and of type table; a last-level entry is a
+      // page with the access flag set, read-only (RO) or never executable at
+      // EL0 when writable (UXN, W^X), and is cleaned for the instruction
+      // cache first.
+      if name_is(p, i, "pt_put") {
+        let k = ir_k(&mut f, 3);
+        e = ir_reg(&mut f);
+        ir_emit(&mut f, IR_OR, e, fr, k, 0, 0);
+      } else {
+        let w = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 3));
+        let page = ir_reg(&mut f);
+        ir_emit(&mut f, IR_RT, page, fr, 0, IRS_SYNC_ICACHE, 0);
+        let zero = ir_k(&mut f, 0);
+        let wm = ir_reg(&mut f);
+        ir_emit(&mut f, IR_SUB, wm, zero, w, 0, 0);
+        let diff = ir_k(&mut f, 18014398509482112);
+        let sel = ir_reg(&mut f);
+        ir_emit(&mut f, IR_AND, sel, wm, diff, 0, 0);
+        let ro = ir_k(&mut f, 128);
+        let wx = ir_reg(&mut f);
+        ir_emit(&mut f, IR_XOR, wx, sel, ro, 0, 0);
+        let mut bits = 9007199254744899;
+        if name_is(p, i, "pt_put_shared") {
+          bits = 81064793292672835;
+        }
+        let k = ir_k(&mut f, bits);
+        let o1 = ir_reg(&mut f);
+        ir_emit(&mut f, IR_OR, o1, page, k, 0, 0);
+        e = ir_reg(&mut f);
+        ir_emit(&mut f, IR_OR, e, o1, wx, 0, 0);
+      }
+      ir_pte_release(&mut f, t, ix, e);
+      return ir_none();
+    }
     if name_is(p, i, "pt_put") {
       let k = ir_k(&mut f, 7);
       e = ir_reg(&mut f);
@@ -3171,7 +3274,15 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     ir_emit(&mut f, IR_LOAD, e, t, ix, 8, 0);
     let z = ir_k(&mut f, 0);
     ir_emit(&mut f, IR_STORE, z, t, ix, 8, 0);
-    let mask = ir_k(&mut f, 4503599627366400);
+    if c.arch == ARCH_AARCH64 {
+      // A taken entry may still be cached by another processor's TLB: the
+      // count of takes moves, and a processor flushes before it next runs
+      // user code if it moved since its last flush.
+      let gen = ir_reg(&mut f);
+      ir_emit(&mut f, IR_GLOBAL, gen, IRS_PT_GEN, 0, 1, 0);
+      ir_emit(&mut f, IR_LOCKINC, IR_NONE, gen, 0, 0, 0);
+    }
+    let mask = ir_k(&mut f, ir_pte_mask(c));
     let d = ir_reg(&mut f);
     ir_emit(&mut f, IR_AND, d, e, mask, 0, 0);
     return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
@@ -3184,6 +3295,48 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let acc = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 2));
     let e = ir_reg(&mut f);
     ir_emit(&mut f, IR_LOAD, e, t, ix, 8, 0);
+    if c.arch == ARCH_AARCH64 {
+      // Clears valid, read-only and hidden (bit 55), then sets hidden and
+      // read-only for 0, valid and read-only for 1, valid for 2.
+      let keep = ir_k(&mut f, 18410715276690587518);
+      let base = ir_reg(&mut f);
+      ir_emit(&mut f, IR_AND, base, e, keep, 0, 0);
+      let zero = ir_k(&mut f, 0);
+      let two = ir_k(&mut f, 2);
+      let one = ir_k(&mut f, 1);
+      let isz = ir_reg(&mut f);
+      ir_emit(&mut f, IR_EQ, isz, acc, zero, 0, 0);
+      let is2 = ir_reg(&mut f);
+      ir_emit(&mut f, IR_EQ, is2, acc, two, 0, 0);
+      let zm = ir_reg(&mut f);
+      ir_emit(&mut f, IR_SUB, zm, zero, isz, 0, 0);
+      let ones = ir_k(&mut f, 18446744073709551615);
+      let nzm = ir_reg(&mut f);
+      ir_emit(&mut f, IR_XOR, nzm, zm, ones, 0, 0);
+      let not2 = ir_reg(&mut f);
+      ir_emit(&mut f, IR_SUB, not2, one, is2, 0, 0);
+      let seven = ir_k(&mut f, 7);
+      let ro = ir_reg(&mut f);
+      ir_emit(&mut f, IR_SHL, ro, not2, seven, 0, 0);
+      let nzv = ir_reg(&mut f);
+      ir_emit(&mut f, IR_OR, nzv, ro, one, 0, 0);
+      let hid = ir_k(&mut f, 36028797018964096);
+      let zbits = ir_reg(&mut f);
+      ir_emit(&mut f, IR_AND, zbits, zm, hid, 0, 0);
+      let ro128 = ir_k(&mut f, 128);
+      let zro = ir_reg(&mut f);
+      ir_emit(&mut f, IR_AND, zro, zm, ro128, 0, 0);
+      let nzbits = ir_reg(&mut f);
+      ir_emit(&mut f, IR_AND, nzbits, nzm, nzv, 0, 0);
+      let b1 = ir_reg(&mut f);
+      ir_emit(&mut f, IR_OR, b1, zbits, zro, 0, 0);
+      let b2 = ir_reg(&mut f);
+      ir_emit(&mut f, IR_OR, b2, b1, nzbits, 0, 0);
+      let out = ir_reg(&mut f);
+      ir_emit(&mut f, IR_OR, out, base, b2, 0, 0);
+      ir_pte_release(&mut f, t, ix, out);
+      return ir_none();
+    }
     let keep = ir_k(&mut f, 18446744073709550588);
     let base = ir_reg(&mut f);
     ir_emit(&mut f, IR_AND, base, e, keep, 0, 0);
@@ -3215,7 +3368,11 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let ix = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
     let e = ir_reg(&mut f);
     ir_emit(&mut f, IR_LOAD, e, t, ix, 8, 0);
-    let nine = ir_k(&mut f, 9);
+    let mut bitno = 9;
+    if c.arch == ARCH_AARCH64 {
+      bitno = 56;
+    }
+    let nine = ir_k(&mut f, bitno);
     let sh = ir_reg(&mut f);
     ir_emit(&mut f, IR_SHR, sh, e, nine, 0, 0);
     let one = ir_k(&mut f, 1);
@@ -3261,7 +3418,7 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let e = ir_reg(&mut f);
     ir_emit(&mut f, IR_LOAD, e, t, ix, 8, 0);
     let mask = ir_reg(&mut f);
-    ir_emit(&mut f, IR_CONST, mask, 4503599627366400, 0, 0, 0);
+    ir_emit(&mut f, IR_CONST, mask, ir_pte_mask(c), 0, 0, 0);
     let child = ir_reg(&mut f);
     ir_emit(&mut f, IR_AND, child, e, mask, 0, 0);
     let callee = plain_inst(&mut m, def);
@@ -4576,6 +4733,10 @@ fn ir_sym(i: u64) -> Str {
   if i == IRS_SHARED_REFS { return "bst_rt_shared_refs"; }
   if i == IRS_USER_TABLE { return "bst_rt_user_table"; }
   if i == IRS_KERNEL_TABLE { return "bst_rt_kernel_table"; }
+  if i == IRS_SYNC_ICACHE { return "bst_rt_sync_icache"; }
+  if i == IRS_PT_GEN { return "bst_rt_pt_gen"; }
+  if i == IRS_KERNEL_ROOT { return "bst_kernel_root"; }
+  if i == IRS_DEFERRED { return "bst_platform_deferred_ttbr0"; }
   return "bst_kernel_pml4";
 }
 

@@ -1,0 +1,79 @@
+// stage1-only: the AArch64 kernel target
+// A kernel built by the native AArch64 backend that builds a page table
+// (tests/aarch64.sh): entries put, inspected, changed and taken out on
+// AArch64 descriptors, a page mapped through two tables as a shared page
+// and given back with the last reference. No Mmu or processor yet.
+import "core/print.bastio";
+
+fn say(con: &mut Serial, ok: bool) {
+  if ok {
+    print_str(con, " yes");
+  } else {
+    print_str(con, " no");
+  }
+}
+
+// has, accessible, writable, shared for a slot of a last-level table.
+fn show(con: &mut Serial, t: &PageTable, i: u64)
+  requires pt_level(t) == 1 && i < 512
+{
+  say(&mut con, pt_has(t, i));
+  say(&mut con, pt_accessible(t, i));
+  say(&mut con, pt_writable(t, i));
+  say(&mut con, pt_shared(t, i));
+  print_nl(con);
+}
+
+fn main(con: &mut Serial, pool: &mut Pool) -> u64 {
+  if pool_size(pool) < 6 {
+    return 1;
+  }
+  let mut code = pool_take(&mut pool, 0);
+  frame_write(&mut code, 0, 0x1111);
+  let mut t = pt_new(pool_take(&mut pool, 1), 1);
+  print_str(con, "empty:");
+  show(&mut con, t, 3);
+  pt_put_frame(&mut t, 3, code, false);
+  print_str(con, "read-only:");
+  show(&mut con, t, 3);
+  pt_set_access(&mut t, 3, 2);
+  print_str(con, "read-write:");
+  show(&mut con, t, 3);
+  pt_set_access(&mut t, 3, 0);
+  print_str(con, "hidden:");
+  show(&mut con, t, 3);
+  pt_set_access(&mut t, 3, 1);
+  print_str(con, "read:");
+  show(&mut con, t, 3);
+  let back = pt_take_frame(&mut t, 3);
+  print_str(con, "taken:");
+  show(&mut con, t, 3);
+  print_str(con, "page ");
+  print_u64(con, frame_id(back));
+  print_str(con, " word ");
+  print_hex(con, frame_read(back, 0));
+  print_nl(con);
+  pt_put_frame(&mut t, 4, back, true);
+  print_str(con, "writable:");
+  show(&mut con, t, 4);
+  let mut u = pt_new(pool_take(&mut pool, 2), 1);
+  let s = shared_new(pool_take(&mut pool, 3));
+  pt_put_shared(&mut u, 7, shared_dup(s), false);
+  pt_put_shared(&mut t, 5, s, true);
+  print_str(con, "shared:");
+  show(&mut con, t, 5);
+  let first = shared_drop(&mut pool, pt_take_shared(&mut t, 5));
+  let last = shared_drop(&mut pool, pt_take_shared(&mut u, 7));
+  print_str(con, "drops ");
+  print_hex(con, first);
+  print_str(con, " ");
+  print_u64(con, last);
+  print_nl(con);
+  if last != 18446744073709551615 {
+    pool_give(&mut pool, pool_take(&mut pool, last));
+  }
+  pool_give(&mut pool, pt_take_frame(&mut t, 4));
+  pool_give(&mut pool, pt_free(t));
+  pool_give(&mut pool, pt_free(u));
+  return 0;
+}

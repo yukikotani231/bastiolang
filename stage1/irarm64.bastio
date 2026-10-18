@@ -1041,7 +1041,7 @@ fn a64_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
       why = 4;
       bad_op = q.op;
     }
-    if (q.op == IR_RT && !(g.target == TARGET_KERNEL && (q.c == IRS_PAGE_AT || q.c == IRS_FRAME_ID))) || q.op == IR_TSC || q.op == IR_MMCHK || q.op == IR_PIN || q.op == IR_POUT {
+    if (q.op == IR_RT && !(g.target == TARGET_KERNEL && (q.c == IRS_PAGE_AT || q.c == IRS_FRAME_ID || q.c == IRS_SYNC_ICACHE))) || q.op == IR_TSC || q.op == IR_MMCHK || q.op == IR_PIN || q.op == IR_POUT {
       ok = false;
       why = 4;
       bad_op = q.op;
@@ -1521,8 +1521,29 @@ fn a64_rt_pool(out: &mut Vec[u64]) {
   w_s(&mut out, "\tldr x7, [x9, x16, lsl #3]\n");
   w_s(&mut out, "\tadd x0, x0, x7\n");
   w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_sync_icache:             // x0 = a page's address, kept: clean it to the PoU, invalidate the I-cache over it\n");
+  w_s(&mut out, "\tmrs x9, ctr_el0\n");
+  w_s(&mut out, "\tubfx x10, x9, #16, #4\n");
+  w_s(&mut out, "\tmov x11, #4\n");
+  w_s(&mut out, "\tlsl x10, x11, x10\n");
+  w_s(&mut out, "\tand x9, x9, #15\n");
+  w_s(&mut out, "\tlsl x9, x11, x9\n");
+  w_s(&mut out, "\tadd x17, x0, #4096\n");
+  w_s(&mut out, "\tmov x16, x0\n");
+  w_s(&mut out, "1:\tdc cvau, x16\n");
+  w_s(&mut out, "\tadd x16, x16, x10\n");
+  w_s(&mut out, "\tcmp x16, x17\n");
+  w_s(&mut out, "\tb.lo 1b\n");
+  w_s(&mut out, "\tdsb ish\n");
+  w_s(&mut out, "\tmov x16, x0\n");
+  w_s(&mut out, "2:\tic ivau, x16\n");
+  w_s(&mut out, "\tadd x16, x16, x9\n");
+  w_s(&mut out, "\tcmp x16, x17\n");
+  w_s(&mut out, "\tb.lo 2b\n");
+  w_s(&mut out, "\tdsb ish\n");
+  w_s(&mut out, "\tisb\n");
+  w_s(&mut out, "\tret\n");
 }
-
 
 /// The allocator over a fixed arena of `words` words (`bst_rt_arena`, with `bst_rt_arena_top` and
 /// `bst_rt_free_list` beside it in the .bss) and the Vec growth built on it.
@@ -1957,6 +1978,7 @@ fn a64_runtime_kernel(out: &mut Vec[u64]) {
   w_s(&mut out, "\t.set bst_rt_alloc_raw, bst_rt_alloc    // the arena hands out zeroed words either way\n");
   w_s(&mut out, "\t.data\n");
   w_s(&mut out, "\t.p2align 3\n");
+  w_s(&mut out, "\t.weak bst_platform_deferred_ttbr0   // defined by a platform that loads user tables from a trampoline\n");
   w_s(&mut out, "\t.weak bst_ram_limit            // where the platform's map of RAM stops, if it says\n");
   w_s(&mut out, "\t.weak bst_uart_base           // a platform with the UART elsewhere defines its own\n");
   w_s(&mut out, "bst_uart_base:\t.quad 0x9000000\n");
@@ -1966,6 +1988,7 @@ fn a64_runtime_kernel(out: &mut Vec[u64]) {
   w_s(&mut out, "bst_rt_arena_top:\t.quad 0\n");
   w_s(&mut out, "bst_rt_free_list:\t.quad 0\n");
   w_s(&mut out, "bst_rt_arena:\t.zero 1048576\n");
+  w_s(&mut out, "bst_rt_pt_gen:\t.quad 0\n");
   w_s(&mut out, "bst_rt_arena2:\t.quad 0\n");
   w_s(&mut out, "bst_rt_arena2_words:\t.quad 0\n");
   w_s(&mut out, "bst_rt_arena2_top:\t.quad 0\n");

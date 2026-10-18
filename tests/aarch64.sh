@@ -12,8 +12,8 @@
 #     aarch64` with the small platform beside it, boots on QEMU's virt
 #     machine and prints what it should: page tables, a user program at EL0
 #     making system calls, an abort, MMIO;
-#  5. a kernel built by the native AArch64 backend (tests/aarch64/hello_kernel.bastio)
-#     boots the same way and prints what it should;
+#  5. kernels built by the native AArch64 backend (tests/aarch64/hello_kernel, hello_pool and hello_pt)
+#     boot the same way and print what they should;
 #  6. the programs the native AArch64 backend (`--arch aarch64 --backend
 #     native`, no C compiler on the proved code) covers behave as under the C
 #     backend (tests/aarch64_native.sh).
@@ -139,6 +139,26 @@ if [ "$(cat "$tmp/pool.txt")" = "$want" ]; then
   echo "aarch64: a native kernel takes pages from the pool and grows past its first arena"
 else
   echo "FAIL aarch64: the native pool kernel's output on QEMU virt:"; sed 's/^/    /' "$tmp/pool.txt"; fails=$((fails+1))
+fi
+# With page tables: AArch64 descriptors (valid, read-only, hidden, shared bits, the instruction
+# cache cleaned before a page is mapped); the same kernel built by the C backend must print the same.
+"$BASTIOC" --target kernel --arch aarch64 --backend native --emit-asm -o "$tmp/pt.s" $k/hello_pt.bastio 2>/dev/null
+${AARCH64_CC%gcc}as -o "$tmp/pt.o" "$tmp/pt.s"
+${AARCH64_CC%gcc}ld -nostdlib -static --no-warn-rwx-segments -T $k/linker.ld \
+  -o "$tmp/pt.elf" "$tmp/boot.o" "$tmp/pt.o" "$tmp/platform.o"
+"$BASTIOC" --target kernel --arch aarch64 -o "$tmp/ptc.c" $k/hello_pt.bastio 2>/dev/null
+$AARCH64_CC $CFLAGS -w -c -o "$tmp/ptc.o" "$tmp/ptc.c"
+${AARCH64_CC%gcc}ld -nostdlib -static --no-warn-rwx-segments -T $k/linker.ld \
+  -o "$tmp/ptc.elf" "$tmp/boot.o" "$tmp/ptc.o" "$tmp/platform.o"
+for v in pt ptc; do
+  timeout 60 qemu-system-aarch64 -M virt -cpu cortex-a57 -m 128M -nographic -no-reboot \
+    -kernel "$tmp/$v.elf" </dev/null 2>&1 | tr -d '\r' >"$tmp/$v.txt" || true
+done
+if [ "$(cat "$tmp/pt.txt")" = "$(cat "$tmp/ptc.txt")" ] && grep -q '^drops 0xffffffffffffffff 3$' "$tmp/pt.txt"; then
+  echo "aarch64: a native kernel builds page tables and prints what the C backend's does"
+else
+  echo "FAIL aarch64: the native page table kernel's output differs from the C backend's:"
+  diff "$tmp/ptc.txt" "$tmp/pt.txt" | sed 's/^/    /'; fails=$((fails+1))
 fi
 BASTIOC="$BASTIOC" tests/aarch64_native.sh || fails=$((fails+1))
 [ "$fails" = 0 ]
