@@ -3745,3 +3745,580 @@ fn iropt_cse(f: &mut IrFn) -> u64 {
   vec_free(bl);
   return found;
 }
+
+// ---- Strength reduction of induction variables ----
+
+/// Where each label is (IR_NONE: nowhere), the lowest and highest position
+/// of a jump to it, and how many of those jumps come from after the label.
+struct IrLabs { pos: Vec[u64], lo: Vec[u64], hi: Vec[u64], back: Vec[u64] }
+
+fn iropt_labs_ref(lb: &mut IrLabs, l: u64, i: u64) {
+  if l < vec_len(lb.pos) {
+    if i < u_at(lb.lo, l) {
+      ra_set(&mut lb.lo, l, i);
+    }
+    if i > u_at(lb.hi, l) {
+      ra_set(&mut lb.hi, l, i);
+    }
+    let p = u_at(lb.pos, l);
+    if p != IR_NONE && i > p {
+      ra_set(&mut lb.back, l, wrap_add(u_at(lb.back, l), 1));
+    }
+  }
+}
+
+fn iropt_labs(f: &IrFn) -> IrLabs {
+  let mut lb = IrLabs { pos: vec_new[u64](), lo: vec_new[u64](), hi: vec_new[u64](), back: vec_new[u64]() };
+  let mut l = 0;
+  while l < f.nlabel && l < 1000000000 {
+    vec_push(&mut lb.pos, IR_NONE);
+    vec_push(&mut lb.lo, IR_NONE);
+    vec_push(&mut lb.hi, 0);
+    vec_push(&mut lb.back, 0);
+    l = l + 1;
+  }
+  let n = vec_len(f.ins);
+  let mut i = 0;
+  while i < n {
+    let q = iropt_at(f, i);
+    if q.op == IR_LABEL {
+      ra_set(&mut lb.pos, q.a, i);
+    }
+    i = wrap_add(i, 1);
+  }
+  i = 0;
+  while i < n {
+    let q = iropt_at(f, i);
+    if q.op == IR_JMP {
+      iropt_labs_ref(&mut lb, q.a, i);
+    }
+    if q.op == IR_BR {
+      iropt_labs_ref(&mut lb, q.b, i);
+      iropt_labs_ref(&mut lb, q.c, i);
+    }
+    i = wrap_add(i, 1);
+  }
+  return lb;
+}
+
+fn iropt_labs_free(lb: IrLabs) {
+  vec_free(lb.pos);
+  vec_free(lb.lo);
+  vec_free(lb.hi);
+  vec_free(lb.back);
+}
+
+/// Is the stretch p .. q of a loop (header label at p, the jump back at q)
+/// one that is entered only at p, and has no jump backwards but the one at q?
+fn iropt_ivs_span_ok(f: &IrFn, lb: &IrLabs, p: u64, q: u64) -> bool {
+  let mut i = wrap_add(p, 1);
+  let mut ok = true;
+  while ok && i < q {
+    let t = iropt_at(f, i);
+    if t.op == IR_LABEL {
+      if t.a >= f.nlabel || u_at(lb.lo, t.a) < p || u_at(lb.hi, t.a) > q {
+        ok = false;
+      }
+    } else if t.op == IR_JMP {
+      if t.a >= f.nlabel || u_at(lb.pos, t.a) == IR_NONE || u_at(lb.pos, t.a) <= i {
+        ok = false;
+      }
+    } else if t.op == IR_BR {
+      if t.b >= f.nlabel || t.c >= f.nlabel || u_at(lb.pos, t.b) == IR_NONE || u_at(lb.pos, t.c) == IR_NONE || u_at(lb.pos, t.b) <= i || u_at(lb.pos, t.c) <= i {
+        ok = false;
+      }
+    } else if t.op == IR_UNREACH {
+      ok = false;
+    }
+    i = wrap_add(i, 1);
+  }
+  return ok;
+}
+
+/// What a register holds in a loop: kind 0, the same in every pass; kind 1,
+/// `scale * k + (the same in every pass)` for the loop's counter k; kind 2,
+/// anything else.
+struct IrKind { kind: u64, scale: u64 }
+
+fn iropt_kind_at(kind: &Vec[u64], scale: &Vec[u64], r: u64) -> IrKind {
+  return IrKind { kind: u_at(kind, r), scale: u_at(scale, r) };
+}
+
+/// The kind of the result of `q` from the kinds of its operands (`ca` and
+/// `cb`: the constant an operand is, or IR_NONE).
+fn iropt_ivs_classify(q: IrIns, ka: IrKind, kb: IrKind, ca: u64, cb: u64) -> IrKind {
+  let other = IrKind { kind: 2, scale: 0 };
+  if q.op == IR_CONST {
+    return IrKind { kind: 0, scale: 0 };
+  }
+  if q.op == IR_MOV {
+    return ka;
+  }
+  if q.c != 0 {
+    return other;
+  }
+  if q.op == IR_ADD {
+    if ka.kind == 0 && kb.kind == 0 {
+      return IrKind { kind: 0, scale: 0 };
+    }
+    if ka.kind == 1 && kb.kind == 0 {
+      return ka;
+    }
+    if ka.kind == 0 && kb.kind == 1 {
+      return kb;
+    }
+  }
+  if q.op == IR_SUB {
+    if ka.kind == 0 && kb.kind == 0 {
+      return IrKind { kind: 0, scale: 0 };
+    }
+    if ka.kind == 1 && kb.kind == 0 {
+      return ka;
+    }
+  }
+  if q.op == IR_MUL {
+    if ka.kind == 0 && kb.kind == 0 {
+      return IrKind { kind: 0, scale: 0 };
+    }
+    if ka.kind == 1 && kb.kind == 0 && cb != IR_NONE && cb < 1048576 && ka.scale < 1048576 && cb > 0 {
+      return IrKind { kind: 1, scale: wrap_mul(ka.scale, cb) };
+    }
+    if ka.kind == 0 && kb.kind == 1 && ca != IR_NONE && ca < 1048576 && kb.scale < 1048576 && ca > 0 {
+      return IrKind { kind: 1, scale: wrap_mul(kb.scale, ca) };
+    }
+  }
+  return other;
+}
+
+/// The single register `q` writes, or IR_NONE.
+fn iropt_ivs_dest(q: IrIns) -> u64 {
+  let mut ws = vec_new[u64]();
+  ra_writes(q, &mut ws);
+  let mut d = IR_NONE;
+  if vec_len(ws) == 1 {
+    d = vec_get(ws, 0);
+  }
+  vec_free(ws);
+  return d;
+}
+
+/// Strength reduction of a loop counter's multiples. In a loop
+/// `L: ..; t = k + c; k = t; jmp L` (the one way back, `k` written outside
+/// the loop and by that move only, the move last), a register `r = k * M + x`
+/// (or `x + k * M`, `k * M - x`, ..: `x` the same in every pass) that is
+/// written once and read only after that and before `t = k + c` becomes a
+/// register `R` of its own: set before the loop by a copy of the
+/// instructions that compute `r` for the first pass, and stepped by `M * c`
+/// just before `t = k + c`. A pass then adds where it multiplied
+/// (`a[i * 400 + k]`). The loop's entry from outside goes through the new
+/// label. Only a register whose computation has at least two instructions
+/// that become dead is reduced, so the step is paid for. Does one register
+/// of one loop; returns whether it changed anything.
+fn iropt_ivs_try(f: &mut IrFn, lb: &IrLabs, l: u64, ndef: &Vec[u64], nuse: &Vec[u64], cv: &Vec[u64], fu: &Vec[u64], lu: &Vec[u64], dp: &Vec[u64], dl: &Vec[u64]) -> bool {
+  let n = vec_len(f.ins);
+  let nr = f.nreg;
+  let p = u_at(lb.pos, l);
+  let q = u_at(lb.hi, l);
+  if p == IR_NONE || q >= n || q < wrap_add(p, 4) {
+    return false;
+  }
+  let jq = iropt_at(f, q);
+  if jq.op != IR_JMP || jq.a != l {
+    return false;
+  }
+  let u = wrap_sub(q, 1);
+  let mv = iropt_at(f, u);
+  if mv.op != IR_MOV || mv.d >= nr || mv.a >= nr {
+    return false;
+  }
+  let k = mv.d;
+  let t = mv.a;
+  if u_at(ndef, k) != 2 || u_at(ndef, t) != 1 || u_at(nuse, t) != 1 {
+    return false;
+  }
+  let w = u_at(dp, t);
+  if w == IR_NONE || w <= p || w >= u {
+    return false;
+  }
+  let ad = iropt_at(f, w);
+  if ad.op != IR_ADD || ad.c != 0 || ad.d != t {
+    return false;
+  }
+  let mut vc = IR_NONE;
+  if ad.a == k {
+    vc = ad.b;
+  } else if ad.b == k {
+    vc = ad.a;
+  }
+  if vc >= nr || u_at(cv, vc) == IR_NONE {
+    return false;
+  }
+  let step = u_at(cv, vc);
+  if step == 0 || step > 1048576 {
+    return false;
+  }
+  // k is written once outside the loop, before it, and by the move.
+  let first = u_at(dp, k);
+  let last = u_at(dl, k);
+  // The constant k starts at, if its first value is one.
+  let mut k0 = IR_NONE;
+  if first == u && last == u {
+    if !ra_is_param(f, k) {
+      return false;
+    }
+  } else if first == u {
+    if last >= p {
+      return false;
+    }
+    let e = iropt_at(f, last);
+    if e.op == IR_CONST && e.d == k {
+      k0 = e.a;
+    }
+  } else if last == u {
+    if first >= p {
+      return false;
+    }
+    let e = iropt_at(f, first);
+    if e.op == IR_CONST && e.d == k {
+      k0 = e.a;
+    }
+  } else {
+    return false;
+  }
+  if !iropt_ivs_span_ok(f, lb, p, q) {
+    return false;
+  }
+  // Writes inside the loop, and what each register holds there.
+  let mut indef = vec_new[u64]();
+  let mut kind = vec_new[u64]();
+  let mut scale = vec_new[u64]();
+  let mut r = 0;
+  while r < nr && r < 1000000000 {
+    vec_push(&mut indef, 0);
+    r = r + 1;
+  }
+  let mut i = p;
+  while i < q {
+    let mut ws = vec_new[u64]();
+    ra_writes(iropt_at(f, i), &mut ws);
+    let mut j = 0;
+    while j < vec_len(ws) {
+      let x = vec_get(ws, j);
+      ra_set(&mut indef, x, wrap_add(u_at(indef, x), 1));
+      j = j + 1;
+    }
+    vec_free(ws);
+    i = wrap_add(i, 1);
+  }
+  r = 0;
+  while r < nr && r < 1000000000 {
+    if u_at(indef, r) == 0 {
+      vec_push(&mut kind, 0);
+    } else {
+      vec_push(&mut kind, 2);
+    }
+    vec_push(&mut scale, 0);
+    r = r + 1;
+  }
+  ra_set(&mut kind, k, 1);
+  ra_set(&mut scale, k, 1);
+  i = p;
+  while i < u {
+    let qi = iropt_at(f, i);
+    let d = iropt_ivs_dest(qi);
+    if d < nr && u_at(ndef, d) == 1 && u_at(indef, d) == 1 && d != t {
+      let mut ca = IR_NONE;
+      let mut cb = IR_NONE;
+      let mut ka = IrKind { kind: 2, scale: 0 };
+      let mut kb = IrKind { kind: 2, scale: 0 };
+      if ra_is_binary(qi.op) || qi.op == IR_MOV {
+        if qi.a < nr {
+          ca = u_at(cv, qi.a);
+          ka = iropt_kind_at(kind, scale, qi.a);
+        }
+        if qi.op != IR_MOV && qi.b < nr {
+          cb = u_at(cv, qi.b);
+          kb = iropt_kind_at(kind, scale, qi.b);
+        }
+      }
+      if qi.op == IR_CONST || qi.op == IR_MOV || ra_is_binary(qi.op) {
+        let kd = iropt_ivs_classify(qi, ka, kb, ca, cb);
+        ra_set(&mut kind, d, kd.kind);
+        ra_set(&mut scale, d, kd.scale);
+      }
+    }
+    i = wrap_add(i, 1);
+  }
+  // A register to reduce: a counter multiple that something other than
+  // another such register reads.
+  let mut done = false;
+  i = wrap_add(p, 1);
+  while !done && i < w {
+    let qi = iropt_at(f, i);
+    let d = iropt_ivs_dest(qi);
+    if d < nr && d != k && d != t && u_at(kind, d) == 1 && u_at(ndef, d) == 1 && u_at(indef, d) == 1 && u_at(scale, d) != 0 && qi.op != IR_MOV && u_at(nuse, d) > 0
+      && u_at(fu, d) > i && u_at(lu, d) < w {
+      if iropt_ivs_apply(&mut f, lb, l, p, q, w, i, k, k0, step, ad.ty, ndef, nuse, cv, dp, indef, kind, scale) {
+        done = true;
+      }
+    }
+    i = wrap_add(i, 1);
+  }
+  vec_free(indef);
+  vec_free(kind);
+  vec_free(scale);
+  return done;
+}
+
+/// Reduces register `d`, written at `di` in the loop p .. q whose counter
+/// `k` (which starts at the constant `k0`, unless that is IR_NONE) is stepped
+/// by the addition at `u`, which every read of `d` comes before and the new
+/// register is stepped ahead of, if its computation is worth it (see
+/// `iropt_ivs_try`).
+fn iropt_ivs_apply(f: &mut IrFn, lb: &IrLabs, l: u64, p: u64, q: u64, u: u64, di: u64, k: u64, k0: u64, step: u64, ty: u64, ndef: &Vec[u64], nuse: &Vec[u64], cv: &Vec[u64], dp: &Vec[u64], indef: &Vec[u64], kind: &Vec[u64], scale: &Vec[u64]) -> bool {
+  let n = vec_len(f.ins);
+  let nr = f.nreg;
+  let qd = iropt_at(f, di);
+  let d = qd.d;
+  // Is every read of d one that computes another such register?
+  let mut ext = 0;
+  let mut i = wrap_add(di, 1);
+  while i < u {
+    let qi = iropt_at(f, i);
+    if ra_reads_has(f, qi, d) {
+      let e = iropt_ivs_dest(qi);
+      let inner = e < nr && e != d && u_at(ndef, e) == 1 && u_at(indef, e) == 1 && u_at(kind, e) <= 1 && (qi.op == IR_ADD || qi.op == IR_SUB || qi.op == IR_MUL);
+      if !inner {
+        ext = wrap_add(ext, 1);
+      }
+    }
+    i = wrap_add(i, 1);
+  }
+  if ext == 0 {
+    return false;
+  }
+  // The instructions that compute d: positions, in order.
+  let mut cone = vec_new[u64]();
+  vec_push(&mut cone, di);
+  let mut c = 0;
+  let mut ok = true;
+  while ok && c < vec_len(cone) {
+    let qc = iropt_at(f, vec_get(cone, c));
+    let mut rs = vec_new[u64]();
+    ra_reads(f, qc, &mut rs);
+    let mut j = 0;
+    while j < vec_len(rs) {
+      let x = vec_get(rs, j);
+      if x != k && x < nr && u_at(indef, x) >= 1 {
+        let px = u_at(dp, x);
+        if u_at(ndef, x) != 1 || u_at(indef, x) != 1 || px == IR_NONE || px <= p || px >= u || u_at(kind, x) > 1 {
+          ok = false;
+        } else if !has_id(cone, px) {
+          vec_push(&mut cone, px);
+        }
+      }
+      j = j + 1;
+    }
+    vec_free(rs);
+    if vec_len(cone) > 16 {
+      ok = false;
+    }
+    c = wrap_add(c, 1);
+  }
+  if !ok {
+    vec_free(cone);
+    return false;
+  }
+  // Ascending.
+  let mut a = 1;
+  while a < vec_len(cone) {
+    let mut b = a;
+    while b > 0 && u_at(cone, wrap_sub(b, 1)) > u_at(cone, b) {
+      let x = u_at(cone, b);
+      ra_set(&mut cone, b, u_at(cone, wrap_sub(b, 1)));
+      ra_set(&mut cone, wrap_sub(b, 1), x);
+      b = wrap_sub(b, 1);
+    }
+    a = wrap_add(a, 1);
+  }
+  // How many of them become dead: the step costs one.
+  let mut dead = 0;
+  c = 0;
+  while c < vec_len(cone) {
+    let qc = iropt_at(f, vec_get(cone, c));
+    if qc.op == IR_ADD || qc.op == IR_SUB || qc.op == IR_MUL {
+      if qc.d == d {
+        dead = wrap_add(dead, 1);
+      } else {
+        let mut inside = 0;
+        let mut e = 0;
+        while e < vec_len(cone) {
+          if ra_reads_has(f, iropt_at(f, vec_get(cone, e)), qc.d) {
+            inside = wrap_add(inside, 1);
+          }
+          e = wrap_add(e, 1);
+        }
+        if inside == u_at(nuse, qc.d) {
+          dead = wrap_add(dead, 1);
+        }
+      }
+    }
+    c = wrap_add(c, 1);
+  }
+  let by = wrap_mul(u_at(scale, d), step);
+  if dead < 2 || by == 0 || by > 1099511627776 {
+    vec_free(cone);
+    return false;
+  }
+  // The new code: a label for the way in, the first value, the step.
+  let top = ir_label(&mut f);
+  let rr = ir_reg(&mut f);
+  let rs = ir_reg(&mut f);
+  let mut out = vec_new[IrIns]();
+  let mut mfrom = vec_new[u64]();
+  let mut mto = vec_new[u64]();
+  i = 0;
+  while i < n {
+    if i == p {
+      vec_push(&mut out, IrIns { op: IR_LABEL, d: IR_NONE, a: top, b: 0, c: 0, ty: 0 });
+      // k's first value, as a constant of its own where it is known.
+      if k0 != IR_NONE {
+        let kc = ir_reg(&mut f);
+        vec_push(&mut out, IrIns { op: IR_CONST, d: kc, a: k0, b: 0, c: 0, ty: 0 });
+        vec_push(&mut mfrom, k);
+        vec_push(&mut mto, kc);
+      }
+      c = 0;
+      while c < vec_len(cone) {
+        let mut qc = iropt_at(f, vec_get(cone, c));
+        let mut m = 0;
+        while m < vec_len(mfrom) {
+          qc = iropt_rename(qc, u_at(mfrom, m), u_at(mto, m));
+          m = wrap_add(m, 1);
+        }
+        let mut nd = rr;
+        if qc.d != d {
+          nd = ir_reg(&mut f);
+        }
+        vec_push(&mut mfrom, qc.d);
+        vec_push(&mut mto, nd);
+        qc.d = nd;
+        vec_push(&mut out, qc);
+        c = wrap_add(c, 1);
+      }
+      vec_push(&mut out, IrIns { op: IR_CONST, d: rs, a: by, b: 0, c: 0, ty: 0 });
+    }
+    let mut qi = iropt_at(f, i);
+    if i < p || i > q {
+      if qi.op == IR_JMP && qi.a == l {
+        qi.a = top;
+      }
+      if qi.op == IR_BR {
+        if qi.b == l {
+          qi.b = top;
+        }
+        if qi.c == l {
+          qi.c = top;
+        }
+      }
+    } else if i == u {
+      vec_push(&mut out, IrIns { op: IR_ADD, d: rr, a: rr, b: rs, c: 0, ty: ty });
+    } else if i > di && i < u {
+      qi = iropt_rename(qi, d, rr);
+      if ra_reads_has(f, qi, d) {
+        ok = false;
+      }
+    }
+    vec_push(&mut out, qi);
+    i = wrap_add(i, 1);
+  }
+  vec_free(cone);
+  vec_free(mfrom);
+  vec_free(mto);
+  if !ok {
+    vec_free(out);
+    return false;
+  }
+  vec_free(f.ins);
+  f.ins = out;
+  return true;
+}
+
+/// `iropt_ivs_try` on every loop until nothing changes. Returns how many
+/// registers it reduced.
+fn iropt_ivs(f: &mut IrFn) -> u64 {
+  let mut total = 0;
+  let mut again = true;
+  while again && total < 200 {
+    again = false;
+    let n = vec_len(f.ins);
+    if n > 4000000 || f.nreg > 100000000 || f.nlabel > 100000000 {
+      return total;
+    }
+    let ndef = iropt_ndef(f);
+    let nuse = iropt_nuse(f);
+    let cv = iropt_consts(f, ndef);
+    let lb = iropt_labs(f);
+    let mut fu = vec_new[u64]();
+    let mut lu = vec_new[u64]();
+    let mut dp = vec_new[u64]();
+    let mut dl = vec_new[u64]();
+    let mut r = 0;
+    while r < f.nreg {
+      vec_push(&mut fu, IR_NONE);
+      vec_push(&mut lu, 0);
+      vec_push(&mut dp, IR_NONE);
+      vec_push(&mut dl, IR_NONE);
+      r = wrap_add(r, 1);
+    }
+    let mut i = 0;
+    while i < n {
+      let qi = iropt_at(f, i);
+      let mut rs = vec_new[u64]();
+      ra_reads(f, qi, &mut rs);
+      ra_writes(qi, &mut rs);
+      let mut nrd = vec_len(rs);
+      let mut reads = vec_new[u64]();
+      ra_reads(f, qi, &mut reads);
+      nrd = vec_len(reads);
+      let mut j = 0;
+      while j < vec_len(rs) {
+        let x = vec_get(rs, j);
+        if j < nrd {
+          if i < u_at(fu, x) {
+            ra_set(&mut fu, x, i);
+          }
+          if i > u_at(lu, x) {
+            ra_set(&mut lu, x, i);
+          }
+        } else {
+          if u_at(dp, x) == IR_NONE {
+            ra_set(&mut dp, x, i);
+          }
+          ra_set(&mut dl, x, i);
+        }
+        j = j + 1;
+      }
+      vec_free(rs);
+      vec_free(reads);
+      i = wrap_add(i, 1);
+    }
+    let mut l = 0;
+    while !again && l < f.nlabel {
+      if u_at(lb.back, l) == 1 && iropt_ivs_try(&mut f, lb, l, ndef, nuse, cv, fu, lu, dp, dl) {
+        again = true;
+        total = wrap_add(total, 1);
+      }
+      l = wrap_add(l, 1);
+    }
+    vec_free(ndef);
+    vec_free(nuse);
+    vec_free(cv);
+    iropt_labs_free(lb);
+    vec_free(fu);
+    vec_free(lu);
+    vec_free(dp);
+    vec_free(dl);
+  }
+  return total;
+}
