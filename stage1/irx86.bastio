@@ -1105,6 +1105,17 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
       w_s(&mut out, "\n");
       return;
     }
+    if op == IR_SUB && !wrap && ld.k == IXK_REG && la.k == IXK_REG && lb0.k == IXK_IMM && lb0.imm <= 2147483647 && la.reg != ld.reg {
+      // `d = a - imm` into another register: one lea instead of a move and a sub.
+      w_s(&mut out, "\tlea -");
+      w_num(&mut out, lb0.imm);
+      w_s(&mut out, "(");
+      w_s(&mut out, x86_rname(la.reg));
+      w_s(&mut out, "), ");
+      w_s(&mut out, x86_rname(ld.reg));
+      w_s(&mut out, "\n");
+      return;
+    }
     ix_mov(&mut out, la, ix_rl(t));
     let lb = ix_src(&mut out, lb0);
     ix_ins2(&mut out, alu, lb, ix_rl(t));
@@ -2742,6 +2753,11 @@ fn irx_function_n(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, nc
   }
   iropt_switch(&mut f);
   iropt_thread(&mut f);
+  if iropt_range(&mut f) > 0 {
+    iropt_copies(&mut f);
+    iropt_dce(&mut f);
+    iropt_thread(&mut f);
+  }
   if iropt_merge(&mut f) > 0 {
     iropt_copies(&mut f);
     iropt_dce(&mut f);
