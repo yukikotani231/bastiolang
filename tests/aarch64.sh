@@ -12,7 +12,7 @@
 #     aarch64` with the small platform beside it, boots on QEMU's virt
 #     machine and prints what it should: page tables, a user program at EL0
 #     making system calls, an abort, MMIO;
-#  5. kernels built by the native AArch64 backend (tests/aarch64/hello_kernel, hello_pool and hello_pt)
+#  5. kernels built by the native AArch64 backend (tests/aarch64/hello_kernel, hello_pool, hello_pt and kernel itself)
 #     boot the same way and print what they should;
 #  6. the programs the native AArch64 backend (`--arch aarch64 --backend
 #     native`, no C compiler on the proved code) covers behave as under the C
@@ -119,6 +119,21 @@ if [ "$(cat "$tmp/hello.txt")" = "$want" ]; then
   echo "aarch64: a kernel built by the native backend boots on QEMU virt and prints"
 else
   echo "FAIL aarch64: the native kernel's output on QEMU virt:"; sed 's/^/    /' "$tmp/hello.txt"; fails=$((fails+1))
+fi
+# The same kernel built by the native backend (pool, tables, MMIO, the processor and the EL0 program) prints the same.
+"$BASTIOC" --target kernel --arch aarch64 --backend native --emit-asm -o "$tmp/nk.s" $k/kernel.bastio 2>/dev/null
+${AARCH64_CC%gcc}as -o "$tmp/nk.o" "$tmp/nk.s"
+${AARCH64_CC%gcc}ld -nostdlib -static --no-warn-rwx-segments -T $k/linker.ld \
+  -o "$tmp/nk.elf" "$tmp/boot.o" "$tmp/nk.o" "$tmp/platform.o"
+timeout 60 qemu-system-aarch64 -M virt -cpu cortex-a57 -m 128M -nographic -no-reboot \
+  -kernel "$tmp/nk.elf" </dev/null 2>&1 | tr -d '\r' >"$tmp/nk.txt" || true
+# (The pool's size depends on how big the kernel image is, so the page count is masked.)
+mask() { sed 's/^aarch64: kernel up, [0-9]* pages$/aarch64: kernel up, N pages/' "$1"; }
+if [ -s "$tmp/nk.txt" ] && [ "$(mask "$tmp/nk.txt")" = "$(mask "$tmp/boot.txt")" ]; then
+  echo "aarch64: the kernel built by the native backend runs a user program at EL0 and prints what the C backend's build does"
+else
+  echo "FAIL aarch64: the native kernel's output differs from the C backend's:"
+  diff <(mask "$tmp/boot.txt") <(mask "$tmp/nk.txt") | sed 's/^/    /'; fails=$((fails+1))
 fi
 # With a pool: the runs of RAM the platform lists, pages taken and given back, and the
 # allocator's second arena (carved from the pool) once the first is full.
