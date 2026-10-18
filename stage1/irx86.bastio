@@ -2426,6 +2426,79 @@ fn ix_coalesce(f: &mut IrFn) {
   f.ins = out;
 }
 
+/// `t = op a, b; a = op2 t, c` (or `op2 c, t`), where `t` is written and
+/// read only there, `c` is not `a`, and the two follow each other (but for
+/// constants between), becomes
+/// `a = op a, b; a = op2 a, c`: the temporary and a copy go, as for
+/// `i = (i + 1) % n`, whose sum would otherwise take a register of its own
+/// for the length of one instruction.
+fn ix_inplace(f: &mut IrFn) -> u64 {
+  let nuse = iropt_nuse(f);
+  let ndef = iropt_ndef(f);
+  let n = vec_len(f.ins);
+  let mut out = vec_new[IrIns]();
+  let mut done = 0;
+  let mut i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    // Constants may sit between the two (the lowering writes them where
+    // they are used).
+    let mut j = wrap_add(i, 1);
+    let mut clean = true;
+    let mut scanning = true;
+    while scanning && j < n && j < wrap_add(i, 4) {
+      let cq = ix_at(f, j);
+      if cq.op == IR_CONST {
+        if cq.d == q.a || cq.d == q.d {
+          clean = false;
+        }
+        j = wrap_add(j, 1);
+      } else {
+        scanning = false;
+      }
+    }
+    let nq = ix_at(f, j);
+    let mut hit = false;
+    if clean && ra_is_binary(q.op) && ra_is_binary(nq.op) && q.d < f.nreg && q.a < f.nreg && nq.d == q.a && q.d != q.a && u_at(ndef, q.d) == 1 && u_at(nuse, q.d) == 1 && j < n {
+      let mut ok = false;
+      let mut y = nq;
+      if nq.a == q.d && nq.b != q.a && nq.b != q.d {
+        ok = true;
+        y.a = q.a;
+      } else if nq.b == q.d && nq.a != q.a && nq.a != q.d {
+        ok = true;
+        y.b = q.a;
+      }
+      if ok {
+        vec_push(&mut out, IrIns { op: q.op, d: q.a, a: q.a, b: q.b, c: q.c, ty: q.ty });
+        let mut m = wrap_add(i, 1);
+        while m < j {
+          vec_push(&mut out, ix_at(f, m));
+          m = wrap_add(m, 1);
+        }
+        vec_push(&mut out, y);
+        hit = true;
+      }
+    }
+    if hit {
+      done = wrap_add(done, 1);
+      i = wrap_add(j, 1);
+    } else {
+      vec_push(&mut out, q);
+      i = wrap_add(i, 1);
+    }
+  }
+  vec_free(nuse);
+  vec_free(ndef);
+  if done == 0 {
+    vec_free(out);
+    return 0;
+  }
+  vec_free(f.ins);
+  f.ins = out;
+  return done;
+}
+
 /// Gives the frame slots of `IR_SLOT` instructions their places in the
 /// slot area: `a` of each is its offset in words, and slots whose addresses
 /// are never live together share words. The result is the area's size. A slot
@@ -2874,6 +2947,7 @@ fn irx_function_n(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, nc
   iropt_labels(&mut f);
   iropt_rotate(&mut f);
   ix_coalesce(&mut f);
+  ix_inplace(&mut f);
   ix_arms(&mut f);
   let xi = inst_at(m, x);
   let pos = ix_positions(&mut g, c, &mut m, p, x);
