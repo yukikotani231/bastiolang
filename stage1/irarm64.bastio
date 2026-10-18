@@ -567,6 +567,19 @@ fn a64_smp(out: &mut Vec[u64], g: &mut X86, m: &Mono, p: &Parser, al: &IrAlloc, 
   w_s(&mut out, "\n\tbl bst_platform_smp_join\n\tadd sp, sp, #16\n");
 }
 
+/// The value of register `r` when it is a constant power of two above one,
+/// else 0.
+fn a64_pow2(al: &IrAlloc, fr: A64F, r: u64) -> u64 {
+  if u_at(al.cst, r) == 0 {
+    return 0;
+  }
+  let v = u_at(al.cv, r);
+  if v > 1 && v & wrap_sub(v, 1) == 0 {
+    return v;
+  }
+  return 0;
+}
+
 /// One instruction other than control flow and calls. `slotw` is the frame
 /// word of the slot this instruction opens, if it is an `IR_SLOT`.
 fn a64_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, fr: A64F, g: &mut X86, m: &Mono, p: &Parser, q: IrIns, slotw: u64) {
@@ -609,6 +622,23 @@ fn a64_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, fr: A64F, g: &mut X86, m:
     }
   } else if op == IR_MOV {
     a64_mov(&mut out, a64_loc(al, fr, q.a), a64_loc(al, fr, q.d));
+  } else if (op == IR_DIV || op == IR_REM) && a64_pow2(al, fr, q.b) != 0 {
+    // Unsigned division by a power of two is a shift and the remainder is a mask.
+    let k = a64_pow2(al, fr, q.b);
+    let t = a64_dest(al, fr, q.d);
+    let ra = a64_use(&mut out, al, fr, q.a, 9);
+    if op == IR_REM {
+      a64_ins3i(&mut out, "and", t, ra, wrap_sub(k, 1));
+    } else {
+      let mut sh = 0;
+      let mut v = k;
+      while v > 1 && sh < 64 {
+        v = v / 2;
+        sh = sh + 1;
+      }
+      a64_ins3i(&mut out, "lsr", t, ra, sh);
+    }
+    a64_finish(&mut out, al, fr, q.d, t);
   } else if op == IR_DIV || op == IR_SDIV {
     let mut name = "udiv";
     if op == IR_SDIV {
