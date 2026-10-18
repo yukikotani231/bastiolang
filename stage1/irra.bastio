@@ -864,14 +864,21 @@ fn ra_cross(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> Vec[u64] {
 }
 
 fn ra_alloc(f: &IrFn, ncallee: u64, ncaller: u64) -> IrAlloc {
-  return ra_alloc_with(f, ncallee, ncaller, false);
+  return ra_alloc_with(f, ncallee, ncaller, false, false);
 }
 
 /// `ra_alloc`, except that a register written once, by a constant, is left
 /// out and recorded in `cst` and `cv` for the emitter to use as an
 /// immediate.
 fn ra_alloc_const(f: &IrFn, ncallee: u64, ncaller: u64) -> IrAlloc {
-  return ra_alloc_with(f, ncallee, ncaller, true);
+  return ra_alloc_with(f, ncallee, ncaller, true, false);
+}
+
+/// `ra_alloc_const`, except that a constant too wide for one instruction
+/// (`bigk`: 16 bits on AArch64) that a loop reads stays in a register, so the
+/// loop does not build it again on every pass.
+fn ra_alloc_const_loops(f: &IrFn, ncallee: u64, ncaller: u64) -> IrAlloc {
+  return ra_alloc_with(f, ncallee, ncaller, true, true);
 }
 
 /// Copies between registers: `cph[r]` heads a chain through `cpn` of the
@@ -966,7 +973,7 @@ fn ra_spill_slot(f: &IrFn, iv: &IrIntervals, sg: &IrSegs, cp: &IrCopies, al: &mu
   return s;
 }
 
-fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc {
+fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool, bigk: bool) -> IrAlloc {
   let bl = ra_blocks(f);
   let lv = ra_live(f, bl);
   let iv = ra_intervals(f, bl, lv);
@@ -1028,6 +1035,27 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool) -> IrAlloc 
       j = j + 1;
     }
     vec_free(ndef);
+    if bigk {
+      let dp = ra_depths(f);
+      j = 0;
+      while j < n {
+        if u_at(dp, j) > 0 {
+          let mut rs = vec_new[u64]();
+          ra_reads(f, vec_get(f.ins, j), &mut rs);
+          let mut w = 0;
+          while w < vec_len(rs) {
+            let x = vec_get(rs, w);
+            if x < nr && u_at(al.cst, x) == 1 && u_at(al.cv, x) >= 65536 && u_at(al.cv, x) < 18446744073709486080 {
+              ra_set(&mut al.cst, x, 0);
+            }
+            w = w + 1;
+          }
+          vec_free(rs);
+        }
+        j = j + 1;
+      }
+      vec_free(dp);
+    }
   }
   let depth = ra_depths(f);
   let cost = ra_costs(f, depth);
