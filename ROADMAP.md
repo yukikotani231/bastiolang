@@ -210,6 +210,7 @@ Safety must not cost speed at run time; that is the point of proving it instead 
   - [ ] An IR between the checker and the backends, with scalar replacement of structs ([#125](https://github.com/yukikotani231/bastiolang/issues/125))
   - [ ] Register allocation over the IR, all argument registers ([#126](https://github.com/yukikotani231/bastiolang/issues/126))
   - [ ] Inlining by heuristic, constant propagation, dead code, loop-invariant code motion, and facts from the proofs (bounds, ranges, no aliasing) given to the optimizer ([#127](https://github.com/yukikotani231/bastiolang/issues/127))
+    - Measured 2026-10-18: facts from the proofs have nothing to remove yet. Generated code carries no bounds or overflow checks (the proofs replace them), the width masks in the BastiOS kernel's native-ir assembly are 0.26% of its lines and are byte extractions the program asks for, and an alias-aware load CSE would shrink the kernel by 0.24% at most. The rest of the gap to C is register moves and spills, which are not a matter of facts.
   - [ ] Vectorization of simple loops ([#128](https://github.com/yukikotani231/bastiolang/issues/128))
   - [ ] The native backend as the default, BastiOS built with it ([#129](https://github.com/yukikotani231/bastiolang/issues/129))
   - [ ] Compile and proof time: a proof cache per function ([#130](https://github.com/yukikotani231/bastiolang/issues/130))
