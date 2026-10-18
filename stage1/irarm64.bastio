@@ -520,6 +520,53 @@ fn a64_call(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, fr: A64F, g: &mut X86, m
   }
 }
 
+/// `smp_run` (a PCALL with c == 13; q.ty packs the callee instance, the
+/// parameter count and which parameters are `&mut`): the block of shared
+/// words is at register `q.a`. The thunk (AAPCS64, the block's address in
+/// x0) calls the function with the block's words and, for each `&mut`
+/// parameter, the address of a zero word of its own, then settles the
+/// processor's page table as the C backend's thunk does. The platform runs
+/// it on the other processors, this one runs it too, and waits for them.
+fn a64_smp(out: &mut Vec[u64], g: &mut X86, m: &Mono, p: &Parser, al: &IrAlloc, fr: A64F, q: IrIns) {
+  let x = q.ty / 65536;
+  let np = (q.ty / 4096) % 16;
+  let mask = q.ty % 4096;
+  let k = g.nsmp;
+  g.nsmp = wrap_add(k, 1);
+  let mut fname = vec_new[u64]();
+  ix_sym(&mut fname, &mut g, m, p, x);
+  w_s(&mut g.smp, "bst_rt_smp_thunk");
+  w_num(&mut g.smp, k);
+  w_s(&mut g.smp, ":\n\tstp x29, x30, [sp, #-48]!\n\tmov x29, sp\n\tstr x19, [sp, #16]\n\tstr xzr, [sp, #24]\n\tmov x19, x0\n");
+  let mut j = 0;
+  while j < np && j < A64_REG_ARGS {
+    if (mask >> j) & 1 == 1 {
+      w_s(&mut g.smp, "\tadd x");
+      w_num(&mut g.smp, j);
+      w_s(&mut g.smp, ", sp, #24\n");
+    } else {
+      w_s(&mut g.smp, "\tldr x");
+      w_num(&mut g.smp, j);
+      w_s(&mut g.smp, ", [x19, #");
+      w_num(&mut g.smp, wrap_mul(8, j));
+      w_s(&mut g.smp, "]\n");
+    }
+    j = j + 1;
+  }
+  w_s(&mut g.smp, "\tbl ");
+  w_append(&mut g.smp, fname);
+  w_s(&mut g.smp, "\n\tbl bst_rt_mmu_settle\n\tldr x19, [sp, #16]\n\tldp x29, x30, [sp], #48\n\tret\n\n");
+  vec_free(fname);
+  a64_mov(&mut out, a64_loc(al, fr, q.a), a64_rl(0));
+  w_s(&mut out, "\tstp x0, x0, [sp, #-16]!\n\tmov x1, x0\n\tadrp x0, bst_rt_smp_thunk");
+  w_num(&mut out, k);
+  w_s(&mut out, "\n\tadd x0, x0, :lo12:bst_rt_smp_thunk");
+  w_num(&mut out, k);
+  w_s(&mut out, "\n\tbl bst_platform_smp_start\n\tldr x0, [sp]\n\tbl bst_rt_smp_thunk");
+  w_num(&mut out, k);
+  w_s(&mut out, "\n\tbl bst_platform_smp_join\n\tadd sp, sp, #16\n");
+}
+
 /// One instruction other than control flow and calls. `slotw` is the frame
 /// word of the slot this instruction opens, if it is an `IR_SLOT`.
 fn a64_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, fr: A64F, g: &mut X86, m: &Mono, p: &Parser, q: IrIns, slotw: u64) {
@@ -703,6 +750,8 @@ fn a64_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, fr: A64F, g: &mut X86, m:
   } else if op == IR_GETC {
     w_s(&mut out, "\tbl bst_rt_getc\n");
     a64_finish(&mut out, al, fr, q.d, 0);
+  } else if op == IR_PCALL && g.target == TARGET_KERNEL && q.c == 13 {
+    a64_smp(&mut out, &mut g, m, p, al, fr, q);
   } else if op == IR_PCALL && g.target == TARGET_KERNEL && q.c != 5 {
     // A platform call or one of the kernel runtime's: the two operands in x0 and x1, the result in x0.
     a64_mov(&mut out, a64_loc(al, fr, q.a), a64_rl(0));
@@ -1052,15 +1101,17 @@ fn a64_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
     // runtime; of the runtime calls it has the Vec reserve (5), the
     // hosted program's files and processes (20 to 30) and its arguments (31).
     if q.op == IR_PCALL && g.target == TARGET_KERNEL && q.c == 13 {
-      ok = false;                       // smp_run: not covered yet
-      why = 4;
-      bad_op = q.op;
+      if (q.ty / 4096) % 16 > A64_REG_ARGS {
+        ok = false;                     // smp_run with parameters past the registers
+        why = 4;
+        bad_op = q.op;
+      }
     } else if q.op == IR_PCALL && q.c != 5 && g.target != TARGET_KERNEL && (q.c < 20 || q.c > 31) && !(g.target == TARGET_USER && q.c >= 10 && q.c <= 12) {
       ok = false;
       why = 4;
       bad_op = q.op;
     }
-    if (q.op == IR_RT && !(g.target == TARGET_KERNEL && (q.c == IRS_PAGE_AT || q.c == IRS_FRAME_ID || q.c == IRS_SYNC_ICACHE))) || (g.target != TARGET_KERNEL && (q.op == IR_TSC || q.op == IR_MMCHK)) || q.op == IR_PIN || q.op == IR_POUT {
+    if (q.op == IR_RT && !(g.target == TARGET_KERNEL && (q.c == IRS_PAGE_AT || q.c == IRS_FRAME_ID || q.c == IRS_SYNC_ICACHE || q.c == IRS_SERIAL_POLL))) || (g.target != TARGET_KERNEL && (q.op == IR_TSC || q.op == IR_MMCHK)) || q.op == IR_PIN || q.op == IR_POUT {
       ok = false;
       why = 4;
       bad_op = q.op;
@@ -2287,6 +2338,17 @@ fn a64_runtime_kernel(out: &mut Vec[u64]) {
   w_s(&mut out, "2:\tldr w0, [x9]\n");
   w_s(&mut out, "\tand w0, w0, #0xff\n");
   w_s(&mut out, "\tret\n");
+  w_s(&mut out, "bst_rt_serial_poll:             // x0 = the next byte received, or 256 when there is none\n");
+  w_s(&mut out, "\tadrp x9, bst_uart_base\n");
+  w_s(&mut out, "\tldr x9, [x9, :lo12:bst_uart_base]\n");
+  w_s(&mut out, "\tcbnz x9, 1f\n");
+  w_s(&mut out, "\tmov x9, #0x9000000\n");
+  w_s(&mut out, "1:\tldr w10, [x9, #0x18]\n");
+  w_s(&mut out, "\tmov x0, #256\n");
+  w_s(&mut out, "\ttbnz w10, #4, 2f              // receive FIFO empty\n");
+  w_s(&mut out, "\tldr w0, [x9]\n");
+  w_s(&mut out, "\tand w0, w0, #0xff\n");
+  w_s(&mut out, "2:\tret\n");
   a64_rt_print(&mut out);
   a64_rt_arena(&mut out, 131072, true);
   a64_rt_pool(&mut out);
@@ -3182,6 +3244,8 @@ fn a64_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
   vec_free(ms);
   if g.target == TARGET_KERNEL {
     w_s(&mut g.out, "\n\tmov sp, x29\n\tldp x29, x30, [sp], #16\n\tret\n");
+    w_s(&mut g.out, "\n");
+    w_append(&mut g.out, g.smp);
     a64_runtime_kernel(&mut g.out);
   } else if g.target == TARGET_USER {
     w_s(&mut g.out, "\n\tmov x19, x0\n\tbl bst_rt_flush\n\tmov x0, x19\n\tmov sp, x29\n\tldr x19, [sp, #16]\n\tldp x29, x30, [sp], #32\n\tret\n");

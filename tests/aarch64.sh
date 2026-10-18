@@ -12,7 +12,7 @@
 #     aarch64` with the small platform beside it, boots on QEMU's virt
 #     machine and prints what it should: page tables, a user program at EL0
 #     making system calls, an abort, MMIO;
-#  5. kernels built by the native AArch64 backend (tests/aarch64/hello_kernel, hello_pool, hello_pt and kernel itself)
+#  5. kernels built by the native AArch64 backend (tests/aarch64/hello_kernel, hello_pool, hello_pt, hello_smp and kernel itself)
 #     boot the same way and print what they should;
 #  6. the programs the native AArch64 backend (`--arch aarch64 --backend
 #     native`, no C compiler on the proved code) covers behave as under the C
@@ -174,6 +174,18 @@ if [ "$(cat "$tmp/pt.txt")" = "$(cat "$tmp/ptc.txt")" ] && grep -q '^drops 0xfff
 else
   echo "FAIL aarch64: the native page table kernel's output differs from the C backend's:"
   diff "$tmp/ptc.txt" "$tmp/pt.txt" | sed 's/^/    /'; fails=$((fails+1))
+fi
+# smp_run and locked calls: the thunk the native backend writes runs once on this platform (it has no other processors).
+"$BASTIOC" --target kernel --arch aarch64 --backend native --emit-asm -o "$tmp/smp.s" $k/hello_smp.bastio 2>/dev/null
+${AARCH64_CC%gcc}as -o "$tmp/smp.o" "$tmp/smp.s"
+${AARCH64_CC%gcc}ld -nostdlib -static --no-warn-rwx-segments -T $k/linker.ld \
+  -o "$tmp/smp.elf" "$tmp/boot.o" "$tmp/smp.o" "$tmp/platform.o"
+timeout 60 qemu-system-aarch64 -M virt -cpu cortex-a57 -m 128M -nographic -no-reboot \
+  -kernel "$tmp/smp.elf" </dev/null 2>&1 | tr -d '\r' >"$tmp/smp.txt" || true
+if [ "$(cat "$tmp/smp.txt")" = "processors that ran: 1" ]; then
+  echo "aarch64: a native kernel runs a function on every processor with smp_run and takes a lock"
+else
+  echo "FAIL aarch64: the native smp_run kernel's output on QEMU virt:"; sed 's/^/    /' "$tmp/smp.txt"; fails=$((fails+1))
 fi
 BASTIOC="$BASTIOC" tests/aarch64_native.sh || fails=$((fails+1))
 [ "$fails" = 0 ]
