@@ -4415,3 +4415,252 @@ fn iropt_wide(f: &mut IrFn) -> u64 {
   }
   return total;
 }
+
+fn iropt_put(f: &mut IrFn, i: u64, q: IrIns) {
+  if i < vec_len(f.ins) {
+    vec_set(&mut f.ins, i, q);
+  }
+}
+
+/// Do registers `x` and `y` hold the same value: the same register (after
+/// `al` maps a register that is a copy of another written once to it), or two
+/// registers that are each written once by a `const` of one value?
+fn iropt_ebb_same(cv: &Vec[u64], al: &Vec[u64], x0: u64, y0: u64) -> bool {
+  let mut x = x0;
+  let mut y = y0;
+  if x < vec_len(al) && u_at(al, x) != IR_NONE {
+    x = u_at(al, x);
+  }
+  if y < vec_len(al) && u_at(al, y) != IR_NONE {
+    y = u_at(al, y);
+  }
+  if x == y {
+    return true;
+  }
+  if x >= vec_len(cv) || y >= vec_len(cv) {
+    return false;
+  }
+  return u_at(cv, x) != IR_NONE && u_at(cv, x) == u_at(cv, y);
+}
+
+/// Is `op` an instruction that cannot change memory, so that a load made
+/// before it still holds after it?
+fn iropt_ebb_keeps_loads(op: u64) -> bool {
+  return op == IR_CONST || op == IR_MOV || ra_is_binary(op) || op == IR_NOT || op == IR_NEG || op == IR_WRAP || op == IR_LOAD || op == IR_LABEL || op == IR_BR || op == IR_SLOT || op == IR_STRLIT;
+}
+
+/// Value numbering along extended basic blocks: a block that only the one
+/// before it can reach (a label whose every jump is the branch just above)
+/// continues what that one knew. An operation or a load whose operands are
+/// the same registers, with none of them written since, and (for a load) no
+/// store or call between, becomes a copy of the first result. Unlike
+/// `iropt_cse`, the registers may be written more than once, which is what a
+/// loop's counter is: `a[j - 1]` read in the test and again in the body.
+/// Returns how many it turned into copies.
+fn iropt_ebb(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  if n > 4000000 || f.nlabel > 100000000 {
+    return 0;
+  }
+  let ndef = iropt_ndef(f);
+  let cv = iropt_consts(f, ndef);
+  let mut al = vec_new[u64]();
+  let mut r = 0;
+  while r < f.nreg && r < 1000000000 {
+    vec_push(&mut al, IR_NONE);
+    r = wrap_add(r, 1);
+  }
+  let mut cnt = vec_new[u64]();
+  let mut l = 0;
+  while l < f.nlabel {
+    vec_push(&mut cnt, 0);
+    l = wrap_add(l, 1);
+  }
+  let mut i = 0;
+  while i < n {
+    let q = iropt_at(f, i);
+    if q.op == IR_JMP && q.a < f.nlabel {
+      ra_set(&mut cnt, q.a, wrap_add(u_at(cnt, q.a), 1));
+    }
+    if q.op == IR_BR {
+      if q.b < f.nlabel {
+        ra_set(&mut cnt, q.b, wrap_add(u_at(cnt, q.b), 1));
+      }
+      if q.c < f.nlabel {
+        ra_set(&mut cnt, q.c, wrap_add(u_at(cnt, q.c), 1));
+      }
+    }
+    i = wrap_add(i, 1);
+  }
+  // The table: operation, operands, result; op 0 is a free slot.
+  let mut te_op = vec_new[u64]();
+  let mut te_a = vec_new[u64]();
+  let mut te_b = vec_new[u64]();
+  let mut te_c = vec_new[u64]();
+  let mut te_ty = vec_new[u64]();
+  let mut te_d = vec_new[u64]();
+  let mut te_nf = vec_new[u64]();
+  let nuse = iropt_nuse(f);
+  let mut done = 0;
+  let mut prev = IrIns { op: IR_JMP, d: IR_NONE, a: IR_NONE, b: 0, c: 0, ty: 0 };
+  i = 0;
+  while i < n {
+    let mut q = iropt_at(f, i);
+    let mut clear = false;
+    if q.op == IR_LABEL {
+      let mut own = 0;
+      if prev.op == IR_BR {
+        if prev.b == q.a {
+          own = wrap_add(own, 1);
+        }
+        if prev.c == q.a {
+          own = wrap_add(own, 1);
+        }
+      }
+      if prev.op == IR_JMP || prev.op == IR_RET || prev.op == IR_UNREACH || q.a >= f.nlabel || u_at(cnt, q.a) != own {
+        clear = true;
+      }
+    } else if prev.op == IR_JMP || prev.op == IR_BR || prev.op == IR_RET || prev.op == IR_UNREACH {
+      clear = true;
+    }
+    let mut t = 0;
+    while t < vec_len(te_op) {
+      if clear || (u_at(te_op, t) == IR_LOAD && !iropt_ebb_keeps_loads(q.op)) {
+        ra_set(&mut te_op, t, 0);
+      }
+      t = wrap_add(t, 1);
+    }
+    let pure = ra_is_binary(q.op) || q.op == IR_NOT || q.op == IR_NEG || q.op == IR_WRAP;
+    if pure || q.op == IR_LOAD {
+      // Is it there already?
+      let mut hit = IR_NONE;
+      t = 0;
+      while hit == IR_NONE && t < vec_len(te_op) {
+        if u_at(te_op, t) == q.op && iropt_ebb_same(cv, al, u_at(te_a, t), q.a) && iropt_ebb_same(cv, al, u_at(te_b, t), q.b) && u_at(te_c, t) == q.c && u_at(te_ty, t) == q.ty {
+          if u_at(te_nf, t) == 0 {
+            hit = u_at(te_d, t);
+          }
+        }
+        t = wrap_add(t, 1);
+      }
+      if hit != IR_NONE && hit != q.d {
+        let orig = q;
+        q = IrIns { op: IR_MOV, d: orig.d, a: hit, b: 0, c: 0, ty: 0 };
+        iropt_put(&mut f, i, q);
+        done = wrap_add(done, 1);
+        if orig.d < vec_len(al) && hit < vec_len(al) && u_at(ndef, orig.d) == 1 && u_at(ndef, hit) == 1 {
+          ra_set(&mut al, orig.d, hit);
+        }
+        // The old entry for the new result is gone by the write below.
+        let mut rs = vec_new[u64]();
+        ra_writes(q, &mut rs);
+        let mut w = 0;
+        while w < vec_len(rs) {
+          let x = vec_get(rs, w);
+          t = 0;
+          while t < vec_len(te_op) {
+            if u_at(te_op, t) != 0 && (u_at(te_a, t) == x || u_at(te_b, t) == x || u_at(te_d, t) == x) {
+              ra_set(&mut te_op, t, 0);
+            }
+            t = wrap_add(t, 1);
+          }
+          w = wrap_add(w, 1);
+        }
+        vec_free(rs);
+      } else {
+        let mut rs = vec_new[u64]();
+        ra_writes(q, &mut rs);
+        let mut w = 0;
+        while w < vec_len(rs) {
+          let x = vec_get(rs, w);
+          t = 0;
+          while t < vec_len(te_op) {
+            if u_at(te_op, t) != 0 && (u_at(te_a, t) == x || u_at(te_b, t) == x || u_at(te_d, t) == x) {
+              ra_set(&mut te_op, t, 0);
+            }
+            t = wrap_add(t, 1);
+          }
+          w = wrap_add(w, 1);
+        }
+        vec_free(rs);
+        if q.d != q.a && q.d != q.b && q.d != IR_NONE {
+          let mut slot = IR_NONE;
+          t = 0;
+          while slot == IR_NONE && t < vec_len(te_op) {
+            if u_at(te_op, t) == 0 {
+              slot = t;
+            }
+            t = wrap_add(t, 1);
+          }
+          if slot == IR_NONE && vec_len(te_op) < 64 {
+            vec_push(&mut te_op, 0);
+            vec_push(&mut te_a, 0);
+            vec_push(&mut te_b, 0);
+            vec_push(&mut te_c, 0);
+            vec_push(&mut te_ty, 0);
+            vec_push(&mut te_d, 0);
+            vec_push(&mut te_nf, 0);
+            slot = wrap_sub(vec_len(te_op), 1);
+          }
+          if slot != IR_NONE {
+            ra_set(&mut te_op, slot, q.op);
+            ra_set(&mut te_a, slot, q.a);
+            ra_set(&mut te_b, slot, q.b);
+            ra_set(&mut te_c, slot, q.c);
+            ra_set(&mut te_ty, slot, q.ty);
+            ra_set(&mut te_d, slot, q.d);
+            // A load that only a compare with a constant reads becomes `cmp $k, mem`: keep it.
+            let mut nf = 0;
+            if q.op == IR_LOAD && q.d < vec_len(nuse) && u_at(nuse, q.d) == 1 {
+              let mut k = wrap_add(i, 1);
+              let mut seen = false;
+              while !seen && k < n && k < wrap_add(i, 4) {
+                let nx = iropt_at(f, k);
+                if nx.op == IR_CONST {
+                  k = wrap_add(k, 1);
+                } else {
+                  seen = true;
+                  if (nx.op == IR_EQ || nx.op == IR_NE) && ((nx.a == q.d && nx.b < vec_len(cv) && u_at(cv, nx.b) != IR_NONE) || (nx.b == q.d && nx.a < vec_len(cv) && u_at(cv, nx.a) != IR_NONE)) {
+                    nf = 1;
+                  }
+                }
+              }
+            }
+            ra_set(&mut te_nf, slot, nf);
+          }
+        }
+      }
+    } else {
+      let mut rs = vec_new[u64]();
+      ra_writes(q, &mut rs);
+      let mut w = 0;
+      while w < vec_len(rs) {
+        let x = vec_get(rs, w);
+        t = 0;
+        while t < vec_len(te_op) {
+          if u_at(te_op, t) != 0 && (u_at(te_a, t) == x || u_at(te_b, t) == x || u_at(te_d, t) == x) {
+            ra_set(&mut te_op, t, 0);
+          }
+          t = wrap_add(t, 1);
+        }
+        w = wrap_add(w, 1);
+      }
+      vec_free(rs);
+    }
+    prev = q;
+    i = wrap_add(i, 1);
+  }
+  vec_free(ndef);
+  vec_free(cv);
+  vec_free(al);
+  vec_free(cnt);
+  vec_free(te_op);
+  vec_free(te_a);
+  vec_free(te_b);
+  vec_free(te_c);
+  vec_free(te_ty);
+  vec_free(te_d);
+  vec_free(te_nf);
+  vec_free(nuse);
+  return done;
+}
