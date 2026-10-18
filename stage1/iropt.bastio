@@ -4664,3 +4664,88 @@ fn iropt_ebb(f: &mut IrFn) -> u64 {
   vec_free(nuse);
   return done;
 }
+
+/// `x % 2 == 1` is `x % 2 != 0` the same way.
+/// `(x & m) == m` for a one-bit mask m is `(x & m) != 0` (and `!=` the other
+/// way): the comparison with zero can use the flags the `and` has already
+/// set. Rewrites a comparison with the mask of an `and` right before it
+/// (constants may stand between), when nothing else reads the `and`'s result.
+/// Returns how many it rewrote.
+fn iropt_bits(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  if n > 4000000 || f.nreg > 100000000 {
+    return 0;
+  }
+  let ndef = iropt_ndef(f);
+  let nuse = iropt_nuse(f);
+  let cv = iropt_consts(f, ndef);
+  let mut out = vec_new[IrIns]();
+  let mut done = 0;
+  let mut i = 0;
+  while i < n {
+    let mut q = iropt_at(f, i);
+    if q.op == IR_EQ || q.op == IR_NE {
+      let mut t = IR_NONE;
+      let mut k = IR_NONE;
+      if q.a < vec_len(cv) && q.b < vec_len(cv) {
+        if u_at(cv, q.b) != IR_NONE && u_at(cv, q.a) == IR_NONE {
+          t = q.a;
+          k = q.b;
+        } else if u_at(cv, q.a) != IR_NONE && u_at(cv, q.b) == IR_NONE {
+          t = q.b;
+          k = q.a;
+        }
+      }
+      if t != IR_NONE && u_at(ndef, t) == 1 && u_at(nuse, t) == 1 {
+        let m = u_at(cv, k);
+        if m != 0 && (m & wrap_sub(m, 1)) == 0 {
+          // The `and` among the last few instructions.
+          let mut found = false;
+          let mut back = 1;
+          while !found && back <= 4 && back <= vec_len(out) {
+            let mut pq = IrIns { op: 0, d: IR_NONE, a: IR_NONE, b: IR_NONE, c: 0, ty: 0 };
+            let pos = wrap_sub(vec_len(out), back);
+            if pos < vec_len(out) {
+              pq = vec_get(out, pos);
+            }
+            if (pq.op == IR_AND || pq.op == IR_REM) && pq.d == t {
+              if pq.op == IR_AND && ((pq.a < vec_len(cv) && u_at(cv, pq.a) == m) || (pq.b < vec_len(cv) && u_at(cv, pq.b) == m)) {
+                found = true;
+              }
+              // x % 2 is 0 or 1.
+              if pq.op == IR_REM && m == 1 && pq.b < vec_len(cv) && u_at(cv, pq.b) == 2 {
+                found = true;
+              }
+              back = 5;
+            } else if pq.op != IR_CONST {
+              back = 5;
+            }
+            back = wrap_add(back, 1);
+          }
+          if found {
+            let z = ir_reg(&mut f);
+            vec_push(&mut out, IrIns { op: IR_CONST, d: z, a: 0, b: 0, c: 0, ty: 0 });
+            let mut nop = IR_NE;
+            if q.op == IR_NE {
+              nop = IR_EQ;
+            }
+            q = IrIns { op: nop, d: q.d, a: t, b: z, c: q.c, ty: q.ty };
+            done = wrap_add(done, 1);
+          }
+        }
+      }
+    }
+    vec_push(&mut out, q);
+    i = wrap_add(i, 1);
+  }
+  vec_free(ndef);
+  vec_free(nuse);
+  vec_free(cv);
+  if done == 0 {
+    vec_free(out);
+    return 0;
+  }
+  vec_free(f.ins);
+  f.ins = out;
+  return done;
+}

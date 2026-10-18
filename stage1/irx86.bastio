@@ -1801,6 +1801,50 @@ fn ix_load_cmp(f: &IrFn, al: &IrAlloc, nuse: &Vec[u64], i: u64) -> u64 {
   return j;
 }
 
+/// Whether instruction `i` is an `and` of a register with an immediate (or a
+/// `%` by 2) that only a comparison for equality with zero, then the branch on
+/// it, read (constants that stand as immediates may lie between): the index of
+/// the comparison, or 0 if it is not so.
+fn ix_test_br(f: &IrFn, al: &IrAlloc, nuse: &Vec[u64], i: u64) -> u64 {
+  let q = ix_at(f, i);
+  if (q.op != IR_AND && q.op != IR_REM) || q.c != 0 || u_at(nuse, q.d) != 1 {
+    return 0;
+  }
+  let la = ix_loc(al, q.a);
+  let lb = ix_loc(al, q.b);
+  if la.k != IXK_REG || lb.k != IXK_IMM || !ix_fits(lb.imm) {
+    return 0;
+  }
+  if q.op == IR_REM && lb.imm != 2 {
+    return 0;
+  }
+  let mut j = wrap_add(i, 1);
+  let mut cm = ix_at(f, j);
+  let mut skipped = 0;
+  let mut more = true;
+  while more && skipped < 4 {
+    more = false;
+    if cm.op == IR_CONST {
+      let cl = ix_loc(al, cm.d);
+      if cl.k == IXK_IMM {
+        j = wrap_add(j, 1);
+        skipped = skipped + 1;
+        cm = ix_at(f, j);
+        more = true;
+      }
+    }
+  }
+  let br = ix_at(f, wrap_add(j, 1));
+  if (cm.op != IR_EQ && cm.op != IR_NE) || cm.a != q.d || br.op != IR_BR || br.a != cm.d || u_at(nuse, cm.d) != 1 {
+    return 0;
+  }
+  let lz = ix_loc(al, cm.b);
+  if lz.k != IXK_IMM || lz.imm != 0 {
+    return 0;
+  }
+  return j;
+}
+
 /// Whether label `t` is among the labels that stand in a row from
 /// instruction `i` on: they are all at one address, so a branch to any of
 /// them is a branch to the next instruction.
@@ -2039,6 +2083,19 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       ix_awrite(&mut out, ap, sz);
       w_s(&mut out, "\n");
       ix_br_flags(&mut out, f.x, op, br.b, br.c, ix_pick_next(f, wrap_add(j, 2), br.b, br.c));
+      i = wrap_add(j, 1);
+    } else if ix_test_br(f, al, nuse, i) != 0 {
+      // `x & mask` (or `x % 2`) that only a comparison with zero and the branch read: `test`.
+      let j = ix_test_br(f, al, nuse, i);
+      let cm = ix_at(f, j);
+      let br = ix_at(f, wrap_add(j, 1));
+      let la = ix_loc(al, q.a);
+      let mut mask = ix_loc(al, q.b);
+      if q.op == IR_REM {
+        mask = ix_il(1);
+      }
+      ix_ins2(&mut out, "test", mask, la);
+      ix_br_flags(&mut out, f.x, cm.op, br.b, br.c, ix_pick_next(f, wrap_add(j, 2), br.b, br.c));
       i = wrap_add(j, 1);
     } else if q.op == IR_LOAD && ix_load_alu(f, al, nuse, i) {
       let ld = ix_loc(al, nq.d);
@@ -2937,6 +2994,7 @@ fn irx_function_n(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, nc
   }
   iropt_ivs(&mut f);
   iropt_ebb(&mut f);
+  iropt_bits(&mut f);
   iropt_wide(&mut f);
   iropt_dead_live(&mut f);
   iropt_copies(&mut f);
