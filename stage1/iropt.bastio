@@ -1133,6 +1133,59 @@ fn iropt_copies(f: &mut IrFn) -> u64 {
       ra_set(&mut labels, i, wrap_add(prev, isl));
       i = i + 1;
     }
+    // loopy[i] > 0: instruction i lies in a loop, the stretch from a label
+    // to a jump or branch back to it.
+    let mut lpos = vec_new[u64]();
+    let mut l = 0;
+    while l < f.nlabel && l < 1000000000 {
+      vec_push(&mut lpos, IR_NONE);
+      l = l + 1;
+    }
+    let mut loopy = vec_new[u64]();
+    i = 0;
+    while i <= n {
+      vec_push(&mut loopy, 0);
+      i = i + 1;
+    }
+    i = 0;
+    while i < n {
+      let q = vec_get(f.ins, i);
+      if q.op == IR_LABEL && q.a < f.nlabel {
+        ra_set(&mut lpos, q.a, i);
+      }
+      i = i + 1;
+    }
+    i = 0;
+    while i < n {
+      let q = vec_get(f.ins, i);
+      let mut k = 0;
+      while k < 2 {
+        let mut tl = IR_NONE;
+        if q.op == IR_JMP && k == 0 {
+          tl = q.a;
+        } else if q.op == IR_BR && k == 0 {
+          tl = q.b;
+        } else if q.op == IR_BR {
+          tl = q.c;
+        }
+        if tl < f.nlabel {
+          let lp = u_at(lpos, tl);
+          if lp != IR_NONE && lp < i {
+            ra_set(&mut loopy, lp, wrap_add(u_at(loopy, lp), 1));
+            ra_set(&mut loopy, i + 1, wrap_sub(u_at(loopy, i + 1), 1));
+          }
+        }
+        k = k + 1;
+      }
+      i = i + 1;
+    }
+    let mut run = 0;
+    i = 0;
+    while i < n {
+      run = wrap_add(run, u_at(loopy, i));
+      ra_set(&mut loopy, i, run);
+      i = i + 1;
+    }
     // Pick the copies to remove in this round: no source is itself a
     // copy removed in the same round (the next round takes those).
     let mut isdst = vec_new[u64]();
@@ -1155,6 +1208,9 @@ fn iropt_copies(f: &mut IrFn) -> u64 {
           ok = true;
         } else if pa < i && qa.op == IR_CONST {
           // A constant is the same wherever the copy of it is read.
+          ok = true;
+        } else if pa < i && u_at(loopy, pa) == 0 {
+          // Written once, outside every loop: it keeps its value.
           ok = true;
         } else if pa < i && lu >= i {
           // No label among instructions pa + 1 .. lu.
@@ -1209,6 +1265,8 @@ fn iropt_copies(f: &mut IrFn) -> u64 {
     }
     vec_free(pick);
     vec_free(isdst);
+    vec_free(lpos);
+    vec_free(loopy);
     vec_free(labels);
     vec_free(last);
     vec_free(first);
@@ -1635,6 +1693,207 @@ fn iropt_reach(f: &mut IrFn) -> u64 {
     vec_free(out);
   }
   return dropped;
+}
+
+/// A comparison of `x` with a constant, as the set of values of `x` for
+/// which it is true: [lo, hi] (unsigned). `ok` is false for anything but
+/// `lt`, `le`, `gt` and `ge` against a nonempty set.
+struct IrSpan { ok: bool, x: u64, lo: u64, hi: u64 }
+
+/// The span of `c = op a, b` when one operand is a register written once by
+/// a `const` and the other is not. `neg` takes the span of the negation.
+fn iropt_span(cv: &Vec[u64], q: IrIns, neg: bool) -> IrSpan {
+  let none = IrSpan { ok: false, x: 0, lo: 0, hi: 0 };
+  if q.a == IR_NONE || q.b == IR_NONE {
+    return none;
+  }
+  let ka = iropt_cval(cv, q.a);
+  let kb = iropt_cval(cv, q.b);
+  let mut op = q.op;
+  let mut x = q.a;
+  let mut k = kb;
+  if ka != IR_NONE && kb == IR_NONE {
+    op = iropt_cmp_swap(q.op);
+    x = q.b;
+    k = ka;
+  } else if ka != IR_NONE || kb == IR_NONE {
+    return none;
+  }
+  if op < IR_LT || op > IR_GE {
+    return none;
+  }
+  if neg {
+    op = iropt_cmp_neg(op);
+  }
+  if op == IR_LT && k >= 1 {
+    return IrSpan { ok: true, x: x, lo: 0, hi: k - 1 };
+  }
+  if op == IR_LE {
+    return IrSpan { ok: true, x: x, lo: 0, hi: k };
+  }
+  if op == IR_GT && k < IR_NONE {
+    return IrSpan { ok: true, x: x, lo: k + 1, hi: IR_NONE };
+  }
+  if op == IR_GE {
+    return IrSpan { ok: true, x: x, lo: k, hi: IR_NONE };
+  }
+  return none;
+}
+
+/// Range checks. `x < a || x > b` (and `a <= x && x <= b`, which the lowering
+/// writes as the same two branches to the same place) is two compares and
+/// two branches; with `t = x - a` it is the one unsigned compare `t > b - a`.
+/// The pair `c1 = cmp x, K1; br c1, T, N; N: [const..] c2 = cmp x, K2; br c2,
+/// T, M` (either branch may name its target on the false side), where the
+/// two compares are unsigned and one covers the values from 0 up, the other
+/// the values down from the largest, and nothing else enters `N`, becomes
+/// `t = sub x, a; c = gt t, b - a; br c, T, M`. Returns how many pairs it
+/// replaced.
+fn iropt_range(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  let ndef = iropt_ndef(f);
+  let nuse = iropt_nuse(f);
+  let cv = iropt_consts(f, ndef);
+  let mut refs = vec_new[u64]();
+  let mut l = 0;
+  while l < f.nlabel && l < 1000000000 {
+    vec_push(&mut refs, 0);
+    l = l + 1;
+  }
+  let mut i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    if q.op == IR_JMP && q.a < f.nlabel {
+      ra_set(&mut refs, q.a, wrap_add(u_at(refs, q.a), 1));
+    }
+    if q.op == IR_BR {
+      if q.b < f.nlabel {
+        ra_set(&mut refs, q.b, wrap_add(u_at(refs, q.b), 1));
+      }
+      if q.c < f.nlabel {
+        ra_set(&mut refs, q.c, wrap_add(u_at(refs, q.c), 1));
+      }
+    }
+    i = i + 1;
+  }
+  let mut out = vec_new[IrIns]();
+  let mut done = 0;
+  i = 0;
+  while i < n {
+    let q0 = vec_get(f.ins, i);
+    let mut used = false;
+    if iropt_is_cmp(q0.op) && i + 1 < n && u_at(ndef, q0.d) == 1 && u_at(nuse, q0.d) == 1 {
+      let q1 = vec_get(f.ins, i + 1);
+      if q1.op == IR_BR && q1.a == q0.d && q1.b != q1.c {
+        // The label N that the first branch falls to, on either side.
+        let mut nl = q1.c;
+        let mut tl = q1.b;
+        let mut neg1 = false;
+        if i + 2 < n {
+          let w = vec_get(f.ins, i + 2);
+          if w.op == IR_LABEL && w.a == q1.b {
+            nl = q1.b;
+            tl = q1.c;
+            neg1 = true;
+          }
+        }
+        // Skip the labels, then constants, to the second compare.
+        let mut p = i + 2;
+        let mut clean = true;
+        let mut sawn = false;
+        let mut going = true;
+        while going && p < n
+          invariant p <= n
+        {
+          let w = vec_get(f.ins, p);
+          if w.op == IR_LABEL {
+            let mut want = 0;
+            if w.a == nl {
+              want = 1;
+              sawn = true;
+            }
+            if w.a >= f.nlabel || u_at(refs, w.a) != want {
+              clean = false;
+            }
+            p = p + 1;
+          } else if w.op == IR_CONST {
+            p = p + 1;
+          } else {
+            going = false;
+          }
+        }
+        if clean && sawn && p + 1 < n {
+          let q2 = vec_get(f.ins, p);
+          let q3 = vec_get(f.ins, p + 1);
+          if iropt_is_cmp(q2.op) && q3.op == IR_BR && q3.a == q2.d && u_at(ndef, q2.d) == 1 && u_at(nuse, q2.d) == 1 {
+            let mut ml = q3.c;
+            let mut neg2 = false;
+            let mut ok = false;
+            if q3.b == tl && q3.c != tl {
+              ok = true;
+            } else if q3.c == tl && q3.b != tl {
+              ok = true;
+              neg2 = true;
+              ml = q3.b;
+            }
+            if ok && ml != nl {
+              let s1 = iropt_span(cv, q0, neg1);
+              let s2 = iropt_span(cv, q2, neg2);
+              if s1.ok && s2.ok && s1.x == s2.x && s1.x != q0.d && s1.x != q2.d {
+                // The values that go to T: [0, a-1] and [b+1, max].
+                let mut a = IR_NONE;
+                let mut b = IR_NONE;
+                if s1.lo == 0 && s2.hi == IR_NONE && s1.hi < IR_NONE && s2.lo >= 1 && s1.hi + 1 < s2.lo {
+                  a = s1.hi + 1;
+                  b = s2.lo - 1;
+                } else if s2.lo == 0 && s1.hi == IR_NONE && s2.hi < IR_NONE && s1.lo >= 1 && s2.hi + 1 < s1.lo {
+                  a = s2.hi + 1;
+                  b = s1.lo - 1;
+                }
+                if a != IR_NONE {
+                  // The constants of the second block stay (written once).
+                  let mut j = i + 2;
+                  while j < p {
+                    let w = vec_get(f.ins, j);
+                    if w.op == IR_CONST {
+                      vec_push(&mut out, w);
+                    }
+                    j = j + 1;
+                  }
+                  let ra = ir_reg(&mut f);
+                  let rw = ir_reg(&mut f);
+                  let rt = ir_reg(&mut f);
+                  vec_push(&mut out, IrIns { op: IR_CONST, d: ra, a: a, b: 0, c: 0, ty: 0 });
+                  vec_push(&mut out, IrIns { op: IR_SUB, d: rt, a: s1.x, b: ra, c: 0, ty: 0 });
+                  vec_push(&mut out, IrIns { op: IR_CONST, d: rw, a: b - a, b: 0, c: 0, ty: 0 });
+                  vec_push(&mut out, IrIns { op: IR_GT, d: q0.d, a: rt, b: rw, c: 0, ty: q0.ty });
+                  vec_push(&mut out, IrIns { op: IR_BR, d: q1.d, a: q0.d, b: tl, c: ml, ty: q1.ty });
+                  done = wrap_add(done, 1);
+                  used = true;
+                  i = p + 2;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    if !used {
+      vec_push(&mut out, q0);
+      i = i + 1;
+    }
+  }
+  vec_free(ndef);
+  vec_free(nuse);
+  vec_free(cv);
+  vec_free(refs);
+  if done > 0 {
+    vec_free(f.ins);
+    f.ins = out;
+  } else {
+    vec_free(out);
+  }
+  return done;
 }
 
 /// Collapses chains of moves inside a straight-line run: after `b = mov a`,
