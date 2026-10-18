@@ -864,21 +864,28 @@ fn ra_cross(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> Vec[u64] {
 }
 
 fn ra_alloc(f: &IrFn, ncallee: u64, ncaller: u64) -> IrAlloc {
-  return ra_alloc_with(f, ncallee, ncaller, false, false);
+  return ra_alloc_with(f, ncallee, ncaller, false, 0);
 }
 
 /// `ra_alloc`, except that a register written once, by a constant, is left
 /// out and recorded in `cst` and `cv` for the emitter to use as an
 /// immediate.
 fn ra_alloc_const(f: &IrFn, ncallee: u64, ncaller: u64) -> IrAlloc {
-  return ra_alloc_with(f, ncallee, ncaller, true, false);
+  return ra_alloc_with(f, ncallee, ncaller, true, 0);
 }
 
 /// `ra_alloc_const`, except that a constant too wide for one instruction
 /// (`bigk`: 16 bits on AArch64) that a loop reads stays in a register, so the
 /// loop does not build it again on every pass.
 fn ra_alloc_const_loops(f: &IrFn, ncallee: u64, ncaller: u64) -> IrAlloc {
-  return ra_alloc_with(f, ncallee, ncaller, true, true);
+  return ra_alloc_with(f, ncallee, ncaller, true, 65536);
+}
+
+/// `ra_alloc_const`, except that a constant that needs a 64-bit move on x86
+/// and that a loop reads stays in a register (a power of two stays an
+/// immediate: the emitter makes a shift or a mask of it).
+fn ra_alloc_const_wide(f: &IrFn, ncallee: u64, ncaller: u64) -> IrAlloc {
+  return ra_alloc_with(f, ncallee, ncaller, true, 2147483648);
 }
 
 /// Copies between registers: `cph[r]` heads a chain through `cpn` of the
@@ -973,7 +980,7 @@ fn ra_spill_slot(f: &IrFn, iv: &IrIntervals, sg: &IrSegs, cp: &IrCopies, al: &mu
   return s;
 }
 
-fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool, bigk: bool) -> IrAlloc {
+fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool, bigk: u64) -> IrAlloc {
   let bl = ra_blocks(f);
   let lv = ra_live(f, bl);
   let iv = ra_intervals(f, bl, lv);
@@ -1035,7 +1042,7 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool, bigk: bool)
       j = j + 1;
     }
     vec_free(ndef);
-    if bigk {
+    if bigk > 0 {
       let dp = ra_depths(f);
       j = 0;
       while j < n {
@@ -1045,7 +1052,7 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool, bigk: bool)
           let mut w = 0;
           while w < vec_len(rs) {
             let x = vec_get(rs, w);
-            if x < nr && u_at(al.cst, x) == 1 && u_at(al.cv, x) >= 65536 && u_at(al.cv, x) < 18446744073709486080 {
+            if x < nr && u_at(al.cst, x) == 1 && u_at(al.cv, x) >= bigk && u_at(al.cv, x) < wrap_sub(0, bigk) && (bigk < 2147483648 || (u_at(al.cv, x) & wrap_sub(u_at(al.cv, x), 1)) != 0) {
               ra_set(&mut al.cst, x, 0);
             }
             w = w + 1;

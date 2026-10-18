@@ -4322,3 +4322,96 @@ fn iropt_ivs(f: &mut IrFn) -> u64 {
   }
   return total;
 }
+
+/// Is the stretch p .. q of a loop (header label at p, the last jump back at
+/// q) one that no jump enters except at its header?
+fn iropt_wide_entry_ok(f: &IrFn, lb: &IrLabs, p: u64, q: u64) -> bool {
+  let mut i = wrap_add(p, 1);
+  let mut ok = true;
+  while ok && i <= q && i < vec_len(f.ins) {
+    let t = iropt_at(f, i);
+    if t.op == IR_LABEL {
+      if t.a >= f.nlabel || u_at(lb.lo, t.a) < p || u_at(lb.hi, t.a) > q {
+        ok = false;
+      }
+    }
+    i = wrap_add(i, 1);
+  }
+  return ok;
+}
+
+/// A constant too wide for an immediate (it needs a 64-bit move) that a loop
+/// computes in every pass is moved in front of the outermost loop around it
+/// that has a single way in, where the allocator can keep it in a register.
+/// A power of two stays: the emitter turns an operation with it into a shift
+/// or a mask.
+/// Returns how many it moved.
+fn iropt_wide(f: &mut IrFn) -> u64 {
+  let mut total = 0;
+  let mut again = true;
+  while again && total < 200 {
+    again = false;
+    let n = vec_len(f.ins);
+    if n > 4000000 || f.nreg > 100000000 || f.nlabel > 100000000 {
+      return total;
+    }
+    let ndef = iropt_ndef(f);
+    let lb = iropt_labs(f);
+    let mut i = 0;
+    while !again && i < n {
+      let qi = iropt_at(f, i);
+      if qi.op == IR_CONST && qi.d < f.nreg && u_at(ndef, qi.d) == 1 && qi.a >= 2147483648 && qi.a < 18446744071562067968 && (qi.a & wrap_sub(qi.a, 1)) != 0 {
+        let mut best = IR_NONE;
+        let mut l = 0;
+        while l < f.nlabel {
+          let p = u_at(lb.pos, l);
+          if u_at(lb.back, l) >= 1 && p != IR_NONE && p < i && u_at(lb.hi, l) >= i && (best == IR_NONE || p < u_at(lb.pos, best)) {
+            if iropt_wide_entry_ok(f, lb, p, u_at(lb.hi, l)) {
+              best = l;
+            }
+          }
+          l = wrap_add(l, 1);
+        }
+        if best != IR_NONE {
+          let p = u_at(lb.pos, best);
+          let q = u_at(lb.hi, best);
+          let top = ir_label(&mut f);
+          let mut out = vec_new[IrIns]();
+          let mut j = 0;
+          while j < n {
+            if j == p {
+              vec_push(&mut out, IrIns { op: IR_LABEL, d: IR_NONE, a: top, b: 0, c: 0, ty: 0 });
+              vec_push(&mut out, qi);
+            }
+            if j != i {
+              let mut t = iropt_at(f, j);
+              if j < p || j > q {
+                if t.op == IR_JMP && t.a == best {
+                  t.a = top;
+                }
+                if t.op == IR_BR {
+                  if t.b == best {
+                    t.b = top;
+                  }
+                  if t.c == best {
+                    t.c = top;
+                  }
+                }
+              }
+              vec_push(&mut out, t);
+            }
+            j = wrap_add(j, 1);
+          }
+          vec_free(f.ins);
+          f.ins = out;
+          again = true;
+          total = wrap_add(total, 1);
+        }
+      }
+      i = wrap_add(i, 1);
+    }
+    vec_free(ndef);
+    iropt_labs_free(lb);
+  }
+  return total;
+}
