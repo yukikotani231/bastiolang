@@ -1,0 +1,23 @@
+// stage1-only: the AArch64 kernel target
+// `smp_run` and `locked` in a kernel built by the native backend: every
+// processor adds to a count under a lock. The test platform has no other
+// processors, so the thunk runs once, on this one.
+import "core/print.bastio";
+
+struct Count { n: u64 } invariant n < 1000000;
+fn add(c: &mut Count) requires c.n < 1000000 ensures c.n < 1000000 {
+  if c.n < 999999 { c.n = c.n + 1; }
+}
+fn tally(cpu: &mut Cpu, l: &Lock[Count]) {
+  locked(l, add);
+}
+
+fn main(con: &mut Serial, cpu: &mut Cpu) -> u64 {
+  let l = lock_new(Count { n: 0 });
+  smp_run(tally, &mut cpu, l);
+  let c = lock_end(l);
+  print_str(con, "processors that ran: ");
+  print_u64(con, c.n);
+  print_str(con, "\n");
+  return 0;
+}
