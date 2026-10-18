@@ -82,7 +82,7 @@ const IRS_KERNEL_TABLE: u64 = 9;
 const IRS_SYNC_ICACHE: u64 = 10;   // AArch64: cleans a page to the point of unification and invalidates the instruction cache over it; the result is the argument
 const IRS_PT_GEN: u64 = 11;        // AArch64: the count of entries taken out of any table
 const IRS_KERNEL_ROOT: u64 = 12;   // AArch64: the platform's top-level table
-const IRS_DEFERRED: u64 = 13;      // AArch64: defined by a platform that loads user tables from a trampoline
+const IRS_DEFERRED: u64 = 13;      // AArch64: the address of the symbol a platform that loads user tables from a trampoline defines, else 0
 
 const IR_DEVR: u64 = 61;     // d = the c-byte (1, 2, 4 or 8) value at address a, zero-extended: a volatile load, never dropped or reordered
 const IR_DEVW: u64 = 62;     // the low c bytes of b are stored at address a: a volatile store
@@ -412,6 +412,21 @@ fn ir_pte_mask(c: &Checker) -> u64 {
     return 281474976706560;
   }
   return 4503599627366400;
+}
+
+/// A call of the AArch64 kernel's runtime (`a64_kcall`) `which` on `w` and `x` (a zero where absent); the result.
+fn ir_kcall(f: &mut IrFn, which: u64, w: u64, x: u64) -> u64 {
+  let mut a = w;
+  let mut b = x;
+  if a == IR_NONE {
+    a = ir_k(&mut f, 0);
+  }
+  if b == IR_NONE {
+    b = ir_k(&mut f, 0);
+  }
+  let d = ir_reg(&mut f);
+  ir_emit(&mut f, IR_PCALL, d, a, b, which, 0);
+  return d;
 }
 
 /// The address of slot `ix` of the table at address register `t`.
@@ -2550,6 +2565,10 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     if f.failed {
       return ir_none();
     }
+    if c.arch == ARCH_AARCH64 {
+      ir_kcall(&mut f, 41, l, IR_NONE);
+      return ir_none();
+    }
     let kt = ir_reg(&mut f);
     ir_emit(&mut f, IR_RT, kt, l, 0, IRS_KERNEL_TABLE, 0);
     let at = ir_count_addr(&mut f, c, IRS_PT_LEASES, kt);
@@ -2605,6 +2624,21 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     }
     let addr = ir_reg(&mut f);
     ir_emit(&mut f, IR_ADD, addr, base, off, 0, 0);
+    if dk == 2 && c.target == TARGET_KERNEL && c.arch == ARCH_AARCH64 {
+      // Device memory above 512 GiB is mapped only in the kernel's tables: a
+      // user table this processor parked goes back before it is touched.
+      let l_settle = f.nlabel;
+      f.nlabel = wrap_add(f.nlabel, 1);
+      let l_done = f.nlabel;
+      f.nlabel = wrap_add(f.nlabel, 1);
+      let sh39 = ir_k(&mut f, 39);
+      let hi = ir_reg(&mut f);
+      ir_emit(&mut f, IR_SHR, hi, addr, sh39, 0, 0);
+      ir_emit(&mut f, IR_BR, IR_NONE, hi, l_settle, l_done, 0);
+      ir_emit(&mut f, IR_LABEL, IR_NONE, l_settle, 0, 0, 0);
+      ir_kcall(&mut f, 44, IR_NONE, IR_NONE);
+      ir_emit(&mut f, IR_LABEL, IR_NONE, l_done, 0, 0, 0);
+    }
     if dk == 1 && c.target == TARGET_KERNEL {
       if wr {
         ir_emit(&mut f, IR_POUT, IR_NONE, addr, val, dw, 0);
@@ -2748,7 +2782,7 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
         // Not on a platform that loads the user's table from a trampoline of
         // its own (BST_DEFERRED): the weak symbol it defines is then non-zero.
         let dv = ir_reg(&mut f);
-        ir_emit(&mut f, IR_GLOBAL, dv, IRS_DEFERRED, 0, 1, 0);
+        ir_emit(&mut f, IR_GLOBAL, dv, IRS_DEFERRED, 0, 0, 0);
         let zero = ir_k(&mut f, 0);
         let nd = ir_reg(&mut f);
         ir_emit(&mut f, IR_EQ, nd, dv, zero, 0, 0);
@@ -3117,7 +3151,25 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     if f.failed {
       return ir_none();
     }
+    if c.arch == ARCH_AARCH64 {
+      // The platform may release the table's address-space number.
+      let r = ir_kcall(&mut f, 46, t, IR_NONE);
+      return IrVal { k: IRK_INT, r0: r, r1: IR_NONE, t: 0 };
+    }
     return IrVal { k: IRK_INT, r0: t, r1: IR_NONE, t: 0 };
+  }
+  if name_is(p, i, "mmu_kernel") {
+    // The kernel's own tables, a parked user table given back first.
+    if c.target != TARGET_KERNEL || c.arch != ARCH_AARCH64 {
+      ir_fail(&mut f, "an mmu_kernel outside the AArch64 kernel");
+      return ir_none();
+    }
+    let mm = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 0));
+    if f.failed {
+      return ir_none();
+    }
+    ir_kcall(&mut f, 42, IR_NONE, IR_NONE);
+    return ir_none();
   }
   if name_is(p, i, "mmu_enter") {
     // Counts the lease before the table can be in use (`lockinc` is a full
@@ -3131,6 +3183,10 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     if f.failed {
       return ir_none();
     }
+    if c.arch == ARCH_AARCH64 {
+      let l = ir_kcall(&mut f, 40, t, IR_NONE);
+      return IrVal { k: IRK_INT, r0: l, r1: IR_NONE, t: 0 };
+    }
     let at = ir_count_addr(&mut f, c, IRS_PT_LEASES, t);
     ir_emit(&mut f, IR_LOCKINC, IR_NONE, at, 0, 0, 0);
     let d = ir_reg(&mut f);
@@ -3143,6 +3199,10 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let t = ir_int(&mut f, c, &mut m, p, n.a);
     if f.failed {
       return ir_none();
+    }
+    if c.arch == ARCH_AARCH64 {
+      // A lease this processor parked is given back first.
+      ir_kcall(&mut f, 45, t, IR_NONE);
     }
     let at = ir_count_addr(&mut f, c, IRS_PT_LEASES, t);
     let d = ir_reg(&mut f);
@@ -4736,7 +4796,7 @@ fn ir_sym(i: u64) -> Str {
   if i == IRS_SYNC_ICACHE { return "bst_rt_sync_icache"; }
   if i == IRS_PT_GEN { return "bst_rt_pt_gen"; }
   if i == IRS_KERNEL_ROOT { return "bst_kernel_root"; }
-  if i == IRS_DEFERRED { return "bst_platform_deferred_ttbr0"; }
+  if i == IRS_DEFERRED { return "bst_rt_deferred_ptr"; }
   return "bst_kernel_pml4";
 }
 
