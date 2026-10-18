@@ -82,6 +82,7 @@ const IRS_KERNEL_TABLE: u64 = 9;
 const IRS_SYNC_ICACHE: u64 = 10;   // AArch64: cleans a page to the point of unification and invalidates the instruction cache over it; the result is the argument
 const IRS_PT_GEN: u64 = 11;        // AArch64: the count of entries taken out of any table
 const IRS_KERNEL_ROOT: u64 = 12;   // AArch64: the platform's top-level table
+const IRS_SERIAL_POLL: u64 = 14;   // AArch64: the next byte received, or 256 when there is none
 const IRS_DEFERRED: u64 = 13;      // AArch64: the address of the symbol a platform that loads user tables from a trampoline defines, else 0
 
 const IR_DEVR: u64 = 61;     // d = the c-byte (1, 2, 4 or 8) value at address a, zero-extended: a volatile load, never dropped or reordered
@@ -3492,6 +3493,22 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     ir_emit(&mut f, IR_PUTC, IR_NONE, b, 0, 0, 0);
     return ir_none();
   }
+  if name_is(p, i, "serial_poll") && c.target == TARGET_KERNEL && c.arch == ARCH_AARCH64 {
+    let d = ir_reg(&mut f);
+    let z = ir_k(&mut f, 0);
+    ir_emit(&mut f, IR_RT, d, z, 0, IRS_SERIAL_POLL, 0);
+    return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+  }
+  if name_is(p, i, "boot_fb") && c.target == TARGET_KERNEL && c.arch == ARCH_AARCH64 {
+    // No framebuffer on AArch64 yet: every field is 0.
+    let h = ir_handle_arg(&mut f, c, &mut m, p, cg_arg(p, i, 0));
+    let fld = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    if f.failed || h == IR_NONE {
+      return ir_none();
+    }
+    let zero = ir_k(&mut f, 0);
+    return IrVal { k: IRK_INT, r0: zero, r1: IR_NONE, t: 0 };
+  }
   if name_is(p, i, "serial_read") {
     let d = ir_reg(&mut f);
     ir_emit(&mut f, IR_GETC, d, 0, 0, 0, 0);
@@ -4796,6 +4813,7 @@ fn ir_sym(i: u64) -> Str {
   if i == IRS_SYNC_ICACHE { return "bst_rt_sync_icache"; }
   if i == IRS_PT_GEN { return "bst_rt_pt_gen"; }
   if i == IRS_KERNEL_ROOT { return "bst_kernel_root"; }
+  if i == IRS_SERIAL_POLL { return "bst_rt_serial_poll"; }
   if i == IRS_DEFERRED { return "bst_rt_deferred_ptr"; }
   return "bst_kernel_pml4";
 }
