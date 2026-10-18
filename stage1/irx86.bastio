@@ -675,6 +675,20 @@ fn ix_ends_with(v: &Vec[u64], s: Str) -> bool {
   return true;
 }
 
+/// How many times the text `v` contains `pat`.
+fn ix_count(v: &Vec[u64], pat: Str) -> u64 {
+  let n = vec_len(v);
+  let mut c = 0;
+  let mut i = 0;
+  while i < n {
+    if ix_has_at(v, i, pat) {
+      c = wrap_add(c, 1);
+    }
+    i = i + 1;
+  }
+  return c;
+}
+
 /// Whether the text `v` contains `pat`.
 fn ix_mentions(v: &Vec[u64], pat: Str) -> bool {
   let n = vec_len(v);
@@ -1210,9 +1224,36 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
       }
       res = XR_RSI;
     }
-    w_append(&mut out, g.body);
-    x86_clear(&mut g.body);
-    ix_finish(&mut out, al, q.d, res);
+    // `n - q * d` straight into the result's register: the copy of n in %rsi
+    // and the move from it go.
+    let head = "\tmov %rax, %rsi\n";
+    let last = "\tsub %rdx, %rsi\n";
+    let ldr = ix_loc(al, q.d);
+    let lar = ix_loc(al, q.a);
+    if res == XR_RSI && ldr.k == IXK_REG && lar.k == IXK_REG && ix_has_at(g.body, 0, head) && ix_ends_with(g.body, last)
+       && ix_count(g.body, "%rsi") == 2 && vec_len(g.body) >= slen(head) && vec_len(g.body) - slen(head) >= slen(last) {
+      let mut k = slen(head);
+      let end = vec_len(g.body) - slen(last);
+      while k < end && k < vec_len(g.body) {
+        vec_push(&mut out, vec_get(g.body, k));
+        k = k + 1;
+      }
+      if ldr.reg != lar.reg {
+        w_s(&mut out, "\tmov ");
+        w_s(&mut out, x86_rname(lar.reg));
+        w_s(&mut out, ", ");
+        w_s(&mut out, x86_rname(ldr.reg));
+        w_s(&mut out, "\n");
+      }
+      w_s(&mut out, "\tsub %rdx, ");
+      w_s(&mut out, x86_rname(ldr.reg));
+      w_s(&mut out, "\n");
+      x86_clear(&mut g.body);
+    } else {
+      w_append(&mut out, g.body);
+      x86_clear(&mut g.body);
+      ix_finish(&mut out, al, q.d, res);
+    }
   } else if op == IR_DIV || op == IR_REM || op == IR_SDIV || op == IR_SREM {
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RAX));
     ix_mov(&mut out, ix_loc(al, q.b), ix_rl(XR_RCX));
@@ -1672,6 +1713,37 @@ fn ix_br_flags(out: &mut Vec[u64], x: u64, op: u64, then: u64, els: u64, next: u
   }
 }
 
+/// Whether the 8-byte load at `i` is read only by the next instruction, an
+/// `add`, `sub`, `and`, `or` or `xor` (no wrapping) that puts the result in the
+/// register that already holds its other operand: the operation reads memory
+/// (`add (%rbx,%r11,8), %r10`), no register is loaded. A `sub` must take the
+/// loaded value as its second operand.
+fn ix_load_alu(f: &IrFn, al: &IrAlloc, nuse: &Vec[u64], i: u64) -> bool {
+  let q = ix_at(f, i);
+  if q.c != 8 || u_at(nuse, q.d) != 1 {
+    return false;
+  }
+  let nq = ix_at(f, wrap_add(i, 1));
+  if slen(ix_alu(nq.op)) == 0 || nq.op == IR_MUL || nq.c != 0 || nq.a == nq.b {
+    return false;
+  }
+  let mut x = nq.a;
+  if nq.a == q.d {
+    if nq.op == IR_SUB {
+      return false;
+    }
+    x = nq.b;
+  } else if nq.b != q.d {
+    return false;
+  }
+  if x == IR_NONE || x == q.d {
+    return false;
+  }
+  let ld = ix_loc(al, nq.d);
+  let lx = ix_loc(al, x);
+  return ld.k == IXK_REG && lx.k == IXK_REG && lx.reg == ld.reg;
+}
+
 /// Whether the load at `i` is read only by a comparison with a constant that
 /// stands as an immediate (constants that cost nothing may stand between)
 /// and then the branch on it, or directly by the branch: the index of that
@@ -1968,6 +2040,17 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       w_s(&mut out, "\n");
       ix_br_flags(&mut out, f.x, op, br.b, br.c, ix_pick_next(f, wrap_add(j, 2), br.b, br.c));
       i = wrap_add(j, 1);
+    } else if q.op == IR_LOAD && ix_load_alu(f, al, nuse, i) {
+      let ld = ix_loc(al, nq.d);
+      let ap = ix_aprep(&mut out, al, q.a, q.b, q.ty);
+      w_s(&mut out, "\t");
+      w_s(&mut out, ix_alu(nq.op));
+      w_s(&mut out, " ");
+      ix_awrite(&mut out, ap, 8);
+      w_s(&mut out, ", ");
+      w_s(&mut out, x86_rname(ld.reg));
+      w_s(&mut out, "\n");
+      i = i + 1;
     } else if ix_is_cmp(q.op) && nq.op == IR_BR && nq.a == q.d && u_at(nuse, q.d) == 1 {
       // A comparison that only the branch after it reads: no boolean.
       ix_cmp(&mut out, al, q.a, q.b);
@@ -2738,6 +2821,7 @@ fn irx_function_n(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, nc
     return 0;
   }
   iropt_inline(&mut f, c, &mut m, p);
+  iropt_copies(&mut f);
   iropt_slots(&mut f);
   iropt_fold(&mut f);
   iropt_copies(&mut f);

@@ -624,6 +624,8 @@ fn iropt_slot_ok(f: &IrFn, s: u64, words: u64, cv: &Vec[u64]) -> bool {
         if q.op == IR_STORE && q.d == s {
           ok = false;
         }
+      } else if q.op == IR_VGROW && q.a == s {
+        // The header goes to the frame just before and comes back just after.
       } else {
         ok = false;
       }
@@ -631,6 +633,19 @@ fn iropt_slot_ok(f: &IrFn, s: u64, words: u64, cv: &Vec[u64]) -> bool {
     i = i + 1;
   }
   return ok;
+}
+
+/// Does a `vgrow` name the slot register `s`?
+fn iropt_slot_grows(f: &IrFn, s: u64) -> bool {
+  let mut i = 0;
+  while i < vec_len(f.ins) {
+    let q = vec_get(f.ins, i);
+    if q.op == IR_VGROW && q.a == s {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
 }
 
 /// Replaces the promotable slots of `f` by registers. Returns how many.
@@ -665,13 +680,43 @@ fn iropt_slots(f: &mut IrFn) -> u64 {
     let q = vec_get(f.ins, i);
     let mut keep = true;
     if q.op == IR_SLOT && u_at(base, i) != IR_NONE {
+      // A slot that a `vgrow` names stays, for the header to go through.
+      let grows = iropt_slot_grows(f, q.d);
       keep = false;
       let mut k = 0;
       while k < q.c {
-        if iropt_first_is_load(f, i, q.d, k, cv) {
+        if grows || iropt_first_is_load(f, i, q.d, k, cv) {
           vec_push(&mut out, IrIns { op: IR_CONST, d: wrap_add(u_at(base, i), k), a: 0, b: 0, c: 0, ty: 0 });
         }
         k = k + 1;
+      }
+      if grows {
+        vec_push(&mut out, q);
+        keep = false;
+      }
+    } else if q.op == IR_VGROW {
+      let mut j = 0;
+      while j < vec_len(f.ins) {
+        let sq = vec_get(f.ins, j);
+        if sq.op == IR_SLOT && sq.d == q.a && u_at(base, j) != IR_NONE {
+          let mut k = 0;
+          while k < sq.c {
+            let kr = ir_reg(&mut f);
+            vec_push(&mut out, IrIns { op: IR_CONST, d: kr, a: k, b: 0, c: 0, ty: 0 });
+            vec_push(&mut out, IrIns { op: IR_STORE, d: wrap_add(u_at(base, j), k), a: q.a, b: kr, c: 8, ty: 0 });
+            k = k + 1;
+          }
+          vec_push(&mut out, q);
+          k = 0;
+          while k < sq.c {
+            let kr = ir_reg(&mut f);
+            vec_push(&mut out, IrIns { op: IR_CONST, d: kr, a: k, b: 0, c: 0, ty: 0 });
+            vec_push(&mut out, IrIns { op: IR_LOAD, d: wrap_add(u_at(base, j), k), a: q.a, b: kr, c: 8, ty: 0 });
+            k = k + 1;
+          }
+          keep = false;
+        }
+        j = j + 1;
       }
     } else if q.op == IR_LOAD || q.op == IR_STORE {
       // Which promoted slot is `a`, if any?
@@ -1206,8 +1251,9 @@ fn iropt_copies(f: &mut IrFn) -> u64 {
         let mut ok = false;
         if pa == IR_NONE {
           ok = true;
-        } else if pa < i && qa.op == IR_CONST {
-          // A constant is the same wherever the copy of it is read.
+        } else if pa < i && (qa.op == IR_CONST || qa.op == IR_SLOT) {
+          // A constant is the same wherever the copy of it is read, and so is
+          // the address of a frame slot (one per instruction).
           ok = true;
         } else if pa < i && u_at(loopy, pa) == 0 {
           // Written once, outside every loop: it keeps its value.
