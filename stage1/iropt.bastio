@@ -4749,3 +4749,199 @@ fn iropt_bits(f: &mut IrFn) -> u64 {
   f.ins = out;
   return done;
 }
+
+/// Can `iropt_licm` move an instruction with this operation out of a loop? It
+/// must have no effect but its result and not trap.
+fn iropt_licm_op(op: u64) -> bool {
+  return op == IR_ADD || op == IR_SUB || op == IR_MUL || op == IR_AND || op == IR_OR || op == IR_XOR || op == IR_SHL || op == IR_SHR || op == IR_SAR || op == IR_NOT || op == IR_NEG || op == IR_WRAP || (op >= IR_EQ && op <= IR_SGE);
+}
+
+/// Is register `r` the same in every pass of the loop whose header label is at
+/// `p`: a constant, a register written once outside the loop (a parameter
+/// counts), or one `moved` says is moved out?
+fn iropt_licm_inv(r: u64, p: u64, ndef: &Vec[u64], cv: &Vec[u64], dp: &Vec[u64], moved: &Vec[u64]) -> bool {
+  if r >= vec_len(ndef) || r >= vec_len(cv) || r >= vec_len(dp) || r >= vec_len(moved) {
+    return false;
+  }
+  if u_at(cv, r) != IR_NONE || u_at(moved, r) != 0 {
+    return true;
+  }
+  return u_at(ndef, r) == 1 && (u_at(dp, r) == IR_NONE || u_at(dp, r) < p);
+}
+
+/// Loop-invariant code motion: an operation whose result is written once and
+/// whose operands are the same in every pass of a loop (constants, registers
+/// written once before the loop, results of operations moved the same way) is
+/// made once in front of the loop, entered through a new label, instead of in
+/// every pass. A loop with more than one way in stays. The innermost loop goes
+/// first; a result that is invariant in the loop around it moves again on the
+/// next round. Returns how many instructions it moved.
+fn iropt_licm(f: &mut IrFn) -> u64 {
+  let mut total = 0;
+  let mut again = true;
+  let mut rounds = 0;
+  while again && rounds < 60 {
+    again = false;
+    rounds = wrap_add(rounds, 1);
+    let n = vec_len(f.ins);
+    if n > 4000000 || f.nreg > 100000000 || f.nlabel > 100000000 {
+      return total;
+    }
+    let ndef = iropt_ndef(f);
+    let cv = iropt_consts(f, ndef);
+    let lb = iropt_labs(f);
+    let mut dp = vec_new[u64]();
+    let mut r = 0;
+    while r < f.nreg {
+      vec_push(&mut dp, IR_NONE);
+      r = wrap_add(r, 1);
+    }
+    let mut i = 0;
+    while i < n {
+      let qi = iropt_at(f, i);
+      let mut ws = vec_new[u64]();
+      ra_writes(qi, &mut ws);
+      let mut w = 0;
+      while w < vec_len(ws) {
+        let x = vec_get(ws, w);
+        if x < vec_len(dp) && u_at(dp, x) == IR_NONE {
+          ra_set(&mut dp, x, i);
+        }
+        w = wrap_add(w, 1);
+      }
+      vec_free(ws);
+      i = wrap_add(i, 1);
+    }
+    // The loop with the largest header position that has something to move.
+    let mut best = IR_NONE;
+    let mut best_set = vec_new[u64]();
+    let mut l = 0;
+    while l < f.nlabel {
+      let p = u_at(lb.pos, l);
+      if u_at(lb.back, l) >= 1 && p != IR_NONE && (best == IR_NONE || p > u_at(lb.pos, best)) {
+        let q = u_at(lb.hi, l);
+        if q > p && q < n && iropt_wide_entry_ok(f, lb, p, q) {
+          let mut moved = vec_new[u64]();
+          r = 0;
+          while r < f.nreg {
+            vec_push(&mut moved, 0);
+            r = wrap_add(r, 1);
+          }
+          let mut set = vec_new[u64]();
+          let mut grew = true;
+          while grew && vec_len(set) < 64 {
+            grew = false;
+            i = wrap_add(p, 1);
+            while i <= q && i < n {
+              let qi = iropt_at(f, i);
+              if iropt_licm_op(qi.op) && qi.d < vec_len(moved) && u_at(ndef, qi.d) == 1 && u_at(moved, qi.d) == 0 && qi.d != qi.a && qi.d != qi.b {
+                let mut ok = iropt_licm_inv(qi.a, p, ndef, cv, dp, moved);
+                if ok && qi.op != IR_NOT && qi.op != IR_NEG && qi.op != IR_WRAP {
+                  ok = iropt_licm_inv(qi.b, p, ndef, cv, dp, moved);
+                }
+                if ok {
+                  ra_set(&mut moved, qi.d, 1);
+                  vec_push(&mut set, i);
+                  grew = true;
+                }
+              }
+              i = wrap_add(i, 1);
+            }
+          }
+          if vec_len(set) > 0 {
+            // Instructions that read a constant defined in the loop take it along.
+            best = l;
+            vec_free(best_set);
+            best_set = set;
+          } else {
+            vec_free(set);
+          }
+          vec_free(moved);
+        }
+      }
+      l = wrap_add(l, 1);
+    }
+    if best != IR_NONE {
+      let p = u_at(lb.pos, best);
+      let q = u_at(lb.hi, best);
+      // Constants the moved instructions read, if they lie in the loop, go too.
+      let mut mv = vec_new[u64]();
+      let mut inset = vec_new[u64]();
+      i = 0;
+      while i < n {
+        vec_push(&mut inset, 0);
+        i = wrap_add(i, 1);
+      }
+      let mut k = 0;
+      while k < vec_len(best_set) {
+        ra_set(&mut inset, vec_get(best_set, k), 1);
+        k = wrap_add(k, 1);
+      }
+      i = wrap_add(p, 1);
+      while i <= q && i < n {
+        let qi = iropt_at(f, i);
+        if qi.op == IR_CONST && qi.d < vec_len(ndef) && u_at(ndef, qi.d) == 1 {
+          // Is it read by a moved instruction?
+          let mut used = false;
+          k = 0;
+          while k < vec_len(best_set) && !used {
+            let mq = iropt_at(f, vec_get(best_set, k));
+            if mq.a == qi.d || mq.b == qi.d {
+              used = true;
+            }
+            k = wrap_add(k, 1);
+          }
+          if used {
+            ra_set(&mut inset, i, 2);
+          }
+        }
+        i = wrap_add(i, 1);
+      }
+      let top = ir_label(&mut f);
+      let mut out = vec_new[IrIns]();
+      i = 0;
+      while i < n {
+        if i == p {
+          vec_push(&mut out, IrIns { op: IR_LABEL, d: IR_NONE, a: top, b: 0, c: 0, ty: 0 });
+          let mut j = wrap_add(p, 1);
+          while j <= q && j < n {
+            if u_at(inset, j) != 0 {
+              vec_push(&mut out, iropt_at(f, j));
+            }
+            j = wrap_add(j, 1);
+          }
+        }
+        if !(i > p && i <= q && u_at(inset, i) != 0) {
+          let mut t = iropt_at(f, i);
+          if i < p || i > q {
+            if t.op == IR_JMP && t.a == best {
+              t.a = top;
+            }
+            if t.op == IR_BR {
+              if t.b == best {
+                t.b = top;
+              }
+              if t.c == best {
+                t.c = top;
+              }
+            }
+          }
+          vec_push(&mut out, t);
+        }
+        i = wrap_add(i, 1);
+      }
+      total = wrap_add(total, vec_len(best_set));
+      vec_free(f.ins);
+      f.ins = out;
+      vec_free(mv);
+      vec_free(inset);
+      again = true;
+    }
+    vec_free(best_set);
+    vec_free(ndef);
+    vec_free(cv);
+    vec_free(dp);
+    iropt_labs_free(lb);
+  }
+  return total;
+}

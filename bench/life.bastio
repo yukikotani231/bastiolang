@@ -1,0 +1,69 @@
+// Conway's Game of Life on a 256 x 256 torus kept in two Bufs of cells (0 or 1):
+// 200 generations from a pseudo-random start, then the number of live cells.
+fn step(src: &Buf, mut dst: Buf) -> Buf
+  requires len(src) == 65536 && len(dst) == 65536
+  ensures len(result) == 65536
+{
+  let mut y = 0;
+  while y < 256
+    invariant y <= 256 && len(dst) == 65536 && len(src) == 65536
+  {
+    let up = (y + 255) % 256;
+    let dn = (y + 1) % 256;
+    let mut x = 0;
+    while x < 256
+      invariant x <= 256 && y < 256 && up < 256 && dn < 256 && len(dst) == 65536 && len(src) == 65536
+    {
+      let lf = (x + 255) % 256;
+      let rt = (x + 1) % 256;
+      let n = get(src, up * 256 + lf) % 2 + get(src, up * 256 + x) % 2 + get(src, up * 256 + rt) % 2
+            + get(src, y * 256 + lf) % 2 + get(src, y * 256 + rt) % 2
+            + get(src, dn * 256 + lf) % 2 + get(src, dn * 256 + x) % 2 + get(src, dn * 256 + rt) % 2;
+      let me = get(src, y * 256 + x) % 2;
+      let mut v = 0;
+      if n == 3 || (n == 2 && me == 1) {
+        v = 1;
+      }
+      dst = set(dst, y * 256 + x, v);
+      x = x + 1;
+    }
+    y = y + 1;
+  }
+  return dst;
+}
+
+fn main() -> u64 {
+  let mut a = alloc(65536);
+  let mut b = alloc(65536);
+  let mut s = 12345;
+  let mut i = 0;
+  while i < 65536
+    invariant i <= 65536 && len(a) == 65536 && len(b) == 65536 && s < 4294967296
+  {
+    s = (s * 1103515245 + 12345) % 4294967296;
+    a = set(a, i, s / 65536 % 2);
+    i = i + 1;
+  }
+  let mut g = 0;
+  while g < 200
+    invariant g <= 200 && len(a) == 65536 && len(b) == 65536
+  {
+    b = step(a, b);
+    let t = a;
+    a = b;
+    b = t;
+    g = g + 1;
+  }
+  let mut live = 0;
+  i = 0;
+  while i < 65536
+    invariant i <= 65536 && len(a) == 65536 && live <= i
+  {
+    live = live + get(a, i) % 2;
+    i = i + 1;
+  }
+  print(live);
+  free(a);
+  free(b);
+  return 0;
+}

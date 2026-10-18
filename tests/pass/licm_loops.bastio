@@ -1,0 +1,107 @@
+// Loop-invariant code motion (stage1/iropt.bastio, iropt_licm).
+// expect-exit: 0
+// expect-stdout: 9763919
+// Arithmetic on values that do not change inside a loop is computed once
+// before it. Each shape here is one the pass handles or must leave alone:
+// a product that is invariant only in the inner loop, an operation that runs
+// in one arm of an `if` only, a value that the loop itself redefines, a
+// loop that runs no pass, and a division that must stay where it is.
+fn inner(a: u64, b: u64, n: u64) -> u64
+  requires a <= 1000 && b <= 1000 && n <= 1000
+{
+  let mut s = 0;
+  let mut i = 0;
+  while i < n
+    invariant i <= n && n <= 1000
+  {
+    s = wrap_add(s, wrap_mul(a, 256) + (b ^ 77) + i);
+    i = i + 1;
+  }
+  return s;
+}
+
+fn nested(n: u64) -> u64
+  requires n <= 100
+{
+  let mut s = 0;
+  let mut y = 0;
+  while y < n
+    invariant y <= n && n <= 100
+  {
+    let mut x = 0;
+    while x < n
+      invariant x <= n && n <= 100
+    {
+      s = wrap_add(s, y * 256 + x * 3 + (n << 4));
+      x = x + 1;
+    }
+    y = y + 1;
+  }
+  return s;
+}
+
+fn guarded(k: u64, n: u64) -> u64
+  requires k <= 1000 && n <= 1000
+{
+  let mut s = 0;
+  let mut i = 0;
+  while i < n
+    invariant i <= n && n <= 1000
+  {
+    if i % 3 == 0 {
+      s = wrap_add(s, k * 1000 + 5);
+    } else {
+      s = wrap_add(s, i);
+    }
+    i = i + 1;
+  }
+  return s;
+}
+
+fn changing(n: u64) -> u64
+  requires n <= 1000
+{
+  let mut s = 0;
+  let mut m = 1;
+  let mut i = 0;
+  while i < n
+    invariant i <= n && n <= 1000 && m <= 2048
+  {
+    s = wrap_add(s, m * 8);
+    if m < 1024 {
+      m = m * 2;
+    }
+    i = i + 1;
+  }
+  return s;
+}
+
+fn divided(d: u64, n: u64) -> u64
+  requires d <= 1000 && n <= 1000
+{
+  let mut s = 0;
+  let mut i = 0;
+  while i < n
+    invariant i <= n && n <= 1000
+  {
+    if d != 0 {
+      s = wrap_add(s, 5000 / d + i);
+    }
+    i = i + 1;
+  }
+  return s;
+}
+
+fn main() -> u64 {
+  let mut t = 0;
+  t = wrap_add(t, inner(3, 9, 100));
+  t = wrap_add(t, inner(5, 1, 0));
+  t = wrap_add(t, nested(40));
+  t = wrap_add(t, nested(0));
+  t = wrap_add(t, guarded(7, 90));
+  t = wrap_add(t, changing(50));
+  t = wrap_add(t, divided(0, 30));
+  t = wrap_add(t, divided(7, 30));
+  print(t % 1000000007);
+  return 0;
+}
