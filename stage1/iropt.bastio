@@ -4899,6 +4899,369 @@ fn iropt_flag(f: &IrFn, i: u64, c: u64, cv: &Vec[u64], ndef: &Vec[u64]) -> u64 {
   return c;
 }
 
+/// How many instructions of positions `s` to `e` write register `r`.
+fn iropt_count_defs(f: &IrFn, s: u64, e: u64, r: u64) -> u64 {
+  let mut n = 0;
+  let mut k = s;
+  while k < e {
+    if ra_writes_has(iropt_at(f, k), r) {
+      n = wrap_add(n, 1);
+    }
+    k = wrap_add(k, 1);
+  }
+  return n;
+}
+
+/// Appends `n` fresh registers to `v` (copy `m` of an unrolled body; none for copy 0).
+fn w_fresh(v: &mut Vec[u64], f: &mut IrFn, n: u64, m: u64) {
+  if m > 0 {
+    let mut k = 0;
+    while k < n {
+      vec_push(&mut v, ir_reg(&mut f));
+      k = wrap_add(k, 1);
+    }
+  }
+}
+
+/// Is register `x` one of the induction variables in `ivr`: its index there, or IR_NONE?
+fn iropt_iv_index(ivr: &Vec[u64], x: u64) -> u64 {
+  let mut k = 0;
+  while k < vec_len(ivr) {
+    if vec_get(ivr, k) == x {
+      return k;
+    }
+    k = wrap_add(k, 1);
+  }
+  return IR_NONE;
+}
+
+/// Partial unrolling of a counted loop with a straight-line body:
+///
+///   L3: [consts]; t = lt k, B; br t, L4, L5
+///   L4: body                       (k and other induction variables x = x + c)
+///       jmp L3
+///
+/// where k starts at a constant, steps by a constant and takes a number of
+/// trips divisible by 2 or 4. The body is written out U times in a row, each
+/// register it only uses privately renamed per copy, and each induction
+/// variable stepped once per round by U times its step: a read of x in copy m
+/// becomes `x + m * step` (a displacement the address folding then absorbs).
+/// The loop test, the pointer increments and the jump are paid once for U
+/// iterations. Each loop is considered once, in one pass over the function.
+/// Returns how many loops it unrolled.
+fn iropt_punroll(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  if n > 400000 || f.nreg > 10000000 {
+    return 0;
+  }
+  let ndef = iropt_ndef(f);
+  let nuse = iropt_nuse(f);
+  let cv = iropt_consts(f, ndef);
+  let mut refs = vec_new[u64]();
+  let mut l = 0;
+  while l < f.nlabel && l < 1000000000 {
+    vec_push(&mut refs, 0);
+    l = wrap_add(l, 1);
+  }
+  let mut i = 0;
+  while i < n {
+    let q = iropt_at(f, i);
+    if q.op == IR_JMP && q.a < f.nlabel {
+      ra_set(&mut refs, q.a, wrap_add(u_at(refs, q.a), 1));
+    }
+    if q.op == IR_BR {
+      if q.b < f.nlabel {
+        ra_set(&mut refs, q.b, wrap_add(u_at(refs, q.b), 1));
+      }
+      if q.c < f.nlabel {
+        ra_set(&mut refs, q.c, wrap_add(u_at(refs, q.c), 1));
+      }
+    }
+    i = wrap_add(i, 1);
+  }
+  let mut out = vec_new[IrIns]();
+  let mut done = 0;
+  let mut p = 0;
+  while p < n {
+    let ql = iropt_at(f, p);
+    let mut next = wrap_add(p, 1);
+    let mut hq = wrap_add(p, 1);
+    if ql.op == IR_LABEL && u_at(refs, ql.a) == 1 {
+      let mut scanning = true;
+      while scanning && hq < n {
+        let qc0 = iropt_at(f, hq);
+        if qc0.op == IR_CONST {
+          hq = wrap_add(hq, 1);
+        } else {
+          scanning = false;
+        }
+      }
+      let q1 = iropt_at(f, hq);
+      let q2 = iropt_at(f, wrap_add(hq, 1));
+      let q3 = iropt_at(f, wrap_add(hq, 2));
+      let bound = iropt_cval(cv, q1.b);
+      if q1.op == IR_LT && q2.op == IR_BR && q2.a == q1.d && q3.op == IR_LABEL && q3.a == q2.b && u_at(refs, q3.a) == 1 && u_at(ndef, q1.d) == 1 && u_at(nuse, q1.d) == 1 && bound != IR_NONE {
+        let bs = wrap_add(hq, 3);
+        let mut e = bs;
+        let mut going = true;
+        while going && e < n && e < wrap_add(bs, 49) {
+          let qe = iropt_at(f, e);
+          if qe.op == IR_JMP {
+            going = false;
+          } else if !iropt_unroll_ok(qe) {
+            e = n;
+          } else {
+            e = wrap_add(e, 1);
+          }
+        }
+        let qj = iropt_at(f, e);
+        if e < n && qj.op == IR_JMP && qj.a == ql.a && e > bs && wrap_add(e, 1) <= n {
+          // The induction variables: x = add x, c, or t = add x, c ... x = mov t.
+          let mut ivr = vec_new[u64]();
+          let mut ivs = vec_new[u64]();
+          let mut ivu = vec_new[u64]();
+          let mut iva = vec_new[u64]();
+          let mut j = bs;
+          while j < e {
+            let qj2 = iropt_at(f, j);
+            if qj2.op == IR_ADD && qj2.d == qj2.a && qj2.c != 1 && iropt_cval(cv, qj2.b) != IR_NONE && iropt_count_defs(f, bs, e, qj2.d) == 1 {
+              vec_push(&mut ivr, qj2.d);
+              vec_push(&mut ivs, iropt_cval(cv, qj2.b));
+              vec_push(&mut ivu, j);
+              vec_push(&mut iva, IR_NONE);
+            } else if qj2.op == IR_MOV && iropt_count_defs(f, bs, e, qj2.d) == 1 && u_at(ndef, qj2.a) == 1 && u_at(nuse, qj2.a) == 1 {
+              let mut k2 = bs;
+              while k2 < j {
+                let qa = iropt_at(f, k2);
+                if qa.op == IR_ADD && qa.d == qj2.a && qa.a == qj2.d && qa.c != 1 && iropt_cval(cv, qa.b) != IR_NONE {
+                  vec_push(&mut ivr, qj2.d);
+                  vec_push(&mut ivs, iropt_cval(cv, qa.b));
+                  vec_push(&mut ivu, j);
+                  vec_push(&mut iva, k2);
+                }
+                k2 = wrap_add(k2, 1);
+              }
+            }
+            j = wrap_add(j, 1);
+          }
+          let kix = iropt_iv_index(ivr, q1.a);
+          let mut c0 = IR_NONE;
+          let mut step = 0;
+          if kix != IR_NONE && u_at(ndef, q1.a) == 2 {
+            step = u_at(ivs, kix);
+            let mut k3 = 0;
+            while k3 < n {
+              let qd = iropt_at(f, k3);
+              if qd.op == IR_CONST && qd.d == q1.a && (k3 < bs || k3 >= e) {
+                c0 = qd.a;
+              }
+              k3 = wrap_add(k3, 1);
+            }
+          }
+          let mut u = 0;
+          if c0 != IR_NONE && step > 0 && step < 1000000 && c0 < bound && bound < 1000000000 && (bound - c0) % step == 0 {
+            let trips = (bound - c0) / step;
+            if trips >= 8 && trips % 4 == 0 {
+              u = 4;
+            } else if trips >= 4 && trips % 2 == 0 {
+              u = 2;
+            }
+          }
+          if u > 0 && wrap_mul(wrap_sub(e, bs), u) <= 160 {
+            // Registers the body writes once and only reads after that, nowhere else.
+            let mut inb = vec_new[u64]();
+            let mut seen = vec_new[u64]();
+            let mut bad = vec_new[u64]();
+            let mut nin = vec_new[u64]();
+            let mut r = 0;
+            while r < f.nreg && r < 1000000000 {
+              vec_push(&mut inb, 0);
+              vec_push(&mut seen, 0);
+              vec_push(&mut bad, 0);
+              vec_push(&mut nin, 0);
+              r = wrap_add(r, 1);
+            }
+            let mut k = bs;
+            while k < e {
+              let mut ws = vec_new[u64]();
+              ra_writes(iropt_at(f, k), &mut ws);
+              let mut w = 0;
+              while w < vec_len(ws) {
+                ra_set(&mut inb, vec_get(ws, w), 1);
+                w = wrap_add(w, 1);
+              }
+              vec_free(ws);
+              k = wrap_add(k, 1);
+            }
+            k = bs;
+            while k < e {
+              let qk = iropt_at(f, k);
+              let mut rs = vec_new[u64]();
+              ra_reads(f, qk, &mut rs);
+              let mut w = 0;
+              while w < vec_len(rs) {
+                let x = vec_get(rs, w);
+                ra_set(&mut nin, x, wrap_add(u_at(nin, x), 1));
+                if u_at(inb, x) == 1 && u_at(seen, x) == 0 {
+                  ra_set(&mut bad, x, 1);
+                }
+                w = wrap_add(w, 1);
+              }
+              vec_free(rs);
+              let mut ws = vec_new[u64]();
+              ra_writes(qk, &mut ws);
+              w = 0;
+              while w < vec_len(ws) {
+                ra_set(&mut seen, vec_get(ws, w), 1);
+                w = wrap_add(w, 1);
+              }
+              vec_free(ws);
+              k = wrap_add(k, 1);
+            }
+            let mut priv = vec_new[u64]();
+            r = 0;
+            while r < f.nreg && r < 1000000000 {
+              if u_at(inb, r) == 1 && u_at(bad, r) == 0 && u_at(ndef, r) == 1 && u_at(nuse, r) == u_at(nin, r) && iropt_iv_index(ivr, r) == IR_NONE {
+                vec_push(&mut priv, r);
+              }
+              r = wrap_add(r, 1);
+            }
+            // The loop's header and its first label, as they are.
+            k = p;
+            while k < bs {
+              vec_push(&mut out, iropt_at(f, k));
+              k = wrap_add(k, 1);
+            }
+            let mut m = 0;
+            while m < u {
+              let mut mt = vec_new[u64]();
+              w_fresh(&mut mt, &mut f, vec_len(priv), m);
+              k = bs;
+              while k < e {
+                let mut skip = false;
+                j = 0;
+                while j < vec_len(ivr) {
+                  if k == u_at(ivu, j) || k == u_at(iva, j) {
+                    skip = true;
+                  }
+                  j = wrap_add(j, 1);
+                }
+                if !skip {
+                  let mut qk = iropt_at(f, k);
+                  j = 0;
+                  while j < vec_len(ivr) {
+                    let x = vec_get(ivr, j);
+                    if ra_reads_has(f, qk, x) {
+                      let mut rounds = m;
+                      if k > u_at(ivu, j) {
+                        rounds = wrap_add(m, 1);
+                      }
+                      if rounds > 0 {
+                        let ck = ir_reg(&mut f);
+                        let xt = ir_reg(&mut f);
+                        vec_push(&mut out, IrIns { op: IR_CONST, d: ck, a: wrap_mul(rounds, u_at(ivs, j)), b: 0, c: 0, ty: 0 });
+                        vec_push(&mut out, IrIns { op: IR_ADD, d: xt, a: x, b: ck, c: 0, ty: 0 });
+                        qk = ra_subst(qk, x, xt);
+                      }
+                    }
+                    j = wrap_add(j, 1);
+                  }
+                  if m > 0 {
+                    j = 0;
+                    while j < vec_len(priv) && j < vec_len(mt) {
+                      qk = iropt_unroll_ren(qk, vec_get(priv, j), vec_get(mt, j));
+                      j = wrap_add(j, 1);
+                    }
+                  }
+                  vec_push(&mut out, qk);
+                }
+                k = wrap_add(k, 1);
+              }
+              vec_free(mt);
+              m = wrap_add(m, 1);
+            }
+            j = 0;
+            while j < vec_len(ivr) {
+              let ck = ir_reg(&mut f);
+              vec_push(&mut out, IrIns { op: IR_CONST, d: ck, a: wrap_mul(u, u_at(ivs, j)), b: 0, c: 0, ty: 0 });
+              vec_push(&mut out, IrIns { op: IR_ADD, d: vec_get(ivr, j), a: vec_get(ivr, j), b: ck, c: 0, ty: 0 });
+              j = wrap_add(j, 1);
+            }
+            vec_push(&mut out, qj);
+            next = wrap_add(e, 1);
+            done = wrap_add(done, 1);
+            vec_free(inb);
+            vec_free(seen);
+            vec_free(bad);
+            vec_free(nin);
+            vec_free(priv);
+          }
+          vec_free(ivr);
+          vec_free(ivs);
+          vec_free(ivu);
+          vec_free(iva);
+        }
+      }
+    }
+    if next == wrap_add(p, 1) {
+      vec_push(&mut out, ql);
+    }
+    p = next;
+  }
+  vec_free(ndef);
+  vec_free(nuse);
+  vec_free(cv);
+  vec_free(refs);
+  if done == 0 {
+    vec_free(out);
+    return 0;
+  }
+  vec_free(f.ins);
+  f.ins = out;
+  return done;
+}
+
+/// Does the condition register `c` of the branch at `i` depend on a `load`
+/// within the straight-line run before it (at most twelve instructions)? Such
+/// a branch tests memory, and the predictor often runs ahead of the load; a
+/// mask would make the code after it wait for that load.
+fn iropt_cond_loads(f: &IrFn, i: u64, c: u64) -> bool {
+  let mut cone = vec_new[u64]();
+  vec_push(&mut cone, c);
+  let mut hit = false;
+  let mut k = i;
+  let mut steps = 0;
+  while k > 0 && steps < 12 && !hit {
+    k = k - 1;
+    let q = iropt_at(f, k);
+    if q.op == IR_LABEL || q.op == IR_JMP || q.op == IR_BR {
+      steps = 12;
+    } else {
+      let mut ws = vec_new[u64]();
+      ra_writes(q, &mut ws);
+      let mut w = 0;
+      let mut in_cone = false;
+      while w < vec_len(ws) {
+        if iropt_count(cone, vec_get(ws, w)) > 0 {
+          in_cone = true;
+        }
+        w = wrap_add(w, 1);
+      }
+      vec_free(ws);
+      if in_cone {
+        if q.op == IR_LOAD {
+          hit = true;
+        } else {
+          ra_reads(f, q, &mut cone);
+        }
+      }
+    }
+    steps = wrap_add(steps, 1);
+  }
+  vec_free(cone);
+  return hit;
+}
+
 /// Branchless `if`: an `if` (or `if`/`else`) whose arms are a few
 /// instructions that only compute registers, and whose condition is a
 /// comparison, runs both arms and selects the results with a mask,
@@ -4955,7 +5318,7 @@ fn iropt_ifconv(f: &mut IrFn) -> u64 {
     let q = iropt_at(f, i);
     let mut next = wrap_add(i, 1);
     let l0 = iropt_at(f, wrap_add(i, 1));
-    if q.op == IR_BR && q.b != q.c && q.b < f.nlabel && q.c < f.nlabel && u_at(cmp, q.a) == 1 && l0.op == IR_LABEL && (l0.a == q.b || l0.a == q.c) && u_at(refs, l0.a) == 1 {
+    if q.op == IR_BR && q.b != q.c && q.b < f.nlabel && q.c < f.nlabel && u_at(cmp, q.a) == 1 && !iropt_cond_loads(f, i, q.a) && l0.op == IR_LABEL && (l0.a == q.b || l0.a == q.c) && u_at(refs, l0.a) == 1 {
       let mut other = q.b;
       if l0.a == q.b {
         other = q.c;
