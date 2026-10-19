@@ -5221,6 +5221,47 @@ fn iropt_punroll(f: &mut IrFn) -> u64 {
   return done;
 }
 
+/// Does the condition register `c` of the branch at `i` depend on a `load`
+/// within the straight-line run before it (at most twelve instructions)? Such
+/// a branch tests memory, and the predictor often runs ahead of the load; a
+/// mask would make the code after it wait for that load.
+fn iropt_cond_loads(f: &IrFn, i: u64, c: u64) -> bool {
+  let mut cone = vec_new[u64]();
+  vec_push(&mut cone, c);
+  let mut hit = false;
+  let mut k = i;
+  let mut steps = 0;
+  while k > 0 && steps < 12 && !hit {
+    k = k - 1;
+    let q = iropt_at(f, k);
+    if q.op == IR_LABEL || q.op == IR_JMP || q.op == IR_BR {
+      steps = 12;
+    } else {
+      let mut ws = vec_new[u64]();
+      ra_writes(q, &mut ws);
+      let mut w = 0;
+      let mut in_cone = false;
+      while w < vec_len(ws) {
+        if iropt_count(cone, vec_get(ws, w)) > 0 {
+          in_cone = true;
+        }
+        w = wrap_add(w, 1);
+      }
+      vec_free(ws);
+      if in_cone {
+        if q.op == IR_LOAD {
+          hit = true;
+        } else {
+          ra_reads(f, q, &mut cone);
+        }
+      }
+    }
+    steps = wrap_add(steps, 1);
+  }
+  vec_free(cone);
+  return hit;
+}
+
 /// Branchless `if`: an `if` (or `if`/`else`) whose arms are a few
 /// instructions that only compute registers, and whose condition is a
 /// comparison, runs both arms and selects the results with a mask,
@@ -5277,7 +5318,7 @@ fn iropt_ifconv(f: &mut IrFn) -> u64 {
     let q = iropt_at(f, i);
     let mut next = wrap_add(i, 1);
     let l0 = iropt_at(f, wrap_add(i, 1));
-    if q.op == IR_BR && q.b != q.c && q.b < f.nlabel && q.c < f.nlabel && u_at(cmp, q.a) == 1 && l0.op == IR_LABEL && (l0.a == q.b || l0.a == q.c) && u_at(refs, l0.a) == 1 {
+    if q.op == IR_BR && q.b != q.c && q.b < f.nlabel && q.c < f.nlabel && u_at(cmp, q.a) == 1 && !iropt_cond_loads(f, i, q.a) && l0.op == IR_LABEL && (l0.a == q.b || l0.a == q.c) && u_at(refs, l0.a) == 1 {
       let mut other = q.b;
       if l0.a == q.b {
         other = q.c;
