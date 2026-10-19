@@ -6092,3 +6092,118 @@ fn iropt_xorcancel(f: &mut IrFn) -> u64 {
   }
   return done;
 }
+
+/// The position of the call of function `x` that sets register `r` and
+/// stands right before position `at`, or IR_NONE.
+fn iropt_self_call(f: &IrFn, x: u64, at: u64, r: u64) -> u64 {
+  if at == 0 {
+    return IR_NONE;
+  }
+  let j = at - 1;
+  let q = iropt_at(f, j);
+  if q.op == IR_CALL && q.a == x && q.d == r && q.ty == IR_NONE && q.c == vec_len(f.params) {
+    return j;
+  }
+  return IR_NONE;
+}
+
+/// `return t + f(a)` in a function `f` that returns one word, with the add
+/// wrapping, is `acc = acc + t; params = a; goto top`, and every other
+/// `return v` is `return v + acc`: the second recursive call of `fib(n - 1) +
+/// fib(n - 2)` becomes a loop, which halves the calls (gcc does the same). The
+/// wrapping add is associative, so the order of the additions does not
+/// change the result. A function that takes the address of its frame, takes a
+/// buffer parameter or returns more than one word is left alone. Returns how
+/// many returns it rewrote.
+fn iropt_accrec(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  if n > 100000 || f.nreg > 100000000 || f.failed || vec_len(f.lent) > 0 || vec_len(f.params) > 8 {
+    return 0;
+  }
+  let x = f.x;
+  let mut sites = 0;
+  let mut aty = 0;
+  let mut i = 0;
+  while i < n {
+    let q = iropt_at(f, i);
+    if q.op == IR_SLOT || q.op == IR_CALLM || q.op == IR_VGROW {
+      return 0;
+    }
+    if q.op == IR_RET && (q.c != 0 || q.a == IR_NONE || q.b != IR_NONE) {
+      return 0;
+    }
+    if q.op == IR_RET && i >= 2 {
+      let s = iropt_at(f, i - 1);
+      if s.op == IR_ADD && s.c == 1 && s.d == q.a {
+        let mut j = iropt_self_call(f, x, i - 1, s.b);
+        if j == IR_NONE {
+          j = iropt_self_call(f, x, i - 1, s.a);
+        }
+        if j != IR_NONE {
+          sites = wrap_add(sites, 1);
+          aty = s.ty;
+        }
+      }
+    }
+    i = wrap_add(i, 1);
+  }
+  if sites == 0 {
+    return 0;
+  }
+  let acc = ir_reg(&mut f);
+  let top = ir_label(&mut f);
+  let mut out = vec_new[IrIns]();
+  vec_push(&mut out, IrIns { op: IR_CONST, d: acc, a: 0, b: 0, c: 0, ty: 0 });
+  vec_push(&mut out, IrIns { op: IR_LABEL, d: IR_NONE, a: top, b: 0, c: 0, ty: 0 });
+  i = 0;
+  while i < n {
+    let q = iropt_at(f, i);
+    let mut handled = false;
+    // The call, the add and the return are three instructions in a row.
+    if q.op == IR_CALL && q.a == x && q.ty == IR_NONE && q.c == vec_len(f.params) && wrap_add(i, 2) < n {
+      let s = iropt_at(f, wrap_add(i, 1));
+      let rt = iropt_at(f, wrap_add(i, 2));
+      if s.op == IR_ADD && s.c == 1 && rt.op == IR_RET && s.d == rt.a && (s.a == q.d || s.b == q.d) && s.a != s.b && q.d != IR_NONE {
+        let mut t = s.a;
+        if s.a == q.d {
+          t = s.b;
+        }
+        // `t` must not be the call's own result, and all the reads of the
+        // arguments happen before the parameters are written.
+        if t != q.d {
+          vec_push(&mut out, IrIns { op: IR_ADD, d: acc, a: acc, b: t, c: 1, ty: s.ty });
+          let mut tmps = vec_new[u64]();
+          let mut k = 0;
+          while k < q.c && k < 8 {
+            let tmp = ir_reg(&mut f);
+            vec_push(&mut tmps, tmp);
+            vec_push(&mut out, IrIns { op: IR_MOV, d: tmp, a: u_at(f.args, wrap_add(q.b, k)), b: 0, c: 0, ty: 0 });
+            k = wrap_add(k, 1);
+          }
+          k = 0;
+          while k < q.c && k < 8 {
+            vec_push(&mut out, IrIns { op: IR_MOV, d: u_at(f.params, k), a: u_at(tmps, k), b: 0, c: 0, ty: 0 });
+            k = wrap_add(k, 1);
+          }
+          vec_free(tmps);
+          vec_push(&mut out, IrIns { op: IR_JMP, d: IR_NONE, a: top, b: 0, c: 0, ty: 0 });
+          handled = true;
+          i = wrap_add(i, 3);
+        }
+      }
+    }
+    if !handled {
+      if q.op == IR_RET && q.a != IR_NONE {
+        let y = ir_reg(&mut f);
+        vec_push(&mut out, IrIns { op: IR_ADD, d: y, a: q.a, b: acc, c: 1, ty: aty });
+        vec_push(&mut out, IrIns { op: IR_RET, d: q.d, a: y, b: q.b, c: q.c, ty: q.ty });
+      } else {
+        vec_push(&mut out, q);
+      }
+      i = wrap_add(i, 1);
+    }
+  }
+  vec_free(f.ins);
+  f.ins = out;
+  return sites;
+}
