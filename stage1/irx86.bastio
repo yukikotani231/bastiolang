@@ -2688,6 +2688,59 @@ fn ix_coalesce(f: &mut IrFn) {
     vec_free(ws);
     i = i + 1;
   }
+  // moved[i] = j + 1: the definition at i, whose only use is the copy
+  // `s = mov t` at j in the same straight run, with no read or write of s
+  // between them, may write s directly; gone[j]: that copy.
+  let mut moved = vec_new[u64]();
+  let mut gone = vec_new[u64]();
+  i = 0;
+  while i < vec_len(f.ins) {
+    vec_push(&mut moved, 0);
+    vec_push(&mut gone, 0);
+    i = i + 1;
+  }
+  i = 0;
+  while i < vec_len(f.ins) {
+    let q = vec_get(f.ins, i);
+    let mut cand = u_at(gone, i) == 0 && ix_defines(q) && q.d != IR_NONE && q.d < vec_len(ndef) && u_at(ndef, q.d) == 1 && u_at(nuse, q.d) == 1 && q.op != IR_CALL && q.op != IR_CALLM && q.op != IR_CONST;
+    let adj = ix_at(f, i + 1);
+    if cand && adj.op == IR_MOV && adj.a == q.d {
+      cand = false;
+    }
+    j = wrap_add(i, 1);
+    let mut s = IR_NONE;
+    let mut scanning = cand;
+    while scanning && j < vec_len(f.ins) && j < wrap_add(i, 40) {
+      let m = vec_get(f.ins, j);
+      if m.op == IR_LABEL || ra_is_end(m.op) {
+        scanning = false;
+      } else if m.op == IR_MOV && m.a == q.d && m.d != q.d && m.d < vec_len(ndef) {
+        s = m.d;
+        scanning = false;
+      } else if ra_writes_has(m, q.d) || ra_reads_has(f, m, q.d) {
+        scanning = false;
+      } else {
+        j = wrap_add(j, 1);
+      }
+    }
+    if s != IR_NONE {
+      // Between the definition and the copy, nothing touches s.
+      let mut ok = true;
+      let mut x = wrap_add(i, 1);
+      while ok && x < j {
+        let m = ix_at(f, x);
+        if ra_writes_has(m, s) || ra_reads_has(f, m, s) || m.op == IR_CALL || m.op == IR_CALLM {
+          ok = false;
+        }
+        x = wrap_add(x, 1);
+      }
+      if ok && u_at(gone, j) == 0 && u_at(moved, i) == 0 {
+        ra_set(&mut moved, i, wrap_add(j, 1));
+        ra_set(&mut gone, j, 1);
+      }
+    }
+    i = wrap_add(i, 1);
+  }
   let mut out = vec_new[IrIns]();
   i = 0;
   while i < vec_len(f.ins) {
@@ -2701,10 +2754,24 @@ fn ix_coalesce(f: &mut IrFn) {
     if q.op == IR_CALL && q.ty != IR_NONE && q.ty != 0 {
       other = true;
     }
-    if !other && ix_defines(q) && q.d != IR_NONE && nq.op == IR_MOV && nq.a == q.d && nq.d != q.d
+    if u_at(gone, i) != 0 {
+      i = i + 1;
+    } else if !other && ix_defines(q) && q.d != IR_NONE && nq.op == IR_MOV && nq.a == q.d && nq.d != q.d
       && u_at(ndef, q.d) == 1 && u_at(nuse, q.d) == 1 {
-      vec_push(&mut out, IrIns { op: q.op, d: nq.d, a: q.a, b: q.b, c: q.c, ty: q.ty });
+      // (The copy may itself be one that writes a later copy's target.)
+      let mut dst = nq.d;
+      if u_at(moved, i + 1) != 0 {
+        let rq = ix_at(f, wrap_sub(u_at(moved, i + 1), 1));
+        dst = rq.d;
+      }
+      vec_push(&mut out, IrIns { op: q.op, d: dst, a: q.a, b: q.b, c: q.c, ty: q.ty });
       i = i + 2;
+    } else if !other && ix_defines(q) && q.d != IR_NONE && q.d < vec_len(ndef) && u_at(ndef, q.d) == 1 && u_at(nuse, q.d) == 1 && u_at(moved, i) != 0 {
+      // The copy comes later in the same run (the words of a result loaded
+      // together, then bound one by one): the definition writes its target.
+      let tq = ix_at(f, wrap_sub(u_at(moved, i), 1));
+      vec_push(&mut out, IrIns { op: q.op, d: tq.d, a: q.a, b: q.b, c: q.c, ty: q.ty });
+      i = i + 1;
     } else {
       vec_push(&mut out, q);
       i = i + 1;
@@ -2712,6 +2779,8 @@ fn ix_coalesce(f: &mut IrFn) {
   }
   vec_free(nuse);
   vec_free(ndef);
+  vec_free(moved);
+  vec_free(gone);
   vec_free(f.ins);
   f.ins = out;
 }
