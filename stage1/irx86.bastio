@@ -1386,6 +1386,16 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     ix_awrite(&mut out, ap, q.c);
     w_s(&mut out, "\n");
   } else if op == IR_ALLOC {
+    let words = ix_loc(al, q.a);
+    if q.ty == 2 && q.c == 8 && g.target == TARGET_HOSTED && words.k == IXK_IMM && words.imm > 0 && words.imm < 100000000 {
+      // A box of a known size on a hosted target: malloc itself, from a
+      // frame that is aligned at every call (the runtime routine realigns
+      // the stack and tests for zero words, which cannot happen here).
+      ix_mov(&mut out, ix_il(wrap_mul(8, words.imm)), ix_rl(XR_RDI));
+      w_s(&mut out, "\tcall malloc@PLT\n\ttest %rax, %rax\n\tjz bst_rt_oom\n");
+      ix_finish(&mut out, al, q.d, XR_RAX);
+      return;
+    }
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RDI));
     if q.ty == 1 && q.c == 1 {
       w_s(&mut out, "\tcall bst_rt_try_balloc\n");
@@ -1401,7 +1411,11 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     ix_finish(&mut out, al, q.d, XR_RAX);
   } else if op == IR_FREE {
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RDI));
-    w_s(&mut out, "\tcall bst_rt_free\n");
+    if g.target == TARGET_HOSTED {
+      w_s(&mut out, "\tcall free@PLT\n");
+    } else {
+      w_s(&mut out, "\tcall bst_rt_free\n");
+    }
   } else if op == IR_PRINT {
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RDI));
     w_s(&mut out, "\tcall bst_rt_print\n");
@@ -2946,6 +2960,164 @@ fn ix_fold_slots(f: &IrFn, al: &mut IrAlloc, base: u64) {
   vec_free(ndef);
 }
 
+/// The family (see x86_fam_at) of the 64-bit register named from `d` to `e`,
+/// or 0 for anything else, %rsp and %rbp included.
+fn ix_reg64(code: &Vec[u64], d: u64, e: u64) -> u64 {
+  if u_at(code, d) != 37 || e <= wrap_add(d, 1) {
+    return 0;
+  }
+  let f = x86_fam_at(code, wrap_add(d, 1));
+  if f == 0 || f == 7 || f == 8 {
+    return 0;
+  }
+  if f <= 8 {
+    if u_at(code, wrap_add(d, 1)) == 114 {
+      return f;
+    }
+    return 0;
+  }
+  let last = u_at(code, wrap_sub(e, 1));
+  if last >= 48 && last <= 57 {
+    return f;
+  }
+  return 0;
+}
+
+/// N when the operand from `s` to `e` is `N(%rsp)` with N a multiple of 8 in
+/// `lo` .. `hi` (the frame words of spilled values), else IR_NONE.
+fn ix_spill_at(code: &Vec[u64], s: u64, e: u64, lo: u64, hi: u64) -> u64 {
+  let mut p = s;
+  while p < e && p < vec_len(code) && vec_get(code, p) != 40 {
+    p = p + 1;
+  }
+  if p >= e || !x86_txt(code, p, e, "(%rsp)") {
+    return IR_NONE;
+  }
+  if p <= s || wrap_sub(p, s) > 6 {
+    return IR_NONE;
+  }
+  let mut v = 0;
+  let mut k = s;
+  while k < p {
+    let ch = u_at(code, k);
+    if ch < 48 || ch > 57 {
+      return IR_NONE;
+    }
+    v = wrap_add(wrap_mul(v, 10), wrap_sub(ch, 48));
+    k = k + 1;
+  }
+  if v % 8 != 0 || v < lo || v >= hi {
+    return IR_NONE;
+  }
+  return v;
+}
+
+/// The entries of the table (register family, frame offset) that survive
+/// when the registers in `mask` (a bit per family) are written and, when
+/// `off` is not IR_NONE, the word at that offset is.
+fn ix_reload_kill(treg: &mut Vec[u64], toff: &mut Vec[u64], mask: u64, off: u64) {
+  let mut nr = vec_new[u64]();
+  let mut no = vec_new[u64]();
+  let mut j = 0;
+  while j < vec_len(treg) {
+    let f = u_at(treg, j);
+    let o = u_at(toff, j);
+    let mut gone = o == off;
+    if f < 64 && ((mask >> f) & 1) == 1 {
+      gone = true;
+    }
+    if !gone {
+      vec_push(&mut nr, f);
+      vec_push(&mut no, o);
+    }
+    j = j + 1;
+  }
+  vec_free(treg);
+  vec_free(toff);
+  treg = nr;
+  toff = no;
+}
+
+/// Does the table say that register family `f` holds the word at `off`?
+fn ix_reload_has(treg: &Vec[u64], toff: &Vec[u64], f: u64, off: u64) -> bool {
+  let mut j = 0;
+  while j < vec_len(treg) {
+    if u_at(treg, j) == f && u_at(toff, j) == off {
+      return true;
+    }
+    j = j + 1;
+  }
+  return false;
+}
+
+/// Drops the load of a spilled value into a register that holds that value
+/// already: `mov 40(%rsp), %rsi` again after stores through %rsi, as when a
+/// struct is written field by field to an address kept in the frame. `lo` ..
+/// `hi` are the byte offsets of the frame words the allocator spills to;
+/// nothing but a move into the register or a store to that word changes what
+/// they hold (they are never addressed). Whatever else a line does that is
+/// not a compare, a jump or a plain write to registers forgets everything.
+fn ix_reload(code: &Vec[u64], lo: u64, hi: u64, out: &mut Vec[u64]) {
+  let starts = x86_line_starts(code);
+  let nl = vec_len(starts);
+  let mut treg = vec_new[u64]();
+  let mut toff = vec_new[u64]();
+  let mut i = 0;
+  while i < nl
+    invariant i <= nl
+  {
+    let s = u_at(starts, i);
+    let e = x86_line_end(code, s);
+    let mut keep = true;
+    if u_at(code, s) != 9 || u_at(code, wrap_add(s, 1)) == 46 {
+      ix_reload_kill(&mut treg, &mut toff, 131071, IR_NONE);
+    } else if x86_has_prefix(code, s, "\tj") || x86_has_prefix(code, s, "\tcmp") || x86_has_prefix(code, s, "\ttest ") {
+      keep = true;
+    } else if x86_has_prefix(code, s, "\tmov ") || x86_has_prefix(code, s, "\tmovq ") || x86_has_prefix(code, s, "\tmovl ")
+      || x86_has_prefix(code, s, "\tmovb ") || x86_has_prefix(code, s, "\tmovw ")
+    {
+      let d = x86_last_op(code, s, e);
+      if d == e || d < 2 {
+        ix_reload_kill(&mut treg, &mut toff, 131071, IR_NONE);
+      } else if u_at(code, d) == 37 {
+        let f = ix_reg64(code, d, e);
+        let mut off = IR_NONE;
+        if f != 0 && x86_has_prefix(code, s, "\tmov ") {
+          off = ix_spill_at(code, wrap_add(s, 5), wrap_sub(d, 2), lo, hi);
+        }
+        if off != IR_NONE && ix_reload_has(treg, toff, f, off) {
+          keep = false;
+        } else {
+          ix_reload_kill(&mut treg, &mut toff, x86_fams(code, d, e), IR_NONE);
+          if off != IR_NONE && vec_len(treg) < 8 {
+            vec_push(&mut treg, f);
+            vec_push(&mut toff, off);
+          }
+        }
+      } else if x86_has_rsp(code, d, e) {
+        ix_reload_kill(&mut treg, &mut toff, 0, ix_spill_at(code, d, e, lo, hi));
+      }
+    } else {
+      let w = x86_plain_writes(code, s, e);
+      ix_reload_kill(&mut treg, &mut toff, w, IR_NONE);
+    }
+    if keep {
+      let mut k = s;
+      while k < e {
+        vec_push(&mut out, u_at(code, k));
+        k = k + 1;
+      }
+      if e < vec_len(code) {
+        vec_push(&mut out, 10);
+      }
+    }
+    i = i + 1;
+  }
+  vec_free(starts);
+  vec_free(treg);
+  vec_free(toff);
+}
+
 /// Writes function instance `x` from its IR, to `g.out`. False (nothing
 /// written) when the IR does not cover it or the convention does not match.
 fn irx_function_n(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, ncallee: u64) -> u64 {
@@ -3151,8 +3323,16 @@ fn irx_function_n(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, nc
       w_s(&mut out, "\tsub $");
       w_num(&mut out, wrap_add(wrap_mul(8, words), 8));
       w_s(&mut out, ", %rsp\n");
+      // Spilled values live in the words just above the slots.
+      let mut rl = vec_new[u64]();
+      if words >= wrap_add(al.ncallee_used, al.nspill) {
+        ix_reload(fp, wrap_mul(8, wrap_sub(words, wrap_add(al.ncallee_used, al.nspill))), wrap_mul(8, wrap_sub(words, al.ncallee_used)), &mut rl);
+      } else {
+        ix_reload(fp, 0, 0, &mut rl);
+      }
       vec_free(framed);
-      framed = fp;
+      vec_free(fp);
+      framed = rl;
     } else {
       vec_free(fp);
       if al.ncallee_used > 5 {
