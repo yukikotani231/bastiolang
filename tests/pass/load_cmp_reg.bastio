@@ -1,0 +1,52 @@
+// A load that only a comparison with a register and a branch read becomes
+// `cmpq %reg, mem` (irx86 ix_load_cmp): loads on the left and on the right of
+// `==`, `!=`, `<` and `>=`, with the register unchanged between.
+// expect-exit: 0
+// expect-stdout: 1872
+fn fill(mut t: Buf) -> Buf
+  requires len(t) == 64
+  ensures len(result) == 64
+{
+  let mut i = 0;
+  while i < 64
+    invariant i <= 64 && len(t) == 64
+  {
+    t = set(t, i, (i * 5 + 1) % 17);
+    i = i + 1;
+  }
+  return t;
+}
+
+fn count(t: &Buf, k: u64) -> u64
+  requires len(t) == 64
+  ensures result <= 256
+{
+  let mut i = 0;
+  let mut n = 0;
+  while i < 64
+    invariant i <= 64 && len(t) == 64 && n <= 4 * i
+  {
+    if get(t, i) == k { n = n + 1; }
+    if k != get(t, i) { n = n + 0; }
+    if get(t, i) < k { n = n + 1; }
+    if get(t, i) >= k { n = n + 1; }
+    i = i + 1;
+  }
+  return n;
+}
+
+fn main() -> u64 {
+  let mut t = alloc(64);
+  t = fill(t);
+  let mut k = 0;
+  let mut s = 0;
+  while k < 20
+    invariant k <= 20 && len(t) == 64 && s <= 20 * 256
+  {
+    s = s * 2 % 4096 + count(t, k);
+    k = k + 1;
+  }
+  print(s);
+  free(t);
+  return 0;
+}
