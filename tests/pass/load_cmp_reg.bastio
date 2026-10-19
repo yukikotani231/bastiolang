@@ -1,67 +1,52 @@
+// A load that only a comparison with a register and a branch read becomes
+// `cmpq %reg, mem` (irx86 ix_load_cmp): loads on the left and on the right of
+// `==`, `!=`, `<` and `>=`, with the register unchanged between.
 // expect-exit: 0
-// expect-stdout: 22
-// expect-stdout: 3
-// expect-stdout: 6
-// A word that only a comparison with a register reads, and then the branch,
-// is compared in memory. The load may be either operand of the comparison,
-// and the comparison may be signed or unsigned.
-fn count_eq(b: &Buf, k: u64) -> u64
-  requires len(b) == 16
-  ensures result <= 16
+// expect-stdout: 1872
+fn fill(mut t: Buf) -> Buf
+  requires len(t) == 64
+  ensures len(result) == 64
 {
-  let mut c = 0;
   let mut i = 0;
-  while i < 16
-    invariant i <= 16 && len(b) == 16 && c <= i
+  while i < 64
+    invariant i <= 64 && len(t) == 64
   {
-    if get(b, i) == k { c = c + 1; }
+    t = set(t, i, (i * 5 + 1) % 17);
     i = i + 1;
   }
-  return c;
+  return t;
 }
 
-fn count_below(b: &Buf, k: u64) -> u64
-  requires len(b) == 16
-  ensures result <= 16
+fn count(t: &Buf, k: u64) -> u64
+  requires len(t) == 64
+  ensures result <= 256
 {
-  let mut c = 0;
   let mut i = 0;
-  while i < 16
-    invariant i <= 16 && len(b) == 16 && c <= i
+  let mut n = 0;
+  while i < 64
+    invariant i <= 64 && len(t) == 64 && n <= 4 * i
   {
-    if k > get(b, i) { c = c + 1; }
+    if get(t, i) == k { n = n + 1; }
+    if k != get(t, i) { n = n + 0; }
+    if get(t, i) < k { n = n + 1; }
+    if get(t, i) >= k { n = n + 1; }
     i = i + 1;
   }
-  return c;
-}
-
-fn count_above(b: &Buf, k: u64) -> u64
-  requires len(b) == 16
-  ensures result <= 16
-{
-  let mut c = 0;
-  let mut i = 0;
-  while i < 16
-    invariant i <= 16 && len(b) == 16 && c <= i
-  {
-    if get(b, i) > k { c = c + 1; }
-    i = i + 1;
-  }
-  return c;
+  return n;
 }
 
 fn main() -> u64 {
-  let mut b = alloc(16);
-  let mut i = 0;
-  while i < 16
-    invariant i <= 16 && len(b) == 16
+  let mut t = alloc(64);
+  t = fill(t);
+  let mut k = 0;
+  let mut s = 0;
+  while k < 20
+    invariant k <= 20 && len(t) == 64 && s <= 20 * 256
   {
-    b = set(b, i, i % 5);
-    i = i + 1;
+    s = s * 2 % 4096 + count(t, k);
+    k = k + 1;
   }
-  print(count_below(b, 3) + count_eq(b, 4) + count_above(b, 2) + 3);
-  print(count_eq(b, 4));
-  print(count_above(b, 2));
-  free(b);
+  print(s);
+  free(t);
   return 0;
 }
