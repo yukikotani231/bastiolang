@@ -1,0 +1,78 @@
+// stage1-only: loop rotation of a test that starts with loads
+// expect-exit: 0
+// expect-stdout: 38013169
+// Tests that read the buffer first (`while get(t, i) != 0 && ...`) are copied
+// to the bottom of the loop, so a pass runs no jump back to the top. The
+// results must stay right when the loop runs zero, one and many times, when
+// the test is an `||`, and when the registers read by the copy are changed in
+// the body.
+fn fill(mut t: Buf, n: u64) -> Buf
+  requires len(t) == 64 && n <= 64
+  ensures len(result) == 64
+{
+  let mut i = 0;
+  while i < n
+    invariant i <= n && n <= 64 && len(t) == 64
+  {
+    t = set(t, i, i + 1);
+    i = i + 1;
+  }
+  return t;
+}
+
+/// How many nonzero slots from `start` on, stopping at `lim`.
+fn run(t: &Buf, start: u64, lim: u64) -> u64
+  requires len(t) == 64 && start < 64 && lim <= 64
+  ensures result <= 64
+{
+  let mut i = start;
+  let mut c = 0;
+  while i < lim && get(t, i) != 0 && get(t, i) != 40
+    invariant i <= 64 && len(t) == 64 && c <= i && lim <= 64
+  {
+    i = i + 1;
+    c = c + 1;
+  }
+  return c;
+}
+
+/// The same with an `||` in the test and a body that changes the index twice.
+fn skip(t: &Buf, start: u64) -> u64
+  requires len(t) == 64 && start < 64
+{
+  let mut i = start;
+  let mut s = 0;
+  while get(t, i) == 0 || get(t, i) % 2 == 1
+    invariant i < 64 && len(t) == 64 && s <= 2000000
+  {
+    if i + 2 < 64 {
+      i = i + 2;
+    } else {
+      i = 63 - (i % 2);
+      s = s + 1000;
+    }
+    if s > 3000 {
+      i = 1;
+      s = 1000000;
+    }
+    s = s + 1;
+  }
+  return i + s;
+}
+
+fn main() -> u64 {
+  let mut t = alloc(64);
+  t = fill(t, 50);
+  let mut sum = 0;
+  let mut st = 0;
+  while st < 64
+    invariant st <= 64 && len(t) == 64
+  {
+    sum = wrap_add(sum, wrap_mul(run(t, st, 64), st + 1));
+    st = st + 1;
+  }
+  let a = wrap_add(sum, wrap_mul(skip(t, 0), 7));
+  print(wrap_add(a, wrap_add(wrap_mul(skip(t, 1), 13), wrap_mul(skip(t, 63), 31))));
+  free(t);
+  return 0;
+}
