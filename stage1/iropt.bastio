@@ -4847,6 +4847,58 @@ fn iropt_conv_arm(f: &mut IrFn, out: &mut Vec[IrIns], s: u64, e: u64, shared: &V
   }
 }
 
+/// The instruction within eight before position `i`, in the same straight-line
+/// run, that writes `r` (IR_NONE if there is none).
+fn iropt_def_before(f: &IrFn, i: u64, r: u64) -> u64 {
+  let mut k = i;
+  let mut steps = 0;
+  while k > 0 && steps < 8 {
+    k = k - 1;
+    let q = iropt_at(f, k);
+    if q.op == IR_LABEL || q.op == IR_JMP || q.op == IR_BR {
+      return IR_NONE;
+    }
+    if ra_writes_has(q, r) {
+      return k;
+    }
+    steps = wrap_add(steps, 1);
+  }
+  return IR_NONE;
+}
+
+/// The register that holds the condition of the branch at `i` as 0 or 1: for
+/// `x % 2 == 1`, `x % 2 != 0` and the same with `x & 1`, the register
+/// `x % 2` / `x & 1` itself, whose negation is then the mask without a
+/// compare; the condition register otherwise.
+fn iropt_flag(f: &IrFn, i: u64, c: u64, cv: &Vec[u64], ndef: &Vec[u64]) -> u64 {
+  let dc = iropt_def_before(f, i, c);
+  if dc == IR_NONE {
+    return c;
+  }
+  let qc = iropt_at(f, dc);
+  let mut t = IR_NONE;
+  if qc.op == IR_NE && iropt_cval(cv, qc.b) == 0 {
+    t = qc.a;
+  } else if qc.op == IR_EQ && iropt_cval(cv, qc.b) == 1 {
+    t = qc.a;
+  }
+  if t == IR_NONE || u_at(ndef, t) != 1 {
+    return c;
+  }
+  let dt = iropt_def_before(f, dc, t);
+  if dt == IR_NONE {
+    return c;
+  }
+  let qt = iropt_at(f, dt);
+  if qt.op == IR_REM && iropt_cval(cv, qt.b) == 2 {
+    return t;
+  }
+  if qt.op == IR_AND && (iropt_cval(cv, qt.b) == 1 || iropt_cval(cv, qt.a) == 1) {
+    return t;
+  }
+  return c;
+}
+
 /// Branchless `if`: an `if` (or `if`/`else`) whose arms are a few
 /// instructions that only compute registers, and whose condition is a
 /// comparison, runs both arms and selects the results with a mask,
@@ -4975,7 +5027,7 @@ fn iropt_ifconv(f: &mut IrFn) -> u64 {
         if vec_len(shared) >= 1 && vec_len(shared) <= 3 && !fresh_only {
           // The first arm is the then-arm when its label is the true target.
           let m = ir_reg(&mut f);
-          vec_push(&mut out, IrIns { op: IR_NEG, d: m, a: q.a, b: 0, c: 0, ty: 0 });
+          vec_push(&mut out, IrIns { op: IR_NEG, d: m, a: iropt_flag(f, i, q.a, cv, ndef), b: 0, c: 0, ty: 0 });
           let mut mo1 = vec_new[u64]();
           let mut mn1 = vec_new[u64]();
           let mut mo2 = vec_new[u64]();
