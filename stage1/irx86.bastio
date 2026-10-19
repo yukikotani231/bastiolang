@@ -2502,6 +2502,149 @@ fn ix_addr_fold(f: &mut IrFn) -> u64 {
   return found;
 }
 
+/// `ix_addr_fold` for a sum with several users: the loads and stores among
+/// them that take it as the index (a cell read at `j + 1` and written at
+/// `j + 1`), at most 32 instructions after the add and perhaps on either side
+/// of a branch, address off `x` with the displacement. Nothing writes `x` up
+/// to the last of them, and every label in that stretch is reached only from
+/// inside it, so a path to such a user always runs through the add and `x` is
+/// what it was there. The add stays for the users that remain; when there are
+/// none it is dead.
+fn ix_addr_fold2(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  if n > 4000000 || f.nreg > 100000000 {
+    return 0;
+  }
+  let ndef = iropt_ndef(f);
+  let nuse = iropt_nuse(f);
+  let cv = iropt_consts(f, ndef);
+  // The first and the last position that jumps to each label.
+  let mut lmin = vec_new[u64]();
+  let mut lmax = vec_new[u64]();
+  let mut l = 0;
+  while l < f.nlabel && l < 1000000000 {
+    vec_push(&mut lmin, IR_NONE);
+    vec_push(&mut lmax, 0);
+    l = wrap_add(l, 1);
+  }
+  let mut i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    let mut t1 = IR_NONE;
+    let mut t2 = IR_NONE;
+    if q.op == IR_JMP {
+      t1 = q.a;
+    } else if q.op == IR_BR {
+      t1 = q.b;
+      t2 = q.c;
+    }
+    if t1 < f.nlabel {
+      if i < u_at(lmin, t1) {
+        ra_set(&mut lmin, t1, i);
+      }
+      if i > u_at(lmax, t1) {
+        ra_set(&mut lmax, t1, i);
+      }
+    }
+    if t2 < f.nlabel {
+      if i < u_at(lmin, t2) {
+        ra_set(&mut lmin, t2, i);
+      }
+      if i > u_at(lmax, t2) {
+        ra_set(&mut lmax, t2, i);
+      }
+    }
+    i = i + 1;
+  }
+  let mut found = 0;
+  i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    if q.op == IR_ADD && q.c != 1 && q.ty == 0 && q.d != IR_NONE && q.d < f.nreg && u_at(ndef, q.d) == 1 && u_at(nuse, q.d) >= 2 {
+      let ka = u_at(cv, q.a);
+      let kb = u_at(cv, q.b);
+      let mut x = IR_NONE;
+      let mut k = IR_NONE;
+      if ka == IR_NONE && kb != IR_NONE {
+        x = q.a;
+        k = kb;
+      } else if ka != IR_NONE && kb == IR_NONE {
+        x = q.b;
+        k = ka;
+      }
+      if x != IR_NONE && x != q.d && k != 0 && k < 134217728 {
+        let mut users = vec_new[u64]();
+        let mut going = true;
+        let mut j = wrap_add(i, 1);
+        while going && j < n && j < wrap_add(i, 33) {
+          let r = vec_get(f.ins, j);
+          let mut reads = vec_new[u64]();
+          ra_reads(f, r, &mut reads);
+          let mut uses = false;
+          let mut w = 0;
+          while w < vec_len(reads) {
+            if vec_get(reads, w) == q.d {
+              uses = true;
+            }
+            w = w + 1;
+          }
+          vec_free(reads);
+          if uses && (r.op == IR_LOAD || r.op == IR_STORE) && r.b == q.d && r.a != q.d && r.d != q.d && r.ty == 0 {
+            vec_push(&mut users, j);
+          }
+          let mut ws = vec_new[u64]();
+          ra_writes(r, &mut ws);
+          w = 0;
+          while w < vec_len(ws) {
+            if vec_get(ws, w) == x || vec_get(ws, w) == q.d {
+              going = false;
+            }
+            w = w + 1;
+          }
+          vec_free(ws);
+          j = wrap_add(j, 1);
+        }
+        // Every label up to the last user is jumped to only from inside.
+        let mut last = i;
+        if vec_len(users) > 0 {
+          last = vec_get(users, wrap_sub(vec_len(users), 1));
+        }
+        let mut ok = vec_len(users) > 0;
+        let mut p = i;
+        while ok && p <= last && p < n {
+          let r = ix_at(f, p);
+          if r.op == IR_LABEL && r.a < f.nlabel && u_at(lmin, r.a) != IR_NONE && (u_at(lmin, r.a) < i || u_at(lmax, r.a) > last) {
+            ok = false;
+          }
+          p = wrap_add(p, 1);
+        }
+        if ok {
+          let mut m = 0;
+          while m < vec_len(users) {
+            let pos = vec_get(users, m);
+            if pos < vec_len(f.ins) {
+              let mut r2 = vec_get(f.ins, pos);
+              r2.b = x;
+              r2.ty = k;
+              vec_set(&mut f.ins, pos, r2);
+              found = wrap_add(found, 1);
+            }
+            m = m + 1;
+          }
+        }
+        vec_free(users);
+      }
+    }
+    i = i + 1;
+  }
+  vec_free(lmin);
+  vec_free(lmax);
+  vec_free(ndef);
+  vec_free(nuse);
+  vec_free(cv);
+  return found;
+}
+
 /// Where an if/else has a straight run of instructions with a load for its
 /// then-arm and a few instructions for its else-arm, as the bounds test of a
 /// vector read inlined from `get`, the then-arm goes last and falls into the
@@ -2740,7 +2883,8 @@ fn ix_ivmerge(f: &mut IrFn) -> u64 {
 
 /// `t = add x, K; ...; x = mov t`, where `t` is written once, read only
 /// between the two (the `x + 1` an address wanted, say), `K` is a constant and
-/// `x` is not written in between, becomes `x = add x, K` at the `mov`. A
+/// `x` is not written in between, becomes `x = add x, K` at the `mov` (when
+/// nothing else reads the sum, the first `add` is dead then). A
 /// common-subexpression pass merges `x + 1` of the loop body with the step of
 /// the counter, and the sum would then stay in a register (or the frame) from
 /// its first use to the end of the loop; added again, it takes one `add`
@@ -2784,7 +2928,7 @@ fn ix_incr(f: &mut IrFn) -> u64 {
           }
           j = wrap_add(j, 1);
         }
-        if ok && reads == wrap_sub(u_at(nuse, q.a), 1) && reads > 0 {
+        if ok && reads == wrap_sub(u_at(nuse, q.a), 1) {
           let kr = ir_reg(&mut f);
           vec_push(&mut out, IrIns { op: IR_CONST, d: kr, a: u_at(cv, a.b), b: 0, c: 0, ty: 0 });
           vec_push(&mut out, IrIns { op: IR_ADD, d: q.d, a: q.d, b: kr, c: a.c, ty: a.ty });
@@ -3881,13 +4025,16 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
   iropt_copies(&mut f);
   iropt_fold(&mut f);
   ix_addr_fold(&mut f);
+  ix_addr_fold2(&mut f);
   iropt_dce(&mut f);
   // Dead stores gone, a block may now be only a `jmp`.
   iropt_thread(&mut f);
   iropt_reach(&mut f);
   iropt_labels(&mut f);
   iropt_rotate(&mut f);
-  ix_incr(&mut f);
+  if ix_incr(&mut f) > 0 {
+    iropt_dce(&mut f);
+  }
   ix_ivmerge(&mut f);
   ix_coalesce(&mut f);
   ix_inplace(&mut f);

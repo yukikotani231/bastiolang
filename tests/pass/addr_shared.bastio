@@ -1,0 +1,91 @@
+// expect-exit: 0
+// expect-stdout: 856
+// expect-stdout: 9668
+// A sum `j + 1` that a load and a store both index with, on either side of a
+// branch, is addressed off `j` for each of them. `later` writes the base
+// register between the two users, so the second must still see the old sum.
+fn lcs_row(s: u64, t: &Buf, prev: &Buf, mut cur: Buf) -> Buf
+  requires len(t) == 16 && len(prev) == 17 && len(cur) == 17
+  ensures len(result) == 17
+{
+  cur = set(cur, 0, 0);
+  let mut j = 0;
+  while j < 16
+    invariant j <= 16 && len(t) == 16 && len(prev) == 17 && len(cur) == 17
+  {
+    let mut v = 0;
+    if s == get(t, j) {
+      v = wrap_add(get(prev, j), 1);
+    } else {
+      let up = get(prev, j + 1);
+      let left = get(cur, j);
+      if up > left { v = up; } else { v = left; }
+    }
+    cur = set(cur, j + 1, v);
+    j = j + 1;
+  }
+  return cur;
+}
+
+fn later(mut b: Buf) -> Buf
+  requires len(b) == 16
+  ensures len(result) == 16
+{
+  let mut i = 0;
+  while i < 12
+    invariant i <= 13 && len(b) == 16
+  {
+    let k = i + 1;
+    b = set(b, k, wrap_add(get(b, k), 3));
+    i = i + 2;
+    b = set(b, k + 2, wrap_add(get(b, k), i));
+  }
+  return b;
+}
+
+fn main() -> u64 {
+  let mut t = alloc(16);
+  let mut prev = alloc(17);
+  let mut cur = alloc(17);
+  let mut i = 0;
+  while i < 16
+    invariant i <= 16 && len(t) == 16 && len(prev) == 17 && len(cur) == 17
+  {
+    t = set(t, i, i * 7 % 4);
+    i = i + 1;
+  }
+  let mut r = 0;
+  while r < 16
+    invariant r <= 16 && len(t) == 16 && len(prev) == 17 && len(cur) == 17
+  {
+    cur = lcs_row(r * 5 % 4, t, prev, cur);
+    let tmp = prev;
+    prev = cur;
+    cur = tmp;
+    r = r + 1;
+  }
+  print(wrap_add(wrap_add(wrap_mul(get(prev, 16), 100), wrap_mul(get(prev, 5), 10)), get(prev, 9)));
+  let mut b = alloc(16);
+  i = 0;
+  while i < 16
+    invariant i <= 16 && len(b) == 16
+  {
+    b = set(b, i, i);
+    i = i + 1;
+  }
+  b = later(b);
+  let mut sum = 0;
+  i = 0;
+  while i < 16
+    invariant i <= 16 && len(b) == 16
+  {
+    sum = wrap_add(wrap_mul(sum, 31), get(b, i));
+    i = i + 1;
+  }
+  print(sum % 10007);
+  free(t);
+  free(prev);
+  free(cur);
+  free(b);
+  return 0;
+}
