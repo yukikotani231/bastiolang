@@ -2446,6 +2446,133 @@ fn ix_arms(f: &mut IrFn) {
   vec_free(refs);
 }
 
+/// Two counters that start equal and step together: `a = ...; b = mov a`
+/// (or both `mov` of one register) in one straight run, and the same
+/// `a = a + K` and `b = b + K` side by side. `b` is then `a`, and goes: the
+/// address `y * 256 + x` of a load and of a store, each with an induction
+/// variable of its own, take one register. Only counters whose every other
+/// read can be rewritten, and that are not parameters.
+fn ix_ivmerge(f: &mut IrFn) -> u64 {
+  let ndef = iropt_ndef(f);
+  let nuse = iropt_nuse(f);
+  let cv = iropt_consts(f, ndef);
+  let n = vec_len(f.ins);
+  let mut done = 0;
+  let mut drop = vec_new[u64]();
+  let mut k = 0;
+  while k < n {
+    vec_push(&mut drop, 0);
+    k = wrap_add(k, 1);
+  }
+  let mut ren = vec_new[IrIns]();
+  let mut i = 0;
+  while i < n {
+    let qa = ix_at(f, i);
+    if qa.op == IR_ADD && qa.d == qa.a && qa.d < f.nreg && qa.b < vec_len(cv) && u_at(cv, qa.b) != IR_NONE && u_at(ndef, qa.d) == 2 && u_at(drop, i) == 0 {
+      // The step of the other counter follows, with constants between.
+      let mut j = wrap_add(i, 1);
+      let mut qb = ix_at(f, j);
+      while qb.op == IR_CONST {
+        j = wrap_add(j, 1);
+        qb = ix_at(f, j);
+      }
+      if j < n && qb.op == IR_ADD && qb.d == qb.a && qb.d != qa.d && qb.d < f.nreg && qb.b < vec_len(cv) && u_at(cv, qb.b) == u_at(cv, qa.b) && u_at(ndef, qb.d) == 2 && !ra_is_param(f, qb.d) && qa.c == qb.c && qa.ty == qb.ty {
+        // Where each starts.
+        let mut pa = IR_NONE;
+        let mut pb = IR_NONE;
+        let mut p = 0;
+        while p < n {
+          let m = vec_get(f.ins, p);
+          if p != i && ra_writes_has(m, qa.d) {
+            pa = p;
+          }
+          if p != j && ra_writes_has(m, qb.d) {
+            pb = p;
+          }
+          p = wrap_add(p, 1);
+        }
+        if pa != IR_NONE && pb != IR_NONE && pa < i && pb < i {
+          let ia = vec_get(f.ins, pa);
+          let ib = vec_get(f.ins, pb);
+          let mut same = false;
+          if ib.op == IR_MOV && ib.a == qa.d && pb > pa {
+            same = true;
+          } else if ia.op == IR_MOV && ib.op == IR_MOV && ia.a == ib.a && u_at(ndef, ia.a) <= 1 {
+            same = true;
+          }
+          // One straight run between the two starts, so they always happen
+          // together; the steps are side by side.
+          let first = pa;
+          let mut lo = first;
+          if pb < lo {
+            lo = pb;
+          }
+          let mut hi = pa;
+          if pb > hi {
+            hi = pb;
+          }
+          let mut ok = same;
+          let mut x = wrap_add(lo, 1);
+          while ok && x < hi {
+            let m = vec_get(f.ins, x);
+            if m.op == IR_LABEL || ra_is_end(m.op) || m.op == IR_CALL || m.op == IR_CALLM {
+              ok = false;
+            }
+            if x != pa && x != pb && (ra_writes_has(m, qa.d) || ra_writes_has(m, qb.d)) {
+              ok = false;
+            }
+            x = wrap_add(x, 1);
+          }
+          // Every read of b can be rewritten.
+          x = 0;
+          while ok && x < n {
+            let m = vec_get(f.ins, x);
+            if x != j && ra_reads_has(f, m, qb.d) && !ra_substable(m.op) {
+              ok = false;
+            }
+            x = wrap_add(x, 1);
+          }
+          if ok {
+            ra_set(&mut drop, pb, 1);
+            ra_set(&mut drop, j, 1);
+            vec_push(&mut ren, IrIns { op: 0, d: qb.d, a: qa.d, b: 0, c: 0, ty: 0 });
+            done = wrap_add(done, 1);
+          }
+        }
+      }
+    }
+    i = wrap_add(i, 1);
+  }
+  vec_free(ndef);
+  vec_free(nuse);
+  vec_free(cv);
+  if done == 0 {
+    vec_free(drop);
+    vec_free(ren);
+    return 0;
+  }
+  let mut out = vec_new[IrIns]();
+  k = 0;
+  while k < n {
+    if u_at(drop, k) == 0 {
+      let mut q = vec_get(f.ins, k);
+      let mut r = 0;
+      while r < vec_len(ren) {
+        let e = vec_get(ren, r);
+        q = ra_subst(q, e.d, e.a);
+        r = wrap_add(r, 1);
+      }
+      vec_push(&mut out, q);
+    }
+    k = wrap_add(k, 1);
+  }
+  vec_free(drop);
+  vec_free(ren);
+  vec_free(f.ins);
+  f.ins = out;
+  return done;
+}
+
 /// `t = add x, K; ...; x = mov t`, where `t` is written once, read only
 /// between the two (the `x + 1` an address wanted, say), `K` is a constant and
 /// `x` is not written in between, becomes `x = add x, K` at the `mov`. A
@@ -3295,6 +3422,7 @@ fn irx_function_n(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, nc
   iropt_labels(&mut f);
   iropt_rotate(&mut f);
   ix_incr(&mut f);
+  ix_ivmerge(&mut f);
   ix_coalesce(&mut f);
   ix_inplace(&mut f);
   ix_arms(&mut f);
