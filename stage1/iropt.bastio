@@ -5262,6 +5262,174 @@ fn iropt_cond_loads(f: &IrFn, i: u64, c: u64) -> bool {
   return hit;
 }
 
+/// Instruction `k` of `v` (an instruction of op 0 past the end).
+fn iropt_ins_in(v: &Vec[IrIns], k: u64) -> IrIns {
+  if k < vec_len(v) {
+    return vec_get(v, k);
+  }
+  return IrIns { op: 0, d: IR_NONE, a: IR_NONE, b: IR_NONE, c: 0, ty: 0 };
+}
+
+/// Like `iropt_arm_end`, for a run that ends in a conditional branch: the
+/// position of that `br`, or IR_NONE.
+fn iropt_run_end(f: &IrFn, s: u64, cv: &Vec[u64]) -> u64 {
+  let mut k = s;
+  while k < vec_len(f.ins) && k < wrap_add(s, 9) {
+    let q = iropt_at(f, k);
+    if q.op == IR_BR {
+      return k;
+    }
+    if q.op == IR_JMP || q.op == IR_LABEL || !iropt_spec_ok(q, cv) {
+      return IR_NONE;
+    }
+    k = wrap_add(k, 1);
+  }
+  return IR_NONE;
+}
+
+/// Whether the code at label `l` is a short, non-empty pure arm (see
+/// `iropt_arm_end`) that ends at label `other`, by falling into it or by a
+/// `jmp`: the `if` without `else` that `iropt_ifconv` converts.
+fn iropt_label_arm(f: &IrFn, l: u64, other: u64, cv: &Vec[u64]) -> bool {
+  let mut k = 0;
+  while k < vec_len(f.ins) {
+    let q = iropt_at(f, k);
+    if q.op == IR_LABEL && q.a == l {
+      let e = iropt_arm_end(f, wrap_add(k, 1), cv);
+      if e == IR_NONE || e <= wrap_add(k, 1) {
+        return false;
+      }
+      let z = iropt_at(f, e);
+      return z.a == other;
+    }
+    k = wrap_add(k, 1);
+  }
+  return false;
+}
+
+/// `a || b` and `a && b` of two comparisons as one branch. In
+///
+///     br c1, T, M          br c1, M, F
+///   M: ops                M: ops
+///     br c2, T, F          br c2, T, F
+///
+/// `c1` and `c2` hold 0 or 1 (comparisons), `M` is entered only by the first
+/// branch and `ops` (at most six) only compute registers, so they may run
+/// whether or not `c1` decides: the code becomes `ops; r = or c1, c2; br r, T, F`
+/// (`and` for the second shape). One branch instead of two, and for a test
+/// of data the second is as unpredictable as the first. Returns how many it
+/// joined, and only where one side is a short pure arm, which `iropt_ifconv`
+/// can then turn into a mask.
+fn iropt_cmpfuse(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  if n > 4000000 || f.nreg > 100000000 {
+    return 0;
+  }
+  let ndef = iropt_ndef(f);
+  let cv = iropt_consts(f, ndef);
+  let mut refs = vec_new[u64]();
+  let mut l = 0;
+  while l < f.nlabel && l < 1000000000 {
+    vec_push(&mut refs, 0);
+    l = wrap_add(l, 1);
+  }
+  let mut cmp = vec_new[u64]();
+  let mut r = 0;
+  while r < f.nreg && r < 1000000000 {
+    vec_push(&mut cmp, 0);
+    r = wrap_add(r, 1);
+  }
+  let mut i = 0;
+  while i < n {
+    let q = iropt_at(f, i);
+    if q.op == IR_JMP && q.a < f.nlabel {
+      ra_set(&mut refs, q.a, wrap_add(u_at(refs, q.a), 1));
+    }
+    if q.op == IR_BR {
+      if q.b < f.nlabel {
+        ra_set(&mut refs, q.b, wrap_add(u_at(refs, q.b), 1));
+      }
+      if q.c < f.nlabel {
+        ra_set(&mut refs, q.c, wrap_add(u_at(refs, q.c), 1));
+      }
+    }
+    if q.d != IR_NONE && q.d < f.nreg && u_at(ndef, q.d) == 1 {
+      if iropt_is_cmp(q.op) {
+        ra_set(&mut cmp, q.d, 1);
+      } else if (q.op == IR_OR || q.op == IR_AND) && u_at(cmp, q.a) == 1 && u_at(cmp, q.b) == 1 {
+        ra_set(&mut cmp, q.d, 1);
+      }
+    }
+    i = wrap_add(i, 1);
+  }
+  let mut out = vec_new[IrIns]();
+  let mut done = 0;
+  i = 0;
+  while i < n {
+    let q = iropt_at(f, i);
+    let mut next = wrap_add(i, 1);
+    let l0 = iropt_at(f, wrap_add(i, 1));
+    if q.op == IR_BR && q.b != q.c && q.b < f.nlabel && q.c < f.nlabel && u_at(cmp, q.a) == 1 && l0.op == IR_LABEL {
+      // Which target is M: the false one (||) or the true one (&&)?
+      let mut is_or = false;
+      if l0.a == q.c && u_at(refs, q.c) == 1 {
+        is_or = true;
+      }
+      if is_or || (l0.a == q.b && u_at(refs, q.b) == 1) {
+        let s1 = wrap_add(i, 2);
+        let e1 = iropt_run_end(f, s1, cv);
+        let b2 = iropt_at(f, e1);
+        if e1 != IR_NONE && wrap_sub(e1, s1) <= 6 && b2.op == IR_BR && u_at(cmp, b2.a) == 1 {
+          let mut ok = false;
+          if is_or && b2.b == q.b && b2.c != q.c {
+            ok = true;
+          }
+          if !is_or && b2.c == q.c && b2.b != q.b {
+            ok = true;
+          }
+          // Only worth it when `iropt_ifconv` can then take the branch: one
+          // side is a short pure arm. Elsewhere (an error check) both
+          // branches predict well and two are cheaper than the extra ops.
+          if ok && !(iropt_label_arm(f, b2.b, b2.c, cv) || iropt_label_arm(f, b2.c, b2.b, cv)) {
+            ok = false;
+          }
+          if ok {
+            let mut k = s1;
+            while k < e1 {
+              vec_push(&mut out, iropt_at(f, k));
+              k = wrap_add(k, 1);
+            }
+            let t = ir_reg(&mut f);
+            let mut op = IR_AND;
+            if is_or {
+              op = IR_OR;
+            }
+            vec_push(&mut out, IrIns { op: op, d: t, a: q.a, b: b2.a, c: 0, ty: 0 });
+            vec_push(&mut out, IrIns { op: IR_BR, d: IR_NONE, a: t, b: b2.b, c: b2.c, ty: 0 });
+            done = wrap_add(done, 1);
+            next = wrap_add(e1, 1);
+          }
+        }
+      }
+    }
+    if next == wrap_add(i, 1) {
+      vec_push(&mut out, q);
+    }
+    i = next;
+  }
+  vec_free(ndef);
+  vec_free(cv);
+  vec_free(refs);
+  vec_free(cmp);
+  if done == 0 {
+    vec_free(out);
+    return 0;
+  }
+  vec_free(f.ins);
+  f.ins = out;
+  return done;
+}
+
 /// Branchless `if`: an `if` (or `if`/`else`) whose arms are a few
 /// instructions that only compute registers, and whose condition is a
 /// comparison, runs both arms and selects the results with a mask,
@@ -5305,9 +5473,13 @@ fn iropt_ifconv(f: &mut IrFn) -> u64 {
         ra_set(&mut refs, q.c, wrap_add(u_at(refs, q.c), 1));
       }
     }
-    // A register written once by a comparison holds 0 or 1.
-    if q.d != IR_NONE && q.d < f.nreg && u_at(ndef, q.d) == 1 && iropt_is_cmp(q.op) {
-      ra_set(&mut cmp, q.d, 1);
+    // A register written once by a comparison (or `and`/`or` of two) holds 0 or 1.
+    if q.d != IR_NONE && q.d < f.nreg && u_at(ndef, q.d) == 1 {
+      if iropt_is_cmp(q.op) {
+        ra_set(&mut cmp, q.d, 1);
+      } else if (q.op == IR_OR || q.op == IR_AND) && u_at(cmp, q.a) == 1 && u_at(cmp, q.b) == 1 {
+        ra_set(&mut cmp, q.d, 1);
+      }
     }
     i = wrap_add(i, 1);
   }
@@ -5318,7 +5490,7 @@ fn iropt_ifconv(f: &mut IrFn) -> u64 {
     let q = iropt_at(f, i);
     let mut next = wrap_add(i, 1);
     let l0 = iropt_at(f, wrap_add(i, 1));
-    if q.op == IR_BR && q.b != q.c && q.b < f.nlabel && q.c < f.nlabel && u_at(cmp, q.a) == 1 && !iropt_cond_loads(f, i, q.a) && l0.op == IR_LABEL && (l0.a == q.b || l0.a == q.c) && u_at(refs, l0.a) == 1 {
+    if q.op == IR_BR && q.b != q.c && q.b < f.nlabel && q.c < f.nlabel && u_at(cmp, q.a) == 1 && l0.op == IR_LABEL && (l0.a == q.b || l0.a == q.c) && u_at(refs, l0.a) == 1 {
       let mut other = q.b;
       if l0.a == q.b {
         other = q.c;
@@ -5387,10 +5559,24 @@ fn iropt_ifconv(f: &mut IrFn) -> u64 {
           }
           k = wrap_add(k, 1);
         }
-        if vec_len(shared) >= 1 && vec_len(shared) <= 3 && !fresh_only {
+        // A branch that tests a load stays a branch when an arm accumulates into
+        // a register (the predictor runs ahead of the load; a mask would put the
+        // load on the chain through that register).
+        let mut chained = false;
+        if vec_len(shared) >= 1 && iropt_cond_loads(f, i, q.a) {
+          let mut sx = 0;
+          while sx < vec_len(shared) {
+            if iropt_count(rr, vec_get(shared, sx)) > 0 {
+              chained = true;
+            }
+            sx = wrap_add(sx, 1);
+          }
+        }
+        if vec_len(shared) >= 1 && vec_len(shared) <= 3 && !fresh_only && !chained {
           // The first arm is the then-arm when its label is the true target.
           let m = ir_reg(&mut f);
-          vec_push(&mut out, IrIns { op: IR_NEG, d: m, a: iropt_flag(f, i, q.a, cv, ndef), b: 0, c: 0, ty: 0 });
+          let fl = iropt_flag(f, i, q.a, cv, ndef);
+          vec_push(&mut out, IrIns { op: IR_NEG, d: m, a: fl, b: 0, c: 0, ty: 0 });
           let mut mo1 = vec_new[u64]();
           let mut mn1 = vec_new[u64]();
           let mut mo2 = vec_new[u64]();
@@ -5407,11 +5593,40 @@ fn iropt_ifconv(f: &mut IrFn) -> u64 {
               vt = ve;
               ve = sw;
             }
-            let x1 = ir_reg(&mut f);
-            let x2 = ir_reg(&mut f);
-            vec_push(&mut out, IrIns { op: IR_XOR, d: x1, a: vt, b: ve, c: 0, ty: 0 });
-            vec_push(&mut out, IrIns { op: IR_AND, d: x2, a: x1, b: m, c: 0, ty: 0 });
-            vec_push(&mut out, IrIns { op: IR_XOR, d: d, a: ve, b: x2, c: 0, ty: 0 });
+            // `if c { d = d + k }` (also -, |, ^): d = d + (k & -c), or d + c for
+            // k = 1, one instruction on the chain through d instead of three.
+            let mut simple = false;
+            if ve == d {
+              let mut di = vec_len(out);
+              let mut tries = 0;
+              let mut want = vt;
+              while di > 0 && tries < 40 && !simple {
+                di = di - 1;
+                tries = wrap_add(tries, 1);
+                let qd = iropt_ins_in(out, di);
+                if qd.d == want && qd.op == IR_MOV {
+                  // d = mov t: look for the instruction that wrote t.
+                  want = qd.a;
+                }
+                if qd.d == want && qd.a == d && qd.c == 0 && (qd.op == IR_ADD || qd.op == IR_SUB || qd.op == IR_OR || qd.op == IR_XOR) && iropt_cval(cv, qd.b) != IR_NONE {
+                  simple = true;
+                  if iropt_cval(cv, qd.b) == 1 {
+                    vec_push(&mut out, IrIns { op: qd.op, d: d, a: d, b: fl, c: 0, ty: 0 });
+                  } else {
+                    let x2 = ir_reg(&mut f);
+                    vec_push(&mut out, IrIns { op: IR_AND, d: x2, a: m, b: qd.b, c: 0, ty: 0 });
+                    vec_push(&mut out, IrIns { op: qd.op, d: d, a: d, b: x2, c: 0, ty: 0 });
+                  }
+                }
+              }
+            }
+            if !simple {
+              let x1 = ir_reg(&mut f);
+              let x2 = ir_reg(&mut f);
+              vec_push(&mut out, IrIns { op: IR_XOR, d: x1, a: vt, b: ve, c: 0, ty: 0 });
+              vec_push(&mut out, IrIns { op: IR_AND, d: x2, a: x1, b: m, c: 0, ty: 0 });
+              vec_push(&mut out, IrIns { op: IR_XOR, d: d, a: ve, b: x2, c: 0, ty: 0 });
+            }
             j = wrap_add(j, 1);
           }
           vec_free(mo1);
