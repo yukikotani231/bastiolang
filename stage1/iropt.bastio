@@ -5974,6 +5974,218 @@ fn iropt_licm(f: &mut IrFn) -> u64 {
   return total;
 }
 
+/// Row pointers. In a loop, `a[r + i]` with `r` the same in every pass (a row
+/// start such as `up * 256`) and `i` the loop's own index is `(a + r * 8)[i]`:
+/// the address `a + r * 8` is made once in front of the loop, which leaves a
+/// load or store with a base and an index that the emitter addresses in one
+/// instruction, instead of an add before each. The add of the two, read only
+/// by that access, goes; the access reads `P[i]`, with one `P` for every
+/// access of the loop that has the same `a` and `r`. Done only when `a` and
+/// `r` are written once before the loop, so that the pointer can be made in
+/// front of it. The sum may wrap: so does the address. Returns how many
+/// accesses it rewrote.
+fn iropt_rowptr(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  if n > 4000000 || f.nreg > 100000000 || f.nlabel > 100000000 {
+    return 0;
+  }
+  let ndef = iropt_ndef(f);
+  let nuse = iropt_nuse(f);
+  let cv = iropt_consts(f, ndef);
+  let lb = iropt_labs(f);
+  let mut dp = vec_new[u64]();
+  let mut none = vec_new[u64]();
+  let mut r = 0;
+  while r < f.nreg {
+    vec_push(&mut dp, IR_NONE);
+    vec_push(&mut none, 0);
+    r = wrap_add(r, 1);
+  }
+  let mut i = 0;
+  while i < n {
+    let qi = iropt_at(f, i);
+    let mut ws = vec_new[u64]();
+    ra_writes(qi, &mut ws);
+    let mut w = 0;
+    while w < vec_len(ws) {
+      let x = vec_get(ws, w);
+      if x < vec_len(dp) && u_at(dp, x) == IR_NONE {
+        ra_set(&mut dp, x, i);
+      }
+      w = wrap_add(w, 1);
+    }
+    vec_free(ws);
+    i = wrap_add(i, 1);
+  }
+  // Per access (at the position of its add's successor): the pointer it uses
+  // and the register it indexes with. The pointers: loop, base, row, size, register.
+  let mut pa = vec_new[u64]();
+  let mut pb = vec_new[u64]();
+  let mut hdr = vec_new[u64]();
+  i = 0;
+  while i < n {
+    vec_push(&mut pa, IR_NONE);
+    vec_push(&mut pb, IR_NONE);
+    vec_push(&mut hdr, IR_NONE);
+    i = wrap_add(i, 1);
+  }
+  let mut gl = vec_new[u64]();
+  let mut gs = vec_new[u64]();
+  let mut ga = vec_new[u64]();
+  let mut gc = vec_new[u64]();
+  let mut gp = vec_new[u64]();
+  let mut done = 0;
+  i = 1;
+  while i < n && vec_len(gl) < 64 {
+    let q = iropt_at(f, i);
+    let g = iropt_at(f, wrap_sub(i, 1));
+    if (q.op == IR_LOAD || q.op == IR_STORE) && (q.c == 8 || q.c == 1) && g.op == IR_ADD && g.c == 0 && g.d == q.b && g.d < f.nreg && g.d != g.a && g.d != g.b && u_at(ndef, g.d) == 1 && u_at(nuse, g.d) == 1 && q.a != g.d {
+      // The innermost loop around the access.
+      let mut best = IR_NONE;
+      let mut l = 0;
+      while l < f.nlabel {
+        let p = u_at(lb.pos, l);
+        if u_at(lb.back, l) >= 1 && p != IR_NONE && p < i && u_at(lb.hi, l) >= i && (best == IR_NONE || p > u_at(lb.pos, best)) {
+          best = l;
+        }
+        l = wrap_add(l, 1);
+      }
+      if best != IR_NONE {
+        let p = u_at(lb.pos, best);
+        let hi = u_at(lb.hi, best);
+        if hi < n && iropt_wide_entry_ok(f, lb, p, hi) && iropt_licm_inv(q.a, p, ndef, cv, dp, none) {
+          let ia = iropt_licm_inv(g.a, p, ndef, cv, dp, none);
+          let ib = iropt_licm_inv(g.b, p, ndef, cv, dp, none);
+          let mut row = IR_NONE;
+          let mut idx = IR_NONE;
+          if ia && !ib {
+            row = g.a;
+            idx = g.b;
+          }
+          if ib && !ia {
+            row = g.b;
+            idx = g.a;
+          }
+          // A constant row stays in the displacement of the access.
+          if row != IR_NONE && u_at(cv, row) == IR_NONE && u_at(cv, q.a) == IR_NONE {
+            let mut gi = IR_NONE;
+            let mut k = 0;
+            while k < vec_len(gl) {
+              if u_at(gl, k) == best && u_at(gs, k) == q.a && u_at(ga, k) == row && u_at(gc, k) == q.c {
+                gi = k;
+              }
+              k = wrap_add(k, 1);
+            }
+            if gi == IR_NONE {
+              gi = vec_len(gl);
+              vec_push(&mut gl, best);
+              vec_push(&mut gs, q.a);
+              vec_push(&mut ga, row);
+              vec_push(&mut gc, q.c);
+              vec_push(&mut gp, ir_reg(&mut f));
+              ra_set(&mut hdr, p, best);
+            }
+            ra_set(&mut pa, i, u_at(gp, gi));
+            ra_set(&mut pb, i, idx);
+            done = wrap_add(done, 1);
+          }
+        }
+      }
+    }
+    i = wrap_add(i, 1);
+  }
+  if done > 0 {
+    // A label in front of each loop that has pointers, entered by the jumps from outside it.
+    let mut top = vec_new[u64]();
+    let mut l = 0;
+    while l < f.nlabel {
+      vec_push(&mut top, IR_NONE);
+      l = wrap_add(l, 1);
+    }
+    let mut k = 0;
+    while k < vec_len(gl) {
+      let lk = u_at(gl, k);
+      if u_at(top, lk) == IR_NONE {
+        ra_set(&mut top, lk, ir_label(&mut f));
+      }
+      k = wrap_add(k, 1);
+    }
+    let mut out = vec_new[IrIns]();
+    i = 0;
+    while i < n {
+      let q = iropt_at(f, i);
+      let hl = u_at(hdr, i);
+      if hl != IR_NONE {
+        vec_push(&mut out, IrIns { op: IR_LABEL, d: IR_NONE, a: u_at(top, hl), b: 0, c: 0, ty: 0 });
+        k = 0;
+        while k < vec_len(gl) {
+          if u_at(gl, k) == hl {
+            let mut sc = u_at(ga, k);
+            if u_at(gc, k) == 8 {
+              let kr = ir_reg(&mut f);
+              let sh = ir_reg(&mut f);
+              vec_push(&mut out, IrIns { op: IR_CONST, d: kr, a: 3, b: 0, c: 0, ty: 0 });
+              vec_push(&mut out, IrIns { op: IR_SHL, d: sh, a: sc, b: kr, c: 0, ty: 0 });
+              sc = sh;
+            }
+            vec_push(&mut out, IrIns { op: IR_ADD, d: u_at(gp, k), a: u_at(gs, k), b: sc, c: 0, ty: 0 });
+          }
+          k = wrap_add(k, 1);
+        }
+      }
+      let nx = wrap_add(i, 1);
+      if nx < n && u_at(pa, nx) != IR_NONE {
+        // The add before the access goes; the access takes the pointer.
+        let mut m = iropt_at(f, nx);
+        m.a = u_at(pa, nx);
+        m.b = u_at(pb, nx);
+        vec_push(&mut out, m);
+        i = wrap_add(i, 2);
+      } else {
+        let mut t = q;
+        // A jump into a loop from outside it goes through the label in front.
+        let mut tl = IR_NONE;
+        if t.op == IR_JMP {
+          tl = t.a;
+        }
+        if t.op == IR_BR {
+          tl = t.b;
+        }
+        if tl < f.nlabel && u_at(top, tl) != IR_NONE && (i < u_at(lb.pos, tl) || i > u_at(lb.hi, tl)) {
+          if t.op == IR_JMP {
+            t.a = u_at(top, tl);
+          } else {
+            t.b = u_at(top, tl);
+          }
+        }
+        if t.op == IR_BR && t.c < f.nlabel && u_at(top, t.c) != IR_NONE && (i < u_at(lb.pos, t.c) || i > u_at(lb.hi, t.c)) {
+          t.c = u_at(top, t.c);
+        }
+        vec_push(&mut out, t);
+        i = wrap_add(i, 1);
+      }
+    }
+    vec_free(f.ins);
+    f.ins = out;
+    vec_free(top);
+  }
+  vec_free(pa);
+  vec_free(pb);
+  vec_free(hdr);
+  vec_free(gl);
+  vec_free(gs);
+  vec_free(ga);
+  vec_free(gc);
+  vec_free(gp);
+  vec_free(none);
+  vec_free(dp);
+  vec_free(ndef);
+  vec_free(nuse);
+  vec_free(cv);
+  iropt_labs_free(lb);
+  return done;
+}
+
 /// The smallest 2^n - 1 that is at least `x`.
 fn iropt_pow2m1(x: u64) -> u64 {
   let mut m = 0;
