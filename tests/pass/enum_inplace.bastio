@@ -1,0 +1,115 @@
+// An enum kept in memory is built where it is assigned (stage1/ir.bastio,
+// ir_variant_into), and a payload that is put back where it came from is
+// not copied.
+// expect-exit: 0
+// expect-stdout: 198
+// The shapes: a payload bound with `mut`, changed and put back; put back
+// without a change; a different variant around the same payload; the
+// variant `None`, which writes only the tag; a payload that comes from
+// another variable; and a payload that is read after the enum it came from
+// was assigned (it must keep its own copy).
+struct Net {
+  v: Vec[u64],
+  a: u64,
+  b: u64,
+  c: u64,
+  d: u64,
+}
+
+enum Nic {
+  None,
+  Up(Net),
+  Down(Net),
+}
+
+fn net_new(a: u64) -> Net {
+  return Net { v: vec_new[u64](), a: a, b: wrap_add(a, 1), c: wrap_add(a, 2), d: wrap_add(a, 3) };
+}
+
+fn bump(c: &mut Nic, k: u64) -> u64 {
+  match c {
+    Nic::None => { c = Nic::None; return 0; },
+    Nic::Down(mut n) => { c = Nic::Down(n); return 0; },
+    Nic::Up(mut n) => {
+      if k == 7 {
+        c = Nic::Up(n);
+        return 1;
+      }
+      n.b = wrap_add(n.b, k);
+      let r = n.b;
+      c = Nic::Up(n);
+      return r;
+    },
+  }
+}
+
+fn flip(c: &mut Nic) {
+  match c {
+    Nic::None => { c = Nic::None; },
+    Nic::Up(mut n) => {
+      n.c = wrap_add(n.c, 100);
+      c = Nic::Down(n);
+    },
+    Nic::Down(mut n) => {
+      n.d = wrap_add(n.d, 1000);
+      c = Nic::Up(n);
+    },
+  }
+}
+
+fn take(c: &mut Nic) -> u64 {
+  match c {
+    Nic::None => { c = Nic::None; return 0; },
+    Nic::Down(mut n) => { c = Nic::Down(n); return 0; },
+    Nic::Up(mut n) => {
+      c = Nic::None;
+      let r = n.a;
+      vec_free(n.v);
+      return r;
+    },
+  }
+}
+
+fn tag(c: &Nic) -> u64 {
+  match c {
+    Nic::None => { return 0; },
+    Nic::Up(n) => { return n.c; },
+    Nic::Down(n) => { return n.d; },
+  }
+}
+
+fn replace(c: &mut Nic, n: Net) {
+  match c {
+    Nic::None => { c = Nic::Up(n); },
+    Nic::Up(m) => { vec_free(m.v); c = Nic::Up(n); },
+    Nic::Down(m) => { vec_free(m.v); c = Nic::Down(n); },
+  }
+}
+
+fn done(c: Nic) {
+  match c {
+    Nic::None => { },
+    Nic::Up(n) => { vec_free(n.v); },
+    Nic::Down(n) => { vec_free(n.v); },
+  }
+}
+
+fn main() -> u64 {
+  let mut c = Nic::Up(net_new(1));
+  let mut t = 0;
+  t = wrap_add(t, bump(&mut c, 7));
+  t = wrap_add(t, bump(&mut c, 5));
+  flip(&mut c);
+  t = wrap_add(t, tag(c));
+  t = wrap_add(t, bump(&mut c, 5));
+  flip(&mut c);
+  t = wrap_add(t, tag(c));
+  replace(&mut c, net_new(40));
+  t = wrap_add(t, bump(&mut c, 2));
+  t = wrap_add(t, take(&mut c));
+  t = wrap_add(t, tag(c));
+  t = wrap_add(t, bump(&mut c, 9));
+  done(c);
+  print(t);
+  return 0;
+}
