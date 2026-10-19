@@ -1,0 +1,37 @@
+// stage1-only: frame_to_frame
+// expect-exit: 42
+// `frame_to_frame` copies a byte range from one page into another page in one
+// go, with both ranges proved in bounds: bytes go in through one page, across
+// to the other at different offsets (odd length and offsets, so whole words and
+// a tail), and out again.
+fn main(pool: &mut Pool) -> u64 {
+  if pool_size(pool) < 2 {
+    return 1;
+  }
+  let mut src = balloc(4096);
+  let mut i = 0;
+  while i < 4096
+    invariant i <= 4096 && blen(src) == 4096
+  {
+    bset(&mut src, i, cast[u8](i * 7 % 256));
+    i = i + 1;
+  }
+  let mut a = pool_take(&mut pool, 0);
+  let mut b = pool_take(&mut pool, 1);
+  bytes_to_frame(&mut a, 0, src, 0, 4096);
+  bytes_to_frame(&mut b, 0, src, 0, 1);
+  frame_to_frame(&mut b, 5, a, 11, 4085);
+  frame_to_frame(&mut b, 0, a, 0, 0);
+  let mut back = balloc(4096);
+  frame_to_bytes(&mut back, 0, b, 0, 4096);
+  let ok = bget(back, 0) == bget(src, 0) && bget(back, 5) == bget(src, 11)
+    && bget(back, 4089) == bget(src, 4095) && bget(back, 4) == 0;
+  pool_give(&mut pool, a);
+  pool_give(&mut pool, b);
+  bfree(src);
+  bfree(back);
+  if ok {
+    return 42;
+  }
+  return 2;
+}

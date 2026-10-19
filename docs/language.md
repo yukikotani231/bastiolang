@@ -1033,6 +1033,7 @@ Ghost accessors, usable in specifications:
 | `frame_read8(f: &Frame, o: u64) -> u8`, `frame_write8(f: &mut Frame, o: u64, b: u8)` | `o < 4096` | A byte of the page |
 | `frame_to_bytes(dst: &mut Bytes, d: u64, f: &Frame, o: u64, n: u64)` | `o + n <= 4096` and `d + n <= blen(dst)` | Copies bytes `o .. o+n` of the page over bytes `d .. d+n` of `dst` in one go. The page's contents are not tracked, so those bytes of `dst` become unknown to the proof; the rest stay as they were |
 | `bytes_to_frame(f: &mut Frame, o: u64, src: &Bytes, s: u64, n: u64)` | `o + n <= 4096` and `s + n <= blen(src)` | Copies bytes `s .. s+n` of `src` into the page at `o`. It stays the same page |
+| `frame_to_frame(dst: &mut Frame, d: u64, src: &Frame, s: u64, n: u64)` | `d + n <= 4096` and `s + n <= 4096` | Copies bytes `s .. s+n` of `src` over bytes `d .. d+n` of `dst` in one go, with no buffer in between (`frame_to_bytes` then `bytes_to_frame` copies twice). Both pages' contents are untracked; `dst` stays the same page. |
 | `pt_new(f: Frame, level: u64) -> PageTable` | `1 <= level <= 5` | Turns a page into an empty table. A level-4 table gets the kernel's map in slot 0 (not owned, never touched) |
 | `pt_free(t: PageTable) -> Frame` | level is not 4; every slot empty | Turns an empty table back into a page |
 | `pt_free_root(m: &Mmu, t: PageTable) -> Frame` | level 4; slots 1-255 empty; `pt_id(t) != mmu_root(m)`; `pt_leases(t) == 0` | Kernel only. The same for a top-level table, which must not be in CR3, here or on another processor |
