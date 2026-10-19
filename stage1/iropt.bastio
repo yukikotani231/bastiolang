@@ -4500,6 +4500,7 @@ fn iropt_ebb(f: &mut IrFn) -> u64 {
   let mut te_ty = vec_new[u64]();
   let mut te_d = vec_new[u64]();
   let mut te_nf = vec_new[u64]();
+  let mut te_pos = vec_new[u64]();
   let nuse = iropt_nuse(f);
   let mut done = 0;
   let mut prev = IrIns { op: IR_JMP, d: IR_NONE, a: IR_NONE, b: 0, c: 0, ty: 0 };
@@ -4537,7 +4538,11 @@ fn iropt_ebb(f: &mut IrFn) -> u64 {
       t = 0;
       while hit == IR_NONE && t < vec_len(te_op) {
         if u_at(te_op, t) == q.op && iropt_ebb_same(cv, al, u_at(te_a, t), q.a) && iropt_ebb_same(cv, al, u_at(te_b, t), q.b) && u_at(te_c, t) == q.c && u_at(te_ty, t) == q.ty {
-          if u_at(te_nf, t) == 0 {
+          // A cheap operation on a constant, far from its first computation,
+          // is computed again: keeping it would hold a register for the
+          // whole stretch.
+          let far = wrap_sub(i, u_at(te_pos, t)) > 24 && (q.op == IR_ADD || q.op == IR_SUB || q.op == IR_AND || q.op == IR_OR || q.op == IR_XOR || q.op == IR_SHL || q.op == IR_SHR) && q.b < vec_len(cv) && u_at(cv, q.b) != IR_NONE;
+          if u_at(te_nf, t) == 0 && !far {
             hit = u_at(te_d, t);
           }
         }
@@ -4600,6 +4605,7 @@ fn iropt_ebb(f: &mut IrFn) -> u64 {
             vec_push(&mut te_ty, 0);
             vec_push(&mut te_d, 0);
             vec_push(&mut te_nf, 0);
+            vec_push(&mut te_pos, 0);
             slot = wrap_sub(vec_len(te_op), 1);
           }
           if slot != IR_NONE {
@@ -4627,6 +4633,7 @@ fn iropt_ebb(f: &mut IrFn) -> u64 {
               }
             }
             ra_set(&mut te_nf, slot, nf);
+            ra_set(&mut te_pos, slot, i);
           }
         }
       }
@@ -4661,6 +4668,7 @@ fn iropt_ebb(f: &mut IrFn) -> u64 {
   vec_free(te_ty);
   vec_free(te_d);
   vec_free(te_nf);
+  vec_free(te_pos);
   vec_free(nuse);
   return done;
 }
