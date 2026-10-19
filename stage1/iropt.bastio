@@ -6290,7 +6290,7 @@ fn iropt_ub_ins(q: IrIns, ub: &Vec[u64], cv: &Vec[u64]) -> u64 {
 /// rounds is unbounded); the arguments, calls and every operation not listed
 /// in `iropt_ub_ins` are unbounded. A CRC step `(c / 2 ^ K) % 2^32` of a `c`
 /// below 2^32 then loses the reduction. Returns how many it dropped.
-fn iropt_zext(f: &mut IrFn) -> u64 {
+fn iropt_zext(f: &mut IrFn, late: bool) -> u64 {
   let n = vec_len(f.ins);
   if n > 4000000 || f.nreg > 100000000 {
     return 0;
@@ -6371,6 +6371,12 @@ fn iropt_zext(f: &mut IrFn) -> u64 {
           drop = true;
         }
         if q.op == IR_AND && kb != IR_NONE && kb & wrap_add(kb, 1) == 0 && iropt_cval(ub, q.a) <= kb {
+          drop = true;
+        }
+        // `x == 1` and `x != 0` of an `x` that is 0 or 1 are `x`, but only after
+        // `iropt_ifconv` (late): it converts a branch on a comparison, not on a
+        // bare value, and the unpredictable branch costs more than the compare.
+        if late && q.c == 0 && ((q.op == IR_EQ && kb == 1) || (q.op == IR_NE && kb == 0)) && iropt_cval(ub, q.a) <= 1 {
           drop = true;
         }
         if drop && ka == IR_NONE {
