@@ -5784,17 +5784,44 @@ fn iropt_licm_op(op: u64) -> bool {
   return op == IR_ADD || op == IR_SUB || op == IR_MUL || op == IR_AND || op == IR_OR || op == IR_XOR || op == IR_SHL || op == IR_SHR || op == IR_SAR || op == IR_NOT || op == IR_NEG || op == IR_WRAP || (op >= IR_EQ && op <= IR_SGE);
 }
 
-/// Is register `r` the same in every pass of the loop whose header label is at
-/// `p`: a constant, a register written once outside the loop (a parameter
-/// counts), or one `moved` says is moved out?
-fn iropt_licm_inv(r: u64, p: u64, ndef: &Vec[u64], cv: &Vec[u64], dp: &Vec[u64], moved: &Vec[u64]) -> bool {
-  if r >= vec_len(ndef) || r >= vec_len(cv) || r >= vec_len(dp) || r >= vec_len(moved) {
+/// Is register `r` the same in every pass of a loop: a constant, a register
+/// the loop never writes (`inl` is 1 for the ones it does; a register written
+/// several times before the loop, or a parameter, counts), or one `moved` says
+/// is moved out?
+fn iropt_licm_inv(r: u64, cv: &Vec[u64], inl: &Vec[u64], moved: &Vec[u64]) -> bool {
+  if r >= vec_len(cv) || r >= vec_len(inl) || r >= vec_len(moved) {
     return false;
   }
   if u_at(cv, r) != IR_NONE || u_at(moved, r) != 0 {
     return true;
   }
-  return u_at(ndef, r) == 1 && (u_at(dp, r) == IR_NONE || u_at(dp, r) < p);
+  return u_at(inl, r) == 0;
+}
+
+/// The registers written in the loop whose header is at `p` and whose last jump is at `q`.
+fn iropt_licm_written(f: &IrFn, p: u64, q: u64) -> Vec[u64] {
+  let mut inl = vec_new[u64]();
+  let mut r = 0;
+  while r < f.nreg && r < 1000000000 {
+    vec_push(&mut inl, 0);
+    r = wrap_add(r, 1);
+  }
+  let mut i = wrap_add(p, 1);
+  while i <= q && i < vec_len(f.ins) {
+    let mut ws = vec_new[u64]();
+    ra_writes(iropt_at(f, i), &mut ws);
+    let mut w = 0;
+    while w < vec_len(ws) {
+      let x = vec_get(ws, w);
+      if x < vec_len(inl) {
+        ra_set(&mut inl, x, 1);
+      }
+      w = wrap_add(w, 1);
+    }
+    vec_free(ws);
+    i = wrap_add(i, 1);
+  }
+  return inl;
 }
 
 /// Loop-invariant code motion: an operation whose result is written once and
@@ -5855,6 +5882,7 @@ fn iropt_licm(f: &mut IrFn) -> u64 {
             vec_push(&mut moved, 0);
             r = wrap_add(r, 1);
           }
+          let inl = iropt_licm_written(f, p, q);
           let mut set = vec_new[u64]();
           let mut grew = true;
           while grew && vec_len(set) < 64 {
@@ -5863,9 +5891,9 @@ fn iropt_licm(f: &mut IrFn) -> u64 {
             while i <= q && i < n {
               let qi = iropt_at(f, i);
               if iropt_licm_op(qi.op) && qi.d < vec_len(moved) && u_at(ndef, qi.d) == 1 && u_at(moved, qi.d) == 0 && qi.d != qi.a && qi.d != qi.b {
-                let mut ok = iropt_licm_inv(qi.a, p, ndef, cv, dp, moved);
+                let mut ok = iropt_licm_inv(qi.a, cv, inl, moved);
                 if ok && qi.op != IR_NOT && qi.op != IR_NEG && qi.op != IR_WRAP {
-                  ok = iropt_licm_inv(qi.b, p, ndef, cv, dp, moved);
+                  ok = iropt_licm_inv(qi.b, cv, inl, moved);
                 }
                 if ok {
                   ra_set(&mut moved, qi.d, 1);
@@ -5885,6 +5913,7 @@ fn iropt_licm(f: &mut IrFn) -> u64 {
             vec_free(set);
           }
           vec_free(moved);
+          vec_free(inl);
         }
       }
       l = wrap_add(l, 1);
@@ -5993,30 +6022,16 @@ fn iropt_rowptr(f: &mut IrFn) -> u64 {
   let nuse = iropt_nuse(f);
   let cv = iropt_consts(f, ndef);
   let lb = iropt_labs(f);
-  let mut dp = vec_new[u64]();
   let mut none = vec_new[u64]();
   let mut r = 0;
   while r < f.nreg {
-    vec_push(&mut dp, IR_NONE);
     vec_push(&mut none, 0);
     r = wrap_add(r, 1);
   }
+  // The registers the loop of the last access written, kept while accesses are in the same loop.
+  let mut inl = vec_new[u64]();
+  let mut inl_of = IR_NONE;
   let mut i = 0;
-  while i < n {
-    let qi = iropt_at(f, i);
-    let mut ws = vec_new[u64]();
-    ra_writes(qi, &mut ws);
-    let mut w = 0;
-    while w < vec_len(ws) {
-      let x = vec_get(ws, w);
-      if x < vec_len(dp) && u_at(dp, x) == IR_NONE {
-        ra_set(&mut dp, x, i);
-      }
-      w = wrap_add(w, 1);
-    }
-    vec_free(ws);
-    i = wrap_add(i, 1);
-  }
   // Per access (at the position of its add's successor): the pointer it uses
   // and the register it indexes with. The pointers: loop, base, row, size, register.
   let mut pa = vec_new[u64]();
@@ -6053,9 +6068,14 @@ fn iropt_rowptr(f: &mut IrFn) -> u64 {
       if best != IR_NONE {
         let p = u_at(lb.pos, best);
         let hi = u_at(lb.hi, best);
-        if hi < n && iropt_wide_entry_ok(f, lb, p, hi) && iropt_licm_inv(q.a, p, ndef, cv, dp, none) {
-          let ia = iropt_licm_inv(g.a, p, ndef, cv, dp, none);
-          let ib = iropt_licm_inv(g.b, p, ndef, cv, dp, none);
+        if hi < n && inl_of != best && iropt_wide_entry_ok(f, lb, p, hi) {
+          vec_free(inl);
+          inl = iropt_licm_written(f, p, hi);
+          inl_of = best;
+        }
+        if hi < n && inl_of == best && iropt_licm_inv(q.a, cv, inl, none) {
+          let ia = iropt_licm_inv(g.a, cv, inl, none);
+          let ib = iropt_licm_inv(g.b, cv, inl, none);
           let mut row = IR_NONE;
           let mut idx = IR_NONE;
           if ia && !ib {
@@ -6178,7 +6198,7 @@ fn iropt_rowptr(f: &mut IrFn) -> u64 {
   vec_free(gc);
   vec_free(gp);
   vec_free(none);
-  vec_free(dp);
+  vec_free(inl);
   vec_free(ndef);
   vec_free(nuse);
   vec_free(cv);
