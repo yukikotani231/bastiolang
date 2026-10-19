@@ -4750,6 +4750,285 @@ fn iropt_bits(f: &mut IrFn) -> u64 {
   return done;
 }
 
+/// Can `iropt_ifconv` run `q` whether or not its arm is taken? It only
+/// computes a register and cannot trap: no load, no store, no call, and a
+/// division only by a nonzero constant.
+fn iropt_spec_ok(q: IrIns, cv: &Vec[u64]) -> bool {
+  let op = q.op;
+  if q.d == IR_NONE {
+    return false;
+  }
+  if op == IR_CONST || op == IR_MOV || op == IR_NOT || op == IR_NEG || op == IR_WRAP {
+    return true;
+  }
+  if op == IR_DIV || op == IR_REM {
+    return u_at(cv, q.b) != IR_NONE && u_at(cv, q.b) != 0;
+  }
+  return ra_is_binary(op) && op != IR_SDIV && op != IR_SREM;
+}
+
+/// The position of the `jmp` or label that closes the arm of an `if` that
+/// starts at `s`, or IR_NONE if the arm is longer than eight instructions
+/// or holds one `iropt_spec_ok` does not accept.
+fn iropt_arm_end(f: &IrFn, s: u64, cv: &Vec[u64]) -> u64 {
+  let mut k = s;
+  while k < vec_len(f.ins) && k < wrap_add(s, 9) {
+    let q = iropt_at(f, k);
+    if q.op == IR_JMP || q.op == IR_LABEL {
+      return k;
+    }
+    if !iropt_spec_ok(q, cv) {
+      return IR_NONE;
+    }
+    k = wrap_add(k, 1);
+  }
+  return IR_NONE;
+}
+
+/// How often `x` is in `v`.
+fn iropt_count(v: &Vec[u64], x: u64) -> u64 {
+  let mut n = 0;
+  let mut k = 0;
+  while k < vec_len(v) {
+    if vec_get(v, k) == x {
+      n = wrap_add(n, 1);
+    }
+    k = wrap_add(k, 1);
+  }
+  return n;
+}
+
+/// The register that holds `r` in an arm: the fresh register it was last
+/// written to there, or `r`.
+fn iropt_arm_reg(mo: &Vec[u64], mn: &Vec[u64], r: u64) -> u64 {
+  let mut k = 0;
+  while k < vec_len(mo) && k < vec_len(mn) {
+    if vec_get(mo, k) == r {
+      return vec_get(mn, k);
+    }
+    k = wrap_add(k, 1);
+  }
+  return r;
+}
+
+/// Appends the instructions `s` to `e` of an arm to `out`. A register in
+/// `shared` (written in an arm and read elsewhere, or written more than
+/// once) is written to a fresh register instead, which `mo`/`mn` record, and
+/// the later reads of the arm follow it; the other registers keep their
+/// names, since nothing outside the arm reads them.
+fn iropt_conv_arm(f: &mut IrFn, out: &mut Vec[IrIns], s: u64, e: u64, shared: &Vec[u64], mo: &mut Vec[u64], mn: &mut Vec[u64]) {
+  let mut k = s;
+  while k < e {
+    let mut q = iropt_at(f, k);
+    let mut j = 0;
+    while j < vec_len(mo) && j < vec_len(mn) {
+      q = ra_subst(q, vec_get(mo, j), vec_get(mn, j));
+      j = wrap_add(j, 1);
+    }
+    if iropt_count(shared, q.d) > 0 {
+      let t = ir_reg(&mut f);
+      let mut found = false;
+      j = 0;
+      while j < vec_len(mo) && j < vec_len(mn) {
+        if vec_get(mo, j) == q.d {
+          vec_set(&mut mn, j, t);
+          found = true;
+        }
+        j = wrap_add(j, 1);
+      }
+      if !found {
+        vec_push(&mut mo, q.d);
+        vec_push(&mut mn, t);
+      }
+      q.d = t;
+    }
+    vec_push(&mut out, q);
+    k = wrap_add(k, 1);
+  }
+}
+
+/// Branchless `if`: an `if` (or `if`/`else`) whose arms are a few
+/// instructions that only compute registers, and whose condition is a
+/// comparison, runs both arms and selects the results with a mask,
+/// `r = e ^ ((t ^ e) & -c)`. A branch the program cannot predict (a test of
+/// a data bit, the sign of a difference) costs more than the dozen
+/// instructions that replace it; gcc and clang do the same with `cmov`.
+/// Arms with a load, a store, a call or a division the proof does not cover
+/// stay branches, as do arms that write more than three registers other
+/// than their own temporaries. Returns how many it converted.
+fn iropt_ifconv(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  if n > 4000000 || f.nreg > 100000000 {
+    return 0;
+  }
+  let ndef = iropt_ndef(f);
+  let nuse = iropt_nuse(f);
+  let cv = iropt_consts(f, ndef);
+  let mut refs = vec_new[u64]();
+  let mut l = 0;
+  while l < f.nlabel && l < 1000000000 {
+    vec_push(&mut refs, 0);
+    l = wrap_add(l, 1);
+  }
+  let mut cmp = vec_new[u64]();
+  let mut r = 0;
+  while r < f.nreg && r < 1000000000 {
+    vec_push(&mut cmp, 0);
+    r = wrap_add(r, 1);
+  }
+  let mut i = 0;
+  while i < n {
+    let q = iropt_at(f, i);
+    if q.op == IR_JMP && q.a < f.nlabel {
+      ra_set(&mut refs, q.a, wrap_add(u_at(refs, q.a), 1));
+    }
+    if q.op == IR_BR {
+      if q.b < f.nlabel {
+        ra_set(&mut refs, q.b, wrap_add(u_at(refs, q.b), 1));
+      }
+      if q.c < f.nlabel {
+        ra_set(&mut refs, q.c, wrap_add(u_at(refs, q.c), 1));
+      }
+    }
+    // A register written once by a comparison holds 0 or 1.
+    if q.d != IR_NONE && q.d < f.nreg && u_at(ndef, q.d) == 1 && iropt_is_cmp(q.op) {
+      ra_set(&mut cmp, q.d, 1);
+    }
+    i = wrap_add(i, 1);
+  }
+  let mut out = vec_new[IrIns]();
+  let mut done = 0;
+  i = 0;
+  while i < n {
+    let q = iropt_at(f, i);
+    let mut next = wrap_add(i, 1);
+    let l0 = iropt_at(f, wrap_add(i, 1));
+    if q.op == IR_BR && q.b != q.c && q.b < f.nlabel && q.c < f.nlabel && u_at(cmp, q.a) == 1 && l0.op == IR_LABEL && (l0.a == q.b || l0.a == q.c) && u_at(refs, l0.a) == 1 {
+      let mut other = q.b;
+      if l0.a == q.b {
+        other = q.c;
+      }
+      let s1 = wrap_add(i, 2);
+      let e1 = iropt_arm_end(f, s1, cv);
+      let c1 = iropt_at(f, e1);
+      // The arms: [s1, e1) behind label l0.a, [s2, e2) behind `other`
+      // (empty when `other` is the join itself), and where the join label
+      // `resume` is.
+      let mut s2 = 0;
+      let mut e2 = 0;
+      let mut resume = IR_NONE;
+      if e1 != IR_NONE {
+        if c1.op == IR_LABEL && c1.a == other {
+          resume = e1;
+        } else if c1.op == IR_JMP {
+          let m1 = iropt_at(f, wrap_add(e1, 1));
+          if m1.op == IR_LABEL && m1.a == other && c1.a == other {
+            resume = wrap_add(e1, 1);
+          } else if m1.op == IR_LABEL && m1.a == other && u_at(refs, other) == 1 && c1.a != l0.a {
+            s2 = wrap_add(e1, 2);
+            let x2 = iropt_arm_end(f, s2, cv);
+            if x2 != IR_NONE {
+              let c2 = iropt_at(f, x2);
+              let m2 = iropt_at(f, wrap_add(x2, 1));
+              if c2.op == IR_LABEL && c2.a == c1.a {
+                resume = x2;
+                e2 = x2;
+              } else if c2.op == IR_JMP && c2.a == c1.a && m2.op == IR_LABEL && m2.a == c1.a {
+                resume = wrap_add(x2, 1);
+                e2 = x2;
+              }
+            }
+          }
+        }
+      }
+      if resume != IR_NONE {
+        // The registers the arms write and something else reads or writes.
+        let mut rr = vec_new[u64]();
+        let mut k = s1;
+        while k < e1 {
+          ra_reads(f, iropt_at(f, k), &mut rr);
+          k = wrap_add(k, 1);
+        }
+        k = s2;
+        while k < e2 {
+          ra_reads(f, iropt_at(f, k), &mut rr);
+          k = wrap_add(k, 1);
+        }
+        let mut shared = vec_new[u64]();
+        // (A register written once, by an arm, and read after it has no value
+        // on the other path: it stays a branch.)
+        let mut fresh_only = false;
+        k = s1;
+        while k < resume && vec_len(shared) < 8 {
+          let w = iropt_at(f, k);
+          if (k < e1 || (k >= s2 && k < e2)) && w.d != IR_NONE && w.d < f.nreg {
+            let local = u_at(ndef, w.d) == 1 && iropt_count(rr, w.d) == u_at(nuse, w.d);
+            if !local && u_at(ndef, w.d) < 2 {
+              fresh_only = true;
+            }
+            if !local && iropt_count(shared, w.d) == 0 {
+              vec_push(&mut shared, w.d);
+            }
+          }
+          k = wrap_add(k, 1);
+        }
+        if vec_len(shared) >= 1 && vec_len(shared) <= 3 && !fresh_only {
+          // The first arm is the then-arm when its label is the true target.
+          let m = ir_reg(&mut f);
+          vec_push(&mut out, IrIns { op: IR_NEG, d: m, a: q.a, b: 0, c: 0, ty: 0 });
+          let mut mo1 = vec_new[u64]();
+          let mut mn1 = vec_new[u64]();
+          let mut mo2 = vec_new[u64]();
+          let mut mn2 = vec_new[u64]();
+          iropt_conv_arm(&mut f, &mut out, s1, e1, shared, &mut mo1, &mut mn1);
+          iropt_conv_arm(&mut f, &mut out, s2, e2, shared, &mut mo2, &mut mn2);
+          let mut j = 0;
+          while j < vec_len(shared) {
+            let d = vec_get(shared, j);
+            let mut vt = iropt_arm_reg(mo1, mn1, d);
+            let mut ve = iropt_arm_reg(mo2, mn2, d);
+            if l0.a != q.b {
+              let sw = vt;
+              vt = ve;
+              ve = sw;
+            }
+            let x1 = ir_reg(&mut f);
+            let x2 = ir_reg(&mut f);
+            vec_push(&mut out, IrIns { op: IR_XOR, d: x1, a: vt, b: ve, c: 0, ty: 0 });
+            vec_push(&mut out, IrIns { op: IR_AND, d: x2, a: x1, b: m, c: 0, ty: 0 });
+            vec_push(&mut out, IrIns { op: IR_XOR, d: d, a: ve, b: x2, c: 0, ty: 0 });
+            j = wrap_add(j, 1);
+          }
+          vec_free(mo1);
+          vec_free(mn1);
+          vec_free(mo2);
+          vec_free(mn2);
+          done = wrap_add(done, 1);
+          next = resume;
+        }
+        vec_free(shared);
+        vec_free(rr);
+      }
+    }
+    if next == wrap_add(i, 1) {
+      vec_push(&mut out, q);
+    }
+    i = next;
+  }
+  vec_free(ndef);
+  vec_free(nuse);
+  vec_free(cv);
+  vec_free(refs);
+  vec_free(cmp);
+  if done == 0 {
+    vec_free(out);
+    return 0;
+  }
+  vec_free(f.ins);
+  f.ins = out;
+  return done;
+}
+
 /// Can `iropt_licm` move an instruction with this operation out of a loop? It
 /// must have no effect but its result and not trap.
 fn iropt_licm_op(op: u64) -> bool {
