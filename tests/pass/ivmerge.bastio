@@ -1,0 +1,78 @@
+// expect-exit: 0
+// expect-stdout: 3662
+// expect-stdout: 2887
+// Two induction variables that start equal and step together (the index of
+// a load and of a store in one row, `y * 32 + x`) are one register on
+// native-ir. In the second function the two step by different amounts, and
+// stay two.
+fn smooth(src: &Buf, mut dst: Buf) -> Buf
+  requires len(src) == 1024 && len(dst) == 1024
+  ensures len(result) == 1024
+{
+  let mut y = 0;
+  while y < 32
+    invariant y <= 32 && len(src) == 1024 && len(dst) == 1024
+  {
+    let mut x = 0;
+    while x < 32
+      invariant x <= 32 && y < 32 && len(src) == 1024 && len(dst) == 1024
+    {
+      let v = get(src, y * 32 + x) % 7;
+      dst = set(dst, y * 32 + x, v + x % 3);
+      x = x + 1;
+    }
+    y = y + 1;
+  }
+  return dst;
+}
+
+fn skew(src: &Buf, mut dst: Buf) -> Buf
+  requires len(src) == 1024 && len(dst) == 1024
+  ensures len(result) == 1024
+{
+  let mut i = 0;
+  let mut j = 0;
+  while i < 512
+    invariant i <= 512 && j == 2 * i && len(src) == 1024 && len(dst) == 1024
+  {
+    dst = set(dst, j, get(src, i) % 5);
+    i = i + 1;
+    j = j + 2;
+  }
+  return dst;
+}
+
+fn main() -> u64 {
+  let mut a = alloc(1024);
+  let mut b = alloc(1024);
+  let mut i = 0;
+  while i < 1024
+    invariant i <= 1024 && len(a) == 1024 && len(b) == 1024
+  {
+    a = set(a, i, wrap_mul(i, 2654435761) % 1000);
+    i = i + 1;
+  }
+  b = smooth(a, b);
+  let mut s = 0;
+  i = 0;
+  while i < 1024
+    invariant i <= 1024 && len(b) == 1024 && s <= 8 * i
+  {
+    s = s + get(b, i) % 8;
+    i = i + 1;
+  }
+  print(s);
+  b = skew(a, b);
+  s = 0;
+  i = 0;
+  while i < 1024
+    invariant i <= 1024 && len(b) == 1024 && s <= 8 * i
+  {
+    s = s + get(b, i) % 8;
+    i = i + 1;
+  }
+  print(s);
+  free(a);
+  free(b);
+  return 0;
+}

@@ -5278,6 +5278,34 @@ fn iropt_ins_in(v: &Vec[IrIns], k: u64) -> IrIns {
   return IrIns { op: 0, d: IR_NONE, a: IR_NONE, b: IR_NONE, c: 0, ty: 0 };
 }
 
+/// The constant that register `r` holds after the instructions `out[..end]`,
+/// when the last write to it within forty is a `const` or a `mov` of one
+/// (IR_NONE: not known).
+fn iropt_out_const(out: &Vec[IrIns], end: u64, r: u64) -> u64 {
+  let mut want = r;
+  let mut di = end;
+  let mut tries = 0;
+  while di > 0 && tries < 40 {
+    di = di - 1;
+    tries = wrap_add(tries, 1);
+    let qd = iropt_ins_in(out, di);
+    if qd.op == IR_LABEL || qd.op == IR_JMP || qd.op == IR_BR {
+      return IR_NONE;
+    }
+    if ra_writes_has(qd, want) {
+      if qd.op == IR_CONST {
+        return qd.a;
+      }
+      if qd.op == IR_MOV {
+        want = qd.a;
+      } else {
+        return IR_NONE;
+      }
+    }
+  }
+  return IR_NONE;
+}
+
 /// Like `iropt_arm_end`, for a run that ends in a conditional branch: the
 /// position of that `br`, or IR_NONE.
 fn iropt_run_end(f: &IrFn, s: u64, cv: &Vec[u64]) -> u64 {
@@ -5627,6 +5655,11 @@ fn iropt_ifconv(f: &mut IrFn) -> u64 {
                   }
                 }
               }
+            }
+            if !simple && iropt_out_const(out, vec_len(out), vt) == 1 && ((ve < vec_len(cv) && iropt_cval(cv, ve) == 0) || (ve == d && iropt_out_const(out, vec_len(out), d) == 0)) {
+              // d = 1 or 0 by the condition: the 0/1 flag itself.
+              simple = true;
+              vec_push(&mut out, IrIns { op: IR_MOV, d: d, a: fl, b: 0, c: 0, ty: 0 });
             }
             if !simple {
               let x1 = ir_reg(&mut f);
