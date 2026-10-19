@@ -1862,7 +1862,25 @@ fn ix_load_cmp(f: &IrFn, al: &IrAlloc, nuse: &Vec[u64], i: u64) -> u64 {
     }
   }
   let br = ix_at(f, wrap_add(j, 1));
-  if !ix_is_cmp(cm.op) || cm.a != q.d || br.op != IR_BR || br.a != cm.d || u_at(nuse, cm.d) != 1 {
+  if !ix_is_cmp(cm.op) || (cm.a != q.d && cm.b != q.d) || br.op != IR_BR || br.a != cm.d || u_at(nuse, cm.d) != 1 {
+    return 0;
+  }
+  if q.c == 8 && cm.a != cm.b {
+    // A comparison with a register: `cmpq %reg, mem` (the load on the right
+    // only for equality, which does not care about the order).
+    if cm.a == q.d {
+      let lr = ix_loc(al, cm.b);
+      if lr.k == IXK_REG {
+        return j;
+      }
+    } else if cm.op == IR_EQ || cm.op == IR_NE {
+      let lr = ix_loc(al, cm.a);
+      if lr.k == IXK_REG {
+        return j;
+      }
+    }
+  }
+  if cm.a != q.d {
     return 0;
   }
   let lb = ix_loc(al, cm.b);
@@ -2149,10 +2167,20 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       }
       let mut op = IR_NE;
       let mut imm = 0;
+      let mut rg = XR_RAX;
+      let mut byreg = false;
       if j != i {
         op = cm.op;
         let lb = ix_loc(al, cm.b);
         imm = lb.imm;
+        if cm.a == q.d && lb.k == IXK_REG {
+          byreg = true;
+          rg = lb.reg;
+        } else if cm.b == q.d {
+          let la2 = ix_loc(al, cm.a);
+          byreg = true;
+          rg = la2.reg;
+        }
       }
       if q.c == 1 {
         w_s(&mut out, "\tcmpb ");
@@ -2163,7 +2191,11 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       } else {
         w_s(&mut out, "\tcmpq ");
       }
-      ix_w_imm(&mut out, imm);
+      if byreg {
+        w_s(&mut out, x86_rname(rg));
+      } else {
+        ix_w_imm(&mut out, imm);
+      }
       w_s(&mut out, ", ");
       ix_awrite(&mut out, ap, sz);
       w_s(&mut out, "\n");
