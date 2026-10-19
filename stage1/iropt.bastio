@@ -5854,3 +5854,241 @@ fn iropt_licm(f: &mut IrFn) -> u64 {
   }
   return total;
 }
+
+/// The smallest 2^n - 1 that is at least `x`.
+fn iropt_pow2m1(x: u64) -> u64 {
+  let mut m = 0;
+  let mut k = 0;
+  while m < x && k < 64 {
+    m = wrap_add(wrap_mul(m, 2), 1);
+    k = wrap_add(k, 1);
+  }
+  return m;
+}
+
+/// An upper bound of the result of `q` (an operation `iropt_zext` knows)
+/// given the bounds `ub` of its operands; 0xFFFFFFFFFFFFFFFF if none.
+fn iropt_ub_ins(q: IrIns, ub: &Vec[u64], cv: &Vec[u64]) -> u64 {
+  let op = q.op;
+  let top = 0xFFFFFFFFFFFFFFFF;
+  let ua = iropt_cval(ub, q.a);
+  let ub2 = iropt_cval(ub, q.b);
+  let kb = iropt_cval(cv, q.b);
+  if op == IR_CONST {
+    return q.a;
+  }
+  if op == IR_MOV {
+    return ua;
+  }
+  if op == IR_AND {
+    if ua < ub2 {
+      return ua;
+    }
+    return ub2;
+  }
+  if op == IR_OR || op == IR_XOR {
+    if ua > ub2 {
+      return iropt_pow2m1(ua);
+    }
+    return iropt_pow2m1(ub2);
+  }
+  if op == IR_SHR && kb < 64 {
+    return ua >> kb;
+  }
+  if op == IR_DIV && kb != IR_NONE && kb > 0 {
+    return ua / kb;
+  }
+  if op == IR_REM && kb != IR_NONE && kb > 0 {
+    if ua < kb {
+      return ua;
+    }
+    return kb - 1;
+  }
+  if iropt_is_cmp(op) {
+    return 1;
+  }
+  if op == IR_LOAD && q.c == 1 {
+    return 255;
+  }
+  if op == IR_ADD && q.c != 1 {
+    if ua <= top - ub2 {
+      return ua + ub2;
+    }
+    return top;
+  }
+  if op == IR_MUL && q.c != 1 {
+    if ua == 0 || ub2 == 0 {
+      return 0;
+    }
+    if ub2 <= top / ua {
+      return ua * ub2;
+    }
+    return top;
+  }
+  if op == IR_SHL && kb < 64 && ua <= (top >> kb) {
+    return ua << kb;
+  }
+  return top;
+}
+
+/// Drops a reduction that cannot change its operand: `x % 4294967296` and
+/// `x & 0xffffffff` (and any `% k` or `& (2^n - 1)`) of a value already below
+/// the modulus become a `mov`. The bound of a register is the largest value
+/// any instruction that writes it can give, found by iterating over the
+/// function until nothing grows (a register that still grows after a few
+/// rounds is unbounded); the arguments, calls and every operation not listed
+/// in `iropt_ub_ins` are unbounded. A CRC step `(c / 2 ^ K) % 2^32` of a `c`
+/// below 2^32 then loses the reduction. Returns how many it dropped.
+fn iropt_zext(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  if n > 4000000 || f.nreg > 100000000 {
+    return 0;
+  }
+  let top = 0xFFFFFFFFFFFFFFFF;
+  let ndef = iropt_ndef(f);
+  let cv = iropt_consts(f, ndef);
+  let mut ub = vec_new[u64]();
+  let mut r = 0;
+  while r < f.nreg && r < 1000000000 {
+    if u_at(ndef, r) == 0 {
+      vec_push(&mut ub, top);
+    } else {
+      vec_push(&mut ub, 0);
+    }
+    r = wrap_add(r, 1);
+  }
+  // A parameter holds its argument on entry, whatever the body writes to it.
+  let mut pi = 0;
+  while pi < vec_len(f.params) {
+    let pr = vec_get(f.params, pi);
+    if pr < f.nreg {
+      ra_set(&mut ub, pr, top);
+    }
+    pi = wrap_add(pi, 1);
+  }
+  pi = 0;
+  while pi < vec_len(f.lent) {
+    let pr = vec_get(f.lent, pi);
+    if pr < f.nreg {
+      ra_set(&mut ub, pr, top);
+    }
+    pi = wrap_add(pi, 1);
+  }
+  let mut round = 0;
+  let mut changed = true;
+  while changed && round < 16 {
+    changed = false;
+    let mut i = 0;
+    while i < n {
+      let q = iropt_at(f, i);
+      let mut w = vec_new[u64]();
+      ra_writes(q, &mut w);
+      let mut j = 0;
+      while j < vec_len(w) {
+        let d = vec_get(w, j);
+        if d < f.nreg {
+          let mut nb = top;
+          if d == q.d && q.op != IR_CALL && q.op != IR_CALLM {
+            nb = iropt_ub_ins(q, ub, cv);
+          }
+          let prev = u_at(ub, d);
+          if nb > prev {
+            if round >= 4 {
+              nb = top;
+            }
+            ra_set(&mut ub, d, nb);
+            changed = true;
+          }
+        }
+        j = wrap_add(j, 1);
+      }
+      vec_free(w);
+      i = wrap_add(i, 1);
+    }
+    round = wrap_add(round, 1);
+  }
+  let mut done = 0;
+  if !changed {
+    let mut i = 0;
+    while i < n {
+      let q = iropt_at(f, i);
+      if q.d != IR_NONE && q.d < f.nreg && q.a < f.nreg {
+        let kb = iropt_cval(cv, q.b);
+        let ka = iropt_cval(cv, q.a);
+        let mut drop = false;
+        if q.op == IR_REM && kb != IR_NONE && kb > 0 && iropt_cval(ub, q.a) < kb {
+          drop = true;
+        }
+        if q.op == IR_AND && kb != IR_NONE && kb & wrap_add(kb, 1) == 0 && iropt_cval(ub, q.a) <= kb {
+          drop = true;
+        }
+        if drop && ka == IR_NONE {
+          vec_set(&mut f.ins, i, IrIns { op: IR_MOV, d: q.d, a: q.a, b: 0, c: 0, ty: q.ty });
+          done = wrap_add(done, 1);
+        }
+      }
+      i = wrap_add(i, 1);
+    }
+  }
+  vec_free(ndef);
+  vec_free(cv);
+  vec_free(ub);
+  return done;
+}
+
+/// The register that holds `a ^ b` where `a` was set a few instructions
+/// before position `i`, in the same block, to `b ^ y` or `y ^ b`, and neither
+/// `b` nor `y` has been written since: `y`. IR_NONE if not.
+fn iropt_xor_other(f: &IrFn, i: u64, a: u64, b: u64) -> u64 {
+  let k = iropt_def_before(f, i, a);
+  if k == IR_NONE {
+    return IR_NONE;
+  }
+  let q = iropt_at(f, k);
+  if q.op != IR_XOR || q.c == 1 || q.d != a || q.d == q.a || q.d == q.b {
+    return IR_NONE;
+  }
+  let mut y = IR_NONE;
+  if q.a == b {
+    y = q.b;
+  } else if q.b == b {
+    y = q.a;
+  }
+  if y == IR_NONE || y == a {
+    return IR_NONE;
+  }
+  let mut j = wrap_add(k, 1);
+  while j < i {
+    let p = iropt_at(f, j);
+    if ra_writes_has(p, b) || ra_writes_has(p, y) {
+      return IR_NONE;
+    }
+    j = wrap_add(j, 1);
+  }
+  return y;
+}
+
+/// `(e ^ k) ^ e` is `k`: the mask select `r = e ^ ((t ^ e) & -c)` of
+/// `iropt_ifconv` with a `t` that is `e ^ k`, once `iropt_zext` has dropped
+/// the reduction between them, is `r = e ^ (k & -c)`. Returns how many it
+/// rewrote.
+fn iropt_xorcancel(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  let mut done = 0;
+  let mut i = 0;
+  while i < n {
+    let q = iropt_at(f, i);
+    if q.op == IR_XOR && q.c != 1 && q.d != IR_NONE && q.a != IR_NONE && q.b != IR_NONE {
+      let mut y = iropt_xor_other(f, i, q.a, q.b);
+      if y == IR_NONE {
+        y = iropt_xor_other(f, i, q.b, q.a);
+      }
+      if y != IR_NONE {
+        vec_set(&mut f.ins, i, IrIns { op: IR_MOV, d: q.d, a: y, b: 0, c: 0, ty: q.ty });
+        done = wrap_add(done, 1);
+      }
+    }
+    i = wrap_add(i, 1);
+  }
+  return done;
+}
