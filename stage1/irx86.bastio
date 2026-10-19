@@ -1300,9 +1300,16 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     }
     ix_finish(&mut out, al, q.d, XR_RAX);
   } else if op == IR_NEG {
-    ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RAX));
-    w_s(&mut out, "\tneg %rax\n");
-    ix_finish(&mut out, al, q.d, XR_RAX);
+    let ld = ix_loc(al, q.d);
+    let mut t = XR_RAX;
+    if ld.k == IXK_REG {
+      t = ld.reg;
+    }
+    ix_mov(&mut out, ix_loc(al, q.a), ix_rl(t));
+    w_s(&mut out, "\tneg ");
+    w_s(&mut out, x86_rname(t));
+    w_s(&mut out, "\n");
+    ix_finish(&mut out, al, q.d, t);
   } else if op == IR_WRAP {
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RAX));
     ix_norm(&mut out, m, q.ty);
@@ -3164,10 +3171,23 @@ fn irx_function_n(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, nc
     iropt_copies(&mut f);
     iropt_dce(&mut f);
   }
+  let mut fused = 0;
+  while iropt_cmpfuse(&mut f) > 0 && fused < 4 {
+    fused = fused + 1;
+  }
+  if iropt_ifconv(&mut f) > 0 {
+    iropt_copies(&mut f);
+    iropt_dce(&mut f);
+    iropt_labels(&mut f);
+  }
   iropt_ivs(&mut f);
   iropt_ebb(&mut f);
   iropt_bits(&mut f);
   iropt_licm(&mut f);
+  if iropt_punroll(&mut f) > 0 {
+    iropt_copies(&mut f);
+    iropt_dce(&mut f);
+  }
   iropt_wide(&mut f);
   iropt_dead_live(&mut f);
   iropt_copies(&mut f);
