@@ -3669,6 +3669,31 @@ fn ix_writes_args(v: &Vec[u64]) -> bool {
   return false;
 }
 
+/// The code of stub `v` up to its last jump to the function proper: what the
+/// stub does after that is its return, which may write %rax and %rdx.
+fn ix_stub_head(v: &Vec[u64]) -> Vec[u64] {
+  let n = vec_len(v);
+  let mut last = 0;
+  let mut i = 0;
+  while i < n {
+    if ix_has_at(v, i, "_4000000000") {
+      last = i;
+    }
+    i = i + 1;
+  }
+  let mut e = last;
+  while e < n && u_at(v, e) != 10 {
+    e = e + 1;
+  }
+  let mut r = vec_new[u64]();
+  i = 0;
+  while i < e {
+    vec_push(&mut r, u_at(v, i));
+    i = i + 1;
+  }
+  return r;
+}
+
 /// `s` with each `\tud2` turned into a jump to the function proper of instance `x`.
 fn ix_stub_jumps(v: &Vec[u64], x: u64) -> Vec[u64] {
   let mut r = vec_new[u64]();
@@ -3704,7 +3729,10 @@ fn irx_function_n(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, nc
       let mut st = vec_new[u64]();
       let none = vec_new[u64]();
       let r = ix_function_core(&mut g, c, &mut m, p, x, ncallee, s, true, none, &mut st);
-      if r == 1 && !ix_writes_args(st) {
+      let head = ix_stub_head(st);
+      let clobbers = ix_writes_args(head);
+      vec_free(head);
+      if r == 1 && !clobbers {
         vec_free(stub);
         stub = st;
       } else {
@@ -3880,7 +3908,9 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
     w_s(&mut out, ", @function\n");
     ix_sym(&mut out, &mut g, m, p, x);
     w_s(&mut out, ":                  # from the IR\n");
-    if vec_len(stub) > 0 {
+    // The stub costs a compare and a jump on every other entry, and saves the
+    // frame only on the early one: it pays when the frame is heavy.
+    if vec_len(stub) > 0 && al.ncallee_used >= 4 {
       w_append(&mut out, stub);
       ix_lbl(&mut out, x, IX_SLOW);
       w_s(&mut out, ":\n");
