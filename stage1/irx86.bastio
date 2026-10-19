@@ -1130,6 +1130,70 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
       w_s(&mut out, "\n");
       return;
     }
+    if wrap && kind_t(m, q.ty) == TY_U32 && (op == IR_ADD || op == IR_SUB || op == IR_MUL) && ld.k == IXK_REG && la.k == IXK_REG
+       && ((lb0.k == IXK_IMM && ix_fits(lb0.imm)) || (lb0.k == IXK_REG && lb0.reg != ld.reg && op != IR_SUB)) {
+      // Arithmetic modulo 2^32 in 32-bit registers: the upper half of the
+      // result is zero already, so no extension follows.
+      if op == IR_MUL && lb0.k == IXK_IMM {
+        w_s(&mut out, "\timul ");
+        ix_w_imm(&mut out, lb0.imm);
+        w_s(&mut out, ", ");
+        w_s(&mut out, ix_name32(la.reg));
+        w_s(&mut out, ", ");
+        w_s(&mut out, ix_name32(ld.reg));
+        w_s(&mut out, "\n");
+        return;
+      }
+      if op == IR_ADD && la.reg != ld.reg {
+        // One lea: the address arithmetic is 64-bit, the 32-bit destination
+        // keeps the low half.
+        w_s(&mut out, "\tlea ");
+        if lb0.k == IXK_IMM {
+          if lb0.imm <= 2147483647 {
+            w_num(&mut out, lb0.imm);
+          } else {
+            w_s(&mut out, "-");
+            w_num(&mut out, wrap_sub(0, lb0.imm));
+          }
+          w_s(&mut out, "(");
+          w_s(&mut out, x86_rname(la.reg));
+          w_s(&mut out, "), ");
+        } else {
+          w_s(&mut out, "(");
+          w_s(&mut out, x86_rname(la.reg));
+          w_s(&mut out, ", ");
+          w_s(&mut out, x86_rname(lb0.reg));
+          w_s(&mut out, "), ");
+        }
+        w_s(&mut out, ix_name32(ld.reg));
+        w_s(&mut out, "\n");
+        return;
+      }
+      if op == IR_SUB && lb0.k == IXK_IMM && la.reg != ld.reg && lb0.imm <= 2147483647 {
+        w_s(&mut out, "\tlea -");
+        w_num(&mut out, lb0.imm);
+        w_s(&mut out, "(");
+        w_s(&mut out, x86_rname(la.reg));
+        w_s(&mut out, "), ");
+        w_s(&mut out, ix_name32(ld.reg));
+        w_s(&mut out, "\n");
+        return;
+      }
+      if la.reg == ld.reg {
+        w_s(&mut out, "\t");
+        w_s(&mut out, alu);
+        w_s(&mut out, " ");
+        if lb0.k == IXK_IMM {
+          ix_w_imm(&mut out, lb0.imm);
+        } else {
+          w_s(&mut out, ix_name32(lb0.reg));
+        }
+        w_s(&mut out, ", ");
+        w_s(&mut out, ix_name32(ld.reg));
+        w_s(&mut out, "\n");
+        return;
+      }
+    }
     ix_mov(&mut out, la, ix_rl(t));
     let lb = ix_src(&mut out, lb0);
     ix_ins2(&mut out, alu, lb, ix_rl(t));
@@ -3455,6 +3519,17 @@ fn irx_function_n(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, nc
   }
   if iropt_zext(&mut f) > 0 {
     iropt_copies(&mut f);
+    iropt_dce(&mut f);
+  }
+  let mut u32t = IR_NONE;
+  let mut ti = 0;
+  while ti < vec_len(m.tys) && u32t == IR_NONE {
+    if kind_t(m, ti) == TY_U32 {
+      u32t = ti;
+    }
+    ti = wrap_add(ti, 1);
+  }
+  if u32t != IR_NONE && iropt_wrap32(&mut f, u32t) > 0 {
     iropt_dce(&mut f);
   }
   let mut fused = 0;
