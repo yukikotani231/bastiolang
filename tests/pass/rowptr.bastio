@@ -4,7 +4,7 @@
 // loop around, when two loops share a row register, when the row changes in
 // the loop (no pointer), when it is a constant, and for a store.
 // expect-exit: 0
-// expect-stdout: 101290
+// expect-stdout: 115502
 fn fill(mut t: Buf) -> Buf
   requires len(t) == 4096 
   ensures len(result) == 4096
@@ -83,6 +83,32 @@ fn offsets(src: &Buf) -> u64
   return s;
 }
 
+/// `y * 64` is the same in the whole inner loop although y changes in the outer one;
+/// `k * 64` is not, because the inner loop writes k.
+fn mixed(src: &Buf) -> u64
+  requires len(src) == 4096
+{
+  let mut s = 0;
+  let mut y = 0;
+  while y < 8
+    invariant y <= 8 && len(src) == 4096
+  {
+    let mut k = y;
+    let mut x = 0;
+    while x < 16
+      invariant x <= 16 && y < 8 && ((x <= 5 && k == y) || (x > 5 && k == y + 1)) && len(src) == 4096
+    {
+      s = wrap_add(s, wrap_add(get(src, y * 64 + x), get(src, k * 64 + x)));
+      if x == 5 {
+        k = k + 1;
+      }
+      x = x + 1;
+    }
+    y = y + 1;
+  }
+  return s;
+}
+
 fn main() -> u64 {
   let mut a = alloc(4096);
   let mut b = alloc(4096);
@@ -96,7 +122,7 @@ fn main() -> u64 {
     c = wrap_add(c, get(b, i) % 1000);
     i = i + 1;
   }
-  let r = wrap_add(wrap_add(c, wrap_mul(walk(a), 3)), wrap_mul(offsets(a), 5));
+  let r = wrap_add(wrap_add(c, wrap_mul(walk(a), 3)), wrap_add(wrap_mul(offsets(a), 5), wrap_mul(mixed(a), 11)));
   print(r);
   free(a);
   free(b);
