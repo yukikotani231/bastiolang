@@ -6387,6 +6387,49 @@ fn iropt_zext(f: &mut IrFn) -> u64 {
   return done;
 }
 
+/// `u = a op b; r = u % 4294967296` (op one of + - *, `u` read nowhere
+/// else, only constants between) becomes `r = a op b` wrapped to the 32-bit
+/// type `u32t`: one instruction that the emitter writes with 32-bit
+/// operands (which zero-extend), where the remainder was a move of its own.
+/// Returns how many it fused.
+fn iropt_wrap32(f: &mut IrFn, u32t: u64) -> u64 {
+  let n = vec_len(f.ins);
+  if n > 4000000 || f.nreg > 100000000 {
+    return 0;
+  }
+  let ndef = iropt_ndef(f);
+  let nuse = iropt_nuse(f);
+  let cv = iropt_consts(f, ndef);
+  let mut done = 0;
+  let mut i = 0;
+  while i < n {
+    let q = iropt_at(f, i);
+    if (q.op == IR_ADD || q.op == IR_SUB || q.op == IR_MUL) && q.c == 0 && q.d < f.nreg && q.a < f.nreg && q.b < f.nreg
+       && u_at(ndef, q.d) == 1 && u_at(nuse, q.d) == 1 {
+      let mut j = wrap_add(i, 1);
+      let mut go = true;
+      while go && j < n && j < wrap_add(i, 6) {
+        let s = iropt_at(f, j);
+        if s.op == IR_CONST && s.d != q.a && s.d != q.b && s.d != q.d {
+          j = wrap_add(j, 1);
+        } else {
+          go = false;
+        }
+      }
+      let s = iropt_at(f, j);
+      if j < vec_len(f.ins) && s.op == IR_REM && s.c == 0 && s.a == q.d && s.d < f.nreg && s.d != q.d && iropt_cval(cv, s.b) == 4294967296 {
+        vec_set(&mut f.ins, j, IrIns { op: q.op, d: s.d, a: q.a, b: q.b, c: 1, ty: u32t });
+        done = wrap_add(done, 1);
+      }
+    }
+    i = wrap_add(i, 1);
+  }
+  vec_free(ndef);
+  vec_free(nuse);
+  vec_free(cv);
+  return done;
+}
+
 /// The register that holds `a ^ b` where `a` was set a few instructions
 /// before position `i`, in the same block, to `b ^ y` or `y ^ b`, and neither
 /// `b` nor `y` has been written since: `y`. IR_NONE if not.
