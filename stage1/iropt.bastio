@@ -1345,25 +1345,31 @@ fn iropt_after_label(f: &IrFn, lpos: &Vec[u64], l: u64) -> u64 {
   return p;
 }
 
-/// Loop rotation. A loop whose test is at the top, `L: t = cmp a, b; br t,
-/// B, E; B: ...; jmp L`, tests again at the bottom instead of jumping back to
-/// the test: the `jmp L` becomes `t' = cmp a, b; br t', B, E`, so a pass of
-/// the loop runs one jump fewer. The first test stays where it is. Returns
-/// how many jumps it replaced.
+/// Loop rotation. A loop whose test is at the top, `L: [loads] t = cmp a, b;
+/// br t, B, E; B: ...; jmp L`, tests again at the bottom instead of jumping
+/// back to the test: the `jmp L` becomes a copy of the test, `br t', B, E`,
+/// so a pass of the loop runs one jump fewer. The test may be preceded by up
+/// to three constants or loads, as in `while get(t, i) != 0 && ...`; their
+/// results must be read only inside the test, and the copy gets registers of
+/// its own. The first test stays where it is. Returns how many jumps it
+/// replaced.
 fn iropt_rotate(f: &mut IrFn) -> u64 {
   let n = vec_len(f.ins);
   let nl = f.nlabel;
   if nl > 100000000 || n > 4000000 {
     return 0;
   }
-  // Where each label is, and for a label heading `t = cmp; br t, B, E; B:`
-  // where t is read nowhere else, the position of the compare.
+  // Where each label is, and for a label heading `...; t = cmp; br t, B, E;
+  // B:` where what the test defines is read nowhere else, the position of the
+  // first instruction of the test and how many come before the `br`.
   let mut lpos = vec_new[u64]();
   let mut hdr = vec_new[u64]();
+  let mut hlen = vec_new[u64]();
   let mut l = 0;
   while l < nl {
     vec_push(&mut lpos, IR_NONE);
     vec_push(&mut hdr, IR_NONE);
+    vec_push(&mut hlen, 0);
     l = wrap_add(l, 1);
   }
   let mut i = 0;
@@ -1379,12 +1385,57 @@ fn iropt_rotate(f: &mut IrFn) -> u64 {
   l = 0;
   while l < nl {
     let h = u_at(lpos, l);
-    if h != IR_NONE && wrap_add(h, 3) < n {
-      let c = iropt_at(f, wrap_add(h, 1));
-      let b = iropt_at(f, wrap_add(h, 2));
-      let lb = iropt_at(f, wrap_add(h, 3));
-      if iropt_is_cmp(c.op) && c.d < f.nreg && b.op == IR_BR && b.a == c.d && lb.op == IR_LABEL && lb.a == b.b && b.b != b.c && u_at(nuse, c.d) == 1 && u_at(ndef, c.d) == 1 {
-        ra_set(&mut hdr, l, wrap_add(h, 1));
+    if h != IR_NONE {
+      // The longest run of constants, loads and compares after the label.
+      let mut m = 0;
+      let mut going = true;
+      while going && m < 4 && wrap_add(wrap_add(h, m), 3) < n {
+        let c = iropt_at(f, wrap_add(wrap_add(h, 1), m));
+        if c.op == IR_CONST || c.op == IR_LOAD || iropt_is_cmp(c.op) {
+          m = wrap_add(m, 1);
+        } else {
+          going = false;
+        }
+      }
+      if m > 0 && wrap_add(wrap_add(h, m), 2) < n {
+        let c = iropt_at(f, wrap_add(h, m));
+        let b = iropt_at(f, wrap_add(wrap_add(h, m), 1));
+        let lb = iropt_at(f, wrap_add(wrap_add(h, m), 2));
+        if iropt_is_cmp(c.op) && c.d < f.nreg && b.op == IR_BR && b.a == c.d && lb.op == IR_LABEL && lb.a == b.b && b.b != b.c {
+          // Every register the test defines is written once, and read only by it.
+          let mut reads = vec_new[u64]();
+          let mut k = 0;
+          while k <= m {
+            ra_reads(f, iropt_at(f, wrap_add(wrap_add(h, 1), k)), &mut reads);
+            k = wrap_add(k, 1);
+          }
+          let mut ok = true;
+          k = 0;
+          while k < m {
+            let w = iropt_at(f, wrap_add(wrap_add(h, 1), k));
+            if w.d >= f.nreg || u_at(ndef, w.d) != 1 {
+              ok = false;
+            } else {
+              let mut cnt = 0;
+              let mut j = 0;
+              while j < vec_len(reads) {
+                if vec_get(reads, j) == w.d {
+                  cnt = wrap_add(cnt, 1);
+                }
+                j = wrap_add(j, 1);
+              }
+              if cnt != u_at(nuse, w.d) {
+                ok = false;
+              }
+            }
+            k = wrap_add(k, 1);
+          }
+          vec_free(reads);
+          if ok {
+            ra_set(&mut hdr, l, wrap_add(h, 1));
+            ra_set(&mut hlen, l, m);
+          }
+        }
       }
     }
     l = wrap_add(l, 1);
@@ -1398,11 +1449,37 @@ fn iropt_rotate(f: &mut IrFn) -> u64 {
     if q.op == IR_JMP && q.a < nl {
       let h = u_at(hdr, q.a);
       if h != IR_NONE && h < i {
-        let c = iropt_at(f, h);
-        let b = iropt_at(f, wrap_add(h, 1));
-        let t2 = ir_reg(&mut f);
-        vec_push(&mut out, IrIns { op: c.op, d: t2, a: c.a, b: c.b, c: c.c, ty: c.ty });
-        vec_push(&mut out, IrIns { op: IR_BR, d: b.d, a: t2, b: b.b, c: b.c, ty: b.ty });
+        let m = u_at(hlen, q.a);
+        // The copy: what the test defines gets ndst registers.
+        let mut osrc = vec_new[u64]();
+        let mut ndst = vec_new[u64]();
+        let mut k = 0;
+        while k < m {
+          let c = iropt_at(f, wrap_add(h, k));
+          let mut r = c;
+          if c.op != IR_CONST {
+            let mut j = 0;
+            while j < vec_len(osrc) {
+              if r.a == u_at(osrc, j) {
+                r.a = u_at(ndst, j);
+              }
+              if r.b == u_at(osrc, j) {
+                r.b = u_at(ndst, j);
+              }
+              j = wrap_add(j, 1);
+            }
+          }
+          let t2 = ir_reg(&mut f);
+          vec_push(&mut osrc, c.d);
+          vec_push(&mut ndst, t2);
+          r.d = t2;
+          vec_push(&mut out, r);
+          k = wrap_add(k, 1);
+        }
+        let b = iropt_at(f, wrap_add(h, m));
+        vec_push(&mut out, IrIns { op: IR_BR, d: b.d, a: u_at(ndst, wrap_sub(m, 1)), b: b.b, c: b.c, ty: b.ty });
+        vec_free(osrc);
+        vec_free(ndst);
         done = wrap_add(done, 1);
         rotated = true;
       }
@@ -1414,6 +1491,7 @@ fn iropt_rotate(f: &mut IrFn) -> u64 {
   }
   vec_free(lpos);
   vec_free(hdr);
+  vec_free(hlen);
   vec_free(nuse);
   vec_free(ndef);
   if done == 0 {
