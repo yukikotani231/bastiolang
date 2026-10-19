@@ -2142,7 +2142,10 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       }
       let mut j = 0;
       while j < q.c && j < 4096 {
-        if q.a == IR_NONE {
+        // A value kept in its word of the result area needs no store.
+        let kept = q.a == IR_NONE && ix_in_result(al, u_at(f.args, wrap_add(q.b, j)), wrap_add(retoff / 8, j));
+        if kept {
+        } else if q.a == IR_NONE {
           // A register or a small constant is stored as it is.
           let src = ix_loc(al, u_at(f.args, wrap_add(q.b, j)));
           if src.k == IXK_REG {
@@ -2164,8 +2167,10 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
           w_s(&mut out, x86_rname(rb));
           w_s(&mut out, "), %rax\n\tmov %rax, ");
         }
-        w_num(&mut out, wrap_add(retoff, wrap_mul(8, j)));
-        w_s(&mut out, "(%fp)\n");
+        if !kept {
+          w_num(&mut out, wrap_add(retoff, wrap_mul(8, j)));
+          w_s(&mut out, "(%fp)\n");
+        }
         j = j + 1;
       }
       if i + 1 < n {
@@ -2229,6 +2234,70 @@ fn ix_cmp_zero(out: &mut Vec[u64], al: &IrAlloc, r: u64) {
 }
 
 /// How many instructions read each register.
+/// A value the allocator left in the frame that appears in the results of
+/// more than two words only as one and the same word of them is kept in that
+/// word of the result area (above the saved frame pointer) instead: its store
+/// at the return is then already done. One value per result word; nothing
+/// else lives in the result area, and a value read at no other word is not
+/// overwritten by the stores of another return before its own is skipped.
+/// `rw` is the first result word's distance above %rbp, in words.
+fn ix_result_homes(f: &IrFn, al: &mut IrAlloc, rw: u64) {
+  // For each register: the word it is returned in, plus one (0: none yet),
+  // or a large number when it is returned in two different words.
+  let mut at = vec_new[u64]();
+  let mut r = 0;
+  while r < f.nreg && r < 1000000000 {
+    vec_push(&mut at, 0);
+    r = r + 1;
+  }
+  let mut pk = 0;
+  while pk < vec_len(f.params) {
+    ra_set(&mut at, vec_get(f.params, pk), 1000000);
+    pk = pk + 1;
+  }
+  let mut i = 0;
+  while i < vec_len(f.ins) {
+    let q = vec_get(f.ins, i);
+    if q.op == IR_RET && q.c > 2 && q.a == IR_NONE {
+      let mut j = 0;
+      while j < q.c && j < 4096 {
+        let x = u_at(f.args, wrap_add(q.b, j));
+        let cur = u_at(at, x);
+        if x < f.nreg && cur != 0 && cur != wrap_add(j, 1) {
+          ra_set(&mut at, x, 1000000);
+        } else if x < f.nreg && cur == 0 {
+          ra_set(&mut at, x, wrap_add(j, 1));
+        }
+        j = j + 1;
+      }
+    }
+    i = i + 1;
+  }
+  let mut taken = vec_new[u64]();
+  r = 0;
+  while r < f.nreg && r < 1000000000 {
+    let w = u_at(at, r);
+    if w != 0 && w <= 4096 && u_at(al.cls, r) == RA_SPILL && u_at(al.cst, r) == 0 {
+      while vec_len(taken) <= w {
+        vec_push(&mut taken, 0);
+      }
+      if u_at(taken, w) == 0 {
+        ra_set(&mut taken, w, 1);
+        ra_set(&mut al.idx, r, wrap_sub(0, wrap_add(wrap_add(al.ncallee_used, 1), wrap_add(rw, wrap_sub(w, 1)))));
+      }
+    }
+    r = r + 1;
+  }
+  vec_free(taken);
+  vec_free(at);
+}
+
+/// Is `r` in the frame word `home` words above %rbp?
+fn ix_in_result(al: &IrAlloc, r: u64, home: u64) -> bool {
+  let l = ix_loc(al, r);
+  return l.k == IXK_MEM && l.off == wrap_sub(0, home);
+}
+
 fn ix_uses(f: &IrFn) -> Vec[u64] {
   let mut nuse = vec_new[u64]();
   let mut r = 0;
@@ -3555,6 +3624,12 @@ fn irx_function_n(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, nc
     ix_ins2(&mut inner, "mov", ix_rl(ix_callee(k)), ix_ml(wrap_add(k, 1)));
     k = k + 1;
   }
+  // A result of more than two words is above the parameters left on the stack.
+  let mut retoff = 16;
+  if na == 0 {
+    retoff = wrap_add(16, wrap_mul(8, vec_len(pos)));
+  }
+  ix_result_homes(f, &mut al, retoff / 8);
   // The parameters, from their argument registers or stack words. A
   // parameter the allocator left in the frame stays in the stack word it
   // came in (the callee owns its arguments).
@@ -3585,11 +3660,6 @@ fn irx_function_n(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, nc
       }
     }
     k = k + 1;
-  }
-  // A result of more than two words is above the parameters left on the stack.
-  let mut retoff = 16;
-  if na == 0 {
-    retoff = wrap_add(16, wrap_mul(8, vec_len(pos)));
   }
   ix_body(&mut inner, f, al, &mut g, c, &mut m, p, nuse, moff, base, words, ix_buffer(c, m, p, rt), retoff);
   ix_lbl(&mut inner, x, IR_NONE);
