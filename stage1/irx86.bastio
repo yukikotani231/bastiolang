@@ -3470,15 +3470,200 @@ fn ix_reload(code: &Vec[u64], lo: u64, hi: u64, out: &mut Vec[u64]) {
 
 /// Writes function instance `x` from its IR, to `g.out`. False (nothing
 /// written) when the IR does not cover it or the convention does not match.
+/// The label at the start of the code that a return-at-once stub leaves to
+/// the function proper.
+const IX_SLOW: u64 = 4000000000;
+
+/// An instruction that a return-at-once stub may hold: it computes with
+/// registers only, and its code uses no register but %rax and the
+/// allocatable ones.
+fn ix_stub_op(q: IrIns) -> bool {
+  let op = q.op;
+  return op == IR_CONST || op == IR_MOV || op == IR_ADD || op == IR_SUB || op == IR_AND || op == IR_OR || op == IR_XOR || (op >= IR_EQ && op <= IR_SGE);
+}
+
+/// The position of the label `l` in `f`, or IR_NONE.
+fn ix_label_pos(f: &IrFn, l: u64) -> u64 {
+  let mut i = 0;
+  while i < vec_len(f.ins) {
+    let q = ix_at(f, i);
+    if q.op == IR_LABEL && q.a == l {
+      return i;
+    }
+    i = i + 1;
+  }
+  return IR_NONE;
+}
+
+/// A function that first tests its parameters and, when they pass, returns
+/// a value computed from them at once is entered through a stub: the test and
+/// that return, with no frame and no saved registers, in front of the
+/// function proper. This returns the stub as a function of its own (no
+/// instructions: there is none). Its labels carry a number of their own, so
+/// they cannot clash with the ones of `f`.
+fn ix_fast_entry(f: &IrFn) -> IrFn {
+  let mut s = ir_new(wrap_add(f.x, 2000000000));
+  let n = vec_len(f.ins);
+  let mut i = 0;
+  while i < n && ix_stub_op(ix_at(f, i)) {
+    i = i + 1;
+  }
+  let br = ix_at(f, i);
+  if i >= n || br.op != IR_BR || vec_len(f.params) > 4 || vec_len(f.lent) > 0 {
+    return s;
+  }
+  let mut side = 0;
+  let mut ret = IR_NONE;
+  let mut e = 1;
+  while e <= 2 && side == 0 {
+    let mut l = br.b;
+    if e == 2 {
+      l = br.c;
+    }
+    let lp = ix_label_pos(f, l);
+    if lp != IR_NONE {
+      let mut k = wrap_add(lp, 1);
+      while k < n && ix_stub_op(ix_at(f, k)) {
+        k = k + 1;
+      }
+      let rq = ix_at(f, k);
+      if k < n && rq.op == IR_RET && rq.c == 0 {
+        side = e;
+        ret = k;
+      }
+    }
+    e = e + 1;
+  }
+  if side == 0 {
+    return s;
+  }
+  let mut l = br.b;
+  if side == 2 {
+    l = br.c;
+  }
+  let lp = ix_label_pos(f, l);
+  let lo = f.nlabel;
+  let hi = wrap_add(f.nlabel, 1);
+  let mut k = 0;
+  while k < vec_len(f.params) {
+    vec_push(&mut s.params, vec_get(f.params, k));
+    k = k + 1;
+  }
+  s.nreg = f.nreg;
+  s.nlabel = wrap_add(f.nlabel, 2);
+  k = 0;
+  while k < i {
+    vec_push(&mut s.ins, ix_at(f, k));
+    k = k + 1;
+  }
+  // The exit block is last, so its return needs no jump.
+  if side == 1 {
+    ir_emit(&mut s, IR_BR, IR_NONE, br.a, hi, lo, 0);
+  } else {
+    ir_emit(&mut s, IR_BR, IR_NONE, br.a, lo, hi, 0);
+  }
+  ir_place(&mut s, lo);
+  ir_emit(&mut s, IR_UNREACH, IR_NONE, IR_NONE, IR_NONE, 0, 0);
+  ir_place(&mut s, hi);
+  k = wrap_add(lp, 1);
+  while k <= ret && k < n {
+    vec_push(&mut s.ins, ix_at(f, k));
+    k = k + 1;
+  }
+  return s;
+}
+
+/// Does the code in `v` write one of the registers that hold the arguments
+/// (%rdi, %rsi, %rdx, %rcx)? It is read line by line: the operand after the
+/// last comma, or the only operand, is where an instruction writes.
+fn ix_writes_args(v: &Vec[u64]) -> bool {
+  let n = vec_len(v);
+  let mut i = 0;
+  while i < n {
+    let mut e = i;
+    while e < n && u_at(v, e) != 10 {
+      e = wrap_add(e, 1);
+    }
+    // The operand starts after the last comma, or the first blank, of the line.
+    let mut st = i;
+    let mut k = i;
+    while k < e {
+      let ch = u_at(v, k);
+      if ch == 44 || ch == 32 || ch == 9 {
+        st = wrap_add(k, 1);
+      }
+      k = wrap_add(k, 1);
+    }
+    if st < e && u_at(v, st) == 37 && (ix_has_at(v, st, "%rdi") || ix_has_at(v, st, "%rsi") || ix_has_at(v, st, "%rdx") || ix_has_at(v, st, "%rcx")
+      || ix_has_at(v, st, "%edi") || ix_has_at(v, st, "%esi") || ix_has_at(v, st, "%edx") || ix_has_at(v, st, "%ecx")
+      || ix_has_at(v, st, "%di") || ix_has_at(v, st, "%si") || ix_has_at(v, st, "%dx") || ix_has_at(v, st, "%cx")
+      || ix_has_at(v, st, "%dl") || ix_has_at(v, st, "%cl")) {
+      return true;
+    }
+    i = wrap_add(e, 1);
+  }
+  return false;
+}
+
+/// `s` with each `\tud2` turned into a jump to the function proper of instance `x`.
+fn ix_stub_jumps(v: &Vec[u64], x: u64) -> Vec[u64] {
+  let mut r = vec_new[u64]();
+  let n = vec_len(v);
+  let mut i = 0;
+  while i < n {
+    if ix_has_at(v, i, "\tud2\n") {
+      w_s(&mut r, "\tjmp ");
+      ix_lbl(&mut r, x, IX_SLOW);
+      w_s(&mut r, "\n");
+      i = i + 5;
+    } else {
+      vec_push(&mut r, u_at(v, i));
+      i = i + 1;
+    }
+  }
+  return r;
+}
+
 fn irx_function_n(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, ncallee: u64) -> u64 {
   if g.stage0 {
     return 0;
   }
-  let mut f = ir_lower(c, &mut m, p, x);
+  let f = ir_lower(c, &mut m, p, x);
   if f.failed || vec_len(f.ins) > IX_MAX_INS {
     ir_free(f);
     return 0;
   }
+  let mut stub = vec_new[u64]();
+  if x86_regargs(&mut g, c, &mut m, p, x) > 0 {
+    let s = ix_fast_entry(f);
+    if vec_len(s.ins) > 0 {
+      let mut st = vec_new[u64]();
+      let none = vec_new[u64]();
+      let r = ix_function_core(&mut g, c, &mut m, p, x, ncallee, s, true, none, &mut st);
+      if r == 1 && !ix_writes_args(st) {
+        vec_free(stub);
+        stub = st;
+      } else {
+        vec_free(st);
+      }
+    } else {
+      ir_free(s);
+    }
+  }
+  let mut res = vec_new[u64]();
+  let r = ix_function_core(&mut g, c, &mut m, p, x, ncallee, f, false, stub, &mut res);
+  if r == 1 {
+    w_append(&mut g.out, res);
+  }
+  vec_free(res);
+  return r;
+}
+
+/// The assembly of function `f` (lowered) of instance `x`, appended to
+/// `res`. With `fast` it is a stub (see `ix_fast_entry`) that has no frame
+/// and no header; otherwise `stub` goes in front of the prologue.
+fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, ncallee: u64, fin: IrFn, fast: bool, stub: Vec[u64], res: &mut Vec[u64]) -> u64 {
+  let mut f = fin;
   let looped = iropt_accrec(&mut f) > 0;
   iropt_inline(&mut f, c, &mut m, p, looped);
   iropt_copies(&mut f);
@@ -3585,6 +3770,7 @@ fn irx_function_n(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, nc
   }
   if !ok {
     vec_free(pos);
+    vec_free(stub);
     ir_free(f);
     return 0;
   }
@@ -3613,11 +3799,18 @@ fn irx_function_n(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, nc
   ix_fold_slots(f, &mut al, base);
   let words = wrap_add(base, slots);
   let mut out = vec_new[u64]();
-  w_s(&mut out, "\t.type ");
-  ix_sym(&mut out, &mut g, m, p, x);
-  w_s(&mut out, ", @function\n");
-  ix_sym(&mut out, &mut g, m, p, x);
-  w_s(&mut out, ":                  # from the IR\n");
+  if !fast {
+    w_s(&mut out, "\t.type ");
+    ix_sym(&mut out, &mut g, m, p, x);
+    w_s(&mut out, ", @function\n");
+    ix_sym(&mut out, &mut g, m, p, x);
+    w_s(&mut out, ":                  # from the IR\n");
+    if vec_len(stub) > 0 {
+      w_append(&mut out, stub);
+      ix_lbl(&mut out, x, IX_SLOW);
+      w_s(&mut out, ":\n");
+    }
+  }
   let mut inner = vec_new[u64]();
   k = 0;
   while k < al.ncallee_used {
@@ -3662,7 +3855,7 @@ fn irx_function_n(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, nc
     k = k + 1;
   }
   ix_body(&mut inner, f, al, &mut g, c, &mut m, p, nuse, moff, base, words, ix_buffer(c, m, p, rt), retoff);
-  ix_lbl(&mut inner, x, IR_NONE);
+  ix_lbl(&mut inner, f.x, IR_NONE);
   w_s(&mut inner, ":\n");
   k = 0;
   while k < al.ncallee_used {
@@ -3672,15 +3865,34 @@ fn irx_function_n(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, nc
   // A function with no frame, no calls and no use of the frame pointer
   // needs none of it: no push, no leave.
   let bare = words == 0 && !ix_mentions(inner, "%fp") && !ix_mentions(inner, "%rsp") && !ix_mentions(inner, "call");
-  if bare {
-    w_s(&mut inner, "\tret\n\t.size ");
-  } else {
-    w_s(&mut inner, "\tleave\n\tret\n\t.size ");
+  if fast && !bare {
+    vec_free(inner);
+    vec_free(out);
+    vec_free(nuse);
+    vec_free(moff);
+    vec_free(pos);
+    vec_free(stub);
+    ra_free(al);
+    ir_free(f);
+    return 3;
   }
-  ix_sym(&mut inner, &mut g, m, p, x);
-  w_s(&mut inner, ", .-");
-  ix_sym(&mut inner, &mut g, m, p, x);
-  w_s(&mut inner, "\n\n");
+  if bare {
+    w_s(&mut inner, "\tret\n");
+  } else {
+    w_s(&mut inner, "\tleave\n\tret\n");
+  }
+  if !fast {
+    w_s(&mut inner, "\t.size ");
+    ix_sym(&mut inner, &mut g, m, p, x);
+    w_s(&mut inner, ", .-");
+    ix_sym(&mut inner, &mut g, m, p, x);
+    w_s(&mut inner, "\n\n");
+  }
+  if fast {
+    let jumped = ix_stub_jumps(inner, x);
+    vec_free(inner);
+    inner = jumped;
+  }
   let mut framed = ix_flip_jumps(inner);
   vec_free(inner);
   if !bare {
@@ -3709,6 +3921,7 @@ fn irx_function_n(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, nc
         vec_free(nuse);
         vec_free(moff);
         vec_free(pos);
+        vec_free(stub);
         ra_free(al);
         ir_free(f);
         return 2;
@@ -3722,12 +3935,13 @@ fn irx_function_n(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, nc
     }
   }
   w_append(&mut out, framed);
-  w_append(&mut g.out, out);
+  w_append(&mut res, out);
   vec_free(framed);
   vec_free(out);
   vec_free(nuse);
   vec_free(moff);
   vec_free(pos);
+  vec_free(stub);
   ra_free(al);
   ir_free(f);
   return 1;
