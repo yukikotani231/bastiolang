@@ -803,27 +803,39 @@ fn ir_buf(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, k: u64) -
   return v;
 }
 
-/// The enum value built by variant node `i` of enum instance `x`.
-fn ir_variant(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, x: u64) -> IrVal {
+/// The enum value built by variant node `i` of enum instance `x`. For an
+/// enum the IR keeps in memory, `dest` (a place of that enum, or `ir_none()`
+/// for a frame slot of ours) is where it is built.
+fn ir_variant(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, x: u64, dest: IrVal) -> IrVal {
   let n = node_at(p.nodes, i);
   let t = intern(&mut m, p, TY_ENUM, x);
   let mw = ir_ms(c, m, p, t);
   if mw > 0 {
-    // An enum the IR keeps in memory: the tag, then the payload, in a frame
-    // slot of ours.
-    let slot = ir_reg(&mut f);
-    ir_emit(&mut f, IR_SLOT, slot, 0, 0, mw, 0);
-    let out = IrVal { k: IRK_PLACE, r0: slot, r1: 0, t: base_t(m, t) };
+    // An enum the IR keeps in memory: the tag, then the payload.
+    let mut out = dest;
+    if dest.k != IRK_PLACE {
+      let slot = ir_reg(&mut f);
+      ir_emit(&mut f, IR_SLOT, slot, 0, 0, mw, 0);
+      out = IrVal { k: IRK_PLACE, r0: slot, r1: 0, t: base_t(m, t) };
+    }
     let v = cg_variant(m, p, x, n.s2, n.e2);
+    let mut pv = ir_none();
+    if n.a != 0 {
+      // Read before anything is written: it may be part of `dest`.
+      pv = ir_vexpr(&mut f, c, &mut m, p, n.a);
+    }
     let tag = ir_reg(&mut f);
     ir_emit(&mut f, IR_CONST, tag, v, 0, 0, 0);
-    ir_hdr_store(&mut f, slot, 0, tag);
+    ir_hdr_store(&mut f, out.r0, out.r1, tag);
     if n.a != 0 {
-      let pv = ir_vexpr(&mut f, c, &mut m, p, n.a);
       let ft = fld_ty(c, x, v);
       if !f.failed && ft != 0 {
-        let dst = IrVal { k: IRK_PLACE, r0: slot, r1: 1, t: base_t(m, ft) };
-        ir_store_val(&mut f, c, m, p, dst, pv);
+        let dst = IrVal { k: IRK_PLACE, r0: out.r0, r1: wrap_add(out.r1, 1), t: base_t(m, ft) };
+        // A payload that already sits where it goes (a binding of the
+        // payload of the place being assigned) needs no copy.
+        if !(pv.k == IRK_PLACE && pv.r0 == dst.r0 && pv.r1 == dst.r1) {
+          ir_store_val(&mut f, c, m, p, dst, pv);
+        }
       }
     }
     return out;
@@ -853,6 +865,37 @@ fn ir_variant(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, x: u6
     }
   }
   return out;
+}
+
+/// Builds expression `i`, a variant of the enum of the place `dest`, in
+/// `dest` itself when that enum is kept in memory: no frame slot and no copy
+/// of the finished value. False (nothing emitted) for anything else.
+fn ir_variant_into(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, dest: IrVal) -> bool {
+  if dest.k != IRK_PLACE || ir_ms(c, m, p, dest.t) == 0 || kind_t(m, base_t(m, dest.t)) != TY_ENUM {
+    return false;
+  }
+  let n = node_at(p.nodes, i);
+  let mut x = 0;
+  let mut vn = i;
+  if n.kind == E_VARIANT {
+    let def = find_in(p, p.enums.head, i);
+    let dnode = node_at(p.nodes, def);
+    if def == 0 || dnode.v != 0 {
+      return false;
+    }
+    x = plain_inst(&mut m, def);
+  } else if n.kind == E_TAPP && kind_of(p, n.b) == E_VARIANT {
+    x = tapp_inst(&mut m, p, i, f.x);
+    vn = n.b;
+  }
+  if x == 0 {
+    return false;
+  }
+  if base_t(m, intern(&mut m, p, TY_ENUM, x)) != base_t(m, dest.t) {
+    return false;
+  }
+  ir_variant(&mut f, c, &mut m, p, vn, x, dest);
+  return true;
 }
 
 /// Writes the fields of struct literal `i` into the place `out` (a struct
@@ -1091,7 +1134,7 @@ fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       return ir_none();
     }
     let x = plain_inst(&mut m, def);
-    return ir_variant(&mut f, c, &mut m, p, i, x);
+    return ir_variant(&mut f, c, &mut m, p, i, x, ir_none());
   }
   if k == E_TAPP && kind_of(p, n.b) == E_CALL && !is_typed_builtin(p, n.b) {
     // `f[T](args)`: the instance the monomorphizer made.
@@ -1109,7 +1152,7 @@ fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       ir_fail(&mut f, "a variant of a generic enum");
       return ir_none();
     }
-    return ir_variant(&mut f, c, &mut m, p, n.b, x);
+    return ir_variant(&mut f, c, &mut m, p, n.b, x, ir_none());
   }
   if k == E_IS {
     let e0 = ir_expr(&mut f, c, &mut m, p, n.a);
@@ -4447,6 +4490,9 @@ fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
         }
         ir_emit(&mut f, IR_STORE, v, target.r0, ix, size, 0);
       }
+      return;
+    }
+    if target.k == IRK_PLACE && ir_variant_into(&mut f, c, &mut m, p, n.b, target) {
       return;
     }
     let v = ir_own(&mut f, ir_vexpr(&mut f, c, &mut m, p, n.b));
