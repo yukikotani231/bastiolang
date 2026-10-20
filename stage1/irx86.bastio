@@ -190,6 +190,36 @@ fn ix_use(out: &mut Vec[u64], al: &IrAlloc, r: u64, scratch: u64) -> u64 {
 }
 
 /// `d = <machine register t>`.
+struct IxMagic { ok: bool, m: u64, sh: u64 }
+
+/// The multiplier and shift of an unsigned division by `d` (not a power of
+/// two, below 2^63) without a shift of the dividend first: q = mulhi(n, m) >>
+/// sh, with m = ceil(2^(64 + sh) / d) fitting 64 bits and the error below
+/// 2^sh, which makes it exact for every 64-bit n.
+fn ix_div_magic(d: u64) -> IxMagic {
+  let mut r = IxMagic { ok: false, m: 0, sh: 0 };
+  if d < 3 || d >= 9223372036854775808 || d & wrap_sub(d, 1) == 0 {
+    return r;
+  }
+  let mut sh = 0;
+  let mut p2 = 1;
+  while sh < 63 && p2 < d && !r.ok {
+    let qr = x86_longdiv(p2, d);
+    if qr.r == 0 || qr.q < 18446744073709551615 {
+      let mut ex = 0;
+      if qr.r != 0 {
+        ex = wrap_sub(d, qr.r);
+      }
+      if ex <= p2 {
+        r = IxMagic { ok: true, m: wrap_add(qr.q, x86_ne0(qr.r)), sh: sh };
+      }
+    }
+    sh = sh + 1;
+    p2 = wrap_mul(p2, 2);
+  }
+  return r;
+}
+
 fn ix_finish(out: &mut Vec[u64], al: &IrAlloc, d: u64, t: u64) {
   ix_mov(&mut out, ix_rl(t), ix_loc(al, d));
 }
@@ -1068,6 +1098,7 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
   let op = q.op;
   let alu = ix_alu(op);
   let lbq = ix_loc(al, q.b);
+  let mg = ix_div_magic(lbq.imm);
   if slen(alu) > 0 {
     let ld = ix_loc(al, q.d);
     let mut la = ix_loc(al, q.a);
@@ -1288,6 +1319,19 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     w_s(&mut out, x86_rname(t));
     w_s(&mut out, "\n");
     ix_finish(&mut out, al, q.d, t);
+  } else if op == IR_DIV && lbq.k == IXK_IMM && mg.ok {
+    // A constant divisor without a shift of the dividend first: the quotient
+    // is the high half of the product, shifted, and stays in %rdx.
+    ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RAX));
+    w_s(&mut out, "\tmovabs $");
+    w_num(&mut out, mg.m);
+    w_s(&mut out, ", %rdx\n\tmul %rdx\n");
+    if mg.sh > 0 {
+      w_s(&mut out, "\tshr $");
+      w_num(&mut out, mg.sh);
+      w_s(&mut out, ", %rdx\n");
+    }
+    ix_finish(&mut out, al, q.d, XR_RDX);
   } else if (op == IR_DIV || op == IR_REM) && lbq.k == IXK_IMM && lbq.imm != 0 {
     // A constant divisor: shifts and a multiplication, as the generator
     // of x86.bastio does it (the code is written into its line buffer).
@@ -4635,6 +4679,7 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
     iropt_dce(&mut f);
   }
   iropt_ivs(&mut f);
+  iropt_remdiv(&mut f);
   iropt_ebb(&mut f);
   iropt_copies(&mut f);
   if iropt_xorcancel(&mut f) > 0 {

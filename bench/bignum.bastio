@@ -1,0 +1,69 @@
+// Schoolbook multiplication of two 1024-limb numbers (32-bit limbs held in
+// u64 words), repeated 8 times with the product folded back into an operand;
+// the carry chain is a multiply, a shift and a mask per step. The sum of the
+// product limbs is the checksum.
+const L: u64 = 1024;
+
+fn main() -> u64 {
+  let mut a = alloc(L);
+  let mut b = alloc(L);
+  let mut r = alloc(L + L);
+  let mut s = 12345;
+  let mut i = 0;
+  while i < L
+    invariant i <= L && len(a) == L && len(b) == L && s < 4294967296
+  {
+    s = (s * 1103515245 + 12345) % 4294967296;
+    a = set(a, i, s);
+    s = (s * 1103515245 + 12345) % 4294967296;
+    b = set(b, i, s);
+    i = i + 1;
+  }
+  let mut rep = 0;
+  let mut total = 0;
+  while rep < 8
+    invariant rep <= 8 && len(a) == L && len(b) == L && len(r) == L + L
+  {
+    i = 0;
+    while i < L + L
+      invariant i <= L + L && len(r) == L + L
+    {
+      r = set(r, i, 0);
+      i = i + 1;
+    }
+    i = 0;
+    while i < L
+      invariant i <= L && len(a) == L && len(b) == L && len(r) == L + L
+    {
+      let ai = get(a, i) % 4294967296;
+      let mut carry = 0;
+      let mut j = 0;
+      while j < L
+        invariant j <= L && i < L && carry < 4294967296 && len(b) == L && len(r) == L + L
+      {
+        let cur = get(r, i + j) % 4294967296;
+        let t = ai * (get(b, j) % 4294967296) + cur + carry;
+        r = set(r, i + j, t % 4294967296);
+        carry = t / 4294967296;
+        j = j + 1;
+      }
+      r = set(r, i + L, carry);
+      i = i + 1;
+    }
+    i = 0;
+    while i < L
+      invariant i <= L && len(a) == L && len(r) == L + L
+    {
+      let v = get(r, i) % 4294967296;
+      a = set(a, i, v);
+      total = wrap_add(total, v);
+      i = i + 1;
+    }
+    rep = rep + 1;
+  }
+  print(total);
+  free(a);
+  free(b);
+  free(r);
+  return 0;
+}

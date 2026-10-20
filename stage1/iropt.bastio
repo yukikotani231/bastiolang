@@ -3427,6 +3427,65 @@ fn iropt_jt_edge(f: &IrFn, bl: &Vec[IrBlock], ndef: &Vec[u64], cv: &Vec[u64], re
   return IR_NONE;
 }
 
+/// `a % K` next to an `a / K` of the same register and constant (the digit
+/// loop of a decimal formatter: `v % 10`, then `v = v / 10`) is
+/// `a - (a / K) * K`, so that the value numbering shares the division, which
+/// is a multiplication and shifts by a magic constant, with the other. Only for
+/// a `K` that is not a power of two (those are a mask) and for plain
+/// 64-bit operations. Returns how many it rewrote.
+fn iropt_remdiv(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  if n > 200000 || f.nreg > 100000000 {
+    return 0;
+  }
+  let ndef = iropt_ndef(f);
+  let cv = iropt_consts(f, ndef);
+  let mut out = vec_new[IrIns]();
+  let mut done = 0;
+  let mut i = 0;
+  while i < n {
+    let q = iropt_at(f, i);
+    let mut rewrote = false;
+    if q.op == IR_REM && q.c == 0 && q.ty == 0 && q.d != IR_NONE && q.d < f.nreg && q.a < f.nreg {
+      let k = iropt_cval(cv, q.b);
+      if k != IR_NONE && k >= 3 && k & wrap_sub(k, 1) != 0 {
+        let mut found = false;
+        let mut j = 0;
+        while !found && j < n {
+          let r = iropt_at(f, j);
+          if r.op == IR_DIV && r.a == q.a && r.c == 0 && r.ty == 0 && iropt_cval(cv, r.b) == k {
+            found = true;
+          }
+          j = wrap_add(j, 1);
+        }
+        if found {
+          let qt = f.nreg;
+          let mt = wrap_add(f.nreg, 1);
+          f.nreg = wrap_add(f.nreg, 2);
+          vec_push(&mut out, IrIns { op: IR_DIV, d: qt, a: q.a, b: q.b, c: 0, ty: 0 });
+          vec_push(&mut out, IrIns { op: IR_MUL, d: mt, a: qt, b: q.b, c: 0, ty: 0 });
+          vec_push(&mut out, IrIns { op: IR_SUB, d: q.d, a: q.a, b: mt, c: 0, ty: 0 });
+          rewrote = true;
+          done = wrap_add(done, 1);
+        }
+      }
+    }
+    if !rewrote {
+      vec_push(&mut out, q);
+    }
+    i = wrap_add(i, 1);
+  }
+  vec_free(ndef);
+  vec_free(cv);
+  if done == 0 {
+    vec_free(out);
+    return 0;
+  }
+  vec_free(f.ins);
+  f.ins = out;
+  return done;
+}
+
 /// Common subexpression elimination over the dominator tree. A binary
 /// operation whose operands are registers written once (or constants), and
 /// whose result lands in a register written once, is remembered while the
