@@ -31,6 +31,11 @@ const IRI_ROUNDS: u64 = 3;
 /// caller: it is a few compares after the switch pass, and the call, the
 /// frame and the materialised `bool` cost more.
 const IRI_PRED: u64 = 120;
+/// A body that only reads (calls, loads and arithmetic between constants, and
+/// branches that go forward; no store, other effect or loop) is inlined up to
+/// this size: the getter of one field of a record returns the whole record
+/// through memory, and inlined, only the word the caller reads is loaded.
+const IRI_GET: u64 = 100;
 /// A callee with exactly one call site in the whole program (`iri_count`) is
 /// inlined up to this size, into a caller of fewer than IRI_ONCE_CALLER
 /// instructions: the program gains the call's cost and the body is not copied
@@ -249,6 +254,35 @@ fn iri_predicate(g: &IrFn) -> bool {
   return true;
 }
 
+/// Does `g` only read memory, compute and call, with no loop? (see IRI_GET)
+fn iri_getter(g: &IrFn, x: u64) -> bool {
+  let lp = ra_lpos(g);
+  let mut ok = true;
+  let mut i = 0;
+  while ok && i < vec_len(g.ins) {
+    let t = vec_get(g.ins, i);
+    let op = t.op;
+    if op == IR_JMP {
+      if t.a >= vec_len(lp) || u_at(lp, t.a) <= i {
+        ok = false;
+      }
+    } else if op == IR_BR {
+      if t.b >= vec_len(lp) || t.c >= vec_len(lp) || u_at(lp, t.b) <= i || u_at(lp, t.c) <= i {
+        ok = false;
+      }
+    } else if op == IR_CALL || op == IR_CALLM {
+      if t.a == x {
+        ok = false;
+      }
+    } else if !(op == IR_CONST || op == IR_MOV || op == IR_LABEL || op == IR_RET || op == IR_LOAD || op == IR_NOT || op == IR_NEG || op == IR_WRAP || (ra_is_binary(op) && op != IR_DIV && op != IR_REM && op != IR_SDIV && op != IR_SREM)) {
+      ok = false;
+    }
+    i = i + 1;
+  }
+  vec_free(lp);
+  return ok;
+}
+
 /// Does the body of `g`, the instance `x`, call `x` itself?
 fn iri_recursive(g: &IrFn, x: u64) -> bool {
   let mut i = 0;
@@ -288,6 +322,9 @@ fn iri_round(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, selfok: bool, 
         }
         if limit < IRI_PRED && iri_predicate(g) {
           limit = IRI_PRED;
+        }
+        if limit < IRI_GET && iri_getter(g, q.a) {
+          limit = IRI_GET;
         }
         if once {
           limit = IRI_ONCE;
