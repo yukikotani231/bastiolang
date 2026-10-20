@@ -1907,7 +1907,7 @@ fn ix_load_cmp(f: &IrFn, al: &IrAlloc, nuse: &Vec[u64], i: u64) -> u64 {
 /// Index of the `k`th instruction of a select that starts with the comparison
 /// at `i`: constants that stand as immediates (they write nothing) may lie
 /// between its instructions.
-fn ix_sel_pos(f: &IrFn, al: &IrAlloc, i: u64, k: u64) -> u64 {
+fn ix_sel_pos(f: &IrFn, al: &IrAlloc, nuse: &Vec[u64], i: u64, k: u64) -> u64 {
   let mut p = i;
   let mut t = 0;
   while t < k && t < 8 {
@@ -1924,6 +1924,16 @@ fn ix_sel_pos(f: &IrFn, al: &IrAlloc, i: u64, k: u64) -> u64 {
           skipped = skipped + 1;
           more = true;
         }
+      } else if c.op == IR_MOV && c.d != IR_NONE && c.a != IR_NONE && u_at(nuse, c.d) == 1 {
+        // A copy of an arm, read only by the select: the select reads the
+        // arm itself.
+        let ld = ix_loc(al, c.d);
+        let la = ix_loc(al, c.a);
+        if ld.k == IXK_REG && la.k == IXK_REG {
+          p = wrap_add(p, 1);
+          skipped = skipped + 1;
+          more = true;
+        }
       }
     }
     t = t + 1;
@@ -1931,26 +1941,41 @@ fn ix_sel_pos(f: &IrFn, al: &IrAlloc, i: u64, k: u64) -> u64 {
   return p;
 }
 
+/// `v`, or what the copy of it among the select's instructions copies.
+fn ix_sel_src(f: &IrFn, al: &IrAlloc, nuse: &Vec[u64], i: u64, v: u64) -> u64 {
+  let last = ix_sel_pos(f, al, nuse, i, 4);
+  let mut p = wrap_add(i, 1);
+  let mut r = v;
+  while p < last && p < wrap_add(i, 24) {
+    let c = ix_at(f, p);
+    if c.op == IR_MOV && c.d == v {
+      r = c.a;
+    }
+    p = wrap_add(p, 1);
+  }
+  return r;
+}
+
 /// The arm a select takes when its condition is false: the operand of the
 /// last `xor` that is not the masked difference.
-fn ix_sel_ve(f: &IrFn, al: &IrAlloc, i: u64) -> u64 {
-  let an = ix_at(f, ix_sel_pos(f, al, i, 3));
-  let x2 = ix_at(f, ix_sel_pos(f, al, i, 4));
+fn ix_sel_ve(f: &IrFn, al: &IrAlloc, nuse: &Vec[u64], i: u64) -> u64 {
+  let an = ix_at(f, ix_sel_pos(f, al, nuse, i, 3));
+  let x2 = ix_at(f, ix_sel_pos(f, al, nuse, i, 4));
   if x2.b == an.d {
-    return x2.a;
+    return ix_sel_src(f, al, nuse, i, x2.a);
   }
-  return x2.b;
+  return ix_sel_src(f, al, nuse, i, x2.b);
 }
 
 /// The arm it takes when its condition is true: the other operand of the
 /// first `xor`.
-fn ix_sel_vt(f: &IrFn, al: &IrAlloc, i: u64) -> u64 {
-  let x1 = ix_at(f, ix_sel_pos(f, al, i, 2));
-  let ve = ix_sel_ve(f, al, i);
-  if x1.a == ve {
-    return x1.b;
+fn ix_sel_vt(f: &IrFn, al: &IrAlloc, nuse: &Vec[u64], i: u64) -> u64 {
+  let x1 = ix_at(f, ix_sel_pos(f, al, nuse, i, 2));
+  let ve = ix_sel_ve(f, al, nuse, i);
+  if ix_sel_src(f, al, nuse, i, x1.a) == ve {
+    return ix_sel_src(f, al, nuse, i, x1.b);
   }
-  return x1.a;
+  return ix_sel_src(f, al, nuse, i, x1.a);
 }
 
 /// Whether the unsigned comparison at `i`, its mask (`neg`) and the three
@@ -1960,26 +1985,26 @@ fn ix_sel_vt(f: &IrFn, al: &IrAlloc, i: u64) -> u64 {
 /// shares with the other arm.
 fn ix_cmov_ok(f: &IrFn, al: &IrAlloc, nuse: &Vec[u64], i: u64) -> bool {
   let q = ix_at(f, i);
-  let ng = ix_at(f, ix_sel_pos(f, al, i, 1));
-  let x1 = ix_at(f, ix_sel_pos(f, al, i, 2));
-  let an = ix_at(f, ix_sel_pos(f, al, i, 3));
-  let x2 = ix_at(f, ix_sel_pos(f, al, i, 4));
+  let ng = ix_at(f, ix_sel_pos(f, al, nuse, i, 1));
+  let x1 = ix_at(f, ix_sel_pos(f, al, nuse, i, 2));
+  let an = ix_at(f, ix_sel_pos(f, al, nuse, i, 3));
+  let x2 = ix_at(f, ix_sel_pos(f, al, nuse, i, 4));
   if !(ix_is_cmp(q.op) && ng.op == IR_NEG && ng.a == q.d && u_at(nuse, q.d) == 1) {
     return false;
   }
-  if x1.op != IR_XOR || x1.c != 0 || an.op != IR_AND || an.a != x1.d || an.b != ng.d || x2.op != IR_XOR || (x2.b != an.d && x2.a != an.d) || (ix_sel_ve(f, al, i) != x1.a && ix_sel_ve(f, al, i) != x1.b) {
+  if x1.op != IR_XOR || x1.c != 0 || an.op != IR_AND || !((an.a == x1.d && an.b == ng.d) || (an.a == ng.d && an.b == x1.d)) || x2.op != IR_XOR || (x2.b != an.d && x2.a != an.d) || (ix_sel_ve(f, al, nuse, i) != ix_sel_src(f, al, nuse, i, x1.a) && ix_sel_ve(f, al, nuse, i) != ix_sel_src(f, al, nuse, i, x1.b)) {
     return false;
   }
   if u_at(nuse, ng.d) != 1 || u_at(nuse, x1.d) != 1 || u_at(nuse, an.d) != 1 {
     return false;
   }
   let ld = ix_loc(al, x2.d);
-  let lt = ix_loc(al, ix_sel_vt(f, al, i));
-  let le = ix_loc(al, ix_sel_ve(f, al, i));
+  let lt = ix_loc(al, ix_sel_vt(f, al, nuse, i));
+  let le = ix_loc(al, ix_sel_ve(f, al, nuse, i));
   if ld.k != IXK_REG || (lt.k != IXK_REG && lt.k != IXK_MEM && lt.k != IXK_IMM) {
     return false;
   }
-  if x1.a == x1.b || x2.d == IR_NONE {
+  if ix_sel_src(f, al, nuse, i, x1.a) == ix_sel_src(f, al, nuse, i, x1.b) || x2.d == IR_NONE {
     return false;
   }
   // The result may be the register of the other arm (it is then loaded
@@ -2317,10 +2342,10 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       // then `cmov` on its condition (or on the opposite one when the result
       // already is the register of the arm the condition takes).
       ix_cmp(&mut out, al, q.a, q.b);
-      let x2 = ix_at(f, ix_sel_pos(f, al, i, 4));
+      let x2 = ix_at(f, ix_sel_pos(f, al, nuse, i, 4));
       let ld = ix_loc(al, x2.d);
-      let lt = ix_loc(al, ix_sel_vt(f, al, i));
-      let le = ix_loc(al, ix_sel_ve(f, al, i));
+      let lt = ix_loc(al, ix_sel_vt(f, al, nuse, i));
+      let le = ix_loc(al, ix_sel_ve(f, al, nuse, i));
       if lt.k == IXK_REG && lt.reg == ld.reg {
         let mut src = le;
         if le.k == IXK_IMM {
@@ -2346,7 +2371,7 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       w_s(&mut out, ", ");
       w_s(&mut out, x86_rname(ld.reg));
       w_s(&mut out, "\n");
-      i = ix_sel_pos(f, al, i, 4);
+      i = ix_sel_pos(f, al, nuse, i, 4);
     } else if (q.op == IR_LT || q.op == IR_GT) && nq.op == IR_NEG && nq.a == q.d && u_at(nuse, q.d) == 1 && lnq.k == IXK_REG {
       // The mask of an unsigned comparison (`-(a < b)`, what a select by it
       // wants): the borrow of the comparison spread over a register.
@@ -2360,10 +2385,10 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
         // The select by the mask is a conditional move: `d = ve`, then
         // `d = vt` when the borrow is set (or the other way round when the
         // result already is the register of `vt`).
-        let x2 = ix_at(f, ix_sel_pos(f, al, i, 4));
+        let x2 = ix_at(f, ix_sel_pos(f, al, nuse, i, 4));
         let ld = ix_loc(al, x2.d);
-        let lt = ix_loc(al, ix_sel_vt(f, al, i));
-        let le = ix_loc(al, ix_sel_ve(f, al, i));
+        let lt = ix_loc(al, ix_sel_vt(f, al, nuse, i));
+        let le = ix_loc(al, ix_sel_ve(f, al, nuse, i));
         if lt.k == IXK_REG && lt.reg == ld.reg {
           let mut src = le;
           if le.k == IXK_IMM {
@@ -2385,7 +2410,7 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
         w_s(&mut out, ", ");
         w_s(&mut out, x86_rname(ld.reg));
         w_s(&mut out, "\n");
-        i = ix_sel_pos(f, al, i, 4);
+        i = ix_sel_pos(f, al, nuse, i, 4);
       } else {
         w_s(&mut out, "\tsbb ");
         w_s(&mut out, x86_rname(lm.reg));
