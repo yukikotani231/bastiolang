@@ -1,0 +1,80 @@
+// LSD radix sort of 2^20 pseudo-random 32-bit keys, four passes of eight bits
+// with a 256-entry histogram each, then a checksum of every 4096th key.
+const N: u64 = 1048576;
+
+fn pass(src: &Buf, mut dst: Buf, shift: u64) -> Buf
+  requires len(src) == N && len(dst) == N && shift <= 24
+  ensures len(result) == N
+{
+  let mut cnt = alloc(256);
+  let mut i = 0;
+  while i < N
+    invariant i <= N && len(src) == N && len(dst) == N && len(cnt) == 256
+  {
+    let d = get(src, i) >> shift & 255;
+    cnt = set(cnt, d, wrap_add(get(cnt, d), 1));
+    i = i + 1;
+  }
+  let mut sum = 0;
+  let mut b = 0;
+  while b < 256
+    invariant b <= 256 && len(cnt) == 256
+  {
+    let c = get(cnt, b);
+    cnt = set(cnt, b, sum);
+    sum = wrap_add(sum, c);
+    b = b + 1;
+  }
+  i = 0;
+  while i < N
+    invariant i <= N && len(src) == N && len(dst) == N && len(cnt) == 256
+  {
+    let v = get(src, i);
+    let d = v >> shift & 255;
+    let p = get(cnt, d);
+    cnt = set(cnt, d, wrap_add(p, 1));
+    if p < N {
+      dst = set(dst, p, v);
+    }
+    i = i + 1;
+  }
+  free(cnt);
+  return dst;
+}
+
+fn main() -> u64 {
+  let mut a = alloc(N);
+  let mut b = alloc(N);
+  let mut x = 12345;
+  let mut i = 0;
+  while i < N
+    invariant i <= N && len(a) == N && len(b) == N && x < 4294967296
+  {
+    x = (x * 1103515245 + 12345) % 4294967296;
+    a = set(a, i, x);
+    i = i + 1;
+  }
+  let mut r = 0;
+  while r < 4
+    invariant r <= 4 && len(a) == N && len(b) == N
+  {
+    b = pass(a, b, r * 8);
+    let t = a;
+    a = b;
+    b = t;
+    r = r + 1;
+  }
+  let mut s = 0;
+  i = 0;
+  let mut k = 0;
+  while k < 256
+    invariant k <= 256 && len(a) == N
+  {
+    s = wrap_add(wrap_mul(s, 31), get(a, k * 4096));
+    k = k + 1;
+  }
+  print(s);
+  free(a);
+  free(b);
+  return 0;
+}
