@@ -811,6 +811,53 @@ fn ix_has_at(v: &Vec[u64], i: u64, pat: Str) -> bool {
   return j == m;
 }
 
+/// The `movabs $M, %rdx; mul %rdx` in the code of a division by a constant
+/// (`g.body`), as `mul` of the register that holds the multiplier.
+fn ix_mulreg(g: &mut X86, mval: u64, reg: u64) {
+  let mut pat = vec_new[u64]();
+  w_s(&mut pat, "\tmovabs $");
+  w_num(&mut pat, mval);
+  w_s(&mut pat, ", %rdx\n\tmul %rdx\n");
+  let mut at = IR_NONE;
+  let mut k = 0;
+  while k < vec_len(g.body) && at == IR_NONE && k < 100000 {
+    if ix_has_vec(g.body, k, pat) {
+      at = k;
+    }
+    k = wrap_add(k, 1);
+  }
+  if at != IR_NONE {
+    let mut nb = vec_new[u64]();
+    k = 0;
+    while k < at && k < vec_len(g.body) {
+      vec_push(&mut nb, vec_get(g.body, k));
+      k = wrap_add(k, 1);
+    }
+    w_s(&mut nb, "\tmul ");
+    w_s(&mut nb, x86_rname(reg));
+    w_s(&mut nb, "\n");
+    k = wrap_add(at, vec_len(pat));
+    while k < vec_len(g.body) {
+      vec_push(&mut nb, vec_get(g.body, k));
+      k = wrap_add(k, 1);
+    }
+    x86_clear(&mut g.body);
+    w_append(&mut g.body, nb);
+    vec_free(nb);
+  }
+  vec_free(pat);
+}
+
+/// Does `v` hold the bytes of `pat` at `i`?
+fn ix_has_vec(v: &Vec[u64], i: u64, pat: &Vec[u64]) -> bool {
+  let m = vec_len(pat);
+  let mut j = 0;
+  while j < m && i < 1000000000 && i + j < vec_len(v) && vec_get(v, i + j) == vec_get(pat, j) {
+    j = j + 1;
+  }
+  return j == m;
+}
+
 /// The end of the decimal number at `i` in `v`, and the number in `ix_fpo_val`.
 fn ix_digits_end(v: &Vec[u64], i: u64) -> u64 {
   let mut k = i;
@@ -1393,9 +1440,17 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     // A constant divisor without a shift of the dividend first: the quotient
     // is the high half of the product, shifted, and stays in %rdx.
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RAX));
-    w_s(&mut out, "\tmovabs $");
-    w_num(&mut out, mg.m);
-    w_s(&mut out, ", %rdx\n\tmul %rdx\n");
+    let lm = ix_loc(al, wrap_sub(q.c, 2));
+    if q.c >= 2 && lm.k == IXK_REG {
+      // The multiplier was made in front of the loop.
+      w_s(&mut out, "\tmul ");
+      w_s(&mut out, x86_rname(lm.reg));
+      w_s(&mut out, "\n");
+    } else {
+      w_s(&mut out, "\tmovabs $");
+      w_num(&mut out, mg.m);
+      w_s(&mut out, ", %rdx\n\tmul %rdx\n");
+    }
     if mg.sh > 0 {
       w_s(&mut out, "\tshr $");
       w_num(&mut out, mg.sh);
@@ -1408,6 +1463,12 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RAX));
     x86_clear(&mut g.body);
     x86_div_const(&mut g, lbq.imm, op == IR_REM);
+    if q.c >= 2 {
+      let lm = ix_loc(al, wrap_sub(q.c, 2));
+      if lm.k == IXK_REG {
+        ix_mulreg(&mut g, u_at(al.cv, wrap_sub(q.c, 2)), lm.reg);
+      }
+    }
     // A remainder ends with its result in %rsi moved to %rax: take it from
     // %rsi directly.
     let tail = "\tmov %rsi, %rax\n";
@@ -4199,6 +4260,194 @@ fn ix_sinkld(f: &mut IrFn) -> u64 {
   return done;
 }
 
+/// The multiplier that the division by the constant `k` loads into %rdx
+/// (`movabs $M, %rdx; mul %rdx`), 0 if its code has no such pair.
+fn ix_divm(g: &mut X86, k: u64, rem: bool) -> u64 {
+  x86_clear(&mut g.body);
+  x86_div_const(&mut g, k, rem);
+  let mut m = 0;
+  let mut found = 0;
+  let mut i = 0;
+  while i < vec_len(g.body) && i < 100000 {
+    if ix_has_at(g.body, i, "\tmovabs $") {
+      let mut e = wrap_add(i, 9);
+      let mut x = 0;
+      while e < vec_len(g.body) && e < wrap_add(i, 29) && vec_get(g.body, e) >= 48 && vec_get(g.body, e) <= 57 {
+        x = wrap_add(wrap_mul(x, 10), wrap_sub(vec_get(g.body, e), 48));
+        e = wrap_add(e, 1);
+      }
+      if e > wrap_add(i, 9) && ix_has_at(g.body, e, ", %rdx\n\tmul %rdx\n") {
+        m = x;
+        found = wrap_add(found, 1);
+      }
+    }
+    i = wrap_add(i, 1);
+  }
+  x86_clear(&mut g.body);
+  if found != 1 {
+    return 0;
+  }
+  return m;
+}
+
+/// A division by a constant inside a loop loads its multiplier on every pass
+/// (`movabs`); the multiplier is made once in front of the loop instead, a
+/// register of its own that the loop reads, and the division records it in
+/// its `c` (the register plus two). The loop is the innermost one around the
+/// division whose header is reached only by falling in and by its back edges.
+fn ix_divhoist(f: &mut IrFn, g: &mut X86) -> u64 {
+  let n = vec_len(f.ins);
+  let ndef = iropt_ndef(f);
+  let mut kv = vec_new[u64]();
+  let mut r = 0;
+  while r < f.nreg && r < 1000000000 {
+    vec_push(&mut kv, IR_NONE);
+    r = wrap_add(r, 1);
+  }
+  let mut lpos = vec_new[u64]();
+  let mut fref = vec_new[u64]();
+  let mut lref = vec_new[u64]();
+  let mut l = 0;
+  while l < f.nlabel && l < 1000000000 {
+    vec_push(&mut lpos, IR_NONE);
+    vec_push(&mut fref, IR_NONE);
+    vec_push(&mut lref, 0);
+    l = wrap_add(l, 1);
+  }
+  let mut i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    if q.op == IR_CONST && q.d < vec_len(ndef) && u_at(ndef, q.d) == 1 {
+      ra_set(&mut kv, q.d, q.a);
+    } else if q.op == IR_LABEL && q.a < vec_len(lpos) {
+      ra_set(&mut lpos, q.a, i);
+    } else if q.op == IR_JMP && q.a < vec_len(lpos) {
+      if u_at(fref, q.a) == IR_NONE {
+        ra_set(&mut fref, q.a, i);
+      }
+      ra_set(&mut lref, q.a, i);
+    } else if q.op == IR_BR && q.b < vec_len(lpos) && q.c < vec_len(lpos) {
+      if u_at(fref, q.b) == IR_NONE {
+        ra_set(&mut fref, q.b, i);
+      }
+      ra_set(&mut lref, q.b, i);
+      if u_at(fref, q.c) == IR_NONE {
+        ra_set(&mut fref, q.c, i);
+      }
+      ra_set(&mut lref, q.c, i);
+    }
+    i = wrap_add(i, 1);
+  }
+  // The registers made in front of a label: (label position, multiplier).
+  let mut hp = vec_new[u64]();
+  let mut hm = vec_new[u64]();
+  let mut hr = vec_new[u64]();
+  let mut dreg = vec_new[u64]();
+  i = 0;
+  while i < n {
+    vec_push(&mut dreg, 0);
+    i = wrap_add(i, 1);
+  }
+  let mut done = 0;
+  i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    if (q.op == IR_DIV || q.op == IR_REM) && q.c == 0 && q.b < vec_len(kv) && u_at(kv, q.b) != IR_NONE && u_at(kv, q.b) > 2 {
+      // The innermost loop around position i.
+      let mut best = IR_NONE;
+      let mut lb = 0;
+      while lb < vec_len(lpos) {
+        let lp = u_at(lpos, lb);
+        if lp != IR_NONE && lp < i && u_at(lref, lb) > i && u_at(fref, lb) != IR_NONE && u_at(fref, lb) > lp && (best == IR_NONE || lp > best) {
+          // Single entry: no jump from outside the loop lands inside it.
+          let hi = u_at(lref, lb);
+          let mut ok = true;
+          let mut j = 0;
+          while j < n && ok {
+            if j < lp || j > hi {
+              let t = vec_get(f.ins, j);
+              if t.op == IR_JMP && t.a < vec_len(lpos) && u_at(lpos, t.a) != IR_NONE && u_at(lpos, t.a) > lp && u_at(lpos, t.a) <= hi {
+                ok = false;
+              }
+              if t.op == IR_BR && t.b < vec_len(lpos) && t.c < vec_len(lpos) {
+                if (u_at(lpos, t.b) != IR_NONE && u_at(lpos, t.b) > lp && u_at(lpos, t.b) <= hi) || (u_at(lpos, t.c) != IR_NONE && u_at(lpos, t.c) > lp && u_at(lpos, t.c) <= hi) {
+                  ok = false;
+                }
+              }
+            }
+            j = wrap_add(j, 1);
+          }
+          if ok {
+            best = lp;
+          }
+        }
+        lb = wrap_add(lb, 1);
+      }
+      if best != IR_NONE {
+        // The multiplier the emitter would load: that of the shift-free form
+        // for a division it has one for, else the one in the generated code.
+        let mg = ix_div_magic(u_at(kv, q.b));
+        let mut mm = 0;
+        if q.op == IR_DIV && mg.ok {
+          mm = mg.m;
+        } else {
+          mm = ix_divm(&mut g, u_at(kv, q.b), q.op == IR_REM);
+        }
+        if mm >= 2147483648 {
+          let mut h = 0;
+          let mut at = IR_NONE;
+          while h < vec_len(hp) {
+            if u_at(hp, h) == best && u_at(hm, h) == mm {
+              at = h;
+            }
+            h = wrap_add(h, 1);
+          }
+          if at == IR_NONE {
+            at = vec_len(hp);
+            vec_push(&mut hp, best);
+            vec_push(&mut hm, mm);
+            vec_push(&mut hr, ir_reg(&mut f));
+          }
+          ra_set(&mut dreg, i, wrap_add(u_at(hr, at), 2));
+          done = wrap_add(done, 1);
+        }
+      }
+    }
+    i = wrap_add(i, 1);
+  }
+  if done > 0 {
+    let mut out = vec_new[IrIns]();
+    i = 0;
+    while i < n {
+      let mut h = 0;
+      while h < vec_len(hp) {
+        if u_at(hp, h) == i {
+          vec_push(&mut out, IrIns { op: IR_CONST, d: u_at(hr, h), a: u_at(hm, h), b: 0, c: 0, ty: 0 });
+        }
+        h = wrap_add(h, 1);
+      }
+      let mut q = vec_get(f.ins, i);
+      if u_at(dreg, i) != 0 {
+        q.c = u_at(dreg, i);
+      }
+      vec_push(&mut out, q);
+      i = wrap_add(i, 1);
+    }
+    vec_free(f.ins);
+    f.ins = out;
+  }
+  vec_free(ndef);
+  vec_free(kv);
+  vec_free(lpos);
+  vec_free(fref);
+  vec_free(lref);
+  vec_free(hp);
+  vec_free(hm);
+  vec_free(hr);
+  vec_free(dreg);
+  return done;
+}
+
 /// `y = op s, b; ...; s = op2 y, c` (or `op2 c, y`), where `y` is written and
 /// read only there, `b` and `c` are not `s`, and nothing between the two
 /// reads or writes `s`, becomes `s = op s, b; ...; s = op2 s, c`: the old
@@ -5186,6 +5435,7 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
   ix_fwd(&mut f);
   ix_arms(&mut f);
   iropt_coldarm(&mut f);
+  ix_divhoist(&mut f, &mut g);
   let xi = inst_at(m, x);
   let pos = ix_positions(&mut g, c, &mut m, p, x);
   let mut ok = vec_len(pos) == vec_len(f.params);
