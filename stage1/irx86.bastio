@@ -1968,6 +1968,140 @@ fn ix_load_alu(f: &IrFn, al: &IrAlloc, m: &Mono, nuse: &Vec[u64], i: u64) -> boo
   return ld.k == IXK_REG && lx.k == IXK_REG && lx.reg == ld.reg;
 }
 
+struct IxRot { j: u64, x: u64, d: u64, k: u64 }
+
+/// Whether the shift at `i` starts `d = wrap32(x << k) | (x >> (32 - k))` of
+/// an `x` below 2^32 (the shifts and the `wrap` in either order, with only
+/// constants that stand as immediates between them, and the three results
+/// read once): a rotation of a 32-bit word. `j` is the position of the `or`
+/// (0: not such a sequence), `k` the left rotation.
+fn ix_rot32(f: &IrFn, al: &IrAlloc, m: &Mono, ub: &Vec[u64], nuse: &Vec[u64], i: u64) -> IxRot {
+  let none = IxRot { j: 0, x: 0, d: 0, k: 0 };
+  let q = ix_at(f, i);
+  if (q.op != IR_SHL && q.op != IR_SHR) || q.a >= vec_len(ub) || q.d >= vec_len(nuse) || u_at(ub, q.a) > 4294967295 || u_at(nuse, q.d) != 1 {
+    return none;
+  }
+  let l1 = ix_loc(al, q.b);
+  if l1.k != IXK_IMM || l1.imm < 1 || l1.imm > 31 || q.d == q.a {
+    return none;
+  }
+  let mut wp = IR_NONE;
+  let mut other = IR_NONE;
+  let mut orp = IR_NONE;
+  let mut p = wrap_add(i, 1);
+  let mut going = true;
+  while going && p < vec_len(f.ins) && p < wrap_add(i, 8) {
+    let t = ix_at(f, p);
+    let mut imm_const = false;
+    if t.op == IR_CONST {
+      let lc = ix_loc(al, t.d);
+      imm_const = lc.k == IXK_IMM;
+    }
+    if imm_const {
+      p = wrap_add(p, 1);
+    } else if t.op == IR_WRAP && wp == IR_NONE && kind_t(m, t.ty) == TY_U32 && t.d < vec_len(nuse) && u_at(nuse, t.d) == 1 && t.d != q.a {
+      wp = p;
+      p = wrap_add(p, 1);
+    } else if (t.op == IR_SHL || t.op == IR_SHR) && t.op != q.op && other == IR_NONE && t.a == q.a && t.d != q.a && t.d < vec_len(nuse) && u_at(nuse, t.d) == 1 {
+      let l2 = ix_loc(al, t.b);
+      if l2.k != IXK_IMM || wrap_add(l1.imm, l2.imm) != 32 {
+        return none;
+      }
+      other = p;
+      p = wrap_add(p, 1);
+    } else if t.op == IR_OR && wp != IR_NONE && other != IR_NONE {
+      orp = p;
+      going = false;
+    } else {
+      return none;
+    }
+  }
+  if orp == IR_NONE {
+    return none;
+  }
+  let mut shl = q;
+  let mut shr = ix_at(f, other);
+  if q.op == IR_SHR {
+    shr = q;
+    shl = ix_at(f, other);
+  }
+  let w = ix_at(f, wp);
+  let o = ix_at(f, orp);
+  if w.a != shl.d || !((o.a == w.d && o.b == shr.d) || (o.b == w.d && o.a == shr.d)) || o.c != 0 || o.d == IR_NONE {
+    return none;
+  }
+  // The wrap must follow its shift, and the temporaries must not be the word.
+  let mut shl_pos = i;
+  if q.op == IR_SHR {
+    shl_pos = other;
+  }
+  if wp < shl_pos || w.d == q.a || shl.d == w.d {
+    return none;
+  }
+  let ld = ix_loc(al, o.d);
+  let lx = ix_loc(al, q.a);
+  if ld.k != IXK_REG || lx.k != IXK_REG {
+    return none;
+  }
+  let lk = ix_loc(al, shl.b);
+  return IxRot { j: orp, x: q.a, d: o.d, k: lk.imm };
+}
+
+fn ix_rot32j(f: &IrFn, al: &IrAlloc, m: &Mono, ub: &Vec[u64], nuse: &Vec[u64], i: u64) -> u64 {
+  let r = ix_rot32(f, al, m, ub, nuse, i);
+  return r.j;
+}
+
+/// Whether the `xor`, `or` or `and` at `i` makes the word that the rotation
+/// right after it (`ix_rot32`) turns, into the register of its other operand,
+/// which the rotation then overwrites: `v8 = xor v3, v0; v3 = rotl(v8, k)` is
+/// `xorl v0, v3; roll k, v3`. `j` is the position of the rotation's last
+/// instruction (0: no such pair).
+fn ix_rotprod(f: &IrFn, al: &IrAlloc, m: &Mono, ub: &Vec[u64], nuse: &Vec[u64], i: u64) -> IxRot {
+  let none = IxRot { j: 0, x: 0, d: 0, k: 0 };
+  let q = ix_at(f, i);
+  if (q.op != IR_XOR && q.op != IR_OR && q.op != IR_AND) || q.d == IR_NONE || q.d >= vec_len(nuse) || u_at(nuse, q.d) != 2 || q.a == q.b {
+    return none;
+  }
+  let mut k = wrap_add(i, 1);
+  let mut nq = ix_at(f, k);
+  let mut skipped = 0;
+  while nq.op == IR_CONST && skipped < 4 {
+    let lc = ix_loc(al, nq.d);
+    if lc.k != IXK_IMM {
+      return none;
+    }
+    k = wrap_add(k, 1);
+    skipped = skipped + 1;
+    nq = ix_at(f, k);
+  }
+  if nq.a != q.d {
+    return none;
+  }
+  let rt = ix_rot32(f, al, m, ub, nuse, k);
+  if rt.j == 0 || rt.x != q.d || (rt.d != q.a && rt.d != q.b) {
+    return none;
+  }
+  let ld = ix_loc(al, rt.d);
+  let mut other = q.b;
+  if rt.d == q.b {
+    other = q.a;
+  }
+  let lo = ix_loc(al, other);
+  if lo.k == IXK_REG && lo.reg == ld.reg {
+    return none;
+  }
+  if lo.k != IXK_REG && !(lo.k == IXK_IMM && ix_fits(lo.imm)) {
+    return none;
+  }
+  return rt;
+}
+
+fn ix_rotprodj(f: &IrFn, al: &IrAlloc, m: &Mono, ub: &Vec[u64], nuse: &Vec[u64], i: u64) -> u64 {
+  let r = ix_rotprod(f, al, m, ub, nuse, i);
+  return r.j;
+}
+
 /// Whether the load at `i` is read only by a comparison with a constant that
 /// stands as an immediate (constants that cost nothing may stand between)
 /// and then the branch on it, or directly by the branch: the index of that
@@ -2349,7 +2483,7 @@ fn ix_smp(out: &mut Vec[u64], g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser
 }
 
 /// The body of the function: its instructions.
-fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, nuse: &Vec[u64], moff: &Vec[u64], base: u64, words: u64, rswap: bool, retoff: u64) {
+fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, nuse: &Vec[u64], ub: &Vec[u64], moff: &Vec[u64], base: u64, words: u64, rswap: bool, retoff: u64) {
   let n = vec_len(f.ins);
   // The position after each label (0: no such label).
   let mut lpos = vec_new[u64]();
@@ -2524,6 +2658,49 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
     } else if q.op == IR_BR {
       ix_cmp_zero(&mut out, al, q.a);
       ix_br_flags(&mut out, f.x, IR_NE, q.b, q.c, ix_pick_next(f, i + 1, q.b, q.c));
+    } else if (q.op == IR_XOR || q.op == IR_OR || q.op == IR_AND) && ix_rotprodj(f, al, m, ub, nuse, i) != 0 {
+      // The word of a rotation made in the register the rotation overwrites.
+      let rt = ix_rotprod(f, al, m, ub, nuse, i);
+      let ldr = ix_loc(al, rt.d);
+      let mut other = q.b;
+      if rt.d == q.b {
+        other = q.a;
+      }
+      let lor = ix_loc(al, other);
+      w_s(&mut out, "\t");
+      w_s(&mut out, ix_alu(q.op));
+      w_s(&mut out, "l ");
+      if lor.k == IXK_IMM {
+        ix_w_imm(&mut out, lor.imm);
+      } else {
+        w_s(&mut out, ix_name32(lor.reg));
+      }
+      w_s(&mut out, ", ");
+      w_s(&mut out, ix_name32(ldr.reg));
+      w_s(&mut out, "\n\troll $");
+      w_num(&mut out, rt.k);
+      w_s(&mut out, ", ");
+      w_s(&mut out, ix_name32(ldr.reg));
+      w_s(&mut out, "\n");
+      i = rt.j;
+    } else if (q.op == IR_SHL || q.op == IR_SHR) && ix_rot32j(f, al, m, ub, nuse, i) != 0 {
+      // A rotation of a 32-bit word: `roll`.
+      let rt = ix_rot32(f, al, m, ub, nuse, i);
+      let ldr = ix_loc(al, rt.d);
+      let lxr = ix_loc(al, rt.x);
+      if lxr.reg != ldr.reg {
+        w_s(&mut out, "\tmovl ");
+        w_s(&mut out, ix_name32(lxr.reg));
+        w_s(&mut out, ", ");
+        w_s(&mut out, ix_name32(ldr.reg));
+        w_s(&mut out, "\n");
+      }
+      w_s(&mut out, "\troll $");
+      w_num(&mut out, rt.k);
+      w_s(&mut out, ", ");
+      w_s(&mut out, ix_name32(ldr.reg));
+      w_s(&mut out, "\n");
+      i = rt.j;
     } else if q.op == IR_LOAD && ix_rmw(f, al, m, nuse, i) != 0 {
       // `t = load p[k]; u = t op x; store p[k], u`: one instruction on memory.
       let j = ix_rmw(f, al, m, nuse, i);
@@ -4794,7 +4971,33 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
     }
     k = k + 1;
   }
-  ix_body(&mut inner, f, al, &mut g, c, &mut m, p, nuse, moff, base, words, ix_buffer(c, m, p, rt), retoff);
+  let ndef_b = iropt_ndef(f);
+  let cv_b = iropt_consts(f, ndef_b);
+  let mut conv_b = false;
+  let mut wb_b = vec_new[u64]();
+  let mut wi = 0;
+  while wi < vec_len(f.ins) {
+    let wq = vec_get(f.ins, wi);
+    let mut bits = 0;
+    if wq.ty != 0 && (wq.op == IR_WRAP || (wq.c == 1 && (wq.op == IR_ADD || wq.op == IR_SUB || wq.op == IR_MUL))) {
+      let kt = kind_t(m, wq.ty);
+      if kt == TY_U32 {
+        bits = 32;
+      } else if kt == TY_U16 {
+        bits = 16;
+      } else if kt == TY_U8 {
+        bits = 8;
+      }
+    }
+    vec_push(&mut wb_b, bits);
+    wi = wi + 1;
+  }
+  let ub_b = iropt_ub_all(f, ndef_b, cv_b, wb_b, &mut conv_b);
+  vec_free(wb_b);
+  ix_body(&mut inner, f, al, &mut g, c, &mut m, p, nuse, ub_b, moff, base, words, ix_buffer(c, m, p, rt), retoff);
+  vec_free(ndef_b);
+  vec_free(cv_b);
+  vec_free(ub_b);
   ix_lbl(&mut inner, f.x, IR_NONE);
   w_s(&mut inner, ":\n");
   // The allocator counted a callee-saved register that no instruction ended
