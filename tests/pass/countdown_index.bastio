@@ -1,0 +1,107 @@
+// expect-exit: 0
+// expect-stdout: 67
+// expect-stdout: 7002084549521343256
+// expect-stdout: 0
+// expect-stdout: 15
+// expect-stdout: 20362
+// expect-stdout: 10137760696691381782
+// An index made from a loop counter that counts down (`a[j * 3 + 1]`,
+// `a[(j - 1) * 3]`), a copy shifted one record up as an insertion sort does,
+// and the exits of such loops: at zero, at an early break, and with the counter
+// written by the body.
+struct R { key: u64, val: u64 }
+
+fn key_at(rs: &Vec[R], j: u64) -> u64
+  requires vlen(rs) == 16 && j < 16
+{
+  let r = vec_get(rs, j);
+  return r.key;
+}
+
+fn shift(rs: &mut Vec[R], i: u64) -> u64
+  requires vlen(rs) == 16 && i < 16
+{
+  let cur = vec_get(rs, i);
+  let mut j = i;
+  while j > 0 && key_at(rs, j - 1) > cur.key
+    invariant j <= i && i < 16 && vlen(rs) == 16
+  {
+    let prev = vec_get(rs, j - 1);
+    vec_set(&mut rs, j, prev);
+    j = j - 1;
+  }
+  vec_set(&mut rs, j, cur);
+  return j;
+}
+
+fn weights(n: u64) -> u64
+  requires n <= 100
+{
+  let mut a = vec_new[u64]();
+  let mut i = 0;
+  while i < 301
+    invariant i <= 301 && vlen(a) == i
+  {
+    vec_push(&mut a, i * 7 % 13);
+    i = i + 1;
+  }
+  let mut j = n;
+  let mut t = 0;
+  while j > 0
+    invariant j <= n && n <= 100 && vlen(a) == 301
+  {
+    t = wrap_add(wrap_mul(t, 31), wrap_add(vec_get(a, j * 3), vec_get(a, (j - 1) * 3 + 1)));
+    j = j - 1;
+  }
+  let mut k = n;
+  while k > 2
+    invariant k <= n && n <= 100 && vlen(a) == 301
+  {
+    t = wrap_add(t, vec_get(a, k * 3));
+    if vec_get(a, k) == 5 {
+      k = k - 2;
+    } else {
+      k = k - 1;
+    }
+  }
+  vec_free(a);
+  return t;
+}
+
+fn main() -> u64 {
+  let mut rs = vec_new[R]();
+  let mut s = 7;
+  let mut i = 0;
+  while i < 16
+    invariant i <= 16 && vlen(rs) == i && s < 4294967296
+  {
+    s = (s * 1103515245 + 12345) % 4294967296;
+    vec_push(&mut rs, R { key: s / 16 % 100, val: i });
+    i = i + 1;
+  }
+  let mut moved = 0;
+  i = 1;
+  while i < 16
+    invariant i <= 16 && vlen(rs) == 16
+  {
+    moved = wrap_add(moved, shift(&mut rs, i));
+    i = i + 1;
+  }
+  let mut sum = 0;
+  i = 0;
+  while i < 16
+    invariant i <= 16 && vlen(rs) == 16
+  {
+    let r = vec_get(rs, i);
+    sum = wrap_add(wrap_mul(sum, 31), wrap_add(wrap_mul(r.key, 16), r.val));
+    i = i + 1;
+  }
+  print(moved);
+  print(sum);
+  print(weights(0));
+  print(weights(1));
+  print(weights(3));
+  print(weights(100));
+  vec_free(rs);
+  return 0;
+}
