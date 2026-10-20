@@ -1938,17 +1938,17 @@ fn ix_scale_fuse(f: &IrFn, al: &IrAlloc, m: &Mono, nuse: &Vec[u64], i: u64) -> u
 }
 
 /// Whether the 8-byte load at `i` is read only by the next instruction, an
-/// `add`, `sub`, `and`, `or` or `xor` (no wrapping) that puts the result in the
+/// `add`, `sub`, `and`, `or` or `xor` (without a normalising wrap) that puts the result in the
 /// register that already holds its other operand: the operation reads memory
 /// (`add (%rbx,%r11,8), %r10`), no register is loaded. A `sub` must take the
 /// loaded value as its second operand.
-fn ix_load_alu(f: &IrFn, al: &IrAlloc, nuse: &Vec[u64], i: u64) -> bool {
+fn ix_load_alu(f: &IrFn, al: &IrAlloc, m: &Mono, nuse: &Vec[u64], i: u64) -> bool {
   let q = ix_at(f, i);
   if q.c != 8 || u_at(nuse, q.d) != 1 {
     return false;
   }
   let nq = ix_at(f, wrap_add(i, 1));
-  if slen(ix_alu(nq.op)) == 0 || nq.op == IR_MUL || nq.c != 0 || nq.a == nq.b {
+  if slen(ix_alu(nq.op)) == 0 || nq.op == IR_MUL || ix_wraps(m, nq) || nq.a == nq.b {
     return false;
   }
   let mut x = nq.a;
@@ -2606,7 +2606,7 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       ix_ins2(&mut out, "test", mask, la);
       ix_br_flags(&mut out, f.x, cm.op, br.b, br.c, ix_pick_next(f, wrap_add(j, 2), br.b, br.c));
       i = wrap_add(j, 1);
-    } else if q.op == IR_LOAD && ix_load_alu(f, al, nuse, i) {
+    } else if q.op == IR_LOAD && ix_load_alu(f, al, m, nuse, i) {
       let ld = ix_loc(al, nq.d);
       let ap = ix_aprep(&mut out, al, q.a, q.b, q.ty);
       w_s(&mut out, "\t");
@@ -4708,6 +4708,16 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
     ra_free(al);
     al = ra_alloc_const_wide(f, ncallee, 4);
   }
+  // A retry with fewer registers (see below) that spills more than the
+  // attempt before it is not worth the saves it avoids.
+  g.rspill = al.nspill;
+  if al.nspill > g.rlimit {
+    vec_free(pos);
+    vec_free(stub);
+    ra_free(al);
+    ir_free(f);
+    return 15;
+  }
   let nuse = ix_uses(f);
   // The frame: saved registers, spills, slots.
   let mut moff = vec_new[u64]();
@@ -4791,7 +4801,7 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
   // up using: allocate again with one register fewer, so the function does
   // not save and restore it.
   let top = wrap_sub(al.ncallee_used, 1);
-  if !fast && top >= 1 && top <= 4 && !ix_mentions_from(inner, save_end, x86_rname(ix_callee(top))) {
+  if !fast && !g.rkeep && top >= 1 && top <= 4 && !ix_mentions_from(inner, save_end, x86_rname(ix_callee(top))) {
     vec_free(inner);
     vec_free(out);
     vec_free(nuse);
@@ -4892,22 +4902,38 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
   return 1;
 }
 
+/// `irx_function_n`, again with the register that ended up unused taken out
+/// of the pool, while that does not make it spill more.
+fn irx_shrink(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, n0: u64) -> u64 {
+  g.rlimit = 1000000000;
+  g.rkeep = false;
+  let mut n = n0;
+  let mut r = irx_function_n(&mut g, c, &mut m, p, x, n);
+  let mut tries = 0;
+  while r >= 11 && r <= 14 && tries < 6 {
+    let prev = n;
+    n = r - 10;
+    g.rlimit = g.rspill;
+    r = irx_function_n(&mut g, c, &mut m, p, x, n);
+    if r == 15 {
+      g.rlimit = 1000000000;
+      g.rkeep = true;
+      r = irx_function_n(&mut g, c, &mut m, p, x, prev);
+      g.rkeep = false;
+      return r;
+    }
+    tries = tries + 1;
+  }
+  g.rlimit = 1000000000;
+  return r;
+}
+
 /// `irx_function_n` with %rbp among the registers, and without it when the
 /// frame cannot be addressed from %rsp.
 fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> bool {
-  let mut r = irx_function_n(&mut g, c, &mut m, p, x, 6);
-  let mut tries = 0;
-  while r >= 11 && r <= 14 && tries < 6 {
-    r = irx_function_n(&mut g, c, &mut m, p, x, r - 10);
-    tries = tries + 1;
-  }
+  let mut r = irx_shrink(&mut g, c, &mut m, p, x, 6);
   if r == 2 {
-    r = irx_function_n(&mut g, c, &mut m, p, x, 5);
-    tries = 0;
-    while r >= 11 && r <= 14 && tries < 6 {
-      r = irx_function_n(&mut g, c, &mut m, p, x, r - 10);
-      tries = tries + 1;
-    }
+    r = irx_shrink(&mut g, c, &mut m, p, x, 5);
   }
   return r == 1;
 }
