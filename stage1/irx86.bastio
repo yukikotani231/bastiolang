@@ -2114,6 +2114,7 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
     ctx = false;
     let q = vec_get(f.ins, i);
     let nq = ix_at(f, i + 1);
+    let lnq = ix_loc(al, nq.d);
     if q.op == IR_LABEL {
       if u_at(heads, q.a) == 1 {
         w_s(&mut out, "\t.p2align 4\n");
@@ -2223,6 +2224,21 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       ix_awrite(&mut out, ap, 8);
       w_s(&mut out, ", ");
       w_s(&mut out, x86_rname(ld.reg));
+      w_s(&mut out, "\n");
+      i = i + 1;
+    } else if (q.op == IR_LT || q.op == IR_GT) && nq.op == IR_NEG && nq.a == q.d && u_at(nuse, q.d) == 1 && lnq.k == IXK_REG {
+      // The mask of an unsigned comparison (`-(a < b)`, what a select by it
+      // wants): the borrow of the comparison spread over a register.
+      let lm = ix_loc(al, nq.d);
+      if q.op == IR_LT {
+        ix_cmp(&mut out, al, q.a, q.b);
+      } else {
+        ix_cmp(&mut out, al, q.b, q.a);
+      }
+      w_s(&mut out, "\tsbb ");
+      w_s(&mut out, x86_rname(lm.reg));
+      w_s(&mut out, ", ");
+      w_s(&mut out, x86_rname(lm.reg));
       w_s(&mut out, "\n");
       i = i + 1;
     } else if ix_is_cmp(q.op) && nq.op == IR_BR && nq.a == q.d && u_at(nuse, q.d) == 1 {
