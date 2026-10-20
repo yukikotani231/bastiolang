@@ -1,0 +1,76 @@
+// A word count over 32 MiB of pseudo-random text, 8 passes: bytes, lines,
+// words and the longest word, in one state machine over the bytes.
+const SIZE: u64 = 33554432;
+
+fn text() -> Bytes
+  ensures blen(result) == SIZE
+{
+  let mut b = balloc(SIZE);
+  let mut x = 12345;
+  let mut i = 0;
+  while i < SIZE
+    invariant blen(b) == SIZE && i <= SIZE
+  {
+    x = wrap_add(wrap_mul(x, 6364136223846793005), 1442695040888963407);
+    let r = x / 4294967296;
+    let k = r % 8;
+    if k == 0 {
+      bset(&mut b, i, 32);
+    } else if k == 1 && r / 8 % 8 == 0 {
+      bset(&mut b, i, 10);
+    } else {
+      bset(&mut b, i, cast[u8](97 + r / 8 % 26));
+    }
+    i = i + 1;
+  }
+  return b;
+}
+
+fn count(b: &Bytes) -> u64
+  requires blen(b) == SIZE
+{
+  let mut lines = 0;
+  let mut words = 0;
+  let mut cur = 0;
+  let mut best = 0;
+  let mut inword = false;
+  let mut i = 0;
+  while i < SIZE
+    invariant i <= SIZE && blen(b) == SIZE && lines <= i && words <= i && cur <= i && best <= i
+  {
+    let c = bget(b, i);
+    if c == 10 {
+      lines = lines + 1;
+    }
+    if c == 32 || c == 10 {
+      inword = false;
+      cur = 0;
+    } else {
+      if !inword {
+        inword = true;
+        words = words + 1;
+      }
+      cur = cur + 1;
+      if cur > best {
+        best = cur;
+      }
+    }
+    i = i + 1;
+  }
+  return lines * 1000003 + words * 31 + best;
+}
+
+fn main() -> u64 {
+  let b = text();
+  let mut t = 0;
+  let mut p = 0;
+  while p < 8
+    invariant p <= 8 && blen(b) == SIZE
+  {
+    t = wrap_add(t, count(b));
+    p = p + 1;
+  }
+  print(t);
+  bfree(b);
+  return 0;
+}
