@@ -4981,7 +4981,19 @@ fn iropt_efacts(f: &mut IrFn) -> u64 {
               more = false;
             }
           }
-          if wrap_add(k, 1) < n {
+          // Each constant must be read by the comparison: one read elsewhere
+          // (past the branch) would be skipped by the new edge.
+          let mut mine = true;
+          let mut hz = wrap_add(p, 1);
+          while hz < k && hz < n {
+            let zq = iropt_at(f, hz);
+            let cz = iropt_at(f, k);
+            if zq.d != cz.a && zq.d != cz.b {
+              mine = false;
+            }
+            hz = wrap_add(hz, 1);
+          }
+          if mine && wrap_add(k, 1) < n {
             let cq = iropt_at(f, k);
             let bq = iropt_at(f, wrap_add(k, 1));
             let ck2 = iropt_ef_cmpk(cv, cq);
@@ -5028,6 +5040,26 @@ fn iropt_efacts(f: &mut IrFn) -> u64 {
           }
         }
         side = wrap_add(side, 1);
+      }
+      // A new edge into a label that was already passed, or into one the walk
+      // below treats as only the block above's, would break what it assumed
+      // about that label: such a target is left alone, and a later label
+      // counts the edge.
+      if tl != q.b {
+        let pt = u_at(lpos, tl);
+        if pt == IR_NONE || pt <= i {
+          tl = q.b;
+        } else {
+          ra_set(&mut cnt, tl, wrap_add(u_at(cnt, tl), 1));
+        }
+      }
+      if fl != q.c {
+        let pf = u_at(lpos, fl);
+        if pf == IR_NONE || pf <= i {
+          fl = q.c;
+        } else {
+          ra_set(&mut cnt, fl, wrap_add(u_at(cnt, fl), 1));
+        }
       }
       if tl != q.b || fl != q.c {
         iropt_put(&mut f, i, IrIns { op: IR_BR, d: q.d, a: q.a, b: tl, c: fl, ty: q.ty });
