@@ -6645,3 +6645,300 @@ fn iropt_accrec(f: &mut IrFn) -> u64 {
   f.ins = out;
   return sites;
 }
+
+// ---- Vec headers in registers ----
+
+/// Is `q` a load or store of a Vec header word that the lowering marked?
+fn iropt_vlen_hdr(q: IrIns) -> bool {
+  return (q.op == IR_LOAD || q.op == IR_STORE) && (q.ty == IR_HDR || q.ty == IR_HDR2);
+}
+
+/// The operations a loop may hold for `iropt_vlen`: none of them writes
+/// memory or calls out, so the loop's stores are the ones it checks.
+fn iropt_vlen_op(op: u64) -> bool {
+  return op == IR_CONST || op == IR_MOV || (op >= IR_ADD && op <= IR_NEG) || (op >= IR_EQ && op <= IR_SGE) || op == IR_WRAP || op == IR_LABEL || op == IR_JMP || op == IR_BR || op == IR_RET || op == IR_UNREACH || op == IR_GLOBAL || op == IR_STRLIT;
+}
+
+/// 1 for each register that holds the data address of a Vec wherever it is
+/// written: by a marked load of header word 2, or by a copy of such a register.
+/// A store through one cannot reach a header.
+fn iropt_vlen_data(f: &IrFn, cv: &Vec[u64]) -> Vec[u64] {
+  let n = vec_len(f.ins);
+  let mut isd = vec_new[u64]();
+  let mut r = 0;
+  while r < f.nreg && r < 1000000000 {
+    vec_push(&mut isd, 0);
+    r = wrap_add(r, 1);
+  }
+  let mut i = 0;
+  while i < n {
+    let mut ws = vec_new[u64]();
+    ra_writes(iropt_at(f, i), &mut ws);
+    let mut w = 0;
+    while w < vec_len(ws) {
+      ra_set(&mut isd, vec_get(ws, w), 1);
+      w = wrap_add(w, 1);
+    }
+    vec_free(ws);
+    i = wrap_add(i, 1);
+  }
+  let mut j = 0;
+  while j < vec_len(f.params) {
+    ra_set(&mut isd, vec_get(f.params, j), 0);
+    j = wrap_add(j, 1);
+  }
+  let mut changed = true;
+  let mut rounds = 0;
+  while changed && rounds < 64 {
+    changed = false;
+    rounds = wrap_add(rounds, 1);
+    i = 0;
+    while i < n {
+      let q = iropt_at(f, i);
+      let mut ws = vec_new[u64]();
+      ra_writes(q, &mut ws);
+      let good = (q.op == IR_LOAD && iropt_vlen_hdr(q) && q.c == 8 && u_at(cv, q.b) == 2) || (q.op == IR_MOV && u_at(isd, q.a) == 1);
+      let mut w = 0;
+      while w < vec_len(ws) {
+        let x = vec_get(ws, w);
+        if u_at(isd, x) == 1 && !good {
+          ra_set(&mut isd, x, 0);
+          changed = true;
+        }
+        w = wrap_add(w, 1);
+      }
+      vec_free(ws);
+      i = wrap_add(i, 1);
+    }
+  }
+  if changed {
+    r = 0;
+    while r < vec_len(isd) {
+      ra_set(&mut isd, r, 0);
+      r = wrap_add(r, 1);
+    }
+  }
+  return isd;
+}
+
+/// What `iropt_vlen_try` found: the header's address register and, for each
+/// of the words 0 to 2, whether the loop loads it.
+struct IrVLoop { ok: bool, v: u64, m0: bool, m1: bool, m2: bool }
+
+/// Can the header words that the loop at label `l` loads be kept in registers?
+/// It needs one way in (falling through to the label), no operation but the
+/// ones `iropt_vlen_op` lists and `vgrow`, header words of one Vec at one
+/// address register that the loop does not write, and no store but those and
+/// stores through data addresses.
+fn iropt_vlen_try(f: &IrFn, lb: &IrLabs, l: u64, cv: &Vec[u64], isd: &Vec[u64]) -> IrVLoop {
+  let none = IrVLoop { ok: false, v: IR_NONE, m0: false, m1: false, m2: false };
+  let n = vec_len(f.ins);
+  let p = u_at(lb.pos, l);
+  let q = u_at(lb.hi, l);
+  if u_at(lb.back, l) < 1 || p == IR_NONE || q <= p || q >= n || u_at(lb.lo, l) <= p {
+    return none;
+  }
+  if p > 0 {
+    let prev = iropt_at(f, p - 1);
+    if prev.op == IR_JMP || prev.op == IR_BR || prev.op == IR_RET || prev.op == IR_UNREACH {
+      return none;
+    }
+  }
+  if !iropt_wide_entry_ok(f, lb, p, q) {
+    return none;
+  }
+  let mut v = IR_NONE;
+  let mut vg = IR_NONE;
+  let mut m0 = false;
+  let mut m1 = false;
+  let mut m2 = false;
+  let mut ok = true;
+  let mut i = wrap_add(p, 1);
+  while ok && i <= q {
+    let t = iropt_at(f, i);
+    if t.op == IR_LOAD || t.op == IR_STORE {
+      if iropt_vlen_hdr(t) {
+        let k = u_at(cv, t.b);
+        if t.c != 8 || k >= 3 || (t.op == IR_STORE && t.ty != IR_HDR) {
+          ok = false;
+        } else if v == IR_NONE {
+          v = t.a;
+        } else if v != t.a {
+          ok = false;
+        }
+        if ok && t.op == IR_LOAD && t.ty == IR_HDR {
+          if k == 0 {
+            m0 = true;
+          } else if k == 1 {
+            m1 = true;
+          } else {
+            m2 = true;
+          }
+        }
+      } else if t.op == IR_STORE && u_at(isd, t.a) != 1 {
+        ok = false;
+      }
+    } else if t.op == IR_VGROW {
+      if vg == IR_NONE {
+        vg = t.a;
+      } else if vg != t.a {
+        ok = false;
+      }
+    } else if !iropt_vlen_op(t.op) {
+      ok = false;
+    }
+    i = wrap_add(i, 1);
+  }
+  if !ok || v == IR_NONE || (vg != IR_NONE && vg != v) || !(m0 || m1 || m2) {
+    return none;
+  }
+  let inl = iropt_licm_written(f, p, q);
+  let inv = u_at(inl, v) == 0 && v < vec_len(inl);
+  vec_free(inl);
+  if !inv {
+    return none;
+  }
+  return IrVLoop { ok: true, v: v, m0: m0, m1: m1, m2: m2 };
+}
+
+/// Header words of a Vec that a loop reads (`vec_len` and the data address
+/// in `vec_push`, `vec_get` and `vec_set`; the length and capacity that a
+/// push checks and updates) are read once in front of the loop and kept in
+/// registers: a store of a word is kept and also copies the new value to the
+/// register, and a `vgrow` is followed by a read of them again. So the length
+/// of a push loop is not carried from one pass to the next through a store and
+/// a load of the same address. The marks the lowering put on the header
+/// operations are cleared. Returns how many loops it changed.
+fn iropt_vlen(f: &mut IrFn) -> u64 {
+  let mut total = 0;
+  let mut again = true;
+  let mut rounds = 0;
+  while again && rounds < 32 {
+    again = false;
+    rounds = wrap_add(rounds, 1);
+    let n = vec_len(f.ins);
+    if n > 4000000 || f.nreg > 100000000 || f.nlabel > 100000000 {
+      again = false;
+    } else {
+      let ndef = iropt_ndef(f);
+      let cv = iropt_consts(f, ndef);
+      let isd = iropt_vlen_data(f, cv);
+      let lb = iropt_labs(f);
+      // The innermost loop first.
+      let mut best = IR_NONE;
+      let mut bl = IrVLoop { ok: false, v: IR_NONE, m0: false, m1: false, m2: false };
+      let mut l = 0;
+      while l < f.nlabel {
+        let p = u_at(lb.pos, l);
+        if p != IR_NONE && (best == IR_NONE || p > u_at(lb.pos, best)) {
+          let t = iropt_vlen_try(f, lb, l, cv, isd);
+          if t.ok {
+            best = l;
+            bl = t;
+          }
+        }
+        l = wrap_add(l, 1);
+      }
+      if best != IR_NONE {
+        let p = u_at(lb.pos, best);
+        let q = u_at(lb.hi, best);
+        let v = bl.v;
+        let l0 = ir_reg(&mut f);
+        let l1 = ir_reg(&mut f);
+        let l2 = ir_reg(&mut f);
+        let mut out = vec_new[IrIns]();
+        let mut i = 0;
+        while i < n {
+          let t = iropt_at(f, i);
+          if i == p {
+            let mut k = 0;
+            while k < 3 {
+              let used = (k == 0 && bl.m0) || (k == 1 && bl.m1) || (k == 2 && bl.m2);
+              if used {
+                let kr = ir_reg(&mut f);
+                vec_push(&mut out, IrIns { op: IR_CONST, d: kr, a: k, b: 0, c: 0, ty: 0 });
+                let mut lr = l2;
+                if k == 0 {
+                  lr = l0;
+                } else if k == 1 {
+                  lr = l1;
+                }
+                vec_push(&mut out, IrIns { op: IR_LOAD, d: lr, a: v, b: kr, c: 8, ty: IR_HDR });
+              }
+              k = wrap_add(k, 1);
+            }
+          }
+          if i > p && i <= q && iropt_vlen_hdr(t) && t.a == v {
+            let k = u_at(cv, t.b);
+            let mut lr = l2;
+            let mut used = bl.m2;
+            if k == 0 {
+              lr = l0;
+              used = bl.m0;
+            } else if k == 1 {
+              lr = l1;
+              used = bl.m1;
+            }
+            if t.op == IR_LOAD && t.ty == IR_HDR {
+              vec_push(&mut out, IrIns { op: IR_MOV, d: t.d, a: lr, b: 0, c: 0, ty: 0 });
+            } else {
+              if t.op == IR_STORE && used {
+                // The register gets the value first and the store reads it from there.
+                vec_push(&mut out, IrIns { op: IR_MOV, d: lr, a: t.d, b: 0, c: 0, ty: 0 });
+                let mut st = t;
+                st.d = lr;
+                vec_push(&mut out, st);
+              } else {
+                vec_push(&mut out, t);
+              }
+            }
+          } else {
+            vec_push(&mut out, t);
+            if i > p && i <= q && t.op == IR_VGROW {
+              let mut k = 0;
+              while k < 3 {
+                // `vgrow` changes the capacity and the data address, not the length.
+                let used = (k == 1 && bl.m1) || (k == 2 && bl.m2);
+                if used {
+                  let kr = ir_reg(&mut f);
+                  vec_push(&mut out, IrIns { op: IR_CONST, d: kr, a: k, b: 0, c: 0, ty: 0 });
+                  let mut lr = l2;
+                  if k == 1 {
+                    lr = l1;
+                  }
+                  vec_push(&mut out, IrIns { op: IR_LOAD, d: lr, a: v, b: kr, c: 8, ty: IR_HDR2 });
+                }
+                k = wrap_add(k, 1);
+              }
+            }
+          }
+          i = wrap_add(i, 1);
+        }
+        vec_free(f.ins);
+        f.ins = out;
+        total = wrap_add(total, 1);
+        again = true;
+      }
+      iropt_labs_free(lb);
+      vec_free(isd);
+      vec_free(cv);
+      vec_free(ndef);
+    }
+  }
+  iropt_vlen_untag(&mut f);
+  return total;
+}
+
+/// Clears the marks on header operations.
+fn iropt_vlen_untag(f: &mut IrFn) {
+  let mut i = 0;
+  while i < vec_len(f.ins) {
+    let q = vec_get(f.ins, i);
+    if iropt_vlen_hdr(q) {
+      let mut r = q;
+      r.ty = 0;
+      vec_set(&mut f.ins, i, r);
+    }
+    i = wrap_add(i, 1);
+  }
+}
