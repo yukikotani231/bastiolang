@@ -1,0 +1,66 @@
+// A register bytecode interpreter: 30000000 steps of a six-instruction loop,
+// dispatching on the opcode with a chain of comparisons, operands read from
+// the instruction words, registers in a Buf.
+fn put(mut c: Buf, pc: u64, op: u64, a: u64, b: u64, d: u64) -> Buf
+  requires len(c) == 64 && pc < 16
+  ensures len(result) == 64
+{
+  c = set(c, pc * 4, op);
+  c = set(c, pc * 4 + 1, a);
+  c = set(c, pc * 4 + 2, b);
+  c = set(c, pc * 4 + 3, d);
+  return c;
+}
+
+fn run(code: &Buf, mut r: Buf) -> Buf
+  requires len(code) == 64 && len(r) == 8
+  ensures len(result) == 8
+{
+  let mut pc = 0;
+  let mut steps = 0;
+  while steps < 30000000
+    invariant pc < 16 && steps <= 30000000 && len(code) == 64 && len(r) == 8
+  {
+    let op = get(code, pc * 4) % 8;
+    let a = get(code, pc * 4 + 1) % 8;
+    let b = get(code, pc * 4 + 2) % 8;
+    let d = get(code, pc * 4 + 3);
+    pc = (pc + 1) % 16;
+    if op == 0 {
+      r = set(r, a, wrap_add(get(r, b), get(r, d % 8)));
+    } else if op == 1 {
+      r = set(r, a, wrap_add(get(r, b), d));
+    } else if op == 2 {
+      r = set(r, a, wrap_mul(get(r, b), get(r, d % 8)));
+    } else if op == 3 {
+      if get(r, a) < get(r, b) {
+        pc = d % 16;
+      }
+    } else if op == 4 {
+      r = set(r, a, wrap_sub(get(r, b), get(r, d % 8)));
+    } else if op == 5 {
+      r = set(r, a, get(r, b) ^ get(r, d % 8));
+    } else if op == 6 {
+      r = set(r, a, get(r, b) & get(r, d % 8));
+    }
+    steps = steps + 1;
+  }
+  return r;
+}
+
+fn main() -> u64 {
+  let mut code = alloc(64);
+  // r0 = i, r1 = limit, r2 = acc, r3 = temp
+  code = put(code, 0, 1, 1, 1, 1000000000);
+  code = put(code, 1, 2, 3, 0, 0);
+  code = put(code, 2, 0, 2, 2, 3);
+  code = put(code, 3, 5, 2, 2, 0);
+  code = put(code, 4, 1, 0, 0, 1);
+  code = put(code, 5, 3, 0, 1, 1);
+  let mut r = alloc(8);
+  r = run(code, r);
+  print(wrap_add(get(r, 2) % 1000000007, get(r, 0)));
+  free(code);
+  free(r);
+  return 0;
+}
