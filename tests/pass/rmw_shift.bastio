@@ -1,0 +1,52 @@
+// expect-exit: 0
+// expect-stdout: 12
+// expect-stdout: 0
+// expect-stdout: 53
+// expect-stdout: 18446744073709551558
+// expect-stdout: 8250
+// expect-stdout: 16181728248922
+// A word of a buffer changed in place by `add`, `sub`, `and`, `or` and `xor`
+// (an immediate or a register, either side) and variable shifts.
+fn bump(t: Buf, n: u64) -> Buf
+  requires len(t) == 8
+  ensures len(result) == 8
+{
+  let mut c = t;
+  let mut i = 0;
+  while i < n
+    invariant i <= n && len(c) == 8
+  {
+    let k = i % 8;
+    c = set(c, k, wrap_add(get(c, k), 1));
+    c = set(c, 7, wrap_sub(get(c, 7), 3));
+    c = set(c, 6, get(c, 6) | i);
+    c = set(c, 5, get(c, 5) ^ wrap_add(i, 9));
+    c = set(c, 4, i & get(c, 4));
+    i = i + 1;
+  }
+  return c;
+}
+
+fn shifts(x: u64, s: u64) -> u64
+  requires s < 20 && x < 1000000000
+{
+  let a = x >> s;
+  let b = x << s;
+  let t = s;
+  let c = x >> t & 255;
+  return wrap_add(wrap_add(a, b), c);
+}
+
+fn main() -> u64 {
+  let mut c = alloc(8);
+  c = set(c, 4, 255);
+  c = bump(c, 20);
+  print(wrap_add(wrap_add(get(c, 0), get(c, 1)), wrap_add(get(c, 2), get(c, 3))));
+  print(get(c, 4));
+  print(wrap_add(get(c, 5), get(c, 6)) % 1000003);
+  print(get(c, 7));
+  print(shifts(1000, 3));
+  print(shifts(123456789, 17));
+  free(c);
+  return 0;
+}
