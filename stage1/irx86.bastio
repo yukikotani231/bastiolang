@@ -1300,6 +1300,19 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
         return;
       }
     }
+    if wrap && kind_t(m, q.ty) == TY_U32 && (op == IR_ADD || op == IR_SUB || op == IR_MUL) && ld.k == IXK_REG && lb0.k == IXK_MEM {
+      // A spilled operand: the 32-bit instruction reads its low half and
+      // leaves the destination's upper half zero.
+      ix_mov(&mut out, la, ix_rl(ld.reg));
+      w_s(&mut out, "\t");
+      w_s(&mut out, alu);
+      w_s(&mut out, " ");
+      ix_op(&mut out, lb0);
+      w_s(&mut out, ", ");
+      w_s(&mut out, ix_name32(ld.reg));
+      w_s(&mut out, "\n");
+      return;
+    }
     ix_mov(&mut out, la, ix_rl(t));
     let lb = ix_src(&mut out, lb0);
     ix_ins2(&mut out, alu, lb, ix_rl(t));
@@ -1497,9 +1510,25 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     w_s(&mut out, "\n");
     ix_finish(&mut out, al, q.d, t);
   } else if op == IR_WRAP {
-    ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RAX));
-    ix_norm(&mut out, m, q.ty);
-    ix_finish(&mut out, al, q.d, XR_RAX);
+    let ld = ix_loc(al, q.d);
+    let la = ix_loc(al, q.a);
+    if ld.k == IXK_REG && kind_t(m, q.ty) == TY_U32 {
+      if la.k == IXK_REG {
+        w_s(&mut out, "\tmovl ");
+        w_s(&mut out, ix_name32(la.reg));
+      } else {
+        ix_mov(&mut out, la, ix_rl(ld.reg));
+        w_s(&mut out, "\tmovl ");
+        w_s(&mut out, ix_name32(ld.reg));
+      }
+      w_s(&mut out, ", ");
+      w_s(&mut out, ix_name32(ld.reg));
+      w_s(&mut out, "\n");
+    } else {
+      ix_mov(&mut out, la, ix_rl(XR_RAX));
+      ix_norm(&mut out, m, q.ty);
+      ix_finish(&mut out, al, q.d, XR_RAX);
+    }
   } else if op == IR_LOAD {
     let ld = ix_loc(al, q.d);
     let ap = ix_aprep(&mut out, al, q.a, q.b, q.ty);
@@ -2079,8 +2108,14 @@ struct IxRot { j: u64, x: u64, d: u64, k: u64 }
 fn ix_rot32(f: &IrFn, al: &IrAlloc, m: &Mono, ub: &Vec[u64], nuse: &Vec[u64], i: u64) -> IxRot {
   let none = IxRot { j: 0, x: 0, d: 0, k: 0 };
   let q = ix_at(f, i);
-  if (q.op != IR_SHL && q.op != IR_SHR) || q.a >= vec_len(ub) || q.d >= vec_len(nuse) || u_at(ub, q.a) > 4294967295 || u_at(nuse, q.d) != 1 {
+  if (q.op != IR_SHL && q.op != IR_SHR) || q.a >= vec_len(ub) || q.d >= vec_len(nuse) || u_at(nuse, q.d) != 1 {
     return none;
+  }
+  // The word is below 2^32 when a bound says so or the right shift is typed
+  // u32 (a u32 value is always held zero-extended).
+  let mut small = u_at(ub, q.a) <= 4294967295;
+  if q.op == IR_SHR && kind_t(m, q.ty) == TY_U32 {
+    small = true;
   }
   let l1 = ix_loc(al, q.b);
   if l1.k != IXK_IMM || l1.imm < 1 || l1.imm > 31 || q.d == q.a {
@@ -2109,6 +2144,9 @@ fn ix_rot32(f: &IrFn, al: &IrAlloc, m: &Mono, ub: &Vec[u64], nuse: &Vec[u64], i:
         return none;
       }
       other = p;
+      if t.op == IR_SHR && kind_t(m, t.ty) == TY_U32 {
+        small = true;
+      }
       p = wrap_add(p, 1);
     } else if t.op == IR_OR && wp != IR_NONE && other != IR_NONE {
       orp = p;
@@ -2117,7 +2155,7 @@ fn ix_rot32(f: &IrFn, al: &IrAlloc, m: &Mono, ub: &Vec[u64], nuse: &Vec[u64], i:
       return none;
     }
   }
-  if orp == IR_NONE {
+  if orp == IR_NONE || !small {
     return none;
   }
   let mut shl = q;

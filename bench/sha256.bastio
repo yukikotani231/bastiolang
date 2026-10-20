@@ -1,0 +1,105 @@
+// The SHA-256 compression function on 400000 blocks: a message schedule in a
+// Vec, round constants in another, and u32 adds, xors, ands and rotations
+// (a rotation is a shift each way on the widened word). Each block is the
+// previous state mixed with the block number; the first state word is the
+// checksum.
+fn rotr(x: u32, n: u64) -> u32
+  requires n >= 1 && n <= 31
+{
+  return wrap[u32](cast[u64](x) << (32 - n)) | (x >> n);
+}
+
+fn compress(h: &mut Vec[u32], w: &mut Vec[u32], k: &Vec[u32])
+  requires vlen(h) == 8 && vlen(w) == 64 && vlen(k) == 64
+  ensures vlen(h) == 8 && vlen(w) == 64
+{
+  let mut t = 16;
+  while t < 64
+    invariant t >= 16 && t <= 64 && vlen(w) == 64
+  {
+    let x = vec_get(w, t - 15);
+    let y = vec_get(w, t - 2);
+    let s0 = rotr(x, 7) ^ rotr(x, 18) ^ (x >> 3);
+    let s1 = rotr(y, 17) ^ rotr(y, 19) ^ (y >> 10);
+    vec_set(&mut w, t, wrap_add(wrap_add(vec_get(w, t - 16), s0), wrap_add(vec_get(w, t - 7), s1)));
+    t = t + 1;
+  }
+  let mut a = vec_get(h, 0);
+  let mut b = vec_get(h, 1);
+  let mut c = vec_get(h, 2);
+  let mut d = vec_get(h, 3);
+  let mut e = vec_get(h, 4);
+  let mut f = vec_get(h, 5);
+  let mut g = vec_get(h, 6);
+  let mut hh = vec_get(h, 7);
+  t = 0;
+  while t < 64
+    invariant t <= 64 && vlen(w) == 64 && vlen(k) == 64
+  {
+    let s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+    let ch = (e & f) ^ ((e ^ 4294967295) & g);
+    let t1 = wrap_add(wrap_add(hh, s1), wrap_add(wrap_add(ch, vec_get(k, t)), vec_get(w, t)));
+    let s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+    let maj = (a & b) ^ (a & c) ^ (b & c);
+    let t2 = wrap_add(s0, maj);
+    hh = g;
+    g = f;
+    f = e;
+    e = wrap_add(d, t1);
+    d = c;
+    c = b;
+    b = a;
+    a = wrap_add(t1, t2);
+    t = t + 1;
+  }
+  vec_set(&mut h, 0, wrap_add(vec_get(h, 0), a));
+  vec_set(&mut h, 1, wrap_add(vec_get(h, 1), b));
+  vec_set(&mut h, 2, wrap_add(vec_get(h, 2), c));
+  vec_set(&mut h, 3, wrap_add(vec_get(h, 3), d));
+  vec_set(&mut h, 4, wrap_add(vec_get(h, 4), e));
+  vec_set(&mut h, 5, wrap_add(vec_get(h, 5), f));
+  vec_set(&mut h, 6, wrap_add(vec_get(h, 6), g));
+  vec_set(&mut h, 7, wrap_add(vec_get(h, 7), hh));
+}
+
+fn main() -> u64 {
+  let mut h = vec_new[u32]();
+  let mut w = vec_new[u32]();
+  let mut k = vec_new[u32]();
+  let mut i = 0;
+  while i < 8
+    invariant i <= 8 && vlen(h) == i
+  {
+    vec_push(&mut h, cast[u32](1779033703 + i * 1013904242 % 2147483648));
+    i = i + 1;
+  }
+  i = 0;
+  let mut s: u64 = 12345;
+  while i < 64
+    invariant i <= 64 && vlen(w) == i && vlen(k) == i && s < 4294967296
+  {
+    s = (s * 1103515245 + 12345) % 4294967296;
+    vec_push(&mut k, cast[u32](s));
+    vec_push(&mut w, 0);
+    i = i + 1;
+  }
+  let mut blk = 0;
+  while blk < 400000
+    invariant blk <= 400000 && vlen(h) == 8 && vlen(w) == 64 && vlen(k) == 64
+  {
+    let mut j = 0;
+    while j < 16
+      invariant j <= 16 && vlen(h) == 8 && vlen(w) == 64
+    {
+      vec_set(&mut w, j, vec_get(h, j % 8) ^ cast[u32](blk * 16 + j));
+      j = j + 1;
+    }
+    compress(&mut h, &mut w, k);
+    blk = blk + 1;
+  }
+  print(cast[u64](vec_get(h, 0)));
+  vec_free(h);
+  vec_free(w);
+  vec_free(k);
+  return 0;
+}
