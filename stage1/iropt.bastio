@@ -3427,6 +3427,65 @@ fn iropt_jt_edge(f: &IrFn, bl: &Vec[IrBlock], ndef: &Vec[u64], cv: &Vec[u64], re
   return IR_NONE;
 }
 
+/// `a % K` next to an `a / K` of the same register and constant (the digit
+/// loop of a decimal formatter: `v % 10`, then `v = v / 10`) is
+/// `a - (a / K) * K`, so that the value numbering shares the division, which
+/// is a multiplication and shifts by a magic constant, with the other. Only for
+/// a `K` that is not a power of two (those are a mask) and for plain
+/// 64-bit operations. Returns how many it rewrote.
+fn iropt_remdiv(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  if n > 200000 || f.nreg > 100000000 {
+    return 0;
+  }
+  let ndef = iropt_ndef(f);
+  let cv = iropt_consts(f, ndef);
+  let mut out = vec_new[IrIns]();
+  let mut done = 0;
+  let mut i = 0;
+  while i < n {
+    let q = iropt_at(f, i);
+    let mut rewrote = false;
+    if q.op == IR_REM && q.c == 0 && q.ty == 0 && q.d != IR_NONE && q.d < f.nreg && q.a < f.nreg {
+      let k = iropt_cval(cv, q.b);
+      if k != IR_NONE && k >= 3 && k & wrap_sub(k, 1) != 0 {
+        let mut found = false;
+        let mut j = 0;
+        while !found && j < n {
+          let r = iropt_at(f, j);
+          if r.op == IR_DIV && r.a == q.a && r.c == 0 && r.ty == 0 && iropt_cval(cv, r.b) == k {
+            found = true;
+          }
+          j = wrap_add(j, 1);
+        }
+        if found {
+          let qt = f.nreg;
+          let mt = wrap_add(f.nreg, 1);
+          f.nreg = wrap_add(f.nreg, 2);
+          vec_push(&mut out, IrIns { op: IR_DIV, d: qt, a: q.a, b: q.b, c: 0, ty: 0 });
+          vec_push(&mut out, IrIns { op: IR_MUL, d: mt, a: qt, b: q.b, c: 0, ty: 0 });
+          vec_push(&mut out, IrIns { op: IR_SUB, d: q.d, a: q.a, b: mt, c: 0, ty: 0 });
+          rewrote = true;
+          done = wrap_add(done, 1);
+        }
+      }
+    }
+    if !rewrote {
+      vec_push(&mut out, q);
+    }
+    i = wrap_add(i, 1);
+  }
+  vec_free(ndef);
+  vec_free(cv);
+  if done == 0 {
+    vec_free(out);
+    return 0;
+  }
+  vec_free(f.ins);
+  f.ins = out;
+  return done;
+}
+
 /// Common subexpression elimination over the dominator tree. A binary
 /// operation whose operands are registers written once (or constants), and
 /// whose result lands in a register written once, is remembered while the
@@ -4118,13 +4177,16 @@ fn iropt_ivs_try(f: &mut IrFn, lb: &IrLabs, l: u64, ndef: &Vec[u64], nuse: &Vec[
     return false;
   }
   let ad = iropt_at(f, w);
-  if ad.op != IR_ADD || ad.c != 0 || ad.d != t {
+  if (ad.op != IR_ADD && ad.op != IR_SUB) || ad.c != 0 || ad.d != t {
     return false;
   }
+  // `k = k - c` counts down: the new register is then stepped with a
+  // subtraction.
+  let down = ad.op == IR_SUB;
   let mut vc = IR_NONE;
   if ad.a == k {
     vc = ad.b;
-  } else if ad.b == k {
+  } else if ad.b == k && !down {
     vc = ad.a;
   }
   if vc >= nr || u_at(cv, vc) == IR_NONE {
@@ -4235,7 +4297,7 @@ fn iropt_ivs_try(f: &mut IrFn, lb: &IrLabs, l: u64, ndef: &Vec[u64], nuse: &Vec[
     let d = iropt_ivs_dest(qi);
     if d < nr && d != k && d != t && u_at(kind, d) == 1 && u_at(ndef, d) == 1 && u_at(indef, d) == 1 && u_at(scale, d) != 0 && qi.op != IR_MOV && u_at(nuse, d) > 0
       && u_at(fu, d) > i && u_at(lu, d) < w {
-      if iropt_ivs_apply(&mut f, lb, l, p, q, w, i, k, k0, step, ad.ty, ndef, nuse, cv, dp, indef, kind, scale) {
+      if iropt_ivs_apply(&mut f, lb, l, p, q, w, i, k, k0, step, ad.ty, down, ndef, nuse, cv, dp, indef, kind, scale) {
         done = true;
       }
     }
@@ -4252,7 +4314,7 @@ fn iropt_ivs_try(f: &mut IrFn, lb: &IrLabs, l: u64, ndef: &Vec[u64], nuse: &Vec[
 /// by the addition at `u`, which every read of `d` comes before and the new
 /// register is stepped ahead of, if its computation is worth it (see
 /// `iropt_ivs_try`).
-fn iropt_ivs_apply(f: &mut IrFn, lb: &IrLabs, l: u64, p: u64, q: u64, u: u64, di: u64, k: u64, k0: u64, step: u64, ty: u64, ndef: &Vec[u64], nuse: &Vec[u64], cv: &Vec[u64], dp: &Vec[u64], indef: &Vec[u64], kind: &Vec[u64], scale: &Vec[u64]) -> bool {
+fn iropt_ivs_apply(f: &mut IrFn, lb: &IrLabs, l: u64, p: u64, q: u64, u: u64, di: u64, k: u64, k0: u64, step: u64, ty: u64, down: bool, ndef: &Vec[u64], nuse: &Vec[u64], cv: &Vec[u64], dp: &Vec[u64], indef: &Vec[u64], kind: &Vec[u64], scale: &Vec[u64]) -> bool {
   let n = vec_len(f.ins);
   let nr = f.nreg;
   let qd = iropt_at(f, di);
@@ -4399,7 +4461,11 @@ fn iropt_ivs_apply(f: &mut IrFn, lb: &IrLabs, l: u64, p: u64, q: u64, u: u64, di
         }
       }
     } else if i == u {
-      vec_push(&mut out, IrIns { op: IR_ADD, d: rr, a: rr, b: rs, c: 0, ty: ty });
+      let mut sop = IR_ADD;
+      if down {
+        sop = IR_SUB;
+      }
+      vec_push(&mut out, IrIns { op: sop, d: rr, a: rr, b: rs, c: 0, ty: ty });
     } else if i > di && i < u {
       qi = iropt_rename(qi, d, rr);
       if ra_reads_has(f, qi, d) {
@@ -4602,7 +4668,7 @@ fn iropt_put(f: &mut IrFn, i: u64, q: IrIns) {
 /// Do registers `x` and `y` hold the same value: the same register (after
 /// `al` maps a register that is a copy of another written once to it), or two
 /// registers that are each written once by a `const` of one value?
-fn iropt_ebb_same(cv: &Vec[u64], al: &Vec[u64], x0: u64, y0: u64) -> bool {
+fn iropt_ebb_same(cv: &Vec[u64], al: &Vec[u64], ea: &Vec[u64], x0: u64, y0: u64) -> bool {
   let mut x = x0;
   let mut y = y0;
   if x < vec_len(al) && u_at(al, x) != IR_NONE {
@@ -4610,6 +4676,12 @@ fn iropt_ebb_same(cv: &Vec[u64], al: &Vec[u64], x0: u64, y0: u64) -> bool {
   }
   if y < vec_len(al) && u_at(al, y) != IR_NONE {
     y = u_at(al, y);
+  }
+  if x < vec_len(ea) && u_at(ea, x) != IR_NONE {
+    x = u_at(ea, x);
+  }
+  if y < vec_len(ea) && u_at(ea, y) != IR_NONE {
+    y = u_at(ea, y);
   }
   if x == y {
     return true;
@@ -4647,6 +4719,13 @@ fn iropt_ebb(f: &mut IrFn) -> u64 {
     vec_push(&mut al, IR_NONE);
     r = wrap_add(r, 1);
   }
+  let mut ea = vec_new[u64]();
+  r = 0;
+  while r < f.nreg && r < 1000000000 {
+    vec_push(&mut ea, IR_NONE);
+    r = wrap_add(r, 1);
+  }
+  let mut ea_list = vec_new[u64]();
   let mut cnt = vec_new[u64]();
   let mut l = 0;
   while l < f.nlabel {
@@ -4708,13 +4787,43 @@ fn iropt_ebb(f: &mut IrFn) -> u64 {
       }
       t = wrap_add(t, 1);
     }
+    // The copies of a register that this instruction writes are stale, and
+    // all of them at the start of a block that is not a continuation.
+    let mut ws = vec_new[u64]();
+    ra_writes(q, &mut ws);
+    let mut e = 0;
+    while e < vec_len(ea_list) {
+      let ed = vec_get(ea_list, e);
+      let mut stale = clear;
+      let mut w = 0;
+      while w < vec_len(ws) {
+        if ed < vec_len(ea) && u_at(ea, ed) == vec_get(ws, w) {
+          stale = true;
+        }
+        w = wrap_add(w, 1);
+      }
+      if stale && ed < vec_len(ea) {
+        ra_set(&mut ea, ed, IR_NONE);
+      }
+      e = wrap_add(e, 1);
+    }
+    if clear {
+      while vec_len(ea_list) > 0 {
+        vec_pop(&mut ea_list);
+      }
+    }
+    vec_free(ws);
+    if q.op == IR_MOV && q.d < vec_len(ea) && q.a < vec_len(ea) && q.d != q.a && u_at(ndef, q.d) == 1 && u_at(ndef, q.a) != 1 && vec_len(ea_list) < 64 {
+      ra_set(&mut ea, q.d, q.a);
+      vec_push(&mut ea_list, q.d);
+    }
     let pure = ra_is_binary(q.op) || q.op == IR_NOT || q.op == IR_NEG || q.op == IR_WRAP;
     if pure || q.op == IR_LOAD {
       // Is it there already?
       let mut hit = IR_NONE;
       t = 0;
       while hit == IR_NONE && t < vec_len(te_op) {
-        if u_at(te_op, t) == q.op && iropt_ebb_same(cv, al, u_at(te_a, t), q.a) && iropt_ebb_same(cv, al, u_at(te_b, t), q.b) && u_at(te_c, t) == q.c && u_at(te_ty, t) == q.ty {
+        if u_at(te_op, t) == q.op && iropt_ebb_same(cv, al, ea, u_at(te_a, t), q.a) && iropt_ebb_same(cv, al, ea, u_at(te_b, t), q.b) && u_at(te_c, t) == q.c && u_at(te_ty, t) == q.ty {
           // A cheap operation on a constant, far from its first computation,
           // is computed again: keeping it would hold a register for the
           // whole stretch.
@@ -4724,6 +4833,14 @@ fn iropt_ebb(f: &mut IrFn) -> u64 {
           }
         }
         t = wrap_add(t, 1);
+      }
+      // `t = k - 1; k = mov t`, the step of a counter, stays what it is: the
+      // loop passes know that form.
+      if hit != IR_NONE && (q.op == IR_ADD || q.op == IR_SUB) && wrap_add(i, 1) < n {
+        let nx = iropt_at(f, wrap_add(i, 1));
+        if nx.op == IR_MOV && nx.a == q.d && nx.d == q.a {
+          hit = IR_NONE;
+        }
       }
       if hit != IR_NONE && hit != q.d {
         let orig = q;
@@ -4837,6 +4954,8 @@ fn iropt_ebb(f: &mut IrFn) -> u64 {
   vec_free(ndef);
   vec_free(cv);
   vec_free(al);
+  vec_free(ea);
+  vec_free(ea_list);
   vec_free(cnt);
   vec_free(te_op);
   vec_free(te_a);

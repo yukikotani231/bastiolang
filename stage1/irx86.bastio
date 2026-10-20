@@ -190,6 +190,36 @@ fn ix_use(out: &mut Vec[u64], al: &IrAlloc, r: u64, scratch: u64) -> u64 {
 }
 
 /// `d = <machine register t>`.
+struct IxMagic { ok: bool, m: u64, sh: u64 }
+
+/// The multiplier and shift of an unsigned division by `d` (not a power of
+/// two, below 2^63) without a shift of the dividend first: q = mulhi(n, m) >>
+/// sh, with m = ceil(2^(64 + sh) / d) fitting 64 bits and the error below
+/// 2^sh, which makes it exact for every 64-bit n.
+fn ix_div_magic(d: u64) -> IxMagic {
+  let mut r = IxMagic { ok: false, m: 0, sh: 0 };
+  if d < 3 || d >= 9223372036854775808 || d & wrap_sub(d, 1) == 0 {
+    return r;
+  }
+  let mut sh = 0;
+  let mut p2 = 1;
+  while sh < 63 && p2 < d && !r.ok {
+    let qr = x86_longdiv(p2, d);
+    if qr.r == 0 || qr.q < 18446744073709551615 {
+      let mut ex = 0;
+      if qr.r != 0 {
+        ex = wrap_sub(d, qr.r);
+      }
+      if ex <= p2 {
+        r = IxMagic { ok: true, m: wrap_add(qr.q, x86_ne0(qr.r)), sh: sh };
+      }
+    }
+    sh = sh + 1;
+    p2 = wrap_mul(p2, 2);
+  }
+  return r;
+}
+
 fn ix_finish(out: &mut Vec[u64], al: &IrAlloc, d: u64, t: u64) {
   ix_mov(&mut out, ix_rl(t), ix_loc(al, d));
 }
@@ -446,6 +476,24 @@ fn ix_cmp(out: &mut Vec[u64], al: &IrAlloc, a: u64, b: u64) {
   } else {
     ix_ins2(&mut out, "cmp", lb, la);
   }
+}
+
+/// The comparison before a branch on `op`, and the condition to branch on.
+/// An unsigned `a > 0` or `a <= 0` is a test of ZF alone (`a != 0`, `a == 0`),
+/// so when the instruction just written is an `add` or `sub` into the
+/// register `a` (the step of a countdown), its flags are the comparison's.
+fn ix_cmp_br(out: &mut Vec[u64], al: &IrAlloc, a: u64, b: u64, op: u64) -> u64 {
+  let la = ix_loc(al, a);
+  let lb = ix_loc(al, b);
+  if lb.k == IXK_IMM && lb.imm == 0 && la.k == IXK_REG && (op == IR_GT || op == IR_LE)
+     && (ix_last_line(out, "\tsub ", x86_rname(la.reg)) || ix_last_line(out, "\tadd ", x86_rname(la.reg))) {
+    if op == IR_GT {
+      return IR_NE;
+    }
+    return IR_EQ;
+  }
+  ix_cmp(&mut out, al, a, b);
+  return op;
 }
 
 /// The symbol of function instance `x`.
@@ -1068,6 +1116,7 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
   let op = q.op;
   let alu = ix_alu(op);
   let lbq = ix_loc(al, q.b);
+  let mg = ix_div_magic(lbq.imm);
   if slen(alu) > 0 {
     let ld = ix_loc(al, q.d);
     let mut la = ix_loc(al, q.a);
@@ -1288,6 +1337,19 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     w_s(&mut out, x86_rname(t));
     w_s(&mut out, "\n");
     ix_finish(&mut out, al, q.d, t);
+  } else if op == IR_DIV && lbq.k == IXK_IMM && mg.ok {
+    // A constant divisor without a shift of the dividend first: the quotient
+    // is the high half of the product, shifted, and stays in %rdx.
+    ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RAX));
+    w_s(&mut out, "\tmovabs $");
+    w_num(&mut out, mg.m);
+    w_s(&mut out, ", %rdx\n\tmul %rdx\n");
+    if mg.sh > 0 {
+      w_s(&mut out, "\tshr $");
+      w_num(&mut out, mg.sh);
+      w_s(&mut out, ", %rdx\n");
+    }
+    ix_finish(&mut out, al, q.d, XR_RDX);
   } else if (op == IR_DIV || op == IR_REM) && lbq.k == IXK_IMM && lbq.imm != 0 {
     // A constant divisor: shifts and a multiplication, as the generator
     // of x86.bastio does it (the code is written into its line buffer).
@@ -2650,8 +2712,8 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
         ix_cmp_zero(&mut out, al, h1.a);
         ix_br_flags(&mut out, f.x, IR_NE, h1.b, h1.c, ix_pick_next(f, i + 1, h1.b, h1.c));
       } else if lp0 != 0 && ix_is_cmp(h1.op) && h2.op == IR_BR && h2.a == h1.d && u_at(nuse, h1.d) == 1 && !falls {
-        ix_cmp(&mut out, al, h1.a, h1.b);
-        ix_br_flags(&mut out, f.x, h1.op, h2.b, h2.c, ix_pick_next(f, i + 1, h2.b, h2.c));
+        let cop = ix_cmp_br(&mut out, al, h1.a, h1.b, h1.op);
+        ix_br_flags(&mut out, f.x, cop, h2.b, h2.c, ix_pick_next(f, i + 1, h2.b, h2.c));
       } else if !falls {
         ix_jump(&mut out, "jmp", f.x, q.a);
       }
@@ -2830,8 +2892,8 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       i = i + 1;
     } else if ix_is_cmp(q.op) && nq.op == IR_BR && nq.a == q.d && u_at(nuse, q.d) == 1 {
       // A comparison that only the branch after it reads: no boolean.
-      ix_cmp(&mut out, al, q.a, q.b);
-      ix_br_flags(&mut out, f.x, q.op, nq.b, nq.c, ix_pick_next(f, i + 2, nq.b, nq.c));
+      let cop = ix_cmp_br(&mut out, al, q.a, q.b, q.op);
+      ix_br_flags(&mut out, f.x, cop, nq.b, nq.c, ix_pick_next(f, i + 2, nq.b, nq.c));
       i = i + 1;
     } else if q.op == IR_RET && q.c > 0 {
       // A result of more than two words goes to the space the caller reserved.
@@ -4820,7 +4882,15 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
     iropt_copies(&mut f);
     iropt_dce(&mut f);
   }
+  // The same address computed twice in a loop (the load a comparison reads
+  // and the load after it) is one value before the counter's multiples are
+  // reduced, so that one register stands for it.
+  if iropt_ebb(&mut f) > 0 {
+    iropt_copies(&mut f);
+    iropt_dce(&mut f);
+  }
   iropt_ivs(&mut f);
+  iropt_remdiv(&mut f);
   iropt_ebb(&mut f);
   iropt_copies(&mut f);
   if iropt_xorcancel(&mut f) > 0 {
