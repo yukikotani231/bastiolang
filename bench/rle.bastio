@@ -1,0 +1,78 @@
+// Run-length encoding of 32 MiB of bytes made of runs of 1 to 16 equal bytes,
+// 4 passes: pairs of (run length, byte) are written to a second buffer and the
+// output is summed.
+const SIZE: u64 = 33554432;
+
+fn text() -> Bytes
+  ensures blen(result) == SIZE
+{
+  let mut b = balloc(SIZE);
+  let mut x = 12345;
+  let mut i = 0;
+  while i < SIZE
+    invariant blen(b) == SIZE && i <= SIZE
+  {
+    x = wrap_add(wrap_mul(x, 6364136223846793005), 1442695040888963407);
+    let r = x / 4294967296;
+    let n = r % 16 + 1;
+    let c = cast[u8](97 + r / 16 % 4);
+    let mut k = 0;
+    while k < n && i < SIZE
+      invariant blen(b) == SIZE && i <= SIZE
+    {
+      bset(&mut b, i, c);
+      i = i + 1;
+      k = k + 1;
+    }
+  }
+  return b;
+}
+
+fn encode(b: &Bytes, out: &mut Bytes) -> u64
+  requires blen(b) == SIZE && blen(out) == 2 * SIZE
+  ensures blen(out) == 2 * SIZE
+{
+  let mut o = 0;
+  let mut i = 0;
+  while i < SIZE
+    invariant i <= SIZE && o <= 2 * i && blen(b) == SIZE && blen(out) == 2 * SIZE
+  {
+    let c = bget(b, i);
+    let mut n = 1;
+    while i + n < SIZE && n < 255 && bget(b, i + n) == c
+      invariant n >= 1 && n <= 255 && i + n <= SIZE && blen(b) == SIZE
+    {
+      n = n + 1;
+    }
+    bset(&mut out, o, cast[u8](n));
+    bset(&mut out, o + 1, c);
+    o = o + 2;
+    i = i + n;
+  }
+  return o;
+}
+
+fn main() -> u64 {
+  let b = text();
+  let mut out = balloc(2 * SIZE);
+  let mut t = 0;
+  let mut p = 0;
+  while p < 4
+    invariant p <= 4 && blen(b) == SIZE && blen(out) == 2 * SIZE
+  {
+    let o = encode(b, &mut out);
+    t = wrap_add(t, o);
+    let mut j = 0;
+    while j < o && j < 2 * SIZE
+      invariant blen(out) == 2 * SIZE
+    {
+      t = wrap_add(wrap_mul(t, 31), cast[u64](bget(out, j)));
+      j = j + 1;
+    }
+    p = p + 1;
+  }
+  print(t);
+  bfree(b);
+  bfree(out);
+  return 0;
+}
