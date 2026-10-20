@@ -2279,6 +2279,59 @@ fn ix_load_cmp(f: &IrFn, al: &IrAlloc, nuse: &Vec[u64], ub: &Vec[u64], i: u64) -
   return j;
 }
 
+/// Writes the displacement `-k` of an address (nothing for 0).
+fn ix_w_disp(out: &mut Vec[u64], k: u64) {
+  if k != 0 {
+    w_s(&mut out, "-");
+    w_num(&mut out, k);
+  }
+}
+
+/// The position of a `sub` of a register by a small constant, read once, by
+/// the add that `ix_scale_fuse` pairs with the multiply at `i`, among the
+/// instructions between them (so that the `lea` of the pair can carry the
+/// constant as a displacement and the `sub` is not written); 0 if none.
+fn ix_sub_disp(f: &IrFn, al: &IrAlloc, m: &Mono, nuse: &Vec[u64], i: u64) -> u64 {
+  let mq = ix_at(f, i);
+  let j = ix_scale_fuse(f, al, m, nuse, i);
+  if mq.op != IR_MUL || j == 0 || j > wrap_add(i, 8) {
+    return 0;
+  }
+  let aq = ix_at(f, j);
+  let mut found = 0;
+  let mut k = wrap_add(i, 1);
+  while k < j && found == 0 {
+    let q = ix_at(f, k);
+    if q.op == IR_SUB && !ix_wraps(m, q) && q.d != IR_NONE && q.d < vec_len(nuse) && u_at(nuse, q.d) == 1 && (aq.a == q.d || aq.b == q.d) {
+      let lk = ix_loc(al, q.b);
+      let lx = ix_loc(al, q.a);
+      let lm = ix_loc(al, mq.d);
+      let ld = ix_loc(al, aq.d);
+      let la = ix_loc(al, mq.a);
+      let mut ok = lk.k == IXK_IMM && lk.imm != 0 && lk.imm < 1000000 && lx.k == IXK_REG;
+      // x is read by the `lea`, after the multiply wrote its result and the
+      // add its own, and nothing in between writes it.
+      if ok {
+        ok = lm.k == IXK_REG && ld.k == IXK_REG && lm.reg != lx.reg && ld.reg != lx.reg && la.k == IXK_REG && la.reg != lx.reg && q.a != mq.d;
+      }
+      let mut z = wrap_add(k, 1);
+      while ok && z < j {
+        let t = ix_at(f, z);
+        let lt = ix_loc(al, t.d);
+        if lt.k == IXK_REG && lt.reg == lx.reg {
+          ok = false;
+        }
+        z = wrap_add(z, 1);
+      }
+      if ok {
+        found = k;
+      }
+    }
+    k = wrap_add(k, 1);
+  }
+  return found;
+}
+
 /// Index of the `k`th instruction of a select that starts with the comparison
 /// at `i`: constants that stand as immediates (they write nothing) may lie
 /// between its instructions.
@@ -2653,6 +2706,10 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
   let mut ctx = false;
   let mut pend_j = 0;
   let mut pend_i = 0;
+  // A `y = x - K` that the `lea` of the add after it (`ix_scale_fuse`) takes as a displacement: y, the register of x and K.
+  let mut sk_y = IR_NONE;
+  let mut sk_reg = 0;
+  let mut sk_k = 0;
   let mut i = 0;
   while i < n {
     let live = ctx;
@@ -2668,7 +2725,12 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
         y = q.a;
       }
       let la = ix_loc(al, mq.a);
-      let ly = ix_loc(al, y);
+      let mut ly = ix_loc(al, y);
+      let mut disp = 0;
+      if y == sk_y {
+        ly = ix_rl(sk_reg);
+        disp = sk_k;
+      }
       let ld = ix_loc(al, q.d);
       let lk = ix_loc(al, mq.b);
       let k = lk.imm;
@@ -2695,7 +2757,9 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
         if k == 6 || k == 10 || k == 18 {
           sc2 = 2;
         }
-        w_s(&mut out, "\tlea (");
+        w_s(&mut out, "\tlea ");
+        ix_w_disp(&mut out, disp);
+        w_s(&mut out, "(");
         w_s(&mut out, x86_rname(ly.reg));
         w_s(&mut out, ", ");
         w_s(&mut out, x86_rname(ld.reg));
@@ -2706,7 +2770,9 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
         w_s(&mut out, x86_rname(ld.reg));
         w_s(&mut out, "\n");
       } else {
-        w_s(&mut out, "\tlea (");
+        w_s(&mut out, "\tlea ");
+        ix_w_disp(&mut out, disp);
+        w_s(&mut out, "(");
         w_s(&mut out, x86_rname(ly.reg));
         w_s(&mut out, ", ");
         w_s(&mut out, x86_rname(la.reg));
@@ -2717,9 +2783,21 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
         w_s(&mut out, "\n");
       }
       pend_j = 0;
+      sk_y = IR_NONE;
+    } else if q.op == IR_SUB && sk_y == q.d && pend_j != 0 {
+      // Taken by the `lea` of the add (see `ix_sub_disp`).
     } else if q.op == IR_MUL && pend_j == 0 && ix_scale_fuse(f, al, m, nuse, i) != 0 {
       pend_j = ix_scale_fuse(f, al, m, nuse, i);
       pend_i = i;
+      let sp = ix_sub_disp(f, al, m, nuse, i);
+      if sp != 0 {
+        let sq = ix_at(f, sp);
+        let lx = ix_loc(al, sq.a);
+        let lkk = ix_loc(al, sq.b);
+        sk_y = sq.d;
+        sk_reg = lx.reg;
+        sk_k = lkk.imm;
+      }
     } else if q.op == IR_LABEL {
       if u_at(heads, q.a) == 1 {
         w_s(&mut out, "\t.p2align 4\n");
