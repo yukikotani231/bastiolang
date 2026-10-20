@@ -707,6 +707,24 @@ fn ix_mentions(v: &Vec[u64], pat: Str) -> bool {
   return false;
 }
 
+/// Does the text `v` mention `pat` from position `from` on?
+fn ix_mentions_from(v: &Vec[u64], from: u64, pat: Str) -> bool {
+  let n = vec_len(v);
+  let m = slen(pat);
+  let mut i = from;
+  while i < n {
+    let mut j = 0;
+    while j < m && i + j < n && vec_get(v, i + j) == cast[u64](sget(pat, j)) {
+      j = j + 1;
+    }
+    if j == m {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
 /// Whether the text `v` has `pat` at position `i`.
 fn ix_has_at(v: &Vec[u64], i: u64, pat: Str) -> bool {
   let m = slen(pat);
@@ -4521,6 +4539,9 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
   iropt_reach(&mut f);
   iropt_labels(&mut f);
   iropt_rotate(&mut f);
+  if iropt_entry_guard(&mut f) > 0 {
+    iropt_labels(&mut f);
+  }
   if ix_incr(&mut f) > 0 {
     iropt_dce(&mut f);
   }
@@ -4597,6 +4618,7 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
     ix_ins2(&mut inner, "mov", ix_rl(ix_callee(k)), ix_ml(wrap_add(k, 1)));
     k = k + 1;
   }
+  let save_end = vec_len(inner);
   // A result of more than two words is above the parameters left on the stack.
   let mut retoff = 16;
   if na == 0 {
@@ -4637,6 +4659,21 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
   ix_body(&mut inner, f, al, &mut g, c, &mut m, p, nuse, moff, base, words, ix_buffer(c, m, p, rt), retoff);
   ix_lbl(&mut inner, f.x, IR_NONE);
   w_s(&mut inner, ":\n");
+  // The allocator counted a callee-saved register that no instruction ended
+  // up using: allocate again with one register fewer, so the function does
+  // not save and restore it.
+  let top = wrap_sub(al.ncallee_used, 1);
+  if !fast && top >= 1 && top <= 4 && !ix_mentions_from(inner, save_end, x86_rname(ix_callee(top))) {
+    vec_free(inner);
+    vec_free(out);
+    vec_free(nuse);
+    vec_free(moff);
+    vec_free(pos);
+    vec_free(stub);
+    ra_free(al);
+    ir_free(f);
+    return wrap_add(10, top);
+  }
   k = 0;
   while k < al.ncallee_used {
     ix_ins2(&mut inner, "mov", ix_ml(wrap_add(k, 1)), ix_rl(ix_callee(k)));
@@ -4730,9 +4767,19 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
 /// `irx_function_n` with %rbp among the registers, and without it when the
 /// frame cannot be addressed from %rsp.
 fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> bool {
-  let r = irx_function_n(&mut g, c, &mut m, p, x, 6);
+  let mut r = irx_function_n(&mut g, c, &mut m, p, x, 6);
+  let mut tries = 0;
+  while r >= 11 && r <= 14 && tries < 6 {
+    r = irx_function_n(&mut g, c, &mut m, p, x, r - 10);
+    tries = tries + 1;
+  }
   if r == 2 {
-    return irx_function_n(&mut g, c, &mut m, p, x, 5) == 1;
+    r = irx_function_n(&mut g, c, &mut m, p, x, 5);
+    tries = 0;
+    while r >= 11 && r <= 14 && tries < 6 {
+      r = irx_function_n(&mut g, c, &mut m, p, x, r - 10);
+      tries = tries + 1;
+    }
   }
   return r == 1;
 }
