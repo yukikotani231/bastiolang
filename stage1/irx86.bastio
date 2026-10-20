@@ -478,6 +478,24 @@ fn ix_cmp(out: &mut Vec[u64], al: &IrAlloc, a: u64, b: u64) {
   }
 }
 
+/// The comparison before a branch on `op`, and the condition to branch on.
+/// An unsigned `a > 0` or `a <= 0` is a test of ZF alone (`a != 0`, `a == 0`),
+/// so when the instruction just written is an `add` or `sub` into the
+/// register `a` (the step of a countdown), its flags are the comparison's.
+fn ix_cmp_br(out: &mut Vec[u64], al: &IrAlloc, a: u64, b: u64, op: u64) -> u64 {
+  let la = ix_loc(al, a);
+  let lb = ix_loc(al, b);
+  if lb.k == IXK_IMM && lb.imm == 0 && la.k == IXK_REG && (op == IR_GT || op == IR_LE)
+     && (ix_last_line(out, "\tsub ", x86_rname(la.reg)) || ix_last_line(out, "\tadd ", x86_rname(la.reg))) {
+    if op == IR_GT {
+      return IR_NE;
+    }
+    return IR_EQ;
+  }
+  ix_cmp(&mut out, al, a, b);
+  return op;
+}
+
 /// The symbol of function instance `x`.
 fn ix_sym(out: &mut Vec[u64], g: &mut X86, m: &Mono, p: &Parser, x: u64) {
   x86_sym(&mut g, m, p, x);
@@ -2694,8 +2712,8 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
         ix_cmp_zero(&mut out, al, h1.a);
         ix_br_flags(&mut out, f.x, IR_NE, h1.b, h1.c, ix_pick_next(f, i + 1, h1.b, h1.c));
       } else if lp0 != 0 && ix_is_cmp(h1.op) && h2.op == IR_BR && h2.a == h1.d && u_at(nuse, h1.d) == 1 && !falls {
-        ix_cmp(&mut out, al, h1.a, h1.b);
-        ix_br_flags(&mut out, f.x, h1.op, h2.b, h2.c, ix_pick_next(f, i + 1, h2.b, h2.c));
+        let cop = ix_cmp_br(&mut out, al, h1.a, h1.b, h1.op);
+        ix_br_flags(&mut out, f.x, cop, h2.b, h2.c, ix_pick_next(f, i + 1, h2.b, h2.c));
       } else if !falls {
         ix_jump(&mut out, "jmp", f.x, q.a);
       }
@@ -2874,8 +2892,8 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       i = i + 1;
     } else if ix_is_cmp(q.op) && nq.op == IR_BR && nq.a == q.d && u_at(nuse, q.d) == 1 {
       // A comparison that only the branch after it reads: no boolean.
-      ix_cmp(&mut out, al, q.a, q.b);
-      ix_br_flags(&mut out, f.x, q.op, nq.b, nq.c, ix_pick_next(f, i + 2, nq.b, nq.c));
+      let cop = ix_cmp_br(&mut out, al, q.a, q.b, q.op);
+      ix_br_flags(&mut out, f.x, cop, nq.b, nq.c, ix_pick_next(f, i + 2, nq.b, nq.c));
       i = i + 1;
     } else if q.op == IR_RET && q.c > 0 {
       // A result of more than two words goes to the space the caller reserved.
@@ -4852,6 +4870,13 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
     iropt_labels(&mut f);
   }
   if iropt_zext(&mut f, true) > 0 {
+    iropt_copies(&mut f);
+    iropt_dce(&mut f);
+  }
+  // The same address computed twice in a loop (the load a comparison reads
+  // and the load after it) is one value before the counter's multiples are
+  // reduced, so that one register stands for it.
+  if iropt_ebb(&mut f) > 0 {
     iropt_copies(&mut f);
     iropt_dce(&mut f);
   }
