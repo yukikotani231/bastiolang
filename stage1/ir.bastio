@@ -136,6 +136,8 @@ struct IrFn {
   why: Vec[u64],
   /// The `&mut Buf` / `&mut Bytes` parameters: per parameter its address, data and length registers.
   lent: Vec[u64],
+  /// Integer parameters that `requires` proves nonzero (`k > 0`, `k >= 1`, `k != 0`).
+  nz: Vec[u64],
   /// The line of the statement being lowered, and where the lowering failed.
   cur: u64,
   at: u64
@@ -143,7 +145,7 @@ struct IrFn {
 
 fn ir_new(x: u64) -> IrFn {
   return IrFn { x: x, params: vec_new[u64](), ins: vec_new[IrIns](), args: vec_new[u64](), nreg: 0, nlabel: 0,
-    vars: vec_new[IrVar](), failed: false, why: vec_new[u64](), lent: vec_new[u64](), cur: 0, at: 0 };
+    vars: vec_new[IrVar](), failed: false, why: vec_new[u64](), lent: vec_new[u64](), nz: vec_new[u64](), cur: 0, at: 0 };
 }
 
 fn ir_free(f: IrFn) {
@@ -153,6 +155,7 @@ fn ir_free(f: IrFn) {
   vec_free(f.vars);
   vec_free(f.why);
   vec_free(f.lent);
+  vec_free(f.nz);
 }
 
 fn ir_fail(f: &mut IrFn, why: Str) {
@@ -4747,6 +4750,19 @@ fn ir_trim(f: &mut IrFn) {
 /// Lowers function instance `x`: parameters, then the body, and a `return`
 /// at the end for a body that falls off it. `f.failed` says whether the
 /// function is outside the subset.
+/// Does the `requires` clause `e` say that the variable `s..en` is not zero:
+/// `k > 0`, `k >= 1`, `k != 0`, or one of them in a conjunction?
+fn ir_req_nz(p: &Parser, e: u64, s: u64, en: u64) -> bool {
+  if e == 0 {
+    return false;
+  }
+  let x = node_at(p.nodes, e);
+  if x.kind == E_BIN && x.v == P_ANDAND {
+    return ir_req_nz(p, x.a, s, en) || ir_req_nz(p, x.b, s, en);
+  }
+  return ir_is_var_op_int(p, e, s, en, P_GT, 0) || ir_is_var_op_int(p, e, s, en, P_GE, 1) || ir_is_var_op_int(p, e, s, en, P_NE, 0);
+}
+
 fn ir_lower(c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> IrFn {
   let mut f = ir_new(x);
   let xi = inst_at(m, x);
@@ -4837,6 +4853,16 @@ fn ir_lower(c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> IrFn {
         vec_push(&mut f.params, r.r0);
         if r.r1 != IR_NONE {
           vec_push(&mut f.params, r.r1);
+        }
+        if pk == IRK_INT && kind_t(m, pt) != TY_MUTREF && qn.v == 0 {
+          let mut rq = dn.c;
+          while rq != 0 {
+            let rn = node_at(p.nodes, rq);
+            if ir_req_nz(p, rq, qn.s, qn.e) {
+              vec_push(&mut f.nz, r.r0);
+            }
+            rq = rn.next;
+          }
         }
       }
       ir_bind(&mut f, qn.s, qn.e, r);
