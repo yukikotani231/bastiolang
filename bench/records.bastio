@@ -1,0 +1,54 @@
+// Insertion sort of 8192 records (a key and a payload) held in one Vec: the
+// work is struct loads and stores through a Vec with a data-dependent exit.
+// The sum of key * position over the sorted records is the checksum.
+struct R { key: u64, val: u64 }
+
+const N: u64 = 8192;
+
+fn key_at(rs: &Vec[R], j: u64) -> u64
+  requires vlen(rs) == N && j < N
+{
+  let r = vec_get(rs, j);
+  return r.key;
+}
+
+fn main() -> u64 {
+  let mut rs = vec_new[R]();
+  let mut s = 12345;
+  let mut i = 0;
+  while i < N
+    invariant i <= N && vlen(rs) == i && s < 4294967296
+  {
+    s = (s * 1103515245 + 12345) % 4294967296;
+    vec_push(&mut rs, R { key: s / 16 % 1048576, val: i });
+    i = i + 1;
+  }
+  i = 1;
+  while i < N
+    invariant i <= N && vlen(rs) == N
+  {
+    let cur = vec_get(rs, i);
+    let mut j = i;
+    while j > 0 && key_at(rs, j - 1) > cur.key
+      invariant j <= i && i < N && vlen(rs) == N
+    {
+      let prev = vec_get(rs, j - 1);
+      vec_set(&mut rs, j, prev);
+      j = j - 1;
+    }
+    vec_set(&mut rs, j, cur);
+    i = i + 1;
+  }
+  let mut t = 0;
+  i = 0;
+  while i < N
+    invariant i <= N && vlen(rs) == N
+  {
+    let r = vec_get(rs, i);
+    t = wrap_add(t, wrap_mul(r.key, i) ^ r.val);
+    i = i + 1;
+  }
+  print(t);
+  vec_free(rs);
+  return 0;
+}

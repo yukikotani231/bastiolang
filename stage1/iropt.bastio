@@ -6490,22 +6490,14 @@ fn iropt_ub_ins(q: IrIns, ub: &Vec[u64], cv: &Vec[u64]) -> u64 {
   return top;
 }
 
-/// Drops a reduction that cannot change its operand: `x % 4294967296` and
-/// `x & 0xffffffff` (and any `% k` or `& (2^n - 1)`) of a value already below
-/// the modulus become a `mov`. The bound of a register is the largest value
-/// any instruction that writes it can give, found by iterating over the
-/// function until nothing grows (a register that still grows after a few
-/// rounds is unbounded); the arguments, calls and every operation not listed
-/// in `iropt_ub_ins` are unbounded. A CRC step `(c / 2 ^ K) % 2^32` of a `c`
-/// below 2^32 then loses the reduction. Returns how many it dropped.
-fn iropt_zext(f: &mut IrFn, late: bool) -> u64 {
+/// The bound of every register (see `iropt_zext`), with `ndef` and `cv` of
+/// `f`. `wb`, if not empty, has for each instruction the width in bits of the
+/// sized integer a `wrap` or wrapping operation reduces to (0: none), which
+/// is then also a bound. `conv` tells whether the iteration settled; when it
+/// did not, the bounds are not to be used.
+fn iropt_ub_all(f: &IrFn, ndef: &Vec[u64], cv: &Vec[u64], wb: &Vec[u64], conv: &mut bool) -> Vec[u64] {
   let n = vec_len(f.ins);
-  if n > 4000000 || f.nreg > 100000000 {
-    return 0;
-  }
   let top = 0xFFFFFFFFFFFFFFFF;
-  let ndef = iropt_ndef(f);
-  let cv = iropt_consts(f, ndef);
   let mut ub = vec_new[u64]();
   let mut r = 0;
   while r < f.nreg && r < 1000000000 {
@@ -6549,6 +6541,15 @@ fn iropt_zext(f: &mut IrFn, late: bool) -> u64 {
           let mut nb = top;
           if d == q.d && q.op != IR_CALL && q.op != IR_CALLM {
             nb = iropt_ub_ins(q, ub, cv);
+            if i < vec_len(wb) {
+              let bits = u_at(wb, i);
+              if bits != 0 && bits < 64 {
+                let cap = wrap_sub(1 << bits, 1);
+                if nb > cap {
+                  nb = cap;
+                }
+              }
+            }
           }
           let prev = u_at(ub, d);
           if nb > prev {
@@ -6566,6 +6567,38 @@ fn iropt_zext(f: &mut IrFn, late: bool) -> u64 {
     }
     round = wrap_add(round, 1);
   }
+  conv = !changed;
+  if changed {
+    let mut r2 = 0;
+    while r2 < vec_len(ub) {
+      ra_set(&mut ub, r2, top);
+      r2 = wrap_add(r2, 1);
+    }
+  }
+  return ub;
+}
+
+/// Drops a reduction that cannot change its operand: `x % 4294967296` and
+/// `x & 0xffffffff` (and any `% k` or `& (2^n - 1)`) of a value already below
+/// the modulus become a `mov`. The bound of a register is the largest value
+/// any instruction that writes it can give, found by iterating over the
+/// function until nothing grows (a register that still grows after a few
+/// rounds is unbounded); the arguments, calls and every operation not listed
+/// in `iropt_ub_ins` are unbounded. A CRC step `(c / 2 ^ K) % 2^32` of a `c`
+/// below 2^32 then loses the reduction. Returns how many it dropped.
+fn iropt_zext(f: &mut IrFn, late: bool) -> u64 {
+  let n = vec_len(f.ins);
+  if n > 4000000 || f.nreg > 100000000 {
+    return 0;
+  }
+  let top = 0xFFFFFFFFFFFFFFFF;
+  let ndef = iropt_ndef(f);
+  let cv = iropt_consts(f, ndef);
+  let mut conv = false;
+  let nowb = vec_new[u64]();
+  let ub = iropt_ub_all(f, ndef, cv, nowb, &mut conv);
+  vec_free(nowb);
+  let changed = !conv;
   let mut done = 0;
   if !changed {
     let mut i = 0;
