@@ -1246,7 +1246,7 @@ fn iropt_copies(f: &mut IrFn) -> u64 {
     while i < n {
       let q = vec_get(f.ins, i);
       if q.op == IR_MOV && q.d != q.a && q.d < f.nreg && q.a < f.nreg && u_at(ndef, q.d) == 1 && u_at(ndef, q.a) == 1
-        && u_at(isdst, q.a) == 0 && u_at(first, q.d) != IR_NONE && u_at(first, q.d) > i {
+        && u_at(isdst, q.a) == 0 && iropt_count(f.nz, q.d) == 0 && u_at(first, q.d) != IR_NONE && u_at(first, q.d) > i {
         let pa = u_at(defpos, q.a);
         let lu = u_at(last, q.d);
         let qa = iropt_at(f, pa);
@@ -7931,4 +7931,519 @@ fn iropt_coldarm(f: &mut IrFn) -> u64 {
     iropt_labs_free(lb);
   }
   return total;
+}
+
+// ---- Results known on the way out of a loop ----
+
+/// Does `op` end a block?
+fn iropt_xf_term(op: u64) -> bool {
+  return op == IR_JMP || op == IR_BR || op == IR_RET || op == IR_UNREACH;
+}
+
+/// Is `x == y` known on this path: 1 or 0 (2: not known)?
+fn iropt_xf_fact(fx: &Vec[u64], fy: &Vec[u64], fv: &Vec[u64], x: u64, y: u64) -> u64 {
+  let mut k = 0;
+  while k < vec_len(fx) {
+    let v = u_at(fv, k);
+    if v <= 1 && ((vec_get(fx, k) == x && u_at(fy, k) == y) || (vec_get(fx, k) == y && u_at(fy, k) == x)) {
+      return v;
+    }
+    k = wrap_add(k, 1);
+  }
+  return 2;
+}
+
+/// The constant that register `r` holds on this path (IR_NONE: not known): a
+/// constant register, or one that a fact equates with one.
+fn iropt_xf_known(cv: &Vec[u64], fx: &Vec[u64], fy: &Vec[u64], fv: &Vec[u64], r: u64) -> u64 {
+  if r < vec_len(cv) && u_at(cv, r) != IR_NONE {
+    return u_at(cv, r);
+  }
+  let mut k = 0;
+  while k < vec_len(fx) {
+    if u_at(fv, k) == 1 {
+      let a = vec_get(fx, k);
+      let b = u_at(fy, k);
+      if a == r && b < vec_len(cv) && u_at(cv, b) != IR_NONE {
+        return u_at(cv, b);
+      }
+      if b == r && a < vec_len(cv) && u_at(cv, a) != IR_NONE {
+        return u_at(cv, a);
+      }
+    }
+    k = wrap_add(k, 1);
+  }
+  return IR_NONE;
+}
+
+/// Forget what a path knows about register `r`, which an instruction writes.
+fn iropt_xf_kill(fx: &Vec[u64], fy: &Vec[u64], fv: &mut Vec[u64], la: &Vec[u64], lb: &Vec[u64], ld: &mut Vec[u64], ck: &mut Vec[u64], cx: &Vec[u64], cy: &Vec[u64], cd: &Vec[u64], r: u64) {
+  let mut k = 0;
+  while k < vec_len(fx) {
+    if vec_get(fx, k) == r || u_at(fy, k) == r {
+      ra_set(&mut fv, k, 9);
+    }
+    k = wrap_add(k, 1);
+  }
+  k = 0;
+  while k < vec_len(la) {
+    if vec_get(la, k) == r || u_at(lb, k) == r || u_at(ld, k) == r {
+      ra_set(&mut ld, k, IR_NONE);
+    }
+    k = wrap_add(k, 1);
+  }
+  k = 0;
+  while k < vec_len(cx) {
+    if vec_get(cx, k) == r || u_at(cy, k) == r || u_at(cd, k) == r {
+      ra_set(&mut ck, k, 0);
+    }
+    k = wrap_add(k, 1);
+  }
+}
+
+/// The tail `iropt_exitfacts` looks for: positions of its load (IR_NONE:
+/// none), its compare, the copy of the compare into the register that the code
+/// after it reads (IR_NONE: the tail returns the compare) and its `ret` or `jmp`.
+struct IrXTail { ok: bool, ld: u64, cm: u64, mv: u64, rt: u64 }
+
+/// Is the code after the label at `h` `[load] [const..] cmp ret`, or
+/// `[load] [const..] cmp mov jmp`, with what it defines read nowhere else (but
+/// the register the `mov` writes) and the `ret` or `mov` taking the compare?
+fn iropt_xf_tail(f: &IrFn, h: u64, ndef: &Vec[u64], nuse: &Vec[u64]) -> IrXTail {
+  let none = IrXTail { ok: false, ld: IR_NONE, cm: IR_NONE, mv: IR_NONE, rt: IR_NONE };
+  let n = vec_len(f.ins);
+  let mut ld = IR_NONE;
+  let mut cm = IR_NONE;
+  let mut mv = IR_NONE;
+  let mut rt = IR_NONE;
+  let mut ok = true;
+  let mut e = wrap_add(h, 1);
+  while ok && rt == IR_NONE && e < n && e < wrap_add(h, 8) {
+    let t = iropt_at(f, e);
+    if t.op == IR_RET || (t.op == IR_JMP && mv != IR_NONE) {
+      rt = e;
+    } else if t.op == IR_LOAD && ld == IR_NONE && cm == IR_NONE && t.c == 8 {
+      ld = e;
+    } else if t.op == IR_CONST {
+      ok = true;
+    } else if (t.op == IR_EQ || t.op == IR_NE) && cm == IR_NONE {
+      cm = e;
+    } else if t.op == IR_MOV && cm != IR_NONE && mv == IR_NONE {
+      mv = e;
+    } else {
+      ok = false;
+    }
+    e = wrap_add(e, 1);
+  }
+  if !ok || cm == IR_NONE || rt == IR_NONE {
+    return none;
+  }
+  let cq = iropt_at(f, cm);
+  let rq = iropt_at(f, rt);
+  let mq = iropt_at(f, mv);
+  if cq.d >= vec_len(ndef) || u_at(ndef, cq.d) != 1 {
+    return none;
+  }
+  if mv == IR_NONE && (rq.op != IR_RET || rq.a != cq.d) {
+    return none;
+  }
+  if mv != IR_NONE && (rq.op != IR_JMP || mq.a != cq.d || mq.d == cq.d || mq.d == cq.a || mq.d == cq.b) {
+    return none;
+  }
+  let mut inside = vec_new[u64]();
+  let mut k = wrap_add(h, 1);
+  while k <= rt {
+    ra_reads(f, iropt_at(f, k), &mut inside);
+    k = wrap_add(k, 1);
+  }
+  let mut tidy = true;
+  k = wrap_add(h, 1);
+  while tidy && k < rt {
+    let t = iropt_at(f, k);
+    if k != mv && (t.d >= vec_len(ndef) || u_at(ndef, t.d) != 1 || iropt_count(inside, t.d) != u_at(nuse, t.d)) {
+      tidy = false;
+    }
+    k = wrap_add(k, 1);
+  }
+  vec_free(inside);
+  if !tidy {
+    return none;
+  }
+  return IrXTail { ok: true, ld: ld, cm: cm, mv: mv, rt: rt };
+}
+
+/// Is it known that register `r` is not the constant `k`: a fact says `r` is
+/// unequal to a register that holds `k`?
+fn iropt_xf_differs(cv: &Vec[u64], fx: &Vec[u64], fy: &Vec[u64], fv: &Vec[u64], r: u64, k: u64) -> bool {
+  let mut z = 0;
+  while z < vec_len(fx) {
+    if u_at(fv, z) == 0 {
+      let a = vec_get(fx, z);
+      let b = u_at(fy, z);
+      if a == r && b < vec_len(cv) && u_at(cv, b) == k {
+        return true;
+      }
+      if b == r && a < vec_len(cv) && u_at(cv, a) == k {
+        return true;
+      }
+    }
+    z = wrap_add(z, 1);
+  }
+  return false;
+}
+
+/// The answer (1 or 0; 2: not known) of the tail `t` on the edge of the
+/// branch at `b` (`pol` 1: its true edge, 0: its false edge), from the
+/// branches and loads on the way to it. The way back stops at a label with
+/// more than one entry.
+fn iropt_xf_edge(f: &IrFn, cv: &Vec[u64], lpos: &Vec[u64], refs: &Vec[u64], rpos: &Vec[u64], b: u64, pol0: u64, t: IrXTail) -> u64 {
+  // The blocks on the way: [first, br) and the polarity of the edge that
+  // leaves each, newest first.
+  let mut ss = vec_new[u64]();
+  let mut se = vec_new[u64]();
+  let mut sp = vec_new[u64]();
+  let mut cur = b;
+  let mut pol = pol0;
+  let mut more = true;
+  while more && vec_len(ss) < 6 {
+    let mut k = cur;
+    let mut bs = IR_NONE;
+    let mut scanning = true;
+    while scanning && k > 0 {
+      k = wrap_sub(k, 1);
+      let q = iropt_at(f, k);
+      if q.op == IR_LABEL {
+        bs = k;
+        scanning = false;
+      } else if iropt_xf_term(q.op) {
+        scanning = false;
+      }
+    }
+    if bs == IR_NONE {
+      // Dead code, or the entry block with no label.
+      if scanning {
+        vec_push(&mut ss, 0);
+        vec_push(&mut se, cur);
+        vec_push(&mut sp, pol);
+      }
+      more = false;
+    } else {
+      vec_push(&mut ss, wrap_add(bs, 1));
+      vec_push(&mut se, cur);
+      vec_push(&mut sp, pol);
+      let lq = iropt_at(f, bs);
+      more = false;
+      let before = iropt_at(f, wrap_sub(bs, 1));
+      if lq.a < vec_len(refs) && u_at(refs, lq.a) == 1 && bs > 0 && iropt_xf_term(before.op) {
+        let rp = u_at(rpos, lq.a);
+        let pq = iropt_at(f, rp);
+        if rp != IR_NONE && pq.op == IR_BR && pq.b != pq.c && rp != cur {
+          if pq.b == lq.a {
+            pol = 1;
+          } else {
+            pol = 0;
+          }
+          cur = rp;
+          more = true;
+        } else if rp != IR_NONE && pq.op == IR_JMP && rp != cur {
+          pol = 2;
+          cur = rp;
+          more = true;
+        }
+      }
+    }
+  }
+  // The facts, replayed from the oldest block.
+  let mut fx = vec_new[u64]();
+  let mut fy = vec_new[u64]();
+  let mut fv = vec_new[u64]();
+  let mut la = vec_new[u64]();
+  let mut lb = vec_new[u64]();
+  let mut ld = vec_new[u64]();
+  let mut ck = vec_new[u64]();
+  let mut cx = vec_new[u64]();
+  let mut cy = vec_new[u64]();
+  let mut cd = vec_new[u64]();
+  let mut si = vec_len(ss);
+  while si > 0 {
+    si = wrap_sub(si, 1);
+    let mut p = u_at(ss, si);
+    let pe = u_at(se, si);
+    while p < pe {
+      let q = iropt_at(f, p);
+      let mut ws = vec_new[u64]();
+      ra_writes(q, &mut ws);
+      let mut w = 0;
+      while w < vec_len(ws) {
+        iropt_xf_kill(fx, fy, &mut fv, la, lb, &mut ld, &mut ck, cx, cy, cd, vec_get(ws, w));
+        w = wrap_add(w, 1);
+      }
+      vec_free(ws);
+      if !iropt_ebb_keeps_loads(q.op) {
+        let mut z = 0;
+        while z < vec_len(ld) {
+          ra_set(&mut ld, z, IR_NONE);
+          z = wrap_add(z, 1);
+        }
+      }
+      if q.op == IR_LOAD && q.c == 8 && q.d != q.a && q.d != q.b && vec_len(la) < 16 {
+        vec_push(&mut la, q.a);
+        vec_push(&mut lb, q.b);
+        vec_push(&mut ld, q.d);
+      }
+      if (q.op == IR_EQ || q.op == IR_NE) && q.d != q.a && q.d != q.b && vec_len(ck) < 16 {
+        vec_push(&mut ck, q.op);
+        vec_push(&mut cx, q.a);
+        vec_push(&mut cy, q.b);
+        vec_push(&mut cd, q.d);
+      }
+      p = wrap_add(p, 1);
+    }
+    // The branch that ends the block, and the edge it takes.
+    let br = iropt_at(f, pe);
+    let pl = u_at(sp, si);
+    if br.op == IR_BR && pl <= 1 {
+      let mut z = 0;
+      while z < vec_len(ck) {
+        if u_at(ck, z) != 0 && u_at(cd, z) == br.a {
+          let mut v = pl;
+          if u_at(ck, z) == IR_NE {
+            v = wrap_sub(1, pl);
+          }
+          vec_push(&mut fx, u_at(cx, z));
+          vec_push(&mut fy, u_at(cy, z));
+          vec_push(&mut fv, v);
+        }
+        z = wrap_add(z, 1);
+      }
+    }
+  }
+  // The tail on this path.
+  let mut res = 2;
+  let cq = iropt_at(f, t.cm);
+  let mut x = cq.a;
+  let mut y = cq.b;
+  if t.ld != IR_NONE {
+    let lq = iropt_at(f, t.ld);
+    let mut found = IR_NONE;
+    let mut z = vec_len(la);
+    while z > 0 && found == IR_NONE {
+      z = wrap_sub(z, 1);
+      if u_at(ld, z) != IR_NONE && u_at(la, z) == lq.a && u_at(lb, z) == lq.b {
+        found = u_at(ld, z);
+      }
+    }
+    if found != IR_NONE {
+      if x == lq.d {
+        x = found;
+      }
+      if y == lq.d {
+        y = found;
+      }
+    } else if x == lq.d || y == lq.d {
+      x = IR_NONE;
+    }
+  }
+  if x != IR_NONE && y != IR_NONE {
+    if x == y {
+      res = 1;
+    } else {
+      res = iropt_xf_fact(fx, fy, fv, x, y);
+      if res == 2 {
+        let kx = iropt_xf_known(cv, fx, fy, fv, x);
+        let ky = iropt_xf_known(cv, fx, fy, fv, y);
+        if kx != IR_NONE && ky != IR_NONE {
+          res = 0;
+          if kx == ky {
+            res = 1;
+          }
+        } else if kx == 0 && iropt_count(f.nz, y) > 0 {
+          res = 0;
+        } else if ky == 0 && iropt_count(f.nz, x) > 0 {
+          res = 0;
+        } else if kx != IR_NONE && iropt_xf_differs(cv, fx, fy, fv, y, kx) {
+          res = 0;
+        } else if ky != IR_NONE && iropt_xf_differs(cv, fx, fy, fv, x, ky) {
+          res = 0;
+        }
+      }
+    }
+  }
+  if res <= 1 && cq.op == IR_NE {
+    res = wrap_sub(1, res);
+  }
+  vec_free(ss);
+  vec_free(se);
+  vec_free(sp);
+  vec_free(fx);
+  vec_free(fy);
+  vec_free(fv);
+  vec_free(la);
+  vec_free(lb);
+  vec_free(ld);
+  vec_free(ck);
+  vec_free(cx);
+  vec_free(cy);
+  vec_free(cd);
+  return res;
+}
+
+/// A join in front of `ret` that recomputes what the paths into it already
+/// settle: `L: v = load a[b]; c = eq v, k; ret c`, reached from the exits of a
+/// search loop. On each path into it the answer follows from the branches
+/// taken (`x == 0` where the empty slot ended the loop, `x == k` where the
+/// match did, `x != k` where the step limit did) and from the load that a
+/// block before already made, so the edge goes to a block that returns the
+/// constant. A parameter that `requires` proves nonzero is never equal to a
+/// register known to be 0. Returns how many edges it redirected.
+fn iropt_exitfacts(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  if n > 200000 || f.nlabel > 1000000 || f.nreg > 10000000 || n == 0 {
+    return 0;
+  }
+  let last = iropt_at(f, wrap_sub(n, 1));
+  if !iropt_xf_term(last.op) {
+    return 0;
+  }
+  let ndef = iropt_ndef(f);
+  let nuse = iropt_nuse(f);
+  let cv = iropt_consts(f, ndef);
+  let mut lpos = vec_new[u64]();
+  let mut refs = vec_new[u64]();
+  let mut rpos = vec_new[u64]();
+  let mut l = 0;
+  while l < f.nlabel {
+    vec_push(&mut lpos, IR_NONE);
+    vec_push(&mut refs, 0);
+    vec_push(&mut rpos, IR_NONE);
+    l = wrap_add(l, 1);
+  }
+  let mut i = 0;
+  while i < n {
+    let q = iropt_at(f, i);
+    if q.op == IR_LABEL && q.a < f.nlabel {
+      ra_set(&mut lpos, q.a, i);
+    }
+    if q.op == IR_JMP && q.a < f.nlabel {
+      ra_set(&mut refs, q.a, wrap_add(u_at(refs, q.a), 1));
+      ra_set(&mut rpos, q.a, i);
+    }
+    if q.op == IR_BR {
+      if q.b < f.nlabel {
+        ra_set(&mut refs, q.b, wrap_add(u_at(refs, q.b), 1));
+        ra_set(&mut rpos, q.b, i);
+      }
+      if q.c < f.nlabel {
+        ra_set(&mut refs, q.c, wrap_add(u_at(refs, q.c), 1));
+        ra_set(&mut rpos, q.c, i);
+      }
+    }
+    i = wrap_add(i, 1);
+  }
+  // The edits: the branch at `ep` sends its true (1) or false (0) edge, `ee`,
+  // to a block that returns `ev` through the `ret` at `er`.
+  let mut ep = vec_new[u64]();
+  let mut ee = vec_new[u64]();
+  let mut ev = vec_new[u64]();
+  let mut er = vec_new[u64]();
+  let mut em = vec_new[u64]();
+  let mut en = vec_new[u64]();
+  l = 0;
+  while l < f.nlabel && l < 1000000 {
+    let h = u_at(lpos, l);
+    if h != IR_NONE && u_at(refs, l) >= 2 {
+      let t = iropt_xf_tail(f, h, ndef, nuse);
+      if t.ok {
+        i = 0;
+        while i < n && vec_len(ep) < 64 {
+          let q = iropt_at(f, i);
+          if q.op == IR_BR && q.b != q.c {
+            let mut side = 0;
+            while side < 2 {
+              let mut tgt = q.b;
+              let mut pol = 1;
+              if side == 1 {
+                tgt = q.c;
+                pol = 0;
+              }
+              if tgt == l {
+                let r = iropt_xf_edge(f, cv, lpos, refs, rpos, i, pol, t);
+                if r <= 1 {
+                  vec_push(&mut ep, i);
+                  vec_push(&mut ee, pol);
+                  vec_push(&mut ev, r);
+                  vec_push(&mut er, t.rt);
+                  vec_push(&mut em, t.mv);
+                  let nl = ir_label(&mut f);
+                  vec_push(&mut en, nl);
+                }
+              }
+              side = wrap_add(side, 1);
+            }
+          }
+          i = wrap_add(i, 1);
+        }
+      }
+    }
+    l = wrap_add(l, 1);
+  }
+  vec_free(lpos);
+  vec_free(refs);
+  vec_free(rpos);
+  vec_free(ndef);
+  vec_free(nuse);
+  vec_free(cv);
+  let done = vec_len(ep);
+  if done == 0 {
+    vec_free(ep);
+    vec_free(ee);
+    vec_free(ev);
+    vec_free(er);
+    vec_free(em);
+    vec_free(en);
+    return 0;
+  }
+  let mut out = vec_new[IrIns]();
+  i = 0;
+  while i < n {
+    let mut q = iropt_at(f, i);
+    let mut k = 0;
+    while k < vec_len(ep) {
+      if vec_get(ep, k) == i {
+        if u_at(ee, k) == 1 {
+          q.b = u_at(en, k);
+        } else {
+          q.c = u_at(en, k);
+        }
+      }
+      k = wrap_add(k, 1);
+    }
+    vec_push(&mut out, q);
+    i = wrap_add(i, 1);
+  }
+  // The new blocks, after the last instruction.
+  let mut k = 0;
+  while k < vec_len(ep) {
+    let rq = iropt_at(f, u_at(er, k));
+    let fresh = ir_reg(&mut f);
+    vec_push(&mut out, IrIns { op: IR_LABEL, d: IR_NONE, a: u_at(en, k), b: 0, c: 0, ty: 0 });
+    vec_push(&mut out, IrIns { op: IR_CONST, d: fresh, a: u_at(ev, k), b: 0, c: 0, ty: 0 });
+    if u_at(em, k) == IR_NONE {
+      vec_push(&mut out, IrIns { op: IR_RET, d: rq.d, a: fresh, b: rq.b, c: rq.c, ty: rq.ty });
+    } else {
+      let mq = iropt_at(f, u_at(em, k));
+      vec_push(&mut out, IrIns { op: IR_MOV, d: mq.d, a: fresh, b: mq.b, c: mq.c, ty: mq.ty });
+      vec_push(&mut out, rq);
+    }
+    k = wrap_add(k, 1);
+  }
+  vec_free(ep);
+  vec_free(ee);
+  vec_free(ev);
+  vec_free(er);
+  vec_free(em);
+  vec_free(en);
+  vec_free(f.ins);
+  f.ins = out;
+  return done;
 }
