@@ -478,6 +478,34 @@ fn ix_cmp(out: &mut Vec[u64], al: &IrAlloc, a: u64, b: u64) {
   }
 }
 
+/// A byte `load` at `i` that only the `eq` or `ne` after it reads, whose other
+/// operand is the byte loaded by the instruction before (in a register, read
+/// by nothing else than that compare), and a branch on the compare after it:
+/// the register of the other operand, or IR_NONE.
+fn ix_ld8cmp(f: &IrFn, al: &IrAlloc, nuse: &Vec[u64], i: u64) -> u64 {
+  if i == 0 || i > 100000000 {
+    return IR_NONE;
+  }
+  let q = ix_at(f, i);
+  let pq = ix_at(f, i - 1);
+  let cq = ix_at(f, i + 1);
+  let bq = ix_at(f, i + 2);
+  if q.op != IR_LOAD || q.c != 1 || pq.op != IR_LOAD || pq.c != 1 || (cq.op != IR_EQ && cq.op != IR_NE) || bq.op != IR_BR || bq.a != cq.d {
+    return IR_NONE;
+  }
+  if u_at(nuse, q.d) != 1 || u_at(nuse, cq.d) != 1 || u_at(nuse, pq.d) != 1 {
+    return IR_NONE;
+  }
+  if !((cq.a == pq.d && cq.b == q.d) || (cq.b == pq.d && cq.a == q.d)) {
+    return IR_NONE;
+  }
+  let lo = ix_loc(al, pq.d);
+  if lo.k != IXK_REG {
+    return IR_NONE;
+  }
+  return pq.d;
+}
+
 /// The comparison before a branch on `op`, and the condition to branch on.
 /// An unsigned `a > 0` or `a <= 0` is a test of ZF alone (`a != 0`, `a == 0`),
 /// so when the instruction just written is an `add` or `sub` into the
@@ -2890,6 +2918,21 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       w_s(&mut out, x86_rname(lm.reg));
       w_s(&mut out, "\n");
       i = i + 1;
+    } else if q.op == IR_LOAD && q.c == 1 && ix_ld8cmp(f, al, nuse, i) != IR_NONE {
+      // A byte loaded only to be compared for (in)equality with the byte
+      // loaded just before: `cmpb mem, %reg8`, no register for the second.
+      let o = ix_ld8cmp(f, al, nuse, i);
+      let cq = ix_at(f, i + 1);
+      let bq = ix_at(f, i + 2);
+      let lo = ix_loc(al, o);
+      let ap = ix_aprep(&mut out, al, q.a, q.b, q.ty);
+      w_s(&mut out, "\tcmpb ");
+      ix_awrite(&mut out, ap, 1);
+      w_s(&mut out, ", ");
+      w_s(&mut out, ix_name8(lo.reg));
+      w_s(&mut out, "\n");
+      ix_br_flags(&mut out, f.x, cq.op, bq.b, bq.c, ix_pick_next(f, i + 3, bq.b, bq.c));
+      i = i + 2;
     } else if ix_is_cmp(q.op) && nq.op == IR_BR && nq.a == q.d && u_at(nuse, q.d) == 1 {
       // A comparison that only the branch after it reads: no boolean.
       let cop = ix_cmp_br(&mut out, al, q.a, q.b, q.op);
@@ -4864,6 +4907,9 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
   while iropt_cmpfuse(&mut f) > 0 && fused < 4 {
     fused = fused + 1;
   }
+  // After `while k < n && a[k] == b[k] { k += 1 }` an `if k == n` on the exit
+  // of a mismatch is decided by the loop's test, which holds there.
+  iropt_efacts(&mut f);
   if iropt_ifconv(&mut f) > 0 {
     iropt_copies(&mut f);
     iropt_dce(&mut f);

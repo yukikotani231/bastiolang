@@ -1490,7 +1490,7 @@ fn iropt_rotate(f: &mut IrFn) -> u64 {
       let mut going = true;
       while going && m < 4 && wrap_add(wrap_add(h, m), 3) < n {
         let c = iropt_at(f, wrap_add(wrap_add(h, 1), m));
-        if c.op == IR_CONST || c.op == IR_MOV || c.op == IR_LOAD || iropt_is_cmp(c.op) {
+        if c.op == IR_CONST || c.op == IR_MOV || c.op == IR_LOAD || iropt_is_cmp(c.op) || c.op == IR_ADD || c.op == IR_SUB || c.op == IR_AND || c.op == IR_SHR {
           m = wrap_add(m, 1);
         } else {
           going = false;
@@ -4696,6 +4696,377 @@ fn iropt_ebb_same(cv: &Vec[u64], al: &Vec[u64], ea: &Vec[u64], x0: u64, y0: u64)
 /// before it still holds after it?
 fn iropt_ebb_keeps_loads(op: u64) -> bool {
   return op == IR_CONST || op == IR_MOV || ra_is_binary(op) || op == IR_NOT || op == IR_NEG || op == IR_WRAP || op == IR_LOAD || op == IR_LABEL || op == IR_BR || op == IR_SLOT || op == IR_STRLIT;
+}
+
+/// The range of `x` (unsigned) that the comparison `x op k` being `t` (1 or 0)
+/// says it lies in, as (lo, hi); (0, max) when it says nothing.
+fn iropt_ef_range(op: u64, k: u64, t: u64) -> IrRange {
+  let mx = 18446744073709551615;
+  let mut r = IrRange { lo: 0, hi: mx };
+  if op == IR_LT {
+    if t == 1 && k > 0 {
+      r.hi = k - 1;
+    } else if t == 0 {
+      r.lo = k;
+    }
+  } else if op == IR_LE {
+    if t == 1 {
+      r.hi = k;
+    } else if k < mx {
+      r.lo = k + 1;
+    }
+  } else if op == IR_GT {
+    if t == 1 && k < mx {
+      r.lo = k + 1;
+    } else if t == 0 {
+      r.hi = k;
+    }
+  } else if op == IR_GE {
+    if t == 1 {
+      r.lo = k;
+    } else if k > 0 {
+      r.hi = k - 1;
+    }
+  } else if (op == IR_EQ && t == 1) || (op == IR_NE && t == 0) {
+    r.lo = k;
+    r.hi = k;
+  }
+  return r;
+}
+
+struct IrRange { lo: u64, hi: u64 }
+
+/// 1 or 0 when `x op k` is decided for every `x` in `r`, IR_NONE otherwise.
+fn iropt_ef_decide(op: u64, k: u64, r: IrRange) -> u64 {
+  if op == IR_EQ {
+    if k < r.lo || k > r.hi {
+      return 0;
+    }
+    if r.lo == r.hi {
+      return 1;
+    }
+  } else if op == IR_NE {
+    if k < r.lo || k > r.hi {
+      return 1;
+    }
+    if r.lo == r.hi {
+      return 0;
+    }
+  } else if op == IR_LT {
+    if r.hi < k {
+      return 1;
+    }
+    if r.lo >= k {
+      return 0;
+    }
+  } else if op == IR_LE {
+    if r.hi <= k {
+      return 1;
+    }
+    if r.lo > k {
+      return 0;
+    }
+  } else if op == IR_GT {
+    if r.lo > k {
+      return 1;
+    }
+    if r.hi <= k {
+      return 0;
+    }
+  } else if op == IR_GE {
+    if r.lo >= k {
+      return 1;
+    }
+    if r.hi < k {
+      return 0;
+    }
+  }
+  return IR_NONE;
+}
+
+/// The comparison `c = x op k` (unsigned, `k` a constant) as (op, x, k):
+/// op is 0 when `q` is not of that form.
+struct IrCmpK { op: u64, x: u64, k: u64 }
+
+fn iropt_ef_cmpk(cv: &Vec[u64], q: IrIns) -> IrCmpK {
+  let none = IrCmpK { op: 0, x: 0, k: 0 };
+  if q.op != IR_EQ && q.op != IR_NE && q.op != IR_LT && q.op != IR_LE && q.op != IR_GT && q.op != IR_GE {
+    return none;
+  }
+  let ka = iropt_cval(cv, q.a);
+  let kb = iropt_cval(cv, q.b);
+  if q.a >= vec_len(cv) || q.b >= vec_len(cv) {
+    return none;
+  }
+  if kb != IR_NONE && ka == IR_NONE {
+    return IrCmpK { op: q.op, x: q.a, k: kb };
+  }
+  if ka != IR_NONE && kb == IR_NONE {
+    let mut op = q.op;
+    if op == IR_LT {
+      op = IR_GT;
+    } else if op == IR_GT {
+      op = IR_LT;
+    } else if op == IR_LE {
+      op = IR_GE;
+    } else if op == IR_GE {
+      op = IR_LE;
+    }
+    return IrCmpK { op: op, x: q.b, k: ka };
+  }
+  return none;
+}
+
+/// Branches into a test that the facts about a register decide. A branch on
+/// `c = x < k` (a comparison of a register with a constant, just before it)
+/// tells, on each side, a range for `x` until `x` is written: along the
+/// extended basic block that continues after it. A branch of the block to a label whose code is only constants read once,
+/// a comparison of `x` with a constant and its branch (the `if k == 12` after
+/// a loop that ended on a mismatch, with `k < 12` known from the loop's test)
+/// goes straight to the side the ranges decide. Returns how many edges it
+/// redirected.
+fn iropt_efacts(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  if n > 200000 || f.nlabel > 100000000 || f.nreg > 100000000 {
+    return 0;
+  }
+  let ndef = iropt_ndef(f);
+  let nuse = iropt_nuse(f);
+  let cv = iropt_consts(f, ndef);
+  let mut lpos = vec_new[u64]();
+  let mut cnt = vec_new[u64]();
+  let mut l = 0;
+  while l < f.nlabel {
+    vec_push(&mut lpos, IR_NONE);
+    vec_push(&mut cnt, 0);
+    l = wrap_add(l, 1);
+  }
+  // For each branch: the comparison that makes its condition, if it is one.
+  let mut bop = vec_new[u64]();
+  let mut bx = vec_new[u64]();
+  let mut bk = vec_new[u64]();
+  let mut i = 0;
+  while i < n {
+    let q = iropt_at(f, i);
+    let mut op = 0;
+    let mut x = 0;
+    let mut k = 0;
+    if q.op == IR_LABEL && q.a < f.nlabel {
+      ra_set(&mut lpos, q.a, i);
+    }
+    if q.op == IR_JMP && q.a < f.nlabel {
+      ra_set(&mut cnt, q.a, wrap_add(u_at(cnt, q.a), 1));
+    }
+    if q.op == IR_BR {
+      if q.b < f.nlabel {
+        ra_set(&mut cnt, q.b, wrap_add(u_at(cnt, q.b), 1));
+      }
+      if q.c < f.nlabel {
+        ra_set(&mut cnt, q.c, wrap_add(u_at(cnt, q.c), 1));
+      }
+      // The comparison among the constants and the instruction before them.
+      let mut back = 1;
+      let mut going = true;
+      while going && back <= 3 && back <= i {
+        let pq = iropt_at(f, wrap_sub(i, back));
+        if pq.op == IR_CONST {
+          back = wrap_add(back, 1);
+        } else {
+          going = false;
+          let cm = iropt_ef_cmpk(cv, pq);
+          if cm.op != 0 && pq.d == q.a && u_at(ndef, q.a) == 1 && q.a < f.nreg {
+            // x must not be one of the constants written in between.
+            let mut ok = true;
+            let mut z = 1;
+            while z < back {
+              let zq = iropt_at(f, wrap_sub(i, z));
+              if zq.d == cm.x {
+                ok = false;
+              }
+              z = wrap_add(z, 1);
+            }
+            if ok {
+              op = cm.op;
+              x = cm.x;
+              k = cm.k;
+            }
+          }
+        }
+      }
+    }
+    vec_push(&mut bop, op);
+    vec_push(&mut bx, x);
+    vec_push(&mut bk, k);
+    i = wrap_add(i, 1);
+  }
+  // Facts: register, lo, hi.
+  let mut fr = vec_new[u64]();
+  let mut flo = vec_new[u64]();
+  let mut fhi = vec_new[u64]();
+  let mut done = 0;
+  let mut prev = IrIns { op: IR_JMP, d: IR_NONE, a: IR_NONE, b: 0, c: 0, ty: 0 };
+  let mut pi = 0;
+  i = 0;
+  while i < n {
+    let q = iropt_at(f, i);
+    let mut clear = false;
+    let mut cont = false;
+    if q.op == IR_LABEL {
+      let mut own = 0;
+      if prev.op == IR_BR {
+        if prev.b == q.a {
+          own = wrap_add(own, 1);
+        }
+        if prev.c == q.a {
+          own = wrap_add(own, 1);
+        }
+      }
+      if prev.op == IR_JMP || prev.op == IR_RET || prev.op == IR_UNREACH || q.a >= f.nlabel || u_at(cnt, q.a) != own {
+        clear = true;
+      } else {
+        cont = true;
+      }
+    } else if prev.op == IR_JMP || prev.op == IR_BR || prev.op == IR_RET || prev.op == IR_UNREACH {
+      clear = true;
+    }
+    if clear {
+      while vec_len(fr) > 0 {
+        vec_pop(&mut fr);
+      }
+      while vec_len(flo) > 0 {
+        vec_pop(&mut flo);
+      }
+      while vec_len(fhi) > 0 {
+        vec_pop(&mut fhi);
+      }
+    }
+    if q.op == IR_LABEL && q.a < f.nlabel && cont && prev.op == IR_BR && prev.b != prev.c && u_at(bop, pi) != 0 {
+      // Entering along the branch just above.
+      let mut t = 2;
+      if prev.b == q.a {
+        t = 1;
+      } else if prev.c == q.a {
+        t = 0;
+      }
+      if t != 2 && vec_len(fr) < 32 {
+        let rg = iropt_ef_range(u_at(bop, pi), u_at(bk, pi), t);
+        vec_push(&mut fr, u_at(bx, pi));
+        vec_push(&mut flo, rg.lo);
+        vec_push(&mut fhi, rg.hi);
+      }
+    }
+    if q.op == IR_BR && q.b != q.c && q.b < f.nlabel && q.c < f.nlabel {
+      // The edge to each side: the ranges plus what the branch itself says.
+      let mut tl = q.b;
+      let mut fl = q.c;
+      let mut side = 0;
+      while side < 2 {
+        let mut tgt = q.b;
+        if side == 1 {
+          tgt = q.c;
+        }
+        let tv = wrap_sub(1, side);
+        let p = u_at(lpos, tgt);
+        if p != IR_NONE && wrap_add(p, 4) < n {
+          // The header: up to three constants read once, the comparison, its branch.
+          let mut k = wrap_add(p, 1);
+          let mut nc = 0;
+          let mut more = true;
+          while more && nc < 3 && k < n {
+            let hq = iropt_at(f, k);
+            if hq.op == IR_CONST && hq.d < f.nreg && u_at(nuse, hq.d) == 1 {
+              k = wrap_add(k, 1);
+              nc = wrap_add(nc, 1);
+            } else {
+              more = false;
+            }
+          }
+          if wrap_add(k, 1) < n {
+            let cq = iropt_at(f, k);
+            let bq = iropt_at(f, wrap_add(k, 1));
+            let ck2 = iropt_ef_cmpk(cv, cq);
+            if ck2.op != 0 && bq.op == IR_BR && bq.a == cq.d && cq.d < f.nreg && u_at(nuse, cq.d) == 1 && u_at(ndef, cq.d) == 1 && bq.b != bq.c {
+              let mut r = IrRange { lo: 0, hi: 18446744073709551615 };
+              let mut j = 0;
+              while j < vec_len(fr) {
+                if u_at(fr, j) == ck2.x {
+                  if u_at(flo, j) > r.lo {
+                    r.lo = u_at(flo, j);
+                  }
+                  if u_at(fhi, j) < r.hi {
+                    r.hi = u_at(fhi, j);
+                  }
+                }
+                j = wrap_add(j, 1);
+              }
+              if u_at(bop, i) != 0 && u_at(bx, i) == ck2.x {
+                let rg = iropt_ef_range(u_at(bop, i), u_at(bk, i), tv);
+                if rg.lo > r.lo {
+                  r.lo = rg.lo;
+                }
+                if rg.hi < r.hi {
+                  r.hi = rg.hi;
+                }
+              }
+              if r.lo <= r.hi {
+                let dv = iropt_ef_decide(ck2.op, ck2.k, r);
+                if dv == 1 {
+                  if side == 0 {
+                    tl = bq.b;
+                  } else {
+                    fl = bq.b;
+                  }
+                } else if dv == 0 {
+                  if side == 0 {
+                    tl = bq.c;
+                  } else {
+                    fl = bq.c;
+                  }
+                }
+              }
+            }
+          }
+        }
+        side = wrap_add(side, 1);
+      }
+      if tl != q.b || fl != q.c {
+        iropt_put(&mut f, i, IrIns { op: IR_BR, d: q.d, a: q.a, b: tl, c: fl, ty: q.ty });
+        done = wrap_add(done, 1);
+      }
+    }
+    // A register written here: what is known about it goes.
+    let mut ws = vec_new[u64]();
+    ra_writes(q, &mut ws);
+    let mut w = 0;
+    while w < vec_len(ws) {
+      let x = vec_get(ws, w);
+      let mut j = 0;
+      while j < vec_len(fr) {
+        if u_at(fr, j) == x {
+          ra_set(&mut flo, j, 0);
+          ra_set(&mut fhi, j, 18446744073709551615);
+        }
+        j = wrap_add(j, 1);
+      }
+      w = wrap_add(w, 1);
+    }
+    vec_free(ws);
+    prev = q;
+    pi = i;
+    i = wrap_add(i, 1);
+  }
+  vec_free(fr);
+  vec_free(flo);
+  vec_free(fhi);
+  vec_free(bop);
+  vec_free(bx);
+  vec_free(bk);
+  vec_free(lpos);
+  vec_free(cnt);
+  vec_free(ndef);
+  vec_free(nuse);
+  vec_free(cv);
+  return done;
 }
 
 /// Value numbering along extended basic blocks: a block that only the one
