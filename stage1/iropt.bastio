@@ -5506,6 +5506,61 @@ fn iropt_cond_loads(f: &IrFn, i: u64, c: u64) -> bool {
   return hit;
 }
 
+/// Does the condition register `c` of the branch at `i` depend on a `load`
+/// whose address depends on one of the registers `shared` (within the same
+/// straight-line run)? Then the loop carries those registers through the load:
+/// a binary search steps from `lo` and `hi` to `mid`, loads `a[mid]` and picks
+/// the next pair by the result. A branch lets the predictor start the next
+/// load before this one is back; a select would put the whole load latency on
+/// the chain of every step.
+fn iropt_cond_addr_chain(f: &IrFn, i: u64, c: u64, shared: &Vec[u64]) -> bool {
+  let mut cone = vec_new[u64]();
+  vec_push(&mut cone, c);
+  let mut seen = false;
+  let mut hit = false;
+  let mut k = i;
+  let mut steps = 0;
+  while k > 0 && steps < 16 && !hit {
+    k = k - 1;
+    let q = iropt_at(f, k);
+    if q.op == IR_LABEL || q.op == IR_JMP || q.op == IR_BR {
+      steps = 16;
+    } else {
+      let mut ws = vec_new[u64]();
+      ra_writes(q, &mut ws);
+      let mut w = 0;
+      let mut in_cone = false;
+      while w < vec_len(ws) {
+        if iropt_count(cone, vec_get(ws, w)) > 0 {
+          in_cone = true;
+        }
+        w = wrap_add(w, 1);
+      }
+      vec_free(ws);
+      if in_cone {
+        if q.op == IR_LOAD {
+          seen = true;
+        }
+        let mut rs = vec_new[u64]();
+        ra_reads(f, q, &mut rs);
+        let mut x = 0;
+        while x < vec_len(rs) {
+          let r = vec_get(rs, x);
+          vec_push(&mut cone, r);
+          if seen && iropt_count(shared, r) > 0 {
+            hit = true;
+          }
+          x = wrap_add(x, 1);
+        }
+        vec_free(rs);
+      }
+    }
+    steps = wrap_add(steps, 1);
+  }
+  vec_free(cone);
+  return hit;
+}
+
 /// Instruction `k` of `v` (an instruction of op 0 past the end).
 fn iropt_ins_in(v: &Vec[IrIns], k: u64) -> IrIns {
   if k < vec_len(v) {
@@ -5862,6 +5917,9 @@ fn iropt_ifconv(f: &mut IrFn) -> u64 {
         // a register (the predictor runs ahead of the load; a mask would put the
         // load on the chain through that register).
         let mut chained = false;
+        if vec_len(shared) >= 1 && iropt_cond_addr_chain(f, i, q.a, shared) {
+          chained = true;
+        }
         if vec_len(shared) >= 1 && iropt_cond_loads(f, i, q.a) {
           let mut sx = 0;
           while sx < vec_len(shared) {
