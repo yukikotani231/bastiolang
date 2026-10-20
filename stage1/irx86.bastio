@@ -3180,6 +3180,34 @@ fn ix_arms(f: &mut IrFn) {
   vec_free(refs);
 }
 
+/// The register a chain of single-definition copies of `r` ends at (`r`
+/// itself when it is not written once by a `mov`), and in `first` the position
+/// of the earliest copy of the chain.
+fn ix_mov_root(f: &IrFn, ndef: &Vec[u64], r: u64, first: &mut u64) -> u64 {
+  let mut cur = r;
+  let mut hops = 0;
+  while hops < 4 && cur < vec_len(ndef) && u_at(ndef, cur) == 1 {
+    let mut next = cur;
+    let mut x = 0;
+    while x < vec_len(f.ins) {
+      let m = vec_get(f.ins, x);
+      if m.op == IR_MOV && m.d == cur {
+        next = m.a;
+        if x < first {
+          first = x;
+        }
+      }
+      x = wrap_add(x, 1);
+    }
+    if next == cur {
+      return cur;
+    }
+    cur = next;
+    hops = wrap_add(hops, 1);
+  }
+  return cur;
+}
+
 /// Two counters that start equal and step together: `a = ...; b = mov a`
 /// (or both `mov` of one register) in one straight run, and the same
 /// `a = a + K` and `b = b + K` side by side. `b` is then `a`, and goes: the
@@ -3234,10 +3262,29 @@ fn ix_ivmerge(f: &mut IrFn) -> u64 {
           } else if ia.op == IR_MOV && ib.op == IR_MOV && ia.a == ib.a && u_at(ndef, ia.a) <= 1 {
             same = true;
           }
+          // Or copies of one register through copies written once, with
+          // no write of that register from the first copy to the later start.
+          let mut fa = pa;
+          let mut root = IR_NONE;
+          if !same && ia.op == IR_MOV && ib.op == IR_MOV {
+            let mut fb = pb;
+            let ra = ix_mov_root(f, ndef, ia.a, &mut fa);
+            let rb = ix_mov_root(f, ndef, ib.a, &mut fb);
+            if fb < fa {
+              fa = fb;
+            }
+            if ra == rb {
+              same = true;
+              root = ra;
+            }
+          }
           // One straight run between the two starts, so they always happen
           // together; the steps are side by side.
           let first = pa;
           let mut lo = first;
+          if fa < lo {
+            lo = fa;
+          }
           if pb < lo {
             lo = pb;
           }
@@ -3253,6 +3300,9 @@ fn ix_ivmerge(f: &mut IrFn) -> u64 {
               ok = false;
             }
             if x != pa && x != pb && (ra_writes_has(m, qa.d) || ra_writes_has(m, qb.d)) {
+              ok = false;
+            }
+            if root != IR_NONE && ra_writes_has(m, root) {
               ok = false;
             }
             x = wrap_add(x, 1);
