@@ -1938,17 +1938,17 @@ fn ix_scale_fuse(f: &IrFn, al: &IrAlloc, m: &Mono, nuse: &Vec[u64], i: u64) -> u
 }
 
 /// Whether the 8-byte load at `i` is read only by the next instruction, an
-/// `add`, `sub`, `and`, `or` or `xor` (no wrapping) that puts the result in the
+/// `add`, `sub`, `and`, `or` or `xor` (without a normalising wrap) that puts the result in the
 /// register that already holds its other operand: the operation reads memory
 /// (`add (%rbx,%r11,8), %r10`), no register is loaded. A `sub` must take the
 /// loaded value as its second operand.
-fn ix_load_alu(f: &IrFn, al: &IrAlloc, nuse: &Vec[u64], i: u64) -> bool {
+fn ix_load_alu(f: &IrFn, al: &IrAlloc, m: &Mono, nuse: &Vec[u64], i: u64) -> bool {
   let q = ix_at(f, i);
   if q.c != 8 || u_at(nuse, q.d) != 1 {
     return false;
   }
   let nq = ix_at(f, wrap_add(i, 1));
-  if slen(ix_alu(nq.op)) == 0 || nq.op == IR_MUL || nq.c != 0 || nq.a == nq.b {
+  if slen(ix_alu(nq.op)) == 0 || nq.op == IR_MUL || ix_wraps(m, nq) || nq.a == nq.b {
     return false;
   }
   let mut x = nq.a;
@@ -2606,7 +2606,7 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       ix_ins2(&mut out, "test", mask, la);
       ix_br_flags(&mut out, f.x, cm.op, br.b, br.c, ix_pick_next(f, wrap_add(j, 2), br.b, br.c));
       i = wrap_add(j, 1);
-    } else if q.op == IR_LOAD && ix_load_alu(f, al, nuse, i) {
+    } else if q.op == IR_LOAD && ix_load_alu(f, al, m, nuse, i) {
       let ld = ix_loc(al, nq.d);
       let ap = ix_aprep(&mut out, al, q.a, q.b, q.ty);
       w_s(&mut out, "\t");
