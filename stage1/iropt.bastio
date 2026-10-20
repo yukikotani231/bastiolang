@@ -1490,7 +1490,7 @@ fn iropt_rotate(f: &mut IrFn) -> u64 {
       let mut going = true;
       while going && m < 4 && wrap_add(wrap_add(h, m), 3) < n {
         let c = iropt_at(f, wrap_add(wrap_add(h, 1), m));
-        if c.op == IR_CONST || c.op == IR_LOAD || iropt_is_cmp(c.op) {
+        if c.op == IR_CONST || c.op == IR_MOV || c.op == IR_LOAD || iropt_is_cmp(c.op) {
           m = wrap_add(m, 1);
         } else {
           going = false;
@@ -6771,8 +6771,9 @@ fn iropt_vlen_op(op: u64) -> bool {
 }
 
 /// 1 for each register that holds the data address of a Vec wherever it is
-/// written: by a marked load of header word 2, or by a copy of such a register.
-/// A store through one cannot reach a header.
+/// written: by a marked load of header word 2, by a copy of such a register, or
+/// by adding an offset to one (the place of an element, which the proof keeps
+/// inside the data). A store through one cannot reach a header.
 fn iropt_vlen_data(f: &IrFn, cv: &Vec[u64]) -> Vec[u64] {
   let n = vec_len(f.ins);
   let mut isd = vec_new[u64]();
@@ -6808,7 +6809,7 @@ fn iropt_vlen_data(f: &IrFn, cv: &Vec[u64]) -> Vec[u64] {
       let q = iropt_at(f, i);
       let mut ws = vec_new[u64]();
       ra_writes(q, &mut ws);
-      let good = (q.op == IR_LOAD && iropt_vlen_hdr(q) && q.c == 8 && u_at(cv, q.b) == 2) || (q.op == IR_MOV && u_at(isd, q.a) == 1);
+      let good = (q.op == IR_LOAD && iropt_vlen_hdr(q) && q.c == 8 && u_at(cv, q.b) == 2) || (q.op == IR_MOV && u_at(isd, q.a) == 1) || (q.op == IR_ADD && u_at(isd, q.a) == 1);
       let mut w = 0;
       while w < vec_len(ws) {
         let x = vec_get(ws, w);
