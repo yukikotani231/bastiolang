@@ -3180,6 +3180,34 @@ fn ix_arms(f: &mut IrFn) {
   vec_free(refs);
 }
 
+/// The register a chain of single-definition copies of `r` ends at (`r`
+/// itself when it is not written once by a `mov`), and in `first` the position
+/// of the earliest copy of the chain.
+fn ix_mov_root(f: &IrFn, ndef: &Vec[u64], r: u64, first: &mut u64) -> u64 {
+  let mut cur = r;
+  let mut hops = 0;
+  while hops < 4 && cur < vec_len(ndef) && u_at(ndef, cur) == 1 {
+    let mut next = cur;
+    let mut x = 0;
+    while x < vec_len(f.ins) {
+      let m = vec_get(f.ins, x);
+      if m.op == IR_MOV && m.d == cur {
+        next = m.a;
+        if x < first {
+          first = x;
+        }
+      }
+      x = wrap_add(x, 1);
+    }
+    if next == cur {
+      return cur;
+    }
+    cur = next;
+    hops = wrap_add(hops, 1);
+  }
+  return cur;
+}
+
 /// Two counters that start equal and step together: `a = ...; b = mov a`
 /// (or both `mov` of one register) in one straight run, and the same
 /// `a = a + K` and `b = b + K` side by side. `b` is then `a`, and goes: the
@@ -3234,10 +3262,29 @@ fn ix_ivmerge(f: &mut IrFn) -> u64 {
           } else if ia.op == IR_MOV && ib.op == IR_MOV && ia.a == ib.a && u_at(ndef, ia.a) <= 1 {
             same = true;
           }
+          // Or copies of one register through copies written once, with
+          // no write of that register from the first copy to the later start.
+          let mut fa = pa;
+          let mut root = IR_NONE;
+          if !same && ia.op == IR_MOV && ib.op == IR_MOV {
+            let mut fb = pb;
+            let ra = ix_mov_root(f, ndef, ia.a, &mut fa);
+            let rb = ix_mov_root(f, ndef, ib.a, &mut fb);
+            if fb < fa {
+              fa = fb;
+            }
+            if ra == rb {
+              same = true;
+              root = ra;
+            }
+          }
           // One straight run between the two starts, so they always happen
           // together; the steps are side by side.
           let first = pa;
           let mut lo = first;
+          if fa < lo {
+            lo = fa;
+          }
           if pb < lo {
             lo = pb;
           }
@@ -3253,6 +3300,9 @@ fn ix_ivmerge(f: &mut IrFn) -> u64 {
               ok = false;
             }
             if x != pa && x != pb && (ra_writes_has(m, qa.d) || ra_writes_has(m, qb.d)) {
+              ok = false;
+            }
+            if root != IR_NONE && ra_writes_has(m, root) {
               ok = false;
             }
             x = wrap_add(x, 1);
@@ -4658,6 +4708,16 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
     ra_free(al);
     al = ra_alloc_const_wide(f, ncallee, 4);
   }
+  // A retry with fewer registers (see below) that spills more than the
+  // attempt before it is not worth the saves it avoids.
+  g.rspill = al.nspill;
+  if al.nspill > g.rlimit {
+    vec_free(pos);
+    vec_free(stub);
+    ra_free(al);
+    ir_free(f);
+    return 15;
+  }
   let nuse = ix_uses(f);
   // The frame: saved registers, spills, slots.
   let mut moff = vec_new[u64]();
@@ -4741,7 +4801,7 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
   // up using: allocate again with one register fewer, so the function does
   // not save and restore it.
   let top = wrap_sub(al.ncallee_used, 1);
-  if !fast && top >= 1 && top <= 4 && !ix_mentions_from(inner, save_end, x86_rname(ix_callee(top))) {
+  if !fast && !g.rkeep && top >= 1 && top <= 4 && !ix_mentions_from(inner, save_end, x86_rname(ix_callee(top))) {
     vec_free(inner);
     vec_free(out);
     vec_free(nuse);
@@ -4842,22 +4902,38 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
   return 1;
 }
 
+/// `irx_function_n`, again with the register that ended up unused taken out
+/// of the pool, while that does not make it spill more.
+fn irx_shrink(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, n0: u64) -> u64 {
+  g.rlimit = 1000000000;
+  g.rkeep = false;
+  let mut n = n0;
+  let mut r = irx_function_n(&mut g, c, &mut m, p, x, n);
+  let mut tries = 0;
+  while r >= 11 && r <= 14 && tries < 6 {
+    let prev = n;
+    n = r - 10;
+    g.rlimit = g.rspill;
+    r = irx_function_n(&mut g, c, &mut m, p, x, n);
+    if r == 15 {
+      g.rlimit = 1000000000;
+      g.rkeep = true;
+      r = irx_function_n(&mut g, c, &mut m, p, x, prev);
+      g.rkeep = false;
+      return r;
+    }
+    tries = tries + 1;
+  }
+  g.rlimit = 1000000000;
+  return r;
+}
+
 /// `irx_function_n` with %rbp among the registers, and without it when the
 /// frame cannot be addressed from %rsp.
 fn irx_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> bool {
-  let mut r = irx_function_n(&mut g, c, &mut m, p, x, 6);
-  let mut tries = 0;
-  while r >= 11 && r <= 14 && tries < 6 {
-    r = irx_function_n(&mut g, c, &mut m, p, x, r - 10);
-    tries = tries + 1;
-  }
+  let mut r = irx_shrink(&mut g, c, &mut m, p, x, 6);
   if r == 2 {
-    r = irx_function_n(&mut g, c, &mut m, p, x, 5);
-    tries = 0;
-    while r >= 11 && r <= 14 && tries < 6 {
-      r = irx_function_n(&mut g, c, &mut m, p, x, r - 10);
-      tries = tries + 1;
-    }
+    r = irx_shrink(&mut g, c, &mut m, p, x, 5);
   }
   return r == 1;
 }
