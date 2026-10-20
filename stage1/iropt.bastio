@@ -1476,7 +1476,7 @@ fn iropt_rot_blk(f: &IrFn, s: u64, n: u64) -> u64 {
 /// so a pass of the loop runs one jump fewer. The test may be preceded by up
 /// to three constants or loads, as in `while get(t, i) != 0 && ...`; their
 /// results must be read only inside the test, and the copy gets registers of
-/// its own. Several tests with the same exit in a row (`a && b && c`) are
+/// its own. Several tests that each leave the loop in a row (`a && b && c`) are
 /// copied together, a label of its own between the copies. The first test
 /// stays where it is. Returns how many jumps it replaced.
 fn iropt_rotate(f: &mut IrFn) -> u64 {
@@ -1489,11 +1489,13 @@ fn iropt_rotate(f: &mut IrFn) -> u64 {
   // B:` where what the test defines is read nowhere else, the position of the
   // first instruction of the test and how many come before the `br`.
   let mut lpos = vec_new[u64]();
+  let mut ljmp = vec_new[u64]();
   let mut hdr = vec_new[u64]();
   let mut hlen = vec_new[u64]();
   let mut l = 0;
   while l < nl {
     vec_push(&mut lpos, IR_NONE);
+    vec_push(&mut ljmp, 0);
     vec_push(&mut hdr, IR_NONE);
     vec_push(&mut hlen, 0);
     l = wrap_add(l, 1);
@@ -1503,6 +1505,9 @@ fn iropt_rotate(f: &mut IrFn) -> u64 {
     let q = iropt_at(f, i);
     if q.op == IR_LABEL && q.a < nl {
       ra_set(&mut lpos, q.a, i);
+    }
+    if q.op == IR_JMP && q.a < nl {
+      ra_set(&mut ljmp, q.a, i);
     }
     i = wrap_add(i, 1);
   }
@@ -1525,7 +1530,11 @@ fn iropt_rotate(f: &mut IrFn) -> u64 {
           let m2 = iropt_rot_blk(f, s2, n);
           if m2 > 0 {
             let b2 = iropt_at(f, wrap_add(s2, m2));
-            if b2.c == b1.c && wrap_add(wrap_sub(wrap_add(s2, m2), h), 0) < 16 {
+            // A later test may leave through another label, as long as that
+            // label lies past the end of the loop (an `if` in the body that
+            // branches to a join point inside it does not).
+            let leaves = b2.c == b1.c || (b2.c < nl && u_at(lpos, b2.c) != IR_NONE && u_at(lpos, b2.c) > u_at(ljmp, l));
+            if leaves && wrap_add(wrap_sub(wrap_add(s2, m2), h), 0) < 16 {
               last = wrap_add(s2, m2);
               nb = wrap_add(nb, 1);
               more = true;
@@ -1666,6 +1675,7 @@ fn iropt_rotate(f: &mut IrFn) -> u64 {
     i = wrap_add(i, 1);
   }
   vec_free(lpos);
+  vec_free(ljmp);
   vec_free(hdr);
   vec_free(hlen);
   vec_free(nuse);
