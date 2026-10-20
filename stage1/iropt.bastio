@@ -5812,7 +5812,21 @@ fn iropt_ifconv(f: &mut IrFn) -> u64 {
             sx = wrap_add(sx, 1);
           }
         }
-        if vec_len(shared) >= 1 && vec_len(shared) <= 3 && !fresh_only && !chained {
+        // What the conversion costs on every pass: the arms' computations (not
+        // constants or copies) and three instructions per selected register.
+        // A branch that is usually predicted (a bounce at the edge of a range)
+        // is cheaper than that when the arms do real work.
+        let mut work = wrap_mul(3, vec_len(shared));
+        k = s1;
+        while k < resume {
+          let w = iropt_at(f, k);
+          if (k < e1 || (k >= s2 && k < e2)) && w.op != IR_CONST && w.op != IR_MOV {
+            work = wrap_add(work, 1);
+          }
+          k = wrap_add(k, 1);
+        }
+        let slow = work > 8;
+        if vec_len(shared) >= 1 && vec_len(shared) <= 3 && !fresh_only && !chained && !slow {
           // The first arm is the then-arm when its label is the true target.
           let m = ir_reg(&mut f);
           let fl = iropt_flag(f, i, q.a, cv, ndef);
