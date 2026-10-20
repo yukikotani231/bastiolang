@@ -1,0 +1,44 @@
+// expect-exit: 0
+// expect-stdout: 2569201
+// A loop whose test joins three conditions with `&&` tests them again at the
+// bottom (native-ir): the run-length scan below stops on the bound, on the run
+// length limit or on a different byte, and the cases hit each of the three.
+const SIZE: u64 = 300;
+
+fn runs(b: &Bytes, limit: u64) -> u64
+  requires blen(b) == SIZE && limit >= 1 && limit <= 255
+{
+  let mut total = 0;
+  let mut i = 0;
+  while i < SIZE
+    invariant i <= SIZE && blen(b) == SIZE && total <= 2 * i
+  {
+    let c = bget(b, i);
+    let mut n = 1;
+    while i + n < SIZE && n < limit && bget(b, i + n) == c
+      invariant n >= 1 && n <= limit && i + n <= SIZE && blen(b) == SIZE
+    {
+      n = n + 1;
+    }
+    total = total + 2;
+    i = i + n;
+  }
+  return total;
+}
+
+fn main() -> u64 {
+  let mut b = balloc(SIZE);
+  let mut i = 0;
+  while i < SIZE
+    invariant i <= SIZE && blen(b) == SIZE
+  {
+    bset(&mut b, i, cast[u8](97 + i / 7 % 3));
+    i = i + 1;
+  }
+  let r1 = runs(b, 255);
+  let r2 = runs(b, 3);
+  let r3 = runs(b, 1);
+  print(wrap_add(wrap_add(wrap_add(wrap_mul(r1, 100), wrap_mul(r2, 10000)), r3), 1));
+  bfree(b);
+  return 0;
+}
