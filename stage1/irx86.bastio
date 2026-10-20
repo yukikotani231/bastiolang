@@ -3248,6 +3248,90 @@ fn ix_inplace(f: &mut IrFn) -> u64 {
   return done;
 }
 
+/// `y = op s, b; ...; s = op2 y, c` (or `op2 c, y`), where `y` is written and
+/// read only there, `b` and `c` are not `s`, and nothing between the two
+/// reads or writes `s`, becomes `s = op s, b; ...; s = op2 s, c`: the old
+/// value of `s` is dead once the first reads it, so `y` needs no register of
+/// its own. This is the loop-carried `x = (x >> 1) ^ (m & k)`, where the
+/// shifted value would otherwise be copied back into `x`'s register.
+fn ix_fwd(f: &mut IrFn) -> u64 {
+  let nuse = iropt_nuse(f);
+  let ndef = iropt_ndef(f);
+  let n = vec_len(f.ins);
+  // newd[i] = s + 1: the definition at i writes s; usep[j] = 1: the use at j
+  // reads s in place of y (its operand renamed through `ra_subst`).
+  let mut newd = vec_new[u64]();
+  let mut usey = vec_new[u64]();
+  let mut i = 0;
+  while i < n {
+    vec_push(&mut newd, 0);
+    vec_push(&mut usey, 0);
+    i = i + 1;
+  }
+  let mut done = 0;
+  i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    let y = q.d;
+    if ra_is_binary(q.op) && y < f.nreg && q.a < f.nreg && q.a != y && q.b != q.a && q.b != y && u_at(ndef, y) == 1 && u_at(nuse, y) == 1 && u_at(newd, i) == 0 && u_at(usey, i) == 0 {
+      let s = q.a;
+      let mut j = wrap_add(i, 1);
+      let mut scanning = true;
+      let mut found = n;
+      while scanning && j < n && j < wrap_add(i, 40) {
+        let m = vec_get(f.ins, j);
+        if m.op == IR_LABEL || ra_is_end(m.op) {
+          scanning = false;
+        } else if ra_reads_has(f, m, y) {
+          scanning = false;
+          if ra_is_binary(m.op) && m.d == s && u_at(newd, j) == 0 && u_at(usey, j) == 0 && ((m.a == y && m.b != s && m.b != y) || (m.b == y && m.a != s && m.a != y)) {
+            found = j;
+          }
+        } else if ra_reads_has(f, m, s) || ra_writes_has(m, s) || ra_writes_has(m, y) {
+          scanning = false;
+        } else {
+          j = wrap_add(j, 1);
+        }
+      }
+      if found < n {
+        ra_set(&mut newd, i, wrap_add(s, 1));
+        ra_set(&mut usey, found, y + 1);
+        done = wrap_add(done, 1);
+      }
+    }
+    i = i + 1;
+  }
+  if done == 0 {
+    vec_free(nuse);
+    vec_free(ndef);
+    vec_free(newd);
+    vec_free(usey);
+    return 0;
+  }
+  let mut out = vec_new[IrIns]();
+  i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    let nd = u_at(newd, i);
+    let uy = u_at(usey, i);
+    if nd != 0 {
+      vec_push(&mut out, IrIns { op: q.op, d: wrap_sub(nd, 1), a: q.a, b: q.b, c: q.c, ty: q.ty });
+    } else if uy != 0 {
+      vec_push(&mut out, ra_subst(q, wrap_sub(uy, 1), q.d));
+    } else {
+      vec_push(&mut out, q);
+    }
+    i = i + 1;
+  }
+  vec_free(nuse);
+  vec_free(ndef);
+  vec_free(newd);
+  vec_free(usey);
+  vec_free(f.ins);
+  f.ins = out;
+  return done;
+}
+
 /// Gives the frame slots of `IR_SLOT` instructions their places in the
 /// slot area: `a` of each is its offset in words, and slots whose addresses
 /// are never live together share words. The result is the area's size. A slot
@@ -4119,6 +4203,7 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
   ix_ivmerge(&mut f);
   ix_coalesce(&mut f);
   ix_inplace(&mut f);
+  ix_fwd(&mut f);
   ix_arms(&mut f);
   let xi = inst_at(m, x);
   let pos = ix_positions(&mut g, c, &mut m, p, x);
