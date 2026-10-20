@@ -1,0 +1,121 @@
+// expect-exit: 0
+// expect-stdout: 2180499589
+// The arm of an equality test that native-ir moves behind the end of the loop:
+// an `if a == b` whose two arms meet again, in a loop, in nested loops, with an
+// arm that reads and writes several variables, and with a loop that leaves
+// early.
+fn lcs(n: u64) -> u64
+  requires n <= 400
+{
+  let mut a = vec_new[u64]();
+  let mut b = vec_new[u64]();
+  let mut x = 12345;
+  let mut i = 0;
+  while i < n
+    invariant i <= n && vlen(a) == i && vlen(b) == i
+  {
+    x = wrap_add(wrap_mul(x, 1103515245), 12345) % 4294967296;
+    vec_push(&mut a, x / 65536 % 4);
+    x = wrap_add(wrap_mul(x, 1103515245), 12345) % 4294967296;
+    vec_push(&mut b, x / 65536 % 4);
+    i = i + 1;
+  }
+  let mut prev = vec_new[u64]();
+  let mut cur = vec_new[u64]();
+  let mut k = 0;
+  while k <= n
+    invariant k <= n + 1 && vlen(prev) == k && vlen(cur) == k
+  {
+    vec_push(&mut prev, 0);
+    vec_push(&mut cur, 0);
+    k = k + 1;
+  }
+  i = 0;
+  while i < n
+    invariant i <= n && vlen(a) == n && vlen(b) == n && vlen(prev) == n + 1 && vlen(cur) == n + 1
+  {
+    let mut j = 0;
+    while j < n
+      invariant j <= n && vlen(a) == n && vlen(b) == n && vlen(prev) == n + 1 && vlen(cur) == n + 1
+    {
+      let mut v = 0;
+      if vec_get(a, i) == vec_get(b, j) {
+        v = wrap_add(vec_get(prev, j), 1);
+      } else {
+        let up = vec_get(prev, j + 1);
+        let left = vec_get(cur, j);
+        if up > left {
+          v = up;
+        } else {
+          v = left;
+        }
+      }
+      vec_set(&mut cur, j + 1, v);
+      j = j + 1;
+    }
+    let mut c = 0;
+    while c <= n
+      invariant c <= n + 1 && vlen(prev) == n + 1 && vlen(cur) == n + 1
+    {
+      vec_set(&mut prev, c, vec_get(cur, c));
+      c = c + 1;
+    }
+    i = i + 1;
+  }
+  let r = vec_get(prev, n);
+  vec_free(a);
+  vec_free(b);
+  vec_free(prev);
+  vec_free(cur);
+  return r;
+}
+
+// An equality arm with several statements, and a loop that stops at a hit.
+fn runs(n: u64, m: u64) -> u64
+  requires n <= 100000 && m >= 1 && m <= 100000
+{
+  let mut i = 0;
+  let mut hits = 0;
+  let mut sum = 0;
+  let mut last = 0;
+  while i < n
+    invariant i <= n
+  {
+    if i % m == 0 {
+      hits = wrap_add(hits, 1);
+      sum = wrap_add(sum, wrap_mul(i, 3));
+      last = i;
+    } else {
+      sum = wrap_add(sum, 1);
+    }
+    i = i + 1;
+  }
+  return wrap_add(wrap_add(hits, sum), last);
+}
+
+fn first(n: u64, m: u64) -> u64
+  requires n >= 1 && n <= 100000 && m >= 1
+{
+  let mut i = 1;
+  let mut acc = 0;
+  while i < n
+    invariant i <= n
+  {
+    if i % m == 0 {
+      return wrap_add(acc, i);
+    }
+    acc = wrap_add(acc, i % 7);
+    i = i + 1;
+  }
+  return acc;
+}
+
+fn main() -> u64 {
+  let mut s = lcs(300);
+  s = wrap_add(s, runs(100000, 7));
+  s = wrap_add(s, runs(5000, 1));
+  s = wrap_add(s, first(100000, 977));
+  s = wrap_add(s, first(50, 99999));
+  print(s);
+  return 0;
+}

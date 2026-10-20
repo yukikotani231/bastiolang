@@ -7039,3 +7039,113 @@ fn iropt_vlen_untag(f: &mut IrFn) {
     i = wrap_add(i, 1);
   }
 }
+
+// ---- Cold arms out of line ----
+
+/// The arm an equality test makes unlikely: for `br (a == b), T, F` with the
+/// label of T right after the branch, the code of T, which ends in a `jmp`
+/// to a label further on, moves behind the last jump of the loop around it
+/// (the loop whose header label is before the branch and referenced after
+/// that jump). The pass of the loop that finds the two values different, the
+/// usual one, then runs straight on from the test to the end of the loop
+/// and takes one jump instead of two. The arm is at most 12 instructions
+/// with no label and no branch but its last, and only the branch refers to
+/// its label. The arm's jump has `b` = 1. Returns how many arms it moved.
+fn iropt_coldarm(f: &mut IrFn) -> u64 {
+  let mut total = 0;
+  let mut again = true;
+  let mut rounds = 0;
+  while again && rounds < 16 {
+    again = false;
+    rounds = wrap_add(rounds, 1);
+    let n = vec_len(f.ins);
+    if n > 4000000 || f.nlabel > 100000000 {
+      return total;
+    }
+    let lb = iropt_labs(f);
+    let mut b = 3;
+    while !again && b < n && n - b > 2 {
+      let t = iropt_at(f, b);
+      let lt = iropt_at(f, wrap_add(b, 1));
+      if t.op == IR_BR && lt.op == IR_LABEL && t.b == lt.a && t.b != t.c && t.b < f.nlabel && u_at(lb.lo, t.b) == b && u_at(lb.hi, t.b) == b {
+        // The condition is made by an equality just before the branch.
+        let mut eq = false;
+        let mut k = 1;
+        while k <= 3 && k <= b && !eq {
+          let d = iropt_at(f, b - k);
+          if d.d == t.a && d.op == IR_EQ {
+            eq = true;
+          }
+          k = wrap_add(k, 1);
+        }
+        // The arm: straight code up to a jump.
+        let mut e = wrap_add(b, 2);
+        let mut going = eq;
+        while going && e < n && e < wrap_add(b, 14) {
+          let q = iropt_at(f, e);
+          if q.op == IR_LABEL || q.op == IR_BR || q.op == IR_RET || q.op == IR_UNREACH {
+            going = false;
+            eq = false;
+          } else if q.op == IR_JMP {
+            going = false;
+          } else {
+            e = wrap_add(e, 1);
+          }
+        }
+        let jm = iropt_at(f, e);
+        if eq && jm.op == IR_JMP && jm.a < f.nlabel && u_at(lb.pos, jm.a) != IR_NONE && u_at(lb.pos, jm.a) > e {
+          // The innermost loop around the branch that is closed after the join.
+          let join = u_at(lb.pos, jm.a);
+          let mut best = IR_NONE;
+          let mut l = 0;
+          while l < f.nlabel {
+            let p = u_at(lb.pos, l);
+            if p != IR_NONE && p < b && u_at(lb.back, l) >= 1 && u_at(lb.hi, l) > join && u_at(lb.hi, l) < n && (best == IR_NONE || p > u_at(lb.pos, best)) {
+              best = l;
+            }
+            l = wrap_add(l, 1);
+          }
+          if best != IR_NONE {
+            let q = u_at(lb.hi, best);
+            let tail = iropt_at(f, q);
+            if (tail.op == IR_JMP || tail.op == IR_BR) && q > e {
+              let mut out = vec_new[IrIns]();
+              let mut i = 0;
+              while i <= b {
+                vec_push(&mut out, iropt_at(f, i));
+                i = wrap_add(i, 1);
+              }
+              i = wrap_add(e, 1);
+              while i <= q {
+                vec_push(&mut out, iropt_at(f, i));
+                i = wrap_add(i, 1);
+              }
+              i = wrap_add(b, 1);
+              while i <= e {
+                let mut mq = iropt_at(f, i);
+                if i == e {
+                  // Marks the jump: it is not the way back of a loop.
+                  mq.b = 1;
+                }
+                vec_push(&mut out, mq);
+                i = wrap_add(i, 1);
+              }
+              i = wrap_add(q, 1);
+              while i < n {
+                vec_push(&mut out, iropt_at(f, i));
+                i = wrap_add(i, 1);
+              }
+              vec_free(f.ins);
+              f.ins = out;
+              total = wrap_add(total, 1);
+              again = true;
+            }
+          }
+        }
+      }
+      b = wrap_add(b, 1);
+    }
+    iropt_labs_free(lb);
+  }
+  return total;
+}
