@@ -1,0 +1,66 @@
+// A naive search for a 12-byte pattern in 32 MiB of text over a 3-letter
+// alphabet, 4 passes: counts the places the pattern occurs.
+const SIZE: u64 = 33554432;
+const PAT: u64 = 12;
+
+fn text() -> Bytes
+  ensures blen(result) == SIZE
+{
+  let mut b = balloc(SIZE);
+  let mut x = 12345;
+  let mut i = 0;
+  while i < SIZE
+    invariant blen(b) == SIZE && i <= SIZE
+  {
+    x = wrap_add(wrap_mul(x, 6364136223846793005), 1442695040888963407);
+    bset(&mut b, i, cast[u8](97 + x / 4294967296 % 3));
+    i = i + 1;
+  }
+  return b;
+}
+
+fn count(b: &Bytes, p: &Bytes) -> u64
+  requires blen(b) == SIZE && blen(p) == PAT
+{
+  let mut hits = 0;
+  let mut i = 0;
+  while i + PAT <= SIZE
+    invariant i + PAT <= SIZE + 1 && blen(b) == SIZE && blen(p) == PAT && hits <= i
+  {
+    let mut k = 0;
+    while k < PAT && bget(b, i + k) == bget(p, k)
+      invariant k <= PAT && i + PAT <= SIZE && blen(b) == SIZE && blen(p) == PAT
+    {
+      k = k + 1;
+    }
+    if k == PAT {
+      hits = hits + 1;
+    }
+    i = i + 1;
+  }
+  return hits;
+}
+
+fn main() -> u64 {
+  let b = text();
+  let mut p = balloc(PAT);
+  let mut k = 0;
+  while k < PAT
+    invariant k <= PAT && blen(p) == PAT
+  {
+    bset(&mut p, k, cast[u8](97 + k * 7 % 3));
+    k = k + 1;
+  }
+  let mut t = 0;
+  let mut r = 0;
+  while r < 4
+    invariant r <= 4 && blen(b) == SIZE && blen(p) == PAT
+  {
+    t = wrap_add(wrap_mul(t, 1000003), count(b, p));
+    r = r + 1;
+  }
+  print(t);
+  bfree(b);
+  bfree(p);
+  return 0;
+}
