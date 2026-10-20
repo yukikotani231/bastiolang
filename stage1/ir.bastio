@@ -67,7 +67,7 @@ const IR_WRAP: u64 = 51;     // d = a truncated to the integer type ty
 const IR_SLOT: u64 = 52;     // d = the address of a frame slot of c words (one per instruction, allocated once per function however often it runs)
 const IR_STRLIT: u64 = 55;   // d = the address of the bytes of the string literal or blob at syntax node a
 const IR_CALLM: u64 = 54;    // d = the address of a frame slot of ty words that instance a, called with the c registers of args[b ..], fills with its result (a result of more than two words)
-const IR_VGROW: u64 = 53;    // makes room in the Vec whose 3-word header is at address a (c = words per element): a runtime call that may change the header
+const IR_VGROW: u64 = 53;    // makes room in the Vec whose 3-word header is at address a (c = words per element): a runtime call that changes the capacity and the data address (words 1 and 2 of the header), not the length
 
 const IRS_PAGE_AT: u64 = 0;
 const IRS_FRAME_ID: u64 = 1;
@@ -103,6 +103,12 @@ const IR_LOCKACQ: u64 = 74;  // spins until it takes the lock word at address a 
 const IR_POUT: u64 = 64;     // the low c bytes of b are written to I/O port a (`out`)
 
 const IR_NONE: u64 = 18446744073709551615;
+
+/// The `ty` of a LOAD or STORE of a word of a Vec header made by a `vec_*`
+/// builtin (`iropt_vlen` reads it, then clears it), and of the load that
+/// `iropt_vlen` puts after a `vgrow` to read the word again.
+const IR_HDR: u64 = 2199023255552;
+const IR_HDR2: u64 = 2199023255553;
 
 /// In a `lent` entry, the third word at least this is a struct or enum of
 /// that many words less this, held in registers.
@@ -1609,6 +1615,21 @@ fn ir_hdr_load(f: &mut IrFn, a: u64, k: u64) -> u64 {
   return d;
 }
 
+/// `ir_hdr_load` of a word of the header of a Vec (see `IR_HDR`).
+fn ir_vhdr_load(f: &mut IrFn, a: u64, k: u64) -> u64 {
+  let kr = ir_reg(&mut f);
+  ir_emit(&mut f, IR_CONST, kr, k, 0, 0, 0);
+  let d = ir_reg(&mut f);
+  ir_emit(&mut f, IR_LOAD, d, a, kr, 8, IR_HDR);
+  return d;
+}
+
+fn ir_vhdr_store(f: &mut IrFn, a: u64, k: u64, v: u64) {
+  let kr = ir_reg(&mut f);
+  ir_emit(&mut f, IR_CONST, kr, k, 0, 0, 0);
+  ir_emit(&mut f, IR_STORE, v, a, kr, 8, IR_HDR);
+}
+
 fn ir_hdr_store(f: &mut IrFn, a: u64, k: u64, v: u64) {
   let kr = ir_reg(&mut f);
   ir_emit(&mut f, IR_CONST, kr, k, 0, 0, 0);
@@ -2070,7 +2091,7 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     if f.failed {
       return ir_none();
     }
-    return IrVal { k: IRK_INT, r0: ir_hdr_load(&mut f, v.r0, 0), r1: IR_NONE, t: 0 };
+    return IrVal { k: IRK_INT, r0: ir_vhdr_load(&mut f, v.r0, 0), r1: IR_NONE, t: 0 };
   }
   if name_is(p, i, "vec_get") || name_is(p, i, "vec_set") {
     let v = ir_vec_arg(&mut f, c, &mut m, p, n.a);
@@ -2084,7 +2105,7 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     }
     let setting = name_is(p, i, "vec_set");
     if ir_vsimple(c, m, p, v) {
-      let data = ir_hdr_load(&mut f, v.r0, 2);
+      let data = ir_vhdr_load(&mut f, v.r0, 2);
       if !setting {
         let d = ir_reg(&mut f);
         ir_emit(&mut f, IR_LOAD, d, data, ix, 8, 0);
@@ -2124,14 +2145,14 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     if f.failed {
       return ir_none();
     }
-    let len = ir_hdr_load(&mut f, v.r0, 0);
+    let len = ir_vhdr_load(&mut f, v.r0, 0);
     let one = ir_reg(&mut f);
     ir_emit(&mut f, IR_CONST, one, 1, 0, 0, 0);
     let len1 = ir_reg(&mut f);
     ir_emit(&mut f, IR_SUB, len1, len, one, 0, c.tu64);
-    ir_hdr_store(&mut f, v.r0, 0, len1);
+    ir_vhdr_store(&mut f, v.r0, 0, len1);
     if ir_vsimple(c, m, p, v) {
-      let data = ir_hdr_load(&mut f, v.r0, 2);
+      let data = ir_vhdr_load(&mut f, v.r0, 2);
       let d = ir_reg(&mut f);
       ir_emit(&mut f, IR_LOAD, d, data, len1, 8, 0);
       return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
@@ -2148,7 +2169,7 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       return ir_none();
     }
     if ir_vsimple(c, m, p, v) {
-      let data = ir_hdr_load(&mut f, v.r0, 2);
+      let data = ir_vhdr_load(&mut f, v.r0, 2);
       let d = ir_reg(&mut f);
       ir_emit(&mut f, IR_LOAD, d, data, ix, 8, 0);
       ir_emit(&mut f, IR_STORE, x.r0, data, ix, 8, 0);
@@ -2174,8 +2195,8 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       return ir_none();
     }
     let w = ir_mw(c, m, p, ir_velem(v), 0);
-    let len = ir_hdr_load(&mut f, v.r0, 0);
-    let cap = ir_hdr_load(&mut f, v.r0, 1);
+    let len = ir_vhdr_load(&mut f, v.r0, 0);
+    let cap = ir_vhdr_load(&mut f, v.r0, 1);
     // `vec_push_within` is proved to have the room: no check, no growing.
     if name_is(p, i, "vec_push") {
       let full = ir_reg(&mut f);
@@ -2188,7 +2209,7 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       ir_place(&mut f, l_room);
     }
     if ir_vsimple(c, m, p, v) {
-      let data = ir_hdr_load(&mut f, v.r0, 2);
+      let data = ir_vhdr_load(&mut f, v.r0, 2);
       ir_emit(&mut f, IR_STORE, x.r0, data, len, 8, 0);
     } else {
       let el = ir_vel(&mut f, c, m, p, v, len, w);
@@ -2198,7 +2219,7 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     ir_emit(&mut f, IR_CONST, one, 1, 0, 0, 0);
     let len1 = ir_reg(&mut f);
     ir_emit(&mut f, IR_ADD, len1, len, one, 0, c.tu64);
-    ir_hdr_store(&mut f, v.r0, 0, len1);
+    ir_vhdr_store(&mut f, v.r0, 0, len1);
     return ir_none();
   }
   if name_is(p, i, "set") || name_is(p, i, "bset") {
