@@ -1798,6 +1798,71 @@ fn ix_br_flags(out: &mut Vec[u64], x: u64, op: u64, then: u64, els: u64, next: u
   }
 }
 
+/// Does `q` wrap its result to a type narrower than 64 bits?
+fn ix_wraps(m: &Mono, q: IrIns) -> bool {
+  return q.c == 1 && q.ty != 0 && slen(x86_normalize(m, q.ty)) > 0;
+}
+
+/// Whether the `mul` at `i` by a constant of 2, 3, 4, 5, 6, 8, 9, 10 or 18 is
+/// read only by an `add` at most six instructions on, with nothing between
+/// that writes the registers it reads or reads the product (all in registers,
+/// no wrapping): the position of that `add`, or 0. The product is then not
+/// computed alone; the `add` makes it with `lea`s (`cur * 10 + c` is
+/// `lea (a,a,4), t; lea (c,t,2), d`, as a compiler writes it by hand).
+fn ix_scale_fuse(f: &IrFn, al: &IrAlloc, m: &Mono, nuse: &Vec[u64], i: u64) -> u64 {
+  let q = ix_at(f, i);
+  if q.op != IR_MUL || ix_wraps(m, q) || q.d == IR_NONE {
+    return 0;
+  }
+  let lk = ix_loc(al, q.b);
+  let la = ix_loc(al, q.a);
+  if lk.k != IXK_IMM || la.k != IXK_REG {
+    return 0;
+  }
+  let k = lk.imm;
+  if !(k == 2 || k == 3 || k == 4 || k == 5 || k == 6 || k == 8 || k == 9 || k == 10 || k == 18) {
+    return 0;
+  }
+  let mut j = wrap_add(i, 1);
+  let mut found = 0;
+  while found == 0 && j < wrap_add(i, 7) {
+    let t = ix_at(f, j);
+    if t.op == IR_ADD && !ix_wraps(m, t) && ((t.a == q.d && t.b != q.d) || (t.b == q.d && t.a != q.d)) {
+      let mut y = t.b;
+      if t.b == q.d {
+        y = t.a;
+      }
+      let ly = ix_loc(al, y);
+      let ld = ix_loc(al, t.d);
+      // The result register may not be the one the other operand is in: the
+      // first `lea` writes it.
+      // The product has no other reader: it is the only use, or the `add`
+      // writes it again (`cur = cur * 10; cur = cur + c`).
+      if ly.k == IXK_REG && ld.k == IXK_REG && ly.reg != ld.reg && y != q.a && (u_at(nuse, q.d) == 1 || t.d == q.d) {
+        found = j;
+      } else {
+        return 0;
+      }
+    } else if t.op == IR_CONST || t.op == IR_MOV || slen(ix_alu(t.op)) > 0 {
+      let lt = ix_loc(al, t.d);
+      if t.a == q.d || t.b == q.d || t.d == q.d || t.d == q.a {
+        return 0;
+      }
+      // A constant that stands as an immediate writes nothing.
+      if lt.k != IXK_IMM && (lt.k != IXK_REG || lt.reg == la.reg) {
+        return 0;
+      }
+      j = wrap_add(j, 1);
+    } else {
+      return 0;
+    }
+  }
+  if found == 0 {
+    return 0;
+  }
+  return found;
+}
+
 /// Whether the 8-byte load at `i` is read only by the next instruction, an
 /// `add`, `sub`, `and`, `or` or `xor` (no wrapping) that puts the result in the
 /// register that already holds its other operand: the operation reads memory
@@ -2275,6 +2340,8 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
   // from the last of those instructions, if only instructions that keep
   // %rax came since.
   let mut ctx = false;
+  let mut pend_j = 0;
+  let mut pend_i = 0;
   let mut i = 0;
   while i < n {
     let live = ctx;
@@ -2282,7 +2349,67 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
     let q = vec_get(f.ins, i);
     let nq = ix_at(f, i + 1);
     let lnq = ix_loc(al, nq.d);
-    if q.op == IR_LABEL {
+    if pend_j != 0 && i == pend_j {
+      // The `add` of a product kept for it (`ix_scale_fuse`).
+      let mq = ix_at(f, pend_i);
+      let mut y = q.b;
+      if q.b == mq.d {
+        y = q.a;
+      }
+      let la = ix_loc(al, mq.a);
+      let ly = ix_loc(al, y);
+      let ld = ix_loc(al, q.d);
+      let lk = ix_loc(al, mq.b);
+      let k = lk.imm;
+      let mut sc = k;
+      if k == 3 || k == 5 || k == 9 || k == 6 || k == 10 || k == 18 {
+        if k == 3 || k == 6 {
+          sc = 2;
+        } else if k == 5 || k == 10 {
+          sc = 4;
+        } else {
+          sc = 8;
+        }
+        // d = a + a * sc
+        w_s(&mut out, "\tlea (");
+        w_s(&mut out, x86_rname(la.reg));
+        w_s(&mut out, ", ");
+        w_s(&mut out, x86_rname(la.reg));
+        w_s(&mut out, ", ");
+        w_num(&mut out, sc);
+        w_s(&mut out, "), ");
+        w_s(&mut out, x86_rname(ld.reg));
+        w_s(&mut out, "\n");
+        let mut sc2 = 1;
+        if k == 6 || k == 10 || k == 18 {
+          sc2 = 2;
+        }
+        w_s(&mut out, "\tlea (");
+        w_s(&mut out, x86_rname(ly.reg));
+        w_s(&mut out, ", ");
+        w_s(&mut out, x86_rname(ld.reg));
+        if sc2 > 1 {
+          w_s(&mut out, ", 2");
+        }
+        w_s(&mut out, "), ");
+        w_s(&mut out, x86_rname(ld.reg));
+        w_s(&mut out, "\n");
+      } else {
+        w_s(&mut out, "\tlea (");
+        w_s(&mut out, x86_rname(ly.reg));
+        w_s(&mut out, ", ");
+        w_s(&mut out, x86_rname(la.reg));
+        w_s(&mut out, ", ");
+        w_num(&mut out, sc);
+        w_s(&mut out, "), ");
+        w_s(&mut out, x86_rname(ld.reg));
+        w_s(&mut out, "\n");
+      }
+      pend_j = 0;
+    } else if q.op == IR_MUL && pend_j == 0 && ix_scale_fuse(f, al, m, nuse, i) != 0 {
+      pend_j = ix_scale_fuse(f, al, m, nuse, i);
+      pend_i = i;
+    } else if q.op == IR_LABEL {
       if u_at(heads, q.a) == 1 {
         w_s(&mut out, "\t.p2align 4\n");
       }
@@ -4369,6 +4496,10 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
   }
   iropt_bits(&mut f);
   iropt_licm(&mut f);
+  if iropt_vlen(&mut f) > 0 {
+    iropt_copies(&mut f);
+    iropt_dce(&mut f);
+  }
   if iropt_rowptr(&mut f) > 0 {
     iropt_copies(&mut f);
     iropt_dce(&mut f);

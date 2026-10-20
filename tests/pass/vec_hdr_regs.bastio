@@ -1,0 +1,202 @@
+// expect-exit: 0
+// expect-stdout: 4784903
+// The header words of a Vec that a loop reads and writes (the length and
+// capacity a push checks and updates, the data address it stores through) are
+// kept in registers by native-ir, and read again after a `vgrow`. The cases
+// push past several capacities, read `vec_len` in the loop, nest loops with the
+// push in the outer one or the inner one, pop in a branch, push to two vectors
+// in one loop, and leave a loop early.
+fn pushes(v: &mut Vec[u64], n: u64)
+  requires vlen(v) == 0 && n <= 100000
+  ensures vlen(v) == n
+{
+  let mut i = 0;
+  while i < n
+    invariant i <= n && vlen(v) == i
+  {
+    vec_push(&mut v, i % 7);
+    i = i + 1;
+  }
+}
+
+fn total(v: &Vec[u64]) -> u64
+  requires vlen(v) <= 100000
+  ensures result <= vlen(v) * 100
+{
+  let mut t = 0;
+  let mut i = 0;
+  while i < vec_len(v)
+    invariant i <= vlen(v) && t <= i * 100
+  {
+    t = t + vec_get(v, i) % 100;
+    i = i + 1;
+  }
+  return t;
+}
+
+// The length is read in the loop's test while the body pushes.
+fn until(v: &mut Vec[u64], n: u64)
+  requires vlen(v) == 0 && n <= 100000
+  ensures vlen(v) <= n
+{
+  while vec_len(v) < n
+    invariant vlen(v) <= n
+  {
+    vec_push(&mut v, vec_len(v) % 5);
+  }
+}
+
+// The push is in the outer loop and the inner loop only reads.
+fn nested(v: &mut Vec[u64], n: u64) -> u64
+  requires vlen(v) == 0 && n <= 300
+  ensures vlen(v) == n
+{
+  let mut a = 0;
+  let mut s = 0;
+  while a < n
+    invariant a <= n && vlen(v) == a
+  {
+    vec_push(&mut v, a % 4);
+    let mut b = 0;
+    while b < vec_len(v)
+      invariant b <= vlen(v) && vlen(v) == a + 1
+    {
+      s = wrap_add(s, vec_get(v, b));
+      b = b + 1;
+    }
+    a = a + 1;
+  }
+  return s;
+}
+
+// The push is in the inner loop.
+fn inner(v: &mut Vec[u64], n: u64)
+  requires vlen(v) == 0 && n <= 100
+  ensures vlen(v) == n * 10
+{
+  let mut a = 0;
+  while a < n
+    invariant a <= n && vlen(v) == a * 10
+  {
+    let mut b = 0;
+    while b < 10
+      invariant b <= 10 && vlen(v) == a * 10 + b
+    {
+      vec_push(&mut v, a + b);
+      b = b + 1;
+    }
+    a = a + 1;
+  }
+}
+
+// The length goes up and down in one loop.
+fn updown(v: &mut Vec[u64], n: u64) -> u64
+  requires vlen(v) == 0 && n <= 30000
+  ensures vlen(v) >= 1 && vlen(v) <= 2 * n + 1
+{
+  vec_push(&mut v, 1);
+  let mut i = 0;
+  let mut s = 0;
+  while i < n
+    invariant i <= n && vlen(v) >= 1 && vlen(v) <= 2 * i + 1
+  {
+    vec_push(&mut v, i);
+    vec_push(&mut v, i + 1);
+    if i % 3 == 0 {
+      let x = vec_pop(&mut v);
+      s = wrap_add(s, x % 8);
+    }
+    i = i + 1;
+  }
+  return s;
+}
+
+// Two vectors in one loop.
+fn two(a: &mut Vec[u64], b: &mut Vec[u64], n: u64)
+  requires vlen(a) == 0 && vlen(b) == 0 && n <= 10000
+  ensures vlen(a) == n && vlen(b) == n
+{
+  let mut i = 0;
+  while i < n
+    invariant i <= n && vlen(a) == i && vlen(b) == i
+  {
+    vec_push(&mut a, i % 11);
+    vec_push(&mut b, i % 13);
+    i = i + 1;
+  }
+}
+
+// An early exit, and the vector used after the loop.
+fn early(v: &mut Vec[u64], n: u64, stop: u64)
+  requires vlen(v) == 0 && n <= 50000
+  ensures vlen(v) <= n + 1
+{
+  let mut i = 0;
+  while i < n && vec_len(v) < stop
+    invariant i <= n && vlen(v) == i
+  {
+    vec_push(&mut v, i % 9);
+    i = i + 1;
+  }
+  vec_push(&mut v, 3);
+}
+
+// Stores through the data address between pushes.
+fn rewrite(v: &mut Vec[u64], n: u64)
+  requires vlen(v) == 0 && n >= 1 && n <= 100000
+  ensures vlen(v) == n
+{
+  vec_push(&mut v, 0);
+  let mut i = 1;
+  while i < n
+    invariant i >= 1 && i <= n && vlen(v) == i
+  {
+    vec_push(&mut v, i % 10);
+    vec_set(&mut v, i - 1, wrap_add(vec_get(v, i - 1), i) % 10);
+    i = i + 1;
+  }
+}
+
+fn main() -> u64 {
+  let mut sum = 0;
+  let mut v = vec_new[u64]();
+  pushes(&mut v, 5000);
+  sum = wrap_add(sum, total(v));
+  vec_free(v);
+  v = vec_new[u64]();
+  until(&mut v, 3000);
+  sum = wrap_add(sum, wrap_mul(total(v), 3));
+  vec_free(v);
+  v = vec_new[u64]();
+  let c = nested(&mut v, 200);
+  sum = wrap_add(sum, wrap_mul(c, 5));
+  vec_free(v);
+  v = vec_new[u64]();
+  inner(&mut v, 60);
+  sum = wrap_add(sum, wrap_mul(total(v), 7));
+  vec_free(v);
+  v = vec_new[u64]();
+  let e = updown(&mut v, 4000);
+  sum = wrap_add(sum, wrap_mul(wrap_add(total(v), e), 11));
+  vec_free(v);
+  v = vec_new[u64]();
+  let mut w = vec_new[u64]();
+  two(&mut v, &mut w, 3000);
+  sum = wrap_add(sum, wrap_mul(wrap_add(total(v), total(w)), 13));
+  vec_free(v);
+  vec_free(w);
+  v = vec_new[u64]();
+  early(&mut v, 5000, 40);
+  sum = wrap_add(sum, wrap_mul(wrap_add(total(v), vec_len(v)), 17));
+  vec_free(v);
+  v = vec_new[u64]();
+  early(&mut v, 10, 40);
+  sum = wrap_add(sum, wrap_mul(wrap_add(total(v), vec_len(v)), 19));
+  vec_free(v);
+  v = vec_new[u64]();
+  rewrite(&mut v, 3000);
+  sum = wrap_add(sum, wrap_mul(total(v), 23));
+  vec_free(v);
+  print(sum);
+  return 0;
+}
