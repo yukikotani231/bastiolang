@@ -2196,7 +2196,7 @@ fn ix_rotprodj(f: &IrFn, al: &IrAlloc, m: &Mono, ub: &Vec[u64], nuse: &Vec[u64],
 /// stands as an immediate (constants that cost nothing may stand between)
 /// and then the branch on it, or directly by the branch: the index of that
 /// comparison (`i` for the branch alone), or 0 if the load is not such.
-fn ix_load_cmp(f: &IrFn, al: &IrAlloc, nuse: &Vec[u64], i: u64) -> u64 {
+fn ix_load_cmp(f: &IrFn, al: &IrAlloc, nuse: &Vec[u64], ub: &Vec[u64], i: u64) -> u64 {
   let q = ix_at(f, i);
   if u_at(nuse, q.d) != 1 {
     return 0;
@@ -2241,6 +2241,18 @@ fn ix_load_cmp(f: &IrFn, al: &IrAlloc, nuse: &Vec[u64], i: u64) -> u64 {
       if lr.k == IXK_REG {
         return j;
       }
+    }
+  }
+  if q.c == 1 && cm.a != cm.b && cm.op < IR_SLT {
+    // A byte against a register that holds a byte: `cmpb` on the byte
+    // registers, the order of the unsigned comparison unchanged.
+    let mut other = cm.a;
+    if cm.a == q.d {
+      other = cm.b;
+    }
+    let lr = ix_loc(al, other);
+    if lr.k == IXK_REG && other < vec_len(ub) && u_at(ub, other) < 256 {
+      return j;
     }
   }
   if cm.a != q.d {
@@ -2813,10 +2825,10 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       ix_awrite(&mut out, ap, 8);
       w_s(&mut out, "\n");
       i = j;
-    } else if q.op == IR_LOAD && ix_load_cmp(f, al, nuse, i) != 0 {
+    } else if q.op == IR_LOAD && ix_load_cmp(f, al, nuse, ub, i) != 0 {
       // A load that only a comparison with a constant (or the branch) reads:
       // the comparison reads memory, no register is loaded.
-      let j = ix_load_cmp(f, al, nuse, i);
+      let j = ix_load_cmp(f, al, nuse, ub, i);
       let cm = ix_at(f, j);
       let br = ix_at(f, wrap_add(j, 1));
       let ap = ix_aprep(&mut out, al, q.a, q.b, q.ty);
@@ -2850,14 +2862,20 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       } else {
         w_s(&mut out, "\tcmpq ");
       }
-      if byreg && j != i && cm.b == q.d && op != IR_EQ && op != IR_NE {
+      if byreg && j != i && cm.b == q.d && (op != IR_EQ && op != IR_NE || q.c == 1) {
         // The loaded word is the right operand: `cmpq mem, %reg` compares
         // the register with it, in the order of the comparison.
         ix_awrite(&mut out, ap, sz);
         w_s(&mut out, ", ");
-        w_s(&mut out, x86_rname(rg));
+        if q.c == 1 {
+          w_s(&mut out, ix_name8(rg));
+        } else {
+          w_s(&mut out, x86_rname(rg));
+        }
       } else {
-        if byreg {
+        if byreg && q.c == 1 {
+          w_s(&mut out, ix_name8(rg));
+        } else if byreg {
           w_s(&mut out, x86_rname(rg));
         } else {
           ix_w_imm(&mut out, imm);
@@ -4019,7 +4037,7 @@ fn ix_sinkld(f: &mut IrFn) -> u64 {
   let mut i = 0;
   while i < n {
     let q = iropt_at(f, i);
-    if q.op == IR_LOAD && q.c == 8 && q.d < f.nreg && u_at(nuse, q.d) == 1 && u_at(ndef, q.d) == 1 {
+    if q.op == IR_LOAD && (q.c == 8 || q.c == 1) && q.d < f.nreg && u_at(nuse, q.d) == 1 && u_at(ndef, q.d) == 1 {
       let mut j = wrap_add(i, 1);
       let mut tgt = n;
       let mut scanning = true;
