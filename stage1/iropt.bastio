@@ -4321,6 +4321,7 @@ fn iropt_ivs_apply(f: &mut IrFn, lb: &IrLabs, l: u64, p: u64, q: u64, u: u64, di
   let d = qd.d;
   // Is every read of d one that computes another such register?
   let mut ext = 0;
+  let mut idx_only = true;
   let mut i = wrap_add(di, 1);
   while i < u {
     let qi = iropt_at(f, i);
@@ -4329,6 +4330,9 @@ fn iropt_ivs_apply(f: &mut IrFn, lb: &IrLabs, l: u64, p: u64, q: u64, u: u64, di
       let inner = e < nr && e != d && u_at(ndef, e) == 1 && u_at(indef, e) == 1 && u_at(kind, e) <= 1 && (qi.op == IR_ADD || qi.op == IR_SUB || qi.op == IR_MUL);
       if !inner {
         ext = wrap_add(ext, 1);
+        if (qi.op != IR_LOAD && qi.op != IR_STORE) || qi.b != d || qi.a == d || qi.d == d {
+          idx_only = false;
+        }
       }
     }
     i = wrap_add(i, 1);
@@ -4405,7 +4409,18 @@ fn iropt_ivs_apply(f: &mut IrFn, lb: &IrLabs, l: u64, p: u64, q: u64, u: u64, di
     c = wrap_add(c, 1);
   }
   let by = wrap_mul(u_at(scale, d), step);
-  if dead < 2 || by == 0 || by > 1099511627776 {
+  // `a[k - n]`: one addition by a register, read only as an index. Stepping
+  // a register of its own costs what the addition did, and saves the copy a
+  // two-operand `sub` makes of `k` first.
+  let mut cheap = false;
+  if dead == 1 && vec_len(cone) == 1 && idx_only && qd.c == 0 && (qd.op == IR_ADD || qd.op == IR_SUB) {
+    let ia = qd.a == k;
+    let other = u_at(cv, qd.b);
+    if ia && qd.b < nr && other == IR_NONE && u_at(scale, d) == 1 {
+      cheap = true;
+    }
+  }
+  if (dead < 2 && !cheap) || by == 0 || by > 1099511627776 {
     vec_free(cone);
     return false;
   }
@@ -5219,6 +5234,13 @@ fn iropt_ebb(f: &mut IrFn) -> u64 {
     if q.op == IR_MOV && q.d < vec_len(ea) && q.a < vec_len(ea) && q.d != q.a && u_at(ndef, q.d) == 1 && u_at(ndef, q.a) != 1 && vec_len(ea_list) < 64 {
       ra_set(&mut ea, q.d, q.a);
       vec_push(&mut ea_list, q.d);
+    }
+    // The base of a memory access that is a copy of a register the block keeps
+    // is that register: one name for the address, and the copy goes dead.
+    if (q.op == IR_LOAD || q.op == IR_STORE) && q.a < vec_len(ea) && u_at(ea, q.a) != IR_NONE {
+      q.a = u_at(ea, q.a);
+      iropt_put(&mut f, i, q);
+      done = wrap_add(done, 1);
     }
     let pure = ra_is_binary(q.op) || q.op == IR_NOT || q.op == IR_NEG || q.op == IR_WRAP;
     if pure || q.op == IR_LOAD {
