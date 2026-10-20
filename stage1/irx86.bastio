@@ -2229,14 +2229,14 @@ fn ix_load_cmp(f: &IrFn, al: &IrAlloc, nuse: &Vec[u64], i: u64) -> u64 {
     return 0;
   }
   if q.c == 8 && cm.a != cm.b {
-    // A comparison with a register: `cmpq %reg, mem` (the load on the right
-    // only for equality, which does not care about the order).
+    // A comparison with a register: `cmpq %reg, mem` (the load on the left),
+    // or `cmpq mem, %reg` (on the right).
     if cm.a == q.d {
       let lr = ix_loc(al, cm.b);
       if lr.k == IXK_REG {
         return j;
       }
-    } else if cm.op == IR_EQ || cm.op == IR_NE {
+    } else {
       let lr = ix_loc(al, cm.a);
       if lr.k == IXK_REG {
         return j;
@@ -2850,13 +2850,21 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       } else {
         w_s(&mut out, "\tcmpq ");
       }
-      if byreg {
+      if byreg && j != i && cm.b == q.d && op != IR_EQ && op != IR_NE {
+        // The loaded word is the right operand: `cmpq mem, %reg` compares
+        // the register with it, in the order of the comparison.
+        ix_awrite(&mut out, ap, sz);
+        w_s(&mut out, ", ");
         w_s(&mut out, x86_rname(rg));
       } else {
-        ix_w_imm(&mut out, imm);
+        if byreg {
+          w_s(&mut out, x86_rname(rg));
+        } else {
+          ix_w_imm(&mut out, imm);
+        }
+        w_s(&mut out, ", ");
+        ix_awrite(&mut out, ap, sz);
       }
-      w_s(&mut out, ", ");
-      ix_awrite(&mut out, ap, sz);
       w_s(&mut out, "\n");
       ix_br_flags(&mut out, f.x, op, br.b, br.c, ix_pick_next(f, wrap_add(j, 2), br.b, br.c));
       i = wrap_add(j, 1);
@@ -3996,6 +4004,56 @@ fn ix_selprep(f: &mut IrFn) -> u64 {
   return done;
 }
 
+/// Moves a word load that only a comparison and its branch read down to just
+/// before that comparison, over instructions that neither write memory nor
+/// the load's address, so that the comparison can read the word from memory
+/// (`cmpq mem, %reg`) and no register holds it. Returns how many moved.
+fn ix_sinkld(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  if n > 4000000 {
+    return 0;
+  }
+  let nuse = iropt_nuse(f);
+  let ndef = iropt_ndef(f);
+  let mut done = 0;
+  let mut i = 0;
+  while i < n {
+    let q = iropt_at(f, i);
+    if q.op == IR_LOAD && q.c == 8 && q.d < f.nreg && u_at(nuse, q.d) == 1 && u_at(ndef, q.d) == 1 {
+      let mut j = wrap_add(i, 1);
+      let mut tgt = n;
+      let mut scanning = true;
+      while scanning && j < n && j < wrap_add(i, 12) {
+        let m = iropt_at(f, j);
+        if ra_reads_has(f, m, q.d) {
+          scanning = false;
+          let b = iropt_at(f, wrap_add(j, 1));
+          if ix_is_cmp(m.op) && m.a != m.b && b.op == IR_BR && b.a == m.d && u_at(nuse, m.d) == 1 {
+            tgt = j;
+          }
+        } else if !iropt_ebb_keeps_loads(m.op) || m.op == IR_LABEL || m.op == IR_BR || ra_writes_has(m, q.a) || ra_writes_has(m, q.b) {
+          scanning = false;
+        } else {
+          j = wrap_add(j, 1);
+        }
+      }
+      if tgt < n && tgt > wrap_add(i, 1) {
+        let mut k = i;
+        while wrap_add(k, 1) < tgt {
+          iropt_put(&mut f, k, iropt_at(f, wrap_add(k, 1)));
+          k = wrap_add(k, 1);
+        }
+        iropt_put(&mut f, wrap_sub(tgt, 1), q);
+        done = wrap_add(done, 1);
+      }
+    }
+    i = wrap_add(i, 1);
+  }
+  vec_free(nuse);
+  vec_free(ndef);
+  return done;
+}
+
 /// `y = op s, b; ...; s = op2 y, c` (or `op2 c, y`), where `y` is written and
 /// read only there, `b` and `c` are not `s`, and nothing between the two
 /// reads or writes `s`, becomes `s = op s, b; ...; s = op2 s, c`: the old
@@ -4975,6 +5033,7 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
   if ix_incr(&mut f) > 0 {
     iropt_dce(&mut f);
   }
+  ix_sinkld(&mut f);
   ix_ivmerge(&mut f);
   ix_selprep(&mut f);
   ix_coalesce(&mut f);
