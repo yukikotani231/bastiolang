@@ -818,7 +818,7 @@ fn ix_has_at(v: &Vec[u64], i: u64, pat: Str) -> bool {
 
 /// The `movabs $M, %rdx; mul %rdx` in the code of a division by a constant
 /// (`g.body`), as `mul` of the register that holds the multiplier.
-fn ix_mulreg(g: &mut X86, mval: u64, reg: u64) {
+fn ix_mulreg(g: &mut X86, mval: u64, lm: IxL) {
   let mut pat = vec_new[u64]();
   w_s(&mut pat, "\tmovabs $");
   w_num(&mut pat, mval);
@@ -838,8 +838,12 @@ fn ix_mulreg(g: &mut X86, mval: u64, reg: u64) {
       vec_push(&mut nb, vec_get(g.body, k));
       k = wrap_add(k, 1);
     }
-    w_s(&mut nb, "\tmul ");
-    w_s(&mut nb, x86_rname(reg));
+    w_s(&mut nb, "\tmul");
+    if lm.k == IXK_MEM {
+      w_s(&mut nb, "q");
+    }
+    w_s(&mut nb, " ");
+    ix_op(&mut nb, lm);
     w_s(&mut nb, "\n");
     k = wrap_add(at, vec_len(pat));
     while k < vec_len(g.body) {
@@ -1283,6 +1287,21 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
       w_s(&mut out, "\n");
       return;
     }
+    if op == IR_ADD && !wrap && ld.k == IXK_MEM && la.k == IXK_REG && lb0.k == IXK_IMM && ix_fits(lb0.imm) {
+      // `d = a + imm` into the frame: one lea into %rax, then the store.
+      w_s(&mut out, "\tlea ");
+      if lb0.imm <= 2147483647 {
+        w_num(&mut out, lb0.imm);
+      } else {
+        w_s(&mut out, "-");
+        w_num(&mut out, wrap_sub(0, lb0.imm));
+      }
+      w_s(&mut out, "(");
+      w_s(&mut out, x86_rname(la.reg));
+      w_s(&mut out, "), %rax\n");
+      ix_ins2(&mut out, "mov", ix_rl(XR_RAX), ld);
+      return;
+    }
     if op == IR_SUB && !wrap && ld.k == IXK_REG && la.k == IXK_REG && lb0.k == IXK_IMM && lb0.imm <= 2147483647 && la.reg != ld.reg {
       // `d = a - imm` into another register: one lea instead of a move and a sub.
       w_s(&mut out, "\tlea -");
@@ -1498,10 +1517,14 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     // is the high half of the product, shifted, and stays in %rdx.
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RAX));
     let lm = ix_loc(al, wrap_sub(q.c, 2));
-    if q.c >= 2 && lm.k == IXK_REG {
+    if q.c >= 2 && (lm.k == IXK_REG || lm.k == IXK_MEM) {
       // The multiplier was made in front of the loop.
-      w_s(&mut out, "\tmul ");
-      w_s(&mut out, x86_rname(lm.reg));
+      w_s(&mut out, "\tmul");
+      if lm.k == IXK_MEM {
+        w_s(&mut out, "q");
+      }
+      w_s(&mut out, " ");
+      ix_op(&mut out, lm);
       w_s(&mut out, "\n");
     } else {
       w_s(&mut out, "\tmovabs $");
@@ -1522,8 +1545,8 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     x86_div_const(&mut g, lbq.imm, op == IR_REM);
     if q.c >= 2 {
       let lm = ix_loc(al, wrap_sub(q.c, 2));
-      if lm.k == IXK_REG {
-        ix_mulreg(&mut g, u_at(al.cv, wrap_sub(q.c, 2)), lm.reg);
+      if lm.k == IXK_REG || lm.k == IXK_MEM {
+        ix_mulreg(&mut g, u_at(al.cv, wrap_sub(q.c, 2)), lm);
       }
     }
     // A remainder ends with its result in %rsi moved to %rax: take it from
@@ -1542,6 +1565,9 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     // and the move from it go.
     let head = "\tmov %rax, %rsi\n";
     let last = "\tsub %rdx, %rsi\n";
+    let head2 = "\tmov %rax, %rsi\n\tmov %rax, %rdi\n";
+    let last2 = "\tsub %rax, %rsi\n";
+    let mvd = "\tmov %rdi, %rax\n";
     let ldr = ix_loc(al, q.d);
     let lar = ix_loc(al, q.a);
     if res == XR_RSI && ldr.k == IXK_REG && lar.k == IXK_REG && ix_has_at(g.body, 0, head) && ix_ends_with(g.body, last)
@@ -1560,6 +1586,35 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
         w_s(&mut out, "\n");
       }
       w_s(&mut out, "\tsub %rdx, ");
+      w_s(&mut out, x86_rname(ldr.reg));
+      w_s(&mut out, "\n");
+      x86_clear(&mut g.body);
+    } else if res == XR_RSI && ldr.k == IXK_REG && lar.k == IXK_REG && ix_has_at(g.body, 0, head2) && ix_ends_with(g.body, last2)
+       && ix_count(g.body, "%rsi") == 2 && ix_count(g.body, "%rdi") == 2 && ix_count(g.body, mvd) == 1 && vec_len(g.body) >= slen(head2) && vec_len(g.body) - slen(head2) >= slen(last2) {
+      // The divisor needs the dividend's 65th bit: `n` is kept in two
+      // registers for the end. It is still in its own register: read it
+      // from there, and subtract into the result's register.
+      let mut k = slen(head2);
+      let end = vec_len(g.body) - slen(last2);
+      while k < end && k < vec_len(g.body) {
+        if ix_has_at(g.body, k, mvd) {
+          w_s(&mut out, "\tmov ");
+          w_s(&mut out, x86_rname(lar.reg));
+          w_s(&mut out, ", %rax\n");
+          k = wrap_add(k, slen(mvd));
+        } else {
+          vec_push(&mut out, vec_get(g.body, k));
+          k = wrap_add(k, 1);
+        }
+      }
+      if ldr.reg != lar.reg {
+        w_s(&mut out, "\tmov ");
+        w_s(&mut out, x86_rname(lar.reg));
+        w_s(&mut out, ", ");
+        w_s(&mut out, x86_rname(ldr.reg));
+        w_s(&mut out, "\n");
+      }
+      w_s(&mut out, "\tsub %rax, ");
       w_s(&mut out, x86_rname(ldr.reg));
       w_s(&mut out, "\n");
       x86_clear(&mut g.body);
@@ -5144,6 +5199,83 @@ fn ix_hoist_at(f: &IrFn, lpos: &Vec[u64], lp: u64, hi: u64) -> u64 {
   return e0;
 }
 
+/// A store of 1, 2 or 4 bytes keeps only the low bytes of its value, so the
+/// `x % 2^k` or `x & mask` (the low bytes of the mask all ones) that only the
+/// store reads, made just before it, is not needed: the store takes `x`.
+fn ix_stmask(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  let ndef = iropt_ndef(f);
+  let nuse = iropt_nuse(f);
+  let mut kv = vec_new[u64]();
+  let mut r = 0;
+  while r < f.nreg && r < 1000000000 {
+    vec_push(&mut kv, IR_NONE);
+    r = wrap_add(r, 1);
+  }
+  let mut i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    if q.op == IR_CONST && q.d < vec_len(ndef) && u_at(ndef, q.d) == 1 {
+      ra_set(&mut kv, q.d, q.a);
+    }
+    i = wrap_add(i, 1);
+  }
+  let mut skip = vec_new[u64]();
+  i = 0;
+  while i < n {
+    vec_push(&mut skip, 0);
+    i = wrap_add(i, 1);
+  }
+  let mut done = 0;
+  i = 1;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    if i > 0 && i <= vec_len(f.ins) && q.op == IR_STORE && (q.c == 1 || q.c == 2 || q.c == 4) && q.d < vec_len(nuse) && u_at(nuse, q.d) == 1 && u_at(ndef, q.d) == 1 {
+      let p = vec_get(f.ins, wrap_sub(i, 1));
+      if p.d == q.d && p.a != p.d && p.c == 0 && p.ty == 0 && (p.op == IR_REM || p.op == IR_AND) && p.b < vec_len(kv) && u_at(kv, p.b) != IR_NONE && u_at(skip, wrap_sub(i, 1)) == 0 {
+        let k = u_at(kv, p.b);
+        let mut low = 255;
+        if q.c == 2 {
+          low = 65535;
+        } else if q.c == 4 {
+          low = 4294967295;
+        }
+        let mut ok = false;
+        if p.op == IR_REM {
+          ok = k > low && (k & wrap_sub(k, 1)) == 0;
+        } else {
+          ok = (k & low) == low;
+        }
+        if ok {
+          ra_set(&mut skip, wrap_sub(i, 1), 1);
+          let mut s = q;
+          s.d = p.a;
+          vec_set(&mut f.ins, i, s);
+          done = wrap_add(done, 1);
+        }
+      }
+    }
+    i = wrap_add(i, 1);
+  }
+  if done > 0 {
+    let mut out = vec_new[IrIns]();
+    i = 0;
+    while i < n {
+      if u_at(skip, i) == 0 {
+        vec_push(&mut out, vec_get(f.ins, i));
+      }
+      i = wrap_add(i, 1);
+    }
+    vec_free(f.ins);
+    f.ins = out;
+  }
+  vec_free(ndef);
+  vec_free(nuse);
+  vec_free(kv);
+  vec_free(skip);
+  return done;
+}
+
 /// A division by a constant inside a loop loads its multiplier on every pass
 /// (`movabs`); the multiplier is made once in front of the loop instead, a
 /// register of its own that the loop reads, and the division records it in
@@ -6131,6 +6263,323 @@ fn irx_function_n(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, nc
   return r;
 }
 
+/// Is `c` a letter or a digit?
+fn ix_alnum(c: u64) -> bool {
+  return (c >= 48 && c <= 57) || (c >= 97 && c <= 122) || (c >= 65 && c <= 90);
+}
+
+/// Is the register named at `p` in the text `v` (a name ends at the first byte
+/// that is no letter or digit) the one called `pat`?
+fn ix_reg_is(v: &Vec[u64], p: u64, pat: Str) -> bool {
+  return ix_has_at(v, p, pat) && !ix_alnum(u_at(v, wrap_add(p, slen(pat))));
+}
+
+/// Does the register named at `p` belong to the register `r` (its 64, 32, 16
+/// and 8 bit names)?
+fn ix_in_fam(v: &Vec[u64], p: u64, r: u64) -> bool {
+  if r == XR_RBX {
+    return ix_reg_is(v, p, "%rbx") || ix_reg_is(v, p, "%ebx") || ix_reg_is(v, p, "%bx") || ix_reg_is(v, p, "%bl") || ix_reg_is(v, p, "%bh");
+  }
+  if r == XR_RSI {
+    return ix_reg_is(v, p, "%rsi") || ix_reg_is(v, p, "%esi") || ix_reg_is(v, p, "%si") || ix_reg_is(v, p, "%sil");
+  }
+  if r == XR_RDI {
+    return ix_reg_is(v, p, "%rdi") || ix_reg_is(v, p, "%edi") || ix_reg_is(v, p, "%di") || ix_reg_is(v, p, "%dil");
+  }
+  if r == XR_RBP {
+    return ix_reg_is(v, p, "%rbp") || ix_reg_is(v, p, "%ebp") || ix_reg_is(v, p, "%bp") || ix_reg_is(v, p, "%bpl");
+  }
+  let nm = x86_rname(r);
+  if !ix_has_at(v, p, nm) {
+    return false;
+  }
+  let a = u_at(v, wrap_add(p, slen(nm)));
+  if !ix_alnum(a) {
+    return true;
+  }
+  return (a == 100 || a == 119 || a == 98) && !ix_alnum(u_at(v, wrap_add(wrap_add(p, slen(nm)), 1)));
+}
+
+/// Does the line `s` to `e` of `v` contain `pat`?
+fn ix_line_has(v: &Vec[u64], s: u64, e: u64, pat: Str) -> bool {
+  let m = slen(pat);
+  let mut p = s;
+  while wrap_add(p, m) <= e && p < 1000000000 {
+    if ix_has_at(v, p, pat) {
+      return true;
+    }
+    p = wrap_add(p, 1);
+  }
+  return false;
+}
+
+/// The register that the line `s` to `e` copies into %rcx (`mov %r15, %rcx`),
+/// or 0 when it is another line, or the register is %rax, %rcx, %rdx or %rsp.
+fn ix_cxmov(v: &Vec[u64], s: u64, e: u64) -> u64 {
+  if !ix_has_at(v, s, "\tmov %") {
+    return 0;
+  }
+  let st = wrap_add(s, 5);
+  let mut r = 1;
+  while r <= 16 {
+    let nm = x86_rname(r);
+    let at = wrap_add(st, slen(nm));
+    if ix_has_at(v, st, nm) && ix_has_at(v, at, ", %rcx") && wrap_add(at, 6) == e {
+      if r == XR_RAX || r == XR_RCX || r == XR_RDX || r == XR_RSP {
+        return 0;
+      }
+      return r;
+    }
+    r = wrap_add(r, 1);
+  }
+  return 0;
+}
+
+/// Is `a` to `ae` the same text as `b` to `be`?
+fn ix_same_text(v: &Vec[u64], a: u64, ae: u64, b: u64, be: u64) -> bool {
+  if wrap_sub(ae, a) != wrap_sub(be, b) || ae < a || be < b {
+    return false;
+  }
+  let mut k = 0;
+  while wrap_add(a, k) < ae && k < 1000000 {
+    if u_at(v, wrap_add(a, k)) != u_at(v, wrap_add(b, k)) {
+      return false;
+    }
+    k = wrap_add(k, 1);
+  }
+  return true;
+}
+
+/// Does the line `s` to `e` start an instruction that changes %rcx behind the
+/// text (a call, a string or system instruction) or jumps to a computed place?
+fn ix_cl_denied(v: &Vec[u64], s: u64) -> bool {
+  return ix_has_at(v, s, "\tcall") || ix_has_at(v, s, "\trep") || ix_has_at(v, s, "\tsyscall") || ix_has_at(v, s, "\tcpuid")
+    || ix_has_at(v, s, "\trdtscp") || ix_has_at(v, s, "\trdmsr") || ix_has_at(v, s, "\twrmsr") || ix_has_at(v, s, "\tloop")
+    || ix_has_at(v, s, "\tjrcxz") || ix_has_at(v, s, "\tjecxz") || ix_has_at(v, s, "\txgetbv") || ix_has_at(v, s, "\txsetbv")
+    || ix_has_at(v, s, "\tcmpxchg") || ix_has_at(v, s, "\trdpmc") || ix_has_at(v, s, "\tint") || ix_has_at(v, s, "\tsysenter")
+    || ix_has_at(v, s, "\tsysret") || ix_has_at(v, s, "\tjmp *") || ix_has_at(v, s, "\txchg") || ix_has_at(v, s, "\txadd")
+    || ix_has_at(v, s, "\tlock");
+}
+
+/// The register that every `%cl` use in lines `h + 1` to `j` of `ls` gets
+/// from a copy placed right before it, when the lines hold nothing else that
+/// touches %rcx and never write that register; else 0.
+fn ix_cl_span(v: &Vec[u64], ls: &Vec[u64], h: u64, j: u64) -> u64 {
+  let mut reg = 0;
+  let mut ncl = 0;
+  let mut ok = true;
+  let mut k = wrap_add(h, 1);
+  while k <= j && ok && k < 1000000000 {
+    let s = u_at(ls, k);
+    let e = wrap_sub(u_at(ls, wrap_add(k, 1)), 1);
+    let m = ix_cxmov(v, s, e);
+    if m != 0 {
+      if reg == 0 {
+        reg = m;
+      } else if reg != m {
+        ok = false;
+      }
+    } else {
+      if ix_line_has(v, s, e, "%rcx") || ix_line_has(v, s, e, "%ecx") || ix_line_has(v, s, e, "%cx") || ix_line_has(v, s, e, "%ch") || ix_cl_denied(v, s) {
+        ok = false;
+      }
+      if ix_line_has(v, s, e, "%cl") {
+        let ps = u_at(ls, wrap_sub(k, 1));
+        if k == 0 || ix_cxmov(v, ps, wrap_sub(s, 1)) == 0 {
+          ok = false;
+        }
+        ncl = wrap_add(ncl, 1);
+      }
+    }
+    k = wrap_add(k, 1);
+  }
+  if !ok || reg == 0 || ncl == 0 {
+    return 0;
+  }
+  // The register must not change inside: no line has it as its last operand
+  // (or only operand).
+  k = wrap_add(h, 1);
+  while k <= j && ok && k < 1000000000 {
+    let s = u_at(ls, k);
+    let e = wrap_sub(u_at(ls, wrap_add(k, 1)), 1);
+    if ix_cxmov(v, s, e) == 0 {
+      let mut st = s;
+      let mut q = s;
+      while q < e {
+        let ch = u_at(v, q);
+        if ch == 44 || ch == 32 || ch == 9 {
+          st = wrap_add(q, 1);
+        }
+        q = wrap_add(q, 1);
+      }
+      if st < e && u_at(v, st) == 37 && ix_in_fam(v, st, reg) {
+        ok = false;
+      }
+    }
+    k = wrap_add(k, 1);
+  }
+  if !ok {
+    return 0;
+  }
+  return reg;
+}
+
+/// Is the stretch of lines `h` to `j` of `ls` entered only at its first line
+/// (a label) and by falling in: no jump from outside it names a label in it?
+fn ix_cl_closed(v: &Vec[u64], ls: &Vec[u64], nl: u64, h: u64, j: u64) -> bool {
+  let mut k = 0;
+  while k < nl && k < 1000000000 {
+    if k < h || k > j {
+      let s = u_at(ls, k);
+      let e = wrap_sub(u_at(ls, wrap_add(k, 1)), 1);
+      if ix_has_at(v, s, "\tj") {
+        let mut ts = s;
+        let mut q = s;
+        while q < e {
+          if u_at(v, q) == 32 {
+            ts = wrap_add(q, 1);
+          }
+          q = wrap_add(q, 1);
+        }
+        let mut m = h;
+        while m <= j && m < 1000000000 {
+          let ms = u_at(ls, m);
+          let me = wrap_sub(u_at(ls, wrap_add(m, 1)), 1);
+          if me > ms && u_at(v, wrap_sub(me, 1)) == 58 && ix_has_at(v, ms, ".Lir") && ix_same_text(v, ts, e, ms, wrap_sub(me, 1)) {
+            return false;
+          }
+          m = wrap_add(m, 1);
+        }
+      }
+    }
+    k = wrap_add(k, 1);
+  }
+  return true;
+}
+
+/// A shift by a count in a register moves it to %cl first. In a loop that
+/// does nothing else with %rcx, and never changes that register, the copy is
+/// made once in front of the loop instead of on every pass. The loop is read
+/// from the text `v` from `from` on: a label, the last jump back to it, and
+/// between them every use of %rcx is such a copy and the `%cl` that follows.
+fn ix_clhoist(v: &mut Vec[u64], from: u64) {
+  if !ix_mentions_from(v, from, "%cl") {
+    return;
+  }
+  let n = vec_len(v);
+  let mut ls = vec_new[u64]();
+  let mut i = from;
+  vec_push(&mut ls, from);
+  while i < n {
+    if u_at(v, i) == 10 {
+      vec_push(&mut ls, wrap_add(i, 1));
+    }
+    i = wrap_add(i, 1);
+  }
+  if u_at(ls, wrap_sub(vec_len(ls), 1)) != n {
+    vec_push(&mut ls, wrap_add(n, 1));
+  }
+  let nl = wrap_sub(vec_len(ls), 1);
+  let mut lastcl = 0;
+  let mut k = 0;
+  while k < nl {
+    if ix_line_has(v, u_at(ls, k), wrap_sub(u_at(ls, wrap_add(k, 1)), 1), "%cl") {
+      lastcl = k;
+    }
+    k = wrap_add(k, 1);
+  }
+  let mut del = vec_new[u64]();
+  let mut ins = vec_new[u64]();
+  k = 0;
+  while k < nl {
+    vec_push(&mut del, 0);
+    vec_push(&mut ins, 0);
+    k = wrap_add(k, 1);
+  }
+  let mut done = 0;
+  // The end of the last accepted loop: a loop inside it is already served.
+  let mut upto = 0;
+  let mut h = 0;
+  while h < lastcl {
+    let hs = u_at(ls, h);
+    let he = wrap_sub(u_at(ls, wrap_add(h, 1)), 1);
+    if h >= upto && he > hs && u_at(v, wrap_sub(he, 1)) == 58 && ix_has_at(v, hs, ".Lir") {
+      // The last jump back to the label.
+      let mut j = 0;
+      k = wrap_add(h, 1);
+      while k < nl {
+        let s = u_at(ls, k);
+        let e = wrap_sub(u_at(ls, wrap_add(k, 1)), 1);
+        if ix_has_at(v, s, "\tj") && e > s {
+          let mut ts = s;
+          let mut q = s;
+          while q < e {
+            if u_at(v, q) == 32 {
+              ts = wrap_add(q, 1);
+            }
+            q = wrap_add(q, 1);
+          }
+          if ix_same_text(v, ts, e, hs, wrap_sub(he, 1)) {
+            j = k;
+          }
+        }
+        k = wrap_add(k, 1);
+      }
+      if j > h {
+        let reg = ix_cl_span(v, ls, h, j);
+        if reg != 0 && ix_cl_closed(v, ls, nl, h, j) {
+          k = wrap_add(h, 1);
+          while k <= j {
+            if ix_cxmov(v, u_at(ls, k), wrap_sub(u_at(ls, wrap_add(k, 1)), 1)) != 0 {
+              ra_set(&mut del, k, 1);
+            }
+            k = wrap_add(k, 1);
+          }
+          // In front of the alignment of the header, off the loop's path.
+          let mut at = h;
+          if h > 0 && ix_has_at(v, u_at(ls, h - 1), "\t.p2align 4\n") {
+            at = h - 1;
+          }
+          ra_set(&mut ins, at, reg);
+          upto = wrap_add(j, 1);
+          done = wrap_add(done, 1);
+        }
+      }
+    }
+    h = wrap_add(h, 1);
+  }
+  if done > 0 {
+    let mut w = vec_new[u64]();
+    i = 0;
+    while i < from {
+      vec_push(&mut w, u_at(v, i));
+      i = wrap_add(i, 1);
+    }
+    k = 0;
+    while k < nl {
+      if u_at(ins, k) != 0 {
+        w_s(&mut w, "\tmov ");
+        w_s(&mut w, x86_rname(u_at(ins, k)));
+        w_s(&mut w, ", %rcx\n");
+      }
+      if u_at(del, k) == 0 {
+        i = u_at(ls, k);
+        while i < u_at(ls, wrap_add(k, 1)) && i < n {
+          vec_push(&mut w, u_at(v, i));
+          i = wrap_add(i, 1);
+        }
+      }
+      k = wrap_add(k, 1);
+    }
+    x86_clear(&mut v);
+    w_append(&mut v, w);
+    vec_free(w);
+  }
+  vec_free(ls);
+  vec_free(del);
+  vec_free(ins);
+}
+
 /// The assembly of function `f` (lowered) of instance `x`, appended to
 /// `res`. With `fast` it is a stub (see `ix_fast_entry`) that has no frame
 /// and no header; otherwise `stub` goes in front of the prologue.
@@ -6299,6 +6748,7 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
   ix_arms(&mut f);
   iropt_coldarm(&mut f);
   iropt_taildup(&mut f);
+  ix_stmask(&mut f);
   ix_divhoist(&mut f, &mut g);
   let xi = inst_at(m, x);
   let pos = ix_positions(&mut g, c, &mut m, p, x);
@@ -6438,6 +6888,7 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
   let ub_b = iropt_ub_all(f, ndef_b, cv_b, wb_b, &mut conv_b);
   vec_free(wb_b);
   ix_body(&mut inner, f, al, &mut g, c, &mut m, p, nuse, ub_b, moff, base, words, ix_buffer(c, m, p, rt), retoff);
+  ix_clhoist(&mut inner, save_end);
   vec_free(ndef_b);
   vec_free(cv_b);
   vec_free(ub_b);
