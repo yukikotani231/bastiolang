@@ -549,6 +549,9 @@ static inline void bst_frame_to_bytes(bst_bytes *dst, uint64_t d, bst_frame f, u
 static inline void bst_bytes_to_frame(bst_frame *f, uint64_t o, bst_bytes src, uint64_t s, uint64_t n) {
     if (n) bst_copy_fwd((unsigned char *)*f + o, src.data + s, n);
 }
+static inline void bst_frame_to_frame(bst_frame *d, uint64_t o, bst_frame f, uint64_t s, uint64_t n) {
+    if (n) bst_copy_fwd((unsigned char *)*d + o, (const unsigned char *)f + s, n);
+}
 static inline bst_pt bst_pt_new(bst_frame f, uint64_t level) {
     uint64_t *e = (uint64_t *)f;
     bst_zero_page(f);      /* f may be a page that held data, not a fresh one */
