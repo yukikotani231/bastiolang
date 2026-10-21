@@ -2091,6 +2091,58 @@ fn ix_wraps(m: &Mono, q: IrIns) -> bool {
   return q.c == 1 && q.ty != 0 && slen(x86_normalize(m, q.ty)) > 0;
 }
 
+/// Whether the `load` at `i` is a whole word that only `u = t % 2^32` (or `t
+/// & 0xffffffff`, constants in between) reads: the position of that
+/// instruction, or 0. The two are then one `movl`, which loads the low half
+/// and leaves the upper half zero.
+fn ix_ld32(f: &IrFn, al: &IrAlloc, m: &Mono, nuse: &Vec[u64], i: u64) -> u64 {
+  let q = ix_at(f, i);
+  if q.c != 8 || q.d == IR_NONE || q.d >= vec_len(nuse) || u_at(nuse, q.d) != 1 {
+    return 0;
+  }
+  let mut j = wrap_add(i, 1);
+  let mut aq = ix_at(f, j);
+  let mut skipped = 0;
+  let mut more = aq.op == IR_CONST;
+  while more && skipped < 2 {
+    let cl = ix_loc(al, aq.d);
+    if cl.k == IXK_IMM {
+      j = wrap_add(j, 1);
+      skipped = skipped + 1;
+      aq = ix_at(f, j);
+      more = aq.op == IR_CONST;
+    } else {
+      more = false;
+    }
+  }
+  if ix_wraps(m, aq) || aq.d == IR_NONE {
+    return 0;
+  }
+  let ld = ix_loc(al, aq.d);
+  if ld.k != IXK_REG {
+    return 0;
+  }
+  if aq.op == IR_REM && aq.a == q.d && aq.b != q.d {
+    let lb = ix_loc(al, aq.b);
+    if lb.k == IXK_IMM && lb.imm == 4294967296 {
+      return j;
+    }
+  }
+  if aq.op == IR_AND {
+    let mut x = aq.b;
+    if aq.b == q.d {
+      x = aq.a;
+    }
+    if (aq.a == q.d || aq.b == q.d) && aq.a != aq.b {
+      let lx = ix_loc(al, x);
+      if lx.k == IXK_IMM && lx.imm == 4294967295 {
+        return j;
+      }
+    }
+  }
+  return 0;
+}
+
 /// Whether the `load` at `i` is the first of `t = load p[k]; [consts] u = t op
 /// x; store p[k], u` of whole words (op `add`, `sub`, `and`, `or` or `xor`;
 /// `x` an immediate or a register; no wrapping; `t` and `u` read once): the
@@ -3145,6 +3197,18 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       w_s(&mut out, ix_name32(ldr.reg));
       w_s(&mut out, "\n");
       i = rt.j;
+    } else if q.op == IR_LOAD && ix_ld32(f, al, m, nuse, i) != 0 {
+      // A whole word reduced to its low 32 bits: one `movl` from memory.
+      let j = ix_ld32(f, al, m, nuse, i);
+      let rq = ix_at(f, j);
+      let ldr = ix_loc(al, rq.d);
+      let ap = ix_aprep(&mut out, al, q.a, q.b, q.ty);
+      w_s(&mut out, "\tmovl ");
+      ix_awrite(&mut out, ap, 8);
+      w_s(&mut out, ", ");
+      w_s(&mut out, ix_name32(ldr.reg));
+      w_s(&mut out, "\n");
+      i = j;
     } else if q.op == IR_LOAD && ix_rmw(f, al, m, nuse, i) != 0 {
       // `t = load p[k]; u = t op x; store p[k], u`: one instruction on memory.
       let j = ix_rmw(f, al, m, nuse, i);
