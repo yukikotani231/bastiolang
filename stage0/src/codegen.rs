@@ -366,6 +366,7 @@ static inline bst_buf bst_set(bst_buf b, uint64_t i, uint64_t v) { b.data[i] = v
 const PRELUDE_HOSTED: &str = r#"#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 static inline void bst_serial_write(bst_serial s, uint64_t b) { (void)s; putchar((int)b); if (b == '\n') fflush(stdout); }
 static inline uint64_t bst_serial_read(bst_serial s) { (void)s; fflush(stdout); int c = getchar(); return c == EOF ? 4 : (uint64_t)c; }
 static inline void bst_mmu_settle(void) { }
