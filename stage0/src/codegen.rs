@@ -366,10 +366,6 @@ static inline bst_buf bst_set(bst_buf b, uint64_t i, uint64_t v) { b.data[i] = v
 const PRELUDE_HOSTED: &str = r#"#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef __APPLE__
-/* <sys/sysctl.h> does not compile under -std=c11 on macOS; libSystem has the function. */
-int sysctlbyname(const char *, void *, size_t *, void *, size_t);
-#endif
 static inline void bst_serial_write(bst_serial s, uint64_t b) { (void)s; putchar((int)b); if (b == '\n') fflush(stdout); }
 static inline uint64_t bst_serial_read(bst_serial s) { (void)s; fflush(stdout); int c = getchar(); return c == EOF ? 4 : (uint64_t)c; }
 static inline void bst_mmu_settle(void) { }
@@ -1005,16 +1001,12 @@ static bool bst_host_env(bst_host h, bst_str name, bst_bytes *out) {
     return true;
 }
 /* The number of processors online (at least 1). */
+#if defined(__APPLE__) && !defined(_SC_NPROCESSORS_ONLN)
+#define _SC_NPROCESSORS_ONLN 58 /* -std=c11 hides it from <unistd.h> */
+#endif
 static uint64_t bst_host_cpus(bst_host h) {
     (void)h;
-#ifdef __APPLE__
-    /* -std=c11 hides _SC_NPROCESSORS_ONLN from <unistd.h> on macOS. */
-    int n = 1;
-    size_t sz = sizeof n;
-    if (sysctlbyname("hw.logicalcpu", &n, &sz, NULL, 0) != 0) n = 1;
-#else
     long n = sysconf(_SC_NPROCESSORS_ONLN);
-#endif
     return n < 1 ? 1 : (uint64_t)n;
 }
 "#;
