@@ -4164,6 +4164,172 @@ fn ix_countdown(f: &mut IrFn) -> u64 {
   return done;
 }
 
+/// Counting down to a bound held in a register. A loop `i = const 0; ...;
+/// g = lt i, m; br g, B, E; B: ...; i = add i, 1; ...; t = lt i, m'; br t, B,
+/// E` (the entry test and the test at the bottom, `m` and `m'` the same value
+/// held in a register that is written once before the loop, or copies of it)
+/// whose counter `i` nothing else reads counts down from the bound instead:
+/// `i = mov m; ...; i = sub i, 1; t = gt i, 0`, the entry test becoming `gt m,
+/// 0`. The subtraction leaves the flags the branch wants, so the compare and
+/// the copy of the bound at the bottom go. The entry test sends a bound of
+/// zero to `E`, so the body runs with `m` >= 1 and as many times as before.
+/// One loop per call. Returns 1 if it changed one.
+fn ix_countdown_reg1(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  if n > 4000000 || n < 8 {
+    return 0;
+  }
+  let nuse = iropt_nuse(f);
+  let ndef = iropt_ndef(f);
+  let cv = iropt_consts(f, ndef);
+  let lp = ra_lpos(f);
+  let mut dpos = vec_new[u64]();
+  let mut k = 0;
+  while k < f.nreg && k < 1000000000 {
+    vec_push(&mut dpos, IR_NONE);
+    k = wrap_add(k, 1);
+  }
+  k = 0;
+  while k < n {
+    let t = vec_get(f.ins, k);
+    if t.d < vec_len(dpos) && t.op != IR_STORE && t.op != IR_BR && t.op != IR_JMP && t.op != IR_LABEL && u_at(dpos, t.d) == IR_NONE {
+      ra_set(&mut dpos, t.d, k);
+    }
+    k = wrap_add(k, 1);
+  }
+  let mut found = false;
+  let mut e_d0 = 0;
+  let mut e_gl = 0;
+  let mut e_pa = 0;
+  let mut e_bl = 0;
+  let mut e_cp = IR_NONE;
+  let mut e_nb = 0;
+  let mut b = 6;
+  while !found && b < n {
+    let q = vec_get(f.ins, b);
+    if q.op == IR_BR && q.b < vec_len(lp) {
+      let hb = u_at(lp, q.b);
+      let cmp = ix_at(f, wrap_sub(b, 1));
+      let iv = cmp.a;
+      let g = ix_at(f, wrap_sub(hb, 1));
+      let gl = ix_at(f, wrap_sub(hb, 2));
+      if hb != IR_NONE && hb > 3 && hb < b && cmp.op == IR_LT && cmp.d == q.a && cmp.ty == 0 && cmp.d < vec_len(nuse) && u_at(nuse, cmp.d) == 1
+         && iv < vec_len(ndef) && cmp.b < vec_len(ndef) && u_at(ndef, iv) == 2 && u_at(nuse, iv) == 3
+         && g.op == IR_BR && g.b == q.b && g.c == q.c && gl.op == IR_LT && gl.d == g.a && gl.a == iv && gl.ty == 0 && gl.b < vec_len(ndef) && u_at(nuse, gl.d) == 1 {
+        // The step, behind constants and copies of the bound.
+        let mut pa = wrap_sub(b, 2);
+        let mut pq = ix_at(f, pa);
+        while pa > hb && (pq.op == IR_CONST || (pq.op == IR_MOV && pq.d == cmp.b)) {
+          pa = wrap_sub(pa, 1);
+          pq = ix_at(f, pa);
+        }
+        let add = pq;
+        // The bound of the bottom test: a register written once before the
+        // loop, or a copy of one just before the test.
+        let mut nb = cmp.b;
+        let mut cp = IR_NONE;
+        let mut j = wrap_add(pa, 1);
+        while j < wrap_sub(b, 1) {
+          let t = vec_get(f.ins, j);
+          if t.op == IR_MOV && t.d == cmp.b && u_at(ndef, t.d) == 1 && u_at(nuse, t.d) == 1 {
+            nb = t.a;
+            cp = j;
+          }
+          j = wrap_add(j, 1);
+        }
+        let mut ok = pa > hb && add.op == IR_ADD && add.d == iv && add.a == iv && add.c == 0 && add.ty == 0 && add.b < vec_len(cv) && u_at(cv, add.b) == 1;
+        // The entry test's bound is the same value.
+        let mut gb = gl.b;
+        let gdef = u_at(dpos, gb);
+        if ok && gdef != IR_NONE && gdef < hb {
+          let gm = ix_at(f, gdef);
+          if gm.op == IR_MOV && gm.d == gb && u_at(ndef, gb) == 1 && u_at(nuse, gb) == 1 {
+            gb = gm.a;
+          }
+        }
+        if ok && (gb != nb || nb >= vec_len(ndef) || u_at(dpos, nb) == IR_NONE) {
+          ok = false;
+        }
+        // The counter starts at zero, with only constants and copies between
+        // that and the entry test, and the bound is set before that.
+        let mut d0 = IR_NONE;
+        j = wrap_sub(hb, 3);
+        while ok && d0 == IR_NONE && j > 0 && j < hb && wrap_add(j, 12) > hb {
+          let t = vec_get(f.ins, j);
+          if t.op == IR_CONST && t.d == iv && t.a == 0 {
+            d0 = j;
+          } else if t.op != IR_CONST && t.op != IR_MOV {
+            ok = false;
+          }
+          j = wrap_sub(j, 1);
+        }
+        if ok && (d0 == IR_NONE || u_at(dpos, nb) >= d0) {
+          ok = false;
+        }
+        // The bound is not written from the start of the counter to the end of the loop.
+        j = d0;
+        while ok && j <= b {
+          let t = vec_get(f.ins, j);
+          if ra_writes_has(t, nb) {
+            ok = false;
+          }
+          j = wrap_add(j, 1);
+        }
+        // The body is entered only from the two tests.
+        j = 0;
+        while ok && j < n {
+          let t = vec_get(f.ins, j);
+          if (t.op == IR_JMP && t.a == q.b) || (t.op == IR_BR && (t.b == q.b || t.c == q.b) && j != b && j != wrap_sub(hb, 1)) {
+            ok = false;
+          }
+          j = wrap_add(j, 1);
+        }
+        if ok {
+          found = true;
+          e_d0 = d0;
+          e_gl = wrap_sub(hb, 2);
+          e_pa = pa;
+          e_bl = wrap_sub(b, 1);
+          e_cp = cp;
+          e_nb = nb;
+        }
+      }
+    }
+    b = wrap_add(b, 1);
+  }
+  vec_free(lp);
+  vec_free(cv);
+  vec_free(ndef);
+  vec_free(nuse);
+  vec_free(dpos);
+  if !found {
+    return 0;
+  }
+  let zr = ir_reg(&mut f);
+  let mut out = vec_new[IrIns]();
+  k = 0;
+  while k < n {
+    let t = vec_get(f.ins, k);
+    if k == e_cp {
+    } else if k == e_d0 {
+      vec_push(&mut out, IrIns { op: IR_MOV, d: t.d, a: e_nb, b: 0, c: 0, ty: t.ty });
+    } else if k == e_gl {
+      vec_push(&mut out, IrIns { op: IR_CONST, d: zr, a: 0, b: 0, c: 0, ty: 0 });
+      vec_push(&mut out, IrIns { op: IR_GT, d: t.d, a: t.b, b: zr, c: t.c, ty: t.ty });
+    } else if k == e_pa {
+      vec_push(&mut out, IrIns { op: IR_SUB, d: t.d, a: t.a, b: t.b, c: t.c, ty: t.ty });
+    } else if k == e_bl {
+      vec_push(&mut out, IrIns { op: IR_GT, d: t.d, a: t.a, b: zr, c: t.c, ty: t.ty });
+    } else {
+      vec_push(&mut out, t);
+    }
+    k = wrap_add(k, 1);
+  }
+  vec_free(f.ins);
+  f.ins = out;
+  return 1;
+}
+
 /// `t = add x, K; ...; x = mov t`, where `t` is written once, read only
 /// between the two (the `x + 1` an address wanted, say), `K` is a constant and
 /// `x` is not written in between, becomes `x = add x, K` at the `mov` (when
@@ -6113,6 +6279,10 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
     iropt_dce(&mut f);
   }
   ix_countdown(&mut f);
+  let mut cdr = 0;
+  while ix_countdown_reg1(&mut f) > 0 && cdr < 64 {
+    cdr = wrap_add(cdr, 1);
+  }
   if g.target != TARGET_KERNEL && ix_copy16(&mut f) > 0 {
     iropt_copies(&mut f);
     iropt_dce(&mut f);
