@@ -1,0 +1,65 @@
+// expect-exit: 0
+// expect-stdout: 364
+// expect-stdout: 101
+// expect-stdout: 49
+// expect-stdout: 0
+// Facts that hold on every edge into a label hold at the label: a count that
+// is not zero on the way out of a loop and not zero on the way out of the
+// branch for zero is not zero after the two meet, and a register that the
+// loop after it does not write keeps what was known, so the tests `k > 0` and
+// `0 < len` there are decided.
+const BUF: u64 = 64;
+
+fn fmt(out: &mut Bytes, n: u64) -> u64
+  requires blen(out) == BUF
+  ensures blen(out) == BUF && result <= 20
+{
+  let mut tmp = n;
+  let mut len = 0;
+  while tmp > 0 && len < 20
+    invariant len <= 20
+  {
+    tmp = tmp / 10;
+    len = len + 1;
+  }
+  if len == 0 {
+    bset(&mut out, 0, 48);
+    return 1;
+  }
+  let mut v = n;
+  let mut k = len;
+  while k > 0
+    invariant k <= len && len <= 20 && blen(out) == BUF
+  {
+    k = k - 1;
+    bset(&mut out, k, cast[u8](48 + v % 10));
+    v = v / 10;
+  }
+  return len;
+}
+
+fn digits(out: &mut Bytes, n: u64) -> u64
+  requires blen(out) == BUF
+  ensures blen(out) == BUF
+{
+  let len = fmt(&mut out, n);
+  let mut j = 0;
+  let mut sum = 0;
+  while j < len
+    invariant j <= len && len <= 20 && blen(out) == BUF
+  {
+    sum = wrap_add(sum, cast[u64](bget(out, j)));
+    j = j + 1;
+  }
+  return sum;
+}
+
+fn main() -> u64 {
+  let mut out = balloc(BUF);
+  print(digits(&mut out, 1234567));
+  print(wrap_add(digits(&mut out, 0), digits(&mut out, 5)));
+  print(digits(&mut out, 1) % 50);
+  print(digits(&mut out, 0) % 48);
+  bfree(out);
+  return 0;
+}
