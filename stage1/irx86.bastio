@@ -1553,12 +1553,21 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     }
   } else if op == IR_DIV || op == IR_REM || op == IR_SDIV || op == IR_SREM {
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RAX));
-    ix_mov(&mut out, ix_loc(al, q.b), ix_rl(XR_RCX));
-    if op == IR_DIV || op == IR_REM {
-      w_s(&mut out, "\txor %edx, %edx\n\tdiv %rcx\n");
+    // A divisor in a register of its own is divided by where it is.
+    let ldv = ix_loc(al, q.b);
+    let mut dv = ix_rl(XR_RCX);
+    if ldv.k == IXK_REG && ldv.reg != XR_RAX && ldv.reg != XR_RDX {
+      dv = ldv;
     } else {
-      w_s(&mut out, "\tcqo\n\tidiv %rcx\n");
+      ix_mov(&mut out, ldv, ix_rl(XR_RCX));
     }
+    if op == IR_DIV || op == IR_REM {
+      w_s(&mut out, "\txor %edx, %edx\n\tdiv ");
+    } else {
+      w_s(&mut out, "\tcqo\n\tidiv ");
+    }
+    w_s(&mut out, x86_rname(dv.reg));
+    w_s(&mut out, "\n");
     if op == IR_REM || op == IR_SREM {
       ix_finish(&mut out, al, q.d, XR_RDX);
     } else {
@@ -2678,6 +2687,25 @@ fn ix_emit_cmov(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, nuse: &Vec[u64], n: 
   return ix_sel_pos(f, al, nuse, n, 3);
 }
 
+/// `t = rem a, b`, `x = mov b` and `b = mov t` (the step of Euclid's
+/// algorithm; `t` read by that last move alone, `b` and `x` in registers
+/// other than `%rax` and `%rdx`): whether they are so, for one division whose
+/// remainder goes straight to `b`.
+fn ix_rem_swap(f: &IrFn, al: &IrAlloc, nuse: &Vec[u64], i: u64) -> bool {
+  let q = ix_at(f, i);
+  if q.op != IR_REM || q.c != 0 || q.d >= vec_len(nuse) || u_at(nuse, q.d) != 1 {
+    return false;
+  }
+  let m1 = ix_at(f, wrap_add(i, 1));
+  let m2 = ix_at(f, wrap_add(i, 2));
+  if m1.op != IR_MOV || m1.a != q.b || m2.op != IR_MOV || m2.a != q.d || m2.d != q.b || m1.d == q.b || m1.d == q.d {
+    return false;
+  }
+  let lb = ix_loc(al, q.b);
+  let lx = ix_loc(al, m1.d);
+  return lb.k == IXK_REG && lb.reg != XR_RAX && lb.reg != XR_RDX && lx.k == IXK_REG;
+}
+
 /// `t = mul a, 3|5|9` (no wrap) and the `d = add t, imm` after it (constants
 /// that stand as immediates may lie between), `t` read by that `add` alone,
 /// `a` and `d` in registers: the position of the `add`, for one
@@ -3243,6 +3271,21 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       w_s(&mut out, x86_rname(ld.reg));
       w_s(&mut out, "\n");
       i = ix_mul_lea(f, al, nuse, i);
+    } else if ix_rem_swap(f, al, nuse, i) {
+      // `t = a % b; x = b; b = t`: the remainder lands in `b` itself and
+      // the register of `t` is never written.
+      let lbr = ix_loc(al, q.b);
+      let xm = ix_at(f, wrap_add(i, 1));
+      let lxr = ix_loc(al, xm.d);
+      ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RAX));
+      w_s(&mut out, "\txor %edx, %edx\n\tdiv ");
+      w_s(&mut out, x86_rname(lbr.reg));
+      w_s(&mut out, "\n");
+      if lxr.reg != lbr.reg {
+        ix_mov(&mut out, lbr, lxr);
+      }
+      ix_mov(&mut out, ix_rl(XR_RDX), lbr);
+      i = wrap_add(i, 2);
     } else if ix_cmov_n(f, al, nuse, i) > 0 {
       // A select (or two that share the mask) by a comparison, which
       // `iropt_ifconv` wrote as `d = ve ^ ((vt ^ ve) & -(a ? b))`: the flags
