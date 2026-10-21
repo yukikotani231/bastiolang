@@ -4396,6 +4396,90 @@ fn iropt_ivs_try(f: &mut IrFn, lb: &IrLabs, l: u64, ndef: &Vec[u64], nuse: &Vec[
   return done;
 }
 
+/// `d = k - c` (or `k + c`) read only as the index of `load`/`store`s of one
+/// base `a` that the loop does not write, `c` also not written by it: the
+/// accesses `a[d]` become `b[k]`, with `b = a - c*size` made in front of the
+/// loop, so the loop steps no register for `d` and the two accesses share
+/// their index (`a[w]` and `a[w - wt]` of a table updated from the top).
+/// `p`..`q` is the loop, `di` the position of the definition of `d`, `u` the
+/// step of `k`. Returns whether it rewrote the function.
+fn iropt_ivs_fold(f: &mut IrFn, l: u64, p: u64, q: u64, u: u64, di: u64, k: u64, indef: &Vec[u64]) -> bool {
+  let n = vec_len(f.ins);
+  let nr = f.nreg;
+  let qd = iropt_at(f, di);
+  let d = qd.d;
+  let c = qd.b;
+  if qd.a != k || c >= nr || c == k || c == d || u_at(indef, c) != 0 {
+    return false;
+  }
+  let mut base = IR_NONE;
+  let mut size = 0;
+  let mut cnt = 0;
+  let mut ok = true;
+  let mut i = wrap_add(di, 1);
+  while i < u && ok {
+    let qi = iropt_at(f, i);
+    if ra_reads_has(f, qi, d) {
+      if (qi.op != IR_LOAD && qi.op != IR_STORE) || qi.b != d || qi.a == d || qi.d == d || (qi.c != 1 && qi.c != 8) || qi.a >= nr || u_at(indef, qi.a) != 0 || qi.a == k {
+        ok = false;
+      } else if cnt == 0 {
+        base = qi.a;
+        size = qi.c;
+      } else if qi.a != base || qi.c != size {
+        ok = false;
+      }
+      cnt = wrap_add(cnt, 1);
+    }
+    i = wrap_add(i, 1);
+  }
+  if !ok || cnt == 0 {
+    return false;
+  }
+  let top = ir_label(&mut f);
+  let nb = ir_reg(&mut f);
+  let mut cs = c;
+  let mut out = vec_new[IrIns]();
+  i = 0;
+  while i < n {
+    if i == p {
+      vec_push(&mut out, IrIns { op: IR_LABEL, d: IR_NONE, a: top, b: 0, c: 0, ty: 0 });
+      if size == 8 {
+        let three = ir_reg(&mut f);
+        cs = ir_reg(&mut f);
+        vec_push(&mut out, IrIns { op: IR_CONST, d: three, a: 3, b: 0, c: 0, ty: 0 });
+        vec_push(&mut out, IrIns { op: IR_SHL, d: cs, a: c, b: three, c: 0, ty: 0 });
+      }
+      let mut sop = IR_SUB;
+      if qd.op == IR_ADD {
+        sop = IR_ADD;
+      }
+      vec_push(&mut out, IrIns { op: sop, d: nb, a: base, b: cs, c: 0, ty: 0 });
+    }
+    let mut qi = iropt_at(f, i);
+    if i < p || i > q {
+      if qi.op == IR_JMP && qi.a == l {
+        qi.a = top;
+      }
+      if qi.op == IR_BR {
+        if qi.b == l {
+          qi.b = top;
+        }
+        if qi.c == l {
+          qi.c = top;
+        }
+      }
+    } else if i > di && i < u && (qi.op == IR_LOAD || qi.op == IR_STORE) && qi.b == d {
+      qi.a = nb;
+      qi.b = k;
+    }
+    vec_push(&mut out, qi);
+    i = wrap_add(i, 1);
+  }
+  vec_free(f.ins);
+  f.ins = out;
+  return true;
+}
+
 /// Reduces register `d`, written at `di` in the loop p .. q whose counter
 /// `k` (which starts at the constant `k0`, unless that is IR_NONE) is stepped
 /// by the addition at `u`, which every read of `d` comes before and the new
@@ -4506,6 +4590,10 @@ fn iropt_ivs_apply(f: &mut IrFn, lb: &IrLabs, l: u64, p: u64, q: u64, u: u64, di
     if ia && qd.b < nr && other == IR_NONE && u_at(scale, d) == 1 {
       cheap = true;
     }
+  }
+  if cheap && by != 0 && by <= 1099511627776 && iropt_ivs_fold(&mut f, l, p, q, u, di, k, indef) {
+    vec_free(cone);
+    return true;
   }
   if (dead < 2 && !cheap) || by == 0 || by > 1099511627776 {
     vec_free(cone);
