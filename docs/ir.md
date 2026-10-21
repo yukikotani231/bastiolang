@@ -71,3 +71,5 @@ The verifier, the checker and the C backend. Ghost code is erased before lowerin
 
 - Whether the AArch64 work starts from the first IR subset or waits for scalar replacement; the first is faster to a running program, the second avoids a second round of emitter changes.
 - Whether SSA is worth building for #127, or whether value numbering over blocks and a liveness-based dead-store pass are enough for the loops BastiOS spends its time in. The benchmarks above say what is left on the table; the answer should come from where the remaining instructions are, not from the textbook.
+
+The native-ir emitter keeps one copy of a wide constant that a loop reads (the pass that hoists it also merges it with an equal constant just in front of the loop), puts the multiplier of a division by a constant in a register ahead of the loop even when the loop is entered through a test or a cold block placed after it, and turns `x % K == 0` / `!= 0` for an odd constant `K` into a multiply by the inverse of `K` and one compare against `(2^64-1)/K`.
