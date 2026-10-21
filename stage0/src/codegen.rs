@@ -367,7 +367,8 @@ const PRELUDE_HOSTED: &str = r#"#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #ifdef __APPLE__
-#include <sys/sysctl.h>
+/* <sys/sysctl.h> does not compile under -std=c11 on macOS; libSystem has the function. */
+int sysctlbyname(const char *, void *, size_t *, void *, size_t);
 #endif
 static inline void bst_serial_write(bst_serial s, uint64_t b) { (void)s; putchar((int)b); if (b == '\n') fflush(stdout); }
 static inline uint64_t bst_serial_read(bst_serial s) { (void)s; fflush(stdout); int c = getchar(); return c == EOF ? 4 : (uint64_t)c; }
