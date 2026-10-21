@@ -6003,6 +6003,20 @@ fn iropt_efacts(f: &mut IrFn) -> u64 {
       w = wrap_add(w, 1);
     }
     vec_free(ws);
+    // `x = x + K` of a positive constant, with no wrapping, is not zero; a
+    // copy of such a value is not either.
+    if q.op == IR_ADD && q.c == 0 && q.d < f.nreg && vec_len(fxr) < 32 {
+      let ka = iropt_cval(cv, q.a);
+      let kb = iropt_cval(cv, q.b);
+      if (kb != IR_NONE && kb > 0 && kb < 1073741824) || (ka != IR_NONE && ka > 0 && ka < 1073741824) {
+        vec_push(&mut fxr, q.d);
+        vec_push(&mut fxv, 0);
+      }
+    }
+    if q.op == IR_MOV && q.d < f.nreg && q.a != q.d && vec_len(fxr) < 32 && iropt_ef_excl(fxr, fxv, q.a, 0) {
+      vec_push(&mut fxr, q.d);
+      vec_push(&mut fxv, 0);
+    }
     prev = q;
     pi = i;
     i = wrap_add(i, 1);
