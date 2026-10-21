@@ -2142,6 +2142,26 @@ fn ix_br_flags(out: &mut Vec[u64], x: u64, op: u64, then: u64, els: u64, next: u
 }
 
 /// Does `q` wrap its result to a type narrower than 64 bits?
+/// Whether the add `q`, of the comparison `r` to a register, is done in
+/// place: that register is the one `q` writes.
+fn ix_in_place(al: &IrAlloc, q: IrIns, r: u64) -> bool {
+  let o = ix_other(q, r);
+  if o == IR_NONE || q.d == IR_NONE {
+    return false;
+  }
+  let lo = ix_loc(al, o);
+  let ld = ix_loc(al, q.d);
+  return lo.k == IXK_REG && ld.k == IXK_REG && lo.reg == ld.reg;
+}
+
+/// The operand of the binary `q` that is not the register `r`.
+fn ix_other(q: IrIns, r: u64) -> u64 {
+  if q.a == r {
+    return q.b;
+  }
+  return q.a;
+}
+
 fn ix_wraps(m: &Mono, q: IrIns) -> bool {
   return q.c == 1 && q.ty != 0 && slen(x86_normalize(m, q.ty)) > 0;
 }
@@ -2502,6 +2522,66 @@ fn ix_rotprod(f: &IrFn, al: &IrAlloc, m: &Mono, ub: &Vec[u64], nuse: &Vec[u64], 
 fn ix_rotprodj(f: &IrFn, al: &IrAlloc, m: &Mono, ub: &Vec[u64], nuse: &Vec[u64], i: u64) -> u64 {
   let r = ix_rotprod(f, al, m, ub, nuse, i);
   return r.j;
+}
+
+/// Whether the load at `i` is read only by a comparison `x < y` (or `x > y`)
+/// whose other side is a register or an immediate, the result added to a
+/// register in place (`ix_cinc`'s `c = c + (x < k)`), constants that stand
+/// as immediates in between: the index of the add, or 0.
+fn ix_load_adc(f: &IrFn, al: &IrAlloc, m: &Mono, nuse: &Vec[u64], i: u64) -> u64 {
+  let q = ix_at(f, i);
+  if q.d == IR_NONE || q.d >= vec_len(nuse) || u_at(nuse, q.d) != 1 {
+    return 0;
+  }
+  if q.c != 1 && q.c != 2 && q.c != 4 && q.c != 8 {
+    return 0;
+  }
+  let mut j = wrap_add(i, 1);
+  let mut cm = ix_at(f, j);
+  let mut skipped = 0;
+  let mut more = true;
+  while more && skipped < 4 {
+    more = false;
+    if cm.op == IR_CONST {
+      let cl = ix_loc(al, cm.d);
+      if cl.k == IXK_IMM {
+        j = wrap_add(j, 1);
+        skipped = skipped + 1;
+        cm = ix_at(f, j);
+        more = true;
+      }
+    }
+  }
+  if (cm.op != IR_LT && cm.op != IR_GT) || cm.d == IR_NONE || cm.d >= vec_len(nuse) || u_at(nuse, cm.d) != 1 || cm.a == cm.b {
+    return 0;
+  }
+  // x < y: the left side of `cmp y, x`.
+  let mut x = cm.a;
+  let mut y = cm.b;
+  if cm.op == IR_GT {
+    x = cm.b;
+    y = cm.a;
+  }
+  if x != q.d && y != q.d {
+    return 0;
+  }
+  let mut other = y;
+  if y == q.d {
+    other = x;
+  }
+  let lo = ix_loc(al, other);
+  if lo.k == IXK_IMM {
+    if x != q.d || !ix_fits(lo.imm) {
+      return 0;
+    }
+  } else if lo.k != IXK_REG || q.c != 8 {
+    return 0;
+  }
+  let ad = ix_at(f, wrap_add(j, 1));
+  if ad.op != IR_ADD || ad.c != 0 || (ad.a == cm.d) == (ad.b == cm.d) || ix_wraps(m, ad) || !ix_in_place(al, ad, cm.d) {
+    return 0;
+  }
+  return wrap_add(j, 1);
 }
 
 /// Whether the load at `i` is read only by a comparison with a constant that
@@ -3286,6 +3366,53 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       ix_awrite(&mut out, ap, 8);
       w_s(&mut out, "\n");
       i = j;
+    } else if q.op == IR_LOAD && ix_load_adc(f, al, m, nuse, i) != 0 {
+      // The word compared with a register or an immediate and the carry
+      // added in place: `cmpq y, mem; adc $0, %reg`, no register for the load.
+      let j = ix_load_adc(f, al, m, nuse, i);
+      let ad = ix_at(f, j);
+      let cm = ix_at(f, wrap_sub(j, 1));
+      let ld = ix_loc(al, ad.d);
+      let mut x = cm.a;
+      let mut y = cm.b;
+      if cm.op == IR_GT {
+        x = cm.b;
+        y = cm.a;
+      }
+      let ap = ix_aprep(&mut out, al, q.a, q.b, q.ty);
+      let mut sz = 1;
+      if q.c == 8 {
+        sz = 8;
+        w_s(&mut out, "\tcmpq ");
+      } else if q.c == 4 {
+        sz = 4;
+        w_s(&mut out, "\tcmpl ");
+      } else if q.c == 2 {
+        sz = 2;
+        w_s(&mut out, "\tcmpw ");
+      } else {
+        w_s(&mut out, "\tcmpb ");
+      }
+      if y == q.d {
+        // `cmp mem, %x`.
+        ix_awrite(&mut out, ap, sz);
+        w_s(&mut out, ", ");
+        let lx = ix_loc(al, x);
+        w_s(&mut out, x86_rname(lx.reg));
+      } else {
+        let ly = ix_loc(al, y);
+        if ly.k == IXK_IMM {
+          ix_w_imm(&mut out, ly.imm);
+        } else {
+          w_s(&mut out, x86_rname(ly.reg));
+        }
+        w_s(&mut out, ", ");
+        ix_awrite(&mut out, ap, sz);
+      }
+      w_s(&mut out, "\n\tadc $0, ");
+      w_s(&mut out, x86_rname(ld.reg));
+      w_s(&mut out, "\n");
+      i = j;
     } else if q.op == IR_LOAD && ix_load_cmp(f, al, nuse, ub, i) != 0 {
       // A load that only a comparison with a constant (or the branch) reads:
       // the comparison reads memory, no register is loaded.
@@ -3444,6 +3571,17 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
         last = ix_emit_cmov(&mut out, f, al, nuse, last, op);
       }
       i = last;
+    } else if (q.op == IR_LT || q.op == IR_GT) && nq.op == IR_ADD && nq.c == 0 && (nq.a == q.d) != (nq.b == q.d) && u_at(nuse, q.d) == 1 && lnq.k == IXK_REG && !ix_wraps(m, nq) && ix_in_place(al, nq, q.d) {
+      // `c = c + (a < b)`: the carry of the comparison added to `c`.
+      if q.op == IR_LT {
+        ix_cmp(&mut out, al, q.a, q.b);
+      } else {
+        ix_cmp(&mut out, al, q.b, q.a);
+      }
+      w_s(&mut out, "\tadc $0, ");
+      w_s(&mut out, x86_rname(lnq.reg));
+      w_s(&mut out, "\n");
+      i = i + 1;
     } else if (q.op == IR_LT || q.op == IR_GT) && nq.op == IR_NEG && nq.a == q.d && u_at(nuse, q.d) == 1 && lnq.k == IXK_REG {
       // The mask of an unsigned comparison (`-(a < b)`, what a select by it
       // wants): the borrow of the comparison spread over a register.
@@ -5116,6 +5254,144 @@ fn ix_divisible(f: &mut IrFn, m: &Mono) -> u64 {
   return done;
 }
 
+/// `if a < b { c = c + 1 }` (or `a > b`, or `x == 0`, which is `x < 1`): the
+/// branch around one increment becomes `c = c + (a < b)`, which the emitter
+/// writes as `cmp; adc $0, c`. The test runs every time either way; the
+/// branch and its mispredictions go. Returns how many it turned.
+fn ix_cinc(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  if n > 4000000 || f.nreg > 100000000 || f.nlabel > 100000000 {
+    return 0;
+  }
+  let ndef = iropt_ndef(f);
+  let nuse = iropt_nuse(f);
+  let cv = iropt_consts(f, ndef);
+  let mut refs = vec_new[u64]();
+  let mut l = 0;
+  while l < f.nlabel {
+    vec_push(&mut refs, 0);
+    l = wrap_add(l, 1);
+  }
+  let mut i = 0;
+  while i < n {
+    let q = iropt_at(f, i);
+    if q.op == IR_JMP && q.a < f.nlabel {
+      ra_set(&mut refs, q.a, wrap_add(u_at(refs, q.a), 1));
+    }
+    if q.op == IR_BR {
+      if q.b < f.nlabel {
+        ra_set(&mut refs, q.b, wrap_add(u_at(refs, q.b), 1));
+      }
+      if q.c < f.nlabel {
+        ra_set(&mut refs, q.c, wrap_add(u_at(refs, q.c), 1));
+      }
+    }
+    i = wrap_add(i, 1);
+  }
+  let mut out = vec_new[IrIns]();
+  let mut done = 0;
+  i = 0;
+  while i < n {
+    let q = iropt_at(f, i);
+    let mut next = IR_NONE;
+    let br = iropt_at(f, wrap_add(i, 1));
+    let lb = iropt_at(f, wrap_add(i, 2));
+    let isq = q.op == IR_LT || q.op == IR_GT || (q.op == IR_EQ && q.b < vec_len(cv) && u_at(cv, q.b) == 0 && !(q.a < vec_len(cv) && u_at(cv, q.a) != IR_NONE));
+    if isq && q.d < f.nreg && u_at(ndef, q.d) == 1 && u_at(nuse, q.d) == 1 && br.op == IR_BR && br.a == q.d && br.b != br.c && br.b < f.nlabel && br.c < f.nlabel && lb.op == IR_LABEL && lb.a == br.b && u_at(refs, br.b) == 1 {
+      let mut j = wrap_add(i, 3);
+      let mut a1 = iropt_at(f, j);
+      // The addend: a register known to be 1, defined here or before.
+      if a1.op == IR_CONST && a1.a == 1 && a1.d < f.nreg && u_at(ndef, a1.d) == 1 && u_at(nuse, a1.d) == 1 {
+        j = wrap_add(j, 1);
+        a1 = iropt_at(f, j);
+      }
+      if a1.op == IR_ADD && a1.c == 0 && a1.d < f.nreg && a1.a < f.nreg && a1.b < f.nreg {
+        let mut c = a1.a;
+        let mut one = a1.b;
+        if u_at(cv, a1.a) == 1 {
+          c = a1.b;
+          one = a1.a;
+        }
+        let mut ok = u_at(cv, one) == 1 && c != one && c != q.d;
+        let mut m = wrap_add(j, 1);
+        if ok && a1.d != c {
+          // `y = add c, 1; c = mov y`.
+          let mv = iropt_at(f, m);
+          if mv.op == IR_MOV && mv.a == a1.d && mv.d == c && u_at(ndef, a1.d) == 1 && u_at(nuse, a1.d) == 1 {
+            m = wrap_add(m, 1);
+          } else {
+            ok = false;
+          }
+        }
+        if ok {
+          // The arm ends in the join: by falling into the else label, or by
+          // a jump to it or to a label right behind it.
+          let mut e = m;
+          let mut endok = false;
+          let mut jl = IR_NONE;
+          let mut ar = iropt_at(f, e);
+          if ar.op == IR_JMP && ar.a < f.nlabel {
+            jl = ar.a;
+            e = wrap_add(e, 1);
+            ar = iropt_at(f, e);
+          }
+          if ar.op == IR_LABEL && ar.a == br.c && (jl == IR_NONE || jl == br.c) {
+            endok = true;
+          } else if jl != IR_NONE && ar.op == IR_LABEL && ar.a == br.c {
+            endok = true;
+          }
+          if endok && jl != IR_NONE && jl != br.c {
+            let mut w = e;
+            let mut found = false;
+            let mut more = true;
+            while more && w < n {
+              let wq = iropt_at(f, w);
+              if wq.op == IR_LABEL {
+                if wq.a == jl {
+                  found = true;
+                }
+                w = wrap_add(w, 1);
+              } else {
+                more = false;
+              }
+            }
+            endok = found;
+          }
+          if endok {
+            if q.op == IR_EQ {
+              let k = ir_reg(&mut f);
+              vec_push(&mut out, IrIns { op: IR_CONST, d: k, a: 1, b: 0, c: 0, ty: 0 });
+              vec_push(&mut out, IrIns { op: IR_LT, d: q.d, a: q.a, b: k, c: q.c, ty: q.ty });
+            } else {
+              vec_push(&mut out, q);
+            }
+            vec_push(&mut out, IrIns { op: IR_ADD, d: c, a: c, b: q.d, c: a1.c, ty: a1.ty });
+            next = e;
+            done = wrap_add(done, 1);
+          }
+        }
+      }
+    }
+    if next == IR_NONE {
+      vec_push(&mut out, q);
+      i = wrap_add(i, 1);
+    } else {
+      i = next;
+    }
+  }
+  vec_free(ndef);
+  vec_free(nuse);
+  vec_free(cv);
+  vec_free(refs);
+  if done > 0 {
+    vec_free(f.ins);
+    f.ins = out;
+  } else {
+    vec_free(out);
+  }
+  return done;
+}
+
 /// The multiplier that the division by the constant `k` loads into %rdx
 /// (`movabs $M, %rdx; mul %rdx`), 0 if its code has no such pair.
 fn ix_divm(g: &mut X86, k: u64, rem: bool) -> u64 {
@@ -6734,6 +7010,11 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
   let mut efd = 0;
   while iropt_efacts(&mut f) > 0 && efd < 3 {
     efd = efd + 1;
+  }
+  if ix_cinc(&mut f) > 0 {
+    iropt_copies(&mut f);
+    iropt_dce(&mut f);
+    iropt_labels(&mut f);
   }
   if iropt_ifconv(&mut f) > 0 {
     iropt_copies(&mut f);
