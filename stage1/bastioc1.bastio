@@ -451,7 +451,7 @@ fn b1_help(out: &mut Vec[u64]) {
   w_s(&mut out, "  --emit-c         write the generated C instead of an executable\n");
   w_s(&mut out, "  --target T       hosted (the default), or kernel or user for BastiOS (these write C, or assembly with --backend native)\n");
   w_s(&mut out, "  --arch A         x86_64 (the default) or aarch64 (hosted programs compile with aarch64-linux-gnu-gcc; --backend native: partial)\n");
-  w_s(&mut out, "  --backend B      c (the default) or native (experimental: x86-64 assembly, or AArch64 with --arch aarch64)\n");
+  w_s(&mut out, "  --backend B      c, or native (x86-64 assembly, or AArch64 with --arch aarch64); x86-64 hosted programs use native-ir unless --backend or --emit-c says otherwise\n");
   w_s(&mut out, "  --emit-asm       with --backend native: write the assembly instead of an executable\n");
   w_s(&mut out, "  --lib DIR        also look for imported files in DIR\n");
   w_s(&mut out, "  --header FILE    also write a C header for the program's `export fn`s\n");
@@ -468,6 +468,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
   let mut emit_c = false;
   let mut native = false;
   let mut native_ir = false;
+  let mut backend_set = false;
   let mut emit_asm = false;
   let mut dump_smt = false;
   let mut target = TARGET_HOSTED;
@@ -499,6 +500,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
       bfree(a);
       i = cg_add(i, 1);
       let b = host_arg(host, i);
+      backend_set = true;
       if b1_is(b, "c") {
         native = false;
       } else if b1_is(b, "native") {
@@ -622,6 +624,12 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
   if status == 0 && vec_len(inputs) == 0 {
     w_s(&mut out, "usage: bastioc1 [--check] [--emit-c] [--target hosted|kernel|user] [--arch x86_64|aarch64] [--lib DIR] [--backend c|native] [--emit-asm] [--header F] [-o out] <file.bastio>...\n");
     status = 2;
+  }
+  // An x86-64 program for the host is built by the native backend unless
+  // `--backend c` or `--emit-c` asks for C.
+  if status == 0 && !backend_set && !aarch64 && !emit_c && target == TARGET_HOSTED {
+    native = true;
+    native_ir = true;
   }
   if status == 0 && aarch64 && native_ir {
     w_s(&mut out, "bastioc1: --backend native-ir is for x86-64\n");
