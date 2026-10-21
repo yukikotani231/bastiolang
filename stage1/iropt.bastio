@@ -179,6 +179,9 @@ fn iropt_fold(f: &mut IrFn) -> u64 {
         }
       } else if op == IR_NEG && x != IR_NONE {
         r = IrIns { op: IR_CONST, d: q.d, a: wrap_sub(0, x), b: 0, c: 0, ty: 0 };
+      } else if op == IR_MOV && x != IR_NONE {
+        // (`i = 0` for a second loop: the counter is set from a constant.)
+        r = IrIns { op: IR_CONST, d: q.d, a: x, b: 0, c: 0, ty: 0 };
       } else if (op == IR_ADD || op == IR_SUB || op == IR_OR || op == IR_XOR || op == IR_SHL || op == IR_SHR || op == IR_SAR) && y == 0 {
         r = IrIns { op: IR_MOV, d: q.d, a: q.a, b: 0, c: 0, ty: 0 };
       } else if (op == IR_MUL || op == IR_DIV) && y == 1 {
@@ -1406,9 +1409,9 @@ fn iropt_entry_guard(f: &mut IrFn) -> u64 {
         while going && p > 0 {
           p = wrap_sub(p, 1);
           let w = iropt_at(f, p);
-          if w.op == IR_LABEL || w.op == IR_JMP || w.op == IR_BR || w.op == IR_RET {
+          if (w.op == IR_LABEL && !(w.a < f.nlabel && u_at(refs, w.a) == 0)) || w.op == IR_JMP || w.op == IR_BR || w.op == IR_RET {
             going = false;
-          } else if w.d == cm.a {
+          } else if w.op != IR_LABEL && w.d == cm.a {
             going = false;
             if w.op == IR_CONST && w.a < kc.a {
               known = true;
@@ -2871,6 +2874,260 @@ fn iropt_dead_live(f: &mut IrFn) -> u64 {
     vec_free(lv.bit);
   }
   return total;
+}
+
+/// Union-find: the root of `x`.
+fn iropt_uf_find(par: &Vec[u64], x: u64) -> u64 {
+  let mut r = x;
+  let mut steps = 0;
+  while u_at(par, r) != r && steps < 1000000000 {
+    r = u_at(par, r);
+    steps = wrap_add(steps, 1);
+  }
+  return r;
+}
+
+fn iropt_uf_union(par: &mut Vec[u64], a: u64, b: u64) {
+  let ra = iropt_uf_find(par, a);
+  let rb = iropt_uf_find(par, b);
+  if ra != rb {
+    ra_set(&mut par, rb, ra);
+  }
+}
+
+/// Is `q` an instruction `iropt_unroll_ren` renames completely (every read
+/// and the write of a register)?
+fn iropt_webs_op(q: IrIns) -> bool {
+  let op = q.op;
+  if op == IR_DIV || op == IR_REM {
+    return q.c == 0;
+  }
+  return op == IR_BR || (op != IR_PCALL && iropt_unroll_ok(q));
+}
+
+/// A register written in several places that are unrelated (a counter `i`
+/// that runs one loop and is set to 0 for the next) is one register for
+/// every pass that counts its writes. Its live ranges are split into webs:
+/// two writes are one web when a read can see both, and a read and a write
+/// of one instruction are one web. Every web but the first gets a register
+/// of its own. Only registers all of whose instructions are plain
+/// computations are split (no call, no parameter). Returns how many
+/// registers it gained.
+fn iropt_webs(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  let nr = f.nreg;
+  let mut ndef = vec_new[u64]();
+  let mut bad = vec_new[u64]();
+  let mut r = 0;
+  while r < nr && r < 1000000000 {
+    vec_push(&mut ndef, 0);
+    vec_push(&mut bad, 0);
+    r = r + 1;
+  }
+  let mut i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    let ok = iropt_webs_op(q);
+    let mut ws = vec_new[u64]();
+    ra_writes(q, &mut ws);
+    let mut j = 0;
+    while j < vec_len(ws) {
+      let x = vec_get(ws, j);
+      ra_set(&mut ndef, x, wrap_add(u_at(ndef, x), 1));
+      if !ok {
+        ra_set(&mut bad, x, 1);
+      }
+      j = j + 1;
+    }
+    vec_free(ws);
+    if !ok {
+      let mut rs = vec_new[u64]();
+      ra_reads(f, q, &mut rs);
+      j = 0;
+      while j < vec_len(rs) {
+        ra_set(&mut bad, vec_get(rs, j), 1);
+        j = j + 1;
+      }
+      vec_free(rs);
+    }
+    i = i + 1;
+  }
+  let mut cand = vec_new[u64]();
+  r = 0;
+  while r < nr && r < 1000000000 {
+    if u_at(ndef, r) >= 3 && u_at(bad, r) == 0 && !ra_is_param(f, r) {
+      vec_push(&mut cand, r);
+    }
+    r = r + 1;
+  }
+  let mut gained = 0;
+  if vec_len(cand) > 0 {
+    let bl = ra_blocks(f);
+    let lv = ra_live(f, bl);
+    let nb = vec_len(bl);
+    // The block of every instruction.
+    let mut bid = vec_new[u64]();
+    let mut b = 0;
+    while b < nb {
+      let blk = vec_get(bl, b);
+      let mut k = blk.s;
+      while k < blk.e && k < n {
+        vec_push(&mut bid, b);
+        k = wrap_add(k, 1);
+      }
+      b = b + 1;
+    }
+    let mut c = 0;
+    while c < vec_len(cand) && wrap_mul(nb, vec_len(cand)) < 100000000 {
+      let v = vec_get(cand, c);
+      // The instructions that touch v, in order.
+      let mut tp = vec_new[u64]();
+      i = 0;
+      while i < n {
+        let q = vec_get(f.ins, i);
+        if ra_reads_has(f, q, v) || ra_writes_has(q, v) {
+          vec_push(&mut tp, i);
+        }
+        i = i + 1;
+      }
+      let k = vec_len(tp);
+      // Nodes: a touch (the write of it), and the entry of a block.
+      let mut par = vec_new[u64]();
+      let mut x = 0;
+      while x < wrap_add(k, nb) {
+        vec_push(&mut par, x);
+        x = wrap_add(x, 1);
+      }
+      let none = wrap_add(k, nb);
+      let mut cur = vec_new[u64]();
+      b = 0;
+      while b < nb {
+        if ra_in(lv, b, v) {
+          vec_push(&mut cur, wrap_add(k, b));
+        } else {
+          vec_push(&mut cur, none);
+        }
+        b = b + 1;
+      }
+      let mut web = vec_new[u64]();
+      let mut t = 0;
+      while t < k {
+        let j = vec_get(tp, t);
+        let q = iropt_at(f, j);
+        let bb = u_at(bid, j);
+        let rd = ra_reads_has(f, q, v);
+        let wr = ra_writes_has(q, v);
+        let src = u_at(cur, bb);
+        let mut node = t;
+        if rd && src != none {
+          node = src;
+        }
+        if wr {
+          node = t;
+          if rd && src != none {
+            iropt_uf_union(&mut par, t, src);
+          }
+          ra_set(&mut cur, bb, t);
+        }
+        vec_push(&mut web, node);
+        t = wrap_add(t, 1);
+      }
+      b = 0;
+      while b < nb {
+        let blk = vec_get(bl, b);
+        let last = u_at(cur, b);
+        if last != none {
+          let s1 = blk.n1;
+          let s2 = blk.n2;
+          if s1 > 0 && ra_in(lv, wrap_sub(s1, 1), v) {
+            iropt_uf_union(&mut par, wrap_add(k, wrap_sub(s1, 1)), last);
+          }
+          if s2 > 0 && ra_in(lv, wrap_sub(s2, 1), v) {
+            iropt_uf_union(&mut par, wrap_add(k, wrap_sub(s2, 1)), last);
+          }
+        }
+        b = b + 1;
+      }
+      // The webs, in order of their first touch. A web with a single write
+      // (a temporary that one statement sets for the next) stays in v: a
+      // register of its own would only cost the allocator a copy. Of the
+      // others the first keeps v too.
+      let mut roots = vec_new[u64]();
+      let mut regs = vec_new[u64]();
+      let mut wdefs = vec_new[u64]();
+      t = 0;
+      while t < k {
+        let rt = iropt_uf_find(par, u_at(web, t));
+        let mut at = IR_NONE;
+        let mut m = 0;
+        while m < vec_len(roots) {
+          if vec_get(roots, m) == rt {
+            at = m;
+          }
+          m = wrap_add(m, 1);
+        }
+        if at == IR_NONE {
+          at = vec_len(roots);
+          vec_push(&mut roots, rt);
+          vec_push(&mut wdefs, 0);
+        }
+        if ra_writes_has(iropt_at(f, u_at(tp, t)), v) {
+          ra_set(&mut wdefs, at, wrap_add(u_at(wdefs, at), 1));
+        }
+        t = wrap_add(t, 1);
+      }
+      let mut wm = 0;
+      let mut first = true;
+      let mut nsplit = 0;
+      while wm < vec_len(roots) {
+        if u_at(wdefs, wm) >= 2 && first {
+          vec_push(&mut regs, v);
+          first = false;
+        } else if u_at(wdefs, wm) >= 2 {
+          vec_push(&mut regs, ir_reg(&mut f));
+          gained = wrap_add(gained, 1);
+          nsplit = wrap_add(nsplit, 1);
+        } else {
+          vec_push(&mut regs, v);
+        }
+        wm = wrap_add(wm, 1);
+      }
+      if nsplit > 0 {
+        t = 0;
+        while t < k {
+          let rt = iropt_uf_find(par, u_at(web, t));
+          let mut m = 0;
+          while m < vec_len(roots) {
+            if vec_get(roots, m) == rt && u_at(regs, m) != v {
+              let j = vec_get(tp, t);
+              if j < vec_len(f.ins) {
+                vec_set(&mut f.ins, j, iropt_unroll_ren(vec_get(f.ins, j), v, u_at(regs, m)));
+              }
+            }
+            m = wrap_add(m, 1);
+          }
+          t = wrap_add(t, 1);
+        }
+      }
+      vec_free(roots);
+      vec_free(regs);
+      vec_free(wdefs);
+      vec_free(web);
+      vec_free(cur);
+      vec_free(par);
+      vec_free(tp);
+      c = wrap_add(c, 1);
+    }
+    vec_free(bid);
+    vec_free(bl);
+    vec_free(lv.inn);
+    vec_free(lv.out);
+    vec_free(lv.bit);
+  }
+  vec_free(cand);
+  vec_free(ndef);
+  vec_free(bad);
+  return gained;
 }
 
 /// Does `q` only compute a register (no effect, no trap)? Division is left
