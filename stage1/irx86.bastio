@@ -1379,6 +1379,27 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
       w_s(&mut out, "\n");
       return;
     }
+    if wrap && kind_t(m, q.ty) == TY_U32 && (op == IR_ADD || op == IR_SUB || op == IR_MUL) && (lb0.k == IXK_REG || lb0.k == IXK_MEM || (lb0.k == IXK_IMM && ix_fits(lb0.imm))) {
+      // The same modulo 2^32 through %eax, for a destination in memory or
+      // an operand that shares the destination's register: the 32-bit
+      // instruction leaves the upper half zero, so no extension follows.
+      ix_mov(&mut out, la, ix_rl(t));
+      w_s(&mut out, "\t");
+      w_s(&mut out, alu);
+      w_s(&mut out, " ");
+      if lb0.k == IXK_REG {
+        w_s(&mut out, ix_name32(lb0.reg));
+      } else if lb0.k == IXK_IMM {
+        ix_w_imm(&mut out, lb0.imm);
+      } else {
+        ix_op(&mut out, lb0);
+      }
+      w_s(&mut out, ", ");
+      w_s(&mut out, ix_name32(t));
+      w_s(&mut out, "\n");
+      ix_finish(&mut out, al, q.d, t);
+      return;
+    }
     ix_mov(&mut out, la, ix_rl(t));
     let lb = ix_src(&mut out, lb0);
     ix_ins2(&mut out, alu, lb, ix_rl(t));
@@ -2164,11 +2185,20 @@ fn ix_scale_fuse(f: &IrFn, al: &IrAlloc, m: &Mono, nuse: &Vec[u64], i: u64) -> u
 /// loaded value as its second operand.
 fn ix_load_alu(f: &IrFn, al: &IrAlloc, m: &Mono, nuse: &Vec[u64], i: u64) -> bool {
   let q = ix_at(f, i);
-  if q.c != 8 || u_at(nuse, q.d) != 1 {
+  if u_at(nuse, q.d) != 1 {
     return false;
   }
   let nq = ix_at(f, wrap_add(i, 1));
-  if slen(ix_alu(nq.op)) == 0 || nq.op == IR_MUL || ix_wraps(m, nq) || nq.a == nq.b {
+  if slen(ix_alu(nq.op)) == 0 || nq.op == IR_MUL || nq.a == nq.b {
+    return false;
+  }
+  // A sum or difference modulo 2^32 reads the low half of the word (or the
+  // four bytes of a narrow load); anything else wrapped is left alone.
+  let w32 = ix_wraps(m, nq) && kind_t(m, nq.ty) == TY_U32 && (nq.op == IR_ADD || nq.op == IR_SUB);
+  if ix_wraps(m, nq) && !w32 {
+    return false;
+  }
+  if q.c != 8 && !(w32 && q.c == 4) {
     return false;
   }
   let mut x = nq.a;
@@ -2185,7 +2215,17 @@ fn ix_load_alu(f: &IrFn, al: &IrAlloc, m: &Mono, nuse: &Vec[u64], i: u64) -> boo
   }
   let ld = ix_loc(al, nq.d);
   let lx = ix_loc(al, x);
-  return ld.k == IXK_REG && lx.k == IXK_REG && lx.reg == ld.reg;
+  if ld.k != IXK_REG || lx.k != IXK_REG {
+    return false;
+  }
+  if lx.reg == ld.reg {
+    return true;
+  }
+  // `d = x op [mem]` into another register: a move first, which must not
+  // overwrite a register the address needs.
+  let lqa = ix_loc(al, q.a);
+  let lqb = ix_loc(al, q.b);
+  return !(lqa.k == IXK_REG && lqa.reg == ld.reg) && !(lqb.k == IXK_REG && lqb.reg == ld.reg);
 }
 
 struct IxRot { j: u64, x: u64, d: u64, k: u64 }
@@ -3155,13 +3195,29 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       i = wrap_add(j, 1);
     } else if q.op == IR_LOAD && ix_load_alu(f, al, m, nuse, i) {
       let ld = ix_loc(al, nq.d);
+      let mut x = nq.a;
+      if nq.a == q.d {
+        x = nq.b;
+      }
+      let lx = ix_loc(al, x);
+      if lx.reg != ld.reg {
+        ix_mov(&mut out, lx, ld);
+      }
       let ap = ix_aprep(&mut out, al, q.a, q.b, q.ty);
       w_s(&mut out, "\t");
       w_s(&mut out, ix_alu(nq.op));
       w_s(&mut out, " ");
-      ix_awrite(&mut out, ap, 8);
+      if q.c == 4 {
+        ix_awrite(&mut out, ap, 1);
+      } else {
+        ix_awrite(&mut out, ap, 8);
+      }
       w_s(&mut out, ", ");
-      w_s(&mut out, x86_rname(ld.reg));
+      if ix_wraps(m, nq) {
+        w_s(&mut out, ix_name32(ld.reg));
+      } else {
+        w_s(&mut out, x86_rname(ld.reg));
+      }
       w_s(&mut out, "\n");
       i = i + 1;
     } else if ix_mul_lea(f, al, nuse, i) != IR_NONE {
@@ -5930,7 +5986,12 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
   }
   // After `while k < n && a[k] == b[k] { k += 1 }` an `if k == n` on the exit
   // of a mismatch is decided by the loop's test, which holds there.
-  iropt_efacts(&mut f);
+  // A redirected edge reaches the next test, which the same facts may decide
+  // (`c == 32 || c == 10` after `c == 10`).
+  let mut efd = 0;
+  while iropt_efacts(&mut f) > 0 && efd < 3 {
+    efd = efd + 1;
+  }
   if iropt_ifconv(&mut f) > 0 {
     iropt_copies(&mut f);
     iropt_dce(&mut f);
