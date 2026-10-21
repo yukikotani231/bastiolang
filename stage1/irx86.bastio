@@ -4290,6 +4290,74 @@ fn ix_divm(g: &mut X86, k: u64, rem: bool) -> u64 {
   return m;
 }
 
+/// Where to make a value that the loop spanning positions `lp` to `hi` (its
+/// header label at `lp`, its last back edge at `hi`) reads: a position in
+/// front of it that every path into the loop passes, or IR_NONE. Without a
+/// jump from outside into the loop that is the header; with the entry test of
+/// a rotated loop (a branch that lands on the header or inside the loop) it
+/// is that branch, and the stretch from it to the header holds no label, so
+/// nothing enters between them.
+fn ix_hoist_at(f: &IrFn, lpos: &Vec[u64], lp: u64, hi: u64) -> u64 {
+  let n = vec_len(f.ins);
+  let mut e0 = IR_NONE;
+  let mut ok = true;
+  let mut j = 0;
+  while j < n && ok {
+    if j < lp || j > hi {
+      let t = vec_get(f.ins, j);
+      let mut x1 = IR_NONE;
+      let mut x2 = IR_NONE;
+      if t.op == IR_JMP {
+        x1 = t.a;
+      } else if t.op == IR_BR {
+        x1 = t.b;
+        x2 = t.c;
+      }
+      let mut into = false;
+      if x1 < vec_len(lpos) && u_at(lpos, x1) != IR_NONE && u_at(lpos, x1) >= lp && u_at(lpos, x1) <= hi {
+        into = true;
+      }
+      if x2 < vec_len(lpos) && u_at(lpos, x2) != IR_NONE && u_at(lpos, x2) >= lp && u_at(lpos, x2) <= hi {
+        into = true;
+      }
+      if into {
+        if j > hi {
+          ok = false;
+        } else if e0 == IR_NONE {
+          e0 = j;
+        }
+      }
+    }
+    j = wrap_add(j, 1);
+  }
+  if !ok {
+    return IR_NONE;
+  }
+  if e0 == IR_NONE {
+    return lp;
+  }
+  if e0 >= n {
+    return IR_NONE;
+  }
+  let mut k = wrap_add(e0, 1);
+  while k < lp && k < n {
+    let tk = vec_get(f.ins, k);
+    if tk.op == IR_LABEL {
+      return IR_NONE;
+    }
+    k = wrap_add(k, 1);
+  }
+  // Keep the compare that the entry branch tests next to it.
+  let eb = vec_get(f.ins, e0);
+  if e0 > 0 && eb.op == IR_BR {
+    let pv = vec_get(f.ins, e0 - 1);
+    if iropt_is_cmp(pv.op) && pv.d == eb.a {
+      return e0 - 1;
+    }
+  }
+  return e0;
+}
+
 /// A division by a constant inside a loop loads its multiplier on every pass
 /// (`movabs`); the multiplier is made once in front of the loop instead, a
 /// register of its own that the loop reads, and the division records it in
@@ -4353,32 +4421,17 @@ fn ix_divhoist(f: &mut IrFn, g: &mut X86) -> u64 {
   while i < n {
     let q = vec_get(f.ins, i);
     if (q.op == IR_DIV || q.op == IR_REM) && q.c == 0 && q.b < vec_len(kv) && u_at(kv, q.b) != IR_NONE && u_at(kv, q.b) > 2 {
-      // The innermost loop around position i.
+      // The innermost loop around position i that has a place in front of it.
       let mut best = IR_NONE;
+      let mut bestp = IR_NONE;
       let mut lb = 0;
       while lb < vec_len(lpos) {
         let lp = u_at(lpos, lb);
-        if lp != IR_NONE && lp < i && u_at(lref, lb) > i && u_at(fref, lb) != IR_NONE && u_at(fref, lb) > lp && (best == IR_NONE || lp > best) {
-          // Single entry: no jump from outside the loop lands inside it.
-          let hi = u_at(lref, lb);
-          let mut ok = true;
-          let mut j = 0;
-          while j < n && ok {
-            if j < lp || j > hi {
-              let t = vec_get(f.ins, j);
-              if t.op == IR_JMP && t.a < vec_len(lpos) && u_at(lpos, t.a) != IR_NONE && u_at(lpos, t.a) > lp && u_at(lpos, t.a) <= hi {
-                ok = false;
-              }
-              if t.op == IR_BR && t.b < vec_len(lpos) && t.c < vec_len(lpos) {
-                if (u_at(lpos, t.b) != IR_NONE && u_at(lpos, t.b) > lp && u_at(lpos, t.b) <= hi) || (u_at(lpos, t.c) != IR_NONE && u_at(lpos, t.c) > lp && u_at(lpos, t.c) <= hi) {
-                  ok = false;
-                }
-              }
-            }
-            j = wrap_add(j, 1);
-          }
-          if ok {
+        if lp != IR_NONE && lp < i && u_at(lref, lb) > i && (best == IR_NONE || lp > best) {
+          let at = ix_hoist_at(f, lpos, lp, u_at(lref, lb));
+          if at != IR_NONE {
             best = lp;
+            bestp = at;
           }
         }
         lb = wrap_add(lb, 1);
@@ -4397,14 +4450,14 @@ fn ix_divhoist(f: &mut IrFn, g: &mut X86) -> u64 {
           let mut h = 0;
           let mut at = IR_NONE;
           while h < vec_len(hp) {
-            if u_at(hp, h) == best && u_at(hm, h) == mm {
+            if u_at(hp, h) == bestp && u_at(hm, h) == mm {
               at = h;
             }
             h = wrap_add(h, 1);
           }
           if at == IR_NONE {
             at = vec_len(hp);
-            vec_push(&mut hp, best);
+            vec_push(&mut hp, bestp);
             vec_push(&mut hm, mm);
             vec_push(&mut hr, ir_reg(&mut f));
           }
