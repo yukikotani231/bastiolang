@@ -8604,6 +8604,203 @@ fn iropt_coldarm(f: &mut IrFn) -> u64 {
   return total;
 }
 
+// ---- Tail duplication ----
+
+/// May the instruction `op` be copied by `iropt_taildup`? Values only: no
+/// effect that a second copy would repeat, no load, no operand but `a` and `b`.
+fn iropt_td_ok(op: u64) -> bool {
+  if op == IR_DIV || op == IR_REM || op == IR_SDIV || op == IR_SREM {
+    return false;
+  }
+  return op == IR_CONST || op == IR_MOV || ra_is_binary(op);
+}
+
+/// The position of the first `br` or `jmp` from `s` on, when only instructions
+/// that `iropt_td_ok` allows come before it (and fewer than `lim`), else
+/// IR_NONE.
+fn iropt_td_end(f: &IrFn, s: u64, lim: u64) -> u64 {
+  let n = vec_len(f.ins);
+  let mut e = s;
+  let mut res = IR_NONE;
+  let mut going = true;
+  while going && e < n && e < wrap_add(s, lim) {
+    let r = iropt_at(f, e);
+    if r.op == IR_BR || r.op == IR_JMP {
+      res = e;
+      going = false;
+    } else if !iropt_td_ok(r.op) {
+      going = false;
+    } else {
+      e = wrap_add(e, 1);
+    }
+  }
+  return res;
+}
+
+/// `r` with the registers it reads and the one it writes replaced where the
+/// map (`osrc` to `ndst`) says so.
+fn iropt_td_ren(r: IrIns, osrc: &Vec[u64], ndst: &Vec[u64]) -> IrIns {
+  let mut x = r;
+  let mut j = 0;
+  while j < vec_len(osrc) {
+    let o = u_at(osrc, j);
+    if r.op != IR_BR && r.op != IR_JMP && r.d == o {
+      x.d = u_at(ndst, j);
+    }
+    if r.op == IR_BR || r.op == IR_MOV || ra_is_binary(r.op) {
+      if r.a == o {
+        x.a = u_at(ndst, j);
+      }
+    }
+    if ra_is_binary(r.op) {
+      if r.b == o {
+        x.b = u_at(ndst, j);
+      }
+    }
+    j = wrap_add(j, 1);
+  }
+  return x;
+}
+
+/// Tail duplication. A `jmp` to a short run of instructions (up to six, then
+/// a `br` or `jmp`, and when the `br` falls into a label a second short run
+/// of the same kind) is replaced by a copy of it: the path that took the
+/// jump runs one jump fewer, as the code of a compiler that duplicates the
+/// join of an `if` has. A register that is written once, inside the run, and
+/// read only there gets a new register in the copy. Returns the number of
+/// jumps replaced.
+fn iropt_taildup(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  let nl = f.nlabel;
+  // A big function has registers to spare nowhere: a copy of a run there
+  // makes the allocator spill, so only small ones are taken.
+  if nl > 100000000 || n > 200 || f.nreg > 100000000 {
+    return 0;
+  }
+  let mut lpos = vec_new[u64]();
+  let mut l = 0;
+  while l < nl {
+    vec_push(&mut lpos, IR_NONE);
+    l = wrap_add(l, 1);
+  }
+  let mut i = 0;
+  while i < n {
+    let q = iropt_at(f, i);
+    if q.op == IR_LABEL && q.a < nl {
+      ra_set(&mut lpos, q.a, i);
+    }
+    i = wrap_add(i, 1);
+  }
+  let nuse = iropt_nuse(f);
+  let ndef = iropt_ndef(f);
+  let mut out = vec_new[IrIns]();
+  let mut done = 0;
+  i = 0;
+  while i < n {
+    let q = iropt_at(f, i);
+    let mut cloned = false;
+    if q.op == IR_JMP && q.a < nl && done < 64 {
+      let h = u_at(lpos, q.a);
+      let nx = iropt_at(f, wrap_add(i, 1));
+      if h != IR_NONE && h < n && !(nx.op == IR_LABEL && nx.a == q.a) {
+        let e1 = iropt_td_end(f, wrap_add(h, 1), 7);
+        if e1 != IR_NONE {
+          let t1 = iropt_at(f, e1);
+          let nxl = iropt_at(f, wrap_add(e1, 1));
+          let mut e2 = IR_NONE;
+          if t1.op == IR_BR && t1.b != t1.c && nxl.op == IR_LABEL && (nxl.a == t1.b || nxl.a == t1.c) {
+            e2 = iropt_td_end(f, wrap_add(e1, 2), 6);
+          }
+          let mut last = e1;
+          if e2 != IR_NONE {
+            last = e2;
+          }
+          // The jump is not inside what is copied, and the copy is no more
+          // than a dozen instructions.
+          if !(i >= h && i <= last) && wrap_sub(last, h) <= 13 {
+            // Registers written once, in the copied run, and read only there.
+            let mut reads = vec_new[u64]();
+            let mut k = wrap_add(h, 1);
+            while k <= last {
+              let r = iropt_at(f, k);
+              if r.op != IR_LABEL {
+                ra_reads(f, r, &mut reads);
+              }
+              k = wrap_add(k, 1);
+            }
+            let mut osrc = vec_new[u64]();
+            let mut ndst = vec_new[u64]();
+            k = wrap_add(h, 1);
+            while k <= last {
+              let r = iropt_at(f, k);
+              if r.op != IR_LABEL && r.op != IR_BR && r.op != IR_JMP && r.d < f.nreg && u_at(ndef, r.d) == 1 {
+                let mut cnt = 0;
+                let mut j = 0;
+                while j < vec_len(reads) {
+                  if vec_get(reads, j) == r.d {
+                    cnt = wrap_add(cnt, 1);
+                  }
+                  j = wrap_add(j, 1);
+                }
+                if cnt == u_at(nuse, r.d) {
+                  vec_push(&mut osrc, r.d);
+                  vec_push(&mut ndst, ir_reg(&mut f));
+                }
+              }
+              k = wrap_add(k, 1);
+            }
+            vec_free(reads);
+            let mut nlab = IR_NONE;
+            if e2 != IR_NONE {
+              nlab = ir_label(&mut f);
+            }
+            k = wrap_add(h, 1);
+            while k <= e1 {
+              let mut r = iropt_td_ren(iropt_at(f, k), osrc, ndst);
+              if r.op == IR_BR && nlab != IR_NONE {
+                if r.b == nxl.a {
+                  r.b = nlab;
+                }
+                if r.c == nxl.a {
+                  r.c = nlab;
+                }
+              }
+              vec_push(&mut out, r);
+              k = wrap_add(k, 1);
+            }
+            if e2 != IR_NONE {
+              vec_push(&mut out, IrIns { op: IR_LABEL, d: nxl.d, a: nlab, b: nxl.b, c: nxl.c, ty: nxl.ty });
+              k = wrap_add(e1, 2);
+              while k <= e2 {
+                vec_push(&mut out, iropt_td_ren(iropt_at(f, k), osrc, ndst));
+                k = wrap_add(k, 1);
+              }
+            }
+            vec_free(osrc);
+            vec_free(ndst);
+            done = wrap_add(done, 1);
+            cloned = true;
+          }
+        }
+      }
+    }
+    if !cloned {
+      vec_push(&mut out, q);
+    }
+    i = wrap_add(i, 1);
+  }
+  vec_free(lpos);
+  vec_free(nuse);
+  vec_free(ndef);
+  if done == 0 {
+    vec_free(out);
+    return 0;
+  }
+  vec_free(f.ins);
+  f.ins = out;
+  return done;
+}
+
 // ---- Results known on the way out of a loop ----
 
 /// Does `op` end a block?
