@@ -1372,14 +1372,14 @@ fn iropt_entry_guard(f: &mut IrFn) -> u64 {
   while i < n {
     let q = iropt_at(f, i);
     if q.op == IR_JMP && q.a < f.nlabel {
-      ra_set(&mut refs, q.a, 1);
+      ra_set(&mut refs, q.a, wrap_add(u_at(refs, q.a), 1));
     }
     if q.op == IR_BR {
       if q.b < f.nlabel {
-        ra_set(&mut refs, q.b, 1);
+        ra_set(&mut refs, q.b, wrap_add(u_at(refs, q.b), 1));
       }
       if q.c < f.nlabel {
-        ra_set(&mut refs, q.c, 1);
+        ra_set(&mut refs, q.c, wrap_add(u_at(refs, q.c), 1));
       }
     }
     i = wrap_add(i, 1);
@@ -1394,7 +1394,11 @@ fn iropt_entry_guard(f: &mut IrFn) -> u64 {
   i = 1;
   while i < n {
     let q = iropt_at(f, i);
-    if q.op == IR_LABEL && q.a < f.nlabel && u_at(refs, q.a) == 0 && wrap_add(i, 4) < n {
+    // Reached only by falling in: no jump names the label, or the one branch
+    // right before it does (the test above it that rotation copied).
+    let pv = iropt_at(f, wrap_sub(i, 1));
+    let fall = pv.op == IR_BR && q.op == IR_LABEL && pv.b == q.a && pv.c != q.a;
+    if q.op == IR_LABEL && q.a < f.nlabel && (u_at(refs, q.a) == 0 || (u_at(refs, q.a) == 1 && fall)) && wrap_add(i, 4) < n {
       let kc = iropt_at(f, wrap_add(i, 1));
       let cm = iropt_at(f, wrap_add(i, 2));
       let br = iropt_at(f, wrap_add(i, 3));
@@ -1409,7 +1413,9 @@ fn iropt_entry_guard(f: &mut IrFn) -> u64 {
         while going && p > 0 {
           p = wrap_sub(p, 1);
           let w = iropt_at(f, p);
-          if (w.op == IR_LABEL && !(w.a < f.nlabel && u_at(refs, w.a) == 0)) || w.op == IR_JMP || w.op == IR_BR || w.op == IR_RET {
+          if p == wrap_sub(i, 1) && fall {
+            // The branch above: its other side does not matter here.
+          } else if (w.op == IR_LABEL && !(w.a < f.nlabel && u_at(refs, w.a) == 0)) || w.op == IR_JMP || w.op == IR_BR || w.op == IR_RET {
             going = false;
           } else if w.op != IR_LABEL && w.d == cm.a {
             going = false;
