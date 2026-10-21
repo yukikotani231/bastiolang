@@ -1,0 +1,54 @@
+// expect-exit: 0
+// expect-stdout: 0
+// expect-stdout: 3334
+// expect-stdout: 20002
+// A loop whose test computes a value (`p[r] % 1024`) that the body reads
+// again is tested at the bottom with the same registers; a select of
+// two loaded values takes the register of one of them.
+const N: u64 = 1024;
+
+fn chase(p: &mut Buf, start: u64) -> u64
+  requires len(p) == N && start < N
+  ensures result < N
+{
+  let mut r = start;
+  let mut steps = 0;
+  while get(p, r) % N != r && steps < 10000
+    invariant len(p) == N && r < N && steps <= 10000
+  {
+    let g = get(p, r) % N;
+    p = set(p, r, get(p, g) % N);
+    r = g;
+    steps = steps + 1;
+  }
+  return r;
+}
+
+fn main() -> u64 {
+  let mut p = alloc(N);
+  let mut i = 0;
+  while i < N
+    invariant i <= N && len(p) == N
+  {
+    p = set(p, i, (i * 7 + 3) % N);
+    i = i + 1;
+  }
+  p = set(p, 5, 5);
+  print(chase(&mut p, 0) % 4);
+  let mut best = 0;
+  let mut j = 0;
+  while j < 1000
+    invariant j <= 1000 && len(p) == N
+  {
+    let up = get(p, j);
+    let left = get(p, j + 1);
+    let mut v = 0;
+    if up > left { v = up; } else { v = left; }
+    best = wrap_add(best, v);
+    j = j + 1;
+  }
+  print(best % 4096);
+  print(chase(&mut p, 1) + chase(&mut p, 2) + 20000);
+  free(p);
+  return 0;
+}

@@ -1452,7 +1452,7 @@ fn iropt_rot_blk(f: &IrFn, s: u64, n: u64) -> u64 {
   let mut going = true;
   while going && m < 4 && wrap_add(wrap_add(s, m), 2) < n {
     let c = iropt_at(f, wrap_add(s, m));
-    if c.op == IR_CONST || c.op == IR_MOV || c.op == IR_LOAD || iropt_is_cmp(c.op) || c.op == IR_ADD || c.op == IR_SUB || c.op == IR_AND || c.op == IR_SHR {
+    if c.op == IR_CONST || c.op == IR_MOV || c.op == IR_LOAD || iropt_is_cmp(c.op) || c.op == IR_ADD || c.op == IR_SUB || c.op == IR_AND || c.op == IR_SHR || c.op == IR_REM || c.op == IR_DIV || c.op == IR_MUL || c.op == IR_OR || c.op == IR_XOR || c.op == IR_SHL {
       m = wrap_add(m, 1);
     } else {
       going = false;
@@ -1513,6 +1513,13 @@ fn iropt_rotate(f: &mut IrFn) -> u64 {
   }
   let nuse = iropt_nuse(f);
   let ndef = iropt_ndef(f);
+  // The registers a test defines that something outside the tests reads too.
+  let mut ext = vec_new[u64]();
+  let mut er = 0;
+  while er < f.nreg && er < 1000000000 {
+    vec_push(&mut ext, 0);
+    er = er + 1;
+  }
   l = 0;
   while l < nl {
     let h = u_at(lpos, l);
@@ -1541,7 +1548,8 @@ fn iropt_rotate(f: &mut IrFn) -> u64 {
             }
           }
         }
-        // Every register the tests define is written once, and read only by them.
+        // Every register the tests define is written once. One that the body
+        // reads too is written again by the copy (a constant is not copied).
         let mut reads = vec_new[u64]();
         let mut k = wrap_add(h, 1);
         while k <= last && k < n {
@@ -1549,6 +1557,7 @@ fn iropt_rotate(f: &mut IrFn) -> u64 {
           k = wrap_add(k, 1);
         }
         let mut ok = true;
+        let mut marks = vec_new[u64]();
         k = wrap_add(h, 1);
         while k <= last && k < n {
           let w = iropt_at(f, k);
@@ -1564,14 +1573,28 @@ fn iropt_rotate(f: &mut IrFn) -> u64 {
                 }
                 j = wrap_add(j, 1);
               }
+              // The result of a compare is read by the branch only, and a loaded
+              // word that the body reads stays a single load.
               if cnt != u_at(nuse, w.d) {
-                ok = false;
+                if iropt_is_cmp(w.op) || w.op == IR_LOAD {
+                  ok = false;
+                } else {
+                  vec_push(&mut marks, w.d);
+                }
               }
             }
           }
           k = wrap_add(k, 1);
         }
         vec_free(reads);
+        if ok {
+          let mut mk = 0;
+          while mk < vec_len(marks) {
+            ra_set(&mut ext, vec_get(marks, mk), 1);
+            mk = wrap_add(mk, 1);
+          }
+        }
+        vec_free(marks);
         if ok {
           ra_set(&mut hdr, l, wrap_add(h, 1));
           ra_set(&mut hlen, l, wrap_sub(last, h));
@@ -1639,6 +1662,8 @@ fn iropt_rotate(f: &mut IrFn) -> u64 {
               j = wrap_add(j, 1);
             }
             vec_push(&mut out, r);
+          } else if c.op == IR_CONST && u_at(ext, c.d) != 0 {
+            // The body reads this constant: it stays what it was.
           } else {
             let mut r = c;
             if c.op != IR_CONST {
@@ -1653,11 +1678,16 @@ fn iropt_rotate(f: &mut IrFn) -> u64 {
                 j = wrap_add(j, 1);
               }
             }
-            let t2 = ir_reg(&mut f);
-            vec_push(&mut osrc, c.d);
-            vec_push(&mut ndst, t2);
-            r.d = t2;
-            vec_push(&mut out, r);
+            if u_at(ext, c.d) != 0 {
+              // The body reads it: the copy writes the register itself.
+              vec_push(&mut out, r);
+            } else {
+              let t2 = ir_reg(&mut f);
+              vec_push(&mut osrc, c.d);
+              vec_push(&mut ndst, t2);
+              r.d = t2;
+              vec_push(&mut out, r);
+            }
           }
           k = wrap_add(k, 1);
         }
@@ -1680,6 +1710,7 @@ fn iropt_rotate(f: &mut IrFn) -> u64 {
   vec_free(hlen);
   vec_free(nuse);
   vec_free(ndef);
+  vec_free(ext);
   if done == 0 {
     vec_free(out);
     return 0;
