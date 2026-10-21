@@ -10,7 +10,8 @@
 #
 # bastio-lsp (tools/bastio-lsp), the language server:
 # - test/lsp_test.py drives it over standard input and output: hover,
-#   go to definition (in the file and in an imported one), document symbols,
+#   go to definition (in the file and in an imported one), references,
+#   highlights, rename, document symbols,
 #   formatting, the compiler's diagnostics with their ranges, lexical errors as
 #   the text changes, malformed input;
 # - editors/vim/test/nvim_test.lua does the same from headless Neovim, through

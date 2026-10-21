@@ -34,12 +34,36 @@ local function request(method)
   end
 end
 
+local function request_with(method, extra)
+  local params = vim.tbl_extend('force', vim.lsp.util.make_position_params(), extra)
+  local res = vim.lsp.buf_request_sync(0, method, params, 20000)
+  for _, r in pairs(res or {}) do
+    return r.result
+  end
+end
+
 vim.fn.cursor(1, 1)
 vim.fn.search('double')
 local hover = request('textDocument/hover')
 check(hover and hover.contents.value:find('fn double(x: u64) -> u64', 1, true), 'hover on a function')
 local def = request('textDocument/definition')
 check(def and def.uri:find('lib.bastio$') and def.range.start.line == 2, 'go to definition in another file')
+
+-- References and rename, through the standard client calls.
+local refs = vim.lsp.buf_request_sync(0, 'textDocument/references',
+  vim.tbl_extend('force', vim.lsp.util.make_position_params(), { context = { includeDeclaration = true } }), 20000)
+local n = 0
+for _, r in pairs(refs or {}) do
+  n = #(r.result or {})
+end
+check(n == 2, 'references to a function: ' .. n)
+local rename = request_with('textDocument/rename', { newName = 'twice' })
+check(rename and rename.changes and vim.tbl_count(rename.changes) == 2, 'rename edits both files')
+if rename then
+  vim.lsp.util.apply_workspace_edit(rename, 'utf-16')
+  check(vim.fn.getline(vim.fn.search('twice', 'nw')):find('twice(p.a)', 1, true), 'rename applied to the buffer')
+  vim.cmd('silent! undo')
+end
 
 -- The diagnostic of the compiler appears after opening a file with an error.
 vim.cmd('edit ' .. dir .. '/bad.bastio')
