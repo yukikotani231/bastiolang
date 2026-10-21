@@ -3863,6 +3863,104 @@ fn ix_ivmerge(f: &mut IrFn) -> u64 {
   return done;
 }
 
+/// Counting down: a loop `i = const c0; H: ...; i = add i, 1; t = lt i, K;
+/// br t, H, E` whose counter `i` nothing else reads (no index, no guard)
+/// and whose bound `K` is a constant above `c0`, counts `K - c0` down to
+/// zero instead: `i = const (K - c0); ...; i = sub i, 1; t = gt i, 0`. The
+/// subtraction leaves the flags the branch wants, so no compare is needed.
+/// `H` is reached only by the back edge and the straight line from the
+/// `const`, and the constant `K` is read by the compare alone. Returns how
+/// many loops it changed.
+fn ix_countdown(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  let nuse = iropt_nuse(f);
+  let ndef = iropt_ndef(f);
+  let cv = iropt_consts(f, ndef);
+  let lp = ra_lpos(f);
+  let mut done = 0;
+  let mut b = 3;
+  while b < n {
+    let q = vec_get(f.ins, b);
+    if q.op == IR_BR && q.b < vec_len(lp) {
+      let h = u_at(lp, q.b);
+      let cmp = ix_at(f, wrap_sub(b, 1));
+      // The step is behind the constants the compare and the step read.
+      let mut pa = wrap_sub(b, 2);
+      let mut pq = ix_at(f, pa);
+      while pa > 0 && pa < n && pq.op == IR_CONST {
+        pa = wrap_sub(pa, 1);
+        pq = ix_at(f, pa);
+      }
+      let add = ix_at(f, pa);
+      if h != IR_NONE && h < b && cmp.op == IR_LT && cmp.d == q.a && cmp.ty == 0 && cmp.d < vec_len(nuse) && u_at(nuse, cmp.d) == 1 && add.op == IR_ADD && add.d == cmp.a && add.a == cmp.a && add.c == 0 && add.ty == 0 && cmp.b < vec_len(cv) && add.b < vec_len(cv) && cmp.a < vec_len(ndef) && cmp.b < vec_len(nuse) {
+        let i = cmp.a;
+        let k = u_at(cv, cmp.b);
+        if u_at(cv, add.b) == 1 && k != IR_NONE && u_at(ndef, i) == 2 && u_at(nuse, i) == 2 && u_at(nuse, cmp.b) == 1 {
+          // The other write of `i` is a `const` before the loop with no
+          // label or jump between it and `H`, and `H` has no other way in.
+          let mut d0 = IR_NONE;
+          let mut kd = IR_NONE;
+          let mut j = 0;
+          while j < b {
+            let t = vec_get(f.ins, j);
+            if t.op == IR_CONST && t.d == i && j < h {
+              d0 = j;
+            }
+            if t.op == IR_CONST && t.d == cmp.b {
+              kd = j;
+            }
+            j = wrap_add(j, 1);
+          }
+          let mut ok = d0 != IR_NONE && kd != IR_NONE;
+          if ok {
+            j = wrap_add(d0, 1);
+            while j < h {
+              let t = vec_get(f.ins, j);
+              if t.op == IR_LABEL || t.op == IR_JMP || t.op == IR_BR || t.op == IR_RET {
+                ok = false;
+              }
+              j = wrap_add(j, 1);
+            }
+          }
+          j = 0;
+          while ok && j < n {
+            let t = vec_get(f.ins, j);
+            if j != b && ((t.op == IR_JMP && t.a == q.b) || (t.op == IR_BR && (t.b == q.b || t.c == q.b))) {
+              ok = false;
+            }
+            j = wrap_add(j, 1);
+          }
+          if ok {
+            let cq = ix_at(f, d0);
+            let c0 = cq.a;
+            if c0 < k && d0 < vec_len(f.ins) && kd < vec_len(f.ins) && b < vec_len(f.ins) && pa < vec_len(f.ins) {
+              let mut t0 = cq;
+              t0.a = wrap_sub(k, c0);
+              vec_set(&mut f.ins, d0, t0);
+              let mut tk = ix_at(f, kd);
+              tk.a = 0;
+              vec_set(&mut f.ins, kd, tk);
+              let mut a2 = add;
+              a2.op = IR_SUB;
+              vec_set(&mut f.ins, pa, a2);
+              let mut c2 = cmp;
+              c2.op = IR_GT;
+              vec_set(&mut f.ins, wrap_sub(b, 1), c2);
+              done = wrap_add(done, 1);
+            }
+          }
+        }
+      }
+    }
+    b = wrap_add(b, 1);
+  }
+  vec_free(lp);
+  vec_free(cv);
+  vec_free(ndef);
+  vec_free(nuse);
+  return done;
+}
+
 /// `t = add x, K; ...; x = mov t`, where `t` is written once, read only
 /// between the two (the `x + 1` an address wanted, say), `K` is a constant and
 /// `x` is not written in between, becomes `x = add x, K` at the `mov` (when
@@ -5806,6 +5904,7 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
   if ix_incr(&mut f) > 0 {
     iropt_dce(&mut f);
   }
+  ix_countdown(&mut f);
   if g.target != TARGET_KERNEL && ix_copy16(&mut f) > 0 {
     iropt_copies(&mut f);
     iropt_dce(&mut f);
