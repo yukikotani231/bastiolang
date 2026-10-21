@@ -5608,6 +5608,25 @@ fn iropt_ef_hop(f: &IrFn, lpos: &Vec[u64], cv: &Vec[u64], ndef: &Vec[u64], nuse:
   return tgt;
 }
 
+/// Whether the label `l` has a single edge from above, with every edge from
+/// below (a loop's back edges) a branch on one register against a constant:
+/// the facts of the edge from above, widened by what those branches say,
+/// hold at the label.
+fn iropt_ef_single(cnt: &Vec[u64], nback: &Vec[u64], hbad: &Vec[u64], hx: &Vec[u64], l: u64) -> bool {
+  if l >= vec_len(cnt) || l >= vec_len(nback) || l >= vec_len(hbad) || l >= vec_len(hx) {
+    return false;
+  }
+  let nb = u_at(nback, l);
+  let c = u_at(cnt, l);
+  if c < nb || wrap_sub(c, nb) != 1 {
+    return false;
+  }
+  if nb == 0 {
+    return true;
+  }
+  return u_at(hbad, l) == 0 && u_at(hx, l) != IR_NONE;
+}
+
 /// Records, for the label `lab` that this edge alone reaches, the facts that
 /// hold on the edge: the ranges and exclusions known now, and what the branch
 /// itself says on that side (`bop`, `bx`, `bk` of the branch, `tv` 1 or 0;
@@ -5739,6 +5758,71 @@ fn iropt_efacts(f: &mut IrFn) -> u64 {
     vec_push(&mut bk, k);
     i = wrap_add(i, 1);
   }
+  // The back edges of each label: how many, and the range of one register
+  // that all of them agree on (a branch against a constant).
+  let mut nback = vec_new[u64]();
+  let mut hx = vec_new[u64]();
+  let mut hlo = vec_new[u64]();
+  let mut hhi = vec_new[u64]();
+  let mut hbad = vec_new[u64]();
+  l = 0;
+  while l < f.nlabel {
+    vec_push(&mut nback, 0);
+    vec_push(&mut hx, IR_NONE);
+    vec_push(&mut hlo, 0);
+    vec_push(&mut hhi, 0);
+    vec_push(&mut hbad, 0);
+    l = wrap_add(l, 1);
+  }
+  i = 0;
+  while i < n {
+    let q = iropt_at(f, i);
+    if q.op == IR_JMP && q.a < f.nlabel {
+      let p = u_at(lpos, q.a);
+      if p != IR_NONE && p <= i {
+        ra_set(&mut nback, q.a, wrap_add(u_at(nback, q.a), 1));
+        ra_set(&mut hbad, q.a, 1);
+      }
+    }
+    if q.op == IR_BR {
+      let mut side = 0;
+      while side < 2 {
+        let mut tgt = q.b;
+        if side == 1 {
+          tgt = q.c;
+        }
+        if tgt < f.nlabel {
+          let p = u_at(lpos, tgt);
+          if p != IR_NONE && p <= i {
+            ra_set(&mut nback, tgt, wrap_add(u_at(nback, tgt), 1));
+            if q.b == q.c || u_at(bop, i) == 0 {
+              ra_set(&mut hbad, tgt, 1);
+            } else {
+              let rg = iropt_ef_range(u_at(bop, i), u_at(bk, i), wrap_sub(1, side));
+              if rg.lo > rg.hi {
+                ra_set(&mut hbad, tgt, 1);
+              } else if u_at(hx, tgt) == IR_NONE {
+                ra_set(&mut hx, tgt, u_at(bx, i));
+                ra_set(&mut hlo, tgt, rg.lo);
+                ra_set(&mut hhi, tgt, rg.hi);
+              } else if u_at(hx, tgt) == u_at(bx, i) {
+                if rg.lo < u_at(hlo, tgt) {
+                  ra_set(&mut hlo, tgt, rg.lo);
+                }
+                if rg.hi > u_at(hhi, tgt) {
+                  ra_set(&mut hhi, tgt, rg.hi);
+                }
+              } else {
+                ra_set(&mut hbad, tgt, 1);
+              }
+            }
+          }
+        }
+        side = wrap_add(side, 1);
+      }
+    }
+    i = wrap_add(i, 1);
+  }
   // Facts: register, lo, hi.
   let mut fr = vec_new[u64]();
   let mut flo = vec_new[u64]();
@@ -5790,7 +5874,7 @@ fn iropt_efacts(f: &mut IrFn) -> u64 {
         vec_pop(&mut fxv);
       }
       // A label that one edge alone reaches starts with the facts of that edge.
-      if q.op == IR_LABEL && q.a < f.nlabel && u_at(cnt, q.a) == 1 && (prev.op == IR_JMP || prev.op == IR_BR || prev.op == IR_RET || prev.op == IR_UNREACH) {
+      if q.op == IR_LABEL && q.a < f.nlabel && iropt_ef_single(cnt, nback, hbad, hx, q.a) && (prev.op == IR_JMP || prev.op == IR_BR || prev.op == IR_RET || prev.op == IR_UNREACH) {
         let mut sj = 0;
         while sj < vec_len(sn.l) && sj < vec_len(sn.k) && sj < vec_len(sn.r) && sj < vec_len(sn.a) && sj < vec_len(sn.b) {
           if u_at(sn.l, sj) == q.a {
@@ -5804,6 +5888,53 @@ fn iropt_efacts(f: &mut IrFn) -> u64 {
             }
           }
           sj = wrap_add(sj, 1);
+        }
+        if u_at(nback, q.a) > 0 {
+          // A loop header: only what the edges from below agree on holds,
+          // the range of one register widened by theirs.
+          let hr = u_at(hx, q.a);
+          let mut rl = 0;
+          let mut rh = 18446744073709551615;
+          let mut j = 0;
+          while j < vec_len(fr) {
+            if u_at(fr, j) == hr {
+              if u_at(flo, j) > rl {
+                rl = u_at(flo, j);
+              }
+              if u_at(fhi, j) < rh {
+                rh = u_at(fhi, j);
+              }
+            }
+            j = wrap_add(j, 1);
+          }
+          while vec_len(fr) > 0 {
+            vec_pop(&mut fr);
+          }
+          while vec_len(flo) > 0 {
+            vec_pop(&mut flo);
+          }
+          while vec_len(fhi) > 0 {
+            vec_pop(&mut fhi);
+          }
+          while vec_len(fxr) > 0 {
+            vec_pop(&mut fxr);
+          }
+          while vec_len(fxv) > 0 {
+            vec_pop(&mut fxv);
+          }
+          if rl <= rh {
+            if u_at(hlo, q.a) < rl {
+              rl = u_at(hlo, q.a);
+            }
+            if u_at(hhi, q.a) > rh {
+              rh = u_at(hhi, q.a);
+            }
+            if rl > 0 || rh < 18446744073709551615 {
+              vec_push(&mut fr, hr);
+              vec_push(&mut flo, rl);
+              vec_push(&mut fhi, rh);
+            }
+          }
         }
       }
     }
@@ -5944,10 +6075,10 @@ fn iropt_efacts(f: &mut IrFn) -> u64 {
         iropt_put(&mut f, i, IrIns { op: IR_BR, d: q.d, a: q.a, b: tl, c: fl, ty: q.ty });
         done = wrap_add(done, 1);
       }
-      if tl < f.nlabel && u_at(cnt, tl) == 1 && u_at(lpos, tl) != IR_NONE && u_at(lpos, tl) > i {
+      if tl < f.nlabel && iropt_ef_single(cnt, nback, hbad, hx, tl) && u_at(lpos, tl) != IR_NONE && u_at(lpos, tl) > i {
         iropt_ef_snap(&mut sn, tl, fr, flo, fhi, fxr, fxv, u_at(bop, i), u_at(bx, i), u_at(bk, i), 1);
       }
-      if fl < f.nlabel && u_at(cnt, fl) == 1 && u_at(lpos, fl) != IR_NONE && u_at(lpos, fl) > i {
+      if fl < f.nlabel && iropt_ef_single(cnt, nback, hbad, hx, fl) && u_at(lpos, fl) != IR_NONE && u_at(lpos, fl) > i {
         iropt_ef_snap(&mut sn, fl, fr, flo, fhi, fxr, fxv, u_at(bop, i), u_at(bx, i), u_at(bk, i), 0);
       }
     }
@@ -5975,7 +6106,7 @@ fn iropt_efacts(f: &mut IrFn) -> u64 {
     if q.op == IR_JMP && q.a < f.nlabel {
       let jq = iropt_at(f, i);
       let jt = jq.a;
-      if jt < f.nlabel && u_at(cnt, jt) == 1 && u_at(lpos, jt) != IR_NONE && u_at(lpos, jt) > i {
+      if jt < f.nlabel && iropt_ef_single(cnt, nback, hbad, hx, jt) && u_at(lpos, jt) != IR_NONE && u_at(lpos, jt) > i {
         iropt_ef_snap(&mut sn, jt, fr, flo, fhi, fxr, fxv, 0, 0, 0, 0);
       }
     }
@@ -6031,6 +6162,11 @@ fn iropt_efacts(f: &mut IrFn) -> u64 {
   vec_free(sn.r);
   vec_free(sn.a);
   vec_free(sn.b);
+  vec_free(nback);
+  vec_free(hx);
+  vec_free(hlo);
+  vec_free(hhi);
+  vec_free(hbad);
   vec_free(bop);
   vec_free(bx);
   vec_free(bk);
