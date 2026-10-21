@@ -1172,6 +1172,21 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool, bigk: u64) 
         }
       }
     }
+    // The result of a two-operand instruction may take the machine register
+    // of its first operand when that dies there: the emitter then has no
+    // copy to make before the operation.
+    if want == IR_NONE && touch && (lo > 0 || !ra_is_param(f, v)) && lo < n {
+      let q2 = vec_get(f.ins, lo);
+      if ra_is_binary(q2.op) && q2.d == v && q2.a != v && q2.b != v && q2.a != q2.b && q2.a < nr && u_at(iv.hi, q2.a) <= lo && u_at(al.cst, q2.a) == 0 {
+        let cu2 = u_at(al.cls, q2.a);
+        let iu2 = u_at(al.idx, q2.a);
+        if cu2 == RA_CALLER && !crosses {
+          want = wrap_add(ncallee, iu2);
+        } else if cu2 == RA_CALLEE {
+          want = iu2;
+        }
+      }
+    }
     // A copy of a register that stays live beside it takes its machine
     // register too, when nothing writes that register while the copy lives.
     let mut cpu = IR_NONE;

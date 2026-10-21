@@ -1452,7 +1452,7 @@ fn iropt_rot_blk(f: &IrFn, s: u64, n: u64) -> u64 {
   let mut going = true;
   while going && m < 4 && wrap_add(wrap_add(s, m), 2) < n {
     let c = iropt_at(f, wrap_add(s, m));
-    if c.op == IR_CONST || c.op == IR_MOV || c.op == IR_LOAD || iropt_is_cmp(c.op) || c.op == IR_ADD || c.op == IR_SUB || c.op == IR_AND || c.op == IR_SHR || c.op == IR_REM || c.op == IR_MUL || c.op == IR_SHL || c.op == IR_OR || c.op == IR_XOR {
+    if c.op == IR_CONST || c.op == IR_MOV || c.op == IR_LOAD || iropt_is_cmp(c.op) || c.op == IR_ADD || c.op == IR_SUB || c.op == IR_AND || c.op == IR_SHR || c.op == IR_REM || c.op == IR_MUL || c.op == IR_SHL || c.op == IR_OR || c.op == IR_XOR || c.op == IR_DIV {
       m = wrap_add(m, 1);
     } else {
       going = false;
@@ -1555,7 +1555,8 @@ fn iropt_rotate(f: &mut IrFn) -> u64 {
             }
           }
         }
-        // Every register the tests define is written once, and read only by them.
+        // Every register the tests define is written once. One that the body
+        // reads too is written again by the copy (a constant is not copied).
         let mut reads = vec_new[u64]();
         let mut k = wrap_add(h, 1);
         while k <= last && k < n {
@@ -1579,6 +1580,8 @@ fn iropt_rotate(f: &mut IrFn) -> u64 {
                 }
                 j = wrap_add(j, 1);
               }
+              // The result of a compare is read by the branch only, and a loaded
+              // word that the body reads stays a single load.
               if cnt != u_at(nuse, w.d) {
                 // Read outside the tests as well: a constant is copied under a
                 // new register all the same, any other value is recomputed in
@@ -2171,6 +2174,130 @@ fn iropt_reach(f: &mut IrFn) -> u64 {
   vec_free(work);
   vec_free(reach);
   vec_free(lpos);
+  if dropped > 0 {
+    vec_free(f.ins);
+    f.ins = out;
+  } else {
+    vec_free(out);
+  }
+  return dropped;
+}
+
+/// Walks every path from the entry, tracking whether `t` is still a copy of
+/// `v`: it is from the `mov` at `dpos` (`t = mov v`, `t` written only there)
+/// until `t` or `v` is written again. Each `v = mov t` reached with the copy
+/// intact is marked 1 in `drop` (it changes nothing), one reached without it 2.
+fn iropt_wbk_walk(f: &IrFn, lpos: &Vec[u64], dpos: u64, t: u64, v: u64, drop: &mut Vec[u64]) {
+  let n = vec_len(f.ins);
+  let mut visited = vec_new[u64]();
+  let mut k = 0;
+  while k < n && k < 1000000000 {
+    vec_push(&mut visited, 0);
+    vec_push(&mut visited, 0);
+    k = k + 1;
+  }
+  let mut work = vec_new[u64]();
+  vec_push(&mut work, 0);
+  while vec_len(work) > 0 {
+    let s = vec_pop(&mut work);
+    let mut p = s / 2;
+    let mut valid = s % 2;
+    let mut going = true;
+    while going && p < n {
+      let key = wrap_add(wrap_mul(p, 2), valid);
+      if u_at(visited, key) != 0 {
+        going = false;
+      } else {
+        ra_set(&mut visited, key, 1);
+        let q = vec_get(f.ins, p);
+        if p == dpos {
+          valid = 1;
+        } else if q.op == IR_MOV && q.d == v && q.a == t {
+          if valid == 0 {
+            ra_set(&mut drop, p, 2);
+          } else if u_at(drop, p) == 0 {
+            ra_set(&mut drop, p, 1);
+          }
+        } else if ra_writes_has(q, v) || ra_writes_has(q, t) {
+          valid = 0;
+        }
+        if q.op == IR_JMP {
+          vec_push(&mut work, wrap_add(wrap_mul(u_at(lpos, q.a), 2), valid));
+          going = false;
+        } else if q.op == IR_BR {
+          vec_push(&mut work, wrap_add(wrap_mul(u_at(lpos, q.b), 2), valid));
+          vec_push(&mut work, wrap_add(wrap_mul(u_at(lpos, q.c), 2), valid));
+          going = false;
+        } else if q.op == IR_RET || q.op == IR_UNREACH {
+          going = false;
+        } else {
+          p = p + 1;
+        }
+      }
+    }
+  }
+  vec_free(work);
+  vec_free(visited);
+}
+
+/// Write-back removal: `t = mov v` with `t` written once, and a `v = mov t`
+/// that every path reaches with neither `t` nor `v` written since: the second
+/// `mov` stores what `v` holds. An argument passed in a frame slot that the
+/// callee only copies back (a `&mut` struct that an inlined function leaves
+/// as it found it) comes round a loop like that. Returns how many it dropped.
+fn iropt_wbk(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  let ndef = iropt_ndef(f);
+  let lpos = ra_lpos(f);
+  let mut defpos = vec_new[u64]();
+  let mut seen = vec_new[u64]();
+  let mut r = 0;
+  while r < f.nreg && r < 1000000000 {
+    vec_push(&mut defpos, IR_NONE);
+    vec_push(&mut seen, 0);
+    r = r + 1;
+  }
+  let mut drop = vec_new[u64]();
+  let mut i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    vec_push(&mut drop, 0);
+    if q.op == IR_MOV && u_at(ndef, q.d) == 1 {
+      ra_set(&mut defpos, q.d, i);
+    }
+    i = i + 1;
+  }
+  i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    if q.op == IR_MOV && q.d != q.a {
+      let t = q.a;
+      let v = q.d;
+      let dp = u_at(defpos, t);
+      if dp < n && u_at(seen, t) == 0 && u_at(ndef, t) == 1 {
+        let dq = vec_get(f.ins, dp);
+        if dq.a == v {
+          ra_set(&mut seen, t, 1);
+          iropt_wbk_walk(f, lpos, dp, t, v, &mut drop);
+        }
+      }
+    }
+    i = i + 1;
+  }
+  let mut out = vec_new[IrIns]();
+  i = 0;
+  while i < n {
+    if u_at(drop, i) != 1 {
+      vec_push(&mut out, vec_get(f.ins, i));
+    }
+    i = i + 1;
+  }
+  let dropped = wrap_sub(n, vec_len(out));
+  vec_free(lpos);
+  vec_free(defpos);
+  vec_free(seen);
+  vec_free(drop);
+  vec_free(ndef);
   if dropped > 0 {
     vec_free(f.ins);
     f.ins = out;
