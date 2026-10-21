@@ -1,0 +1,101 @@
+// expect-exit: 0
+// expect-stdout: 6921938880757783199
+// expect-stdout: 13193036909270258048
+// expect-stdout: 17169973794007473775
+// expect-stdout: 16190172697242889013
+// expect-stdout: 30
+// expect-stdout: 4
+// expect-stdout: 445686975290430769
+// A two-word struct copied from one place of a vector to another is one
+// 16-byte move. Records are shifted up and down within one vector (source
+// and destination ranges overlap), swapped, and copied while one of the words
+// is also compared.
+struct R { key: u64, val: u64 }
+
+const N: u64 = 64;
+
+fn shift_up(rs: &mut Vec[R], lo: u64, hi: u64)
+  requires vlen(rs) == N && lo < hi && hi < N
+{
+  let mut j = hi;
+  while j > lo
+    invariant j <= hi && hi < N && vlen(rs) == N
+  {
+    let p = vec_get(rs, j - 1);
+    vec_set(&mut rs, j, p);
+    j = j - 1;
+  }
+}
+
+fn shift_down(rs: &mut Vec[R], lo: u64, hi: u64)
+  requires vlen(rs) == N && lo < hi && hi < N
+{
+  let mut j = lo;
+  while j < hi
+    invariant j <= hi && hi < N && vlen(rs) == N
+  {
+    let p = vec_get(rs, j + 1);
+    vec_set(&mut rs, j, p);
+    j = j + 1;
+  }
+}
+
+fn swap(rs: &mut Vec[R], a: u64, b: u64)
+  requires vlen(rs) == N && a < N && b < N
+{
+  let x = vec_get(rs, a);
+  let y = vec_get(rs, b);
+  vec_set(&mut rs, a, y);
+  vec_set(&mut rs, b, x);
+}
+
+fn copy_big(rs: &mut Vec[R], from: u64, to: u64) -> u64
+  requires vlen(rs) == N && from < N && to < N
+{
+  let p = vec_get(rs, from);
+  let mut hit = 0;
+  if p.key > 20 {
+    hit = 1;
+  }
+  vec_set(&mut rs, to, p);
+  return wrap_add(hit, p.val);
+}
+
+fn sum(rs: &Vec[R]) -> u64
+  requires vlen(rs) == N
+{
+  let mut t = 0;
+  let mut i = 0;
+  while i < N
+    invariant i <= N && vlen(rs) == N
+  {
+    let r = vec_get(rs, i);
+    t = wrap_add(wrap_mul(t, 31), wrap_add(wrap_mul(r.key, i + 1), wrap_mul(r.val, 7)));
+    i = i + 1;
+  }
+  return t;
+}
+
+fn main() -> u64 {
+  let mut rs = vec_new[R]();
+  let mut i = 0;
+  while i < N
+    invariant i <= N && vlen(rs) == i
+  {
+    vec_push(&mut rs, R { key: i * 5 % 41, val: i * 11 % 37 });
+    i = i + 1;
+  }
+  print(sum(rs));
+  shift_up(&mut rs, 3, 40);
+  print(sum(rs));
+  shift_down(&mut rs, 10, 50);
+  print(sum(rs));
+  swap(&mut rs, 2, 61);
+  swap(&mut rs, 30, 30);
+  print(sum(rs));
+  print(copy_big(&mut rs, 33, 4));
+  print(copy_big(&mut rs, 8, 9));
+  print(sum(rs));
+  vec_free(rs);
+  return 0;
+}

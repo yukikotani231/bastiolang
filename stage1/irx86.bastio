@@ -1862,6 +1862,16 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     ix_mov(&mut out, ix_loc(al, q.b), ix_rl(XR_RAX));
     ix_mov(&mut out, ix_loc(al, q.c), ix_rl(XR_RCX));
     w_s(&mut out, "\trep stosb\n");
+  } else if op == IR_CP16 {
+    // Two words from c[d] to a[b], through %xmm0.
+    let aps = ix_aprep(&mut out, al, q.c, q.d, 0);
+    w_s(&mut out, "\tmovdqu ");
+    ix_awrite(&mut out, aps, 8);
+    w_s(&mut out, ", %xmm0\n");
+    let apd = ix_aprep(&mut out, al, q.a, q.b, 0);
+    w_s(&mut out, "\tmovups %xmm0, ");
+    ix_awrite(&mut out, apd, 8);
+    w_s(&mut out, "\n");
   } else if op == IR_COPY {
     // Whole words with rep movsq, then the rest with rep movsb.
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RDI));
@@ -4260,6 +4270,263 @@ fn ix_sinkld(f: &mut IrFn) -> u64 {
   return done;
 }
 
+/// Two adjacent word loads from one base and the two stores of them to
+/// adjacent words of another (the copy of a two-word struct, `v = a[i]` then
+/// `b[j] = v`) become one 16-byte move, `IR_CP16`. The pair of stores must be
+/// next to each other (only constants between), nothing between the loads and
+/// the first store may write memory or the loads' registers, the second load
+/// is read only by the second store, and the first load stays if anything
+/// else reads it (a comparison of the key).
+fn ix_copy16(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  let nr = f.nreg;
+  let ndef = iropt_ndef(f);
+  let nuse = iropt_nuse(f);
+  let mut kv = vec_new[u64]();
+  let mut dpos = vec_new[u64]();
+  let mut r = 0;
+  while r < nr && r < 1000000000 {
+    vec_push(&mut kv, IR_NONE);
+    vec_push(&mut dpos, IR_NONE);
+    r = wrap_add(r, 1);
+  }
+  let mut i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    if q.op == IR_CONST && q.d < nr && u_at(ndef, q.d) == 1 {
+      ra_set(&mut kv, q.d, q.a);
+    }
+    if (q.op == IR_LOAD || q.op == IR_CONST || ra_is_binary(q.op) || q.op == IR_MOV) && q.d < nr && u_at(ndef, q.d) == 1 {
+      ra_set(&mut dpos, q.d, i);
+    }
+    i = wrap_add(i, 1);
+  }
+  // For each label: how many jumps and branches name it, and where the first is.
+  let mut lcnt = vec_new[u64]();
+  let mut lfst = vec_new[u64]();
+  let mut lb = 0;
+  while lb < f.nlabel && lb < 1000000000 {
+    vec_push(&mut lcnt, 0);
+    vec_push(&mut lfst, IR_NONE);
+    lb = wrap_add(lb, 1);
+  }
+  i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    if q.op == IR_JMP && q.a < vec_len(lcnt) {
+      ra_set(&mut lcnt, q.a, wrap_add(u_at(lcnt, q.a), 1));
+      if u_at(lfst, q.a) == IR_NONE {
+        ra_set(&mut lfst, q.a, i);
+      }
+    } else if q.op == IR_BR && q.b < vec_len(lcnt) && q.c < vec_len(lcnt) {
+      ra_set(&mut lcnt, q.b, wrap_add(u_at(lcnt, q.b), 1));
+      if u_at(lfst, q.b) == IR_NONE {
+        ra_set(&mut lfst, q.b, i);
+      }
+      ra_set(&mut lcnt, q.c, wrap_add(u_at(lcnt, q.c), 1));
+      if u_at(lfst, q.c) == IR_NONE {
+        ra_set(&mut lfst, q.c, i);
+      }
+    }
+    i = wrap_add(i, 1);
+  }
+  // kill[i] = 1: instruction i is dropped; 2: i is replaced.
+  let mut kill = vec_new[u64]();
+  let mut rep = vec_new[IrIns]();
+  i = 0;
+  while i < n {
+    vec_push(&mut kill, 0);
+    vec_push(&mut rep, vec_get(f.ins, i));
+    i = wrap_add(i, 1);
+  }
+  let mut done = 0;
+  i = 0;
+  while i < n {
+    let s1 = vec_get(f.ins, i);
+    if s1.op == IR_STORE && s1.c == 8 && s1.ty == 0 && s1.b < nr && u_at(kv, s1.b) != IR_NONE && s1.d < nr && u_at(kv, s1.b) < 1000000 && u_at(kill, i) == 0 {
+      // The second store: next store, only constants between.
+      let mut j = wrap_add(i, 1);
+      let mut going = true;
+      while going && j < n && j < wrap_add(i, 6) {
+        let t = vec_get(f.ins, j);
+        if t.op == IR_CONST {
+          j = wrap_add(j, 1);
+        } else {
+          going = false;
+        }
+      }
+      if j < n {
+        let s2 = vec_get(f.ins, j);
+        if s2.op == IR_STORE && s2.c == 8 && s2.ty == 0 && s2.a == s1.a && s2.b < nr && u_at(kv, s2.b) == wrap_add(u_at(kv, s1.b), 1) && s2.d < nr && s2.d != s1.d && s2.a != s1.d && s2.a != s2.d {
+          // x is the first word, through copies (a value that a comparison
+          // also reads is often the result register of an inlined call).
+          let mut x = s1.d;
+          let y = s2.d;
+          let mut hops = 0;
+          let mut px = u_at(dpos, x);
+          let mut xdirect = true;
+          let mut chase = true;
+          while chase && hops < 4 && px != IR_NONE && px < n {
+            let mv = vec_get(f.ins, px);
+            if mv.op != IR_MOV {
+              chase = false;
+            } else if mv.a < nr && u_at(ndef, mv.a) == 1 && u_at(dpos, mv.a) != IR_NONE {
+              x = mv.a;
+              px = u_at(dpos, x);
+              xdirect = false;
+            } else {
+              px = IR_NONE;
+              chase = false;
+            }
+            hops = wrap_add(hops, 1);
+          }
+          let py = u_at(dpos, y);
+          if px != IR_NONE && py != IR_NONE && px < i && py < i && u_at(ndef, x) == 1 && u_at(ndef, y) == 1 && u_at(nuse, y) == 1 && x != y {
+            let lx = vec_get(f.ins, px);
+            let ly = vec_get(f.ins, py);
+            if lx.op == IR_LOAD && ly.op == IR_LOAD && lx.c == 8 && ly.c == 8 && lx.ty == 0 && ly.ty == 0 && lx.a == ly.a && lx.b < nr && ly.b < nr && u_at(kv, lx.b) != IR_NONE && u_at(kv, ly.b) == wrap_add(u_at(kv, lx.b), 1) && lx.a != x && lx.a != y {
+              // Nothing between the first load and the first store writes
+              // memory or the source base.
+              let lo = px;
+              let mut ok = true;
+              let mut m = lo;
+              while m < i && ok {
+                let t = vec_get(f.ins, m);
+                if t.op == IR_BR {
+                  // A branch is fine when each target is reached only from the
+                  // branches in this stretch (checked at the label).
+                } else if t.op == IR_LABEL {
+                  // Entered only by one branch of this stretch.
+                  if t.a >= vec_len(lcnt) || u_at(lcnt, t.a) != 1 || u_at(lfst, t.a) == IR_NONE || u_at(lfst, t.a) < lo || u_at(lfst, t.a) >= m {
+                    ok = false;
+                  }
+                } else if !(t.op == IR_CONST || t.op == IR_MOV || t.op == IR_LOAD || t.op == IR_WRAP || t.op == IR_NOT || t.op == IR_NEG || ra_is_binary(t.op)) {
+                  ok = false;
+                }
+                if m != px && m != py && ra_writes_has(t, lx.a) {
+                  ok = false;
+                }
+                m = wrap_add(m, 1);
+              }
+              if ok && i < vec_len(rep) && j < vec_len(kill) && py < vec_len(kill) && px < vec_len(kill) {
+                vec_set(&mut rep, i, IrIns { op: IR_CP16, d: lx.b, a: s1.a, b: s1.b, c: lx.a, ty: 0 });
+                vec_set(&mut kill, j, 1);
+                vec_set(&mut kill, py, 1);
+                if xdirect && u_at(nuse, x) == 1 {
+                  vec_set(&mut kill, px, 1);
+                }
+                done = wrap_add(done, 1);
+              }
+            }
+          }
+        }
+      }
+    }
+    i = wrap_add(i, 1);
+  }
+  if done > 0 {
+    let mut out = vec_new[IrIns]();
+    i = 0;
+    while i < n {
+      if i < vec_len(rep) && u_at(kill, i) == 0 {
+        vec_push(&mut out, vec_get(rep, i));
+      }
+      i = wrap_add(i, 1);
+    }
+    vec_free(f.ins);
+    f.ins = out;
+  }
+  vec_free(ndef);
+  vec_free(nuse);
+  vec_free(kv);
+  vec_free(dpos);
+  vec_free(kill);
+  vec_free(rep);
+  vec_free(lcnt);
+  vec_free(lfst);
+  return done;
+}
+
+/// `x % K == 0` (or `!= 0`) for an odd constant K above 1 and a 64-bit x, the
+/// remainder read only by that test: `x * inv(K)`, wrapping, is at most
+/// floor((2^64 - 1) / K) exactly when K divides x (`inv` the inverse of K
+/// modulo 2^64). One multiplication and one compare instead of the
+/// remainder's multiply, shift and subtract chain. Returns how many it
+/// rewrote.
+fn ix_divisible(f: &mut IrFn, m: &Mono) -> u64 {
+  let n = vec_len(f.ins);
+  let ndef = iropt_ndef(f);
+  let nuse = iropt_nuse(f);
+  let cv = iropt_consts(f, ndef);
+  let mut out = vec_new[IrIns]();
+  let mut done = 0;
+  let mut i = 0;
+  while i < n {
+    let q = vec_get(f.ins, i);
+    let mut hit = false;
+    if q.op == IR_REM && q.d < f.nreg && u_at(ndef, q.d) == 1 && u_at(nuse, q.d) == 1 && q.b < vec_len(cv) && u_at(cv, q.b) != IR_NONE {
+      let k = u_at(cv, q.b);
+      if k >= 3 && k < 9223372036854775808 && (k & 1) == 1 && (q.ty == 0 || slen(x86_normalize(m, q.ty)) == 0) {
+        // The test: next compare of the remainder against zero.
+        let mut j = wrap_add(i, 1);
+        let mut at = IR_NONE;
+        while j < n && j < wrap_add(i, 6) && at == IR_NONE {
+          let t = vec_get(f.ins, j);
+          if (t.op == IR_EQ || t.op == IR_NE) && ((t.a == q.d && t.b < vec_len(cv) && u_at(cv, t.b) == 0) || (t.b == q.d && t.a < vec_len(cv) && u_at(cv, t.a) == 0)) {
+            at = j;
+          } else if ra_reads_has(f, t, q.d) || ra_writes_has(t, q.a) {
+            j = n;
+          }
+          j = wrap_add(j, 1);
+        }
+        if at != IR_NONE && at < n {
+          let mut inv = k;
+          let mut r = 0;
+          while r < 6 {
+            inv = wrap_mul(inv, wrap_sub(2, wrap_mul(k, inv)));
+            r = wrap_add(r, 1);
+          }
+          let ri = ir_reg(&mut f);
+          let rt = ir_reg(&mut f);
+          vec_push(&mut out, IrIns { op: IR_CONST, d: ri, a: inv, b: 0, c: 0, ty: 0 });
+          vec_push(&mut out, IrIns { op: IR_CONST, d: rt, a: 18446744073709551615 / k, b: 0, c: 0, ty: 0 });
+          vec_push(&mut out, IrIns { op: IR_MUL, d: q.d, a: q.a, b: ri, c: 1, ty: q.ty });
+          // The compare, later: x * inv <= limit for `== 0`, above it for `!= 0`.
+          let t = vec_get(f.ins, at);
+          let mut cop = IR_LE;
+          if t.op == IR_NE {
+            cop = IR_GT;
+          }
+          let mut p = i;
+          p = wrap_add(p, 1);
+          while p < at {
+            vec_push(&mut out, vec_get(f.ins, p));
+            p = wrap_add(p, 1);
+          }
+          vec_push(&mut out, IrIns { op: cop, d: t.d, a: q.d, b: rt, c: 0, ty: t.ty });
+          i = at;
+          hit = true;
+          done = wrap_add(done, 1);
+        }
+      }
+    }
+    if !hit {
+      vec_push(&mut out, q);
+    }
+    i = wrap_add(i, 1);
+  }
+  vec_free(ndef);
+  vec_free(nuse);
+  vec_free(cv);
+  if done > 0 {
+    vec_free(f.ins);
+    f.ins = out;
+  } else {
+    vec_free(out);
+  }
+  return done;
+}
+
 /// The multiplier that the division by the constant `k` loads into %rdx
 /// (`movabs $M, %rdx; mul %rdx`), 0 if its code has no such pair.
 fn ix_divm(g: &mut X86, k: u64, rem: bool) -> u64 {
@@ -4288,6 +4555,51 @@ fn ix_divm(g: &mut X86, k: u64, rem: bool) -> u64 {
     return 0;
   }
   return m;
+}
+
+/// Is the instruction at `j`, after the loop spanning `lp` to `hi`, in a block
+/// that begins at a label only branches from inside the loop name and that a
+/// jump or a return ends just before (so nothing falls into it)?
+fn ix_cold_of(f: &IrFn, lpos: &Vec[u64], lp: u64, hi: u64, j: u64) -> bool {
+  let n = vec_len(f.ins);
+  if j >= n {
+    return false;
+  }
+  // The label that starts the block.
+  let mut t = j;
+  let mut found = false;
+  while !found && t > hi && t < n {
+    let tq = vec_get(f.ins, t);
+    if tq.op == IR_LABEL {
+      found = true;
+    } else {
+      t = wrap_sub(t, 1);
+    }
+  }
+  if !found || t <= hi || t == 0 || t >= n {
+    return false;
+  }
+  let pv = vec_get(f.ins, t - 1);
+  if pv.op != IR_JMP && pv.op != IR_BR && pv.op != IR_RET && pv.op != IR_UNREACH {
+    return false;
+  }
+  let lq = vec_get(f.ins, t);
+  let mut ok = true;
+  let mut k = 0;
+  while k < n && ok {
+    if k < lp || k > hi {
+      let r = vec_get(f.ins, k);
+      if (r.op == IR_JMP && r.a == lq.a) || (r.op == IR_BR && (r.b == lq.a || r.c == lq.a)) {
+        // A jump to the block from outside the loop must come from the
+        // block's own stretch (a loop inside it).
+        if k < t || k > j {
+          ok = false;
+        }
+      }
+    }
+    k = wrap_add(k, 1);
+  }
+  return ok;
 }
 
 /// Where to make a value that the loop spanning positions `lp` to `hi` (its
@@ -4322,7 +4634,11 @@ fn ix_hoist_at(f: &IrFn, lpos: &Vec[u64], lp: u64, hi: u64) -> u64 {
       }
       if into {
         if j > hi {
-          ok = false;
+          // Allowed from a block placed after the loop that only the loop
+          // branches to and that nothing falls into (a rarely taken arm).
+          if !ix_cold_of(f, lpos, lp, hi, j) {
+            ok = false;
+          }
         } else if e0 == IR_NONE {
           e0 = j;
         }
@@ -5450,6 +5766,10 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
   }
   iropt_bits(&mut f);
   iropt_licm(&mut f);
+  if ix_divisible(&mut f, m) > 0 {
+    iropt_copies(&mut f);
+    iropt_dce(&mut f);
+  }
   if iropt_vlen(&mut f) > 0 {
     iropt_copies(&mut f);
     iropt_dce(&mut f);
@@ -5478,6 +5798,10 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
     iropt_labels(&mut f);
   }
   if ix_incr(&mut f) > 0 {
+    iropt_dce(&mut f);
+  }
+  if g.target != TARGET_KERNEL && ix_copy16(&mut f) > 0 {
+    iropt_copies(&mut f);
     iropt_dce(&mut f);
   }
   ix_sinkld(&mut f);
