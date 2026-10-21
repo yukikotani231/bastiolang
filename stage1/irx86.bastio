@@ -1272,6 +1272,20 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
       w_s(&mut out, "\n");
       return;
     }
+    if op == IR_SUB && !wrap && ld.k == IXK_REG && la.k == IXK_IMM && ix_fits(la.imm) && lb0.k == IXK_REG && lb0.reg == ld.reg {
+      // `d = imm - d`: negate d, then add imm (`0 - d` is the negation alone).
+      w_s(&mut out, "\tneg ");
+      w_s(&mut out, x86_rname(ld.reg));
+      w_s(&mut out, "\n");
+      if la.imm != 0 {
+        w_s(&mut out, "\tadd ");
+        ix_w_imm(&mut out, la.imm);
+        w_s(&mut out, ", ");
+        w_s(&mut out, x86_rname(ld.reg));
+        w_s(&mut out, "\n");
+      }
+      return;
+    }
     if op == IR_SUB && !wrap && ld.k == IXK_REG && la.k == IXK_REG && lb0.k == IXK_REG && lb0.reg == ld.reg && la.reg != ld.reg {
       // `d = a - d`: negate d and add a, not a move through %rax.
       w_s(&mut out, "\tneg ");
@@ -2619,6 +2633,43 @@ fn ix_emit_cmov(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, nuse: &Vec[u64], n: 
   return ix_sel_pos(f, al, nuse, n, 3);
 }
 
+/// `t = mul a, 3|5|9` (no wrap) and the `d = add t, imm` after it (constants
+/// that stand as immediates may lie between), `t` read by that `add` alone,
+/// `a` and `d` in registers: the position of the `add`, for one
+/// `lea imm(a, a, 2|4|8)`; IR_NONE if it is not so.
+fn ix_mul_lea(f: &IrFn, al: &IrAlloc, nuse: &Vec[u64], i: u64) -> u64 {
+  let q = ix_at(f, i);
+  if q.op != IR_MUL || q.c != 0 || q.d >= vec_len(nuse) || u_at(nuse, q.d) != 1 {
+    return IR_NONE;
+  }
+  let mut j = wrap_add(i, 1);
+  let mut nq = ix_at(f, j);
+  let mut nl = ix_loc(al, nq.d);
+  while nq.op == IR_CONST && nl.k == IXK_IMM && j < wrap_add(i, 4) {
+    j = wrap_add(j, 1);
+    nq = ix_at(f, j);
+    nl = ix_loc(al, nq.d);
+  }
+  if nq.op != IR_ADD || nq.c != 0 || nq.a != q.d || nq.b == q.d {
+    return IR_NONE;
+  }
+  let mut la = ix_loc(al, q.a);
+  let mut lm = ix_loc(al, q.b);
+  if la.k == IXK_IMM {
+    lm = la;
+    la = ix_loc(al, q.b);
+  }
+  let lb = ix_loc(al, nq.b);
+  let ld = ix_loc(al, nq.d);
+  if la.k != IXK_REG || ld.k != IXK_REG || lm.k != IXK_IMM || lb.k != IXK_IMM {
+    return IR_NONE;
+  }
+  if (lm.imm == 3 || lm.imm == 5 || lm.imm == 9) && lb.imm <= 2147483647 {
+    return j;
+  }
+  return IR_NONE;
+}
+
 /// Whether instruction `i` is an `and` of a register with an immediate (or a
 /// `%` by 2) that only a comparison for equality with zero, then the branch on
 /// it, read (constants that stand as immediates may lie between): the index of
@@ -3108,6 +3159,29 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       w_s(&mut out, x86_rname(ld.reg));
       w_s(&mut out, "\n");
       i = i + 1;
+    } else if ix_mul_lea(f, al, nuse, i) != IR_NONE {
+      // `3 * x + 1` and the like: one lea.
+      let aq = ix_at(f, ix_mul_lea(f, al, nuse, i));
+      let mut lm = ix_loc(al, q.b);
+      let mut la = ix_loc(al, q.a);
+      if la.k == IXK_IMM {
+        lm = la;
+        la = ix_loc(al, q.b);
+      }
+      let lb = ix_loc(al, aq.b);
+      let ld = ix_loc(al, aq.d);
+      w_s(&mut out, "\tlea ");
+      w_num(&mut out, lb.imm);
+      w_s(&mut out, "(");
+      w_s(&mut out, x86_rname(la.reg));
+      w_s(&mut out, ", ");
+      w_s(&mut out, x86_rname(la.reg));
+      w_s(&mut out, ", ");
+      w_num(&mut out, wrap_sub(lm.imm, 1));
+      w_s(&mut out, "), ");
+      w_s(&mut out, x86_rname(ld.reg));
+      w_s(&mut out, "\n");
+      i = ix_mul_lea(f, al, nuse, i);
     } else if ix_cmov_n(f, al, nuse, i) > 0 {
       // A select (or two that share the mask) by a comparison, which
       // `iropt_ifconv` wrote as `d = ve ^ ((vt ^ ve) & -(a ? b))`: the flags
