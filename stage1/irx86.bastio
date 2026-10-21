@@ -2949,11 +2949,13 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
         }
       }
     } else if hq.op == IR_BR {
-      if u_at(lpos, hq.b) != 0 && u_at(lpos, hq.b) <= z {
-        ra_set(&mut heads, hq.b, 1);
+      // Reached by a branch back (not a jump): aligned only when no
+      // instruction falls into it, else the padding runs on every pass.
+      if u_at(lpos, hq.b) != 0 && u_at(lpos, hq.b) <= z && u_at(heads, hq.b) == 0 {
+        ra_set(&mut heads, hq.b, 2);
       }
-      if u_at(lpos, hq.c) != 0 && u_at(lpos, hq.c) <= z {
-        ra_set(&mut heads, hq.c, 1);
+      if u_at(lpos, hq.c) != 0 && u_at(lpos, hq.c) <= z && u_at(heads, hq.c) == 0 {
+        ra_set(&mut heads, hq.c, 2);
       }
     }
     z = z + 1;
@@ -3060,7 +3062,8 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
         sk_k = lkk.imm;
       }
     } else if q.op == IR_LABEL {
-      if u_at(heads, q.a) == 1 {
+      let pq = ix_at(f, wrap_sub(i, 1));
+      if u_at(heads, q.a) == 1 || (u_at(heads, q.a) == 2 && (i == 0 || pq.op == IR_JMP || pq.op == IR_RET || pq.op == IR_UNREACH)) {
         w_s(&mut out, "\t.p2align 4\n");
       }
       ix_lbl(&mut out, f.x, q.a);
@@ -6295,6 +6298,7 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
   ix_fwd(&mut f);
   ix_arms(&mut f);
   iropt_coldarm(&mut f);
+  iropt_taildup(&mut f);
   ix_divhoist(&mut f, &mut g);
   let xi = inst_at(m, x);
   let pos = ix_positions(&mut g, c, &mut m, p, x);
