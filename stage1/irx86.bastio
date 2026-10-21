@@ -313,6 +313,16 @@ fn ix_aprep(out: &mut Vec[u64], al: &IrAlloc, a: u64, b: u64, disp: u64) -> IxA 
   return IxA { rb: rb, ri: ix_use(&mut out, al, b, XR_RDI), imm: 0, sw: sw, disp: disp };
 }
 
+/// Writes a signed number held as a two's complement word.
+fn ix_w_snum(out: &mut Vec[u64], v: u64) {
+  if v >= 9223372036854775808 {
+    w_s(&mut out, "-");
+    w_num(&mut out, wrap_sub(0, v));
+  } else {
+    w_num(&mut out, v);
+  }
+}
+
 fn ix_awrite(out: &mut Vec[u64], ap: IxA, size: u64) {
   if ap.sw != 0 {
     // A frame slot: one signed displacement off the frame register.
@@ -321,12 +331,7 @@ fn ix_awrite(out: &mut Vec[u64], ap: IxA, size: u64) {
       up = wrap_mul(ap.disp, size);
     }
     let down = wrap_mul(8, ap.sw);
-    if up >= down {
-      w_num(&mut out, wrap_sub(up, down));
-    } else {
-      w_s(&mut out, "-");
-      w_num(&mut out, wrap_sub(down, up));
-    }
+    ix_w_snum(&mut out, wrap_sub(up, down));
     if ap.ri == 0 {
       w_s(&mut out, "(%fp)");
     } else {
@@ -344,7 +349,7 @@ fn ix_awrite(out: &mut Vec[u64], ap: IxA, size: u64) {
     w_s(&mut out, ")");
   } else {
     if ap.disp != 0 {
-      w_num(&mut out, wrap_mul(ap.disp, size));
+      ix_w_snum(&mut out, wrap_mul(ap.disp, size));
     }
     ix_w_addr(&mut out, ap.rb, ap.ri, size);
   }
@@ -3445,7 +3450,7 @@ fn ix_addr_fold(f: &mut IrFn) -> u64 {
   let mut i = 0;
   while i < n {
     let q = vec_get(f.ins, i);
-    if q.op == IR_ADD && q.c != 1 && q.ty == 0 && q.d != IR_NONE && q.d < f.nreg && u_at(ndef, q.d) == 1 && u_at(nuse, q.d) == 1 {
+    if (q.op == IR_ADD || q.op == IR_SUB) && q.c != 1 && q.ty == 0 && q.d != IR_NONE && q.d < f.nreg && u_at(ndef, q.d) == 1 && u_at(nuse, q.d) == 1 {
       let ka = u_at(cv, q.a);
       let kb = u_at(cv, q.b);
       let mut x = IR_NONE;
@@ -3453,11 +3458,15 @@ fn ix_addr_fold(f: &mut IrFn) -> u64 {
       if ka == IR_NONE && kb != IR_NONE {
         x = q.a;
         k = kb;
-      } else if ka != IR_NONE && kb == IR_NONE {
+      } else if ka != IR_NONE && kb == IR_NONE && q.op == IR_ADD {
         x = q.b;
         k = ka;
       }
       if x != IR_NONE && x != q.d && k != 0 && k < 134217728 {
+        // `x - K` is the displacement -K, kept as a two's complement word.
+        if q.op == IR_SUB {
+          k = wrap_sub(0, k);
+        }
         let mut j = wrap_add(i, 1);
         let mut going = true;
         while going && j < n && j < wrap_add(i, 8) {
@@ -3566,7 +3575,7 @@ fn ix_addr_fold2(f: &mut IrFn) -> u64 {
   i = 0;
   while i < n {
     let q = vec_get(f.ins, i);
-    if q.op == IR_ADD && q.c != 1 && q.ty == 0 && q.d != IR_NONE && q.d < f.nreg && u_at(ndef, q.d) == 1 && u_at(nuse, q.d) >= 2 {
+    if (q.op == IR_ADD || q.op == IR_SUB) && q.c != 1 && q.ty == 0 && q.d != IR_NONE && q.d < f.nreg && u_at(ndef, q.d) == 1 && u_at(nuse, q.d) >= 2 {
       let ka = u_at(cv, q.a);
       let kb = u_at(cv, q.b);
       let mut x = IR_NONE;
@@ -3574,11 +3583,15 @@ fn ix_addr_fold2(f: &mut IrFn) -> u64 {
       if ka == IR_NONE && kb != IR_NONE {
         x = q.a;
         k = kb;
-      } else if ka != IR_NONE && kb == IR_NONE {
+      } else if ka != IR_NONE && kb == IR_NONE && q.op == IR_ADD {
         x = q.b;
         k = ka;
       }
       if x != IR_NONE && x != q.d && k != 0 && k < 134217728 {
+        // `x - K` is the displacement -K, kept as a two's complement word.
+        if q.op == IR_SUB {
+          k = wrap_sub(0, k);
+        }
         let mut users = vec_new[u64]();
         let mut going = true;
         let mut j = wrap_add(i, 1);
