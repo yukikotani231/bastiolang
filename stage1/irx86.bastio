@@ -1219,6 +1219,23 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
     if ld.k == IXK_REG && !wrap && !(lb0.k == IXK_REG && lb0.reg == ld.reg) {
       t = ld.reg;
     }
+    if (op == IR_ADD || op == IR_SUB || op == IR_AND || op == IR_OR || op == IR_XOR) && !wrap && ld.k == IXK_MEM && ix_same(la, ld)
+       && (lb0.k == IXK_REG || (lb0.k == IXK_IMM && ix_fits(lb0.imm))) {
+      // `d = d op x` of a spilled d: one instruction on the frame word, not a
+      // load, the operation and a store through %rax.
+      w_s(&mut out, "\t");
+      w_s(&mut out, alu);
+      if lb0.k == IXK_IMM {
+        w_s(&mut out, "q ");
+      } else {
+        w_s(&mut out, " ");
+      }
+      ix_op(&mut out, lb0);
+      w_s(&mut out, ", ");
+      ix_op(&mut out, ld);
+      w_s(&mut out, "\n");
+      return;
+    }
     if op == IR_MUL && !wrap && ld.k == IXK_REG && lb0.k == IXK_IMM && ix_fits(lb0.imm) && la.k != IXK_IMM {
       // `d = a * imm`: the three-operand form, with no move first.
       w_s(&mut out, "\timul ");
