@@ -2130,9 +2130,14 @@ fn ix_jcc(out: &mut Vec[u64], op: u64, x: u64, l: u64) {
 }
 
 /// The jumps of a branch whose condition `op` is already in the flags.
-fn ix_br_flags(out: &mut Vec[u64], x: u64, op: u64, then: u64, els: u64, next: u64) {
+fn ix_br_flags(out: &mut Vec[u64], x: u64, op: u64, then: u64, els: u64, next: u64, cur: u64) {
   if next == then {
     ix_jcc(&mut out, ix_not(op), x, els);
+  } else if next != els && els == cur && then != cur {
+    // A block that is its own loop: the way back is the one jump taken
+    // while it goes round, the way out the one taken once.
+    ix_jcc(&mut out, ix_not(op), x, els);
+    ix_jump(&mut out, "jmp", x, then);
   } else {
     ix_jcc(&mut out, op, x, then);
     if next != els {
@@ -2946,6 +2951,22 @@ fn ix_pick_next(f: &IrFn, i: u64, then: u64, els: u64) -> u64 {
   return IR_NONE;
 }
 
+/// The label of the block that holds instruction `i` (`IR_NONE` if none is
+/// within reach).
+fn ix_cur_label(f: &IrFn, i: u64) -> u64 {
+  let mut j = i;
+  let mut n = 0;
+  while j > 0 && n < 64 {
+    j = wrap_sub(j, 1);
+    let q = ix_at(f, j);
+    if q.op == IR_LABEL {
+      return q.a;
+    }
+    n = n + 1;
+  }
+  return IR_NONE;
+}
+
 /// Instruction `i` of `f` (an instruction of op 0 past the end).
 fn ix_at(f: &IrFn, i: u64) -> IrIns {
   if i < vec_len(f.ins) {
@@ -3199,16 +3220,16 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       let falls = ix_label_run_has(f, i + 1, q.a);
       if lp0 != 0 && h1.op == IR_BR && !falls {
         ix_cmp_zero(&mut out, al, h1.a);
-        ix_br_flags(&mut out, f.x, IR_NE, h1.b, h1.c, ix_pick_next(f, i + 1, h1.b, h1.c));
+        ix_br_flags(&mut out, f.x, IR_NE, h1.b, h1.c, ix_pick_next(f, i + 1, h1.b, h1.c), ix_cur_label(f, i + 1));
       } else if lp0 != 0 && ix_is_cmp(h1.op) && h2.op == IR_BR && h2.a == h1.d && u_at(nuse, h1.d) == 1 && !falls {
         let cop = ix_cmp_br(&mut out, al, h1.a, h1.b, h1.op);
-        ix_br_flags(&mut out, f.x, cop, h2.b, h2.c, ix_pick_next(f, i + 1, h2.b, h2.c));
+        ix_br_flags(&mut out, f.x, cop, h2.b, h2.c, ix_pick_next(f, i + 1, h2.b, h2.c), ix_cur_label(f, i + 1));
       } else if !falls {
         ix_jump(&mut out, "jmp", f.x, q.a);
       }
     } else if q.op == IR_BR {
       ix_cmp_zero(&mut out, al, q.a);
-      ix_br_flags(&mut out, f.x, IR_NE, q.b, q.c, ix_pick_next(f, i + 1, q.b, q.c));
+      ix_br_flags(&mut out, f.x, IR_NE, q.b, q.c, ix_pick_next(f, i + 1, q.b, q.c), ix_cur_label(f, i + 1));
     } else if (q.op == IR_XOR || q.op == IR_OR || q.op == IR_AND) && ix_rotprodj(f, al, m, ub, nuse, i) != 0 {
       // The word of a rotation made in the register the rotation overwrites.
       let rt = ix_rotprod(f, al, m, ub, nuse, i);
@@ -3345,7 +3366,7 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
         ix_awrite(&mut out, ap, sz);
       }
       w_s(&mut out, "\n");
-      ix_br_flags(&mut out, f.x, op, br.b, br.c, ix_pick_next(f, wrap_add(j, 2), br.b, br.c));
+      ix_br_flags(&mut out, f.x, op, br.b, br.c, ix_pick_next(f, wrap_add(j, 2), br.b, br.c), ix_cur_label(f, j));
       i = wrap_add(j, 1);
     } else if ix_test_br(f, al, nuse, i) != 0 {
       // `x & mask` (or `x % 2`) that only a comparison with zero and the branch read: `test`.
@@ -3358,7 +3379,7 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
         mask = ix_il(1);
       }
       ix_ins2(&mut out, "test", mask, la);
-      ix_br_flags(&mut out, f.x, cm.op, br.b, br.c, ix_pick_next(f, wrap_add(j, 2), br.b, br.c));
+      ix_br_flags(&mut out, f.x, cm.op, br.b, br.c, ix_pick_next(f, wrap_add(j, 2), br.b, br.c), ix_cur_label(f, j));
       i = wrap_add(j, 1);
     } else if q.op == IR_LOAD && ix_load_alu(f, al, m, nuse, i) {
       let ld = ix_loc(al, nq.d);
@@ -3472,12 +3493,12 @@ fn ix_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       w_s(&mut out, ", ");
       w_s(&mut out, ix_name8(lo.reg));
       w_s(&mut out, "\n");
-      ix_br_flags(&mut out, f.x, cq.op, bq.b, bq.c, ix_pick_next(f, i + 3, bq.b, bq.c));
+      ix_br_flags(&mut out, f.x, cq.op, bq.b, bq.c, ix_pick_next(f, i + 3, bq.b, bq.c), ix_cur_label(f, i + 3));
       i = i + 2;
     } else if ix_is_cmp(q.op) && nq.op == IR_BR && nq.a == q.d && u_at(nuse, q.d) == 1 {
       // A comparison that only the branch after it reads: no boolean.
       let cop = ix_cmp_br(&mut out, al, q.a, q.b, q.op);
-      ix_br_flags(&mut out, f.x, cop, nq.b, nq.c, ix_pick_next(f, i + 2, nq.b, nq.c));
+      ix_br_flags(&mut out, f.x, cop, nq.b, nq.c, ix_pick_next(f, i + 2, nq.b, nq.c), ix_cur_label(f, i + 2));
       i = i + 1;
     } else if q.op == IR_RET && q.c > 0 {
       // A result of more than two words goes to the space the caller reserved.
