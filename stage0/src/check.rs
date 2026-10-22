@@ -98,6 +98,7 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("frame_write8", Avail::Mem, vec![m(Frame), U64, U8], Unit),
         ("frame_to_bytes", Avail::Mem, vec![m(Bytes), U64, r(Frame), U64, U64], Unit),
         ("bytes_to_frame", Avail::Mem, vec![m(Frame), U64, r(Bytes), U64, U64], Unit),
+        ("frame_to_frame", Avail::Mem, vec![m(Frame), U64, r(Frame), U64, U64], Unit),
         ("pt_new", Avail::Mem, vec![Frame, U64], PageTable),
         ("pt_free", Avail::Mem, vec![PageTable], Frame),
         ("pt_free_root", Avail::Kernel, vec![r(Mmu), PageTable], Frame),

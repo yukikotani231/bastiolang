@@ -75,6 +75,9 @@ What will be 0.2.0.
   between and within `Bytes`, `frame_to_bytes` / `bytes_to_frame` for pages
   and `dma_to_bytes` / `bytes_to_dma` for lent pages. The prover knows what
   `bcopy` and `bmove` copy; page contents stay untracked (#91).
+- `frame_to_frame` copies a range of one page into another in a single copy,
+  proved in bounds like the other bulk copies, so a kernel can move file data
+  from a cached page to a user page without staging it in a buffer.
 - `Dirty` pages: `pool_take_dirty` takes a page without zeroing it, and it
   becomes a `Frame` only by being overwritten whole (`dirty_zero`,
   `frame_copy`, `shared_copy`, or `dirty_fill` from a page's worth of
