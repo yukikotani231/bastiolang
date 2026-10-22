@@ -51,6 +51,7 @@ A [Language Server Protocol](https://microsoft.github.io/language-server-protoco
 | Completion | Triggered by `.` and `:` (or any word): the locals declared earlier in the function, the definitions of the file and its imports, and the keywords; after `.` the fields of every struct, after `::` the variants (of the enum named before it, when it is known), and between the braces of `Name { ... }` that struct's fields. Nothing in a comment or a string. Types are not inferred, so `.` offers every field; a local is offered from its declaration to the end of the function, whether or not its block has closed |
 | Signature help | Inside the parentheses of a call to a function, `spec fn` or variant: the signature, its parameters with the one under the cursor marked, and the `///` doc comment |
 | Hover | The signature (the whole definition for a type) and the `///` doc comment above it; for a local variable, its `let` or parameter |
+| Workspace symbols | `vim.lsp.buf.workspace_symbol()` searches the definitions (and variants and fields) of every open document and the files they import; the query's letters must appear in order in the name, case ignored. At most 500 results |
 | Document symbols | Top-level definitions, with variants and fields as children |
 | Formatting | The whole document, with `bastiofmt`'s rules |
 
@@ -91,4 +92,4 @@ Then `vim.lsp.buf.hover()`, `vim.lsp.buf.definition()` (`<C-]>` works through `t
 
 ### Tests
 
-`tests/tools.sh` runs `tools/bastio-lsp/test/lsp_test.py`, which speaks the protocol to the server (hover, definitions in the file and in an imported one, references, highlights, rename, completion, signature help, symbols, formatting, diagnostics with their ranges, malformed input), and, when `nvim` is installed, `editors/vim/test/nvim_test.lua`, which does the same from headless Neovim through the plugin.
+`tests/tools.sh` runs `tools/bastio-lsp/test/lsp_test.py`, which speaks the protocol to the server (hover, definitions in the file and in an imported one, references, highlights, rename, completion, signature help, symbols, workspace symbols, formatting, diagnostics with their ranges, malformed input), and, when `nvim` is installed, `editors/vim/test/nvim_test.lua`, which does the same from headless Neovim through the plugin.
