@@ -533,7 +533,16 @@ resp, notes, rc = session([
     ("textDocument/didOpen", {"textDocument": {"uri": fu, "languageId": "bastio", "version": 1, "text": src}}, False),
     ("textDocument/foldingRange", {"textDocument": {"uri": fu}}, True),
     ("textDocument/documentLink", {"textDocument": {"uri": fu}}, True),
+    ("textDocument/selectionRange", {"textDocument": {"uri": fu}, "positions": [{"line": 6, "character": 12}]}, True),
 ])
+sel = []
+node = resp[103]["result"][0]
+while node:
+    r = node["range"]
+    sel.append((r["start"]["line"], r["start"]["character"], r["end"]["line"], r["end"]["character"]))
+    node = node.get("parent")
+want = [(6, 11, 6, 12), (5, 12, 7, 2), (5, 11, 7, 3), (3, 18, 9, 0), (3, 17, 9, 1), (0, 0, 13, 0)]
+check(sel == want, "selection ranges: %r" % sel)
 folds = sorted((f["startLine"], f["endLine"], f.get("kind", "")) for f in resp[101]["result"])
 check(folds == [(1, 2, "comment"), (3, 8, ""), (5, 6, ""), (10, 11, "")], "folding ranges: %r" % folds)
 links = resp[102]["result"]
