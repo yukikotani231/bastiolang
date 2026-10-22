@@ -1555,6 +1555,51 @@ fn on_symbols(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64
   vec_free(res_);
 }
 
+/// A lens with the number of references over each top-level function,
+/// struct and enum of the document; the title is all it carries.
+fn on_codelens(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
+  let params = jget(j, root, "params");
+  let uri = str_of(j, jpath2(j, params, "textDocument", "uri"));
+  let k = find_doc(&mut st, uri);
+  bfree(uri);
+  let mut res_ = vec_new[u64]();
+  w_s(&mut res_, "[");
+  if k > 0 {
+    let path = doc_copy(&mut st.paths, k - 1);
+    let ix = pg_for(host, &mut st, path);
+    bfree(path);
+    let mut first = true;
+    let mut d = 0;
+    while d < vec_len(ix.defs) && d < 100000
+    {
+      let df = vec_get(ix.defs, d);
+      if df.file == 0 && df.parent == 0 {
+        let mut h = hits_new();
+        collect_refs(&mut h, &mut st, ix, Res { found: true, local: false, idx: d }, false, true);
+        if !first {
+          vec_push(&mut res_, 44);
+        }
+        w_s(&mut res_, "{\"range\":");
+        w_range(&mut res_, ix.all, u_at(ix.fstart, 0), df.ns, df.ne);
+        w_s(&mut res_, ",\"command\":{\"title\":\"");
+        w_num(&mut res_, vec_len(h.huri));
+        if vec_len(h.huri) == 1 {
+          w_s(&mut res_, " reference\",\"command\":\"\"}}");
+        } else {
+          w_s(&mut res_, " references\",\"command\":\"\"}}");
+        }
+        first = false;
+        hits_free(h);
+      }
+      d = vadd(d, 1);
+    }
+    pg_free(ix);
+  }
+  w_s(&mut res_, "]");
+  send_result(&mut con, id, res_);
+  vec_free(res_);
+}
+
 /// Does `all[s..e]` hold the letters of `q` in order, ignoring case?
 fn fuzzy_match(all: &Bytes, s: u64, e: u64, q: &Bytes) -> bool {
   let mut qi = 0;
@@ -2065,7 +2110,7 @@ fn on_initialize(con: &mut Serial, st: &mut State, j: &Json, root: u64, id: &Vec
   }
   let mut res_ = vec_new[u64]();
   w_s(&mut res_, "{\"capabilities\":{\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":{\"includeText\":false}},");
-  w_s(&mut res_, "\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"documentHighlightProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"completionProvider\":{\"triggerCharacters\":[\".\",\":\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"function\",\"struct\",\"enum\",\"enumMember\",\"property\",\"variable\",\"parameter\"],\"tokenModifiers\":[\"declaration\",\"readonly\"]},\"full\":true},\"documentFormattingProvider\":true,\"inlayHintProvider\":true,\"foldingRangeProvider\":true,\"selectionRangeProvider\":true,\"documentLinkProvider\":{},\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\"]}},");
+  w_s(&mut res_, "\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"documentHighlightProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"completionProvider\":{\"triggerCharacters\":[\".\",\":\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"function\",\"struct\",\"enum\",\"enumMember\",\"property\",\"variable\",\"parameter\"],\"tokenModifiers\":[\"declaration\",\"readonly\"]},\"full\":true},\"documentFormattingProvider\":true,\"inlayHintProvider\":true,\"foldingRangeProvider\":true,\"selectionRangeProvider\":true,\"codeLensProvider\":{},\"documentLinkProvider\":{},\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\"]}},");
   w_s(&mut res_, "\"serverInfo\":{\"name\":\"bastio-lsp\"}}");
   send_result(&mut con, id, res_);
   vec_free(res_);
@@ -2146,6 +2191,8 @@ fn handle(con: &mut Serial, host: &mut Host, st: &mut State, msg: Bytes) -> u64 
       on_symbols(&mut con, host, &mut st, p.j, root, id);
     } else if vec_is(method, "textDocument/foldingRange") {
       on_folding(&mut con, host, &mut st, p.j, root, id);
+    } else if vec_is(method, "textDocument/codeLens") {
+      on_codelens(&mut con, host, &mut st, p.j, root, id);
     } else if vec_is(method, "textDocument/selectionRange") {
       on_selection(&mut con, host, &mut st, p.j, root, id);
     } else if vec_is(method, "textDocument/documentLink") {
