@@ -23,6 +23,9 @@
 //     value is a call, a struct literal or a variant;
 //   - folding ranges (blocks and runs of comments) and links from imports
 //     to the files they name;
+//   - selection ranges (expand the selection token, brackets, file), the
+//     number of references over each top-level item (code lenses) and the
+//     call hierarchy of functions;
 //   - formatting, with bastiofmt's rules.
 //
 // Options (`initializationOptions`): `bastioc` (the compiler, default
@@ -38,6 +41,7 @@ import "semantic.bastio";
 import "actions.bastio";
 import "inlay.bastio";
 import "ranges.bastio";
+import "calls.bastio";
 
 struct State {
   uris: Vec[Bytes],
@@ -1555,6 +1559,143 @@ fn on_symbols(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64
   vec_free(res_);
 }
 
+/// The call hierarchy item of function `d`; `doc` is the URI of the open
+/// document whose program holds it, and `data` lets later requests find it.
+fn w_call_item(out: &mut Vec[u64], st: &mut State, ix: &Prog, d: u64, doc: &Bytes) {
+  let df = def_at(ix, d);
+  let from = u_at(ix.fstart, df.file);
+  let uri = pg_uri(&mut st, ix, df.file);
+  w_s(&mut out, "{\"name\":\"");
+  jesc_bytes(&mut out, ix.all, df.ns, df.ne);
+  w_s(&mut out, "\",\"kind\":12,\"uri\":\"");
+  jesc_bytes(&mut out, uri, 0, blen(uri));
+  w_s(&mut out, "\",\"range\":");
+  w_range(&mut out, ix.all, from, df.ss, df.ie);
+  w_s(&mut out, ",\"selectionRange\":");
+  w_range(&mut out, ix.all, from, df.ns, df.ne);
+  w_s(&mut out, ",\"data\":{\"doc\":\"");
+  jesc_bytes(&mut out, doc, 0, blen(doc));
+  w_s(&mut out, "\",\"ns\":");
+  w_num(&mut out, df.ns);
+  w_s(&mut out, "}}");
+  bfree(uri);
+}
+
+fn on_prepare_calls(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
+  let params = jget(j, root, "params");
+  let f = locate(host, &mut st, j, params);
+  let mut res_ = vec_new[u64]();
+  let mut is_fn = false;
+  if f.res.found && !f.res.local {
+    let fd = def_at(f.ix, f.res.idx);
+    is_fn = fd.kind == DK_FN;
+  }
+  if is_fn {
+    let doc = str_of(j, jpath2(j, params, "textDocument", "uri"));
+    w_s(&mut res_, "[");
+    w_call_item(&mut res_, &mut st, f.ix, f.res.idx, doc);
+    w_s(&mut res_, "]");
+    bfree(doc);
+  } else {
+    w_s(&mut res_, "null");
+  }
+  send_result(&mut con, id, res_);
+  vec_free(res_);
+  pg_free(f.ix);
+}
+
+/// Incoming or outgoing calls of the function an item names: the item's
+/// `data` holds the open document whose program to look in.
+fn on_calls(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64], incoming: bool) {
+  let params = jget(j, root, "params");
+  let data = jpath2(j, params, "item", "data");
+  let doc = str_of(j, jget(j, data, "doc"));
+  let ns = jnum(j, jget(j, data, "ns"));
+  let k = find_doc(&mut st, doc);
+  let mut res_ = vec_new[u64]();
+  w_s(&mut res_, "[");
+  if k > 0 {
+    let path = doc_copy(&mut st.paths, k - 1);
+    let ix = pg_for(host, &mut st, path);
+    bfree(path);
+    let mut d = 0;
+    let mut found = false;
+    while d < vec_len(ix.defs) && !found
+    {
+      let df = vec_get(ix.defs, d);
+      if df.kind == DK_FN && df.ns == ns {
+        found = true;
+      } else {
+        d = vadd(d, 1);
+      }
+    }
+    if found {
+      let mut tr = vec_new[u64]();
+      if incoming {
+        calls_in(ix, d, &mut tr);
+      } else {
+        calls_out(ix, d, &mut tr);
+      }
+      let mut seen = vec_new[u64]();
+      let mut a = 0;
+      while vadd(a, 2) < vec_len(tr)
+      {
+        let who = u_at(tr, a);
+        let mut dup = false;
+        let mut q = 0;
+        while q < vec_len(seen)
+        {
+          if u_at(seen, q) == who {
+            dup = true;
+          }
+          q = vadd(q, 1);
+        }
+        if !dup {
+          if vec_len(seen) > 0 {
+            vec_push(&mut res_, 44);
+          }
+          vec_push(&mut seen, who);
+          if incoming {
+            w_s(&mut res_, "{\"from\":");
+          } else {
+            w_s(&mut res_, "{\"to\":");
+          }
+          w_call_item(&mut res_, &mut st, ix, who, doc);
+          w_s(&mut res_, ",\"fromRanges\":[");
+          let target = def_at(ix, d);
+          let mut file = target.file;
+          if incoming {
+            let caller = def_at(ix, who);
+            file = caller.file;
+          }
+          let mut b = 0;
+          let mut first = true;
+          while vadd(b, 2) < vec_len(tr)
+          {
+            if u_at(tr, b) == who {
+              if !first {
+                vec_push(&mut res_, 44);
+              }
+              w_range(&mut res_, ix.all, u_at(ix.fstart, file), u_at(tr, vadd(b, 1)), u_at(tr, vadd(b, 2)));
+              first = false;
+            }
+            b = vadd(b, 3);
+          }
+          w_s(&mut res_, "]}");
+        }
+        a = vadd(a, 3);
+      }
+      vec_free(seen);
+      vec_free(tr);
+    }
+    pg_free(ix);
+  }
+  w_s(&mut res_, "]");
+  bfree(doc);
+  send_result(&mut con, id, res_);
+  vec_free(res_);
+}
+
 /// A lens with the number of references over each top-level function,
 /// struct and enum of the document; the title is all it carries.
 fn on_codelens(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
@@ -2110,7 +2251,7 @@ fn on_initialize(con: &mut Serial, st: &mut State, j: &Json, root: u64, id: &Vec
   }
   let mut res_ = vec_new[u64]();
   w_s(&mut res_, "{\"capabilities\":{\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":{\"includeText\":false}},");
-  w_s(&mut res_, "\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"documentHighlightProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"completionProvider\":{\"triggerCharacters\":[\".\",\":\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"function\",\"struct\",\"enum\",\"enumMember\",\"property\",\"variable\",\"parameter\"],\"tokenModifiers\":[\"declaration\",\"readonly\"]},\"full\":true},\"documentFormattingProvider\":true,\"inlayHintProvider\":true,\"foldingRangeProvider\":true,\"selectionRangeProvider\":true,\"codeLensProvider\":{},\"documentLinkProvider\":{},\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\"]}},");
+  w_s(&mut res_, "\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"documentHighlightProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"completionProvider\":{\"triggerCharacters\":[\".\",\":\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"function\",\"struct\",\"enum\",\"enumMember\",\"property\",\"variable\",\"parameter\"],\"tokenModifiers\":[\"declaration\",\"readonly\"]},\"full\":true},\"documentFormattingProvider\":true,\"inlayHintProvider\":true,\"foldingRangeProvider\":true,\"selectionRangeProvider\":true,\"codeLensProvider\":{},\"callHierarchyProvider\":true,\"documentLinkProvider\":{},\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\"]}},");
   w_s(&mut res_, "\"serverInfo\":{\"name\":\"bastio-lsp\"}}");
   send_result(&mut con, id, res_);
   vec_free(res_);
@@ -2191,6 +2332,12 @@ fn handle(con: &mut Serial, host: &mut Host, st: &mut State, msg: Bytes) -> u64 
       on_symbols(&mut con, host, &mut st, p.j, root, id);
     } else if vec_is(method, "textDocument/foldingRange") {
       on_folding(&mut con, host, &mut st, p.j, root, id);
+    } else if vec_is(method, "textDocument/prepareCallHierarchy") {
+      on_prepare_calls(&mut con, host, &mut st, p.j, root, id);
+    } else if vec_is(method, "callHierarchy/incomingCalls") {
+      on_calls(&mut con, host, &mut st, p.j, root, id, true);
+    } else if vec_is(method, "callHierarchy/outgoingCalls") {
+      on_calls(&mut con, host, &mut st, p.j, root, id, false);
     } else if vec_is(method, "textDocument/codeLens") {
       on_codelens(&mut con, host, &mut st, p.j, root, id);
     } else if vec_is(method, "textDocument/selectionRange") {
