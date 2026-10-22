@@ -80,3 +80,82 @@ fn folding_ranges(ix: &Prog, out: &mut Vec[u64]) {
     ln = vadd(ln, 1);
   }
 }
+
+/// The selection ranges (innermost first, as start/end byte offset pairs in
+/// `chain`) around byte offset `off` of file 0: the token, then each
+/// enclosing bracket pair (its contents, then the pair), then the file.
+fn selection_chain(ix: &Prog, off: u64, chain: &mut Vec[u64]) {
+  let ts = u_at(ix.tstart, 0);
+  let te = file_toks_end(ix, 0);
+  let tk = tok_at_offset(ix, 0, off);
+  if tk.found {
+    let t = tok_at(ix.toks, tk.idx);
+    if t.kind != K_EOF {
+      vec_push(&mut chain, tok_start(t));
+      vec_push(&mut chain, tok_end(t));
+    }
+  }
+  let mut stack = vec_new[u64]();
+  let mut i = ts;
+  while i < te && i < vec_len(ix.toks)
+  {
+    let t = tok_at(ix.toks, i);
+    if is_opener(t) {
+      vec_push(&mut stack, i);
+    } else if is_closer(t) && vec_len(stack) > 0 {
+      let o = tok_at(ix.toks, vec_pop(&mut stack));
+      let s = tok_start(o);
+      let e = tok_end(t);
+      if s <= off && off <= e {
+        // The contents come first, when the cursor is not on a bracket.
+        if o.end <= off && off <= t.start && o.end < t.start {
+          vec_push(&mut chain, o.end);
+          vec_push(&mut chain, t.start);
+        }
+        vec_push(&mut chain, s);
+        vec_push(&mut chain, e);
+      }
+    }
+    i = vadd(i, 1);
+  }
+  vec_free(stack);
+  let mut n = blen(ix.all);
+  if vec_len(ix.fstart) > 1 && u_at(ix.fstart, 1) <= n {
+    n = u_at(ix.fstart, 1);
+  }
+  vec_push(&mut chain, 0);
+  vec_push(&mut chain, n);
+}
+
+/// One `SelectionRange` for byte offset `off`: each range of the chain that
+/// is strictly larger than the one before becomes the parent of that one.
+fn w_selection(out: &mut Vec[u64], ix: &Prog, off: u64) {
+  let mut chain = vec_new[u64]();
+  selection_chain(ix, off, &mut chain);
+  let mut open = 0;
+  let mut ps = 0;
+  let mut pe = 0;
+  let mut k = 0;
+  while vadd(k, 1) < vec_len(chain) && open < 100000
+  {
+    let s = u_at(chain, k);
+    let e = u_at(chain, vadd(k, 1));
+    if open == 0 || (s <= ps && pe <= e && (s < ps || pe < e)) {
+      if open > 0 {
+        w_s(&mut out, ",\"parent\":");
+      }
+      w_s(&mut out, "{\"range\":");
+      w_range(&mut out, ix.all, 0, s, e);
+      open = vadd(open, 1);
+      ps = s;
+      pe = e;
+    }
+    k = vadd(k, 2);
+  }
+  while open > 0
+  {
+    w_s(&mut out, "}");
+    open = open - 1;
+  }
+  vec_free(chain);
+}
