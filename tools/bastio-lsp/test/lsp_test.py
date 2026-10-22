@@ -299,6 +299,25 @@ check(resp[rid["nosig"]]["result"] is None, "no signature outside a call")
 s = resp[rid["sigvariant"]]["result"]
 check(s["signatures"][0]["label"] == "Line(u64)" and s["activeParameter"] == 0, "signature of a variant: %r" % s)
 
+# ---- Workspace symbols ----
+def wsym(q):
+    return ("workspace/symbol", {"query": q}, True)
+
+
+steps = [open_doc("main.bastio"), wsym("dbl"), wsym("LINE"), wsym(""), wsym("zzz")]
+resp, notes, rc = session(steps)
+check(resp[1]["result"]["capabilities"].get("workspaceSymbolProvider"), "capability for workspace symbols")
+r = resp[101]["result"]
+check(len(r) == 1 and r[0]["name"] == "double" and r[0]["kind"] == 12 and r[0]["location"]["uri"] == uri("lib.bastio")
+      and r[0]["location"]["range"]["start"] == where("lib.bastio", "double"),
+      "the letters of the query in order find a function in an imported file: %r" % r)
+r = resp[102]["result"]
+check([(x["name"], x.get("containerName")) for x in r] == [("Line", "Shape")], "case is ignored, a variant has its enum: %r" % r)
+names = sorted(x["name"] for x in resp[103]["result"])
+check(names == sorted(["main", "double", "Pair", "a", "b", "Shape", "Dot", "Line", "LIMIT"]),
+      "an empty query lists the definitions of the program once: %r" % names)
+check(resp[104]["result"] == [], "no match")
+
 # ---- Diagnostics ----
 resp, notes, rc = session([open_doc("bad.bastio")])
 d = notes[0]["params"]["diagnostics"]

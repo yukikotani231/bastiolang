@@ -65,6 +65,14 @@ if rename then
   vim.cmd('silent! undo')
 end
 
+-- Workspace symbols.
+local ws = vim.lsp.buf_request_sync(0, 'workspace/symbol', { query = 'dbl' }, 20000)
+local found = 0
+for _, r in pairs(ws or {}) do
+  found = #(r.result or {})
+end
+check(found == 1, 'workspace/symbol finds double: ' .. found)
+
 -- The diagnostic of the compiler appears after opening a file with an error.
 vim.cmd('edit ' .. dir .. '/bad.bastio')
 local got = vim.wait(30000, function()
