@@ -561,6 +561,12 @@ static inline bst_pt bst_pt_new(bst_frame f, uint64_t level) {
     return f;
 }
 static inline bst_frame bst_pt_free(bst_pt t) { return t; }
+/* Counts every entry taken out of any table, and every protection change: a processor whose TLB may
+ * still hold the entry reloads CR3 before it runs user code again if the
+ * count moved since its last load (bst_cpu_run, bst_mmu_enter). Putting an
+ * entry into an empty slot needs no reload: x86 caches no translation for
+ * a slot that was not present. */
+uint64_t bst_pt_gen;
 /* A last-level slot the program may not touch (pt_set_access 0) keeps its
  * page with the present bit clear, marked by a bit the CPU ignores in a
  * non-present entry, so the table still owns it. */
@@ -572,6 +578,7 @@ static inline void bst_pt_set_access(bst_pt *t, uint64_t i, uint64_t a) {
     uint64_t e = ((uint64_t *)*t)[i] & ~(BST_PTE_P | BST_PTE_W | BST_PTE_HIDDEN);
     e |= a == 0 ? BST_PTE_HIDDEN : (BST_PTE_P | (a == 2 ? BST_PTE_W : 0));
     __atomic_store_n(&((uint64_t *)*t)[i], e, __ATOMIC_RELEASE);
+    __atomic_fetch_add(&bst_pt_gen, 1, __ATOMIC_SEQ_CST);
 }
 /* Another processor may be walking the table (it holds a lease on the
  * tree), so an entry is written with one 64-bit store, present bit
@@ -593,12 +600,6 @@ static inline uint64_t bst_pt_lease_count(bst_pt *t) {
     bst_mmu_settle_on(*t);
     return __atomic_load_n(&bst_pt_leases[bst_frame_id(*t)], __ATOMIC_ACQUIRE);
 }
-/* Counts every entry taken out of any table: a processor whose TLB may
- * still hold the entry reloads CR3 before it runs user code again if the
- * count moved since its last load (bst_cpu_run, bst_mmu_enter). Putting an
- * entry into an empty slot needs no reload: x86 caches no translation for
- * a slot that was not present. */
-uint64_t bst_pt_gen;
 static inline uint64_t bst_pt_take(bst_pt *t, uint64_t i) {
     uint64_t *e = &((uint64_t *)*t)[i];
     uint64_t a = *e & BST_PTE_ADDR;

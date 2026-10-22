@@ -277,6 +277,12 @@ fn cg_prelude_pages(out: &mut Vec[u64]) {
   w_s(&mut out, "    return f;\n");
   w_s(&mut out, "}\n");
   w_s(&mut out, "static inline bst_frame bst_pt_free(bst_pt t) { return t; }\n");
+  w_s(&mut out, "/* Counts every entry taken out of any table, and every protection change: a processor whose TLB may\n");
+  w_s(&mut out, " * still hold the entry reloads CR3 before it runs user code again if the\n");
+  w_s(&mut out, " * count moved since its last load (bst_cpu_run, bst_mmu_enter). Putting an\n");
+  w_s(&mut out, " * entry into an empty slot needs no reload: x86 caches no translation for\n");
+  w_s(&mut out, " * a slot that was not present. */\n");
+  w_s(&mut out, "uint64_t bst_pt_gen;\n");
   w_s(&mut out, "/* A last-level slot the program may not touch (pt_set_access 0) keeps its\n");
   w_s(&mut out, " * page with the present bit clear, marked by a bit the CPU ignores in a\n");
   w_s(&mut out, " * non-present entry, so the table still owns it. */\n");
@@ -288,6 +294,7 @@ fn cg_prelude_pages(out: &mut Vec[u64]) {
   w_s(&mut out, "    uint64_t e = ((uint64_t *)*t)[i] & ~(BST_PTE_P | BST_PTE_W | BST_PTE_HIDDEN);\n");
   w_s(&mut out, "    e |= a == 0 ? BST_PTE_HIDDEN : (BST_PTE_P | (a == 2 ? BST_PTE_W : 0));\n");
   w_s(&mut out, "    __atomic_store_n(&((uint64_t *)*t)[i], e, __ATOMIC_RELEASE);\n");
+  w_s(&mut out, "    __atomic_fetch_add(&bst_pt_gen, 1, __ATOMIC_SEQ_CST);\n");
   w_s(&mut out, "}\n");
   w_s(&mut out, "/* Another processor may be walking the table (it holds a lease on the\n");
   w_s(&mut out, " * tree), so an entry is written with one 64-bit store, present bit\n");
@@ -309,12 +316,6 @@ fn cg_prelude_pages(out: &mut Vec[u64]) {
   w_s(&mut out, "    bst_mmu_settle_on(*t);\n");
   w_s(&mut out, "    return __atomic_load_n(&bst_pt_leases[bst_frame_id(*t)], __ATOMIC_ACQUIRE);\n");
   w_s(&mut out, "}\n");
-  w_s(&mut out, "/* Counts every entry taken out of any table: a processor whose TLB may\n");
-  w_s(&mut out, " * still hold the entry reloads CR3 before it runs user code again if the\n");
-  w_s(&mut out, " * count moved since its last load (bst_cpu_run, bst_mmu_enter). Putting an\n");
-  w_s(&mut out, " * entry into an empty slot needs no reload: x86 caches no translation for\n");
-  w_s(&mut out, " * a slot that was not present. */\n");
-  w_s(&mut out, "uint64_t bst_pt_gen;\n");
   w_s(&mut out, "static inline uint64_t bst_pt_take(bst_pt *t, uint64_t i) {\n");
   w_s(&mut out, "    uint64_t *e = &((uint64_t *)*t)[i];\n");
   w_s(&mut out, "    uint64_t a = *e & BST_PTE_ADDR;\n");
@@ -1498,7 +1499,7 @@ fn cg_prelude_pages_a64(out: &mut Vec[u64]) {
   w_s(&mut out, "    bst_mmu_settle_on(*t);\n");
   w_s(&mut out, "    return __atomic_load_n(&bst_pt_leases[bst_frame_id(*t)], __ATOMIC_ACQUIRE);\n");
   w_s(&mut out, "}\n");
-  w_s(&mut out, "/* Counts every entry taken out of any table: a processor whose TLB may\n");
+  w_s(&mut out, "/* Counts every entry taken out of any table, and every protection change: a processor whose TLB may\n");
   w_s(&mut out, " * still hold the entry flushes it before it runs user code again if the\n");
   w_s(&mut out, " * count moved since its last flush (bst_cpu_run, bst_mmu_enter). Putting an\n");
   w_s(&mut out, " * entry into an empty slot needs no flush: no translation is cached for an\n");
