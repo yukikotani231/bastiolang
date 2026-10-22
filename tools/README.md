@@ -46,6 +46,8 @@ A [Language Server Protocol](https://microsoft.github.io/language-server-protoco
 | --- | --- |
 | Diagnostics | The lexical error of the buffer as you type. When a file is opened or saved (with `checkOnChange`, on every edit too), the first error of `bastioc1 --check` on the text of the buffer: syntax, types, linearity and failed proofs, with the counterexample, at the position and width the compiler gives. A library file (no `main`) is checked through a program that only imports it |
 | Go to definition | Functions, `spec fn`s, structs, enums, constants, variants (`E::V`), fields (`x.f`), and local variables (`let`, parameters, `match` bindings, `forall` variables), in the file and in every file it imports (found as the compiler finds them, with `--lib` directories and `BASTIO_LIB`) |
+| References, highlights | `vim.lsp.buf.references()` lists every use of a definition or local, in the open documents and what they import; `documentHighlight` marks the uses in the buffer. Fields are found by name, including `Name { field: ... }` |
+| Rename | `vim.lsp.buf.rename()` renames a definition, variant, field or local in every open document that names it and in the files they import (a file that is neither open nor imported is not seen). The new name must be one identifier, not a keyword; collisions are left to the compiler's diagnostics |
 | Hover | The signature (the whole definition for a type) and the `///` doc comment above it; for a local variable, its `let` or parameter |
 | Document symbols | Top-level definitions, with variants and fields as children |
 | Formatting | The whole document, with `bastiofmt`'s rules |
@@ -83,8 +85,8 @@ vim.api.nvim_create_autocmd('FileType', {
 })
 ```
 
-Then `vim.lsp.buf.hover()`, `vim.lsp.buf.definition()` (`<C-]>` works through `tagfunc`), `vim.lsp.buf.document_symbol()` and `vim.lsp.buf.format()` are the usual Neovim calls (Neovim 0.10 maps `K` to hover by default), and the diagnostics appear as for any server.
+Then `vim.lsp.buf.hover()`, `vim.lsp.buf.definition()` (`<C-]>` works through `tagfunc`), `vim.lsp.buf.references()`, `vim.lsp.buf.rename()`, `vim.lsp.buf.document_symbol()` and `vim.lsp.buf.format()` are the usual Neovim calls (Neovim 0.10 maps `K` to hover by default), and the diagnostics appear as for any server.
 
 ### Tests
 
-`tests/tools.sh` runs `tools/bastio-lsp/test/lsp_test.py`, which speaks the protocol to the server (hover, definitions in the file and in an imported one, symbols, formatting, diagnostics with their ranges, malformed input), and, when `nvim` is installed, `editors/vim/test/nvim_test.lua`, which does the same from headless Neovim through the plugin.
+`tests/tools.sh` runs `tools/bastio-lsp/test/lsp_test.py`, which speaks the protocol to the server (hover, definitions in the file and in an imported one, references, highlights, rename, symbols, formatting, diagnostics with their ranges, malformed input), and, when `nvim` is installed, `editors/vim/test/nvim_test.lua`, which does the same from headless Neovim through the plugin.

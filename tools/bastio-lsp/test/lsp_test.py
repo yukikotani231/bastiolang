@@ -143,6 +143,78 @@ check([c["name"] for c in syms["Shape"]["children"]] == ["Dot", "Line"], "enum v
 check([c["name"] for c in syms["Pair"]["children"]] == ["a", "b"], "struct fields are children")
 check(resp[112]["result"] == [], "a formatted file has no formatting edits")
 
+# ---- References, highlights, rename ----
+def at_req(method, name, pos, extra=None):
+    p = {"textDocument": {"uri": uri(name)}, "position": pos}
+    p.update(extra or {})
+    return ("textDocument/" + method, p, True)
+
+
+def refs(name, pos, decl=True):
+    return at_req("references", name, pos, {"context": {"includeDeclaration": decl}})
+
+
+def starts(locs, name):
+    return sorted((l["range"]["start"]["line"], l["range"]["start"]["character"])
+                  for l in locs if l["uri"] == uri(name))
+
+
+def pos_t(p):
+    return (p["line"], p["character"])
+
+
+steps = [
+    open_doc("main.bastio"), open_doc("lib.bastio"),
+    refs("main.bastio", where("main.bastio", "double")),                   # 102
+    refs("main.bastio", where("main.bastio", "double"), False),            # 103
+    refs("lib.bastio", where("lib.bastio", "double")),                     # 104
+    refs("main.bastio", where("main.bastio", "a)")),                       # 105
+    refs("main.bastio", where("main.bastio", "n)")),                       # 106
+    at_req("documentHighlight", "main.bastio", where("main.bastio", "len", 2)),  # 107
+    at_req("rename", "lib.bastio", where("lib.bastio", "double"), {"newName": "twice"}),  # 108
+    at_req("rename", "main.bastio", where("main.bastio", "n)"), {"newName": "m"}),        # 109
+    at_req("rename", "main.bastio", where("main.bastio", "n)"), {"newName": "fn"}),       # 110
+    at_req("prepareRename", "main.bastio", where("main.bastio", "fn")),                  # 111
+    at_req("prepareRename", "main.bastio", where("main.bastio", "Pair")),                # 112
+    refs("main.bastio", where("main.bastio", "Dot")),                      # 113
+    refs("main.bastio", where("main.bastio", "p =")),                      # 114
+]
+resp, notes, rc = session(steps)
+caps = resp[1]["result"]["capabilities"]
+check(caps["referencesProvider"] and caps["documentHighlightProvider"] and caps["renameProvider"],
+      "capabilities for references, highlights and rename")
+r = resp[102]["result"]
+check(starts(r, "lib.bastio") == [pos_t(where("lib.bastio", "double"))]
+      and starts(r, "main.bastio") == [pos_t(where("main.bastio", "double"))] and len(r) == 2,
+      "references to a function across files: %r" % r)
+r = resp[103]["result"]
+check(len(r) == 1 and r[0]["uri"] == uri("main.bastio"), "references without the declaration: %r" % r)
+check(len(resp[104]["result"]) == 2, "references from the declaration see the use in another open file")
+r = resp[105]["result"]
+check(starts(r, "lib.bastio") == [pos_t(where("lib.bastio", "a:"))]
+      and starts(r, "main.bastio") == sorted([pos_t(where("main.bastio", "a:")), pos_t(where("main.bastio", "a)"))]),
+      "references to a field: its declaration, its initialiser and a use: %r" % r)
+r = resp[106]["result"]
+check(starts(r, "main.bastio") == sorted([pos_t(where("main.bastio", "n =")), pos_t(where("main.bastio", "n)"))])
+      and len(r) == 2, "references to a local: %r" % r)
+r = resp[107]["result"]
+check(len(r) == 2 and all(h["kind"] == 1 for h in r), "highlights of a match binding: %r" % r)
+ch = resp[108]["result"]["changes"]
+check(set(ch) == {uri("lib.bastio"), uri("main.bastio")}
+      and all(e["newText"] == "twice" for v in ch.values() for e in v)
+      and len(ch[uri("lib.bastio")]) == 1 and len(ch[uri("main.bastio")]) == 1,
+      "renaming a function edits every open file that names it: %r" % ch)
+ch = resp[109]["result"]["changes"]
+check(list(ch) == [uri("main.bastio")] and len(ch[uri("main.bastio")]) == 2, "renaming a local: %r" % ch)
+check(resp[110]["error"]["code"] == -32602, "a keyword is not a name: %r" % resp[110])
+check(resp[111]["result"] is None, "nothing to rename on a keyword")
+check(resp[112]["result"]["placeholder"] == "Pair", "prepareRename names the token: %r" % resp[112])
+r = resp[113]["result"]
+check(len(r) == 2 and starts(r, "lib.bastio") == [pos_t(where("lib.bastio", "Dot"))],
+      "references to a variant: %r" % r)
+r = resp[114]["result"]
+check(len(r) == 2, "references to a local declared by `let` and used after it: %r" % r)
+
 # ---- Diagnostics ----
 resp, notes, rc = session([open_doc("bad.bastio")])
 d = notes[0]["params"]["diagnostics"]

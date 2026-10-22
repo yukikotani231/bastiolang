@@ -5526,7 +5526,18 @@ fn iropt_ef_excl(xr: &Vec[u64], xv: &Vec[u64], x: u64, k: u64) -> bool {
 
 /// The decision of `iropt_ef_decide`, or of an exclusion when the range
 /// leaves an `==` or `!=` open.
-fn iropt_ef_decide_x(xr: &Vec[u64], xv: &Vec[u64], x: u64, op: u64, k: u64, r: IrRange) -> u64 {
+fn iropt_ef_decide_x(xr: &Vec[u64], xv: &Vec[u64], x: u64, op: u64, k: u64, r0: IrRange) -> u64 {
+  // An excluded value at either end of the range is not in it.
+  let mut r = r0;
+  let mut t = 0;
+  while t < 4 && r.lo < r.hi {
+    if iropt_ef_excl(xr, xv, x, r.lo) {
+      r.lo = wrap_add(r.lo, 1);
+    } else if iropt_ef_excl(xr, xv, x, r.hi) {
+      r.hi = wrap_sub(r.hi, 1);
+    }
+    t = wrap_add(t, 1);
+  }
   let dv = iropt_ef_decide(op, k, r);
   if dv == IR_NONE && iropt_ef_excl(xr, xv, x, k) {
     if op == IR_EQ {
@@ -5627,14 +5638,237 @@ fn iropt_ef_single(cnt: &Vec[u64], nback: &Vec[u64], hbad: &Vec[u64], hx: &Vec[u
   return u_at(hbad, l) == 0 && u_at(hx, l) != IR_NONE;
 }
 
+/// The end of the loop whose header is at `p`: the last position that can run
+/// between the header and an edge back to it (a jump back to a label inside
+/// pulls in the code it jumps from), or `IR_NONE` if there is no such edge,
+/// the loop is large, or an edge from above lands inside it.
+fn iropt_ef_span(bpos: &Vec[u64], btgt: &Vec[u64], fpos: &Vec[u64], ftgt: &Vec[u64], p: u64) -> u64 {
+  if vec_len(bpos) > 2000 || vec_len(fpos) > 4000 {
+    return IR_NONE;
+  }
+  let mut end = IR_NONE;
+  let mut j = 0;
+  while j < vec_len(bpos) && j < vec_len(btgt) {
+    if u_at(btgt, j) == p && (end == IR_NONE || u_at(bpos, j) > end) {
+      end = u_at(bpos, j);
+    }
+    j = wrap_add(j, 1);
+  }
+  if end == IR_NONE {
+    return IR_NONE;
+  }
+  let mut round = 0;
+  let mut changed = true;
+  while changed && round < 16 {
+    changed = false;
+    j = 0;
+    while j < vec_len(bpos) && j < vec_len(btgt) {
+      if u_at(btgt, j) > p && u_at(btgt, j) <= end && u_at(bpos, j) > end {
+        end = u_at(bpos, j);
+        changed = true;
+      }
+      j = wrap_add(j, 1);
+    }
+    round = wrap_add(round, 1);
+  }
+  if changed {
+    return IR_NONE;
+  }
+  j = 0;
+  while j < vec_len(fpos) && j < vec_len(ftgt) {
+    if u_at(fpos, j) < p && u_at(ftgt, j) > p && u_at(ftgt, j) <= end {
+      return IR_NONE;
+    }
+    j = wrap_add(j, 1);
+  }
+  return end;
+}
+
+/// The range the facts give the register `x`.
+fn iropt_ef_live(fr: &Vec[u64], flo: &Vec[u64], fhi: &Vec[u64], x: u64) -> IrRange {
+  let mut r = IrRange { lo: 0, hi: 18446744073709551615 };
+  let mut j = 0;
+  while j < vec_len(fr) && j < vec_len(flo) && j < vec_len(fhi) {
+    if u_at(fr, j) == x {
+      if u_at(flo, j) > r.lo {
+        r.lo = u_at(flo, j);
+      }
+      if u_at(fhi, j) < r.hi {
+        r.hi = u_at(fhi, j);
+      }
+    }
+    j = wrap_add(j, 1);
+  }
+  return r;
+}
+
+/// Is `x` in `xs`?
+fn iropt_ef_has(xs: &Vec[u64], x: u64) -> bool {
+  let mut z = 0;
+  while z < vec_len(xs) {
+    if u_at(xs, z) == x {
+      return true;
+    }
+    z = wrap_add(z, 1);
+  }
+  return false;
+}
+
+/// The registers among `xs` that some instruction from `p` to `end` writes.
+fn iropt_ef_written(f: &IrFn, p: u64, end: u64, xs: &Vec[u64]) -> Vec[u64] {
+  let mut out = vec_new[u64]();
+  let mut j = p;
+  while j <= end && j < vec_len(f.ins) {
+    let mut ws = vec_new[u64]();
+    ra_writes(iropt_at(f, j), &mut ws);
+    let mut w = 0;
+    while w < vec_len(ws) {
+      let x = vec_get(ws, w);
+      let mut z = 0;
+      while z < vec_len(xs) {
+        if u_at(xs, z) == x {
+          vec_push(&mut out, x);
+        }
+        z = wrap_add(z, 1);
+      }
+      w = wrap_add(w, 1);
+    }
+    vec_free(ws);
+    j = wrap_add(j, 1);
+  }
+  return out;
+}
+
+/// Whether the label `l` has only edges from above, two to four of them: what
+/// all of them agree on holds at the label.
+fn iropt_ef_join(cnt: &Vec[u64], nback: &Vec[u64], l: u64) -> bool {
+  if l >= vec_len(cnt) || l >= vec_len(nback) {
+    return false;
+  }
+  let c = u_at(cnt, l);
+  return u_at(nback, l) == 0 && c >= 2 && c <= 4;
+}
+
+/// The facts at the label `lab` that each of its `want` edges recorded in
+/// `sn`: a range for a register is the widest of the edges' ranges, an
+/// excluded value is one that every edge excludes. Nothing is added unless
+/// exactly `want` edges marked themselves.
+fn iropt_ef_join_apply(sn: &IrSnap, lab: u64, want: u64, fr: &mut Vec[u64], flo: &mut Vec[u64], fhi: &mut Vec[u64], fxr: &mut Vec[u64], fxv: &mut Vec[u64]) {
+  let mut idx = vec_new[u64]();
+  let mut eds = vec_new[u64]();
+  let mut j = 0;
+  while j < vec_len(sn.l) && j < vec_len(sn.k) && j < vec_len(sn.r) && j < vec_len(sn.a) && j < vec_len(sn.b) && j < vec_len(sn.e) {
+    if u_at(sn.l, j) == lab {
+      vec_push(&mut idx, j);
+      if u_at(sn.k, j) == 2 {
+        vec_push(&mut eds, u_at(sn.e, j));
+      }
+    }
+    j = wrap_add(j, 1);
+  }
+  if vec_len(eds) == want && want >= 2 && vec_len(idx) <= 400 {
+    let mut m = 0;
+    while m < vec_len(idx) {
+      let jm = u_at(idx, m);
+      let km = u_at(sn.k, jm);
+      let rm = u_at(sn.r, jm);
+      let em = u_at(sn.e, jm);
+      if (km == 0 && em == u_at(eds, 0)) || km == 1 {
+        let mut seen = false;
+        let mut z = 0;
+        if km == 0 {
+          while z < vec_len(fr) {
+            if u_at(fr, z) == rm {
+              seen = true;
+            }
+            z = wrap_add(z, 1);
+          }
+        } else {
+          while z < vec_len(fxr) && z < vec_len(fxv) {
+            if u_at(fxr, z) == rm && u_at(fxv, z) == u_at(sn.a, jm) {
+              seen = true;
+            }
+            z = wrap_add(z, 1);
+          }
+        }
+        if !seen {
+          let mut ok = true;
+          let mut jlo = 18446744073709551615;
+          let mut jhi = 0;
+          let mut d = 0;
+          while d < vec_len(eds) && ok {
+            let ed = u_at(eds, d);
+            let mut has = false;
+            let mut lo = 0;
+            let mut hi = 18446744073709551615;
+            let mut ranged = false;
+            let mut q = 0;
+            while q < vec_len(idx) {
+              let jq = u_at(idx, q);
+              if u_at(sn.e, jq) == ed && u_at(sn.r, jq) == rm {
+                if u_at(sn.k, jq) == 0 {
+                  ranged = true;
+                  if u_at(sn.a, jq) > lo {
+                    lo = u_at(sn.a, jq);
+                  }
+                  if u_at(sn.b, jq) < hi {
+                    hi = u_at(sn.b, jq);
+                  }
+                } else if u_at(sn.k, jq) == 1 && km == 1 && u_at(sn.a, jq) == u_at(sn.a, jm) {
+                  has = true;
+                }
+              }
+              q = wrap_add(q, 1);
+            }
+            if km == 0 {
+              has = ranged;
+            } else if ranged && (u_at(sn.a, jm) < lo || u_at(sn.a, jm) > hi) {
+              // The edge's range leaves the value out.
+              has = true;
+            }
+            if !has || (km == 0 && lo > hi) {
+              ok = false;
+            }
+            if lo < jlo {
+              jlo = lo;
+            }
+            if hi > jhi {
+              jhi = hi;
+            }
+            d = wrap_add(d, 1);
+          }
+          if ok && km == 0 && (jlo > 0 || jhi < 18446744073709551615) && vec_len(fr) < 96 {
+            vec_push(&mut fr, rm);
+            vec_push(&mut flo, jlo);
+            vec_push(&mut fhi, jhi);
+          } else if ok && km == 1 && vec_len(fxr) < 96 {
+            vec_push(&mut fxr, rm);
+            vec_push(&mut fxv, u_at(sn.a, jm));
+          }
+        }
+      }
+      m = wrap_add(m, 1);
+    }
+  }
+  vec_free(idx);
+  vec_free(eds);
+}
+
 /// Records, for the label `lab` that this edge alone reaches, the facts that
 /// hold on the edge: the ranges and exclusions known now, and what the branch
 /// itself says on that side (`bop`, `bx`, `bk` of the branch, `tv` 1 or 0;
 /// `bop` 0 for a plain jump).
-fn iropt_ef_snap(sn: &mut IrSnap, lab: u64, fr: &Vec[u64], flo: &Vec[u64], fhi: &Vec[u64], fxr: &Vec[u64], fxv: &Vec[u64], bop: u64, bx: u64, bk: u64, tv: u64) {
+fn iropt_ef_snap(sn: &mut IrSnap, e: u64, lab: u64, fr: &Vec[u64], flo: &Vec[u64], fhi: &Vec[u64], fxr: &Vec[u64], fxv: &Vec[u64], bop: u64, bx: u64, bk: u64, tv: u64) {
   if vec_len(sn.l) > 4000 {
     return;
   }
+  // The mark of the edge itself, so that a label counts the edges it has seen.
+  vec_push(&mut sn.l, lab);
+  vec_push(&mut sn.k, 2);
+  vec_push(&mut sn.r, 0);
+  vec_push(&mut sn.a, 0);
+  vec_push(&mut sn.b, 0);
+  vec_push(&mut sn.e, e);
   let mut j = 0;
   while j < vec_len(fr) && j < vec_len(flo) && j < vec_len(fhi) {
     vec_push(&mut sn.l, lab);
@@ -5642,6 +5876,7 @@ fn iropt_ef_snap(sn: &mut IrSnap, lab: u64, fr: &Vec[u64], flo: &Vec[u64], fhi: 
     vec_push(&mut sn.r, u_at(fr, j));
     vec_push(&mut sn.a, u_at(flo, j));
     vec_push(&mut sn.b, u_at(fhi, j));
+    vec_push(&mut sn.e, e);
     j = wrap_add(j, 1);
   }
   j = 0;
@@ -5652,6 +5887,7 @@ fn iropt_ef_snap(sn: &mut IrSnap, lab: u64, fr: &Vec[u64], flo: &Vec[u64], fhi: 
       vec_push(&mut sn.r, u_at(fxr, j));
       vec_push(&mut sn.a, u_at(fxv, j));
       vec_push(&mut sn.b, 0);
+      vec_push(&mut sn.e, e);
     }
     j = wrap_add(j, 1);
   }
@@ -5662,19 +5898,22 @@ fn iropt_ef_snap(sn: &mut IrSnap, lab: u64, fr: &Vec[u64], flo: &Vec[u64], fhi: 
     vec_push(&mut sn.r, bx);
     vec_push(&mut sn.a, rg.lo);
     vec_push(&mut sn.b, rg.hi);
+    vec_push(&mut sn.e, e);
     if (bop == IR_EQ && tv == 0) || (bop == IR_NE && tv == 1) {
       vec_push(&mut sn.l, lab);
       vec_push(&mut sn.k, 1);
       vec_push(&mut sn.r, bx);
       vec_push(&mut sn.a, bk);
       vec_push(&mut sn.b, 0);
+      vec_push(&mut sn.e, e);
     }
   }
 }
 
 /// The facts recorded for each label an edge alone reaches: label, kind (0 a
-/// range, 1 an excluded value), register, lowest (or the value), highest.
-struct IrSnap { l: Vec[u64], k: Vec[u64], r: Vec[u64], a: Vec[u64], b: Vec[u64] }
+/// range, 1 an excluded value, 2 the mark of an edge), register, lowest (or
+/// the value), highest, and the number of the edge.
+struct IrSnap { l: Vec[u64], k: Vec[u64], r: Vec[u64], a: Vec[u64], b: Vec[u64], e: Vec[u64] }
 
 /// Branches into a test that the facts about a register decide. A branch on
 /// `c = x < k` (a comparison of a register with a constant, just before it)
@@ -5774,6 +6013,12 @@ fn iropt_efacts(f: &mut IrFn) -> u64 {
     vec_push(&mut hbad, 0);
     l = wrap_add(l, 1);
   }
+  // The edges as positions: from where, to where; those that go back and
+  // those that go forward.
+  let mut bpos = vec_new[u64]();
+  let mut btgt = vec_new[u64]();
+  let mut fpos = vec_new[u64]();
+  let mut ftgt = vec_new[u64]();
   i = 0;
   while i < n {
     let q = iropt_at(f, i);
@@ -5782,6 +6027,11 @@ fn iropt_efacts(f: &mut IrFn) -> u64 {
       if p != IR_NONE && p <= i {
         ra_set(&mut nback, q.a, wrap_add(u_at(nback, q.a), 1));
         ra_set(&mut hbad, q.a, 1);
+        vec_push(&mut bpos, i);
+        vec_push(&mut btgt, p);
+      } else if p != IR_NONE {
+        vec_push(&mut fpos, i);
+        vec_push(&mut ftgt, p);
       }
     }
     if q.op == IR_BR {
@@ -5793,7 +6043,13 @@ fn iropt_efacts(f: &mut IrFn) -> u64 {
         }
         if tgt < f.nlabel {
           let p = u_at(lpos, tgt);
+          if p != IR_NONE && p > i {
+            vec_push(&mut fpos, i);
+            vec_push(&mut ftgt, p);
+          }
           if p != IR_NONE && p <= i {
+            vec_push(&mut bpos, i);
+            vec_push(&mut btgt, p);
             ra_set(&mut nback, tgt, wrap_add(u_at(nback, tgt), 1));
             if q.b == q.c || u_at(bop, i) == 0 {
               ra_set(&mut hbad, tgt, 1);
@@ -5830,7 +6086,8 @@ fn iropt_efacts(f: &mut IrFn) -> u64 {
   // Values a register is known not to equal: register, value.
   let mut fxr = vec_new[u64]();
   let mut fxv = vec_new[u64]();
-  let mut sn = IrSnap { l: vec_new[u64](), k: vec_new[u64](), r: vec_new[u64](), a: vec_new[u64](), b: vec_new[u64]() };
+  let mut sn = IrSnap { l: vec_new[u64](), k: vec_new[u64](), r: vec_new[u64](), a: vec_new[u64](), b: vec_new[u64](), e: vec_new[u64]() };
+  let mut ne = 0;
   let mut done = 0;
   let mut prev = IrIns { op: IR_JMP, d: IR_NONE, a: IR_NONE, b: 0, c: 0, ty: 0 };
   let mut pi = 0;
@@ -5857,6 +6114,38 @@ fn iropt_efacts(f: &mut IrFn) -> u64 {
     } else if prev.op == IR_JMP || prev.op == IR_BR || prev.op == IR_RET || prev.op == IR_UNREACH {
       clear = true;
     }
+    // A loop header that the code above falls into, with no other edge from
+    // above: the facts there are the loop's, as for a single jump into it.
+    let mut fallhdr = false;
+    let mut sr = vec_new[u64]();
+    let mut slo = vec_new[u64]();
+    let mut shi = vec_new[u64]();
+    let mut sxr = vec_new[u64]();
+    let mut sxv = vec_new[u64]();
+    if clear && q.op == IR_LABEL && q.a < f.nlabel && q.a < vec_len(cnt) && q.a < vec_len(nback) && q.a < vec_len(hbad) && q.a < vec_len(hx) && u_at(nback, q.a) > 0 && u_at(cnt, q.a) == u_at(nback, q.a) && u_at(hbad, q.a) == 0 && u_at(hx, q.a) != IR_NONE && prev.op != IR_JMP && prev.op != IR_BR && prev.op != IR_RET && prev.op != IR_UNREACH {
+      fallhdr = true;
+      let mut z = 0;
+      while z < vec_len(fr) && z < vec_len(flo) && z < vec_len(fhi) {
+        vec_push(&mut sr, u_at(fr, z));
+        vec_push(&mut slo, u_at(flo, z));
+        vec_push(&mut shi, u_at(fhi, z));
+        z = wrap_add(z, 1);
+      }
+      z = 0;
+      while z < vec_len(fxr) && z < vec_len(fxv) {
+        vec_push(&mut sxr, u_at(fxr, z));
+        vec_push(&mut sxv, u_at(fxv, z));
+        z = wrap_add(z, 1);
+      }
+    }
+    // A label that the code above falls into besides one to three jumps: the
+    // facts at the end of the code above are one more edge.
+    let mut fallj = false;
+    if clear && q.op == IR_LABEL && q.a < f.nlabel && q.a < vec_len(cnt) && q.a < vec_len(nback) && u_at(nback, q.a) == 0 && u_at(cnt, q.a) >= 1 && u_at(cnt, q.a) <= 3 && prev.op != IR_JMP && prev.op != IR_BR && prev.op != IR_RET && prev.op != IR_UNREACH {
+      fallj = true;
+      iropt_ef_snap(&mut sn, ne, q.a, fr, flo, fhi, fxr, fxv, 0, 0, 0, 0);
+      ne = wrap_add(ne, 1);
+    }
     if clear {
       while vec_len(fr) > 0 {
         vec_pop(&mut fr);
@@ -5874,15 +6163,30 @@ fn iropt_efacts(f: &mut IrFn) -> u64 {
         vec_pop(&mut fxv);
       }
       // A label that one edge alone reaches starts with the facts of that edge.
-      if q.op == IR_LABEL && q.a < f.nlabel && iropt_ef_single(cnt, nback, hbad, hx, q.a) && (prev.op == IR_JMP || prev.op == IR_BR || prev.op == IR_RET || prev.op == IR_UNREACH) {
+      if fallhdr {
+        let mut z = 0;
+        while z < vec_len(sr) && z < vec_len(slo) && z < vec_len(shi) {
+          vec_push(&mut fr, u_at(sr, z));
+          vec_push(&mut flo, u_at(slo, z));
+          vec_push(&mut fhi, u_at(shi, z));
+          z = wrap_add(z, 1);
+        }
+        z = 0;
+        while z < vec_len(sxr) && z < vec_len(sxv) {
+          vec_push(&mut fxr, u_at(sxr, z));
+          vec_push(&mut fxv, u_at(sxv, z));
+          z = wrap_add(z, 1);
+        }
+      }
+      if q.op == IR_LABEL && q.a < f.nlabel && (fallhdr || (iropt_ef_single(cnt, nback, hbad, hx, q.a) && (prev.op == IR_JMP || prev.op == IR_BR || prev.op == IR_RET || prev.op == IR_UNREACH))) {
         let mut sj = 0;
         while sj < vec_len(sn.l) && sj < vec_len(sn.k) && sj < vec_len(sn.r) && sj < vec_len(sn.a) && sj < vec_len(sn.b) {
           if u_at(sn.l, sj) == q.a {
-            if u_at(sn.k, sj) == 0 && vec_len(fr) < 32 {
+            if u_at(sn.k, sj) == 0 && vec_len(fr) < 96 {
               vec_push(&mut fr, u_at(sn.r, sj));
               vec_push(&mut flo, u_at(sn.a, sj));
               vec_push(&mut fhi, u_at(sn.b, sj));
-            } else if u_at(sn.k, sj) == 1 && vec_len(fxr) < 32 {
+            } else if u_at(sn.k, sj) == 1 && vec_len(fxr) < 96 {
               vec_push(&mut fxr, u_at(sn.r, sj));
               vec_push(&mut fxv, u_at(sn.a, sj));
             }
@@ -5893,6 +6197,49 @@ fn iropt_efacts(f: &mut IrFn) -> u64 {
           // A loop header: only what the edges from below agree on holds,
           // the range of one register widened by theirs.
           let hr = u_at(hx, q.a);
+          // What the edge from above says about a register that nothing in
+          // the loop writes holds at the header on every round.
+          let mut kr = vec_new[u64]();
+          let mut klo = vec_new[u64]();
+          let mut khi = vec_new[u64]();
+          let mut kxr = vec_new[u64]();
+          let mut kxv = vec_new[u64]();
+          let lend = iropt_ef_span(bpos, btgt, fpos, ftgt, i);
+          if lend != IR_NONE && lend >= i && wrap_sub(lend, i) < 3000 {
+            let mut cand = vec_new[u64]();
+            let mut z = 0;
+            while z < vec_len(fr) {
+              vec_push(&mut cand, u_at(fr, z));
+              z = wrap_add(z, 1);
+            }
+            z = 0;
+            while z < vec_len(fxr) {
+              vec_push(&mut cand, u_at(fxr, z));
+              z = wrap_add(z, 1);
+            }
+            let wr = iropt_ef_written(f, i, lend, cand);
+            z = 0;
+            while z < vec_len(fr) && z < vec_len(flo) && z < vec_len(fhi) {
+              let x = u_at(fr, z);
+              if x != hr && !iropt_ef_has(wr, x) && vec_len(kr) < 16 {
+                vec_push(&mut kr, x);
+                vec_push(&mut klo, u_at(flo, z));
+                vec_push(&mut khi, u_at(fhi, z));
+              }
+              z = wrap_add(z, 1);
+            }
+            z = 0;
+            while z < vec_len(fxr) && z < vec_len(fxv) {
+              let x = u_at(fxr, z);
+              if x != IR_NONE && !iropt_ef_has(wr, x) && vec_len(kxr) < 16 {
+                vec_push(&mut kxr, x);
+                vec_push(&mut kxv, u_at(fxv, z));
+              }
+              z = wrap_add(z, 1);
+            }
+            vec_free(wr);
+            vec_free(cand);
+          }
           let mut rl = 0;
           let mut rh = 18446744073709551615;
           let mut j = 0;
@@ -5935,8 +6282,41 @@ fn iropt_efacts(f: &mut IrFn) -> u64 {
               vec_push(&mut fhi, rh);
             }
           }
+          let mut z = 0;
+          while z < vec_len(kr) && z < vec_len(klo) && z < vec_len(khi) {
+            if vec_len(fr) < 96 {
+              vec_push(&mut fr, u_at(kr, z));
+              vec_push(&mut flo, u_at(klo, z));
+              vec_push(&mut fhi, u_at(khi, z));
+            }
+            z = wrap_add(z, 1);
+          }
+          z = 0;
+          while z < vec_len(kxr) && z < vec_len(kxv) {
+            if vec_len(fxr) < 96 {
+              vec_push(&mut fxr, u_at(kxr, z));
+              vec_push(&mut fxv, u_at(kxv, z));
+            }
+            z = wrap_add(z, 1);
+          }
+          vec_free(kr);
+          vec_free(klo);
+          vec_free(khi);
+          vec_free(kxr);
+          vec_free(kxv);
         }
       }
+    }
+    vec_free(sr);
+    vec_free(slo);
+    vec_free(shi);
+    vec_free(sxr);
+    vec_free(sxv);
+    if clear && q.op == IR_LABEL && q.a < f.nlabel && iropt_ef_join(cnt, nback, q.a) && (prev.op == IR_JMP || prev.op == IR_BR || prev.op == IR_RET || prev.op == IR_UNREACH) {
+      // A label with several edges from above: what they all agree on.
+      iropt_ef_join_apply(sn, q.a, u_at(cnt, q.a), &mut fr, &mut flo, &mut fhi, &mut fxr, &mut fxv);
+    } else if fallj {
+      iropt_ef_join_apply(sn, q.a, wrap_add(u_at(cnt, q.a), 1), &mut fr, &mut flo, &mut fhi, &mut fxr, &mut fxv);
     }
     if q.op == IR_LABEL && q.a < f.nlabel && cont && prev.op == IR_BR && prev.b != prev.c && u_at(bop, pi) != 0 {
       // Entering along the branch just above.
@@ -5946,18 +6326,85 @@ fn iropt_efacts(f: &mut IrFn) -> u64 {
       } else if prev.c == q.a {
         t = 0;
       }
-      if t != 2 && vec_len(fr) < 32 {
+      if t != 2 && vec_len(fr) < 96 {
         let rg = iropt_ef_range(u_at(bop, pi), u_at(bk, pi), t);
         vec_push(&mut fr, u_at(bx, pi));
         vec_push(&mut flo, rg.lo);
         vec_push(&mut fhi, rg.hi);
-        if ((u_at(bop, pi) == IR_EQ && t == 0) || (u_at(bop, pi) == IR_NE && t == 1)) && vec_len(fxr) < 32 {
+        if ((u_at(bop, pi) == IR_EQ && t == 0) || (u_at(bop, pi) == IR_NE && t == 1)) && vec_len(fxr) < 96 {
           vec_push(&mut fxr, u_at(bx, pi));
           vec_push(&mut fxv, u_at(bk, pi));
         }
       }
     }
-    if q.op == IR_BR && q.b != q.c && q.b < f.nlabel && q.c < f.nlabel {
+    // A branch on a register against a constant that the facts decide becomes
+    // a jump; the side it no longer reaches loses an edge.
+    let mut folded = false;
+    let mut keepguard = false;
+    let mut fop = u_at(bop, i);
+    let mut fx = u_at(bx, i);
+    let mut fk = u_at(bk, i);
+    if fop == 0 && q.op == IR_BR && i > 0 {
+      // The comparison just above, of two registers one of which holds a
+      // constant here.
+      let pq = iropt_at(f, wrap_sub(i, 1));
+      if pq.d == q.a && pq.d < f.nreg && u_at(ndef, pq.d) == 1 && (pq.op == IR_EQ || pq.op == IR_NE || pq.op == IR_LT || pq.op == IR_LE || pq.op == IR_GT || pq.op == IR_GE) && pq.a != pq.d && pq.b != pq.d {
+        let ra = iropt_ef_live(fr, flo, fhi, pq.a);
+        let rb = iropt_ef_live(fr, flo, fhi, pq.b);
+        if rb.lo == rb.hi {
+          fop = pq.op;
+          fx = pq.a;
+          fk = rb.lo;
+        } else if ra.lo == ra.hi {
+          // A counter from zero that only the two tests and the step read
+          // is left to the countdown, which wants the entry test.
+          if ra.lo == 0 && pq.a < vec_len(nuse) && pq.a < vec_len(ndef) && u_at(nuse, pq.a) == 3 && u_at(ndef, pq.a) == 2 {
+            keepguard = true;
+          }
+          fop = pq.op;
+          if fop == IR_LT {
+            fop = IR_GT;
+          } else if fop == IR_GT {
+            fop = IR_LT;
+          } else if fop == IR_LE {
+            fop = IR_GE;
+          } else if fop == IR_GE {
+            fop = IR_LE;
+          }
+          fx = pq.b;
+          fk = ra.lo;
+        }
+      }
+    }
+    if q.op == IR_BR && q.b != q.c && q.b < f.nlabel && q.c < f.nlabel && fop != 0 && !keepguard && vec_len(fr) + vec_len(fxr) > 0 {
+      let r = iropt_ef_live(fr, flo, fhi, fx);
+      if r.lo <= r.hi {
+        let dv = iropt_ef_decide_x(fxr, fxv, fx, fop, fk, r);
+        if dv == 0 || dv == 1 {
+          let mut keep = q.c;
+          let mut drop = q.b;
+          let mut tv = 0;
+          if dv == 1 {
+            keep = q.b;
+            drop = q.c;
+            tv = 1;
+          }
+          let pd = u_at(lpos, drop);
+          let pk = u_at(lpos, keep);
+          if pd != IR_NONE && pd > i && pk != IR_NONE && pk > i && u_at(cnt, drop) > 0 {
+            ra_set(&mut cnt, drop, wrap_sub(u_at(cnt, drop), 1));
+            iropt_put(&mut f, i, IrIns { op: IR_JMP, d: IR_NONE, a: keep, b: 0, c: 0, ty: 0 });
+            done = wrap_add(done, 1);
+            folded = true;
+            if iropt_ef_single(cnt, nback, hbad, hx, keep) || iropt_ef_join(cnt, nback, keep) {
+              iropt_ef_snap(&mut sn, ne, keep, fr, flo, fhi, fxr, fxv, fop, fx, fk, tv);
+              ne = wrap_add(ne, 1);
+            }
+          }
+        }
+      }
+    }
+    if !folded && q.op == IR_BR && q.b != q.c && q.b < f.nlabel && q.c < f.nlabel {
       // The edge to each side: the ranges plus what the branch itself says.
       let mut tl = q.b;
       let mut fl = q.c;
@@ -6061,6 +6508,8 @@ fn iropt_efacts(f: &mut IrFn) -> u64 {
           tl = q.b;
         } else {
           ra_set(&mut cnt, tl, wrap_add(u_at(cnt, tl), 1));
+          vec_push(&mut fpos, i);
+          vec_push(&mut ftgt, pt);
         }
       }
       if fl != q.c {
@@ -6069,17 +6518,21 @@ fn iropt_efacts(f: &mut IrFn) -> u64 {
           fl = q.c;
         } else {
           ra_set(&mut cnt, fl, wrap_add(u_at(cnt, fl), 1));
+          vec_push(&mut fpos, i);
+          vec_push(&mut ftgt, pf);
         }
       }
       if tl != q.b || fl != q.c {
         iropt_put(&mut f, i, IrIns { op: IR_BR, d: q.d, a: q.a, b: tl, c: fl, ty: q.ty });
         done = wrap_add(done, 1);
       }
-      if tl < f.nlabel && iropt_ef_single(cnt, nback, hbad, hx, tl) && u_at(lpos, tl) != IR_NONE && u_at(lpos, tl) > i {
-        iropt_ef_snap(&mut sn, tl, fr, flo, fhi, fxr, fxv, u_at(bop, i), u_at(bx, i), u_at(bk, i), 1);
+      if tl < f.nlabel && (iropt_ef_single(cnt, nback, hbad, hx, tl) || iropt_ef_join(cnt, nback, tl)) && u_at(lpos, tl) != IR_NONE && u_at(lpos, tl) > i {
+        iropt_ef_snap(&mut sn, ne, tl, fr, flo, fhi, fxr, fxv, u_at(bop, i), u_at(bx, i), u_at(bk, i), 1);
+        ne = wrap_add(ne, 1);
       }
-      if fl < f.nlabel && iropt_ef_single(cnt, nback, hbad, hx, fl) && u_at(lpos, fl) != IR_NONE && u_at(lpos, fl) > i {
-        iropt_ef_snap(&mut sn, fl, fr, flo, fhi, fxr, fxv, u_at(bop, i), u_at(bx, i), u_at(bk, i), 0);
+      if fl < f.nlabel && (iropt_ef_single(cnt, nback, hbad, hx, fl) || iropt_ef_join(cnt, nback, fl)) && u_at(lpos, fl) != IR_NONE && u_at(lpos, fl) > i {
+        iropt_ef_snap(&mut sn, ne, fl, fr, flo, fhi, fxr, fxv, u_at(bop, i), u_at(bx, i), u_at(bk, i), 0);
+        ne = wrap_add(ne, 1);
       }
     }
     if q.op == IR_JMP && q.a < f.nlabel && vec_len(fr) > 0 {
@@ -6099,6 +6552,8 @@ fn iropt_efacts(f: &mut IrFn) -> u64 {
       }
       if tg != q.a {
         ra_set(&mut cnt, tg, wrap_add(u_at(cnt, tg), 1));
+        vec_push(&mut fpos, i);
+        vec_push(&mut ftgt, u_at(lpos, tg));
         iropt_put(&mut f, i, IrIns { op: IR_JMP, d: q.d, a: tg, b: q.b, c: q.c, ty: q.ty });
         done = wrap_add(done, 1);
       }
@@ -6106,8 +6561,9 @@ fn iropt_efacts(f: &mut IrFn) -> u64 {
     if q.op == IR_JMP && q.a < f.nlabel {
       let jq = iropt_at(f, i);
       let jt = jq.a;
-      if jt < f.nlabel && iropt_ef_single(cnt, nback, hbad, hx, jt) && u_at(lpos, jt) != IR_NONE && u_at(lpos, jt) > i {
-        iropt_ef_snap(&mut sn, jt, fr, flo, fhi, fxr, fxv, 0, 0, 0, 0);
+      if jt < f.nlabel && (iropt_ef_single(cnt, nback, hbad, hx, jt) || iropt_ef_join(cnt, nback, jt)) && u_at(lpos, jt) != IR_NONE && u_at(lpos, jt) > i {
+        iropt_ef_snap(&mut sn, ne, jt, fr, flo, fhi, fxr, fxv, 0, 0, 0, 0);
+        ne = wrap_add(ne, 1);
       }
     }
     // A register written here: what is known about it goes.
@@ -6134,9 +6590,39 @@ fn iropt_efacts(f: &mut IrFn) -> u64 {
       w = wrap_add(w, 1);
     }
     vec_free(ws);
+    // A register that holds a constant is a range of one value, until it is written.
+    if q.op == IR_CONST && q.d < f.nreg {
+      let mut at = IR_NONE;
+      let mut j = 0;
+      while j < vec_len(fr) {
+        if u_at(fr, j) == q.d {
+          at = j;
+        }
+        j = wrap_add(j, 1);
+      }
+      if at == IR_NONE {
+        // A row whose register was written since says nothing: take it.
+        j = 0;
+        while j < vec_len(fr) && j < vec_len(flo) && j < vec_len(fhi) && at == IR_NONE {
+          if u_at(flo, j) == 0 && u_at(fhi, j) == 18446744073709551615 {
+            at = j;
+            ra_set(&mut fr, j, q.d);
+          }
+          j = wrap_add(j, 1);
+        }
+      }
+      if at != IR_NONE && at < vec_len(flo) && at < vec_len(fhi) {
+        ra_set(&mut flo, at, q.a);
+        ra_set(&mut fhi, at, q.a);
+      } else if vec_len(fr) < 96 {
+        vec_push(&mut fr, q.d);
+        vec_push(&mut flo, q.a);
+        vec_push(&mut fhi, q.a);
+      }
+    }
     // `x = x + K` of a positive constant, with no wrapping, is not zero; a
     // copy of such a value is not either.
-    if q.op == IR_ADD && q.c == 0 && q.d < f.nreg && vec_len(fxr) < 32 {
+    if q.op == IR_ADD && q.c == 0 && q.d < f.nreg && vec_len(fxr) < 96 {
       let ka = iropt_cval(cv, q.a);
       let kb = iropt_cval(cv, q.b);
       if (kb != IR_NONE && kb > 0 && kb < 1073741824) || (ka != IR_NONE && ka > 0 && ka < 1073741824) {
@@ -6144,11 +6630,15 @@ fn iropt_efacts(f: &mut IrFn) -> u64 {
         vec_push(&mut fxv, 0);
       }
     }
-    if q.op == IR_MOV && q.d < f.nreg && q.a != q.d && vec_len(fxr) < 32 && iropt_ef_excl(fxr, fxv, q.a, 0) {
+    if q.op == IR_MOV && q.d < f.nreg && q.a != q.d && vec_len(fxr) < 96 && iropt_ef_excl(fxr, fxv, q.a, 0) {
       vec_push(&mut fxr, q.d);
       vec_push(&mut fxv, 0);
     }
-    prev = q;
+    if folded {
+      prev = IrIns { op: IR_JMP, d: IR_NONE, a: IR_NONE, b: 0, c: 0, ty: 0 };
+    } else {
+      prev = q;
+    }
     pi = i;
     i = wrap_add(i, 1);
   }
@@ -6157,11 +6647,16 @@ fn iropt_efacts(f: &mut IrFn) -> u64 {
   vec_free(fhi);
   vec_free(fxr);
   vec_free(fxv);
+  vec_free(sn.e);
   vec_free(sn.l);
   vec_free(sn.k);
   vec_free(sn.r);
   vec_free(sn.a);
   vec_free(sn.b);
+  vec_free(bpos);
+  vec_free(btgt);
+  vec_free(fpos);
+  vec_free(ftgt);
   vec_free(nback);
   vec_free(hx);
   vec_free(hlo);
