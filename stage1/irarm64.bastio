@@ -580,6 +580,20 @@ fn a64_pow2(al: &IrAlloc, fr: A64F, r: u64) -> u64 {
   return 0;
 }
 
+/// The multiplier of an unsigned division by register `r` when it is a
+/// constant that is not a power of two and has an exact multiplier of 64 bits.
+fn a64_magic(al: &IrAlloc, r: u64) -> IxMagic {
+  if u_at(al.cst, r) == 0 {
+    return IxMagic { ok: false, m: 0, sh: 0 };
+  }
+  return ix_div_magic(u_at(al.cv, r));
+}
+
+fn a64_magic_ok(al: &IrAlloc, r: u64) -> bool {
+  let mg = a64_magic(al, r);
+  return mg.ok;
+}
+
 /// One instruction other than control flow and calls. `slotw` is the frame
 /// word of the slot this instruction opens, if it is an `IR_SLOT`.
 fn a64_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, fr: A64F, g: &mut X86, m: &Mono, p: &Parser, q: IrIns, slotw: u64) {
@@ -637,6 +651,28 @@ fn a64_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, fr: A64F, g: &mut X86, m:
         sh = sh + 1;
       }
       a64_ins3i(&mut out, "lsr", t, ra, sh);
+    }
+    a64_finish(&mut out, al, fr, q.d, t);
+  } else if (op == IR_DIV || op == IR_REM) && a64_magic_ok(al, q.b) {
+    // A division by a constant is a high multiply and a shift; the
+    // remainder is a multiply-subtract from the quotient.
+    let mg = a64_magic(al, q.b);
+    let ra = a64_use(&mut out, al, fr, q.a, 9);
+    a64_movi(&mut out, 16, mg.m);
+    a64_ins3(&mut out, "umulh", 16, ra, 16);
+    if mg.sh > 0 {
+      a64_ins3i(&mut out, "lsr", 16, 16, mg.sh);
+    }
+    let t = a64_dest(al, fr, q.d);
+    if op == IR_REM {
+      a64_movi(&mut out, 17, u_at(al.cv, q.b));
+      w_s(&mut out, "\tmsub ");
+      a64_x(&mut out, t);
+      w_s(&mut out, ", x16, x17, ");
+      a64_x(&mut out, ra);
+      w_s(&mut out, "\n");
+    } else {
+      a64_ins3i(&mut out, "add", t, 16, 0);
     }
     a64_finish(&mut out, al, fr, q.d, t);
   } else if op == IR_DIV || op == IR_SDIV {
@@ -1103,18 +1139,43 @@ fn a64_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
     ir_free(f);
     return false;
   }
-  iropt_inline(&mut f, c, &mut m, p, false);
+  let looped = iropt_accrec(&mut f) > 0;
+  iropt_inline(&mut f, c, &mut m, p, looped);
   vec_free(f.nz);
   f.nz = vec_new[u64]();
   iropt_slots(&mut f);
   iropt_fold(&mut f);
   iropt_copies(&mut f);
   iropt_dce(&mut f);
+  iropt_webs(&mut f);
+  let mut wb = 0;
+  while wb < 4 && iropt_wbk(&mut f) > 0 {
+    iropt_copies(&mut f);
+    iropt_dce(&mut f);
+    wb = wb + 1;
+  }
+  if iropt_exitfacts(&mut f) > 0 {
+    iropt_reach(&mut f);
+    iropt_copies(&mut f);
+    iropt_dce(&mut f);
+    iropt_labels(&mut f);
+  }
   if iropt_cse(&mut f) > 0 {
     iropt_copies(&mut f);
     iropt_dce(&mut f);
   }
+  if iropt_unroll(&mut f) > 0 {
+    iropt_fold(&mut f);
+    iropt_copies(&mut f);
+    iropt_dce(&mut f);
+  }
+  iropt_switch(&mut f);
   iropt_thread(&mut f);
+  if iropt_range(&mut f) > 0 {
+    iropt_copies(&mut f);
+    iropt_dce(&mut f);
+    iropt_thread(&mut f);
+  }
   if iropt_merge(&mut f) > 0 {
     iropt_copies(&mut f);
     iropt_dce(&mut f);
@@ -1134,8 +1195,54 @@ fn a64_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
     iropt_dce(&mut f);
   }
   iropt_vlen_untag(&mut f);
+  if iropt_zext(&mut f, false) > 0 {
+    iropt_copies(&mut f);
+    iropt_dce(&mut f);
+  }
+  let mut fused = 0;
+  while iropt_cmpfuse(&mut f) > 0 && fused < 4 {
+    fused = fused + 1;
+  }
+  let mut efd = 0;
+  while iropt_efacts(&mut f) > 0 && efd < 3 {
+    efd = efd + 1;
+  }
+  if iropt_ifconv(&mut f) > 0 {
+    iropt_copies(&mut f);
+    iropt_dce(&mut f);
+    iropt_labels(&mut f);
+  }
+  if iropt_zext(&mut f, true) > 0 {
+    iropt_copies(&mut f);
+    iropt_dce(&mut f);
+  }
+  if iropt_ebb(&mut f) > 0 {
+    iropt_copies(&mut f);
+    iropt_dce(&mut f);
+  }
   iropt_ivs(&mut f);
+  iropt_remdiv(&mut f);
   iropt_ebb(&mut f);
+  iropt_copies(&mut f);
+  if iropt_xorcancel(&mut f) > 0 {
+    iropt_copies(&mut f);
+    iropt_dce(&mut f);
+  }
+  iropt_bits(&mut f);
+  iropt_licm(&mut f);
+  if iropt_vlen(&mut f) > 0 {
+    iropt_copies(&mut f);
+    iropt_dce(&mut f);
+  }
+  if iropt_rowptr(&mut f) > 0 {
+    iropt_copies(&mut f);
+    iropt_dce(&mut f);
+  }
+  if iropt_punroll(&mut f) > 0 {
+    iropt_copies(&mut f);
+    iropt_dce(&mut f);
+  }
+  iropt_wide(&mut f);
   iropt_dead_live(&mut f);
   iropt_copies(&mut f);
   iropt_fold(&mut f);
