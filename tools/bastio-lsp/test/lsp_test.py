@@ -560,6 +560,27 @@ resp, notes, rc = session([
 lens = [(l["range"]["start"]["line"], l["command"]["title"]) for l in resp[101]["result"]]
 check(lens == [(0, "2 references"), (1, "0 references"), (2, "0 references")], "code lenses: %r" % lens)
 
+# ---- Call hierarchy ----
+src = ("fn leaf() -> u64 { return 1; }\n"
+       "fn mid() -> u64 { return leaf() + leaf(); }\n"
+       "fn top() -> u64 { return mid() + leaf(); }\n")
+cu = uri("calls_test.bastio")
+resp, notes, rc = session([
+    ("textDocument/didOpen", {"textDocument": {"uri": cu, "languageId": "bastio", "version": 1, "text": src}}, False),
+    ("textDocument/prepareCallHierarchy", {"textDocument": {"uri": cu}, "position": {"line": 0, "character": 4}}, True),
+])
+item = resp[101]["result"][0]
+check(item["name"] == "leaf" and item["uri"] == cu, "call hierarchy item: %r" % item)
+resp, notes, rc = session([
+    ("textDocument/didOpen", {"textDocument": {"uri": cu, "languageId": "bastio", "version": 1, "text": src}}, False),
+    ("callHierarchy/incomingCalls", {"item": item}, True),
+    ("callHierarchy/outgoingCalls", {"item": dict(item, data=dict(item["data"], ns=src.index("mid")))}, True),
+])
+inc = sorted((c["from"]["name"], len(c["fromRanges"])) for c in resp[101]["result"])
+check(inc == [("mid", 2), ("top", 1)], "incoming calls: %r" % inc)
+out = sorted((c["to"]["name"], len(c["fromRanges"])) for c in resp[102]["result"])
+check(out == [("leaf", 2)], "outgoing calls: %r" % out)
+
 # ---- Protocol ----
 resp, notes, rc = session([("workspace/nothing", {}, True), ("$/cancelRequest", {"id": 5}, False)])
 check(resp[100]["error"]["code"] == -32601, "an unknown request gets an error")
