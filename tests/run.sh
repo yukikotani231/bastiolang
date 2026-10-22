@@ -76,8 +76,11 @@ fail_one() {
 user_one() {
   local f=$1 name
   name=$(basename "$f" .bastio)
+  # The C of a user program has x86 inline assembly, so it is only compiled
+  # on an x86-64 host.
   if "$BASTIOC" --target user -o "$w/$name.u.c" "$f" 2>"$w/$name.err" \
-     && ${CC:-cc} -c -ffreestanding -fpie -o "$w/$name.u.o" "$w/$name.u.c" 2>>"$w/$name.err"; then
+     && { [ "$(uname -m)" != x86_64 ] \
+          || ${CC:-cc} -c -ffreestanding -fpie -o "$w/$name.u.o" "$w/$name.u.c" 2>>"$w/$name.err"; }; then
     echo =pass
   else
     echo "FAIL $f"; sed 's/^/    /' "$w/$name.err"; echo =fail
@@ -116,7 +119,10 @@ case "$BASTIOC" in /*) abs=$BASTIOC ;; */*) abs=$PWD/$BASTIOC ;; *) abs=$BASTIOC
 for f in tests/diag/*.bastio; do
   name=$(basename "$f" .bastio)
   (cd tests/diag && "$abs" --check "$name.bastio" 2>"$tmp/diag.err" >/dev/null)
-  if cmp -s "$tmp/diag.err" "tests/diag/$name.err"; then
+  # The numbers of a counterexample are whatever model the solver picks,
+  # which differs between Z3 versions: compare their names, not their values.
+  nums='/= counterexample:/s/= [-]*[0-9][0-9]*/= N/g'
+  if cmp -s <(sed "$nums" "$tmp/diag.err") <(sed "$nums" "tests/diag/$name.err"); then
     pass=$((pass+1))
   else
     echo "FAIL $f: the error output differs from $name.err"; diff "tests/diag/$name.err" "$tmp/diag.err" | sed 's/^/    /'; fail=$((fail+1))
