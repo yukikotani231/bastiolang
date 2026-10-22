@@ -1,0 +1,482 @@
+// Code actions: quick fixes for the diagnostics of the compiler, worked out
+// from the diagnostic's message and range and from the tokens of the file.
+// A fix is an edit of the open document only; the compiler is not run again.
+import "complete.bastio";
+
+/// Does `v` contain `pat`?
+fn has_text(v: &Vec[u64], pat: Str) -> bool {
+  let n = vec_len(v);
+  let mut k = 0;
+  while k < n && n - k >= slen(pat)
+  {
+    let mut m = 0;
+    while m < slen(pat) && u_at(v, vadd(k, m)) == cast[u64](sget(pat, m))
+    {
+      m = vadd(m, 1);
+    }
+    if m == slen(pat) {
+      return true;
+    }
+    k = vadd(k, 1);
+  }
+  return false;
+}
+
+/// The text between the `nth` (from 0) pair of backticks of `v` (empty if
+/// there is none).
+fn ticked(v: &Vec[u64], nth: u64) -> Vec[u64] {
+  let mut out = vec_new[u64]();
+  let n = vec_len(v);
+  let mut k = 0;
+  let mut skip = nth;
+  while skip > 0
+  {
+    while k < n && u_at(v, k) != 96
+    {
+      k = vadd(k, 1);
+    }
+    k = vadd(k, 1);
+    while k < n && u_at(v, k) != 96
+    {
+      k = vadd(k, 1);
+    }
+    k = vadd(k, 1);
+    skip = skip - 1;
+  }
+  while k < n && u_at(v, k) != 96
+  {
+    k = vadd(k, 1);
+  }
+  k = vadd(k, 1);
+  while k < n && u_at(v, k) != 96
+  {
+    vec_push(&mut out, u_at(v, k));
+    k = vadd(k, 1);
+  }
+  if k >= n {
+    vec_free(out);
+    return vec_new[u64]();
+  }
+  return out;
+}
+
+/// The text of `all[s..e]`.
+fn text_vec(all: &Bytes, s: u64, e: u64) -> Vec[u64] {
+  let mut out = vec_new[u64]();
+  let mut k = s;
+  while k < e && k < blen(all)
+  {
+    vec_push(&mut out, cast[u64](bget(all, k)));
+    k = vadd(k, 1);
+  }
+  return out;
+}
+
+/// Does token `ti` of the program spell `w`?
+fn tok_spells(ix: &Prog, ti: u64, w: &Vec[u64]) -> bool {
+  let t = tok_at(ix.toks, ti);
+  if t.end < t.start || t.end - t.start != vec_len(w) || t.end > blen(ix.all) {
+    return false;
+  }
+  let mut k = 0;
+  while k < vec_len(w)
+    invariant k <= vlen(w) && t.end <= blen(ix.all) && t.end - t.start == vlen(w)
+  {
+    if cast[u64](bget(ix.all, t.start + k)) != u_at(w, k) {
+      return false;
+    }
+    k = vadd(k, 1);
+  }
+  return true;
+}
+
+// ---- Output ----
+
+/// Starts a quick fix titled `title` for the diagnostic `raw` (its JSON), whose
+/// edits go to the document `uri`. `out` holds the actions so far, so a comma
+/// goes first when it is not empty.
+fn fix_begin(out: &mut Vec[u64], uri: &Bytes, title: &Vec[u64], raw: &Vec[u64]) {
+  if vec_len(out) > 0 {
+    vec_push(&mut out, 44);
+  }
+  w_s(&mut out, "{\"title\":\"");
+  jesc_vec(&mut out, title);
+  w_s(&mut out, "\",\"kind\":\"quickfix\",\"diagnostics\":[");
+  w_append(&mut out, raw);
+  w_s(&mut out, "],\"edit\":{\"changes\":{\"");
+  jesc_bytes(&mut out, uri, 0, blen(uri));
+  w_s(&mut out, "\":[");
+}
+
+/// One edit: `all[s..e]` becomes `text`. `first` says whether it is the
+/// first edit of the fix.
+fn fix_edit(out: &mut Vec[u64], all: &Bytes, first: bool, s: u64, e: u64, text: &Vec[u64]) {
+  if !first {
+    vec_push(&mut out, 44);
+  }
+  w_s(&mut out, "{\"range\":");
+  w_range(&mut out, all, 0, s, e);
+  w_s(&mut out, ",\"newText\":\"");
+  jesc_vec(&mut out, text);
+  w_s(&mut out, "\"}");
+}
+
+fn fix_end(out: &mut Vec[u64]) {
+  w_s(&mut out, "]}}}");
+}
+
+/// A fix that is one edit.
+fn fix_one(out: &mut Vec[u64], uri: &Bytes, all: &Bytes, raw: &Vec[u64], title: &Vec[u64], s: u64, e: u64, text: &Vec[u64]) {
+  fix_begin(&mut out, uri, title, raw);
+  fix_edit(&mut out, all, true, s, e, text);
+  fix_end(&mut out);
+}
+
+// ---- Fixes ----
+
+/// "expected `;` at the end of this line": insert it where the compiler points.
+fn fix_semicolon(out: &mut Vec[u64], uri: &Bytes, ix: &Prog, raw: &Vec[u64], s: u64) {
+  let mut title = vec_new[u64]();
+  w_s(&mut title, "Insert `;`");
+  let mut text = vec_new[u64]();
+  w_s(&mut text, ";");
+  fix_one(&mut out, uri, ix.all, raw, title, s, s, text);
+  vec_free(title);
+  vec_free(text);
+}
+
+/// "`x` is not mutable": put `mut` after the `let` of the nearest
+/// declaration of `x` before the use.
+fn fix_mut(out: &mut Vec[u64], uri: &Bytes, ix: &Prog, raw: &Vec[u64], name: &Vec[u64], s: u64) {
+  let at_tok = tok_at_offset(ix, 0, s);
+  if !at_tok.found || vec_len(name) == 0 {
+    return;
+  }
+  let ts = u_at(ix.tstart, 0);
+  let mut j = at_tok.idx;
+  while j > ts
+  {
+    j = j - 1;
+    let c = tok_at(ix.toks, j);
+    let p = tok_at(ix.toks, vsub(j, 1));
+    if binding_at(ix, j, ts) && tok_spells(ix, j, name) {
+      if is_kw(p, KW_LET) {
+        let mut title = vec_new[u64]();
+        w_s(&mut title, "Declare `");
+        w_append(&mut title, name);
+        w_s(&mut title, "` with `mut`");
+        let mut text = vec_new[u64]();
+        w_s(&mut text, "mut ");
+        fix_one(&mut out, uri, ix.all, raw, title, c.start, c.start, text);
+        vec_free(title);
+        vec_free(text);
+      }
+      return;
+    }
+  }
+}
+
+/// Where the line that holds offset `off` starts.
+fn line_start(all: &Bytes, off: u64) -> u64 {
+  let mut k = off;
+  if k > blen(all) {
+    k = blen(all);
+  }
+  while k > 0 && at(all, k - 1) != 10
+  {
+    k = k - 1;
+  }
+  return k;
+}
+
+/// The offset after the white space at the start of the line that holds `off`.
+fn indent_end(all: &Bytes, off: u64) -> u64 {
+  let mut k = line_start(all, off);
+  while k < blen(all) && (at(all, k) == 32 || at(all, k) == 9)
+  {
+    k = vadd(k, 1);
+  }
+  return k;
+}
+
+/// Does variant `v` of the enum `en` carry a payload (`V(T)`)?
+fn variant_has_payload(ix: &Prog, en: &Vec[u64], v: &Vec[u64]) -> bool {
+  let mut d = 0;
+  while d < vec_len(ix.defs)
+  {
+    let df = vec_get(ix.defs, d);
+    if df.kind == DK_VARIANT && df.parent > 0 && df.ne <= blen(ix.all) {
+      let pd = def_at(ix, df.parent - 1);
+      let vt = text_vec(ix.all, df.ns, df.ne);
+      let et = text_vec(ix.all, pd.ns, pd.ne);
+      let hit = vec_len(vt) == vec_len(v) && has_text_eq(vt, v) && vec_len(et) == vec_len(en) && has_text_eq(et, en);
+      vec_free(vt);
+      vec_free(et);
+      if hit {
+        return df.ne < blen(ix.all) && at(ix.all, df.ne) == 40;
+      }
+    }
+    d = vadd(d, 1);
+  }
+  return false;
+}
+
+fn has_text_eq(a: &Vec[u64], b: &Vec[u64]) -> bool {
+  if vec_len(a) != vec_len(b) {
+    return false;
+  }
+  let mut k = 0;
+  while k < vec_len(a)
+  {
+    if u_at(a, k) != u_at(b, k) {
+      return false;
+    }
+    k = vadd(k, 1);
+  }
+  return true;
+}
+
+/// "this `match` does not handle `E::V`": add an arm for it before the
+/// closing brace of the `match`.
+fn fix_arm(out: &mut Vec[u64], uri: &Bytes, ix: &Prog, raw: &Vec[u64], variant: &Vec[u64], s: u64) {
+  let at_tok = tok_at_offset(ix, 0, s);
+  if !at_tok.found || !is_kw(tok_at(ix.toks, at_tok.idx), KW_MATCH) {
+    return;
+  }
+  let te = file_toks_end(ix, 0);
+  // The `{` of the match, then its `}`.
+  let mut open = at_tok.idx;
+  while open < te && !is_p(tok_at(ix.toks, open), P_LBRACE)
+  {
+    open = vadd(open, 1);
+  }
+  if open >= te {
+    return;
+  }
+  let close = match_close(ix.toks, open, te);
+  let ct = tok_at(ix.toks, close);
+  if close <= open || !is_p(ct, P_RBRACE) {
+    return;
+  }
+  // `E::V` splits at the last `::`.
+  let mut sep = vec_len(variant);
+  let mut k = 0;
+  while vadd(k, 1) < vec_len(variant)
+  {
+    if u_at(variant, k) == 58 && u_at(variant, vadd(k, 1)) == 58 {
+      sep = k;
+    }
+    k = vadd(k, 1);
+  }
+  let mut en = vec_new[u64]();
+  let mut vn = vec_new[u64]();
+  let mut q = 0;
+  while q < vec_len(variant)
+  {
+    if q < sep {
+      vec_push(&mut en, u_at(variant, q));
+    } else if q >= vadd(sep, 2) {
+      vec_push(&mut vn, u_at(variant, q));
+    }
+    q = vadd(q, 1);
+  }
+  let payload = variant_has_payload(ix, en, vn);
+  vec_free(en);
+  vec_free(vn);
+  let mut arm = vec_new[u64]();
+  w_append(&mut arm, variant);
+  if payload {
+    w_s(&mut arm, "(_)");
+  }
+  w_s(&mut arm, " => {}");
+  let mut title = vec_new[u64]();
+  w_s(&mut title, "Add the arm for `");
+  w_append(&mut title, variant);
+  w_s(&mut title, "`");
+  let mut text = vec_new[u64]();
+  let cs = ct.start;
+  let ls = line_start(ix.all, cs);
+  let ie = indent_end(ix.all, cs);
+  if ie == cs {
+    // The `}` starts its line: the arm gets a line of its own above it, one
+    // level deeper than the `match`.
+    let mi = indent_end(ix.all, tok_at_start(ix.toks, at_tok.idx));
+    let ms = line_start(ix.all, tok_at_start(ix.toks, at_tok.idx));
+    let mut c = ms;
+    while c < mi
+    {
+      vec_push(&mut text, at(ix.all, c));
+      c = vadd(c, 1);
+    }
+    w_s(&mut text, "  ");
+    w_append(&mut text, arm);
+    w_s(&mut text, ",\n");
+    fix_one(&mut out, uri, ix.all, raw, title, ls, ls, text);
+  } else {
+    w_s(&mut text, " ");
+    w_append(&mut text, arm);
+    w_s(&mut text, ", ");
+    fix_one(&mut out, uri, ix.all, raw, title, cs, cs, text);
+  }
+  vec_free(arm);
+  vec_free(title);
+  vec_free(text);
+}
+
+// ---- Spelling ----
+
+/// The edit distance between `a` and `b` (at most 64 characters each).
+fn distance(a: &Vec[u64], b: &Vec[u64]) -> u64 {
+  if vec_len(a) > 64 || vec_len(b) > 64 {
+    return 1000;
+  }
+  let mut prev = vec_new[u64]();
+  let mut j = 0;
+  while j <= vec_len(b)
+  {
+    vec_push(&mut prev, j);
+    j = vadd(j, 1);
+  }
+  let mut i = 0;
+  while i < vec_len(a)
+  {
+    let mut cur = vec_new[u64]();
+    vec_push(&mut cur, vadd(i, 1));
+    let mut m = 0;
+    while m < vec_len(b)
+    {
+      let mut sub = u_at(prev, m);
+      if u_at(a, i) != u_at(b, m) {
+        sub = vadd(sub, 1);
+      }
+      let del = vadd(u_at(prev, vadd(m, 1)), 1);
+      let ins = vadd(u_at(cur, m), 1);
+      let mut best = sub;
+      if del < best {
+        best = del;
+      }
+      if ins < best {
+        best = ins;
+      }
+      vec_push(&mut cur, best);
+      m = vadd(m, 1);
+    }
+    vec_free(prev);
+    prev = cur;
+    i = vadd(i, 1);
+  }
+  let d = u_at(prev, vec_len(b));
+  vec_free(prev);
+  return d;
+}
+
+/// The nearest of the names in `cands` (each a `ss, se` pair of offsets in
+/// the program text) to `name`, if one is within reach: the same name with
+/// up to two letters wrong, fewer for a short name. Empty if there is none.
+fn nearest(ix: &Prog, name: &Vec[u64], cands: &Vec[u64]) -> Vec[u64] {
+  let mut limit = 2;
+  if vec_len(name) <= 4 {
+    limit = 1;
+  }
+  let mut best = vec_new[u64]();
+  let mut bestd = 1000;
+  let mut k = 0;
+  while vadd(k, 1) < vec_len(cands)
+  {
+    let c = text_vec(ix.all, u_at(cands, k), u_at(cands, vadd(k, 1)));
+    let d = distance(name, c);
+    if d > 0 && d <= limit && d < bestd {
+      bestd = d;
+      vec_free(best);
+      best = c;
+    } else {
+      vec_free(c);
+    }
+    k = vadd(k, 2);
+  }
+  return best;
+}
+
+/// "unknown variable `x`" or "unknown function `f`": offer the nearest name
+/// in scope as a replacement. `func` says which of the two it is.
+fn fix_spelling(out: &mut Vec[u64], uri: &Bytes, ix: &Prog, raw: &Vec[u64], name: &Vec[u64], func: bool, s: u64, e: u64) {
+  let mut cands = vec_new[u64]();
+  let mut d = 0;
+  while d < vec_len(ix.defs)
+  {
+    let df = vec_get(ix.defs, d);
+    let mut want = df.kind == DK_CONST;
+    if func {
+      want = df.kind == DK_FN || df.kind == DK_SPEC;
+    }
+    if want {
+      vec_push(&mut cands, df.ns);
+      vec_push(&mut cands, df.ne);
+    }
+    d = vadd(d, 1);
+  }
+  if !func {
+    // The locals declared before the use, in the function around it.
+    let ts = u_at(ix.tstart, 0);
+    let at_tok = tok_at_offset(ix, 0, s);
+    let mut fn_start = 0;
+    let mut have = false;
+    let mut f = 0;
+    while f < vec_len(ix.defs)
+    {
+      let df = vec_get(ix.defs, f);
+      if df.file == 0 && (df.kind == DK_FN || df.kind == DK_SPEC) && df.ss <= s && s <= df.ie {
+        fn_start = df.ss;
+        have = true;
+      }
+      f = vadd(f, 1);
+    }
+    if have && at_tok.found {
+      let mut j = at_tok.idx;
+      while j > ts
+      {
+        j = j - 1;
+        let c = tok_at(ix.toks, j);
+        if c.start >= fn_start && binding_at(ix, j, ts) {
+          vec_push(&mut cands, c.start);
+          vec_push(&mut cands, c.end);
+        }
+      }
+    }
+  }
+  let near = nearest(ix, name, cands);
+  vec_free(cands);
+  if vec_len(near) > 0 {
+    let mut title = vec_new[u64]();
+    w_s(&mut title, "Change to `");
+    w_append(&mut title, near);
+    w_s(&mut title, "`");
+    fix_one(&mut out, uri, ix.all, raw, title, s, e, near);
+    vec_free(title);
+  }
+  vec_free(near);
+}
+
+/// The quick fixes for one diagnostic of the document `uri`, whose program
+/// is `ix` (the document is its first file): `s..e` is the range of the
+/// diagnostic in the text, `code` and `msg` are its code and message and
+/// `raw` is its JSON. Each fix is appended to `out` as a code action.
+fn diag_fixes(out: &mut Vec[u64], uri: &Bytes, ix: &Prog, raw: &Vec[u64], code: &Vec[u64], msg: &Vec[u64], s: u64, e: u64) {
+  let mut nth = 0;
+  if has_text(msg, "does not handle `") {
+    nth = 1;
+  }
+  let name = ticked(msg, nth);
+  if has_text(msg, "expected `;`") {
+    fix_semicolon(&mut out, uri, ix, raw, s);
+  } else if has_text(msg, " is not mutable") {
+    fix_mut(&mut out, uri, ix, raw, name, s);
+  } else if has_text(msg, "does not handle `") {
+    fix_arm(&mut out, uri, ix, raw, name, s);
+  } else if has_text(msg, "unknown variable `") {
+    fix_spelling(&mut out, uri, ix, raw, name, false, s, e);
+  } else if has_text(msg, "unknown function `") {
+    fix_spelling(&mut out, uri, ix, raw, name, true, s, e);
+  }
+  vec_free(name);
+}
