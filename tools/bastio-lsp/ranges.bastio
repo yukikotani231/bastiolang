@@ -1,0 +1,82 @@
+// Folding ranges, from the tokens of a program: every `{ .. }` that spans
+// at least three lines folds to its first line, and so does a run of line
+// comments.
+import "complete.bastio";
+
+fn w_fold(out: &mut Vec[u64], first: u64, last: u64, comment: bool) {
+  if vec_len(out) > 0 {
+    vec_push(&mut out, 44);
+  }
+  w_s(&mut out, "{\"startLine\":");
+  w_num(&mut out, first);
+  w_s(&mut out, ",\"endLine\":");
+  w_num(&mut out, last);
+  if comment {
+    w_s(&mut out, ",\"kind\":\"comment\"");
+  }
+  w_s(&mut out, "}");
+}
+
+/// The folding ranges (JSON objects, separated by commas) of file 0. Lines
+/// are 0-based; a block folds up to the line before its `}`.
+fn folding_ranges(ix: &Prog, out: &mut Vec[u64]) {
+  let ts = u_at(ix.tstart, 0);
+  let te = file_toks_end(ix, 0);
+  let mut i = ts;
+  while i < te && i < vec_len(ix.toks) && vec_len(out) < 200000
+  {
+    let c = tok_at(ix.toks, i);
+    if is_p(c, P_LBRACE) {
+      let close = match_close(ix.toks, i, te);
+      let ct = tok_at(ix.toks, close);
+      if close > i && is_p(ct, P_RBRACE) && c.line >= 1 && ct.line > vadd(c.line, 1) {
+        w_fold(&mut out, c.line - 1, ct.line - 2, false);
+      }
+    }
+    i = vadd(i, 1);
+  }
+  // Runs of line comments: lines that start (after white space) with `//`.
+  // File 0 only: the text of the files it imports follows it.
+  let mut n = blen(ix.all);
+  if vec_len(ix.fstart) > 1 && u_at(ix.fstart, 1) <= n {
+    n = u_at(ix.fstart, 1);
+  }
+  let mut ln = 0;
+  let mut pos = 0;
+  let mut first = 0;
+  let mut run = 0;
+  while pos <= n && ln < 10000000
+  {
+    let mut q = pos;
+    while q < n && (at(ix.all, q) == 32 || at(ix.all, q) == 9)
+    {
+      q = vadd(q, 1);
+    }
+    let is_comment = vadd(q, 1) < n && at(ix.all, q) == 47 && at(ix.all, vadd(q, 1)) == 47;
+    if is_comment {
+      if run == 0 {
+        first = ln;
+      }
+      run = vadd(run, 1);
+    } else {
+      if run >= 2 && ln > 0 {
+        w_fold(&mut out, first, ln - 1, true);
+      }
+      run = 0;
+    }
+    let mut e = pos;
+    while e < n && at(ix.all, e) != 10
+    {
+      e = vadd(e, 1);
+    }
+    if e >= n {
+      if run >= 2 && is_comment {
+        w_fold(&mut out, first, ln, true);
+      }
+      pos = vadd(n, 1);
+    } else {
+      pos = vadd(e, 1);
+    }
+    ln = vadd(ln, 1);
+  }
+}

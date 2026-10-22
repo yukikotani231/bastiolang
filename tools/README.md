@@ -56,6 +56,7 @@ A [Language Server Protocol](https://microsoft.github.io/language-server-protoco
 | Document symbols | Top-level definitions, with variants and fields as children |
 | Code actions | Quick fixes for the compiler's diagnostics, as edits of the buffer: insert a missing `;`, declare a variable `mut` that is assigned to, add the arm a `match` does not handle (with `(_)` for a variant that carries a payload), change a misspelled variable or function to the nearest name in scope, and import the open document that defines an unknown name |
 | Inlay hints | The name of the parameter each argument of a call goes to (not when the argument is a variable of that name), and the type of a `let` whose value is a call, a struct literal or a variant (`let a: u64 = f(x);`); any other value gets no hint, as types are not inferred. In Neovim 0.10: `vim.lsp.inlay_hint.enable()` |
+| Folding, links | Every `{ .. }` of three lines or more and every run of line comments folds; each `import "file";` is a link to the file |
 | Formatting | The whole document, with `bastiofmt`'s rules |
 
 Definitions are found from tokens, not from a syntax tree, so they work while a file is half typed; the cost is that scopes are approximate (a local is the nearest declaration before the use in the same function) and a name that two files define is resolved to the one in the current file first. Types are not inferred, so hover on `p.a` finds a field by name, not by the type of `p`. Diagnostics from the compiler show only its first error, because the compiler stops there.
@@ -95,4 +96,4 @@ Then `vim.lsp.buf.hover()`, `vim.lsp.buf.definition()` (`<C-]>` works through `t
 
 ### Tests
 
-`tests/tools.sh` runs `tools/bastio-lsp/test/lsp_test.py`, which speaks the protocol to the server (hover, definitions in the file and in an imported one, references, highlights, rename, completion, signature help, symbols, workspace symbols, semantic tokens, formatting, code actions, inlay hints, diagnostics with their ranges, malformed input), and, when `nvim` is installed, `editors/vim/test/nvim_test.lua`, which does the same from headless Neovim through the plugin.
+`tests/tools.sh` runs `tools/bastio-lsp/test/lsp_test.py`, which speaks the protocol to the server (hover, definitions in the file and in an imported one, references, highlights, rename, completion, signature help, symbols, workspace symbols, semantic tokens, formatting, code actions, inlay hints, folding ranges, import links, diagnostics with their ranges, malformed input), and, when `nvim` is installed, `editors/vim/test/nvim_test.lua`, which does the same from headless Neovim through the plugin.

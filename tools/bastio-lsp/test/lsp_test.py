@@ -513,6 +513,34 @@ want = [(5, 7, ": u64"), (5, 18, "h:"), (6, 7, ": P"), (7, 7, ": E")]
 check(hints == want, "inlay hints: %r" % hints)
 check(len(resp[102]["result"]) == 2, "inlay hints only in the range: %r" % resp[102]["result"])
 
+# ---- Folding ranges and links ----
+src = (
+    "import \"lib.bastio\";\n"          # 0
+    "// one\n"                           # 1
+    "// two\n"                           # 2
+    "fn main() -> u64 {\n"               # 3
+    "  let x = 1;\n"                     # 4
+    "  if x > 0 {\n"                     # 5
+    "    return 1;\n"                    # 6
+    "  }\n"                              # 7
+    "  return 0;\n"                      # 8
+    "}\n"                                # 9
+    "fn tiny() -> u64 {\n"               # 10
+    "  return 1;\n"                      # 11
+    "}\n")                               # 12
+fu = uri("fold_test.bastio")
+resp, notes, rc = session([
+    ("textDocument/didOpen", {"textDocument": {"uri": fu, "languageId": "bastio", "version": 1, "text": src}}, False),
+    ("textDocument/foldingRange", {"textDocument": {"uri": fu}}, True),
+    ("textDocument/documentLink", {"textDocument": {"uri": fu}}, True),
+])
+folds = sorted((f["startLine"], f["endLine"], f.get("kind", "")) for f in resp[101]["result"])
+check(folds == [(1, 2, "comment"), (3, 8, ""), (5, 6, ""), (10, 11, "")], "folding ranges: %r" % folds)
+links = resp[102]["result"]
+check(len(links) == 1 and links[0]["target"] == uri("lib.bastio")
+      and links[0]["range"] == {"start": {"line": 0, "character": 8}, "end": {"line": 0, "character": 18}},
+      "import link: %r" % links)
+
 # ---- Protocol ----
 resp, notes, rc = session([("workspace/nothing", {}, True), ("$/cancelRequest", {"id": 5}, False)])
 check(resp[100]["error"]["code"] == -32601, "an unknown request gets an error")

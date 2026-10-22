@@ -21,6 +21,8 @@
 //     missing `;`, `mut`, a `match` arm, a misspelled name, an import);
 //   - inlay hints: parameter names at calls, the type of a `let` whose
 //     value is a call, a struct literal or a variant;
+//   - folding ranges (blocks and runs of comments) and links from imports
+//     to the files they name;
 //   - formatting, with bastiofmt's rules.
 //
 // Options (`initializationOptions`): `bastioc` (the compiler, default
@@ -35,6 +37,7 @@ import "complete.bastio";
 import "semantic.bastio";
 import "actions.bastio";
 import "inlay.bastio";
+import "ranges.bastio";
 
 struct State {
   uris: Vec[Bytes],
@@ -1853,6 +1856,82 @@ fn fix_import(out: &mut Vec[u64], host: &Host, st: &mut State, ix: &Prog, uri: &
   }
 }
 
+fn doc_ix(host: &Host, st: &mut State, j: &Json, root: u64) -> Prog {
+  let params = jget(j, root, "params");
+  let uri = str_of(j, jpath2(j, params, "textDocument", "uri"));
+  let k = find_doc(&mut st, uri);
+  bfree(uri);
+  if k == 0 {
+    return pg_new();
+  }
+  let path = doc_copy(&mut st.paths, k - 1);
+  let ix = pg_for(host, &mut st, path);
+  bfree(path);
+  return ix;
+}
+
+fn on_folding(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
+  let ix = doc_ix(host, &mut st, j, root);
+  let mut out = vec_new[u64]();
+  folding_ranges(ix, &mut out);
+  let mut res_ = vec_new[u64]();
+  w_s(&mut res_, "[");
+  w_append(&mut res_, out);
+  w_s(&mut res_, "]");
+  send_result(&mut con, id, res_);
+  vec_free(res_);
+  vec_free(out);
+  pg_free(ix);
+}
+
+/// Each `import "file";` is a link to the file.
+fn on_links(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
+  let mut ix = doc_ix(host, &mut st, j, root);
+  let params = jget(j, root, "params");
+  let uri = str_of(j, jpath2(j, params, "textDocument", "uri"));
+  let k = find_doc(&mut st, uri);
+  bfree(uri);
+  let mut out = vec_new[u64]();
+  if k > 0 && vec_len(ix.tstart) > 0 {
+    let path = doc_copy(&mut st.paths, k - 1);
+    let dir = parent(path);
+    bfree(path);
+    let ts = u_at(ix.tstart, 0);
+    let te = file_toks_end(ix, 0);
+    let mut i = ts;
+    while i < te && te - i > 2 && is_kw(tok_at(ix.toks, i), KW_IMPORT)
+    {
+      let name = tok_at(ix.toks, vadd(i, 1));
+      if name.kind == K_STR && name.start <= name.end && name.end <= blen(ix.all) {
+        let rel = decode(ix.all, name.start, name.end);
+        let target = resolve(host, &mut ix.ld, dir, rel);
+        bfree(rel);
+        let tu = path_to_uri(target);
+        bfree(target);
+        if vec_len(out) > 0 {
+          vec_push(&mut out, 44);
+        }
+        w_s(&mut out, "{\"range\":");
+        w_range(&mut out, ix.all, 0, name.start, name.end);
+        w_s(&mut out, ",\"target\":\"");
+        jesc_bytes(&mut out, tu, 0, blen(tu));
+        w_s(&mut out, "\"}");
+        bfree(tu);
+      }
+      i = vadd(i, 3);
+    }
+    bfree(dir);
+  }
+  let mut res_ = vec_new[u64]();
+  w_s(&mut res_, "[");
+  w_append(&mut res_, out);
+  w_s(&mut res_, "]");
+  send_result(&mut con, id, res_);
+  vec_free(res_);
+  vec_free(out);
+  pg_free(ix);
+}
+
 fn on_inlay(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
   let params = jget(j, root, "params");
   let uri = str_of(j, jpath2(j, params, "textDocument", "uri"));
@@ -1960,7 +2039,7 @@ fn on_initialize(con: &mut Serial, st: &mut State, j: &Json, root: u64, id: &Vec
   }
   let mut res_ = vec_new[u64]();
   w_s(&mut res_, "{\"capabilities\":{\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":{\"includeText\":false}},");
-  w_s(&mut res_, "\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"documentHighlightProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"completionProvider\":{\"triggerCharacters\":[\".\",\":\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"function\",\"struct\",\"enum\",\"enumMember\",\"property\",\"variable\",\"parameter\"],\"tokenModifiers\":[\"declaration\",\"readonly\"]},\"full\":true},\"documentFormattingProvider\":true,\"inlayHintProvider\":true,\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\"]}},");
+  w_s(&mut res_, "\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"documentHighlightProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"completionProvider\":{\"triggerCharacters\":[\".\",\":\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"function\",\"struct\",\"enum\",\"enumMember\",\"property\",\"variable\",\"parameter\"],\"tokenModifiers\":[\"declaration\",\"readonly\"]},\"full\":true},\"documentFormattingProvider\":true,\"inlayHintProvider\":true,\"foldingRangeProvider\":true,\"documentLinkProvider\":{},\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\"]}},");
   w_s(&mut res_, "\"serverInfo\":{\"name\":\"bastio-lsp\"}}");
   send_result(&mut con, id, res_);
   vec_free(res_);
@@ -2039,6 +2118,10 @@ fn handle(con: &mut Serial, host: &mut Host, st: &mut State, msg: Bytes) -> u64 
       on_workspace_symbols(&mut con, host, &mut st, p.j, root, id);
     } else if vec_is(method, "textDocument/documentSymbol") {
       on_symbols(&mut con, host, &mut st, p.j, root, id);
+    } else if vec_is(method, "textDocument/foldingRange") {
+      on_folding(&mut con, host, &mut st, p.j, root, id);
+    } else if vec_is(method, "textDocument/documentLink") {
+      on_links(&mut con, host, &mut st, p.j, root, id);
     } else if vec_is(method, "textDocument/inlayHint") {
       on_inlay(&mut con, host, &mut st, p.j, root, id);
     } else if vec_is(method, "textDocument/codeAction") {
