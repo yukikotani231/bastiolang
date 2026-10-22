@@ -1056,13 +1056,22 @@ static bool bst_vec_try_grow(bst_vec *v, uint64_t k, uint64_t size) {
 static inline void bst_bset(bst_bytes *b, uint64_t i, uint64_t v) { b->data[i] = (unsigned char)v; }
 /* Bulk copies. The prover has shown both ranges in bounds, so there are no
  * checks. Kernels are built with -mgeneral-regs-only and no libc, so on
- * x86-64 a forward copy is rep movsq then rep movsb, and nothing here calls
- * memcpy or memmove. */
+ * x86-64 a forward copy is one rep movsb where the platform has set
+ * bst_copy_erms (CPUID.7:EBX bit 9: fast strings copy by whole cache
+ * lines, faster than rep movsq on a page), else rep movsq then rep movsb
+ * (an emulator runs rep movsb byte by byte). Nothing here calls memcpy or
+ * memmove. */
+#if defined(__x86_64__)
+uint8_t bst_copy_erms;
+#endif
 static inline void bst_copy_fwd(unsigned char *d, const unsigned char *s, uint64_t n) {
 #if defined(__x86_64__)
-    uint64_t w = n >> 3, r = n & 7;
-    __asm__ volatile ("rep movsq" : "+D"(d), "+S"(s), "+c"(w) : : "memory");
-    __asm__ volatile ("rep movsb" : "+D"(d), "+S"(s), "+c"(r) : : "memory");
+    if (!bst_copy_erms) {
+        uint64_t w = n >> 3;
+        __asm__ volatile ("rep movsq" : "+D"(d), "+S"(s), "+c"(w) : : "memory");
+        n &= 7;
+    }
+    __asm__ volatile ("rep movsb" : "+D"(d), "+S"(s), "+c"(n) : : "memory");
 #else
     for (uint64_t k = 0; k < n; k++) d[k] = s[k];
 #endif
