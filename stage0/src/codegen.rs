@@ -598,7 +598,7 @@ static inline uint64_t bst_pt_lease_count(bst_pt *t) {
  * count moved since its last load (bst_cpu_run, bst_mmu_enter). Putting an
  * entry into an empty slot needs no reload: x86 caches no translation for
  * a slot that was not present. */
-static uint64_t bst_pt_gen;
+uint64_t bst_pt_gen;
 static inline uint64_t bst_pt_take(bst_pt *t, uint64_t i) {
     uint64_t *e = &((uint64_t *)*t)[i];
     uint64_t a = *e & BST_PTE_ADDR;
