@@ -9,7 +9,7 @@ A build has four stages, and the first two are the point of the language:
 1. **Check.** Parsing, types and ownership. A linear value that is leaked, used twice or dropped on one branch is rejected here (`E-LINEAR-*`).
 2. **Prove.** For every function the compiler walks the body, turns each obligation (an index in bounds, an addition that cannot overflow, a precondition of a callee, a loop invariant that holds on entry and is preserved) into a question for Z3, and rejects the program unless Z3 answers that no counterexample exists. The line it prints at the end, `12 proof obligation(s) discharged`, is the count of questions answered. Contracts make this modular: a function is proved against its callers' `requires` and against its own `ensures`, never by looking inside another body.
 3. **Erase.** Everything that was only for the proof, `requires`, `ensures`, `invariant`, `assert`, `spec fn`, ghost state of capabilities, leaves nothing behind. This is the zero-overhead rule: the generated code has no bounds checks, overflow checks or reference counts, because a proof replaced each of them.
-4. **Generate.** C by default, or assembly with `--backend native`, and then the C compiler or the assembler and linker.
+4. **Generate.** assembly by default for hosted programs on x86-64 Linux (native-ir), or C with `--backend c` or `--emit-c`, and then the C compiler or the assembler and linker.
 
 Because the proofs are all done by the end of stage 2, the choice of target or backend in stage 4 cannot make a program unsafe in the language's terms. It can only change what you have to trust (below) and how fast the result is.
 
@@ -78,9 +78,9 @@ The `kernel` and `user` targets write C or assembly rather than an executable, s
 | --- | --- | --- |
 | C | `--backend c` (default) | emits C11 and runs `cc -O2`. The most mature and the fastest, since the C compiler optimizes |
 | native | `--backend native` | emits x86-64 assembly directly and assembles it. The C compiler is no longer in the trusted base for your program's code. Experimental |
-| native-ir | `--backend native-ir` | the same output goal, through an intermediate representation with a register allocator. Experimental, x86-64 only, not in `--help` yet |
+| native-ir | `--backend native-ir` | the same output goal, through an intermediate representation with a register allocator. x86-64 only. The default for hosted programs on x86-64 Linux |
 
-All three produce programs with identical behavior; `tests/native.sh` builds every test and benchmark both ways and compares exit status and output. The native backends do not yet beat `cc -O2` on every benchmark, and the project's [roadmap](../ROADMAP.md) makes that a condition for making one of them the default; `bench/run.sh` prints the current gap.
+All three produce programs with identical behavior; `tests/native.sh` builds every test and benchmark both ways and compares exit status and output. A hosted program on x86-64 Linux is built with native-ir unless you pass `--backend c`, `--backend native` or `--emit-c`; macOS and AArch64 hosts (which have no ELF output) build through the C backend, as do `--arch aarch64` and the kernel and user targets. The default was switched when native-ir came within 2% of `cc -O2` in instruction count (callgrind) on every `bench/` program except sha256, which needs SIMD; `bench/run.sh` prints the current gap.
 
 ```text
 $ bastioc1 --backend native --emit-asm -o hello.s hello.bastio
