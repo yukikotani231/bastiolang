@@ -381,6 +381,7 @@ static bst_buf bst_alloc(uint64_t n) {
 static bst_buf bst_try_alloc(uint64_t n) {
     bst_buf b;
     b.data = (uint64_t *)calloc(n ? n : 1, sizeof(uint64_t));
+    __asm__ volatile ("" : "+r"(b.data)); /* clang drops a calloc that is only freed, and with it the failure */
     b.len = b.data ? n : 0;
     return b;
 }
@@ -408,6 +409,7 @@ static bst_bytes bst_balloc(uint64_t n) {
 static bst_bytes bst_try_balloc(uint64_t n) {
     bst_bytes b;
     b.data = (unsigned char *)calloc(n ? n : 1, 1);
+    __asm__ volatile ("" : "+r"(b.data)); /* clang drops a calloc that is only freed, and with it the failure */
     b.len = b.data ? n : 0;
     return b;
 }
@@ -1001,6 +1003,9 @@ static bool bst_host_env(bst_host h, bst_str name, bst_bytes *out) {
     return true;
 }
 /* The number of processors online (at least 1). */
+#if defined(__APPLE__) && !defined(_SC_NPROCESSORS_ONLN)
+#define _SC_NPROCESSORS_ONLN 58 /* -std=c11 hides it from <unistd.h> */
+#endif
 static uint64_t bst_host_cpus(bst_host h) {
     (void)h;
     long n = sysconf(_SC_NPROCESSORS_ONLN);
