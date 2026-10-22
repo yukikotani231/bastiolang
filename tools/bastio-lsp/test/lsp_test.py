@@ -550,6 +550,16 @@ check(len(links) == 1 and links[0]["target"] == uri("lib.bastio")
       and links[0]["range"] == {"start": {"line": 0, "character": 8}, "end": {"line": 0, "character": 18}},
       "import link: %r" % links)
 
+# ---- Code lenses ----
+src = "fn used() -> u64 { return 1; }\nfn unused() -> u64 { return 2; }\nfn main() -> u64 { return used() + used(); }\n"
+lu = uri("lens_test.bastio")
+resp, notes, rc = session([
+    ("textDocument/didOpen", {"textDocument": {"uri": lu, "languageId": "bastio", "version": 1, "text": src}}, False),
+    ("textDocument/codeLens", {"textDocument": {"uri": lu}}, True),
+])
+lens = [(l["range"]["start"]["line"], l["command"]["title"]) for l in resp[101]["result"]]
+check(lens == [(0, "2 references"), (1, "0 references"), (2, "0 references")], "code lenses: %r" % lens)
+
 # ---- Protocol ----
 resp, notes, rc = session([("workspace/nothing", {}, True), ("$/cancelRequest", {"id": 5}, False)])
 check(resp[100]["error"]["code"] == -32601, "an unknown request gets an error")
