@@ -318,6 +318,46 @@ check(names == sorted(["main", "double", "Pair", "a", "b", "Shape", "Dot", "Line
       "an empty query lists the definitions of the program once: %r" % names)
 check(resp[104]["result"] == [], "no match")
 
+# ---- Semantic tokens ----
+def sem(name):
+    return ("textDocument/semanticTokens/full", {"textDocument": {"uri": uri(name)}}, True)
+
+
+def decode_tokens(data):
+    out, line, ch = {}, 0, 0
+    for i in range(0, len(data), 5):
+        dl, dc, ln, ty, md = data[i:i + 5]
+        line, ch = line + dl, (ch + dc if dl == 0 else dc)
+        out[(line, ch)] = (ln, ty, md)
+    return out
+
+
+resp, notes, rc = session([open_doc("main.bastio"), open_doc("lib.bastio"), sem("main.bastio"), sem("lib.bastio")])
+leg = resp[1]["result"]["capabilities"]["semanticTokensProvider"]["legend"]
+check(leg["tokenTypes"][:3] == ["function", "struct", "enum"] and leg["tokenModifiers"] == ["declaration", "readonly"],
+      "the legend: %r" % leg)
+
+
+def tok(res, name, pos, nth=1):
+    at = where(name, pos, nth)
+    return res.get((at["line"], at["character"]))
+
+
+m = decode_tokens(resp[102]["result"]["data"])
+check(tok(m, "main.bastio", "double") == (6, 0, 0), "a call is a function: %r" % (tok(m, "main.bastio", "double"),))
+check(tok(m, "main.bastio", "Pair") == (4, 1, 0), "a struct literal names a struct")
+check(tok(m, "main.bastio", "n =") == (1, 5, 1), "a `let` is a declared variable")
+check(tok(m, "main.bastio", "n)") == (1, 5, 0), "a use of a local is a variable")
+check(tok(m, "main.bastio", "a:") == (1, 4, 0), "a field in a literal is a property")
+check(tok(m, "main.bastio", "LIMIT") == (5, 5, 2), "a constant is read-only")
+check(tok(m, "main.bastio", "Line") == (4, 3, 0), "a variant is an enum member: %r" % (tok(m, "main.bastio", "Line"),))
+check(tok(m, "main.bastio", "Shape") == (5, 2, 0), "an enum")
+check(tok(m, "main.bastio", "u64") is None, "built-in types are left to the syntax")
+l = decode_tokens(resp[103]["result"]["data"])
+check(tok(l, "lib.bastio", "double") == (6, 0, 1), "a declared function")
+check(tok(l, "lib.bastio", "x:") == (1, 6, 1), "a parameter, declared: %r" % (tok(l, "lib.bastio", "x:"),))
+check(tok(l, "lib.bastio", "LIMIT") == (5, 5, 3), "a declared constant")
+
 # ---- Diagnostics ----
 resp, notes, rc = session([open_doc("bad.bastio")])
 d = notes[0]["params"]["diagnostics"]
