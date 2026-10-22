@@ -191,6 +191,13 @@ Goal, set 2026-10-11: Bastio and BastiOS run on AArch64 as well as x86-64, on QE
 
 Invariant 1 holds on arm64: system registers and device memory are reached only through capability types. What the port adds to the trusted base (the exception vectors, early boot) is listed and reviewed under invariant 3.
 
+## Other host platforms
+
+- [x] macOS (Apple Silicon and Intel): the hosted toolchain builds with Apple clang and `tests/run.sh` passes in CI (2026-10-22). It goes through the C backend, so no Mach-O output is needed.
+- [ ] The rest of the test scripts on macOS: difftest, `tests/native.sh` (the native backend writes ELF for x86-64 Linux only), `tests/aarch64.sh`.
+- [ ] A native backend for macOS (Mach-O, Apple Silicon first), so the C compiler can leave the trusted base there too.
+- [ ] Windows.
+
 ## Performance
 
 Safety must not cost speed at run time; that is the point of proving it instead of checking it. Three things are tracked:

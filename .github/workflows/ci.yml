@@ -53,6 +53,35 @@ jobs:
           name: fuzz-findings-${{ github.sha }}
           path: fuzz-findings
           if-no-files-found: ignore
+  macos:
+    # The hosted toolchain on macOS: Apple Silicon and Intel.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Z3 and GNU coreutils
+        run: brew install z3 coreutils
+      - name: Tool versions
+        run: |
+          rustc --version
+          z3 --version
+          cc --version | head -1
+          uname -m
+      - name: Build stage0
+        run: cd stage0 && RUSTFLAGS="-D warnings" cargo build --release --locked
+      - name: Build bastioc1 with stage0
+        run: tests/bastioc1.sh
+      - name: Tests
+        run: |
+          rc=0
+          tests/run.sh > run.log 2>&1 || rc=$?
+          grep -A12 '^FAIL' run.log || true
+          tail -1 run.log
+          exit $rc
   difftest:
     # stage1/difftest.sh compares every phase of the self-hosted compiler with
     # stage0's. Its parts (DIFFTEST_PARTS) are independent, so each runs on a
