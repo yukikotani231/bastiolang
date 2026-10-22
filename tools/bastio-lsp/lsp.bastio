@@ -14,6 +14,7 @@
 //     documents and the files they import;
 //   - completion (locals, definitions and keywords; fields after `.`,
 //     variants after `::`, a struct literal's fields) and signature help;
+//   - semantic tokens (what each identifier names);
 //   - document symbols, and a search for definitions by name across the
 //     open documents and what they import (workspace symbols);
 //   - formatting, with bastiofmt's rules.
@@ -27,6 +28,7 @@
 // everything it reports about other files comes from the files on disk, or
 // from their open buffers.
 import "complete.bastio";
+import "semantic.bastio";
 
 struct State {
   uris: Vec[Bytes],
@@ -1686,6 +1688,27 @@ fn on_signature(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u
   vec_free(res_);
 }
 
+fn on_semantic(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
+  let params = jget(j, root, "params");
+  let uri = str_of(j, jpath2(j, params, "textDocument", "uri"));
+  let k = find_doc(&mut st, uri);
+  bfree(uri);
+  let mut res_ = vec_new[u64]();
+  if k > 0 {
+    let path = doc_copy(&mut st.paths, k - 1);
+    let ix = pg_for(host, &mut st, path);
+    bfree(path);
+    w_s(&mut res_, "{\"data\":[");
+    semantic_tokens(ix, &mut res_);
+    w_s(&mut res_, "]}");
+    pg_free(ix);
+  } else {
+    w_s(&mut res_, "null");
+  }
+  send_result(&mut con, id, res_);
+  vec_free(res_);
+}
+
 fn on_format(con: &mut Serial, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
   let params = jget(j, root, "params");
   let uri = str_of(j, jpath2(j, params, "textDocument", "uri"));
@@ -1752,7 +1775,7 @@ fn on_initialize(con: &mut Serial, st: &mut State, j: &Json, root: u64, id: &Vec
   }
   let mut res_ = vec_new[u64]();
   w_s(&mut res_, "{\"capabilities\":{\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":{\"includeText\":false}},");
-  w_s(&mut res_, "\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"documentHighlightProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"completionProvider\":{\"triggerCharacters\":[\".\",\":\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true,\"documentFormattingProvider\":true},");
+  w_s(&mut res_, "\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"documentHighlightProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"completionProvider\":{\"triggerCharacters\":[\".\",\":\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"function\",\"struct\",\"enum\",\"enumMember\",\"property\",\"variable\",\"parameter\"],\"tokenModifiers\":[\"declaration\",\"readonly\"]},\"full\":true},\"documentFormattingProvider\":true},");
   w_s(&mut res_, "\"serverInfo\":{\"name\":\"bastio-lsp\"}}");
   send_result(&mut con, id, res_);
   vec_free(res_);
@@ -1825,6 +1848,8 @@ fn handle(con: &mut Serial, host: &mut Host, st: &mut State, msg: Bytes) -> u64 
       on_complete(&mut con, host, &mut st, p.j, root, id);
     } else if vec_is(method, "textDocument/signatureHelp") {
       on_signature(&mut con, host, &mut st, p.j, root, id);
+    } else if vec_is(method, "textDocument/semanticTokens/full") {
+      on_semantic(&mut con, host, &mut st, p.j, root, id);
     } else if vec_is(method, "workspace/symbol") {
       on_workspace_symbols(&mut con, host, &mut st, p.j, root, id);
     } else if vec_is(method, "textDocument/documentSymbol") {

@@ -73,6 +73,15 @@ for _, r in pairs(ws or {}) do
 end
 check(found == 1, 'workspace/symbol finds double: ' .. found)
 
+-- Semantic tokens.
+local sem = vim.lsp.buf_request_sync(0, 'textDocument/semanticTokens/full',
+  { textDocument = vim.lsp.util.make_text_document_params() }, 20000)
+local ntok = 0
+for _, r in pairs(sem or {}) do
+  ntok = #((r.result or {}).data or {}) / 5
+end
+check(ntok > 10, 'semantic tokens: ' .. ntok)
+
 -- The diagnostic of the compiler appears after opening a file with an error.
 vim.cmd('edit ' .. dir .. '/bad.bastio')
 local got = vim.wait(30000, function()

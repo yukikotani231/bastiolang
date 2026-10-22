@@ -1,0 +1,92 @@
+// Semantic tokens: the identifiers of a file, each with the kind of thing it
+// names, so an editor can colour a function, a type, a variant, a field and
+// a local differently. Names that resolve to nothing (the built-in types,
+// say) are left to the editor's syntax highlighting.
+import "defs.bastio";
+
+// The legend sent in `initialize`, in this order.
+const ST_FUNCTION: u64 = 0;
+const ST_STRUCT: u64 = 1;
+const ST_ENUM: u64 = 2;
+const ST_ENUM_MEMBER: u64 = 3;
+const ST_PROPERTY: u64 = 4;
+const ST_VARIABLE: u64 = 5;
+const ST_PARAMETER: u64 = 6;
+
+// Modifier bits: `declaration`, `readonly`.
+const SM_DECLARATION: u64 = 1;
+const SM_READONLY: u64 = 2;
+
+/// Is the local binding at token `j` a parameter (`name: T` after `(`, `,`
+/// or `mut`, and not a `let`)?
+fn is_parameter(ix: &Prog, j: u64) -> bool {
+  let p = tok_at(ix.toks, vsub(j, 1));
+  let p2 = tok_at(ix.toks, vsub(j, 2));
+  if is_kw(p, KW_LET) || (is_kw(p, KW_MUT) && is_kw(p2, KW_LET)) {
+    return false;
+  }
+  return is_p(tok_at(ix.toks, vadd(j, 1)), P_COLON);
+}
+
+/// Writes the `data` array of `SemanticTokens` for file 0 of `ix`: five
+/// numbers per token, each position relative to the token before it.
+fn semantic_tokens(ix: &Prog, out: &mut Vec[u64]) {
+  let ts = u_at(ix.tstart, 0);
+  let te = file_toks_end(ix, 0);
+  let mut prev = 0;
+  let mut first = true;
+  let mut i = ts;
+  while i < te && i < vec_len(ix.toks)
+  {
+    let t = vec_get(ix.toks, i);
+    if t.kind == K_IDENT && t.start <= t.end {
+      let r = resolve_any(ix, 0, i);
+      if r.found {
+        let mut ty = ST_VARIABLE;
+        let mut mods = 0;
+        if r.local {
+          if is_parameter(ix, r.idx) {
+            ty = ST_PARAMETER;
+          }
+          if r.idx == i {
+            mods = SM_DECLARATION;
+          }
+        } else {
+          let d = def_at(ix, r.idx);
+          if d.kind == DK_FN || d.kind == DK_SPEC {
+            ty = ST_FUNCTION;
+          } else if d.kind == DK_STRUCT {
+            ty = ST_STRUCT;
+          } else if d.kind == DK_ENUM {
+            ty = ST_ENUM;
+          } else if d.kind == DK_VARIANT {
+            ty = ST_ENUM_MEMBER;
+          } else if d.kind == DK_FIELD {
+            ty = ST_PROPERTY;
+          } else {
+            mods = SM_READONLY;
+          }
+          if d.file == 0 && d.ns == t.start {
+            mods = mods + SM_DECLARATION;
+          }
+        }
+        let p = off_to_lsp(ix.all, prev, t.start);
+        if !first {
+          vec_push(&mut out, 44);
+        }
+        w_num(&mut out, p.line);
+        vec_push(&mut out, 44);
+        w_num(&mut out, p.ch);
+        vec_push(&mut out, 44);
+        w_num(&mut out, t.end - t.start);
+        vec_push(&mut out, 44);
+        w_num(&mut out, ty);
+        vec_push(&mut out, 44);
+        w_num(&mut out, mods);
+        prev = t.start;
+        first = false;
+      }
+    }
+    i = vadd(i, 1);
+  }
+}
