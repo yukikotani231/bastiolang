@@ -1658,7 +1658,105 @@ fn ra_split_loops(f: &mut IrFn, al: &IrAlloc, minrefs: u64) -> u64 {
     v = v + 1;
   }
   vec_free(sl);
+  let mut rounds = 0;
+  while made > 0 && rounds < 3 && ra_dead_movs(&mut f) > 0 {
+    rounds = wrap_add(rounds, 1);
+  }
   return made;
+}
+
+/// Removes the copies whose result is dead where they stand: no path from
+/// the copy reads the register before it is written again. The entry copies
+/// `ra_split_loops` makes for every loop a branch enters are the usual ones.
+/// Returns how many copies it removed.
+fn ra_dead_movs(f: &mut IrFn) -> u64 {
+  let n = vec_len(f.ins);
+  if n > 200000 || f.nreg > 100000000 || f.nlabel > 100000000 {
+    return 0;
+  }
+  let nr = f.nreg;
+  let bl = ra_blocks(f);
+  let lv = ra_live(f, bl);
+  let nb = vec_len(bl);
+  let nw = lv.nw;
+  let mut dead = vec_new[u64]();
+  let mut i = 0;
+  while i < n {
+    vec_push(&mut dead, 0);
+    i = wrap_add(i, 1);
+  }
+  let mut cur = vec_new[u64]();
+  let mut w = 0;
+  while w < nw {
+    vec_push(&mut cur, 0);
+    w = wrap_add(w, 1);
+  }
+  let mut count = 0;
+  let mut b = 0;
+  while b < nb {
+    let blk = vec_get(bl, b);
+    w = 0;
+    while w < nw {
+      ra_set(&mut cur, w, u_at(lv.out, wrap_add(wrap_mul(b, nw), w)));
+      w = wrap_add(w, 1);
+    }
+    let mut j = blk.e;
+    while j > blk.s && j <= vec_len(f.ins) {
+      j = wrap_sub(j, 1);
+      let q = vec_get(f.ins, j);
+      let mut ws = vec_new[u64]();
+      ra_writes(q, &mut ws);
+      let mut isdead = false;
+      if q.op == IR_MOV && q.d < nr && vec_len(ws) == 1 {
+        isdead = (u_at(cur, q.d / 64) & u_at(lv.bit, q.d % 64)) == 0;
+      }
+      if isdead {
+        ra_set(&mut dead, j, 1);
+        count = wrap_add(count, 1);
+      } else {
+        let mut x = 0;
+        while x < vec_len(ws) {
+          let r = vec_get(ws, x);
+          if r < nr {
+            ra_set(&mut cur, r / 64, u_at(cur, r / 64) & !u_at(lv.bit, r % 64));
+          }
+          x = wrap_add(x, 1);
+        }
+        let mut rs = vec_new[u64]();
+        ra_reads(f, q, &mut rs);
+        x = 0;
+        while x < vec_len(rs) {
+          let r = vec_get(rs, x);
+          if r < nr {
+            ra_set(&mut cur, r / 64, u_at(cur, r / 64) | u_at(lv.bit, r % 64));
+          }
+          x = wrap_add(x, 1);
+        }
+        vec_free(rs);
+      }
+      vec_free(ws);
+    }
+    b = wrap_add(b, 1);
+  }
+  vec_free(cur);
+  vec_free(lv.inn);
+  vec_free(lv.out);
+  vec_free(lv.bit);
+  vec_free(bl);
+  if count > 0 {
+    let mut out = vec_new[IrIns]();
+    i = 0;
+    while i < n {
+      if u_at(dead, i) == 0 {
+        vec_push(&mut out, vec_get(f.ins, i));
+      }
+      i = wrap_add(i, 1);
+    }
+    vec_free(f.ins);
+    f.ins = out;
+  }
+  vec_free(dead);
+  return count;
 }
 
 /// Do two registers that share a machine register ever live together, or
