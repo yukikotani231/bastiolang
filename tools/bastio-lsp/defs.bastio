@@ -673,3 +673,60 @@ fn doc_comment(all: &Bytes, fstart: u64, off: u64, out: &mut Vec[u64]) {
   }
   vec_free(lines);
 }
+
+/// The span of a local binding's statement or parameter, for hover: the
+/// `let` through the end of the line, or the parameter and its type.
+struct Span { s: u64, e: u64 }
+
+fn local_span(ix: &Prog, ti: u64) -> Span {
+  let t = tok_at(ix.toks, ti);
+  let p = tok_at(ix.toks, vsub(ti, 1));
+  let mut s = t.start;
+  if is_kw(p, KW_MUT) {
+    s = p.start;
+  }
+  // `let [mut] x [: T] = ...;` up to the `=`; a parameter up to `,` or `)`.
+  let mut j = vadd(ti, 1);
+  let mut depth = 0;
+  let mut e = t.end;
+  let mut stop = false;
+  while !stop && j < vec_len(ix.toks) && j < vadd(ti, 60)
+  {
+    let c = tok_at(ix.toks, j);
+    if c.kind == K_EOF {
+      stop = true;
+    } else if is_opener(c) {
+      depth = sadd(depth, 1);
+      e = c.end;
+    } else if is_closer(c) {
+      if depth == 0 {
+        stop = true;
+      } else {
+        depth = depth - 1;
+        e = c.end;
+      }
+    } else if depth == 0 && (is_p(c, P_COMMA) || is_p(c, P_EQ) || is_p(c, P_SEMI) || is_p(c, P_FATARROW)) {
+      stop = true;
+    } else {
+      e = tok_end(c);
+    }
+    j = vadd(j, 1);
+  }
+  let mut k = s;
+  if is_kw(tok_at(ix.toks, vsub(ti, 2)), KW_LET) && is_kw(p, KW_MUT) {
+    k = tok_at_start(ix.toks, vsub(ti, 2));
+  } else if is_kw(p, KW_LET) {
+    k = p.start;
+  }
+  return Span { s: k, e: e };
+}
+
+fn local_text(ix: &Prog, ti: u64, out: &mut Vec[u64]) {
+  let sp = local_span(ix, ti);
+  let mut k = sp.s;
+  while k < sp.e && k < blen(ix.all)
+  {
+    vec_push(&mut out, at(ix.all, k));
+    k = vadd(k, 1);
+  }
+}

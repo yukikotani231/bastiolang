@@ -1,0 +1,463 @@
+// Completion and signature help, from the tokens of a program and the
+// offset of the cursor in its first file. Like the definitions they offer,
+// they work on text that is half typed.
+import "defs.bastio";
+
+// LSP `CompletionItemKind`.
+const CI_FUNCTION: u64 = 3;
+const CI_FIELD: u64 = 5;
+const CI_VARIABLE: u64 = 6;
+const CI_ENUM: u64 = 13;
+const CI_KEYWORD: u64 = 14;
+const CI_ENUM_MEMBER: u64 = 20;
+const CI_CONSTANT: u64 = 21;
+const CI_STRUCT: u64 = 22;
+
+fn is_word(c: u64) -> bool {
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+}
+
+/// Where the identifier that ends at `off` starts.
+fn word_start(all: &Bytes, off: u64) -> u64 {
+  let mut k = off;
+  if k > blen(all) {
+    k = blen(all);
+  }
+  while k > 0 && is_word(at(all, k - 1))
+  {
+    k = k - 1;
+  }
+  return k;
+}
+
+/// Is offset `off` in a comment or a string literal of its line?
+fn in_comment_or_string(all: &Bytes, off: u64) -> bool {
+  let mut ls = off;
+  if ls > blen(all) {
+    ls = blen(all);
+  }
+  while ls > 0 && at(all, ls - 1) != 10
+  {
+    ls = ls - 1;
+  }
+  let mut in_str = false;
+  let mut k = ls;
+  while k < off && k < blen(all)
+  {
+    let c = at(all, k);
+    if in_str {
+      if c == 92 {
+        k = vadd(k, 1);
+      } else if c == 34 {
+        in_str = false;
+      }
+    } else if c == 34 {
+      in_str = true;
+    } else if c == 47 && at(all, vadd(k, 1)) == 47 {
+      return true;
+    }
+    k = vadd(k, 1);
+  }
+  return in_str;
+}
+
+/// Does `all[s..e]` start with `all[ps..pe]`?
+fn starts_with(all: &Bytes, s: u64, e: u64, ps: u64, pe: u64) -> bool {
+  if e < s || pe < ps || pe - ps > e - s {
+    return false;
+  }
+  return same_text(all, s, vadd(s, pe - ps), ps, pe);
+}
+
+/// Appends `all[s..e]` with runs of white space made into one space.
+fn collapse(all: &Bytes, s: u64, e: u64, out: &mut Vec[u64]) {
+  let mut sp = false;
+  let mut k = s;
+  while k < e && k < blen(all)
+  {
+    let c = at(all, k);
+    if is_space(c) {
+      sp = true;
+    } else {
+      if sp && vec_len(out) > 0 {
+        vec_push(&mut out, 32);
+      }
+      sp = false;
+      vec_push(&mut out, c);
+    }
+    k = vadd(k, 1);
+  }
+}
+
+/// Where completion items are collected: `out` holds the JSON objects of
+/// the items, `seen` the (start, end) of the names already offered, and the
+/// word typed so far is `all[ps..pe]`.
+struct Items { out: Vec[u64], seen: Vec[u64], ps: u64, pe: u64 }
+
+fn items_free(it: Items) {
+  vec_free(it.out);
+  vec_free(it.seen);
+}
+
+fn seen_has(it: &Items, all: &Bytes, s: u64, e: u64) -> bool {
+  let mut k = 0;
+  while vadd(k, 1) < vec_len(it.seen)
+  {
+    if same_text(all, u_at(it.seen, k), u_at(it.seen, vadd(k, 1)), s, e) {
+      return true;
+    }
+    k = vadd(k, 2);
+  }
+  return false;
+}
+
+/// Offers the name `all[s..e]` (if it fits the word typed and has not been
+/// offered), with `all[ds..de]` as its detail.
+fn offer(it: &mut Items, all: &Bytes, s: u64, e: u64, kind: u64, ds: u64, de: u64) {
+  if !starts_with(all, s, e, it.ps, it.pe) || seen_has(it, all, s, e) {
+    return;
+  }
+  vec_push(&mut it.seen, s);
+  vec_push(&mut it.seen, e);
+  if vec_len(it.out) > 0 {
+    vec_push(&mut it.out, 44);
+  }
+  w_s(&mut it.out, "{\"label\":\"");
+  jesc_bytes(&mut it.out, all, s, e);
+  w_s(&mut it.out, "\",\"kind\":");
+  w_num(&mut it.out, kind);
+  if de > ds {
+    let mut d = vec_new[u64]();
+    let mut e2 = de;
+    if e2 - ds > 200 {
+      e2 = vadd(ds, 200);
+    }
+    collapse(all, ds, e2, &mut d);
+    w_s(&mut it.out, ",\"detail\":\"");
+    jesc_vec(&mut it.out, d);
+    w_s(&mut it.out, "\"");
+    vec_free(d);
+  }
+  w_s(&mut it.out, "}");
+}
+
+/// Offers the keyword `w`, if it fits the word typed.
+fn offer_kw(it: &mut Items, all: &Bytes, w: Str) {
+  if it.pe < it.ps {
+    return;
+  }
+  let n = it.pe - it.ps;
+  if n > slen(w) {
+    return;
+  }
+  let mut k = 0;
+  while k < n
+    invariant k <= n && n <= slen(w)
+  {
+    if at(all, vadd(it.ps, k)) != cast[u64](sget(w, k)) {
+      return;
+    }
+    k = k + 1;
+  }
+  if vec_len(it.out) > 0 {
+    vec_push(&mut it.out, 44);
+  }
+  w_s(&mut it.out, "{\"label\":\"");
+  w_s(&mut it.out, w);
+  w_s(&mut it.out, "\",\"kind\":");
+  w_num(&mut it.out, CI_KEYWORD);
+  w_s(&mut it.out, "}");
+}
+
+fn def_kind_item(kind: u64) -> u64 {
+  if kind == DK_FN || kind == DK_SPEC { return CI_FUNCTION; }
+  if kind == DK_STRUCT { return CI_STRUCT; }
+  if kind == DK_ENUM { return CI_ENUM; }
+  if kind == DK_CONST { return CI_CONSTANT; }
+  if kind == DK_VARIANT { return CI_ENUM_MEMBER; }
+  return CI_FIELD;
+}
+
+/// Offers the members (`want` is `DK_FIELD` or `DK_VARIANT`) of the type
+/// `parent` (1 + its definition's index), or of every type if it is 0.
+fn offer_members(it: &mut Items, ix: &Prog, want: u64, parent: u64) {
+  let mut d = 0;
+  while d < vec_len(ix.defs)
+  {
+    let df = vec_get(ix.defs, d);
+    if df.kind == want && (parent == 0 || df.parent == parent) {
+      offer(&mut it, ix.all, df.ns, df.ne, def_kind_item(df.kind), df.ss, df.se);
+    }
+    d = vadd(d, 1);
+  }
+}
+
+/// The locals the function that holds offset `ps` of file 0 has declared
+/// before token `ti`, the nearest binding of a name first.
+fn offer_locals(it: &mut Items, ix: &Prog, ps: u64, ti: u64) {
+  let ts = u_at(ix.tstart, 0);
+  let mut fn_start = 0;
+  let mut have = false;
+  let mut d = 0;
+  while d < vec_len(ix.defs)
+  {
+    let df = vec_get(ix.defs, d);
+    if df.file == 0 && (df.kind == DK_FN || df.kind == DK_SPEC) && df.ss <= ps && ps <= df.ie {
+      fn_start = df.ss;
+      have = true;
+    }
+    d = vadd(d, 1);
+  }
+  if !have {
+    return;
+  }
+  let mut j = ti;
+  while j > ts
+  {
+    j = j - 1;
+    let c = tok_at(ix.toks, j);
+    if c.start < fn_start {
+      return;
+    }
+    if binding_at(ix, j, ts) {
+      let sp = local_span(ix, j);
+      offer(&mut it, ix.all, c.start, c.end, CI_VARIABLE, sp.s, sp.e);
+    }
+  }
+}
+
+/// The completion items (JSON objects, separated by commas) for the cursor
+/// at `off` of file 0: after `.` the fields, after `::` the variants (of the
+/// enum named before it, if that is known), where a struct literal's fields
+/// go that struct's fields, and elsewhere the locals in scope, the
+/// definitions of the program and the keywords.
+fn complete_items(ix: &Prog, off: u64, out: &mut Vec[u64]) {
+  let mut o = off;
+  if o > blen(ix.all) {
+    o = blen(ix.all);
+  }
+  if in_comment_or_string(ix.all, o) {
+    return;
+  }
+  let ps = word_start(ix.all, o);
+  let mut it = Items { out: vec_new[u64](), seen: vec_new[u64](), ps: ps, pe: o };
+  let mut b = ps;
+  while b > 0 && is_space(at(ix.all, b - 1))
+  {
+    b = b - 1;
+  }
+  let mut before = 0;
+  if b > 0 {
+    before = at(ix.all, b - 1);
+  }
+  let ts = u_at(ix.tstart, 0);
+  let te = file_toks_end(ix, 0);
+  // The token the word will be: the first that starts at or after it.
+  let mut ti = ts;
+  while ti < te && ti < vec_len(ix.toks) && tok_start(tok_at(ix.toks, ti)) < ps
+  {
+    ti = vadd(ti, 1);
+  }
+  let prev = tok_at(ix.toks, vsub(ti, 1));
+  let mut done = false;
+  if before == 46 {
+    offer_members(&mut it, ix, DK_FIELD, 0);
+    done = true;
+  } else if before == 58 && b >= 2 && at(ix.all, b - 2) == 58 {
+    let mut parent = 0;
+    if ti >= vadd(ts, 2) {
+      let q = resolve_at(ix, 0, ti - 2);
+      let qd = def_at(ix, q.idx);
+      if q.found && !q.local && qd.kind == DK_ENUM {
+        parent = vadd(q.idx, 1);
+      }
+    }
+    offer_members(&mut it, ix, DK_VARIANT, parent);
+    done = true;
+  } else if ti > ts && (is_p(prev, P_LBRACE) || is_p(prev, P_COMMA)) {
+    // `Name { field: ..., | }`: the fields of the struct.
+    let op = enclosing_open(ix, ti, ts);
+    if op >= 2 && is_p(tok_at(ix.toks, op - 1), P_LBRACE) {
+      let before_name = tok_at(ix.toks, vsub(op, 3));
+      let q = resolve_at(ix, 0, op - 2);
+      let qd = def_at(ix, q.idx);
+      if q.found && !q.local && qd.kind == DK_STRUCT && !(op >= 3 && (is_p(before_name, P_ARROW) || is_kw(before_name, KW_STRUCT))) {
+        offer_members(&mut it, ix, DK_FIELD, vadd(q.idx, 1));
+        done = true;
+      }
+    }
+  }
+  if !done {
+    offer_locals(&mut it, ix, ps, ti);
+    let mut d = 0;
+    while d < vec_len(ix.defs)
+    {
+      let df = vec_get(ix.defs, d);
+      if df.kind != DK_FIELD && df.kind != DK_VARIANT {
+        offer(&mut it, ix.all, df.ns, df.ne, def_kind_item(df.kind), df.ss, df.se);
+      }
+      d = vadd(d, 1);
+    }
+    offer_kw(&mut it, ix.all, "fn");
+    offer_kw(&mut it, ix.all, "struct");
+    offer_kw(&mut it, ix.all, "enum");
+    offer_kw(&mut it, ix.all, "match");
+    offer_kw(&mut it, ix.all, "is");
+    offer_kw(&mut it, ix.all, "spec");
+    offer_kw(&mut it, ix.all, "const");
+    offer_kw(&mut it, ix.all, "let");
+    offer_kw(&mut it, ix.all, "mut");
+    offer_kw(&mut it, ix.all, "if");
+    offer_kw(&mut it, ix.all, "else");
+    offer_kw(&mut it, ix.all, "while");
+    offer_kw(&mut it, ix.all, "return");
+    offer_kw(&mut it, ix.all, "import");
+    offer_kw(&mut it, ix.all, "export");
+    offer_kw(&mut it, ix.all, "unreachable");
+    offer_kw(&mut it, ix.all, "requires");
+    offer_kw(&mut it, ix.all, "ensures");
+    offer_kw(&mut it, ix.all, "invariant");
+    offer_kw(&mut it, ix.all, "assert");
+    offer_kw(&mut it, ix.all, "forall");
+    offer_kw(&mut it, ix.all, "true");
+    offer_kw(&mut it, ix.all, "false");
+  }
+  w_append(&mut out, it.out);
+  items_free(it);
+}
+
+/// Writes the `SignatureHelp` for the call that holds offset `off` of
+/// file 0, and says whether there is one: the signature of the function (or
+/// variant) called, its parameters, and which one the cursor is at.
+fn signature_help(ix: &Prog, off: u64, out: &mut Vec[u64]) -> bool {
+  let ts = u_at(ix.tstart, 0);
+  let te = file_toks_end(ix, 0);
+  let mut ti = ts;
+  while ti < te && ti < vec_len(ix.toks) && tok_start(tok_at(ix.toks, ti)) < off
+  {
+    ti = vadd(ti, 1);
+  }
+  // Back to the `(` that is still open, counting the commas at its level.
+  let mut depth = 0;
+  let mut commas = 0;
+  let mut open = 0;
+  let mut have = false;
+  let mut j = ti;
+  while j > ts && !have
+  {
+    j = j - 1;
+    let c = tok_at(ix.toks, j);
+    if is_closer(c) {
+      depth = sadd(depth, 1);
+    } else if is_opener(c) {
+      if depth > 0 {
+        depth = depth - 1;
+      } else if is_p(c, P_LPAREN) {
+        open = j;
+        have = true;
+      } else {
+        commas = 0;
+      }
+    } else if depth == 0 && is_p(c, P_COMMA) {
+      commas = sadd(commas, 1);
+    }
+  }
+  if !have || open <= ts {
+    return false;
+  }
+  let callee = tok_at(ix.toks, open - 1);
+  if callee.kind != K_IDENT || (open >= vadd(ts, 2) && is_kw(tok_at(ix.toks, open - 2), KW_FN)) {
+    return false;
+  }
+  let r = resolve_at(ix, 0, open - 1);
+  if !r.found || r.local {
+    return false;
+  }
+  let d = def_at(ix, r.idx);
+  if d.kind != DK_FN && d.kind != DK_SPEC && d.kind != DK_VARIANT {
+    return false;
+  }
+  let mut lab = vec_new[u64]();
+  collapse(ix.all, d.ss, d.se, &mut lab);
+  // The parameters: the pieces of the first `(...)`, split at its commas.
+  let mut ps = vec_new[u64]();
+  let mut nest = 0;
+  let mut started = false;
+  let mut fin = false;
+  let mut pstart = 0;
+  let mut k = 0;
+  while k < vec_len(lab) && !fin
+  {
+    let c = u_at(lab, k);
+    if c == 40 || c == 91 || c == 123 {
+      if c == 40 && !started && nest == 0 {
+        started = true;
+        pstart = vadd(k, 1);
+      }
+      nest = sadd(nest, 1);
+    } else if c == 41 || c == 93 || c == 125 {
+      if nest > 0 {
+        nest = nest - 1;
+      }
+      if started && nest == 0 {
+        if k > pstart {
+          vec_push(&mut ps, pstart);
+          vec_push(&mut ps, k);
+        }
+        fin = true;
+      }
+    } else if c == 44 && started && nest == 1 {
+      vec_push(&mut ps, pstart);
+      vec_push(&mut ps, k);
+      pstart = vadd(k, 1);
+    }
+    k = vadd(k, 1);
+  }
+  w_s(&mut out, "{\"signatures\":[{\"label\":\"");
+  jesc_vec(&mut out, lab);
+  w_s(&mut out, "\"");
+  let mut doc = vec_new[u64]();
+  doc_comment(ix.all, u_at(ix.fstart, d.file), d.ss, &mut doc);
+  if vec_len(doc) > 0 {
+    w_s(&mut out, ",\"documentation\":{\"kind\":\"markdown\",\"value\":\"");
+    jesc_vec(&mut out, doc);
+    w_s(&mut out, "\"}");
+  }
+  vec_free(doc);
+  w_s(&mut out, ",\"parameters\":[");
+  let mut n = 0;
+  while vadd(n, 1) < vec_len(ps)
+  {
+    let mut s = u_at(ps, n);
+    let mut e = u_at(ps, vadd(n, 1));
+    while s < e && u_at(lab, s) == 32
+    {
+      s = vadd(s, 1);
+    }
+    while e > s && u_at(lab, e - 1) == 32
+    {
+      e = e - 1;
+    }
+    let mut piece = vec_new[u64]();
+    let mut m = s;
+    while m < e
+    {
+      vec_push(&mut piece, u_at(lab, m));
+      m = vadd(m, 1);
+    }
+    if n > 0 {
+      vec_push(&mut out, 44);
+    }
+    w_s(&mut out, "{\"label\":\"");
+    jesc_vec(&mut out, piece);
+    w_s(&mut out, "\"}");
+    vec_free(piece);
+    n = vadd(n, 2);
+  }
+  w_s(&mut out, "]}],\"activeSignature\":0,\"activeParameter\":");
+  w_num(&mut out, commas);
+  w_s(&mut out, "}");
+  vec_free(ps);
+  vec_free(lab);
+  return true;
+}

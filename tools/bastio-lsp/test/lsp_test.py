@@ -215,6 +215,90 @@ check(len(r) == 2 and starts(r, "lib.bastio") == [pos_t(where("lib.bastio", "Dot
 r = resp[114]["result"]
 check(len(r) == 2, "references to a local declared by `let` and used after it: %r" % r)
 
+# ---- Completion and signature help ----
+# Each case is a buffer with `|` where the cursor is; the buffers are not on
+# disk (they import lib.bastio from the test directory), and are half typed.
+CASES = {
+    "word": "import \"lib.bastio\";\nfn main() -> u64 {\n  let count = 1;\n  let total = cou|\n}\n",
+    "scope": "import \"lib.bastio\";\nfn other(zed: u64) -> u64 { return zed; }\nfn main() -> u64 {\n  let count = 1;\n  |\n}\n",
+    "keyword": "fn main() -> u64 {\n  ret|\n}\n",
+    "field": "import \"lib.bastio\";\nfn main() -> u64 {\n  let p = Pair { a: 1, b: 2 };\n  let x = p.|\n}\n",
+    "variant": "import \"lib.bastio\";\nfn main() -> u64 {\n  let s = Shape::|\n}\n",
+    "literal": "import \"lib.bastio\";\nfn main() -> u64 {\n  let p = Pair { a: 1, |\n}\n",
+    "comment": "fn main() -> u64 {\n  // ret|\n}\n",
+    "string": "import \"lib|\";\nfn main() -> u64 { return 0; }\n",
+    "sig0": "import \"lib.bastio\";\nfn main() -> u64 {\n  let n = double(|\n}\n",
+    "sig1": "fn add(a: u64, b: Vec[u64]) -> u64 { return a; }\nfn main() -> u64 {\n  let n = add(1, |\n}\n",
+    "nosig": "fn add(a: u64) -> u64 { return a; }\nfn main() -> u64 {\n  let n = (1 + |\n}\n",
+    "sigvariant": "import \"lib.bastio\";\nfn main() -> u64 {\n  let s = Shape::Line(|\n}\n",
+}
+
+
+def case_uri(k):
+    return uri("case_%s.bastio" % k)
+
+
+def cursor_of(t):
+    at = t.index("|")
+    return t.replace("|", ""), {"line": t.count("\n", 0, at), "character": at - (t.rfind("\n", 0, at) + 1)}
+
+
+steps, rid = [], {}
+for k, t in CASES.items():
+    body, pos = cursor_of(t)
+    steps.append(("textDocument/didOpen", {"textDocument": {
+        "uri": case_uri(k), "languageId": "bastio", "version": 1, "text": body}}, False))
+for k, t in CASES.items():
+    body, pos = cursor_of(t)
+    method = "signatureHelp" if k.startswith(("sig", "nosig")) else "completion"
+    rid[k] = 100 + len(steps)
+    steps.append(("textDocument/" + method, {"textDocument": {"uri": case_uri(k)}, "position": pos}, True))
+resp, notes, rc = session(steps)
+caps = resp[1]["result"]["capabilities"]
+check("completionProvider" in caps and "signatureHelpProvider" in caps, "capabilities for completion and signature help")
+
+
+def labels(k):
+    return [i["label"] for i in resp[rid[k]]["result"]["items"]]
+
+
+def item(k, name):
+    return next(i for i in resp[rid[k]]["result"]["items"] if i["label"] == name)
+
+
+l = labels("word")
+check(l == ["count"],
+      "a word completes to what starts with it, a local first: %r" % l)
+check(item("word", "count")["kind"] == 6 and "let count" in item("word", "count")["detail"],
+      "a local is a variable with its declaration: %r" % item("word", "count"))
+l = labels("scope")
+check({"count", "double", "Pair", "Shape", "LIMIT", "other", "main", "fn"} <= set(l) and "zed" not in l and "a" not in l and "Dot" not in l,
+      "everything in scope, and nothing from another function, nor fields nor variants: %r" % l)
+check(item("scope", "double")["kind"] == 3 and item("scope", "Pair")["kind"] == 22
+      and item("scope", "Shape")["kind"] == 13 and item("scope", "LIMIT")["kind"] == 21
+      and "fn double(x: u64) -> u64" in item("scope", "double")["detail"],
+      "kinds and details of definitions: %r" % item("scope", "double"))
+check(labels("keyword") == ["return"], "keywords: %r" % labels("keyword"))
+check(sorted(labels("field")) == ["a", "b"], "after a dot: the fields: %r" % labels("field"))
+check(item("field", "a")["kind"] == 5 and item("field", "a")["detail"] == "a: u64", "a field: %r" % item("field", "a"))
+check(sorted(labels("variant")) == ["Dot", "Line"] and item("variant", "Line")["kind"] == 20
+      and item("variant", "Line")["detail"] == "Line(u64)",
+      "after `::`: the variants: %r" % labels("variant"))
+check(sorted(labels("literal")) == ["a", "b"], "in a struct literal: its fields: %r" % labels("literal"))
+check(labels("comment") == [] and labels("string") == [], "nothing in a comment or a string")
+
+s = resp[rid["sig0"]]["result"]
+sig = s["signatures"][0]
+check(sig["label"].startswith("fn double(x: u64) -> u64") and [p["label"] for p in sig["parameters"]] == ["x: u64"]
+      and s["activeParameter"] == 0 and "Doubles `x`." in sig["documentation"]["value"],
+      "signature help: %r" % s)
+s = resp[rid["sig1"]]["result"]
+check(s["activeParameter"] == 1 and [p["label"] for p in s["signatures"][0]["parameters"]] == ["a: u64", "b: Vec[u64]"],
+      "the second parameter, with brackets in a type: %r" % s)
+check(resp[rid["nosig"]]["result"] is None, "no signature outside a call")
+s = resp[rid["sigvariant"]]["result"]
+check(s["signatures"][0]["label"] == "Line(u64)" and s["activeParameter"] == 0, "signature of a variant: %r" % s)
+
 # ---- Diagnostics ----
 resp, notes, rc = session([open_doc("bad.bastio")])
 d = notes[0]["params"]["diagnostics"]

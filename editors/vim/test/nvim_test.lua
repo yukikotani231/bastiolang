@@ -76,6 +76,30 @@ if got then
   check(d.lnum == 1 and d.code == 'E-TYPE' and d.message:find('must be u64', 1, true), 'its place and text')
 end
 
+-- Completion and signature help, on a buffer that is half typed.
+vim.cmd('enew')
+vim.bo.filetype = 'bastio'
+vim.cmd('file ' .. dir .. '/scratch_completion.bastio')
+vim.api.nvim_buf_set_lines(0, 0, -1, false, {
+  'import "lib.bastio";', 'fn main() -> u64 {', '  let count = 1;', '  let n = dou', '}' })
+vim.wait(20000, function()
+  return #vim.lsp.get_active_clients({ bufnr = 0, name = 'bastio-lsp' }) > 0
+end, 50)
+vim.wait(1000)
+vim.fn.cursor(4, 14)
+local comp = request('textDocument/completion')
+local names = {}
+for _, i in ipairs(comp and comp.items or {}) do
+  names[#names + 1] = i.label
+end
+check(#names == 1 and names[1] == 'double', 'completion offers double: ' .. table.concat(names, ','))
+vim.api.nvim_buf_set_lines(0, 3, 4, false, { '  let n = double(' })
+vim.wait(1000)
+-- (The cursor sits after the paren, which normal mode cannot do.)
+local sig = request_with('textDocument/signatureHelp', { position = { line = 3, character = 17 } })
+check(sig and sig.signatures[1].parameters[1].label == 'x: u64' and sig.activeParameter == 0, 'signature help in a call')
+vim.bo.modified = false
+
 -- Formatting through the server.
 vim.cmd('enew')
 vim.bo.filetype = 'bastio'
