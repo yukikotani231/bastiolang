@@ -19,6 +19,8 @@
 //     open documents and what they import (workspace symbols);
 //   - code actions: quick fixes for the diagnostics of the compiler (a
 //     missing `;`, `mut`, a `match` arm, a misspelled name, an import);
+//   - inlay hints: parameter names at calls, the type of a `let` whose
+//     value is a call, a struct literal or a variant;
 //   - formatting, with bastiofmt's rules.
 //
 // Options (`initializationOptions`): `bastioc` (the compiler, default
@@ -32,6 +34,7 @@
 import "complete.bastio";
 import "semantic.bastio";
 import "actions.bastio";
+import "inlay.bastio";
 
 struct State {
   uris: Vec[Bytes],
@@ -1850,6 +1853,32 @@ fn fix_import(out: &mut Vec[u64], host: &Host, st: &mut State, ix: &Prog, uri: &
   }
 }
 
+fn on_inlay(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
+  let params = jget(j, root, "params");
+  let uri = str_of(j, jpath2(j, params, "textDocument", "uri"));
+  let k = find_doc(&mut st, uri);
+  bfree(uri);
+  let mut out = vec_new[u64]();
+  if k > 0 {
+    let path = doc_copy(&mut st.paths, k - 1);
+    let ix = pg_for(host, &mut st, path);
+    bfree(path);
+    let rs = jpath2(j, params, "range", "start");
+    let re = jpath2(j, params, "range", "end");
+    let s = lsp_to_off(ix.all, 0, jnum(j, jget(j, rs, "line")), jnum(j, jget(j, rs, "character")));
+    let e = lsp_to_off(ix.all, 0, jnum(j, jget(j, re, "line")), jnum(j, jget(j, re, "character")));
+    inlay_hints(ix, s, e, &mut out);
+    pg_free(ix);
+  }
+  let mut res_ = vec_new[u64]();
+  w_s(&mut res_, "[");
+  w_append(&mut res_, out);
+  w_s(&mut res_, "]");
+  send_result(&mut con, id, res_);
+  vec_free(res_);
+  vec_free(out);
+}
+
 /// The quick fixes for the diagnostics the editor sends with the request.
 fn on_code_action(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
   let params = jget(j, root, "params");
@@ -1931,7 +1960,7 @@ fn on_initialize(con: &mut Serial, st: &mut State, j: &Json, root: u64, id: &Vec
   }
   let mut res_ = vec_new[u64]();
   w_s(&mut res_, "{\"capabilities\":{\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":{\"includeText\":false}},");
-  w_s(&mut res_, "\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"documentHighlightProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"completionProvider\":{\"triggerCharacters\":[\".\",\":\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"function\",\"struct\",\"enum\",\"enumMember\",\"property\",\"variable\",\"parameter\"],\"tokenModifiers\":[\"declaration\",\"readonly\"]},\"full\":true},\"documentFormattingProvider\":true,\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\"]}},");
+  w_s(&mut res_, "\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"documentHighlightProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"completionProvider\":{\"triggerCharacters\":[\".\",\":\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"function\",\"struct\",\"enum\",\"enumMember\",\"property\",\"variable\",\"parameter\"],\"tokenModifiers\":[\"declaration\",\"readonly\"]},\"full\":true},\"documentFormattingProvider\":true,\"inlayHintProvider\":true,\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\"]}},");
   w_s(&mut res_, "\"serverInfo\":{\"name\":\"bastio-lsp\"}}");
   send_result(&mut con, id, res_);
   vec_free(res_);
@@ -2010,6 +2039,8 @@ fn handle(con: &mut Serial, host: &mut Host, st: &mut State, msg: Bytes) -> u64 
       on_workspace_symbols(&mut con, host, &mut st, p.j, root, id);
     } else if vec_is(method, "textDocument/documentSymbol") {
       on_symbols(&mut con, host, &mut st, p.j, root, id);
+    } else if vec_is(method, "textDocument/inlayHint") {
+      on_inlay(&mut con, host, &mut st, p.j, root, id);
     } else if vec_is(method, "textDocument/codeAction") {
       on_code_action(&mut con, host, &mut st, p.j, root, id);
     } else if vec_is(method, "textDocument/formatting") {

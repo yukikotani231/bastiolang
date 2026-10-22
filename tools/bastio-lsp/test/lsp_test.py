@@ -489,6 +489,30 @@ check([a["title"] for a in acts] == ["Import `lib.bastio`"], "fix: import titles
 e = acts[0]["edit"]["changes"][mu][0]
 check(e["newText"] == 'import "lib.bastio";\n' and e["range"]["start"] == {"line": 0, "character": 0}, "fix: the import edit: %r" % e)
 
+# ---- Inlay hints ----
+src = (
+    "fn area(w: u64, h: u64) -> u64 requires w < 1000 && h < 1000 { return w * h; }\n"
+    "struct P { a: u64 }\n"
+    "enum E { A, B(u64) }\n"
+    "fn main() -> u64 {\n"
+    "  let w = 3;\n"
+    "  let a = area(w, 4);\n"
+    "  let p = P { a: 1 };\n"
+    "  let e = E::B(2);\n"
+    "  let n = 5;\n"
+    "  return a + p.a + n;\n"
+    "}\n")
+iu = "file:///tmp/inlay_test.bastio"
+resp, notes, rc = session([
+    ("textDocument/didOpen", {"textDocument": {"uri": iu, "languageId": "bastio", "version": 1, "text": src}}, False),
+    ("textDocument/inlayHint", {"textDocument": {"uri": iu}, "range": {"start": {"line": 0, "character": 0}, "end": {"line": 11, "character": 0}}}, True),
+    ("textDocument/inlayHint", {"textDocument": {"uri": iu}, "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 30}}}, True),
+])
+hints = [(h["position"]["line"], h["position"]["character"], h["label"]) for h in resp[101]["result"]]
+want = [(5, 7, ": u64"), (5, 18, "h:"), (6, 7, ": P"), (7, 7, ": E")]
+check(hints == want, "inlay hints: %r" % hints)
+check(len(resp[102]["result"]) == 2, "inlay hints only in the range: %r" % resp[102]["result"])
+
 # ---- Protocol ----
 resp, notes, rc = session([("workspace/nothing", {}, True), ("$/cancelRequest", {"id": 5}, False)])
 check(resp[100]["error"]["code"] == -32601, "an unknown request gets an error")
