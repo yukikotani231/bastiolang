@@ -64,10 +64,10 @@ Requirements:
 | --- | --- | --- |
 | Rust | 1.97.0 | Pinned in `rust-toolchain.toml`; rustup installs it on the first build |
 | Z3 | 4.8.12 (Ubuntu 24.04 package), 5.1.0 | Must be on `PATH` as `z3`; the compiler runs it as a subprocess |
-| C compiler | GCC 13 | Called as `cc`; the generated C is C11 |
+| C compiler | GCC 13, Apple clang 15 | Called as `cc`; the generated C is C11 |
 | Python 3 | 3.12, 3.13 | Only for `stage1/difftest.sh` |
 
-Tested on x86-64 Linux (Ubuntu 24.04), which is what CI runs; other platforms are untested. On Ubuntu: `sudo apt-get install z3 build-essential python3`, plus [rustup](https://rustup.rs).
+The hosted compiler is tested on x86-64 Linux (Ubuntu 24.04) and on macOS (Apple Silicon and Intel, with `brew install z3`); CI builds it and runs `tests/run.sh` on all three. The kernel and user targets, the native backend and the other test scripts are Linux-only so far. On Ubuntu: `sudo apt-get install z3 build-essential python3`, plus [rustup](https://rustup.rs).
 
 ```sh
 git clone https://github.com/yukikotani231/bastiolang && cd bastiolang
