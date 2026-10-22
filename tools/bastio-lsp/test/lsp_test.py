@@ -474,6 +474,21 @@ check(r == [("Change to `helper`", "fn helper() -> u64 { return 1; }\nfn main() 
 r = fixes("fn main() -> u64 {\n  return zzzzzz;\n}\n")
 check(r == [], "no fix for a name that is nothing like another: %r" % r)
 
+# An unknown name that another open document defines: offer its import, after
+# the imports the file has (a new directory name is `../`-relative).
+mu = uri("fix_main.bastio")
+main_src = 'fn main() -> u64 {\n  return double(2);\n}\n'
+open_main = ("textDocument/didOpen", {"textDocument": {"uri": mu, "languageId": "bastio", "version": 1, "text": main_src}}, False)
+open_lib = open_doc("lib.bastio")
+resp, notes, rc = session([open_lib, open_main])
+d = [d for n in notes if n["params"]["uri"] == mu for d in n["params"]["diagnostics"]][0]
+resp, notes, rc = session([open_lib, open_main,
+    ("textDocument/codeAction", {"textDocument": {"uri": mu}, "range": d["range"], "context": {"diagnostics": [d]}}, True)])
+acts = resp[102]["result"]
+check([a["title"] for a in acts] == ["Import `lib.bastio`"], "fix: import titles: %r" % acts)
+e = acts[0]["edit"]["changes"][mu][0]
+check(e["newText"] == 'import "lib.bastio";\n' and e["range"]["start"] == {"line": 0, "character": 0}, "fix: the import edit: %r" % e)
+
 # ---- Protocol ----
 resp, notes, rc = session([("workspace/nothing", {}, True), ("$/cancelRequest", {"id": 5}, False)])
 check(resp[100]["error"]["code"] == -32601, "an unknown request gets an error")
