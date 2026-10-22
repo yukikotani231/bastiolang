@@ -17,6 +17,7 @@
 //   - semantic tokens (what each identifier names);
 //   - document symbols, and a search for definitions by name across the
 //     open documents and what they import (workspace symbols);
+//   - code actions: quick fixes for the diagnostics of the compiler;
 //   - formatting, with bastiofmt's rules.
 //
 // Options (`initializationOptions`): `bastioc` (the compiler, default
@@ -29,6 +30,7 @@
 // from their open buffers.
 import "complete.bastio";
 import "semantic.bastio";
+import "actions.bastio";
 
 struct State {
   uris: Vec[Bytes],
@@ -1747,6 +1749,52 @@ fn on_format(con: &mut Serial, st: &mut State, j: &Json, root: u64, id: &Vec[u64
   vec_free(res_);
 }
 
+/// The quick fixes for the diagnostics the editor sends with the request.
+fn on_code_action(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
+  let params = jget(j, root, "params");
+  let uri = str_of(j, jpath2(j, params, "textDocument", "uri"));
+  let k = find_doc(&mut st, uri);
+  let mut out = vec_new[u64]();
+  if k > 0 {
+    let path = doc_copy(&mut st.paths, k - 1);
+    let ix = pg_for(host, &mut st, path);
+    bfree(path);
+    let diags = jpath2(j, params, "context", "diagnostics");
+    let n = jcount(j, diags);
+    let mut d = 0;
+    while d < n && d < 64
+    {
+      let dn = jelem(j, diags, d);
+      let rs = jpath2(j, dn, "range", "start");
+      let re = jpath2(j, dn, "range", "end");
+      let s = lsp_to_off(ix.all, 0, jnum(j, jget(j, rs, "line")), jnum(j, jget(j, rs, "character")));
+      let e = lsp_to_off(ix.all, 0, jnum(j, jget(j, re, "line")), jnum(j, jget(j, re, "character")));
+      let mut raw = vec_new[u64]();
+      jraw(j, dn, &mut raw);
+      let mut code = vec_new[u64]();
+      jdecode(j, jget(j, dn, "code"), &mut code);
+      let mut msg = vec_new[u64]();
+      jdecode(j, jget(j, dn, "message"), &mut msg);
+      if blen(ix.all) >= s && s <= e {
+        diag_fixes(&mut out, uri, ix, raw, code, msg, s, e);
+      }
+      vec_free(raw);
+      vec_free(code);
+      vec_free(msg);
+      d = vadd(d, 1);
+    }
+    pg_free(ix);
+  }
+  let mut res_ = vec_new[u64]();
+  w_s(&mut res_, "[");
+  w_append(&mut res_, out);
+  w_s(&mut res_, "]");
+  send_result(&mut con, id, res_);
+  vec_free(res_);
+  vec_free(out);
+  bfree(uri);
+}
+
 fn on_initialize(con: &mut Serial, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
   let opts = jget(j, jget(j, root, "params"), "initializationOptions");
   let cmd = jget(j, opts, "bastioc");
@@ -1775,7 +1823,7 @@ fn on_initialize(con: &mut Serial, st: &mut State, j: &Json, root: u64, id: &Vec
   }
   let mut res_ = vec_new[u64]();
   w_s(&mut res_, "{\"capabilities\":{\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":{\"includeText\":false}},");
-  w_s(&mut res_, "\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"documentHighlightProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"completionProvider\":{\"triggerCharacters\":[\".\",\":\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"function\",\"struct\",\"enum\",\"enumMember\",\"property\",\"variable\",\"parameter\"],\"tokenModifiers\":[\"declaration\",\"readonly\"]},\"full\":true},\"documentFormattingProvider\":true},");
+  w_s(&mut res_, "\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"documentHighlightProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"completionProvider\":{\"triggerCharacters\":[\".\",\":\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"function\",\"struct\",\"enum\",\"enumMember\",\"property\",\"variable\",\"parameter\"],\"tokenModifiers\":[\"declaration\",\"readonly\"]},\"full\":true},\"documentFormattingProvider\":true,\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\"]}},");
   w_s(&mut res_, "\"serverInfo\":{\"name\":\"bastio-lsp\"}}");
   send_result(&mut con, id, res_);
   vec_free(res_);
@@ -1854,6 +1902,8 @@ fn handle(con: &mut Serial, host: &mut Host, st: &mut State, msg: Bytes) -> u64 
       on_workspace_symbols(&mut con, host, &mut st, p.j, root, id);
     } else if vec_is(method, "textDocument/documentSymbol") {
       on_symbols(&mut con, host, &mut st, p.j, root, id);
+    } else if vec_is(method, "textDocument/codeAction") {
+      on_code_action(&mut con, host, &mut st, p.j, root, id);
     } else if vec_is(method, "textDocument/formatting") {
       on_format(&mut con, &mut st, p.j, root, id);
     } else if is_request && vec_len(method) > 0 {

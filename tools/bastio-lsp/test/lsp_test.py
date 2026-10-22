@@ -430,6 +430,50 @@ edit = resp[101]["result"]
 check(len(edit) == 1 and edit[0]["newText"] == "fn main() -> u64 {\n  return 1;\n}\n",
       "formatting replaces the text: %r" % edit)
 
+# ---- Code actions ----
+def fixes(src, name="/tmp/fix_test.bastio"):
+    """Opens `src` (the compiler checks it), asks for the code actions of the
+    diagnostic it reports, and returns (title, text with the edit applied)."""
+    u = "file://" + name
+    resp, notes, rc = session([
+        ("textDocument/didOpen", {"textDocument": {"uri": u, "languageId": "bastio", "version": 1, "text": src}}, False),
+    ])
+    diags = [d for n in notes if n["method"] == "textDocument/publishDiagnostics" for d in n["params"]["diagnostics"]]
+    if not diags:
+        return None
+    d = diags[0]
+    resp, notes, rc = session([
+        ("textDocument/didOpen", {"textDocument": {"uri": u, "languageId": "bastio", "version": 1, "text": src}}, False),
+        ("textDocument/codeAction", {"textDocument": {"uri": u}, "range": d["range"],
+                                     "context": {"diagnostics": [d]}}, True),
+    ])
+    out = []
+    lines = src.split("\n")
+    for a in resp[101]["result"]:
+        t = src
+        for e in sorted(a["edit"]["changes"][u], key=lambda e: (e["range"]["start"]["line"], e["range"]["start"]["character"]), reverse=True):
+            def off(p):
+                return sum(len(l) + 1 for l in lines[:p["line"]]) + p["character"]
+            t = t[:off(e["range"]["start"])] + e["newText"] + t[off(e["range"]["end"]):]
+        out.append((a["title"], t))
+    return out
+
+
+r = fixes("fn main() -> u64 {\n  let x = 1\n  return x;\n}\n")
+check(r == [("Insert `;`", "fn main() -> u64 {\n  let x = 1;\n  return x;\n}\n")], "fix: insert a semicolon: %r" % r)
+r = fixes("fn main() -> u64 {\n  let x = 1;\n  x = 2;\n  return x;\n}\n")
+check(r == [("Declare `x` with `mut`", "fn main() -> u64 {\n  let mut x = 1;\n  x = 2;\n  return x;\n}\n")], "fix: declare with mut: %r" % r)
+r = fixes("enum Color { Red, Green, Blue }\nfn main() -> u64 {\n  let c = Color::Red;\n  match c {\n    Color::Red => { return 1; },\n    Color::Green => { return 2; },\n  }\n  return 0;\n}\n")
+check(r and r[0][0] == "Add the arm for `Color::Blue`" and "    Color::Blue => {},\n  }" in r[0][1], "fix: add a match arm: %r" % r)
+r = fixes("enum Opt { Some(u64), None }\nfn main() -> u64 {\n  let o = Opt::Some(1);\n  match o {\n    Opt::None => { return 0; },\n  }\n  return 0;\n}\n")
+check(r and "Opt::Some(_) => {}," in r[0][1], "fix: the new arm of a variant with a payload: %r" % r)
+r = fixes("fn main() -> u64 {\n  let count = 3;\n  return cuont + 1;\n}\n")
+check(r == [("Change to `count`", "fn main() -> u64 {\n  let count = 3;\n  return count + 1;\n}\n")], "fix: a misspelled variable: %r" % r)
+r = fixes("fn helper() -> u64 { return 1; }\nfn main() -> u64 {\n  return helpr();\n}\n")
+check(r == [("Change to `helper`", "fn helper() -> u64 { return 1; }\nfn main() -> u64 {\n  return helper();\n}\n")], "fix: a misspelled function: %r" % r)
+r = fixes("fn main() -> u64 {\n  return zzzzzz;\n}\n")
+check(r == [], "no fix for a name that is nothing like another: %r" % r)
+
 # ---- Protocol ----
 resp, notes, rc = session([("workspace/nothing", {}, True), ("$/cancelRequest", {"id": 5}, False)])
 check(resp[100]["error"]["code"] == -32601, "an unknown request gets an error")
