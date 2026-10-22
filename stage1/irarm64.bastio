@@ -1031,8 +1031,90 @@ fn a64_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, fr: A64F, g: &mut X86, m:
   }
 }
 
+fn a64_rot32(f: &IrFn, al: &IrAlloc, fr: A64F, m: &Mono, ub: &Vec[u64], nuse: &Vec[u64], i: u64) -> IxRot {
+  let none = IxRot { j: 0, x: 0, d: 0, k: 0 };
+  let q = ix_at(f, i);
+  if (q.op != IR_SHL && q.op != IR_SHR) || q.a >= vec_len(ub) || q.d >= vec_len(nuse) || u_at(nuse, q.d) != 1 {
+    return none;
+  }
+  // The word is below 2^32 when a bound says so or the right shift is typed
+  // u32 (a u32 value is always held zero-extended).
+  let mut small = u_at(ub, q.a) <= 4294967295;
+  if q.op == IR_SHR && kind_t(m, q.ty) == TY_U32 {
+    small = true;
+  }
+  let l1 = a64_loc(al, fr, q.b);
+  if l1.k != A64K_IMM || l1.imm < 1 || l1.imm > 31 || q.d == q.a {
+    return none;
+  }
+  let mut wp = IR_NONE;
+  let mut other = IR_NONE;
+  let mut orp = IR_NONE;
+  let mut p = wrap_add(i, 1);
+  let mut going = true;
+  while going && p < vec_len(f.ins) && p < wrap_add(i, 8) {
+    let t = ix_at(f, p);
+    let mut imm_const = false;
+    if t.op == IR_CONST {
+      let lc = a64_loc(al, fr, t.d);
+      imm_const = lc.k == A64K_IMM;
+    }
+    if imm_const {
+      p = wrap_add(p, 1);
+    } else if t.op == IR_WRAP && wp == IR_NONE && kind_t(m, t.ty) == TY_U32 && t.d < vec_len(nuse) && u_at(nuse, t.d) == 1 && t.d != q.a {
+      wp = p;
+      p = wrap_add(p, 1);
+    } else if (t.op == IR_SHL || t.op == IR_SHR) && t.op != q.op && other == IR_NONE && t.a == q.a && t.d != q.a && t.d < vec_len(nuse) && u_at(nuse, t.d) == 1 {
+      let l2 = a64_loc(al, fr, t.b);
+      if l2.k != A64K_IMM || wrap_add(l1.imm, l2.imm) != 32 {
+        return none;
+      }
+      other = p;
+      if t.op == IR_SHR && kind_t(m, t.ty) == TY_U32 {
+        small = true;
+      }
+      p = wrap_add(p, 1);
+    } else if t.op == IR_OR && wp != IR_NONE && other != IR_NONE {
+      orp = p;
+      going = false;
+    } else {
+      return none;
+    }
+  }
+  if orp == IR_NONE || !small {
+    return none;
+  }
+  let mut shl = q;
+  let mut shr = ix_at(f, other);
+  if q.op == IR_SHR {
+    shr = q;
+    shl = ix_at(f, other);
+  }
+  let w = ix_at(f, wp);
+  let o = ix_at(f, orp);
+  if w.a != shl.d || !((o.a == w.d && o.b == shr.d) || (o.b == w.d && o.a == shr.d)) || o.c != 0 || o.d == IR_NONE {
+    return none;
+  }
+  // The wrap must follow its shift, and the temporaries must not be the word.
+  let mut shl_pos = i;
+  if q.op == IR_SHR {
+    shl_pos = other;
+  }
+  if wp < shl_pos || w.d == q.a || shl.d == w.d {
+    return none;
+  }
+  let lk = a64_loc(al, fr, shl.b);
+  return IxRot { j: orp, x: q.a, d: o.d, k: lk.imm };
+}
+
+
+fn a64_rot32j(f: &IrFn, al: &IrAlloc, fr: A64F, m: &Mono, ub: &Vec[u64], nuse: &Vec[u64], i: u64) -> u64 {
+  let r = a64_rot32(f, al, fr, m, ub, nuse, i);
+  return r.j;
+}
+
 /// The body of the function: its instructions.
-fn a64_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, fr: A64F, g: &mut X86, m: &mut Mono, p: &Parser, nuse: &Vec[u64], base: u64) {
+fn a64_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, fr: A64F, g: &mut X86, m: &mut Mono, p: &Parser, nuse: &Vec[u64], ub: &Vec[u64], base: u64) {
   let n = vec_len(f.ins);
   let mut slotw = base;
   let mut i = 0;
@@ -1054,6 +1136,22 @@ fn a64_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, fr: A64F, g: &mut X86, m
     } else if q.op == IR_BR {
       let r = a64_use(&mut out, al, fr, q.a, 9);
       a64_br_reg(&mut out, r, f.x, q.b, q.c, next);
+    } else if (q.op == IR_SHL || q.op == IR_SHR) && a64_rot32j(f, al, fr, m, ub, nuse, i) != 0 {
+      // A rotation of a 32-bit word: `ror` of the low half, which clears the high half.
+      let rt = a64_rot32(f, al, fr, m, ub, nuse, i);
+      let t = a64_dest(al, fr, rt.d);
+      let rx = a64_use(&mut out, al, fr, rt.x, 9);
+      w_s(&mut out, "\tror ");
+      a64_w(&mut out, t);
+      w_s(&mut out, ", ");
+      a64_w(&mut out, rx);
+      w_s(&mut out, ", #");
+      w_num(&mut out, wrap_sub(32, rt.k));
+      w_s(&mut out, "\n");
+      a64_finish(&mut out, al, fr, rt.d, t);
+      if rt.j < n {
+        i = rt.j;
+      }
     } else if ix_is_cmp(q.op) && nq.op == IR_BR && nq.a == q.d && u_at(nuse, q.d) == 1 {
       // A comparison that only the branch after it reads: no boolean.
       let mut next2 = IR_NONE;
@@ -1382,7 +1480,33 @@ fn a64_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
     }
     k = k + 1;
   }
-  a64_body(&mut out, f, al, fr, &mut g, &mut m, p, nuse, base);
+  let ndef_b = iropt_ndef(f);
+  let cv_b = iropt_consts(f, ndef_b);
+  let mut conv_b = false;
+  let mut wb_b = vec_new[u64]();
+  let mut wi = 0;
+  while wi < vec_len(f.ins) {
+    let wq = vec_get(f.ins, wi);
+    let mut bits = 0;
+    if wq.ty != 0 && (wq.op == IR_WRAP || (wq.c == 1 && (wq.op == IR_ADD || wq.op == IR_SUB || wq.op == IR_MUL))) {
+      let kt = kind_t(m, wq.ty);
+      if kt == TY_U32 {
+        bits = 32;
+      } else if kt == TY_U16 {
+        bits = 16;
+      } else if kt == TY_U8 {
+        bits = 8;
+      }
+    }
+    vec_push(&mut wb_b, bits);
+    wi = wi + 1;
+  }
+  let ub_b = iropt_ub_all(f, ndef_b, cv_b, wb_b, &mut conv_b);
+  vec_free(wb_b);
+  a64_body(&mut out, f, al, fr, &mut g, &mut m, p, nuse, ub_b, base);
+  vec_free(ndef_b);
+  vec_free(cv_b);
+  vec_free(ub_b);
   ix_lbl(&mut out, x, IR_NONE);
   w_s(&mut out, ":\n");
   k = 0;
