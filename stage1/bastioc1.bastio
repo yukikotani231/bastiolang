@@ -308,6 +308,21 @@ fn b1_is(b: &Bytes, w: Str) -> bool {
   return spells(b, 0, blen(b), w);
 }
 
+/// Whether this compiler is itself an x86-64 ELF program, that is, whether
+/// it runs on x86-64 Linux: the native backends write ELF for that and
+/// nothing else (macOS and AArch64 hosts build through the C backend).
+fn b1_host_x86_64_elf(host: &Host) -> bool {
+  let path = bfrom("/proc/self/exe");
+  let mut b = balloc(0);
+  let mut ok = false;
+  if host_read(host, path, &mut b) && blen(b) > 19 {
+    ok = bget(b, 0) == 127 && bget(b, 1) == 69 && bget(b, 2) == 76 && bget(b, 3) == 70 && bget(b, 18) == 62;
+  }
+  bfree(b);
+  bfree(path);
+  return ok;
+}
+
 /// Runs `argv` and waits for it: its exit status (127 if it cannot run).
 fn b1_run(host: &Host, argv: Vec[Bytes]) -> u64 {
   let ch = host_spawn(host, argv);
@@ -451,7 +466,7 @@ fn b1_help(out: &mut Vec[u64]) {
   w_s(&mut out, "  --emit-c         write the generated C instead of an executable\n");
   w_s(&mut out, "  --target T       hosted (the default), or kernel or user for BastiOS (these write C, or assembly with --backend native)\n");
   w_s(&mut out, "  --arch A         x86_64 (the default) or aarch64 (hosted programs compile with aarch64-linux-gnu-gcc; --backend native: partial)\n");
-  w_s(&mut out, "  --backend B      c, or native (x86-64 assembly, or AArch64 with --arch aarch64); x86-64 hosted programs use native-ir unless --backend or --emit-c says otherwise\n");
+  w_s(&mut out, "  --backend B      c, or native (x86-64 assembly, or AArch64 with --arch aarch64); hosted programs on x86-64 Linux use native-ir unless --backend or --emit-c says otherwise\n");
   w_s(&mut out, "  --emit-asm       with --backend native: write the assembly instead of an executable\n");
   w_s(&mut out, "  --lib DIR        also look for imported files in DIR\n");
   w_s(&mut out, "  --header FILE    also write a C header for the program's `export fn`s\n");
@@ -625,9 +640,9 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
     w_s(&mut out, "usage: bastioc1 [--check] [--emit-c] [--target hosted|kernel|user] [--arch x86_64|aarch64] [--lib DIR] [--backend c|native] [--emit-asm] [--header F] [-o out] <file.bastio>...\n");
     status = 2;
   }
-  // An x86-64 program for the host is built by the native backend unless
+  // A hosted program on x86-64 Linux is built by the native backend unless
   // `--backend c` or `--emit-c` asks for C.
-  if status == 0 && !backend_set && !aarch64 && !emit_c && target == TARGET_HOSTED {
+  if status == 0 && !backend_set && !aarch64 && !emit_c && target == TARGET_HOSTED && b1_host_x86_64_elf(host) {
     native = true;
     native_ir = true;
   }
