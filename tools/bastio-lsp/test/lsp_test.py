@@ -474,6 +474,73 @@ check(r == [("Change to `helper`", "fn helper() -> u64 { return 1; }\nfn main() 
 r = fixes("fn main() -> u64 {\n  return zzzzzz;\n}\n")
 check(r == [], "no fix for a name that is nothing like another: %r" % r)
 
+# An unknown name that another open document defines: offer its import, after
+# the imports the file has (a new directory name is `../`-relative).
+mu = uri("fix_main.bastio")
+main_src = 'fn main() -> u64 {\n  return double(2);\n}\n'
+open_main = ("textDocument/didOpen", {"textDocument": {"uri": mu, "languageId": "bastio", "version": 1, "text": main_src}}, False)
+open_lib = open_doc("lib.bastio")
+resp, notes, rc = session([open_lib, open_main])
+d = [d for n in notes if n["params"]["uri"] == mu for d in n["params"]["diagnostics"]][0]
+resp, notes, rc = session([open_lib, open_main,
+    ("textDocument/codeAction", {"textDocument": {"uri": mu}, "range": d["range"], "context": {"diagnostics": [d]}}, True)])
+acts = resp[102]["result"]
+check([a["title"] for a in acts] == ["Import `lib.bastio`"], "fix: import titles: %r" % acts)
+e = acts[0]["edit"]["changes"][mu][0]
+check(e["newText"] == 'import "lib.bastio";\n' and e["range"]["start"] == {"line": 0, "character": 0}, "fix: the import edit: %r" % e)
+
+# ---- Inlay hints ----
+src = (
+    "fn area(w: u64, h: u64) -> u64 requires w < 1000 && h < 1000 { return w * h; }\n"
+    "struct P { a: u64 }\n"
+    "enum E { A, B(u64) }\n"
+    "fn main() -> u64 {\n"
+    "  let w = 3;\n"
+    "  let a = area(w, 4);\n"
+    "  let p = P { a: 1 };\n"
+    "  let e = E::B(2);\n"
+    "  let n = 5;\n"
+    "  return a + p.a + n;\n"
+    "}\n")
+iu = "file:///tmp/inlay_test.bastio"
+resp, notes, rc = session([
+    ("textDocument/didOpen", {"textDocument": {"uri": iu, "languageId": "bastio", "version": 1, "text": src}}, False),
+    ("textDocument/inlayHint", {"textDocument": {"uri": iu}, "range": {"start": {"line": 0, "character": 0}, "end": {"line": 11, "character": 0}}}, True),
+    ("textDocument/inlayHint", {"textDocument": {"uri": iu}, "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 30}}}, True),
+])
+hints = [(h["position"]["line"], h["position"]["character"], h["label"]) for h in resp[101]["result"]]
+want = [(5, 7, ": u64"), (5, 18, "h:"), (6, 7, ": P"), (7, 7, ": E")]
+check(hints == want, "inlay hints: %r" % hints)
+check(len(resp[102]["result"]) == 2, "inlay hints only in the range: %r" % resp[102]["result"])
+
+# ---- Folding ranges and links ----
+src = (
+    "import \"lib.bastio\";\n"          # 0
+    "// one\n"                           # 1
+    "// two\n"                           # 2
+    "fn main() -> u64 {\n"               # 3
+    "  let x = 1;\n"                     # 4
+    "  if x > 0 {\n"                     # 5
+    "    return 1;\n"                    # 6
+    "  }\n"                              # 7
+    "  return 0;\n"                      # 8
+    "}\n"                                # 9
+    "fn tiny() -> u64 {\n"               # 10
+    "  return 1;\n"                      # 11
+    "}\n")                               # 12
+fu = uri("fold_test.bastio")
+resp, notes, rc = session([
+    ("textDocument/didOpen", {"textDocument": {"uri": fu, "languageId": "bastio", "version": 1, "text": src}}, False),
+    ("textDocument/foldingRange", {"textDocument": {"uri": fu}}, True),
+    ("textDocument/documentLink", {"textDocument": {"uri": fu}}, True),
+])
+folds = sorted((f["startLine"], f["endLine"], f.get("kind", "")) for f in resp[101]["result"])
+check(folds == [(1, 2, "comment"), (3, 8, ""), (5, 6, ""), (10, 11, "")], "folding ranges: %r" % folds)
+links = resp[102]["result"]
+check(len(links) == 1 and links[0]["target"] == uri("lib.bastio")
+      and links[0]["range"] == {"start": {"line": 0, "character": 8}, "end": {"line": 0, "character": 18}},
+      "import link: %r" % links)
+
 # ---- Protocol ----
 resp, notes, rc = session([("workspace/nothing", {}, True), ("$/cancelRequest", {"id": 5}, False)])
 check(resp[100]["error"]["code"] == -32601, "an unknown request gets an error")
