@@ -508,6 +508,7 @@ src = (
     "fn area(w: u64, h: u64) -> u64 requires w < 1000 && h < 1000 { return w * h; }\n"
     "struct P { a: u64 }\n"
     "enum E { A, B(u64) }\n"
+    "fn mk() -> P { return P { a: 2 }; }\n"
     "fn main() -> u64 {\n"
     "  let w = 3;\n"
     "  let a = area(w, 4);\n"
@@ -526,16 +527,18 @@ src = (
     "  let t = q * 2 + r;\n"
     "  let c = cast[u8](q);\n"
     "  let fa = p.a;\n"
+    "  let pm = mk();\n"
+    "  let fb = pm.a;\n"
     "  return a + p.a + m;\n"
     "}\n")
 iu = "file:///tmp/inlay_test.bastio"
 resp, notes, rc = session([
     ("textDocument/didOpen", {"textDocument": {"uri": iu, "languageId": "bastio", "version": 1, "text": src}}, False),
-    ("textDocument/inlayHint", {"textDocument": {"uri": iu}, "range": {"start": {"line": 0, "character": 0}, "end": {"line": 24, "character": 0}}}, True),
-    ("textDocument/inlayHint", {"textDocument": {"uri": iu}, "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 30}}}, True),
+    ("textDocument/inlayHint", {"textDocument": {"uri": iu}, "range": {"start": {"line": 0, "character": 0}, "end": {"line": 26, "character": 0}}}, True),
+    ("textDocument/inlayHint", {"textDocument": {"uri": iu}, "range": {"start": {"line": 6, "character": 0}, "end": {"line": 6, "character": 30}}}, True),
 ])
 hints = [(h["position"]["line"], h["position"]["character"], h["label"]) for h in resp[101]["result"]]
-want = [(4, 7, ": u64"), (5, 7, ": u64"), (5, 18, "h:"), (6, 7, ": P"), (7, 7, ": E"), (8, 7, ": u64"), (11, 7, ": u64"), (12, 7, ": Str"), (13, 8, ": bool"), (14, 8, ": bool"), (15, 10, ": bool"), (16, 9, ": bool"), (18, 7, ": u64"), (19, 7, ": u8"), (20, 8, ": u64")]
+want = [(5, 7, ": u64"), (6, 7, ": u64"), (6, 18, "h:"), (7, 7, ": P"), (8, 7, ": E"), (9, 7, ": u64"), (12, 7, ": u64"), (13, 7, ": Str"), (14, 8, ": bool"), (15, 8, ": bool"), (16, 10, ": bool"), (17, 9, ": bool"), (19, 7, ": u64"), (20, 7, ": u8"), (21, 8, ": u64"), (22, 8, ": P"), (23, 8, ": u64")]
 check(hints == want, "inlay hints: %r" % hints)
 check(len(resp[102]["result"]) == 2, "inlay hints only in the range: %r" % resp[102]["result"])
 
