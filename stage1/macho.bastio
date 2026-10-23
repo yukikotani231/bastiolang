@@ -185,3 +185,141 @@ fn macho_text(v: &Vec[u64]) -> Vec[u64] {
   }
   return out;
 }
+
+/// One line of x86-64 assembly (AT&T syntax) for Apple's assembler: the C
+/// library's names behind `@PLT` and `@GOTPCREL` get the platform's spelling,
+/// and the numbers that differ between Linux and macOS are the macOS ones.
+fn mo_line_x86(out: &mut Vec[u64], v: &Vec[u64], s: u64, e: u64) {
+  let mut t = s;
+  while t < e && (u_at(v, t) == 9 || u_at(v, t) == 32) {
+    t = wrap_add(t, 1);
+  }
+  if ix_has_at(v, t, ".type ") || ix_has_at(v, t, ".size ") || ix_has_at(v, t, ".section .note") {
+    return;
+  }
+  if ix_has_at(v, t, ".section .rodata") {
+    w_s(&mut out, "\t.section __TEXT,__const\n");
+    return;
+  }
+  if mo_name_at(v, t, ".bss") {
+    w_s(&mut out, "\t.data\n");
+    return;
+  }
+  if ix_has_at(v, s, "main:") {
+    w_s(&mut out, "_main:");
+    mo_copy(&mut out, v, wrap_add(s, 5), e);
+    vec_push(&mut out, 10);
+    return;
+  }
+  if mo_name_at(v, t, ".globl") && ix_has_at(v, wrap_add(t, 7), "main") && !mo_ident(u_at(v, wrap_add(t, 11))) {
+    w_s(&mut out, "\t.globl _main\n");
+    return;
+  }
+  if ix_has_at(v, t, "mov $0x241, %esi") {
+    // O_WRONLY | O_CREAT | O_TRUNC
+    w_s(&mut out, "\tmov $0x601, %esi");
+    mo_copy(&mut out, v, wrap_add(t, 16), e);
+    vec_push(&mut out, 10);
+    return;
+  }
+  if ix_has_at(v, t, "mov $84, %edi") {
+    // _SC_NPROCESSORS_ONLN
+    w_s(&mut out, "\tmov $58, %edi");
+    mo_copy(&mut out, v, wrap_add(t, 13), e);
+    vec_push(&mut out, 10);
+    return;
+  }
+  let mut k = s;
+  while k < e {
+    let c = u_at(v, k);
+    if mo_ident(c) && (k == s || !mo_ident(u_at(v, wrap_sub(k, 1)))) {
+      let mut n = k;
+      while n < e && mo_ident(u_at(v, n)) {
+        n = wrap_add(n, 1);
+      }
+      if ix_has_at(v, n, "@PLT") {
+        // A C library function is called through a thunk that realigns the
+        // stack: the IR's frames are not 16-byte aligned at every call, and
+        // macOS's allocator uses aligned vector stores.
+        if mo_ext(v, k) {
+          w_s(&mut out, "bst_mo_");
+          mo_copy(&mut out, v, k, n);
+        } else {
+          mo_name(&mut out, v, k);
+        }
+        k = wrap_add(n, 4);
+      } else if ix_has_at(v, n, "@GOTPCREL") {
+        mo_name(&mut out, v, k);
+        k = n;
+      } else {
+        mo_copy(&mut out, v, k, n);
+        k = n;
+      }
+    } else {
+      vec_push(&mut out, c);
+      k = wrap_add(k, 1);
+    }
+  }
+  vec_push(&mut out, 10);
+}
+
+/// `bst_mo_name`: calls the C function `name` with the stack aligned to 16
+/// bytes (the registers, %rbp and %rax, are as the caller left them).
+fn mo_thunk(out: &mut Vec[u64], name: Str) {
+  w_s(&mut out, "bst_mo_");
+  w_s(&mut out, name);
+  w_s(&mut out, ":\n\tpush %rbp\n\tmov %rsp, %rbp\n\tand $-16, %rsp\n\tcall _");
+  w_s(&mut out, name);
+  w_s(&mut out, "\n\tleave\n\tret\n");
+}
+
+/// The Mach-O spelling of the x86-64 assembly text `v`.
+fn macho_text_x86(v: &Vec[u64]) -> Vec[u64] {
+  let mut out = vec_new[u64]();
+  let n = vec_len(v);
+  let mut s = 0;
+  while s < n {
+    let mut e = s;
+    while e < n && vec_get(v, e) != 10 {
+      e = wrap_add(e, 1);
+    }
+    mo_line_x86(&mut out, v, s, e);
+    s = wrap_add(e, 1);
+  }
+  w_s(&mut out, "\t.text\n");
+  mo_thunk(&mut out, "abort");
+  mo_thunk(&mut out, "aligned_alloc");
+  mo_thunk(&mut out, "calloc");
+  mo_thunk(&mut out, "close");
+  mo_thunk(&mut out, "exit");
+  mo_thunk(&mut out, "fclose");
+  mo_thunk(&mut out, "fcntl");
+  mo_thunk(&mut out, "fdopen");
+  mo_thunk(&mut out, "fflush");
+  mo_thunk(&mut out, "free");
+  mo_thunk(&mut out, "fwrite");
+  mo_thunk(&mut out, "getc");
+  mo_thunk(&mut out, "getchar");
+  mo_thunk(&mut out, "getenv");
+  mo_thunk(&mut out, "malloc");
+  mo_thunk(&mut out, "memcpy");
+  mo_thunk(&mut out, "memmove");
+  mo_thunk(&mut out, "memset");
+  mo_thunk(&mut out, "open");
+  mo_thunk(&mut out, "pipe");
+  mo_thunk(&mut out, "posix_spawn_file_actions_addclose");
+  mo_thunk(&mut out, "posix_spawn_file_actions_adddup2");
+  mo_thunk(&mut out, "posix_spawn_file_actions_destroy");
+  mo_thunk(&mut out, "posix_spawn_file_actions_init");
+  mo_thunk(&mut out, "posix_spawnp");
+  mo_thunk(&mut out, "printf");
+  mo_thunk(&mut out, "putchar");
+  mo_thunk(&mut out, "read");
+  mo_thunk(&mut out, "realloc");
+  mo_thunk(&mut out, "signal");
+  mo_thunk(&mut out, "strlen");
+  mo_thunk(&mut out, "sysconf");
+  mo_thunk(&mut out, "waitpid");
+  mo_thunk(&mut out, "write");
+  return out;
+}
