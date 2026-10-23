@@ -484,7 +484,11 @@ static uint32_t bst_pt_leases[BST_HOSTED_PAGES], bst_shared_refs[BST_HOSTED_PAGE
 static bst_pool bst_pool_init(void) {
     bst_pool p;
     p.size = BST_HOSTED_PAGES;
+#ifdef _WIN32
+    p.base = (uint64_t)_aligned_malloc(BST_HOSTED_PAGES * 4096, 4096);
+#else
     p.base = (uint64_t)aligned_alloc(4096, BST_HOSTED_PAGES * 4096);
+#endif
     if (!p.base) { fputs("Bastio: out of memory\n", stderr); abort(); }
     bst_run_at[0] = p.base;
     bst_run_id[1] = BST_HOSTED_PAGES;
@@ -902,10 +906,18 @@ const PRELUDE_CHILD: &str = r#"
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
+#ifdef _WIN32
+#include <io.h>
+#include <process.h>
+/* The parent's ends of the pipes are not inherited (_O_NOINHERIT), so closing
+ * a child's input reaches it as end of file. */
+#define pipe(p) _pipe((p), 65536, _O_BINARY | _O_NOINHERIT)
+#else
 #include <sys/wait.h>
 #include <spawn.h>
 extern char **environ;
-typedef struct { int pid; int in; FILE *out; } bst_child;
+#endif
+typedef struct { intptr_t pid; int in; FILE *out; } bst_child;
 /* A child that cannot be started (no such program, no pipes or processes
  * left) behaves like one that exited with 127 without output, which is
  * what a failed exec in the child looks like anyway. */
@@ -915,15 +927,27 @@ static bst_child bst_host_spawn(bst_host h, bst_vec argv) {
     int to[2], from[2];
     if (argv.len == 0 || pipe(to) != 0) return c;
     if (pipe(from) != 0) { close(to[0]); close(to[1]); return c; }
+#ifndef _WIN32
     /* The parent's ends are not inherited by later children, so closing a
      * child's input reaches it as end of file. */
     fcntl(to[1], F_SETFD, FD_CLOEXEC);
     fcntl(from[0], F_SETFD, FD_CLOEXEC);
+#endif
     char **av = (char **)malloc((argv.len + 1) * sizeof(char *));
     if (!av) { fputs("Bastio: out of memory\n", stderr); abort(); }
     for (uint64_t i = 0; i < argv.len; i++) av[i] = bst_cpath(((bst_bytes *)argv.data)[i]);
     av[argv.len] = NULL;
     fflush(NULL);
+#ifdef _WIN32
+    /* The child's ends stand in for standard input and output while it is
+     * started, the way a shell does it. */
+    intptr_t pid = -1;
+    int sin = _dup(0), sout = _dup(1);
+    if (sin >= 0 && sout >= 0 && _dup2(to[0], 0) == 0 && _dup2(from[1], 1) == 1)
+        pid = _spawnvp(_P_NOWAIT, av[0], (const char *const *)av);
+    if (sin >= 0) { _dup2(sin, 0); close(sin); }
+    if (sout >= 0) { _dup2(sout, 1); close(sout); }
+#else
     /* posix_spawn, not fork: the parent's memory is never copied, which a
      * kernel without copy-on-write (BastiOS) cannot do for a large one.
      * The parent's ends are close-on-exec already. */
@@ -937,12 +961,15 @@ static bst_child bst_host_spawn(bst_host h, bst_vec argv) {
             posix_spawnp(&pid, av[0], &fa, NULL, av, environ) != 0) pid = -1;
         posix_spawn_file_actions_destroy(&fa);
     }
+#endif
     for (uint64_t i = 0; i < argv.len; i++) free(av[i]);
     free(av);
     close(to[0]);
     close(from[1]);
     if (pid < 0) { close(to[1]); close(from[0]); return c; }
+#ifdef SIGPIPE
     signal(SIGPIPE, SIG_IGN);   /* writing to a child that has exited fails instead */
+#endif
     c.pid = pid;
     c.in = to[1];
     c.out = fdopen(from[0], "rb");
@@ -987,10 +1014,15 @@ static uint64_t bst_child_wait(bst_child c) {
     if (c.out) fclose(c.out);
     if (c.pid < 0) return 127;
     int st;
-    while (waitpid(c.pid, &st, 0) < 0) {}
+#ifdef _WIN32
+    if (_cwait(&st, c.pid, 0) < 0) return 255;
+    return (uint64_t)(unsigned)st;
+#else
+    while (waitpid((pid_t)c.pid, &st, 0) < 0) {}
     if (WIFEXITED(st)) return (uint64_t)WEXITSTATUS(st);
     if (WIFSIGNALED(st)) return 128 + (uint64_t)WTERMSIG(st);
     return 255;
+#endif
 }
 /* The environment variable `name`, if it is set. */
 static bool bst_host_env(bst_host h, bst_str name, bst_bytes *out) {
@@ -1012,7 +1044,12 @@ static bool bst_host_env(bst_host h, bst_str name, bst_bytes *out) {
 #endif
 static uint64_t bst_host_cpus(bst_host h) {
     (void)h;
+#ifdef _WIN32
+    const char *e = getenv("NUMBER_OF_PROCESSORS");
+    long n = e ? atol(e) : 1;
+#else
     long n = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
     return n < 1 ? 1 : (uint64_t)n;
 }
 "#;
