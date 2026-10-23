@@ -481,6 +481,9 @@ static void bst_host_eprint(bst_host h, bst_bytes b) {
 static uint64_t bst_run_at[1], bst_run_id[2], bst_runs;
 static uint32_t bst_pt_leases[BST_HOSTED_PAGES], bst_shared_refs[BST_HOSTED_PAGES];
 #define BST_MMIO_CHECK(b, l) ((void)(b), (void)(l))
+#ifdef _WIN32
+#include <malloc.h>
+#endif
 static bst_pool bst_pool_init(void) {
     bst_pool p;
     p.size = BST_HOSTED_PAGES;
@@ -1041,6 +1044,9 @@ static bool bst_child_read_line(bst_child *c, bst_bytes *out) {
         d[n++] = (unsigned char)ch;
     }
     if (ch == EOF && n == 0) { free(d); return false; }
+#ifdef _WIN32
+    if (n && d[n - 1] == '\r') n--;   /* Windows tools end their lines with CRLF */
+#endif
     free(out->data);
     out->len = n;
     out->data = d;
