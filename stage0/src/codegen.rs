@@ -422,9 +422,13 @@ static uint64_t bst_host_argc(bst_host h) { (void)h; return (uint64_t)bst_argc; 
 static bst_bytes bst_host_arg(bst_host h, uint64_t i) {
     (void)h;
     if (i >= (uint64_t)bst_argc) return bst_balloc(0);
-    size_t n = strlen(bst_argv[i]);
+    const char *a = bst_argv[i];
+#ifdef _WIN32
+    if (i == 0 && _pgmptr) a = _pgmptr;   /* argv[0] may lack the .exe that opens the file */
+#endif
+    size_t n = strlen(a);
     bst_bytes b = bst_balloc(n);
-    memcpy(b.data, bst_argv[i], n);
+    memcpy(b.data, a, n);
     return b;
 }
 static char *bst_cpath(bst_bytes p) {   /* a NUL-terminated copy; a NUL inside ends the path */
