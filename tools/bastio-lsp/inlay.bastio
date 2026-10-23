@@ -287,6 +287,95 @@ fn cast_type(ix: &Prog, k: u64) -> Vec[u64] {
   return out;
 }
 
+/// The struct that the local declared at token `b` holds: the type it was
+/// declared with (without a `&` or `&mut`) or the struct of the literal it
+/// was initialized with. Empty if neither says.
+fn local_struct(ix: &Prog, b: u64) -> Vec[u64] {
+  let t = declared_type(ix, b);
+  if vec_len(t) > 0 {
+    let mut out = vec_new[u64]();
+    let mut k = 0;
+    if u_at(t, 0) == 38 {
+      k = 1;
+      if vec_len(t) >= 5 && u_at(t, 1) == 109 && u_at(t, 2) == 117 && u_at(t, 3) == 116 && u_at(t, 4) == 32 {
+        k = 5;
+      }
+    }
+    while k < vec_len(t)
+    {
+      vec_push(&mut out, u_at(t, k));
+      k = vadd(k, 1);
+    }
+    vec_free(t);
+    return out;
+  }
+  vec_free(t);
+  if is_p(tok_at(ix.toks, vadd(b, 1)), P_EQ) && tok_at_kind(ix.toks, vadd(b, 2)) == K_IDENT && is_p(tok_at(ix.toks, vadd(b, 3)), P_LBRACE) {
+    let n = tok_at(ix.toks, vadd(b, 2));
+    return text_vec(ix.all, n.start, n.end);
+  }
+  return vec_new[u64]();
+}
+
+/// The type of the field `f` (token `ft`) of the local at token `lt`, if the
+/// local holds a struct that declares it: `let x = p.a;`.
+fn field_type(ix: &Prog, lt: u64, ft: u64) -> Vec[u64] {
+  let sname = local_struct(ix, lt);
+  let mut out = vec_new[u64]();
+  let f = tok_at(ix.toks, ft);
+  let mut d = 0;
+  let mut parent = 0;
+  while d < vec_len(ix.defs) && vec_len(sname) > 0
+  {
+    let df = vec_get(ix.defs, d);
+    if df.kind == DK_STRUCT && same_text_vec(ix.all, df.ns, df.ne, sname) {
+      parent = vadd(d, 1);
+    }
+    d = vadd(d, 1);
+  }
+  d = 0;
+  while d < vec_len(ix.defs) && parent > 0 && vec_len(out) == 0
+  {
+    let df = vec_get(ix.defs, d);
+    if df.kind == DK_FIELD && df.parent == parent && same_text(ix.all, df.ns, df.ne, f.start, f.end) {
+      // `name: Type`: the text after the colon.
+      let mut q = df.ne;
+      while q < df.se && at(ix.all, q) != 58
+      {
+        q = vadd(q, 1);
+      }
+      q = vadd(q, 1);
+      while q < df.se && at(ix.all, q) == 32
+      {
+        q = vadd(q, 1);
+      }
+      if q < df.se {
+        vec_free(out);
+        out = text_vec(ix.all, q, df.se);
+      }
+    }
+    d = vadd(d, 1);
+  }
+  vec_free(sname);
+  return out;
+}
+
+/// Is `all[s..e]` the text `v`?
+fn same_text_vec(all: &Bytes, s: u64, e: u64, v: &Vec[u64]) -> bool {
+  if e < s || e - s != vec_len(v) || e > blen(all) {
+    return false;
+  }
+  let mut k = 0;
+  while k < vec_len(v)
+  {
+    if cast[u64](bget(all, s + k)) != u_at(v, k) {
+      return false;
+    }
+    k = vadd(k, 1);
+  }
+  return true;
+}
+
 /// The hint for the `let` at token `i`: its type when the value says it.
 fn let_hint(ix: &Prog, i: u64, rs: u64, re: u64, out: &mut Vec[u64]) {
   let te = file_toks_end(ix, 0);
@@ -326,6 +415,13 @@ fn let_hint(ix: &Prog, i: u64, rs: u64, re: u64, out: &mut Vec[u64]) {
       }
       vec_free(lab);
       lab = t;
+    }
+  } else if is_p(next, P_DOT) && tok_at_kind(ix.toks, vadd(k, 2)) == K_IDENT && is_p(tok_at(ix.toks, vadd(k, 3)), P_SEMI) {
+    // `let x = p.a;` where `p` holds a struct that declares `a`.
+    let r = resolve_at(ix, 0, k);
+    if r.found && r.local {
+      vec_free(lab);
+      lab = field_type(ix, r.idx, vadd(k, 2));
     }
   } else if is_p(next, P_SEMI) {
     // `let x = y;` where `y` was declared with a type.
