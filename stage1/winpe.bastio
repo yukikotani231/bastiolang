@@ -132,7 +132,7 @@ fn wn_tail(out: &mut Vec[u64]) {
   w_s(&mut out, "\tcall bst_prog_main\n\tadd $40, %rsp\n\tpop %rbx\n\tpop %rsi\n\tpop %rdi\n\tpop %rbp\n\tret\n");
   wn_thunk(&mut out, "abort", "abort");
   w_s(&mut out, "bst_wn_aligned_alloc:\n\tpush %rbp\n\tmov %rsp, %rbp\n\tsub $32, %rsp\n\tand $-16, %rsp\n");
-  w_s(&mut out, "\tmov %rdi, %rdx\n\tmov %rsi, %rcx\n\tcall _aligned_malloc\n\tleave\n\tret\n");
+  w_s(&mut out, "\tmov %rdi, %rdx\n\tmov %rsi, %rcx\n\tcall _aligned_malloc\n\tmov %rax, bst_w_aligned(%rip)\n\tleave\n\tret\n");
   wn_thunk(&mut out, "calloc", "calloc");
   wn_thunk(&mut out, "close", "_close");
   wn_thunk(&mut out, "exit", "exit");
@@ -140,7 +140,10 @@ fn wn_tail(out: &mut Vec[u64]) {
   wn_stub(&mut out, "fcntl", "0");
   wn_thunk(&mut out, "fdopen", "_fdopen");
   wn_thunk(&mut out, "fflush", "fflush");
-  wn_thunk(&mut out, "free", "free");
+  // The only aligned block (the simulated pool) must go back through
+  // _aligned_free; everything else is malloc's.
+  w_s(&mut out, "bst_wn_free:\n\tpush %rbp\n\tmov %rsp, %rbp\n\tsub $32, %rsp\n\tand $-16, %rsp\n\tmov %rdi, %rcx\n");
+  w_s(&mut out, "\tcmp bst_w_aligned(%rip), %rcx\n\tjne 1f\n\tcall _aligned_free\n\tleave\n\tret\n1:\tcall free\n\tleave\n\tret\n");
   wn_thunk(&mut out, "fwrite", "fwrite");
   wn_thunk(&mut out, "getc", "getc");
   wn_thunk(&mut out, "getchar", "getchar");
@@ -169,7 +172,7 @@ fn wn_tail(out: &mut Vec[u64]) {
   w_s(&mut out, "\tmov $0xffff, %ecx\n\tcall GetActiveProcessorCount\n\tleave\n\tret\n");
   wn_stub(&mut out, "waitpid", "-1");
   wn_thunk(&mut out, "write", "_write");
-  w_s(&mut out, "\t.section .rdata,\"dr\"\nbst_w_mode:\n\t.asciz \"w\"\n\t.data\n\t.p2align 3\nbst_w_stderr:\n\t.quad 0\nbst_w_null:\n\t.quad 0\n");
+  w_s(&mut out, "\t.section .rdata,\"dr\"\nbst_w_mode:\n\t.asciz \"w\"\n\t.data\n\t.p2align 3\nbst_w_stderr:\n\t.quad 0\nbst_w_null:\n\t.quad 0\nbst_w_aligned:\n\t.quad 0\n");
 }
 
 /// The Windows spelling of the x86-64 assembly text `v`.
