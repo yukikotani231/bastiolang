@@ -498,7 +498,11 @@ static bst_pool bst_pool_init(void) {
     bst_runs = 1;
     return p;
 }
+#ifdef _WIN32
+static void bst_pool_fini(bst_pool p) { _aligned_free((void *)p.base); }
+#else
 static void bst_pool_fini(bst_pool p) { free((void *)p.base); }
+#endif
 "#;
 
 /* Pages and page tables: shared by the hosted simulation and the kernel.
