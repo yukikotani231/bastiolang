@@ -436,6 +436,9 @@ static char *bst_cpath(bst_bytes p) {   /* a NUL-terminated copy; a NUL inside e
     if (!c) { fputs("Bastio: out of memory\n", stderr); abort(); }
     memcpy(c, p.data, p.len);
     c[p.len] = 0;
+#ifdef _WIN32
+    if (p.len == 9 && memcmp(c, "/dev/null", 9) == 0) memcpy(c, "NUL", 4);
+#endif
     return c;
 }
 static bool bst_host_read(bst_host h, bst_bytes path, bst_bytes *out) {
