@@ -17,9 +17,10 @@
 // - `main` becomes the Win64 entry point: it puts the standard streams in
 //   binary mode, makes `stderr` unbuffered and calls the program with the
 //   System V registers. `stdout` flushes through `fflush(NULL)`.
-// - There is no fork on Windows: starting a child process fails, as
-//   `posix_spawnp` failing does on Linux, and the signal, descriptor-flag
-//   and wait calls around it do nothing.
+// - There is no fork on Windows: `posix_spawnp` records the `dup2` actions,
+//   does them on the parent's own descriptors around `_spawnvp` and undoes
+//   them; pipes are not inheritable, `waitpid` is `_cwait` with the status
+//   in wait's encoding. Signals and descriptor flags do nothing.
 //
 // Part of the trusted base like the runtime text it rewrites.
 import "macho.bastio";
@@ -29,6 +30,14 @@ fn wn_line(out: &mut Vec[u64], v: &Vec[u64], s: u64, e: u64) {
   let mut t = s;
   while t < e && (u_at(v, t) == 9 || u_at(v, t) == 32) {
     t = wrap_add(t, 1);
+  }
+  let mut f = t;
+  while f < e {
+    if ix_has_at(v, f, "# from[2]") {
+      // The pipe from a child carries text: its line ends are CR LF.
+      w_s(&mut out, "\tmovl $1, bst_w_pipe_text(%rip)\n");
+    }
+    f = wrap_add(f, 1);
   }
   if ix_has_at(v, t, ".type ") || ix_has_at(v, t, ".size ") || ix_has_at(v, t, ".section .note") {
     return;
@@ -120,6 +129,40 @@ fn wn_stub(out: &mut Vec[u64], name: Str, value: Str) {
   w_s(&mut out, ", %eax\n\tret\n");
 }
 
+/// `posix_spawnp`: the recorded `dup2` actions are done on this process's own
+/// descriptors around `_spawnvp` (the children inherit descriptors 0 to 2 and
+/// the pipes are made not inheritable), then undone. Returns 0 or 1.
+fn wn_spawn(out: &mut Vec[u64]) {
+  w_s(&mut out, "bst_wn_posix_spawnp:\n\tpush %rbp\n\tmov %rsp, %rbp\n\tpush %rbx\n\tpush %r12\n\tpush %r13\n\tpush %r14\n\tpush %r15\n");
+  w_s(&mut out, "\tsub $160, %rsp\n\tand $-16, %rsp\n\tmov %rdi, -48(%rbp)\n\tmov %rsi, -56(%rbp)\n\tmov %r8, %r13\n\txor %ebx, %ebx\n");
+  // The C runtime joins the arguments with blanks and does not quote them.
+  w_s(&mut out, "9:\tcmpq $0, (%r13,%rbx,8)\n\tje 8f\n\tinc %ebx\n\tjmp 9b\n");
+  w_s(&mut out, "8:\tmov %rbx, -72(%rbp)\n\tlea 8(,%rbx,8), %rcx\n\tcall malloc\n\tmov %rax, %r14\n\txor %r15d, %r15d\n");
+  w_s(&mut out, "7:\tcmp %rbx, %r15\n\tjae 6f\n\tmov (%r13,%r15,8), %rdi\n\tcall bst_wn_quote\n\tmov %rax, (%r14,%r15,8)\n\tinc %r15\n\tjmp 7b\n");
+  w_s(&mut out, "6:\tmovq $0, (%r14,%rbx,8)\n\txor %ebx, %ebx\n");
+  w_s(&mut out, "1:\tcmp bst_w_nacts(%rip), %ebx\n\tjge 2f\n\tlea bst_w_acts(%rip), %rax\n\tmov 4(%rax,%rbx,8), %ecx\n\tcall _dup\n");
+  w_s(&mut out, "\tmov %eax, -96(%rbp,%rbx,4)\n\tlea bst_w_acts(%rip), %rax\n\tmov (%rax,%rbx,8), %ecx\n\tmov 4(%rax,%rbx,8), %edx\n\tcall _dup2\n\tinc %ebx\n\tjmp 1b\n");
+  w_s(&mut out, "2:\tmov %r14, %r8\n\tmov -56(%rbp), %rdx\n\tmov $1, %ecx\n\tcall _spawnvp\n\tmov %rax, %r12\n\txor %ebx, %ebx\n");
+  w_s(&mut out, "3:\tcmp bst_w_nacts(%rip), %ebx\n\tjge 4f\n\tlea bst_w_acts(%rip), %rax\n\tmov 4(%rax,%rbx,8), %edx\n\tmov -96(%rbp,%rbx,4), %ecx\n\tcall _dup2\n");
+  w_s(&mut out, "\tmov -96(%rbp,%rbx,4), %ecx\n\tcall _close\n\tinc %ebx\n\tjmp 3b\n");
+  w_s(&mut out, "4:\txor %ebx, %ebx\n5:\tcmp -72(%rbp), %rbx\n\tjae 0f\n\tmov (%r14,%rbx,8), %rcx\n\tcall free\n\tinc %ebx\n\tjmp 5b\n");
+  w_s(&mut out, "0:\tmov %r14, %rcx\n\tcall free\n\tmov $1, %eax\n\tcmp $-1, %r12\n\tje 5f\n\tmov -48(%rbp), %rax\n\tmov %r12d, (%rax)\n\txor %eax, %eax\n");
+  w_s(&mut out, "5:\tlea -40(%rbp), %rsp\n\tpop %r15\n\tpop %r14\n\tpop %r13\n\tpop %r12\n\tpop %rbx\n\tpop %rbp\n\tret\n");
+}
+
+/// `bst_wn_quote`: the argument `%rdi` in quotes, as the C runtime's command
+/// line parser reads them back (a malloc'd string in `%rax`).
+fn wn_quote(out: &mut Vec[u64]) {
+  w_s(&mut out, "bst_wn_quote:\n\tpush %rbp\n\tmov %rsp, %rbp\n\tpush %rbx\n\tpush %r12\n\tpush %r13\n\tsub $40, %rsp\n\tand $-16, %rsp\n");
+  w_s(&mut out, "\tmov %rdi, %rbx\n\tmov %rbx, %rcx\n\tcall strlen\n\tlea 3(,%rax,2), %rcx\n\tcall malloc\n\tmov %rax, %r12\n\tmov %rax, %r13\n");
+  w_s(&mut out, "\tmovb $34, (%r13)\n\tinc %r13\n\txor %ecx, %ecx\n");
+  w_s(&mut out, "1:\tmovzbl (%rbx), %eax\n\ttest %eax, %eax\n\tjz 5f\n\tinc %rbx\n\tcmp $92, %eax\n\tjne 2f\n\tinc %ecx\n\tmovb $92, (%r13)\n\tinc %r13\n\tjmp 1b\n");
+  w_s(&mut out, "2:\tcmp $34, %eax\n\tjne 3f\n\tmov %ecx, %edx\n6:\ttest %edx, %edx\n\tjz 7f\n\tmovb $92, (%r13)\n\tinc %r13\n\tdec %edx\n\tjmp 6b\n");
+  w_s(&mut out, "7:\tmovb $92, (%r13)\n\tinc %r13\n3:\txor %ecx, %ecx\n\tmov %al, (%r13)\n\tinc %r13\n\tjmp 1b\n");
+  w_s(&mut out, "5:\ttest %ecx, %ecx\n8:\tjz 9f\n\tmovb $92, (%r13)\n\tinc %r13\n\tdec %ecx\n\tjmp 8b\n");
+  w_s(&mut out, "9:\tmovb $34, (%r13)\n\tmovb $0, 1(%r13)\n\tmov %r12, %rax\n\tlea -24(%rbp), %rsp\n\tpop %r13\n\tpop %r12\n\tpop %rbx\n\tpop %rbp\n\tret\n");
+}
+
 /// The entry point, the thunks and the data they use.
 fn wn_tail(out: &mut Vec[u64]) {
   w_s(&mut out, "\t.text\n\t.globl main\nmain:\n\tpush %rbp\n\tpush %rdi\n\tpush %rsi\n\tpush %rbx\n\tsub $40, %rsp\n");
@@ -156,12 +199,15 @@ fn wn_tail(out: &mut Vec[u64]) {
   w_s(&mut out, "\tpush %rbp\n\tmov %rsp, %rbp\n\tsub $32, %rsp\n\tand $-16, %rsp\n");
   w_s(&mut out, "\tmov %rdx, %r8\n\tmov %rsi, %rdx\n\tmov %rdi, %rcx\n\tcall _open\n\tleave\n\tret\n");
   w_s(&mut out, "bst_wn_pipe:\n\tpush %rbp\n\tmov %rsp, %rbp\n\tsub $32, %rsp\n\tand $-16, %rsp\n");
-  w_s(&mut out, "\tmov %rdi, %rcx\n\tmov $65536, %edx\n\tmov $0x8000, %r8d\n\tcall _pipe\n\tleave\n\tret\n");
+  w_s(&mut out, "\tmov %rdi, %rcx\n\tmov $65536, %edx\n\tmov $0x8080, %r8d\n\tcmpl $0, bst_w_pipe_text(%rip)\n\tje 1f\n");
+  w_s(&mut out, "\tmov $0x4080, %r8d\n\tmovl $0, bst_w_pipe_text(%rip)\n1:\tcall _pipe\n\tleave\n\tret\n");
   wn_stub(&mut out, "posix_spawn_file_actions_addclose", "0");
-  wn_stub(&mut out, "posix_spawn_file_actions_adddup2", "0");
+  w_s(&mut out, "bst_wn_posix_spawn_file_actions_adddup2:\n\tmov bst_w_nacts(%rip), %eax\n\tlea bst_w_acts(%rip), %rcx\n");
+  w_s(&mut out, "\tmov %esi, (%rcx,%rax,8)\n\tmov %edx, 4(%rcx,%rax,8)\n\tinc %eax\n\tmov %eax, bst_w_nacts(%rip)\n\txor %eax, %eax\n\tret\n");
   wn_stub(&mut out, "posix_spawn_file_actions_destroy", "0");
-  wn_stub(&mut out, "posix_spawn_file_actions_init", "0");
-  wn_stub(&mut out, "posix_spawnp", "1");
+  w_s(&mut out, "bst_wn_posix_spawn_file_actions_init:\n\tmovl $0, bst_w_nacts(%rip)\n\txor %eax, %eax\n\tret\n");
+  wn_spawn(&mut out);
+  wn_quote(&mut out);
   wn_thunk(&mut out, "printf", "printf");
   wn_thunk(&mut out, "putchar", "putchar");
   wn_thunk(&mut out, "read", "_read");
@@ -170,9 +216,12 @@ fn wn_tail(out: &mut Vec[u64]) {
   wn_thunk(&mut out, "strlen", "strlen");
   w_s(&mut out, "bst_wn_sysconf:\n\tpush %rbp\n\tmov %rsp, %rbp\n\tsub $32, %rsp\n\tand $-16, %rsp\n");
   w_s(&mut out, "\tmov $0xffff, %ecx\n\tcall GetActiveProcessorCount\n\tleave\n\tret\n");
-  wn_stub(&mut out, "waitpid", "-1");
+  // _cwait gives the exit status itself; the caller expects wait's encoding.
+  w_s(&mut out, "bst_wn_waitpid:\n\tpush %rbp\n\tmov %rsp, %rbp\n\tsub $32, %rsp\n\tand $-16, %rsp\n");
+  w_s(&mut out, "\tmov %rsi, %rcx\n\tmovslq %edi, %rdx\n\txor %r8d, %r8d\n\tcall _cwait\n");
+  w_s(&mut out, "\tcmp $-1, %eax\n\tje 2f\n\tshll $8, (%rsi)\n\tleave\n\tret\n2:\tmovl $0x7f00, (%rsi)\n\txor %eax, %eax\n\tleave\n\tret\n");
   wn_thunk(&mut out, "write", "_write");
-  w_s(&mut out, "\t.section .rdata,\"dr\"\nbst_w_mode:\n\t.asciz \"w\"\n\t.data\n\t.p2align 3\nbst_w_stderr:\n\t.quad 0\nbst_w_null:\n\t.quad 0\nbst_w_aligned:\n\t.quad 0\n");
+  w_s(&mut out, "\t.section .rdata,\"dr\"\nbst_w_mode:\n\t.asciz \"w\"\n\t.data\n\t.p2align 3\nbst_w_stderr:\n\t.quad 0\nbst_w_null:\n\t.quad 0\nbst_w_aligned:\n\t.quad 0\nbst_w_pipe_text:\n\t.long 0\n\t.long 0\nbst_w_nacts:\n\t.long 0\n\t.long 0\nbst_w_acts:\n\t.zero 64\n");
 }
 
 /// The Windows spelling of the x86-64 assembly text `v`.
