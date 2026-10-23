@@ -519,16 +519,18 @@ src = (
     "  let both = ok && n == 1;\n"
     "  let not = !ok;\n"
     "  let sum = n + 1;\n"
+    "  let t = q * 2 + r;\n"
+    "  let c = cast[u8](q);\n"
     "  return a + p.a + m;\n"
     "}\n")
 iu = "file:///tmp/inlay_test.bastio"
 resp, notes, rc = session([
     ("textDocument/didOpen", {"textDocument": {"uri": iu, "languageId": "bastio", "version": 1, "text": src}}, False),
-    ("textDocument/inlayHint", {"textDocument": {"uri": iu}, "range": {"start": {"line": 0, "character": 0}, "end": {"line": 17, "character": 0}}}, True),
+    ("textDocument/inlayHint", {"textDocument": {"uri": iu}, "range": {"start": {"line": 0, "character": 0}, "end": {"line": 22, "character": 0}}}, True),
     ("textDocument/inlayHint", {"textDocument": {"uri": iu}, "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 30}}}, True),
 ])
 hints = [(h["position"]["line"], h["position"]["character"], h["label"]) for h in resp[101]["result"]]
-want = [(4, 7, ": u64"), (5, 7, ": u64"), (5, 18, "h:"), (6, 7, ": P"), (7, 7, ": E"), (8, 7, ": u64"), (11, 7, ": u64"), (12, 7, ": Str"), (13, 8, ": bool"), (14, 8, ": bool"), (15, 10, ": bool"), (16, 9, ": bool")]
+want = [(4, 7, ": u64"), (5, 7, ": u64"), (5, 18, "h:"), (6, 7, ": P"), (7, 7, ": E"), (8, 7, ": u64"), (11, 7, ": u64"), (12, 7, ": Str"), (13, 8, ": bool"), (14, 8, ": bool"), (15, 10, ": bool"), (16, 9, ": bool"), (18, 7, ": u64"), (19, 7, ": u8")]
 check(hints == want, "inlay hints: %r" % hints)
 check(len(resp[102]["result"]) == 2, "inlay hints only in the range: %r" % resp[102]["result"])
 
