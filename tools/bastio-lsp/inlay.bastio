@@ -228,6 +228,65 @@ fn is_bool_value(ix: &Prog, k: u64) -> bool {
   return found && stop && is_p(tok_at(ix.toks, vsub(j, 1)), P_SEMI);
 }
 
+fn is_arith(c: Tok) -> bool {
+  return is_p(c, P_PLUS) || is_p(c, P_MINUS) || is_p(c, P_STAR) || is_p(c, P_SLASH) || is_p(c, P_PERCENT);
+}
+
+/// The type of `a + 1 * b`: a value of names, integers and arithmetic that
+/// starts at token `k` and ends at the next `;` has the declared type of its
+/// first name, if that is a local with one. Empty if the value is anything else.
+fn arith_type(ix: &Prog, k: u64) -> Vec[u64] {
+  let te = file_toks_end(ix, 0);
+  let mut j = k;
+  let mut ok = true;
+  let mut first = 0;
+  let mut stop = false;
+  while j < te && !stop && ok && vsub(j, k) < 60
+  {
+    let c = tok_at(ix.toks, j);
+    if is_p(c, P_SEMI) {
+      stop = true;
+    } else if c.kind == K_IDENT {
+      if first == 0 {
+        first = j;
+      }
+    } else if c.kind != K_INT && !is_arith(c) {
+      ok = false;
+    }
+    if !stop {
+      j = vadd(j, 1);
+    }
+  }
+  if ok && stop && first > 0 {
+    let r = resolve_at(ix, 0, first);
+    if r.found && r.local {
+      return declared_type(ix, r.idx);
+    }
+  }
+  return vec_new[u64]();
+}
+
+/// The type `T` of `cast[T](x)` when token `k` starts the value of a `let`, or
+/// nothing if the value is anything else.
+fn cast_type(ix: &Prog, k: u64) -> Vec[u64] {
+  let te = file_toks_end(ix, 0);
+  let mut w = vec_new[u64]();
+  w_s(&mut w, "cast");
+  let mut out = vec_new[u64]();
+  if tok_spells(ix, k, w) && is_p(tok_at(ix.toks, vadd(k, 1)), P_LBRACKET) {
+    let rb = match_close(ix.toks, vadd(k, 1), te);
+    if rb > vadd(k, 2) && is_p(tok_at(ix.toks, vadd(rb, 1)), P_LPAREN) {
+      let rp = match_close(ix.toks, vadd(rb, 1), te);
+      if is_p(tok_at(ix.toks, vadd(rp, 1)), P_SEMI) {
+        vec_free(out);
+        out = text_vec(ix.all, tok_start(tok_at(ix.toks, vadd(k, 2))), tok_end(tok_at(ix.toks, vsub(rb, 1))));
+      }
+    }
+  }
+  vec_free(w);
+  return out;
+}
+
 /// The hint for the `let` at token `i`: its type when the value says it.
 fn let_hint(ix: &Prog, i: u64, rs: u64, re: u64, out: &mut Vec[u64]) {
   let te = file_toks_end(ix, 0);
@@ -275,6 +334,14 @@ fn let_hint(ix: &Prog, i: u64, rs: u64, re: u64, out: &mut Vec[u64]) {
       vec_free(lab);
       lab = declared_type(ix, r.idx);
     }
+  } else if is_arith(next) {
+    // `let x = a + 1;` where `a` was declared with a type.
+    vec_free(lab);
+    lab = arith_type(ix, k);
+  } else if is_p(next, P_LBRACKET) {
+    // `let x = cast[T](..);`
+    vec_free(lab);
+    lab = cast_type(ix, k);
   } else if is_p(next, P_LPAREN) {
     // `let x = f(..);`
     let close = match_close(ix.toks, vadd(k, 1), te);
