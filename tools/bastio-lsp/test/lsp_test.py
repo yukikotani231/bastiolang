@@ -471,6 +471,12 @@ r = fixes("fn main() -> u64 {\n  let count = 3;\n  return cuont + 1;\n}\n")
 check(r == [("Change to `count`", "fn main() -> u64 {\n  let count = 3;\n  return count + 1;\n}\n")], "fix: a misspelled variable: %r" % r)
 r = fixes("fn helper() -> u64 { return 1; }\nfn main() -> u64 {\n  return helpr();\n}\n")
 check(r == [("Change to `helper`", "fn helper() -> u64 { return 1; }\nfn main() -> u64 {\n  return helper();\n}\n")], "fix: a misspelled function: %r" % r)
+r = fixes("struct P { a: u64, ok: bool }\nfn main() -> u64 {\n  let p = P { a: 1 };\n  return p.a;\n}\n")
+check(r == [("Add the field `ok`", "struct P { a: u64, ok: bool }\nfn main() -> u64 {\n  let p = P { a: 1, ok: false };\n  return p.a;\n}\n")], "fix: a missing field: %r" % r)
+r = fixes("struct P { a: u64, b: i32 }\nfn main() -> u64 {\n  let p = P { a: 1, };\n  return p.a;\n}\n")
+check(r and "P { a: 1, b: 0, }" in r[0][1], "fix: a missing field after a comma: %r" % r)
+r = fixes("struct B { n: u64, v: Buf }\nfn main() -> u64 {\n  let p = B { n: 1 };\n  return 0;\n}\n")
+check(r == [], "no fix for a field that has no obvious value: %r" % r)
 r = fixes("fn main() -> u64 {\n  return zzzzzz;\n}\n")
 check(r == [], "no fix for a name that is nothing like another: %r" % r)
 
@@ -500,16 +506,21 @@ src = (
     "  let p = P { a: 1 };\n"
     "  let e = E::B(2);\n"
     "  let n = 5;\n"
-    "  return a + p.a + n;\n"
+    "  let m = n;\n"
+    "  let q: u64 = 7;\n"
+    "  let r = q;\n"
+    "  let s = \"hi\";\n"
+    "  let ok = true;\n"
+    "  return a + p.a + m;\n"
     "}\n")
 iu = "file:///tmp/inlay_test.bastio"
 resp, notes, rc = session([
     ("textDocument/didOpen", {"textDocument": {"uri": iu, "languageId": "bastio", "version": 1, "text": src}}, False),
-    ("textDocument/inlayHint", {"textDocument": {"uri": iu}, "range": {"start": {"line": 0, "character": 0}, "end": {"line": 11, "character": 0}}}, True),
+    ("textDocument/inlayHint", {"textDocument": {"uri": iu}, "range": {"start": {"line": 0, "character": 0}, "end": {"line": 17, "character": 0}}}, True),
     ("textDocument/inlayHint", {"textDocument": {"uri": iu}, "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 30}}}, True),
 ])
 hints = [(h["position"]["line"], h["position"]["character"], h["label"]) for h in resp[101]["result"]]
-want = [(5, 7, ": u64"), (5, 18, "h:"), (6, 7, ": P"), (7, 7, ": E")]
+want = [(4, 7, ": u64"), (5, 7, ": u64"), (5, 18, "h:"), (6, 7, ": P"), (7, 7, ": E"), (8, 7, ": u64"), (11, 7, ": u64"), (12, 7, ": Str"), (13, 8, ": bool")]
 check(hints == want, "inlay hints: %r" % hints)
 check(len(resp[102]["result"]) == 2, "inlay hints only in the range: %r" % resp[102]["result"])
 
