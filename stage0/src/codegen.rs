@@ -907,6 +907,8 @@ const PRELUDE_CHILD: &str = r#"
 #include <fcntl.h>
 #include <signal.h>
 #ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include <io.h>
 #include <process.h>
 /* The parent's ends of the pipes are not inherited (_O_NOINHERIT), so closing
@@ -939,14 +941,49 @@ static bst_child bst_host_spawn(bst_host h, bst_vec argv) {
     av[argv.len] = NULL;
     fflush(NULL);
 #ifdef _WIN32
-    /* The child's ends stand in for standard input and output while it is
-     * started, the way a shell does it. */
+    /* CreateProcess with the child's ends as its standard handles, made
+     * inheritable only while it starts. */
     intptr_t pid = -1;
-    int sin = _dup(0), sout = _dup(1);
-    if (sin >= 0 && sout >= 0 && _dup2(to[0], 0) == 0 && _dup2(from[1], 1) == 1)
-        pid = _spawnvp(_P_NOWAIT, av[0], (const char *const *)av);
-    if (sin >= 0) { _dup2(sin, 0); close(sin); }
-    if (sout >= 0) { _dup2(sout, 1); close(sout); }
+    {
+        size_t cap = 1;
+        for (uint64_t i = 0; i < argv.len; i++) cap += 2 * strlen(av[i]) + 3;
+        char *cl = (char *)malloc(cap), *w = cl;
+        if (!cl) { fputs("Bastio: out of memory\n", stderr); abort(); }
+        for (uint64_t i = 0; i < argv.len; i++) {
+            const char *a = av[i];
+            int q = !*a || strpbrk(a, " \t\"") != NULL;
+            if (i) *w++ = ' ';
+            if (q) *w++ = '"';
+            size_t b = 0;
+            for (; *a; a++) {
+                if (*a == '\\') { b++; continue; }
+                if (*a == '"') b = 2 * b + 1;
+                for (; b; b--) *w++ = '\\';
+                *w++ = *a;
+            }
+            for (b = q ? 2 * b : b; b; b--) *w++ = '\\';
+            if (q) *w++ = '"';
+        }
+        *w = 0;
+        HANDLE hin = (HANDLE)_get_osfhandle(to[0]), hout = (HANDLE)_get_osfhandle(from[1]);
+        SetHandleInformation(hin, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        SetHandleInformation(hout, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        STARTUPINFOA si;
+        PROCESS_INFORMATION pi;
+        memset(&si, 0, sizeof si);
+        si.cb = sizeof si;
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = hin;
+        si.hStdOutput = hout;
+        si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+        if (CreateProcessA(NULL, cl, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+            CloseHandle(pi.hThread);
+            pid = (intptr_t)pi.hProcess;
+        }
+        SetHandleInformation(hin, HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(hout, HANDLE_FLAG_INHERIT, 0);
+        free(cl);
+    }
 #else
     /* posix_spawn, not fork: the parent's memory is never copied, which a
      * kernel without copy-on-write (BastiOS) cannot do for a large one.
