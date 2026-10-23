@@ -197,7 +197,7 @@ Invariant 1 holds on arm64: system registers and device memory are reached only 
 - [x] A native backend for macOS (Mach-O): `--os macos` with `--backend native --arch aarch64` (Apple Silicon) and `--backend native-ir` (Intel); the programs of `tests/pass` and `bench` run in CI on both (2026-10-23).
 - [ ] The rest of the test scripts on macOS: difftest, `tests/aarch64.sh`, and the compiler itself built natively there.
 - [x] Windows, through the C backend: stage0, bastioc1 and `tests/run.sh` build and pass under MSYS2 / MinGW-w64 in CI (2026-10-23): child processes use CreateProcess, the simulated pool `_aligned_malloc`. Not on Windows yet: the sanitizer cross-check, `--lib` search tests, the native backends (a PE output) and the other test scripts.
-- [ ] A native backend for Windows (PE/COFF), so the C compiler can leave the trusted base there too. `--os windows` with `--backend native-ir` now writes MinGW-w64 assembly (stage1/winpe.bastio) and `tests/native.sh` runs on it in the `windows` CI job; child processes (`posix_spawn` has no counterpart yet) and the assembler/linker being MinGW's rather than ours remain.
+- [ ] A native backend for Windows (PE/COFF), so the C compiler can leave the trusted base there too. `--os windows` with `--backend native-ir` now writes MinGW-w64 assembly (stage1/winpe.bastio) and `tests/native.sh` runs on it in the `windows` CI job; the assembler/linker being MinGW's rather than ours remains.
 
 ## Performance
 

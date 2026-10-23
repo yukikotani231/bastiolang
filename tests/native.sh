@@ -58,8 +58,6 @@ both() {
   if ! "$BASTIOC" -o "$w/c.exe" "$f" 2>/dev/null; then
     echo "FAIL $f: the C backend rejected it"; echo =fail; return
   fi
-  # Starting a child process is not written for the Windows assembly yet.
-  if [ "${OSARG:-}" = "--os windows" ] && grep -q host_spawn "$f"; then echo "skip $f: child processes on Windows"; echo =skip; return; fi
   "$BASTIOC" --backend "${BACKEND:-native}" ${OSARG:-} -o "$w/x.exe" "$f" 2>"$w/err"; rc=$?
   if [ $rc = 4 ]; then echo "skip $f: $(grep -o 'does not support.*' "$w/err" | head -1)"; echo =skip; return; fi
   if [ $rc != 0 ]; then echo "FAIL $f: native build failed"; sed 's/^/    /' "$w/err" | head -20; echo =fail; return; fi
