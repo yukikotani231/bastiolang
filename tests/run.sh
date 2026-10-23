@@ -157,7 +157,9 @@ if [ -n "$stage0_compiler" ]; then
 else
   cp tests/trusted_base.txt "$tmp/tb.expect"
 fi
-if "$BASTIOC" --trusted-base | diff -u "$tmp/tb.expect" - >"$tmp/tb.diff"; then
+# (Line ends are not compared: a Windows checkout may have CR LF in the files.)
+tr -d '\r' <"$tmp/tb.expect" >"$tmp/tb.expect.lf"
+if "$BASTIOC" --trusted-base | tr -d '\r' | diff -u "$tmp/tb.expect.lf" - >"$tmp/tb.diff"; then
   pass=$((pass+1))
 else
   echo "FAIL trusted base changed; review it, then: $BASTIOC --trusted-base > tests/trusted_base.txt"
@@ -166,7 +168,8 @@ fi
 # The same for AArch64's preludes (stage1 only: stage0 has no AArch64 kernel
 # or user target).
 if [ -z "$stage0_compiler" ]; then
-  if "$BASTIOC" --arch aarch64 --trusted-base | diff -u tests/trusted_base_aarch64.txt - >"$tmp/tb.diff"; then
+  tr -d '\r' <tests/trusted_base_aarch64.txt >"$tmp/tb.a64.lf"
+  if "$BASTIOC" --arch aarch64 --trusted-base | tr -d '\r' | diff -u "$tmp/tb.a64.lf" - >"$tmp/tb.diff"; then
     pass=$((pass+1))
   else
     echo "FAIL AArch64 trusted base changed; review it, then: $BASTIOC --arch aarch64 --trusted-base > tests/trusted_base_aarch64.txt"
