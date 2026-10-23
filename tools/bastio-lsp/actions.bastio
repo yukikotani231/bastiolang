@@ -398,17 +398,20 @@ fn nearest(ix: &Prog, name: &Vec[u64], cands: &Vec[u64]) -> Vec[u64] {
   return best;
 }
 
-/// "unknown variable `x`" or "unknown function `f`": offer the nearest name
-/// in scope as a replacement. `func` says which of the two it is.
-fn fix_spelling(out: &mut Vec[u64], uri: &Bytes, ix: &Prog, raw: &Vec[u64], name: &Vec[u64], func: bool, s: u64, e: u64) {
+/// "unknown variable `x`", "unknown function `f`" or "unknown type `T`": offer
+/// the nearest name in scope as a replacement. `mode` says which of the three
+/// it is: 0 a variable, 1 a function, 2 a type.
+fn fix_spelling(out: &mut Vec[u64], uri: &Bytes, ix: &Prog, raw: &Vec[u64], name: &Vec[u64], mode: u64, s: u64, e: u64) {
   let mut cands = vec_new[u64]();
   let mut d = 0;
   while d < vec_len(ix.defs)
   {
     let df = vec_get(ix.defs, d);
     let mut want = df.kind == DK_CONST;
-    if func {
+    if mode == 1 {
       want = df.kind == DK_FN || df.kind == DK_SPEC;
+    } else if mode == 2 {
+      want = df.kind == DK_STRUCT || df.kind == DK_ENUM;
     }
     if want {
       vec_push(&mut cands, df.ns);
@@ -416,7 +419,7 @@ fn fix_spelling(out: &mut Vec[u64], uri: &Bytes, ix: &Prog, raw: &Vec[u64], name
     }
     d = vadd(d, 1);
   }
-  if !func {
+  if mode == 0 {
     // The locals declared before the use, in the function around it.
     let ts = u_at(ix.tstart, 0);
     let at_tok = tok_at_offset(ix, 0, s);
@@ -445,14 +448,43 @@ fn fix_spelling(out: &mut Vec[u64], uri: &Bytes, ix: &Prog, raw: &Vec[u64], name
       }
     }
   }
-  let near = nearest(ix, name, cands);
+  let mut near = nearest(ix, name, cands);
   vec_free(cands);
+  let mut fs = s;
+  let mut fe = e;
+  if mode == 2 {
+    // The diagnostic points at the start of the declaration or the `let`
+    // that holds the type, not at the type: find the name from there.
+    let at_tok = tok_at_offset(ix, 0, s);
+    let te = file_toks_end(ix, 0);
+    let mut j = at_tok.idx;
+    let mut hit = 0;
+    let mut stop = !at_tok.found;
+    while j < te && !stop && vsub(j, at_tok.idx) < 64
+    {
+      let c = tok_at(ix.toks, j);
+      if c.kind == K_IDENT && tok_spells(ix, j, name) {
+        hit = c.start;
+        fe = c.end;
+        stop = true;
+      } else if is_p(c, P_LBRACE) || is_p(c, P_SEMI) {
+        stop = true;
+      }
+      j = vadd(j, 1);
+    }
+    if hit == 0 {
+      vec_free(near);
+      near = vec_new[u64]();
+    } else {
+      fs = hit;
+    }
+  }
   if vec_len(near) > 0 {
     let mut title = vec_new[u64]();
     w_s(&mut title, "Change to `");
     w_append(&mut title, near);
     w_s(&mut title, "`");
-    fix_one(&mut out, uri, ix.all, raw, title, s, e, near);
+    fix_one(&mut out, uri, ix.all, raw, title, fs, fe, near);
     vec_free(title);
   }
   vec_free(near);
@@ -585,9 +617,11 @@ fn diag_fixes(out: &mut Vec[u64], uri: &Bytes, ix: &Prog, raw: &Vec[u64], code: 
   } else if has_text(msg, "field `") && has_text(msg, "` is missing") {
     fix_field(&mut out, uri, ix, raw, name, sname, s);
   } else if has_text(msg, "unknown variable `") {
-    fix_spelling(&mut out, uri, ix, raw, name, false, s, e);
+    fix_spelling(&mut out, uri, ix, raw, name, 0, s, e);
   } else if has_text(msg, "unknown function `") {
-    fix_spelling(&mut out, uri, ix, raw, name, true, s, e);
+    fix_spelling(&mut out, uri, ix, raw, name, 1, s, e);
+  } else if has_text(msg, "unknown type `") {
+    fix_spelling(&mut out, uri, ix, raw, name, 2, s, e);
   }
   vec_free(name);
   vec_free(sname);

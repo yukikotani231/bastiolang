@@ -1,7 +1,8 @@
 // Inlay hints, from the tokens of a program: the name of the parameter that
 // each argument of a call to a function goes to, and the type of a `let`
-// whose value is a call, a struct literal or a variant. Types are not
-// inferred, so a `let` of any other value gets no hint.
+// whose value is a call, a struct literal, a variant, a literal or a
+// comparison. Types are not inferred, so a `let` of any other value gets no
+// hint.
 import "complete.bastio";
 
 const HINTS_MAX: u64 = 500;
@@ -193,6 +194,40 @@ fn declared_type(ix: &Prog, b: u64) -> Vec[u64] {
   return out;
 }
 
+/// Is the value that starts at token `k` and ends at the next `;` a `bool`
+/// for sure: a comparison or `&&` / `||` outside any brackets, or a `!`?
+fn is_bool_value(ix: &Prog, k: u64) -> bool {
+  let te = file_toks_end(ix, 0);
+  if is_p(tok_at(ix.toks, k), P_BANG) {
+    return true;
+  }
+  let mut j = k;
+  let mut depth = 0;
+  let mut found = false;
+  let mut stop = false;
+  while j < te && !stop && vsub(j, k) < 200
+  {
+    let c = tok_at(ix.toks, j);
+    if is_opener(c) {
+      depth = sadd(depth, 1);
+    } else if is_closer(c) {
+      if depth == 0 {
+        stop = true;
+      } else {
+        depth = depth - 1;
+      }
+    } else if depth == 0 {
+      if is_p(c, P_SEMI) {
+        stop = true;
+      } else if is_p(c, P_EQEQ) || is_p(c, P_NE) || is_p(c, P_LE) || is_p(c, P_GE) || is_p(c, P_LT) || is_p(c, P_GT) || is_p(c, P_ANDAND) || is_p(c, P_OROR) {
+        found = true;
+      }
+    }
+    j = vadd(j, 1);
+  }
+  return found && stop && is_p(tok_at(ix.toks, vsub(j, 1)), P_SEMI);
+}
+
 /// The hint for the `let` at token `i`: its type when the value says it.
 fn let_hint(ix: &Prog, i: u64, rs: u64, re: u64, out: &mut Vec[u64]) {
   let te = file_toks_end(ix, 0);
@@ -206,6 +241,13 @@ fn let_hint(ix: &Prog, i: u64, rs: u64, re: u64, out: &mut Vec[u64]) {
   }
   let k = vadd(j, 2);
   let v = tok_at(ix.toks, k);
+  if in_range(name.end, rs, re) && is_bool_value(ix, k) {
+    let mut full = vec_new[u64]();
+    w_s(&mut full, ": bool");
+    w_hint(&mut out, ix.all, name.end, full, 1, false);
+    vec_free(full);
+    return;
+  }
   let literal = v.kind == K_INT || v.kind == K_STR || is_kw(v, KW_TRUE) || is_kw(v, KW_FALSE);
   if (v.kind != K_IDENT && !literal) || !in_range(name.end, rs, re) {
     return;
