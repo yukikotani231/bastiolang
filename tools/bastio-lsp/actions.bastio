@@ -177,6 +177,134 @@ fn fix_mut(out: &mut Vec[u64], uri: &Bytes, ix: &Prog, raw: &Vec[u64], name: &Ve
   }
 }
 
+/// The type name that follows `pat` in `v`: letters, digits, `_` and brackets
+/// (empty if `pat` is not there).
+fn word_after(v: &Vec[u64], pat: Str) -> Vec[u64] {
+  let n = vec_len(v);
+  let mut out = vec_new[u64]();
+  let mut k = 0;
+  while k < n && n - k >= slen(pat)
+  {
+    let mut m = 0;
+    while m < slen(pat) && u_at(v, vadd(k, m)) == cast[u64](sget(pat, m))
+    {
+      m = vadd(m, 1);
+    }
+    if m == slen(pat) {
+      let mut q = vadd(k, m);
+      while q < n && is_type_char(u_at(v, q))
+      {
+        vec_push(&mut out, u_at(v, q));
+        q = vadd(q, 1);
+      }
+      return out;
+    }
+    k = vadd(k, 1);
+  }
+  return out;
+}
+
+fn is_type_char(c: u64) -> bool {
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c == 91 || c == 93;
+}
+
+/// "integer types never convert on their own": wrap the expression that the
+/// diagnostic points at in `cast[T](..)` or `wrap[T](..)`, `T` being the type
+/// the context wants.
+fn fix_convert(out: &mut Vec[u64], uri: &Bytes, ix: &Prog, raw: &Vec[u64], ty: &Vec[u64], s: u64) {
+  let at_tok = tok_at_offset(ix, 0, s);
+  if !at_tok.found || vec_len(ty) == 0 {
+    return;
+  }
+  // The expression runs to the `;`, `,` or closing bracket that ends it.
+  let te = file_toks_end(ix, 0);
+  let mut j = at_tok.idx;
+  let mut depth = 0;
+  let mut stop = false;
+  while j < te && !stop
+  {
+    let c = tok_at(ix.toks, j);
+    if is_opener(c) {
+      depth = sadd(depth, 1);
+    } else if is_closer(c) {
+      if depth == 0 {
+        stop = true;
+      } else {
+        depth = depth - 1;
+      }
+    } else if depth == 0 && (is_p(c, P_SEMI) || is_p(c, P_COMMA)) {
+      stop = true;
+    }
+    if !stop {
+      j = vadd(j, 1);
+    }
+  }
+  if j == at_tok.idx || !stop {
+    return;
+  }
+  let first = tok_at(ix.toks, at_tok.idx);
+  let last = tok_at(ix.toks, vsub(j, 1));
+  let mut k = 0;
+  while k < 2
+  {
+    let mut title = vec_new[u64]();
+    let mut pre = vec_new[u64]();
+    if k == 0 {
+      w_s(&mut title, "Convert with `cast[");
+      w_s(&mut pre, "cast[");
+    } else {
+      w_s(&mut title, "Keep the low bits with `wrap[");
+      w_s(&mut pre, "wrap[");
+    }
+    w_append(&mut title, ty);
+    w_s(&mut title, "](..)`");
+    w_append(&mut pre, ty);
+    w_s(&mut pre, "](");
+    let mut post = vec_new[u64]();
+    w_s(&mut post, ")");
+    fix_begin(&mut out, uri, title, raw);
+    fix_edit(&mut out, ix.all, true, first.start, first.start, pre);
+    fix_edit(&mut out, ix.all, false, last.end, last.end, post);
+    fix_end(&mut out);
+    vec_free(title);
+    vec_free(pre);
+    vec_free(post);
+    k = vadd(k, 1);
+  }
+}
+
+/// "the returned value must be (), found T": add `-> T` after the parameters
+/// of the function around the `return`.
+fn fix_return_type(out: &mut Vec[u64], uri: &Bytes, ix: &Prog, raw: &Vec[u64], ty: &Vec[u64], s: u64) {
+  if vec_len(ty) == 0 {
+    return;
+  }
+  let mut f = 0;
+  while f < vec_len(ix.defs)
+  {
+    let df = vec_get(ix.defs, f);
+    if df.file == 0 && df.kind == DK_FN && df.ss <= s && s <= df.ie {
+      let nt = def_name_tok(ix, df);
+      if nt > 0 && is_p(tok_at(ix.toks, vadd(nt, 1)), P_LPAREN) {
+        let close = match_close(ix.toks, vadd(nt, 1), file_toks_end(ix, 0));
+        let at = tok_end(tok_at(ix.toks, close));
+        let mut title = vec_new[u64]();
+        w_s(&mut title, "Add the return type `");
+        w_append(&mut title, ty);
+        w_s(&mut title, "`");
+        let mut text = vec_new[u64]();
+        w_s(&mut text, " -> ");
+        w_append(&mut text, ty);
+        fix_one(&mut out, uri, ix.all, raw, title, at, at, text);
+        vec_free(title);
+        vec_free(text);
+      }
+      return;
+    }
+    f = vadd(f, 1);
+  }
+}
+
 /// Where the line that holds offset `off` starts.
 fn line_start(all: &Bytes, off: u64) -> u64 {
   let mut k = off;
@@ -620,6 +748,14 @@ fn diag_fixes(out: &mut Vec[u64], uri: &Bytes, ix: &Prog, raw: &Vec[u64], code: 
     fix_spelling(&mut out, uri, ix, raw, name, 0, s, e);
   } else if has_text(msg, "unknown function `") {
     fix_spelling(&mut out, uri, ix, raw, name, 1, s, e);
+  } else if has_text(msg, "must be ") && has_text(msg, "found ") && has_text(msg, "never convert") {
+    let want = word_after(msg, "must be ");
+    fix_convert(&mut out, uri, ix, raw, want, s);
+    vec_free(want);
+  } else if has_text(msg, "returned value must be (), found ") {
+    let got = word_after(msg, "found ");
+    fix_return_type(&mut out, uri, ix, raw, got, s);
+    vec_free(got);
   } else if has_text(msg, "unknown type `") {
     fix_spelling(&mut out, uri, ix, raw, name, 2, s, e);
   }
