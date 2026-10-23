@@ -473,6 +473,10 @@ r = fixes("fn helper() -> u64 { return 1; }\nfn main() -> u64 {\n  return helpr(
 check(r == [("Change to `helper`", "fn helper() -> u64 { return 1; }\nfn main() -> u64 {\n  return helper();\n}\n")], "fix: a misspelled function: %r" % r)
 r = fixes("struct Point { x: u64 }\nfn get(p: Pont) -> u64 { return 0; }\nfn main() -> u64 { return 0; }\n")
 check(r == [("Change to `Point`", "struct Point { x: u64 }\nfn get(p: Point) -> u64 { return 0; }\nfn main() -> u64 { return 0; }\n")], "fix: a misspelled type: %r" % r)
+r = fixes("fn f(a: u32) -> u64 {\n  let b: u64 = a;\n  return b;\n}\nfn main() -> u64 { return f(1); }\n")
+check(r and r[0] == ("Convert with `cast[u64](..)`", "fn f(a: u32) -> u64 {\n  let b: u64 = cast[u64](a);\n  return b;\n}\nfn main() -> u64 { return f(1); }\n") and "wrap[u64](a)" in r[1][1], "fix: convert an integer: %r" % r)
+r = fixes("fn g() {\n  return 1;\n}\nfn main() -> u64 { return 0; }\n")
+check(r == [("Add the return type `u64`", "fn g() -> u64 {\n  return 1;\n}\nfn main() -> u64 { return 0; }\n")], "fix: add a return type: %r" % r)
 r = fixes("fn get(p: Zzzzzz) -> u64 { return 0; }\nfn main() -> u64 { return 0; }\n")
 check(r == [], "no fix for a type that is nothing like another: %r" % r)
 r = fixes("struct P { a: u64, ok: bool }\nfn main() -> u64 {\n  let p = P { a: 1 };\n  return p.a;\n}\n")
@@ -504,6 +508,7 @@ src = (
     "fn area(w: u64, h: u64) -> u64 requires w < 1000 && h < 1000 { return w * h; }\n"
     "struct P { a: u64 }\n"
     "enum E { A, B(u64) }\n"
+    "fn mk() -> P { return P { a: 2 }; }\n"
     "fn main() -> u64 {\n"
     "  let w = 3;\n"
     "  let a = area(w, 4);\n"
@@ -521,16 +526,19 @@ src = (
     "  let sum = n + 1;\n"
     "  let t = q * 2 + r;\n"
     "  let c = cast[u8](q);\n"
+    "  let fa = p.a;\n"
+    "  let pm = mk();\n"
+    "  let fb = pm.a;\n"
     "  return a + p.a + m;\n"
     "}\n")
 iu = "file:///tmp/inlay_test.bastio"
 resp, notes, rc = session([
     ("textDocument/didOpen", {"textDocument": {"uri": iu, "languageId": "bastio", "version": 1, "text": src}}, False),
-    ("textDocument/inlayHint", {"textDocument": {"uri": iu}, "range": {"start": {"line": 0, "character": 0}, "end": {"line": 22, "character": 0}}}, True),
-    ("textDocument/inlayHint", {"textDocument": {"uri": iu}, "range": {"start": {"line": 5, "character": 0}, "end": {"line": 5, "character": 30}}}, True),
+    ("textDocument/inlayHint", {"textDocument": {"uri": iu}, "range": {"start": {"line": 0, "character": 0}, "end": {"line": 26, "character": 0}}}, True),
+    ("textDocument/inlayHint", {"textDocument": {"uri": iu}, "range": {"start": {"line": 6, "character": 0}, "end": {"line": 6, "character": 30}}}, True),
 ])
 hints = [(h["position"]["line"], h["position"]["character"], h["label"]) for h in resp[101]["result"]]
-want = [(4, 7, ": u64"), (5, 7, ": u64"), (5, 18, "h:"), (6, 7, ": P"), (7, 7, ": E"), (8, 7, ": u64"), (11, 7, ": u64"), (12, 7, ": Str"), (13, 8, ": bool"), (14, 8, ": bool"), (15, 10, ": bool"), (16, 9, ": bool"), (18, 7, ": u64"), (19, 7, ": u8")]
+want = [(5, 7, ": u64"), (6, 7, ": u64"), (6, 18, "h:"), (7, 7, ": P"), (8, 7, ": E"), (9, 7, ": u64"), (12, 7, ": u64"), (13, 7, ": Str"), (14, 8, ": bool"), (15, 8, ": bool"), (16, 10, ": bool"), (17, 9, ": bool"), (19, 7, ": u64"), (20, 7, ": u8"), (21, 8, ": u64"), (22, 8, ": P"), (23, 8, ": u64")]
 check(hints == want, "inlay hints: %r" % hints)
 check(len(resp[102]["result"]) == 2, "inlay hints only in the range: %r" % resp[102]["result"])
 
