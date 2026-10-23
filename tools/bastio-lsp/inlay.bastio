@@ -156,6 +156,43 @@ fn arg_hints(ix: &Prog, d: Def, open: u64, rs: u64, re: u64, out: &mut Vec[u64])
   vec_free(names);
 }
 
+/// The type written after the `:` that follows binding token `b` (a
+/// parameter or a typed `let`), or nothing if it has none.
+fn declared_type(ix: &Prog, b: u64) -> Vec[u64] {
+  let mut out = vec_new[u64]();
+  if !is_p(tok_at(ix.toks, vadd(b, 1)), P_COLON) {
+    return out;
+  }
+  let te = file_toks_end(ix, 0);
+  let first = vadd(b, 2);
+  let mut j = first;
+  let mut depth = 0;
+  let mut stop = false;
+  while j < te && !stop
+  {
+    let c = tok_at(ix.toks, j);
+    if is_opener(c) {
+      depth = sadd(depth, 1);
+    } else if is_closer(c) {
+      if depth == 0 {
+        stop = true;
+      } else {
+        depth = depth - 1;
+      }
+    } else if depth == 0 && (is_p(c, P_COMMA) || is_p(c, P_EQ) || is_p(c, P_SEMI) || is_p(c, P_LBRACE)) {
+      stop = true;
+    }
+    if !stop {
+      j = vadd(j, 1);
+    }
+  }
+  if j > first {
+    vec_free(out);
+    out = text_vec(ix.all, tok_start(tok_at(ix.toks, first)), tok_end(tok_at(ix.toks, vsub(j, 1))));
+  }
+  return out;
+}
+
 /// The hint for the `let` at token `i`: its type when the value says it.
 fn let_hint(ix: &Prog, i: u64, rs: u64, re: u64, out: &mut Vec[u64]) {
   let te = file_toks_end(ix, 0);
@@ -169,12 +206,34 @@ fn let_hint(ix: &Prog, i: u64, rs: u64, re: u64, out: &mut Vec[u64]) {
   }
   let k = vadd(j, 2);
   let v = tok_at(ix.toks, k);
-  if v.kind != K_IDENT || !in_range(name.end, rs, re) {
+  let literal = v.kind == K_INT || v.kind == K_STR || is_kw(v, KW_TRUE) || is_kw(v, KW_FALSE);
+  if (v.kind != K_IDENT && !literal) || !in_range(name.end, rs, re) {
     return;
   }
   let mut lab = vec_new[u64]();
   let next = tok_at(ix.toks, vadd(k, 1));
-  if is_p(next, P_LPAREN) {
+  if literal {
+    // `let x = 5;`: a literal that nothing types is a `u64`.
+    if is_p(next, P_SEMI) {
+      let mut t = vec_new[u64]();
+      if v.kind == K_INT {
+        w_s(&mut t, "u64");
+      } else if v.kind == K_STR {
+        w_s(&mut t, "Str");
+      } else {
+        w_s(&mut t, "bool");
+      }
+      vec_free(lab);
+      lab = t;
+    }
+  } else if is_p(next, P_SEMI) {
+    // `let x = y;` where `y` was declared with a type.
+    let r = resolve_at(ix, 0, k);
+    if r.found && r.local {
+      vec_free(lab);
+      lab = declared_type(ix, r.idx);
+    }
+  } else if is_p(next, P_LPAREN) {
     // `let x = f(..);`
     let close = match_close(ix.toks, vadd(k, 1), te);
     if is_p(tok_at(ix.toks, vadd(close, 1)), P_SEMI) {
