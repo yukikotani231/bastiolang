@@ -47,6 +47,7 @@ import "header.bastio";
 import "x86.bastio";
 import "irx86.bastio";
 import "irarm64.bastio";
+import "winpe.bastio";
 
 fn b1_code(code: u64) -> Str {
   if code == C_USE { return "E-LINEAR-USE"; }
@@ -389,7 +390,7 @@ fn b1_tool(host: &Host, argv: Vec[Bytes], what: Str, out: &mut Vec[u64]) -> u64 
 /// `--backend native`, as stage0's x86::build: the assembly is written to
 /// `outp` (`--emit-asm`), or assembled and linked into the executable
 /// `outp`. Returns the exit status.
-fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, aarch64: bool, macos: bool, ir: bool, emit_asm: bool, lib: bool, outp: &Bytes, has_out: bool, out: &mut Vec[u64]) -> u64 {
+fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, aarch64: bool, macos: bool, windows: bool, ir: bool, emit_asm: bool, lib: bool, outp: &Bytes, has_out: bool, out: &mut Vec[u64]) -> u64 {
   let mut g = x86_new();
   g.macos = macos;
   // A BastiOS user program or kernel: the assembly is the output (as the C
@@ -408,6 +409,11 @@ fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, aa
     let mo = macho_text_x86(g.out);
     vec_free(g.out);
     g.out = mo;
+  }
+  if built && windows && target == TARGET_HOSTED {
+    let wn = winpe_text(g.out);
+    vec_free(g.out);
+    g.out = wn;
   }
   if !built {
     w_s(&mut out, "bastioc1: ");
@@ -489,6 +495,11 @@ fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, aa
         push_arg(&mut ld, "-o");
         vec_push(&mut ld, b1_concat(exe, ""));
         vec_push(&mut ld, b1_concat(ofile, ""));
+        if windows {
+          // The stack is committed up front: Windows grows it one guard page
+          // at a time, and the generated frames can be larger than a page.
+          push_arg(&mut ld, "-Wl,--stack,16777216,16777216");
+        }
         status = b1_tool(host, ld, "the linker", &mut out);
       }
       if status == 0 {
@@ -518,7 +529,7 @@ fn b1_help(out: &mut Vec[u64]) {
   w_s(&mut out, "  --emit-c         write the generated C instead of an executable\n");
   w_s(&mut out, "  --target T       hosted (the default), or kernel or user for BastiOS (these write C, or assembly with --backend native)\n");
   w_s(&mut out, "  --arch A         x86_64 (the default) or aarch64 (hosted programs compile with aarch64-linux-gnu-gcc; --backend native: partial)\n");
-  w_s(&mut out, "  --os O           linux (the default) or macos (--backend native --arch aarch64, or --backend native-ir: Mach-O assembly for Apple's assembler and linker driver)\n");
+  w_s(&mut out, "  --os O           linux (the default), macos (--backend native --arch aarch64, or --backend native-ir: Mach-O assembly for Apple's assembler and linker driver) or windows (--backend native-ir: assembly for MinGW-w64)\n");
   w_s(&mut out, "  --backend B      c, or native (x86-64 assembly, or AArch64 with --arch aarch64); hosted programs on x86-64 Linux use native-ir unless --backend or --emit-c says otherwise\n");
   w_s(&mut out, "  --emit-asm       with --backend native: write the assembly instead of an executable\n");
   w_s(&mut out, "  --lib DIR        also look for imported files in DIR\n");
@@ -542,6 +553,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
   let mut target = TARGET_HOSTED;
   let mut aarch64 = false;
   let mut macos = false;
+  let mut windows = false;
   let mut outp = balloc(0);
   let mut has_out = false;
   let mut hdr = balloc(0);
@@ -626,12 +638,17 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
       let t = host_arg(host, i);
       if b1_is(t, "linux") {
         macos = false;
+        windows = false;
       } else if b1_is(t, "macos") {
         macos = true;
+        windows = false;
+      } else if b1_is(t, "windows") {
+        macos = false;
+        windows = true;
       } else {
         w_s(&mut out, "bastioc1: unknown operating system `");
         b1_bytes(&mut out, t);
-        w_s(&mut out, "` (expected `linux` or `macos`)\n");
+        w_s(&mut out, "` (expected `linux`, `macos` or `windows`)\n");
         status = 2;
       }
       bfree(t);
@@ -717,6 +734,10 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
   }
   if status == 0 && macos && !(native && (aarch64 || native_ir)) {
     w_s(&mut out, "bastioc1: --os macos needs --backend native (AArch64) or native-ir (x86-64)\n");
+    status = 2;
+  }
+  if status == 0 && windows && !(native_ir && !aarch64) {
+    w_s(&mut out, "bastioc1: --os windows needs --backend native-ir (x86-64)\n");
     status = 2;
   }
   if status == 0 && aarch64 && native_ir {
@@ -860,7 +881,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
             status = 2;
           } else if native {
             b1_flush(host, &mut out);
-            status = b1_native(host, c, &mut m, p, target, aarch64, macos, native_ir, emit_asm, !has_main, outp, has_out, &mut out);
+            status = b1_native(host, c, &mut m, p, target, aarch64, macos, windows, native_ir, emit_asm, !has_main, outp, has_out, &mut out);
           } else {
             let mut g = cg_new(target);
             g.arch = c.arch;

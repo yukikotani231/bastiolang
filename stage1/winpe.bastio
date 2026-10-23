@@ -1,0 +1,190 @@
+// Assembly for Windows (PE/COFF, MinGW-w64) from the assembly the x86-64
+// native-IR backend writes for Linux (ELF).
+//
+// The code is the same; the object format, the calling convention of the
+// C library and the system calls behind it are not. This pass rewrites the
+// text of a finished hosted program line by line, as macho.bastio does for
+// macOS:
+//
+// - `.type` and `.size` lines and the GNU-stack note are dropped;
+//   read-only data goes to `.rdata`.
+// - The generated code follows the System V convention, so each call of a
+//   C library function goes through a `bst_wn_<name>` thunk that moves the
+//   arguments to the Win64 registers, reserves the shadow space and aligns
+//   the stack (the IR's frames are not 16-byte aligned at every call).
+//   The thunks of `open` and `pipe` also map the flags and ask for binary
+//   mode; `aligned_alloc` is `_aligned_malloc` with its arguments swapped.
+// - `main` becomes the Win64 entry point: it puts the standard streams in
+//   binary mode, makes `stderr` unbuffered and calls the program with the
+//   System V registers. `stdout` flushes through `fflush(NULL)`.
+// - There is no fork on Windows: starting a child process fails, as
+//   `posix_spawnp` failing does on Linux, and the signal, descriptor-flag
+//   and wait calls around it do nothing.
+//
+// Part of the trusted base like the runtime text it rewrites.
+import "macho.bastio";
+
+/// One line `v[s .. e]` (without its newline) as MinGW-w64's assembler wants it.
+fn wn_line(out: &mut Vec[u64], v: &Vec[u64], s: u64, e: u64) {
+  let mut t = s;
+  while t < e && (u_at(v, t) == 9 || u_at(v, t) == 32) {
+    t = wrap_add(t, 1);
+  }
+  if ix_has_at(v, t, ".type ") || ix_has_at(v, t, ".size ") || ix_has_at(v, t, ".section .note") {
+    return;
+  }
+  if ix_has_at(v, t, ".section .rodata") {
+    w_s(&mut out, "\t.section .rdata,\"dr\"\n");
+    return;
+  }
+  if ix_has_at(v, s, "main:") {
+    w_s(&mut out, "bst_prog_main:");
+    mo_copy(&mut out, v, wrap_add(s, 5), e);
+    vec_push(&mut out, 10);
+    return;
+  }
+  if mo_name_at(v, t, ".globl") && ix_has_at(v, wrap_add(t, 7), "main") && !mo_ident(u_at(v, wrap_add(t, 11))) {
+    return;
+  }
+  if ix_has_at(v, t, "mov $0x241, %esi") {
+    // O_WRONLY | O_CREAT | O_TRUNC, as _open spells them
+    w_s(&mut out, "\tmov $0x301, %esi");
+    mo_copy(&mut out, v, wrap_add(t, 16), e);
+    vec_push(&mut out, 10);
+    return;
+  }
+  if ix_has_at(v, t, "mov ") {
+    // `mov stdout@GOTPCREL(%rip), %rax`: the address of a pointer that is
+    // dereferenced next. Windows has no such variables; these are ours.
+    let mut k = wrap_add(t, 4);
+    let mut n = k;
+    while n < e && mo_ident(u_at(v, n)) {
+      n = wrap_add(n, 1);
+    }
+    if ix_has_at(v, n, "@GOTPCREL(%rip)") {
+      w_s(&mut out, "\tlea ");
+      if mo_name_at(v, k, "stderr") {
+        w_s(&mut out, "bst_w_stderr");
+      } else {
+        w_s(&mut out, "bst_w_null");
+      }
+      w_s(&mut out, "(%rip)");
+      mo_copy(&mut out, v, wrap_add(n, 15), e);
+      vec_push(&mut out, 10);
+      return;
+    }
+  }
+  let mut k = s;
+  while k < e {
+    let c = u_at(v, k);
+    if mo_ident(c) && (k == s || !mo_ident(u_at(v, wrap_sub(k, 1)))) {
+      let mut n = k;
+      while n < e && mo_ident(u_at(v, n)) {
+        n = wrap_add(n, 1);
+      }
+      if ix_has_at(v, n, "@PLT") {
+        if mo_ext(v, k) {
+          w_s(&mut out, "bst_wn_");
+        }
+        mo_copy(&mut out, v, k, n);
+        k = wrap_add(n, 4);
+      } else {
+        mo_copy(&mut out, v, k, n);
+        k = n;
+      }
+    } else {
+      vec_push(&mut out, c);
+      k = wrap_add(k, 1);
+    }
+  }
+  vec_push(&mut out, 10);
+}
+
+/// `bst_wn_name`: calls the Win64 function `target` with the first four
+/// System V arguments.
+fn wn_thunk(out: &mut Vec[u64], name: Str, target: Str) {
+  w_s(&mut out, "bst_wn_");
+  w_s(&mut out, name);
+  w_s(&mut out, ":\n\tpush %rbp\n\tmov %rsp, %rbp\n\tsub $32, %rsp\n\tand $-16, %rsp\n");
+  w_s(&mut out, "\tmov %rcx, %r9\n\tmov %rdx, %r8\n\tmov %rsi, %rdx\n\tmov %rdi, %rcx\n\tcall ");
+  w_s(&mut out, target);
+  w_s(&mut out, "\n\tleave\n\tret\n");
+}
+
+/// `bst_wn_name`: returns `value` without calling anything.
+fn wn_stub(out: &mut Vec[u64], name: Str, value: Str) {
+  w_s(&mut out, "bst_wn_");
+  w_s(&mut out, name);
+  w_s(&mut out, ":\n\tmov $");
+  w_s(&mut out, value);
+  w_s(&mut out, ", %eax\n\tret\n");
+}
+
+/// The entry point, the thunks and the data they use.
+fn wn_tail(out: &mut Vec[u64]) {
+  w_s(&mut out, "\t.text\n\t.globl main\nmain:\n\tpush %rbp\n\tpush %rdi\n\tpush %rsi\n\tpush %rbx\n\tsub $40, %rsp\n");
+  w_s(&mut out, "\tmov %rcx, %rdi\n\tmov %rdx, %rsi\n");
+  w_s(&mut out, "\txor %ecx, %ecx\n\tmov $0x8000, %edx\n\tcall _setmode\n");
+  w_s(&mut out, "\tmov $1, %ecx\n\tmov $0x8000, %edx\n\tcall _setmode\n");
+  w_s(&mut out, "\tmov $2, %ecx\n\tmov $0x8000, %edx\n\tcall _setmode\n");
+  w_s(&mut out, "\tmov $2, %ecx\n\tlea bst_w_mode(%rip), %rdx\n\tcall _fdopen\n");
+  w_s(&mut out, "\tmov %rax, bst_w_stderr(%rip)\n\tmov %rax, %rcx\n\txor %edx, %edx\n\tmov $4, %r8d\n\txor %r9d, %r9d\n\tcall setvbuf\n");
+  w_s(&mut out, "\tcall bst_prog_main\n\tadd $40, %rsp\n\tpop %rbx\n\tpop %rsi\n\tpop %rdi\n\tpop %rbp\n\tret\n");
+  wn_thunk(&mut out, "abort", "abort");
+  w_s(&mut out, "bst_wn_aligned_alloc:\n\tpush %rbp\n\tmov %rsp, %rbp\n\tsub $32, %rsp\n\tand $-16, %rsp\n");
+  w_s(&mut out, "\tmov %rdi, %rdx\n\tmov %rsi, %rcx\n\tcall _aligned_malloc\n\tleave\n\tret\n");
+  wn_thunk(&mut out, "calloc", "calloc");
+  wn_thunk(&mut out, "close", "_close");
+  wn_thunk(&mut out, "exit", "exit");
+  wn_thunk(&mut out, "fclose", "fclose");
+  wn_stub(&mut out, "fcntl", "0");
+  wn_thunk(&mut out, "fdopen", "_fdopen");
+  wn_thunk(&mut out, "fflush", "fflush");
+  wn_thunk(&mut out, "free", "free");
+  wn_thunk(&mut out, "fwrite", "fwrite");
+  wn_thunk(&mut out, "getc", "getc");
+  wn_thunk(&mut out, "getchar", "getchar");
+  wn_thunk(&mut out, "getenv", "getenv");
+  wn_thunk(&mut out, "malloc", "malloc");
+  wn_thunk(&mut out, "memcpy", "memcpy");
+  wn_thunk(&mut out, "memmove", "memmove");
+  wn_thunk(&mut out, "memset", "memset");
+  w_s(&mut out, "bst_wn_open:\n\tor $0x8000, %esi\n");
+  w_s(&mut out, "\tpush %rbp\n\tmov %rsp, %rbp\n\tsub $32, %rsp\n\tand $-16, %rsp\n");
+  w_s(&mut out, "\tmov %rdx, %r8\n\tmov %rsi, %rdx\n\tmov %rdi, %rcx\n\tcall _open\n\tleave\n\tret\n");
+  w_s(&mut out, "bst_wn_pipe:\n\tpush %rbp\n\tmov %rsp, %rbp\n\tsub $32, %rsp\n\tand $-16, %rsp\n");
+  w_s(&mut out, "\tmov %rdi, %rcx\n\tmov $65536, %edx\n\tmov $0x8000, %r8d\n\tcall _pipe\n\tleave\n\tret\n");
+  wn_stub(&mut out, "posix_spawn_file_actions_addclose", "0");
+  wn_stub(&mut out, "posix_spawn_file_actions_adddup2", "0");
+  wn_stub(&mut out, "posix_spawn_file_actions_destroy", "0");
+  wn_stub(&mut out, "posix_spawn_file_actions_init", "0");
+  wn_stub(&mut out, "posix_spawnp", "1");
+  wn_thunk(&mut out, "printf", "printf");
+  wn_thunk(&mut out, "putchar", "putchar");
+  wn_thunk(&mut out, "read", "_read");
+  wn_thunk(&mut out, "realloc", "realloc");
+  wn_stub(&mut out, "signal", "0");
+  wn_thunk(&mut out, "strlen", "strlen");
+  w_s(&mut out, "bst_wn_sysconf:\n\tpush %rbp\n\tmov %rsp, %rbp\n\tsub $32, %rsp\n\tand $-16, %rsp\n");
+  w_s(&mut out, "\tmov $0xffff, %ecx\n\tcall GetActiveProcessorCount\n\tleave\n\tret\n");
+  wn_stub(&mut out, "waitpid", "-1");
+  wn_thunk(&mut out, "write", "_write");
+  w_s(&mut out, "\t.section .rdata,\"dr\"\nbst_w_mode:\n\t.asciz \"w\"\n\t.data\n\t.p2align 3\nbst_w_stderr:\n\t.quad 0\nbst_w_null:\n\t.quad 0\n");
+}
+
+/// The Windows spelling of the x86-64 assembly text `v`.
+fn winpe_text(v: &Vec[u64]) -> Vec[u64] {
+  let mut out = vec_new[u64]();
+  let n = vec_len(v);
+  let mut s = 0;
+  while s < n {
+    let mut e = s;
+    while e < n && vec_get(v, e) != 10 {
+      e = wrap_add(e, 1);
+    }
+    wn_line(&mut out, v, s, e);
+    s = wrap_add(e, 1);
+  }
+  wn_tail(&mut out);
+  return out;
+}

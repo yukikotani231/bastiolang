@@ -11,7 +11,8 @@
 # libraries are built by `native` only.)
 #
 # NATIVE_OS=macos (with BACKEND=native-ir) runs the comparison on an Intel Mac
-# for the Mach-O assembly (`--os macos`); the example libraries and the
+# for the Mach-O assembly (`--os macos`), NATIVE_OS=windows on Windows (MSYS2)
+# for the MinGW-w64 assembly (`--os windows`); the example libraries and the
 # fixed-point check are left out there.
 #
 # tests/native.sh --stage1 instead runs stage1/difftest.sh with the tools of
@@ -49,6 +50,7 @@ BASTIOC=${BASTIOC:-$(tests/bastioc1.sh)} || exit 1
 . tests/stage1_only.sh
 OSARG=
 [ "${NATIVE_OS:-linux}" = macos ] && OSARG="--os macos"
+[ "${NATIVE_OS:-linux}" = windows ] && OSARG="--os windows"
 export BASTIOC OSARG
 # One program, built by both backends; JOBS of them at a time.
 both() {
