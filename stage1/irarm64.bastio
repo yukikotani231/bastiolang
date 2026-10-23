@@ -581,48 +581,53 @@ fn a64_pow2(al: &IrAlloc, fr: A64F, r: u64) -> u64 {
 }
 
 /// A division by a constant as a high multiply: q = mulhi(n >> pre, m) >> sh.
-struct A64Magic { ok: bool, pre: u64, m: u64, sh: u64 }
+struct A64Magic { ok: bool, pre: u64, m: u64, sh: u64, wide: bool }
 
 /// The multiplier of an unsigned division by register `r` when it is a
 /// constant that is not a power of two and has an exact multiplier of 64
 /// bits, with a shift of the dividend first for an even divisor (`% 1000`).
 fn a64_magic(al: &IrAlloc, r: u64) -> A64Magic {
-  let none = A64Magic { ok: false, pre: 0, m: 0, sh: 0 };
+  let none = A64Magic { ok: false, pre: 0, m: 0, sh: 0, wide: false };
   if u_at(al.cst, r) == 0 {
     return none;
   }
   let d = u_at(al.cv, r);
   let mg = ix_div_magic(d);
   if mg.ok {
-    return A64Magic { ok: true, pre: 0, m: mg.m, sh: mg.sh };
+    return A64Magic { ok: true, pre: 0, m: mg.m, sh: mg.sh, wide: false };
   }
-  if d < 3 || d >= 9223372036854775808 || d & wrap_sub(d, 1) == 0 || d & 1 == 1 {
+  if d < 3 || d >= 9223372036854775808 || d & wrap_sub(d, 1) == 0 {
     return none;
   }
-  // An even divisor d = dd * 2^k: shift first; then the multiplier of dd is
-  // ceil(2^(64 + sh) / dd) when it fits 64 bits and its error stays below
-  // 2^(sh + k), which makes it exact for every 64-bit n.
-  let k = x86_tz(d);
-  if k >= 63 {
-    return none;
-  }
-  let dd = d >> k;
   let mut r2 = none;
-  let mut sh = 0;
-  let mut p2 = 1;
-  while sh < 63 && p2 < dd && !r2.ok {
-    let qr = x86_longdiv(p2, dd);
-    if qr.r == 0 || qr.q < 18446744073709551615 {
-      let mut ex = 0;
-      if qr.r != 0 {
-        ex = wrap_sub(dd, qr.r);
+  let k = x86_tz(d);
+  if k >= 1 && k < 63 {
+    // An even divisor d = dd * 2^k: shift first; then the multiplier of dd is
+    // ceil(2^(64 + sh) / dd) when it fits 64 bits and its error stays below
+    // 2^(sh + k), which makes it exact for every 64-bit n.
+    let dd = d >> k;
+    let mut sh = 0;
+    let mut p2 = 1;
+    while sh < 63 && p2 < dd && !r2.ok {
+      let qr = x86_longdiv(p2, dd);
+      if qr.r == 0 || qr.q < 18446744073709551615 {
+        let mut ex = 0;
+        if qr.r != 0 {
+          ex = wrap_sub(dd, qr.r);
+        }
+        if sh + k >= 63 || ex <= x86_p2(sh + k) {
+          r2 = A64Magic { ok: true, pre: k, m: wrap_add(qr.q, x86_ne0(qr.r)), sh: sh, wide: false };
+        }
       }
-      if sh + k >= 63 || ex <= x86_p2(sh + k) {
-        r2 = A64Magic { ok: true, pre: k, m: wrap_add(qr.q, x86_ne0(qr.r)), sh: sh };
-      }
+      sh = sh + 1;
+      p2 = wrap_mul(p2, 2);
     }
-    sh = sh + 1;
-    p2 = wrap_mul(p2, 2);
+  }
+  if !r2.ok {
+    // A 65-bit multiplier: q = (((n - t) >> 1) + t) >> (l - 1), t = mulhi(n, m).
+    let l = x86_bits(wrap_sub(d, 1));
+    let qr = x86_longdiv(wrap_sub(x86_p2(l), d), d);
+    r2 = A64Magic { ok: true, pre: l, m: wrap_add(qr.q, 1), sh: 0, wide: true };
   }
   return r2;
 }
@@ -697,7 +702,15 @@ fn a64_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, fr: A64F, g: &mut X86, m:
     let mg = a64_magic(al, q.b);
     let ra = a64_use(&mut out, al, fr, q.a, 9);
     a64_movi(&mut out, 16, mg.m);
-    if mg.pre > 0 {
+    if mg.wide {
+      a64_ins3(&mut out, "umulh", 16, ra, 16);
+      a64_ins3(&mut out, "sub", 17, ra, 16);
+      a64_ins3i(&mut out, "lsr", 17, 17, 1);
+      a64_ins3(&mut out, "add", 16, 16, 17);
+      if mg.pre > 1 {
+        a64_ins3i(&mut out, "lsr", 16, 16, wrap_sub(mg.pre, 1));
+      }
+    } else if mg.pre > 0 {
       a64_ins3i(&mut out, "lsr", 17, ra, mg.pre);
       a64_ins3(&mut out, "umulh", 16, 17, 16);
     } else {
@@ -1360,6 +1373,12 @@ fn a64_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
     iropt_copies(&mut f);
     iropt_dce(&mut f);
   }
+  // The data address of a Vec in a register first: `iropt_ivs_fold` needs a
+  // loop-invariant base.
+  if iropt_vlen(&mut f) > 0 {
+    iropt_copies(&mut f);
+    iropt_dce(&mut f);
+  }
   iropt_ivs(&mut f);
   iropt_remdiv(&mut f);
   iropt_ebb(&mut f);
@@ -1370,10 +1389,6 @@ fn a64_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   }
   iropt_bits(&mut f);
   iropt_licm(&mut f);
-  if iropt_vlen(&mut f) > 0 {
-    iropt_copies(&mut f);
-    iropt_dce(&mut f);
-  }
   if iropt_rowptr(&mut f) > 0 {
     iropt_copies(&mut f);
     iropt_dce(&mut f);
