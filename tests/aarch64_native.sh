@@ -11,6 +11,10 @@
 # Needs an AArch64 assembler and linker driver (aarch64-linux-gnu-as and
 # aarch64-linux-gnu-gcc, or CC) and qemu-aarch64 (Debian/Ubuntu:
 # gcc-aarch64-linux-gnu qemu-user).
+#
+# NATIVE_OS=macos runs the same comparison on an Apple Silicon Mac, for the
+# Mach-O assembly (`--os macos`): the executables run natively, the programs
+# SELFHOST defaults to 0 there.
 set -u
 cd "$(dirname "$0")/.."
 tmp=$(mktemp -d)
@@ -18,11 +22,16 @@ trap 'rm -rf "$tmp"' EXIT
 BASTIOC=${BASTIOC:-$(tests/bastioc1.sh)} || exit 1
 . tests/pfor.sh
 . tests/stage1_only.sh
-if [ "$(uname -m)" = aarch64 ]; then RUN=; else
+OSARG=
+if [ "${NATIVE_OS:-linux}" = macos ]; then
+  OSARG="--os macos"
+  SELFHOST=${SELFHOST:-0}
+fi
+if [ "$(uname -m)" = aarch64 ] || [ -n "$OSARG" ]; then RUN=; else
   RUN=qemu-aarch64
   export QEMU_LD_PREFIX=${QEMU_LD_PREFIX:-/usr/aarch64-linux-gnu}
 fi
-export BASTIOC RUN
+export BASTIOC RUN OSARG
 # One program; JOBS of them at a time.
 both() {
   local f=$1 want xs cs
@@ -30,7 +39,7 @@ both() {
     echo "FAIL $f: the C backend rejected it"; echo =fail; return
   fi
   "$w/c.exe" </dev/null >"$w/c.out" 2>/dev/null; cs=$?
-  "$BASTIOC" --arch aarch64 --backend native -o "$w/x.exe" "$f" 2>"$w/err"; rc=$?
+  "$BASTIOC" --arch aarch64 --backend native $OSARG -o "$w/x.exe" "$f" 2>"$w/err"; rc=$?
   if [ $rc = 4 ]; then echo "skip $f: $(grep -o 'does not cover.*' "$w/err" | head -1)"; echo =skip; return; fi
   if [ $rc != 0 ]; then echo "FAIL $f: AArch64 native build failed"; sed 's/^/    /' "$w/err" | head -20; echo =fail; return; fi
   $RUN "$w/x.exe" </dev/null >"$w/x.out" 2>/dev/null; xs=$?
@@ -46,7 +55,7 @@ pfor both $(s1files tests/pass/*.bastio bench/*.bastio) || lost=1
 # A copy to or from a page lent to a device is ordered both ways (`dmb osh`,
 # as the C prelude's bytes_to_dma and dma_to_bytes are): two copies, four
 # barriers, besides the two full ones of dma_lend and dma_take.
-"$BASTIOC" --arch aarch64 --backend native --emit-asm -o "$tmp/dma.s" tests/ir_a64/dma_copy.bastio 2>/dev/null
+"$BASTIOC" --arch aarch64 --backend native $OSARG --emit-asm -o "$tmp/dma.s" tests/ir_a64/dma_copy.bastio 2>/dev/null
 if [ "$(grep -c 'dmb osh' "$tmp/dma.s")" = 4 ] && [ "$(grep -c 'dmb ish' "$tmp/dma.s")" = 2 ]; then
   echo "aarch64 native: DMA copies carry dmb osh before and after"
 else

@@ -23,6 +23,7 @@
 // values, the slots of `IR_SLOT` and `IR_CALLM`; the frame pointer and the
 // return address are saved above it.
 import "irx86.bastio";
+import "macho.bastio";
 
 /// Argument words that travel in registers.
 const A64_REG_ARGS: u64 = 8;
@@ -1586,17 +1587,22 @@ fn a64_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
 
 /// The runtime of the hosted target: assembly over the C library, part of
 /// the trusted base (as `x86_runtime` is for x86-64).
-fn a64_runtime(out: &mut Vec[u64]) {
+fn a64_runtime(out: &mut Vec[u64], macos: bool) {
   w_s(&mut out, "\n// ---- runtime (trusted base) ----\n");
-  w_s(&mut out, "bst_rt_print:                   // print(x0) as a decimal line\n");
-  w_s(&mut out, "\tstp x29, x30, [sp, #-16]!\n");
-  w_s(&mut out, "\tmov x29, sp\n");
-  w_s(&mut out, "\tmov x1, x0\n");
-  w_s(&mut out, "\tadrp x0, .Lrt_fmt\n");
-  w_s(&mut out, "\tadd x0, x0, :lo12:.Lrt_fmt\n");
-  w_s(&mut out, "\tbl printf\n");
-  w_s(&mut out, "\tldp x29, x30, [sp], #16\n");
-  w_s(&mut out, "\tret\n");
+  if macos {
+    // printf takes its variadic argument on the stack there: print over putc.
+    a64_rt_print(&mut out);
+  } else {
+    w_s(&mut out, "bst_rt_print:                   // print(x0) as a decimal line\n");
+    w_s(&mut out, "\tstp x29, x30, [sp, #-16]!\n");
+    w_s(&mut out, "\tmov x29, sp\n");
+    w_s(&mut out, "\tmov x1, x0\n");
+    w_s(&mut out, "\tadrp x0, .Lrt_fmt\n");
+    w_s(&mut out, "\tadd x0, x0, :lo12:.Lrt_fmt\n");
+    w_s(&mut out, "\tbl printf\n");
+    w_s(&mut out, "\tldp x29, x30, [sp], #16\n");
+    w_s(&mut out, "\tret\n");
+  }
   w_s(&mut out, "bst_rt_alloc:                   // x0 = x0 zeroed words (at least one)\n");
   w_s(&mut out, "\tmov x1, #8\n");
   w_s(&mut out, "\tb 1f\n");
@@ -1658,8 +1664,8 @@ fn a64_runtime(out: &mut Vec[u64]) {
   w_s(&mut out, "\t.string \"Bastio: out of memory\\n\"\n");
   w_s(&mut out, "\t.text\n");
   a64_runtime_alloc(&mut out);
-  a64_runtime_host(&mut out);
-  a64_runtime_child(&mut out);
+  a64_runtime_host(&mut out, macos);
+  a64_runtime_child(&mut out, macos);
 }
 
 /// `print`: x0 as a decimal line, over `bst_rt_putc`.
@@ -2930,8 +2936,27 @@ fn a64_runtime_alloc(out: &mut Vec[u64]) {
   w_s(&mut out, "\tret\n");
 }
 
+/// A call of the C function `name` whose argument number `fixed` (counting
+/// from 0) is the first of its variable arguments (`open`'s mode, `fcntl`'s
+/// third argument). Apple's AArch64 convention passes those on the stack;
+/// Linux's passes them in registers like the rest.
+fn a64_variadic(out: &mut Vec[u64], macos: bool, name: Str, fixed: u64) {
+  if macos {
+    w_s(&mut out, "\tsub sp, sp, #16\n");
+    w_s(&mut out, "\tstr x");
+    w_num(&mut out, fixed);
+    w_s(&mut out, ", [sp]\n");
+  }
+  w_s(&mut out, "\tbl ");
+  w_s(&mut out, name);
+  w_s(&mut out, "\n");
+  if macos {
+    w_s(&mut out, "\tadd sp, sp, #16\n");
+  }
+}
+
 /// The hosted target's files, environment and arguments, over the C library.
-fn a64_runtime_host(out: &mut Vec[u64]) {
+fn a64_runtime_host(out: &mut Vec[u64], macos: bool) {
   w_s(&mut out, "\t.text\n");
   w_s(&mut out, "bst_rt_host_arg:                // argument x0 as Bytes: x0 = data, x1 = len\n");
   w_s(&mut out, "\tstp x29, x30, [sp, #-32]!\n");
@@ -3046,9 +3071,15 @@ fn a64_runtime_host(out: &mut Vec[u64]) {
   w_s(&mut out, "\tmov x22, x3\n");
   w_s(&mut out, "\tbl bst_rt_cpath\n");
   w_s(&mut out, "\tmov x21, x0\n");
-  w_s(&mut out, "\tmov w1, #0x241              // O_WRONLY | O_CREAT | O_TRUNC\n");
-  w_s(&mut out, "\tmov w2, #0x1b6              // 0666\n");
-  w_s(&mut out, "\tbl open\n");
+  if macos {
+    w_s(&mut out, "\tmov w1, #0x601              // O_WRONLY | O_CREAT | O_TRUNC\n");
+    w_s(&mut out, "\tmov w2, #0x1b6              // 0666\n");
+    a64_variadic(&mut out, true, "open", 2);
+  } else {
+    w_s(&mut out, "\tmov w1, #0x241              // O_WRONLY | O_CREAT | O_TRUNC\n");
+    w_s(&mut out, "\tmov w2, #0x1b6              // 0666\n");
+    w_s(&mut out, "\tbl open\n");
+  }
   w_s(&mut out, "\tsxtw x20, w0\n");
   w_s(&mut out, "\tmov x0, x21\n");
   w_s(&mut out, "\tbl free\n");
@@ -3115,7 +3146,11 @@ fn a64_runtime_host(out: &mut Vec[u64]) {
   w_s(&mut out, "bst_rt_host_cpus:               // x0 = the processors online (at least 1)\n");
   w_s(&mut out, "\tstp x29, x30, [sp, #-16]!\n");
   w_s(&mut out, "\tmov x29, sp\n");
-  w_s(&mut out, "\tmov x0, #84                 // _SC_NPROCESSORS_ONLN\n");
+  if macos {
+    w_s(&mut out, "\tmov x0, #58                 // _SC_NPROCESSORS_ONLN\n");
+  } else {
+    w_s(&mut out, "\tmov x0, #84                 // _SC_NPROCESSORS_ONLN\n");
+  }
   w_s(&mut out, "\tbl sysconf\n");
   w_s(&mut out, "\tcmp x0, #1\n");
   w_s(&mut out, "\tb.ge 1f\n");
@@ -3145,7 +3180,7 @@ fn a64_runtime_host(out: &mut Vec[u64]) {
 }
 
 /// The hosted target's child processes, over the C library.
-fn a64_runtime_child(out: &mut Vec[u64]) {
+fn a64_runtime_child(out: &mut Vec[u64], macos: bool) {
   w_s(&mut out, "\t.text\n");
   w_s(&mut out, "// A Child is three words: process id, the pipe to its input, and its output\n");
   w_s(&mut out, "// (a FILE *). One that cannot be started is -1, -1, 0, and behaves like one\n");
@@ -3177,11 +3212,11 @@ fn a64_runtime_child(out: &mut Vec[u64]) {
   w_s(&mut out, "1:\tldrsw x0, [sp, #84]         // the parent's ends are not inherited by later children,\n");
   w_s(&mut out, "\tmov x1, #2                  // so closing a child's input reaches it as end of file\n");
   w_s(&mut out, "\tmov x2, #1                  // (F_SETFD, FD_CLOEXEC)\n");
-  w_s(&mut out, "\tbl fcntl\n");
+  a64_variadic(&mut out, macos, "fcntl", 2);
   w_s(&mut out, "\tldrsw x0, [sp, #88]\n");
   w_s(&mut out, "\tmov x1, #2\n");
   w_s(&mut out, "\tmov x2, #1\n");
-  w_s(&mut out, "\tbl fcntl\n");
+  a64_variadic(&mut out, macos, "fcntl", 2);
   w_s(&mut out, "\tlsl x0, x20, #3             // argv for execvp, NULL-terminated\n");
   w_s(&mut out, "\tadd x0, x0, #8\n");
   w_s(&mut out, "\tbl malloc\n");
@@ -3602,7 +3637,7 @@ fn a64_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
     a64_runtime_user(&mut g.out);
   } else {
     w_s(&mut g.out, "\n\tmov sp, x29\n\tldp x29, x30, [sp], #16\n\tret\n");
-    a64_runtime(&mut g.out);
+    a64_runtime(&mut g.out, g.macos);
   }
   w_s(&mut g.out, "\t.section .rodata\n");
   k = 0;
@@ -3628,5 +3663,10 @@ fn a64_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
     k = k + 1;
   }
   w_s(&mut g.out, "\t.section .note.GNU-stack,\"\",%progbits\n");
+  if g.macos {
+    let mo = macho_text(g.out);
+    vec_free(g.out);
+    g.out = mo;
+  }
   return true;
 }
