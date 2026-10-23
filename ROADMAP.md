@@ -196,7 +196,8 @@ Invariant 1 holds on arm64: system registers and device memory are reached only 
 - [x] macOS (Apple Silicon and Intel): the hosted toolchain builds with Apple clang and `tests/run.sh` passes in CI (2026-10-22). It goes through the C backend, so no Mach-O output is needed.
 - [x] A native backend for macOS (Mach-O): `--os macos` with `--backend native --arch aarch64` (Apple Silicon) and `--backend native-ir` (Intel); the programs of `tests/pass` and `bench` run in CI on both (2026-10-23).
 - [ ] The rest of the test scripts on macOS: difftest, `tests/aarch64.sh`, and the compiler itself built natively there.
-- [ ] Windows.
+- [x] Windows, through the C backend: stage0, bastioc1 and `tests/run.sh` build and pass under MSYS2 / MinGW-w64 in CI (2026-10-23): child processes use CreateProcess, the simulated pool `_aligned_malloc`. Not on Windows yet: the sanitizer cross-check, `--lib` search tests, the native backends (a PE output) and the other test scripts.
+- [ ] A native backend for Windows (PE/COFF), so the C compiler can leave the trusted base there too.
 
 ## Performance
 
