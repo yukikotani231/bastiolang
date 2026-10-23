@@ -63,6 +63,8 @@ both() {
   if [ $rc != 0 ]; then echo "FAIL $f: native build failed"; sed 's/^/    /' "$w/err" | head -20; echo =fail; return; fi
   "$w/c.exe" </dev/null >"$w/c.out" 2>/dev/null; cs=$?
   "$w/x.exe" </dev/null >"$w/x.out" 2>/dev/null; xs=$?
+  # The C build writes text-mode lines on Windows, the native one bytes.
+  [ "${OSARG:-}" != "--os windows" ] || { tr -d '\r' <"$w/c.out" >"$w/c.out2"; mv "$w/c.out2" "$w/c.out"; }
   if [ $cs != $xs ]; then echo "FAIL $f: exit $xs, C backend $cs"; echo =fail; return; fi
   if ! cmp -s "$w/c.out" "$w/x.out"; then
     echo "FAIL $f: output differs from the C backend"; diff "$w/c.out" "$w/x.out" | head -10 | sed 's/^/    /'; echo =fail; return
