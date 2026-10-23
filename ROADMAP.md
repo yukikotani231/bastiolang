@@ -194,8 +194,8 @@ Invariant 1 holds on arm64: system registers and device memory are reached only 
 ## Other host platforms
 
 - [x] macOS (Apple Silicon and Intel): the hosted toolchain builds with Apple clang and `tests/run.sh` passes in CI (2026-10-22). It goes through the C backend, so no Mach-O output is needed.
-- [ ] The rest of the test scripts on macOS: difftest, `tests/native.sh` (the native backend writes ELF for x86-64 Linux only), `tests/aarch64.sh`.
-- [ ] A native backend for macOS (Mach-O, Apple Silicon first), so the C compiler can leave the trusted base there too.
+- [x] A native backend for macOS (Mach-O): `--os macos` with `--backend native --arch aarch64` (Apple Silicon) and `--backend native-ir` (Intel); the programs of `tests/pass` and `bench` run in CI on both (2026-10-23).
+- [ ] The rest of the test scripts on macOS: difftest, `tests/aarch64.sh`, and the compiler itself built natively there.
 - [ ] Windows.
 
 ## Performance
