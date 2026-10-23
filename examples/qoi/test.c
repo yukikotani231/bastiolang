@@ -87,10 +87,10 @@ static size_t ref_encode(const uint8_t *pix, uint32_t w, uint32_t h, int ch, int
 
 /* The verdicts of qoi_decode, with its error offsets: 0 and the pixels in
  * *out (malloc'd), or TOO_BIG, or -1 - (offset of the first bad byte). */
-#define TOO_BIG (-(1L << 62))
-static long ref_decode(const uint8_t *s, size_t n, uint64_t max_pixels, uint8_t **out, uint32_t *w, uint32_t *h, int *ch) {
+#define TOO_BIG (-(1LL << 62))
+static long long ref_decode(const uint8_t *s, size_t n, uint64_t max_pixels, uint8_t **out, uint32_t *w, uint32_t *h, int *ch) {
     *out = NULL;
-    if (n < 22) return -1 - (long)n;
+    if (n < 22) return -1 - (long long)n;
     if (memcmp(s, "qoif", 4) != 0) return -1;
     *w = get32(s + 4);
     *h = get32(s + 8);
@@ -106,25 +106,25 @@ static long ref_decode(const uint8_t *s, size_t n, uint64_t max_pixels, uint8_t 
     memset(index, 0, sizeof index);
     size_t i = 14, end = n - 8;
     int run = 0;
-    long bad = 0;
+    long long bad = 0;
     for (uint64_t q = 0; q < px; q++) {
         if (run > 0) {
             run--;
         } else {
-            if (i >= end) { bad = -1 - (long)i; break; }
+            if (i >= end) { bad = -1 - (long long)i; break; }
             uint8_t b1 = s[i];
             if (b1 == 0xfe) {
-                if (i + 4 > end) { bad = -1 - (long)i; break; }
+                if (i + 4 > end) { bad = -1 - (long long)i; break; }
                 p.c.r = s[i + 1]; p.c.g = s[i + 2]; p.c.b = s[i + 3]; i += 4;
             } else if (b1 == 0xff) {
-                if (i + 5 > end) { bad = -1 - (long)i; break; }
+                if (i + 5 > end) { bad = -1 - (long long)i; break; }
                 p.c.r = s[i + 1]; p.c.g = s[i + 2]; p.c.b = s[i + 3]; p.c.a = s[i + 4]; i += 5;
             } else if ((b1 & 0xc0) == 0x00) {
                 p = index[b1]; i += 1;
             } else if ((b1 & 0xc0) == 0x40) {
                 p.c.r += ((b1 >> 4) & 3) - 2; p.c.g += ((b1 >> 2) & 3) - 2; p.c.b += (b1 & 3) - 2; i += 1;
             } else if ((b1 & 0xc0) == 0x80) {
-                if (i + 2 > end) { bad = -1 - (long)i; break; }
+                if (i + 2 > end) { bad = -1 - (long long)i; break; }
                 int vg = (b1 & 0x3f) - 32;
                 uint8_t b2 = s[i + 1];
                 p.c.r += vg - 8 + ((b2 >> 4) & 15); p.c.g += vg; p.c.b += vg - 8 + (b2 & 15); i += 2;
@@ -137,11 +137,11 @@ static long ref_decode(const uint8_t *s, size_t n, uint64_t max_pixels, uint8_t 
         d[0] = p.c.r; d[1] = p.c.g; d[2] = p.c.b;
         if (*ch == 4) d[3] = p.c.a;
     }
-    if (!bad && run > 0) bad = -1 - (long)(i - 1);   /* a run past the last pixel */
-    if (!bad && i != end) bad = -1 - (long)i;          /* chunks after the last pixel */
+    if (!bad && run > 0) bad = -1 - (long long)(i - 1);   /* a run past the last pixel */
+    if (!bad && i != end) bad = -1 - (long long)i;          /* chunks after the last pixel */
     static const uint8_t marker[8] = { 0, 0, 0, 0, 0, 0, 0, 1 };
     for (int k = 0; !bad && k < 8; k++)
-        if (s[end + k] != marker[k]) bad = -1 - (long)(end + k);
+        if (s[end + k] != marker[k]) bad = -1 - (long long)(end + k);
     if (bad) { free(pix); return bad; }
     *out = pix;
     return 0;
@@ -213,11 +213,11 @@ static void round_trip(uint32_t w, uint32_t h, int ch, int cs) {
 }
 
 /* Decodes `s` with both decoders and compares verdicts, offsets and pixels. */
-static long compare_decode(const uint8_t *s, size_t n, uint64_t max_pixels) {
+static long long compare_decode(const uint8_t *s, size_t n, uint64_t max_pixels) {
     uint8_t *rp;
     uint32_t w, h;
     int ch;
-    long want = ref_decode(s, n, max_pixels, &rp, &w, &h, &ch);
+    long long want = ref_decode(s, n, max_pixels, &rp, &w, &h, &ch);
     bst_e_QoiDecoded d = qoi_decode(s, n, max_pixels);
     if (want == 0) {
         CHECK(d.tag == bst_e_QoiDecoded_Ok, "decode of %zu bytes: tag %llu (err %llu), want Ok", n, (unsigned long long)d.tag, (unsigned long long)d.u.Err);
@@ -229,7 +229,7 @@ static long compare_decode(const uint8_t *s, size_t n, uint64_t max_pixels) {
     } else if (want == TOO_BIG) {
         CHECK(d.tag == bst_e_QoiDecoded_TooBig, "decode of %zu bytes: tag %llu, want TooBig", n, (unsigned long long)d.tag);
     } else {
-        CHECK(d.tag == bst_e_QoiDecoded_Err && d.u.Err == (uint64_t)(-1 - want), "decode of %zu bytes: tag %llu offset %llu, want Err at %ld",
+        CHECK(d.tag == bst_e_QoiDecoded_Err && d.u.Err == (uint64_t)(-1 - want), "decode of %zu bytes: tag %llu offset %llu, want Err at %lld",
               n, (unsigned long long)d.tag, (unsigned long long)d.u.Err, -1 - want);
         if (d.tag == bst_e_QoiDecoded_Ok) free(d.u.Ok.pixels.data);
     }
@@ -238,7 +238,7 @@ static long compare_decode(const uint8_t *s, size_t n, uint64_t max_pixels) {
 }
 
 static void fuzz_decoder(int rounds) {
-    long ok = 0, err = 0, big = 0;
+    long long ok = 0, err = 0, big = 0;
     for (int r = 0; r < rounds; r++) {
         uint32_t w = 1 + rnd() % 24, h = 1 + rnd() % 24;
         int ch = 3 + rnd() % 2;
@@ -258,11 +258,11 @@ static void fuzz_decoder(int rounds) {
         }
         /* A flipped header byte can claim billions of pixels: the cap keeps
          * both decoders from asking for gigabytes. */
-        long v = compare_decode(enc, n, 1u << 20);
+        long long v = compare_decode(enc, n, 1u << 20);
         if (v == 0) ok++; else if (v == TOO_BIG) big++; else err++;
         free(enc);
     }
-    printf("fuzz: %d decodes compared (%ld valid, %ld errors, %ld too big)\n", rounds, ok, err, big);
+    printf("fuzz: %d decodes compared (%lld valid, %lld errors, %lld too big)\n", rounds, ok, err, big);
 }
 
 static void test_params(void) {

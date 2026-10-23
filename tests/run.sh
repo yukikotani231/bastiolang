@@ -136,7 +136,7 @@ else
   echo "FAIL --help: no usage on standard output, or a nonzero exit"; fail=$((fail+1))
 fi
 want='examples/hello.bastio: error[E-SOLVER]: could not start the SMT solver `/nonexistent/z3` (install Z3 and put `z3` on PATH)'
-got=$(BASTIO_SOLVER=/nonexistent/z3 "$BASTIOC" --check examples/hello.bastio 2>&1)
+got=$(MSYS2_ENV_CONV_EXCL=BASTIO_SOLVER BASTIO_SOLVER=/nonexistent/z3 "$BASTIOC" --check examples/hello.bastio 2>&1)
 if [ "$got" = "$want" ]; then
   pass=$((pass+1))
 else
@@ -177,7 +177,10 @@ fi
 # `--lib` or BASTIO_LIB (docs/language.md, "Several files").
 mkdir -p "$tmp/away"
 printf 'import "core/option.bastio";\nfn main() -> u64 { return opt_or[u64](Option[u64]::Some(7), 0); }\n' >"$tmp/away/prog.bastio"
-if BASTIO_LIB= "$BASTIOC" --check "$tmp/away/prog.bastio" 2>"$tmp/away.err"; then
+if case "$(uname -s)" in MINGW*|MSYS*) true ;; *) false ;; esac; then
+  # BASTIO_LIB is a ';'-separated list of C:/ paths there, not ':'-separated.
+  echo "(--lib search skipped on Windows)"
+elif BASTIO_LIB= "$BASTIOC" --check "$tmp/away/prog.bastio" 2>"$tmp/away.err"; then
   echo "FAIL --lib: core found without --lib"; fail=$((fail+1))
 elif ! grep -q 'error\[E-IMPORT\]' "$tmp/away.err"; then
   echo "FAIL --lib: wrong error without --lib"; sed 's/^/    /' "$tmp/away.err"; fail=$((fail+1))

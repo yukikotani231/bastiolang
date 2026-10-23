@@ -422,9 +422,13 @@ static uint64_t bst_host_argc(bst_host h) { (void)h; return (uint64_t)bst_argc; 
 static bst_bytes bst_host_arg(bst_host h, uint64_t i) {
     (void)h;
     if (i >= (uint64_t)bst_argc) return bst_balloc(0);
-    size_t n = strlen(bst_argv[i]);
+    const char *a = bst_argv[i];
+#ifdef _WIN32
+    if (i == 0 && _pgmptr) a = _pgmptr;   /* argv[0] may lack the .exe that opens the file */
+#endif
+    size_t n = strlen(a);
     bst_bytes b = bst_balloc(n);
-    memcpy(b.data, bst_argv[i], n);
+    memcpy(b.data, a, n);
     return b;
 }
 static char *bst_cpath(bst_bytes p) {   /* a NUL-terminated copy; a NUL inside ends the path */
@@ -432,6 +436,9 @@ static char *bst_cpath(bst_bytes p) {   /* a NUL-terminated copy; a NUL inside e
     if (!c) { fputs("Bastio: out of memory\n", stderr); abort(); }
     memcpy(c, p.data, p.len);
     c[p.len] = 0;
+#ifdef _WIN32
+    if (p.len == 9 && memcmp(c, "/dev/null", 9) == 0) memcpy(c, "NUL", 4);
+#endif
     return c;
 }
 static bool bst_host_read(bst_host h, bst_bytes path, bst_bytes *out) {
@@ -481,17 +488,28 @@ static void bst_host_eprint(bst_host h, bst_bytes b) {
 static uint64_t bst_run_at[1], bst_run_id[2], bst_runs;
 static uint32_t bst_pt_leases[BST_HOSTED_PAGES], bst_shared_refs[BST_HOSTED_PAGES];
 #define BST_MMIO_CHECK(b, l) ((void)(b), (void)(l))
+#ifdef _WIN32
+#include <malloc.h>
+#endif
 static bst_pool bst_pool_init(void) {
     bst_pool p;
     p.size = BST_HOSTED_PAGES;
+#ifdef _WIN32
+    p.base = (uint64_t)_aligned_malloc(BST_HOSTED_PAGES * 4096, 4096);
+#else
     p.base = (uint64_t)aligned_alloc(4096, BST_HOSTED_PAGES * 4096);
+#endif
     if (!p.base) { fputs("Bastio: out of memory\n", stderr); abort(); }
     bst_run_at[0] = p.base;
     bst_run_id[1] = BST_HOSTED_PAGES;
     bst_runs = 1;
     return p;
 }
+#ifdef _WIN32
+static void bst_pool_fini(bst_pool p) { _aligned_free((void *)p.base); }
+#else
 static void bst_pool_fini(bst_pool p) { free((void *)p.base); }
+#endif
 "#;
 
 /* Pages and page tables: shared by the hosted simulation and the kernel.
@@ -902,10 +920,20 @@ const PRELUDE_CHILD: &str = r#"
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <io.h>
+#include <process.h>
+/* The parent's ends of the pipes are not inherited (_O_NOINHERIT), so closing
+ * a child's input reaches it as end of file. */
+#define pipe(p) _pipe((p), 65536, _O_BINARY | _O_NOINHERIT)
+#else
 #include <sys/wait.h>
 #include <spawn.h>
 extern char **environ;
-typedef struct { int pid; int in; FILE *out; } bst_child;
+#endif
+typedef struct { intptr_t pid; int in; FILE *out; } bst_child;
 /* A child that cannot be started (no such program, no pipes or processes
  * left) behaves like one that exited with 127 without output, which is
  * what a failed exec in the child looks like anyway. */
@@ -915,15 +943,62 @@ static bst_child bst_host_spawn(bst_host h, bst_vec argv) {
     int to[2], from[2];
     if (argv.len == 0 || pipe(to) != 0) return c;
     if (pipe(from) != 0) { close(to[0]); close(to[1]); return c; }
+#ifndef _WIN32
     /* The parent's ends are not inherited by later children, so closing a
      * child's input reaches it as end of file. */
     fcntl(to[1], F_SETFD, FD_CLOEXEC);
     fcntl(from[0], F_SETFD, FD_CLOEXEC);
+#endif
     char **av = (char **)malloc((argv.len + 1) * sizeof(char *));
     if (!av) { fputs("Bastio: out of memory\n", stderr); abort(); }
     for (uint64_t i = 0; i < argv.len; i++) av[i] = bst_cpath(((bst_bytes *)argv.data)[i]);
     av[argv.len] = NULL;
     fflush(NULL);
+#ifdef _WIN32
+    /* CreateProcess with the child's ends as its standard handles, made
+     * inheritable only while it starts. */
+    intptr_t pid = -1;
+    {
+        size_t cap = 1;
+        for (uint64_t i = 0; i < argv.len; i++) cap += 2 * strlen(av[i]) + 3;
+        char *cl = (char *)malloc(cap), *w = cl;
+        if (!cl) { fputs("Bastio: out of memory\n", stderr); abort(); }
+        for (uint64_t i = 0; i < argv.len; i++) {
+            const char *a = av[i];
+            int q = !*a || strpbrk(a, " \t\"") != NULL;
+            if (i) *w++ = ' ';
+            if (q) *w++ = '"';
+            size_t b = 0;
+            for (; *a; a++) {
+                if (*a == '\\') { b++; continue; }
+                if (*a == '"') b = 2 * b + 1;
+                for (; b; b--) *w++ = '\\';
+                *w++ = *a;
+            }
+            for (b = q ? 2 * b : b; b; b--) *w++ = '\\';
+            if (q) *w++ = '"';
+        }
+        *w = 0;
+        HANDLE hin = (HANDLE)_get_osfhandle(to[0]), hout = (HANDLE)_get_osfhandle(from[1]);
+        SetHandleInformation(hin, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        SetHandleInformation(hout, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        STARTUPINFOA si;
+        PROCESS_INFORMATION pi;
+        memset(&si, 0, sizeof si);
+        si.cb = sizeof si;
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = hin;
+        si.hStdOutput = hout;
+        si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+        if (CreateProcessA(NULL, cl, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+            CloseHandle(pi.hThread);
+            pid = (intptr_t)pi.hProcess;
+        }
+        SetHandleInformation(hin, HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(hout, HANDLE_FLAG_INHERIT, 0);
+        free(cl);
+    }
+#else
     /* posix_spawn, not fork: the parent's memory is never copied, which a
      * kernel without copy-on-write (BastiOS) cannot do for a large one.
      * The parent's ends are close-on-exec already. */
@@ -937,12 +1012,15 @@ static bst_child bst_host_spawn(bst_host h, bst_vec argv) {
             posix_spawnp(&pid, av[0], &fa, NULL, av, environ) != 0) pid = -1;
         posix_spawn_file_actions_destroy(&fa);
     }
+#endif
     for (uint64_t i = 0; i < argv.len; i++) free(av[i]);
     free(av);
     close(to[0]);
     close(from[1]);
     if (pid < 0) { close(to[1]); close(from[0]); return c; }
+#ifdef SIGPIPE
     signal(SIGPIPE, SIG_IGN);   /* writing to a child that has exited fails instead */
+#endif
     c.pid = pid;
     c.in = to[1];
     c.out = fdopen(from[0], "rb");
@@ -977,6 +1055,9 @@ static bool bst_child_read_line(bst_child *c, bst_bytes *out) {
         d[n++] = (unsigned char)ch;
     }
     if (ch == EOF && n == 0) { free(d); return false; }
+#ifdef _WIN32
+    if (n && d[n - 1] == '\r') n--;   /* Windows tools end their lines with CRLF */
+#endif
     free(out->data);
     out->len = n;
     out->data = d;
@@ -987,10 +1068,15 @@ static uint64_t bst_child_wait(bst_child c) {
     if (c.out) fclose(c.out);
     if (c.pid < 0) return 127;
     int st;
-    while (waitpid(c.pid, &st, 0) < 0) {}
+#ifdef _WIN32
+    if (_cwait(&st, c.pid, 0) < 0) return 255;
+    return (uint64_t)(unsigned)st;
+#else
+    while (waitpid((pid_t)c.pid, &st, 0) < 0) {}
     if (WIFEXITED(st)) return (uint64_t)WEXITSTATUS(st);
     if (WIFSIGNALED(st)) return 128 + (uint64_t)WTERMSIG(st);
     return 255;
+#endif
 }
 /* The environment variable `name`, if it is set. */
 static bool bst_host_env(bst_host h, bst_str name, bst_bytes *out) {
@@ -1012,7 +1098,12 @@ static bool bst_host_env(bst_host h, bst_str name, bst_bytes *out) {
 #endif
 static uint64_t bst_host_cpus(bst_host h) {
     (void)h;
+#ifdef _WIN32
+    const char *e = getenv("NUMBER_OF_PROCESSORS");
+    long n = e ? atol(e) : 1;
+#else
     long n = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
     return n < 1 ? 1 : (uint64_t)n;
 }
 "#;

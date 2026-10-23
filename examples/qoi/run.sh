@@ -29,8 +29,11 @@ if [ "${1:-}" = bench ]; then
   "$tmp/test" bench
   exit
 fi
-build -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all
+# The sanitizers, where the C compiler has them (not MinGW-w64).
+SAN="-fsanitize=address,undefined -fno-sanitize-recover=all"
+echo 'int main(void){return 0;}' | "$CC" $SAN -x c - -o "$tmp/san_probe" 2>/dev/null || SAN=
+build -O1 -g $SAN
 # Allocations over 64 MiB fail (malloc returns NULL), so the test can check
 # that running out of memory is reported, not a crash.
-export ASAN_OPTIONS=allocator_may_return_null=1:max_allocation_size_mb=64
+[ -z "$SAN" ] || export ASAN_OPTIONS=allocator_may_return_null=1:max_allocation_size_mb=64
 "$tmp/test" "$@"

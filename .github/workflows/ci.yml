@@ -88,6 +88,42 @@ jobs:
       - name: Native x86-64 backend (Mach-O)
         if: matrix.os == 'macos-15-intel'
         run: NATIVE_OS=macos BACKEND=native-ir tests/native.sh
+  windows:
+    # The hosted toolchain under MSYS2 / MinGW-w64 (ROADMAP, other host
+    # platforms): the C backend, with the sanitizer cross-check skipped.
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc mingw-w64-x86_64-z3 mingw-w64-x86_64-rust mingw-w64-x86_64-python
+            make diffutils
+      - name: Tool versions
+        run: |
+          rustc --version
+          z3 --version
+          cc --version | head -1
+      - name: Build stage0
+        run: cd stage0 && cargo build --release --locked
+      - name: Build bastioc1 with stage0
+        run: tests/bastioc1.sh
+      - name: Tests
+        run: |
+          # Native programs (bastioc1, the solver) must be given paths they
+          # open too: C:/-style, not MSYS2's /tmp.
+          export TMPDIR=$(cygpath -m /tmp)
+          rc=0
+          tests/run.sh > run.log 2>&1 || rc=$?
+          grep -A8 '^FAIL' run.log | head -150 || true
+          tail -1 run.log
+          exit $rc
   difftest:
     # stage1/difftest.sh compares every phase of the self-hosted compiler with
     # stage0's. Its parts (DIFFTEST_PARTS) are independent, so each runs on a
