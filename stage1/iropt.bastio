@@ -79,6 +79,23 @@ fn iropt_consts(f: &IrFn, ndef: &Vec[u64]) -> Vec[u64] {
 fn iropt_fold(f: &mut IrFn) -> u64 {
   let ndef = iropt_ndef(f);
   let mut cv = iropt_consts(f, ndef);
+  // `iropt_consts` cannot hold a constant of all ones (IR_NONE is that
+  // word), so the registers written once by one are marked here: `!x` is
+  // `x ^ ones`, `x & !0xf` is `x & (0xf ^ ones)`.
+  let mut ones = vec_new[u64]();
+  let mut r1 = 0;
+  while r1 < f.nreg && r1 < 1000000000 {
+    vec_push(&mut ones, 0);
+    r1 = r1 + 1;
+  }
+  let mut i1 = 0;
+  while i1 < vec_len(f.ins) {
+    let q1 = vec_get(f.ins, i1);
+    if q1.op == IR_CONST && q1.a == IR_NONE && q1.d < f.nreg && u_at(ndef, q1.d) == 1 {
+      ra_set(&mut ones, q1.d, 1);
+    }
+    i1 = i1 + 1;
+  }
   let mut n = 0;
   let mut nbr = 0;
   // What a register holds at this point of the block, where it is written
@@ -177,6 +194,29 @@ fn iropt_fold(f: &mut IrFn) -> u64 {
         if t {
           r.a = 1;
         }
+      } else if (op == IR_EQ || op == IR_NE || op == IR_LT || op == IR_LE || op == IR_GT || op == IR_GE) && q.b < f.nreg && q.a < f.nreg
+        && ((u_at(ones, q.b) == 1 && x != IR_NONE) || (u_at(ones, q.a) == 1 && y != IR_NONE)) {
+        // A constant that is not all ones, against all ones.
+        let mut t = false;
+        if u_at(ones, q.b) == 1 {
+          t = op == IR_NE || op == IR_LT || op == IR_LE;
+        } else {
+          t = op == IR_NE || op == IR_GT || op == IR_GE;
+        }
+        r = IrIns { op: IR_CONST, d: q.d, a: 0, b: 0, c: 0, ty: 0 };
+        if t {
+          r.a = 1;
+        }
+      } else if op == IR_XOR && q.b < f.nreg && q.a < f.nreg && u_at(ones, q.b) == 1 && u_at(ones, q.a) == 0 && x != IR_NONE {
+        r = IrIns { op: IR_CONST, d: q.d, a: x ^ IR_NONE, b: 0, c: 0, ty: 0 };
+      } else if op == IR_XOR && q.a < f.nreg && q.b < f.nreg && u_at(ones, q.a) == 1 && u_at(ones, q.b) == 0 && y != IR_NONE {
+        r = IrIns { op: IR_CONST, d: q.d, a: y ^ IR_NONE, b: 0, c: 0, ty: 0 };
+      } else if op == IR_AND && q.b < f.nreg && u_at(ones, q.b) == 1 {
+        r = IrIns { op: IR_MOV, d: q.d, a: q.a, b: 0, c: 0, ty: 0 };
+      } else if op == IR_AND && q.a < f.nreg && u_at(ones, q.a) == 1 {
+        r = IrIns { op: IR_MOV, d: q.d, a: q.b, b: 0, c: 0, ty: 0 };
+      } else if op == IR_OR && ((q.a < f.nreg && u_at(ones, q.a) == 1) || (q.b < f.nreg && u_at(ones, q.b) == 1)) {
+        r = IrIns { op: IR_CONST, d: q.d, a: IR_NONE, b: 0, c: 0, ty: 0 };
       } else if op == IR_NEG && x != IR_NONE {
         r = IrIns { op: IR_CONST, d: q.d, a: wrap_sub(0, x), b: 0, c: 0, ty: 0 };
       } else if op == IR_MOV && x != IR_NONE {
@@ -231,6 +271,7 @@ fn iropt_fold(f: &mut IrFn) -> u64 {
   vec_free(kv);
   vec_free(ndef);
   vec_free(cv);
+  vec_free(ones);
   if nbr > 0 {
     iropt_reach(&mut f);
   }
