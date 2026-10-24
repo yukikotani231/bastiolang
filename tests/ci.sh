@@ -33,6 +33,7 @@ if command -v z3 >/dev/null; then
   step "tests/ra.sh";        tests/ra.sh
   step "tests/native.sh";    tests/native.sh
   step "tests/native.sh (IR emitter)"; BACKEND=native-ir tests/native.sh
+  step "tests/as86.sh";      tests/as86.sh
   step "tests/proof_cache.sh"; tests/proof_cache.sh
   step "tests/tools.sh";     tests/tools.sh
   step "stage1/difftest.sh"; stage1/difftest.sh

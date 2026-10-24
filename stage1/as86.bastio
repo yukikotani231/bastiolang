@@ -1,0 +1,76 @@
+// Encodes the instruction lines of an assembly file with `asm86.bastio` and
+// prints each as hexadecimal bytes, one line per line of the input; a line it
+// does not encode prints `?`. For `tests/as86.sh`, which compares with GNU as.
+//   usage: as86 FILE
+import "asm86.bastio";
+import "out.bastio";
+import "loader.bastio";
+
+fn main(con: &mut Serial, host: &mut Host) -> u64 {
+  if host_argc(host) < 2 {
+    put(con, "usage: as86 FILE\n");
+    return 2;
+  }
+  let path = host_arg(host, 1);
+  let mut data = balloc(0);
+  let ok = host_read(host, path, &mut data);
+  bfree(path);
+  if !ok {
+    put(con, "cannot read the file\n");
+    bfree(data);
+    return 1;
+  }
+  let mut line = vec_new[u64]();
+  let mut k = 0;
+  while k <= blen(data) {
+    let mut c = 10;
+    if k < blen(data) {
+      c = cast[u64](bget(data, k));
+    }
+    if c == 10 {
+      if vec_len(line) > 0 {
+        let mut out = vec_new[u64]();
+        let mut text = vec_new[u64]();
+        if as_line(&mut out, line, 0, vec_len(line)) {
+          let mut j = 0;
+          while j < vec_len(out) {
+            let x = vec_get(out, j);
+            if j > 0 {
+              vec_push(&mut text, 32);
+            }
+            vec_push(&mut text, as_hexdig(x / 16));
+            vec_push(&mut text, as_hexdig(x % 16));
+            j = j + 1;
+          }
+        } else {
+          vec_push(&mut text, 63);
+        }
+        vec_push(&mut text, 10);
+        let mut j = 0;
+        while j < vec_len(text) {
+          serial_write(con, cast[u8]((vec_get(text, j) & 255)));
+          j = j + 1;
+        }
+        vec_free(text);
+        vec_free(out);
+      } else {
+        serial_write(con, 10);
+      }
+      vec_free(line);
+      line = vec_new[u64]();
+    } else {
+      vec_push(&mut line, c);
+    }
+    k = k + 1;
+  }
+  vec_free(line);
+  bfree(data);
+  return 0;
+}
+
+fn as_hexdig(x: u64) -> u64 {
+  if x < 10 {
+    return 48 + x;
+  }
+  return wrap_add(87, x);
+}
