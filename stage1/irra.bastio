@@ -21,6 +21,7 @@
 // The allocation is target independent; `ra_print` writes it with the names
 // of the x86-64 registers the first emitter will use.
 import "ir.bastio";
+import "x86.bastio";
 
 // Where a virtual register lives.
 const RA_NONE: u64 = 0;      // never written or read
@@ -872,19 +873,80 @@ fn ra_cross(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> Vec[u64] {
   return mark;
 }
 
+struct IxMagic { ok: bool, m: u64, sh: u64 }
+
+/// The multiplier and shift of an unsigned division by `d` (not a power of
+/// two, below 2^63) without a shift of the dividend first: q = mulhi(n, m) >>
+/// sh, with m = ceil(2^(64 + sh) / d) fitting 64 bits and the error below
+/// 2^sh, which makes it exact for every 64-bit n.
+fn ix_div_magic(d: u64) -> IxMagic {
+  let mut r = IxMagic { ok: false, m: 0, sh: 0 };
+  if d < 3 || d >= 9223372036854775808 || d & wrap_sub(d, 1) == 0 {
+    return r;
+  }
+  let mut sh = 0;
+  let mut p2 = 1;
+  while sh < 63 && p2 < d && !r.ok {
+    let qr = x86_longdiv(p2, d);
+    if qr.r == 0 || qr.q < 18446744073709551615 {
+      let mut ex = 0;
+      if qr.r != 0 {
+        ex = wrap_sub(d, qr.r);
+      }
+      if ex <= p2 {
+        r = IxMagic { ok: true, m: wrap_add(qr.q, x86_ne0(qr.r)), sh: sh };
+      }
+    }
+    sh = sh + 1;
+    p2 = wrap_mul(p2, 2);
+  }
+  return r;
+}
+
+/// A division by a constant that the x86-64 emitter does with one multiplication
+/// and a shift (`ix_div_magic`): it uses %rax and %rdx and nothing else, and
+/// leaves its result in %rdx.
+fn ra_magic_div(q: IrIns, kv: &Vec[u64]) -> bool {
+  if q.op != IR_DIV || q.b >= vec_len(kv) {
+    return false;
+  }
+  let k = u_at(kv, q.b);
+  let mg = ix_div_magic(k);
+  return k != IR_NONE && k < 2147483648 && mg.ok;
+}
+
+/// A division or remainder by a constant power of two: a shift or a mask in the
+/// result's own register.
+fn ra_pow2_div(q: IrIns, kv: &Vec[u64]) -> bool {
+  if (q.op != IR_DIV && q.op != IR_REM) || q.b >= vec_len(kv) {
+    return false;
+  }
+  let k = u_at(kv, q.b);
+  return k != IR_NONE && k > 1 && k <= 2147483648 && (k & wrap_sub(k, 1)) == 0;
+}
+
 /// Which of %rdx (bit 0) and %rcx (bit 1) does instruction `q` use as scratch,
 /// in some form the x86 emitter has for it? Only the plain moves, loads,
 /// stores, jumps and the additive and logical operations and comparisons use
 /// neither; a shift by a variable count uses %rcx alone; the others
-/// (division, calls, the runtime's operations) use both.
-fn ra_dc_clob(q: IrIns, small: &Vec[u64]) -> u64 {
+/// (division, calls, the runtime's operations) use both. Bit 2 says that the
+/// instruction's own operands and result may be in the registers anyway: only
+/// a value that lives across it may not (a division by a constant reads its
+/// dividend first and leaves its quotient in %rdx).
+fn ra_dc_clob(q: IrIns, kv: &Vec[u64]) -> u64 {
   let op = q.op;
   if op == IR_SHL || op == IR_SHR || op == IR_SAR {
     // A count that is a constant below 64 is an immediate.
-    if q.b < vec_len(small) && u_at(small, q.b) == 1 {
+    if q.b < vec_len(kv) && u_at(kv, q.b) < 64 {
       return 0;
     }
     return 2;
+  }
+  if ra_pow2_div(q, kv) {
+    return 0;
+  }
+  if ra_magic_div(q, kv) {
+    return 5;
   }
   if op == IR_LABEL || op == IR_JMP || op == IR_BR || op == IR_CONST || op == IR_MOV || op == IR_LOAD || op == IR_STORE
     || op == IR_ADD || op == IR_SUB || op == IR_MUL || op == IR_AND || op == IR_OR || op == IR_XOR || (op >= IR_EQ && op <= IR_SGE)
@@ -894,15 +956,16 @@ fn ra_dc_clob(q: IrIns, small: &Vec[u64]) -> u64 {
   return 3;
 }
 
-/// For each register, 1 when it is written once, by a constant below 64.
-fn ra_small_consts(f: &IrFn) -> Vec[u64] {
+/// For each register written once, by a constant, the constant; IR_NONE for
+/// the others.
+fn ra_kvals(f: &IrFn) -> Vec[u64] {
   let nr = f.nreg;
   let mut nd = vec_new[u64]();
-  let mut sm = vec_new[u64]();
+  let mut kv = vec_new[u64]();
   let mut r = 0;
   while r < nr && r < 1000000000 {
     vec_push(&mut nd, 0);
-    vec_push(&mut sm, 0);
+    vec_push(&mut kv, IR_NONE);
     r = r + 1;
   }
   let mut j = 0;
@@ -923,8 +986,8 @@ fn ra_small_consts(f: &IrFn) -> Vec[u64] {
       let w = vec_get(ws, j);
       if w < nr {
         ra_set(&mut nd, w, wrap_add(u_at(nd, w), 1));
-        if q.op == IR_CONST && q.a < 64 {
-          ra_set(&mut sm, w, 1);
+        if q.op == IR_CONST {
+          ra_set(&mut kv, w, q.a);
         }
       }
       j = j + 1;
@@ -935,19 +998,19 @@ fn ra_small_consts(f: &IrFn) -> Vec[u64] {
   r = 0;
   while r < nr && r < 1000000000 {
     if u_at(nd, r) != 1 {
-      ra_set(&mut sm, r, 0);
+      ra_set(&mut kv, r, IR_NONE);
     }
     r = r + 1;
   }
   vec_free(nd);
-  return sm;
+  return kv;
 }
 
 /// For every register, the union of `ra_dc_clob` over the instructions it is
 /// live just after, read by or written by: it may not be kept in %rdx (bit 0)
 /// or %rcx (bit 1) if the bit is set.
 fn ra_dcmark(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> Vec[u64] {
-  let small = ra_small_consts(f);
+  let kv = ra_kvals(f);
   let nr = f.nreg;
   let nw = lv.nw;
   let mut mark = vec_new[u64]();
@@ -980,7 +1043,8 @@ fn ra_dcmark(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> Vec[u64] {
         k = k + 1;
       }
       vec_free(ws);
-      let clob = ra_dc_clob(q, small);
+      let clob = ra_dc_clob(q, kv) & 3;
+      let own = ra_dc_clob(q, kv) < 4;
       if clob != 0 {
         let mut wi = 0;
         while wi < nw && wi < vec_len(cur) {
@@ -999,7 +1063,7 @@ fn ra_dcmark(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> Vec[u64] {
       }
       let mut rs = vec_new[u64]();
       ra_reads(f, q, &mut rs);
-      if clob != 0 {
+      if clob != 0 && own {
         k = 0;
         while k < vec_len(rs) {
           if vec_get(rs, k) < nr {
@@ -1031,7 +1095,7 @@ fn ra_dcmark(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> Vec[u64] {
     vec_free(cur);
     b = b + 1;
   }
-  vec_free(small);
+  vec_free(kv);
   return mark;
 }
 
@@ -1180,6 +1244,7 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool, bigk: u64, 
   let iv = ra_intervals(f, bl, lv);
   let xmark = ra_cross(f, bl, lv);
   let dcm = ra_dcmark(f, bl, lv);
+  let dkv = ra_kvals(f);
   let nr = f.nreg;
   let n = vec_len(f.ins);
   // Call positions, to tell which intervals cross a call.
@@ -1358,6 +1423,13 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool, bigk: u64, 
         }
       }
     }
+    // The quotient of a division by a constant is left in %rdx.
+    if nres > 0 && want == IR_NONE && !crosses && touch && lo < n {
+      let q3 = vec_get(f.ins, lo);
+      if q3.d == v && ra_magic_div(q3, dkv) {
+        want = wrap_sub(nm, nres);
+      }
+    }
     // The result of a two-operand instruction may take the machine register
     // of its first operand when that dies there: the emitter then has no
     // copy to make before the operation.
@@ -1515,6 +1587,7 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool, bigk: u64, 
   vec_free(calls);
   vec_free(xmark);
   vec_free(dcm);
+  vec_free(dkv);
   vec_free(iv.lo);
   vec_free(iv.hi);
   vec_free(lv.inn);
