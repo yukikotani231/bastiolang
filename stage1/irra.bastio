@@ -872,29 +872,136 @@ fn ra_cross(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> Vec[u64] {
   return mark;
 }
 
+/// Does instruction `q` leave %rdx and %rcx alone, in every form the x86
+/// emitter has for it? Only the plain moves, loads, stores, jumps and the
+/// additive and logical operations and comparisons are known to: the others
+/// (multiplication, division, shifts, calls, the runtime's operations)
+/// use them as scratch.
+fn ra_dc_safe(q: IrIns) -> bool {
+  let op = q.op;
+  return op == IR_LABEL || op == IR_JMP || op == IR_BR || op == IR_CONST || op == IR_MOV || op == IR_LOAD || op == IR_STORE
+    || op == IR_ADD || op == IR_SUB || op == IR_AND || op == IR_OR || op == IR_XOR || (op >= IR_EQ && op <= IR_SGE);
+}
+
+/// For every register, 1 when it is live just after an instruction that is not
+/// `ra_dc_safe`, or is read or written by one: it may not be kept in %rdx or
+/// %rcx.
+fn ra_dcmark(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> Vec[u64] {
+  let nr = f.nreg;
+  let nw = lv.nw;
+  let mut mark = vec_new[u64]();
+  let mut r = 0;
+  while r < nr && r < 1000000000 {
+    vec_push(&mut mark, 0);
+    r = r + 1;
+  }
+  let mut b = 0;
+  while b < vec_len(bl) {
+    let blk = vec_get(bl, b);
+    let mut cur = vec_new[u64]();
+    let mut w = 0;
+    while w < nw && w < 1000000000 {
+      vec_push(&mut cur, u_at(lv.out, wrap_add(wrap_mul(b, nw), w)));
+      w = w + 1;
+    }
+    let mut p = blk.e;
+    while p > blk.s && p <= vec_len(f.ins) {
+      p = p - 1;
+      let q = vec_get(f.ins, p);
+      let mut ws = vec_new[u64]();
+      ra_writes(q, &mut ws);
+      let mut k = 0;
+      while k < vec_len(ws) {
+        let x = vec_get(ws, k);
+        if x < nr {
+          ra_set(&mut cur, x / 64, u_at(cur, x / 64) & wrap_sub(18446744073709551615, u_at(lv.bit, x % 64)));
+        }
+        k = k + 1;
+      }
+      vec_free(ws);
+      if !ra_dc_safe(q) {
+        let mut wi = 0;
+        while wi < nw && wi < vec_len(cur) {
+          let word = vec_get(cur, wi);
+          if word != 0 {
+            let mut bi = 0;
+            while bi < 64 {
+              if (word & u_at(lv.bit, bi)) != 0 {
+                ra_set(&mut mark, wrap_add(wrap_mul(wi, 64), bi), 1);
+              }
+              bi = bi + 1;
+            }
+          }
+          wi = wi + 1;
+        }
+      }
+      let mut rs = vec_new[u64]();
+      ra_reads(f, q, &mut rs);
+      if !ra_dc_safe(q) {
+        k = 0;
+        while k < vec_len(rs) {
+          if vec_get(rs, k) < nr {
+            ra_set(&mut mark, vec_get(rs, k), 1);
+          }
+          k = k + 1;
+        }
+        let mut ws2 = vec_new[u64]();
+        ra_writes(q, &mut ws2);
+        k = 0;
+        while k < vec_len(ws2) {
+          if vec_get(ws2, k) < nr {
+            ra_set(&mut mark, vec_get(ws2, k), 1);
+          }
+          k = k + 1;
+        }
+        vec_free(ws2);
+      }
+      k = 0;
+      while k < vec_len(rs) {
+        let x = vec_get(rs, k);
+        if x < nr {
+          ra_set(&mut cur, x / 64, u_at(cur, x / 64) | u_at(lv.bit, x % 64));
+        }
+        k = k + 1;
+      }
+      vec_free(rs);
+    }
+    vec_free(cur);
+    b = b + 1;
+  }
+  return mark;
+}
+
 fn ra_alloc(f: &IrFn, ncallee: u64, ncaller: u64) -> IrAlloc {
-  return ra_alloc_with(f, ncallee, ncaller, false, 0);
+  return ra_alloc_with(f, ncallee, ncaller, false, 0, 0);
 }
 
 /// `ra_alloc`, except that a register written once, by a constant, is left
 /// out and recorded in `cst` and `cv` for the emitter to use as an
 /// immediate.
 fn ra_alloc_const(f: &IrFn, ncallee: u64, ncaller: u64) -> IrAlloc {
-  return ra_alloc_with(f, ncallee, ncaller, true, 0);
+  return ra_alloc_with(f, ncallee, ncaller, true, 0, 0);
 }
 
 /// `ra_alloc_const`, except that a constant too wide for one instruction
 /// (`bigk`: 16 bits on AArch64) that a loop reads stays in a register, so the
 /// loop does not build it again on every pass.
 fn ra_alloc_const_loops(f: &IrFn, ncallee: u64, ncaller: u64) -> IrAlloc {
-  return ra_alloc_with(f, ncallee, ncaller, true, 65536);
+  return ra_alloc_with(f, ncallee, ncaller, true, 65536, 0);
 }
 
 /// `ra_alloc_const`, except that a constant that needs a 64-bit move on x86
 /// and that a loop reads stays in a register (a power of two stays an
 /// immediate: the emitter makes a shift or a mask of it).
 fn ra_alloc_const_wide(f: &IrFn, ncallee: u64, ncaller: u64) -> IrAlloc {
-  return ra_alloc_with(f, ncallee, ncaller, true, 2147483648);
+  return ra_alloc_with(f, ncallee, ncaller, true, 2147483648, 0);
+}
+
+/// `ra_alloc_const_wide`, with the last `nres` of the `ncaller` caller-saved
+/// registers kept for the registers that `ra_dcmark` leaves free (a parameter
+/// is never given one: the prologue reads the argument registers in turn).
+fn ra_alloc_const_wide_res(f: &IrFn, ncallee: u64, ncaller: u64, nres: u64) -> IrAlloc {
+  return ra_alloc_with(f, ncallee, ncaller, true, 2147483648, nres);
 }
 
 /// Copies between registers: `cph[r]` heads a chain through `cpn` of the
@@ -989,11 +1096,12 @@ fn ra_spill_slot(f: &IrFn, iv: &IrIntervals, sg: &IrSegs, cp: &IrCopies, al: &mu
   return s;
 }
 
-fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool, bigk: u64) -> IrAlloc {
+fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool, bigk: u64, nres: u64) -> IrAlloc {
   let bl = ra_blocks(f);
   let lv = ra_live(f, bl);
   let iv = ra_intervals(f, bl, lv);
   let xmark = ra_cross(f, bl, lv);
+  let dcm = ra_dcmark(f, bl, lv);
   let nr = f.nreg;
   let n = vec_len(f.ins);
   // Call positions, to tell which intervals cross a call.
@@ -1219,6 +1327,9 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool, bigk: u64) 
           // register that is referenced a few times at least.
           cand = m < ncallee && (!touch || m < al.ncallee_used || u_at(cost, v) >= 6);
         }
+        if cand && nres > 0 && m >= wrap_sub(nm, nres) && (u_at(dcm, v) != 0 || ra_is_param(f, v)) {
+          cand = false;
+        }
         if cand {
           let mut clash = false;
           let mut h2 = 0;
@@ -1260,7 +1371,7 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool, bigk: u64) 
       let mut best_m = 0;
       let mut m = 0;
       while m < nm {
-        if m < ncallee || !crosses {
+        if (m < ncallee || !crosses) && !(nres > 0 && m >= wrap_sub(nm, nres) && (u_at(dcm, v) != 0 || ra_is_param(f, v))) {
           let mut nclash = 0;
           let mut who = IR_NONE;
           let mut h2 = 0;
@@ -1321,6 +1432,7 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool, bigk: u64) 
   vec_free(cost);
   vec_free(calls);
   vec_free(xmark);
+  vec_free(dcm);
   vec_free(iv.lo);
   vec_free(iv.hi);
   vec_free(lv.inn);
