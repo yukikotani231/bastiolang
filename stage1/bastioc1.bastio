@@ -4,7 +4,7 @@
 // Pipeline: load -> monomorphize -> check (types and linearity) -> verify
 // (Z3) -> C -> the system C compiler.
 //
-// usage: bastioc1 [--help] [--check] [--emit-c] [--target T] [--arch A] [--lib DIR] [--backend B] [--emit-asm] [--self-link|--mingw-link] [--header F] [--dump-smt] [-o out] <file.bastio>...
+// usage: bastioc1 [--help] [--check] [--emit-c] [--target T] [--arch A] [--lib DIR] [--backend B] [--emit-asm] [--self-link|--gnu-link] [--header F] [--dump-smt] [-o out] <file.bastio>...
 //   (default)   verify, then build a native executable `out` (default: a.out)
 //               with the C compiler `$CC` (default: cc)
 //   --check     stop after verification
@@ -48,7 +48,7 @@ import "x86.bastio";
 import "irx86.bastio";
 import "irarm64.bastio";
 import "winpe.bastio";
-import "pe.bastio";
+import "elf.bastio";
 
 fn b1_code(code: u64) -> Str {
   if code == C_USE { return "E-LINEAR-USE"; }
@@ -391,7 +391,7 @@ fn b1_tool(host: &Host, argv: Vec[Bytes], what: Str, out: &mut Vec[u64]) -> u64 
 /// `--backend native`, as stage0's x86::build: the assembly is written to
 /// `outp` (`--emit-asm`), or assembled and linked into the executable
 /// `outp`. Returns the exit status.
-fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, aarch64: bool, macos: bool, windows: bool, selflink: bool, ir: bool, emit_asm: bool, lib: bool, outp: &Bytes, has_out: bool, out: &mut Vec[u64]) -> u64 {
+fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, aarch64: bool, macos: bool, windows: bool, linkchoice: u64, ir: bool, emit_asm: bool, lib: bool, outp: &Bytes, has_out: bool, out: &mut Vec[u64]) -> u64 {
   let mut g = x86_new();
   g.macos = macos;
   // A BastiOS user program or kernel: the assembly is the output (as the C
@@ -425,7 +425,7 @@ fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, aa
     }
     w_s(&mut out, "\n");
     status = 4;
-  } else if selflink && windows && !emit_asm && target == TARGET_HOSTED && !lib {
+  } else if (linkchoice == 1 || (linkchoice == 0 && windows)) && !aarch64 && !macos && !emit_asm && target == TARGET_HOSTED && !lib {
     // The program is assembled and linked by pe.bastio: no `as`, no `cc`.
     let mut exe = b1_concat(outp, "");
     if !has_out {
@@ -441,9 +441,21 @@ fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, aa
       }
       k = k + 1;
     }
-    let st = pe_build(host, exe, text);
+    let mut st = 0;
+    if windows {
+      st = pe_build(host, exe, text);
+    } else {
+      st = elf_build(host, exe, text);
+      if st == 0 {
+        let mut cm = vec_new[Bytes]();
+        push_arg(&mut cm, "chmod");
+        push_arg(&mut cm, "+x");
+        vec_push(&mut cm, b1_concat(exe, ""));
+        b1_run(host, cm);
+      }
+    }
     if st != 0 {
-      w_s(&mut out, "bastioc1: the PE linker failed (status ");
+      w_s(&mut out, "bastioc1: the linker of our own failed (status ");
       w_num(&mut out, st);
       w_s(&mut out, ")\n");
       status = 4;
@@ -558,8 +570,8 @@ fn b1_help(out: &mut Vec[u64]) {
   w_s(&mut out, "  --arch A         x86_64 (the default) or aarch64 (hosted programs compile with aarch64-linux-gnu-gcc; --backend native: partial)\n");
   w_s(&mut out, "  --os O           linux (the default), macos (--backend native --arch aarch64, or --backend native-ir: Mach-O assembly for Apple's assembler and linker driver) or windows (--backend native-ir: assembly for MinGW-w64)\n");
   w_s(&mut out, "  --backend B      c, or native (x86-64 assembly, or AArch64 with --arch aarch64); hosted programs on x86-64 Linux use native-ir unless --backend or --emit-c says otherwise\n");
-  w_s(&mut out, "  --self-link      with --os windows: link the executable with the built-in PE linker (the default)\n");
-  w_s(&mut out, "  --mingw-link     with --os windows: assemble and link with MinGW-w64 instead\n");
+  w_s(&mut out, "  --self-link      with --backend native-ir: assemble and link with the built-in assembler and linker (the default for --os windows)\n");
+  w_s(&mut out, "  --gnu-link       with --backend native-ir: assemble and link with the platform's as and cc instead (--mingw-link is the same)\n");
   w_s(&mut out, "  --emit-asm       with --backend native: write the assembly instead of an executable\n");
   w_s(&mut out, "  --lib DIR        also look for imported files in DIR\n");
   w_s(&mut out, "  --header FILE    also write a C header for the program's `export fn`s\n");
@@ -583,7 +595,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
   let mut aarch64 = false;
   let mut macos = false;
   let mut windows = false;
-  let mut selflink = true;
+  let mut linkchoice = 0;
   let mut outp = balloc(0);
   let mut has_out = false;
   let mut hdr = balloc(0);
@@ -605,10 +617,10 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
       emit_asm = true;
       bfree(a);
     } else if b1_is(a, "--self-link") {
-      selflink = true;
+      linkchoice = 1;
       bfree(a);
-    } else if b1_is(a, "--mingw-link") {
-      selflink = false;
+    } else if b1_is(a, "--gnu-link") || b1_is(a, "--mingw-link") {
+      linkchoice = 2;
       bfree(a);
     } else if b1_is(a, "--dump-smt") {
       dump_smt = true;
@@ -917,7 +929,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
             status = 2;
           } else if native {
             b1_flush(host, &mut out);
-            status = b1_native(host, c, &mut m, p, target, aarch64, macos, windows, selflink, native_ir, emit_asm, !has_main, outp, has_out, &mut out);
+            status = b1_native(host, c, &mut m, p, target, aarch64, macos, windows, linkchoice, native_ir, emit_asm, !has_main, outp, has_out, &mut out);
           } else {
             let mut g = cg_new(target);
             g.arch = c.arch;

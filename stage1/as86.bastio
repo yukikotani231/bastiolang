@@ -3,11 +3,12 @@
 //   as86 FILE         the bytes of each instruction line, one line per line
 //                     of FILE, `?` for a line it cannot encode
 //   as86 --pe OUT FILE  links FILE into the Windows executable OUT
+//   as86 --elf OUT FILE  links FILE into the Linux executable OUT
 //   as86 --obj FILE   the sections and relocations of the whole file:
 //                       S <section> <size>   then its bytes in hexadecimal
 //                       R <section> <offset> <type> <symbol> <addend>
 //                       E <errors> <first line with an error>
-import "pe.bastio";
+import "elf.bastio";
 import "out.bastio";
 import "loader.bastio";
 
@@ -18,6 +19,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
   }
   let mut obj = false;
   let mut pe = false;
+  let mut elf = false;
   let mut argi = 1;
   let a1 = host_arg(host, 1);
   if blen(a1) == 5 && bget(a1, 0) == 45 && bget(a1, 1) == 45 && bget(a1, 2) == 111 {
@@ -26,6 +28,10 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
   }
   if blen(a1) == 4 && bget(a1, 0) == 45 && bget(a1, 1) == 45 && bget(a1, 2) == 112 {
     pe = true;
+    argi = 3;
+  }
+  if blen(a1) == 5 && bget(a1, 0) == 45 && bget(a1, 1) == 45 && bget(a1, 2) == 101 {
+    elf = true;
     argi = 3;
   }
   bfree(a1);
@@ -37,6 +43,13 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
     put(con, "cannot read the file\n");
     bfree(data);
     return 1;
+  }
+  if elf {
+    let outp = host_arg(host, 2);
+    let st = elf_build(host, outp, data);
+    bfree(outp);
+    bfree(data);
+    return st;
   }
   if pe {
     let outp = host_arg(host, 2);
@@ -116,7 +129,7 @@ fn as_secname(sec: u64) -> Str {
 }
 
 fn as_object(con: &mut Serial, data: &Bytes) {
-  let mut g = pe_feed(data, false);
+  let mut g = pe_feed(data, "");
   ao_layout(&mut g);
   let mut rel = vec_new[u64]();
   let mut sec = 0;

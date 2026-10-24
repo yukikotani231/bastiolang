@@ -477,7 +477,8 @@ fn pe_first_slot(d: u64, ncmsvcrt: u64) -> u64 {
 }
 
 /// Assembles the text of `data` (the lines of a file) into a fresh object.
-fn pe_feed(data: &Bytes, entry: bool) -> AsObj {
+/// `stub` is more assembly (the entry point) appended to it.
+fn pe_feed(data: &Bytes, stub: Str) -> AsObj {
   let mut nl = 0;
   let mut c = 0;
   while c < blen(data) {
@@ -486,13 +487,11 @@ fn pe_feed(data: &Bytes, entry: bool) -> AsObj {
     }
     c = wrap_add(c, 1);
   }
-  let stub = bfrom(pe_entry());
+  let tail = bfrom(stub);
   let mut g = ao_new(wrap_add(wrap_add(nl, 16), 64));
   pe_lines_into(&mut g, data);
-  if entry {
-    pe_lines_into(&mut g, stub);
-  }
-  bfree(stub);
+  pe_lines_into(&mut g, tail);
+  bfree(tail);
   return g;
 }
 
@@ -518,7 +517,7 @@ fn pe_lines_into(g: &mut AsObj, data: &Bytes) {
 
 /// Links the program into the Windows executable at `outp`.
 fn pe_build(host: &Host, outp: &Bytes, data: &Bytes) -> u64 {
-  let mut g = pe_feed(data, true);
+  let mut g = pe_feed(data, pe_entry());
   if g.errs > 0 {
     ao_free(g);
     return 3;
@@ -530,6 +529,11 @@ fn pe_build(host: &Host, outp: &Bytes, data: &Bytes) -> u64 {
     vec_free(image);
     return 4;
   }
+  return pe_write(host, outp, image);
+}
+
+/// Writes the image to the file `outp`; 0 when that worked.
+fn pe_write(host: &Host, outp: &Bytes, image: Vec[u64]) -> u64 {
   let mut b = balloc(vec_len(image));
   let mut k = 0;
   while k < vec_len(image) && k < blen(b) {
