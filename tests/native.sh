@@ -54,6 +54,8 @@ OSARG=
 # GNU_LINK=1 (MINGW_LINK=1 on Windows): the platform's as and cc instead of
 # bastioc1's own assembler and linker, which are the default.
 [ -n "${MINGW_LINK:-}${GNU_LINK:-}" ] && OSARG="$OSARG --gnu-link"
+# SELF_LINK=1 (macOS, x86-64): bastioc1's own assembler and Mach-O writer.
+[ -n "${SELF_LINK:-}" ] && OSARG="$OSARG --self-link"
 export BASTIOC OSARG
 # One program, built by both backends; JOBS of them at a time.
 both() {

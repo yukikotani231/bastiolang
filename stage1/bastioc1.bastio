@@ -49,6 +49,7 @@ import "irx86.bastio";
 import "irarm64.bastio";
 import "winpe.bastio";
 import "elf.bastio";
+import "machold.bastio";
 
 fn b1_code(code: u64) -> Str {
   if code == C_USE { return "E-LINEAR-USE"; }
@@ -436,7 +437,7 @@ fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, aa
     }
     w_s(&mut out, "\n");
     status = 4;
-  } else if (linkchoice == 1 || (linkchoice == 0 && (windows || (ir && !aarch64 && b1_glibc(host, "/lib64/ld-linux-x86-64.so.2")) || (aarch64 && b1_glibc(host, "/lib/ld-linux-aarch64.so.1"))))) && !macos && !emit_asm && target == TARGET_HOSTED && !lib {
+  } else if (linkchoice == 1 || (linkchoice == 0 && (windows || (ir && !aarch64 && b1_glibc(host, "/lib64/ld-linux-x86-64.so.2")) || (aarch64 && b1_glibc(host, "/lib/ld-linux-aarch64.so.1"))))) && (!macos || (!aarch64 && linkchoice == 1)) && !emit_asm && target == TARGET_HOSTED && !lib {
     // The program is assembled and linked by pe.bastio: no `as`, no `cc`.
     let mut exe = b1_concat(outp, "");
     if !has_out {
@@ -455,6 +456,15 @@ fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, aa
     let mut st = 0;
     if windows {
       st = pe_build(host, exe, text);
+    } else if macos {
+      st = ml_build(host, exe, text);
+      if st == 0 {
+        let mut cm = vec_new[Bytes]();
+        push_arg(&mut cm, "chmod");
+        push_arg(&mut cm, "+x");
+        vec_push(&mut cm, b1_concat(exe, ""));
+        b1_run(host, cm);
+      }
     } else if aarch64 {
       st = elf_build_a64(host, exe, text);
       if st == 0 {

@@ -4,12 +4,14 @@
 //                     of FILE, `?` for a line it cannot encode
 //   as86 --pe OUT FILE  links FILE into the Windows executable OUT
 //   as86 --elf OUT FILE  links FILE into the Linux executable OUT
+//   as86 --macho OUT FILE  links FILE into the macOS (x86-64) executable OUT
 //   as86 --a64 OUT FILE  links the AArch64 assembly FILE into the Linux executable OUT
 //   as86 --obj FILE   the sections and relocations of the whole file:
 //                       S <section> <size>   then its bytes in hexadecimal
 //                       R <section> <offset> <type> <symbol> <addend>
 //                       E <errors> <first line with an error>
 import "elf.bastio";
+import "machold.bastio";
 import "out.bastio";
 import "loader.bastio";
 
@@ -22,6 +24,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
   let mut pe = false;
   let mut elf = false;
   let mut a64 = false;
+  let mut macho = false;
   let mut argi = 1;
   let a1 = host_arg(host, 1);
   if blen(a1) == 5 && bget(a1, 0) == 45 && bget(a1, 1) == 45 && bget(a1, 2) == 111 {
@@ -40,6 +43,10 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
     a64 = true;
     argi = 3;
   }
+  if blen(a1) == 7 && bget(a1, 0) == 45 && bget(a1, 1) == 45 && bget(a1, 2) == 109 {
+    macho = true;
+    argi = 3;
+  }
   bfree(a1);
   let path = host_arg(host, argi);
   let mut data = balloc(0);
@@ -49,6 +56,13 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
     put(con, "cannot read the file\n");
     bfree(data);
     return 1;
+  }
+  if macho {
+    let outp = host_arg(host, 2);
+    let st = ml_build(host, outp, data);
+    bfree(outp);
+    bfree(data);
+    return st;
   }
   if a64 {
     let outp = host_arg(host, 2);
