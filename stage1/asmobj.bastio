@@ -12,6 +12,7 @@
 // Part of the trusted base once a target uses it instead of the system's
 // assembler.
 import "asm86.bastio";
+import "asma64.bastio";
 
 const AB_BYTES: u64 = 1;
 const AB_BRANCH: u64 = 2;
@@ -47,6 +48,7 @@ struct AsObj {
   numdef: Vec[u64],
   numpend: Vec[u64],
   sec: u64,
+  arm: bool,
   errs: u64,
   errline: u64,
   line: u64
@@ -71,7 +73,7 @@ fn ao_new(nlines: u64) -> AsObj {
     vec_push(&mut np, 0);
     j = j + 1;
   }
-  return AsObj { names: vec_new[u64](), syms: vec_new[u64](), htab: htab, items: vec_new[u64](), pool: vec_new[u64](), numdef: nd, numpend: np, sec: AB_TEXT, errs: 0, errline: 0, line: 0 };
+  return AsObj { names: vec_new[u64](), syms: vec_new[u64](), htab: htab, items: vec_new[u64](), pool: vec_new[u64](), numdef: nd, numpend: np, sec: AB_TEXT, arm: false, errs: 0, errline: 0, line: 0 };
 }
 
 fn ao_free(g: AsObj) {
@@ -603,6 +605,39 @@ fn ao_branch(g: &mut AsObj, v: &Vec[u64], s: u64, e: u64) -> bool {
   return true;
 }
 
+/// An AArch64 instruction line: one word, with a relocation when it names a
+/// symbol.
+fn ao_arm(g: &mut AsObj, v: &Vec[u64], s: u64, e: u64) {
+  let r = a6_line(v, s, e);
+  if !r.ok {
+    ao_err(&mut g);
+    return;
+  }
+  let mut out = vec_new[u64]();
+  as_le(&mut out, r.w, 4);
+  if r.rt == 0 {
+    ao_bytes(&mut g, out, v, as_op_none());
+    vec_free(out);
+    return;
+  }
+  let start = vec_len(g.pool);
+  let mut k = 0;
+  while k < 4 {
+    vec_push(&mut g.pool, u_at(out, k));
+    k = wrap_add(k, 1);
+  }
+  vec_free(out);
+  let mut id = 0;
+  let c = u_at(v, wrap_sub(r.se, 1));
+  let num = as_number(v, r.ss, r.se);
+  if num.ok && num.next == wrap_sub(r.se, 1) && (c == 102 || c == 98) {
+    id = ao_ref_num(&mut g, num.val, c == 102);
+  } else {
+    id = ao_intern(&mut g, v, r.ss, r.se);
+  }
+  ao_push_item(&mut g, AB_RELOC, start, 4, id, a6_at(r.rt, 32), r.add);
+}
+
 /// One line of the file.
 fn ao_line(g: &mut AsObj, v: &Vec[u64], s0: u64, e0: u64) {
   g.line = wrap_add(g.line, 1);
@@ -615,7 +650,10 @@ fn ao_line(g: &mut AsObj, v: &Vec[u64], s0: u64, e0: u64) {
     if c == 34 {
       instr = !instr;
     }
-    if c == 35 && !instr {
+    if !g.arm && c == 35 && !instr {
+      e = q;
+      q = e0;
+    } else if g.arm && c == 47 && !instr && wrap_add(q, 1) < e0 && u_at(v, wrap_add(q, 1)) == 47 {
       e = q;
       q = e0;
     } else {
@@ -646,6 +684,10 @@ fn ao_line(g: &mut AsObj, v: &Vec[u64], s0: u64, e0: u64) {
   }
   if u_at(v, t) == 46 {
     ao_directive(&mut g, v, t, e);
+    return;
+  }
+  if g.arm {
+    ao_arm(&mut g, v, t, e);
     return;
   }
   if ao_branch(&mut g, v, t, e) {
@@ -913,7 +955,7 @@ fn ao_emit(g: &AsObj, sec: u64, rel: &mut Vec[u64]) -> Vec[u64] {
           let rt = ao_item(g, i, 5) >> 32;
           let addend = ao_item(g, i, 6);
           let at = wrap_add(o, off);
-          if ao_local_in(g, sym, sec) {
+          if !g.arm && ao_local_in(g, sym, sec) {
             let val = wrap_sub(wrap_add(ao_sym_off(g, sym), addend), at);
             let base = wrap_sub(wrap_add(vec_len(out), off), size);
             let mut m = 0;
@@ -922,11 +964,13 @@ fn ao_emit(g: &AsObj, sec: u64, rel: &mut Vec[u64]) -> Vec[u64] {
               m = m + 1;
             }
           } else {
-            let base = wrap_sub(wrap_add(vec_len(out), off), size);
-            let mut m = 0;
-            while m < 4 {
-              ao_set(&mut out, wrap_add(base, m), 0);
-              m = m + 1;
+            if !g.arm {
+              let base = wrap_sub(wrap_add(vec_len(out), off), size);
+              let mut m = 0;
+              while m < 4 {
+                ao_set(&mut out, wrap_add(base, m), 0);
+                m = m + 1;
+              }
             }
             vec_push(&mut rel, sec);
             vec_push(&mut rel, at);
@@ -970,7 +1014,16 @@ fn ao_emit(g: &AsObj, sec: u64, rel: &mut Vec[u64]) -> Vec[u64] {
           }
         }
       } else if k == AB_ALIGN {
-        ao_pad(&mut out, size, sec == AB_TEXT);
+        if g.arm && sec == AB_TEXT {
+          let mut left = size;
+          while left >= 4 {
+            as_le(&mut out, 3573751839, 4);
+            left = wrap_sub(left, 4);
+          }
+          ao_pad(&mut out, left, false);
+        } else {
+          ao_pad(&mut out, size, sec == AB_TEXT);
+        }
       } else if k == AB_ZERO {
         ao_pad(&mut out, size, false);
       }

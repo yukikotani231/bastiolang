@@ -31,7 +31,12 @@ if [ "$(uname -m)" = aarch64 ] || [ -n "$OSARG" ]; then RUN=; else
   RUN=qemu-aarch64
   export QEMU_LD_PREFIX=${QEMU_LD_PREFIX:-/usr/aarch64-linux-gnu}
 fi
-export BASTIOC RUN OSARG
+# SELF_LINK=1: bastioc1's own assembler and linker; GNU_LINK=1: the platform's
+# as and cc. Neither: the default (own linker on a glibc AArch64 host).
+LINKARG=
+[ -n "${SELF_LINK:-}" ] && LINKARG=--self-link
+[ -n "${GNU_LINK:-}" ] && LINKARG=--gnu-link
+export BASTIOC RUN OSARG LINKARG
 # One program; JOBS of them at a time.
 both() {
   local f=$1 want xs cs
@@ -39,7 +44,7 @@ both() {
     echo "FAIL $f: the C backend rejected it"; echo =fail; return
   fi
   "$w/c.exe" </dev/null >"$w/c.out" 2>/dev/null; cs=$?
-  "$BASTIOC" --arch aarch64 --backend native $OSARG -o "$w/x.exe" "$f" 2>"$w/err"; rc=$?
+  "$BASTIOC" --arch aarch64 --backend native $OSARG $LINKARG -o "$w/x.exe" "$f" 2>"$w/err"; rc=$?
   if [ $rc = 4 ]; then echo "skip $f: $(grep -o 'does not cover.*' "$w/err" | head -1)"; echo =skip; return; fi
   if [ $rc != 0 ]; then echo "FAIL $f: AArch64 native build failed"; sed 's/^/    /' "$w/err" | head -20; echo =fail; return; fi
   $RUN "$w/x.exe" </dev/null >"$w/x.out" 2>/dev/null; xs=$?
