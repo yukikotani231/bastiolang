@@ -1,0 +1,206 @@
+// SHA-256 over the bytes of a Vec, for the ad-hoc code signature that
+// `machold.bastio` writes into the arm64 executables macOS runs.
+//
+// Not a security boundary of the compiler's own: the signature only has to
+// match what the kernel recomputes, so that it lets the file run.
+
+fn sha_shl(x: u64, k: u64) -> u64 {
+  if k >= 64 {
+    return 0;
+  }
+  return wrap_mul(x, 1 << k);
+}
+
+fn sha_rotr(x: u64, n: u64) -> u64 {
+  if n >= 32 {
+    return x;
+  }
+  return ((x >> n) | sha_shl(x, wrap_sub(32, n))) & 4294967295;
+}
+
+fn sha_k() -> Vec[u64] {
+  let mut k = vec_new[u64]();
+  vec_push(&mut k, 1116352408);
+  vec_push(&mut k, 1899447441);
+  vec_push(&mut k, 3049323471);
+  vec_push(&mut k, 3921009573);
+  vec_push(&mut k, 961987163);
+  vec_push(&mut k, 1508970993);
+  vec_push(&mut k, 2453635748);
+  vec_push(&mut k, 2870763221);
+  vec_push(&mut k, 3624381080);
+  vec_push(&mut k, 310598401);
+  vec_push(&mut k, 607225278);
+  vec_push(&mut k, 1426881987);
+  vec_push(&mut k, 1925078388);
+  vec_push(&mut k, 2162078206);
+  vec_push(&mut k, 2614888103);
+  vec_push(&mut k, 3248222580);
+  vec_push(&mut k, 3835390401);
+  vec_push(&mut k, 4022224774);
+  vec_push(&mut k, 264347078);
+  vec_push(&mut k, 604807628);
+  vec_push(&mut k, 770255983);
+  vec_push(&mut k, 1249150122);
+  vec_push(&mut k, 1555081692);
+  vec_push(&mut k, 1996064986);
+  vec_push(&mut k, 2554220882);
+  vec_push(&mut k, 2821834349);
+  vec_push(&mut k, 2952996808);
+  vec_push(&mut k, 3210313671);
+  vec_push(&mut k, 3336571891);
+  vec_push(&mut k, 3584528711);
+  vec_push(&mut k, 113926993);
+  vec_push(&mut k, 338241895);
+  vec_push(&mut k, 666307205);
+  vec_push(&mut k, 773529912);
+  vec_push(&mut k, 1294757372);
+  vec_push(&mut k, 1396182291);
+  vec_push(&mut k, 1695183700);
+  vec_push(&mut k, 1986661051);
+  vec_push(&mut k, 2177026350);
+  vec_push(&mut k, 2456956037);
+  vec_push(&mut k, 2730485921);
+  vec_push(&mut k, 2820302411);
+  vec_push(&mut k, 3259730800);
+  vec_push(&mut k, 3345764771);
+  vec_push(&mut k, 3516065817);
+  vec_push(&mut k, 3600352804);
+  vec_push(&mut k, 4094571909);
+  vec_push(&mut k, 275423344);
+  vec_push(&mut k, 430227734);
+  vec_push(&mut k, 506948616);
+  vec_push(&mut k, 659060556);
+  vec_push(&mut k, 883997877);
+  vec_push(&mut k, 958139571);
+  vec_push(&mut k, 1322822218);
+  vec_push(&mut k, 1537002063);
+  vec_push(&mut k, 1747873779);
+  vec_push(&mut k, 1955562222);
+  vec_push(&mut k, 2024104815);
+  vec_push(&mut k, 2227730452);
+  vec_push(&mut k, 2361852424);
+  vec_push(&mut k, 2428436474);
+  vec_push(&mut k, 2756734187);
+  vec_push(&mut k, 3204031479);
+  vec_push(&mut k, 3329325298);
+  return k;
+}
+
+/// The byte at `i` of the padded message: `len` bytes from `start` of
+/// `data`, then 0x80, zeros and the length in bits, big endian.
+fn sha_byte(data: &Vec[u64], start: u64, len: u64, total: u64, i: u64) -> u64 {
+  if i < len {
+    return u_at(data, wrap_add(start, i)) & 255;
+  }
+  if i == len {
+    return 128;
+  }
+  if i >= wrap_sub(total, 8) {
+    let j = wrap_sub(wrap_sub(total, 1), i);
+    if j < 8 {
+      return (wrap_mul(len, 8) >> wrap_mul(j, 8)) & 255;
+    }
+  }
+  return 0;
+}
+
+/// Pushes the 32 bytes of the SHA-256 of `len` bytes of `data` from `start`.
+fn sha256(data: &Vec[u64], start: u64, len: u64, out: &mut Vec[u64]) {
+  let k = sha_k();
+  let mut h = vec_new[u64]();
+  vec_push(&mut h, 1779033703);
+  vec_push(&mut h, 3144134277);
+  vec_push(&mut h, 1013904242);
+  vec_push(&mut h, 2773480762);
+  vec_push(&mut h, 1359893119);
+  vec_push(&mut h, 2600822924);
+  vec_push(&mut h, 528734635);
+  vec_push(&mut h, 1541459225);
+  let total = wrap_mul(wrap_add(wrap_add(len, 8) / 64, 1), 64);
+  let mut w = vec_new[u64]();
+  let mut t = 0;
+  while t < 64
+    invariant t <= 64 && vlen(w) == t
+  {
+    vec_push(&mut w, 0);
+    t = wrap_add(t, 1);
+  }
+  let mut blk = 0;
+  while blk < total
+    invariant vlen(w) == 64 && vlen(h) == 8
+  {
+    t = 0;
+    while t < 16
+      invariant t <= 16 && vlen(w) == 64 && vlen(h) == 8
+    {
+      let at = wrap_add(blk, wrap_mul(t, 4));
+      let b0 = sha_byte(data, start, len, total, at);
+      let b1 = sha_byte(data, start, len, total, wrap_add(at, 1));
+      let b2 = sha_byte(data, start, len, total, wrap_add(at, 2));
+      let b3 = sha_byte(data, start, len, total, wrap_add(at, 3));
+      vec_set(&mut w, t, wrap_add(wrap_add(wrap_mul(b0, 16777216), wrap_mul(b1, 65536)), wrap_add(wrap_mul(b2, 256), b3)));
+      t = wrap_add(t, 1);
+    }
+    while t >= 16 && t < 64
+      invariant t >= 16 && t <= 64 && vlen(w) == 64 && vlen(h) == 8
+    {
+      let x = u_at(w, wrap_sub(t, 15));
+      let y = u_at(w, wrap_sub(t, 2));
+      let s0 = sha_rotr(x, 7) ^ sha_rotr(x, 18) ^ (x >> 3);
+      let s1 = sha_rotr(y, 17) ^ sha_rotr(y, 19) ^ (y >> 10);
+      let sum = wrap_add(wrap_add(u_at(w, wrap_sub(t, 16)), s0), wrap_add(u_at(w, wrap_sub(t, 7)), s1));
+      vec_set(&mut w, t, sum & 4294967295);
+      t = wrap_add(t, 1);
+    }
+    let mut a = u_at(h, 0);
+    let mut b = u_at(h, 1);
+    let mut c = u_at(h, 2);
+    let mut d = u_at(h, 3);
+    let mut e = u_at(h, 4);
+    let mut f = u_at(h, 5);
+    let mut g = u_at(h, 6);
+    let mut hh = u_at(h, 7);
+    t = 0;
+    while t < 64
+      invariant t <= 64 && vlen(w) == 64 && vlen(h) == 8
+    {
+      let s1 = sha_rotr(e, 6) ^ sha_rotr(e, 11) ^ sha_rotr(e, 25);
+      let ch = (e & f) ^ ((e ^ 4294967295) & g);
+      let t1 = wrap_add(wrap_add(hh, s1), wrap_add(wrap_add(ch, u_at(k, t)), u_at(w, t)));
+      let s0 = sha_rotr(a, 2) ^ sha_rotr(a, 13) ^ sha_rotr(a, 22);
+      let maj = (a & b) ^ (a & c) ^ (b & c);
+      let t2 = wrap_add(s0, maj);
+      hh = g;
+      g = f;
+      f = e;
+      e = wrap_add(d, t1) & 4294967295;
+      d = c;
+      c = b;
+      b = a;
+      a = wrap_add(t1, t2) & 4294967295;
+      t = wrap_add(t, 1);
+    }
+    vec_set(&mut h, 0, wrap_add(u_at(h, 0), a) & 4294967295);
+    vec_set(&mut h, 1, wrap_add(u_at(h, 1), b) & 4294967295);
+    vec_set(&mut h, 2, wrap_add(u_at(h, 2), c) & 4294967295);
+    vec_set(&mut h, 3, wrap_add(u_at(h, 3), d) & 4294967295);
+    vec_set(&mut h, 4, wrap_add(u_at(h, 4), e) & 4294967295);
+    vec_set(&mut h, 5, wrap_add(u_at(h, 5), f) & 4294967295);
+    vec_set(&mut h, 6, wrap_add(u_at(h, 6), g) & 4294967295);
+    vec_set(&mut h, 7, wrap_add(u_at(h, 7), hh) & 4294967295);
+    blk = wrap_add(blk, 64);
+  }
+  t = 0;
+  while t < 8 {
+    let x = u_at(h, t);
+    vec_push(&mut out, (x >> 24) & 255);
+    vec_push(&mut out, (x >> 16) & 255);
+    vec_push(&mut out, (x >> 8) & 255);
+    vec_push(&mut out, x & 255);
+    t = wrap_add(t, 1);
+  }
+  vec_free(k);
+  vec_free(h);
+  vec_free(w);
+}
