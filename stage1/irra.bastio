@@ -1391,21 +1391,25 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool, bigk: u64, 
       }
     }
     let mut pass = 0;
-    while pass < 3 && !placed {
+    while pass < 4 && !placed {
       let mut m = 0;
       while m < nm && !placed {
         let mut cand = false;
         if pass == 0 {
           cand = want != IR_NONE && m == want;
         } else if pass == 1 {
-          cand = m >= ncallee && !crosses;
+          cand = m >= ncallee && !crosses && !(nres > 0 && m >= wrap_sub(nm, nres));
+        } else if pass == 3 {
+          // %rdx and %rcx last: a value that fits a register of the older pool
+          // keeps it, so that the chain of in-place updates stays in one.
+          cand = nres > 0 && m >= wrap_sub(nm, nres) && !crosses;
         } else {
           // A callee-saved register nobody has used yet costs a save and a
           // restore in every call of the function: only worth it for a
           // register that is referenced a few times at least.
           cand = m < ncallee && (!touch || m < al.ncallee_used || u_at(cost, v) >= 6);
         }
-        if cand && nres > 0 && m >= wrap_sub(nm, nres) && (u_at(dcm, v) != 0 || ra_is_param(f, v)) {
+        if cand && nres > 0 && m >= wrap_sub(nm, nres) && ra_restricted(dcm, v, m, nm, nres, f) {
           cand = false;
         }
         if cand {
