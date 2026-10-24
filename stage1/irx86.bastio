@@ -12,8 +12,9 @@
 // Registers. The allocator is given the six callee-saved registers (%rbp
 // among them: the frame is addressed from %rsp, see `ix_fpo`, and the
 // function is written again with five when that cannot be done) and
-// four of the caller-saved ones (%r8-%r11); the emitter keeps %rax, %rcx,
-// %rdx, %rsi and %rdi to itself, so no value shares a register with an
+// four of the caller-saved ones (%r8-%r11), and %rdx and %rcx for values that
+// no instruction with a scratch use of them overlaps (`ra_dcmark`); the emitter
+// keeps %rax, %rsi and %rdi to itself, so no value shares a register with an
 // argument of a call. Spilled values and the slots of `IR_SLOT` live in the
 // frame below the saved registers. The code is a plain walk of the
 // instructions: operands are used from where the allocator put them, a
@@ -68,7 +69,9 @@ fn ix_caller(i: u64) -> u64 {
   if i == 0 { return XR_R8; }
   if i == 1 { return XR_R9; }
   if i == 2 { return XR_R10; }
-  return XR_R11;
+  if i == 3 { return XR_R11; }
+  if i == 4 { return XR_RDX; }
+  return XR_RCX;
 }
 
 /// Where virtual register `r` lives.
@@ -162,11 +165,11 @@ fn ix_mov(out: &mut Vec[u64], from: IxL, to: IxL) {
 }
 
 /// `from` as the source operand of an instruction that takes a 32-bit
-/// immediate, a register or memory: a larger constant goes through %rcx.
+/// immediate, a register or memory: a larger constant goes through %rsi.
 fn ix_src(out: &mut Vec[u64], from: IxL) -> IxL {
   if from.k == IXK_IMM && !ix_fits(from.imm) {
-    ix_mov(&mut out, from, ix_rl(XR_RCX));
-    return ix_rl(XR_RCX);
+    ix_mov(&mut out, from, ix_rl(XR_RSI));
+    return ix_rl(XR_RSI);
   }
   return from;
 }
@@ -2872,8 +2875,8 @@ fn ix_emit_cmov(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, nuse: &Vec[u64], n: 
     // load the other arm when the condition is false.
     let mut src = le;
     if le.k == IXK_IMM {
-      ix_mov(&mut out, le, ix_rl(XR_RCX));
-      src = ix_rl(XR_RCX);
+      ix_mov(&mut out, le, ix_rl(XR_RAX));
+      src = ix_rl(XR_RAX);
     }
     w_s(&mut out, "\tcmov");
     w_s(&mut out, ix_cc(ix_not(op)));
@@ -2883,8 +2886,8 @@ fn ix_emit_cmov(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, nuse: &Vec[u64], n: 
     ix_mov(&mut out, le, ld);
     let mut src = lt;
     if lt.k == IXK_IMM {
-      ix_mov(&mut out, lt, ix_rl(XR_RCX));
-      src = ix_rl(XR_RCX);
+      ix_mov(&mut out, lt, ix_rl(XR_RAX));
+      src = ix_rl(XR_RAX);
     }
     w_s(&mut out, "\tcmov");
     w_s(&mut out, ix_cc(op));
@@ -7295,11 +7298,11 @@ fn ix_function_core(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64, 
     return 0;
   }
   let na = x86_regargs(&mut g, c, &mut m, p, x);
-  let mut al = ra_alloc_const_wide(f, ncallee, 4);
+  let mut al = ra_alloc_const_wide_res(f, ncallee, 6, 2);
   // A register kept in the frame is copied to a register around a loop that uses it.
   if ra_split_loops(&mut f, al, 6) > 0 {
     ra_free(al);
-    al = ra_alloc_const_wide(f, ncallee, 4);
+    al = ra_alloc_const_wide_res(f, ncallee, 6, 2);
   }
   // A retry with fewer registers (see below) that spills more than the
   // attempt before it is not worth the saves it avoids.
