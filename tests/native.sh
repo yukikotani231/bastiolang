@@ -51,6 +51,8 @@ BASTIOC=${BASTIOC:-$(tests/bastioc1.sh)} || exit 1
 OSARG=
 [ "${NATIVE_OS:-linux}" = macos ] && OSARG="--os macos"
 [ "${NATIVE_OS:-linux}" = windows ] && OSARG="--os windows"
+# SELF_LINK=1 (with NATIVE_OS=windows): link with bastioc1's own PE linker.
+[ -n "${SELF_LINK:-}" ] && OSARG="$OSARG --self-link"
 export BASTIOC OSARG
 # One program, built by both backends; JOBS of them at a time.
 both() {
@@ -64,7 +66,7 @@ both() {
   "$w/c.exe" </dev/null >"$w/c.out" 2>/dev/null; cs=$?
   "$w/x.exe" </dev/null >"$w/x.out" 2>/dev/null; xs=$?
   # The C build writes text-mode lines on Windows, the native one bytes.
-  [ "${OSARG:-}" != "--os windows" ] || { tr -d '\r' <"$w/c.out" >"$w/c.out2"; mv "$w/c.out2" "$w/c.out"; }
+  case "${OSARG:-}" in "--os windows"*) false;; *) true;; esac || { tr -d '\r' <"$w/c.out" >"$w/c.out2"; mv "$w/c.out2" "$w/c.out"; }
   if [ $cs != $xs ]; then echo "FAIL $f: exit $xs, C backend $cs"; echo =fail; return; fi
   if ! cmp -s "$w/c.out" "$w/x.out"; then
     echo "FAIL $f: output differs from the C backend"; diff "$w/c.out" "$w/x.out" | head -10 | sed 's/^/    /'; echo =fail; return

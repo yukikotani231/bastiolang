@@ -198,7 +198,7 @@ Invariant 1 holds on arm64: system registers and device memory are reached only 
 - [ ] The rest of the test scripts on macOS: difftest, `tests/aarch64.sh`, and the compiler itself built natively there.
 - [x] Windows, through the C backend: stage0, bastioc1 and `tests/run.sh` build and pass under MSYS2 / MinGW-w64 in CI (2026-10-23): child processes use CreateProcess, the simulated pool `_aligned_malloc`. 
 - [x] A native backend for Windows (2026-10-23): `--os windows` with `--backend native-ir` writes MinGW-w64 assembly (stage1/winpe.bastio; C library calls go through Win64 thunks, children start over `_spawnvp`). The `windows` CI job compares every `tests/native.sh` program with its C build and runs the whole `tests/run.sh` suite with a `bastioc1` built this way. Still MinGW's `as` and `cc` for the last step.
-- [ ] Windows: an assembler and linker of our own (a PE writer), the sanitizer cross-check (MinGW-w64 gcc has none), the `--lib` search tests and the other test scripts (difftest, aarch64).
+- [ ] Windows: an assembler and linker of our own. Done so far: the assembler (stage1/asm86.bastio, stage1/asmobj.bastio, byte-identical to GNU as on the test programs) and a PE writer (stage1/pe.bastio, `bastioc1 --os windows --self-link`, no MinGW `as` or `cc`; imports from msvcrt.dll and kernel32.dll). Left: using it by default, a self-link run of the whole suite, and dropping MinGW's import libraries. Also left: the sanitizer cross-check (MinGW-w64 gcc has none), the `--lib` search tests and the other test scripts (difftest, aarch64).
 
 ## Performance
 
