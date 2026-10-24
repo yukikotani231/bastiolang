@@ -1,0 +1,338 @@
+// A linker and writer of Linux executables (ELF64, x86-64, dynamically linked
+// against the C library) for the assembly `asmobj.bastio` assembles, the
+// counterpart of `pe.bastio`: the whole program is one object, so linking
+// means giving each section an address, resolving every relocation against
+// it, and turning the symbols the object does not define into imports from
+// `libc.so.6`.
+//
+// The image is not position independent and has a fixed base. Each import
+// gets one slot in a table that the dynamic loader fills in at start-up
+// (`R_X86_64_GLOB_DAT`) and a six-byte `jmp *slot(%rip)` thunk in `.text`
+// (a call through the PLT is a call to the thunk; `@GOTPCREL` is the slot).
+//
+// Part of the trusted base once the Linux build uses it instead of GNU as and
+// the C compiler driver.
+import "pe.bastio";
+
+const ELF_BASE: u64 = 4194304;
+const ELF_PAGE: u64 = 4096;
+const ELF_NPHDR: u64 = 7;
+const ELF_DYNSZ: u64 = 160;
+
+/// The text of the program's entry point: the C library starts the program,
+/// calls `main` and exits with its value.
+fn elf_entry() -> Str {
+  return "\t.text\n\t.globl _start\n_start:\n\txor %ebp, %ebp\n\tmov %rdx, %r9\n\tpop %rsi\n\tmov %rsp, %rdx\n\tand $-16, %rsp\n\tpush %rax\n\tpush %rsp\n\txor %r8d, %r8d\n\txor %ecx, %ecx\n\tlea main(%rip), %rdi\n\tcall __libc_start_main@PLT\n\tud2\n";
+}
+
+fn elf_phdr(out: &mut Vec[u64], kind: u64, flags: u64, off: u64, filesz: u64, memsz: u64, align: u64) {
+  as_le(&mut out, kind, 4);
+  as_le(&mut out, flags, 4);
+  as_le(&mut out, off, 8);
+  as_le(&mut out, wrap_add(ELF_BASE, off), 8);
+  as_le(&mut out, wrap_add(ELF_BASE, off), 8);
+  as_le(&mut out, filesz, 8);
+  as_le(&mut out, memsz, 8);
+  as_le(&mut out, align, 8);
+}
+
+/// Links the assembled program `g` (laid out by `ao_layout`) into a Linux
+/// executable; the bytes of the file, or an empty vector when something is
+/// undefined that cannot be an import.
+fn elf_link(g: &mut AsObj) -> Vec[u64] {
+  let mut rel = vec_new[u64]();
+  let mut text = ao_emit(g, AB_TEXT, &mut rel);
+  let mut ro = ao_emit(g, AB_RODATA, &mut rel);
+  let mut data = ao_emit(g, AB_DATA, &mut rel);
+  let bss0 = ao_sec_size(g, AB_BSS);
+  // common symbols get their room at the end of .bss
+  let nsym = ao_nsyms(g);
+  let mut bss = pe_align(bss0, 16);
+  let mut cs = 0;
+  let mut comm = vec_new[u64]();
+  while cs < nsym {
+    if (ao_sym(g, cs, 4) & 2) != 0 {
+      vec_push(&mut comm, cs);
+      vec_push(&mut comm, bss);
+      bss = pe_align(wrap_add(bss, ao_sym(g, cs, 5)), 16);
+    }
+    cs = wrap_add(cs, 1);
+  }
+  // the imports: the undefined symbols the relocations name
+  let mut imports = vec_new[u64]();
+  let mut r = 0;
+  while wrap_add(r, 5) <= vec_len(rel) {
+    let sym = u_at(rel, wrap_add(r, 3));
+    if ao_sym(g, sym, 2) == AS_NONE && (ao_sym(g, sym, 4) & 2) == 0 && !has_id(imports, sym) {
+      vec_push(&mut imports, sym);
+    }
+    r = wrap_add(r, 5);
+  }
+  let nimp = vec_len(imports);
+  let nds = wrap_add(nimp, 1);
+  // the read-only segment: headers, the dynamic section's tables, .rodata
+  let interp = wrap_add(64, wrap_mul(ELF_NPHDR, 56));
+  let hash = pe_align(wrap_add(interp, 28), 8);
+  let dynsym = pe_align(wrap_add(hash, wrap_mul(4, wrap_add(3, nds))), 8);
+  let dynstr = wrap_add(dynsym, wrap_mul(24, nds));
+  let mut name_off = vec_new[u64]();
+  let mut cur = 11;
+  let mut k = 0;
+  while k < nimp {
+    vec_push(&mut name_off, cur);
+    cur = wrap_add(wrap_add(cur, ao_sym(g, u_at(imports, k), 1)), 1);
+    k = wrap_add(k, 1);
+  }
+  let dynstr_len = cur;
+  let rela = pe_align(wrap_add(dynstr, dynstr_len), 8);
+  let ro_off = pe_align(wrap_add(rela, wrap_mul(24, nimp)), 16);
+  let r_end = wrap_add(ro_off, vec_len(ro));
+  // .text, then a thunk of eight bytes for each import
+  let text_off = pe_align(r_end, ELF_PAGE);
+  let tstart = pe_align(vec_len(text), 16);
+  let ttotal = wrap_add(tstart, wrap_mul(nimp, 8));
+  // the writable segment: .data, the import slots, the dynamic section, .bss
+  let data_off = pe_align(wrap_add(text_off, ttotal), ELF_PAGE);
+  let got_off = wrap_add(data_off, pe_align(vec_len(data), 8));
+  let dyn_off = wrap_add(got_off, wrap_mul(nimp, 8));
+  let dyn_end = wrap_add(dyn_off, ELF_DYNSZ);
+  let bss_off = pe_align(dyn_end, 16);
+  let bss_end = wrap_add(bss_off, bss);
+  // the address of every symbol, for the relocations
+  let mut bad = false;
+  r = 0;
+  while wrap_add(r, 5) <= vec_len(rel) {
+    let sec = u_at(rel, r);
+    let at = u_at(rel, wrap_add(r, 1));
+    let kind = u_at(rel, wrap_add(r, 2));
+    let sym = u_at(rel, wrap_add(r, 3));
+    let addend = u_at(rel, wrap_add(r, 4));
+    let mut target = 0;
+    let ssec = ao_sym(g, sym, 2);
+    if ssec == AS_NONE && (ao_sym(g, sym, 4) & 2) != 0 {
+      // a common symbol
+      let mut q = 0;
+      while wrap_add(q, 2) <= vec_len(comm) {
+        if u_at(comm, q) == sym {
+          target = wrap_add(ELF_BASE, wrap_add(bss_off, u_at(comm, wrap_add(q, 1))));
+        }
+        q = wrap_add(q, 2);
+      }
+      if kind == 3 {
+        bad = true;
+      }
+    } else if ssec == AS_NONE {
+      let mut q = 0;
+      while q < nimp {
+        if u_at(imports, q) == sym {
+          if kind == 3 {
+            target = wrap_add(ELF_BASE, wrap_add(got_off, wrap_mul(q, 8)));
+          } else if kind == 2 {
+            target = wrap_add(ELF_BASE, wrap_add(text_off, wrap_add(tstart, wrap_mul(q, 8))));
+          } else {
+            bad = true;
+          }
+        }
+        q = wrap_add(q, 1);
+      }
+    } else {
+      let off = ao_sym_off(g, sym);
+      if ssec == AB_TEXT {
+        target = wrap_add(ELF_BASE, wrap_add(text_off, off));
+      } else if ssec == AB_RODATA {
+        target = wrap_add(ELF_BASE, wrap_add(ro_off, off));
+      } else if ssec == AB_DATA {
+        target = wrap_add(ELF_BASE, wrap_add(data_off, off));
+      } else {
+        target = wrap_add(ELF_BASE, wrap_add(bss_off, off));
+      }
+      if kind == 3 {
+        bad = true;
+      }
+    }
+    let mut base = wrap_add(ELF_BASE, text_off);
+    if sec == AB_RODATA {
+      base = wrap_add(ELF_BASE, ro_off);
+    } else if sec == AB_DATA {
+      base = wrap_add(ELF_BASE, data_off);
+    }
+    let value = wrap_sub(wrap_add(target, addend), wrap_add(base, at));
+    if sec == AB_TEXT {
+      pe_patch(&mut text, at, value, 4);
+    } else if sec == AB_RODATA {
+      pe_patch(&mut ro, at, value, 4);
+    } else if sec == AB_DATA {
+      pe_patch(&mut data, at, value, 4);
+    } else {
+      bad = true;
+    }
+    if target == 0 {
+      bad = true;
+    }
+    r = wrap_add(r, 5);
+  }
+  // the entry point
+  let entry = pe_find(g, "_start");
+  if entry == AS_NONE || ao_sym(g, entry, 2) != AB_TEXT {
+    bad = true;
+  }
+  let mut out = vec_new[u64]();
+  if bad {
+    vec_free(text);
+    vec_free(ro);
+    vec_free(data);
+    vec_free(rel);
+    vec_free(imports);
+    vec_free(comm);
+    vec_free(name_off);
+    return out;
+  }
+  // the thunks
+  pe_pad_to(&mut text, tstart);
+  k = 0;
+  while k < nimp {
+    let slot = wrap_add(ELF_BASE, wrap_add(got_off, wrap_mul(k, 8)));
+    let here = wrap_add(ELF_BASE, wrap_add(text_off, wrap_add(tstart, wrap_mul(k, 8))));
+    as_byte(&mut text, 255);
+    as_byte(&mut text, 37);
+    as_le(&mut text, wrap_sub(slot, wrap_add(here, 6)), 4);
+    as_byte(&mut text, 204);
+    as_byte(&mut text, 204);
+    k = wrap_add(k, 1);
+  }
+  // the ELF header
+  as_byte(&mut out, 127);
+  pe_put(&mut out, "ELF");
+  as_byte(&mut out, 2);
+  as_byte(&mut out, 1);
+  as_byte(&mut out, 1);
+  pe_pad_to(&mut out, 16);
+  as_le(&mut out, 2, 2);
+  as_le(&mut out, 62, 2);
+  as_le(&mut out, 1, 4);
+  as_le(&mut out, wrap_add(ELF_BASE, wrap_add(text_off, ao_sym_off(g, entry))), 8);
+  as_le(&mut out, 64, 8);
+  as_le(&mut out, 0, 8);
+  as_le(&mut out, 0, 4);
+  as_le(&mut out, 64, 2);
+  as_le(&mut out, 56, 2);
+  as_le(&mut out, ELF_NPHDR, 2);
+  as_le(&mut out, 64, 2);
+  as_le(&mut out, 0, 2);
+  as_le(&mut out, 0, 2);
+  // the program headers
+  elf_phdr(&mut out, 6, 4, 64, wrap_mul(ELF_NPHDR, 56), wrap_mul(ELF_NPHDR, 56), 8);
+  elf_phdr(&mut out, 3, 4, interp, 28, 28, 1);
+  elf_phdr(&mut out, 1, 4, 0, r_end, r_end, ELF_PAGE);
+  elf_phdr(&mut out, 1, 5, text_off, ttotal, ttotal, ELF_PAGE);
+  elf_phdr(&mut out, 1, 6, data_off, wrap_sub(dyn_end, data_off), wrap_sub(bss_end, data_off), ELF_PAGE);
+  elf_phdr(&mut out, 2, 6, dyn_off, ELF_DYNSZ, ELF_DYNSZ, 8);
+  elf_phdr(&mut out, 1685382481, 6, 0, 0, 0, 16);
+  // the interpreter
+  pe_put(&mut out, "/lib64/ld-linux-x86-64.so.2");
+  as_byte(&mut out, 0);
+  // the hash table: one bucket, which is empty (nothing here is exported)
+  pe_pad_to(&mut out, hash);
+  as_le(&mut out, 1, 4);
+  as_le(&mut out, nds, 4);
+  as_le(&mut out, 0, 4);
+  k = 0;
+  while k < nds {
+    as_le(&mut out, 0, 4);
+    k = wrap_add(k, 1);
+  }
+  // the symbols: the null one, then the imports (global, undefined)
+  pe_pad_to(&mut out, dynsym);
+  as_le(&mut out, 0, 8);
+  as_le(&mut out, 0, 8);
+  as_le(&mut out, 0, 8);
+  k = 0;
+  while k < nimp {
+    as_le(&mut out, u_at(name_off, k), 4);
+    as_byte(&mut out, 16);
+    as_byte(&mut out, 0);
+    as_le(&mut out, 0, 2);
+    as_le(&mut out, 0, 8);
+    as_le(&mut out, 0, 8);
+    k = wrap_add(k, 1);
+  }
+  // the strings: the library's name, then the imports'
+  as_byte(&mut out, 0);
+  pe_put(&mut out, "libc.so.6");
+  as_byte(&mut out, 0);
+  k = 0;
+  while k < nimp {
+    let id = u_at(imports, k);
+    let ns = ao_sym(g, id, 0);
+    let mut c = 0;
+    while c < ao_sym(g, id, 1) {
+      as_byte(&mut out, u_at(g.names, wrap_add(ns, c)));
+      c = wrap_add(c, 1);
+    }
+    as_byte(&mut out, 0);
+    k = wrap_add(k, 1);
+  }
+  // the relocations that fill the slots
+  pe_pad_to(&mut out, rela);
+  k = 0;
+  while k < nimp {
+    as_le(&mut out, wrap_add(ELF_BASE, wrap_add(got_off, wrap_mul(k, 8))), 8);
+    as_le(&mut out, wrap_add(wrap_mul(wrap_add(k, 1), 4294967296), 6), 8);
+    as_le(&mut out, 0, 8);
+    k = wrap_add(k, 1);
+  }
+  let ro_len = vec_len(ro);
+  let text_len = vec_len(text);
+  let data_len = vec_len(data);
+  pe_pad_to(&mut out, ro_off);
+  pe_append(&mut out, ro, ro_len);
+  pe_pad_to(&mut out, text_off);
+  pe_append(&mut out, text, text_len);
+  pe_pad_to(&mut out, data_off);
+  pe_append(&mut out, data, data_len);
+  pe_pad_to(&mut out, got_off);
+  pe_pad_to(&mut out, dyn_off);
+  // the dynamic section
+  as_le(&mut out, 1, 8);
+  as_le(&mut out, 1, 8);
+  as_le(&mut out, 4, 8);
+  as_le(&mut out, wrap_add(ELF_BASE, hash), 8);
+  as_le(&mut out, 5, 8);
+  as_le(&mut out, wrap_add(ELF_BASE, dynstr), 8);
+  as_le(&mut out, 6, 8);
+  as_le(&mut out, wrap_add(ELF_BASE, dynsym), 8);
+  as_le(&mut out, 10, 8);
+  as_le(&mut out, dynstr_len, 8);
+  as_le(&mut out, 11, 8);
+  as_le(&mut out, 24, 8);
+  as_le(&mut out, 7, 8);
+  as_le(&mut out, wrap_add(ELF_BASE, rela), 8);
+  as_le(&mut out, 8, 8);
+  as_le(&mut out, wrap_mul(24, nimp), 8);
+  as_le(&mut out, 9, 8);
+  as_le(&mut out, 24, 8);
+  as_le(&mut out, 0, 8);
+  as_le(&mut out, 0, 8);
+  vec_free(rel);
+  vec_free(imports);
+  vec_free(comm);
+  vec_free(name_off);
+  return out;
+}
+
+/// Links the program into the Linux executable at `outp`.
+fn elf_build(host: &Host, outp: &Bytes, data: &Bytes) -> u64 {
+  let mut g = pe_feed(data, elf_entry());
+  if g.errs > 0 {
+    ao_free(g);
+    return 3;
+  }
+  ao_layout(&mut g);
+  let image = elf_link(&mut g);
+  ao_free(g);
+  if vec_len(image) == 0 {
+    vec_free(image);
+    return 4;
+  }
+  return pe_write(host, outp, image);
+}
