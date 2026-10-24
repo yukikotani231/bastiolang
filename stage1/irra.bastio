@@ -877,16 +877,71 @@ fn ra_cross(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> Vec[u64] {
 /// additive and logical operations and comparisons are known to: the others
 /// (multiplication, division, shifts, calls, the runtime's operations)
 /// use them as scratch.
-fn ra_dc_safe(q: IrIns) -> bool {
+fn ra_dc_safe(q: IrIns, small: &Vec[u64]) -> bool {
   let op = q.op;
+  if (op == IR_SHL || op == IR_SHR || op == IR_SAR) && q.b < vec_len(small) {
+    // A count that is a constant below 64 is an immediate.
+    return u_at(small, q.b) == 1;
+  }
   return op == IR_LABEL || op == IR_JMP || op == IR_BR || op == IR_CONST || op == IR_MOV || op == IR_LOAD || op == IR_STORE
-    || op == IR_ADD || op == IR_SUB || op == IR_AND || op == IR_OR || op == IR_XOR || (op >= IR_EQ && op <= IR_SGE);
+    || op == IR_ADD || op == IR_SUB || op == IR_MUL || op == IR_AND || op == IR_OR || op == IR_XOR || (op >= IR_EQ && op <= IR_SGE)
+    || op == IR_NOT || op == IR_NEG || op == IR_WRAP || op == IR_GLOBAL || op == IR_STRLIT || op == IR_SLOT;
+}
+
+/// For each register, 1 when it is written once, by a constant below 64.
+fn ra_small_consts(f: &IrFn) -> Vec[u64] {
+  let nr = f.nreg;
+  let mut nd = vec_new[u64]();
+  let mut sm = vec_new[u64]();
+  let mut r = 0;
+  while r < nr && r < 1000000000 {
+    vec_push(&mut nd, 0);
+    vec_push(&mut sm, 0);
+    r = r + 1;
+  }
+  let mut j = 0;
+  while j < vec_len(f.params) {
+    let pr = vec_get(f.params, j);
+    if pr < nr {
+      ra_set(&mut nd, pr, 2);
+    }
+    j = j + 1;
+  }
+  let mut i = 0;
+  while i < vec_len(f.ins) {
+    let q = vec_get(f.ins, i);
+    let mut ws = vec_new[u64]();
+    ra_writes(q, &mut ws);
+    j = 0;
+    while j < vec_len(ws) {
+      let w = vec_get(ws, j);
+      if w < nr {
+        ra_set(&mut nd, w, wrap_add(u_at(nd, w), 1));
+        if q.op == IR_CONST && q.a < 64 {
+          ra_set(&mut sm, w, 1);
+        }
+      }
+      j = j + 1;
+    }
+    vec_free(ws);
+    i = i + 1;
+  }
+  r = 0;
+  while r < nr && r < 1000000000 {
+    if u_at(nd, r) != 1 {
+      ra_set(&mut sm, r, 0);
+    }
+    r = r + 1;
+  }
+  vec_free(nd);
+  return sm;
 }
 
 /// For every register, 1 when it is live just after an instruction that is not
 /// `ra_dc_safe`, or is read or written by one: it may not be kept in %rdx or
 /// %rcx.
 fn ra_dcmark(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> Vec[u64] {
+  let small = ra_small_consts(f);
   let nr = f.nreg;
   let nw = lv.nw;
   let mut mark = vec_new[u64]();
@@ -919,7 +974,7 @@ fn ra_dcmark(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> Vec[u64] {
         k = k + 1;
       }
       vec_free(ws);
-      if !ra_dc_safe(q) {
+      if !ra_dc_safe(q, small) {
         let mut wi = 0;
         while wi < nw && wi < vec_len(cur) {
           let word = vec_get(cur, wi);
@@ -937,7 +992,7 @@ fn ra_dcmark(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> Vec[u64] {
       }
       let mut rs = vec_new[u64]();
       ra_reads(f, q, &mut rs);
-      if !ra_dc_safe(q) {
+      if !ra_dc_safe(q, small) {
         k = 0;
         while k < vec_len(rs) {
           if vec_get(rs, k) < nr {
@@ -969,6 +1024,7 @@ fn ra_dcmark(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> Vec[u64] {
     vec_free(cur);
     b = b + 1;
   }
+  vec_free(small);
   return mark;
 }
 
