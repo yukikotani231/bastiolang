@@ -747,6 +747,94 @@ fn a6_pair(v: &Vec[u64], ops: &Vec[u64], n: u64, load: bool, rt: A6R) -> A6 {
 }
 
 /// Encodes the instruction on `v[s .. e)` (no label, no comment).
+/// Is the suffix after `@` at `i`..`j` the word `w`?
+fn a6_suffix(v: &Vec[u64], i: u64, j: u64, w: Str) -> bool {
+  if wrap_sub(j, i) != slen(w) {
+    return false;
+  }
+  let mut k = 0;
+  while k < slen(w)
+    invariant k <= slen(w)
+  {
+    if u_at(v, wrap_add(i, k)) != cast[u64](sget(w, k)) {
+      return false;
+    }
+    k = k + 1;
+  }
+  return true;
+}
+
+/// The line `s`..`e` with Apple's relocation operators written the GNU way:
+/// `sym@PAGE` is `sym`, `sym@PAGEOFF` is `:lo12:sym`, `sym@GOTPAGE` is
+/// `:got:sym` and `sym@GOTPAGEOFF` is `:got_lo12:sym`. The result is a new
+/// line, which the caller frees.
+fn a6_unmac(v: &Vec[u64], s: u64, e: u64) -> Vec[u64] {
+  let mut out = vec_new[u64]();
+  let mut idst = 0;
+  let mut inid = false;
+  let mut i = s;
+  while i < e {
+    let c = u_at(v, i);
+    if c == 64 && inid {
+      let mut j = wrap_add(i, 1);
+      while j < e && as_is_alnum(u_at(v, j)) {
+        j = wrap_add(j, 1);
+      }
+      let mut pre = "";
+      let mut known = true;
+      if a6_suffix(v, wrap_add(i, 1), j, "PAGEOFF") {
+        pre = ":lo12:";
+      } else if a6_suffix(v, wrap_add(i, 1), j, "PAGE") {
+        pre = "";
+      } else if a6_suffix(v, wrap_add(i, 1), j, "GOTPAGEOFF") {
+        pre = ":got_lo12:";
+      } else if a6_suffix(v, wrap_add(i, 1), j, "GOTPAGE") {
+        pre = ":got:";
+      } else {
+        known = false;
+      }
+      if known {
+        let mut o2 = vec_new[u64]();
+        let mut k = 0;
+        while k < idst && k < vec_len(out) {
+          vec_push(&mut o2, u_at(out, k));
+          k = wrap_add(k, 1);
+        }
+        k = 0;
+        while k < slen(pre) {
+          vec_push(&mut o2, cast[u64](sget(pre, k)));
+          k = wrap_add(k, 1);
+        }
+        k = idst;
+        while k < vec_len(out) {
+          vec_push(&mut o2, u_at(out, k));
+          k = wrap_add(k, 1);
+        }
+        vec_free(out);
+        out = o2;
+        i = j;
+        inid = false;
+      } else {
+        vec_push(&mut out, c);
+        i = wrap_add(i, 1);
+        inid = false;
+      }
+    } else {
+      if as_is_alnum(c) {
+        if !inid {
+          idst = vec_len(out);
+          inid = true;
+        }
+      } else {
+        inid = false;
+      }
+      vec_push(&mut out, c);
+      i = wrap_add(i, 1);
+    }
+  }
+  return out;
+}
+
 fn a6_line(v: &Vec[u64], s: u64, e: u64) -> A6 {
   let ns = as_skip(v, s, e);
   let ne = wrap_add(ns, as_namelen(v, ns, e));

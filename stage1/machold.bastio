@@ -15,6 +15,7 @@
 // Part of the trusted base once the macOS build uses it instead of Apple's
 // assembler and linker driver.
 import "elf.bastio";
+import "sha256.bastio";
 
 const ML_BASE: u64 = 4294967296;
 const ML_PAGE: u64 = 4096;
@@ -71,7 +72,88 @@ fn ml_sect(out: &mut Vec[u64], name: Str, seg: Str, addr: u64, size: u64, off: u
   as_le(&mut out, 0, 4);
 }
 
-fn ml_link(g: &mut AsObj) -> Vec[u64] {
+/// Links the assembled program `g` (laid out by `ao_layout`) into a macOS
+/// executable, x86-64 or (`arm`) arm64; the bytes of the file, or an empty
+/// vector when something is undefined that cannot be an import.
+fn ml_be(out: &mut Vec[u64], x: u64, n: u64) {
+  if n > 8 {
+    return;
+  }
+  let mut k = n;
+  while k > 0
+    invariant k <= 8
+  {
+    k = wrap_sub(k, 1);
+    as_byte(&mut out, (x >> wrap_mul(k, 8)) & 255);
+  }
+}
+
+/// Appends the ad-hoc code signature of the first `sig_off` bytes of `out`:
+/// a SuperBlob holding one CodeDirectory, which has a SHA-256 for each page
+/// of 4096 bytes. `seg` is the size of the executable segment.
+fn ml_sign(out: &mut Vec[u64], sig_off: u64, nslots: u64, sig_len: u64, seg: u64) {
+  let cd = wrap_sub(sig_len, 20);
+  let ident = "a.out";
+  ml_be(&mut out, 4208856256, 4);
+  ml_be(&mut out, sig_len, 4);
+  ml_be(&mut out, 1, 4);
+  ml_be(&mut out, 0, 4);
+  ml_be(&mut out, 20, 4);
+  // the CodeDirectory
+  ml_be(&mut out, 4208856066, 4);
+  ml_be(&mut out, cd, 4);
+  ml_be(&mut out, 132096, 4);
+  ml_be(&mut out, 131074, 4);
+  ml_be(&mut out, 94, 4);
+  ml_be(&mut out, 88, 4);
+  ml_be(&mut out, 0, 4);
+  ml_be(&mut out, nslots, 4);
+  ml_be(&mut out, sig_off, 4);
+  as_byte(&mut out, 32);
+  as_byte(&mut out, 2);
+  as_byte(&mut out, 0);
+  as_byte(&mut out, 12);
+  ml_be(&mut out, 0, 4);
+  ml_be(&mut out, 0, 4);
+  ml_be(&mut out, 0, 4);
+  ml_be(&mut out, 0, 4);
+  ml_be(&mut out, 0, 8);
+  ml_be(&mut out, 0, 8);
+  ml_be(&mut out, seg, 8);
+  ml_be(&mut out, 1, 8);
+  pe_put(&mut out, ident);
+  as_byte(&mut out, 0);
+  let mut digest = vec_new[u64]();
+  let mut p = 0;
+  while p < nslots {
+    let start = wrap_mul(p, 4096);
+    let mut len = wrap_sub(sig_off, start);
+    if len > 4096 {
+      len = 4096;
+    }
+    sha256(out, start, len, &mut digest);
+    p = wrap_add(p, 1);
+  }
+  let dl = vec_len(digest);
+  let mut k = 0;
+  while k < dl {
+    as_byte(&mut out, u_at(digest, k));
+    k = wrap_add(k, 1);
+  }
+  vec_free(digest);
+}
+
+fn ml_link(g: &mut AsObj, arm: bool) -> Vec[u64] {
+  let mut page = ML_PAGE;
+  let mut tsz = 8;
+  let mut cmds = ML_CMDS;
+  let mut ncmds = ML_NCMDS;
+  if arm {
+    page = 16384;
+    tsz = 16;
+    cmds = wrap_add(ML_CMDS, 16);
+    ncmds = wrap_add(ML_NCMDS, 1);
+  }
   let mut rel = vec_new[u64]();
   let mut text = ao_emit(g, AB_TEXT, &mut rel);
   let mut ro = ao_emit(g, AB_RODATA, &mut rel);
@@ -102,21 +184,21 @@ fn ml_link(g: &mut AsObj) -> Vec[u64] {
   }
   let nimp = vec_len(imports);
   // the read-only and executable segment: the headers, .text and its thunks, .rodata
-  let text_off = pe_align(wrap_add(32, ML_CMDS), 16);
+  let text_off = pe_align(wrap_add(32, cmds), 16);
   let tstart = pe_align(vec_len(text), 16);
-  let ttotal = wrap_add(tstart, wrap_mul(nimp, 8));
+  let ttotal = wrap_add(tstart, wrap_mul(nimp, tsz));
   let ro_off = pe_align(wrap_add(text_off, ttotal), 16);
   let ro_len = vec_len(ro);
   let text_end = wrap_add(ro_off, ro_len);
-  let tseg = pe_align(text_end, ML_PAGE);
+  let tseg = pe_align(text_end, page);
   // the writable segment: .data, the import slots, then .bss
   let data_off = tseg;
   let data_len = vec_len(data);
   let got_off = wrap_add(data_off, pe_align(data_len, 8));
   let data_end = wrap_add(got_off, wrap_mul(nimp, 8));
-  let dseg = pe_align(wrap_sub(data_end, data_off), ML_PAGE);
+  let dseg = pe_align(wrap_sub(data_end, data_off), page);
   let bss_off = wrap_add(data_off, dseg);
-  let dvm = wrap_add(dseg, pe_align(bss, ML_PAGE));
+  let dvm = wrap_add(dseg, pe_align(bss, page));
   // the link-edit segment: the bind opcodes and an empty symbol table
   let le_off = wrap_add(data_off, dseg);
   let le_vm = wrap_add(data_off, dvm);
@@ -142,7 +224,16 @@ fn ml_link(g: &mut AsObj) -> Vec[u64] {
   as_byte(&mut bind, 0);
   let bind_len = vec_len(bind);
   let bind_size = pe_align(bind_len, 8);
-  let le_size = wrap_add(bind_size, 8);
+  // arm64: the ad-hoc code signature closes the segment, 16-byte aligned,
+  // one SHA-256 for each 4096 bytes of the file before it
+  let sig_off = pe_align(wrap_add(le_off, wrap_add(bind_size, 8)), 16);
+  let nslots = wrap_add(sig_off, 4095) / 4096;
+  let mut sig_len = 0;
+  let mut le_size = wrap_add(bind_size, 8);
+  if arm {
+    sig_len = wrap_add(114, wrap_mul(32, nslots));
+    le_size = wrap_add(wrap_sub(sig_off, le_off), sig_len);
+  }
   // the address of every symbol, for the relocations
   let mut bad = false;
   r = 0;
@@ -162,17 +253,17 @@ fn ml_link(g: &mut AsObj) -> Vec[u64] {
         }
         q = wrap_add(q, 2);
       }
-      if elf_is_got(kind, false) {
+      if elf_is_got(kind, arm) {
         bad = true;
       }
     } else if ssec == AS_NONE {
       let mut q = 0;
       while q < nimp {
         if u_at(imports, q) == sym {
-          if elf_is_got(kind, false) {
+          if elf_is_got(kind, arm) {
             target = wrap_add(ML_BASE, wrap_add(got_off, wrap_mul(q, 8)));
-          } else if elf_is_call(kind, false) {
-            target = wrap_add(ML_BASE, wrap_add(text_off, wrap_add(tstart, wrap_mul(q, 8))));
+          } else if elf_is_call(kind, arm) {
+            target = wrap_add(ML_BASE, wrap_add(text_off, wrap_add(tstart, wrap_mul(q, tsz))));
           } else {
             bad = true;
           }
@@ -190,7 +281,7 @@ fn ml_link(g: &mut AsObj) -> Vec[u64] {
       } else {
         target = wrap_add(ML_BASE, wrap_add(bss_off, off));
       }
-      if elf_is_got(kind, false) {
+      if elf_is_got(kind, arm) {
         bad = true;
       }
     }
@@ -201,7 +292,19 @@ fn ml_link(g: &mut AsObj) -> Vec[u64] {
       base = wrap_add(ML_BASE, data_off);
     }
     let value = wrap_sub(wrap_add(target, addend), wrap_add(base, at));
-    if sec == AB_TEXT {
+    if arm {
+      let sa = wrap_add(target, addend);
+      let place = wrap_add(base, at);
+      if sec == AB_TEXT {
+        if !elf_a64_apply(&mut text, at, kind, sa, place) { bad = true; }
+      } else if sec == AB_RODATA {
+        if !elf_a64_apply(&mut ro, at, kind, sa, place) { bad = true; }
+      } else if sec == AB_DATA {
+        if !elf_a64_apply(&mut data, at, kind, sa, place) { bad = true; }
+      } else {
+        bad = true;
+      }
+    } else if sec == AB_TEXT {
       pe_patch(&mut text, at, value, 4);
     } else if sec == AB_RODATA {
       pe_patch(&mut ro, at, value, 4);
@@ -236,22 +339,35 @@ fn ml_link(g: &mut AsObj) -> Vec[u64] {
   k = 0;
   while k < nimp {
     let slot = wrap_add(ML_BASE, wrap_add(got_off, wrap_mul(k, 8)));
-    let here = wrap_add(ML_BASE, wrap_add(text_off, wrap_add(tstart, wrap_mul(k, 8))));
-    as_byte(&mut text, 255);
-    as_byte(&mut text, 37);
-    as_le(&mut text, wrap_sub(slot, wrap_add(here, 6)), 4);
-    as_byte(&mut text, 204);
-    as_byte(&mut text, 204);
+    let here = wrap_add(ML_BASE, wrap_add(text_off, wrap_add(tstart, wrap_mul(k, tsz))));
+    if arm {
+      elf_a64_stub(&mut text, tstart, k, slot, here);
+    } else {
+      as_byte(&mut text, 255);
+      as_byte(&mut text, 37);
+      as_le(&mut text, wrap_sub(slot, wrap_add(here, 6)), 4);
+      as_byte(&mut text, 204);
+      as_byte(&mut text, 204);
+    }
     k = wrap_add(k, 1);
   }
   // the header
   as_le(&mut out, 4277009103, 4);
-  as_le(&mut out, 16777223, 4);
-  as_le(&mut out, 3, 4);
+  if arm {
+    as_le(&mut out, 16777228, 4);
+    as_le(&mut out, 0, 4);
+  } else {
+    as_le(&mut out, 16777223, 4);
+    as_le(&mut out, 3, 4);
+  }
   as_le(&mut out, 2, 4);
-  as_le(&mut out, ML_NCMDS, 4);
-  as_le(&mut out, ML_CMDS, 4);
-  as_le(&mut out, 133, 4);
+  as_le(&mut out, ncmds, 4);
+  as_le(&mut out, cmds, 4);
+  if arm {
+    as_le(&mut out, 2097285, 4);
+  } else {
+    as_le(&mut out, 133, 4);
+  }
   as_le(&mut out, 0, 4);
   // the load commands
   ml_seg(&mut out, "__PAGEZERO", 0, ML_BASE, 0, 0, 0, 0);
@@ -261,7 +377,7 @@ fn ml_link(g: &mut AsObj) -> Vec[u64] {
   ml_seg(&mut out, "__DATA", wrap_add(ML_BASE, data_off), dvm, data_off, dseg, 3, 2);
   ml_sect(&mut out, "__data", "__DATA", wrap_add(ML_BASE, data_off), wrap_sub(data_end, data_off), data_off, 4, 0);
   ml_sect(&mut out, "__bss", "__DATA", wrap_add(ML_BASE, bss_off), bss, 0, 4, 1);
-  ml_seg(&mut out, "__LINKEDIT", wrap_add(ML_BASE, le_vm), pe_align(le_size, ML_PAGE), le_off, le_size, 1, 0);
+  ml_seg(&mut out, "__LINKEDIT", wrap_add(ML_BASE, le_vm), pe_align(le_size, page), le_off, le_size, 1, 0);
   // LC_DYLD_INFO_ONLY: no rebases, the binds, no lazy binds and no exports
   as_le(&mut out, 2147483682, 4);
   as_le(&mut out, 48, 4);
@@ -309,14 +425,26 @@ fn ml_link(g: &mut AsObj) -> Vec[u64] {
   as_le(&mut out, 65536, 4);
   pe_put(&mut out, "/usr/lib/libSystem.B.dylib");
   pe_pad_to(&mut out, pe_align(vec_len(out), 8));
-  // LC_BUILD_VERSION: macOS 10.15, no tools
+  // LC_BUILD_VERSION: macOS 10.15 (11.0 on arm64), no tools
   as_le(&mut out, 50, 4);
   as_le(&mut out, 24, 4);
   as_le(&mut out, 1, 4);
-  as_le(&mut out, 659200, 4);
-  as_le(&mut out, 659200, 4);
+  if arm {
+    as_le(&mut out, 720896, 4);
+    as_le(&mut out, 720896, 4);
+  } else {
+    as_le(&mut out, 659200, 4);
+    as_le(&mut out, 659200, 4);
+  }
   as_le(&mut out, 0, 4);
-  if vec_len(out) != wrap_add(32, ML_CMDS) {
+  if arm {
+    // LC_CODE_SIGNATURE
+    as_le(&mut out, 29, 4);
+    as_le(&mut out, 16, 4);
+    as_le(&mut out, sig_off, 4);
+    as_le(&mut out, sig_len, 4);
+  }
+  if vec_len(out) != wrap_add(32, cmds) {
     vec_free(text);
     vec_free(ro);
     vec_free(data);
@@ -337,6 +465,10 @@ fn ml_link(g: &mut AsObj) -> Vec[u64] {
   pe_pad_to(&mut out, data_end);
   pe_pad_to(&mut out, le_off);
   pe_append(&mut out, bind, bind_len);
+  if arm {
+    pe_pad_to(&mut out, sig_off);
+    ml_sign(&mut out, sig_off, nslots, sig_len, tseg);
+  }
   pe_pad_to(&mut out, wrap_add(le_off, le_size));
   vec_free(rel);
   vec_free(imports);
@@ -344,15 +476,16 @@ fn ml_link(g: &mut AsObj) -> Vec[u64] {
   return out;
 }
 
-/// Links the program into the macOS executable at `outp`.
-fn ml_build(host: &Host, outp: &Bytes, data: &Bytes) -> u64 {
-  let mut g = pe_feed(data, "", false);
+/// Links the program into the macOS executable at `outp`: arm64 when `arm`
+/// (the text is the AArch64 assembly), x86-64 otherwise.
+fn ml_build(host: &Host, outp: &Bytes, data: &Bytes, arm: bool) -> u64 {
+  let mut g = pe_feed(data, "", arm);
   if g.errs > 0 {
     ao_free(g);
     return 3;
   }
   ao_layout(&mut g);
-  let image = ml_link(&mut g);
+  let image = ml_link(&mut g, arm);
   ao_free(g);
   if vec_len(image) == 0 {
     vec_free(image);

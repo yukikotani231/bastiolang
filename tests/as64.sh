@@ -28,3 +28,12 @@ cat "$work"/asm/*.s | grep -P '^\t[a-z]' \
   | sort -u > "$work/forms.txt"
 tests/as64_forms.py "$work/as64" "$work/forms.txt"
 tests/as64_forms.py "$work/as64" tests/as64_extra.txt
+# Apple's relocation operators (`sym@PAGE`, `@PAGEOFF`, `@GOTPAGE`,
+# `@GOTPAGEOFF`) encode as the GNU spelling on the other side of the `|`.
+cut -d'|' -f1 tests/as64_mac.txt > "$work/mac_a.txt"
+cut -d'|' -f2 tests/as64_mac.txt > "$work/mac_b.txt"
+"$work/as64" "$work/mac_a.txt" > "$work/mac_a.out"
+"$work/as64" "$work/mac_b.txt" > "$work/mac_b.out"
+cmp "$work/mac_a.out" "$work/mac_b.out" || { echo "as64.sh: the macOS spellings encode differently" >&2; exit 1; }
+if grep -q '?' "$work/mac_a.out"; then echo "as64.sh: a macOS spelling does not assemble" >&2; exit 1; fi
+echo "as64.sh: $(wc -l < "$work/mac_a.txt") macOS relocation spellings equal the GNU ones"

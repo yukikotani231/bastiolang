@@ -36,6 +36,7 @@ if command -v z3 >/dev/null; then
   step "tests/native.sh (IR emitter, GNU as and cc)"; GNU_LINK=1 BACKEND=native-ir tests/native.sh
   step "tests/as86.sh";      tests/as86.sh
   step "tests/as64.sh";      tests/as64.sh
+  step "tests/macho.sh";     tests/macho.sh
   step "tests/proof_cache.sh"; tests/proof_cache.sh
   step "tests/tools.sh";     tests/tools.sh
   step "stage1/difftest.sh"; stage1/difftest.sh

@@ -5,6 +5,8 @@
 //   as86 --pe OUT FILE  links FILE into the Windows executable OUT
 //   as86 --elf OUT FILE  links FILE into the Linux executable OUT
 //   as86 --macho OUT FILE  links FILE into the macOS (x86-64) executable OUT
+//   as86 --macho64 OUT FILE  the same for the AArch64 assembly
+//   as86 --sha FILE  the SHA-256 of the bytes of FILE, in hexadecimal
 //   as86 --a64 OUT FILE  links the AArch64 assembly FILE into the Linux executable OUT
 //   as86 --obj FILE   the sections and relocations of the whole file:
 //                       S <section> <size>   then its bytes in hexadecimal
@@ -12,6 +14,7 @@
 //                       E <errors> <first line with an error>
 import "elf.bastio";
 import "machold.bastio";
+import "sha256.bastio";
 import "out.bastio";
 import "loader.bastio";
 
@@ -25,6 +28,8 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
   let mut elf = false;
   let mut a64 = false;
   let mut macho = false;
+  let mut sha = false;
+  let mut arm64 = false;
   let mut argi = 1;
   let a1 = host_arg(host, 1);
   if blen(a1) == 5 && bget(a1, 0) == 45 && bget(a1, 1) == 45 && bget(a1, 2) == 111 {
@@ -43,6 +48,15 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
     a64 = true;
     argi = 3;
   }
+  if blen(a1) == 5 && bget(a1, 0) == 45 && bget(a1, 1) == 45 && bget(a1, 2) == 115 {
+    sha = true;
+    argi = 2;
+  }
+  if blen(a1) == 9 && bget(a1, 0) == 45 && bget(a1, 1) == 45 && bget(a1, 2) == 109 {
+    macho = true;
+    arm64 = true;
+    argi = 3;
+  }
   if blen(a1) == 7 && bget(a1, 0) == 45 && bget(a1, 1) == 45 && bget(a1, 2) == 109 {
     macho = true;
     argi = 3;
@@ -57,9 +71,32 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
     bfree(data);
     return 1;
   }
+  if sha {
+    let mut bytes = vec_new[u64]();
+    let mut j = 0;
+    while j < blen(data) {
+      vec_push(&mut bytes, cast[u64](bget(data, j)));
+      j = wrap_add(j, 1);
+    }
+    let mut dg = vec_new[u64]();
+    sha256(bytes, 0, vec_len(bytes), &mut dg);
+    let mut text = vec_new[u64]();
+    j = 0;
+    while j < vec_len(dg) {
+      as_put_hex(&mut text, u_at(dg, j));
+      j = wrap_add(j, 1);
+    }
+    vec_push(&mut text, 10);
+    as_flush(&mut con, text);
+    vec_free(text);
+    vec_free(dg);
+    vec_free(bytes);
+    bfree(data);
+    return 0;
+  }
   if macho {
     let outp = host_arg(host, 2);
-    let st = ml_build(host, outp, data);
+    let st = ml_build(host, outp, data, arm64);
     bfree(outp);
     bfree(data);
     return st;
