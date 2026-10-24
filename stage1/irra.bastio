@@ -872,20 +872,26 @@ fn ra_cross(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> Vec[u64] {
   return mark;
 }
 
-/// Does instruction `q` leave %rdx and %rcx alone, in every form the x86
-/// emitter has for it? Only the plain moves, loads, stores, jumps and the
-/// additive and logical operations and comparisons are known to: the others
-/// (multiplication, division, shifts, calls, the runtime's operations)
-/// use them as scratch.
-fn ra_dc_safe(q: IrIns, small: &Vec[u64]) -> bool {
+/// Which of %rdx (bit 0) and %rcx (bit 1) does instruction `q` use as scratch,
+/// in some form the x86 emitter has for it? Only the plain moves, loads,
+/// stores, jumps and the additive and logical operations and comparisons use
+/// neither; a shift by a variable count uses %rcx alone; the others
+/// (division, calls, the runtime's operations) use both.
+fn ra_dc_clob(q: IrIns, small: &Vec[u64]) -> u64 {
   let op = q.op;
-  if (op == IR_SHL || op == IR_SHR || op == IR_SAR) && q.b < vec_len(small) {
+  if op == IR_SHL || op == IR_SHR || op == IR_SAR {
     // A count that is a constant below 64 is an immediate.
-    return u_at(small, q.b) == 1;
+    if q.b < vec_len(small) && u_at(small, q.b) == 1 {
+      return 0;
+    }
+    return 2;
   }
-  return op == IR_LABEL || op == IR_JMP || op == IR_BR || op == IR_CONST || op == IR_MOV || op == IR_LOAD || op == IR_STORE
+  if op == IR_LABEL || op == IR_JMP || op == IR_BR || op == IR_CONST || op == IR_MOV || op == IR_LOAD || op == IR_STORE
     || op == IR_ADD || op == IR_SUB || op == IR_MUL || op == IR_AND || op == IR_OR || op == IR_XOR || (op >= IR_EQ && op <= IR_SGE)
-    || op == IR_NOT || op == IR_NEG || op == IR_WRAP || op == IR_GLOBAL || op == IR_STRLIT || op == IR_SLOT;
+    || op == IR_NOT || op == IR_NEG || op == IR_WRAP || op == IR_GLOBAL || op == IR_STRLIT || op == IR_SLOT {
+    return 0;
+  }
+  return 3;
 }
 
 /// For each register, 1 when it is written once, by a constant below 64.
@@ -937,9 +943,9 @@ fn ra_small_consts(f: &IrFn) -> Vec[u64] {
   return sm;
 }
 
-/// For every register, 1 when it is live just after an instruction that is not
-/// `ra_dc_safe`, or is read or written by one: it may not be kept in %rdx or
-/// %rcx.
+/// For every register, the union of `ra_dc_clob` over the instructions it is
+/// live just after, read by or written by: it may not be kept in %rdx (bit 0)
+/// or %rcx (bit 1) if the bit is set.
 fn ra_dcmark(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> Vec[u64] {
   let small = ra_small_consts(f);
   let nr = f.nreg;
@@ -974,7 +980,8 @@ fn ra_dcmark(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> Vec[u64] {
         k = k + 1;
       }
       vec_free(ws);
-      if !ra_dc_safe(q, small) {
+      let clob = ra_dc_clob(q, small);
+      if clob != 0 {
         let mut wi = 0;
         while wi < nw && wi < vec_len(cur) {
           let word = vec_get(cur, wi);
@@ -982,7 +989,7 @@ fn ra_dcmark(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> Vec[u64] {
             let mut bi = 0;
             while bi < 64 {
               if (word & u_at(lv.bit, bi)) != 0 {
-                ra_set(&mut mark, wrap_add(wrap_mul(wi, 64), bi), 1);
+                ra_set(&mut mark, wrap_add(wrap_mul(wi, 64), bi), u_at(mark, wrap_add(wrap_mul(wi, 64), bi)) | clob);
               }
               bi = bi + 1;
             }
@@ -992,11 +999,11 @@ fn ra_dcmark(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> Vec[u64] {
       }
       let mut rs = vec_new[u64]();
       ra_reads(f, q, &mut rs);
-      if !ra_dc_safe(q, small) {
+      if clob != 0 {
         k = 0;
         while k < vec_len(rs) {
           if vec_get(rs, k) < nr {
-            ra_set(&mut mark, vec_get(rs, k), 1);
+            ra_set(&mut mark, vec_get(rs, k), u_at(mark, vec_get(rs, k)) | clob);
           }
           k = k + 1;
         }
@@ -1005,7 +1012,7 @@ fn ra_dcmark(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> Vec[u64] {
         k = 0;
         while k < vec_len(ws2) {
           if vec_get(ws2, k) < nr {
-            ra_set(&mut mark, vec_get(ws2, k), 1);
+            ra_set(&mut mark, vec_get(ws2, k), u_at(mark, vec_get(ws2, k)) | clob);
           }
           k = k + 1;
         }
@@ -1026,6 +1033,21 @@ fn ra_dcmark(f: &IrFn, bl: &Vec[IrBlock], lv: &IrLive) -> Vec[u64] {
   }
   vec_free(small);
   return mark;
+}
+
+/// May value `v` not live in caller-saved register `m`, one of the last `nres`
+/// of `nm`? The first of them is %rdx and the second %rcx (bits 0 and 1 of
+/// `dcm`), and a parameter is never given either.
+fn ra_restricted(dcm: &Vec[u64], v: u64, m: u64, nm: u64, nres: u64, f: &IrFn) -> bool {
+  if ra_is_param(f, v) {
+    return true;
+  }
+  let bit = wrap_sub(m, wrap_sub(nm, nres));
+  let mut mask = 1;
+  if bit != 0 {
+    mask = 2;
+  }
+  return (u_at(dcm, v) & mask) != 0;
 }
 
 fn ra_alloc(f: &IrFn, ncallee: u64, ncaller: u64) -> IrAlloc {
@@ -1427,7 +1449,7 @@ fn ra_alloc_with(f: &IrFn, ncallee: u64, ncaller: u64, consts: bool, bigk: u64, 
       let mut best_m = 0;
       let mut m = 0;
       while m < nm {
-        if (m < ncallee || !crosses) && !(nres > 0 && m >= wrap_sub(nm, nres) && (u_at(dcm, v) != 0 || ra_is_param(f, v))) {
+        if (m < ncallee || !crosses) && !(nres > 0 && m >= wrap_sub(nm, nres) && ra_restricted(dcm, v, m, nm, nres, f)) {
           let mut nclash = 0;
           let mut who = IR_NONE;
           let mut h2 = 0;
