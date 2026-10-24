@@ -1,0 +1,1141 @@
+// An x86-64 assembler for the text the native-IR backend writes (AT&T
+// syntax), so that a program need not go through the system's `as`.
+//
+// `as_line` encodes one instruction line into bytes. It covers the integer
+// instructions the emitter uses: moves, the arithmetic and logic group,
+// shifts, multiplies and divides, loads of an address, the conditional moves
+// and sets, stack operations and the few system instructions. An operand is a
+// register, an immediate or a memory reference `disp(base,index,scale)`, with
+// a numeric displacement. A line it cannot encode (a symbol, an instruction
+// it does not know) is reported to the caller, never guessed.
+//
+// The bytes are those of GNU as: `tests/as86.sh` assembles every distinct
+// instruction line of the programs in tests/pass and bench with GNU as and
+// compares.
+//
+// Part of the trusted base once a target uses it instead of the system's
+// assembler.
+import "wtext.bastio";
+
+const AS_NONE: u64 = 18446744073709551615;
+
+const AO_NONE: u64 = 0;
+const AO_REG: u64 = 1;
+const AO_IMM: u64 = 2;
+const AO_MEM: u64 = 3;
+const AO_XMM: u64 = 4;
+
+/// An operand: a register (`reg` 0-15 of `size` 1, 2, 4 or 8 bytes; `rex` when
+/// it is one of %spl, %bpl, %sil and %dil, which need a REX prefix), an
+/// immediate, or memory at `disp + base + index * scale` (`base` or `index`
+/// AS_NONE when absent; `rip` when addressed from the instruction pointer).
+struct AsOp { k: u64, reg: u64, size: u64, rex: bool, base: u64, index: u64, scale: u64, disp: u64, rip: bool, imm: u64 }
+
+struct AsParse { op: AsOp, next: u64, ok: bool }
+
+fn as_op_none() -> AsOp {
+  return AsOp { k: AO_NONE, reg: 0, size: 0, rex: false, base: AS_NONE, index: AS_NONE, scale: 1, disp: 0, rip: false, imm: 0 };
+}
+
+fn as_is_blank(c: u64) -> bool {
+  return c == 32 || c == 9;
+}
+
+fn as_is_alnum(c: u64) -> bool {
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c == 46;
+}
+
+fn as_skip(v: &Vec[u64], i: u64, e: u64) -> u64 {
+  let mut t = i;
+  while t < e && as_is_blank(u_at(v, t)) {
+    t = wrap_add(t, 1);
+  }
+  return t;
+}
+
+/// Does the name `s` begin at `i` and end there (not followed by a name
+/// character)?
+fn as_name_at(v: &Vec[u64], i: u64, e: u64, s: Str) -> bool {
+  let n = slen(s);
+  if wrap_add(i, n) > e {
+    return false;
+  }
+  let mut k = 0;
+  while k < n
+    invariant k <= n
+  {
+    if u_at(v, wrap_add(i, k)) != cast[u64](sget(s, k)) {
+      return false;
+    }
+    k = k + 1;
+  }
+  if wrap_add(i, n) < e && as_is_alnum(u_at(v, wrap_add(i, n))) {
+    return false;
+  }
+  return true;
+}
+
+/// The hexadecimal or decimal number at `i`, optionally negative, wrapping at
+/// 2^64; `next` is past it. `ok` is false when there is no digit.
+struct AsNum { val: u64, next: u64, ok: bool }
+
+fn as_number(v: &Vec[u64], i: u64, e: u64) -> AsNum {
+  let mut t = i;
+  let mut neg = false;
+  if t < e && u_at(v, t) == 45 {
+    neg = true;
+    t = wrap_add(t, 1);
+  }
+  let mut val = 0;
+  let mut digits = 0;
+  if wrap_add(t, 2) <= e && u_at(v, t) == 48 && (u_at(v, wrap_add(t, 1)) == 120 || u_at(v, wrap_add(t, 1)) == 88) {
+    t = wrap_add(t, 2);
+    let mut more = true;
+    while more && t < e {
+      let c = u_at(v, t);
+      let mut d = 16;
+      if c >= 48 && c <= 57 {
+        d = c - 48;
+      } else if c >= 97 && c <= 102 {
+        d = c - 87;
+      } else if c >= 65 && c <= 70 {
+        d = c - 55;
+      }
+      if d < 16 {
+        val = wrap_add(wrap_mul(val, 16), d);
+        digits = wrap_add(digits, 1);
+        t = wrap_add(t, 1);
+      } else {
+        more = false;
+      }
+    }
+  } else {
+    let mut more = true;
+    let mut base = 10;
+    if wrap_add(t, 1) < e && u_at(v, t) == 48 && u_at(v, wrap_add(t, 1)) >= 48 && u_at(v, wrap_add(t, 1)) <= 55 {
+      base = 8;
+    }
+    while more && t < e {
+      let c = u_at(v, t);
+      if c >= 48 && c <= 57 {
+        val = wrap_add(wrap_mul(val, base), c - 48);
+        digits = wrap_add(digits, 1);
+        t = wrap_add(t, 1);
+      } else {
+        more = false;
+      }
+    }
+  }
+  if neg {
+    val = wrap_sub(0, val);
+  }
+  return AsNum { val: val, next: t, ok: digits > 0 };
+}
+
+/// The register names of one width, in order of register number, as a list
+/// separated by spaces.
+fn as_names(size: u64) -> Str {
+  if size == 8 {
+    return "rax rcx rdx rbx rsp rbp rsi rdi r8 r9 r10 r11 r12 r13 r14 r15";
+  }
+  if size == 4 {
+    return "eax ecx edx ebx esp ebp esi edi r8d r9d r10d r11d r12d r13d r14d r15d";
+  }
+  if size == 2 {
+    return "ax cx dx bx sp bp si di r8w r9w r10w r11w r12w r13w r14w r15w";
+  }
+  return "al cl dl bl spl bpl sil dil r8b r9b r10b r11b r12b r13b r14b r15b";
+}
+
+/// The index in the list `names` of the name at `i` (in `v`), or AS_NONE.
+fn as_find(v: &Vec[u64], i: u64, e: u64, names: Str) -> u64 {
+  let n = slen(names);
+  let mut k = 0;
+  let mut idx = 0;
+  while k < n
+    invariant k <= n
+  {
+    let mut j = k;
+    while j < n && sget(names, j) != 32
+      invariant j <= n && k <= j
+    {
+      j = j + 1;
+    }
+    // names[k .. j] is one name
+    let len = j - k;
+    if wrap_add(i, len) <= e {
+      let mut same = true;
+      let mut m = 0;
+      while m < len && same
+        invariant m <= len
+      {
+        if u_at(v, wrap_add(i, m)) != cast[u64](sget(names, k + m)) {
+          same = false;
+        }
+        m = m + 1;
+      }
+      if same && (wrap_add(i, len) >= e || !as_is_alnum(u_at(v, wrap_add(i, len)))) {
+        return idx;
+      }
+    }
+    idx = wrap_add(idx, 1);
+    if j < n { k = j + 1; } else { k = n; }
+  }
+  return AS_NONE;
+}
+
+/// How many characters the name at `i` has.
+fn as_namelen(v: &Vec[u64], i: u64, e: u64) -> u64 {
+  let mut t = i;
+  while t < e && as_is_alnum(u_at(v, t))
+    invariant i <= t
+  {
+    t = t + 1;
+  }
+  return t - i;
+}
+
+/// The register `%name` at `i` (the percent sign included).
+fn as_reg(v: &Vec[u64], i: u64, e: u64) -> AsParse {
+  let mut r = AsParse { op: as_op_none(), next: i, ok: false };
+  if i >= e || u_at(v, i) != 37 {
+    return r;
+  }
+  let t = wrap_add(i, 1);
+  let mut size = 8;
+  while size > 0 && !r.ok {
+    let x = as_find(v, t, e, as_names(size));
+    if x != AS_NONE {
+      r.ok = true;
+      r.op = AsOp { k: AO_REG, reg: x, size: size, rex: size == 1 && x >= 4 && x < 8, base: AS_NONE, index: AS_NONE, scale: 1, disp: 0, rip: false, imm: 0 };
+      r.next = wrap_add(t, as_namelen(v, t, e));
+    }
+    size = size / 2;
+  }
+  if !r.ok && wrap_add(t, 3) <= e && u_at(v, t) == 120 && u_at(v, wrap_add(t, 1)) == 109 && u_at(v, wrap_add(t, 2)) == 109 {
+    // %xmmN
+    let n = as_number(v, wrap_add(t, 3), e);
+    if n.ok && n.val < 16 {
+      r.ok = true;
+      r.op = AsOp { k: AO_XMM, reg: n.val, size: 16, rex: false, base: AS_NONE, index: AS_NONE, scale: 1, disp: 0, rip: false, imm: 0 };
+      r.next = n.next;
+    }
+  }
+  return r;
+}
+
+/// One operand starting at `i`.
+fn as_operand(v: &Vec[u64], i: u64, e: u64) -> AsParse {
+  let t = as_skip(v, i, e);
+  let mut r = AsParse { op: as_op_none(), next: t, ok: false };
+  if t >= e {
+    return r;
+  }
+  let c = u_at(v, t);
+  if c == 37 {
+    return as_reg(v, t, e);
+  }
+  if c == 36 {
+    let n = as_number(v, wrap_add(t, 1), e);
+    if n.ok {
+      r.ok = true;
+      r.op = AsOp { k: AO_IMM, reg: 0, size: 0, rex: false, base: AS_NONE, index: AS_NONE, scale: 1, disp: 0, rip: false, imm: n.val };
+      r.next = n.next;
+    }
+    return r;
+  }
+  // memory: [disp] [ ( [base] [, index [, scale]] ) ]
+  let mut p = t;
+  let mut disp = 0;
+  if c != 40 {
+    let n = as_number(v, p, e);
+    if !n.ok {
+      return r;
+    }
+    disp = n.val;
+    p = n.next;
+  }
+  let mut op = AsOp { k: AO_MEM, reg: 0, size: 0, rex: false, base: AS_NONE, index: AS_NONE, scale: 1, disp: disp, rip: false, imm: 0 };
+  if p < e && u_at(v, p) == 40 {
+    p = wrap_add(p, 1);
+    if as_name_at(v, wrap_add(p, 1), e, "rip") && u_at(v, p) == 37 {
+      op.rip = true;
+      p = wrap_add(p, 4);
+    } else if p < e && u_at(v, p) == 37 {
+      let b = as_reg(v, p, e);
+      if !b.ok || b.op.size != 8 {
+        return r;
+      }
+      op.base = b.op.reg;
+      p = b.next;
+    }
+    if p < e && u_at(v, p) == 44 {
+      let x = as_reg(v, as_skip(v, wrap_add(p, 1), e), e);
+      if !x.ok || x.op.size != 8 {
+        return r;
+      }
+      op.index = x.op.reg;
+      p = x.next;
+      op.scale = 1;
+      if p < e && u_at(v, p) == 44 {
+        let sc = as_number(v, as_skip(v, wrap_add(p, 1), e), e);
+        if !sc.ok || (sc.val != 1 && sc.val != 2 && sc.val != 4 && sc.val != 8) {
+          return r;
+        }
+        op.scale = sc.val;
+        p = sc.next;
+      }
+    }
+    if p >= e || u_at(v, p) != 41 {
+      return r;
+    }
+    p = wrap_add(p, 1);
+  } else {
+    // a bare number is an absolute address
+    op.base = AS_NONE;
+  }
+  r.ok = true;
+  r.op = op;
+  r.next = p;
+  return r;
+}
+
+/// Does `x` (as a signed 64-bit number) fit a signed `bits`-bit field?
+fn as_fits(x: u64, bits: u64) -> bool {
+  if bits >= 64 || bits == 0 {
+    return true;
+  }
+  let lim = 1 << wrap_sub(bits, 1);
+  if x < lim {
+    return true;
+  }
+  return x >= wrap_sub(0, lim);
+}
+
+fn as_byte(out: &mut Vec[u64], b: u64) {
+  vec_push(&mut out, b & 255);
+}
+
+/// `n` bytes of `x`, least significant first.
+fn as_le(out: &mut Vec[u64], x: u64, n: u64) {
+  let mut k = 0;
+  while k < n && k < 8 {
+    as_byte(&mut out, x >> wrap_mul(k, 8));
+    k = k + 1;
+  }
+}
+
+/// How an instruction names its operands: a prefix byte (0 for none), the
+/// opcode bytes (`oplen` of them, first byte most significant), the operand
+/// size, the `reg` field (a register number or an opcode extension) and the
+/// `rm` operand.
+struct AsEnc { pfx: u64, opc: u64, oplen: u64, size: u64, reg: u64, rm: AsOp, forcerex: bool, imm: u64, immlen: u64, regbyte: bool }
+
+fn as_enc(pfx: u64, opc: u64, oplen: u64, size: u64, reg: u64, rm: AsOp) -> AsEnc {
+  return AsEnc { pfx: pfx, opc: opc, oplen: oplen, size: size, reg: reg, rm: rm, forcerex: false, imm: 0, immlen: 0, regbyte: false };
+}
+
+/// Writes the prefixes, REX, opcode, ModRM, SIB, displacement and immediate.
+fn as_emit(out: &mut Vec[u64], en: AsEnc) {
+  let rm = en.rm;
+  if en.size == 2 {
+    as_byte(&mut out, 102);
+  }
+  if en.pfx != 0 {
+    as_byte(&mut out, en.pfx);
+  }
+  let mut rex = 0;
+  if en.size == 8 {
+    rex = rex | 8;
+  }
+  if en.reg >= 8 && en.reg < 16 {
+    rex = rex | 4;
+  }
+  if rm.k == AO_REG || rm.k == AO_XMM {
+    if rm.reg >= 8 {
+      rex = rex | 1;
+    }
+  } else {
+    if rm.index != AS_NONE && rm.index >= 8 {
+      rex = rex | 2;
+    }
+    if rm.base != AS_NONE && rm.base >= 8 {
+      rex = rex | 1;
+    }
+  }
+  if rex != 0 || en.forcerex || (rm.k == AO_REG && rm.rex) {
+    as_byte(&mut out, 64 | rex);
+  }
+  let mut k = en.oplen;
+  while k > 0 && k <= 3 {
+    k = k - 1;
+    as_byte(&mut out, en.opc >> wrap_mul(k, 8));
+  }
+  // ModRM
+  let r3 = en.reg & 7;
+  if rm.k == AO_REG || rm.k == AO_XMM {
+    as_byte(&mut out, 192 | (r3 << 3) | (rm.reg & 7));
+  } else if rm.rip {
+    as_byte(&mut out, (r3 << 3) | 5);
+    as_le(&mut out, rm.disp, 4);
+  } else if rm.base == AS_NONE && rm.index == AS_NONE {
+    as_byte(&mut out, (r3 << 3) | 4);
+    as_byte(&mut out, 37);
+    as_le(&mut out, rm.disp, 4);
+  } else if rm.base == AS_NONE {
+    // index only: SIB with no base, a 32-bit displacement
+    as_byte(&mut out, (r3 << 3) | 4);
+    as_byte(&mut out, as_scale_bits(rm.scale) | ((rm.index & 7) << 3) | 5);
+    as_le(&mut out, rm.disp, 4);
+  } else {
+    let b3 = rm.base & 7;
+    let mut md = 2;
+    if rm.disp == 0 && b3 != 5 {
+      md = 0;
+    } else if as_fits(rm.disp, 8) {
+      md = 1;
+    }
+    if rm.index != AS_NONE || b3 == 4 {
+      as_byte(&mut out, (md << 6) | (r3 << 3) | 4);
+      let mut ix = 4;
+      if rm.index != AS_NONE {
+        ix = rm.index & 7;
+      }
+      as_byte(&mut out, as_scale_bits(rm.scale) | (ix << 3) | b3);
+    } else {
+      as_byte(&mut out, (md << 6) | (r3 << 3) | b3);
+    }
+    if md == 1 {
+      as_le(&mut out, rm.disp, 1);
+    } else if md == 2 {
+      as_le(&mut out, rm.disp, 4);
+    }
+  }
+  if en.immlen > 0 {
+    as_le(&mut out, en.imm, en.immlen);
+  }
+}
+
+fn as_scale_bits(s: u64) -> u64 {
+  if s == 2 {
+    return 64;
+  }
+  if s == 4 {
+    return 128;
+  }
+  if s == 8 {
+    return 192;
+  }
+  return 0;
+}
+
+/// Sign-extends the low `size` bytes of `x`.
+fn as_sext(x: u64, size: u64) -> u64 {
+  if size == 1 {
+    if (x & 128) != 0 {
+      return (x & 255) | 18446744073709551360;
+    }
+    return x & 255;
+  }
+  if size == 2 {
+    if (x & 32768) != 0 {
+      return (x & 65535) | 18446744073709486080;
+    }
+    return x & 65535;
+  }
+  if size == 4 {
+    if (x & 2147483648) != 0 {
+      return (x & 4294967295) | 18446744069414584320;
+    }
+    return x & 4294967295;
+  }
+  return x;
+}
+
+/// How the mnemonic `v[ns .. ne]` spells `base`: 9 when exactly, 1, 2, 4 or 8
+/// with the suffix b, w, l or q, 0 when not at all.
+fn as_sfx(v: &Vec[u64], ns: u64, ne: u64, base: Str) -> u64 {
+  let n = slen(base);
+  if ns > ne {
+    return 0;
+  }
+  let len = ne - ns;
+  if len != n && len != wrap_add(n, 1) {
+    return 0;
+  }
+  let mut k = 0;
+  while k < n
+    invariant k <= n
+  {
+    if u_at(v, wrap_add(ns, k)) != cast[u64](sget(base, k)) {
+      return 0;
+    }
+    k = k + 1;
+  }
+  if len == n {
+    return 9;
+  }
+  let c = u_at(v, wrap_add(ns, n));
+  if c == 98 { return 1; }
+  if c == 119 { return 2; }
+  if c == 108 { return 4; }
+  if c == 113 { return 8; }
+  return 0;
+}
+
+/// The condition code number of the name `v[s .. e]` (`ne` for "ne"), or
+/// AS_NONE.
+fn as_cc(v: &Vec[u64], s: u64, e: u64) -> u64 {
+  let names = "o no b ae e ne be a s ns p np l ge le g";
+  let x = as_find(v, s, e, names);
+  if x != AS_NONE && as_namelen(v, s, e) == wrap_sub(e, s) {
+    return x;
+  }
+  if as_name_at(v, s, e, "c") || as_name_at(v, s, e, "nae") { return 2; }
+  if as_name_at(v, s, e, "nb") || as_name_at(v, s, e, "nc") { return 3; }
+  if as_name_at(v, s, e, "z") { return 4; }
+  if as_name_at(v, s, e, "nz") { return 5; }
+  if as_name_at(v, s, e, "na") { return 6; }
+  if as_name_at(v, s, e, "nbe") { return 7; }
+  if as_name_at(v, s, e, "nge") { return 12; }
+  if as_name_at(v, s, e, "nl") { return 13; }
+  if as_name_at(v, s, e, "ng") { return 14; }
+  if as_name_at(v, s, e, "nle") { return 15; }
+  return AS_NONE;
+}
+
+/// The operand size an instruction works on: the register's if there is one,
+/// else the mnemonic's suffix.
+fn as_size(sfx: u64, a: AsOp, b: AsOp) -> u64 {
+  if b.k == AO_REG {
+    return b.size;
+  }
+  if a.k == AO_REG {
+    return a.size;
+  }
+  if sfx == 9 {
+    return 0;
+  }
+  return sfx;
+}
+
+fn as_reg_op(r: u64, size: u64) -> AsOp {
+  return AsOp { k: AO_REG, reg: r, size: size, rex: false, base: AS_NONE, index: AS_NONE, scale: 1, disp: 0, rip: false, imm: 0 };
+}
+
+/// `op $imm, rm` of the arithmetic group (`n` 0-7: add or adc sbb and sub xor
+/// cmp), the short accumulator form where GNU as uses it.
+fn as_alu_imm(out: &mut Vec[u64], n: u64, size: u64, imm0: u64, rm: AsOp) -> bool {
+  let imm = as_sext(imm0, size);
+  if size == 1 {
+    if rm.k == AO_REG && rm.reg == 0 {
+      as_byte(&mut out, wrap_add(wrap_mul(n, 8), 4));
+      as_byte(&mut out, imm);
+      return true;
+    }
+    let mut en = as_enc(0, 128, 1, 1, n, rm);
+    en.imm = imm;
+    en.immlen = 1;
+    as_emit(&mut out, en);
+    return true;
+  }
+  if size != 2 && size != 4 && size != 8 {
+    return false;
+  }
+  if size == 8 && !as_fits(imm, 32) {
+    return false;
+  }
+  if as_fits(imm, 8) {
+    let mut en = as_enc(0, 131, 1, size, n, rm);
+    en.imm = imm;
+    en.immlen = 1;
+    as_emit(&mut out, en);
+    return true;
+  }
+  let mut il = 4;
+  if size == 2 {
+    il = 2;
+  }
+  if rm.k == AO_REG && rm.reg == 0 {
+    if size == 2 {
+      as_byte(&mut out, 102);
+    }
+    if size == 8 {
+      as_byte(&mut out, 72);
+    }
+    as_byte(&mut out, wrap_add(wrap_mul(n, 8), 5));
+    as_le(&mut out, imm, il);
+    return true;
+  }
+  let mut en = as_enc(0, 129, 1, size, n, rm);
+  en.imm = imm;
+  en.immlen = il;
+  as_emit(&mut out, en);
+  return true;
+}
+
+/// Is `x` a plain register or memory operand (not an immediate)?
+fn as_rm(x: AsOp) -> bool {
+  return x.k == AO_REG || x.k == AO_MEM;
+}
+
+/// A two-operand instruction `op src, dst` whose opcodes are `rm_r` (the
+/// register is the source) and `r_rm` (the register is the destination).
+fn as_two(out: &mut Vec[u64], rm_r: u64, r_rm: u64, size: u64, src: AsOp, dst: AsOp) -> bool {
+  if src.k == AO_REG && as_rm(dst) {
+    let mut en = as_enc(0, rm_r, 1, size, src.reg, dst);
+    en.forcerex = src.rex;
+    as_emit(&mut out, en);
+    return true;
+  }
+  if src.k == AO_MEM && dst.k == AO_REG {
+    let mut en = as_enc(0, r_rm, 1, size, dst.reg, src);
+    en.forcerex = dst.rex;
+    as_emit(&mut out, en);
+    return true;
+  }
+  return false;
+}
+
+/// One-operand group 3 and 4/5 forms: `opc /ext rm`.
+fn as_one(out: &mut Vec[u64], opc8: u64, opc: u64, ext: u64, size: u64, rm: AsOp) -> bool {
+  if !as_rm(rm) || size == 0 {
+    return false;
+  }
+  let mut o = opc;
+  if size == 1 {
+    o = opc8;
+  }
+  as_emit(&mut out, as_enc(0, o, 1, size, ext, rm));
+  return true;
+}
+
+/// A mnemonic `v[ns .. ne]` and up to three operands.
+struct AsIns { ns: u64, ne: u64, n: u64, a: AsOp, b: AsOp, c: AsOp, ok: bool }
+
+fn as_split(v: &Vec[u64], s: u64, e: u64) -> AsIns {
+  let mut r = AsIns { ns: s, ne: s, n: 0, a: as_op_none(), b: as_op_none(), c: as_op_none(), ok: true };
+  let t = as_skip(v, s, e);
+  r.ns = t;
+  r.ne = wrap_add(t, as_namelen(v, t, e));
+  let mut p = as_skip(v, r.ne, e);
+  while p < e && r.ok {
+    let o = as_operand(v, p, e);
+    if !o.ok {
+      r.ok = false;
+    } else {
+      if r.n == 0 {
+        r.a = o.op;
+      } else if r.n == 1 {
+        r.b = o.op;
+      } else if r.n == 2 {
+        r.c = o.op;
+      } else {
+        r.ok = false;
+      }
+      r.n = wrap_add(r.n, 1);
+      p = as_skip(v, o.next, e);
+      if p < e {
+        if u_at(v, p) == 44 {
+          p = wrap_add(p, 1);
+        } else {
+          r.ok = false;
+        }
+      }
+    }
+  }
+  return r;
+}
+
+/// Encodes the instruction on the line `v[s .. e]` (without its newline) into
+/// `out`; false when it is one this assembler does not encode.
+fn as_line(out: &mut Vec[u64], v: &Vec[u64], s: u64, e: u64) -> bool {
+  let ns0 = as_skip(v, s, e);
+  if as_name_at(v, ns0, e, "lock") {
+    as_byte(&mut out, 240);
+    return as_line(&mut out, v, wrap_add(ns0, 4), e);
+  }
+  if as_name_at(v, ns0, e, "rep") {
+    as_byte(&mut out, 243);
+    return as_line(&mut out, v, wrap_add(ns0, 3), e);
+  }
+  let ins = as_split(v, s, e);
+  if !ins.ok {
+    return false;
+  }
+  let ns = ins.ns;
+  let ne = ins.ne;
+  let a = ins.a;
+  let b = ins.b;
+  let c = ins.c;
+  // no operands
+  if ins.n == 0 {
+    if as_name_at(v, ns, ne, "ret") { as_byte(&mut out, 195); return true; }
+    if as_name_at(v, ns, ne, "leave") { as_byte(&mut out, 201); return true; }
+    if as_name_at(v, ns, ne, "cqo") { as_byte(&mut out, 72); as_byte(&mut out, 153); return true; }
+    if as_name_at(v, ns, ne, "cltq") { as_byte(&mut out, 72); as_byte(&mut out, 152); return true; }
+    if as_name_at(v, ns, ne, "cltd") { as_byte(&mut out, 153); return true; }
+    if as_name_at(v, ns, ne, "ud2") { as_byte(&mut out, 15); as_byte(&mut out, 11); return true; }
+    if as_name_at(v, ns, ne, "pause") { as_byte(&mut out, 243); as_byte(&mut out, 144); return true; }
+    if as_name_at(v, ns, ne, "mfence") { as_byte(&mut out, 15); as_byte(&mut out, 174); as_byte(&mut out, 240); return true; }
+    if as_name_at(v, ns, ne, "movsb") { as_byte(&mut out, 164); return true; }
+    if as_name_at(v, ns, ne, "movsq") { as_byte(&mut out, 72); as_byte(&mut out, 165); return true; }
+    if as_name_at(v, ns, ne, "stosb") { as_byte(&mut out, 170); return true; }
+    if as_name_at(v, ns, ne, "stosq") { as_byte(&mut out, 72); as_byte(&mut out, 171); return true; }
+    return false;
+  }
+  // the arithmetic group
+  let mut an = 0;
+  let mut sfx = as_sfx(v, ns, ne, "add");
+  if sfx == 0 { an = 1; sfx = as_sfx(v, ns, ne, "or"); }
+  if sfx == 0 { an = 2; sfx = as_sfx(v, ns, ne, "adc"); }
+  if sfx == 0 { an = 3; sfx = as_sfx(v, ns, ne, "sbb"); }
+  if sfx == 0 { an = 4; sfx = as_sfx(v, ns, ne, "and"); }
+  if sfx == 0 { an = 5; sfx = as_sfx(v, ns, ne, "sub"); }
+  if sfx == 0 { an = 6; sfx = as_sfx(v, ns, ne, "xor"); }
+  if sfx == 0 { an = 7; sfx = as_sfx(v, ns, ne, "cmp"); }
+  if sfx != 0 && ins.n == 2 {
+    let size = as_size(sfx, a, b);
+    if size == 0 {
+      return false;
+    }
+    if a.k == AO_IMM && as_rm(b) {
+      return as_alu_imm(&mut out, an, size, a.imm, b);
+    }
+    let base = wrap_mul(an, 8);
+    if size == 1 {
+      return as_two(&mut out, base, wrap_add(base, 2), size, a, b);
+    }
+    return as_two(&mut out, wrap_add(base, 1), wrap_add(base, 3), size, a, b);
+  }
+  return as_other(&mut out, v, ns, ne, ins);
+}
+
+/// A move of a constant to a register, in the short form: `mov $imm, %reg`.
+fn as_mov_imm_reg(out: &mut Vec[u64], size: u64, imm0: u64, r: AsOp) -> bool {
+  let imm = as_sext(imm0, size);
+  let hi = r.reg >= 8;
+  if size == 8 {
+    if !as_fits(imm, 32) {
+      return false;
+    }
+    as_emit(&mut out, AsEnc { pfx: 0, opc: 199, oplen: 1, size: 8, reg: 0, rm: r, forcerex: false, imm: imm, immlen: 4, regbyte: false });
+    return true;
+  }
+  if size == 4 {
+    if hi {
+      as_byte(&mut out, 65);
+    }
+    as_byte(&mut out, wrap_add(184, r.reg & 7));
+    as_le(&mut out, imm, 4);
+    return true;
+  }
+  if size == 2 {
+    as_byte(&mut out, 102);
+    if hi {
+      as_byte(&mut out, 65);
+    }
+    as_byte(&mut out, wrap_add(184, r.reg & 7));
+    as_le(&mut out, imm, 2);
+    return true;
+  }
+  if hi {
+    as_byte(&mut out, 65);
+  } else if r.rex {
+    as_byte(&mut out, 64);
+  }
+  as_byte(&mut out, wrap_add(176, r.reg & 7));
+  as_le(&mut out, imm, 1);
+  return true;
+}
+
+/// A shift or rotate: the `n`-th of rol ror (rcl rcr) shl shr (sal) sar.
+fn as_shift(out: &mut Vec[u64], n: u64, size: u64, a: AsOp, b: AsOp, one: bool) -> bool {
+  let mut rm = b;
+  let mut cnt = a;
+  if one {
+    rm = a;
+  }
+  if !as_rm(rm) || size == 0 {
+    return false;
+  }
+  if one {
+    let mut o = 209;
+    if size == 1 {
+      o = 208;
+    }
+    as_emit(&mut out, as_enc(0, o, 1, size, n, rm));
+    return true;
+  }
+  if cnt.k == AO_REG && cnt.size == 1 && cnt.reg == 1 {
+    let mut o = 211;
+    if size == 1 {
+      o = 210;
+    }
+    as_emit(&mut out, as_enc(0, o, 1, size, n, rm));
+    return true;
+  }
+  if cnt.k == AO_IMM {
+    if cnt.imm == 1 {
+      let mut o = 209;
+      if size == 1 {
+        o = 208;
+      }
+      as_emit(&mut out, as_enc(0, o, 1, size, n, rm));
+      return true;
+    }
+    let mut o = 193;
+    if size == 1 {
+      o = 192;
+    }
+    let mut en = as_enc(0, o, 1, size, n, rm);
+    en.imm = cnt.imm;
+    en.immlen = 1;
+    as_emit(&mut out, en);
+    return true;
+  }
+  return false;
+}
+
+/// The remaining instructions.
+fn as_other(out: &mut Vec[u64], v: &Vec[u64], ns: u64, ne: u64, ins: AsIns) -> bool {
+  let a = ins.a;
+  let b = ins.b;
+  let c = ins.c;
+  let n = ins.n;
+  // mov
+  let mut sf = as_sfx(v, ns, ne, "mov");
+  if sf != 0 && n == 2 {
+    let size = as_size(sf, a, b);
+    if size == 0 {
+      return false;
+    }
+    if a.k == AO_IMM && b.k == AO_REG {
+      return as_mov_imm_reg(&mut out, size, a.imm, b);
+    }
+    if a.k == AO_IMM && b.k == AO_MEM {
+      if size == 1 {
+        let mut en = as_enc(0, 198, 1, 1, 0, b);
+        en.imm = a.imm;
+        en.immlen = 1;
+        as_emit(&mut out, en);
+        return true;
+      }
+      let mut il = 4;
+      if size == 2 {
+        il = 2;
+      }
+      let imm = as_sext(a.imm, size);
+      if size == 8 && !as_fits(imm, 32) {
+        return false;
+      }
+      let mut en = as_enc(0, 199, 1, size, 0, b);
+      en.imm = imm;
+      en.immlen = il;
+      as_emit(&mut out, en);
+      return true;
+    }
+    if size == 1 {
+      return as_two(&mut out, 136, 138, size, a, b);
+    }
+    return as_two(&mut out, 137, 139, size, a, b);
+  }
+  if as_name_at(v, ns, ne, "movabs") && n == 2 && a.k == AO_IMM && b.k == AO_REG && b.size == 8 {
+    let mut rx = 72;
+    if b.reg >= 8 {
+      rx = 73;
+    }
+    as_byte(&mut out, rx);
+    as_byte(&mut out, wrap_add(184, b.reg & 7));
+    as_le(&mut out, a.imm, 8);
+    return true;
+  }
+  // lea
+  if as_name_at(v, ns, ne, "lea") && n == 2 && a.k == AO_MEM && b.k == AO_REG {
+    as_emit(&mut out, as_enc(0, 141, 1, b.size, b.reg, a));
+    return true;
+  }
+  // push and pop
+  if as_name_at(v, ns, ne, "push") && n == 1 {
+    if a.k == AO_REG && a.size == 8 {
+      if a.reg >= 8 {
+        as_byte(&mut out, 65);
+      }
+      as_byte(&mut out, wrap_add(80, a.reg & 7));
+      return true;
+    }
+    if a.k == AO_IMM {
+      let imm = as_sext(a.imm, 4);
+      if as_fits(imm, 8) {
+        as_byte(&mut out, 106);
+        as_le(&mut out, imm, 1);
+        return true;
+      }
+      if as_fits(imm, 32) {
+        as_byte(&mut out, 104);
+        as_le(&mut out, imm, 4);
+        return true;
+      }
+      return false;
+    }
+    if a.k == AO_MEM {
+      as_emit(&mut out, as_enc(0, 255, 1, 4, 6, a));
+      return true;
+    }
+    return false;
+  }
+  if as_name_at(v, ns, ne, "pop") && n == 1 && a.k == AO_REG && a.size == 8 {
+    if a.reg >= 8 {
+      as_byte(&mut out, 65);
+    }
+    as_byte(&mut out, wrap_add(88, a.reg & 7));
+    return true;
+  }
+  // imul
+  sf = as_sfx(v, ns, ne, "imul");
+  if sf != 0 {
+    if n == 3 && a.k == AO_IMM && as_rm(b) && c.k == AO_REG {
+      let imm = as_sext(a.imm, c.size);
+      if as_fits(imm, 8) {
+        let mut en = as_enc(0, 107, 1, c.size, c.reg, b);
+        en.imm = imm;
+        en.immlen = 1;
+        as_emit(&mut out, en);
+        return true;
+      }
+      if !as_fits(imm, 32) {
+        return false;
+      }
+      let mut il = 4;
+      if c.size == 2 {
+        il = 2;
+      }
+      let mut en = as_enc(0, 105, 1, c.size, c.reg, b);
+      en.imm = imm;
+      en.immlen = il;
+      as_emit(&mut out, en);
+      return true;
+    }
+    if n == 2 && a.k == AO_IMM && b.k == AO_REG {
+      let imm = as_sext(a.imm, b.size);
+      if as_fits(imm, 8) {
+        let mut en = as_enc(0, 107, 1, b.size, b.reg, b);
+        en.imm = imm;
+        en.immlen = 1;
+        as_emit(&mut out, en);
+        return true;
+      }
+      if !as_fits(imm, 32) {
+        return false;
+      }
+      let mut en = as_enc(0, 105, 1, b.size, b.reg, b);
+      en.imm = imm;
+      en.immlen = 4;
+      as_emit(&mut out, en);
+      return true;
+    }
+    if n == 2 && as_rm(a) && b.k == AO_REG {
+      as_emit(&mut out, as_enc(0, 4015, 2, b.size, b.reg, a));
+      return true;
+    }
+    if n == 1 {
+      return as_one(&mut out, 246, 247, 5, as_size(sf, a, a), a);
+    }
+    return false;
+  }
+  // one-operand group 3
+  if n == 1 {
+    sf = as_sfx(v, ns, ne, "mul");
+    if sf != 0 { return as_one(&mut out, 246, 247, 4, as_size(sf, a, a), a); }
+    sf = as_sfx(v, ns, ne, "div");
+    if sf != 0 { return as_one(&mut out, 246, 247, 6, as_size(sf, a, a), a); }
+    sf = as_sfx(v, ns, ne, "idiv");
+    if sf != 0 { return as_one(&mut out, 246, 247, 7, as_size(sf, a, a), a); }
+    sf = as_sfx(v, ns, ne, "neg");
+    if sf != 0 { return as_one(&mut out, 246, 247, 3, as_size(sf, a, a), a); }
+    sf = as_sfx(v, ns, ne, "not");
+    if sf != 0 { return as_one(&mut out, 246, 247, 2, as_size(sf, a, a), a); }
+    sf = as_sfx(v, ns, ne, "inc");
+    if sf != 0 { return as_one(&mut out, 254, 255, 0, as_size(sf, a, a), a); }
+    sf = as_sfx(v, ns, ne, "dec");
+    if sf != 0 { return as_one(&mut out, 254, 255, 1, as_size(sf, a, a), a); }
+  }
+  // shifts and rotates
+  if n == 1 || n == 2 {
+    let mut sn = AS_NONE;
+    sf = as_sfx(v, ns, ne, "rol");
+    if sf != 0 { sn = 0; }
+    if sn == AS_NONE { sf = as_sfx(v, ns, ne, "ror"); if sf != 0 { sn = 1; } }
+    if sn == AS_NONE { sf = as_sfx(v, ns, ne, "shl"); if sf != 0 { sn = 4; } }
+    if sn == AS_NONE { sf = as_sfx(v, ns, ne, "shr"); if sf != 0 { sn = 5; } }
+    if sn == AS_NONE { sf = as_sfx(v, ns, ne, "sar"); if sf != 0 { sn = 7; } }
+    if sn != AS_NONE {
+      let mut dst = a;
+      if n == 2 {
+        dst = b;
+      }
+      return as_shift(&mut out, sn, as_size(sf, dst, dst), a, b, n == 1);
+    }
+  }
+  // test
+  sf = as_sfx(v, ns, ne, "test");
+  if sf != 0 && n == 2 {
+    let size = as_size(sf, a, b);
+    if a.k == AO_REG && as_rm(b) {
+      let mut o = 133;
+      if size == 1 {
+        o = 132;
+      }
+      let mut en = as_enc(0, o, 1, size, a.reg, b);
+      en.forcerex = a.rex;
+      as_emit(&mut out, en);
+      return true;
+    }
+    if a.k == AO_IMM && as_rm(b) && size != 0 {
+      let imm = as_sext(a.imm, size);
+      if size == 1 {
+        if b.k == AO_REG && b.reg == 0 {
+          as_byte(&mut out, 168);
+          as_le(&mut out, imm, 1);
+          return true;
+        }
+        let mut en = as_enc(0, 246, 1, 1, 0, b);
+        en.imm = imm;
+        en.immlen = 1;
+        as_emit(&mut out, en);
+        return true;
+      }
+      if size == 8 && !as_fits(imm, 32) {
+        return false;
+      }
+      let mut il = 4;
+      if size == 2 {
+        il = 2;
+      }
+      if b.k == AO_REG && b.reg == 0 {
+        if size == 2 {
+          as_byte(&mut out, 102);
+        }
+        if size == 8 {
+          as_byte(&mut out, 72);
+        }
+        as_byte(&mut out, 169);
+        as_le(&mut out, imm, il);
+        return true;
+      }
+      let mut en = as_enc(0, 247, 1, size, 0, b);
+      en.imm = imm;
+      en.immlen = il;
+      as_emit(&mut out, en);
+      return true;
+    }
+    return false;
+  }
+  // setcc and cmovcc
+  if wrap_sub(ne, ns) > 3 && as_name_at(v, ns, wrap_add(ns, 3), "set") && n == 1 && as_rm(a) {
+    let cc = as_cc(v, wrap_add(ns, 3), ne);
+    if cc == AS_NONE {
+      return false;
+    }
+    let mut en = as_enc(0, wrap_add(3984, cc), 2, 1, 0, a);
+    en.forcerex = a.k == AO_REG && a.rex;
+    as_emit(&mut out, en);
+    return true;
+  }
+  if wrap_sub(ne, ns) > 4 && as_name_at(v, ns, wrap_add(ns, 4), "cmov") && n == 2 && as_rm(a) && b.k == AO_REG {
+    let cc = as_cc(v, wrap_add(ns, 4), ne);
+    if cc == AS_NONE {
+      return false;
+    }
+    as_emit(&mut out, as_enc(0, wrap_add(3904, cc), 2, b.size, b.reg, a));
+    return true;
+  }
+  // zero and sign extensions: movzbl movzwl movzbq movsbq movswq movslq ...
+  if wrap_sub(ne, ns) == 6 && as_name_at(v, ns, wrap_add(ns, 3), "mov") && n == 2 && as_rm(a) && b.k == AO_REG {
+    let zs = u_at(v, wrap_add(ns, 3));
+    let sc = u_at(v, wrap_add(ns, 4));
+    let dc = u_at(v, wrap_add(ns, 5));
+    let mut ss = 0;
+    if sc == 98 { ss = 1; }
+    if sc == 119 { ss = 2; }
+    if sc == 108 { ss = 4; }
+    let mut ds = 0;
+    if dc == 119 { ds = 2; }
+    if dc == 108 { ds = 4; }
+    if dc == 113 { ds = 8; }
+    if ss == 0 || ds != b.size || (a.k == AO_REG && a.size != ss) {
+      return false;
+    }
+    if zs == 122 && ss < 4 {
+      let mut o = 4022;
+      if ss == 2 {
+        o = 4023;
+      }
+      let mut en = as_enc(0, o, 2, ds, b.reg, a);
+      en.forcerex = a.k == AO_REG && a.rex;
+      as_emit(&mut out, en);
+      return true;
+    }
+    if zs == 115 && ss < 4 {
+      let mut o = 4030;
+      if ss == 2 {
+        o = 4031;
+      }
+      let mut en = as_enc(0, o, 2, ds, b.reg, a);
+      en.forcerex = a.k == AO_REG && a.rex;
+      as_emit(&mut out, en);
+      return true;
+    }
+    if zs == 115 && ss == 4 && ds == 8 {
+      as_emit(&mut out, as_enc(0, 99, 1, 8, b.reg, a));
+      return true;
+    }
+    return false;
+  }
+  // xchg and cmpxchg
+  if as_name_at(v, ns, ne, "xchg") && n == 2 && a.k == AO_REG && as_rm(b) {
+    let mut o = 135;
+    if a.size == 1 {
+      o = 134;
+    }
+    let mut en = as_enc(0, o, 1, a.size, a.reg, b);
+    en.forcerex = a.rex;
+    as_emit(&mut out, en);
+    return true;
+  }
+  if as_name_at(v, ns, ne, "cmpxchg") && n == 2 && a.k == AO_REG && as_rm(b) {
+    let mut o = 4017;
+    if a.size == 1 {
+      o = 4016;
+    }
+    let mut en = as_enc(0, o, 2, a.size, a.reg, b);
+    en.forcerex = a.rex;
+    as_emit(&mut out, en);
+    return true;
+  }
+  // SSE moves of 16 bytes
+  if n == 2 && (as_name_at(v, ns, ne, "movups") || as_name_at(v, ns, ne, "movdqu")) {
+    let mut pfx = 0;
+    let mut ld = 3856;
+    let mut stv = 3857;
+    if as_name_at(v, ns, ne, "movdqu") {
+      pfx = 243;
+      ld = 3951;
+      stv = 3967;
+    }
+    if a.k == AO_XMM && as_rm_x(b) {
+      as_emit(&mut out, as_enc(pfx, stv, 2, 0, a.reg, b));
+      return true;
+    }
+    if as_rm_x(a) && b.k == AO_XMM {
+      as_emit(&mut out, as_enc(pfx, ld, 2, 0, b.reg, a));
+      return true;
+    }
+    return false;
+  }
+  return false;
+}
+
+fn as_rm_x(x: AsOp) -> bool {
+  return x.k == AO_MEM || x.k == AO_XMM;
+}
