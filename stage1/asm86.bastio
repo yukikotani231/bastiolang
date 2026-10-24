@@ -18,6 +18,7 @@
 import "wtext.bastio";
 
 const AS_NONE: u64 = 18446744073709551615;
+const AS_SYMDISP: u64 = 287454020;
 
 const AO_NONE: u64 = 0;
 const AO_REG: u64 = 1;
@@ -29,12 +30,16 @@ const AO_XMM: u64 = 4;
 /// it is one of %spl, %bpl, %sil and %dil, which need a REX prefix), an
 /// immediate, or memory at `disp + base + index * scale` (`base` or `index`
 /// AS_NONE when absent; `rip` when addressed from the instruction pointer).
-struct AsOp { k: u64, reg: u64, size: u64, rex: bool, base: u64, index: u64, scale: u64, disp: u64, rip: bool, imm: u64 }
+/// A memory operand may name a symbol, `v[ss .. se)`, with `rk` 1 for the
+/// address itself, 2 for `@PLT` and 3 for `@GOTPCREL`; `disp` is then the
+/// placeholder AS_SYMDISP, which the object writer finds in the encoding and
+/// replaces by a relocation, and `imm` the constant added to the symbol.
+struct AsOp { k: u64, reg: u64, size: u64, rex: bool, base: u64, index: u64, scale: u64, disp: u64, rip: bool, imm: u64, ss: u64, se: u64, rk: u64 }
 
 struct AsParse { op: AsOp, next: u64, ok: bool }
 
 fn as_op_none() -> AsOp {
-  return AsOp { k: AO_NONE, reg: 0, size: 0, rex: false, base: AS_NONE, index: AS_NONE, scale: 1, disp: 0, rip: false, imm: 0 };
+  return AsOp { k: AO_NONE, reg: 0, size: 0, rex: false, base: AS_NONE, index: AS_NONE, scale: 1, disp: 0, rip: false, imm: 0, ss: 0, se: 0, rk: 0 };
 }
 
 fn as_is_blank(c: u64) -> bool {
@@ -207,7 +212,7 @@ fn as_reg(v: &Vec[u64], i: u64, e: u64) -> AsParse {
     let x = as_find(v, t, e, as_names(size));
     if x != AS_NONE {
       r.ok = true;
-      r.op = AsOp { k: AO_REG, reg: x, size: size, rex: size == 1 && x >= 4 && x < 8, base: AS_NONE, index: AS_NONE, scale: 1, disp: 0, rip: false, imm: 0 };
+      r.op = AsOp { k: AO_REG, reg: x, size: size, rex: size == 1 && x >= 4 && x < 8, base: AS_NONE, index: AS_NONE, scale: 1, disp: 0, rip: false, imm: 0, ss: 0, se: 0, rk: 0 };
       r.next = wrap_add(t, as_namelen(v, t, e));
     }
     size = size / 2;
@@ -217,7 +222,7 @@ fn as_reg(v: &Vec[u64], i: u64, e: u64) -> AsParse {
     let n = as_number(v, wrap_add(t, 3), e);
     if n.ok && n.val < 16 {
       r.ok = true;
-      r.op = AsOp { k: AO_XMM, reg: n.val, size: 16, rex: false, base: AS_NONE, index: AS_NONE, scale: 1, disp: 0, rip: false, imm: 0 };
+      r.op = AsOp { k: AO_XMM, reg: n.val, size: 16, rex: false, base: AS_NONE, index: AS_NONE, scale: 1, disp: 0, rip: false, imm: 0, ss: 0, se: 0, rk: 0 };
       r.next = n.next;
     }
   }
@@ -239,7 +244,7 @@ fn as_operand(v: &Vec[u64], i: u64, e: u64) -> AsParse {
     let n = as_number(v, wrap_add(t, 1), e);
     if n.ok {
       r.ok = true;
-      r.op = AsOp { k: AO_IMM, reg: 0, size: 0, rex: false, base: AS_NONE, index: AS_NONE, scale: 1, disp: 0, rip: false, imm: n.val };
+      r.op = AsOp { k: AO_IMM, reg: 0, size: 0, rex: false, base: AS_NONE, index: AS_NONE, scale: 1, disp: 0, rip: false, imm: n.val, ss: 0, se: 0, rk: 0 };
       r.next = n.next;
     }
     return r;
@@ -247,7 +252,43 @@ fn as_operand(v: &Vec[u64], i: u64, e: u64) -> AsParse {
   // memory: [disp] [ ( [base] [, index [, scale]] ) ]
   let mut p = t;
   let mut disp = 0;
-  if c != 40 {
+  let mut ss = 0;
+  let mut se = 0;
+  let mut rk = 0;
+  let mut add = 0;
+  if (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c == 46 {
+    ss = t;
+    se = wrap_add(t, as_namelen(v, t, e));
+    p = se;
+    rk = 1;
+    if p < e && u_at(v, p) == 64 {
+      if as_name_at(v, wrap_add(p, 1), e, "PLT") {
+        rk = 2;
+        p = wrap_add(p, 4);
+      } else if as_name_at(v, wrap_add(p, 1), e, "GOTPCREL") {
+        rk = 3;
+        p = wrap_add(p, 9);
+      } else {
+        return r;
+      }
+    }
+    if p < e && (u_at(v, p) == 43 || u_at(v, p) == 45) {
+      let mut q = p;
+      if u_at(v, p) == 43 {
+        q = wrap_add(p, 1);
+      }
+      let n = as_number(v, q, e);
+      if !n.ok {
+        return r;
+      }
+      add = n.val;
+      p = n.next;
+    }
+    if p >= e || u_at(v, p) != 40 {
+      return r;
+    }
+    disp = AS_SYMDISP;
+  } else if c != 40 {
     let n = as_number(v, p, e);
     if !n.ok {
       return r;
@@ -255,7 +296,7 @@ fn as_operand(v: &Vec[u64], i: u64, e: u64) -> AsParse {
     disp = n.val;
     p = n.next;
   }
-  let mut op = AsOp { k: AO_MEM, reg: 0, size: 0, rex: false, base: AS_NONE, index: AS_NONE, scale: 1, disp: disp, rip: false, imm: 0 };
+  let mut op = AsOp { k: AO_MEM, reg: 0, size: 0, rex: false, base: AS_NONE, index: AS_NONE, scale: 1, disp: disp, rip: false, imm: add, ss: ss, se: se, rk: rk };
   if p < e && u_at(v, p) == 40 {
     p = wrap_add(p, 1);
     if as_name_at(v, wrap_add(p, 1), e, "rip") && u_at(v, p) == 37 {
@@ -520,7 +561,7 @@ fn as_size(sfx: u64, a: AsOp, b: AsOp) -> u64 {
 }
 
 fn as_reg_op(r: u64, size: u64) -> AsOp {
-  return AsOp { k: AO_REG, reg: r, size: size, rex: false, base: AS_NONE, index: AS_NONE, scale: 1, disp: 0, rip: false, imm: 0 };
+  return AsOp { k: AO_REG, reg: r, size: size, rex: false, base: AS_NONE, index: AS_NONE, scale: 1, disp: 0, rip: false, imm: 0, ss: 0, se: 0, rk: 0 };
 }
 
 /// `op $imm, rm` of the arithmetic group (`n` 0-7: add or adc sbb and sub xor
@@ -677,6 +718,7 @@ fn as_line(out: &mut Vec[u64], v: &Vec[u64], s: u64, e: u64) -> bool {
     if as_name_at(v, ns, ne, "cltd") { as_byte(&mut out, 153); return true; }
     if as_name_at(v, ns, ne, "ud2") { as_byte(&mut out, 15); as_byte(&mut out, 11); return true; }
     if as_name_at(v, ns, ne, "pause") { as_byte(&mut out, 243); as_byte(&mut out, 144); return true; }
+    if as_name_at(v, ns, ne, "nop") { as_byte(&mut out, 144); return true; }
     if as_name_at(v, ns, ne, "mfence") { as_byte(&mut out, 15); as_byte(&mut out, 174); as_byte(&mut out, 240); return true; }
     if as_name_at(v, ns, ne, "movsb") { as_byte(&mut out, 164); return true; }
     if as_name_at(v, ns, ne, "movsq") { as_byte(&mut out, 72); as_byte(&mut out, 165); return true; }
