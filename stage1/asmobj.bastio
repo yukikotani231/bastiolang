@@ -1,0 +1,981 @@
+// An assembler for the assembly text the x86-64 native backend writes: it
+// reads a whole file (labels, branches, sections, data directives and the
+// instructions `asm86.bastio` encodes), lays the sections out, relaxes the
+// branches to their shortest form, and reports the bytes of each section and
+// the relocations that a linker still has to apply.
+//
+// The result is what an object file holds: `.text`, `.rodata` and `.data`
+// bytes, the size of `.bss`, and one relocation for each reference to a
+// symbol that is not defined in the same section (or is global). A PE or ELF
+// writer turns that into a file; `tests/as86.sh` checks it against GNU as.
+//
+// Part of the trusted base once a target uses it instead of the system's
+// assembler.
+import "asm86.bastio";
+
+const AB_BYTES: u64 = 1;
+const AB_BRANCH: u64 = 2;
+const AB_ALIGN: u64 = 3;
+const AB_ZERO: u64 = 4;
+const AB_LABEL: u64 = 5;
+const AB_RELOC: u64 = 6;
+
+/// Words per item: kind, section, a, b, c, d, e, offset in the section.
+const AB_ITEM: u64 = 8;
+/// Words per symbol: name start, name length, section, label item, flags, 0.
+const AB_SYM: u64 = 6;
+
+const AB_TEXT: u64 = 0;
+const AB_RODATA: u64 = 1;
+const AB_DATA: u64 = 2;
+const AB_BSS: u64 = 3;
+/// A section whose contents are dropped (notes, debug information).
+const AB_SKIP: u64 = 9;
+
+/// Relocation types: the symbol's address relative to the field (PC32), a
+/// call or jump through the PLT (PLT32), the address of its GOT slot (GOTPCREL).
+const AR_PC32: u64 = 1;
+const AR_PLT32: u64 = 2;
+const AR_GOT32: u64 = 3;
+
+struct AsObj {
+  names: Vec[u64],
+  syms: Vec[u64],
+  htab: Vec[u64],
+  items: Vec[u64],
+  pool: Vec[u64],
+  numdef: Vec[u64],
+  numpend: Vec[u64],
+  sec: u64,
+  errs: u64,
+  errline: u64,
+  line: u64
+}
+
+fn ao_new(nlines: u64) -> AsObj {
+  let mut size = 16;
+  while size < 2147483648 && size < wrap_mul(nlines, 4) {
+    size = size * 2;
+  }
+  let mut htab = vec_new[u64]();
+  let mut k = 0;
+  while k < size {
+    vec_push(&mut htab, 0);
+    k = k + 1;
+  }
+  let mut nd = vec_new[u64]();
+  let mut np = vec_new[u64]();
+  let mut j = 0;
+  while j < 10000 {
+    vec_push(&mut nd, 0);
+    vec_push(&mut np, 0);
+    j = j + 1;
+  }
+  return AsObj { names: vec_new[u64](), syms: vec_new[u64](), htab: htab, items: vec_new[u64](), pool: vec_new[u64](), numdef: nd, numpend: np, sec: AB_TEXT, errs: 0, errline: 0, line: 0 };
+}
+
+fn ao_free(g: AsObj) {
+  vec_free(g.names);
+  vec_free(g.syms);
+  vec_free(g.htab);
+  vec_free(g.items);
+  vec_free(g.pool);
+  vec_free(g.numdef);
+  vec_free(g.numpend);
+}
+
+fn ao_set(v: &mut Vec[u64], i: u64, x: u64) {
+  if i < vec_len(v) {
+    vec_set(&mut v, i, x);
+  }
+}
+
+fn ao_err(g: &mut AsObj) {
+  if g.errs == 0 {
+    g.errline = g.line;
+  }
+  g.errs = wrap_add(g.errs, 1);
+}
+
+fn ao_nsyms(g: &AsObj) -> u64 {
+  return vec_len(g.syms) / AB_SYM;
+}
+
+fn ao_nitems(g: &AsObj) -> u64 {
+  return vec_len(g.items) / AB_ITEM;
+}
+
+fn ao_sym(g: &AsObj, id: u64, f: u64) -> u64 {
+  return u_at(g.syms, wrap_add(wrap_mul(id, AB_SYM), f));
+}
+
+fn ao_sym_set(g: &mut AsObj, id: u64, f: u64, x: u64) {
+  ao_set(&mut g.syms, wrap_add(wrap_mul(id, AB_SYM), f), x);
+}
+
+fn ao_item(g: &AsObj, i: u64, f: u64) -> u64 {
+  return u_at(g.items, wrap_add(wrap_mul(i, AB_ITEM), f));
+}
+
+fn ao_item_set(g: &mut AsObj, i: u64, f: u64, x: u64) {
+  ao_set(&mut g.items, wrap_add(wrap_mul(i, AB_ITEM), f), x);
+}
+
+fn ao_push_item(g: &mut AsObj, kind: u64, a: u64, b: u64, c: u64, d: u64, e: u64) {
+  if g.sec >= 5 {
+    return;
+  }
+  vec_push(&mut g.items, kind);
+  vec_push(&mut g.items, g.sec);
+  vec_push(&mut g.items, a);
+  vec_push(&mut g.items, b);
+  vec_push(&mut g.items, c);
+  vec_push(&mut g.items, d);
+  vec_push(&mut g.items, e);
+  vec_push(&mut g.items, 0);
+}
+
+fn ao_hash(v: &Vec[u64], s: u64, e: u64) -> u64 {
+  let mut h = 5381;
+  let mut k = s;
+  while k < e {
+    h = wrap_add(wrap_mul(h, 33), u_at(v, k));
+    k = wrap_add(k, 1);
+  }
+  return h;
+}
+
+fn ao_name_eq(g: &AsObj, id: u64, v: &Vec[u64], s: u64, e: u64) -> bool {
+  let ns = ao_sym(g, id, 0);
+  let nl = ao_sym(g, id, 1);
+  if nl != wrap_sub(e, s) || s > e {
+    return false;
+  }
+  let mut k = 0;
+  while k < nl {
+    if u_at(g.names, wrap_add(ns, k)) != u_at(v, wrap_add(s, k)) {
+      return false;
+    }
+    k = wrap_add(k, 1);
+  }
+  return true;
+}
+
+fn ao_new_sym(g: &mut AsObj, v: &Vec[u64], s: u64, e: u64) -> u64 {
+  let id = ao_nsyms(g);
+  let ns = vec_len(g.names);
+  let mut k = s;
+  while k < e {
+    vec_push(&mut g.names, u_at(v, k));
+    k = wrap_add(k, 1);
+  }
+  vec_push(&mut g.syms, ns);
+  vec_push(&mut g.syms, wrap_sub(e, s));
+  vec_push(&mut g.syms, AS_NONE);
+  vec_push(&mut g.syms, 0);
+  vec_push(&mut g.syms, 0);
+  vec_push(&mut g.syms, 0);
+  return id;
+}
+
+/// The symbol called `v[s .. e)`, created undefined when it is new.
+fn ao_intern(g: &mut AsObj, v: &Vec[u64], s: u64, e: u64) -> u64 {
+  let size = vec_len(g.htab);
+  let mask = wrap_sub(size, 1);
+  let mut i = ao_hash(v, s, e) & mask;
+  let mut probes = 0;
+  while probes < size {
+    let slot = u_at(g.htab, i);
+    if slot == 0 {
+      let id = ao_new_sym(&mut g, v, s, e);
+      ao_set(&mut g.htab, i, wrap_add(id, 1));
+      return id;
+    }
+    if ao_name_eq(g, wrap_sub(slot, 1), v, s, e) {
+      return wrap_sub(slot, 1);
+    }
+    i = wrap_add(i, 1) & mask;
+    probes = wrap_add(probes, 1);
+  }
+  ao_err(&mut g);
+  return 0;
+}
+
+fn ao_anon(g: &mut AsObj) -> u64 {
+  let id = ao_nsyms(g);
+  vec_push(&mut g.syms, 0);
+  vec_push(&mut g.syms, 0);
+  vec_push(&mut g.syms, AS_NONE);
+  vec_push(&mut g.syms, 0);
+  vec_push(&mut g.syms, 0);
+  vec_push(&mut g.syms, 0);
+  return id;
+}
+
+fn ao_define(g: &mut AsObj, id: u64) {
+  if ao_sym(g, id, 2) != AS_NONE {
+    ao_err(&mut g);
+    return;
+  }
+  if g.sec >= 5 {
+    return;
+  }
+  ao_sym_set(&mut g, id, 2, g.sec);
+  ao_sym_set(&mut g, id, 3, ao_nitems(g));
+  ao_push_item(&mut g, AB_LABEL, id, 0, 0, 0, 0);
+}
+
+/// A numeric label `n:` is defined: it binds the pending forward reference
+/// `nf` if there is one, and is the target of later `nb` references.
+fn ao_define_num(g: &mut AsObj, n: u64) {
+  if n >= 10000 {
+    ao_err(&mut g);
+    return;
+  }
+  let mut id = u_at(g.numpend, n);
+  if id == 0 {
+    id = wrap_add(ao_anon(&mut g), 1);
+  }
+  ao_set(&mut g.numpend, n, 0);
+  ao_set(&mut g.numdef, n, id);
+  ao_define(&mut g, wrap_sub(id, 1));
+}
+
+/// The symbol a numeric reference `nf` or `nb` (`n` and the direction)
+/// names.
+fn ao_ref_num(g: &mut AsObj, n: u64, fwd: bool) -> u64 {
+  if n >= 10000 {
+    ao_err(&mut g);
+    return 0;
+  }
+  if !fwd {
+    let id = u_at(g.numdef, n);
+    if id == 0 {
+      ao_err(&mut g);
+      return 0;
+    }
+    return wrap_sub(id, 1);
+  }
+  let mut id = u_at(g.numpend, n);
+  if id == 0 {
+    id = wrap_add(ao_anon(&mut g), 1);
+    ao_set(&mut g.numpend, n, id);
+  }
+  return wrap_sub(id, 1);
+}
+
+/// The first memory operand of `ins` that names a symbol.
+fn ao_symop(ins: AsIns) -> AsOp {
+  if ins.n >= 1 && ins.a.k == AO_MEM && ins.a.se > ins.a.ss {
+    return ins.a;
+  }
+  if ins.n >= 2 && ins.b.k == AO_MEM && ins.b.se > ins.b.ss {
+    return ins.b;
+  }
+  if ins.n >= 3 && ins.c.k == AO_MEM && ins.c.se > ins.c.ss {
+    return ins.c;
+  }
+  return as_op_none();
+}
+
+/// Where the placeholder displacement of a symbol operand sits in `out`.
+fn ao_find_disp(out: &Vec[u64]) -> u64 {
+  let n = vec_len(out);
+  let mut k = n;
+  while k >= 4 {
+    let j = wrap_sub(k, 4);
+    if u_at(out, j) == 68 && u_at(out, wrap_add(j, 1)) == 51 && u_at(out, wrap_add(j, 2)) == 34 && u_at(out, wrap_add(j, 3)) == 17 {
+      return j;
+    }
+    k = wrap_sub(k, 1);
+  }
+  return AS_NONE;
+}
+
+/// Adds the instruction bytes `out`; `op` is its symbol operand, if any.
+fn ao_bytes(g: &mut AsObj, out: &Vec[u64], v: &Vec[u64], op: AsOp) {
+  let start = vec_len(g.pool);
+  let len = vec_len(out);
+  let mut k = 0;
+  while k < len {
+    vec_push(&mut g.pool, u_at(out, k));
+    k = wrap_add(k, 1);
+  }
+  if op.se > op.ss {
+    let off = ao_find_disp(out);
+    if off == AS_NONE {
+      ao_err(&mut g);
+      return;
+    }
+    let id = ao_intern(&mut g, v, op.ss, op.se);
+    let mut rt = AR_PC32;
+    if op.rk == 2 {
+      rt = AR_PLT32;
+    } else if op.rk == 3 {
+      rt = AR_GOT32;
+    }
+    let addend = wrap_sub(op.imm, wrap_sub(len, off));
+    ao_push_item(&mut g, AB_RELOC, start, len, id, off | (rt << 32), addend);
+  } else {
+    ao_push_item(&mut g, AB_BYTES, start, len, 0, 0, 0);
+  }
+}
+
+fn ao_data(g: &mut AsObj, x: u64, n: u64) {
+  let mut out = vec_new[u64]();
+  as_le(&mut out, x, n);
+  ao_bytes(&mut g, out, out, as_op_none());
+  vec_free(out);
+}
+
+/// The section a `.section` name stands for.
+fn ao_section(v: &Vec[u64], s: u64, e: u64) -> u64 {
+  if as_name_at(v, s, e, ".text") {
+    return AB_TEXT;
+  }
+  if as_name_at(v, s, e, ".rodata") || as_name_at(v, s, e, ".rdata") {
+    return AB_RODATA;
+  }
+  if as_name_at(v, s, e, ".data") {
+    return AB_DATA;
+  }
+  if as_name_at(v, s, e, ".bss") {
+    return AB_BSS;
+  }
+  return AB_SKIP;
+}
+
+fn ao_pow2(x: u64) -> u64 {
+  let mut k = 0;
+  while k < 32 && (1 << k) < x {
+    k = k + 1;
+  }
+  return k;
+}
+
+/// A string literal at `i` (the quote included) into data bytes; the offset
+/// past it, or AS_NONE when it is not a literal.
+fn ao_string(g: &mut AsObj, v: &Vec[u64], i: u64, e: u64, nul: bool) -> u64 {
+  if i >= e || u_at(v, i) != 34 {
+    return AS_NONE;
+  }
+  let mut out = vec_new[u64]();
+  let mut p = wrap_add(i, 1);
+  let mut done = false;
+  while p < e && !done {
+    let c = u_at(v, p);
+    if c == 34 {
+      done = true;
+      p = wrap_add(p, 1);
+    } else if c == 92 && wrap_add(p, 1) < e {
+      let d = u_at(v, wrap_add(p, 1));
+      p = wrap_add(p, 2);
+      if d == 110 {
+        vec_push(&mut out, 10);
+      } else if d == 116 {
+        vec_push(&mut out, 9);
+      } else if d == 114 {
+        vec_push(&mut out, 13);
+      } else if d == 98 {
+        vec_push(&mut out, 8);
+      } else if d == 102 {
+        vec_push(&mut out, 12);
+      } else if d >= 48 && d <= 55 {
+        let mut x = d - 48;
+        let mut m = 0;
+        while m < 2 && p < e && u_at(v, p) >= 48 && u_at(v, p) <= 55 {
+          x = wrap_add(wrap_mul(x, 8), wrap_sub(u_at(v, p), 48));
+          p = wrap_add(p, 1);
+          m = m + 1;
+        }
+        vec_push(&mut out, x & 255);
+      } else if d == 120 {
+        let mut x = 0;
+        let mut m = 0;
+        while m < 2 && p < e && as_hex(u_at(v, p)) < 16 {
+          x = wrap_add(wrap_mul(x, 16), as_hex(u_at(v, p)));
+          p = wrap_add(p, 1);
+          m = m + 1;
+        }
+        vec_push(&mut out, x & 255);
+      } else {
+        vec_push(&mut out, d);
+      }
+    } else {
+      vec_push(&mut out, c);
+      p = wrap_add(p, 1);
+    }
+  }
+  if !done {
+    ao_err(&mut g);
+  }
+  if nul {
+    vec_push(&mut out, 0);
+  }
+  if vec_len(out) > 0 {
+    ao_bytes(&mut g, out, out, as_op_none());
+  }
+  vec_free(out);
+  return p;
+}
+
+fn as_hex(c: u64) -> u64 {
+  if c >= 48 && c <= 57 {
+    return c - 48;
+  }
+  if c >= 97 && c <= 102 {
+    return c - 87;
+  }
+  if c >= 65 && c <= 70 {
+    return c - 55;
+  }
+  return 16;
+}
+
+/// A comma separated list of numbers, each of `n` bytes.
+fn ao_numbers(g: &mut AsObj, v: &Vec[u64], i: u64, e: u64, n: u64) {
+  let mut p = as_skip(v, i, e);
+  while p < e {
+    let x = as_number(v, p, e);
+    if !x.ok {
+      ao_err(&mut g);
+      return;
+    }
+    ao_data(&mut g, x.val, n);
+    p = as_skip(v, x.next, e);
+    if p < e && u_at(v, p) == 44 {
+      p = as_skip(v, wrap_add(p, 1), e);
+    } else if p < e {
+      ao_err(&mut g);
+      return;
+    }
+  }
+}
+
+fn ao_directive(g: &mut AsObj, v: &Vec[u64], s: u64, e: u64) {
+  let nl = as_namelen(v, s, e);
+  let ne = wrap_add(s, nl);
+  let t = as_skip(v, ne, e);
+  if as_name_at(v, s, ne, ".text") {
+    g.sec = AB_TEXT;
+  } else if as_name_at(v, s, ne, ".data") {
+    g.sec = AB_DATA;
+  } else if as_name_at(v, s, ne, ".bss") {
+    g.sec = AB_BSS;
+  } else if as_name_at(v, s, ne, ".section") {
+    g.sec = ao_section(v, t, e);
+  } else if as_name_at(v, s, ne, ".globl") || as_name_at(v, s, ne, ".global") {
+    let id = ao_intern(&mut g, v, t, wrap_add(t, as_namelen(v, t, e)));
+    ao_sym_set(&mut g, id, 4, ao_sym(g, id, 4) | 1);
+  } else if as_name_at(v, s, ne, ".type") || as_name_at(v, s, ne, ".size") || as_name_at(v, s, ne, ".file") || as_name_at(v, s, ne, ".ident") || as_name_at(v, s, ne, ".weak") {
+    return;
+  } else if as_name_at(v, s, ne, ".p2align") {
+    let x = as_number(v, t, e);
+    if !x.ok || x.val >= 32 {
+      ao_err(&mut g);
+      return;
+    }
+    let mut mx = AS_NONE;
+    let mut p = as_skip(v, x.next, e);
+    if p < e && u_at(v, p) == 44 {
+      p = as_skip(v, wrap_add(p, 1), e);
+      if p < e && u_at(v, p) == 44 {
+        let m = as_number(v, as_skip(v, wrap_add(p, 1), e), e);
+        if m.ok {
+          mx = m.val;
+        }
+      }
+    }
+    ao_push_item(&mut g, AB_ALIGN, x.val, mx, 0, 0, 0);
+  } else if as_name_at(v, s, ne, ".string") || as_name_at(v, s, ne, ".asciz") {
+    let mut p = t;
+    while p != AS_NONE && p < e {
+      p = ao_string(&mut g, v, p, e, true);
+      if p != AS_NONE {
+        p = as_skip(v, p, e);
+        if p < e && u_at(v, p) == 44 {
+          p = as_skip(v, wrap_add(p, 1), e);
+        }
+      } else {
+        ao_err(&mut g);
+      }
+    }
+  } else if as_name_at(v, s, ne, ".ascii") {
+    let p = ao_string(&mut g, v, t, e, false);
+    if p == AS_NONE {
+      ao_err(&mut g);
+    }
+  } else if as_name_at(v, s, ne, ".byte") {
+    ao_numbers(&mut g, v, t, e, 1);
+  } else if as_name_at(v, s, ne, ".word") || as_name_at(v, s, ne, ".value") || as_name_at(v, s, ne, ".short") {
+    ao_numbers(&mut g, v, t, e, 2);
+  } else if as_name_at(v, s, ne, ".long") || as_name_at(v, s, ne, ".int") {
+    ao_numbers(&mut g, v, t, e, 4);
+  } else if as_name_at(v, s, ne, ".quad") {
+    ao_numbers(&mut g, v, t, e, 8);
+  } else if as_name_at(v, s, ne, ".zero") || as_name_at(v, s, ne, ".skip") {
+    let x = as_number(v, t, e);
+    if !x.ok {
+      ao_err(&mut g);
+      return;
+    }
+    ao_push_item(&mut g, AB_ZERO, x.val, 0, 0, 0, 0);
+  } else if as_name_at(v, s, ne, ".comm") {
+    let nm = as_namelen(v, t, e);
+    let id = ao_intern(&mut g, v, t, wrap_add(t, nm));
+    let p = as_skip(v, wrap_add(t, nm), e);
+    if p >= e || u_at(v, p) != 44 {
+      ao_err(&mut g);
+      return;
+    }
+    let sz = as_number(v, as_skip(v, wrap_add(p, 1), e), e);
+    if !sz.ok {
+      ao_err(&mut g);
+      return;
+    }
+    // a common symbol has no place in this object: the linker gives it one
+    ao_sym_set(&mut g, id, 4, ao_sym(g, id, 4) | 3);
+    ao_sym_set(&mut g, id, 5, sz.val);
+  } else {
+    ao_err(&mut g);
+  }
+}
+
+/// A branch or call: `jmp`, `jcc` or `call` to a label or a symbol, or an
+/// indirect one through `*operand`. False when the line is none of these.
+fn ao_branch(g: &mut AsObj, v: &Vec[u64], s: u64, e: u64) -> bool {
+  let ns = as_skip(v, s, e);
+  let ne = wrap_add(ns, as_namelen(v, ns, e));
+  let mut kind = AS_NONE;
+  if as_name_at(v, ns, ne, "jmp") {
+    kind = 16;
+  } else if as_name_at(v, ns, ne, "call") {
+    kind = 17;
+  } else if u_at(v, ns) == 106 && ne > wrap_add(ns, 1) {
+    let cc = as_cc(v, wrap_add(ns, 1), ne);
+    if cc != AS_NONE {
+      kind = cc;
+    }
+  }
+  if kind == AS_NONE {
+    return false;
+  }
+  let t = as_skip(v, ne, e);
+  if t >= e {
+    ao_err(&mut g);
+    return true;
+  }
+  if u_at(v, t) == 42 {
+    // indirect
+    if kind < 16 {
+      ao_err(&mut g);
+      return true;
+    }
+    let p = as_operand(v, wrap_add(t, 1), e);
+    if !p.ok || (p.op.k != AO_REG && p.op.k != AO_MEM) {
+      ao_err(&mut g);
+      return true;
+    }
+    let mut ext = 4;
+    if kind == 17 {
+      ext = 2;
+    }
+    let mut out = vec_new[u64]();
+    as_emit(&mut out, as_enc(0, 255, 1, 4, ext, p.op));
+    ao_bytes(&mut g, out, v, p.op);
+    vec_free(out);
+    return true;
+  }
+  let tl = as_namelen(v, t, e);
+  let mut id = 0;
+  let c = u_at(v, wrap_add(t, wrap_sub(tl, 1)));
+  let num = as_number(v, t, e);
+  if num.ok && num.next == wrap_sub(wrap_add(t, tl), 1) && (c == 102 || c == 98) {
+    id = ao_ref_num(&mut g, num.val, c == 102);
+  } else {
+    id = ao_intern(&mut g, v, t, wrap_add(t, tl));
+  }
+  let mut size = 2;
+  if kind == 17 {
+    size = 5;
+  }
+  ao_push_item(&mut g, AB_BRANCH, id, kind, size, 0, 0);
+  return true;
+}
+
+/// One line of the file.
+fn ao_line(g: &mut AsObj, v: &Vec[u64], s0: u64, e0: u64) {
+  g.line = wrap_add(g.line, 1);
+  // drop the comment and the trailing blanks
+  let mut e = e0;
+  let mut q = s0;
+  let mut instr = false;
+  while q < e0 {
+    let c = u_at(v, q);
+    if c == 34 {
+      instr = !instr;
+    }
+    if c == 35 && !instr {
+      e = q;
+      q = e0;
+    } else {
+      q = wrap_add(q, 1);
+    }
+  }
+  while e > s0 && as_is_blank(u_at(v, wrap_sub(e, 1))) {
+    e = wrap_sub(e, 1);
+  }
+  let mut t = as_skip(v, s0, e);
+  if t >= e {
+    return;
+  }
+  // a label
+  let nl = as_namelen(v, t, e);
+  if nl > 0 && wrap_add(t, nl) < e && u_at(v, wrap_add(t, nl)) == 58 {
+    let num = as_number(v, t, e);
+    if num.ok && num.next == wrap_add(t, nl) {
+      ao_define_num(&mut g, num.val);
+    } else {
+      let id = ao_intern(&mut g, v, t, wrap_add(t, nl));
+      ao_define(&mut g, id);
+    }
+    t = as_skip(v, wrap_add(wrap_add(t, nl), 1), e);
+    if t >= e {
+      return;
+    }
+  }
+  if u_at(v, t) == 46 {
+    ao_directive(&mut g, v, t, e);
+    return;
+  }
+  if ao_branch(&mut g, v, t, e) {
+    return;
+  }
+  let mut out = vec_new[u64]();
+  if as_line(&mut out, v, t, e) {
+    let ins = as_split(v, t, e);
+    ao_bytes(&mut g, out, v, ao_symop(ins));
+  } else {
+    ao_err(&mut g);
+  }
+  vec_free(out);
+}
+
+/// The padding that item `i` (an alignment) needs at offset `o`.
+fn ao_pad_at(g: &AsObj, i: u64, o: u64) -> u64 {
+  let a = ao_item(g, i, 2);
+  if a >= 32 {
+    return 0;
+  }
+  let mask = wrap_sub(1 << a, 1);
+  let pad = wrap_sub(0, o) & mask;
+  let mx = ao_item(g, i, 3);
+  if mx != AS_NONE && pad > mx {
+    return 0;
+  }
+  return pad;
+}
+
+/// The size of item `i` placed at offset `o`.
+fn ao_size(g: &AsObj, i: u64, o: u64) -> u64 {
+  let k = ao_item(g, i, 0);
+  if k == AB_BYTES || k == AB_RELOC {
+    return ao_item(g, i, 3);
+  }
+  if k == AB_BRANCH {
+    return ao_item(g, i, 4);
+  }
+  if k == AB_ZERO {
+    return ao_item(g, i, 2);
+  }
+  if k == AB_ALIGN {
+    return ao_item(g, i, 4);
+  }
+  return 0;
+}
+
+/// The offset of the label `id` in its section.
+fn ao_sym_off(g: &AsObj, id: u64) -> u64 {
+  return ao_item(g, ao_sym(g, id, 3), 7);
+}
+
+/// Is `id` defined in section `sec` and local, so that nothing but this
+/// assembler decides its address?
+fn ao_local_in(g: &AsObj, id: u64, sec: u64) -> bool {
+  return ao_sym(g, id, 2) == sec && (ao_sym(g, id, 4) & 1) == 0;
+}
+
+fn ao_fits8(d: u64) -> bool {
+  return d < 128 || d >= 18446744073709551488;
+}
+
+/// Places the items in their sections and relaxes the branches the way GNU
+/// as does: a first pass places everything with the shortest forms (and no
+/// alignment padding; the first relaxation pass adds it), then
+/// passes walk the items in order, each branch measuring its target with the
+/// growth so far in the pass added to the targets still ahead, until a pass
+/// changes no size. A branch only ever grows; an alignment may shrink again.
+fn ao_layout(g: &mut AsObj) {
+  let n = ao_nitems(g);
+  let mut secoff = vec_new[u64]();
+  let mut z = 0;
+  while z < 5 {
+    vec_push(&mut secoff, 0);
+    z = z + 1;
+  }
+  let mut i = 0;
+  while i < n {
+    let sec = ao_item(g, i, 1);
+    let o = u_at(secoff, sec);
+    ao_item_set(&mut g, i, 7, o);
+    if ao_item(g, i, 0) == AB_BRANCH && ao_item(g, i, 4) == 2 && !ao_local_in(g, ao_item(g, i, 2), sec) {
+      // a target the assembler does not decide is a long branch from the start
+      let mut long = 6;
+      if ao_item(g, i, 3) == 16 {
+        long = 5;
+      }
+      ao_item_set(&mut g, i, 4, long);
+    }
+    ao_set(&mut secoff, sec, wrap_add(o, ao_size(g, i, o)));
+    i = wrap_add(i, 1);
+  }
+  vec_free(secoff);
+  let mut changed = true;
+  let mut rounds = 0;
+  while changed && rounds < 100000 {
+    changed = false;
+    rounds = wrap_add(rounds, 1);
+    let mut stretch = vec_new[u64]();
+    let mut y = 0;
+    while y < 5 {
+      vec_push(&mut stretch, 0);
+      y = y + 1;
+    }
+    let mut j = 0;
+    while j < n {
+      let sec = ao_item(g, j, 1);
+      let st = u_at(stretch, sec);
+      let here = wrap_add(ao_item(g, j, 7), st);
+      ao_item_set(&mut g, j, 7, here);
+      let k = ao_item(g, j, 0);
+      if k == AB_ALIGN {
+        let pad = ao_pad_at(g, j, here);
+        let was = ao_item(g, j, 4);
+        if pad != was {
+          ao_item_set(&mut g, j, 4, pad);
+          ao_set(&mut stretch, sec, wrap_add(st, wrap_sub(pad, was)));
+          changed = true;
+        }
+      } else if k == AB_BRANCH && ao_item(g, j, 4) == 2 {
+        let t = ao_item(g, j, 2);
+        let mut grow = true;
+        if ao_local_in(g, t, sec) {
+          let ti = ao_sym(g, t, 3);
+          let mut to = ao_item(g, ti, 7);
+          if ti > j {
+            to = wrap_add(to, st);
+          }
+          grow = !ao_fits8(wrap_sub(to, wrap_add(here, 2)));
+        }
+        if grow {
+          let mut long = 6;
+          if ao_item(g, j, 3) == 16 {
+            long = 5;
+          }
+          ao_item_set(&mut g, j, 4, long);
+          ao_set(&mut stretch, sec, wrap_add(st, wrap_sub(long, 2)));
+          changed = true;
+        }
+      }
+      j = wrap_add(j, 1);
+    }
+    vec_free(stretch);
+  }
+}
+
+/// The multi-byte NOP of `n` bytes (1 to 11) the GNU assembler pads with.
+fn ao_nop(out: &mut Vec[u64], n: u64) {
+  if n == 1 {
+    as_byte(&mut out, 144);
+    return;
+  }
+  if n == 2 {
+    as_byte(&mut out, 102);
+    as_byte(&mut out, 144);
+    return;
+  }
+  if n >= 9 {
+    // 66 [66] [2e] 0f 1f 84 00 00 00 00 00
+    let mut pre = wrap_sub(n, 8);
+    if n == 9 {
+      pre = 1;
+    }
+    let mut k = 0;
+    while k < pre {
+      if k + 1 == pre && n >= 10 {
+        as_byte(&mut out, 46);
+      } else {
+        as_byte(&mut out, 102);
+      }
+      k = k + 1;
+    }
+    as_byte(&mut out, 15);
+    as_byte(&mut out, 31);
+    as_byte(&mut out, 132);
+    as_le(&mut out, 0, 5);
+    return;
+  }
+  if n == 6 {
+    as_byte(&mut out, 102);
+    as_byte(&mut out, 15);
+    as_byte(&mut out, 31);
+    as_byte(&mut out, 68);
+    as_le(&mut out, 0, 2);
+    return;
+  }
+  as_byte(&mut out, 15);
+  as_byte(&mut out, 31);
+  if n == 3 {
+    as_byte(&mut out, 0);
+  } else if n == 4 {
+    as_byte(&mut out, 64);
+    as_byte(&mut out, 0);
+  } else if n == 5 {
+    as_byte(&mut out, 68);
+    as_le(&mut out, 0, 2);
+  } else if n == 7 {
+    as_byte(&mut out, 128);
+    as_le(&mut out, 0, 4);
+  } else {
+    as_byte(&mut out, 132);
+    as_le(&mut out, 0, 5);
+  }
+}
+
+fn ao_pad(out: &mut Vec[u64], n: u64, text: bool) {
+  let mut left = n;
+  while left > 0 {
+    if text {
+      let mut m = left;
+      if m > 11 {
+        m = 11;
+      }
+      ao_nop(&mut out, m);
+      left = left - m;
+    } else {
+      as_byte(&mut out, 0);
+      left = left - 1;
+    }
+  }
+}
+
+/// The size of the section `sec` after the layout.
+fn ao_sec_size(g: &AsObj, sec: u64) -> u64 {
+  let n = ao_nitems(g);
+  let mut last = AS_NONE;
+  let mut i = 0;
+  while i < n {
+    if ao_item(g, i, 1) == sec {
+      last = i;
+    }
+    i = wrap_add(i, 1);
+  }
+  if last == AS_NONE {
+    return 0;
+  }
+  return wrap_add(ao_item(g, last, 7), ao_size(g, last, ao_item(g, last, 7)));
+}
+
+/// The relocation of one field, or its resolved value.
+struct AsReloc { sec: u64, off: u64, rtype: u64, sym: u64, addend: u64 }
+
+/// The bytes of section `sec`, with the relocations that cannot be resolved
+/// here appended to `rel`.
+fn ao_emit(g: &AsObj, sec: u64, rel: &mut Vec[u64]) -> Vec[u64] {
+  let mut out = vec_new[u64]();
+  let n = ao_nitems(g);
+  let mut i = 0;
+  while i < n {
+    if ao_item(g, i, 1) == sec {
+      let k = ao_item(g, i, 0);
+      let o = ao_item(g, i, 7);
+      let size = ao_size(g, i, o);
+      if k == AB_BYTES || k == AB_RELOC {
+        let start = ao_item(g, i, 2);
+        let mut b = 0;
+        while b < size {
+          vec_push(&mut out, u_at(g.pool, wrap_add(start, b)));
+          b = wrap_add(b, 1);
+        }
+        if k == AB_RELOC {
+          let sym = ao_item(g, i, 4);
+          let off = ao_item(g, i, 5) & 4294967295;
+          let rt = ao_item(g, i, 5) >> 32;
+          let addend = ao_item(g, i, 6);
+          let at = wrap_add(o, off);
+          if ao_local_in(g, sym, sec) {
+            let val = wrap_sub(wrap_add(ao_sym_off(g, sym), addend), at);
+            let base = wrap_sub(wrap_add(vec_len(out), off), size);
+            let mut m = 0;
+            while m < 4 {
+              ao_set(&mut out, wrap_add(base, m), (val >> wrap_mul(m, 8)) & 255);
+              m = m + 1;
+            }
+          } else {
+            let base = wrap_sub(wrap_add(vec_len(out), off), size);
+            let mut m = 0;
+            while m < 4 {
+              ao_set(&mut out, wrap_add(base, m), 0);
+              m = m + 1;
+            }
+            vec_push(&mut rel, sec);
+            vec_push(&mut rel, at);
+            vec_push(&mut rel, rt);
+            vec_push(&mut rel, sym);
+            vec_push(&mut rel, addend);
+          }
+        }
+      } else if k == AB_BRANCH {
+        let t = ao_item(g, i, 2);
+        let kind = ao_item(g, i, 3);
+        let cur = ao_item(g, i, 4);
+        let local = ao_local_in(g, t, sec);
+        if cur == 2 {
+          if kind == 16 {
+            as_byte(&mut out, 235);
+          } else {
+            as_byte(&mut out, wrap_add(112, kind));
+          }
+          as_byte(&mut out, wrap_sub(ao_sym_off(g, t), wrap_add(o, 2)));
+        } else {
+          let mut pos = 1;
+          if kind == 16 {
+            as_byte(&mut out, 233);
+          } else if kind == 17 {
+            as_byte(&mut out, 232);
+          } else {
+            as_byte(&mut out, 15);
+            as_byte(&mut out, wrap_add(128, kind));
+            pos = 2;
+          }
+          if local {
+            as_le(&mut out, wrap_sub(ao_sym_off(g, t), wrap_add(o, size)), 4);
+          } else {
+            as_le(&mut out, 0, 4);
+            vec_push(&mut rel, sec);
+            vec_push(&mut rel, wrap_add(o, pos));
+            vec_push(&mut rel, AR_PLT32);
+            vec_push(&mut rel, t);
+            vec_push(&mut rel, wrap_sub(0, 4));
+          }
+        }
+      } else if k == AB_ALIGN {
+        ao_pad(&mut out, size, sec == AB_TEXT);
+      } else if k == AB_ZERO {
+        ao_pad(&mut out, size, false);
+      }
+    }
+    i = wrap_add(i, 1);
+  }
+  return out;
+}
