@@ -2,11 +2,12 @@
 // for `tests/as86.sh`, which compares it with GNU as.
 //   as86 FILE         the bytes of each instruction line, one line per line
 //                     of FILE, `?` for a line it cannot encode
+//   as86 --pe OUT FILE  links FILE into the Windows executable OUT
 //   as86 --obj FILE   the sections and relocations of the whole file:
 //                       S <section> <size>   then its bytes in hexadecimal
 //                       R <section> <offset> <type> <symbol> <addend>
 //                       E <errors> <first line with an error>
-import "asmobj.bastio";
+import "pe.bastio";
 import "out.bastio";
 import "loader.bastio";
 
@@ -16,11 +17,16 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
     return 2;
   }
   let mut obj = false;
+  let mut pe = false;
   let mut argi = 1;
   let a1 = host_arg(host, 1);
   if blen(a1) == 5 && bget(a1, 0) == 45 && bget(a1, 1) == 45 && bget(a1, 2) == 111 {
     obj = true;
     argi = 2;
+  }
+  if blen(a1) == 4 && bget(a1, 0) == 45 && bget(a1, 1) == 45 && bget(a1, 2) == 112 {
+    pe = true;
+    argi = 3;
   }
   bfree(a1);
   let path = host_arg(host, argi);
@@ -31,6 +37,13 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
     put(con, "cannot read the file\n");
     bfree(data);
     return 1;
+  }
+  if pe {
+    let outp = host_arg(host, 2);
+    let st = pe_build(host, outp, data);
+    bfree(outp);
+    bfree(data);
+    return st;
   }
   if obj {
     as_object(&mut con, data);
@@ -102,34 +115,8 @@ fn as_secname(sec: u64) -> Str {
   return ".bss";
 }
 
-/// Splits the file into lines and calls `f` on each: here, `ao_line`.
 fn as_object(con: &mut Serial, data: &Bytes) {
-  let mut nl = 0;
-  let mut c = 0;
-  while c < blen(data) {
-    if bget(data, c) == 10 {
-      nl = wrap_add(nl, 1);
-    }
-    c = wrap_add(c, 1);
-  }
-  let mut g = ao_new(wrap_add(nl, 16));
-  let mut line = vec_new[u64]();
-  let mut k = 0;
-  while k <= blen(data) {
-    let mut ch = 10;
-    if k < blen(data) {
-      ch = cast[u64](bget(data, k));
-    }
-    if ch == 10 {
-      ao_line(&mut g, line, 0, vec_len(line));
-      vec_free(line);
-      line = vec_new[u64]();
-    } else {
-      vec_push(&mut line, ch);
-    }
-    k = wrap_add(k, 1);
-  }
-  vec_free(line);
+  let mut g = pe_feed(data, false);
   ao_layout(&mut g);
   let mut rel = vec_new[u64]();
   let mut sec = 0;
