@@ -310,6 +310,17 @@ fn b1_is(b: &Bytes, w: Str) -> bool {
   return spells(b, 0, blen(b), w);
 }
 
+/// Whether the C library is glibc's, the one `elf.bastio` writes executables
+/// for (musl names its dynamic loader and library differently).
+fn b1_glibc(host: &Host) -> bool {
+  let path = bfrom("/lib64/ld-linux-x86-64.so.2");
+  let mut b = balloc(0);
+  let ok = host_read(host, path, &mut b) && blen(b) > 0;
+  bfree(b);
+  bfree(path);
+  return ok;
+}
+
 /// Whether this compiler is itself an x86-64 ELF program, that is, whether
 /// it runs on x86-64 Linux: the native backends write ELF for that and
 /// nothing else (macOS and AArch64 hosts build through the C backend).
@@ -425,7 +436,7 @@ fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, aa
     }
     w_s(&mut out, "\n");
     status = 4;
-  } else if (linkchoice == 1 || (linkchoice == 0 && windows)) && !aarch64 && !macos && !emit_asm && target == TARGET_HOSTED && !lib {
+  } else if (linkchoice == 1 || (linkchoice == 0 && (windows || (ir && b1_glibc(host))))) && !aarch64 && !macos && !emit_asm && target == TARGET_HOSTED && !lib {
     // The program is assembled and linked by pe.bastio: no `as`, no `cc`.
     let mut exe = b1_concat(outp, "");
     if !has_out {
@@ -570,7 +581,7 @@ fn b1_help(out: &mut Vec[u64]) {
   w_s(&mut out, "  --arch A         x86_64 (the default) or aarch64 (hosted programs compile with aarch64-linux-gnu-gcc; --backend native: partial)\n");
   w_s(&mut out, "  --os O           linux (the default), macos (--backend native --arch aarch64, or --backend native-ir: Mach-O assembly for Apple's assembler and linker driver) or windows (--backend native-ir: assembly for MinGW-w64)\n");
   w_s(&mut out, "  --backend B      c, or native (x86-64 assembly, or AArch64 with --arch aarch64); hosted programs on x86-64 Linux use native-ir unless --backend or --emit-c says otherwise\n");
-  w_s(&mut out, "  --self-link      with --backend native-ir: assemble and link with the built-in assembler and linker (the default for --os windows)\n");
+  w_s(&mut out, "  --self-link      with --backend native-ir: assemble and link with the built-in assembler and linker (the default with --backend native-ir on Linux and Windows)\n");
   w_s(&mut out, "  --gnu-link       with --backend native-ir: assemble and link with the platform's as and cc instead (--mingw-link is the same)\n");
   w_s(&mut out, "  --emit-asm       with --backend native: write the assembly instead of an executable\n");
   w_s(&mut out, "  --lib DIR        also look for imported files in DIR\n");
