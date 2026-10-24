@@ -188,4 +188,6 @@ else
   echo "FAIL aarch64: the native smp_run kernel's output on QEMU virt:"; sed 's/^/    /' "$tmp/smp.txt"; fails=$((fails+1))
 fi
 BASTIOC="$BASTIOC" tests/aarch64_native.sh || fails=$((fails+1))
+# The same programs through bastioc1's own assembler and ELF linker.
+SELF_LINK=1 BASTIOC="$BASTIOC" tests/aarch64_native.sh || fails=$((fails+1))
 [ "$fails" = 0 ]
