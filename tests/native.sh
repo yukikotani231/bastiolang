@@ -51,8 +51,9 @@ BASTIOC=${BASTIOC:-$(tests/bastioc1.sh)} || exit 1
 OSARG=
 [ "${NATIVE_OS:-linux}" = macos ] && OSARG="--os macos"
 [ "${NATIVE_OS:-linux}" = windows ] && OSARG="--os windows"
-# SELF_LINK=1 (with NATIVE_OS=windows): link with bastioc1's own PE linker.
-[ -n "${SELF_LINK:-}" ] && OSARG="$OSARG --self-link"
+# MINGW_LINK=1 (with NATIVE_OS=windows): MinGW-w64's as and cc instead of
+# bastioc1's own PE linker.
+[ -n "${MINGW_LINK:-}" ] && OSARG="$OSARG --mingw-link"
 export BASTIOC OSARG
 # One program, built by both backends; JOBS of them at a time.
 both() {
