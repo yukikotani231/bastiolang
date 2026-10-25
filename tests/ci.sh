@@ -34,6 +34,7 @@ if command -v z3 >/dev/null; then
   step "tests/native.sh";    tests/native.sh
   step "tests/native.sh (IR emitter)"; BACKEND=native-ir tests/native.sh
   step "tests/native.sh (IR emitter, GNU as and cc)"; GNU_LINK=1 BACKEND=native-ir tests/native.sh
+  if [ -e /lib/ld-musl-x86_64.so.1 ]; then step "tests/native.sh (IR emitter, musl loader)"; MUSL_LINK=1 BACKEND=native-ir tests/native.sh; fi
   step "tests/as86.sh";      tests/as86.sh
   step "tests/as64.sh";      tests/as64.sh
   step "tests/macho.sh";     tests/macho.sh

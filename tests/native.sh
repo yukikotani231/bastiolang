@@ -57,6 +57,8 @@ OSARG=
 [ -n "${MINGW_LINK:-}${GNU_LINK:-}" ] && OSARG="$OSARG --gnu-link"
 # SELF_LINK=1 (macOS, x86-64): bastioc1's own assembler and Mach-O writer.
 [ -n "${SELF_LINK:-}" ] && OSARG="$OSARG --self-link"
+# MUSL_LINK=1 (Linux, x86-64): the same, for an executable that runs on musl's loader.
+[ -n "${MUSL_LINK:-}" ] && OSARG="$OSARG --musl-link"
 export BASTIOC OSARG
 # One program, built by both backends; JOBS of them at a time.
 both() {

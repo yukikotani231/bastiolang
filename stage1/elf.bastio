@@ -146,10 +146,17 @@ fn elf_a64_stub(text: &mut Vec[u64], tstart: u64, k: u64, slot: u64, here: u64) 
 /// Links the assembled program `g` (laid out by `ao_layout`) into a Linux
 /// executable; the bytes of the file, or an empty vector when something is
 /// undefined that cannot be an import.
-fn elf_link(g: &mut AsObj, arm: bool) -> Vec[u64] {
+fn elf_link(g: &mut AsObj, arm: bool, musl: bool) -> Vec[u64] {
   let mut page = ELF_PAGE;
   let mut tsz = 8;
   let mut ilen = 28;
+  // the string table starts with the C library's name: libc.so.6, or libc.so
+  // for musl, whose loader takes any libc.so* as itself
+  let mut cur0 = 11;
+  if musl {
+    ilen = 25;
+    cur0 = 9;
+  }
   if arm {
     page = 65536;
     tsz = 16;
@@ -191,7 +198,7 @@ fn elf_link(g: &mut AsObj, arm: bool) -> Vec[u64] {
   let dynsym = pe_align(wrap_add(hash, wrap_mul(4, wrap_add(3, nds))), 8);
   let dynstr = wrap_add(dynsym, wrap_mul(24, nds));
   let mut name_off = vec_new[u64]();
-  let mut cur = 11;
+  let mut cur = cur0;
   let mut k = 0;
   while k < nimp {
     vec_push(&mut name_off, cur);
@@ -367,6 +374,8 @@ fn elf_link(g: &mut AsObj, arm: bool) -> Vec[u64] {
   // the interpreter
   if arm {
     pe_put(&mut out, "/lib/ld-linux-aarch64.so.1");
+  } else if musl {
+    pe_put(&mut out, "/lib/ld-musl-x86_64.so.1");
   } else {
     pe_put(&mut out, "/lib64/ld-linux-x86-64.so.2");
   }
@@ -398,7 +407,11 @@ fn elf_link(g: &mut AsObj, arm: bool) -> Vec[u64] {
   }
   // the strings: the library's name, then the imports'
   as_byte(&mut out, 0);
-  pe_put(&mut out, "libc.so.6");
+  if musl {
+    pe_put(&mut out, "libc.so");
+  } else {
+    pe_put(&mut out, "libc.so.6");
+  }
   as_byte(&mut out, 0);
   k = 0;
   while k < nimp {
@@ -464,15 +477,15 @@ fn elf_link(g: &mut AsObj, arm: bool) -> Vec[u64] {
   return out;
 }
 
-/// Links the program into the Linux executable at `outp`.
-fn elf_build(host: &Host, outp: &Bytes, data: &Bytes) -> u64 {
+/// Links the program into the Linux executable at `outp`, for musl when `musl`.
+fn elf_build(host: &Host, outp: &Bytes, data: &Bytes, musl: bool) -> u64 {
   let mut g = pe_feed(data, elf_entry(), false);
   if g.errs > 0 {
     ao_free(g);
     return 3;
   }
   ao_layout(&mut g);
-  let image = elf_link(&mut g, false);
+  let image = elf_link(&mut g, false, musl);
   ao_free(g);
   if vec_len(image) == 0 {
     vec_free(image);
@@ -489,7 +502,7 @@ fn elf_build_a64(host: &Host, outp: &Bytes, data: &Bytes) -> u64 {
     return 3;
   }
   ao_layout(&mut g);
-  let image = elf_link(&mut g, true);
+  let image = elf_link(&mut g, true, false);
   ao_free(g);
   if vec_len(image) == 0 {
     vec_free(image);
