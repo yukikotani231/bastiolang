@@ -227,6 +227,51 @@ int main(void) {
         }
     }
 
+    /* Body framing: random sets of header fields against the rules, written
+     * out per field kind. */
+    {
+        struct { const char *line; int kind; uint64_t v; } pool[] = {
+            { "Host: example.org\r\n", 0, 0 }, { "X-Y: z\r\n", 0, 0 },
+            { "Content-Length: 5\r\n", 1, 5 }, { "content-length: 0\r\n", 1, 0 },
+            { "CONTENT-LENGTH:  12 \r\n", 1, 12 }, { "Content-Length: 72057594037927935\r\n", 1, 72057594037927935ull },
+            { "Content-Length: 5x\r\n", 2, 0 }, { "Content-Length:\r\n", 2, 0 },
+            { "Content-Length: -1\r\n", 2, 0 }, { "Content-Length: 5, 5\r\n", 2, 0 },
+            { "Content-Length: 72057594037927936\r\n", 2, 0 },
+            { "Transfer-Encoding: chunked\r\n", 3, 0 }, { "transfer-encoding: CHUNKED\r\n", 3, 0 },
+            { "Transfer-Encoding: gzip\r\n", 4, 0 }, { "Transfer-Encoding: gzip, chunked\r\n", 4, 0 },
+            { "Transfer-Encoding: chunkedx\r\n", 4, 0 }, { "Content-Length-X: 5\r\n", 0, 0 },
+        };
+        int np = sizeof pool / sizeof *pool;
+        for (int it = 0; it < 20000; it++) {
+            char msg[512] = "GET / HTTP/1.1\r\n";
+            int ncl = 0, nte = 0, bad = 0;
+            uint64_t clv = 0;
+            int nf = rand() % 4;
+            for (int j = 0; j < nf; j++) {
+                int c = rand() % np;
+                strcat(msg, pool[c].line);
+                if (pool[c].kind == 1) { ncl++; clv = pool[c].v; }
+                if (pool[c].kind == 2) { ncl++; bad = 1; }
+                if (pool[c].kind == 3) nte++;
+                if (pool[c].kind == 4) { nte++; bad = 1; }
+            }
+            strcat(msg, "\r\n");
+            if (ncl > 1 || nte > 1 || (ncl && nte)) bad = 1;
+            size_t mn = strlen(msg);
+            bst_e_Head hd = http_parse_head((const uint8_t *)msg, mn);
+            CHECK(hd.tag == bst_e_Head_Ok, "body test head: %s", msg);
+            if (hd.tag != bst_e_Head_Ok) continue;
+            bst_e_Body b = http_body((const uint8_t *)msg, mn, hd.u.Ok.fields);
+            if (bad) CHECK(b.tag == bst_e_Body_Bad, "body %d: wanted Bad for %s", it, msg);
+            else if (nte) CHECK(b.tag == bst_e_Body_Chunked, "body %d: wanted Chunked for %s", it, msg);
+            else if (ncl) CHECK(b.tag == bst_e_Body_Length && b.u.Length == clv, "body %d: wanted Length for %s", it, msg);
+            else CHECK(b.tag == bst_e_Body_None, "body %d: wanted None for %s", it, msg);
+            /* An incomplete head is never framed. */
+            bst_e_Body q = http_body((const uint8_t *)msg, mn - 1, hd.u.Ok.fields);
+            CHECK(q.tag == bst_e_Body_Bad, "body %d: truncated head", it);
+        }
+    }
+
     /* Every proper prefix of a complete head is Partial (or, for a prefix
      * that already breaks a rule, malformed). */
     size_t gn = strlen(good);

@@ -375,3 +375,130 @@ export fn http_chunk(s: &Bytes, at: u64) -> Chunk
   }
   return Chunk::Ok(ChunkData { data: data, size: size, next: data + size + 2 });
 }
+
+/// `c` in lower case, if it is an ASCII letter.
+fn http_lower(c: u8) -> u8 {
+  if c >= 65 && c <= 90 { return c + 32; }
+  return c;
+}
+
+/// Is `s[a..b)` equal to "content-length", ignoring case?
+fn http_is_content_length(s: &Bytes, a: u64, b: u64) -> bool
+  requires a <= b && b <= blen(s)
+{
+  if b - a != 14 { return false; }
+  let mut i = 0;
+  while i < 14
+    invariant i <= 14 && a + 14 == b
+  {
+    if http_lower(bget(s, a + i)) != sget("content-length", i) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+/// Is `s[a..b)` equal to "transfer-encoding", ignoring case?
+fn http_is_transfer_encoding(s: &Bytes, a: u64, b: u64) -> bool
+  requires a <= b && b <= blen(s)
+{
+  if b - a != 17 { return false; }
+  let mut i = 0;
+  while i < 17
+    invariant i <= 17 && a + 17 == b
+  {
+    if http_lower(bget(s, a + i)) != sget("transfer-encoding", i) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+/// Is `s[a..b)` equal to "chunked", ignoring case?
+fn http_is_chunked(s: &Bytes, a: u64, b: u64) -> bool
+  requires a <= b && b <= blen(s)
+{
+  if b - a != 7 { return false; }
+  let mut i = 0;
+  while i < 7
+    invariant i <= 7 && a + 7 == b
+  {
+    if http_lower(bget(s, a + i)) != sget("chunked", i) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+/// How the body of a message is delimited (RFC 9112, section 6.3).
+enum Body {
+  // Neither header: no body (a request) or a body that runs to the end of
+  // the connection (a response); the caller knows which.
+  None,
+  // `Content-Length`: this many bytes.
+  Length(u64),
+  // `Transfer-Encoding: chunked`: read it with http_chunk.
+  Chunked,
+  // The offset of the field that makes the framing ambiguous or invalid.
+  Bad(u64),
+}
+
+/// Decides how the body is delimited from the header fields that start at
+/// `first` (as `http_parse_head` and `http_parse_response` return it). The
+/// rules are the strict ones that stop request smuggling: a repeated
+/// `Content-Length` or `Transfer-Encoding`, both at once, a transfer coding
+/// other than a lone `chunked`, and a length that is not plain decimal digits
+/// (at most 2^56 - 1) are all rejected.
+export fn http_body(s: &Bytes, first: u64) -> Body
+  ensures result is Body::Bad ==> result.Bad <= blen(s)
+{
+  let n = blen(s);
+  if first > n {
+    return Body::Bad(n);
+  }
+  let mut at = first;
+  let mut have_len = false;
+  let mut len: u64 = 0;
+  let mut chunked = false;
+  while at < n
+    invariant first <= at && at <= n
+  {
+    match http_field(s, at) {
+      Next::Partial => { return Body::Bad(n); }
+      Next::Bad(x) => { return Body::Bad(x); }
+      Next::End(x) => {
+        if chunked && have_len {
+          return Body::Bad(first);
+        }
+        if chunked { return Body::Chunked; }
+        if have_len { return Body::Length(len); }
+        return Body::None;
+      }
+      Next::Ok(f) => {
+        if http_is_content_length(s, at, f.name_end) {
+          if have_len || f.value == f.value_end {
+            return Body::Bad(at);
+          }
+          let mut v: u64 = 0;
+          let mut k = f.value;
+          while k < f.value_end
+            invariant f.value <= k && k <= f.value_end && f.value_end <= n && v < 0x0100000000000000
+          {
+            let c = bget(s, k);
+            if c < 48 || c > 57 { return Body::Bad(k); }
+            v = v * 10 + (cast[u64](c) - 48);
+            if v >= 0x0100000000000000 { return Body::Bad(k); }
+            k = k + 1;
+          }
+          have_len = true;
+          len = v;
+        }
+        if http_is_transfer_encoding(s, at, f.name_end) {
+          if chunked || !http_is_chunked(s, f.value, f.value_end) {
+            return Body::Bad(at);
+          }
+          chunked = true;
+        }
+        at = f.next;
+      }
+    }
+  }
+  return Body::Bad(n);
+}

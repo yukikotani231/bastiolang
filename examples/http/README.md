@@ -8,7 +8,7 @@ request be read two ways by two servers (request smuggling).
 
 | File | What it is |
 | --- | --- |
-| `http.bastio` | The library: `export fn http_parse_head`, `http_parse_response`, `http_field` and `http_chunk`. Proved |
+| `http.bastio` | The library: `export fn http_parse_head`, `http_parse_response`, `http_field`, `http_chunk` and `http_body`. Proved |
 | `test.c` | The C harness: vectors, every prefix of a well-formed head, a differential fuzz, for requests and for responses, against an independent state-machine parser |
 | `run.sh` | Generates `http.c` and `http.h`, then builds and runs the harness under AddressSanitizer + UBSan |
 
@@ -24,7 +24,7 @@ if (h.tag == bst_e_Head_Ok) {
 }
 ```
 
-`http_parse_response` does the same for a response head (`bst_e_RespHead`: version, the status code 100 to 599, the reason phrase, the fields). `http_chunk` reads one chunk of a chunked body at an offset (the size in hexadecimal up to 2^56 - 1, extensions skipped, the data span, or the last chunk with its trailer fields). The parser allocates nothing; it returns offsets into `buf`.
+`http_parse_response` does the same for a response head (`bst_e_RespHead`: version, the status code 100 to 599, the reason phrase, the fields). `http_chunk` reads one chunk of a chunked body at an offset (the size in hexadecimal up to 2^56 - 1, extensions skipped, the data span, or the last chunk with its trailer fields). `http_body` decides from the header fields how the body is delimited (none, `Content-Length: n`, or chunked) with the strict rules that stop request smuggling: a repeated or conflicting `Content-Length` or `Transfer-Encoding`, both together, any coding but a lone `chunked`, and a length that is not plain digits are all rejected. The parser allocates nothing; it returns offsets into `buf`.
 
 ## What is proved
 

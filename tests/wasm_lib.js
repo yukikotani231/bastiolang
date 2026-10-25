@@ -110,5 +110,11 @@ async function load(path) {
   assert.strictEqual(H.word(hres, 0), 1n);                             // Chunk::Last
   assert.strictEqual(H.word(hres, 1), BigInt(chunks.length));
 
+  const framed = Buffer.from('POST / HTTP/1.1\r\nContent-Length: 11\r\n\r\n');
+  const [fp, fl] = H.put(framed);
+  assert.deepStrictEqual(H.e.http_body(fp, fl, 17n), [1n, 11n]);       // Body::Length(11)
+  const [xp, xl] = H.put(Buffer.from('POST / HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n'));
+  assert.strictEqual(H.e.http_body(xp, xl, 17n)[0], 3n);              // Body::Bad: both at once
+
   console.log('wasm libraries: lines, base64, utf8 and http pass from JavaScript');
 })().catch((e) => { console.error(e); process.exit(1); });
