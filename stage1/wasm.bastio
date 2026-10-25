@@ -1,0 +1,1215 @@
+// WebAssembly backend: `bastioc1 --arch wasm32` writes a wasm module from the
+// IR, the way `irarm64.bastio` writes AArch64 assembly (ROADMAP, "Beyond
+// systems programming").
+//
+// The module (hosted target):
+//   * every IR register is an `i64` local, every word an `i64`; an address is
+//     a 32-bit offset into the one linear memory, held zero-extended in a word;
+//   * control flow: the instructions between two labels form a segment. A
+//     function with labels is one `loop` around nested `block`s with a
+//     `br_table` over the segment number, so any jump is "set pc, branch to
+//     the loop";
+//   * memory: the shadow stack (frames of `IR_SLOT`s) grows down from 1 MiB,
+//     the string literals sit above it, the heap above them is a bump
+//     allocator (`free` gives nothing back yet, so fresh memory is always
+//     zero, which `alloc` promises);
+//   * imports: `bastio.print(i64)` (a decimal line) and `bastio.putc(i64)`;
+//   * exports: `memory`, `bst_alloc(n)`, `main` (when the program has one;
+//     its result is the exit code) and every `export fn` under its name, with
+//     the internal word convention (a `Bytes` is its address, then its length).
+//
+// The runtime (the allocator, the growth of a `Vec`) is a few hand-written
+// functions below: the wasm counterpart of the trusted runtime of the other
+// backends, and the only unchecked code in the module.
+
+const WA_STACK_TOP: u64 = 1048576;
+const WA_FN_ALLOC: u64 = 2;
+const WA_FN_GROW: u64 = 3;
+const WA_FN_RESERVE: u64 = 4;
+const WA_FN_FREE: u64 = 6;
+const WA_FN_BASE: u64 = 7;
+
+// ---- Bytes ----
+
+fn wa_b(o: &mut Vec[u64], b: u64) {
+  vec_push(&mut o, b);
+}
+
+/// Unsigned LEB128.
+fn wa_u(o: &mut Vec[u64], v: u64) {
+  let mut x = v;
+  while x >= 128 {
+    vec_push(&mut o, x % 128 + 128);
+    x = x / 128;
+  }
+  vec_push(&mut o, x);
+}
+
+/// Signed LEB128 of the 64-bit two's-complement word `v`.
+fn wa_s(o: &mut Vec[u64], v: u64) {
+  if v < 9223372036854775808 {
+    let mut x = v;
+    let mut going = true;
+    while going {
+      let b = x % 128;
+      x = x / 128;
+      if x == 0 && b < 64 {
+        vec_push(&mut o, b);
+        going = false;
+      } else {
+        vec_push(&mut o, b + 128);
+      }
+    }
+  } else {
+    // -n: encode n - 1 with every bit flipped.
+    let mut x = wrap_sub(wrap_sub(0, v), 1);
+    let mut going = true;
+    while going {
+      let b = 127 - x % 128;
+      x = x / 128;
+      if x == 0 && b >= 64 {
+        vec_push(&mut o, b);
+        going = false;
+      } else {
+        vec_push(&mut o, b + 128);
+      }
+    }
+  }
+}
+
+/// A name: its length, then its bytes.
+fn wa_name(o: &mut Vec[u64], s: Str) {
+  wa_u(&mut o, slen(s));
+  w_s(&mut o, s);
+}
+
+/// A section: its id, its size, then its contents.
+fn wa_section(o: &mut Vec[u64], id: u64, body: &Vec[u64]) {
+  wa_b(&mut o, id);
+  wa_u(&mut o, vec_len(body));
+  w_append(&mut o, body);
+}
+
+// ---- Instructions ----
+
+fn wa_i64(o: &mut Vec[u64], v: u64) {
+  wa_b(&mut o, 66);
+  wa_s(&mut o, v);
+}
+
+fn wa_i32(o: &mut Vec[u64], v: u64) {
+  wa_b(&mut o, 65);
+  wa_s(&mut o, v);
+}
+
+fn wa_get(o: &mut Vec[u64], i: u64) {
+  wa_b(&mut o, 32);
+  wa_u(&mut o, i);
+}
+
+fn wa_set(o: &mut Vec[u64], i: u64) {
+  wa_b(&mut o, 33);
+  wa_u(&mut o, i);
+}
+
+fn wa_call(o: &mut Vec[u64], i: u64) {
+  wa_b(&mut o, 16);
+  wa_u(&mut o, i);
+}
+
+/// A load or store: opcode, alignment (log2), offset.
+fn wa_mem(o: &mut Vec[u64], op: u64, al: u64, off: u64) {
+  wa_b(&mut o, op);
+  wa_u(&mut o, al);
+  wa_u(&mut o, off);
+}
+
+/// The address in local `i` as an `i32`.
+fn wa_addr_of(o: &mut Vec[u64], i: u64) {
+  wa_get(&mut o, i);
+  wa_b(&mut o, 167);                    // i32.wrap_i64
+}
+
+/// `return 0` when the allocator was asked not to trap (parameter 2), else trap.
+fn wa_fail(o: &mut Vec[u64]) {
+  wa_get(&mut o, 2);
+  wa_i64(&mut o, 0);
+  wa_b(&mut o, 82);                     // i64.ne
+  wa_b(&mut o, 4);                      // if
+  wa_b(&mut o, 64);
+  wa_i64(&mut o, 0);
+  wa_b(&mut o, 15);                     // return
+  wa_b(&mut o, 11);                     // end
+  wa_b(&mut o, 0);                      // unreachable
+}
+
+/// `if local[i] >= 2^32 { fail }`
+fn wa_big(o: &mut Vec[u64], i: u64) {
+  wa_get(&mut o, i);
+  wa_i64(&mut o, 4294967296);
+  wa_b(&mut o, 90);                     // i64.ge_u
+  wa_b(&mut o, 4);
+  wa_b(&mut o, 64);
+  wa_fail(&mut o);
+  wa_b(&mut o, 11);
+}
+
+/// The address of the head of the free list of class `cl` (local): 16 + 8 * cl.
+fn wa_head(o: &mut Vec[u64], cl: u64) {
+  wa_get(&mut o, cl);
+  wa_i64(&mut o, 8);
+  wa_b(&mut o, 126);
+  wa_i64(&mut o, 16);
+  wa_b(&mut o, 124);
+  wa_b(&mut o, 167);
+}
+
+/// alloc(count, size, try) -> address: `count * size` zeroed bytes behind a
+/// header word that holds the block's class (blocks are powers of two from
+/// 16 bytes; a freed block waits on the list of its class, whose heads are
+/// the words from address 16). A block that is not on a list comes from the
+/// bump pointer (global 1), and the memory grows when it runs out. Past 4
+/// GiB it traps, or returns 0 when `try` is nonzero.
+fn wa_rt_alloc(o: &mut Vec[u64]) {
+  wa_u(&mut o, 1);
+  wa_u(&mut o, 4);
+  wa_b(&mut o, 126);                    // 4 x i64: p, n, class, end
+  wa_big(&mut o, 0);
+  wa_get(&mut o, 0);
+  wa_get(&mut o, 1);
+  wa_b(&mut o, 126);
+  wa_i64(&mut o, 8);
+  wa_b(&mut o, 124);
+  wa_set(&mut o, 4);
+  wa_get(&mut o, 4);
+  wa_i64(&mut o, 16);
+  wa_b(&mut o, 84);                     // i64.lt_u
+  wa_b(&mut o, 4);
+  wa_b(&mut o, 64);
+  wa_i64(&mut o, 16);
+  wa_set(&mut o, 4);
+  wa_b(&mut o, 11);
+  wa_i64(&mut o, 64);                   // class = 64 - clz(n - 1)
+  wa_get(&mut o, 4);
+  wa_i64(&mut o, 1);
+  wa_b(&mut o, 125);
+  wa_b(&mut o, 121);                    // i64.clz
+  wa_b(&mut o, 125);
+  wa_set(&mut o, 5);
+  wa_get(&mut o, 5);
+  wa_i64(&mut o, 32);
+  wa_b(&mut o, 86);                     // i64.gt_u
+  wa_b(&mut o, 4);
+  wa_b(&mut o, 64);
+  wa_fail(&mut o);
+  wa_b(&mut o, 11);
+  // A freed block of the class: unlink it and clear it.
+  wa_head(&mut o, 5);
+  wa_mem(&mut o, 41, 3, 0);
+  wa_set(&mut o, 3);
+  wa_get(&mut o, 3);
+  wa_i64(&mut o, 0);
+  wa_b(&mut o, 82);
+  wa_b(&mut o, 4);
+  wa_b(&mut o, 64);
+  wa_head(&mut o, 5);
+  wa_addr_of(&mut o, 3);
+  wa_mem(&mut o, 41, 3, 0);
+  wa_mem(&mut o, 55, 3, 0);
+  wa_addr_of(&mut o, 3);
+  wa_i32(&mut o, 0);
+  wa_i64(&mut o, 1);
+  wa_get(&mut o, 5);
+  wa_b(&mut o, 134);                    // i64.shl
+  wa_i64(&mut o, 8);
+  wa_b(&mut o, 125);
+  wa_b(&mut o, 167);
+  wa_b(&mut o, 252);                    // memory.fill
+  wa_u(&mut o, 11);
+  wa_b(&mut o, 0);
+  wa_get(&mut o, 3);
+  wa_b(&mut o, 15);
+  wa_b(&mut o, 11);
+  // A fresh block: the end of it, growing the memory when it passes its end.
+  wa_b(&mut o, 35);
+  wa_u(&mut o, 1);
+  wa_i64(&mut o, 1);
+  wa_get(&mut o, 5);
+  wa_b(&mut o, 134);
+  wa_b(&mut o, 124);
+  wa_set(&mut o, 6);
+  wa_big(&mut o, 6);
+  wa_get(&mut o, 6);
+  wa_b(&mut o, 63);                     // memory.size
+  wa_b(&mut o, 0);
+  wa_b(&mut o, 173);                    // i64.extend_i32_u
+  wa_i64(&mut o, 65536);
+  wa_b(&mut o, 126);
+  wa_b(&mut o, 86);                     // i64.gt_u
+  wa_b(&mut o, 4);
+  wa_b(&mut o, 64);
+  wa_get(&mut o, 6);
+  wa_b(&mut o, 63);
+  wa_b(&mut o, 0);
+  wa_b(&mut o, 173);
+  wa_i64(&mut o, 65536);
+  wa_b(&mut o, 126);
+  wa_b(&mut o, 125);                    // i64.sub
+  wa_i64(&mut o, 65535);
+  wa_b(&mut o, 124);
+  wa_i64(&mut o, 16);
+  wa_b(&mut o, 136);                    // i64.shr_u
+  wa_b(&mut o, 167);
+  wa_b(&mut o, 64);                     // memory.grow
+  wa_b(&mut o, 0);
+  wa_i32(&mut o, 18446744073709551615);
+  wa_b(&mut o, 70);                     // i32.eq
+  wa_b(&mut o, 4);
+  wa_b(&mut o, 64);
+  wa_fail(&mut o);
+  wa_b(&mut o, 11);
+  wa_b(&mut o, 11);
+  wa_b(&mut o, 35);                     // the header, at the old bump pointer
+  wa_u(&mut o, 1);
+  wa_b(&mut o, 167);
+  wa_get(&mut o, 5);
+  wa_mem(&mut o, 55, 3, 0);
+  wa_b(&mut o, 35);
+  wa_u(&mut o, 1);
+  wa_i64(&mut o, 8);
+  wa_b(&mut o, 124);
+  wa_set(&mut o, 3);
+  wa_get(&mut o, 6);
+  wa_b(&mut o, 36);                     // global.set 1
+  wa_u(&mut o, 1);
+  wa_get(&mut o, 3);
+  wa_b(&mut o, 11);
+}
+
+/// free(address): the block goes on the list of its class.
+fn wa_rt_free(o: &mut Vec[u64]) {
+  wa_u(&mut o, 1);
+  wa_u(&mut o, 1);
+  wa_b(&mut o, 126);
+  wa_get(&mut o, 0);
+  wa_b(&mut o, 80);
+  wa_b(&mut o, 4);
+  wa_b(&mut o, 64);
+  wa_b(&mut o, 15);
+  wa_b(&mut o, 11);
+  wa_get(&mut o, 0);
+  wa_i64(&mut o, 8);
+  wa_b(&mut o, 125);
+  wa_b(&mut o, 167);
+  wa_mem(&mut o, 41, 3, 0);
+  wa_set(&mut o, 1);
+  wa_addr_of(&mut o, 0);
+  wa_head(&mut o, 1);
+  wa_mem(&mut o, 41, 3, 0);
+  wa_mem(&mut o, 55, 3, 0);
+  wa_head(&mut o, 1);
+  wa_get(&mut o, 0);
+  wa_mem(&mut o, 55, 3, 0);
+  wa_b(&mut o, 11);
+}
+
+/// Moves the data of the Vec header at local 0 to local `nd`, copying `len *
+/// size` (local `szl`) bytes, sets its capacity to local `cap`, and frees
+/// the old data (kept in local `old`).
+fn wa_rt_move(o: &mut Vec[u64], nd: u64, cap: u64, szl: u64, od: u64) {
+  wa_addr_of(&mut o, 0);
+  wa_mem(&mut o, 41, 3, 16);
+  wa_set(&mut o, od);
+  wa_addr_of(&mut o, nd);
+  wa_addr_of(&mut o, od);
+  wa_addr_of(&mut o, 0);
+  wa_mem(&mut o, 41, 3, 0);             // the length
+  wa_get(&mut o, szl);
+  wa_b(&mut o, 126);
+  wa_b(&mut o, 167);
+  wa_b(&mut o, 252);                    // memory.copy
+  wa_u(&mut o, 10);
+  wa_b(&mut o, 0);
+  wa_b(&mut o, 0);
+  wa_addr_of(&mut o, 0);
+  wa_get(&mut o, nd);
+  wa_mem(&mut o, 55, 3, 16);            // i64.store
+  wa_addr_of(&mut o, 0);
+  wa_get(&mut o, cap);
+  wa_mem(&mut o, 55, 3, 8);
+  wa_get(&mut o, od);
+  wa_call(&mut o, WA_FN_FREE);
+}
+
+/// vec_grow(header, size): the capacity doubles (4 when empty).
+fn wa_rt_grow(o: &mut Vec[u64]) {
+  wa_u(&mut o, 1);
+  wa_u(&mut o, 3);
+  wa_b(&mut o, 126);                    // cap, new data
+  wa_addr_of(&mut o, 0);
+  wa_mem(&mut o, 41, 3, 8);
+  wa_i64(&mut o, 2);
+  wa_b(&mut o, 126);
+  wa_set(&mut o, 2);
+  wa_get(&mut o, 2);
+  wa_b(&mut o, 80);
+  wa_b(&mut o, 4);
+  wa_b(&mut o, 64);
+  wa_i64(&mut o, 4);
+  wa_set(&mut o, 2);
+  wa_b(&mut o, 11);
+  wa_get(&mut o, 2);
+  wa_get(&mut o, 1);
+  wa_i64(&mut o, 0);
+  wa_call(&mut o, WA_FN_ALLOC);
+  wa_set(&mut o, 3);
+  wa_rt_move(&mut o, 3, 2, 1, 4);
+  wa_b(&mut o, 11);
+}
+
+/// vec_try_reserve(header, k, size) -> 1, or 0 and unchanged: room for `k`
+/// more elements.
+fn wa_rt_reserve(o: &mut Vec[u64]) {
+  wa_u(&mut o, 1);
+  wa_u(&mut o, 6);
+  wa_b(&mut o, 126);                    // len, cap, need, new cap, new data
+  wa_addr_of(&mut o, 0);
+  wa_mem(&mut o, 41, 3, 0);
+  wa_set(&mut o, 3);
+  wa_addr_of(&mut o, 0);
+  wa_mem(&mut o, 41, 3, 8);
+  wa_set(&mut o, 4);
+  wa_get(&mut o, 4);
+  wa_get(&mut o, 3);
+  wa_b(&mut o, 125);
+  wa_get(&mut o, 1);
+  wa_b(&mut o, 90);                     // cap - len >= k: nothing to do
+  wa_b(&mut o, 4);
+  wa_b(&mut o, 64);
+  wa_i64(&mut o, 1);
+  wa_b(&mut o, 15);
+  wa_b(&mut o, 11);
+  wa_get(&mut o, 3);
+  wa_get(&mut o, 1);
+  wa_b(&mut o, 124);
+  wa_set(&mut o, 5);
+  wa_get(&mut o, 5);
+  wa_get(&mut o, 3);
+  wa_b(&mut o, 84);                     // need < len: the sum wrapped
+  wa_b(&mut o, 4);
+  wa_b(&mut o, 64);
+  wa_i64(&mut o, 0);
+  wa_b(&mut o, 15);
+  wa_b(&mut o, 11);
+  wa_get(&mut o, 4);
+  wa_i64(&mut o, 2);
+  wa_b(&mut o, 126);
+  wa_set(&mut o, 6);
+  wa_get(&mut o, 6);
+  wa_get(&mut o, 5);
+  wa_b(&mut o, 84);
+  wa_b(&mut o, 4);
+  wa_b(&mut o, 64);
+  wa_get(&mut o, 5);
+  wa_set(&mut o, 6);
+  wa_b(&mut o, 11);
+  wa_get(&mut o, 6);
+  wa_get(&mut o, 2);
+  wa_i64(&mut o, 1);
+  wa_call(&mut o, WA_FN_ALLOC);
+  wa_set(&mut o, 7);
+  wa_get(&mut o, 7);
+  wa_b(&mut o, 80);
+  wa_b(&mut o, 4);
+  wa_b(&mut o, 64);
+  wa_i64(&mut o, 0);
+  wa_b(&mut o, 15);
+  wa_b(&mut o, 11);
+  wa_rt_move(&mut o, 7, 6, 2, 8);
+  wa_i64(&mut o, 1);
+  wa_b(&mut o, 11);
+}
+
+// ---- Types ----
+
+/// The index of the function type with `np` i64 parameters and `nr` i64
+/// results, added when it is new.
+fn wa_type(types: &mut Vec[u64], np: u64, nr: u64) -> u64 {
+  let key = wrap_add(wrap_mul(np, 4), nr);
+  let mut k = 0;
+  while k < vec_len(types) {
+    if u_at(types, k) == key {
+      return k;
+    }
+    k = k + 1;
+  }
+  vec_push(&mut types, key);
+  return k;
+}
+
+/// The words of a result type; 3 for one the backend does not carry.
+fn wa_ret_words(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> u64 {
+  let rt = cg_ret_ty(&mut m, p, x);
+  return x86_words(&mut g, c, m, p, rt);
+}
+
+/// The index of function instance `x` in `m.fns`.
+fn wa_index(m: &Mono, x: u64) -> u64 {
+  let mut k = 0;
+  while k < vec_len(m.fns) && u_at(m.fns, k) != x {
+    k = k + 1;
+  }
+  return k;
+}
+
+// ---- Functions ----
+
+/// Wraps the word on the stack to the integer type `t`, as `a64_norm` does.
+fn wa_norm(o: &mut Vec[u64], m: &Mono, t: u64) {
+  let k = kind_t(m, t);
+  if k == TY_U8 {
+    wa_i64(&mut o, 255);
+    wa_b(&mut o, 131);
+  } else if k == TY_U16 {
+    wa_i64(&mut o, 65535);
+    wa_b(&mut o, 131);
+  } else if k == TY_U32 {
+    wa_i64(&mut o, 4294967295);
+    wa_b(&mut o, 131);
+  } else if k == TY_I8 {
+    wa_b(&mut o, 194);
+  } else if k == TY_I16 {
+    wa_b(&mut o, 195);
+  } else if k == TY_I32 {
+    wa_b(&mut o, 196);
+  }
+}
+
+/// The opcode of the binary operation `op` on two words, or 0.
+fn wa_binop(op: u64) -> u64 {
+  if op == IR_ADD { return 124; }
+  if op == IR_SUB { return 125; }
+  if op == IR_MUL { return 126; }
+  if op == IR_SDIV { return 127; }
+  if op == IR_DIV { return 128; }
+  if op == IR_SREM { return 129; }
+  if op == IR_REM { return 130; }
+  if op == IR_AND { return 131; }
+  if op == IR_OR { return 132; }
+  if op == IR_XOR { return 133; }
+  if op == IR_SHL { return 134; }
+  if op == IR_SAR { return 135; }
+  if op == IR_SHR { return 136; }
+  return 0;
+}
+
+/// The opcode of the comparison `op`.
+fn wa_cmpop(op: u64) -> u64 {
+  if op == IR_EQ { return 81; }
+  if op == IR_NE { return 82; }
+  if op == IR_SLT { return 83; }
+  if op == IR_LT { return 84; }
+  if op == IR_SGT { return 85; }
+  if op == IR_GT { return 86; }
+  if op == IR_SLE { return 87; }
+  if op == IR_LE { return 88; }
+  if op == IR_SGE { return 89; }
+  return 90;
+}
+
+fn wa_ok_op(q: IrIns) -> bool {
+  let op = q.op;
+  if op == IR_CONST || op == IR_MOV || wa_binop(op) != 0 || ix_is_cmp(op) || op == IR_NOT || op == IR_NEG || op == IR_WRAP {
+    return true;
+  }
+  if op == IR_LABEL || op == IR_JMP || op == IR_BR || op == IR_UNREACH || op == IR_CALL {
+    return true;
+  }
+  if op == IR_RET {
+    return q.c == 0;
+  }
+  if op == IR_LOAD || op == IR_STORE || op == IR_ALLOC || op == IR_FREE || op == IR_PRINT || op == IR_PUTC {
+    return true;
+  }
+  if op == IR_SLOT || op == IR_STRLIT || op == IR_COPY || op == IR_FILL || op == IR_VGROW {
+    return true;
+  }
+  return op == IR_PCALL && q.c == 5;
+}
+
+/// A register's local: the parameters come first.
+fn wa_rg(o: &mut Vec[u64], np: u64, r: u64) {
+  wa_get(&mut o, wrap_add(np, r));
+}
+
+/// Stores the word on the stack to register `d` (dropped when there is none).
+fn wa_rs(o: &mut Vec[u64], np: u64, d: u64) {
+  if d == IR_NONE {
+    wa_b(&mut o, 26);
+  } else {
+    wa_set(&mut o, wrap_add(np, d));
+  }
+}
+
+/// The 32-bit address of `a[b]` for elements of `c` bytes.
+fn wa_elem(o: &mut Vec[u64], np: u64, a: u64, b: u64, c: u64) {
+  wa_rg(&mut o, np, a);
+  wa_rg(&mut o, np, b);
+  wa_i64(&mut o, c);
+  wa_b(&mut o, 126);
+  wa_b(&mut o, 124);
+  wa_b(&mut o, 167);
+}
+
+/// `pc = label's segment; br loop`, from segment `cs` of `nseg`.
+fn wa_jump(o: &mut Vec[u64], seg: &Vec[u64], pcl: u64, nseg: u64, cs: u64, lab: u64) {
+  wa_i32(&mut o, u_at(seg, lab));
+  wa_set(&mut o, pcl);
+  wa_b(&mut o, 12);
+  wa_u(&mut o, wrap_sub(wrap_sub(nseg, 1), cs));
+}
+
+/// One instruction other than control flow.
+fn wa_ins(o: &mut Vec[u64], f: &IrFn, g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, np: u64, fbl: u64, soff: u64, q: IrIns) {
+  let op = q.op;
+  if op == IR_CONST {
+    wa_i64(&mut o, q.a);
+    wa_rs(&mut o, np, q.d);
+  } else if op == IR_MOV {
+    wa_rg(&mut o, np, q.a);
+    wa_rs(&mut o, np, q.d);
+  } else if wa_binop(op) != 0 {
+    wa_rg(&mut o, np, q.a);
+    wa_rg(&mut o, np, q.b);
+    wa_b(&mut o, wa_binop(op));
+    if q.c == 1 && (op == IR_ADD || op == IR_SUB || op == IR_MUL) && q.ty != 0 {
+      wa_norm(&mut o, m, q.ty);
+    }
+    wa_rs(&mut o, np, q.d);
+  } else if ix_is_cmp(op) {
+    wa_rg(&mut o, np, q.a);
+    wa_rg(&mut o, np, q.b);
+    wa_b(&mut o, wa_cmpop(op));
+    wa_b(&mut o, 173);
+    wa_rs(&mut o, np, q.d);
+  } else if op == IR_NOT {
+    wa_rg(&mut o, np, q.a);
+    if q.ty != 0 {
+      wa_i64(&mut o, 18446744073709551615);
+      wa_b(&mut o, 133);
+      wa_norm(&mut o, m, q.ty);
+    } else {
+      wa_i64(&mut o, 1);
+      wa_b(&mut o, 133);
+    }
+    wa_rs(&mut o, np, q.d);
+  } else if op == IR_NEG {
+    wa_i64(&mut o, 0);
+    wa_rg(&mut o, np, q.a);
+    wa_b(&mut o, 125);
+    wa_rs(&mut o, np, q.d);
+  } else if op == IR_WRAP {
+    wa_rg(&mut o, np, q.a);
+    wa_norm(&mut o, m, q.ty);
+    wa_rs(&mut o, np, q.d);
+  } else if op == IR_LOAD {
+    wa_elem(&mut o, np, q.a, q.b, q.c);
+    if q.c == 1 {
+      wa_mem(&mut o, 49, 0, 0);         // i64.load8_u
+    } else if q.c == 2 {
+      wa_mem(&mut o, 51, 1, 0);
+    } else if q.c == 4 {
+      wa_mem(&mut o, 53, 2, 0);
+    } else {
+      wa_mem(&mut o, 41, 3, 0);
+    }
+    wa_rs(&mut o, np, q.d);
+  } else if op == IR_STORE {
+    wa_elem(&mut o, np, q.a, q.b, q.c);
+    wa_rg(&mut o, np, q.d);
+    if q.c == 1 {
+      wa_mem(&mut o, 60, 0, 0);         // i64.store8
+    } else if q.c == 2 {
+      wa_mem(&mut o, 61, 1, 0);
+    } else if q.c == 4 {
+      wa_mem(&mut o, 62, 2, 0);
+    } else {
+      wa_mem(&mut o, 55, 3, 0);
+    }
+  } else if op == IR_FILL {
+    wa_addr_of(&mut o, wrap_add(np, q.a));
+    wa_addr_of(&mut o, wrap_add(np, q.b));
+    wa_addr_of(&mut o, wrap_add(np, q.c));
+    wa_b(&mut o, 252);                  // memory.fill
+    wa_u(&mut o, 11);
+    wa_b(&mut o, 0);
+  } else if op == IR_COPY {
+    wa_addr_of(&mut o, wrap_add(np, q.a));
+    wa_addr_of(&mut o, wrap_add(np, q.b));
+    wa_addr_of(&mut o, wrap_add(np, q.c));
+    wa_b(&mut o, 252);                  // memory.copy
+    wa_u(&mut o, 10);
+    wa_b(&mut o, 0);
+    wa_b(&mut o, 0);
+  } else if op == IR_ALLOC {
+    wa_rg(&mut o, np, q.a);
+    wa_i64(&mut o, q.c);
+    if q.ty == 1 {
+      wa_i64(&mut o, 1);
+    } else {
+      wa_i64(&mut o, 0);
+    }
+    wa_call(&mut o, WA_FN_ALLOC);
+    wa_rs(&mut o, np, q.d);
+  } else if op == IR_FREE {
+    wa_rg(&mut o, np, q.a);
+    wa_call(&mut o, WA_FN_FREE);
+  } else if op == IR_PRINT {
+    wa_rg(&mut o, np, q.a);
+    wa_call(&mut o, 0);
+  } else if op == IR_PUTC {
+    wa_rg(&mut o, np, q.a);
+    wa_call(&mut o, 1);
+  } else if op == IR_VGROW {
+    wa_rg(&mut o, np, q.a);
+    wa_i64(&mut o, wrap_mul(8, q.c));
+    wa_call(&mut o, WA_FN_GROW);
+  } else if op == IR_PCALL {
+    // Room for b more elements of ty words in the Vec at a.
+    wa_rg(&mut o, np, q.a);
+    wa_rg(&mut o, np, q.b);
+    wa_i64(&mut o, wrap_mul(8, q.ty));
+    wa_call(&mut o, WA_FN_RESERVE);
+    wa_rs(&mut o, np, q.d);
+  } else if op == IR_SLOT {
+    wa_get(&mut o, fbl);
+    wa_i64(&mut o, soff);
+    wa_b(&mut o, 124);
+    wa_rs(&mut o, np, q.d);
+  } else if op == IR_STRLIT {
+    let mut s = 0;
+    while s < vec_len(g.snode) && u_at(g.snode, s) != q.a {
+      s = s + 1;
+    }
+    if s == vec_len(g.snode) {
+      let b = x86_lit_bytes(p, q.a);
+      s = x86_add_string(&mut g, b);
+      vec_push(&mut g.snode, q.a);
+      vec_free(b);
+    }
+    wa_i64(&mut o, wrap_add(WA_STACK_TOP, u_at(g.sstart, s)));
+    wa_rs(&mut o, np, q.d);
+  }
+}
+
+/// A call: the argument words, then the result words into `d` and `ty`.
+fn wa_call_ins(o: &mut Vec[u64], f: &IrFn, g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, np: u64, q: IrIns) {
+  let mut j = 0;
+  while j < q.c {
+    wa_rg(&mut o, np, u_at(f.args, wrap_add(q.b, j)));
+    j = j + 1;
+  }
+  wa_call(&mut o, wrap_add(WA_FN_BASE, wa_index(m, q.a)));
+  let rw = wa_ret_words(&mut g, c, &mut m, p, q.a);
+  if rw == 2 {
+    if q.ty != IR_NONE && q.ty != 0 {
+      wa_rs(&mut o, np, q.ty);
+    } else {
+      wa_b(&mut o, 26);
+    }
+  }
+  if rw > 0 {
+    wa_rs(&mut o, np, q.d);
+  }
+}
+
+/// Writes function instance `x`: its type goes to `ftypes` (its parameter
+/// words to `fnp`), its body to `codes`. False, with the reason in `g`, when
+/// the IR does not cover it.
+fn wa_function(codes: &mut Vec[u64], types: &mut Vec[u64], ftypes: &mut Vec[u64], fnp: &mut Vec[u64], g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> bool {
+  let mut f = ir_lower(c, &mut m, p, x);
+  if !f.failed {
+    a64_passes(&mut f, c, &mut m, p);
+  }
+  let np = vec_len(f.params);
+  let rw = wa_ret_words(&mut g, c, &mut m, p, x);
+  let mut ok = !f.failed && rw <= 2;
+  let mut bad = 0;
+  let pos = ix_positions(&mut g, c, &mut m, p, x);
+  if vec_len(pos) != np {
+    ok = false;
+  }
+  vec_free(pos);
+  let mut k = 0;
+  while ok && k < vec_len(f.ins) {
+    let q = vec_get(f.ins, k);
+    if !wa_ok_op(q) {
+      ok = false;
+      bad = q.op;
+    } else if q.op == IR_CALL && (q.c > 4000 || !ix_call_ok(f, &mut g, c, &mut m, p, q)) {
+      ok = false;
+    }
+    k = k + 1;
+  }
+  if !ok {
+    x86_sym(&mut g, m, p, x);
+    if !g.failed {
+      g.failed = true;
+      w_s(&mut g.fmsg, "the WebAssembly backend does not cover `");
+      w_append(&mut g.fmsg, g.ln);
+      w_s(&mut g.fmsg, "` yet: ");
+      if f.failed {
+        w_append(&mut g.fmsg, f.why);
+      } else if bad != 0 {
+        w_s(&mut g.fmsg, "an operation outside the first subset (IR op ");
+        w_num(&mut g.fmsg, bad);
+        w_s(&mut g.fmsg, ")");
+      } else {
+        w_s(&mut g.fmsg, "a call or result it cannot carry");
+      }
+    }
+    while vec_len(g.ln) > 0 {
+      vec_pop(&mut g.ln);
+    }
+    ir_free(f);
+    return false;
+  }
+  vec_push(&mut ftypes, wa_type(&mut types, np, rw));
+  vec_push(&mut fnp, np);
+  // Segments: the instructions from one label to the next.
+  let mut seg = vec_new[u64]();
+  k = 0;
+  while k < f.nlabel {
+    vec_push(&mut seg, 0);
+    k = k + 1;
+  }
+  vec_push(&mut seg, 0);
+  let mut nseg = 1;
+  let mut slots = 0;
+  k = 0;
+  while k < vec_len(f.ins) {
+    let q = vec_get(f.ins, k);
+    if q.op == IR_LABEL && q.a < vec_len(seg) {
+      vec_set(&mut seg, q.a, nseg);
+      nseg = wrap_add(nseg, 1);
+    } else if q.op == IR_SLOT {
+      slots = wrap_add(slots, q.c);
+    }
+    k = k + 1;
+  }
+  let fbytes = wrap_mul(wrap_add(wrap_mul(8, slots), 15) / 16, 16);
+  let pcl = wrap_add(np, f.nreg);
+  let fbl = wrap_add(pcl, 1);
+  let mut o = vec_new[u64]();
+  // Locals: the registers, the segment number, the frame base.
+  wa_u(&mut o, 3);
+  wa_u(&mut o, f.nreg);
+  wa_b(&mut o, 126);
+  wa_u(&mut o, 1);
+  wa_b(&mut o, 127);
+  wa_u(&mut o, 1);
+  wa_b(&mut o, 126);
+  k = 0;
+  while k < np {
+    let r = vec_get(f.params, k);
+    if r < f.nreg {
+      wa_get(&mut o, k);
+      wa_set(&mut o, wrap_add(np, r));
+    }
+    k = k + 1;
+  }
+  if fbytes > 0 {
+    wa_b(&mut o, 35);                   // global.get 0: the stack pointer
+    wa_u(&mut o, 0);
+    wa_i64(&mut o, fbytes);
+    wa_b(&mut o, 125);
+    wa_b(&mut o, 34);                   // local.tee
+    wa_u(&mut o, fbl);
+    wa_b(&mut o, 36);
+    wa_u(&mut o, 0);
+  }
+  if nseg > 1 {
+    wa_b(&mut o, 3);                    // loop
+    wa_b(&mut o, 64);
+    let mut j = 0;
+    while j < nseg {
+      wa_b(&mut o, 2);                  // block
+      wa_b(&mut o, 64);
+      j = j + 1;
+    }
+    wa_get(&mut o, pcl);
+    wa_b(&mut o, 14);                   // br_table: segment s leaves block s
+    wa_u(&mut o, nseg);
+    j = 0;
+    while j < nseg {
+      wa_u(&mut o, j);
+      j = j + 1;
+    }
+    wa_u(&mut o, wrap_sub(nseg, 1));
+    wa_b(&mut o, 11);
+  }
+  let mut cs = 0;
+  let mut soff = 0;
+  let n = vec_len(f.ins);
+  k = 0;
+  while k < n {
+    let q = vec_get(f.ins, k);
+    let nq = ix_at(f, wrap_add(k, 1));
+    let mut next = IR_NONE;
+    if nq.op == IR_LABEL {
+      next = nq.a;
+    }
+    if q.op == IR_LABEL {
+      cs = wrap_add(cs, 1);
+      if cs < nseg {
+        wa_b(&mut o, 11);               // the end of block cs - 1: segment cs starts here
+      }
+    } else if q.op == IR_JMP {
+      if next != q.a {
+        wa_jump(&mut o, seg, pcl, nseg, cs, q.a);
+      }
+    } else if q.op == IR_BR {
+      wa_i32(&mut o, u_at(seg, q.b));
+      wa_i32(&mut o, u_at(seg, q.c));
+      wa_rg(&mut o, np, q.a);
+      wa_i64(&mut o, 0);
+      wa_b(&mut o, 82);                 // i64.ne
+      wa_b(&mut o, 27);                 // select
+      wa_set(&mut o, pcl);
+      wa_b(&mut o, 12);
+      wa_u(&mut o, wrap_sub(wrap_sub(nseg, 1), cs));
+    } else if q.op == IR_RET {
+      if q.a != IR_NONE {
+        wa_rg(&mut o, np, q.a);
+      }
+      if q.b != IR_NONE {
+        wa_rg(&mut o, np, q.b);
+      }
+      if fbytes > 0 {
+        wa_get(&mut o, fbl);
+        wa_i64(&mut o, fbytes);
+        wa_b(&mut o, 124);
+        wa_b(&mut o, 36);
+        wa_u(&mut o, 0);
+      }
+      wa_b(&mut o, 15);
+    } else if q.op == IR_UNREACH {
+      wa_b(&mut o, 0);
+    } else if q.op == IR_CALL {
+      wa_call_ins(&mut o, f, &mut g, c, &mut m, p, np, q);
+    } else {
+      wa_ins(&mut o, f, &mut g, c, &mut m, p, np, fbl, soff, q);
+      if q.op == IR_SLOT {
+        soff = wrap_add(soff, wrap_mul(8, q.c));
+      }
+    }
+    k = k + 1;
+  }
+  if nseg > 1 {
+    wa_b(&mut o, 11);                   // the loop
+  }
+  wa_b(&mut o, 0);                      // unreachable: control never falls off the end
+  wa_b(&mut o, 11);
+  wa_u(&mut codes, vec_len(o));
+  w_append(&mut codes, o);
+  vec_free(o);
+  vec_free(seg);
+  ir_free(f);
+  return true;
+}
+
+// ---- The module ----
+
+/// The wrapper that calls `main` with its capabilities: zero words, or the
+/// address of a zeroed cell when lent by `&mut`.
+fn wa_main(o: &mut Vec[u64], g: &mut X86, m: &mut Mono, p: &Parser, mx: u64, np: u64, k: u64) -> bool {
+  let xi = inst_at(m, mx);
+  let dn = node_at(p.nodes, xi.def);
+  wa_u(&mut o, 0);
+  let mut n = 0;
+  let mut q = dn.a;
+  while q != 0 && np > 0 {
+    let qn = node_at(p.nodes, q);
+    let pt = conv(&mut m, p, qn.a, mx, q);
+    if kind_t(m, base_t(m, pt)) == TY_POOL {
+      x86_fail(&mut g, "the WebAssembly backend does not support a `main` that takes a page pool");
+      return false;
+    }
+    if kind_t(m, pt) == TY_MUTREF {
+      wa_i64(&mut o, 1);
+      wa_i64(&mut o, 8);
+      wa_i64(&mut o, 0);
+      wa_call(&mut o, WA_FN_ALLOC);
+    } else {
+      wa_i64(&mut o, 0);
+    }
+    n = wrap_add(n, 1);
+    q = qn.next;
+  }
+  if n != np {
+    x86_fail(&mut g, "the WebAssembly backend does not support a `main` with these parameters");
+    return false;
+  }
+  wa_call(&mut o, wrap_add(WA_FN_BASE, k));
+  wa_b(&mut o, 11);
+  return true;
+}
+
+fn wa_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
+  let mut main_x = 0;
+  let mut main_k = 0;
+  let mut nexp = 0;
+  let mut k = 0;
+  while k < vec_len(m.fns) {
+    let x = u_at(m.fns, k);
+    let xi = inst_at(m, x);
+    if name_is(p, xi.def, "main") {
+      main_x = x;
+      main_k = k;
+    }
+    if exported_x(m, p, x) {
+      nexp = wrap_add(nexp, 1);
+    }
+    k = k + 1;
+  }
+  if g.target != TARGET_HOSTED || (main_x == 0 && nexp == 0) {
+    x86_fail(&mut g, "the WebAssembly backend builds hosted programs with a `main`, or libraries of `export fn`s");
+    return false;
+  }
+  let mut types = vec_new[u64]();
+  let mut ftypes = vec_new[u64]();
+  let mut fnp = vec_new[u64]();
+  let mut codes = vec_new[u64]();
+  // The imports and the runtime come first.
+  let t_print = wa_type(&mut types, 1, 0);
+  let t_alloc = wa_type(&mut types, 3, 1);
+  let t_grow = wa_type(&mut types, 2, 0);
+  let t_reserve = wa_type(&mut types, 3, 1);
+  let t_bst_alloc = wa_type(&mut types, 1, 1);
+  let mut rt = vec_new[u64]();
+  wa_rt_alloc(&mut rt);
+  wa_u(&mut codes, vec_len(rt));
+  w_append(&mut codes, rt);
+  while vec_len(rt) > 0 {
+    vec_pop(&mut rt);
+  }
+  wa_rt_grow(&mut rt);
+  wa_u(&mut codes, vec_len(rt));
+  w_append(&mut codes, rt);
+  while vec_len(rt) > 0 {
+    vec_pop(&mut rt);
+  }
+  wa_rt_reserve(&mut rt);
+  wa_u(&mut codes, vec_len(rt));
+  w_append(&mut codes, rt);
+  while vec_len(rt) > 0 {
+    vec_pop(&mut rt);
+  }
+  // bst_alloc(n): n zeroed bytes, for a caller outside.
+  wa_u(&mut rt, 0);
+  wa_get(&mut rt, 0);
+  wa_i64(&mut rt, 1);
+  wa_i64(&mut rt, 0);
+  wa_call(&mut rt, WA_FN_ALLOC);
+  wa_b(&mut rt, 11);
+  wa_u(&mut codes, vec_len(rt));
+  w_append(&mut codes, rt);
+  while vec_len(rt) > 0 {
+    vec_pop(&mut rt);
+  }
+  wa_rt_free(&mut rt);
+  wa_u(&mut codes, vec_len(rt));
+  w_append(&mut codes, rt);
+  vec_free(rt);
+  k = 0;
+  while k < vec_len(m.fns) {
+    if !wa_function(&mut codes, &mut types, &mut ftypes, &mut fnp, &mut g, c, &mut m, p, u_at(m.fns, k)) {
+      vec_free(types);
+      vec_free(ftypes);
+      vec_free(fnp);
+      vec_free(codes);
+      return false;
+    }
+    k = k + 1;
+  }
+  let mut mainw = vec_new[u64]();
+  let mut t_main = 0;
+  if main_x != 0 {
+    let rw = wa_ret_words(&mut g, c, &mut m, p, main_x);
+    t_main = wa_type(&mut types, 0, rw);
+    if !wa_main(&mut mainw, &mut g, &mut m, p, main_x, u_at(fnp, main_k), main_k) {
+      vec_free(types);
+      vec_free(ftypes);
+      vec_free(fnp);
+      vec_free(codes);
+      vec_free(mainw);
+      return false;
+    }
+    wa_u(&mut codes, vec_len(mainw));
+    w_append(&mut codes, mainw);
+  }
+  vec_free(mainw);
+  let mut ndef = wrap_add(5, vec_len(ftypes));
+  if main_x != 0 {
+    ndef = wrap_add(ndef, 1);
+  }
+  // The data: the string literals, then the heap. The stack is below them.
+  let dlen = vec_len(g.sdata);
+  let heap = wrap_mul(wrap_add(wrap_add(WA_STACK_TOP, dlen), 15) / 16, 16);
+  let pages = wrap_add(wrap_add(heap, 1048576), 65535) / 65536;
+  let mut o = vec_new[u64]();
+  wa_b(&mut o, 0);
+  w_s(&mut o, "asm");
+  wa_b(&mut o, 1);
+  wa_b(&mut o, 0);
+  wa_b(&mut o, 0);
+  wa_b(&mut o, 0);
+  let mut s = vec_new[u64]();
+  // types
+  wa_u(&mut s, vec_len(types));
+  k = 0;
+  while k < vec_len(types) {
+    let key = u_at(types, k);
+    wa_b(&mut s, 96);
+    wa_u(&mut s, key / 4);
+    let mut j = 0;
+    while j < key / 4 {
+      wa_b(&mut s, 126);
+      j = j + 1;
+    }
+    wa_u(&mut s, key % 4);
+    j = 0;
+    while j < key % 4 {
+      wa_b(&mut s, 126);
+      j = j + 1;
+    }
+    k = k + 1;
+  }
+  wa_section(&mut o, 1, s);
+  while vec_len(s) > 0 {
+    vec_pop(&mut s);
+  }
+  // imports: print and putc
+  wa_u(&mut s, 2);
+  wa_name(&mut s, "bastio");
+  wa_name(&mut s, "print");
+  wa_b(&mut s, 0);
+  wa_u(&mut s, t_print);
+  wa_name(&mut s, "bastio");
+  wa_name(&mut s, "putc");
+  wa_b(&mut s, 0);
+  wa_u(&mut s, t_print);
+  wa_section(&mut o, 2, s);
+  while vec_len(s) > 0 {
+    vec_pop(&mut s);
+  }
+  // functions
+  wa_u(&mut s, ndef);
+  wa_u(&mut s, t_alloc);
+  wa_u(&mut s, t_grow);
+  wa_u(&mut s, t_reserve);
+  wa_u(&mut s, t_bst_alloc);
+  wa_u(&mut s, t_print);
+  k = 0;
+  while k < vec_len(ftypes) {
+    wa_u(&mut s, u_at(ftypes, k));
+    k = k + 1;
+  }
+  if main_x != 0 {
+    wa_u(&mut s, t_main);
+  }
+  wa_section(&mut o, 3, s);
+  while vec_len(s) > 0 {
+    vec_pop(&mut s);
+  }
+  // memory
+  wa_u(&mut s, 1);
+  wa_b(&mut s, 0);
+  wa_u(&mut s, pages);
+  wa_section(&mut o, 5, s);
+  while vec_len(s) > 0 {
+    vec_pop(&mut s);
+  }
+  // globals: the stack pointer and the heap pointer
+  wa_u(&mut s, 2);
+  wa_b(&mut s, 126);
+  wa_b(&mut s, 1);
+  wa_i64(&mut s, WA_STACK_TOP);
+  wa_b(&mut s, 11);
+  wa_b(&mut s, 126);
+  wa_b(&mut s, 1);
+  wa_i64(&mut s, heap);
+  wa_b(&mut s, 11);
+  wa_section(&mut o, 6, s);
+  while vec_len(s) > 0 {
+    vec_pop(&mut s);
+  }
+  // exports
+  let mut ne = wrap_add(3, nexp);
+  if main_x != 0 {
+    ne = wrap_add(ne, 1);
+  }
+  wa_u(&mut s, ne);
+  wa_name(&mut s, "memory");
+  wa_b(&mut s, 2);
+  wa_u(&mut s, 0);
+  wa_name(&mut s, "bst_alloc");
+  wa_b(&mut s, 0);
+  wa_u(&mut s, 5);
+  wa_name(&mut s, "bst_free");
+  wa_b(&mut s, 0);
+  wa_u(&mut s, WA_FN_FREE);
+  k = 0;
+  while k < vec_len(m.fns) {
+    let x = u_at(m.fns, k);
+    if exported_x(m, p, x) {
+      let xi = inst_at(m, x);
+      let dn = node_at(p.nodes, xi.def);
+      let mut nm = vec_new[u64]();
+      rd_src(&mut nm, p, dn.s, dn.e);
+      wa_u(&mut s, vec_len(nm));
+      w_append(&mut s, nm);
+      vec_free(nm);
+      wa_b(&mut s, 0);
+      wa_u(&mut s, wrap_add(WA_FN_BASE, k));
+    }
+    k = k + 1;
+  }
+  if main_x != 0 {
+    wa_name(&mut s, "main");
+    wa_b(&mut s, 0);
+    wa_u(&mut s, wrap_add(WA_FN_BASE, vec_len(ftypes)));
+  }
+  wa_section(&mut o, 7, s);
+  while vec_len(s) > 0 {
+    vec_pop(&mut s);
+  }
+  // code
+  wa_u(&mut s, ndef);
+  w_append(&mut s, codes);
+  wa_section(&mut o, 10, s);
+  while vec_len(s) > 0 {
+    vec_pop(&mut s);
+  }
+  // data
+  if dlen > 0 {
+    wa_u(&mut s, 1);
+    wa_b(&mut s, 0);
+    wa_i32(&mut s, WA_STACK_TOP);
+    wa_b(&mut s, 11);
+    wa_u(&mut s, dlen);
+    w_append(&mut s, g.sdata);
+    wa_section(&mut o, 11, s);
+  }
+  vec_free(s);
+  vec_free(types);
+  vec_free(ftypes);
+  vec_free(fnp);
+  vec_free(codes);
+  while vec_len(g.out) > 0 {
+    vec_pop(&mut g.out);
+  }
+  w_append(&mut g.out, o);
+  vec_free(o);
+  return true;
+}

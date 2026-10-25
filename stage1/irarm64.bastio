@@ -1274,26 +1274,8 @@ fn a64_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, fr: A64F, g: &mut X86, m
   }
 }
 
-/// Writes function instance `x` from its IR, to `g.out`. False, with the
-/// reason in `g`, when the IR does not cover it.
-fn a64_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> bool {
-  let mut f = ir_lower(c, &mut m, p, x);
-  let xi = inst_at(m, x);
-  if f.failed {
-    x86_sym(&mut g, m, p, x);
-    if !g.failed {
-      g.failed = true;
-      w_s(&mut g.fmsg, "the AArch64 backend does not cover `");
-      w_append(&mut g.fmsg, g.ln);
-      w_s(&mut g.fmsg, "` yet: ");
-      w_append(&mut g.fmsg, f.why);
-    }
-    while vec_len(g.ln) > 0 {
-      vec_pop(&mut g.ln);
-    }
-    ir_free(f);
-    return false;
-  }
+/// The machine-independent IR passes, in the order the AArch64 emitter runs them.
+fn a64_passes(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser) {
   let looped = iropt_accrec(&mut f) > 0;
   iropt_inline(&mut f, c, &mut m, p, looped);
   vec_free(f.nz);
@@ -1406,6 +1388,29 @@ fn a64_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> b
   iropt_thread(&mut f);
   iropt_reach(&mut f);
   iropt_labels(&mut f);
+}
+
+/// Writes function instance `x` from its IR, to `g.out`. False, with the
+/// reason in `g`, when the IR does not cover it.
+fn a64_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> bool {
+  let mut f = ir_lower(c, &mut m, p, x);
+  let xi = inst_at(m, x);
+  if f.failed {
+    x86_sym(&mut g, m, p, x);
+    if !g.failed {
+      g.failed = true;
+      w_s(&mut g.fmsg, "the AArch64 backend does not cover `");
+      w_append(&mut g.fmsg, g.ln);
+      w_s(&mut g.fmsg, "` yet: ");
+      w_append(&mut g.fmsg, f.why);
+    }
+    while vec_len(g.ln) > 0 {
+      vec_pop(&mut g.ln);
+    }
+    ir_free(f);
+    return false;
+  }
+  a64_passes(&mut f, c, &mut m, p);
   let mut ok = vec_len(f.params) <= A64_MAX_ARGS;
   let mut why = 1;                          // 1: parameters, 2: instructions, 3: a call, 4: an operation
   let mut bad_op = 0;

@@ -47,6 +47,7 @@ import "header.bastio";
 import "x86.bastio";
 import "irx86.bastio";
 import "irarm64.bastio";
+import "wasm.bastio";
 import "winpe.bastio";
 import "elf.bastio";
 import "machold.bastio";
@@ -403,7 +404,7 @@ fn b1_tool(host: &Host, argv: Vec[Bytes], what: Str, out: &mut Vec[u64]) -> u64 
 /// `--backend native`, as stage0's x86::build: the assembly is written to
 /// `outp` (`--emit-asm`), or assembled and linked into the executable
 /// `outp`. Returns the exit status.
-fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, aarch64: bool, macos: bool, windows: bool, linkchoice: u64, ir: bool, emit_asm: bool, lib: bool, outp: &Bytes, has_out: bool, out: &mut Vec[u64]) -> u64 {
+fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, aarch64: bool, wasm: bool, macos: bool, windows: bool, linkchoice: u64, ir: bool, emit_asm: bool, lib: bool, outp: &Bytes, has_out: bool, out: &mut Vec[u64]) -> u64 {
   let mut g = x86_new();
   g.macos = macos;
   // A BastiOS user program or kernel: the assembly is the output (as the C
@@ -411,7 +412,9 @@ fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, aa
   g.target = target;
   let mut status = 0;
   let mut built = false;
-  if aarch64 {
+  if wasm {
+    built = wa_program(&mut g, c, &mut m, p);
+  } else if aarch64 {
     built = a64_program(&mut g, c, &mut m, p);
   } else if ir {
     built = x86_program_ir(&mut g, c, &mut m, p);
@@ -437,6 +440,20 @@ fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, aa
     }
     w_s(&mut out, "\n");
     status = 4;
+  } else if wasm {
+    // The module is the output: no assembler, no linker.
+    let mut path = b1_concat(outp, "");
+    if !has_out {
+      bfree(path);
+      path = bfrom("a.wasm");
+    }
+    if !b1_write(host, path, g.out) {
+      w_s(&mut out, "bastioc1: cannot write ");
+      b1_bytes(&mut out, path);
+      w_s(&mut out, "\n");
+      status = 2;
+    }
+    bfree(path);
   } else if lib && !emit_asm && target == TARGET_HOSTED && !windows && !macos && ((linkchoice == 1 || linkchoice == 3) || (linkchoice == 0 && ((!aarch64 && (b1_glibc(host, "/lib64/ld-linux-x86-64.so.2") || b1_glibc(host, "/lib/ld-musl-x86_64.so.1"))) || (aarch64 && b1_glibc(host, "/lib/ld-linux-aarch64.so.1"))))) {
     // A library is an object file for the C program that calls it, written
     // by elf.bastio: no `as`.
@@ -649,6 +666,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
   let mut dump_smt = false;
   let mut target = TARGET_HOSTED;
   let mut aarch64 = false;
+  let mut wasm = false;
   let mut macos = false;
   let mut windows = false;
   let mut linkchoice = 0;
@@ -730,12 +748,17 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
       let t = host_arg(host, i);
       if b1_is(t, "x86_64") {
         aarch64 = false;
+        wasm = false;
       } else if b1_is(t, "aarch64") {
         aarch64 = true;
+        wasm = false;
+      } else if b1_is(t, "wasm32") {
+        aarch64 = false;
+        wasm = true;
       } else {
         w_s(&mut out, "bastioc1: unknown architecture `");
         b1_bytes(&mut out, t);
-        w_s(&mut out, "` (expected `x86_64` or `aarch64`)\n");
+        w_s(&mut out, "` (expected `x86_64`, `aarch64` or `wasm32`)\n");
         status = 2;
       }
       bfree(t);
@@ -838,6 +861,14 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
   if status == 0 && !backend_set && !aarch64 && !emit_c && target == TARGET_HOSTED && b1_host_x86_64_elf(host) && b1_have_as(host) {
     native = true;
     native_ir = true;
+  }
+  if status == 0 && wasm {
+    native = true;
+    native_ir = true;
+    if macos || windows || target != TARGET_HOSTED {
+      w_s(&mut out, "bastioc1: --arch wasm32 builds hosted programs only\n");
+      status = 2;
+    }
   }
   if status == 0 && macos && !(native && (aarch64 || native_ir)) {
     w_s(&mut out, "bastioc1: --os macos needs --backend native (AArch64) or native-ir (x86-64)\n");
@@ -988,7 +1019,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
             status = 2;
           } else if native {
             b1_flush(host, &mut out);
-            status = b1_native(host, c, &mut m, p, target, aarch64, macos, windows, linkchoice, native_ir, emit_asm, !has_main, outp, has_out, &mut out);
+            status = b1_native(host, c, &mut m, p, target, aarch64, wasm, macos, windows, linkchoice, native_ir, emit_asm, !has_main, outp, has_out, &mut out);
           } else {
             let mut g = cg_new(target);
             g.arch = c.arch;
