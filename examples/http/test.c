@@ -1,0 +1,146 @@
+/* Tests the Bastio HTTP head parser through its generated C API (http.h):
+ *   1. vectors: well-formed heads, and the malformed ones a strict parser
+ *      must refuse (bare LF, space before the colon, line folding, ...);
+ *   2. every prefix of a well-formed head, which must be Partial until the
+ *      head is complete;
+ *   3. a differential fuzz against an independent parser written here in C
+ *      as a byte-at-a-time state machine.
+ * Built under AddressSanitizer + UBSan by run.sh. */
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "http.h"
+
+static int failures;
+#define CHECK(c, ...) do { if (!(c)) { failures++; fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
+
+/* The reference. Returns 0 for a complete head (and its field count and
+ * length), 1 for an incomplete one, 2 for a malformed one. */
+static int ref_head(const uint8_t *s, size_t n, uint64_t *nfields, uint64_t *len) {
+    enum { M0, M, T0, T, V, VCR, VLF, N0, N, OWS, VAL, CR, LF, ECR, ELF } st = M0;
+    static const char ver[] = "HTTP/1.";
+    size_t vi = 0;
+    uint64_t count = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t c = s[i];
+        int tok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c && strchr("!#$%&'*+-.^_`|~", c));
+        int text = (c >= 32 && c != 127) || c == '\t';
+        switch (st) {
+        case M0: if (!tok) return 2; st = M; break;
+        case M: if (c == ' ') st = T0; else if (!tok) return 2; break;
+        case T0: if (c <= 32 || c == 127) return 2; st = T; break;
+        case T: if (c == ' ') { st = V; vi = 0; } else if (c <= 32 || c == 127) return 2; break;
+        case V:
+            if (vi < 7) { if (c != (uint8_t)ver[vi++]) return 2; }
+            else if (vi == 7) { if (c != '0' && c != '1') return 2; vi++; st = VCR; }
+            break;
+        case VCR: if (c != '\r') return 2; st = VLF; break;
+        case VLF: if (c != '\n') return 2; st = N0; break;
+        case N0: if (c == '\r') st = ELF; else if (tok) st = N; else return 2; break;
+        case ELF: if (c != '\n') return 2; *nfields = count; *len = i + 1; return 0;
+        case N: if (c == ':') st = OWS; else if (!tok) return 2; break;
+        case OWS: if (c == ' ' || c == '\t') break; /* fall through */
+        case VAL: if (c == '\r') st = LF; else if (text) st = VAL; else return 2; break;
+        case LF: if (c != '\n') return 2; count++; st = N0; break;
+        default: return 2;
+        }
+        (void)CR;
+    }
+    return 1;
+}
+
+static void expect(const char *s, int kind) {
+    size_t n = strlen(s);
+    bst_e_Head h = http_parse_head((const uint8_t *)s, n);
+    int got = h.tag == bst_e_Head_Ok ? 0 : h.tag == bst_e_Head_Partial ? 1 : 2;
+    CHECK(got == kind, "%s -> %d, wanted %d", s, got, kind);
+}
+
+static void fields_of(const char *s) {
+    size_t n = strlen(s);
+    bst_e_Head h = http_parse_head((const uint8_t *)s, n);
+    CHECK(h.tag == bst_e_Head_Ok, "fields_of: %s", s);
+    if (h.tag != bst_e_Head_Ok) return;
+    uint64_t at = h.u.Ok.fields, seen = 0;
+    for (;;) {
+        bst_e_Next f = http_field((const uint8_t *)s, n, at);
+        if (f.tag == bst_e_Next_End) { CHECK(f.u.End == h.u.Ok.head_end, "end"); break; }
+        CHECK(f.tag == bst_e_Next_Ok, "field tag");
+        if (f.tag != bst_e_Next_Ok) return;
+        seen++;
+        at = f.u.Ok.next;
+    }
+    CHECK(seen == h.u.Ok.nfields, "count %llu vs %llu", (unsigned long long)seen, (unsigned long long)h.u.Ok.nfields);
+}
+
+int main(void) {
+    const char *good = "GET /index.html?a=1 HTTP/1.1\r\nHost: example.org\r\nAccept:  text/html \t\r\nX-Empty:\r\n\r\n";
+    expect(good, 0);
+    fields_of(good);
+    bst_e_Head h = http_parse_head((const uint8_t *)good, strlen(good));
+    CHECK(h.u.Ok.method_end == 3 && h.u.Ok.target == 4 && h.u.Ok.target_end == 19 && h.u.Ok.minor == 1, "request line");
+    CHECK(h.u.Ok.nfields == 3 && h.u.Ok.head_end == strlen(good), "fields %llu", (unsigned long long)h.u.Ok.nfields);
+    bst_e_Next f = http_field((const uint8_t *)good, strlen(good), h.u.Ok.fields);
+    CHECK(f.tag == bst_e_Next_Ok && f.u.Ok.name_end == 34 && memcmp(good + f.u.Ok.value, "example.org", 11) == 0 && f.u.Ok.value_end - f.u.Ok.value == 11, "Host field");
+    expect("POST / HTTP/1.0\r\n\r\nbody", 0);
+    expect("", 1);
+    expect("GET / HTTP/1.1\r\nHost: a\r\n", 1);
+    expect("GET / HTTP/1.1\r\nHost: a\r\n\r", 1);
+    /* malformed */
+    expect("GET / HTTP/1.1\nHost: a\n\n", 2);                /* bare LF */
+    expect("GET / HTTP/1.1\r\nHost : a\r\n\r\n", 2);         /* space before colon */
+    expect("GET / HTTP/1.1\r\nHost: a\r\n b\r\n\r\n", 2);    /* line folding */
+    expect("GET / HTTP/1.1\r\nHost: a\rb\r\n\r\n", 2);       /* bare CR */
+    expect("GET / HTTP/1.1\r\nHost: a\x01\r\n\r\n", 2);      /* control character */
+    expect("GET / HTTP/2.0\r\n\r\n", 2);
+    expect("GET / HTTP/1.2\r\n\r\n", 2);
+    expect("GET  / HTTP/1.1\r\n\r\n", 2);                    /* two spaces */
+    expect("G(T / HTTP/1.1\r\n\r\n", 2);                     /* not a token */
+    expect(" GET / HTTP/1.1\r\n\r\n", 2);
+    expect("GET /a b HTTP/1.1\r\n\r\n", 2);
+    expect("GET / HTTP/1.1\r\n: a\r\n\r\n", 2);              /* empty name */
+    expect("\r\nGET / HTTP/1.1\r\n\r\n", 2);
+
+    /* Every proper prefix of a complete head is Partial (or, for a prefix
+     * that already breaks a rule, malformed). */
+    size_t gn = strlen(good);
+    for (size_t k = 0; k < gn; k++) {
+        bst_e_Head p = http_parse_head((const uint8_t *)good, k);
+        CHECK(p.tag == bst_e_Head_Partial, "prefix %zu is %llu", k, (unsigned long long)p.tag);
+    }
+
+    /* Differential fuzz: mutate the good head and compare with the reference. */
+    srand(12345);
+    long agree = 0;
+    for (int it = 0; it < 200000; it++) {
+        uint8_t buf[256];
+        size_t n = gn;
+        memcpy(buf, good, gn);
+        int muts = 1 + rand() % 3;
+        for (int m = 0; m < muts; m++) {
+            size_t at = (size_t)rand() % n;
+            switch (rand() % 4) {
+            case 0: buf[at] = (uint8_t)rand(); break;
+            case 1: buf[at] = " \r\n:\t/H"[rand() % 7]; break;
+            case 2: if (n > 1) { memmove(buf + at, buf + at + 1, n - at - 1); n--; } break;
+            default: if (n < sizeof buf) { memmove(buf + at + 1, buf + at, n - at); buf[at] = " \r\n:a"[rand() % 5]; n++; } break;
+            }
+        }
+        if (rand() % 4 == 0) n = (size_t)rand() % (n + 1);
+        uint64_t rc = 0, rl = 0;
+        int rk = ref_head(buf, n, &rc, &rl);
+        bst_e_Head p = http_parse_head(buf, n);
+        int k = p.tag == bst_e_Head_Ok ? 0 : p.tag == bst_e_Head_Partial ? 1 : 2;
+        /* The parser reads whole lines, so it may say Partial where the
+         * state machine already sees a violation; anything else must agree. */
+        int ok = k == rk || (k == 1 && rk == 2);
+        CHECK(ok, "fuzz %d: parser %d, reference %d", it, k, rk);
+        if (k == 0 && rk == 0) CHECK(p.u.Ok.nfields == rc && p.u.Ok.head_end == rl, "fuzz %d: counts", it);
+        agree += ok;
+        if (failures > 20) return 1;
+    }
+    if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }
+    printf("http: vectors, prefixes and %ld fuzz cases ok\n", agree);
+    return 0;
+}

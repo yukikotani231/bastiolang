@@ -1,6 +1,6 @@
-// Calls the proved example libraries (examples/{lines,base64,utf8}) from
+// Calls the proved example libraries (examples/{lines,base64,utf8,http}) from
 // JavaScript: modules written by `bastioc1 --arch wasm32`, one per library.
-// usage: node tests/wasm_lib.js lines.wasm base64.wasm utf8.wasm
+// usage: node tests/wasm_lib.js lines.wasm base64.wasm utf8.wasm http.wasm
 'use strict';
 const fs = require('fs');
 const assert = require('assert');
@@ -30,7 +30,7 @@ async function load(path) {
 }
 
 (async () => {
-  const [linesPath, base64Path, utf8Path] = process.argv.slice(2);
+  const [linesPath, base64Path, utf8Path, httpPath] = process.argv.slice(2);
 
   const L = await load(linesPath);
   const text = Buffer.from('one\ntwo\nthree\n\nx');
@@ -79,5 +79,20 @@ async function load(path) {
     if (want) assert.deepStrictEqual([tag, val], want, `valid ${raw.toString('hex')}`);
     else assert.strictEqual(tag, 1n, `invalid ${raw.toString('hex')}`);   // Utf8::Invalid
   }
-  console.log('wasm libraries: lines, base64 and utf8 pass from JavaScript');
+  const H = await load(httpPath);
+  const head = Buffer.from('GET /a?b=1 HTTP/1.1\r\nHost: example.org\r\nX: y\r\n\r\nbody');
+  const [hp, hl] = H.put(head);
+  const hres = H.e.bst_alloc(80n);
+  H.e.http_parse_head(hp, hl, hres);
+  assert.strictEqual(H.word(hres, 0), 0n);                             // Head::Ok
+  // method_end, target, target_end, minor, fields, nfields, head_end
+  assert.deepStrictEqual([1, 2, 3, 4, 5, 6, 7].map((i) => H.word(hres, i)), [3n, 4n, 10n, 1n, 21n, 2n, BigInt(head.length - 4)]);
+  const [pp, pl] = H.put(head.subarray(0, 25));
+  H.e.http_parse_head(pp, pl, hres);
+  assert.strictEqual(H.word(hres, 0), 1n);                             // Head::Partial
+  const [bp2, bl2] = H.put(Buffer.from('GET / HTTP/1.1\nHost: a\n\n'));
+  H.e.http_parse_head(bp2, bl2, hres);
+  assert.strictEqual(H.word(hres, 0), 2n);                             // Head::Bad: bare LF
+
+  console.log('wasm libraries: lines, base64, utf8 and http pass from JavaScript');
 })().catch((e) => { console.error(e); process.exit(1); });
