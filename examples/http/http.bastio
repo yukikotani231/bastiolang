@@ -295,3 +295,83 @@ export fn http_parse_response(s: &Bytes) -> RespHead
     }
   }
 }
+
+/// The value of hexadecimal digit `c`, or 16 if `c` is not one.
+fn http_hex(c: u8) -> u8
+  ensures result <= 16
+{
+  if c >= 48 && c <= 57 { return c - 48; }
+  if c >= 65 && c <= 70 { return c - 55; }
+  if c >= 97 && c <= 102 { return c - 87; }
+  return 16;
+}
+
+/// One chunk of a chunked message body: its data is `data..data+size` and
+/// the next chunk starts at `next`.
+struct ChunkData { data: u64, size: u64, next: u64 }
+
+enum Chunk {
+  Ok(ChunkData),
+  // The last chunk (size 0) and the trailer fields after it, up to and
+  // including the empty line: the message ends at this offset.
+  Last(u64),
+  Partial,
+  Bad(u64),
+}
+
+/// The chunk that starts at `at` in a chunked body (RFC 9112, section 7.1):
+/// a size in hexadecimal (at most 2^56 - 1), an optional extension that is
+/// skipped, CR LF, the data, CR LF.
+export fn http_chunk(s: &Bytes, at: u64) -> Chunk
+  ensures result is Chunk::Ok ==> at < result.Ok.data && result.Ok.data + result.Ok.size + 2 == result.Ok.next
+  ensures result is Chunk::Ok ==> 0 < result.Ok.size && result.Ok.next <= blen(s)
+  ensures result is Chunk::Last ==> at + 3 <= result.Last && result.Last <= blen(s)
+  ensures result is Chunk::Bad ==> result.Bad <= blen(s)
+{
+  let n = blen(s);
+  if at > n {
+    return Chunk::Bad(n);
+  }
+  let mut e = 0;
+  match http_line(s, at) {
+    Line::Partial => { return Chunk::Partial; }
+    Line::Bad(x) => { return Chunk::Bad(x); }
+    Line::Ok(x) => { e = x; }
+  }
+  let mut p = at;
+  let mut size: u64 = 0;
+  while p < e && http_hex(bget(s, p)) < 16
+    invariant at <= p && p <= e && e + 2 <= n && size < 0x0100000000000000
+  {
+    size = size * 16 + cast[u64](http_hex(bget(s, p)));
+    if size >= 0x0100000000000000 {
+      return Chunk::Bad(p);
+    }
+    p = p + 1;
+  }
+  if p == at {
+    return Chunk::Bad(p);
+  }
+  // An extension: ";" and text to the end of the line.
+  if p < e && bget(s, p) != 59 {
+    return Chunk::Bad(p);
+  }
+  let data = e + 2;
+  if size == 0 {
+    match http_fields(s, data) {
+      Fields::Partial => { return Chunk::Partial; }
+      Fields::Bad(x) => { return Chunk::Bad(x); }
+      Fields::Ok(r) => { return Chunk::Last(r.head_end); }
+    }
+  }
+  if n - data < size + 2 {
+    return Chunk::Partial;
+  }
+  if bget(s, data + size) != 13 {
+    return Chunk::Bad(data + size);
+  }
+  if bget(s, data + size + 1) != 10 {
+    return Chunk::Bad(data + size + 1);
+  }
+  return Chunk::Ok(ChunkData { data: data, size: size, next: data + size + 2 });
+}

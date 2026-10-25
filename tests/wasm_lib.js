@@ -101,5 +101,14 @@ async function load(path) {
   // minor, status, reason, reason_end, fields, nfields, head_end
   assert.deepStrictEqual([1, 2, 3, 4, 5, 6, 7].map((i) => H.word(hres, i)), [1n, 404n, 13n, 22n, 24n, 1n, BigInt(resp.length - 9)]);
 
+  const chunks = Buffer.from('5\r\nhello\r\n0\r\n\r\n');
+  const [cp, cl] = H.put(chunks);
+  H.e.http_chunk(cp, cl, 0n, hres);
+  assert.strictEqual(H.word(hres, 0), 0n);                             // Chunk::Ok
+  assert.deepStrictEqual([1, 2, 3].map((i) => H.word(hres, i)), [3n, 5n, 10n]);  // data, size, next
+  H.e.http_chunk(cp, cl, 10n, hres);
+  assert.strictEqual(H.word(hres, 0), 1n);                             // Chunk::Last
+  assert.strictEqual(H.word(hres, 1), BigInt(chunks.length));
+
   console.log('wasm libraries: lines, base64, utf8 and http pass from JavaScript');
 })().catch((e) => { console.error(e); process.exit(1); });
