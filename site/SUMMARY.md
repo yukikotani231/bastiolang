@@ -15,6 +15,7 @@
   - [UTF-8](examples-utf8.md)
   - [DER](examples-der.md)
   - [QOI](examples-qoi.md)
+  - [HTTP](examples-http.md)
 
 # Reference
 

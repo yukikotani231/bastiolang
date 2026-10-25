@@ -10,4 +10,5 @@ trap 'rm -rf "$tmp"' EXIT
 "$BASTIOC" --arch wasm32 -o "$tmp/lines.wasm" examples/lines/lines.bastio >/dev/null
 "$BASTIOC" --arch wasm32 -o "$tmp/base64.wasm" examples/base64/lib.bastio >/dev/null
 "$BASTIOC" --arch wasm32 -o "$tmp/utf8.wasm" examples/utf8/utf8.bastio >/dev/null
-node tests/wasm_lib.js "$tmp/lines.wasm" "$tmp/base64.wasm" "$tmp/utf8.wasm"
+"$BASTIOC" --arch wasm32 -o "$tmp/http.wasm" examples/http/http.bastio >/dev/null
+node tests/wasm_lib.js "$tmp/lines.wasm" "$tmp/base64.wasm" "$tmp/utf8.wasm" "$tmp/http.wasm"

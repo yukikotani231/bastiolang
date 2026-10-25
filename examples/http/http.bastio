@@ -1,0 +1,214 @@
+// HTTP/1.1 request head parser (RFC 9112, sections 3 to 5), strict: the
+// request line and header fields of a message that arrives from a socket,
+// where a length or a delimiter read without care sends a parser past its
+// buffer or lets a request be read two ways (request smuggling).
+//
+// A library: each `export fn` is a C function or a WebAssembly export (see
+// README.md). The parser allocates nothing: it hands back offsets into the
+// input. What the compiler proves, for every input and with no runtime
+// checks in the generated code: no out-of-bounds read, no overflow, and the
+// `ensures` clauses (every offset handed back lies inside the input, in
+// order). Not proved: that the parser accepts exactly the requests it
+// should; the tests check that against vectors.
+//
+// Strict means: a line ends with CR LF (a bare LF or CR is rejected), no
+// control character other than HT appears in the head, the method is a
+// token, the target is one or more visible characters, the version is
+// HTTP/1.0 or HTTP/1.1, and a header field is `name: value` with no space
+// before the colon. Obsolete line folding is rejected (a line that starts
+// with a space is not a field name).
+
+/// One request head: the method is `0..method_end`, the target
+/// `target..target_end`, the version is HTTP/1.`minor`, the first header
+/// field starts at `fields`, there are `nfields` of them and the body
+/// starts at `head_end`.
+struct Req { method_end: u64, target: u64, target_end: u64, minor: u8, fields: u64, nfields: u64, head_end: u64 }
+
+enum Head {
+  Ok(Req),
+  // The input ends inside the head: read more and call again.
+  Partial,
+  // The offset of the first byte that makes the head invalid.
+  Bad(u64),
+}
+
+/// One header field: the name is `at..name_end`, the value (with the
+/// whitespace around it removed) `value..value_end`, the next line starts at
+/// `next`.
+struct Field { name_end: u64, value: u64, value_end: u64, next: u64 }
+
+enum Next {
+  Ok(Field),
+  // The empty line that ends the head; the body starts at this offset.
+  End(u64),
+  Partial,
+  Bad(u64),
+}
+
+/// Is `c` a token character (RFC 9110, section 5.6.2)?
+fn http_tchar(c: u8) -> bool {
+  if c >= 48 && c <= 57 { return true; }
+  if c >= 65 && c <= 90 { return true; }
+  if c >= 97 && c <= 122 { return true; }
+  return c == 33 || c == 35 || c == 36 || c == 37 || c == 38 || c == 39 || c == 42
+    || c == 43 || c == 45 || c == 46 || c == 94 || c == 95 || c == 96 || c == 124 || c == 126;
+}
+
+/// The offset of the first byte from `at` on that cannot be part of a line:
+/// a control character other than HT, or the end of the input.
+fn http_line_end(s: &Bytes, at: u64) -> u64
+  requires at <= blen(s)
+  ensures at <= result && result <= blen(s)
+{
+  let n = blen(s);
+  let mut k = at;
+  while k < n && (bget(s, k) >= 32 && bget(s, k) != 127 || bget(s, k) == 9)
+    invariant at <= k && k <= n
+  {
+    k = k + 1;
+  }
+  return k;
+}
+
+/// The line that starts at `at`: Ok(e) when it ends with CR LF at `e`
+/// (the next line starts at e + 2), Partial when the input ends in it,
+/// Bad(e) otherwise.
+enum Line { Ok(u64), Partial, Bad(u64) }
+
+fn http_line(s: &Bytes, at: u64) -> Line
+  requires at <= blen(s)
+  ensures result is Line::Ok ==> at <= result.Ok && result.Ok + 2 <= blen(s)
+  ensures result is Line::Bad ==> at <= result.Bad && result.Bad < blen(s)
+{
+  let n = blen(s);
+  let e = http_line_end(s, at);
+  if e == n {
+    return Line::Partial;
+  }
+  if bget(s, e) != 13 {
+    return Line::Bad(e);
+  }
+  if e + 1 == n {
+    return Line::Partial;
+  }
+  if bget(s, e + 1) != 10 {
+    return Line::Bad(e + 1);
+  }
+  return Line::Ok(e);
+}
+
+/// The header field that starts at `at`, or the empty line that ends the head.
+export fn http_field(s: &Bytes, at: u64) -> Next
+  ensures result is Next::Ok ==> at < result.Ok.name_end && result.Ok.name_end < result.Ok.value
+  ensures result is Next::Ok ==> result.Ok.value <= result.Ok.value_end && result.Ok.value_end + 2 <= result.Ok.next
+  ensures result is Next::Ok ==> at < result.Ok.next && result.Ok.next <= blen(s)
+  ensures result is Next::End ==> at + 2 <= result.End && result.End <= blen(s)
+  ensures result is Next::Bad ==> result.Bad <= blen(s)
+{
+  let n = blen(s);
+  if at > n {
+    return Next::Bad(n);
+  }
+  let mut e = 0;
+  match http_line(s, at) {
+    Line::Partial => { return Next::Partial; }
+    Line::Bad(x) => { return Next::Bad(x); }
+    Line::Ok(x) => { e = x; }
+  }
+  if e == at {
+    return Next::End(at + 2);
+  }
+  let mut p = at;
+  while p < e && http_tchar(bget(s, p))
+    invariant at <= p && p <= e && e + 2 <= n
+  {
+    p = p + 1;
+  }
+  if p == at || p == e || bget(s, p) != 58 {
+    return Next::Bad(p);
+  }
+  let mut v = p + 1;
+  while v < e && (bget(s, v) == 32 || bget(s, v) == 9)
+    invariant p < v && v <= e && e + 2 <= n
+  {
+    v = v + 1;
+  }
+  let mut ve = e;
+  while ve > v && (bget(s, ve - 1) == 32 || bget(s, ve - 1) == 9)
+    invariant v <= ve && ve <= e && e + 2 <= n
+  {
+    ve = ve - 1;
+  }
+  return Next::Ok(Field { name_end: p, value: v, value_end: ve, next: e + 2 });
+}
+
+/// Parses the request line and counts the header fields of the head at the
+/// start of `s`.
+export fn http_parse_head(s: &Bytes) -> Head
+  ensures result is Head::Ok ==> 0 < result.Ok.method_end && result.Ok.method_end < result.Ok.target
+  ensures result is Head::Ok ==> result.Ok.target < result.Ok.target_end && result.Ok.target_end + 11 == result.Ok.fields
+  ensures result is Head::Ok ==> result.Ok.fields <= result.Ok.head_end && result.Ok.head_end <= blen(s)
+  ensures result is Head::Ok ==> result.Ok.minor <= 1
+  ensures result is Head::Bad ==> result.Bad <= blen(s)
+{
+  let n = blen(s);
+  let mut e = 0;
+  match http_line(s, 0) {
+    Line::Partial => { return Head::Partial; }
+    Line::Bad(x) => { return Head::Bad(x); }
+    Line::Ok(x) => { e = x; }
+  }
+  // The method.
+  let mut m = 0;
+  while m < e && http_tchar(bget(s, m))
+    invariant m <= e && e + 2 <= n
+  {
+    m = m + 1;
+  }
+  if m == 0 || m == e || bget(s, m) != 32 {
+    return Head::Bad(m);
+  }
+  // The target: visible characters up to the next space.
+  let t = m + 1;
+  let mut q = t;
+  while q < e && bget(s, q) > 32
+    invariant t <= q && q <= e && e + 2 <= n
+  {
+    q = q + 1;
+  }
+  if q == t || q == e || bget(s, q) != 32 {
+    return Head::Bad(q);
+  }
+  // The version, which fills the rest of the line: "HTTP/1." and a digit.
+  if e - q != 9 {
+    return Head::Bad(q + 1);
+  }
+  if bget(s, q + 1) != 72 || bget(s, q + 2) != 84 || bget(s, q + 3) != 84 || bget(s, q + 4) != 80
+    || bget(s, q + 5) != 47 || bget(s, q + 6) != 49 || bget(s, q + 7) != 46 {
+    return Head::Bad(q + 1);
+  }
+  let d = bget(s, q + 8);
+  if d != 48 && d != 49 {
+    return Head::Bad(q + 8);
+  }
+  // The header fields, up to the empty line.
+  let first = e + 2;
+  let mut at = first;
+  let mut count: u64 = 0;
+  while at < n
+    invariant first <= at && at <= n && count <= at
+  {
+    match http_field(s, at) {
+      Next::Partial => { return Head::Partial; }
+      Next::Bad(x) => { return Head::Bad(x); }
+      Next::End(x) => {
+        return Head::Ok(Req { method_end: m, target: t, target_end: q, minor: d - 48, fields: first, nfields: count, head_end: x });
+      }
+      Next::Ok(f) => {
+        at = f.next;
+        count = count + 1;
+      }
+    }
+  }
+  return Head::Partial;
+}
