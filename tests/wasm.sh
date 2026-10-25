@@ -16,6 +16,8 @@ BASTIOC=${BASTIOC:-$(tests/bastioc1.sh)} || exit 1
 export BASTIOC
 both() {
   local f=$1 cs xs rc
+  # It checks its own executable for an ELF, Mach-O or PE header.
+  case "$f" in tests/pass/bytes_host.bastio) echo "skip $f: reads its own executable's header"; echo =skip; return;; esac
   if ! "$BASTIOC" -o "$w/c.exe" "$f" 2>/dev/null; then
     echo "FAIL $f: the C backend rejected it"; echo =fail; return
   fi
