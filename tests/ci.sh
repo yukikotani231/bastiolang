@@ -37,6 +37,7 @@ if command -v z3 >/dev/null; then
   if [ -e /lib/ld-musl-x86_64.so.1 ]; then step "tests/native.sh (IR emitter, musl loader)"; MUSL_LINK=1 BACKEND=native-ir tests/native.sh; fi
   step "tests/as86.sh";      tests/as86.sh
   step "tests/elfobj.sh";    tests/elfobj.sh
+  if command -v node >/dev/null; then step "tests/wasm.sh";      tests/wasm.sh; step "tests/wasm_lib.sh";  tests/wasm_lib.sh; else skipped+=("tests/wasm.sh (needs node)"); fi
   step "tests/as64.sh";      tests/as64.sh
   step "tests/macho.sh";     tests/macho.sh
   step "tests/proof_cache.sh"; tests/proof_cache.sh
