@@ -34,6 +34,7 @@ PAGES = {
     "examples/utf8/README.md": "examples-utf8.md",
     "examples/der/README.md": "examples-der.md",
     "examples/qoi/README.md": "examples-qoi.md",
+    "examples/http/README.md": "examples-http.md",
     "ROADMAP.md": "roadmap.md",
     "CONTRIBUTING.md": "contributing.md",
     "CHANGELOG.md": "changelog.md",
