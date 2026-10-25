@@ -21,11 +21,22 @@ What will be 0.2.0.
   its input. See [tools/README.md](tools/README.md).
 - `tools/bastio-lsp`: a language server written in Bastio. Diagnostics from
   `bastioc1 --check` (and the lexer while typing), go to definition and hover
-  in the file and its imports, document symbols and formatting.
+  in the file and its imports, references, highlights and rename, completion
+  and signature help, workspace symbols, semantic tokens, document symbols,
+  formatting, quick fixes (code actions) for the common compiler errors and
+  inlay hints (parameter names at calls, the type of a `let` from its value), folding
+  ranges and links from imports to their files.
+  The compiler checks the text of the buffer, not the saved file; with the
+  option `checkOnChange` it runs on every edit.
 - `editors/vim`: file type, syntax, indentation and a Neovim plugin that
   starts the language server.
 
 ### Compiler
+
+- The page-table prelude marks a page mapped writable (`pt_put_frame`,
+  `pt_put_shared` with `writable`) no-execute on x86-64, and leaves a
+  read-only one executable, so a kernel that sets `EFER.NXE` gets W^X from
+  how it maps pages. `pt_set_access` leaves the bit alone.
 
 - Diagnostics say what to do about the slips a newcomer meets first: `=`
   where `==` is meant, `+=`, `var` and `for`, a parameter without its type, a
@@ -33,7 +44,7 @@ What will be 0.2.0.
   returning, an integer of the wrong type (with the `cast` and `wrap`
   spelling for the type wanted), a `return` of a value from a function with
   no return type, a linear value consumed in one branch of an `if`, a variant
-  matched twice, and a failed proof of `vec_free` or `unreachable`. Each
+  matched twice, a call with the wrong number of arguments (the parameter types are listed), and a failed proof of `vec_free` or `unreachable`. Each
   message has a golden test in `tests/diag`.
 - `BASTIO_PROOF_CACHE=<dir>`: bastioc1 records each function it has proved
   (by a hash of its verification conditions, the preamble, the solver and the
@@ -67,6 +78,9 @@ What will be 0.2.0.
   between and within `Bytes`, `frame_to_bytes` / `bytes_to_frame` for pages
   and `dma_to_bytes` / `bytes_to_dma` for lent pages. The prover knows what
   `bcopy` and `bmove` copy; page contents stay untracked (#91).
+- `frame_to_frame` copies a range of one page into another in a single copy,
+  proved in bounds like the other bulk copies, so a kernel can move file data
+  from a cached page to a user page without staging it in a buffer.
 - `Dirty` pages: `pool_take_dirty` takes a page without zeroing it, and it
   becomes a `Frame` only by being overwritten whole (`dirty_zero`,
   `frame_copy`, `shared_copy`, or `dirty_fill` from a page's worth of
@@ -102,6 +116,9 @@ What will be 0.2.0.
 
 ### Library
 
+- `core/strsort`: `spans_order` sorts pieces of a text in byte order by
+  returning the indices `0..n` in order, proved a permutation with every
+  neighbouring pair in order; `core/spancmp` has `span_cmp` for one pair.
 - Six new modules. `core/path` splits file names (`path_split`,
   `path_ext`), joins them (`path_join`) and cleans them lexically
   (`path_clean`); every span it returns is proved to lie inside the path.
@@ -268,6 +285,8 @@ What will be 0.2.0.
 
 ### Documentation
 
+- For contributors: `tools/setup-dev.sh` sets up a Debian or Ubuntu machine in one command (and a dev container runs it), `docs/architecture.md` maps the compiler's phases to files, and CONTRIBUTING.md explains the issue labels and where to find a first issue. A feature-request issue template and `.github/labels.yml` (synced by a workflow) were added.
+- Releases: the release workflow also builds for AArch64 Linux (on an arm64 runner, tested there), makes the archives byte-for-byte repeatable, records build provenance attestations, and `docs/releasing.md` says how to verify a download and rebuild a release.
 - A documentation index (`docs/README.md`), linked from the README, and a README layout table that lists every document. `docs/integers.md` says the sized integers are implemented. CONTRIBUTING.md has a "Getting oriented" section.
 
 - `docs/bootstrap.md`: how stage0 builds bastioc1, how to check the

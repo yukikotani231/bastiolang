@@ -4,22 +4,44 @@
 //   - diagnostics: the lexical error of the buffer as you type, and the
 //     first error of `bastioc1 --check` (syntax, types, linearity and the
 //     proofs, with a failed proof's counterexample) when a file is opened
-//     or saved;
+//     or saved, on the text of the buffer (with `checkOnChange`, on every
+//     edit too);
 //   - go to definition and hover for functions, `spec fn`s, structs, enums,
 //     constants, variants, fields and local variables, in the file and in
 //     the files it imports (hover shows the signature and the `///` doc
 //     comment);
-//   - document symbols;
+//   - find references, highlights and rename of the same names, in the open
+//     documents and the files they import;
+//   - completion (locals, definitions and keywords; fields after `.`,
+//     variants after `::`, a struct literal's fields) and signature help;
+//   - semantic tokens (what each identifier names);
+//   - document symbols, and a search for definitions by name across the
+//     open documents and what they import (workspace symbols);
+//   - code actions: quick fixes for the diagnostics of the compiler (a
+//     missing `;`, `mut`, a `match` arm, a misspelled name, an import);
+//   - inlay hints: parameter names at calls, the type of a `let` whose
+//     value is a call, a struct literal or a variant;
+//   - folding ranges (blocks and runs of comments) and links from imports
+//     to the files they name;
+//   - selection ranges (expand the selection token, brackets, file), the
+//     number of references over each top-level item (code lenses) and the
+//     call hierarchy of functions;
 //   - formatting, with bastiofmt's rules.
 //
 // Options (`initializationOptions`): `bastioc` (the compiler, default
 // `$BASTIOC` or `bastioc1`), `target` (`hosted`, `kernel` or `user`), `lib`
-// (a list of library directories, for imports and for the compiler).
+// (a list of library directories, for imports and for the compiler),
+// `checkOnChange` (run the compiler on every edit).
 //
 // It reads the buffer text the editor sends (full-text synchronization), and
 // everything it reports about other files comes from the files on disk, or
 // from their open buffers.
-import "defs.bastio";
+import "complete.bastio";
+import "semantic.bastio";
+import "actions.bastio";
+import "inlay.bastio";
+import "ranges.bastio";
+import "calls.bastio";
 
 struct State {
   uris: Vec[Bytes],
@@ -28,6 +50,7 @@ struct State {
   cmd: Bytes,
   target: Bytes,
   libs: Vec[Bytes],
+  on_change: bool,
   shutdown: bool
 }
 
@@ -708,14 +731,45 @@ fn wrapper_path(path: &Bytes) -> Bytes {
   return b;
 }
 
-/// Runs the compiler on `path` and appends its first error as a diagnostic.
-/// `all` is the buffer's text, which positions are in. Returns false if the
-/// compiler found nothing wrong.
+/// A file beside `path` (so that its imports resolve the same way) named
+/// after it: where the text of the buffer is written to be checked.
+fn shadow_path(path: &Bytes) -> Bytes {
+  let mut slash = 0;
+  let mut k = 0;
+  while k < blen(path)
+  {
+    if bget(path, k) == 47 {
+      slash = vadd(k, 1);
+    }
+    k = vadd(k, 1);
+  }
+  let mut v = vec_new[u64]();
+  let mut q = 0;
+  while q < slash && q < blen(path)
+  {
+    vec_push(&mut v, cast[u64](bget(path, q)));
+    q = vadd(q, 1);
+  }
+  w_s(&mut v, ".bastio-lsp-");
+  let mut r = slash;
+  while r < blen(path)
+  {
+    vec_push(&mut v, cast[u64](bget(path, r)));
+    r = vadd(r, 1);
+  }
+  let b = to_bytes(v);
+  vec_free(v);
+  return b;
+}
+
+/// Runs the compiler on the file `path` and appends its first error as a
+/// diagnostic. `all` is the buffer's text, which positions are in. Returns
+/// false if the compiler found nothing wrong.
 ///
 /// A library has no `main`, so the compiler stops at that. It is then
 /// checked through a program that only imports it, written to the
 /// temporary directory.
-fn compiler_diags(host: &mut Host, st: &mut State, path: &Bytes, all: &Bytes, out: &mut Vec[u64]) -> bool {
+fn check_diags(host: &mut Host, st: &mut State, path: &Bytes, all: &Bytes, out: &mut Vec[u64]) -> bool {
   let mut lines = vec_new[Vec[u64]]();
   let mut status = run_check(&mut host, &mut st, path, &mut lines);
   if lines_have(&mut lines, "no `main` function") {
@@ -899,6 +953,22 @@ fn compiler_diags(host: &mut Host, st: &mut State, path: &Bytes, all: &Bytes, ou
   return found;
 }
 
+/// The compiler checks what is in the buffer, not what is on disk: the text
+/// is written to a file beside `real` (`shadow_path`), checked, and removed.
+/// If that file cannot be written, `real` itself is checked.
+fn compiler_diags(host: &mut Host, st: &mut State, real: &Bytes, all: &Bytes, out: &mut Vec[u64]) -> bool {
+  let sp = shadow_path(real);
+  let mut found = false;
+  if host_write(host, sp, all) {
+    found = check_diags(&mut host, &mut st, sp, all, &mut out);
+    remove_file(&mut host, sp);
+  } else {
+    found = check_diags(&mut host, &mut st, real, all, &mut out);
+  }
+  bfree(sp);
+  return found;
+}
+
 /// Publishes the diagnostics of the open document `uri`; `full` runs the
 /// compiler too.
 fn publish(con: &mut Serial, host: &mut Host, st: &mut State, uri: &Bytes, full: bool) {
@@ -948,55 +1018,6 @@ fn kind_name(kind: u64) -> Str {
   if kind == DK_CONST { return "constant"; }
   if kind == DK_VARIANT { return "variant"; }
   return "field";
-}
-
-/// The span of a local binding's statement or parameter, for hover: the
-/// `let` through the end of the line, or the parameter and its type.
-fn local_text(ix: &Prog, ti: u64, out: &mut Vec[u64]) {
-  let t = tok_at(ix.toks, ti);
-  let p = tok_at(ix.toks, vsub(ti, 1));
-  let mut s = t.start;
-  if is_kw(p, KW_MUT) {
-    s = p.start;
-  }
-  // `let [mut] x [: T] = ...;` up to the `=`; a parameter up to `,` or `)`.
-  let mut j = vadd(ti, 1);
-  let mut depth = 0;
-  let mut e = t.end;
-  let mut stop = false;
-  while !stop && j < vec_len(ix.toks) && j < vadd(ti, 60)
-  {
-    let c = tok_at(ix.toks, j);
-    if c.kind == K_EOF {
-      stop = true;
-    } else if is_opener(c) {
-      depth = sadd(depth, 1);
-      e = c.end;
-    } else if is_closer(c) {
-      if depth == 0 {
-        stop = true;
-      } else {
-        depth = depth - 1;
-        e = c.end;
-      }
-    } else if depth == 0 && (is_p(c, P_COMMA) || is_p(c, P_EQ) || is_p(c, P_SEMI) || is_p(c, P_FATARROW)) {
-      stop = true;
-    } else {
-      e = tok_end(c);
-    }
-    j = vadd(j, 1);
-  }
-  let mut k = s;
-  if is_kw(tok_at(ix.toks, vsub(ti, 2)), KW_LET) && is_kw(p, KW_MUT) {
-    k = tok_at_start(ix.toks, vsub(ti, 2));
-  } else if is_kw(p, KW_LET) {
-    k = p.start;
-  }
-  while k < e && k < blen(ix.all)
-  {
-    vec_push(&mut out, at(ix.all, k));
-    k = vadd(k, 1);
-  }
 }
 
 /// The hover text (Markdown) for definition `d` of the program.
@@ -1070,7 +1091,7 @@ fn locate(host: &Host, st: &mut State, j: &Json, params: u64) -> Found {
   if !at_tok.found {
     return Found { ix: ix, res: no_res(), ti: 0 };
   }
-  let r = resolve_at(ix, 0, at_tok.idx);
+  let r = resolve_any(ix, 0, at_tok.idx);
   return Found { ix: ix, res: r, ti: at_tok.idx };
 }
 
@@ -1134,6 +1155,331 @@ fn on_definition(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: 
   send_result(&mut con, id, res_);
   vec_free(res_);
   pg_free(f.ix);
+}
+
+// ---- References, highlights and rename ----
+
+/// Places that name one thing: `uris` are the files, hit k is range
+/// `hrange[k]` (as JSON) of file `huri[k]`.
+struct Hits { uris: Vec[Bytes], huri: Vec[u64], hrange: Vec[Bytes] }
+
+fn hits_new() -> Hits {
+  return Hits { uris: vec_new[Bytes](), huri: vec_new[u64](), hrange: vec_new[Bytes]() };
+}
+
+fn hits_free(h: Hits) {
+  let mut uris = h.uris;
+  while vec_len(uris) > 0 {
+    bfree(vec_pop(&mut uris));
+  }
+  vec_free(uris);
+  vec_free(h.huri);
+  let mut ranges = h.hrange;
+  while vec_len(ranges) > 0 {
+    bfree(vec_pop(&mut ranges));
+  }
+  vec_free(ranges);
+}
+
+fn bytes_at_same(v: &mut Vec[Bytes], k: u64, b: &Bytes) -> bool {
+  if k >= vec_len(v) {
+    return false;
+  }
+  let t = vec_swap(&mut v, k, balloc(0));
+  let same = bytes_same(t, b);
+  bfree(vec_swap(&mut v, k, t));
+  return same;
+}
+
+/// The index of `uri` in the hits' files; it is added if it is new.
+fn hits_uri(h: &mut Hits, uri: &Bytes) -> u64 {
+  let mut k = 0;
+  while k < vec_len(h.uris)
+  {
+    if bytes_at_same(&mut h.uris, k, uri) {
+      return k;
+    }
+    k = vadd(k, 1);
+  }
+  vec_push(&mut h.uris, byte_range(uri, 0, blen(uri)));
+  return k;
+}
+
+/// Adds the range `rb` of file `uri`, unless it is there. Takes `rb`.
+fn hits_add(h: &mut Hits, uri: &Bytes, rb: Bytes) {
+  let u = hits_uri(&mut h, uri);
+  let mut k = 0;
+  while k < vec_len(h.huri)
+  {
+    if u_at(h.huri, k) == u && bytes_at_same(&mut h.hrange, k, rb) {
+      bfree(rb);
+      return;
+    }
+    k = vadd(k, 1);
+  }
+  vec_push(&mut h.huri, u);
+  vec_push(&mut h.hrange, rb);
+}
+
+/// Adds every place of program `ix` that names `tgt` (a result of
+/// `resolve_any` in `ix`): all its files, or only file 0 with `only0`; the
+/// place where it is declared only with `decl`.
+fn collect_refs(h: &mut Hits, st: &mut State, ix: &Prog, tgt: Res, decl: bool, only0: bool) {
+  let mut ns = 0;
+  let mut ne = 0;
+  let mut dfile = 0;
+  if tgt.local {
+    let t = tok_at(ix.toks, tgt.idx);
+    ns = t.start;
+    ne = t.end;
+  } else {
+    let d = def_at(ix, tgt.idx);
+    ns = d.ns;
+    ne = d.ne;
+    dfile = d.file;
+  }
+  let mut f = 0;
+  while f < vec_len(ix.fstart) && (!only0 || f == 0)
+  {
+    let uri = pg_uri(&mut st, ix, f);
+    let from = u_at(ix.fstart, f);
+    let te = file_toks_end(ix, f);
+    let mut i = u_at(ix.tstart, f);
+    while i < te && i < vec_len(ix.toks)
+    {
+      let t = vec_get(ix.toks, i);
+      if t.kind == K_IDENT && same_text(ix.all, t.start, t.end, ns, ne) {
+        let r = resolve_any(ix, f, i);
+        if r.found && r.local == tgt.local && r.idx == tgt.idx {
+          let mut is_decl = i == tgt.idx;
+          if !tgt.local {
+            is_decl = f == dfile && t.start == ns;
+          }
+          if decl || !is_decl {
+            let mut rj = vec_new[u64]();
+            w_range(&mut rj, ix.all, from, t.start, t.end);
+            let rb = to_bytes(rj);
+            vec_free(rj);
+            hits_add(&mut h, uri, rb);
+          }
+        }
+      }
+      i = vadd(i, 1);
+    }
+    bfree(uri);
+    f = vadd(f, 1);
+  }
+}
+
+/// The places that name what the request's position is on. A local is
+/// searched for in its file; anything else also in the programs of the other
+/// open documents, which may use it without the first one seeing them.
+fn gather(host: &Host, st: &mut State, f: &Found, decl: bool, everywhere: bool) -> Hits {
+  let mut h = hits_new();
+  if !f.res.found {
+    return h;
+  }
+  collect_refs(&mut h, &mut st, f.ix, f.res, decl, f.res.local || !everywhere);
+  if f.res.local || !everywhere {
+    return h;
+  }
+  let d = def_at(f.ix, f.res.idx);
+  let dpath = pg_path(f.ix, d.file);
+  let rel = vsub(d.ns, u_at(f.ix.fstart, d.file));
+  let me = pg_path(f.ix, 0);
+  let mut k = 0;
+  while k < vec_len(st.paths)
+  {
+    let p = doc_copy(&mut st.paths, k);
+    if !bytes_same(p, me) {
+      let ix2 = pg_for(host, &mut st, p);
+      let mut found = false;
+      let mut d2 = 0;
+      while d2 < vec_len(ix2.defs) && !found
+      {
+        let df = vec_get(ix2.defs, d2);
+        if df.kind == d.kind && vsub(df.ns, u_at(ix2.fstart, df.file)) == rel {
+          let q = pg_path(ix2, df.file);
+          if bytes_same(q, dpath) {
+            found = true;
+          }
+          bfree(q);
+        }
+        if !found {
+          d2 = vadd(d2, 1);
+        }
+      }
+      if found {
+        collect_refs(&mut h, &mut st, ix2, Res { found: true, local: false, idx: d2 }, decl, false);
+      }
+      pg_free(ix2);
+    }
+    bfree(p);
+    k = vadd(k, 1);
+  }
+  bfree(dpath);
+  bfree(me);
+  return h;
+}
+
+fn on_references(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
+  let params = jget(j, root, "params");
+  let decl = jis_true(j, jpath2(j, params, "context", "includeDeclaration"));
+  let f = locate(host, &mut st, j, params);
+  let mut res_ = vec_new[u64]();
+  if f.res.found {
+    let mut h = gather(host, &mut st, f, decl, true);
+    w_s(&mut res_, "[");
+    let mut k = 0;
+    while k < vec_len(h.huri)
+    {
+      if k > 0 {
+        vec_push(&mut res_, 44);
+      }
+      let uri = doc_copy(&mut h.uris, u_at(h.huri, k));
+      w_s(&mut res_, "{\"uri\":\"");
+      jesc_bytes(&mut res_, uri, 0, blen(uri));
+      w_s(&mut res_, "\",\"range\":");
+      let rb = doc_copy(&mut h.hrange, k);
+      push_bytes(&mut res_, rb);
+      w_s(&mut res_, "}");
+      bfree(rb);
+      bfree(uri);
+      k = vadd(k, 1);
+    }
+    w_s(&mut res_, "]");
+    hits_free(h);
+  } else {
+    w_s(&mut res_, "null");
+  }
+  send_result(&mut con, id, res_);
+  vec_free(res_);
+  pg_free(f.ix);
+}
+
+fn on_highlight(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
+  let params = jget(j, root, "params");
+  let f = locate(host, &mut st, j, params);
+  let mut res_ = vec_new[u64]();
+  if f.res.found {
+    let mut h = gather(host, &mut st, f, true, false);
+    w_s(&mut res_, "[");
+    let mut k = 0;
+    while k < vec_len(h.huri)
+    {
+      // Only the file of the request (the first one the hits name).
+      if u_at(h.huri, k) == 0 {
+        if k > 0 {
+          vec_push(&mut res_, 44);
+        }
+        w_s(&mut res_, "{\"range\":");
+        let rb = doc_copy(&mut h.hrange, k);
+        push_bytes(&mut res_, rb);
+        w_s(&mut res_, ",\"kind\":1}");
+        bfree(rb);
+      }
+      k = vadd(k, 1);
+    }
+    w_s(&mut res_, "]");
+    hits_free(h);
+  } else {
+    w_s(&mut res_, "null");
+  }
+  send_result(&mut con, id, res_);
+  vec_free(res_);
+  pg_free(f.ix);
+}
+
+fn on_prepare_rename(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
+  let params = jget(j, root, "params");
+  let f = locate(host, &mut st, j, params);
+  let mut res_ = vec_new[u64]();
+  if f.res.found {
+    let t = tok_at(f.ix.toks, f.ti);
+    w_s(&mut res_, "{\"range\":");
+    w_range(&mut res_, f.ix.all, 0, t.start, t.end);
+    w_s(&mut res_, ",\"placeholder\":\"");
+    jesc_bytes(&mut res_, f.ix.all, t.start, t.end);
+    w_s(&mut res_, "\"}");
+  } else {
+    w_s(&mut res_, "null");
+  }
+  send_result(&mut con, id, res_);
+  vec_free(res_);
+  pg_free(f.ix);
+}
+
+/// Is `name` one identifier (and not a keyword)?
+fn is_ident_name(name: &Bytes) -> bool {
+  if blen(name) == 0 || blen(name) > 256 {
+    return false;
+  }
+  let mut toks = vec_new[Tok]();
+  lex(name, 0, &mut toks);
+  let mut ok = false;
+  if vec_len(toks) == 2 {
+    let t = vec_get(toks, 0);
+    ok = t.kind == K_IDENT && t.start == 0 && t.end == blen(name);
+  }
+  vec_free(toks);
+  return ok;
+}
+
+fn on_rename(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
+  let params = jget(j, root, "params");
+  let name = str_of(j, jget(j, params, "newName"));
+  if !is_ident_name(name) {
+    send_error(&mut con, id, 32602, "the new name is not an identifier");
+    bfree(name);
+    return;
+  }
+  let f = locate(host, &mut st, j, params);
+  let mut res_ = vec_new[u64]();
+  if f.res.found {
+    let mut h = gather(host, &mut st, f, true, true);
+    w_s(&mut res_, "{\"changes\":{");
+    let mut u = 0;
+    while u < vec_len(h.uris)
+    {
+      if u > 0 {
+        vec_push(&mut res_, 44);
+      }
+      let uri = doc_copy(&mut h.uris, u);
+      w_s(&mut res_, "\"");
+      jesc_bytes(&mut res_, uri, 0, blen(uri));
+      w_s(&mut res_, "\":[");
+      bfree(uri);
+      let mut first = true;
+      let mut k = 0;
+      while k < vec_len(h.huri)
+      {
+        if u_at(h.huri, k) == u {
+          if !first {
+            vec_push(&mut res_, 44);
+          }
+          first = false;
+          w_s(&mut res_, "{\"range\":");
+          let rb = doc_copy(&mut h.hrange, k);
+          push_bytes(&mut res_, rb);
+          bfree(rb);
+          w_s(&mut res_, ",\"newText\":\"");
+          jesc_bytes(&mut res_, name, 0, blen(name));
+          w_s(&mut res_, "\"}");
+        }
+        k = vadd(k, 1);
+      }
+      w_s(&mut res_, "]");
+      u = vadd(u, 1);
+    }
+    w_s(&mut res_, "}}");
+    hits_free(h);
+  } else {
+    w_s(&mut res_, "null");
+  }
+  send_result(&mut con, id, res_);
+  vec_free(res_);
+  pg_free(f.ix);
+  bfree(name);
 }
 
 fn symbol_kind(kind: u64) -> u64 {
@@ -1213,6 +1559,351 @@ fn on_symbols(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64
   vec_free(res_);
 }
 
+/// The call hierarchy item of function `d`; `doc` is the URI of the open
+/// document whose program holds it, and `data` lets later requests find it.
+fn w_call_item(out: &mut Vec[u64], st: &mut State, ix: &Prog, d: u64, doc: &Bytes) {
+  let df = def_at(ix, d);
+  let from = u_at(ix.fstart, df.file);
+  let uri = pg_uri(&mut st, ix, df.file);
+  w_s(&mut out, "{\"name\":\"");
+  jesc_bytes(&mut out, ix.all, df.ns, df.ne);
+  w_s(&mut out, "\",\"kind\":12,\"uri\":\"");
+  jesc_bytes(&mut out, uri, 0, blen(uri));
+  w_s(&mut out, "\",\"range\":");
+  w_range(&mut out, ix.all, from, df.ss, df.ie);
+  w_s(&mut out, ",\"selectionRange\":");
+  w_range(&mut out, ix.all, from, df.ns, df.ne);
+  w_s(&mut out, ",\"data\":{\"doc\":\"");
+  jesc_bytes(&mut out, doc, 0, blen(doc));
+  w_s(&mut out, "\",\"ns\":");
+  w_num(&mut out, df.ns);
+  w_s(&mut out, "}}");
+  bfree(uri);
+}
+
+fn on_prepare_calls(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
+  let params = jget(j, root, "params");
+  let f = locate(host, &mut st, j, params);
+  let mut res_ = vec_new[u64]();
+  let mut is_fn = false;
+  if f.res.found && !f.res.local {
+    let fd = def_at(f.ix, f.res.idx);
+    is_fn = fd.kind == DK_FN;
+  }
+  if is_fn {
+    let doc = str_of(j, jpath2(j, params, "textDocument", "uri"));
+    w_s(&mut res_, "[");
+    w_call_item(&mut res_, &mut st, f.ix, f.res.idx, doc);
+    w_s(&mut res_, "]");
+    bfree(doc);
+  } else {
+    w_s(&mut res_, "null");
+  }
+  send_result(&mut con, id, res_);
+  vec_free(res_);
+  pg_free(f.ix);
+}
+
+/// Incoming or outgoing calls of the function an item names: the item's
+/// `data` holds the open document whose program to look in.
+fn on_calls(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64], incoming: bool) {
+  let params = jget(j, root, "params");
+  let data = jpath2(j, params, "item", "data");
+  let doc = str_of(j, jget(j, data, "doc"));
+  let ns = jnum(j, jget(j, data, "ns"));
+  let k = find_doc(&mut st, doc);
+  let mut res_ = vec_new[u64]();
+  w_s(&mut res_, "[");
+  if k > 0 {
+    let path = doc_copy(&mut st.paths, k - 1);
+    let ix = pg_for(host, &mut st, path);
+    bfree(path);
+    let mut d = 0;
+    let mut found = false;
+    while d < vec_len(ix.defs) && !found
+    {
+      let df = vec_get(ix.defs, d);
+      if df.kind == DK_FN && df.ns == ns {
+        found = true;
+      } else {
+        d = vadd(d, 1);
+      }
+    }
+    if found {
+      let mut tr = vec_new[u64]();
+      if incoming {
+        calls_in(ix, d, &mut tr);
+      } else {
+        calls_out(ix, d, &mut tr);
+      }
+      let mut seen = vec_new[u64]();
+      let mut a = 0;
+      while vadd(a, 2) < vec_len(tr)
+      {
+        let who = u_at(tr, a);
+        let mut dup = false;
+        let mut q = 0;
+        while q < vec_len(seen)
+        {
+          if u_at(seen, q) == who {
+            dup = true;
+          }
+          q = vadd(q, 1);
+        }
+        if !dup {
+          if vec_len(seen) > 0 {
+            vec_push(&mut res_, 44);
+          }
+          vec_push(&mut seen, who);
+          if incoming {
+            w_s(&mut res_, "{\"from\":");
+          } else {
+            w_s(&mut res_, "{\"to\":");
+          }
+          w_call_item(&mut res_, &mut st, ix, who, doc);
+          w_s(&mut res_, ",\"fromRanges\":[");
+          let target = def_at(ix, d);
+          let mut file = target.file;
+          if incoming {
+            let caller = def_at(ix, who);
+            file = caller.file;
+          }
+          let mut b = 0;
+          let mut first = true;
+          while vadd(b, 2) < vec_len(tr)
+          {
+            if u_at(tr, b) == who {
+              if !first {
+                vec_push(&mut res_, 44);
+              }
+              w_range(&mut res_, ix.all, u_at(ix.fstart, file), u_at(tr, vadd(b, 1)), u_at(tr, vadd(b, 2)));
+              first = false;
+            }
+            b = vadd(b, 3);
+          }
+          w_s(&mut res_, "]}");
+        }
+        a = vadd(a, 3);
+      }
+      vec_free(seen);
+      vec_free(tr);
+    }
+    pg_free(ix);
+  }
+  w_s(&mut res_, "]");
+  bfree(doc);
+  send_result(&mut con, id, res_);
+  vec_free(res_);
+}
+
+/// A lens with the number of references over each top-level function,
+/// struct and enum of the document; the title is all it carries.
+fn on_codelens(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
+  let params = jget(j, root, "params");
+  let uri = str_of(j, jpath2(j, params, "textDocument", "uri"));
+  let k = find_doc(&mut st, uri);
+  bfree(uri);
+  let mut res_ = vec_new[u64]();
+  w_s(&mut res_, "[");
+  if k > 0 {
+    let path = doc_copy(&mut st.paths, k - 1);
+    let ix = pg_for(host, &mut st, path);
+    bfree(path);
+    let mut first = true;
+    let mut d = 0;
+    while d < vec_len(ix.defs) && d < 100000
+    {
+      let df = vec_get(ix.defs, d);
+      if df.file == 0 && df.parent == 0 {
+        let mut h = hits_new();
+        collect_refs(&mut h, &mut st, ix, Res { found: true, local: false, idx: d }, false, true);
+        if !first {
+          vec_push(&mut res_, 44);
+        }
+        w_s(&mut res_, "{\"range\":");
+        w_range(&mut res_, ix.all, u_at(ix.fstart, 0), df.ns, df.ne);
+        w_s(&mut res_, ",\"command\":{\"title\":\"");
+        w_num(&mut res_, vec_len(h.huri));
+        if vec_len(h.huri) == 1 {
+          w_s(&mut res_, " reference\",\"command\":\"\"}}");
+        } else {
+          w_s(&mut res_, " references\",\"command\":\"\"}}");
+        }
+        first = false;
+        hits_free(h);
+      }
+      d = vadd(d, 1);
+    }
+    pg_free(ix);
+  }
+  w_s(&mut res_, "]");
+  send_result(&mut con, id, res_);
+  vec_free(res_);
+}
+
+/// Does `all[s..e]` hold the letters of `q` in order, ignoring case?
+fn fuzzy_match(all: &Bytes, s: u64, e: u64, q: &Bytes) -> bool {
+  let mut qi = 0;
+  let mut k = s;
+  while k < e && k < blen(all) && qi < blen(q)
+  {
+    if lower(at(all, k)) == lower(at(q, qi)) {
+      qi = vadd(qi, 1);
+    }
+    k = vadd(k, 1);
+  }
+  return qi >= blen(q);
+}
+
+fn lower(c: u64) -> u64 {
+  if c >= 65 && c <= 90 {
+    return c + 32;
+  }
+  return c;
+}
+
+/// Adds the definitions of program `ix` whose names match `q` to `h`, as
+/// `SymbolInformation` objects.
+fn collect_symbols(h: &mut Hits, st: &mut State, ix: &Prog, q: &Bytes) {
+  let mut d = 0;
+  while d < vec_len(ix.defs) && vec_len(h.huri) < 500
+  {
+    let df = vec_get(ix.defs, d);
+    if fuzzy_match(ix.all, df.ns, df.ne, q) {
+      let uri = pg_uri(&mut st, ix, df.file);
+      let mut o = vec_new[u64]();
+      w_s(&mut o, "{\"name\":\"");
+      jesc_bytes(&mut o, ix.all, df.ns, df.ne);
+      w_s(&mut o, "\",\"kind\":");
+      w_num(&mut o, symbol_kind(df.kind));
+      if df.parent != 0 {
+        let pd = def_at(ix, df.parent - 1);
+        w_s(&mut o, ",\"containerName\":\"");
+        jesc_bytes(&mut o, ix.all, pd.ns, pd.ne);
+        w_s(&mut o, "\"");
+      }
+      w_s(&mut o, ",\"location\":{\"uri\":\"");
+      jesc_bytes(&mut o, uri, 0, blen(uri));
+      w_s(&mut o, "\",\"range\":");
+      w_range(&mut o, ix.all, u_at(ix.fstart, df.file), df.ns, df.ne);
+      w_s(&mut o, "}}");
+      let ob = to_bytes(o);
+      vec_free(o);
+      hits_add(&mut h, uri, ob);
+      bfree(uri);
+    }
+    d = vadd(d, 1);
+  }
+}
+
+/// `workspace/symbol`: the definitions, in every open document and the
+/// files they import, whose names hold the letters of the query in order.
+fn on_workspace_symbols(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
+  let params = jget(j, root, "params");
+  let q = str_of(j, jget(j, params, "query"));
+  let mut h = hits_new();
+  let mut k = 0;
+  while k < vec_len(st.paths)
+  {
+    let p = doc_copy(&mut st.paths, k);
+    let ix = pg_for(host, &mut st, p);
+    collect_symbols(&mut h, &mut st, ix, q);
+    pg_free(ix);
+    bfree(p);
+    k = vadd(k, 1);
+  }
+  let mut res_ = vec_new[u64]();
+  w_s(&mut res_, "[");
+  let mut n = 0;
+  while n < vec_len(h.hrange)
+  {
+    if n > 0 {
+      vec_push(&mut res_, 44);
+    }
+    let ob = doc_copy(&mut h.hrange, n);
+    push_bytes(&mut res_, ob);
+    bfree(ob);
+    n = vadd(n, 1);
+  }
+  w_s(&mut res_, "]");
+  send_result(&mut con, id, res_);
+  vec_free(res_);
+  hits_free(h);
+  bfree(q);
+}
+
+/// The cursor of a request: the program of the document and the offset.
+fn on_complete(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
+  let params = jget(j, root, "params");
+  let uri = str_of(j, jpath2(j, params, "textDocument", "uri"));
+  let k = find_doc(&mut st, uri);
+  bfree(uri);
+  let mut res_ = vec_new[u64]();
+  if k > 0 {
+    let path = doc_copy(&mut st.paths, k - 1);
+    let ix = pg_for(host, &mut st, path);
+    bfree(path);
+    let line = jnum(j, jpath2(j, params, "position", "line"));
+    let ch = jnum(j, jpath2(j, params, "position", "character"));
+    let off = lsp_to_off(ix.all, 0, line, ch);
+    w_s(&mut res_, "{\"isIncomplete\":false,\"items\":[");
+    complete_items(ix, off, &mut res_);
+    w_s(&mut res_, "]}");
+    pg_free(ix);
+  } else {
+    w_s(&mut res_, "null");
+  }
+  send_result(&mut con, id, res_);
+  vec_free(res_);
+}
+
+fn on_signature(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
+  let params = jget(j, root, "params");
+  let uri = str_of(j, jpath2(j, params, "textDocument", "uri"));
+  let k = find_doc(&mut st, uri);
+  bfree(uri);
+  let mut res_ = vec_new[u64]();
+  let mut have = false;
+  if k > 0 {
+    let path = doc_copy(&mut st.paths, k - 1);
+    let ix = pg_for(host, &mut st, path);
+    bfree(path);
+    let line = jnum(j, jpath2(j, params, "position", "line"));
+    let ch = jnum(j, jpath2(j, params, "position", "character"));
+    let off = lsp_to_off(ix.all, 0, line, ch);
+    have = signature_help(ix, off, &mut res_);
+    pg_free(ix);
+  }
+  if !have {
+    vec_free(res_);
+    res_ = vec_new[u64]();
+    w_s(&mut res_, "null");
+  }
+  send_result(&mut con, id, res_);
+  vec_free(res_);
+}
+
+fn on_semantic(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
+  let params = jget(j, root, "params");
+  let uri = str_of(j, jpath2(j, params, "textDocument", "uri"));
+  let k = find_doc(&mut st, uri);
+  bfree(uri);
+  let mut res_ = vec_new[u64]();
+  if k > 0 {
+    let path = doc_copy(&mut st.paths, k - 1);
+    let ix = pg_for(host, &mut st, path);
+    bfree(path);
+    w_s(&mut res_, "{\"data\":[");
+    semantic_tokens(ix, &mut res_);
+    w_s(&mut res_, "]}");
+    pg_free(ix);
+  } else {
+    w_s(&mut res_, "null");
+  }
+  send_result(&mut con, id, res_);
+  vec_free(res_);
+}
+
 fn on_format(con: &mut Serial, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
   let params = jget(j, root, "params");
   let uri = str_of(j, jpath2(j, params, "textDocument", "uri"));
@@ -1251,6 +1942,287 @@ fn on_format(con: &mut Serial, st: &mut State, j: &Json, root: u64, id: &Vec[u64
   vec_free(res_);
 }
 
+/// The path of `to` as an import in `from`: relative to the directory of
+/// `from`, with `../` for each directory to go up.
+fn rel_path(from: &Bytes, to: &Bytes) -> Bytes {
+  // `c` is the length of the common directory prefix, including its `/`.
+  let mut c = 0;
+  let mut k = 0;
+  while k < blen(from) && k < blen(to) && at(from, k) == at(to, k)
+  {
+    if at(from, k) == 47 {
+      c = vadd(k, 1);
+    }
+    k = vadd(k, 1);
+  }
+  let mut out = vec_new[u64]();
+  let mut q = c;
+  while q < blen(from)
+  {
+    if at(from, q) == 47 {
+      w_s(&mut out, "../");
+    }
+    q = vadd(q, 1);
+  }
+  let mut r = c;
+  while r < blen(to)
+  {
+    vec_push(&mut out, at(to, r));
+    r = vadd(r, 1);
+  }
+  let b = to_bytes(out);
+  vec_free(out);
+  return b;
+}
+
+/// Where a new `import` goes: after the leading ones.
+fn import_point(ix: &Prog) -> u64 {
+  let ts = u_at(ix.tstart, 0);
+  let te = file_toks_end(ix, 0);
+  let mut i = ts;
+  let mut off = 0;
+  while i < te && te - i > 2 && is_kw(tok_at(ix.toks, i), KW_IMPORT) && is_p(tok_at(ix.toks, vadd(i, 2)), P_SEMI)
+  {
+    off = tok_at_end(ix.toks, vadd(i, 2));
+    i = vadd(i, 3);
+  }
+  return off;
+}
+
+/// "unknown function `f`" (or variable): if another open document defines
+/// the name, offer to import it.
+fn fix_import(out: &mut Vec[u64], host: &Host, st: &mut State, ix: &Prog, uri: &Bytes, raw: &Vec[u64], name: &Vec[u64], path: &Bytes) {
+  if vec_len(name) == 0 {
+    return;
+  }
+  let mut k = 0;
+  while k < vec_len(st.paths)
+  {
+    let other = doc_copy(&mut st.paths, k);
+    if !bytes_same(other, path) {
+      let ox = pg_for(host, &mut st, other);
+      let mut d = 0;
+      let mut hit = false;
+      while d < vec_len(ox.defs) && !hit
+      {
+        let df = vec_get(ox.defs, d);
+        if df.file == 0 && df.parent == 0 && df.ne <= blen(ox.all) && df.kind != DK_VARIANT && df.kind != DK_FIELD {
+          let t = text_vec(ox.all, df.ns, df.ne);
+          hit = has_text_eq(t, name);
+          vec_free(t);
+        }
+        d = vadd(d, 1);
+      }
+      pg_free(ox);
+      if hit {
+        let rel = rel_path(path, other);
+        let mut title = vec_new[u64]();
+        w_s(&mut title, "Import `");
+        push_bytes(&mut title, rel);
+        w_s(&mut title, "`");
+        let at_off = import_point(ix);
+        let mut text = vec_new[u64]();
+        if at_off > 0 {
+          w_s(&mut text, "\n");
+        }
+        w_s(&mut text, "import \"");
+        push_bytes(&mut text, rel);
+        w_s(&mut text, "\";");
+        if at_off == 0 {
+          w_s(&mut text, "\n");
+        }
+        fix_one(&mut out, uri, ix.all, raw, title, at_off, at_off, text);
+        vec_free(title);
+        vec_free(text);
+        bfree(rel);
+      }
+    }
+    bfree(other);
+    k = vadd(k, 1);
+  }
+}
+
+fn doc_ix(host: &Host, st: &mut State, j: &Json, root: u64) -> Prog {
+  let params = jget(j, root, "params");
+  let uri = str_of(j, jpath2(j, params, "textDocument", "uri"));
+  let k = find_doc(&mut st, uri);
+  bfree(uri);
+  if k == 0 {
+    return pg_new();
+  }
+  let path = doc_copy(&mut st.paths, k - 1);
+  let ix = pg_for(host, &mut st, path);
+  bfree(path);
+  return ix;
+}
+
+fn on_folding(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
+  let ix = doc_ix(host, &mut st, j, root);
+  let mut out = vec_new[u64]();
+  folding_ranges(ix, &mut out);
+  let mut res_ = vec_new[u64]();
+  w_s(&mut res_, "[");
+  w_append(&mut res_, out);
+  w_s(&mut res_, "]");
+  send_result(&mut con, id, res_);
+  vec_free(res_);
+  vec_free(out);
+  pg_free(ix);
+}
+
+fn on_selection(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
+  let ix = doc_ix(host, &mut st, j, root);
+  let params = jget(j, root, "params");
+  let ps = jget(j, params, "positions");
+  let n = jcount(j, ps);
+  let mut res_ = vec_new[u64]();
+  w_s(&mut res_, "[");
+  if vec_len(ix.tstart) > 0 {
+    let mut k = 0;
+    while k < n && k < 10000
+    {
+      let p = jelem(j, ps, k);
+      let off = lsp_to_off(ix.all, 0, jnum(j, jget(j, p, "line")), jnum(j, jget(j, p, "character")));
+      if k > 0 {
+        vec_push(&mut res_, 44);
+      }
+      w_selection(&mut res_, ix, off);
+      k = vadd(k, 1);
+    }
+  }
+  w_s(&mut res_, "]");
+  send_result(&mut con, id, res_);
+  vec_free(res_);
+  pg_free(ix);
+}
+
+/// Each `import "file";` is a link to the file.
+fn on_links(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
+  let mut ix = doc_ix(host, &mut st, j, root);
+  let params = jget(j, root, "params");
+  let uri = str_of(j, jpath2(j, params, "textDocument", "uri"));
+  let k = find_doc(&mut st, uri);
+  bfree(uri);
+  let mut out = vec_new[u64]();
+  if k > 0 && vec_len(ix.tstart) > 0 {
+    let path = doc_copy(&mut st.paths, k - 1);
+    let dir = parent(path);
+    bfree(path);
+    let ts = u_at(ix.tstart, 0);
+    let te = file_toks_end(ix, 0);
+    let mut i = ts;
+    while i < te && te - i > 2 && is_kw(tok_at(ix.toks, i), KW_IMPORT)
+    {
+      let name = tok_at(ix.toks, vadd(i, 1));
+      if name.kind == K_STR && name.start <= name.end && name.end <= blen(ix.all) {
+        let rel = decode(ix.all, name.start, name.end);
+        let target = resolve(host, &mut ix.ld, dir, rel);
+        bfree(rel);
+        let tu = path_to_uri(target);
+        bfree(target);
+        if vec_len(out) > 0 {
+          vec_push(&mut out, 44);
+        }
+        w_s(&mut out, "{\"range\":");
+        w_range(&mut out, ix.all, 0, name.start, name.end);
+        w_s(&mut out, ",\"target\":\"");
+        jesc_bytes(&mut out, tu, 0, blen(tu));
+        w_s(&mut out, "\"}");
+        bfree(tu);
+      }
+      i = vadd(i, 3);
+    }
+    bfree(dir);
+  }
+  let mut res_ = vec_new[u64]();
+  w_s(&mut res_, "[");
+  w_append(&mut res_, out);
+  w_s(&mut res_, "]");
+  send_result(&mut con, id, res_);
+  vec_free(res_);
+  vec_free(out);
+  pg_free(ix);
+}
+
+fn on_inlay(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
+  let params = jget(j, root, "params");
+  let uri = str_of(j, jpath2(j, params, "textDocument", "uri"));
+  let k = find_doc(&mut st, uri);
+  bfree(uri);
+  let mut out = vec_new[u64]();
+  if k > 0 {
+    let path = doc_copy(&mut st.paths, k - 1);
+    let ix = pg_for(host, &mut st, path);
+    bfree(path);
+    let rs = jpath2(j, params, "range", "start");
+    let re = jpath2(j, params, "range", "end");
+    let s = lsp_to_off(ix.all, 0, jnum(j, jget(j, rs, "line")), jnum(j, jget(j, rs, "character")));
+    let e = lsp_to_off(ix.all, 0, jnum(j, jget(j, re, "line")), jnum(j, jget(j, re, "character")));
+    inlay_hints(ix, s, e, &mut out);
+    pg_free(ix);
+  }
+  let mut res_ = vec_new[u64]();
+  w_s(&mut res_, "[");
+  w_append(&mut res_, out);
+  w_s(&mut res_, "]");
+  send_result(&mut con, id, res_);
+  vec_free(res_);
+  vec_free(out);
+}
+
+/// The quick fixes for the diagnostics the editor sends with the request.
+fn on_code_action(con: &mut Serial, host: &Host, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
+  let params = jget(j, root, "params");
+  let uri = str_of(j, jpath2(j, params, "textDocument", "uri"));
+  let k = find_doc(&mut st, uri);
+  let mut out = vec_new[u64]();
+  if k > 0 {
+    let path = doc_copy(&mut st.paths, k - 1);
+    let ix = pg_for(host, &mut st, path);
+    bfree(path);
+    let diags = jpath2(j, params, "context", "diagnostics");
+    let n = jcount(j, diags);
+    let mut d = 0;
+    while d < n && d < 64
+    {
+      let dn = jelem(j, diags, d);
+      let rs = jpath2(j, dn, "range", "start");
+      let re = jpath2(j, dn, "range", "end");
+      let s = lsp_to_off(ix.all, 0, jnum(j, jget(j, rs, "line")), jnum(j, jget(j, rs, "character")));
+      let e = lsp_to_off(ix.all, 0, jnum(j, jget(j, re, "line")), jnum(j, jget(j, re, "character")));
+      let mut raw = vec_new[u64]();
+      jraw(j, dn, &mut raw);
+      let mut code = vec_new[u64]();
+      jdecode(j, jget(j, dn, "code"), &mut code);
+      let mut msg = vec_new[u64]();
+      jdecode(j, jget(j, dn, "message"), &mut msg);
+      if blen(ix.all) >= s && s <= e {
+        diag_fixes(&mut out, uri, ix, raw, code, msg, s, e);
+        if has_text(msg, "unknown function `") || has_text(msg, "unknown variable `") {
+          let nm = ticked(msg, 0);
+          let dp = doc_copy(&mut st.paths, k - 1);
+          fix_import(&mut out, host, &mut st, ix, uri, raw, nm, dp);
+          bfree(dp);
+          vec_free(nm);
+        }
+      }
+      vec_free(raw);
+      vec_free(code);
+      vec_free(msg);
+      d = vadd(d, 1);
+    }
+    pg_free(ix);
+  }
+  let mut res_ = vec_new[u64]();
+  w_s(&mut res_, "[");
+  w_append(&mut res_, out);
+  w_s(&mut res_, "]");
+  send_result(&mut con, id, res_);
+  vec_free(res_);
+  vec_free(out);
+  bfree(uri);
+}
+
 fn on_initialize(con: &mut Serial, st: &mut State, j: &Json, root: u64, id: &Vec[u64]) {
   let opts = jget(j, jget(j, root, "params"), "initializationOptions");
   let cmd = jget(j, opts, "bastioc");
@@ -1262,6 +2234,9 @@ fn on_initialize(con: &mut Serial, st: &mut State, j: &Json, root: u64, id: &Vec
   if jis_str(j, target) {
     bfree(st.target);
     st.target = str_of(j, target);
+  }
+  if jis_true(j, jget(j, opts, "checkOnChange")) {
+    st.on_change = true;
   }
   let libs = jget(j, opts, "lib");
   let n = jcount(j, libs);
@@ -1276,7 +2251,7 @@ fn on_initialize(con: &mut Serial, st: &mut State, j: &Json, root: u64, id: &Vec
   }
   let mut res_ = vec_new[u64]();
   w_s(&mut res_, "{\"capabilities\":{\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":{\"includeText\":false}},");
-  w_s(&mut res_, "\"hoverProvider\":true,\"definitionProvider\":true,\"documentSymbolProvider\":true,\"documentFormattingProvider\":true},");
+  w_s(&mut res_, "\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"documentHighlightProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"completionProvider\":{\"triggerCharacters\":[\".\",\":\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true,\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"function\",\"struct\",\"enum\",\"enumMember\",\"property\",\"variable\",\"parameter\"],\"tokenModifiers\":[\"declaration\",\"readonly\"]},\"full\":true},\"documentFormattingProvider\":true,\"inlayHintProvider\":true,\"foldingRangeProvider\":true,\"selectionRangeProvider\":true,\"codeLensProvider\":{},\"callHierarchyProvider\":true,\"documentLinkProvider\":{},\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\"]}},");
   w_s(&mut res_, "\"serverInfo\":{\"name\":\"bastio-lsp\"}}");
   send_result(&mut con, id, res_);
   vec_free(res_);
@@ -1321,7 +2296,7 @@ fn handle(con: &mut Serial, host: &mut Host, st: &mut State, msg: Bytes) -> u64 
       if n > 0 {
         let text = str_of(p.j, jget(p.j, jelem(p.j, changes, n - 1), "text"));
         set_doc(&mut st, uri, text);
-        publish(&mut con, &mut host, &mut st, uri, false);
+        publish(&mut con, &mut host, &mut st, uri, st.on_change);
       }
       bfree(uri);
     } else if vec_is(method, "textDocument/didSave") {
@@ -1337,8 +2312,42 @@ fn handle(con: &mut Serial, host: &mut Host, st: &mut State, msg: Bytes) -> u64 
       on_hover(&mut con, host, &mut st, p.j, root, id);
     } else if vec_is(method, "textDocument/definition") {
       on_definition(&mut con, host, &mut st, p.j, root, id);
+    } else if vec_is(method, "textDocument/references") {
+      on_references(&mut con, host, &mut st, p.j, root, id);
+    } else if vec_is(method, "textDocument/documentHighlight") {
+      on_highlight(&mut con, host, &mut st, p.j, root, id);
+    } else if vec_is(method, "textDocument/prepareRename") {
+      on_prepare_rename(&mut con, host, &mut st, p.j, root, id);
+    } else if vec_is(method, "textDocument/rename") {
+      on_rename(&mut con, host, &mut st, p.j, root, id);
+    } else if vec_is(method, "textDocument/completion") {
+      on_complete(&mut con, host, &mut st, p.j, root, id);
+    } else if vec_is(method, "textDocument/signatureHelp") {
+      on_signature(&mut con, host, &mut st, p.j, root, id);
+    } else if vec_is(method, "textDocument/semanticTokens/full") {
+      on_semantic(&mut con, host, &mut st, p.j, root, id);
+    } else if vec_is(method, "workspace/symbol") {
+      on_workspace_symbols(&mut con, host, &mut st, p.j, root, id);
     } else if vec_is(method, "textDocument/documentSymbol") {
       on_symbols(&mut con, host, &mut st, p.j, root, id);
+    } else if vec_is(method, "textDocument/foldingRange") {
+      on_folding(&mut con, host, &mut st, p.j, root, id);
+    } else if vec_is(method, "textDocument/prepareCallHierarchy") {
+      on_prepare_calls(&mut con, host, &mut st, p.j, root, id);
+    } else if vec_is(method, "callHierarchy/incomingCalls") {
+      on_calls(&mut con, host, &mut st, p.j, root, id, true);
+    } else if vec_is(method, "callHierarchy/outgoingCalls") {
+      on_calls(&mut con, host, &mut st, p.j, root, id, false);
+    } else if vec_is(method, "textDocument/codeLens") {
+      on_codelens(&mut con, host, &mut st, p.j, root, id);
+    } else if vec_is(method, "textDocument/selectionRange") {
+      on_selection(&mut con, host, &mut st, p.j, root, id);
+    } else if vec_is(method, "textDocument/documentLink") {
+      on_links(&mut con, host, &mut st, p.j, root, id);
+    } else if vec_is(method, "textDocument/inlayHint") {
+      on_inlay(&mut con, host, &mut st, p.j, root, id);
+    } else if vec_is(method, "textDocument/codeAction") {
+      on_code_action(&mut con, host, &mut st, p.j, root, id);
     } else if vec_is(method, "textDocument/formatting") {
       on_format(&mut con, &mut st, p.j, root, id);
     } else if is_request && vec_len(method) > 0 {
@@ -1365,6 +2374,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
     cmd: cmd,
     target: balloc(0),
     libs: vec_new[Bytes](),
+    on_change: false,
     shutdown: false
   };
   let mut status = 1;

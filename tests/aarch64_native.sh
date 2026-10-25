@@ -11,6 +11,10 @@
 # Needs an AArch64 assembler and linker driver (aarch64-linux-gnu-as and
 # aarch64-linux-gnu-gcc, or CC) and qemu-aarch64 (Debian/Ubuntu:
 # gcc-aarch64-linux-gnu qemu-user).
+#
+# NATIVE_OS=macos runs the same comparison on an Apple Silicon Mac, for the
+# Mach-O assembly (`--os macos`): the executables run natively, the programs
+# SELFHOST defaults to 0 there.
 set -u
 cd "$(dirname "$0")/.."
 tmp=$(mktemp -d)
@@ -18,11 +22,21 @@ trap 'rm -rf "$tmp"' EXIT
 BASTIOC=${BASTIOC:-$(tests/bastioc1.sh)} || exit 1
 . tests/pfor.sh
 . tests/stage1_only.sh
-if [ "$(uname -m)" = aarch64 ]; then RUN=; else
+OSARG=
+if [ "${NATIVE_OS:-linux}" = macos ]; then
+  OSARG="--os macos"
+  SELFHOST=${SELFHOST:-0}
+fi
+if [ "$(uname -m)" = aarch64 ] || [ -n "$OSARG" ]; then RUN=; else
   RUN=qemu-aarch64
   export QEMU_LD_PREFIX=${QEMU_LD_PREFIX:-/usr/aarch64-linux-gnu}
 fi
-export BASTIOC RUN
+# SELF_LINK=1: bastioc1's own assembler and linker; GNU_LINK=1: the platform's
+# as and cc. Neither: the default (own linker on a glibc AArch64 host).
+LINKARG=
+[ -n "${SELF_LINK:-}" ] && LINKARG=--self-link
+[ -n "${GNU_LINK:-}" ] && LINKARG=--gnu-link
+export BASTIOC RUN OSARG LINKARG
 # One program; JOBS of them at a time.
 both() {
   local f=$1 want xs cs
@@ -30,7 +44,7 @@ both() {
     echo "FAIL $f: the C backend rejected it"; echo =fail; return
   fi
   "$w/c.exe" </dev/null >"$w/c.out" 2>/dev/null; cs=$?
-  "$BASTIOC" --arch aarch64 --backend native -o "$w/x.exe" "$f" 2>"$w/err"; rc=$?
+  "$BASTIOC" --arch aarch64 --backend native $OSARG $LINKARG -o "$w/x.exe" "$f" 2>"$w/err"; rc=$?
   if [ $rc = 4 ]; then echo "skip $f: $(grep -o 'does not cover.*' "$w/err" | head -1)"; echo =skip; return; fi
   if [ $rc != 0 ]; then echo "FAIL $f: AArch64 native build failed"; sed 's/^/    /' "$w/err" | head -20; echo =fail; return; fi
   $RUN "$w/x.exe" </dev/null >"$w/x.out" 2>/dev/null; xs=$?
@@ -43,6 +57,15 @@ both() {
 export -f both
 lost=0
 pfor both $(s1files tests/pass/*.bastio bench/*.bastio) || lost=1
+# A copy to or from a page lent to a device is ordered both ways (`dmb osh`,
+# as the C prelude's bytes_to_dma and dma_to_bytes are): two copies, four
+# barriers, besides the two full ones of dma_lend and dma_take.
+"$BASTIOC" --arch aarch64 --backend native $OSARG --emit-asm -o "$tmp/dma.s" tests/ir_a64/dma_copy.bastio 2>/dev/null
+if [ "$(grep -c 'dmb osh' "$tmp/dma.s")" = 4 ] && [ "$(grep -c 'dmb ish' "$tmp/dma.s")" = 2 ]; then
+  echo "aarch64 native: DMA copies carry dmb osh before and after"
+else
+  echo "FAIL tests/ir_a64/dma_copy.bastio: the DMA copies are not bracketed by dmb osh"; lost=1
+fi
 # The compiler itself, built for AArch64 with no C compiler on its code, must
 # compile itself to the same C as the build that runs here. It needs z3 on
 # the machine (qemu-aarch64 runs it as a host program).

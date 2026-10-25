@@ -313,18 +313,53 @@ typedef uint64_t bst_lease;                 /* the address of the table it holds
  * (bst_lock_depth). */
 static inline void bst_mmu_settle(void);    /* defined per target */
 static inline void bst_lock_depth(int d);   /* defined per target */
+#ifndef BST_SPIN_PLAIN
+#define BST_SPIN_PLAIN 4096u
+#endif
+#ifdef BST_LOCKSTAT
+/* Diagnostic build (-DBST_LOCKSTAT): per lock, how many times it was taken,
+ * how many of those had to wait, and the time spent waiting and holding,
+ * in TSC ticks. Read bst_lockstat from a debugger. */
+struct bst_ls { uint64_t *w; uint64_t acq, contended, wait, hold, t0; };
+struct bst_ls bst_lockstat[8];
+static inline struct bst_ls *bst_ls_of(uint64_t *w) {
+    for (int i = 0; i < 8; i++) {
+        uint64_t *o = 0;
+        if (__atomic_load_n(&bst_lockstat[i].w, __ATOMIC_ACQUIRE) == w) return &bst_lockstat[i];
+        if (__atomic_compare_exchange_n(&bst_lockstat[i].w, &o, w, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return &bst_lockstat[i];
+    }
+    return &bst_lockstat[7];
+}
+#endif
 static inline void bst_lock_acquire(uint64_t *w) {
+#ifdef BST_LOCKSTAT
+    uint64_t bst_t0 = __builtin_ia32_rdtsc();
+    int bst_waited = 0;
+#endif
     while (__atomic_exchange_n(w, 1, __ATOMIC_ACQUIRE)) {
+#ifdef BST_LOCKSTAT
+        bst_waited = 1;
+#endif
         bst_mmu_settle();
+        unsigned bst_spins = 0;
         while (__atomic_load_n(w, __ATOMIC_RELAXED)) {
 #if defined(__x86_64__) || defined(__i386__)
-            __asm__ volatile ("pause");
+            if (++bst_spins > BST_SPIN_PLAIN) __asm__ volatile ("pause");
 #endif
         }
     }
+#ifdef BST_LOCKSTAT
+    { struct bst_ls *l = bst_ls_of(w); uint64_t t = __builtin_ia32_rdtsc();
+      l->acq++; l->contended += bst_waited; l->wait += t - bst_t0; l->t0 = t; }
+#endif
     bst_lock_depth(1);
 }
-static inline void bst_lock_release(uint64_t *w) { __atomic_store_n(w, 0, __ATOMIC_RELEASE); bst_lock_depth(-1); }
+static inline void bst_lock_release(uint64_t *w) {
+#ifdef BST_LOCKSTAT
+    { struct bst_ls *l = bst_ls_of(w); l->hold += __builtin_ia32_rdtsc() - l->t0; }
+#endif
+    __atomic_store_n(w, 0, __ATOMIC_RELEASE); bst_lock_depth(-1);
+}
 static inline bst_buf bst_set(bst_buf b, uint64_t i, uint64_t v) { b.data[i] = v; return b; }
 "#;
 
@@ -346,6 +381,7 @@ static bst_buf bst_alloc(uint64_t n) {
 static bst_buf bst_try_alloc(uint64_t n) {
     bst_buf b;
     b.data = (uint64_t *)calloc(n ? n : 1, sizeof(uint64_t));
+    __asm__ volatile ("" : "+r"(b.data)); /* clang drops a calloc that is only freed, and with it the failure */
     b.len = b.data ? n : 0;
     return b;
 }
@@ -373,6 +409,7 @@ static bst_bytes bst_balloc(uint64_t n) {
 static bst_bytes bst_try_balloc(uint64_t n) {
     bst_bytes b;
     b.data = (unsigned char *)calloc(n ? n : 1, 1);
+    __asm__ volatile ("" : "+r"(b.data)); /* clang drops a calloc that is only freed, and with it the failure */
     b.len = b.data ? n : 0;
     return b;
 }
@@ -385,9 +422,13 @@ static uint64_t bst_host_argc(bst_host h) { (void)h; return (uint64_t)bst_argc; 
 static bst_bytes bst_host_arg(bst_host h, uint64_t i) {
     (void)h;
     if (i >= (uint64_t)bst_argc) return bst_balloc(0);
-    size_t n = strlen(bst_argv[i]);
+    const char *a = bst_argv[i];
+#ifdef _WIN32
+    if (i == 0 && _pgmptr) a = _pgmptr;   /* argv[0] may lack the .exe that opens the file */
+#endif
+    size_t n = strlen(a);
     bst_bytes b = bst_balloc(n);
-    memcpy(b.data, bst_argv[i], n);
+    memcpy(b.data, a, n);
     return b;
 }
 static char *bst_cpath(bst_bytes p) {   /* a NUL-terminated copy; a NUL inside ends the path */
@@ -395,6 +436,9 @@ static char *bst_cpath(bst_bytes p) {   /* a NUL-terminated copy; a NUL inside e
     if (!c) { fputs("Bastio: out of memory\n", stderr); abort(); }
     memcpy(c, p.data, p.len);
     c[p.len] = 0;
+#ifdef _WIN32
+    if (p.len == 9 && memcmp(c, "/dev/null", 9) == 0) memcpy(c, "NUL", 4);
+#endif
     return c;
 }
 static bool bst_host_read(bst_host h, bst_bytes path, bst_bytes *out) {
@@ -444,17 +488,28 @@ static void bst_host_eprint(bst_host h, bst_bytes b) {
 static uint64_t bst_run_at[1], bst_run_id[2], bst_runs;
 static uint32_t bst_pt_leases[BST_HOSTED_PAGES], bst_shared_refs[BST_HOSTED_PAGES];
 #define BST_MMIO_CHECK(b, l) ((void)(b), (void)(l))
+#ifdef _WIN32
+#include <malloc.h>
+#endif
 static bst_pool bst_pool_init(void) {
     bst_pool p;
     p.size = BST_HOSTED_PAGES;
+#ifdef _WIN32
+    p.base = (uint64_t)_aligned_malloc(BST_HOSTED_PAGES * 4096, 4096);
+#else
     p.base = (uint64_t)aligned_alloc(4096, BST_HOSTED_PAGES * 4096);
+#endif
     if (!p.base) { fputs("Bastio: out of memory\n", stderr); abort(); }
     bst_run_at[0] = p.base;
     bst_run_id[1] = BST_HOSTED_PAGES;
     bst_runs = 1;
     return p;
 }
+#ifdef _WIN32
+static void bst_pool_fini(bst_pool p) { _aligned_free((void *)p.base); }
+#else
 static void bst_pool_fini(bst_pool p) { free((void *)p.base); }
+#endif
 "#;
 
 /* Pages and page tables: shared by the hosted simulation and the kernel.
@@ -464,6 +519,14 @@ const PRELUDE_PAGES: &str = r#"
 #define BST_PTE_P 1ull
 #define BST_PTE_W 2ull
 #define BST_PTE_U 4ull
+/* A page the program may write is never one it may run (W^X): the entry
+ * has the no-execute bit when it is made writable (pt_put_frame and
+ * pt_put_shared with w), and has not when made read-only, so a page is
+ * executable if it was mapped read-only (program text) or if the kernel
+ * made it so by mapping it again read-only. pt_set_access leaves the bit
+ * alone: a page that becomes writable for a copy-on-write fault keeps what
+ * its mapping chose. Needs EFER.NXE (boot.S). */
+#define BST_PTE_NX (1ull << 63)
 #define BST_PTE_ADDR 0x000FFFFFFFFFF000ull
 static inline void bst_zero_page(uint64_t a) {
 #if defined(__x86_64__)
@@ -506,6 +569,9 @@ static inline void bst_frame_to_bytes(bst_bytes *dst, uint64_t d, bst_frame f, u
 static inline void bst_bytes_to_frame(bst_frame *f, uint64_t o, bst_bytes src, uint64_t s, uint64_t n) {
     if (n) bst_copy_fwd((unsigned char *)*f + o, src.data + s, n);
 }
+static inline void bst_frame_to_frame(bst_frame *d, uint64_t o, bst_frame f, uint64_t s, uint64_t n) {
+    if (n) bst_copy_fwd((unsigned char *)*d + o, (const unsigned char *)f + s, n);
+}
 static inline bst_pt bst_pt_new(bst_frame f, uint64_t level) {
     uint64_t *e = (uint64_t *)f;
     bst_zero_page(f);      /* f may be a page that held data, not a fresh one */
@@ -513,6 +579,12 @@ static inline bst_pt bst_pt_new(bst_frame f, uint64_t level) {
     return f;
 }
 static inline bst_frame bst_pt_free(bst_pt t) { return t; }
+/* Counts every entry taken out of any table, and every protection change: a processor whose TLB may
+ * still hold the entry reloads CR3 before it runs user code again if the
+ * count moved since its last load (bst_cpu_run, bst_mmu_enter). Putting an
+ * entry into an empty slot needs no reload: x86 caches no translation for
+ * a slot that was not present. */
+uint64_t bst_pt_gen;
 /* A last-level slot the program may not touch (pt_set_access 0) keeps its
  * page with the present bit clear, marked by a bit the CPU ignores in a
  * non-present entry, so the table still owns it. */
@@ -524,6 +596,7 @@ static inline void bst_pt_set_access(bst_pt *t, uint64_t i, uint64_t a) {
     uint64_t e = ((uint64_t *)*t)[i] & ~(BST_PTE_P | BST_PTE_W | BST_PTE_HIDDEN);
     e |= a == 0 ? BST_PTE_HIDDEN : (BST_PTE_P | (a == 2 ? BST_PTE_W : 0));
     __atomic_store_n(&((uint64_t *)*t)[i], e, __ATOMIC_RELEASE);
+    __atomic_fetch_add(&bst_pt_gen, 1, __ATOMIC_SEQ_CST);
 }
 /* Another processor may be walking the table (it holds a lease on the
  * tree), so an entry is written with one 64-bit store, present bit
@@ -532,7 +605,7 @@ static inline void bst_pt_put(bst_pt *t, uint64_t i, bst_pt c) {
     __atomic_store_n(&((uint64_t *)*t)[i], c | BST_PTE_P | BST_PTE_W | BST_PTE_U, __ATOMIC_RELEASE);
 }
 static inline void bst_pt_put_frame(bst_pt *t, uint64_t i, bst_frame f, bool w) {
-    __atomic_store_n(&((uint64_t *)*t)[i], f | BST_PTE_P | BST_PTE_U | (w ? BST_PTE_W : 0), __ATOMIC_RELEASE);
+    __atomic_store_n(&((uint64_t *)*t)[i], f | BST_PTE_P | BST_PTE_U | (w ? BST_PTE_W | BST_PTE_NX : 0), __ATOMIC_RELEASE);
 }
 /* What slot i points to, left in place (pt_borrow). */
 static inline uint64_t bst_pt_child(bst_pt t, uint64_t i) { return ((uint64_t *)t)[i] & BST_PTE_ADDR; }
@@ -545,12 +618,6 @@ static inline uint64_t bst_pt_lease_count(bst_pt *t) {
     bst_mmu_settle_on(*t);
     return __atomic_load_n(&bst_pt_leases[bst_frame_id(*t)], __ATOMIC_ACQUIRE);
 }
-/* Counts every entry taken out of any table: a processor whose TLB may
- * still hold the entry reloads CR3 before it runs user code again if the
- * count moved since its last load (bst_cpu_run, bst_mmu_enter). Putting an
- * entry into an empty slot needs no reload: x86 caches no translation for
- * a slot that was not present. */
-static uint64_t bst_pt_gen;
 static inline uint64_t bst_pt_take(bst_pt *t, uint64_t i) {
     uint64_t *e = &((uint64_t *)*t)[i];
     uint64_t a = *e & BST_PTE_ADDR;
@@ -573,7 +640,7 @@ static inline uint64_t bst_shared_drop(bst_pool *p, bst_frame s) {
 static inline uint64_t bst_shared_id(bst_frame s) { return bst_frame_id(s); }
 static inline bool bst_pt_shared(bst_pt t, uint64_t i) { return (((uint64_t *)t)[i] & BST_PTE_SHARED) != 0; }
 static inline void bst_pt_put_shared(bst_pt *t, uint64_t i, bst_frame s, bool w) {
-    __atomic_store_n(&((uint64_t *)*t)[i], s | BST_PTE_P | BST_PTE_U | BST_PTE_SHARED | (w ? BST_PTE_W : 0), __ATOMIC_RELEASE);
+    __atomic_store_n(&((uint64_t *)*t)[i], s | BST_PTE_P | BST_PTE_U | BST_PTE_SHARED | (w ? BST_PTE_W | BST_PTE_NX : 0), __ATOMIC_RELEASE);
 }
 #define bst_pt_take_shared bst_pt_take
 static inline bst_frame bst_pt_dup_shared(bst_pt t, uint64_t i) { return bst_shared_dup(((uint64_t *)t)[i] & BST_PTE_ADDR); }
@@ -628,7 +695,7 @@ static void bst_puthex(uint64_t v) {
 }
 
 /* Memory for Buf: a fixed arena with an exact-size free list, then the
- * extension bst_pool_init carves from RAM (a 16th of the pool, at least 4 MiB), so
+ * extension bst_pool_init carves from RAM (an eighth of the pool, at least 4 MiB), so
  * the kernel's own tables can grow with the machine. */
 #define BST_ARENA_WORDS (1u << 20)   /* 8 MiB */
 static uint64_t bst_arena[BST_ARENA_WORDS];
@@ -717,7 +784,7 @@ static void bst_print(uint64_t v) {
  * PCI one below 4 GiB have none. A map outside the first 1 GiB is not read.
  * The front of the run that holds them is carved off for the pool's
  * bookkeeping: two 32-bit counters a page (leases, shared references) and
- * the arena's extension of a 16th of the pool (at least 4 MiB). */
+ * the arena's extension of an eighth of the pool (at least 4 MiB). */
 extern char _end[];
 /* Where the image starts, if the linker script says: the runs of RAM from
  * 1 MiB up to it join the pool, since nothing else uses them. */
@@ -822,7 +889,7 @@ static bst_pool bst_pool_init(uint64_t mbi) {
     }
     /* The bookkeeping, from the first run with room (the arena extension
      * only if there is room for it too). */
-    uint64_t counters = (pages * 8 + 4095) / 4096, ext = pages / 16, r = n;
+    uint64_t counters = (pages * 8 + 4095) / 4096, ext = pages / 8, r = n;
     if (ext < 1024) ext = pages / 8 < 1024 ? pages / 8 : 1024;   /* at least 4 MiB, at most an eighth */
     for (int tries = 0; tries < 2 && r == n; tries++) {
         if (tries) ext = 0;
@@ -903,10 +970,20 @@ const PRELUDE_CHILD: &str = r#"
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <io.h>
+#include <process.h>
+/* The parent's ends of the pipes are not inherited (_O_NOINHERIT), so closing
+ * a child's input reaches it as end of file. */
+#define pipe(p) _pipe((p), 65536, _O_BINARY | _O_NOINHERIT)
+#else
 #include <sys/wait.h>
 #include <spawn.h>
 extern char **environ;
-typedef struct { int pid; int in; FILE *out; } bst_child;
+#endif
+typedef struct { intptr_t pid; int in; FILE *out; } bst_child;
 /* A child that cannot be started (no such program, no pipes or processes
  * left) behaves like one that exited with 127 without output, which is
  * what a failed exec in the child looks like anyway. */
@@ -916,15 +993,62 @@ static bst_child bst_host_spawn(bst_host h, bst_vec argv) {
     int to[2], from[2];
     if (argv.len == 0 || pipe(to) != 0) return c;
     if (pipe(from) != 0) { close(to[0]); close(to[1]); return c; }
+#ifndef _WIN32
     /* The parent's ends are not inherited by later children, so closing a
      * child's input reaches it as end of file. */
     fcntl(to[1], F_SETFD, FD_CLOEXEC);
     fcntl(from[0], F_SETFD, FD_CLOEXEC);
+#endif
     char **av = (char **)malloc((argv.len + 1) * sizeof(char *));
     if (!av) { fputs("Bastio: out of memory\n", stderr); abort(); }
     for (uint64_t i = 0; i < argv.len; i++) av[i] = bst_cpath(((bst_bytes *)argv.data)[i]);
     av[argv.len] = NULL;
     fflush(NULL);
+#ifdef _WIN32
+    /* CreateProcess with the child's ends as its standard handles, made
+     * inheritable only while it starts. */
+    intptr_t pid = -1;
+    {
+        size_t cap = 1;
+        for (uint64_t i = 0; i < argv.len; i++) cap += 2 * strlen(av[i]) + 3;
+        char *cl = (char *)malloc(cap), *w = cl;
+        if (!cl) { fputs("Bastio: out of memory\n", stderr); abort(); }
+        for (uint64_t i = 0; i < argv.len; i++) {
+            const char *a = av[i];
+            int q = !*a || strpbrk(a, " \t\"") != NULL;
+            if (i) *w++ = ' ';
+            if (q) *w++ = '"';
+            size_t b = 0;
+            for (; *a; a++) {
+                if (*a == '\\') { b++; continue; }
+                if (*a == '"') b = 2 * b + 1;
+                for (; b; b--) *w++ = '\\';
+                *w++ = *a;
+            }
+            for (b = q ? 2 * b : b; b; b--) *w++ = '\\';
+            if (q) *w++ = '"';
+        }
+        *w = 0;
+        HANDLE hin = (HANDLE)_get_osfhandle(to[0]), hout = (HANDLE)_get_osfhandle(from[1]);
+        SetHandleInformation(hin, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        SetHandleInformation(hout, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        STARTUPINFOA si;
+        PROCESS_INFORMATION pi;
+        memset(&si, 0, sizeof si);
+        si.cb = sizeof si;
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = hin;
+        si.hStdOutput = hout;
+        si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+        if (CreateProcessA(NULL, cl, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+            CloseHandle(pi.hThread);
+            pid = (intptr_t)pi.hProcess;
+        }
+        SetHandleInformation(hin, HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(hout, HANDLE_FLAG_INHERIT, 0);
+        free(cl);
+    }
+#else
     /* posix_spawn, not fork: the parent's memory is never copied, which a
      * kernel without copy-on-write (BastiOS) cannot do for a large one.
      * The parent's ends are close-on-exec already. */
@@ -938,12 +1062,15 @@ static bst_child bst_host_spawn(bst_host h, bst_vec argv) {
             posix_spawnp(&pid, av[0], &fa, NULL, av, environ) != 0) pid = -1;
         posix_spawn_file_actions_destroy(&fa);
     }
+#endif
     for (uint64_t i = 0; i < argv.len; i++) free(av[i]);
     free(av);
     close(to[0]);
     close(from[1]);
     if (pid < 0) { close(to[1]); close(from[0]); return c; }
+#ifdef SIGPIPE
     signal(SIGPIPE, SIG_IGN);   /* writing to a child that has exited fails instead */
+#endif
     c.pid = pid;
     c.in = to[1];
     c.out = fdopen(from[0], "rb");
@@ -978,6 +1105,9 @@ static bool bst_child_read_line(bst_child *c, bst_bytes *out) {
         d[n++] = (unsigned char)ch;
     }
     if (ch == EOF && n == 0) { free(d); return false; }
+#ifdef _WIN32
+    if (n && d[n - 1] == '\r') n--;   /* Windows tools end their lines with CRLF */
+#endif
     free(out->data);
     out->len = n;
     out->data = d;
@@ -988,10 +1118,15 @@ static uint64_t bst_child_wait(bst_child c) {
     if (c.out) fclose(c.out);
     if (c.pid < 0) return 127;
     int st;
-    while (waitpid(c.pid, &st, 0) < 0) {}
+#ifdef _WIN32
+    if (_cwait(&st, c.pid, 0) < 0) return 255;
+    return (uint64_t)(unsigned)st;
+#else
+    while (waitpid((pid_t)c.pid, &st, 0) < 0) {}
     if (WIFEXITED(st)) return (uint64_t)WEXITSTATUS(st);
     if (WIFSIGNALED(st)) return 128 + (uint64_t)WTERMSIG(st);
     return 255;
+#endif
 }
 /* The environment variable `name`, if it is set. */
 static bool bst_host_env(bst_host h, bst_str name, bst_bytes *out) {
@@ -1008,9 +1143,17 @@ static bool bst_host_env(bst_host h, bst_str name, bst_bytes *out) {
     return true;
 }
 /* The number of processors online (at least 1). */
+#if defined(__APPLE__) && !defined(_SC_NPROCESSORS_ONLN)
+#define _SC_NPROCESSORS_ONLN 58 /* -std=c11 hides it from <unistd.h> */
+#endif
 static uint64_t bst_host_cpus(bst_host h) {
     (void)h;
+#ifdef _WIN32
+    const char *e = getenv("NUMBER_OF_PROCESSORS");
+    long n = e ? atol(e) : 1;
+#else
     long n = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
     return n < 1 ? 1 : (uint64_t)n;
 }
 "#;
@@ -1054,13 +1197,22 @@ static bool bst_vec_try_grow(bst_vec *v, uint64_t k, uint64_t size) {
 static inline void bst_bset(bst_bytes *b, uint64_t i, uint64_t v) { b->data[i] = (unsigned char)v; }
 /* Bulk copies. The prover has shown both ranges in bounds, so there are no
  * checks. Kernels are built with -mgeneral-regs-only and no libc, so on
- * x86-64 a forward copy is rep movsq then rep movsb, and nothing here calls
- * memcpy or memmove. */
+ * x86-64 a forward copy is one rep movsb where the platform has set
+ * bst_copy_erms (CPUID.7:EBX bit 9: fast strings copy by whole cache
+ * lines, faster than rep movsq on a page), else rep movsq then rep movsb
+ * (an emulator runs rep movsb byte by byte). Nothing here calls memcpy or
+ * memmove. */
+#if defined(__x86_64__)
+uint8_t bst_copy_erms;
+#endif
 static inline void bst_copy_fwd(unsigned char *d, const unsigned char *s, uint64_t n) {
 #if defined(__x86_64__)
-    uint64_t w = n >> 3, r = n & 7;
-    __asm__ volatile ("rep movsq" : "+D"(d), "+S"(s), "+c"(w) : : "memory");
-    __asm__ volatile ("rep movsb" : "+D"(d), "+S"(s), "+c"(r) : : "memory");
+    if (!bst_copy_erms) {
+        uint64_t w = n >> 3;
+        __asm__ volatile ("rep movsq" : "+D"(d), "+S"(s), "+c"(w) : : "memory");
+        n &= 7;
+    }
+    __asm__ volatile ("rep movsb" : "+D"(d), "+S"(s), "+c"(n) : : "memory");
 #else
     for (uint64_t k = 0; k < n; k++) d[k] = s[k];
 #endif

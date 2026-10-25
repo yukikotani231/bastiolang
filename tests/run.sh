@@ -76,8 +76,11 @@ fail_one() {
 user_one() {
   local f=$1 name
   name=$(basename "$f" .bastio)
+  # The C of a user program has x86 inline assembly, so it is only compiled
+  # on an x86-64 host.
   if "$BASTIOC" --target user -o "$w/$name.u.c" "$f" 2>"$w/$name.err" \
-     && ${CC:-cc} -c -ffreestanding -fpie -o "$w/$name.u.o" "$w/$name.u.c" 2>>"$w/$name.err"; then
+     && { [ "$(uname -m)" != x86_64 ] \
+          || ${CC:-cc} -c -ffreestanding -fpie -o "$w/$name.u.o" "$w/$name.u.c" 2>>"$w/$name.err"; }; then
     echo =pass
   else
     echo "FAIL $f"; sed 's/^/    /' "$w/$name.err"; echo =fail
@@ -116,7 +119,10 @@ case "$BASTIOC" in /*) abs=$BASTIOC ;; */*) abs=$PWD/$BASTIOC ;; *) abs=$BASTIOC
 for f in tests/diag/*.bastio; do
   name=$(basename "$f" .bastio)
   (cd tests/diag && "$abs" --check "$name.bastio" 2>"$tmp/diag.err" >/dev/null)
-  if cmp -s "$tmp/diag.err" "tests/diag/$name.err"; then
+  # The numbers of a counterexample are whatever model the solver picks,
+  # which differs between Z3 versions: compare their names, not their values.
+  nums='/= counterexample:/s/= [-]*[0-9][0-9]*/= N/g'
+  if cmp -s <(sed "$nums" "$tmp/diag.err") <(sed "$nums" "tests/diag/$name.err"); then
     pass=$((pass+1))
   else
     echo "FAIL $f: the error output differs from $name.err"; diff "tests/diag/$name.err" "$tmp/diag.err" | sed 's/^/    /'; fail=$((fail+1))
@@ -130,7 +136,7 @@ else
   echo "FAIL --help: no usage on standard output, or a nonzero exit"; fail=$((fail+1))
 fi
 want='examples/hello.bastio: error[E-SOLVER]: could not start the SMT solver `/nonexistent/z3` (install Z3 and put `z3` on PATH)'
-got=$(BASTIO_SOLVER=/nonexistent/z3 "$BASTIOC" --check examples/hello.bastio 2>&1)
+got=$(MSYS2_ENV_CONV_EXCL=BASTIO_SOLVER BASTIO_SOLVER=/nonexistent/z3 "$BASTIOC" --check examples/hello.bastio 2>&1)
 if [ "$got" = "$want" ]; then
   pass=$((pass+1))
 else
@@ -151,7 +157,9 @@ if [ -n "$stage0_compiler" ]; then
 else
   cp tests/trusted_base.txt "$tmp/tb.expect"
 fi
-if "$BASTIOC" --trusted-base | diff -u "$tmp/tb.expect" - >"$tmp/tb.diff"; then
+# (Line ends are not compared: a Windows checkout may have CR LF in the files.)
+tr -d '\r' <"$tmp/tb.expect" >"$tmp/tb.expect.lf"
+if "$BASTIOC" --trusted-base | tr -d '\r' | diff -u "$tmp/tb.expect.lf" - >"$tmp/tb.diff"; then
   pass=$((pass+1))
 else
   echo "FAIL trusted base changed; review it, then: $BASTIOC --trusted-base > tests/trusted_base.txt"
@@ -160,7 +168,8 @@ fi
 # The same for AArch64's preludes (stage1 only: stage0 has no AArch64 kernel
 # or user target).
 if [ -z "$stage0_compiler" ]; then
-  if "$BASTIOC" --arch aarch64 --trusted-base | diff -u tests/trusted_base_aarch64.txt - >"$tmp/tb.diff"; then
+  tr -d '\r' <tests/trusted_base_aarch64.txt >"$tmp/tb.a64.lf"
+  if "$BASTIOC" --arch aarch64 --trusted-base | tr -d '\r' | diff -u "$tmp/tb.a64.lf" - >"$tmp/tb.diff"; then
     pass=$((pass+1))
   else
     echo "FAIL AArch64 trusted base changed; review it, then: $BASTIOC --arch aarch64 --trusted-base > tests/trusted_base_aarch64.txt"
@@ -171,7 +180,10 @@ fi
 # `--lib` or BASTIO_LIB (docs/language.md, "Several files").
 mkdir -p "$tmp/away"
 printf 'import "core/option.bastio";\nfn main() -> u64 { return opt_or[u64](Option[u64]::Some(7), 0); }\n' >"$tmp/away/prog.bastio"
-if BASTIO_LIB= "$BASTIOC" --check "$tmp/away/prog.bastio" 2>"$tmp/away.err"; then
+if case "$(uname -s)" in MINGW*|MSYS*) true ;; *) false ;; esac; then
+  # BASTIO_LIB is a ';'-separated list of C:/ paths there, not ':'-separated.
+  echo "(--lib search skipped on Windows)"
+elif BASTIO_LIB= "$BASTIOC" --check "$tmp/away/prog.bastio" 2>"$tmp/away.err"; then
   echo "FAIL --lib: core found without --lib"; fail=$((fail+1))
 elif ! grep -q 'error\[E-IMPORT\]' "$tmp/away.err"; then
   echo "FAIL --lib: wrong error without --lib"; sed 's/^/    /' "$tmp/away.err"; fail=$((fail+1))

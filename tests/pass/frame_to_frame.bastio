@@ -1,0 +1,52 @@
+// expect-exit: 42
+// `frame_to_frame` copies a range of one page over a range of another in a
+// single copy, between offsets that need not line up with anything. Each
+// range is proved inside its page, so the copy has no checks.
+
+/// Byte k of the page is k * 7 mod 256.
+fn fill(f: &mut Frame) {
+  let mut k = 0;
+  while k < 4096
+    invariant k <= 4096
+  {
+    frame_write8(&mut f, k, cast[u8]((k * 7) % 256));
+    k = k + 1;
+  }
+}
+
+fn main(pool: &mut Pool) -> u64 {
+  if pool_size(pool) < 2 {
+    return 0;
+  }
+  let mut a = pool_take(&mut pool, 0);
+  let mut b = pool_take(&mut pool, 1);
+  fill(&mut a);
+  // An odd length and odd offsets: whole words and a tail.
+  frame_to_frame(&mut b, 3, a, 11, 4000);
+  let mut ok = true;
+  let mut k = 0;
+  while k < 4000
+    invariant k <= 4000
+  {
+    if frame_read8(b, 3 + k) != frame_read8(a, 11 + k) {
+      ok = false;
+    }
+    k = k + 1;
+  }
+  // Nothing was copied outside the range.
+  if frame_read8(b, 2) != 0 || frame_read8(b, 4003) != 0 {
+    ok = false;
+  }
+  // A whole page, and an empty range at the very end of one.
+  frame_to_frame(&mut b, 0, a, 0, 4096);
+  frame_to_frame(&mut b, 4096, a, 4096, 0);
+  if frame_read8(b, 4095) != frame_read8(a, 4095) {
+    ok = false;
+  }
+  pool_give(&mut pool, a);
+  pool_give(&mut pool, b);
+  if ok {
+    return 42;
+  }
+  return 1;
+}

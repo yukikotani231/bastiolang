@@ -13,25 +13,35 @@ on:
         required: true
 permissions:
   contents: read
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
 jobs:
   build:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 40
-    env:
-      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
       - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y z3
+        run: sudo grep -rlE 'packages\.microsoft\.com' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null | xargs -r sudo rm -f; sudo apt-get update && sudo apt-get install -y z3
       - name: The tag matches the version and the changelog
         run: |
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' stage0/Cargo.toml | head -1)
           [ "$TAG" = "v$version" ] || { echo "::error::tag $TAG but stage0/Cargo.toml says $version"; exit 1; }
           grep -q "^## \[$version\]" CHANGELOG.md || { echo "::error::CHANGELOG.md has no section for $version"; exit 1; }
-      - name: Build stage0
-        run: cd stage0 && RUSTFLAGS="-D warnings" cargo build --release --locked
+      - name: Build stage0 (paths remapped, so the binary does not depend on where it was built)
+        run: |
+          export RUSTFLAGS="-D warnings --remap-path-prefix=$PWD=/src --remap-path-prefix=$HOME/.cargo=/cargo"
+          cd stage0 && cargo build --release --locked
       - name: Tests
         run: |
           tests/run.sh
@@ -41,36 +51,40 @@ jobs:
           stage0/target/release/bastioc0 -o bastioc1-gen1 stage1/bastioc1.bastio
           ./bastioc1-gen1 -o bastioc1 stage1/bastioc1.bastio
       - name: Build the documentation site
+        if: matrix.arch == 'x86_64'
         run: |
           curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.52/mdbook-v0.4.52-x86_64-unknown-linux-gnu.tar.gz | tar xz -C /usr/local/bin
           site/build.sh
       - name: Package
         run: |
-          name=bastio-$TAG-x86_64-linux
+          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          name=bastio-$TAG-${{ matrix.arch }}-linux
           mkdir -p dist/$name/bin
           cp stage0/target/release/bastioc0 bastioc1 dist/$name/bin/
           cp README.md CHANGELOG.md LICENSE-APACHE LICENSE-MIT dist/$name/
           cp -r examples dist/$name/
-          tar -C dist -czf dist/$name.tar.gz $name
-          tar -C site/build -czf dist/bastio-$TAG-docs.tar.gz html
-          # The release notes are this version's section of the changelog.
-          awk -v v="${TAG#v}" '$0 ~ "^## \\[" v "\\]" {on=1; next} on && /^## \[/ {exit} on && !/^\[[^]]*\]: /' CHANGELOG.md > dist/notes.md
-          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+          # Fixed order, owner and time: the archive's bytes depend only on its contents.
+          tar_fixed() { tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$SOURCE_DATE_EPOCH" -C "$1" -cf - "$2" | gzip -n; }
+          tar_fixed dist $name > dist/$name.tar.gz
+          if [ "${{ matrix.arch }}" = x86_64 ]; then
+            tar_fixed site/build html > dist/bastio-$TAG-docs.tar.gz
+            # The release notes are this version's section of the changelog.
+            awk -v v="${TAG#v}" '$0 ~ "^## \\[" v "\\]" {on=1; next} on && /^## \[/ {exit} on && !/^\[[^]]*\]: /' CHANGELOG.md > dist/notes.md
+            # What does not work yet travels with every release: the README's Status section.
+            { echo; echo "### Status"; awk '/^## Status/ {on=1; next} on && /^## / {exit} on' README.md; } >> dist/notes.md
+          fi
       - name: Smoke test the package
         run: |
           d=$(mktemp -d)
-          tar -C "$d" -xzf dist/bastio-$TAG-x86_64-linux.tar.gz
+          tar -C "$d" -xzf dist/bastio-$TAG-${{ matrix.arch }}-linux.tar.gz
           for c in bastioc0 bastioc1; do
-            "$d"/bastio-$TAG-x86_64-linux/bin/$c -o "$d/hello" examples/hello.bastio
+            "$d"/bastio-$TAG-${{ matrix.arch }}-linux/bin/$c -o "$d/hello" examples/hello.bastio
             "$d/hello"
           done
       - uses: actions/upload-artifact@v5
         with:
-          name: bastio-${{ env.TAG }}
-          path: |
-            dist/*.tar.gz
-            dist/SHA256SUMS
-            dist/notes.md
+          name: bastio-${{ env.TAG }}-${{ matrix.arch }}
+          path: dist/*
   draft-release:
     # Only for a pushed tag, not for a build started by hand.
     if: github.event_name == 'push'
@@ -78,11 +92,20 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@v5
         with:
-          name: bastio-${{ github.ref_name }}
+          pattern: bastio-${{ github.ref_name }}-*
+          merge-multiple: true
           path: dist
+      - name: Checksums
+        run: cd dist && sha256sum *.tar.gz > SHA256SUMS
+      - name: Attest where the archives were built
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/*.tar.gz
       - name: Create a draft release
         env:
           GH_TOKEN: ${{ github.token }}

@@ -1,0 +1,70 @@
+// expect-exit: 0
+// expect-stdout: 2833
+// expect-stdout: 7
+// expect-stdout: 70
+// expect-stdout: 3
+// A vector field of a struct is read and written through the field's address
+// (`&s.k.table`, a constant above the struct); the native backend addresses
+// the word as a displacement off the struct, for a vector's data word, for
+// its elements and for a byte buffer, and the results are the same.
+struct Slot { tag: u64, val: u64 }
+struct Inner { a: u64, b: u64, c: u64, table: Vec[Slot], words: Vec[u64] }
+struct Outer { x: u64, k: Inner }
+
+fn take(v: &mut Vec[Slot], i: u64) -> Slot
+  requires i < vlen(v)
+{
+  let o = vec_get(v, i);
+  vec_set(&mut v, i, Slot { tag: 1, val: 0 });
+  return o;
+}
+
+fn go(s: &mut Outer, p: u64) -> u64
+  requires p < vlen(s.k.table)
+{
+  let o = take(&mut s.k.table, p);
+  return wrap_add(o.tag, o.val);
+}
+
+fn words_sum(s: &Outer) -> u64 {
+  let mut t = 0;
+  let mut i = 0;
+  while i < vec_len(s.k.words) {
+    t = wrap_add(t, vec_get(s.k.words, i));
+    i = i + 1;
+  }
+  return t;
+}
+
+fn main() -> u64 {
+  let mut s = Outer { x: 5, k: Inner { a: 1, b: 2, c: 3, table: vec_new[Slot](), words: vec_new[u64]() } };
+  let mut i = 0;
+  while i < 8 {
+    vec_push(&mut s.k.table, Slot { tag: i, val: i * 100 });
+    i = i + 1;
+  }
+  let mut t = 0;
+  i = 0;
+  while i < 8 {
+    if i < vec_len(s.k.table) {
+      t = wrap_add(t, go(&mut s, i));
+    }
+    i = i + 1;
+  }
+  print(wrap_add(t, s.x));
+  let mut g = 0;
+  if 3 < vec_len(s.k.table) {
+    g = go(&mut s, 3);
+  }
+  print(wrap_add(wrap_add(g, s.k.c), 3));
+  i = 0;
+  while i < 10 {
+    vec_push(&mut s.k.words, i * 2);
+    i = i + 1;
+  }
+  print(wrap_sub(words_sum(s), 20));
+  print(s.k.c);
+  vec_free(s.k.table);
+  vec_free(s.k.words);
+  return 0;
+}

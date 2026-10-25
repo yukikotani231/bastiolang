@@ -33,11 +33,19 @@ if command -v z3 >/dev/null; then
   step "tests/ra.sh";        tests/ra.sh
   step "tests/native.sh";    tests/native.sh
   step "tests/native.sh (IR emitter)"; BACKEND=native-ir tests/native.sh
+  step "tests/native.sh (IR emitter, GNU as and cc)"; GNU_LINK=1 BACKEND=native-ir tests/native.sh
+  if [ -e /lib/ld-musl-x86_64.so.1 ]; then step "tests/native.sh (IR emitter, musl loader)"; MUSL_LINK=1 BACKEND=native-ir tests/native.sh; fi
+  step "tests/as86.sh";      tests/as86.sh
+  step "tests/elfobj.sh";    tests/elfobj.sh
+  if command -v node >/dev/null; then step "tests/wasm.sh";      tests/wasm.sh; step "tests/wasm_lib.sh";  tests/wasm_lib.sh; else skipped+=("tests/wasm.sh (needs node)"); fi
+  step "tests/as64.sh";      tests/as64.sh
+  step "tests/macho.sh";     tests/macho.sh
   step "tests/proof_cache.sh"; tests/proof_cache.sh
   step "tests/tools.sh";     tests/tools.sh
   step "stage1/difftest.sh"; stage1/difftest.sh
   if command -v cvc5 >/dev/null; then
     step "tests/crosscheck.py (cvc5 confirms the proofs)"; tests/crosscheck.py --selftest; tests/crosscheck.py --min-agree 90
+    CROSSCHECK_BASTIOC=$PWD/stage0/target/release/bastioc1 tests/crosscheck.py --min-agree 90 stage1/bastioc1.bastio
   else
     skipped+=("tests/crosscheck.py (no cvc5: apt install cvc5)")
   fi

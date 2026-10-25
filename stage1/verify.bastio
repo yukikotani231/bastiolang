@@ -3001,15 +3001,7 @@ fn str_val(v: &mut Vr, p: &Parser, s: u64, e: u64) -> u64 {
 
 /// The spec fn named `s..e`, or 0.
 fn vspec_def(p: &Parser, s: u64, e: u64) -> u64 {
-  let mut k = p.specs.head;
-  while k != 0 {
-    let n = node_at(p.nodes, k);
-    if same(p.src, n.s, n.e, s, e) {
-      return k;
-    }
-    k = n.next;
-  }
-  return 0;
+  return ix_node(p, p.ix_specs, s, e);
 }
 
 /// Argument `j` of a call node.
@@ -4848,6 +4840,14 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
   if name_is(p, i, "len") || name_is(p, i, "slen") || name_is(p, i, "blen") || name_is(p, i, "vec_len") {
     return mk_u(&mut v, a0.a);
   }
+  return vbuiltin_1b(&mut v, c, &mut m, p, i, args, vals, &mut st);
+}
+
+fn vbuiltin_1b(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Vec[u64], vals: &Vec[u64], st: &mut VState) -> u64 {
+  let x0 = u_at(vals, 0);
+  let x1 = u_at(vals, 1);
+  let x2 = u_at(vals, 2);
+  let a0 = vl_at(v, x0);
   if name_is(p, i, "get") || name_is(p, i, "sget") || name_is(p, i, "bget") {
     let ix = term(v, x1);
     let g = app2(&mut v, OP_LT, ix, a0.a);
@@ -4975,10 +4975,35 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     prove(&mut v, st, g2, i, VC_BOUNDS);
     return v.unit;
   }
+  // From one page into another: neither page's contents are tracked, both
+  // stay the same pages.
+  if name_is(p, i, "frame_to_frame") {
+    let d = term(v, x1);
+    let s = term(v, u_at(vals, 3));
+    let n = term(v, u_at(vals, 4));
+    let page = num(&mut v, 4096);
+    let de = app2(&mut v, OP_ADD, d, n);
+    let g = app2(&mut v, OP_LE, de, page);
+    vm_prange(&mut v, p, args, 1, 4);
+    prove(&mut v, st, g, i, VC_BOUNDS);
+    let se = app2(&mut v, OP_ADD, s, n);
+    let g2 = app2(&mut v, OP_LE, se, page);
+    vm_prange(&mut v, p, args, 3, 4);
+    prove(&mut v, st, g2, i, VC_BOUNDS);
+    return v.unit;
+  }
   // A u8 always fits in a byte: the type says what E-VERIFY-BYTE used to prove.
   if name_is(p, i, "serial_write") {
     return v.unit;
   }
+  return vbuiltin_2(&mut v, c, &mut m, p, i, args, vals, &mut st);
+}
+
+fn vbuiltin_2(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Vec[u64], vals: &Vec[u64], st: &mut VState) -> u64 {
+  let x0 = u_at(vals, 0);
+  let x1 = u_at(vals, 1);
+  let x2 = u_at(vals, 2);
+  let a0 = vl_at(v, x0);
   if name_is(p, i, "serial_read") {
     return fresh_upto(&mut v, &mut st, "serial_read", 255);
   }
@@ -5122,6 +5147,14 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
   if name_is(p, i, "bfrom") {
     return mk(&mut v, VV_BUF, 0, a0.a, a0.b, 0, 0);
   }
+  return vbuiltin_3(&mut v, c, &mut m, p, i, args, vals, &mut st);
+}
+
+fn vbuiltin_3(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Vec[u64], vals: &Vec[u64], st: &mut VState) -> u64 {
+  let x0 = u_at(vals, 0);
+  let x1 = u_at(vals, 1);
+  let x2 = u_at(vals, 2);
+  let a0 = vl_at(v, x0);
   if name_is(p, i, "host_argc") {
     return fresh_u64_named(&mut v, "argc");
   }
@@ -5313,6 +5346,14 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     let r = app3(&mut v, OP_ITE, at0, term(v, k), sel);
     return mk_b(&mut v, r);
   }
+  return vbuiltin_4(&mut v, c, &mut m, p, i, args, vals, &mut st);
+}
+
+fn vbuiltin_4(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Vec[u64], vals: &Vec[u64], st: &mut VState) -> u64 {
+  let x0 = u_at(vals, 0);
+  let x1 = u_at(vals, 1);
+  let x2 = u_at(vals, 2);
+  let a0 = vl_at(v, x0);
   if name_is(p, i, "pt_writable") {
     // Whether the page in slot i of a last-level table may be written.
     // Nothing the proof tracks: the answer is unknown.
@@ -5405,6 +5446,14 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     put_back(&mut v, m, p, &mut st, u_at(args, 0), np);
     return mk_obj(&mut v, m, kind_ty(m, p, TY_PORTIO), b, n, 0);
   }
+  return vbuiltin_4_2(&mut v, c, &mut m, p, i, args, vals, &mut st);
+}
+
+fn vbuiltin_4_2(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Vec[u64], vals: &Vec[u64], st: &mut VState) -> u64 {
+  let x0 = u_at(vals, 0);
+  let x1 = u_at(vals, 1);
+  let x2 = u_at(vals, 2);
+  let a0 = vl_at(v, x0);
   if name_is(p, i, "port_release") {
     let inr = port_range(&mut v, g_base(v, x1), g_count(v, x1));
     let sel = app2(&mut v, OP_SELECT, g_free(v, x0), v.t_k);
@@ -5449,6 +5498,14 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     put_back(&mut v, m, p, &mut st, u_at(args, 0), np);
     return mk_obj(&mut v, m, kind_ty(m, p, TY_MMIO), b, n, 0);
   }
+  return vbuiltin_4_3(&mut v, c, &mut m, p, i, args, vals, &mut st);
+}
+
+fn vbuiltin_4_3(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Vec[u64], vals: &Vec[u64], st: &mut VState) -> u64 {
+  let x0 = u_at(vals, 0);
+  let x1 = u_at(vals, 1);
+  let x2 = u_at(vals, 2);
+  let a0 = vl_at(v, x0);
   if name_is(p, i, "mmio_release") {
     let inr = port_range(&mut v, g_base(v, x1), g_len(v, x1));
     let sel = app2(&mut v, OP_SELECT, g_free(v, x0), v.t_k);
@@ -5522,6 +5579,14 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
   if name_is(p, i, "dma_lend") {
     return mk_obj(&mut v, m, kind_ty(m, p, TY_DMA), g_id(v, x0), 0, 0);
   }
+  return vbuiltin_5(&mut v, c, &mut m, p, i, args, vals, &mut st);
+}
+
+fn vbuiltin_5(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Vec[u64], vals: &Vec[u64], st: &mut VState) -> u64 {
+  let x0 = u_at(vals, 0);
+  let x1 = u_at(vals, 1);
+  let x2 = u_at(vals, 2);
+  let a0 = vl_at(v, x0);
   if name_is(p, i, "dma_take") {
     return mk_obj(&mut v, m, v.ty_frame, g_id(v, x0), 0, 0);
   }
@@ -5649,6 +5714,14 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     put_back(&mut v, m, p, &mut st, u_at(args, 0), np);
     return r;
   }
+  return vbuiltin_6(&mut v, c, &mut m, p, i, args, vals, &mut st);
+}
+
+fn vbuiltin_6(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Vec[u64], vals: &Vec[u64], st: &mut VState) -> u64 {
+  let x0 = u_at(vals, 0);
+  let x1 = u_at(vals, 1);
+  let x2 = u_at(vals, 2);
+  let a0 = vl_at(v, x0);
   if name_is(p, i, "pt_shared") || name_is(p, i, "pt_put_shared") || name_is(p, i, "pt_take_shared") || name_is(p, i, "pt_dup_shared") {
     let ix = term(v, x1);
     let sa0 = u_at(args, 0);
@@ -5762,6 +5835,14 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     put_back(&mut v, m, p, &mut st, u_at(args, 0), nt);
     return r;
   }
+  return vbuiltin_6_2(&mut v, c, &mut m, p, i, args, vals, &mut st);
+}
+
+fn vbuiltin_6_2(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Vec[u64], vals: &Vec[u64], st: &mut VState) -> u64 {
+  let x0 = u_at(vals, 0);
+  let x1 = u_at(vals, 1);
+  let x2 = u_at(vals, 2);
+  let a0 = vl_at(v, x0);
   if name_is(p, i, "mmu_kernel") {
     let nm = mk_obj(&mut v, m, kind_ty(m, p, TY_MMU), v.t_flimit, 0, 0);
     put_back(&mut v, m, p, &mut st, u_at(args, 0), nm);
@@ -5810,6 +5891,14 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     need_lt(&mut v, p, st, i, term(v, x1), 21, u_at(args, 1), "the saved registers");
     return fresh_u64_named(&mut v, "reg");
   }
+  return vbuiltin_6_3(&mut v, c, &mut m, p, i, args, vals, &mut st);
+}
+
+fn vbuiltin_6_3(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Vec[u64], vals: &Vec[u64], st: &mut VState) -> u64 {
+  let x0 = u_at(vals, 0);
+  let x1 = u_at(vals, 1);
+  let x2 = u_at(vals, 2);
+  let a0 = vl_at(v, x0);
   if name_is(p, i, "cpu_set") && v.arch == ARCH_AARCH64 {
     // x0-x30, SP_EL0, ELR_EL1 and SPSR_EL1 (0-33) and TPIDR_EL0 (36); the
     // syndrome and fault address (34, 35) are only reported by a trap.
@@ -6479,7 +6568,7 @@ fn shape_keeping(p: &Parser, i: u64) -> bool {
     || name_is(p, i, "pt_borrow") || name_is(p, i, "pt_borrow_frame") || name_is(p, i, "pt_lease_count") || name_is(p, i, "pt_set_access")
     || name_is(p, i, "pt_put_shared") || name_is(p, i, "pt_take_shared") || name_is(p, i, "shared_drop") || name_is(p, i, "pool_take") || name_is(p, i, "pool_take_dirty") || name_is(p, i, "pool_give") || name_is(p, i, "frame_write")
     || name_is(p, i, "frame_write8") || name_is(p, i, "bcopy") || name_is(p, i, "bmove") || name_is(p, i, "frame_to_bytes")
-    || name_is(p, i, "bytes_to_frame") || name_is(p, i, "dma_to_bytes") || name_is(p, i, "bytes_to_dma") || name_is(p, i, "cpu_set") || name_is(p, i, "cpu_run") || name_is(p, i, "cpu_idle")
+    || name_is(p, i, "bytes_to_frame") || name_is(p, i, "frame_to_frame") || name_is(p, i, "dma_to_bytes") || name_is(p, i, "bytes_to_dma") || name_is(p, i, "cpu_set") || name_is(p, i, "cpu_run") || name_is(p, i, "cpu_idle")
     || name_is(p, i, "cpu_fpu_save") || name_is(p, i, "cpu_fpu_load") || name_is(p, i, "pio_in8") || name_is(p, i, "pio_in16")
     || name_is(p, i, "pio_in32") || name_is(p, i, "pio_out8") || name_is(p, i, "pio_out16") || name_is(p, i, "pio_out32")
     || name_is(p, i, "mmio_read8") || name_is(p, i, "mmio_read16") || name_is(p, i, "mmio_read32") || name_is(p, i, "mmio_read64")

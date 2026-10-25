@@ -1,0 +1,87 @@
+// expect-exit: 0
+// expect-stdout: 389438
+// A result of many words whose words are loaded first and stored at the
+// return: native-ir keeps each loaded word in its word of the result area.
+// The other return of the same function, and a word that is read again
+// after the load, still store theirs.
+struct Wide { a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, h: u64, i: u64, j: u64 }
+
+fn zero() -> Wide {
+  return Wide { a: 0, b: 0, c: 0, d: 0, e: 0, f: 0, g: 0, h: 0, i: 0, j: 0 };
+}
+
+fn at(v: &Vec[Wide], i: u64) -> Wide {
+  if i < vec_len(v) {
+    return vec_get(v, i);
+  }
+  return zero();
+}
+
+// The words are read after the load too.
+fn twice(v: &Vec[Wide], i: u64) -> Wide {
+  let w = at(v, i);
+  let s = wrap_add(w.a, w.j);
+  if s % 2 == 0 {
+    return Wide { a: w.j, b: w.i, c: w.h, d: w.g, e: w.f, f: w.e, g: w.d, h: w.c, i: w.b, j: s };
+  }
+  return w;
+}
+
+// Words written more than once, in a loop and by both arms, and returned by
+// two different returns: one word is returned at another position by the
+// second return.
+fn mixed(n: u64) -> Wide
+  requires n <= 50
+{
+  let mut a = 1;
+  let mut b = 2;
+  let mut c = 3;
+  let mut d = 4;
+  let mut e = 5;
+  let mut f = 6;
+  let mut i = 0;
+  while i < n
+    invariant i <= n && n <= 50
+  {
+    a = wrap_add(a, b);
+    b = wrap_add(b, c);
+    c = wrap_add(c, d);
+    d = wrap_add(d, e);
+    e = wrap_add(e, f);
+    f = wrap_add(f, a);
+    i = i + 1;
+  }
+  if n % 2 == 0 {
+    return Wide { a: a, b: b, c: c, d: d, e: e, f: f, g: a, h: b, i: c, j: d };
+  }
+  return Wide { a: b, b: a, c: c, d: d, e: e, f: f, g: f, h: e, i: d, j: c };
+}
+
+fn sum(w: Wide) -> u64 {
+  return wrap_add(wrap_add(wrap_add(w.a, w.b), wrap_add(w.c, w.d)), wrap_add(wrap_add(w.e, w.f), wrap_add(wrap_add(w.g, w.h), wrap_add(wrap_mul(w.i, 3), wrap_mul(w.j, 7)))));
+}
+
+fn main() -> u64 {
+  let mut v = vec_new[Wide]();
+  let mut k = 0;
+  while k < 6
+    invariant k <= 6
+  {
+    vec_push(&mut v, Wide { a: k, b: k + 1, c: k + 2, d: k + 3, e: k + 4, f: k + 5, g: k + 6, h: k + 7, i: k + 8, j: k + 9 });
+    k = k + 1;
+  }
+  let mut total = 0;
+  k = 0;
+  while k < 9
+    invariant k <= 9
+  {
+    total = wrap_add(total, sum(at(v, k)));
+    total = wrap_add(total, wrap_mul(sum(twice(v, k)), 5));
+    k = k + 1;
+  }
+  total = wrap_add(total, sum(mixed(10)));
+  total = wrap_add(total, sum(mixed(11)));
+  print(total);
+  vec_free(v);
+  return 0;
+}

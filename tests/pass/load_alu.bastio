@@ -1,0 +1,66 @@
+// expect-exit: 0
+// expect-stdout: 18084
+// A load that only the next arithmetic instruction reads is one instruction
+// with a memory operand in the native IR path (`s = s + get(b, i)`, also
+// `-`, `&`, `|`, `^`), a remainder by a constant is computed in place, and a
+// Vec pushed to in a loop keeps its header in registers except around the
+// growth. Every shape runs here against its plain value.
+fn mix(b: &Buf) -> u64
+  requires len(b) <= 1000
+  requires forall j: u64 :: j < len(b) ==> get(b, j) < 1000
+{
+  let mut s = 0;
+  let mut x = 1023;
+  let mut o = 0;
+  let mut e = 0;
+  let mut i = 0;
+  while i < len(b)
+    invariant i <= len(b) && s <= i * 1000
+  {
+    s = s + get(b, i);
+    x = x & (get(b, i) + 24);
+    o = o | get(b, i);
+    e = e ^ get(b, i);
+    i = i + 1;
+  }
+  return wrap_add(wrap_add(s, x), wrap_add(o, e));
+}
+
+fn grow(n: u64) -> u64
+  requires n <= 1000
+  ensures result <= 1000 * 7
+{
+  let mut v = vec_new[u64]();
+  let mut i = 0;
+  while i < n
+    invariant i <= n && vlen(v) == i
+  {
+    vec_push(&mut v, i % 7);
+    i = i + 1;
+  }
+  let mut t = 0;
+  let mut k = 0;
+  while k < vec_len(v)
+    invariant k <= vlen(v) && t <= k * 7
+  {
+    t = t + vec_get(v, k) % 7;
+    k = k + 1;
+  }
+  vec_free(v);
+  return t;
+}
+
+fn main() -> u64 {
+  let mut b = alloc(40);
+  let mut i = 0;
+  while i < 40
+    invariant i <= 40 && len(b) == 40 && forall j: u64 :: j < i ==> get(b, j) < 1000
+  {
+    b = set(b, i, (i * 37) % 1000);
+    i = i + 1;
+  }
+  let r = wrap_add(mix(b), grow(20));
+  free(b);
+  print(r);
+  return 0;
+}

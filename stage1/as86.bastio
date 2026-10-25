@@ -1,0 +1,319 @@
+// The command line of the assembler of `asm86.bastio` and `asmobj.bastio`,
+// for `tests/as86.sh`, which compares it with GNU as.
+//   as86 FILE         the bytes of each instruction line, one line per line
+//                     of FILE, `?` for a line it cannot encode
+//   as86 --pe OUT FILE  links FILE into the Windows executable OUT
+//   as86 --elf OUT FILE  links FILE into the Linux executable OUT
+//   as86 --macho OUT FILE  links FILE into the macOS (x86-64) executable OUT
+//   as86 --macho64 OUT FILE  the same for the AArch64 assembly
+//   as86 --sha FILE  the SHA-256 of the bytes of FILE, in hexadecimal
+//   as86 --a64 OUT FILE  links the AArch64 assembly FILE into the Linux executable OUT
+//   as86 --obj FILE   the sections and relocations of the whole file:
+//                       S <section> <size>   then its bytes in hexadecimal
+//                       R <section> <offset> <type> <symbol> <addend>
+//                       E <errors> <first line with an error>
+import "elf.bastio";
+import "machold.bastio";
+import "sha256.bastio";
+import "out.bastio";
+import "loader.bastio";
+
+fn main(con: &mut Serial, host: &mut Host) -> u64 {
+  if host_argc(host) < 2 {
+    put(con, "usage: as86 [--obj] FILE\n");
+    return 2;
+  }
+  let mut obj = false;
+  let mut pe = false;
+  let mut elf = false;
+  let mut a64 = false;
+  let mut macho = false;
+  let mut sha = false;
+  let mut arm64 = false;
+  let mut argi = 1;
+  let a1 = host_arg(host, 1);
+  if blen(a1) == 5 && bget(a1, 0) == 45 && bget(a1, 1) == 45 && bget(a1, 2) == 111 {
+    obj = true;
+    argi = 2;
+  }
+  if blen(a1) == 4 && bget(a1, 0) == 45 && bget(a1, 1) == 45 && bget(a1, 2) == 112 {
+    pe = true;
+    argi = 3;
+  }
+  if blen(a1) == 5 && bget(a1, 0) == 45 && bget(a1, 1) == 45 && bget(a1, 2) == 101 {
+    elf = true;
+    argi = 3;
+  }
+  if blen(a1) == 5 && bget(a1, 0) == 45 && bget(a1, 1) == 45 && bget(a1, 2) == 97 {
+    a64 = true;
+    argi = 3;
+  }
+  if blen(a1) == 5 && bget(a1, 0) == 45 && bget(a1, 1) == 45 && bget(a1, 2) == 115 {
+    sha = true;
+    argi = 2;
+  }
+  if blen(a1) == 9 && bget(a1, 0) == 45 && bget(a1, 1) == 45 && bget(a1, 2) == 109 {
+    macho = true;
+    arm64 = true;
+    argi = 3;
+  }
+  if blen(a1) == 7 && bget(a1, 0) == 45 && bget(a1, 1) == 45 && bget(a1, 2) == 109 {
+    macho = true;
+    argi = 3;
+  }
+  bfree(a1);
+  let path = host_arg(host, argi);
+  let mut data = balloc(0);
+  let ok = host_read(host, path, &mut data);
+  bfree(path);
+  if !ok {
+    put(con, "cannot read the file\n");
+    bfree(data);
+    return 1;
+  }
+  if sha {
+    let mut bytes = vec_new[u64]();
+    let mut j = 0;
+    while j < blen(data) {
+      vec_push(&mut bytes, cast[u64](bget(data, j)));
+      j = wrap_add(j, 1);
+    }
+    let mut dg = vec_new[u64]();
+    sha256(bytes, 0, vec_len(bytes), &mut dg);
+    let mut text = vec_new[u64]();
+    j = 0;
+    while j < vec_len(dg) {
+      as_put_hex(&mut text, u_at(dg, j));
+      j = wrap_add(j, 1);
+    }
+    vec_push(&mut text, 10);
+    as_flush(&mut con, text);
+    vec_free(text);
+    vec_free(dg);
+    vec_free(bytes);
+    bfree(data);
+    return 0;
+  }
+  if macho {
+    let outp = host_arg(host, 2);
+    let st = ml_build(host, outp, data, arm64);
+    bfree(outp);
+    bfree(data);
+    return st;
+  }
+  if a64 {
+    let outp = host_arg(host, 2);
+    let st = elf_build_a64(host, outp, data);
+    bfree(outp);
+    bfree(data);
+    return st;
+  }
+  if elf {
+    let outp = host_arg(host, 2);
+    let st = elf_build(host, outp, data, false);
+    bfree(outp);
+    bfree(data);
+    return st;
+  }
+  if pe {
+    let outp = host_arg(host, 2);
+    let st = pe_build(host, outp, data);
+    bfree(outp);
+    bfree(data);
+    return st;
+  }
+  if obj {
+    as_object(&mut con, data);
+  } else {
+    as_lines(&mut con, data);
+  }
+  bfree(data);
+  return 0;
+}
+
+fn as_flush(con: &mut Serial, text: &Vec[u64]) {
+  let mut j = 0;
+  while j < vec_len(text) {
+    serial_write(con, cast[u8]((u_at(text, j) & 255)));
+    j = wrap_add(j, 1);
+  }
+}
+
+fn as_put_str(text: &mut Vec[u64], s: Str) {
+  let mut k = 0;
+  while k < slen(s) {
+    vec_push(&mut text, cast[u64](sget(s, k)));
+    k = wrap_add(k, 1);
+  }
+}
+
+fn as_put_dec(text: &mut Vec[u64], x: u64) {
+  let mut digits = vec_new[u64]();
+  let mut y = x;
+  if y == 0 {
+    vec_push(&mut digits, 48);
+  }
+  while y > 0 {
+    vec_push(&mut digits, wrap_add(48, y % 10));
+    y = y / 10;
+  }
+  let mut k = vec_len(digits);
+  while k > 0 {
+    k = wrap_sub(k, 1);
+    vec_push(&mut text, u_at(digits, k));
+  }
+  vec_free(digits);
+}
+
+fn as_put_signed(text: &mut Vec[u64], x: u64) {
+  if x >= 9223372036854775808 {
+    vec_push(&mut text, 45);
+    as_put_dec(&mut text, wrap_sub(0, x));
+  } else {
+    as_put_dec(&mut text, x);
+  }
+}
+
+fn as_put_hex(text: &mut Vec[u64], x: u64) {
+  vec_push(&mut text, as_hexdig(x / 16));
+  vec_push(&mut text, as_hexdig(x % 16));
+}
+
+fn as_secname(sec: u64) -> Str {
+  if sec == AB_TEXT {
+    return ".text";
+  }
+  if sec == AB_RODATA {
+    return ".rodata";
+  }
+  if sec == AB_DATA {
+    return ".data";
+  }
+  return ".bss";
+}
+
+fn as_object(con: &mut Serial, data: &Bytes) {
+  let mut g = pe_feed(data, "", false);
+  ao_layout(&mut g);
+  let mut rel = vec_new[u64]();
+  let mut sec = 0;
+  while sec < 4 {
+    let bytes = ao_emit(g, sec, &mut rel);
+    let mut text = vec_new[u64]();
+    as_put_str(&mut text, "S ");
+    as_put_str(&mut text, as_secname(sec));
+    vec_push(&mut text, 32);
+    if sec == AB_BSS {
+      as_put_dec(&mut text, ao_sec_size(g, sec));
+    } else {
+      as_put_dec(&mut text, vec_len(bytes));
+    }
+    vec_push(&mut text, 10);
+    if sec != AB_BSS {
+      let mut j = 0;
+      while j < vec_len(bytes) {
+        as_put_hex(&mut text, u_at(bytes, j));
+        j = wrap_add(j, 1);
+        if vec_len(text) > 65536 {
+          as_flush(&mut con, text);
+          vec_free(text);
+          text = vec_new[u64]();
+        }
+      }
+      vec_push(&mut text, 10);
+    }
+    as_flush(&mut con, text);
+    vec_free(text);
+    vec_free(bytes);
+    sec = wrap_add(sec, 1);
+  }
+  let mut text = vec_new[u64]();
+  let mut r = 0;
+  while wrap_add(r, 5) <= vec_len(rel) {
+    let rs = u_at(rel, r);
+    let off = u_at(rel, wrap_add(r, 1));
+    let rt = u_at(rel, wrap_add(r, 2));
+    let sym = u_at(rel, wrap_add(r, 3));
+    let mut addend = u_at(rel, wrap_add(r, 4));
+    as_put_str(&mut text, "R ");
+    as_put_str(&mut text, as_secname(rs));
+    vec_push(&mut text, 32);
+    as_put_dec(&mut text, off);
+    vec_push(&mut text, 32);
+    as_put_dec(&mut text, rt);
+    vec_push(&mut text, 32);
+    if ao_sym(g, sym, 2) != AS_NONE && (ao_sym(g, sym, 4) & 1) == 0 {
+      as_put_str(&mut text, as_secname(ao_sym(g, sym, 2)));
+      addend = wrap_add(addend, ao_sym_off(g, sym));
+    } else {
+      let ns = ao_sym(g, sym, 0);
+      let nn = ao_sym(g, sym, 1);
+      let mut q = 0;
+      while q < nn {
+        vec_push(&mut text, u_at(g.names, wrap_add(ns, q)));
+        q = wrap_add(q, 1);
+      }
+    }
+    vec_push(&mut text, 32);
+    as_put_signed(&mut text, addend);
+    vec_push(&mut text, 10);
+    r = wrap_add(r, 5);
+  }
+  as_put_str(&mut text, "E ");
+  as_put_dec(&mut text, g.errs);
+  vec_push(&mut text, 32);
+  as_put_dec(&mut text, g.errline);
+  vec_push(&mut text, 10);
+  as_flush(&mut con, text);
+  vec_free(text);
+  vec_free(rel);
+  ao_free(g);
+}
+
+fn as_lines(con: &mut Serial, data: &Bytes) {
+  let mut line = vec_new[u64]();
+  let mut k = 0;
+  while k <= blen(data) {
+    let mut c = 10;
+    if k < blen(data) {
+      c = cast[u64](bget(data, k));
+    }
+    if c == 10 {
+      if vec_len(line) > 0 {
+        let mut out = vec_new[u64]();
+        let mut text = vec_new[u64]();
+        if as_line(&mut out, line, 0, vec_len(line)) {
+          let mut j = 0;
+          while j < vec_len(out) {
+            if j > 0 {
+              vec_push(&mut text, 32);
+            }
+            as_put_hex(&mut text, u_at(out, j));
+            j = wrap_add(j, 1);
+          }
+        } else {
+          vec_push(&mut text, 63);
+        }
+        vec_push(&mut text, 10);
+        as_flush(&mut con, text);
+        vec_free(text);
+        vec_free(out);
+      } else {
+        serial_write(con, 10);
+      }
+      vec_free(line);
+      line = vec_new[u64]();
+    } else {
+      vec_push(&mut line, c);
+    }
+    k = wrap_add(k, 1);
+  }
+  vec_free(line);
+}
+
+fn as_hexdig(x: u64) -> u64 {
+  if x < 10 {
+    return 48 + x;
+  }
+  return wrap_add(87, x);
+}

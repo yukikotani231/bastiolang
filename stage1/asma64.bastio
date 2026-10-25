@@ -1,0 +1,1244 @@
+// An AArch64 assembler for the text the native AArch64 backend writes, the
+// counterpart of `asm86.bastio`, so that a program need not go through
+// `aarch64-linux-gnu-as`.
+//
+// `a6_line` encodes one instruction line into its 32-bit word. A branch, an
+// `adrp` or a `:lo12:` operand names a symbol; the word then has that field
+// zero and the result says which relocation the linker must apply (`rt`, the
+// ELF number of the relocation type), against which symbol (`v[ss .. se)`)
+// and with which addend. A line it cannot encode is reported, never guessed.
+//
+// The words are those of GNU as: `tests/as64.sh` assembles every distinct
+// instruction line of the programs in tests/pass with GNU as and compares.
+//
+// Part of the trusted base once a target uses it instead of the system's
+// assembler.
+import "asm86.bastio";
+
+const A6_ADR_PAGE: u64 = 275;
+const A6_ADD_LO12: u64 = 277;
+const A6_LDST8: u64 = 278;
+const A6_TSTBR14: u64 = 279;
+const A6_CONDBR19: u64 = 280;
+const A6_JUMP26: u64 = 282;
+const A6_CALL26: u64 = 283;
+const A6_LDST16: u64 = 284;
+const A6_LDST32: u64 = 285;
+const A6_LDST64: u64 = 286;
+const A6_GOT_PAGE: u64 = 311;
+const A6_GOT_LO12: u64 = 312;
+
+/// An encoded instruction: the word, and the relocation it needs (`rt` 0 for
+/// none) against the symbol `v[ss .. se)` plus `add`.
+struct A6 { ok: bool, w: u64, rt: u64, ss: u64, se: u64, add: u64 }
+
+/// A register: `n` 0-31, `x` for a 64-bit name, `sp` when 31 is the stack
+/// pointer and not the zero register.
+struct A6R { ok: bool, n: u64, x: bool, sp: bool }
+
+/// `x` shifted left by `k` bits (bits shifted out are lost).
+fn a6_at(x: u64, k: u64) -> u64 {
+  if k >= 64 {
+    return 0;
+  }
+  return wrap_mul(x, 1 << k);
+}
+
+fn a6_fail() -> A6 {
+  return A6 { ok: false, w: 0, rt: 0, ss: 0, se: 0, add: 0 };
+}
+
+fn a6_word(w: u64) -> A6 {
+  return A6 { ok: true, w: w & 4294967295, rt: 0, ss: 0, se: 0, add: 0 };
+}
+
+fn a6_rtrim(v: &Vec[u64], s: u64, e: u64) -> u64 {
+  let mut t = e;
+  while t > s && as_is_blank(u_at(v, wrap_sub(t, 1))) {
+    t = wrap_sub(t, 1);
+  }
+  return t;
+}
+
+/// The register named by the token `v[s .. e)`.
+fn a6_reg(v: &Vec[u64], s: u64, e0: u64) -> A6R {
+  let mut r = A6R { ok: false, n: 0, x: false, sp: false };
+  let t = as_skip(v, s, e0);
+  let e = a6_rtrim(v, t, e0);
+  if t >= e {
+    return r;
+  }
+  let len = wrap_sub(e, t);
+  if len == 2 && as_name_at(v, t, e, "sp") {
+    return A6R { ok: true, n: 31, x: true, sp: true };
+  }
+  if len == 3 && as_name_at(v, t, e, "wsp") {
+    return A6R { ok: true, n: 31, x: false, sp: true };
+  }
+  if len == 3 && as_name_at(v, t, e, "xzr") {
+    return A6R { ok: true, n: 31, x: true, sp: false };
+  }
+  if len == 3 && as_name_at(v, t, e, "wzr") {
+    return A6R { ok: true, n: 31, x: false, sp: false };
+  }
+  let c = u_at(v, t);
+  if (c == 120 || c == 119) && len >= 2 && len <= 3 {
+    let d = u_at(v, wrap_add(t, 1));
+    if d >= 48 && d <= 57 {
+      let num = as_number(v, wrap_add(t, 1), e);
+      if num.ok && num.next == e && num.val <= 30 {
+        r.ok = true;
+        r.n = num.val;
+        r.x = c == 120;
+      }
+    }
+  }
+  return r;
+}
+
+/// Splits `v[s .. e)` at the commas outside brackets into the token ranges
+/// pushed to `ops` (start, end); the number of tokens.
+fn a6_split(v: &Vec[u64], s: u64, e: u64, ops: &mut Vec[u64]) -> u64 {
+  let mut n = 0;
+  let mut depth = 0;
+  let mut start = as_skip(v, s, e);
+  let mut k = start;
+  while k <= e {
+    let mut c = 44;
+    if k < e {
+      c = u_at(v, k);
+    }
+    if c == 91 {
+      depth = wrap_add(depth, 1);
+    } else if c == 93 && depth > 0 {
+      depth = wrap_sub(depth, 1);
+    }
+    if (c == 44 && depth == 0) || k == e {
+      let te = a6_rtrim(v, start, k);
+      if te > start || k < e {
+        vec_push(&mut ops, start);
+        vec_push(&mut ops, te);
+        n = wrap_add(n, 1);
+      }
+      start = as_skip(v, wrap_add(k, 1), e);
+    }
+    k = wrap_add(k, 1);
+  }
+  return n;
+}
+
+fn a6_op_s(ops: &Vec[u64], i: u64) -> u64 {
+  return u_at(ops, wrap_mul(i, 2));
+}
+
+fn a6_op_e(ops: &Vec[u64], i: u64) -> u64 {
+  return u_at(ops, wrap_add(wrap_mul(i, 2), 1));
+}
+
+/// The immediate `#n` of a token; false when it is not one.
+fn a6_imm(v: &Vec[u64], s: u64, e: u64) -> AsNum {
+  let t = as_skip(v, s, e);
+  if t < e && u_at(v, t) == 35 {
+    let n = as_number(v, wrap_add(t, 1), e);
+    if n.ok && a6_rtrim(v, t, n.next) == a6_rtrim(v, t, e) && as_skip(v, n.next, e) >= e {
+      return n;
+    }
+    return AsNum { val: 0, next: t, ok: false };
+  }
+  return AsNum { val: 0, next: t, ok: false };
+}
+
+/// The condition code named by `v[s .. e)`, or AS_NONE.
+fn a6_cond(v: &Vec[u64], s: u64, e: u64) -> u64 {
+  if as_name_at(v, s, e, "eq") { return 0; }
+  if as_name_at(v, s, e, "ne") { return 1; }
+  if as_name_at(v, s, e, "hs") || as_name_at(v, s, e, "cs") { return 2; }
+  if as_name_at(v, s, e, "lo") || as_name_at(v, s, e, "cc") { return 3; }
+  if as_name_at(v, s, e, "mi") { return 4; }
+  if as_name_at(v, s, e, "pl") { return 5; }
+  if as_name_at(v, s, e, "vs") { return 6; }
+  if as_name_at(v, s, e, "vc") { return 7; }
+  if as_name_at(v, s, e, "hi") { return 8; }
+  if as_name_at(v, s, e, "ls") { return 9; }
+  if as_name_at(v, s, e, "ge") { return 10; }
+  if as_name_at(v, s, e, "lt") { return 11; }
+  if as_name_at(v, s, e, "gt") { return 12; }
+  if as_name_at(v, s, e, "le") { return 13; }
+  if as_name_at(v, s, e, "al") { return 14; }
+  return AS_NONE;
+}
+
+/// Is `s .. e` (a whole token) exactly the name `n`?
+fn a6_is(v: &Vec[u64], s: u64, e: u64, n: Str) -> bool {
+  return wrap_sub(e, s) == slen(n) && as_name_at(v, s, e, n);
+}
+
+/// Does the token start with `n` (a name, then a non-name character or end)?
+fn a6_starts(v: &Vec[u64], s: u64, e: u64, n: Str) -> bool {
+  return as_name_at(v, s, e, n);
+}
+
+fn a6_sf(r: A6R) -> u64 {
+  if r.x {
+    return 2147483648;
+  }
+  return 0;
+}
+
+/// The symbol operand `name[+-n]` of a branch or address: false when the
+/// token is not a name.
+struct A6Sym { ok: bool, ss: u64, se: u64, add: u64 }
+
+fn a6_sym(v: &Vec[u64], s: u64, e0: u64) -> A6Sym {
+  let t = as_skip(v, s, e0);
+  let e = a6_rtrim(v, t, e0);
+  let mut r = A6Sym { ok: false, ss: t, se: t, add: 0 };
+  let nl = as_namelen(v, t, e);
+  if nl == 0 {
+    return r;
+  }
+  let c = u_at(v, t);
+  if c >= 48 && c <= 57 {
+    // a numeric label reference: digits then f or b
+    let num = as_number(v, t, e);
+    let lc = u_at(v, wrap_sub(wrap_add(t, nl), 1));
+    if num.ok && num.next == wrap_sub(wrap_add(t, nl), 1) && (lc == 102 || lc == 98) && wrap_add(t, nl) == e {
+      r.ok = true;
+      r.se = e;
+    }
+    return r;
+  }
+  r.se = wrap_add(t, nl);
+  r.ok = true;
+  let p = as_skip(v, r.se, e);
+  if p < e {
+    let sg = u_at(v, p);
+    if sg == 43 || sg == 45 {
+      let num = as_number(v, as_skip(v, wrap_add(p, 1), e), e);
+      if !num.ok || as_skip(v, num.next, e) < e {
+        r.ok = false;
+        return r;
+      }
+      if sg == 45 {
+        r.add = wrap_sub(0, num.val);
+      } else {
+        r.add = num.val;
+      }
+    } else {
+      r.ok = false;
+    }
+  }
+  return r;
+}
+
+/// A relocation operator `:lo12:sym`, `:got:sym`, `:got_lo12:sym` (kind 1, 2,
+/// 3); kind 0 when the token has none.
+struct A6Rel { kind: u64, sym: A6Sym }
+
+fn a6_rel(v: &Vec[u64], s: u64, e0: u64) -> A6Rel {
+  let t = as_skip(v, s, e0);
+  let e = a6_rtrim(v, t, e0);
+  let none = A6Sym { ok: false, ss: t, se: t, add: 0 };
+  let mut r = A6Rel { kind: 0, sym: none };
+  if t >= e || u_at(v, t) != 58 {
+    return r;
+  }
+  let mut q = wrap_add(t, 1);
+  let mut c = q;
+  while c < e && u_at(v, c) != 58 {
+    c = wrap_add(c, 1);
+  }
+  if c >= e {
+    return r;
+  }
+  if a6_is(v, q, c, "lo12") {
+    r.kind = 1;
+  } else if a6_is(v, q, c, "got") {
+    r.kind = 2;
+  } else if a6_is(v, q, c, "got_lo12") {
+    r.kind = 3;
+  } else {
+    return r;
+  }
+  q = wrap_add(c, 1);
+  r.sym = a6_sym(v, q, e);
+  if !r.sym.ok {
+    r.kind = 0;
+  }
+  return r;
+}
+
+fn a6_with(w: u64, rt: u64, sy: A6Sym) -> A6 {
+  return A6 { ok: true, w: w & 4294967295, rt: rt, ss: sy.ss, se: sy.se, add: sy.add };
+}
+
+/// Encoding of a logical immediate (N, immr, imms as the 13 bits above bit 9
+/// of the instruction word), or AS_NONE when `imm` is not one.
+fn a6_bitmask(imm0: u64, is64: bool) -> u64 {
+  let mut imm = imm0;
+  if !is64 {
+    imm = (imm & 4294967295) | (a6_at((imm & 4294967295), 32));
+  }
+  if imm == 0 || imm == 18446744073709551615 {
+    return AS_NONE;
+  }
+  // the smallest repeating element
+  let mut size = 64;
+  let mut go = true;
+  while go && size > 2
+    invariant size <= 64
+  {
+    let half = size / 2;
+    let mask = wrap_sub(1 << half, 1);
+    if (imm & mask) == ((imm >> half) & mask) {
+      size = half;
+    } else {
+      go = false;
+    }
+  }
+  if size > 64 || size < 2 {
+    return AS_NONE;
+  }
+  let mut elem = imm;
+  if size < 64 {
+    elem = imm & wrap_sub(1 << size, 1);
+  }
+  // the number of ones, and the rotation that puts them at the bottom
+  let mut ones = 0;
+  let mut b = 0;
+  while b < size && b < 64 {
+    if ((elem >> b) & 1) == 1 {
+      ones = wrap_add(ones, 1);
+    }
+    b = wrap_add(b, 1);
+  }
+  if ones == 0 || ones >= size {
+    return AS_NONE;
+  }
+  let run = wrap_sub(1 << ones, 1);
+  let mut rot = 0;
+  let mut found = false;
+  let mut r = 0;
+  while r < size && r < 64 && !found {
+    // ror(run, r) within `size` bits
+    let mut x = run;
+    if r > 0 && r < size {
+      let hi = a6_at(run, wrap_sub(size, r)) & elem_mask(size);
+      x = (run >> r) | hi;
+    }
+    if x == elem {
+      found = true;
+      rot = r;
+    }
+    r = wrap_add(r, 1);
+  }
+  if !found {
+    return AS_NONE;
+  }
+  let mut n = 0;
+  if size == 64 {
+    n = 1;
+  }
+  let imms = (wrap_sub(0, wrap_mul(size, 2)) & 63) | wrap_sub(ones, 1);
+  return (a6_at(n, 12)) | (a6_at(rot, 6)) | imms;
+}
+
+fn elem_mask(size: u64) -> u64 {
+  if size >= 64 {
+    return 18446744073709551615;
+  }
+  return wrap_sub(1 << size, 1);
+}
+
+/// `mov` of an immediate into the register `rd`: movz, movn or an `orr`.
+fn a6_movimm(rd: A6R, imm: u64) -> A6 {
+  let sf = a6_sf(rd);
+  let mut val = imm;
+  let mut bits = 64;
+  let mut all = 18446744073709551615;
+  if !rd.x {
+    bits = 32;
+    all = 4294967295;
+    // a negative number is a 32-bit value too
+    if imm >= 18446744069414584320 {
+      val = imm & 4294967295;
+    }
+    if val > 4294967295 {
+      return a6_fail();
+    }
+  }
+  let mut hw = 0;
+  while hw < 4 {
+    let sh = wrap_mul(hw, 16);
+    if sh < bits && (val & (65535 << sh)) == val {
+      return a6_word(sf | 0x52800000 | (a6_at(hw, 21)) | (a6_at((val >> sh), 5)) | rd.n);
+    }
+    hw = wrap_add(hw, 1);
+  }
+  let inv = (val ^ all) & all;
+  hw = 0;
+  while hw < 4 {
+    let sh = wrap_mul(hw, 16);
+    if sh < bits && (inv & (65535 << sh)) == inv {
+      return a6_word(sf | 0x12800000 | (a6_at(hw, 21)) | (a6_at((inv >> sh), 5)) | rd.n);
+    }
+    hw = wrap_add(hw, 1);
+  }
+  let bm = a6_bitmask(val, rd.x);
+  if bm != AS_NONE {
+    return a6_word(sf | 0x320003e0 | (a6_at(bm, 10)) | rd.n);
+  }
+  return a6_fail();
+}
+
+/// Is the operand token an immediate (`#...`)?
+fn a6_is_imm(v: &Vec[u64], s: u64, e: u64) -> bool {
+  let t = as_skip(v, s, e);
+  return t < e && u_at(v, t) == 35;
+}
+
+/// The shift in a token `lsl #n`/`lsr #n`/`asr #n`/`ror #n`: kind 0-3 in
+/// `val`'s upper half and the amount in the lower; AS_NONE if it is none.
+fn a6_shift(v: &Vec[u64], s: u64, e0: u64) -> u64 {
+  let t = as_skip(v, s, e0);
+  let e = a6_rtrim(v, t, e0);
+  let nl = as_namelen(v, t, e);
+  if nl != 3 {
+    return AS_NONE;
+  }
+  let mut kind = AS_NONE;
+  if a6_starts(v, t, wrap_add(t, 3), "lsl") { kind = 0; }
+  if a6_starts(v, t, wrap_add(t, 3), "lsr") { kind = 1; }
+  if a6_starts(v, t, wrap_add(t, 3), "asr") { kind = 2; }
+  if a6_starts(v, t, wrap_add(t, 3), "ror") { kind = 3; }
+  if kind == AS_NONE {
+    return AS_NONE;
+  }
+  let im = a6_imm(v, wrap_add(t, 3), e);
+  if !im.ok || im.val > 63 {
+    return AS_NONE;
+  }
+  return (a6_at(kind, 8)) | im.val;
+}
+
+/// add, sub, adds, subs (op 0/1, `setf`): rd, rn, then an immediate or a
+/// (shifted) register. `rd` may be the zero register for the compare forms.
+fn a6_addsub(v: &Vec[u64], ops: &Vec[u64], n: u64, sub: bool, setf: bool, rd: A6R, first: u64) -> A6 {
+  // operands from `first`: rn, operand2 [, shift]
+  if wrap_sub(n, first) < 2 {
+    return a6_fail();
+  }
+  let rn = a6_reg(v, a6_op_s(ops, first), a6_op_e(ops, first));
+  if !rn.ok || rn.x != rd.x {
+    return a6_fail();
+  }
+  let sf = a6_sf(rd);
+  let mut opb = 0;
+  if sub {
+    opb = 1073741824;
+  }
+  let mut sb = 0;
+  if setf {
+    sb = 536870912;
+  }
+  let o2s = a6_op_s(ops, wrap_add(first, 1));
+  let o2e = a6_op_e(ops, wrap_add(first, 1));
+  if a6_is_imm(v, o2s, o2e) {
+    let im = a6_imm(v, o2s, o2e);
+    if !im.ok {
+      return a6_fail();
+    }
+    let neg = im.val >= 9223372036854775808;
+    let mut val = im.val;
+    if neg {
+      val = wrap_sub(0, im.val);
+    }
+    let mut sh = 0;
+    let mut op2 = opb;
+    if wrap_sub(n, first) == 3 {
+      let s3 = a6_shift(v, a6_op_s(ops, wrap_add(first, 2)), a6_op_e(ops, wrap_add(first, 2)));
+      if s3 != 12 {
+        return a6_fail();
+      }
+      sh = 4194304;
+    }
+    if neg {
+      // a negative immediate flips the operation
+      op2 = opb ^ 1073741824;
+    }
+    if val > 4095 {
+      return a6_fail();
+    }
+    return a6_word(sf | op2 | sb | 0x11000000 | sh | (a6_at(val, 10)) | (a6_at(rn.n, 5)) | rd.n);
+  }
+  let rel = a6_rel(v, o2s, o2e);
+  if rel.kind == 1 && !sub && !setf {
+    return a6_with(sf | 0x11000000 | (a6_at(rn.n, 5)) | rd.n, A6_ADD_LO12, rel.sym);
+  }
+  let rm = a6_reg(v, o2s, o2e);
+  if !rm.ok || rm.x != rd.x {
+    return a6_fail();
+  }
+  let mut shift = 0;
+  let mut amt = 0;
+  if wrap_sub(n, first) == 3 {
+    let s3 = a6_shift(v, a6_op_s(ops, wrap_add(first, 2)), a6_op_e(ops, wrap_add(first, 2)));
+    if s3 == AS_NONE || (s3 >> 8) > 2 {
+      return a6_fail();
+    }
+    shift = s3 >> 8;
+    amt = s3 & 255;
+  }
+  if rn.sp || (rd.sp && !setf) {
+    // the extended-register form, which takes the stack pointer
+    if shift > 0 || amt > 4 {
+      return a6_fail();
+    }
+    let opt = 3;
+    if !rd.x {
+      return a6_fail();
+    }
+    return a6_word(sf | opb | sb | 0x0b200000 | (a6_at(rm.n, 16)) | (a6_at(opt, 13)) | (a6_at(amt, 10)) | (a6_at(rn.n, 5)) | rd.n);
+  }
+  if !rd.x && amt > 31 {
+    return a6_fail();
+  }
+  return a6_word(sf | opb | sb | 0x0b000000 | (a6_at(shift, 22)) | (a6_at(rm.n, 16)) | (a6_at(amt, 10)) | (a6_at(rn.n, 5)) | rd.n);
+}
+
+/// and, orr, eor, ands (opc 0-3) with an immediate or a shifted register.
+fn a6_logic(v: &Vec[u64], ops: &Vec[u64], n: u64, opc: u64, rd: A6R) -> A6 {
+  if n < 3 {
+    return a6_fail();
+  }
+  let rn = a6_reg(v, a6_op_s(ops, 1), a6_op_e(ops, 1));
+  if !rn.ok || rn.x != rd.x {
+    return a6_fail();
+  }
+  let sf = a6_sf(rd);
+  let o2s = a6_op_s(ops, 2);
+  let o2e = a6_op_e(ops, 2);
+  if a6_is_imm(v, o2s, o2e) {
+    let im = a6_imm(v, o2s, o2e);
+    if !im.ok || n != 3 {
+      return a6_fail();
+    }
+    let bm = a6_bitmask(im.val, rd.x);
+    if bm == AS_NONE {
+      return a6_fail();
+    }
+    return a6_word(sf | (a6_at(opc, 29)) | 0x12000000 | (a6_at(bm, 10)) | (a6_at(rn.n, 5)) | rd.n);
+  }
+  let rm = a6_reg(v, o2s, o2e);
+  if !rm.ok || rm.x != rd.x {
+    return a6_fail();
+  }
+  let mut shift = 0;
+  let mut amt = 0;
+  if n == 4 {
+    let s3 = a6_shift(v, a6_op_s(ops, 3), a6_op_e(ops, 3));
+    if s3 == AS_NONE {
+      return a6_fail();
+    }
+    shift = s3 >> 8;
+    amt = s3 & 255;
+  }
+  return a6_word(sf | (a6_at(opc, 29)) | 0x0a000000 | (a6_at(shift, 22)) | (a6_at(rm.n, 16)) | (a6_at(amt, 10)) | (a6_at(rn.n, 5)) | rd.n);
+}
+
+/// A memory operand `[base]`, `[base, #imm]`, `[base, #imm]!`, `[base, rm]`,
+/// `[base, rm, lsl #s]`, `[base, :lo12:sym]`, `[base, :got_lo12:sym]`:
+/// `mode` 0 for a plain or immediate offset, 1 pre-indexed, 2 a register
+/// offset, 3 a relocated offset.
+struct A6M { ok: bool, base: u64, mode: u64, imm: u64, rm: u64, shift: u64, rel: A6Rel }
+
+fn a6_mem(v: &Vec[u64], s: u64, e0: u64) -> A6M {
+  let t = as_skip(v, s, e0);
+  let mut e = a6_rtrim(v, t, e0);
+  let none = A6Sym { ok: false, ss: t, se: t, add: 0 };
+  let mut r = A6M { ok: false, base: 0, mode: 0, imm: 0, rm: 0, shift: 0, rel: A6Rel { kind: 0, sym: none } };
+  if t >= e || u_at(v, t) != 91 {
+    return r;
+  }
+  if u_at(v, wrap_sub(e, 1)) == 33 {
+    r.mode = 1;
+    e = a6_rtrim(v, t, wrap_sub(e, 1));
+  }
+  if e <= wrap_add(t, 1) || u_at(v, wrap_sub(e, 1)) != 93 {
+    return r;
+  }
+  let mut inner = vec_new[u64]();
+  let k = a6_split(v, wrap_add(t, 1), wrap_sub(e, 1), &mut inner);
+  if k < 1 || k > 3 {
+    vec_free(inner);
+    return r;
+  }
+  let b = a6_reg(v, a6_op_s(inner, 0), a6_op_e(inner, 0));
+  if !b.ok || !b.x {
+    vec_free(inner);
+    return r;
+  }
+  r.base = b.n;
+  if k == 1 {
+    r.ok = true;
+  } else {
+    let o = a6_op_s(inner, 1);
+    let oe = a6_op_e(inner, 1);
+    if a6_is_imm(v, o, oe) {
+      let im = a6_imm(v, o, oe);
+      if im.ok && k == 2 {
+        r.ok = true;
+        r.imm = im.val;
+      }
+    } else if r.mode == 0 {
+      let rm = a6_reg(v, o, oe);
+      let rel = a6_rel(v, o, oe);
+      if rm.ok && k <= 3 {
+        r.rm = rm.n;
+        r.mode = 2;
+        r.ok = rm.x;
+        if k == 3 {
+          let s3 = a6_shift(v, a6_op_s(inner, 2), a6_op_e(inner, 2));
+          if s3 == AS_NONE || (s3 >> 8) != 0 {
+            r.ok = false;
+          }
+          r.shift = wrap_add(s3 & 255, 1);
+        }
+      } else if rel.kind != 0 && k == 2 {
+        r.ok = true;
+        r.mode = 3;
+        r.rel = rel;
+      }
+    }
+  }
+  vec_free(inner);
+  return r;
+}
+
+/// ldr, str, ldrb, strb, ldrh, strh, ldrsw: `size` log2 of the access, `opc`
+/// 0 store, 1 load, 2 sign-extending load.
+fn a6_ldst(v: &Vec[u64], ops: &Vec[u64], n: u64, size: u64, opc: u64, rt: A6R) -> A6 {
+  if n < 2 || n > 3 {
+    return a6_fail();
+  }
+  let m = a6_mem(v, a6_op_s(ops, 1), a6_op_e(ops, 1));
+  if !m.ok {
+    return a6_fail();
+  }
+  let top = (a6_at(size, 30)) | (a6_at(opc, 22));
+  let rn = m.base;
+  let mut post = false;
+  let mut pimm = 0;
+  if n == 3 {
+    if m.mode != 0 || m.imm != 0 {
+      return a6_fail();
+    }
+    let im = a6_imm(v, a6_op_s(ops, 2), a6_op_e(ops, 2));
+    if !im.ok {
+      return a6_fail();
+    }
+    post = true;
+    pimm = im.val;
+  }
+  if post {
+    if !as_fits(pimm, 9) {
+      return a6_fail();
+    }
+    return a6_word(top | 0x38000400 | (a6_at((pimm & 511), 12)) | (a6_at(rn, 5)) | rt.n);
+  }
+  if m.mode == 1 {
+    if !as_fits(m.imm, 9) {
+      return a6_fail();
+    }
+    return a6_word(top | 0x38000c00 | (a6_at((m.imm & 511), 12)) | (a6_at(rn, 5)) | rt.n);
+  }
+  if m.mode == 2 {
+    let mut sflag = 0;
+    if m.shift > 0 {
+      if wrap_sub(m.shift, 1) == size {
+        sflag = 4096;
+      } else if m.shift != 1 {
+        return a6_fail();
+      }
+    }
+    return a6_word(top | 0x38200800 | (a6_at(m.rm, 16)) | (a6_at(3, 13)) | sflag | (a6_at(rn, 5)) | rt.n);
+  }
+  if m.mode == 3 {
+    let mut rtype = 0;
+    if m.rel.kind == 1 {
+      if size == 0 { rtype = A6_LDST8; }
+      if size == 1 { rtype = A6_LDST16; }
+      if size == 2 { rtype = A6_LDST32; }
+      if size == 3 { rtype = A6_LDST64; }
+    } else if m.rel.kind == 3 && size == 3 && opc == 1 {
+      rtype = A6_GOT_LO12;
+    }
+    if rtype == 0 {
+      return a6_fail();
+    }
+    return a6_with(top | 0x39000000 | (a6_at(rn, 5)) | rt.n, rtype, m.rel.sym);
+  }
+  // an immediate offset: scaled and unsigned, or unscaled and signed
+  let scale = size;
+  if scale > 3 {
+    return a6_fail();
+  }
+  let mask = wrap_sub(1 << scale, 1);
+  if (m.imm & mask) == 0 && m.imm < a6_at(4096, scale) && m.imm < 18446744073709551488 {
+    return a6_word(top | 0x39000000 | (a6_at((m.imm >> scale), 10)) | (a6_at(rn, 5)) | rt.n);
+  }
+  if as_fits(m.imm, 9) {
+    return a6_word(top | 0x38000000 | (a6_at((m.imm & 511), 12)) | (a6_at(rn, 5)) | rt.n);
+  }
+  return a6_fail();
+}
+
+/// ldp and stp.
+fn a6_pair(v: &Vec[u64], ops: &Vec[u64], n: u64, load: bool, rt: A6R) -> A6 {
+  if n < 3 || n > 4 {
+    return a6_fail();
+  }
+  let rt2 = a6_reg(v, a6_op_s(ops, 1), a6_op_e(ops, 1));
+  if !rt2.ok || rt2.x != rt.x {
+    return a6_fail();
+  }
+  let m = a6_mem(v, a6_op_s(ops, 2), a6_op_e(ops, 2));
+  if !m.ok || m.mode > 1 {
+    return a6_fail();
+  }
+  let mut opc = 0;
+  let mut scale = 2;
+  if rt.x {
+    opc = 2;
+    scale = 3;
+  }
+  let mut base = (a6_at(opc, 30)) | 0x28000000;
+  if load {
+    base = base | 4194304;
+  }
+  let mut imm = m.imm;
+  let mut kind = 16777216;
+  if m.mode == 1 {
+    kind = 25165824;
+  }
+  if n == 4 {
+    let im = a6_imm(v, a6_op_s(ops, 3), a6_op_e(ops, 3));
+    if !im.ok || m.mode != 0 || m.imm != 0 {
+      return a6_fail();
+    }
+    imm = im.val;
+    kind = 8388608;
+  }
+  let mask = wrap_sub(1 << scale, 1);
+  if (imm & mask) != 0 {
+    return a6_fail();
+  }
+  let mut q = imm >> scale;
+  if imm >= 9223372036854775808 {
+    let mag = wrap_sub(0, imm) >> scale;
+    if mag > 64 {
+      return a6_fail();
+    }
+    q = wrap_sub(0, mag);
+  } else if q > 63 {
+    return a6_fail();
+  }
+  return a6_word(base | kind | (a6_at((q & 127), 15)) | (a6_at(rt2.n, 10)) | (a6_at(m.base, 5)) | rt.n);
+}
+
+/// Encodes the instruction on `v[s .. e)` (no label, no comment).
+/// Is the suffix after `@` at `i`..`j` the word `w`?
+fn a6_suffix(v: &Vec[u64], i: u64, j: u64, w: Str) -> bool {
+  if wrap_sub(j, i) != slen(w) {
+    return false;
+  }
+  let mut k = 0;
+  while k < slen(w)
+    invariant k <= slen(w)
+  {
+    if u_at(v, wrap_add(i, k)) != cast[u64](sget(w, k)) {
+      return false;
+    }
+    k = k + 1;
+  }
+  return true;
+}
+
+/// The line `s`..`e` with Apple's relocation operators written the GNU way:
+/// `sym@PAGE` is `sym`, `sym@PAGEOFF` is `:lo12:sym`, `sym@GOTPAGE` is
+/// `:got:sym` and `sym@GOTPAGEOFF` is `:got_lo12:sym`. The result is a new
+/// line, which the caller frees.
+fn a6_unmac(v: &Vec[u64], s: u64, e: u64) -> Vec[u64] {
+  let mut out = vec_new[u64]();
+  let mut idst = 0;
+  let mut inid = false;
+  let mut i = s;
+  while i < e {
+    let c = u_at(v, i);
+    if c == 64 && inid {
+      let mut j = wrap_add(i, 1);
+      while j < e && as_is_alnum(u_at(v, j)) {
+        j = wrap_add(j, 1);
+      }
+      let mut pre = "";
+      let mut known = true;
+      if a6_suffix(v, wrap_add(i, 1), j, "PAGEOFF") {
+        pre = ":lo12:";
+      } else if a6_suffix(v, wrap_add(i, 1), j, "PAGE") {
+        pre = "";
+      } else if a6_suffix(v, wrap_add(i, 1), j, "GOTPAGEOFF") {
+        pre = ":got_lo12:";
+      } else if a6_suffix(v, wrap_add(i, 1), j, "GOTPAGE") {
+        pre = ":got:";
+      } else {
+        known = false;
+      }
+      if known {
+        let mut o2 = vec_new[u64]();
+        let mut k = 0;
+        while k < idst && k < vec_len(out) {
+          vec_push(&mut o2, u_at(out, k));
+          k = wrap_add(k, 1);
+        }
+        k = 0;
+        while k < slen(pre) {
+          vec_push(&mut o2, cast[u64](sget(pre, k)));
+          k = wrap_add(k, 1);
+        }
+        k = idst;
+        while k < vec_len(out) {
+          vec_push(&mut o2, u_at(out, k));
+          k = wrap_add(k, 1);
+        }
+        vec_free(out);
+        out = o2;
+        i = j;
+        inid = false;
+      } else {
+        vec_push(&mut out, c);
+        i = wrap_add(i, 1);
+        inid = false;
+      }
+    } else {
+      if as_is_alnum(c) {
+        if !inid {
+          idst = vec_len(out);
+          inid = true;
+        }
+      } else {
+        inid = false;
+      }
+      vec_push(&mut out, c);
+      i = wrap_add(i, 1);
+    }
+  }
+  return out;
+}
+
+fn a6_line(v: &Vec[u64], s: u64, e: u64) -> A6 {
+  let ns = as_skip(v, s, e);
+  let ne = wrap_add(ns, as_namelen(v, ns, e));
+  if ne == ns {
+    return a6_fail();
+  }
+  let mut ops = vec_new[u64]();
+  let n = a6_split(v, ne, e, &mut ops);
+  let r = a6_dispatch(v, ns, ne, ops, n);
+  vec_free(ops);
+  return r;
+}
+
+fn a6_dispatch(v: &Vec[u64], ns: u64, ne: u64, ops: &Vec[u64], n: u64) -> A6 {
+  if n == 0 {
+    if as_name_at(v, ns, ne, "ret") { return a6_word(0xd65f03c0); }
+    if as_name_at(v, ns, ne, "nop") { return a6_word(0xd503201f); }
+    if as_name_at(v, ns, ne, "yield") { return a6_word(0xd503203f); }
+    if as_name_at(v, ns, ne, "clrex") { return a6_word(0xd5033f5f); }
+    return a6_fail();
+  }
+  let t0s = a6_op_s(ops, 0);
+  let t0e = a6_op_e(ops, 0);
+  // branches
+  if as_name_at(v, ns, ne, "b") || as_name_at(v, ns, ne, "bl") {
+    let sy = a6_sym(v, t0s, t0e);
+    if !sy.ok || n != 1 {
+      return a6_fail();
+    }
+    if as_name_at(v, ns, ne, "bl") {
+      return a6_with(0x94000000, A6_CALL26, sy);
+    }
+    return a6_with(0x14000000, A6_JUMP26, sy);
+  }
+  if u_at(v, ns) == 98 && u_at(v, wrap_add(ns, 1)) == 46 && n == 1 {
+    let cc = a6_cond(v, wrap_add(ns, 2), ne);
+    let sy = a6_sym(v, t0s, t0e);
+    if cc == AS_NONE || !sy.ok {
+      return a6_fail();
+    }
+    return a6_with(0x54000000 | cc, A6_CONDBR19, sy);
+  }
+  if as_name_at(v, ns, ne, "br") || as_name_at(v, ns, ne, "blr") {
+    let r = a6_reg(v, t0s, t0e);
+    if !r.ok || !r.x || n != 1 {
+      return a6_fail();
+    }
+    if as_name_at(v, ns, ne, "br") {
+      return a6_word(0xd61f0000 | (a6_at(r.n, 5)));
+    }
+    return a6_word(0xd63f0000 | (a6_at(r.n, 5)));
+  }
+  if as_name_at(v, ns, ne, "brk") || as_name_at(v, ns, ne, "svc") {
+    let im = a6_imm(v, t0s, t0e);
+    if !im.ok || im.val > 65535 || n != 1 {
+      return a6_fail();
+    }
+    if as_name_at(v, ns, ne, "brk") {
+      return a6_word(0xd4200000 | (a6_at(im.val, 5)));
+    }
+    return a6_word(0xd4000001 | (a6_at(im.val, 5)));
+  }
+  if as_name_at(v, ns, ne, "dmb") {
+    let mut crm = AS_NONE;
+    if a6_is(v, t0s, t0e, "oshld") { crm = 1; }
+    if a6_is(v, t0s, t0e, "oshst") { crm = 2; }
+    if a6_is(v, t0s, t0e, "osh") { crm = 3; }
+    if a6_is(v, t0s, t0e, "nshld") { crm = 5; }
+    if a6_is(v, t0s, t0e, "nshst") { crm = 6; }
+    if a6_is(v, t0s, t0e, "nsh") { crm = 7; }
+    if a6_is(v, t0s, t0e, "ishld") { crm = 9; }
+    if a6_is(v, t0s, t0e, "ishst") { crm = 10; }
+    if a6_is(v, t0s, t0e, "ish") { crm = 11; }
+    if a6_is(v, t0s, t0e, "ld") { crm = 13; }
+    if a6_is(v, t0s, t0e, "st") { crm = 14; }
+    if a6_is(v, t0s, t0e, "sy") { crm = 15; }
+    if crm == AS_NONE || n != 1 {
+      return a6_fail();
+    }
+    return a6_word(0xd50330bf | (a6_at(crm, 8)));
+  }
+  let rd = a6_reg(v, t0s, t0e);
+  if !rd.ok {
+    return a6_fail();
+  }
+  if n == 1 {
+    return a6_fail();
+  }
+  let t1s = a6_op_s(ops, 1);
+  let t1e = a6_op_e(ops, 1);
+  let sf = a6_sf(rd);
+  if as_name_at(v, ns, ne, "adrp") {
+    if n != 2 {
+      return a6_fail();
+    }
+    let rel = a6_rel(v, t1s, t1e);
+    if rel.kind == 2 {
+      return a6_with(0x90000000 | rd.n, A6_GOT_PAGE, rel.sym);
+    }
+    let sy = a6_sym(v, t1s, t1e);
+    if !sy.ok || !rd.x {
+      return a6_fail();
+    }
+    return a6_with(0x90000000 | rd.n, A6_ADR_PAGE, sy);
+  }
+  if as_name_at(v, ns, ne, "cbz") || as_name_at(v, ns, ne, "cbnz") {
+    let sy = a6_sym(v, t1s, t1e);
+    if !sy.ok || n != 2 {
+      return a6_fail();
+    }
+    let mut op = 0x34000000;
+    if as_name_at(v, ns, ne, "cbnz") {
+      op = 0x35000000;
+    }
+    return a6_with(sf | op | rd.n, A6_CONDBR19, sy);
+  }
+  if as_name_at(v, ns, ne, "tbz") || as_name_at(v, ns, ne, "tbnz") {
+    let bit = a6_imm(v, t1s, t1e);
+    if !bit.ok || bit.val > 63 || n != 3 {
+      return a6_fail();
+    }
+    let sy = a6_sym(v, a6_op_s(ops, 2), a6_op_e(ops, 2));
+    if !sy.ok {
+      return a6_fail();
+    }
+    let mut op = 0x36000000;
+    if as_name_at(v, ns, ne, "tbnz") {
+      op = 0x37000000;
+    }
+    let b5 = a6_at((bit.val >> 5), 31);
+    return a6_with(op | b5 | (a6_at((bit.val & 31), 19)) | rd.n, A6_TSTBR14, sy);
+  }
+  // loads and stores
+  if as_name_at(v, ns, ne, "ldr") || as_name_at(v, ns, ne, "str") {
+    let mut size = 2;
+    if rd.x {
+      size = 3;
+    }
+    let mut opc = 0;
+    if as_name_at(v, ns, ne, "ldr") {
+      opc = 1;
+    }
+    return a6_ldst(v, ops, n, size, opc, rd);
+  }
+  if as_name_at(v, ns, ne, "ldrb") || as_name_at(v, ns, ne, "strb") || as_name_at(v, ns, ne, "ldrh") || as_name_at(v, ns, ne, "strh") {
+    if rd.x {
+      return a6_fail();
+    }
+    let mut size = 0;
+    if u_at(v, wrap_add(ns, 3)) == 104 {
+      size = 1;
+    }
+    let mut opc = 0;
+    if u_at(v, ns) == 108 {
+      opc = 1;
+    }
+    return a6_ldst(v, ops, n, size, opc, rd);
+  }
+  if as_name_at(v, ns, ne, "ldrsw") {
+    if !rd.x {
+      return a6_fail();
+    }
+    return a6_ldst(v, ops, n, 2, 2, rd);
+  }
+  if as_name_at(v, ns, ne, "ldp") || as_name_at(v, ns, ne, "stp") {
+    return a6_pair(v, ops, n, as_name_at(v, ns, ne, "ldp"), rd);
+  }
+  if as_name_at(v, ns, ne, "ldar") || as_name_at(v, ns, ne, "ldarb") || as_name_at(v, ns, ne, "ldarh") || as_name_at(v, ns, ne, "stlr") || as_name_at(v, ns, ne, "stlrb") || as_name_at(v, ns, ne, "stlrh") {
+    let m = a6_mem(v, t1s, t1e);
+    if !m.ok || m.mode != 0 || m.imm != 0 || n != 2 {
+      return a6_fail();
+    }
+    let mut size = 2;
+    if rd.x {
+      size = 3;
+    }
+    let last = u_at(v, wrap_sub(ne, 1));
+    if last == 98 {
+      size = 0;
+    } else if last == 104 {
+      size = 1;
+    }
+    if (size < 2 && rd.x) || (size == 3 && !rd.x) {
+      return a6_fail();
+    }
+    let mut base = 0x08dffc00;
+    if u_at(v, ns) == 115 {
+      base = 0x089ffc00;
+    }
+    return a6_word(base | (a6_at(size, 30)) | (a6_at(m.base, 5)) | rd.n);
+  }
+  if as_name_at(v, ns, ne, "stlxr") {
+    if n != 3 || rd.x {
+      return a6_fail();
+    }
+    let rt = a6_reg(v, t1s, t1e);
+    let m = a6_mem(v, a6_op_s(ops, 2), a6_op_e(ops, 2));
+    if !rt.ok || !m.ok || m.mode != 0 || m.imm != 0 {
+      return a6_fail();
+    }
+    let mut size = 2;
+    if rt.x {
+      size = 3;
+    }
+    return a6_word(0x0800fc00 | (a6_at(size, 30)) | (a6_at(rd.n, 16)) | (a6_at(m.base, 5)) | rt.n);
+  }
+  // moves
+  if as_name_at(v, ns, ne, "mov") {
+    if n != 2 {
+      return a6_fail();
+    }
+    if a6_is_imm(v, t1s, t1e) {
+      let im = a6_imm(v, t1s, t1e);
+      if !im.ok || rd.sp {
+        return a6_fail();
+      }
+      return a6_movimm(rd, im.val);
+    }
+    let rm = a6_reg(v, t1s, t1e);
+    if !rm.ok || rm.x != rd.x {
+      return a6_fail();
+    }
+    if rd.sp || rm.sp {
+      return a6_word(sf | 0x11000000 | (a6_at(rm.n, 5)) | rd.n);
+    }
+    return a6_word(sf | 0x2a0003e0 | (a6_at(rm.n, 16)) | rd.n);
+  }
+  if as_name_at(v, ns, ne, "movz") || as_name_at(v, ns, ne, "movk") || as_name_at(v, ns, ne, "movn") {
+    let im = a6_imm(v, t1s, t1e);
+    if !im.ok || im.val > 65535 || n < 2 || n > 3 {
+      return a6_fail();
+    }
+    let mut hw = 0;
+    if n == 3 {
+      let s3 = a6_shift(v, a6_op_s(ops, 2), a6_op_e(ops, 2));
+      if s3 == AS_NONE || (s3 >> 8) != 0 || (s3 & 15) != 0 || (s3 & 255) > 48 {
+        return a6_fail();
+      }
+      hw = (s3 & 255) / 16;
+      if !rd.x && hw > 1 {
+        return a6_fail();
+      }
+    }
+    let mut opc = 0x12800000;
+    if as_name_at(v, ns, ne, "movz") {
+      opc = 0x52800000;
+    } else if as_name_at(v, ns, ne, "movk") {
+      opc = 0x72800000;
+    }
+    return a6_word(sf | opc | (a6_at(hw, 21)) | (a6_at(im.val, 5)) | rd.n);
+  }
+  if as_name_at(v, ns, ne, "mvn") {
+    let rm = a6_reg(v, t1s, t1e);
+    if !rm.ok || rm.x != rd.x || n != 2 {
+      return a6_fail();
+    }
+    return a6_word(sf | 0x2a2003e0 | (a6_at(rm.n, 16)) | rd.n);
+  }
+  if as_name_at(v, ns, ne, "neg") {
+    let rm = a6_reg(v, t1s, t1e);
+    if !rm.ok || rm.x != rd.x || n != 2 {
+      return a6_fail();
+    }
+    return a6_word(sf | 0x4b0003e0 | (a6_at(rm.n, 16)) | rd.n);
+  }
+  if as_name_at(v, ns, ne, "cmp") || as_name_at(v, ns, ne, "cmn") {
+    // the first operand is the register compared, the destination is zr
+    let zr = A6R { ok: true, n: 31, x: rd.x, sp: false };
+    return a6_addsub(v, ops, n, as_name_at(v, ns, ne, "cmp"), true, zr, 0);
+  }
+  if as_name_at(v, ns, ne, "add") || as_name_at(v, ns, ne, "sub") || as_name_at(v, ns, ne, "adds") || as_name_at(v, ns, ne, "subs") {
+    let sub = u_at(v, wrap_add(ns, 1)) == 117;
+    let setf = u_at(v, wrap_sub(ne, 1)) == 115;
+    if n < 3 {
+      return a6_fail();
+    }
+    return a6_addsub(v, ops, n, sub, setf, rd, 1);
+  }
+  if as_name_at(v, ns, ne, "and") {
+    return a6_logic(v, ops, n, 0, rd);
+  }
+  if as_name_at(v, ns, ne, "orr") {
+    return a6_logic(v, ops, n, 1, rd);
+  }
+  if as_name_at(v, ns, ne, "eor") {
+    return a6_logic(v, ops, n, 2, rd);
+  }
+  if as_name_at(v, ns, ne, "ands") {
+    return a6_logic(v, ops, n, 3, rd);
+  }
+  if as_name_at(v, ns, ne, "cset") {
+    let cc = a6_cond(v, t1s, t1e);
+    if cc == AS_NONE || n != 2 {
+      return a6_fail();
+    }
+    return a6_word(sf | 0x1a9f07e0 | (a6_at((cc ^ 1), 12)) | rd.n);
+  }
+  if as_name_at(v, ns, ne, "sxtw") || as_name_at(v, ns, ne, "uxtb") || as_name_at(v, ns, ne, "uxth") || as_name_at(v, ns, ne, "sxth") || as_name_at(v, ns, ne, "sxtb") {
+    let rn = a6_reg(v, t1s, t1e);
+    if !rn.ok || rn.x || n != 2 {
+      return a6_fail();
+    }
+    let mut imms = 31;
+    if u_at(v, wrap_sub(ne, 1)) == 98 {
+      imms = 7;
+    } else if u_at(v, wrap_sub(ne, 1)) == 104 {
+      imms = 15;
+    }
+    let signed = u_at(v, ns) == 115;
+    if !signed && rd.x {
+      return a6_fail();
+    }
+    if as_name_at(v, ns, ne, "sxtw") && !rd.x {
+      return a6_fail();
+    }
+    let mut base = 0x53000000;
+    if signed {
+      base = 0x13000000;
+    }
+    if rd.x {
+      base = base | 0x80400000;
+    }
+    return a6_word(base | (a6_at(imms, 10)) | (a6_at(rn.n, 5)) | rd.n);
+  }
+  if as_name_at(v, ns, ne, "mul") || as_name_at(v, ns, ne, "udiv") || as_name_at(v, ns, ne, "sdiv") || as_name_at(v, ns, ne, "umulh") || as_name_at(v, ns, ne, "lsl") || as_name_at(v, ns, ne, "lsr") || as_name_at(v, ns, ne, "asr") || as_name_at(v, ns, ne, "ror") {
+    if n != 3 {
+      return a6_fail();
+    }
+    let rn = a6_reg(v, t1s, t1e);
+    if !rn.ok || rn.x != rd.x {
+      return a6_fail();
+    }
+    let t2s = a6_op_s(ops, 2);
+    let t2e = a6_op_e(ops, 2);
+    if a6_is_imm(v, t2s, t2e) {
+      let im = a6_imm(v, t2s, t2e);
+      let w = 32;
+      let mut bits = w;
+      if rd.x {
+        bits = 64;
+      }
+      if !im.ok || im.val >= bits {
+        return a6_fail();
+      }
+      let f = sf | (sf >> 9);
+      if as_name_at(v, ns, ne, "lsl") {
+        return a6_word(f | 0x53000000 | (a6_at((wrap_sub(bits, im.val) & wrap_sub(bits, 1)), 16)) | (a6_at(wrap_sub(wrap_sub(bits, 1), im.val), 10)) | (a6_at(rn.n, 5)) | rd.n);
+      }
+      if as_name_at(v, ns, ne, "lsr") {
+        return a6_word(f | 0x53000000 | (a6_at(im.val, 16)) | (a6_at(wrap_sub(bits, 1), 10)) | (a6_at(rn.n, 5)) | rd.n);
+      }
+      if as_name_at(v, ns, ne, "asr") {
+        return a6_word(f | 0x13000000 | (a6_at(im.val, 16)) | (a6_at(wrap_sub(bits, 1), 10)) | (a6_at(rn.n, 5)) | rd.n);
+      }
+      if as_name_at(v, ns, ne, "ror") {
+        return a6_word(sf | 0x13800000 | (sf >> 9) | (a6_at(rn.n, 16)) | (a6_at(im.val, 10)) | (a6_at(rn.n, 5)) | rd.n);
+      }
+      return a6_fail();
+    }
+    let rm = a6_reg(v, t2s, t2e);
+    if !rm.ok || rm.x != rd.x {
+      return a6_fail();
+    }
+    if as_name_at(v, ns, ne, "mul") {
+      return a6_word(sf | 0x1b007c00 | (a6_at(rm.n, 16)) | (a6_at(rn.n, 5)) | rd.n);
+    }
+    if as_name_at(v, ns, ne, "udiv") {
+      return a6_word(sf | 0x1ac00800 | (a6_at(rm.n, 16)) | (a6_at(rn.n, 5)) | rd.n);
+    }
+    if as_name_at(v, ns, ne, "sdiv") {
+      return a6_word(sf | 0x1ac00c00 | (a6_at(rm.n, 16)) | (a6_at(rn.n, 5)) | rd.n);
+    }
+    if as_name_at(v, ns, ne, "umulh") {
+      if !rd.x {
+        return a6_fail();
+      }
+      return a6_word(0x9bc07c00 | (a6_at(rm.n, 16)) | (a6_at(rn.n, 5)) | rd.n);
+    }
+    if as_name_at(v, ns, ne, "lsl") {
+      return a6_word(sf | 0x1ac02000 | (a6_at(rm.n, 16)) | (a6_at(rn.n, 5)) | rd.n);
+    }
+    if as_name_at(v, ns, ne, "lsr") {
+      return a6_word(sf | 0x1ac02400 | (a6_at(rm.n, 16)) | (a6_at(rn.n, 5)) | rd.n);
+    }
+    if as_name_at(v, ns, ne, "asr") {
+      return a6_word(sf | 0x1ac02800 | (a6_at(rm.n, 16)) | (a6_at(rn.n, 5)) | rd.n);
+    }
+    return a6_word(sf | 0x1ac02c00 | (a6_at(rm.n, 16)) | (a6_at(rn.n, 5)) | rd.n);
+  }
+  if as_name_at(v, ns, ne, "msub") || as_name_at(v, ns, ne, "madd") {
+    if n != 4 {
+      return a6_fail();
+    }
+    let rn = a6_reg(v, t1s, t1e);
+    let rm = a6_reg(v, a6_op_s(ops, 2), a6_op_e(ops, 2));
+    let ra = a6_reg(v, a6_op_s(ops, 3), a6_op_e(ops, 3));
+    if !rn.ok || !rm.ok || !ra.ok || rn.x != rd.x || rm.x != rd.x || ra.x != rd.x {
+      return a6_fail();
+    }
+    let mut o0 = 0;
+    if as_name_at(v, ns, ne, "msub") {
+      o0 = 32768;
+    }
+    return a6_word(sf | 0x1b000000 | o0 | (a6_at(rm.n, 16)) | (a6_at(ra.n, 10)) | (a6_at(rn.n, 5)) | rd.n);
+  }
+  return a6_fail();
+}

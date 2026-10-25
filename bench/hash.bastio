@@ -1,0 +1,65 @@
+// Open-addressing hash set of u64 keys in a Buf of 2^20 slots (0: empty),
+// linear probing, multiplicative hash: 500000 inserts, then 8000000 lookups.
+fn slot(k: u64) -> u64
+  ensures result < 1048576
+{
+  return wrap_mul(k, 11400714819323198485) >> 44;
+}
+
+fn insert(mut t: Buf, k: u64) -> Buf
+  requires len(t) == 1048576 && k > 0
+  ensures len(result) == 1048576
+{
+  let mut i = slot(k);
+  let mut steps = 0;
+  while get(t, i) != 0 && get(t, i) != k && steps < 1048576
+    invariant i < 1048576 && len(t) == 1048576 && steps <= 1048576
+  {
+    i = (i + 1) % 1048576;
+    steps = steps + 1;
+  }
+  if get(t, i) == 0 {
+    t = set(t, i, k);
+  }
+  return t;
+}
+
+fn has(t: &Buf, k: u64) -> bool
+  requires len(t) == 1048576 && k > 0
+{
+  let mut i = slot(k);
+  let mut steps = 0;
+  while get(t, i) != 0 && get(t, i) != k && steps < 1048576
+    invariant i < 1048576 && len(t) == 1048576 && steps <= 1048576
+  {
+    i = (i + 1) % 1048576;
+    steps = steps + 1;
+  }
+  return get(t, i) == k;
+}
+
+fn main() -> u64 {
+  let mut t = alloc(1048576);
+  let mut x = 12345;
+  let mut n = 0;
+  while n < 500000
+    invariant n <= 500000 && len(t) == 1048576 && x < 4294967296
+  {
+    x = (x * 1103515245 + 12345) % 4294967296;
+    t = insert(t, x + 1);
+    n = n + 1;
+  }
+  let mut hits = 0;
+  let mut y = 12345;
+  let mut m = 0;
+  while m < 8000000
+    invariant m <= 8000000 && len(t) == 1048576 && y < 4294967296 && hits <= m
+  {
+    y = (y * 1103515245 + 12345) % 4294967296;
+    if has(t, y + 1) { hits = hits + 1; }
+    m = m + 1;
+  }
+  print(hits);
+  free(t);
+  return 0;
+}

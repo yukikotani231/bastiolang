@@ -1,0 +1,79 @@
+// expect-exit: 0
+// expect-stdout: 40000400
+// A probe loop with three exits (empty slot, match, step limit) followed by
+// `get(t, i) == k`: with `k > 0` from `requires`, each exit decides the
+// comparison, so the native-ir backend returns constants from the exits. The
+// cases cover the helper called standalone and inlined, with a full table (step
+// limit), a hit, and a miss.
+fn put(mut t: Buf, k: u64) -> Buf
+  requires len(t) == 64 && k > 0
+  ensures len(result) == 64
+{
+  let mut i = k % 64;
+  let mut steps = 0;
+  while get(t, i) != 0 && get(t, i) != k && steps < 64
+    invariant i < 64 && len(t) == 64 && steps <= 64
+  {
+    i = (i + 1) % 64;
+    steps = steps + 1;
+  }
+  if get(t, i) == 0 {
+    t = set(t, i, k);
+  }
+  return t;
+}
+
+fn has(t: &Buf, k: u64) -> bool
+  requires len(t) == 64 && k > 0
+{
+  let mut i = k % 64;
+  let mut steps = 0;
+  while get(t, i) != 0 && get(t, i) != k && steps < 64
+    invariant i < 64 && len(t) == 64 && steps <= 64
+  {
+    i = (i + 1) % 64;
+    steps = steps + 1;
+  }
+  return get(t, i) == k;
+}
+
+fn count(t: &Buf, lo: u64, hi: u64) -> u64
+  requires len(t) == 64 && lo > 0 && lo <= hi && hi <= 1000
+{
+  let mut n = 0;
+  let mut k = lo;
+  while k < hi
+    invariant k <= hi && n <= k && len(t) == 64 && k > 0
+  {
+    if has(t, k) { n = n + 1; }
+    k = k + 1;
+  }
+  return n;
+}
+
+fn main() -> u64 {
+  let mut t = alloc(64);
+  let mut k = 1;
+  while k <= 40
+    invariant k <= 41 && len(t) == 64 && k > 0
+  {
+    t = put(t, k * 7);
+    k = k + 1;
+  }
+  // 40 keys present, the rest of 1..1000 absent.
+  let a = count(t, 1, 1000);
+  // Fill the table completely with other keys, then probe a missing one (step limit).
+  let mut j = 1;
+  while j <= 200
+    invariant j <= 201 && len(t) == 64 && j > 0
+  {
+    t = put(t, 1000 + j);
+    j = j + 1;
+  }
+  let b = count(t, 1, 1000);
+  let mut c = 0;
+  if has(t, 5000) { c = 1; }
+  print(wrap_add(wrap_add(wrap_mul(a, 1000000), wrap_mul(b, 10)), c));
+  free(t);
+  return 0;
+}

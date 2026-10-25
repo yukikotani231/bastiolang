@@ -131,6 +131,13 @@ struct X86 {
   /// For instance names (`cg_instname`) and sort keys.
   cg: Cg,
   names: Vec[X86Name],
+  /// A hash index over `names` (see `x86_nm`).
+  nix: Ix,
+  /// For each function instance (by position in `Mono.fns`), the nodes of
+  /// the variables its body lends mutably: start and count in `bnodes`, or
+  /// a count of X86_NODES until they are computed.
+  bspan: Vec[u64],
+  bnodes: Vec[u64],
   vars: Vec[X86Var],
   /// Variables below this index are not visible (an inlined body sees
   /// only its parameters and its own variables).
@@ -196,6 +203,8 @@ struct X86 {
   /// TARGET_HOSTED, or TARGET_USER: a BastiOS user program, with its own
   /// runtime over the kernel's system calls instead of the C library.
   target: u64,
+  /// Assembly for macOS (Mach-O) rather than Linux (ELF), see macho.bastio.
+  macos: bool,
   /// The thunks of the `smp_run` calls (kernel target), written after the
   /// functions, and how many there are.
   smp: Vec[u64],
@@ -205,19 +214,23 @@ struct X86 {
   snode: Vec[u64],
   /// A `let` whose struct is only read through some of its fields: its
   /// storage (as an X86Dst) and the words to fill (a bit each; stage1).
-  mk: u64, ma: u64, mmask: u64
+  mk: u64, ma: u64, mmask: u64,
+  /// Register allocation retries of the IR path (`irx_shrink`): the spill
+  /// slots of the last attempt, the most a retry may use (1000000000: no limit),
+  /// and whether the attempt is the one to keep.
+  rspill: u64, rlimit: u64, rkeep: bool
 }
 
 fn x86_new() -> X86 {
   return X86 {
     out: vec_new[u64](), body: vec_new[u64](), ln: vec_new[u64](), cg: cg_new(TARGET_HOSTED),
-    names: vec_new[X86Name](), vars: vec_new[X86Var](), vfloor: 0, used: vec_new[u64](),
+    names: vec_new[X86Name](), nix: ix_new(), bspan: vec_new[u64](), bnodes: vec_new[u64](), vars: vec_new[X86Var](), vfloor: 0, used: vec_new[u64](),
     saves: vec_new[X86Save](), stack: vec_new[u64](), bsize: vec_new[u64](), ncalls: vec_new[u64](),
     sdata: vec_new[u64](), sstart: vec_new[u64](), slens: vec_new[u64](),
     labels: 0, frame: 0, slots: vec_new[u64](), live: vec_new[u64](), freed: vec_new[u64](), depth: 0, env: 0, pre: 0, retl: 0, retw: 0, reto: 0, rdk: 0, rda: 0, rdo: 0,
     parent: vec_new[u64](), cur: 0, decl: vec_new[X86Decl](), ivs: vec_new[X86Iv](), pos: 0, loops: vec_new[u64](), xt: vec_new[u64](), sw: false, failed: false, fmsg: vec_new[u64](),
-    stage0: false, target: TARGET_HOSTED, smp: vec_new[u64](), nsmp: 0, snode: vec_new[u64](),
-    mk: 0, ma: 0, mmask: 0
+    stage0: false, target: TARGET_HOSTED, macos: false, smp: vec_new[u64](), nsmp: 0, snode: vec_new[u64](),
+    mk: 0, ma: 0, mmask: 0, rspill: 0, rlimit: 1000000000, rkeep: false
   };
 }
 
@@ -227,6 +240,9 @@ fn x86_free(g: X86) {
   vec_free(g.ln);
   cg_free(g.cg);
   vec_free(g.names);
+  ix_free(g.nix);
+  vec_free(g.bspan);
+  vec_free(g.bnodes);
   vec_free(g.vars);
   vec_free(g.used);
   vec_free(g.saves);
@@ -717,17 +733,41 @@ fn x86_name_set(g: &mut X86, id: u64, n: X86Name) {
   }
 }
 
+/// Empties the name index, with `names` emptied.
+fn x86_nix_clear(g: &mut X86) {
+  while vec_len(g.nix.hs) > 0 {
+    vec_pop(&mut g.nix.hs);
+  }
+  while vec_len(g.nix.nexts) > 0 {
+    vec_pop(&mut g.nix.nexts);
+  }
+  while vec_len(g.nix.vals) > 0 {
+    vec_pop(&mut g.nix.vals);
+  }
+  while vec_len(g.nix.heads) > 64 {
+    vec_pop(&mut g.nix.heads);
+  }
+  let mut k = 0;
+  while k < vec_len(g.nix.heads) {
+    vec_set(&mut g.nix.heads, k, 0);
+    k = k + 1;
+  }
+}
+
 /// The name `s..e` declared in the body of instance `x` (0: the function
 /// being generated).
 fn x86_nm(g: &mut X86, p: &Parser, x: u64, s: u64, e: u64) -> u64 {
-  let mut k = 0;
-  while k < vec_len(g.names) {
-    let n = vec_get(g.names, k);
+  let h = wrap_mul(text_hash(p.src, s, e) ^ x, 1099511628211);
+  let mut j = ix_first(g.nix, h);
+  while j != 0 {
+    let k = ix_val(g.nix, j);
+    let n = x86_name_at(g, wrap_add(k, 1));
     if n.x == x && same(p.src, n.s, n.e, s, e) {
-      return k + 1;
+      return wrap_add(k, 1);
     }
-    k = k + 1;
+    j = ix_next(g.nix, h, j);
   }
+  ix_add(&mut g.nix, h, vec_len(g.names));
   vec_push(&mut g.names, X86Name { x: x, s: s, e: e, uses: 0, whole: false, read: 0, size: 0, bad: false, asg: false, alias: 0, brw: false, rn: 0, r0: 0, r1: 0, r2: 0, iv: 0 });
   return vec_len(g.names);
 }
@@ -900,7 +940,7 @@ fn x86_inline_builtin(p: &Parser, i: u64) -> bool {
     || name_is(p, i, "pt_new") || name_is(p, i, "pt_free") || name_is(p, i, "frame_id") || name_is(p, i, "frame_read")
     || name_is(p, i, "frame_read8") || name_is(p, i, "frame_write") || name_is(p, i, "frame_write8") || name_is(p, i, "pt_has") || name_is(p, i, "pt_writable")
     || name_is(p, i, "pt_put") || name_is(p, i, "pt_put_frame") || name_is(p, i, "pt_take") || name_is(p, i, "pt_take_frame")
-    || name_is(p, i, "bcopy") || name_is(p, i, "bmove") || name_is(p, i, "frame_to_bytes") || name_is(p, i, "bytes_to_frame")
+    || name_is(p, i, "bcopy") || name_is(p, i, "bmove") || name_is(p, i, "frame_to_bytes") || name_is(p, i, "bytes_to_frame") || name_is(p, i, "frame_to_frame")
     || name_is(p, i, "pt_lease_count") || name_is(p, i, "shared_new") || name_is(p, i, "shared_dup") || name_is(p, i, "shared_drop")
     || name_is(p, i, "shared_id") || name_is(p, i, "pt_shared") || name_is(p, i, "pt_put_shared") || name_is(p, i, "pt_take_shared")
     || name_is(p, i, "pt_dup_shared") || name_is(p, i, "pool_take_dirty") || name_is(p, i, "dirty_id") || name_is(p, i, "dirty_zero")
@@ -1102,7 +1142,11 @@ fn x86_list_root(p: &Parser, head: u64) -> u64 {
 }
 
 /// The variables lent mutably (`&mut x`) in an expression, as names of
-/// body `pre` (stage0's `stmts_borrows`).
+/// body `pre` (stage0's `stmts_borrows`). With `pre` = X86_NODES the
+/// variables' nodes are collected instead, in the same order, to be named
+/// later (see `x86_borrow_nodes`).
+const X86_NODES: u64 = 18446744073709551615;
+
 fn x86_eborrows(g: &mut X86, p: &Parser, i: u64, pre: u64, out: &mut Vec[u64]) {
   if i == 0 {
     return;
@@ -1110,9 +1154,13 @@ fn x86_eborrows(g: &mut X86, p: &Parser, i: u64, pre: u64, out: &mut Vec[u64]) {
   let n = node_at(p.nodes, i);
   let k = n.kind;
   if k == E_MUTBORROW {
-    let r = node_at(p.nodes, n.a);
-    let id = x86_nm(&mut g, p, pre, r.s, r.e);
-    add_id(&mut out, id);
+    if pre == X86_NODES {
+      vec_push(&mut out, n.a);
+    } else {
+      let r = node_at(p.nodes, n.a);
+      let id = x86_nm(&mut g, p, pre, r.s, r.e);
+      add_id(&mut out, id);
+    }
   } else if k == E_FIELD || k == E_IS || k == E_NOT || k == E_NEG || k == E_VARIANT {
     x86_eborrows(&mut g, p, n.a, pre, &mut out);
   } else if k == E_TAPP {
@@ -1162,6 +1210,45 @@ fn x86_borrows(g: &mut X86, p: &Parser, head: u64, pre: u64, out: &mut Vec[u64])
       }
     }
     i = n.next;
+  }
+}
+
+/// Marks the variables the body of instance `y` (the k-th of `m.fns`) lends
+/// mutably as borrowed (never in a register), as the names of the current
+/// function: what `x86_borrows` and the marking after it would do, but the
+/// walk of the body is made once.
+fn x86_borrow_names(g: &mut X86, m: &Mono, p: &Parser, k: u64, y: u64) {
+  while vec_len(g.bspan) < wrap_mul(vec_len(m.fns), 2) {
+    vec_push(&mut g.bspan, 0);
+    vec_push(&mut g.bspan, X86_NODES);
+  }
+  let at = wrap_mul(k, 2);
+  if at + 1 < vec_len(g.bspan) {
+    if vec_get(g.bspan, at + 1) == X86_NODES {
+      let start = vec_len(g.bnodes);
+      let mut found = vec_new[u64]();
+      x86_borrows(&mut g, p, x86_body(m, p, y), X86_NODES, &mut found);
+      let mut q = 0;
+      while q < vec_len(found) {
+        vec_push(&mut g.bnodes, vec_get(found, q));
+        q = q + 1;
+      }
+      vec_set(&mut g.bspan, at, start);
+      vec_set(&mut g.bspan, at + 1, vec_len(found));
+      vec_free(found);
+    }
+    let start = vec_get(g.bspan, at);
+    let cnt = vec_get(g.bspan, at + 1);
+    let mut q = 0;
+    while q < cnt && wrap_add(start, q) < vec_len(g.bnodes) {
+      let r = node_at(p.nodes, vec_get(g.bnodes, wrap_add(start, q)));
+      let id = x86_nm(&mut g, p, y, r.s, r.e);
+      let mut nm = x86_name_at(g, id);
+      nm.brw = true;
+      nm.bad = true;
+      x86_name_set(&mut g, id, nm);
+      q = q + 1;
+    }
   }
 }
 
@@ -4322,15 +4409,18 @@ fn x86_to_regs_cpu(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, r
   if r2 != 0 { x86_pop(&mut g, x86_reg(r2)); }
 }
 
-/// Copies %rcx bytes from (%rsi) to (%rdi), lowest first: whole words with
-/// rep movsq, then the rest with rep movsb (the C prelude's bst_copy_fwd).
+/// Copies %rcx bytes from (%rsi) to (%rdi), lowest first: one rep movsb
+/// where bst_copy_erms is set, else whole words first (the C prelude's
+/// bst_copy_fwd).
 fn x86_copy_fwd(g: &mut X86) {
+  x86_es(&mut g, "cmpb $0, bst_copy_erms(%rip)");
+  x86_es(&mut g, "jne 1f");
   x86_es(&mut g, "mov %rcx, %rax");
   x86_es(&mut g, "shr $3, %rcx");
   x86_es(&mut g, "rep movsq");
   x86_es(&mut g, "mov %eax, %ecx");
   x86_es(&mut g, "and $7, %ecx");
-  x86_es(&mut g, "rep movsb");
+  x86_es(&mut g, "1: rep movsb");
 }
 
 /// For a copy call `i` whose source is a Bytes value (argument 2) between
@@ -4518,7 +4608,17 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_pop(&mut g, x86_reg(XR_RCX));
     x86_es(&mut g, "mov 8(%rsp), %rdx");
     x86_es(&mut g, "mov %rax, (%rdx,%rcx,8)");
-  } else if name_is(p, i, "bset") && !g.stage0 && kind_of(p, a0) == E_MUTBORROW {
+  } else {
+    x86_builtin_2(&mut g, c, &mut m, p, i);
+  }
+}
+
+fn x86_builtin_2(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
+  let n = node_at(p.nodes, i);
+  let a0 = n.a;
+  let a1 = cg_arg(p, i, 1);
+  let a2 = cg_arg(p, i, 2);
+  if name_is(p, i, "bset") && !g.stage0 && kind_of(p, a0) == E_MUTBORROW {
     // stage1: the value first, then the borrow (a place's address, which
     // has no effects and needs no register but %rcx) and the index.
     let mut simple = x86_simple(p, a1);
@@ -4676,7 +4776,17 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
       x86_es(&mut g, "mov %rcx, (%rdx)");
       x86_place_label(&mut g, l);
     }
-  } else if name_is(p, i, "pool_give") {
+  } else {
+    x86_builtin_3(&mut g, c, &mut m, p, i);
+  }
+}
+
+fn x86_builtin_3(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
+  let n = node_at(p.nodes, i);
+  let a0 = n.a;
+  let a1 = cg_arg(p, i, 1);
+  let a2 = cg_arg(p, i, 2);
+  if name_is(p, i, "pool_give") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RAX, 0, 0, 0);
   } else if name_is(p, i, "pt_free") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RAX, 0, 0, 0, 0);
@@ -4720,6 +4830,14 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
   } else if name_is(p, i, "frame_to_bytes") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, XR_RAX, XR_RSI, XR_RDX, XR_RCX);
     x86_es(&mut g, "mov 8(%rdi), %rdi");
+    x86_es(&mut g, "add %rax, %rdi");
+    x86_es(&mut g, "add %rdx, %rsi");
+    x86_copy_fwd(&mut g);
+  } else if name_is(p, i, "frame_to_frame") {
+    // The destination page is lent as `&mut`: the address of its address;
+    // the source page is lent as `&`: its address.
+    x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, XR_RAX, XR_RSI, XR_RDX, XR_RCX);
+    x86_es(&mut g, "mov (%rdi), %rdi");
     x86_es(&mut g, "add %rax, %rdi");
     x86_es(&mut g, "add %rdx, %rsi");
     x86_copy_fwd(&mut g);
@@ -4788,7 +4906,17 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     } else {
       x86_es(&mut g, "lock incl (%rcx,%rdx,4)");
     }
-  } else if name_is(p, i, "shared_drop") {
+  } else {
+    x86_builtin_4(&mut g, c, &mut m, p, i);
+  }
+}
+
+fn x86_builtin_4(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
+  let n = node_at(p.nodes, i);
+  let a0 = n.a;
+  let a1 = cg_arg(p, i, 1);
+  let a2 = cg_arg(p, i, 2);
+  if name_is(p, i, "shared_drop") {
     // Gives up one reference: the page number when it was the last, else
     // all ones.
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RSI, XR_RAX, 0, 0, 0);
@@ -4860,6 +4988,9 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_es(&mut g, "lea (%rdx,%rcx,8), %rdx");
     x86_es(&mut g, "mov (%rdx), %rax");
     x86_es(&mut g, "movq $0, (%rdx)");
+    if g.target == TARGET_KERNEL {
+      x86_es(&mut g, "lock incq bst_rt_pt_gen(%rip)");
+    }
     x86_es(&mut g, "movabs $0x000FFFFFFFFFF000, %rcx");
     x86_es(&mut g, "and %rcx, %rax");
   } else if name_is(p, i, "box") {
@@ -4901,7 +5032,17 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     if w == 1 {
       x86_pop(&mut g, x86_reg(XR_RAX));
     }
-  } else if name_is(p, i, "vec_push") {
+  } else {
+    x86_builtin_5(&mut g, c, &mut m, p, i);
+  }
+}
+
+fn x86_builtin_5(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
+  let n = node_at(p.nodes, i);
+  let a0 = n.a;
+  let a1 = cg_arg(p, i, 1);
+  let a2 = cg_arg(p, i, 2);
+  if name_is(p, i, "vec_push") {
     let w = x86_words(&mut g, c, m, p, x86_vec_elem(&mut g, c, &mut m, p, a0));
     let pr = x86_mutref_reg(&mut g, p, a0);
     // stage1: the vector's header, in memory at an address in a register
@@ -5037,7 +5178,17 @@ fn x86_builtin(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_pop(&mut g, x86_reg(XR_RDI));
     x86_es_off(&mut g, "mov $", w, ", %edx");
     x86_es(&mut g, "call bst_rt_vec_try_reserve");
-  } else if name_is(p, i, "vec_pop") {
+  } else {
+    x86_builtin_6(&mut g, c, &mut m, p, i);
+  }
+}
+
+fn x86_builtin_6(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
+  let n = node_at(p.nodes, i);
+  let a0 = n.a;
+  let a1 = cg_arg(p, i, 1);
+  let a2 = cg_arg(p, i, 2);
+  if name_is(p, i, "vec_pop") {
     let w = x86_words(&mut g, c, m, p, x86_vec_elem(&mut g, c, &mut m, p, a0));
     x86_scalar(&mut g, c, &mut m, p, a0);
     x86_es(&mut g, "mov %rax, %rdi");
@@ -5650,6 +5801,9 @@ fn x86_builtin1(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_es(&mut g, "cmovz %rdi, %rsi");
     x86_es(&mut g, "or %rsi, %rcx");
     x86_es(&mut g, "mov %rcx, (%rdx)");
+    if g.target == TARGET_KERNEL {
+      x86_es(&mut g, "lock incq bst_rt_pt_gen(%rip)");
+    }
   } else if name_is(p, i, "atomic_load") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, 0, 0, 0, 0);
     x86_es(&mut g, "mov (%rdi), %rax");
@@ -5675,7 +5829,14 @@ fn x86_builtin1(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
     x86_es(&mut g, "mov %rdx, %rax");
     x86_es(&mut g, "lock cmpxchg %rcx, (%rdi)");
     x86_jump(&mut g, "jne", again);
-  } else if name_is(p, i, "port_claim") || name_is(p, i, "mmio_claim") {
+  } else {
+    x86_builtin1_2(&mut g, c, &mut m, p, i);
+  }
+}
+
+fn x86_builtin1_2(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
+  let n = node_at(p.nodes, i);
+  if name_is(p, i, "port_claim") || name_is(p, i, "mmio_claim") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RDI, XR_RSI, XR_RDX, 0, 0);
     if name_is(p, i, "mmio_claim") && g.target == TARGET_KERNEL {
       x86_es(&mut g, "call bst_rt_mmio_check");   // the window overlaps RAM above 2 GiB
@@ -5765,7 +5926,14 @@ fn x86_builtin1(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
   } else if name_is(p, i, "mmu_kernel") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, 0, 0, 0, 0);
     x86_es(&mut g, "call bst_rt_kernel_table");
-  } else if name_is(p, i, "cpu_run") {
+  } else {
+    x86_builtin1_3(&mut g, c, &mut m, p, i);
+  }
+}
+
+fn x86_builtin1_3(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
+  let n = node_at(p.nodes, i);
+  if name_is(p, i, "cpu_run") {
     x86_to_regs(&mut g, c, &mut m, p, i, XR_RDX, XR_RAX, 0, 0, 0);
     x86_es(&mut g, "call bst_rt_cpu_run");
   } else if name_is(p, i, "cpu_idle") || name_is(p, i, "cpu_count") {
@@ -7906,6 +8074,7 @@ fn x86_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
   while vec_len(g.names) > 0 {
     vec_pop(&mut g.names);
   }
+  x86_nix_clear(&mut g);
   x86_truncate(&mut g, 0);
   g.vfloor = 0;
   x86_clear(&mut g.used);
@@ -7931,7 +8100,7 @@ fn x86_function(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
   while k < vec_len(m.fns) {
     let y = u_at(m.fns, k);
     if x86_inlinable(&mut g, m, p, y) {
-      x86_borrows(&mut g, p, x86_body(m, p, y), y, &mut brw);
+      x86_borrow_names(&mut g, m, p, k, y);
     }
     k = k + 1;
   }
@@ -8183,6 +8352,26 @@ fn x86_entry(g: &mut X86, m: &mut Mono, p: &Parser, x: u64) {
   } else {
     w_s(&mut g.out, "\t.globl main\nmain:\n\tpush %rbp\n\tmov %rsp, %rbp\n\tpush %rbx\n\tsub $72, %rsp\n");
     w_s(&mut g.out, "\tmov %edi, bst_rt_argc(%rip)\n\tmov %rsi, bst_rt_argv(%rip)\n");
+  }
+  // `main` is called with its capabilities pushed: an odd number of words
+  // gets a word of padding, so that it is entered as any function is (%rsp
+  // 8 modulo 16) and the C library is called with an aligned stack.
+  let mut pw = 0;
+  let mut pq = dn.a;
+  let mut poff = 8;
+  while pq != 0 && poff <= 64 {
+    let pn = node_at(p.nodes, pq);
+    let pk = kind_t(m, base_t(m, conv(&mut m, p, pn.a, x, pq)));
+    let mut w = 1;
+    if pk == TY_POOL {
+      w = 2;
+    }
+    pw = wrap_add(pw, w);
+    poff = wrap_add(poff, wrap_mul(8, w));
+    pq = pn.next;
+  }
+  if (pw & 1) == 1 {
+    w_s(&mut g.out, "\tsub $8, %rsp\n");
   }
   // Each capability lives in a frame slot below the saved %rbx; `main`
   // gets it by value or by address.
@@ -8570,7 +8759,7 @@ fn x86_program_start(g: &mut X86, m: &mut Mono, p: &Parser) -> u64 {
     return 0;
   }
 
-  w_s(&mut g.out, "# generated by bastioc0 --backend native -- do not edit\n\t.text\n");
+  w_s(&mut g.out, "# generated by bastioc0 --backend native -- do not edit\n\t.comm bst_copy_erms,1,1\n\t.text\n");
   return main_x;
 }
 
@@ -8735,6 +8924,7 @@ fn x86_runtime(out: &mut Vec[u64]) {
   w_s(&mut out, "\tmul %rsi                    # bytes; past 64 bits the request cannot be met\n");
   w_s(&mut out, "\tjo bst_rt_oom\n");
   w_s(&mut out, "\tmov %rax, %rsi\n");
+  w_s(&mut out, "\tand $-16, %rsp\n");
   w_s(&mut out, "\tmov 16(%rbx), %rdi\n");
   w_s(&mut out, "\tcall realloc@PLT\n");
   w_s(&mut out, "\ttest %rax, %rax\n");
@@ -10182,7 +10372,7 @@ fn x86_runtime_kernel(out: &mut Vec[u64], fast: bool) {
   w_s(&mut out, "3:\tlea 4095(,%r13,8), %r15     # the bookkeeping: counter pages, then the arena's extension\n");
   w_s(&mut out, "\tshr $12, %r15\n");
   w_s(&mut out, "\tmov %r13, %r11\n");
-  w_s(&mut out, "\tshr $4, %r11\n");
+  w_s(&mut out, "\tshr $3, %r11\n");
   w_s(&mut out, "\tcmp $1024, %r11               # at least 4 MiB, at most an eighth of the pages\n");
   w_s(&mut out, "\tjae 4f\n");
   w_s(&mut out, "\tmov %r13, %r11\n");
@@ -10299,6 +10489,15 @@ fn x86_runtime_kernel(out: &mut Vec[u64], fast: bool) {
   w_s(&mut out, "\tinc %rax\n");
   w_s(&mut out, "6:\tret\n");
   w_s(&mut out, "bst_rt_page_at:                 # %rax = the address of page %rax (the C prelude's bst_page_at); keeps every other register\n");
+  if fast {
+    w_s(&mut out, "\tcmpq $1, bst_rt_runs(%rip)       # one run (the usual case): no search, no saved registers\n");
+    w_s(&mut out, "\tja 3f\n");
+    w_s(&mut out, "\tsub bst_rt_run_id(%rip), %rax\n");
+    w_s(&mut out, "\tshl $12, %rax\n");
+    w_s(&mut out, "\tadd bst_rt_run_at(%rip), %rax\n");
+    w_s(&mut out, "\tret\n");
+    w_s(&mut out, "3:\n");
+  }
   w_s(&mut out, "\tpush %rcx\n");
   w_s(&mut out, "\tpush %rdx\n");
   w_s(&mut out, "\tpush %rsi\n");
@@ -10546,6 +10745,9 @@ fn x86_runtime_kernel(out: &mut Vec[u64], fast: bool) {
   w_s(&mut out, "\t.bss\n");
   w_s(&mut out, "\t.p2align 3\n");
   w_s(&mut out, "bst_rt_mbi:\t.quad 0\n");
+  w_s(&mut out, "\t.globl bst_pt_gen\n");
+  w_s(&mut out, "bst_pt_gen:\n");
+  w_s(&mut out, "bst_rt_pt_gen:\t.quad 0         # entries taken out of any table (boot.S compares it)\n");
   w_s(&mut out, "bst_rt_run_at:\t.zero 256        # where each run of RAM starts (bst_rt_pool_init)\n");
   w_s(&mut out, "bst_rt_run_id:\t.zero 264        # the page number each starts at, and the end\n");
   w_s(&mut out, "bst_rt_runs:\t.quad 0\n");
@@ -10553,7 +10755,7 @@ fn x86_runtime_kernel(out: &mut Vec[u64], fast: bool) {
   w_s(&mut out, "bst_rt_shared_refs:\t.quad 0     # a 32-bit reference count per pool page, after them\n");
   w_s(&mut out, "bst_rt_carved_lo:\t.quad 0       # the RAM carved off for the counters and the arena's extension\n");
   w_s(&mut out, "bst_rt_carved_hi:\t.quad 0\n");
-  w_s(&mut out, "bst_rt_arena2:\t.quad 0          # the arena's extension: a 16th of the pool, at least 4 MiB\n");
+  w_s(&mut out, "bst_rt_arena2:\t.quad 0          # the arena's extension: an eighth of the pool, at least 4 MiB\n");
   w_s(&mut out, "bst_rt_arena2_words:\t.quad 0\n");
   w_s(&mut out, "bst_rt_arena2_top:\t.quad 0\n");
   w_s(&mut out, "bst_rt_arena_lock:\t.quad 0\n");

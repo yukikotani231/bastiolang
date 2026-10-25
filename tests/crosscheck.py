@@ -21,18 +21,70 @@ import argparse, os, re, subprocess, sys, tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BASTIOC0 = os.path.join(ROOT, "stage0/target/release/bastioc0")
+BASTIOC0 = os.environ.get("CROSSCHECK_BASTIOC") or os.path.join(ROOT, "stage0/target/release/bastioc0")
 OPTION = re.compile(r"^\(set-option :(rlimit|timeout) ")
 ANSWER = re.compile(r"^(sat|unsat|unknown)$")
 
 
+EXTRA = []
+
+
 def session(path):
     """The commands the compiler sends for `path`, one per line, or None."""
-    p = subprocess.run([BASTIOC0, "--check", "--dump-smt", path],
+    p = subprocess.run([BASTIOC0, "--check", "--dump-smt", *EXTRA, path],
                        capture_output=True, text=True)
     if p.returncode != 0:
         return None
     return [l for l in p.stdout.splitlines() if l.startswith("(") and not OPTION.match(l)]
+
+
+TOKEN = re.compile(r"\(|\)|\|[^|]*\||[^\s()]+")
+
+
+def parse(line):
+    stack, cur = [], []
+    for t in TOKEN.findall(line):
+        if t == "(":
+            stack.append(cur)
+            cur = []
+        elif t == ")":
+            done, cur = cur, stack.pop()
+            cur.append(done)
+        else:
+            cur.append(t)
+    return cur[0]
+
+
+def show(t):
+    return t if isinstance(t, str) else "(" + " ".join(show(x) for x in t) + ")"
+
+
+BINDERS = ("lambda", "forall", "exists")
+
+
+def subst(t, k, v):
+    if isinstance(t, str):
+        return v if t == k else t
+    if t and t[0] in BINDERS and any(b[0] == k for b in t[1]):
+        return t  # k is bound again inside: nothing to replace
+    return [subst(x, k, v) for x in t]
+
+
+def beta(t):
+    """Reads of a lambda array, `(select (lambda ((k Int)) B) i)`, become B
+    with i for k. This is plain rewriting that keeps the query's meaning, and
+    it leaves cvc5 a query without the Z3-only `lambda`."""
+    if isinstance(t, str):
+        return t
+    t = [beta(x) for x in t]
+    if (len(t) == 3 and t[0] == "select" and isinstance(t[1], list) and len(t[1]) == 3
+            and t[1][0] == "lambda" and len(t[1][1]) == 1):
+        return beta(subst(t[1][2], t[1][1][0][0], t[2]))
+    return t
+
+
+def reduce_lambdas(cmds):
+    return [show(beta(parse(c))) if "lambda" in c else c for c in cmds]
 
 
 def cvc5_view(cmds):
@@ -76,19 +128,49 @@ def run(solver_cmd, cmds):
     return [l for l in p.stdout.splitlines() if ANSWER.match(l)]
 
 
+CHUNK = 300  # check-sats per piece of a long session
+LEAVES = None  # the pool that runs the pieces, set by main
+
+
+def pieces(cmds):
+    """A session cut at `(reset)`, which forgets every declaration, so the
+    pieces are independent; each holds about CHUNK queries."""
+    out, cur, n = [], [], 0
+    for c in cmds:
+        if c.startswith("(reset") and n >= CHUNK:
+            out.append(cur)
+            cur, n = [], 0
+        cur.append(c)
+        n += c.startswith("(check-sat")
+    out.append(cur)
+    return out
+
+
+def answers(cmds, tlimit):
+    z3 = run(["z3", "-smt2", "-T:600"], cmds)
+    view, skip = cvc5_view(reduce_lambdas(cmds))
+    cv = run(["cvc5", "--lang", "smt2", "--incremental", f"--tlimit-per={tlimit}"], view)
+    return z3, cv, skip
+
+
 def check(path, tlimit, cmds=None):
     cmds = cmds or session(path)
     if cmds is None:
         return None
-    z3 = run(["z3", "-smt2", "-T:600"], cmds)
-    view, skip = cvc5_view(cmds)
-    cv = run(["cvc5", "--lang", "smt2", "--incremental", f"--tlimit-per={tlimit}"], view)
-    n = sum(1 for c in cmds if c.startswith("(check-sat"))
+    ps = pieces(cmds)
+    parts = list(LEAVES.map(lambda p: answers(p, tlimit), ps)) if LEAVES else [answers(p, tlimit) for p in ps]
+    z3, cv, skip = [], [], []
+    for (zz, cc, ss), p in zip(parts, ps):
+        k = sum(1 for c in p if c.startswith("(check-sat"))
+        z3 += (zz + ["missing"] * k)[:k]
+        cv += (cc + ["missing"] * k)[:k]
+        skip += ss
+    n = len(skip)
     agree = unchecked = 0
     bad = []
     for i in range(n):
         a = z3[i] if i < len(z3) else "missing"
-        b = cv[i] if i < len(cv) else "missing"
+        b = cv[i]
         if a != "unsat":
             bad.append((i, a, b))
         elif skip[i] or b in ("unknown", "missing"):
@@ -107,8 +189,10 @@ def main():
     ap.add_argument("--tlimit", type=int, default=20000, help="cvc5 time limit per query, ms")
     ap.add_argument("--min-agree", type=float, default=0.0,
                     help="fail if fewer than this percentage of queries are confirmed")
+    ap.add_argument("--args", default="", help="extra bastioc0 flags, e.g. \"--target kernel --lib DIR\"")
     ap.add_argument("--selftest", action="store_true", help="check that a wrong proof is reported")
     a = ap.parse_args()
+    EXTRA.extend(a.args.split())
     if a.selftest:
         wrong = ["(declare-const x Int)", "(push 1)", "(assert (> x 0))", "(check-sat)", "(pop 1)"]
         right = ["(declare-const x Int)", "(push 1)", "(assert (and (> x 0) (< x 0)))", "(check-sat)", "(pop 1)"]
@@ -118,7 +202,9 @@ def main():
     files = a.files or sorted(
         os.path.join(ROOT, "tests/pass", f) for f in os.listdir(os.path.join(ROOT, "tests/pass"))
         if f.endswith(".bastio"))
-    with ThreadPoolExecutor(a.j) as ex:
+    global LEAVES
+    LEAVES = ThreadPoolExecutor(a.j)
+    with ThreadPoolExecutor(max(1, a.j // 2)) as ex:
         results = list(ex.map(lambda f: check(f, a.tlimit), files))
     tot_a = tot_u = 0
     failed = False

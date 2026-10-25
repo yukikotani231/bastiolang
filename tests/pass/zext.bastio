@@ -1,0 +1,46 @@
+// expect-exit: 0
+// expect-stdout: 633535628
+// expect-stdout: 852764865
+// expect-stdout: 89105450
+// expect-stdout: 405479776
+// A reduction modulo 2^32 of a value the program has already kept below 2^32
+// is dropped on native-ir, and `(e ^ k) ^ e` is `k`. The cases: the CRC step
+// (the select of both arms), a value that grows past 2^32 and must still be
+// reduced, a byte-sized value reduced by a larger power of two, and a shift
+// whose result stays below the modulus.
+fn step(crc: u64) -> u64
+  requires crc < 4294967296
+  ensures result < 4294967296
+{
+  if crc % 2 == 1 {
+    return (crc / 2 ^ 3988292384) % 4294967296;
+  }
+  return crc / 2;
+}
+
+fn run(n: u64) -> u64 {
+  let mut crc = 4294967295;
+  let mut grow = 1;
+  let mut small = 0;
+  let mut sh = 0;
+  let mut i = 0;
+  while i < n
+    invariant i <= n && crc < 4294967296 && grow < 4294967296 && small < 4294967296 && sh < 4294967296
+  {
+    crc = step(crc);
+    // 3 * grow + 1 exceeds 2^32 before the reduction.
+    grow = (grow * 3 + 1) % 4294967296;
+    small = (small + (crc % 256) * 7) % 4294967296;
+    sh = ((crc / 16 ^ 305419896) % 4294967296 + sh) % 4294967296;
+    i = i + 1;
+  }
+  print(crc);
+  print(grow);
+  print(small);
+  print(sh);
+  return 0;
+}
+
+fn main() -> u64 {
+  return run(100000);
+}

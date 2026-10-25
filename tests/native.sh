@@ -10,6 +10,11 @@
 # it, stage1/irx86.bastio); the C backend stays the reference. (The example
 # libraries are built by `native` only.)
 #
+# NATIVE_OS=macos (with BACKEND=native-ir) runs the comparison on an Intel Mac
+# for the Mach-O assembly (`--os macos`), NATIVE_OS=windows on Windows (MSYS2)
+# for the MinGW-w64 assembly (`--os windows`); the example libraries and the
+# fixed-point check are left out there.
+#
 # tests/native.sh --stage1 instead runs stage1/difftest.sh with the tools of
 # the self-hosted compiler built by the native backend (by the C backend
 # when it does not support one yet): large programs whose output is checked
@@ -43,18 +48,31 @@ fi
 BASTIOC=${BASTIOC:-$(tests/bastioc1.sh)} || exit 1
 . tests/pfor.sh
 . tests/stage1_only.sh
-export BASTIOC
+OSARG=
+[ "${NATIVE_OS:-linux}" = macos ] && OSARG="--os macos"
+[ "${NATIVE_OS:-linux}" = windows ] && OSARG="--os windows"
+# GNU_LINK=1 (MINGW_LINK=1 on Windows): the platform's as and cc instead of
+# bastioc1's own assembler and linker, which are the default (on Linux, Windows
+# and macOS Intel).
+[ -n "${MINGW_LINK:-}${GNU_LINK:-}" ] && OSARG="$OSARG --gnu-link"
+# SELF_LINK=1 (macOS, x86-64): bastioc1's own assembler and Mach-O writer.
+[ -n "${SELF_LINK:-}" ] && OSARG="$OSARG --self-link"
+# MUSL_LINK=1 (Linux, x86-64): the same, for an executable that runs on musl's loader.
+[ -n "${MUSL_LINK:-}" ] && OSARG="$OSARG --musl-link"
+export BASTIOC OSARG
 # One program, built by both backends; JOBS of them at a time.
 both() {
   local f=$1 cs xs
   if ! "$BASTIOC" -o "$w/c.exe" "$f" 2>/dev/null; then
     echo "FAIL $f: the C backend rejected it"; echo =fail; return
   fi
-  "$BASTIOC" --backend "${BACKEND:-native}" -o "$w/x.exe" "$f" 2>"$w/err"; rc=$?
+  "$BASTIOC" --backend "${BACKEND:-native}" ${OSARG:-} -o "$w/x.exe" "$f" 2>"$w/err"; rc=$?
   if [ $rc = 4 ]; then echo "skip $f: $(grep -o 'does not support.*' "$w/err" | head -1)"; echo =skip; return; fi
   if [ $rc != 0 ]; then echo "FAIL $f: native build failed"; sed 's/^/    /' "$w/err" | head -20; echo =fail; return; fi
   "$w/c.exe" </dev/null >"$w/c.out" 2>/dev/null; cs=$?
   "$w/x.exe" </dev/null >"$w/x.out" 2>/dev/null; xs=$?
+  # The C build writes text-mode lines on Windows, the native one bytes.
+  case "${OSARG:-}" in "--os windows"*) false;; *) true;; esac || { tr -d '\r' <"$w/c.out" >"$w/c.out2"; mv "$w/c.out2" "$w/c.out"; }
   if [ $cs != $xs ]; then echo "FAIL $f: exit $xs, C backend $cs"; echo =fail; return; fi
   if ! cmp -s "$w/c.out" "$w/x.out"; then
     echo "FAIL $f: output differs from the C backend"; diff "$w/c.out" "$w/x.out" | head -10 | sed 's/^/    /'; echo =fail; return
@@ -70,6 +88,7 @@ libs=0
 for r in examples/*/run.sh; do
   [ -e "$r" ] || continue
   [ "${BACKEND:-native}" = native ] || continue
+  [ -z "$OSARG" ] || continue
   if BACKEND=native BASTIOC="$BASTIOC" "$r" >"$tmp/lib.out" 2>&1; then libs=$((libs+1)); else
     echo "FAIL $r with the native backend"; sed 's/^/    /' "$tmp/lib.out" | tail -20; lost=1
   fi
@@ -77,7 +96,7 @@ done
 # With the IR emitter, bastioc1 built through it compiles itself to the very
 # assembly that the C-built bastioc1 writes with the same backend (a fixed
 # point): the code the IR path writes for the compiler is the compiler's.
-if [ "${BACKEND:-native}" = native-ir ]; then
+if [ "${BACKEND:-native}" = native-ir ] && [ -z "$OSARG" ]; then
   if "$BASTIOC" --backend native-ir -o "$tmp/b1" stage1/bastioc1.bastio >/dev/null 2>&1 \
      && "$BASTIOC" --backend native-ir --emit-asm -o "$tmp/a.s" stage1/bastioc1.bastio >/dev/null 2>&1 \
      && "$tmp/b1" --backend native-ir --emit-asm -o "$tmp/b.s" stage1/bastioc1.bastio >/dev/null 2>&1 \

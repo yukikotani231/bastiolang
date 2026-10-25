@@ -1,0 +1,68 @@
+// Call hierarchy: which functions a function calls and which call it, from
+// the tokens of a program. Each call is a triple in the output vector: the
+// other function (an index into `defs`), then the start and end offsets of
+// the call's name.
+import "complete.bastio";
+
+/// The calls made in the body of function `d`.
+fn calls_out(ix: &Prog, d: u64, out: &mut Vec[u64]) {
+  let df = def_at(ix, d);
+  let te = file_toks_end(ix, df.file);
+  let mut i = u_at(ix.tstart, df.file);
+  while i < te && i < vec_len(ix.toks) && vec_len(out) < 300000
+  {
+    let t = tok_at(ix.toks, i);
+    if t.kind == K_IDENT && t.start >= df.ss && t.end <= df.ie && t.start != df.ns {
+      let r = resolve_any(ix, df.file, i);
+      if r.found && !r.local {
+        let cd = def_at(ix, r.idx);
+        if cd.kind == DK_FN {
+          vec_push(&mut out, r.idx);
+          vec_push(&mut out, t.start);
+          vec_push(&mut out, t.end);
+        }
+      }
+    }
+    i = vadd(i, 1);
+  }
+}
+
+/// The calls of function `d`, from the functions of all the files of the
+/// program.
+fn calls_in(ix: &Prog, d: u64, out: &mut Vec[u64]) {
+  let df = def_at(ix, d);
+  let mut f = 0;
+  while f < vec_len(ix.fstart)
+  {
+    let te = file_toks_end(ix, f);
+    let mut i = u_at(ix.tstart, f);
+    while i < te && i < vec_len(ix.toks) && vec_len(out) < 300000
+    {
+      let t = tok_at(ix.toks, i);
+      if t.kind == K_IDENT && same_text(ix.all, t.start, t.end, df.ns, df.ne) && !(f == df.file && t.start == df.ns) {
+        let r = resolve_any(ix, f, i);
+        if r.found && !r.local && r.idx == d {
+          // The function the call is in.
+          let mut c = 0;
+          let mut found = false;
+          while c < vec_len(ix.defs) && !found
+          {
+            let cd = vec_get(ix.defs, c);
+            if cd.kind == DK_FN && cd.file == f && cd.ss <= t.start && t.end <= cd.ie {
+              found = true;
+            } else {
+              c = vadd(c, 1);
+            }
+          }
+          if found {
+            vec_push(&mut out, c);
+            vec_push(&mut out, t.start);
+            vec_push(&mut out, t.end);
+          }
+        }
+      }
+      i = vadd(i, 1);
+    }
+    f = vadd(f, 1);
+  }
+}

@@ -1,0 +1,78 @@
+// expect-exit: 0
+// expect-stdout: 8714
+// expect-stdout: 6005
+// expect-stdout: 300220
+// expect-stdout: 300214
+// expect-stdout: 300149
+// A table read at the counter and at the counter less a register that the
+// loop does not write (`a[w]` and `a[w - wt]`, also `b[w + s]` over bytes):
+// the second base is made in front of the loop, and the loop steps one
+// register. Entered more than once, with different offsets, and from the top
+// down and from the bottom up.
+const W: u64 = 600;
+
+fn down(dp: &mut Vec[u64], wt: u64, val: u64)
+  requires vlen(dp) == W + 1 && wt >= 1 && wt <= 200
+{
+  let mut w = W;
+  while w >= wt
+    invariant w <= W && wt >= 1 && wt <= 200 && vlen(dp) == W + 1
+  {
+    let a = vec_get(dp, w);
+    let b = wrap_add(vec_get(dp, w - wt), val);
+    if b > a {
+      vec_set(&mut dp, w, b);
+    }
+    w = w - 1;
+  }
+}
+
+fn up(b: &Bytes, s: u64) -> u64
+  requires blen(b) == W + 300 && s <= 200
+{
+  let mut t = 0;
+  let mut w = 0;
+  while w < W
+    invariant w <= W && t < 4000000000 && blen(b) == W + 300 && s <= 200
+  {
+    t = (t + cast[u64](bget(b, w)) * 3 + cast[u64](bget(b, w + s))) % 1000000007;
+    w = w + 1;
+  }
+  return t;
+}
+
+fn main() -> u64 {
+  let mut dp = vec_new[u64]();
+  let mut i = 0;
+  while i <= W
+    invariant i <= W + 1 && vlen(dp) == i
+  {
+    vec_push(&mut dp, i % 7);
+    i = i + 1;
+  }
+  let mut x = 12345;
+  let mut it = 0;
+  while it < 40
+    invariant it <= 40 && vlen(dp) == W + 1
+  {
+    x = wrap_add(wrap_mul(x, 6364136223846793005), 1442695040888963407);
+    down(&mut dp, x / 4294967296 % 200 + 1, x / 65536 % 1000 + 1);
+    it = it + 1;
+  }
+  print(vec_get(dp, W));
+  print(vec_get(dp, 300));
+  let mut b = balloc(W + 300);
+  let mut k = 0;
+  while k < W + 300
+    invariant k <= W + 300 && blen(b) == W + 300
+  {
+    bset(&mut b, k, cast[u8](k * 31 % 251));
+    k = k + 1;
+  }
+  print(up(b, 0));
+  print(up(b, 77));
+  print(up(b, 200));
+  bfree(b);
+  vec_free(dp);
+  return 0;
+}

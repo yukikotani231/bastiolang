@@ -1,0 +1,50 @@
+// Adler-32 over 16 MiB of pseudo-random bytes, 8 passes, with the reduction
+// done once per 5552 bytes: a byte load, two adds and a rare modulus. The
+// sum of the 8 checksums is the result.
+const SIZE: u64 = 16777216;
+
+fn main() -> u64 {
+  let mut b = balloc(SIZE);
+  let mut x = 12345;
+  let mut i = 0;
+  while i < SIZE
+    invariant blen(b) == SIZE && i <= SIZE
+  {
+    x = wrap_add(wrap_mul(x, 6364136223846793005), 1442695040888963407);
+    bset(&mut b, i, cast[u8](x / 4294967296 % 256));
+    i = i + 1;
+  }
+  let mut total = 0;
+  let mut pass = 0;
+  while pass < 8
+    invariant pass <= 8 && blen(b) == SIZE
+  {
+    let mut a = 1;
+    let mut s = 0;
+    let mut pos = 0;
+    while pos < SIZE
+      invariant pos <= SIZE && blen(b) == SIZE
+    {
+      let mut end = pos + 5552;
+      if end > SIZE {
+        end = SIZE;
+      }
+      let mut k = pos;
+      while k < end
+        invariant k <= end && end <= SIZE && blen(b) == SIZE
+      {
+        a = wrap_add(a, cast[u64](bget(b, k)));
+        s = wrap_add(s, a);
+        k = k + 1;
+      }
+      a = a % 65521;
+      s = s % 65521;
+      pos = end;
+    }
+    total = wrap_add(total, wrap_add(wrap_mul(s, 65536), a));
+    pass = pass + 1;
+  }
+  print(total);
+  bfree(b);
+  return 0;
+}

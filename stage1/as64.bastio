@@ -1,0 +1,110 @@
+// The AArch64 assembler as a program, for `tests/as64.sh`, which compares it
+// with GNU as: `as64 FILE` writes, for each line of FILE, the word of the
+// instruction as eight hexadecimal digits and, for a field a linker must
+// fill, ` R <relocation type> <symbol> <addend>`; `?` for a line it cannot
+// encode.
+import "asma64.bastio";
+import "out.bastio";
+import "loader.bastio";
+
+fn main(con: &mut Serial, host: &mut Host) -> u64 {
+  if host_argc(host) < 2 {
+    return 2;
+  }
+  let path = host_arg(host, 1);
+  let mut data = balloc(0);
+  let ok = host_read(host, path, &mut data);
+  bfree(path);
+  if !ok {
+    bfree(data);
+    return 1;
+  }
+  let mut line = vec_new[u64]();
+  let mut k = 0;
+  while k <= blen(data) {
+    let mut c = 10;
+    if k < blen(data) {
+      c = cast[u64](bget(data, k));
+    }
+    if c == 10 {
+      if vec_len(line) > 0 {
+        let mut text = vec_new[u64]();
+        let ln = a6_unmac(line, 0, vec_len(line));
+        let r = a6_line(ln, 0, vec_len(ln));
+        if r.ok {
+          let mut sh = 8;
+          while sh > 0
+            invariant sh <= 8
+          {
+            sh = wrap_sub(sh, 1);
+            vec_push(&mut text, a6_hexdig((r.w >> wrap_mul(sh, 4)) & 15));
+          }
+          if r.rt != 0 {
+            vec_push(&mut text, 32);
+            vec_push(&mut text, 82);
+            vec_push(&mut text, 32);
+            a6_dec(&mut text, r.rt);
+            vec_push(&mut text, 32);
+            let mut q = r.ss;
+            while q < r.se {
+              vec_push(&mut text, u_at(ln, q));
+              q = wrap_add(q, 1);
+            }
+            vec_push(&mut text, 32);
+            if r.add >= 9223372036854775808 {
+              vec_push(&mut text, 45);
+              a6_dec(&mut text, wrap_sub(0, r.add));
+            } else {
+              a6_dec(&mut text, r.add);
+            }
+          }
+        } else {
+          vec_push(&mut text, 63);
+        }
+        vec_push(&mut text, 10);
+        let mut j = 0;
+        while j < vec_len(text) {
+          serial_write(con, cast[u8]((u_at(text, j) & 255)));
+          j = wrap_add(j, 1);
+        }
+        vec_free(text);
+        vec_free(ln);
+      } else {
+        serial_write(con, 10);
+      }
+      vec_free(line);
+      line = vec_new[u64]();
+    } else {
+      vec_push(&mut line, c);
+    }
+    k = wrap_add(k, 1);
+  }
+  vec_free(line);
+  bfree(data);
+  return 0;
+}
+
+fn a6_hexdig(x: u64) -> u64 {
+  if x < 10 {
+    return wrap_add(48, x);
+  }
+  return wrap_add(87, x);
+}
+
+fn a6_dec(text: &mut Vec[u64], x: u64) {
+  let mut digits = vec_new[u64]();
+  let mut y = x;
+  if y == 0 {
+    vec_push(&mut digits, 48);
+  }
+  while y > 0 {
+    vec_push(&mut digits, wrap_add(48, y % 10));
+    y = y / 10;
+  }
+  let mut k = vec_len(digits);
+  while k > 0 {
+    k = wrap_sub(k, 1);
+    vec_push(&mut text, u_at(digits, k));
+  }
+  vec_free(digits);
+}
