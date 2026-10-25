@@ -192,23 +192,106 @@ export fn http_parse_head(s: &Bytes) -> Head
     return Head::Bad(q + 8);
   }
   // The header fields, up to the empty line.
-  let first = e + 2;
+  match http_fields(s, e + 2) {
+    Fields::Partial => { return Head::Partial; }
+    Fields::Bad(x) => { return Head::Bad(x); }
+    Fields::Ok(r) => {
+      return Head::Ok(Req { method_end: m, target: t, target_end: q, minor: d - 48, fields: e + 2, nfields: r.count, head_end: r.head_end });
+    }
+  }
+}
+
+/// The number of header fields and the end of the head.
+struct Done { count: u64, head_end: u64 }
+
+enum Fields { Ok(Done), Partial, Bad(u64) }
+
+/// Walks the header fields from `first` to the empty line that ends the head.
+fn http_fields(s: &Bytes, first: u64) -> Fields
+  requires first <= blen(s)
+  ensures result is Fields::Ok ==> first + 2 <= result.Ok.head_end && result.Ok.head_end <= blen(s)
+  ensures result is Fields::Bad ==> result.Bad <= blen(s)
+{
+  let n = blen(s);
   let mut at = first;
   let mut count: u64 = 0;
   while at < n
     invariant first <= at && at <= n && count <= at
   {
     match http_field(s, at) {
-      Next::Partial => { return Head::Partial; }
-      Next::Bad(x) => { return Head::Bad(x); }
-      Next::End(x) => {
-        return Head::Ok(Req { method_end: m, target: t, target_end: q, minor: d - 48, fields: first, nfields: count, head_end: x });
-      }
+      Next::Partial => { return Fields::Partial; }
+      Next::Bad(x) => { return Fields::Bad(x); }
+      Next::End(x) => { return Fields::Ok(Done { count: count, head_end: x }); }
       Next::Ok(f) => {
         at = f.next;
         count = count + 1;
       }
     }
   }
-  return Head::Partial;
+  return Fields::Partial;
+}
+
+/// One response head: HTTP/1.`minor`, the status code, the reason phrase
+/// `reason..reason_end` (possibly empty), then the header fields as in `Req`.
+struct Resp { minor: u8, status: u64, reason: u64, reason_end: u64, fields: u64, nfields: u64, head_end: u64 }
+
+enum RespHead {
+  Ok(Resp),
+  Partial,
+  Bad(u64),
+}
+
+/// Parses the status line and counts the header fields of the response head
+/// at the start of `s`: "HTTP/1.x", a space, a three-digit status from 100 to
+/// 599, a space, the reason phrase (which may be empty), CR LF.
+export fn http_parse_response(s: &Bytes) -> RespHead
+  ensures result is RespHead::Ok ==> result.Ok.minor <= 1 && 100 <= result.Ok.status && result.Ok.status <= 599
+  ensures result is RespHead::Ok ==> result.Ok.reason == 13 && result.Ok.reason <= result.Ok.reason_end
+  ensures result is RespHead::Ok ==> result.Ok.reason_end + 2 == result.Ok.fields
+  ensures result is RespHead::Ok ==> result.Ok.fields <= result.Ok.head_end && result.Ok.head_end <= blen(s)
+  ensures result is RespHead::Bad ==> result.Bad <= blen(s)
+{
+  let mut e = 0;
+  match http_line(s, 0) {
+    Line::Partial => { return RespHead::Partial; }
+    Line::Bad(x) => { return RespHead::Bad(x); }
+    Line::Ok(x) => { e = x; }
+  }
+  if e < 13 {
+    return RespHead::Bad(e);
+  }
+  if bget(s, 0) != 72 || bget(s, 1) != 84 || bget(s, 2) != 84 || bget(s, 3) != 80
+    || bget(s, 4) != 47 || bget(s, 5) != 49 || bget(s, 6) != 46 {
+    return RespHead::Bad(0);
+  }
+  let d = bget(s, 7);
+  if d != 48 && d != 49 {
+    return RespHead::Bad(7);
+  }
+  if bget(s, 8) != 32 {
+    return RespHead::Bad(8);
+  }
+  let a = bget(s, 9);
+  let b = bget(s, 10);
+  let c = bget(s, 11);
+  if a < 49 || a > 53 {
+    return RespHead::Bad(9);
+  }
+  if b < 48 || b > 57 {
+    return RespHead::Bad(10);
+  }
+  if c < 48 || c > 57 {
+    return RespHead::Bad(11);
+  }
+  if bget(s, 12) != 32 {
+    return RespHead::Bad(12);
+  }
+  let status = (cast[u64](a) - 48) * 100 + (cast[u64](b) - 48) * 10 + (cast[u64](c) - 48);
+  match http_fields(s, e + 2) {
+    Fields::Partial => { return RespHead::Partial; }
+    Fields::Bad(x) => { return RespHead::Bad(x); }
+    Fields::Ok(r) => {
+      return RespHead::Ok(Resp { minor: d - 48, status: status, reason: 13, reason_end: e, fields: e + 2, nfields: r.count, head_end: r.head_end });
+    }
+  }
 }

@@ -94,5 +94,12 @@ async function load(path) {
   H.e.http_parse_head(bp2, bl2, hres);
   assert.strictEqual(H.word(hres, 0), 2n);                             // Head::Bad: bare LF
 
+  const resp = Buffer.from('HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot found');
+  const [rp, rl] = H.put(resp);
+  H.e.http_parse_response(rp, rl, hres);
+  assert.strictEqual(H.word(hres, 0), 0n);                             // RespHead::Ok
+  // minor, status, reason, reason_end, fields, nfields, head_end
+  assert.deepStrictEqual([1, 2, 3, 4, 5, 6, 7].map((i) => H.word(hres, i)), [1n, 404n, 13n, 22n, 24n, 1n, BigInt(resp.length - 9)]);
+
   console.log('wasm libraries: lines, base64, utf8 and http pass from JavaScript');
 })().catch((e) => { console.error(e); process.exit(1); });

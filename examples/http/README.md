@@ -1,6 +1,6 @@
-# A proved HTTP/1.1 request head parser, called from C
+# A proved HTTP/1.1 head parser, called from C
 
-The request line and header fields of an HTTP/1.1 message (RFC 9112), as a
+The request or status line and the header fields of an HTTP/1.1 message (RFC 9112), as a
 library written in Bastio. The bytes come from a socket, so they are
 untrusted: a length or a delimiter read without care sends a parser past its
 buffer, and a parser that is lenient about line endings or folding lets one
@@ -8,8 +8,8 @@ request be read two ways by two servers (request smuggling).
 
 | File | What it is |
 | --- | --- |
-| `http.bastio` | The library: `export fn http_parse_head` and `http_field`. Proved |
-| `test.c` | The C harness: vectors, every prefix of a well-formed head, a differential fuzz against an independent state-machine parser |
+| `http.bastio` | The library: `export fn http_parse_head`, `http_parse_response` and `http_field`. Proved |
+| `test.c` | The C harness: vectors, every prefix of a well-formed head, a differential fuzz, for requests and for responses, against an independent state-machine parser |
 | `run.sh` | Generates `http.c` and `http.h`, then builds and runs the harness under AddressSanitizer + UBSan |
 
 ```c
@@ -24,7 +24,7 @@ if (h.tag == bst_e_Head_Ok) {
 }
 ```
 
-The parser allocates nothing; it returns offsets into `buf`.
+`http_parse_response` does the same for a response head (`bst_e_RespHead`: version, the status code 100 to 599, the reason phrase, the fields). The parser allocates nothing; it returns offsets into `buf`.
 
 ## What is proved
 
