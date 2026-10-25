@@ -7,7 +7,7 @@ const assert = require('assert');
 const crypto = require('crypto');
 
 async function load(path) {
-  const imports = { bastio: { print: () => {}, putc: () => {} } };
+  const imports = { bastio: { print: () => {}, putc: () => {}, host: () => 0n } };
   const { instance } = await WebAssembly.instantiate(fs.readFileSync(path), imports);
   const e = instance.exports;
   const u8 = () => new Uint8Array(e.memory.buffer);

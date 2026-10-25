@@ -23,11 +23,12 @@
 // backends, and the only unchecked code in the module.
 
 const WA_STACK_TOP: u64 = 1048576;
-const WA_FN_ALLOC: u64 = 2;
-const WA_FN_GROW: u64 = 3;
-const WA_FN_RESERVE: u64 = 4;
-const WA_FN_FREE: u64 = 6;
-const WA_FN_BASE: u64 = 7;
+const WA_FN_HOST: u64 = 2;
+const WA_FN_ALLOC: u64 = 3;
+const WA_FN_GROW: u64 = 4;
+const WA_FN_RESERVE: u64 = 5;
+const WA_FN_FREE: u64 = 7;
+const WA_FN_BASE: u64 = 8;
 
 // ---- Bytes ----
 
@@ -534,7 +535,7 @@ fn wa_ok_op(q: IrIns) -> bool {
   if op == IR_SLOT || op == IR_STRLIT || op == IR_COPY || op == IR_FILL || op == IR_VGROW {
     return true;
   }
-  return op == IR_PCALL && q.c == 5;
+  return op == IR_PCALL && (q.c == 5 || (q.c >= 20 && q.c <= 25) || q.c == 31);
 }
 
 /// A register's local: the parameters come first.
@@ -674,6 +675,17 @@ fn wa_ins(o: &mut Vec[u64], f: &IrFn, g: &mut X86, c: &Checker, m: &mut Mono, p:
     wa_rg(&mut o, np, q.a);
     wa_i64(&mut o, wrap_mul(8, q.c));
     wa_call(&mut o, WA_FN_GROW);
+  } else if op == IR_PCALL && q.c != 5 {
+    // A host routine (arguments, files, the environment, standard error): the
+    // embedder reads and writes the block of words at address a.
+    wa_i64(&mut o, q.c);
+    if q.c == 31 {
+      wa_i64(&mut o, 0);
+    } else {
+      wa_rg(&mut o, np, q.a);
+    }
+    wa_call(&mut o, WA_FN_HOST);
+    wa_rs(&mut o, np, q.d);
   } else if op == IR_PCALL {
     // Room for b more elements of ty words in the Vec at a.
     wa_rg(&mut o, np, q.a);
@@ -1031,6 +1043,7 @@ fn wa_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
   let mut codes = vec_new[u64]();
   // The imports and the runtime come first.
   let t_print = wa_type(&mut types, 1, 0);
+  let t_host = wa_type(&mut types, 2, 1);
   let t_alloc = wa_type(&mut types, 3, 1);
   let t_grow = wa_type(&mut types, 2, 0);
   let t_reserve = wa_type(&mut types, 3, 1);
@@ -1139,7 +1152,7 @@ fn wa_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
     vec_pop(&mut s);
   }
   // imports: print and putc
-  wa_u(&mut s, 2);
+  wa_u(&mut s, 3);
   wa_name(&mut s, "bastio");
   wa_name(&mut s, "print");
   wa_b(&mut s, 0);
@@ -1148,6 +1161,10 @@ fn wa_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
   wa_name(&mut s, "putc");
   wa_b(&mut s, 0);
   wa_u(&mut s, t_print);
+  wa_name(&mut s, "bastio");
+  wa_name(&mut s, "host");
+  wa_b(&mut s, 0);
+  wa_u(&mut s, t_host);
   wa_section(&mut o, 2, s);
   while vec_len(s) > 0 {
     vec_pop(&mut s);
@@ -1204,7 +1221,7 @@ fn wa_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
   wa_u(&mut s, 0);
   wa_name(&mut s, "bst_alloc");
   wa_b(&mut s, 0);
-  wa_u(&mut s, 5);
+  wa_u(&mut s, WA_FN_FREE - 1);
   wa_name(&mut s, "bst_free");
   wa_b(&mut s, 0);
   wa_u(&mut s, WA_FN_FREE);
