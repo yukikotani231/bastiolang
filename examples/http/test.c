@@ -81,6 +81,47 @@ static void expect_resp(const char *s, int kind) {
     CHECK(got == kind, "%s -> %d, wanted %d", s, got, kind);
 }
 
+/* A chunk of a chunked body, by the same state-machine style: returns 0 (a
+ * data chunk: size and next set; or the last chunk, last set to 1 and next
+ * the end of the message), 1 for incomplete, 2 for malformed. */
+static int ref_chunk(const uint8_t *s, size_t n, size_t at, uint64_t *size, uint64_t *next, int *last) {
+    size_t e = n;
+    for (size_t i = at; i < n; i++) {
+        uint8_t c = s[i];
+        if (c == '\r') {
+            if (i + 1 == n) return 1;
+            if (s[i + 1] != '\n') return 2;
+            e = i;
+            break;
+        }
+        if ((c < 32 && c != '\t') || c == 127) return 2;
+    }
+    if (e == n) return 1;
+    uint64_t v = 0;
+    size_t k = at;
+    for (; k < e; k++) {
+        int d = s[k] >= '0' && s[k] <= '9' ? s[k] - '0' : s[k] >= 'a' && s[k] <= 'f' ? s[k] - 'a' + 10 : s[k] >= 'A' && s[k] <= 'F' ? s[k] - 'A' + 10 : -1;
+        if (d < 0) break;
+        v = v * 16 + (uint64_t)d;
+        if (v >= (1ull << 56)) return 2;
+    }
+    if (k == at) return 2;
+    if (k < e && s[k] != ';') return 2;
+    *size = v;
+    *last = 0;
+    if (v == 0) {
+        uint64_t cnt, len;
+        int r = ref_run(s, n, N0, e + 2, &cnt, &len);
+        if (r == 0) { *last = 1; *next = len; }
+        return r;
+    }
+    size_t data = e + 2;
+    if (n - data < v + 2) return 1;
+    if (s[data + v] != '\r' || s[data + v + 1] != '\n') return 2;
+    *next = data + v + 2;
+    return 0;
+}
+
 static void expect(const char *s, int kind) {
     size_t n = strlen(s);
     bst_e_Head h = http_parse_head((const uint8_t *)s, n);
@@ -154,6 +195,38 @@ int main(void) {
         CHECK(p.tag == bst_e_RespHead_Partial, "response prefix %zu is %llu", k, (unsigned long long)p.tag);
     }
 
+    /* Chunked bodies. */
+    const char *cgood = "5\r\nhello\r\nA;ext=1\r\n0123456789\r\n0\r\nTrailer: x\r\n\r\n";
+    {
+        size_t cn = strlen(cgood), at = 0, total = 0;
+        char body[64];
+        for (;;) {
+            bst_e_Chunk c = http_chunk((const uint8_t *)cgood, cn, at);
+            if (c.tag == bst_e_Chunk_Ok) {
+                memcpy(body + total, cgood + c.u.Ok.data, c.u.Ok.size);
+                total += c.u.Ok.size;
+                at = c.u.Ok.next;
+            } else {
+                CHECK(c.tag == bst_e_Chunk_Last && c.u.Last == cn, "chunked end");
+                break;
+            }
+        }
+        CHECK(total == 15 && memcmp(body, "hello0123456789", 15) == 0, "chunked body");
+        for (size_t k = 0; k < cn; k++) {
+            bst_e_Chunk c = http_chunk((const uint8_t *)cgood, k, 0);
+            if (k < 7) CHECK(c.tag == bst_e_Chunk_Partial, "chunk prefix %zu is %llu", k, (unsigned long long)c.tag);
+            (void)c;
+        }
+    }
+    {
+        const char *bad[] = { "g\r\nx\r\n", "\r\n", "5\r\nhelloX\r\n", "5\nhello\r\n", "5 \r\nhello\r\n",
+                              "100000000000000\r\n", "5;a\x01\r\nhello\r\n", "0\r\nBad Header: x\r\n\r\n" };
+        for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
+            bst_e_Chunk c = http_chunk((const uint8_t *)bad[i], strlen(bad[i]), 0);
+            CHECK(c.tag == bst_e_Chunk_Bad, "bad chunk %zu is %llu", i, (unsigned long long)c.tag);
+        }
+    }
+
     /* Every proper prefix of a complete head is Partial (or, for a prefix
      * that already breaks a rule, malformed). */
     size_t gn = strlen(good);
@@ -216,6 +289,38 @@ int main(void) {
         int ok = k == rk || (k == 1 && rk == 2);
         CHECK(ok, "response fuzz %d: parser %d, reference %d", it, k, rk);
         if (k == 0 && rk == 0) CHECK(p.u.Ok.nfields == rc && p.u.Ok.head_end == rl && p.u.Ok.status == rs, "response fuzz %d: counts", it);
+        agree += ok;
+        if (failures > 20) return 1;
+    }
+    /* The same for chunks, from every start offset of mutated bodies. */
+    size_t cn0 = strlen(cgood);
+    for (int it = 0; it < 200000; it++) {
+        uint8_t buf[128];
+        size_t n = cn0;
+        memcpy(buf, cgood, cn0);
+        int muts = 1 + rand() % 3;
+        for (int m = 0; m < muts; m++) {
+            size_t at = (size_t)rand() % n;
+            switch (rand() % 4) {
+            case 0: buf[at] = (uint8_t)rand(); break;
+            case 1: buf[at] = " \r\n;:0Fg"[rand() % 8]; break;
+            case 2: if (n > 1) { memmove(buf + at, buf + at + 1, n - at - 1); n--; } break;
+            default: if (n < sizeof buf) { memmove(buf + at + 1, buf + at, n - at); buf[at] = "\r\n;F5"[rand() % 5]; n++; } break;
+            }
+        }
+        if (rand() % 4 == 0) n = (size_t)rand() % (n + 1);
+        size_t from = (size_t)rand() % (n + 1);
+        uint64_t rsz = 0, rnx = 0;
+        int rlast = 0;
+        int rk = ref_chunk(buf, n, from, &rsz, &rnx, &rlast);
+        bst_e_Chunk p = http_chunk(buf, n, from);
+        int k = (p.tag == bst_e_Chunk_Ok || p.tag == bst_e_Chunk_Last) ? 0 : p.tag == bst_e_Chunk_Partial ? 1 : 2;
+        int ok = k == rk || (k == 1 && rk == 2);
+        CHECK(ok, "chunk fuzz %d: parser %d, reference %d", it, k, rk);
+        if (k == 0 && rk == 0) {
+            if (rlast) CHECK(p.tag == bst_e_Chunk_Last && p.u.Last == rnx, "chunk fuzz %d: last", it);
+            else CHECK(p.tag == bst_e_Chunk_Ok && p.u.Ok.size == rsz && p.u.Ok.next == rnx, "chunk fuzz %d: data", it);
+        }
         agree += ok;
         if (failures > 20) return 1;
     }
