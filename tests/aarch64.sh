@@ -190,4 +190,18 @@ fi
 BASTIOC="$BASTIOC" tests/aarch64_native.sh || fails=$((fails+1))
 # The same programs through bastioc1's own assembler and ELF linker.
 SELF_LINK=1 BASTIOC="$BASTIOC" tests/aarch64_native.sh || fails=$((fails+1))
+# The example libraries (`export fn`, no `main`), built by the native backend
+# either way (GNU as, or bastioc1's own object writer) and driven by their C
+# harnesses under qemu-aarch64.
+if [ "$(uname -m)" = aarch64 ]; then lrun=; else lrun=qemu-aarch64; fi
+export QEMU_LD_PREFIX=${QEMU_LD_PREFIX:-/usr/aarch64-linux-gnu}
+libs=0
+for r in examples/*/run.sh; do
+  for link in --gnu-link --self-link; do
+    if BACKEND=native BASTIOC="$BASTIOC" BFLAGS="--arch aarch64 $link" CC="$AARCH64_CC" RUNNER="$lrun" "$r" >"$tmp/lib.out" 2>&1; then libs=$((libs+1)); else
+      echo "FAIL aarch64: $r ($link)"; sed 's/^/    /' "$tmp/lib.out" | tail -20; fails=$((fails+1))
+    fi
+  done
+done
+echo "aarch64: $libs library builds pass their C harnesses under qemu-aarch64"
 [ "$fails" = 0 ]

@@ -3509,6 +3509,181 @@ fn a64_kcall(c: u64) -> Str {
   return "bst_rt_free_root";
 }
 
+/// The C-callable wrapper of `export fn` `x` (AAPCS64): a buffer arrives as
+/// its data address and length, in the order the function's own code takes
+/// them; a `&mut Bytes` is the address of a (length, data address) cell that
+/// the wrapper makes in its frame, so it takes one register where C passes
+/// two; a narrow integer is normalised (C does not extend it). A result of
+/// more than two words comes back through x8, as in C.
+fn a64_export(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
+  let xi = inst_at(m, x);
+  let dn = node_at(p.nodes, xi.def);
+  let rt = cg_ret_ty(&mut m, p, x);
+  let rw = x86_words(&mut g, c, m, p, rt);
+  if rw > 1 && !x86_cabi_ok(&mut g, c, m, p, rt) {
+    x86_fail(&mut g, "the native backend supports only word-sized fields (64-bit integers, `Bytes`, or narrower ones followed by padding) inside the result of an `export fn` yet");
+    return;
+  }
+  let mut nsrc = 0;
+  let mut nmut = 0;
+  let mut q = dn.a;
+  while q != 0 {
+    let qn = node_at(p.nodes, q);
+    let pt = conv(&mut m, p, qn.a, x, q);
+    if kind_t(m, base_t(m, pt)) == TY_BYTES {
+      nsrc = wrap_add(nsrc, 2);
+      if kind_t(m, pt) == TY_MUTREF {
+        nmut = wrap_add(nmut, 1);
+      }
+    } else if kind_t(m, pt) == TY_REF || kind_t(m, pt) == TY_MUTREF || x86_words(&mut g, c, m, p, pt) != 1 {
+      x86_fail(&mut g, "the native backend supports only integers, `bool` and buffers as `export fn` parameters yet");
+      return;
+    } else {
+      nsrc = wrap_add(nsrc, 1);
+    }
+    q = qn.next;
+  }
+  if nsrc > A64_REG_ARGS {
+    x86_fail(&mut g, "the AArch64 backend takes at most eight words of `export fn` parameters yet");
+    return;
+  }
+  w_s(&mut g.out, "\t.globl ");
+  rd_src(&mut g.out, p, dn.s, dn.e);
+  w_s(&mut g.out, "\n\t.type ");
+  rd_src(&mut g.out, p, dn.s, dn.e);
+  w_s(&mut g.out, ", %function\n");
+  rd_src(&mut g.out, p, dn.s, dn.e);
+  w_s(&mut g.out, ":\n\tstp x29, x30, [sp, #-");
+  w_num(&mut g.out, wrap_add(16, wrap_mul(16, nmut)));
+  w_s(&mut g.out, "]!\n\tmov x29, sp\n");
+  // the cells of the lent buffers, before any register moves
+  let mut s = 0;
+  let mut mi = 0;
+  q = dn.a;
+  while q != 0 {
+    let qn = node_at(p.nodes, q);
+    let pt = conv(&mut m, p, qn.a, x, q);
+    if kind_t(m, base_t(m, pt)) == TY_BYTES {
+      if kind_t(m, pt) == TY_MUTREF {
+        w_s(&mut g.out, "\tstr x");
+        w_num(&mut g.out, wrap_add(s, 1));
+        w_s(&mut g.out, ", [x29, #");
+        w_num(&mut g.out, wrap_add(16, wrap_mul(16, mi)));
+        w_s(&mut g.out, "]\n\tstr x");
+        w_num(&mut g.out, s);
+        w_s(&mut g.out, ", [x29, #");
+        w_num(&mut g.out, wrap_add(24, wrap_mul(16, mi)));
+        w_s(&mut g.out, "]\n");
+        mi = wrap_add(mi, 1);
+      }
+      s = wrap_add(s, 2);
+    } else {
+      s = wrap_add(s, 1);
+    }
+    q = qn.next;
+  }
+  // the words in the order the function takes them, never to a higher
+  // register than the one they came in
+  s = 0;
+  let mut d = 0;
+  mi = 0;
+  q = dn.a;
+  while q != 0 {
+    let qn = node_at(p.nodes, q);
+    let pt = conv(&mut m, p, qn.a, x, q);
+    if kind_t(m, base_t(m, pt)) == TY_BYTES {
+      if kind_t(m, pt) == TY_MUTREF {
+        w_s(&mut g.out, "\tadd x");
+        w_num(&mut g.out, d);
+        w_s(&mut g.out, ", x29, #");
+        w_num(&mut g.out, wrap_add(16, wrap_mul(16, mi)));
+        w_s(&mut g.out, "\n");
+        mi = wrap_add(mi, 1);
+        d = wrap_add(d, 1);
+      } else {
+        if d != s {
+          w_s(&mut g.out, "\tmov x");
+          w_num(&mut g.out, d);
+          w_s(&mut g.out, ", x");
+          w_num(&mut g.out, s);
+          w_s(&mut g.out, "\n\tmov x");
+          w_num(&mut g.out, wrap_add(d, 1));
+          w_s(&mut g.out, ", x");
+          w_num(&mut g.out, wrap_add(s, 1));
+          w_s(&mut g.out, "\n");
+        }
+        d = wrap_add(d, 2);
+      }
+      s = wrap_add(s, 2);
+    } else {
+      if d != s {
+        w_s(&mut g.out, "\tmov x");
+        w_num(&mut g.out, d);
+        w_s(&mut g.out, ", x");
+        w_num(&mut g.out, s);
+        w_s(&mut g.out, "\n");
+      }
+      a64_norm(&mut g.out, m, pt, d);
+      if kind_t(m, pt) == TY_BOOL {
+        w_s(&mut g.out, "\tuxtb w");
+        w_num(&mut g.out, d);
+        w_s(&mut g.out, ", w");
+        w_num(&mut g.out, d);
+        w_s(&mut g.out, "\n");
+      }
+      d = wrap_add(d, 1);
+      s = wrap_add(s, 1);
+    }
+    q = qn.next;
+  }
+  w_s(&mut g.out, "\tbl ");
+  let mut sy = vec_new[u64]();
+  ix_sym(&mut sy, &mut g, m, p, x);
+  w_append(&mut g.out, sy);
+  vec_free(sy);
+  w_s(&mut g.out, "\n\tldp x29, x30, [sp], #");
+  w_num(&mut g.out, wrap_add(16, wrap_mul(16, nmut)));
+  w_s(&mut g.out, "\n\tret\n\t.size ");
+  rd_src(&mut g.out, p, dn.s, dn.e);
+  w_s(&mut g.out, ", .-");
+  rd_src(&mut g.out, p, dn.s, dn.e);
+  w_s(&mut g.out, "\n\n");
+}
+
+/// The string data and the end of the file, after the runtime.
+fn a64_tail(g: &mut X86) -> bool {
+  let mut k = 0;
+  w_s(&mut g.out, "\t.section .rodata\n");
+  while k < vec_len(g.slens) {
+    w_s(&mut g.out, ".Lstr");
+    w_num(&mut g.out, k);
+    w_s(&mut g.out, ":\n");
+    let from = u_at(g.sstart, k);
+    let n = u_at(g.slens, k);
+    let mut j = 0;
+    while j < n {
+      if j % 24 == 0 {
+        w_s(&mut g.out, "\t.byte ");
+      } else {
+        w_s(&mut g.out, ",");
+      }
+      w_num(&mut g.out, u_at(g.sdata, wrap_add(from, j)));
+      j = j + 1;
+      if j % 24 == 0 || j == n {
+        w_s(&mut g.out, "\n");
+      }
+    }
+    k = k + 1;
+  }
+  w_s(&mut g.out, "\t.section .note.GNU-stack,\"\",%progbits\n");
+  if g.macos {
+    let mo = macho_text(g.out);
+    vec_free(g.out);
+    g.out = mo;
+  }
+  return true;
+}
+
 /// A program for AArch64: every function from its IR, then `main` as the
 /// C library's entry point, the runtime and the string data. False, with
 /// the reason in `g`, when something is not covered yet.
@@ -3523,8 +3698,16 @@ fn a64_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
     }
     k = k + 1;
   }
-  if main_x == 0 || (g.target != TARGET_HOSTED && g.target != TARGET_USER && g.target != TARGET_KERNEL) {
-    x86_fail(&mut g, "the AArch64 backend builds hosted, user and kernel programs with a `main` only so far");
+  let mut nexp = 0;
+  k = 0;
+  while k < vec_len(m.fns) {
+    if exported_x(m, p, u_at(m.fns, k)) {
+      nexp = wrap_add(nexp, 1);
+    }
+    k = k + 1;
+  }
+  if (main_x == 0 && (g.target != TARGET_HOSTED || nexp == 0)) || (g.target != TARGET_HOSTED && g.target != TARGET_USER && g.target != TARGET_KERNEL) {
+    x86_fail(&mut g, "the AArch64 backend builds hosted, user and kernel programs with a `main` (or hosted libraries of `export fn`s) only so far");
     return false;
   }
   w_s(&mut g.out, "// generated by bastioc1 --arch aarch64 --backend native -- do not edit\n\t.text\n");
@@ -3535,6 +3718,22 @@ fn a64_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
       return false;
     }
     k = k + 1;
+  }
+  if main_x == 0 {
+    // A library: each `export fn` gets a C-callable wrapper.
+    k = 0;
+    while k < vec_len(m.fns) && !g.failed {
+      let x = u_at(m.fns, k);
+      if exported_x(m, p, x) {
+        a64_export(&mut g, c, &mut m, p, x);
+      }
+      k = k + 1;
+    }
+    if g.failed {
+      return false;
+    }
+    a64_runtime(&mut g.out, g.macos);
+    return a64_tail(&mut g);
   }
   if g.target == TARGET_KERNEL {
     // Called by the platform's boot code with the memory map; what it
@@ -3639,34 +3838,5 @@ fn a64_program(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser) -> bool {
     w_s(&mut g.out, "\n\tmov sp, x29\n\tldp x29, x30, [sp], #16\n\tret\n");
     a64_runtime(&mut g.out, g.macos);
   }
-  w_s(&mut g.out, "\t.section .rodata\n");
-  k = 0;
-  while k < vec_len(g.slens) {
-    w_s(&mut g.out, ".Lstr");
-    w_num(&mut g.out, k);
-    w_s(&mut g.out, ":\n");
-    let from = u_at(g.sstart, k);
-    let n = u_at(g.slens, k);
-    let mut j = 0;
-    while j < n {
-      if j % 24 == 0 {
-        w_s(&mut g.out, "\t.byte ");
-      } else {
-        w_s(&mut g.out, ",");
-      }
-      w_num(&mut g.out, u_at(g.sdata, wrap_add(from, j)));
-      j = j + 1;
-      if j % 24 == 0 || j == n {
-        w_s(&mut g.out, "\n");
-      }
-    }
-    k = k + 1;
-  }
-  w_s(&mut g.out, "\t.section .note.GNU-stack,\"\",%progbits\n");
-  if g.macos {
-    let mo = macho_text(g.out);
-    vec_free(g.out);
-    g.out = mo;
-  }
-  return true;
+  return a64_tail(&mut g);
 }
