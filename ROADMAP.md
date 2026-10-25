@@ -12,7 +12,7 @@ Direction, decided 2026-10-09:
 
 - **Primary target:** OS kernels and drivers (BastiOS, in a separate repository once kernel work starts).
 - **Also targeted:** embedded firmware, hypervisors, and safe libraries callable from C (parsers and codecs that read untrusted input).
-- **Not targeted:** web apps, scripting, GUI applications.
+- **Not targeted:** scripting. Web back ends (a WebAssembly module with a small JavaScript shell) and GUI programs written against a kernel's framebuffer are on the roadmap below, not the focus.
 
 Design consequences:
 1. The standard library splits into `core` (no OS required) and `std` (uses OS services).
@@ -200,6 +200,14 @@ Invariant 1 holds on arm64: system registers and device memory are reached only 
 - [x] Windows, through the C backend: stage0, bastioc1 and `tests/run.sh` build and pass under MSYS2 / MinGW-w64 in CI (2026-10-23): child processes use CreateProcess, the simulated pool `_aligned_malloc`. 
 - [x] A native backend for Windows (2026-10-23): `--os windows` with `--backend native-ir` writes MinGW-w64 assembly (stage1/winpe.bastio; C library calls go through Win64 thunks, children start over `_spawnvp`). The `windows` CI job compares every `tests/native.sh` program with its C build and runs the whole `tests/run.sh` suite with a `bastioc1` built this way. The last step is MinGW's `as` and `cc` with `--mingw-link`; by default it is the PE writer below.
 - [ ] Windows: an assembler and linker of our own. Done so far: the assembler (stage1/asm86.bastio, stage1/asmobj.bastio, byte-identical to GNU as on the test programs) and a PE writer (stage1/pe.bastio, `bastioc1 --os windows` links with it by default, `--mingw-link` keeps MinGW's `as` and `cc`; imports from msvcrt.dll and kernel32.dll). The `windows` CI job runs the whole suite with a `bastioc1` that was built and links this way. Left: dropping the `--mingw-link` path and MinGW's import libraries. Also left: the sanitizer cross-check (MinGW-w64 gcc has none), the `--lib` search tests and the other test scripts (difftest, aarch64).
+
+## Beyond systems programming
+
+The same proofs and the same zero-overhead rule, for programs that run in a browser or answer HTTP requests.
+
+- [ ] WebAssembly: `bastioc1 --arch wasm32` writes a module from the IR (`stage1/wasm.bastio`), so the proved code of a program or library runs in a browser or Node.js with no C compiler and no Emscripten. Started (2026-10-25): hosted programs and `export fn` libraries whose functions use scalars, buffers, structs and `Vec`s; every `tests/pass` and `bench` program the backend covers runs under Node.js with the C backend's output and exit status (`tests/wasm.sh`). Memory is one linear memory with a shadow stack, the string literals and a size-class allocator; the allocator and the growth of a `Vec` are a few hand-written wasm functions, the trusted part of a module. Left: the host calls (arguments, files, standard input), the kernel and device operations (not meaningful in a module), a typed JavaScript shell for `Bytes` and structs, wasm-side tail calls, and a browser demo.
+- [ ] HTTP: a `std` module for servers and clients over sockets, with the request and response parsers proved against untrusted input (the codecs in `examples/` are the model).
+- [ ] A small web framework example: a proved HTTP/1.1 parser behind the wasm module of a page, to show the two ends together.
 
 ## Performance
 
