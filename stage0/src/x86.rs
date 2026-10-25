@@ -354,6 +354,13 @@ fn entry(p: &Program) -> R<String> {
     let main = p.fns.iter().find(|f| f.name == "main").expect("checked");
     let mut s = String::from("\t.globl main\nmain:\n\tpush %rbp\n\tmov %rsp, %rbp\n\tpush %rbx\n\tsub $72, %rsp\n");
     s.push_str("\tmov %edi, bst_rt_argc(%rip)\n\tmov %rsi, bst_rt_argv(%rip)\n");
+    // `main` is called with its capabilities pushed: an odd number of words
+    // gets a word of padding, so that it is entered as any function is (%rsp
+    // 8 modulo 16) and the C library is called with an aligned stack.
+    let pw: usize = main.params.iter().map(|prm| if *prm.ty.base() == Type::Pool { 2 } else { 1 }).sum();
+    if pw % 2 == 1 {
+        s.push_str("\tsub $8, %rsp\n");
+    }
     // Each capability lives in a frame slot below the saved %rbx; `main`
     // gets it by value or by address.
     let mut off = 8;
@@ -2720,6 +2727,7 @@ bst_rt_vec_grow:                # grow the Vec at (%rdi), elements of %rsi bytes
 	mul %rsi                    # bytes; past 64 bits the request cannot be met
 	jo bst_rt_oom
 	mov %rax, %rsi
+	and $-16, %rsp
 	mov 16(%rbx), %rdi
 	call realloc@PLT
 	test %rax, %rax

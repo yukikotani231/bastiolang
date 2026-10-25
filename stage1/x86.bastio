@@ -8353,6 +8353,26 @@ fn x86_entry(g: &mut X86, m: &mut Mono, p: &Parser, x: u64) {
     w_s(&mut g.out, "\t.globl main\nmain:\n\tpush %rbp\n\tmov %rsp, %rbp\n\tpush %rbx\n\tsub $72, %rsp\n");
     w_s(&mut g.out, "\tmov %edi, bst_rt_argc(%rip)\n\tmov %rsi, bst_rt_argv(%rip)\n");
   }
+  // `main` is called with its capabilities pushed: an odd number of words
+  // gets a word of padding, so that it is entered as any function is (%rsp
+  // 8 modulo 16) and the C library is called with an aligned stack.
+  let mut pw = 0;
+  let mut pq = dn.a;
+  let mut poff = 8;
+  while pq != 0 && poff <= 64 {
+    let pn = node_at(p.nodes, pq);
+    let pk = kind_t(m, base_t(m, conv(&mut m, p, pn.a, x, pq)));
+    let mut w = 1;
+    if pk == TY_POOL {
+      w = 2;
+    }
+    pw = wrap_add(pw, w);
+    poff = wrap_add(poff, wrap_mul(8, w));
+    pq = pn.next;
+  }
+  if (pw & 1) == 1 {
+    w_s(&mut g.out, "\tsub $8, %rsp\n");
+  }
   // Each capability lives in a frame slot below the saved %rbx; `main`
   // gets it by value or by address.
   let mut off = 8;
@@ -8904,6 +8924,7 @@ fn x86_runtime(out: &mut Vec[u64]) {
   w_s(&mut out, "\tmul %rsi                    # bytes; past 64 bits the request cannot be met\n");
   w_s(&mut out, "\tjo bst_rt_oom\n");
   w_s(&mut out, "\tmov %rax, %rsi\n");
+  w_s(&mut out, "\tand $-16, %rsp\n");
   w_s(&mut out, "\tmov 16(%rbx), %rdi\n");
   w_s(&mut out, "\tcall realloc@PLT\n");
   w_s(&mut out, "\ttest %rax, %rax\n");

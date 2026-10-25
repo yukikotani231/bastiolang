@@ -4,7 +4,7 @@
 // Pipeline: load -> monomorphize -> check (types and linearity) -> verify
 // (Z3) -> C -> the system C compiler.
 //
-// usage: bastioc1 [--help] [--check] [--emit-c] [--target T] [--arch A] [--lib DIR] [--backend B] [--emit-asm] [--self-link|--gnu-link] [--header F] [--dump-smt] [-o out] <file.bastio>...
+// usage: bastioc1 [--help] [--check] [--emit-c] [--target T] [--arch A] [--lib DIR] [--backend B] [--emit-asm] [--self-link|--gnu-link|--musl-link] [--header F] [--dump-smt] [-o out] <file.bastio>...
 //   (default)   verify, then build a native executable `out` (default: a.out)
 //               with the C compiler `$CC` (default: cc)
 //   --check     stop after verification
@@ -437,7 +437,7 @@ fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, aa
     }
     w_s(&mut out, "\n");
     status = 4;
-  } else if (linkchoice == 1 || (linkchoice == 0 && (windows || macos || (ir && !aarch64 && b1_glibc(host, "/lib64/ld-linux-x86-64.so.2")) || (aarch64 && b1_glibc(host, "/lib/ld-linux-aarch64.so.1"))))) && !emit_asm && target == TARGET_HOSTED && !lib {
+  } else if ((linkchoice == 1 || linkchoice == 3) || (linkchoice == 0 && (windows || macos || (ir && !aarch64 && (b1_glibc(host, "/lib64/ld-linux-x86-64.so.2") || b1_glibc(host, "/lib/ld-musl-x86_64.so.1"))) || (aarch64 && b1_glibc(host, "/lib/ld-linux-aarch64.so.1"))))) && !emit_asm && target == TARGET_HOSTED && !lib {
     // The program is assembled and linked by pe.bastio: no `as`, no `cc`.
     let mut exe = b1_concat(outp, "");
     if !has_out {
@@ -475,7 +475,7 @@ fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, aa
         b1_run(host, cm);
       }
     } else {
-      st = elf_build(host, exe, text);
+      st = elf_build(host, exe, text, linkchoice == 3 || !b1_glibc(host, "/lib64/ld-linux-x86-64.so.2"));
       if st == 0 {
         let mut cm = vec_new[Bytes]();
         push_arg(&mut cm, "chmod");
@@ -600,7 +600,7 @@ fn b1_help(out: &mut Vec[u64]) {
   w_s(&mut out, "  --arch A         x86_64 (the default) or aarch64 (hosted programs compile with aarch64-linux-gnu-gcc; --backend native: partial)\n");
   w_s(&mut out, "  --os O           linux (the default), macos (--backend native --arch aarch64, or --backend native-ir: Mach-O assembly for Apple's assembler and linker driver) or windows (--backend native-ir: assembly for MinGW-w64)\n");
   w_s(&mut out, "  --backend B      c, or native (x86-64 assembly, or AArch64 with --arch aarch64); hosted programs on x86-64 Linux use native-ir unless --backend or --emit-c says otherwise\n");
-  w_s(&mut out, "  --self-link      with --backend native-ir: assemble and link with the built-in assembler and linker (the default on Windows, and on glibc Linux hosts)\n");
+  w_s(&mut out, "  --self-link      with --backend native-ir: assemble and link with the built-in assembler and linker (the default on Windows, macOS and glibc or musl Linux hosts; --musl-link writes an executable for musl's loader)\n");
   w_s(&mut out, "  --gnu-link       with --backend native-ir: assemble and link with the platform's as and cc instead (--mingw-link is the same)\n");
   w_s(&mut out, "  --emit-asm       with --backend native: write the assembly instead of an executable\n");
   w_s(&mut out, "  --lib DIR        also look for imported files in DIR\n");
@@ -648,6 +648,9 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
       bfree(a);
     } else if b1_is(a, "--self-link") {
       linkchoice = 1;
+      bfree(a);
+    } else if b1_is(a, "--musl-link") {
+      linkchoice = 3;
       bfree(a);
     } else if b1_is(a, "--gnu-link") || b1_is(a, "--mingw-link") {
       linkchoice = 2;

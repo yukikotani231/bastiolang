@@ -614,7 +614,23 @@ fn ix_call(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
   let na = x86_regargs(&mut g, c, &mut m, p, q.a);
   // With the result area at the bottom of the frame, the callee writes the
   // result straight into the slot: it is just above the arguments.
-  let direct = q.op == IR_CALLM && inplace;
+  // (An odd number of pushed arguments cannot have the result slot just
+  // above them and the padding word too: that call copies the result.)
+  let direct = q.op == IR_CALLM && inplace && (na > 0 || (total & 1) == 0);
+  // The callee expects %rsp to be 8 modulo 16 on entry, which its own calls
+  // to the C library rely on: a word of padding above the result and the
+  // arguments makes their number even.
+  let mut nwords = 0;
+  if na == 0 {
+    nwords = total;
+  }
+  if q.op == IR_CALLM && !direct {
+    nwords = wrap_add(nwords, q.ty);
+  }
+  let pad = (nwords & 1) == 1;
+  if pad {
+    w_s(&mut out, "\tsub $8, %rsp\n");
+  }
   if q.op == IR_CALLM && !direct {
     // The space for the result, above the arguments (`x86_call_to`).
     w_s(&mut out, "\tsub $");
@@ -651,6 +667,9 @@ fn ix_call(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
     w_s(&mut out, ", %rsp\n");
   }
   vec_free(pos);
+  if q.op == IR_CALLM && direct && pad {
+    w_s(&mut out, "\tadd $8, %rsp\n");
+  }
   if q.op == IR_CALLM {
     // The result words go to the frame slot, whose lowest word is `slotw`
     // words below %rbp; the slot's address is the value of the call.
@@ -667,12 +686,18 @@ fn ix_call(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker,
       w_s(&mut out, "\tadd $");
       w_num(&mut out, wrap_mul(8, q.ty));
       w_s(&mut out, ", %rsp\n");
+      if pad {
+        w_s(&mut out, "\tadd $8, %rsp\n");
+      }
     }
     w_s(&mut out, "\tlea -");
     w_num(&mut out, wrap_mul(8, slotw));
     w_s(&mut out, "(%fp), %rax\n");
     ix_finish(&mut out, al, q.d, XR_RAX);
     return;
+  }
+  if pad {
+    w_s(&mut out, "\tadd $8, %rsp\n");
   }
   if q.d != IR_NONE {
     if q.ty != IR_NONE && q.ty != 0 && ix_buffer(c, m, p, cg_ret_ty(&mut m, p, q.a)) {
