@@ -510,3 +510,320 @@ fn elf_build_a64(host: &Host, outp: &Bytes, data: &Bytes) -> u64 {
   }
   return pe_write(host, outp, image);
 }
+
+/// Appends `s` and a NUL to a string table and returns where it starts.
+fn elf_str(t: &mut Vec[u64], s: Str) -> u64 {
+  let at = vec_len(t);
+  pe_put(&mut t, s);
+  as_byte(&mut t, 0);
+  return at;
+}
+
+/// One 64-byte section header.
+fn elf_shdr(out: &mut Vec[u64], name: u64, kind: u64, flags: u64, off: u64, size: u64, link: u64, info: u64, align: u64, entsize: u64) {
+  as_le(&mut out, name, 4);
+  as_le(&mut out, kind, 4);
+  as_le(&mut out, flags, 8);
+  as_le(&mut out, 0, 8);
+  as_le(&mut out, off, 8);
+  as_le(&mut out, size, 8);
+  as_le(&mut out, link, 4);
+  as_le(&mut out, info, 4);
+  as_le(&mut out, align, 8);
+  as_le(&mut out, entsize, 8);
+}
+
+/// One `Elf64_Rela`.
+fn elf_rela(v: &mut Vec[u64], at: u64, idx: u64, kind: u64, addend: u64) {
+  as_le(&mut v, at, 8);
+  as_le(&mut v, wrap_add(wrap_mul(idx, 4294967296), kind), 8);
+  as_le(&mut v, addend, 8);
+}
+
+/// The index in the symbol table of `id` (after the null symbol and the four
+/// section symbols), or 0 when it has none.
+fn elf_symidx(syms: &Vec[u64], id: u64) -> u64 {
+  let mut k = 0;
+  while k < vec_len(syms) {
+    if u_at(syms, k) == id {
+      return wrap_add(k, 5);
+    }
+    k = wrap_add(k, 1);
+  }
+  return 0;
+}
+
+/// The assembled program `g` (laid out by `ao_layout`) as a relocatable
+/// object, the file `as` would write: `.text`, `.rodata`, `.data` and `.bss`,
+/// the relocations a linker still has to apply, and the symbols (global ones
+/// by name, local ones through their section). Empty when a relocation cannot
+/// be written.
+fn elf_rel(g: &mut AsObj, arm: bool) -> Vec[u64] {
+  let mut rel = vec_new[u64]();
+  let text = ao_emit(g, AB_TEXT, &mut rel);
+  let ro = ao_emit(g, AB_RODATA, &mut rel);
+  let data = ao_emit(g, AB_DATA, &mut rel);
+  let bss = ao_sec_size(g, AB_BSS);
+  let nsym = ao_nsyms(g);
+  // the symbols that get a name: the global ones, and the undefined ones that
+  // a relocation uses
+  let mut gs = vec_new[u64]();
+  let mut r = 0;
+  while wrap_add(r, 5) <= vec_len(rel) {
+    let s = u_at(rel, wrap_add(r, 3));
+    if s < nsym && ao_sym(g, s, 2) == AS_NONE && !has_id(gs, s) {
+      vec_push(&mut gs, s);
+    }
+    r = wrap_add(r, 5);
+  }
+  let mut id = 0;
+  while id < nsym {
+    if (ao_sym(g, id, 4) & 3) != 0 && !has_id(gs, id) && ao_sym(g, id, 1) > 0 {
+      vec_push(&mut gs, id);
+    }
+    id = wrap_add(id, 1);
+  }
+  // the relocations, by section
+  let mut rt = vec_new[u64]();
+  let mut rr = vec_new[u64]();
+  let mut rd = vec_new[u64]();
+  let mut bad = false;
+  r = 0;
+  while wrap_add(r, 5) <= vec_len(rel) {
+    let sec = u_at(rel, r);
+    let at = u_at(rel, wrap_add(r, 1));
+    let mut kind = u_at(rel, wrap_add(r, 2));
+    let s = u_at(rel, wrap_add(r, 3));
+    let mut addend = u_at(rel, wrap_add(r, 4));
+    if !arm {
+      if kind == AR_PC32 {
+        kind = 2;
+      } else if kind == AR_PLT32 {
+        kind = 4;
+      } else if kind == AR_GOT32 {
+        kind = 9;
+      } else {
+        bad = true;
+      }
+    }
+    let mut idx = elf_symidx(gs, s);
+    if idx == 0 {
+      // a local label: its section's symbol, and the label's offset
+      let ssec = ao_sym(g, s, 2);
+      if ssec > AB_BSS {
+        bad = true;
+      } else {
+        idx = wrap_add(ssec, 1);
+        addend = wrap_add(addend, ao_sym_off(g, s));
+      }
+    }
+    if sec == AB_RODATA {
+      elf_rela(&mut rr, at, idx, kind, addend);
+    } else if sec == AB_DATA {
+      elf_rela(&mut rd, at, idx, kind, addend);
+    } else if sec == AB_TEXT {
+      elf_rela(&mut rt, at, idx, kind, addend);
+    } else {
+      bad = true;
+    }
+    r = wrap_add(r, 5);
+  }
+  // the symbol table and its names
+  let mut strtab = vec_new[u64]();
+  as_byte(&mut strtab, 0);
+  let mut symtab = vec_new[u64]();
+  pe_pad_to(&mut symtab, 24);
+  let mut sk = 0;
+  while sk < 4 {
+    // the section symbols: STT_SECTION, local
+    as_le(&mut symtab, 0, 4);
+    as_byte(&mut symtab, 3);
+    as_byte(&mut symtab, 0);
+    as_le(&mut symtab, wrap_add(sk, 1), 2);
+    as_le(&mut symtab, 0, 8);
+    as_le(&mut symtab, 0, 8);
+    sk = wrap_add(sk, 1);
+  }
+  let mut gk = 0;
+  while gk < vec_len(gs) {
+    let s = u_at(gs, gk);
+    as_le(&mut symtab, vec_len(strtab), 4);
+    let nstart = ao_sym(g, s, 0);
+    let nlen = ao_sym(g, s, 1);
+    let mut c = 0;
+    while c < nlen {
+      as_byte(&mut strtab, u_at(g.names, wrap_add(nstart, c)));
+      c = wrap_add(c, 1);
+    }
+    as_byte(&mut strtab, 0);
+    let ssec = ao_sym(g, s, 2);
+    if (ao_sym(g, s, 4) & 2) != 0 && ssec == AS_NONE {
+      // a common symbol: its alignment and size
+      as_byte(&mut symtab, 17);
+      as_byte(&mut symtab, 0);
+      as_le(&mut symtab, 65522, 2);
+      as_le(&mut symtab, 16, 8);
+      as_le(&mut symtab, ao_sym(g, s, 5), 8);
+    } else if ssec == AS_NONE {
+      as_byte(&mut symtab, 16);
+      as_byte(&mut symtab, 0);
+      as_le(&mut symtab, 0, 2);
+      as_le(&mut symtab, 0, 8);
+      as_le(&mut symtab, 0, 8);
+    } else if ssec <= AB_BSS {
+      let mut ty = 0;
+      if ssec == AB_TEXT {
+        ty = 2;
+      }
+      as_byte(&mut symtab, wrap_add(16, ty));
+      as_byte(&mut symtab, 0);
+      as_le(&mut symtab, wrap_add(ssec, 1), 2);
+      as_le(&mut symtab, ao_sym_off(g, s), 8);
+      as_le(&mut symtab, 0, 8);
+    } else {
+      bad = true;
+    }
+    gk = wrap_add(gk, 1);
+  }
+  let mut shstr = vec_new[u64]();
+  as_byte(&mut shstr, 0);
+  let n_text = elf_str(&mut shstr, ".text");
+  let n_ro = elf_str(&mut shstr, ".rodata");
+  let n_data = elf_str(&mut shstr, ".data");
+  let n_bss = elf_str(&mut shstr, ".bss");
+  let n_note = elf_str(&mut shstr, ".note.GNU-stack");
+  let n_rt = elf_str(&mut shstr, ".rela.text");
+  let n_rr = elf_str(&mut shstr, ".rela.rodata");
+  let n_rd = elf_str(&mut shstr, ".rela.data");
+  let n_sym = elf_str(&mut shstr, ".symtab");
+  let n_str = elf_str(&mut shstr, ".strtab");
+  let n_shs = elf_str(&mut shstr, ".shstrtab");
+  let mut out = vec_new[u64]();
+  if !bad {
+    // the file: header, then each section at its alignment, then the headers
+    as_byte(&mut out, 127);
+    pe_put(&mut out, "ELF");
+    as_byte(&mut out, 2);
+    as_byte(&mut out, 1);
+    as_byte(&mut out, 1);
+    pe_pad_to(&mut out, 16);
+    as_le(&mut out, 1, 2);
+    if arm {
+      as_le(&mut out, 183, 2);
+    } else {
+      as_le(&mut out, 62, 2);
+    }
+    as_le(&mut out, 1, 4);
+    as_le(&mut out, 0, 8);
+    as_le(&mut out, 0, 8);
+    let off_text = 64;
+    let off_ro = pe_align(wrap_add(off_text, vec_len(text)), 16);
+    let off_data = pe_align(wrap_add(off_ro, vec_len(ro)), 16);
+    let off_bss = wrap_add(off_data, vec_len(data));
+    let off_rt = pe_align(off_bss, 8);
+    let off_rr = wrap_add(off_rt, vec_len(rt));
+    let off_rd = wrap_add(off_rr, vec_len(rr));
+    let off_sym = wrap_add(off_rd, vec_len(rd));
+    let off_str = wrap_add(off_sym, vec_len(symtab));
+    let off_shs = wrap_add(off_str, vec_len(strtab));
+    let off_sh = pe_align(wrap_add(off_shs, vec_len(shstr)), 8);
+    as_le(&mut out, off_sh, 8);
+    as_le(&mut out, 0, 4);
+    as_le(&mut out, 64, 2);
+    as_le(&mut out, 0, 2);
+    as_le(&mut out, 0, 2);
+    as_le(&mut out, 64, 2);
+    as_le(&mut out, 12, 2);
+    as_le(&mut out, 11, 2);
+    let mut k = 0;
+    while k < vec_len(text) {
+      as_byte(&mut out, u_at(text, k));
+      k = wrap_add(k, 1);
+    }
+    pe_pad_to(&mut out, off_ro);
+    k = 0;
+    while k < vec_len(ro) {
+      as_byte(&mut out, u_at(ro, k));
+      k = wrap_add(k, 1);
+    }
+    pe_pad_to(&mut out, off_data);
+    k = 0;
+    while k < vec_len(data) {
+      as_byte(&mut out, u_at(data, k));
+      k = wrap_add(k, 1);
+    }
+    pe_pad_to(&mut out, off_rt);
+    k = 0;
+    while k < vec_len(rt) {
+      as_byte(&mut out, u_at(rt, k));
+      k = wrap_add(k, 1);
+    }
+    k = 0;
+    while k < vec_len(rr) {
+      as_byte(&mut out, u_at(rr, k));
+      k = wrap_add(k, 1);
+    }
+    k = 0;
+    while k < vec_len(rd) {
+      as_byte(&mut out, u_at(rd, k));
+      k = wrap_add(k, 1);
+    }
+    k = 0;
+    while k < vec_len(symtab) {
+      as_byte(&mut out, u_at(symtab, k));
+      k = wrap_add(k, 1);
+    }
+    k = 0;
+    while k < vec_len(strtab) {
+      as_byte(&mut out, u_at(strtab, k));
+      k = wrap_add(k, 1);
+    }
+    k = 0;
+    while k < vec_len(shstr) {
+      as_byte(&mut out, u_at(shstr, k));
+      k = wrap_add(k, 1);
+    }
+    pe_pad_to(&mut out, off_sh);
+    pe_pad_to(&mut out, wrap_add(off_sh, 64));
+    elf_shdr(&mut out, n_text, 1, 6, off_text, vec_len(text), 0, 0, 16, 0);
+    elf_shdr(&mut out, n_ro, 1, 2, off_ro, vec_len(ro), 0, 0, 16, 0);
+    elf_shdr(&mut out, n_data, 1, 3, off_data, vec_len(data), 0, 0, 16, 0);
+    elf_shdr(&mut out, n_bss, 8, 3, off_bss, bss, 0, 0, 16, 0);
+    elf_shdr(&mut out, n_note, 1, 0, off_bss, 0, 0, 0, 1, 0);
+    elf_shdr(&mut out, n_rt, 4, 64, off_rt, vec_len(rt), 9, 1, 8, 24);
+    elf_shdr(&mut out, n_rr, 4, 64, off_rr, vec_len(rr), 9, 2, 8, 24);
+    elf_shdr(&mut out, n_rd, 4, 64, off_rd, vec_len(rd), 9, 3, 8, 24);
+    elf_shdr(&mut out, n_sym, 2, 0, off_sym, vec_len(symtab), 10, 5, 8, 24);
+    elf_shdr(&mut out, n_str, 3, 0, off_str, vec_len(strtab), 0, 0, 1, 0);
+    elf_shdr(&mut out, n_shs, 3, 0, off_shs, vec_len(shstr), 0, 0, 1, 0);
+  }
+  vec_free(rel);
+  vec_free(text);
+  vec_free(ro);
+  vec_free(data);
+  vec_free(gs);
+  vec_free(rt);
+  vec_free(rr);
+  vec_free(rd);
+  vec_free(strtab);
+  vec_free(symtab);
+  vec_free(shstr);
+  return out;
+}
+
+/// Writes the program's assembly as the relocatable object at `outp`.
+fn elf_build_rel(host: &Host, outp: &Bytes, data: &Bytes, arm: bool) -> u64 {
+  let mut g = pe_feed(data, "", arm);
+  if g.errs > 0 {
+    ao_free(g);
+    return 3;
+  }
+  ao_layout(&mut g);
+  let image = elf_rel(&mut g, arm);
+  ao_free(g);
+  if vec_len(image) == 0 {
+    vec_free(image);
+    return 4;
+  }
+  return pe_write(host, outp, image);
+}
