@@ -110,6 +110,14 @@ async function load(path) {
   assert.strictEqual(er.tag, 0n);
   assert.strictEqual(Buffer.from(er.text).toString(), 'aGVsbG8=');
 
+  // web/http.js: the head, its fields and the body framing as one object.
+  const parsed = require('../web/http.js').parse(S, new Uint8Array(Buffer.from('POST /p HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc')));
+  assert.deepStrictEqual(parsed, { status: 'ok', method: 'POST', target: '/p', version: '1.1',
+    fields: [['Host', 'h'], ['Content-Length', '3']], body: 'length', bodyLength: 3, bodyStart: 48 });
+  assert.strictEqual(require('../web/http.js').parse(S, new Uint8Array(Buffer.from('GET / HTTP/1.1\r\nHo'))).status, 'partial');
+  assert.strictEqual(require('../web/http.js').parse(S, new Uint8Array(Buffer.from('GET / HTTP/1.1\nHost: a\n\n'))).status, 'bad');
+  assert.strictEqual(require('../web/http.js').parse(S, new Uint8Array(Buffer.from('POST / HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n'))).body, 'bad');
+
   const resp = Buffer.from('HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot found');
   const [rp, rl] = H.put(resp);
   H.e.http_parse_response(rp, rl, hres);
