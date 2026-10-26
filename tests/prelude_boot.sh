@@ -29,7 +29,7 @@ fb = func("static uint64_t bst_boot_fb(bst_cpu c, uint64_t f) {")
 pool = func("static bst_pool bst_pool_init(uint64_t mbi) {")
 # The pool's own definitions: the runs, their limits and the bookkeeping.
 pool = s[s.index("extern uint64_t bst_ram_limit"):s.index("static bst_pool bst_pool_init(uint64_t mbi) {")] + pool
-pool = pool.replace("(uint64_t)_end", "0x200000ull")
+pool = pool.replace("(uint64_t)_end", "bst_endv").replace("&_image_start", "bst_img").replace("(uint64_t)_image_start", "bst_img")
 # Page ids to addresses: the page reader and the dirty take.
 pages = func("static inline uint64_t bst_page_at(uint64_t i) {")
 i = s.index("static inline bst_frame bst_pool_take_dirty(")
@@ -44,6 +44,7 @@ typedef int bst_cpu;
 typedef struct { uint64_t base, size; } bst_pool;
 typedef uint64_t bst_frame;
 static uint64_t bst_mbi, bst_pool_base;
+static uint64_t bst_endv = 0x200000ull, bst_img;   /* the image's end, and its start (0: not named) */
 static uint64_t *bst_arena2, bst_arena2_words;
 ''' + fb + pool + pages + r'''
 static int bad;
@@ -92,6 +93,23 @@ int main(void) {
     want("two runs: the first id of the second run", bst_page_at(1658), 0x30000000);
     want("two runs: a dirty page in the second run", bst_pool_take_dirty(&p, 1661), 0x30000000 + 3 * 4096);
     want("two runs: a dirty page in the first run", bst_pool_take_dirty(&p, 1), 0x20000000 + 390 * 4096 + 4096);
+
+    /* RAM below the image: the run at 0x20000000 holds the image at 0x20200000
+     * (to 0x20400000). Its low 2 MiB join the pool, less the page the
+     * information is in and the one the command line is in. */
+    bst_endv = 0x20400000; bst_img = 0x20200000;
+    *(uint32_t *)(m + 24) = 0;                          /* one run: 0x20000000, 8 MiB */
+    info[11] = 24;
+    uint32_t *in2 = (uint32_t *)(0x20000800);
+    memcpy(in2, info, sizeof info);
+    in2[0] = 64 | 4; in2[4] = 0x20003000; strcpy((char *)0x20003000, "console=ttyS0");
+    p = bst_pool_init(0x20000800);
+    want("below the image: both parts, less the loader's pages and the carve", p.size, 1340);
+    want("below the image: the first page is above the information", bst_page_at(0), 0x20001000);
+    want("below the image: the run after the command line", bst_page_at(2), 0x200C6000);
+    bst_img = 0;
+    p = bst_pool_init(0x20000800);
+    want("an image start that is not named leaves the pool as it was", p.size, 1024 - 2 - 128);
     return bad != 0;
 }
 ''')
