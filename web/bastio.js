@@ -8,6 +8,14 @@
 //   b.exports.f(...)                  // an `export fn`; words are BigInts
 //   b.put(u8) -> [address, length]    // a `&Bytes` argument
 //   b.bytesAt(address)                // a `Bytes` stored as (length, address)
+//
+// Child processes (`host_spawn`) need an embedder that can run programs:
+// pass `childProcess: require('child_process')` in Node.js, or your own
+// `spawn(argv, input) -> { status, stdout }`. Without either, as in a browser,
+// every program fails to start (exit status 127, no output). The program runs
+// when its output is first read or it is waited for, with everything written
+// to it until then as its input; a program that must see its input before it
+// answers cannot be driven from the module.
 (function (root) {
   'use strict';
   const enc = new TextEncoder();
@@ -42,6 +50,25 @@
       setWord(cell, 1, p);
     };
     const path = (b) => dec.decode(bytes(word(b, 0), word(b, 1)));
+    const SIGNALS = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGABRT: 6, SIGKILL: 9, SIGSEGV: 11, SIGPIPE: 13, SIGALRM: 14, SIGTERM: 15 };
+    const spawn = opts.spawn || (opts.childProcess && ((argv, input) => {
+      const r = opts.childProcess.spawnSync(argv[0], argv.slice(1), { input, stdio: ['pipe', 'pipe', 'inherit'], maxBuffer: 1 << 30 });
+      if (r.error) return { status: 127, stdout: new Uint8Array(0) };
+      return { status: r.status !== null ? r.status : 128 + (SIGNALS[r.signal] || 0), stdout: r.stdout };
+    })) || null;
+    const kids = new Map();                          // a Child's words are (pid, input, output); the pid keys this table
+    let nextKid = 1n;
+    const NONE = BigInt.asUintN(64, -1n);
+    const run = (kid) => {
+      if (kid.ran) return;
+      kid.ran = true;
+      const input = new Uint8Array(kid.input.reduce((n, c) => n + c.length, 0));
+      let at = 0;
+      for (const c of kid.input) { input.set(c, at); at += c.length; }
+      const r = spawn(kid.argv, input);
+      kid.status = r.status;
+      kid.out = r.stdout;
+    };
     const host = (call, b) => {
       switch (Number(call)) {
         case 20: {                                   // argument number word 0
@@ -82,6 +109,51 @@
           flush();
           (opts.stderr || (() => {}))(bytes(word(b, 0), word(b, 1)));
           return 0n;
+        case 26: {                                   // start argv: data, capacity, length in words 0 to 2
+          const data = word(b, 0), len = Number(word(b, 2));
+          const argv = [];
+          for (let i = 0; i < len; i++) {
+            const cell = data + BigInt(16 * i);
+            argv.push(dec.decode(bytes(word(cell, 1), word(cell, 0))));
+          }
+          if (!spawn || argv.length === 0) {
+            setWord(b, 0, 0n); setWord(b, 1, NONE); setWord(b, 2, NONE);
+            return 0n;
+          }
+          const id = nextKid++;
+          kids.set(id, { argv, input: [], ran: false, out: new Uint8Array(0), pos: 0, status: 127 });
+          setWord(b, 0, id); setWord(b, 1, id); setWord(b, 2, id);   // output, input, pid
+          return 0n;
+        }
+        case 27: {                                   // write words 0, 1 to the Child at word 2
+          const ch = word(b, 2);
+          const kid = kids.get(word(ch, 0));
+          if (!kid || kid.ran || word(ch, 1) === NONE) return 0n;
+          kid.input.push(bytes(word(b, 0), word(b, 1)));
+          return 1n;
+        }
+        case 28:                                     // close the input of the Child at word 0
+          setWord(word(b, 0), 1, NONE);
+          return 0n;
+        case 29: {                                   // the next line of the Child at word 0 into the cell at word 1
+          const ch = word(b, 0);
+          const kid = kids.get(word(ch, 0));
+          if (!kid || word(ch, 2) === 0n) return 0n;
+          run(kid);
+          if (kid.pos >= kid.out.length) return 0n;
+          let end = kid.out.indexOf(10, kid.pos);
+          if (end < 0) end = kid.out.length;
+          fill(word(b, 1), kid.out.subarray(kid.pos, end));
+          kid.pos = end + 1;
+          return 1n;
+        }
+        case 30: {                                   // wait for the Child (output, input, pid in words 0 to 2)
+          const kid = kids.get(word(b, 2));
+          if (!kid) return 127n;
+          run(kid);
+          kids.delete(word(b, 2));
+          return BigInt(kid.status);
+        }
         case 31:
           return BigInt(args.length);
         default:
