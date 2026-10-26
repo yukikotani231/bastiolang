@@ -1,0 +1,521 @@
+// Inlay hints, from the tokens of a program: the name of the parameter that
+// each argument of a call to a function goes to, and the type of a `let`
+// whose value is a call, a struct literal, a variant, a literal or a
+// comparison. Types are not inferred, so a `let` of any other value gets no
+// hint.
+import "complete.bastio";
+
+const HINTS_MAX: u64 = 500;
+
+/// The token index of the name of definition `d`, or 0 if it is not found.
+fn def_name_tok(ix: &Prog, d: Def) -> u64 {
+  let ts = u_at(ix.tstart, d.file);
+  let te = file_toks_end(ix, d.file);
+  let mut i = ts;
+  while i < te && i < vec_len(ix.toks)
+  {
+    if tok_at_start(ix.toks, i) == d.ns && tok_at_kind(ix.toks, i) == K_IDENT {
+      return i;
+    }
+    i = vadd(i, 1);
+  }
+  return 0;
+}
+
+/// The offsets (start, end pairs) of the parameter names of function `d`.
+fn param_names(ix: &Prog, d: Def, names: &mut Vec[u64]) {
+  let nt = def_name_tok(ix, d);
+  if nt == 0 || !is_p(tok_at(ix.toks, vadd(nt, 1)), P_LPAREN) {
+    return;
+  }
+  let te = file_toks_end(ix, d.file);
+  let mut depth = 0;
+  let mut j = vadd(nt, 2);
+  let mut stop = false;
+  while j < te && !stop
+  {
+    let c = tok_at(ix.toks, j);
+    if is_opener(c) {
+      depth = sadd(depth, 1);
+    } else if is_closer(c) {
+      if depth == 0 {
+        stop = true;
+      } else {
+        depth = depth - 1;
+      }
+    } else if depth == 0 && c.kind == K_IDENT && is_p(tok_at(ix.toks, vadd(j, 1)), P_COLON) {
+      vec_push(&mut names, c.start);
+      vec_push(&mut names, c.end);
+    }
+    j = vadd(j, 1);
+  }
+}
+
+/// The text of the return type of function `d` (empty if it has none).
+fn return_type(ix: &Prog, d: Def) -> Vec[u64] {
+  let nt = def_name_tok(ix, d);
+  let mut out = vec_new[u64]();
+  if nt == 0 || !is_p(tok_at(ix.toks, vadd(nt, 1)), P_LPAREN) {
+    return out;
+  }
+  let te = file_toks_end(ix, d.file);
+  let close = match_close(ix.toks, vadd(nt, 1), te);
+  if !is_p(tok_at(ix.toks, vadd(close, 1)), P_ARROW) {
+    return out;
+  }
+  let mut j = vadd(close, 2);
+  let mut stop = false;
+  let mut first = 0;
+  let mut last = 0;
+  while j < te && !stop
+  {
+    let c = tok_at(ix.toks, j);
+    if is_p(c, P_LBRACE) || is_p(c, P_SEMI) || is_kw(c, KW_REQUIRES) || is_kw(c, KW_ENSURES) || c.kind == K_EOF {
+      stop = true;
+    } else {
+      if first == 0 {
+        first = c.start;
+      }
+      last = c.end;
+      j = vadd(j, 1);
+    }
+  }
+  if first > 0 && last > first && last - first <= 100 {
+    collapse(ix.all, first, last, &mut out);
+  }
+  return out;
+}
+
+/// Is `all[s..e]` inside the range `rs..re`?
+fn in_range(s: u64, rs: u64, re: u64) -> bool {
+  return rs <= s && s <= re;
+}
+
+fn w_hint(out: &mut Vec[u64], all: &Bytes, off: u64, label: &Vec[u64], kind: u64, right: bool) {
+  if vec_len(out) > 0 {
+    vec_push(&mut out, 44);
+  }
+  w_s(&mut out, "{\"position\":");
+  w_pos(&mut out, off_to_lsp(all, 0, off));
+  w_s(&mut out, ",\"label\":\"");
+  jesc_vec(&mut out, label);
+  w_s(&mut out, "\",\"kind\":");
+  w_num(&mut out, kind);
+  if right {
+    w_s(&mut out, ",\"paddingRight\":true");
+  } else {
+    w_s(&mut out, ",\"paddingLeft\":false");
+  }
+  w_s(&mut out, "}");
+}
+
+/// The hints for the arguments of the call whose `(` is token `open`, to the
+/// function `d`.
+fn arg_hints(ix: &Prog, d: Def, open: u64, rs: u64, re: u64, out: &mut Vec[u64]) {
+  let mut names = vec_new[u64]();
+  param_names(ix, d, &mut names);
+  let te = file_toks_end(ix, 0);
+  let close = match_close(ix.toks, open, te);
+  let mut n = 0;
+  let mut depth = 0;
+  let mut arg = vadd(open, 1);
+  let mut j = vadd(open, 1);
+  while j <= close && j < te && vadd(n, 1) < vec_len(names)
+  {
+    let c = tok_at(ix.toks, j);
+    let mut ends = false;
+    if j == close {
+      ends = true;
+    } else if is_opener(c) {
+      depth = sadd(depth, 1);
+    } else if is_closer(c) {
+      if depth > 0 {
+        depth = depth - 1;
+      }
+    } else if depth == 0 && is_p(c, P_COMMA) {
+      ends = true;
+    }
+    if ends {
+      if arg < j {
+        let ns = u_at(names, n);
+        let ne = u_at(names, vadd(n, 1));
+        let a = tok_at(ix.toks, arg);
+        // `f(x)` with a parameter called `x` says nothing new.
+        let same = vadd(arg, 1) == j && a.kind == K_IDENT && same_text(ix.all, a.start, a.end, ns, ne);
+        if !same && in_range(tok_start(a), rs, re) && vec_len(out) < 60000 {
+          let mut lab = text_vec(ix.all, ns, ne);
+          vec_push(&mut lab, 58);
+          w_hint(&mut out, ix.all, tok_start(a), lab, 2, true);
+          vec_free(lab);
+        }
+      }
+      n = vadd(n, 2);
+      arg = vadd(j, 1);
+    }
+    j = vadd(j, 1);
+  }
+  vec_free(names);
+}
+
+/// The type written after the `:` that follows binding token `b` (a
+/// parameter or a typed `let`), or nothing if it has none.
+fn declared_type(ix: &Prog, b: u64) -> Vec[u64] {
+  let mut out = vec_new[u64]();
+  if !is_p(tok_at(ix.toks, vadd(b, 1)), P_COLON) {
+    return out;
+  }
+  let te = file_toks_end(ix, 0);
+  let first = vadd(b, 2);
+  let mut j = first;
+  let mut depth = 0;
+  let mut stop = false;
+  while j < te && !stop
+  {
+    let c = tok_at(ix.toks, j);
+    if is_opener(c) {
+      depth = sadd(depth, 1);
+    } else if is_closer(c) {
+      if depth == 0 {
+        stop = true;
+      } else {
+        depth = depth - 1;
+      }
+    } else if depth == 0 && (is_p(c, P_COMMA) || is_p(c, P_EQ) || is_p(c, P_SEMI) || is_p(c, P_LBRACE)) {
+      stop = true;
+    }
+    if !stop {
+      j = vadd(j, 1);
+    }
+  }
+  if j > first {
+    vec_free(out);
+    out = text_vec(ix.all, tok_start(tok_at(ix.toks, first)), tok_end(tok_at(ix.toks, vsub(j, 1))));
+  }
+  return out;
+}
+
+/// Is the value that starts at token `k` and ends at the next `;` a `bool`
+/// for sure: a comparison or `&&` / `||` outside any brackets, or a `!`?
+fn is_bool_value(ix: &Prog, k: u64) -> bool {
+  let te = file_toks_end(ix, 0);
+  if is_p(tok_at(ix.toks, k), P_BANG) {
+    return true;
+  }
+  let mut j = k;
+  let mut depth = 0;
+  let mut found = false;
+  let mut stop = false;
+  while j < te && !stop && vsub(j, k) < 200
+  {
+    let c = tok_at(ix.toks, j);
+    if is_opener(c) {
+      depth = sadd(depth, 1);
+    } else if is_closer(c) {
+      if depth == 0 {
+        stop = true;
+      } else {
+        depth = depth - 1;
+      }
+    } else if depth == 0 {
+      if is_p(c, P_SEMI) {
+        stop = true;
+      } else if is_p(c, P_EQEQ) || is_p(c, P_NE) || is_p(c, P_LE) || is_p(c, P_GE) || is_p(c, P_LT) || is_p(c, P_GT) || is_p(c, P_ANDAND) || is_p(c, P_OROR) {
+        found = true;
+      }
+    }
+    j = vadd(j, 1);
+  }
+  return found && stop && is_p(tok_at(ix.toks, vsub(j, 1)), P_SEMI);
+}
+
+fn is_arith(c: Tok) -> bool {
+  return is_p(c, P_PLUS) || is_p(c, P_MINUS) || is_p(c, P_STAR) || is_p(c, P_SLASH) || is_p(c, P_PERCENT);
+}
+
+/// The type of `a + 1 * b`: a value of names, integers and arithmetic that
+/// starts at token `k` and ends at the next `;` has the declared type of its
+/// first name, if that is a local with one. Empty if the value is anything else.
+fn arith_type(ix: &Prog, k: u64) -> Vec[u64] {
+  let te = file_toks_end(ix, 0);
+  let mut j = k;
+  let mut ok = true;
+  let mut first = 0;
+  let mut stop = false;
+  while j < te && !stop && ok && vsub(j, k) < 60
+  {
+    let c = tok_at(ix.toks, j);
+    if is_p(c, P_SEMI) {
+      stop = true;
+    } else if c.kind == K_IDENT {
+      if first == 0 {
+        first = j;
+      }
+    } else if c.kind != K_INT && !is_arith(c) {
+      ok = false;
+    }
+    if !stop {
+      j = vadd(j, 1);
+    }
+  }
+  if ok && stop && first > 0 {
+    let r = resolve_at(ix, 0, first);
+    if r.found && r.local {
+      return declared_type(ix, r.idx);
+    }
+  }
+  return vec_new[u64]();
+}
+
+/// The type `T` of `cast[T](x)` when token `k` starts the value of a `let`, or
+/// nothing if the value is anything else.
+fn cast_type(ix: &Prog, k: u64) -> Vec[u64] {
+  let te = file_toks_end(ix, 0);
+  let mut w = vec_new[u64]();
+  w_s(&mut w, "cast");
+  let mut out = vec_new[u64]();
+  if tok_spells(ix, k, w) && is_p(tok_at(ix.toks, vadd(k, 1)), P_LBRACKET) {
+    let rb = match_close(ix.toks, vadd(k, 1), te);
+    if rb > vadd(k, 2) && is_p(tok_at(ix.toks, vadd(rb, 1)), P_LPAREN) {
+      let rp = match_close(ix.toks, vadd(rb, 1), te);
+      if is_p(tok_at(ix.toks, vadd(rp, 1)), P_SEMI) {
+        vec_free(out);
+        out = text_vec(ix.all, tok_start(tok_at(ix.toks, vadd(k, 2))), tok_end(tok_at(ix.toks, vsub(rb, 1))));
+      }
+    }
+  }
+  vec_free(w);
+  return out;
+}
+
+/// The struct that the local declared at token `b` holds: the type it was
+/// declared with (without a `&` or `&mut`) or the struct of the literal it
+/// was initialized with. Empty if neither says.
+fn local_struct(ix: &Prog, b: u64) -> Vec[u64] {
+  let t = declared_type(ix, b);
+  if vec_len(t) > 0 {
+    let mut out = vec_new[u64]();
+    let mut k = 0;
+    if u_at(t, 0) == 38 {
+      k = 1;
+      if vec_len(t) >= 5 && u_at(t, 1) == 109 && u_at(t, 2) == 117 && u_at(t, 3) == 116 && u_at(t, 4) == 32 {
+        k = 5;
+      }
+    }
+    while k < vec_len(t)
+    {
+      vec_push(&mut out, u_at(t, k));
+      k = vadd(k, 1);
+    }
+    vec_free(t);
+    return out;
+  }
+  vec_free(t);
+  if is_p(tok_at(ix.toks, vadd(b, 1)), P_EQ) && tok_at_kind(ix.toks, vadd(b, 2)) == K_IDENT && is_p(tok_at(ix.toks, vadd(b, 3)), P_LBRACE) {
+    let n = tok_at(ix.toks, vadd(b, 2));
+    return text_vec(ix.all, n.start, n.end);
+  }
+  // `let p = make(..);`: the return type of the function.
+  if is_p(tok_at(ix.toks, vadd(b, 1)), P_EQ) && tok_at_kind(ix.toks, vadd(b, 2)) == K_IDENT && is_p(tok_at(ix.toks, vadd(b, 3)), P_LPAREN) {
+    let r = resolve_at(ix, 0, vadd(b, 2));
+    if r.found && !r.local {
+      let d = def_at(ix, r.idx);
+      if d.kind == DK_FN {
+        return return_type(ix, d);
+      }
+    }
+  }
+  return vec_new[u64]();
+}
+
+/// The type of the field `f` (token `ft`) of the local at token `lt`, if the
+/// local holds a struct that declares it: `let x = p.a;`.
+fn field_type(ix: &Prog, lt: u64, ft: u64) -> Vec[u64] {
+  let sname = local_struct(ix, lt);
+  let mut out = vec_new[u64]();
+  let f = tok_at(ix.toks, ft);
+  let mut d = 0;
+  let mut parent = 0;
+  while d < vec_len(ix.defs) && vec_len(sname) > 0
+  {
+    let df = vec_get(ix.defs, d);
+    if df.kind == DK_STRUCT && same_text_vec(ix.all, df.ns, df.ne, sname) {
+      parent = vadd(d, 1);
+    }
+    d = vadd(d, 1);
+  }
+  d = 0;
+  while d < vec_len(ix.defs) && parent > 0 && vec_len(out) == 0
+  {
+    let df = vec_get(ix.defs, d);
+    if df.kind == DK_FIELD && df.parent == parent && same_text(ix.all, df.ns, df.ne, f.start, f.end) {
+      // `name: Type`: the text after the colon.
+      let mut q = df.ne;
+      while q < df.se && at(ix.all, q) != 58
+      {
+        q = vadd(q, 1);
+      }
+      q = vadd(q, 1);
+      while q < df.se && at(ix.all, q) == 32
+      {
+        q = vadd(q, 1);
+      }
+      if q < df.se {
+        vec_free(out);
+        out = text_vec(ix.all, q, df.se);
+      }
+    }
+    d = vadd(d, 1);
+  }
+  vec_free(sname);
+  return out;
+}
+
+/// Is `all[s..e]` the text `v`?
+fn same_text_vec(all: &Bytes, s: u64, e: u64, v: &Vec[u64]) -> bool {
+  if e < s || e - s != vec_len(v) || e > blen(all) {
+    return false;
+  }
+  let mut k = 0;
+  while k < vec_len(v)
+  {
+    if cast[u64](bget(all, s + k)) != u_at(v, k) {
+      return false;
+    }
+    k = vadd(k, 1);
+  }
+  return true;
+}
+
+/// The hint for the `let` at token `i`: its type when the value says it.
+fn let_hint(ix: &Prog, i: u64, rs: u64, re: u64, out: &mut Vec[u64]) {
+  let te = file_toks_end(ix, 0);
+  let mut j = vadd(i, 1);
+  if is_kw(tok_at(ix.toks, j), KW_MUT) {
+    j = vadd(j, 1);
+  }
+  let name = tok_at(ix.toks, j);
+  if name.kind != K_IDENT || !is_p(tok_at(ix.toks, vadd(j, 1)), P_EQ) {
+    return;
+  }
+  let k = vadd(j, 2);
+  let v = tok_at(ix.toks, k);
+  if in_range(name.end, rs, re) && is_bool_value(ix, k) {
+    let mut full = vec_new[u64]();
+    w_s(&mut full, ": bool");
+    w_hint(&mut out, ix.all, name.end, full, 1, false);
+    vec_free(full);
+    return;
+  }
+  let literal = v.kind == K_INT || v.kind == K_STR || is_kw(v, KW_TRUE) || is_kw(v, KW_FALSE);
+  if (v.kind != K_IDENT && !literal) || !in_range(name.end, rs, re) {
+    return;
+  }
+  let mut lab = vec_new[u64]();
+  let next = tok_at(ix.toks, vadd(k, 1));
+  if literal {
+    // `let x = 5;`: a literal that nothing types is a `u64`.
+    if is_p(next, P_SEMI) {
+      let mut t = vec_new[u64]();
+      if v.kind == K_INT {
+        w_s(&mut t, "u64");
+      } else if v.kind == K_STR {
+        w_s(&mut t, "Str");
+      } else {
+        w_s(&mut t, "bool");
+      }
+      vec_free(lab);
+      lab = t;
+    }
+  } else if is_p(next, P_DOT) && tok_at_kind(ix.toks, vadd(k, 2)) == K_IDENT && is_p(tok_at(ix.toks, vadd(k, 3)), P_SEMI) {
+    // `let x = p.a;` where `p` holds a struct that declares `a`.
+    let r = resolve_at(ix, 0, k);
+    if r.found && r.local {
+      vec_free(lab);
+      lab = field_type(ix, r.idx, vadd(k, 2));
+    }
+  } else if is_p(next, P_SEMI) {
+    // `let x = y;` where `y` was declared with a type.
+    let r = resolve_at(ix, 0, k);
+    if r.found && r.local {
+      vec_free(lab);
+      lab = declared_type(ix, r.idx);
+    }
+  } else if is_arith(next) {
+    // `let x = a + 1;` where `a` was declared with a type.
+    vec_free(lab);
+    lab = arith_type(ix, k);
+  } else if is_p(next, P_LBRACKET) {
+    // `let x = cast[T](..);`
+    vec_free(lab);
+    lab = cast_type(ix, k);
+  } else if is_p(next, P_LPAREN) {
+    // `let x = f(..);`
+    let close = match_close(ix.toks, vadd(k, 1), te);
+    if is_p(tok_at(ix.toks, vadd(close, 1)), P_SEMI) {
+      let r = resolve_at(ix, 0, k);
+      if r.found && !r.local {
+        let d = def_at(ix, r.idx);
+        if d.kind == DK_FN {
+          vec_free(lab);
+          lab = return_type(ix, d);
+        }
+      }
+    }
+  } else if is_p(next, P_LBRACE) {
+    // `let x = S { .. };`
+    let r = resolve_at(ix, 0, k);
+    if r.found && !r.local {
+      let d = def_at(ix, r.idx);
+      if d.kind == DK_STRUCT {
+        vec_free(lab);
+        lab = text_vec(ix.all, d.ns, d.ne);
+      }
+    }
+  } else if is_p(next, P_COLONCOLON) {
+    // `let x = E::V;` or `let x = E::V(..);`
+    let r = resolve_at(ix, 0, vadd(k, 2));
+    if r.found && !r.local {
+      let d = def_at(ix, r.idx);
+      if d.kind == DK_VARIANT && d.parent > 0 {
+        let pd = def_at(ix, d.parent - 1);
+        vec_free(lab);
+        lab = text_vec(ix.all, pd.ns, pd.ne);
+      }
+    }
+  }
+  if vec_len(lab) > 0 {
+    let mut full = vec_new[u64]();
+    w_s(&mut full, ": ");
+    w_append(&mut full, lab);
+    w_hint(&mut out, ix.all, name.end, full, 1, false);
+    vec_free(full);
+  }
+  vec_free(lab);
+}
+
+/// The inlay hints (JSON objects, separated by commas) for the part
+/// `rs..re` of file 0.
+fn inlay_hints(ix: &Prog, rs: u64, re: u64, out: &mut Vec[u64]) {
+  let ts = u_at(ix.tstart, 0);
+  let te = file_toks_end(ix, 0);
+  let mut i = ts;
+  while i < te && i < vec_len(ix.toks)
+  {
+    let c = tok_at(ix.toks, i);
+    if is_kw(c, KW_LET) {
+      let_hint(ix, i, rs, re, &mut out);
+    } else if c.kind == K_IDENT && is_p(tok_at(ix.toks, vadd(i, 1)), P_LPAREN) {
+      let p = tok_at(ix.toks, vsub(i, 1));
+      if !(i > ts && is_kw(p, KW_FN)) {
+        let r = resolve_at(ix, 0, i);
+        if r.found && !r.local {
+          let d = def_at(ix, r.idx);
+          if d.kind == DK_FN || d.kind == DK_SPEC {
+            arg_hints(ix, d, vadd(i, 1), rs, re, &mut out);
+          }
+        }
+      }
+    }
+    i = vadd(i, 1);
+  }
+}

@@ -1,0 +1,81 @@
+// expect-exit: 0
+// expect-stdout: 1790214
+// A loop that stores whole structs into a Vec keeps the Vec's length and data
+// address in registers (native-ir): the element stores go through the data
+// address, so they cannot change the header. The cases update elements in place
+// through a `&mut Vec`, push structs past several capacities, pop them, and
+// swap elements in one loop.
+struct P { a: u64, b: u64 }
+
+fn bump(ps: &mut Vec[P])
+  requires vlen(ps) <= 1000
+  ensures vlen(ps) == old(vlen(ps))
+{
+  let mut i = 0;
+  while i < vec_len(ps)
+    invariant i <= vlen(ps) && vlen(ps) == old(vlen(ps))
+  {
+    let p = vec_get(ps, i);
+    vec_set(&mut ps, i, P { a: wrap_add(p.a, p.b), b: wrap_add(p.b, 1) });
+    i = i + 1;
+  }
+}
+
+fn fill(ps: &mut Vec[P], n: u64)
+  requires vlen(ps) == 0 && n <= 1000
+  ensures vlen(ps) == n
+{
+  let mut i = 0;
+  while i < n
+    invariant i <= n && vlen(ps) == i
+  {
+    vec_push(&mut ps, P { a: i, b: i % 3 });
+    i = i + 1;
+  }
+}
+
+fn flip(ps: &mut Vec[P])
+  requires vlen(ps) <= 1000
+  ensures vlen(ps) == old(vlen(ps))
+{
+  let mut i = 0;
+  while i + 1 < vec_len(ps)
+    invariant i <= vlen(ps) && vlen(ps) == old(vlen(ps))
+  {
+    let x = vec_get(ps, i + 1);
+    let y = vec_swap(&mut ps, i, x);
+    vec_set(&mut ps, i + 1, y);
+    i = i + 2;
+  }
+}
+
+fn sum(ps: &Vec[P]) -> u64
+  requires vlen(ps) <= 1000
+{
+  let mut t = 0;
+  let mut i = 0;
+  while i < vec_len(ps)
+    invariant i <= vlen(ps)
+  {
+    let p = vec_get(ps, i);
+    t = wrap_add(t, wrap_add(wrap_mul(p.a, 7), p.b));
+    i = i + 1;
+  }
+  return t;
+}
+
+fn main() -> u64 {
+  let mut ps = vec_new[P]();
+  fill(&mut ps, 700);
+  let mut r = 0;
+  while r < 5
+    invariant r <= 5 && vlen(ps) == 700
+  {
+    bump(&mut ps);
+    flip(&mut ps);
+    r = r + 1;
+  }
+  print(sum(ps));
+  vec_free(ps);
+  return 0;
+}

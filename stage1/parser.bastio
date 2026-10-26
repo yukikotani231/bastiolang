@@ -106,6 +106,8 @@ struct Parser {
   ecode: u64,
   /// What is wrong, as bastioc0 says it (the sentence after the code).
   emsg: Vec[u64],
+  /// The hint lines under the error, each "  = ...\n".
+  enotes: Vec[u64],
   // The definitions of every file parsed so far, one list per kind.
   structs: List,
   enums: List,
@@ -125,7 +127,7 @@ fn parser_new(src: Bytes, toks: Vec[Tok], i: u64) -> Parser {
   vec_push(&mut nodes, Node { kind: 0, line: 0, col: 0, s: 0, e: 0, s2: 0, e2: 0, v: 0, a: 0, b: 0, c: 0, d: 0, x: 0, next: 0, file: 0 });
   return Parser {
     src: src, toks: toks, i: i, nodes: nodes, consts: vec_new[Const](), blobs: vec_new[u64](),
-    bstart: vec_new[u64](), bdata: vec_new[u64](), file: 0, failed: false, efile: 0, eline: 0, ecol: 0, ecode: 0, emsg: vec_new[u64](),
+    bstart: vec_new[u64](), bdata: vec_new[u64](), file: 0, failed: false, efile: 0, eline: 0, ecol: 0, ecode: 0, emsg: vec_new[u64](), enotes: vec_new[u64](),
     structs: list_new(), enums: list_new(), specs: list_new(), fns: list_new(),
     ix_structs: ix_new(), ix_enums: ix_new(), ix_specs: ix_new(), ix_fns: ix_new(), ix_consts: ix_new()
   };
@@ -139,6 +141,7 @@ fn parser_free(p: Parser) -> Bytes {
   vec_free(p.bstart);
   vec_free(p.bdata);
   vec_free(p.emsg);
+  vec_free(p.enotes);
   ix_free(p.ix_structs);
   ix_free(p.ix_enums);
   ix_free(p.ix_specs);
@@ -248,6 +251,13 @@ fn pm_text(p: &mut Parser, t: Tok) {
     vec_push(&mut p.emsg, cast[u64](bget(p.src, k)));
     k = k + 1;
   }
+}
+
+/// Adds the hint line `s` under the error.
+fn pm_note(p: &mut Parser, s: Str) {
+  w_s(&mut p.enotes, "  = ");
+  w_s(&mut p.enotes, s);
+  w_s(&mut p.enotes, "\n");
 }
 
 fn pm_clear(p: &mut Parser) {
@@ -422,7 +432,27 @@ fn expect_p(p: &mut Parser, c: u64) -> Tok {
     return t;
   }
   pm_expected_spell(&mut p, t, pm_p_spell(c));
+  // What a newcomer most likely meant, for the slips seen most often.
+  if c == P_LBRACE && is_p(t, P_EQ) {
+    pm_note(&mut p, "`=` assigns; use `==` to compare");
+  } else if c == P_COLON {
+    pm_note(&mut p, "a name is followed by `:` and its type, as in `n: u64`");
+  } else if c == P_SEMI && p.i > 0 {
+    let prev = tok_at(p.toks, p.i - 1);
+    if prev.kind == K_IDENT && tok_is(p.src, prev, "var") {
+      pm_note(&mut p, "declare a variable with `let` (`let mut` if it changes later)");
+    } else if prev.kind == K_IDENT && tok_is(p.src, prev, "for") {
+      pm_note(&mut p, "Bastio has no `for` loop: use `while` with a counter variable");
+    }
+  }
   return t;
+}
+
+/// Is token `t` a binary operator that has a compound assignment form in
+/// other languages (`+=`, `&=` ..)?
+fn pm_is_binop(t: Tok) -> bool {
+  return is_p(t, P_PLUS) || is_p(t, P_MINUS) || is_p(t, P_STAR) || is_p(t, P_SLASH) || is_p(t, P_PERCENT)
+    || is_p(t, P_AMP) || is_p(t, P_PIPE) || is_p(t, P_CARET);
 }
 
 /// `expect_p` where stage0 says more than the token.
@@ -1277,7 +1307,11 @@ fn primary(p: &mut Parser) -> u64 {
     return add(&mut p, n);
   }
   if t.kind != K_IDENT {
+    let was_failed = p.failed;
     pm_expected(&mut p, t, "expression");
+    if !was_failed && is_p(t, P_EQ) && p.i > 0 && pm_is_binop(tok_at(p.toks, p.i - 1)) {
+      pm_note(&mut p, "there are no compound assignments such as `+=`: write `x = x + 1;`");
+    }
     return 0;
   }
   if tok_is(p.src, t, "include_bytes") {
@@ -1454,12 +1488,16 @@ fn const_eval(p: &mut Parser, i: u64) -> u64 {
 // ---- Statements ----
 
 fn block(p: &mut Parser) -> u64 {
+  let open = peek(p);
   expect_p(&mut p, P_LBRACE);
   let mut l = list_new();
   while !p.failed && !at_p(p, P_RBRACE) {
     let t = peek(p);
     if t.kind == K_EOF {
       pm_fail(&mut p, t, "unexpected end of file, missing `}`");
+      w_s(&mut p.enotes, "  = the `{` opened at line ");
+      w_num(&mut p.enotes, open.line);
+      w_s(&mut p.enotes, " is never closed: every `{` needs a matching `}`\n");
       return 0;
     }
     let s = stmt(&mut p);

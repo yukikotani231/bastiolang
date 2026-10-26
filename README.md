@@ -8,7 +8,7 @@ Bastio is a systems language whose memory safety is **proved at compile time**, 
 - **Zero overhead.** Proofs are erased. The generated code has no bounds checks and no runtime checks of any kind.
 - **Opt-in functional correctness.** Functions that carry `requires` / `ensures` / `invariant` are proved to meet them.
 
-New here? Start with the [tutorial](docs/tutorial.md), then keep [common proof failures](docs/proof-failures.md) at hand: it shows the errors people meet first and how to fix each. The [language reference](docs/language.md) has every rule. The examples in all three are compiled by the test suite, so they match the compiler. [docs/README.md](docs/README.md) indexes every document.
+New here? Start with the [tutorial](docs/tutorial.md) and its second and third parts ([sized integers](docs/tutorial-bits.md), [capabilities](docs/tutorial-capabilities.md)); [the toolchain](docs/toolchain.md) explains the targets and backends. Then keep [common proof failures](docs/proof-failures.md) at hand: it shows the errors people meet first and how to fix each. The [language reference](docs/language.md) has every rule. The examples in all three are compiled by the test suite, so they match the compiler. [docs/README.md](docs/README.md) indexes every document.
 
 ## Example
 
@@ -64,10 +64,10 @@ Requirements:
 | --- | --- | --- |
 | Rust | 1.97.0 | Pinned in `rust-toolchain.toml`; rustup installs it on the first build |
 | Z3 | 4.8.12 (Ubuntu 24.04 package), 5.1.0 | Must be on `PATH` as `z3`; the compiler runs it as a subprocess |
-| C compiler | GCC 13 | Called as `cc`; the generated C is C11 |
+| C compiler | GCC 13, Apple clang 15 | Called as `cc`; the generated C is C11 |
 | Python 3 | 3.12, 3.13 | Only for `stage1/difftest.sh` |
 
-Tested on x86-64 Linux (Ubuntu 24.04), which is what CI runs; other platforms are untested. On Ubuntu: `sudo apt-get install z3 build-essential python3`, plus [rustup](https://rustup.rs).
+The hosted compiler is tested on x86-64 Linux (Ubuntu 24.04) and on macOS (Apple Silicon and Intel, with `brew install z3`); CI builds it and runs `tests/run.sh` on all three. The kernel and user targets, the native backend and the other test scripts are Linux-only so far. On Ubuntu: `sudo apt-get install z3 build-essential python3`, plus [rustup](https://rustup.rs).
 
 ```sh
 git clone https://github.com/yukikotani231/bastiolang && cd bastiolang
@@ -99,7 +99,8 @@ bastioc1 is the compiler written in Bastio (`stage1/`); stage0's `bastioc0` only
 | `tests/fail/` | Programs that must be rejected with a given error code |
 | `core/`, `std/` | The library: byte strings, text, numbers, printing, a hash map, sorting (`core/`, every target) and host files (`std/`); see `docs/core.md` |
 | `examples/` | Small programs to start from (`hello.bastio`, `lines`; see `examples/README.md`), and proved libraries called from C through `export fn`: `base64`, `utf8` (validator and decoder) and `der` (ASN.1 structure checker), each with a differential fuzz against a C implementation |
-| `docs/tutorial.md` | A tour of the language for newcomers |
+| `docs/tutorial.md`, `docs/tutorial-bits.md`, `docs/tutorial-capabilities.md` | A tour of the language for newcomers, in three parts |
+| `docs/toolchain.md` | The compilers, targets, backends and what each trusts |
 | `docs/proof-failures.md` | The proof failures newcomers meet first, and how to fix each |
 | `docs/language.md` | The language reference |
 | `docs/core.md` | The core and std libraries: what each function does and what is proved |

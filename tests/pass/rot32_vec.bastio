@@ -1,0 +1,57 @@
+// expect-exit: 0
+// expect-stdout: 938280427
+// expect-stdout: 2655554728
+// A rotation of a u32 read from a vector (the word is typed u32, though the
+// load itself says nothing about its width) is a `roll`, and u32 sums over
+// more live words than there are registers add a spilled word in 32 bits.
+fn rotr(x: u32, n: u64) -> u32
+  requires n >= 1 && n <= 31
+{
+  return wrap[u32](cast[u64](x) << (32 - n)) | (x >> n);
+}
+
+fn mixall(w: &Vec[u32]) -> u32
+  requires vlen(w) == 16
+{
+  let mut a: u32 = 1;
+  let mut b: u32 = 2;
+  let mut c: u32 = 3;
+  let mut d: u32 = 4;
+  let mut e: u32 = 5;
+  let mut f: u32 = 6;
+  let mut g: u32 = 7;
+  let mut h: u32 = 8;
+  let mut i: u32 = 9;
+  let mut j: u32 = 10;
+  let mut k: u32 = 11;
+  let mut l: u32 = 12;
+  let mut n = 0;
+  while n < 16
+    invariant n <= 16 && vlen(w) == 16
+  {
+    let x = vec_get(w, n);
+    let s = rotr(x, 7) ^ rotr(x, 18) ^ (x >> 3);
+    a = wrap_add(a, s); b = wrap_add(b, a ^ x); c = wrap_add(c, b);
+    d = wrap_sub(d, c); e = wrap_add(e, d ^ s); f = wrap_add(f, e);
+    g = wrap_add(g, f); h = wrap_sub(h, g ^ x); i = wrap_add(i, h);
+    j = wrap_add(j, i); k = wrap_sub(k, j ^ s); l = wrap_add(l, k);
+    a = wrap_add(a, l);
+    n = n + 1;
+  }
+  return wrap_add(wrap_add(wrap_add(a, b), wrap_add(c, d)), wrap_add(wrap_add(e, f), wrap_add(g, wrap_add(h, wrap_add(i, wrap_add(j, wrap_add(k, l)))))));
+}
+
+fn main() -> u64 {
+  let mut w = vec_new[u32]();
+  let mut n = 0;
+  while n < 16
+    invariant n <= 16 && vlen(w) == n
+  {
+    vec_push(&mut w, wrap[u32](n * 2654435761 + 4000000000));
+    n = n + 1;
+  }
+  print(cast[u64](mixall(w)));
+  print(cast[u64](rotr(vec_get(w, 3), 5)));
+  vec_free(w);
+  return 0;
+}

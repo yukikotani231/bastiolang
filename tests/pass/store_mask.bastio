@@ -1,0 +1,78 @@
+// expect-exit: 0
+// expect-stdout: 6939
+// expect-stdout: 6249
+// expect-stdout: 83526
+// expect-stdout: 251717
+// A byte store keeps the low byte of its value, so `x % 256` made for the
+// store alone is dropped; a remainder that something else reads too is kept.
+// Remainders by 61 and 53 (divisors whose multiplier needs the 65th bit of
+// the dividend) subtract straight into the result's register.
+fn fill(mut b: Bytes, n: u64) -> Bytes
+  requires blen(b) == 64 && n <= 64
+  ensures blen(result) == 64
+{
+  let mut x = 12345;
+  let mut i = 0;
+  while i < n
+    invariant i <= n && n <= 64 && blen(b) == 64 && x < 4294967296
+  {
+    x = (x * 1103515245 + 12345) % 4294967296;
+    bset(&mut b, i, cast[u8](x / 65536 % 256));
+    i = i + 1;
+  }
+  return b;
+}
+
+fn fill2(mut b: Bytes, n: u64) -> u64
+  requires blen(b) == 64 && n <= 64
+{
+  let mut x = 54321;
+  let mut i = 0;
+  let mut t = 0;
+  while i < n
+    invariant i <= n && n <= 64 && blen(b) == 64 && x < 4294967296
+  {
+    x = (x * 1103515245 + 12345) % 4294967296;
+    let v = x / 65536 % 256;
+    bset(&mut b, i, cast[u8](v));
+    t = wrap_add(t, v);
+    i = i + 1;
+  }
+  bfree(b);
+  return t;
+}
+
+fn rems(n: u64, a: u64) -> u64
+  requires n <= 5000
+{
+  let mut i = 0;
+  let mut s = 0;
+  while i < n
+    invariant i <= n && n <= 5000
+  {
+    let u = wrap_add(a, wrap_mul(i, 7919));
+    let p = u % 61 + 1;
+    let q = u % 53 + 1;
+    s = wrap_add(s, wrap_mul(p, q));
+    i = i + 1;
+  }
+  return s;
+}
+
+fn main() -> u64 {
+  let b = fill(balloc(64), 60);
+  let mut s = 0;
+  let mut i = 0;
+  while i < 60
+    invariant i <= 60 && blen(b) == 64
+  {
+    s = wrap_add(s, cast[u64](bget(b, i)));
+    i = i + 1;
+  }
+  print(s);
+  print(fill2(balloc(64), 50));
+  print(rems(100, 12345));
+  print(rems(300, 999999999999));
+  bfree(b);
+  return 0;
+}

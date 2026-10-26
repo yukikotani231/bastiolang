@@ -1,0 +1,135 @@
+// Strength reduction of loop counter multiples (stage1/iropt.bastio, iropt_ivs).
+// expect-exit: 0
+// expect-stdout: 570037379
+// An index such as `k * 3 + base` or `i * 64 + j` in a loop is kept in a
+// register of its own that the loop steps, instead of multiplying again in
+// every pass. Each shape here is one the pass handles or must leave alone:
+// a base that changes outside the loop, a loop that runs no pass, a step of
+// two, an index read in only one arm of an `if`, and a value that the loop
+// copies to a variable read after it.
+fn fill(mut b: Buf) -> Buf
+  requires len(b) == 4096
+  ensures len(result) == 4096
+{
+  let mut i = 0;
+  while i < 4096
+    invariant i <= 4096 && len(b) == 4096
+  {
+    b = set(b, i, (i * 31 + 7) % 1000);
+    i = i + 1;
+  }
+  return b;
+}
+
+fn strided(b: &Buf, base: u64, n: u64) -> u64
+  requires len(b) == 4096 && base <= 1000 && n <= 1000
+{
+  let mut s = 0;
+  let mut k = 0;
+  while k < n
+    invariant k <= n && n <= 1000
+  {
+    s = wrap_add(s, get(b, k * 3 + base));
+    k = k + 1;
+  }
+  return s;
+}
+
+fn rows(b: &Buf, i: u64) -> u64
+  requires len(b) == 4096 && i < 64
+{
+  let mut s = 0;
+  let mut j = 0;
+  while j < 64
+    invariant j <= 64 && i < 64
+  {
+    s = wrap_add(s, wrap_mul(get(b, i * 64 + j), j + 1));
+    j = j + 1;
+  }
+  return s;
+}
+
+fn cols(b: &Buf, j: u64) -> u64
+  requires len(b) == 4096 && j < 64
+{
+  let mut s = 0;
+  let mut i = 0;
+  while i < 64
+    invariant i <= 64 && j < 64
+  {
+    s = wrap_add(s, wrap_mul(get(b, i * 64 + j), i + 3));
+    i = i + 1;
+  }
+  return s;
+}
+
+fn by_two(b: &Buf, n: u64) -> u64
+  requires len(b) == 4096 && n <= 800
+{
+  let mut s = 0;
+  let mut k = 0;
+  while k < n
+    invariant k <= n + 1 && n <= 800
+  {
+    s = wrap_add(s, get(b, k * 5 + 11));
+    k = k + 2;
+  }
+  return s;
+}
+
+fn arms(b: &Buf, n: u64) -> u64
+  requires len(b) == 4096 && n <= 1000
+{
+  let mut s = 0;
+  let mut k = 0;
+  while k < n
+    invariant k <= n && n <= 1000
+  {
+    if get(b, k) % 2 == 0 {
+      s = wrap_add(s, get(b, k * 2 + 1));
+    } else {
+      s = wrap_add(s, 1);
+    }
+    k = k + 1;
+  }
+  return s;
+}
+
+fn last_index(n: u64) -> u64
+  requires n <= 1000
+{
+  let mut last = 0;
+  let mut k = 0;
+  while k < n
+    invariant k <= n && n <= 1000
+  {
+    last = k * 7 + 3;
+    k = k + 1;
+  }
+  return last;
+}
+
+fn main() -> u64 {
+  let b = fill(alloc(4096));
+  let mut t = 0;
+  t = wrap_add(t, strided(b, 0, 1000));
+  t = wrap_add(t, wrap_mul(strided(b, 999, 1000), 3));
+  t = wrap_add(t, wrap_mul(strided(b, 5, 0), 5));
+  t = wrap_add(t, strided(b, 1000, 1));
+  let mut i = 0;
+  while i < 64
+    invariant i <= 64 && len(b) == 4096
+  {
+    t = wrap_add(t, wrap_mul(rows(b, i), i + 1));
+    t = wrap_add(t, wrap_mul(cols(b, i), i + 2));
+    i = i + 1;
+  }
+  t = wrap_add(t, by_two(b, 800));
+  t = wrap_add(t, by_two(b, 0));
+  t = wrap_add(t, arms(b, 1000));
+  t = wrap_add(t, last_index(0));
+  t = wrap_add(t, wrap_mul(last_index(1000), 11));
+  print(t % 1000000007);
+  free(b);
+  return 0;
+}

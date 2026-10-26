@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bastio in the browser</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; }
+  textarea { width: 100%; box-sizing: border-box; font: 14px monospace; }
+  pre { background: #f2f2f2; padding: .5rem; white-space: pre-wrap; word-break: break-all; }
+  @media (prefers-color-scheme: dark) { body { background: #111; color: #eee; } pre { background: #222; } }
+</style>
+</head>
+<body>
+<h1>Bastio in the browser</h1>
+<p>The base64 library of <code>examples/base64</code>, proved free of overflow and out-of-bounds access, compiled to WebAssembly by <code>bastioc1 --arch wasm32</code>. Nothing else runs: no C compiler, no Emscripten.</p>
+<textarea id="in" rows="4">Hello, Bastio!</textarea>
+<p><button id="enc">Encode</button> <button id="dec">Decode</button></p>
+<pre id="out"></pre>
+<script src="bastio.js"></script>
+<script>
+(async () => {
+  const b = await Bastio.load(await (await fetch('base64.wasm')).arrayBuffer());
+  const te = new TextEncoder(), td = new TextDecoder();
+  // The result enum is three words in a cell the caller provides: the tag (0 is Ok), then a Bytes (length, address).
+  function call(name, text) {
+    const [p, n] = b.put(te.encode(text));
+    const cell = b.exports.bst_alloc(32n);
+    b.exports[name](p, n, cell);
+    const tag = b.word(cell, 0);
+    const result = tag === 0n ? td.decode(b.bytesAt(cell + 8n)) : null;
+    if (tag === 0n) b.exports.bst_free(b.word(cell, 2));
+    b.exports.bst_free(p); b.exports.bst_free(cell);
+    return result;
+  }
+  const out = document.getElementById('out'), inp = document.getElementById('in');
+  document.getElementById('enc').onclick = () => { out.textContent = call('base64_encode', inp.value); };
+  document.getElementById('dec').onclick = () => {
+    const r = call('base64_decode', inp.value.trim());
+    out.textContent = r === null ? 'not valid base64 (the library accepts exactly what it produces)' : r;
+  };
+})();
+</script>
+</body>
+</html>

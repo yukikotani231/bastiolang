@@ -337,7 +337,7 @@ fn kept_by_builtins(t: &Type, field: &str) -> bool {
 
 /// Builtins whose `&mut` argument keeps the fields above.
 const SHAPE_KEEPING: &[&str] =
-    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pt_borrow", "pt_borrow_frame", "pt_lease_count", "pt_set_access", "pt_put_shared", "pt_take_shared", "shared_drop", "pool_take", "pool_take_dirty", "pool_give", "frame_write", "frame_write8", "bcopy", "bmove", "frame_to_bytes", "bytes_to_frame", "dma_to_bytes", "bytes_to_dma", "cpu_set", "cpu_run", "cpu_idle", "cpu_fpu_save", "cpu_fpu_load",
+    &["bset", "vec_set", "vec_swap", "pt_put", "pt_take", "pt_put_frame", "pt_take_frame", "pt_borrow", "pt_borrow_frame", "pt_lease_count", "pt_set_access", "pt_put_shared", "pt_take_shared", "shared_drop", "pool_take", "pool_take_dirty", "pool_give", "frame_write", "frame_write8", "bcopy", "bmove", "frame_to_bytes", "bytes_to_frame", "frame_to_frame", "dma_to_bytes", "bytes_to_dma", "cpu_set", "cpu_run", "cpu_idle", "cpu_fpu_save", "cpu_fpu_load",
       "pio_in8", "pio_in16", "pio_in32", "pio_out8", "pio_out16", "pio_out32",
       "mmio_read8", "mmio_read16", "mmio_read32", "mmio_read64", "mmio_write8", "mmio_write16", "mmio_write32", "mmio_write64",
       "dma_read8", "dma_read16", "dma_read32", "dma_read64", "dma_write8", "dma_write16", "dma_write32", "dma_write64"];
@@ -498,6 +498,8 @@ fn proof_hint(code: &str) -> Option<&'static str> {
         "E-VERIFY-CAST" => "check the value first, with an `if` or a `requires`, or use `wrap[T](..)` if wrapping around is meant",
         "E-VERIFY-SHIFT" => "check the shift amount first, with an `if` or a `requires`",
         "E-VERIFY-ALLOC" => "bound the size first, with an `if` or a `requires`",
+        "E-VERIFY-LEAK" => "pop and consume every element first, or show with a `requires` or an `if` that the vector is empty before freeing it",
+        "E-VERIFY-UNREACHABLE" => "an `unreachable` must follow from what is known there: look at the conditions of the enclosing `if`s and the `requires`",
         "E-VERIFY-ASSERT" => "an `assert` must follow from what is known there: the `requires`, the conditions of the enclosing `if`s and loops, and loop invariants",
         _ => return None,
     })
@@ -2379,6 +2381,16 @@ impl<'p> Verifier<'p> {
                     format!("that `{}` .. `{} + {}` is within the page (`{} + {} <= 4096`)", ra(1), ra(1), ra(4), ra(1), ra(4)))?;
                 self.need(st, format!("(<= (+ {} {}) {})", s, n, len), pos, "E-VERIFY-BOUNDS",
                     format!("that the source `{}` .. `{} + {}` is within `{}` (`{} + {} <= blen({})`)", ra(3), ra(3), ra(4), ra(2), ra(3), ra(4), ra(2)))?;
+                Ok(Val::Unit)
+            }
+            // From one page into another: neither page's contents are tracked,
+            // and both stay the same pages.
+            "frame_to_frame" => {
+                let (d, s, n) = (vals[1].term(), vals[3].term(), vals[4].term());
+                self.need(st, format!("(<= (+ {} {}) 4096)", d, n), pos, "E-VERIFY-BOUNDS",
+                    format!("that `{}` .. `{} + {}` is within the page (`{} + {} <= 4096`)", ra(1), ra(1), ra(4), ra(1), ra(4)))?;
+                self.need(st, format!("(<= (+ {} {}) 4096)", s, n), pos, "E-VERIFY-BOUNDS",
+                    format!("that `{}` .. `{} + {}` is within the page (`{} + {} <= 4096`)", ra(3), ra(3), ra(4), ra(3), ra(4)))?;
                 Ok(Val::Unit)
             }
             "bfrom" => match &vals[0] {

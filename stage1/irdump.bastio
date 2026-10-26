@@ -9,13 +9,16 @@ import "loader.bastio";
 import "out.bastio";
 import "ir.bastio";
 import "iropt.bastio";
+import "iropt_inline.bastio";
 
 fn main(con: &mut Serial, host: &mut Host) -> u64 {
   let mut ld = loader_new();
   let mut base = 1;
   let mut opt = false;
+  let mut inl = false;
   let mut where = false;
   let mut target = TARGET_HOSTED;
+  let mut arch = ARCH_X86_64;
   let mut more = true;
   while more && base < 990 && base + 2 < host_argc(host)
     invariant base <= 1000
@@ -37,11 +40,17 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
     if spells(flag, 0, blen(flag), "--opt") {
       opt = true;
     }
+    if spells(flag, 0, blen(flag), "--inline") {
+      inl = true;
+    }
     if spells(flag, 0, blen(flag), "--where") {
       where = true;
     }
     if spells(flag, 0, blen(flag), "--user") {
       target = TARGET_USER;
+    }
+    if spells(flag, 0, blen(flag), "--aarch64") {
+      arch = ARCH_AARCH64;
     }
     if spells(flag, 0, blen(flag), "--kernel") {
       target = TARGET_KERNEL;
@@ -67,6 +76,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
       code = 1;
     } else {
       let mut c = checker_new(&mut m, p, target);
+      c.arch = arch;
       check_program(&mut c, &mut m, p);
       if c.failed {
         put(con, "error\n");
@@ -88,16 +98,25 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
             }
             w_s(&mut text, "\n");
           } else {
+            if inl {
+              iropt_inline(&mut f, c, &mut m, p, false);
+              iropt_copies(&mut f);
+            }
             if opt {
               iropt_slots(&mut f);
               iropt_fold(&mut f);
               iropt_copies(&mut f);
               iropt_dce(&mut f);
+              iropt_webs(&mut f);
               iropt_thread(&mut f);
               if iropt_merge(&mut f) > 0 {
                 iropt_copies(&mut f);
                 iropt_dce(&mut f);
                 iropt_thread(&mut f);
+              }
+              if iropt_ivs(&mut f) > 0 {
+                iropt_copies(&mut f);
+                iropt_dce(&mut f);
               }
             }
             ir_print(&mut text, f, m, p);

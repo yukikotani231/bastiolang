@@ -1,0 +1,51 @@
+// expect-exit: 0
+// expect-stdout: 12288
+// Self-inlining goes two levels deep: a recursive builder and walkers over a
+// tree of 2^12 leaves give the same result as the plain calls.
+struct Node { l: Tree, r: Tree }
+enum Tree { Leaf(u64), Branch(Box[Node]) }
+
+fn build(d: u64) -> Tree {
+  if d == 0 { return Tree::Leaf(1); }
+  return Tree::Branch(box(Node { l: build(d - 1), r: build(d - 1) }));
+}
+
+fn count(t: &Tree, fuel: u64) -> u64
+  requires fuel <= 1000000000
+  ensures result <= fuel
+{
+  if fuel == 0 { return 0; }
+  match t {
+    Tree::Leaf(v) => { return v % 2; },
+    Tree::Branch(n) => {
+      let half = (fuel - 1) / 2;
+      return count(n.l, half) + count(n.r, half);
+    },
+  }
+}
+
+fn drop_tree(t: Tree) {
+  match t {
+    Tree::Leaf(_) => {},
+    Tree::Branch(b) => {
+      let n = unbox(b);
+      drop_tree(n.l);
+      drop_tree(n.r);
+    },
+  }
+}
+
+fn main() -> u64 {
+  let mut t = 0;
+  let mut r = 0;
+  while r < 3
+    invariant t <= r * 1000000000 && r <= 3
+  {
+    let tr = build(12);
+    t = t + count(tr, 1000000000);
+    drop_tree(tr);
+    r = r + 1;
+  }
+  print(t);
+  return 0;
+}

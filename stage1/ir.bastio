@@ -67,7 +67,7 @@ const IR_WRAP: u64 = 51;     // d = a truncated to the integer type ty
 const IR_SLOT: u64 = 52;     // d = the address of a frame slot of c words (one per instruction, allocated once per function however often it runs)
 const IR_STRLIT: u64 = 55;   // d = the address of the bytes of the string literal or blob at syntax node a
 const IR_CALLM: u64 = 54;    // d = the address of a frame slot of ty words that instance a, called with the c registers of args[b ..], fills with its result (a result of more than two words)
-const IR_VGROW: u64 = 53;    // makes room in the Vec whose 3-word header is at address a (c = words per element): a runtime call that may change the header
+const IR_VGROW: u64 = 53;    // makes room in the Vec whose 3-word header is at address a (c = words per element): a runtime call that changes the capacity and the data address (words 1 and 2 of the header), not the length
 
 const IRS_PAGE_AT: u64 = 0;
 const IRS_FRAME_ID: u64 = 1;
@@ -79,11 +79,16 @@ const IRS_PT_LEASES: u64 = 6;
 const IRS_SHARED_REFS: u64 = 7;
 const IRS_USER_TABLE: u64 = 8;
 const IRS_KERNEL_TABLE: u64 = 9;
+const IRS_SYNC_ICACHE: u64 = 10;   // AArch64: cleans a page to the point of unification and invalidates the instruction cache over it; the result is the argument
+const IRS_PT_GEN: u64 = 11;        // AArch64: the count of entries taken out of any table
+const IRS_KERNEL_ROOT: u64 = 12;   // AArch64: the platform's top-level table
+const IRS_SERIAL_POLL: u64 = 14;   // AArch64: the next byte received, or 256 when there is none
+const IRS_DEFERRED: u64 = 13;      // AArch64: the address of the symbol a platform that loads user tables from a trampoline defines, else 0
 
 const IR_DEVR: u64 = 61;     // d = the c-byte (1, 2, 4 or 8) value at address a, zero-extended: a volatile load, never dropped or reordered
 const IR_DEVW: u64 = 62;     // the low c bytes of b are stored at address a: a volatile store
 const IR_PIN: u64 = 63;      // d = the c-byte value read from I/O port a (`in`)
-const IR_FENCE: u64 = 65;    // a full memory fence (`dma_lend`, `dma_take`)
+const IR_FENCE: u64 = 65;    // a full memory fence (`dma_lend`, `dma_take`); with a = 1 the fence around a copy to or from a lent page, which only the AArch64 target emits (`dmb osh`; x86-64 DMA is coherent)
 const IR_MMCHK: u64 = 66;    // stops the machine if the block at address a, b bytes, is RAM (`mmio_claim` in the kernel): a runtime call that keeps every register
 const IR_TSC: u64 = 67;      // d = the processor's time-stamp counter (`cpu_tsc`)
 const IR_PCALL: u64 = 68;    // d = a call of one runtime or platform function, which c names, on (a, b) (ty: a constant for the callee; for c 20 to 31, a hosted runtime routine called with the four words at address a; for c 10 and 11, a is a system call number and b the address of three argument words, for 12 a is a Buf's data address and b the address of two bounds): a call for the allocator
@@ -94,10 +99,17 @@ const IR_XCHG: u64 = 72;     // d = the 64-bit word at address a, which b replac
 const IR_CAS: u64 = 73;      // d = 1 if the 64-bit word at address a was b and is now the register c, else 0 (atomically)
 const IR_FILL: u64 = 76;     // stores the low byte of b in the c bytes from address a (a `while` that sets each byte of a range to one value)
 const IR_COPY: u64 = 75;     // copies c bytes from address b to address a, lowest address first (`bcopy` and the frame and DMA copies)
+const IR_CP16: u64 = 77;    // a[b] = c[d], two words (16 bytes) from word index d at base c to word index b at base a: one unaligned 16-byte move (x86-64, made late by `ix_copy16`)
 const IR_LOCKACQ: u64 = 74;  // spins until it takes the lock word at address a (0 free, 1 held)
 const IR_POUT: u64 = 64;     // the low c bytes of b are written to I/O port a (`out`)
 
 const IR_NONE: u64 = 18446744073709551615;
+
+/// The `ty` of a LOAD or STORE of a word of a Vec header made by a `vec_*`
+/// builtin (`iropt_vlen` reads it, then clears it), and of the load that
+/// `iropt_vlen` puts after a `vgrow` to read the word again.
+const IR_HDR: u64 = 2199023255552;
+const IR_HDR2: u64 = 2199023255553;
 
 /// In a `lent` entry, the third word at least this is a struct or enum of
 /// that many words less this, held in registers.
@@ -125,6 +137,8 @@ struct IrFn {
   why: Vec[u64],
   /// The `&mut Buf` / `&mut Bytes` parameters: per parameter its address, data and length registers.
   lent: Vec[u64],
+  /// Integer parameters that `requires` proves nonzero (`k > 0`, `k >= 1`, `k != 0`).
+  nz: Vec[u64],
   /// The line of the statement being lowered, and where the lowering failed.
   cur: u64,
   at: u64
@@ -132,7 +146,7 @@ struct IrFn {
 
 fn ir_new(x: u64) -> IrFn {
   return IrFn { x: x, params: vec_new[u64](), ins: vec_new[IrIns](), args: vec_new[u64](), nreg: 0, nlabel: 0,
-    vars: vec_new[IrVar](), failed: false, why: vec_new[u64](), lent: vec_new[u64](), cur: 0, at: 0 };
+    vars: vec_new[IrVar](), failed: false, why: vec_new[u64](), lent: vec_new[u64](), nz: vec_new[u64](), cur: 0, at: 0 };
 }
 
 fn ir_free(f: IrFn) {
@@ -142,6 +156,7 @@ fn ir_free(f: IrFn) {
   vec_free(f.vars);
   vec_free(f.why);
   vec_free(f.lent);
+  vec_free(f.nz);
 }
 
 fn ir_fail(f: &mut IrFn, why: Str) {
@@ -351,7 +366,7 @@ fn ir_atomic_ty(f: &IrFn, c: &Checker, m: &mut Mono, p: &Parser, a: u64) -> u64 
         return 0;
       }
       let t = base_t(m, inner_t(m, pt));
-      if is_int(m, t) || kind_t(m, t) == TY_BOOL {
+      if is_int(m, t) || kind_t(m, t) == TY_BOOL || ir_word_struct(c, m, p, t) {
         return t;
       }
       return 0;
@@ -359,6 +374,29 @@ fn ir_atomic_ty(f: &IrFn, c: &Checker, m: &mut Mono, p: &Parser, a: u64) -> u64 
     q = qn.next;
   }
   return 0;
+}
+
+/// Is `t` a struct the IR keeps in one register (an atomic can hold it)?
+fn ir_word_struct(c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
+  let u = base_t(m, t);
+  return kind_t(m, u) == TY_STRUCT && ir_kind(c, m, p, u) == IRK_STRUCT && ir_words(c, m, p, u, 0) == 1;
+}
+
+/// The one word that argument `a` of an atomic operation is: an integer, or
+/// the register of a one-word struct (`sw`).
+fn ir_atomic_arg(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, a: u64, sw: bool) -> u64 {
+  if !sw {
+    return ir_int(&mut f, c, &mut m, p, a);
+  }
+  let v = ir_vexpr(&mut f, c, &mut m, p, a);
+  if f.failed {
+    return IR_NONE;
+  }
+  if v.k != IRK_STRUCT {
+    ir_fail(&mut f, "an atomic operand of another kind");
+    return IR_NONE;
+  }
+  return v.r0;
 }
 
 /// The index of the page at address register `fr`: the runtime's lookup in
@@ -376,6 +414,47 @@ fn ir_page_id(f: &mut IrFn, c: &Checker, fr: u64) -> u64 {
     ir_emit(&mut f, IR_SHR, d, off, sh, 0, 0);
   }
   return d;
+}
+
+/// The mask of the address bits of a page table entry: x86-64's (bits 12 to 51)
+/// or AArch64's (bits 12 to 47).
+fn ir_pte_mask(c: &Checker) -> u64 {
+  if c.arch == ARCH_AARCH64 {
+    return 281474976706560;
+  }
+  return 4503599627366400;
+}
+
+/// A call of the AArch64 kernel's runtime (`a64_kcall`) `which` on `w` and `x` (a zero where absent); the result.
+fn ir_kcall(f: &mut IrFn, which: u64, w: u64, x: u64) -> u64 {
+  let mut a = w;
+  let mut b = x;
+  if a == IR_NONE {
+    a = ir_k(&mut f, 0);
+  }
+  if b == IR_NONE {
+    b = ir_k(&mut f, 0);
+  }
+  let d = ir_reg(&mut f);
+  ir_emit(&mut f, IR_PCALL, d, a, b, which, 0);
+  return d;
+}
+
+/// The address of slot `ix` of the table at address register `t`.
+fn ir_slot_addr(f: &mut IrFn, t: u64, ix: u64) -> u64 {
+  let three = ir_k(&mut f, 3);
+  let off = ir_reg(&mut f);
+  ir_emit(&mut f, IR_SHL, off, ix, three, 0, 0);
+  let at = ir_reg(&mut f);
+  ir_emit(&mut f, IR_ADD, at, t, off, 0, 0);
+  return at;
+}
+
+/// A page table entry written with one 64-bit store-release: another
+/// processor may be walking the table (the C prelude's `__atomic_store_n`).
+fn ir_pte_release(f: &mut IrFn, t: u64, ix: u64, e: u64) {
+  let at = ir_slot_addr(&mut f, t, ix);
+  ir_emit(&mut f, IR_DEVW, IR_NONE, at, e, 8, 0);
 }
 
 /// The address of the 32-bit count of the page at address register `pg` in
@@ -734,27 +813,39 @@ fn ir_buf(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, k: u64) -
   return v;
 }
 
-/// The enum value built by variant node `i` of enum instance `x`.
-fn ir_variant(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, x: u64) -> IrVal {
+/// The enum value built by variant node `i` of enum instance `x`. For an
+/// enum the IR keeps in memory, `dest` (a place of that enum, or `ir_none()`
+/// for a frame slot of ours) is where it is built.
+fn ir_variant(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, x: u64, dest: IrVal) -> IrVal {
   let n = node_at(p.nodes, i);
   let t = intern(&mut m, p, TY_ENUM, x);
   let mw = ir_ms(c, m, p, t);
   if mw > 0 {
-    // An enum the IR keeps in memory: the tag, then the payload, in a frame
-    // slot of ours.
-    let slot = ir_reg(&mut f);
-    ir_emit(&mut f, IR_SLOT, slot, 0, 0, mw, 0);
-    let out = IrVal { k: IRK_PLACE, r0: slot, r1: 0, t: base_t(m, t) };
+    // An enum the IR keeps in memory: the tag, then the payload.
+    let mut out = dest;
+    if dest.k != IRK_PLACE {
+      let slot = ir_reg(&mut f);
+      ir_emit(&mut f, IR_SLOT, slot, 0, 0, mw, 0);
+      out = IrVal { k: IRK_PLACE, r0: slot, r1: 0, t: base_t(m, t) };
+    }
     let v = cg_variant(m, p, x, n.s2, n.e2);
+    let mut pv = ir_none();
+    if n.a != 0 {
+      // Read before anything is written: it may be part of `dest`.
+      pv = ir_vexpr(&mut f, c, &mut m, p, n.a);
+    }
     let tag = ir_reg(&mut f);
     ir_emit(&mut f, IR_CONST, tag, v, 0, 0, 0);
-    ir_hdr_store(&mut f, slot, 0, tag);
+    ir_hdr_store(&mut f, out.r0, out.r1, tag);
     if n.a != 0 {
-      let pv = ir_vexpr(&mut f, c, &mut m, p, n.a);
       let ft = fld_ty(c, x, v);
       if !f.failed && ft != 0 {
-        let dst = IrVal { k: IRK_PLACE, r0: slot, r1: 1, t: base_t(m, ft) };
-        ir_store_val(&mut f, c, m, p, dst, pv);
+        let dst = IrVal { k: IRK_PLACE, r0: out.r0, r1: wrap_add(out.r1, 1), t: base_t(m, ft) };
+        // A payload that already sits where it goes (a binding of the
+        // payload of the place being assigned) needs no copy.
+        if !(pv.k == IRK_PLACE && pv.r0 == dst.r0 && pv.r1 == dst.r1) {
+          ir_store_val(&mut f, c, m, p, dst, pv);
+        }
       }
     }
     return out;
@@ -784,6 +875,37 @@ fn ir_variant(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, x: u6
     }
   }
   return out;
+}
+
+/// Builds expression `i`, a variant of the enum of the place `dest`, in
+/// `dest` itself when that enum is kept in memory: no frame slot and no copy
+/// of the finished value. False (nothing emitted) for anything else.
+fn ir_variant_into(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, dest: IrVal) -> bool {
+  if dest.k != IRK_PLACE || ir_ms(c, m, p, dest.t) == 0 || kind_t(m, base_t(m, dest.t)) != TY_ENUM {
+    return false;
+  }
+  let n = node_at(p.nodes, i);
+  let mut x = 0;
+  let mut vn = i;
+  if n.kind == E_VARIANT {
+    let def = find_in(p, p.enums.head, i);
+    let dnode = node_at(p.nodes, def);
+    if def == 0 || dnode.v != 0 {
+      return false;
+    }
+    x = plain_inst(&mut m, def);
+  } else if n.kind == E_TAPP && kind_of(p, n.b) == E_VARIANT {
+    x = tapp_inst(&mut m, p, i, f.x);
+    vn = n.b;
+  }
+  if x == 0 {
+    return false;
+  }
+  if base_t(m, intern(&mut m, p, TY_ENUM, x)) != base_t(m, dest.t) {
+    return false;
+  }
+  ir_variant(&mut f, c, &mut m, p, vn, x, dest);
+  return true;
 }
 
 /// Writes the fields of struct literal `i` into the place `out` (a struct
@@ -871,6 +993,12 @@ fn ir_is_path(p: &Parser, e: u64, path: Node) -> bool {
 }
 
 /// Lowers expression `i`; returns the registers that hold its value.
+/// Whether an integer type fills the 64-bit register (no narrowing after an operation).
+fn ir_full_width(m: &Mono, t: u64) -> bool {
+  let k = kind_t(m, t);
+  return k != TY_U8 && k != TY_U16 && k != TY_U32 && k != TY_I8 && k != TY_I16 && k != TY_I32;
+}
+
 fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal {
   if f.failed {
     return ir_none();
@@ -912,7 +1040,16 @@ fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     if k == E_NEG {
       op = IR_NEG;
     }
-    ir_emit(&mut f, op, d, a, 0, 0, cg_int_op(c, f.x, i));
+    let nty = cg_int_op(c, f.x, i);
+    if op == IR_NOT && nty != 0 && ir_full_width(m, nty) {
+      // `!x` on a full-width integer is `x ^ all ones`, which the constant
+      // folder and the immediate forms of the backends understand.
+      let ones = ir_reg(&mut f);
+      ir_emit(&mut f, IR_CONST, ones, 0xFFFFFFFFFFFFFFFF, 0, 0, 0);
+      ir_emit(&mut f, IR_XOR, d, a, ones, 0, 0);
+      return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+    }
+    ir_emit(&mut f, op, d, a, 0, 0, nty);
     return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
   }
   if k == E_BIN && (n.v == P_ANDAND || n.v == P_OROR) {
@@ -1007,7 +1144,7 @@ fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       return ir_none();
     }
     let x = plain_inst(&mut m, def);
-    return ir_variant(&mut f, c, &mut m, p, i, x);
+    return ir_variant(&mut f, c, &mut m, p, i, x, ir_none());
   }
   if k == E_TAPP && kind_of(p, n.b) == E_CALL && !is_typed_builtin(p, n.b) {
     // `f[T](args)`: the instance the monomorphizer made.
@@ -1025,7 +1162,7 @@ fn ir_expr(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       ir_fail(&mut f, "a variant of a generic enum");
       return ir_none();
     }
-    return ir_variant(&mut f, c, &mut m, p, n.b, x);
+    return ir_variant(&mut f, c, &mut m, p, n.b, x, ir_none());
   }
   if k == E_IS {
     let e0 = ir_expr(&mut f, c, &mut m, p, n.a);
@@ -1482,6 +1619,21 @@ fn ir_hdr_load(f: &mut IrFn, a: u64, k: u64) -> u64 {
   return d;
 }
 
+/// `ir_hdr_load` of a word of the header of a Vec (see `IR_HDR`).
+fn ir_vhdr_load(f: &mut IrFn, a: u64, k: u64) -> u64 {
+  let kr = ir_reg(&mut f);
+  ir_emit(&mut f, IR_CONST, kr, k, 0, 0, 0);
+  let d = ir_reg(&mut f);
+  ir_emit(&mut f, IR_LOAD, d, a, kr, 8, IR_HDR);
+  return d;
+}
+
+fn ir_vhdr_store(f: &mut IrFn, a: u64, k: u64, v: u64) {
+  let kr = ir_reg(&mut f);
+  ir_emit(&mut f, IR_CONST, kr, k, 0, 0, 0);
+  ir_emit(&mut f, IR_STORE, v, a, kr, 8, IR_HDR);
+}
+
 fn ir_hdr_store(f: &mut IrFn, a: u64, k: u64, v: u64) {
   let kr = ir_reg(&mut f);
   ir_emit(&mut f, IR_CONST, kr, k, 0, 0, 0);
@@ -1501,7 +1653,7 @@ fn ir_vec_arg(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> Ir
 /// The place of element `ix` (a register) of the Vec `v`: its data address
 /// plus `ix` elements of `w` words.
 fn ir_vel(f: &mut IrFn, c: &Checker, m: &Mono, p: &Parser, v: IrVal, ix: u64, w: u64) -> IrVal {
-  let data = ir_hdr_load(&mut f, v.r0, 2);
+  let data = ir_vhdr_load(&mut f, v.r0, 2);
   let k = ir_reg(&mut f);
   ir_emit(&mut f, IR_CONST, k, wrap_mul(8, w), 0, 0, 0);
   let off = ir_reg(&mut f);
@@ -1943,7 +2095,7 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     if f.failed {
       return ir_none();
     }
-    return IrVal { k: IRK_INT, r0: ir_hdr_load(&mut f, v.r0, 0), r1: IR_NONE, t: 0 };
+    return IrVal { k: IRK_INT, r0: ir_vhdr_load(&mut f, v.r0, 0), r1: IR_NONE, t: 0 };
   }
   if name_is(p, i, "vec_get") || name_is(p, i, "vec_set") {
     let v = ir_vec_arg(&mut f, c, &mut m, p, n.a);
@@ -1957,7 +2109,7 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     }
     let setting = name_is(p, i, "vec_set");
     if ir_vsimple(c, m, p, v) {
-      let data = ir_hdr_load(&mut f, v.r0, 2);
+      let data = ir_vhdr_load(&mut f, v.r0, 2);
       if !setting {
         let d = ir_reg(&mut f);
         ir_emit(&mut f, IR_LOAD, d, data, ix, 8, 0);
@@ -1997,14 +2149,14 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     if f.failed {
       return ir_none();
     }
-    let len = ir_hdr_load(&mut f, v.r0, 0);
+    let len = ir_vhdr_load(&mut f, v.r0, 0);
     let one = ir_reg(&mut f);
     ir_emit(&mut f, IR_CONST, one, 1, 0, 0, 0);
     let len1 = ir_reg(&mut f);
     ir_emit(&mut f, IR_SUB, len1, len, one, 0, c.tu64);
-    ir_hdr_store(&mut f, v.r0, 0, len1);
+    ir_vhdr_store(&mut f, v.r0, 0, len1);
     if ir_vsimple(c, m, p, v) {
-      let data = ir_hdr_load(&mut f, v.r0, 2);
+      let data = ir_vhdr_load(&mut f, v.r0, 2);
       let d = ir_reg(&mut f);
       ir_emit(&mut f, IR_LOAD, d, data, len1, 8, 0);
       return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
@@ -2021,7 +2173,7 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       return ir_none();
     }
     if ir_vsimple(c, m, p, v) {
-      let data = ir_hdr_load(&mut f, v.r0, 2);
+      let data = ir_vhdr_load(&mut f, v.r0, 2);
       let d = ir_reg(&mut f);
       ir_emit(&mut f, IR_LOAD, d, data, ix, 8, 0);
       ir_emit(&mut f, IR_STORE, x.r0, data, ix, 8, 0);
@@ -2037,8 +2189,11 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       // the store overwrites it.
       prev = ir_own_place(&mut f, c, m, p, prev);
     }
+    // A `Vec` is read through its header in the element: copy that out too,
+    // or the store below would be read back as the old value.
+    prev = ir_own(&mut f, prev);
     ir_store_val(&mut f, c, m, p, el, x);
-    return ir_own(&mut f, prev);
+    return prev;
   }
   if name_is(p, i, "vec_push") || name_is(p, i, "vec_push_within") {
     let v = ir_vec_arg(&mut f, c, &mut m, p, n.a);
@@ -2047,8 +2202,8 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       return ir_none();
     }
     let w = ir_mw(c, m, p, ir_velem(v), 0);
-    let len = ir_hdr_load(&mut f, v.r0, 0);
-    let cap = ir_hdr_load(&mut f, v.r0, 1);
+    let len = ir_vhdr_load(&mut f, v.r0, 0);
+    let cap = ir_vhdr_load(&mut f, v.r0, 1);
     // `vec_push_within` is proved to have the room: no check, no growing.
     if name_is(p, i, "vec_push") {
       let full = ir_reg(&mut f);
@@ -2061,7 +2216,7 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       ir_place(&mut f, l_room);
     }
     if ir_vsimple(c, m, p, v) {
-      let data = ir_hdr_load(&mut f, v.r0, 2);
+      let data = ir_vhdr_load(&mut f, v.r0, 2);
       ir_emit(&mut f, IR_STORE, x.r0, data, len, 8, 0);
     } else {
       let el = ir_vel(&mut f, c, m, p, v, len, w);
@@ -2071,7 +2226,7 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     ir_emit(&mut f, IR_CONST, one, 1, 0, 0, 0);
     let len1 = ir_reg(&mut f);
     ir_emit(&mut f, IR_ADD, len1, len, one, 0, c.tu64);
-    ir_hdr_store(&mut f, v.r0, 0, len1);
+    ir_vhdr_store(&mut f, v.r0, 0, len1);
     return ir_none();
   }
   if name_is(p, i, "set") || name_is(p, i, "bset") {
@@ -2138,7 +2293,29 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let s = ir_int(&mut f, c, &mut m, p, a3);
     let cnt = ir_int(&mut f, c, &mut m, p, a4);
     if !f.failed {
+      if name_is(p, i, "bytes_to_dma") && c.arch == ARCH_AARCH64 {
+        ir_emit(&mut f, IR_FENCE, IR_NONE, 1, 0, 0, 0);
+      }
       ir_copy_bytes(&mut f, c, pg, o, src.r0, s, cnt);
+      if name_is(p, i, "bytes_to_dma") && c.arch == ARCH_AARCH64 {
+        ir_emit(&mut f, IR_FENCE, IR_NONE, 1, 0, 0, 0);
+      }
+    }
+    return ir_none();
+  }
+  if name_is(p, i, "frame_to_frame") {
+    // `frame_to_frame(&mut dst, d, &src, s, n)`: one `copy` between pages.
+    let a1 = next_of(p, n.a);
+    let a2 = next_of(p, a1);
+    let a3 = next_of(p, a2);
+    let a4 = next_of(p, a3);
+    let dst = ir_handle_arg(&mut f, c, &mut m, p, n.a);
+    let d = ir_int(&mut f, c, &mut m, p, a1);
+    let src = ir_handle_arg(&mut f, c, &mut m, p, a2);
+    let s = ir_int(&mut f, c, &mut m, p, a3);
+    let cnt = ir_int(&mut f, c, &mut m, p, a4);
+    if !f.failed {
+      ir_copy_bytes(&mut f, c, dst, d, src, s, cnt);
     }
     return ir_none();
   }
@@ -2154,10 +2331,21 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let o = ir_int(&mut f, c, &mut m, p, a3);
     let cnt = ir_int(&mut f, c, &mut m, p, a4);
     if !f.failed {
+      if name_is(p, i, "dma_to_bytes") && c.arch == ARCH_AARCH64 {
+        ir_emit(&mut f, IR_FENCE, IR_NONE, 1, 0, 0, 0);
+      }
       ir_copy_bytes(&mut f, c, dst.r0, d, pg, o, cnt);
+      if name_is(p, i, "dma_to_bytes") && c.arch == ARCH_AARCH64 {
+        ir_emit(&mut f, IR_FENCE, IR_NONE, 1, 0, 0, 0);
+      }
     }
     return ir_none();
   }
+  return ir_call_2(&mut f, c, &mut m, p, i);
+}
+
+fn ir_call_2(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal {
+  let n = node_at(p.nodes, i);
   if name_is(p, i, "bfrom") {
     // A copy of a string literal.
     let s = ir_buf(&mut f, c, &mut m, p, n.a, IRK_STR);
@@ -2355,13 +2543,29 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     return IrVal { k: IRK_INT, r0: ptr, r1: IR_NONE, t: intern(&mut m, p, kind, t0) };
   }
   if name_is(p, i, "atomic_end") {
-    let a = ir_handle_arg(&mut f, c, &mut m, p, n.a);
-    if f.failed || a == IR_NONE {
+    let mut hv = ir_expr(&mut f, c, &mut m, p, n.a);
+    if f.failed {
       return ir_none();
     }
+    if hv.k == IRK_PLACE {
+      hv = ir_rv(&mut f, c, m, p, hv);
+    }
+    if f.failed || hv.k != IRK_INT || hv.r0 == IR_NONE {
+      ir_fail(&mut f, "a page handle that is not one word");
+      return ir_none();
+    }
+    let a = hv.r0;
+    let mut et = 0;
+    if hv.t != 0 && hv.t != IR_NONE && kind_t(m, base_t(m, hv.t)) == TY_ATOMIC {
+      et = base_t(m, inner_t(m, base_t(m, hv.t)));
+    }
+    let zero = ir_k(&mut f, 0);
     let d = ir_reg(&mut f);
-    ir_emit(&mut f, IR_LOAD, d, a, 0, 8, 0);
+    ir_emit(&mut f, IR_LOAD, d, a, zero, 8, 0);
     ir_emit(&mut f, IR_FREE, IR_NONE, a, 0, 0, 0);
+    if et != 0 && ir_word_struct(c, m, p, et) {
+      return IrVal { k: IRK_STRUCT, r0: d, r1: 1, t: et };
+    }
     return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
   }
   if name_is(p, i, "lock_end") {
@@ -2387,6 +2591,11 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     }
     return out;
   }
+  return ir_call_3(&mut f, c, &mut m, p, i);
+}
+
+fn ir_call_3(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal {
+  let n = node_at(p.nodes, i);
   if name_is(p, i, "smp_run") {
     // `smp_run(f, args..)`: the shared arguments go one word each into a
     // block in the frame; the emitter writes the thunk that calls `f` with
@@ -2454,6 +2663,10 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     if f.failed {
       return ir_none();
     }
+    if c.arch == ARCH_AARCH64 {
+      ir_kcall(&mut f, 41, l, IR_NONE);
+      return ir_none();
+    }
     let kt = ir_reg(&mut f);
     ir_emit(&mut f, IR_RT, kt, l, 0, IRS_KERNEL_TABLE, 0);
     let at = ir_count_addr(&mut f, c, IRS_PT_LEASES, kt);
@@ -2509,6 +2722,21 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     }
     let addr = ir_reg(&mut f);
     ir_emit(&mut f, IR_ADD, addr, base, off, 0, 0);
+    if dk == 2 && c.target == TARGET_KERNEL && c.arch == ARCH_AARCH64 {
+      // Device memory above 512 GiB is mapped only in the kernel's tables: a
+      // user table this processor parked goes back before it is touched.
+      let l_settle = f.nlabel;
+      f.nlabel = wrap_add(f.nlabel, 1);
+      let l_done = f.nlabel;
+      f.nlabel = wrap_add(f.nlabel, 1);
+      let sh39 = ir_k(&mut f, 39);
+      let hi = ir_reg(&mut f);
+      ir_emit(&mut f, IR_SHR, hi, addr, sh39, 0, 0);
+      ir_emit(&mut f, IR_BR, IR_NONE, hi, l_settle, l_done, 0);
+      ir_emit(&mut f, IR_LABEL, IR_NONE, l_settle, 0, 0, 0);
+      ir_kcall(&mut f, 44, IR_NONE, IR_NONE);
+      ir_emit(&mut f, IR_LABEL, IR_NONE, l_done, 0, 0, 0);
+    }
     if dk == 1 && c.target == TARGET_KERNEL {
       if wr {
         ir_emit(&mut f, IR_POUT, IR_NONE, addr, val, dw, 0);
@@ -2612,6 +2840,11 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     ir_emit(&mut f, IR_ADD, pg, v.r1, off, 0, 0);
     return IrVal { k: IRK_INT, r0: pg, r1: IR_NONE, t: 0 };
   }
+  return ir_call_4(&mut f, c, &mut m, p, i);
+}
+
+fn ir_call_4(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal {
+  let n = node_at(p.nodes, i);
   if name_is(p, i, "pool_take") || name_is(p, i, "pt_new") {
     // A page is zeroed whenever it is handed out, so it never leaks what it
     // held before.
@@ -2645,13 +2878,27 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       let l_done = f.nlabel;
       f.nlabel = wrap_add(f.nlabel, 1);
       let four = ir_k(&mut f, 4);
-      let is4 = ir_reg(&mut f);
+      let mut is4 = ir_reg(&mut f);
       ir_emit(&mut f, IR_EQ, is4, lv, four, 0, 0);
+      let mut ksym = IRS_KERNEL_PML4;
+      if c.arch == ARCH_AARCH64 {
+        // Not on a platform that loads the user's table from a trampoline of
+        // its own (BST_DEFERRED): the weak symbol it defines is then non-zero.
+        let dv = ir_reg(&mut f);
+        ir_emit(&mut f, IR_GLOBAL, dv, IRS_DEFERRED, 0, 0, 0);
+        let zero = ir_k(&mut f, 0);
+        let nd = ir_reg(&mut f);
+        ir_emit(&mut f, IR_EQ, nd, dv, zero, 0, 0);
+        let both = ir_reg(&mut f);
+        ir_emit(&mut f, IR_AND, both, is4, nd, 0, 0);
+        is4 = both;
+        ksym = IRS_KERNEL_ROOT;
+      }
       ir_emit(&mut f, IR_BR, IR_NONE, is4, l_hook, l_done, 0);
       ir_emit(&mut f, IR_LABEL, IR_NONE, l_hook, 0, 0, 0);
       let gv = ir_reg(&mut f);
-      ir_emit(&mut f, IR_GLOBAL, gv, IRS_KERNEL_PML4, 0, 0, 0);
-      let mask = ir_k(&mut f, 4503599627366400);
+      ir_emit(&mut f, IR_GLOBAL, gv, ksym, 0, 0, 0);
+      let mask = ir_k(&mut f, ir_pte_mask(c));
       let hi = ir_reg(&mut f);
       ir_emit(&mut f, IR_AND, hi, gv, mask, 0, 0);
       let three = ir_k(&mut f, 3);
@@ -2705,22 +2952,45 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     // An atomic is the address of one word on the heap; every access is
     // sequentially consistent (`xchg` and `lock cmpxchg` are full barriers,
     // a plain load suffices).
-    let t = ir_atomic_ty(f, c, &mut m, p, n.a);
-    if t == 0 {
-      ir_fail(&mut f, "an atomic that is not a parameter holding an integer or bool");
-      return ir_none();
-    }
-    let at = ir_handle_arg(&mut f, c, &mut m, p, n.a);
+    let mut t = ir_atomic_ty(f, c, &mut m, p, n.a);
+    let declared = t != 0;
+    let mut hv = ir_expr(&mut f, c, &mut m, p, n.a);
     if f.failed {
       return ir_none();
     }
+    if hv.k == IRK_PLACE {
+      hv = ir_rv(&mut f, c, m, p, hv);
+    }
+    if f.failed || hv.k != IRK_INT {
+      ir_fail(&mut f, "a page handle that is not one word");
+      return ir_none();
+    }
+    let at = hv.r0;
+    if t == 0 && hv.t != 0 && hv.t != IR_NONE {
+      // Not a parameter: the type the handle was given where it was made.
+      let ht = base_t(m, hv.t);
+      if kind_t(m, ht) == TY_ATOMIC {
+        let it = base_t(m, inner_t(m, ht));
+        if is_int(m, it) || kind_t(m, it) == TY_BOOL || ir_word_struct(c, m, p, it) {
+          t = it;
+        }
+      }
+    }
+    if t == 0 {
+      ir_fail(&mut f, "an atomic that does not hold an integer, a bool or a one-word struct");
+      return ir_none();
+    }
+    let sw = ir_word_struct(c, m, p, t);
     if name_is(p, i, "atomic_load") {
       let zero = ir_k(&mut f, 0);
       let d = ir_reg(&mut f);
       ir_emit(&mut f, IR_LOAD, d, at, zero, 8, 0);
+      if sw {
+        return IrVal { k: IRK_STRUCT, r0: d, r1: 1, t: t };
+      }
       return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
     }
-    let v = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    let v = ir_atomic_arg(&mut f, c, &mut m, p, cg_arg(p, i, 1), sw);
     if f.failed {
       return ir_none();
     }
@@ -2730,10 +3000,13 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       if name_is(p, i, "atomic_store") {
         return ir_none();
       }
+      if sw {
+        return IrVal { k: IRK_STRUCT, r0: d, r1: 1, t: t };
+      }
       return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
     }
     if name_is(p, i, "atomic_cas") {
-      let nw = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 2));
+      let nw = ir_atomic_arg(&mut f, c, &mut m, p, cg_arg(p, i, 2), sw);
       if f.failed {
         return ir_none();
       }
@@ -2742,7 +3015,12 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
     }
     // wrap_add: a compare-and-swap loop, so the sum wraps at the width of
-    // the type.
+    // the type. The width is only known for a parameter, where the type is
+    // written down: an atomic made here records its contents as a u64.
+    if !declared || sw {
+      ir_fail(&mut f, "an atomic_wrap_add on an atomic that is not a parameter");
+      return ir_none();
+    }
     let l_again = ir_label(&mut f);
     let l_done = ir_label(&mut f);
     let prev = ir_reg(&mut f);
@@ -2867,6 +3145,11 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     }
     return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
   }
+  return ir_call_5(&mut f, c, &mut m, p, i);
+}
+
+fn ir_call_5(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal {
+  let n = node_at(p.nodes, i);
   if name_is(p, i, "shared_new") || name_is(p, i, "shared_dup") || name_is(p, i, "pt_dup_shared") {
     // A shared page has a 32-bit reference count per page number: a new one
     // starts at one, a copy adds one atomically. `pt_dup_shared` copies the
@@ -2880,7 +3163,7 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
       }
       let e = ir_reg(&mut f);
       ir_emit(&mut f, IR_LOAD, e, t, ix, 8, 0);
-      let mask = ir_k(&mut f, 4503599627366400);
+      let mask = ir_k(&mut f, ir_pte_mask(c));
       pg = ir_reg(&mut f);
       ir_emit(&mut f, IR_AND, pg, e, mask, 0, 0);
     } else {
@@ -2976,7 +3259,25 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     if f.failed {
       return ir_none();
     }
+    if c.arch == ARCH_AARCH64 {
+      // The platform may release the table's address-space number.
+      let r = ir_kcall(&mut f, 46, t, IR_NONE);
+      return IrVal { k: IRK_INT, r0: r, r1: IR_NONE, t: 0 };
+    }
     return IrVal { k: IRK_INT, r0: t, r1: IR_NONE, t: 0 };
+  }
+  if name_is(p, i, "mmu_kernel") {
+    // The kernel's own tables, a parked user table given back first.
+    if c.target != TARGET_KERNEL || c.arch != ARCH_AARCH64 {
+      ir_fail(&mut f, "an mmu_kernel outside the AArch64 kernel");
+      return ir_none();
+    }
+    let mm = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 0));
+    if f.failed {
+      return ir_none();
+    }
+    ir_kcall(&mut f, 42, IR_NONE, IR_NONE);
+    return ir_none();
   }
   if name_is(p, i, "mmu_enter") {
     // Counts the lease before the table can be in use (`lockinc` is a full
@@ -2989,6 +3290,10 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let t = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
     if f.failed {
       return ir_none();
+    }
+    if c.arch == ARCH_AARCH64 {
+      let l = ir_kcall(&mut f, 40, t, IR_NONE);
+      return IrVal { k: IRK_INT, r0: l, r1: IR_NONE, t: 0 };
     }
     let at = ir_count_addr(&mut f, c, IRS_PT_LEASES, t);
     ir_emit(&mut f, IR_LOCKINC, IR_NONE, at, 0, 0, 0);
@@ -3003,6 +3308,10 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     if f.failed {
       return ir_none();
     }
+    if c.arch == ARCH_AARCH64 {
+      // A lease this processor parked is given back first.
+      ir_kcall(&mut f, 45, t, IR_NONE);
+    }
     let at = ir_count_addr(&mut f, c, IRS_PT_LEASES, t);
     let d = ir_reg(&mut f);
     ir_emit(&mut f, IR_DEVR, d, at, 0, 4, 0);
@@ -3016,7 +3325,31 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let e = ir_reg(&mut f);
     ir_emit(&mut f, IR_LOAD, e, t, ix, 8, 0);
     let d = ir_reg(&mut f);
-    if name_is(p, i, "pt_has") {
+    if c.arch == ARCH_AARCH64 {
+      // Bit 0 is valid, bit 7 read-only (AP[2]), bit 55 the software bit that
+      // marks a hidden entry that is still owned.
+      let one = ir_reg(&mut f);
+      ir_emit(&mut f, IR_CONST, one, 1, 0, 0, 0);
+      if name_is(p, i, "pt_has") {
+        let k = ir_reg(&mut f);
+        ir_emit(&mut f, IR_CONST, k, 36028797018963969, 0, 0, 0);
+        let a = ir_reg(&mut f);
+        ir_emit(&mut f, IR_AND, a, e, k, 0, 0);
+        let z = ir_reg(&mut f);
+        ir_emit(&mut f, IR_CONST, z, 0, 0, 0, 0);
+        ir_emit(&mut f, IR_NE, d, a, z, 0, 0);
+      } else if name_is(p, i, "pt_writable") {
+        let seven = ir_reg(&mut f);
+        ir_emit(&mut f, IR_CONST, seven, 7, 0, 0, 0);
+        let a = ir_reg(&mut f);
+        ir_emit(&mut f, IR_SHR, a, e, seven, 0, 0);
+        let b = ir_reg(&mut f);
+        ir_emit(&mut f, IR_AND, b, a, one, 0, 0);
+        ir_emit(&mut f, IR_XOR, d, b, one, 0, 0);
+      } else {
+        ir_emit(&mut f, IR_AND, d, e, one, 0, 0);
+      }
+    } else if name_is(p, i, "pt_has") {
       let k = ir_reg(&mut f);
       ir_emit(&mut f, IR_CONST, k, 1025, 0, 0, 0);
       let a = ir_reg(&mut f);
@@ -3037,6 +3370,11 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     }
     return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
   }
+  return ir_call_6(&mut f, c, &mut m, p, i);
+}
+
+fn ir_call_6(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal {
+  let n = node_at(p.nodes, i);
   if name_is(p, i, "pt_put") || name_is(p, i, "pt_put_frame") || name_is(p, i, "pt_put_shared") {
     // A slot: the page's address with the flag bits (1 present, 2 writable,
     // 4 user, 0x200 shared). `pt_put` maps a writable user page.
@@ -3044,6 +3382,41 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let ix = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
     let fr = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 2));
     let mut e = fr;
+    if c.arch == ARCH_AARCH64 {
+      // A table entry is valid and of type table; a last-level entry is a
+      // page with the access flag set, read-only (RO) or never executable at
+      // EL0 when writable (UXN, W^X), and is cleaned for the instruction
+      // cache first.
+      if name_is(p, i, "pt_put") {
+        let k = ir_k(&mut f, 3);
+        e = ir_reg(&mut f);
+        ir_emit(&mut f, IR_OR, e, fr, k, 0, 0);
+      } else {
+        let w = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 3));
+        let page = ir_reg(&mut f);
+        ir_emit(&mut f, IR_RT, page, fr, 0, IRS_SYNC_ICACHE, 0);
+        let zero = ir_k(&mut f, 0);
+        let wm = ir_reg(&mut f);
+        ir_emit(&mut f, IR_SUB, wm, zero, w, 0, 0);
+        let diff = ir_k(&mut f, 18014398509482112);
+        let sel = ir_reg(&mut f);
+        ir_emit(&mut f, IR_AND, sel, wm, diff, 0, 0);
+        let ro = ir_k(&mut f, 128);
+        let wx = ir_reg(&mut f);
+        ir_emit(&mut f, IR_XOR, wx, sel, ro, 0, 0);
+        let mut bits = 9007199254744899;
+        if name_is(p, i, "pt_put_shared") {
+          bits = 81064793292672835;
+        }
+        let k = ir_k(&mut f, bits);
+        let o1 = ir_reg(&mut f);
+        ir_emit(&mut f, IR_OR, o1, page, k, 0, 0);
+        e = ir_reg(&mut f);
+        ir_emit(&mut f, IR_OR, e, o1, wx, 0, 0);
+      }
+      ir_pte_release(&mut f, t, ix, e);
+      return ir_none();
+    }
     if name_is(p, i, "pt_put") {
       let k = ir_k(&mut f, 7);
       e = ir_reg(&mut f);
@@ -3074,7 +3447,16 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     ir_emit(&mut f, IR_LOAD, e, t, ix, 8, 0);
     let z = ir_k(&mut f, 0);
     ir_emit(&mut f, IR_STORE, z, t, ix, 8, 0);
-    let mask = ir_k(&mut f, 4503599627366400);
+    if c.arch == ARCH_AARCH64 || c.target == TARGET_KERNEL {
+      // A taken entry may still be cached by another processor's TLB: the
+      // count of takes moves, and a processor flushes before it next runs
+      // user code if it moved since its last flush (x86-64: boot/boot.S,
+      // bst_cpu_enter, through the symbol bst_pt_gen).
+      let gen = ir_reg(&mut f);
+      ir_emit(&mut f, IR_GLOBAL, gen, IRS_PT_GEN, 0, 1, 0);
+      ir_emit(&mut f, IR_LOCKINC, IR_NONE, gen, 0, 0, 0);
+    }
+    let mask = ir_k(&mut f, ir_pte_mask(c));
     let d = ir_reg(&mut f);
     ir_emit(&mut f, IR_AND, d, e, mask, 0, 0);
     return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
@@ -3087,6 +3469,48 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let acc = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 2));
     let e = ir_reg(&mut f);
     ir_emit(&mut f, IR_LOAD, e, t, ix, 8, 0);
+    if c.arch == ARCH_AARCH64 {
+      // Clears valid, read-only and hidden (bit 55), then sets hidden and
+      // read-only for 0, valid and read-only for 1, valid for 2.
+      let keep = ir_k(&mut f, 18410715276690587518);
+      let base = ir_reg(&mut f);
+      ir_emit(&mut f, IR_AND, base, e, keep, 0, 0);
+      let zero = ir_k(&mut f, 0);
+      let two = ir_k(&mut f, 2);
+      let one = ir_k(&mut f, 1);
+      let isz = ir_reg(&mut f);
+      ir_emit(&mut f, IR_EQ, isz, acc, zero, 0, 0);
+      let is2 = ir_reg(&mut f);
+      ir_emit(&mut f, IR_EQ, is2, acc, two, 0, 0);
+      let zm = ir_reg(&mut f);
+      ir_emit(&mut f, IR_SUB, zm, zero, isz, 0, 0);
+      let ones = ir_k(&mut f, 18446744073709551615);
+      let nzm = ir_reg(&mut f);
+      ir_emit(&mut f, IR_XOR, nzm, zm, ones, 0, 0);
+      let not2 = ir_reg(&mut f);
+      ir_emit(&mut f, IR_SUB, not2, one, is2, 0, 0);
+      let seven = ir_k(&mut f, 7);
+      let ro = ir_reg(&mut f);
+      ir_emit(&mut f, IR_SHL, ro, not2, seven, 0, 0);
+      let nzv = ir_reg(&mut f);
+      ir_emit(&mut f, IR_OR, nzv, ro, one, 0, 0);
+      let hid = ir_k(&mut f, 36028797018964096);
+      let zbits = ir_reg(&mut f);
+      ir_emit(&mut f, IR_AND, zbits, zm, hid, 0, 0);
+      let ro128 = ir_k(&mut f, 128);
+      let zro = ir_reg(&mut f);
+      ir_emit(&mut f, IR_AND, zro, zm, ro128, 0, 0);
+      let nzbits = ir_reg(&mut f);
+      ir_emit(&mut f, IR_AND, nzbits, nzm, nzv, 0, 0);
+      let b1 = ir_reg(&mut f);
+      ir_emit(&mut f, IR_OR, b1, zbits, zro, 0, 0);
+      let b2 = ir_reg(&mut f);
+      ir_emit(&mut f, IR_OR, b2, b1, nzbits, 0, 0);
+      let out = ir_reg(&mut f);
+      ir_emit(&mut f, IR_OR, out, base, b2, 0, 0);
+      ir_pte_release(&mut f, t, ix, out);
+      return ir_none();
+    }
     let keep = ir_k(&mut f, 18446744073709550588);
     let base = ir_reg(&mut f);
     ir_emit(&mut f, IR_AND, base, e, keep, 0, 0);
@@ -3110,6 +3534,12 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let out = ir_reg(&mut f);
     ir_emit(&mut f, IR_OR, out, base, bits, 0, 0);
     ir_emit(&mut f, IR_STORE, out, t, ix, 8, 0);
+    if c.target == TARGET_KERNEL {
+      // A protection change may leave a stale translation too.
+      let gen = ir_reg(&mut f);
+      ir_emit(&mut f, IR_GLOBAL, gen, IRS_PT_GEN, 0, 1, 0);
+      ir_emit(&mut f, IR_LOCKINC, IR_NONE, gen, 0, 0, 0);
+    }
     return ir_none();
   }
   if name_is(p, i, "pt_shared") {
@@ -3118,7 +3548,11 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let ix = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
     let e = ir_reg(&mut f);
     ir_emit(&mut f, IR_LOAD, e, t, ix, 8, 0);
-    let nine = ir_k(&mut f, 9);
+    let mut bitno = 9;
+    if c.arch == ARCH_AARCH64 {
+      bitno = 56;
+    }
+    let nine = ir_k(&mut f, bitno);
     let sh = ir_reg(&mut f);
     ir_emit(&mut f, IR_SHR, sh, e, nine, 0, 0);
     let one = ir_k(&mut f, 1);
@@ -3164,7 +3598,7 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let e = ir_reg(&mut f);
     ir_emit(&mut f, IR_LOAD, e, t, ix, 8, 0);
     let mask = ir_reg(&mut f);
-    ir_emit(&mut f, IR_CONST, mask, 4503599627366400, 0, 0, 0);
+    ir_emit(&mut f, IR_CONST, mask, ir_pte_mask(c), 0, 0, 0);
     let child = ir_reg(&mut f);
     ir_emit(&mut f, IR_AND, child, e, mask, 0, 0);
     let callee = plain_inst(&mut m, def);
@@ -3177,6 +3611,22 @@ fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal
     let b = ir_int(&mut f, c, &mut m, p, a1);
     ir_emit(&mut f, IR_PUTC, IR_NONE, b, 0, 0, 0);
     return ir_none();
+  }
+  if name_is(p, i, "serial_poll") && c.target == TARGET_KERNEL && c.arch == ARCH_AARCH64 {
+    let d = ir_reg(&mut f);
+    let z = ir_k(&mut f, 0);
+    ir_emit(&mut f, IR_RT, d, z, 0, IRS_SERIAL_POLL, 0);
+    return IrVal { k: IRK_INT, r0: d, r1: IR_NONE, t: 0 };
+  }
+  if name_is(p, i, "boot_fb") && c.target == TARGET_KERNEL && c.arch == ARCH_AARCH64 {
+    // No framebuffer on AArch64 yet: every field is 0.
+    let h = ir_handle_arg(&mut f, c, &mut m, p, cg_arg(p, i, 0));
+    let fld = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
+    if f.failed || h == IR_NONE {
+      return ir_none();
+    }
+    let zero = ir_k(&mut f, 0);
+    return IrVal { k: IRK_INT, r0: zero, r1: IR_NONE, t: 0 };
   }
   if name_is(p, i, "serial_read") {
     let d = ir_reg(&mut f);
@@ -4093,6 +4543,9 @@ fn ir_stmt(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) {
       }
       return;
     }
+    if target.k == IRK_PLACE && ir_variant_into(&mut f, c, &mut m, p, n.b, target) {
+      return;
+    }
     let v = ir_own(&mut f, ir_vexpr(&mut f, c, &mut m, p, n.b));
     if !f.failed {
       if target.k == IRK_PLACE {
@@ -4324,6 +4777,19 @@ fn ir_trim(f: &mut IrFn) {
 /// Lowers function instance `x`: parameters, then the body, and a `return`
 /// at the end for a body that falls off it. `f.failed` says whether the
 /// function is outside the subset.
+/// Does the `requires` clause `e` say that the variable `s..en` is not zero:
+/// `k > 0`, `k >= 1`, `k != 0`, or one of them in a conjunction?
+fn ir_req_nz(p: &Parser, e: u64, s: u64, en: u64) -> bool {
+  if e == 0 {
+    return false;
+  }
+  let x = node_at(p.nodes, e);
+  if x.kind == E_BIN && x.v == P_ANDAND {
+    return ir_req_nz(p, x.a, s, en) || ir_req_nz(p, x.b, s, en);
+  }
+  return ir_is_var_op_int(p, e, s, en, P_GT, 0) || ir_is_var_op_int(p, e, s, en, P_GE, 1) || ir_is_var_op_int(p, e, s, en, P_NE, 0);
+}
+
 fn ir_lower(c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> IrFn {
   let mut f = ir_new(x);
   let xi = inst_at(m, x);
@@ -4415,6 +4881,16 @@ fn ir_lower(c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> IrFn {
         if r.r1 != IR_NONE {
           vec_push(&mut f.params, r.r1);
         }
+        if pk == IRK_INT && kind_t(m, pt) != TY_MUTREF && qn.v == 0 {
+          let mut rq = dn.c;
+          while rq != 0 {
+            let rn = node_at(p.nodes, rq);
+            if ir_req_nz(p, rq, qn.s, qn.e) {
+              vec_push(&mut f.nz, r.r0);
+            }
+            rq = rn.next;
+          }
+        }
       }
       ir_bind(&mut f, qn.s, qn.e, r);
     }
@@ -4479,6 +4955,11 @@ fn ir_sym(i: u64) -> Str {
   if i == IRS_SHARED_REFS { return "bst_rt_shared_refs"; }
   if i == IRS_USER_TABLE { return "bst_rt_user_table"; }
   if i == IRS_KERNEL_TABLE { return "bst_rt_kernel_table"; }
+  if i == IRS_SYNC_ICACHE { return "bst_rt_sync_icache"; }
+  if i == IRS_PT_GEN { return "bst_rt_pt_gen"; }
+  if i == IRS_KERNEL_ROOT { return "bst_kernel_root"; }
+  if i == IRS_SERIAL_POLL { return "bst_rt_serial_poll"; }
+  if i == IRS_DEFERRED { return "bst_rt_deferred_ptr"; }
   return "bst_kernel_pml4";
 }
 
@@ -4740,6 +5221,9 @@ fn ir_print(out: &mut Vec[u64], f: &IrFn, m: &Mono, p: &Parser) {
       ir_w_reg(&mut out, q.a);
     } else if q.op == IR_FENCE {
       w_s(&mut out, "fence");
+      if q.a == 1 {
+        w_s(&mut out, " dma");
+      }
     } else if q.op == IR_DEVR || q.op == IR_PIN {
       ir_w_reg(&mut out, q.d);
       if q.op == IR_DEVR {

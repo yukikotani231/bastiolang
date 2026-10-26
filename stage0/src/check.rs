@@ -98,6 +98,7 @@ fn builtin_table() -> Vec<(&'static str, Avail, Vec<Type>, Type)> {
         ("frame_write8", Avail::Mem, vec![m(Frame), U64, U8], Unit),
         ("frame_to_bytes", Avail::Mem, vec![m(Bytes), U64, r(Frame), U64, U64], Unit),
         ("bytes_to_frame", Avail::Mem, vec![m(Frame), U64, r(Bytes), U64, U64], Unit),
+        ("frame_to_frame", Avail::Mem, vec![m(Frame), U64, r(Frame), U64, U64], Unit),
         ("pt_new", Avail::Mem, vec![Frame, U64], PageTable),
         ("pt_free", Avail::Mem, vec![PageTable], Frame),
         ("pt_free_root", Avail::Kernel, vec![r(Mmu), PageTable], Frame),
@@ -753,7 +754,8 @@ fn check_fn(f: &mut FnDef, sigs: &HashMap<String, Sig>, specs: &[SpecFn], target
     let diverges = cx.block(&mut f.body)?;
     if !diverges {
         if f.ret != Type::Unit {
-            return Err(Diag::new("E-TYPE", f.pos, format!("function `{}` can reach its end without returning a {}", f.name, f.ret.name())));
+            return Err(Diag::new("E-TYPE", f.pos, format!("function `{}` can reach its end without returning a {}", f.name, f.ret.name()))
+                .note("every path through the function must end in a `return`: add one at the end, or make each branch of the `if` return"));
         }
         cx.leak_check_all(f.pos, "at the end of the function")?;
     }
@@ -771,7 +773,12 @@ fn lit_fits(v: i128, t: &Type, pos: Pos) -> Result<(), Diag> {
 
 fn expect_ty(got: &Type, want: &Type, pos: Pos, what: &str) -> Result<(), Diag> {
     if got != want {
-        return Err(Diag::new("E-TYPE", pos, format!("{} must be {}, found {}", what, want.name(), got.name())));
+        let d = Diag::new("E-TYPE", pos, format!("{} must be {}, found {}", what, want.name(), got.name()));
+        return Err(if got.is_int() && want.is_int() {
+            d.note(format!("integer types never convert on their own: write `cast[{0}](..)` if the value is proved to fit, or `wrap[{0}](..)` to keep the low bits", want.name()))
+        } else {
+            d
+        });
     }
     Ok(())
 }
@@ -1052,7 +1059,8 @@ impl<'a> Ctx<'a> {
                         let ct = self.canon();
                         if ct != ce {
                             let diff: Vec<_> = ct.symmetric_difference(&ce).cloned().collect();
-                            return Err(Diag::new("E-LINEAR-BRANCH", pos, format!("`{}` is consumed in only one branch of this `if`", diff.join("`, `"))));
+                            return Err(Diag::new("E-LINEAR-BRANCH", pos, format!("`{}` is consumed in only one branch of this `if`", diff.join("`, `")))
+                            .note("a linear value must be consumed in both branches or in neither: consume it in the other branch too, or before the `if`"));
                         }
                         self.moved = after_then.union(&after_else).cloned().collect();
                         Ok(false)
@@ -1091,7 +1099,13 @@ impl<'a> Ctx<'a> {
                     Some(e) => self.expr_as(e, &ret)?,
                     None => Type::Unit,
                 };
-                expect_ty(&t, &ret, pos, "the returned value")?;
+                expect_ty(&t, &ret, pos, "the returned value").map_err(|d| {
+                    if ret == Type::Unit {
+                        d.note(format!("the function has no return type: add `-> {}` after its parameters to return a value", t.name()))
+                    } else {
+                        d
+                    }
+                })?;
                 self.leak_check_all(pos, "at this `return`")?;
                 Ok(true)
             }
@@ -1159,7 +1173,8 @@ impl<'a> Ctx<'a> {
                     }
                     let k = d.index(v).ok_or_else(|| Diag::new("E-TYPE", a.pos, format!("`{}` has no variant `{}`", en, v)))?;
                     if covered.contains(&k) {
-                        return Err(Diag::new("E-MATCH", a.pos, format!("`{}::{}` is matched twice", en, v)));
+                        return Err(Diag::new("E-MATCH", a.pos, format!("`{}::{}` is matched twice", en, v))
+                            .note("an earlier arm already handles this variant: remove the repeated arm"));
                     }
                     covered.push(k);
                     match (&d.variants[k].1, b) {
@@ -1682,7 +1697,9 @@ impl<'a> Ctx<'a> {
             self.calls.push(name.to_string());
         }
         if sig.params.len() != args.len() {
-            return Err(Diag::new("E-TYPE", pos, format!("`{}` takes {} argument(s), {} given", name, sig.params.len(), args.len())));
+            let types: Vec<String> = sig.params.iter().map(|t| t.name()).collect();
+            return Err(Diag::new("E-TYPE", pos, format!("`{}` takes {} argument(s), {} given", name, sig.params.len(), args.len()))
+                .note(format!("the parameter types are ({})", types.join(", "))));
         }
         // Scalars first, then borrows, then moves: a scalar argument may
         // read a value that a later argument consumes (`set(b, i, get(b, j))`).

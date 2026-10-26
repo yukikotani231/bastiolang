@@ -1,0 +1,105 @@
+// expect-exit: 0
+// expect-stdout: 492
+// expect-stdout: 2040
+// expect-stdout: 92
+// expect-stdout: 140
+// A shift by a count held in a register copies the count to %cl; in a loop
+// that does nothing else with %rcx the copy is made once in front of the
+// loop. The loops that must keep it: one whose count register changes, one
+// with two counts, and one that calls a function.
+fn digits(src: &Buf, sh: u64, mut cnt: Buf, n: u64) -> Buf
+  requires len(src) == 8 && len(cnt) == 16 && sh <= 28 && n <= 8
+  ensures len(result) == 16
+{
+  let mut i = 0;
+  while i < n
+    invariant i <= n && n <= 8 && len(src) == 8 && len(cnt) == 16
+  {
+    let d = get(src, i) >> sh & 15;
+    cnt = set(cnt, d, wrap_add(get(cnt, d), 1));
+    i = i + 1;
+  }
+  return cnt;
+}
+
+fn changing(x: u64, n: u64) -> u64
+  requires n <= 64
+{
+  let mut s = 0;
+  let mut acc = 0;
+  while s < n
+    invariant s <= n && n <= 64
+  {
+    acc = wrap_add(acc, x >> s & 255);
+    s = s + 1;
+  }
+  return acc;
+}
+
+fn two(x: u64, a: u64, b: u64, n: u64) -> u64
+  requires a <= 8 && b <= 8
+{
+  let mut i = 0;
+  let mut acc = 0;
+  while i < n
+    invariant i <= n
+  {
+    acc = wrap_add(acc, (x >> a) & 15);
+    acc = wrap_add(acc, (x >> b) & 15);
+    i = i + 1;
+  }
+  return acc;
+}
+
+fn id(x: u64) -> u64 {
+  return x;
+}
+
+fn calls(x: u64, sh: u64, n: u64) -> u64
+  requires sh <= 8
+{
+  let mut i = 0;
+  let mut acc = 0;
+  while i < n
+    invariant i <= n
+  {
+    acc = wrap_add(acc, id(wrap_add(x, i)) >> sh & 255);
+    i = i + 1;
+  }
+  return acc;
+}
+
+fn main() -> u64 {
+  let mut src = alloc(8);
+  let mut i = 0;
+  while i < 8
+    invariant i <= 8 && len(src) == 8
+  {
+    src = set(src, i, wrap_mul(i + 1, 305419896));
+    i = i + 1;
+  }
+  let mut cnt = alloc(16);
+  i = 0;
+  while i < 16
+    invariant i <= 16 && len(cnt) == 16
+  {
+    cnt = set(cnt, i, 0);
+    i = i + 1;
+  }
+  cnt = digits(src, 8, cnt, 8);
+  let mut weighted = 0;
+  i = 0;
+  while i < 16
+    invariant i <= 16 && len(cnt) == 16
+  {
+    weighted = wrap_add(weighted, wrap_mul(get(cnt, i), i * i + 1));
+    i = i + 1;
+  }
+  print(weighted);
+  print(changing(4294967295, 8));
+  print(two(43981, 4, 8, 4));
+  print(calls(4660, 4, 4));
+  free(src);
+  free(cnt);
+  return 0;
+}

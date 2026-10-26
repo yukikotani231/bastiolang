@@ -1,0 +1,551 @@
+// A linker and writer of Windows executables (PE32+, x86-64, console) for
+// the assembly `asmobj.bastio` assembles: the whole program is one object, so
+// linking means giving each section an address, resolving every relocation
+// against it, and turning the symbols the object does not define into
+// imports from `msvcrt.dll` (the C library) and `kernel32.dll` (a name that
+// starts with a capital letter).
+//
+// The image has no relocation table and a fixed base, so the program is
+// always loaded where it was linked. Each import gets a six-byte
+// `jmp *slot(%rip)` thunk in `.text` (a call to the C library is a call to the
+// thunk) and a slot in the import address table that the loader fills in.
+//
+// Part of the trusted base once the Windows build uses it instead of the
+// MinGW-w64 linker.
+import "asmobj.bastio";
+import "loader.bastio";
+
+const PE_BASE: u64 = 5368709120;
+const PE_SECALIGN: u64 = 4096;
+const PE_FILEALIGN: u64 = 512;
+const PE_HEADERS: u64 = 1024;
+
+fn pe_align(x: u64, a: u64) -> u64 {
+  let m = wrap_sub(a, 1);
+  return wrap_add(x, m) & (18446744073709551615 - m);
+}
+
+/// The symbol called `name`, or AS_NONE.
+fn pe_find(g: &AsObj, name: Str) -> u64 {
+  let n = ao_nsyms(g);
+  let mut id = 0;
+  while id < n {
+    if ao_sym(g, id, 1) == slen(name) {
+      let ns = ao_sym(g, id, 0);
+      let mut same = true;
+      let mut k = 0;
+      while k < slen(name) && same {
+        if u_at(g.names, wrap_add(ns, k)) != cast[u64](sget(name, k)) {
+          same = false;
+        }
+        k = wrap_add(k, 1);
+      }
+      if same {
+        return id;
+      }
+    }
+    id = wrap_add(id, 1);
+  }
+  return AS_NONE;
+}
+
+/// The library that provides the undefined symbol `id`: 1 for kernel32 (a
+/// capital first letter), 0 for the C library.
+fn pe_dll(g: &AsObj, id: u64) -> u64 {
+  let c = u_at(g.names, ao_sym(g, id, 0));
+  if c >= 65 && c <= 90 {
+    return 1;
+  }
+  return 0;
+}
+
+fn pe_put(out: &mut Vec[u64], s: Str) {
+  let mut k = 0;
+  while k < slen(s) {
+    as_byte(&mut out, cast[u64](sget(s, k)));
+    k = wrap_add(k, 1);
+  }
+}
+
+fn pe_pad_to(out: &mut Vec[u64], n: u64) {
+  while vec_len(out) < n {
+    as_byte(&mut out, 0);
+  }
+}
+
+fn pe_patch(out: &mut Vec[u64], at: u64, x: u64, n: u64) {
+  let mut k = 0;
+  while k < n && k < 8 {
+    ao_set(&mut out, wrap_add(at, k), (x >> (k * 8)) & 255);
+    k = wrap_add(k, 1);
+  }
+}
+
+/// The text of the program's entry point, which asks the C library for
+/// `argc` and `argv`, calls `main` the way the generated assembly expects and
+/// leaves through `exit` (which flushes the C library's buffers).
+fn pe_entry() -> Str {
+  return "\t.text\n\t.globl mainCRTStartup\nmainCRTStartup:\n\tsub $72, %rsp\n\tmov $1, %ecx\n\tmovl $0, 40(%rsp)\n\tcall __set_app_type\n\tlea 48(%rsp), %rcx\n\tlea 56(%rsp), %rdx\n\tlea 64(%rsp), %r8\n\txor %r9d, %r9d\n\tlea 40(%rsp), %rax\n\tmov %rax, 32(%rsp)\n\tcall __getmainargs\n\tmov 48(%rsp), %ecx\n\tmov 56(%rsp), %rdx\n\tcall main\n\tmov %eax, %ecx\n\tcall exit\n\tud2\n";
+}
+
+/// Links the assembled program `g` (laid out by `ao_layout`) into a Windows
+/// executable; the bytes of the file, or an empty vector when something is
+/// undefined that cannot be an import.
+fn pe_link(g: &mut AsObj) -> Vec[u64] {
+  let mut rel = vec_new[u64]();
+  let mut text = ao_emit(g, AB_TEXT, &mut rel);
+  let mut ro = ao_emit(g, AB_RODATA, &mut rel);
+  let mut data = ao_emit(g, AB_DATA, &mut rel);
+  let bss0 = ao_sec_size(g, AB_BSS);
+  // common symbols get their room at the end of .bss
+  let nsym = ao_nsyms(g);
+  let mut bss = pe_align(bss0, 16);
+  let mut cs = 0;
+  let mut comm = vec_new[u64]();
+  while cs < nsym {
+    if (ao_sym(g, cs, 4) & 2) != 0 {
+      vec_push(&mut comm, cs);
+      vec_push(&mut comm, bss);
+      bss = pe_align(wrap_add(bss, ao_sym(g, cs, 5)), 16);
+    }
+    cs = wrap_add(cs, 1);
+  }
+  // the imports: the undefined symbols the relocations name, the C library's
+  // first, then kernel32's
+  let mut imports = vec_new[u64]();
+  let mut dll = 0;
+  while dll < 2 {
+    let mut r = 0;
+    while wrap_add(r, 5) <= vec_len(rel) {
+      let sym = u_at(rel, wrap_add(r, 3));
+      if ao_sym(g, sym, 2) == AS_NONE && (ao_sym(g, sym, 4) & 2) == 0 && pe_dll(g, sym) == dll && !has_id(imports, sym) {
+        vec_push(&mut imports, sym);
+      }
+      r = wrap_add(r, 5);
+    }
+    dll = wrap_add(dll, 1);
+  }
+  let nimp = vec_len(imports);
+  // .text: the program, then a thunk of eight bytes for each import
+  let tstart = pe_align(vec_len(text), 16);
+  let ttotal = wrap_add(tstart, wrap_mul(nimp, 8));
+  let text_rva = PE_SECALIGN;
+  // .rdata: the read-only data, then the import tables
+  let rdata_rva = wrap_add(text_rva, pe_align(ttotal, PE_SECALIGN));
+  let idt = pe_align(vec_len(ro), 8);
+  let mut ncmsvcrt = 0;
+  let mut k = 0;
+  while k < nimp {
+    if pe_dll(g, u_at(imports, k)) == 0 {
+      ncmsvcrt = wrap_add(ncmsvcrt, 1);
+    }
+    k = wrap_add(k, 1);
+  }
+  let nckernel = wrap_sub(nimp, ncmsvcrt);
+  let mut ndll = 0;
+  if ncmsvcrt > 0 {
+    ndll = wrap_add(ndll, 1);
+  }
+  if nckernel > 0 {
+    ndll = wrap_add(ndll, 1);
+  }
+  let idt_len = wrap_mul(wrap_add(ndll, 1), 20);
+  let ilt = wrap_add(idt, idt_len);
+  // one table of imports per library, each ended by a zero entry
+  let ilt_len = wrap_add(wrap_mul(nimp, 8), wrap_mul(ndll, 8));
+  let iat = wrap_add(ilt, ilt_len);
+  let names = wrap_add(iat, ilt_len);
+  // the hint/name entries, then the library names
+  let mut name_off = vec_new[u64]();
+  let mut cur = names;
+  k = 0;
+  while k < nimp {
+    vec_push(&mut name_off, cur);
+    let id = u_at(imports, k);
+    cur = pe_align(wrap_add(wrap_add(cur, 3), ao_sym(g, id, 1)), 2);
+    k = wrap_add(k, 1);
+  }
+  let dllname0 = cur;
+  let dllname1 = wrap_add(dllname0, 11);
+  let rdata_len = wrap_add(dllname1, 13);
+  let data_rva = wrap_add(rdata_rva, pe_align(rdata_len, PE_SECALIGN));
+  let bss_rva = wrap_add(data_rva, pe_align(vec_len(data), PE_SECALIGN));
+  let image = wrap_add(bss_rva, pe_align(bss, PE_SECALIGN));
+  // the address of every symbol, for the relocations
+  let mut bad = false;
+  let mut r = 0;
+  while wrap_add(r, 5) <= vec_len(rel) {
+    let sec = u_at(rel, r);
+    let at = u_at(rel, wrap_add(r, 1));
+    let sym = u_at(rel, wrap_add(r, 3));
+    let addend = u_at(rel, wrap_add(r, 4));
+    let mut target = 0;
+    let ssec = ao_sym(g, sym, 2);
+    if ssec == AS_NONE && (ao_sym(g, sym, 4) & 2) != 0 {
+      // a common symbol
+      let mut q = 0;
+      while wrap_add(q, 2) <= vec_len(comm) {
+        if u_at(comm, q) == sym {
+          target = wrap_add(bss_rva, u_at(comm, wrap_add(q, 1)));
+        }
+        q = wrap_add(q, 2);
+      }
+    } else if ssec == AS_NONE {
+      let mut q = 0;
+      while q < nimp {
+        if u_at(imports, q) == sym {
+          target = wrap_add(text_rva, wrap_add(tstart, wrap_mul(q, 8)));
+        }
+        q = wrap_add(q, 1);
+      }
+    } else {
+      let off = ao_sym_off(g, sym);
+      if ssec == AB_TEXT {
+        target = wrap_add(text_rva, off);
+      } else if ssec == AB_RODATA {
+        target = wrap_add(rdata_rva, off);
+      } else if ssec == AB_DATA {
+        target = wrap_add(data_rva, off);
+      } else {
+        target = wrap_add(bss_rva, off);
+      }
+    }
+    let mut base = text_rva;
+    if sec == AB_RODATA {
+      base = rdata_rva;
+    } else if sec == AB_DATA {
+      base = data_rva;
+    }
+    let value = wrap_sub(wrap_add(target, addend), wrap_add(base, at));
+    if sec == AB_TEXT {
+      pe_patch(&mut text, at, value, 4);
+    } else if sec == AB_RODATA {
+      pe_patch(&mut ro, at, value, 4);
+    } else if sec == AB_DATA {
+      pe_patch(&mut data, at, value, 4);
+    } else {
+      bad = true;
+    }
+    if target == 0 {
+      bad = true;
+    }
+    r = wrap_add(r, 5);
+  }
+  // the entry point
+  let entry = pe_find(g, "mainCRTStartup");
+  if entry == AS_NONE || ao_sym(g, entry, 2) != AB_TEXT {
+    bad = true;
+  }
+  let mut out = vec_new[u64]();
+  if bad {
+    vec_free(text);
+    vec_free(ro);
+    vec_free(data);
+    vec_free(rel);
+    vec_free(imports);
+    vec_free(comm);
+    vec_free(name_off);
+    return out;
+  }
+  // the thunks
+  pe_pad_to(&mut text, tstart);
+  k = 0;
+  while k < nimp {
+    let slot = wrap_add(rdata_rva, wrap_add(iat, wrap_mul(pe_slot(g, imports, k), 8)));
+    let here = wrap_add(text_rva, wrap_add(tstart, wrap_mul(k, 8)));
+    as_byte(&mut text, 255);
+    as_byte(&mut text, 37);
+    as_le(&mut text, wrap_sub(slot, wrap_add(here, 6)), 4);
+    as_byte(&mut text, 204);
+    as_byte(&mut text, 204);
+    k = wrap_add(k, 1);
+  }
+  // the import tables
+  pe_pad_to(&mut ro, idt);
+  let mut d = 0;
+  while d < 2 {
+    let mut cnt = ncmsvcrt;
+    if d == 1 {
+      cnt = nckernel;
+    }
+    if cnt > 0 {
+      let slot0 = pe_first_slot(d, ncmsvcrt);
+      as_le(&mut ro, wrap_add(rdata_rva, wrap_add(ilt, wrap_mul(slot0, 8))), 4);
+      as_le(&mut ro, 0, 4);
+      as_le(&mut ro, 0, 4);
+      let mut nm = dllname0;
+      if d == 1 {
+        nm = dllname1;
+      }
+      as_le(&mut ro, wrap_add(rdata_rva, nm), 4);
+      as_le(&mut ro, wrap_add(rdata_rva, wrap_add(iat, wrap_mul(slot0, 8))), 4);
+    }
+    d = wrap_add(d, 1);
+  }
+  as_le(&mut ro, 0, 4);
+  as_le(&mut ro, 0, 4);
+  as_le(&mut ro, 0, 4);
+  as_le(&mut ro, 0, 4);
+  as_le(&mut ro, 0, 4);
+  // the lookup table and the address table: the same entries
+  let mut pass = 0;
+  while pass < 2 {
+    let mut dd = 0;
+    let mut kk = 0;
+    while dd < 2 {
+      let mut cnt = ncmsvcrt;
+      if dd == 1 {
+        cnt = nckernel;
+      }
+      if cnt > 0 {
+        let mut j = 0;
+        while j < cnt {
+          as_le(&mut ro, wrap_add(rdata_rva, u_at(name_off, wrap_add(kk, j))), 8);
+          j = wrap_add(j, 1);
+        }
+        as_le(&mut ro, 0, 8);
+        kk = wrap_add(kk, cnt);
+      }
+      dd = wrap_add(dd, 1);
+    }
+    pass = wrap_add(pass, 1);
+  }
+  k = 0;
+  while k < nimp {
+    let id = u_at(imports, k);
+    as_byte(&mut ro, 0);
+    as_byte(&mut ro, 0);
+    let ns = ao_sym(g, id, 0);
+    let mut c = 0;
+    while c < ao_sym(g, id, 1) {
+      as_byte(&mut ro, u_at(g.names, wrap_add(ns, c)));
+      c = wrap_add(c, 1);
+    }
+    as_byte(&mut ro, 0);
+    pe_pad_to(&mut ro, pe_align(vec_len(ro), 2));
+    k = wrap_add(k, 1);
+  }
+  pe_put(&mut ro, "msvcrt.dll");
+  as_byte(&mut ro, 0);
+  pe_put(&mut ro, "KERNEL32.dll");
+  as_byte(&mut ro, 0);
+  // the file
+  let text_raw = pe_align(vec_len(text), PE_FILEALIGN);
+  let ro_raw = pe_align(vec_len(ro), PE_FILEALIGN);
+  let data_raw = pe_align(vec_len(data), PE_FILEALIGN);
+  let mut nsec = 3;
+  if bss > 0 {
+    nsec = 4;
+  }
+  // DOS header
+  as_byte(&mut out, 77);
+  as_byte(&mut out, 90);
+  pe_pad_to(&mut out, 60);
+  as_le(&mut out, 64, 4);
+  // PE header
+  pe_put(&mut out, "PE");
+  as_le(&mut out, 0, 2);
+  as_le(&mut out, 34404, 2);
+  as_le(&mut out, nsec, 2);
+  as_le(&mut out, 0, 4);
+  as_le(&mut out, 0, 4);
+  as_le(&mut out, 0, 4);
+  as_le(&mut out, 240, 2);
+  // executable image, large addresses, no relocations
+  as_le(&mut out, 35, 2);
+  // optional header
+  as_le(&mut out, 523, 2);
+  as_byte(&mut out, 2);
+  as_byte(&mut out, 30);
+  as_le(&mut out, text_raw, 4);
+  as_le(&mut out, wrap_add(ro_raw, data_raw), 4);
+  as_le(&mut out, bss, 4);
+  as_le(&mut out, wrap_add(text_rva, ao_sym_off(g, entry)), 4);
+  as_le(&mut out, text_rva, 4);
+  as_le(&mut out, PE_BASE, 8);
+  as_le(&mut out, PE_SECALIGN, 4);
+  as_le(&mut out, PE_FILEALIGN, 4);
+  as_le(&mut out, 6, 2);
+  as_le(&mut out, 0, 2);
+  as_le(&mut out, 0, 2);
+  as_le(&mut out, 0, 2);
+  as_le(&mut out, 6, 2);
+  as_le(&mut out, 0, 2);
+  as_le(&mut out, 0, 4);
+  as_le(&mut out, image, 4);
+  as_le(&mut out, PE_HEADERS, 4);
+  as_le(&mut out, 0, 4);
+  // console subsystem, no dynamic base (the image has no relocations)
+  as_le(&mut out, 3, 2);
+  as_le(&mut out, 256, 2);
+  as_le(&mut out, 8388608, 8);
+  as_le(&mut out, 4096, 8);
+  as_le(&mut out, 1048576, 8);
+  as_le(&mut out, 4096, 8);
+  as_le(&mut out, 0, 4);
+  as_le(&mut out, 16, 4);
+  // data directories: export (none), import, then fourteen empty ones
+  as_le(&mut out, 0, 8);
+  as_le(&mut out, wrap_add(rdata_rva, idt), 4);
+  as_le(&mut out, idt_len, 4);
+  let mut z = 0;
+  while z < 14 {
+    as_le(&mut out, 0, 8);
+    z = wrap_add(z, 1);
+  }
+  // section table
+  pe_section(&mut out, ".text", ttotal, text_rva, text_raw, PE_HEADERS, 1610612768);
+  let ro_file = wrap_add(PE_HEADERS, text_raw);
+  pe_section(&mut out, ".rdata", rdata_len, rdata_rva, ro_raw, ro_file, 1073741888);
+  let data_file = wrap_add(ro_file, ro_raw);
+  pe_section(&mut out, ".data", vec_len(data), data_rva, data_raw, data_file, 3221225536);
+  if bss > 0 {
+    pe_section(&mut out, ".bss", bss, bss_rva, 0, 0, 3221225600);
+  }
+  pe_pad_to(&mut out, PE_HEADERS);
+  pe_append(&mut out, text, text_raw);
+  pe_append(&mut out, ro, ro_raw);
+  pe_append(&mut out, data, data_raw);
+  vec_free(rel);
+  vec_free(imports);
+  vec_free(comm);
+  vec_free(name_off);
+  return out;
+}
+
+fn pe_append(out: &mut Vec[u64], bytes: Vec[u64], raw: u64) {
+  let mut k = 0;
+  while k < vec_len(bytes) {
+    as_byte(&mut out, u_at(bytes, k));
+    k = wrap_add(k, 1);
+  }
+  let left = wrap_sub(raw, vec_len(bytes));
+  vec_free(bytes);
+  let mut n = 0;
+  while n < left && n < 1073741824 {
+    as_byte(&mut out, 0);
+    n = wrap_add(n, 1);
+  }
+}
+
+fn pe_section(out: &mut Vec[u64], name: Str, vsize: u64, rva: u64, raw: u64, file: u64, flags: u64) {
+  let mut k = 0;
+  while k < 8 {
+    if k < slen(name) {
+      as_byte(&mut out, cast[u64](sget(name, k)));
+    } else {
+      as_byte(&mut out, 0);
+    }
+    k = wrap_add(k, 1);
+  }
+  as_le(&mut out, vsize, 4);
+  as_le(&mut out, rva, 4);
+  as_le(&mut out, raw, 4);
+  as_le(&mut out, file, 4);
+  as_le(&mut out, 0, 4);
+  as_le(&mut out, 0, 4);
+  as_le(&mut out, 0, 2);
+  as_le(&mut out, 0, 2);
+  as_le(&mut out, flags, 4);
+}
+
+/// The slot of import `k` in the tables: the C library's imports come first
+/// and every library's table ends with a zero entry, so the second library
+/// starts one slot later.
+fn pe_slot(g: &AsObj, imports: &Vec[u64], k: u64) -> u64 {
+  let mut cm = 0;
+  let mut j = 0;
+  while j < vec_len(imports) {
+    if pe_dll(g, u_at(imports, j)) == 0 {
+      cm = wrap_add(cm, 1);
+    }
+    j = wrap_add(j, 1);
+  }
+  if pe_dll(g, u_at(imports, k)) == 0 || cm == 0 {
+    return k;
+  }
+  return wrap_add(k, 1);
+}
+
+/// The slot where library `d`'s table starts: the second library's follows
+/// the first one's zero entry.
+fn pe_first_slot(d: u64, ncmsvcrt: u64) -> u64 {
+  if d == 1 && ncmsvcrt > 0 {
+    return wrap_add(ncmsvcrt, 1);
+  }
+  return 0;
+}
+
+/// Assembles the text of `data` (the lines of a file) into a fresh object.
+/// `stub` is more assembly (the entry point) appended to it.
+fn pe_feed(data: &Bytes, stub: Str, arm: bool) -> AsObj {
+  let mut nl = 0;
+  let mut c = 0;
+  while c < blen(data) {
+    if bget(data, c) == 10 {
+      nl = wrap_add(nl, 1);
+    }
+    c = wrap_add(c, 1);
+  }
+  let tail = bfrom(stub);
+  let mut g = ao_new(wrap_add(wrap_add(nl, 16), 64));
+  g.arm = arm;
+  pe_lines_into(&mut g, data);
+  pe_lines_into(&mut g, tail);
+  bfree(tail);
+  return g;
+}
+
+fn pe_lines_into(g: &mut AsObj, data: &Bytes) {
+  let mut line = vec_new[u64]();
+  let mut k = 0;
+  while k <= blen(data) {
+    let mut ch = 10;
+    if k < blen(data) {
+      ch = cast[u64](bget(data, k));
+    }
+    if ch == 10 {
+      ao_line(&mut g, line, 0, vec_len(line));
+      vec_free(line);
+      line = vec_new[u64]();
+    } else {
+      vec_push(&mut line, ch);
+    }
+    k = wrap_add(k, 1);
+  }
+  vec_free(line);
+}
+
+/// Links the program into the Windows executable at `outp`.
+fn pe_build(host: &Host, outp: &Bytes, data: &Bytes) -> u64 {
+  let mut g = pe_feed(data, pe_entry(), false);
+  if g.errs > 0 {
+    ao_free(g);
+    return 3;
+  }
+  ao_layout(&mut g);
+  let image = pe_link(&mut g);
+  ao_free(g);
+  if vec_len(image) == 0 {
+    vec_free(image);
+    return 4;
+  }
+  return pe_write(host, outp, image);
+}
+
+/// Writes the image to the file `outp`; 0 when that worked.
+fn pe_write(host: &Host, outp: &Bytes, image: Vec[u64]) -> u64 {
+  let mut b = balloc(vec_len(image));
+  let mut k = 0;
+  while k < vec_len(image) && k < blen(b) {
+    bset(&mut b, k, cast[u8]((u_at(image, k) & 255)));
+    k = wrap_add(k, 1);
+  }
+  vec_free(image);
+  let ok = host_write(host, outp, b);
+  bfree(b);
+  if ok {
+    return 0;
+  }
+  return 5;
+}

@@ -3,7 +3,8 @@
 # program in tests/ir, exactly the IR in the .expected file next to it.
 # Where NAME.opt.expected exists, `irdump --opt` (the passes of
 # stage1/iropt.bastio have run) must print that for NAME.bastio too.
-# tests/ir_user/*.bastio are dumped with --user.
+# tests/ir_user/*.bastio are dumped with --user, tests/ir_a64/*.bastio with
+# --aarch64 (what only that target adds to the IR).
 # usage: tests/ir.sh [--update]    (--update rewrites the .expected files)
 set -eu
 cd "$(dirname "$0")/.."
@@ -31,6 +32,17 @@ for f in tests/ir_user/*.bastio; do
     echo "ok   $f (--user)"
   else
     echo "FAIL $f (--user)"; cat "$tmp/diff"; fail=1
+  fi
+done
+# Programs whose IR differs on AArch64 (tests/ir_a64) are dumped with --aarch64.
+for f in tests/ir_a64/*.bastio; do
+  want="${f%.bastio}.expected"
+  if [ "${1:-}" = --update ]; then
+    "$tmp/irdump" --aarch64 "$f" > "$want"
+  elif "$tmp/irdump" --aarch64 "$f" | diff -u "$want" - > "$tmp/diff"; then
+    echo "ok   $f (--aarch64)"
+  else
+    echo "FAIL $f (--aarch64)"; cat "$tmp/diff"; fail=1
   fi
 done
 for f in tests/ir/*.bastio; do

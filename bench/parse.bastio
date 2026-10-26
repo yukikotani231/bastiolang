@@ -1,0 +1,60 @@
+// Parses decimal numbers separated by commas out of 16 MiB of text, 8 passes,
+// and sums them: the digit loop of every number-reading program.
+const SIZE: u64 = 16777216;
+
+fn text() -> Bytes
+  ensures blen(result) == SIZE
+{
+  let mut b = balloc(SIZE);
+  let mut x = 12345;
+  let mut i = 0;
+  while i < SIZE
+    invariant blen(b) == SIZE && i <= SIZE
+  {
+    x = wrap_add(wrap_mul(x, 6364136223846793005), 1442695040888963407);
+    let r = x / 4294967296;
+    if r % 7 == 0 {
+      bset(&mut b, i, 44);
+    } else {
+      bset(&mut b, i, cast[u8](48 + r / 8 % 10));
+    }
+    i = i + 1;
+  }
+  return b;
+}
+
+fn sum(b: &Bytes) -> u64
+  requires blen(b) == SIZE
+{
+  let mut total = 0;
+  let mut cur = 0;
+  let mut i = 0;
+  while i < SIZE
+    invariant i <= SIZE && blen(b) == SIZE
+  {
+    let c = bget(b, i);
+    if c == 44 {
+      total = wrap_add(total, cur);
+      cur = 0;
+    } else {
+      cur = wrap_add(wrap_mul(cur, 10), wrap_sub(cast[u64](c), 48));
+    }
+    i = i + 1;
+  }
+  return wrap_add(total, cur);
+}
+
+fn main() -> u64 {
+  let b = text();
+  let mut t = 0;
+  let mut p = 0;
+  while p < 8
+    invariant p <= 8
+  {
+    t = wrap_add(t, sum(b));
+    p = p + 1;
+  }
+  print(t);
+  bfree(b);
+  return 0;
+}

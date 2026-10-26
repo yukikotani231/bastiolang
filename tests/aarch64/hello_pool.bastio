@@ -1,0 +1,58 @@
+// stage1-only: the AArch64 kernel target
+// A kernel built by the native AArch64 backend that takes pages from the
+// pool (tests/aarch64.sh): the runs of RAM the platform lists, the pages
+// taken from them (zeroed), written, read back and given back, and the
+// allocator's second arena once the first is full. No tables or processor yet.
+import "core/print.bastio";
+
+fn say(con: &mut Serial, ok: bool) {
+  if ok {
+    print_str(con, "yes");
+  } else {
+    print_str(con, "no");
+  }
+  print_nl(con);
+}
+
+fn main(con: &mut Serial, pool: &mut Pool) -> u64 {
+  print_str(con, "more than 1000 pages: ");
+  say(&mut con, pool_size(pool) > 1000);
+  if pool_size(pool) < 8 {
+    return 1;
+  }
+  let mut a = pool_take(&mut pool, 0);
+  let mut b = pool_take(&mut pool, 7);
+  print_str(con, "ids ");
+  print_u64(con, frame_id(a));
+  print_str(con, " ");
+  print_u64(con, frame_id(b));
+  print_nl(con);
+  print_str(con, "zeroed ");
+  print_u64(con, wrap_add(frame_read(a, 0), frame_read(b, 511)));
+  print_nl(con);
+  frame_write(&mut a, 3, 0x1234);
+  frame_write(&mut b, 511, 0x5678);
+  print_str(con, "words ");
+  print_hex(con, frame_read(a, 3));
+  print_str(con, " ");
+  print_hex(con, frame_read(b, 511));
+  print_nl(con);
+  print_str(con, "distinct ");
+  say(&mut con, frame_read(a, 511) == 0 && frame_read(b, 3) == 0);
+  pool_give(&mut pool, a);
+  pool_give(&mut pool, b);
+  // More than the first arena (1 MiB) holds.
+  let mut v = vec_new[u64]();
+  let mut i = 0;
+  while i < 200000
+    invariant vlen(v) == i
+  {
+    vec_push(&mut v, i);
+    i = i + 1;
+  }
+  print_str(con, "big ");
+  print_u64(con, vec_get(v, 199999));
+  print_nl(con);
+  vec_free(v);
+  return 0;
+}

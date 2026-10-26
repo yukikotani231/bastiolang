@@ -279,6 +279,7 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   bsig(&mut c, "frame_write8", AV_MEM, 3, mfrm, u, u8t, 0, un);
   bsig5(&mut c, "frame_to_bytes", AV_MEM, mbyt, u, rfrm, u, u, un);
   bsig5(&mut c, "bytes_to_frame", AV_MEM, mfrm, u, rbyt, u, u, un);
+  bsig5(&mut c, "frame_to_frame", AV_MEM, mfrm, u, rfrm, u, u, un);
   bsig(&mut c, "pt_new", AV_MEM, 2, frm, u, 0, 0, ptb);
   bsig(&mut c, "pt_free", AV_MEM, 1, ptb, 0, 0, 0, frm);
   bsig(&mut c, "pt_free_root", AV_KERNEL, 2, rmmu, ptb, 0, 0, frm);
@@ -971,11 +972,26 @@ fn cm_mismatch(c: &mut Checker, p: &Parser, got: u64, want: u64, loc: u64) -> bo
   return got != want && cm_new(&mut c, p, loc, C_TYPE);
 }
 
+/// The hint under a mismatch between two integer types.
+fn cm_hint_conv(c: &mut Checker, m: &Mono, p: &Parser, want: u64, got: u64) {
+  if is_int(m, got) && is_int(m, want) {
+    let msg = c.emsg;
+    c.emsg = vec_new[u64]();
+    cm_s(&mut c, "  = integer types never convert on their own: write `cast[");
+    cm_ty(&mut c, m, p, want);
+    cm_s(&mut c, "](..)` if the value is proved to fit, or `wrap[");
+    cm_ty(&mut c, m, p, want);
+    cm_s(&mut c, "](..)` to keep the low bits\n");
+    cm_take_note(&mut c, msg);
+  }
+}
+
 /// `WHAT must be WANT, found GOT` unless `got` is `want`.
 fn expect_ty(c: &mut Checker, m: &Mono, p: &Parser, got: u64, want: u64, loc: u64, what: Str) {
   if cm_mismatch(&mut c, p, got, want, loc) {
     cm_s(&mut c, what);
     cm_must(&mut c, m, p, want, got);
+    cm_hint_conv(&mut c, m, p, want, got);
   }
 }
 
@@ -2449,6 +2465,7 @@ fn check_spec_fn(c: &mut Checker, m: &mut Mono, p: &Parser, x: u64) {
     cm_callee(&mut c, m, p, k, env);
     cm_s(&mut c, "`");
     cm_must(&mut c, m, p, r, t);
+    cm_hint_conv(&mut c, m, p, r, t);
   }
 }
 
@@ -2530,6 +2547,7 @@ fn check_fn_body(c: &mut Checker, m: &mut Mono, p: &Parser, x: u64) {
         cm_inst(&mut c, m, p, x);
         cm_s(&mut c, "` can reach its end without returning a ");
         cm_ty(&mut c, m, p, r);
+        cm_note(&mut c, "every path through the function must end in a `return`: add one at the end, or make each branch of the `if` return");
       }
     } else {
       leak_check_all(&mut c, m, p, xi.def, "at the end of the function");
@@ -2596,6 +2614,7 @@ fn ck_stmt(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> bool {
         cm_name(&mut c, p, i);
         cm_s(&mut c, "`");
         cm_must(&mut c, m, p, want, t);
+        cm_hint_conv(&mut c, m, p, want, t);
       }
       if c.failed {
         return false;
@@ -2628,6 +2647,7 @@ fn ck_stmt(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> bool {
       cm_place(&mut c, p, pk);
       cm_s(&mut c, "`");
       cm_must(&mut c, m, p, want, t);
+      cm_hint_conv(&mut c, m, p, want, t);
     }
     if c.failed {
       return false;
@@ -2673,6 +2693,14 @@ fn ck_stmt(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> bool {
     }
     if !c.failed {
       expect_ty(&mut c, m, p, t, c.ret, i, "the returned value");
+      if c.failed && c.ret == c.tunit {
+        let msg = c.emsg;
+        c.emsg = vec_new[u64]();
+        cm_s(&mut c, "  = the function has no return type: add `-> ");
+        cm_ty(&mut c, m, p, t);
+        cm_s(&mut c, "` after its parameters to return a value\n");
+        cm_take_note(&mut c, msg);
+      }
     }
     if !c.failed {
       leak_check_all(&mut c, m, p, i, "at this `return`");
@@ -2742,6 +2770,7 @@ fn ck_if(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> bool {
   if !same_set(ct, ce) && cm_new(&mut c, p, i, C_BRANCH) {
     cm_symdiff(&mut c, p, ct, ce);
     cm_s(&mut c, " is consumed in only one branch of this `if`");
+    cm_note(&mut c, "a linear value must be consumed in both branches or in neither: consume it in the other branch too, or before the `if`");
   }
   let mut all = after_then;
   union_into(&mut all, after_else);
@@ -2943,6 +2972,7 @@ fn ck_match(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> bool {
           cm_s(&mut c, "`");
           cm_variant(&mut c, m, p, x, a);
           cm_s(&mut c, "` is matched twice");
+          cm_note(&mut c, "an earlier arm already handles this variant: remove the repeated arm");
         }
       } else {
         vec_push(&mut covered, j - 1);
@@ -3426,6 +3456,7 @@ fn ck_variant(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u
       cm_variant(&mut c, m, p, x, i);
       cm_s(&mut c, "`");
       cm_must(&mut c, m, p, pt, t);
+      cm_hint_conv(&mut c, m, p, pt, t);
     }
   } else if pt != 0 || n.a != 0 {
     if cm_new(&mut c, p, i, C_TYPE) {
@@ -3550,6 +3581,7 @@ fn ck_slit(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
       cm_name(&mut c, p, q);
       cm_s(&mut c, "`");
       cm_must(&mut c, m, p, ft, t);
+      cm_hint_conv(&mut c, m, p, ft, t);
     }
     q = qn.next;
   }
@@ -3624,12 +3656,14 @@ fn cm_operands(c: &mut Checker, m: &Mono, p: &Parser, op: u64, a: u64, b: u64, w
     cm_op(&mut c, op);
     cm_s(&mut c, "`");
     cm_must(&mut c, m, p, want, a);
+    cm_hint_conv(&mut c, m, p, want, a);
   }
   if cm_mismatch(&mut c, p, b, want, loc) {
     cm_s(&mut c, "the right operand of `");
     cm_op(&mut c, op);
     cm_s(&mut c, "`");
     cm_must(&mut c, m, p, want, b);
+    cm_hint_conv(&mut c, m, p, want, b);
   }
 }
 
@@ -4449,6 +4483,19 @@ fn call_with_v(c: &mut Checker, m: &mut Mono, p: &Parser, ps: &Vec[u64], r: u64,
       cm_s(&mut c, " argument(s), ");
       cm_num(&mut c, vec_len(args));
       cm_s(&mut c, " given");
+      let msg = c.emsg;
+      c.emsg = vec_new[u64]();
+      cm_s(&mut c, "  = the parameter types are (");
+      let mut q = 0;
+      while q < vec_len(ps) {
+        if q > 0 {
+          cm_s(&mut c, ", ");
+        }
+        cm_ty(&mut c, m, p, vec_get(ps, q));
+        q = q + 1;
+      }
+      cm_s(&mut c, ")\n");
+      cm_take_note(&mut c, msg);
     }
     return 0;
   }
@@ -4464,6 +4511,7 @@ fn call_with_v(c: &mut Checker, m: &mut Mono, p: &Parser, ps: &Vec[u64], r: u64,
       if !c.failed && !widens && cm_mismatch(&mut c, p, t, pt, a) {
         cm_arg_of(&mut c, m, p, loc, fx);
         cm_must(&mut c, m, p, pt, t);
+        cm_hint_conv(&mut c, m, p, pt, t);
       }
     }
     j = j + 1;
@@ -4501,6 +4549,7 @@ fn call_with_v(c: &mut Checker, m: &mut Mono, p: &Parser, ps: &Vec[u64], r: u64,
         if !c.failed && cm_mismatch(&mut c, p, t, pt, a) {
           cm_arg_of(&mut c, m, p, loc, fx);
           cm_must(&mut c, m, p, pt, t);
+          cm_hint_conv(&mut c, m, p, pt, t);
         }
       }
     }

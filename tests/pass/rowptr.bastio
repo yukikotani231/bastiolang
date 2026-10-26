@@ -1,0 +1,130 @@
+// Row pointers (stage1/iropt.bastio, iropt_rowptr): `a[r + i]` in a loop,
+// with `r` the same in every pass, reads through a pointer made once in front
+// of the loop. This checks the sums when the row is a value computed in the
+// loop around, when two loops share a row register, when the row changes in
+// the loop (no pointer), when it is a constant, and for a store.
+// expect-exit: 0
+// expect-stdout: 115502
+fn fill(mut t: Buf) -> Buf
+  requires len(t) == 4096 
+  ensures len(result) == 4096
+{
+  let mut i = 0;
+  while i < 4096
+    invariant i <= 4096 && len(t) == 4096
+  {
+    t = set(t, i, (i * 7 + 3) % 11);
+    i = i + 1;
+  }
+  return t;
+}
+
+/// The sum of the 3 rows around row y of a 64-wide grid, for every x.
+fn rows(src: &Buf, mut dst: Buf) -> Buf
+  requires len(src) == 4096 && len(dst) == 4096
+  ensures len(result) == 4096
+{
+  let mut y = 1;
+  while y < 63
+    invariant y >= 1 && y <= 63 && len(src) == 4096 && len(dst) == 4096
+  {
+    let up = (y - 1) * 64;
+    let mid = y * 64;
+    let dn = (y + 1) * 64;
+    let mut x = 0;
+    while x < 64
+      invariant x <= 64 && y >= 1 && y < 63 && up < 4096 && mid < 4096 && dn < 4096 && len(src) == 4096 && len(dst) == 4096
+    {
+      let s = wrap_add(wrap_add(get(src, up + x), get(src, mid + x)), get(src, dn + x));
+      dst = set(dst, mid + x, s);
+      x = x + 1;
+    }
+    y = y + 1;
+  }
+  return dst;
+}
+
+/// A row that moves in the loop: the add stays.
+fn walk(src: &Buf) -> u64
+  requires len(src) == 4096
+{
+  let mut r = 0;
+  let mut s = 0;
+  let mut i = 0;
+  while i < 60
+    invariant i <= 60 && r == i * 60 && s <= i * 100 && len(src) == 4096
+  {
+    s = s + get(src, r + i) % 100;
+    r = r + 60;
+    i = i + 1;
+  }
+  return s;
+}
+
+/// A constant row, and a row the inner loop does not write but the outer one does.
+fn offsets(src: &Buf) -> u64
+  requires len(src) == 4096
+{
+  let mut s = 0;
+  let mut k = 0;
+  while k < 32
+    invariant k <= 32 && len(src) == 4096
+  {
+    let base = k * 100;
+    let mut j = 0;
+    while j < 50
+      invariant j <= 50 && base <= 3100 && len(src) == 4096
+    {
+      s = wrap_add(s, get(src, 5 + j) % 7 + get(src, base + j) % 5 + get(src, j + base + 7) % 3);
+      j = j + 1;
+    }
+    k = k + 1;
+  }
+  return s;
+}
+
+/// `y * 64` is the same in the whole inner loop although y changes in the outer one;
+/// `k * 64` is not, because the inner loop writes k.
+fn mixed(src: &Buf) -> u64
+  requires len(src) == 4096
+{
+  let mut s = 0;
+  let mut y = 0;
+  while y < 8
+    invariant y <= 8 && len(src) == 4096
+  {
+    let mut k = y;
+    let mut x = 0;
+    while x < 16
+      invariant x <= 16 && y < 8 && ((x <= 5 && k == y) || (x > 5 && k == y + 1)) && len(src) == 4096
+    {
+      s = wrap_add(s, wrap_add(get(src, y * 64 + x), get(src, k * 64 + x)));
+      if x == 5 {
+        k = k + 1;
+      }
+      x = x + 1;
+    }
+    y = y + 1;
+  }
+  return s;
+}
+
+fn main() -> u64 {
+  let mut a = alloc(4096);
+  let mut b = alloc(4096);
+  a = fill(a);
+  b = rows(a, b);
+  let mut c = 0;
+  let mut i = 0;
+  while i < 4096
+    invariant i <= 4096 && len(b) == 4096
+  {
+    c = wrap_add(c, get(b, i) % 1000);
+    i = i + 1;
+  }
+  let r = wrap_add(wrap_add(c, wrap_mul(walk(a), 3)), wrap_add(wrap_mul(offsets(a), 5), wrap_mul(mixed(a), 11)));
+  print(r);
+  free(a);
+  free(b);
+  return 0;
+}

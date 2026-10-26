@@ -8,6 +8,8 @@
 --   bastioc         the compiler it runs for diagnostics (default $BASTIOC, else `bastioc1`)
 --   target          `hosted`, `kernel` or `user`, for programs that are not hosted ones
 --   lib             library directories, for imports and for the compiler
+--   check_on_change run the compiler as the text changes, not only when a file is
+--                   opened or saved (slow for programs with many proofs)
 --   format_on_save  format the buffer through the server before writing it
 local M = {}
 
@@ -16,6 +18,7 @@ local defaults = {
   bastioc = nil,
   target = nil,
   lib = {},
+  check_on_change = false,
   format_on_save = false,
 }
 
@@ -29,7 +32,7 @@ function M.setup(opts)
     callback = function(args)
       local name = vim.api.nvim_buf_get_name(args.buf)
       local git = vim.fs.find('.git', { upward = true, path = vim.fs.dirname(name) })[1]
-      local init = { bastioc = opts.bastioc, target = opts.target }
+      local init = { bastioc = opts.bastioc, target = opts.target, checkOnChange = opts.check_on_change or nil }
       if opts.lib and #opts.lib > 0 then
         init.lib = opts.lib
       end

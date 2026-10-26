@@ -13,7 +13,7 @@ trap 'rm -rf "$tmp"' EXIT
 # compiler for the library itself) instead of translating it to C.
 BACKEND=${BACKEND:-c}
 if [ "$BACKEND" = native ]; then
-  "$BASTIOC" --backend native --header "$tmp/base64.h" -o "$tmp/base64.o" "$here/lib.bastio"
+  "$BASTIOC" --backend native ${BFLAGS:-} --header "$tmp/base64.h" -o "$tmp/base64.o" "$here/lib.bastio"
 else
   "$BASTIOC" --emit-c --header "$tmp/base64.h" -o "$tmp/base64.c" "$here/lib.bastio"
 fi
@@ -25,8 +25,11 @@ build() {  # C compiler flags...
 }
 if [ "${1:-}" = bench ]; then
   build -O2
-  "$tmp/test" bench
+  ${RUNNER:-} "$tmp/test" bench
   exit
 fi
-build -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all
-"$tmp/test" "$@"
+# The sanitizers, where the C compiler has them (not MinGW-w64).
+SAN="-fsanitize=address,undefined -fno-sanitize-recover=all"
+echo 'int main(void){return 0;}' | "$CC" $SAN -x c - -o "$tmp/san_probe" 2>/dev/null && ( ${RUNNER:-} "$tmp/san_probe" && : ) 2>/dev/null || SAN=
+build -O1 -g $SAN
+${RUNNER:-} "$tmp/test" "$@"

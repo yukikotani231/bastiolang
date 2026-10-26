@@ -563,7 +563,9 @@ class Fuzz:
         if crashed(c1, e1):
             self.finding("crash1", src, f"bastioc1 --check: {'timeout' if c1 is None else f'exit {c1}'} ({where})\n{e1.decode(errors='replace')[-2000:]}")
             return c0, e0
-        if c0 != c1 or counterexample_free(mask(e0, e1)) != counterexample_free(e1):
+        if c0 == 1 and c1 != c0 and b"error[E-TYPE]: unknown function `" in e0:
+            self.stat("stage0 lacks a stage1-only function")     # stage0 is frozen: it knows less by design
+        elif c0 != c1 or counterexample_free(mask(e0, e1)) != counterexample_free(e1):
             self.finding("differ", src, f"bastioc0 and bastioc1 disagree ({where})\n--- bastioc0 exit {c0}:\n{e0.decode(errors='replace')}--- bastioc1 exit {c1}:\n{e1.decode(errors='replace')}")
         elif c0 == 0:
             o0 = os.path.join(self.cur.tmp, "c0.c")
@@ -637,7 +639,8 @@ class Fuzz:
         for d in ("tests/pass", "tests/fail", "examples", "core"):
             for root, _, names in os.walk(os.path.join(ROOT, d)):
                 fs += [os.path.join(root, n) for n in names if n.endswith(".bastio")]
-        return sorted(fs)
+        # bastioc0 cannot compile a stage1-only program, so it would always disagree.
+        return sorted(f for f in fs if not re.search(rb'^// stage1-only:', open(f, "rb").read(), re.M))
 
     TOKEN = re.compile(rb'[A-Za-z_][A-Za-z0-9_]*|0[xX][0-9a-fA-F_]+|[0-9][0-9_]*|"(?:[^"\\\n]|\\.)*"|==>|::|->|=>|==|!=|<=|>=|&&|\|\||<<|>>|//[^\n]*|\s+|.', re.S)
 
@@ -668,10 +671,34 @@ class Fuzz:
                 toks[i], toks[j] = toks[j], toks[i]
         return b"".join(toks)
 
+    def backends_agree(self, text, path, d, where):
+        """An accepted hosted mutant must do the same through the C backend and the native one."""
+        res = {}
+        for backend in ("c", "native"):
+            exe = os.path.join(self.cur.tmp, f"m.{backend}")
+            code, err, _ = compile_([BASTIOC, "--backend", backend, "-o", exe, path], d)
+            if code is None or (code == 4 and backend == "native"):
+                return                      # too slow to prove, or not supported natively yet
+            if code != 0:
+                self.finding("build", text, f"bastioc0 --backend {backend} fails on an accepted mutant: exit {code} ({where})\n{err.decode(errors='replace')[-2000:]}")
+                return
+            try:
+                r = subprocess.run([exe], capture_output=True, timeout=10, stdin=subprocess.DEVNULL)
+            except subprocess.TimeoutExpired:
+                return                      # termination is not proved
+            res[backend] = (r.returncode, r.stdout)
+        self.stat("mutant run on both backends")
+        if res["c"] != res["native"]:
+            self.finding("miscompile", text, f"the C and native backends disagree: C exit {res['c'][0]}, native exit {res['native'][0]}"
+                         + ("" if res["c"][1] == res["native"][1] else ", and their output differs") + f" ({where})")
+
     def mutate_one(self, seed, corpus):
         rnd = random.Random(seed)
         orig = rnd.choice(corpus)
         src = open(orig, "rb").read()
+        if re.search(rb'^// stage1-only:', src, re.M):
+            self.stat("stage1-only seed skipped")      # bastioc0 is meant to reject it
+            return
         m = self.mutate(rnd, src)
         try:
             text = m.decode()
@@ -690,6 +717,8 @@ class Fuzz:
                 return
             self.stat("mutant accepted")
             hosted = not re.search(rb'^// target:', m, re.M) and re.search(rb'^fn main\(\)', m, re.M) and b"Host" not in m and b"Serial" not in m
+            if hosted:
+                self.backends_agree(text, path, d, where)
             if not (hosted and self.san):
                 return
             c = os.path.join(self.cur.tmp, "m.c")

@@ -1,0 +1,91 @@
+// Constant range checks (stage1/iropt.bastio, iropt_range): see below.
+// expect-exit: 0
+// expect-stdout: 223
+// `x < a || x > b` and `a <= x && x <= b` on constants, in both orders and
+// with either test negated, are one subtract and one unsigned compare in the
+// native IR path. Every spelling is checked at and around both bounds and
+// at the ends of u64.
+fn outside(x: u64) -> u64
+  ensures result <= 1
+{
+  if x < 10 || x > 20 { return 1; }
+  return 0;
+}
+
+fn outside_rev(x: u64) -> u64
+  ensures result <= 1
+{
+  if x > 200 || x < 100 { return 1; }
+  return 0;
+}
+
+fn inside(x: u64) -> u64
+  ensures result <= 1
+{
+  if x >= 48 && x <= 57 { return 1; }
+  return 0;
+}
+
+fn not_inside(x: u64) -> u64
+  ensures result <= 1
+{
+  if !(x >= 5 && x <= 6) { return 1; }
+  return 0;
+}
+
+fn open_ends(x: u64) -> u64
+  ensures result <= 1
+{
+  if x <= 3 || x >= 18446744073709551600 { return 1; }
+  return 0;
+}
+
+fn mixed(x: u64) -> u64
+  ensures result <= 1
+{
+  if x < 1 || x > 18446744073709551614 { return 1; }
+  return 0;
+}
+
+fn probe(x: u64) -> u64
+  ensures result <= 29
+{
+  return outside(x) + 2 * outside_rev(x) + 3 * inside(x) + 5 * not_inside(x) + 7 * open_ends(x) + 11 * mixed(x);
+}
+
+fn main() -> u64 {
+  let mut xs = vec_new[u64]();
+  vec_push(&mut xs, 0);
+  vec_push(&mut xs, 3);
+  vec_push(&mut xs, 4);
+  vec_push(&mut xs, 5);
+  vec_push(&mut xs, 6);
+  vec_push(&mut xs, 7);
+  vec_push(&mut xs, 9);
+  vec_push(&mut xs, 10);
+  vec_push(&mut xs, 20);
+  vec_push(&mut xs, 21);
+  vec_push(&mut xs, 47);
+  vec_push(&mut xs, 48);
+  vec_push(&mut xs, 57);
+  vec_push(&mut xs, 58);
+  vec_push(&mut xs, 99);
+  vec_push(&mut xs, 100);
+  vec_push(&mut xs, 200);
+  vec_push(&mut xs, 201);
+  vec_push(&mut xs, 18446744073709551599);
+  vec_push(&mut xs, 18446744073709551600);
+  vec_push(&mut xs, 18446744073709551614);
+  vec_push(&mut xs, 18446744073709551615);
+  let mut total = 0;
+  let mut i = 0;
+  while i < vec_len(xs)
+    invariant i <= vlen(xs) && total <= i * 29
+  {
+    total = total + probe(vec_get(xs, i));
+    i = i + 1;
+  }
+  vec_free(xs);
+  print(total);
+  return 0;
+}
