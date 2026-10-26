@@ -8,6 +8,10 @@
 //   b.exports.f(...)                  // an `export fn`; words are BigInts
 //   b.put(u8) -> [address, length]    // a `&Bytes` argument
 //   b.bytesAt(address)                // a `Bytes` stored as (length, address)
+//   b.alloc(words) -> address         // a zeroed result slot for a struct returned through a pointer
+//   b.record(address, ['tag', 'end']) // the words at address as { tag: 0n, end: 12n }; a name
+//                                     // may be a [name, 'bytes'] pair to read a `Bytes` cell
+//                                     // (it takes two words)
 //
 // Child processes (`host_spawn`) need an embedder that can run programs:
 // pass `childProcess: require('child_process')` in Node.js, or your own
@@ -181,6 +185,20 @@
       put: store,
       bytesAt(a) { return bytes(word(a, 1), word(a, 0)); },
       word,
+      alloc(n) {
+        const p = inst.exports.bst_alloc(BigInt(8 * n));
+        mem().fill(0, Number(p), Number(p) + 8 * n);
+        return p;
+      },
+      record(a, fields) {
+        const r = {};
+        let i = 0;
+        for (const f of fields) {
+          if (Array.isArray(f)) { r[f[0]] = bytes(word(a, i + 1), word(a, i)); i += 2; }
+          else r[f] = word(a, i++);
+        }
+        return r;
+      },
     };
   }
   
