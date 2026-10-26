@@ -217,7 +217,7 @@ Safety must not cost speed at run time; that is the point of proving it instead 
 3. **Kernel paths.** In BastiOS: system-call round trip, context switch, page fault to resolution, process spawn and teardown.
 
 - [x] Fix `Vec` growth in the C prelude (`realloc` instead of `calloc` plus a byte copy): `bench/vec` went from 2.96x to 1.04x the time of C
-- [ ] BastiOS: `user_byte` walks all four page-table levels for every byte it copies, and the kernel allocator scans its free list linearly and zeroes every page; measure, then batch per page
+- [ ] BastiOS: the copy between user memory and the kernel no longer goes through a per-byte `user_byte` (it is gone from `src/`; reads copy a run at a time), and the page pool has `pool_take_dirty` for pages that are overwritten at once. Left: measure how the pool finds a free page (`src/pages.bastio`), and whether zeroing on `pool_take` shows in `bench`
 - [x] `bench/`, starting from the programs of the first measurement (sum, sieve, tree, vec, each with its C twin), with a script that prints one line per measurement (generated-code time vs C, compile and proof time per file): `bench/run.sh`
 - [x] CI runs it and keeps the numbers as an artifact (`bench-<sha>`), so a regression shows up next to the change that caused it
 - [x] One solver scope per function (2026-10-10): the verifier used to keep every function's declarations and assumptions in one Z3 context, so each function's queries also carried the quantified facts of all earlier ones. Popping them after each function took the BastiOS kernel from 4.5 s to 1.6 s and `stage1/checkdump.bastio` from 9.3 s to 2.3 s. `BASTIO_TIME=1` prints the proof time of each function
