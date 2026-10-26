@@ -94,6 +94,22 @@ async function load(path) {
   H.e.http_parse_head(bp2, bl2, hres);
   assert.strictEqual(H.word(hres, 0), 2n);                             // Head::Bad: bare LF
 
+  // The same head through the shell's typed helpers (web/bastio.js).
+  const S = await require('../web/bastio.js').load(fs.readFileSync(httpPath));
+  const [sp, sl] = S.put(head);
+  const sres = S.alloc(10);
+  S.exports.http_parse_head(sp, sl, sres);
+  assert.deepStrictEqual(S.record(sres, ['tag', 'method_end', 'target', 'target_end', 'minor', 'fields', 'nfields', 'head_end']),
+    { tag: 0n, method_end: 3n, target: 4n, target_end: 10n, minor: 1n, fields: 21n, nfields: 2n, head_end: BigInt(head.length - 4) });
+
+  const S2 = await require('../web/bastio.js').load(fs.readFileSync(base64Path));
+  const [ip, il] = S2.put(Buffer.from('hello'));
+  const eres = S2.alloc(4);
+  S2.exports.base64_encode(ip, il, eres);
+  const er = S2.record(eres, ['tag', ['text', 'bytes']]);
+  assert.strictEqual(er.tag, 0n);
+  assert.strictEqual(Buffer.from(er.text).toString(), 'aGVsbG8=');
+
   const resp = Buffer.from('HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot found');
   const [rp, rl] = H.put(resp);
   H.e.http_parse_response(rp, rl, hres);
