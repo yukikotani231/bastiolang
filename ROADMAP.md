@@ -232,7 +232,7 @@ Safety must not cost speed at run time; that is the point of proving it instead 
   - [ ] Vectorization of simple loops ([#128](https://github.com/yukikotani231/bastiolang/issues/128))
   - [x] The native backend as the default for hosted programs on x86-64 Linux: within 2% of `cc -O2` in instruction count on every bench except sha256 ([#129](https://github.com/yukikotani231/bastiolang/issues/129))
   - [ ] BastiOS built with it by default (`make NATIVE=1` builds the kernel and user programs that way today; the default build still goes through C). Waiting on `make bench` under KVM showing no row slower than the C-built kernel
-  - [ ] Compile and proof time: a proof cache per function ([#130](https://github.com/yukikotani231/bastiolang/issues/130))
+  - [x] Compile and proof time: a proof cache per function ([#130](https://github.com/yukikotani231/bastiolang/issues/130))
   - [ ] BastiOS: system calls without CR3 reloads ([bastios#198](https://github.com/yukikotani231/bastios/issues/198)), disk writes and reads ([bastios#199](https://github.com/yukikotani231/bastios/issues/199)), copy-on-write fork and per-page user copies ([bastios#200](https://github.com/yukikotani231/bastios/issues/200)), TCP bulk ([bastios#201](https://github.com/yukikotani231/bastios/issues/201)), `make bench` kept per release ([bastios#202](https://github.com/yukikotani231/bastios/issues/202))
 
 **Review cadence.** Performance is reviewed at every roadmap milestone (each checked item in v2 to v4) and whenever a phase of the self-hosted compiler lands: run `bench/`, compare with the previous numbers, and note anything that got slower in the PR.
