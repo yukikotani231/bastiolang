@@ -41,6 +41,7 @@ if command -v z3 >/dev/null; then
   step "tests/as64.sh";      tests/as64.sh
   step "tests/macho.sh";     tests/macho.sh
   step "tests/proof_cache.sh"; tests/proof_cache.sh
+  step "tests/package.sh";     tests/package.sh
   step "tests/tools.sh";     tests/tools.sh
   step "stage1/difftest.sh"; stage1/difftest.sh
   if command -v cvc5 >/dev/null; then

@@ -4,7 +4,7 @@
 // Pipeline: load -> monomorphize -> check (types and linearity) -> verify
 // (Z3) -> C -> the system C compiler.
 //
-// usage: bastioc1 [--help] [--check] [--emit-c] [--target T] [--arch A] [--lib DIR] [--backend B] [--emit-asm] [--self-link|--gnu-link|--musl-link] [--header F] [--dump-smt] [-o out] <file.bastio>...
+// usage: bastioc1 [--help] [--check] [--emit-c] [--target T] [--arch A] [--lib DIR] [--pkg NAME=DIR] [--backend B] [--emit-asm] [--self-link|--gnu-link|--musl-link] [--header F] [--dump-smt] [-o out] <file.bastio>...
 //   (default)   verify, then build a native executable `out` (default: a.out)
 //               with the C compiler `$CC` (default: cc)
 //   --check     stop after verification
@@ -22,6 +22,9 @@
 //               only: bastioc0 knows only x86-64 bare metal)
 //   --lib DIR   also look for imported files in DIR (see `resolve` in
 //               loader.bastio); may be given more than once
+//   --pkg NAME=DIR  `import "NAME/rest"` is the file `rest` in DIR, before any
+//               other place is searched; may be given more than once (the
+//               `bastio` tool passes one per package of a project)
 //   --backend native  generate x86-64 (or, with `--arch aarch64`, AArch64)
 //               assembly directly instead of C, then
 //               assemble and link it (hosted); with `--target user` or
@@ -52,6 +55,18 @@ import "winpe.bastio";
 import "prune.bastio";
 import "elf.bastio";
 import "machold.bastio";
+
+/// The index of the first `=` in `b`, or its length when there is none.
+fn b1_find_eq(b: &Bytes) -> u64 {
+  let n = blen(b);
+  let mut i = 0;
+  while i < n && bget(b, i) != 61
+    invariant i <= n && n == blen(b)
+  {
+    i = i + 1;
+  }
+  return i;
+}
 
 fn b1_code(code: u64) -> Str {
   if code == C_USE { return "E-LINEAR-USE"; }
@@ -654,6 +669,7 @@ fn b1_help(out: &mut Vec[u64]) {
   w_s(&mut out, "  --gnu-link       with --backend native-ir: assemble and link with the platform's as and cc instead (--mingw-link is the same)\n");
   w_s(&mut out, "  --emit-asm       with --backend native: write the assembly instead of an executable\n");
   w_s(&mut out, "  --lib DIR        also look for imported files in DIR\n");
+  w_s(&mut out, "  --pkg NAME=DIR   import \"NAME/rest\" is the file rest in DIR\n");
   w_s(&mut out, "  --header FILE    also write a C header for the program's `export fn`s\n");
   w_s(&mut out, "  -o FILE          the output file (default: a.out, or out.c for C and out.s for assembly)\n");
   w_s(&mut out, "  --dump-smt       print every query sent to the solver\n");
@@ -833,6 +849,19 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
       bfree(a);
       i = cg_add(i, 1);
       loader_lib(&mut ld, host_arg(host, i));
+    } else if b1_is(a, "--pkg") {
+      bfree(a);
+      i = cg_add(i, 1);
+      let pspec = host_arg(host, i);
+      let eq = b1_find_eq(pspec);
+      if eq == 0 || eq >= blen(pspec) {
+        w_s(&mut out, "bastioc1: --pkg wants NAME=DIR\n");
+        status = 2;
+        bfree(pspec);
+      } else {
+        loader_pkg(&mut ld, byte_range(pspec, 0, eq), byte_range(pspec, eq + 1, blen(pspec)));
+        bfree(pspec);
+      }
     } else if b1_is(a, "-o") {
       bfree(a);
       i = cg_add(i, 1);
@@ -860,7 +889,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
     return 0;
   }
   if status == 0 && vec_len(inputs) == 0 {
-    w_s(&mut out, "usage: bastioc1 [--check] [--emit-c] [--target hosted|kernel|user] [--arch x86_64|aarch64] [--lib DIR] [--backend c|native] [--emit-asm] [--header F] [-o out] <file.bastio>...\n");
+    w_s(&mut out, "usage: bastioc1 [--check] [--emit-c] [--target hosted|kernel|user] [--arch x86_64|aarch64] [--lib DIR] [--pkg NAME=DIR] [--backend c|native] [--emit-asm] [--header F] [-o out] <file.bastio>...\n");
     status = 2;
   }
   // A hosted program on x86-64 Linux is built by the native backend, if the

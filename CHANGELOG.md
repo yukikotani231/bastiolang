@@ -33,6 +33,12 @@ What will be 0.2.0.
 
 ### Compiler
 
+- `bastio`, a project tool (`stage1/bastio.bastio`), and `bastioc1 --pkg NAME=DIR`.
+  A directory with a `bastio.toml` is a project; its `[dependencies]` are
+  local directories or git repositories (checked out at a tag or commit and
+  pinned in `bastio.lock`), imported by name: `import "util/math.bastio"`.
+  `bastio build`, `check` and `update`. See docs/packages.md.
+
 - The page-table prelude marks a page mapped writable (`pt_put_frame`,
   `pt_put_shared` with `writable`) no-execute on x86-64, and leaves a
   read-only one executable, so a kernel that sets `EFER.NXE` gets W^X from

@@ -22,6 +22,7 @@
 - [Language reference](language.md)
 - [Sized integers](integers.md)
 - [Concurrency](concurrency.md)
+- [Packages and projects](packages.md)
 - [The core and std libraries](core.md)
   - [core/ascii.bastio](lib-core-ascii.md)
   - [core/bitmap.bastio](lib-core-bitmap.md)

@@ -21,6 +21,7 @@ Bastio is a systems language whose memory safety is proved at compile time. The 
 | [Language reference](language.md) | Every rule of the language and its "Soundness scope": what is and is not guaranteed |
 | [Sized integers](integers.md) | `u8` to `u64` and `i8` to `i64`: the design and how each step was built |
 | [Concurrency](concurrency.md) | The concurrency design and what exists so far |
+| [Packages and projects](packages.md) | `bastio.toml`, the `bastio` tool, path and git dependencies, `bastio.lock` |
 | [Core and std libraries](core.md) | What each library function does and what is proved; the per-module pages are in [`lib/`](lib/core-bytes.md) and are generated from the sources |
 
 ## How the compilers work
