@@ -14,6 +14,7 @@ const Bastio = require('../web/bastio.js');
       args: [process.argv[2], ...process.argv.slice(3)],
       env: process.env,
       fs,
+      childProcess: require('child_process'),
       stdout: (u8) => chunks.push(Buffer.from(u8)),
       stderr: (u8) => { fs.writeSync(1, Buffer.concat(chunks)); chunks.length = 0; fs.writeSync(2, Buffer.from(u8)); },
     });

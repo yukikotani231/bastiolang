@@ -30,7 +30,7 @@ async function load(path) {
 }
 
 (async () => {
-  const [linesPath, base64Path, utf8Path, httpPath] = process.argv.slice(2);
+  const [linesPath, base64Path, utf8Path, httpPath, childPath] = process.argv.slice(2);
 
   const L = await load(linesPath);
   const text = Buffer.from('one\ntwo\nthree\n\nx');
@@ -115,6 +115,16 @@ async function load(path) {
   assert.deepStrictEqual(H.e.http_body(fp, fl, 17n), [1n, 11n]);       // Body::Length(11)
   const [xp, xl] = H.put(Buffer.from('POST / HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n'));
   assert.strictEqual(H.e.http_body(xp, xl, 17n)[0], 3n);              // Body::Bad: both at once
+
+  // Child processes: with no embedder to run programs (as in a browser) every
+  // program fails to start (status 127, no output); with Node's child_process
+  // the program of tests/pass/child.bastio runs and exits with 42.
+  const Bastio = require('../web/bastio.js');
+  const childWasm = fs.readFileSync(childPath);
+  const without = await Bastio.load(childWasm, {});
+  assert.notStrictEqual(without.main(), 42);
+  const withProcs = await Bastio.load(childWasm, { childProcess: require('child_process') });
+  assert.strictEqual(withProcs.main(), 42);
 
   console.log('wasm libraries: lines, base64, utf8 and http pass from JavaScript');
 })().catch((e) => { console.error(e); process.exit(1); });
