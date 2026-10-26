@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bastio HTTP parser in the browser</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; }
+  textarea { width: 100%; box-sizing: border-box; font: 14px monospace; }
+  pre { background: #f2f2f2; padding: .5rem; white-space: pre-wrap; word-break: break-all; }
+  @media (prefers-color-scheme: dark) { body { background: #111; color: #eee; } pre { background: #222; } }
+</style>
+</head>
+<body>
+<h1>An HTTP/1.1 request parser, proved</h1>
+<p>The parser of <code>examples/http</code>, proved free of out-of-bounds reads and overflow for every input, compiled to WebAssembly by <code>bastioc1 --arch wasm32</code>. Edit the request: the page shows what the module makes of it. The page sends each line with CR LF; a folded line, a space before a colon or a request that names its body twice is rejected.</p>
+<textarea id="in" rows="8">POST /submit?x=1 HTTP/1.1
+Host: example.org
+Content-Length: 5
+
+hello</textarea>
+<p><a href="index.html">The base64 demo</a></p>
+<pre id="out"></pre>
+<script src="bastio.js"></script>
+<script src="http.js"></script>
+<script>
+(async () => {
+  const b = await Bastio.load(await (await fetch('http.wasm')).arrayBuffer());
+  const inp = document.getElementById('in'), out = document.getElementById('out');
+  const te = new TextEncoder();
+  function show() {
+    // A textarea holds LF; an HTTP head ends its lines with CR LF.
+    const r = BastioHttp.parse(b, te.encode(inp.value.replace(/\r?\n/g, '\r\n')));
+    if (r.status === 'partial') out.textContent = 'incomplete: the head has not ended yet (a real server would read more)';
+    else if (r.status === 'bad') out.textContent = 'rejected, at byte ' + r.at;
+    else out.textContent = [
+      'method   ' + r.method, 'target   ' + r.target, 'version  HTTP/' + r.version,
+      ...r.fields.map(([k, v]) => 'field    ' + k + ': ' + v),
+      'body     ' + (r.body === 'length' ? r.bodyLength + ' bytes' : r.body === 'bad' ? 'rejected: ambiguous framing' : r.body),
+    ].join('\n');
+  }
+  inp.oninput = show;
+  show();
+})();
+</script>
+</body>
+</html>
