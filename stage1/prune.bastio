@@ -1,0 +1,266 @@
+// Dropping the functions nothing calls from a native backend's assembly.
+//
+// The IR passes inline a small or once-called function into its callers, but
+// the function itself is still written, because the emitter writes every
+// instance the program names. Nothing refers to the standalone copy then,
+// and the linker cannot drop it (the code is one section). This pass reads
+// the finished assembly text and removes each function block, from its
+// `.type f_name` line to its `.size f_name` line, that no text outside
+// itself and no kept function refers to. A reference is the name `f_...`
+// anywhere but the `.type` and `.size` lines and the label itself.
+//
+// The pass does not change what a kept function does. If the text is not in
+// the shape it expects (a block inside a block, a `.size` that names another
+// function) it returns the text unchanged. A function it should have kept
+// shows as an undefined symbol when the program is linked, never as a wrong
+// result.
+import "irx86.bastio";
+
+/// A character of a name made of letters, digits and `_`.
+fn pr_word(c: u64) -> bool {
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+}
+
+/// The end of the line that starts at `s` (the offset of its `\n`, or the
+/// length of the text).
+fn pr_line_end(v: &Vec[u64], s: u64) -> u64 {
+  let n = vec_len(v);
+  let mut e = s;
+  while e < n && vec_get(v, e) != 10 {
+    e = wrap_add(e, 1);
+  }
+  return e;
+}
+
+/// The end of the name that starts at `s`.
+fn pr_name_end(v: &Vec[u64], s: u64) -> u64 {
+  let n = vec_len(v);
+  let mut e = s;
+  while e < n && pr_word(vec_get(v, e)) {
+    e = wrap_add(e, 1);
+  }
+  return e;
+}
+
+fn pr_hash(v: &Vec[u64], s: u64, e: u64) -> u64 {
+  let mut h = 14695981039346656037;
+  let mut k = s;
+  while k < e && k < vec_len(v) {
+    h = wrap_mul(h ^ vec_get(v, k), 1099511628211);
+    k = wrap_add(k, 1);
+  }
+  return h;
+}
+
+/// Is the text `a..b` the same as the text `c..d`?
+fn pr_same(v: &Vec[u64], a: u64, b: u64, c: u64, d: u64) -> bool {
+  if wrap_sub(b, a) != wrap_sub(d, c) {
+    return false;
+  }
+  let mut k = 0;
+  let len = wrap_sub(b, a);
+  while k < len && wrap_add(a, k) < vec_len(v) && wrap_add(c, k) < vec_len(v) && vec_get(v, wrap_add(a, k)) == vec_get(v, wrap_add(c, k)) {
+    k = wrap_add(k, 1);
+  }
+  return k == len;
+}
+
+/// The block named by `s..e`, as an index plus one in the table `tab`, or 0.
+fn pr_find(v: &Vec[u64], bs: &Vec[u64], be: &Vec[u64], tab: &Vec[u64], s: u64, e: u64) -> u64 {
+  let m = vec_len(tab);
+  if m == 0 {
+    return 0;
+  }
+  let mut i = pr_hash(v, s, e) % m;
+  let mut steps = 0;
+  while steps < m {
+    let t = u_at(tab, i);
+    if t == 0 {
+      return 0;
+    }
+    if pr_same(v, u_at(bs, t - 1), u_at(be, t - 1), s, e) {
+      return t;
+    }
+    i = wrap_add(i, 1) % m;
+    steps = wrap_add(steps, 1);
+  }
+  return 0;
+}
+
+/// Does the line that starts at `s` begin with `pat`?
+fn pr_starts(v: &Vec[u64], s: u64, pat: Str) -> bool {
+  return ix_has_at(v, s, pat);
+}
+
+/// `text` without the functions that nothing refers to.
+fn asm_prune_dead(text: &Vec[u64]) -> Vec[u64] {
+  let n = vec_len(text);
+  let mut bs = vec_new[u64]();      // the function's name: where it starts and ends
+  let mut be = vec_new[u64]();
+  let mut b0 = vec_new[u64]();      // the block: its first byte and the byte after its last
+  let mut b1 = vec_new[u64]();
+  let mut ok = true;
+  let mut open = false;
+  // Pass 1: the blocks.
+  let mut s = 0;
+  while s < n && ok {
+    let e = pr_line_end(text, s);
+    if pr_starts(text, s, "\t.type f_") {
+      if open {
+        ok = false;
+      } else {
+        let ns = wrap_add(s, 7);
+        vec_push(&mut bs, ns);
+        vec_push(&mut be, pr_name_end(text, ns));
+        vec_push(&mut b0, s);
+        vec_push(&mut b1, 0);
+        open = true;
+      }
+    } else if pr_starts(text, s, "\t.size f_") {
+      let nb = vec_len(bs);
+      if !open || nb == 0 {
+        ok = false;
+      } else {
+        let ns = wrap_add(s, 7);
+        let ne = pr_name_end(text, ns);
+        if pr_same(text, ns, ne, u_at(bs, nb - 1), u_at(be, nb - 1)) && nb - 1 < vec_len(b1) {
+          vec_set(&mut b1, nb - 1, wrap_add(e, 1));
+          open = false;
+        } else {
+          ok = false;
+        }
+      }
+    }
+    s = wrap_add(e, 1);
+  }
+  if open {
+    ok = false;
+  }
+  let nb = vec_len(bs);
+  if !ok || nb == 0 {
+    vec_free(bs);
+    vec_free(be);
+    vec_free(b0);
+    vec_free(b1);
+    return copy_set(text);
+  }
+  // The table of names: open addressing, at most half full.
+  let mut m = 16;
+  while m < wrap_add(nb, nb) && m < 1000000000 {
+    m = wrap_add(m, m);
+  }
+  let mut tab = vec_new[u64]();
+  let mut k = 0;
+  while k < m {
+    vec_push(&mut tab, 0);
+    k = wrap_add(k, 1);
+  }
+  k = 0;
+  while k < nb {
+    let mut i = pr_hash(text, u_at(bs, k), u_at(be, k)) % m;
+    while u_at(tab, i) != 0 {
+      i = wrap_add(i, 1) % m;
+    }
+    if i < vec_len(tab) {
+      vec_set(&mut tab, i, wrap_add(k, 1));
+    }
+    k = wrap_add(k, 1);
+  }
+  // Pass 2: the references. A function that is named outside every block is
+  // kept; one named inside a block is kept when that block is.
+  let mut live = vec_new[u64]();
+  k = 0;
+  while k < nb {
+    vec_push(&mut live, 0);
+    k = wrap_add(k, 1);
+  }
+  let mut esrc = vec_new[u64]();
+  let mut edst = vec_new[u64]();
+  let mut owner = 0;                // the block the scan is in, plus one; 0 outside every block
+  let mut next = 0;                 // the next block to start
+  s = 0;
+  while s < n {
+    let e = pr_line_end(text, s);
+    if owner != 0 && s >= u_at(b1, owner - 1) {
+      owner = 0;
+    }
+    if owner == 0 && next < nb && s >= u_at(b0, next) {
+      owner = wrap_add(next, 1);
+      next = wrap_add(next, 1);
+    }
+    let decl = pr_starts(text, s, "\t.type") || pr_starts(text, s, "\t.size");
+    if !decl {
+      let mut i = s;
+      while i < e {
+        let c = u_at(text, i);
+        if pr_word(c) {
+          let w = pr_name_end(text, i);
+          let isf = u_at(text, i) == 102 && u_at(text, wrap_add(i, 1)) == 95;
+          let label = i == s && u_at(text, w) == 58;
+          if isf && !label {
+            let t = pr_find(text, bs, be, tab, i, w);
+            if t != 0 {
+              if owner == 0 {
+                if t - 1 < vec_len(live) {
+                  vec_set(&mut live, t - 1, 1);
+                }
+              } else {
+                vec_push(&mut esrc, owner - 1);
+                vec_push(&mut edst, t - 1);
+              }
+            }
+          }
+          i = w;
+        } else {
+          i = wrap_add(i, 1);
+        }
+      }
+    }
+    s = wrap_add(e, 1);
+  }
+  // Everything a kept function refers to is kept.
+  let ne = vec_len(esrc);
+  let mut changed = true;
+  while changed {
+    changed = false;
+    let mut j = 0;
+    while j < ne {
+      let a = u_at(esrc, j);
+      let d = u_at(edst, j);
+      if u_at(live, a) == 1 && u_at(live, d) == 0 && d < vec_len(live) {
+        vec_set(&mut live, d, 1);
+        changed = true;
+      }
+      j = wrap_add(j, 1);
+    }
+  }
+  // The text, without the blocks nobody keeps.
+  let mut out = vec_new[u64]();
+  let mut at = 0;
+  k = 0;
+  while k < nb {
+    if u_at(live, k) == 0 {
+      let from = u_at(b0, k);
+      let to = u_at(b1, k);
+      while at < from && at < n {
+        vec_push(&mut out, vec_get(text, at));
+        at = wrap_add(at, 1);
+      }
+      at = to;
+    }
+    k = wrap_add(k, 1);
+  }
+  while at < n {
+    vec_push(&mut out, vec_get(text, at));
+    at = wrap_add(at, 1);
+  }
+  vec_free(bs);
+  vec_free(be);
+  vec_free(b0);
+  vec_free(b1);
+  vec_free(tab);
+  vec_free(live);
+  vec_free(esrc);
+  vec_free(edst);
+  return out;
+}

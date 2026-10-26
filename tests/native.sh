@@ -106,6 +106,16 @@ if [ "${BACKEND:-native}" = native-ir ] && [ -z "$OSARG" ]; then
     echo "FAIL bastioc1 built through the IR does not reproduce its own assembly"; lost=1
   fi
 fi
+# The assembly has no function that nothing refers to (stage1/prune.bastio).
+if [ "${BACKEND:-native}" = native-ir ] && [ -z "$OSARG" ] && [ -s "$tmp/a.s" ]; then
+  grep -v '^[[:space:]]*\.\(type\|size\)' "$tmp/a.s" | grep -v '^f_[A-Za-z0-9_]*:' \
+    | grep -o 'f_[A-Za-z0-9_]*' | sort -u >"$tmp/refs"
+  grep -o '^f_[A-Za-z0-9_]*:' "$tmp/a.s" | tr -d : | sort -u >"$tmp/defs"
+  dead=$(comm -23 "$tmp/defs" "$tmp/refs" | head -3 | tr '\n' ' ')
+  if [ -z "$dead" ]; then echo "ok   no function in the assembly is unreferenced"; else
+    echo "FAIL unreferenced functions are still written: $dead"; lost=1
+  fi
+fi
 pass=$(n pass) skip=$(n skip) fail=$(($(n fail) + lost))
 echo "native: $pass same as the C backend, $skip skipped (unsupported), $fail failed; $libs libraries pass their C harnesses"
 [ $fail = 0 ]
