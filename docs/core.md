@@ -61,6 +61,7 @@ Each module has a reference page, generated from its source: every function with
 | [`core/text.bastio`](lib/core-text.md) | Building byte strings. |
 | [`core/wtext.bastio`](lib/core-wtext.md) | Text kept as a `Vec[u64]`, one character a word. |
 | [`std/host.bastio`](lib/std-host.md) | The command line, files and standard error, for programs on the hosted target. |
+| [`std/net.bastio`](lib/std-net.md) | TCP sockets for programs on the hosted target (Linux and the other targets whose native or C backend links the C library's socket calls). |
 <!-- libref: end -->
 
 ## Gaps

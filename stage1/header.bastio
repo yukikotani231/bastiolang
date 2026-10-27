@@ -44,6 +44,21 @@ fn hd_part_lines(id: u64) -> u64 {
 /// test and tests/trusted_base.txt catch it going stale.
 const NATIVE_RUNTIME_LINES: u64 = 373;
 
+/// Are the literals `a` and `b` the same text?
+fn hd_same(a: Str, b: Str) -> bool {
+  if slen(a) != slen(b) {
+    return false;
+  }
+  let mut i = 0;
+  while i < slen(a) && i < 100 {
+    if sget(a, i) != sget(b, i) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
 fn hd_builtin(out: &mut Vec[u64], name: Str, avail: Str) {
   w_s(&mut out, "builtin ");
   w_s(&mut out, name);
@@ -118,6 +133,9 @@ fn trusted_base(out: &mut Vec[u64], arch: u64) {
     t = t + 1;
   }
   vec_free(seen);
+  w_s(&mut out, "prelude net: ");
+  w_num(&mut out, hd_part_lines(PART_NET));
+  w_s(&mut out, " lines, added to a hosted program that calls host_net (stage1 only)\n");
   if arch != ARCH_AARCH64 {
     w_s(&mut out, "native backend (--backend native, hosted): ");
     w_num(&mut out, NATIVE_RUNTIME_LINES);
@@ -151,13 +169,16 @@ fn trusted_base(out: &mut Vec[u64], arch: u64) {
   hd_builtin(&mut out, "vec_swap", "all");
   hd_builtin(&mut out, "vec_free", "all");
   hd_builtin(&mut out, "vec_with", "all, stage1 only");
+  hd_builtin(&mut out, "host_net", "hosted, stage1 only");
   let mut m = mono_new();
   let p = parser_new(balloc(0), vec_new[Tok](), 0);
   let c = checker_new(&mut m, p, TARGET_HOSTED);
   let mut k = 0;
   while k < vec_len(c.bs) {
     let b = vec_get(c.bs, k);
-    hd_builtin(&mut out, b.name, hd_avail(b.avail));
+    if !hd_same(b.name, "host_net") {
+      hd_builtin(&mut out, b.name, hd_avail(b.avail));
+    }
     k = k + 1;
   }
   checker_free(c);
