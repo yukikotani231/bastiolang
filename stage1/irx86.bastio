@@ -606,6 +606,18 @@ fn ix_call_ok(f: &IrFn, g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, q: I
   return true;
 }
 
+/// A call to the C library function `name` with %rsp aligned to 16 bytes, as
+/// the library requires (musl's `free` stores an SSE register to the stack).
+/// A function of the IR backend keeps its own frame aligned, but one that
+/// the old backend wrote calls it with %rsp at any word, so the stack is
+/// rounded down here and restored from the copy of %rsp that the two pushes
+/// leave just above the rounded stack; the result in %rax is not touched.
+fn ix_libc_call(out: &mut Vec[u64], name: Str) {
+  w_s(&mut out, "\tpush %rsp\n\tpush (%rsp)\n\tand $-16, %rsp\n\tcall ");
+  w_s(&mut out, name);
+  w_s(&mut out, "@PLT\n\tmov 8(%rsp), %rsp\n");
+}
+
 /// A call: the arguments in registers (up to four words) or pushed on the
 /// stack, as `x86_call_to` does it, then the result from %rax and %rdx.
 fn ix_call(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, q: IrIns, slotw: u64, inplace: bool) {
@@ -1783,11 +1795,13 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
   } else if op == IR_ALLOC {
     let words = ix_loc(al, q.a);
     if q.ty == 2 && q.c == 8 && g.target == TARGET_HOSTED && words.k == IXK_IMM && words.imm > 0 && words.imm < 100000000 {
-      // A box of a known size on a hosted target: malloc itself, from a
-      // frame that is aligned at every call (the runtime routine realigns
-      // the stack and tests for zero words, which cannot happen here).
+      // A box of a known size on a hosted target: malloc itself (the
+      // runtime routine tests for zero words, which cannot happen here).
+      // The caller may be a function the old backend wrote, which does not
+      // keep %rsp aligned at its calls, so the stack is aligned here.
       ix_mov(&mut out, ix_il(wrap_mul(8, words.imm)), ix_rl(XR_RDI));
-      w_s(&mut out, "\tcall malloc@PLT\n\ttest %rax, %rax\n\tjz bst_rt_oom\n");
+      ix_libc_call(&mut out, "malloc");
+      w_s(&mut out, "\ttest %rax, %rax\n\tjz bst_rt_oom\n");
       ix_finish(&mut out, al, q.d, XR_RAX);
       return;
     }
@@ -1807,7 +1821,7 @@ fn ix_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, g: &mut X86, m: &Mono, p: 
   } else if op == IR_FREE {
     ix_mov(&mut out, ix_loc(al, q.a), ix_rl(XR_RDI));
     if g.target == TARGET_HOSTED {
-      w_s(&mut out, "\tcall free@PLT\n");
+      ix_libc_call(&mut out, "free");
     } else {
       w_s(&mut out, "\tcall bst_rt_free\n");
     }
