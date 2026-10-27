@@ -1,0 +1,55 @@
+// stage1-only: host_net (TCP sockets on the hosted target)
+// expect-exit: 0
+// A loopback exchange in one process: listen on an ephemeral port, connect
+// to it, accept, send a message each way, and see end of file after the
+// client closes. A failing call is 2^64 - 1.
+fn main(h: &mut Host) -> u64 {
+  let none_ok = 18446744073709551615;
+  let mut bad = 0;
+  let mut none = balloc(0);
+  let lo = 2130706433;
+  let srv = host_net(h, 0, lo, 0, &mut none);
+  if srv == none_ok {
+    bfree(none);
+    return 1;
+  }
+  let port = host_net(h, 6, srv, 0, &mut none);
+  let cli = host_net(h, 2, lo, port, &mut none);
+  let conn = host_net(h, 1, srv, 0, &mut none);
+  if port == 0 || port == none_ok || cli == none_ok || conn == none_ok {
+    bad = bad + 1;
+  }
+  let mut ping = bfrom("ping");
+  if host_net(h, 4, cli, 0, &mut ping) != 4 {
+    bad = bad + 1;
+  }
+  let mut got = balloc(0);
+  if host_net(h, 3, conn, 64, &mut got) != 4 || blen(got) != 4 {
+    bad = bad + 1;
+  } else if bget(got, 0) != 112 || bget(got, 3) != 103 {
+    bad = bad + 1;
+  }
+  let mut pong = bfrom("pong!");
+  if host_net(h, 4, conn, 0, &mut pong) != 5 {
+    bad = bad + 1;
+  }
+  if host_net(h, 3, cli, 64, &mut got) != 5 || blen(got) != 5 {
+    bad = bad + 1;
+  }
+  host_net(h, 5, cli, 0, &mut none);
+  // Closed by the peer: an empty read.
+  if host_net(h, 3, conn, 64, &mut got) != 0 || blen(got) != 0 {
+    bad = bad + 1;
+  }
+  // Nothing listens on a port that was just closed.
+  host_net(h, 5, conn, 0, &mut none);
+  host_net(h, 5, srv, 0, &mut none);
+  if host_net(h, 2, lo, port, &mut none) != none_ok {
+    bad = bad + 1;
+  }
+  bfree(none);
+  bfree(ping);
+  bfree(pong);
+  bfree(got);
+  return bad;
+}

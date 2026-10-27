@@ -1,0 +1,188 @@
+// std/net.bastio: TCP sockets for programs on the hosted target (Linux and
+// the other targets whose native or C backend links the C library's socket
+// calls). Built on the `Host` capability, so a kernel or user program that
+// imports this file is rejected (`E-TARGET`). A call that fails (no such
+// listener, a closed descriptor, an address in use) gives `Option::None` or
+// `false`; on Windows every call fails.
+import "../core/bytes.bastio";
+
+/// An IPv4 address from its four parts, as `host_net` takes it.
+/// ```
+/// let lo = net_ip4(127, 0, 0, 1);
+/// if lo != 2130706433 { return 1; }
+/// ```
+fn net_ip4(a: u64, b: u64, c: u64, d: u64) -> u64 {
+  return (a & 255) * 16777216 + (b & 255) * 65536 + (c & 255) * 256 + (d & 255);
+}
+
+/// Starts listening on `ip`:`port` (port 0 picks a free one).
+/// ```
+/// match net_listen(host, net_ip4(127, 0, 0, 1), 0) {
+///   Option::Some(s) => { net_close(host, s); },
+///   Option::None => { return 1; },
+/// }
+/// ```
+fn net_listen(h: &Host, ip: u64, port: u64) -> Option[u64] {
+  let mut none = balloc(0);
+  let r = host_net(h, 0, ip, port, &mut none);
+  bfree(none);
+  if r == 18446744073709551615 {
+    return Option[u64]::None;
+  }
+  return Option[u64]::Some(r);
+}
+
+/// The port a listening socket is bound to.
+/// ```
+/// match net_listen(host, net_ip4(127, 0, 0, 1), 0) {
+///   Option::Some(s) => {
+///     let p = net_port(host, s);
+///     net_close(host, s);
+///     if p == 0 { return 1; }
+///   },
+///   Option::None => { return 1; },
+/// }
+/// ```
+fn net_port(h: &Host, sock: u64) -> u64 {
+  let mut none = balloc(0);
+  let r = host_net(h, 6, sock, 0, &mut none);
+  bfree(none);
+  if r == 18446744073709551615 {
+    return 0;
+  }
+  return r;
+}
+
+/// Connects to `ip`:`port`.
+/// ```
+/// // Nothing listens on port 1.
+/// match net_connect(host, net_ip4(127, 0, 0, 1), 1) {
+///   Option::Some(s) => { net_close(host, s); return 1; },
+///   Option::None => {},
+/// }
+/// ```
+fn net_connect(h: &Host, ip: u64, port: u64) -> Option[u64] {
+  let mut none = balloc(0);
+  let r = host_net(h, 2, ip, port, &mut none);
+  bfree(none);
+  if r == 18446744073709551615 {
+    return Option[u64]::None;
+  }
+  return Option[u64]::Some(r);
+}
+
+/// Waits for a connection on a listening socket and returns it.
+/// ```
+/// let lo = net_ip4(127, 0, 0, 1);
+/// let mut bad = 1;
+/// match net_listen(host, lo, 0) {
+///   Option::Some(s) => {
+///     let p = net_port(host, s);
+///     match net_connect(host, lo, p) {
+///       Option::Some(c) => {
+///         match net_accept(host, s) {
+///           Option::Some(a) => { bad = 0; net_close(host, a); },
+///           Option::None => {},
+///         }
+///         net_close(host, c);
+///       },
+///       Option::None => {},
+///     }
+///     net_close(host, s);
+///   },
+///   Option::None => {},
+/// }
+/// if bad != 0 { return 1; }
+/// ```
+fn net_accept(h: &Host, sock: u64) -> Option[u64] {
+  let mut none = balloc(0);
+  let r = host_net(h, 1, sock, 0, &mut none);
+  bfree(none);
+  if r == 18446744073709551615 {
+    return Option[u64]::None;
+  }
+  return Option[u64]::Some(r);
+}
+
+/// Reads up to `max` bytes into `out` (replacing it). `Some(0)` is the end of
+/// the stream.
+/// ```
+/// let lo = net_ip4(127, 0, 0, 1);
+/// let mut bad = 1;
+/// match net_listen(host, lo, 0) {
+///   Option::Some(s) => {
+///     let p = net_port(host, s);
+///     match net_connect(host, lo, p) {
+///       Option::Some(c) => {
+///         match net_accept(host, s) {
+///           Option::Some(a) => {
+///             let msg = bfrom("hello");
+///             let sent = net_send_all(host, c, msg);
+///             bfree(msg);
+///             let mut got = balloc(0);
+///             match net_recv(host, a, 16, &mut got) {
+///               Option::Some(n) => { if sent && n == 5 { bad = 0; } },
+///               Option::None => {},
+///             }
+///             bfree(got);
+///             net_close(host, a);
+///           },
+///           Option::None => {},
+///         }
+///         net_close(host, c);
+///       },
+///       Option::None => {},
+///     }
+///     net_close(host, s);
+///   },
+///   Option::None => {},
+/// }
+/// if bad != 0 { return 1; }
+/// ```
+fn net_recv(h: &Host, sock: u64, max: u64, out: &mut Bytes) -> Option[u64] {
+  let r = host_net(h, 3, sock, max, &mut out);
+  if r == 18446744073709551615 {
+    return Option[u64]::None;
+  }
+  return Option[u64]::Some(r);
+}
+
+/// Sends all of `data`, retrying after a partial write. False if the
+/// connection fails first.
+/// ```
+/// let lo = net_ip4(127, 0, 0, 1);
+/// match net_connect(host, lo, 1) {
+///   Option::Some(c) => { net_close(host, c); return 1; },
+///   Option::None => {},
+/// }
+/// ```
+fn net_send_all(h: &Host, sock: u64, data: &Bytes) -> bool {
+  let n = blen(data);
+  let mut off = 0;
+  while off < n {
+    let mut chunk = bytes_slice(data, off, n);
+    let w = host_net(h, 4, sock, 0, &mut chunk);
+    bfree(chunk);
+    if w == 18446744073709551615 || w == 0 {
+      return false;
+    }
+    if w > n - off {
+      return false;
+    }
+    off = off + w;
+  }
+  return true;
+}
+
+/// Closes a socket.
+/// ```
+/// match net_listen(host, net_ip4(127, 0, 0, 1), 0) {
+///   Option::Some(s) => { net_close(host, s); },
+///   Option::None => { return 1; },
+/// }
+/// ```
+fn net_close(h: &Host, sock: u64) {
+  let mut none = balloc(0);
+  host_net(h, 5, sock, 0, &mut none);
+  bfree(none);
+}

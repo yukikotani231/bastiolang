@@ -873,6 +873,76 @@ fn cg_prelude_child(out: &mut Vec[u64]) {
   w_s(&mut out, "}\n");
 }
 
+/// The prelude part for `host_net`, which stage0 does not have: added after the
+/// hosted prelude, and only to a program that calls it.
+fn cg_prelude_net(out: &mut Vec[u64]) {
+  w_s(&mut out, "#ifndef _WIN32\n");
+  w_s(&mut out, "#include <sys/socket.h>\n");
+  w_s(&mut out, "#include <netinet/in.h>\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "/* TCP over IPv4: `op` 0 listens on address `a` (host order), port `b` and returns the\n");
+  w_s(&mut out, " * socket; 1 accepts a connection on socket `a`; 2 connects to address `a`, port `b`;\n");
+  w_s(&mut out, " * 3 reads at most `b` bytes from socket `a` into `*buf` (replacing it; an empty\n");
+  w_s(&mut out, " * result is end of file); 4 writes `*buf` to socket `a` and returns how many bytes\n");
+  w_s(&mut out, " * went; 5 closes socket `a`; 6 returns the local port of socket `a`. The failure\n");
+  w_s(&mut out, " * of any is 2^64 - 1. */\n");
+  w_s(&mut out, "static uint64_t bst_host_net(bst_host h, uint64_t op, uint64_t a, uint64_t b, bst_bytes *buf) {\n");
+  w_s(&mut out, "    (void)h;\n");
+  w_s(&mut out, "#ifdef _WIN32\n");
+  w_s(&mut out, "    (void)op; (void)a; (void)b; (void)buf;\n");
+  w_s(&mut out, "    return ~(uint64_t)0;\n");
+  w_s(&mut out, "#else\n");
+  w_s(&mut out, "    struct sockaddr_in sa;\n");
+  w_s(&mut out, "    memset(&sa, 0, sizeof sa);\n");
+  w_s(&mut out, "    sa.sin_family = AF_INET;\n");
+  w_s(&mut out, "    sa.sin_port = htons((uint16_t)b);\n");
+  w_s(&mut out, "    sa.sin_addr.s_addr = htonl((uint32_t)a);\n");
+  w_s(&mut out, "    if (op == 0 || op == 2) {\n");
+  w_s(&mut out, "        int fd = socket(AF_INET, SOCK_STREAM, 0);\n");
+  w_s(&mut out, "        if (fd < 0) return ~(uint64_t)0;\n");
+  w_s(&mut out, "        if (op == 0) {\n");
+  w_s(&mut out, "            int one = 1;\n");
+  w_s(&mut out, "            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);\n");
+  w_s(&mut out, "            if (bind(fd, (struct sockaddr *)&sa, sizeof sa) != 0 || listen(fd, 128) != 0) { close(fd); return ~(uint64_t)0; }\n");
+  w_s(&mut out, "        } else if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) {\n");
+  w_s(&mut out, "            close(fd);\n");
+  w_s(&mut out, "            return ~(uint64_t)0;\n");
+  w_s(&mut out, "        }\n");
+  w_s(&mut out, "        return (uint64_t)fd;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    if (op == 1) {\n");
+  w_s(&mut out, "        int fd = accept((int)a, NULL, NULL);\n");
+  w_s(&mut out, "        return fd < 0 ? ~(uint64_t)0 : (uint64_t)fd;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    if (op == 3) {\n");
+  w_s(&mut out, "        unsigned char *d = (unsigned char *)malloc(b ? b : 1);\n");
+  w_s(&mut out, "        if (!d) { fputs(\"Bastio: out of memory\\n\", stderr); abort(); }\n");
+  w_s(&mut out, "        ssize_t n = read((int)a, d, b);\n");
+  w_s(&mut out, "        if (n < 0) { free(d); return ~(uint64_t)0; }\n");
+  w_s(&mut out, "        free(buf->data);\n");
+  w_s(&mut out, "        buf->len = (uint64_t)n;\n");
+  w_s(&mut out, "        buf->data = d;\n");
+  w_s(&mut out, "        return (uint64_t)n;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    if (op == 4) {\n");
+  w_s(&mut out, "#ifdef MSG_NOSIGNAL\n");
+  w_s(&mut out, "        ssize_t n = send((int)a, buf->data, buf->len, MSG_NOSIGNAL);\n");
+  w_s(&mut out, "#else\n");
+  w_s(&mut out, "        ssize_t n = send((int)a, buf->data, buf->len, 0);\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "        return n < 0 ? ~(uint64_t)0 : (uint64_t)n;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    if (op == 5) return close((int)a) == 0 ? 0 : ~(uint64_t)0;\n");
+  w_s(&mut out, "    if (op == 6) {\n");
+  w_s(&mut out, "        socklen_t len = sizeof sa;\n");
+  w_s(&mut out, "        if (getsockname((int)a, (struct sockaddr *)&sa, &len) != 0) return ~(uint64_t)0;\n");
+  w_s(&mut out, "        return (uint64_t)ntohs(sa.sin_port);\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    return ~(uint64_t)0;\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "}\n");
+}
+
 fn cg_prelude_bytes(out: &mut Vec[u64]) {
   w_s(&mut out, "\n");
   w_s(&mut out, "/* Box[T]: one allocation from the same allocator as Buf. */\n");
@@ -2052,6 +2122,8 @@ const PART_KERNEL_CPU_A64: u64 = 20;
 const PART_MMIO_KERNEL_A64: u64 = 21;
 const PART_USER_A64: u64 = 22;
 const PART_DMA_A64: u64 = 23;
+/// Not in any target's list (stage0 has no such part): see `cg_prelude_net`.
+const PART_NET: u64 = 24;
 
 fn cg_part_name(id: u64) -> Str {
   if id == PART_POSIX { return "posix"; }
@@ -2077,6 +2149,7 @@ fn cg_part_name(id: u64) -> Str {
   if id == PART_MMIO_KERNEL_A64 { return "mmio_kernel_a64"; }
   if id == PART_USER_A64 { return "user_a64"; }
   if id == PART_DMA_A64 { return "dma_a64"; }
+  if id == PART_NET { return "net"; }
   return "user";
 }
 
@@ -2106,6 +2179,7 @@ fn cg_part(out: &mut Vec[u64], id: u64) {
   else if id == PART_MMIO_KERNEL_A64 { cg_prelude_mmio_kernel_a64(&mut out); }
   else if id == PART_USER_A64 { cg_prelude_user_a64(&mut out); }
   else if id == PART_DMA_A64 { cg_prelude_dma_a64(&mut out); }
+  else if id == PART_NET { cg_prelude_net(&mut out); }
   else { cg_prelude_user(&mut out); }
 }
 
