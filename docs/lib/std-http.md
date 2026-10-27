@@ -30,6 +30,7 @@ that a response is complete.
 | [`http_accept`](#http_accept) | Accepts a connection on the listening socket `sock` and reads its request head (at most `limit` bytes). |
 | [`http_req_target`](#http_req_target) | The request target of `r` (the path and query of `GET /a?b HTTP/1.1`), or empty if the request line has none. |
 | [`http_req_is`](#http_req_is) | Is the request method the literal `m`? |
+| [`http_req_body`](#http_req_body) | Reads the body of the request `r` from its connection and returns it, decoded. |
 | [`http_reply`](#http_reply) | Sends `resp` (build it with `http_response`) on the request's connection, closes the connection and frees the request. |
 | [`http_close`](#http_close) | Closes the request's connection and frees the request. |
 
@@ -325,6 +326,66 @@ match net_listen(host, lo, 0) {
         net_close(host, c);
       },
       Option::None => {},
+    }
+    net_close(host, s);
+  },
+  Option::None => {},
+}
+if bad != 0 { return 1; }
+```
+
+### `http_req_body`
+
+```bastio
+fn http_req_body(h: &Host, r: &HttpReq, limit: u64) -> Option[Bytes]
+```
+
+Reads the body of the request `r` from its connection and returns it,
+decoded: `Content-Length` bytes, or the data of a chunked body without the
+framing, or nothing if the request has neither field. Gives `None` if the
+framing is ambiguous or invalid (a repeated `Content-Length`, both
+fields, a transfer coding other than a lone `chunked`: see `http_body`),
+if the body is longer than `limit` bytes, or if the peer closes or fails
+before the body is whole. The request stays open for the answer.
+
+Example:
+
+```bastio
+// A POST with a Content-Length body, then one with a chunked body.
+let lo = net_ip4(127, 0, 0, 1);
+let mut bad = 1;
+match net_listen(host, lo, 0) {
+  Option::Some(s) => {
+    let p = net_port(host, s);
+    let mut n = 0;
+    while n < 2 {
+      match net_connect(host, lo, p) {
+        Option::Some(c) => {
+          let mut req = bfrom("POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
+          if n == 1 {
+            bfree(req);
+            req = bfrom("POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nhel\r\n2\r\nlo\r\n0\r\n\r\n");
+          }
+          let sent = net_send_all(host, c, req);
+          bfree(req);
+          match http_accept(host, s, 4096) {
+            Option::Some(r) => {
+              match http_req_body(host, r, 4096) {
+                Option::Some(b) => {
+                  if sent && bytes_eq_str(b, "hello") { bad = 0; }
+                  bfree(b);
+                },
+                Option::None => { bad = 1; },
+              }
+              http_close(host, r);
+            },
+            Option::None => { bad = 1; },
+          }
+          net_close(host, c);
+        },
+        Option::None => { bad = 1; },
+      }
+      n = n + 1;
     }
     net_close(host, s);
   },

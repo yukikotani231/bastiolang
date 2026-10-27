@@ -23,6 +23,47 @@ fn client(h: &Host, p: u64, text: Str) -> Option[u64] {
   }
 }
 
+/// Sends `text` as a request, reads its body with `limit` as the bound and
+/// returns the body (`None` if it was refused). With `close`, the client
+/// closes its side after sending, as a peer that gives up does.
+fn body_of(h: &Host, s: u64, p: u64, text: Str, limit: u64, close: bool) -> Option[Bytes] {
+  match client(h, p, text) {
+    Option::Some(c) => {
+      if close { net_close(h, c); }
+      match http_accept(h, s, 4096) {
+        Option::Some(r) => {
+          let b = http_req_body(h, r, limit);
+          http_close(h, r);
+          if !close { net_close(h, c); }
+          return b;
+        },
+        Option::None => {
+          if !close { net_close(h, c); }
+          return Option[Bytes]::None;
+        },
+      }
+    },
+    Option::None => { return Option[Bytes]::None; },
+  }
+}
+
+/// Counts 1 unless the body read from `text` is `want`, or, with `refused`,
+/// the read is refused.
+fn expect_body(h: &Host, s: u64, p: u64, text: Str, limit: u64, close: bool, want: Str, refused: bool) -> u64 {
+  match body_of(h, s, p, text, limit, close) {
+    Option::Some(b) => {
+      let ok = !refused && bytes_eq_str(b, want);
+      bfree(b);
+      if ok { return 0; }
+      return 1;
+    },
+    Option::None => {
+      if refused { return 0; }
+      return 1;
+    },
+  }
+}
+
 fn main(h: &mut Host) -> u64 {
   let mut bad = 0;
   match net_listen(h, net_ip4(127, 0, 0, 1), 0) {
@@ -77,6 +118,18 @@ fn main(h: &mut Host) -> u64 {
         },
         Option::None => { bad = bad + 1; },
       }
+      // Bodies: a length, chunks, none, and the ways to be refused.
+      if expect_body(h, s, p, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello", 100, false, "hello", false) != 0 { bad = bad + 1; }
+      if expect_body(h, s, p, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhelloEXTRA", 100, false, "hello", false) != 0 { bad = bad + 1; }
+      if expect_body(h, s, p, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nhel\r\n2;ext=1\r\nlo\r\n0\r\nX: y\r\n\r\n", 100, false, "hello", false) != 0 { bad = bad + 1; }
+      if expect_body(h, s, p, "GET / HTTP/1.1\r\nHost: x\r\n\r\n", 100, false, "", false) != 0 { bad = bad + 1; }
+      if expect_body(h, s, p, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello", 4, false, "", true) != 0 { bad = bad + 1; }
+      if expect_body(h, s, p, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nhel\r\n2\r\nlo\r\n0\r\n\r\n", 4, false, "", true) != 0 { bad = bad + 1; }
+      if expect_body(h, s, p, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello", 100, false, "", true) != 0 { bad = bad + 1; }
+      if expect_body(h, s, p, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", 100, false, "", true) != 0 { bad = bad + 1; }
+      if expect_body(h, s, p, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 9\r\n\r\nhello", 100, true, "", true) != 0 { bad = bad + 1; }
+      if expect_body(h, s, p, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel", 100, true, "", true) != 0 { bad = bad + 1; }
+      if expect_body(h, s, p, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n", 100, false, "", true) != 0 { bad = bad + 1; }
       net_close(h, s);
     },
     Option::None => { bad = bad + 1; },
