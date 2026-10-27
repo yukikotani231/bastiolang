@@ -1,0 +1,85 @@
+// stage1-only: host_net (sockets), std/http
+// expect-exit: 0
+// The strict request parser sits behind http_accept: a head it rejects is
+// answered with 400 and never reaches the caller, and an accepted one gives
+// the method and target.
+import "std/http.bastio";
+
+/// Sends `text` on a new connection to the listener `s` (on port `p`) and
+/// returns the connection, if it was made and the text went.
+fn client(h: &Host, p: u64, text: Str) -> Option[u64] {
+  match net_connect(h, net_ip4(127, 0, 0, 1), p) {
+    Option::Some(c) => {
+      let b = bfrom(text);
+      let ok = net_send_all(h, c, b);
+      bfree(b);
+      if ok {
+        return Option[u64]::Some(c);
+      }
+      net_close(h, c);
+      return Option[u64]::None;
+    },
+    Option::None => { return Option[u64]::None; },
+  }
+}
+
+fn main(h: &mut Host) -> u64 {
+  let mut bad = 0;
+  match net_listen(h, net_ip4(127, 0, 0, 1), 0) {
+    Option::Some(s) => {
+      let p = net_port(h, s);
+      // A bare LF ends the line: rejected, and the client is told so.
+      match client(h, p, "GET / HTTP/1.1\nHost: x\n\n") {
+        Option::Some(c) => {
+          // A head needs CR LF CR LF to be read at all, so this one is never
+          // complete: close the client side to let the server give up.
+          net_close(h, c);
+          match http_accept(h, s, 4096) {
+            Option::Some(r) => { http_close(h, r); bad = bad + 1; },
+            Option::None => {},
+          }
+        },
+        Option::None => { bad = bad + 1; },
+      }
+      // Complete but invalid: a space before the colon of a field.
+      match client(h, p, "GET / HTTP/1.1\r\nHost : x\r\n\r\n") {
+        Option::Some(c) => {
+          match http_accept(h, s, 4096) {
+            Option::Some(r) => { http_close(h, r); bad = bad + 1; },
+            Option::None => {},
+          }
+          match http_read_all(h, c, 4096) {
+            Option::Some(m) => {
+              if http_status(m) != 400 { bad = bad + 1; }
+              bfree(m);
+            },
+            Option::None => { bad = bad + 1; },
+          }
+          net_close(h, c);
+        },
+        Option::None => { bad = bad + 1; },
+      }
+      // A good one: method and target.
+      match client(h, p, "POST /a/b?c=d HTTP/1.1\r\nHost: x\r\n\r\n") {
+        Option::Some(c) => {
+          match http_accept(h, s, 4096) {
+            Option::Some(r) => {
+              let t = http_req_target(r);
+              if !http_req_is(r, "POST") || http_req_is(r, "GET") || !bytes_eq_str(t, "/a/b?c=d") {
+                bad = bad + 1;
+              }
+              bfree(t);
+              http_close(h, r);
+            },
+            Option::None => { bad = bad + 1; },
+          }
+          net_close(h, c);
+        },
+        Option::None => { bad = bad + 1; },
+      }
+      net_close(h, s);
+    },
+    Option::None => { bad = bad + 1; },
+  }
+  return bad;
+}

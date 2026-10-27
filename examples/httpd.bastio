@@ -1,0 +1,142 @@
+// stage1-only: host_net (sockets), std/http
+// A small HTTP server with std/http: two routes, and an answer for anything
+// else. Run with no arguments it checks itself: it listens on a free port of
+// 127.0.0.1, sends itself a request for each route over a real connection,
+// and exits with 0 if the answers are right. `httpd serve PORT` serves on
+// 127.0.0.1:PORT until it is killed.
+//
+// What the compiler proves: no buffer is read or written out of bounds and
+// none leaks. It does not prove that the answers are right (the self-check
+// does) or that a peer behaves.
+import "core/print.bastio";
+import "std/host.bastio";
+import "std/http.bastio";
+
+/// The answer to a request for `target`.
+fn route(target: &Bytes) -> Bytes {
+  if bytes_eq_str(target, "/") {
+    let body = bfrom("hello from Bastio\n");
+    let r = http_response(200, "OK", "text/plain", body);
+    bfree(body);
+    return r;
+  }
+  if bytes_eq_str(target, "/about") {
+    let body = bfrom("<h1>Bastio</h1><p>memory safety, proved at compile time</p>\n");
+    let r = http_response(200, "OK", "text/html", body);
+    bfree(body);
+    return r;
+  }
+  let body = bfrom("not found\n");
+  let r = http_response(404, "Not Found", "text/plain", body);
+  bfree(body);
+  return r;
+}
+
+/// Reads one request from the listener `s` and answers it. False if the
+/// request could not be read or the answer could not be sent.
+fn serve_one(h: &Host, s: u64) -> bool {
+  match http_accept(h, s, 8192) {
+    Option::Some(r) => {
+      let t = http_req_target(r);
+      let resp = route(t);
+      bfree(t);
+      let ok = http_reply(h, r, resp);
+      bfree(resp);
+      return ok;
+    },
+    Option::None => { return false; },
+  }
+}
+
+/// Asks the server on `lo`:`port` for `path` through `c` (already connected)
+/// and has `s` answer it; returns the status of the answer, 0 on failure.
+fn ask(h: &Host, s: u64, c: u64, path: Str) -> u64 {
+  let req = http_get_request("localhost", path);
+  let sent = net_send_all(h, c, req);
+  bfree(req);
+  if !sent || !serve_one(h, s) {
+    return 0;
+  }
+  match http_read_all(h, c, 65536) {
+    Option::Some(m) => {
+      let st = http_status(m);
+      bfree(m);
+      return st;
+    },
+    Option::None => { return 0; },
+  }
+}
+
+/// Listens on `lo`:`port` and answers requests for ever.
+fn serve(con: &Serial, h: &Host, lo: u64, port: u64) -> u64 {
+  match net_listen(h, lo, port) {
+    Option::Some(s) => {
+      print_str(con, "listening on 127.0.0.1:");
+      print_u64(con, net_port(h, s));
+      print_nl(con);
+      while true {
+        serve_one(h, s);
+      }
+      net_close(h, s);
+      return 0;
+    },
+    Option::None => {
+      print_str(con, "cannot listen\n");
+      return 1;
+    },
+  }
+}
+
+/// Starts the server on a free port and asks it for each route.
+fn selfcheck(con: &Serial, h: &Host, lo: u64) -> u64 {
+  let mut total = 0;
+  match net_listen(h, lo, 0) {
+    Option::Some(s) => {
+      let p = net_port(h, s);
+      let mut want = 0;
+      let mut good = 0;
+      while want < 3
+        invariant want <= 3 && good <= want
+      {
+        match net_connect(h, lo, p) {
+          Option::Some(c) => {
+            let mut st = 0;
+            if want == 0 { st = ask(h, s, c, "/"); }
+            if want == 1 { st = ask(h, s, c, "/about"); }
+            if want == 2 { st = ask(h, s, c, "/missing"); }
+            print_u64(con, st);
+            print_nl(con);
+            if (want < 2 && st == 200) || (want == 2 && st == 404) {
+              good = good + 1;
+            }
+            net_close(h, c);
+          },
+          Option::None => {},
+        }
+        want = want + 1;
+      }
+      total = good;
+      net_close(h, s);
+    },
+    Option::None => {},
+  }
+  if total == 3 {
+    return 0;
+  }
+  return 1;
+}
+
+fn main(con: &mut Serial, h: &mut Host) -> u64 {
+  let lo = net_ip4(127, 0, 0, 1);
+  if host_arg_is(h, 1, "serve") {
+    let a = host_arg(h, 2);
+    let mut port = 8080;
+    match parse_u64(a, 0, blen(a)) {
+      Option::Some(p) => { port = p; },
+      Option::None => {},
+    }
+    bfree(a);
+    return serve(con, h, lo, port);
+  }
+  return selfcheck(con, h, lo);
+}

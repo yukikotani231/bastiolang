@@ -157,7 +157,7 @@ def render(path):
     out += [text[:1].upper() + text[1:], ""]
     imp = f'`import "{path}";`'
     if deps:
-        imp += " also loads " + ", ".join(f"[{d}]({page_name(d)})" for d in deps) + "."
+        imp += " also loads " + ", ".join(f"[{d}]({page_name(d)})" if d.startswith(("std/", "core/")) else f"`{d}`" for d in deps) + "."
     out += [imp, ""]
     types = [it for it in items if it.kind in ("struct", "enum", "const")]
     fns = [it for it in items if it.kind == "fn" and not it.internal]

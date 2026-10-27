@@ -39,7 +39,7 @@ export BASTIOC ARCH RUN
 pass_one() {
   local f=$1 want name got out
   # Sockets are not implemented on Windows (every call fails).
-  case "$f:$(uname -s)" in tests/pass/host_net.bastio:MINGW*|tests/pass/host_net.bastio:MSYS*) echo =pass; return ;; esac
+  case "$f:$(uname -s)" in tests/pass/host_net.bastio:MINGW*|tests/pass/host_net.bastio:MSYS*|tests/pass/std_http.bastio:MINGW*|tests/pass/std_http.bastio:MSYS*) echo =pass; return ;; esac
   want=$(sed -n 's|^// expect-exit: *||p' "$f" | head -1)
   name=$(basename "$f" .bastio)
   if ! "$BASTIOC" --arch "$ARCH" -o "$w/$name" "$f" 2>"$w/$name.err"; then
@@ -91,6 +91,8 @@ user_one() {
 # Single-file examples (examples/*.bastio) build and run, exiting with 0.
 example_one() {
   local f=$1 name
+  # Sockets are not implemented on Windows (every call fails).
+  case "$f:$(uname -s)" in examples/httpd.bastio:MINGW*|examples/httpd.bastio:MSYS*) echo =pass; return ;; esac
   name=$(basename "$f" .bastio)
   if ! "$BASTIOC" --arch "$ARCH" -o "$w/ex_$name" "$f" 2>"$w/ex.err"; then
     echo "FAIL $f: rejected"; sed 's/^/    /' "$w/ex.err"; echo =fail; return
@@ -106,7 +108,7 @@ tally() {  # after a pfor: add its tallies (a lost job is a failure)
 }
 pfor pass_one $(s1files tests/pass/*.bastio); tally $?
 if [ "$ARCH" != x86_64 ]; then
-  pfor example_one examples/*.bastio; tally $?
+  pfor example_one $(s1files examples/*.bastio); tally $?
   echo "-- $pass passed, $fail failed (ARCH=$ARCH: the programs that run)"
   [ "$fail" = 0 ]
   exit
@@ -295,7 +297,7 @@ while read -r mod prog names; do
   if [ "$got" = 0 ]; then pass=$((pass+1)); else
     echo "FAIL examples of $mod: the example of $(echo $names | cut -d' ' -f$got) failed"; fail=$((fail+1)); fi
 done <"$tmp/libref.list"
-pfor example_one examples/*.bastio; tally $?
+pfor example_one $(s1files examples/*.bastio); tally $?
 s1skip=$(s1left tests/pass/*.bastio tests/fail/*.bastio tests/user/*.bastio)
 if [ "$s1skip" -gt 0 ]; then
   echo "-- $pass passed, $fail failed, $s1skip skipped (stage1-only, and BASTIOC is stage0)"
