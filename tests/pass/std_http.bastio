@@ -130,6 +130,55 @@ fn main(h: &mut Host) -> u64 {
       if expect_body(h, s, p, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 9\r\n\r\nhello", 100, true, "", true) != 0 { bad = bad + 1; }
       if expect_body(h, s, p, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel", 100, true, "", true) != 0 { bad = bad + 1; }
       if expect_body(h, s, p, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n", 100, false, "", true) != 0 { bad = bad + 1; }
+      // Keep-alive: a request that asks to close, a body or a second request
+      // sent early gets its connection closed after the answer.
+      match client(h, p, "GET / HTTP/1.1\r\nHost: x\r\n\r\nGET /2 HTTP/1.1\r\nHost: x\r\n\r\n") {
+        Option::Some(c) => {
+          match http_accept(h, s, 4096) {
+            Option::Some(r) => {
+              let b = bfrom("one\n");
+              match http_answer(h, r, 200, "OK", "text/plain", b) {
+                Option::Some(k) => { net_close(h, k); bad = bad + 1; },
+                Option::None => {},
+              }
+              bfree(b);
+            },
+            Option::None => { bad = bad + 1; },
+          }
+          match http_read_all(h, c, 4096) {
+            Option::Some(m) => {
+              if http_status(m) != 200 { bad = bad + 1; }
+              let pat = bfrom("Connection: close");
+              match bytes_find(m, pat, 0) {
+                Option::Some(i) => {},
+                Option::None => { bad = bad + 1; },
+              }
+              bfree(pat);
+              bfree(m);
+            },
+            Option::None => { bad = bad + 1; },
+          }
+          net_close(h, c);
+        },
+        Option::None => { bad = bad + 1; },
+      }
+      match client(h, p, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nhi") {
+        Option::Some(c) => {
+          match http_accept(h, s, 4096) {
+            Option::Some(r) => {
+              let b = bfrom("one\n");
+              match http_answer(h, r, 200, "OK", "text/plain", b) {
+                Option::Some(k) => { net_close(h, k); bad = bad + 1; },
+                Option::None => {},
+              }
+              bfree(b);
+            },
+            Option::None => { bad = bad + 1; },
+          }
+          net_close(h, c);
+        },
+        Option::None => { bad = bad + 1; },
+      }
       net_close(h, s);
     },
     Option::None => { bad = bad + 1; },

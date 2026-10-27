@@ -52,6 +52,11 @@ fn http_get_request(host: Str, path: Str) -> Bytes {
 /// if !ok { return 1; }
 /// ```
 fn http_response(status: u64, reason: Str, ctype: Str, body: &Bytes) -> Bytes {
+  return http_response_with(status, reason, ctype, body, false);
+}
+
+/// Internal: `http_response` with `Connection: keep-alive` when `keep`.
+fn http_response_with(status: u64, reason: Str, ctype: Str, body: &Bytes, keep: bool) -> Bytes {
   let mut t = text_new();
   text_push_str(&mut t, "HTTP/1.1 ");
   fmt_u64(&mut t, status);
@@ -61,7 +66,11 @@ fn http_response(status: u64, reason: Str, ctype: Str, body: &Bytes) -> Bytes {
   text_push_str(&mut t, ctype);
   text_push_str(&mut t, "\r\nContent-Length: ");
   fmt_u64(&mut t, blen(body));
-  text_push_str(&mut t, "\r\nConnection: close\r\n\r\n");
+  if keep {
+    text_push_str(&mut t, "\r\nConnection: keep-alive\r\n\r\n");
+  } else {
+    text_push_str(&mut t, "\r\nConnection: close\r\n\r\n");
+  }
   text_push_bytes(&mut t, body);
   return text_finish(t);
 }
@@ -252,6 +261,121 @@ fn http_read_all(h: &Host, sock: u64, limit: u64) -> Option[Bytes] {
   return Option[Bytes]::None;
 }
 
+/// Reads one response from `sock` and returns it whole, status line and
+/// headers included, without waiting for the peer to close: the head, then
+/// the `Content-Length` bytes it names. A response with no `Content-Length`
+/// is read to the peer's close, as `http_read_all` does it; a chunked one,
+/// a head that is not a valid response head, a message longer than `limit`
+/// and a peer that closes early give `None`.
+/// ```
+/// // A response on a connection that stays open.
+/// let lo = net_ip4(127, 0, 0, 1);
+/// let mut bad = 1;
+/// match net_listen(host, lo, 0) {
+///   Option::Some(s) => {
+///     let p = net_port(host, s);
+///     match net_connect(host, lo, p) {
+///       Option::Some(c) => {
+///         match net_accept(host, s) {
+///           Option::Some(a) => {
+///             let body = bfrom("hello");
+///             let resp = http_response_with(200, "OK", "text/plain", body, true);
+///             let sent = net_send_all(host, a, resp);
+///             bfree(resp);
+///             bfree(body);
+///             // The connection is still open: this returns at once.
+///             match http_read_response(host, c, 4096) {
+///               Option::Some(m) => {
+///                 if sent && http_status(m) == 200 { bad = 0; }
+///                 bfree(m);
+///               },
+///               Option::None => {},
+///             }
+///             net_close(host, a);
+///           },
+///           Option::None => {},
+///         }
+///         net_close(host, c);
+///       },
+///       Option::None => {},
+///     }
+///     net_close(host, s);
+///   },
+///   Option::None => {},
+/// }
+/// if bad != 0 { return 1; }
+/// ```
+fn http_read_response(h: &Host, sock: u64, limit: u64) -> Option[Bytes] {
+  if limit > 1073741824 {
+    return Option[Bytes]::None;
+  }
+  match http_read_head(h, sock, limit) {
+    Option::Some(head) => {
+      let mut want: u64 = 0;
+      let mut rest = false;
+      let mut ok = true;
+      match http_parse_response(head) {
+        RespHead::Ok(q) => {
+          if q.head_end > blen(head) || q.fields > blen(head) {
+            ok = false;
+          } else {
+            match http_body(head, q.fields) {
+              Body::None => { rest = true; },
+              Body::Length(n) => {
+                if n > limit || q.head_end > limit - n {
+                  ok = false;
+                } else {
+                  want = q.head_end + n;
+                }
+              },
+              Body::Chunked => { ok = false; },
+              Body::Bad(x) => { ok = false; },
+            }
+          }
+        },
+        RespHead::Partial => { ok = false; },
+        RespHead::Bad(x) => { ok = false; },
+      }
+      if blen(head) > 1073741824 {
+        ok = false;
+      }
+      let mut acc = head;
+      let mut chunk = balloc(0);
+      while ok && (rest || blen(acc) < want)
+        invariant !ok || blen(acc) <= 2147483648
+      {
+        if blen(acc) >= limit {
+          ok = false;
+        } else {
+          match net_recv(h, sock, limit - blen(acc), &mut chunk) {
+            Option::Some(n) => {
+              if n == 0 || blen(chunk) == 0 {
+                if !rest { ok = false; }
+                rest = false;
+                want = blen(acc);
+              } else if blen(chunk) > limit || blen(acc) > limit {
+                ok = false;
+              } else {
+                let joined = bytes_concat(acc, chunk);
+                bfree(acc);
+                acc = joined;
+              }
+            },
+            Option::None => { ok = false; },
+          }
+        }
+      }
+      bfree(chunk);
+      if ok {
+        return Option[Bytes]::Some(acc);
+      }
+      bfree(acc);
+      return Option[Bytes]::None;
+    },
+    Option::None => { return Option[Bytes]::None; },
+  }
+}
+
 /// Sends `GET path` to `ip`:`port` (the `Host` header says `host`) and
 /// returns the whole response, at most `limit` bytes, status line and
 /// headers included. Check it with `http_status`; the body starts at
@@ -319,42 +443,84 @@ fn http_get(h: &Host, ip: u64, port: u64, host: Str, path: Str, limit: u64) -> O
 /// ```
 fn http_accept(h: &Host, sock: u64, limit: u64) -> Option[HttpReq] {
   match net_accept(h, sock) {
-    Option::Some(c) => {
-      match http_read_head(h, c, limit) {
-        Option::Some(head) => {
-          match http_parse_head(head) {
-            Head::Ok(q) => {
-              return Option[HttpReq]::Some(HttpReq { conn: c, head: head, req: q });
-            },
-            Head::Partial => {
-              let body = bfrom("bad request\n");
-              let resp = http_response(400, "Bad Request", "text/plain", body);
-              net_send_all(h, c, resp);
-              bfree(resp);
-              bfree(body);
-              net_close(h, c);
-              bfree(head);
-              return Option[HttpReq]::None;
-            },
-            Head::Bad(x) => {
-              let body = bfrom("bad request\n");
-              let resp = http_response(400, "Bad Request", "text/plain", body);
-              net_send_all(h, c, resp);
-              bfree(resp);
-              bfree(body);
-              net_close(h, c);
-              bfree(head);
-              return Option[HttpReq]::None;
-            },
-          }
+    Option::Some(c) => { return http_read_request(h, c, limit); },
+    Option::None => { return Option[HttpReq]::None; },
+  }
+}
+
+/// Reads the next request head (at most `limit` bytes) from the connection
+/// `conn`, which `http_accept` or an earlier answer left open. A peer that
+/// closes it, or sends no whole head, or a head the strict parser rejects
+/// (answered with 400) gives `None`, and the connection is closed.
+/// ```
+/// // Two requests, one after the other, on one connection.
+/// let lo = net_ip4(127, 0, 0, 1);
+/// let mut bad = 1;
+/// match net_listen(host, lo, 0) {
+///   Option::Some(s) => {
+///     let p = net_port(host, s);
+///     match net_connect(host, lo, p) {
+///       Option::Some(c) => {
+///         match net_accept(host, s) {
+///           Option::Some(a) => {
+///             let r1 = http_get_request("x", "/one");
+///             let sent = net_send_all(host, c, r1);
+///             bfree(r1);
+///             match http_read_request(host, a, 4096) {
+///               Option::Some(q) => {
+///                 let t = http_req_target(q);
+///                 if sent && bytes_eq_str(t, "/one") { bad = 0; }
+///                 bfree(t);
+///                 http_close(host, q);
+///               },
+///               Option::None => {},
+///             }
+///           },
+///           Option::None => {},
+///         }
+///         net_close(host, c);
+///       },
+///       Option::None => {},
+///     }
+///     net_close(host, s);
+///   },
+///   Option::None => {},
+/// }
+/// if bad != 0 { return 1; }
+/// ```
+fn http_read_request(h: &Host, c: u64, limit: u64) -> Option[HttpReq] {
+  match http_read_head(h, c, limit) {
+    Option::Some(head) => {
+      match http_parse_head(head) {
+        Head::Ok(q) => {
+          return Option[HttpReq]::Some(HttpReq { conn: c, head: head, req: q });
         },
-        Option::None => {
+        Head::Partial => {
+          let body = bfrom("bad request\n");
+          let resp = http_response(400, "Bad Request", "text/plain", body);
+          net_send_all(h, c, resp);
+          bfree(resp);
+          bfree(body);
           net_close(h, c);
+          bfree(head);
+          return Option[HttpReq]::None;
+        },
+        Head::Bad(x) => {
+          let body = bfrom("bad request\n");
+          let resp = http_response(400, "Bad Request", "text/plain", body);
+          net_send_all(h, c, resp);
+          bfree(resp);
+          bfree(body);
+          net_close(h, c);
+          bfree(head);
           return Option[HttpReq]::None;
         },
       }
     },
-    Option::None => { return Option[HttpReq]::None; },
+    Option::None => {
+      net_close(h, c);
+      return Option[HttpReq]::None;
+    },
   }
 }
 
@@ -544,6 +710,193 @@ fn http_req_body(h: &Host, r: &HttpReq, limit: u64) -> Option[Bytes] {
   }
   bfree(out);
   return Option[Bytes]::None;
+}
+
+/// Internal: does `s[a..b)` spell "connection", ignoring case?
+fn http_is_connection(s: &Bytes, a: u64, b: u64) -> bool
+  requires a <= b && b <= blen(s)
+{
+  if b - a != 10 { return false; }
+  let mut i = 0;
+  while i < 10
+    invariant i <= 10 && a + 10 == b
+  {
+    if http_lower(bget(s, a + i)) != sget("connection", i) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+/// Internal: does `s[a..b)` contain "close", ignoring case?
+fn http_has_close(s: &Bytes, a: u64, b: u64) -> bool
+  requires a <= b && b <= blen(s)
+{
+  let mut i = a;
+  while i + 5 <= b
+    invariant a <= i && i <= b
+  {
+    let mut k = 0;
+    while k < 5 && http_lower(bget(s, i + k)) == sget("close", k)
+      invariant k <= 5 && i + 5 <= b
+    {
+      k = k + 1;
+    }
+    if k == 5 { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+/// May the connection of `r` carry another request once it is answered? Yes
+/// for HTTP/1.1 without `Connection: close`, with no body, and with nothing
+/// read past the head (a client that sent the next request early gets the
+/// connection closed after the answer instead).
+/// ```
+/// // HTTP/1.1 keeps; asking to close, or HTTP/1.0, does not.
+/// let lo = net_ip4(127, 0, 0, 1);
+/// let mut bad = 1;
+/// match net_listen(host, lo, 0) {
+///   Option::Some(s) => {
+///     let p = net_port(host, s);
+///     bad = 0;
+///     let mut n = 0;
+///     while n < 3 {
+///       match net_connect(host, lo, p) {
+///         Option::Some(c) => {
+///           let mut req = bfrom("GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+///           if n == 1 {
+///             bfree(req);
+///             req = bfrom("GET / HTTP/1.1\r\nHost: x\r\nConnection: Keep-Alive, CLOSE\r\n\r\n");
+///           }
+///           if n == 2 {
+///             bfree(req);
+///             req = bfrom("GET / HTTP/1.0\r\nHost: x\r\n\r\n");
+///           }
+///           let sent = net_send_all(host, c, req);
+///           bfree(req);
+///           match http_accept(host, s, 4096) {
+///             Option::Some(r) => {
+///               if !sent || http_req_keeps(r) != (n == 0) { bad = 1; }
+///               http_close(host, r);
+///             },
+///             Option::None => { bad = 1; },
+///           }
+///           net_close(host, c);
+///         },
+///         Option::None => { bad = 1; },
+///       }
+///       n = n + 1;
+///     }
+///     net_close(host, s);
+///   },
+///   Option::None => {},
+/// }
+/// if bad != 0 { return 1; }
+/// ```
+fn http_req_keeps(r: &HttpReq) -> bool {
+  if r.req.minor != 1 || r.req.head_end != blen(r.head) || r.req.fields > blen(r.head) {
+    return false;
+  }
+  match http_body(r.head, r.req.fields) {
+    Body::None => {},
+    Body::Length(x) => { return false; },
+    Body::Chunked => { return false; },
+    Body::Bad(x) => { return false; },
+  }
+  let n = blen(r.head);
+  let mut at = r.req.fields;
+  while at < n
+    invariant r.req.fields <= at && at <= n
+  {
+    match http_field(r.head, at) {
+      Next::Partial => { return false; }
+      Next::Bad(x) => { return false; }
+      Next::End(x) => { return true; }
+      Next::Ok(f) => {
+        if http_is_connection(r.head, at, f.name_end) && http_has_close(r.head, f.value, f.value_end) {
+          return false;
+        }
+        at = f.next;
+      }
+    }
+  }
+  return false;
+}
+
+/// Answers `r` with a response made from `status`, `reason`, `ctype` and
+/// `body`, and frees the request. The response says `Connection:
+/// keep-alive` and the connection is returned, still open, when
+/// `http_req_keeps` allows it; otherwise it says `Connection: close` and the
+/// connection is closed (also when the answer could not be sent) and the
+/// result is `None`. The next request on a returned connection is read with
+/// `http_read_request`.
+/// ```
+/// // Two requests on one connection: the first is answered with keep-alive,
+/// // the second asks to close.
+/// let lo = net_ip4(127, 0, 0, 1);
+/// let mut bad = 1;
+/// match net_listen(host, lo, 0) {
+///   Option::Some(s) => {
+///     let p = net_port(host, s);
+///     match net_connect(host, lo, p) {
+///       Option::Some(c) => {
+///         match net_accept(host, s) {
+///           Option::Some(a) => {
+///             let r1 = bfrom("GET /one HTTP/1.1\r\nHost: x\r\n\r\n");
+///             let sent1 = net_send_all(host, c, r1);
+///             bfree(r1);
+///             let body = bfrom("ok\n");
+///             let mut kept = 0;
+///             match http_read_request(host, a, 4096) {
+///               Option::Some(q) => {
+///                 match http_answer(host, q, 200, "OK", "text/plain", body) {
+///                   Option::Some(k) => { kept = k; },
+///                   Option::None => {},
+///                 }
+///               },
+///               Option::None => {},
+///             }
+///             let r2 = http_get_request("x", "/two");
+///             let sent2 = net_send_all(host, c, r2);
+///             bfree(r2);
+///             if sent1 && sent2 && kept != 0 {
+///               match http_read_request(host, kept, 4096) {
+///                 Option::Some(q) => {
+///                   // Connection: close in the request, so no keep-alive.
+///                   match http_answer(host, q, 200, "OK", "text/plain", body) {
+///                     Option::Some(k) => { net_close(host, k); },
+///                     Option::None => { bad = 0; },
+///                   }
+///                 },
+///                 Option::None => {},
+///               }
+///             }
+///             bfree(body);
+///           },
+///           Option::None => {},
+///         }
+///         net_close(host, c);
+///       },
+///       Option::None => {},
+///     }
+///     net_close(host, s);
+///   },
+///   Option::None => {},
+/// }
+/// if bad != 0 { return 1; }
+/// ```
+fn http_answer(h: &Host, r: HttpReq, status: u64, reason: Str, ctype: Str, body: &Bytes) -> Option[u64] {
+  let keep = http_req_keeps(r);
+  let resp = http_response_with(status, reason, ctype, body, keep);
+  let ok = net_send_all(h, r.conn, resp);
+  bfree(resp);
+  let c = r.conn;
+  bfree(r.head);
+  if ok && keep {
+    return Option[u64]::Some(c);
+  }
+  net_close(h, c);
+  return Option[u64]::None;
 }
 
 /// Sends `resp` (build it with `http_response`) on the request's connection,

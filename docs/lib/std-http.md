@@ -26,11 +26,15 @@ that a response is complete.
 | [`http_status`](#http_status) | The status code of a response (0 if the status line is not `HTTP/1.x NNN`). |
 | [`http_read_head`](#http_read_head) | Reads from `sock` until the bytes read hold a whole head (an empty line), or fails if the peer closes first or the head is longer than `limit`. |
 | [`http_read_all`](#http_read_all) | Reads from `sock` until the peer closes it, or fails if more than `limit` bytes arrive. |
+| [`http_read_response`](#http_read_response) | Reads one response from `sock` and returns it whole, status line and headers included, without waiting for the peer to close. |
 | [`http_get`](#http_get) | Sends `GET path` to `ip`:`port` (the `Host` header says `host`) and returns the whole response, at most `limit` bytes, status line and headers included. |
 | [`http_accept`](#http_accept) | Accepts a connection on the listening socket `sock` and reads its request head (at most `limit` bytes). |
+| [`http_read_request`](#http_read_request) | Reads the next request head (at most `limit` bytes) from the connection `conn`, which `http_accept` or an earlier answer left open. |
 | [`http_req_target`](#http_req_target) | The request target of `r` (the path and query of `GET /a?b HTTP/1.1`), or empty if the request line has none. |
 | [`http_req_is`](#http_req_is) | Is the request method the literal `m`? |
 | [`http_req_body`](#http_req_body) | Reads the body of the request `r` from its connection and returns it, decoded. |
+| [`http_req_keeps`](#http_req_keeps) | May the connection of `r` carry another request once it is answered? Yes for HTTP/1.1 without `Connection. |
+| [`http_answer`](#http_answer) | Answers `r` with a response made from `status`, `reason`, `ctype` and `body`, and frees the request. |
 | [`http_reply`](#http_reply) | Sends `resp` (build it with `http_response`) on the request's connection, closes the connection and frees the request. |
 | [`http_close`](#http_close) | Closes the request's connection and frees the request. |
 
@@ -219,6 +223,60 @@ match net_listen(host, lo, 0) {
 if bad != 0 { return 1; }
 ```
 
+### `http_read_response`
+
+```bastio
+fn http_read_response(h: &Host, sock: u64, limit: u64) -> Option[Bytes]
+```
+
+Reads one response from `sock` and returns it whole, status line and
+headers included, without waiting for the peer to close: the head, then
+the `Content-Length` bytes it names. A response with no `Content-Length`
+is read to the peer's close, as `http_read_all` does it; a chunked one,
+a head that is not a valid response head, a message longer than `limit`
+and a peer that closes early give `None`.
+
+Example:
+
+```bastio
+// A response on a connection that stays open.
+let lo = net_ip4(127, 0, 0, 1);
+let mut bad = 1;
+match net_listen(host, lo, 0) {
+  Option::Some(s) => {
+    let p = net_port(host, s);
+    match net_connect(host, lo, p) {
+      Option::Some(c) => {
+        match net_accept(host, s) {
+          Option::Some(a) => {
+            let body = bfrom("hello");
+            let resp = http_response_with(200, "OK", "text/plain", body, true);
+            let sent = net_send_all(host, a, resp);
+            bfree(resp);
+            bfree(body);
+            // The connection is still open: this returns at once.
+            match http_read_response(host, c, 4096) {
+              Option::Some(m) => {
+                if sent && http_status(m) == 200 { bad = 0; }
+                bfree(m);
+              },
+              Option::None => {},
+            }
+            net_close(host, a);
+          },
+          Option::None => {},
+        }
+        net_close(host, c);
+      },
+      Option::None => {},
+    }
+    net_close(host, s);
+  },
+  Option::None => {},
+}
+if bad != 0 { return 1; }
+```
+
 ### `http_get`
 
 ```bastio
@@ -272,6 +330,56 @@ match net_listen(host, lo, 0) {
             if sent && bytes_eq_str(t, "/hello") { bad = 0; }
             bfree(t);
             http_close(host, r);
+          },
+          Option::None => {},
+        }
+        net_close(host, c);
+      },
+      Option::None => {},
+    }
+    net_close(host, s);
+  },
+  Option::None => {},
+}
+if bad != 0 { return 1; }
+```
+
+### `http_read_request`
+
+```bastio
+fn http_read_request(h: &Host, c: u64, limit: u64) -> Option[HttpReq]
+```
+
+Reads the next request head (at most `limit` bytes) from the connection
+`conn`, which `http_accept` or an earlier answer left open. A peer that
+closes it, or sends no whole head, or a head the strict parser rejects
+(answered with 400) gives `None`, and the connection is closed.
+
+Example:
+
+```bastio
+// Two requests, one after the other, on one connection.
+let lo = net_ip4(127, 0, 0, 1);
+let mut bad = 1;
+match net_listen(host, lo, 0) {
+  Option::Some(s) => {
+    let p = net_port(host, s);
+    match net_connect(host, lo, p) {
+      Option::Some(c) => {
+        match net_accept(host, s) {
+          Option::Some(a) => {
+            let r1 = http_get_request("x", "/one");
+            let sent = net_send_all(host, c, r1);
+            bfree(r1);
+            match http_read_request(host, a, 4096) {
+              Option::Some(q) => {
+                let t = http_req_target(q);
+                if sent && bytes_eq_str(t, "/one") { bad = 0; }
+                bfree(t);
+                http_close(host, q);
+              },
+              Option::None => {},
+            }
           },
           Option::None => {},
         }
@@ -394,6 +502,134 @@ match net_listen(host, lo, 0) {
 if bad != 0 { return 1; }
 ```
 
+### `http_req_keeps`
+
+```bastio
+fn http_req_keeps(r: &HttpReq) -> bool
+```
+
+May the connection of `r` carry another request once it is answered? Yes
+for HTTP/1.1 without `Connection: close`, with no body, and with nothing
+read past the head (a client that sent the next request early gets the
+connection closed after the answer instead).
+
+Example:
+
+```bastio
+// HTTP/1.1 keeps; asking to close, or HTTP/1.0, does not.
+let lo = net_ip4(127, 0, 0, 1);
+let mut bad = 1;
+match net_listen(host, lo, 0) {
+  Option::Some(s) => {
+    let p = net_port(host, s);
+    bad = 0;
+    let mut n = 0;
+    while n < 3 {
+      match net_connect(host, lo, p) {
+        Option::Some(c) => {
+          let mut req = bfrom("GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+          if n == 1 {
+            bfree(req);
+            req = bfrom("GET / HTTP/1.1\r\nHost: x\r\nConnection: Keep-Alive, CLOSE\r\n\r\n");
+          }
+          if n == 2 {
+            bfree(req);
+            req = bfrom("GET / HTTP/1.0\r\nHost: x\r\n\r\n");
+          }
+          let sent = net_send_all(host, c, req);
+          bfree(req);
+          match http_accept(host, s, 4096) {
+            Option::Some(r) => {
+              if !sent || http_req_keeps(r) != (n == 0) { bad = 1; }
+              http_close(host, r);
+            },
+            Option::None => { bad = 1; },
+          }
+          net_close(host, c);
+        },
+        Option::None => { bad = 1; },
+      }
+      n = n + 1;
+    }
+    net_close(host, s);
+  },
+  Option::None => {},
+}
+if bad != 0 { return 1; }
+```
+
+### `http_answer`
+
+```bastio
+fn http_answer(h: &Host, r: HttpReq, status: u64, reason: Str, ctype: Str, body: &Bytes) -> Option[u64]
+```
+
+Answers `r` with a response made from `status`, `reason`, `ctype` and
+`body`, and frees the request. The response says `Connection:
+keep-alive` and the connection is returned, still open, when
+`http_req_keeps` allows it; otherwise it says `Connection: close` and the
+connection is closed (also when the answer could not be sent) and the
+result is `None`. The next request on a returned connection is read with
+`http_read_request`.
+
+Example:
+
+```bastio
+// Two requests on one connection: the first is answered with keep-alive,
+// the second asks to close.
+let lo = net_ip4(127, 0, 0, 1);
+let mut bad = 1;
+match net_listen(host, lo, 0) {
+  Option::Some(s) => {
+    let p = net_port(host, s);
+    match net_connect(host, lo, p) {
+      Option::Some(c) => {
+        match net_accept(host, s) {
+          Option::Some(a) => {
+            let r1 = bfrom("GET /one HTTP/1.1\r\nHost: x\r\n\r\n");
+            let sent1 = net_send_all(host, c, r1);
+            bfree(r1);
+            let body = bfrom("ok\n");
+            let mut kept = 0;
+            match http_read_request(host, a, 4096) {
+              Option::Some(q) => {
+                match http_answer(host, q, 200, "OK", "text/plain", body) {
+                  Option::Some(k) => { kept = k; },
+                  Option::None => {},
+                }
+              },
+              Option::None => {},
+            }
+            let r2 = http_get_request("x", "/two");
+            let sent2 = net_send_all(host, c, r2);
+            bfree(r2);
+            if sent1 && sent2 && kept != 0 {
+              match http_read_request(host, kept, 4096) {
+                Option::Some(q) => {
+                  // Connection: close in the request, so no keep-alive.
+                  match http_answer(host, q, 200, "OK", "text/plain", body) {
+                    Option::Some(k) => { net_close(host, k); },
+                    Option::None => { bad = 0; },
+                  }
+                },
+                Option::None => {},
+              }
+            }
+            bfree(body);
+          },
+          Option::None => {},
+        }
+        net_close(host, c);
+      },
+      Option::None => {},
+    }
+    net_close(host, s);
+  },
+  Option::None => {},
+}
+if bad != 0 { return 1; }
+```
+
 ### `http_reply`
 
 ```bastio
@@ -462,3 +698,31 @@ Example:
 ```bastio
 // See `http_accept`.
 ```
+
+## Internals
+
+### `http_response_with`
+
+```bastio
+fn http_response_with(status: u64, reason: Str, ctype: Str, body: &Bytes, keep: bool) -> Bytes
+```
+
+Internal: `http_response` with `Connection: keep-alive` when `keep`.
+
+### `http_is_connection`
+
+```bastio
+fn http_is_connection(s: &Bytes, a: u64, b: u64) -> bool
+  requires a <= b && b <= blen(s)
+```
+
+Internal: does `s[a..b)` spell "connection", ignoring case?
+
+### `http_has_close`
+
+```bastio
+fn http_has_close(s: &Bytes, a: u64, b: u64) -> bool
+  requires a <= b && b <= blen(s)
+```
+
+Internal: does `s[a..b)` contain "close", ignoring case?
