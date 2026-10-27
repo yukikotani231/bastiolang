@@ -7,15 +7,16 @@ target: a client that fetches a page, and the building blocks of a server
 (accept a request, answer it). Every message is sent with
 `Connection: close`, so a body ends where the connection does and no
 chunked transfer is needed. A parser for a request head that is safe
-against hostile input is examples/http/http.bastio; this module only
-finds the end of a head and the request target.
+against hostile input is examples/http/http.bastio, and `http_accept`
+uses it: a request whose head it rejects is answered with 400 and never
+reaches the caller.
 
 What is proved: no read or write is out of bounds, and every buffer is
 freed. Not proved: that a peer speaks HTTP, that what is read stays within
 the limit given (the socket call's result is opaque to the prover), or
 that a response is complete.
 
-`import "std/http.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [std/net.bastio](std-net.md), [core/text.bastio](core-text.md), [core/num.bastio](core-num.md).
+`import "std/http.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [std/net.bastio](std-net.md), [examples/http/http.bastio](examples-http-http.md), [core/text.bastio](core-text.md), [core/num.bastio](core-num.md).
 
 | Function | |
 | --- | --- |
@@ -39,11 +40,12 @@ Every example below is built, verified and run by `tests/run.sh`. An `assert` in
 ### `HttpReq`
 
 ```bastio
-struct HttpReq { conn: u64, head: Bytes }
+struct HttpReq { conn: u64, head: Bytes, req: Req }
 ```
 
-A request that has been read: the connection it came on and the bytes
-read so far (the head, and possibly the start of a body).
+A request that has been read: the connection it came on, the bytes read
+so far (the head, and possibly the start of a body) and where the strict
+parser found the method, the target and the fields in them.
 
 ## Functions
 

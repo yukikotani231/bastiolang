@@ -39,7 +39,7 @@ export BASTIOC ARCH RUN
 pass_one() {
   local f=$1 want name got out
   # Sockets are not implemented on Windows (every call fails).
-  case "$f:$(uname -s)" in tests/pass/host_net.bastio:MINGW*|tests/pass/host_net.bastio:MSYS*) echo =pass; return ;; esac
+  case "$f:$(uname -s)" in tests/pass/host_net.bastio:MINGW*|tests/pass/host_net.bastio:MSYS*|tests/pass/std_http.bastio:MINGW*|tests/pass/std_http.bastio:MSYS*) echo =pass; return ;; esac
   want=$(sed -n 's|^// expect-exit: *||p' "$f" | head -1)
   name=$(basename "$f" .bastio)
   if ! "$BASTIOC" --arch "$ARCH" -o "$w/$name" "$f" 2>"$w/$name.err"; then

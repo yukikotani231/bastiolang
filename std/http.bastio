@@ -3,19 +3,22 @@
 // (accept a request, answer it). Every message is sent with
 // `Connection: close`, so a body ends where the connection does and no
 // chunked transfer is needed. A parser for a request head that is safe
-// against hostile input is examples/http/http.bastio; this module only
-// finds the end of a head and the request target.
+// against hostile input is examples/http/http.bastio, and `http_accept`
+// uses it: a request whose head it rejects is answered with 400 and never
+// reaches the caller.
 //
 // What is proved: no read or write is out of bounds, and every buffer is
 // freed. Not proved: that a peer speaks HTTP, that what is read stays within
 // the limit given (the socket call's result is opaque to the prover), or
 // that a response is complete.
 import "net.bastio";
+import "../examples/http/http.bastio";
 import "../core/num.bastio";
 
-/// A request that has been read: the connection it came on and the bytes
-/// read so far (the head, and possibly the start of a body).
-struct HttpReq { conn: u64, head: Bytes }
+/// A request that has been read: the connection it came on, the bytes read
+/// so far (the head, and possibly the start of a body) and where the strict
+/// parser found the method, the target and the fields in them.
+struct HttpReq { conn: u64, head: Bytes, req: Req }
 
 /// The request for `GET path` from `host`.
 /// ```
@@ -318,7 +321,33 @@ fn http_accept(h: &Host, sock: u64, limit: u64) -> Option[HttpReq] {
   match net_accept(h, sock) {
     Option::Some(c) => {
       match http_read_head(h, c, limit) {
-        Option::Some(head) => { return Option[HttpReq]::Some(HttpReq { conn: c, head: head }); },
+        Option::Some(head) => {
+          match http_parse_head(head) {
+            Head::Ok(q) => {
+              return Option[HttpReq]::Some(HttpReq { conn: c, head: head, req: q });
+            },
+            Head::Partial => {
+              let body = bfrom("bad request\n");
+              let resp = http_response(400, "Bad Request", "text/plain", body);
+              net_send_all(h, c, resp);
+              bfree(resp);
+              bfree(body);
+              net_close(h, c);
+              bfree(head);
+              return Option[HttpReq]::None;
+            },
+            Head::Bad(x) => {
+              let body = bfrom("bad request\n");
+              let resp = http_response(400, "Bad Request", "text/plain", body);
+              net_send_all(h, c, resp);
+              bfree(resp);
+              bfree(body);
+              net_close(h, c);
+              bfree(head);
+              return Option[HttpReq]::None;
+            },
+          }
+        },
         Option::None => {
           net_close(h, c);
           return Option[HttpReq]::None;
@@ -332,16 +361,10 @@ fn http_accept(h: &Host, sock: u64, limit: u64) -> Option[HttpReq] {
 /// The request target of `r` (the path and query of `GET /a?b HTTP/1.1`), or
 /// empty if the request line has none.
 fn http_req_target(r: &HttpReq) -> Bytes {
-  let sp = bytes_find_byte(r.head, 32, 0);
-  if sp >= blen(r.head) {
-    return balloc(0);
+  if r.req.target < r.req.target_end && r.req.target_end <= blen(r.head) {
+    return bytes_slice(r.head, r.req.target, r.req.target_end);
   }
-  let from = sp + 1;
-  let to = bytes_find_byte(r.head, 32, from);
-  if to > blen(r.head) {
-    return balloc(0);
-  }
-  return bytes_slice(r.head, from, to);
+  return balloc(0);
 }
 
 /// Is the request method the literal `m`?
@@ -374,8 +397,7 @@ fn http_req_target(r: &HttpReq) -> Bytes {
 /// if bad != 0 { return 1; }
 /// ```
 fn http_req_is(r: &HttpReq, m: Str) -> bool {
-  let sp = bytes_find_byte(r.head, 32, 0);
-  return sp == slen(m) && bytes_span_eq_str(r.head, 0, sp, m);
+  return r.req.method_end == slen(m) && r.req.method_end <= blen(r.head) && bytes_span_eq_str(r.head, 0, r.req.method_end, m);
 }
 
 /// Sends `resp` (build it with `http_response`) on the request's connection,
