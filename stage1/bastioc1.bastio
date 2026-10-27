@@ -628,12 +628,6 @@ fn b1_native(host: &Host, c: &Checker, m: &mut Mono, p: &Parser, target: u64, aa
         push_arg(&mut ld, "-o");
         vec_push(&mut ld, b1_concat(exe, ""));
         vec_push(&mut ld, b1_concat(ofile, ""));
-        if windows {
-          // The stack is committed up front: Windows grows it one guard page
-          // at a time, and the generated frames can be larger than a page.
-          push_arg(&mut ld, "-Xlinker");
-          push_arg(&mut ld, "--stack=16777216,16777216");
-        }
         status = b1_tool(host, ld, "the linker", &mut out);
       }
       if status == 0 {
@@ -666,7 +660,7 @@ fn b1_help(out: &mut Vec[u64]) {
   w_s(&mut out, "  --os O           linux (the default), macos (--backend native --arch aarch64, or --backend native-ir: Mach-O assembly for Apple's assembler and linker driver) or windows (--backend native-ir: assembly for MinGW-w64)\n");
   w_s(&mut out, "  --backend B      c, or native (x86-64 assembly, or AArch64 with --arch aarch64); hosted programs on x86-64 Linux use native-ir unless --backend or --emit-c says otherwise\n");
   w_s(&mut out, "  --self-link      with --backend native-ir: assemble and link with the built-in assembler and linker (the default on Windows, macOS and glibc or musl Linux hosts; --musl-link writes an executable for musl's loader)\n");
-  w_s(&mut out, "  --gnu-link       with --backend native-ir: assemble and link with the platform's as and cc instead (--mingw-link is the same)\n");
+  w_s(&mut out, "  --gnu-link       with --backend native-ir: assemble and link with the platform's as and cc instead\n");
   w_s(&mut out, "  --emit-asm       with --backend native: write the assembly instead of an executable\n");
   w_s(&mut out, "  --lib DIR        also look for imported files in DIR\n");
   w_s(&mut out, "  --pkg NAME=DIR   import \"NAME/rest\" is the file rest in DIR\n");
@@ -719,7 +713,7 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
     } else if b1_is(a, "--musl-link") {
       linkchoice = 3;
       bfree(a);
-    } else if b1_is(a, "--gnu-link") || b1_is(a, "--mingw-link") {
+    } else if b1_is(a, "--gnu-link") {
       linkchoice = 2;
       bfree(a);
     } else if b1_is(a, "--dump-smt") {
@@ -1052,6 +1046,9 @@ fn main(con: &mut Serial, host: &mut Host) -> u64 {
               k = k + 1;
             }
             w_s(&mut out, " is a library (it has no `main`): build it with --emit-c (or --backend native) and link the result into a program\n");
+            status = 2;
+          } else if native && windows && linkchoice == 2 && !emit_asm {
+            w_s(&mut out, "bastioc1: --gnu-link does not apply to --os windows: the executable is written and linked by bastioc1's own PE writer (--emit-asm gives the assembly)\n");
             status = 2;
           } else if native {
             b1_flush(host, &mut out);
