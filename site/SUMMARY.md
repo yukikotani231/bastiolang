@@ -50,6 +50,7 @@
   - [core/wtext.bastio](lib-core-wtext.md)
   - [std/host.bastio](lib-std-host.md)
   - [std/net.bastio](lib-std-net.md)
+  - [std/http.bastio](lib-std-http.md)
 
 # Project
 

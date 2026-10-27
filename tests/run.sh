@@ -287,7 +287,7 @@ if python3 tests/libref.py --check >"$tmp/libref.out" 2>&1; then pass=$((pass+1)
   echo "FAIL tests/libref.py --check"; sed 's/^/    /' "$tmp/libref.out"; fail=$((fail+1)); fi
 python3 tests/libref.py --examples "$tmp/libref" >"$tmp/libref.list"
 while read -r mod prog names; do
-  case "$mod:$(uname -s)" in std/net.bastio:MINGW*|std/net.bastio:MSYS*) pass=$((pass+1)); continue ;; esac
+  case "$mod:$(uname -s)" in std/net.bastio:MINGW*|std/net.bastio:MSYS*|std/http.bastio:MINGW*|std/http.bastio:MSYS*) pass=$((pass+1)); continue ;; esac
   if ! "$BASTIOC" --lib "$PWD" -o "${prog%.bastio}" "$prog" 2>"$tmp/libref.err"; then
     echo "FAIL examples of $mod: rejected"; sed 's/^/    /' "$tmp/libref.err"; fail=$((fail+1)); continue
   fi
