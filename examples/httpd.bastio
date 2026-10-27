@@ -1,9 +1,9 @@
 // stage1-only: host_net (sockets), std/http
 // A small HTTP server with std/http: two routes, and an answer for anything
-// else. Run with no arguments it checks itself: it listens on a free port of
-// 127.0.0.1, sends itself a request for each route over a real connection,
-// and exits with 0 if the answers are right. `httpd serve PORT` serves on
-// 127.0.0.1:PORT until it is killed.
+// else, with keep-alive. Run with no arguments it checks itself: it listens
+// on a free port of 127.0.0.1, sends itself a request for each route over one
+// real connection, and exits with 0 if the answers are right. `httpd serve
+// PORT` serves on 127.0.0.1:PORT until it is killed.
 //
 // What the compiler proves: no buffer is read or written out of bounds and
 // none leaks. It does not prove that the answers are right (the self-check
@@ -12,52 +12,89 @@ import "core/print.bastio";
 import "std/host.bastio";
 import "std/http.bastio";
 
-/// The answer to a request for `target`.
-fn route(target: &Bytes) -> Bytes {
-  if bytes_eq_str(target, "/") {
+/// Answers the request `r`: the page for its target. The connection comes
+/// back, still open, when the client may send another request on it.
+fn answer(h: &Host, r: HttpReq) -> Option[u64] {
+  let t = http_req_target(r);
+  if bytes_eq_str(t, "/") {
+    bfree(t);
     let body = bfrom("hello from Bastio\n");
-    let r = http_response(200, "OK", "text/plain", body);
+    let k = http_answer(h, r, 200, "OK", "text/plain", body);
     bfree(body);
-    return r;
+    return k;
   }
-  if bytes_eq_str(target, "/about") {
+  if bytes_eq_str(t, "/about") {
+    bfree(t);
     let body = bfrom("<h1>Bastio</h1><p>memory safety, proved at compile time</p>\n");
-    let r = http_response(200, "OK", "text/html", body);
+    let k = http_answer(h, r, 200, "OK", "text/html", body);
     bfree(body);
-    return r;
+    return k;
   }
+  bfree(t);
   let body = bfrom("not found\n");
-  let r = http_response(404, "Not Found", "text/plain", body);
+  let k = http_answer(h, r, 404, "Not Found", "text/plain", body);
   bfree(body);
-  return r;
+  return k;
 }
 
-/// Reads one request from the listener `s` and answers it. False if the
-/// request could not be read or the answer could not be sent.
-fn serve_one(h: &Host, s: u64) -> bool {
-  match http_accept(h, s, 8192) {
-    Option::Some(r) => {
-      let t = http_req_target(r);
-      let resp = route(t);
-      bfree(t);
-      let ok = http_reply(h, r, resp);
-      bfree(resp);
-      return ok;
-    },
-    Option::None => { return false; },
+/// Reads the next request on the connection `c` and answers it. The
+/// connection again if it stays open; `None` once it is closed (the client
+/// asked for that, or went away, or sent something that is not a request).
+fn step(h: &Host, c: u64) -> Option[u64] {
+  match http_read_request(h, c, 8192) {
+    Option::Some(r) => { return answer(h, r); },
+    Option::None => { return Option[u64]::None; },
   }
 }
 
-/// Asks the server on `lo`:`port` for `path` through `c` (already connected)
-/// and has `s` answer it; returns the status of the answer, 0 on failure.
-fn ask(h: &Host, s: u64, c: u64, path: Str) -> u64 {
-  let req = http_get_request("localhost", path);
+/// Serves the connection `c` until it is closed, but for at most 100
+/// requests, so that one client cannot hold the server for ever.
+fn serve_conn(h: &Host, c: u64) {
+  let mut cur = c;
+  let mut n = 0;
+  while cur != 0 && n < 100
+    invariant n <= 100
+  {
+    match step(h, cur) {
+      Option::Some(k) => { cur = k; },
+      Option::None => { cur = 0; },
+    }
+    n = n + 1;
+  }
+  if cur != 0 {
+    net_close(h, cur);
+  }
+}
+
+/// Sends a request for `path` on `c` (already connected) and has the server
+/// side `a` answer it; returns the status of the answer, 0 on failure. The
+/// `Connection: keep-alive` of the answer shows if the connection stayed open.
+fn ask(h: &Host, a: u64, c: u64, path: Str, last: bool) -> u64 {
+  let mut t = text_new();
+  text_push_str(&mut t, "GET ");
+  text_push_str(&mut t, path);
+  if last {
+    text_push_str(&mut t, " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+  } else {
+    text_push_str(&mut t, " HTTP/1.1\r\nHost: localhost\r\n\r\n");
+  }
+  let req = text_finish(t);
   let sent = net_send_all(h, c, req);
   bfree(req);
-  if !sent || !serve_one(h, s) {
+  if !sent {
     return 0;
   }
-  match http_read_all(h, c, 65536) {
+  let mut open = false;
+  match step(h, a) {
+    Option::Some(k) => { open = true; },
+    Option::None => {},
+  }
+  // A kept connection must be kept exactly when the client did not ask to
+  // close it.
+  if open == last {
+    return 0;
+  }
+  match http_read_response(h, c, 65536) {
     Option::Some(m) => {
       let st = http_status(m);
       bfree(m);
@@ -67,7 +104,8 @@ fn ask(h: &Host, s: u64, c: u64, path: Str) -> u64 {
   }
 }
 
-/// Listens on `lo`:`port` and answers requests for ever.
+/// Listens on `lo`:`port` and answers requests for ever, one connection at a
+/// time.
 fn serve(con: &Serial, h: &Host, lo: u64, port: u64) -> u64 {
   match net_listen(h, lo, port) {
     Option::Some(s) => {
@@ -75,7 +113,10 @@ fn serve(con: &Serial, h: &Host, lo: u64, port: u64) -> u64 {
       print_u64(con, net_port(h, s));
       print_nl(con);
       while true {
-        serve_one(h, s);
+        match net_accept(h, s) {
+          Option::Some(c) => { serve_conn(h, c); },
+          Option::None => {},
+        }
       }
       net_close(h, s);
       return 0;
@@ -87,40 +128,40 @@ fn serve(con: &Serial, h: &Host, lo: u64, port: u64) -> u64 {
   }
 }
 
-/// Starts the server on a free port and asks it for each route.
+/// Starts the server on a free port and asks it for each route over one
+/// connection, the last request asking to close it.
 fn selfcheck(con: &Serial, h: &Host, lo: u64) -> u64 {
-  let mut total = 0;
+  let mut good = 0;
   match net_listen(h, lo, 0) {
     Option::Some(s) => {
-      let p = net_port(h, s);
-      let mut want = 0;
-      let mut good = 0;
-      while want < 3
-        invariant want <= 3 && good <= want
-      {
-        match net_connect(h, lo, p) {
-          Option::Some(c) => {
-            let mut st = 0;
-            if want == 0 { st = ask(h, s, c, "/"); }
-            if want == 1 { st = ask(h, s, c, "/about"); }
-            if want == 2 { st = ask(h, s, c, "/missing"); }
-            print_u64(con, st);
-            print_nl(con);
-            if (want < 2 && st == 200) || (want == 2 && st == 404) {
-              good = good + 1;
-            }
-            net_close(h, c);
-          },
-          Option::None => {},
-        }
-        want = want + 1;
+      match net_connect(h, lo, net_port(h, s)) {
+        Option::Some(c) => {
+          match net_accept(h, s) {
+            Option::Some(a) => {
+              let st0 = ask(h, a, c, "/", false);
+              let st1 = ask(h, a, c, "/about", false);
+              let st2 = ask(h, a, c, "/missing", true);
+              print_u64(con, st0);
+              print_nl(con);
+              print_u64(con, st1);
+              print_nl(con);
+              print_u64(con, st2);
+              print_nl(con);
+              if st0 == 200 && st1 == 200 && st2 == 404 {
+                good = 1;
+              }
+            },
+            Option::None => {},
+          }
+          net_close(h, c);
+        },
+        Option::None => {},
       }
-      total = good;
       net_close(h, s);
     },
     Option::None => {},
   }
-  if total == 3 {
+  if good == 1 {
     return 0;
   }
   return 1;
