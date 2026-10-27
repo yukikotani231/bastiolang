@@ -16,7 +16,7 @@ freed. Not proved: that a peer speaks HTTP, that what is read stays within
 the limit given (the socket call's result is opaque to the prover), or
 that a response is complete.
 
-`import "std/http.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [std/net.bastio](std-net.md), [examples/http/http.bastio](examples-http-http.md), [core/text.bastio](core-text.md), [core/num.bastio](core-num.md).
+`import "std/http.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [std/net.bastio](std-net.md), `examples/http/http.bastio`, [core/text.bastio](core-text.md), [core/num.bastio](core-num.md).
 
 | Function | |
 | --- | --- |
