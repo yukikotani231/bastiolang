@@ -1,0 +1,439 @@
+// std/http.bastio: HTTP/1.1 over std/net.bastio, for programs on the hosted
+// target: a client that fetches a page, and the building blocks of a server
+// (accept a request, answer it). Every message is sent with
+// `Connection: close`, so a body ends where the connection does and no
+// chunked transfer is needed. A parser for a request head that is safe
+// against hostile input is examples/http/http.bastio; this module only
+// finds the end of a head and the request target.
+//
+// What is proved: no read or write is out of bounds, and every buffer is
+// freed. Not proved: that a peer speaks HTTP, that what is read stays within
+// the limit given (the socket call's result is opaque to the prover), or
+// that a response is complete.
+import "net.bastio";
+import "../core/num.bastio";
+
+/// A request that has been read: the connection it came on and the bytes
+/// read so far (the head, and possibly the start of a body).
+struct HttpReq { conn: u64, head: Bytes }
+
+/// The request for `GET path` from `host`.
+/// ```
+/// let r = http_get_request("example.org", "/index.html");
+/// let want = bfrom("GET /index.html HTTP/1.1\r\nHost: example.org\r\nConnection: close\r\n\r\n");
+/// let ok = bytes_eq(r, want);
+/// bfree(r);
+/// bfree(want);
+/// if !ok { return 1; }
+/// ```
+fn http_get_request(host: Str, path: Str) -> Bytes {
+  let mut t = text_new();
+  text_push_str(&mut t, "GET ");
+  text_push_str(&mut t, path);
+  text_push_str(&mut t, " HTTP/1.1\r\nHost: ");
+  text_push_str(&mut t, host);
+  text_push_str(&mut t, "\r\nConnection: close\r\n\r\n");
+  return text_finish(t);
+}
+
+/// A response with status `status`, reason phrase `reason`, content type
+/// `ctype` and body `body`.
+/// ```
+/// let body = bfrom("hi");
+/// let r = http_response(200, "OK", "text/plain", body);
+/// let want = bfrom("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi");
+/// let ok = bytes_eq(r, want);
+/// bfree(r);
+/// bfree(want);
+/// bfree(body);
+/// if !ok { return 1; }
+/// ```
+fn http_response(status: u64, reason: Str, ctype: Str, body: &Bytes) -> Bytes {
+  let mut t = text_new();
+  text_push_str(&mut t, "HTTP/1.1 ");
+  fmt_u64(&mut t, status);
+  text_push_str(&mut t, " ");
+  text_push_str(&mut t, reason);
+  text_push_str(&mut t, "\r\nContent-Type: ");
+  text_push_str(&mut t, ctype);
+  text_push_str(&mut t, "\r\nContent-Length: ");
+  fmt_u64(&mut t, blen(body));
+  text_push_str(&mut t, "\r\nConnection: close\r\n\r\n");
+  text_push_bytes(&mut t, body);
+  return text_finish(t);
+}
+
+/// Where the body starts: just past the empty line that ends the head.
+/// ```
+/// let m = bfrom("HTTP/1.1 200 OK\r\nA: b\r\n\r\nbody");
+/// let mut ok = false;
+/// match http_body_start(m) {
+///   Option::Some(i) => { ok = i == 25; },
+///   Option::None => {},
+/// }
+/// bfree(m);
+/// if !ok { return 1; }
+/// ```
+fn http_body_start(m: &Bytes) -> Option[u64] {
+  let end = bfrom("\r\n\r\n");
+  let r = bytes_find(m, end, 0);
+  bfree(end);
+  match r {
+    Option::Some(i) => { return Option[u64]::Some(i + 4); },
+    Option::None => { return Option[u64]::None; },
+  }
+}
+
+/// The status code of a response (0 if the status line is not
+/// `HTTP/1.x NNN`).
+/// ```
+/// let m = bfrom("HTTP/1.1 404 Not Found\r\n\r\n");
+/// let s = http_status(m);
+/// bfree(m);
+/// if s != 404 { return 1; }
+/// ```
+fn http_status(m: &Bytes) -> u64 {
+  if blen(m) < 12 {
+    return 0;
+  }
+  if !bytes_span_eq_str(m, 0, 7, "HTTP/1.") || bget(m, 8) != 32 {
+    return 0;
+  }
+  match parse_u64(m, 9, 12) {
+    Option::Some(s) => { return s; },
+    Option::None => { return 0; },
+  }
+}
+
+/// Reads from `sock` until the bytes read hold a whole head (an empty line),
+/// or fails if the peer closes first or the head is longer than `limit`. The
+/// result may end with the first bytes of a body.
+/// ```
+/// // The head ends at the empty line; a peer that stops sooner is an error.
+/// let lo = net_ip4(127, 0, 0, 1);
+/// let mut bad = 1;
+/// match net_listen(host, lo, 0) {
+///   Option::Some(s) => {
+///     let p = net_port(host, s);
+///     match net_connect(host, lo, p) {
+///       Option::Some(c) => {
+///         match net_accept(host, s) {
+///           Option::Some(a) => {
+///             let part = bfrom("GET / HTTP/1.1\r\nHost: x\r\n");
+///             let sent = net_send_all(host, c, part);
+///             bfree(part);
+///             net_close(host, c);
+///             match http_read_head(host, a, 4096) {
+///               Option::Some(m) => { bfree(m); },
+///               Option::None => { if sent { bad = 0; } },
+///             }
+///             net_close(host, a);
+///           },
+///           Option::None => { net_close(host, c); },
+///         }
+///       },
+///       Option::None => {},
+///     }
+///     net_close(host, s);
+///   },
+///   Option::None => {},
+/// }
+/// if bad != 0 { return 1; }
+/// ```
+fn http_read_head(h: &Host, sock: u64, limit: u64) -> Option[Bytes] {
+  if limit > 1073741824 {
+    return Option[Bytes]::None;
+  }
+  let mut acc = balloc(0);
+  let mut chunk = balloc(0);
+  let mut done = false;
+  let mut ok = true;
+  while !done && ok {
+    match http_body_start(acc) {
+      Option::Some(i) => { done = true; },
+      Option::None => {
+        if blen(acc) >= limit {
+          ok = false;
+        } else {
+          match net_recv(h, sock, limit - blen(acc), &mut chunk) {
+            Option::Some(n) => {
+              if n == 0 || blen(chunk) == 0 || blen(chunk) > limit {
+                ok = false;
+              } else {
+                let joined = bytes_concat(acc, chunk);
+                bfree(acc);
+                acc = joined;
+              }
+            },
+            Option::None => { ok = false; },
+          }
+        }
+      },
+    }
+  }
+  bfree(chunk);
+  if ok {
+    return Option[Bytes]::Some(acc);
+  }
+  bfree(acc);
+  return Option[Bytes]::None;
+}
+
+/// Reads from `sock` until the peer closes it, or fails if more than `limit`
+/// bytes arrive.
+/// ```
+/// // Everything the peer sends, up to its close.
+/// let lo = net_ip4(127, 0, 0, 1);
+/// let mut bad = 1;
+/// match net_listen(host, lo, 0) {
+///   Option::Some(s) => {
+///     let p = net_port(host, s);
+///     match net_connect(host, lo, p) {
+///       Option::Some(c) => {
+///         match net_accept(host, s) {
+///           Option::Some(a) => {
+///             let msg = bfrom("abcdef");
+///             let sent = net_send_all(host, a, msg);
+///             bfree(msg);
+///             net_close(host, a);
+///             match http_read_all(host, c, 100) {
+///               Option::Some(m) => { if sent && bytes_eq_str(m, "abcdef") { bad = 0; } bfree(m); },
+///               Option::None => {},
+///             }
+///           },
+///           Option::None => {},
+///         }
+///         net_close(host, c);
+///       },
+///       Option::None => {},
+///     }
+///     net_close(host, s);
+///   },
+///   Option::None => {},
+/// }
+/// if bad != 0 { return 1; }
+/// ```
+fn http_read_all(h: &Host, sock: u64, limit: u64) -> Option[Bytes] {
+  if limit > 1073741824 {
+    return Option[Bytes]::None;
+  }
+  let mut acc = balloc(0);
+  let mut chunk = balloc(0);
+  let mut done = false;
+  let mut ok = true;
+  while !done && ok {
+    if blen(acc) >= limit {
+      ok = false;
+    } else {
+      match net_recv(h, sock, limit - blen(acc), &mut chunk) {
+        Option::Some(n) => {
+          if n == 0 || blen(chunk) == 0 {
+            done = true;
+          } else if blen(chunk) > limit {
+            ok = false;
+          } else {
+            let joined = bytes_concat(acc, chunk);
+            bfree(acc);
+            acc = joined;
+          }
+        },
+        Option::None => { ok = false; },
+      }
+    }
+  }
+  bfree(chunk);
+  if ok {
+    return Option[Bytes]::Some(acc);
+  }
+  bfree(acc);
+  return Option[Bytes]::None;
+}
+
+/// Sends `GET path` to `ip`:`port` (the `Host` header says `host`) and
+/// returns the whole response, at most `limit` bytes, status line and
+/// headers included. Check it with `http_status`; the body starts at
+/// `http_body_start`.
+/// ```
+/// // Nothing listens on port 1, so there is no response.
+/// let mut none = true;
+/// match http_get(host, net_ip4(127, 0, 0, 1), 1, "localhost", "/", 65536) {
+///   Option::Some(r) => { bfree(r); none = false; },
+///   Option::None => {},
+/// }
+/// if !none { return 1; }
+/// ```
+fn http_get(h: &Host, ip: u64, port: u64, host: Str, path: Str, limit: u64) -> Option[Bytes] {
+  match net_connect(h, ip, port) {
+    Option::Some(s) => {
+      let req = http_get_request(host, path);
+      let sent = net_send_all(h, s, req);
+      bfree(req);
+      if !sent {
+        net_close(h, s);
+        return Option[Bytes]::None;
+      }
+      let r = http_read_all(h, s, limit);
+      net_close(h, s);
+      return r;
+    },
+    Option::None => { return Option[Bytes]::None; },
+  }
+}
+
+/// Accepts a connection on the listening socket `sock` and reads its request
+/// head (at most `limit` bytes). A connection that sends no whole head in
+/// that much is closed and gives `None`.
+/// ```
+/// // The request goes through a loopback connection made in the example.
+/// let lo = net_ip4(127, 0, 0, 1);
+/// let mut bad = 1;
+/// match net_listen(host, lo, 0) {
+///   Option::Some(s) => {
+///     let p = net_port(host, s);
+///     match net_connect(host, lo, p) {
+///       Option::Some(c) => {
+///         let req = http_get_request("localhost", "/hello");
+///         let sent = net_send_all(host, c, req);
+///         bfree(req);
+///         match http_accept(host, s, 4096) {
+///           Option::Some(r) => {
+///             let t = http_req_target(r);
+///             if sent && bytes_eq_str(t, "/hello") { bad = 0; }
+///             bfree(t);
+///             http_close(host, r);
+///           },
+///           Option::None => {},
+///         }
+///         net_close(host, c);
+///       },
+///       Option::None => {},
+///     }
+///     net_close(host, s);
+///   },
+///   Option::None => {},
+/// }
+/// if bad != 0 { return 1; }
+/// ```
+fn http_accept(h: &Host, sock: u64, limit: u64) -> Option[HttpReq] {
+  match net_accept(h, sock) {
+    Option::Some(c) => {
+      match http_read_head(h, c, limit) {
+        Option::Some(head) => { return Option[HttpReq]::Some(HttpReq { conn: c, head: head }); },
+        Option::None => {
+          net_close(h, c);
+          return Option[HttpReq]::None;
+        },
+      }
+    },
+    Option::None => { return Option[HttpReq]::None; },
+  }
+}
+
+/// The request target of `r` (the path and query of `GET /a?b HTTP/1.1`), or
+/// empty if the request line has none.
+fn http_req_target(r: &HttpReq) -> Bytes {
+  let sp = bytes_find_byte(r.head, 32, 0);
+  if sp >= blen(r.head) {
+    return balloc(0);
+  }
+  let from = sp + 1;
+  let to = bytes_find_byte(r.head, 32, from);
+  if to > blen(r.head) {
+    return balloc(0);
+  }
+  return bytes_slice(r.head, from, to);
+}
+
+/// Is the request method the literal `m`?
+/// ```
+/// let lo = net_ip4(127, 0, 0, 1);
+/// let mut bad = 1;
+/// match net_listen(host, lo, 0) {
+///   Option::Some(s) => {
+///     let p = net_port(host, s);
+///     match net_connect(host, lo, p) {
+///       Option::Some(c) => {
+///         let req = http_get_request("localhost", "/");
+///         let sent = net_send_all(host, c, req);
+///         bfree(req);
+///         match http_accept(host, s, 4096) {
+///           Option::Some(r) => {
+///             if sent && http_req_is(r, "GET") && !http_req_is(r, "POST") { bad = 0; }
+///             http_close(host, r);
+///           },
+///           Option::None => {},
+///         }
+///         net_close(host, c);
+///       },
+///       Option::None => {},
+///     }
+///     net_close(host, s);
+///   },
+///   Option::None => {},
+/// }
+/// if bad != 0 { return 1; }
+/// ```
+fn http_req_is(r: &HttpReq, m: Str) -> bool {
+  let sp = bytes_find_byte(r.head, 32, 0);
+  return sp == slen(m) && bytes_span_eq_str(r.head, 0, sp, m);
+}
+
+/// Sends `resp` (build it with `http_response`) on the request's connection,
+/// closes the connection and frees the request.
+/// ```
+/// // A whole exchange in one process: the client's request is already in the
+/// // socket's buffer when the server reads it, and the answer is when the
+/// // client does.
+/// let lo = net_ip4(127, 0, 0, 1);
+/// let mut bad = 1;
+/// match net_listen(host, lo, 0) {
+///   Option::Some(s) => {
+///     let p = net_port(host, s);
+///     match net_connect(host, lo, p) {
+///       Option::Some(c) => {
+///         let req = http_get_request("localhost", "/hi");
+///         let sent = net_send_all(host, c, req);
+///         bfree(req);
+///         match http_accept(host, s, 4096) {
+///           Option::Some(r) => {
+///             let body = bfrom("hello");
+///             let resp = http_response(200, "OK", "text/plain", body);
+///             let ok = http_reply(host, r, resp);
+///             bfree(resp);
+///             bfree(body);
+///             match http_read_all(host, c, 4096) {
+///               Option::Some(m) => {
+///                 let mut at = 0;
+///                 match http_body_start(m) { Option::Some(i) => { at = i; }, Option::None => {} }
+///                 if sent && ok && http_status(m) == 200 && at <= blen(m) && blen(m) - at == 5 { bad = 0; }
+///                 bfree(m);
+///               },
+///               Option::None => {},
+///             }
+///           },
+///           Option::None => {},
+///         }
+///         net_close(host, c);
+///       },
+///       Option::None => {},
+///     }
+///     net_close(host, s);
+///   },
+///   Option::None => {},
+/// }
+/// if bad != 0 { return 1; }
+/// ```
+fn http_reply(h: &Host, r: HttpReq, resp: &Bytes) -> bool {
+  let ok = net_send_all(h, r.conn, resp);
+  http_close(h, r);
+  return ok;
+}
+
+/// Closes the request's connection and frees the request.
+/// ```
+/// // See `http_accept`.
+/// ```
+fn http_close(h: &Host, r: HttpReq) {
+  net_close(h, r.conn);
+  bfree(r.head);
+}
