@@ -134,6 +134,7 @@ What will be 0.2.0.
   so what it writes is always a string the scanner accepts.
 - `core/utf8`: `utf8_seq_len`, `utf8_valid` and `utf8_count` check UTF-8 by RFC 3629 (no overlong forms,
   surrogates or values above U+10FFFF); reads are proved in bounds.
+- `core/url`: `url_encode`, `url_decode`/`url_decode_span` (percent-decoding, `+` as a space on request) and `url_query_get`/`url_query_start` for the query string of a request target; reads are proved in bounds, a decoded string is never longer than its source and an encoded one at most three times as long.
 - `std/http`: `http_header` reads a header field of a response (the name is matched ignoring case,
   the value has its blanks removed), for `Location`, `Content-Type` and the like.
 - `core/json`: `json_i64` reads a signed integer (an optional `-` and digits, within `i64`), and

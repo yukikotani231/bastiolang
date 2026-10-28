@@ -1,0 +1,111 @@
+// expect-exit: 0
+// core/url: every byte survives encode then decode, encoded text holds only
+// unreserved characters and %XX, bad escapes are refused, and query strings
+// split the way a server expects.
+import "core/url.bastio";
+
+/// 1 unless the query string `q` (read from byte 0) gives `want` for `key`
+/// (`want_none`: no such parameter or a bad value).
+fn expect(q: Str, key: Str, want: Str, want_none: bool) -> u64
+  ensures result <= 1
+{
+  let b = bfrom(q);
+  let mut bad = 1;
+  match url_query_get(b, 0, key) {
+    Option::Some(v) => {
+      if !want_none && bytes_eq_str(v, want) { bad = 0; }
+      bfree(v);
+    },
+    Option::None => { if want_none { bad = 0; } },
+  }
+  bfree(b);
+  return bad;
+}
+
+fn main() -> u64 {
+  let mut bad = 0;
+
+  // All 256 byte values round trip, and the encoding is plain.
+  let mut all = balloc(256);
+  let mut i = 0;
+  while i < 256
+    invariant i <= 256 && blen(all) == 256
+  {
+    bset(&mut all, i, cast[u8](i));
+    i = i + 1;
+  }
+  let enc = url_encode(all);
+  let mut j = 0;
+  while j < blen(enc)
+    invariant j <= blen(enc)
+  {
+    let c = bget(enc, j);
+    if !url_unreserved(c) && c != 37 { bad = 1; }
+    if c >= 97 && c <= 122 && j > 0 && bget(enc, j - 1) == 37 { bad = 1; }
+    j = j + 1;
+  }
+  match url_decode(enc, false) {
+    Option::Some(v) => {
+      if blen(v) != 256 { bad = 1; } else {
+        let mut k = 0;
+        while k < 256
+          invariant k <= 256 && blen(v) == 256
+        {
+          if bget(v, k) != cast[u8](k) { bad = 1; }
+          k = k + 1;
+        }
+      }
+      bfree(v);
+    },
+    Option::None => { bad = 1; },
+  }
+  bfree(enc);
+  bfree(all);
+
+  // Bad escapes are refused: cut short, not hex, and a % at the span's edge.
+  let c1 = bfrom("a%");
+  let c2 = bfrom("a%4");
+  let c3 = bfrom("%zz");
+  let c4 = bfrom("%4g");
+  match url_decode(c1, false) { Option::Some(v) => { bad = 1; bfree(v); }, Option::None => {} }
+  match url_decode(c2, false) { Option::Some(v) => { bad = 1; bfree(v); }, Option::None => {} }
+  match url_decode(c3, false) { Option::Some(v) => { bad = 1; bfree(v); }, Option::None => {} }
+  match url_decode(c4, false) { Option::Some(v) => { bad = 1; bfree(v); }, Option::None => {} }
+  // "%41" inside a longer buffer, with the span ending before its last digit.
+  let c5 = bfrom("x%41");
+  match url_decode_span(c5, 1, 3, false) { Option::Some(v) => { bad = 1; bfree(v); }, Option::None => {} }
+  match url_decode_span(c5, 1, 4, false) { Option::Some(v) => { if !bytes_eq_str(v, "A") { bad = 1; } bfree(v); }, Option::None => { bad = 1; } }
+  bfree(c1);
+  bfree(c2);
+  bfree(c3);
+  bfree(c4);
+  bfree(c5);
+
+  // '+' is a space only when asked, lower and upper case hex both decode.
+  let p = bfrom("a+b%2bc%2Bd");
+  match url_decode(p, true) { Option::Some(v) => { if !bytes_eq_str(v, "a b+c+d") { bad = 1; } bfree(v); }, Option::None => { bad = 1; } }
+  match url_decode(p, false) { Option::Some(v) => { if !bytes_eq_str(v, "a+b+c+d") { bad = 1; } bfree(v); }, Option::None => { bad = 1; } }
+  bfree(p);
+
+  // Query strings.
+  if bad == 0 { bad = expect("a=1&b=2&c=3", "a", "1", false); }
+  if bad == 0 { bad = expect("a=1&b=2&c=3", "b", "2", false); }
+  if bad == 0 { bad = expect("a=1&b=2&c=3", "c", "3", false); }
+  if bad == 0 { bad = expect("a=1&b=2&c=3", "d", "", true); }
+  if bad == 0 { bad = expect("a=1&a=2", "a", "1", false); }
+  if bad == 0 { bad = expect("flag&x=1", "flag", "", false); }
+  if bad == 0 { bad = expect("flag=&x=1", "flag", "", false); }
+  if bad == 0 { bad = expect("q=a%26b&r=1", "q", "a&b", false); }
+  if bad == 0 { bad = expect("q=a=b", "q", "a=b", false); }
+  if bad == 0 { bad = expect("&&a=1", "a", "1", false); }
+  if bad == 0 { bad = expect("", "a", "", true); }
+  if bad == 0 { bad = expect("ab=1", "a", "", true); }
+  if bad == 0 { bad = expect("a=%zz", "a", "", true); }
+  if bad == 0 { bad = expect("a=1&", "b", "", true); }
+
+  // The query of a target starts after its first '?'.
+  let t = bfrom("/a?b?c");
+  if url_query_start(t) != 2 { bad = 1; }
+  bfree(t);
+  return bad;
+}
