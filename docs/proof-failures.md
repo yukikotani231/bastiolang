@@ -713,7 +713,7 @@ mix.bastio:9:18: error[E-TYPE]: argument of `double` must be u64, found Buf
 Types are checked before any proof is attempted, so this error has no counterexample: the message names the expected and the found type. Pass a value of the right type, here the length of the buffer:
 
 ```bastio
-// expect-exit: 0
+// expect-exit: 2
 fn double(x: u64) -> u64
   requires x <= 1000
 {
@@ -724,7 +724,7 @@ fn main() -> u64 {
   let b = alloc(1);
   let r = double(len(b));
   free(b);
-  return r - 2;
+  return r;
 }
 ```
 
