@@ -122,6 +122,8 @@ What will be 0.2.0.
 
 ### Library
 
+- `examples/leb128`: a proved unsigned LEB128 (varint) decoder and encoder called from C, fuzzed
+  against a C decoder under AddressSanitizer.
 - `core/bytes`: `bytes_rfind` finds the last occurrence of a byte string (a `Some` is a
   proved occurrence). `core/json` is a strict RFC 8259 scanner with readers and a string
   writer; `std/http` reads chunked responses and keeps a connection alive after a
