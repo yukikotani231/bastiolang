@@ -690,7 +690,9 @@ fn main() -> u64 {
 
 ```bastio
 // expect-error: E-TYPE
-fn double(x: u64) -> u64 {
+fn double(x: u64) -> u64
+  requires x <= 1000
+{
   return x + x;
 }
 
@@ -703,8 +705,8 @@ fn main() -> u64 {
 ```
 
 ```text
-mix.bastio:7:18: error[E-TYPE]: argument of `double` must be u64, found Buf
- 7 |   let r = double(b);
+mix.bastio:9:18: error[E-TYPE]: argument of `double` must be u64, found Buf
+ 9 |   let r = double(b);
    |                  ^
 ```
 
@@ -712,7 +714,9 @@ Types are checked before any proof is attempted, so this error has no counterexa
 
 ```bastio
 // expect-exit: 0
-fn double(x: u64) -> u64 {
+fn double(x: u64) -> u64
+  requires x <= 1000
+{
   return x + x;
 }
 
