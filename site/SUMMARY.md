@@ -8,6 +8,7 @@
   - [Bytes, bits and sized integers](tutorial-bits.md)
   - [Capabilities](tutorial-capabilities.md)
   - [Sharing state](tutorial-shared.md)
+  - [A web service](tutorial-web.md)
 - [The toolchain](toolchain.md)
 - [Common proof failures](proof-failures.md)
 - [Calling Bastio from C](c-libraries.md)
