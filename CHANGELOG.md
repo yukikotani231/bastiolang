@@ -122,6 +122,9 @@ What will be 0.2.0.
 
 ### Library
 
+- `core/json`: `JsonOut` builds a whole JSON document (`json_out_begin_obj`, `json_out_key`,
+  `json_out_str`, `json_out_u64`, `json_out_end`, `json_out_finish`); it tracks commas, keys and nesting,
+  so the result is well-formed or `None`.
 - `examples/leb128`: a proved unsigned LEB128 (varint) decoder and encoder called from C, fuzzed
   against a C decoder under AddressSanitizer.
 - `core/bytes`: `bytes_rfind` finds the last occurrence of a byte string (a `Some` is a

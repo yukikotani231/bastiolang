@@ -54,6 +54,167 @@ fn nested(n: u64) -> u64 {
   return r;
 }
 
+
+// The writer: what json_out_finish gives for `o` must be `want`, and a scan
+// must take it whole.
+fn out_is(o: JsonOut, want: Str) -> u64
+  ensures result <= 1
+{
+  match json_out_finish(o) {
+    Option::Some(b) => {
+      let mut r = 0;
+      if !bytes_eq_str(b, want) { r = 1; }
+      match json_value(b, 0) {
+        Json::Ok(e) => { if e != blen(b) { r = 1; } },
+        Json::Partial => { r = 1; },
+        Json::Bad(x) => { r = 1; },
+      }
+      bfree(b);
+      return r;
+    },
+    Option::None => { return 1; },
+  }
+}
+
+fn out_none(o: JsonOut) -> u64
+  ensures result <= 1
+{
+  match json_out_finish(o) {
+    Option::Some(b) => { bfree(b); return 1; },
+    Option::None => { return 0; },
+  }
+}
+
+fn key(o: &mut JsonOut, k: Str) {
+  let b = bfrom(k);
+  json_out_key(&mut o, b);
+  bfree(b);
+}
+
+fn out_doc() -> u64
+  ensures result <= 1
+{
+  let mut o = json_out_new();
+  json_out_begin_obj(&mut o);
+  key(&mut o, "id");
+  json_out_u64(&mut o, 7);
+  key(&mut o, "tags");
+  json_out_begin_arr(&mut o);
+  let a = bfrom("a");
+  let q = bfrom("b\"c");
+  json_out_str(&mut o, a);
+  json_out_str(&mut o, q);
+  bfree(a);
+  bfree(q);
+  json_out_end(&mut o);
+  key(&mut o, "ok");
+  json_out_bool(&mut o, true);
+  key(&mut o, "none");
+  json_out_null(&mut o);
+  key(&mut o, "nested");
+  json_out_begin_obj(&mut o);
+  key(&mut o, "x");
+  json_out_begin_arr(&mut o);
+  json_out_end(&mut o);
+  json_out_end(&mut o);
+  json_out_end(&mut o);
+  return out_is(o, "{\"id\":7,\"tags\":[\"a\",\"b\\\"c\"],\"ok\":true,\"none\":null,\"nested\":{\"x\":[]}}");
+}
+
+// Calls that do not fit the place they are made in: the writer goes bad.
+fn out_misuse() -> u64
+  ensures result <= 12
+{
+  let mut bad = 0;
+  // a value in an object without a key
+  let mut o1 = json_out_new();
+  json_out_begin_obj(&mut o1);
+  json_out_u64(&mut o1, 1);
+  json_out_end(&mut o1);
+  bad = bad + out_none(o1);
+  // a key in an array
+  let mut o2 = json_out_new();
+  json_out_begin_arr(&mut o2);
+  key(&mut o2, "k");
+  json_out_end(&mut o2);
+  bad = bad + out_none(o2);
+  // two keys in a row
+  let mut o3 = json_out_new();
+  json_out_begin_obj(&mut o3);
+  key(&mut o3, "a");
+  key(&mut o3, "b");
+  json_out_null(&mut o3);
+  json_out_end(&mut o3);
+  bad = bad + out_none(o3);
+  // a key with no value at the end
+  let mut o4 = json_out_new();
+  json_out_begin_obj(&mut o4);
+  key(&mut o4, "a");
+  json_out_end(&mut o4);
+  bad = bad + out_none(o4);
+  // a key at the top level
+  let mut o5 = json_out_new();
+  key(&mut o5, "a");
+  bad = bad + out_none(o5);
+  // an end with nothing open
+  let mut o6 = json_out_new();
+  json_out_end(&mut o6);
+  bad = bad + out_none(o6);
+  // a container never closed, and nothing written
+  let mut o7 = json_out_new();
+  json_out_begin_arr(&mut o7);
+  json_out_u64(&mut o7, 1);
+  bad = bad + out_none(o7);
+  bad = bad + out_none(json_out_new());
+  // two top-level values, also after a container
+  let mut o8 = json_out_new();
+  json_out_begin_arr(&mut o8);
+  json_out_end(&mut o8);
+  json_out_null(&mut o8);
+  bad = bad + out_none(o8);
+  // a good call after a bad one does not bring it back
+  let mut o9 = json_out_new();
+  json_out_end(&mut o9);
+  json_out_null(&mut o9);
+  bad = bad + out_none(o9);
+  return bad;
+}
+
+// Arrays nested n deep, each holding the next.
+fn out_deep(n: u64) -> u64
+  requires n <= 64
+{
+  let mut o = json_out_new();
+  let mut i = 0;
+  while i < n
+    invariant i <= n
+  {
+    json_out_begin_arr(&mut o);
+    i = i + 1;
+  }
+  i = 0;
+  while i < n
+    invariant i <= n
+  {
+    json_out_end(&mut o);
+    i = i + 1;
+  }
+  match json_out_finish(o) {
+    Option::Some(b) => {
+      let mut r = 0;
+      if blen(b) != 2 * n { r = 1; }
+      match json_value(b, 0) {
+        Json::Ok(e) => { if e != blen(b) { r = 1; } },
+        Json::Partial => { r = 1; },
+        Json::Bad(x) => { r = 1; },
+      }
+      bfree(b);
+      return r;
+    },
+    Option::None => { return 2; },
+  }
+}
+
 fn main() -> u64 {
   let mut bad = 0;
   bad = bad + want("0", 0);
@@ -84,6 +245,12 @@ fn main() -> u64 {
   bad = bad + want("nul", 1);
   bad = bad + want("[1] 2", 2);
   bad = bad + want("", 1);
+
+  bad = bad + out_doc();
+  bad = bad + out_misuse();
+  // The writer takes 32 levels and refuses 33, as the scanner does.
+  if out_deep(32) != 0 { bad = bad + 1; }
+  if out_deep(33) != 2 { bad = bad + 1; }
 
   // Nesting: 32 deep is accepted, 33 is refused.
   if nested(32) != 0 { bad = bad + 1; }
