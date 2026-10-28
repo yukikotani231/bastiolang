@@ -18,7 +18,7 @@ import "../core/num.bastio";
 /// A request that has been read: the connection it came on, the bytes read
 /// so far (the head, and possibly the start of a body) and where the strict
 /// parser found the method, the target and the fields in them.
-struct HttpReq { conn: u64, head: Bytes, req: Req }
+struct HttpReq { conn: u64, head: Bytes, req: Req, body_read: bool }
 
 /// The request for `GET path` from `host`.
 /// ```
@@ -602,7 +602,7 @@ fn http_read_request(h: &Host, c: u64, limit: u64) -> Option[HttpReq] {
     Option::Some(head) => {
       match http_parse_head(head) {
         Head::Ok(q) => {
-          return Option[HttpReq]::Some(HttpReq { conn: c, head: head, req: q });
+          return Option[HttpReq]::Some(HttpReq { conn: c, head: head, req: q, body_read: false });
         },
         Head::Partial => {
           let body = bfrom("bad request\n");
@@ -681,7 +681,9 @@ fn http_req_is(r: &HttpReq, m: Str) -> bool {
 /// framing is ambiguous or invalid (a repeated `Content-Length`, both
 /// fields, a transfer coding other than a lone `chunked`: see `http_body`),
 /// if the body is longer than `limit` bytes, or if the peer closes or fails
-/// before the body is whole. The request stays open for the answer.
+/// before the body is whole. The request stays open for the answer; after a
+/// `Content-Length` body that ends the data read, `http_req_keeps` allows
+/// another request on the connection.
 /// ```
 /// // A POST with a Content-Length body, then one with a chunked body.
 /// let lo = net_ip4(127, 0, 0, 1);
@@ -701,8 +703,8 @@ fn http_req_is(r: &HttpReq, m: Str) -> bool {
 ///           let sent = net_send_all(host, c, req);
 ///           bfree(req);
 ///           match http_accept(host, s, 4096) {
-///             Option::Some(r) => {
-///               match http_req_body(host, r, 4096) {
+///             Option::Some(mut r) => {
+///               match http_req_body(host, &mut r, 4096) {
 ///                 Option::Some(b) => {
 ///                   if sent && bytes_eq_str(b, "hello") { bad = 0; }
 ///                   bfree(b);
@@ -725,7 +727,7 @@ fn http_req_is(r: &HttpReq, m: Str) -> bool {
 /// }
 /// if bad != 0 { return 1; }
 /// ```
-fn http_req_body(h: &Host, r: &HttpReq, limit: u64) -> Option[Bytes] {
+fn http_req_body(h: &Host, r: &mut HttpReq, limit: u64) -> Option[Bytes] {
   if limit > 1073741824 || blen(r.head) > 1073741824 || r.req.head_end > blen(r.head) {
     return Option[Bytes]::None;
   }
@@ -760,6 +762,8 @@ fn http_req_body(h: &Host, r: &HttpReq, limit: u64) -> Option[Bytes] {
       if ok && want <= blen(acc) {
         bfree(out);
         out = bytes_slice(acc, 0, want);
+        // Nothing of the next request was read with this one.
+        r.body_read = blen(acc) == want;
       }
     },
     Body::Chunked => {
@@ -817,9 +821,11 @@ fn http_has_close(s: &Bytes, a: u64, b: u64) -> bool
 }
 
 /// May the connection of `r` carry another request once it is answered? Yes
-/// for HTTP/1.1 without `Connection: close`, with no body, and with nothing
-/// read past the head (a client that sent the next request early gets the
-/// connection closed after the answer instead).
+/// for HTTP/1.1 without `Connection: close` when the request has no body, or
+/// a `Content-Length` body that `http_req_body` has read to its last byte,
+/// and nothing of the next request was read with it (a client that sent the
+/// next request early gets the connection closed after the answer instead,
+/// and so does one with a chunked or unread body).
 /// ```
 /// // HTTP/1.1 keeps; asking to close, or HTTP/1.0, does not.
 /// let lo = net_ip4(127, 0, 0, 1);
@@ -863,12 +869,12 @@ fn http_has_close(s: &Bytes, a: u64, b: u64) -> bool
 /// if bad != 0 { return 1; }
 /// ```
 fn http_req_keeps(r: &HttpReq) -> bool {
-  if r.req.minor != 1 || r.req.head_end != blen(r.head) || r.req.fields > blen(r.head) {
+  if r.req.minor != 1 || r.req.fields > blen(r.head) {
     return false;
   }
   match http_body(r.head, r.req.fields) {
-    Body::None => {},
-    Body::Length(x) => { return false; },
+    Body::None => { if r.req.head_end != blen(r.head) { return false; } },
+    Body::Length(x) => { if !r.body_read { return false; } },
     Body::Chunked => { return false; },
     Body::Bad(x) => { return false; },
   }

@@ -31,8 +31,8 @@ fn body_of(h: &Host, s: u64, p: u64, text: Str, limit: u64, close: bool) -> Opti
     Option::Some(c) => {
       if close { net_close(h, c); }
       match http_accept(h, s, 4096) {
-        Option::Some(r) => {
-          let b = http_req_body(h, r, limit);
+        Option::Some(mut r) => {
+          let b = http_req_body(h, &mut r, limit);
           http_close(h, r);
           if !close { net_close(h, c); }
           return b;
@@ -92,6 +92,89 @@ fn expect_resp(h: &Host, s: u64, p: u64, text: Str, limit: u64, want: Str, refus
             Option::None => {
               if refused { bad = 0; }
             },
+          }
+        },
+        Option::None => {},
+      }
+      net_close(h, c);
+    },
+    Option::None => {},
+  }
+  return bad;
+}
+
+/// Sends `first` as a request, accepts it, sends `more` (which the server has
+/// not seen yet), reads the body and says whether the connection may carry
+/// another request. False also when anything failed.
+fn body_keeps(h: &Host, s: u64, p: u64, first: Str, more: Str) -> bool {
+  let mut keeps = false;
+  match client(h, p, first) {
+    Option::Some(c) => {
+      match http_accept(h, s, 4096) {
+        Option::Some(mut r) => {
+          let b = bfrom(more);
+          let sent = net_send_all(h, c, b);
+          bfree(b);
+          match http_req_body(h, &mut r, 100) {
+            Option::Some(body) => {
+              bfree(body);
+              keeps = sent && http_req_keeps(r);
+            },
+            Option::None => {},
+          }
+          http_close(h, r);
+        },
+        Option::None => {},
+      }
+      net_close(h, c);
+    },
+    Option::None => {},
+  }
+  return keeps;
+}
+
+/// 1 unless `body_keeps` says `want`.
+fn expect_keeps(h: &Host, s: u64, p: u64, first: Str, more: Str, want: bool) -> u64
+  ensures result <= 1
+{
+  if body_keeps(h, s, p, first, more) == want { return 0; }
+  return 1;
+}
+
+/// A POST with a body, answered with keep-alive, then a GET on the same
+/// connection. Counts 1 unless the second request arrives.
+fn post_then_get(h: &Host, s: u64, p: u64) -> u64
+  ensures result <= 1
+{
+  let mut bad = 1;
+  match client(h, p, "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello") {
+    Option::Some(c) => {
+      match http_accept(h, s, 4096) {
+        Option::Some(mut r) => {
+          match http_req_body(h, &mut r, 100) {
+            Option::Some(body) => {
+              let reply = bfrom("ok\n");
+              match http_answer(h, r, 200, "OK", "text/plain", reply) {
+                Option::Some(k) => {
+                  let g = bfrom("GET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+                  let sent = net_send_all(h, c, g);
+                  bfree(g);
+                  match http_read_request(h, k, 4096) {
+                    Option::Some(r2) => {
+                      let t = http_req_target(r2);
+                      if sent && bytes_eq_str(body, "hello") && bytes_eq_str(t, "/b") { bad = 0; }
+                      bfree(t);
+                      http_close(h, r2);
+                    },
+                    Option::None => { net_close(h, k); },
+                  }
+                },
+                Option::None => {},
+              }
+              bfree(reply);
+              bfree(body);
+            },
+            Option::None => { http_close(h, r); },
           }
         },
         Option::None => {},
@@ -177,6 +260,16 @@ fn main(h: &mut Host) -> u64 {
       bad = bad + expect_resp(h, s, p, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel", 100, "", true);
       bad = bad + expect_resp(h, s, p, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n", 100, "", true);
       bad = bad + expect_resp(h, s, p, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n9\r\n012345678\r\n0\r\n\r\n", 8, "", true);
+      // A body read to its end leaves the connection for the next request,
+      // unless the client asked to close, sent more than the body, or used
+      // chunked framing.
+      bad = bad + expect_keeps(h, s, p, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello", "", true);
+      bad = bad + expect_keeps(h, s, p, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhe", "llo", true);
+      bad = bad + expect_keeps(h, s, p, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n", "hello", true);
+      bad = bad + expect_keeps(h, s, p, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhelloGET", "", false);
+      bad = bad + expect_keeps(h, s, p, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello", "", false);
+      bad = bad + expect_keeps(h, s, p, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n", "", false);
+      bad = bad + post_then_get(h, s, p);
       // Keep-alive: a request that asks to close, a body or a second request
       // sent early gets its connection closed after the answer.
       match client(h, p, "GET / HTTP/1.1\r\nHost: x\r\n\r\nGET /2 HTTP/1.1\r\nHost: x\r\n\r\n") {
