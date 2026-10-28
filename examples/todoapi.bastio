@@ -2,12 +2,14 @@
 // A to-do list service over HTTP and JSON, kept in memory:
 //
 //   GET    /todos            every item:  [{"id":1,"title":"milk","done":false}]
+//   GET    /todos?done=0     only the open items (done=1: only the finished ones)
 //   POST   /todos            body {"title": "milk"}: adds one, answers 201 with the item
 //   POST   /todos/N/done     marks item N done, answers 200 with the item
 //   DELETE /todos/N          removes item N, answers 200 {"deleted":N}
 //
 // Anything else is 404, an item that does not exist is 404, and a body that
-// is not valid JSON or has no usable string `title` is 400. Run with no
+// is not valid JSON or has no usable string `title` is 400, as is a `done`
+// other than 0 or 1. Run with no
 // arguments it checks itself: it listens on a free port of 127.0.0.1, sends
 // itself requests over one real connection, and exits with 0 if the answers
 // are right. `todoapi serve PORT` serves on 127.0.0.1:PORT until it is
@@ -18,6 +20,7 @@
 // answers are right (the self-check does).
 import "core/print.bastio";
 import "core/json.bastio";
+import "core/url.bastio";
 import "std/host.bastio";
 import "std/http.bastio";
 
@@ -127,8 +130,9 @@ fn reply_json(status: u64, o: JsonOut) -> Reply {
   }
 }
 
-/// `GET /todos`.
-fn list(t: &Todos) -> Reply
+/// `GET /todos`. With `only` 0 the open items, with 1 the finished ones,
+/// with 2 both.
+fn list(t: &Todos, only: u64) -> Reply
   requires todos_ok(t)
 {
   let mut o = json_out_new();
@@ -137,7 +141,8 @@ fn list(t: &Todos) -> Reply
   while i < vec_len(t.starts)
     invariant i <= vlen(t.starts) && todos_ok(t)
   {
-    if vec_get(t.state, i) != 2 {
+    let st = vec_get(t.state, i);
+    if st != 2 && (only == 2 || cast[u64](st) == only) {
       item_json(&mut o, t, i);
     }
     i = i + 1;
@@ -203,15 +208,31 @@ fn route(t: &mut Todos, post: bool, get: bool, del: bool, s: &Bytes, body: &Byte
   requires todos_ok(t)
   ensures todos_ok(t)
 {
-  if bytes_eq_str(s, "/todos") {
-    if get { return list(t); }
+  // The query string is only read for GET /todos; elsewhere it is ignored.
+  let qs = url_query_start(s);
+  if qs == 6 && bytes_span_eq_str(s, 0, 6, "/todos") {
+    if get {
+      let mut only = 2;
+      if qs < blen(s) {
+        match url_query_get(s, qs + 1, "done") {
+          Option::Some(v) => {
+            if bytes_eq_str(v, "0") { only = 0; }
+            else if bytes_eq_str(v, "1") { only = 1; }
+            else { bfree(v); return fail(400, "bad request"); }
+            bfree(v);
+          },
+          Option::None => {},
+        }
+      }
+      return list(t, only);
+    }
     if post { return create(&mut t, body); }
     return fail(405, "method not allowed");
   }
-  if blen(s) > 7 && bytes_span_eq_str(s, 0, 7, "/todos/") {
+  if qs > 7 && bytes_span_eq_str(s, 0, 7, "/todos/") {
     // /todos/N/done
-    if post && blen(s) > 12 && bytes_span_eq_str(s, blen(s) - 5, blen(s), "/done") {
-      let i = find(t, s, 7, blen(s) - 5);
+    if post && qs > 12 && bytes_span_eq_str(s, qs - 5, qs, "/done") {
+      let i = find(t, s, 7, qs - 5);
       if i < vec_len(t.starts) {
         vec_set(&mut t.state, i, 1);
         let mut o = json_out_new();
@@ -222,7 +243,7 @@ fn route(t: &mut Todos, post: bool, get: bool, del: bool, s: &Bytes, body: &Byte
     }
     // /todos/N
     if del {
-      let i = find(t, s, 7, blen(s));
+      let i = find(t, s, 7, qs);
       if i < vec_len(t.starts) {
         vec_set(&mut t.state, i, 2);
         let mut o = json_out_new();
@@ -417,6 +438,10 @@ fn selfcheck(h: &Host, lo: u64) -> u64 {
               n = n + ask(h, &mut t, a, c, "POST", "/todos", "{\"title\":\"caf\\u00e9 \\\"b\\\"\"}", 201, "{\"id\":2,\"title\":\"café \\\"b\\\"\",\"done\":false}", false);
               n = n + ask(h, &mut t, a, c, "POST", "/todos/1/done", "", 200, "{\"id\":1,\"title\":\"milk\",\"done\":true}", false);
               n = n + ask(h, &mut t, a, c, "GET", "/todos", "", 200, "[{\"id\":1,\"title\":\"milk\",\"done\":true},{\"id\":2,\"title\":\"café \\\"b\\\"\",\"done\":false}]", false);
+              n = n + ask(h, &mut t, a, c, "GET", "/todos?done=1", "", 200, "[{\"id\":1,\"title\":\"milk\",\"done\":true}]", false);
+              n = n + ask(h, &mut t, a, c, "GET", "/todos?x=1&done=0", "", 200, "[{\"id\":2,\"title\":\"café \\\"b\\\"\",\"done\":false}]", false);
+              n = n + ask(h, &mut t, a, c, "GET", "/todos?done=2", "", 400, br, false);
+              n = n + ask(h, &mut t, a, c, "GET", "/todos?done=%31", "", 200, "[{\"id\":1,\"title\":\"milk\",\"done\":true}]", false);
               n = n + ask(h, &mut t, a, c, "DELETE", "/todos/1", "", 200, "{\"deleted\":1}", false);
               n = n + ask(h, &mut t, a, c, "DELETE", "/todos/1", "", 404, nf, false);
               n = n + ask(h, &mut t, a, c, "POST", "/todos/9/done", "", 404, nf, false);
