@@ -1,0 +1,57 @@
+// The LEB128 library's C API. Each `export fn` becomes a C function of the
+// same name, declared in a header that `bastioc0 --header` generates (see
+// run.sh). A `&Bytes` parameter is a pointer and a length on the C side.
+import "leb128.bastio";
+
+enum Leb128Decoded {
+  // The value, and how many bytes of the input it took.
+  Ok(Leb),
+  // `at` is past the end of the input, or the input ends inside the value.
+  Truncated,
+  // The tenth byte still has its continuation bit set.
+  TooLong,
+  // The value needs more than 64 bits.
+  Overflow,
+}
+
+/// Decodes one unsigned LEB128 value from `src[at..]`.
+export fn leb128_decode(src: &Bytes, at: u64) -> Leb128Decoded
+  ensures result is Leb128Decoded::Ok ==> result.Ok.used >= 1 && result.Ok.used <= 10
+  ensures result is Leb128Decoded::Ok ==> result.Ok.used <= blen(src) - at
+{
+  if at > blen(src) {
+    return Leb128Decoded::Truncated;
+  }
+  match leb_decode(src, at) {
+    LebDecoded::Ok(l) => { return Leb128Decoded::Ok(l); },
+    LebDecoded::Truncated => { return Leb128Decoded::Truncated; },
+    LebDecoded::TooLong => { return Leb128Decoded::TooLong; },
+    LebDecoded::Overflow => { return Leb128Decoded::Overflow; },
+  }
+}
+
+enum Leb128Written {
+  // The number of bytes written at the start of `out`.
+  Ok(u64),
+  // `out` is too small: the encoding needs this many bytes.
+  TooSmall(u64),
+}
+
+/// Encodes `x` into the caller's buffer `out`, so the library allocates
+/// nothing. C lends `out` as a pointer and a length; the compiler proves
+/// that this function writes only inside it.
+export fn leb128_encode_into(x: u64, out: &mut Bytes) -> Leb128Written
+  ensures result is Leb128Written::Ok ==> result.Ok >= 1 && result.Ok <= 10 && result.Ok <= blen(out)
+  ensures result is Leb128Written::TooSmall ==> result.TooSmall > blen(out)
+{
+  let need = leb_size(x);
+  if need > blen(out) {
+    return Leb128Written::TooSmall(need);
+  }
+  let n = leb_encode_into(x, &mut out);
+  if n == 0 {
+    // Not reached: `need` bytes fit and are enough.
+    return Leb128Written::TooSmall(need + blen(out));
+  }
+  return Leb128Written::Ok(n);
+}

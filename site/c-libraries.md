@@ -19,6 +19,7 @@ CI.
 - [base64](examples-base64.md): a strict codec, with an encoder that writes
   into a caller's buffer.
 - [UTF-8](examples-utf8.md): a strict validator and decoder.
+- [LEB128](examples-leb128.md): the variable-length integer of WebAssembly and DWARF, with the over-long and overflowing cases refused.
 - [DER](examples-der.md): the structure checker under X.509 certificates.
 - [QOI](examples-qoi.md): an image codec. It allocates buffers sized by an
   attacker-controlled header, so it shows how a library reports running out
