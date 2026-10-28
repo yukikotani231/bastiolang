@@ -472,8 +472,8 @@ framing is ambiguous or invalid (a repeated `Content-Length`, both
 fields, a transfer coding other than a lone `chunked`: see `http_body`),
 if the body is longer than `limit` bytes, or if the peer closes or fails
 before the body is whole. The request stays open for the answer; after a
-`Content-Length` body that ends the data read, `http_req_keeps` allows
-another request on the connection.
+`Content-Length` body or a chunked one (through its trailers) that ends
+the data read, `http_req_keeps` allows another request on the connection.
 
 Example:
 
@@ -529,10 +529,11 @@ fn http_req_keeps(r: &HttpReq) -> bool
 
 May the connection of `r` carry another request once it is answered? Yes
 for HTTP/1.1 without `Connection: close` when the request has no body, or
-a `Content-Length` body that `http_req_body` has read to its last byte,
+a `Content-Length` or chunked body that `http_req_body` has read to its
+last byte,
 and nothing of the next request was read with it (a client that sent the
 next request early gets the connection closed after the answer instead,
-and so does one with a chunked or unread body).
+and so does one with an unread body).
 
 Example:
 
@@ -733,13 +734,14 @@ Internal: `http_response` with `Connection: keep-alive` when `keep`.
 ### `http_read_chunked`
 
 ```bastio
-fn http_read_chunked(h: &Host, sock: u64, first: &Bytes, limit: u64) -> Option[Bytes]
+fn http_read_chunked(h: &Host, sock: u64, first: &Bytes, limit: u64, tight: &mut bool) -> Option[Bytes]
   ensures result is Option::Some ==> blen(result.Some) <= limit && limit <= 1073741824
 ```
 
 Internal: the decoded body of a chunked message. `first` holds the bytes
 that followed the head when it was read; the rest comes from `sock` until
-the last chunk. The decoded body is at most `limit` bytes.
+the last chunk. The decoded body is at most `limit` bytes. `tight` says
+whether the data read ends with the last chunk's trailers.
 
 ### `http_is_connection`
 

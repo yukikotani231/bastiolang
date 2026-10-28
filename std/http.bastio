@@ -263,8 +263,9 @@ fn http_read_all(h: &Host, sock: u64, limit: u64) -> Option[Bytes] {
 
 /// Internal: the decoded body of a chunked message. `first` holds the bytes
 /// that followed the head when it was read; the rest comes from `sock` until
-/// the last chunk. The decoded body is at most `limit` bytes.
-fn http_read_chunked(h: &Host, sock: u64, first: &Bytes, limit: u64) -> Option[Bytes]
+/// the last chunk. The decoded body is at most `limit` bytes. `tight` says
+/// whether the data read ends with the last chunk's trailers.
+fn http_read_chunked(h: &Host, sock: u64, first: &Bytes, limit: u64, tight: &mut bool) -> Option[Bytes]
   ensures result is Option::Some ==> blen(result.Some) <= limit && limit <= 1073741824
 {
   if limit > 1073741824 || blen(first) > 1073741824 {
@@ -299,7 +300,11 @@ fn http_read_chunked(h: &Host, sock: u64, first: &Bytes, limit: u64) -> Option[B
           pos = c.next;
         }
       },
-      Chunk::Last(x) => { done = true; },
+      Chunk::Last(x) => {
+        done = true;
+        // Nothing of the next message was read with this one.
+        tight = x == blen(acc);
+      },
       Chunk::Bad(x) => { ok = false; },
       Chunk::Partial => {
         if blen(acc) >= cap {
@@ -433,7 +438,8 @@ fn http_read_response(h: &Host, sock: u64, limit: u64) -> Option[Bytes] {
         let first = bytes_slice(head, hend, blen(head));
         let lead = bytes_slice(head, 0, hend);
         bfree(head);
-        match http_read_chunked(h, sock, first, limit) {
+        let mut tight = false;
+        match http_read_chunked(h, sock, first, limit, &mut tight) {
           Option::Some(d) => {
             let both = bytes_concat(lead, d);
             bfree(d);
@@ -682,8 +688,8 @@ fn http_req_is(r: &HttpReq, m: Str) -> bool {
 /// fields, a transfer coding other than a lone `chunked`: see `http_body`),
 /// if the body is longer than `limit` bytes, or if the peer closes or fails
 /// before the body is whole. The request stays open for the answer; after a
-/// `Content-Length` body that ends the data read, `http_req_keeps` allows
-/// another request on the connection.
+/// `Content-Length` body or a chunked one (through its trailers) that ends
+/// the data read, `http_req_keeps` allows another request on the connection.
 /// ```
 /// // A POST with a Content-Length body, then one with a chunked body.
 /// let lo = net_ip4(127, 0, 0, 1);
@@ -767,10 +773,12 @@ fn http_req_body(h: &Host, r: &mut HttpReq, limit: u64) -> Option[Bytes] {
       }
     },
     Body::Chunked => {
-      match http_read_chunked(h, r.conn, acc, limit) {
+      let mut tight = false;
+      match http_read_chunked(h, r.conn, acc, limit, &mut tight) {
         Option::Some(d) => {
           bfree(out);
           out = d;
+          r.body_read = tight;
         },
         Option::None => { ok = false; },
       }
@@ -822,10 +830,11 @@ fn http_has_close(s: &Bytes, a: u64, b: u64) -> bool
 
 /// May the connection of `r` carry another request once it is answered? Yes
 /// for HTTP/1.1 without `Connection: close` when the request has no body, or
-/// a `Content-Length` body that `http_req_body` has read to its last byte,
+/// a `Content-Length` or chunked body that `http_req_body` has read to its
+/// last byte,
 /// and nothing of the next request was read with it (a client that sent the
 /// next request early gets the connection closed after the answer instead,
-/// and so does one with a chunked or unread body).
+/// and so does one with an unread body).
 /// ```
 /// // HTTP/1.1 keeps; asking to close, or HTTP/1.0, does not.
 /// let lo = net_ip4(127, 0, 0, 1);
@@ -875,7 +884,7 @@ fn http_req_keeps(r: &HttpReq) -> bool {
   match http_body(r.head, r.req.fields) {
     Body::None => { if r.req.head_end != blen(r.head) { return false; } },
     Body::Length(x) => { if !r.body_read { return false; } },
-    Body::Chunked => { return false; },
+    Body::Chunked => { if !r.body_read { return false; } },
     Body::Bad(x) => { return false; },
   }
   let n = blen(r.head);
