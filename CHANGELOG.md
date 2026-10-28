@@ -122,6 +122,9 @@ What will be 0.2.0.
 
 ### Library
 
+- `core/json`: `JsonOut` builds a whole JSON document (`json_out_begin_obj`, `json_out_key`,
+  `json_out_str`, `json_out_u64`, `json_out_end`, `json_out_finish`); it tracks commas, keys and nesting,
+  so the result is well-formed or `None`.
 - `core/bytes`: `bytes_rfind` finds the last occurrence of a byte string (a `Some` is a
   proved occurrence). `core/json` is a strict RFC 8259 scanner with readers and a string
   writer; `std/http` reads chunked responses and keeps a connection alive after a

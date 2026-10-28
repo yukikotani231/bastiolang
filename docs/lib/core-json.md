@@ -5,7 +5,9 @@
 JSON (RFC 8259) read from bytes that cannot be trusted.
 Nothing is allocated to check a document: `json_value` returns where the
 value that starts at an offset ends, and the readers return offsets into
-the same buffer. Objects and arrays nest at most 32 deep.
+the same buffer. Objects and arrays nest at most 32 deep. `JsonOut` (the
+`json_out_*` calls) writes a document the other way: it tracks commas, keys
+and nesting, so what `json_out_finish` returns is well-formed or `None`.
 
 What is proved: no read is outside the buffer, no arithmetic overflows, and
 every offset returned lies inside the buffer and after the one it came
@@ -27,6 +29,16 @@ by the bytes as written.
 | [`json_u64`](#json_u64) | The value at the first non-blank byte at or after `at`, read as a JSON number made only of digits (no sign, fraction or exponent) that fits in a `u64`. |
 | [`json_string`](#json_string) | The string at the first non-blank byte at or after `at`, with its escapes decoded (`\u` escapes become UTF-8; a surrogate pair becomes one code point). |
 | [`json_push_string`](#json_push_string) | Appends `b` to `t` as a JSON string. |
+| [`json_out_new`](#json_out_new) | A new, empty writer. |
+| [`json_out_begin_obj`](#json_out_begin_obj) | Opens an object (`{`). |
+| [`json_out_begin_arr`](#json_out_begin_arr) | Opens an array (`[`). |
+| [`json_out_end`](#json_out_end) | Closes the innermost object or array. |
+| [`json_out_key`](#json_out_key) | Writes the key of the next member of the open object. |
+| [`json_out_str`](#json_out_str) | Writes a string value, escaped as `json_push_string` does. |
+| [`json_out_u64`](#json_out_u64) | Writes a number value, `x` in decimal. |
+| [`json_out_bool`](#json_out_bool) | Writes `true` or `false`. |
+| [`json_out_null`](#json_out_null) | Writes `null`. |
+| [`json_out_finish`](#json_out_finish) | The finished document, or `None` when a call did not fit or the document is not complete (a container still open, nothing written). |
 
 Every example below is built, verified and run by `tests/run.sh`. An `assert` in one is proved at compile time from the contracts above it.
 
@@ -46,6 +58,34 @@ enum Json {
 ```
 
 What `json_value` found.
+
+### `JsonOut`
+
+```bastio
+struct JsonOut {
+  text: Vec[u8],
+  // Bit `d` is 1 when the container at depth `d` is an object.
+  obj: u64,
+  // Bit `d` is 1 when the container at depth `d` already has an element.
+  full: u64,
+  // How many containers are open (at most 32).
+  depth: u64,
+  // A key was written and its value has not been.
+  key: bool,
+  // The top-level value is complete.
+  done: bool,
+  // Some call did not fit.
+  bad: bool,
+}
+```
+
+A JSON document being written. Build it with the `json_out_*` calls and
+take it with `json_out_finish`; the writer keeps track of where commas go
+and which values may come next, so what comes out is a well-formed
+document or nothing. A call that does not fit the place it is made (a
+value in an object without a key before it, a key in an array, an end with
+nothing open, nesting deeper than 32, a second top-level value) writes
+nothing and makes `json_out_finish` return `None`.
 
 ## Functions
 
@@ -234,6 +274,257 @@ bfree(out);
 if !ok { return 1; }
 ```
 
+### `json_out_new`
+
+```bastio
+fn json_out_new() -> JsonOut
+```
+
+A new, empty writer.
+
+Example:
+
+```bastio
+let mut o = json_out_new();
+json_out_begin_obj(&mut o);
+let k = bfrom("n");
+json_out_key(&mut o, k);
+json_out_u64(&mut o, 7);
+json_out_end(&mut o);
+bfree(k);
+match json_out_finish(o) {
+  Option::Some(b) => {
+    let ok = bytes_eq_str(b, "{\"n\":7}");
+    bfree(b);
+    if !ok { return 1; }
+  },
+  Option::None => { return 1; },
+}
+```
+
+### `json_out_begin_obj`
+
+```bastio
+fn json_out_begin_obj(o: &mut JsonOut)
+```
+
+Opens an object (`{`).
+
+Example:
+
+```bastio
+let mut o = json_out_new();
+json_out_begin_arr(&mut o);
+json_out_begin_obj(&mut o);
+json_out_end(&mut o);
+json_out_begin_obj(&mut o);
+json_out_end(&mut o);
+json_out_end(&mut o);
+match json_out_finish(o) {
+  Option::Some(b) => {
+    let ok = bytes_eq_str(b, "[{},{}]");
+    bfree(b);
+    if !ok { return 1; }
+  },
+  Option::None => { return 1; },
+}
+```
+
+### `json_out_begin_arr`
+
+```bastio
+fn json_out_begin_arr(o: &mut JsonOut)
+```
+
+Opens an array (`[`).
+
+Example:
+
+```bastio
+let mut o = json_out_new();
+json_out_begin_arr(&mut o);
+json_out_u64(&mut o, 1);
+json_out_begin_arr(&mut o);
+json_out_end(&mut o);
+json_out_end(&mut o);
+match json_out_finish(o) {
+  Option::Some(b) => {
+    let ok = bytes_eq_str(b, "[1,[]]");
+    bfree(b);
+    if !ok { return 1; }
+  },
+  Option::None => { return 1; },
+}
+```
+
+### `json_out_end`
+
+```bastio
+fn json_out_end(o: &mut JsonOut)
+```
+
+Closes the innermost object or array. With nothing open, or after a key
+that has no value yet, the writer goes bad.
+
+Example:
+
+```bastio
+let mut o = json_out_new();
+json_out_begin_arr(&mut o);
+json_out_end(&mut o);
+json_out_end(&mut o);   // nothing is open
+match json_out_finish(o) {
+  Option::Some(b) => { bfree(b); return 1; },
+  Option::None => {},
+}
+```
+
+### `json_out_key`
+
+```bastio
+fn json_out_key(o: &mut JsonOut, k: &Bytes)
+```
+
+Writes the key of the next member of the open object.
+
+Example:
+
+```bastio
+let mut o = json_out_new();
+json_out_begin_obj(&mut o);
+let a = bfrom("a\"b");
+let c = bfrom("c");
+json_out_key(&mut o, a);
+json_out_bool(&mut o, true);
+json_out_key(&mut o, c);
+json_out_null(&mut o);
+json_out_end(&mut o);
+bfree(a);
+bfree(c);
+match json_out_finish(o) {
+  Option::Some(b) => {
+    let ok = bytes_eq_str(b, "{\"a\\\"b\":true,\"c\":null}");
+    bfree(b);
+    if !ok { return 1; }
+  },
+  Option::None => { return 1; },
+}
+```
+
+### `json_out_str`
+
+```bastio
+fn json_out_str(o: &mut JsonOut, b: &Bytes)
+```
+
+Writes a string value, escaped as `json_push_string` does.
+
+Example:
+
+```bastio
+let mut o = json_out_new();
+let s = bfrom("line\nbreak");
+json_out_str(&mut o, s);
+bfree(s);
+match json_out_finish(o) {
+  Option::Some(b) => {
+    let ok = bytes_eq_str(b, "\"line\\nbreak\"");
+    bfree(b);
+    if !ok { return 1; }
+  },
+  Option::None => { return 1; },
+}
+```
+
+### `json_out_u64`
+
+```bastio
+fn json_out_u64(o: &mut JsonOut, x: u64)
+```
+
+Writes a number value, `x` in decimal.
+
+Example:
+
+```bastio
+let mut o = json_out_new();
+json_out_u64(&mut o, 18446744073709551615);
+match json_out_finish(o) {
+  Option::Some(b) => {
+    let ok = bytes_eq_str(b, "18446744073709551615");
+    bfree(b);
+    if !ok { return 1; }
+  },
+  Option::None => { return 1; },
+}
+```
+
+### `json_out_bool`
+
+```bastio
+fn json_out_bool(o: &mut JsonOut, v: bool)
+```
+
+Writes `true` or `false`.
+
+Example:
+
+```bastio
+let mut o = json_out_new();
+json_out_begin_arr(&mut o);
+json_out_bool(&mut o, true);
+json_out_bool(&mut o, false);
+json_out_end(&mut o);
+match json_out_finish(o) {
+  Option::Some(b) => {
+    let ok = bytes_eq_str(b, "[true,false]");
+    bfree(b);
+    if !ok { return 1; }
+  },
+  Option::None => { return 1; },
+}
+```
+
+### `json_out_null`
+
+```bastio
+fn json_out_null(o: &mut JsonOut)
+```
+
+Writes `null`.
+
+Example:
+
+```bastio
+let mut o = json_out_new();
+json_out_null(&mut o);
+json_out_null(&mut o);   // a second top-level value does not fit
+match json_out_finish(o) {
+  Option::Some(b) => { bfree(b); return 1; },
+  Option::None => {},
+}
+```
+
+### `json_out_finish`
+
+```bastio
+fn json_out_finish(o: JsonOut) -> Option[Bytes]
+```
+
+The finished document, or `None` when a call did not fit or the document
+is not complete (a container still open, nothing written).
+
+Example:
+
+```bastio
+let mut o = json_out_new();
+json_out_begin_arr(&mut o);   // never closed
+match json_out_finish(o) {
+  Option::Some(b) => { bfree(b); return 1; },
+  Option::None => {},
+}
+```
+
 ## Internals
 
 ### `json_str_end`
@@ -287,3 +578,22 @@ fn json_put_utf8(t: &mut Vec[u8], cp: u64)
 ```
 
 Internal: appends the UTF-8 encoding of the code point `cp`.
+
+### `json_out_slot`
+
+```bastio
+fn json_out_slot(o: &mut JsonOut) -> bool
+```
+
+Internal: makes room for a value at the current place: writes the comma
+an array element needs, and returns false (and marks the writer bad) when
+no value may come here. At the top level the value counts as done; a
+container resets that until it is closed.
+
+### `json_out_open`
+
+```bastio
+fn json_out_open(o: &mut JsonOut, open: u8, is_obj: bool)
+```
+
+Internal: opens a container (`open` is `{` or `[`, `is_obj` says which).
