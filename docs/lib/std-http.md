@@ -232,9 +232,10 @@ fn http_read_response(h: &Host, sock: u64, limit: u64) -> Option[Bytes]
 Reads one response from `sock` and returns it whole, status line and
 headers included, without waiting for the peer to close: the head, then
 the `Content-Length` bytes it names. A response with no `Content-Length`
-is read to the peer's close, as `http_read_all` does it; a chunked one,
-a head that is not a valid response head, a message longer than `limit`
-and a peer that closes early give `None`.
+is read to the peer's close, as `http_read_all` does it; a chunked one
+is read to its last chunk and returned with the body decoded after the
+head, which is left as it came. A head that is not a valid response head,
+a message longer than `limit` and a peer that closes early give `None`.
 
 Example:
 
@@ -261,6 +262,22 @@ match net_listen(host, lo, 0) {
                 bfree(m);
               },
               Option::None => {},
+            }
+            // A chunked response on the same connection comes back decoded.
+            let ch = bfrom("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nhel\r\n2\r\nlo\r\n0\r\n\r\n");
+            let sent2 = net_send_all(host, a, ch);
+            bfree(ch);
+            match http_read_response(host, c, 4096) {
+              Option::Some(m) => {
+                match http_body_start(m) {
+                  Option::Some(at) => {
+                    if !sent2 || at > blen(m) || !bytes_span_eq_str(m, at, blen(m), "hello") { bad = 1; }
+                  },
+                  Option::None => { bad = 1; },
+                }
+                bfree(m);
+              },
+              Option::None => { bad = 1; },
             }
             net_close(host, a);
           },
@@ -708,6 +725,17 @@ fn http_response_with(status: u64, reason: Str, ctype: Str, body: &Bytes, keep: 
 ```
 
 Internal: `http_response` with `Connection: keep-alive` when `keep`.
+
+### `http_read_chunked`
+
+```bastio
+fn http_read_chunked(h: &Host, sock: u64, first: &Bytes, limit: u64) -> Option[Bytes]
+  ensures result is Option::Some ==> blen(result.Some) <= limit && limit <= 1073741824
+```
+
+Internal: the decoded body of a chunked message. `first` holds the bytes
+that followed the head when it was read; the rest comes from `sock` until
+the last chunk. The decoded body is at most `limit` bytes.
 
 ### `http_is_connection`
 

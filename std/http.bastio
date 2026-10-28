@@ -261,12 +261,82 @@ fn http_read_all(h: &Host, sock: u64, limit: u64) -> Option[Bytes] {
   return Option[Bytes]::None;
 }
 
+/// Internal: the decoded body of a chunked message. `first` holds the bytes
+/// that followed the head when it was read; the rest comes from `sock` until
+/// the last chunk. The decoded body is at most `limit` bytes.
+fn http_read_chunked(h: &Host, sock: u64, first: &Bytes, limit: u64) -> Option[Bytes]
+  ensures result is Option::Some ==> blen(result.Some) <= limit && limit <= 1073741824
+{
+  if limit > 1073741824 || blen(first) > 1073741824 {
+    return Option[Bytes]::None;
+  }
+  let mut acc = bytes_slice(first, 0, blen(first));
+  let mut chunk = balloc(0);
+  let mut out = balloc(0);
+  let mut ok = true;
+  // The framing is bounded too: a body of one-byte chunks is seven bytes
+  // to the byte of data.
+  let cap = limit * 8 + 65536;
+  let mut pos: u64 = 0;
+  let mut done = false;
+  if blen(acc) > cap {
+    ok = false;
+  }
+  while ok && !done
+    invariant !ok || (pos <= blen(acc) && blen(acc) <= cap)
+    invariant blen(out) <= limit && cap <= 8589934592 + 65536
+  {
+    match http_chunk(acc, pos) {
+      Chunk::Ok(c) => {
+        if c.size > limit - blen(out) {
+          ok = false;
+        } else {
+          let piece = bytes_slice(acc, c.data, c.data + c.size);
+          let joined = bytes_concat(out, piece);
+          bfree(piece);
+          bfree(out);
+          out = joined;
+          pos = c.next;
+        }
+      },
+      Chunk::Last(x) => { done = true; },
+      Chunk::Bad(x) => { ok = false; },
+      Chunk::Partial => {
+        if blen(acc) >= cap {
+          ok = false;
+        } else {
+          match net_recv(h, sock, cap - blen(acc), &mut chunk) {
+            Option::Some(n) => {
+              if n == 0 || blen(chunk) == 0 || blen(chunk) > cap - blen(acc) {
+                ok = false;
+              } else {
+                let joined = bytes_concat(acc, chunk);
+                bfree(acc);
+                acc = joined;
+              }
+            },
+            Option::None => { ok = false; },
+          }
+        }
+      },
+    }
+  }
+  bfree(acc);
+  bfree(chunk);
+  if ok {
+    return Option[Bytes]::Some(out);
+  }
+  bfree(out);
+  return Option[Bytes]::None;
+}
+
 /// Reads one response from `sock` and returns it whole, status line and
 /// headers included, without waiting for the peer to close: the head, then
 /// the `Content-Length` bytes it names. A response with no `Content-Length`
-/// is read to the peer's close, as `http_read_all` does it; a chunked one,
-/// a head that is not a valid response head, a message longer than `limit`
-/// and a peer that closes early give `None`.
+/// is read to the peer's close, as `http_read_all` does it; a chunked one
+/// is read to its last chunk and returned with the body decoded after the
+/// head, which is left as it came. A head that is not a valid response head,
+/// a message longer than `limit` and a peer that closes early give `None`.
 /// ```
 /// // A response on a connection that stays open.
 /// let lo = net_ip4(127, 0, 0, 1);
@@ -291,6 +361,22 @@ fn http_read_all(h: &Host, sock: u64, limit: u64) -> Option[Bytes] {
 ///               },
 ///               Option::None => {},
 ///             }
+///             // A chunked response on the same connection comes back decoded.
+///             let ch = bfrom("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nhel\r\n2\r\nlo\r\n0\r\n\r\n");
+///             let sent2 = net_send_all(host, a, ch);
+///             bfree(ch);
+///             match http_read_response(host, c, 4096) {
+///               Option::Some(m) => {
+///                 match http_body_start(m) {
+///                   Option::Some(at) => {
+///                     if !sent2 || at > blen(m) || !bytes_span_eq_str(m, at, blen(m), "hello") { bad = 1; }
+///                   },
+///                   Option::None => { bad = 1; },
+///                 }
+///                 bfree(m);
+///               },
+///               Option::None => { bad = 1; },
+///             }
 ///             net_close(host, a);
 ///           },
 ///           Option::None => {},
@@ -313,12 +399,15 @@ fn http_read_response(h: &Host, sock: u64, limit: u64) -> Option[Bytes] {
     Option::Some(head) => {
       let mut want: u64 = 0;
       let mut rest = false;
+      let mut chunked = false;
       let mut ok = true;
+      let mut hend: u64 = 0;
       match http_parse_response(head) {
         RespHead::Ok(q) => {
           if q.head_end > blen(head) || q.fields > blen(head) {
             ok = false;
           } else {
+            hend = q.head_end;
             match http_body(head, q.fields) {
               Body::None => { rest = true; },
               Body::Length(n) => {
@@ -328,7 +417,7 @@ fn http_read_response(h: &Host, sock: u64, limit: u64) -> Option[Bytes] {
                   want = q.head_end + n;
                 }
               },
-              Body::Chunked => { ok = false; },
+              Body::Chunked => { chunked = true; },
               Body::Bad(x) => { ok = false; },
             }
           }
@@ -338,6 +427,26 @@ fn http_read_response(h: &Host, sock: u64, limit: u64) -> Option[Bytes] {
       }
       if blen(head) > 1073741824 {
         ok = false;
+      }
+      if chunked && ok && hend <= blen(head) {
+        // The head, then the decoded body in its place.
+        let first = bytes_slice(head, hend, blen(head));
+        let lead = bytes_slice(head, 0, hend);
+        bfree(head);
+        match http_read_chunked(h, sock, first, limit) {
+          Option::Some(d) => {
+            let both = bytes_concat(lead, d);
+            bfree(d);
+            bfree(lead);
+            bfree(first);
+            return Option[Bytes]::Some(both);
+          },
+          Option::None => {
+            bfree(lead);
+            bfree(first);
+            return Option[Bytes]::None;
+          },
+        }
       }
       let mut acc = head;
       let mut chunk = balloc(0);
@@ -654,52 +763,12 @@ fn http_req_body(h: &Host, r: &HttpReq, limit: u64) -> Option[Bytes] {
       }
     },
     Body::Chunked => {
-      // The framing is bounded too: a body of one-byte chunks is seven bytes
-      // to the byte of data.
-      let cap = limit * 8 + 65536;
-      let mut pos: u64 = 0;
-      let mut done = false;
-      if blen(acc) > cap {
-        ok = false;
-      }
-      while ok && !done
-        invariant !ok || (pos <= blen(acc) && blen(acc) <= cap)
-        invariant blen(out) <= limit && cap <= 8589934592 + 65536
-      {
-        match http_chunk(acc, pos) {
-          Chunk::Ok(c) => {
-            if c.size > limit - blen(out) {
-              ok = false;
-            } else {
-              let piece = bytes_slice(acc, c.data, c.data + c.size);
-              let joined = bytes_concat(out, piece);
-              bfree(piece);
-              bfree(out);
-              out = joined;
-              pos = c.next;
-            }
-          },
-          Chunk::Last(x) => { done = true; },
-          Chunk::Bad(x) => { ok = false; },
-          Chunk::Partial => {
-            if blen(acc) >= cap {
-              ok = false;
-            } else {
-              match net_recv(h, r.conn, cap - blen(acc), &mut chunk) {
-                Option::Some(n) => {
-                  if n == 0 || blen(chunk) == 0 || blen(chunk) > cap - blen(acc) {
-                    ok = false;
-                  } else {
-                    let joined = bytes_concat(acc, chunk);
-                    bfree(acc);
-                    acc = joined;
-                  }
-                },
-                Option::None => { ok = false; },
-              }
-            }
-          },
-        }
+      match http_read_chunked(h, r.conn, acc, limit) {
+        Option::Some(d) => {
+          bfree(out);
+          out = d;
+        },
+        Option::None => { ok = false; },
       }
     },
   }
