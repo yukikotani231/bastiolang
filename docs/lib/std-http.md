@@ -24,6 +24,7 @@ that a response is complete.
 | [`http_response`](#http_response) | A response with status `status`, reason phrase `reason`, content type `ctype` and body `body`. |
 | [`http_body_start`](#http_body_start) | Where the body starts. |
 | [`http_status`](#http_status) | The status code of a response (0 if the status line is not `HTTP/1.x NNN`). |
+| [`http_header`](#http_header) | The value of the first header field called `name` (written in lower case; the message may use any case) in the head of the response `m`, without the blanks around it. |
 | [`http_read_head`](#http_read_head) | Reads from `sock` until the bytes read hold a whole head (an empty line), or fails if the peer closes first or the head is longer than `limit`. |
 | [`http_read_all`](#http_read_all) | Reads from `sock` until the peer closes it, or fails if more than `limit` bytes arrive. |
 | [`http_read_response`](#http_read_response) | Reads one response from `sock` and returns it whole, status line and headers included, without waiting for the peer to close. |
@@ -134,6 +135,33 @@ let m = bfrom("HTTP/1.1 404 Not Found\r\n\r\n");
 let s = http_status(m);
 bfree(m);
 if s != 404 { return 1; }
+```
+
+### `http_header`
+
+```bastio
+fn http_header(m: &Bytes, name: Str) -> Option[Bytes]
+```
+
+The value of the first header field called `name` (written in lower
+case; the message may use any case) in the head of the response `m`,
+without the blanks around it. `None` if there is no such field or the
+head is not a well-formed response head.
+
+Example:
+
+```bastio
+let m = bfrom("HTTP/1.1 301 Moved\r\nContent-Type: text/html\r\nLOCATION:  /new \r\n\r\n<a>");
+let mut ok = false;
+match http_header(m, "location") {
+  Option::Some(v) => { ok = bytes_eq_str(v, "/new"); bfree(v); },
+  Option::None => {},
+}
+let none = http_header(m, "etag");
+let missing = none is Option::Some;
+match none { Option::Some(v) => { bfree(v); }, Option::None => {} }
+bfree(m);
+if !ok || missing { return 1; }
 ```
 
 ### `http_read_head`
@@ -777,6 +805,16 @@ fn http_response_with(status: u64, reason: Str, ctype: Str, body: &Bytes, keep: 
 ```
 
 Internal: `http_response` with `Connection: keep-alive` when `keep`.
+
+### `http_name_is`
+
+```bastio
+fn http_name_is(s: &Bytes, a: u64, b: u64, name: Str) -> bool
+  requires a <= b && b <= blen(s)
+```
+
+Internal: is `s[a..b)` equal to `name` (given in lower case), ignoring
+the case of letters in `s`?
 
 ### `http_read_chunked`
 
