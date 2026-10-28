@@ -127,6 +127,8 @@ What will be 0.2.0.
   so the result is well-formed or `None`.
 - `std/http`: `http_post_request` and `http_post` send a `POST` with a body and a content type;
   `http_get`'s response reader reads the answer.
+- `std/http`: `http_header` reads a header field of a response (the name is matched ignoring case,
+  the value has its blanks removed), for `Location`, `Content-Type` and the like.
 - `core/json`: `json_i64` reads a signed integer (an optional `-` and digits, within `i64`), and
   `json_out_i64` writes one.
 - `examples/leb128`: a proved unsigned LEB128 (varint) decoder and encoder called from C, fuzzed

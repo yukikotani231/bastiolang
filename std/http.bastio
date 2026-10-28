@@ -117,6 +117,69 @@ fn http_status(m: &Bytes) -> u64 {
   }
 }
 
+/// Internal: is `s[a..b)` equal to `name` (given in lower case), ignoring
+/// the case of letters in `s`?
+fn http_name_is(s: &Bytes, a: u64, b: u64, name: Str) -> bool
+  requires a <= b && b <= blen(s)
+{
+  if b - a != slen(name) { return false; }
+  let mut i = 0;
+  while i < slen(name)
+    invariant i <= slen(name) && a + slen(name) == b
+  {
+    if http_lower(bget(s, a + i)) != sget(name, i) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+/// The value of the first header field called `name` (written in lower
+/// case; the message may use any case) in the head of the response `m`,
+/// without the blanks around it. `None` if there is no such field or the
+/// head is not a well-formed response head.
+/// ```
+/// let m = bfrom("HTTP/1.1 301 Moved\r\nContent-Type: text/html\r\nLOCATION:  /new \r\n\r\n<a>");
+/// let mut ok = false;
+/// match http_header(m, "location") {
+///   Option::Some(v) => { ok = bytes_eq_str(v, "/new"); bfree(v); },
+///   Option::None => {},
+/// }
+/// let none = http_header(m, "etag");
+/// let missing = none is Option::Some;
+/// match none { Option::Some(v) => { bfree(v); }, Option::None => {} }
+/// bfree(m);
+/// if !ok || missing { return 1; }
+/// ```
+fn http_header(m: &Bytes, name: Str) -> Option[Bytes] {
+  match http_parse_response(m) {
+    RespHead::Ok(r) => {
+      let mut at = r.fields;
+      let mut left = r.nfields;
+      while left > 0 && at < blen(m)
+        invariant at <= blen(m)
+      {
+        match http_field(m, at) {
+          Next::Ok(f) => {
+            if f.name_end <= blen(m) && f.value_end <= blen(m) && at <= f.name_end && f.value <= f.value_end {
+              if http_name_is(m, at, f.name_end, name) {
+                return Option[Bytes]::Some(bytes_slice(m, f.value, f.value_end));
+              }
+            }
+            at = f.next;
+            left = left - 1;
+          },
+          Next::End(x) => { return Option[Bytes]::None; },
+          Next::Partial => { return Option[Bytes]::None; },
+          Next::Bad(x) => { return Option[Bytes]::None; },
+        }
+      }
+      return Option[Bytes]::None;
+    },
+    RespHead::Partial => { return Option[Bytes]::None; },
+    RespHead::Bad(x) => { return Option[Bytes]::None; },
+  }
+}
+
 /// Reads from `sock` until the bytes read hold a whole head (an empty line),
 /// or fails if the peer closes first or the head is longer than `limit`. The
 /// result may end with the first bytes of a body.
