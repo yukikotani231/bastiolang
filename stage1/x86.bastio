@@ -205,6 +205,8 @@ struct X86 {
   target: u64,
   /// Assembly for macOS (Mach-O) rather than Linux (ELF), see macho.bastio.
   macos: bool,
+  /// Assembly for Windows (rewritten by winpe.bastio): sockets are Winsock handles.
+  windows: bool,
   /// The thunks of the `smp_run` calls (kernel target), written after the
   /// functions, and how many there are.
   smp: Vec[u64],
@@ -229,7 +231,7 @@ fn x86_new() -> X86 {
     sdata: vec_new[u64](), sstart: vec_new[u64](), slens: vec_new[u64](),
     labels: 0, frame: 0, slots: vec_new[u64](), live: vec_new[u64](), freed: vec_new[u64](), depth: 0, env: 0, pre: 0, retl: 0, retw: 0, reto: 0, rdk: 0, rda: 0, rdo: 0,
     parent: vec_new[u64](), cur: 0, decl: vec_new[X86Decl](), ivs: vec_new[X86Iv](), pos: 0, loops: vec_new[u64](), xt: vec_new[u64](), sw: false, failed: false, fmsg: vec_new[u64](),
-    stage0: false, target: TARGET_HOSTED, macos: false, smp: vec_new[u64](), nsmp: 0, snode: vec_new[u64](),
+    stage0: false, target: TARGET_HOSTED, macos: false, windows: false, smp: vec_new[u64](), nsmp: 0, snode: vec_new[u64](),
     mk: 0, ma: 0, mmask: 0, rspill: 0, rlimit: 1000000000, rkeep: false
   };
 }
@@ -8797,7 +8799,7 @@ fn x86_program_end(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, main_x: u
   } else {
     x86_runtime(&mut g.out);
     if !g.stage0 {
-      x86_runtime1(&mut g.out, g.macos);
+      x86_runtime1(&mut g.out, g.macos, g.windows);
       w_s(&mut g.out, "\t.bss\n\t.p2align 3\nbst_rt_pt_leases:\t.zero 1048576    # a 32-bit lease count per pool frame\n");
       w_s(&mut g.out, "bst_rt_shared_refs:\t.zero 1048576  # a 32-bit reference count per shared pool frame\n");
     }
@@ -9213,7 +9215,7 @@ fn x86_runtime(out: &mut Vec[u64]) {
 /// The routines of the runtime that only stage1's backend uses (Child,
 /// host_env, host_cpus, host_eprint, the simulated devices), after
 /// `x86_runtime`.
-fn x86_runtime1(out: &mut Vec[u64], macos: bool) {
+fn x86_runtime1(out: &mut Vec[u64], macos: bool, windows: bool) {
   w_s(&mut out, "# ---- runtime only stage1 writes (trusted base) ----\n");
   w_s(&mut out, "\t.text\n");
   w_s(&mut out, "bst_rt_alloc_raw:               # %rax = %rdi words (at least one), not zeroed: the caller writes all of them\n");
@@ -9390,7 +9392,11 @@ fn x86_runtime1(out: &mut Vec[u64], macos: bool) {
   w_s(&mut out, "18:	mov %r12d, %eax\n");
   w_s(&mut out, "	jmp 9b\n");
   w_s(&mut out, "17:	mov %r12d, %edi\n");
-  w_s(&mut out, "	call close@PLT\n");
+  if windows {
+    w_s(&mut out, "	call closesocket@PLT\n");
+  } else {
+    w_s(&mut out, "	call close@PLT\n");
+  }
   w_s(&mut out, "	jmp 8b\n");
   w_s(&mut out, "11:	mov %ebx, %edi\n");
   w_s(&mut out, "	xor %esi, %esi\n");
@@ -9405,7 +9411,11 @@ fn x86_runtime1(out: &mut Vec[u64], macos: bool) {
   w_s(&mut out, "	mov %ebx, %edi\n");
   w_s(&mut out, "	mov %r14, %rsi\n");
   w_s(&mut out, "	mov %r12, %rdx\n");
-  w_s(&mut out, "	call read@PLT\n");
+  if windows {
+    w_s(&mut out, "	call recv@PLT                 # a socket is not a C library descriptor\n");
+  } else {
+    w_s(&mut out, "	call read@PLT\n");
+  }
   w_s(&mut out, "	test %rax, %rax\n");
   w_s(&mut out, "	js 19f\n");
   w_s(&mut out, "	mov %rax, %rbx\n");
@@ -9421,7 +9431,7 @@ fn x86_runtime1(out: &mut Vec[u64], macos: bool) {
   w_s(&mut out, "13:	mov %ebx, %edi\n");
   w_s(&mut out, "	mov 8(%r13), %rsi\n");
   w_s(&mut out, "	mov (%r13), %rdx\n");
-  if macos {
+  if macos || windows {
     w_s(&mut out, "	xor %ecx, %ecx                # no flags (SIGPIPE is ignored)\n");
   } else {
     w_s(&mut out, "	mov $0x4000, %ecx             # MSG_NOSIGNAL\n");
@@ -9431,7 +9441,11 @@ fn x86_runtime1(out: &mut Vec[u64], macos: bool) {
   w_s(&mut out, "	js 8b\n");
   w_s(&mut out, "	jmp 9b\n");
   w_s(&mut out, "14:	mov %ebx, %edi\n");
-  w_s(&mut out, "	call close@PLT\n");
+  if windows {
+    w_s(&mut out, "	call closesocket@PLT\n");
+  } else {
+    w_s(&mut out, "	call close@PLT\n");
+  }
   w_s(&mut out, "	test %eax, %eax\n");
   w_s(&mut out, "	jnz 8b\n");
   w_s(&mut out, "	xor %eax, %eax\n");

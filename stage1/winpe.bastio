@@ -163,6 +163,47 @@ fn wn_quote(out: &mut Vec[u64]) {
   w_s(&mut out, "9:\tmovb $34, (%r13)\n\tmovb $0, 1(%r13)\n\tmov %r12, %rax\n\tlea -24(%rbp), %rsp\n\tpop %r13\n\tpop %r12\n\tpop %rbx\n\tpop %rbp\n\tret\n");
 }
 
+/// `bst_wn_wsget`: the address of Winsock function number `%r11d` (1 socket,
+/// 2 bind, 3 listen, 4 accept, 5 connect, 6 recv, 7 send, 8 closesocket,
+/// 9 getsockname) in `%rax`, or 0 when ws2_32.dll cannot be loaded. The first
+/// call loads the library, finds the nine functions and `WSAStartup`s.
+fn wn_wsget(out: &mut Vec[u64]) {
+  w_s(&mut out, "bst_wn_wsget:\n\tpush %rbp\n\tmov %rsp, %rbp\n\tpush %rbx\n\tpush %r12\n\tpush %r13\n\tpush %r14\n\tsub $576, %rsp\n\tand $-16, %rsp\n");
+  w_s(&mut out, "\tmov %r11d, %ebx\n\tmov bst_w_wsstate(%rip), %eax\n\ttest %eax, %eax\n\tjnz 5f\n");
+  w_s(&mut out, "\tmovl $-1, bst_w_wsstate(%rip)\n\tlea bst_w_wsnames(%rip), %rcx\n\tcall LoadLibraryA\n\ttest %rax, %rax\n\tjz 6f\n");
+  w_s(&mut out, "\tmov %rax, %r12\n\tlea bst_w_wsnames+11(%rip), %r13\n\txor %r14d, %r14d\n");
+  w_s(&mut out, "1:\tcmp $10, %r14d\n\tjae 3f\n\tmov %r12, %rcx\n\tmov %r13, %rdx\n\tcall GetProcAddress\n\ttest %rax, %rax\n\tjz 6f\n");
+  w_s(&mut out, "\tlea bst_w_ws(%rip), %rcx\n\tmov %rax, (%rcx,%r14,8)\n");
+  w_s(&mut out, "2:\tcmpb $0, (%r13)\n\tje 4f\n\tinc %r13\n\tjmp 2b\n");
+  w_s(&mut out, "4:\tinc %r13\n\tinc %r14d\n\tjmp 1b\n");
+  w_s(&mut out, "3:\tmov $0x202, %ecx\n\tlea 32(%rsp), %rdx\n\tmov bst_w_ws(%rip), %rax\n\tcall *%rax\n\ttest %eax, %eax\n\tjnz 6f\n");
+  w_s(&mut out, "\tmovl $1, bst_w_wsstate(%rip)\n");
+  w_s(&mut out, "5:\tcmpl $1, bst_w_wsstate(%rip)\n\tjne 6f\n\tlea bst_w_ws(%rip), %rax\n\tmov (%rax,%rbx,8), %rax\n\tjmp 7f\n");
+  w_s(&mut out, "6:\txor %eax, %eax\n");
+  w_s(&mut out, "7:\tlea -32(%rbp), %rsp\n\tpop %r14\n\tpop %r13\n\tpop %r12\n\tpop %rbx\n\tpop %rbp\n\tret\n");
+}
+
+/// `bst_wn_name`: calls Winsock function number `idx` with the first four
+/// System V arguments (`zero_r9`: the fourth is 0 whatever the caller left
+/// there), and -1 when Winsock is not there. `widen`: the result is an `int`,
+/// which is sign-extended (the program tests the whole register).
+fn wn_ws(out: &mut Vec[u64], name: Str, idx: u64, zero_r9: bool, widen: bool) {
+  w_s(&mut out, "bst_wn_");
+  w_s(&mut out, name);
+  w_s(&mut out, ":\n\tpush %rbp\n\tmov %rsp, %rbp\n\tpush %rdi\n\tpush %rsi\n\tpush %rdx\n\tpush %rcx\n\tmov $");
+  w_num(&mut out, idx);
+  w_s(&mut out, ", %r11d\n\tcall bst_wn_wsget\n\ttest %rax, %rax\n\tjz 1f\n\tmov %rax, %r11\n");
+  w_s(&mut out, "\tpop %r9\n\tpop %r8\n\tpop %rdx\n\tpop %rcx\n");
+  if zero_r9 {
+    w_s(&mut out, "\txor %r9d, %r9d\n");
+  }
+  w_s(&mut out, "\tsub $32, %rsp\n\tand $-16, %rsp\n\tcall *%r11\n");
+  if widen {
+    w_s(&mut out, "\tcltq\n");
+  }
+  w_s(&mut out, "\tleave\n\tret\n1:\tmov $-1, %rax\n\tleave\n\tret\n");
+}
+
 /// The entry point, the thunks and the data they use.
 fn wn_tail(out: &mut Vec[u64]) {
   w_s(&mut out, "\t.text\n\t.globl main\nmain:\n\tpush %rbp\n\tpush %rdi\n\tpush %rsi\n\tpush %rbx\n\tsub $40, %rsp\n");
@@ -174,15 +215,18 @@ fn wn_tail(out: &mut Vec[u64]) {
   w_s(&mut out, "\tmov %rax, bst_w_stderr(%rip)\n\tmov %rax, %rcx\n\txor %edx, %edx\n\tmov $4, %r8d\n\txor %r9d, %r9d\n\tcall setvbuf\n");
   w_s(&mut out, "\tcall bst_prog_main\n\tadd $40, %rsp\n\tpop %rbx\n\tpop %rsi\n\tpop %rdi\n\tpop %rbp\n\tret\n");
   wn_thunk(&mut out, "abort", "abort");
-  // host_net has no Windows spelling yet: no socket can be made, so the rest is never reached.
-  wn_stub(&mut out, "socket", "-1");
-  wn_stub(&mut out, "setsockopt", "-1");
-  wn_stub(&mut out, "bind", "-1");
-  wn_stub(&mut out, "listen", "-1");
-  wn_stub(&mut out, "accept", "-1");
-  wn_stub(&mut out, "connect", "-1");
-  wn_stub(&mut out, "send", "-1");
-  wn_stub(&mut out, "getsockname", "-1");
+  // host_net: Winsock, loaded on the first call (see wn_wsget).
+  wn_wsget(&mut out);
+  wn_ws(&mut out, "socket", 1, false, false);
+  wn_ws(&mut out, "bind", 2, false, false);
+  wn_ws(&mut out, "listen", 3, false, false);
+  wn_ws(&mut out, "accept", 4, false, false);
+  wn_ws(&mut out, "connect", 5, false, false);
+  wn_ws(&mut out, "recv", 6, true, true);
+  wn_ws(&mut out, "send", 7, false, true);
+  wn_ws(&mut out, "closesocket", 8, false, false);
+  wn_ws(&mut out, "getsockname", 9, false, false);
+  wn_stub(&mut out, "setsockopt", "0");
   w_s(&mut out, "bst_wn_aligned_alloc:\n\tpush %rbp\n\tmov %rsp, %rbp\n\tsub $32, %rsp\n\tand $-16, %rsp\n");
   w_s(&mut out, "\tmov %rdi, %rdx\n\tmov %rsi, %rcx\n\tcall _aligned_malloc\n\tmov %rax, bst_w_aligned(%rip)\n\tleave\n\tret\n");
   wn_thunk(&mut out, "calloc", "calloc");
@@ -230,7 +274,7 @@ fn wn_tail(out: &mut Vec[u64]) {
   w_s(&mut out, "\tmov %rsi, %rcx\n\tmovslq %edi, %rdx\n\txor %r8d, %r8d\n\tcall _cwait\n");
   w_s(&mut out, "\tcmp $-1, %eax\n\tje 2f\n\tshll $8, (%rsi)\n\tleave\n\tret\n2:\tmovl $0x7f00, (%rsi)\n\txor %eax, %eax\n\tleave\n\tret\n");
   wn_thunk(&mut out, "write", "_write");
-  w_s(&mut out, "\t.section .rdata,\"dr\"\nbst_w_mode:\n\t.asciz \"w\"\n\t.data\n\t.p2align 3\nbst_w_stderr:\n\t.quad 0\nbst_w_null:\n\t.quad 0\nbst_w_aligned:\n\t.quad 0\nbst_w_pipe_text:\n\t.long 0\n\t.long 0\nbst_w_nacts:\n\t.long 0\n\t.long 0\nbst_w_acts:\n\t.zero 64\n");
+  w_s(&mut out, "\t.section .rdata,\"dr\"\nbst_w_mode:\n\t.asciz \"w\"\nbst_w_wsnames:\n\t.asciz \"ws2_32.dll\"\n\t.asciz \"WSAStartup\"\n\t.asciz \"socket\"\n\t.asciz \"bind\"\n\t.asciz \"listen\"\n\t.asciz \"accept\"\n\t.asciz \"connect\"\n\t.asciz \"recv\"\n\t.asciz \"send\"\n\t.asciz \"closesocket\"\n\t.asciz \"getsockname\"\n\t.data\n\t.p2align 3\nbst_w_stderr:\n\t.quad 0\nbst_w_null:\n\t.quad 0\nbst_w_aligned:\n\t.quad 0\nbst_w_pipe_text:\n\t.long 0\n\t.long 0\nbst_w_nacts:\n\t.long 0\n\t.long 0\nbst_w_acts:\n\t.zero 64\nbst_w_wsstate:\n\t.long 0\n\t.long 0\nbst_w_ws:\n\t.zero 80\n");
 }
 
 /// The Windows spelling of the x86-64 assembly text `v`.
