@@ -122,6 +122,8 @@ What will be 0.2.0.
 
 ### Library
 
+- `examples/leb128`: a proved unsigned LEB128 (varint) decoder and encoder called from C, fuzzed
+  against a C decoder under AddressSanitizer.
 - `core/strsort`: `spans_order` sorts pieces of a text in byte order by
   returning the indices `0..n` in order, proved a permutation with every
   neighbouring pair in order; `core/spancmp` has `span_cmp` for one pair.

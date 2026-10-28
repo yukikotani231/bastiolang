@@ -33,6 +33,7 @@ PAGES = {
     "docs/packages.md": "packages.md",
     "examples/base64/README.md": "examples-base64.md",
     "examples/utf8/README.md": "examples-utf8.md",
+    "examples/leb128/README.md": "examples-leb128.md",
     "examples/der/README.md": "examples-der.md",
     "examples/qoi/README.md": "examples-qoi.md",
     "examples/http/README.md": "examples-http.md",

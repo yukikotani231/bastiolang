@@ -13,6 +13,7 @@
 - [Calling Bastio from C](c-libraries.md)
   - [base64](examples-base64.md)
   - [UTF-8](examples-utf8.md)
+  - [LEB128](examples-leb128.md)
   - [DER](examples-der.md)
   - [QOI](examples-qoi.md)
   - [HTTP](examples-http.md)

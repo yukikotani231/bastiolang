@@ -1,0 +1,105 @@
+// Unsigned LEB128 (as used by WebAssembly, DWARF and protobuf varints): seven
+// bits per byte, least significant group first, the high bit of a byte says
+// that another byte follows. A value is 64 bits, so an encoding is 1 to 10
+// bytes.
+//
+// What the compiler proves about this file, with no runtime checks in the
+// generated code:
+// - the decoder reads only inside the buffer, for every input and every
+//   starting offset it accepts, and never more than 10 bytes;
+// - the number of bytes it reports is between 1 and 10 and fits the buffer;
+// - no shift is 64 or more, no integer overflow, no division by zero;
+// - the encoder writes only inside the output buffer it is lent, and tells
+//   how many bytes it wrote (the same count `leb_size` gives).
+// Not proved: that decoding inverts encoding, or that an encoding is the
+// shortest. The C harness checks those by testing (see README.md).
+
+/// The longest encoding of a 64-bit value.
+const LEB_MAX_BYTES: u64 = 10;
+
+struct Leb {
+  // The decoded value.
+  value: u64,
+  // How many bytes of the input it took, 1 to 10.
+  used: u64,
+}
+
+enum LebDecoded {
+  Ok(Leb),
+  // The input ends before a byte without the continuation bit.
+  Truncated,
+  // The tenth byte still asks for more.
+  TooLong,
+  // The value needs more than 64 bits (the tenth byte is more than 1).
+  Overflow,
+}
+
+/// The number of bytes that `x` encodes to.
+fn leb_size(x: u64) -> u64
+  ensures result >= 1 && result <= LEB_MAX_BYTES
+{
+  let mut n = 1;
+  let mut rest = x;
+  // A 64-bit value has at most nine 7-bit groups after the first.
+  while rest >= 128 && n < LEB_MAX_BYTES
+    invariant n >= 1 && n <= LEB_MAX_BYTES
+  {
+    rest = rest / 128;
+    n = n + 1;
+  }
+  return n;
+}
+
+/// Decodes the value that starts at `at` in `src`.
+fn leb_decode(src: &Bytes, at: u64) -> LebDecoded
+  requires at <= blen(src)
+  ensures result is LebDecoded::Ok ==> result.Ok.used >= 1 && result.Ok.used <= LEB_MAX_BYTES
+  ensures result is LebDecoded::Ok ==> result.Ok.used <= blen(src) - at
+{
+  let mut value: u64 = 0;
+  let mut i: u64 = 0;
+  while i < LEB_MAX_BYTES && at + i < blen(src)
+    invariant i <= LEB_MAX_BYTES && at + i <= blen(src)
+  {
+    let b = bget(src, at + i);
+    let low = cast[u64](b % 128);
+    // The tenth byte holds bit 63 only: more than that does not fit.
+    if i == 9 {
+      if b >= 128 {
+        return LebDecoded::TooLong;
+      }
+      if low > 1 {
+        return LebDecoded::Overflow;
+      }
+    }
+    value = value | (low << (i * 7));
+    if b < 128 {
+      return LebDecoded::Ok(Leb { value: value, used: i + 1 });
+    }
+    i = i + 1;
+  }
+  return LebDecoded::Truncated;
+}
+
+/// Writes `x` at the start of `out` and returns how many bytes it took, or
+/// 0 when `out` is too small (nothing past `out` is written either way).
+fn leb_encode_into(x: u64, out: &mut Bytes) -> u64
+  ensures result <= LEB_MAX_BYTES
+  ensures result <= blen(out)
+{
+  let mut rest = x;
+  let mut i: u64 = 0;
+  while rest >= 128 && i < LEB_MAX_BYTES && i < blen(out)
+    invariant i <= LEB_MAX_BYTES && i <= blen(out)
+  {
+    bset(&mut out, i, cast[u8](rest % 128 + 128));
+    rest = rest / 128;
+    i = i + 1;
+  }
+  // (`i` is at most 9 here for every x, but the prover is told only the bound.)
+  if rest >= 128 || i + 1 > LEB_MAX_BYTES || i >= blen(out) {
+    return 0;
+  }
+  bset(&mut out, i, cast[u8](rest));
+  return i + 1;
+}
