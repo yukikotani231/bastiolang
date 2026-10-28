@@ -315,6 +315,52 @@ fn bytes_find(hay: &Bytes, needle: &Bytes, from: u64) -> Option[u64]
   return Option[u64]::None;
 }
 
+/// The last index where `needle` occurs in `hay`, if any. Proved: a `Some`
+/// is a real occurrence. Not proved: that it is the last, or that `None`
+/// means there is none (as for `bytes_find`).
+/// ```
+/// let hay = bfrom("a/b/c.txt");
+/// let needle = bfrom("/");
+/// let mut at = 99;
+/// match bytes_rfind(hay, needle) {
+///   Option::Some(i) => {
+///     // The contract says the needle is there, so this slice needs no check.
+///     let found = bytes_slice(hay, i, i + blen(needle));
+///     if bytes_eq(found, needle) { at = i; }
+///     bfree(found);
+///   },
+///   Option::None => {},
+/// }
+/// bfree(hay);
+/// bfree(needle);
+/// if at != 3 { return 1; }
+/// ```
+fn bytes_rfind(hay: &Bytes, needle: &Bytes) -> Option[u64]
+  ensures result is Option::Some ==> result.Some + blen(needle) <= blen(hay)
+  ensures result is Option::Some ==> bytes_same_at(hay, result.Some, needle, 0, blen(needle))
+{
+  if blen(needle) > blen(hay) {
+    return Option[u64]::None;
+  }
+  let mut i = blen(hay) - blen(needle) + 1;
+  while i > 0
+    invariant i + blen(needle) <= blen(hay) + 1
+  {
+    let at = i - 1;
+    let mut j = 0;
+    while j < blen(needle) && bget(hay, at + j) == bget(needle, j)
+      invariant j <= blen(needle) && bytes_same_at(hay, at, needle, 0, j)
+    {
+      j = j + 1;
+    }
+    if j == blen(needle) {
+      return Option[u64]::Some(at);
+    }
+    i = at;
+  }
+  return Option[u64]::None;
+}
+
 /// A copy of bytes `from..to` of `b`.
 /// ```
 /// let b = bfrom("hello, world");
