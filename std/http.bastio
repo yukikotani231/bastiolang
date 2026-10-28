@@ -522,6 +522,64 @@ fn http_get(h: &Host, ip: u64, port: u64, host: Str, path: Str, limit: u64) -> O
   }
 }
 
+/// The request for `POST path` from `host`, with `body` as its content of
+/// type `ctype`.
+/// ```
+/// let body = bfrom("{\"a\":1}");
+/// let r = http_post_request("example.org", "/api", "application/json", body);
+/// let want = bfrom("POST /api HTTP/1.1\r\nHost: example.org\r\nContent-Type: application/json\r\nContent-Length: 7\r\nConnection: close\r\n\r\n{\"a\":1}");
+/// let ok = bytes_eq(r, want);
+/// bfree(r);
+/// bfree(want);
+/// bfree(body);
+/// if !ok { return 1; }
+/// ```
+fn http_post_request(host: Str, path: Str, ctype: Str, body: &Bytes) -> Bytes {
+  let mut t = text_new();
+  text_push_str(&mut t, "POST ");
+  text_push_str(&mut t, path);
+  text_push_str(&mut t, " HTTP/1.1\r\nHost: ");
+  text_push_str(&mut t, host);
+  text_push_str(&mut t, "\r\nContent-Type: ");
+  text_push_str(&mut t, ctype);
+  text_push_str(&mut t, "\r\nContent-Length: ");
+  fmt_u64(&mut t, blen(body));
+  text_push_str(&mut t, "\r\nConnection: close\r\n\r\n");
+  text_push_bytes(&mut t, body);
+  return text_finish(t);
+}
+
+/// Sends `POST path` with `body` (of type `ctype`) to `ip`:`port` and
+/// returns the whole response, as `http_get` does.
+/// ```
+/// // Nothing listens on port 1, so there is no response.
+/// let body = bfrom("x");
+/// let mut none = true;
+/// match http_post(host, net_ip4(127, 0, 0, 1), 1, "localhost", "/", "text/plain", body, 65536) {
+///   Option::Some(r) => { bfree(r); none = false; },
+///   Option::None => {},
+/// }
+/// bfree(body);
+/// if !none { return 1; }
+/// ```
+fn http_post(h: &Host, ip: u64, port: u64, host: Str, path: Str, ctype: Str, body: &Bytes, limit: u64) -> Option[Bytes] {
+  match net_connect(h, ip, port) {
+    Option::Some(s) => {
+      let req = http_post_request(host, path, ctype, body);
+      let sent = net_send_all(h, s, req);
+      bfree(req);
+      if !sent {
+        net_close(h, s);
+        return Option[Bytes]::None;
+      }
+      let r = http_read_all(h, s, limit);
+      net_close(h, s);
+      return r;
+    },
+    Option::None => { return Option[Bytes]::None; },
+  }
+}
+
 /// Accepts a connection on the listening socket `sock` and reads its request
 /// head (at most `limit` bytes). A connection that sends no whole head in
 /// that much is closed and gives `None`.

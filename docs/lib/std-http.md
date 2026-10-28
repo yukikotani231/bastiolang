@@ -28,6 +28,8 @@ that a response is complete.
 | [`http_read_all`](#http_read_all) | Reads from `sock` until the peer closes it, or fails if more than `limit` bytes arrive. |
 | [`http_read_response`](#http_read_response) | Reads one response from `sock` and returns it whole, status line and headers included, without waiting for the peer to close. |
 | [`http_get`](#http_get) | Sends `GET path` to `ip`:`port` (the `Host` header says `host`) and returns the whole response, at most `limit` bytes, status line and headers included. |
+| [`http_post_request`](#http_post_request) | The request for `POST path` from `host`, with `body` as its content of type `ctype`. |
+| [`http_post`](#http_post) | Sends `POST path` with `body` (of type `ctype`) to `ip`:`port` and returns the whole response, as `http_get` does. |
 | [`http_accept`](#http_accept) | Accepts a connection on the listening socket `sock` and reads its request head (at most `limit` bytes). |
 | [`http_read_request`](#http_read_request) | Reads the next request head (at most `limit` bytes) from the connection `conn`, which `http_accept` or an earlier answer left open. |
 | [`http_req_target`](#http_req_target) | The request target of `r` (the path and query of `GET /a?b HTTP/1.1`), or empty if the request line has none. |
@@ -314,6 +316,51 @@ match http_get(host, net_ip4(127, 0, 0, 1), 1, "localhost", "/", 65536) {
   Option::Some(r) => { bfree(r); none = false; },
   Option::None => {},
 }
+if !none { return 1; }
+```
+
+### `http_post_request`
+
+```bastio
+fn http_post_request(host: Str, path: Str, ctype: Str, body: &Bytes) -> Bytes
+```
+
+The request for `POST path` from `host`, with `body` as its content of
+type `ctype`.
+
+Example:
+
+```bastio
+let body = bfrom("{\"a\":1}");
+let r = http_post_request("example.org", "/api", "application/json", body);
+let want = bfrom("POST /api HTTP/1.1\r\nHost: example.org\r\nContent-Type: application/json\r\nContent-Length: 7\r\nConnection: close\r\n\r\n{\"a\":1}");
+let ok = bytes_eq(r, want);
+bfree(r);
+bfree(want);
+bfree(body);
+if !ok { return 1; }
+```
+
+### `http_post`
+
+```bastio
+fn http_post(h: &Host, ip: u64, port: u64, host: Str, path: Str, ctype: Str, body: &Bytes, limit: u64) -> Option[Bytes]
+```
+
+Sends `POST path` with `body` (of type `ctype`) to `ip`:`port` and
+returns the whole response, as `http_get` does.
+
+Example:
+
+```bastio
+// Nothing listens on port 1, so there is no response.
+let body = bfrom("x");
+let mut none = true;
+match http_post(host, net_ip4(127, 0, 0, 1), 1, "localhost", "/", "text/plain", body, 65536) {
+  Option::Some(r) => { bfree(r); none = false; },
+  Option::None => {},
+}
+bfree(body);
 if !none { return 1; }
 ```
 
