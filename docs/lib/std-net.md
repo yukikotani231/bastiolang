@@ -7,7 +7,7 @@ the other targets whose native or C backend links the C library's socket
 calls). Built on the `Host` capability, so a kernel or user program that
 imports this file is rejected (`E-TARGET`). A call that fails (no such
 listener, a closed descriptor, an address in use) gives `Option::None` or
-`false`; on Windows every call fails.
+`false`. On Windows the calls go to Winsock, loaded on the first call.
 
 `import "std/net.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md).
 
