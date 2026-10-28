@@ -92,7 +92,7 @@ user_one() {
 example_one() {
   local f=$1 name
   # Sockets are not implemented on Windows (every call fails).
-  case "$f:$(uname -s)" in examples/httpd.bastio:MINGW*|examples/httpd.bastio:MSYS*) echo =pass; return ;; esac
+  case "$f:$(uname -s)" in examples/httpd.bastio:MINGW*|examples/httpd.bastio:MSYS*|examples/jsonapi.bastio:MINGW*|examples/jsonapi.bastio:MSYS*) echo =pass; return ;; esac
   name=$(basename "$f" .bastio)
   if ! "$BASTIOC" --arch "$ARCH" -o "$w/ex_$name" "$f" 2>"$w/ex.err"; then
     echo "FAIL $f: rejected"; sed 's/^/    /' "$w/ex.err"; echo =fail; return

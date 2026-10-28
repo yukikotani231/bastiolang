@@ -1,0 +1,254 @@
+// stage1-only: host_net (sockets), std/http, core/json
+// A small JSON API with std/http and core/json: `POST /greet` with a body
+// such as {"name": "Ada", "times": 2} answers {"greeting":"hello Ada","times":2}
+// (`times` is optional and defaults to 1); a body that is not valid JSON, has
+// no string `name`, or has a `times` that is not a small number is answered
+// 400, and any other target 404. Run with no arguments it checks itself: it
+// listens on a free port of 127.0.0.1, sends itself requests over one real
+// connection, and exits with 0 if the answers are right. `jsonapi serve PORT`
+// serves on 127.0.0.1:PORT until it is killed.
+//
+// What the compiler proves: no buffer is read or written out of bounds and
+// none leaks, whatever bytes a client sends. It does not prove that the
+// answers are right (the self-check does).
+import "core/print.bastio";
+import "core/json.bastio";
+import "std/host.bastio";
+import "std/http.bastio";
+
+/// The reply body for the JSON document `b`, or `None` if it is refused.
+fn greeting(b: &Bytes) -> Option[Bytes] {
+  // The whole body must be one JSON value.
+  match json_value(b, 0) {
+    Json::Ok(e) => { if e != blen(b) { return Option[Bytes]::None; } },
+    Json::Partial => { return Option[Bytes]::None; },
+    Json::Bad(x) => { return Option[Bytes]::None; },
+  }
+  let mut times: u64 = 1;
+  match json_member(b, 0, "times") {
+    Option::Some(at) => {
+      match json_u64(b, at) {
+        Option::Some(n) => {
+          if n > 1000 { return Option[Bytes]::None; }
+          times = n;
+        },
+        Option::None => { return Option[Bytes]::None; },
+      }
+    },
+    Option::None => {},
+  }
+  match json_member(b, 0, "name") {
+    Option::Some(at) => {
+      match json_string(b, at) {
+        Option::Some(name) => {
+          if blen(name) > 1000 {
+            bfree(name);
+            return Option[Bytes]::None;
+          }
+          let mut hi = text_new();
+          text_push_str(&mut hi, "hello ");
+          text_push_bytes(&mut hi, name);
+          bfree(name);
+          let msg = text_finish(hi);
+          let mut t = text_new();
+          text_push_str(&mut t, "{\"greeting\":");
+          json_push_string(&mut t, msg);
+          bfree(msg);
+          text_push_str(&mut t, ",\"times\":");
+          fmt_u64(&mut t, times);
+          text_push_str(&mut t, "}");
+          return Option[Bytes]::Some(text_finish(t));
+        },
+        Option::None => { return Option[Bytes]::None; },
+      }
+    },
+    Option::None => { return Option[Bytes]::None; },
+  }
+}
+
+/// Answers the request `r`. The connection comes back, still open, when the
+/// client may send another request on it.
+fn answer(h: &Host, mut r: HttpReq) -> Option[u64] {
+  let t = http_req_target(r);
+  let greet = bytes_eq_str(t, "/greet") && http_req_is(r, "POST");
+  bfree(t);
+  if !greet {
+    let body = bfrom("{\"error\":\"not found\"}\n");
+    let k = http_answer(h, r, 404, "Not Found", "application/json", body);
+    bfree(body);
+    return k;
+  }
+  match http_req_body(h, &mut r, 4096) {
+    Option::Some(b) => {
+      match greeting(b) {
+        Option::Some(reply) => {
+          bfree(b);
+          let k = http_answer(h, r, 200, "OK", "application/json", reply);
+          bfree(reply);
+          return k;
+        },
+        Option::None => {
+          bfree(b);
+          let body = bfrom("{\"error\":\"bad request\"}\n");
+          let k = http_answer(h, r, 400, "Bad Request", "application/json", body);
+          bfree(body);
+          return k;
+        },
+      }
+    },
+    Option::None => {
+      // The body could not be read; do not keep the connection.
+      http_close(h, r);
+      return Option[u64]::None;
+    },
+  }
+}
+
+/// Reads the next request on the connection `c` and answers it. The
+/// connection again if it stays open; `None` once it is closed.
+fn step(h: &Host, c: u64) -> Option[u64] {
+  match http_read_request(h, c, 8192) {
+    Option::Some(r) => { return answer(h, r); },
+    Option::None => { return Option[u64]::None; },
+  }
+}
+
+/// Serves the connection `c` until it is closed, but for at most 100
+/// requests.
+fn serve_conn(h: &Host, c: u64) {
+  let mut cur = c;
+  let mut n = 0;
+  while cur != 0 && n < 100
+    invariant n <= 100
+  {
+    match step(h, cur) {
+      Option::Some(k) => { cur = k; },
+      Option::None => { cur = 0; },
+    }
+    n = n + 1;
+  }
+  if cur != 0 {
+    net_close(h, cur);
+  }
+}
+
+/// Sends a request with `target` and `body` on `c` and has the server side
+/// `a` answer it. Counts 1 unless the answer has status `want_status` and, if
+/// `want_body` is not empty, ends with `want_body` (an error line included).
+fn ask(h: &Host, a: u64, c: u64, target: Str, body: Str, want_status: u64, want_body: Str, last: bool) -> u64
+  ensures result <= 1
+{
+  let mut t = text_new();
+  text_push_str(&mut t, "POST ");
+  text_push_str(&mut t, target);
+  text_push_str(&mut t, " HTTP/1.1\r\nHost: localhost\r\nContent-Length: ");
+  fmt_u64(&mut t, slen(body));
+  if last {
+    text_push_str(&mut t, "\r\nConnection: close");
+  }
+  text_push_str(&mut t, "\r\n\r\n");
+  text_push_str(&mut t, body);
+  let req = text_finish(t);
+  let sent = net_send_all(h, c, req);
+  bfree(req);
+  if !sent {
+    return 1;
+  }
+  let mut open = false;
+  match step(h, a) {
+    Option::Some(k) => { open = true; },
+    Option::None => {},
+  }
+  if open == last {
+    return 1;
+  }
+  let mut bad = 1;
+  match http_read_response(h, c, 65536) {
+    Option::Some(m) => {
+      match http_body_start(m) {
+        Option::Some(at) => {
+          if at <= blen(m) && http_status(m) == want_status && bytes_span_eq_str(m, at, blen(m), want_body) {
+            bad = 0;
+          }
+        },
+        Option::None => {},
+      }
+      bfree(m);
+    },
+    Option::None => {},
+  }
+  return bad;
+}
+
+/// Listens on `lo`:`port` and answers requests for ever, one connection at a
+/// time.
+fn serve(con: &Serial, h: &Host, lo: u64, port: u64) -> u64 {
+  match net_listen(h, lo, port) {
+    Option::Some(s) => {
+      print_str(con, "listening on 127.0.0.1:");
+      print_u64(con, net_port(h, s));
+      print_nl(con);
+      while true {
+        match net_accept(h, s) {
+          Option::Some(c) => { serve_conn(h, c); },
+          Option::None => {},
+        }
+      }
+      net_close(h, s);
+      return 0;
+    },
+    Option::None => {
+      print_str(con, "cannot listen\n");
+      return 1;
+    },
+  }
+}
+
+/// Starts the server on a free port and sends it requests over one
+/// connection, the last asking to close it.
+fn selfcheck(h: &Host, lo: u64) -> u64 {
+  let mut bad = 1;
+  match net_listen(h, lo, 0) {
+    Option::Some(s) => {
+      match net_connect(h, lo, net_port(h, s)) {
+        Option::Some(c) => {
+          match net_accept(h, s) {
+            Option::Some(a) => {
+              let mut n = 0;
+              n = n + ask(h, a, c, "/greet", "{\"name\": \"Ada\", \"times\": 2}", 200, "{\"greeting\":\"hello Ada\",\"times\":2}", false);
+              n = n + ask(h, a, c, "/greet", "{\"name\":\"a\\\"b\\u00e9\"}", 200, "{\"greeting\":\"hello a\\\"bé\",\"times\":1}", false);
+              n = n + ask(h, a, c, "/greet", "{\"name\": 7}", 400, "{\"error\":\"bad request\"}\n", false);
+              n = n + ask(h, a, c, "/greet", "{\"name\": \"x\", \"times\": 5000}", 400, "{\"error\":\"bad request\"}\n", false);
+              n = n + ask(h, a, c, "/greet", "{\"name\": \"x\",}", 400, "{\"error\":\"bad request\"}\n", false);
+              n = n + ask(h, a, c, "/other", "{}", 404, "{\"error\":\"not found\"}\n", true);
+              if n == 0 {
+                bad = 0;
+              }
+            },
+            Option::None => {},
+          }
+          net_close(h, c);
+        },
+        Option::None => {},
+      }
+      net_close(h, s);
+    },
+    Option::None => {},
+  }
+  return bad;
+}
+
+fn main(con: &mut Serial, h: &mut Host) -> u64 {
+  let lo = net_ip4(127, 0, 0, 1);
+  if host_arg_is(h, 1, "serve") {
+    let a = host_arg(h, 2);
+    let mut port = 8080;
+    match parse_u64(a, 0, blen(a)) {
+      Option::Some(p) => { port = p; },
+      Option::None => {},
+    }
+    bfree(a);
+    return serve(con, h, lo, port);
+  }
+  return selfcheck(h, lo);
+}
