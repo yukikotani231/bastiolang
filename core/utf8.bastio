@@ -1,0 +1,173 @@
+// core/utf8.bastio: UTF-8 validation (RFC 3629). A sequence is valid when
+// it is one of the shortest encodings of a Unicode scalar value: no
+// overlong forms, no surrogates (U+D800 to U+DFFF) and nothing above
+// U+10FFFF.
+//
+// What is proved: no read is out of bounds, a sequence length is 0 (invalid)
+// or 1 to 4 and stays inside the string, and a count never exceeds the
+// number of bytes. Not proved: that the accepted sequences are exactly the
+// ones RFC 3629 lists (the tests check the boundary cases of each form).
+import "option.bastio";
+
+/// Internal: `c` is a continuation byte, `80`..`BF`.
+fn utf8_cont(c: u8) -> bool {
+  return c >= 128 && c <= 191;
+}
+
+/// The length of the valid UTF-8 sequence that starts at byte `i`, or 0 if
+/// the bytes at `i` are not a valid sequence (a stray continuation byte,
+/// an overlong form, a surrogate, a value above U+10FFFF, or a sequence
+/// cut short by the end of the string).
+/// ```
+/// let b = bfrom("aé€😀");
+/// let one = utf8_seq_len(b, 0);     // 'a'
+/// let two = utf8_seq_len(b, 1);     // U+00E9
+/// let three = utf8_seq_len(b, 3);   // U+20AC
+/// let four = utf8_seq_len(b, 6);    // U+1F600
+/// let mut cut = balloc(2);          // a 3-byte lead cut short
+/// bset(&mut cut, 0, 226);
+/// bset(&mut cut, 1, 130);
+/// let bad = utf8_seq_len(cut, 0);
+/// bfree(cut);
+/// bfree(b);
+/// if one != 1 || two != 2 || three != 3 || four != 4 || bad != 0 { return 1; }
+/// ```
+fn utf8_seq_len(b: &Bytes, i: u64) -> u64
+  requires i < blen(b)
+  ensures result <= 4 && i + result <= blen(b)
+{
+  let n = blen(b);
+  let c = bget(b, i);
+  if c < 128 {
+    return 1;
+  }
+  if c >= 194 && c <= 223 {
+    if i + 2 <= n && utf8_cont(bget(b, i + 1)) {
+      return 2;
+    }
+    return 0;
+  }
+  if c >= 224 && c <= 239 {
+    if i + 3 > n {
+      return 0;
+    }
+    let c1 = bget(b, i + 1);
+    let c2 = bget(b, i + 2);
+    if !utf8_cont(c2) {
+      return 0;
+    }
+    if c == 224 {
+      // E0 A0..BF: shorter forms use two bytes.
+      if c1 >= 160 && c1 <= 191 {
+        return 3;
+      }
+      return 0;
+    }
+    if c == 237 {
+      // ED 80..9F: A0..BF would be a surrogate.
+      if c1 >= 128 && c1 <= 159 {
+        return 3;
+      }
+      return 0;
+    }
+    if utf8_cont(c1) {
+      return 3;
+    }
+    return 0;
+  }
+  if c >= 240 && c <= 244 {
+    if i + 4 > n {
+      return 0;
+    }
+    let c1 = bget(b, i + 1);
+    if !utf8_cont(bget(b, i + 2)) || !utf8_cont(bget(b, i + 3)) {
+      return 0;
+    }
+    if c == 240 {
+      // F0 90..BF: shorter forms use three bytes.
+      if c1 >= 144 && c1 <= 191 {
+        return 4;
+      }
+      return 0;
+    }
+    if c == 244 {
+      // F4 80..8F: 90..BF would be above U+10FFFF.
+      if c1 >= 128 && c1 <= 143 {
+        return 4;
+      }
+      return 0;
+    }
+    if utf8_cont(c1) {
+      return 4;
+    }
+    return 0;
+  }
+  return 0;
+}
+
+/// `b` is valid UTF-8 (the empty string is).
+/// ```
+/// let ok = bfrom("café €");
+/// let mut over = balloc(2);        // C0 80: an overlong NUL
+/// bset(&mut over, 0, 192);
+/// bset(&mut over, 1, 128);
+/// let mut sur = balloc(3);         // ED A0 80: a surrogate
+/// bset(&mut sur, 0, 237);
+/// bset(&mut sur, 1, 160);
+/// bset(&mut sur, 2, 128);
+/// let good = utf8_valid(ok);
+/// let bad = utf8_valid(over) || utf8_valid(sur);
+/// bfree(ok);
+/// bfree(over);
+/// bfree(sur);
+/// if !good || bad { return 1; }
+/// ```
+fn utf8_valid(b: &Bytes) -> bool {
+  let n = blen(b);
+  let mut i = 0;
+  while i < n
+    invariant i <= n
+  {
+    let k = utf8_seq_len(b, i);
+    if k == 0 {
+      return false;
+    }
+    i = i + k;
+  }
+  return true;
+}
+
+/// The number of characters (Unicode scalar values) in `b`, or `None` if
+/// `b` is not valid UTF-8.
+/// ```
+/// let b = bfrom("aé€");
+/// let mut bad = balloc(2);         // 'a' then FF, which no sequence uses
+/// bset(&mut bad, 0, 97);
+/// bset(&mut bad, 1, 255);
+/// let mut n = 0;
+/// match utf8_count(b) { Option::Some(x) => { n = x; }, Option::None => {} }
+/// let none = utf8_count(bad);
+/// let rejected = none is Option::None;
+/// match none { Option::Some(x) => {}, Option::None => {} }
+/// bfree(b);
+/// bfree(bad);
+/// if n != 3 || !rejected { return 1; }
+/// ```
+fn utf8_count(b: &Bytes) -> Option[u64]
+  ensures result is Option::Some ==> result.Some <= blen(b)
+{
+  let n = blen(b);
+  let mut i = 0;
+  let mut chars = 0;
+  while i < n
+    invariant i <= n && chars <= i
+  {
+    let k = utf8_seq_len(b, i);
+    if k == 0 {
+      return Option[u64]::None;
+    }
+    i = i + k;
+    chars = chars + 1;
+  }
+  return Option[u64]::Some(chars);
+}
