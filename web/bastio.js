@@ -13,6 +13,11 @@
 //                                     // may be a [name, 'bytes'] pair to read a `Bytes` cell
 //                                     // (it takes two words)
 //
+// TCP (`host_net`, so std/net.bastio and std/http.bastio) needs an embedder
+// that can wait for a socket: pass `net: require('./netsync.js').create()` in
+// Node.js and call its `close()` at the end. Without it, as in a browser,
+// every network call fails.
+//
 // Child processes (`host_spawn`) need an embedder that can run programs:
 // pass `childProcess: require('child_process')` in Node.js, or your own
 // `spawn(argv, input) -> { status, stdout }`. Without either, as in a browser,
@@ -60,6 +65,7 @@
       if (r.error) return { status: 127, stdout: new Uint8Array(0) };
       return { status: r.status !== null ? r.status : 128 + (SIGNALS[r.signal] || 0), stdout: r.stdout };
     })) || null;
+    const net = opts.net || null;                    // synchronous TCP: `call(op, a, b, data) -> { result, data }` (see web/netsync.js)
     const kids = new Map();                          // a Child's words are (pid, input, output); the pid keys this table
     let nextKid = 1n;
     const NONE = BigInt.asUintN(64, -1n);
@@ -160,6 +166,18 @@
         }
         case 31:
           return BigInt(args.length);
+        case 32: {                                   // TCP: operation, two numbers, the Bytes cell (see bst_host_net in the C prelude)
+          if (!net) return NONE;
+          const op = Number(word(b, 0)), x = word(b, 1), y = word(b, 2), cell = word(b, 3);
+          if (op === 4) {                            // write the cell's bytes to socket x
+            const data = bytes(word(cell, 1), word(cell, 0));
+            const r = net.call(op, x, y, data);
+            return r.result;
+          }
+          const r = net.call(op, x, y, null);
+          if (op === 3 && r.result !== NONE) fill(cell, r.data);
+          return r.result;
+        }
         default:
           throw new Error('bastio: unsupported host routine ' + call);
       }
