@@ -64,6 +64,45 @@ fn expect_body(h: &Host, s: u64, p: u64, text: Str, limit: u64, close: bool, wan
   }
 }
 
+/// Has the server side of a new connection send `text`, closes it, and reads
+/// the response on the client side. Counts 1 unless the response ends with
+/// `want` after its head, or, with `refused`, the read is refused.
+fn expect_resp(h: &Host, s: u64, p: u64, text: Str, limit: u64, want: Str, refused: bool) -> u64
+  ensures result <= 1
+{
+  let mut bad = 1;
+  match net_connect(h, net_ip4(127, 0, 0, 1), p) {
+    Option::Some(c) => {
+      match net_accept(h, s) {
+        Option::Some(a) => {
+          let b = bfrom(text);
+          let sent = net_send_all(h, a, b);
+          bfree(b);
+          net_close(h, a);
+          match http_read_response(h, c, limit) {
+            Option::Some(m) => {
+              match http_body_start(m) {
+                Option::Some(at) => {
+                  if sent && !refused && at <= blen(m) && bytes_span_eq_str(m, at, blen(m), want) { bad = 0; }
+                },
+                Option::None => {},
+              }
+              bfree(m);
+            },
+            Option::None => {
+              if refused { bad = 0; }
+            },
+          }
+        },
+        Option::None => {},
+      }
+      net_close(h, c);
+    },
+    Option::None => {},
+  }
+  return bad;
+}
+
 fn main(h: &mut Host) -> u64 {
   let mut bad = 0;
   match net_listen(h, net_ip4(127, 0, 0, 1), 0) {
@@ -130,6 +169,14 @@ fn main(h: &mut Host) -> u64 {
       if expect_body(h, s, p, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 9\r\n\r\nhello", 100, true, "", true) != 0 { bad = bad + 1; }
       if expect_body(h, s, p, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel", 100, true, "", true) != 0 { bad = bad + 1; }
       if expect_body(h, s, p, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n", 100, false, "", true) != 0 { bad = bad + 1; }
+      // Chunked responses are decoded; framing errors, a short stream and a
+      // body over the limit are refused.
+      bad = bad + expect_resp(h, s, p, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nhel\r\n2\r\nlo\r\n0\r\n\r\n", 100, "hello", false);
+      bad = bad + expect_resp(h, s, p, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", 100, "", false);
+      bad = bad + expect_resp(h, s, p, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nA;ext=1\r\n0123456789\r\n0\r\n\r\n", 100, "0123456789", false);
+      bad = bad + expect_resp(h, s, p, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel", 100, "", true);
+      bad = bad + expect_resp(h, s, p, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n", 100, "", true);
+      bad = bad + expect_resp(h, s, p, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n9\r\n012345678\r\n0\r\n\r\n", 8, "", true);
       // Keep-alive: a request that asks to close, a body or a second request
       // sent early gets its connection closed after the answer.
       match client(h, p, "GET / HTTP/1.1\r\nHost: x\r\n\r\nGET /2 HTTP/1.1\r\nHost: x\r\n\r\n") {
