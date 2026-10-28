@@ -8797,7 +8797,7 @@ fn x86_program_end(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, main_x: u
   } else {
     x86_runtime(&mut g.out);
     if !g.stage0 {
-      x86_runtime1(&mut g.out);
+      x86_runtime1(&mut g.out, g.macos);
       w_s(&mut g.out, "\t.bss\n\t.p2align 3\nbst_rt_pt_leases:\t.zero 1048576    # a 32-bit lease count per pool frame\n");
       w_s(&mut g.out, "bst_rt_shared_refs:\t.zero 1048576  # a 32-bit reference count per shared pool frame\n");
     }
@@ -9213,7 +9213,7 @@ fn x86_runtime(out: &mut Vec[u64]) {
 /// The routines of the runtime that only stage1's backend uses (Child,
 /// host_env, host_cpus, host_eprint, the simulated devices), after
 /// `x86_runtime`.
-fn x86_runtime1(out: &mut Vec[u64]) {
+fn x86_runtime1(out: &mut Vec[u64], macos: bool) {
   w_s(&mut out, "# ---- runtime only stage1 writes (trusted base) ----\n");
   w_s(&mut out, "\t.text\n");
   w_s(&mut out, "bst_rt_alloc_raw:               # %rax = %rdi words (at least one), not zeroed: the caller writes all of them\n");
@@ -9274,7 +9274,11 @@ fn x86_runtime1(out: &mut Vec[u64]) {
   w_s(&mut out, "\tpush %rbp\n");
   w_s(&mut out, "\tmov %rsp, %rbp\n");
   w_s(&mut out, "\tand $-16, %rsp\n");
-  w_s(&mut out, "\tmov $84, %edi               # _SC_NPROCESSORS_ONLN\n");
+  if macos {
+    w_s(&mut out, "\tmov $58, %edi               # _SC_NPROCESSORS_ONLN\n");
+  } else {
+    w_s(&mut out, "\tmov $84, %edi               # _SC_NPROCESSORS_ONLN\n");
+  }
   w_s(&mut out, "\tcall sysconf@PLT\n");
   w_s(&mut out, "\tcmp $1, %rax\n");
   w_s(&mut out, "\tjge 1f\n");
@@ -9318,7 +9322,12 @@ fn x86_runtime1(out: &mut Vec[u64]) {
   w_s(&mut out, "	xor %eax, %eax\n");
   w_s(&mut out, "	mov %rax, (%rsp)\n");
   w_s(&mut out, "	mov %rax, 8(%rsp)\n");
-  w_s(&mut out, "	movw $2, (%rsp)\n");
+  if macos {
+    w_s(&mut out, "	movb $16, (%rsp)               # sin_len, sin_family\n");
+    w_s(&mut out, "	movb $2, 1(%rsp)\n");
+  } else {
+    w_s(&mut out, "	movw $2, (%rsp)\n");
+  }
   w_s(&mut out, "	mov %r12d, %eax\n");
   w_s(&mut out, "	shr $8, %eax\n");
   w_s(&mut out, "	movb %al, 2(%rsp)\n");
@@ -9340,12 +9349,23 @@ fn x86_runtime1(out: &mut Vec[u64]) {
   w_s(&mut out, "	test %eax, %eax\n");
   w_s(&mut out, "	js 8b\n");
   w_s(&mut out, "	mov %eax, %r12d               # %r12 = the socket, %r14 = the operation\n");
+  if macos {
+    // No MSG_NOSIGNAL here: a write to a closed peer must not kill the program.
+    w_s(&mut out, "	mov $13, %edi                 # SIGPIPE\n");
+    w_s(&mut out, "	mov $1, %esi                  # SIG_IGN\n");
+    w_s(&mut out, "	call signal@PLT\n");
+  }
   w_s(&mut out, "	test %r14, %r14\n");
   w_s(&mut out, "	jnz 16f\n");
   w_s(&mut out, "	movl $1, 16(%rsp)\n");
   w_s(&mut out, "	mov %r12d, %edi\n");
-  w_s(&mut out, "	mov $1, %esi                  # SOL_SOCKET\n");
-  w_s(&mut out, "	mov $2, %edx                  # SO_REUSEADDR\n");
+  if macos {
+    w_s(&mut out, "	mov $0xffff, %esi             # SOL_SOCKET\n");
+    w_s(&mut out, "	mov $4, %edx                  # SO_REUSEADDR\n");
+  } else {
+    w_s(&mut out, "	mov $1, %esi                  # SOL_SOCKET\n");
+    w_s(&mut out, "	mov $2, %edx                  # SO_REUSEADDR\n");
+  }
   w_s(&mut out, "	lea 16(%rsp), %rcx\n");
   w_s(&mut out, "	mov $4, %r8d\n");
   w_s(&mut out, "	call setsockopt@PLT\n");
@@ -9401,7 +9421,11 @@ fn x86_runtime1(out: &mut Vec[u64]) {
   w_s(&mut out, "13:	mov %ebx, %edi\n");
   w_s(&mut out, "	mov 8(%r13), %rsi\n");
   w_s(&mut out, "	mov (%r13), %rdx\n");
-  w_s(&mut out, "	mov $0x4000, %ecx             # MSG_NOSIGNAL\n");
+  if macos {
+    w_s(&mut out, "	xor %ecx, %ecx                # no flags (SIGPIPE is ignored)\n");
+  } else {
+    w_s(&mut out, "	mov $0x4000, %ecx             # MSG_NOSIGNAL\n");
+  }
   w_s(&mut out, "	call send@PLT\n");
   w_s(&mut out, "	test %rax, %rax\n");
   w_s(&mut out, "	js 8b\n");
