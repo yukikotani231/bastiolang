@@ -127,6 +127,9 @@ What will be 0.2.0.
   so the result is well-formed or `None`.
 - `std/http`: `http_post_request` and `http_post` send a `POST` with a body and a content type;
   `http_get`'s response reader reads the answer.
+- `core/json`: the scanner refuses a string whose bytes are not valid UTF-8 (a sequence cut off by the end
+  of the input is `Partial`), and `json_push_string` writes a byte that starts no valid sequence as U+FFFD,
+  so what it writes is always a string the scanner accepts.
 - `core/utf8`: `utf8_seq_len`, `utf8_valid` and `utf8_count` check UTF-8 by RFC 3629 (no overlong forms,
   surrogates or values above U+10FFFF); reads are proved in bounds.
 - `std/http`: `http_header` reads a header field of a response (the name is matched ignoring case,

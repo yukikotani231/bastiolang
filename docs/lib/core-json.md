@@ -13,12 +13,12 @@ What is proved: no read is outside the buffer, no arithmetic overflows, and
 every offset returned lies inside the buffer and after the one it came
 from. Not proved: that exactly the documents of RFC 8259 are accepted. The
 scanner is strict (no comments, no trailing commas, no leading zeros, no
-control characters in strings, no single quotes), but it does not check
-that the bytes of a string are UTF-8 and it accepts an escaped surrogate on
-its own (`json_string` refuses it). A key with an escape in it is compared
+control characters in strings, no single quotes, and the bytes of a string
+must be valid UTF-8), but it accepts an escaped surrogate on its own
+(`json_string` refuses it). A key with an escape in it is compared
 by the bytes as written.
 
-`import "core/json.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/text.bastio](core-text.md), [core/num.bastio](core-num.md).
+`import "core/json.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/text.bastio](core-text.md), [core/num.bastio](core-num.md), [core/utf8.bastio](core-utf8.md).
 
 | Function | |
 | --- | --- |
@@ -288,8 +288,9 @@ fn json_push_string(t: &mut Vec[u8], b: &Bytes)
 ```
 
 Appends `b` to `t` as a JSON string: in quotes, with `"` and `\` escaped,
-and the control characters below 32 as `\n`, `\r`, `\t` or `\u00XX`. Other
-bytes, UTF-8 included, are copied as they are.
+and the control characters below 32 as `\n`, `\r`, `\t` or `\u00XX`. Valid
+UTF-8 is copied as it is; a byte that starts no valid sequence is written
+as U+FFFD, so the result is always a string `json_value` accepts.
 
 Example:
 
