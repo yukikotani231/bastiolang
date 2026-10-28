@@ -9,14 +9,15 @@
 // every offset returned lies inside the buffer and after the one it came
 // from. Not proved: that exactly the documents of RFC 8259 are accepted. The
 // scanner is strict (no comments, no trailing commas, no leading zeros, no
-// control characters in strings, no single quotes), but it does not check
-// that the bytes of a string are UTF-8 and it accepts an escaped surrogate on
-// its own (`json_string` refuses it). A key with an escape in it is compared
+// control characters in strings, no single quotes, and the bytes of a string
+// must be valid UTF-8), but it accepts an escaped surrogate on its own
+// (`json_string` refuses it). A key with an escape in it is compared
 // by the bytes as written.
 import "option.bastio";
 import "bytes.bastio";
 import "text.bastio";
 import "num.bastio";
+import "utf8.bastio";
 
 /// What `json_value` found.
 enum Json {
@@ -93,6 +94,28 @@ fn json_str_end(s: &Bytes, p: u64) -> Json
       } else {
         return Json::Bad(i + 1);
       }
+    } else if c >= 128 {
+      // Bytes of a character must form valid UTF-8 (RFC 8259, section 8.1).
+      let k = utf8_seq_len(s, i);
+      if k == 0 {
+        // A lead byte followed only by continuation bytes up to the end of
+        // the input may still be completed.
+        let mut cutoff = c >= 194 && c <= 244 && i + 4 > n;
+        let mut j = i + 1;
+        while j < n && cutoff
+          invariant i < j && j <= n
+        {
+          if bget(s, j) < 128 || bget(s, j) > 191 {
+            cutoff = false;
+          }
+          j = j + 1;
+        }
+        if cutoff {
+          return Json::Partial;
+        }
+        return Json::Bad(i);
+      }
+      i = i + k;
     } else {
       i = i + 1;
     }
@@ -683,8 +706,9 @@ fn json_string(s: &Bytes, at: u64) -> Option[Bytes]
 }
 
 /// Appends `b` to `t` as a JSON string: in quotes, with `"` and `\` escaped,
-/// and the control characters below 32 as `\n`, `\r`, `\t` or `\u00XX`. Other
-/// bytes, UTF-8 included, are copied as they are.
+/// and the control characters below 32 as `\n`, `\r`, `\t` or `\u00XX`. Valid
+/// UTF-8 is copied as it is; a byte that starts no valid sequence is written
+/// as U+FFFD, so the result is always a string `json_value` accepts.
 /// ```
 /// let mut v = bfrom("a\"b\\\n.");
 /// bset(&mut v, 5, 1);
@@ -717,6 +741,24 @@ fn json_push_string(t: &mut Vec[u8], b: &Bytes)
       text_push_str(&mut t, "\\u00");
       text_push(&mut t, hex_char(cast[u64](c) / 16));
       text_push(&mut t, hex_char(cast[u64](c) % 16));
+    } else if c >= 128 {
+      // Valid UTF-8 is copied; a byte that starts no valid sequence becomes
+      // U+FFFD, so what is written is a string the scanner accepts.
+      let k = utf8_seq_len(b, i);
+      if k == 0 {
+        text_push(&mut t, 239);
+        text_push(&mut t, 191);
+        text_push(&mut t, 189);
+      } else {
+        let mut j = 0;
+        while j < k
+          invariant j <= k && i + k <= blen(b)
+        {
+          text_push(&mut t, bget(b, i + j));
+          j = j + 1;
+        }
+        i = i + (k - 1);
+      }
     } else {
       text_push(&mut t, c);
     }
