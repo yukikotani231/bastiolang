@@ -10,6 +10,7 @@ Bastio is a systems language whose memory safety is proved at compile time. The 
 | [Tutorial part 2: bytes, bits and sized integers](tutorial-bits.md) | `u8` to `i64`, `cast` and `wrap`, bit operators, parsing a binary format |
 | [Tutorial part 3: capabilities](tutorial-capabilities.md) | The console, pages, page tables, ports, device registers and DMA, and what is proved about each |
 | [Tutorial part 4: sharing state](tutorial-shared.md) | Locks and struct invariants, deadlock freedom, atomics, `smp_run` |
+| [Tutorial part 5: a web service](tutorial-web.md) | Untrusted JSON, building well-formed JSON, an invariant on server state, serving requests over HTTP |
 | [The toolchain](toolchain.md) | The two compilers, options, targets, backends and what each trusts |
 | [Common proof failures](proof-failures.md) | The errors people meet first, with the counterexample the compiler prints and how to fix each |
 | [Examples](../examples/README.md) | Small programs and proved libraries (base64, UTF-8, DER, QOI) to read and build |
