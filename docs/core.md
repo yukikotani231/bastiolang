@@ -55,6 +55,7 @@ Each module has a reference page, generated from its source: every function with
 | [`core/rows.bastio`](lib/core-rows.md) | Tables of fixed-size rows in one `Buf`. |
 | [`core/scan.bastio`](lib/core-scan.md) | Cutting a byte string into pieces. |
 | [`core/set.bastio`](lib/core-set.md) | A set of `u64`, built on core/hashmap.bastio. |
+| [`core/sha256.bastio`](lib/core-sha256.md) | SHA-256 (FIPS 180-4) and HMAC-SHA-256 (RFC 2104). |
 | [`core/slots.bastio`](lib/core-slots.md) | A growable table of numbered slots, for ids that a program hands out and takes back (process ids, file descriptors, pipe and socket numbers). |
 | [`core/sort.bastio`](lib/core-sort.md) | Sorting and searching vectors of `u64`, and sorting indices by a key. |
 | [`core/spancmp.bastio`](lib/core-spancmp.md) | Comparing two pieces of a text in byte order. |

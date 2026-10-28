@@ -44,6 +44,7 @@
   - [core/ring.bastio](lib-core-ring.md)
   - [core/rows.bastio](lib-core-rows.md)
   - [core/set.bastio](lib-core-set.md)
+  - [core/sha256.bastio](lib-core-sha256.md)
   - [core/slots.bastio](lib-core-slots.md)
   - [core/scan.bastio](lib-core-scan.md)
   - [core/spancmp.bastio](lib-core-spancmp.md)
