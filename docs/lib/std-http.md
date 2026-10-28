@@ -45,7 +45,7 @@ Every example below is built, verified and run by `tests/run.sh`. An `assert` in
 ### `HttpReq`
 
 ```bastio
-struct HttpReq { conn: u64, head: Bytes, req: Req }
+struct HttpReq { conn: u64, head: Bytes, req: Req, body_read: bool }
 ```
 
 A request that has been read: the connection it came on, the bytes read
@@ -462,7 +462,7 @@ if bad != 0 { return 1; }
 ### `http_req_body`
 
 ```bastio
-fn http_req_body(h: &Host, r: &HttpReq, limit: u64) -> Option[Bytes]
+fn http_req_body(h: &Host, r: &mut HttpReq, limit: u64) -> Option[Bytes]
 ```
 
 Reads the body of the request `r` from its connection and returns it,
@@ -471,7 +471,9 @@ framing, or nothing if the request has neither field. Gives `None` if the
 framing is ambiguous or invalid (a repeated `Content-Length`, both
 fields, a transfer coding other than a lone `chunked`: see `http_body`),
 if the body is longer than `limit` bytes, or if the peer closes or fails
-before the body is whole. The request stays open for the answer.
+before the body is whole. The request stays open for the answer; after a
+`Content-Length` body that ends the data read, `http_req_keeps` allows
+another request on the connection.
 
 Example:
 
@@ -494,8 +496,8 @@ match net_listen(host, lo, 0) {
           let sent = net_send_all(host, c, req);
           bfree(req);
           match http_accept(host, s, 4096) {
-            Option::Some(r) => {
-              match http_req_body(host, r, 4096) {
+            Option::Some(mut r) => {
+              match http_req_body(host, &mut r, 4096) {
                 Option::Some(b) => {
                   if sent && bytes_eq_str(b, "hello") { bad = 0; }
                   bfree(b);
@@ -526,9 +528,11 @@ fn http_req_keeps(r: &HttpReq) -> bool
 ```
 
 May the connection of `r` carry another request once it is answered? Yes
-for HTTP/1.1 without `Connection: close`, with no body, and with nothing
-read past the head (a client that sent the next request early gets the
-connection closed after the answer instead).
+for HTTP/1.1 without `Connection: close` when the request has no body, or
+a `Content-Length` body that `http_req_body` has read to its last byte,
+and nothing of the next request was read with it (a client that sent the
+next request early gets the connection closed after the answer instead,
+and so does one with a chunked or unread body).
 
 Example:
 
