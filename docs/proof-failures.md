@@ -20,7 +20,12 @@ As in the tutorial, every program on this page is compiled by `tests/run.sh`, an
 | `E-VERIFY-CAST` | [8](#8-narrowing-a-number) |
 | `E-VERIFY-DIVZERO` | [9](#9-dividing-by-a-value-read-from-memory) |
 | `E-LINEAR-LEAK` | [10](#10-an-early-return-that-leaks) |
-| `the solver gave up` | [11](#11-the-solver-gave-up) |
+| `E-VERIFY-SHIFT` | [11](#11-a-shift-by-an-unknown-amount) |
+| `E-VERIFY-ASSERT` | [12](#12-an-assertion-that-is-not-known) |
+| `E-LINEAR-USE` | [13](#13-using-a-value-after-it-was-consumed) |
+| `E-MATCH` | [14](#14-a-match-that-skips-a-variant) |
+| `E-TYPE` | [15](#15-a-value-of-the-wrong-type) |
+| `the solver gave up` | [16](#16-the-solver-gave-up) |
 
 ## 1. The last element of a buffer that may be empty
 
@@ -538,7 +543,188 @@ fn main() -> u64 {
 
 The same error at the end of an `if` or a `match` arm, instead of a `return`, is `E-LINEAR-BRANCH`: one branch frees the value and another does not.
 
-## 11. The solver gave up
+## 11. A shift by an unknown amount
+
+```bastio
+// expect-error: E-VERIFY-SHIFT
+fn bit(n: u64) -> u64 {
+  return 1 << n;
+}
+
+fn main() -> u64 {
+  return bit(3);
+}
+```
+
+```text
+bit.bastio:2:12: error[E-VERIFY-SHIFT]: could not prove that the shift amount `n` is less than 64, the width of u64
+ 2 |   return 1 << n;
+   |            ^
+   = counterexample: n = 64
+   = check the shift amount first, with an `if` or a `requires`
+```
+
+In C, shifting a 64-bit value by 64 or more is undefined, so the compiler wants a proof that the amount is below the width. A caller could pass any value, and the counterexample is the smallest one that breaks it. Check the amount first (or state it as a `requires`, as in section 4):
+
+```bastio
+// expect-exit: 8
+fn bit(n: u64) -> u64 {
+  if n >= 64 {
+    return 0;
+  }
+  return 1 << n;
+}
+
+fn main() -> u64 {
+  return bit(3);
+}
+```
+
+## 12. An assertion that is not known
+
+```bastio
+// expect-error: E-VERIFY-ASSERT
+fn main() -> u64 {
+  let b = alloc(3);
+  assert get(b, 0) == 1;
+  free(b);
+  return 0;
+}
+```
+
+```text
+check.bastio:3:3: error[E-VERIFY-ASSERT]: could not prove `get(b, 0) == 1`
+ 3 |   assert get(b, 0) == 1;
+   |   ^^^^^^
+   = counterexample: len(b) = 3, b = [0, 0, 0]
+   = an `assert` must follow from what is known there: the `requires`, the conditions of the enclosing `if`s and loops, and loop invariants
+```
+
+An `assert` is a claim the compiler must prove, not a runtime check: nothing is added to the generated code. A fresh buffer holds zeros, so the claim is false here, and the counterexample shows the contents. Make the program establish the fact before it asserts it:
+
+```bastio
+// expect-exit: 1
+fn main() -> u64 {
+  let mut b = alloc(3);
+  b = set(b, 0, 1);
+  assert get(b, 0) == 1;
+  let x = get(b, 0);
+  free(b);
+  return x;
+}
+```
+
+## 13. Using a value after it was consumed
+
+```bastio
+// expect-error: E-LINEAR-USE
+fn main() -> u64 {
+  let b = alloc(4);
+  free(b);
+  return get(b, 0);
+}
+```
+
+```text
+reuse.bastio:4:14: error[E-LINEAR-USE]: `b` is borrowed after it was consumed
+ 4 |   return get(b, 0);
+   |              ^
+   = `b` was consumed at 3:8
+```
+
+`free` consumes the buffer, so it can no longer be read. This is the ownership rule that section 10 enforces at each `return`; here it is enforced at each use. Use the value first and consume it last:
+
+```bastio
+// expect-exit: 0
+fn main() -> u64 {
+  let b = alloc(4);
+  let x = get(b, 0);
+  free(b);
+  return x;
+}
+```
+
+## 14. A match that skips a variant
+
+```bastio
+// expect-error: E-MATCH
+enum Shape { Dot, Line(u64) }
+
+fn size(s: Shape) -> u64 {
+  match s {
+    Shape::Line(n) => { return n; },
+  }
+  return 0;
+}
+
+fn main() -> u64 {
+  return size(Shape::Line(3));
+}
+```
+
+```text
+pick.bastio:4:3: error[E-MATCH]: this `match` does not handle `Shape::Dot`
+ 4 |   match s {
+   |   ^^^^^
+```
+
+Every variant of an `enum` needs an arm, so a case cannot be forgotten when a variant is added later. Add the missing arm. (Once every arm of a `match` returns, nothing may follow it.)
+
+```bastio
+// expect-exit: 3
+enum Shape { Dot, Line(u64) }
+
+fn size(s: Shape) -> u64 {
+  match s {
+    Shape::Dot => { return 0; },
+    Shape::Line(n) => { return n; },
+  }
+}
+
+fn main() -> u64 {
+  return size(Shape::Line(3));
+}
+```
+
+## 15. A value of the wrong type
+
+```bastio
+// expect-error: E-TYPE
+fn double(x: u64) -> u64 {
+  return x + x;
+}
+
+fn main() -> u64 {
+  let b = alloc(1);
+  let r = double(b);
+  free(b);
+  return r;
+}
+```
+
+```text
+mix.bastio:7:18: error[E-TYPE]: argument of `double` must be u64, found Buf
+ 7 |   let r = double(b);
+   |                  ^
+```
+
+Types are checked before any proof is attempted, so this error has no counterexample: the message names the expected and the found type. Pass a value of the right type, here the length of the buffer:
+
+```bastio
+// expect-exit: 0
+fn double(x: u64) -> u64 {
+  return x + x;
+}
+
+fn main() -> u64 {
+  let b = alloc(1);
+  let r = double(len(b));
+  free(b);
+  return r - 2;
+}
+```
+
+## 16. The solver gave up
 
 Instead of a counterexample, some errors end with:
 
