@@ -1,0 +1,460 @@
+// stage1-only: host_net (sockets), std/http, core/json
+// A to-do list service over HTTP and JSON, kept in memory:
+//
+//   GET    /todos            every item:  [{"id":1,"title":"milk","done":false}]
+//   POST   /todos            body {"title": "milk"}: adds one, answers 201 with the item
+//   POST   /todos/N/done     marks item N done, answers 200 with the item
+//   DELETE /todos/N          removes item N, answers 200 {"deleted":N}
+//
+// Anything else is 404, an item that does not exist is 404, and a body that
+// is not valid JSON or has no usable string `title` is 400. Run with no
+// arguments it checks itself: it listens on a free port of 127.0.0.1, sends
+// itself requests over one real connection, and exits with 0 if the answers
+// are right. `todoapi serve PORT` serves on 127.0.0.1:PORT until it is
+// killed.
+//
+// What the compiler proves: no buffer is read or written out of bounds and
+// none leaks, whatever bytes a client sends. It does not prove that the
+// answers are right (the self-check does).
+import "core/print.bastio";
+import "core/json.bastio";
+import "std/host.bastio";
+import "std/http.bastio";
+
+/// The items. Item `i` has the id `i + 1`; its title is
+/// `arena[starts[i]..ends[i])`; `state` is 0 (open), 1 (done) or 2 (removed).
+/// A removed item keeps its place so that ids are never reused.
+struct Todos { arena: Vec[u8], starts: Vec[u64], ends: Vec[u64], state: Vec[u8] }
+
+/// An empty list.
+fn todos_new() -> Todos
+  ensures todos_ok(result)
+{
+  return Todos { arena: vec_new[u8](), starts: vec_new[u64](), ends: vec_new[u64](), state: vec_new[u8]() };
+}
+
+/// Frees the list.
+fn todos_free(t: Todos) {
+  vec_free(t.arena);
+  vec_free(t.starts);
+  vec_free(t.ends);
+  vec_free(t.state);
+}
+
+/// What the three item vectors must keep true.
+spec fn todos_ok(t: &Todos) -> bool {
+  vlen(t.starts) == vlen(t.ends) && vlen(t.state) == vlen(t.starts)
+}
+
+/// Adds an item with the title `title` and returns its id, or 0 if the list
+/// is full (1000 items or 1 MiB of titles).
+fn todos_add(t: &mut Todos, title: &Bytes) -> u64
+  requires todos_ok(t)
+  ensures todos_ok(t) && result <= vlen(t.starts)
+{
+  if vec_len(t.starts) >= 1000 || vec_len(t.arena) + blen(title) > 1048576 {
+    return 0;
+  }
+  let from = vec_len(t.arena);
+  let mut i = 0;
+  while i < blen(title)
+    invariant i <= blen(title) && todos_ok(t)
+  {
+    vec_push(&mut t.arena, bget(title, i));
+    i = i + 1;
+  }
+  vec_push(&mut t.starts, from);
+  vec_push(&mut t.ends, vec_len(t.arena));
+  vec_push(&mut t.state, 0);
+  return vec_len(t.starts);
+}
+
+/// Writes item `i` as a JSON object.
+fn item_json(o: &mut JsonOut, t: &Todos, i: u64)
+  requires todos_ok(t) && i < vlen(t.starts)
+{
+  let kid = bfrom("id");
+  let kt = bfrom("title");
+  let kd = bfrom("done");
+  json_out_begin_obj(&mut o);
+  json_out_key(&mut o, kid);
+  json_out_u64(&mut o, i + 1);
+  json_out_key(&mut o, kt);
+  let from = vec_get(t.starts, i);
+  let to = vec_get(t.ends, i);
+  if from <= to && to <= vec_len(t.arena) {
+    let mut title = balloc(to - from);
+    let mut k = 0;
+    while k < to - from
+      invariant k <= to - from && blen(title) == to - from && to <= vlen(t.arena)
+    {
+      bset(&mut title, k, vec_get(t.arena, from + k));
+      k = k + 1;
+    }
+    json_out_str(&mut o, title);
+    bfree(title);
+  } else {
+    let empty = balloc(0);
+    json_out_str(&mut o, empty);
+    bfree(empty);
+  }
+  json_out_key(&mut o, kd);
+  json_out_bool(&mut o, vec_get(t.state, i) == 1);
+  json_out_end(&mut o);
+  bfree(kid);
+  bfree(kt);
+  bfree(kd);
+}
+
+/// An answer: its status code and body.
+struct Reply { status: u64, body: Bytes }
+
+/// A fixed error answer.
+fn fail(status: u64, msg: Str) -> Reply {
+  let mut t = text_new();
+  text_push_str(&mut t, "{\"error\":\"");
+  text_push_str(&mut t, msg);
+  text_push_str(&mut t, "\"}\n");
+  return Reply { status: status, body: text_finish(t) };
+}
+
+/// The answer carrying the JSON document `o` has built, or a 500 if it is
+/// not well formed.
+fn reply_json(status: u64, o: JsonOut) -> Reply {
+  match json_out_finish(o) {
+    Option::Some(b) => { return Reply { status: status, body: b }; },
+    Option::None => { return fail(500, "internal error"); },
+  }
+}
+
+/// `GET /todos`.
+fn list(t: &Todos) -> Reply
+  requires todos_ok(t)
+{
+  let mut o = json_out_new();
+  json_out_begin_arr(&mut o);
+  let mut i = 0;
+  while i < vec_len(t.starts)
+    invariant i <= vlen(t.starts) && todos_ok(t)
+  {
+    if vec_get(t.state, i) != 2 {
+      item_json(&mut o, t, i);
+    }
+    i = i + 1;
+  }
+  json_out_end(&mut o);
+  return reply_json(200, o);
+}
+
+/// `POST /todos` with the body `b`.
+fn create(t: &mut Todos, b: &Bytes) -> Reply
+  requires todos_ok(t)
+  ensures todos_ok(t)
+{
+  match json_value(b, 0) {
+    Json::Ok(e) => { if json_ws(b, e) != blen(b) { return fail(400, "bad request"); } },
+    Json::Partial => { return fail(400, "bad request"); },
+    Json::Bad(x) => { return fail(400, "bad request"); },
+  }
+  match json_member(b, 0, "title") {
+    Option::Some(at) => {
+      match json_string(b, at) {
+        Option::Some(title) => {
+          if blen(title) == 0 || blen(title) > 200 {
+            bfree(title);
+            return fail(400, "bad request");
+          }
+          let id = todos_add(&mut t, title);
+          bfree(title);
+          if id == 0 {
+            return fail(507, "list full");
+          }
+          let mut o = json_out_new();
+          item_json(&mut o, t, id - 1);
+          return reply_json(201, o);
+        },
+        Option::None => { return fail(400, "bad request"); },
+      }
+    },
+    Option::None => { return fail(400, "bad request"); },
+  }
+}
+
+/// The item the number in `s[from..to)` names: its index, or the length of
+/// the list if there is no such live item.
+fn find(t: &Todos, s: &Bytes, from: u64, to: u64) -> u64
+  requires todos_ok(t) && from <= to && to <= blen(s)
+  ensures result <= vlen(t.starts)
+{
+  match parse_u64(s, from, to) {
+    Option::Some(id) => {
+      if id >= 1 && id <= vec_len(t.starts) && vec_get(t.state, id - 1) != 2 {
+        return id - 1;
+      }
+    },
+    Option::None => {},
+  }
+  return vec_len(t.starts);
+}
+
+/// Routes the request with the method `method` and the target `s` (its body
+/// is `body`, empty unless the method has one).
+fn route(t: &mut Todos, post: bool, get: bool, del: bool, s: &Bytes, body: &Bytes) -> Reply
+  requires todos_ok(t)
+  ensures todos_ok(t)
+{
+  if bytes_eq_str(s, "/todos") {
+    if get { return list(t); }
+    if post { return create(&mut t, body); }
+    return fail(405, "method not allowed");
+  }
+  if blen(s) > 7 && bytes_span_eq_str(s, 0, 7, "/todos/") {
+    // /todos/N/done
+    if post && blen(s) > 12 && bytes_span_eq_str(s, blen(s) - 5, blen(s), "/done") {
+      let i = find(t, s, 7, blen(s) - 5);
+      if i < vec_len(t.starts) {
+        vec_set(&mut t.state, i, 1);
+        let mut o = json_out_new();
+        item_json(&mut o, t, i);
+        return reply_json(200, o);
+      }
+      return fail(404, "not found");
+    }
+    // /todos/N
+    if del {
+      let i = find(t, s, 7, blen(s));
+      if i < vec_len(t.starts) {
+        vec_set(&mut t.state, i, 2);
+        let mut o = json_out_new();
+        let kd = bfrom("deleted");
+        json_out_begin_obj(&mut o);
+        json_out_key(&mut o, kd);
+        json_out_u64(&mut o, i + 1);
+        json_out_end(&mut o);
+        bfree(kd);
+        return reply_json(200, o);
+      }
+      return fail(404, "not found");
+    }
+  }
+  return fail(404, "not found");
+}
+
+/// The reason phrase of a status code this service sends.
+fn reason(status: u64) -> Str {
+  if status == 200 { return "OK"; }
+  if status == 201 { return "Created"; }
+  if status == 400 { return "Bad Request"; }
+  if status == 404 { return "Not Found"; }
+  if status == 405 { return "Method Not Allowed"; }
+  if status == 507 { return "Insufficient Storage"; }
+  return "Internal Server Error";
+}
+
+/// Answers the request `r`. The connection comes back, still open, when the
+/// client may send another request on it.
+fn answer(h: &Host, t: &mut Todos, mut r: HttpReq) -> Option[u64]
+  requires todos_ok(t)
+  ensures todos_ok(t)
+{
+  let target = http_req_target(r);
+  let post = http_req_is(r, "POST");
+  let get = http_req_is(r, "GET");
+  let del = http_req_is(r, "DELETE");
+  // The body is read for every method, so that a request that carries one
+  // (even an empty one) leaves the connection ready for the next.
+  let mut body = balloc(0);
+  match http_req_body(h, &mut r, 4096) {
+    Option::Some(b) => {
+      bfree(body);
+      body = b;
+    },
+    Option::None => {
+      // The body could not be read; do not keep the connection.
+      bfree(body);
+      bfree(target);
+      http_close(h, r);
+      return Option[u64]::None;
+    },
+  }
+  let rep = route(&mut t, post, get, del, target, body);
+  bfree(target);
+  bfree(body);
+  let status = rep.status;
+  let k = http_answer(h, r, status, reason(status), "application/json", rep.body);
+  bfree(rep.body);
+  return k;
+}
+
+/// Reads the next request on the connection `c` and answers it. The
+/// connection again if it stays open; `None` once it is closed.
+fn step(h: &Host, t: &mut Todos, c: u64) -> Option[u64]
+  requires todos_ok(t)
+  ensures todos_ok(t)
+{
+  match http_read_request(h, c, 8192) {
+    Option::Some(r) => { return answer(h, &mut t, r); },
+    Option::None => { return Option[u64]::None; },
+  }
+}
+
+/// Serves the connection `c` until it is closed, but for at most 100
+/// requests.
+fn serve_conn(h: &Host, t: &mut Todos, c: u64)
+  requires todos_ok(t)
+  ensures todos_ok(t)
+{
+  let mut cur = c;
+  let mut n = 0;
+  while cur != 0 && n < 100
+    invariant n <= 100 && todos_ok(t)
+  {
+    match step(h, &mut t, cur) {
+      Option::Some(k) => { cur = k; },
+      Option::None => { cur = 0; },
+    }
+    n = n + 1;
+  }
+  if cur != 0 {
+    net_close(h, cur);
+  }
+}
+
+/// Sends `method target` with `body` on `c` and has the server side `a`
+/// answer it. Counts 1 unless the answer has status `want_status` and its
+/// body is `want_body`.
+fn ask(h: &Host, t: &mut Todos, a: u64, c: u64, method: Str, target: Str, body: Str, want_status: u64, want_body: Str, last: bool) -> u64
+  requires todos_ok(t)
+  ensures result <= 1 && todos_ok(t)
+{
+  let mut x = text_new();
+  text_push_str(&mut x, method);
+  text_push_str(&mut x, " ");
+  text_push_str(&mut x, target);
+  text_push_str(&mut x, " HTTP/1.1\r\nHost: localhost\r\nContent-Length: ");
+  fmt_u64(&mut x, slen(body));
+  if last {
+    text_push_str(&mut x, "\r\nConnection: close");
+  }
+  text_push_str(&mut x, "\r\n\r\n");
+  text_push_str(&mut x, body);
+  let req = text_finish(x);
+  let sent = net_send_all(h, c, req);
+  bfree(req);
+  if !sent {
+    return 1;
+  }
+  let mut open = false;
+  match step(h, &mut t, a) {
+    Option::Some(k) => { open = true; },
+    Option::None => {},
+  }
+  if open == last {
+    return 1;
+  }
+  let mut bad = 1;
+  match http_read_response(h, c, 65536) {
+    Option::Some(m) => {
+      match http_body_start(m) {
+        Option::Some(at) => {
+          if at <= blen(m) && http_status(m) == want_status && bytes_span_eq_str(m, at, blen(m), want_body) {
+            bad = 0;
+          }
+        },
+        Option::None => {},
+      }
+      bfree(m);
+    },
+    Option::None => {},
+  }
+  return bad;
+}
+
+/// Listens on `lo`:`port` and answers requests for ever, one connection at a
+/// time.
+fn serve(con: &Serial, h: &Host, lo: u64, port: u64) -> u64 {
+  match net_listen(h, lo, port) {
+    Option::Some(s) => {
+      print_str(con, "listening on 127.0.0.1:");
+      print_u64(con, net_port(h, s));
+      print_nl(con);
+      let mut t = todos_new();
+      while true
+        invariant todos_ok(t)
+      {
+        match net_accept(h, s) {
+          Option::Some(c) => { serve_conn(h, &mut t, c); },
+          Option::None => {},
+        }
+      }
+      todos_free(t);
+      net_close(h, s);
+      return 0;
+    },
+    Option::None => {
+      print_str(con, "cannot listen\n");
+      return 1;
+    },
+  }
+}
+
+/// Starts the server on a free port and sends it requests over one
+/// connection, the last asking to close it.
+fn selfcheck(h: &Host, lo: u64) -> u64 {
+  let mut bad = 1;
+  match net_listen(h, lo, 0) {
+    Option::Some(s) => {
+      match net_connect(h, lo, net_port(h, s)) {
+        Option::Some(c) => {
+          match net_accept(h, s) {
+            Option::Some(a) => {
+              let mut t = todos_new();
+              let mut n = 0;
+              let nf = "{\"error\":\"not found\"}\n";
+              let br = "{\"error\":\"bad request\"}\n";
+              n = n + ask(h, &mut t, a, c, "GET", "/todos", "", 200, "[]", false);
+              n = n + ask(h, &mut t, a, c, "POST", "/todos", "{\"title\": \"milk\"}", 201, "{\"id\":1,\"title\":\"milk\",\"done\":false}", false);
+              n = n + ask(h, &mut t, a, c, "POST", "/todos", "{\"title\":\"caf\\u00e9 \\\"b\\\"\"}", 201, "{\"id\":2,\"title\":\"café \\\"b\\\"\",\"done\":false}", false);
+              n = n + ask(h, &mut t, a, c, "POST", "/todos/1/done", "", 200, "{\"id\":1,\"title\":\"milk\",\"done\":true}", false);
+              n = n + ask(h, &mut t, a, c, "GET", "/todos", "", 200, "[{\"id\":1,\"title\":\"milk\",\"done\":true},{\"id\":2,\"title\":\"café \\\"b\\\"\",\"done\":false}]", false);
+              n = n + ask(h, &mut t, a, c, "DELETE", "/todos/1", "", 200, "{\"deleted\":1}", false);
+              n = n + ask(h, &mut t, a, c, "DELETE", "/todos/1", "", 404, nf, false);
+              n = n + ask(h, &mut t, a, c, "POST", "/todos/9/done", "", 404, nf, false);
+              n = n + ask(h, &mut t, a, c, "GET", "/todos", "", 200, "[{\"id\":2,\"title\":\"café \\\"b\\\"\",\"done\":false}]", false);
+              n = n + ask(h, &mut t, a, c, "POST", "/todos", "{\"title\": 7}", 400, br, false);
+              n = n + ask(h, &mut t, a, c, "POST", "/todos", "{\"title\": \"\"}", 400, br, false);
+              n = n + ask(h, &mut t, a, c, "POST", "/todos", "{\"title\": \"x\",}", 400, br, false);
+              n = n + ask(h, &mut t, a, c, "GET", "/other", "", 404, nf, false);
+              n = n + ask(h, &mut t, a, c, "PUT", "/todos", "", 405, "{\"error\":\"method not allowed\"}\n", true);
+              todos_free(t);
+              if n == 0 {
+                bad = 0;
+              }
+            },
+            Option::None => {},
+          }
+          net_close(h, c);
+        },
+        Option::None => {},
+      }
+      net_close(h, s);
+    },
+    Option::None => {},
+  }
+  return bad;
+}
+
+fn main(con: &mut Serial, h: &mut Host) -> u64 {
+  let lo = net_ip4(127, 0, 0, 1);
+  if host_arg_is(h, 1, "serve") {
+    let a = host_arg(h, 2);
+    let mut port = 8080;
+    match parse_u64(a, 0, blen(a)) {
+      Option::Some(p) => { port = p; },
+      Option::None => {},
+    }
+    bfree(a);
+    return serve(con, h, lo, port);
+  }
+  return selfcheck(h, lo);
+}
