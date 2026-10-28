@@ -1,0 +1,111 @@
+// expect-exit: 0
+// The JSON scanner accepts what RFC 8259 accepts and refuses what it does
+// not, without reading outside the buffer on any prefix of a document.
+import "../../core/json.bastio";
+
+// 0: the whole text is one valid value; 1: cut short; 2: invalid.
+fn kind(src: Str) -> u64 {
+  let b = bfrom(src);
+  let mut r = 3;
+  match json_value(b, 0) {
+    Json::Ok(e) => {
+      if json_ws(b, e) == blen(b) { r = 0; } else { r = 2; }
+    },
+    Json::Partial => { r = 1; },
+    Json::Bad(x) => { r = 2; },
+  }
+  bfree(b);
+  return r;
+}
+
+fn want(src: Str, k: u64) -> u64
+  ensures result <= 1
+{
+  if kind(src) != k { return 1; }
+  return 0;
+}
+
+// `n` opening brackets, `n` closing ones.
+fn nested(n: u64) -> u64 {
+  if n > 100 { return 9; }
+  let mut t = text_new();
+  let mut i = 0;
+  while i < n
+    invariant i <= n
+  {
+    text_push(&mut t, 91);
+    i = i + 1;
+  }
+  i = 0;
+  while i < n
+    invariant i <= n
+  {
+    text_push(&mut t, 93);
+    i = i + 1;
+  }
+  let b = text_finish(t);
+  let mut r = 3;
+  match json_value(b, 0) {
+    Json::Ok(e) => { r = 0; },
+    Json::Partial => { r = 1; },
+    Json::Bad(x) => { r = 2; },
+  }
+  bfree(b);
+  return r;
+}
+
+fn main() -> u64 {
+  let mut bad = 0;
+  bad = bad + want("0", 0);
+  bad = bad + want("-0", 0);
+  bad = bad + want("-12.5e+3", 0);
+  bad = bad + want(" [ ] ", 0);
+  bad = bad + want("{}", 0);
+  bad = bad + want("{\"a\":[{}],\"b\":null}", 0);
+  bad = bad + want("\"\\u00e9\\\"\"", 0);
+  bad = bad + want("01", 2);
+  bad = bad + want("1.", 1);
+  bad = bad + want("1.e3", 2);
+  bad = bad + want("+1", 2);
+  bad = bad + want("[1,]", 2);
+  bad = bad + want("[,1]", 2);
+  bad = bad + want("{\"a\":1,}", 2);
+  bad = bad + want("{a:1}", 2);
+  bad = bad + want("{'a':1}", 2);
+  bad = bad + want("[1 2]", 2);
+  bad = bad + want("{\"a\" 1}", 2);
+  bad = bad + want("[}", 2);
+  bad = bad + want("{]", 2);
+  bad = bad + want("\"a\tb\"", 2);
+  bad = bad + want("\"\\x\"", 2);
+  bad = bad + want("\"\\u12g4\"", 2);
+  bad = bad + want("tru", 1);
+  bad = bad + want("trux", 2);
+  bad = bad + want("nul", 1);
+  bad = bad + want("[1] 2", 2);
+  bad = bad + want("", 1);
+
+  // Nesting: 32 deep is accepted, 33 is refused.
+  if nested(32) != 0 { bad = bad + 1; }
+  if nested(33) != 2 { bad = bad + 1; }
+
+  // Every prefix of a document is "cut short" or invalid, never a crash.
+  let doc = bfrom("{\"k\": [1, {\"z\": \"\\u00e9\"}, false], \"n\": -1.5E2}");
+  let mut miss = false;
+  let mut cut = 0;
+  while cut < blen(doc)
+    invariant cut <= blen(doc)
+  {
+    let pre = bytes_slice(doc, 0, cut);
+    match json_value(pre, 0) {
+      Json::Ok(e) => { miss = true; },
+      Json::Partial => {},
+      Json::Bad(x) => { miss = true; },
+    }
+    bfree(pre);
+    cut = cut + 1;
+  }
+  bfree(doc);
+  if miss { bad = bad + 1; }
+  return bad;
+}

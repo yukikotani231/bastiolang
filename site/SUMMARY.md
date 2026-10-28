@@ -33,6 +33,7 @@
   - [core/endian.bastio](lib-core-endian.md)
   - [core/format.bastio](lib-core-format.md)
   - [core/hashmap.bastio](lib-core-hashmap.md)
+  - [core/json.bastio](lib-core-json.md)
   - [core/lines.bastio](lib-core-lines.md)
   - [core/num.bastio](lib-core-num.md)
   - [core/option.bastio](lib-core-option.md)

@@ -45,6 +45,7 @@ Each module has a reference page, generated from its source: every function with
 | [`core/endian.bastio`](lib/core-endian.md) | Fixed-width integers stored in byte strings, as packet headers, file formats and disk blocks hold them. |
 | [`core/format.bastio`](lib/core-format.md) | Building text out of pieces. |
 | [`core/hashmap.bastio`](lib/core-hashmap.md) | A hash map from `u64` keys to values of any type `V` that can be copied (`u64`, `Span`, a struct of numbers, ...). |
+| [`core/json.bastio`](lib/core-json.md) | JSON (RFC 8259) read from bytes that cannot be trusted. |
 | [`core/lines.bastio`](lib/core-lines.md) | Splitting text into lines. |
 | [`core/num.bastio`](lib/core-num.md) | Parsing integers from bytes and formatting them as text. |
 | [`core/option.bastio`](lib/core-option.md) | An optional value, and a span of a byte string. |
