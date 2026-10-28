@@ -26,6 +26,7 @@ by the bytes as written.
 | [`json_element`](#json_element) | The offset of element number `idx` (from 0) of the array that starts at the first non-blank byte at or after `at`, or `None` when there are fewer elements or the document is damaged. |
 | [`json_u64`](#json_u64) | The value at the first non-blank byte at or after `at`, read as a JSON number made only of digits (no sign, fraction or exponent) that fits in a `u64`. |
 | [`json_string`](#json_string) | The string at the first non-blank byte at or after `at`, with its escapes decoded (`\u` escapes become UTF-8; a surrogate pair becomes one code point). |
+| [`json_push_string`](#json_push_string) | Appends `b` to `t` as a JSON string. |
 
 Every example below is built, verified and run by `tests/run.sh`. An `assert` in one is proved at compile time from the contracts above it.
 
@@ -207,6 +208,30 @@ match json_string(lone, 0) {
 bfree(b);
 bfree(lone);
 if !ok || !refused { return 1; }
+```
+
+### `json_push_string`
+
+```bastio
+fn json_push_string(t: &mut Vec[u8], b: &Bytes)
+```
+
+Appends `b` to `t` as a JSON string: in quotes, with `"` and `\` escaped,
+and the control characters below 32 as `\n`, `\r`, `\t` or `\u00XX`. Other
+bytes, UTF-8 included, are copied as they are.
+
+Example:
+
+```bastio
+let mut v = bfrom("a\"b\\\n.");
+bset(&mut v, 5, 1);
+let mut t = text_new();
+json_push_string(&mut t, v);
+let out = text_finish(t);
+let ok = bytes_eq_str(out, "\"a\\\"b\\\\\\n\\u0001\"");
+bfree(v);
+bfree(out);
+if !ok { return 1; }
 ```
 
 ## Internals

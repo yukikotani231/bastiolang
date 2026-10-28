@@ -641,3 +641,46 @@ fn json_string(s: &Bytes, at: u64) -> Option[Bytes]
   vec_free(t);
   return Option[Bytes]::None;
 }
+
+/// Appends `b` to `t` as a JSON string: in quotes, with `"` and `\` escaped,
+/// and the control characters below 32 as `\n`, `\r`, `\t` or `\u00XX`. Other
+/// bytes, UTF-8 included, are copied as they are.
+/// ```
+/// let mut v = bfrom("a\"b\\\n.");
+/// bset(&mut v, 5, 1);
+/// let mut t = text_new();
+/// json_push_string(&mut t, v);
+/// let out = text_finish(t);
+/// let ok = bytes_eq_str(out, "\"a\\\"b\\\\\\n\\u0001\"");
+/// bfree(v);
+/// bfree(out);
+/// if !ok { return 1; }
+/// ```
+fn json_push_string(t: &mut Vec[u8], b: &Bytes)
+{
+  text_push(&mut t, 34);
+  let mut i = 0;
+  while i < blen(b)
+    invariant i <= blen(b)
+  {
+    let c = bget(b, i);
+    if c == 34 || c == 92 {
+      text_push(&mut t, 92);
+      text_push(&mut t, c);
+    } else if c == 10 {
+      text_push_str(&mut t, "\\n");
+    } else if c == 13 {
+      text_push_str(&mut t, "\\r");
+    } else if c == 9 {
+      text_push_str(&mut t, "\\t");
+    } else if c < 32 {
+      text_push_str(&mut t, "\\u00");
+      text_push(&mut t, hex_char(cast[u64](c) / 16));
+      text_push(&mut t, hex_char(cast[u64](c) % 16));
+    } else {
+      text_push(&mut t, c);
+    }
+    i = i + 1;
+  }
+  text_push(&mut t, 34);
+}

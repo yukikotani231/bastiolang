@@ -89,6 +89,30 @@ fn main() -> u64 {
   if nested(32) != 0 { bad = bad + 1; }
   if nested(33) != 2 { bad = bad + 1; }
 
+  // What json_push_string writes, json_string reads back, for every byte.
+  let mut all = balloc(256);
+  let mut k = 0;
+  while k < 256
+    invariant k <= 256 && blen(all) == 256
+  {
+    bset(&mut all, k, cast[u8](k));
+    k = k + 1;
+  }
+  let mut t = text_new();
+  json_push_string(&mut t, all);
+  let w = text_finish(t);
+  match json_value(w, 0) {
+    Json::Ok(e) => { if e != blen(w) { bad = bad + 1; } },
+    Json::Partial => { bad = bad + 1; },
+    Json::Bad(x) => { bad = bad + 1; },
+  }
+  match json_string(w, 0) {
+    Option::Some(v) => { if !bytes_eq(v, all) { bad = bad + 1; } bfree(v); },
+    Option::None => { bad = bad + 1; },
+  }
+  bfree(w);
+  bfree(all);
+
   // Every prefix of a document is "cut short" or invalid, never a crash.
   let doc = bfrom("{\"k\": [1, {\"z\": \"\\u00e9\"}, false], \"n\": -1.5E2}");
   let mut miss = false;
