@@ -1,0 +1,151 @@
+// core/chacha20poly1305.bastio: authenticated encryption with ChaCha20 and
+// Poly1305 (RFC 8439 section 2.8).
+//
+// What is proved: every access is in bounds, nothing leaks, a sealed message
+// is 16 bytes longer than its plaintext, and `aead_open` returns `Some` only
+// after the tag has been compared in full. Not proved: that the output is
+// RFC 8439's (the tests check its vectors, a tampered byte in every position,
+// and a differential run against a reference), or that the code is constant
+// time (the tag comparison folds all 16 bytes without an early exit).
+//
+// A nonce must never be used twice with one key.
+import "chacha20.bastio";
+import "poly1305.bastio";
+import "text.bastio";
+
+/// Internal: pads the text `t` with zeros to a multiple of 16 bytes.
+fn aead_pad16(t: &mut Vec[u8]) {
+  while vec_len(t) % 16 != 0
+    invariant true
+  {
+    text_push(&mut t, 0);
+  }
+}
+
+/// Internal: appends `x` as 8 little-endian bytes.
+fn aead_push_le64(t: &mut Vec[u8], x: u64) {
+  let mut i = 0;
+  let mut v = x;
+  while i < 8
+    invariant i <= 8
+  {
+    text_push(&mut t, cast[u8](v & 255));
+    v = v / 256;
+    i = i + 1;
+  }
+}
+
+/// Internal: the Poly1305 tag over `aad`, `ct`, padded, and both lengths,
+/// under the one-time key from block 0 of the cipher.
+fn aead_tag(key: &Bytes, nonce: &Bytes, aad: &Bytes, ct: &Bytes) -> Bytes
+  requires blen(key) == 32 && blen(nonce) == 12
+  ensures blen(result) == 16
+{
+  let mut block = balloc(64);
+  chacha_block(&mut block, 0, key, 0, nonce);
+  let mut otk = balloc(32);
+  bytes_copy_span(&mut otk, 0, block, 0, 32);
+  let mut t = text_new();
+  text_push_bytes(&mut t, aad);
+  aead_pad16(&mut t);
+  text_push_bytes(&mut t, ct);
+  aead_pad16(&mut t);
+  aead_push_le64(&mut t, blen(aad));
+  aead_push_le64(&mut t, blen(ct));
+  let mac_data = text_finish(t);
+  let tag = poly1305(otk, mac_data);
+  bfree(mac_data);
+  bfree(otk);
+  bfree(block);
+  return tag;
+}
+
+/// Encrypts `plain` under the 32-byte `key` and 12-byte `nonce`, and
+/// authenticates it together with `aad` (which stays in the clear): the
+/// ciphertext followed by a 16-byte tag.
+/// ```
+/// let mut key = balloc(32);
+/// let mut i = 0;
+/// while i < 32 invariant i <= 32 && blen(key) == 32 { bset(&mut key, i, cast[u8](i + 128)); i = i + 1; }
+/// let nonce = balloc(12);
+/// let aad = bfrom("header");
+/// let plain = bfrom("attack at dawn");
+/// let sealed = aead_seal(key, nonce, aad, plain);
+/// let n = blen(sealed);
+/// let mut ok = false;
+/// match aead_open(key, nonce, aad, sealed) {
+///   Option::Some(p) => { ok = bytes_eq(p, plain); bfree(p); },
+///   Option::None => {},
+/// }
+/// bfree(sealed);
+/// bfree(plain);
+/// bfree(aad);
+/// bfree(nonce);
+/// bfree(key);
+/// if n != 30 || !ok { return 1; }
+/// ```
+fn aead_seal(key: &Bytes, nonce: &Bytes, aad: &Bytes, plain: &Bytes) -> Bytes
+  requires blen(key) == 32 && blen(nonce) == 12 && blen(plain) < 274877906944
+  ensures blen(result) == blen(plain) + 16
+{
+  let ct = chacha20_xor(key, nonce, 1, plain);
+  let tag = aead_tag(key, nonce, aad, ct);
+  let mut t = text_new();
+  text_push_bytes(&mut t, ct);
+  text_push_bytes(&mut t, tag);
+  bfree(ct);
+  bfree(tag);
+  return text_finish(t);
+}
+
+/// Checks the tag at the end of `sealed` and, if it is right, decrypts: the
+/// plaintext. `None` for a message shorter than a tag, or one whose tag, data
+/// or `aad` was changed.
+/// ```
+/// let mut key = balloc(32);
+/// let nonce = balloc(12);
+/// let aad = balloc(0);
+/// let plain = bfrom("x");
+/// let mut sealed = aead_seal(key, nonce, aad, plain);
+/// bset(&mut sealed, 0, bget(sealed, 0) ^ 1);     // flip a bit
+/// let mut refused = true;
+/// match aead_open(key, nonce, aad, sealed) {
+///   Option::Some(p) => { refused = false; bfree(p); },
+///   Option::None => {},
+/// }
+/// bfree(sealed);
+/// bfree(plain);
+/// bfree(aad);
+/// bfree(nonce);
+/// bfree(key);
+/// if !refused { return 1; }
+/// ```
+fn aead_open(key: &Bytes, nonce: &Bytes, aad: &Bytes, sealed: &Bytes) -> Option[Bytes]
+  requires blen(key) == 32 && blen(nonce) == 12 && blen(sealed) < 274877906944
+  ensures result is Option::Some ==> blen(result.Some) + 16 == blen(sealed)
+{
+  if blen(sealed) < 16 {
+    return Option[Bytes]::None;
+  }
+  let n = blen(sealed) - 16;
+  let mut ct = balloc(n);
+  bytes_copy_span(&mut ct, 0, sealed, 0, n);
+  let want = aead_tag(key, nonce, aad, ct);
+  // Compare all 16 bytes whatever they hold.
+  let mut diff: u8 = 0;
+  let mut i = 0;
+  while i < 16
+    invariant i <= 16 && blen(want) == 16 && n + 16 == blen(sealed)
+  {
+    diff = diff | (bget(want, i) ^ bget(sealed, n + i));
+    i = i + 1;
+  }
+  bfree(want);
+  if diff != 0 {
+    bfree(ct);
+    return Option[Bytes]::None;
+  }
+  let plain = chacha20_xor(key, nonce, 1, ct);
+  bfree(ct);
+  return Option[Bytes]::Some(plain);
+}

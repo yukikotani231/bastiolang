@@ -41,6 +41,8 @@ Each module has a reference page, generated from its source: every function with
 | [`core/boxed.bastio`](lib/core-boxed.md) | A box that reports running out of memory. |
 | [`core/bytes.bastio`](lib/core-bytes.md) | Comparing, searching, slicing and hashing byte strings. |
 | [`core/bytesmap.bastio`](lib/core-bytesmap.md) | A hash map from byte strings to values of any type `V` that can be copied, for symbol tables, paths and names. |
+| [`core/chacha20.bastio`](lib/core-chacha20.md) | The ChaCha20 stream cipher (RFC 8439 section 2.4). |
+| [`core/chacha20poly1305.bastio`](lib/core-chacha20poly1305.md) | Authenticated encryption with ChaCha20 and Poly1305 (RFC 8439 section 2.8). |
 | [`core/csum.bastio`](lib/core-csum.md) | Checksums over byte strings. |
 | [`core/endian.bastio`](lib/core-endian.md) | Fixed-width integers stored in byte strings, as packet headers, file formats and disk blocks hold them. |
 | [`core/format.bastio`](lib/core-format.md) | Building text out of pieces. |
@@ -50,6 +52,7 @@ Each module has a reference page, generated from its source: every function with
 | [`core/num.bastio`](lib/core-num.md) | Parsing integers from bytes and formatting them as text. |
 | [`core/option.bastio`](lib/core-option.md) | An optional value, and a span of a byte string. |
 | [`core/path.bastio`](lib/core-path.md) | File names. |
+| [`core/poly1305.bastio`](lib/core-poly1305.md) | The Poly1305 one-time authenticator (RFC 8439 section 2.5), in the 26-bit-limb form of poly1305-donna. |
 | [`core/print.bastio`](lib/core-print.md) | Writing text and numbers to the serial console. |
 | [`core/ring.bastio`](lib/core-ring.md) | Ring buffers and fixed-capacity FIFO queues. |
 | [`core/rows.bastio`](lib/core-rows.md) | Tables of fixed-size rows in one `Buf`. |
