@@ -491,6 +491,44 @@ fn json_u64(s: &Bytes, at: u64) -> Option[u64]
   }
 }
 
+/// The value at the first non-blank byte at or after `at`, read as a JSON
+/// number made only of an optional `-` and digits (no fraction or exponent)
+/// that fits in an `i64`.
+/// ```
+/// let b = bfrom("[42, -7, -9223372036854775808, 9223372036854775808, 1.5]");
+/// let mut a: i64 = 0;
+/// let mut m: i64 = 0;
+/// let mut lo: i64 = 0;
+/// match json_i64(b, 1) { Option::Some(x) => { a = x; }, Option::None => {} }
+/// match json_i64(b, 5) { Option::Some(x) => { m = x; }, Option::None => {} }
+/// match json_i64(b, 9) { Option::Some(x) => { lo = x; }, Option::None => {} }
+/// let big = json_i64(b, 31);
+/// let frac = json_i64(b, 52);
+/// bfree(b);
+/// let min: i64 = -9223372036854775807;
+/// if a != 42 || m != -7 || lo != min - 1 { return 1; }
+/// if big is Option::Some || frac is Option::Some { return 1; }
+/// ```
+fn json_i64(s: &Bytes, at: u64) -> Option[i64]
+  requires at <= blen(s)
+{
+  let n = blen(s);
+  let p = json_ws(s, at);
+  if p >= n {
+    return Option[i64]::None;
+  }
+  match json_num_end(s, p) {
+    Json::Ok(e) => {
+      if e > n || e <= p {
+        return Option[i64]::None;
+      }
+      return parse_i64(s, p, e);
+    },
+    Json::Partial => { return Option[i64]::None; },
+    Json::Bad(x) => { return Option[i64]::None; },
+  }
+}
+
 /// Internal: the four hexadecimal digits at `i`, or `None`.
 fn json_hex4(s: &Bytes, i: u64) -> Option[u64]
   requires i + 4 <= blen(s)
@@ -944,6 +982,31 @@ fn json_out_u64(o: &mut JsonOut, x: u64)
 {
   if json_out_slot(&mut o) {
     fmt_u64(&mut o.text, x);
+  }
+}
+
+/// Writes a signed integer.
+/// ```
+/// let mut o = json_out_new();
+/// json_out_begin_arr(&mut o);
+/// json_out_i64(&mut o, -7);
+/// json_out_i64(&mut o, 0);
+/// let min: i64 = -9223372036854775807;
+/// json_out_i64(&mut o, min - 1);
+/// json_out_end(&mut o);
+/// match json_out_finish(o) {
+///   Option::Some(b) => {
+///     let ok = bytes_eq_str(b, "[-7,0,-9223372036854775808]");
+///     bfree(b);
+///     if !ok { return 1; }
+///   },
+///   Option::None => { return 1; },
+/// }
+/// ```
+fn json_out_i64(o: &mut JsonOut, x: i64)
+{
+  if json_out_slot(&mut o) {
+    fmt_i64(&mut o.text, x);
   }
 }
 

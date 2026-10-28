@@ -27,6 +27,7 @@ by the bytes as written.
 | [`json_member`](#json_member) | The offset of the value of the member `key` of the object that starts at the first non-blank byte at or after `at`, or `None` when there is no such member or the document is damaged. |
 | [`json_element`](#json_element) | The offset of element number `idx` (from 0) of the array that starts at the first non-blank byte at or after `at`, or `None` when there are fewer elements or the document is damaged. |
 | [`json_u64`](#json_u64) | The value at the first non-blank byte at or after `at`, read as a JSON number made only of digits (no sign, fraction or exponent) that fits in a `u64`. |
+| [`json_i64`](#json_i64) | The value at the first non-blank byte at or after `at`, read as a JSON number made only of an optional `-` and digits (no fraction or exponent) that fits in an `i64`. |
 | [`json_string`](#json_string) | The string at the first non-blank byte at or after `at`, with its escapes decoded (`\u` escapes become UTF-8; a surrogate pair becomes one code point). |
 | [`json_push_string`](#json_push_string) | Appends `b` to `t` as a JSON string. |
 | [`json_out_new`](#json_out_new) | A new, empty writer. |
@@ -36,6 +37,7 @@ by the bytes as written.
 | [`json_out_key`](#json_out_key) | Writes the key of the next member of the open object. |
 | [`json_out_str`](#json_out_str) | Writes a string value, escaped as `json_push_string` does. |
 | [`json_out_u64`](#json_out_u64) | Writes a number value, `x` in decimal. |
+| [`json_out_i64`](#json_out_i64) | Writes a signed integer. |
 | [`json_out_bool`](#json_out_bool) | Writes `true` or `false`. |
 | [`json_out_null`](#json_out_null) | Writes `null`. |
 | [`json_out_finish`](#json_out_finish) | The finished document, or `None` when a call did not fit or the document is not complete (a container still open, nothing written). |
@@ -215,6 +217,35 @@ let frac = json_u64(b, 9);
 let big = json_u64(b, 14);
 bfree(b);
 if a != 42 || neg is Option::Some || frac is Option::Some || big is Option::Some { return 1; }
+```
+
+### `json_i64`
+
+```bastio
+fn json_i64(s: &Bytes, at: u64) -> Option[i64]
+  requires at <= blen(s)
+```
+
+The value at the first non-blank byte at or after `at`, read as a JSON
+number made only of an optional `-` and digits (no fraction or exponent)
+that fits in an `i64`.
+
+Example:
+
+```bastio
+let b = bfrom("[42, -7, -9223372036854775808, 9223372036854775808, 1.5]");
+let mut a: i64 = 0;
+let mut m: i64 = 0;
+let mut lo: i64 = 0;
+match json_i64(b, 1) { Option::Some(x) => { a = x; }, Option::None => {} }
+match json_i64(b, 5) { Option::Some(x) => { m = x; }, Option::None => {} }
+match json_i64(b, 9) { Option::Some(x) => { lo = x; }, Option::None => {} }
+let big = json_i64(b, 31);
+let frac = json_i64(b, 52);
+bfree(b);
+let min: i64 = -9223372036854775807;
+if a != 42 || m != -7 || lo != min - 1 { return 1; }
+if big is Option::Some || frac is Option::Some { return 1; }
 ```
 
 ### `json_string`
@@ -452,6 +483,34 @@ json_out_u64(&mut o, 18446744073709551615);
 match json_out_finish(o) {
   Option::Some(b) => {
     let ok = bytes_eq_str(b, "18446744073709551615");
+    bfree(b);
+    if !ok { return 1; }
+  },
+  Option::None => { return 1; },
+}
+```
+
+### `json_out_i64`
+
+```bastio
+fn json_out_i64(o: &mut JsonOut, x: i64)
+```
+
+Writes a signed integer.
+
+Example:
+
+```bastio
+let mut o = json_out_new();
+json_out_begin_arr(&mut o);
+json_out_i64(&mut o, -7);
+json_out_i64(&mut o, 0);
+let min: i64 = -9223372036854775807;
+json_out_i64(&mut o, min - 1);
+json_out_end(&mut o);
+match json_out_finish(o) {
+  Option::Some(b) => {
+    let ok = bytes_eq_str(b, "[-7,0,-9223372036854775808]");
     bfree(b);
     if !ok { return 1; }
   },
