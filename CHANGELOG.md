@@ -198,6 +198,9 @@ What will be 0.2.0.
 
 ### Compilers
 
+- `--arch wasm32`: `host_net` is a host import, so programs that use `std/net` and `std/http` (and
+  `examples/todoapi`) run as a module under Node.js. `web/netsync.js` does the sockets in a worker thread
+  while the module waits on a shared buffer; `tests/wasm.sh` runs `std_http` and `todoapi` that way.
 - `--arch aarch64` builds for AArch64 with the C backend. Hosted programs
   build for AArch64 Linux in both compilers (#121). In bastioc1, the kernel
   and user targets get AArch64 preludes too: a PL011 console, VMSAv8-64

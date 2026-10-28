@@ -4,7 +4,8 @@
 # as a wasm module, and the module, run by Node.js (tests/wasm_run.js), must
 # exit with the same status and print the same output. A program using
 # something the backend does not cover yet is reported as skipped; anything
-# else that differs fails. Needs node (18 or later).
+# else that differs fails. examples/todoapi.bastio is in the list too: its
+# self-check talks to itself over sockets (web/netsync.js). Needs node (18 or later).
 set -u
 cd "$(dirname "$0")/.."
 if ! command -v node >/dev/null; then echo "wasm: node is missing, SKIPPED"; exit 0; fi
@@ -34,7 +35,7 @@ both() {
 }
 export -f both
 lost=0
-pfor both $(s1files tests/pass/*.bastio bench/*.bastio) || lost=1
+pfor both $(s1files tests/pass/*.bastio bench/*.bastio examples/todoapi.bastio) || lost=1
 pass=$(n pass) skip=$(n skip) fail=$(($(n fail) + lost))
 echo "wasm: $pass same as the C backend, $skip skipped (unsupported), $fail failed"
 [ $fail = 0 ]

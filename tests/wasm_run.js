@@ -6,6 +6,7 @@
 'use strict';
 const fs = require('fs');
 const Bastio = require('../web/bastio.js');
+const net = require('../web/netsync.js').create();
 (async () => {
   let code = 0;
   const chunks = [];
@@ -15,6 +16,7 @@ const Bastio = require('../web/bastio.js');
       env: process.env,
       fs,
       childProcess: require('child_process'),
+      net,
       stdout: (u8) => chunks.push(Buffer.from(u8)),
       stderr: (u8) => { fs.writeSync(1, Buffer.concat(chunks)); chunks.length = 0; fs.writeSync(2, Buffer.from(u8)); },
     });
@@ -24,5 +26,6 @@ const Bastio = require('../web/bastio.js');
     code = 99;
   }
   fs.writeSync(1, Buffer.concat(chunks));
+  net.close();
   process.exitCode = code;
 })();
