@@ -60,6 +60,7 @@ Each module has a reference page, generated from its source: every function with
 | [`core/spancmp.bastio`](lib/core-spancmp.md) | Comparing two pieces of a text in byte order. |
 | [`core/strsort.bastio`](lib/core-strsort.md) | Sorting pieces of a text in dictionary order (byte order), for sorted word lists, directory listings and `sort | uniq`. |
 | [`core/text.bastio`](lib/core-text.md) | Building byte strings. |
+| [`core/url.bastio`](lib/core-url.md) | Percent-encoding (RFC 3986 section 2.1) and the query string of a request target (`/path?a=1&b=two%20words`). |
 | [`core/utf8.bastio`](lib/core-utf8.md) | UTF-8 validation (RFC 3629). |
 | [`core/wtext.bastio`](lib/core-wtext.md) | Text kept as a `Vec[u64]`, one character a word. |
 | [`std/host.bastio`](lib/std-host.md) | The command line, files and standard error, for programs on the hosted target. |

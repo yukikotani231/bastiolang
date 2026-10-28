@@ -1,0 +1,209 @@
+// core/url.bastio: percent-encoding (RFC 3986 section 2.1) and the query
+// string of a request target (`/path?a=1&b=two%20words`).
+//
+// What is proved: no read is out of bounds, a decoded string is never longer
+// than the text it came from, an encoded one is at most three times as long,
+// and every byte the encoder writes is an unreserved character or a `%` with
+// two upper-case hex digits. Not proved: that decoding undoes encoding for
+// every input (the tests check it for all 256 byte values), or that the
+// query splitter agrees with any particular server's.
+import "text.bastio";
+import "num.bastio";
+
+/// Internal: `c` needs no escaping in a URL component: a letter, a digit,
+/// or one of `-`, `.`, `_`, `~`.
+fn url_unreserved(c: u8) -> bool {
+  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 45 || c == 46 || c == 95 || c == 126;
+}
+
+/// Internal: the upper-case hex digit for `d`.
+fn url_hex_up(d: u64) -> u8
+  requires d < 16
+{
+  if d < 10 {
+    return cast[u8](d) + 48;
+  }
+  return cast[u8](d) + 55;
+}
+
+/// `b` percent-encoded for use as a URL component: letters, digits and
+/// `-._~` stay, every other byte becomes `%` and two upper-case hex digits.
+/// ```
+/// let b = bfrom("a b&c=é");
+/// let e = url_encode(b);
+/// let ok = bytes_eq_str(e, "a%20b%26c%3D%C3%A9");
+/// bfree(e);
+/// bfree(b);
+/// if !ok { return 1; }
+/// ```
+fn url_encode(b: &Bytes) -> Bytes
+  ensures blen(result) >= blen(b) && blen(result) <= 3 * blen(b)
+{
+  let mut t = text_new();
+  let mut i = 0;
+  while i < blen(b)
+    invariant i <= blen(b) && vlen(t) >= i && vlen(t) <= 3 * i
+  {
+    let c = bget(b, i);
+    if url_unreserved(c) {
+      text_push(&mut t, c);
+    } else {
+      text_push(&mut t, 37);
+      text_push(&mut t, url_hex_up(cast[u64](c) / 16));
+      text_push(&mut t, url_hex_up(cast[u64](c) % 16));
+    }
+    i = i + 1;
+  }
+  return text_finish(t);
+}
+
+/// The bytes `from..to` of `b` with each `%XX` replaced by the byte it names,
+/// and, when `plus` is true, each `+` by a space (the form of a query
+/// string). `None` when a `%` is not followed by two hex digits inside the
+/// span.
+/// ```
+/// let b = bfrom("x=a%20b+c%2b");
+/// let mut ok = false;
+/// match url_decode_span(b, 2, 12, true) {
+///   Option::Some(v) => { ok = bytes_eq_str(v, "a b c+"); bfree(v); },
+///   Option::None => {},
+/// }
+/// let cut = bfrom("100%");
+/// let mut refused = true;
+/// match url_decode_span(cut, 0, 4, false) {
+///   Option::Some(v) => { refused = false; bfree(v); },
+///   Option::None => {},
+/// }
+/// bfree(b);
+/// bfree(cut);
+/// if !ok || !refused { return 1; }
+/// ```
+fn url_decode_span(b: &Bytes, from: u64, to: u64, plus: bool) -> Option[Bytes]
+  requires from <= to && to <= blen(b)
+  ensures result is Option::Some ==> blen(result.Some) <= to - from
+{
+  let mut t = text_new();
+  let mut i = from;
+  let mut ok = true;
+  while ok && i < to
+    invariant from <= i && i <= to && vlen(t) <= i - from
+  {
+    let c = bget(b, i);
+    if c == 37 {
+      if i + 2 >= to {
+        ok = false;
+      } else {
+        let hi = hex_value(bget(b, i + 1));
+        let lo = hex_value(bget(b, i + 2));
+        if hi == 16 || lo == 16 {
+          ok = false;
+        } else {
+          text_push(&mut t, cast[u8](hi * 16 + lo));
+          i = i + 3;
+        }
+      }
+    } else if plus && c == 43 {
+      text_push(&mut t, 32);
+      i = i + 1;
+    } else {
+      text_push(&mut t, c);
+      i = i + 1;
+    }
+  }
+  if !ok {
+    vec_free(t);
+    return Option[Bytes]::None;
+  }
+  return Option[Bytes]::Some(text_finish(t));
+}
+
+/// All of `b` percent-decoded (see `url_decode_span`).
+/// ```
+/// let b = bfrom("%E2%82%AC5");
+/// let mut ok = false;
+/// match url_decode(b, false) {
+///   Option::Some(v) => { ok = blen(v) == 4 && bget(v, 0) == 226 && bget(v, 3) == 53; bfree(v); },
+///   Option::None => {},
+/// }
+/// bfree(b);
+/// if !ok { return 1; }
+/// ```
+fn url_decode(b: &Bytes, plus: bool) -> Option[Bytes]
+  ensures result is Option::Some ==> blen(result.Some) <= blen(b)
+{
+  return url_decode_span(b, 0, blen(b), plus);
+}
+
+/// The index of the first `?` in `b`, or `blen(b)` if there is none: the
+/// path of a request target is `0..url_query_start(b)` and the query string
+/// starts one byte later.
+/// ```
+/// let t = bfrom("/todos?done=1");
+/// let n = bfrom("/todos");
+/// let q = url_query_start(t);
+/// let none = url_query_start(n);
+/// bfree(t);
+/// bfree(n);
+/// if q != 6 || none != 6 { return 1; }
+/// ```
+fn url_query_start(b: &Bytes) -> u64
+  ensures result <= blen(b)
+{
+  let mut i = 0;
+  while i < blen(b) && bget(b, i) != 63
+    invariant i <= blen(b)
+  {
+    i = i + 1;
+  }
+  return i;
+}
+
+/// The decoded value of the first parameter named `key` in the query string
+/// that starts at byte `from` of `b` (`a=1&b=two+words`), with `+` read as a
+/// space. A parameter with no `=` has the value "". `None` when there is no
+/// such parameter or its value is not valid percent-encoding. The key is
+/// compared as written, so a key that is itself encoded does not match.
+/// ```
+/// let t = bfrom("/s?q=a+b%21&n=7&flag");
+/// let mut q = false;
+/// let mut n = false;
+/// let mut f = false;
+/// match url_query_get(t, 3, "q") { Option::Some(v) => { q = bytes_eq_str(v, "a b!"); bfree(v); }, Option::None => {} }
+/// match url_query_get(t, 3, "n") { Option::Some(v) => { n = bytes_eq_str(v, "7"); bfree(v); }, Option::None => {} }
+/// match url_query_get(t, 3, "flag") { Option::Some(v) => { f = blen(v) == 0; bfree(v); }, Option::None => {} }
+/// let mut found = false;
+/// match url_query_get(t, 3, "x") { Option::Some(v) => { found = true; bfree(v); }, Option::None => {} }
+/// bfree(t);
+/// if !q || !n || !f || found { return 1; }
+/// ```
+fn url_query_get(b: &Bytes, from: u64, key: Str) -> Option[Bytes]
+  requires from <= blen(b)
+{
+  let n = blen(b);
+  let mut s = from;
+  while s <= n
+    invariant from <= s && s <= n + 1 && n == blen(b)
+  {
+    // The pair is s..e; its key ends at q (the first `=`, or e).
+    let mut e = s;
+    while e < n && bget(b, e) != 38
+      invariant s <= e && e <= n
+    {
+      e = e + 1;
+    }
+    let mut q = s;
+    while q < e && bget(b, q) != 61
+      invariant s <= q && q <= e
+    {
+      q = q + 1;
+    }
+    if bytes_span_eq_str(b, s, q, key) {
+      if q < e {
+        return url_decode_span(b, q + 1, e, true);
+      }
+      return Option[Bytes]::Some(balloc(0));
+    }
+    s = e + 1;
+  }
+  return Option[Bytes]::None;
+}

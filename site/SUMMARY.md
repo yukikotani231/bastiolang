@@ -50,6 +50,7 @@
   - [core/strsort.bastio](lib-core-strsort.md)
   - [core/sort.bastio](lib-core-sort.md)
   - [core/text.bastio](lib-core-text.md)
+  - [core/url.bastio](lib-core-url.md)
   - [core/utf8.bastio](lib-core-utf8.md)
   - [core/wtext.bastio](lib-core-wtext.md)
   - [std/host.bastio](lib-std-host.md)
