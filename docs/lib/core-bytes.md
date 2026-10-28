@@ -30,6 +30,7 @@ bytes is rejected at compile time.
 | [`bytes_find_byte`](#bytes_find_byte) | The first index at or after `from` holding `c`, or `blen(b)` if there is none. |
 | [`bytes_rfind_byte`](#bytes_rfind_byte) | The last index below `to` holding `c`, if any. |
 | [`bytes_find`](#bytes_find) | The first index at or after `from` where `needle` occurs in `hay`, if any. |
+| [`bytes_rfind`](#bytes_rfind) | The last index where `needle` occurs in `hay`, if any. |
 | [`bytes_slice`](#bytes_slice) | A copy of bytes `from..to` of `b`. |
 | [`bytes_concat`](#bytes_concat) | A new byte string holding `a` followed by `b`. |
 | [`bytes_copy_into`](#bytes_copy_into) | Copies `src` into `dst` at `at`, leaving the other bytes of `dst` alone. |
@@ -251,6 +252,38 @@ match bytes_find(hay, needle, 0) {
 bfree(hay);
 bfree(needle);
 if at != 2 { return 1; }
+```
+
+### `bytes_rfind`
+
+```bastio
+fn bytes_rfind(hay: &Bytes, needle: &Bytes) -> Option[u64]
+  ensures result is Option::Some ==> result.Some + blen(needle) <= blen(hay)
+  ensures result is Option::Some ==> bytes_same_at(hay, result.Some, needle, 0, blen(needle))
+```
+
+The last index where `needle` occurs in `hay`, if any. Proved: a `Some`
+is a real occurrence. Not proved: that it is the last, or that `None`
+means there is none (as for `bytes_find`).
+
+Example:
+
+```bastio
+let hay = bfrom("a/b/c.txt");
+let needle = bfrom("/");
+let mut at = 99;
+match bytes_rfind(hay, needle) {
+  Option::Some(i) => {
+    // The contract says the needle is there, so this slice needs no check.
+    let found = bytes_slice(hay, i, i + blen(needle));
+    if bytes_eq(found, needle) { at = i; }
+    bfree(found);
+  },
+  Option::None => {},
+}
+bfree(hay);
+bfree(needle);
+if at != 3 { return 1; }
 ```
 
 ### `bytes_slice`

@@ -124,6 +124,10 @@ What will be 0.2.0.
 
 - `examples/leb128`: a proved unsigned LEB128 (varint) decoder and encoder called from C, fuzzed
   against a C decoder under AddressSanitizer.
+- `core/bytes`: `bytes_rfind` finds the last occurrence of a byte string (a `Some` is a
+  proved occurrence). `core/json` is a strict RFC 8259 scanner with readers and a string
+  writer; `std/http` reads chunked responses and keeps a connection alive after a
+  `Content-Length` or chunked request body; `host_net` works on macOS and Windows.
 - `core/strsort`: `spans_order` sorts pieces of a text in byte order by
   returning the indices `0..n` in order, proved a permutation with every
   neighbouring pair in order; `core/spancmp` has `span_cmp` for one pair.
