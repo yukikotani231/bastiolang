@@ -1,0 +1,173 @@
+// std/dns.bastio: the IPv4 address of a host name, for programs on the
+// hosted target: the query and the reader of core/dns.bastio, over a TCP
+// connection to a resolver on port 53 (DNS over TCP, RFC 7766, which every
+// recursive resolver answers; it needs no UDP in `host_net`). The resolver
+// comes from the caller or from /etc/resolv.conf; the message id is random
+// (`net_random`). Only A records, no search domains, no cache, no DNSSEC; the
+// answer is as trustworthy as the path to the resolver (HTTPS authenticates
+// the server whatever address the lookup gave).
+import "../core/bytes.bastio";
+import "../core/dns.bastio";
+import "../core/text.bastio";
+import "net.bastio";
+import "host.bastio";
+
+/// Internal: sends the query `q` (id `id`) over `sock` and reads the length
+/// -prefixed response, up to 64 KiB. The address in the answer, 0 if there
+/// is none or anything fails.
+fn dns_exchange(h: &Host, sock: u64, id: u64, q: &Bytes) -> u64
+  requires blen(q) <= 512 && id < 65536
+{
+  let mut t = text_new();
+  text_push(&mut t, cast[u8](blen(q) / 256));
+  text_push(&mut t, cast[u8](blen(q) % 256));
+  text_push_bytes(&mut t, q);
+  let frame = text_finish(t);
+  let sent = net_send_all(h, sock, frame);
+  bfree(frame);
+  if !sent { return 0; }
+  let mut acc = text_new();
+  let mut buf = balloc(0);
+  let mut rounds = 0;
+  let mut alive = true;
+  let mut done = false;
+  while alive && !done && rounds < 64
+    invariant rounds <= 64 && vlen(acc) < 70000
+  {
+    match net_recv(h, sock, 4096, &mut buf) {
+      Option::None => { alive = false; },
+      Option::Some(n) => {
+        if n == 0 || blen(buf) > 4096 || vec_len(acc) + blen(buf) > 69000 {
+          alive = false;
+        } else {
+          text_push_bytes(&mut acc, buf);
+          if vec_len(acc) >= 2 {
+            let want = 2 + cast[u64](vec_get(acc, 0)) * 256 + cast[u64](vec_get(acc, 1));
+            if vec_len(acc) >= want { done = true; }
+          }
+        }
+      },
+    }
+    rounds = rounds + 1;
+  }
+  bfree(buf);
+  let mut ip = 0;
+  let all = text_to_bytes(acc);
+  if done && blen(all) >= 2 {
+    let want = 2 + cast[u64](bget(all, 0)) * 256 + cast[u64](bget(all, 1));
+    if want <= blen(all) {
+      let msg = bytes_slice(all, 2, want);
+      match dns_parse_a(msg, id) {
+        Option::Some(a) => { ip = a; },
+        Option::None => {},
+      }
+      bfree(msg);
+    }
+  }
+  bfree(all);
+  vec_free(acc);
+  return ip;
+}
+
+/// The IPv4 address (as `net_ip4` makes it) of the host `name`, asked of the
+/// resolver at `resolver` (port 53, over TCP): `None` if `name` is not a
+/// valid host name, nothing answers, or the answer holds no A record.
+/// ```
+/// // Nothing listens on port 53 of the loopback in the test setup (or it
+/// // does not know this name): either way no address comes back.
+/// let name = bfrom("no-such-host.invalid");
+/// let mut bad = 0;
+/// match dns_lookup_via(host, net_ip4(127, 0, 0, 1), name) {
+///   Option::Some(ip) => { bad = 1; },
+///   Option::None => {},
+/// }
+/// bfree(name);
+/// if bad != 0 { return 1; }
+/// ```
+fn dns_lookup_via(h: &Host, resolver: u64, name: &Bytes) -> Option[u64] {
+  return dns_lookup_at(h, resolver, 53, name);
+}
+
+/// `dns_lookup_via` for a resolver that listens on `port`.
+/// ```
+/// let name = bfrom("no-such-host.invalid");
+/// let mut bad = 0;
+/// match dns_lookup_at(host, net_ip4(127, 0, 0, 1), 1, name) {
+///   Option::Some(ip) => { bad = 1; },
+///   Option::None => {},
+/// }
+/// bfree(name);
+/// if bad != 0 { return 1; }
+/// ```
+fn dns_lookup_at(h: &Host, resolver: u64, port: u64, name: &Bytes) -> Option[u64] {
+  match net_random(h, 2) {
+    Option::None => { return Option[u64]::None; },
+    Option::Some(r) => {
+      let id = cast[u64](bget(r, 0)) * 256 + cast[u64](bget(r, 1));
+      bfree(r);
+      match dns_query(name, id) {
+        Option::None => { return Option[u64]::None; },
+        Option::Some(q) => {
+          if blen(q) > 512 {
+            bfree(q);
+            return Option[u64]::None;
+          }
+          match net_connect(h, resolver, port) {
+            Option::None => { bfree(q); return Option[u64]::None; },
+            Option::Some(sock) => {
+              let ip = dns_exchange(h, sock, id, q);
+              net_close(h, sock);
+              bfree(q);
+              if ip == 0 { return Option[u64]::None; }
+              return Option[u64]::Some(ip);
+            },
+          }
+        },
+      }
+    },
+  }
+}
+
+/// The first IPv4 nameserver of /etc/resolv.conf, if the file is there and
+/// has one.
+/// ```
+/// // Either a nameserver is listed or the file has none; both are fine.
+/// match dns_system_resolver(host) {
+///   Option::Some(ip) => { if ip == 0 { return 1; } },
+///   Option::None => {},
+/// }
+/// ```
+fn dns_system_resolver(h: &Host) -> Option[u64] {
+  match read_file_str(h, "/etc/resolv.conf") {
+    Option::None => { return Option[u64]::None; },
+    Option::Some(t) => {
+      let r = dns_resolv_conf(t);
+      bfree(t);
+      return r;
+    },
+  }
+}
+
+/// The IPv4 address of the host `name` from the system's resolver (see
+/// `dns_system_resolver`). A name that is a dotted-quad address is returned
+/// as it is, without a lookup.
+/// ```
+/// let lo = bfrom("127.0.0.1");
+/// let mut bad = 1;
+/// match dns_lookup(host, lo) {
+///   Option::Some(ip) => { if ip == 2130706433 { bad = 0; } },
+///   Option::None => {},
+/// }
+/// bfree(lo);
+/// if bad != 0 { return 1; }
+/// ```
+fn dns_lookup(h: &Host, name: &Bytes) -> Option[u64] {
+  match dns_dotted(name, 0, blen(name)) {
+    Option::Some(ip) => { return Option[u64]::Some(ip); },
+    Option::None => {},
+  }
+  match dns_system_resolver(h) {
+    Option::None => { return Option[u64]::None; },
+    Option::Some(resolver) => { return dns_lookup_via(h, resolver, name); },
+  }
+}

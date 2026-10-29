@@ -1,0 +1,190 @@
+// expect-exit: 0
+// core/dns: the queries are the ones dnspython writes (several names, the
+// longest legal one, a trailing dot), bad names are refused, and responses made
+// by dnspython (an answer with two addresses, a CNAME before the address, name
+// error, truncated, no answer, a wrong id) and every too-short prefix of them
+// are read as they should be.
+import "core/dns.bastio";
+
+/// The value of the hex digit `c` (0 for anything else).
+fn nib(c: u8) -> u8
+  ensures result < 16
+{
+  if c >= 48 && c <= 57 { return c - 48; }
+  if c >= 97 && c <= 102 { return c - 87; }
+  return 0;
+}
+
+/// The bytes written as hex digits in `s`.
+fn unhex(s: Str) -> Bytes
+  requires slen(s) < 100000
+  ensures blen(result) == slen(s) / 2
+{
+  let n = slen(s) / 2;
+  let mut b = balloc(n);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && blen(b) == n && slen(s) >= 2 * n
+  {
+    bset(&mut b, i, nib(sget(s, 2 * i)) * 16 + nib(sget(s, 2 * i + 1)));
+    i = i + 1;
+  }
+  return b;
+}
+
+
+/// 1 unless the query for `name` with `id` is the hex string `want`.
+fn query_is(name: Str, id: u64, want: Str) -> u64
+  requires slen(name) < 1000 && id < 65536 && slen(want) < 100000
+  ensures result <= 1
+{
+  let nb = bfrom(name);
+  let w = unhex(want);
+  let mut bad = 1;
+  match dns_query(nb, id) {
+    Option::Some(q) => {
+      if bytes_eq(q, w) { bad = 0; }
+      bfree(q);
+    },
+    Option::None => {},
+  }
+  bfree(w);
+  bfree(nb);
+  return bad;
+}
+
+/// 1 unless `name` is refused.
+fn query_refused(name: Str) -> u64
+  requires slen(name) < 1000
+  ensures result <= 1
+{
+  let nb = bfrom(name);
+  let mut bad = 0;
+  match dns_query(nb, 1) {
+    Option::Some(q) => { bfree(q); bad = 1; },
+    Option::None => {},
+  }
+  bfree(nb);
+  return bad;
+}
+
+/// 1 unless the response in hex `s` with id `id` gives the address `ip` (or none, if `ip` is 0).
+fn reads(s: Str, id: u64, ip: u64) -> u64
+  requires slen(s) < 100000
+  ensures result <= 1
+{
+  let m = unhex(s);
+  let mut bad = 1;
+  match dns_parse_a(m, id) {
+    Option::Some(got) => { if got == ip { bad = 0; } },
+    Option::None => { if ip == 0 { bad = 0; } },
+  }
+  bfree(m);
+  return bad;
+}
+
+/// The number of prefixes of the response `s` (hex) shorter than `limit` bytes that are accepted.
+fn short_prefixes(s: Str, id: u64, limit: u64) -> u64
+  requires slen(s) < 100000 && limit <= slen(s) / 2
+  ensures result <= limit
+{
+  let m = unhex(s);
+  let mut bad = 0;
+  let mut n = 0;
+  while n < limit
+    invariant n <= limit && bad <= n && blen(m) == slen(s) / 2 && limit <= blen(m)
+  {
+    let p = bytes_slice(m, 0, n);
+    match dns_parse_a(p, id) {
+      Option::Some(got) => { bad = bad + 1; },
+      Option::None => {},
+    }
+    bfree(p);
+    n = n + 1;
+  }
+  bfree(m);
+  return bad;
+}
+
+fn queries() -> u64
+  ensures result <= 6
+{
+  return query_is("example.com", 4660, "123401000001000000000000076578616d706c6503636f6d0000010001") +
+    query_is("a.b", 1, "000101000001000000000000016101620000010001") +
+    query_is("localhost", 65535, "ffff01000001000000000000096c6f63616c686f73740000010001") +
+    query_is("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.y", 7, "0007010000010000000000003f78787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787801790000010001") +
+    query_is("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 9, "000901000001000000000000316161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616131616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161613161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161316161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616131616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161610000010001") +
+    query_is("a.b.", 1, "000101000001000000000000016101620000010001");
+}
+
+fn refusals() -> u64
+  ensures result <= 7
+{
+  return query_refused("") +
+    query_refused(".") +
+    query_refused("a..b") +
+    query_refused(".a") +
+    query_refused("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.b") +
+    query_refused("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") +
+    query_refused("a b..c");
+}
+
+fn responses() -> u64
+  ensures result <= 11
+{
+  return reads("123481800001000200000000076578616d706c6503636f6d0000010001c00c000100010000003c00045db8d822c00c000100010000003c000401020304", 4660, 1572395042) +
+    reads("123481800001000200000000076578616d706c6503636f6d0000010001c00c000100010000003c00045db8d822c00c000100010000003c000401020304", 4661, 0) +
+    reads("012c8180000100020000000003777777076578616d706c6503636f6d0000010001c00c000500010000003c0002c010c010000100010000003c00040a000007", 300, 167772167) +
+    reads("000581830001000000000000026e78076578616d706c6503636f6d0000010001", 5, 0) +
+    reads("000683800001000100000000076578616d706c6503636f6d0000010001c00c000100010000003c000401010101", 6, 0) +
+    reads("000881800001000000000000076578616d706c6503636f6d0000010001", 8, 0) +
+    reads("", 0, 0) +
+    reads("123401800001000200000000076578616d706c6503636f6d0000010001c00c000100010000003c00045db8d822c00c000100010000003c000401020304", 4660, 0) +
+    reads("123481800002000200000000076578616d706c6503636f6d0000010001c00c000100010000003c00045db8d822c00c000100010000003c000401020304", 4660, 0) +
+    reads("123481800001000200000000416578616d706c6503636f6d0000010001c00c000100010000003c00045db8d822c00c000100010000003c000401020304", 4660, 0) +
+    reads("123481020001000200000000076578616d706c6503636f6d0000010001c00c000100010000003c00045db8d822c00c000100010000003c000401020304", 4660, 0);
+}
+
+fn prefixes() -> u64
+  ensures result <= 108
+{
+  return short_prefixes("123481800001000200000000076578616d706c6503636f6d0000010001c00c000100010000003c00045db8d822c00c000100010000003c000401020304", 4660, 45) +
+    short_prefixes("012c8180000100020000000003777777076578616d706c6503636f6d0000010001c00c000500010000003c0002c010c010000100010000003c00040a000007", 300, 63);
+}
+
+/// 1 unless the first nameserver of the resolv.conf text `s` is `ip` (none if `ip` is 0).
+fn resolv(s: Str, ip: u64) -> u64
+  ensures result <= 1
+{
+  let t = bfrom(s);
+  let mut bad = 1;
+  match dns_resolv_conf(t) {
+    Option::Some(got) => { if got == ip { bad = 0; } },
+    Option::None => { if ip == 0 { bad = 0; } },
+  }
+  bfree(t);
+  return bad;
+}
+
+fn resolvs() -> u64
+  ensures result <= 12
+{
+  return resolv("nameserver 10.0.2.3\n", 167772675) +
+    resolv("nameserver 10.0.2.3", 167772675) +
+    resolv("search lan\n# nameserver 1.1.1.1\nnameserver\t8.8.4.4  \n", 134743044) +
+    resolv("nameserver 192.168.1.1# router\r\nnameserver 8.8.8.8\n", 3232235777) +
+    resolv("nameserver ::1\nnameserver 1.2.3.4\n", 16909060) +
+    resolv("nameserver 255.255.255.255\n", 4294967295) +
+    resolv("nameserver 256.1.1.1\n", 0) +
+    resolv("nameserver 1.2.3\n", 0) +
+    resolv("nameserver 1.2.3.4.5\n", 0) +
+    resolv("nameserver1.2.3.4\n", 0) +
+    resolv("nameserver 1..2.3\n", 0) +
+    resolv("", 0);
+}
+
+fn main() -> u64 {
+  let bad = queries() + refusals() + responses() + prefixes() + resolvs();
+  if bad > 0 { return 1; }
+  return 0;
+}

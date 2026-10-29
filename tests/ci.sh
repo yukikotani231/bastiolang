@@ -38,6 +38,7 @@ if command -v z3 >/dev/null; then
   step "tests/as86.sh";      tests/as86.sh
   step "tests/elfobj.sh";    tests/elfobj.sh
   if command -v openssl >/dev/null; then step "tests/tls.sh"; tests/tls.sh; else skipped+=("tests/tls.sh (needs openssl)"); fi
+  if command -v python3 >/dev/null; then step "tests/dns.sh"; tests/dns.sh; else skipped+=("tests/dns.sh (needs python3)"); fi
   if command -v node >/dev/null; then step "tests/wasm.sh";      tests/wasm.sh; step "tests/wasm_lib.sh";  tests/wasm_lib.sh; else skipped+=("tests/wasm.sh (needs node)"); fi
   step "tests/as64.sh";      tests/as64.sh
   step "tests/macho.sh";     tests/macho.sh

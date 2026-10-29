@@ -1,0 +1,85 @@
+// stage1-only: host_net (sockets), core/dns
+// Looks up the IPv4 address of a host name and prints it.
+//
+//   lookup NAME             the system's resolver (/etc/resolv.conf)
+//   lookup NAME PORT        a resolver on 127.0.0.1:PORT (for tests)
+//   lookup                  a check that needs no network
+//
+// A name that is a dotted-quad address is printed as it is. It exits with 0
+// if an address was found, 1 if not, 2 for a bad command line. With no
+// arguments it checks a query it makes and an address it takes as given.
+//
+// What the compiler proves: the query and the reading of the answer are in
+// bounds and leak nothing, whatever the resolver sends (core/dns).
+import "core/dns.bastio";
+import "core/num.bastio";
+import "core/print.bastio";
+import "std/dns.bastio";
+import "std/host.bastio";
+import "std/net.bastio";
+
+fn show(con: &mut Serial, ip: u64) {
+  print_u64(con, (ip / 16777216) % 256);
+  print_str(con, ".");
+  print_u64(con, (ip / 65536) % 256);
+  print_str(con, ".");
+  print_u64(con, (ip / 256) % 256);
+  print_str(con, ".");
+  print_u64(con, ip % 256);
+  print_str(con, "\n");
+}
+
+fn selfcheck(con: &mut Serial, h: &Host) -> u64 {
+  let name = bfrom("a.bc");
+  let mut ok = false;
+  match dns_query(name, 4660) {
+    Option::Some(q) => {
+      ok = blen(q) == 12 + 1 + 1 + 1 + 2 + 1 + 4 && bget(q, 0) == 18 && bget(q, 1) == 52;
+      bfree(q);
+    },
+    Option::None => {},
+  }
+  bfree(name);
+  let quad = bfrom("1.2.3.4");
+  match dns_lookup(h, quad) {
+    Option::Some(ip) => { ok = ok && ip == 16909060; },
+    Option::None => { ok = false; },
+  }
+  bfree(quad);
+  if ok {
+    print_str(con, "ok\n");
+    return 0;
+  }
+  print_str(con, "self-check failed\n");
+  return 1;
+}
+
+fn main(con: &mut Serial, h: &mut Host) -> u64 {
+  if host_argc(h) == 1 {
+    return selfcheck(&mut con, h);
+  }
+  if host_argc(h) != 2 && host_argc(h) != 3 {
+    print_str(con, "usage: lookup NAME [PORT]\n");
+    return 2;
+  }
+  let name = host_arg(h, 1);
+  let mut found = Option[u64]::None;
+  if host_argc(h) == 3 {
+    let a_port = host_arg(h, 2);
+    let port = opt_or[u64](parse_u64(a_port, 0, blen(a_port)), 0);
+    bfree(a_port);
+    if port == 0 {
+      bfree(name);
+      print_str(con, "usage: lookup NAME [PORT]\n");
+      return 2;
+    }
+    found = dns_lookup_at(h, net_ip4(127, 0, 0, 1), port, name);
+  } else {
+    found = dns_lookup(h, name);
+  }
+  bfree(name);
+  match found {
+    Option::Some(ip) => { show(&mut con, ip); return 0; },
+    Option::None => { print_str(con, "not found\n"); return 1; },
+  }
+}

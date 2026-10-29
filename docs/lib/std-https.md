@@ -7,11 +7,12 @@ hosted target: core/tls13client over the sockets of std/net.bastio. The
 server is authenticated against the roots the caller trusts (DER
 certificates one after the other, as `host_read` gives a file of them),
 and the random bytes and the time come from the system (`net_random`,
-`net_now`). One suite (TLS_CHACHA20_POLY1305_SHA256 with X25519), servers
-by IPv4 address (there is no name lookup), no client certificates and no
-resumption; see core/tls13client.bastio for what is checked and what is not.
+`net_now`). Two suites (TLS_AES_128_GCM_SHA256 and
+TLS_CHACHA20_POLY1305_SHA256, with X25519), servers by IPv4 address or, with
+`https_get_by_name`, by a name looked up through std/dns, no client
+certificates and no resumption; see core/tls13client.bastio for what is checked and what is not.
 
-`import "std/https.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/text.bastio](core-text.md), [core/endian.bastio](core-endian.md), [core/sha256.bastio](core-sha256.md), [core/hkdf.bastio](core-hkdf.md), [core/tls13.bastio](core-tls13.md), [core/tls13hs.bastio](core-tls13hs.md), [core/aes.bastio](core-aes.md), [core/aesgcm.bastio](core-aesgcm.md), [core/chacha20.bastio](core-chacha20.md), [core/poly1305.bastio](core-poly1305.md), [core/chacha20poly1305.bastio](core-chacha20poly1305.md), [core/tls13record.bastio](core-tls13record.md), [core/x25519.bastio](core-x25519.md), [core/der.bastio](core-der.md), [core/sha512.bastio](core-sha512.md), [core/ed25519.bastio](core-ed25519.md), [core/p256.bastio](core-p256.md), [core/rsa.bastio](core-rsa.md), [core/x509.bastio](core-x509.md), [core/tls13client.bastio](core-tls13client.md), [std/net.bastio](std-net.md).
+`import "std/https.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/text.bastio](core-text.md), [core/endian.bastio](core-endian.md), [core/sha256.bastio](core-sha256.md), [core/hkdf.bastio](core-hkdf.md), [core/tls13.bastio](core-tls13.md), [core/tls13hs.bastio](core-tls13hs.md), [core/aes.bastio](core-aes.md), [core/aesgcm.bastio](core-aesgcm.md), [core/chacha20.bastio](core-chacha20.md), [core/poly1305.bastio](core-poly1305.md), [core/chacha20poly1305.bastio](core-chacha20poly1305.md), [core/tls13record.bastio](core-tls13record.md), [core/x25519.bastio](core-x25519.md), [core/der.bastio](core-der.md), [core/sha512.bastio](core-sha512.md), [core/ed25519.bastio](core-ed25519.md), [core/p256.bastio](core-p256.md), [core/rsa.bastio](core-rsa.md), [core/x509.bastio](core-x509.md), [core/tls13client.bastio](core-tls13client.md), [core/dns.bastio](core-dns.md), [std/net.bastio](std-net.md), [std/host.bastio](std-host.md), [std/dns.bastio](std-dns.md).
 
 | Function | |
 | --- | --- |
@@ -19,6 +20,7 @@ resumption; see core/tls13client.bastio for what is checked and what is not.
 | [`https_result_free`](#https_result_free) | Frees a result (see `https_run`). |
 | [`https_request`](#https_request) | Connects to `ip`:`port`, runs a TLS exchange with the server `name` (see `https_run`) and returns what the server sent after `request`, if it ended with a close_notify (a connection that is cut off, which could hide a truncated answer, gives `None`, as does any failure of the handshake). |
 | [`https_get`](#https_get) | A `GET` of `path` on the server `name` over HTTPS (HTTP/1.0 with the connection closed after the answer). |
+| [`https_get_by_name`](#https_get_by_name) | `https_get` for a server given by `name`, whose address comes from the system's resolver (std/dns; a name that is a dotted-quad address is used as it is). |
 
 Every example below is built, verified and run by `tests/run.sh`. An `assert` in one is proved at compile time from the contracts above it.
 
@@ -149,6 +151,35 @@ let path = bfrom("/");
 let roots = balloc(0);
 let mut bad = 0;
 match https_get(host, net_ip4(127, 0, 0, 1), 1, name, path, roots) {
+  Option::Some(r) => { bfree(r); bad = 1; },
+  Option::None => {},
+}
+bfree(roots);
+bfree(path);
+bfree(name);
+if bad != 0 { return 1; }
+```
+
+### `https_get_by_name`
+
+```bastio
+fn https_get_by_name(h: &Host, name: &Bytes, port: u64, path: &Bytes, roots: &Bytes) -> Option[Bytes]
+  requires blen(name) <= 255 && blen(path) < 65536 && blen(roots) < 274877906944
+```
+
+`https_get` for a server given by `name`, whose address comes from the
+system's resolver (std/dns; a name that is a dotted-quad address is used as
+it is). `None` if the name does not resolve or the exchange fails.
+
+Example:
+
+```bastio
+// Nothing listens on port 1 of the loopback.
+let name = bfrom("127.0.0.1");
+let path = bfrom("/");
+let roots = balloc(0);
+let mut bad = 0;
+match https_get_by_name(host, name, 1, path, roots) {
   Option::Some(r) => { bfree(r); bad = 1; },
   Option::None => {},
 }
