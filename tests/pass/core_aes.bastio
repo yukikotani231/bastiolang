@@ -1,0 +1,104 @@
+// expect-exit: 0
+// core/aes: AES-128 of the FIPS 197 examples (appendix B and C.1) and of 62 more blocks and keys,
+// made by OpenSSL (Python's `cryptography`).
+import "core/aes.bastio";
+
+/// The value of the hex digit `c` (0 for anything else).
+fn nib(c: u8) -> u8
+  ensures result < 16
+{
+  if c >= 48 && c <= 57 { return c - 48; }
+  if c >= 97 && c <= 102 { return c - 87; }
+  return 0;
+}
+
+/// The bytes written as hex digits in `s`.
+fn unhex(s: Str) -> Bytes
+  requires slen(s) < 100000
+  ensures blen(result) == slen(s) / 2
+{
+  let n = slen(s) / 2;
+  let mut b = balloc(n);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && blen(b) == n && slen(s) >= 2 * n
+  {
+    bset(&mut b, i, nib(sget(s, 2 * i)) * 16 + nib(sget(s, 2 * i + 1)));
+    i = i + 1;
+  }
+  return b;
+}
+
+/// 0 if AES-128 of `block` under `key` (hex) is `want` (hex), else 1.
+fn check(key: Str, block: Str, want: Str) -> u64
+  requires slen(key) == 32 && slen(block) == 32 && slen(want) == 32
+  ensures result <= 1
+{
+  let k = unhex(key);
+  let b = unhex(block);
+  let w = unhex(want);
+  let a = aes128_new(k);
+  let out = aes128_encrypt(a, b);
+  let mut bad = 1;
+  if bytes_eq(out, w) { bad = 0; }
+  bfree(out);
+  aes128_free(a);
+  bfree(w);
+  bfree(b);
+  bfree(k);
+  return bad;
+}
+
+fn group0() -> u64
+  ensures result <= 8
+{
+  return check("000102030405060708090a0b0c0d0e0f", "00112233445566778899aabbccddeeff", "69c4e0d86a7b0430d8cdb78070b4c55a") + check("00000000000000000000000000000000", "00000000000000000000000000000000", "66e94bd4ef8a2c3b884cfa59ca342b2e") + check("ffffffffffffffffffffffffffffffff", "ffffffffffffffffffffffffffffffff", "bcbf217cb280cf30b2517052193ab979") + check("2b7e151628aed2a6abf7158809cf4f3c", "3243f6a8885a308d313198a2e0370734", "3925841d02dc09fbdc118597196a0b32") + check("a407367b4867cabc6116e34551a45c7a", "80225ad9ac57e26a454af32acaa9991f", "45db38d170d48788a3010c43213fae56") + check("717695c3f1b40d0eb4dbd0fea32579c4", "a1390e8d681990fb4827bd43cf6aa9f1", "ab86788ec23eef7ca058bced56a22de5") + check("327bad7c56af663db3ccbdd6cc698cd1", "b63561f5c92125c493a42e82136b099c", "56ba6b4ca655d314b69d09383f81ce76") + check("523c4c4b8d590dfa93894de273c6b782", "df73f3c899aaf9f61ced95fbb4170e35", "98f0f6c69797ef1d89d9282b0e4dd3a4");
+}
+
+fn group1() -> u64
+  ensures result <= 8
+{
+  return check("7e46f348912aac050f5cabb60c5ffeaf", "082254076f7d347eef240cf79b92362d", "582ef34508fe99637a25bdd984aca552") + check("fb6389a0e4d24464609af6a9a7238588", "6672eea05e17e7c72aeb33132ed3aea9", "0aa01567cd26442a7a06d6e23adcd5d3") + check("0f17530aef5eece412f6dd952b58ebe0", "87d7574bbd91d61b585ca3a89aa72518", "987db2378c8ee2969f89ca8b9090af32") + check("657d4445ab159fe5bd1f8acc231b27f1", "b64306117ab14454e5724dbe3d50544e", "da7eb3a4b621d4d72d30fe0f002f0e26") + check("e9251e89a6bb888aa52d682cd8a46680", "e401fb7a6ccc7364c86bc96deafa90e6", "6b93848d6c0c15fec09ca1273634e034") + check("6b44e0e09238c3b38303ff8be32c4880", "5d1facd89e42113c4c3ae374c90fd887", "7a133bb01839a5a62522965e4276fa97") + check("fcbbb23eee5b8bb53a9bacfdde875909", "5229056901e5f11cc44b032ccf6f769e", "461911c14480755f3fa89c149d3dc0c4") + check("49c6c9f7de1a8f4004152d3f52e98726", "63994cbc21f40593cf7847a12ad80250", "670b75b4665d9a15ced53227300f0778");
+}
+
+fn group2() -> u64
+  ensures result <= 8
+{
+  return check("83059e82027daf74086f4bcb2f0449c6", "52ccd6cc9d5e216665acd6d018191042", "eec871ce86a8730c249584e828b39406") + check("90724dc5e5b2adf255dd04ced651d7c8", "e42533b0f8f93aa76e79f6d9faf6129c", "a9843cafef1a8373c408a5f4331aa09c") + check("48d9f87abaa09641e70fbc828bd0961b", "664eb0f4f85c8c542439a9359011ad34", "0e290d2407d2df91504186730a008564") + check("c99172acb7b4640718919115b1998cd7", "b5f353fba646148d8fc20cac7711f748", "bc970e71ed008778880f3490194a9aaf") + check("7118c0eddefb167440b30d6c2d910b74", "c9b00169cb5ab72d8c815f3db0c7c067", "3184d4f26fe24551f139a9253592292a") + check("f03a36bb6c28033232a0690d230c9fb7", "00fd529cc1d7c227fc40dfa901467edc", "ee0b20f21d6b8c53ca3041fcefa1ca1b") + check("417fb84bac8a171b7a982cbb30d0c9ce", "90a8b619b3ba2b38206dc83fa7cd0362", "e097cd344763c29a0a31b32212f401a1") + check("15b82bfe61baa06b18d1842214a2d42e", "2a9db67716c63fd6aaae524ffe725556", "fa05da74d7351f75f682d3e2f364ef25");
+}
+
+fn group3() -> u64
+  ensures result <= 8
+{
+  return check("3564049454f8204ac5657c26b885d9ac", "d57ceee6aec278b27e6868da0dbad08c", "b53c2d8b53d194f3cd3417a81ad0aa2a") + check("e7f1f1827649e844c0fc449aedfdce8b", "e58d1c80f798662a7c05e3c6a365d9ef", "db34b84142d3538ba4495b01f152bc82") + check("a78937b89645ecaf1783e8d26c24a6bf", "e2127c7a9dc225db1b90a5b9966d6ce1", "c86fb9c158e84d4c82ab2fff5c2931c5") + check("b48e376fa8cfb2433e187836ac3e3e5d", "79b996ad34733ef751ac673b6abb105f", "478da684753ea8cc1b41a12af28df627") + check("53bbb970ba7107bca2b2579d172c9b2e", "2dd7dddc43d4ad2dd015ddf1dc06b143", "c43a1c9313e70a3fd5a326e7e145cb39") + check("ed570fb629456978597e94867fbfe611", "2c6e9bf651412563258c87e4a3d01fe8", "1481fc1040b217b8d7cd5d863d27250a") + check("05dc0e1b87940d564707bf310520bfc5", "16eb52b3cfd8e1dada89d4eb887aed79", "7b0ea2d5fc170679cddafb2e5e312966") + check("e07cf5b9c968f07d78abf60dedcc180e", "209d520e107fe379148a1a37e633aec7", "28c14b648cc3cc8dd3d3c4bfc3b49081");
+}
+
+fn group4() -> u64
+  ensures result <= 8
+{
+  return check("d27d0fa9ac9db955b6d9c2a241d23562", "d01725f26ef7e3a526ab58954571e7a6", "affe7e713d9dc4f9ad86fb4bc42e821f") + check("9507b3ebad54aba62cb0bba77756c767", "a841247c25a77b867b5820118d23b3dd", "a63fd30ad78db349dd42d5430a707d30") + check("b1742fafe09042a1b521098fef978a9c", "ecd5ee29ef2a8d734b11bf69f233b34f", "c3da5458a67e93b2d5993b1b0b51c535") + check("bb505b8d6f95b0775e5bebba864278e6", "fe1cb84560aa4f71b99f299775510869", "74491dd04e6aecb3381b9681e0e2f1d3") + check("20a7a161b55f6f4e1038b3fc0010ddf1", "450052da793e7d7c8c65e558f6b9448b", "6c15ea2be70f420df2a9eb4a2aa08caa") + check("2e4ea6602e8d599adeac52efac81cf48", "c9706b56eb9664a0f86fb78da9d98be4", "d83751d2576a05e3b9c30750bb604c46") + check("3d04c214c592b37ff92428e862bb50f4", "84b22f200fbee1cc262d7d402bedef15", "bb1e271af0a93d7a9414473d0f116b42") + check("e6e3a51170b3b25ae704439a4d6732a4", "44d384ee19701d626c4aa26657612dab", "bd43dbce18317a234f6992ee8e16dd23");
+}
+
+fn group5() -> u64
+  ensures result <= 8
+{
+  return check("054d292139adb437df28c745caaa2a03", "96e2e7e6c771e6cae3a7841f25ac1931", "14965ac8e500e0648d467564f08ee1c7") + check("23cdb7b3861c15b283bd79abbe1c17c2", "6dfb28c0b39a24503bf2c8d57182a1d1", "4d21b055de2f33b6a8435b3d3ff9985c") + check("c8aec7c56947c6bb8b76ce1f4df21ed7", "d58b5f917b81359cea27bf5e9e381dda", "1f6fa6d4055c0a4e8f6d17dace036c10") + check("6c19d276acddf903af7b0892e1bb90aa", "c6c6dd55d4b5fcdd187a991f5ff4dc35", "53b8d11013fbd0eaeb438aa8bd3c1b0f") + check("eebbf3dc8160c7b18f0ae17aef15bc42", "24b3e067645cf91ac47d3350ed73d3ad", "454f0f7d9d494ac0a445cbfbfeba845a") + check("4112dff8b873735704b05db9de3a6144", "b6e4fffd9c5793516c7d3765e8a637f7", "5c54f1b23f2992cba723d919bd71c4d1") + check("1674e55bdb522ec8dae824caaa1922e8", "28a0ce30032aecfa6829a9a9a3058af1", "adb27156451b49c849b4fbee3d3deacb") + check("4167cb8786b115a7372bf34a70f76eb8", "f388d2a399cdb5d48c7e126715342689", "02f9d5119261a084624823a5e3f4ae2b");
+}
+
+fn group6() -> u64
+  ensures result <= 8
+{
+  return check("475943efde452735cfa87f4d6d8f6d46", "209088a0a7e6d06e8c56316175043806", "5705f407ecb9bd5fef7acddcc1921f20") + check("fdbf2313f5b27abea106ef2a38bcd4ca", "2180766a363111c6799de39be0e402d6", "9bd138a17953850187a1d263aec529a0") + check("47e7d393b90ab29ae0c41757cc530017", "8990aa094e48190724cb5f2ba06e45d7", "7c6327fe5f3d5bf39f5825ffadc71558") + check("c5a250e431f0f005841a25b43f451ac5", "6a05e5fdcca6e04a88811ee43985e8f7", "de7f6d0f081bc84db586a4efa22df814") + check("9e097146a1d04c3d83ede01287f0a777", "7839d6d5051ed2100bca7bbb83bbc3b2", "28e1ae8f574109b9aacb3e60010ad2fc") + check("ac778b814086366f422e4ec5133c0647", "95a1bd9f711cb94eb7bb477eb5bb0ed9", "baf42024fa56f387a59f56871a56dc23") + check("9c82451a92ae84764d64f37838784a7b", "311377b82209a059fac5b9a5e0443b18", "b4d4cfff49a8bbf3551a3cef24b5d4a3") + check("04c0d654df8d04a09e64a97f28bbf1aa", "b920ace3aac0e3068c32f093b1daa321", "f6cf4ea7b8b102521db7b317368e503b");
+}
+
+fn group7() -> u64
+  ensures result <= 8
+{
+  return check("b4993085e94275dd8cbe117db563b649", "7354c80b51e30558ad1a25ca563933ec", "890b80433f2660ff33b48a138bbb054b") + check("d58ff8bc651b7fab1a150f0eb76a3b34", "79441777c77c887f38472c8361700605", "54b903a1eaa4c830fd063564d0c0c9f0") + check("ef04cccad4f04ffffb9fee651d65207f", "ca79219c1c880f1b3642c958ef2f264e", "a62c3ede1908b81aaa68bb8211177eb0") + check("b0f26461f0a1ac05ef0ca220ca4f4847", "8bfb88c6f12df06dca2e0d4e2b136460", "ba51867b7c2e9939126ea6bd5e22e3e3") + check("79aa9c40de6317fcdf4a78a5db33f3dc", "6c0e861111c631f160e48d7f25d520be", "8c8006557e6668ea8edfb326959b7930") + check("11a6be582f5beae34749e0269e259e4e", "1112106879e7edc68f5a924136e0ec6c", "3e634e8a4da3a7d4ac9a5a57e60950dd") + check("c146dd7f18cbebbb35cb1c859ff07b17", "7d507b8d19f39c2aabfbe0b39848032d", "8904c750669282a325acf40491263c2e") + check("f111eed2c8faf3e4f509cf5a5c2b676c", "a15fa40bd871e1bf43ba0d4da704ea66", "d55ea3a8cca61db049c2a033f6913729");
+}
+
+fn main() -> u64 {
+  let total = group0() + group1() + group2() + group3() + group4() + group5() + group6() + group7();
+  if total != 0 { return 1; }
+  return 0;
+}

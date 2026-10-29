@@ -138,7 +138,8 @@ fn tls13_client_hello(random: &Bytes, session_id: &Bytes, server_name: &Bytes, k
   text_push_bytes(&mut t, random);
   text_push(&mut t, 32);
   text_push_bytes(&mut t, session_id);
-  tls13_push_u16(&mut t, 2);
+  tls13_push_u16(&mut t, 4);
+  tls13_push_u16(&mut t, 4865);
   tls13_push_u16(&mut t, 4867);
   text_push(&mut t, 1);
   text_push(&mut t, 0);
@@ -203,7 +204,7 @@ fn tls13_parse_server_hello(msg: &Bytes) -> Option[Bytes]
   let sid = cast[u64](bget(msg, 38));
   let at = 39 + sid;
   if at + 5 + 2 > n { return Option[Bytes]::None; }
-  if load_be16(msg, at) != 4867 { return Option[Bytes]::None; }
+  if load_be16(msg, at) != 4867 && load_be16(msg, at) != 4865 { return Option[Bytes]::None; }
   if bget(msg, at + 2) != 0 { return Option[Bytes]::None; }
   let ext_len = cast[u64](load_be16(msg, at + 3));
   let mut p = at + 5;
@@ -240,6 +241,29 @@ fn tls13_parse_server_hello(msg: &Bytes) -> Option[Bytes]
   if have_version && have_key { return Option[Bytes]::Some(share); }
   bfree(share);
   return Option[Bytes]::None;
+}
+
+/// The cipher suite a ServerHello `msg` chose: 4865 (TLS_AES_128_GCM_SHA256,
+/// 0x1301) or 4867 (TLS_CHACHA20_POLY1305_SHA256, 0x1303), or 0 when the
+/// message is too short to hold one or names another.
+/// ```
+/// let msg = balloc(60);
+/// let s = tls13_server_hello_suite(msg);
+/// bfree(msg);
+/// if s != 0 { return 1; }
+/// ```
+fn tls13_server_hello_suite(msg: &Bytes) -> u64
+  requires blen(msg) < 274877906944
+  ensures result == 0 || result == 4865 || result == 4867
+{
+  let n = blen(msg);
+  if n < 48 || n > 70000 { return 0; }
+  let sid = cast[u64](bget(msg, 38));
+  let at = 39 + sid;
+  if at + 2 > n { return 0; }
+  let s = cast[u64](load_be16(msg, at));
+  if s == 4865 || s == 4867 { return s; }
+  return 0;
 }
 
 /// Internal: the random value that marks a HelloRetryRequest.

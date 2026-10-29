@@ -54,12 +54,13 @@ make_cert() { # name kind ca names [ca_flag]
     -days 365 $alg -extfile "$ext" 2>/dev/null || return 1
 }
 port=24000
+suites=TLS_CHACHA20_POLY1305_SHA256
 # Starts a server with the certificate file cert (its chain behind it) and key, and sets $port.
 serve() { # cert key [chain]
   port=$((port + 1))
   local chain=()
   [ -n "${3:-}" ] && chain=(-cert_chain "$tmp/$3.pem")
-  openssl s_server -www -accept "127.0.0.1:$port" -tls1_3 -ciphersuites TLS_CHACHA20_POLY1305_SHA256 -groups X25519 \
+  openssl s_server -www -accept "127.0.0.1:$port" -tls1_3 -ciphersuites "$suites" -groups X25519 \
     -cert "$tmp/$1.pem" -key "$tmp/$1.key" "${chain[@]}" >"$tmp/server.log" 2>&1 &
   pids+=($!)
   local i
@@ -109,6 +110,11 @@ serve eclocal eclocal && {
   system_client "std/https: wrong name" 1 example.org ec.roots
   system_client "std/https: untrusted root" 1 localhost other.roots
 }
+suites=TLS_AES_128_GCM_SHA256
+serve eclocal eclocal && client "AES-128-GCM only server" 0 localhost ec.roots
+suites=TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256
+serve eclocal eclocal && client "server that offers both suites" 0 localhost ec.roots
+suites=TLS_CHACHA20_POLY1305_SHA256
 make_cert rsalocal rsa rsaca "DNS:localhost"
 serve rsalocal rsalocal && client "RSA certificate (rsa_pss_rsae_sha256)" 0 localhost rsa.roots
 make_cert edlocal ed25519 edca "DNS:localhost"

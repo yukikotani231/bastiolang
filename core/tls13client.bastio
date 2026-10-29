@@ -39,6 +39,7 @@ import "rsa.bastio";
 struct Tls13Client {
   state: u64, priv_key: Bytes, name: Bytes, transcript: Bytes,
   hs_secret: Bytes, c_hs: Bytes, s_hs: Bytes,
+  suite: u64, c_suite: u64, s_suite: u64,
   c_key: Bytes, c_iv: Bytes, s_key: Bytes, s_iv: Bytes,
   c_secret: Bytes, s_secret: Bytes, c_seq: u64, s_seq: u64,
   inbuf: Bytes, hsbuf: Bytes, leaf: Bytes
@@ -47,7 +48,10 @@ struct Tls13Client {
 /// Internal: the sizes of the keys and secrets the record layer needs.
 spec fn tls13c_ok(c: &Tls13Client) -> bool {
   c.state <= 7 && blen(c.priv_key) == 32 && blen(c.hs_secret) == 32 && blen(c.c_hs) == 32 && blen(c.s_hs) == 32
-    && blen(c.c_key) == 32 && blen(c.c_iv) == 12 && blen(c.s_key) == 32 && blen(c.s_iv) == 12
+    && (c.suite == 4865 || c.suite == 4867)
+    && ((c.c_suite == 4867 && blen(c.c_key) == 32) || (c.c_suite == 4865 && blen(c.c_key) == 16))
+    && ((c.s_suite == 4867 && blen(c.s_key) == 32) || (c.s_suite == 4865 && blen(c.s_key) == 16))
+    && blen(c.c_iv) == 12 && blen(c.s_iv) == 12
     && blen(c.c_secret) == 32 && blen(c.s_secret) == 32 && blen(c.name) <= 255
     && blen(c.transcript) < 1073741824 && blen(c.inbuf) < 1073741824 && blen(c.hsbuf) < 1073741824 && blen(c.leaf) < 1048576
 }
@@ -110,6 +114,7 @@ fn tls13c_new(random: &Bytes, session_id: &Bytes, priv_key: &Bytes, name: &Bytes
   return Tls13Client {
     state: 0, priv_key: bytes_slice(priv_key, 0, 32), name: bytes_slice(name, 0, blen(name)), transcript: hello,
     hs_secret: balloc(32), c_hs: balloc(32), s_hs: balloc(32),
+    suite: 4867, c_suite: 4867, s_suite: 4867,
     c_key: balloc(32), c_iv: balloc(12), s_key: balloc(32), s_iv: balloc(12),
     c_secret: balloc(32), s_secret: balloc(32), c_seq: 0, s_seq: 0,
     inbuf: balloc(0), hsbuf: balloc(0), leaf: balloc(0)
@@ -347,19 +352,25 @@ fn tls13c_keys(c: &mut Tls13Client, secret: &Bytes, write: bool)
   requires tls13c_ok(c) && blen(secret) == 32
   ensures tls13c_ok(c)
 {
-  let key = tls13_traffic_key(secret, 32);
+  let mut n = 32;
+  if c.suite == 4865 {
+    n = 16;
+  }
+  let key = tls13_traffic_key(secret, n);
   let iv = tls13_traffic_iv(secret);
   if write {
     bfree(c.c_key);
     bfree(c.c_iv);
     c.c_key = key;
     c.c_iv = iv;
+    c.c_suite = c.suite;
     c.c_seq = 0;
   } else {
     bfree(c.s_key);
     bfree(c.s_iv);
     c.s_key = key;
     c.s_iv = iv;
+    c.s_suite = c.suite;
     c.s_seq = 0;
   }
 }
@@ -435,6 +446,11 @@ fn tls13c_server_hello(c: &mut Tls13Client, msg: &Bytes) -> u64
       if !tls13c_note(&mut c, msg) {
         bfree(share);
         return tls13c_fail(&mut c, 1);
+      }
+      if tls13_server_hello_suite(msg) == 4865 {
+        c.suite = 4865;
+      } else {
+        c.suite = 4867;
       }
       let ok = tls13c_handshake_keys(&mut c, share);
       bfree(share);
@@ -554,7 +570,7 @@ fn tls13c_send_record(c: &mut Tls13Client, ty: u8, plain: &Bytes, out: &mut Vec[
   ensures tls13c_ok(c)
 {
   if c.c_seq >= 4611686018427387904 { return false; }
-  let rec = tls13_seal(c.c_key, c.c_iv, c.c_seq, ty, plain, 0);
+  let rec = tls13_seal(c.c_suite, c.c_key, c.c_iv, c.c_seq, ty, plain, 0);
   c.c_seq = c.c_seq + 1;
   text_push_bytes(&mut out, rec);
   bfree(rec);
@@ -728,7 +744,7 @@ fn tls13c_record(c: &mut Tls13Client, rec: &Bytes, roots: &Bytes, now: u64, out:
   }
   if ty == 23 && c.state >= 1 && c.state <= 5 {
     if c.s_seq >= 4611686018427387904 { return tls13c_fail(&mut c, 5); }
-    match tls13_open(c.s_key, c.s_iv, c.s_seq, rec) {
+    match tls13_open(c.s_suite, c.s_key, c.s_iv, c.s_seq, rec) {
       Option::None => { return tls13c_fail(&mut c, 5); },
       Option::Some(r) => {
         c.s_seq = c.s_seq + 1;

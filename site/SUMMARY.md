@@ -26,6 +26,8 @@
 - [Concurrency](concurrency.md)
 - [Packages and projects](packages.md)
 - [The core and std libraries](core.md)
+  - [core/aes.bastio](lib-core-aes.md)
+  - [core/aesgcm.bastio](lib-core-aesgcm.md)
   - [core/ascii.bastio](lib-core-ascii.md)
   - [core/bitmap.bastio](lib-core-bitmap.md)
   - [core/boxed.bastio](lib-core-boxed.md)

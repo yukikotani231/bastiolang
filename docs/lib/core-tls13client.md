@@ -25,7 +25,7 @@ Not done: certificate path length and name constraints, extended key usage
 and revocation checks; SHA-384 suites and certificates; session tickets; a
 check that the random values are random (the caller supplies them).
 
-`import "core/tls13client.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/endian.bastio](core-endian.md), [core/text.bastio](core-text.md), [core/sha256.bastio](core-sha256.md), [core/hkdf.bastio](core-hkdf.md), [core/tls13.bastio](core-tls13.md), [core/tls13hs.bastio](core-tls13hs.md), [core/chacha20.bastio](core-chacha20.md), [core/poly1305.bastio](core-poly1305.md), [core/chacha20poly1305.bastio](core-chacha20poly1305.md), [core/tls13record.bastio](core-tls13record.md), [core/x25519.bastio](core-x25519.md), [core/der.bastio](core-der.md), [core/sha512.bastio](core-sha512.md), [core/ed25519.bastio](core-ed25519.md), [core/p256.bastio](core-p256.md), [core/rsa.bastio](core-rsa.md), [core/x509.bastio](core-x509.md).
+`import "core/tls13client.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/endian.bastio](core-endian.md), [core/text.bastio](core-text.md), [core/sha256.bastio](core-sha256.md), [core/hkdf.bastio](core-hkdf.md), [core/tls13.bastio](core-tls13.md), [core/tls13hs.bastio](core-tls13hs.md), [core/aes.bastio](core-aes.md), [core/aesgcm.bastio](core-aesgcm.md), [core/chacha20.bastio](core-chacha20.md), [core/poly1305.bastio](core-poly1305.md), [core/chacha20poly1305.bastio](core-chacha20poly1305.md), [core/tls13record.bastio](core-tls13record.md), [core/x25519.bastio](core-x25519.md), [core/der.bastio](core-der.md), [core/sha512.bastio](core-sha512.md), [core/ed25519.bastio](core-ed25519.md), [core/p256.bastio](core-p256.md), [core/rsa.bastio](core-rsa.md), [core/x509.bastio](core-x509.md).
 
 | Function | |
 | --- | --- |
@@ -46,6 +46,7 @@ Every example below is built, verified and run by `tests/run.sh`. An `assert` in
 struct Tls13Client {
   state: u64, priv_key: Bytes, name: Bytes, transcript: Bytes,
   hs_secret: Bytes, c_hs: Bytes, s_hs: Bytes,
+  suite: u64, c_suite: u64, s_suite: u64,
   c_key: Bytes, c_iv: Bytes, s_key: Bytes, s_iv: Bytes,
   c_secret: Bytes, s_secret: Bytes, c_seq: u64, s_seq: u64,
   inbuf: Bytes, hsbuf: Bytes, leaf: Bytes
@@ -220,7 +221,10 @@ if closed { return 1; }
 ```bastio
 spec fn tls13c_ok(c: &Tls13Client) -> bool {
   c.state <= 7 && blen(c.priv_key) == 32 && blen(c.hs_secret) == 32 && blen(c.c_hs) == 32 && blen(c.s_hs) == 32
-    && blen(c.c_key) == 32 && blen(c.c_iv) == 12 && blen(c.s_key) == 32 && blen(c.s_iv) == 12
+    && (c.suite == 4865 || c.suite == 4867)
+    && ((c.c_suite == 4867 && blen(c.c_key) == 32) || (c.c_suite == 4865 && blen(c.c_key) == 16))
+    && ((c.s_suite == 4867 && blen(c.s_key) == 32) || (c.s_suite == 4865 && blen(c.s_key) == 16))
+    && blen(c.c_iv) == 12 && blen(c.s_iv) == 12
     && blen(c.c_secret) == 32 && blen(c.s_secret) == 32 && blen(c.name) <= 255
     && blen(c.transcript) < 1073741824 && blen(c.inbuf) < 1073741824 && blen(c.hsbuf) < 1073741824 && blen(c.leaf) < 1048576
 }
