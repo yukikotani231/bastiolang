@@ -150,6 +150,8 @@ What will be 0.2.0.
 - `core/der`: `der_item` reads one element of ASN.1 DER (one-byte tags, definite lengths in their shortest form) and `der_content_eq`
   compares its content; an item it returns is proved to lie inside the span it was asked to read. Tested on lengths from 0 to
   65536, on the encodings DER forbids and on a real Ed25519 X.509 certificate walked down to its fields.
+- `core/sha512`: `sha512` (FIPS 180-4). Reads are proved in bounds and a digest is 64 bytes; that it is SHA-512's is checked by the
+  FIPS 180-4 vectors, the lengths around a block and a million `a`s.
 - `core/url`: `url_encode`, `url_decode`/`url_decode_span` (percent-decoding, `+` as a space on request) and `url_query_get`/`url_query_start` for the query string of a request target; reads are proved in bounds, a decoded string is never longer than its source and an encoded one at most three times as long.
 - `std/http`: `http_header` reads a header field of a response (the name is matched ignoring case,
   the value has its blanks removed), for `Location`, `Content-Type` and the like.
