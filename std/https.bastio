@@ -1,0 +1,216 @@
+// std/https.bastio: HTTPS (or any protocol over TLS 1.3) for programs on the
+// hosted target: core/tls13client over the sockets of std/net.bastio. The
+// server is authenticated against the roots the caller trusts (DER
+// certificates one after the other, as `host_read` gives a file of them),
+// and the random bytes and the time come from the system (`net_random`,
+// `net_now`). One suite (TLS_CHACHA20_POLY1305_SHA256 with X25519), servers
+// by IPv4 address (there is no name lookup), no client certificates and no
+// resumption; see core/tls13client.bastio for what is checked and what is not.
+import "../core/bytes.bastio";
+import "../core/text.bastio";
+import "../core/tls13client.bastio";
+import "net.bastio";
+
+/// What a TLS exchange ended with: the `state` of the client (6 is a clean
+/// close by the server, 7 a failure), its error code (see `tls13c_feed`; 0
+/// when the connection broke without one) and the application data received.
+struct HttpsResult { state: u64, error: u64, data: Bytes }
+
+/// Internal: sends what is in `out` over the socket and empties it. False if sending fails.
+fn https_flush(h: &Host, sock: u64, out: &mut Vec[u8]) -> bool {
+  if vec_len(out) == 0 { return true; }
+  let b = text_to_bytes(out);
+  while vec_len(out) > 0
+    invariant true
+  {
+    vec_pop(&mut out);
+  }
+  let ok = net_send_all(h, sock, b);
+  bfree(b);
+  return ok;
+}
+
+/// Runs a TLS 1.3 exchange on the connected socket `sock`: the handshake with
+/// the server `name` (checked against the certificate), then `request` as
+/// application data, then everything the server sends until it closes.
+/// `random`, `session` and `key` are 32 bytes each that nobody can predict
+/// (use each once), `now` the time in seconds since 1970. The socket stays
+/// open.
+/// ```
+/// // The server hangs up at once: the handshake never gets going.
+/// let lo = net_ip4(127, 0, 0, 1);
+/// let name = bfrom("localhost");
+/// let request = bfrom("GET / HTTP/1.0\r\n\r\n");
+/// let roots = balloc(0);
+/// let random = balloc(32);
+/// let session = balloc(32);
+/// let key = balloc(32);
+/// let mut bad = 1;
+/// match net_listen(host, lo, 0) {
+///   Option::Some(s) => {
+///     match net_connect(host, lo, net_port(host, s)) {
+///       Option::Some(c) => {
+///         match net_accept(host, s) {
+///           Option::Some(a) => {
+///             net_close(host, a);
+///             let r = https_run(host, c, name, request, roots, 1800000000, random, session, key);
+///             if r.state == 0 && r.error == 0 && blen(r.data) == 0 { bad = 0; }
+///             https_result_free(r);
+///           },
+///           Option::None => {},
+///         }
+///         net_close(host, c);
+///       },
+///       Option::None => {},
+///     }
+///     net_close(host, s);
+///   },
+///   Option::None => {},
+/// }
+/// bfree(key);
+/// bfree(session);
+/// bfree(random);
+/// bfree(roots);
+/// bfree(request);
+/// bfree(name);
+/// if bad != 0 { return 1; }
+/// ```
+fn https_run(h: &Host, sock: u64, name: &Bytes, request: &Bytes, roots: &Bytes, now: u64, random: &Bytes, session: &Bytes, key: &Bytes) -> HttpsResult
+  requires blen(name) <= 255 && blen(request) < 1073741824 && blen(roots) < 274877906944
+  requires blen(random) == 32 && blen(session) == 32 && blen(key) == 32
+{
+  let mut out = text_new();
+  let mut app = text_new();
+  let mut client = tls13c_new(random, session, key, name, &mut out);
+  let mut asked = false;
+  let mut alive = https_flush(h, sock, &mut out);
+  let mut buf = balloc(0);
+  let mut rounds = 0;
+  let mut code = 0;
+  while alive && rounds < 100000 && tls13c_state(client) < 6
+    invariant rounds <= 100000 && tls13c_ok(client) && blen(request) < 1073741824 && blen(roots) < 274877906944
+  {
+    if tls13c_state(client) == 5 && !asked {
+      asked = true;
+      alive = tls13c_send(&mut client, request, &mut out);
+    }
+    if alive { alive = https_flush(h, sock, &mut out); }
+    if alive {
+      match net_recv(h, sock, 16384, &mut buf) {
+        Option::None => { alive = false; },
+        Option::Some(n) => {
+          if n == 0 || blen(buf) >= 1048576 {
+            alive = false;
+          } else {
+            code = tls13c_feed(&mut client, buf, roots, now, &mut out, &mut app);
+            if code != 0 { alive = false; }
+          }
+        },
+      }
+    }
+    rounds = rounds + 1;
+  }
+  if tls13c_state(client) == 5 || tls13c_state(client) == 6 {
+    // The close_notify we may have to answer, or nothing.
+    https_flush(h, sock, &mut out);
+  }
+  let st = tls13c_state(client);
+  let data = text_to_bytes(app);
+  bfree(buf);
+  tls13c_free(client);
+  vec_free(app);
+  vec_free(out);
+  return HttpsResult { state: st, error: code, data: data };
+}
+
+/// Frees a result (see `https_run`).
+fn https_result_free(r: HttpsResult) {
+  bfree(r.data);
+}
+
+/// Connects to `ip`:`port`, runs a TLS exchange with the server `name` (see
+/// `https_run`) and returns what the server sent after `request`, if it ended
+/// with a close_notify (a connection that is cut off, which could hide a
+/// truncated answer, gives `None`, as does any failure of the handshake).
+/// ```
+/// // Nothing listens on port 1.
+/// let name = bfrom("localhost");
+/// let request = bfrom("GET / HTTP/1.0\r\n\r\n");
+/// let roots = balloc(0);
+/// let mut bad = 0;
+/// match https_request(host, net_ip4(127, 0, 0, 1), 1, name, request, roots) {
+///   Option::Some(r) => { bfree(r); bad = 1; },
+///   Option::None => {},
+/// }
+/// bfree(roots);
+/// bfree(request);
+/// bfree(name);
+/// if bad != 0 { return 1; }
+/// ```
+fn https_request(h: &Host, ip: u64, port: u64, name: &Bytes, request: &Bytes, roots: &Bytes) -> Option[Bytes]
+  requires blen(name) <= 255 && blen(request) < 1073741824 && blen(roots) < 274877906944
+{
+  match net_random(h, 96) {
+    Option::None => { return Option[Bytes]::None; },
+    Option::Some(rnd) => {
+      let a = https_connected(h, ip, port, name, request, roots, rnd);
+      bfree(rnd);
+      return a;
+    },
+  }
+}
+
+/// Internal: `https_request` with the 96 random bytes `rnd` already drawn.
+fn https_connected(h: &Host, ip: u64, port: u64, name: &Bytes, request: &Bytes, roots: &Bytes, rnd: &Bytes) -> Option[Bytes]
+  requires blen(name) <= 255 && blen(request) < 1073741824 && blen(roots) < 274877906944 && blen(rnd) == 96
+{
+  match net_connect(h, ip, port) {
+    Option::None => { return Option[Bytes]::None; },
+    Option::Some(sock) => {
+      let random = bytes_slice(rnd, 0, 32);
+      let session = bytes_slice(rnd, 32, 64);
+      let key = bytes_slice(rnd, 64, 96);
+      let r = https_run(h, sock, name, request, roots, net_now(h), random, session, key);
+      net_close(h, sock);
+      bfree(key);
+      bfree(session);
+      bfree(random);
+      if r.state == 6 {
+        return Option[Bytes]::Some(r.data);
+      }
+      bfree(r.data);
+      return Option[Bytes]::None;
+    },
+  }
+}
+
+/// A `GET` of `path` on the server `name` over HTTPS (HTTP/1.0 with the
+/// connection closed after the answer): the whole answer, head and body.
+/// ```
+/// let name = bfrom("localhost");
+/// let path = bfrom("/");
+/// let roots = balloc(0);
+/// let mut bad = 0;
+/// match https_get(host, net_ip4(127, 0, 0, 1), 1, name, path, roots) {
+///   Option::Some(r) => { bfree(r); bad = 1; },
+///   Option::None => {},
+/// }
+/// bfree(roots);
+/// bfree(path);
+/// bfree(name);
+/// if bad != 0 { return 1; }
+/// ```
+fn https_get(h: &Host, ip: u64, port: u64, name: &Bytes, path: &Bytes, roots: &Bytes) -> Option[Bytes]
+  requires blen(name) <= 255 && blen(path) < 65536 && blen(roots) < 274877906944
+{
+  let mut t = text_new();
+  text_push_str(&mut t, "GET ");
+  text_push_bytes(&mut t, path);
+  text_push_str(&mut t, " HTTP/1.0\r\nHost: ");
+  text_push_bytes(&mut t, name);
+  text_push_str(&mut t, "\r\nConnection: close\r\n\r\n");
+  let request = text_finish(t);
+  let r = https_request(h, ip, port, name, request, roots);
+  bfree(request);
+  return r;
+}

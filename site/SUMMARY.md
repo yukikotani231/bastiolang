@@ -72,6 +72,7 @@
   - [std/host.bastio](lib-std-host.md)
   - [std/net.bastio](lib-std-net.md)
   - [std/http.bastio](lib-std-http.md)
+  - [std/https.bastio](lib-std-https.md)
 
 # Project
 
