@@ -34,6 +34,7 @@
   - [core/chacha20.bastio](lib-core-chacha20.md)
   - [core/chacha20poly1305.bastio](lib-core-chacha20poly1305.md)
   - [core/csum.bastio](lib-core-csum.md)
+  - [core/der.bastio](lib-core-der.md)
   - [core/endian.bastio](lib-core-endian.md)
   - [core/format.bastio](lib-core-format.md)
   - [core/hashmap.bastio](lib-core-hashmap.md)

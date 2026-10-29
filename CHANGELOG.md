@@ -147,6 +147,9 @@ What will be 0.2.0.
 - `core/x25519`: `x25519` (RFC 7748), the Diffie-Hellman function on Curve25519, with 16-limb field elements. Reads are proved
   in bounds and a result is 32 bytes; that it is RFC 7748's is checked by its vectors, the iterated function after 1 and 1000
   steps, and the exchange of section 6.1.
+- `core/der`: `der_item` reads one element of ASN.1 DER (one-byte tags, definite lengths in their shortest form) and `der_content_eq`
+  compares its content; an item it returns is proved to lie inside the span it was asked to read. Tested on lengths from 0 to
+  65536, on the encodings DER forbids and on a real Ed25519 X.509 certificate walked down to its fields.
 - `core/url`: `url_encode`, `url_decode`/`url_decode_span` (percent-decoding, `+` as a space on request) and `url_query_get`/`url_query_start` for the query string of a request target; reads are proved in bounds, a decoded string is never longer than its source and an encoded one at most three times as long.
 - `std/http`: `http_header` reads a header field of a response (the name is matched ignoring case,
   the value has its blanks removed), for `Location`, `Content-Type` and the like.

@@ -44,6 +44,7 @@ Each module has a reference page, generated from its source: every function with
 | [`core/chacha20.bastio`](lib/core-chacha20.md) | The ChaCha20 stream cipher (RFC 8439 section 2.4). |
 | [`core/chacha20poly1305.bastio`](lib/core-chacha20poly1305.md) | Authenticated encryption with ChaCha20 and Poly1305 (RFC 8439 section 2.8). |
 | [`core/csum.bastio`](lib/core-csum.md) | Checksums over byte strings. |
+| [`core/der.bastio`](lib/core-der.md) | Reading ASN.1 DER, the encoding of X.509 certificates and of most of what TLS carries (RFC 5280, ITU-T X.690). |
 | [`core/endian.bastio`](lib/core-endian.md) | Fixed-width integers stored in byte strings, as packet headers, file formats and disk blocks hold them. |
 | [`core/format.bastio`](lib/core-format.md) | Building text out of pieces. |
 | [`core/hashmap.bastio`](lib/core-hashmap.md) | A hash map from `u64` keys to values of any type `V` that can be copied (`u64`, `Span`, a struct of numbers, ...). |
