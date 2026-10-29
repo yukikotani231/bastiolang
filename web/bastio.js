@@ -167,8 +167,17 @@
         case 31:
           return BigInt(args.length);
         case 32: {                                   // TCP: operation, two numbers, the Bytes cell (see bst_host_net in the C prelude)
-          if (!net) return NONE;
           const op = Number(word(b, 0)), x = word(b, 1), y = word(b, 2), cell = word(b, 3);
+          if (op === 7) return BigInt(Math.floor(Date.now() / 1000));   // the time, which needs no sockets
+          if (op === 8) {                            // y random bytes replace the cell's
+            const g = typeof crypto !== 'undefined' && crypto.getRandomValues;
+            if (!g || y > 256n) return NONE;
+            const r = new Uint8Array(Number(y));
+            crypto.getRandomValues(r);
+            fill(cell, r);
+            return y;
+          }
+          if (!net) return NONE;
           if (op === 4) {                            // write the cell's bytes to socket x
             const data = bytes(word(cell, 1), word(cell, 0));
             const r = net.call(op, x, y, data);

@@ -186,3 +186,53 @@ fn net_close(h: &Host, sock: u64) {
   host_net(h, 5, sock, 0, &mut none);
   bfree(none);
 }
+
+/// The time in seconds since 1970-01-01 UTC, from the system clock (0 if
+/// there is none). The caller of the TLS client gives this as `now`.
+/// ```
+/// // After 2023, and the clock does not run backwards.
+/// let a = net_now(host);
+/// let b = net_now(host);
+/// if a < 1700000000 || b < a { return 1; }
+/// ```
+fn net_now(h: &Host) -> u64 {
+  let mut none = balloc(0);
+  let r = host_net(h, 7, 0, 0, &mut none);
+  bfree(none);
+  if r == 18446744073709551615 {
+    return 0;
+  }
+  return r;
+}
+
+/// `n` random bytes (at most 256) from the system's source (`/dev/urandom`,
+/// `RtlGenRandom`, `crypto.getRandomValues`), or `None` when there is none.
+/// The Bytes returned has exactly `n` bytes.
+/// ```
+/// match net_random(host, 32) {
+///   Option::Some(a) => {
+///     match net_random(host, 32) {
+///       Option::Some(b) => {
+///         // Two draws of 256 bits are the same with probability 2^-256.
+///         let same = bytes_eq(a, b);
+///         bfree(b);
+///         bfree(a);
+///         if same { return 1; }
+///       },
+///       Option::None => { bfree(a); return 1; },
+///     }
+///   },
+///   Option::None => { return 1; },
+/// }
+/// ```
+fn net_random(h: &Host, n: u64) -> Option[Bytes]
+  ensures result is Option::Some ==> blen(result.Some) == n
+{
+  let mut buf = balloc(0);
+  let r = host_net(h, 8, 0, n, &mut buf);
+  if r == n && blen(buf) == n {
+    return Option[Bytes]::Some(buf);
+  }
+  bfree(buf);
+  return Option[Bytes]::None;
+}

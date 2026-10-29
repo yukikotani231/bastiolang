@@ -21,6 +21,8 @@ listener, a closed descriptor, an address in use) gives `Option::None` or
 | [`net_recv`](#net_recv) | Reads up to `max` bytes into `out` (replacing it). |
 | [`net_send_all`](#net_send_all) | Sends all of `data`, retrying after a partial write. |
 | [`net_close`](#net_close) | Closes a socket. |
+| [`net_now`](#net_now) | The time in seconds since 1970-01-01 UTC, from the system clock (0 if there is none). |
+| [`net_random`](#net_random) | `n` random bytes (at most 256) from the system's source (`/dev/urandom`, `RtlGenRandom`, `crypto.getRandomValues`), or `None` when there is none. |
 
 Every example below is built, verified and run by `tests/run.sh`. An `assert` in one is proved at compile time from the contracts above it.
 
@@ -207,6 +209,55 @@ Example:
 ```bastio
 match net_listen(host, net_ip4(127, 0, 0, 1), 0) {
   Option::Some(s) => { net_close(host, s); },
+  Option::None => { return 1; },
+}
+```
+
+### `net_now`
+
+```bastio
+fn net_now(h: &Host) -> u64
+```
+
+The time in seconds since 1970-01-01 UTC, from the system clock (0 if
+there is none). The caller of the TLS client gives this as `now`.
+
+Example:
+
+```bastio
+// After 2023, and the clock does not run backwards.
+let a = net_now(host);
+let b = net_now(host);
+if a < 1700000000 || b < a { return 1; }
+```
+
+### `net_random`
+
+```bastio
+fn net_random(h: &Host, n: u64) -> Option[Bytes]
+  ensures result is Option::Some ==> blen(result.Some) == n
+```
+
+`n` random bytes (at most 256) from the system's source (`/dev/urandom`,
+`RtlGenRandom`, `crypto.getRandomValues`), or `None` when there is none.
+The Bytes returned has exactly `n` bytes.
+
+Example:
+
+```bastio
+match net_random(host, 32) {
+  Option::Some(a) => {
+    match net_random(host, 32) {
+      Option::Some(b) => {
+        // Two draws of 256 bits are the same with probability 2^-256.
+        let same = bytes_eq(a, b);
+        bfree(b);
+        bfree(a);
+        if same { return 1; }
+      },
+      Option::None => { bfree(a); return 1; },
+    }
+  },
   Option::None => { return 1; },
 }
 ```

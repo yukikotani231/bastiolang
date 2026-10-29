@@ -1,0 +1,58 @@
+// stage1-only: host_net operations 7 (the time) and 8 (random bytes), std/net's net_now and net_random
+// expect-exit: 0
+// The clock is past 2023 and does not run backwards; random bytes have the
+// length asked for, two draws differ, a draw of 0 bytes is empty and one of
+// more than 256 is refused. Nothing printed depends on the values drawn, so
+// the C and native backends and WebAssembly give the same output.
+import "std/host.bastio";
+import "std/net.bastio";
+
+fn draws(h: &Host) -> u64
+  ensures result <= 5
+{
+  let mut bad = 0;
+  match net_random(h, 32) {
+    Option::Some(a) => {
+      match net_random(h, 32) {
+        Option::Some(b) => {
+          if bytes_eq(a, b) { bad = bad + 1; }
+          bfree(b);
+        },
+        Option::None => { bad = bad + 1; },
+      }
+      // 256 random bits are not all zero, and not all equal to one byte.
+      let mut i = 1;
+      let mut varied = false;
+      while i < blen(a)
+        invariant i <= blen(a)
+      {
+        if bget(a, i) != bget(a, 0) { varied = true; }
+        i = i + 1;
+      }
+      if !varied { bad = bad + 1; }
+      bfree(a);
+    },
+    Option::None => { bad = bad + 1; },
+  }
+  match net_random(h, 0) {
+    Option::Some(e) => { if blen(e) != 0 { bad = bad + 1; } bfree(e); },
+    Option::None => { bad = bad + 1; },
+  }
+  match net_random(h, 256) {
+    Option::Some(f) => { bfree(f); },
+    Option::None => { bad = bad + 1; },
+  }
+  match net_random(h, 257) {
+    Option::Some(g) => { bfree(g); bad = bad + 1; },
+    Option::None => {},
+  }
+  return bad;
+}
+
+fn main(h: &mut Host) -> u64 {
+  let a = net_now(h);
+  let b = net_now(h);
+  let mut bad = draws(h);
+  if a < 1700000000 || b < a { bad = bad + 1; }
+  return bad;
+}
