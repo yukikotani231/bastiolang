@@ -56,17 +56,17 @@ fn tls13_u16_list(a: u64, b: u64, c: u64, n: u64) -> Bytes
 }
 
 /// Internal: the extensions of a ClientHello, behind none of their length.
-fn tls13_hello_extensions(server_name: Str, key_share: &Bytes) -> Bytes
-  requires blen(key_share) == 32 && slen(server_name) <= 255
+fn tls13_hello_extensions(server_name: &Bytes, key_share: &Bytes) -> Bytes
+  requires blen(key_share) == 32 && blen(server_name) <= 255
   ensures blen(result) <= 340
 {
   let mut t = text_new();
-  if slen(server_name) > 0 {
+  if blen(server_name) > 0 {
     // server_name: a list of one entry, of type host_name (0).
     let mut e = text_new();
     text_push(&mut e, 0);
-    tls13_push_u16(&mut e, slen(server_name));
-    text_push_str(&mut e, server_name);
+    tls13_push_u16(&mut e, blen(server_name));
+    text_push_bytes(&mut e, server_name);
     let entry = text_finish(e);
     let mut l = text_new();
     tls13_push_block16(&mut l, entry);
@@ -108,7 +108,7 @@ fn tls13_hello_extensions(server_name: Str, key_share: &Bytes) -> Bytes
 /// TLS_CHACHA20_POLY1305_SHA256, the group X25519 (with the key share
 /// `key_share`, 32 bytes) and the signature schemes ed25519,
 /// ecdsa_secp256r1_sha256 and rsa_pss_rsae_sha256, for the server named
-/// `server_name` (at most 255 bytes; empty for none). `random` and
+/// `server_name` (the host name, at most 255 bytes; empty for none). `random` and
 /// `session_id` are 32 bytes each; the session id is echoed back by the
 /// server and exists for compatibility with middleboxes. The result starts
 /// with the type and a 3-byte length of what follows.
@@ -116,18 +116,20 @@ fn tls13_hello_extensions(server_name: Str, key_share: &Bytes) -> Bytes
 /// let random = balloc(32);
 /// let sid = balloc(32);
 /// let key = balloc(32);
-/// let hello = tls13_client_hello(random, sid, "example.com", key);
+/// let name = bfrom("example.com");
+/// let hello = tls13_client_hello(random, sid, name, key);
 /// let n = blen(hello);
 /// let ty = bget(hello, 0);
 /// let ln = load_be16(hello, 2);
 /// bfree(hello);
+/// bfree(name);
 /// bfree(key);
 /// bfree(sid);
 /// bfree(random);
 /// if ty != 1 || cast[u64](ln) + 4 != n { return 1; }
 /// ```
-fn tls13_client_hello(random: &Bytes, session_id: &Bytes, server_name: Str, key_share: &Bytes) -> Bytes
-  requires blen(random) == 32 && blen(session_id) == 32 && blen(key_share) == 32 && slen(server_name) <= 255
+fn tls13_client_hello(random: &Bytes, session_id: &Bytes, server_name: &Bytes, key_share: &Bytes) -> Bytes
+  requires blen(random) == 32 && blen(session_id) == 32 && blen(key_share) == 32 && blen(server_name) <= 255
   ensures blen(result) > 4 && blen(result) < 600
 {
   let exts = tls13_hello_extensions(server_name, key_share);
@@ -169,13 +171,15 @@ fn tls13_client_hello(random: &Bytes, session_id: &Bytes, server_name: Str, key_
 /// let random = balloc(32);
 /// let sid = balloc(32);
 /// let key = balloc(32);
-/// let hello = tls13_client_hello(random, sid, "", key);
+/// let name = balloc(0);
+/// let hello = tls13_client_hello(random, sid, name, key);
 /// let mut ok = false;
 /// match tls13_parse_server_hello(hello) {
 ///   Option::Some(k) => { bfree(k); },
 ///   Option::None => { ok = true; },
 /// }
 /// bfree(hello);
+/// bfree(name);
 /// bfree(key);
 /// bfree(sid);
 /// bfree(random);
@@ -183,6 +187,7 @@ fn tls13_client_hello(random: &Bytes, session_id: &Bytes, server_name: Str, key_
 /// ```
 fn tls13_parse_server_hello(msg: &Bytes) -> Option[Bytes]
   requires blen(msg) < 274877906944
+  ensures result is Option::Some ==> blen(result.Some) == 32
 {
   let n = blen(msg);
   if n < 48 || n > 70000 { return Option[Bytes]::None; }
@@ -207,7 +212,7 @@ fn tls13_parse_server_hello(msg: &Bytes) -> Option[Bytes]
   let mut have_key = false;
   let mut share = balloc(0);
   while p < n
-    invariant p <= n && n == blen(msg)
+    invariant p <= n && n == blen(msg) && (have_key ==> blen(share) == 32)
   {
     if p + 4 > n {
       bfree(share);

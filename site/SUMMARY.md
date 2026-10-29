@@ -63,6 +63,8 @@
   - [core/tls13hs.bastio](lib-core-tls13hs.md)
   - [core/p256.bastio](lib-core-p256.md)
   - [core/rsa.bastio](lib-core-rsa.md)
+  - [core/x509.bastio](lib-core-x509.md)
+  - [core/tls13client.bastio](lib-core-tls13client.md)
   - [core/url.bastio](lib-core-url.md)
   - [core/utf8.bastio](lib-core-utf8.md)
   - [core/x25519.bastio](lib-core-x25519.md)

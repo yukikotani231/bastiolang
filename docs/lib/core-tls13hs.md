@@ -18,7 +18,7 @@ of the standard (it takes the one suite and group the client offered).
 
 | Function | |
 | --- | --- |
-| [`tls13_client_hello`](#tls13_client_hello) | The ClientHello message (handshake type 1) offering TLS 1.3 with TLS_CHACHA20_POLY1305_SHA256, the group X25519 (with the key share `key_share`, 32 bytes) and the signature schemes ed25519, ecdsa_secp256r1_sha256 and rsa_pss_rsae_sha256, for the server named `server_name` (at most 255 bytes; empty for none). |
+| [`tls13_client_hello`](#tls13_client_hello) | The ClientHello message (handshake type 1) offering TLS 1.3 with TLS_CHACHA20_POLY1305_SHA256, the group X25519 (with the key share `key_share`, 32 bytes) and the signature schemes ed25519, ecdsa_secp256r1_sha256 and rsa_pss_rsae_sha256, for the server named `server_name` (the host name, at most 255 bytes; empty for none). |
 | [`tls13_parse_server_hello`](#tls13_parse_server_hello) | The X25519 public key (32 bytes) in the ServerHello `msg` (the whole handshake message, with its 4-byte header), or `None` unless it is a ServerHello for what `tls13_client_hello` offers. |
 
 Every example below is built, verified and run by `tests/run.sh`. An `assert` in one is proved at compile time from the contracts above it.
@@ -28,8 +28,8 @@ Every example below is built, verified and run by `tests/run.sh`. An `assert` in
 ### `tls13_client_hello`
 
 ```bastio
-fn tls13_client_hello(random: &Bytes, session_id: &Bytes, server_name: Str, key_share: &Bytes) -> Bytes
-  requires blen(random) == 32 && blen(session_id) == 32 && blen(key_share) == 32 && slen(server_name) <= 255
+fn tls13_client_hello(random: &Bytes, session_id: &Bytes, server_name: &Bytes, key_share: &Bytes) -> Bytes
+  requires blen(random) == 32 && blen(session_id) == 32 && blen(key_share) == 32 && blen(server_name) <= 255
   ensures blen(result) > 4 && blen(result) < 600
 ```
 
@@ -37,7 +37,7 @@ The ClientHello message (handshake type 1) offering TLS 1.3 with
 TLS_CHACHA20_POLY1305_SHA256, the group X25519 (with the key share
 `key_share`, 32 bytes) and the signature schemes ed25519,
 ecdsa_secp256r1_sha256 and rsa_pss_rsae_sha256, for the server named
-`server_name` (at most 255 bytes; empty for none). `random` and
+`server_name` (the host name, at most 255 bytes; empty for none). `random` and
 `session_id` are 32 bytes each; the session id is echoed back by the
 server and exists for compatibility with middleboxes. The result starts
 with the type and a 3-byte length of what follows.
@@ -48,11 +48,13 @@ Example:
 let random = balloc(32);
 let sid = balloc(32);
 let key = balloc(32);
-let hello = tls13_client_hello(random, sid, "example.com", key);
+let name = bfrom("example.com");
+let hello = tls13_client_hello(random, sid, name, key);
 let n = blen(hello);
 let ty = bget(hello, 0);
 let ln = load_be16(hello, 2);
 bfree(hello);
+bfree(name);
 bfree(key);
 bfree(sid);
 bfree(random);
@@ -64,6 +66,7 @@ if ty != 1 || cast[u64](ln) + 4 != n { return 1; }
 ```bastio
 fn tls13_parse_server_hello(msg: &Bytes) -> Option[Bytes]
   requires blen(msg) < 274877906944
+  ensures result is Option::Some ==> blen(result.Some) == 32
 ```
 
 The X25519 public key (32 bytes) in the ServerHello `msg` (the whole
@@ -80,13 +83,15 @@ Example:
 let random = balloc(32);
 let sid = balloc(32);
 let key = balloc(32);
-let hello = tls13_client_hello(random, sid, "", key);
+let name = balloc(0);
+let hello = tls13_client_hello(random, sid, name, key);
 let mut ok = false;
 match tls13_parse_server_hello(hello) {
   Option::Some(k) => { bfree(k); },
   Option::None => { ok = true; },
 }
 bfree(hello);
+bfree(name);
 bfree(key);
 bfree(sid);
 bfree(random);
@@ -139,8 +144,8 @@ their length.
 ### `tls13_hello_extensions`
 
 ```bastio
-fn tls13_hello_extensions(server_name: Str, key_share: &Bytes) -> Bytes
-  requires blen(key_share) == 32 && slen(server_name) <= 255
+fn tls13_hello_extensions(server_name: &Bytes, key_share: &Bytes) -> Bytes
+  requires blen(key_share) == 32 && blen(server_name) <= 255
   ensures blen(result) <= 340
 ```
 
