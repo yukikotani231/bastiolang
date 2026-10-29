@@ -69,6 +69,7 @@ Each module has a reference page, generated from its source: every function with
 | [`core/strsort.bastio`](lib/core-strsort.md) | Sorting pieces of a text in dictionary order (byte order), for sorted word lists, directory listings and `sort | uniq`. |
 | [`core/text.bastio`](lib/core-text.md) | Building byte strings. |
 | [`core/tls13.bastio`](lib/core-tls13.md) | The key schedule of TLS 1.3 with SHA-256 (RFC 8446 section 7). |
+| [`core/tls13record.bastio`](lib/core-tls13record.md) | The TLS 1.3 record layer with the ChaCha20-Poly1305 cipher suite (RFC 8446 section 5). |
 | [`core/url.bastio`](lib/core-url.md) | Percent-encoding (RFC 3986 section 2.1) and the query string of a request target (`/path?a=1&b=two%20words`). |
 | [`core/utf8.bastio`](lib/core-utf8.md) | UTF-8 validation (RFC 3629). |
 | [`core/wtext.bastio`](lib/core-wtext.md) | Text kept as a `Vec[u64]`, one character a word. |

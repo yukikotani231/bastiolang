@@ -159,6 +159,9 @@ What will be 0.2.0.
   `tls13_early_secret`, `tls13_next_secret` (handshake and master secrets), `tls13_traffic_key`, `tls13_traffic_iv`, `tls13_nonce` and
   `tls13_finished`. Output lengths are proved; the values are checked against RFC 8448 (early, `derived`, handshake secret) and a
   Python reference.
+- `core/tls13record`: the TLS 1.3 record layer with ChaCha20-Poly1305 (RFC 8446 section 5): `tls13_seal` makes a record from a message,
+  a content type and padding; `tls13_open` checks the header and the tag and returns the content type and message. Lengths are proved;
+  the records are checked against ones made by Python's `cryptography` (sequence numbers, padding, 16 KiB) and every bit change refused.
 - `core/url`: `url_encode`, `url_decode`/`url_decode_span` (percent-decoding, `+` as a space on request) and `url_query_get`/`url_query_start` for the query string of a request target; reads are proved in bounds, a decoded string is never longer than its source and an encoded one at most three times as long.
 - `std/http`: `http_header` reads a header field of a response (the name is matched ignoring case,
   the value has its blanks removed), for `Location`, `Content-Type` and the like.

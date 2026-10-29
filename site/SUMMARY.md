@@ -59,6 +59,7 @@
   - [core/sort.bastio](lib-core-sort.md)
   - [core/text.bastio](lib-core-text.md)
   - [core/tls13.bastio](lib-core-tls13.md)
+  - [core/tls13record.bastio](lib-core-tls13record.md)
   - [core/url.bastio](lib-core-url.md)
   - [core/utf8.bastio](lib-core-utf8.md)
   - [core/x25519.bastio](lib-core-x25519.md)
