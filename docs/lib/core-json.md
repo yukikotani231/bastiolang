@@ -15,8 +15,8 @@ from. Not proved: that exactly the documents of RFC 8259 are accepted. The
 scanner is strict (no comments, no trailing commas, no leading zeros, no
 control characters in strings, no single quotes, and the bytes of a string
 must be valid UTF-8), but it accepts an escaped surrogate on its own
-(`json_string` refuses it). A key with an escape in it is compared
-by the bytes as written.
+(`json_string` refuses it). A key with an escape in it is compared as
+the string it stands for.
 
 `import "core/json.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/text.bastio](core-text.md), [core/num.bastio](core-num.md), [core/utf8.bastio](core-utf8.md).
 
@@ -156,9 +156,9 @@ fn json_member(s: &Bytes, at: u64, key: Str) -> Option[u64]
 
 The offset of the value of the member `key` of the object that starts at
 the first non-blank byte at or after `at`, or `None` when there is no such
-member or the document is damaged. The first member of that name wins. Keys
-are compared by the bytes as written, so a key written with an escape
-does not match its unescaped spelling.
+member or the document is damaged. The first member of that name wins. A key
+written with escapes is compared as the string it stands for (RFC 8259,
+section 4), so `"\u0061"` is the key `a`.
 
 Example:
 
@@ -168,8 +168,13 @@ let mut c = 0;
 match json_member(b, 0, "c") { Option::Some(x) => { c = x; }, Option::None => {} }
 let gone = json_member(b, 0, "d");
 let onearr = json_member(b, c, "a");   // `c` is an array, not an object
+let e = bfrom("{\"a\\u0062\": 7}");           // the key is written with an escape: ab
+let mut seven = 0;
+match json_member(e, 0, "ab") { Option::Some(x) => { seven = x; }, Option::None => {} }
+let raw = json_member(e, 0, "a\\u0062");   // not the spelling in the file
+bfree(e);
 bfree(b);
-if c != 29 || gone is Option::Some || onearr is Option::Some { return 1; }
+if c != 29 || gone is Option::Some || onearr is Option::Some || seven != 12 || raw is Option::Some { return 1; }
 ```
 
 ### `json_element`
