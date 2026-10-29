@@ -47,6 +47,15 @@ struct HttpsReply { status: u64, body: Bytes }
 
 What `https_fetch` found: the status code of the last response and its body.
 
+### `HttpsChunks`
+
+```bastio
+struct HttpsChunks { body: Bytes, end: u64 }
+```
+
+Internal: a chunked body decoded from data that already holds it: the
+body, and the offset just behind the last chunk and its trailers.
+
 ## Functions
 
 ### `https_run`
@@ -260,8 +269,8 @@ fn https_fetch(h: &Host, url: &Bytes, roots: &Bytes, redirects: u64) -> Option[H
 
 Fetches the `https://` URL `url`: looks the host up, connects, checks the
 server against `roots` and returns the status and body of the answer
-(HTTP/1.0 with the connection closed after it, so the body is everything
-behind the head). A redirect (301, 302, 303, 307, 308) to a path on the
+(HTTP/1.1 with the connection closed after it; the body is the data behind
+the head, with a chunked body decoded). A redirect (301, 302, 303, 307, 308) to a path on the
 same server or to another `https://` URL is followed, at most `redirects`
 times; a redirect to anything else (plain `http://`, another scheme) is
 not followed and its answer is returned as it is. `None` if the URL is
@@ -311,6 +320,17 @@ fn https_is_redirect(st: u64) -> bool
 
 Internal: is `st` a redirect status that carries a `Location`?
 
+### `https_unchunk`
+
+```bastio
+fn https_unchunk(raw: &Bytes, at: u64) -> Option[HttpsChunks]
+  ensures result is Option::Some ==> result.Some.end <= blen(raw) && blen(result.Some.body) <= blen(raw)
+```
+
+Internal: the chunked body that starts at `at` in `raw`, decoded, or
+`None` if it is malformed or not all there (the last chunk and the empty
+line after its trailers are missing).
+
 ### `https_keep`
 
 ```bastio
@@ -321,9 +341,11 @@ fn https_keep(raw: &Bytes, state: u64) -> u64
 Internal: how many bytes of the data `raw` (with the final `state` of the
 exchange) make up a complete answer, or 0 if it is not: with a
 `Content-Length`, the head and that many bytes of body (a cut-off
-connection, state 5, is fine then); without one, all the data, but only if
-the server ended it with a close_notify (state 6). A `Transfer-Encoding` is
-refused (the request is HTTP/1.0, which servers must not chunk).
+connection, state 5, is fine then); with a chunked body, up to the end of
+its last chunk and trailers (also fine when cut off); without either, all
+the data, but only if the server ended it with a close_notify (state 6).
+Framing that `http_body` finds ambiguous (both headers, a repeated one,
+another transfer coding) is refused.
 
 ### `https_complete`
 
@@ -331,7 +353,8 @@ refused (the request is HTTP/1.0, which servers must not chunk).
 fn https_complete(r: HttpsResult) -> Option[Bytes]
 ```
 
-Internal: the complete answer in `r` (see `https_keep`). Frees `r`.
+Internal: the complete answer in `r` (see `https_keep`); a chunked body is
+replaced by its decoded data. Frees `r`.
 
 ### `https_has`
 
