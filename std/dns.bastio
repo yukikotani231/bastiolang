@@ -1,9 +1,9 @@
-// std/dns.bastio: the IPv4 address of a host name, for programs on the
+// std/dns.bastio: the IPv4 or IPv6 address of a host name, for programs on the
 // hosted target: the query and the reader of core/dns.bastio, over a TCP
 // connection to a resolver on port 53 (DNS over TCP, RFC 7766, which every
 // recursive resolver answers; it needs no UDP in `host_net`). The resolver
 // comes from the caller or from /etc/resolv.conf; the message id is random
-// (`net_random`). Only A records, no search domains, no cache, no DNSSEC; the
+// (`net_random`). Only A and AAAA records, no search domains, no cache, no DNSSEC; the
 // answer is as trustworthy as the path to the resolver (HTTPS authenticates
 // the server whatever address the lookup gave). Connecting to the resolver and
 // each read are limited to 5 seconds (not on Windows yet, see
@@ -14,11 +14,11 @@ import "../core/text.bastio";
 import "net.bastio";
 import "host.bastio";
 
-/// Internal: sends the query `q` (id `id`) over `sock` and reads the length
-/// -prefixed response, up to 64 KiB. The address in the answer, 0 if there
-/// is none or anything fails.
-fn dns_exchange(h: &Host, sock: u64, id: u64, q: &Bytes) -> u64
-  requires blen(q) <= 512 && id < 65536
+/// Internal: sends the query `q` over `sock` and reads the length-prefixed
+/// response, up to 64 KiB: the message without its length, `None` if anything
+/// fails.
+fn dns_exchange_msg(h: &Host, sock: u64, q: &Bytes) -> Option[Bytes]
+  requires blen(q) <= 512
 {
   let mut t = text_new();
   text_push(&mut t, cast[u8](blen(q) / 256));
@@ -27,7 +27,7 @@ fn dns_exchange(h: &Host, sock: u64, id: u64, q: &Bytes) -> u64
   let frame = text_finish(t);
   let sent = net_send_all(h, sock, frame);
   bfree(frame);
-  if !sent { return 0; }
+  if !sent { return Option[Bytes]::None; }
   let mut acc = text_new();
   let mut buf = balloc(0);
   let mut rounds = 0;
@@ -53,22 +53,39 @@ fn dns_exchange(h: &Host, sock: u64, id: u64, q: &Bytes) -> u64
     rounds = rounds + 1;
   }
   bfree(buf);
-  let mut ip = 0;
   let all = text_to_bytes(acc);
+  vec_free(acc);
   if done && blen(all) >= 2 {
     let want = 2 + cast[u64](bget(all, 0)) * 256 + cast[u64](bget(all, 1));
     if want <= blen(all) {
       let msg = bytes_slice(all, 2, want);
-      match dns_parse_a(msg, id) {
-        Option::Some(a) => { ip = a; },
-        Option::None => {},
-      }
-      bfree(msg);
+      bfree(all);
+      return Option[Bytes]::Some(msg);
     }
   }
   bfree(all);
-  vec_free(acc);
-  return ip;
+  return Option[Bytes]::None;
+}
+
+/// Internal: `dns_exchange_msg`, then the address in its first A record; 0 if
+/// there is none or anything fails.
+fn dns_exchange(h: &Host, sock: u64, id: u64, q: &Bytes) -> u64
+  requires blen(q) <= 512 && id < 65536
+{
+  match dns_exchange_msg(h, sock, q) {
+    Option::None => { return 0; },
+    Option::Some(msg) => {
+      let mut ip = 0;
+      if blen(msg) < 1073741824 {
+        match dns_parse_a(msg, id) {
+          Option::Some(a) => { ip = a; },
+          Option::None => {},
+        }
+      }
+      bfree(msg);
+      return ip;
+    },
+  }
 }
 
 /// The IPv4 address (as `net_ip4` makes it) of the host `name`, asked of the
@@ -187,5 +204,101 @@ fn dns_lookup(h: &Host, name: &Bytes) -> Option[u64] {
   match dns_system_resolver(h) {
     Option::None => { return Option[u64]::None; },
     Option::Some(resolver) => { return dns_lookup_via(h, resolver, name); },
+  }
+}
+
+/// The IPv6 address (16 bytes, network order) of the host `name`, asked of
+/// the resolver at `resolver`, port `port`, over TCP, in an AAAA record:
+/// `None` if `name` is not a valid host name, nothing answers, or the answer
+/// holds no AAAA record.
+/// ```
+/// let name = bfrom("no-such-host.invalid");
+/// let mut bad = 0;
+/// match dns_lookup6_at(host, net_ip4(127, 0, 0, 1), 1, name) {
+///   Option::Some(a) => { bfree(a); bad = 1; },
+///   Option::None => {},
+/// }
+/// bfree(name);
+/// if bad != 0 { return 1; }
+/// ```
+fn dns_lookup6_at(h: &Host, resolver: u64, port: u64, name: &Bytes) -> Option[Bytes] {
+  match net_random(h, 2) {
+    Option::None => { return Option[Bytes]::None; },
+    Option::Some(r) => {
+      let id = cast[u64](bget(r, 0)) * 256 + cast[u64](bget(r, 1));
+      bfree(r);
+      match dns_query_type(name, id, 28) {
+        Option::None => { return Option[Bytes]::None; },
+        Option::Some(q) => {
+          if blen(q) > 512 {
+            bfree(q);
+            return Option[Bytes]::None;
+          }
+          match net_connect_timeout(h, resolver, port, 5000) {
+            Option::None => { bfree(q); return Option[Bytes]::None; },
+            Option::Some(sock) => {
+              let m = dns_exchange_msg(h, sock, q);
+              net_close(h, sock);
+              bfree(q);
+              match m {
+                Option::None => { return Option[Bytes]::None; },
+                Option::Some(msg) => {
+                  if blen(msg) >= 1073741824 {
+                    bfree(msg);
+                    return Option[Bytes]::None;
+                  }
+                  let a = dns_parse_aaaa(msg, id);
+                  bfree(msg);
+                  return a;
+                },
+              }
+            },
+          }
+        },
+      }
+    },
+  }
+}
+
+/// The IPv6 address of the host `name` (16 bytes, network order): an IPv6
+/// literal is returned as it is, `localhost` is `::1`, then the system's
+/// resolver is asked for an AAAA record (see `dns_system_resolver`;
+/// /etc/hosts is not read for IPv6 addresses).
+/// ```
+/// let t = bfrom("::1");
+/// let mut bad = 1;
+/// match dns_lookup6(host, t) {
+///   Option::Some(a) => {
+///     if blen(a) == 16 && bget(a, 15) == 1 && bget(a, 0) == 0 { bad = 0; }
+///     bfree(a);
+///   },
+///   Option::None => {},
+/// }
+/// bfree(t);
+/// if bad != 0 { return 1; }
+/// ```
+fn dns_lookup6(h: &Host, name: &Bytes) -> Option[Bytes] {
+  match dns_ip6(name, 0, blen(name)) {
+    Option::Some(a) => { return Option[Bytes]::Some(a); },
+    Option::None => {},
+  }
+  let local = bfrom("localhost");
+  let same = bytes_eq(local, name);
+  bfree(local);
+  if same {
+    let mut t = text_new();
+    let mut k = 0;
+    while k < 15
+      invariant k <= 15 && vlen(t) == k
+    {
+      text_push(&mut t, 0);
+      k = k + 1;
+    }
+    text_push(&mut t, 1);
+    return Option[Bytes]::Some(text_finish(t));
+  }
+  match dns_system_resolver(h) {
+    Option::None => { return Option[Bytes]::None; },
+    Option::Some(resolver) => { return dns_lookup6_at(h, resolver, 53, name); },
   }
 }

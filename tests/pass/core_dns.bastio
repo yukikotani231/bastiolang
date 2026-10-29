@@ -218,8 +218,61 @@ fn hostss() -> u64
     hosts("   10.0.0.9   x  \n", "x", 167772169);
 }
 
+/// 1 unless the IPv6 text `t` reads as the 16 bytes of the hex string `want`
+/// (or, if `want` is empty, is refused).
+fn ip6_is(t: Str, want: Str) -> u64
+  requires slen(t) < 1000 && slen(want) < 100
+  ensures result <= 1
+{
+  let tb = bfrom(t);
+  let w = unhex(want);
+  let mut bad = 1;
+  match dns_ip6(tb, 0, blen(tb)) {
+    Option::Some(a) => {
+      if slen(want) == 32 && bytes_eq(a, w) { bad = 0; }
+      bfree(a);
+    },
+    Option::None => {
+      if slen(want) == 0 { bad = 0; }
+    },
+  }
+  bfree(w);
+  bfree(tb);
+  return bad;
+}
+
+/// IPv6 literals: full, compressed in each place, loopback and any, and
+/// the refusals (two gaps, too many or too few groups, a group of five
+/// digits, a stray colon, a bad digit, a dotted quad, empty).
+fn ip6s() -> u64
+  ensures result < 100
+{
+  let mut bad = 0;
+  bad = bad + ip6_is("2001:db8:0:0:0:0:0:1", "20010db8000000000000000000000001");
+  bad = bad + ip6_is("2001:db8::1", "20010db8000000000000000000000001");
+  bad = bad + ip6_is("::1", "00000000000000000000000000000001");
+  bad = bad + ip6_is("::", "00000000000000000000000000000000");
+  bad = bad + ip6_is("fe80::", "fe800000000000000000000000000000");
+  bad = bad + ip6_is("1::2", "00010000000000000000000000000002");
+  bad = bad + ip6_is("1:2:3:4:5:6:7::", "00010002000300040005000600070000");
+  bad = bad + ip6_is("::2:3:4:5:6:7:8", "00000002000300040005000600070008");
+  bad = bad + ip6_is("ABCD:ef01:2:3:4:5:6:7", "abcdef01000200030004000500060007");
+  bad = bad + ip6_is("1::2::3", "");
+  bad = bad + ip6_is("1:2:3:4:5:6:7", "");
+  bad = bad + ip6_is("1:2:3:4:5:6:7:8:9", "");
+  bad = bad + ip6_is("1:2:3:4:5:6:7:8::", "");
+  bad = bad + ip6_is("12345::1", "");
+  bad = bad + ip6_is(":1:2:3:4:5:6:7", "");
+  bad = bad + ip6_is("1:2:3:4:5:6:7:", "");
+  bad = bad + ip6_is("1:::2", "");
+  bad = bad + ip6_is("g::1", "");
+  bad = bad + ip6_is("::1.2.3.4", "");
+  bad = bad + ip6_is("", "");
+  return bad;
+}
+
 fn main() -> u64 {
-  let bad = queries() + refusals() + responses() + prefixes() + resolvs() + hostss();
+  let bad = queries() + refusals() + responses() + prefixes() + resolvs() + hostss() + ip6s();
   if bad > 0 { return 1; }
   return 0;
 }

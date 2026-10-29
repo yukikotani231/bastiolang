@@ -20,9 +20,12 @@ and refuses a truncated response or one with an error code.
 | Function | |
 | --- | --- |
 | [`dns_query`](#dns_query) | The query for the A record of the host `name`, with the message id `id` (the 12-byte header, the question, no length prefix). |
+| [`dns_query_type`](#dns_query_type) | `dns_query` for records of type `ty` (1 is A, 28 is AAAA). |
 | [`dns_parse_a`](#dns_parse_a) | The IPv4 address (as `net_ip4` makes it) in the first A record of the response `msg` to a query with id `id`; `None` if the response is not a complete answer without error to that query or holds no A record. |
 | [`dns_resolv_conf`](#dns_resolv_conf) | The first IPv4 `nameserver` of the text of a resolv.conf (IPv6 servers and other lines are skipped). |
 | [`dns_hosts`](#dns_hosts) | The IPv4 address that the text of a hosts file (`/etc/hosts`) gives to `name`, ignoring case; lines for IPv6 addresses and comments are skipped, and the first line that names it wins. |
+| [`dns_parse_aaaa`](#dns_parse_aaaa) | The IPv6 address (16 bytes, network order) in the first AAAA record of the response `msg` to an AAAA query with id `id`; `None` if the response is not a complete answer without error to that query or holds no AAAA record. |
+| [`dns_ip6`](#dns_ip6) | The IPv6 address written in `t[from..to]` as groups of one to four hex digits between colons, with at most one `::` for a run of zero groups (no embedded dotted quad, no zone). |
 
 Every example below is built, verified and run by `tests/run.sh`. An `assert` in one is proved at compile time from the contracts above it.
 
@@ -47,6 +50,33 @@ let mut bad = 1;
 match dns_query(name, 4660) {
   Option::Some(q) => {
     if blen(q) == 12 + 1 + 1 + 1 + 2 + 1 + 4 && bget(q, 0) == 18 && bget(q, 1) == 52 && bget(q, 12) == 1 && bget(q, 13) == 97 && bget(q, 14) == 2 {
+      bad = 0;
+    }
+    bfree(q);
+  },
+  Option::None => {},
+}
+bfree(name);
+if bad != 0 { return 1; }
+```
+
+### `dns_query_type`
+
+```bastio
+fn dns_query_type(name: &Bytes, id: u64, ty: u64) -> Option[Bytes]
+  requires id < 65536 && ty < 65536
+```
+
+`dns_query` for records of type `ty` (1 is A, 28 is AAAA).
+
+Example:
+
+```bastio
+let name = bfrom("a.b");
+let mut bad = 1;
+match dns_query_type(name, 4660, 28) {
+  Option::Some(q) => {
+    if blen(q) == 12 + 1 + 1 + 1 + 1 + 1 + 4 && bget(q, 18) == 28 {
       bad = 0;
     }
     bfree(q);
@@ -148,6 +178,77 @@ match dns_hosts(text, local) {
 bfree(local);
 bfree(name);
 bfree(text);
+if bad != 0 { return 1; }
+```
+
+### `dns_parse_aaaa`
+
+```bastio
+fn dns_parse_aaaa(msg: &Bytes, id: u64) -> Option[Bytes]
+  requires blen(msg) < 1073741824
+  ensures result is Option::Some ==> blen(result.Some) == 16
+```
+
+The IPv6 address (16 bytes, network order) in the first AAAA record of the
+response `msg` to an AAAA query with id `id`; `None` if the response is not
+a complete answer without error to that query or holds no AAAA record.
+
+Example:
+
+```bastio
+// a.b -> 2001:db8::1, the answer's name a pointer to the question's.
+let mut t = text_new();
+text_push(&mut t, 18); text_push(&mut t, 52); text_push(&mut t, 129); text_push(&mut t, 128);
+text_push(&mut t, 0); text_push(&mut t, 1); text_push(&mut t, 0); text_push(&mut t, 1);
+text_push(&mut t, 0); text_push(&mut t, 0); text_push(&mut t, 0); text_push(&mut t, 0);
+text_push(&mut t, 1); text_push(&mut t, 97); text_push(&mut t, 1); text_push(&mut t, 98); text_push(&mut t, 0);
+text_push(&mut t, 0); text_push(&mut t, 28); text_push(&mut t, 0); text_push(&mut t, 1);
+text_push(&mut t, 192); text_push(&mut t, 12);
+text_push(&mut t, 0); text_push(&mut t, 28); text_push(&mut t, 0); text_push(&mut t, 1);
+text_push(&mut t, 0); text_push(&mut t, 0); text_push(&mut t, 0); text_push(&mut t, 60);
+text_push(&mut t, 0); text_push(&mut t, 16);
+text_push(&mut t, 32); text_push(&mut t, 1); text_push(&mut t, 13); text_push(&mut t, 184);
+text_push(&mut t, 0); text_push(&mut t, 0); text_push(&mut t, 0); text_push(&mut t, 0);
+text_push(&mut t, 0); text_push(&mut t, 0); text_push(&mut t, 0); text_push(&mut t, 0);
+text_push(&mut t, 0); text_push(&mut t, 0); text_push(&mut t, 0); text_push(&mut t, 1);
+let msg = text_finish(t);
+let mut bad = 1;
+match dns_parse_aaaa(msg, 4660) {
+  Option::Some(a) => {
+    if blen(a) == 16 && bget(a, 0) == 32 && bget(a, 3) == 184 && bget(a, 15) == 1 { bad = 0; }
+    bfree(a);
+  },
+  Option::None => {},
+}
+bfree(msg);
+if bad != 0 { return 1; }
+```
+
+### `dns_ip6`
+
+```bastio
+fn dns_ip6(t: &Bytes, from: u64, to: u64) -> Option[Bytes]
+  requires from <= to && to <= blen(t)
+  ensures result is Option::Some ==> blen(result.Some) == 16
+```
+
+The IPv6 address written in `t[from..to]` as groups of one to four hex
+digits between colons, with at most one `::` for a run of zero groups
+(no embedded dotted quad, no zone): 16 bytes in network order, or `None`.
+
+Example:
+
+```bastio
+let t = bfrom("2001:db8::1");
+let mut bad = 1;
+match dns_ip6(t, 0, blen(t)) {
+  Option::Some(a) => {
+    if blen(a) == 16 && bget(a, 0) == 32 && bget(a, 1) == 1 && bget(a, 2) == 13 && bget(a, 3) == 184 && bget(a, 14) == 0 && bget(a, 15) == 1 { bad = 0; }
+    bfree(a);
+  },
+  Option::None => {},
+}
+bfree(t);
 if bad != 0 { return 1; }
 ```
 
@@ -253,3 +354,22 @@ fn dns_hosts_line(t: &Bytes, ls: u64, le0: u64, name: &Bytes) -> Option[u64]
 
 Internal: the address of the hosts-file line `t[ls..le]` (an IPv4 address,
 then names, `#` starts a comment) if `name` is one of its names.
+
+### `dns_scan_aaaa`
+
+```bastio
+fn dns_scan_aaaa(msg: &Bytes, from: u64, cnt: u64) -> Option[Bytes]
+  requires from <= blen(msg) && cnt < 65536
+  ensures result is Option::Some ==> blen(result.Some) == 16
+```
+
+Internal: the first AAAA record of `cnt` answers that start at `from`.
+
+### `dns_hexval`
+
+```bastio
+fn dns_hexval(c: u8) -> u64
+  ensures result <= 16
+```
+
+Internal: the value of the hex digit `c`, 16 if it is none.
