@@ -1,0 +1,275 @@
+// expect-exit: 0
+// core/tls13record: records made by Python's `cryptography` (ChaCha20-Poly1305
+// under a key and IV, with sequence numbers, padding and the largest size) are
+// made and opened the same way; a record with a bit changed, the wrong sequence
+// number, a bad header, a length that is wrong or nothing but padding is refused.
+import "core/tls13record.bastio";
+import "core/num.bastio";
+
+/// The value of the hex digit `c` (0 for anything else).
+fn nib(c: u8) -> u8
+  ensures result < 16
+{
+  if c >= 48 && c <= 57 { return c - 48; }
+  if c >= 97 && c <= 102 { return c - 87; }
+  return 0;
+}
+
+/// The bytes written as hex digits in `s`.
+fn unhex(s: Str) -> Bytes
+  requires slen(s) < 100000
+  ensures blen(result) == slen(s) / 2
+{
+  let n = slen(s) / 2;
+  let mut b = balloc(n);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && blen(b) == n && slen(s) >= 2 * n
+  {
+    bset(&mut b, i, nib(sget(s, 2 * i)) * 16 + nib(sget(s, 2 * i + 1)));
+    i = i + 1;
+  }
+  return b;
+}
+
+/// The lower-case hex text of `d`.
+fn hex(d: &Bytes) -> Bytes {
+  let mut t = text_new();
+  let mut i = 0;
+  while i < blen(d)
+    invariant i <= blen(d)
+  {
+    text_push(&mut t, hex_char(cast[u64](bget(d, i)) / 16));
+    text_push(&mut t, hex_char(cast[u64](bget(d, i)) % 16));
+    i = i + 1;
+  }
+  return text_finish(t);
+}
+
+/// The key and the IV of every test.
+fn key() -> Bytes
+  ensures blen(result) == 32
+{
+  let mut k = balloc(32);
+  let mut i = 0;
+  while i < 32
+    invariant i <= 32 && blen(k) == 32
+  {
+    bset(&mut k, i, cast[u8](i));
+    i = i + 1;
+  }
+  return k;
+}
+
+fn iv() -> Bytes
+  ensures blen(result) == 12
+{
+  let mut k = balloc(12);
+  let mut i = 0;
+  while i < 12
+    invariant i <= 12 && blen(k) == 12
+  {
+    bset(&mut k, i, cast[u8](100 + i));
+    i = i + 1;
+  }
+  return k;
+}
+
+/// `n` bytes, `n < 20000`, from a small generator (the same as the Python side).
+fn filler(n: u64, seed: u64) -> Bytes
+  requires n < 20000 && seed < 256
+  ensures blen(result) == n
+{
+  let mut b = balloc(n);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && blen(b) == n
+  {
+    bset(&mut b, i, cast[u8]((i * 7 + seed) % 256));
+    i = i + 1;
+  }
+  return b;
+}
+
+/// 1 unless sealing `plain` (of type `ct`, with `pad` zeros, as record `seq`) gives the SHA-256 `want` and opening it gives the message back.
+fn roundtrip(seq: u64, ct: u8, plain: &Bytes, pad: u64, want: Str) -> u64
+  requires blen(plain) <= 16384 && blen(plain) + 1 + pad + 16 <= 16640 && slen(want) == 64
+  ensures result <= 2
+{
+  let k = key();
+  let v = iv();
+  let rec = tls13_seal(k, v, seq, ct, plain, pad);
+  let d = sha256(rec);
+  let h = hex(d);
+  let mut bad = 0;
+  if !bytes_eq_str(h, want) { bad = bad + 1; }
+  match tls13_open(k, v, seq, rec) {
+    Option::Some(r) => {
+      if r.content_type != ct || !bytes_eq(r.data, plain) { bad = bad + 1; }
+      bfree(r.data);
+    },
+    Option::None => { bad = bad + 1; },
+  }
+  bfree(h);
+  bfree(d);
+  bfree(rec);
+  bfree(v);
+  bfree(k);
+  return bad;
+}
+
+/// 1 unless `tls13_open` refuses the record written in hex `s` as record `seq`.
+fn refused(s: Str, seq: u64) -> u64
+  requires slen(s) < 100000
+  ensures result <= 1
+{
+  let k = key();
+  let v = iv();
+  let rec = unhex(s);
+  let mut r = 1;
+  match tls13_open(k, v, seq, rec) {
+    Option::Some(x) => { bfree(x.data); },
+    Option::None => { r = 0; },
+  }
+  bfree(rec);
+  bfree(v);
+  bfree(k);
+  return r;
+}
+
+fn case0() -> u64
+  ensures result <= 2
+{
+  let p = balloc(0);
+  let r = roundtrip(0, 22, p, 0, "73c86cfb29781b3cac49da284b95c5c4313a9dde0437da378d9bf5eacd62c8bd");
+  bfree(p);
+  return r;
+}
+
+fn case1() -> u64
+  ensures result <= 2
+{
+  let p = bfrom("hello");
+  let r = roundtrip(1, 23, p, 3, "fc16966d3c861f4980a6ed8475a9531541a114a40d27aa26e92b52a01d835bd4");
+  bfree(p);
+  return r;
+}
+
+fn case2() -> u64
+  ensures result <= 2
+{
+  let mut p = balloc(2);
+  bset(&mut p, 0, 1);
+  let r = roundtrip(7, 21, p, 0, "f335b98b0f42f4c697c1b0446591d9b6a140944a520b8c0b3d6b1ab45195c893");
+  bfree(p);
+  return r;
+}
+
+fn case3() -> u64
+  ensures result <= 2
+{
+  let p = filler(100, 3);
+  let r = roundtrip(1099511627781, 22, p, 17, "c070d086eede9e056c151c77f03880519ed4254a6b2cf2930315ad053c6dabe2");
+  bfree(p);
+  return r;
+}
+
+fn case4() -> u64
+  ensures result <= 2
+{
+  let p = filler(16384, 9);
+  let r = roundtrip(5, 23, p, 239, "6da107d3519c4d6995569406a7fae804675d94ca03df067ada42105cc52fb9ff");
+  bfree(p);
+  return r;
+}
+
+fn refuse0() -> u64
+  ensures result <= 10
+{
+  return refused("16030300195c74d7a6f7b37652fb0fe64646e35a31992e89969923d0aad9", 0) +
+    refused("37030300195c74d7a6f7b37652fb0fe64646e35a31992e89969923d0aad9", 0) +
+    refused("17070300195c74d7a6f7b37652fb0fe64646e35a31992e89969923d0aad9", 0) +
+    refused("17830300195c74d7a6f7b37652fb0fe64646e35a31992e89969923d0aad9", 0) +
+    refused("17031300195c74d7a6f7b37652fb0fe64646e35a31992e89969923d0aad9", 0) +
+    refused("17030302195c74d7a6f7b37652fb0fe64646e35a31992e89969923d0aad9", 0) +
+    refused("17030340195c74d7a6f7b37652fb0fe64646e35a31992e89969923d0aad9", 0) +
+    refused("17030300115c74d7a6f7b37652fb0fe64646e35a31992e89969923d0aad9", 0) +
+    refused("17030300195d74d7a6f7b37652fb0fe64646e35a31992e89969923d0aad9", 0) +
+    refused("17030300197c74d7a6f7b37652fb0fe64646e35a31992e89969923d0aad9", 0);
+}
+
+fn refuse1() -> u64
+  ensures result <= 10
+{
+  return refused("17030300195c70d7a6f7b37652fb0fe64646e35a31992e89969923d0aad9", 0) +
+    refused("17030300195cf4d7a6f7b37652fb0fe64646e35a31992e89969923d0aad9", 0) +
+    refused("17030300195c74c7a6f7b37652fb0fe64646e35a31992e89969923d0aad9", 0) +
+    refused("17030300195c74d7a4f7b37652fb0fe64646e35a31992e89969923d0aad9", 0) +
+    refused("17030300195c74d7e6f7b37652fb0fe64646e35a31992e89969923d0aad9", 0) +
+    refused("17030300195c74d7a6ffb37652fb0fe64646e35a31992e89969923d0aad9", 0) +
+    refused("17030300195c74d7a6f7b27652fb0fe64646e35a31992e89969923d0aad9", 0) +
+    refused("17030300195c74d7a6f7937652fb0fe64646e35a31992e89969923d0aad9", 0) +
+    refused("17030300195c74d7a6f7b37252fb0fe64646e35a31992e89969923d0aad9", 0) +
+    refused("17030300195c74d7a6f7b3f652fb0fe64646e35a31992e89969923d0aad9", 0);
+}
+
+fn refuse2() -> u64
+  ensures result <= 10
+{
+  return refused("17030300195c74d7a6f7b37642fb0fe64646e35a31992e89969923d0aad9", 0) +
+    refused("17030300195c74d7a6f7b37652f90fe64646e35a31992e89969923d0aad9", 0) +
+    refused("17030300195c74d7a6f7b37652bb0fe64646e35a31992e89969923d0aad9", 0) +
+    refused("17030300195c74d7a6f7b37652fb07e64646e35a31992e89969923d0aad9", 0) +
+    refused("17030300195c74d7a6f7b37652fb0fe74646e35a31992e89969923d0aad9", 0) +
+    refused("17030300195c74d7a6f7b37652fb0fc64646e35a31992e89969923d0aad9", 0) +
+    refused("17030300195c74d7a6f7b37652fb0fe64246e35a31992e89969923d0aad9", 0) +
+    refused("17030300195c74d7a6f7b37652fb0fe6c646e35a31992e89969923d0aad9", 0) +
+    refused("17030300195c74d7a6f7b37652fb0fe64656e35a31992e89969923d0aad9", 0) +
+    refused("17030300195c74d7a6f7b37652fb0fe64646e15a31992e89969923d0aad9", 0);
+}
+
+fn refuse3() -> u64
+  ensures result <= 10
+{
+  return refused("17030300195c74d7a6f7b37652fb0fe64646a35a31992e89969923d0aad9", 0) +
+    refused("17030300195c74d7a6f7b37652fb0fe64646e35231992e89969923d0aad9", 0) +
+    refused("17030300195c74d7a6f7b37652fb0fe64646e35a30992e89969923d0aad9", 0) +
+    refused("17030300195c74d7a6f7b37652fb0fe64646e35a11992e89969923d0aad9", 0) +
+    refused("17030300195c74d7a6f7b37652fb0fe64646e35a319d2e89969923d0aad9", 0) +
+    refused("17030300195c74d7a6f7b37652fb0fe64646e35a31192e89969923d0aad9", 0) +
+    refused("17030300195c74d7a6f7b37652fb0fe64646e35a31993e89969923d0aad9", 0) +
+    refused("17030300195c74d7a6f7b37652fb0fe64646e35a31992e8b969923d0aad9", 0) +
+    refused("17030300195c74d7a6f7b37652fb0fe64646e35a31992ec9969923d0aad9", 0) +
+    refused("17030300195c74d7a6f7b37652fb0fe64646e35a31992e899e9923d0aad9", 0);
+}
+
+fn refuse4() -> u64
+  ensures result <= 10
+{
+  return refused("17030300195c74d7a6f7b37652fb0fe64646e35a31992e89969823d0aad9", 0) +
+    refused("17030300195c74d7a6f7b37652fb0fe64646e35a31992e8996b923d0aad9", 0) +
+    refused("17030300195c74d7a6f7b37652fb0fe64646e35a31992e89969927d0aad9", 0) +
+    refused("17030300195c74d7a6f7b37652fb0fe64646e35a31992e899699a3d0aad9", 0) +
+    refused("17030300195c74d7a6f7b37652fb0fe64646e35a31992e89969923c0aad9", 0) +
+    refused("17030300195c74d7a6f7b37652fb0fe64646e35a31992e89969923d0a8d9", 0) +
+    refused("17030300195c74d7a6f7b37652fb0fe64646e35a31992e89969923d0ead9", 0) +
+    refused("17030300195c74d7a6f7b37652fb0fe64646e35a31992e89969923d0aad1", 0) +
+    refused("17030300195c74d7a6f7b37652fb0fe64646e35a31992e89969923d0aad9", 1) +
+    refused("17030300195c74d7a6f7b37652fb0fe64646e35a31992e89969923d0aa", 0);
+}
+
+fn refuse5() -> u64
+  ensures result <= 5
+{
+  return refused("17030300195c74d7a6f7b37652fb0fe64646e35a31992e89969923d0aad900", 0) +
+    refused("", 0) +
+    refused("1703030000", 0) +
+    refused("170303001134f0c77f86d134d5f3abe3d23434d58207", 0) +
+    refused("17030300163411bbca98a54c6b1edafdaf4c5e7ea7151a3ac564de", 0);
+}
+
+fn main() -> u64 {
+  let bad = case0() + case1() + case2() + case3() + case4() + refuse0() + refuse1() + refuse2() + refuse3() + refuse4() + refuse5();
+  if bad > 0 { return 1; }
+  return 0;
+}

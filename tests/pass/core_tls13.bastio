@@ -1,0 +1,149 @@
+// expect-exit: 0
+// core/tls13: the key schedule of TLS 1.3 (RFC 8446 section 7). The early
+// secret, `derived` and the handshake secret are the values of RFC 8448; the
+// rest were computed by a Python reference from them.
+import "core/tls13.bastio";
+import "core/num.bastio";
+
+/// The value of the hex digit `c` (0 for anything else).
+fn nib(c: u8) -> u8
+  ensures result < 16
+{
+  if c >= 48 && c <= 57 { return c - 48; }
+  if c >= 97 && c <= 102 { return c - 87; }
+  return 0;
+}
+
+/// The bytes written as hex digits in `s`.
+fn unhex(s: Str) -> Bytes
+  requires slen(s) < 100000
+  ensures blen(result) == slen(s) / 2
+{
+  let n = slen(s) / 2;
+  let mut b = balloc(n);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && blen(b) == n && slen(s) >= 2 * n
+  {
+    bset(&mut b, i, nib(sget(s, 2 * i)) * 16 + nib(sget(s, 2 * i + 1)));
+    i = i + 1;
+  }
+  return b;
+}
+
+/// The lower-case hex text of `d`.
+fn hex(d: &Bytes) -> Bytes {
+  let mut t = text_new();
+  let mut i = 0;
+  while i < blen(d)
+    invariant i <= blen(d)
+  {
+    text_push(&mut t, hex_char(cast[u64](bget(d, i)) / 16));
+    text_push(&mut t, hex_char(cast[u64](bget(d, i)) % 16));
+    i = i + 1;
+  }
+  return text_finish(t);
+}
+
+/// 1 unless `d` is the bytes written in `want`.
+fn is_hex(d: &Bytes, want: Str) -> u64
+  ensures result <= 1
+{
+  let h = hex(d);
+  let ok = bytes_eq_str(h, want);
+  bfree(h);
+  if ok { return 0; }
+  return 1;
+}
+
+fn schedule() -> u64
+  ensures result <= 4
+{
+  let shared = unhex("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
+  let zeros = balloc(32);
+  let early = tls13_early_secret();
+  let empty = balloc(0);
+  let eh = sha256(empty);
+  let derived = tls13_derive_secret(early, "derived", eh);
+  let hs = tls13_next_secret(early, shared);
+  let master = tls13_next_secret(hs, zeros);
+  let bad = is_hex(early, "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a")
+    + is_hex(derived, "6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba")
+    + is_hex(hs, "1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac")
+    + is_hex(master, "18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919");
+  bfree(master);
+  bfree(hs);
+  bfree(derived);
+  bfree(eh);
+  bfree(empty);
+  bfree(early);
+  bfree(zeros);
+  bfree(shared);
+  return bad;
+}
+
+fn traffic() -> u64
+  ensures result <= 9
+{
+  let hs = unhex("1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac");
+  let h = bfrom("transcript");
+  let th = sha256(h);
+  let chs = tls13_derive_secret(hs, "c hs traffic", th);
+  let k16 = tls13_traffic_key(chs, 16);
+  let k32 = tls13_traffic_key(chs, 32);
+  let iv = tls13_traffic_iv(chs);
+  let n0 = tls13_nonce(iv, 0);
+  let n5 = tls13_nonce(iv, 5);
+  let nbig = tls13_nonce(iv, 72623859790382856);
+  let fin = tls13_finished(chs, th);
+  let bad = is_hex(th, "54e6289e14c7b0e7ad9acc2dfc4c1e3d027d0eef7f5c4c3fe7c292761d0e06a6")
+    + is_hex(chs, "6dff8b95b30ad4c1df61bd4c1cd2545604686659cde68da3511b69cdcb96af59")
+    + is_hex(k16, "4b9f26eb08c90918725b1e10fa339851")
+    + is_hex(k32, "c9211b95aedb06f06c672f9bf372a676a35317995ee2c52d5503ecaa3b4796d5")
+    + is_hex(iv, "2b177f4c7e5103785f1dc2fb")
+    + is_hex(n0, "2b177f4c7e5103785f1dc2fb")
+    + is_hex(n5, "2b177f4c7e5103785f1dc2fe")
+    + is_hex(nbig, "2b177f4c7f53007c5a1bc5f3");
+  let bad2 = is_hex(fin, "cbc78a28a1767065ad830b377958ee1245d384bd3bd688c49a45d77171f532e1");
+  bfree(fin);
+  bfree(nbig);
+  bfree(n5);
+  bfree(n0);
+  bfree(iv);
+  bfree(k32);
+  bfree(k16);
+  bfree(chs);
+  bfree(th);
+  bfree(h);
+  bfree(hs);
+  return bad + bad2;
+}
+
+/// The longest label and context a label can have, and a 100-byte output, compared by digest.
+fn longest() -> u64
+  ensures result <= 1
+{
+  let hs = unhex("1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac");
+  let mut ctx = balloc(255);
+  let mut i = 0;
+  while i < 255
+    invariant i <= 255 && blen(ctx) == 255
+  {
+    bset(&mut ctx, i, 99);
+    i = i + 1;
+  }
+  let out = tls13_expand_label(hs, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", ctx, 100);
+  let d = sha256(out);
+  let bad = is_hex(d, "0d3d690bfee0718239758696b24ffd5b370d6616bd0abb362b8d54b5ed9205bb");
+  bfree(d);
+  bfree(out);
+  bfree(ctx);
+  bfree(hs);
+  return bad;
+}
+
+fn main() -> u64 {
+  let bad = schedule() + traffic() + longest();
+  if bad > 0 { return 1; }
+  return 0;
+}

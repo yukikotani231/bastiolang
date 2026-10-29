@@ -1,0 +1,237 @@
+// core/sha512.bastio: SHA-512 (FIPS 180-4).
+//
+// What is proved: every access is in bounds, nothing leaks, and a digest is
+// 64 bytes. Not proved: that the digest is SHA-512's (the tests check the
+// FIPS 180-4 vectors, the block-boundary lengths 111, 112, 127, 128 and 129,
+// and a million `a`s), or that the code takes the same time for
+// every input (it does not branch on its data, but nothing checks that).
+import "bytes.bastio";
+import "endian.bastio";
+import "text.bastio";
+
+/// Internal: the round constants.
+fn sha512_k() -> Vec[u64]
+  ensures vlen(result) == 80
+{
+  let mut k = vec_new[u64]();
+  vec_push(&mut k, 4794697086780616226);
+  vec_push(&mut k, 8158064640168781261);
+  vec_push(&mut k, 13096744586834688815);
+  vec_push(&mut k, 16840607885511220156);
+  vec_push(&mut k, 4131703408338449720);
+  vec_push(&mut k, 6480981068601479193);
+  vec_push(&mut k, 10538285296894168987);
+  vec_push(&mut k, 12329834152419229976);
+  vec_push(&mut k, 15566598209576043074);
+  vec_push(&mut k, 1334009975649890238);
+  vec_push(&mut k, 2608012711638119052);
+  vec_push(&mut k, 6128411473006802146);
+  vec_push(&mut k, 8268148722764581231);
+  vec_push(&mut k, 9286055187155687089);
+  vec_push(&mut k, 11230858885718282805);
+  vec_push(&mut k, 13951009754708518548);
+  vec_push(&mut k, 16472876342353939154);
+  vec_push(&mut k, 17275323862435702243);
+  vec_push(&mut k, 1135362057144423861);
+  vec_push(&mut k, 2597628984639134821);
+  vec_push(&mut k, 3308224258029322869);
+  vec_push(&mut k, 5365058923640841347);
+  vec_push(&mut k, 6679025012923562964);
+  vec_push(&mut k, 8573033837759648693);
+  vec_push(&mut k, 10970295158949994411);
+  vec_push(&mut k, 12119686244451234320);
+  vec_push(&mut k, 12683024718118986047);
+  vec_push(&mut k, 13788192230050041572);
+  vec_push(&mut k, 14330467153632333762);
+  vec_push(&mut k, 15395433587784984357);
+  vec_push(&mut k, 489312712824947311);
+  vec_push(&mut k, 1452737877330783856);
+  vec_push(&mut k, 2861767655752347644);
+  vec_push(&mut k, 3322285676063803686);
+  vec_push(&mut k, 5560940570517711597);
+  vec_push(&mut k, 5996557281743188959);
+  vec_push(&mut k, 7280758554555802590);
+  vec_push(&mut k, 8532644243296465576);
+  vec_push(&mut k, 9350256976987008742);
+  vec_push(&mut k, 10552545826968843579);
+  vec_push(&mut k, 11727347734174303076);
+  vec_push(&mut k, 12113106623233404929);
+  vec_push(&mut k, 14000437183269869457);
+  vec_push(&mut k, 14369950271660146224);
+  vec_push(&mut k, 15101387698204529176);
+  vec_push(&mut k, 15463397548674623760);
+  vec_push(&mut k, 17586052441742319658);
+  vec_push(&mut k, 1182934255886127544);
+  vec_push(&mut k, 1847814050463011016);
+  vec_push(&mut k, 2177327727835720531);
+  vec_push(&mut k, 2830643537854262169);
+  vec_push(&mut k, 3796741975233480872);
+  vec_push(&mut k, 4115178125766777443);
+  vec_push(&mut k, 5681478168544905931);
+  vec_push(&mut k, 6601373596472566643);
+  vec_push(&mut k, 7507060721942968483);
+  vec_push(&mut k, 8399075790359081724);
+  vec_push(&mut k, 8693463985226723168);
+  vec_push(&mut k, 9568029438360202098);
+  vec_push(&mut k, 10144078919501101548);
+  vec_push(&mut k, 10430055236837252648);
+  vec_push(&mut k, 11840083180663258601);
+  vec_push(&mut k, 13761210420658862357);
+  vec_push(&mut k, 14299343276471374635);
+  vec_push(&mut k, 14566680578165727644);
+  vec_push(&mut k, 15097957966210449927);
+  vec_push(&mut k, 16922976911328602910);
+  vec_push(&mut k, 17689382322260857208);
+  vec_push(&mut k, 500013540394364858);
+  vec_push(&mut k, 748580250866718886);
+  vec_push(&mut k, 1242879168328830382);
+  vec_push(&mut k, 1977374033974150939);
+  vec_push(&mut k, 2944078676154940804);
+  vec_push(&mut k, 3659926193048069267);
+  vec_push(&mut k, 4368137639120453308);
+  vec_push(&mut k, 4836135668995329356);
+  vec_push(&mut k, 5532061633213252278);
+  vec_push(&mut k, 6448918945643986474);
+  vec_push(&mut k, 6902733635092675308);
+  vec_push(&mut k, 7801388544844847127);
+  return k;
+}
+
+/// Internal: `x` rotated right by `n` bits, 1 to 63.
+fn sha512_rotr(x: u64, n: u64) -> u64
+  requires n >= 1 && n <= 63
+{
+  return (x >> n) | wrap_mul(x, 1 << (64 - n));
+}
+
+/// Internal: the eight state words after the 128-byte block at `at` of `m`.
+fn sha512_block(h: &mut Vec[u64], k: &Vec[u64], w: &mut Vec[u64], m: &Bytes, at: u64)
+  requires vlen(h) == 8 && vlen(k) == 80 && vlen(w) == 80 && at + 128 <= blen(m)
+  ensures vlen(h) == 8 && vlen(w) == 80
+{
+  let mut i = 0;
+  while i < 16
+    invariant i <= 16 && vlen(w) == 80 && at + 128 <= blen(m)
+  {
+    vec_set(&mut w, i, load_be64(m, at + 8 * i));
+    i = i + 1;
+  }
+  while i < 80
+    invariant 16 <= i && i <= 80 && vlen(w) == 80
+  {
+    let w15 = vec_get(w, i - 15);
+    let w2 = vec_get(w, i - 2);
+    let s0 = sha512_rotr(w15, 1) ^ sha512_rotr(w15, 8) ^ (w15 >> 7);
+    let s1 = sha512_rotr(w2, 19) ^ sha512_rotr(w2, 61) ^ (w2 >> 6);
+    vec_set(&mut w, i, wrap_add(wrap_add(vec_get(w, i - 16), s0), wrap_add(vec_get(w, i - 7), s1)));
+    i = i + 1;
+  }
+  let mut a = vec_get(h, 0);
+  let mut b = vec_get(h, 1);
+  let mut c = vec_get(h, 2);
+  let mut d = vec_get(h, 3);
+  let mut e = vec_get(h, 4);
+  let mut f = vec_get(h, 5);
+  let mut g = vec_get(h, 6);
+  let mut hh = vec_get(h, 7);
+  let mut r = 0;
+  while r < 80
+    invariant r <= 80 && vlen(w) == 80 && vlen(k) == 80
+  {
+    let big1 = sha512_rotr(e, 14) ^ sha512_rotr(e, 18) ^ sha512_rotr(e, 41);
+    let ch = (e & f) ^ ((e ^ 18446744073709551615) & g);
+    let t1 = wrap_add(wrap_add(wrap_add(hh, big1), wrap_add(ch, vec_get(k, r))), vec_get(w, r));
+    let big0 = sha512_rotr(a, 28) ^ sha512_rotr(a, 34) ^ sha512_rotr(a, 39);
+    let maj = (a & b) ^ (a & c) ^ (b & c);
+    let t2 = wrap_add(big0, maj);
+    hh = g;
+    g = f;
+    f = e;
+    e = wrap_add(d, t1);
+    d = c;
+    c = b;
+    b = a;
+    a = wrap_add(t1, t2);
+    r = r + 1;
+  }
+  vec_set(&mut h, 0, wrap_add(vec_get(h, 0), a));
+  vec_set(&mut h, 1, wrap_add(vec_get(h, 1), b));
+  vec_set(&mut h, 2, wrap_add(vec_get(h, 2), c));
+  vec_set(&mut h, 3, wrap_add(vec_get(h, 3), d));
+  vec_set(&mut h, 4, wrap_add(vec_get(h, 4), e));
+  vec_set(&mut h, 5, wrap_add(vec_get(h, 5), f));
+  vec_set(&mut h, 6, wrap_add(vec_get(h, 6), g));
+  vec_set(&mut h, 7, wrap_add(vec_get(h, 7), hh));
+}
+
+/// The SHA-512 digest of `m`: 64 bytes.
+/// ```
+/// let m = bfrom("abc");
+/// let d = sha512(m);
+/// let first = bget(d, 0);          // dd af 35 a1 ... a5 4c
+/// let last = bget(d, 63);
+/// let n = blen(d);
+/// bfree(d);
+/// bfree(m);
+/// if n != 64 || first != 221 || last != 159 { return 1; }
+/// ```
+fn sha512(m: &Bytes) -> Bytes
+  ensures blen(result) == 64
+{
+  let n = blen(m);
+  let k = sha512_k();
+  let mut w = vec_new[u64]();
+  let mut h = vec_new[u64]();
+  let mut i = 0;
+  while i < 80
+    invariant i <= 80 && vlen(w) == i
+  {
+    vec_push(&mut w, 0);
+    i = i + 1;
+  }
+  vec_push(&mut h, 7640891576956012808);
+  vec_push(&mut h, 13503953896175478587);
+  vec_push(&mut h, 4354685564936845355);
+  vec_push(&mut h, 11912009170470909681);
+  vec_push(&mut h, 5840696475078001361);
+  vec_push(&mut h, 11170449401992604703);
+  vec_push(&mut h, 2270897969802886507);
+  vec_push(&mut h, 6620516959819538809);
+  // The whole blocks straight from the message.
+  let whole = n / 128 * 128;
+  let mut at = 0;
+  while at < whole
+    invariant at <= whole && whole <= n && n == blen(m) && at % 128 == 0 && vlen(h) == 8 && vlen(k) == 80 && vlen(w) == 80
+  {
+    sha512_block(&mut h, k, &mut w, m, at);
+    at = at + 128;
+  }
+  // The rest, a 1 bit, zeros and the length in bits (mod 2^64; the upper 64
+  // bits of the 128-bit field stay zero) in one or two more blocks.
+  let rem = n - whole;
+  let mut tail = balloc(256);
+  bytes_copy_span(&mut tail, 0, m, whole, n);
+  bset(&mut tail, rem, 128);
+  let mut tlen = 128;
+  if rem >= 112 {
+    tlen = 256;
+  }
+  store_be64(&mut tail, tlen - 8, wrap_mul(n, 8));
+  sha512_block(&mut h, k, &mut w, tail, 0);
+  if tlen == 256 {
+    sha512_block(&mut h, k, &mut w, tail, 128);
+  }
+  let mut out = balloc(64);
+  let mut j = 0;
+  while j < 8
+    invariant j <= 8 && vlen(h) == 8 && blen(out) == 64
+  {
+    store_be64(&mut out, 8 * j, vec_get(h, j));
+    j = j + 1;
+  }
+  bfree(tail);
+  vec_free(k);
+  vec_free(w);
+  vec_free(h);
+  return out;
+}

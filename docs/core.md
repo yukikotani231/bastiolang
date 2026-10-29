@@ -45,6 +45,7 @@ Each module has a reference page, generated from its source: every function with
 | [`core/chacha20poly1305.bastio`](lib/core-chacha20poly1305.md) | Authenticated encryption with ChaCha20 and Poly1305 (RFC 8439 section 2.8). |
 | [`core/csum.bastio`](lib/core-csum.md) | Checksums over byte strings. |
 | [`core/der.bastio`](lib/core-der.md) | Reading ASN.1 DER, the encoding of X.509 certificates and of most of what TLS carries (RFC 5280, ITU-T X.690). |
+| [`core/ed25519.bastio`](lib/core-ed25519.md) | Ed25519 signature verification (RFC 8032 section 5.1.7), on the field arithmetic of core/x25519.bastio and the hash of core/sha512.bastio. |
 | [`core/endian.bastio`](lib/core-endian.md) | Fixed-width integers stored in byte strings, as packet headers, file formats and disk blocks hold them. |
 | [`core/format.bastio`](lib/core-format.md) | Building text out of pieces. |
 | [`core/hashmap.bastio`](lib/core-hashmap.md) | A hash map from `u64` keys to values of any type `V` that can be copied (`u64`, `Span`, a struct of numbers, ...). |
@@ -61,11 +62,14 @@ Each module has a reference page, generated from its source: every function with
 | [`core/scan.bastio`](lib/core-scan.md) | Cutting a byte string into pieces. |
 | [`core/set.bastio`](lib/core-set.md) | A set of `u64`, built on core/hashmap.bastio. |
 | [`core/sha256.bastio`](lib/core-sha256.md) | SHA-256 (FIPS 180-4) and HMAC-SHA-256 (RFC 2104). |
+| [`core/sha512.bastio`](lib/core-sha512.md) | SHA-512 (FIPS 180-4). |
 | [`core/slots.bastio`](lib/core-slots.md) | A growable table of numbered slots, for ids that a program hands out and takes back (process ids, file descriptors, pipe and socket numbers). |
 | [`core/sort.bastio`](lib/core-sort.md) | Sorting and searching vectors of `u64`, and sorting indices by a key. |
 | [`core/spancmp.bastio`](lib/core-spancmp.md) | Comparing two pieces of a text in byte order. |
 | [`core/strsort.bastio`](lib/core-strsort.md) | Sorting pieces of a text in dictionary order (byte order), for sorted word lists, directory listings and `sort | uniq`. |
 | [`core/text.bastio`](lib/core-text.md) | Building byte strings. |
+| [`core/tls13.bastio`](lib/core-tls13.md) | The key schedule of TLS 1.3 with SHA-256 (RFC 8446 section 7). |
+| [`core/tls13record.bastio`](lib/core-tls13record.md) | The TLS 1.3 record layer with the ChaCha20-Poly1305 cipher suite (RFC 8446 section 5). |
 | [`core/url.bastio`](lib/core-url.md) | Percent-encoding (RFC 3986 section 2.1) and the query string of a request target (`/path?a=1&b=two%20words`). |
 | [`core/utf8.bastio`](lib/core-utf8.md) | UTF-8 validation (RFC 3629). |
 | [`core/wtext.bastio`](lib/core-wtext.md) | Text kept as a `Vec[u64]`, one character a word. |

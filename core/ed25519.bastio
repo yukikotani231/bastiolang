@@ -1,0 +1,486 @@
+// core/ed25519.bastio: Ed25519 signature verification (RFC 8032 section
+// 5.1.7), on the field arithmetic of core/x25519.bastio and the hash of
+// core/sha512.bastio.
+//
+// What is proved: every access is in bounds, nothing leaks, and the
+// functions return what their types say. Not proved: that `ed25519_verify`
+// accepts exactly the signatures RFC 8032 accepts (the tests check the
+// RFC's vectors, signatures made by another implementation, and every
+// single-bit change of a signature, a message and a key being refused).
+// Verification works on public data only, so nothing here is constant time.
+//
+// A point is a `Vec[u64]` of 64 limbs: the extended coordinates X, Y, Z and
+// T, 16 limbs each, with x = X/Z, y = Y/Z and x * y = T/Z.
+import "x25519.bastio";
+import "sha512.bastio";
+import "bytes.bastio";
+
+/// Internal: the nibble of the hex digit `c`.
+fn ed_nib(c: u8) -> u8
+  ensures result < 16
+{
+  if c >= 48 && c <= 57 { return c - 48; }
+  if c >= 97 && c <= 102 { return c - 87; }
+  return 0;
+}
+
+/// Internal: the field element whose 32 little-endian bytes are the 64 hex
+/// digits of `s`.
+fn ed_const(s: Str) -> Vec[u64]
+  requires slen(s) == 64
+  ensures vlen(result) == 16
+{
+  let mut b = balloc(32);
+  let mut i = 0;
+  while i < 32
+    invariant i <= 32 && blen(b) == 32 && slen(s) == 64
+  {
+    bset(&mut b, i, ed_nib(sget(s, 2 * i)) * 16 + ed_nib(sget(s, 2 * i + 1)));
+    i = i + 1;
+  }
+  let f = fe_unpack(b);
+  bfree(b);
+  return f;
+}
+
+/// Internal: limbs `16 * k..16 * k + 16` of `p` (a coordinate), copied.
+fn ed_get(p: &Vec[u64], k: u64) -> Vec[u64]
+  requires vlen(p) == 64 && k < 4
+  ensures vlen(result) == 16
+{
+  let mut r = fe_zero();
+  let mut i = 0;
+  while i < 16
+    invariant i <= 16 && vlen(r) == 16 && vlen(p) == 64 && k < 4
+  {
+    vec_set(&mut r, i, vec_get(p, 16 * k + i));
+    i = i + 1;
+  }
+  return r;
+}
+
+/// Internal: the point with the coordinates `x`, `y`, `z` and `t`.
+fn ed_make(x: &Vec[u64], y: &Vec[u64], z: &Vec[u64], t: &Vec[u64]) -> Vec[u64]
+  requires vlen(x) == 16 && vlen(y) == 16 && vlen(z) == 16 && vlen(t) == 16
+  ensures vlen(result) == 64
+{
+  let mut r = vec_new[u64]();
+  let mut i = 0;
+  while i < 16
+    invariant i <= 16 && vlen(r) == i && vlen(x) == 16
+  {
+    vec_push(&mut r, vec_get(x, i));
+    i = i + 1;
+  }
+  i = 0;
+  while i < 16
+    invariant i <= 16 && vlen(r) == 16 + i && vlen(y) == 16
+  {
+    vec_push(&mut r, vec_get(y, i));
+    i = i + 1;
+  }
+  i = 0;
+  while i < 16
+    invariant i <= 16 && vlen(r) == 32 + i && vlen(z) == 16
+  {
+    vec_push(&mut r, vec_get(z, i));
+    i = i + 1;
+  }
+  i = 0;
+  while i < 16
+    invariant i <= 16 && vlen(r) == 48 + i && vlen(t) == 16
+  {
+    vec_push(&mut r, vec_get(t, i));
+    i = i + 1;
+  }
+  return r;
+}
+
+/// Internal: the neutral point (0, 1).
+fn ed_identity() -> Vec[u64]
+  ensures vlen(result) == 64
+{
+  let x = fe_zero();
+  let mut y = fe_zero();
+  vec_set(&mut y, 0, 1);
+  let z = fe_copy(y);
+  let t = fe_zero();
+  let r = ed_make(x, y, z, t);
+  vec_free(x);
+  vec_free(y);
+  vec_free(z);
+  vec_free(t);
+  return r;
+}
+
+/// Internal: the sum of the points `p` and `q` (the complete addition law of
+/// the twisted Edwards curve, which also doubles).
+fn ed_add(p: &Vec[u64], q: &Vec[u64]) -> Vec[u64]
+  requires vlen(p) == 64 && vlen(q) == 64
+  ensures vlen(result) == 64
+{
+  let x1 = ed_get(p, 0);
+  let y1 = ed_get(p, 1);
+  let z1 = ed_get(p, 2);
+  let t1 = ed_get(p, 3);
+  let x2 = ed_get(q, 0);
+  let y2 = ed_get(q, 1);
+  let z2 = ed_get(q, 2);
+  let t2 = ed_get(q, 3);
+  let d2 = ed_const("59f1b226949bd6eb56b183829a14e00030d1f3eef2808e19e7fcdf56dcd90624");
+  let ym1 = fe_sub(y1, x1);
+  let ym2 = fe_sub(y2, x2);
+  let yp1 = fe_add(y1, x1);
+  let yp2 = fe_add(y2, x2);
+  let a = fe_mul(ym1, ym2);
+  let b = fe_mul(yp1, yp2);
+  let t12 = fe_mul(t1, t2);
+  let c = fe_mul(t12, d2);
+  let zz = fe_mul(z1, z2);
+  let d = fe_add(zz, zz);
+  let e = fe_sub(b, a);
+  let f = fe_sub(d, c);
+  let g = fe_add(d, c);
+  let h = fe_add(b, a);
+  let x3 = fe_mul(e, f);
+  let y3 = fe_mul(g, h);
+  let t3 = fe_mul(e, h);
+  let z3 = fe_mul(f, g);
+  let r = ed_make(x3, y3, z3, t3);
+  vec_free(x1);
+  vec_free(y1);
+  vec_free(z1);
+  vec_free(t1);
+  vec_free(x2);
+  vec_free(y2);
+  vec_free(z2);
+  vec_free(t2);
+  vec_free(d2);
+  vec_free(ym1);
+  vec_free(ym2);
+  vec_free(yp1);
+  vec_free(yp2);
+  vec_free(a);
+  vec_free(b);
+  vec_free(t12);
+  vec_free(c);
+  vec_free(zz);
+  vec_free(d);
+  vec_free(e);
+  vec_free(f);
+  vec_free(g);
+  vec_free(h);
+  vec_free(x3);
+  vec_free(y3);
+  vec_free(t3);
+  vec_free(z3);
+  return r;
+}
+
+/// Internal: the scalar `k` (little-endian bytes) times the point `p`, by
+/// doubling and adding from the top bit down.
+fn ed_mul(p: &Vec[u64], k: &Bytes) -> Vec[u64]
+  requires vlen(p) == 64 && blen(k) < 1000
+  ensures vlen(result) == 64
+{
+  let mut r = ed_identity();
+  let mut i = 8 * blen(k);
+  while i > 0
+    invariant i <= 8 * blen(k) && blen(k) < 1000 && vlen(r) == 64 && vlen(p) == 64
+  {
+    i = i - 1;
+    let dbl = ed_add(r, r);
+    vec_free(r);
+    r = dbl;
+    if ((cast[u64](bget(k, i / 8)) >> (i % 8)) & 1) == 1 {
+      let sum = ed_add(r, p);
+      vec_free(r);
+      r = sum;
+    }
+  }
+  return r;
+}
+
+/// Internal: the base point.
+fn ed_base() -> Vec[u64]
+  ensures vlen(result) == 64
+{
+  let x = ed_const("1ad5258f602d56c9b2a7259560c72c695cdcd6fd31e2a4c0fe536ecdd3366921");
+  let y = ed_const("5866666666666666666666666666666666666666666666666666666666666666");
+  let mut z = fe_zero();
+  vec_set(&mut z, 0, 1);
+  let t = fe_mul(x, y);
+  let r = ed_make(x, y, z, t);
+  vec_free(x);
+  vec_free(y);
+  vec_free(z);
+  vec_free(t);
+  return r;
+}
+
+/// Internal: `a` to the power (p - 5) / 8 = 2^252 - 3.
+fn fe_pow2523(a: &Vec[u64]) -> Vec[u64]
+  requires vlen(a) == 16
+  ensures vlen(result) == 16
+{
+  let mut c = fe_copy(a);
+  let mut n = 0;
+  while n < 251
+    invariant n <= 251 && vlen(c) == 16 && vlen(a) == 16
+  {
+    let sq = fe_mul(c, c);
+    vec_free(c);
+    c = sq;
+    // The exponent 2^252 - 3 has every bit set except bit 1.
+    if n != 249 {
+      let m = fe_mul(c, a);
+      vec_free(c);
+      c = m;
+    }
+    n = n + 1;
+  }
+  return c;
+}
+
+/// Internal: the bytes of the field element `a`, reduced.
+fn ed_bytes(a: &Vec[u64]) -> Bytes
+  requires vlen(a) == 16
+  ensures blen(result) == 32
+{
+  return fe_pack(a);
+}
+
+/// Internal: the point whose compressed form is the 32 bytes `b` (y, then the
+/// parity of x in the top bit), or nothing if there is no such point.
+fn ed_decompress(b: &Bytes) -> Option[Vec[u64]]
+  requires blen(b) == 32
+  ensures result is Option::Some ==> vlen(result.Some) == 64
+{
+  let y = fe_unpack(b);
+  // y must be below p: packing it again must give the bytes back.
+  let yb = ed_bytes(y);
+  let mut canonical = (bget(b, 31) & 127) == bget(yb, 31);
+  let mut i = 0;
+  while i < 31
+    invariant i <= 31 && blen(b) == 32 && blen(yb) == 32
+  {
+    if bget(b, i) != bget(yb, i) { canonical = false; }
+    i = i + 1;
+  }
+  bfree(yb);
+  let sign = cast[u64](bget(b, 31) >> 7);
+  let mut one = fe_zero();
+  vec_set(&mut one, 0, 1);
+  let d = ed_const("a3785913ca4deb75abd841414d0a700098e879777940c78c73fe6f2bee6c0352");
+  let yy = fe_mul(y, y);
+  let u = fe_sub(yy, one);
+  let dyy = fe_mul(d, yy);
+  let v = fe_add(dyy, one);
+  // x = u v^3 (u v^7)^((p - 5) / 8)
+  let v2 = fe_mul(v, v);
+  let v3 = fe_mul(v2, v);
+  let v4 = fe_mul(v2, v2);
+  let v7 = fe_mul(v4, v3);
+  let uv3 = fe_mul(u, v3);
+  let uv7 = fe_mul(u, v7);
+  let pw = fe_pow2523(uv7);
+  let mut x = fe_mul(uv3, pw);
+  // v x^2 must be u, or -u (then x is multiplied by the square root of -1).
+  let xx = fe_mul(x, x);
+  let vxx = fe_mul(v, xx);
+  let diff = fe_sub(vxx, u);
+  let sum = fe_add(vxx, u);
+  let dz = ed_bytes(diff);
+  let sz = ed_bytes(sum);
+  let mut diff_zero = true;
+  let mut sum_zero = true;
+  i = 0;
+  while i < 32
+    invariant i <= 32 && blen(dz) == 32 && blen(sz) == 32
+  {
+    if bget(dz, i) != 0 { diff_zero = false; }
+    if bget(sz, i) != 0 { sum_zero = false; }
+    i = i + 1;
+  }
+  bfree(dz);
+  bfree(sz);
+  let mut valid = canonical && (diff_zero || sum_zero);
+  if !diff_zero && sum_zero {
+    let sqm1 = ed_const("b0a00e4a271beec478e42fad0618432fa7d7fb3d99004d2b0bdfc14f8024832b");
+    let x2 = fe_mul(x, sqm1);
+    vec_free(x);
+    vec_free(sqm1);
+    x = x2;
+  }
+  // The sign: x = 0 with the sign bit set is not a point; otherwise negate x
+  // if its parity is not the sign.
+  let xb = ed_bytes(x);
+  let mut x_zero = true;
+  i = 0;
+  while i < 32
+    invariant i <= 32 && blen(xb) == 32
+  {
+    if bget(xb, i) != 0 { x_zero = false; }
+    i = i + 1;
+  }
+  let parity = cast[u64](bget(xb, 0) & 1);
+  bfree(xb);
+  if x_zero && sign == 1 { valid = false; }
+  let zero = fe_zero();
+  if parity != sign {
+    let nx = fe_sub(zero, x);
+    vec_free(x);
+    x = nx;
+  }
+  let t = fe_mul(x, y);
+  let p = ed_make(x, y, one, t);
+  vec_free(zero);
+  vec_free(t);
+  vec_free(sum);
+  vec_free(diff);
+  vec_free(vxx);
+  vec_free(xx);
+  vec_free(x);
+  vec_free(pw);
+  vec_free(uv7);
+  vec_free(uv3);
+  vec_free(v7);
+  vec_free(v4);
+  vec_free(v3);
+  vec_free(v2);
+  vec_free(v);
+  vec_free(dyy);
+  vec_free(u);
+  vec_free(yy);
+  vec_free(d);
+  vec_free(one);
+  vec_free(y);
+  if valid {
+    return Option[Vec[u64]]::Some(p);
+  }
+  vec_free(p);
+  return Option[Vec[u64]]::None;
+}
+
+/// Internal: the compressed form of the point `p`: 32 bytes.
+fn ed_compress(p: &Vec[u64]) -> Bytes
+  requires vlen(p) == 64
+  ensures blen(result) == 32
+{
+  let x = ed_get(p, 0);
+  let y = ed_get(p, 1);
+  let z = ed_get(p, 2);
+  let zi = fe_inv(z);
+  let xa = fe_mul(x, zi);
+  let ya = fe_mul(y, zi);
+  let xb = ed_bytes(xa);
+  let mut out = ed_bytes(ya);
+  bset(&mut out, 31, bget(out, 31) | ((bget(xb, 0) & 1) << 7));
+  bfree(xb);
+  vec_free(ya);
+  vec_free(xa);
+  vec_free(zi);
+  vec_free(z);
+  vec_free(y);
+  vec_free(x);
+  return out;
+}
+
+/// Internal: the scalar `s` (32 little-endian bytes) is below the group order
+/// L = 2^252 + 27742317777372353535851937790883648493.
+fn ed_below_l(s: &Bytes, off: u64) -> bool
+  requires blen(s) >= 32 && off <= blen(s) - 32
+{
+  let l = ed_const("edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010");
+  // L's bytes, by comparing from the top byte down.
+  let lb = ed_bytes(l);
+  vec_free(l);
+  let mut i = 32;
+  let mut less = false;
+  let mut decided = false;
+  while i > 0
+    invariant i <= 32 && blen(lb) == 32 && blen(s) >= 32 && off <= blen(s) - 32
+  {
+    i = i - 1;
+    if !decided {
+      if bget(s, off + i) < bget(lb, i) {
+        less = true;
+        decided = true;
+      } else {
+        if bget(s, off + i) > bget(lb, i) { decided = true; }
+      }
+    }
+  }
+  bfree(lb);
+  return less;
+}
+
+/// Whether `sig` (64 bytes: R, then S) is a valid Ed25519 signature of `msg`
+/// under the public key `pubkey` (32 bytes). The signature is refused if S is
+/// not below the group order or the key is not a point.
+/// ```
+/// let pubkey = balloc(32);
+/// let sig = balloc(64);
+/// let msg = bfrom("hello");
+/// // All zeros is not a signature of anything.
+/// let ok = ed25519_verify(pubkey, msg, sig);
+/// bfree(msg);
+/// bfree(sig);
+/// bfree(pubkey);
+/// if ok { return 1; }
+/// ```
+fn ed25519_verify(pubkey: &Bytes, msg: &Bytes, sig: &Bytes) -> bool
+  requires blen(pubkey) == 32 && blen(sig) == 64 && blen(msg) < 1000000000
+{
+  if !ed_below_l(sig, 32) {
+    return false;
+  }
+  match ed_decompress(pubkey) {
+    Option::None => { return false; },
+    Option::Some(a) => {
+      // h = SHA-512(R || A || M), taken as a 512-bit little-endian number.
+      let mut data = text_new();
+      text_push_span(&mut data, sig, 0, 32);
+      text_push_bytes(&mut data, pubkey);
+      text_push_bytes(&mut data, msg);
+      let db = text_finish(data);
+      let h = sha512(db);
+      bfree(db);
+      // [S]B - [h]A, which must be R.
+      let zero = fe_zero();
+      let ax = ed_get(a, 0);
+      let ay = ed_get(a, 1);
+      let az = ed_get(a, 2);
+      let at = ed_get(a, 3);
+      let nax = fe_sub(zero, ax);
+      let nat = fe_sub(zero, at);
+      let na = ed_make(nax, ay, az, nat);
+      let s = bytes_slice(sig, 32, 64);
+      let base = ed_base();
+      let sb = ed_mul(base, s);
+      let ha = ed_mul(na, h);
+      let sum = ed_add(sb, ha);
+      let enc = ed_compress(sum);
+      let rb = bytes_slice(sig, 0, 32);
+      let same = bytes_eq(enc, rb);
+      bfree(rb);
+      bfree(enc);
+      vec_free(sum);
+      vec_free(ha);
+      vec_free(sb);
+      vec_free(base);
+      bfree(s);
+      vec_free(na);
+      vec_free(nat);
+      vec_free(nax);
+      vec_free(at);
+      vec_free(az);
+      vec_free(ay);
+      vec_free(ax);
+      vec_free(zero);
+      bfree(h);
+      vec_free(a);
+      return same;
+    },
+  }
+}

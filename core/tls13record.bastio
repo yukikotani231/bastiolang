@@ -1,0 +1,142 @@
+// core/tls13record.bastio: the TLS 1.3 record layer with the
+// ChaCha20-Poly1305 cipher suite (RFC 8446 section 5): a record carries one
+// message of one content type, padded and sealed under the key and IV of
+// core/tls13 with the record's sequence number.
+//
+// What is proved: every access is in bounds, nothing leaks, a sealed record
+// is the 5-byte header, the message, the content type, the padding and the
+// 16-byte tag (so its length is exact), and an opened message is shorter
+// than its record. Not proved: that the records are the standard's; the tests
+// check records made by another implementation (Python's `cryptography`) and
+// every single-bit change of a record being refused.
+import "chacha20poly1305.bastio";
+import "tls13.bastio";
+
+/// A record that was opened: the content type (22 handshake, 23 application
+/// data, 21 alert) and the message.
+struct TlsRecord { content_type: u8, data: Bytes }
+
+/// Internal: the 5-byte header of a record whose sealed part is `n` bytes.
+fn tls13_header(n: u64) -> Bytes
+  requires n < 65536
+  ensures blen(result) == 5
+{
+  let mut h = balloc(5);
+  bset(&mut h, 0, 23);
+  bset(&mut h, 1, 3);
+  bset(&mut h, 2, 3);
+  bset(&mut h, 3, cast[u8](n / 256));
+  bset(&mut h, 4, cast[u8](n % 256));
+  return h;
+}
+
+/// The record that carries `plain` as a message of type `content_type`,
+/// followed by `pad` zero bytes (the sealed part, with its tag, may not be
+/// longer than 2^14 + 256 bytes), sealed under `key` (32 bytes) and `iv` (12
+/// bytes) as record number `seq`.
+/// ```
+/// let key = balloc(32);
+/// let iv = balloc(12);
+/// let msg = bfrom("hello");
+/// let rec = tls13_seal(key, iv, 0, 23, msg, 0);
+/// let n = blen(rec);
+/// bfree(rec);
+/// bfree(msg);
+/// bfree(iv);
+/// bfree(key);
+/// if n != 5 + 5 + 1 + 16 { return 1; }
+/// ```
+fn tls13_seal(key: &Bytes, iv: &Bytes, seq: u64, content_type: u8, plain: &Bytes, pad: u64) -> Bytes
+  requires blen(key) == 32 && blen(iv) == 12 && blen(plain) <= 16384 && blen(plain) + 1 + pad + 16 <= 16640
+  ensures blen(result) == 5 + blen(plain) + 1 + pad + 16
+{
+  let mut inner = text_new();
+  text_push_bytes(&mut inner, plain);
+  text_push(&mut inner, content_type);
+  let mut i = 0;
+  while i < pad
+    invariant i <= pad && vlen(inner) == blen(plain) + 1 + i
+  {
+    text_push(&mut inner, 0);
+    i = i + 1;
+  }
+  let ib = text_finish(inner);
+  let hdr = tls13_header(blen(ib) + 16);
+  let nonce = tls13_nonce(iv, seq);
+  let sealed = aead_seal(key, nonce, hdr, ib);
+  let mut rec = text_new();
+  text_push_bytes(&mut rec, hdr);
+  text_push_bytes(&mut rec, sealed);
+  let r = text_finish(rec);
+  bfree(sealed);
+  bfree(nonce);
+  bfree(hdr);
+  bfree(ib);
+  return r;
+}
+
+/// Opens `record` (a whole record, header included) as record number `seq`:
+/// its content type and message, or nothing if the header is not a TLS 1.3
+/// record header, the length is wrong, the tag does not match, or there is no
+/// content type in the plaintext (all zeros).
+/// ```
+/// let key = balloc(32);
+/// let iv = balloc(12);
+/// let msg = bfrom("hello");
+/// let rec = tls13_seal(key, iv, 7, 22, msg, 3);
+/// let mut ok = false;
+/// match tls13_open(key, iv, 7, rec) {
+///   Option::Some(r) => {
+///     ok = r.content_type == 22 && bytes_eq_str(r.data, "hello");
+///     bfree(r.data);
+///   },
+///   Option::None => {},
+/// }
+/// bfree(rec);
+/// bfree(msg);
+/// bfree(iv);
+/// bfree(key);
+/// if !ok { return 1; }
+/// ```
+fn tls13_open(key: &Bytes, iv: &Bytes, seq: u64, record: &Bytes) -> Option[TlsRecord]
+  requires blen(key) == 32 && blen(iv) == 12 && blen(record) < 274877906944
+  ensures result is Option::Some ==> blen(result.Some.data) + 21 < blen(record)
+{
+  if blen(record) < 22 || blen(record) > 5 + 16384 + 256 {
+    return Option[TlsRecord]::None;
+  }
+  let n = blen(record) - 5;
+  if bget(record, 0) != 23 || bget(record, 1) != 3 || bget(record, 2) != 3 {
+    return Option[TlsRecord]::None;
+  }
+  if cast[u64](bget(record, 3)) * 256 + cast[u64](bget(record, 4)) != n {
+    return Option[TlsRecord]::None;
+  }
+  let hdr = bytes_slice(record, 0, 5);
+  let sealed = bytes_slice(record, 5, blen(record));
+  let nonce = tls13_nonce(iv, seq);
+  let opened = aead_open(key, nonce, hdr, sealed);
+  bfree(sealed);
+  bfree(nonce);
+  bfree(hdr);
+  match opened {
+    Option::None => { return Option[TlsRecord]::None; },
+    Option::Some(plain) => {
+      // The content type is the last byte that is not zero.
+      let mut end = blen(plain);
+      while end > 0 && bget(plain, end - 1) == 0
+        invariant end <= blen(plain)
+      {
+        end = end - 1;
+      }
+      if end == 0 {
+        bfree(plain);
+        return Option[TlsRecord]::None;
+      }
+      let ct = bget(plain, end - 1);
+      let data = bytes_slice(plain, 0, end - 1);
+      bfree(plain);
+      return Option[TlsRecord]::Some(TlsRecord { content_type: ct, data: data });
+    },
+  }
+}
