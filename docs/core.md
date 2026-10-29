@@ -53,6 +53,7 @@ Each module has a reference page, generated from its source: every function with
 | [`core/format.bastio`](lib/core-format.md) | Building text out of pieces. |
 | [`core/hashmap.bastio`](lib/core-hashmap.md) | A hash map from `u64` keys to values of any type `V` that can be copied (`u64`, `Span`, a struct of numbers, ...). |
 | [`core/hkdf.bastio`](lib/core-hkdf.md) | HKDF with HMAC-SHA-256 (RFC 5869), the key derivation that TLS 1.3 uses. |
+| [`core/httpsurl.bastio`](lib/core-httpsurl.md) | The `https://` URLs a client follows (the Location of a redirect, or a address typed by a person) split into host, port and path, strictly. |
 | [`core/json.bastio`](lib/core-json.md) | JSON (RFC 8259) read from bytes that cannot be trusted. |
 | [`core/lines.bastio`](lib/core-lines.md) | Splitting text into lines. |
 | [`core/num.bastio`](lib/core-num.md) | Parsing integers from bytes and formatting them as text. |

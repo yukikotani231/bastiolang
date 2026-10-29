@@ -1,0 +1,196 @@
+// core/httpsurl.bastio: the `https://` URLs a client follows (the Location of
+// a redirect, or a address typed by a person) split into host, port and
+// path, strictly: a URL the client could be tricked by is refused, not
+// repaired.
+//
+// What is proved: no read is out of bounds, nothing leaks, and the parts
+// come out as the HTTPS client needs them: a host of 1 to 255 bytes, a port
+// from 1 to 65535 and a path of 1 to 65535 bytes that starts with `/`. Not
+// proved: that the URL means to every other program what it means here. Only
+// the scheme `https`, a host of letters, digits, dots and hyphens (no user
+// information, no IPv6 literal, no percent-escapes in the host) and a path
+// without a space or control character (so it cannot carry a line break
+// into a request) are accepted; the fragment is dropped.
+import "bytes.bastio";
+import "num.bastio";
+import "option.bastio";
+import "text.bastio";
+
+/// A parsed `https://` URL.
+struct HttpsUrl { host: Bytes, port: u64, path: Bytes }
+
+/// Internal: `u[from..to]` is a host name: 1 to 255 letters, digits, dots and
+/// hyphens.
+fn httpsurl_host_ok(u: &Bytes, from: u64, to: u64) -> bool
+  requires from <= to && to <= blen(u)
+  ensures result ==> to > from && to - from <= 255
+{
+  if to == from || to - from > 255 { return false; }
+  let mut i = from;
+  while i < to
+    invariant from <= i && i <= to
+  {
+    let c = bget(u, i);
+    if !((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 46 || c == 45) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+/// Internal: `u[from..to]` has no space, control character or DEL.
+fn httpsurl_path_ok(u: &Bytes, from: u64, to: u64) -> bool
+  requires from <= to && to <= blen(u)
+{
+  let mut i = from;
+  while i < to
+    invariant from <= i && i <= to
+  {
+    let c = bget(u, i);
+    if c <= 32 || c == 127 { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+/// Internal: the first position at or after `from` of a byte in `stops`
+/// (`n` if there is none).
+fn httpsurl_find(u: &Bytes, from: u64, a: u8, b: u8, c: u8) -> u64
+  requires from <= blen(u)
+  ensures result >= from && result <= blen(u)
+{
+  let mut i = from;
+  while i < blen(u) && bget(u, i) != a && bget(u, i) != b && bget(u, i) != c
+    invariant from <= i && i <= blen(u)
+  {
+    i = i + 1;
+  }
+  return i;
+}
+
+/// Internal: the path of `u[from..to]` for a request: the span itself, or
+/// `/` for an empty one, or `/` before a span that starts with `?`.
+fn httpsurl_path(u: &Bytes, from: u64, to: u64) -> Bytes
+  requires from <= to && to <= blen(u) && to - from < 65535
+  ensures blen(result) >= 1 && blen(result) < 65536
+{
+  let mut t = text_new();
+  if from == to || bget(u, from) == 63 {
+    text_push(&mut t, 47);
+  }
+  text_push_span(&mut t, u, from, to);
+  return text_finish(t);
+}
+
+/// Internal: the port in `u[from..to]` (`:` already dropped), 0 if it is not
+/// 1 to 65535.
+fn httpsurl_port(u: &Bytes, from: u64, to: u64) -> u64
+  requires from <= to && to <= blen(u)
+  ensures result <= 65535
+{
+  match parse_u64(u, from, to) {
+    Option::Some(p) => {
+      if p >= 1 && p <= 65535 { return p; }
+      return 0;
+    },
+    Option::None => { return 0; },
+  }
+}
+
+/// Splits an `https://` URL. `None` for another scheme, user information, an
+/// IPv6 literal, a bad host or port, or a space or control character in the
+/// path.
+/// ```
+/// let u = bfrom("https://Example.com:8443/a/b?q=1#top");
+/// let mut bad = 1;
+/// match httpsurl_parse(u) {
+///   Option::Some(p) => {
+///     if bytes_eq_str(p.host, "Example.com") && p.port == 8443 && bytes_eq_str(p.path, "/a/b?q=1") { bad = 0; }
+///     httpsurl_free(p);
+///   },
+///   Option::None => {},
+/// }
+/// bfree(u);
+/// if bad != 0 { return 1; }
+/// ```
+fn httpsurl_parse(u: &Bytes) -> Option[HttpsUrl]
+  requires blen(u) < 65536
+  ensures result is Option::Some ==> blen(result.Some.host) >= 1 && blen(result.Some.host) <= 255
+  ensures result is Option::Some ==> result.Some.port >= 1 && result.Some.port <= 65535
+  ensures result is Option::Some ==> blen(result.Some.path) >= 1 && blen(result.Some.path) < 65536
+{
+  let n = blen(u);
+  if n < 9 { return Option[HttpsUrl]::None; }
+  let scheme = "https://";
+  let mut i = 0;
+  while i < 8
+    invariant i <= 8 && n >= 9
+  {
+    if (bget(u, i) | 32) != sget(scheme, i) { return Option[HttpsUrl]::None; }
+    i = i + 1;
+  }
+  let e = httpsurl_find(u, 8, 47, 63, 35);
+  let colon = httpsurl_find(u, 8, 58, 64, 91);
+  let mut host_end = e;
+  let mut port = 443;
+  if colon < e {
+    if bget(u, colon) != 58 { return Option[HttpsUrl]::None; }
+    host_end = colon;
+    port = httpsurl_port(u, colon + 1, e);
+    if port == 0 { return Option[HttpsUrl]::None; }
+  }
+  if !httpsurl_host_ok(u, 8, host_end) { return Option[HttpsUrl]::None; }
+  let fend = httpsurl_find(u, e, 35, 35, 35);
+  if !httpsurl_path_ok(u, e, fend) { return Option[HttpsUrl]::None; }
+  let host = bytes_slice(u, 8, host_end);
+  let path = httpsurl_path(u, e, fend);
+  return Option[HttpsUrl]::Some(HttpsUrl { host: host, port: port, path: path });
+}
+
+/// Frees a parsed URL.
+/// ```
+/// let u = bfrom("https://a.example/");
+/// match httpsurl_parse(u) {
+///   Option::Some(p) => { httpsurl_free(p); },
+///   Option::None => { bfree(u); return 1; },
+/// }
+/// bfree(u);
+/// ```
+fn httpsurl_free(p: HttpsUrl) {
+  bfree(p.host);
+  bfree(p.path);
+}
+
+/// The URL a redirect's `location` leads to from the server `host`:`port`
+/// (for a location that is a path starting with a single `/`, the same
+/// server) or an `https://` URL. `None` for anything else (another scheme, a
+/// relative path without a leading `/`, `//host/...`).
+/// ```
+/// let loc = bfrom("/login?next=1");
+/// let server = bfrom("example.com");
+/// let mut bad = 1;
+/// match httpsurl_follow(server, 8443, loc) {
+///   Option::Some(p) => {
+///     if bytes_eq_str(p.host, "example.com") && p.port == 8443 && bytes_eq_str(p.path, "/login?next=1") { bad = 0; }
+///     httpsurl_free(p);
+///   },
+///   Option::None => {},
+/// }
+/// bfree(server);
+/// bfree(loc);
+/// if bad != 0 { return 1; }
+/// ```
+fn httpsurl_follow(host: &Bytes, port: u64, location: &Bytes) -> Option[HttpsUrl]
+  requires blen(host) >= 1 && blen(host) <= 255 && port >= 1 && port <= 65535 && blen(location) < 65535
+  ensures result is Option::Some ==> blen(result.Some.host) >= 1 && blen(result.Some.host) <= 255
+  ensures result is Option::Some ==> result.Some.port >= 1 && result.Some.port <= 65535
+  ensures result is Option::Some ==> blen(result.Some.path) >= 1 && blen(result.Some.path) < 65536
+{
+  let n = blen(location);
+  if n >= 1 && bget(location, 0) == 47 {
+    if n >= 2 && bget(location, 1) == 47 { return Option[HttpsUrl]::None; }
+    let fend = httpsurl_find(location, 0, 35, 35, 35);
+    if !httpsurl_path_ok(location, 0, fend) { return Option[HttpsUrl]::None; }
+    return Option[HttpsUrl]::Some(HttpsUrl { host: bytes_slice(host, 0, blen(host)), port: port, path: httpsurl_path(location, 0, fend) });
+  }
+  return httpsurl_parse(location);
+}

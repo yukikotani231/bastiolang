@@ -5,13 +5,17 @@
 //
 //   httpsget PORT NAME ROOTS SEED NOW
 //   httpsget PORT NAME ROOTS
+//   httpsget URL ROOTS
 //
 // PORT is the port on 127.0.0.1, NAME the host name to check the certificate
 // for (and to send), ROOTS a file of DER certificates one after the other,
 // SEED a file of 32 bytes that must be unpredictable (every value that has
 // to be random is made from it, so it may be used only once), and NOW the
 // time in seconds since 1970. It exits with 0 if the answer starts with
-// `HTTP/1.` and a 200 status. With three arguments the seed and the time come
+// `HTTP/1.` and a 200 status. With two arguments, URL is an `https://` URL: the
+// host is looked up (std/dns), redirects are followed (at most 5) and the
+// status and the body of the last answer are printed (`https_fetch`); the exit
+// code is 0 for status 200. With three arguments the seed and the time come
 // from the system and std/https does it all (`https_get`). With no arguments it only checks that a
 // connection starts: the client makes a ClientHello, refuses bytes that are
 // no TLS and does nothing before the handshake is done.
@@ -120,7 +124,38 @@ fn system_get(con: &Serial, h: &Host) -> u64 {
   return code;
 }
 
+/// `httpsget URL ROOTS`: `https_fetch`.
+fn url_get(con: &Serial, h: &Host) -> u64 {
+  let url = host_arg(h, 1);
+  let a_roots = host_arg(h, 2);
+  let mut roots = balloc(0);
+  let mut code = 2;
+  if blen(url) < 65536 && host_read(h, a_roots, &mut roots) && blen(roots) < 16777216 {
+    code = 1;
+    match https_fetch(h, url, roots, 5) {
+      Option::None => { print_str(con, "no answer\n"); },
+      Option::Some(r) => {
+        print_str(con, "status ");
+        print_u64(con, r.status);
+        print_str(con, "\n");
+        print_bytes(con, r.body);
+        if r.status == 200 { code = 0; }
+        https_reply_free(r);
+      },
+    }
+  } else {
+    print_str(con, "usage: httpsget URL ROOTS\n");
+  }
+  bfree(roots);
+  bfree(a_roots);
+  bfree(url);
+  return code;
+}
+
 fn main(con: &mut Serial, h: &mut Host) -> u64 {
+  if host_argc(h) == 3 {
+    return url_get(con, h);
+  }
   if host_argc(h) == 4 {
     return system_get(con, h);
   }

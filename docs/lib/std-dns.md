@@ -18,7 +18,7 @@ the server whatever address the lookup gave).
 | [`dns_lookup_via`](#dns_lookup_via) | The IPv4 address (as `net_ip4` makes it) of the host `name`, asked of the resolver at `resolver` (port 53, over TCP). |
 | [`dns_lookup_at`](#dns_lookup_at) | `dns_lookup_via` for a resolver that listens on `port`. |
 | [`dns_system_resolver`](#dns_system_resolver) | The first IPv4 nameserver of /etc/resolv.conf, if the file is there and has one. |
-| [`dns_lookup`](#dns_lookup) | The IPv4 address of the host `name` from the system's resolver (see `dns_system_resolver`). |
+| [`dns_lookup`](#dns_lookup) | The IPv4 address of the host `name`. |
 
 Every example below is built, verified and run by `tests/run.sh`. An `assert` in one is proved at compile time from the contracts above it.
 
@@ -95,9 +95,9 @@ match dns_system_resolver(host) {
 fn dns_lookup(h: &Host, name: &Bytes) -> Option[u64]
 ```
 
-The IPv4 address of the host `name` from the system's resolver (see
-`dns_system_resolver`). A name that is a dotted-quad address is returned
-as it is, without a lookup.
+The IPv4 address of the host `name`: a dotted-quad address is returned as
+it is, then /etc/hosts is read (`dns_hosts`; `localhost` is always
+127.0.0.1), then the system's resolver is asked (see `dns_system_resolver`).
 
 Example:
 

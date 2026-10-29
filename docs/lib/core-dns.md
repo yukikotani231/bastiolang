@@ -22,6 +22,7 @@ and refuses a truncated response or one with an error code.
 | [`dns_query`](#dns_query) | The query for the A record of the host `name`, with the message id `id` (the 12-byte header, the question, no length prefix). |
 | [`dns_parse_a`](#dns_parse_a) | The IPv4 address (as `net_ip4` makes it) in the first A record of the response `msg` to a query with id `id`; `None` if the response is not a complete answer without error to that query or holds no A record. |
 | [`dns_resolv_conf`](#dns_resolv_conf) | The first IPv4 `nameserver` of the text of a resolv.conf (IPv6 servers and other lines are skipped). |
+| [`dns_hosts`](#dns_hosts) | The IPv4 address that the text of a hosts file (`/etc/hosts`) gives to `name`, ignoring case; lines for IPv6 addresses and comments are skipped, and the first line that names it wins. |
 
 Every example below is built, verified and run by `tests/run.sh`. An `assert` in one is proved at compile time from the contracts above it.
 
@@ -118,6 +119,38 @@ bfree(text);
 if bad != 0 { return 1; }
 ```
 
+### `dns_hosts`
+
+```bastio
+fn dns_hosts(text: &Bytes, name: &Bytes) -> Option[u64]
+```
+
+The IPv4 address that the text of a hosts file (`/etc/hosts`) gives to
+`name`, ignoring case; lines for IPv6 addresses and comments are skipped,
+and the first line that names it wins. `localhost` is always 127.0.0.1
+(RFC 6761), file or not.
+
+Example:
+
+```bastio
+let text = bfrom("# hosts\n::1 localhost\n10.0.0.5  Build  ci.lan # the CI box\n127.0.1.1 build\n");
+let name = bfrom("CI.lan");
+let local = bfrom("localhost");
+let mut bad = 1;
+match dns_hosts(text, name) {
+  Option::Some(ip) => { if ip == 167772165 { bad = 0; } },
+  Option::None => {},
+}
+match dns_hosts(text, local) {
+  Option::Some(ip) => { if ip != 2130706433 { bad = 1; } },
+  Option::None => { bad = 1; },
+}
+bfree(local);
+bfree(name);
+bfree(text);
+if bad != 0 { return 1; }
+```
+
 ## Internals
 
 ### `dns_push_labels`
@@ -193,3 +226,30 @@ fn dns_nameserver_line(t: &Bytes, ls: u64, le: u64) -> Option[u64]
 
 Internal: the address on the line `t[ls..le]` if it is `nameserver`, white
 space and an IPv4 address (a comment or white space may follow).
+
+### `dns_lower`
+
+```bastio
+fn dns_lower(c: u8) -> u8
+```
+
+Internal: the byte `c` in lower case (ASCII letters only).
+
+### `dns_name_is`
+
+```bastio
+fn dns_name_is(t: &Bytes, from: u64, to: u64, name: &Bytes) -> bool
+  requires from <= to && to <= blen(t)
+```
+
+Internal: `t[from..to]` is the same name as `name`, ignoring ASCII case.
+
+### `dns_hosts_line`
+
+```bastio
+fn dns_hosts_line(t: &Bytes, ls: u64, le0: u64, name: &Bytes) -> Option[u64]
+  requires ls <= le0 && le0 <= blen(t)
+```
+
+Internal: the address of the hosts-file line `t[ls..le]` (an IPv4 address,
+then names, `#` starts a comment) if `name` is one of its names.
