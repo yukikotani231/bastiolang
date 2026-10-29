@@ -1,0 +1,258 @@
+// expect-exit: 0
+// core/der: lengths in short and long form, the encodings DER forbids, and a
+// real X.509 certificate (Ed25519, made with OpenSSL) walked down to its
+// fields.
+import "core/der.bastio";
+import "core/num.bastio";
+
+/// The value of the hex digit `c` (0 for anything else).
+fn nib(c: u8) -> u8
+  ensures result < 16
+{
+  if c >= 48 && c <= 57 { return c - 48; }
+  if c >= 97 && c <= 102 { return c - 87; }
+  return 0;
+}
+
+/// The bytes written as hex digits in `s`.
+fn unhex(s: Str) -> Bytes
+  requires slen(s) < 100000
+{
+  let n = slen(s) / 2;
+  let mut b = balloc(n);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && blen(b) == n && slen(s) >= 2 * n
+  {
+    bset(&mut b, i, nib(sget(s, 2 * i)) * 16 + nib(sget(s, 2 * i + 1)));
+    i = i + 1;
+  }
+  return b;
+}
+
+/// 1 unless `der_item` reads `b` as an element with tag `tag` whose content is `n` bytes long and ends at `b`'s end.
+fn whole(b: &Bytes, tag: u8, n: u64) -> u64
+  ensures result <= 1
+{
+  match der_item(b, 0, blen(b)) {
+    Option::Some(it) => {
+      if it.tag == tag && it.content.end - it.content.start == n && it.content.end == blen(b) { return 0; }
+      return 1;
+    },
+    Option::None => { return 1; },
+  }
+}
+
+/// 1 unless `der_item` refuses the bytes written in `s`.
+fn refused(s: Str) -> u64
+  requires slen(s) < 100000
+  ensures result <= 1
+{
+  let b = unhex(s);
+  let mut r = 1;
+  match der_item(b, 0, blen(b)) {
+    Option::Some(it) => {},
+    Option::None => { r = 0; },
+  }
+  bfree(b);
+  return r;
+}
+
+/// 1 unless an OCTET STRING of `n` bytes, with its header, reads back with the right length.
+fn octets(n: u64) -> u64
+  requires n < 100000
+  ensures result <= 1
+{
+  let mut hdr = 2;
+  if n >= 128 { hdr = 3; }
+  if n >= 256 { hdr = 4; }
+  if n >= 65536 { hdr = 5; }
+  let mut b = balloc(hdr + n);
+  bset(&mut b, 0, 4);
+  if n < 128 {
+    bset(&mut b, 1, cast[u8](n));
+  } else {
+    if n < 256 {
+      bset(&mut b, 1, 129);
+      bset(&mut b, 2, cast[u8](n));
+    } else {
+      if n < 65536 {
+        bset(&mut b, 1, 130);
+        bset(&mut b, 2, cast[u8](n / 256));
+        bset(&mut b, 3, cast[u8](n % 256));
+      } else {
+        bset(&mut b, 1, 131);
+        bset(&mut b, 2, cast[u8](n / 65536));
+        bset(&mut b, 3, cast[u8]((n / 256) % 256));
+        bset(&mut b, 4, cast[u8](n % 256));
+      }
+    }
+  }
+  let r = whole(b, 4, n);
+  bfree(b);
+  return r;
+}
+
+fn lengths() -> u64
+  ensures result <= 9
+{
+  return octets(0) + octets(1) + octets(127) + octets(128) + octets(129) + octets(255) + octets(256) + octets(65535) + octets(65536);
+}
+
+fn forbidden() -> u64
+  ensures result <= 10
+{
+  // Each string is an element DER does not allow, or one cut off.
+  return refused("")
+    + refused("04")
+    + refused("0480")
+    + refused("048105")
+    + refused("04820005")
+    + refused("0482007f")
+    + refused("04830000ff")
+    + refused("0485010000000000")
+    + refused("0405aabbcc")
+    + refused("1f0100");
+}
+
+fn cert() -> Bytes
+{
+  let mut all = text_new();
+  let part0 = unhex("308201323081e5a003020102021420dbc82b0cf6f7706f08785435004e3176cdd222300506032b6570300f310d300b06");
+  text_push_bytes(&mut all, part0);
+  bfree(part0);
+  let part1 = unhex("035504030c0474657374301e170d3236313032393033313831365a170d3336313032363033313831365a300f310d300b");
+  text_push_bytes(&mut all, part1);
+  bfree(part1);
+  let part2 = unhex("06035504030c0474657374302a300506032b6570032100e4819392bcd9f3bd8e699b221fcddb0ae3c1e799da80d0943b");
+  text_push_bytes(&mut all, part2);
+  bfree(part2);
+  let part3 = unhex("120b12f3822d8ba3533051301d0603551d0e04160414f7922b9ca0b98124553f133d51aed762975e6564301f0603551d");
+  text_push_bytes(&mut all, part3);
+  bfree(part3);
+  let part4 = unhex("23041830168014f7922b9ca0b98124553f133d51aed762975e6564300f0603551d130101ff040530030101ff30050603");
+  text_push_bytes(&mut all, part4);
+  bfree(part4);
+  let part5 = unhex("2b65700341008e6663be82f7b8dc3f519d5320f065a632f85b5f3eb70985705f84f4fdaedf9c41df84d5fd89735bddfa");
+  text_push_bytes(&mut all, part5);
+  bfree(part5);
+  let part6 = unhex("dd91ffc6719d11503dd2e66d04333cbe2dfde941b103");
+  text_push_bytes(&mut all, part6);
+  bfree(part6);
+  return text_finish(all);
+}
+
+/// 1 unless the certificate reads as a SEQUENCE of a SEQUENCE (the part that is signed), a SEQUENCE (the algorithm, Ed25519) and a BIT STRING (the signature).
+fn outline(c: &Bytes) -> u64
+  ensures result <= 8
+{
+  let mut bad = 8;
+  match der_item(c, 0, blen(c)) {
+    Option::Some(top) => {
+      if top.tag == 48 && top.content.end == blen(c) {
+        bad = 7;
+        match der_item(c, top.content.start, top.content.end) {
+          Option::Some(tbs) => {
+            match der_item(c, tbs.content.end, top.content.end) {
+              Option::Some(alg) => {
+                match der_item(c, alg.content.end, top.content.end) {
+                  Option::Some(sig) => {
+                    bad = 0;
+                    if tbs.tag != 48 { bad = bad + 1; }
+                    if alg.tag != 48 { bad = bad + 1; }
+                    if sig.tag != 3 { bad = bad + 1; }
+                    if sig.content.end != top.content.end { bad = bad + 1; }
+                    if sig.content.end - sig.content.start != 65 { bad = bad + 1; }
+                    if !der_oid_ed25519(c, alg) { bad = bad + 1; }
+                  },
+                  Option::None => {},
+                }
+              },
+              Option::None => {},
+            }
+          },
+          Option::None => {},
+        }
+      }
+    },
+    Option::None => {},
+  }
+  return bad;
+}
+
+/// The first element inside the SEQUENCE `alg` is the object identifier 1.3.101.112 (Ed25519).
+fn der_oid_ed25519(c: &Bytes, alg: DerItem) -> bool
+  requires span_in(alg.content, c)
+{
+  let mut ok = false;
+  match der_item(c, alg.content.start, alg.content.end) {
+    Option::Some(oid) => {
+      let want = unhex("2b6570");
+      ok = oid.tag == 6 && der_content_eq(c, oid, want);
+      bfree(want);
+    },
+    Option::None => {},
+  }
+  return ok;
+}
+
+/// 1 unless the elements inside the signed part, one after the other, have these tags and end exactly where it ends.
+fn children(c: &Bytes) -> u64
+  ensures result <= 2
+{
+  let mut bad = 2;
+  match der_item(c, 0, blen(c)) {
+    Option::Some(top) => {
+      match der_item(c, top.content.start, top.content.end) {
+        Option::Some(tbs) => {
+          let mut tags = text_new();
+          let mut pos = tbs.content.start;
+          let mut ok = true;
+          while ok && pos < tbs.content.end
+            invariant tbs.content.start <= pos && pos <= tbs.content.end && tbs.content.end <= blen(c)
+          {
+            match der_item(c, pos, tbs.content.end) {
+              Option::Some(kid) => {
+                text_push(&mut tags, kid.tag);
+                pos = kid.content.end;
+              },
+              Option::None => { ok = false; },
+            }
+          }
+          let tb = text_finish(tags);
+          bad = 0;
+          if !ok || pos != tbs.content.end { bad = bad + 1; }
+          let h = hex(tb);
+          if !bytes_eq_str(h, "a0023030303030a3") { bad = bad + 1; }
+          bfree(h);
+          bfree(tb);
+        },
+        Option::None => {},
+      }
+    },
+    Option::None => {},
+  }
+  return bad;
+}
+
+/// The lower-case hex text of `d`.
+fn hex(d: &Bytes) -> Bytes {
+  let mut t = text_new();
+  let mut i = 0;
+  while i < blen(d)
+    invariant i <= blen(d)
+  {
+    text_push(&mut t, hex_char(cast[u64](bget(d, i)) / 16));
+    text_push(&mut t, hex_char(cast[u64](bget(d, i)) % 16));
+    i = i + 1;
+  }
+  return text_finish(t);
+}
+
+fn main() -> u64 {
+  let c = cert();
+  let bad = lengths() + forbidden() + outline(c) + children(c);
+  bfree(c);
+  if bad > 0 { return 1; }
+  return 0;
+}
