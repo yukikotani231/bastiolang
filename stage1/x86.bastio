@@ -9325,6 +9325,10 @@ fn x86_runtime1(out: &mut Vec[u64], macos: bool, windows: bool) {
   w_s(&mut out, "	pop %rbp\n");
   w_s(&mut out, "	ret\n");
   w_s(&mut out, "10:	mov %rdi, %r14                # the socket address at (%rsp): family, port and address in network order\n");
+  if !windows {
+    w_s(&mut out, "	mov %r12, %r13                # %r13 = the time limit of a connect in milliseconds (0: none), in the bits of the port word above bit 15\n");
+    w_s(&mut out, "	shr $16, %r13\n");
+  }
   w_s(&mut out, "	xor %eax, %eax\n");
   w_s(&mut out, "	mov %rax, (%rsp)\n");
   w_s(&mut out, "	mov %rax, 8(%rsp)\n");
@@ -9387,7 +9391,13 @@ fn x86_runtime1(out: &mut Vec[u64], macos: bool, windows: bool) {
   w_s(&mut out, "	test %eax, %eax\n");
   w_s(&mut out, "	jnz 17f\n");
   w_s(&mut out, "	jmp 18f\n");
-  w_s(&mut out, "16:	mov %r12d, %edi\n");
+  if !windows {
+    w_s(&mut out, "16:	test %r13, %r13\n");
+    w_s(&mut out, "	jnz 30f\n");
+  } else {
+    w_s(&mut out, "16:\n");
+  }
+  w_s(&mut out, "	mov %r12d, %edi\n");
   w_s(&mut out, "	mov %rsp, %rsi\n");
   w_s(&mut out, "	mov $16, %edx\n");
   w_s(&mut out, "	call connect@PLT\n");
@@ -9395,6 +9405,100 @@ fn x86_runtime1(out: &mut Vec[u64], macos: bool, windows: bool) {
   w_s(&mut out, "	jnz 17f\n");
   w_s(&mut out, "18:	mov %r12d, %eax\n");
   w_s(&mut out, "	jmp 9b\n");
+  if !windows {
+    // A connect with a time limit: non-blocking, waited for with poll, then blocking again with the same limit on reads and writes.
+    w_s(&mut out, "30:	mov $3600000, %eax\n");
+    w_s(&mut out, "	cmp %rax, %r13\n");
+    w_s(&mut out, "	cmova %rax, %r13\n");
+    w_s(&mut out, "	mov %r12d, %edi\n");
+    w_s(&mut out, "	mov $3, %esi                  # F_GETFL\n");
+    w_s(&mut out, "	xor %edx, %edx\n");
+    w_s(&mut out, "	xor %eax, %eax\n");
+    w_s(&mut out, "	call fcntl@PLT\n");
+    w_s(&mut out, "	test %eax, %eax\n");
+    w_s(&mut out, "	js 17f\n");
+    w_s(&mut out, "	mov %eax, 24(%rsp)\n");
+    if macos {
+      w_s(&mut out, "	or $0x4, %eax                 # O_NONBLOCK\n");
+    } else {
+      w_s(&mut out, "	or $0x800, %eax               # O_NONBLOCK\n");
+    }
+    w_s(&mut out, "	mov %eax, %edx\n");
+    w_s(&mut out, "	mov %r12d, %edi\n");
+    w_s(&mut out, "	mov $4, %esi                  # F_SETFL\n");
+    w_s(&mut out, "	xor %eax, %eax\n");
+    w_s(&mut out, "	call fcntl@PLT\n");
+    w_s(&mut out, "	test %eax, %eax\n");
+    w_s(&mut out, "	jnz 17f\n");
+    w_s(&mut out, "	mov %r12d, %edi\n");
+    w_s(&mut out, "	mov %rsp, %rsi\n");
+    w_s(&mut out, "	mov $16, %edx\n");
+    w_s(&mut out, "	call connect@PLT\n");
+    w_s(&mut out, "	test %eax, %eax\n");
+    w_s(&mut out, "	jz 31f\n");
+    w_s(&mut out, "	mov %r12d, 32(%rsp)           # struct pollfd: fd, events = POLLOUT, revents = 0\n");
+    w_s(&mut out, "	movl $4, 36(%rsp)\n");
+    w_s(&mut out, "	lea 32(%rsp), %rdi\n");
+    w_s(&mut out, "	mov $1, %esi\n");
+    w_s(&mut out, "	mov %r13d, %edx\n");
+    w_s(&mut out, "	call poll@PLT\n");
+    w_s(&mut out, "	test %eax, %eax\n");
+    w_s(&mut out, "	jle 17f\n");
+    w_s(&mut out, "	movl $0, 40(%rsp)\n");
+    w_s(&mut out, "	movl $4, 44(%rsp)\n");
+    w_s(&mut out, "	mov %r12d, %edi\n");
+    if macos {
+      w_s(&mut out, "	mov $0xffff, %esi             # SOL_SOCKET\n");
+      w_s(&mut out, "	mov $0x1007, %edx             # SO_ERROR\n");
+    } else {
+      w_s(&mut out, "	mov $1, %esi                  # SOL_SOCKET\n");
+      w_s(&mut out, "	mov $4, %edx                  # SO_ERROR\n");
+    }
+    w_s(&mut out, "	lea 40(%rsp), %rcx\n");
+    w_s(&mut out, "	lea 44(%rsp), %r8\n");
+    w_s(&mut out, "	call getsockopt@PLT\n");
+    w_s(&mut out, "	test %eax, %eax\n");
+    w_s(&mut out, "	jnz 17f\n");
+    w_s(&mut out, "	cmpl $0, 40(%rsp)\n");
+    w_s(&mut out, "	jne 17f\n");
+    w_s(&mut out, "31:	mov %r12d, %edi\n");
+    w_s(&mut out, "	mov $4, %esi                  # F_SETFL: blocking again\n");
+    w_s(&mut out, "	mov 24(%rsp), %edx\n");
+    w_s(&mut out, "	xor %eax, %eax\n");
+    w_s(&mut out, "	call fcntl@PLT\n");
+    w_s(&mut out, "	test %eax, %eax\n");
+    w_s(&mut out, "	jnz 17f\n");
+    w_s(&mut out, "	mov %r13, %rax                # struct timeval at 32(%rsp): seconds and microseconds\n");
+    w_s(&mut out, "	xor %edx, %edx\n");
+    w_s(&mut out, "	mov $1000, %ecx\n");
+    w_s(&mut out, "	div %rcx\n");
+    w_s(&mut out, "	mov %rax, 32(%rsp)\n");
+    w_s(&mut out, "	imul $1000, %rdx, %rdx\n");
+    w_s(&mut out, "	mov %rdx, 40(%rsp)\n");
+    w_s(&mut out, "	mov %r12d, %edi\n");
+    if macos {
+      w_s(&mut out, "	mov $0xffff, %esi\n");
+      w_s(&mut out, "	mov $0x1006, %edx             # SO_RCVTIMEO\n");
+    } else {
+      w_s(&mut out, "	mov $1, %esi\n");
+      w_s(&mut out, "	mov $20, %edx                 # SO_RCVTIMEO\n");
+    }
+    w_s(&mut out, "	lea 32(%rsp), %rcx\n");
+    w_s(&mut out, "	mov $16, %r8d\n");
+    w_s(&mut out, "	call setsockopt@PLT\n");
+    w_s(&mut out, "	mov %r12d, %edi\n");
+    if macos {
+      w_s(&mut out, "	mov $0xffff, %esi\n");
+      w_s(&mut out, "	mov $0x1005, %edx             # SO_SNDTIMEO\n");
+    } else {
+      w_s(&mut out, "	mov $1, %esi\n");
+      w_s(&mut out, "	mov $21, %edx                 # SO_SNDTIMEO\n");
+    }
+    w_s(&mut out, "	lea 32(%rsp), %rcx\n");
+    w_s(&mut out, "	mov $16, %r8d\n");
+    w_s(&mut out, "	call setsockopt@PLT\n");
+    w_s(&mut out, "	jmp 18b\n");
+  }
   w_s(&mut out, "17:	mov %r12d, %edi\n");
   if windows {
     w_s(&mut out, "	call closesocket@PLT\n");

@@ -15,6 +15,8 @@ What will be 0.2.0.
 
 ### Tools
 
+- `host_net` operation 2 takes a time limit in the bits of `b` above the port (`std/net`'s `net_connect_timeout`): a connect that does not finish in time fails, and reads and sends on that socket give up after the same time. `dns_lookup` and `https_fetch` use it. Windows ignores the limit.
+
 - `tools/bastiofmt`: a source formatter written in Bastio (`bastiofmt file.bastio`,
   `--write`, `--check`, `-` for standard input). It lays a file out from its
   tokens and refuses to print anything that does not lex to the same tokens as

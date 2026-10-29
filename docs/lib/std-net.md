@@ -17,6 +17,7 @@ listener, a closed descriptor, an address in use) gives `Option::None` or
 | [`net_listen`](#net_listen) | Starts listening on `ip`:`port` (port 0 picks a free one). |
 | [`net_port`](#net_port) | The port a listening socket is bound to. |
 | [`net_connect`](#net_connect) | Connects to `ip`:`port`. |
+| [`net_connect_timeout`](#net_connect_timeout) | Connects to `ip`:`port` within `ms` milliseconds (0 means no limit, as `net_connect`; more than an hour is cut to an hour). |
 | [`net_accept`](#net_accept) | Waits for a connection on a listening socket and returns it. |
 | [`net_recv`](#net_recv) | Reads up to `max` bytes into `out` (replacing it). |
 | [`net_send_all`](#net_send_all) | Sends all of `data`, retrying after a partial write. |
@@ -97,6 +98,59 @@ match net_connect(host, net_ip4(127, 0, 0, 1), 1) {
   Option::Some(s) => { net_close(host, s); return 1; },
   Option::None => {},
 }
+```
+
+### `net_connect_timeout`
+
+```bastio
+fn net_connect_timeout(h: &Host, ip: u64, port: u64, ms: u64) -> Option[u64]
+```
+
+Connects to `ip`:`port` within `ms` milliseconds (0 means no limit, as
+`net_connect`; more than an hour is cut to an hour). The socket has the
+same limit on every later read and write, so `net_recv` gives `None` when
+nothing arrives in time and `net_send_all` returns false. The limit is not
+applied on Windows yet: there the call blocks as `net_connect` does.
+
+Example:
+
+```bastio
+// Nothing listens on port 1; the refusal comes at once.
+match net_connect_timeout(host, net_ip4(127, 0, 0, 1), 1, 2000) {
+  Option::Some(s) => { net_close(host, s); return 1; },
+  Option::None => {},
+}
+// A listener that is there: the connection is made and works.
+let lo = net_ip4(127, 0, 0, 1);
+let mut bad = 1;
+match net_listen(host, lo, 0) {
+  Option::Some(l) => {
+    match net_connect_timeout(host, lo, net_port(host, l), 2000) {
+      Option::Some(c) => {
+        match net_accept(host, l) {
+          Option::Some(a) => {
+            let msg = bfrom("ping");
+            let sent = net_send_all(host, c, msg);
+            bfree(msg);
+            let mut got = balloc(0);
+            match net_recv(host, a, 16, &mut got) {
+              Option::Some(n) => { if sent && n == 4 { bad = 0; } },
+              Option::None => {},
+            }
+            bfree(got);
+            net_close(host, a);
+          },
+          Option::None => {},
+        }
+        net_close(host, c);
+      },
+      Option::None => {},
+    }
+    net_close(host, l);
+  },
+  Option::None => {},
+}
+if bad != 0 { return 1; }
 ```
 
 ### `net_accept`

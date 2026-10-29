@@ -104,9 +104,12 @@ if (isMainThread) {
       const go = () => { if (o.queue.length) reply(o.queue.shift()); else o.wait = go; };
       go();
     } else if (op === 2n) {
-      const s = net.connect({ host: ip(BigInt.asUintN(32, a)), port: Number(b) });
-      s.once('connect', () => reply(track(s)));
-      s.once('error', () => reply(FAIL));
+      const limit = Number(BigInt.asUintN(48, b) >> 16n);   // the bits of the port word above bit 15: a time limit in milliseconds
+      const s = net.connect({ host: ip(BigInt.asUintN(32, a)), port: Number(b & 0xffffn) });
+      let done = false;
+      const timer = limit > 0 ? setTimeout(() => { if (!done) { done = true; s.destroy(); reply(FAIL); } }, Math.min(limit, 3600000)) : null;
+      s.once('connect', () => { if (done) return; done = true; if (timer) clearTimeout(timer); const id = track(s); socks.get(id).limit = limit > 0 ? Math.min(limit, 3600000) : 0; reply(id); });
+      s.once('error', () => { if (done) return; done = true; if (timer) clearTimeout(timer); reply(FAIL); });
     } else if (op === 3n) {
       const o = socks.get(a);
       if (!o) return reply(FAIL);
@@ -118,7 +121,14 @@ if (isMainThread) {
           o.buf = n < all.length ? [all.subarray(n)] : [];
           reply(BigInt(n), all.subarray(0, n));
         } else if (o.ended || want === 0) reply(0n, new Uint8Array(0));
-        else o.wait = go;
+        else {
+          let t = null;
+          const resume = () => { if (t) clearTimeout(t); go(); };
+          o.wait = resume;
+          if (o.limit > 0) {                        // a read that has waited for the socket's time limit fails
+            t = setTimeout(() => { if (o.wait === resume) { o.wait = null; reply(FAIL); } }, o.limit);
+          }
+        }
       };
       go();
     } else if (op === 4n) {
