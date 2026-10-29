@@ -58,6 +58,10 @@ if (isMainThread) {
 } else {
   const net = require('net');
   const { ctrl, args, data } = workerData;
+  // A pending Atomics.waitAsync does not keep the thread alive: once every
+  // socket is closed the event loop would end and a later request would wait
+  // for ever. The timer keeps it running until the module ends the worker.
+  setInterval(() => {}, 1 << 30);
   let next = 3n;
   const socks = new Map();                          // id -> { s, buf: [Buffer], ended, wait: fn }
   const servers = new Map();                        // id -> { srv, queue: [id], wait: fn }
