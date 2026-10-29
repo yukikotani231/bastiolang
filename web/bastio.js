@@ -178,6 +178,10 @@
             return y;
           }
           if (!net) return NONE;
+          if (op === 9) {                            // connect over IPv6 to the 16 bytes of the cell
+            if (word(cell, 0) !== 16n) return NONE;
+            return net.call(op, 0n, y, bytes(word(cell, 1), 16n)).result;
+          }
           if (op === 4) {                            // write the cell's bytes to socket x
             const data = bytes(word(cell, 1), word(cell, 0));
             const r = net.call(op, x, y, data);
