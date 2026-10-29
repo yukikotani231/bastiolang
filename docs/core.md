@@ -81,6 +81,7 @@ Each module has a reference page, generated from its source: every function with
 | [`core/x509.bastio`](lib/core-x509.md) | Reading X.509 certificates (RFC 5280) and checking their signatures, for the chain a TLS 1.3 server sends. |
 | [`std/host.bastio`](lib/std-host.md) | The command line, files and standard error, for programs on the hosted target. |
 | [`std/http.bastio`](lib/std-http.md) | HTTP/1.1 over std/net.bastio, for programs on the hosted target. |
+| [`std/https.bastio`](lib/std-https.md) | HTTPS (or any protocol over TLS 1.3) for programs on the hosted target. |
 | [`std/net.bastio`](lib/std-net.md) | TCP sockets for programs on the hosted target (Linux and the other targets whose native or C backend links the C library's socket calls). |
 <!-- libref: end -->
 

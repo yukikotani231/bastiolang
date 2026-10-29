@@ -79,6 +79,16 @@ client() { # description want(0|nonzero) name roots now
   else echo "ok   $d"; fi
 }
 
+# The same with the system's clock and random bytes (std/https's https_get).
+system_client() { # description want(0|nonzero) name roots
+  local d=$1 want=$2
+  timeout 60 "$tmp/httpsget" "$port" "$3" "$tmp/$4" > "$tmp/out" 2>&1
+  local rc=$?
+  if [ "$want" = 0 ] && [ $rc != 0 ]; then fail "$d: exit $rc"; sed 's/^/    /' "$tmp/out" | head -5
+  elif [ "$want" != 0 ] && [ $rc = 0 ]; then fail "$d: accepted"; sed 's/^/    /' "$tmp/out" | head -5
+  else echo "ok   $d"; fi
+}
+
 make_ca ecca ec; make_ca rsaca rsa; make_ca edca ed25519; make_ca other ec
 cat "$tmp/ecca.der" > "$tmp/ec.roots"; cat "$tmp/rsaca.der" > "$tmp/rsa.roots"; cat "$tmp/edca.der" > "$tmp/ed.roots"
 cat "$tmp/other.der" > "$tmp/other.roots"; cat "$tmp/ecca.der" "$tmp/rsaca.der" "$tmp/edca.der" > "$tmp/all.roots"
@@ -95,6 +105,9 @@ serve eclocal eclocal && {
   client "no roots at all" 1 localhost /dev/null
   client "not valid yet" 1 localhost ec.roots 1000000000
   client "expired" 1 localhost ec.roots 4102444800
+  system_client "std/https: https_get" 0 localhost ec.roots
+  system_client "std/https: wrong name" 1 example.org ec.roots
+  system_client "std/https: untrusted root" 1 localhost other.roots
 }
 make_cert rsalocal rsa rsaca "DNS:localhost"
 serve rsalocal rsalocal && client "RSA certificate (rsa_pss_rsae_sha256)" 0 localhost rsa.roots

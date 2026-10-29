@@ -876,6 +876,7 @@ fn cg_prelude_child(out: &mut Vec[u64]) {
 /// The prelude part for `host_net`, which stage0 does not have: added after the
 /// hosted prelude, and only to a program that calls it.
 fn cg_prelude_net(out: &mut Vec[u64]) {
+  w_s(&mut out, "#include <time.h>\n");
   w_s(&mut out, "#ifndef _WIN32\n");
   w_s(&mut out, "#include <sys/socket.h>\n");
   w_s(&mut out, "#include <netinet/in.h>\n");
@@ -920,6 +921,19 @@ fn cg_prelude_net(out: &mut Vec[u64]) {
   w_s(&mut out, "}\n");
   w_s(&mut out, "static uint64_t bst_host_net_win(uint64_t op, uint64_t a, uint64_t b, bst_bytes *buf) {\n");
   w_s(&mut out, "    const bst_sock bad = ~(bst_sock)0;\n");
+  w_s(&mut out, "    if (op == 7) return (uint64_t)time(NULL);\n");
+  w_s(&mut out, "    if (op == 8) {   /* RtlGenRandom, which advapi32 exports as SystemFunction036 */\n");
+  w_s(&mut out, "        if (b > 256) return ~(uint64_t)0;\n");
+  w_s(&mut out, "        HMODULE m = LoadLibraryA(\"advapi32.dll\");\n");
+  w_s(&mut out, "        BOOLEAN (__stdcall *gen)(void *, ULONG) = m ? (BOOLEAN (__stdcall *)(void *, ULONG))(void *)GetProcAddress(m, \"SystemFunction036\") : NULL;\n");
+  w_s(&mut out, "        unsigned char *d = (unsigned char *)malloc(b ? b : 1);\n");
+  w_s(&mut out, "        if (!d) { fputs(\"Bastio: out of memory\\n\", stderr); abort(); }\n");
+  w_s(&mut out, "        if (!gen || !gen(d, (ULONG)b)) { free(d); return ~(uint64_t)0; }\n");
+  w_s(&mut out, "        free(buf->data);\n");
+  w_s(&mut out, "        buf->len = b;\n");
+  w_s(&mut out, "        buf->data = d;\n");
+  w_s(&mut out, "        return b;\n");
+  w_s(&mut out, "    }\n");
   w_s(&mut out, "    unsigned char sa[16];   /* sockaddr_in: family, port and address in network order */\n");
   w_s(&mut out, "    if (!bst_ws_init()) return ~(uint64_t)0;\n");
   w_s(&mut out, "    memset(sa, 0, sizeof sa);\n");
@@ -965,8 +979,9 @@ fn cg_prelude_net(out: &mut Vec[u64]) {
   w_s(&mut out, " * socket; 1 accepts a connection on socket `a`; 2 connects to address `a`, port `b`;\n");
   w_s(&mut out, " * 3 reads at most `b` bytes from socket `a` into `*buf` (replacing it; an empty\n");
   w_s(&mut out, " * result is end of file); 4 writes `*buf` to socket `a` and returns how many bytes\n");
-  w_s(&mut out, " * went; 5 closes socket `a`; 6 returns the local port of socket `a`. The failure\n");
-  w_s(&mut out, " * of any is 2^64 - 1. */\n");
+  w_s(&mut out, " * went; 5 closes socket `a`; 6 returns the local port of socket `a`;\n");
+  w_s(&mut out, " * 7 returns the time in seconds since 1970; 8 replaces `*buf` with `b` (at most\n");
+  w_s(&mut out, " * 256) random bytes from the system's source. The failure of any is 2^64 - 1. */\n");
   w_s(&mut out, "static uint64_t bst_host_net(bst_host h, uint64_t op, uint64_t a, uint64_t b, bst_bytes *buf) {\n");
   w_s(&mut out, "    (void)h;\n");
   w_s(&mut out, "#ifdef _WIN32\n");
@@ -977,6 +992,25 @@ fn cg_prelude_net(out: &mut Vec[u64]) {
   w_s(&mut out, "    sa.sin_family = AF_INET;\n");
   w_s(&mut out, "    sa.sin_port = htons((uint16_t)b);\n");
   w_s(&mut out, "    sa.sin_addr.s_addr = htonl((uint32_t)a);\n");
+  w_s(&mut out, "    if (op == 7) return (uint64_t)time(NULL);\n");
+  w_s(&mut out, "    if (op == 8) {\n");
+  w_s(&mut out, "        if (b > 256) return ~(uint64_t)0;\n");
+  w_s(&mut out, "        unsigned char *d = (unsigned char *)malloc(b ? b : 1);\n");
+  w_s(&mut out, "        if (!d) { fputs(\"Bastio: out of memory\\n\", stderr); abort(); }\n");
+  w_s(&mut out, "        int fd = open(\"/dev/urandom\", O_RDONLY);\n");
+  w_s(&mut out, "        uint64_t got = 0;\n");
+  w_s(&mut out, "        while (fd >= 0 && got < b) {\n");
+  w_s(&mut out, "            ssize_t n = read(fd, d + got, b - got);\n");
+  w_s(&mut out, "            if (n <= 0) break;\n");
+  w_s(&mut out, "            got += (uint64_t)n;\n");
+  w_s(&mut out, "        }\n");
+  w_s(&mut out, "        if (fd >= 0) close(fd);\n");
+  w_s(&mut out, "        if (got != b) { free(d); return ~(uint64_t)0; }\n");
+  w_s(&mut out, "        free(buf->data);\n");
+  w_s(&mut out, "        buf->len = b;\n");
+  w_s(&mut out, "        buf->data = d;\n");
+  w_s(&mut out, "        return b;\n");
+  w_s(&mut out, "    }\n");
   w_s(&mut out, "    if (op == 0 || op == 2) {\n");
   w_s(&mut out, "        int fd = socket(AF_INET, SOCK_STREAM, 0);\n");
   w_s(&mut out, "        if (fd < 0) return ~(uint64_t)0;\n");

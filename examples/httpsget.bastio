@@ -4,13 +4,15 @@
 // roots in a file, sends `GET / HTTP/1.0` and prints the answer.
 //
 //   httpsget PORT NAME ROOTS SEED NOW
+//   httpsget PORT NAME ROOTS
 //
 // PORT is the port on 127.0.0.1, NAME the host name to check the certificate
 // for (and to send), ROOTS a file of DER certificates one after the other,
 // SEED a file of 32 bytes that must be unpredictable (every value that has
 // to be random is made from it, so it may be used only once), and NOW the
 // time in seconds since 1970. It exits with 0 if the answer starts with
-// `HTTP/1.` and a 200 status. With no arguments it only checks that a
+// `HTTP/1.` and a 200 status. With three arguments the seed and the time come
+// from the system and std/https does it all (`https_get`). With no arguments it only checks that a
 // connection starts: the client makes a ClientHello, refuses bytes that are
 // no TLS and does nothing before the handshake is done.
 //
@@ -24,6 +26,7 @@ import "core/sha256.bastio";
 import "core/text.bastio";
 import "core/tls13client.bastio";
 import "std/host.bastio";
+import "std/https.bastio";
 import "std/net.bastio";
 
 /// 32 bytes made from `seed` and the byte `tag`: SHA-256 of the two.
@@ -39,20 +42,6 @@ fn derive(seed: &Bytes, tag: u8) -> Bytes
   return r;
 }
 
-/// Sends what is in `out` over the socket and empties it. False if sending fails.
-fn flush(h: &Host, sock: u64, out: &mut Vec[u8]) -> bool {
-  if vec_len(out) == 0 { return true; }
-  let b = text_to_bytes(out);
-  while vec_len(out) > 0
-    invariant true
-  {
-    vec_pop(&mut out);
-  }
-  let ok = net_send_all(h, sock, b);
-  bfree(b);
-  return ok;
-}
-
 /// Runs the whole exchange on the connected socket `sock`; the exit code.
 fn exchange(con: &Serial, h: &Host, sock: u64, name: &Bytes, roots: &Bytes, seed: &Bytes, now: u64) -> u64
   requires blen(name) <= 255 && blen(roots) < 274877906944 && blen(seed) == 32
@@ -60,76 +49,81 @@ fn exchange(con: &Serial, h: &Host, sock: u64, name: &Bytes, roots: &Bytes, seed
   let random = derive(seed, 1);
   let session = derive(seed, 2);
   let key = derive(seed, 3);
-  let mut out = text_new();
-  let mut app = text_new();
-  let mut client = tls13c_new(random, session, key, name, &mut out);
   let request = bfrom("GET / HTTP/1.0\r\nConnection: close\r\n\r\n");
-  let mut asked = false;
-  let mut alive = flush(h, sock, &mut out);
-  let mut buf = balloc(0);
-  let mut rounds = 0;
-  let mut code = 0;
-  while alive && rounds < 10000 && tls13c_state(client) < 6
-    invariant rounds <= 10000 && tls13c_ok(client) && blen(request) < 1000 && blen(roots) < 274877906944
-  {
-    if tls13c_state(client) == 5 && !asked {
-      asked = true;
-      alive = tls13c_send(&mut client, request, &mut out);
-    }
-    if alive { alive = flush(h, sock, &mut out); }
-    if alive {
-      match net_recv(h, sock, 16384, &mut buf) {
-        Option::None => { alive = false; },
-        Option::Some(n) => {
-          if n == 0 || blen(buf) >= 1048576 {
-            alive = false;
-          } else {
-            code = tls13c_feed(&mut client, buf, roots, now, &mut out, &mut app);
-            if code != 0 { alive = false; }
-          }
-        },
-      }
-    }
-    rounds = rounds + 1;
-  }
-  if tls13c_state(client) == 5 || tls13c_state(client) == 6 {
-    // The close_notify we may have to answer, or nothing.
-    flush(h, sock, &mut out);
-  }
-  let st = tls13c_state(client);
-  let reply = text_to_bytes(app);
+  let r = https_run(h, sock, name, request, roots, now, random, session, key);
   print_str(con, "state ");
-  print_u64(con, st);
+  print_u64(con, r.state);
   print_str(con, ", error ");
-  print_u64(con, code);
+  print_u64(con, r.error);
   print_str(con, ", ");
-  print_u64(con, blen(reply));
+  print_u64(con, blen(r.data));
   print_str(con, " bytes of application data\n");
   let mut verdict = 1;
   let head = bfrom("HTTP/1.");
   let status = bfrom(" 200 ");
-  if st == 6 && bytes_starts_with(reply, head) {
-    match bytes_find(reply, status, 0) {
+  if r.state == 6 && bytes_starts_with(r.data, head) {
+    match bytes_find(r.data, status, 0) {
       Option::Some(i) => { if i < 16 { verdict = 0; } },
       Option::None => {},
     }
   }
   bfree(status);
   bfree(head);
-  print_bytes(con, reply);
-  bfree(reply);
-  bfree(buf);
+  print_bytes(con, r.data);
+  https_result_free(r);
   bfree(request);
-  tls13c_free(client);
-  vec_free(app);
-  vec_free(out);
   bfree(key);
   bfree(session);
   bfree(random);
   return verdict;
 }
 
+/// `httpsget PORT NAME ROOTS`: std/https's `https_get` with the system's
+/// clock and random bytes; the exit code is 0 for an answer with status 200.
+fn system_get(con: &Serial, h: &Host) -> u64 {
+  let a_port = host_arg(h, 1);
+  let name = host_arg(h, 2);
+  let a_roots = host_arg(h, 3);
+  let port = opt_or[u64](parse_u64(a_port, 0, blen(a_port)), 0);
+  let mut roots = balloc(0);
+  let path = bfrom("/");
+  let mut code = 2;
+  if port != 0 && blen(name) <= 255 && host_read(h, a_roots, &mut roots) && blen(roots) < 16777216 {
+    code = 1;
+    match https_get(h, net_ip4(127, 0, 0, 1), port, name, path, roots) {
+      Option::None => { print_str(con, "no answer\n"); },
+      Option::Some(reply) => {
+        let head = bfrom("HTTP/1.");
+        let status = bfrom(" 200 ");
+        if bytes_starts_with(reply, head) {
+          match bytes_find(reply, status, 0) {
+            Option::Some(i) => { if i < 16 { code = 0; } },
+            Option::None => {},
+          }
+        }
+        bfree(status);
+        bfree(head);
+        print_str(con, "answer of ");
+        print_u64(con, blen(reply));
+        print_str(con, " bytes\n");
+        bfree(reply);
+      },
+    }
+  } else {
+    print_str(con, "usage: httpsget PORT NAME ROOTS\n");
+  }
+  bfree(path);
+  bfree(roots);
+  bfree(a_roots);
+  bfree(name);
+  bfree(a_port);
+  return code;
+}
+
 fn main(con: &mut Serial, h: &mut Host) -> u64 {
+  if host_argc(h) == 4 {
+    return system_get(con, h);
+  }
   if host_argc(h) < 6 {
     return selfcheck(con);
   }
