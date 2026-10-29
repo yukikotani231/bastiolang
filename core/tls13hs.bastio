@@ -1,0 +1,263 @@
+// core/tls13hs.bastio: the first two messages of a TLS 1.3 handshake (RFC
+// 8446 section 4): the ClientHello a client sends and the reading of the
+// ServerHello that answers it, for the cipher suite
+// TLS_CHACHA20_POLY1305_SHA256 and the key exchange X25519.
+//
+// What is proved: every access is in bounds, nothing leaks, a ClientHello
+// has the length its fields add up to, and `tls13_parse_server_hello` reads
+// no byte outside the message it is given, whatever it holds. Not proved:
+// that a ClientHello is one a server accepts (the tests compare it with one
+// assembled by another program) or that the reader accepts every ServerHello
+// of the standard (it takes the one suite and group the client offered).
+import "bytes.bastio";
+import "endian.bastio";
+import "option.bastio";
+import "text.bastio";
+
+/// Internal: appends the 16-bit big-endian number `v` to `t`.
+fn tls13_push_u16(t: &mut Vec[u8], v: u64)
+  requires v < 65536
+  ensures vlen(t) == vlen(old(t)) + 2
+{
+  text_push(&mut t, cast[u8](v / 256));
+  text_push(&mut t, cast[u8](v % 256));
+}
+
+/// Internal: appends `b` to `t`, behind its length as a 16-bit number.
+fn tls13_push_block16(t: &mut Vec[u8], b: &Bytes)
+  requires blen(b) < 65536
+  ensures vlen(t) == vlen(old(t)) + 2 + blen(b)
+{
+  tls13_push_u16(&mut t, blen(b));
+  text_push_bytes(&mut t, b);
+}
+
+/// Internal: appends the extension of type `ty` with the contents `body`.
+fn tls13_push_ext(t: &mut Vec[u8], ty: u64, body: &Bytes)
+  requires ty < 65536 && blen(body) < 65536
+  ensures vlen(t) == vlen(old(t)) + 4 + blen(body)
+{
+  tls13_push_u16(&mut t, ty);
+  tls13_push_block16(&mut t, body);
+}
+
+/// Internal: the contents of a list of 16-bit numbers `a`, `b`, ... behind
+/// their length.
+fn tls13_u16_list(a: u64, b: u64, c: u64, n: u64) -> Bytes
+  requires a < 65536 && b < 65536 && c < 65536 && n >= 1 && n <= 3
+  ensures blen(result) == 2 + 2 * n
+{
+  let mut t = text_new();
+  tls13_push_u16(&mut t, 2 * n);
+  tls13_push_u16(&mut t, a);
+  if n >= 2 { tls13_push_u16(&mut t, b); }
+  if n >= 3 { tls13_push_u16(&mut t, c); }
+  return text_finish(t);
+}
+
+/// Internal: the extensions of a ClientHello, behind none of their length.
+fn tls13_hello_extensions(server_name: Str, key_share: &Bytes) -> Bytes
+  requires blen(key_share) == 32 && slen(server_name) <= 255
+  ensures blen(result) <= 340
+{
+  let mut t = text_new();
+  if slen(server_name) > 0 {
+    // server_name: a list of one entry, of type host_name (0).
+    let mut e = text_new();
+    text_push(&mut e, 0);
+    tls13_push_u16(&mut e, slen(server_name));
+    text_push_str(&mut e, server_name);
+    let entry = text_finish(e);
+    let mut l = text_new();
+    tls13_push_block16(&mut l, entry);
+    let list = text_finish(l);
+    tls13_push_ext(&mut t, 0, list);
+    bfree(list);
+    bfree(entry);
+  }
+  // supported_groups: x25519.
+  let groups = tls13_u16_list(29, 0, 0, 1);
+  tls13_push_ext(&mut t, 10, groups);
+  bfree(groups);
+  // signature_algorithms: ed25519, ecdsa_secp256r1_sha256, rsa_pss_rsae_sha256.
+  let schemes = tls13_u16_list(2055, 1027, 2052, 3);
+  tls13_push_ext(&mut t, 13, schemes);
+  bfree(schemes);
+  // supported_versions: TLS 1.3 only (a list with a one-byte length).
+  let mut v = text_new();
+  text_push(&mut v, 2);
+  tls13_push_u16(&mut v, 772);
+  let versions = text_finish(v);
+  tls13_push_ext(&mut t, 43, versions);
+  bfree(versions);
+  // key_share: one entry, x25519 with its 32-byte public key.
+  let mut k = text_new();
+  tls13_push_u16(&mut k, 29);
+  tls13_push_block16(&mut k, key_share);
+  let entry2 = text_finish(k);
+  let mut l2 = text_new();
+  tls13_push_block16(&mut l2, entry2);
+  let list2 = text_finish(l2);
+  tls13_push_ext(&mut t, 51, list2);
+  bfree(list2);
+  bfree(entry2);
+  return text_finish(t);
+}
+
+/// The ClientHello message (handshake type 1) offering TLS 1.3 with
+/// TLS_CHACHA20_POLY1305_SHA256, the group X25519 (with the key share
+/// `key_share`, 32 bytes) and the signature schemes ed25519,
+/// ecdsa_secp256r1_sha256 and rsa_pss_rsae_sha256, for the server named
+/// `server_name` (at most 255 bytes; empty for none). `random` and
+/// `session_id` are 32 bytes each; the session id is echoed back by the
+/// server and exists for compatibility with middleboxes. The result starts
+/// with the type and a 3-byte length of what follows.
+/// ```
+/// let random = balloc(32);
+/// let sid = balloc(32);
+/// let key = balloc(32);
+/// let hello = tls13_client_hello(random, sid, "example.com", key);
+/// let n = blen(hello);
+/// let ty = bget(hello, 0);
+/// let ln = load_be16(hello, 2);
+/// bfree(hello);
+/// bfree(key);
+/// bfree(sid);
+/// bfree(random);
+/// if ty != 1 || cast[u64](ln) + 4 != n { return 1; }
+/// ```
+fn tls13_client_hello(random: &Bytes, session_id: &Bytes, server_name: Str, key_share: &Bytes) -> Bytes
+  requires blen(random) == 32 && blen(session_id) == 32 && blen(key_share) == 32 && slen(server_name) <= 255
+  ensures blen(result) > 4 && blen(result) < 600
+{
+  let exts = tls13_hello_extensions(server_name, key_share);
+  let mut t = text_new();
+  tls13_push_u16(&mut t, 771);
+  text_push_bytes(&mut t, random);
+  text_push(&mut t, 32);
+  text_push_bytes(&mut t, session_id);
+  tls13_push_u16(&mut t, 2);
+  tls13_push_u16(&mut t, 4867);
+  text_push(&mut t, 1);
+  text_push(&mut t, 0);
+  tls13_push_block16(&mut t, exts);
+  bfree(exts);
+  let n = vec_len(t);
+  let mut m = text_new();
+  text_push(&mut m, 1);
+  text_push(&mut m, 0);
+  tls13_push_u16(&mut m, n);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && vlen(m) == 4 + i && vlen(t) == n
+  {
+    text_push(&mut m, vec_get(t, i));
+    i = i + 1;
+  }
+  vec_free(t);
+  return text_finish(m);
+}
+
+/// The X25519 public key (32 bytes) in the ServerHello `msg` (the whole
+/// handshake message, with its 4-byte header), or `None` unless it is a
+/// ServerHello for what `tls13_client_hello` offers: TLS 1.2 in the legacy
+/// version, the suite TLS_CHACHA20_POLY1305_SHA256, no compression, exactly
+/// the extensions supported_versions (TLS 1.3) and key_share (x25519, once
+/// each), and the length of each part inside the one before it. A
+/// HelloRetryRequest is refused.
+/// ```
+/// let random = balloc(32);
+/// let sid = balloc(32);
+/// let key = balloc(32);
+/// let hello = tls13_client_hello(random, sid, "", key);
+/// let mut ok = false;
+/// match tls13_parse_server_hello(hello) {
+///   Option::Some(k) => { bfree(k); },
+///   Option::None => { ok = true; },
+/// }
+/// bfree(hello);
+/// bfree(key);
+/// bfree(sid);
+/// bfree(random);
+/// if !ok { return 1; }
+/// ```
+fn tls13_parse_server_hello(msg: &Bytes) -> Option[Bytes]
+  requires blen(msg) < 274877906944
+{
+  let n = blen(msg);
+  if n < 48 || n > 70000 { return Option[Bytes]::None; }
+  if bget(msg, 0) != 2 { return Option[Bytes]::None; }
+  let len = cast[u64](bget(msg, 1)) * 65536 + cast[u64](load_be16(msg, 2));
+  if len + 4 != n { return Option[Bytes]::None; }
+  if load_be16(msg, 4) != 771 { return Option[Bytes]::None; }
+  // A HelloRetryRequest carries this fixed value as its random.
+  let hrr = tls13_hrr_random();
+  let retry = bytes_span_eq(msg, 6, hrr, 0, 32);
+  bfree(hrr);
+  if retry { return Option[Bytes]::None; }
+  let sid = cast[u64](bget(msg, 38));
+  let at = 39 + sid;
+  if at + 5 + 2 > n { return Option[Bytes]::None; }
+  if load_be16(msg, at) != 4867 { return Option[Bytes]::None; }
+  if bget(msg, at + 2) != 0 { return Option[Bytes]::None; }
+  let ext_len = cast[u64](load_be16(msg, at + 3));
+  let mut p = at + 5;
+  if p + ext_len != n { return Option[Bytes]::None; }
+  let mut have_version = false;
+  let mut have_key = false;
+  let mut share = balloc(0);
+  while p < n
+    invariant p <= n && n == blen(msg)
+  {
+    if p + 4 > n {
+      bfree(share);
+      return Option[Bytes]::None;
+    }
+    let ty = cast[u64](load_be16(msg, p));
+    let el = cast[u64](load_be16(msg, p + 2));
+    p = p + 4;
+    if el > n - p {
+      bfree(share);
+      return Option[Bytes]::None;
+    }
+    if ty == 43 && !have_version && el == 2 && load_be16(msg, p) == 772 {
+      have_version = true;
+    } else if ty == 51 && !have_key && el == 36 && load_be16(msg, p) == 29 && load_be16(msg, p + 2) == 32 {
+      have_key = true;
+      bfree(share);
+      share = bytes_slice(msg, p + 4, p + 36);
+    } else {
+      bfree(share);
+      return Option[Bytes]::None;
+    }
+    p = p + el;
+  }
+  if have_version && have_key { return Option[Bytes]::Some(share); }
+  bfree(share);
+  return Option[Bytes]::None;
+}
+
+/// Internal: the random value that marks a HelloRetryRequest.
+fn tls13_hrr_random() -> Bytes
+  ensures blen(result) == 32
+{
+  let mut b = balloc(32);
+  let h = "cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c";
+  let mut i = 0;
+  while i < 32
+    invariant i <= 32 && blen(b) == 32 && slen(h) == 64
+  {
+    bset(&mut b, i, tls13_nib(sget(h, 2 * i)) * 16 + tls13_nib(sget(h, 2 * i + 1)));
+    i = i + 1;
+  }
+  return b;
+}
+
+/// Internal: the value of the hex digit `c`.
+fn tls13_nib(c: u8) -> u8
+  ensures result < 16
+{
+  if c >= 48 && c <= 57 { return c - 48; }
+  if c >= 97 && c <= 102 { return c - 87; }
+  return 0;
+}
