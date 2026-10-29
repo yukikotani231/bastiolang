@@ -27,7 +27,10 @@ make_ca() { # name kind
   local n=$1 k=$2 opts
   case $k in
     ec) opts="-newkey ec -pkeyopt ec_paramgen_curve:P-256 -sha256";;
+    ec384) opts="-newkey ec -pkeyopt ec_paramgen_curve:P-384 -sha384";;
     rsa) opts="-newkey rsa:2048 -sha256";;
+    rsa384) opts="-newkey rsa:2048 -sha384";;
+    rsa512) opts="-newkey rsa:2048 -sha512";;
     ed25519) opts="-newkey ed25519";;
   esac
   openssl req -x509 $opts -nodes -keyout "$tmp/$n.key" -out "$tmp/$n.pem" -subj "/CN=$n" -days 3650 \
@@ -36,10 +39,11 @@ make_ca() { # name kind
 }
 # A certificate for names, of key kind k, signed by the authority ca.
 # ca_flag=1 makes it an intermediate that may sign.
-make_cert() { # name kind ca names [ca_flag]
-  local n=$1 k=$2 ca=$3 names=$4 flag=${5:-0} opts ext="$tmp/$1.ext"
+make_cert() { # name kind ca names [ca_flag [hash]]
+  local n=$1 k=$2 ca=$3 names=$4 flag=${5:-0} hash=${6:--sha256} opts ext="$tmp/$1.ext"
   case $k in
     ec) opts="-newkey ec -pkeyopt ec_paramgen_curve:P-256";;
+    ec384) opts="-newkey ec -pkeyopt ec_paramgen_curve:P-384";;
     rsa) opts="-newkey rsa:2048";;
     ed25519) opts="-newkey ed25519";;
   esac
@@ -49,7 +53,7 @@ make_cert() { # name kind ca names [ca_flag]
   else
     printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nsubjectAltName=%s\n' "$names" > "$ext"
   fi
-  local alg=-sha256; [ "$(openssl x509 -in "$tmp/$ca.pem" -noout -text | grep -c 'Public Key Algorithm: ED25519')" != 0 ] && alg=
+  local alg=$hash; [ "$(openssl x509 -in "$tmp/$ca.pem" -noout -text | grep -c 'Public Key Algorithm: ED25519')" != 0 ] && alg=
   openssl x509 -req -in "$tmp/$n.csr" -CA "$tmp/$ca.pem" -CAkey "$tmp/$ca.key" -CAcreateserial -out "$tmp/$n.pem" \
     -days 365 $alg -extfile "$ext" 2>/dev/null || return 1
 }
@@ -119,6 +123,22 @@ make_cert rsalocal rsa rsaca "DNS:localhost"
 serve rsalocal rsalocal && client "RSA certificate (rsa_pss_rsae_sha256)" 0 localhost rsa.roots
 make_cert edlocal ed25519 edca "DNS:localhost"
 serve edlocal edlocal && client "Ed25519 certificate" 0 localhost ed.roots
+
+# P-384 and SHA-384 / SHA-512 signatures: the certificate chains that Let's Encrypt and most public CAs use.
+make_ca ec384ca ec384; cat "$tmp/ec384ca.der" > "$tmp/ec384.roots"
+make_cert ec384local ec384 ec384ca "DNS:localhost" 0 -sha384
+serve ec384local ec384local && client "P-384 certificate under a P-384 root (ecdsa_secp384r1_sha384)" 0 localhost ec384.roots
+make_cert ec256under384 ec ec384ca "DNS:localhost" 0 -sha384
+serve ec256under384 ec256under384 && client "P-256 certificate signed by a P-384 root with SHA-384" 0 localhost ec384.roots
+make_cert ec384under384 ec384 ec384ca "DNS:localhost" 0 -sha512
+serve ec384under384 ec384under384 && client "P-384 certificate signed with ecdsa-with-SHA512" 0 localhost ec384.roots
+make_ca rsa384ca rsa384; cat "$tmp/rsa384ca.der" > "$tmp/rsa384.roots"
+make_cert rsa384local rsa rsa384ca "DNS:localhost" 0 -sha384
+serve rsa384local rsa384local && client "RSA certificate signed with sha384WithRSAEncryption" 0 localhost rsa384.roots
+make_ca rsa512ca rsa512; cat "$tmp/rsa512ca.der" > "$tmp/rsa512.roots"
+make_cert rsa512local ec rsa512ca "DNS:localhost" 0 -sha512
+serve rsa512local rsa512local && client "ECDSA certificate under a root signed with sha512WithRSAEncryption" 0 localhost rsa512.roots
+serve ec384local ec384local && client "P-384 certificate, other root" 1 localhost ec.roots
 
 # A chain of three: root, intermediate (RSA), leaf (ECDSA); the server sends the leaf and the intermediate.
 make_cert mid rsa ecca "" 1

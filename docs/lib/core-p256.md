@@ -22,6 +22,7 @@ verification takes about as long as a few thousand field multiplications of
 
 | Function | |
 | --- | --- |
+| [`ecdsa_p256_verify_digest`](#ecdsa_p256_verify_digest) | Whether `sig` is a valid ECDSA signature, under the public key `pubkey` on the curve P-256, of the message whose digest is `digest` (from any hash. |
 | [`ecdsa_p256_verify`](#ecdsa_p256_verify) | Whether `sig` is a valid ECDSA signature of `msg` under the public key `pubkey`, with the curve P-256 and SHA-256. |
 
 Every example below is built, verified and run by `tests/run.sh`. An `assert` in one is proved at compile time from the contracts above it.
@@ -47,6 +48,31 @@ Internal: a point in Jacobian coordinates, (X / Z^2, Y / Z^3); Z = 0 is
 the point at infinity.
 
 ## Functions
+
+### `ecdsa_p256_verify_digest`
+
+```bastio
+fn ecdsa_p256_verify_digest(pubkey: &Bytes, digest: &Bytes, sig: &Bytes) -> bool
+  requires blen(digest) < 274877906944 && blen(sig) < 274877906944 && blen(pubkey) < 274877906944
+```
+
+Whether `sig` is a valid ECDSA signature, under the public key `pubkey`
+on the curve P-256, of the message whose digest is `digest` (from any
+hash: SHA-256, SHA-384 or SHA-512; a digest longer than 32 bytes is cut
+to its leftmost 32). Encodings as in `ecdsa_p256_verify`.
+
+Example:
+
+```bastio
+let key = balloc(65);
+let digest = balloc(48);
+let sig = balloc(8);
+let ok = ecdsa_p256_verify_digest(key, digest, sig);
+bfree(sig);
+bfree(digest);
+bfree(key);
+if ok { return 1; }
+```
 
 ### `ecdsa_p256_verify`
 
@@ -392,3 +418,14 @@ fn p256_verify_numbers(qx: &Vec[u64], qy: &Vec[u64], e: &Vec[u64], r: &Vec[u64],
 
 Internal: checks the signature (`r`, `s`) of the hash `e` under the key
 (`qx`, `qy`), all as numbers.
+
+### `p256_hash_number`
+
+```bastio
+fn p256_hash_number(d: &Bytes) -> Vec[u64]
+  ensures vlen(result) == 16
+```
+
+Internal: the first 32 bytes of the digest `d` (as a number), or `d`
+itself with leading zeros when it is shorter (FIPS 186-4 6.4: a longer
+hash is cut to the leftmost bits of the order's length).

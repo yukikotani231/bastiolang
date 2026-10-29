@@ -1,0 +1,809 @@
+// core/p384.bastio: ECDSA signatures over the curve P-384 (secp384r1) with
+// SHA-384, verification only (FIPS 186-4, RFC 6979 is for signing), for the
+// ecdsa_secp384r1_sha384 scheme of TLS 1.3 certificates.
+//
+// What is proved: every access is in bounds, nothing leaks, and the numbers
+// the arithmetic works on have 24 limbs. Not proved: that the arithmetic is
+// right; the tests check signatures made by OpenSSL, many one-bit changes of
+// the signature, key and message being refused, and out-of-range values. The
+// code is not constant time and does not need to be: verification handles
+// only public values.
+//
+// A number is a `Vec[u64]` of 24 limbs of 16 bits, least significant first,
+// below 2^384. Products are built by doubling and adding, which is slow (a
+// verification takes about as long as a few thousand field multiplications of
+// 384 steps each) but short enough to read.
+import "bytes.bastio";
+import "der.bastio";
+import "option.bastio";
+import "sha512.bastio";
+
+/// Internal: the value of the hex digit `c` (0 for anything else).
+fn p384_nib(c: u8) -> u64
+  ensures result < 24
+{
+  if c >= 48 && c <= 57 { return cast[u64](c) - 48; }
+  if c >= 97 && c <= 102 { return cast[u64](c) - 87; }
+  return 0;
+}
+
+/// Internal: the number 0.
+fn bn384_zero() -> Vec[u64]
+  ensures vlen(result) == 24
+{
+  let mut r = vec_new[u64]();
+  let mut i = 0;
+  while i < 24
+    invariant i <= 24 && vlen(r) == i
+  {
+    vec_push(&mut r, 0);
+    i = i + 1;
+  }
+  return r;
+}
+
+/// Internal: a copy of `a`.
+fn bn384_copy(a: &Vec[u64]) -> Vec[u64]
+  requires vlen(a) == 24
+  ensures vlen(result) == 24
+{
+  let mut r = vec_new[u64]();
+  let mut i = 0;
+  while i < 24
+    invariant i <= 24 && vlen(r) == i && vlen(a) == 24
+  {
+    vec_push(&mut r, vec_get(a, i));
+    i = i + 1;
+  }
+  return r;
+}
+
+/// Internal: the number `v` (below 65536).
+fn bn384_small(v: u64) -> Vec[u64]
+  requires v < 65536
+  ensures vlen(result) == 24
+{
+  let mut r = bn384_zero();
+  vec_set(&mut r, 0, v);
+  return r;
+}
+
+/// Internal: the number written as the 96 hex digits of `s`.
+fn bn384_hex(s: Str) -> Vec[u64]
+  requires slen(s) == 96
+  ensures vlen(result) == 24
+{
+  let mut r = bn384_zero();
+  let mut i = 0;
+  while i < 24
+    invariant i <= 24 && vlen(r) == 24 && slen(s) == 96
+  {
+    let k = 92 - 4 * i;
+    let v = p384_nib(sget(s, k)) * 4096 + p384_nib(sget(s, k + 1)) * 256 + p384_nib(sget(s, k + 2)) * 16 + p384_nib(sget(s, k + 3));
+    vec_set(&mut r, i, v);
+    i = i + 1;
+  }
+  return r;
+}
+
+/// Internal: the big-endian number in the 48 bytes `b[at..at+48]`.
+fn bn384_from_bytes(b: &Bytes, at: u64) -> Vec[u64]
+  requires at + 48 <= blen(b) && at < 274877906944
+  ensures vlen(result) == 24
+{
+  let mut r = bn384_zero();
+  let mut i = 0;
+  while i < 24
+    invariant i <= 24 && vlen(r) == 24 && at + 48 <= blen(b)
+  {
+    let hi = cast[u64](bget(b, at + 46 - 2 * i));
+    let lo = cast[u64](bget(b, at + 47 - 2 * i));
+    vec_set(&mut r, i, hi * 256 + lo);
+    i = i + 1;
+  }
+  return r;
+}
+
+/// Internal: whether `a >= b`.
+fn bn384_ge(a: &Vec[u64], b: &Vec[u64]) -> bool
+  requires vlen(a) == 24 && vlen(b) == 24
+{
+  let mut k = 0;
+  while k < 24
+    invariant k <= 24 && vlen(a) == 24 && vlen(b) == 24
+  {
+    let x = vec_get(a, 23 - k);
+    let y = vec_get(b, 23 - k);
+    if x > y { return true; }
+    if x < y { return false; }
+    k = k + 1;
+  }
+  return true;
+}
+
+/// Internal: whether `a == b`.
+fn bn384_eq(a: &Vec[u64], b: &Vec[u64]) -> bool
+  requires vlen(a) == 24 && vlen(b) == 24
+{
+  let mut i = 0;
+  while i < 24
+    invariant i <= 24 && vlen(a) == 24 && vlen(b) == 24
+  {
+    if vec_get(a, i) != vec_get(b, i) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+/// Internal: whether `a == 0`.
+fn bn384_is_zero(a: &Vec[u64]) -> bool
+  requires vlen(a) == 24
+{
+  let mut i = 0;
+  while i < 24
+    invariant i <= 24 && vlen(a) == 24
+  {
+    if vec_get(a, i) != 0 { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+/// Internal: `a + b` modulo 2^384, and in the 25th limb the carry.
+fn bn384_add17(a: &Vec[u64], b: &Vec[u64]) -> Vec[u64]
+  requires vlen(a) == 24 && vlen(b) == 24
+  ensures vlen(result) == 25
+{
+  let mut r = vec_new[u64]();
+  let mut carry = 0;
+  let mut i = 0;
+  while i < 24
+    invariant i <= 24 && vlen(r) == i && vlen(a) == 24 && vlen(b) == 24 && carry <= 1
+  {
+    let s = wrap_add(wrap_add(vec_get(a, i), vec_get(b, i)), carry);
+    vec_push(&mut r, s & 65535);
+    carry = (s >> 16) & 1;
+    i = i + 1;
+  }
+  vec_push(&mut r, carry);
+  return r;
+}
+
+/// Internal: `a + b` modulo 2^384.
+fn bn384_add_wrap(a: &Vec[u64], b: &Vec[u64]) -> Vec[u64]
+  requires vlen(a) == 24 && vlen(b) == 24
+  ensures vlen(result) == 24
+{
+  let s = bn384_add17(a, b);
+  let mut r = bn384_zero();
+  let mut i = 0;
+  while i < 24
+    invariant i <= 24 && vlen(r) == 24 && vlen(s) == 25
+  {
+    vec_set(&mut r, i, vec_get(s, i));
+    i = i + 1;
+  }
+  vec_free(s);
+  return r;
+}
+
+/// Internal: `a - b` modulo 2^384.
+fn bn384_sub_wrap(a: &Vec[u64], b: &Vec[u64]) -> Vec[u64]
+  requires vlen(a) == 24 && vlen(b) == 24
+  ensures vlen(result) == 24
+{
+  let mut r = bn384_zero();
+  let mut borrow = 0;
+  let mut i = 0;
+  while i < 24
+    invariant i <= 24 && vlen(r) == 24 && vlen(a) == 24 && vlen(b) == 24 && borrow <= 1
+  {
+    let d = wrap_sub(wrap_sub(wrap_add(vec_get(a, i), 65536), vec_get(b, i)), borrow);
+    vec_set(&mut r, i, d & 65535);
+    borrow = 1 - ((d >> 16) & 1);
+    i = i + 1;
+  }
+  return r;
+}
+
+/// Internal: a prime modulus `m` with what Montgomery multiplication needs:
+/// `r2` is 2^768 modulo `m` and `minv` is -1/m modulo 2^16.
+struct Modulus384 { m: Vec[u64], r2: Vec[u64], minv: u64 }
+
+/// Internal: the modulus has 24 limbs, like its `r2`.
+spec fn mod384_ok(m: &Modulus384) -> bool {
+  vlen(m.m) == 24 && vlen(m.r2) == 24
+}
+
+/// Internal: `a + b` modulo `m` (for `a` and `b` below `m`).
+fn mod384_add(a: &Vec[u64], b: &Vec[u64], m: &Modulus384) -> Vec[u64]
+  requires vlen(a) == 24 && vlen(b) == 24 && mod384_ok(m)
+  ensures vlen(result) == 24
+{
+  let s = bn384_add17(a, b);
+  let mut low = bn384_zero();
+  let mut i = 0;
+  while i < 24
+    invariant i <= 24 && vlen(low) == 24 && vlen(s) == 25
+  {
+    vec_set(&mut low, i, vec_get(s, i));
+    i = i + 1;
+  }
+  let over = vec_get(s, 24) > 0 || bn384_ge(low, m.m);
+  vec_free(s);
+  if over {
+    let r = bn384_sub_wrap(low, m.m);
+    vec_free(low);
+    return r;
+  }
+  return low;
+}
+
+/// Internal: `a - b` modulo `m` (for `a` and `b` below `m`).
+fn mod384_sub(a: &Vec[u64], b: &Vec[u64], m: &Modulus384) -> Vec[u64]
+  requires vlen(a) == 24 && vlen(b) == 24 && mod384_ok(m)
+  ensures vlen(result) == 24
+{
+  let d = bn384_sub_wrap(a, b);
+  if bn384_ge(a, b) { return d; }
+  let r = bn384_add_wrap(d, m.m);
+  vec_free(d);
+  return r;
+}
+
+/// Internal: bit `i` of `a` (0 or 1).
+fn bn384_bit(a: &Vec[u64], i: u64) -> u64
+  requires vlen(a) == 24 && i < 384
+  ensures result <= 1
+{
+  return (vec_get(a, i / 16) >> (i % 16)) & 1;
+}
+
+/// Internal: `a * b / 2^384` modulo `m` (Montgomery multiplication, for `a`
+/// and `b` below `m`).
+fn mont384_mul(a: &Vec[u64], b: &Vec[u64], m: &Modulus384) -> Vec[u64]
+  requires vlen(a) == 24 && vlen(b) == 24 && mod384_ok(m)
+  ensures vlen(result) == 24
+{
+  let mut t = vec_new[u64]();
+  let mut k = 0;
+  while k < 26
+    invariant k <= 26 && vlen(t) == k
+  {
+    vec_push(&mut t, 0);
+    k = k + 1;
+  }
+  let mut i = 0;
+  while i < 24
+    invariant i <= 24 && vlen(t) == 26 && vlen(a) == 24 && vlen(b) == 24 && mod384_ok(m)
+  {
+    let ai = vec_get(a, i);
+    let mut c = 0;
+    let mut j = 0;
+    while j < 24
+      invariant j <= 24 && vlen(t) == 26 && vlen(b) == 24
+    {
+      let x = wrap_add(wrap_add(vec_get(t, j), wrap_mul(ai, vec_get(b, j))), c);
+      vec_set(&mut t, j, x & 65535);
+      c = x >> 16;
+      j = j + 1;
+    }
+    let x16 = wrap_add(vec_get(t, 24), c);
+    vec_set(&mut t, 24, x16 & 65535);
+    vec_set(&mut t, 25, x16 >> 16);
+    let q = wrap_mul(vec_get(t, 0), m.minv) & 65535;
+    c = 0;
+    j = 0;
+    while j < 24
+      invariant j <= 24 && vlen(t) == 26 && vlen(m.m) == 24
+    {
+      let y = wrap_add(wrap_add(vec_get(t, j), wrap_mul(q, vec_get(m.m, j))), c);
+      if j > 0 { vec_set(&mut t, j - 1, y & 65535); }
+      c = y >> 16;
+      j = j + 1;
+    }
+    let y16 = wrap_add(vec_get(t, 24), c);
+    vec_set(&mut t, 23, y16 & 65535);
+    vec_set(&mut t, 24, wrap_add(vec_get(t, 25), y16 >> 16));
+    vec_set(&mut t, 25, 0);
+    i = i + 1;
+  }
+  let mut low = bn384_zero();
+  i = 0;
+  while i < 24
+    invariant i <= 24 && vlen(low) == 24 && vlen(t) == 26
+  {
+    vec_set(&mut low, i, vec_get(t, i));
+    i = i + 1;
+  }
+  let over = vec_get(t, 24) > 0 || bn384_ge(low, m.m);
+  vec_free(t);
+  if over {
+    let r = bn384_sub_wrap(low, m.m);
+    vec_free(low);
+    return r;
+  }
+  return low;
+}
+
+/// Internal: `a * b` modulo `m` (for `a` and `b` below `m`).
+fn mod384_mul(a: &Vec[u64], b: &Vec[u64], m: &Modulus384) -> Vec[u64]
+  requires vlen(a) == 24 && vlen(b) == 24 && mod384_ok(m)
+  ensures vlen(result) == 24
+{
+  let t = mont384_mul(a, b, m);
+  let r = mont384_mul(t, m.r2, m);
+  vec_free(t);
+  return r;
+}
+
+/// Internal: the modulus for the odd number `m`.
+fn mod384_new(m: Vec[u64]) -> Modulus384
+  requires vlen(m) == 24
+  ensures mod384_ok(result)
+{
+  // Newton's iteration for 1/m modulo 2^16, then its negative.
+  let m0 = vec_get(m, 0);
+  let mut inv = 1;
+  let mut k = 0;
+  while k < 5
+    invariant k <= 5
+  {
+    inv = wrap_mul(inv, wrap_sub(2, wrap_mul(m0, inv))) & 65535;
+    k = k + 1;
+  }
+  let minv = wrap_sub(65536, inv) & 65535;
+  // 2^768 modulo m: 1 doubled 768 times (m is a prime well above 2).
+  let mut r2 = bn384_small(1);
+  let mut stub = Modulus384 { m: m, r2: bn384_zero(), minv: minv };
+  k = 0;
+  while k < 768
+    invariant k <= 768 && vlen(r2) == 24 && mod384_ok(stub)
+  {
+    let d = mod384_add(r2, r2, stub);
+    vec_free(r2);
+    r2 = d;
+    k = k + 1;
+  }
+  vec_free(stub.r2);
+  stub.r2 = r2;
+  return stub;
+}
+
+/// Internal: frees `m`.
+fn mod384_free(m: Modulus384) {
+  vec_free(m.m);
+  vec_free(m.r2);
+}
+
+/// Internal: `a` to the power `e`, modulo `m`.
+fn mod384_pow(a: &Vec[u64], e: &Vec[u64], m: &Modulus384) -> Vec[u64]
+  requires vlen(a) == 24 && vlen(e) == 24 && mod384_ok(m)
+  ensures vlen(result) == 24
+{
+  let mut r = bn384_small(1);
+  let mut k = 0;
+  while k < 384
+    invariant k <= 384 && vlen(r) == 24 && vlen(a) == 24 && vlen(e) == 24 && mod384_ok(m)
+  {
+    let sq = mod384_mul(r, r, m);
+    vec_free(r);
+    r = sq;
+    if bn384_bit(e, 383 - k) == 1 {
+      let p = mod384_mul(r, a, m);
+      vec_free(r);
+      r = p;
+    }
+    k = k + 1;
+  }
+  return r;
+}
+
+/// Internal: the inverse of `a` modulo the prime `m` (0 for 0).
+fn mod384_inv(a: &Vec[u64], m: &Modulus384) -> Vec[u64]
+  requires vlen(a) == 24 && mod384_ok(m)
+  ensures vlen(result) == 24
+{
+  let two = bn384_small(2);
+  let e = bn384_sub_wrap(m.m, two);
+  let r = mod384_pow(a, e, m);
+  vec_free(e);
+  vec_free(two);
+  return r;
+}
+
+/// Internal: a point in Jacobian coordinates, (X / Z^2, Y / Z^3); Z = 0 is
+/// the point at infinity.
+struct P384Point { x: Vec[u64], y: Vec[u64], z: Vec[u64] }
+
+/// Internal: frees `q`.
+fn p384_free(q: P384Point) {
+  vec_free(q.x);
+  vec_free(q.y);
+  vec_free(q.z);
+}
+
+/// Internal: the point at infinity.
+fn p384_infinity() -> P384Point
+  ensures vlen(result.x) == 24 && vlen(result.y) == 24 && vlen(result.z) == 24
+{
+  return P384Point { x: bn384_small(1), y: bn384_small(1), z: bn384_zero() };
+}
+
+/// Internal: a copy of `q`.
+fn p384_copy(q: &P384Point) -> P384Point
+  requires vlen(q.x) == 24 && vlen(q.y) == 24 && vlen(q.z) == 24
+  ensures vlen(result.x) == 24 && vlen(result.y) == 24 && vlen(result.z) == 24
+{
+  return P384Point { x: bn384_copy(q.x), y: bn384_copy(q.y), z: bn384_copy(q.z) };
+}
+
+/// Internal: `a * a` modulo `p`.
+fn p384_sq(a: &Vec[u64], p: &Modulus384) -> Vec[u64]
+  requires vlen(a) == 24 && mod384_ok(p)
+  ensures vlen(result) == 24
+{
+  return mod384_mul(a, a, p);
+}
+
+/// Internal: `2 * q`.
+fn p384_double(q: &P384Point, p: &Modulus384) -> P384Point
+  requires vlen(q.x) == 24 && vlen(q.y) == 24 && vlen(q.z) == 24 && mod384_ok(p)
+  ensures vlen(result.x) == 24 && vlen(result.y) == 24 && vlen(result.z) == 24
+{
+  if bn384_is_zero(q.z) { return p384_infinity(); }
+  let delta = p384_sq(q.z, p);
+  let gamma = p384_sq(q.y, p);
+  let beta = mod384_mul(q.x, gamma, p);
+  let t1 = mod384_sub(q.x, delta, p);
+  let t2 = mod384_add(q.x, delta, p);
+  let t3 = mod384_mul(t1, t2, p);
+  let t3b = mod384_add(t3, t3, p);
+  let alpha = mod384_add(t3b, t3, p);
+  let a2 = p384_sq(alpha, p);
+  let b2 = mod384_add(beta, beta, p);
+  let b4 = mod384_add(b2, b2, p);
+  let b8 = mod384_add(b4, b4, p);
+  let x3 = mod384_sub(a2, b8, p);
+  let yz = mod384_add(q.y, q.z, p);
+  let yz2 = p384_sq(yz, p);
+  let z1 = mod384_sub(yz2, gamma, p);
+  let z3 = mod384_sub(z1, delta, p);
+  let t4 = mod384_sub(b4, x3, p);
+  let t5 = mod384_mul(alpha, t4, p);
+  let g2 = p384_sq(gamma, p);
+  let g4 = mod384_add(g2, g2, p);
+  let g8 = mod384_add(g4, g4, p);
+  let g16 = mod384_add(g8, g8, p);
+  let y3 = mod384_sub(t5, g16, p);
+  vec_free(g16);
+  vec_free(g8);
+  vec_free(g4);
+  vec_free(g2);
+  vec_free(t5);
+  vec_free(t4);
+  vec_free(z1);
+  vec_free(yz2);
+  vec_free(yz);
+  vec_free(b2);
+  vec_free(b8);
+  vec_free(a2);
+  vec_free(alpha);
+  vec_free(t3b);
+  vec_free(t3);
+  vec_free(t2);
+  vec_free(t1);
+  vec_free(beta);
+  vec_free(gamma);
+  vec_free(delta);
+  vec_free(b4);
+  return P384Point { x: x3, y: y3, z: z3 };
+}
+
+/// Internal: `q1 + q2`.
+fn p384_add(q1: &P384Point, q2: &P384Point, p: &Modulus384) -> P384Point
+  requires vlen(q1.x) == 24 && vlen(q1.y) == 24 && vlen(q1.z) == 24
+  requires vlen(q2.x) == 24 && vlen(q2.y) == 24 && vlen(q2.z) == 24 && mod384_ok(p)
+  ensures vlen(result.x) == 24 && vlen(result.y) == 24 && vlen(result.z) == 24
+{
+  if bn384_is_zero(q1.z) { return p384_copy(q2); }
+  if bn384_is_zero(q2.z) { return p384_copy(q1); }
+  let z1z1 = p384_sq(q1.z, p);
+  let z2z2 = p384_sq(q2.z, p);
+  let u1 = mod384_mul(q1.x, z2z2, p);
+  let u2 = mod384_mul(q2.x, z1z1, p);
+  let y1z2 = mod384_mul(q1.y, q2.z, p);
+  let s1 = mod384_mul(y1z2, z2z2, p);
+  let y2z1 = mod384_mul(q2.y, q1.z, p);
+  let s2 = mod384_mul(y2z1, z1z1, p);
+  let h = mod384_sub(u2, u1, p);
+  let r = mod384_sub(s2, s1, p);
+  let mut out = p384_infinity();
+  if bn384_is_zero(h) {
+    if bn384_is_zero(r) {
+      p384_free(out);
+      out = p384_double(q1, p);
+    }
+  } else {
+    let h2 = p384_sq(h, p);
+    let h3 = mod384_mul(h2, h, p);
+    let u1h2 = mod384_mul(u1, h2, p);
+    let r2 = p384_sq(r, p);
+    let x1 = mod384_sub(r2, h3, p);
+    let u1h2x2 = mod384_add(u1h2, u1h2, p);
+    let x3 = mod384_sub(x1, u1h2x2, p);
+    let y1 = mod384_sub(u1h2, x3, p);
+    let y2 = mod384_mul(r, y1, p);
+    let s1h3 = mod384_mul(s1, h3, p);
+    let y3 = mod384_sub(y2, s1h3, p);
+    let z12 = mod384_mul(q1.z, q2.z, p);
+    let z3 = mod384_mul(z12, h, p);
+    vec_free(z12);
+    vec_free(s1h3);
+    vec_free(y2);
+    vec_free(y1);
+    vec_free(u1h2x2);
+    vec_free(x1);
+    vec_free(r2);
+    vec_free(u1h2);
+    vec_free(h3);
+    vec_free(h2);
+    p384_free(out);
+    out = P384Point { x: x3, y: y3, z: z3 };
+  }
+  vec_free(r);
+  vec_free(h);
+  vec_free(s2);
+  vec_free(y2z1);
+  vec_free(s1);
+  vec_free(y1z2);
+  vec_free(u2);
+  vec_free(u1);
+  vec_free(z2z2);
+  vec_free(z1z1);
+  return out;
+}
+
+/// Internal: `k * q`.
+fn p384_mul(k: &Vec[u64], q: &P384Point, p: &Modulus384) -> P384Point
+  requires vlen(k) == 24 && vlen(q.x) == 24 && vlen(q.y) == 24 && vlen(q.z) == 24 && mod384_ok(p)
+  ensures vlen(result.x) == 24 && vlen(result.y) == 24 && vlen(result.z) == 24
+{
+  let mut r = p384_infinity();
+  let mut i = 0;
+  while i < 384
+    invariant i <= 384 && vlen(k) == 24 && mod384_ok(p)
+    invariant vlen(r.x) == 24 && vlen(r.y) == 24 && vlen(r.z) == 24
+    invariant vlen(q.x) == 24 && vlen(q.y) == 24 && vlen(q.z) == 24
+  {
+    let d = p384_double(r, p);
+    p384_free(r);
+    r = d;
+    if bn384_bit(k, 383 - i) == 1 {
+      let s = p384_add(r, q, p);
+      p384_free(r);
+      r = s;
+    }
+    i = i + 1;
+  }
+  return r;
+}
+
+/// Internal: whether (x, y) is on the curve y^2 = x^3 - 3x + b, with both
+/// coordinates below `p`.
+fn p384_on_curve(x: &Vec[u64], y: &Vec[u64], p: &Modulus384) -> bool
+  requires vlen(x) == 24 && vlen(y) == 24 && mod384_ok(p)
+{
+  if bn384_ge(x, p.m) || bn384_ge(y, p.m) { return false; }
+  let b = bn384_hex("b3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f5013875ac656398d8a2ed19d2a85c8edd3ec2aef");
+  let lhs = p384_sq(y, p);
+  let x2 = p384_sq(x, p);
+  let x3 = mod384_mul(x2, x, p);
+  let t1 = mod384_sub(x3, x, p);
+  let t2 = mod384_sub(t1, x, p);
+  let t3 = mod384_sub(t2, x, p);
+  let rhs = mod384_add(t3, b, p);
+  let same = bn384_eq(lhs, rhs);
+  vec_free(rhs);
+  vec_free(t3);
+  vec_free(t2);
+  vec_free(t1);
+  vec_free(x3);
+  vec_free(x2);
+  vec_free(lhs);
+  vec_free(b);
+  return same;
+}
+
+/// Internal: the signature number in the INTEGER `item` of `sig` as 48
+/// bytes, if it is a positive DER integer of at most 384 bits in the shortest
+/// form.
+fn p384_der_uint(sig: &Bytes, start: u64, end: u64) -> Option[Bytes]
+  requires start <= end && end <= blen(sig)
+  ensures result is Option::Some ==> blen(result.Some) == 48
+{
+  if end - start < 1 || end - start > 49 { return Option[Bytes]::None; }
+  let first = bget(sig, start);
+  if first >= 128 { return Option[Bytes]::None; }
+  let mut from = start;
+  if end - start > 1 && first == 0 {
+    if bget(sig, start + 1) < 128 { return Option[Bytes]::None; }
+    from = start + 1;
+  }
+  if end - from > 48 { return Option[Bytes]::None; }
+  let n = end - from;
+  let mut out = balloc(48);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && n == end - from && n <= 48 && blen(out) == 48 && end <= blen(sig) && from <= end
+  {
+    bset(&mut out, 48 - n + i, bget(sig, from + i));
+    i = i + 1;
+  }
+  return Option[Bytes]::Some(out);
+}
+
+/// Internal: checks the signature (`r`, `s`) of the hash `e` under the key
+/// (`qx`, `qy`), all as numbers.
+fn p384_verify_numbers(qx: &Vec[u64], qy: &Vec[u64], e: &Vec[u64], r: &Vec[u64], s: &Vec[u64]) -> bool
+  requires vlen(qx) == 24 && vlen(qy) == 24 && vlen(e) == 24 && vlen(r) == 24 && vlen(s) == 24
+{
+  let p = mod384_new(bn384_hex("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff"));
+  let n = mod384_new(bn384_hex("ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973"));
+  let mut ok = false;
+  if !bn384_is_zero(r) && !bn384_ge(r, n.m) && !bn384_is_zero(s) && !bn384_ge(s, n.m) && p384_on_curve(qx, qy, p) {
+    let mut e1 = bn384_copy(e);
+    if bn384_ge(e1, n.m) {
+      let d = bn384_sub_wrap(e1, n.m);
+      vec_free(e1);
+      e1 = d;
+    }
+    let w = mod384_inv(s, n);
+    let u1 = mod384_mul(e1, w, n);
+    let u2 = mod384_mul(r, w, n);
+    let gx = bn384_hex("aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab7");
+    let gy = bn384_hex("3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f");
+    let g = P384Point { x: gx, y: gy, z: bn384_small(1) };
+    let q = P384Point { x: bn384_copy(qx), y: bn384_copy(qy), z: bn384_small(1) };
+    let a = p384_mul(u1, g, p);
+    let b = p384_mul(u2, q, p);
+    let sum = p384_add(a, b, p);
+    if !bn384_is_zero(sum.z) {
+      let zi = mod384_inv(sum.z, p);
+      let zi2 = p384_sq(zi, p);
+      let ax = mod384_mul(sum.x, zi2, p);
+      let mut v = bn384_copy(ax);
+      if bn384_ge(v, n.m) {
+        let d2 = bn384_sub_wrap(v, n.m);
+        vec_free(v);
+        v = d2;
+      }
+      ok = bn384_eq(v, r);
+      vec_free(v);
+      vec_free(ax);
+      vec_free(zi2);
+      vec_free(zi);
+    }
+    p384_free(sum);
+    p384_free(b);
+    p384_free(a);
+    p384_free(q);
+    p384_free(g);
+    vec_free(u2);
+    vec_free(u1);
+    vec_free(w);
+    vec_free(e1);
+  }
+  mod384_free(n);
+  mod384_free(p);
+  return ok;
+}
+
+/// Internal: the first 48 bytes of the digest `d` (as a number), or `d`
+/// itself with leading zeros when it is shorter (FIPS 186-4 6.4: a longer
+/// hash is cut to the leftmost bits of the order's length).
+fn p384_hash_number(d: &Bytes) -> Vec[u64]
+  ensures vlen(result) == 24
+{
+  let mut buf = balloc(48);
+  let n = blen(d);
+  if n >= 48 {
+    bytes_copy_span(&mut buf, 0, d, 0, 48);
+  } else {
+    bytes_copy_span(&mut buf, 48 - n, d, 0, n);
+  }
+  let e = bn384_from_bytes(buf, 0);
+  bfree(buf);
+  return e;
+}
+
+/// Whether `sig` is a valid ECDSA signature, under the public key `pubkey`
+/// on the curve P-384, of the message whose digest is `digest` (from any
+/// hash: SHA-256, SHA-384 or SHA-512; a digest longer than 48 bytes is cut
+/// to its leftmost 48; a shorter one is padded with zeros on the left). Encodings as in `ecdsa_p384_verify`.
+/// ```
+/// let key = balloc(97);
+/// let digest = balloc(48);
+/// let sig = balloc(8);
+/// let ok = ecdsa_p384_verify_digest(key, digest, sig);
+/// bfree(sig);
+/// bfree(digest);
+/// bfree(key);
+/// if ok { return 1; }
+/// ```
+fn ecdsa_p384_verify_digest(pubkey: &Bytes, digest: &Bytes, sig: &Bytes) -> bool
+  requires blen(digest) < 274877906944 && blen(sig) < 274877906944 && blen(pubkey) < 274877906944
+{
+  if blen(pubkey) != 97 || bget(pubkey, 0) != 4 { return false; }
+  let n = blen(sig);
+  match der_item(sig, 0, n) {
+    Option::None => { return false; },
+    Option::Some(seq) => {
+      if seq.tag != 48 || seq.content.end != n { return false; }
+      match der_item(sig, seq.content.start, seq.content.end) {
+        Option::None => { return false; },
+        Option::Some(ri) => {
+          if ri.tag != 2 { return false; }
+          match der_item(sig, ri.content.end, seq.content.end) {
+            Option::None => { return false; },
+            Option::Some(si) => {
+              if si.tag != 2 || si.content.end != seq.content.end { return false; }
+              match p384_der_uint(sig, ri.content.start, ri.content.end) {
+                Option::None => { return false; },
+                Option::Some(rb) => {
+                  match p384_der_uint(sig, si.content.start, si.content.end) {
+                    Option::None => {
+                      bfree(rb);
+                      return false;
+                    },
+                    Option::Some(sb) => {
+                      let e = p384_hash_number(digest);
+                      let r = bn384_from_bytes(rb, 0);
+                      let s = bn384_from_bytes(sb, 0);
+                      let qx = bn384_from_bytes(pubkey, 1);
+                      let qy = bn384_from_bytes(pubkey, 49);
+                      let ok = p384_verify_numbers(qx, qy, e, r, s);
+                      vec_free(qy);
+                      vec_free(qx);
+                      vec_free(s);
+                      vec_free(r);
+                      vec_free(e);
+                      bfree(sb);
+                      bfree(rb);
+                      return ok;
+                    },
+                  }
+                },
+              }
+            },
+          }
+        },
+      }
+    },
+  }
+}
+
+/// Whether `sig` is a valid ECDSA signature of `msg` under the public key
+/// `pubkey`, with the curve P-384 and SHA-384. `pubkey` is the 97 bytes of
+/// an uncompressed point (0x04, x, y) and `sig` the DER encoding of
+/// SEQUENCE { INTEGER r, INTEGER s } that X.509 and TLS use. A key that is
+/// not on the curve, an `r` or `s` outside 1..n-1 and any other encoding are
+/// refused.
+/// ```
+/// let key = balloc(97);
+/// let msg = bfrom("hello");
+/// let sig = balloc(8);
+/// let ok = ecdsa_p384_verify(key, msg, sig);
+/// bfree(sig);
+/// bfree(msg);
+/// bfree(key);
+/// if ok { return 1; }
+/// ```
+fn ecdsa_p384_verify(pubkey: &Bytes, msg: &Bytes, sig: &Bytes) -> bool
+  requires blen(msg) < 274877906944 && blen(sig) < 274877906944 && blen(pubkey) < 274877906944
+{
+  let digest = sha384(msg);
+  let ok = ecdsa_p384_verify_digest(pubkey, digest, sig);
+  bfree(digest);
+  return ok;
+}

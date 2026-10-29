@@ -4,12 +4,13 @@
 // the caller writes to the connection, and the data received from the peer is
 // appended to another. So the same code runs over a socket, a pipe or a test.
 //
-// It speaks one suite, TLS_CHACHA20_POLY1305_SHA256, with X25519, and checks
+// It speaks two suites, TLS_AES_128_GCM_SHA256 and TLS_CHACHA20_POLY1305_SHA256, with X25519, and checks
 // the server: the certificate chain against the trusted roots the caller
-// gives (X.509 with sha256WithRSAEncryption, ecdsa-with-SHA256 and Ed25519
-// signatures, validity, host name, CA flags and key usage), the
-// CertificateVerify signature (ed25519, ecdsa_secp256r1_sha256 or
-// rsa_pss_rsae_sha256) and the Finished message. It sends no client
+// gives (X.509 with RSA, ECDSA (P-256 and P-384) and Ed25519 signatures made
+// with SHA-256, SHA-384 or SHA-512, validity, host name, CA flags and key
+// usage), the CertificateVerify signature (ed25519, ecdsa_secp256r1_sha256,
+// ecdsa_secp384r1_sha384, rsa_pss_rsae_sha256 or rsa_pss_rsae_sha384) and
+// the Finished message. It sends no client
 // certificate, offers no resumption or early data, and accepts a KeyUpdate
 // and NewSessionTicket messages.
 //
@@ -18,7 +19,7 @@
 // Not proved: that the protocol is followed; the tests run a handshake with
 // an OpenSSL server (tests/tls.sh) and feed damaged and truncated flights.
 // Not done: certificate path length and name constraints, extended key usage
-// and revocation checks; SHA-384 suites and certificates; session tickets; a
+// and revocation checks; the SHA-384 suite; session tickets; a
 // check that the random values are random (the caller supplies them).
 import "bytes.bastio";
 import "option.bastio";
@@ -546,6 +547,12 @@ fn tls13c_certificate_verify(c: &mut Tls13Client, msg: &Bytes) -> u64
       }
       if scheme == 1027 && x.key_kind == 2 && blen(sig) < 274877906944 {
         ok = ecdsa_p256_verify(ka, content, sig);
+      }
+      if scheme == 1283 && x.key_kind == 4 && blen(sig) < 274877906944 {
+        ok = ecdsa_p384_verify(ka, content, sig);
+      }
+      if scheme == 2053 && x.key_kind == 1 && blen(ka) < 65536 && blen(kb) < 65536 && blen(sig) < 65536 {
+        ok = rsa_pss_verify(ka, kb, content, sig, 48);
       }
       if scheme == 2052 && x.key_kind == 1 && blen(ka) < 65536 && blen(kb) < 65536 && blen(sig) < 65536 {
         ok = rsa_pss_sha256_verify(ka, kb, content, sig);
