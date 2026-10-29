@@ -142,8 +142,48 @@ fn longest() -> u64
   return bad;
 }
 
+/// The schedule with SHA-384 (48-byte secrets), against values computed with Python's hmac.
+fn schedule384() -> u64
+  ensures result <= 8
+{
+  let mut bad = 0;
+  let early = tls13_early_secret384();
+  bad = bad + is_hex(early, "7ee8206f5570023e6dc7519eb1073bc4e791ad37b5c382aa10ba18e2357e716971f9362f2c2fe2a76bfd78dfec4ea9b5");
+  let shared = unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+  let hs = tls13_next_secret(early, shared);
+  bad = bad + is_hex(hs, "03e67b8797b8868b32c737ad09d2454266b47b828fe83999484501c1d0f12bfefdecf2341ab055c50f8f81a4d91610dd");
+  let th = unhex("09836fbc72a988c2c056c2226a73e6b0e0d91859972e66ad6402b4d74216182fd82f81a7a52fe21adfe65869c693ee6a");
+  let chs = tls13_derive_secret(hs, "c hs traffic", th);
+  bad = bad + is_hex(chs, "950933e38b760dc226f285c8925888fceb1d0c837a7e196317370db04b1387cac3ba693183db3a4a15d9a3e758b44189");
+  let key = tls13_traffic_key(chs, 32);
+  bad = bad + is_hex(key, "76dd029ecac36b827c56bf1c27dd55c8460994956d8dff53793c1d6010efba92");
+  let key16 = tls13_traffic_key(chs, 16);
+  bad = bad + is_hex(key16, "a43f565d2283fb1294655f03ce30da95");
+  let iv = tls13_traffic_iv(chs);
+  bad = bad + is_hex(iv, "ba816333e7b2e833f3d706dd");
+  let fin = tls13_finished(chs, th);
+  bad = bad + is_hex(fin, "610a9bd6486e9e036e414ebbbc3d3d9ceeaff710740458616ece5bc3026125ba46ecc5f703ae4c15ba150c04fe22f829");
+  let zeros = balloc(48);
+  let master = tls13_next_secret(hs, zeros);
+  let sap = tls13_derive_secret(master, "s ap traffic", th);
+  bad = bad + is_hex(sap, "77b3ab6e7ea954b625709d245da33c1fdb92747f502639eb45a5e4bee3f4bc9fe3d677a8a3f3b9fb0a0e00d35316d6fe");
+  bfree(sap);
+  bfree(master);
+  bfree(zeros);
+  bfree(fin);
+  bfree(iv);
+  bfree(key16);
+  bfree(key);
+  bfree(chs);
+  bfree(th);
+  bfree(hs);
+  bfree(shared);
+  bfree(early);
+  return bad;
+}
+
 fn main() -> u64 {
-  let bad = schedule() + traffic() + longest();
+  let bad = schedule() + traffic() + longest() + schedule384();
   if bad > 0 { return 1; }
   return 0;
 }

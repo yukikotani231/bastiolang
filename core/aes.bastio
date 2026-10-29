@@ -1,19 +1,20 @@
-// core/aes.bastio: the AES-128 block cipher (FIPS 197), encryption only,
-// which is all that GCM needs.
+// core/aes.bastio: the AES-128 and AES-256 block ciphers (FIPS 197),
+// encryption only, which is all that GCM needs.
 //
 // What is proved: every access is in bounds, nothing leaks, and a key
-// schedule is 176 bytes, an encrypted block 16. Not proved: that the output
+// schedule is 176 bytes (AES-128) or 240 (AES-256), an encrypted block 16. Not proved: that the output
 // is AES's (the tests check FIPS 197's vectors and blocks made by OpenSSL),
 // or that the code is constant time: the S-box is looked up by index, so a
 // program that shares a machine with an attacker who can time cache misses
 // leaks key bytes. The S-box is computed when the key is set up, not stored.
 import "bytes.bastio";
 
-/// An expanded key: the S-box (256 bytes) and the 11 round keys (176 bytes).
-struct Aes128 { sbox: Bytes, rk: Bytes }
+/// An expanded key: the S-box (256 bytes), the number of rounds `nr` (10 for
+/// AES-128, 14 for AES-256) and the `nr + 1` round keys (176 or 240 bytes).
+struct Aes { sbox: Bytes, rk: Bytes, nr: u64 }
 
-spec fn aes_ok(a: &Aes128) -> bool {
-  blen(a.sbox) == 256 && blen(a.rk) == 176
+spec fn aes_ok(a: &Aes) -> bool {
+  blen(a.sbox) == 256 && ((a.nr == 10 && blen(a.rk) == 176) || (a.nr == 14 && blen(a.rk) == 240))
 }
 
 /// Internal: `x` times 2 in GF(2^8) (the AES polynomial).
@@ -59,38 +60,31 @@ fn aes_make_sbox() -> Bytes
   return s;
 }
 
-/// The expanded key of the 16-byte `key`.
-/// ```
-/// let key = balloc(16);
-/// let a = aes128_new(key);
-/// let out = aes128_encrypt(a, key);
-/// let first = bget(out, 0);
-/// bfree(out);
-/// aes128_free(a);
-/// bfree(key);
-/// // AES-128 of the zero block under the zero key starts 66 e9 4b d4.
-/// if first != 102 { return 1; }
-/// ```
-fn aes128_new(key: &Bytes) -> Aes128
-  requires blen(key) == 16
-  ensures aes_ok(result)
+/// Internal: the expanded key of the `4 * nk` bytes of `key`, `nk` 4 (AES-128)
+/// or 8 (AES-256).
+fn aes_expand(key: &Bytes, nk: u64) -> Aes
+  requires (nk == 4 || nk == 8) && blen(key) == 4 * nk
+  ensures aes_ok(result) && result.nr == nk + 6
 {
   let sbox = aes_make_sbox();
-  let mut rk = balloc(176);
-  bytes_copy_span(&mut rk, 0, key, 0, 16);
+  let nr = nk + 6;
+  let words = 4 * (nr + 1);
+  let mut rk = balloc(4 * words);
+  bytes_copy_span(&mut rk, 0, key, 0, 4 * nk);
   let mut rcon: u64 = 1;
-  let mut i = 4;
-  while i < 44
-    invariant i >= 4 && i <= 44 && blen(rk) == 176 && blen(sbox) == 256 && rcon < 256
+  let mut i = nk;
+  while i < words
+    invariant i >= nk && i <= words && (nk == 4 || nk == 8) && nr == nk + 6 && words == 4 * (nr + 1) && blen(rk) == 4 * words && blen(sbox) == 256 && rcon < 256
   {
-    // word i = word i-4 xor f(word i-1), where f is the identity except
-    // every fourth word: rotated, substituted and mixed with the round constant
+    // word i = word i-nk xor f(word i-1), where f is the identity except
+    // every nk-th word: rotated, substituted and mixed with the round
+    // constant, and, for AES-256, the word in the middle: only substituted
     let b = 4 * (i - 1);
     let mut t0 = cast[u64](bget(rk, b));
     let mut t1 = cast[u64](bget(rk, b + 1));
     let mut t2 = cast[u64](bget(rk, b + 2));
     let mut t3 = cast[u64](bget(rk, b + 3));
-    if i % 4 == 0 {
+    if (nk == 4 && i % 4 == 0) || (nk == 8 && i % 8 == 0) {
       let u0 = cast[u64](bget(sbox, t1)) ^ rcon;
       let u1 = cast[u64](bget(sbox, t2));
       let u2 = cast[u64](bget(sbox, t3));
@@ -100,37 +94,83 @@ fn aes128_new(key: &Bytes) -> Aes128
       t2 = u2;
       t3 = u3;
       rcon = aes_xtime(rcon);
+    } else if nk == 8 && i % 8 == 4 {
+      t0 = cast[u64](bget(sbox, t0));
+      t1 = cast[u64](bget(sbox, t1));
+      t2 = cast[u64](bget(sbox, t2));
+      t3 = cast[u64](bget(sbox, t3));
     }
-    let w = 4 * (i - 4);
+    let w = 4 * (i - nk);
     bset(&mut rk, 4 * i, bget(rk, w) ^ cast[u8](t0 & 255));
     bset(&mut rk, 4 * i + 1, bget(rk, w + 1) ^ cast[u8](t1 & 255));
     bset(&mut rk, 4 * i + 2, bget(rk, w + 2) ^ cast[u8](t2 & 255));
     bset(&mut rk, 4 * i + 3, bget(rk, w + 3) ^ cast[u8](t3 & 255));
     i = i + 1;
   }
-  return Aes128 { sbox: sbox, rk: rk };
+  return Aes { sbox: sbox, rk: rk, nr: nr };
+}
+
+/// The expanded key of the 16-byte `key` (AES-128).
+/// ```
+/// let key = balloc(16);
+/// let a = aes128_new(key);
+/// let out = aes_encrypt(a, key);
+/// let first = bget(out, 0);
+/// bfree(out);
+/// aes_free(a);
+/// bfree(key);
+/// // AES-128 of the zero block under the zero key starts 66 e9 4b d4.
+/// if first != 102 { return 1; }
+/// ```
+fn aes128_new(key: &Bytes) -> Aes
+  requires blen(key) == 16
+  ensures aes_ok(result) && result.nr == 10
+{
+  return aes_expand(key, 4);
+}
+
+/// The expanded key of the 32-byte `key` (AES-256).
+/// ```
+/// let key = balloc(32);
+/// let a = aes256_new(key);
+/// let block = balloc(16);
+/// let out = aes_encrypt(a, block);
+/// let first = bget(out, 0);
+/// bfree(out);
+/// bfree(block);
+/// aes_free(a);
+/// bfree(key);
+/// // AES-256 of the zero block under the zero key starts dc 95 c0 78.
+/// if first != 220 { return 1; }
+/// ```
+fn aes256_new(key: &Bytes) -> Aes
+  requires blen(key) == 32
+  ensures aes_ok(result) && result.nr == 14
+{
+  return aes_expand(key, 8);
 }
 
 /// Frees an expanded key.
 /// ```
 /// let key = balloc(16);
 /// let a = aes128_new(key);
-/// aes128_free(a);
+/// aes_free(a);
 /// bfree(key);
 /// ```
-fn aes128_free(a: Aes128) {
+fn aes_free(a: Aes) {
   bfree(a.sbox);
   bfree(a.rk);
 }
 
-/// Internal: xors round key `r` (0 to 10) into the 16-byte state `s`.
+/// Internal: xors round key `r` (0 to 14, within the key schedule) into the
+/// 16-byte state `s`.
 fn aes_add_round_key(s: &mut Bytes, rk: &Bytes, r: u64)
-  requires blen(s) == 16 && blen(rk) == 176 && r <= 10
+  requires blen(s) == 16 && r <= 14 && 16 * r + 16 <= blen(rk)
   ensures blen(s) == 16
 {
   let mut i = 0;
   while i < 16
-    invariant i <= 16 && blen(s) == 16 && blen(rk) == 176 && r <= 10
+    invariant i <= 16 && blen(s) == 16 && r <= 14 && 16 * r + 16 <= blen(rk)
   {
     bset(&mut s, i, bget(s, i) ^ bget(rk, 16 * r + i));
     i = i + 1;
@@ -183,7 +223,7 @@ fn aes_mix_columns(s: &mut Bytes)
   }
 }
 
-/// AES-128 of one 16-byte block.
+/// AES (128 or 256, as the key was expanded) of one 16-byte block.
 /// ```
 /// let mut key = balloc(16);
 /// let mut block = balloc(16);
@@ -194,24 +234,24 @@ fn aes_mix_columns(s: &mut Bytes)
 ///   i = i + 1;
 /// }
 /// let a = aes128_new(key);
-/// let out = aes128_encrypt(a, block);
+/// let out = aes_encrypt(a, block);
 /// // FIPS 197 appendix C.1 starts 69 c4 e0 d8 and ends 70 b4 c5 5a.
 /// let ok = bget(out, 0) == 105 && bget(out, 1) == 196 && bget(out, 15) == 90;
 /// bfree(out);
-/// aes128_free(a);
+/// aes_free(a);
 /// bfree(block);
 /// bfree(key);
 /// if !ok { return 1; }
 /// ```
-fn aes128_encrypt(a: &Aes128, block: &Bytes) -> Bytes
+fn aes_encrypt(a: &Aes, block: &Bytes) -> Bytes
   requires aes_ok(a) && blen(block) == 16
   ensures blen(result) == 16
 {
   let mut s = bytes_slice(block, 0, 16);
   aes_add_round_key(&mut s, a.rk, 0);
   let mut round = 1;
-  while round < 10
-    invariant round >= 1 && round <= 10 && blen(s) == 16 && aes_ok(a)
+  while round < a.nr
+    invariant round >= 1 && round <= a.nr && blen(s) == 16 && aes_ok(a)
   {
     let t = aes_sub_shift(s, a.sbox);
     bfree(s);
@@ -223,6 +263,6 @@ fn aes128_encrypt(a: &Aes128, block: &Bytes) -> Bytes
   let t = aes_sub_shift(s, a.sbox);
   bfree(s);
   s = t;
-  aes_add_round_key(&mut s, a.rk, 10);
+  aes_add_round_key(&mut s, a.rk, a.nr);
   return s;
 }

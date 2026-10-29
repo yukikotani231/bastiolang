@@ -352,8 +352,53 @@ fn aes_refuse() -> u64
     aes_refused("1703030019dc60057fc39266c543aeda34efe0b72f3d89dd7017aa591ea300", 1);
 }
 
+/// Like `aes_roundtrip` for AES-256-GCM, with the whole 32-byte test key.
+fn aes256_roundtrip(seq: u64, ct: u8, plain: &Bytes, pad: u64, want: Str) -> u64
+  requires blen(plain) <= 16384 && blen(plain) + 1 + pad + 16 <= 16640 && slen(want) == 64
+  ensures result <= 2
+{
+  let k = key();
+  let v = iv();
+  let rec = tls13_seal(4866, k, v, seq, ct, plain, pad);
+  let d = sha256(rec);
+  let h = hex(d);
+  let mut bad = 0;
+  if !bytes_eq_str(h, want) { bad = bad + 1; }
+  match tls13_open(4866, k, v, seq, rec) {
+    Option::Some(r) => {
+      if r.content_type != ct || !bytes_eq(r.data, plain) { bad = bad + 1; }
+      bfree(r.data);
+    },
+    Option::None => { bad = bad + 1; },
+  }
+  bfree(h);
+  bfree(d);
+  bfree(rec);
+  bfree(v);
+  bfree(k);
+  return bad;
+}
+
+/// AES-256-GCM records, sealed by OpenSSL (Python's cryptography).
+fn aes256_cases() -> u64
+  ensures result <= 6
+{
+  let mut bad = 0;
+  let p0 = balloc(0);
+  bad = bad + aes256_roundtrip(0, 22, p0, 0, "4a938887a818be7cd44fa30f23b7ff190febc4cefdfa78966fdfa7533cdcc14c");
+  bfree(p0);
+  let p1 = bfrom("hello");
+  bad = bad + aes256_roundtrip(1, 23, p1, 3, "d28165e46e6fc482f7fd5213f42dea2ce40709bad8de00558144a95efea4b427");
+  bfree(p1);
+  let mut p2 = balloc(2);
+  bset(&mut p2, 0, 1);
+  bad = bad + aes256_roundtrip(7, 21, p2, 0, "820fd881fa9a2ef8545ab96b09b1f52d9b119a08d34e4e022e20971e0a1a40b5");
+  bfree(p2);
+  return bad;
+}
+
 fn main() -> u64 {
-  let bad = case0() + case1() + case2() + case3() + case4() + refuse0() + refuse1() + refuse2() + refuse3() + refuse4() + refuse5() + aes_cases() + aes_refuse();
+  let bad = case0() + case1() + case2() + case3() + case4() + refuse0() + refuse1() + refuse2() + refuse3() + refuse4() + refuse5() + aes_cases() + aes_refuse() + aes256_cases();
   if bad > 0 { return 1; }
   return 0;
 }

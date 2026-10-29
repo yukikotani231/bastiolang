@@ -1,5 +1,5 @@
 // expect-exit: 0
-// core/hkdf: the test cases of RFC 5869 (1, 2 and 3), and the output lengths
+// core/hkdf: the test cases of RFC 5869 (1, 2 and 3), the inputs of the first with HMAC-SHA-384 (values from Python's hmac), and the output lengths
 // around a block, up to the longest the RFC allows, compared by digest.
 import "core/hkdf.bastio";
 import "core/num.bastio";
@@ -129,8 +129,39 @@ fn lengths() -> u64
     digest(8160, "e3963f0e8b66c425fb6879cf9bdaf9aac0ffdbac3093b9857871bb35b0056dce");
 }
 
+/// 1 unless HKDF-SHA-384 of the RFC 5869 case 1 inputs gives the extract output `want_prk`, the expand output `want` (48 + 42 + 1 bytes) and the empty-salt extract `want_empty`.
+fn sha384_case(want_prk: Str, want: Str, want_empty: Str) -> u64
+  ensures result <= 3
+{
+  let ikm = run(22, 11, 0);
+  let salt = run(13, 0, 1);
+  let info = run(10, 240, 1);
+  let prk = hkdf_extract384(salt, ikm);
+  let okm = hkdf_expand(prk, info, 91);
+  let empty = balloc(0);
+  let pe = hkdf_extract384(empty, ikm);
+  let h1 = hex(prk);
+  let h2 = hex(okm);
+  let h3 = hex(pe);
+  let mut bad = 0;
+  if !bytes_eq_str(h1, want_prk) { bad = bad + 1; }
+  if !bytes_eq_str(h2, want) { bad = bad + 1; }
+  if !bytes_eq_str(h3, want_empty) { bad = bad + 1; }
+  bfree(h3);
+  bfree(h2);
+  bfree(h1);
+  bfree(pe);
+  bfree(empty);
+  bfree(okm);
+  bfree(prk);
+  bfree(info);
+  bfree(salt);
+  bfree(ikm);
+  return bad;
+}
+
 fn main() -> u64 {
-  let bad = case1() + case2() + case3() + lengths();
+  let bad = case1() + case2() + case3() + lengths() + sha384_case("704b39990779ce1dc548052c7dc39f303570dd13fb39f7acc564680bef80e8dec70ee9a7e1f3e293ef68eceb072a5ade", "9b5097a86038b805309076a44b3a9f38063e25b516dcbf369f394cfab43685f748b6457763e4f0204fc5d95d1da3e62587b22eb8943d0fab6bb631a2fe9df1a68c6ce5d56116a52005b3f122b88b39b7251fcd6c44d3ef25f20ed9", "10e40cf072a4c5626e43dd22c1cf727d4bb140975c9ad0cbc8e45b40068f8f0ba57cdb598af9dfa6963a96899af047e5");
   if bad > 0 { return 1; }
   return 0;
 }
