@@ -1,0 +1,384 @@
+// core/x25519.bastio: X25519, the Diffie-Hellman function on Curve25519 (RFC
+// 7748), with field elements of 16 limbs of 16 bits in the style of TweetNaCl.
+//
+// What is proved: every access is in bounds, nothing leaks, and a result is
+// 32 bytes. Not proved: that the result is RFC 7748's (the tests check its
+// vectors, including the iterated ones, and a Diffie-Hellman agreement), or
+// that the code is constant time (the ladder swaps with a mask, and no branch
+// or index depends on the scalar, but nothing checks that).
+//
+// A field element is a `Vec[u64]` of 16 limbs; after `fe_carry` each limb is
+// below 2^16 + 38. The sums of limbs are wrapped (`wrap_add`, `wrap_mul`) on
+// purpose: they stay far below 2^64 for such limbs, so the tests rather than
+// a proof show the field arithmetic right.
+import "bytes.bastio";
+
+/// Internal: a field element equal to 0.
+fn fe_zero() -> Vec[u64]
+  ensures vlen(result) == 16
+{
+  let mut r = vec_new[u64]();
+  let mut i = 0;
+  while i < 16
+    invariant i <= 16 && vlen(r) == i
+  {
+    vec_push(&mut r, 0);
+    i = i + 1;
+  }
+  return r;
+}
+
+/// Internal: a copy of `a`.
+fn fe_copy(a: &Vec[u64]) -> Vec[u64]
+  requires vlen(a) == 16
+  ensures vlen(result) == 16
+{
+  let mut r = vec_new[u64]();
+  let mut i = 0;
+  while i < 16
+    invariant i <= 16 && vlen(r) == i && vlen(a) == 16
+  {
+    vec_push(&mut r, vec_get(a, i));
+    i = i + 1;
+  }
+  return r;
+}
+
+/// Internal: moves the carries of `o` up, and the carry out of the top limb
+/// back into the bottom one times 38 (2^256 is 38 modulo 2^255 - 19).
+fn fe_carry(o: &mut Vec[u64])
+  requires vlen(o) == 16
+  ensures vlen(o) == 16
+{
+  let mut pass = 0;
+  while pass < 3
+    invariant pass <= 3 && vlen(o) == 16
+  {
+    let mut i = 0;
+    while i < 15
+      invariant i <= 15 && vlen(o) == 16
+    {
+      let c = vec_get(o, i) >> 16;
+      vec_set(&mut o, i, vec_get(o, i) & 65535);
+      vec_set(&mut o, i + 1, wrap_add(vec_get(o, i + 1), c));
+      i = i + 1;
+    }
+    let c = vec_get(o, 15) >> 16;
+    vec_set(&mut o, 15, vec_get(o, 15) & 65535);
+    vec_set(&mut o, 0, wrap_add(vec_get(o, 0), wrap_mul(38, c)));
+    pass = pass + 1;
+  }
+}
+
+/// Internal: `a + b`.
+fn fe_add(a: &Vec[u64], b: &Vec[u64]) -> Vec[u64]
+  requires vlen(a) == 16 && vlen(b) == 16
+  ensures vlen(result) == 16
+{
+  let mut r = fe_zero();
+  let mut i = 0;
+  while i < 16
+    invariant i <= 16 && vlen(r) == 16 && vlen(a) == 16 && vlen(b) == 16
+  {
+    vec_set(&mut r, i, wrap_add(vec_get(a, i), vec_get(b, i)));
+    i = i + 1;
+  }
+  fe_carry(&mut r);
+  return r;
+}
+
+/// Internal: `a - b`, computed as `a + 4p - b` so that no limb goes negative.
+fn fe_sub(a: &Vec[u64], b: &Vec[u64]) -> Vec[u64]
+  requires vlen(a) == 16 && vlen(b) == 16
+  ensures vlen(result) == 16
+{
+  let mut r = fe_zero();
+  let mut i = 0;
+  while i < 16
+    invariant i <= 16 && vlen(r) == 16 && vlen(a) == 16 && vlen(b) == 16
+  {
+    // 4p, limb by limb: 4 * 0xffed, 4 * 0xffff (fourteen times), 4 * 0x7fff.
+    let mut bias = 262140;
+    if i == 0 { bias = 262068; }
+    if i == 15 { bias = 131068; }
+    vec_set(&mut r, i, wrap_sub(wrap_add(vec_get(a, i), bias), vec_get(b, i)));
+    i = i + 1;
+  }
+  fe_carry(&mut r);
+  return r;
+}
+
+/// Internal: `a * b`.
+fn fe_mul(a: &Vec[u64], b: &Vec[u64]) -> Vec[u64]
+  requires vlen(a) == 16 && vlen(b) == 16
+  ensures vlen(result) == 16
+{
+  let mut t = vec_new[u64]();
+  let mut k = 0;
+  while k < 32
+    invariant k <= 32 && vlen(t) == k
+  {
+    vec_push(&mut t, 0);
+    k = k + 1;
+  }
+  let mut i = 0;
+  while i < 16
+    invariant i <= 16 && vlen(t) == 32 && vlen(a) == 16 && vlen(b) == 16
+  {
+    let mut j = 0;
+    while j < 16
+      invariant j <= 16 && i < 16 && vlen(t) == 32 && vlen(a) == 16 && vlen(b) == 16
+    {
+      vec_set(&mut t, i + j, wrap_add(vec_get(t, i + j), wrap_mul(vec_get(a, i), vec_get(b, j))));
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  let mut r = fe_zero();
+  i = 0;
+  while i < 16
+    invariant i <= 16 && vlen(t) == 32 && vlen(r) == 16
+  {
+    vec_set(&mut r, i, wrap_add(vec_get(t, i), wrap_mul(38, vec_get(t, i + 16))));
+    i = i + 1;
+  }
+  vec_free(t);
+  fe_carry(&mut r);
+  return r;
+}
+
+/// Internal: `a` times the small constant `k`.
+fn fe_mul_small(a: &Vec[u64], k: u64) -> Vec[u64]
+  requires vlen(a) == 16
+  ensures vlen(result) == 16
+{
+  let mut r = fe_zero();
+  let mut i = 0;
+  while i < 16
+    invariant i <= 16 && vlen(r) == 16 && vlen(a) == 16
+  {
+    vec_set(&mut r, i, wrap_mul(vec_get(a, i), k));
+    i = i + 1;
+  }
+  fe_carry(&mut r);
+  return r;
+}
+
+/// Internal: `a` to the power p - 2, the inverse of `a` (0 for 0).
+fn fe_inv(a: &Vec[u64]) -> Vec[u64]
+  requires vlen(a) == 16
+  ensures vlen(result) == 16
+{
+  let mut c = fe_copy(a);
+  let mut n = 0;
+  while n < 254
+    invariant n <= 254 && vlen(c) == 16 && vlen(a) == 16
+  {
+    let sq = fe_mul(c, c);
+    vec_free(c);
+    c = sq;
+    // The exponent 2^255 - 21 has every bit set except bits 2 and 4.
+    let e = 253 - n;
+    if e != 2 && e != 4 {
+      let m = fe_mul(c, a);
+      vec_free(c);
+      c = m;
+    }
+    n = n + 1;
+  }
+  return c;
+}
+
+/// Internal: swaps `p` and `q` if `bit` is 1, and leaves them if it is 0.
+fn fe_cswap(p: &mut Vec[u64], q: &mut Vec[u64], bit: u64)
+  requires vlen(p) == 16 && vlen(q) == 16 && bit <= 1
+  ensures vlen(p) == 16 && vlen(q) == 16
+{
+  let mask = wrap_sub(0, bit);
+  let mut i = 0;
+  while i < 16
+    invariant i <= 16 && vlen(p) == 16 && vlen(q) == 16
+  {
+    let t = mask & (vec_get(p, i) ^ vec_get(q, i));
+    vec_set(&mut p, i, vec_get(p, i) ^ t);
+    vec_set(&mut q, i, vec_get(q, i) ^ t);
+    i = i + 1;
+  }
+}
+
+/// Internal: the field element of the 32 little-endian bytes of `b` (the top
+/// bit is ignored).
+fn fe_unpack(b: &Bytes) -> Vec[u64]
+  requires blen(b) == 32
+  ensures vlen(result) == 16
+{
+  let mut r = fe_zero();
+  let mut i = 0;
+  while i < 16
+    invariant i <= 16 && vlen(r) == 16 && blen(b) == 32
+  {
+    vec_set(&mut r, i, cast[u64](bget(b, 2 * i)) + 256 * cast[u64](bget(b, 2 * i + 1)));
+    i = i + 1;
+  }
+  vec_set(&mut r, 15, vec_get(r, 15) & 32767);
+  return r;
+}
+
+/// Internal: one step of the final reduction. Adds 19; if that reaches 2^255
+/// the value was at least p, and the sum without the bit 255 (the value minus
+/// p) replaces it. Chosen by a mask, not a branch.
+fn fe_reduce_once(o: &mut Vec[u64])
+  requires vlen(o) == 16
+  ensures vlen(o) == 16
+{
+  let mut m = fe_copy(o);
+  vec_set(&mut m, 0, wrap_add(vec_get(m, 0), 19));
+  let mut i = 0;
+  while i < 15
+    invariant i <= 15 && vlen(m) == 16
+  {
+    let c = vec_get(m, i) >> 16;
+    vec_set(&mut m, i, vec_get(m, i) & 65535);
+    vec_set(&mut m, i + 1, wrap_add(vec_get(m, i + 1), c));
+    i = i + 1;
+  }
+  let top = (vec_get(m, 15) >> 15) & 1;
+  vec_set(&mut m, 15, vec_get(m, 15) & 32767);
+  let mask = wrap_sub(0, top);
+  i = 0;
+  while i < 16
+    invariant i <= 16 && vlen(m) == 16 && vlen(o) == 16
+  {
+    vec_set(&mut o, i, (vec_get(m, i) & mask) | (vec_get(o, i) & (mask ^ 18446744073709551615)));
+    i = i + 1;
+  }
+  vec_free(m);
+}
+
+/// Internal: the 32 little-endian bytes of `a` reduced modulo 2^255 - 19.
+fn fe_pack(a: &Vec[u64]) -> Bytes
+  requires vlen(a) == 16
+  ensures blen(result) == 32
+{
+  let mut o = fe_copy(a);
+  fe_carry(&mut o);
+  fe_reduce_once(&mut o);
+  fe_reduce_once(&mut o);
+  let mut r = balloc(32);
+  let mut i = 0;
+  while i < 16
+    invariant i <= 16 && vlen(o) == 16 && blen(r) == 32
+  {
+    bset(&mut r, 2 * i, wrap[u8](vec_get(o, i)));
+    bset(&mut r, 2 * i + 1, wrap[u8](vec_get(o, i) >> 8));
+    i = i + 1;
+  }
+  vec_free(o);
+  return r;
+}
+
+/// Internal: the bit `t` of the scalar `k`.
+fn x25519_bit(k: &Bytes, t: u64) -> u64
+  requires blen(k) == 32 && t < 256
+  ensures result <= 1
+{
+  return (cast[u64](bget(k, t / 8)) >> (t % 8)) & 1;
+}
+
+/// X25519: the scalar `k` (32 bytes, clamped as RFC 7748 says) times the
+/// point whose u-coordinate is `u` (32 bytes): 32 bytes. With `u` the base
+/// point (the byte 9, then zeros) it gives a public key.
+/// ```
+/// let mut k = balloc(32);
+/// let mut u = balloc(32);
+/// let mut i = 0;
+/// while i < 32
+///   invariant i <= 32 && blen(k) == 32 && blen(u) == 32
+/// {
+///   bset(&mut k, i, 7);
+///   i = i + 1;
+/// }
+/// bset(&mut u, 0, 9);
+/// let pub = x25519(k, u);
+/// let n = blen(pub);
+/// bfree(pub);
+/// bfree(u);
+/// bfree(k);
+/// if n != 32 { return 1; }
+/// ```
+fn x25519(k: &Bytes, u: &Bytes) -> Bytes
+  requires blen(k) == 32 && blen(u) == 32
+  ensures blen(result) == 32
+{
+  let mut kc = bytes_slice(k, 0, 32);
+  bset(&mut kc, 0, bget(kc, 0) & 248);
+  bset(&mut kc, 31, (bget(kc, 31) & 127) | 64);
+  let x1 = fe_unpack(u);
+  let mut x2 = fe_zero();
+  vec_set(&mut x2, 0, 1);
+  let mut z2 = fe_zero();
+  let mut x3 = fe_copy(x1);
+  let mut z3 = fe_zero();
+  vec_set(&mut z3, 0, 1);
+  let mut swap = 0;
+  let mut t = 255;
+  while t > 0
+    invariant t <= 255 && blen(kc) == 32 && vlen(x1) == 16 && vlen(x2) == 16 && vlen(z2) == 16 && vlen(x3) == 16 && vlen(z3) == 16 && swap <= 1
+  {
+    t = t - 1;
+    let kt = x25519_bit(kc, t);
+    fe_cswap(&mut x2, &mut x3, (swap ^ kt) & 1);
+    fe_cswap(&mut z2, &mut z3, (swap ^ kt) & 1);
+    swap = kt;
+    let a = fe_add(x2, z2);
+    let aa = fe_mul(a, a);
+    let b = fe_sub(x2, z2);
+    let bb = fe_mul(b, b);
+    let e = fe_sub(aa, bb);
+    let c = fe_add(x3, z3);
+    let d = fe_sub(x3, z3);
+    let da = fe_mul(d, a);
+    let cb = fe_mul(c, b);
+    let s = fe_add(da, cb);
+    let df = fe_sub(da, cb);
+    vec_free(x3);
+    x3 = fe_mul(s, s);
+    let df2 = fe_mul(df, df);
+    vec_free(z3);
+    z3 = fe_mul(x1, df2);
+    vec_free(x2);
+    x2 = fe_mul(aa, bb);
+    let a24e = fe_mul_small(e, 121665);
+    let f = fe_add(aa, a24e);
+    vec_free(z2);
+    z2 = fe_mul(e, f);
+    vec_free(a);
+    vec_free(aa);
+    vec_free(b);
+    vec_free(bb);
+    vec_free(e);
+    vec_free(c);
+    vec_free(d);
+    vec_free(da);
+    vec_free(cb);
+    vec_free(s);
+    vec_free(df);
+    vec_free(df2);
+    vec_free(a24e);
+    vec_free(f);
+  }
+  fe_cswap(&mut x2, &mut x3, swap);
+  fe_cswap(&mut z2, &mut z3, swap);
+  let zi = fe_inv(z2);
+  let r = fe_mul(x2, zi);
+  let out = fe_pack(r);
+  vec_free(r);
+  vec_free(zi);
+  vec_free(x1);
+  vec_free(x2);
+  vec_free(z2);
+  vec_free(x3);
+  vec_free(z3);
+  bfree(kc);
+  return out;
+}

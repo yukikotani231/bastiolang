@@ -57,6 +57,7 @@
   - [core/text.bastio](lib-core-text.md)
   - [core/url.bastio](lib-core-url.md)
   - [core/utf8.bastio](lib-core-utf8.md)
+  - [core/x25519.bastio](lib-core-x25519.md)
   - [core/wtext.bastio](lib-core-wtext.md)
   - [std/host.bastio](lib-std-host.md)
   - [std/net.bastio](lib-std-net.md)
