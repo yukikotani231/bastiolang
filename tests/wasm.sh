@@ -25,8 +25,10 @@ both() {
   "$BASTIOC" --arch wasm32 -o "$w/x.wasm" "$f" 2>"$w/err"; rc=$?
   if [ $rc = 4 ]; then echo "skip $f: $(grep -o 'does not .*' "$w/err" | head -1)"; echo =skip; return; fi
   if [ $rc != 0 ]; then echo "FAIL $f: wasm build failed"; sed 's/^/    /' "$w/err" | head -20; echo =fail; return; fi
-  "$w/c.exe" </dev/null >"$w/c.out" 2>/dev/null; cs=$?
-  node tests/wasm_run.js "$w/x.wasm" </dev/null >"$w/x.out" 2>"$w/x.err"; xs=$?
+  timeout 300 "$w/c.exe" </dev/null >"$w/c.out" 2>/dev/null; cs=$?
+  # A module that never finishes fails here, by name, instead of holding the job until CI cancels it.
+  timeout 300 node tests/wasm_run.js "$w/x.wasm" </dev/null >"$w/x.out" 2>"$w/x.err"; xs=$?
+  if [ $xs = 124 ]; then echo "FAIL $f: the wasm module did not finish in 300 s"; echo =fail; return; fi
   if [ $cs != $xs ]; then echo "FAIL $f: exit $xs, C backend $cs"; head -3 "$w/x.err" | sed 's/^/    /'; echo =fail; return; fi
   if ! cmp -s "$w/c.out" "$w/x.out"; then
     echo "FAIL $f: output differs from the C backend"; diff "$w/c.out" "$w/x.out" | head -10 | sed 's/^/    /'; echo =fail; return
