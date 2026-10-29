@@ -47,6 +47,7 @@ Each module has a reference page, generated from its source: every function with
 | [`core/chacha20poly1305.bastio`](lib/core-chacha20poly1305.md) | Authenticated encryption with ChaCha20 and Poly1305 (RFC 8439 section 2.8). |
 | [`core/csum.bastio`](lib/core-csum.md) | Checksums over byte strings. |
 | [`core/der.bastio`](lib/core-der.md) | Reading ASN.1 DER, the encoding of X.509 certificates and of most of what TLS carries (RFC 5280, ITU-T X.690). |
+| [`core/dns.bastio`](lib/core-dns.md) | The messages of a DNS lookup for an IPv4 address (RFC 1035). |
 | [`core/ed25519.bastio`](lib/core-ed25519.md) | Ed25519 signature verification (RFC 8032 section 5.1.7), on the field arithmetic of core/x25519.bastio and the hash of core/sha512.bastio. |
 | [`core/endian.bastio`](lib/core-endian.md) | Fixed-width integers stored in byte strings, as packet headers, file formats and disk blocks hold them. |
 | [`core/format.bastio`](lib/core-format.md) | Building text out of pieces. |
@@ -81,6 +82,7 @@ Each module has a reference page, generated from its source: every function with
 | [`core/wtext.bastio`](lib/core-wtext.md) | Text kept as a `Vec[u64]`, one character a word. |
 | [`core/x25519.bastio`](lib/core-x25519.md) | X25519, the Diffie-Hellman function on Curve25519 (RFC 7748), with field elements of 16 limbs of 16 bits in the style of TweetNaCl. |
 | [`core/x509.bastio`](lib/core-x509.md) | Reading X.509 certificates (RFC 5280) and checking their signatures, for the chain a TLS 1.3 server sends. |
+| [`std/dns.bastio`](lib/std-dns.md) | The IPv4 address of a host name, for programs on the hosted target. |
 | [`std/host.bastio`](lib/std-host.md) | The command line, files and standard error, for programs on the hosted target. |
 | [`std/http.bastio`](lib/std-http.md) | HTTP/1.1 over std/net.bastio, for programs on the hosted target. |
 | [`std/https.bastio`](lib/std-https.md) | HTTPS (or any protocol over TLS 1.3) for programs on the hosted target. |

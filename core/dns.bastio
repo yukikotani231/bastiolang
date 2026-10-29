@@ -1,0 +1,301 @@
+// core/dns.bastio: the messages of a DNS lookup for an IPv4 address (RFC
+// 1035): the query for a host name and the reading of the response.
+//
+// What is proved: every access is in bounds, nothing leaks, and the reader
+// looks at no byte outside the response, whatever it holds (names are
+// skipped, never followed, so a pointer loop cannot hang it). Not proved:
+// that a query is one a resolver accepts or that the reader accepts every
+// response of the standard; the tests compare the query with one made by
+// another program. The reader takes the first A record of a response to the
+// one question asked, checks the id (which is all the protection against a
+// forged answer a plain UDP resolver gives, so use an unpredictable one),
+// and refuses a truncated response or one with an error code.
+import "bytes.bastio";
+import "endian.bastio";
+import "option.bastio";
+import "text.bastio";
+
+/// Internal: pushes the labels of `name` (at most 253 bytes, dots between
+/// non-empty labels of at most 63 bytes, one dot allowed at the end) and the
+/// zero that ends them. False if `name` is not of that form (`t` then holds
+/// part of the labels).
+fn dns_push_labels(t: &mut Vec[u8], name: &Bytes) -> bool
+  requires blen(name) >= 1 && blen(name) <= 253
+{
+  let n = blen(name);
+  let mut at = 0;
+  while at < n
+    invariant at <= n + 1
+  {
+    let mut j = at;
+    while j < n && bget(name, j) != 46
+      invariant at <= j && j <= n
+    {
+      j = j + 1;
+    }
+    if j == at || j - at > 63 { return false; }
+    text_push(&mut t, cast[u8](j - at));
+    text_push_span(&mut t, name, at, j);
+    at = j + 1;
+  }
+  text_push(&mut t, 0);
+  return true;
+}
+
+/// The query for the A record of the host `name`, with the message id `id`
+/// (the 12-byte header, the question, no length prefix): `None` if `name` is
+/// empty, longer than 253 bytes, or has an empty or over-long label.
+/// ```
+/// let name = bfrom("a.bc");
+/// let mut bad = 1;
+/// match dns_query(name, 4660) {
+///   Option::Some(q) => {
+///     if blen(q) == 12 + 1 + 1 + 1 + 2 + 1 + 4 && bget(q, 0) == 18 && bget(q, 1) == 52 && bget(q, 12) == 1 && bget(q, 13) == 97 && bget(q, 14) == 2 {
+///       bad = 0;
+///     }
+///     bfree(q);
+///   },
+///   Option::None => {},
+/// }
+/// bfree(name);
+/// if bad != 0 { return 1; }
+/// ```
+fn dns_query(name: &Bytes, id: u64) -> Option[Bytes]
+  requires id < 65536
+{
+  if blen(name) < 1 || blen(name) > 253 { return Option[Bytes]::None; }
+  let mut t = text_new();
+  text_push(&mut t, cast[u8](id / 256));
+  text_push(&mut t, cast[u8](id % 256));
+  text_push(&mut t, 1);
+  text_push(&mut t, 0);
+  text_push(&mut t, 0);
+  text_push(&mut t, 1);
+  text_push(&mut t, 0);
+  text_push(&mut t, 0);
+  text_push(&mut t, 0);
+  text_push(&mut t, 0);
+  text_push(&mut t, 0);
+  text_push(&mut t, 0);
+  if !dns_push_labels(&mut t, name) {
+    vec_free(t);
+    return Option[Bytes]::None;
+  }
+  text_push(&mut t, 0);
+  text_push(&mut t, 1);
+  text_push(&mut t, 0);
+  text_push(&mut t, 1);
+  return Option[Bytes]::Some(text_finish(t));
+}
+
+/// Internal: the position behind the name that starts at `from` in `msg`: a
+/// compression pointer ends a name and is not followed. 0 if the name is
+/// malformed or runs past the end.
+fn dns_skip_name(msg: &Bytes, from: u64) -> u64
+  requires from <= blen(msg)
+  ensures result <= blen(msg) && (result == 0 || result > from)
+{
+  let n = blen(msg);
+  let mut at = from;
+  while at < n
+    invariant at >= from && at <= n
+  {
+    let l = cast[u64](bget(msg, at));
+    if l >= 192 {
+      if at + 2 <= n { return at + 2; }
+      return 0;
+    }
+    if l >= 64 { return 0; }
+    if l == 0 { return at + 1; }
+    if at + 1 + l > n { return 0; }
+    at = at + 1 + l;
+  }
+  return 0;
+}
+
+/// Internal: the number of answers in `msg` if it is a complete response
+/// without error to the one question with id `id`, else 0.
+fn dns_answers(msg: &Bytes, id: u64) -> u64
+  ensures result < 65536 && (result == 0 || blen(msg) >= 12)
+{
+  if blen(msg) < 12 { return 0; }
+  let flags = cast[u64](load_be16(msg, 2));
+  if cast[u64](load_be16(msg, 0)) != id { return 0; }
+  if flags < 32768 || flags % 16 != 0 || (flags / 512) % 2 == 1 { return 0; }
+  if cast[u64](load_be16(msg, 4)) != 1 { return 0; }
+  return cast[u64](load_be16(msg, 6));
+}
+
+/// Internal: the first A record of `cnt` answers that start at `from`.
+fn dns_scan_a(msg: &Bytes, from: u64, cnt: u64) -> Option[u64]
+  requires from <= blen(msg) && cnt < 65536
+{
+  let n = blen(msg);
+  let mut at = from;
+  let mut i = 0;
+  while i < cnt
+    invariant i <= cnt && at <= n
+  {
+    let p = dns_skip_name(msg, at);
+    if p == 0 || p + 10 > n { return Option[u64]::None; }
+    let ty = cast[u64](load_be16(msg, p));
+    let cls = cast[u64](load_be16(msg, p + 2));
+    let rl = cast[u64](load_be16(msg, p + 8));
+    if p + 10 + rl > n { return Option[u64]::None; }
+    if ty == 1 && cls == 1 && rl == 4 {
+      let q = p + 10;
+      return Option[u64]::Some(cast[u64](bget(msg, q)) * 16777216 + cast[u64](bget(msg, q + 1)) * 65536 + cast[u64](bget(msg, q + 2)) * 256 + cast[u64](bget(msg, q + 3)));
+    }
+    at = p + 10 + rl;
+    i = i + 1;
+  }
+  return Option[u64]::None;
+}
+
+/// The IPv4 address (as `net_ip4` makes it) in the first A record of the
+/// response `msg` to a query with id `id`; `None` if the response is not a
+/// complete answer without error to that query or holds no A record.
+/// ```
+/// // a.b -> 1.2.3.4, the answer's name a pointer to the question's.
+/// let mut t = text_new();
+/// text_push(&mut t, 18); text_push(&mut t, 52); text_push(&mut t, 129); text_push(&mut t, 128);
+/// text_push(&mut t, 0); text_push(&mut t, 1); text_push(&mut t, 0); text_push(&mut t, 1);
+/// text_push(&mut t, 0); text_push(&mut t, 0); text_push(&mut t, 0); text_push(&mut t, 0);
+/// text_push(&mut t, 1); text_push(&mut t, 97); text_push(&mut t, 1); text_push(&mut t, 98); text_push(&mut t, 0);
+/// text_push(&mut t, 0); text_push(&mut t, 1); text_push(&mut t, 0); text_push(&mut t, 1);
+/// text_push(&mut t, 192); text_push(&mut t, 12);
+/// text_push(&mut t, 0); text_push(&mut t, 1); text_push(&mut t, 0); text_push(&mut t, 1);
+/// text_push(&mut t, 0); text_push(&mut t, 0); text_push(&mut t, 0); text_push(&mut t, 60);
+/// text_push(&mut t, 0); text_push(&mut t, 4);
+/// text_push(&mut t, 1); text_push(&mut t, 2); text_push(&mut t, 3); text_push(&mut t, 4);
+/// let msg = text_finish(t);
+/// let mut bad = 1;
+/// match dns_parse_a(msg, 4660) {
+///   Option::Some(ip) => { if ip == 16909060 { bad = 0; } },
+///   Option::None => {},
+/// }
+/// match dns_parse_a(msg, 4661) {
+///   Option::Some(ip) => { bad = 1; },
+///   Option::None => {},
+/// }
+/// bfree(msg);
+/// if bad != 0 { return 1; }
+/// ```
+fn dns_parse_a(msg: &Bytes, id: u64) -> Option[u64]
+  requires blen(msg) < 1073741824
+{
+  let cnt = dns_answers(msg, id);
+  if cnt == 0 { return Option[u64]::None; }
+  let q = dns_skip_name(msg, 12);
+  if q == 0 || q + 4 > blen(msg) { return Option[u64]::None; }
+  return dns_scan_a(msg, q + 4, cnt);
+}
+
+/// Internal: the decimal number of at most 3 digits that starts at `at`
+/// (below `to`) in `t`, as `digits * 256 + value`; 0 if there is none or it is
+/// above 255. The position behind it is `at + digits`.
+fn dns_octet(t: &Bytes, at: u64, to: u64) -> u64
+  requires at <= to && to <= blen(t)
+  ensures result == 0 || (result / 256 >= 1 && result / 256 <= 3 && result % 256 <= 255 && at + result / 256 <= to)
+{
+  let mut v = 0;
+  let mut d = 0;
+  while at + d < to && d < 3 && bget(t, at + d) >= 48 && bget(t, at + d) <= 57
+    invariant d <= 3 && at + d <= to && v < 1000
+    invariant (d == 0 ==> v == 0) && (d == 1 ==> v < 10) && (d == 2 ==> v < 100)
+  {
+    v = v * 10 + cast[u64](bget(t, at + d)) - 48;
+    d = d + 1;
+  }
+  if d == 0 || v > 255 { return 0; }
+  return d * 256 + v;
+}
+
+/// Internal: the dotted-quad IPv4 address that fills `t[from..to]`.
+fn dns_dotted(t: &Bytes, from: u64, to: u64) -> Option[u64]
+  requires from <= to && to <= blen(t)
+{
+  let mut at = from;
+  let mut ip = 0;
+  let mut k = 0;
+  while k < 4
+    invariant k <= 4 && at <= to && ip < 4294967296
+    invariant (k == 0 ==> ip == 0) && (k == 1 ==> ip < 256) && (k == 2 ==> ip < 65536) && (k == 3 ==> ip < 16777216)
+  {
+    let o = dns_octet(t, at, to);
+    if o == 0 { return Option[u64]::None; }
+    at = at + o / 256;
+    ip = ip * 256 + o % 256;
+    k = k + 1;
+    if k < 4 {
+      if at >= to || bget(t, at) != 46 { return Option[u64]::None; }
+      at = at + 1;
+    }
+  }
+  if at != to { return Option[u64]::None; }
+  return Option[u64]::Some(ip);
+}
+
+/// Internal: the address on the line `t[ls..le]` if it is `nameserver`, white
+/// space and an IPv4 address (a comment or white space may follow).
+fn dns_nameserver_line(t: &Bytes, ls: u64, le: u64) -> Option[u64]
+  requires ls <= le && le <= blen(t)
+{
+  if le - ls < 12 { return Option[u64]::None; }
+  let key = "nameserver";
+  let mut i = 0;
+  while i < 10
+    invariant i <= 10 && ls + 10 < le
+  {
+    if bget(t, ls + i) != sget(key, i) { return Option[u64]::None; }
+    i = i + 1;
+  }
+  if bget(t, ls + 10) != 32 && bget(t, ls + 10) != 9 { return Option[u64]::None; }
+  let mut a = ls + 10;
+  while a < le && (bget(t, a) == 32 || bget(t, a) == 9)
+    invariant a >= ls && a <= le
+  {
+    a = a + 1;
+  }
+  let mut e = a;
+  while e < le && bget(t, e) != 32 && bget(t, e) != 9 && bget(t, e) != 35
+    invariant a <= e && e <= le
+  {
+    e = e + 1;
+  }
+  return dns_dotted(t, a, e);
+}
+
+/// The first IPv4 `nameserver` of the text of a resolv.conf (IPv6 servers
+/// and other lines are skipped).
+/// ```
+/// let text = bfrom("# comment\nsearch lan\nnameserver fe80::1\nnameserver 192.168.1.1 # router\nnameserver 8.8.8.8\n");
+/// let mut bad = 1;
+/// match dns_resolv_conf(text) {
+///   Option::Some(ip) => { if ip == 3232235777 { bad = 0; } },
+///   Option::None => {},
+/// }
+/// bfree(text);
+/// if bad != 0 { return 1; }
+/// ```
+fn dns_resolv_conf(text: &Bytes) -> Option[u64]
+{
+  let n = blen(text);
+  let mut ls = 0;
+  while ls < n
+    invariant ls <= n + 1
+  {
+    let mut le = ls;
+    while le < n && bget(text, le) != 10
+      invariant ls <= le && le <= n
+    {
+      le = le + 1;
+    }
+    match dns_nameserver_line(text, ls, le) {
+      Option::Some(ip) => { return Option[u64]::Some(ip); },
+      Option::None => {},
+    }
+    ls = le + 1;
+  }
+  return Option[u64]::None;
+}

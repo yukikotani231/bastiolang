@@ -3,12 +3,14 @@
 // server is authenticated against the roots the caller trusts (DER
 // certificates one after the other, as `host_read` gives a file of them),
 // and the random bytes and the time come from the system (`net_random`,
-// `net_now`). One suite (TLS_CHACHA20_POLY1305_SHA256 with X25519), servers
-// by IPv4 address (there is no name lookup), no client certificates and no
-// resumption; see core/tls13client.bastio for what is checked and what is not.
+// `net_now`). Two suites (TLS_AES_128_GCM_SHA256 and
+// TLS_CHACHA20_POLY1305_SHA256, with X25519), servers by IPv4 address or, with
+// `https_get_by_name`, by a name looked up through std/dns, no client
+// certificates and no resumption; see core/tls13client.bastio for what is checked and what is not.
 import "../core/bytes.bastio";
 import "../core/text.bastio";
 import "../core/tls13client.bastio";
+import "dns.bastio";
 import "net.bastio";
 
 /// What a TLS exchange ended with: the `state` of the client (6 is a clean
@@ -213,4 +215,31 @@ fn https_get(h: &Host, ip: u64, port: u64, name: &Bytes, path: &Bytes, roots: &B
   let r = https_request(h, ip, port, name, request, roots);
   bfree(request);
   return r;
+}
+
+/// `https_get` for a server given by `name`, whose address comes from the
+/// system's resolver (std/dns; a name that is a dotted-quad address is used as
+/// it is). `None` if the name does not resolve or the exchange fails.
+/// ```
+/// // Nothing listens on port 1 of the loopback.
+/// let name = bfrom("127.0.0.1");
+/// let path = bfrom("/");
+/// let roots = balloc(0);
+/// let mut bad = 0;
+/// match https_get_by_name(host, name, 1, path, roots) {
+///   Option::Some(r) => { bfree(r); bad = 1; },
+///   Option::None => {},
+/// }
+/// bfree(roots);
+/// bfree(path);
+/// bfree(name);
+/// if bad != 0 { return 1; }
+/// ```
+fn https_get_by_name(h: &Host, name: &Bytes, port: u64, path: &Bytes, roots: &Bytes) -> Option[Bytes]
+  requires blen(name) <= 255 && blen(path) < 65536 && blen(roots) < 274877906944
+{
+  match dns_lookup(h, name) {
+    Option::None => { return Option[Bytes]::None; },
+    Option::Some(ip) => { return https_get(h, ip, port, name, path, roots); },
+  }
 }
