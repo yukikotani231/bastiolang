@@ -134,4 +134,65 @@ make_cert notca ec ecca "DNS:localhost"
 make_cert badchild ec notca "DNS:localhost"
 serve badchild badchild notca && client "signer is not a CA" 1 localhost ec.roots
 
+# https_fetch (URLs, host lookup, redirects) against a small HTTPS server in python3 with the ECDSA certificate.
+if command -v python3 >/dev/null; then
+  port=$((port + 1))
+  cat > "$tmp/fetchd.py" <<'PY'
+import http.server, ssl, sys
+port, cert, key = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        p, hdr, code, body = self.path, [], 200, b'hello'
+        def to(loc, c=302):
+            return c, [('Location', loc)], b'moved'
+        if p == '/r1': code, hdr, body = to('/ok')
+        elif p == '/r2': code, hdr, body = to('https://localhost:%d/ok' % port, 301)
+        elif p.startswith('/chain/'):
+            n = int(p[7:])
+            code, hdr, body = to('/ok' if n == 0 else '/chain/%d' % (n - 1), (303, 307, 308)[n % 3])
+        elif p == '/loop': code, hdr, body = to('/loop')
+        elif p == '/http': code, hdr, body = to('http://localhost/ok')
+        elif p == '/evil': code, hdr, body = to('//evil.example/ok')
+        elif p.startswith('/echo'): body = p.encode()
+        elif p != '/ok': code, body = 404, b'nope'
+        self.send_response(code)
+        for k, v in hdr: self.send_header(k, v)
+        if p != '/nolen': self.send_header('Content-Length', str(100 if p == '/short' else len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+ctx.load_cert_chain(cert, key)
+srv = http.server.HTTPServer(('127.0.0.1', port), H)
+srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+srv.serve_forever()
+PY
+  python3 "$tmp/fetchd.py" "$port" "$tmp/eclocal.pem" "$tmp/eclocal.key" >"$tmp/fetchd.log" 2>&1 &
+  pids+=($!)
+  for i in $(seq 1 100); do (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break; sleep 0.1; done
+  fetch() { # description url roots want_rc want_text
+    local out rc
+    out=$(timeout 60 "$tmp/httpsget" "$2" "$tmp/$3" 2>&1); rc=$?
+    if [ "$rc" = "$4" ] && printf '%s' "$out" | grep -qF -- "$5"; then echo "ok   $1"
+    else fail "$1: exit $rc, output '$(printf '%s' "$out" | head -c 200)'"; fi
+  }
+  base="https://localhost:$port"
+  fetch "fetch: plain" "$base/ok" ec.roots 0 hello
+  fetch "fetch: relative redirect" "$base/r1" ec.roots 0 hello
+  fetch "fetch: absolute redirect" "$base/r2" ec.roots 0 hello
+  fetch "fetch: three redirects in a row" "$base/chain/3" ec.roots 0 hello
+  fetch "fetch: too many redirects" "$base/chain/9" ec.roots 1 "status 30"
+  fetch "fetch: redirect loop" "$base/loop" ec.roots 1 "status 302"
+  fetch "fetch: redirect to plain http is not followed" "$base/http" ec.roots 1 "status 302"
+  fetch "fetch: redirect to another host by scheme-relative URL is not followed" "$base/evil" ec.roots 1 "status 302"
+  fetch "fetch: 404 is reported" "$base/missing" ec.roots 1 "status 404"
+  fetch "fetch: query string" "$base/echo?a=b&c=d#frag" ec.roots 0 "/echo?a=b&c=d"
+  fetch "fetch: cut off with no Content-Length (no close_notify) is refused" "$base/nolen" ec.roots 1 "no answer"
+  fetch "fetch: fewer bytes than Content-Length is refused" "$base/short" ec.roots 1 "no answer"
+  fetch "fetch: untrusted root" "$base/ok" other.roots 1 "no answer"
+  fetch "fetch: address where the certificate has a name" "https://127.0.0.1:$port/ok" ec.roots 1 "no answer"
+  fetch "fetch: not an https URL" "http://localhost:$port/ok" ec.roots 1 "no answer"
+fi
+
 [ $fails = 0 ] && echo "tls: all passed" || { echo "tls: $fails failed"; exit 1; }

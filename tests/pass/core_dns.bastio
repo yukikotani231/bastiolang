@@ -183,8 +183,43 @@ fn resolvs() -> u64
     resolv("", 0);
 }
 
+/// 1 unless the hosts text `s` gives `name` the address `ip` (none if `ip` is 0).
+fn hosts(s: Str, name: Str, ip: u64) -> u64
+  ensures result <= 1
+{
+  let t = bfrom(s);
+  let n = bfrom(name);
+  let mut bad = 1;
+  match dns_hosts(t, n) {
+    Option::Some(got) => { if got == ip { bad = 0; } },
+    Option::None => { if ip == 0 { bad = 0; } },
+  }
+  bfree(n);
+  bfree(t);
+  return bad;
+}
+
+fn hostss() -> u64
+  ensures result <= 14
+{
+  return hosts("127.0.0.1 localhost\n", "localhost", 2130706433) +
+    hosts("", "localhost", 2130706433) +
+    hosts("", "LocalHost", 2130706433) +
+    hosts("::1 localhost\n", "localhost", 2130706433) +
+    hosts("10.0.0.5 build ci.lan\n", "ci.lan", 167772165) +
+    hosts("10.0.0.5\tbuild\tCI.lan # the box\r\n", "ci.LAN", 167772165) +
+    hosts("# 10.0.0.5 build\n", "build", 0) +
+    hosts("10.0.0.5 build # ci.lan\n", "ci.lan", 0) +
+    hosts("10.0.0.5 build\n10.0.0.6 build\n", "build", 167772165) +
+    hosts("::1 build\n", "build", 0) +
+    hosts("10.0.0.5 buildx\n", "build", 0) +
+    hosts("10.0.0.5\n", "10.0.0.5", 0) +
+    hosts("300.0.0.5 build\n", "build", 0) +
+    hosts("   10.0.0.9   x  \n", "x", 167772169);
+}
+
 fn main() -> u64 {
-  let bad = queries() + refusals() + responses() + prefixes() + resolvs();
+  let bad = queries() + refusals() + responses() + prefixes() + resolvs() + hostss();
   if bad > 0 { return 1; }
   return 0;
 }

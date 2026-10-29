@@ -12,15 +12,18 @@ TLS_CHACHA20_POLY1305_SHA256, with X25519), servers by IPv4 address or, with
 `https_get_by_name`, by a name looked up through std/dns, no client
 certificates and no resumption; see core/tls13client.bastio for what is checked and what is not.
 
-`import "std/https.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/text.bastio](core-text.md), [core/endian.bastio](core-endian.md), [core/sha256.bastio](core-sha256.md), [core/hkdf.bastio](core-hkdf.md), [core/tls13.bastio](core-tls13.md), [core/tls13hs.bastio](core-tls13hs.md), [core/aes.bastio](core-aes.md), [core/aesgcm.bastio](core-aesgcm.md), [core/chacha20.bastio](core-chacha20.md), [core/poly1305.bastio](core-poly1305.md), [core/chacha20poly1305.bastio](core-chacha20poly1305.md), [core/tls13record.bastio](core-tls13record.md), [core/x25519.bastio](core-x25519.md), [core/der.bastio](core-der.md), [core/sha512.bastio](core-sha512.md), [core/ed25519.bastio](core-ed25519.md), [core/p256.bastio](core-p256.md), [core/rsa.bastio](core-rsa.md), [core/x509.bastio](core-x509.md), [core/tls13client.bastio](core-tls13client.md), [core/dns.bastio](core-dns.md), [std/net.bastio](std-net.md), [std/host.bastio](std-host.md), [std/dns.bastio](std-dns.md).
+`import "std/https.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/text.bastio](core-text.md), [core/endian.bastio](core-endian.md), [core/sha256.bastio](core-sha256.md), [core/hkdf.bastio](core-hkdf.md), [core/tls13.bastio](core-tls13.md), [core/tls13hs.bastio](core-tls13hs.md), [core/aes.bastio](core-aes.md), [core/aesgcm.bastio](core-aesgcm.md), [core/chacha20.bastio](core-chacha20.md), [core/poly1305.bastio](core-poly1305.md), [core/chacha20poly1305.bastio](core-chacha20poly1305.md), [core/tls13record.bastio](core-tls13record.md), [core/x25519.bastio](core-x25519.md), [core/der.bastio](core-der.md), [core/sha512.bastio](core-sha512.md), [core/ed25519.bastio](core-ed25519.md), [core/p256.bastio](core-p256.md), [core/rsa.bastio](core-rsa.md), [core/x509.bastio](core-x509.md), [core/tls13client.bastio](core-tls13client.md), [core/num.bastio](core-num.md), [core/httpsurl.bastio](core-httpsurl.md), [core/dns.bastio](core-dns.md), [std/net.bastio](std-net.md), [std/host.bastio](std-host.md), [std/dns.bastio](std-dns.md), `examples/http/http.bastio`, [std/http.bastio](std-http.md).
 
 | Function | |
 | --- | --- |
 | [`https_run`](#https_run) | Runs a TLS 1.3 exchange on the connected socket `sock`. |
 | [`https_result_free`](#https_result_free) | Frees a result (see `https_run`). |
 | [`https_request`](#https_request) | Connects to `ip`:`port`, runs a TLS exchange with the server `name` (see `https_run`) and returns what the server sent after `request`, if it ended with a close_notify (a connection that is cut off, which could hide a truncated answer, gives `None`, as does any failure of the handshake). |
+| [`https_exchange`](#https_exchange) | Like `https_request`, but gives the whole result whatever state the exchange ended in (6 for a close_notify, 5 for a connection that was cut off after the handshake, 7 for a failure), for a caller that can tell by other means (a `Content-Length`) whether the answer is complete. |
 | [`https_get`](#https_get) | A `GET` of `path` on the server `name` over HTTPS (HTTP/1.0 with the connection closed after the answer). |
 | [`https_get_by_name`](#https_get_by_name) | `https_get` for a server given by `name`, whose address comes from the system's resolver (std/dns; a name that is a dotted-quad address is used as it is). |
+| [`https_reply_free`](#https_reply_free) | Frees a reply. |
+| [`https_fetch`](#https_fetch) | Fetches the `https://` URL `url`. |
 
 Every example below is built, verified and run by `tests/run.sh`. An `assert` in one is proved at compile time from the contracts above it.
 
@@ -35,6 +38,14 @@ struct HttpsResult { state: u64, error: u64, data: Bytes }
 What a TLS exchange ended with: the `state` of the client (6 is a clean
 close by the server, 7 a failure), its error code (see `tls13c_feed`; 0
 when the connection broke without one) and the application data received.
+
+### `HttpsReply`
+
+```bastio
+struct HttpsReply { status: u64, body: Bytes }
+```
+
+What `https_fetch` found: the status code of the last response and its body.
 
 ## Functions
 
@@ -133,6 +144,36 @@ bfree(name);
 if bad != 0 { return 1; }
 ```
 
+### `https_exchange`
+
+```bastio
+fn https_exchange(h: &Host, ip: u64, port: u64, name: &Bytes, request: &Bytes, roots: &Bytes) -> Option[HttpsResult]
+  requires blen(name) <= 255 && blen(request) < 1073741824 && blen(roots) < 274877906944
+```
+
+Like `https_request`, but gives the whole result whatever state the
+exchange ended in (6 for a close_notify, 5 for a connection that was cut
+off after the handshake, 7 for a failure), for a caller that can tell by
+other means (a `Content-Length`) whether the answer is complete. `None`
+only if there are no random bytes or the connection cannot be made.
+
+Example:
+
+```bastio
+let name = bfrom("localhost");
+let request = bfrom("GET / HTTP/1.0\r\n\r\n");
+let roots = balloc(0);
+let mut bad = 0;
+match https_exchange(host, net_ip4(127, 0, 0, 1), 1, name, request, roots) {
+  Option::Some(r) => { https_result_free(r); bad = 1; },
+  Option::None => {},
+}
+bfree(roots);
+bfree(request);
+bfree(name);
+if bad != 0 { return 1; }
+```
+
 ### `https_get`
 
 ```bastio
@@ -189,6 +230,60 @@ bfree(name);
 if bad != 0 { return 1; }
 ```
 
+### `https_reply_free`
+
+```bastio
+fn https_reply_free(r: HttpsReply)
+```
+
+Frees a reply.
+
+Example:
+
+```bastio
+let name = bfrom("https://127.0.0.1:1/");
+let roots = balloc(0);
+match https_fetch(host, name, roots, 3) {
+  Option::Some(r) => { https_reply_free(r); },
+  Option::None => {},
+}
+bfree(roots);
+bfree(name);
+```
+
+### `https_fetch`
+
+```bastio
+fn https_fetch(h: &Host, url: &Bytes, roots: &Bytes, redirects: u64) -> Option[HttpsReply]
+  requires blen(url) < 65536 && blen(roots) < 274877906944 && redirects <= 16
+```
+
+Fetches the `https://` URL `url`: looks the host up, connects, checks the
+server against `roots` and returns the status and body of the answer
+(HTTP/1.0 with the connection closed after it, so the body is everything
+behind the head). A redirect (301, 302, 303, 307, 308) to a path on the
+same server or to another `https://` URL is followed, at most `redirects`
+times; a redirect to anything else (plain `http://`, another scheme) is
+not followed and its answer is returned as it is. `None` if the URL is
+not an acceptable `https://` URL, the name does not resolve, the exchange
+fails or the answer has no head.
+
+Example:
+
+```bastio
+// Nothing listens on port 1 of the loopback.
+let url = bfrom("https://127.0.0.1:1/");
+let roots = balloc(0);
+let mut bad = 0;
+match https_fetch(host, url, roots, 3) {
+  Option::Some(r) => { https_reply_free(r); bad = 1; },
+  Option::None => {},
+}
+bfree(roots);
+bfree(url);
+if bad != 0 { return 1; }
+```
+
 ## Internals
 
 ### `https_flush`
@@ -202,8 +297,68 @@ Internal: sends what is in `out` over the socket and empties it. False if sendin
 ### `https_connected`
 
 ```bastio
-fn https_connected(h: &Host, ip: u64, port: u64, name: &Bytes, request: &Bytes, roots: &Bytes, rnd: &Bytes) -> Option[Bytes]
+fn https_connected(h: &Host, ip: u64, port: u64, name: &Bytes, request: &Bytes, roots: &Bytes, rnd: &Bytes) -> Option[HttpsResult]
   requires blen(name) <= 255 && blen(request) < 1073741824 && blen(roots) < 274877906944 && blen(rnd) == 96
 ```
 
-Internal: `https_request` with the 96 random bytes `rnd` already drawn.
+Internal: `https_exchange` with the 96 random bytes `rnd` already drawn.
+
+### `https_is_redirect`
+
+```bastio
+fn https_is_redirect(st: u64) -> bool
+```
+
+Internal: is `st` a redirect status that carries a `Location`?
+
+### `https_keep`
+
+```bastio
+fn https_keep(raw: &Bytes, state: u64) -> u64
+  ensures result <= blen(raw)
+```
+
+Internal: how many bytes of the data `raw` (with the final `state` of the
+exchange) make up a complete answer, or 0 if it is not: with a
+`Content-Length`, the head and that many bytes of body (a cut-off
+connection, state 5, is fine then); without one, all the data, but only if
+the server ended it with a close_notify (state 6). A `Transfer-Encoding` is
+refused (the request is HTTP/1.0, which servers must not chunk).
+
+### `https_complete`
+
+```bastio
+fn https_complete(r: HttpsResult) -> Option[Bytes]
+```
+
+Internal: the complete answer in `r` (see `https_keep`). Frees `r`.
+
+### `https_has`
+
+```bastio
+fn https_has(m: &Bytes, name: Str) -> bool
+```
+
+Internal: does the head of `m` have the header `name`?
+
+### `https_step`
+
+```bastio
+fn https_step(h: &Host, u: &HttpsUrl, roots: &Bytes) -> Option[Bytes]
+  requires blen(u.host) <= 255 && blen(u.path) < 65536 && blen(roots) < 274877906944
+```
+
+Internal: one `GET` of the URL `u`: the whole answer (see `https_complete`).
+
+### `https_redirect`
+
+```bastio
+fn https_redirect(raw: &Bytes, u: &HttpsUrl) -> Option[HttpsUrl]
+  requires blen(u.host) >= 1 && blen(u.host) <= 255 && u.port >= 1 && u.port <= 65535
+  ensures result is Option::Some ==> blen(result.Some.host) >= 1 && blen(result.Some.host) <= 255
+  ensures result is Option::Some ==> result.Some.port >= 1 && result.Some.port <= 65535
+  ensures result is Option::Some ==> blen(result.Some.path) >= 1 && blen(result.Some.path) < 65536
+```
+
+Internal: the URL a redirecting `raw` answer from `u` leads to, if it
+names one the client may follow (see `httpsurl_follow`).

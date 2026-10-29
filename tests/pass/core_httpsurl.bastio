@@ -1,0 +1,110 @@
+// expect-exit: 0
+// core/httpsurl: URLs split into host, port and path; other schemes, user
+// information, IPv6 literals, bad hosts and ports, spaces and line breaks in
+// the path are refused; redirects stay on the server or name an https URL.
+import "core/httpsurl.bastio";
+
+/// 1 unless `url` parses to this host, port and path.
+fn parses(url: Str, host: Str, port: u64, path: Str) -> u64
+  requires slen(url) < 60000
+  ensures result <= 1
+{
+  let u = bfrom(url);
+  let mut bad = 1;
+  match httpsurl_parse(u) {
+    Option::Some(p) => {
+      if bytes_eq_str(p.host, host) && p.port == port && bytes_eq_str(p.path, path) { bad = 0; }
+      httpsurl_free(p);
+    },
+    Option::None => {},
+  }
+  bfree(u);
+  return bad;
+}
+
+/// 1 unless `url` is refused.
+fn refuses(url: Str) -> u64
+  requires slen(url) < 60000
+  ensures result <= 1
+{
+  let u = bfrom(url);
+  let mut bad = 0;
+  match httpsurl_parse(u) {
+    Option::Some(p) => { httpsurl_free(p); bad = 1; },
+    Option::None => {},
+  }
+  bfree(u);
+  return bad;
+}
+
+/// 1 unless following `loc` from `example.com:8443` gives this host, port and path (a refusal if `host` is empty).
+fn follows(loc: Str, host: Str, port: u64, path: Str) -> u64
+  requires slen(loc) < 60000
+  ensures result <= 1
+{
+  let h = bfrom("example.com");
+  let l = bfrom(loc);
+  let mut bad = 1;
+  match httpsurl_follow(h, 8443, l) {
+    Option::Some(p) => {
+      if slen(host) > 0 && bytes_eq_str(p.host, host) && p.port == port && bytes_eq_str(p.path, path) { bad = 0; }
+      httpsurl_free(p);
+    },
+    Option::None => { if slen(host) == 0 { bad = 0; } },
+  }
+  bfree(l);
+  bfree(h);
+  return bad;
+}
+
+fn good() -> u64
+  ensures result <= 12
+{
+  return parses("https://example.com", "example.com", 443, "/") +
+    parses("https://example.com/", "example.com", 443, "/") +
+    parses("HTTPS://Example.COM/A", "Example.COM", 443, "/A") +
+    parses("https://example.com:8443/a/b?q=1#top", "example.com", 8443, "/a/b?q=1") +
+    parses("https://example.com?x=y", "example.com", 443, "/?x=y") +
+    parses("https://example.com#frag", "example.com", 443, "/") +
+    parses("https://a-b.c.example:1/x", "a-b.c.example", 1, "/x") +
+    parses("https://10.1.2.3:65535", "10.1.2.3", 65535, "/") +
+    parses("https://h/p%20q", "h", 443, "/p%20q") +
+    parses("https://h//x", "h", 443, "//x") +
+    parses("https://h/a#b#c", "h", 443, "/a") +
+    parses("https://h:443/", "h", 443, "/");
+}
+
+fn bad_urls() -> u64
+  ensures result <= 22
+{
+  return refuses("") + refuses("https://") + refuses("http://example.com/") + refuses("ftp://example.com/") +
+    refuses("example.com/") + refuses("//example.com/") + refuses("https:/example.com/") +
+    refuses("https://user@example.com/") + refuses("https://user:pw@example.com/") +
+    refuses("https://example.com:80@evil.example/") + refuses("https://[::1]/") + refuses("https://[::1]:8443/") +
+    refuses("https://exa mple.com/") + refuses("https://example.com:/") + refuses("https://example.com:0/") +
+    refuses("https://example.com:65536/") + refuses("https://example.com:12a/") + refuses("https://:443/") +
+    refuses("https://exa_mple.com/") + refuses("https://example.com/a b") + refuses("https://example.com/a\r\nHost: evil") +
+    refuses("https://example.com/a\tb");
+}
+
+fn redirects() -> u64
+  ensures result <= 11
+{
+  return follows("/login?next=1", "example.com", 8443, "/login?next=1") +
+    follows("/", "example.com", 8443, "/") +
+    follows("/a#frag", "example.com", 8443, "/a") +
+    follows("https://other.example/x", "other.example", 443, "/x") +
+    follows("https://other.example:9/", "other.example", 9, "/") +
+    follows("//evil.example/x", "", 0, "") +
+    follows("login", "", 0, "") +
+    follows("http://example.com/", "", 0, "") +
+    follows("", "", 0, "") +
+    follows("/a b", "", 0, "") +
+    follows("/a\r\nX: y", "", 0, "");
+}
+
+fn main() -> u64 {
+  let bad = good() + bad_urls() + redirects();
+  if bad > 0 { return 1; }
+  return 0;
+}

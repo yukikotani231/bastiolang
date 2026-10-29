@@ -299,3 +299,121 @@ fn dns_resolv_conf(text: &Bytes) -> Option[u64]
   }
   return Option[u64]::None;
 }
+
+/// Internal: the byte `c` in lower case (ASCII letters only).
+fn dns_lower(c: u8) -> u8 {
+  if c >= 65 && c <= 90 { return c + 32; }
+  return c;
+}
+
+/// Internal: `t[from..to]` is the same name as `name`, ignoring ASCII case.
+fn dns_name_is(t: &Bytes, from: u64, to: u64, name: &Bytes) -> bool
+  requires from <= to && to <= blen(t)
+{
+  if to - from != blen(name) { return false; }
+  let mut i = 0;
+  while i < blen(name)
+    invariant i <= blen(name) && to - from == blen(name) && to <= blen(t)
+  {
+    if dns_lower(bget(t, from + i)) != dns_lower(bget(name, i)) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+/// Internal: the address of the hosts-file line `t[ls..le]` (an IPv4 address,
+/// then names, `#` starts a comment) if `name` is one of its names.
+fn dns_hosts_line(t: &Bytes, ls: u64, le0: u64, name: &Bytes) -> Option[u64]
+  requires ls <= le0 && le0 <= blen(t)
+{
+  let mut le = ls;
+  while le < le0 && bget(t, le) != 35
+    invariant ls <= le && le <= le0
+  {
+    le = le + 1;
+  }
+  let mut a = ls;
+  while a < le && (bget(t, a) == 32 || bget(t, a) == 9 || bget(t, a) == 13)
+    invariant ls <= a && a <= le
+  {
+    a = a + 1;
+  }
+  let mut e = a;
+  while e < le && bget(t, e) != 32 && bget(t, e) != 9 && bget(t, e) != 13
+    invariant a <= e && e <= le
+  {
+    e = e + 1;
+  }
+  match dns_dotted(t, a, e) {
+    Option::None => { return Option[u64]::None; },
+    Option::Some(ip) => {
+      let mut at = e;
+      while at < le
+        invariant at <= le
+      {
+        while at < le && (bget(t, at) == 32 || bget(t, at) == 9 || bget(t, at) == 13)
+          invariant at <= le
+        {
+          at = at + 1;
+        }
+        let mut f = at;
+        while f < le && bget(t, f) != 32 && bget(t, f) != 9 && bget(t, f) != 13
+          invariant at <= f && f <= le
+        {
+          f = f + 1;
+        }
+        if f > at && dns_name_is(t, at, f, name) { return Option[u64]::Some(ip); }
+        at = f;
+      }
+      return Option[u64]::None;
+    },
+  }
+}
+
+/// The IPv4 address that the text of a hosts file (`/etc/hosts`) gives to
+/// `name`, ignoring case; lines for IPv6 addresses and comments are skipped,
+/// and the first line that names it wins. `localhost` is always 127.0.0.1
+/// (RFC 6761), file or not.
+/// ```
+/// let text = bfrom("# hosts\n::1 localhost\n10.0.0.5  Build  ci.lan # the CI box\n127.0.1.1 build\n");
+/// let name = bfrom("CI.lan");
+/// let local = bfrom("localhost");
+/// let mut bad = 1;
+/// match dns_hosts(text, name) {
+///   Option::Some(ip) => { if ip == 167772165 { bad = 0; } },
+///   Option::None => {},
+/// }
+/// match dns_hosts(text, local) {
+///   Option::Some(ip) => { if ip != 2130706433 { bad = 1; } },
+///   Option::None => { bad = 1; },
+/// }
+/// bfree(local);
+/// bfree(name);
+/// bfree(text);
+/// if bad != 0 { return 1; }
+/// ```
+fn dns_hosts(text: &Bytes, name: &Bytes) -> Option[u64]
+{
+  let n = blen(text);
+  let mut ls = 0;
+  while ls < n
+    invariant ls <= n + 1
+  {
+    let mut le = ls;
+    while le < n && bget(text, le) != 10
+      invariant ls <= le && le <= n
+    {
+      le = le + 1;
+    }
+    match dns_hosts_line(text, ls, le, name) {
+      Option::Some(ip) => { return Option[u64]::Some(ip); },
+      Option::None => {},
+    }
+    ls = le + 1;
+  }
+  let local = bfrom("localhost");
+  let is_local = dns_name_is(local, 0, blen(local), name);
+  bfree(local);
+  if is_local { return Option[u64]::Some(2130706433); }
+  return Option[u64]::None;
+}

@@ -148,9 +148,9 @@ fn dns_system_resolver(h: &Host) -> Option[u64] {
   }
 }
 
-/// The IPv4 address of the host `name` from the system's resolver (see
-/// `dns_system_resolver`). A name that is a dotted-quad address is returned
-/// as it is, without a lookup.
+/// The IPv4 address of the host `name`: a dotted-quad address is returned as
+/// it is, then /etc/hosts is read (`dns_hosts`; `localhost` is always
+/// 127.0.0.1), then the system's resolver is asked (see `dns_system_resolver`).
 /// ```
 /// let lo = bfrom("127.0.0.1");
 /// let mut bad = 1;
@@ -165,6 +165,22 @@ fn dns_lookup(h: &Host, name: &Bytes) -> Option[u64] {
   match dns_dotted(name, 0, blen(name)) {
     Option::Some(ip) => { return Option[u64]::Some(ip); },
     Option::None => {},
+  }
+  match read_file_str(h, "/etc/hosts") {
+    Option::Some(t) => {
+      let found = dns_hosts(t, name);
+      bfree(t);
+      match found {
+        Option::Some(ip) => { return Option[u64]::Some(ip); },
+        Option::None => {},
+      }
+    },
+    Option::None => {
+      let local = bfrom("localhost");
+      let same = bytes_eq(local, name);
+      bfree(local);
+      if same { return Option[u64]::Some(2130706433); }
+    },
   }
   match dns_system_resolver(h) {
     Option::None => { return Option[u64]::None; },
