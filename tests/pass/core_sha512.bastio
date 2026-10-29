@@ -93,6 +93,61 @@ fn text_same384(s: Str, want: Str) -> u64
   return 1;
 }
 
+/// 1 unless HMAC-SHA-384 of `msg` under `key` is `want`.
+fn mac384(key: &Bytes, msg: &Bytes, want: Str) -> u64
+  ensures result <= 1
+{
+  let d = hmac_sha384(key, msg);
+  let h = hex(d);
+  let ok = bytes_eq_str(h, want);
+  bfree(h);
+  bfree(d);
+  if ok { return 0; }
+  return 1;
+}
+
+/// 1 unless HMAC-SHA-384 of the text `m` under the text `k` is `want`.
+fn mac384_text(k: Str, m: Str, want: Str) -> u64
+  ensures result <= 1
+{
+  let kb = bfrom(k);
+  let mb = bfrom(m);
+  let r = mac384(kb, mb, want);
+  bfree(mb);
+  bfree(kb);
+  return r;
+}
+
+/// 1 unless HMAC-SHA-384 under `n` bytes `c` of key and the text `m` gives `want`.
+fn mac384_fill(n: u64, c: u8, m: Str, want: Str) -> u64
+  requires n < 1000000
+  ensures result <= 1
+{
+  let mut kb = balloc(n);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && blen(kb) == n
+  {
+    bset(&mut kb, i, c);
+    i = i + 1;
+  }
+  let mb = bfrom(m);
+  let r = mac384(kb, mb, want);
+  bfree(mb);
+  bfree(kb);
+  return r;
+}
+
+/// The number of HMAC-SHA-384 checks that fail (RFC 4231 cases 2, 1 and 6, and an empty key and message).
+fn group6() -> u64
+  ensures result <= 4
+{
+  return mac384_text("Jefe", "what do ya want for nothing?", "af45d2e376484031617f78d2b58a6b1b9c7ef464f5a01b47e42ec3736322445e8e2240ca5e69e2c78b3239ecfab21649") +
+    mac384_fill(20, 11, "Hi There", "afd03944d84895626b0825f4ab46907f15f9dadbe4101ec682aa034c7cebc59cfaea9ea9076ede7f4af152e8b2fa9cb6") +
+    mac384_fill(131, 170, "Test Using Larger Than Block-Size Key - Hash Key First", "4ece084485813e9088d2c63a041bc5b44f9ef1012a2b588f3cd11f05033ac4c60c2ef6ab4030fe8296248df163f44952") +
+    mac384_text("", "", "6c1f2ee938fad2e24bd91298474382ca218c75db3d83e114b3d4367776d14d3551289e75e8209cd4b792302840234adc");
+}
+
 /// The number of SHA-384 checks that fail.
 fn group5() -> u64
   ensures result <= 8
@@ -150,7 +205,7 @@ fn group4() -> u64
 }
 
 fn main() -> u64 {
-  let bad = group1() + group2() + group3() + group4() + group5();
+  let bad = group1() + group2() + group3() + group4() + group5() + group6();
   if bad > 0 { return 1; }
   return 0;
 }

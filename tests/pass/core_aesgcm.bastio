@@ -162,8 +162,118 @@ fn tampers() -> u64
   return tamper("00000000000000000000000000000000", "000000000000000000000000", "", "0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf") + tamper("feffe9928665731c6d6a8f9467308308", "cafebabefacedbaddecaf888", "feedfacedeadbeeffeedfacedeadbeefabaddad2", "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e0915bc94fbc3221a5db94fae95ae7121a47") + tamper("c29ca3364d6a6aca5239460dc923298b", "3d4f98e9cdbc015c9b0859ec", "5fabbf256da0eb3b04e17defb2", "db56871f69c7d7fb485849aed671bffaf8") + tamper("5c78bf1fbd73bb26d629ddcd2816cb0b", "c0130e26637a610016fe9396", "", "196aba4aa9449e3e92c7d6ae29d3916a23a8e3b0de94ebadf81d0a1a8d25260d") + tamper("a6b922ef547eb230edc5fadf26a70d59", "5be34f5796493934244be6f6", "0db65eba9a7fe066c4df80520ca1f90ee93bccf98a1528cd74034ab8e15bdedfe9983048bf7a9dc7", "0bf5ccdb6afd80882b807381f7cc27dced393d931af749c2e39e0c3b6fbb93ad");
 }
 
+/// 0 if sealing with AES-256 `plain` under `key`, `nonce` and `aad` (all hex) gives `want` (hex) and opening `want` gives `plain` back, else 1.
+fn check256(key: Str, nonce: Str, aad: Str, plain: Str, want: Str) -> u64
+  requires slen(key) == 64 && slen(nonce) == 24 && slen(aad) < 1000 && slen(plain) < 3000 && slen(want) < 3100
+  ensures result <= 1
+{
+  let k = unhex(key);
+  let n = unhex(nonce);
+  let a = unhex(aad);
+  let p = unhex(plain);
+  let w = unhex(want);
+  let mut bad = 1;
+  let s = gcm_seal(k, n, a, p);
+  if bytes_eq(s, w) {
+    match gcm_open(k, n, a, w) {
+      Option::Some(q) => { if bytes_eq(q, p) { bad = 0; } bfree(q); },
+      Option::None => {},
+    }
+  }
+  bfree(s);
+  bfree(w);
+  bfree(p);
+  bfree(a);
+  bfree(n);
+  bfree(k);
+  return bad;
+}
+
+
+/// 1 if any change of the sealed message `want` is accepted: each byte flipped in turn, the associated data, nonce and key changed, a truncation or a message shorter than a tag.
+fn tamper256(key: Str, nonce: Str, aad: Str, want: Str) -> u64
+  requires slen(key) == 64 && slen(nonce) == 24 && slen(aad) < 1000 && slen(want) >= 32 && slen(want) < 3100
+  ensures result <= 1
+{
+  let k = unhex(key);
+  let n = unhex(nonce);
+  let a = unhex(aad);
+  let mut w = unhex(want);
+  let mut accepted = 0;
+  let mut i = 0;
+  while i < blen(w)
+    invariant accepted <= 1 && i <= blen(w) && blen(k) == 32 && blen(n) == 12 && blen(w) >= 16 && blen(w) < 1550
+  {
+    bset(&mut w, i, bget(w, i) ^ 1);
+    match gcm_open(k, n, a, w) {
+      Option::Some(q) => { accepted = 1; bfree(q); },
+      Option::None => {},
+    }
+    bset(&mut w, i, bget(w, i) ^ 1);
+    i = i + 1;
+  }
+  let a2 = bfrom("x");
+  match gcm_open(k, n, a2, w) {
+    Option::Some(q) => { accepted = 1; bfree(q); },
+    Option::None => {},
+  }
+  bfree(a2);
+  let mut n2 = bytes_slice(n, 0, 12);
+  bset(&mut n2, 11, bget(n2, 11) ^ 1);
+  match gcm_open(k, n2, a, w) {
+    Option::Some(q) => { accepted = 1; bfree(q); },
+    Option::None => {},
+  }
+  bfree(n2);
+  let mut k2 = bytes_slice(k, 0, 32);
+  bset(&mut k2, 0, bget(k2, 0) ^ 1);
+  match gcm_open(k2, n, a, w) {
+    Option::Some(q) => { accepted = 1; bfree(q); },
+    Option::None => {},
+  }
+  bfree(k2);
+  let cut = bytes_slice(w, 0, blen(w) - 1);
+  match gcm_open(k, n, a, cut) {
+    Option::Some(q) => { accepted = 1; bfree(q); },
+    Option::None => {},
+  }
+  bfree(cut);
+  let short = bytes_slice(w, 0, 15);
+  match gcm_open(k, n, a, short) {
+    Option::Some(q) => { accepted = 1; bfree(q); },
+    Option::None => {},
+  }
+  bfree(short);
+  bfree(w);
+  bfree(a);
+  bfree(n);
+  bfree(k);
+  return accepted;
+}
+
+/// The number of AES-256-GCM checks that fail (sealed by OpenSSL via Python's cryptography; the empty message under the zero key is NIST's test case 13).
+fn group256() -> u64
+  ensures result <= 6
+{
+  return 0
+    + check256("82b70eee7f1a5039bef07ec2347f066ed08f5dc7512447e3404300026b6e5455", "94a065685d64c4980bb8d454", "", "", "8cd34f13dbccd87a65237df9903e0056")
+    + check256("4a8721a99a01ad219eb59cf6a15ef6f15a1d830bb7ce09d6bbc004e7175c643c", "7decb0b580ec37bc9712dd2e", "", "6aaeb94bae", "eba2bcbaef2154f25729c1d4c1e44675c5def8ef0d")
+    + check256("8d2f9fa29c5a284c9ef7521829cf1079b080e9d74a1c10fcab6a4243d33656de", "be4c1ed79648e856e8f9a2f5", "8c95f0ce4b39c15bffad5c2dfb", "8bb820b6119cba8ff88796ae5b05f280", "9185b4726b9871e1acd2cdf82d4bd32db3c2eeef6b250f146c31dd8b6e3296ec")
+    + check256("a68ced93b6b28cb0d1b358e6baab485565b9f49028d557d79a8a0e6451e15c70", "5c15f173541b4438a25cf763", "12d4eeb3c2246879bf00b3cf8ed13abf129a3097", "ad96b442d6d1bdef4850c3f465442eb300c337a648a6c0dbdd73fc95f5c2c451859afe80d40aa39dfb9249f40c3ee37d961445c806f58c7cf2127dfa89", "b2493b26805dc94d55b6c30ab3b64f3f6c952dc59dfbd4d3ea4ae53f90b2f8c55696724aaa1bae04ac07234833bd8b76c14ce3e601a1643b59a0c4115101599044c1beaa82b210794ea4cc2950")
+    + check256("4f9296fcf33c08409990ac970dedb3b843120181e9376107dbdaf6c5f3c86497", "ee219b01dd92f19f4954f4fe", "", "a94ed9182375882b200daadb23cff9193f3e70384495e04c5d5ed352226d1637c2248f1d3ccc4405dd2ea1fafab4bf1c46964d947086207882914478bee8c75b4309ae2b122e3fe87ac7ecf5a5370fc41b4ddb723b2afb6c47c0b57894aab2c5c145b797", "7be4779f32b92e0c7f2483ad74c0601160c7a4ebea95d8cd2d3bf0fdbdf539ff3877eb3283a23769724bc25885408232ca663b01a993027d374bd8431f12785ea004f0d6f22d12dcb8f8daf8ae8a903337475773ca5ef434a999cdb9fe66dad1ee7f5983ecdcbc2560ae09366606a88b339cc9c6")
+    + check256("0000000000000000000000000000000000000000000000000000000000000000", "000000000000000000000000", "", "", "530f8afbc74536b9a963b4f1c4cb738b")
+  ;
+}
+
+/// 1 if any change of an AES-256-GCM message is accepted.
+fn tampers256() -> u64
+  ensures result <= 2
+{
+  return tamper256("a68ced93b6b28cb0d1b358e6baab485565b9f49028d557d79a8a0e6451e15c70", "5c15f173541b4438a25cf763", "12d4eeb3c2246879bf00b3cf8ed13abf129a3097", "b2493b26805dc94d55b6c30ab3b64f3f6c952dc59dfbd4d3ea4ae53f90b2f8c55696724aaa1bae04ac07234833bd8b76c14ce3e601a1643b59a0c4115101599044c1beaa82b210794ea4cc2950") + tamper256("4f9296fcf33c08409990ac970dedb3b843120181e9376107dbdaf6c5f3c86497", "ee219b01dd92f19f4954f4fe", "", "7be4779f32b92e0c7f2483ad74c0601160c7a4ebea95d8cd2d3bf0fdbdf539ff3877eb3283a23769724bc25885408232ca663b01a993027d374bd8431f12785ea004f0d6f22d12dcb8f8daf8ae8a903337475773ca5ef434a999cdb9fe66dad1ee7f5983ecdcbc2560ae09366606a88b339cc9c6");
+}
+
 fn main() -> u64 {
-  let total = group0() + group1() + group2() + group3() + group4() + group5() + tampers();
+  let total = group0() + group1() + group2() + group3() + group4() + group5() + tampers() + group256() + tampers256();
   if total != 0 { return 1; }
   return 0;
 }

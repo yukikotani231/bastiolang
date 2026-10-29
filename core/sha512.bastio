@@ -1,4 +1,4 @@
-// core/sha512.bastio: SHA-512 and SHA-384 (FIPS 180-4).
+// core/sha512.bastio: SHA-512, SHA-384 (FIPS 180-4) and HMAC-SHA-384 (RFC 2104).
 //
 // What is proved: every access is in bounds, nothing leaks, and a digest is
 // 64 bytes (48 for SHA-384). Not proved: that the digest is SHA-512's or SHA-384's (the tests check the
@@ -276,4 +276,51 @@ fn sha384(m: &Bytes) -> Bytes
   bytes_copy_span(&mut out, 0, full, 0, 48);
   bfree(full);
   return out;
+}
+
+/// HMAC-SHA-384 of `msg` under `key` (any length): 48 bytes.
+/// ```
+/// let key = bfrom("Jefe");
+/// let msg = bfrom("what do ya want for nothing?");
+/// let mac = hmac_sha384(key, msg);
+/// let first = bget(mac, 0);        // af 45 d2 e3 ... 49
+/// let last = bget(mac, 47);
+/// bfree(mac);
+/// bfree(key);
+/// bfree(msg);
+/// if first != 175 || last != 73 { return 1; }
+/// ```
+fn hmac_sha384(key: &Bytes, msg: &Bytes) -> Bytes
+  ensures blen(result) == 48
+{
+  // A key longer than a block is hashed first; a shorter one is padded with zeros.
+  let mut k0 = balloc(128);
+  if blen(key) > 128 {
+    let hk = sha384(key);
+    bytes_copy_into(&mut k0, 0, hk);
+    bfree(hk);
+  } else {
+    bytes_copy_into(&mut k0, 0, key);
+  }
+  let mut inner = text_new();
+  let mut outer = text_new();
+  let mut i = 0;
+  while i < 128
+    invariant i <= 128 && blen(k0) == 128 && vlen(inner) == i && vlen(outer) == i
+  {
+    text_push(&mut inner, bget(k0, i) ^ 54);
+    text_push(&mut outer, bget(k0, i) ^ 92);
+    i = i + 1;
+  }
+  text_push_bytes(&mut inner, msg);
+  let ib = text_finish(inner);
+  let ih = sha384(ib);
+  text_push_bytes(&mut outer, ih);
+  let ob = text_finish(outer);
+  let r = sha384(ob);
+  bfree(k0);
+  bfree(ib);
+  bfree(ih);
+  bfree(ob);
+  return r;
 }

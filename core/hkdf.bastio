@@ -1,11 +1,14 @@
-// core/hkdf.bastio: HKDF with HMAC-SHA-256 (RFC 5869), the key derivation
-// that TLS 1.3 uses.
+// core/hkdf.bastio: HKDF with HMAC-SHA-256 or HMAC-SHA-384 (RFC 5869), the
+// key derivation that TLS 1.3 uses.
 //
 // What is proved: every access is in bounds, nothing leaks, `hkdf_extract`
-// returns 32 bytes and `hkdf_expand` returns exactly the number of bytes
-// asked for (at most 255 blocks, 8160 bytes, as the RFC requires). Not
+// returns 32 bytes (`hkdf_extract384` 48) and `hkdf_expand` returns exactly
+// the number of bytes asked for (at most 8160 bytes, below the 255 blocks the
+// RFC allows), with the hash its key is the output of: SHA-256 for 32 bytes,
+// SHA-384 for 48. Not
 // proved: that the output is RFC 5869's; the tests check its vectors.
 import "sha256.bastio";
+import "sha512.bastio";
 
 /// The pseudo-random key of the input key material `ikm` under `salt`: 32
 /// bytes. An empty salt is the same as 32 zero bytes, as the RFC says.
@@ -25,8 +28,26 @@ fn hkdf_extract(salt: &Bytes, ikm: &Bytes) -> Bytes
   return hmac_sha256(salt, ikm);
 }
 
-/// `n` bytes of output key material from the pseudo-random key `prk` and the
-/// context `info`.
+/// The pseudo-random key of the input key material `ikm` under `salt` with
+/// HMAC-SHA-384: 48 bytes. An empty salt is the same as 48 zero bytes.
+/// ```
+/// let salt = bfrom("salt");
+/// let ikm = bfrom("input key material");
+/// let prk = hkdf_extract384(salt, ikm);
+/// let n = blen(prk);
+/// bfree(prk);
+/// bfree(ikm);
+/// bfree(salt);
+/// if n != 48 { return 1; }
+/// ```
+fn hkdf_extract384(salt: &Bytes, ikm: &Bytes) -> Bytes
+  ensures blen(result) == 48
+{
+  return hmac_sha384(salt, ikm);
+}
+
+/// `n` bytes of output key material from the pseudo-random key `prk` (32
+/// bytes: HMAC-SHA-256, 48 bytes: HMAC-SHA-384) and the context `info`.
 /// ```
 /// let salt = bfrom("salt");
 /// let ikm = bfrom("input key material");
@@ -42,21 +63,27 @@ fn hkdf_extract(salt: &Bytes, ikm: &Bytes) -> Bytes
 /// if n != 42 { return 1; }
 /// ```
 fn hkdf_expand(prk: &Bytes, info: &Bytes, n: u64) -> Bytes
-  requires n <= 8160
+  requires n <= 8160 && (blen(prk) == 32 || blen(prk) == 48)
   ensures blen(result) == n
 {
   let mut out = text_new();
   let mut prev = balloc(0);
   let mut counter = 1;
+  let hl = blen(prk);
   while vec_len(out) < n
-    invariant counter >= 1 && counter <= 256 && vlen(out) == 32 * (counter - 1) && n <= 8160
+    invariant counter >= 1 && counter <= 256 && n <= 8160 && blen(prk) == hl
+    invariant (hl == 32 && vlen(out) == 32 * (counter - 1)) || (hl == 48 && vlen(out) == 48 * (counter - 1))
   {
     let mut msg = text_new();
     text_push_bytes(&mut msg, prev);
     text_push_bytes(&mut msg, info);
     text_push(&mut msg, cast[u8](counter));
     let mb = text_finish(msg);
-    let t = hmac_sha256(prk, mb);
+    let mut t = hmac_sha256(prk, mb);
+    if hl == 48 {
+      bfree(t);
+      t = hmac_sha384(prk, mb);
+    }
     text_push_bytes(&mut out, t);
     bfree(mb);
     bfree(prev);

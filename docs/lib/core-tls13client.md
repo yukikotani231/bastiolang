@@ -8,7 +8,8 @@ its own. The caller reads bytes from a connection and passes them to
 the caller writes to the connection, and the data received from the peer is
 appended to another. So the same code runs over a socket, a pipe or a test.
 
-It speaks two suites, TLS_AES_128_GCM_SHA256 and TLS_CHACHA20_POLY1305_SHA256, with X25519, and checks
+It speaks three suites, TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and
+TLS_CHACHA20_POLY1305_SHA256, with X25519, and checks
 the server: the certificate chain against the trusted roots the caller
 gives (X.509 with RSA, ECDSA (P-256 and P-384) and Ed25519 signatures made
 with SHA-256, SHA-384 or SHA-512, validity, host name, CA flags and key
@@ -23,10 +24,10 @@ secrets the state holds always have the lengths the record layer needs.
 Not proved: that the protocol is followed; the tests run a handshake with
 an OpenSSL server (tests/tls.sh) and feed damaged and truncated flights.
 Not done: certificate path length and name constraints, extended key usage
-and revocation checks; the SHA-384 suite; session tickets; a
+and revocation checks; session tickets; a
 check that the random values are random (the caller supplies them).
 
-`import "core/tls13client.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/endian.bastio](core-endian.md), [core/text.bastio](core-text.md), [core/sha256.bastio](core-sha256.md), [core/hkdf.bastio](core-hkdf.md), [core/tls13.bastio](core-tls13.md), [core/tls13hs.bastio](core-tls13hs.md), [core/aes.bastio](core-aes.md), [core/aesgcm.bastio](core-aesgcm.md), [core/chacha20.bastio](core-chacha20.md), [core/poly1305.bastio](core-poly1305.md), [core/chacha20poly1305.bastio](core-chacha20poly1305.md), [core/tls13record.bastio](core-tls13record.md), [core/x25519.bastio](core-x25519.md), [core/der.bastio](core-der.md), [core/sha512.bastio](core-sha512.md), [core/ed25519.bastio](core-ed25519.md), [core/p256.bastio](core-p256.md), [core/p384.bastio](core-p384.md), [core/rsa.bastio](core-rsa.md), [core/x509.bastio](core-x509.md).
+`import "core/tls13client.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/endian.bastio](core-endian.md), [core/text.bastio](core-text.md), [core/sha256.bastio](core-sha256.md), [core/sha512.bastio](core-sha512.md), [core/hkdf.bastio](core-hkdf.md), [core/tls13.bastio](core-tls13.md), [core/tls13hs.bastio](core-tls13hs.md), [core/aes.bastio](core-aes.md), [core/aesgcm.bastio](core-aesgcm.md), [core/chacha20.bastio](core-chacha20.md), [core/poly1305.bastio](core-poly1305.md), [core/chacha20poly1305.bastio](core-chacha20poly1305.md), [core/tls13record.bastio](core-tls13record.md), [core/x25519.bastio](core-x25519.md), [core/der.bastio](core-der.md), [core/ed25519.bastio](core-ed25519.md), [core/p256.bastio](core-p256.md), [core/p384.bastio](core-p384.md), [core/rsa.bastio](core-rsa.md), [core/x509.bastio](core-x509.md).
 
 | Function | |
 | --- | --- |
@@ -217,16 +218,28 @@ if closed { return 1; }
 
 ## Specification functions
 
+### `tls13c_secrets`
+
+```bastio
+spec fn tls13c_secrets(c: &Tls13Client, n: u64) -> bool {
+  blen(c.hs_secret) == n && blen(c.c_hs) == n && blen(c.s_hs) == n && blen(c.c_secret) == n && blen(c.s_secret) == n
+}
+```
+
+Internal: the handshake and traffic secrets of `c` all have `n` bytes, the
+output length of the hash of the cipher suite (32 for SHA-256, 48 for
+SHA-384).
+
 ### `tls13c_ok`
 
 ```bastio
 spec fn tls13c_ok(c: &Tls13Client) -> bool {
-  c.state <= 7 && blen(c.priv_key) == 32 && blen(c.hs_secret) == 32 && blen(c.c_hs) == 32 && blen(c.s_hs) == 32
-    && (c.suite == 4865 || c.suite == 4867)
-    && ((c.c_suite == 4867 && blen(c.c_key) == 32) || (c.c_suite == 4865 && blen(c.c_key) == 16))
-    && ((c.s_suite == 4867 && blen(c.s_key) == 32) || (c.s_suite == 4865 && blen(c.s_key) == 16))
+  c.state <= 7 && blen(c.priv_key) == 32
+    && ((c.suite == 4866 && tls13c_secrets(c, 48)) || ((c.suite == 4865 || c.suite == 4867) && tls13c_secrets(c, 32)))
+    && ((c.c_suite == 4867 && blen(c.c_key) == 32) || (c.c_suite == 4866 && blen(c.c_key) == 32) || (c.c_suite == 4865 && blen(c.c_key) == 16))
+    && ((c.s_suite == 4867 && blen(c.s_key) == 32) || (c.s_suite == 4866 && blen(c.s_key) == 32) || (c.s_suite == 4865 && blen(c.s_key) == 16))
     && blen(c.c_iv) == 12 && blen(c.s_iv) == 12
-    && blen(c.c_secret) == 32 && blen(c.s_secret) == 32 && blen(c.name) <= 255
+    && blen(c.name) <= 255
     && blen(c.transcript) < 1073741824 && blen(c.inbuf) < 1073741824 && blen(c.hsbuf) < 1073741824 && blen(c.leaf) < 1048576
 }
 ```
@@ -280,7 +293,7 @@ Internal: replaces `buf` with `buf` followed by `more`.
 ```bastio
 fn tls13c_hash(c: &Tls13Client) -> Bytes
   requires tls13c_ok(c)
-  ensures blen(result) == 32
+  ensures blen(result) == blen(c.hs_secret)
 ```
 
 Internal: the hash of the handshake messages so far.
@@ -360,12 +373,24 @@ Internal: 1 if all of `b` is zero.
 
 ```bastio
 fn tls13c_keys(c: &mut Tls13Client, secret: &Bytes, write: bool)
-  requires tls13c_ok(c) && blen(secret) == 32
+  requires tls13c_ok(c) && blen(secret) == blen(c.hs_secret)
   ensures tls13c_ok(c)
 ```
 
 Internal: installs the traffic keys for the client's writing (`write`) or
-reading side from the 32-byte `secret`.
+reading side from the `secret` (as long as the hash of the suite).
+
+### `tls13c_set_suite`
+
+```bastio
+fn tls13c_set_suite(c: &mut Tls13Client, suite: u64)
+  requires tls13c_ok(c) && (suite == 4865 || suite == 4866 || suite == 4867)
+  ensures tls13c_ok(c) && c.suite == suite
+```
+
+Internal: switches `c` to the cipher suite `suite`, which fixes the hash
+and so the length of the secrets: they are replaced by zeros of the right
+length (they are made anew from the key exchange right after).
 
 ### `tls13c_handshake_keys`
 
@@ -424,8 +449,8 @@ Internal: handles the Certificate `msg` (state 2).
 
 ```bastio
 fn tls13c_signed_content(h: &Bytes) -> Bytes
-  requires blen(h) == 32
-  ensures blen(result) == 130
+  requires blen(h) == 32 || blen(h) == 48
+  ensures blen(result) == 98 + blen(h)
 ```
 
 Internal: what the server signs in its CertificateVerify (RFC 8446
@@ -467,8 +492,8 @@ client's, and switches to the application keys.
 
 ```bastio
 fn tls13c_update_secret(secret: &Bytes) -> Bytes
-  requires blen(secret) == 32
-  ensures blen(result) == 32
+  requires blen(secret) == 32 || blen(secret) == 48
+  ensures blen(result) == blen(secret)
 ```
 
 Internal: the next traffic secret after `secret` (RFC 8446 section 7.2).

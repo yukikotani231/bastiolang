@@ -1,17 +1,21 @@
-// core/tls13.bastio: the key schedule of TLS 1.3 with SHA-256 (RFC 8446
-// section 7): HKDF-Expand-Label, Derive-Secret, the early, handshake and
-// master secrets, traffic keys and IVs, record nonces and Finished values.
+// core/tls13.bastio: the key schedule of TLS 1.3 with SHA-256 or SHA-384
+// (RFC 8446 section 7): HKDF-Expand-Label, Derive-Secret, the early,
+// handshake and master secrets, traffic keys and IVs, record nonces and
+// Finished values. The hash is the one whose output length a secret has: 32
+// bytes SHA-256, 48 bytes SHA-384.
 //
 // What is proved: every access is in bounds, nothing leaks, and each
-// function returns the number of bytes its name says (32 for a secret, 12
-// for an IV or a nonce, the asked-for length for a key). Not proved: that
+// function returns the number of bytes its name says (32 or 48 for a secret,
+// as long as the secret it came from, 12 for an IV or a nonce, the asked-for
+// length for a key). Not proved: that
 // the values are the standard's; the tests check the values of RFC 8448
 // (the early secret, `derived`, the handshake secret) and values computed
 // by a Python reference for the rest.
 import "hkdf.bastio";
 import "text.bastio";
 
-/// HKDF-Expand-Label (RFC 8446 section 7.1): `n` bytes from `secret` for the
+/// HKDF-Expand-Label (RFC 8446 section 7.1): `n` bytes from `secret` (32 or 48
+/// bytes) for the
 /// `label` (without the "tls13 " prefix) and `context`.
 /// ```
 /// let secret = balloc(32);
@@ -24,7 +28,7 @@ import "text.bastio";
 /// if n != 16 { return 1; }
 /// ```
 fn tls13_expand_label(secret: &Bytes, label: Str, context: &Bytes, n: u64) -> Bytes
-  requires blen(secret) == 32 && slen(label) <= 249 && blen(context) <= 255 && n <= 8160
+  requires (blen(secret) == 32 || blen(secret) == 48) && slen(label) <= 249 && blen(context) <= 255 && n <= 8160
   ensures blen(result) == n
 {
   let mut info = text_new();
@@ -41,8 +45,8 @@ fn tls13_expand_label(secret: &Bytes, label: Str, context: &Bytes, n: u64) -> By
   return r;
 }
 
-/// Derive-Secret: 32 bytes from `secret` for the `label` and the hash of the
-/// handshake messages so far.
+/// Derive-Secret: as many bytes as `secret` has, for the `label` and the hash
+/// of the handshake messages so far.
 /// ```
 /// let secret = balloc(32);
 /// let hash = balloc(32);
@@ -54,10 +58,10 @@ fn tls13_expand_label(secret: &Bytes, label: Str, context: &Bytes, n: u64) -> By
 /// if n != 32 { return 1; }
 /// ```
 fn tls13_derive_secret(secret: &Bytes, label: Str, transcript_hash: &Bytes) -> Bytes
-  requires blen(secret) == 32 && slen(label) <= 249 && blen(transcript_hash) <= 255
-  ensures blen(result) == 32
+  requires (blen(secret) == 32 || blen(secret) == 48) && slen(label) <= 249 && blen(transcript_hash) <= 255
+  ensures blen(result) == blen(secret)
 {
-  return tls13_expand_label(secret, label, transcript_hash, 32);
+  return tls13_expand_label(secret, label, transcript_hash, blen(secret));
 }
 
 /// The early secret when no pre-shared key is used: HKDF-Extract of 32 zero
@@ -79,9 +83,29 @@ fn tls13_early_secret() -> Bytes
   return r;
 }
 
+/// The early secret of the SHA-384 schedule: HKDF-Extract of 48 zero bytes
+/// with a salt of 48 zero bytes.
+/// ```
+/// let early = tls13_early_secret384();
+/// let n = blen(early);
+/// bfree(early);
+/// if n != 48 { return 1; }
+/// ```
+fn tls13_early_secret384() -> Bytes
+  ensures blen(result) == 48
+{
+  let zeros = balloc(48);
+  let empty = balloc(0);
+  let r = hkdf_extract384(empty, zeros);
+  bfree(empty);
+  bfree(zeros);
+  return r;
+}
+
 /// The next secret in the schedule: HKDF-Extract of `input` (the shared
-/// secret of the key exchange, or 32 zero bytes for the master secret) under
-/// the "derived" secret of `secret`.
+/// secret of the key exchange, or as many zero bytes as `secret` has for the
+/// master secret) under the "derived" secret of `secret`; the hash is SHA-384
+/// when `secret` has 48 bytes.
 /// ```
 /// let early = tls13_early_secret();
 /// let shared = balloc(32);
@@ -93,13 +117,21 @@ fn tls13_early_secret() -> Bytes
 /// if n != 32 { return 1; }
 /// ```
 fn tls13_next_secret(secret: &Bytes, input: &Bytes) -> Bytes
-  requires blen(secret) == 32
-  ensures blen(result) == 32
+  requires blen(secret) == 32 || blen(secret) == 48
+  ensures blen(result) == blen(secret)
 {
   let empty = balloc(0);
-  let h = sha256(empty);
+  let mut h = sha256(empty);
+  if blen(secret) == 48 {
+    bfree(h);
+    h = sha384(empty);
+  }
   let derived = tls13_derive_secret(secret, "derived", h);
-  let r = hkdf_extract(derived, input);
+  let mut r = hkdf_extract(derived, input);
+  if blen(secret) == 48 {
+    bfree(r);
+    r = hkdf_extract384(derived, input);
+  }
   bfree(derived);
   bfree(h);
   bfree(empty);
@@ -107,7 +139,7 @@ fn tls13_next_secret(secret: &Bytes, input: &Bytes) -> Bytes
 }
 
 /// The traffic key of a traffic secret: `n` bytes (16 for AES-128-GCM, 32
-/// for ChaCha20-Poly1305).
+/// for AES-256-GCM and ChaCha20-Poly1305).
 /// ```
 /// let secret = balloc(32);
 /// let key = tls13_traffic_key(secret, 32);
@@ -117,7 +149,7 @@ fn tls13_next_secret(secret: &Bytes, input: &Bytes) -> Bytes
 /// if n != 32 { return 1; }
 /// ```
 fn tls13_traffic_key(secret: &Bytes, n: u64) -> Bytes
-  requires blen(secret) == 32 && n <= 8160
+  requires (blen(secret) == 32 || blen(secret) == 48) && n <= 8160
   ensures blen(result) == n
 {
   let empty = balloc(0);
@@ -136,7 +168,7 @@ fn tls13_traffic_key(secret: &Bytes, n: u64) -> Bytes
 /// if n != 12 { return 1; }
 /// ```
 fn tls13_traffic_iv(secret: &Bytes) -> Bytes
-  requires blen(secret) == 32
+  requires blen(secret) == 32 || blen(secret) == 48
   ensures blen(result) == 12
 {
   let empty = balloc(0);
@@ -170,8 +202,9 @@ fn tls13_nonce(iv: &Bytes, seq: u64) -> Bytes
   return r;
 }
 
-/// The Finished message's verify data: HMAC-SHA-256 of the transcript hash
-/// under the finished key of `base_secret` (a handshake traffic secret).
+/// The Finished message's verify data: HMAC of the transcript hash under the
+/// finished key of `base_secret` (a handshake traffic secret), with SHA-256
+/// for a 32-byte secret and SHA-384 for a 48-byte one.
 /// ```
 /// let secret = balloc(32);
 /// let hash = balloc(32);
@@ -183,12 +216,16 @@ fn tls13_nonce(iv: &Bytes, seq: u64) -> Bytes
 /// if n != 32 { return 1; }
 /// ```
 fn tls13_finished(base_secret: &Bytes, transcript_hash: &Bytes) -> Bytes
-  requires blen(base_secret) == 32
-  ensures blen(result) == 32
+  requires blen(base_secret) == 32 || blen(base_secret) == 48
+  ensures blen(result) == blen(base_secret)
 {
   let empty = balloc(0);
-  let fk = tls13_expand_label(base_secret, "finished", empty, 32);
-  let r = hmac_sha256(fk, transcript_hash);
+  let fk = tls13_expand_label(base_secret, "finished", empty, blen(base_secret));
+  let mut r = hmac_sha256(fk, transcript_hash);
+  if blen(base_secret) == 48 {
+    bfree(r);
+    r = hmac_sha384(fk, transcript_hash);
+  }
   bfree(fk);
   bfree(empty);
   return r;

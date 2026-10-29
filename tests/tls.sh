@@ -116,8 +116,10 @@ serve eclocal eclocal && {
 }
 suites=TLS_AES_128_GCM_SHA256
 serve eclocal eclocal && client "AES-128-GCM only server" 0 localhost ec.roots
-suites=TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256
-serve eclocal eclocal && client "server that offers both suites" 0 localhost ec.roots
+suites=TLS_AES_256_GCM_SHA384
+serve eclocal eclocal && client "AES-256-GCM only server (SHA-384 key schedule)" 0 localhost ec.roots
+suites=TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256
+serve eclocal eclocal && client "server that offers all three suites" 0 localhost ec.roots
 suites=TLS_CHACHA20_POLY1305_SHA256
 make_cert rsalocal rsa rsaca "DNS:localhost"
 serve rsalocal rsalocal && client "RSA certificate (rsa_pss_rsae_sha256)" 0 localhost rsa.roots
@@ -128,6 +130,9 @@ serve edlocal edlocal && client "Ed25519 certificate" 0 localhost ed.roots
 make_ca ec384ca ec384; cat "$tmp/ec384ca.der" > "$tmp/ec384.roots"
 make_cert ec384local ec384 ec384ca "DNS:localhost" 0 -sha384
 serve ec384local ec384local && client "P-384 certificate under a P-384 root (ecdsa_secp384r1_sha384)" 0 localhost ec384.roots
+suites=TLS_AES_256_GCM_SHA384
+serve ec384local ec384local && client "P-384 certificate, AES-256-GCM-SHA384 suite" 0 localhost ec384.roots
+suites=TLS_CHACHA20_POLY1305_SHA256
 make_cert ec256under384 ec ec384ca "DNS:localhost" 0 -sha384
 serve ec256under384 ec256under384 && client "P-256 certificate signed by a P-384 root with SHA-384" 0 localhost ec384.roots
 make_cert ec384under384 ec384 ec384ca "DNS:localhost" 0 -sha512

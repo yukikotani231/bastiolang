@@ -1,6 +1,6 @@
-// core/aesgcm.bastio: authenticated encryption with AES-128 in Galois/Counter
+// core/aesgcm.bastio: authenticated encryption with AES-128 or AES-256 in Galois/Counter
 // Mode (NIST SP 800-38D) with a 96-bit nonce and a 128-bit tag, as
-// TLS_AES_128_GCM_SHA256 uses it.
+// TLS_AES_128_GCM_SHA256 and TLS_AES_256_GCM_SHA384 use it (the key is 16 or 32 bytes).
 //
 // What is proved: every access is in bounds, nothing leaks, a sealed message
 // is 16 bytes longer than its plaintext, and `gcm_open` returns `Some` only
@@ -95,9 +95,18 @@ fn gcm_ghash(h: &Bytes, aad: &Bytes, ct: &Bytes) -> Bytes
   return y;
 }
 
+/// Internal: the expanded key for AES-128 (16 bytes) or AES-256 (32 bytes).
+fn gcm_key(key: &Bytes) -> Aes
+  requires blen(key) == 16 || blen(key) == 32
+  ensures aes_ok(result)
+{
+  if blen(key) == 32 { return aes256_new(key); }
+  return aes128_new(key);
+}
+
 /// Internal: `data` xor the AES-CTR keystream that starts at the counter
 /// block `nonce || 00 00 00 start`.
-fn gcm_ctr(a: &Aes128, nonce: &Bytes, start: u64, data: &Bytes) -> Bytes
+fn gcm_ctr(a: &Aes, nonce: &Bytes, start: u64, data: &Bytes) -> Bytes
   requires aes_ok(a) && blen(nonce) == 12 && blen(data) < 274877906944
   ensures blen(result) == blen(data)
 {
@@ -111,7 +120,7 @@ fn gcm_ctr(a: &Aes128, nonce: &Bytes, start: u64, data: &Bytes) -> Bytes
     invariant at <= n + 15 && n == blen(data) && n < 274877906944 && blen(out) == n && blen(cb) == 16 && aes_ok(a)
   {
     store_be32(&mut cb, 12, counter);
-    let ks = aes128_encrypt(a, cb);
+    let ks = aes_encrypt(a, cb);
     let mut j = 0;
     while j < 16 && at + j < n
       invariant j <= 16 && at < n && at + j <= n && n == blen(data) && blen(out) == n && blen(ks) == 16
@@ -128,12 +137,12 @@ fn gcm_ctr(a: &Aes128, nonce: &Bytes, start: u64, data: &Bytes) -> Bytes
 }
 
 /// Internal: the tag over `aad` and the ciphertext `ct`.
-fn gcm_tag(a: &Aes128, nonce: &Bytes, aad: &Bytes, ct: &Bytes) -> Bytes
+fn gcm_tag(a: &Aes, nonce: &Bytes, aad: &Bytes, ct: &Bytes) -> Bytes
   requires aes_ok(a) && blen(nonce) == 12 && blen(aad) < 274877906944 && blen(ct) < 274877906944
   ensures blen(result) == 16
 {
   let zero = balloc(16);
-  let h = aes128_encrypt(a, zero);
+  let h = aes_encrypt(a, zero);
   bfree(zero);
   let g = gcm_ghash(h, aad, ct);
   bfree(h);
@@ -159,10 +168,10 @@ fn gcm_tag(a: &Aes128, nonce: &Bytes, aad: &Bytes, ct: &Bytes) -> Bytes
 /// if n != 21 { return 1; }
 /// ```
 fn gcm_seal(key: &Bytes, nonce: &Bytes, aad: &Bytes, plain: &Bytes) -> Bytes
-  requires blen(key) == 16 && blen(nonce) == 12 && blen(aad) < 274877906944 && blen(plain) < 274877906944
+  requires (blen(key) == 16 || blen(key) == 32) && blen(nonce) == 12 && blen(aad) < 274877906944 && blen(plain) < 274877906944
   ensures blen(result) == blen(plain) + 16
 {
-  let a = aes128_new(key);
+  let a = gcm_key(key);
   let ct = gcm_ctr(a, nonce, 2, plain);
   let tag = gcm_tag(a, nonce, aad, ct);
   let mut t = balloc(blen(plain) + 16);
@@ -170,7 +179,7 @@ fn gcm_seal(key: &Bytes, nonce: &Bytes, aad: &Bytes, plain: &Bytes) -> Bytes
   bytes_copy_span(&mut t, blen(plain), tag, 0, 16);
   bfree(tag);
   bfree(ct);
-  aes128_free(a);
+  aes_free(a);
   return t;
 }
 
@@ -197,14 +206,14 @@ fn gcm_seal(key: &Bytes, nonce: &Bytes, aad: &Bytes, plain: &Bytes) -> Bytes
 /// if !refused { return 1; }
 /// ```
 fn gcm_open(key: &Bytes, nonce: &Bytes, aad: &Bytes, sealed: &Bytes) -> Option[Bytes]
-  requires blen(key) == 16 && blen(nonce) == 12 && blen(aad) < 274877906944 && blen(sealed) < 274877906944
+  requires (blen(key) == 16 || blen(key) == 32) && blen(nonce) == 12 && blen(aad) < 274877906944 && blen(sealed) < 274877906944
   ensures result is Option::Some ==> blen(result.Some) + 16 == blen(sealed)
 {
   if blen(sealed) < 16 {
     return Option[Bytes]::None;
   }
   let n = blen(sealed) - 16;
-  let a = aes128_new(key);
+  let a = gcm_key(key);
   let ct = bytes_slice(sealed, 0, n);
   let want = gcm_tag(a, nonce, aad, ct);
   // Compare all 16 bytes whatever they hold.
@@ -219,11 +228,11 @@ fn gcm_open(key: &Bytes, nonce: &Bytes, aad: &Bytes, sealed: &Bytes) -> Option[B
   bfree(want);
   if diff != 0 {
     bfree(ct);
-    aes128_free(a);
+    aes_free(a);
     return Option[Bytes]::None;
   }
   let plain = gcm_ctr(a, nonce, 2, ct);
   bfree(ct);
-  aes128_free(a);
+  aes_free(a);
   return Option[Bytes]::Some(plain);
 }
