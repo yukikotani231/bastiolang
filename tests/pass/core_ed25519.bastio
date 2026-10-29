@@ -1,0 +1,187 @@
+// expect-exit: 0
+// core/ed25519: the signatures of RFC 8032 section 7.1 (tests 1 and 2) and of
+// OpenSSL (4 keys, messages of 1 to 1000 bytes) verify, and a signature, a
+// key or a message with a bit changed (every third bit of the signature, every
+// seventh of the key, every bit of the first byte of the message) is refused. Also refused: a
+// signature whose S is not below the group order, and a key that is not a point.
+import "core/ed25519.bastio";
+
+/// The value of the hex digit `c` (0 for anything else).
+fn nib(c: u8) -> u8
+  ensures result < 16
+{
+  if c >= 48 && c <= 57 { return c - 48; }
+  if c >= 97 && c <= 102 { return c - 87; }
+  return 0;
+}
+
+/// The bytes written as hex digits in `s`.
+fn unhex(s: Str) -> Bytes
+  requires slen(s) < 100000
+  ensures blen(result) == slen(s) / 2
+{
+  let n = slen(s) / 2;
+  let mut b = balloc(n);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && blen(b) == n && slen(s) >= 2 * n
+  {
+    bset(&mut b, i, nib(sget(s, 2 * i)) * 16 + nib(sget(s, 2 * i + 1)));
+    i = i + 1;
+  }
+  return b;
+}
+
+/// 1 unless the signature `sig` of `msg` under `pubkey` (all in hex) verifies.
+fn good(pubkey: Str, msg: Str, sig: Str) -> u64
+  requires slen(pubkey) == 64 && slen(sig) == 128 && slen(msg) < 100000
+  ensures result <= 1
+{
+  let p = unhex(pubkey);
+  let m = unhex(msg);
+  let s = unhex(sig);
+  let ok = ed25519_verify(p, m, s);
+  bfree(s);
+  bfree(m);
+  bfree(p);
+  if ok { return 0; }
+  return 1;
+}
+
+/// `b` with bit `i` toggled.
+fn flip(b: &mut Bytes, i: u64)
+  requires i / 8 < blen(b)
+  ensures blen(b) == blen(old(b))
+{
+  let mask = cast[u8](1 << (i % 8));
+  bset(&mut b, i / 8, bget(b, i / 8) ^ mask);
+}
+
+/// The number of one-bit changes of the signature, the key and the message
+/// (all in hex) that still verify.
+fn tamper(pubkey: Str, msg: Str, sig: Str) -> u64
+  requires slen(pubkey) == 64 && slen(sig) == 128 && slen(msg) < 100000
+  ensures result <= 2000
+{
+  let p = unhex(pubkey);
+  let mut m = unhex(msg);
+  let mut s = unhex(sig);
+  let mut p2 = unhex(pubkey);
+  let mut bad = 0;
+  let mut i = 0;
+  while i < 512
+    invariant i <= 515 && blen(s) == 64 && blen(p) == 32 && blen(m) < 100000 && bad <= i
+  {
+    flip(&mut s, i);
+    if ed25519_verify(p, m, s) { bad = bad + 1; }
+    flip(&mut s, i);
+    i = i + 3;
+  }
+  i = 0;
+  while i < 256
+    invariant i <= 262 && blen(s) == 64 && blen(p2) == 32 && blen(m) < 100000 && bad <= 600 + i
+  {
+    flip(&mut p2, i);
+    if ed25519_verify(p2, m, s) { bad = bad + 1; }
+    flip(&mut p2, i);
+    i = i + 7;
+  }
+  i = 0;
+  while i < 8 * blen(m) && i < 8
+    invariant i <= 8 && i <= 8 * blen(m) && blen(s) == 64 && blen(p) == 32 && blen(m) < 100000 && bad <= 900 + i
+  {
+    flip(&mut m, i);
+    if ed25519_verify(p, m, s) { bad = bad + 1; }
+    flip(&mut m, i);
+    i = i + 1;
+  }
+  bfree(p2);
+  bfree(s);
+  bfree(m);
+  bfree(p);
+  return bad;
+}
+
+/// 1 unless the valid signature of the RFC's test 2, with its S replaced by S + L, is refused.
+fn malleable() -> u64
+  ensures result <= 1
+{
+  let p = unhex("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c");
+  let m = unhex("72");
+  let s = unhex("92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69daf52db7415978abc61b2c2eb6aeebfca0387b2eaeb4302aeeb00d291612bb0c10");
+  let ok = ed25519_verify(p, m, s);
+  bfree(s);
+  bfree(m);
+  bfree(p);
+  if ok { return 1; }
+  return 0;
+}
+
+/// 1 unless a key that is not a point (y = 2, for which x^2 has no root) is refused.
+fn not_a_point() -> u64
+  ensures result <= 1
+{
+  let p = unhex("0200000000000000000000000000000000000000000000000000000000000000");
+  let m = unhex("72");
+  let s = unhex("92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00");
+  let ok = ed25519_verify(p, m, s);
+  bfree(s);
+  bfree(m);
+  bfree(p);
+  if ok { return 1; }
+  return 0;
+}
+
+fn group1() -> u64
+  ensures result <= 3
+{
+  return good("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a", "", "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b") +
+    good("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c", "72", "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00") +
+    good("9cb557080efd7e514164ffa75bdc9dfc560a02446a9004954d283c40ba4907b1", "82", "0940c07aaf694c0485e3ac02d0bcb38115da22977ec89c4e45a643f29c886aaaa577302968e38e31a0a27c83908b8dbc802d52711d038e74f34bb66c2bb4cc0f");
+}
+
+fn group2() -> u64
+  ensures result <= 3
+{
+  return good("9cb557080efd7e514164ffa75bdc9dfc560a02446a9004954d283c40ba4907b1", "b70eee7f1a5039bef07ec2347f066ed08f5dc7512447e3404300026b6e545594a065685d64c4980bb8d4544a8721a99a01ad219eb59cf6a15ef6f15a1d830b", "8556c61431927459a258caa601ace17748bdc360a3b28d0f246a3f6bf9c3520f0aa6c7082c71cc2b0a360a41a187ff2de4b415ff73d28f887adf6c76b60d4d01") +
+    good("9cb557080efd7e514164ffa75bdc9dfc560a02446a9004954d283c40ba4907b1", "b7ce09d6bbc004e7175c643c7decb0b580ec37bc9712dd2e6aaeb94bae8d2f9fa29c5a284c9ef7521829cf1079b080e9d74a1c10fcab6a4243d33656debe4c1e", "c7ac65bf74d2f9dc3a4a9c46457f1455d14024dd102edc89a08df8effe73907bfdb8407305016421b74f0d72f3e5e4b5582c5420232dc1939ee126dcea2ae700") +
+    good("9cb557080efd7e514164ffa75bdc9dfc560a02446a9004954d283c40ba4907b1", "d79648e856e8f9a2f58c95f0ce4b39c15bffad5c2dfb8bb820b6119cba8ff88796ae5b05f280a68ced93b6b28cb0d1b358e6baab485565b9f49028d557d79a8a0e", "ee15658204a6572129c834ed592d06186e8bcb7f5c92a30954b3e621a07938504895e1847311a596017441747dd380261653b2d5efabc0fba836a634fa5f250f");
+}
+
+fn group3() -> u64
+  ensures result <= 3
+{
+  return good("9cb557080efd7e514164ffa75bdc9dfc560a02446a9004954d283c40ba4907b1", "6451e15c705c15f173541b4438a25cf76312d4eeb3c2246879bf00b3cf8ed13abf129a3097ad96b442d6d1bdef4850c3f465442eb300c337a648a6c0dbdd73fc95f5c2c451859afe80d40aa39dfb9249f40c3ee37d961445c806f58c7cf2127dfa894f9296fcf33c08409990ac970dedb3b843120181e9376107dbdaf6c5f3c86497ee219b01dd92f19f4954f4fea94ed9182375882b200daadb23cff9193f3e70384495e04c5d5ed352226d1637c2248f1d3ccc4405dd2ea1fafab4bf1c46964d94708620788291", "b639fcba9dc358452b57ed8271bb0cd5a737d780afbe93613625a1ca82c9761e8f3e5f208d0b65688b003a88275bccc2ae133a6cbf16c77a5ba759c3bb15520f") +
+    good("9cb557080efd7e514164ffa75bdc9dfc560a02446a9004954d283c40ba4907b1", "4478bee8c75b4309ae2b122e3fe87ac7ecf5a5370fc41b4ddb723b2afb6c47c0b57894aab2c5c145b797ddb9126e5cca203112105f676414faf6b200daf099dba5eeec33624f5124bfc5f04d82388e52927810f610b0bca11e0be9f14f3ca695e87a5311660c7628cdba9f5eefb99022ef537b596a16dc8a03ec1fe7d2561711b3302479fb2ff11b7c19fecb1e1882d0e49c1a13635bce60772ba0372c52266d08e1b7f9d8c043069de5723b479ff72c86cea0434229f17d2bdb7d8d1ffc7f186692bf3224d7a0c20092430ee2490918da8936c342a4219c564686fea59211200e0e3e1942b6df840876db40b967a9b706535330895749e4dedb3caaa2e474ecde57e21852f2fb003540d61a6a001078f6b5c9ed6e678d669bb67bbbb47f1ffdcdb249497afac3133056cb329066a5f4f02e65c005355ec70ba20d9fc4f3cce61f4bd5b90a699192270d2cb6d39d078c7824132d99b36af72f3d7aafd8c901c7c15b6aa4c5a537bf7f336c969c89275527d35e7320d0d576d9f77d9ad68f2ba95fd70f4c3b975ede61a634a9271ff84625a360efc475f433006350392fab4dbc35e1a55d34bb34216469a5bf58ea2a7dceeec0023cbf4301fdc3af24fb97083bf5b564afc34894ff2d3897d0ac20dd1970d7798a254a8a31f4dd5cc57d2fe7b6422a0248b8080a80eac4281b6f63e206f12b8ef00b1b51c9de126e0cd7d3ddc10755ad4b9b61d827bd6ec9d7618a47f0ba92013f56ea2725c312d14c6409fca2ea45ef7927ba0f075edb2b8843beab6d4d962e913836ccbf9bbcf4e37b47860806c54479f61c04076cd677789d1c7a13c5b10a98e1e6343fbd8dc7c19a5527e51c6cc73299bfd146e9b320fd016ae8151e2d3baf49bfae868df7493f86800c81c6557d86e05a461ab53f04e916fd140dd23cd3e27138202f1522eb9b238b3dcf9c84e8989900a5feeec24f6e86a169ea2d4cb428d9e0ca596447fb56e4b0084ade89fc6e7a56d680a096376484d9b787f92c3b38ac3134915b19c458ab8533d1a8319f2095acd2d120219a235c1430d035ecd52473d70d9437a5b926eec234577d3a302ac2df3a8b9ce8db146b44c35c62a624479c1bee9ce282915583e9f0ce324467ea34e377447f552de483ed53f6359880b61a3e690cacf6fa90aa1d9344d796d4bd4194631000f9519fd590d7ecaea70751fd00f7eebf167401f53d67565779cc34c5d5758c05687822bfde9c7230bee31f85014bd91ded0761613658eae0f0f494260cee680ae36721ae6633bd2d5870ca0111db1d9960c7c8553ac4606f43cee64bd10d8ce967882f77d8d5e36167a780176252bb30ddb949935d034cd93503eea628f94dbc031dbdf487e7a8d357c9dae10875f5963724f7702aa03029a6d059a4b3159e", "36dc134b345f5c7a865fb165a68ec0efd8a9015eea5640ef8ce941e7de1b005df2a90d16fb602403450a84cf43b0eebf2dcc52a3a795d83c1a5810dc87ae2509") +
+    good("4c7b7011bb493dcc48c6bf26944bb30fc7b7b2ab0829d972199d12e75e314d77", "3f", "ad0f6c175e1b536c09371de86dd762ddc49def7a51109bc0cd6153e0d91a727c3466679382fcc47248e8db79d8b347a5ae01bc36d906a9f478bac5d4b4277506");
+}
+
+fn group4() -> u64
+  ensures result <= 3
+{
+  return good("4c7b7011bb493dcc48c6bf26944bb30fc7b7b2ab0829d972199d12e75e314d77", "2a2b14f9f06ee29b4dd98ee6247c942e9a25c095d33151b1d92daf6bb635eca632fea712e71d74929e87ebb12fe7d364cfda3f4320e0a5139cbad7375904e4", "0362eeee1e6ffe02e6157702d90b4930c09bdf4635dcddd00cbe6bd274c9699c91c0f45a48cb00fb6cc36d05b52bc6b7a436e3a6d1c1d704f72e0c3892935d08") +
+    good("4c7b7011bb493dcc48c6bf26944bb30fc7b7b2ab0829d972199d12e75e314d77", "499c1537182229969591dd7611dde99752aacaeeec135abbf2a32d38e08bbdae3bc7cde687424aeab68e5c58d204cda182634fdfe83c92c1126363cf7cff0d3a", "dcd00cc5fddda5210131b1c4c5004c2f3bb0682583e9231c617cbc75d47cd4efc4ce52770a4af53e10aa94aceedbe8d3009c809abb05a7ca64432747c110840f") +
+    good("4c7b7011bb493dcc48c6bf26944bb30fc7b7b2ab0829d972199d12e75e314d77", "9c32adacb153061764ff108bf3681772a9a071bce908103e62379f3d7e2138b3ac82d2568a9c21c8597bfb059cf0761c6fc43190f8128501ea4b3d297ea3bc7bf9", "90e83947119a86d023e98d9c00ff152949e6db2375bdb3b1db3eab000e1184f25c493038ed6c6e99d7c243c9044f1b0aec78628da4b6539b58e29d3b9edbf407");
+}
+
+fn group5() -> u64
+  ensures result <= 3
+{
+  return good("4c7b7011bb493dcc48c6bf26944bb30fc7b7b2ab0829d972199d12e75e314d77", "0300a4c9b4a2896e97e74c046574029a2d747969c46f904669563cf971e09c82285fee30b1f3079a0754519fc28ef0ac4463e463340aff5c960f658a528dcc8a28b49f397c0a758fc1e28322f5caf84ccff41fcb166784a959bcdc53c4761f9074d5fbf55aeff6fbe27a79a5704b2b3ee4ef054b07f947391721dae15e3d0aaadfad7253fcfca519a304ff156861818e98757be322fef477a8d4846ebadf00a13d4c79a19278b57f9635f5813c8916493533e0994a71a2a65e16dcd9c4013a84c82c3103a09dee47", "2ad67bf512ceee077d4bb45ff788dcff46d4209b446358db946fbb180f40329b170ab3dccb7d25091cf4716c3f0850a7f013affd4269a0c641a62652c8031f0c") +
+    good("4c7b7011bb493dcc48c6bf26944bb30fc7b7b2ab0829d972199d12e75e314d77", "4cba9b8e2adfda03e8f59ef3329d267dd8383579c762f2bb674b0f0c3dcfd305efac77a0fc846b74f9f78123882b95dd17ef1b581977d94c6ab37820db5c72e4fb44e353b9f73aef9824eca5b87c258fbe9d13b1beb05773c3d2be88d7d2705c0faf163064daf33adb63bd70ca3912c1a174b250d3aa8e9ffca7577617eba7712cfeb7982d9a4ba8f954f265c9e08a0d6336d5500aa8820d0bb7df3a705ea39368ca5246f793cbe8a487a1a91191caf1798626372a35d036b844fed712f1bea4833e633afe4222b29041771ac63843e5276ee1268b01336b74defe9a387547f8bcff0947d0884410c613d457b7eaf5fad774a7b3f3da3d0d0b62e447a8a7d228ad8bc7263f2725244a2561ffdfb0c37cbc61622b9e8811d3c670a4404c0667e1641800bf83fdfcfc25e727a25815200ba6313af20479ec0d79c0b33a143964f0a38a71baed6b78625a643fc6f2088bf568077109da4f49c48658af36a18666b9be5edc55fa7fab1c549482483ae0263e4082b9881ce174f177ed595284bc67db0f1789aed574bd3802efa53faeebfdc6289dfa6cda821625b9addbbc8364338041844928622855be24428588d83cc291c8e2df7d2a426bbc777f88c153ebb4d7c4458eb028aa52c821c43a975a0efe6508e2ff21a9a8507ae1049850f133d0b2be4c847c7e5d4a5b85d8fbe77a5ad3134959be6300966aca0543e2824e2de8aa51206fe162b6ffeb264a8d204b2d352985dbed7377f2dcfb23caee9da67df004450e8bb024e5c272ee2bfb7fabdec86d5db3a47366fb26a7dc924887b687b8bc611ac044c6985706a8a04047acd57aacca7e7d9cfe436bcb3d4999db132d8cad4dd86a08f0af4dbcc81257909ee1290c5835290915addee78fb8cbd0148e315567c2b1096a4a2d6784469bc5961fe35c429440b17d65e0577bfbff407073489c70a6d95f105d9afbe91d8989fa9c18042d776560fb8868507664a95fcfed0cb35a3e53b5ca53d57d01eb887fd02525486d44da6bc8deed4d5ce6af058f8c9dde311cb396a82f3b4ab0f1946e2417de607959a93f0a0b291cb684d6983d01dbaf1c030e98be5bd0b5a1b63c7eb050db6465f683a6e7f5d28085909b628a6cc762f8109ab8f2bce9cf8dd997b264f8fcbd0716408eebcd329f64394d46de61a4a246efcd6b78ba130dc9d6a915f00d64f526beaa7031f25465f219ed79b33811641054f028cfe03faf7b60815b6379c2db5feac56d22db1ec3cc2960ff95dc8780a1f7214638aa3b4d3a0e2ad30d9c3687870e82ade784f537449193ed9c0e46f130be5c8e838fcb1fce5cc623ee5514d5c52c97ac27131bb5b0b8d028426393ba7433d05923aebb121dba29380fbe442a45559ae4736a1b0fec8124fb43145648235799916afd7a5d", "98ec8f04c89dc5cee6a4ea1830b783deb33504c437270949793680f45abc7fcc2c502dfdbd1865a874fbdf0f4889647690848a8831c46dc63bd3a84e3c328d06") +
+    good("d33de658655ed05a24024e2bbb9b85c93c46ad1edb74d2a64061b769c83f50ab", "fb", "0750c3aa4facacd0274767962d145498d3f2b9b3c25092f2913bfea712ac2913ed20d7277d2d01122881dabcfa45bb53fa927354f01c70f3a0a0d7a4ac590305");
+}
+
+fn group6() -> u64
+  ensures result <= 3
+{
+  return good("d33de658655ed05a24024e2bbb9b85c93c46ad1edb74d2a64061b769c83f50ab", "dc854fc5efad6555147a61942316995c743dc8139e3c6e08cc24d2ab351dd11a95535a708e6cedb6f0a18e68d77df47666bd3f53861a03b9f3a949bc5e84a64b1a", "ecd84151038be33d716756ac674960c4a74a328277af29a32a81b834ae1ebbe1e46d315700d7e742c0d9d5d4213cc916deaf41fb4db268a1e14216946185a501") +
+    good("e22874edd2c51141db16ae34c9ee5a60ce10e6fa1777be660e23d7cb867b8d20", "94", "3890d2fa3a74062cebad4a670fd9e539ec7bc775fff6e16322902432a326e33044383e0b6f593e229ede3e1fad8809a91539465cac79be52771421e292bc000a") +
+    good("e22874edd2c51141db16ae34c9ee5a60ce10e6fa1777be660e23d7cb867b8d20", "3bd6581396d3eee5de47fc724c5d7b74f29f189035d34b084b7634a10f42b30d4f93820b166d0686033e5ae9b77fa918aca15cdfae29fd60571558f296cbe2c6cc", "f32de48d27fdb657a657aacb38ce6669ceea7fea1cfa3ee7df639ba64b7e5925570857c9d3ced54430d08da0eb8035836eb18b70b4800a8ef684561d761ea309");
+}
+
+fn main() -> u64 {
+  let bad = group1() + group2() + group3() + group4() + group5() + group6() + malleable() + not_a_point() + tamper("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c", "72", "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00");
+  if bad > 0 { return 1; }
+  return 0;
+}

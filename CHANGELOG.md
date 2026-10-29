@@ -152,6 +152,9 @@ What will be 0.2.0.
   65536, on the encodings DER forbids and on a real Ed25519 X.509 certificate walked down to its fields.
 - `core/sha512`: `sha512` (FIPS 180-4). Reads are proved in bounds and a digest is 64 bytes; that it is SHA-512's is checked by the
   FIPS 180-4 vectors, the lengths around a block and a million `a`s.
+- `core/ed25519`: `ed25519_verify` (RFC 8032), on the field arithmetic of `core/x25519` and `core/sha512`. Reads are proved in bounds;
+  that it accepts the signatures RFC 8032 accepts is checked by the RFC's vectors, signatures made by OpenSSL, a signature whose S is
+  not below the group order, a key that is not a point, and signatures, keys and messages with a bit changed.
 - `core/url`: `url_encode`, `url_decode`/`url_decode_span` (percent-decoding, `+` as a space on request) and `url_query_get`/`url_query_start` for the query string of a request target; reads are proved in bounds, a decoded string is never longer than its source and an encoded one at most three times as long.
 - `std/http`: `http_header` reads a header field of a response (the name is matched ignoring case,
   the value has its blanks removed), for `Location`, `Content-Type` and the like.
