@@ -1,0 +1,291 @@
+// expect-exit: 0
+// core/chacha20, core/poly1305 and core/chacha20poly1305: the RFC 8439
+// vectors (sections 2.3.2, 2.4.2, 2.5.2 and 2.8.2), the same operations at
+// many lengths against a reference written in Python, and every one-bit
+// change of a sealed message refused.
+import "core/chacha20poly1305.bastio";
+import "core/sha256.bastio";
+import "core/num.bastio";
+
+/// The lower-case hex text of `d`.
+fn hex(d: &Bytes) -> Bytes {
+  let mut t = text_new();
+  let mut i = 0;
+  while i < blen(d)
+    invariant i <= blen(d)
+  {
+    text_push(&mut t, hex_char(cast[u64](bget(d, i)) / 16));
+    text_push(&mut t, hex_char(cast[u64](bget(d, i)) % 16));
+    i = i + 1;
+  }
+  return text_finish(t);
+}
+
+/// `n` bytes `(i * mul + add) mod 256`.
+fn pattern(n: u64, mul: u64, add: u64) -> Bytes
+  requires n < 100000 && mul < 256 && add < 256
+  ensures blen(result) == n
+{
+  let mut b = balloc(n);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && blen(b) == n
+  {
+    bset(&mut b, i, cast[u8]((i * mul + add) % 256));
+    i = i + 1;
+  }
+  return b;
+}
+
+/// 1 unless the hex of `d` is `want`; frees `d`.
+fn is_hex(d: Bytes, want: Str) -> u64
+  ensures result <= 1
+{
+  let h = hex(d);
+  let ok = bytes_eq_str(h, want);
+  bfree(h);
+  bfree(d);
+  if ok { return 0; }
+  return 1;
+}
+
+/// 1 unless the SHA-256 of `d` is `want` (hex); frees `d`. The long outputs of the
+/// differential cases are compared by their digests, which keeps the literals short.
+fn is_hash(d: Bytes, want: Str) -> u64
+  ensures result <= 1
+{
+  let h = sha256(d);
+  bfree(d);
+  return is_hex(h, want);
+}
+
+/// 1 unless the keystream block for key 00..1f, counter 1 and the nonce of RFC 8439 2.3.2 starts as the RFC says.
+fn block_check() -> u64
+  ensures result <= 1
+{
+  let key = pattern(32, 1, 0);
+  let mut nonce = balloc(12);
+  bset(&mut nonce, 3, 9);
+  bset(&mut nonce, 7, 74);
+  let mut out = balloc(64);
+  chacha_block(&mut out, 0, key, 1, nonce);
+  let mut first = balloc(16);
+  bytes_copy_span(&mut first, 0, out, 0, 16);
+  bfree(out);
+  bfree(nonce);
+  bfree(key);
+  return is_hex(first, "10f1e7e4d13b5915500fdd1fa32071c4");
+}
+
+/// 1 unless the cipher, the authenticator and the sealed message for a
+/// message of `l` bytes and an `a`-byte aad are the SHA-256 digests (hex) `c`, `t` and `s`.
+fn diff_case(l: u64, a: u64, c: Str, t: Str, s: Str) -> u64
+  requires l < 5000 && a < 37
+  ensures result <= 1
+{
+  let key = pattern(32, 7, 3);
+  let nonce = pattern(12, 5, 1);
+  let otk = pattern(32, 11, 2);
+  let msg = pattern(l, 13, 5);
+  let aad = pattern(a, 3, 9);
+  let cc = chacha20_xor(key, nonce, 7, msg);
+  let tt = poly1305(otk, msg);
+  let ss = aead_seal(key, nonce, aad, msg);
+  let mut bad = is_hash(cc, c);
+  if bad == 0 { bad = is_hash(tt, t); } else { bfree(tt); }
+  if bad == 0 { bad = is_hash(ss, s); } else { bfree(ss); }
+  bfree(aad);
+  bfree(msg);
+  bfree(otk);
+  bfree(nonce);
+  bfree(key);
+  return bad;
+}
+
+/// RFC 8439 2.4.2: 1 unless the sunscreen message encrypts as the RFC says.
+fn rfc24() -> u64
+  ensures result <= 1
+{
+  let key = pattern(32, 1, 0);
+  let mut nonce = balloc(12);
+  bset(&mut nonce, 7, 74);
+  let m = bfrom("Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.");
+  let c = chacha20_xor(key, nonce, 1, m);
+  let bad = is_hex(c, "6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0bf91b65c5524733ab8f593dabcd62b3571639d624e65152ab8f530c359f0861d807ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab77937365af90bbf74a35be6b40b8eedf2785e42874d");
+  bfree(m);
+  bfree(nonce);
+  bfree(key);
+  return bad;
+}
+
+/// RFC 8439 2.5.2: 1 unless the tag is the RFC's.
+fn rfc25() -> u64
+  ensures result <= 1
+{
+    let mut key = balloc(32);
+    let hexkey = "85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b";
+    let mut i = 0;
+    while i < 32
+      invariant i <= 32 && blen(key) == 32 && slen(hexkey) == 64
+    {
+      bset(&mut key, i, cast[u8](hex_value(sget(hexkey, 2 * i)) * 16 + hex_value(sget(hexkey, 2 * i + 1))));
+      i = i + 1;
+    }
+    let m = bfrom("Cryptographic Forum Research Group");
+    let t = poly1305(key, m);
+    let bad = is_hex(t, "a8061dc1305136c6c22b8baf0c0127a9");
+    bfree(m);
+    bfree(key);
+  return bad;
+}
+
+/// RFC 8439 2.8.2, then every bit of the sealed message changed in turn: 1 on any difference.
+fn tamper() -> u64
+  ensures result <= 1
+{
+  let mut bad = 0;
+    let key = pattern(32, 1, 128);
+    let mut nonce = balloc(12);
+    bset(&mut nonce, 0, 7);
+    let mut j = 4;
+    while j < 12
+      invariant j <= 12 && blen(nonce) == 12
+    {
+      bset(&mut nonce, j, cast[u8](60 + j));
+      j = j + 1;
+    }
+    let mut aad = balloc(12);
+    let mut a = 0;
+    while a < 12
+      invariant a <= 12 && blen(aad) == 12
+    {
+      if a < 4 { bset(&mut aad, a, cast[u8](80 + a)); } else { bset(&mut aad, a, cast[u8](188 + a)); }
+      a = a + 1;
+    }
+    let m = bfrom("Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.");
+    let mut sealed = aead_seal(key, nonce, aad, m);
+    let h = hex(sealed);
+    if !bytes_eq_str(h, "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b61161ae10b594f09e26a7e902ecbd0600691") { bad = 1; }
+    bfree(h);
+    match aead_open(key, nonce, aad, sealed) {
+      Option::Some(p) => { if !bytes_eq(p, m) { bad = 1; } bfree(p); },
+      Option::None => { bad = 1; },
+    }
+    let mut i = 0;
+    while i < blen(sealed)
+      invariant i <= blen(sealed) && bad <= 1
+    {
+      let mut bit = 0;
+      while bit < 8
+        invariant bit <= 8 && i < blen(sealed) && bad <= 1
+      {
+        let was = bget(sealed, i);
+        bset(&mut sealed, i, was ^ cast[u8](1 << bit));
+        match aead_open(key, nonce, aad, sealed) {
+          Option::Some(p) => { bad = 1; bfree(p); },
+          Option::None => {},
+        }
+        bset(&mut sealed, i, was);
+        bit = bit + 1;
+      }
+      i = i + 1;
+    }
+    // A different aad is refused too, and a message shorter than a tag.
+    let other = bfrom("x");
+    match aead_open(key, nonce, other, sealed) {
+      Option::Some(p) => { bad = 1; bfree(p); },
+      Option::None => {},
+    }
+    let short = balloc(15);
+    match aead_open(key, nonce, aad, short) {
+      Option::Some(p) => { bad = 1; bfree(p); },
+      Option::None => {},
+    }
+    bfree(short);
+    bfree(other);
+    bfree(sealed);
+    bfree(m);
+    bfree(aad);
+    bfree(nonce);
+    bfree(key);
+  return bad;
+}
+
+/// Differential cases, group 0: 1 unless all agree with the reference.
+fn diffs0() -> u64
+  ensures result <= 1
+{
+  let r0 = diff_case(0, 0, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "09e607e7d8b22aca9866441d1da675c8a10882df9f81aa19fc89cf401cca8b77", "122ad12ff929936051505aecda14dadbbbe9e586f2e1e64f910265724b8b0d54");
+  let r1 = diff_case(1, 1, "f031efa58744e97a34555ca98621d4e8a52ceb5f20b891d5c44ccae0daaaa644", "8d50e8604e1db53ae26770d0828a6cc07f37d79eecaf9a0c4396ad2572c0e797", "263645859e65e512123e0e59b6cf9def5e782455740f6dac96aa2fe4444ae1d6");
+  let r2 = diff_case(2, 2, "6c00b5590af7077bc6eb2df9e810cee8594c0209bab3812d8cb4ea87d5ac8af2", "55c5284dcfbb7e174ef54165eda78f9b5146852c1d6c73e978958c8b005d5001", "fc4a1674ab79720e0f8538ce987de6b9473872c9c2c0b43f680a0d7fc196d629");
+  let r3 = diff_case(15, 15, "606db7a6231f0f8c71f8973c113af488ca1520f4aff2506b19cf32666b2c0c28", "d43b186b36aa3574a0d10ad355829024badf2d1b9422292ad918e8ffe7d4d6d9", "733eb80ccb46edfbb83f1d42e2da2151cbe591fae65913066f36bf2d2b6234c8");
+  let r4 = diff_case(16, 16, "49ae8b978cd56ec2e6c361b965aa3825d8f5ec50d0f328bf6ca6860e1dd0032a", "23d5d9f0a0bdf351f1ffb1376d03167ec81b09bb5992c92def9349b589cb27d8", "cbc5cddbbc8d028410ef327e5acf4b803d759baccf6c08eb163f72decdaf9396");
+  if r0 + r1 + r2 + r3 + r4 > 0 { return 1; }
+  return 0;
+}
+
+/// Differential cases, group 1: 1 unless all agree with the reference.
+fn diffs1() -> u64
+  ensures result <= 1
+{
+  let r0 = diff_case(17, 17, "6c809b118759da8a9a6aace2e81710e57afca879ef9ada9debf48f9e535a7fef", "8720a81047b7f44533e1977be4a3799b0434741b4b3645145a18671f84f68bcd", "0a31dc0931387885ea8a2777a92153d0249bc3a7ba89b8c09511acc3705cccfd");
+  let r1 = diff_case(31, 31, "62c397c78d72357747799f4765387c849064ba6e366a73dbcd2419092aa66ccc", "93660482d2d62d35f93cacc0cdbdd4d6e00464a049a482387d25cb0b5f086ab6", "eab3aff09486090b5856136110adc16ec6bf5bbec8d10dc2fe3cdd41bf1d4420");
+  let r2 = diff_case(32, 32, "06303160904ed4d0183c932121b753c79ab0fea27d21ded7260d1e163a5e032a", "fb94cddd01d97c279f7d39985f3eee8359d0c97c471bb31d62edd427159094ce", "365af325f11bf4f19c27c7644f23e5e61983e97e8a3a08d7b6f2502fb97e43de");
+  let r3 = diff_case(33, 33, "6c86d7b7ab15065d7fa9793251845c84a0b04507d8853ad1aaaaabdd06fc4f3b", "1733047502cca9cdc83ac2882eafdc994139a266466d63427b5b2857acb66a7f", "af861ae4e007d95c1beaf8e32524fb0873e126f1f7136a147df5eac04b7687dc");
+  let r4 = diff_case(47, 10, "b93bffceffd2070231112bd0eaedcc8d5a6c9bf3d958300cbba580c36bee1a87", "63ac695927339f42a8c925d5021eb9109de70e197982fa01003bf71f3e4a2588", "9a1609a9601b4785e6cb787e702b73c2d099ad7b83d7f7c65cbc53e74ee0b4ff");
+  if r0 + r1 + r2 + r3 + r4 > 0 { return 1; }
+  return 0;
+}
+
+/// Differential cases, group 2: 1 unless all agree with the reference.
+fn diffs2() -> u64
+  ensures result <= 1
+{
+  let r0 = diff_case(48, 11, "751a8b89da352b9491257dbb4cd5be8bdcec9a835b0ecb7705ebb63772bf1e52", "c8ef843e0735e0050a234dc953489f7b76c54a85b1adef86785aa9689f627fdc", "5fd4e9cfdc5ba331ff4fc9361a37865b4a332cf28fc4860942069c70193487b0");
+  let r1 = diff_case(49, 12, "17ac3eff3f7c4761db9fd4227ef871237b370037d886dff9639e49f4f958a918", "c381cd945fd0b9563204192cc497bfcdcf8b72b4ff6f4b56afce76286ee2ee30", "273146f59d63b341f3c0c44d1d811c45bb83b4b6008310879ca6280a3578f148");
+  let r2 = diff_case(63, 26, "ee1e397462af1a6d3d5aca033a9f7e91ef40cc164b7334cb801c2dd89fa71381", "12afb5f414e3f66a0f612c6fb8c87beeb32d2ea94e3b70daa1fb0ab316cc47a6", "4c79ed55fda8efdb76bd14c192018ae6ba88547b3987f577de7737e05e1444d0");
+  let r3 = diff_case(64, 27, "ac942d1eef9c74c3c6a6a517816db0b620c19642183da89c6b5fd2488de1d0f5", "dd63bdbda7239a68c25f59e594930933a2c1bcd8c1aa5383938edc451b229e07", "7ea721c730fe355ce54bf9d08040ee505e8c2ebbf47778ddac8cc30c78761373");
+  let r4 = diff_case(65, 28, "e6f934ad79ee3d4db1551955a9e0e2a6c2e3dd0ae656d94f87383f5f55eef44c", "9ec180fd752cde87971c5f4ce942edc5131e8faffe0247413a90da6e8a6336c0", "3a43b63fb155ed89eb5dd7d49a7b8e50cad64fc32cc1d49c89e8d4f5d44fb957");
+  if r0 + r1 + r2 + r3 + r4 > 0 { return 1; }
+  return 0;
+}
+
+/// Differential cases, group 3: 1 unless all agree with the reference.
+fn diffs3() -> u64
+  ensures result <= 1
+{
+  let r0 = diff_case(100, 26, "946aa0a3eff9ed622927d6b00896eff3760904d9f0a1370f86a193e85202e00f", "a10fe8a40afb54413f10a0555419ee67087f92190bbfc78cf37bac710e10ed96", "fc57cffcdbfaba82886ffb7eafc2b4c5ded8d9aedba012a030f93ee3babc6a6b");
+  let r1 = diff_case(127, 16, "40e00cbbcca0d5f6733d1ba32885b0ddd3aeb1bf71f0239feca20eb3d45231ca", "2c9cf943a5810daa2c0f4055044105c6c4f665250c92c6b3b936b52710fa6da2", "067512c25a23bfbbf8bf33707879d68bfb786be084f757ef57ed855b4cd89e07");
+  let r2 = diff_case(128, 17, "7e10d5a4d691b5d660700a603eb734a6c70d5542348abcaaa7fa864824a65c7b", "5d0f2622c21e1cbf50cad3c67a306c7cd3dadc8b1d4a0154f579b47041af719e", "4331649e865e50da2cf7438dae6a5355a702b1c4d709bdc8187c7b218758c710");
+  let r3 = diff_case(129, 18, "de542730fbb35a3a3dccb9878e039ca0340e816335bfb669bf482e68ab9551be", "ea0b5d06d7d8dee02bec61540a3f44ccc318c2093216517825bf81a275b5ac1e", "e94ba3d72f7b2f0ac7464e7fcb5dc32cee7c5f0b3f17ddf2466a619ec1dd352f");
+  let r4 = diff_case(191, 6, "ead2f19cb76bf81a0f9c60b8140556144f6372e77b0b5fbc86526f555850224f", "d33f94f938cccfae980ed6d564a62b9c6e5f6d535ccf8dfe5d687f6e63c89c2a", "4709625a6f4842b9b5fe5e9ae26a6bab421355e4663eaf11570a9727d374ac10");
+  if r0 + r1 + r2 + r3 + r4 > 0 { return 1; }
+  return 0;
+}
+
+/// Differential cases, group 4: 1 unless all agree with the reference.
+fn diffs4() -> u64
+  ensures result <= 1
+{
+  let r0 = diff_case(255, 33, "0545984ea2dc662a1991cdc285a700f040bfc698110359e834bf32a43030cf46", "17db309e436bc4d235b5aa2931a7084fd12683778eae5ff9fe44c115c0f5122b", "4fa0b7a57c7e4afac9ba6b45d10d3501337c6914084a00eef4130a33aa577f11");
+  let r1 = diff_case(256, 34, "d45d1ae6519ae4d63b5b594760f948e8b74023107cf41dcf75e74e92bda93bf8", "24cec5ef4fbeee68ca8ade98d035119c4cbe52a521cbe3fa1aab1afc10019495", "9882e8e8a81848258d7f41ec1d28b914af9501c12edf395afbbab74e349fbe0e");
+  let r2 = diff_case(257, 35, "618660c75f294f45c0a5139a409c04c8e50bce9e75a26d8bb7b0766781a0806b", "2986007ebdc19cba6bbd5c418476d0fe68fa5842e6d60c9f33a49f1e2058743c", "d3883767f542cff25ce89c2e1b08e5ddedec272c9b0039aff8e9d1271fe68b26");
+  let r3 = diff_case(1000, 1, "1e239665e13dcc2651d4fcb432930498dd7020e8f66d221ee5aadf3f28e2443b", "eeefe7ad0f4850c783c87cf9c387efb98f361736cd9e29a9d0d2ebc90bd42c2c", "f46dd9f1f45e21dc602af1f1773064ee4cf3720295ed12d9fe241ceca9a76958");
+  let r4 = diff_case(4097, 27, "928adcb920eb6e01d7d3ca12cead0e7c23fc9325b2f1e6b49fdc2eb3c324d38e", "ce9db4ceb728adbb8780a5ec57ab949713719c16492469c1c4b824c0f3ad007b", "eef10f102cb0e56eda394cc2d3a41ab9fe22518582e6fd2d15331dd4477717e8");
+  if r0 + r1 + r2 + r3 + r4 > 0 { return 1; }
+  return 0;
+}
+
+fn main() -> u64 {
+  let a0 = block_check();
+  let a1 = rfc24();
+  let a2 = rfc25();
+  let a3 = diffs0();
+  let a4 = diffs1();
+  let a5 = diffs2();
+  let a6 = diffs3();
+  let a7 = diffs4();
+  let a8 = tamper();
+  if a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 > 0 { return 1; }
+  return 0;
+}
