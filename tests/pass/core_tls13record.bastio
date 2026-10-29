@@ -98,12 +98,12 @@ fn roundtrip(seq: u64, ct: u8, plain: &Bytes, pad: u64, want: Str) -> u64
 {
   let k = key();
   let v = iv();
-  let rec = tls13_seal(k, v, seq, ct, plain, pad);
+  let rec = tls13_seal(4867, k, v, seq, ct, plain, pad);
   let d = sha256(rec);
   let h = hex(d);
   let mut bad = 0;
   if !bytes_eq_str(h, want) { bad = bad + 1; }
-  match tls13_open(k, v, seq, rec) {
+  match tls13_open(4867, k, v, seq, rec) {
     Option::Some(r) => {
       if r.content_type != ct || !bytes_eq(r.data, plain) { bad = bad + 1; }
       bfree(r.data);
@@ -127,7 +127,7 @@ fn refused(s: Str, seq: u64) -> u64
   let v = iv();
   let rec = unhex(s);
   let mut r = 1;
-  match tls13_open(k, v, seq, rec) {
+  match tls13_open(4867, k, v, seq, rec) {
     Option::Some(x) => { bfree(x.data); },
     Option::None => { r = 0; },
   }
@@ -268,8 +268,92 @@ fn refuse5() -> u64
     refused("17030300163411bbca98a54c6b1edafdaf4c5e7ea7151a3ac564de", 0);
 }
 
+/// Like `roundtrip` for the AES-128-GCM suite, whose key is the first 16 bytes of the test key.
+fn aes_roundtrip(seq: u64, ct: u8, plain: &Bytes, pad: u64, want: Str) -> u64
+  requires blen(plain) <= 16384 && blen(plain) + 1 + pad + 16 <= 16640 && slen(want) == 64
+  ensures result <= 2
+{
+  let k32 = key();
+  let k = bytes_slice(k32, 0, 16);
+  let v = iv();
+  let rec = tls13_seal(4865, k, v, seq, ct, plain, pad);
+  let d = sha256(rec);
+  let h = hex(d);
+  let mut bad = 0;
+  if !bytes_eq_str(h, want) { bad = bad + 1; }
+  match tls13_open(4865, k, v, seq, rec) {
+    Option::Some(r) => {
+      if r.content_type != ct || !bytes_eq(r.data, plain) { bad = bad + 1; }
+      bfree(r.data);
+    },
+    Option::None => { bad = bad + 1; },
+  }
+  bfree(h);
+  bfree(d);
+  bfree(rec);
+  bfree(v);
+  bfree(k);
+  bfree(k32);
+  return bad;
+}
+
+/// 1 unless AES-128-GCM `tls13_open` refuses the record in hex `s` as record `seq`.
+fn aes_refused(s: Str, seq: u64) -> u64
+  requires slen(s) < 100000
+  ensures result <= 1
+{
+  let k32 = key();
+  let k = bytes_slice(k32, 0, 16);
+  let v = iv();
+  let rec = unhex(s);
+  let mut r = 1;
+  match tls13_open(4865, k, v, seq, rec) {
+    Option::Some(x) => { bfree(x.data); },
+    Option::None => { r = 0; },
+  }
+  bfree(rec);
+  bfree(v);
+  bfree(k);
+  bfree(k32);
+  return r;
+}
+
+fn aes_cases() -> u64
+  ensures result <= 10
+{
+  let mut bad = 0;
+  let p0 = balloc(0);
+  bad = bad + aes_roundtrip(0, 22, p0, 0, "cb490136940d537aedb7e635c16414ff798bbb93cd025a571acda4673a726558");
+  bfree(p0);
+  let p1 = bfrom("hello");
+  bad = bad + aes_roundtrip(1, 23, p1, 3, "c716ce5626291aaae519e250a2dd66627be1a503117a94269aa617a4cb7fcf9e");
+  bfree(p1);
+  let mut p2 = balloc(2);
+  bset(&mut p2, 0, 1);
+  bad = bad + aes_roundtrip(7, 21, p2, 0, "a1b91beed304c4523f0ac12cadced8433481b9813365ba6b9644d7ffb52a8563");
+  bfree(p2);
+  let p3 = filler(100, 3);
+  bad = bad + aes_roundtrip(1099511627781, 22, p3, 17, "edaa1577c3213bd14679ad43b95da12022942c9d148e82a3d2d317668ecd9290");
+  bfree(p3);
+  let p4 = filler(16384, 9);
+  bad = bad + aes_roundtrip(5, 23, p4, 239, "a7d157e7ba001154bd17b0e6f041dc8d41b8686021ab22eae8425af435e68ba6");
+  bfree(p4);
+  return bad;
+}
+
+fn aes_refuse() -> u64
+  ensures result <= 6
+{
+  return aes_refused("1703030019dc60057fc39266c543aeda34efe0b72f3d89dd7017aa591ea3", 0) +
+    aes_refused("1703030019dd60057fc39266c543aeda34efe0b72f3d89dd7017aa591ea3", 1) +
+    aes_refused("1703030019dc60057fc39266c543aeda34efe0b72f3d89dd7017aa591ea2", 1) +
+    aes_refused("1703030019dc60057fc39266c543aeda34efe0b72f3d89dd7017aa591e", 1) +
+    aes_refused("1603030019dc60057fc39266c543aeda34efe0b72f3d89dd7017aa591ea3", 1) +
+    aes_refused("1703030019dc60057fc39266c543aeda34efe0b72f3d89dd7017aa591ea300", 1);
+}
+
 fn main() -> u64 {
-  let bad = case0() + case1() + case2() + case3() + case4() + refuse0() + refuse1() + refuse2() + refuse3() + refuse4() + refuse5();
+  let bad = case0() + case1() + case2() + case3() + case4() + refuse0() + refuse1() + refuse2() + refuse3() + refuse4() + refuse5() + aes_cases() + aes_refuse();
   if bad > 0 { return 1; }
   return 0;
 }
