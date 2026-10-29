@@ -162,6 +162,7 @@ What will be 0.2.0.
 - `core/tls13record`: the TLS 1.3 record layer with ChaCha20-Poly1305 (RFC 8446 section 5): `tls13_seal` makes a record from a message,
   a content type and padding; `tls13_open` checks the header and the tag and returns the content type and message. Lengths are proved;
   the records are checked against ones made by Python's `cryptography` (sequence numbers, padding, 16 KiB) and every bit change refused.
+- `core/tls13hs`: the first two TLS 1.3 handshake messages: `tls13_client_hello` builds a ClientHello (X25519, TLS_CHACHA20_POLY1305_SHA256, ed25519 / ECDSA P-256 / RSA-PSS schemes, server name) and `tls13_parse_server_hello` returns the server key share, refusing a HelloRetryRequest, other suites, groups or extensions and any length that leaves its part. Bounds and lengths are proved; the ClientHello is compared with one assembled in Python, and malformed and truncated ServerHellos are refused.
 - `core/url`: `url_encode`, `url_decode`/`url_decode_span` (percent-decoding, `+` as a space on request) and `url_query_get`/`url_query_start` for the query string of a request target; reads are proved in bounds, a decoded string is never longer than its source and an encoded one at most three times as long.
 - `std/http`: `http_header` reads a header field of a response (the name is matched ignoring case,
   the value has its blanks removed), for `Location`, `Content-Type` and the like.
