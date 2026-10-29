@@ -3165,7 +3165,7 @@ fn a64_runtime_host(out: &mut Vec[u64], macos: bool) {
   w_s(&mut out, "1:\tldp x29, x30, [sp], #16\n");
   w_s(&mut out, "\tret\n");
   w_s(&mut out, "bst_rt_host_net:                // op x0, numbers x1 and x2, the Bytes header (length, data) at x3: x0 = the result, -1 if it fails (see bst_host_net in the C prelude)\n");
-  w_s(&mut out, "	stp x29, x30, [sp, #-96]!\n");
+  w_s(&mut out, "	stp x29, x30, [sp, #-144]!\n");
   w_s(&mut out, "	mov x29, sp\n");
   w_s(&mut out, "	stp x19, x20, [sp, #16]\n");
   w_s(&mut out, "	stp x21, x22, [sp, #32]\n");
@@ -3196,9 +3196,10 @@ fn a64_runtime_host(out: &mut Vec[u64], macos: bool) {
   w_s(&mut out, "9:	ldp x19, x20, [sp, #16]\n");
   w_s(&mut out, "	ldp x21, x22, [sp, #32]\n");
   w_s(&mut out, "	ldp x23, x24, [sp, #48]\n");
-  w_s(&mut out, "	ldp x29, x30, [sp], #96\n");
+  w_s(&mut out, "	ldp x29, x30, [sp], #144\n");
   w_s(&mut out, "	ret\n");
-  w_s(&mut out, "10:	stp xzr, xzr, [sp, #64]       // the socket address: family, port and address in network order\n");
+  w_s(&mut out, "10:	lsr x24, x20, #16             // x24 = the time limit of a connect in milliseconds (0: none), in the bits of the port word above bit 15\n");
+  w_s(&mut out, "	stp xzr, xzr, [sp, #64]       // the socket address: family, port and address in network order\n");
   if macos {
     w_s(&mut out, "	mov w0, #16                   // sin_len, sin_family\n");
     w_s(&mut out, "	strb w0, [sp, #64]\n");
@@ -3254,7 +3255,8 @@ fn a64_runtime_host(out: &mut Vec[u64], macos: bool) {
   w_s(&mut out, "	bl listen\n");
   w_s(&mut out, "	cbnz w0, 17f\n");
   w_s(&mut out, "	b 18f\n");
-  w_s(&mut out, "16:	mov w0, w23\n");
+  w_s(&mut out, "16:	cbnz x24, 30f\n");
+  w_s(&mut out, "	mov w0, w23\n");
   w_s(&mut out, "	add x1, sp, #64\n");
   w_s(&mut out, "	mov w2, #16\n");
   w_s(&mut out, "	bl connect\n");
@@ -3264,6 +3266,92 @@ fn a64_runtime_host(out: &mut Vec[u64], macos: bool) {
   w_s(&mut out, "17:	mov w0, w23\n");
   w_s(&mut out, "	bl close\n");
   w_s(&mut out, "	b 8b\n");
+  // A connect with a time limit: non-blocking, waited for with poll, then blocking again with the same limit on reads and writes.
+  w_s(&mut out, "30:	mov x0, #0xee80               // at most an hour: 3600000\n");
+  w_s(&mut out, "	movk x0, #0x36, lsl #16\n");
+  w_s(&mut out, "	cmp x24, x0\n");
+  w_s(&mut out, "	b.ls 32f\n");
+  w_s(&mut out, "	mov x24, x0\n");
+  w_s(&mut out, "32:\tmov w0, w23\n");
+  w_s(&mut out, "	mov w1, #3                    // F_GETFL\n");
+  w_s(&mut out, "	mov w2, #0\n");
+  a64_variadic(&mut out, macos, "fcntl", 2);
+  w_s(&mut out, "	tbnz w0, #31, 17b\n");
+  w_s(&mut out, "	str w0, [sp, #96]\n");
+  if macos {
+    w_s(&mut out, "	orr w2, w0, #0x4              // O_NONBLOCK\n");
+  } else {
+    w_s(&mut out, "	orr w2, w0, #0x800            // O_NONBLOCK\n");
+  }
+  w_s(&mut out, "	mov w0, w23\n");
+  w_s(&mut out, "	mov w1, #4                    // F_SETFL\n");
+  a64_variadic(&mut out, macos, "fcntl", 2);
+  w_s(&mut out, "	cbnz w0, 17b\n");
+  w_s(&mut out, "	mov w0, w23\n");
+  w_s(&mut out, "	add x1, sp, #64\n");
+  w_s(&mut out, "	mov w2, #16\n");
+  w_s(&mut out, "	bl connect\n");
+  w_s(&mut out, "	cbz w0, 31f\n");
+  w_s(&mut out, "	str w23, [sp, #104]           // struct pollfd: fd, events = POLLOUT, revents = 0\n");
+  w_s(&mut out, "	mov w0, #4\n");
+  w_s(&mut out, "	str w0, [sp, #108]\n");
+  w_s(&mut out, "	add x0, sp, #104\n");
+  w_s(&mut out, "	mov x1, #1\n");
+  w_s(&mut out, "	mov w2, w24\n");
+  w_s(&mut out, "	bl poll\n");
+  w_s(&mut out, "	cmp w0, #0\n");
+  w_s(&mut out, "	b.le 17b\n");
+  w_s(&mut out, "	str wzr, [sp, #112]\n");
+  w_s(&mut out, "	mov w0, #4\n");
+  w_s(&mut out, "	str w0, [sp, #116]\n");
+  w_s(&mut out, "	mov w0, w23\n");
+  if macos {
+    w_s(&mut out, "	mov w1, #0xffff               // SOL_SOCKET\n");
+    w_s(&mut out, "	mov w2, #0x1007               // SO_ERROR\n");
+  } else {
+    w_s(&mut out, "	mov w1, #1                    // SOL_SOCKET\n");
+    w_s(&mut out, "	mov w2, #4                    // SO_ERROR\n");
+  }
+  w_s(&mut out, "	add x3, sp, #112\n");
+  w_s(&mut out, "	add x4, sp, #116\n");
+  w_s(&mut out, "	bl getsockopt\n");
+  w_s(&mut out, "	cbnz w0, 17b\n");
+  w_s(&mut out, "	ldr w0, [sp, #112]\n");
+  w_s(&mut out, "	cbnz w0, 17b\n");
+  w_s(&mut out, "31:	mov w0, w23\n");
+  w_s(&mut out, "	mov w1, #4                    // F_SETFL: blocking again\n");
+  w_s(&mut out, "	ldr w2, [sp, #96]\n");
+  a64_variadic(&mut out, macos, "fcntl", 2);
+  w_s(&mut out, "	cbnz w0, 17b\n");
+  w_s(&mut out, "	mov x0, #1000                 // struct timeval at sp+120: seconds and microseconds\n");
+  w_s(&mut out, "	udiv x1, x24, x0\n");
+  w_s(&mut out, "	msub x2, x1, x0, x24\n");
+  w_s(&mut out, "	mul x2, x2, x0\n");
+  w_s(&mut out, "	str x1, [sp, #120]\n");
+  w_s(&mut out, "	str x2, [sp, #128]\n");
+  w_s(&mut out, "	mov w0, w23\n");
+  if macos {
+    w_s(&mut out, "	mov w1, #0xffff\n");
+    w_s(&mut out, "	mov w2, #0x1006               // SO_RCVTIMEO\n");
+  } else {
+    w_s(&mut out, "	mov w1, #1\n");
+    w_s(&mut out, "	mov w2, #20                   // SO_RCVTIMEO\n");
+  }
+  w_s(&mut out, "	add x3, sp, #120\n");
+  w_s(&mut out, "	mov w4, #16\n");
+  w_s(&mut out, "	bl setsockopt\n");
+  w_s(&mut out, "	mov w0, w23\n");
+  if macos {
+    w_s(&mut out, "	mov w1, #0xffff\n");
+    w_s(&mut out, "	mov w2, #0x1005               // SO_SNDTIMEO\n");
+  } else {
+    w_s(&mut out, "	mov w1, #1\n");
+    w_s(&mut out, "	mov w2, #21                   // SO_SNDTIMEO\n");
+  }
+  w_s(&mut out, "	add x3, sp, #120\n");
+  w_s(&mut out, "	mov w4, #16\n");
+  w_s(&mut out, "	bl setsockopt\n");
+  w_s(&mut out, "	b 18b\n");
   w_s(&mut out, "11:	mov w0, w19\n");
   w_s(&mut out, "	mov x1, xzr\n");
   w_s(&mut out, "	mov x2, xzr\n");

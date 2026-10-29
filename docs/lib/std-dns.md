@@ -9,7 +9,9 @@ recursive resolver answers; it needs no UDP in `host_net`). The resolver
 comes from the caller or from /etc/resolv.conf; the message id is random
 (`net_random`). Only A records, no search domains, no cache, no DNSSEC; the
 answer is as trustworthy as the path to the resolver (HTTPS authenticates
-the server whatever address the lookup gave).
+the server whatever address the lookup gave). Connecting to the resolver and
+each read are limited to 5 seconds (not on Windows yet, see
+`net_connect_timeout`).
 
 `import "std/dns.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/endian.bastio](core-endian.md), [core/text.bastio](core-text.md), [core/dns.bastio](core-dns.md), [std/net.bastio](std-net.md), [std/host.bastio](std-host.md).
 

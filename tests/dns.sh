@@ -53,9 +53,17 @@ def serve(c):
             c.sendall(out)
     finally:
         c.close()
+def mute(l):
+    held = []
+    while True:
+        c, _ = l.accept()   # a resolver that accepts the query and never answers
+        held.append(c)
+m = socket.socket(); m.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+m.bind(('127.0.0.1', 0)); m.listen(16)
+threading.Thread(target=mute, args=(m,), daemon=True).start()
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(('127.0.0.1', 0)); s.listen(16)
-print(s.getsockname()[1], flush=True)
+print(s.getsockname()[1], m.getsockname()[1], flush=True)
 while True:
     c, _ = s.accept()
     threading.Thread(target=serve, args=(c,), daemon=True).start()
@@ -63,7 +71,7 @@ PY
 python3 "$tmp/server.py" > "$tmp/port" &
 pid=$!
 for i in $(seq 1 100); do [ -s "$tmp/port" ] && break; sleep 0.1; done
-port=$(cat "$tmp/port")
+read -r port mute < "$tmp/port"
 [ -n "$port" ] || { echo "dns: the server did not start"; exit 1; }
 fails=0
 check() { # description name port want_output want_rc
@@ -82,5 +90,10 @@ check "answer cut short" cut.test "$port" "not found" 1
 check "name in capitals (the test server knows only lower case)" EXAMPLE.TEST "$port" "not found" 1
 check "empty label" a..b "$port" "not found" 1
 check "name already an address" 10.20.30.40 "" 10.20.30.40 0
+start=$(date +%s)
+check "a resolver that never answers is given up on (5 seconds)" example.test "$mute" "not found" 1
+elapsed=$(( $(date +%s) - start ))
+if [ "$elapsed" -ge 4 ] && [ "$elapsed" -le 20 ]; then echo "ok   it took $elapsed seconds"
+else echo "FAIL dns: the silent resolver took $elapsed seconds"; fails=$((fails + 1)); fi
 check "nothing listens" example.test 1 "not found" 1
 [ $fails = 0 ] && echo "dns: all passed" || { echo "dns: $fails failed"; exit 1; }

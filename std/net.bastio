@@ -63,7 +63,62 @@ fn net_port(h: &Host, sock: u64) -> u64 {
 /// ```
 fn net_connect(h: &Host, ip: u64, port: u64) -> Option[u64] {
   let mut none = balloc(0);
-  let r = host_net(h, 2, ip, port, &mut none);
+  let r = host_net(h, 2, ip, port % 65536, &mut none);
+  bfree(none);
+  if r == 18446744073709551615 {
+    return Option[u64]::None;
+  }
+  return Option[u64]::Some(r);
+}
+
+/// Connects to `ip`:`port` within `ms` milliseconds (0 means no limit, as
+/// `net_connect`; more than an hour is cut to an hour). The socket has the
+/// same limit on every later read and write, so `net_recv` gives `None` when
+/// nothing arrives in time and `net_send_all` returns false. The limit is not
+/// applied on Windows yet: there the call blocks as `net_connect` does.
+/// ```
+/// // Nothing listens on port 1; the refusal comes at once.
+/// match net_connect_timeout(host, net_ip4(127, 0, 0, 1), 1, 2000) {
+///   Option::Some(s) => { net_close(host, s); return 1; },
+///   Option::None => {},
+/// }
+/// // A listener that is there: the connection is made and works.
+/// let lo = net_ip4(127, 0, 0, 1);
+/// let mut bad = 1;
+/// match net_listen(host, lo, 0) {
+///   Option::Some(l) => {
+///     match net_connect_timeout(host, lo, net_port(host, l), 2000) {
+///       Option::Some(c) => {
+///         match net_accept(host, l) {
+///           Option::Some(a) => {
+///             let msg = bfrom("ping");
+///             let sent = net_send_all(host, c, msg);
+///             bfree(msg);
+///             let mut got = balloc(0);
+///             match net_recv(host, a, 16, &mut got) {
+///               Option::Some(n) => { if sent && n == 4 { bad = 0; } },
+///               Option::None => {},
+///             }
+///             bfree(got);
+///             net_close(host, a);
+///           },
+///           Option::None => {},
+///         }
+///         net_close(host, c);
+///       },
+///       Option::None => {},
+///     }
+///     net_close(host, l);
+///   },
+///   Option::None => {},
+/// }
+/// if bad != 0 { return 1; }
+/// ```
+fn net_connect_timeout(h: &Host, ip: u64, port: u64, ms: u64) -> Option[u64] {
+  let mut limit = ms;
+  if limit > 3600000 { limit = 3600000; }
+  let mut none = balloc(0);
+  let r = host_net(h, 2, ip, port % 65536 + limit * 65536, &mut none);
   bfree(none);
   if r == 18446744073709551615 {
     return Option[u64]::None;

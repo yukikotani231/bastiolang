@@ -1,0 +1,57 @@
+// stage1-only: host_net connect with a time limit, std/net's net_connect_timeout
+// expect-exit: 0
+// Connecting with a time limit: a refused connection fails at once, a
+// listener that is there is reached and the socket works, and a limit of 0
+// connects as `net_connect` does. (A limit that runs out is tried by
+// tests/dns.sh, which needs a server that stays silent; Windows does not
+// apply the limit yet.)
+import "std/host.bastio";
+import "std/net.bastio";
+
+fn main(h: &mut Host) -> u64 {
+  let lo = net_ip4(127, 0, 0, 1);
+  let mut bad = 0;
+  match net_connect_timeout(h, lo, 1, 3000) {
+    Option::Some(s) => { net_close(h, s); bad = 1; },
+    Option::None => {},
+  }
+  match net_listen(h, lo, 0) {
+    Option::Some(l) => {
+      let port = net_port(h, l);
+      let mut which = 0;
+      while which < 3
+        invariant which <= 3
+      {
+        let mut ms = 3000;
+        if which == 1 { ms = 0; }
+        if which == 2 { ms = 99999999; }
+        match net_connect_timeout(h, lo, port, ms) {
+          Option::Some(c) => {
+            match net_accept(h, l) {
+              Option::Some(a) => {
+                let msg = bfrom("hello");
+                let sent = net_send_all(h, c, msg);
+                bfree(msg);
+                let mut got = balloc(0);
+                match net_recv(h, a, 16, &mut got) {
+                  Option::Some(n) => { if !sent || n != 5 { bad = 1; } },
+                  Option::None => { bad = 1; },
+                }
+                bfree(got);
+                net_close(h, a);
+              },
+              Option::None => { bad = 1; },
+            }
+            net_close(h, c);
+          },
+          Option::None => { bad = 1; },
+        }
+        which = which + 1;
+      }
+      net_close(h, l);
+    },
+    Option::None => { bad = 1; },
+  }
+  if bad > 0 { return 1; }
+  return 0;
+}
