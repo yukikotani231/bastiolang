@@ -1,0 +1,539 @@
+// core/rsa.bastio: RSA signature verification with SHA-256 (RFC 8017): the
+// padding RSASSA-PSS that TLS 1.3 uses in rsa_pss_rsae_sha256 and the older
+// RSASSA-PKCS1-v1_5 that most certificates are still signed with. Keys of
+// 2048 to 4096 bits.
+//
+// What is proved: every access is in bounds, nothing leaks, and the numbers
+// the arithmetic works on have the length of the key. Not proved: that the
+// arithmetic and the padding checks are right; the tests check signatures
+// made by OpenSSL (2048, 3072 and 4096 bits, several public exponents), many
+// one-bit changes of signature and message being refused, and padding that
+// breaks each rule of the standard. The code is not constant time and does
+// not need to be: verification handles only public values.
+//
+// A number is a `Vec[u64]` of `l` limbs of 16 bits, least significant first.
+import "bytes.bastio";
+import "option.bastio";
+import "sha256.bastio";
+import "text.bastio";
+
+/// Internal: the number 0 of `l` limbs.
+fn rsa_zero(l: u64) -> Vec[u64]
+  ensures vlen(result) == l
+{
+  let mut r = vec_new[u64]();
+  let mut i = 0;
+  while i < l
+    invariant i <= l && vlen(r) == i
+  {
+    vec_push(&mut r, 0);
+    i = i + 1;
+  }
+  return r;
+}
+
+/// Internal: the big-endian number in `b[from..to]` as `l` limbs, where `l`
+/// is half the number of bytes, rounded up.
+fn rsa_limbs(b: &Bytes, from: u64, to: u64, l: u64) -> Vec[u64]
+  requires from <= to && to <= blen(b) && l == (to - from + 1) / 2
+  ensures vlen(result) == l
+{
+  let mut r = rsa_zero(l);
+  let mut i = 0;
+  while i < to - from
+    invariant i <= to - from && vlen(r) == l && l == (to - from + 1) / 2 && to <= blen(b) && from <= to
+  {
+    // Byte `i` from the end is the low (even) or high (odd) half of a limb.
+    let v = cast[u64](bget(b, to - 1 - i));
+    let at = i / 2;
+    if i % 2 == 0 {
+      vec_set(&mut r, at, wrap_add(vec_get(r, at), v));
+    } else {
+      vec_set(&mut r, at, wrap_add(vec_get(r, at), wrap_mul(v, 256)));
+    }
+    i = i + 1;
+  }
+  return r;
+}
+
+/// Internal: whether `a >= b` (both of `l` limbs).
+fn rsa_ge(a: &Vec[u64], b: &Vec[u64], l: u64) -> bool
+  requires vlen(a) == l && vlen(b) == l
+{
+  let mut k = 0;
+  while k < l
+    invariant k <= l && vlen(a) == l && vlen(b) == l
+  {
+    let x = vec_get(a, l - 1 - k);
+    let y = vec_get(b, l - 1 - k);
+    if x > y { return true; }
+    if x < y { return false; }
+    k = k + 1;
+  }
+  return true;
+}
+
+/// Internal: `a - b` modulo 2^(16 l).
+fn rsa_sub(a: &Vec[u64], b: &Vec[u64], l: u64) -> Vec[u64]
+  requires vlen(a) == l && vlen(b) == l
+  ensures vlen(result) == l
+{
+  let mut r = rsa_zero(l);
+  let mut borrow = 0;
+  let mut i = 0;
+  while i < l
+    invariant i <= l && vlen(r) == l && vlen(a) == l && vlen(b) == l && borrow <= 1
+  {
+    let d = wrap_sub(wrap_sub(wrap_add(vec_get(a, i), 65536), vec_get(b, i)), borrow);
+    vec_set(&mut r, i, d & 65535);
+    borrow = 1 - ((d >> 16) & 1);
+    i = i + 1;
+  }
+  return r;
+}
+
+/// Internal: `2 * a` modulo `n` (for `a` below `n`).
+fn rsa_double(a: &Vec[u64], n: &Vec[u64], l: u64) -> Vec[u64]
+  requires vlen(a) == l && vlen(n) == l
+  ensures vlen(result) == l
+{
+  let mut r = rsa_zero(l);
+  let mut carry = 0;
+  let mut i = 0;
+  while i < l
+    invariant i <= l && vlen(r) == l && vlen(a) == l && carry <= 1
+  {
+    let s = wrap_add(wrap_mul(vec_get(a, i), 2), carry);
+    vec_set(&mut r, i, s & 65535);
+    carry = (s >> 16) & 1;
+    i = i + 1;
+  }
+  if carry > 0 || rsa_ge(r, n, l) {
+    let d = rsa_sub(r, n, l);
+    vec_free(r);
+    return d;
+  }
+  return r;
+}
+
+/// Internal: `a * b / 2^(16 l)` modulo `n` (Montgomery multiplication, for
+/// `a` and `b` below `n`); `ninv` is -1/n modulo 2^16.
+fn rsa_mont(a: &Vec[u64], b: &Vec[u64], n: &Vec[u64], ninv: u64, l: u64) -> Vec[u64]
+  requires vlen(a) == l && vlen(b) == l && vlen(n) == l && l >= 1 && l <= 256
+  ensures vlen(result) == l
+{
+  let mut t = rsa_zero(l + 2);
+  let mut i = 0;
+  while i < l
+    invariant i <= l && vlen(t) == l + 2 && vlen(a) == l && vlen(b) == l && vlen(n) == l && l <= 256
+  {
+    let ai = vec_get(a, i);
+    let mut c = 0;
+    let mut j = 0;
+    while j < l
+      invariant j <= l && vlen(t) == l + 2 && vlen(b) == l
+    {
+      let x = wrap_add(wrap_add(vec_get(t, j), wrap_mul(ai, vec_get(b, j))), c);
+      vec_set(&mut t, j, x & 65535);
+      c = x >> 16;
+      j = j + 1;
+    }
+    let xt = wrap_add(vec_get(t, l), c);
+    vec_set(&mut t, l, xt & 65535);
+    vec_set(&mut t, l + 1, xt >> 16);
+    let q = wrap_mul(vec_get(t, 0), ninv) & 65535;
+    c = 0;
+    j = 0;
+    while j < l
+      invariant j <= l && vlen(t) == l + 2 && vlen(n) == l
+    {
+      let y = wrap_add(wrap_add(vec_get(t, j), wrap_mul(q, vec_get(n, j))), c);
+      if j > 0 { vec_set(&mut t, j - 1, y & 65535); }
+      c = y >> 16;
+      j = j + 1;
+    }
+    let yt = wrap_add(vec_get(t, l), c);
+    vec_set(&mut t, l - 1, yt & 65535);
+    vec_set(&mut t, l, wrap_add(vec_get(t, l + 1), yt >> 16));
+    vec_set(&mut t, l + 1, 0);
+    i = i + 1;
+  }
+  let mut low = rsa_zero(l);
+  i = 0;
+  while i < l
+    invariant i <= l && vlen(low) == l && vlen(t) == l + 2
+  {
+    vec_set(&mut low, i, vec_get(t, i));
+    i = i + 1;
+  }
+  let over = vec_get(t, l) > 0 || rsa_ge(low, n, l);
+  vec_free(t);
+  if over {
+    let r = rsa_sub(low, n, l);
+    vec_free(low);
+    return r;
+  }
+  return low;
+}
+
+/// Internal: `s` to the power `e` modulo the odd number `n` (of `l` limbs),
+/// for `s` below `n` and `e` of at least 3.
+fn rsa_pow(s: &Vec[u64], e: u64, n: &Vec[u64], l: u64) -> Vec[u64]
+  requires vlen(s) == l && vlen(n) == l && l >= 1 && l <= 256 && e >= 3 && e < 4294967296
+  ensures vlen(result) == l
+{
+  // -1/n modulo 2^16 by Newton's iteration.
+  let n0 = vec_get(n, 0);
+  let mut inv = 1;
+  let mut k = 0;
+  while k < 5
+    invariant k <= 5
+  {
+    inv = wrap_mul(inv, wrap_sub(2, wrap_mul(n0, inv))) & 65535;
+    k = k + 1;
+  }
+  let ninv = wrap_sub(65536, inv) & 65535;
+  // R^2 modulo n, where R = 2^(16 l): 1 doubled 32 l times.
+  let mut r2 = rsa_zero(l);
+  vec_set(&mut r2, 0, 1);
+  k = 0;
+  while k < 32 * l
+    invariant k <= 32 * l && vlen(r2) == l && vlen(n) == l && l <= 256
+  {
+    let d = rsa_double(r2, n, l);
+    vec_free(r2);
+    r2 = d;
+    k = k + 1;
+  }
+  let sm = rsa_mont(s, r2, n, ninv, l);
+  let mut x = rsa_zero(l);
+  let mut i = 0;
+  while i < l
+    invariant i <= l && vlen(x) == l
+  {
+    vec_set(&mut x, i, vec_get(sm, i));
+    i = i + 1;
+  }
+  // Square and multiply, from the bit below the highest one of e.
+  let mut top = 31;
+  while top > 0 && (e >> top) == 0
+    invariant top <= 31
+  {
+    top = top - 1;
+  }
+  let mut bit = top;
+  while bit > 0
+    invariant bit <= 31 && vlen(x) == l && vlen(sm) == l && vlen(n) == l && l <= 256
+  {
+    bit = bit - 1;
+    let sq = rsa_mont(x, x, n, ninv, l);
+    vec_free(x);
+    x = sq;
+    if (e >> bit) & 1 == 1 {
+      let p = rsa_mont(x, sm, n, ninv, l);
+      vec_free(x);
+      x = p;
+    }
+  }
+  // Out of Montgomery form: multiply by 1.
+  let mut one = rsa_zero(l);
+  vec_set(&mut one, 0, 1);
+  let out = rsa_mont(x, one, n, ninv, l);
+  vec_free(one);
+  vec_free(x);
+  vec_free(sm);
+  vec_free(r2);
+  return out;
+}
+
+/// Internal: the encoded message `s ^ e mod n` as `k` bytes, or `None` for a
+/// key that is not usable (`n` not odd, or not of 2048 to 4096 bits once its
+/// leading zero bytes are dropped, `e` not odd or outside 3 .. 2^32 - 1) or
+/// a signature that is not of `k` bytes and below `n`. `k` is the length
+/// of the key in bytes, which the result also has; the key bits are in
+/// `modbits`.
+fn rsa_encode(n: &Bytes, e: &Bytes, sig: &Bytes) -> Option[Bytes]
+  requires blen(n) < 65536 && blen(e) < 65536 && blen(sig) < 65536
+  ensures result is Option::Some ==> blen(result.Some) >= 256 && blen(result.Some) <= 512
+{
+  // Drop leading zero bytes of the modulus and the exponent.
+  let mut ns = 0;
+  while ns < blen(n) && bget(n, ns) == 0
+    invariant ns <= blen(n)
+  {
+    ns = ns + 1;
+  }
+  let mut es = 0;
+  while es < blen(e) && bget(e, es) == 0
+    invariant es <= blen(e)
+  {
+    es = es + 1;
+  }
+  let k = blen(n) - ns;
+  let el = blen(e) - es;
+  if k < 256 || k > 512 || el < 1 || el > 4 { return Option[Bytes]::None; }
+  if bget(n, blen(n) - 1) % 2 == 0 || bget(e, blen(e) - 1) % 2 == 0 { return Option[Bytes]::None; }
+  if blen(sig) != k { return Option[Bytes]::None; }
+  let mut ev = 0;
+  let mut i = es;
+  while i < blen(e)
+    invariant i <= blen(e)
+  {
+    ev = wrap_add(wrap_mul(ev, 256), cast[u64](bget(e, i)));
+    i = i + 1;
+  }
+  if ev < 3 || ev >= 4294967296 { return Option[Bytes]::None; }
+  let l = (k + 1) / 2;
+  let nl = rsa_limbs(n, ns, blen(n), l);
+  let sl = rsa_limbs(sig, 0, blen(sig), l);
+  if rsa_ge(sl, nl, l) {
+    vec_free(sl);
+    vec_free(nl);
+    return Option[Bytes]::None;
+  }
+  let m = rsa_pow(sl, ev, nl, l);
+  let mut out = balloc(k);
+  let mut j = 0;
+  while j < k
+    invariant j <= k && blen(out) == k && vlen(m) == l && l == (k + 1) / 2
+  {
+    let limb = vec_get(m, j / 2);
+    let mut v = limb & 255;
+    if j % 2 == 1 { v = (limb >> 8) & 255; }
+    bset(&mut out, k - 1 - j, cast[u8](v));
+    j = j + 1;
+  }
+  vec_free(m);
+  vec_free(sl);
+  vec_free(nl);
+  return Option[Bytes]::Some(out);
+}
+
+/// Internal: MGF1 with SHA-256 (RFC 8017 appendix B.2.1): `len` bytes made
+/// from `seed`.
+fn rsa_mgf1(seed: &Bytes, len: u64) -> Bytes
+  requires blen(seed) < 65536 && len <= 1024
+  ensures blen(result) == len
+{
+  let mut out = balloc(len);
+  let mut counter = 0;
+  let mut at = 0;
+  while at < len
+    invariant at <= len + 31 && blen(out) == len && counter <= 33 && at == 32 * counter
+  {
+    let mut t = text_new();
+    text_push_bytes(&mut t, seed);
+    text_push(&mut t, 0);
+    text_push(&mut t, 0);
+    text_push(&mut t, cast[u8](counter / 256));
+    text_push(&mut t, cast[u8](counter % 256));
+    let block = text_finish(t);
+    let h = sha256(block);
+    let mut j = 0;
+    while j < 32 && at + j < len
+      invariant j <= 32 && at + j <= len && blen(out) == len && blen(h) == 32
+    {
+      bset(&mut out, at + j, bget(h, j));
+      j = j + 1;
+    }
+    bfree(h);
+    bfree(block);
+    at = at + 32;
+    counter = counter + 1;
+  }
+  return out;
+}
+
+/// Whether `sig` is a valid RSASSA-PSS signature of `msg` under the key
+/// (`n`, `e`) (both big-endian, `n` of 2048 to 4096 bits, `e` odd and below
+/// 2^32), with SHA-256, MGF1 with SHA-256 and a salt of 32 bytes: the
+/// rsa_pss_rsae_sha256 scheme of TLS 1.3.
+/// ```
+/// let n = balloc(256);
+/// let e = bfrom("");
+/// let msg = bfrom("hello");
+/// let sig = balloc(256);
+/// let ok = rsa_pss_sha256_verify(n, e, msg, sig);
+/// bfree(sig);
+/// bfree(msg);
+/// bfree(e);
+/// bfree(n);
+/// if ok { return 1; }
+/// ```
+fn rsa_pss_sha256_verify(n: &Bytes, e: &Bytes, msg: &Bytes, sig: &Bytes) -> bool
+  requires blen(n) < 65536 && blen(e) < 65536 && blen(sig) < 65536 && blen(msg) < 274877906944
+{
+  match rsa_encode(n, e, sig) {
+    Option::None => { return false; },
+    Option::Some(em_full) => {
+      let k = blen(em_full);
+      // The bits of the modulus decide the length of the encoded message.
+      let mut ns = 0;
+      while ns < blen(n) && bget(n, ns) == 0
+        invariant ns <= blen(n)
+      {
+        ns = ns + 1;
+      }
+      if blen(n) - ns != k {
+        bfree(em_full);
+        return false;
+      }
+      let top = bget(n, ns);
+      let mut topbits = 8;
+      while topbits > 1 && (top >> (topbits - 1)) == 0
+        invariant topbits <= 8 && topbits >= 1
+      {
+        topbits = topbits - 1;
+      }
+      // emBits = modBits - 1; emLen is k, or k - 1 when modBits is 8 k - 7.
+      let mod_bits = 8 * (k - 1) + topbits;
+      let em_bits = mod_bits - 1;
+      let em_len = (em_bits + 7) / 8;
+      if em_len + 1 < k || em_len > k || em_len < 66 {
+        bfree(em_full);
+        return false;
+      }
+      let skip = k - em_len;
+      // If the encoded message is a byte shorter than the key, the byte before it is 0.
+      if skip == 1 && bget(em_full, 0) != 0 {
+        bfree(em_full);
+        return false;
+      }
+      let em = bytes_slice(em_full, skip, k);
+      bfree(em_full);
+      let db_len = em_len - 33;
+      let mut ok = bget(em, em_len - 1) == 188;
+      let mask_bits = 8 * em_len - em_bits;
+      // The leftmost bits of the first byte are 0.
+      if mask_bits >= 8 { ok = false; }
+      if ok && mask_bits > 0 && (bget(em, 0) >> (8 - mask_bits)) != 0 { ok = false; }
+      if ok {
+        let masked = bytes_slice(em, 0, db_len);
+        let hash = bytes_slice(em, db_len, em_len - 1);
+        let mask = rsa_mgf1(hash, db_len);
+        let mut j = 0;
+        let mut db = balloc(db_len);
+        while j < db_len
+          invariant j <= db_len && blen(db) == db_len && blen(masked) == db_len && blen(mask) == db_len
+        {
+          bset(&mut db, j, bget(masked, j) ^ bget(mask, j));
+          j = j + 1;
+        }
+        if mask_bits > 0 && mask_bits < 8 {
+          // Clear the leftmost bits.
+          bset(&mut db, 0, bget(db, 0) & cast[u8](255 >> mask_bits));
+        }
+        // The padding is zeros and a 1, then the 32-byte salt.
+        let pad_len = db_len - 33;
+        j = 0;
+        while j < pad_len
+          invariant j <= pad_len && pad_len == db_len - 33 && blen(db) == db_len
+        {
+          if bget(db, j) != 0 { ok = false; }
+          j = j + 1;
+        }
+        if bget(db, pad_len) != 1 { ok = false; }
+        if ok {
+          let salt = bytes_slice(db, pad_len + 1, db_len);
+          let mhash = sha256(msg);
+          let mut t = text_new();
+          let mut z = 0;
+          while z < 8
+            invariant z <= 8 && vlen(t) == z
+          {
+            text_push(&mut t, 0);
+            z = z + 1;
+          }
+          text_push_bytes(&mut t, mhash);
+          text_push_bytes(&mut t, salt);
+          let mprime = text_finish(t);
+          let check = sha256(mprime);
+          if !bytes_eq(check, hash) { ok = false; }
+          bfree(check);
+          bfree(mprime);
+          bfree(mhash);
+          bfree(salt);
+        }
+        bfree(db);
+        bfree(mask);
+        bfree(hash);
+        bfree(masked);
+      }
+      bfree(em);
+      return ok;
+    },
+  }
+}
+
+/// Whether `sig` is a valid RSASSA-PKCS1-v1_5 signature of `msg` under the
+/// key (`n`, `e`) (both big-endian, `n` of 2048 to 4096 bits, `e` odd and
+/// below 2^32), with SHA-256: the padding of sha256WithRSAEncryption, as most
+/// certificates are signed. The padding must be exactly 0x00 0x01, 0xff
+/// bytes (at least 8), 0x00 and the DigestInfo of the hash.
+/// ```
+/// let n = balloc(256);
+/// let e = bfrom("");
+/// let msg = bfrom("hello");
+/// let sig = balloc(256);
+/// let ok = rsa_pkcs1_sha256_verify(n, e, msg, sig);
+/// bfree(sig);
+/// bfree(msg);
+/// bfree(e);
+/// bfree(n);
+/// if ok { return 1; }
+/// ```
+fn rsa_pkcs1_sha256_verify(n: &Bytes, e: &Bytes, msg: &Bytes, sig: &Bytes) -> bool
+  requires blen(n) < 65536 && blen(e) < 65536 && blen(sig) < 65536 && blen(msg) < 274877906944
+{
+  match rsa_encode(n, e, sig) {
+    Option::None => { return false; },
+    Option::Some(em) => {
+      let k = blen(em);
+      let mhash = sha256(msg);
+      // DigestInfo for SHA-256: 30 31 30 0d 06 09 60 86 48 01 65 03 04 02 01 05 00 04 20 || hash.
+      let prefix = "3031300d060960864801650304020105000420";
+      let t_len = 19 + 32;
+      let mut ok = k >= t_len + 11;
+      if ok {
+        ok = bget(em, 0) == 0 && bget(em, 1) == 1;
+        let ps_end = k - t_len - 1;
+        let mut i = 2;
+        while i < ps_end
+          invariant i <= ps_end && ps_end == k - t_len - 1 && k == blen(em)
+        {
+          if bget(em, i) != 255 { ok = false; }
+          i = i + 1;
+        }
+        if bget(em, ps_end) != 0 { ok = false; }
+        let mut j = 0;
+        while j < 19
+          invariant j <= 19 && k == blen(em) && k >= t_len + 11 && slen(prefix) == 38
+        {
+          let hi = rsa_nib(sget(prefix, 2 * j));
+          let lo = rsa_nib(sget(prefix, 2 * j + 1));
+          if bget(em, ps_end + 1 + j) != hi * 16 + lo { ok = false; }
+          j = j + 1;
+        }
+        j = 0;
+        while j < 32
+          invariant j <= 32 && k == blen(em) && k >= t_len + 11 && blen(mhash) == 32
+        {
+          if bget(em, ps_end + 20 + j) != bget(mhash, j) { ok = false; }
+          j = j + 1;
+        }
+      }
+      bfree(mhash);
+      bfree(em);
+      return ok;
+    },
+  }
+}
+
+/// Internal: the value of the hex digit `c` (0 for anything else).
+fn rsa_nib(c: u8) -> u8
+  ensures result < 16
+{
+  if c >= 48 && c <= 57 { return c - 48; }
+  if c >= 97 && c <= 102 { return c - 87; }
+  return 0;
+}
