@@ -71,12 +71,14 @@ Each module has a reference page, generated from its source: every function with
 | [`core/strsort.bastio`](lib/core-strsort.md) | Sorting pieces of a text in dictionary order (byte order), for sorted word lists, directory listings and `sort | uniq`. |
 | [`core/text.bastio`](lib/core-text.md) | Building byte strings. |
 | [`core/tls13.bastio`](lib/core-tls13.md) | The key schedule of TLS 1.3 with SHA-256 (RFC 8446 section 7). |
+| [`core/tls13client.bastio`](lib/core-tls13client.md) | A TLS 1.3 client that does no input or output of its own. |
 | [`core/tls13hs.bastio`](lib/core-tls13hs.md) | The first two messages of a TLS 1.3 handshake (RFC 8446 section 4). |
 | [`core/tls13record.bastio`](lib/core-tls13record.md) | The TLS 1.3 record layer with the ChaCha20-Poly1305 cipher suite (RFC 8446 section 5). |
 | [`core/url.bastio`](lib/core-url.md) | Percent-encoding (RFC 3986 section 2.1) and the query string of a request target (`/path?a=1&b=two%20words`). |
 | [`core/utf8.bastio`](lib/core-utf8.md) | UTF-8 validation (RFC 3629). |
 | [`core/wtext.bastio`](lib/core-wtext.md) | Text kept as a `Vec[u64]`, one character a word. |
 | [`core/x25519.bastio`](lib/core-x25519.md) | X25519, the Diffie-Hellman function on Curve25519 (RFC 7748), with field elements of 16 limbs of 16 bits in the style of TweetNaCl. |
+| [`core/x509.bastio`](lib/core-x509.md) | Reading X.509 certificates (RFC 5280) and checking their signatures, for the chain a TLS 1.3 server sends. |
 | [`std/host.bastio`](lib/std-host.md) | The command line, files and standard error, for programs on the hosted target. |
 | [`std/http.bastio`](lib/std-http.md) | HTTP/1.1 over std/net.bastio, for programs on the hosted target. |
 | [`std/net.bastio`](lib/std-net.md) | TCP sockets for programs on the hosted target (Linux and the other targets whose native or C backend links the C library's socket calls). |

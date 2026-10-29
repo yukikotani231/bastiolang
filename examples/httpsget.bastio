@@ -1,0 +1,200 @@
+// stage1-only: host_net (sockets), core/tls13client
+// An HTTPS client for a server on this machine: it connects, runs the TLS 1.3
+// handshake of core/tls13client, checks the server's certificate against the
+// roots in a file, sends `GET / HTTP/1.0` and prints the answer.
+//
+//   httpsget PORT NAME ROOTS SEED NOW
+//
+// PORT is the port on 127.0.0.1, NAME the host name to check the certificate
+// for (and to send), ROOTS a file of DER certificates one after the other,
+// SEED a file of 32 bytes that must be unpredictable (every value that has
+// to be random is made from it, so it may be used only once), and NOW the
+// time in seconds since 1970. It exits with 0 if the answer starts with
+// `HTTP/1.` and a 200 status. With no arguments it only checks that a
+// connection starts: the client makes a ClientHello, refuses bytes that are
+// no TLS and does nothing before the handshake is done.
+//
+// What the compiler proves: no buffer is read or written out of bounds and
+// none leaks, whatever the server sends. That the server is the one named
+// is for the certificate checks of core/x509 and core/tls13client, which
+// tests/tls.sh tries against OpenSSL.
+import "core/num.bastio";
+import "core/print.bastio";
+import "core/sha256.bastio";
+import "core/text.bastio";
+import "core/tls13client.bastio";
+import "std/host.bastio";
+import "std/net.bastio";
+
+/// 32 bytes made from `seed` and the byte `tag`: SHA-256 of the two.
+fn derive(seed: &Bytes, tag: u8) -> Bytes
+  ensures blen(result) == 32
+{
+  let mut t = text_new();
+  text_push_bytes(&mut t, seed);
+  text_push(&mut t, tag);
+  let b = text_finish(t);
+  let r = sha256(b);
+  bfree(b);
+  return r;
+}
+
+/// Sends what is in `out` over the socket and empties it. False if sending fails.
+fn flush(h: &Host, sock: u64, out: &mut Vec[u8]) -> bool {
+  if vec_len(out) == 0 { return true; }
+  let b = text_to_bytes(out);
+  while vec_len(out) > 0
+    invariant true
+  {
+    vec_pop(&mut out);
+  }
+  let ok = net_send_all(h, sock, b);
+  bfree(b);
+  return ok;
+}
+
+/// Runs the whole exchange on the connected socket `sock`; the exit code.
+fn exchange(con: &Serial, h: &Host, sock: u64, name: &Bytes, roots: &Bytes, seed: &Bytes, now: u64) -> u64
+  requires blen(name) <= 255 && blen(roots) < 274877906944 && blen(seed) == 32
+{
+  let random = derive(seed, 1);
+  let session = derive(seed, 2);
+  let key = derive(seed, 3);
+  let mut out = text_new();
+  let mut app = text_new();
+  let mut client = tls13c_new(random, session, key, name, &mut out);
+  let request = bfrom("GET / HTTP/1.0\r\nConnection: close\r\n\r\n");
+  let mut asked = false;
+  let mut alive = flush(h, sock, &mut out);
+  let mut buf = balloc(0);
+  let mut rounds = 0;
+  let mut code = 0;
+  while alive && rounds < 10000 && tls13c_state(client) < 6
+    invariant rounds <= 10000 && tls13c_ok(client) && blen(request) < 1000 && blen(roots) < 274877906944
+  {
+    if tls13c_state(client) == 5 && !asked {
+      asked = true;
+      alive = tls13c_send(&mut client, request, &mut out);
+    }
+    if alive { alive = flush(h, sock, &mut out); }
+    if alive {
+      match net_recv(h, sock, 16384, &mut buf) {
+        Option::None => { alive = false; },
+        Option::Some(n) => {
+          if n == 0 || blen(buf) >= 1048576 {
+            alive = false;
+          } else {
+            code = tls13c_feed(&mut client, buf, roots, now, &mut out, &mut app);
+            if code != 0 { alive = false; }
+          }
+        },
+      }
+    }
+    rounds = rounds + 1;
+  }
+  if tls13c_state(client) == 5 || tls13c_state(client) == 6 {
+    // The close_notify we may have to answer, or nothing.
+    flush(h, sock, &mut out);
+  }
+  let st = tls13c_state(client);
+  let reply = text_to_bytes(app);
+  print_str(con, "state ");
+  print_u64(con, st);
+  print_str(con, ", error ");
+  print_u64(con, code);
+  print_str(con, ", ");
+  print_u64(con, blen(reply));
+  print_str(con, " bytes of application data\n");
+  let mut verdict = 1;
+  let head = bfrom("HTTP/1.");
+  let status = bfrom(" 200 ");
+  if st == 6 && bytes_starts_with(reply, head) {
+    match bytes_find(reply, status, 0) {
+      Option::Some(i) => { if i < 16 { verdict = 0; } },
+      Option::None => {},
+    }
+  }
+  bfree(status);
+  bfree(head);
+  print_bytes(con, reply);
+  bfree(reply);
+  bfree(buf);
+  bfree(request);
+  tls13c_free(client);
+  vec_free(app);
+  vec_free(out);
+  bfree(key);
+  bfree(session);
+  bfree(random);
+  return verdict;
+}
+
+fn main(con: &mut Serial, h: &mut Host) -> u64 {
+  if host_argc(h) < 6 {
+    return selfcheck(con);
+  }
+  let a_port = host_arg(h, 1);
+  let name = host_arg(h, 2);
+  let a_roots = host_arg(h, 3);
+  let a_seed = host_arg(h, 4);
+  let a_now = host_arg(h, 5);
+  let mut code = 2;
+  let port = opt_or[u64](parse_u64(a_port, 0, blen(a_port)), 0);
+  let now = opt_or[u64](parse_u64(a_now, 0, blen(a_now)), 0);
+  let mut roots = balloc(0);
+  let mut seed = balloc(0);
+  if port != 0 && now != 0 && blen(name) <= 255 && host_read(h, a_roots, &mut roots) && host_read(h, a_seed, &mut seed) && blen(seed) == 32 && blen(roots) < 16777216 {
+    match net_connect(h, net_ip4(127, 0, 0, 1), port) {
+      Option::Some(sock) => {
+        code = exchange(con, h, sock, name, roots, seed, now);
+        net_close(h, sock);
+      },
+      Option::None => { print_str(con, "cannot connect\n"); },
+    }
+  } else {
+    print_str(con, "usage: httpsget PORT NAME ROOTS SEED NOW\n");
+  }
+  bfree(seed);
+  bfree(roots);
+  bfree(a_now);
+  bfree(a_seed);
+  bfree(a_roots);
+  bfree(name);
+  bfree(a_port);
+  return code;
+}
+
+/// With no arguments: a ClientHello is made, bytes that are no TLS fail the
+/// connection, and the client refuses to send data before the handshake.
+fn selfcheck(con: &Serial) -> u64 {
+  let random = balloc(32);
+  let session = balloc(32);
+  let key = balloc(32);
+  let name = bfrom("localhost");
+  let mut out = text_new();
+  let mut app = text_new();
+  let mut c = tls13c_new(random, session, key, name, &mut out);
+  let hello_ok = vec_len(out) > 100 && vec_get(out, 0) == 22;
+  let early = bfrom("data");
+  let refused = !tls13c_send(&mut c, early, &mut out);
+  let junk = bfrom("HTTP/1.1 400 Bad Request\r\n\r\n");
+  let roots = balloc(0);
+  let code = tls13c_feed(&mut c, junk, roots, 1800000000, &mut out, &mut app);
+  let failed = code != 0 && tls13c_state(c) == 7;
+  tls13c_free(c);
+  bfree(roots);
+  bfree(junk);
+  bfree(early);
+  vec_free(app);
+  vec_free(out);
+  bfree(name);
+  bfree(key);
+  bfree(session);
+  bfree(random);
+  if hello_ok && refused && failed {
+    print_str(con, "ok\n");
+    return 0;
+  }
+  print_str(con, "self-check failed\n");
+  return 1;
+}
