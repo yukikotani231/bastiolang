@@ -76,7 +76,7 @@ let name = bfrom("a.b");
 let mut bad = 1;
 match dns_query_type(name, 4660, 28) {
   Option::Some(q) => {
-    if blen(q) == 12 + 1 + 1 + 1 + 1 + 1 + 4 && bget(q, 17) == 28 {
+    if blen(q) == 12 + 1 + 1 + 1 + 1 + 1 + 4 && bget(q, 18) == 28 {
       bad = 0;
     }
     bfree(q);
