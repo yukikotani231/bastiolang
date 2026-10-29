@@ -298,51 +298,140 @@ fn https_is_redirect(st: u64) -> bool {
   return st == 301 || st == 302 || st == 303 || st == 307 || st == 308;
 }
 
+/// Internal: a chunked body decoded from data that already holds it: the
+/// body, and the offset just behind the last chunk and its trailers.
+struct HttpsChunks { body: Bytes, end: u64 }
+
+/// Internal: the chunked body that starts at `at` in `raw`, decoded, or
+/// `None` if it is malformed or not all there (the last chunk and the empty
+/// line after its trailers are missing).
+fn https_unchunk(raw: &Bytes, at: u64) -> Option[HttpsChunks]
+  ensures result is Option::Some ==> result.Some.end <= blen(raw) && blen(result.Some.body) <= blen(raw)
+{
+  if at > blen(raw) || blen(raw) > 1073741824 {
+    return Option[HttpsChunks]::None;
+  }
+  let mut out = balloc(0);
+  let mut pos = at;
+  let mut end: u64 = 0;
+  let mut ok = true;
+  let mut done = false;
+  while ok && !done
+    invariant pos <= blen(raw) && blen(out) <= pos && blen(raw) <= 1073741824
+  {
+    match http_chunk(raw, pos) {
+      Chunk::Ok(c) => {
+        if c.next <= pos || c.next > blen(raw) || c.data + c.size > blen(raw) || c.size > blen(raw) - blen(out) || blen(out) + c.size > pos + c.size {
+          ok = false;
+        } else {
+          let piece = bytes_slice(raw, c.data, c.data + c.size);
+          let joined = bytes_concat(out, piece);
+          bfree(piece);
+          bfree(out);
+          out = joined;
+          pos = c.next;
+        }
+      },
+      Chunk::Last(x) => {
+        end = x;
+        done = true;
+      },
+      Chunk::Partial => { ok = false; },
+      Chunk::Bad(x) => { ok = false; },
+    }
+  }
+  if ok && end <= blen(raw) {
+    return Option[HttpsChunks]::Some(HttpsChunks { body: out, end: end });
+  }
+  bfree(out);
+  return Option[HttpsChunks]::None;
+}
+
 /// Internal: how many bytes of the data `raw` (with the final `state` of the
 /// exchange) make up a complete answer, or 0 if it is not: with a
 /// `Content-Length`, the head and that many bytes of body (a cut-off
-/// connection, state 5, is fine then); without one, all the data, but only if
-/// the server ended it with a close_notify (state 6). A `Transfer-Encoding` is
-/// refused (the request is HTTP/1.0, which servers must not chunk).
+/// connection, state 5, is fine then); with a chunked body, up to the end of
+/// its last chunk and trailers (also fine when cut off); without either, all
+/// the data, but only if the server ended it with a close_notify (state 6).
+/// Framing that `http_body` finds ambiguous (both headers, a repeated one,
+/// another transfer coding) is refused.
 fn https_keep(raw: &Bytes, state: u64) -> u64
   ensures result <= blen(raw)
 {
   if (state != 5 && state != 6) || blen(raw) >= 1073741824 { return 0; }
-  match http_body_start(raw) {
-    Option::None => { return 0; },
-    Option::Some(at) => {
-      if at > blen(raw) || https_has(raw, "transfer-encoding") { return 0; }
-      match http_header(raw, "content-length") {
-        Option::Some(v) => {
-          let mut keep = 0;
-          match parse_u64(v, 0, blen(v)) {
-            Option::Some(want) => {
-              if want <= blen(raw) - at { keep = at + want; }
-            },
-            Option::None => {},
-          }
-          bfree(v);
-          return keep;
+  match http_parse_response(raw) {
+    RespHead::Ok(q) => {
+      if q.head_end > blen(raw) || q.fields > blen(raw) { return 0; }
+      match http_body(raw, q.fields) {
+        Body::Length(want) => {
+          if want <= blen(raw) - q.head_end { return q.head_end + want; }
+          return 0;
         },
-        Option::None => {
+        Body::Chunked => {
+          match https_unchunk(raw, q.head_end) {
+            Option::Some(c) => {
+              bfree(c.body);
+              return c.end;
+            },
+            Option::None => { return 0; },
+          }
+        },
+        Body::None => {
           if state == 6 { return blen(raw); }
           return 0;
         },
+        Body::Bad(x) => { return 0; },
       }
     },
+    RespHead::Partial => { return 0; },
+    RespHead::Bad(x) => { return 0; },
   }
 }
 
-/// Internal: the complete answer in `r` (see `https_keep`). Frees `r`.
+/// Internal: the complete answer in `r` (see `https_keep`); a chunked body is
+/// replaced by its decoded data. Frees `r`.
 fn https_complete(r: HttpsResult) -> Option[Bytes] {
   let keep = https_keep(r.data, r.state);
   if keep == 0 {
     bfree(r.data);
     return Option[Bytes]::None;
   }
-  let out = bytes_slice(r.data, 0, keep);
+  let whole = bytes_slice(r.data, 0, keep);
   bfree(r.data);
-  return Option[Bytes]::Some(out);
+  if blen(whole) >= 1073741824 {
+    bfree(whole);
+    return Option[Bytes]::None;
+  }
+  match http_parse_response(whole) {
+    RespHead::Ok(q) => {
+      if q.head_end <= blen(whole) && q.fields <= blen(whole) {
+        match http_body(whole, q.fields) {
+          Body::Chunked => {
+            match https_unchunk(whole, q.head_end) {
+              Option::Some(c) => {
+                let lead = bytes_slice(whole, 0, q.head_end);
+                bfree(whole);
+                let both = bytes_concat(lead, c.body);
+                bfree(lead);
+                bfree(c.body);
+                return Option[Bytes]::Some(both);
+              },
+              Option::None => {
+                bfree(whole);
+                return Option[Bytes]::None;
+              },
+            }
+          },
+          Body::Length(x) => {},
+          Body::None => {},
+          Body::Bad(x) => {},
+        }
+      }
+    },
+    RespHead::Partial => {},
+    RespHead::Bad(x) => {},
+  }
+  return Option[Bytes]::Some(whole);
 }
 
 /// Internal: does the head of `m` have the header `name`?
@@ -363,7 +452,7 @@ fn https_step(h: &Host, u: &HttpsUrl, roots: &Bytes) -> Option[Bytes]
       let mut t = text_new();
       text_push_str(&mut t, "GET ");
       text_push_bytes(&mut t, u.path);
-      text_push_str(&mut t, " HTTP/1.0\r\nHost: ");
+      text_push_str(&mut t, " HTTP/1.1\r\nHost: ");
       text_push_bytes(&mut t, u.host);
       if u.port != 443 {
         text_push_str(&mut t, ":");
@@ -405,8 +494,8 @@ fn https_redirect(raw: &Bytes, u: &HttpsUrl) -> Option[HttpsUrl]
 
 /// Fetches the `https://` URL `url`: looks the host up, connects, checks the
 /// server against `roots` and returns the status and body of the answer
-/// (HTTP/1.0 with the connection closed after it, so the body is everything
-/// behind the head). A redirect (301, 302, 303, 307, 308) to a path on the
+/// (HTTP/1.1 with the connection closed after it; the body is the data behind
+/// the head, with a chunked body decoded). A redirect (301, 302, 303, 307, 308) to a path on the
 /// same server or to another `https://` URL is followed, at most `redirects`
 /// times; a redirect to anything else (plain `http://`, another scheme) is
 /// not followed and its answer is returned as it is. `None` if the URL is

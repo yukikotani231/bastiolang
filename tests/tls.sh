@@ -169,6 +169,18 @@ class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def do_GET(self):
         p, hdr, code, body = self.path, [], 200, b'hello'
+        raw = {
+            '/chunked': b'5;x=y\r\nhello\r\n7\r\n, world\r\n0\r\nT: v\r\n\r\n',
+            '/chunkedcut': b'5\r\nhello\r\n',
+            '/chunkedbad': b'zz\r\nhello\r\n0\r\n\r\n',
+            '/chunkedone': b'1\r\nA\r\n0\r\n\r\n',
+        }
+        if p in raw:
+            self.wfile.write(b'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n' + raw[p])
+            return
+        if p == '/both':
+            self.wfile.write(b'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n5\r\nhello\r\n0\r\n\r\n')
+            return
         def to(loc, c=302):
             return c, [('Location', loc)], b'moved'
         if p == '/r1': code, hdr, body = to('/ok')
@@ -215,6 +227,11 @@ PY
   fetch "fetch: query string" "$base/echo?a=b&c=d#frag" ec.roots 0 "/echo?a=b&c=d"
   fetch "fetch: cut off with no Content-Length (no close_notify) is refused" "$base/nolen" ec.roots 1 "no answer"
   fetch "fetch: fewer bytes than Content-Length is refused" "$base/short" ec.roots 1 "no answer"
+  fetch "fetch: chunked body, with an extension and a trailer" "$base/chunked" ec.roots 0 "hello, world"
+  fetch "fetch: chunked body of one chunk" "$base/chunkedone" ec.roots 0 "status 200"
+  fetch "fetch: chunked body without its last chunk is refused" "$base/chunkedcut" ec.roots 1 "no answer"
+  fetch "fetch: malformed chunk size is refused" "$base/chunkedbad" ec.roots 1 "no answer"
+  fetch "fetch: Transfer-Encoding with Content-Length is refused" "$base/both" ec.roots 1 "no answer"
   fetch "fetch: untrusted root" "$base/ok" other.roots 1 "no answer"
   fetch "fetch: address where the certificate has a name" "https://127.0.0.1:$port/ok" ec.roots 1 "no answer"
   fetch "fetch: not an https URL" "http://localhost:$port/ok" ec.roots 1 "no answer"
