@@ -15,6 +15,8 @@ What will be 0.2.0.
 
 ### Tools
 
+- TLS 1.3 chains with SHA-384 and SHA-512 and the curve P-384: `core/sha512` gains `sha384`; new `core/p384` (`ecdsa_p384_verify`, `ecdsa_p384_verify_digest`, built like `core/p256`); `core/p256` gains `ecdsa_p256_verify_digest` (a digest from any hash); `core/rsa` gains `rsa_pkcs1_verify` and `rsa_pss_verify` taking the hash length (32, 48 or 64); `core/x509` reads sha384/sha512WithRSAEncryption, ecdsa-with-SHA384/512 and P-384 keys; the client offers and checks ecdsa_secp384r1_sha384 and rsa_pss_rsae_sha384. The cipher suites are unchanged (SHA-384 suites are not done).
+
 - `host_net` operation 2 takes a time limit in the bits of `b` above the port (`std/net`'s `net_connect_timeout`): a connect that does not finish in time fails, and reads and sends on that socket give up after the same time. `dns_lookup` and `https_fetch` use it. Windows ignores the limit.
 
 - `tools/bastiofmt`: a source formatter written in Bastio (`bastiofmt file.bastio`,

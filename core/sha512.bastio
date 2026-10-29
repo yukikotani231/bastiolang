@@ -1,7 +1,7 @@
-// core/sha512.bastio: SHA-512 (FIPS 180-4).
+// core/sha512.bastio: SHA-512 and SHA-384 (FIPS 180-4).
 //
 // What is proved: every access is in bounds, nothing leaks, and a digest is
-// 64 bytes. Not proved: that the digest is SHA-512's (the tests check the
+// 64 bytes (48 for SHA-384). Not proved: that the digest is SHA-512's or SHA-384's (the tests check the
 // FIPS 180-4 vectors, the block-boundary lengths 111, 112, 127, 128 and 129,
 // and a million `a`s), or that the code takes the same time for
 // every input (it does not branch on its data, but nothing checks that).
@@ -164,18 +164,9 @@ fn sha512_block(h: &mut Vec[u64], k: &Vec[u64], w: &mut Vec[u64], m: &Bytes, at:
   vec_set(&mut h, 7, wrap_add(vec_get(h, 7), hh));
 }
 
-/// The SHA-512 digest of `m`: 64 bytes.
-/// ```
-/// let m = bfrom("abc");
-/// let d = sha512(m);
-/// let first = bget(d, 0);          // dd af 35 a1 ... a5 4c
-/// let last = bget(d, 63);
-/// let n = blen(d);
-/// bfree(d);
-/// bfree(m);
-/// if n != 64 || first != 221 || last != 159 { return 1; }
-/// ```
-fn sha512(m: &Bytes) -> Bytes
+/// Internal: the digest of `m` with the SHA-512 initial values, or with the
+/// SHA-384 ones when `small` (the caller keeps 48 bytes).
+fn sha512_run(m: &Bytes, small: bool) -> Bytes
   ensures blen(result) == 64
 {
   let n = blen(m);
@@ -189,14 +180,25 @@ fn sha512(m: &Bytes) -> Bytes
     vec_push(&mut w, 0);
     i = i + 1;
   }
-  vec_push(&mut h, 7640891576956012808);
-  vec_push(&mut h, 13503953896175478587);
-  vec_push(&mut h, 4354685564936845355);
-  vec_push(&mut h, 11912009170470909681);
-  vec_push(&mut h, 5840696475078001361);
-  vec_push(&mut h, 11170449401992604703);
-  vec_push(&mut h, 2270897969802886507);
-  vec_push(&mut h, 6620516959819538809);
+  if small {
+    vec_push(&mut h, 14680500436340154072);
+    vec_push(&mut h, 7105036623409894663);
+    vec_push(&mut h, 10473403895298186519);
+    vec_push(&mut h, 1526699215303891257);
+    vec_push(&mut h, 7436329637833083697);
+    vec_push(&mut h, 10282925794625328401);
+    vec_push(&mut h, 15784041429090275239);
+    vec_push(&mut h, 5167115440072839076);
+  } else {
+    vec_push(&mut h, 7640891576956012808);
+    vec_push(&mut h, 13503953896175478587);
+    vec_push(&mut h, 4354685564936845355);
+    vec_push(&mut h, 11912009170470909681);
+    vec_push(&mut h, 5840696475078001361);
+    vec_push(&mut h, 11170449401992604703);
+    vec_push(&mut h, 2270897969802886507);
+    vec_push(&mut h, 6620516959819538809);
+  }
   // The whole blocks straight from the message.
   let whole = n / 128 * 128;
   let mut at = 0;
@@ -233,5 +235,45 @@ fn sha512(m: &Bytes) -> Bytes
   vec_free(k);
   vec_free(w);
   vec_free(h);
+  return out;
+}
+
+
+/// The SHA-512 digest of `m`: 64 bytes.
+/// ```
+/// let m = bfrom("abc");
+/// let d = sha512(m);
+/// let first = bget(d, 0);          // dd af 35 a1 ... a5 4c
+/// let last = bget(d, 63);
+/// let n = blen(d);
+/// bfree(d);
+/// bfree(m);
+/// if n != 64 || first != 221 || last != 159 { return 1; }
+/// ```
+fn sha512(m: &Bytes) -> Bytes
+  ensures blen(result) == 64
+{
+  return sha512_run(m, false);
+}
+
+/// The SHA-384 digest of `m`: 48 bytes (SHA-512 with other initial values,
+/// cut to 384 bits).
+/// ```
+/// let m = bfrom("abc");
+/// let d = sha384(m);
+/// let first = bget(d, 0);          // cb 00 75 3f ... a7
+/// let last = bget(d, 47);
+/// let n = blen(d);
+/// bfree(d);
+/// bfree(m);
+/// if n != 48 || first != 203 || last != 167 { return 1; }
+/// ```
+fn sha384(m: &Bytes) -> Bytes
+  ensures blen(result) == 48
+{
+  let full = sha512_run(m, true);
+  let mut out = balloc(48);
+  bytes_copy_span(&mut out, 0, full, 0, 48);
+  bfree(full);
   return out;
 }

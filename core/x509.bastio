@@ -5,28 +5,35 @@
 // certificate holds lies inside the bytes it was read from. What is read: the
 // signed part, the signature, the issuer and subject names (as the bytes of
 // their DER, to be compared as bytes), the validity times, the public key
-// (RSA, ECDSA P-256 or Ed25519), and the extensions basicConstraints,
+// (RSA, ECDSA P-256, ECDSA P-384 or Ed25519), and the extensions basicConstraints,
 // keyUsage and subjectAltName. A critical extension of any other kind makes
 // the certificate unreadable, as RFC 5280 requires. The signature algorithms
-// are sha256WithRSAEncryption, ecdsa-with-SHA256 and Ed25519. Not proved:
+// are sha256, sha384 and sha512WithRSAEncryption, ecdsa-with-SHA256,
+// ecdsa-with-SHA384 and ecdsa-with-SHA512 (on either curve) and Ed25519. Not proved:
 // that a certificate accepted here is a valid one; the tests check
 // certificates made by OpenSSL, and that damaged ones, other signers and
 // other names are refused. Not done: certificate policies, name constraints,
-// revocation, SHA-384 and SHA-512 signatures and the curve P-384.
+// revocation, and the curves other than P-256 and P-384.
 import "bytes.bastio";
 import "der.bastio";
 import "ed25519.bastio";
 import "option.bastio";
 import "p256.bastio";
+import "p384.bastio";
 import "rsa.bastio";
+import "sha256.bastio";
+import "sha512.bastio";
 
 /// A certificate read from some bytes. Every span is a range of those bytes.
 /// `tbs` is the signed part including its header; `sig_kind` the signature
-/// algorithm (1 sha256WithRSAEncryption, 2 ecdsa-with-SHA256, 3 Ed25519) and
+/// algorithm (1 sha256WithRSAEncryption, 2 ecdsa-with-SHA256, 3 Ed25519,
+/// 4 sha384WithRSAEncryption, 5 sha512WithRSAEncryption, 6 ecdsa-with-SHA384,
+/// 7 ecdsa-with-SHA512) and
 /// `sig` the signature; `issuer` and `subject` are the DER of the names;
 /// `not_before` and `not_after` are in seconds since 1970; `key_kind` the key
-/// (1 RSA, 2 ECDSA P-256, 3 Ed25519), for RSA `key_a` the modulus and `key_b`
-/// the exponent, for the others `key_a` the key (65 or 32 bytes). `key_usage`
+/// (1 RSA, 2 ECDSA P-256, 3 Ed25519, 4 ECDSA P-384), for RSA `key_a` the
+/// modulus and `key_b` the exponent, for the others `key_a` the key (65, 32
+/// or 97 bytes). `key_usage`
 /// is the first byte of the keyUsage bits (digitalSignature 128, keyCertSign
 /// 4) or 65535 when the extension is missing; `is_ca` is the cA flag of
 /// basicConstraints; `san` the subjectAltName's list of names, if `has_san`.
@@ -167,14 +174,26 @@ fn x509_sig_kind(b: &Bytes, alg: Span) -> u64
   let oid = x509_item(b, alg.start, alg.end);
   if oid.tag != 6 { return 0; }
   let rest = oid.content.end;
-  if x509_is(b, oid, "2a864886f70d01010b") {
+  if x509_is(b, oid, "2a864886f70d01010b") || x509_is(b, oid, "2a864886f70d01010c") || x509_is(b, oid, "2a864886f70d01010d") {
     // The parameters are NULL.
     let p = x509_item(b, rest, alg.end);
-    if p.tag == 5 && p.content.end == p.content.start && p.content.end == alg.end { return 1; }
+    if p.tag == 5 && p.content.end == p.content.start && p.content.end == alg.end {
+      if x509_is(b, oid, "2a864886f70d01010c") { return 4; }
+      if x509_is(b, oid, "2a864886f70d01010d") { return 5; }
+      return 1;
+    }
     return 0;
   }
   if x509_is(b, oid, "2a8648ce3d040302") {
     if rest == alg.end { return 2; }
+    return 0;
+  }
+  if x509_is(b, oid, "2a8648ce3d040303") {
+    if rest == alg.end { return 6; }
+    return 0;
+  }
+  if x509_is(b, oid, "2a8648ce3d040304") {
+    if rest == alg.end { return 7; }
     return 0;
   }
   if x509_is(b, oid, "2b6570") {
@@ -222,11 +241,18 @@ fn x509_key(b: &Bytes, spki: Span) -> X509Key
     return X509Key { kind: 1, a: n.content, b: e.content };
   }
   if x509_is(b, oid, "2a8648ce3d0201") {
-    // id-ecPublicKey with the named curve prime256v1; the key is an uncompressed point.
+    // id-ecPublicKey with the named curve prime256v1 or secp384r1; the key is an uncompressed point.
     let c = x509_item(b, oid.content.end, alg.content.end);
-    if c.tag != 6 || c.content.end != alg.content.end || !x509_is(b, c, "2a8648ce3d030107") { return x509_no_key(); }
-    if key.end - key.start != 65 || bget(b, key.start) != 4 { return x509_no_key(); }
-    return X509Key { kind: 2, a: key, b: Span { start: key.end, end: key.end } };
+    if c.tag != 6 || c.content.end != alg.content.end { return x509_no_key(); }
+    if x509_is(b, c, "2a8648ce3d030107") {
+      if key.end - key.start != 65 || bget(b, key.start) != 4 { return x509_no_key(); }
+      return X509Key { kind: 2, a: key, b: Span { start: key.end, end: key.end } };
+    }
+    if x509_is(b, c, "2b81040022") {
+      if key.end - key.start != 97 || bget(b, key.start) != 4 { return x509_no_key(); }
+      return X509Key { kind: 4, a: key, b: Span { start: key.end, end: key.end } };
+    }
+    return x509_no_key();
   }
   if x509_is(b, oid, "2b6570") {
     if oid.content.end != alg.content.end || key.end - key.start != 32 { return x509_no_key(); }
@@ -432,6 +458,17 @@ fn x509_parse(b: &Bytes) -> Option[X509]
   });
 }
 
+/// Internal: whether a signature algorithm (`sig_kind` of `X509`) can be made
+/// with a key (`key_kind`): RSA signatures need an RSA key, ECDSA ones a P-256
+/// or P-384 key (the hash is independent of the curve), Ed25519 an Ed25519
+/// key.
+fn x509_sig_fits(sig_kind: u64, key_kind: u64) -> bool {
+  if sig_kind == 1 || sig_kind == 4 || sig_kind == 5 { return key_kind == 1; }
+  if sig_kind == 2 || sig_kind == 6 || sig_kind == 7 { return key_kind == 2 || key_kind == 4; }
+  if sig_kind == 3 { return key_kind == 3; }
+  return false;
+}
+
 /// Whether `c`, read from `cb`, was signed by the holder of the key of
 /// `issuer`, read from `ib`: the signature algorithm and the key must agree,
 /// the issuer name of `c` must be the subject name of `issuer` byte for byte,
@@ -454,17 +491,31 @@ fn x509_signed_by(cb: &Bytes, c: X509, ib: &Bytes, issuer: X509) -> bool
 {
   if c.issuer.end - c.issuer.start != issuer.subject.end - issuer.subject.start { return false; }
   if !bytes_span_eq(cb, c.issuer.start, ib, issuer.subject.start, c.issuer.end - c.issuer.start) { return false; }
-  if c.sig_kind != issuer.key_kind { return false; }
+  if !x509_sig_fits(c.sig_kind, issuer.key_kind) { return false; }
   let msg = bytes_slice(cb, c.tbs.start, c.tbs.end);
   let sig = bytes_slice(cb, c.sig.start, c.sig.end);
   let ka = bytes_slice(ib, issuer.key_a.start, issuer.key_a.end);
   let kb = bytes_slice(ib, issuer.key_b.start, issuer.key_b.end);
   let mut ok = false;
-  if c.sig_kind == 1 && blen(ka) < 65536 && blen(kb) < 65536 && blen(sig) < 65536 {
-    ok = rsa_pkcs1_sha256_verify(ka, kb, msg, sig);
+  if (c.sig_kind == 1 || c.sig_kind == 4 || c.sig_kind == 5) && blen(ka) < 65536 && blen(kb) < 65536 && blen(sig) < 65536 {
+    let mut hl = 32;
+    if c.sig_kind == 4 { hl = 48; }
+    if c.sig_kind == 5 { hl = 64; }
+    ok = rsa_pkcs1_verify(ka, kb, msg, sig, hl);
   }
-  if c.sig_kind == 2 && blen(sig) < 65536 {
-    ok = ecdsa_p256_verify(ka, msg, sig);
+  if (c.sig_kind == 2 || c.sig_kind == 6 || c.sig_kind == 7) && blen(sig) < 65536 && blen(msg) < 274877906944 {
+    let mut digest = sha256(msg);
+    if c.sig_kind == 6 {
+      bfree(digest);
+      digest = sha384(msg);
+    }
+    if c.sig_kind == 7 {
+      bfree(digest);
+      digest = sha512(msg);
+    }
+    if issuer.key_kind == 2 { ok = ecdsa_p256_verify_digest(ka, digest, sig); }
+    if issuer.key_kind == 4 { ok = ecdsa_p384_verify_digest(ka, digest, sig); }
+    bfree(digest);
   }
   if c.sig_kind == 3 && blen(ka) == 32 && blen(sig) == 64 && blen(msg) < 1000000000 {
     ok = ed25519_verify(ka, msg, sig);

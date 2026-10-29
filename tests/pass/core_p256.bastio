@@ -211,8 +211,37 @@ fn tamper() -> u64
   return tamper_sig("040a08c6f5a506af89ca941f883c7eee4c9c0e05e262b5ce85b8d6645b2d7a40bc1cffcdd293942aad2b07b27ded7dcdc09364803a1d530a8c119632b4e452d7ba", "61", "3045022100929249d495613b320b3117d34cf2fc585e0f4da0fc9419ec38aee9a0dc375b8002205cead038fb469b61ed9856483c3bb9da38db3307a317e969796530ed907044c1") + tamper_key("040a08c6f5a506af89ca941f883c7eee4c9c0e05e262b5ce85b8d6645b2d7a40bc1cffcdd293942aad2b07b27ded7dcdc09364803a1d530a8c119632b4e452d7ba", "61", "3045022100929249d495613b320b3117d34cf2fc585e0f4da0fc9419ec38aee9a0dc375b8002205cead038fb469b61ed9856483c3bb9da38db3307a317e969796530ed907044c1") + tamper_msg("040a08c6f5a506af89ca941f883c7eee4c9c0e05e262b5ce85b8d6645b2d7a40bc1cffcdd293942aad2b07b27ded7dcdc09364803a1d530a8c119632b4e452d7ba", "61", "3045022100929249d495613b320b3117d34cf2fc585e0f4da0fc9419ec38aee9a0dc375b8002205cead038fb469b61ed9856483c3bb9da38db3307a317e969796530ed907044c1");
 }
 
+/// 1 unless the signature `sig` under `pubkey` of the message whose digest is `digest` (all in hex) verifies.
+fn good_digest(pubkey: Str, digest: Str, sig: Str) -> u64
+  requires slen(pubkey) == 130 && slen(digest) < 1000 && slen(sig) < 400
+  ensures result <= 1
+{
+  let p = unhex(pubkey);
+  let d = unhex(digest);
+  let s = unhex(sig);
+  let ok = ecdsa_p256_verify_digest(p, d, s);
+  bfree(s);
+  bfree(d);
+  bfree(p);
+  if ok { return 0; }
+  return 1;
+}
+
+/// Signatures made with another hash than the curve's own (the leftmost bits
+/// of a longer digest, a shorter one padded with zeros).
+fn other_hashes() -> u64
+  ensures result <= 4
+{
+  return 0
+    + good_digest("0469fc794ae7975962d5c8e57e64c94938238c8da56ae5aa8c778e28e99456c2b11ea1538e83b759cf24ab8653e2828933bbe339c60ca53d6aa4dd4e63fdcfa7fa", "f525073467a9dd43312169cf87daf4b09d72103c2e239ec42d961cbee6ebf477ea7c35266b2bff5023bc88df0d03ce6e", "3045022020d2bb1c115e6aa67572d94ab89aca95e8788f8bfa4bf562193dfc699e832121022100d579fdb5a72b494982d3fbe4b7c8240e670ec86c448a0cc5645c54fcdefe1c80")
+    + good_digest("04ca2d511e44650fff4f3ffd939e0bc5f4d5781768b6b5c99c3ba6486d6ff35428c40e2baa29b1be2e39df26c391b04b39fcef568c049e11174f04ad2f73827910", "311d3f6fee36245df3fbc9eef5dcafb7e364e9de5e720e6a8db69d410a2181bc42520abb0764dac899337968dba40ff296b027d11d0625436d5194412b0aac2f", "304402200704e922a936501adce57cdaa4f735ad859539d87744c41e3a4fbede096c4e40022071a7d1d20d8deb2f248624108bb9eb9b81a8f97b64d51c5403e7dd31002b94f8")
+    + good_digest("042a173640560a615e15f368f1dd3079f45a91796dd3234ad5a9d27faefc2cc08f97aed70af2c6a8b5d837ca713903fad432371e9d0fe3892c1a5a31ba8876e94d", "aad9a74f487dfccef6f80cfae921f559edf9ab9b9246686cbd32a9825325639f", "3045022059e24f7d3950c74d37aee5354f994148a998721a3e49e01a7e008c9e8b665a830221008127216f8459edddde815d6bc68dffef1bdae590837490b8e5a4d73bb150dec5")
+    + (1 - good_digest("04a2844b19808c423a47ec31422ca1a8f84855d083d9008a037fbf3f5d3c66349f532e54e86e6a4338a465ae1417159a9bf802b18be12bddb379aa2ef0e7275e97", "f425073467a9dd43312169cf87daf4b09d72103c2e239ec42d961cbee6ebf477ea7c35266b2bff5023bc88df0d03ce6e", "304502206cc8c091a0f14f251284cebcc026c6f3125fdb9d5253d7bb84e2cfb1de756fc6022100d6fe1c30217eb8e2219de0349281d9e874b35e6f7e44aa099a90c2267f2caae9"))
+  ;
+}
+
 fn main() -> u64 {
-  let n = case0() + case1() + case2() + case3() + case4() + refuse0() + refuse1() + refuse2() + refuse3() + tamper();
+  let n = case0() + case1() + case2() + case3() + case4() + refuse0() + refuse1() + refuse2() + refuse3() + tamper() + other_hashes();
   if n > 0 { return 1; }
   return 0;
 }

@@ -59,16 +59,17 @@ Each module has a reference page, generated from its source: every function with
 | [`core/num.bastio`](lib/core-num.md) | Parsing integers from bytes and formatting them as text. |
 | [`core/option.bastio`](lib/core-option.md) | An optional value, and a span of a byte string. |
 | [`core/p256.bastio`](lib/core-p256.md) | ECDSA signatures over the curve P-256 (secp256r1) with SHA-256, verification only (FIPS 186-4, RFC 6979 is for signing), for the ecdsa_secp256r1_sha256 scheme of TLS 1.3 certificates. |
+| [`core/p384.bastio`](lib/core-p384.md) | ECDSA signatures over the curve P-384 (secp384r1) with SHA-384, verification only (FIPS 186-4, RFC 6979 is for signing), for the ecdsa_secp384r1_sha384 scheme of TLS 1.3 certificates. |
 | [`core/path.bastio`](lib/core-path.md) | File names. |
 | [`core/poly1305.bastio`](lib/core-poly1305.md) | The Poly1305 one-time authenticator (RFC 8439 section 2.5), in the 26-bit-limb form of poly1305-donna. |
 | [`core/print.bastio`](lib/core-print.md) | Writing text and numbers to the serial console. |
 | [`core/ring.bastio`](lib/core-ring.md) | Ring buffers and fixed-capacity FIFO queues. |
 | [`core/rows.bastio`](lib/core-rows.md) | Tables of fixed-size rows in one `Buf`. |
-| [`core/rsa.bastio`](lib/core-rsa.md) | RSA signature verification with SHA-256 (RFC 8017). |
+| [`core/rsa.bastio`](lib/core-rsa.md) | RSA signature verification with SHA-256, SHA-384 and SHA-512 (RFC 8017). |
 | [`core/scan.bastio`](lib/core-scan.md) | Cutting a byte string into pieces. |
 | [`core/set.bastio`](lib/core-set.md) | A set of `u64`, built on core/hashmap.bastio. |
 | [`core/sha256.bastio`](lib/core-sha256.md) | SHA-256 (FIPS 180-4) and HMAC-SHA-256 (RFC 2104). |
-| [`core/sha512.bastio`](lib/core-sha512.md) | SHA-512 (FIPS 180-4). |
+| [`core/sha512.bastio`](lib/core-sha512.md) | SHA-512 and SHA-384 (FIPS 180-4). |
 | [`core/slots.bastio`](lib/core-slots.md) | A growable table of numbered slots, for ids that a program hands out and takes back (process ids, file descriptors, pipe and socket numbers). |
 | [`core/sort.bastio`](lib/core-sort.md) | Sorting and searching vectors of `u64`, and sorting indices by a key. |
 | [`core/spancmp.bastio`](lib/core-spancmp.md) | Comparing two pieces of a text in byte order. |

@@ -699,24 +699,40 @@ fn p256_verify_numbers(qx: &Vec[u64], qy: &Vec[u64], e: &Vec[u64], r: &Vec[u64],
   return ok;
 }
 
-/// Whether `sig` is a valid ECDSA signature of `msg` under the public key
-/// `pubkey`, with the curve P-256 and SHA-256. `pubkey` is the 65 bytes of
-/// an uncompressed point (0x04, x, y) and `sig` the DER encoding of
-/// SEQUENCE { INTEGER r, INTEGER s } that X.509 and TLS use. A key that is
-/// not on the curve, an `r` or `s` outside 1..n-1 and any other encoding are
-/// refused.
+/// Internal: the first 32 bytes of the digest `d` (as a number), or `d`
+/// itself with leading zeros when it is shorter (FIPS 186-4 6.4: a longer
+/// hash is cut to the leftmost bits of the order's length).
+fn p256_hash_number(d: &Bytes) -> Vec[u64]
+  ensures vlen(result) == 16
+{
+  let mut buf = balloc(32);
+  let n = blen(d);
+  if n >= 32 {
+    bytes_copy_span(&mut buf, 0, d, 0, 32);
+  } else {
+    bytes_copy_span(&mut buf, 32 - n, d, 0, n);
+  }
+  let e = bn_from_bytes(buf, 0);
+  bfree(buf);
+  return e;
+}
+
+/// Whether `sig` is a valid ECDSA signature, under the public key `pubkey`
+/// on the curve P-256, of the message whose digest is `digest` (from any
+/// hash: SHA-256, SHA-384 or SHA-512; a digest longer than 32 bytes is cut
+/// to its leftmost 32). Encodings as in `ecdsa_p256_verify`.
 /// ```
 /// let key = balloc(65);
-/// let msg = bfrom("hello");
+/// let digest = balloc(48);
 /// let sig = balloc(8);
-/// let ok = ecdsa_p256_verify(key, msg, sig);
+/// let ok = ecdsa_p256_verify_digest(key, digest, sig);
 /// bfree(sig);
-/// bfree(msg);
+/// bfree(digest);
 /// bfree(key);
 /// if ok { return 1; }
 /// ```
-fn ecdsa_p256_verify(pubkey: &Bytes, msg: &Bytes, sig: &Bytes) -> bool
-  requires blen(msg) < 274877906944 && blen(sig) < 274877906944 && blen(pubkey) < 274877906944
+fn ecdsa_p256_verify_digest(pubkey: &Bytes, digest: &Bytes, sig: &Bytes) -> bool
+  requires blen(digest) < 274877906944 && blen(sig) < 274877906944 && blen(pubkey) < 274877906944
 {
   if blen(pubkey) != 65 || bget(pubkey, 0) != 4 { return false; }
   let n = blen(sig);
@@ -741,8 +757,7 @@ fn ecdsa_p256_verify(pubkey: &Bytes, msg: &Bytes, sig: &Bytes) -> bool
                       return false;
                     },
                     Option::Some(sb) => {
-                      let digest = sha256(msg);
-                      let e = bn_from_bytes(digest, 0);
+                      let e = p256_hash_number(digest);
                       let r = bn_from_bytes(rb, 0);
                       let s = bn_from_bytes(sb, 0);
                       let qx = bn_from_bytes(pubkey, 1);
@@ -753,7 +768,6 @@ fn ecdsa_p256_verify(pubkey: &Bytes, msg: &Bytes, sig: &Bytes) -> bool
                       vec_free(s);
                       vec_free(r);
                       vec_free(e);
-                      bfree(digest);
                       bfree(sb);
                       bfree(rb);
                       return ok;
@@ -767,4 +781,29 @@ fn ecdsa_p256_verify(pubkey: &Bytes, msg: &Bytes, sig: &Bytes) -> bool
       }
     },
   }
+}
+
+/// Whether `sig` is a valid ECDSA signature of `msg` under the public key
+/// `pubkey`, with the curve P-256 and SHA-256. `pubkey` is the 65 bytes of
+/// an uncompressed point (0x04, x, y) and `sig` the DER encoding of
+/// SEQUENCE { INTEGER r, INTEGER s } that X.509 and TLS use. A key that is
+/// not on the curve, an `r` or `s` outside 1..n-1 and any other encoding are
+/// refused.
+/// ```
+/// let key = balloc(65);
+/// let msg = bfrom("hello");
+/// let sig = balloc(8);
+/// let ok = ecdsa_p256_verify(key, msg, sig);
+/// bfree(sig);
+/// bfree(msg);
+/// bfree(key);
+/// if ok { return 1; }
+/// ```
+fn ecdsa_p256_verify(pubkey: &Bytes, msg: &Bytes, sig: &Bytes) -> bool
+  requires blen(msg) < 274877906944 && blen(sig) < 274877906944 && blen(pubkey) < 274877906944
+{
+  let digest = sha256(msg);
+  let ok = ecdsa_p256_verify_digest(pubkey, digest, sig);
+  bfree(digest);
+  return ok;
 }

@@ -8,12 +8,13 @@ its own. The caller reads bytes from a connection and passes them to
 the caller writes to the connection, and the data received from the peer is
 appended to another. So the same code runs over a socket, a pipe or a test.
 
-It speaks one suite, TLS_CHACHA20_POLY1305_SHA256, with X25519, and checks
+It speaks two suites, TLS_AES_128_GCM_SHA256 and TLS_CHACHA20_POLY1305_SHA256, with X25519, and checks
 the server: the certificate chain against the trusted roots the caller
-gives (X.509 with sha256WithRSAEncryption, ecdsa-with-SHA256 and Ed25519
-signatures, validity, host name, CA flags and key usage), the
-CertificateVerify signature (ed25519, ecdsa_secp256r1_sha256 or
-rsa_pss_rsae_sha256) and the Finished message. It sends no client
+gives (X.509 with RSA, ECDSA (P-256 and P-384) and Ed25519 signatures made
+with SHA-256, SHA-384 or SHA-512, validity, host name, CA flags and key
+usage), the CertificateVerify signature (ed25519, ecdsa_secp256r1_sha256,
+ecdsa_secp384r1_sha384, rsa_pss_rsae_sha256 or rsa_pss_rsae_sha384) and
+the Finished message. It sends no client
 certificate, offers no resumption or early data, and accepts a KeyUpdate
 and NewSessionTicket messages.
 
@@ -22,10 +23,10 @@ secrets the state holds always have the lengths the record layer needs.
 Not proved: that the protocol is followed; the tests run a handshake with
 an OpenSSL server (tests/tls.sh) and feed damaged and truncated flights.
 Not done: certificate path length and name constraints, extended key usage
-and revocation checks; SHA-384 suites and certificates; session tickets; a
+and revocation checks; the SHA-384 suite; session tickets; a
 check that the random values are random (the caller supplies them).
 
-`import "core/tls13client.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/endian.bastio](core-endian.md), [core/text.bastio](core-text.md), [core/sha256.bastio](core-sha256.md), [core/hkdf.bastio](core-hkdf.md), [core/tls13.bastio](core-tls13.md), [core/tls13hs.bastio](core-tls13hs.md), [core/aes.bastio](core-aes.md), [core/aesgcm.bastio](core-aesgcm.md), [core/chacha20.bastio](core-chacha20.md), [core/poly1305.bastio](core-poly1305.md), [core/chacha20poly1305.bastio](core-chacha20poly1305.md), [core/tls13record.bastio](core-tls13record.md), [core/x25519.bastio](core-x25519.md), [core/der.bastio](core-der.md), [core/sha512.bastio](core-sha512.md), [core/ed25519.bastio](core-ed25519.md), [core/p256.bastio](core-p256.md), [core/rsa.bastio](core-rsa.md), [core/x509.bastio](core-x509.md).
+`import "core/tls13client.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/endian.bastio](core-endian.md), [core/text.bastio](core-text.md), [core/sha256.bastio](core-sha256.md), [core/hkdf.bastio](core-hkdf.md), [core/tls13.bastio](core-tls13.md), [core/tls13hs.bastio](core-tls13hs.md), [core/aes.bastio](core-aes.md), [core/aesgcm.bastio](core-aesgcm.md), [core/chacha20.bastio](core-chacha20.md), [core/poly1305.bastio](core-poly1305.md), [core/chacha20poly1305.bastio](core-chacha20poly1305.md), [core/tls13record.bastio](core-tls13record.md), [core/x25519.bastio](core-x25519.md), [core/der.bastio](core-der.md), [core/sha512.bastio](core-sha512.md), [core/ed25519.bastio](core-ed25519.md), [core/p256.bastio](core-p256.md), [core/p384.bastio](core-p384.md), [core/rsa.bastio](core-rsa.md), [core/x509.bastio](core-x509.md).
 
 | Function | |
 | --- | --- |

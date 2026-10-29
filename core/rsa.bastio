@@ -1,5 +1,6 @@
-// core/rsa.bastio: RSA signature verification with SHA-256 (RFC 8017): the
-// padding RSASSA-PSS that TLS 1.3 uses in rsa_pss_rsae_sha256 and the older
+// core/rsa.bastio: RSA signature verification with SHA-256, SHA-384 and
+// SHA-512 (RFC 8017): the padding RSASSA-PSS that TLS 1.3 uses in
+// rsa_pss_rsae_sha256 and rsa_pss_rsae_sha384 and the older
 // RSASSA-PKCS1-v1_5 that most certificates are still signed with. Keys of
 // 2048 to 4096 bits.
 //
@@ -15,6 +16,7 @@
 import "bytes.bastio";
 import "option.bastio";
 import "sha256.bastio";
+import "sha512.bastio";
 import "text.bastio";
 
 /// Internal: the number 0 of `l` limbs.
@@ -309,17 +311,28 @@ fn rsa_encode(n: &Bytes, e: &Bytes, sig: &Bytes) -> Option[Bytes]
   return Option[Bytes]::Some(out);
 }
 
-/// Internal: MGF1 with SHA-256 (RFC 8017 appendix B.2.1): `len` bytes made
-/// from `seed`.
-fn rsa_mgf1(seed: &Bytes, len: u64) -> Bytes
-  requires blen(seed) < 65536 && len <= 1024
+/// Internal: the digest of `m` with the hash of `hl` bytes (32: SHA-256,
+/// 48: SHA-384, 64: SHA-512).
+fn rsa_hash(m: &Bytes, hl: u64) -> Bytes
+  requires blen(m) < 274877906944 && (hl == 32 || hl == 48 || hl == 64)
+  ensures blen(result) == hl
+{
+  if hl == 32 { return sha256(m); }
+  if hl == 48 { return sha384(m); }
+  return sha512(m);
+}
+
+/// Internal: MGF1 (RFC 8017 appendix B.2.1) with the hash of `hl` bytes:
+/// `len` bytes made from `seed`.
+fn rsa_mgf1(seed: &Bytes, len: u64, hl: u64) -> Bytes
+  requires blen(seed) < 65536 && len <= 1024 && (hl == 32 || hl == 48 || hl == 64)
   ensures blen(result) == len
 {
   let mut out = balloc(len);
   let mut counter = 0;
   let mut at = 0;
   while at < len
-    invariant at <= len + 31 && blen(out) == len && counter <= 33 && at == 32 * counter
+    invariant at <= len + 63 && blen(out) == len && counter <= 33 && 32 * counter <= at && (hl == 32 || hl == 48 || hl == 64)
   {
     let mut t = text_new();
     text_push_bytes(&mut t, seed);
@@ -328,17 +341,17 @@ fn rsa_mgf1(seed: &Bytes, len: u64) -> Bytes
     text_push(&mut t, cast[u8](counter / 256));
     text_push(&mut t, cast[u8](counter % 256));
     let block = text_finish(t);
-    let h = sha256(block);
+    let h = rsa_hash(block, hl);
     let mut j = 0;
-    while j < 32 && at + j < len
-      invariant j <= 32 && at + j <= len && blen(out) == len && blen(h) == 32
+    while j < hl && at + j < len
+      invariant j <= hl && at + j <= len && blen(out) == len && blen(h) == hl
     {
       bset(&mut out, at + j, bget(h, j));
       j = j + 1;
     }
     bfree(h);
     bfree(block);
-    at = at + 32;
+    at = at + hl;
     counter = counter + 1;
   }
   return out;
@@ -346,23 +359,26 @@ fn rsa_mgf1(seed: &Bytes, len: u64) -> Bytes
 
 /// Whether `sig` is a valid RSASSA-PSS signature of `msg` under the key
 /// (`n`, `e`) (both big-endian, `n` of 2048 to 4096 bits, `e` odd and below
-/// 2^32), with SHA-256, MGF1 with SHA-256 and a salt of 32 bytes: the
-/// rsa_pss_rsae_sha256 scheme of TLS 1.3.
+/// 2^32), with the hash of `hl` bytes (32: SHA-256, 48: SHA-384, 64:
+/// SHA-512), MGF1 with the same hash and a salt of `hl` bytes: the
+/// rsa_pss_rsae_sha256, rsa_pss_rsae_sha384 and rsa_pss_rsae_sha512 schemes
+/// of TLS 1.3. Any other `hl` is refused.
 /// ```
 /// let n = balloc(256);
 /// let e = bfrom("");
 /// let msg = bfrom("hello");
 /// let sig = balloc(256);
-/// let ok = rsa_pss_sha256_verify(n, e, msg, sig);
+/// let ok = rsa_pss_verify(n, e, msg, sig, 48);
 /// bfree(sig);
 /// bfree(msg);
 /// bfree(e);
 /// bfree(n);
 /// if ok { return 1; }
 /// ```
-fn rsa_pss_sha256_verify(n: &Bytes, e: &Bytes, msg: &Bytes, sig: &Bytes) -> bool
+fn rsa_pss_verify(n: &Bytes, e: &Bytes, msg: &Bytes, sig: &Bytes, hl: u64) -> bool
   requires blen(n) < 65536 && blen(e) < 65536 && blen(sig) < 65536 && blen(msg) < 274877906944
 {
+  if hl != 32 && hl != 48 && hl != 64 { return false; }
   match rsa_encode(n, e, sig) {
     Option::None => { return false; },
     Option::Some(em_full) => {
@@ -389,7 +405,7 @@ fn rsa_pss_sha256_verify(n: &Bytes, e: &Bytes, msg: &Bytes, sig: &Bytes) -> bool
       let mod_bits = 8 * (k - 1) + topbits;
       let em_bits = mod_bits - 1;
       let em_len = (em_bits + 7) / 8;
-      if em_len + 1 < k || em_len > k || em_len < 66 {
+      if em_len + 1 < k || em_len > k || em_len < 2 * hl + 2 {
         bfree(em_full);
         return false;
       }
@@ -401,7 +417,7 @@ fn rsa_pss_sha256_verify(n: &Bytes, e: &Bytes, msg: &Bytes, sig: &Bytes) -> bool
       }
       let em = bytes_slice(em_full, skip, k);
       bfree(em_full);
-      let db_len = em_len - 33;
+      let db_len = em_len - hl - 1;
       let mut ok = bget(em, em_len - 1) == 188;
       let mask_bits = 8 * em_len - em_bits;
       // The leftmost bits of the first byte are 0.
@@ -410,7 +426,7 @@ fn rsa_pss_sha256_verify(n: &Bytes, e: &Bytes, msg: &Bytes, sig: &Bytes) -> bool
       if ok {
         let masked = bytes_slice(em, 0, db_len);
         let hash = bytes_slice(em, db_len, em_len - 1);
-        let mask = rsa_mgf1(hash, db_len);
+        let mask = rsa_mgf1(hash, db_len, hl);
         let mut j = 0;
         let mut db = balloc(db_len);
         while j < db_len
@@ -423,11 +439,11 @@ fn rsa_pss_sha256_verify(n: &Bytes, e: &Bytes, msg: &Bytes, sig: &Bytes) -> bool
           // Clear the leftmost bits.
           bset(&mut db, 0, bget(db, 0) & cast[u8](255 >> mask_bits));
         }
-        // The padding is zeros and a 1, then the 32-byte salt.
-        let pad_len = db_len - 33;
+        // The padding is zeros and a 1, then the salt of `hl` bytes.
+        let pad_len = db_len - hl - 1;
         j = 0;
         while j < pad_len
-          invariant j <= pad_len && pad_len == db_len - 33 && blen(db) == db_len
+          invariant j <= pad_len && pad_len == db_len - hl - 1 && blen(db) == db_len
         {
           if bget(db, j) != 0 { ok = false; }
           j = j + 1;
@@ -435,7 +451,7 @@ fn rsa_pss_sha256_verify(n: &Bytes, e: &Bytes, msg: &Bytes, sig: &Bytes) -> bool
         if bget(db, pad_len) != 1 { ok = false; }
         if ok {
           let salt = bytes_slice(db, pad_len + 1, db_len);
-          let mhash = sha256(msg);
+          let mhash = rsa_hash(msg, hl);
           let mut t = text_new();
           let mut z = 0;
           while z < 8
@@ -447,7 +463,7 @@ fn rsa_pss_sha256_verify(n: &Bytes, e: &Bytes, msg: &Bytes, sig: &Bytes) -> bool
           text_push_bytes(&mut t, mhash);
           text_push_bytes(&mut t, salt);
           let mprime = text_finish(t);
-          let check = sha256(mprime);
+          let check = rsa_hash(mprime, hl);
           if !bytes_eq(check, hash) { ok = false; }
           bfree(check);
           bfree(mprime);
@@ -465,11 +481,99 @@ fn rsa_pss_sha256_verify(n: &Bytes, e: &Bytes, msg: &Bytes, sig: &Bytes) -> bool
   }
 }
 
+/// Whether `sig` is a valid RSASSA-PSS signature of `msg` under the key
+/// (`n`, `e`) with SHA-256, MGF1 with SHA-256 and a salt of 32 bytes: the
+/// rsa_pss_rsae_sha256 scheme of TLS 1.3 (`rsa_pss_verify` with 32).
+/// ```
+/// let n = balloc(256);
+/// let e = bfrom("");
+/// let msg = bfrom("hello");
+/// let sig = balloc(256);
+/// let ok = rsa_pss_sha256_verify(n, e, msg, sig);
+/// bfree(sig);
+/// bfree(msg);
+/// bfree(e);
+/// bfree(n);
+/// if ok { return 1; }
+/// ```
+fn rsa_pss_sha256_verify(n: &Bytes, e: &Bytes, msg: &Bytes, sig: &Bytes) -> bool
+  requires blen(n) < 65536 && blen(e) < 65536 && blen(sig) < 65536 && blen(msg) < 274877906944
+{
+  return rsa_pss_verify(n, e, msg, sig, 32);
+}
+
 /// Whether `sig` is a valid RSASSA-PKCS1-v1_5 signature of `msg` under the
 /// key (`n`, `e`) (both big-endian, `n` of 2048 to 4096 bits, `e` odd and
-/// below 2^32), with SHA-256: the padding of sha256WithRSAEncryption, as most
-/// certificates are signed. The padding must be exactly 0x00 0x01, 0xff
-/// bytes (at least 8), 0x00 and the DigestInfo of the hash.
+/// below 2^32), with the hash of `hl` bytes (32: SHA-256, 48: SHA-384, 64:
+/// SHA-512): the padding of sha256WithRSAEncryption and its siblings, as
+/// most certificates are signed. The padding must be exactly 0x00 0x01, 0xff
+/// bytes (at least 8), 0x00 and the DigestInfo of the hash. Any other `hl`
+/// is refused.
+/// ```
+/// let n = balloc(256);
+/// let e = bfrom("");
+/// let msg = bfrom("hello");
+/// let sig = balloc(256);
+/// let ok = rsa_pkcs1_verify(n, e, msg, sig, 48);
+/// bfree(sig);
+/// bfree(msg);
+/// bfree(e);
+/// bfree(n);
+/// if ok { return 1; }
+/// ```
+fn rsa_pkcs1_verify(n: &Bytes, e: &Bytes, msg: &Bytes, sig: &Bytes, hl: u64) -> bool
+  requires blen(n) < 65536 && blen(e) < 65536 && blen(sig) < 65536 && blen(msg) < 274877906944
+{
+  if hl != 32 && hl != 48 && hl != 64 { return false; }
+  match rsa_encode(n, e, sig) {
+    Option::None => { return false; },
+    Option::Some(em) => {
+      let k = blen(em);
+      let mhash = rsa_hash(msg, hl);
+      // DigestInfo: 30 (hl+17) 30 0d 06 09 60 86 48 01 65 03 04 02 (01, 02 or 03) 05 00 04 hl || hash.
+      let mut prefix = "3031300d060960864801650304020105000420";
+      if hl == 48 { prefix = "3041300d060960864801650304020205000430"; }
+      if hl == 64 { prefix = "3051300d060960864801650304020305000440"; }
+      let t_len = 19 + hl;
+      let mut ok = k >= t_len + 11;
+      if ok {
+        ok = bget(em, 0) == 0 && bget(em, 1) == 1;
+        let ps_end = k - t_len - 1;
+        let mut i = 2;
+        while i < ps_end
+          invariant i <= ps_end && ps_end == k - t_len - 1 && k == blen(em)
+        {
+          if bget(em, i) != 255 { ok = false; }
+          i = i + 1;
+        }
+        if bget(em, ps_end) != 0 { ok = false; }
+        let mut j = 0;
+        while j < 19
+          invariant j <= 19 && k == blen(em) && k >= t_len + 11 && slen(prefix) == 38 && t_len == 19 + hl
+        {
+          let hi = rsa_nib(sget(prefix, 2 * j));
+          let lo = rsa_nib(sget(prefix, 2 * j + 1));
+          if bget(em, ps_end + 1 + j) != hi * 16 + lo { ok = false; }
+          j = j + 1;
+        }
+        j = 0;
+        while j < hl
+          invariant j <= hl && k == blen(em) && k >= t_len + 11 && t_len == 19 + hl && blen(mhash) == hl
+        {
+          if bget(em, ps_end + 20 + j) != bget(mhash, j) { ok = false; }
+          j = j + 1;
+        }
+      }
+      bfree(mhash);
+      bfree(em);
+      return ok;
+    },
+  }
+}
+
+/// Whether `sig` is a valid RSASSA-PKCS1-v1_5 signature of `msg` under the
+/// key (`n`, `e`) with SHA-256: sha256WithRSAEncryption (`rsa_pkcs1_verify`
+/// with 32).
 /// ```
 /// let n = balloc(256);
 /// let e = bfrom("");
@@ -485,48 +589,7 @@ fn rsa_pss_sha256_verify(n: &Bytes, e: &Bytes, msg: &Bytes, sig: &Bytes) -> bool
 fn rsa_pkcs1_sha256_verify(n: &Bytes, e: &Bytes, msg: &Bytes, sig: &Bytes) -> bool
   requires blen(n) < 65536 && blen(e) < 65536 && blen(sig) < 65536 && blen(msg) < 274877906944
 {
-  match rsa_encode(n, e, sig) {
-    Option::None => { return false; },
-    Option::Some(em) => {
-      let k = blen(em);
-      let mhash = sha256(msg);
-      // DigestInfo for SHA-256: 30 31 30 0d 06 09 60 86 48 01 65 03 04 02 01 05 00 04 20 || hash.
-      let prefix = "3031300d060960864801650304020105000420";
-      let t_len = 19 + 32;
-      let mut ok = k >= t_len + 11;
-      if ok {
-        ok = bget(em, 0) == 0 && bget(em, 1) == 1;
-        let ps_end = k - t_len - 1;
-        let mut i = 2;
-        while i < ps_end
-          invariant i <= ps_end && ps_end == k - t_len - 1 && k == blen(em)
-        {
-          if bget(em, i) != 255 { ok = false; }
-          i = i + 1;
-        }
-        if bget(em, ps_end) != 0 { ok = false; }
-        let mut j = 0;
-        while j < 19
-          invariant j <= 19 && k == blen(em) && k >= t_len + 11 && slen(prefix) == 38
-        {
-          let hi = rsa_nib(sget(prefix, 2 * j));
-          let lo = rsa_nib(sget(prefix, 2 * j + 1));
-          if bget(em, ps_end + 1 + j) != hi * 16 + lo { ok = false; }
-          j = j + 1;
-        }
-        j = 0;
-        while j < 32
-          invariant j <= 32 && k == blen(em) && k >= t_len + 11 && blen(mhash) == 32
-        {
-          if bget(em, ps_end + 20 + j) != bget(mhash, j) { ok = false; }
-          j = j + 1;
-        }
-      }
-      bfree(mhash);
-      bfree(em);
-      return ok;
-    },
-  }
+  return rsa_pkcs1_verify(n, e, msg, sig, 32);
 }
 
 /// Internal: the value of the hex digit `c` (0 for anything else).

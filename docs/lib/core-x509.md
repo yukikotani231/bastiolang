@@ -9,16 +9,17 @@ What is proved: every access is in bounds, nothing leaks, and every span a
 certificate holds lies inside the bytes it was read from. What is read: the
 signed part, the signature, the issuer and subject names (as the bytes of
 their DER, to be compared as bytes), the validity times, the public key
-(RSA, ECDSA P-256 or Ed25519), and the extensions basicConstraints,
+(RSA, ECDSA P-256, ECDSA P-384 or Ed25519), and the extensions basicConstraints,
 keyUsage and subjectAltName. A critical extension of any other kind makes
 the certificate unreadable, as RFC 5280 requires. The signature algorithms
-are sha256WithRSAEncryption, ecdsa-with-SHA256 and Ed25519. Not proved:
+are sha256, sha384 and sha512WithRSAEncryption, ecdsa-with-SHA256,
+ecdsa-with-SHA384 and ecdsa-with-SHA512 (on either curve) and Ed25519. Not proved:
 that a certificate accepted here is a valid one; the tests check
 certificates made by OpenSSL, and that damaged ones, other signers and
 other names are refused. Not done: certificate policies, name constraints,
-revocation, SHA-384 and SHA-512 signatures and the curve P-384.
+revocation, and the curves other than P-256 and P-384.
 
-`import "core/x509.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/der.bastio](core-der.md), [core/x25519.bastio](core-x25519.md), [core/endian.bastio](core-endian.md), [core/text.bastio](core-text.md), [core/sha512.bastio](core-sha512.md), [core/ed25519.bastio](core-ed25519.md), [core/sha256.bastio](core-sha256.md), [core/p256.bastio](core-p256.md), [core/rsa.bastio](core-rsa.md).
+`import "core/x509.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/der.bastio](core-der.md), [core/x25519.bastio](core-x25519.md), [core/endian.bastio](core-endian.md), [core/text.bastio](core-text.md), [core/sha512.bastio](core-sha512.md), [core/ed25519.bastio](core-ed25519.md), [core/sha256.bastio](core-sha256.md), [core/p256.bastio](core-p256.md), [core/p384.bastio](core-p384.md), [core/rsa.bastio](core-rsa.md).
 
 | Function | |
 | --- | --- |
@@ -44,11 +45,14 @@ struct X509 {
 
 A certificate read from some bytes. Every span is a range of those bytes.
 `tbs` is the signed part including its header; `sig_kind` the signature
-algorithm (1 sha256WithRSAEncryption, 2 ecdsa-with-SHA256, 3 Ed25519) and
+algorithm (1 sha256WithRSAEncryption, 2 ecdsa-with-SHA256, 3 Ed25519,
+4 sha384WithRSAEncryption, 5 sha512WithRSAEncryption, 6 ecdsa-with-SHA384,
+7 ecdsa-with-SHA512) and
 `sig` the signature; `issuer` and `subject` are the DER of the names;
 `not_before` and `not_after` are in seconds since 1970; `key_kind` the key
-(1 RSA, 2 ECDSA P-256, 3 Ed25519), for RSA `key_a` the modulus and `key_b`
-the exponent, for the others `key_a` the key (65 or 32 bytes). `key_usage`
+(1 RSA, 2 ECDSA P-256, 3 Ed25519, 4 ECDSA P-384), for RSA `key_a` the
+modulus and `key_b` the exponent, for the others `key_a` the key (65, 32
+or 97 bytes). `key_usage`
 is the first byte of the keyUsage bits (digitalSignature 128, keyCertSign
 4) or 65535 when the extension is missing; `is_ca` is the cA flag of
 basicConstraints; `san` the subjectAltName's list of names, if `has_san`.
@@ -313,6 +317,17 @@ fn x509_exts(b: &Bytes, ext: Span) -> X509Exts
 ```
 
 Internal: the Extensions SEQUENCE whose content is `ext`.
+
+### `x509_sig_fits`
+
+```bastio
+fn x509_sig_fits(sig_kind: u64, key_kind: u64) -> bool
+```
+
+Internal: whether a signature algorithm (`sig_kind` of `X509`) can be made
+with a key (`key_kind`): RSA signatures need an RSA key, ECDSA ones a P-256
+or P-384 key (the hash is independent of the curve), Ed25519 an Ed25519
+key.
 
 ### `x509_lower`
 

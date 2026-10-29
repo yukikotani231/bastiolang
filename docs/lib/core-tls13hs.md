@@ -18,7 +18,7 @@ of the standard (it takes the one suite and group the client offered).
 
 | Function | |
 | --- | --- |
-| [`tls13_client_hello`](#tls13_client_hello) | The ClientHello message (handshake type 1) offering TLS 1.3 with TLS_CHACHA20_POLY1305_SHA256, the group X25519 (with the key share `key_share`, 32 bytes) and the signature schemes ed25519, ecdsa_secp256r1_sha256 and rsa_pss_rsae_sha256, for the server named `server_name` (the host name, at most 255 bytes; empty for none). |
+| [`tls13_client_hello`](#tls13_client_hello) | The ClientHello message (handshake type 1) offering TLS 1.3 with TLS_CHACHA20_POLY1305_SHA256, the group X25519 (with the key share `key_share`, 32 bytes) and the signature schemes ed25519, ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384, rsa_pss_rsae_sha256 and rsa_pss_rsae_sha384, for the server named `server_name` (the host name, at most 255 bytes; empty for none). |
 | [`tls13_parse_server_hello`](#tls13_parse_server_hello) | The X25519 public key (32 bytes) in the ServerHello `msg` (the whole handshake message, with its 4-byte header), or `None` unless it is a ServerHello for what `tls13_client_hello` offers. |
 | [`tls13_server_hello_suite`](#tls13_server_hello_suite) | The cipher suite a ServerHello `msg` chose. |
 
@@ -37,7 +37,8 @@ fn tls13_client_hello(random: &Bytes, session_id: &Bytes, server_name: &Bytes, k
 The ClientHello message (handshake type 1) offering TLS 1.3 with
 TLS_CHACHA20_POLY1305_SHA256, the group X25519 (with the key share
 `key_share`, 32 bytes) and the signature schemes ed25519,
-ecdsa_secp256r1_sha256 and rsa_pss_rsae_sha256, for the server named
+ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384, rsa_pss_rsae_sha256 and
+rsa_pss_rsae_sha384, for the server named
 `server_name` (the host name, at most 255 bytes; empty for none). `random` and
 `session_id` are 32 bytes each; the session id is echoed back by the
 server and exists for compatibility with middleboxes. The result starts
@@ -155,13 +156,13 @@ Internal: appends the extension of type `ty` with the contents `body`.
 ### `tls13_u16_list`
 
 ```bastio
-fn tls13_u16_list(a: u64, b: u64, c: u64, n: u64) -> Bytes
-  requires a < 65536 && b < 65536 && c < 65536 && n >= 1 && n <= 3
+fn tls13_u16_list(a: u64, b: u64, c: u64, d: u64, e: u64, n: u64) -> Bytes
+  requires a < 65536 && b < 65536 && c < 65536 && d < 65536 && e < 65536 && n >= 1 && n <= 5
   ensures blen(result) == 2 + 2 * n
 ```
 
-Internal: the contents of a list of 16-bit numbers `a`, `b`, ... behind
-their length.
+Internal: the contents of a list of 16-bit numbers `a`, `b`, ... (the
+first `n` of five) behind their length.
 
 ### `tls13_hello_extensions`
 
