@@ -1,0 +1,136 @@
+// expect-exit: 0
+// core/hkdf: the test cases of RFC 5869 (1, 2 and 3), and the output lengths
+// around a block, up to the longest the RFC allows, compared by digest.
+import "core/hkdf.bastio";
+import "core/num.bastio";
+
+/// The lower-case hex text of `d`.
+fn hex(d: &Bytes) -> Bytes {
+  let mut t = text_new();
+  let mut i = 0;
+  while i < blen(d)
+    invariant i <= blen(d)
+  {
+    text_push(&mut t, hex_char(cast[u64](bget(d, i)) / 16));
+    text_push(&mut t, hex_char(cast[u64](bget(d, i)) % 16));
+    i = i + 1;
+  }
+  return text_finish(t);
+}
+
+/// `n` bytes `first`, `first + 1`, ... (wrapping), or `n` copies of `first` if `step` is 0.
+fn run(n: u64, first: u8, step: u8) -> Bytes
+  requires n < 1000
+  ensures blen(result) == n
+{
+  let mut b = balloc(n);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && blen(b) == n
+  {
+    bset(&mut b, i, wrap_add(first, wrap_mul(cast[u8](i % 256), step)));
+    i = i + 1;
+  }
+  return b;
+}
+
+/// 1 unless HKDF of these inputs gives the PRK `want_prk` and the `n` bytes `want`.
+fn rfc(salt: &Bytes, ikm: &Bytes, info: &Bytes, n: u64, want_prk: Str, want: Str) -> u64
+  requires n <= 8160
+  ensures result <= 2
+{
+  let prk = hkdf_extract(salt, ikm);
+  let okm = hkdf_expand(prk, info, n);
+  let h1 = hex(prk);
+  let h2 = hex(okm);
+  let mut bad = 0;
+  if !bytes_eq_str(h1, want_prk) { bad = bad + 1; }
+  if !bytes_eq_str(h2, want) { bad = bad + 1; }
+  bfree(h1);
+  bfree(h2);
+  bfree(okm);
+  bfree(prk);
+  return bad;
+}
+
+fn case1() -> u64
+  ensures result <= 2
+{
+  let ikm = run(22, 11, 0);
+  let salt = run(13, 0, 1);
+  let info = run(10, 240, 1);
+  let r = rfc(salt, ikm, info, 42, "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5", "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865");
+  bfree(ikm);
+  bfree(salt);
+  bfree(info);
+  return r;
+}
+
+fn case2() -> u64
+  ensures result <= 2
+{
+  let ikm = run(80, 0, 1);
+  let salt = run(80, 96, 1);
+  let info = run(80, 176, 1);
+  let r = rfc(salt, ikm, info, 82, "06a6b88c5853361a06104c9ceb35b45cef760014904671014a193f40c15fc244", "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87");
+  bfree(ikm);
+  bfree(salt);
+  bfree(info);
+  return r;
+}
+
+fn case3() -> u64
+  ensures result <= 2
+{
+  let ikm = run(22, 11, 0);
+  let salt = balloc(0);
+  let info = balloc(0);
+  let r = rfc(salt, ikm, info, 42, "19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04", "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8");
+  bfree(ikm);
+  bfree(salt);
+  bfree(info);
+  return r;
+}
+
+/// 1 unless the SHA-256 of `n` bytes of HKDF output for salt "salt", key "ikm" and info "info" is `want`.
+fn digest(n: u64, want: Str) -> u64
+  requires n <= 8160
+  ensures result <= 1
+{
+  let salt = bfrom("salt");
+  let ikm = bfrom("ikm");
+  let info = bfrom("info");
+  let prk = hkdf_extract(salt, ikm);
+  let okm = hkdf_expand(prk, info, n);
+  let d = sha256(okm);
+  let h = hex(d);
+  let ok = bytes_eq_str(h, want);
+  bfree(h);
+  bfree(d);
+  bfree(okm);
+  bfree(prk);
+  bfree(info);
+  bfree(ikm);
+  bfree(salt);
+  if ok { return 0; }
+  return 1;
+}
+
+fn lengths() -> u64
+  ensures result <= 8
+{
+  return digest(0, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") +
+    digest(1, "aa687b58b0e73e2e383f8c500d75b591e188efe0168b3ffbcd3771caaa6dd4c7") +
+    digest(31, "085ff3d656e3b3a7f6917ecea01a8ba613569d42a51b7418509e026a4f75b033") +
+    digest(32, "c87518693c0ecab6fcece59fed6ecfb908f751ed5ecdfd6cedecef31529f9fff") +
+    digest(33, "a2df0df6af092aa64cc3e35de35a183b417bdc6dd390b02a0ef51346c524a9e8") +
+    digest(64, "929ad7e2ad8be7272eaa46bab2ca893721c63741336e8bb438d4e9d3431f9c18") +
+    digest(65, "6e87cfdd62a55661b9a072b7bd54a0802e67929603cd9ab6ad46d9fbc6353865") +
+    digest(8160, "e3963f0e8b66c425fb6879cf9bdaf9aac0ffdbac3093b9857871bb35b0056dce");
+}
+
+fn main() -> u64 {
+  let bad = case1() + case2() + case3() + lengths();
+  if bad > 0 { return 1; }
+  return 0;
+}

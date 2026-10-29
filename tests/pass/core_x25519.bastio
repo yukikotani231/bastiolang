@@ -1,0 +1,129 @@
+// expect-exit: 0
+// core/x25519: the vectors of RFC 7748 (section 5.2, the iterated function
+// after 1 and 1000 steps, and the Diffie-Hellman exchange of section 6.1).
+import "core/x25519.bastio";
+import "core/num.bastio";
+
+/// The value of the hex digit `c` (0 for anything else).
+fn nib(c: u8) -> u8
+  ensures result < 16
+{
+  if c >= 48 && c <= 57 { return c - 48; }
+  if c >= 97 && c <= 102 { return c - 87; }
+  return 0;
+}
+
+/// The 32 bytes written as 64 hex digits in `s`.
+fn unhex(s: Str) -> Bytes
+  requires slen(s) == 64
+  ensures blen(result) == 32
+{
+  let mut b = balloc(32);
+  let mut i = 0;
+  while i < 32
+    invariant i <= 32 && blen(b) == 32 && slen(s) == 64
+  {
+    bset(&mut b, i, nib(sget(s, 2 * i)) * 16 + nib(sget(s, 2 * i + 1)));
+    i = i + 1;
+  }
+  return b;
+}
+
+/// The lower-case hex text of `d`.
+fn hex(d: &Bytes) -> Bytes {
+  let mut t = text_new();
+  let mut i = 0;
+  while i < blen(d)
+    invariant i <= blen(d)
+  {
+    text_push(&mut t, hex_char(cast[u64](bget(d, i)) / 16));
+    text_push(&mut t, hex_char(cast[u64](bget(d, i)) % 16));
+    i = i + 1;
+  }
+  return text_finish(t);
+}
+
+/// 1 unless `d` is the bytes written in `want`.
+fn is_hex(d: &Bytes, want: Str) -> u64
+  ensures result <= 1
+{
+  let h = hex(d);
+  let ok = bytes_eq_str(h, want);
+  bfree(h);
+  if ok { return 0; }
+  return 1;
+}
+
+/// 1 unless X25519 of scalar `k` and point `u` (hex) is `want` (hex).
+fn vector(k: Str, u: Str, want: Str) -> u64
+  requires slen(k) == 64 && slen(u) == 64
+  ensures result <= 1
+{
+  let kb = unhex(k);
+  let ub = unhex(u);
+  let r = x25519(kb, ub);
+  let bad = is_hex(r, want);
+  bfree(r);
+  bfree(ub);
+  bfree(kb);
+  return bad;
+}
+
+/// 1 unless the iterated function (RFC 7748 section 5.2) gives `want` after `n` steps.
+fn iterate(n: u64, want: Str) -> u64
+  ensures result <= 1
+{
+  let mut k = balloc(32);
+  bset(&mut k, 0, 9);
+  let mut u = bytes_slice(k, 0, 32);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && blen(k) == 32 && blen(u) == 32
+  {
+    let r = x25519(k, u);
+    bfree(u);
+    u = k;
+    k = r;
+    i = i + 1;
+  }
+  let bad = is_hex(k, want);
+  bfree(k);
+  bfree(u);
+  return bad;
+}
+
+/// 1 unless the exchange of RFC 7748 section 6.1 gives its keys and secret.
+fn exchange() -> u64
+  ensures result <= 5
+{
+  let a = unhex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+  let b = unhex("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
+  let mut base = balloc(32);
+  bset(&mut base, 0, 9);
+  let pa = x25519(a, base);
+  let pb = x25519(b, base);
+  let sa = x25519(a, pb);
+  let sb = x25519(b, pa);
+  let bad = is_hex(pa, "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
+    + is_hex(pb, "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")
+    + is_hex(sa, "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")
+    + is_hex(sb, "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
+  bfree(sb);
+  bfree(sa);
+  bfree(pb);
+  bfree(pa);
+  bfree(base);
+  bfree(b);
+  bfree(a);
+  return bad;
+}
+
+fn main() -> u64 {
+  let bad = vector("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4", "e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c", "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552")
+    + vector("4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d", "e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493", "95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957")
+    + iterate(1, "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079")
+    + iterate(1000, "684cf59ba83309552800ef566f2f4d3c1c3887c49360e3875f2eb94d99532c51")
+    + exchange();
+  if bad > 0 { return 1; }
+  return 0;
+}

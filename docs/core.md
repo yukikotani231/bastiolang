@@ -47,6 +47,7 @@ Each module has a reference page, generated from its source: every function with
 | [`core/endian.bastio`](lib/core-endian.md) | Fixed-width integers stored in byte strings, as packet headers, file formats and disk blocks hold them. |
 | [`core/format.bastio`](lib/core-format.md) | Building text out of pieces. |
 | [`core/hashmap.bastio`](lib/core-hashmap.md) | A hash map from `u64` keys to values of any type `V` that can be copied (`u64`, `Span`, a struct of numbers, ...). |
+| [`core/hkdf.bastio`](lib/core-hkdf.md) | HKDF with HMAC-SHA-256 (RFC 5869), the key derivation that TLS 1.3 uses. |
 | [`core/json.bastio`](lib/core-json.md) | JSON (RFC 8259) read from bytes that cannot be trusted. |
 | [`core/lines.bastio`](lib/core-lines.md) | Splitting text into lines. |
 | [`core/num.bastio`](lib/core-num.md) | Parsing integers from bytes and formatting them as text. |
@@ -67,6 +68,7 @@ Each module has a reference page, generated from its source: every function with
 | [`core/url.bastio`](lib/core-url.md) | Percent-encoding (RFC 3986 section 2.1) and the query string of a request target (`/path?a=1&b=two%20words`). |
 | [`core/utf8.bastio`](lib/core-utf8.md) | UTF-8 validation (RFC 3629). |
 | [`core/wtext.bastio`](lib/core-wtext.md) | Text kept as a `Vec[u64]`, one character a word. |
+| [`core/x25519.bastio`](lib/core-x25519.md) | X25519, the Diffie-Hellman function on Curve25519 (RFC 7748), with field elements of 16 limbs of 16 bits in the style of TweetNaCl. |
 | [`std/host.bastio`](lib/std-host.md) | The command line, files and standard error, for programs on the hosted target. |
 | [`std/http.bastio`](lib/std-http.md) | HTTP/1.1 over std/net.bastio, for programs on the hosted target. |
 | [`std/net.bastio`](lib/std-net.md) | TCP sockets for programs on the hosted target (Linux and the other targets whose native or C backend links the C library's socket calls). |

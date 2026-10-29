@@ -141,6 +141,12 @@ What will be 0.2.0.
   full before anything is decrypted). Reads are proved in bounds; that the output is RFC 8439's is checked by its
   vectors, a differential run against a Python reference on 25 lengths up to 4097, and every one-bit change of a
   sealed message being refused.
+- `core/hkdf`: `hkdf_extract` and `hkdf_expand` (HKDF with HMAC-SHA-256, RFC 5869), the key derivation of TLS 1.3. Reads are proved in
+  bounds and `hkdf_expand` returns exactly the number of bytes asked for (up to 8160); that the output is RFC 5869's is
+  checked by its three test cases and by digests of outputs from 0 to 8160 bytes against a Python reference.
+- `core/x25519`: `x25519` (RFC 7748), the Diffie-Hellman function on Curve25519, with 16-limb field elements. Reads are proved
+  in bounds and a result is 32 bytes; that it is RFC 7748's is checked by its vectors, the iterated function after 1 and 1000
+  steps, and the exchange of section 6.1.
 - `core/url`: `url_encode`, `url_decode`/`url_decode_span` (percent-decoding, `+` as a space on request) and `url_query_get`/`url_query_start` for the query string of a request target; reads are proved in bounds, a decoded string is never longer than its source and an encoded one at most three times as long.
 - `std/http`: `http_header` reads a header field of a response (the name is matched ignoring case,
   the value has its blanks removed), for `Location`, `Content-Type` and the like.
