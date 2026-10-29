@@ -54,6 +54,7 @@ Each module has a reference page, generated from its source: every function with
 | [`core/lines.bastio`](lib/core-lines.md) | Splitting text into lines. |
 | [`core/num.bastio`](lib/core-num.md) | Parsing integers from bytes and formatting them as text. |
 | [`core/option.bastio`](lib/core-option.md) | An optional value, and a span of a byte string. |
+| [`core/p256.bastio`](lib/core-p256.md) | ECDSA signatures over the curve P-256 (secp256r1) with SHA-256, verification only (FIPS 186-4, RFC 6979 is for signing), for the ecdsa_secp256r1_sha256 scheme of TLS 1.3 certificates. |
 | [`core/path.bastio`](lib/core-path.md) | File names. |
 | [`core/poly1305.bastio`](lib/core-poly1305.md) | The Poly1305 one-time authenticator (RFC 8439 section 2.5), in the 26-bit-limb form of poly1305-donna. |
 | [`core/print.bastio`](lib/core-print.md) | Writing text and numbers to the serial console. |
