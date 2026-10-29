@@ -240,6 +240,39 @@ fn post_roundtrip(h: &Host, s: u64, p: u64) -> u64
   return bad;
 }
 
+/// Counts 1 unless `text`, sent as a request head, is answered with 400 and
+/// never reaches the caller (`refused`), or reaches it (not `refused`).
+fn expect_head(h: &Host, s: u64, p: u64, text: Str, refused: bool) -> u64
+  ensures result <= 3
+{
+  let mut bad = 0;
+  match client(h, p, text) {
+    Option::Some(c) => {
+      match http_accept(h, s, 4096) {
+        Option::Some(r) => {
+          if refused { bad = bad + 1; }
+          http_close(h, r);
+        },
+        Option::None => {
+          if !refused { bad = bad + 1; }
+        },
+      }
+      if refused {
+        match http_read_all(h, c, 4096) {
+          Option::Some(m) => {
+            if http_status(m) != 400 { bad = bad + 1; }
+            bfree(m);
+          },
+          Option::None => { bad = bad + 1; },
+        }
+      }
+      net_close(h, c);
+    },
+    Option::None => { bad = bad + 1; },
+  }
+  return bad;
+}
+
 fn main(h: &mut Host) -> u64 {
   let mut bad = 0;
   match net_listen(h, net_ip4(127, 0, 0, 1), 0) {
@@ -276,6 +309,13 @@ fn main(h: &mut Host) -> u64 {
         },
         Option::None => { bad = bad + 1; },
       }
+      // RFC 9112, section 3.2: an HTTP/1.1 request needs exactly one Host
+      // (HTTP/1.0 need not have one).
+      bad = bad + expect_head(h, s, p, "GET / HTTP/1.1\r\n\r\n", true);
+      bad = bad + expect_head(h, s, p, "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n", true);
+      bad = bad + expect_head(h, s, p, "GET / HTTP/1.1\r\nHOST: a\r\nhost: a\r\n\r\n", true);
+      bad = bad + expect_head(h, s, p, "GET / HTTP/1.1\r\nhOsT: a\r\n\r\n", false);
+      bad = bad + expect_head(h, s, p, "GET / HTTP/1.0\r\n\r\n", false);
       // A good one: method and target.
       match client(h, p, "POST /a/b?c=d HTTP/1.1\r\nHost: x\r\n\r\n") {
         Option::Some(c) => {
