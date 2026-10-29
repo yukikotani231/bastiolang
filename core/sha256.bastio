@@ -1,0 +1,268 @@
+// core/sha256.bastio: SHA-256 (FIPS 180-4) and HMAC-SHA-256 (RFC 2104).
+//
+// What is proved: every access is in bounds, nothing leaks, and a digest is
+// 32 bytes. Not proved: that the digest is SHA-256's (the tests check the
+// FIPS 180-4 and RFC 4231 vectors, including the block-boundary lengths 55,
+// 56, 63, 64 and 65, and a million `a`s), or that the code takes the same
+// time for every input (it does not branch on its data, but nothing checks
+// that).
+import "bytes.bastio";
+import "endian.bastio";
+import "text.bastio";
+
+/// Internal: the round constants.
+fn sha256_k() -> Vec[u32]
+  ensures vlen(result) == 64
+{
+  let mut k = vec_new[u32]();
+  vec_push(&mut k, 1116352408);
+  vec_push(&mut k, 1899447441);
+  vec_push(&mut k, 3049323471);
+  vec_push(&mut k, 3921009573);
+  vec_push(&mut k, 961987163);
+  vec_push(&mut k, 1508970993);
+  vec_push(&mut k, 2453635748);
+  vec_push(&mut k, 2870763221);
+  vec_push(&mut k, 3624381080);
+  vec_push(&mut k, 310598401);
+  vec_push(&mut k, 607225278);
+  vec_push(&mut k, 1426881987);
+  vec_push(&mut k, 1925078388);
+  vec_push(&mut k, 2162078206);
+  vec_push(&mut k, 2614888103);
+  vec_push(&mut k, 3248222580);
+  vec_push(&mut k, 3835390401);
+  vec_push(&mut k, 4022224774);
+  vec_push(&mut k, 264347078);
+  vec_push(&mut k, 604807628);
+  vec_push(&mut k, 770255983);
+  vec_push(&mut k, 1249150122);
+  vec_push(&mut k, 1555081692);
+  vec_push(&mut k, 1996064986);
+  vec_push(&mut k, 2554220882);
+  vec_push(&mut k, 2821834349);
+  vec_push(&mut k, 2952996808);
+  vec_push(&mut k, 3210313671);
+  vec_push(&mut k, 3336571891);
+  vec_push(&mut k, 3584528711);
+  vec_push(&mut k, 113926993);
+  vec_push(&mut k, 338241895);
+  vec_push(&mut k, 666307205);
+  vec_push(&mut k, 773529912);
+  vec_push(&mut k, 1294757372);
+  vec_push(&mut k, 1396182291);
+  vec_push(&mut k, 1695183700);
+  vec_push(&mut k, 1986661051);
+  vec_push(&mut k, 2177026350);
+  vec_push(&mut k, 2456956037);
+  vec_push(&mut k, 2730485921);
+  vec_push(&mut k, 2820302411);
+  vec_push(&mut k, 3259730800);
+  vec_push(&mut k, 3345764771);
+  vec_push(&mut k, 3516065817);
+  vec_push(&mut k, 3600352804);
+  vec_push(&mut k, 4094571909);
+  vec_push(&mut k, 275423344);
+  vec_push(&mut k, 430227734);
+  vec_push(&mut k, 506948616);
+  vec_push(&mut k, 659060556);
+  vec_push(&mut k, 883997877);
+  vec_push(&mut k, 958139571);
+  vec_push(&mut k, 1322822218);
+  vec_push(&mut k, 1537002063);
+  vec_push(&mut k, 1747873779);
+  vec_push(&mut k, 1955562222);
+  vec_push(&mut k, 2024104815);
+  vec_push(&mut k, 2227730452);
+  vec_push(&mut k, 2361852424);
+  vec_push(&mut k, 2428436474);
+  vec_push(&mut k, 2756734187);
+  vec_push(&mut k, 3204031479);
+  vec_push(&mut k, 3329325298);
+  return k;
+}
+
+/// Internal: `x` rotated right by `n` bits, 1 to 31.
+fn sha256_rotr(x: u32, n: u64) -> u32
+  requires n >= 1 && n <= 31
+{
+  return (x >> n) | wrap[u32](cast[u64](x) << (32 - n));
+}
+
+/// Internal: the eight state words after the 64-byte block at `at` of `m`.
+fn sha256_block(h: &mut Vec[u32], k: &Vec[u32], w: &mut Vec[u32], m: &Bytes, at: u64)
+  requires vlen(h) == 8 && vlen(k) == 64 && vlen(w) == 64 && at + 64 <= blen(m)
+  ensures vlen(h) == 8 && vlen(w) == 64
+{
+  let mut i = 0;
+  while i < 16
+    invariant i <= 16 && vlen(w) == 64 && at + 64 <= blen(m)
+  {
+    vec_set(&mut w, i, load_be32(m, at + 4 * i));
+    i = i + 1;
+  }
+  while i < 64
+    invariant 16 <= i && i <= 64 && vlen(w) == 64
+  {
+    let w15 = vec_get(w, i - 15);
+    let w2 = vec_get(w, i - 2);
+    let s0 = sha256_rotr(w15, 7) ^ sha256_rotr(w15, 18) ^ (w15 >> 3);
+    let s1 = sha256_rotr(w2, 17) ^ sha256_rotr(w2, 19) ^ (w2 >> 10);
+    vec_set(&mut w, i, wrap_add(wrap_add(vec_get(w, i - 16), s0), wrap_add(vec_get(w, i - 7), s1)));
+    i = i + 1;
+  }
+  let mut a = vec_get(h, 0);
+  let mut b = vec_get(h, 1);
+  let mut c = vec_get(h, 2);
+  let mut d = vec_get(h, 3);
+  let mut e = vec_get(h, 4);
+  let mut f = vec_get(h, 5);
+  let mut g = vec_get(h, 6);
+  let mut hh = vec_get(h, 7);
+  let mut r = 0;
+  while r < 64
+    invariant r <= 64 && vlen(w) == 64 && vlen(k) == 64
+  {
+    let big1 = sha256_rotr(e, 6) ^ sha256_rotr(e, 11) ^ sha256_rotr(e, 25);
+    let ch = (e & f) ^ ((e ^ 4294967295) & g);
+    let t1 = wrap_add(wrap_add(wrap_add(hh, big1), wrap_add(ch, vec_get(k, r))), vec_get(w, r));
+    let big0 = sha256_rotr(a, 2) ^ sha256_rotr(a, 13) ^ sha256_rotr(a, 22);
+    let maj = (a & b) ^ (a & c) ^ (b & c);
+    let t2 = wrap_add(big0, maj);
+    hh = g;
+    g = f;
+    f = e;
+    e = wrap_add(d, t1);
+    d = c;
+    c = b;
+    b = a;
+    a = wrap_add(t1, t2);
+    r = r + 1;
+  }
+  vec_set(&mut h, 0, wrap_add(vec_get(h, 0), a));
+  vec_set(&mut h, 1, wrap_add(vec_get(h, 1), b));
+  vec_set(&mut h, 2, wrap_add(vec_get(h, 2), c));
+  vec_set(&mut h, 3, wrap_add(vec_get(h, 3), d));
+  vec_set(&mut h, 4, wrap_add(vec_get(h, 4), e));
+  vec_set(&mut h, 5, wrap_add(vec_get(h, 5), f));
+  vec_set(&mut h, 6, wrap_add(vec_get(h, 6), g));
+  vec_set(&mut h, 7, wrap_add(vec_get(h, 7), hh));
+}
+
+/// The SHA-256 digest of `m`: 32 bytes.
+/// ```
+/// let m = bfrom("abc");
+/// let d = sha256(m);
+/// let first = bget(d, 0);          // ba 78 16 bf ... 15 ad
+/// let last = bget(d, 31);
+/// let n = blen(d);
+/// bfree(d);
+/// bfree(m);
+/// if n != 32 || first != 186 || last != 173 { return 1; }
+/// ```
+fn sha256(m: &Bytes) -> Bytes
+  ensures blen(result) == 32
+{
+  let n = blen(m);
+  let k = sha256_k();
+  let mut w = vec_new[u32]();
+  let mut h = vec_new[u32]();
+  let mut i = 0;
+  while i < 64
+    invariant i <= 64 && vlen(w) == i
+  {
+    vec_push(&mut w, 0);
+    i = i + 1;
+  }
+  vec_push(&mut h, 1779033703);
+  vec_push(&mut h, 3144134277);
+  vec_push(&mut h, 1013904242);
+  vec_push(&mut h, 2773480762);
+  vec_push(&mut h, 1359893119);
+  vec_push(&mut h, 2600822924);
+  vec_push(&mut h, 528734635);
+  vec_push(&mut h, 1541459225);
+  // The whole blocks straight from the message.
+  let whole = n / 64 * 64;
+  let mut at = 0;
+  while at < whole
+    invariant at <= whole && whole <= n && n == blen(m) && at % 64 == 0 && vlen(h) == 8 && vlen(k) == 64 && vlen(w) == 64
+  {
+    sha256_block(&mut h, k, &mut w, m, at);
+    at = at + 64;
+  }
+  // The rest, a 1 bit, zeros and the length in bits (mod 2^64) in one or two more blocks.
+  let rem = n - whole;
+  let mut tail = balloc(128);
+  bytes_copy_span(&mut tail, 0, m, whole, n);
+  bset(&mut tail, rem, 128);
+  let mut tlen = 64;
+  if rem >= 56 {
+    tlen = 128;
+  }
+  store_be64(&mut tail, tlen - 8, wrap_mul(n, 8));
+  sha256_block(&mut h, k, &mut w, tail, 0);
+  if tlen == 128 {
+    sha256_block(&mut h, k, &mut w, tail, 64);
+  }
+  let mut out = balloc(32);
+  let mut j = 0;
+  while j < 8
+    invariant j <= 8 && vlen(h) == 8 && blen(out) == 32
+  {
+    store_be32(&mut out, 4 * j, vec_get(h, j));
+    j = j + 1;
+  }
+  bfree(tail);
+  vec_free(k);
+  vec_free(w);
+  vec_free(h);
+  return out;
+}
+
+/// HMAC-SHA-256 of `msg` under `key` (any length): 32 bytes.
+/// ```
+/// let key = bfrom("key");
+/// let msg = bfrom("The quick brown fox jumps over the lazy dog");
+/// let mac = hmac_sha256(key, msg);
+/// let first = bget(mac, 0);        // f7 bc 83 f4 ... d8
+/// let last = bget(mac, 31);
+/// bfree(mac);
+/// bfree(key);
+/// bfree(msg);
+/// if first != 247 || last != 216 { return 1; }
+/// ```
+fn hmac_sha256(key: &Bytes, msg: &Bytes) -> Bytes
+  ensures blen(result) == 32
+{
+  // A key longer than a block is hashed first; a shorter one is padded with zeros.
+  let mut k0 = balloc(64);
+  if blen(key) > 64 {
+    let hk = sha256(key);
+    bytes_copy_into(&mut k0, 0, hk);
+    bfree(hk);
+  } else {
+    bytes_copy_into(&mut k0, 0, key);
+  }
+  let mut inner = text_new();
+  let mut outer = text_new();
+  let mut i = 0;
+  while i < 64
+    invariant i <= 64 && blen(k0) == 64 && vlen(inner) == i && vlen(outer) == i
+  {
+    text_push(&mut inner, bget(k0, i) ^ 54);
+    text_push(&mut outer, bget(k0, i) ^ 92);
+    i = i + 1;
+  }
+  text_push_bytes(&mut inner, msg);
+  let ib = text_finish(inner);
+  let ih = sha256(ib);
+  text_push_bytes(&mut outer, ih);
+  let ob = text_finish(outer);
+  let r = sha256(ob);
+  bfree(k0);
+  bfree(ib);
+  bfree(ih);
+  bfree(ob);
+  return r;
+}

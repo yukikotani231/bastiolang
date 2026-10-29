@@ -1,0 +1,138 @@
+// core/chacha20.bastio: the ChaCha20 stream cipher (RFC 8439 section 2.4).
+//
+// What is proved: every access is in bounds, nothing leaks, and the output
+// is as long as the input. Not proved: that the keystream is ChaCha20's (the
+// tests check the RFC 8439 vectors) or that the code is constant time (it
+// has no branch or index that depends on the key, but nothing checks that).
+import "bytes.bastio";
+import "endian.bastio";
+
+/// Internal: `x` rotated left by `n` bits, 1 to 31.
+fn chacha_rotl(x: u32, n: u64) -> u32
+  requires n >= 1 && n <= 31
+{
+  return wrap[u32](cast[u64](x) << n) | (x >> (32 - n));
+}
+
+/// Internal: the quarter round on words `a`, `b`, `c`, `d` of `s`.
+fn chacha_quarter(s: &mut Vec[u32], a: u64, b: u64, c: u64, d: u64)
+  requires vlen(s) == 16 && a < 16 && b < 16 && c < 16 && d < 16
+  ensures vlen(s) == 16
+{
+  let mut xa = vec_get(s, a);
+  let mut xb = vec_get(s, b);
+  let mut xc = vec_get(s, c);
+  let mut xd = vec_get(s, d);
+  xa = wrap_add(xa, xb); xd = xd ^ xa; xd = chacha_rotl(xd, 16);
+  xc = wrap_add(xc, xd); xb = xb ^ xc; xb = chacha_rotl(xb, 12);
+  xa = wrap_add(xa, xb); xd = xd ^ xa; xd = chacha_rotl(xd, 8);
+  xc = wrap_add(xc, xd); xb = xb ^ xc; xb = chacha_rotl(xb, 7);
+  vec_set(&mut s, a, xa);
+  vec_set(&mut s, b, xb);
+  vec_set(&mut s, c, xc);
+  vec_set(&mut s, d, xd);
+}
+
+/// Internal: the 64-byte keystream block for `key`, `counter` and `nonce`
+/// written at `at` of `out`.
+fn chacha_block(out: &mut Bytes, at: u64, key: &Bytes, counter: u32, nonce: &Bytes)
+  requires blen(key) == 32 && blen(nonce) == 12 && at + 64 <= blen(out)
+  ensures blen(out) == blen(old(out))
+{
+  let mut init = vec_new[u32]();
+  vec_push(&mut init, 1634760805);
+  vec_push(&mut init, 857760878);
+  vec_push(&mut init, 2036477234);
+  vec_push(&mut init, 1797285236);
+  let mut i = 0;
+  while i < 8
+    invariant i <= 8 && vlen(init) == 4 + i && blen(key) == 32
+  {
+    vec_push(&mut init, load_le32(key, 4 * i));
+    i = i + 1;
+  }
+  vec_push(&mut init, counter);
+  vec_push(&mut init, load_le32(nonce, 0));
+  vec_push(&mut init, load_le32(nonce, 4));
+  vec_push(&mut init, load_le32(nonce, 8));
+  let mut s = vec_new[u32]();
+  let mut j = 0;
+  while j < 16
+    invariant j <= 16 && vlen(init) == 16 && vlen(s) == j
+  {
+    vec_push(&mut s, vec_get(init, j));
+    j = j + 1;
+  }
+  let mut r = 0;
+  while r < 10
+    invariant r <= 10 && vlen(s) == 16
+  {
+    chacha_quarter(&mut s, 0, 4, 8, 12);
+    chacha_quarter(&mut s, 1, 5, 9, 13);
+    chacha_quarter(&mut s, 2, 6, 10, 14);
+    chacha_quarter(&mut s, 3, 7, 11, 15);
+    chacha_quarter(&mut s, 0, 5, 10, 15);
+    chacha_quarter(&mut s, 1, 6, 11, 12);
+    chacha_quarter(&mut s, 2, 7, 8, 13);
+    chacha_quarter(&mut s, 3, 4, 9, 14);
+    r = r + 1;
+  }
+  let mut w = 0;
+  while w < 16
+    invariant w <= 16 && vlen(s) == 16 && vlen(init) == 16 && at + 64 <= blen(out)
+  {
+    store_le32(&mut out, at + 4 * w, wrap_add(vec_get(s, w), vec_get(init, w)));
+    w = w + 1;
+  }
+  vec_free(init);
+  vec_free(s);
+}
+
+/// `data` encrypted (or decrypted: the cipher is its own inverse) with the
+/// 32-byte `key` and 12-byte `nonce`, the keystream starting at block
+/// `counter`. The result is as long as `data`, which must be shorter than
+/// 2^38 bytes (2^32 blocks), or the block counter would wrap and repeat the
+/// keystream.
+/// ```
+/// let mut key = balloc(32);
+/// let mut i = 0;
+/// while i < 32 invariant i <= 32 && blen(key) == 32 { bset(&mut key, i, cast[u8](i)); i = i + 1; }
+/// let nonce = balloc(12);
+/// let m = bfrom("hello");
+/// let c = chacha20_xor(key, nonce, 1, m);
+/// let back = chacha20_xor(key, nonce, 1, c);
+/// let same = bytes_eq(back, m);
+/// let differs = !bytes_eq(c, m);
+/// bfree(back);
+/// bfree(c);
+/// bfree(m);
+/// bfree(nonce);
+/// bfree(key);
+/// if !same || !differs { return 1; }
+/// ```
+fn chacha20_xor(key: &Bytes, nonce: &Bytes, counter: u32, data: &Bytes) -> Bytes
+  requires blen(key) == 32 && blen(nonce) == 12 && blen(data) < 274877906944
+  ensures blen(result) == blen(data)
+{
+  let n = blen(data);
+  let mut out = balloc(n);
+  let mut ks = balloc(64);
+  let mut at = 0;
+  let mut ctr = counter;
+  while at < n
+    invariant at < n + 64 && n == blen(data) && blen(out) == n && blen(ks) == 64 && blen(key) == 32 && blen(nonce) == 12
+  {
+    chacha_block(&mut ks, 0, key, ctr, nonce);
+    let mut j = 0;
+    while j < 64 && at + j < n
+      invariant j <= 64 && at + j <= n && blen(out) == n && blen(ks) == 64 && n == blen(data)
+    {
+      bset(&mut out, at + j, bget(data, at + j) ^ bget(ks, j));
+      j = j + 1;
+    }
+    ctr = wrap_add(ctr, 1);
+    at = at + 64;
+  }
+  bfree(ks);
+  return out;
+}

@@ -1,0 +1,202 @@
+// core/poly1305.bastio: the Poly1305 one-time authenticator (RFC 8439
+// section 2.5), in the 26-bit-limb form of poly1305-donna.
+//
+// What is proved: every access is in bounds, nothing leaks, and a tag is 16
+// bytes. Not proved: that the tag is Poly1305's (the tests check the RFC 8439
+// vectors and a differential run against a reference on many lengths) or
+// that the code is constant time (there is no branch or index that depends on
+// the key or the message except the length, but nothing checks that).
+//
+// A key must be used for one message only: two tags under one key reveal it.
+import "bytes.bastio";
+import "endian.bastio";
+
+/// Internal: the little-endian 32-bit word at `at` of `b`, as a `u64`.
+fn poly_word(b: &Bytes, at: u64) -> u64
+  requires at + 4 <= blen(b)
+  ensures result < 4294967296
+{
+  return cast[u64](load_le32(b, at));
+}
+
+/// Internal: adds the 16-byte block at `at` of `m` (with `hibit` the 2^128
+/// bit, `16777216` for a full block, 0 for a padded one) to the accumulator
+/// `h` (five 26-bit limbs) and multiplies by `r` (five limbs; `s` is `5 * r`
+/// for limbs 1 to 4).
+fn poly_block(h: &mut Vec[u64], r: &Vec[u64], m: &Bytes, at: u64, hibit: u64)
+  requires vlen(h) == 5 && vlen(r) == 9 && at + 16 <= blen(m)
+  ensures vlen(h) == 5
+{
+  let t0 = poly_word(m, at);
+  let t1 = poly_word(m, at + 4);
+  let t2 = poly_word(m, at + 8);
+  let t3 = poly_word(m, at + 12);
+  let mask = 67108863;
+  let h0 = wrap_add(vec_get(h, 0), t0 & mask);
+  let h1 = wrap_add(vec_get(h, 1), (t0 / 67108864 + wrap_mul(t1, 64)) & mask);
+  let h2 = wrap_add(vec_get(h, 2), (t1 / 1048576 + wrap_mul(t2, 4096)) & mask);
+  let h3 = wrap_add(vec_get(h, 3), (t2 / 16384 + wrap_mul(t3, 262144)) & mask);
+  let h4 = wrap_add(vec_get(h, 4), wrap_add(t3 / 256, hibit));
+  let r0 = vec_get(r, 0);
+  let r1 = vec_get(r, 1);
+  let r2 = vec_get(r, 2);
+  let r3 = vec_get(r, 3);
+  let r4 = vec_get(r, 4);
+  let s1 = vec_get(r, 5);
+  let s2 = vec_get(r, 6);
+  let s3 = vec_get(r, 7);
+  let s4 = vec_get(r, 8);
+  let mut d0 = wrap_add(wrap_add(wrap_mul(h0, r0), wrap_mul(h1, s4)), wrap_add(wrap_mul(h2, s3), wrap_add(wrap_mul(h3, s2), wrap_mul(h4, s1))));
+  let mut d1 = wrap_add(wrap_add(wrap_mul(h0, r1), wrap_mul(h1, r0)), wrap_add(wrap_mul(h2, s4), wrap_add(wrap_mul(h3, s3), wrap_mul(h4, s2))));
+  let mut d2 = wrap_add(wrap_add(wrap_mul(h0, r2), wrap_mul(h1, r1)), wrap_add(wrap_mul(h2, r0), wrap_add(wrap_mul(h3, s4), wrap_mul(h4, s3))));
+  let mut d3 = wrap_add(wrap_add(wrap_mul(h0, r3), wrap_mul(h1, r2)), wrap_add(wrap_mul(h2, r1), wrap_add(wrap_mul(h3, r0), wrap_mul(h4, s4))));
+  let mut d4 = wrap_add(wrap_add(wrap_mul(h0, r4), wrap_mul(h1, r3)), wrap_add(wrap_mul(h2, r2), wrap_add(wrap_mul(h3, r1), wrap_mul(h4, r0))));
+  let mut c = d0 / 67108864;
+  let n0 = d0 & mask;
+  d1 = wrap_add(d1, c);
+  c = d1 / 67108864;
+  let n1 = d1 & mask;
+  d2 = wrap_add(d2, c);
+  c = d2 / 67108864;
+  let n2 = d2 & mask;
+  d3 = wrap_add(d3, c);
+  c = d3 / 67108864;
+  let n3 = d3 & mask;
+  d4 = wrap_add(d4, c);
+  c = d4 / 67108864;
+  let n4 = d4 & mask;
+  let m0 = wrap_add(n0, wrap_mul(c, 5));
+  c = m0 / 67108864;
+  vec_set(&mut h, 0, m0 & mask);
+  vec_set(&mut h, 1, wrap_add(n1, c));
+  vec_set(&mut h, 2, n2);
+  vec_set(&mut h, 3, n3);
+  vec_set(&mut h, 4, n4);
+}
+
+/// The Poly1305 tag of `m` under the 32-byte one-time `key` (`r` then `s`):
+/// 16 bytes.
+/// ```
+/// let mut key = balloc(32);
+/// let mut i = 0;
+/// while i < 32 invariant i <= 32 && blen(key) == 32 { bset(&mut key, i, cast[u8](i + 1)); i = i + 1; }
+/// let m = bfrom("Cryptographic Forum Research Group");
+/// let t = poly1305(key, m);
+/// let n = blen(t);
+/// bfree(t);
+/// bfree(m);
+/// bfree(key);
+/// if n != 16 { return 1; }
+/// ```
+fn poly1305(key: &Bytes, m: &Bytes) -> Bytes
+  requires blen(key) == 32
+  ensures blen(result) == 16
+{
+  // r, clamped, in five limbs; then 5 * r1..r4.
+  let k0 = poly_word(key, 0);
+  let k1 = poly_word(key, 4);
+  let k2 = poly_word(key, 8);
+  let k3 = poly_word(key, 12);
+  let mut r = vec_new[u64]();
+  let r0 = k0 & 67108863;
+  let r1 = (k0 / 67108864 + wrap_mul(k1, 64)) & 67108611;
+  let r2 = (k1 / 1048576 + wrap_mul(k2, 4096)) & 67092735;
+  let r3 = (k2 / 16384 + wrap_mul(k3, 262144)) & 66076671;
+  let r4 = (k3 / 256) & 1048575;
+  vec_push(&mut r, r0);
+  vec_push(&mut r, r1);
+  vec_push(&mut r, r2);
+  vec_push(&mut r, r3);
+  vec_push(&mut r, r4);
+  vec_push(&mut r, wrap_mul(r1, 5));
+  vec_push(&mut r, wrap_mul(r2, 5));
+  vec_push(&mut r, wrap_mul(r3, 5));
+  vec_push(&mut r, wrap_mul(r4, 5));
+  let mut h = vec_new[u64]();
+  vec_push(&mut h, 0);
+  vec_push(&mut h, 0);
+  vec_push(&mut h, 0);
+  vec_push(&mut h, 0);
+  vec_push(&mut h, 0);
+  let n = blen(m);
+  let whole = n / 16 * 16;
+  let mut at = 0;
+  while at < whole
+    invariant at <= whole && whole <= n && n == blen(m) && at % 16 == 0 && whole % 16 == 0 && vlen(h) == 5 && vlen(r) == 9
+  {
+    poly_block(&mut h, r, m, at, 16777216);
+    at = at + 16;
+  }
+  if whole < n {
+    // The last, partial block: its bytes, then a 1 byte, then zeros.
+    let mut last = balloc(16);
+    bytes_copy_span(&mut last, 0, m, whole, n);
+    bset(&mut last, n - whole, 1);
+    poly_block(&mut h, r, last, 0, 0);
+    bfree(last);
+  }
+  // Fully carry h, then subtract p = 2^130 - 5 if h >= p, without a branch.
+  let mask = 67108863;
+  let mut h0 = vec_get(h, 0);
+  let mut h1 = vec_get(h, 1);
+  let mut h2 = vec_get(h, 2);
+  let mut h3 = vec_get(h, 3);
+  let mut h4 = vec_get(h, 4);
+  let mut c = h1 / 67108864;
+  h1 = h1 & mask;
+  h2 = wrap_add(h2, c);
+  c = h2 / 67108864;
+  h2 = h2 & mask;
+  h3 = wrap_add(h3, c);
+  c = h3 / 67108864;
+  h3 = h3 & mask;
+  h4 = wrap_add(h4, c);
+  c = h4 / 67108864;
+  h4 = h4 & mask;
+  h0 = wrap_add(h0, wrap_mul(c, 5));
+  c = h0 / 67108864;
+  h0 = h0 & mask;
+  h1 = wrap_add(h1, c);
+  let mut g0 = wrap_add(h0, 5);
+  c = g0 / 67108864;
+  g0 = g0 & mask;
+  let mut g1 = wrap_add(h1, c);
+  c = g1 / 67108864;
+  g1 = g1 & mask;
+  let mut g2 = wrap_add(h2, c);
+  c = g2 / 67108864;
+  g2 = g2 & mask;
+  let mut g3 = wrap_add(h3, c);
+  c = g3 / 67108864;
+  g3 = g3 & mask;
+  let g4 = wrap_sub(wrap_add(h4, c), 67108864);
+  // g4 has its top bit set exactly when h < p: then keep h.
+  let take_g = wrap_sub(g4 / 9223372036854775808, 1);
+  let keep_h = take_g ^ 18446744073709551615;
+  h0 = (h0 & keep_h) | (g0 & take_g);
+  h1 = (h1 & keep_h) | (g1 & take_g);
+  h2 = (h2 & keep_h) | (g2 & take_g);
+  h3 = (h3 & keep_h) | (g3 & take_g);
+  h4 = (h4 & keep_h) | (g4 & take_g);
+  // Pack into four 32-bit words and add s.
+  let w0 = (h0 | wrap_mul(h1, 67108864)) & 4294967295;
+  let w1 = (h1 / 64 + wrap_mul(h2, 1048576)) & 4294967295;
+  let w2 = (h2 / 4096 + wrap_mul(h3, 16384)) & 4294967295;
+  let w3 = (h3 / 262144 + wrap_mul(h4, 256)) & 4294967295;
+  let mut f = wrap_add(w0, poly_word(key, 16));
+  let o0 = f & 4294967295;
+  f = wrap_add(wrap_add(w1, poly_word(key, 20)), f / 4294967296);
+  let o1 = f & 4294967295;
+  f = wrap_add(wrap_add(w2, poly_word(key, 24)), f / 4294967296);
+  let o2 = f & 4294967295;
+  f = wrap_add(wrap_add(w3, poly_word(key, 28)), f / 4294967296);
+  let o3 = f & 4294967295;
+  let mut out = balloc(16);
+  store_le32(&mut out, 0, cast[u32](o0));
+  store_le32(&mut out, 4, cast[u32](o1));
+  store_le32(&mut out, 8, cast[u32](o2));
+  store_le32(&mut out, 12, cast[u32](o3));
+  vec_free(r);
+  vec_free(h);
+  return out;
+}
