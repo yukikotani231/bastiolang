@@ -828,6 +828,25 @@ that followed the head when it was read; the rest comes from `sock` until
 the last chunk. The decoded body is at most `limit` bytes. `tight` says
 whether the data read ends with the last chunk's trailers.
 
+### `http_reject`
+
+```bastio
+fn http_reject(h: &Host, c: u64, head: Bytes)
+```
+
+Internal: answers a request head that cannot be served with 400, closes
+the connection and frees the head.
+
+### `http_host_fields`
+
+```bastio
+fn http_host_fields(s: &Bytes, first: u64) -> u64
+  requires first <= blen(s)
+```
+
+Internal: how many `Host` fields the fields from `first` on (up to the
+empty line) hold.
+
 ### `http_is_connection`
 
 ```bastio

@@ -729,26 +729,19 @@ fn http_read_request(h: &Host, c: u64, limit: u64) -> Option[HttpReq] {
     Option::Some(head) => {
       match http_parse_head(head) {
         Head::Ok(q) => {
+          // RFC 9112, section 3.2: an HTTP/1.1 request has exactly one Host.
+          if q.minor == 1 && http_host_fields(head, q.fields) != 1 {
+            http_reject(h, c, head);
+            return Option[HttpReq]::None;
+          }
           return Option[HttpReq]::Some(HttpReq { conn: c, head: head, req: q, body_read: false });
         },
         Head::Partial => {
-          let body = bfrom("bad request\n");
-          let resp = http_response(400, "Bad Request", "text/plain", body);
-          net_send_all(h, c, resp);
-          bfree(resp);
-          bfree(body);
-          net_close(h, c);
-          bfree(head);
+          http_reject(h, c, head);
           return Option[HttpReq]::None;
         },
         Head::Bad(x) => {
-          let body = bfrom("bad request\n");
-          let resp = http_response(400, "Bad Request", "text/plain", body);
-          net_send_all(h, c, resp);
-          bfree(resp);
-          bfree(body);
-          net_close(h, c);
-          bfree(head);
+          http_reject(h, c, head);
           return Option[HttpReq]::None;
         },
       }
@@ -758,6 +751,44 @@ fn http_read_request(h: &Host, c: u64, limit: u64) -> Option[HttpReq] {
       return Option[HttpReq]::None;
     },
   }
+}
+
+/// Internal: answers a request head that cannot be served with 400, closes
+/// the connection and frees the head.
+fn http_reject(h: &Host, c: u64, head: Bytes) {
+  let body = bfrom("bad request\n");
+  let resp = http_response(400, "Bad Request", "text/plain", body);
+  net_send_all(h, c, resp);
+  bfree(resp);
+  bfree(body);
+  net_close(h, c);
+  bfree(head);
+}
+
+/// Internal: how many `Host` fields the fields from `first` on (up to the
+/// empty line) hold.
+fn http_host_fields(s: &Bytes, first: u64) -> u64
+  requires first <= blen(s)
+{
+  let n = blen(s);
+  let mut at = first;
+  let mut count: u64 = 0;
+  while at < n
+    invariant first <= at && at <= n && count <= at
+  {
+    match http_field(s, at) {
+      Next::Ok(f) => {
+        if http_name_is(s, at, f.name_end, "host") {
+          count = count + 1;
+        }
+        at = f.next;
+      },
+      Next::End(x) => { return count; },
+      Next::Partial => { return count; },
+      Next::Bad(x) => { return count; },
+    }
+  }
+  return count;
 }
 
 /// The request target of `r` (the path and query of `GET /a?b HTTP/1.1`), or

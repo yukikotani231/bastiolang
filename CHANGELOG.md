@@ -318,6 +318,8 @@ What will be 0.2.0.
 
 ### Fixed
 
+- `http_read_request` answers an HTTP/1.1 request with no `Host` field, or more than one, with 400 (RFC 9112, section 3.2); it used to pass it on.
+- `json_member` compares a key written with escapes as the string it stands for (RFC 8259, section 4): `{"a\u0062": 1}` has the key `ab`. It compared the bytes as written.
 - `wrap[T](..)`, `wrap_add`, `wrap_sub` and `wrap_mul` are written for the
   solver without `mod`: the result is a fresh value in the type's range
   that differs from the exact one by a multiple of 2^width. Z3 4.8.12 (the
