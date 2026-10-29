@@ -32,8 +32,19 @@ def serve(c):
         name = '.'.join(labels)
         question = q[12:e+5]
         ptr = b'\xc0\x0c'
+        qtype = struct.unpack('>H', q[e+1:e+3])[0]
         rc = 0; ans = []; rid = i; tc = 0
-        if name == 'example.test': ans.append(rr(ptr, 1, bytes([192,0,2,7])))
+        if qtype == 28:
+            v6 = {'example.test': '2001:db8::7', 'frag.test': '2001:db8::9', 'badid.test': '2001:db8::a'}
+            if name in v6: ans.append(rr(ptr, 28, socket.inet_pton(socket.AF_INET6, v6[name])))
+            elif name == 'www.example.test':
+                ans.append(rr(ptr, 5, b'\x07example\x04test\x00'))
+                ans.append(rr(b'\xc0' + bytes([12 + 1 + 3 + 1]), 28, socket.inet_pton(socket.AF_INET6, '2001:db8::8')))
+            elif name == 'badid.test': rid = i ^ 1
+            elif name != 'none.test' and name != 'v4only.test': rc = 3
+            if name == 'badid.test': rid = i ^ 1
+        elif name == 'v4only.test': ans.append(rr(ptr, 1, bytes([192,0,2,12])))
+        elif name == 'example.test': ans.append(rr(ptr, 1, bytes([192,0,2,7])))
         elif name == 'www.example.test':
             ans.append(rr(ptr, 5, b'\x07example\x04test\x00'))
             ans.append(rr(b'\xc0' + bytes([12 + 1 + 3 + 1]), 1, bytes([192,0,2,8])))
@@ -95,5 +106,19 @@ check "a resolver that never answers is given up on (5 seconds)" example.test "$
 elapsed=$(( $(date +%s) - start ))
 if [ "$elapsed" -ge 4 ] && [ "$elapsed" -le 20 ]; then echo "ok   it took $elapsed seconds"
 else echo "FAIL dns: the silent resolver took $elapsed seconds"; fails=$((fails + 1)); fi
+check6() { # description name port want_output want_rc
+  local out rc
+  out=$(timeout 20 "$tmp/lookup" -6 "$2" ${3:+"$3"} 2>&1); rc=$?
+  if [ "$rc" = "$5" ] && [ "$out" = "$4" ]; then echo "ok   $1"
+  else echo "FAIL dns: $1: exit $rc, output '$out'"; fails=$((fails + 1)); fi
+}
+check6 "AAAA record" example.test "$port" 2001:0db8:0000:0000:0000:0000:0000:0007 0
+check6 "CNAME, then the AAAA record" www.example.test "$port" 2001:0db8:0000:0000:0000:0000:0000:0008 0
+check6 "AAAA answer a byte at a time" frag.test "$port" 2001:0db8:0000:0000:0000:0000:0000:0009 0
+check6 "a host with only an A record" v4only.test "$port" "not found" 1
+check6 "AAAA: name error" nx.test "$port" "not found" 1
+check6 "AAAA: wrong id" badid.test "$port" "not found" 1
+check6 "name already an IPv6 address" 2001:db8::1 "" 2001:0db8:0000:0000:0000:0000:0000:0001 0
+check6 "localhost" localhost "" 0000:0000:0000:0000:0000:0000:0000:0001 0
 check "nothing listens" example.test 1 "not found" 1
 [ $fails = 0 ] && echo "dns: all passed" || { echo "dns: $fails failed"; exit 1; }

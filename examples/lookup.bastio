@@ -3,6 +3,7 @@
 //
 //   lookup NAME             the system's resolver (/etc/resolv.conf)
 //   lookup NAME PORT        a resolver on 127.0.0.1:PORT (for tests)
+//   lookup -6 NAME [PORT]   the same for the IPv6 address (AAAA record)
 //   lookup                  a check that needs no network
 //
 // A name that is a dotted-quad address is printed as it is. It exits with 0
@@ -27,6 +28,71 @@ fn show(con: &mut Serial, ip: u64) {
   print_str(con, ".");
   print_u64(con, ip % 256);
   print_str(con, "\n");
+}
+
+fn hex_digit(v: u64) -> Str
+  requires v < 16
+{
+  if v == 0 { return "0"; } if v == 1 { return "1"; } if v == 2 { return "2"; } if v == 3 { return "3"; }
+  if v == 4 { return "4"; } if v == 5 { return "5"; } if v == 6 { return "6"; } if v == 7 { return "7"; }
+  if v == 8 { return "8"; } if v == 9 { return "9"; } if v == 10 { return "a"; } if v == 11 { return "b"; }
+  if v == 12 { return "c"; } if v == 13 { return "d"; } if v == 14 { return "e"; }
+  return "f";
+}
+
+/// Prints the 16 bytes `a` as eight groups of hex digits (no compression).
+fn show6(con: &mut Serial, a: &Bytes)
+  requires blen(a) == 16
+{
+  let mut i = 0;
+  while i < 8
+    invariant i <= 8 && blen(a) == 16
+  {
+    let w = cast[u64](bget(a, 2 * i)) * 256 + cast[u64](bget(a, 2 * i + 1));
+    print_str(con, hex_digit(w / 4096));
+    print_str(con, hex_digit((w / 256) % 16));
+    print_str(con, hex_digit((w / 16) % 16));
+    print_str(con, hex_digit(w % 16));
+    if i < 7 { print_str(con, ":"); }
+    i = i + 1;
+  }
+  print_str(con, "\n");
+}
+
+fn finish6(con: &mut Serial, found: Option[Bytes]) -> u64 {
+  match found {
+    Option::Some(a) => {
+      if blen(a) == 16 { show6(&mut con, a); }
+      bfree(a);
+      return 0;
+    },
+    Option::None => { print_str(con, "not found\n"); return 1; },
+  }
+}
+
+fn lookup6(con: &mut Serial, h: &Host) -> u64 {
+  let n = host_argc(h);
+  if n != 3 && n != 4 {
+    print_str(con, "usage: lookup -6 NAME [PORT]\n");
+    return 2;
+  }
+  let name = host_arg(h, 2);
+  if n == 4 {
+    let a_port = host_arg(h, 3);
+    let port = opt_or[u64](parse_u64(a_port, 0, blen(a_port)), 0);
+    bfree(a_port);
+    if port == 0 {
+      bfree(name);
+      print_str(con, "usage: lookup -6 NAME [PORT]\n");
+      return 2;
+    }
+    let found = dns_lookup6_at(h, net_ip4(127, 0, 0, 1), port, name);
+    bfree(name);
+    return finish6(&mut con, found);
+  }
+  let found = dns_lookup6(h, name);
+  bfree(name);
+  return finish6(&mut con, found);
 }
 
 fn selfcheck(con: &mut Serial, h: &Host) -> u64 {
@@ -57,6 +123,12 @@ fn selfcheck(con: &mut Serial, h: &Host) -> u64 {
 fn main(con: &mut Serial, h: &mut Host) -> u64 {
   if host_argc(h) == 1 {
     return selfcheck(&mut con, h);
+  }
+  if host_argc(h) >= 3 {
+    let flag = host_arg(h, 1);
+    let six = bytes_eq_str(flag, "-6");
+    bfree(flag);
+    if six { return lookup6(&mut con, h); }
   }
   if host_argc(h) != 2 && host_argc(h) != 3 {
     print_str(con, "usage: lookup NAME [PORT]\n");

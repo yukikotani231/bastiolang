@@ -63,6 +63,28 @@ fn dns_push_labels(t: &mut Vec[u8], name: &Bytes) -> bool
 fn dns_query(name: &Bytes, id: u64) -> Option[Bytes]
   requires id < 65536
 {
+  return dns_query_type(name, id, 1);
+}
+
+/// `dns_query` for records of type `ty` (1 is A, 28 is AAAA).
+/// ```
+/// let name = bfrom("a.b");
+/// let mut bad = 1;
+/// match dns_query_type(name, 4660, 28) {
+///   Option::Some(q) => {
+///     if blen(q) == 12 + 1 + 1 + 1 + 1 + 1 + 4 && bget(q, 17) == 28 {
+///       bad = 0;
+///     }
+///     bfree(q);
+///   },
+///   Option::None => {},
+/// }
+/// bfree(name);
+/// if bad != 0 { return 1; }
+/// ```
+fn dns_query_type(name: &Bytes, id: u64, ty: u64) -> Option[Bytes]
+  requires id < 65536 && ty < 65536
+{
   if blen(name) < 1 || blen(name) > 253 { return Option[Bytes]::None; }
   let mut t = text_new();
   text_push(&mut t, cast[u8](id / 256));
@@ -81,8 +103,8 @@ fn dns_query(name: &Bytes, id: u64) -> Option[Bytes]
     vec_free(t);
     return Option[Bytes]::None;
   }
-  text_push(&mut t, 0);
-  text_push(&mut t, 1);
+  text_push(&mut t, cast[u8](ty / 256));
+  text_push(&mut t, cast[u8](ty % 256));
   text_push(&mut t, 0);
   text_push(&mut t, 1);
   return Option[Bytes]::Some(text_finish(t));
@@ -416,4 +438,193 @@ fn dns_hosts(text: &Bytes, name: &Bytes) -> Option[u64]
   bfree(local);
   if is_local { return Option[u64]::Some(2130706433); }
   return Option[u64]::None;
+}
+
+/// Internal: the first AAAA record of `cnt` answers that start at `from`.
+fn dns_scan_aaaa(msg: &Bytes, from: u64, cnt: u64) -> Option[Bytes]
+  requires from <= blen(msg) && cnt < 65536
+  ensures result is Option::Some ==> blen(result.Some) == 16
+{
+  let n = blen(msg);
+  let mut at = from;
+  let mut i = 0;
+  while i < cnt
+    invariant i <= cnt && at <= n
+  {
+    let p = dns_skip_name(msg, at);
+    if p == 0 || p + 10 > n { return Option[Bytes]::None; }
+    let ty = cast[u64](load_be16(msg, p));
+    let cls = cast[u64](load_be16(msg, p + 2));
+    let rl = cast[u64](load_be16(msg, p + 8));
+    if p + 10 + rl > n { return Option[Bytes]::None; }
+    if ty == 28 && cls == 1 && rl == 16 {
+      return Option[Bytes]::Some(bytes_slice(msg, p + 10, p + 26));
+    }
+    at = p + 10 + rl;
+    i = i + 1;
+  }
+  return Option[Bytes]::None;
+}
+
+/// The IPv6 address (16 bytes, network order) in the first AAAA record of the
+/// response `msg` to an AAAA query with id `id`; `None` if the response is not
+/// a complete answer without error to that query or holds no AAAA record.
+/// ```
+/// // a.b -> 2001:db8::1, the answer's name a pointer to the question's.
+/// let mut t = text_new();
+/// text_push(&mut t, 18); text_push(&mut t, 52); text_push(&mut t, 129); text_push(&mut t, 128);
+/// text_push(&mut t, 0); text_push(&mut t, 1); text_push(&mut t, 0); text_push(&mut t, 1);
+/// text_push(&mut t, 0); text_push(&mut t, 0); text_push(&mut t, 0); text_push(&mut t, 0);
+/// text_push(&mut t, 1); text_push(&mut t, 97); text_push(&mut t, 1); text_push(&mut t, 98); text_push(&mut t, 0);
+/// text_push(&mut t, 0); text_push(&mut t, 28); text_push(&mut t, 0); text_push(&mut t, 1);
+/// text_push(&mut t, 192); text_push(&mut t, 12);
+/// text_push(&mut t, 0); text_push(&mut t, 28); text_push(&mut t, 0); text_push(&mut t, 1);
+/// text_push(&mut t, 0); text_push(&mut t, 0); text_push(&mut t, 0); text_push(&mut t, 60);
+/// text_push(&mut t, 0); text_push(&mut t, 16);
+/// text_push(&mut t, 32); text_push(&mut t, 1); text_push(&mut t, 13); text_push(&mut t, 184);
+/// text_push(&mut t, 0); text_push(&mut t, 0); text_push(&mut t, 0); text_push(&mut t, 0);
+/// text_push(&mut t, 0); text_push(&mut t, 0); text_push(&mut t, 0); text_push(&mut t, 0);
+/// text_push(&mut t, 0); text_push(&mut t, 0); text_push(&mut t, 0); text_push(&mut t, 1);
+/// let msg = text_finish(t);
+/// let mut bad = 1;
+/// match dns_parse_aaaa(msg, 4660) {
+///   Option::Some(a) => {
+///     if blen(a) == 16 && bget(a, 0) == 32 && bget(a, 3) == 184 && bget(a, 15) == 1 { bad = 0; }
+///     bfree(a);
+///   },
+///   Option::None => {},
+/// }
+/// bfree(msg);
+/// if bad != 0 { return 1; }
+/// ```
+fn dns_parse_aaaa(msg: &Bytes, id: u64) -> Option[Bytes]
+  requires blen(msg) < 1073741824
+  ensures result is Option::Some ==> blen(result.Some) == 16
+{
+  let cnt = dns_answers(msg, id);
+  if cnt == 0 { return Option[Bytes]::None; }
+  let q = dns_skip_name(msg, 12);
+  if q == 0 || q + 4 > blen(msg) { return Option[Bytes]::None; }
+  return dns_scan_aaaa(msg, q + 4, cnt);
+}
+
+/// Internal: the value of the hex digit `c`, 16 if it is none.
+fn dns_hexval(c: u8) -> u64
+  ensures result <= 16
+{
+  if c >= 48 && c <= 57 { return cast[u64](c) - 48; }
+  if c >= 97 && c <= 102 { return cast[u64](c) - 87; }
+  if c >= 65 && c <= 70 { return cast[u64](c) - 55; }
+  return 16;
+}
+
+/// The IPv6 address written in `t[from..to]` as groups of one to four hex
+/// digits between colons, with at most one `::` for a run of zero groups
+/// (no embedded dotted quad, no zone): 16 bytes in network order, or `None`.
+/// ```
+/// let t = bfrom("2001:db8::1");
+/// let mut bad = 1;
+/// match dns_ip6(t, 0, blen(t)) {
+///   Option::Some(a) => {
+///     if blen(a) == 16 && bget(a, 0) == 32 && bget(a, 1) == 1 && bget(a, 2) == 13 && bget(a, 3) == 184 && bget(a, 14) == 0 && bget(a, 15) == 1 { bad = 0; }
+///     bfree(a);
+///   },
+///   Option::None => {},
+/// }
+/// bfree(t);
+/// if bad != 0 { return 1; }
+/// ```
+fn dns_ip6(t: &Bytes, from: u64, to: u64) -> Option[Bytes]
+  requires from <= to && to <= blen(t)
+  ensures result is Option::Some ==> blen(result.Some) == 16
+{
+  let mut head = text_new();
+  let mut tail = text_new();
+  let mut nh: u64 = 0;
+  let mut nt: u64 = 0;
+  let mut in_tail = false;
+  let mut gap = false;
+  let mut ok = true;
+  let mut at = from;
+  if to - from >= 2 && bget(t, from) == 58 && bget(t, from + 1) == 58 {
+    gap = true;
+    in_tail = true;
+    at = from + 2;
+  } else if from < to && bget(t, from) == 58 {
+    ok = false;
+  }
+  while ok && at < to
+    invariant at >= from && at <= to && nh <= 16 && nt <= 16
+    invariant vlen(head) == nh && vlen(tail) == nt
+  {
+    let mut v: u64 = 0;
+    let mut d: u64 = 0;
+    let mut more = true;
+    while more && at + d < to && d < 4
+      invariant d <= 4 && at + d <= to && v < 65536
+      invariant (d == 0 ==> v == 0) && (d == 1 ==> v < 16) && (d == 2 ==> v < 256) && (d == 3 ==> v < 4096)
+    {
+      let dv = dns_hexval(bget(t, at + d));
+      if dv < 16 {
+        v = v * 16 + dv;
+        d = d + 1;
+      } else {
+        more = false;
+      }
+    }
+    if d == 0 || nh + nt > 14 {
+      ok = false;
+    } else {
+      if in_tail {
+        text_push(&mut tail, cast[u8](v / 256));
+        text_push(&mut tail, cast[u8](v % 256));
+        nt = nt + 2;
+      } else {
+        text_push(&mut head, cast[u8](v / 256));
+        text_push(&mut head, cast[u8](v % 256));
+        nh = nh + 2;
+      }
+      at = at + d;
+      if at < to {
+        if bget(t, at) != 58 {
+          ok = false;
+        } else if at + 1 < to && bget(t, at + 1) == 58 {
+          if gap {
+            ok = false;
+          } else {
+            gap = true;
+            in_tail = true;
+            at = at + 2;
+          }
+        } else if at + 1 >= to {
+          ok = false;
+        } else {
+          at = at + 1;
+        }
+      }
+    }
+  }
+  let total = nh + nt;
+  if ok && ((gap && total <= 14) || (!gap && total == 16)) {
+    let mut out = text_new();
+    let hb = text_to_bytes(head);
+    let tb = text_to_bytes(tail);
+    text_push_bytes(&mut out, hb);
+    let mut z = total;
+    while z < 16
+      invariant z <= 16 && vlen(out) == nh + (z - total)
+    {
+      text_push(&mut out, 0);
+      z = z + 1;
+    }
+    text_push_bytes(&mut out, tb);
+    bfree(hb);
+    bfree(tb);
+    vec_free(head);
+    vec_free(tail);
+    return Option[Bytes]::Some(text_finish(out));
+  }
+  vec_free(head);
+  vec_free(tail);
+  return Option[Bytes]::None;
 }
