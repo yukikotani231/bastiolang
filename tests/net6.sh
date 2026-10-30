@@ -19,6 +19,8 @@ cat > "$tmp/shim.c" <<'C'
 #include <stdio.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <errno.h>
+#include <stdlib.h>
 int socket(int d, int t, int p) {
     int (*real)(int, int, int) = (int (*)(int, int, int))dlsym(RTLD_NEXT, "socket");
     fprintf(stderr, "socket %d\n", d);
@@ -29,6 +31,7 @@ int connect(int fd, const struct sockaddr *a, socklen_t l) {
     fprintf(stderr, "connect %u ", (unsigned)l);
     for (socklen_t i = 0; i < l; i++) fprintf(stderr, "%02x", b[i]);
     fprintf(stderr, "\n");
+    if (getenv("SHIM_FAIL")) { errno = ENETUNREACH; return -1; }   // a connect that fails at once, as with no route
     return 0;
 }
 C
@@ -46,6 +49,8 @@ for backend in "" "--backend c" "--backend native" "--backend native-ir"; do
     name=${backend:-default}
     "$BASTIOC" $backend -o "$tmp/p" tests/pass/host_net6.bastio >/dev/null 2>"$tmp/err" || { fail "$name: cannot build ($(head -c 200 "$tmp/err"))"; continue; }
     check_probe "x86-64 $name: sockaddr_in6 reaches connect" "$tmp/p"
+    # A connect that fails at once (no route) fails the call, with a time limit too.
+    if SHIM_FAIL=1 LD_PRELOAD="$tmp/shim.so" "$tmp/p" up 5 >/dev/null 2>&1; then fail "x86-64 $name: a connect that fails at once was taken for a success"; else echo "ok   x86-64 $name: a connect that fails at once fails"; fi
 done
 if command -v aarch64-linux-gnu-gcc >/dev/null && command -v qemu-aarch64 >/dev/null; then
     aarch64-linux-gnu-gcc -shared -fPIC -o "$tmp/shim64.so" "$tmp/shim.c" -ldl || fail "cannot build the AArch64 shim"
@@ -56,6 +61,7 @@ if command -v aarch64-linux-gnu-gcc >/dev/null && command -v qemu-aarch64 >/dev/
         want="2 $want_connect
 2 socket 10"
         if [ "$out" = "$want" ]; then echo "ok   aarch64 $backend: sockaddr_in6 reaches connect"; else fail "aarch64 $backend: got '$out'"; fi
+        if SHIM_FAIL=1 QEMU_SET_ENV="LD_PRELOAD=$tmp/shim64.so,SHIM_FAIL=1" qemu-aarch64 "$tmp/p64" up 5 >/dev/null 2>&1; then fail "aarch64 $backend: a connect that fails at once was taken for a success"; else echo "ok   aarch64 $backend: a connect that fails at once fails"; fi
     done
 else
     echo "net6: aarch64-linux-gnu-gcc or qemu-aarch64 is missing, the AArch64 runs are SKIPPED"
