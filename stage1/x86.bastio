@@ -9294,10 +9294,12 @@ fn x86_runtime1(out: &mut Vec[u64], macos: bool, windows: bool) {
   w_s(&mut out, "	push %r12\n");
   w_s(&mut out, "	push %r13\n");
   w_s(&mut out, "	push %r14\n");
-  w_s(&mut out, "	sub $48, %rsp\n");
+  w_s(&mut out, "	sub $64, %rsp\n");
   w_s(&mut out, "	mov %rsi, %rbx\n");
   w_s(&mut out, "	mov %rdx, %r12\n");
   w_s(&mut out, "	mov %rcx, %r13\n");
+  w_s(&mut out, "	cmp $9, %rdi\n");
+  w_s(&mut out, "	je 10f\n");
   w_s(&mut out, "	cmp $0, %rdi\n");
   w_s(&mut out, "	je 10f\n");
   w_s(&mut out, "	cmp $2, %rdi\n");
@@ -9324,7 +9326,17 @@ fn x86_runtime1(out: &mut Vec[u64], macos: bool, windows: bool) {
   w_s(&mut out, "	pop %rbx\n");
   w_s(&mut out, "	pop %rbp\n");
   w_s(&mut out, "	ret\n");
-  w_s(&mut out, "10:	mov %rdi, %r14                # the socket address at (%rsp): family, port and address in network order\n");
+  w_s(&mut out, "10:	mov %rdi, %r14                # the socket address at (%rsp): family, port and address in network order (op 9: a sockaddr_in6, 28 bytes, its address kept at 48(%rsp) meanwhile)\n");
+  w_s(&mut out, "	cmp $9, %r14\n");
+  w_s(&mut out, "	jne 40f\n");
+  w_s(&mut out, "	cmpq $16, (%r13)               # the address: a Bytes of 16\n");
+  w_s(&mut out, "	jne 8b\n");
+  w_s(&mut out, "	mov 8(%r13), %rax\n");
+  w_s(&mut out, "	mov (%rax), %rcx\n");
+  w_s(&mut out, "	mov %rcx, 48(%rsp)\n");
+  w_s(&mut out, "	mov 8(%rax), %rcx\n");
+  w_s(&mut out, "	mov %rcx, 56(%rsp)\n");
+  w_s(&mut out, "40:\n");
   if !windows {
     w_s(&mut out, "	mov %r12, %r13                # %r13 = the time limit of a connect in milliseconds (0: none), in the bits of the port word above bit 15\n");
     w_s(&mut out, "	shr $16, %r13\n");
@@ -9353,6 +9365,27 @@ fn x86_runtime1(out: &mut Vec[u64], macos: bool, windows: bool) {
   w_s(&mut out, "	movb %al, 6(%rsp)\n");
   w_s(&mut out, "	movb %bl, 7(%rsp)\n");
   w_s(&mut out, "	mov $2, %edi\n");
+  w_s(&mut out, "	cmp $9, %r14\n");
+  w_s(&mut out, "	jne 41f\n");
+  // IPv6: the family, the flow label (zero), the address and the scope (zero).
+  if macos {
+    w_s(&mut out, "	movb $28, (%rsp)               # sin6_len, sin6_family\n");
+    w_s(&mut out, "	movb $30, 1(%rsp)\n");
+    w_s(&mut out, "	mov $30, %edi\n");
+  } else if windows {
+    w_s(&mut out, "	movw $23, (%rsp)\n");
+    w_s(&mut out, "	mov $23, %edi\n");
+  } else {
+    w_s(&mut out, "	movw $10, (%rsp)\n");
+    w_s(&mut out, "	mov $10, %edi\n");
+  }
+  w_s(&mut out, "	movl $0, 4(%rsp)\n");
+  w_s(&mut out, "	mov 48(%rsp), %rax\n");
+  w_s(&mut out, "	mov %rax, 8(%rsp)\n");
+  w_s(&mut out, "	mov 56(%rsp), %rax\n");
+  w_s(&mut out, "	mov %rax, 16(%rsp)\n");
+  w_s(&mut out, "	movl $0, 24(%rsp)\n");
+  w_s(&mut out, "41:\n");
   w_s(&mut out, "	mov $1, %esi\n");
   w_s(&mut out, "	xor %edx, %edx\n");
   w_s(&mut out, "	call socket@PLT\n");
@@ -9400,6 +9433,9 @@ fn x86_runtime1(out: &mut Vec[u64], macos: bool, windows: bool) {
   w_s(&mut out, "	mov %r12d, %edi\n");
   w_s(&mut out, "	mov %rsp, %rsi\n");
   w_s(&mut out, "	mov $16, %edx\n");
+  w_s(&mut out, "	mov $28, %eax\n");
+  w_s(&mut out, "	cmp $9, %r14\n");
+  w_s(&mut out, "	cmove %eax, %edx\n");
   w_s(&mut out, "	call connect@PLT\n");
   w_s(&mut out, "	test %eax, %eax\n");
   w_s(&mut out, "	jnz 17f\n");
@@ -9417,7 +9453,7 @@ fn x86_runtime1(out: &mut Vec[u64], macos: bool, windows: bool) {
     w_s(&mut out, "	call fcntl@PLT\n");
     w_s(&mut out, "	test %eax, %eax\n");
     w_s(&mut out, "	js 17f\n");
-    w_s(&mut out, "	mov %eax, 24(%rsp)\n");
+    w_s(&mut out, "	mov %eax, 28(%rsp)\n");
     if macos {
       w_s(&mut out, "	or $0x4, %eax                 # O_NONBLOCK\n");
     } else {
@@ -9433,6 +9469,9 @@ fn x86_runtime1(out: &mut Vec[u64], macos: bool, windows: bool) {
     w_s(&mut out, "	mov %r12d, %edi\n");
     w_s(&mut out, "	mov %rsp, %rsi\n");
     w_s(&mut out, "	mov $16, %edx\n");
+    w_s(&mut out, "	mov $28, %eax\n");
+    w_s(&mut out, "	cmp $9, %r14\n");
+    w_s(&mut out, "	cmove %eax, %edx\n");
     w_s(&mut out, "	call connect@PLT\n");
     w_s(&mut out, "	test %eax, %eax\n");
     w_s(&mut out, "	jz 31f\n");
@@ -9461,9 +9500,17 @@ fn x86_runtime1(out: &mut Vec[u64], macos: bool, windows: bool) {
     w_s(&mut out, "	jnz 17f\n");
     w_s(&mut out, "	cmpl $0, 40(%rsp)\n");
     w_s(&mut out, "	jne 17f\n");
+    // A connect that failed at once leaves no error to read: ask for the peer (the address is not needed any more).
+    w_s(&mut out, "	movl $28, 44(%rsp)\n");
+    w_s(&mut out, "	mov %r12d, %edi\n");
+    w_s(&mut out, "	mov %rsp, %rsi\n");
+    w_s(&mut out, "	lea 44(%rsp), %rdx\n");
+    w_s(&mut out, "	call getpeername@PLT\n");
+    w_s(&mut out, "	test %eax, %eax\n");
+    w_s(&mut out, "	jnz 17f\n");
     w_s(&mut out, "31:	mov %r12d, %edi\n");
     w_s(&mut out, "	mov $4, %esi                  # F_SETFL: blocking again\n");
-    w_s(&mut out, "	mov 24(%rsp), %edx\n");
+    w_s(&mut out, "	mov 28(%rsp), %edx\n");
     w_s(&mut out, "	xor %eax, %eax\n");
     w_s(&mut out, "	call fcntl@PLT\n");
     w_s(&mut out, "	test %eax, %eax\n");

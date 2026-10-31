@@ -20,6 +20,7 @@ certificates and no resumption; see core/tls13client.bastio for what is checked 
 | [`https_result_free`](#https_result_free) | Frees a result (see `https_run`). |
 | [`https_request`](#https_request) | Connects to `ip`:`port`, runs a TLS exchange with the server `name` (see `https_run`) and returns what the server sent after `request`, if it ended with a close_notify (a connection that is cut off, which could hide a truncated answer, gives `None`, as does any failure of the handshake). |
 | [`https_exchange`](#https_exchange) | Like `https_request`, but gives the whole result whatever state the exchange ended in (6 for a close_notify, 5 for a connection that was cut off after the handshake, 7 for a failure), for a caller that can tell by other means (a `Content-Length`) whether the answer is complete. |
+| [`https_exchange6`](#https_exchange6) | `https_exchange` to the IPv6 address `ip6` (16 bytes, network order). |
 | [`https_get`](#https_get) | A `GET` of `path` on the server `name` over HTTPS (HTTP/1.0 with the connection closed after the answer). |
 | [`https_get_by_name`](#https_get_by_name) | `https_get` for a server given by `name`, whose address comes from the system's resolver (std/dns; a name that is a dotted-quad address is used as it is). |
 | [`https_reply_free`](#https_reply_free) | Frees a reply. |
@@ -183,6 +184,34 @@ bfree(name);
 if bad != 0 { return 1; }
 ```
 
+### `https_exchange6`
+
+```bastio
+fn https_exchange6(h: &Host, ip6: &Bytes, port: u64, name: &Bytes, request: &Bytes, roots: &Bytes) -> Option[HttpsResult]
+  requires blen(name) <= 255 && blen(request) < 1073741824 && blen(roots) < 274877906944
+```
+
+`https_exchange` to the IPv6 address `ip6` (16 bytes, network order).
+
+Example:
+
+```bastio
+let name = bfrom("localhost");
+let request = bfrom("GET / HTTP/1.0\r\n\r\n");
+let roots = balloc(0);
+let lo = bfrom("0123456789abcdef");
+let mut bad = 0;
+match https_exchange6(host, lo, 1, name, request, roots) {
+  Option::Some(r) => { https_result_free(r); bad = 1; },
+  Option::None => {},
+}
+bfree(lo);
+bfree(roots);
+bfree(request);
+bfree(name);
+if bad != 0 { return 1; }
+```
+
 ### `https_get`
 
 ```bastio
@@ -267,7 +296,8 @@ fn https_fetch(h: &Host, url: &Bytes, roots: &Bytes, redirects: u64) -> Option[H
   requires blen(url) < 65536 && blen(roots) < 274877906944 && redirects <= 16
 ```
 
-Fetches the `https://` URL `url`: looks the host up, connects, checks the
+Fetches the `https://` URL `url`: looks the host up (its IPv4 address, or
+if it has none or the connection fails, its IPv6 address), connects, checks the
 server against `roots` and returns the status and body of the answer
 (HTTP/1.1 with the connection closed after it; the body is the data behind
 the head, with a chunked body decoded). A redirect (301, 302, 303, 307, 308) to a path on the
@@ -302,6 +332,16 @@ fn https_flush(h: &Host, sock: u64, out: &mut Vec[u8]) -> bool
 ```
 
 Internal: sends what is in `out` over the socket and empties it. False if sending fails.
+
+### `https_on`
+
+```bastio
+fn https_on(h: &Host, sock: u64, name: &Bytes, request: &Bytes, roots: &Bytes, rnd: &Bytes) -> HttpsResult
+  requires blen(name) <= 255 && blen(request) < 1073741824 && blen(roots) < 274877906944 && blen(rnd) == 96
+```
+
+Internal: the exchange over the connected socket `sock`, with the 96
+random bytes `rnd`; closes the socket.
 
 ### `https_connected`
 
@@ -363,6 +403,16 @@ fn https_has(m: &Bytes, name: Str) -> bool
 ```
 
 Internal: does the head of `m` have the header `name`?
+
+### `https_try4`
+
+```bastio
+fn https_try4(h: &Host, u: &HttpsUrl, request: &Bytes, roots: &Bytes) -> Option[HttpsResult]
+  requires blen(u.host) <= 255 && blen(request) < 1073741824 && blen(roots) < 274877906944
+```
+
+Internal: `https_exchange` to the IPv4 address of the host of `u`; `None`
+if it has none or the connection cannot be made.
 
 ### `https_step`
 

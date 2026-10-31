@@ -10,7 +10,7 @@
 //
 // `call(op, a, b, data)` takes the operations of `bst_host_net` in the C
 // prelude (0 listen, 1 accept, 2 connect, 3 read at most b bytes, 4 write
-// `data`, 5 close, 6 local port) and returns `{ result, data }`; a failure is
+// `data`, 5 close, 6 local port, 9 connect to the IPv6 address in `data`, 16 bytes) and returns `{ result, data }`; a failure is
 // 2^64 - 1. A listen or connect address is in host order.
 'use strict';
 const { Worker, isMainThread, workerData } = require('worker_threads');
@@ -103,9 +103,14 @@ if (isMainThread) {
       if (!o) return reply(FAIL);
       const go = () => { if (o.queue.length) reply(o.queue.shift()); else o.wait = go; };
       go();
-    } else if (op === 2n) {
+    } else if (op === 2n || op === 9n) {
       const limit = Number(BigInt.asUintN(48, b) >> 16n);   // the bits of the port word above bit 15: a time limit in milliseconds
-      const s = net.connect({ host: ip(BigInt.asUintN(32, a)), port: Number(b & 0xffffn) });
+      let host;
+      if (op === 9n) {
+        if (!payload || payload.length !== 16) return reply(FAIL);
+        host = Array.from({ length: 8 }, (_, i) => ((payload[2 * i] << 8) | payload[2 * i + 1]).toString(16)).join(':');
+      } else host = ip(BigInt.asUintN(32, a));
+      const s = net.connect({ host, port: Number(b & 0xffffn) });
       let done = false;
       const timer = limit > 0 ? setTimeout(() => { if (!done) { done = true; s.destroy(); reply(FAIL); } }, Math.min(limit, 3600000)) : null;
       s.once('connect', () => { if (done) return; done = true; if (timer) clearTimeout(timer); const id = track(s); socks.get(id).limit = limit > 0 ? Math.min(limit, 3600000) : 0; reply(id); });

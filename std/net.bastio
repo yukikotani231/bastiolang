@@ -126,6 +126,37 @@ fn net_connect_timeout(h: &Host, ip: u64, port: u64, ms: u64) -> Option[u64] {
   return Option[u64]::Some(r);
 }
 
+/// Connects over IPv6 to the 16-byte address `ip` (network order, as
+/// `dns_ip6` makes it) and `port`, giving up after `ms` milliseconds (as
+/// `net_connect_timeout`). `None` if `ip` is not 16 bytes, the host has no
+/// IPv6, or the connection fails.
+/// ```
+/// // An address that nothing answers on port 1 (or a host with no IPv6):
+/// // either way the connection fails.
+/// let lo = bfrom("0123456789abcdef");
+/// let mut bad = 0;
+/// match net_connect6(host, lo, 1, 1000) {
+///   Option::Some(c) => { net_close(host, c); bad = 1; },
+///   Option::None => {},
+/// }
+/// bfree(lo);
+/// if bad != 0 { return 1; }
+/// ```
+fn net_connect6(h: &Host, ip: &Bytes, port: u64, ms: u64) -> Option[u64] {
+  if blen(ip) != 16 {
+    return Option[u64]::None;
+  }
+  let mut limit = ms;
+  if limit > 3600000 { limit = 3600000; }
+  let mut a = bytes_slice(ip, 0, 16);
+  let r = host_net(h, 9, 0, port % 65536 + limit * 65536, &mut a);
+  bfree(a);
+  if r == 18446744073709551615 {
+    return Option[u64]::None;
+  }
+  return Option[u64]::Some(r);
+}
+
 /// Waits for a connection on a listening socket and returns it.
 /// ```
 /// let lo = net_ip4(127, 0, 0, 1);

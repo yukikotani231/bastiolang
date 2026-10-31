@@ -18,6 +18,7 @@ listener, a closed descriptor, an address in use) gives `Option::None` or
 | [`net_port`](#net_port) | The port a listening socket is bound to. |
 | [`net_connect`](#net_connect) | Connects to `ip`:`port`. |
 | [`net_connect_timeout`](#net_connect_timeout) | Connects to `ip`:`port` within `ms` milliseconds (0 means no limit, as `net_connect`; more than an hour is cut to an hour). |
+| [`net_connect6`](#net_connect6) | Connects over IPv6 to the 16-byte address `ip` (network order, as `dns_ip6` makes it) and `port`, giving up after `ms` milliseconds (as `net_connect_timeout`). |
 | [`net_accept`](#net_accept) | Waits for a connection on a listening socket and returns it. |
 | [`net_recv`](#net_recv) | Reads up to `max` bytes into `out` (replacing it). |
 | [`net_send_all`](#net_send_all) | Sends all of `data`, retrying after a partial write. |
@@ -150,6 +151,32 @@ match net_listen(host, lo, 0) {
   },
   Option::None => {},
 }
+if bad != 0 { return 1; }
+```
+
+### `net_connect6`
+
+```bastio
+fn net_connect6(h: &Host, ip: &Bytes, port: u64, ms: u64) -> Option[u64]
+```
+
+Connects over IPv6 to the 16-byte address `ip` (network order, as
+`dns_ip6` makes it) and `port`, giving up after `ms` milliseconds (as
+`net_connect_timeout`). `None` if `ip` is not 16 bytes, the host has no
+IPv6, or the connection fails.
+
+Example:
+
+```bastio
+// An address that nothing answers on port 1 (or a host with no IPv6):
+// either way the connection fails.
+let lo = bfrom("0123456789abcdef");
+let mut bad = 0;
+match net_connect6(host, lo, 1, 1000) {
+  Option::Some(c) => { net_close(host, c); bad = 1; },
+  Option::None => {},
+}
+bfree(lo);
 if bad != 0 { return 1; }
 ```
 

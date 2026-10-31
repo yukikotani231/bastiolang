@@ -197,6 +197,22 @@ fn https_exchange(h: &Host, ip: u64, port: u64, name: &Bytes, request: &Bytes, r
   }
 }
 
+/// Internal: the exchange over the connected socket `sock`, with the 96
+/// random bytes `rnd`; closes the socket.
+fn https_on(h: &Host, sock: u64, name: &Bytes, request: &Bytes, roots: &Bytes, rnd: &Bytes) -> HttpsResult
+  requires blen(name) <= 255 && blen(request) < 1073741824 && blen(roots) < 274877906944 && blen(rnd) == 96
+{
+  let random = bytes_slice(rnd, 0, 32);
+  let session = bytes_slice(rnd, 32, 64);
+  let key = bytes_slice(rnd, 64, 96);
+  let r = https_run(h, sock, name, request, roots, net_now(h), random, session, key);
+  net_close(h, sock);
+  bfree(key);
+  bfree(session);
+  bfree(random);
+  return r;
+}
+
 /// Internal: `https_exchange` with the 96 random bytes `rnd` already drawn.
 fn https_connected(h: &Host, ip: u64, port: u64, name: &Bytes, request: &Bytes, roots: &Bytes, rnd: &Bytes) -> Option[HttpsResult]
   requires blen(name) <= 255 && blen(request) < 1073741824 && blen(roots) < 274877906944 && blen(rnd) == 96
@@ -204,15 +220,42 @@ fn https_connected(h: &Host, ip: u64, port: u64, name: &Bytes, request: &Bytes, 
   match net_connect_timeout(h, ip, port, 20000) {
     Option::None => { return Option[HttpsResult]::None; },
     Option::Some(sock) => {
-      let random = bytes_slice(rnd, 0, 32);
-      let session = bytes_slice(rnd, 32, 64);
-      let key = bytes_slice(rnd, 64, 96);
-      let r = https_run(h, sock, name, request, roots, net_now(h), random, session, key);
-      net_close(h, sock);
-      bfree(key);
-      bfree(session);
-      bfree(random);
-      return Option[HttpsResult]::Some(r);
+      return Option[HttpsResult]::Some(https_on(h, sock, name, request, roots, rnd));
+    },
+  }
+}
+
+/// `https_exchange` to the IPv6 address `ip6` (16 bytes, network order).
+/// ```
+/// let name = bfrom("localhost");
+/// let request = bfrom("GET / HTTP/1.0\r\n\r\n");
+/// let roots = balloc(0);
+/// let lo = bfrom("0123456789abcdef");
+/// let mut bad = 0;
+/// match https_exchange6(host, lo, 1, name, request, roots) {
+///   Option::Some(r) => { https_result_free(r); bad = 1; },
+///   Option::None => {},
+/// }
+/// bfree(lo);
+/// bfree(roots);
+/// bfree(request);
+/// bfree(name);
+/// if bad != 0 { return 1; }
+/// ```
+fn https_exchange6(h: &Host, ip6: &Bytes, port: u64, name: &Bytes, request: &Bytes, roots: &Bytes) -> Option[HttpsResult]
+  requires blen(name) <= 255 && blen(request) < 1073741824 && blen(roots) < 274877906944
+{
+  match net_random(h, 96) {
+    Option::None => { return Option[HttpsResult]::None; },
+    Option::Some(rnd) => {
+      match net_connect6(h, ip6, port, 20000) {
+        Option::None => { bfree(rnd); return Option[HttpsResult]::None; },
+        Option::Some(sock) => {
+          let r = https_on(h, sock, name, request, roots, rnd);
+          bfree(rnd);
+          return Option[HttpsResult]::Some(r);
+        },
+      }
     },
   }
 }
@@ -442,29 +485,51 @@ fn https_has(m: &Bytes, name: Str) -> bool {
   }
 }
 
+/// Internal: `https_exchange` to the IPv4 address of the host of `u`; `None`
+/// if it has none or the connection cannot be made.
+fn https_try4(h: &Host, u: &HttpsUrl, request: &Bytes, roots: &Bytes) -> Option[HttpsResult]
+  requires blen(u.host) <= 255 && blen(request) < 1073741824 && blen(roots) < 274877906944
+{
+  match dns_lookup(h, u.host) {
+    Option::Some(ip) => { return https_exchange(h, ip, u.port, u.host, request, roots); },
+    Option::None => { return Option[HttpsResult]::None; },
+  }
+}
+
 /// Internal: one `GET` of the URL `u`: the whole answer (see `https_complete`).
 fn https_step(h: &Host, u: &HttpsUrl, roots: &Bytes) -> Option[Bytes]
   requires blen(u.host) <= 255 && blen(u.path) < 65536 && blen(roots) < 274877906944
 {
-  match dns_lookup(h, u.host) {
-    Option::None => { return Option[Bytes]::None; },
-    Option::Some(ip) => {
-      let mut t = text_new();
-      text_push_str(&mut t, "GET ");
-      text_push_bytes(&mut t, u.path);
-      text_push_str(&mut t, " HTTP/1.1\r\nHost: ");
-      text_push_bytes(&mut t, u.host);
-      if u.port != 443 {
-        text_push_str(&mut t, ":");
-        fmt_u64(&mut t, u.port);
-      }
-      text_push_str(&mut t, "\r\nConnection: close\r\n\r\n");
-      let request = text_finish(t);
-      let a = https_exchange(h, ip, u.port, u.host, request, roots);
+  let mut t = text_new();
+  text_push_str(&mut t, "GET ");
+  text_push_bytes(&mut t, u.path);
+  text_push_str(&mut t, " HTTP/1.1\r\nHost: ");
+  text_push_bytes(&mut t, u.host);
+  if u.port != 443 {
+    text_push_str(&mut t, ":");
+    fmt_u64(&mut t, u.port);
+  }
+  text_push_str(&mut t, "\r\nConnection: close\r\n\r\n");
+  let request = text_finish(t);
+  // The IPv4 address first; if there is none, or the connection to it fails,
+  // the IPv6 address.
+  match https_try4(h, u, request, roots) {
+    Option::Some(r) => {
       bfree(request);
-      match a {
-        Option::None => { return Option[Bytes]::None; },
-        Option::Some(r) => { return https_complete(r); },
+      return https_complete(r);
+    },
+    Option::None => {
+      match dns_lookup6(h, u.host) {
+        Option::None => { bfree(request); return Option[Bytes]::None; },
+        Option::Some(ip6) => {
+          let b = https_exchange6(h, ip6, u.port, u.host, request, roots);
+          bfree(ip6);
+          bfree(request);
+          match b {
+            Option::None => { return Option[Bytes]::None; },
+            Option::Some(r) => { return https_complete(r); },
+          }
+        },
       }
     },
   }
@@ -492,7 +557,8 @@ fn https_redirect(raw: &Bytes, u: &HttpsUrl) -> Option[HttpsUrl]
   }
 }
 
-/// Fetches the `https://` URL `url`: looks the host up, connects, checks the
+/// Fetches the `https://` URL `url`: looks the host up (its IPv4 address, or
+/// if it has none or the connection fails, its IPv6 address), connects, checks the
 /// server against `roots` and returns the status and body of the answer
 /// (HTTP/1.1 with the connection closed after it; the body is the data behind
 /// the head, with a chunked body decoded). A redirect (301, 302, 303, 307, 308) to a path on the

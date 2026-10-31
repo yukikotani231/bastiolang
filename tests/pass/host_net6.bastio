@@ -1,0 +1,92 @@
+// stage1-only: host_net IPv6 connect, std/net's net_connect6
+// expect-exit: 0
+// net_connect6: an address that is not 16 bytes is refused, and a connection to
+// the IPv6 loopback where nothing listens fails (also on a host with no IPv6).
+// Arguments, used by tests/net6.sh: `probe` connects to a documentation
+// address twice (with no limit and with one) and ignores the outcome, so a
+// shim can look at what reaches connect; `lo PORT` connects to [::1]:PORT,
+// sends "hi" and exits 0 if that worked; `up PORT` exits 0 if the connection
+// itself was made.
+import "std/host.bastio";
+import "core/num.bastio";
+import "std/net.bastio";
+
+/// The IPv6 address `g0:g1:...:g7` (eight 16-bit groups).
+fn addr6(g0: u64, g1: u64, g2: u64, g3: u64, g4: u64, g5: u64, g6: u64, g7: u64) -> Bytes
+  requires g0 < 65536 && g1 < 65536 && g2 < 65536 && g3 < 65536 && g4 < 65536 && g5 < 65536 && g6 < 65536 && g7 < 65536
+  ensures blen(result) == 16
+{
+  let mut t = text_new();
+  text_push(&mut t, cast[u8](g0 / 256)); text_push(&mut t, cast[u8](g0 % 256));
+  text_push(&mut t, cast[u8](g1 / 256)); text_push(&mut t, cast[u8](g1 % 256));
+  text_push(&mut t, cast[u8](g2 / 256)); text_push(&mut t, cast[u8](g2 % 256));
+  text_push(&mut t, cast[u8](g3 / 256)); text_push(&mut t, cast[u8](g3 % 256));
+  text_push(&mut t, cast[u8](g4 / 256)); text_push(&mut t, cast[u8](g4 % 256));
+  text_push(&mut t, cast[u8](g5 / 256)); text_push(&mut t, cast[u8](g5 % 256));
+  text_push(&mut t, cast[u8](g6 / 256)); text_push(&mut t, cast[u8](g6 % 256));
+  text_push(&mut t, cast[u8](g7 / 256)); text_push(&mut t, cast[u8](g7 % 256));
+  return text_finish(t);
+}
+
+fn try_connect(h: &Host, ip: &Bytes, port: u64, ms: u64) -> bool
+  requires blen(ip) == 16
+{
+  match net_connect6(h, ip, port, ms) {
+    Option::Some(c) => { net_close(h, c); return true; },
+    Option::None => { return false; },
+  }
+}
+
+fn main(h: &mut Host) -> u64 {
+  let n = host_argc(h);
+  if n == 2 && host_arg_is(h, 1, "probe") {
+    let doc = addr6(8193, 3512, 1, 2, 3, 4, 5, 6);
+    try_connect(h, doc, 43981, 0);
+    try_connect(h, doc, 43981, 2000);
+    bfree(doc);
+    return 0;
+  }
+  if n == 3 && host_arg_is(h, 1, "up") {
+    let a_port = host_arg(h, 2);
+    let port = opt_or[u64](parse_u64(a_port, 0, blen(a_port)), 0);
+    bfree(a_port);
+    let lo = addr6(0, 0, 0, 0, 0, 0, 0, 1);
+    let up = port > 0 && port < 65536 && try_connect(h, lo, port, 3000);
+    bfree(lo);
+    if up { return 0; }
+    return 1;
+  }
+  if n == 3 && host_arg_is(h, 1, "lo") {
+    let a_port = host_arg(h, 2);
+    let port = opt_or[u64](parse_u64(a_port, 0, blen(a_port)), 0);
+    bfree(a_port);
+    let lo = addr6(0, 0, 0, 0, 0, 0, 0, 1);
+    let mut ok = false;
+    if port > 0 && port < 65536 {
+      match net_connect6(h, lo, port, 3000) {
+        Option::Some(c) => {
+          let msg = bfrom("hi");
+          ok = net_send_all(h, c, msg);
+          bfree(msg);
+          net_close(h, c);
+        },
+        Option::None => {},
+      }
+    }
+    bfree(lo);
+    if ok { return 0; }
+    return 1;
+  }
+  let mut bad = 0;
+  let short = balloc(4);
+  match net_connect6(h, short, 80, 1000) {
+    Option::Some(c) => { net_close(h, c); bad = 1; },
+    Option::None => {},
+  }
+  bfree(short);
+  let lo = addr6(0, 0, 0, 0, 0, 0, 0, 1);
+  if try_connect(h, lo, 1, 3000) { bad = 1; }
+  bfree(lo);
+  if bad > 0 { return 1; }
+  return 0;
+}
