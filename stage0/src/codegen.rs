@@ -890,7 +890,7 @@ static bst_pool bst_pool_init(uint64_t mbi) {
     /* The bookkeeping, from the first run with room (the arena extension
      * only if there is room for it too). */
     uint64_t counters = (pages * 8 + 4095) / 4096, ext = pages / 8, r = n;
-    if (ext < 1024) ext = pages / 8 < 1024 ? pages / 8 : 1024;   /* at least 4 MiB, at most an eighth */
+    if (pages >= 8192 && ext < 1536) ext = 1536;   /* from 32 MiB of pages: at least 6 MiB */
     for (int tries = 0; tries < 2 && r == n; tries++) {
         if (tries) ext = 0;
         for (r = 0; r < n && (hi[r] - lo[r]) / 4096 <= counters + ext; r++) {}
