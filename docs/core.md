@@ -40,6 +40,7 @@ Each module has a reference page, generated from its source: every function with
 | [`core/aesgcm.bastio`](lib/core-aesgcm.md) | Authenticated encryption with AES-128 or AES-256 in Galois/Counter Mode (NIST SP 800-38D) with a 96-bit nonce and a 128-bit tag, as TLS_AES_128_GCM_SHA256 and TLS_AES_256_GCM_SHA384 use it (the key is 16 or 32 bytes). |
 | [`core/ascii.bastio`](lib/core-ascii.md) | ASCII character classes and case conversion. |
 | [`core/bitmap.bastio`](lib/core-bitmap.md) | Allocation maps. |
+| [`core/blake2s.bastio`](lib/core-blake2s.md) | BLAKE2s (RFC 7693) and HMAC-BLAKE2s (RFC 2104 over it). |
 | [`core/boxed.bastio`](lib/core-boxed.md) | A box that reports running out of memory. |
 | [`core/bytes.bastio`](lib/core-bytes.md) | Comparing, searching, slicing and hashing byte strings. |
 | [`core/bytesmap.bastio`](lib/core-bytesmap.md) | A hash map from byte strings to values of any type `V` that can be copied, for symbol tables, paths and names. |
