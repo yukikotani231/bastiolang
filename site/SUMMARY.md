@@ -30,6 +30,7 @@
   - [core/aesgcm.bastio](lib-core-aesgcm.md)
   - [core/ascii.bastio](lib-core-ascii.md)
   - [core/bitmap.bastio](lib-core-bitmap.md)
+  - [core/blake2s.bastio](lib-core-blake2s.md)
   - [core/boxed.bastio](lib-core-boxed.md)
   - [core/bytes.bastio](lib-core-bytes.md)
   - [core/bytesmap.bastio](lib-core-bytesmap.md)
