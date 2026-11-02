@@ -1,0 +1,234 @@
+// expect-exit: 0
+// core/wgnoise: WireGuard's Noise_IKpsk2 handshake against a reference
+// (Python: hashlib's BLAKE2s and HMAC, the cryptography package's X25519 and
+// ChaCha20-Poly1305). Fixed keys give fixed messages: the initiation, the
+// state after it, the response and the transport keys. Then the whole
+// exchange between the two sides, and the refusals: a changed byte anywhere
+// in either message, a wrong pre-shared key, a low-order public key, and the
+// MACs with and without a cookie.
+import "core/wgnoise.bastio";
+import "core/num.bastio";
+
+/// The bytes whose hex text is `s`.
+fn unhex(s: Str) -> Bytes
+  requires slen(s) % 2 == 0 && slen(s) < 100000
+  ensures blen(result) == slen(s) / 2
+{
+  let n = slen(s) / 2;
+  let mut b = balloc(n);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && blen(b) == n && slen(s) == 2 * n
+  {
+    bset(&mut b, i, wrap[u8](hex_value(sget(s, 2 * i)) * 16 + hex_value(sget(s, 2 * i + 1))));
+    i = i + 1;
+  }
+  return b;
+}
+
+/// 1 if `bad` is 1 or the bytes of `d` are not those of `want` (hex), else 0.
+fn same(bad: u64, d: &Bytes, want: Str) -> u64
+  requires slen(want) % 2 == 0 && slen(want) < 100000 && bad <= 1
+  ensures result <= 1
+{
+  let w = unhex(want);
+  let ok = bytes_eq(d, w);
+  bfree(w);
+  if ok { return bad; }
+  return 1;
+}
+
+/// 1 unless the MACs behave: mac1 for the responder, mac2 with a cookie.
+fn macs(init: &Bytes, resp: &Bytes, sr_pub: &Bytes, si_pub: &Bytes) -> u64
+  requires blen(init) == 116 && blen(resp) == 60 && blen(sr_pub) == 32 && blen(si_pub) == 32
+  ensures result <= 1
+{
+  let mut bad: u64 = 0;
+  // The MACs: mac1 for the responder, mac2 with a cookie.
+    let none = balloc(0);
+    let m = wgn_macs(init, sr_pub, none);
+    bad = same(bad, m, "01000000443322115e194dceac659c21c771b5441cd96dbbdd02d8233d6f679f79d2e8c7e5c61012cde063b698879565a1bd7ef987c61360a8006d829a49d807c488997d7e796bbab0611e6285092020a4888f8714b996f84de6f3f83ed61363289db28f661382388e655614ca7d879d0d262f77fe80243df303bcdd0138db894bd6180300000000000000000000000000000000");
+    if !wgn_mac1_ok(m, sr_pub) { bad = 1; }
+    if wgn_mac1_ok(m, si_pub) { bad = 1; }
+    let cookie = unhex("000102030405060708090a0b0c0d0e0f");
+    let mut mc = wgn_macs(init, sr_pub, cookie);
+    bad = same(bad, mc, "01000000443322115e194dceac659c21c771b5441cd96dbbdd02d8233d6f679f79d2e8c7e5c61012cde063b698879565a1bd7ef987c61360a8006d829a49d807c488997d7e796bbab0611e6285092020a4888f8714b996f84de6f3f83ed61363289db28f661382388e655614ca7d879d0d262f77fe80243df303bcdd0138db894bd6180380be99ddd800c702899f4989d140860b");
+    if !wgn_mac1_ok(mc, sr_pub) || !wgn_mac2_ok(mc, cookie) { bad = 1; }
+    if wgn_mac2_ok(m, cookie) { bad = 1; }
+    let mut i = 0;
+    while i < 144
+      invariant i <= 148 && blen(mc) == 148 && bad <= 1
+    {
+      let was = bget(mc, i);
+      bset(&mut mc, i, was ^ 1);
+      if i < 132 && wgn_mac1_ok(mc, sr_pub) { bad = 1; }
+      if i < 132 && wgn_mac2_ok(mc, cookie) { bad = 1; }
+      bset(&mut mc, i, was);
+      i = i + 4;
+    }
+    let rm = wgn_macs(resp, si_pub, none);
+    bad = same(bad, rm, "02000000887766554433221177e00c77c6a67485476e799513580c3489ddb42376b8d73b1f8cf98190bb4a57dfbad98a415c5d0f4b1cfbe5ef8523ed5f5aef9a34cf2cc30d3ee9d61520f41b00000000000000000000000000000000");
+    bfree(rm);
+    bfree(mc);
+    bfree(cookie);
+    bfree(m);
+    bfree(none);
+  return bad;
+}
+
+fn main() -> u64 {
+  let mut bad: u64 = 0;
+  let si_priv = unhex("2a35404b56616c77828d98a3aeb9c4cfdae5f0fb06111c27323d48535e69747f");
+  let sr_priv = unhex("4f5a65707b86919ca7b2bdc8d3dee9f4ff0a15202b36414c57626d78838e99a4");
+  let ei_priv = unhex("747f8a95a0abb6c1ccd7e2edf8030e19242f3a45505b66717c87929da8b3bec9");
+  let er_priv = unhex("99a4afbac5d0dbe6f1fc07121d28333e49545f6a75808b96a1acb7c2cdd8e3ee");
+  let psk = unhex("bec9d4dfeaf5000b16212c37424d58636e79848f9aa5b0bbc6d1dce7f2fd0813");
+  let si_pub = wgn_public(si_priv);
+  let sr_pub = wgn_public(sr_priv);
+  bad = same(bad, si_pub, "c9bdf9835eebc9fa43fd203d078a2fab27a0214669ceed435be0dc59b61e1f0b");
+  bad = same(bad, sr_pub, "148f596db540bde69533716b51127e24a322d90fadff1454c173e703ecf74670");
+  let tai = unhex("404142434445464748494a4b");
+  let mut st_i = balloc(64);
+  let mut st_r = balloc(64);
+
+  // The initiation, byte for byte.
+  let mut init = balloc(116);
+  match wgn_initiation(si_priv, si_pub, sr_pub, ei_priv, 287454020, tai, &mut st_i) {
+    Option::None => { bad = 1; },
+    Option::Some(m) => { bad = same(bad, m, "01000000443322115e194dceac659c21c771b5441cd96dbbdd02d8233d6f679f79d2e8c7e5c61012cde063b698879565a1bd7ef987c61360a8006d829a49d807c488997d7e796bbab0611e6285092020a4888f8714b996f84de6f3f83ed61363289db28f661382388e655614ca7d879d0d262f77"); bytes_copy_into(&mut init, 0, m); bfree(m); },
+  }
+  bad = same(bad, st_i, "f924d0c54daacb6fd551915597c5a8d92d5ee8e0804d0869f1292d23e7b8f4d3f76af857eba3a2f80824a3e2462b0ae20f7b1b21c1d94ff2ae142f462e7523e2");
+
+  // The responder takes it.
+  match wgn_consume_initiation(sr_priv, sr_pub, init, &mut st_r) {
+    Option::None => { bad = 1; },
+    Option::Some(o) => {
+      let who = bytes_slice(o, 0, 32);
+      let when = bytes_slice(o, 32, 44);
+      let eph = bytes_slice(o, 44, 76);
+      bad = same(bad, who, "c9bdf9835eebc9fa43fd203d078a2fab27a0214669ceed435be0dc59b61e1f0b");
+      bad = same(bad, when, "404142434445464748494a4b");
+      bad = same(bad, eph, "5e194dceac659c21c771b5441cd96dbbdd02d8233d6f679f79d2e8c7e5c61012");
+      bfree(who);
+      bfree(when);
+      bfree(eph);
+      bfree(o);
+    },
+  }
+  bad = same(bad, st_r, "f924d0c54daacb6fd551915597c5a8d92d5ee8e0804d0869f1292d23e7b8f4d3f76af857eba3a2f80824a3e2462b0ae20f7b1b21c1d94ff2ae142f462e7523e2");
+
+  // Its answer and its keys.
+  let ei_pub = wgn_public(ei_priv);
+  let mut keys_r = balloc(64);
+  let mut resp = balloc(60);
+  match wgn_response(&mut st_r, er_priv, ei_pub, si_pub, psk, 1432778632, 287454020, &mut keys_r) {
+    Option::None => { bad = 1; },
+    Option::Some(m) => { bad = same(bad, m, "02000000887766554433221177e00c77c6a67485476e799513580c3489ddb42376b8d73b1f8cf98190bb4a57dfbad98a415c5d0f4b1cfbe5ef8523ed"); bytes_copy_into(&mut resp, 0, m); bfree(m); },
+  }
+  bad = same(bad, st_r, "5ecb7aba546b5417a77f263058222d1d142f119aa938c98f4773e1a6df14f2d951b6c5ee3006ee632eec7e578c0f2f05e7f9d3febe6747d9f1b075c9e1357002");
+  bad = same(bad, keys_r, "482c32c2d8fd02ad0c4bc126eb19f2c7371fdc50e1a684525a10e5798f4932961371946c1b9812c7029d0e5709f283e2ccf7db809a497956026390c1207e1fc8");
+
+  // The initiator takes the answer: its keys are the other way round.
+  let mut keys_i = balloc(64);
+  let mut st_i2 = bytes_slice(st_i, 0, 64);
+  if !wgn_consume_response(&mut st_i2, ei_priv, si_priv, psk, resp, &mut keys_i) {
+    bad = 1;
+  }
+  bad = same(bad, keys_i, "1371946c1b9812c7029d0e5709f283e2ccf7db809a497956026390c1207e1fc8482c32c2d8fd02ad0c4bc126eb19f2c7371fdc50e1a684525a10e5798f493296");
+  bad = same(bad, st_i2, "5ecb7aba546b5417a77f263058222d1d142f119aa938c98f4773e1a6df14f2d951b6c5ee3006ee632eec7e578c0f2f05e7f9d3febe6747d9f1b075c9e1357002");
+  let mut swapped = balloc(64);
+  let a = bytes_slice(keys_i, 0, 32);
+  let b = bytes_slice(keys_i, 32, 64);
+  bytes_copy_into(&mut swapped, 0, b);
+  bytes_copy_into(&mut swapped, 32, a);
+  if !bytes_eq(swapped, keys_r) { bad = 1; }
+  bfree(swapped);
+  bfree(a);
+  bfree(b);
+
+  // A wrong pre-shared key, a changed initiator key: the response does not open.
+  if true {
+    let mut wrong = bytes_slice(psk, 0, 32);
+    bset(&mut wrong, 0, bget(wrong, 0) ^ 1);
+    let mut st = bytes_slice(st_i, 0, 64);
+    let mut k = balloc(64);
+    if wgn_consume_response(&mut st, ei_priv, si_priv, wrong, resp, &mut k) { bad = 1; }
+    bfree(st);
+    bfree(k);
+    bfree(wrong);
+  }
+  // Every byte of the response, one bit at a time at the ends and the middle.
+  if true {
+    let mut i = 0;
+    while i < 60
+      invariant i <= 60 && blen(resp) == 60 && bad <= 1
+    {
+      if i >= 4 && i < 12 {
+        i = i + 1;
+      } else {
+        let was = bget(resp, i);
+        bset(&mut resp, i, was ^ 4);
+        let mut st = bytes_slice(st_i, 0, 64);
+        let mut k = balloc(64);
+        if wgn_consume_response(&mut st, ei_priv, si_priv, psk, resp, &mut k) { bad = 1; }
+        bset(&mut resp, i, was);
+        bfree(st);
+        bfree(k);
+        i = i + 1;
+      }
+    }
+  }
+  // Every byte of the initiation from the type to the end.
+  if true {
+    let mut i = 0;
+    while i < 116
+      invariant i <= 116 && blen(init) == 116 && bad <= 1
+    {
+      if i >= 1 && i < 8 {
+        i = i + 1;
+      } else {
+        let was = bget(init, i);
+        bset(&mut init, i, was ^ 4);
+        let mut st = balloc(64);
+        match wgn_consume_initiation(sr_priv, sr_pub, init, &mut st) {
+          Option::Some(o) => { bad = 1; bfree(o); },
+          Option::None => {},
+        }
+        bset(&mut init, i, was);
+        bfree(st);
+        i = i + 1;
+      }
+    }
+  }
+  // A low-order public key (all zeros) as the responder's static key.
+  if true {
+    let zero = balloc(32);
+    let mut st = balloc(64);
+    match wgn_initiation(si_priv, si_pub, zero, ei_priv, 1, tai, &mut st) {
+      Option::Some(m) => { bad = 1; bfree(m); },
+      Option::None => {},
+    }
+    bfree(st);
+    bfree(zero);
+  }
+
+  if macs(init, resp, sr_pub, si_pub) == 1 { bad = 1; }
+  bfree(st_i2);
+  bfree(keys_i);
+  bfree(keys_r);
+  bfree(resp);
+  bfree(ei_pub);
+  bfree(init);
+  bfree(st_r);
+  bfree(st_i);
+  bfree(tai);
+  bfree(sr_pub);
+  bfree(si_pub);
+  bfree(psk);
+  bfree(er_priv);
+  bfree(ei_priv);
+  bfree(sr_priv);
+  bfree(si_priv);
+  if bad != 0 { return 1; }
+  return 0;
+}

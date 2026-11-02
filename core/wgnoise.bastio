@@ -1,0 +1,661 @@
+// WireGuard's handshake: the Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s pattern,
+// as a set of pure functions on byte strings (no clocks, no random numbers,
+// no sockets): the caller brings the keys, the ephemeral private keys, the
+// sender indexes and the TAI64N timestamp, so every message can be checked
+// against a reference.
+//
+// The handshake state is 64 bytes, the chaining key C then the hash H, and
+// is changed in place. A message goes through four steps:
+//
+//   initiator: wgn_initiation        -> 116 bytes (add the two MACs with wgn_macs)
+//   responder: wgn_consume_initiation   (who sent it, when; the state follows)
+//   responder: wgn_response          -> 60 bytes, and the transport keys
+//   initiator: wgn_consume_response     -> the transport keys
+//
+// A transport key pair is 64 bytes: the key this side sends with, then the
+// key it receives with. A Diffie-Hellman result of all zeros (a low-order
+// public key) refuses the message, as in the reference implementation.
+//
+// Not here: replay windows, timers, cookies (wgn_macs takes one) and the
+// data messages: those belong to the caller.
+import "blake2s.bastio";
+import "chacha20poly1305.bastio";
+import "x25519.bastio";
+import "bytes.bastio";
+import "endian.bastio";
+
+/// Internal: HASH(a || b): BLAKE2s-256.
+fn wgn_hash(a: &Bytes, b: &Bytes) -> Bytes
+  requires blen(a) + blen(b) <= 1048576
+  ensures blen(result) == 32
+{
+  let c = bytes_concat(a, b);
+  let none = balloc(0);
+  let h = blake2s(c, none, 32);
+  bfree(c);
+  bfree(none);
+  return h;
+}
+
+/// Internal: One HMAC step of the KDF: HMAC(t0, prev || i).
+fn wgn_kdf_step(t0: &Bytes, prev: &Bytes, i: u64) -> Bytes
+  requires blen(t0) == 32 && blen(prev) <= 32 && i < 256
+  ensures blen(result) == 32
+{
+  let mut m = balloc(blen(prev) + 1);
+  bytes_copy_into(&mut m, 0, prev);
+  bset(&mut m, blen(prev), cast[u8](i));
+  let t = hmac_blake2s(t0, m);
+  bfree(m);
+  return t;
+}
+
+/// Internal: The first n (1 to 3) outputs of WireGuard's KDF(key, input), 32 bytes each.
+fn wgn_kdf(key: &Bytes, input: &Bytes, n: u64) -> Bytes
+  requires blen(key) == 32 && blen(input) <= 1024 && n >= 1 && n <= 3
+  ensures blen(result) == 32 * n
+{
+  let t0 = hmac_blake2s(key, input);
+  let none = balloc(0);
+  let mut out = balloc(32 * n);
+  let t1 = wgn_kdf_step(t0, none, 1);
+  bytes_copy_into(&mut out, 0, t1);
+  if n >= 2 {
+    let t2 = wgn_kdf_step(t0, t1, 2);
+    bytes_copy_into(&mut out, 32, t2);
+    if n >= 3 {
+      let t3 = wgn_kdf_step(t0, t2, 3);
+      bytes_copy_into(&mut out, 64, t3);
+      bfree(t3);
+    }
+    bfree(t2);
+  }
+  bfree(t1);
+  bfree(none);
+  bfree(t0);
+  return out;
+}
+
+/// Internal: ChaCha20-Poly1305 with the counter-0 nonce (4 zero bytes, then 8).
+fn wgn_seal(k: &Bytes, aad: &Bytes, plain: &Bytes) -> Bytes
+  requires blen(k) == 32 && blen(plain) < 1048576
+  ensures blen(result) == blen(plain) + 16
+{
+  let nonce = balloc(12);
+  let s = aead_seal(k, nonce, aad, plain);
+  bfree(nonce);
+  return s;
+}
+
+/// Internal: see the module comment.
+fn wgn_open(k: &Bytes, aad: &Bytes, sealed: &Bytes) -> Option[Bytes]
+  requires blen(k) == 32 && blen(sealed) < 1048576
+  ensures result is Option::Some ==> blen(result.Some) + 16 == blen(sealed)
+{
+  let nonce = balloc(12);
+  let p = aead_open(k, nonce, aad, sealed);
+  bfree(nonce);
+  return p;
+}
+
+/// Internal: DH(priv, pub), or None when the result is all zeros.
+fn wgn_dh(priv: &Bytes, p: &Bytes) -> Option[Bytes]
+  requires blen(priv) == 32 && blen(p) == 32
+  ensures result is Option::Some ==> blen(result.Some) == 32
+{
+  let r = x25519(priv, p);
+  let mut any: u8 = 0;
+  let mut i = 0;
+  while i < 32
+    invariant i <= 32 && blen(r) == 32
+  {
+    any = any | bget(r, i);
+    i = i + 1;
+  }
+  if any == 0 {
+    bfree(r);
+    return Option[Bytes]::None;
+  }
+  return Option[Bytes]::Some(r);
+}
+
+/// The public key of the private key `priv`: X25519 of the base point.
+fn wgn_public(priv: &Bytes) -> Bytes
+  requires blen(priv) == 32
+  ensures blen(result) == 32
+{
+  let mut base = balloc(32);
+  bset(&mut base, 0, 9);
+  let r = x25519(priv, base);
+  bfree(base);
+  return r;
+}
+
+// ---------------------------------------------------------------- the state
+
+/// Internal: st := HASH(C0 || identifier) chain up to the responder's static key:
+/// C = HASH(construction), H = HASH(HASH(C || identifier) || rpub).
+fn wgn_start(st: &mut Bytes, rpub: &Bytes)
+  requires blen(st) == 64 && blen(rpub) == 32
+  ensures blen(st) == 64
+{
+  let cons = bfrom("Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s");
+  let ident = bfrom("WireGuard v1 zx2c4 Jason@zx2c4.com");
+  let none = balloc(0);
+  let c = wgn_hash(cons, none);
+  let h0 = wgn_hash(c, ident);
+  let h1 = wgn_hash(h0, rpub);
+  bytes_copy_into(&mut st, 0, c);
+  bytes_copy_into(&mut st, 32, h1);
+  bfree(cons);
+  bfree(ident);
+  bfree(none);
+  bfree(c);
+  bfree(h0);
+  bfree(h1);
+}
+
+/// Internal: H := HASH(H || data).
+fn wgn_mix_hash(st: &mut Bytes, data: &Bytes)
+  requires blen(st) == 64 && blen(data) <= 4096
+  ensures blen(st) == 64
+{
+  let h = bytes_slice(st, 32, 64);
+  let n = wgn_hash(h, data);
+  bytes_copy_into(&mut st, 32, n);
+  bfree(h);
+  bfree(n);
+}
+
+/// Internal: C := KDF1(C, input).
+fn wgn_mix_key1(st: &mut Bytes, input: &Bytes)
+  requires blen(st) == 64 && blen(input) <= 1024
+  ensures blen(st) == 64
+{
+  let c = bytes_slice(st, 0, 32);
+  let o = wgn_kdf(c, input, 1);
+  bytes_copy_into(&mut st, 0, o);
+  bfree(c);
+  bfree(o);
+}
+
+/// Internal: (C, k) := KDF2(C, input): the key k.
+fn wgn_mix_key2(st: &mut Bytes, input: &Bytes) -> Bytes
+  requires blen(st) == 64 && blen(input) <= 1024
+  ensures blen(st) == 64 && blen(result) == 32
+{
+  let c = bytes_slice(st, 0, 32);
+  let o = wgn_kdf(c, input, 2);
+  let c2 = bytes_slice(o, 0, 32);
+  let k = bytes_slice(o, 32, 64);
+  bytes_copy_into(&mut st, 0, c2);
+  bfree(c);
+  bfree(o);
+  bfree(c2);
+  return k;
+}
+
+/// Internal: DH(priv, p) mixed into C with KDF2: the key, or None for a zero result.
+fn wgn_dh_key2(st: &mut Bytes, priv: &Bytes, p: &Bytes) -> Option[Bytes]
+  requires blen(st) == 64 && blen(priv) == 32 && blen(p) == 32
+  ensures blen(st) == 64 && (result is Option::Some ==> blen(result.Some) == 32)
+{
+  match wgn_dh(priv, p) {
+    Option::None => { return Option[Bytes]::None; },
+    Option::Some(d) => {
+      let k = wgn_mix_key2(&mut st, d);
+      bfree(d);
+      return Option[Bytes]::Some(k);
+    },
+  }
+}
+
+/// Internal: DH(priv, p) mixed into C with KDF1: false for a zero result.
+fn wgn_dh_key1(st: &mut Bytes, priv: &Bytes, p: &Bytes) -> bool
+  requires blen(st) == 64 && blen(priv) == 32 && blen(p) == 32
+  ensures blen(st) == 64
+{
+  match wgn_dh(priv, p) {
+    Option::None => { return false; },
+    Option::Some(d) => {
+      wgn_mix_key1(&mut st, d);
+      bfree(d);
+      return true;
+    },
+  }
+}
+
+/// Internal: H as its own 32 bytes (the associated data of the next sealed field).
+fn wgn_h(st: &Bytes) -> Bytes
+  requires blen(st) == 64
+  ensures blen(result) == 32
+{
+  return bytes_slice(st, 32, 64);
+}
+
+// ---------------------------------------------------------------- initiation
+
+/// The initiator's first message (116 bytes, without the MACs): sender index
+/// `idx`, ephemeral private key `epriv`, static keys spriv/spub, the
+/// responder's static public key rpub and the 12-byte TAI64N `tai`. st
+/// becomes the state after it. None if a Diffie-Hellman result is all zeros.
+/// ```
+/// let mut spriv = balloc(32);
+/// bset(&mut spriv, 0, 8);    // the low three bits are cleared by X25519
+/// let mut rpriv = balloc(32);
+/// bset(&mut rpriv, 0, 16);    // the low three bits are cleared by X25519
+/// let mut epriv = balloc(32);
+/// bset(&mut epriv, 0, 24);    // the low three bits are cleared by X25519
+/// let mut erpriv = balloc(32);
+/// bset(&mut erpriv, 0, 32);    // the low three bits are cleared by X25519
+/// let psk = balloc(32);
+/// let spub = wgn_public(spriv);
+/// let rpub = wgn_public(rpriv);
+/// let epub = wgn_public(epriv);
+/// let tai = balloc(12);
+/// let mut st_i = balloc(64);
+/// let mut st_r = balloc(64);
+/// let mut keys_i = balloc(64);
+/// let mut keys_r = balloc(64);
+/// let mut bad = 1;
+/// match wgn_initiation(spriv, spub, rpub, epriv, 7, tai, &mut st_i) {
+///   Option::None => {},
+///   Option::Some(init) => {
+///     let none = balloc(0);
+///     let full = wgn_macs(init, rpub, none);
+///     let cookie = balloc(16);
+///     let fullc = wgn_macs(init, rpub, cookie);
+///     if wgn_mac1_ok(full, rpub) && !wgn_mac1_ok(full, spub) && wgn_mac2_ok(fullc, cookie) && !wgn_mac2_ok(full, cookie) {
+///       match wgn_consume_initiation(rpriv, rpub, init, &mut st_r) {
+///         Option::None => {},
+///         Option::Some(who) => {
+///           match wgn_response(&mut st_r, erpriv, epub, spub, psk, 9, 7, &mut keys_r) {
+///             Option::None => {},
+///             Option::Some(resp) => {
+///               if wgn_consume_response(&mut st_i, epriv, spriv, psk, resp, &mut keys_i) {
+///                 // What one side sends with, the other receives with.
+///                 let a = bytes_slice(keys_i, 0, 32);
+///                 let b = bytes_slice(keys_r, 32, 64);
+///                 if bytes_eq(a, b) { bad = 0; }
+///                 bfree(a);
+///                 bfree(b);
+///               }
+///               bfree(resp);
+///             },
+///           }
+///           bfree(who);
+///         },
+///       }
+///     }
+///     bfree(fullc);
+///     bfree(cookie);
+///     bfree(full);
+///     bfree(none);
+///     bfree(init);
+///   },
+/// }
+/// bfree(keys_r);
+/// bfree(keys_i);
+/// bfree(st_r);
+/// bfree(st_i);
+/// bfree(tai);
+/// bfree(epub);
+/// bfree(rpub);
+/// bfree(spub);
+/// bfree(psk);
+/// bfree(erpriv);
+/// bfree(epriv);
+/// bfree(rpriv);
+/// bfree(spriv);
+/// if bad != 0 { return 1; }
+/// ```
+fn wgn_initiation(spriv: &Bytes, spub: &Bytes, rpub: &Bytes, epriv: &Bytes, idx: u64, tai: &Bytes, st: &mut Bytes) -> Option[Bytes]
+  requires blen(spriv) == 32 && blen(spub) == 32 && blen(rpub) == 32 && blen(epriv) == 32 && idx < 4294967296 && blen(tai) == 12 && blen(st) == 64
+  ensures blen(st) == 64 && (result is Option::Some ==> blen(result.Some) == 116)
+{
+  wgn_start(&mut st, rpub);
+  let epub = wgn_public(epriv);
+  wgn_mix_key1(&mut st, epub);
+  wgn_mix_hash(&mut st, epub);
+  let mut msg = balloc(116);
+  bset(&mut msg, 0, 1);
+  store_le32(&mut msg, 4, cast[u32](idx));
+  bytes_copy_into(&mut msg, 8, epub);
+  match wgn_dh_key2(&mut st, epriv, rpub) {
+    Option::None => {
+      bfree(epub);
+      bfree(msg);
+      return Option[Bytes]::None;
+    },
+    Option::Some(k) => {
+      let h = wgn_h(st);
+      let es = wgn_seal(k, h, spub);
+      wgn_mix_hash(&mut st, es);
+      bytes_copy_into(&mut msg, 40, es);
+      bfree(h);
+      bfree(es);
+      bfree(k);
+    },
+  }
+  match wgn_dh_key2(&mut st, spriv, rpub) {
+    Option::None => {
+      bfree(epub);
+      bfree(msg);
+      return Option[Bytes]::None;
+    },
+    Option::Some(k2) => {
+      let h2 = wgn_h(st);
+      let ts = wgn_seal(k2, h2, tai);
+      wgn_mix_hash(&mut st, ts);
+      bytes_copy_into(&mut msg, 88, ts);
+      bfree(h2);
+      bfree(ts);
+      bfree(k2);
+    },
+  }
+  bfree(epub);
+  return Option[Bytes]::Some(msg);
+}
+
+/// The responder reads an initiation (the first 116 bytes of the message; the
+/// MACs are the caller's to check): None if it is not one, or its static
+/// field or timestamp does not open, or a Diffie-Hellman result is zero;
+/// otherwise the initiator's static public key (32 bytes), its TAI64N (12)
+/// and its ephemeral public key (32). The caller looks the static key up
+/// among its peers and compares the timestamp with the last one it took.
+fn wgn_consume_initiation(rpriv: &Bytes, rpub: &Bytes, msg: &Bytes, st: &mut Bytes) -> Option[Bytes]
+  requires blen(rpriv) == 32 && blen(rpub) == 32 && blen(msg) == 116 && blen(st) == 64
+  ensures blen(st) == 64 && (result is Option::Some ==> blen(result.Some) == 76)
+{
+  if load_le32(msg, 0) != 1 {
+    return Option[Bytes]::None;               // the type is a 32-bit field: reserved bytes are zero
+  }
+  wgn_start(&mut st, rpub);
+  let epub = bytes_slice(msg, 8, 40);
+  wgn_mix_key1(&mut st, epub);
+  wgn_mix_hash(&mut st, epub);
+  let mut out = balloc(76);
+  bytes_copy_into(&mut out, 44, epub);
+  match wgn_dh_key2(&mut st, rpriv, epub) {
+    Option::None => {
+      bfree(epub);
+      bfree(out);
+      return Option[Bytes]::None;
+    },
+    Option::Some(k) => {
+      let h = wgn_h(st);
+      let es = bytes_slice(msg, 40, 88);
+      match wgn_open(k, h, es) {
+        Option::None => {
+          bfree(h);
+          bfree(es);
+          bfree(k);
+          bfree(epub);
+          bfree(out);
+          return Option[Bytes]::None;
+        },
+        Option::Some(spub) => {
+          wgn_mix_hash(&mut st, es);
+          bytes_copy_into(&mut out, 0, spub);
+          bfree(spub);
+        },
+      }
+      bfree(h);
+      bfree(es);
+      bfree(k);
+    },
+  }
+  let spub2 = bytes_slice(out, 0, 32);
+  match wgn_dh_key2(&mut st, rpriv, spub2) {
+    Option::None => {
+      bfree(spub2);
+      bfree(epub);
+      bfree(out);
+      return Option[Bytes]::None;
+    },
+    Option::Some(k2) => {
+      let h2 = wgn_h(st);
+      let ts = bytes_slice(msg, 88, 116);
+      match wgn_open(k2, h2, ts) {
+        Option::None => {
+          bfree(h2);
+          bfree(ts);
+          bfree(k2);
+          bfree(spub2);
+          bfree(epub);
+          bfree(out);
+          return Option[Bytes]::None;
+        },
+        Option::Some(tai) => {
+          wgn_mix_hash(&mut st, ts);
+          bytes_copy_into(&mut out, 32, tai);
+          bfree(tai);
+        },
+      }
+      bfree(h2);
+      bfree(ts);
+      bfree(k2);
+    },
+  }
+  bfree(spub2);
+  bfree(epub);
+  return Option[Bytes]::Some(out);
+}
+
+// ---------------------------------------------------------------- response
+
+/// Internal: The transport keys from C: KDF2(C, empty), the initiator's sending key
+/// first, as `first_is_send` says for this side.
+fn wgn_keys(st: &Bytes, first_is_send: bool) -> Bytes
+  requires blen(st) == 64
+  ensures blen(result) == 64
+{
+  let c = bytes_slice(st, 0, 32);
+  let none = balloc(0);
+  let o = wgn_kdf(c, none, 2);
+  bfree(c);
+  bfree(none);
+  if first_is_send {
+    return o;
+  }
+  let mut sw = balloc(64);
+  let a = bytes_slice(o, 0, 32);
+  let b = bytes_slice(o, 32, 64);
+  bytes_copy_into(&mut sw, 0, b);
+  bytes_copy_into(&mut sw, 32, a);
+  bfree(a);
+  bfree(b);
+  bfree(o);
+  return sw;
+}
+
+/// Internal: Mixes the response's shared secrets into st after the ephemeral key er
+/// is in: DH(e, ei) and DH(e, si) with KDF1, then psk with KDF3 (its middle
+/// output into H); returns the key that seals the empty field, or None for a
+/// zero Diffie-Hellman result. `epriv`/`epub_peer` and `spriv`/`spub_peer`
+/// name which side's keys are used (the responder uses its ephemeral private
+/// key with the initiator's keys; the initiator the other way round).
+fn wgn_mix_response(st: &mut Bytes, epriv: &Bytes, epub_peer: &Bytes, dh2_priv: &Bytes, dh2_pub: &Bytes, psk: &Bytes) -> Option[Bytes]
+  requires blen(st) == 64 && blen(epriv) == 32 && blen(epub_peer) == 32 && blen(dh2_priv) == 32 && blen(dh2_pub) == 32 && blen(psk) == 32
+  ensures blen(st) == 64 && (result is Option::Some ==> blen(result.Some) == 32)
+{
+  if !wgn_dh_key1(&mut st, epriv, epub_peer) {
+    return Option[Bytes]::None;
+  }
+  if !wgn_dh_key1(&mut st, dh2_priv, dh2_pub) {
+    return Option[Bytes]::None;
+  }
+  let c = bytes_slice(st, 0, 32);
+  let o = wgn_kdf(c, psk, 3);
+  let c2 = bytes_slice(o, 0, 32);
+  let t = bytes_slice(o, 32, 64);
+  let k = bytes_slice(o, 64, 96);
+  bytes_copy_into(&mut st, 0, c2);
+  wgn_mix_hash(&mut st, t);
+  bfree(c);
+  bfree(o);
+  bfree(c2);
+  bfree(t);
+  return Option[Bytes]::Some(k);
+}
+
+/// The responder's answer (60 bytes, without the MACs) to an initiation whose
+/// state is st (after wgn_consume_initiation): sender index `idx`, the
+/// initiator's index `ridx`, the responder's ephemeral private key `epriv`,
+/// the initiator's ephemeral and static public keys and the pre-shared key
+/// (32 zero bytes for none). Also gives the responder's transport keys:
+/// keys := send || receive. None for a zero Diffie-Hellman result.
+fn wgn_response(st: &mut Bytes, epriv: &Bytes, ei_pub: &Bytes, si_pub: &Bytes, psk: &Bytes, idx: u64, ridx: u64, keys: &mut Bytes) -> Option[Bytes]
+  requires blen(st) == 64 && blen(epriv) == 32 && blen(ei_pub) == 32 && blen(si_pub) == 32 && blen(psk) == 32 && idx < 4294967296 && ridx < 4294967296 && blen(keys) == 64
+  ensures blen(st) == 64 && blen(keys) == 64 && (result is Option::Some ==> blen(result.Some) == 60)
+{
+  let epub = wgn_public(epriv);
+  wgn_mix_key1(&mut st, epub);
+  wgn_mix_hash(&mut st, epub);
+  match wgn_mix_response(&mut st, epriv, ei_pub, epriv, si_pub, psk) {
+    Option::None => {
+      bfree(epub);
+      return Option[Bytes]::None;
+    },
+    Option::Some(k) => {
+      let h = wgn_h(st);
+      let none = balloc(0);
+      let empty = wgn_seal(k, h, none);
+      wgn_mix_hash(&mut st, empty);
+      let mut msg = balloc(60);
+      bset(&mut msg, 0, 2);
+      store_le32(&mut msg, 4, cast[u32](idx));
+      store_le32(&mut msg, 8, cast[u32](ridx));
+      bytes_copy_into(&mut msg, 12, epub);
+      bytes_copy_into(&mut msg, 44, empty);
+      let kk = wgn_keys(st, false);
+      bytes_copy_into(&mut keys, 0, kk);
+      bfree(kk);
+      bfree(h);
+      bfree(none);
+      bfree(empty);
+      bfree(k);
+      bfree(epub);
+      return Option[Bytes]::Some(msg);
+    },
+  }
+}
+
+/// The initiator reads the response (60 bytes; MACs and the receiver index
+/// are the caller's to check) to the initiation whose state is st: with its
+/// own ephemeral private key and static private key and the pre-shared key.
+/// True if it opens; keys := the initiator's send || receive keys.
+fn wgn_consume_response(st: &mut Bytes, epriv: &Bytes, spriv: &Bytes, psk: &Bytes, msg: &Bytes, keys: &mut Bytes) -> bool
+  requires blen(st) == 64 && blen(epriv) == 32 && blen(spriv) == 32 && blen(psk) == 32 && blen(msg) == 60 && blen(keys) == 64
+  ensures blen(st) == 64 && blen(keys) == 64
+{
+  if load_le32(msg, 0) != 2 {
+    return false;
+  }
+  let er_pub = bytes_slice(msg, 12, 44);
+  wgn_mix_key1(&mut st, er_pub);
+  wgn_mix_hash(&mut st, er_pub);
+  match wgn_mix_response(&mut st, epriv, er_pub, spriv, er_pub, psk) {
+    Option::None => {
+      bfree(er_pub);
+      return false;
+    },
+    Option::Some(k) => {
+      let h = wgn_h(st);
+      let empty = bytes_slice(msg, 44, 60);
+      let mut ok = false;
+      match wgn_open(k, h, empty) {
+        Option::None => {},
+        Option::Some(p) => {
+          wgn_mix_hash(&mut st, empty);
+          let kk = wgn_keys(st, true);
+          bytes_copy_into(&mut keys, 0, kk);
+          bfree(kk);
+          bfree(p);
+          ok = true;
+        },
+      }
+      bfree(h);
+      bfree(empty);
+      bfree(k);
+      bfree(er_pub);
+      return ok;
+    },
+  }
+}
+
+// ---------------------------------------------------------------- MACs
+
+/// body || mac1 || mac2 for a handshake message addressed to the holder of
+/// static public key `rpub`: mac1 = MAC(HASH("mac1----" || rpub), body) (a
+/// keyed BLAKE2s with 16 output bytes); mac2 is MAC(cookie, body || mac1)
+/// when `cookie` is 16 bytes, and zeros when it is empty.
+fn wgn_macs(body: &Bytes, rpub: &Bytes, cookie: &Bytes) -> Bytes
+  requires blen(body) <= 1024 && blen(rpub) == 32 && (blen(cookie) == 0 || blen(cookie) == 16)
+  ensures blen(result) == blen(body) + 32
+{
+  let label = bfrom("mac1----");
+  let key1 = wgn_hash(label, rpub);
+  let m1 = blake2s(body, key1, 16);
+  let mut out = balloc(blen(body) + 32);
+  bytes_copy_into(&mut out, 0, body);
+  bytes_copy_into(&mut out, blen(body), m1);
+  if blen(cookie) == 16 {
+    let bm = bytes_concat(body, m1);
+    let m2 = blake2s(bm, cookie, 16);
+    bytes_copy_into(&mut out, blen(body) + 16, m2);
+    bfree(bm);
+    bfree(m2);
+  }
+  bfree(label);
+  bfree(key1);
+  bfree(m1);
+  return out;
+}
+
+/// Do the last 32 bytes of `msg` hold a mac1 made for the holder of static
+/// public key `mypub`? (A message shorter than 32 bytes does not.)
+fn wgn_mac1_ok(msg: &Bytes, mypub: &Bytes) -> bool
+  requires blen(msg) <= 1056 && blen(mypub) == 32
+{
+  if blen(msg) < 32 {
+    return false;
+  }
+  let body = bytes_slice(msg, 0, blen(msg) - 32);
+  let none = balloc(0);
+  let all = wgn_macs(body, mypub, none);
+  let mut diff: u8 = 0;
+  let mut i = 0;
+  while i < 16
+    invariant i <= 16 && blen(all) == blen(msg) && blen(msg) >= 32
+  {
+    diff = diff | (bget(all, blen(msg) - 32 + i) ^ bget(msg, blen(msg) - 32 + i));
+    i = i + 1;
+  }
+  bfree(body);
+  bfree(none);
+  bfree(all);
+  return diff == 0;
+}
+
+/// Does `msg` carry a mac2 made with `cookie` (16 bytes)?
+fn wgn_mac2_ok(msg: &Bytes, cookie: &Bytes) -> bool
+  requires blen(msg) <= 1056 && blen(cookie) == 16
+{
+  if blen(msg) < 32 {
+    return false;
+  }
+  let upto = bytes_slice(msg, 0, blen(msg) - 16);
+  let want = blake2s(upto, cookie, 16);
+  let mut diff: u8 = 0;
+  let mut i = 0;
+  while i < 16
+    invariant i <= 16 && blen(want) == 16 && blen(msg) >= 32
+  {
+    diff = diff | (bget(want, i) ^ bget(msg, blen(msg) - 16 + i));
+    i = i + 1;
+  }
+  bfree(upto);
+  bfree(want);
+  return diff == 0;
+}

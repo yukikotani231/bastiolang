@@ -131,6 +131,7 @@ What will be 0.2.0.
 
 ### Library
 
+- `core/wgnoise`: WireGuard's handshake, Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s, as pure functions on byte strings: the initiation and response messages for both sides, the transport keys, the two MACs with an optional cookie, and refusal of low-order public keys. Bounds are proved; the messages, chaining state, keys and MACs are checked byte for byte against a reference implementation, and every byte of both messages is shown to matter.
 - `core/blake2s`: `blake2s` (RFC 7693, with an optional key and an output of 1 to 32 bytes) and `hmac_blake2s`, the hash, keyed MAC and key-derivation pieces WireGuard uses. Bounds are proved; the digests are checked against RFC 7693's vectors and the reference implementation for lengths around a block, keyed hashes and HMAC.
 - `core/json`: `JsonOut` builds a whole JSON document (`json_out_begin_obj`, `json_out_key`,
   `json_out_str`, `json_out_u64`, `json_out_end`, `json_out_finish`); it tracks commas, keys and nesting,
