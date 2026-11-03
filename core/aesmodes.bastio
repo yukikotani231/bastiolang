@@ -1,0 +1,181 @@
+// core/aesmodes.bastio: AES in counter mode and in CBC mode (NIST SP 800-38A),
+// on the block cipher of core/aes.bastio.
+//
+// What is proved: every access is in bounds, nothing leaks, and the result is
+// as long as the input. Not proved: that the output is the standard's (the
+// tests check the vectors of SP 800-38A F.2 and F.5), or that the code is
+// constant time (see core/aes.bastio). CBC takes whole blocks only; padding is
+// the caller's, and so is the integrity check: neither mode authenticates.
+import "aes.bastio";
+
+/// `data` xor the AES-CTR keystream that starts at the 16-byte counter block
+/// `iv`; the whole block counts up as one big-endian number, wrapping at 2^128
+/// (the counter of Linux's `ctr(aes)`). Encrypts and decrypts alike.
+/// ```
+/// let mut key = balloc(16);
+/// let iv = balloc(16);
+/// let mut data = balloc(20);
+/// let mut i = 0;
+/// while i < 16 {
+///   bset(&mut key, i, cast[u8](i));
+///   i = i + 1;
+/// }
+/// let a = aes128_new(key);
+/// let sealed = aes_ctr(a, iv, data);
+/// let back = aes_ctr(a, iv, sealed);
+/// let ok = bytes_eq(back, data) && blen(sealed) == 20;
+/// bfree(back);
+/// bfree(sealed);
+/// aes_free(a);
+/// bfree(data);
+/// bfree(iv);
+/// bfree(key);
+/// if !ok { return 1; }
+/// ```
+fn aes_ctr(a: &Aes, iv: &Bytes, data: &Bytes) -> Bytes
+  requires aes_ok(a) && blen(iv) == 16 && blen(data) < 274877906944
+  ensures blen(result) == blen(data)
+{
+  let n = blen(data);
+  let mut out = balloc(n);
+  let mut cb = bytes_slice(iv, 0, 16);
+  let mut at = 0;
+  while at < n
+    invariant at <= n + 15 && n == blen(data) && n < 274877906944 && blen(out) == n && blen(cb) == 16 && aes_ok(a)
+  {
+    let ks = aes_encrypt(a, cb);
+    let mut j = 0;
+    while j < 16 && at + j < n
+      invariant j <= 16 && at < n && at + j <= n && n == blen(data) && blen(out) == n && blen(ks) == 16
+    {
+      bset(&mut out, at + j, bget(data, at + j) ^ bget(ks, j));
+      j = j + 1;
+    }
+    bfree(ks);
+    // add one to the counter block, carrying from the last byte
+    let mut k = 16;
+    let mut carry = true;
+    while k > 0 && carry
+      invariant k <= 16 && blen(cb) == 16
+    {
+      k = k - 1;
+      let b = bget(cb, k);
+      bset(&mut cb, k, wrap_add(b, 1));
+      carry = b == 255;
+    }
+    at = at + 16;
+  }
+  bfree(cb);
+  return out;
+}
+
+/// Internal: the 16 bytes of `x` xor the 16 bytes of `y` from `at`.
+fn aes_xor16(x: &Bytes, y: &Bytes, at: u64) -> Bytes
+  requires blen(x) == 16 && at + 16 <= blen(y)
+  ensures blen(result) == 16
+{
+  let mut r = balloc(16);
+  let mut j = 0;
+  while j < 16
+    invariant j <= 16 && blen(r) == 16 && blen(x) == 16 && at + 16 <= blen(y)
+  {
+    bset(&mut r, j, bget(x, j) ^ bget(y, at + j));
+    j = j + 1;
+  }
+  return r;
+}
+
+/// CBC encryption of `data`, a whole number of 16-byte blocks, under the
+/// 16-byte `iv`.
+/// ```
+/// let mut key = balloc(16);
+/// let iv = balloc(16);
+/// let data = balloc(32);
+/// let a = aes128_new(key);
+/// let sealed = aes_cbc_encrypt(a, iv, data);
+/// let back = aes_cbc_decrypt(a, iv, sealed);
+/// let ok = bytes_eq(back, data) && blen(sealed) == 32;
+/// bfree(back);
+/// bfree(sealed);
+/// aes_free(a);
+/// bfree(data);
+/// bfree(iv);
+/// bfree(key);
+/// if !ok { return 1; }
+/// ```
+fn aes_cbc_encrypt(a: &Aes, iv: &Bytes, data: &Bytes) -> Bytes
+  requires aes_ok(a) && blen(iv) == 16 && blen(data) % 16 == 0 && blen(data) < 274877906944
+  ensures blen(result) == blen(data)
+{
+  let n = blen(data);
+  let mut out = balloc(n);
+  let mut prev = bytes_slice(iv, 0, 16);
+  let mut at = 0;
+  while at < n
+    invariant at <= n && n == blen(data) && n % 16 == 0 && at % 16 == 0 && blen(out) == n && blen(prev) == 16 && aes_ok(a)
+  {
+    let x = aes_xor16(prev, data, at);
+    let c = aes_encrypt(a, x);
+    bfree(x);
+    bytes_copy_span(&mut out, at, c, 0, 16);
+    bfree(prev);
+    prev = c;
+    at = at + 16;
+  }
+  bfree(prev);
+  return out;
+}
+
+/// Internal: block `at / 16` of the plaintext: `d` xor `iv` for the first,
+/// else xor the ciphertext block before.
+fn aes_cbc_unchain(d: &Bytes, iv: &Bytes, data: &Bytes, at: u64) -> Bytes
+  requires blen(d) == 16 && blen(iv) == 16 && at + 16 <= blen(data) && at % 16 == 0
+  ensures blen(result) == 16
+{
+  if at == 0 {
+    return aes_xor16(d, iv, 0);
+  }
+  return aes_xor16(d, data, at - 16);
+}
+
+/// CBC decryption of `data`, a whole number of 16-byte blocks, under the
+/// 16-byte `iv`.
+/// ```
+/// let key = balloc(32);
+/// let iv = balloc(16);
+/// let data = balloc(16);
+/// let a = aes256_new(key);
+/// let back = aes_cbc_decrypt(a, iv, data);
+/// let again = aes_cbc_encrypt(a, iv, back);
+/// let ok = bytes_eq(again, data);
+/// bfree(again);
+/// bfree(back);
+/// aes_free(a);
+/// bfree(data);
+/// bfree(iv);
+/// bfree(key);
+/// if !ok { return 1; }
+/// ```
+fn aes_cbc_decrypt(a: &Aes, iv: &Bytes, data: &Bytes) -> Bytes
+  requires aes_ok(a) && blen(iv) == 16 && blen(data) % 16 == 0 && blen(data) < 274877906944
+  ensures blen(result) == blen(data)
+{
+  let n = blen(data);
+  let inv = aes_inv_sbox(a);
+  let mut out = balloc(n);
+  let mut at = 0;
+  while at < n
+    invariant at <= n && n == blen(data) && n % 16 == 0 && at % 16 == 0 && blen(out) == n && blen(inv) == 256 && aes_ok(a)
+  {
+    let blk = bytes_slice(data, at, at + 16);
+    let d = aes_decrypt_with(a, inv, blk);
+    bfree(blk);
+    let p = aes_cbc_unchain(d, iv, data, at);
+    bfree(d);
+    bytes_copy_span(&mut out, at, p, 0, 16);
+    bfree(p);
+    at = at + 16;
+  }
+  bfree(inv);
+  return out;
+}

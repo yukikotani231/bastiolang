@@ -1,0 +1,178 @@
+// expect-exit: 0
+// AES decryption, CTR and CBC: FIPS 197 C.1 and C.3 backwards, and the
+// vectors of NIST SP 800-38A F.2.1, F.2.5 (CBC-AES128 and -AES256) and F.5.1,
+// F.5.5 (CTR), a counter that carries through every byte, and round trips of
+// every length.
+import "core/aesmodes.bastio";
+import "core/num.bastio";
+
+/// The bytes of the hex text `h`.
+fn unhex(h: Str) -> Bytes
+  requires slen(h) < 100000
+  ensures blen(result) == slen(h) / 2
+{
+  let n = slen(h) / 2;
+  let mut out = balloc(n);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && blen(out) == n && 2 * n <= slen(h)
+  {
+    let hi = hex_value(sget(h, 2 * i));
+    let lo = hex_value(sget(h, 2 * i + 1));
+    bset(&mut out, i, cast[u8]((hi % 16) * 16 + lo % 16));
+    i = i + 1;
+  }
+  return out;
+}
+
+/// 1 unless `got` equals the bytes of `want`; frees `got`.
+fn is_bytes(got: Bytes, want: Str) -> u64
+  requires slen(want) < 100000
+  ensures result <= 1
+{
+  let w = unhex(want);
+  let ok = bytes_eq(got, w);
+  bfree(w);
+  bfree(got);
+  if ok { return 0; }
+  return 1;
+}
+
+fn fips_check() -> u64
+  ensures result <= 2
+{
+  let key = unhex("000102030405060708090a0b0c0d0e0f");
+  let ct = unhex("69c4e0d86a7b0430d8cdb78070b4c55a");
+  let a = aes128_new(key);
+  let pt = aes_decrypt(a, ct);
+  let bad1 = is_bytes(pt, "00112233445566778899aabbccddeeff");
+  aes_free(a);
+  bfree(ct);
+  bfree(key);
+  let key2 = unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+  let ct2 = unhex("8ea2b7ca516745bfeafc49904b496089");
+  let a2 = aes256_new(key2);
+  let pt2 = aes_decrypt(a2, ct2);
+  let bad2 = is_bytes(pt2, "00112233445566778899aabbccddeeff");
+  aes_free(a2);
+  bfree(ct2);
+  bfree(key2);
+  return bad1 + bad2;
+}
+
+fn cbc_check() -> u64
+  ensures result <= 4
+{
+  let pt = unhex("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51");
+  let iv = unhex("000102030405060708090a0b0c0d0e0f");
+  let key = unhex("2b7e151628aed2a6abf7158809cf4f3c");
+  let a = aes128_new(key);
+  let c = aes_cbc_encrypt(a, iv, pt);
+  let c2 = bytes_slice(c, 0, 32);
+  let back = aes_cbc_decrypt(a, iv, c);
+  let bad1 = is_bytes(c2, "7649abac8119b246cee98e9b12e9197d5086cb9b507219ee95db113a917678b2");
+  let bad2 = is_bytes(back, "6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51");
+  bfree(c);
+  aes_free(a);
+  bfree(key);
+  let key2 = unhex("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4");
+  let a2 = aes256_new(key2);
+  let c3 = aes_cbc_encrypt(a2, iv, pt);
+  let back2 = aes_cbc_decrypt(a2, iv, c3);
+  let c4 = bytes_slice(c3, 0, 32);
+  let bad3 = is_bytes(c4, "f58c4c04d6e5f1ba779eabfb5f7bfbd69cfc4e967edb808d679f777bc6702c7d");
+  let bad4 = is_bytes(back2, "6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51");
+  bfree(c3);
+  aes_free(a2);
+  bfree(key2);
+  bfree(iv);
+  bfree(pt);
+  return bad1 + bad2 + bad3 + bad4;
+}
+
+fn ctr_check() -> u64
+  ensures result <= 3
+{
+  let pt = unhex("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51");
+  let ctr = unhex("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff");
+  let key = unhex("2b7e151628aed2a6abf7158809cf4f3c");
+  let a = aes128_new(key);
+  let c = aes_ctr(a, ctr, pt);
+  let bad1 = is_bytes(c, "874d6191b620e3261bef6864990db6ce9806f66b7970fdff8617187bb9fffdff");
+  aes_free(a);
+  bfree(key);
+  let key2 = unhex("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4");
+  let a2 = aes256_new(key2);
+  let c2 = aes_ctr(a2, ctr, pt);
+  let bad2 = is_bytes(c2, "601ec313775789a5b7a7f504bbf3d228f443e3ca4d62b59aca84e990cacaf5c5");
+  aes_free(a2);
+  bfree(key2);
+  // a counter of 15 ff bytes then ff: the second block uses 00..00
+  let wrap = unhex("ffffffffffffffffffffffffffffffff");
+  let k3 = unhex("2b7e151628aed2a6abf7158809cf4f3c");
+  let a3 = aes128_new(k3);
+  let z = balloc(32);
+  let s = aes_ctr(a3, wrap, z);
+  let zero = balloc(16);
+  let first = bytes_slice(s, 0, 16);
+  let second = bytes_slice(s, 16, 32);
+  let k1 = aes_encrypt(a3, wrap);
+  let k2 = aes_encrypt(a3, zero);
+  let mut bad3 = 1;
+  if bytes_eq(first, k1) && bytes_eq(second, k2) { bad3 = 0; }
+  bfree(k1); bfree(k2); bfree(zero); bfree(first); bfree(second); bfree(s); bfree(z);
+  aes_free(a3);
+  bfree(k3);
+  bfree(wrap);
+  bfree(ctr);
+  bfree(pt);
+  return bad1 + bad2 + bad3;
+}
+
+/// A CTR round trip of every length to 40, and a CBC one of 0 to 5 blocks.
+fn trip_check() -> u64
+  ensures result <= 1
+{
+  let key = unhex("2b7e151628aed2a6abf7158809cf4f3c");
+  let iv = unhex("000102030405060708090a0b0c0d0e0f");
+  let a = aes128_new(key);
+  let mut bad = 0;
+  let mut n = 0;
+  while n <= 40
+    invariant n <= 41 && bad <= 1 && aes_ok(a) && blen(iv) == 16
+  {
+    let mut d = balloc(n);
+    let mut i = 0;
+    while i < n
+      invariant i <= n && blen(d) == n
+    {
+      bset(&mut d, i, cast[u8]((i * 7 + 1) % 256));
+      i = i + 1;
+    }
+    let c = aes_ctr(a, iv, d);
+    let b = aes_ctr(a, iv, c);
+    if !bytes_eq(b, d) { bad = 1; }
+    if n >= 16 && bytes_eq(c, d) { bad = 1; }
+    bfree(b);
+    bfree(c);
+    if n % 16 == 0 {
+      let e = aes_cbc_encrypt(a, iv, d);
+      let f = aes_cbc_decrypt(a, iv, e);
+      if !bytes_eq(f, d) { bad = 1; }
+      bfree(f);
+      bfree(e);
+    }
+    bfree(d);
+    n = n + 1;
+  }
+  aes_free(a);
+  bfree(iv);
+  bfree(key);
+  return bad;
+}
+
+fn main() -> u64 {
+  let t = fips_check() + cbc_check() + ctr_check() + trip_check();
+  if t > 0 { return 1; }
+  return 0;
+}

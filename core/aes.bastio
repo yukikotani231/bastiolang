@@ -1,5 +1,6 @@
 // core/aes.bastio: the AES-128 and AES-256 block ciphers (FIPS 197),
-// encryption only, which is all that GCM needs.
+// both directions: encryption is all that GCM and CTR need; decryption (the
+// inverse cipher) is for CBC.
 //
 // What is proved: every access is in bounds, nothing leaks, and a key
 // schedule is 176 bytes (AES-128) or 240 (AES-256), an encrypted block 16. Not proved: that the output
@@ -265,4 +266,155 @@ fn aes_encrypt(a: &Aes, block: &Bytes) -> Bytes
   s = t;
   aes_add_round_key(&mut s, a.rk, a.nr);
   return s;
+}
+
+/// The inverse S-box (256 bytes) of `a`: `inv[sbox[i]] == i`. Made once and
+/// passed to `aes_decrypt_with`.
+/// ```
+/// let key = balloc(16);
+/// let a = aes128_new(key);
+/// let inv = aes_inv_sbox(a);
+/// // sbox[0] is 0x63, so inv[0x63] is 0.
+/// let ok = bget(inv, 99) == 0 && blen(inv) == 256;
+/// bfree(inv);
+/// aes_free(a);
+/// bfree(key);
+/// if !ok { return 1; }
+/// ```
+fn aes_inv_sbox(a: &Aes) -> Bytes
+  requires aes_ok(a)
+  ensures blen(result) == 256
+{
+  let mut inv = balloc(256);
+  let mut i = 0;
+  while i < 256
+    invariant i <= 256 && blen(inv) == 256 && blen(a.sbox) == 256
+  {
+    bset(&mut inv, cast[u64](bget(a.sbox, i)), cast[u8](i));
+    i = i + 1;
+  }
+  return inv;
+}
+
+/// Internal: InvShiftRows then InvSubBytes: byte `r` of column `c` of the
+/// result is the inverse-substituted byte `r` of column `c - r` (mod 4) of `s`.
+fn aes_inv_sub_shift(s: &Bytes, inv: &Bytes) -> Bytes
+  requires blen(s) == 16 && blen(inv) == 256
+  ensures blen(result) == 16
+{
+  let mut t = balloc(16);
+  let mut c = 0;
+  while c < 4
+    invariant c <= 4 && blen(t) == 16 && blen(s) == 16 && blen(inv) == 256
+  {
+    let mut r = 0;
+    while r < 4
+      invariant r <= 4 && c < 4 && blen(t) == 16 && blen(s) == 16 && blen(inv) == 256
+    {
+      let from = 4 * ((c + 4 - r) % 4) + r;
+      bset(&mut t, 4 * c + r, bget(inv, cast[u64](bget(s, from))));
+      r = r + 1;
+    }
+    c = c + 1;
+  }
+  return t;
+}
+
+/// Internal: InvMixColumns in place on the 16-byte `s`: each column is first
+/// changed by the difference between the inverse and the forward matrix, then
+/// mixed forwards.
+fn aes_inv_mix_columns(s: &mut Bytes)
+  requires blen(s) == 16
+  ensures blen(s) == 16
+{
+  let mut c = 0;
+  while c < 4
+    invariant c <= 4 && blen(s) == 16
+  {
+    let a0 = cast[u64](bget(s, 4 * c));
+    let a1 = cast[u64](bget(s, 4 * c + 1));
+    let a2 = cast[u64](bget(s, 4 * c + 2));
+    let a3 = cast[u64](bget(s, 4 * c + 3));
+    let u = aes_xtime(aes_xtime((a0 ^ a2) & 255));
+    let v = aes_xtime(aes_xtime((a1 ^ a3) & 255));
+    bset(&mut s, 4 * c, cast[u8]((a0 ^ u) & 255));
+    bset(&mut s, 4 * c + 1, cast[u8]((a1 ^ v) & 255));
+    bset(&mut s, 4 * c + 2, cast[u8]((a2 ^ u) & 255));
+    bset(&mut s, 4 * c + 3, cast[u8]((a3 ^ v) & 255));
+    c = c + 1;
+  }
+  aes_mix_columns(&mut s);
+}
+
+/// AES (as the key was expanded) of one 16-byte block, backwards, with the
+/// inverse S-box `inv` from `aes_inv_sbox`: use it when many blocks are done.
+/// ```
+/// let mut key = balloc(16);
+/// let mut block = balloc(16);
+/// let mut i = 0;
+/// while i < 16 {
+///   bset(&mut key, i, cast[u8](i));
+///   bset(&mut block, i, cast[u8](17 * i));
+///   i = i + 1;
+/// }
+/// let a = aes128_new(key);
+/// let inv = aes_inv_sbox(a);
+/// let sealed = aes_encrypt(a, block);
+/// let back = aes_decrypt_with(a, inv, sealed);
+/// let ok = bytes_eq(back, block);
+/// bfree(back);
+/// bfree(sealed);
+/// bfree(inv);
+/// aes_free(a);
+/// bfree(block);
+/// bfree(key);
+/// if !ok { return 1; }
+/// ```
+fn aes_decrypt_with(a: &Aes, inv: &Bytes, block: &Bytes) -> Bytes
+  requires aes_ok(a) && blen(inv) == 256 && blen(block) == 16
+  ensures blen(result) == 16
+{
+  let mut s = bytes_slice(block, 0, 16);
+  aes_add_round_key(&mut s, a.rk, a.nr);
+  let mut k = 1;
+  while k < a.nr
+    invariant k >= 1 && k <= a.nr && blen(s) == 16 && aes_ok(a) && blen(inv) == 256
+  {
+    let t = aes_inv_sub_shift(s, inv);
+    bfree(s);
+    s = t;
+    aes_add_round_key(&mut s, a.rk, a.nr - k);
+    aes_inv_mix_columns(&mut s);
+    k = k + 1;
+  }
+  let t = aes_inv_sub_shift(s, inv);
+  bfree(s);
+  s = t;
+  aes_add_round_key(&mut s, a.rk, 0);
+  return s;
+}
+
+/// The inverse of `aes_encrypt` for one 16-byte block.
+/// ```
+/// let key = balloc(32);
+/// let block = balloc(16);
+/// let a = aes256_new(key);
+/// let sealed = aes_encrypt(a, block);
+/// let back = aes_decrypt(a, sealed);
+/// let ok = bytes_eq(back, block);
+/// bfree(back);
+/// bfree(sealed);
+/// aes_free(a);
+/// bfree(block);
+/// bfree(key);
+/// if !ok { return 1; }
+/// ```
+fn aes_decrypt(a: &Aes, block: &Bytes) -> Bytes
+  requires aes_ok(a) && blen(block) == 16
+  ensures blen(result) == 16
+{
+  let inv = aes_inv_sbox(a);
+  let r = aes_decrypt_with(a, inv, block);
+  bfree(inv);
+  return r;
 }

@@ -28,6 +28,7 @@
 - [The core and std libraries](core.md)
   - [core/aes.bastio](lib-core-aes.md)
   - [core/aesgcm.bastio](lib-core-aesgcm.md)
+  - [core/aesmodes.bastio](lib-core-aesmodes.md)
   - [core/ascii.bastio](lib-core-ascii.md)
   - [core/bitmap.bastio](lib-core-bitmap.md)
   - [core/blake2s.bastio](lib-core-blake2s.md)
