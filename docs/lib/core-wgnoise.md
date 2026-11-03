@@ -290,7 +290,7 @@ Example:
 let rpub = balloc(32);
 let nonce = balloc(24);
 let cookie = bfrom("0123456789abcdef");
-let mac1 = balloc(16);
+let mut mac1 = balloc(16);
 let msg = wgn_cookie_reply(rpub, 1, nonce, cookie, mac1);
 bset(&mut mac1, 0, 1);                       // another initiation's mac1
 let mut refused = true;
