@@ -229,7 +229,7 @@ Example:
 
 ```bastio
 let secret = balloc(32);
-let who = bfrom("\x7f\x00\x00\x01");
+let who = bfrom("abcdef");
 let c = wgn_cookie(secret, who);
 let n = blen(c);
 bfree(c);
