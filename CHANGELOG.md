@@ -131,6 +131,7 @@ What will be 0.2.0.
 
 ### Library
 
+- `core/chacha20`, `core/chacha20poly1305`, `core/wgnoise`: `hchacha20` and `xaead_seal` / `xaead_open` (XChaCha20-Poly1305, with the draft's vectors), and WireGuard's cookie reply: `wgn_cookie` (the cookie for a source address under a secret), `wgn_cookie_reply` and `wgn_consume_cookie_reply` (a reply sealed for one initiation's mac1 is refused for any other, for any other key and after any one-bit change; checked byte for byte against a reference).
 - `core/wgnoise`: WireGuard's handshake, Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s, as pure functions on byte strings: the initiation and response messages for both sides, the transport keys, the two MACs with an optional cookie, and refusal of low-order public keys. Bounds are proved; the messages, chaining state, keys and MACs are checked byte for byte against a reference implementation, and every byte of both messages is shown to matter.
 - `core/blake2s`: `blake2s` (RFC 7693, with an optional key and an output of 1 to 32 bytes) and `hmac_blake2s`, the hash, keyed MAC and key-derivation pieces WireGuard uses. Bounds are proved; the digests are checked against RFC 7693's vectors and the reference implementation for lengths around a block, keyed hashes and HMAC.
 - `core/json`: `JsonOut` builds a whole JSON document (`json_out_begin_obj`, `json_out_key`,

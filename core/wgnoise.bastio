@@ -16,7 +16,7 @@
 // key it receives with. A Diffie-Hellman result of all zeros (a low-order
 // public key) refuses the message, as in the reference implementation.
 //
-// Not here: replay windows, timers, cookies (wgn_macs takes one) and the
+// Not here: replay windows, timers, the choice of when to ask for a cookie and the
 // data messages: those belong to the caller.
 import "blake2s.bastio";
 import "chacha20poly1305.bastio";
@@ -658,4 +658,129 @@ fn wgn_mac2_ok(msg: &Bytes, cookie: &Bytes) -> bool
   bfree(upto);
   bfree(want);
   return diff == 0;
+}
+
+// ---------------------------------------------------------------- cookies
+//
+// A responder that is busy answers an initiation whose mac2 is not valid
+// with a cookie reply instead of doing the Diffie-Hellman work: 64 bytes,
+//
+//   0   type 3 (4 bytes, little-endian)
+//   4   the receiver index: the sender index of the initiation (4)
+//   8   a 24-byte random nonce
+//   32  the cookie, sealed with XChaCha20-Poly1305 (16 + 16 bytes)
+//
+// The cookie is MAC(secret, source address and port), a keyed BLAKE2s with 16
+// output bytes, for a secret the responder changes every two minutes. The
+// seal key is HASH("cookie--" || the responder's public key), and the
+// associated data are the mac1 of the initiation the reply answers, so a
+// reply cannot be taken for another initiation's. The initiator keeps the
+// cookie and uses it as the key of mac2 in its next messages (wgn_macs).
+
+/// Internal: HASH("cookie--" || pub), the key cookie replies to the holder of
+/// static public key `pub` are sealed with.
+fn wgn_cookie_key(pub: &Bytes) -> Bytes
+  requires blen(pub) == 32
+  ensures blen(result) == 32
+{
+  let label = bfrom("cookie--");
+  let k = wgn_hash(label, pub);
+  bfree(label);
+  return k;
+}
+
+/// The 16-byte cookie for the peer at `who` (the bytes of its address and
+/// port, at most 32) under the 32-byte `secret`.
+/// ```
+/// let secret = balloc(32);
+/// let who = bfrom("\x7f\x00\x00\x01");
+/// let c = wgn_cookie(secret, who);
+/// let n = blen(c);
+/// bfree(c);
+/// bfree(who);
+/// bfree(secret);
+/// if n != 16 { return 1; }
+/// ```
+fn wgn_cookie(secret: &Bytes, who: &Bytes) -> Bytes
+  requires blen(secret) == 32 && blen(who) <= 32
+  ensures blen(result) == 16
+{
+  return blake2s(who, secret, 16);
+}
+
+/// The cookie reply (64 bytes) for the initiation with sender index `ridx`
+/// and mac1 `mac1` (16 bytes), from the holder of static public key `mypub`:
+/// the 16-byte `cookie` sealed under the 24-byte `nonce`, which must be
+/// random and used once.
+/// ```
+/// let mypub = balloc(32);
+/// let nonce = balloc(24);
+/// let cookie = balloc(16);
+/// let mac1 = balloc(16);
+/// let msg = wgn_cookie_reply(mypub, 5, nonce, cookie, mac1);
+/// let mut ok = blen(msg) == 64 && bget(msg, 0) == 3 && bget(msg, 4) == 5;
+/// match wgn_consume_cookie_reply(msg, mypub, mac1) {
+///   Option::Some(c) => { ok = ok && bytes_eq(c, cookie); bfree(c); },
+///   Option::None => { ok = false; },
+/// }
+/// bfree(msg);
+/// bfree(mac1);
+/// bfree(cookie);
+/// bfree(nonce);
+/// bfree(mypub);
+/// if !ok { return 1; }
+/// ```
+fn wgn_cookie_reply(mypub: &Bytes, ridx: u64, nonce: &Bytes, cookie: &Bytes, mac1: &Bytes) -> Bytes
+  requires blen(mypub) == 32 && ridx < 4294967296 && blen(nonce) == 24 && blen(cookie) == 16 && blen(mac1) == 16
+  ensures blen(result) == 64
+{
+  let key = wgn_cookie_key(mypub);
+  let sealed = xaead_seal(key, nonce, mac1, cookie);
+  let mut out = balloc(64);
+  store_le32(&mut out, 0, 3);
+  store_le32(&mut out, 4, cast[u32](ridx));
+  bytes_copy_into(&mut out, 8, nonce);
+  bytes_copy_into(&mut out, 32, sealed);
+  bfree(sealed);
+  bfree(key);
+  return out;
+}
+
+/// The cookie in the cookie reply `msg` (64 bytes) to our initiation whose
+/// mac1 was `mac1`, from the holder of static public key `rpub`; `None` if
+/// the reply is not type 3, or was not sealed by that holder for that mac1.
+/// ```
+/// let rpub = balloc(32);
+/// let nonce = balloc(24);
+/// let cookie = bfrom("0123456789abcdef");
+/// let mac1 = balloc(16);
+/// let msg = wgn_cookie_reply(rpub, 1, nonce, cookie, mac1);
+/// bset(&mut mac1, 0, 1);                       // another initiation's mac1
+/// let mut refused = true;
+/// match wgn_consume_cookie_reply(msg, rpub, mac1) {
+///   Option::Some(c) => { refused = false; bfree(c); },
+///   Option::None => {},
+/// }
+/// bfree(msg);
+/// bfree(mac1);
+/// bfree(cookie);
+/// bfree(nonce);
+/// bfree(rpub);
+/// if !refused { return 1; }
+/// ```
+fn wgn_consume_cookie_reply(msg: &Bytes, rpub: &Bytes, mac1: &Bytes) -> Option[Bytes]
+  requires blen(msg) == 64 && blen(rpub) == 32 && blen(mac1) == 16
+  ensures result is Option::Some ==> blen(result.Some) == 16
+{
+  if load_le32(msg, 0) != 3 {
+    return Option[Bytes]::None;
+  }
+  let key = wgn_cookie_key(rpub);
+  let nonce = bytes_slice(msg, 8, 32);
+  let sealed = bytes_slice(msg, 32, 64);
+  let r = xaead_open(key, nonce, mac1, sealed);
+  bfree(sealed);
+  bfree(nonce);
+  bfree(key);
+  return r;
 }
