@@ -13,11 +13,39 @@ has no branch or index that depends on the key, but nothing checks that).
 
 | Function | |
 | --- | --- |
+| [`hchacha20`](#hchacha20) | HChaCha20 (draft-irtf-cfrg-xchacha-03 section 2.2). |
 | [`chacha20_xor`](#chacha20_xor) | `data` encrypted (or decrypted. |
 
 Every example below is built, verified and run by `tests/run.sh`. An `assert` in one is proved at compile time from the contracts above it.
 
 ## Functions
+
+### `hchacha20`
+
+```bastio
+fn hchacha20(key: &Bytes, nonce: &Bytes) -> Bytes
+  requires blen(key) == 32 && blen(nonce) == 16
+  ensures blen(result) == 32
+```
+
+HChaCha20 (draft-irtf-cfrg-xchacha-03 section 2.2): the 32-byte subkey
+that the 32-byte `key` and the first 16 bytes of an XChaCha20 nonce make.
+It is ChaCha20's rounds over the key and a 16-byte input, with no final
+addition, keeping the first and the last row. Like the block function it
+has no branch or index that depends on the key.
+
+Example:
+
+```bastio
+let key = balloc(32);
+let nonce = balloc(16);
+let sub = hchacha20(key, nonce);
+let n = blen(sub);
+bfree(sub);
+bfree(nonce);
+bfree(key);
+if n != 32 { return 1; }
+```
 
 ### `chacha20_xor`
 

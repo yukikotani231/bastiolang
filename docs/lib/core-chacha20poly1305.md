@@ -20,6 +20,8 @@ A nonce must never be used twice with one key.
 | --- | --- |
 | [`aead_seal`](#aead_seal) | Encrypts `plain` under the 32-byte `key` and 12-byte `nonce`, and authenticates it together with `aad` (which stays in the clear). |
 | [`aead_open`](#aead_open) | Checks the tag at the end of `sealed` and, if it is right, decrypts. |
+| [`xaead_seal`](#xaead_seal) | XChaCha20-Poly1305 (draft-irtf-cfrg-xchacha-03 section 2.3). |
+| [`xaead_open`](#xaead_open) | The reverse of `xaead_seal`. |
 
 Every example below is built, verified and run by `tests/run.sh`. An `assert` in one is proved at compile time from the contracts above it.
 
@@ -84,6 +86,69 @@ let mut sealed = aead_seal(key, nonce, aad, plain);
 bset(&mut sealed, 0, bget(sealed, 0) ^ 1);     // flip a bit
 let mut refused = true;
 match aead_open(key, nonce, aad, sealed) {
+  Option::Some(p) => { refused = false; bfree(p); },
+  Option::None => {},
+}
+bfree(sealed);
+bfree(plain);
+bfree(aad);
+bfree(nonce);
+bfree(key);
+if !refused { return 1; }
+```
+
+### `xaead_seal`
+
+```bastio
+fn xaead_seal(key: &Bytes, nonce: &Bytes, aad: &Bytes, plain: &Bytes) -> Bytes
+  requires blen(key) == 32 && blen(nonce) == 24 && blen(plain) < 274877906944
+  ensures blen(result) == blen(plain) + 16
+```
+
+XChaCha20-Poly1305 (draft-irtf-cfrg-xchacha-03 section 2.3): `aead_seal`
+with a 24-byte nonce, which is safe to pick at random. The subkey is
+HChaCha20 of the key and the first 16 bytes of the nonce, and the
+ChaCha20-Poly1305 nonce is four zero bytes and the last 8 of the nonce.
+
+Example:
+
+```bastio
+let key = balloc(32);
+let nonce = balloc(24);
+let aad = balloc(0);
+let plain = bfrom("x");
+let sealed = xaead_seal(key, nonce, aad, plain);
+let n = blen(sealed);
+bfree(sealed);
+bfree(plain);
+bfree(aad);
+bfree(nonce);
+bfree(key);
+if n != 17 { return 1; }
+```
+
+### `xaead_open`
+
+```bastio
+fn xaead_open(key: &Bytes, nonce: &Bytes, aad: &Bytes, sealed: &Bytes) -> Option[Bytes]
+  requires blen(key) == 32 && blen(nonce) == 24 && blen(sealed) < 274877906944
+  ensures result is Option::Some ==> blen(result.Some) + 16 == blen(sealed)
+```
+
+The reverse of `xaead_seal`: the plaintext, or `None` for a message
+shorter than a tag or one whose tag, data or `aad` was changed.
+
+Example:
+
+```bastio
+let key = balloc(32);
+let nonce = balloc(24);
+let aad = balloc(0);
+let plain = bfrom("x");
+let mut sealed = xaead_seal(key, nonce, aad, plain);
+bset(&mut sealed, 0, bget(sealed, 0) ^ 1);     // flip a bit
+let mut refused = true;
+match xaead_open(key, nonce, aad, sealed) {
   Option::Some(p) => { refused = false; bfree(p); },
   Option::None => {},
 }

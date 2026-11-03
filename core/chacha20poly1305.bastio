@@ -149,3 +149,72 @@ fn aead_open(key: &Bytes, nonce: &Bytes, aad: &Bytes, sealed: &Bytes) -> Option[
   bfree(ct);
   return Option[Bytes]::Some(plain);
 }
+
+/// XChaCha20-Poly1305 (draft-irtf-cfrg-xchacha-03 section 2.3): `aead_seal`
+/// with a 24-byte nonce, which is safe to pick at random. The subkey is
+/// HChaCha20 of the key and the first 16 bytes of the nonce, and the
+/// ChaCha20-Poly1305 nonce is four zero bytes and the last 8 of the nonce.
+/// ```
+/// let key = balloc(32);
+/// let nonce = balloc(24);
+/// let aad = balloc(0);
+/// let plain = bfrom("x");
+/// let sealed = xaead_seal(key, nonce, aad, plain);
+/// let n = blen(sealed);
+/// bfree(sealed);
+/// bfree(plain);
+/// bfree(aad);
+/// bfree(nonce);
+/// bfree(key);
+/// if n != 17 { return 1; }
+/// ```
+fn xaead_seal(key: &Bytes, nonce: &Bytes, aad: &Bytes, plain: &Bytes) -> Bytes
+  requires blen(key) == 32 && blen(nonce) == 24 && blen(plain) < 274877906944
+  ensures blen(result) == blen(plain) + 16
+{
+  let head = bytes_slice(nonce, 0, 16);
+  let sub = hchacha20(key, head);
+  let mut n12 = balloc(12);
+  bytes_copy_span(&mut n12, 4, nonce, 16, 24);
+  let sealed = aead_seal(sub, n12, aad, plain);
+  bfree(n12);
+  bfree(sub);
+  bfree(head);
+  return sealed;
+}
+
+/// The reverse of `xaead_seal`: the plaintext, or `None` for a message
+/// shorter than a tag or one whose tag, data or `aad` was changed.
+/// ```
+/// let key = balloc(32);
+/// let nonce = balloc(24);
+/// let aad = balloc(0);
+/// let plain = bfrom("x");
+/// let mut sealed = xaead_seal(key, nonce, aad, plain);
+/// bset(&mut sealed, 0, bget(sealed, 0) ^ 1);     // flip a bit
+/// let mut refused = true;
+/// match xaead_open(key, nonce, aad, sealed) {
+///   Option::Some(p) => { refused = false; bfree(p); },
+///   Option::None => {},
+/// }
+/// bfree(sealed);
+/// bfree(plain);
+/// bfree(aad);
+/// bfree(nonce);
+/// bfree(key);
+/// if !refused { return 1; }
+/// ```
+fn xaead_open(key: &Bytes, nonce: &Bytes, aad: &Bytes, sealed: &Bytes) -> Option[Bytes]
+  requires blen(key) == 32 && blen(nonce) == 24 && blen(sealed) < 274877906944
+  ensures result is Option::Some ==> blen(result.Some) + 16 == blen(sealed)
+{
+  let head = bytes_slice(nonce, 0, 16);
+  let sub = hchacha20(key, head);
+  let mut n12 = balloc(12);
+  bytes_copy_span(&mut n12, 4, nonce, 16, 24);
+  let r = aead_open(sub, n12, aad, sealed);
+  bfree(n12);
+  bfree(sub);
+  bfree(head);
+  return r;
+}

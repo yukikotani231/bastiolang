@@ -20,7 +20,7 @@ A transport key pair is 64 bytes: the key this side sends with, then the
 key it receives with. A Diffie-Hellman result of all zeros (a low-order
 public key) refuses the message, as in the reference implementation.
 
-Not here: replay windows, timers, cookies (wgn_macs takes one) and the
+Not here: replay windows, timers, the choice of when to ask for a cookie and the
 data messages: those belong to the caller.
 
 `import "core/wgnoise.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/endian.bastio](core-endian.md), [core/text.bastio](core-text.md), [core/blake2s.bastio](core-blake2s.md), [core/chacha20.bastio](core-chacha20.md), [core/poly1305.bastio](core-poly1305.md), [core/chacha20poly1305.bastio](core-chacha20poly1305.md), [core/x25519.bastio](core-x25519.md).
@@ -35,6 +35,9 @@ data messages: those belong to the caller.
 | [`wgn_macs`](#wgn_macs) | body || mac1 || mac2 for a handshake message addressed to the holder of static public key `rpub`. |
 | [`wgn_mac1_ok`](#wgn_mac1_ok) | Do the last 32 bytes of `msg` hold a mac1 made for the holder of static public key `mypub`? (A message shorter than 32 bytes does not.) |
 | [`wgn_mac2_ok`](#wgn_mac2_ok) | Does `msg` carry a mac2 made with `cookie` (16 bytes)? |
+| [`wgn_cookie`](#wgn_cookie) | The 16-byte cookie for the peer at `who` (the bytes of its address and port, at most 32) under the 32-byte `secret`. |
+| [`wgn_cookie_reply`](#wgn_cookie_reply) | The cookie reply (64 bytes) for the initiation with sender index `ridx` and mac1 `mac1` (16 bytes), from the holder of static public key `mypub`. |
+| [`wgn_consume_cookie_reply`](#wgn_consume_cookie_reply) | The cookie in the cookie reply `msg` (64 bytes) to our initiation whose mac1 was `mac1`, from the holder of static public key `rpub`; `None` if the reply is not type 3, or was not sealed by that holder for that mac1. |
 
 Every example below is built, verified and run by `tests/run.sh`. An `assert` in one is proved at compile time from the contracts above it.
 
@@ -211,6 +214,98 @@ fn wgn_mac2_ok(msg: &Bytes, cookie: &Bytes) -> bool
 
 Does `msg` carry a mac2 made with `cookie` (16 bytes)?
 
+### `wgn_cookie`
+
+```bastio
+fn wgn_cookie(secret: &Bytes, who: &Bytes) -> Bytes
+  requires blen(secret) == 32 && blen(who) <= 32
+  ensures blen(result) == 16
+```
+
+The 16-byte cookie for the peer at `who` (the bytes of its address and
+port, at most 32) under the 32-byte `secret`.
+
+Example:
+
+```bastio
+let secret = balloc(32);
+let who = bfrom("abcdef");
+let c = wgn_cookie(secret, who);
+let n = blen(c);
+bfree(c);
+bfree(who);
+bfree(secret);
+if n != 16 { return 1; }
+```
+
+### `wgn_cookie_reply`
+
+```bastio
+fn wgn_cookie_reply(mypub: &Bytes, ridx: u64, nonce: &Bytes, cookie: &Bytes, mac1: &Bytes) -> Bytes
+  requires blen(mypub) == 32 && ridx < 4294967296 && blen(nonce) == 24 && blen(cookie) == 16 && blen(mac1) == 16
+  ensures blen(result) == 64
+```
+
+The cookie reply (64 bytes) for the initiation with sender index `ridx`
+and mac1 `mac1` (16 bytes), from the holder of static public key `mypub`:
+the 16-byte `cookie` sealed under the 24-byte `nonce`, which must be
+random and used once.
+
+Example:
+
+```bastio
+let mypub = balloc(32);
+let nonce = balloc(24);
+let cookie = balloc(16);
+let mac1 = balloc(16);
+let msg = wgn_cookie_reply(mypub, 5, nonce, cookie, mac1);
+let mut ok = blen(msg) == 64 && bget(msg, 0) == 3 && bget(msg, 4) == 5;
+match wgn_consume_cookie_reply(msg, mypub, mac1) {
+  Option::Some(c) => { ok = ok && bytes_eq(c, cookie); bfree(c); },
+  Option::None => { ok = false; },
+}
+bfree(msg);
+bfree(mac1);
+bfree(cookie);
+bfree(nonce);
+bfree(mypub);
+if !ok { return 1; }
+```
+
+### `wgn_consume_cookie_reply`
+
+```bastio
+fn wgn_consume_cookie_reply(msg: &Bytes, rpub: &Bytes, mac1: &Bytes) -> Option[Bytes]
+  requires blen(msg) == 64 && blen(rpub) == 32 && blen(mac1) == 16
+  ensures result is Option::Some ==> blen(result.Some) == 16
+```
+
+The cookie in the cookie reply `msg` (64 bytes) to our initiation whose
+mac1 was `mac1`, from the holder of static public key `rpub`; `None` if
+the reply is not type 3, or was not sealed by that holder for that mac1.
+
+Example:
+
+```bastio
+let rpub = balloc(32);
+let nonce = balloc(24);
+let cookie = bfrom("0123456789abcdef");
+let mut mac1 = balloc(16);
+let msg = wgn_cookie_reply(rpub, 1, nonce, cookie, mac1);
+bset(&mut mac1, 0, 1);                       // another initiation's mac1
+let mut refused = true;
+match wgn_consume_cookie_reply(msg, rpub, mac1) {
+  Option::Some(c) => { refused = false; bfree(c); },
+  Option::None => {},
+}
+bfree(msg);
+bfree(mac1);
+bfree(cookie);
+bfree(nonce);
+bfree(rpub);
+if !refused { return 1; }
+```
+
 ## Internals
 
 ### `wgn_hash`
@@ -369,3 +464,14 @@ output into H); returns the key that seals the empty field, or None for a
 zero Diffie-Hellman result. `epriv`/`epub_peer` and `spriv`/`spub_peer`
 name which side's keys are used (the responder uses its ephemeral private
 key with the initiator's keys; the initiator the other way round).
+
+### `wgn_cookie_key`
+
+```bastio
+fn wgn_cookie_key(pub: &Bytes) -> Bytes
+  requires blen(pub) == 32
+  ensures blen(result) == 32
+```
+
+Internal: HASH("cookie--" || pub), the key cookie replies to the holder of
+static public key `pub` are sealed with.
