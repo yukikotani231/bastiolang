@@ -1,10 +1,10 @@
-// core/aesmodes.bastio: AES in counter mode and in CBC mode (NIST SP 800-38A),
+// core/aesmodes.bastio: AES in counter, CBC and ECB mode (NIST SP 800-38A),
 // on the block cipher of core/aes.bastio.
 //
 // What is proved: every access is in bounds, nothing leaks, and the result is
 // as long as the input. Not proved: that the output is the standard's (the
 // tests check the vectors of SP 800-38A F.2 and F.5), or that the code is
-// constant time (see core/aes.bastio). CBC takes whole blocks only; padding is
+// constant time (see core/aes.bastio). CBC and ECB take whole blocks only (ECB leaks equal blocks: use it only to build other modes); padding is
 // the caller's, and so is the integrity check: neither mode authenticates.
 import "aes.bastio";
 
@@ -174,6 +174,80 @@ fn aes_cbc_decrypt(a: &Aes, iv: &Bytes, data: &Bytes) -> Bytes
     bfree(d);
     bytes_copy_span(&mut out, at, p, 0, 16);
     bfree(p);
+    at = at + 16;
+  }
+  bfree(inv);
+  return out;
+}
+
+/// ECB encryption of `data`, a whole number of 16-byte blocks: each block
+/// on its own, so equal blocks give equal ciphertext. Use it only where a
+/// protocol or interface asks for it.
+/// ```
+/// let mut key = balloc(16);
+/// let data = balloc(32);
+/// let a = aes128_new(key);
+/// let sealed = aes_ecb_encrypt(a, data);
+/// let back = aes_ecb_decrypt(a, sealed);
+/// let ok = bytes_eq(back, data) && blen(sealed) == 32;
+/// bfree(back);
+/// bfree(sealed);
+/// aes_free(a);
+/// bfree(data);
+/// bfree(key);
+/// if !ok { return 1; }
+/// ```
+fn aes_ecb_encrypt(a: &Aes, data: &Bytes) -> Bytes
+  requires aes_ok(a) && blen(data) % 16 == 0 && blen(data) < 274877906944
+  ensures blen(result) == blen(data)
+{
+  let n = blen(data);
+  let mut out = balloc(n);
+  let mut at = 0;
+  while at < n
+    invariant at <= n && n == blen(data) && n % 16 == 0 && at % 16 == 0 && blen(out) == n && aes_ok(a)
+  {
+    let blk = bytes_slice(data, at, at + 16);
+    let c = aes_encrypt(a, blk);
+    bfree(blk);
+    bytes_copy_span(&mut out, at, c, 0, 16);
+    bfree(c);
+    at = at + 16;
+  }
+  return out;
+}
+
+/// ECB decryption of `data`, a whole number of 16-byte blocks.
+/// ```
+/// let mut key = balloc(16);
+/// let data = balloc(16);
+/// let a = aes128_new(key);
+/// let sealed = aes_ecb_encrypt(a, data);
+/// let back = aes_ecb_decrypt(a, sealed);
+/// let ok = bytes_eq(back, data);
+/// bfree(back);
+/// bfree(sealed);
+/// aes_free(a);
+/// bfree(data);
+/// bfree(key);
+/// if !ok { return 1; }
+/// ```
+fn aes_ecb_decrypt(a: &Aes, data: &Bytes) -> Bytes
+  requires aes_ok(a) && blen(data) % 16 == 0 && blen(data) < 274877906944
+  ensures blen(result) == blen(data)
+{
+  let n = blen(data);
+  let inv = aes_inv_sbox(a);
+  let mut out = balloc(n);
+  let mut at = 0;
+  while at < n
+    invariant at <= n && n == blen(data) && n % 16 == 0 && at % 16 == 0 && blen(out) == n && blen(inv) == 256 && aes_ok(a)
+  {
+    let blk = bytes_slice(data, at, at + 16);
+    let d = aes_decrypt_with(a, inv, blk);
+    bfree(blk);
+    bytes_copy_span(&mut out, at, d, 0, 16);
+    bfree(d);
     at = at + 16;
   }
   bfree(inv);
