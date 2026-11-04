@@ -38,7 +38,7 @@ Each module has a reference page, generated from its source: every function with
 | --- | --- |
 | [`core/aes.bastio`](lib/core-aes.md) | The AES-128, AES-192 and AES-256 block ciphers (FIPS 197), both directions. |
 | [`core/aesgcm.bastio`](lib/core-aesgcm.md) | Authenticated encryption with AES-128 or AES-256 in Galois/Counter Mode (NIST SP 800-38D) with a 96-bit nonce and a 128-bit tag, as TLS_AES_128_GCM_SHA256 and TLS_AES_256_GCM_SHA384 use it (the key is 16 or 32 bytes). |
-| [`core/aesmodes.bastio`](lib/core-aesmodes.md) | AES in counter mode and in CBC mode (NIST SP 800-38A), on the block cipher of core/aes.bastio. |
+| [`core/aesmodes.bastio`](lib/core-aesmodes.md) | AES in counter, CBC and ECB mode (NIST SP 800-38A), on the block cipher of core/aes.bastio. |
 | [`core/ascii.bastio`](lib/core-ascii.md) | ASCII character classes and case conversion. |
 | [`core/bitmap.bastio`](lib/core-bitmap.md) | Allocation maps. |
 | [`core/blake2s.bastio`](lib/core-blake2s.md) | BLAKE2s (RFC 7693) and HMAC-BLAKE2s (RFC 2104 over it). |
