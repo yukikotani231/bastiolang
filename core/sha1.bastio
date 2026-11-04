@@ -1,0 +1,191 @@
+// core/sha1.bastio: SHA-1 (FIPS 180-4) and HMAC-SHA-1 (RFC 2104).
+//
+// SHA-1 is broken for collision resistance: use it only where a protocol
+// demands it (HMAC-SHA-1 in IPsec and TLS 1.0-1.2 legacy suites, the Linux
+// AF_ALG interface, git object names), never for new signatures.
+//
+// What is proved: every access is in bounds, nothing leaks, and a digest is
+// 20 bytes. Not proved: that the digest is SHA-1's (the tests check the
+// FIPS 180-4 and RFC 2202 vectors, including the block-boundary lengths 55,
+// 56, 63, 64 and 65), or that the code takes the same time for every input
+// (it does not branch on its data, but nothing checks that).
+import "bytes.bastio";
+import "endian.bastio";
+import "text.bastio";
+
+/// Internal: `x` rotated left by `n` (1..31) bits.
+fn sha1_rotl(x: u32, n: u64) -> u32
+  requires n >= 1 && n <= 31
+{
+  return wrap[u32](cast[u64](x) << n) | (x >> (32 - n));
+}
+
+/// Internal: the five state words after the 64-byte block at `at` of `m`.
+fn sha1_block(h: &mut Vec[u32], w: &mut Vec[u32], m: &Bytes, at: u64)
+  requires vlen(h) == 5 && vlen(w) == 80 && at + 64 <= blen(m)
+  ensures vlen(h) == 5 && vlen(w) == 80
+{
+  let mut i = 0;
+  while i < 16
+    invariant i <= 16 && vlen(w) == 80 && at + 64 <= blen(m)
+  {
+    vec_set(&mut w, i, load_be32(m, at + 4 * i));
+    i = i + 1;
+  }
+  while i < 80
+    invariant 16 <= i && i <= 80 && vlen(w) == 80
+  {
+    let x = vec_get(w, i - 3) ^ vec_get(w, i - 8) ^ vec_get(w, i - 14) ^ vec_get(w, i - 16);
+    vec_set(&mut w, i, sha1_rotl(x, 1));
+    i = i + 1;
+  }
+  let mut a = vec_get(h, 0);
+  let mut b = vec_get(h, 1);
+  let mut c = vec_get(h, 2);
+  let mut d = vec_get(h, 3);
+  let mut e = vec_get(h, 4);
+  let mut r = 0;
+  while r < 80
+    invariant r <= 80 && vlen(w) == 80
+  {
+    let mut f: u32 = 0;
+    let mut kk: u32 = 0;
+    if r < 20 {
+      f = (b & c) | ((b ^ 4294967295) & d);
+      kk = 1518500249;
+    } else if r < 40 {
+      f = b ^ c ^ d;
+      kk = 1859775393;
+    } else if r < 60 {
+      f = (b & c) | (b & d) | (c & d);
+      kk = 2400959708;
+    } else {
+      f = b ^ c ^ d;
+      kk = 3395469782;
+    }
+    let t = wrap_add(wrap_add(wrap_add(sha1_rotl(a, 5), f), wrap_add(e, kk)), vec_get(w, r));
+    e = d;
+    d = c;
+    c = sha1_rotl(b, 30);
+    b = a;
+    a = t;
+    r = r + 1;
+  }
+  vec_set(&mut h, 0, wrap_add(vec_get(h, 0), a));
+  vec_set(&mut h, 1, wrap_add(vec_get(h, 1), b));
+  vec_set(&mut h, 2, wrap_add(vec_get(h, 2), c));
+  vec_set(&mut h, 3, wrap_add(vec_get(h, 3), d));
+  vec_set(&mut h, 4, wrap_add(vec_get(h, 4), e));
+}
+
+/// The SHA-1 digest of `m`: 20 bytes.
+/// ```
+/// let m = bfrom("abc");
+/// let d = sha1(m);
+/// let first = bget(d, 0);          // a9 99 3e 36 ... 6c 9c d0 d8 9d
+/// let last = bget(d, 19);
+/// let n = blen(d);
+/// bfree(d);
+/// bfree(m);
+/// if n != 20 || first != 169 || last != 157 { return 1; }
+/// ```
+fn sha1(m: &Bytes) -> Bytes
+  ensures blen(result) == 20
+{
+  let n = blen(m);
+  let mut w = vec_new[u32]();
+  let mut h = vec_new[u32]();
+  let mut i = 0;
+  while i < 80
+    invariant i <= 80 && vlen(w) == i
+  {
+    vec_push(&mut w, 0);
+    i = i + 1;
+  }
+  vec_push(&mut h, 1732584193);
+  vec_push(&mut h, 4023233417);
+  vec_push(&mut h, 2562383102);
+  vec_push(&mut h, 271733878);
+  vec_push(&mut h, 3285377520);
+  let whole = n / 64 * 64;
+  let mut at = 0;
+  while at < whole
+    invariant at <= whole && whole <= n && n == blen(m) && at % 64 == 0 && vlen(h) == 5 && vlen(w) == 80
+  {
+    sha1_block(&mut h, &mut w, m, at);
+    at = at + 64;
+  }
+  // The rest, a 1 bit, zeros and the length in bits (mod 2^64) in one or two more blocks.
+  let rem = n - whole;
+  let mut tail = balloc(128);
+  bytes_copy_span(&mut tail, 0, m, whole, n);
+  bset(&mut tail, rem, 128);
+  let mut tlen = 64;
+  if rem >= 56 {
+    tlen = 128;
+  }
+  store_be64(&mut tail, tlen - 8, wrap_mul(n, 8));
+  sha1_block(&mut h, &mut w, tail, 0);
+  if tlen == 128 {
+    sha1_block(&mut h, &mut w, tail, 64);
+  }
+  let mut out = balloc(20);
+  let mut j = 0;
+  while j < 5
+    invariant j <= 5 && vlen(h) == 5 && blen(out) == 20
+  {
+    store_be32(&mut out, 4 * j, vec_get(h, j));
+    j = j + 1;
+  }
+  bfree(tail);
+  vec_free(w);
+  vec_free(h);
+  return out;
+}
+
+/// HMAC-SHA-1 of `msg` under `key` (any length): 20 bytes.
+/// ```
+/// let key = bfrom("key");
+/// let msg = bfrom("The quick brown fox jumps over the lazy dog");
+/// let mac = hmac_sha1(key, msg);
+/// let first = bget(mac, 0);        // de 7c 9b 85 ... d9
+/// let last = bget(mac, 19);
+/// bfree(mac);
+/// bfree(key);
+/// bfree(msg);
+/// if first != 222 || last != 217 { return 1; }
+/// ```
+fn hmac_sha1(key: &Bytes, msg: &Bytes) -> Bytes
+  ensures blen(result) == 20
+{
+  // A key longer than a block is hashed first; a shorter one is padded with zeros.
+  let mut k0 = balloc(64);
+  if blen(key) > 64 {
+    let hk = sha1(key);
+    bytes_copy_into(&mut k0, 0, hk);
+    bfree(hk);
+  } else {
+    bytes_copy_into(&mut k0, 0, key);
+  }
+  let mut inner = text_new();
+  let mut outer = text_new();
+  let mut i = 0;
+  while i < 64
+    invariant i <= 64 && blen(k0) == 64 && vlen(inner) == i && vlen(outer) == i
+  {
+    text_push(&mut inner, bget(k0, i) ^ 54);
+    text_push(&mut outer, bget(k0, i) ^ 92);
+    i = i + 1;
+  }
+  text_push_bytes(&mut inner, msg);
+  let ib = text_finish(inner);
+  let ih = sha1(ib);
+  text_push_bytes(&mut outer, ih);
+  let ob = text_finish(outer);
+  let r = sha1(ob);
+  bfree(k0);
+  bfree(ib);
+  bfree(ih);
+  bfree(ob);
+  return r;
+}

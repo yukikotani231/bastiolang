@@ -58,6 +58,7 @@ Each module has a reference page, generated from its source: every function with
 | [`core/httpsurl.bastio`](lib/core-httpsurl.md) | The `https://` URLs a client follows (the Location of a redirect, or a address typed by a person) split into host, port and path, strictly. |
 | [`core/json.bastio`](lib/core-json.md) | JSON (RFC 8259) read from bytes that cannot be trusted. |
 | [`core/lines.bastio`](lib/core-lines.md) | Splitting text into lines. |
+| [`core/md5.bastio`](lib/core-md5.md) | MD5 (RFC 1321) and HMAC-MD5 (RFC 2104). |
 | [`core/num.bastio`](lib/core-num.md) | Parsing integers from bytes and formatting them as text. |
 | [`core/option.bastio`](lib/core-option.md) | An optional value, and a span of a byte string. |
 | [`core/p256.bastio`](lib/core-p256.md) | ECDSA signatures over the curve P-256 (secp256r1) with SHA-256, verification only (FIPS 186-4, RFC 6979 is for signing), for the ecdsa_secp256r1_sha256 scheme of TLS 1.3 certificates. |
@@ -70,6 +71,7 @@ Each module has a reference page, generated from its source: every function with
 | [`core/rsa.bastio`](lib/core-rsa.md) | RSA signature verification with SHA-256, SHA-384 and SHA-512 (RFC 8017). |
 | [`core/scan.bastio`](lib/core-scan.md) | Cutting a byte string into pieces. |
 | [`core/set.bastio`](lib/core-set.md) | A set of `u64`, built on core/hashmap.bastio. |
+| [`core/sha1.bastio`](lib/core-sha1.md) | SHA-1 (FIPS 180-4) and HMAC-SHA-1 (RFC 2104). |
 | [`core/sha256.bastio`](lib/core-sha256.md) | SHA-256 (FIPS 180-4) and HMAC-SHA-256 (RFC 2104). |
 | [`core/sha512.bastio`](lib/core-sha512.md) | SHA-512, SHA-384 (FIPS 180-4) and HMAC-SHA-384 (RFC 2104). |
 | [`core/slots.bastio`](lib/core-slots.md) | A growable table of numbered slots, for ids that a program hands out and takes back (process ids, file descriptors, pipe and socket numbers). |

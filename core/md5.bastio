@@ -1,0 +1,316 @@
+// core/md5.bastio: MD5 (RFC 1321) and HMAC-MD5 (RFC 2104).
+//
+// MD5 is broken for collision resistance: use it only where a protocol
+// demands it (the Linux AF_ALG interface, legacy checksums), never for
+// signatures or passwords.
+//
+// What is proved: every access is in bounds, nothing leaks, and a digest is
+// 16 bytes. Not proved: that the digest is MD5's (the tests check the
+// RFC 1321 and RFC 2202 vectors, including the block-boundary lengths 55,
+// 56, 63, 64 and 65), or that the code takes the same time for every input.
+import "bytes.bastio";
+import "endian.bastio";
+import "text.bastio";
+
+/// Internal: the 64 additive constants floor(2^32 * abs(sin(i + 1))).
+fn md5_k() -> Vec[u32]
+  ensures vlen(result) == 64
+{
+  let mut k = vec_new[u32]();
+  vec_push(&mut k, 3614090360);
+  vec_push(&mut k, 3905402710);
+  vec_push(&mut k, 606105819);
+  vec_push(&mut k, 3250441966);
+  vec_push(&mut k, 4118548399);
+  vec_push(&mut k, 1200080426);
+  vec_push(&mut k, 2821735955);
+  vec_push(&mut k, 4249261313);
+  vec_push(&mut k, 1770035416);
+  vec_push(&mut k, 2336552879);
+  vec_push(&mut k, 4294925233);
+  vec_push(&mut k, 2304563134);
+  vec_push(&mut k, 1804603682);
+  vec_push(&mut k, 4254626195);
+  vec_push(&mut k, 2792965006);
+  vec_push(&mut k, 1236535329);
+  vec_push(&mut k, 4129170786);
+  vec_push(&mut k, 3225465664);
+  vec_push(&mut k, 643717713);
+  vec_push(&mut k, 3921069994);
+  vec_push(&mut k, 3593408605);
+  vec_push(&mut k, 38016083);
+  vec_push(&mut k, 3634488961);
+  vec_push(&mut k, 3889429448);
+  vec_push(&mut k, 568446438);
+  vec_push(&mut k, 3275163606);
+  vec_push(&mut k, 4107603335);
+  vec_push(&mut k, 1163531501);
+  vec_push(&mut k, 2850285829);
+  vec_push(&mut k, 4243563512);
+  vec_push(&mut k, 1735328473);
+  vec_push(&mut k, 2368359562);
+  vec_push(&mut k, 4294588738);
+  vec_push(&mut k, 2272392833);
+  vec_push(&mut k, 1839030562);
+  vec_push(&mut k, 4259657740);
+  vec_push(&mut k, 2763975236);
+  vec_push(&mut k, 1272893353);
+  vec_push(&mut k, 4139469664);
+  vec_push(&mut k, 3200236656);
+  vec_push(&mut k, 681279174);
+  vec_push(&mut k, 3936430074);
+  vec_push(&mut k, 3572445317);
+  vec_push(&mut k, 76029189);
+  vec_push(&mut k, 3654602809);
+  vec_push(&mut k, 3873151461);
+  vec_push(&mut k, 530742520);
+  vec_push(&mut k, 3299628645);
+  vec_push(&mut k, 4096336452);
+  vec_push(&mut k, 1126891415);
+  vec_push(&mut k, 2878612391);
+  vec_push(&mut k, 4237533241);
+  vec_push(&mut k, 1700485571);
+  vec_push(&mut k, 2399980690);
+  vec_push(&mut k, 4293915773);
+  vec_push(&mut k, 2240044497);
+  vec_push(&mut k, 1873313359);
+  vec_push(&mut k, 4264355552);
+  vec_push(&mut k, 2734768916);
+  vec_push(&mut k, 1309151649);
+  vec_push(&mut k, 4149444226);
+  vec_push(&mut k, 3174756917);
+  vec_push(&mut k, 718787259);
+  vec_push(&mut k, 3951481745);
+  return k;
+}
+
+/// Internal: the 64 rotation amounts.
+fn md5_s() -> Vec[u32]
+  ensures vlen(result) == 64
+{
+  let mut s = vec_new[u32]();
+  vec_push(&mut s, 7);
+  vec_push(&mut s, 12);
+  vec_push(&mut s, 17);
+  vec_push(&mut s, 22);
+  vec_push(&mut s, 7);
+  vec_push(&mut s, 12);
+  vec_push(&mut s, 17);
+  vec_push(&mut s, 22);
+  vec_push(&mut s, 7);
+  vec_push(&mut s, 12);
+  vec_push(&mut s, 17);
+  vec_push(&mut s, 22);
+  vec_push(&mut s, 7);
+  vec_push(&mut s, 12);
+  vec_push(&mut s, 17);
+  vec_push(&mut s, 22);
+  vec_push(&mut s, 5);
+  vec_push(&mut s, 9);
+  vec_push(&mut s, 14);
+  vec_push(&mut s, 20);
+  vec_push(&mut s, 5);
+  vec_push(&mut s, 9);
+  vec_push(&mut s, 14);
+  vec_push(&mut s, 20);
+  vec_push(&mut s, 5);
+  vec_push(&mut s, 9);
+  vec_push(&mut s, 14);
+  vec_push(&mut s, 20);
+  vec_push(&mut s, 5);
+  vec_push(&mut s, 9);
+  vec_push(&mut s, 14);
+  vec_push(&mut s, 20);
+  vec_push(&mut s, 4);
+  vec_push(&mut s, 11);
+  vec_push(&mut s, 16);
+  vec_push(&mut s, 23);
+  vec_push(&mut s, 4);
+  vec_push(&mut s, 11);
+  vec_push(&mut s, 16);
+  vec_push(&mut s, 23);
+  vec_push(&mut s, 4);
+  vec_push(&mut s, 11);
+  vec_push(&mut s, 16);
+  vec_push(&mut s, 23);
+  vec_push(&mut s, 4);
+  vec_push(&mut s, 11);
+  vec_push(&mut s, 16);
+  vec_push(&mut s, 23);
+  vec_push(&mut s, 6);
+  vec_push(&mut s, 10);
+  vec_push(&mut s, 15);
+  vec_push(&mut s, 21);
+  vec_push(&mut s, 6);
+  vec_push(&mut s, 10);
+  vec_push(&mut s, 15);
+  vec_push(&mut s, 21);
+  vec_push(&mut s, 6);
+  vec_push(&mut s, 10);
+  vec_push(&mut s, 15);
+  vec_push(&mut s, 21);
+  vec_push(&mut s, 6);
+  vec_push(&mut s, 10);
+  vec_push(&mut s, 15);
+  vec_push(&mut s, 21);
+  return s;
+}
+
+/// Internal: `x` rotated left by `n` (1..31) bits.
+fn md5_rotl(x: u32, n: u64) -> u32
+  requires n >= 1 && n <= 31
+{
+  return wrap[u32](cast[u64](x) << n) | (x >> (32 - n));
+}
+
+/// Internal: the four state words after the 64-byte block at `at` of `m`.
+fn md5_block(h: &mut Vec[u32], k: &Vec[u32], s: &Vec[u32], m: &Bytes, at: u64)
+  requires vlen(h) == 4 && vlen(k) == 64 && vlen(s) == 64 && at + 64 <= blen(m)
+  ensures vlen(h) == 4
+{
+  let mut a = vec_get(h, 0);
+  let mut b = vec_get(h, 1);
+  let mut c = vec_get(h, 2);
+  let mut d = vec_get(h, 3);
+  let mut i = 0;
+  while i < 64
+    invariant i <= 64 && vlen(k) == 64 && vlen(s) == 64 && at + 64 <= blen(m)
+  {
+    let mut f: u32 = 0;
+    let mut g = 0;
+    if i < 16 {
+      f = (b & c) | ((b ^ 4294967295) & d);
+      g = i;
+    } else if i < 32 {
+      f = (d & b) | ((d ^ 4294967295) & c);
+      g = (5 * i + 1) % 16;
+    } else if i < 48 {
+      f = b ^ c ^ d;
+      g = (3 * i + 5) % 16;
+    } else {
+      f = c ^ (b | (d ^ 4294967295));
+      g = (7 * i) % 16;
+    }
+    let sum = wrap_add(wrap_add(a, f), wrap_add(vec_get(k, i), load_le32(m, at + 4 * g)));
+    let sh = cast[u64](vec_get(s, i));
+    let mut rot = sum;
+    if sh >= 1 && sh <= 31 {
+      rot = md5_rotl(sum, sh);   // always: the amounts are 4..23
+    }
+    a = d;
+    d = c;
+    c = b;
+    b = wrap_add(b, rot);
+    i = i + 1;
+  }
+  vec_set(&mut h, 0, wrap_add(vec_get(h, 0), a));
+  vec_set(&mut h, 1, wrap_add(vec_get(h, 1), b));
+  vec_set(&mut h, 2, wrap_add(vec_get(h, 2), c));
+  vec_set(&mut h, 3, wrap_add(vec_get(h, 3), d));
+}
+
+/// The MD5 digest of `m`: 16 bytes.
+/// ```
+/// let m = bfrom("abc");
+/// let d = md5(m);
+/// let first = bget(d, 0);          // 90 01 50 98 3c d2 4f b0 d6 96 3f 7d 28 e1 7f 72
+/// let last = bget(d, 15);
+/// let n = blen(d);
+/// bfree(d);
+/// bfree(m);
+/// if n != 16 || first != 144 || last != 114 { return 1; }
+/// ```
+fn md5(m: &Bytes) -> Bytes
+  ensures blen(result) == 16
+{
+  let n = blen(m);
+  let k = md5_k();
+  let s = md5_s();
+  let mut h = vec_new[u32]();
+  vec_push(&mut h, 1732584193);
+  vec_push(&mut h, 4023233417);
+  vec_push(&mut h, 2562383102);
+  vec_push(&mut h, 271733878);
+  let whole = n / 64 * 64;
+  let mut at = 0;
+  while at < whole
+    invariant at <= whole && whole <= n && n == blen(m) && at % 64 == 0 && vlen(h) == 4 && vlen(k) == 64 && vlen(s) == 64
+  {
+    md5_block(&mut h, k, s, m, at);
+    at = at + 64;
+  }
+  // The rest, a 1 bit, zeros and the length in bits (mod 2^64, little-endian) in one or two more blocks.
+  let rem = n - whole;
+  let mut tail = balloc(128);
+  bytes_copy_span(&mut tail, 0, m, whole, n);
+  bset(&mut tail, rem, 128);
+  let mut tlen = 64;
+  if rem >= 56 {
+    tlen = 128;
+  }
+  store_le64(&mut tail, tlen - 8, wrap_mul(n, 8));
+  md5_block(&mut h, k, s, tail, 0);
+  if tlen == 128 {
+    md5_block(&mut h, k, s, tail, 64);
+  }
+  let mut out = balloc(16);
+  let mut j = 0;
+  while j < 4
+    invariant j <= 4 && vlen(h) == 4 && blen(out) == 16
+  {
+    store_le32(&mut out, 4 * j, vec_get(h, j));
+    j = j + 1;
+  }
+  bfree(tail);
+  vec_free(k);
+  vec_free(s);
+  vec_free(h);
+  return out;
+}
+
+/// HMAC-MD5 of `msg` under `key` (any length): 16 bytes.
+/// ```
+/// let key = bfrom("key");
+/// let msg = bfrom("The quick brown fox jumps over the lazy dog");
+/// let mac = hmac_md5(key, msg);
+/// let first = bget(mac, 0);        // 80 07 07 13 ... 75
+/// let last = bget(mac, 15);
+/// bfree(mac);
+/// bfree(key);
+/// bfree(msg);
+/// if first != 128 || last != 117 { return 1; }
+/// ```
+fn hmac_md5(key: &Bytes, msg: &Bytes) -> Bytes
+  ensures blen(result) == 16
+{
+  // A key longer than a block is hashed first; a shorter one is padded with zeros.
+  let mut k0 = balloc(64);
+  if blen(key) > 64 {
+    let hk = md5(key);
+    bytes_copy_into(&mut k0, 0, hk);
+    bfree(hk);
+  } else {
+    bytes_copy_into(&mut k0, 0, key);
+  }
+  let mut inner = text_new();
+  let mut outer = text_new();
+  let mut i = 0;
+  while i < 64
+    invariant i <= 64 && blen(k0) == 64 && vlen(inner) == i && vlen(outer) == i
+  {
+    text_push(&mut inner, bget(k0, i) ^ 54);
+    text_push(&mut outer, bget(k0, i) ^ 92);
+    i = i + 1;
+  }
+  text_push_bytes(&mut inner, msg);
+  let ib = text_finish(inner);
+  let ih = md5(ib);
+  text_push_bytes(&mut outer, ih);
+  let ob = text_finish(outer);
+  let r = md5(ob);
+  bfree(k0);
+  bfree(ib);
+  bfree(ih);
+  bfree(ob);
+  return r;
+}

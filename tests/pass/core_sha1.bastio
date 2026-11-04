@@ -1,0 +1,146 @@
+// expect-exit: 0
+// core/sha1: the FIPS 180-4 vectors, the lengths around a block, and the
+// HMAC-SHA-1 vectors of RFC 2202 (including keys longer than a block).
+import "core/sha1.bastio";
+import "core/num.bastio";
+
+/// The lower-case hex text of `d`.
+fn hex(d: &Bytes) -> Bytes {
+  let mut t = text_new();
+  let mut i = 0;
+  while i < blen(d)
+    invariant i <= blen(d)
+  {
+    text_push(&mut t, hex_char(cast[u64](bget(d, i)) / 16));
+    text_push(&mut t, hex_char(cast[u64](bget(d, i)) % 16));
+    i = i + 1;
+  }
+  return text_finish(t);
+}
+
+/// 1 unless the SHA-1 of the `n` bytes `c` is `want`.
+fn same(n: u64, c: u8, want: Str) -> u64
+  requires n < 1000000000
+  ensures result <= 1
+{
+  let mut m = balloc(n);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && blen(m) == n
+  {
+    bset(&mut m, i, c);
+    i = i + 1;
+  }
+  let d = sha1(m);
+  let h = hex(d);
+  let ok = bytes_eq_str(h, want);
+  bfree(h);
+  bfree(d);
+  bfree(m);
+  if ok { return 0; }
+  return 1;
+}
+
+/// 1 unless the SHA-1 of the text `s` is `want`.
+fn text_same(s: Str, want: Str) -> u64
+  ensures result <= 1
+{
+  let m = bfrom(s);
+  let d = sha1(m);
+  let h = hex(d);
+  let ok = bytes_eq_str(h, want);
+  bfree(h);
+  bfree(d);
+  bfree(m);
+  if ok { return 0; }
+  return 1;
+}
+
+/// 1 unless HMAC-SHA-1 of `msg` under the key of `kn` bytes `kc` (or the text `ks` if `kn` is 0) is `want`.
+fn mac_same(kn: u64, kc: u8, ks: Str, msg: Str, want: Str) -> u64
+  requires kn < 1000
+  ensures result <= 1
+{
+  let mut key = balloc(kn);
+  let mut i = 0;
+  while i < kn
+    invariant i <= kn && blen(key) == kn
+  {
+    bset(&mut key, i, kc);
+    i = i + 1;
+  }
+  if kn == 0 {
+    bfree(key);
+    key = bfrom(ks);
+  }
+  let m = bfrom(msg);
+  let d = hmac_sha1(key, m);
+  let h = hex(d);
+  let ok = bytes_eq_str(h, want);
+  bfree(h);
+  bfree(d);
+  bfree(m);
+  bfree(key);
+  if ok { return 0; }
+  return 1;
+}
+
+/// The number of checks of this group that fail.
+fn group1() -> u64
+  ensures result <= 5
+{
+  return text_same("", "da39a3ee5e6b4b0d3255bfef95601890afd80709") +
+    text_same("abc", "a9993e364706816aba3e25717850c26c9cd0d89d") +
+    text_same("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", "84983e441c3bd26ebaae4aa1f95129e5e54670f1") +
+    text_same("The quick brown fox jumps over the lazy dog", "2fd4e1c67a2d28fced849ee1bb76e7391b93eb12") +
+    same(1, 97, "86f7e437faa5a7fce15d1ddcb9eaeaea377667b8");
+}
+
+/// The number of checks of this group that fail.
+fn group2() -> u64
+  ensures result <= 5
+{
+  return same(55, 97, "c1c8bbdc22796e28c0e15163d20899b65621d65a") +
+    same(56, 97, "c2db330f6083854c99d4b5bfb6e8f29f201be699") +
+    same(57, 97, "f08f24908d682555111be7ff6f004e78283d989a") +
+    same(63, 97, "03f09f5b158a7a8cdad920bddc29b81c18a551f5") +
+    same(64, 97, "0098ba824b5c16427bd7a1122a5a442a25ec644d");
+}
+
+/// The number of checks of this group that fail.
+fn group3() -> u64
+  ensures result <= 5
+{
+  return same(65, 97, "11655326c708d70319be2610e8a57d9a5b959d3b") +
+    same(119, 97, "ee971065aaa017e0632a8ca6c77bb3bf8b1dfc56") +
+    same(120, 97, "f34c1488385346a55709ba056ddd08280dd4c6d6") +
+    same(127, 97, "89d95fa32ed44a7c610b7ee38517ddf57e0bb975") +
+    same(128, 97, "ad5b3fdbcb526778c2839d2f151ea753995e26a0");
+}
+
+/// The number of checks of this group that fail.
+fn group4() -> u64
+  ensures result <= 5
+{
+  return same(129, 97, "d96debf1bdcbc896e6c134ea76e8141f40d78536") +
+    same(1000, 97, "291e9a6c66994949b57ba5e650361e98fc36b1ba") +
+    same(1000000, 97, "34aa973cd4c4daa4f61eeb2bdbad27316534016f") +
+    mac_same(20, 11, "", "Hi There", "b617318655057264e28bc0b6fb378c8ef146be00") +
+    mac_same(0, 0, "Jefe", "what do ya want for nothing?", "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79");
+}
+
+/// The number of checks of this group that fail.
+fn group5() -> u64
+  ensures result <= 4
+{
+  return mac_same(131, 170, "", "Test Using Larger Than Block-Size Key - Hash Key First", "90d0dace1c1bdc957339307803160335bde6df2b") +
+    mac_same(131, 170, "", "This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.", "217e44bb08b6e06a2d6c30f3cb9f537f97c63356") +
+    mac_same(64, 7, "", "x", "94a1963f43833b3a6e66803ea11349ea9a63756e") +
+    mac_same(65, 7, "", "x", "59caad42ca1d705e6414d443e91489a636eaf155");
+}
+
+fn main() -> u64 {
+  let bad = group1() + group2() + group3() + group4() + group5();
+  if bad > 0 { return 1; }
+  return 0;
+}
