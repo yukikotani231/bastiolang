@@ -1,4 +1,4 @@
-// core/aesmodes.bastio: AES in counter, CBC and ECB mode (NIST SP 800-38A),
+// core/aesmodes.bastio: AES in counter, CBC, ECB and XTS mode (NIST SP 800-38A),
 // on the block cipher of core/aes.bastio.
 //
 // What is proved: every access is in bounds, nothing leaks, and the result is
@@ -252,4 +252,126 @@ fn aes_ecb_decrypt(a: &Aes, data: &Bytes) -> Bytes
   }
   bfree(inv);
   return out;
+}
+
+/// Internal: `t` times x in GF(2^128) with the XTS polynomial, the tweak of
+/// the next block (IEEE 1619): a left shift of the little-endian number,
+/// with 0x87 folded into the low byte when a bit falls off the top.
+fn aes_xts_double(t: &mut Bytes)
+  requires blen(t) == 16
+  ensures blen(t) == 16
+{
+  let mut carry = 0;
+  let mut j = 0;
+  while j < 16
+    invariant j <= 16 && blen(t) == 16 && carry <= 1
+  {
+    let b = cast[u64](bget(t, j));
+    bset(&mut t, j, cast[u8]((b * 2) % 256 + carry));
+    carry = b / 128;
+    j = j + 1;
+  }
+  if carry == 1 {
+    let m: u8 = 135;
+    bset(&mut t, 0, bget(t, 0) ^ m);
+  }
+}
+
+/// Internal: the XTS loop, encrypting or decrypting (`enc`) block by block.
+fn aes_xts_run(k1: &Aes, k2: &Aes, tweak: &Bytes, data: &Bytes, enc: bool) -> Bytes
+  requires aes_ok(k1) && aes_ok(k2) && blen(tweak) == 16 && blen(data) % 16 == 0 && blen(data) < 274877906944
+  ensures blen(result) == blen(data)
+{
+  let n = blen(data);
+  let inv = aes_inv_sbox(k1);
+  let mut t = aes_encrypt(k2, tweak);
+  let mut out = balloc(n);
+  let mut at = 0;
+  while at < n
+    invariant at <= n && n == blen(data) && n % 16 == 0 && at % 16 == 0 && blen(out) == n && blen(inv) == 256 && blen(t) == 16 && aes_ok(k1)
+  {
+    let x = aes_xor16(t, data, at);
+    let y = aes_xts_core(k1, inv, x, enc);
+    bfree(x);
+    let z = aes_xor16(t, y, 0);
+    bfree(y);
+    bytes_copy_span(&mut out, at, z, 0, 16);
+    bfree(z);
+    aes_xts_double(&mut t);
+    at = at + 16;
+  }
+  bfree(t);
+  bfree(inv);
+  return out;
+}
+
+/// Internal: one block through the first key, either way.
+fn aes_xts_core(k1: &Aes, inv: &Bytes, x: &Bytes, enc: bool) -> Bytes
+  requires aes_ok(k1) && blen(inv) == 256 && blen(x) == 16
+  ensures blen(result) == 16
+{
+  if enc {
+    return aes_encrypt(k1, x);
+  }
+  return aes_decrypt_with(k1, inv, x);
+}
+
+/// XTS encryption (IEEE 1619, the disk mode of Linux's `xts(aes)`) of `data`,
+/// a whole number of 16-byte blocks, under the data key `k1`, the tweak key
+/// `k2` and the 16-byte `tweak` (the sector number, little endian). Ciphertext
+/// stealing for a last partial block is not done. Like ECB it does not
+/// authenticate.
+/// ```
+/// let mut key = balloc(16);
+/// let mut key2 = balloc(16);
+/// let tweak = balloc(16);
+/// let data = balloc(32);
+/// let a = aes128_new(key);
+/// let b = aes128_new(key2);
+/// let sealed = aes_xts_encrypt(a, b, tweak, data);
+/// let back = aes_xts_decrypt(a, b, tweak, sealed);
+/// let ok = bytes_eq(back, data) && blen(sealed) == 32;
+/// bfree(back);
+/// bfree(sealed);
+/// aes_free(b);
+/// aes_free(a);
+/// bfree(data);
+/// bfree(tweak);
+/// bfree(key2);
+/// bfree(key);
+/// if !ok { return 1; }
+/// ```
+fn aes_xts_encrypt(k1: &Aes, k2: &Aes, tweak: &Bytes, data: &Bytes) -> Bytes
+  requires aes_ok(k1) && aes_ok(k2) && blen(tweak) == 16 && blen(data) % 16 == 0 && blen(data) < 274877906944
+  ensures blen(result) == blen(data)
+{
+  return aes_xts_run(k1, k2, tweak, data, true);
+}
+
+/// XTS decryption of `data`; the arguments are those of `aes_xts_encrypt`.
+/// ```
+/// let mut key = balloc(16);
+/// let mut key2 = balloc(16);
+/// let tweak = balloc(16);
+/// let data = balloc(16);
+/// let a = aes128_new(key);
+/// let b = aes128_new(key2);
+/// let sealed = aes_xts_encrypt(a, b, tweak, data);
+/// let back = aes_xts_decrypt(a, b, tweak, sealed);
+/// let ok = bytes_eq(back, data);
+/// bfree(back);
+/// bfree(sealed);
+/// aes_free(b);
+/// aes_free(a);
+/// bfree(data);
+/// bfree(tweak);
+/// bfree(key2);
+/// bfree(key);
+/// if !ok { return 1; }
+/// ```
+fn aes_xts_decrypt(k1: &Aes, k2: &Aes, tweak: &Bytes, data: &Bytes) -> Bytes
+  requires aes_ok(k1) && aes_ok(k2) && blen(tweak) == 16 && blen(data) % 16 == 0 && blen(data) < 274877906944
+  ensures blen(result) == blen(data)
+{
+  return aes_xts_run(k1, k2, tweak, data, false);
 }

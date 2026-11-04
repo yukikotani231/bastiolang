@@ -230,8 +230,52 @@ fn ecb_check() -> u64
   return bad1 + bad2 + bad3;
 }
 
+/// XTS (IEEE 1619 vectors 1 and 2): two keys, a tweak, two blocks; and the
+/// way back.
+fn xts_check() -> u64
+  ensures result <= 4
+{
+  let z1 = unhex("00000000000000000000000000000000");
+  let z2 = unhex("00000000000000000000000000000000");
+  let z3 = unhex("00000000000000000000000000000000");
+  let zp = unhex("0000000000000000000000000000000000000000000000000000000000000000");
+  let a = aes128_new(z1);
+  let b = aes128_new(z2);
+  let c = aes_xts_encrypt(a, b, z3, zp);
+  let c2 = bytes_slice(c, 0, 32);
+  let bad1 = is_bytes(c, "917cf69ebd68b2ec9b9fe9a3eadda692cd43d2f59598ed858c02c2652fbf922e");
+  let back = aes_xts_decrypt(a, b, z3, c2);
+  let bad2 = is_bytes(back, "0000000000000000000000000000000000000000000000000000000000000000");
+  aes_free(b);
+  aes_free(a);
+  bfree(c2);
+  bfree(zp);
+  bfree(z3);
+  bfree(z2);
+  bfree(z1);
+  let k1 = unhex("11111111111111111111111111111111");
+  let k2 = unhex("22222222222222222222222222222222");
+  let tw = unhex("33333333330000000000000000000000");
+  let pt = unhex("4444444444444444444444444444444444444444444444444444444444444444");
+  let a2 = aes128_new(k1);
+  let b2 = aes128_new(k2);
+  let c3 = aes_xts_encrypt(a2, b2, tw, pt);
+  let c4 = bytes_slice(c3, 0, 32);
+  let bad3 = is_bytes(c3, "c454185e6a16936e39334038acef838bfb186fff7480adc4289382ecd6d394f0");
+  let back2 = aes_xts_decrypt(a2, b2, tw, c4);
+  let bad4 = is_bytes(back2, "4444444444444444444444444444444444444444444444444444444444444444");
+  aes_free(b2);
+  aes_free(a2);
+  bfree(c4);
+  bfree(pt);
+  bfree(tw);
+  bfree(k2);
+  bfree(k1);
+  return bad1 + bad2 + bad3 + bad4;
+}
+
 fn main() -> u64 {
-  let t = fips_check() + cbc_check() + ctr_check() + trip_check() + aes192_check() + ecb_check();
+  let t = fips_check() + cbc_check() + ctr_check() + trip_check() + aes192_check() + ecb_check() + xts_check();
   if t > 0 { return 1; }
   return 0;
 }
