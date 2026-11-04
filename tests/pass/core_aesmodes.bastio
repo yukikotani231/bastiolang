@@ -171,8 +171,40 @@ fn trip_check() -> u64
   return bad;
 }
 
+/// AES-192 (SP 800-38A F.2.3 and F.5.3, first block): CBC and CTR, and the
+/// inverse cipher back to the plaintext.
+fn aes192_check() -> u64
+  ensures result <= 4
+{
+  let key = unhex("8e73b0f7da0e6452c810f32b809079e562f8ead2522c6b7b");
+  let pt = unhex("6bc1bee22e409f96e93d7e117393172a");
+  let iv = unhex("000102030405060708090a0b0c0d0e0f");
+  let ctr = unhex("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff");
+  let a = aes192_new(key);
+  let cbc = aes_cbc_encrypt(a, iv, pt);
+  let cbc2 = bytes_slice(cbc, 0, 16);
+  let cbc3 = bytes_slice(cbc, 0, 16);
+  let bad1 = is_bytes(cbc, "4f021db243bc633d7178183a9fa071e8");
+  let back = aes_cbc_decrypt(a, iv, cbc2);
+  let bad2 = is_bytes(back, "6bc1bee22e409f96e93d7e117393172a");
+  let ctrct = aes_ctr(a, ctr, pt);
+  let bad3 = is_bytes(ctrct, "1abc932417521ca24f2b0459fe7e6e0b");
+  let dec = aes_decrypt(a, cbc3);
+  let one = aes_encrypt(a, dec);
+  let bad4 = is_bytes(one, "4f021db243bc633d7178183a9fa071e8");
+  aes_free(a);
+  bfree(dec);
+  bfree(cbc3);
+  bfree(cbc2);
+  bfree(ctr);
+  bfree(iv);
+  bfree(pt);
+  bfree(key);
+  return bad1 + bad2 + bad3 + bad4;
+}
+
 fn main() -> u64 {
-  let t = fips_check() + cbc_check() + ctr_check() + trip_check();
+  let t = fips_check() + cbc_check() + ctr_check() + trip_check() + aes192_check();
   if t > 0 { return 1; }
   return 0;
 }
