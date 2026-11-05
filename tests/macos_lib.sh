@@ -5,7 +5,9 @@
 # `--arch aarch64`, Intel `--backend native-ir`.
 #
 # usage: tests/macos_lib.sh [--gnu-link]
-#   --gnu-link: Apple's as writes the object instead of bastioc1 itself
+#   --gnu-link: Apple's as writes the object instead of bastioc1 itself. Without
+#   it, each object is also compared with the one Apple's as writes
+#   (tests/machoobj.py).
 set -u
 cd "$(dirname "$0")/.."
 BASTIOC=${BASTIOC:-$(tests/bastioc1.sh)} || exit 1
@@ -16,6 +18,15 @@ case "$(uname -m)" in
 esac
 n=0
 bad=0
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+if [ -z "$link" ]; then
+  for f in $(grep -l '^export fn' examples/*/*.bastio); do
+    "$BASTIOC" $flags -o "$tmp/own.o" "$f" >/dev/null 2>&1 || { echo "FAIL $f: no object"; bad=1; continue; }
+    "$BASTIOC" $flags --gnu-link -o "$tmp/gnu.o" "$f" >/dev/null 2>&1 || { echo "FAIL $f: no object from Apple's as"; bad=1; continue; }
+    tests/machoobj.py "$tmp/own.o" "$tmp/gnu.o" >/dev/null || { echo "FAIL $f: the object differs from Apple's"; tests/machoobj.py "$tmp/own.o" "$tmp/gnu.o" 2>&1 | tail -3; bad=1; }
+  done
+fi
 for r in examples/*/run.sh; do
   [ -e "$r" ] || continue
   d=$(dirname "$r")

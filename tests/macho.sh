@@ -26,8 +26,10 @@ echo "macho.sh: SHA-256 equals sha256sum"
 # every C name (the C harness calls `_utf8_validate`).
 for a in "--backend native-ir" "--arch aarch64 --backend native"; do
   "$BASTIOC" $a --os macos --emit-asm -o "$work/lib.s" examples/utf8/utf8.bastio >/dev/null 2>&1
+  "$BASTIOC" $a --os macos --self-link -o "$work/lib.o" examples/utf8/utf8.bastio >/dev/null 2>&1
+  tests/machoobj.py "$work/lib.o" >/dev/null || { echo "macho.sh: the library object is not well formed ($a)" >&2; exit 1; }
   for f in utf8_validate utf8_decode_into; do
     grep -qx "	.globl _$f" "$work/lib.s" && grep -qx "_$f:" "$work/lib.s" || { echo "macho.sh: $f is not exported as _$f ($a)" >&2; exit 1; }
   done
 done
-echo "macho.sh: library exports are spelled _name"
+echo "macho.sh: library objects are well formed and their exports are spelled _name"
