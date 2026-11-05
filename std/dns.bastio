@@ -147,8 +147,54 @@ fn dns_lookup_at(h: &Host, resolver: u64, port: u64, name: &Bytes) -> Option[u64
   }
 }
 
+/// The IPv4 nameservers that PowerShell reports for the machine, as
+/// `nameserver` lines in the text of a resolv.conf; `exe` names PowerShell
+/// (a program that cannot be started, as on other systems, gives no text).
+/// At most 16 lines are read.
+/// ```
+/// let t = dns_powershell_text(host, "no-such-program-bastio");
+/// let mut bad = 0;
+/// if blen(t) != 0 { bad = 1; }
+/// bfree(t);
+/// if bad != 0 { return 1; }
+/// ```
+fn dns_powershell_text(h: &Host, exe: Str) -> Bytes {
+  let mut argv = vec_new[Bytes]();
+  vec_push(&mut argv, bfrom(exe));
+  vec_push(&mut argv, bfrom("-NoProfile"));
+  vec_push(&mut argv, bfrom("-NonInteractive"));
+  vec_push(&mut argv, bfrom("-Command"));
+  vec_push(&mut argv, bfrom("Get-DnsClientServerAddress -AddressFamily IPv4 | ForEach-Object { $_.ServerAddresses } | ForEach-Object { 'nameserver ' + $_ }"));
+  let mut child = host_spawn(h, argv);
+  let mut text = balloc(0);
+  let nl = bfrom("\n");
+  let mut line = balloc(0);
+  let mut n = 0;
+  while n < 16 && child_read_line(&mut child, &mut line)
+    invariant n <= 16 && blen(text) <= 1000 * n && blen(nl) == 1
+  {
+    // A line longer than any address line is not one: skipped.
+    if blen(line) <= 999 {
+      let with_line = bytes_concat(text, line);
+      bfree(text);
+      text = bytes_concat(with_line, nl);
+      bfree(with_line);
+    }
+    n = n + 1;
+  }
+  let status = child_wait(child);
+  bfree(line);
+  bfree(nl);
+  while vec_len(argv) > 0 {
+    bfree(vec_pop(&mut argv));
+  }
+  vec_free(argv);
+  return text;
+}
+
 /// The first IPv4 nameserver of /etc/resolv.conf, if the file is there and
-/// has one.
+/// has one. Where the file is missing (Windows) the resolver is the first
+/// IPv4 DNS server that PowerShell's `Get-DnsClientServerAddress` lists.
 /// ```
 /// // Either a nameserver is listed or the file has none; both are fine.
 /// match dns_system_resolver(host) {
@@ -158,7 +204,16 @@ fn dns_lookup_at(h: &Host, resolver: u64, port: u64, name: &Bytes) -> Option[u64
 /// ```
 fn dns_system_resolver(h: &Host) -> Option[u64] {
   match read_file_str(h, "/etc/resolv.conf") {
-    Option::None => { return Option[u64]::None; },
+    Option::None => {
+      let mut t = dns_powershell_text(h, "powershell");
+      if blen(t) == 0 {
+        bfree(t);
+        t = dns_powershell_text(h, "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe");
+      }
+      let r = dns_resolv_conf(t);
+      bfree(t);
+      return r;
+    },
     Option::Some(t) => {
       let r = dns_resolv_conf(t);
       bfree(t);
