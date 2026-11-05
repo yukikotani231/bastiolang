@@ -28,6 +28,6 @@ A bastioc1 built with the native backend is a normal compiler: it starts `z3` (a
 
 - Child processes start through `CreateProcess` (C backend) or `_spawnvp` (native backend).
 - Programs built by the C backend print in text mode, so lines end in CR LF; the native backend writes the bytes it is given.
-- `host_net` sockets use Winsock. The connect time limit (`net_connect_timeout`) is ignored, and there is no `/etc/resolv.conf`, so `dns_system_resolver` finds no resolver and the lookups that use it (`https_get_by_name`, `https_fetch`) fail; `dns_lookup_via` with a resolver address the caller supplies works.
+- `host_net` sockets use Winsock. The connect time limit (`net_connect_timeout`) is ignored. There is no `/etc/resolv.conf`, so `dns_system_resolver` asks PowerShell (`Get-DnsClientServerAddress`) for the machine's first IPv4 DNS server; if PowerShell cannot be started, the lookups that use it (`https_get_by_name`, `https_fetch`) fail, and `dns_lookup_via` with a resolver address the caller supplies still works.
 - The sanitizer cross-check of `tests/run.sh` is skipped (MinGW-w64's `gcc` has none), and so is the `--lib` search test.
 - `difftest.sh`, `tests/aarch64.sh` and the kernel and user targets are Linux-only.

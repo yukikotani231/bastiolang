@@ -19,6 +19,7 @@ each read are limited to 5 seconds (not on Windows yet, see
 | --- | --- |
 | [`dns_lookup_via`](#dns_lookup_via) | The IPv4 address (as `net_ip4` makes it) of the host `name`, asked of the resolver at `resolver` (port 53, over TCP). |
 | [`dns_lookup_at`](#dns_lookup_at) | `dns_lookup_via` for a resolver that listens on `port`. |
+| [`dns_powershell_text`](#dns_powershell_text) | The IPv4 nameservers that PowerShell reports for the machine, as `nameserver` lines in the text of a resolv.conf; `exe` names PowerShell (a program that cannot be started, as on other systems, gives no text). |
 | [`dns_system_resolver`](#dns_system_resolver) | The first IPv4 nameserver of /etc/resolv.conf, if the file is there and has one. |
 | [`dns_lookup`](#dns_lookup) | The IPv4 address of the host `name`. |
 | [`dns_lookup6_at`](#dns_lookup6_at) | The IPv6 address (16 bytes, network order) of the host `name`, asked of the resolver at `resolver`, port `port`, over TCP, in an AAAA record. |
@@ -74,6 +75,27 @@ bfree(name);
 if bad != 0 { return 1; }
 ```
 
+### `dns_powershell_text`
+
+```bastio
+fn dns_powershell_text(h: &Host, exe: Str) -> Bytes
+```
+
+The IPv4 nameservers that PowerShell reports for the machine, as
+`nameserver` lines in the text of a resolv.conf; `exe` names PowerShell
+(a program that cannot be started, as on other systems, gives no text).
+At most 16 lines are read.
+
+Example:
+
+```bastio
+let t = dns_powershell_text(host, "no-such-program-bastio");
+let mut bad = 0;
+if blen(t) != 0 { bad = 1; }
+bfree(t);
+if bad != 0 { return 1; }
+```
+
 ### `dns_system_resolver`
 
 ```bastio
@@ -81,7 +103,8 @@ fn dns_system_resolver(h: &Host) -> Option[u64]
 ```
 
 The first IPv4 nameserver of /etc/resolv.conf, if the file is there and
-has one.
+has one. Where the file is missing (Windows) the resolver is the first
+IPv4 DNS server that PowerShell's `Get-DnsClientServerAddress` lists.
 
 Example:
 
