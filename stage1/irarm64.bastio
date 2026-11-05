@@ -642,7 +642,27 @@ fn a64_magic_ok(al: &IrAlloc, r: u64) -> bool {
 /// word of the slot this instruction opens, if it is an `IR_SLOT`.
 fn a64_ins(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, fr: A64F, g: &mut X86, m: &Mono, p: &Parser, q: IrIns, slotw: u64) {
   let op = q.op;
-  if op == IR_ADD || op == IR_SUB || op == IR_MUL || op == IR_AND || op == IR_OR || op == IR_XOR {
+  if op == IR_MUL && (a64_pow2(al, fr, q.a) != 0 || a64_pow2(al, fr, q.b) != 0) {
+    // A product with a power of two is a shift: no constant to place in a register.
+    let mut x = q.a;
+    let mut k = a64_pow2(al, fr, q.b);
+    if k == 0 {
+      x = q.b;
+      k = a64_pow2(al, fr, q.a);
+    }
+    let mut sh = 0;
+    while k > 1 && sh < 64 {
+      k = k / 2;
+      sh = sh + 1;
+    }
+    let t = a64_dest(al, fr, q.d);
+    let ra = a64_use(&mut out, al, fr, x, 9);
+    a64_ins3i(&mut out, "lsl", t, ra, sh);
+    if q.c == 1 && a64_wraps(m, q.ty) {
+      a64_norm(&mut out, m, q.ty, t);
+    }
+    a64_finish(&mut out, al, fr, q.d, t);
+  } else if op == IR_ADD || op == IR_SUB || op == IR_MUL || op == IR_AND || op == IR_OR || op == IR_XOR {
     let mut name = "add";
     let mut imm_ok = true;
     if op == IR_SUB {
@@ -1229,6 +1249,23 @@ fn a64_body(out: &mut Vec[u64], f: &IrFn, al: &IrAlloc, fr: A64F, g: &mut X86, m
       }
       a64_ldr_w(&mut out, 16, fr.nsave);
       let mut j = 0;
+      if q.a != IR_NONE && q.c >= 8 {
+        // A long result is copied by a loop of pairs (x10 reads, x16
+        // writes, x11 counts), not by one load and store a word: the
+        // largest results are the whole kernel state.
+        if rb != 10 {
+          w_s(&mut out, "\tmov x10, ");
+          a64_x(&mut out, rb);
+          w_s(&mut out, "\n");
+        }
+        w_s(&mut out, "\tmov x11, #");
+        w_num(&mut out, q.c / 2);
+        w_s(&mut out, "\n1:\tldp x9, x17, [x10], #16\n\tstp x9, x17, [x16], #16\n\tsubs x11, x11, #1\n\tb.ne 1b\n");
+        if q.c % 2 == 1 {
+          w_s(&mut out, "\tldr x17, [x10]\n\tstr x17, [x16]\n");
+        }
+        j = q.c;
+      }
       while j < q.c && j < 4095 {
         if q.a == IR_NONE {
           a64_mov(&mut out, a64_loc(al, fr, u_at(f.args, wrap_add(q.b, j))), a64_rl(17));
