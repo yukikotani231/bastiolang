@@ -67,7 +67,7 @@ Requirements:
 | C compiler | GCC 13, Apple clang 15 | Called as `cc`; the generated C is C11 |
 | Python 3 | 3.12, 3.13 | Only for `stage1/difftest.sh` |
 
-The hosted compiler is tested on x86-64 Linux (Ubuntu 24.04) and on macOS (Apple Silicon and Intel, with `brew install z3`); CI builds it and runs `tests/run.sh` on all three. The kernel and user targets, the native backend and the other test scripts are Linux-only so far. On Ubuntu: `sudo apt-get install z3 build-essential python3`, plus [rustup](https://rustup.rs).
+The hosted compiler is tested on x86-64 Linux (Ubuntu 24.04), on macOS (Apple Silicon and Intel, with `brew install z3`) and on Windows (x86-64, under MSYS2 / MinGW-w64; see [Bastio on Windows](docs/windows.md)); CI builds it and runs `tests/run.sh` on all four. The kernel and user targets and some of the other test scripts are Linux-only so far. On Ubuntu: `sudo apt-get install z3 build-essential python3`, plus [rustup](https://rustup.rs).
 
 ```sh
 git clone https://github.com/yukikotani231/bastiolang && cd bastiolang

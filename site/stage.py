@@ -23,6 +23,7 @@ PAGES = {
     "docs/tutorial-capabilities.md": "tutorial-capabilities.md",
     "docs/tutorial-shared.md": "tutorial-shared.md",
     "docs/tutorial-web.md": "tutorial-web.md",
+    "docs/windows.md": "windows.md",
     "docs/toolchain.md": "toolchain.md",
     "docs/trusted-base.md": "trusted-base.md",
     "docs/ir.md": "ir.md",

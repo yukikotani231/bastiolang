@@ -10,6 +10,7 @@
   - [Sharing state](tutorial-shared.md)
   - [A web service](tutorial-web.md)
 - [The toolchain](toolchain.md)
+- [Bastio on Windows](windows.md)
 - [Common proof failures](proof-failures.md)
 - [Calling Bastio from C](c-libraries.md)
   - [base64](examples-base64.md)
