@@ -22,3 +22,12 @@ for f in "$work"/accrec.arm stage1/elf.bastio /dev/null; do
   [ "$("$work/as86" --sha "$f")" = "$(sha256sum "$f" | cut -d' ' -f1)" ] || { echo "macho.sh: SHA-256 differs from sha256sum on $f" >&2; exit 1; }
 done
 echo "macho.sh: SHA-256 equals sha256sum"
+# A library's exported functions carry the underscore macOS puts in front of
+# every C name (the C harness calls `_utf8_validate`).
+for a in "--backend native-ir" "--arch aarch64 --backend native"; do
+  "$BASTIOC" $a --os macos --emit-asm -o "$work/lib.s" examples/utf8/utf8.bastio >/dev/null 2>&1
+  for f in utf8_validate utf8_decode_into; do
+    grep -qx "	.globl _$f" "$work/lib.s" && grep -qx "_$f:" "$work/lib.s" || { echo "macho.sh: $f is not exported as _$f ($a)" >&2; exit 1; }
+  done
+done
+echo "macho.sh: library exports are spelled _name"
