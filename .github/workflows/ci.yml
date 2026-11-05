@@ -166,15 +166,26 @@ jobs:
         run: cd stage0 && cargo build --release --locked
       - name: Build bastioc1 with stage0
         run: tests/bastioc1.sh
+      - name: System DNS resolver (PowerShell stands in for /etc/resolv.conf)
+        run: |
+          export TMPDIR=$(cygpath -m /tmp)
+          timeout 120 powershell -NoProfile -NonInteractive -Command "Get-DnsClientServerAddress -AddressFamily IPv4 | ForEach-Object { \$_.ServerAddresses }" < /dev/null || echo "powershell by name: exit $?"
+          for be in c native-ir; do
+            args=""; [ $be = native-ir ] && args="--backend native-ir --os windows"
+            stage0/target/release/bastioc1 $args -o "$TMPDIR/lookup-$be.exe" examples/lookup.bastio
+            r=$(timeout 120 "$TMPDIR/lookup-$be.exe" -r | tr -d '\r')
+            echo "$be: resolver $r"
+            echo "$r" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+          done
       - name: Tests
         run: |
           # Native programs (bastioc1, the solver) must be given paths they
           # open too: C:/-style, not MSYS2's /tmp.
           export TMPDIR=$(cygpath -m /tmp)
           rc=0
-          tests/run.sh > run.log 2>&1 || rc=$?
+          timeout 1500 tests/run.sh > run.log 2>&1 || rc=$?
           grep -A8 '^FAIL' run.log | head -150 || true
-          tail -1 run.log
+          tail -5 run.log
           exit $rc
       - name: Packages (the project tool, --pkg, bastio.lock)
         run: |
@@ -182,16 +193,6 @@ jobs:
           tests/package.sh > package.log 2>&1 || rc=$?
           tail -20 package.log
           exit ${rc:-0}
-      - name: System DNS resolver (PowerShell stands in for /etc/resolv.conf)
-        run: |
-          export TMPDIR=$(cygpath -m /tmp)
-          for be in c native-ir; do
-            args=""; [ $be = native-ir ] && args="--backend native-ir --os windows"
-            stage0/target/release/bastioc1 $args -o "$TMPDIR/lookup-$be.exe" examples/lookup.bastio
-            r=$("$TMPDIR/lookup-$be.exe" -r | tr -d '\r')
-            echo "$be: resolver $r"
-            echo "$r" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
-          done
       - name: Native backend (PE/COFF, linked by bastioc1's own PE linker)
         run: |
           export TMPDIR=$(cygpath -m /tmp)
