@@ -493,3 +493,466 @@ fn ml_build(host: &Host, outp: &Bytes, data: &Bytes, arm: bool) -> u64 {
   }
   return pe_write(host, outp, image);
 }
+
+/// One section header of an object file: like `ml_sect`, with the place of
+/// its relocations.
+fn mo_sect(out: &mut Vec[u64], name: Str, seg: Str, addr: u64, size: u64, off: u64, reloff: u64, nreloc: u64, flags: u64) {
+  ml_name(&mut out, name);
+  ml_name(&mut out, seg);
+  as_le(&mut out, addr, 8);
+  as_le(&mut out, size, 8);
+  as_le(&mut out, off, 4);
+  as_le(&mut out, 4, 4);
+  as_le(&mut out, reloff, 4);
+  as_le(&mut out, nreloc, 4);
+  as_le(&mut out, flags, 4);
+  as_le(&mut out, 0, 4);
+  as_le(&mut out, 0, 4);
+  as_le(&mut out, 0, 4);
+}
+
+/// One `relocation_info`: the field at `at` refers to symbol `sym` (always
+/// by its symbol table index: `r_extern` is 1).
+fn mo_reloc(v: &mut Vec[u64], at: u64, sym: u64, pcrel: u64, kind: u64) {
+  as_le(&mut v, at, 4);
+  as_le(&mut v, (sym & 16777215) | ((pcrel & 1) << 24) | (2 << 25) | (1 << 27) | ((kind & 15) << 28), 4);
+}
+
+/// `ARM64_RELOC_ADDEND`: the constant `addend` for the relocation after it.
+fn mo_addend(v: &mut Vec[u64], at: u64, addend: u64) {
+  as_le(&mut v, at, 4);
+  as_le(&mut v, (addend & 16777215) | (2 << 25) | (10 << 28), 4);
+}
+
+/// The index of `id` in the symbols written: the local ones, then the
+/// defined global ones, then the undefined ones. AS_NONE when it is in none.
+fn mo_symidx(gl: &Vec[u64], ge: &Vec[u64], gu: &Vec[u64], id: u64) -> u64 {
+  let mut k = 0;
+  while k < vec_len(gl) {
+    if u_at(gl, k) == id {
+      return k;
+    }
+    k = wrap_add(k, 1);
+  }
+  k = 0;
+  while k < vec_len(ge) {
+    if u_at(ge, k) == id {
+      return wrap_add(vec_len(gl), k);
+    }
+    k = wrap_add(k, 1);
+  }
+  k = 0;
+  while k < vec_len(gu) {
+    if u_at(gu, k) == id {
+      return wrap_add(wrap_add(vec_len(gl), vec_len(ge)), k);
+    }
+    k = wrap_add(k, 1);
+  }
+  return AS_NONE;
+}
+
+/// The relocations `v` (8 bytes each; an `ARM64_RELOC_ADDEND` comes before the
+/// relocation it belongs to) in the order Apple's tools write them: by
+/// descending address.
+fn mo_rev(v: Vec[u64]) -> Vec[u64] {
+  let mut out = vec_new[u64]();
+  let mut k = vec_len(v) / 8;
+  while k > 0 {
+    let mut take = 1;
+    if k >= 2 && (u_at(v, wrap_sub(wrap_mul(k, 8), 9)) >> 4) == 10 {
+      take = 2;
+    }
+    let first = wrap_sub(k, take);
+    let mut b = wrap_mul(first, 8);
+    while b < wrap_mul(k, 8) {
+      as_byte(&mut out, u_at(v, b));
+      b = wrap_add(b, 1);
+    }
+    k = first;
+  }
+  vec_free(v);
+  return out;
+}
+
+/// How many bytes follow the four-byte field at `at` of section `sec` in its
+/// instruction (an immediate after a `rip`-relative operand), from `tr`, the
+/// (section, field offset, bytes after) of every relocated instruction; `cur`
+/// is the position reached so far in each section (relocations come in the
+/// order of their instructions).
+fn mo_trail(tr: &Vec[u64], cur: &mut Vec[u64], sec: u64, at: u64) -> u64 {
+  let mut c = u_at(cur, sec);
+  while wrap_add(c, 3) <= vec_len(tr) && (u_at(tr, c) != sec || u_at(tr, wrap_add(c, 1)) < at) {
+    c = wrap_add(c, 3);
+  }
+  ao_set(&mut cur, sec, c);
+  if wrap_add(c, 3) <= vec_len(tr) && u_at(tr, c) == sec && u_at(tr, wrap_add(c, 1)) == at {
+    return u_at(tr, wrap_add(c, 2));
+  }
+  return 0;
+}
+
+/// Adds symbol `s` to the list it belongs to, if it is in none.
+fn mo_addsym(g: &AsObj, gl: &mut Vec[u64], ge: &mut Vec[u64], gu: &mut Vec[u64], s: u64) {
+  if has_id(gl, s) || has_id(ge, s) || has_id(gu, s) {
+    return;
+  }
+  let ssec = ao_sym(g, s, 2);
+  if ssec == AS_NONE {
+    vec_push(&mut gu, s);
+  } else if (ao_sym(g, s, 4) & 1) != 0 {
+    vec_push(&mut ge, s);
+  } else {
+    vec_push(&mut gl, s);
+  }
+}
+
+/// Is the AArch64 relocation `kind` one that Mach-O has no type for (the
+/// 14-bit and 19-bit branches)?
+fn mo_inline(kind: u64) -> bool {
+  return kind == 279 || kind == 280;
+}
+
+/// The assembled program `g` (laid out by `ao_layout`) as a Mach-O object
+/// file, the file Apple's `as` would write: `__text`, `__const`, `__data`
+/// and `__bss` in one segment, the relocations a linker still has to apply
+/// (always against a symbol: the local ones are written too), and the
+/// symbols. Empty when a relocation cannot be written.
+fn mo_rel(g: &mut AsObj, arm: bool) -> Vec[u64] {
+  let mut rel = vec_new[u64]();
+  let mut text = ao_emit(g, AB_TEXT, &mut rel);
+  let mut ro = ao_emit(g, AB_RODATA, &mut rel);
+  let mut data = ao_emit(g, AB_DATA, &mut rel);
+  let bss = ao_sec_size(g, AB_BSS);
+  let nsym = ao_nsyms(g);
+  // the symbols: the ones a relocation uses, and the global ones
+  let mut gl = vec_new[u64]();
+  let mut ge = vec_new[u64]();
+  let mut gu = vec_new[u64]();
+  let mut r = 0;
+  while wrap_add(r, 5) <= vec_len(rel) {
+    let s = u_at(rel, wrap_add(r, 3));
+    if s < nsym && !(arm && mo_inline(u_at(rel, wrap_add(r, 2)))) {
+      mo_addsym(g, &mut gl, &mut ge, &mut gu, s);
+    }
+    r = wrap_add(r, 5);
+  }
+  let mut id = 0;
+  while id < nsym {
+    if (ao_sym(g, id, 4) & 3) != 0 && ao_sym(g, id, 1) > 0 {
+      mo_addsym(g, &mut gl, &mut ge, &mut gu, id);
+    }
+    id = wrap_add(id, 1);
+  }
+  // where the instructions with a relocation end
+  let mut tr = vec_new[u64]();
+  let nitems = ao_nitems(g);
+  let mut i = 0;
+  while i < nitems {
+    if ao_item(g, i, 0) == AB_RELOC {
+      let o = ao_item(g, i, 7);
+      let off = ao_item(g, i, 5) & 4294967295;
+      vec_push(&mut tr, ao_item(g, i, 1));
+      vec_push(&mut tr, wrap_add(o, off));
+      vec_push(&mut tr, wrap_sub(wrap_sub(ao_size(g, i, o), off), 4));
+    }
+    i = wrap_add(i, 1);
+  }
+  let mut cur = vec_new[u64]();
+  vec_push(&mut cur, 0);
+  vec_push(&mut cur, 0);
+  vec_push(&mut cur, 0);
+  vec_push(&mut cur, 0);
+  // the relocations by section, ascending; each entry is 8 bytes, or 16 with
+  // an addend in front
+  let mut rt = vec_new[u64]();
+  let mut rr = vec_new[u64]();
+  let mut rd = vec_new[u64]();
+  let mut bad = false;
+  r = 0;
+  while wrap_add(r, 5) <= vec_len(rel) {
+    let sec = u_at(rel, r);
+    let at = u_at(rel, wrap_add(r, 1));
+    let kind = u_at(rel, wrap_add(r, 2));
+    let s = u_at(rel, wrap_add(r, 3));
+    let addend = u_at(rel, wrap_add(r, 4));
+    let si = mo_symidx(gl, ge, gu, s);
+    let mut part = vec_new[u64]();
+    if arm && mo_inline(kind) {
+      // a conditional branch has no relocation in Mach-O: the target must be
+      // in the same section, and the distance is written here
+      if ao_sym(g, s, 2) != sec || sec != AB_TEXT || !elf_a64_apply(&mut text, at, kind, wrap_add(ao_sym_off(g, s), addend), at) {
+        bad = true;
+      }
+    } else if si == AS_NONE || sec > AB_DATA {
+      bad = true;
+    } else if arm {
+      let mut ty = 99;
+      let mut pcrel = 0;
+      if kind == 275 {
+        ty = 3;
+        pcrel = 1;
+      } else if kind == 277 || kind == 278 || kind == 284 || kind == 285 || kind == 286 {
+        ty = 4;
+      } else if kind == 282 || kind == 283 {
+        ty = 2;
+        pcrel = 1;
+      } else if kind == 311 {
+        ty = 5;
+        pcrel = 1;
+      } else if kind == 312 {
+        ty = 6;
+      } else {
+        bad = true;
+      }
+      if addend != 0 {
+        if ty == 5 || ty == 6 || !as_fits(addend, 24) {
+          bad = true;
+        }
+        mo_addend(&mut part, at, addend);
+      }
+      mo_reloc(&mut part, at, si, pcrel, ty);
+    } else {
+      // x86-64: the field holds the ELF addend plus the four bytes of the
+      // field (the linker measures from its end); an immediate after the
+      // field only changes the type, which tells the linker how far the
+      // instruction goes on
+      let n = mo_trail(tr, &mut cur, sec, at);
+      let k = wrap_add(addend, 4);
+      let mut ty = 1;
+      if kind == AR_PLT32 {
+        ty = 2;
+      } else if kind == AR_GOT32 {
+        ty = 3;
+      } else if kind != AR_PC32 {
+        bad = true;
+      } else if n == 1 {
+        ty = 6;
+      } else if n == 2 {
+        ty = 7;
+      } else if n == 4 {
+        ty = 8;
+      } else if n != 0 {
+        bad = true;
+      }
+      if (ty == 2 || ty == 3) && k != 0 {
+        bad = true;
+      }
+      if sec == AB_TEXT {
+        pe_patch(&mut text, at, k, 4);
+      } else if sec == AB_RODATA {
+        pe_patch(&mut ro, at, k, 4);
+      } else {
+        pe_patch(&mut data, at, k, 4);
+      }
+      mo_reloc(&mut part, at, si, 1, ty);
+    }
+    let plen = vec_len(part);
+    if sec == AB_TEXT {
+      pe_append(&mut rt, part, plen);
+    } else if sec == AB_RODATA {
+      pe_append(&mut rr, part, plen);
+    } else {
+      pe_append(&mut rd, part, plen);
+    }
+    r = wrap_add(r, 5);
+  }
+  vec_free(rel);
+  vec_free(tr);
+  vec_free(cur);
+  rt = mo_rev(rt);
+  rr = mo_rev(rr);
+  rd = mo_rev(rd);
+  // the symbol table and its names
+  let a_ro = pe_align(vec_len(text), 16);
+  let a_data = pe_align(wrap_add(a_ro, vec_len(ro)), 16);
+  let a_bss = pe_align(wrap_add(a_data, vec_len(data)), 16);
+  let nl = vec_len(gl);
+  let ne = vec_len(ge);
+  let nu = vec_len(gu);
+  let mut strtab = vec_new[u64]();
+  as_byte(&mut strtab, 0);
+  let mut symtab = vec_new[u64]();
+  let mut k = 0;
+  while k < wrap_add(wrap_add(nl, ne), nu) {
+    let mut s = 0;
+    if k < nl {
+      s = u_at(gl, k);
+    } else if k < wrap_add(nl, ne) {
+      s = u_at(ge, wrap_sub(k, nl));
+    } else {
+      s = u_at(gu, wrap_sub(wrap_sub(k, nl), ne));
+    }
+    as_le(&mut symtab, vec_len(strtab), 4);
+    let nstart = ao_sym(g, s, 0);
+    let nlen = ao_sym(g, s, 1);
+    let mut c = 0;
+    while c < nlen {
+      as_byte(&mut strtab, u_at(g.names, wrap_add(nstart, c)));
+      c = wrap_add(c, 1);
+    }
+    as_byte(&mut strtab, 0);
+    let ssec = ao_sym(g, s, 2);
+    if ssec == AS_NONE && (ao_sym(g, s, 4) & 2) != 0 {
+      // a common symbol: its size, and 2^4 for the alignment
+      as_byte(&mut symtab, 1);
+      as_byte(&mut symtab, 0);
+      as_le(&mut symtab, 1024, 2);
+      as_le(&mut symtab, ao_sym(g, s, 5), 8);
+    } else if ssec == AS_NONE {
+      as_byte(&mut symtab, 1);
+      as_byte(&mut symtab, 0);
+      as_le(&mut symtab, 0, 2);
+      as_le(&mut symtab, 0, 8);
+    } else if ssec <= AB_BSS {
+      let mut ty = 14;
+      if (ao_sym(g, s, 4) & 1) != 0 {
+        ty = 15;
+      }
+      let mut base = 0;
+      if ssec == AB_RODATA {
+        base = a_ro;
+      } else if ssec == AB_DATA {
+        base = a_data;
+      } else if ssec == AB_BSS {
+        base = a_bss;
+      }
+      as_byte(&mut symtab, ty);
+      as_byte(&mut symtab, wrap_add(ssec, 1));
+      as_le(&mut symtab, 0, 2);
+      as_le(&mut symtab, wrap_add(base, ao_sym_off(g, s)), 8);
+    } else {
+      bad = true;
+      as_le(&mut symtab, 0, 12);
+    }
+    k = wrap_add(k, 1);
+  }
+  pe_pad_to(&mut strtab, pe_align(vec_len(strtab), 8));
+  // the file: the header, four sections, the relocations, the symbols
+  let ncmds = 4;
+  let cmds = 520;
+  let off_text = pe_align(wrap_add(32, cmds), 16);
+  let off_ro = wrap_add(off_text, a_ro);
+  let off_data = wrap_add(off_text, a_data);
+  let off_rel = pe_align(wrap_add(off_data, vec_len(data)), 8);
+  let off_rr = wrap_add(off_rel, vec_len(rt));
+  let off_rd = wrap_add(off_rr, vec_len(rr));
+  let off_sym = pe_align(wrap_add(off_rd, vec_len(rd)), 8);
+  let off_str = wrap_add(off_sym, vec_len(symtab));
+  let mut out = vec_new[u64]();
+  if !bad {
+    as_le(&mut out, 4277009103, 4);
+    if arm {
+      as_le(&mut out, 16777228, 4);
+      as_le(&mut out, 0, 4);
+    } else {
+      as_le(&mut out, 16777223, 4);
+      as_le(&mut out, 3, 4);
+    }
+    as_le(&mut out, 1, 4);
+    as_le(&mut out, ncmds, 4);
+    as_le(&mut out, cmds, 4);
+    as_le(&mut out, 0, 4);
+    as_le(&mut out, 0, 4);
+    // the one segment, without a name
+    ml_seg(&mut out, "", 0, wrap_add(a_bss, bss), off_text, wrap_add(a_data, vec_len(data)), 7, 4);
+    mo_sect(&mut out, "__text", "__TEXT", 0, vec_len(text), off_text, off_rel, vec_len(rt) / 8, 2147484672);
+    mo_sect(&mut out, "__const", "__TEXT", a_ro, vec_len(ro), off_ro, off_rr, vec_len(rr) / 8, 0);
+    mo_sect(&mut out, "__data", "__DATA", a_data, vec_len(data), off_data, off_rd, vec_len(rd) / 8, 0);
+    mo_sect(&mut out, "__bss", "__DATA", a_bss, bss, 0, 0, 0, 1);
+    // LC_SYMTAB
+    as_le(&mut out, 2, 4);
+    as_le(&mut out, 24, 4);
+    as_le(&mut out, off_sym, 4);
+    as_le(&mut out, wrap_add(wrap_add(nl, ne), nu), 4);
+    as_le(&mut out, off_str, 4);
+    as_le(&mut out, vec_len(strtab), 4);
+    // LC_DYSYMTAB: the local, defined global and undefined symbols
+    as_le(&mut out, 11, 4);
+    as_le(&mut out, 80, 4);
+    as_le(&mut out, 0, 4);
+    as_le(&mut out, nl, 4);
+    as_le(&mut out, nl, 4);
+    as_le(&mut out, ne, 4);
+    as_le(&mut out, wrap_add(nl, ne), 4);
+    as_le(&mut out, nu, 4);
+    k = 0;
+    while k < 12 {
+      as_le(&mut out, 0, 4);
+      k = wrap_add(k, 1);
+    }
+    // LC_BUILD_VERSION: macOS 10.15 (11.0 on arm64), no tools
+    as_le(&mut out, 50, 4);
+    as_le(&mut out, 24, 4);
+    as_le(&mut out, 1, 4);
+    if arm {
+      as_le(&mut out, 720896, 4);
+      as_le(&mut out, 720896, 4);
+    } else {
+      as_le(&mut out, 659200, 4);
+      as_le(&mut out, 659200, 4);
+    }
+    as_le(&mut out, 0, 4);
+    if vec_len(out) != wrap_add(32, cmds) {
+      bad = true;
+    }
+  }
+  if bad {
+    vec_free(out);
+    out = vec_new[u64]();
+  } else {
+    let n_text = vec_len(text);
+    let n_ro = vec_len(ro);
+    let n_data = vec_len(data);
+    let n_rt = vec_len(rt);
+    let n_rr = vec_len(rr);
+    let n_rd = vec_len(rd);
+    let n_sym = vec_len(symtab);
+    let n_str = vec_len(strtab);
+    pe_pad_to(&mut out, off_text);
+    pe_append(&mut out, text, n_text);
+    pe_pad_to(&mut out, off_ro);
+    pe_append(&mut out, ro, n_ro);
+    pe_pad_to(&mut out, off_data);
+    pe_append(&mut out, data, n_data);
+    pe_pad_to(&mut out, off_rel);
+    pe_append(&mut out, rt, n_rt);
+    pe_append(&mut out, rr, n_rr);
+    pe_append(&mut out, rd, n_rd);
+    pe_pad_to(&mut out, off_sym);
+    pe_append(&mut out, symtab, n_sym);
+    pe_append(&mut out, strtab, n_str);
+    vec_free(gl);
+    vec_free(ge);
+    vec_free(gu);
+    return out;
+  }
+  vec_free(text);
+  vec_free(ro);
+  vec_free(data);
+  vec_free(rt);
+  vec_free(rr);
+  vec_free(rd);
+  vec_free(symtab);
+  vec_free(strtab);
+  vec_free(gl);
+  vec_free(ge);
+  vec_free(gu);
+  return out;
+}
+
+/// Writes the program's assembly as the Mach-O object at `outp`.
+fn mo_build(host: &Host, outp: &Bytes, data: &Bytes, arm: bool) -> u64 {
+  let mut g = pe_feed(data, "", arm);
+  if g.errs > 0 {
+    ao_free(g);
+    return 3;
+  }
+  ao_layout(&mut g);
+  let image = mo_rel(&mut g, arm);
+  ao_free(g);
+  if vec_len(image) == 0 {
+    vec_free(image);
+    return 4;
+  }
+  return pe_write(host, outp, image);
+}

@@ -83,6 +83,75 @@ fn mo_copy(out: &mut Vec[u64], v: &Vec[u64], from: u64, to: u64) {
   }
 }
 
+/// The start of the line whose newline is at `nl`.
+fn mo_line_start(v: &Vec[u64], nl: u64) -> u64 {
+  let mut p = nl;
+  while p > 0 && u_at(v, wrap_sub(p, 1)) != 10 {
+    p = wrap_sub(p, 1);
+  }
+  return p;
+}
+
+/// The first character at or after `p` that is not a space or a tab.
+fn mo_skip_blank(v: &Vec[u64], p0: u64) -> u64 {
+  let mut p = p0;
+  while u_at(v, p) == 9 || u_at(v, p) == 32 {
+    p = wrap_add(p, 1);
+  }
+  return p;
+}
+
+/// Is the line that begins at `s` the label of a global symbol, `name:` right
+/// after `.globl name`? Then returns where the name ends, else 0. The exported
+/// functions of a library are the only global symbols but `main`.
+fn mo_export_label(v: &Vec[u64], s: u64) -> u64 {
+  let mut e = s;
+  while mo_ident(u_at(v, e)) && e < vec_len(v) {
+    e = wrap_add(e, 1);
+  }
+  if e == s || u_at(v, e) != 58 || s < 2 || u_at(v, wrap_sub(s, 1)) != 10 {
+    return 0;
+  }
+  // the previous line, or the one before it when that is the `.type` line
+  let mut p = mo_line_start(v, wrap_sub(s, 1));
+  if ix_has_at(v, mo_skip_blank(v, p), ".type ") && p >= 2 {
+    p = mo_line_start(v, wrap_sub(p, 1));
+  }
+  p = mo_skip_blank(v, p);
+  if !ix_has_at(v, p, ".globl ") {
+    return 0;
+  }
+  let n = wrap_sub(e, s);
+  let mut k = 0;
+  while k < n {
+    if u_at(v, wrap_add(wrap_add(p, 7), k)) != u_at(v, wrap_add(s, k)) {
+      return 0;
+    }
+    k = wrap_add(k, 1);
+  }
+  if mo_ident(u_at(v, wrap_add(wrap_add(p, 7), n))) {
+    return 0;
+  }
+  return e;
+}
+
+/// Writes `.globl name` for the global symbol on the line at `t` with the
+/// underscore macOS puts in front of every C name, and returns true; false for
+/// any other line.
+fn mo_globl(out: &mut Vec[u64], v: &Vec[u64], t: u64, e: u64) -> bool {
+  if !ix_has_at(v, t, ".globl ") {
+    return false;
+  }
+  let mut n = wrap_add(t, 7);
+  while n < e && mo_ident(u_at(v, n)) {
+    n = wrap_add(n, 1);
+  }
+  w_s(&mut out, "\t.globl _");
+  mo_copy(&mut out, v, wrap_add(t, 7), n);
+  vec_push(&mut out, 10);
+  return true;
+}
+
 /// One line `v[s .. e]` (without its newline), or nothing for a line that
 /// macOS does not want.
 fn mo_line(out: &mut Vec[u64], v: &Vec[u64], s: u64, e: u64) {
@@ -115,8 +184,15 @@ fn mo_line(out: &mut Vec[u64], v: &Vec[u64], s: u64, e: u64) {
     vec_push(&mut out, 10);
     return;
   }
-  if mo_name_at(v, t, ".globl") && ix_has_at(v, wrap_add(t, 7), "main") && !mo_ident(u_at(v, wrap_add(t, 11))) {
-    w_s(&mut out, "\t.globl _main\n");
+  if mo_globl(&mut out, v, t, e) {
+    return;
+  }
+  let xe = mo_export_label(v, s);
+  if xe != 0 {
+    vec_push(&mut out, 95);
+    mo_copy(&mut out, v, s, wrap_add(xe, 1));
+    mo_copy(&mut out, v, wrap_add(xe, 1), e);
+    vec_push(&mut out, 10);
     return;
   }
   if ix_has_at(v, t, "adrp ") {
@@ -214,8 +290,15 @@ fn mo_line_x86(out: &mut Vec[u64], v: &Vec[u64], s: u64, e: u64) {
     vec_push(&mut out, 10);
     return;
   }
-  if mo_name_at(v, t, ".globl") && ix_has_at(v, wrap_add(t, 7), "main") && !mo_ident(u_at(v, wrap_add(t, 11))) {
-    w_s(&mut out, "\t.globl _main\n");
+  if mo_globl(&mut out, v, t, e) {
+    return;
+  }
+  let xe = mo_export_label(v, s);
+  if xe != 0 {
+    vec_push(&mut out, 95);
+    mo_copy(&mut out, v, s, wrap_add(xe, 1));
+    mo_copy(&mut out, v, wrap_add(xe, 1), e);
+    vec_push(&mut out, 10);
     return;
   }
   if ix_has_at(v, t, "mov $0x241, %esi") {
