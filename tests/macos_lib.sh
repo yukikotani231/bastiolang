@@ -22,8 +22,8 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 if [ -z "$link" ]; then
   for f in $(grep -l '^export fn' examples/*/*.bastio); do
-    "$BASTIOC" $flags -o "$tmp/own.o" "$f" >/dev/null 2>&1 || { echo "FAIL $f: no object"; bad=1; continue; }
-    "$BASTIOC" $flags --gnu-link -o "$tmp/gnu.o" "$f" >/dev/null 2>&1 || { echo "FAIL $f: no object from Apple's as"; bad=1; continue; }
+    "$BASTIOC" --backend native $flags -o "$tmp/own.o" "$f" >/dev/null 2>&1 || { echo "FAIL $f: no object"; bad=1; continue; }
+    "$BASTIOC" --backend native $flags --gnu-link -o "$tmp/gnu.o" "$f" >/dev/null 2>&1 || { echo "FAIL $f: no object from Apple's as"; bad=1; continue; }
     tests/machoobj.py "$tmp/own.o" "$tmp/gnu.o" >/dev/null || { echo "FAIL $f: the object differs from Apple's"; tests/machoobj.py "$tmp/own.o" "$tmp/gnu.o" 2>&1 | tail -3; bad=1; }
   done
 fi
