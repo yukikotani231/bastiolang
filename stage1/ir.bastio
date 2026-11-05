@@ -105,6 +105,10 @@ const IR_POUT: u64 = 64;     // the low c bytes of b are written to I/O port a (
 
 const IR_NONE: u64 = 18446744073709551615;
 
+/// A struct or enum the IR keeps in memory goes by value as the address of
+/// a copy when it takes this many words or more, not as its words.
+const IR_BYADDR_WORDS: u64 = 16;
+
 /// The `ty` of a LOAD or STORE of a word of a Vec header made by a `vec_*`
 /// builtin (`iropt_vlen` reads it, then clears it), and of the load that
 /// `iropt_vlen` puts after a `vgrow` to read the word again.
@@ -3772,6 +3776,17 @@ fn ir_call_to(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64, calle
       // A buffer held in memory: its own address, and the callee's changes
       // land in it.
       vec_push(&mut regs, ir_paddr(&mut f, v));
+    } else if v.k == IRK_PLACE && ir_byaddr_val(c, m, p, pt) {
+      // A long value by value: a copy in a slot of ours, and its address. The
+      // callee owns the copy (`ir_lower` binds it as a place).
+      let w = ir_mw(c, m, p, pu, 0);
+      let slot = ir_reg(&mut f);
+      ir_emit(&mut f, IR_SLOT, slot, 0, 0, w, 0);
+      let src = ir_paddr(&mut f, v);
+      let cnt = ir_reg(&mut f);
+      ir_emit(&mut f, IR_CONST, cnt, wrap_mul(8, w), 0, 0, 0);
+      ir_emit(&mut f, IR_COPY, IR_NONE, slot, src, cnt, 0);
+      vec_push(&mut regs, slot);
     } else if v.k == IRK_PLACE {
       // By value: the words of the place.
       let w = ir_mw(c, m, p, v.t, 0);
@@ -4805,6 +4820,23 @@ fn ir_req_nz(p: &Parser, e: u64, s: u64, en: u64) -> bool {
   return ir_is_var_op_int(p, e, s, en, P_GT, 0) || ir_is_var_op_int(p, e, s, en, P_GE, 1) || ir_is_var_op_int(p, e, s, en, P_NE, 0);
 }
 
+/// Does a parameter of type `pt` arrive as the address of a copy the caller
+/// made (AArch64 only: the x86-64 emitter falls back on a generator that
+/// passes the words)? A struct or enum the IR keeps in memory, by value, of
+/// `IR_BYADDR_WORDS` words or more.
+fn ir_byaddr_val(c: &Checker, m: &Mono, p: &Parser, pt: u64) -> bool {
+  if c.arch != ARCH_AARCH64 || pt == 0 {
+    return false;
+  }
+  let pu = base_t(m, pt);
+  let k = kind_t(m, pu);
+  if kind_t(m, pt) == TY_REF || kind_t(m, pt) == TY_MUTREF || !(k == TY_STRUCT || k == TY_ENUM || k == TY_CHILD) {
+    return false;
+  }
+  let w = ir_mw(c, m, p, pu, 0);
+  return ir_kind(c, m, p, pu) == 0 && w != IR_NONE && w >= IR_BYADDR_WORDS && w <= 8192;
+}
+
 fn ir_lower(c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> IrFn {
   let mut f = ir_new(x);
   let xi = inst_at(m, x);
@@ -4819,6 +4851,12 @@ fn ir_lower(c: &Checker, m: &mut Mono, p: &Parser, x: u64) -> IrFn {
     let pmw = ir_mw(c, m, p, pu, 0);
     if aggr && pmw != IR_NONE && pmw > 0 && (kind_t(m, pt) == TY_MUTREF || (kind_t(m, pt) == TY_REF && pmw >= 4)) {
       // Lent by address: the value stays where the caller has it.
+      let r = ir_reg(&mut f);
+      vec_push(&mut f.params, r);
+      ir_bind(&mut f, qn.s, qn.e, IrVal { k: IRK_PLACE, r0: r, r1: 0, t: pu });
+    } else if ir_byaddr_val(c, m, p, pt) {
+      // A long value arrives as the address of a copy the caller made for us
+      // (see `ir_call`): the copy is ours, a place like a slot of our own.
       let r = ir_reg(&mut f);
       vec_push(&mut f.params, r);
       ir_bind(&mut f, qn.s, qn.e, IrVal { k: IRK_PLACE, r0: r, r1: 0, t: pu });
