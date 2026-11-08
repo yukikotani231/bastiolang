@@ -37,7 +37,7 @@ both() {
 }
 export -f both
 lost=0
-pfor both $(s1files tests/pass/*.bastio bench/*.bastio examples/todoapi.bastio) || lost=1
+pfor both $(cfiles tests/pass/*.bastio bench/*.bastio examples/todoapi.bastio) || lost=1
 pass=$(n pass) skip=$(n skip) fail=$(($(n fail) + lost))
 echo "wasm: $pass same as the C backend, $skip skipped (unsupported), $fail failed"
 [ $fail = 0 ]

@@ -36,3 +36,13 @@ s1left() {
   done
   echo $n
 }
+
+# The files of "$@" that the native and wasm differential tests build: those
+# s1files keeps, less programs whose header says `// backend: c` (builtins
+# only the C backend has so far, such as f64_*; tests/run.sh builds them).
+cfiles() {
+  local f
+  for f in $(s1files "$@"); do
+    grep -q '^// backend: c' "$f" || echo "$f"
+  done
+}
