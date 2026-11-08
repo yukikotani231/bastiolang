@@ -1745,7 +1745,7 @@ fn ir_handle_arg(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) ->
 /// (`Host` and `Child`)?
 fn ir_is_host(p: &Parser, i: u64) -> bool {
   return name_is(p, i, "host_argc") || name_is(p, i, "host_arg") || name_is(p, i, "host_read") || name_is(p, i, "host_write")
-    || name_is(p, i, "host_env") || name_is(p, i, "host_cpus") || name_is(p, i, "host_net") || name_is(p, i, "host_eprint") || name_is(p, i, "host_spawn")
+    || name_is(p, i, "host_env") || name_is(p, i, "host_cpus") || name_is(p, i, "host_net") || name_is(p, i, "host_sandbox") || name_is(p, i, "host_eprint") || name_is(p, i, "host_spawn")
     || name_is(p, i, "child_write") || name_is(p, i, "child_close") || name_is(p, i, "child_read_line") || name_is(p, i, "child_wait");
 }
 
@@ -1850,9 +1850,12 @@ fn ir_host_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> 
     ir_hdr_store(&mut f, blk, 3, data.r1);
   } else if name_is(p, i, "host_cpus") {
     which = 24;
-  } else if name_is(p, i, "host_net") {
+  } else if name_is(p, i, "host_net") || name_is(p, i, "host_sandbox") {
     // The operation, two numbers and the buffer the runtime may replace.
     which = 32;
+    if name_is(p, i, "host_sandbox") {
+      which = 33;
+    }
     let op = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 1));
     let a = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 2));
     let b = ir_int(&mut f, c, &mut m, p, cg_arg(p, i, 3));
@@ -2072,6 +2075,10 @@ fn ir_syscall(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> Ir
 /// result are integers or buffers (or no result).
 fn ir_call(f: &mut IrFn, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> IrVal {
   let n = node_at(p.nodes, i);
+  if is_code_builtin(p, n.s, n.e) {
+    ir_fail(&mut f, "machine code from plans (stencil, code_build, code_call, code_free); use --backend c");
+    return ir_none();
+  }
   if name_is(p, i, "len") || name_is(p, i, "blen") || name_is(p, i, "slen") {
     let mut kind = IRK_BUF;
     if name_is(p, i, "blen") {

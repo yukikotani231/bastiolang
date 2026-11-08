@@ -941,6 +941,9 @@ On the hosted target, `main` can ask for `&mut Host`: the program's command line
 | `host_env(h: &Host, name: Str, out: &mut Bytes) -> bool` | Replaces `out` with the value of the environment variable `name`; false (and `out` unchanged) if it is not set |
 | `host_cpus(h: &Host) -> u64` | Number of processors online (at least 1, which the prover does not know) |
 | `host_net(h: &mut Host, op: u64, a: u64, b: u64, buf: &mut Bytes) -> u64` | TCP sockets, one call with an operation number (use `std/net.bastio`, which wraps them). `0` listen on IPv4 address `a` (host order), port `b`; `1` accept on listener `a`; `2` connect to address `a`, port `b & 65535`, giving up after `b >> 16` milliseconds when that is not 0 (at most one hour; the limit also bounds each later read and send on that socket; Windows ignores it); `9` connect over IPv6 to the 16 bytes (network order) in `buf`, port `b & 65535` and limit `b >> 16` as for `2` (`a` is 0; `buf` is not changed); `3` read up to `b` bytes from `a` into `buf`; `4` send `buf` on `a`, returning the count; `5` close `a`; `6` port of listener `a`; `7` the time in seconds since 1970; `8` replace `buf` with `b` random bytes (at most 256) from the system's source (`std/net.bastio` has `net_now` and `net_random`). A failure is 2^64 - 1; every socket call fails in WebAssembly (the time and random bytes work there) (on Windows the sockets are Winsock, loaded on the first call) |
+| `host_sandbox(h: &mut Host, op: u64, a: u64, b: u64, buf: &mut Bytes) -> u64` | Giving up what the program may do, and naming paths before it does (stage1 only). `0` sets no_new_privs; `1` installs the seccomp filter whose instructions are `buf` (8 bytes each, little endian: code `u16`, jt `u8`, jf `u8`, k `u32`; 1 to 4096 of them) with flags `a`; `2` returns the Landlock ABI version; `3` creates a Landlock ruleset from the `struct landlock_ruleset_attr` bytes in `buf` and returns its descriptor (close-on-exec); `4` lets ruleset `a` reach the path in `buf` with access `b` (a path that is not a directory keeps only the file rights of `b`, 49159); `5` lets ruleset `a` reach TCP port `b & 65535` with access `b >> 16`; `6` restricts the program to ruleset `a`; `7` closes descriptor `a`; `8` replaces `buf` with its path made absolute (`realpath`; `buf` is unchanged if that fails); `9` replaces `buf` with the current directory; `10` returns the error number of the last call that failed. A path holding a NUL fails. A failure is 2^64 - 1. Operations 0 to 7 work on Linux (x86-64 and AArch64) only; 8 and 9 also work through the C backend elsewhere; the macOS and Windows native backends and WebAssembly fail every call |
+| `f64_add(a: u64, b: u64) -> u64` and the other `f64_*` builtins | IEEE 754 doubles carried as their bits in a `u64` (stage1 only, C backend only so far; use `std/f64.bastio`, which wraps them in a type `F64`): `f64_add`, `f64_sub`, `f64_mul`, `f64_div`, `f64_fma(a, b, c)`; `f64_eq`, `f64_lt`, `f64_le` (false with NaN); `f64_from_u64`, `f64_from_i64(n: i64)`, `f64_to_u64`, `f64_to_i64 -> i64` (toward zero, saturating, NaN is 0); `f64_math(k, x)` and `f64_math2(k, x, y)` for the C library's functions by number; `f64_parse(s: &Bytes)` (`strtod`, NaN unless all of `s` is used); `f64_digits(x, out: &mut Bytes) -> i64` (the shortest digits that read back, and the decimal exponent); `f64_fmt_e(x, prec, out)` and `f64_fmt_f(x, prec, out)` (printf's `%.*e` and `%.*f`). Proofs know only that each result is a value of its type |
+| `stencil`, `code_build`, `code_call`, `code_free` | Machine code from plans, for JIT compilers (stage1 only): see [Machine code from plans](#machine-code-from-plans) |
 | `host_spawn(h: &Host, argv: &Vec[Bytes]) -> Child` | Starts `argv[0]` (looked up in `PATH`) with arguments `argv`. A program that cannot be started gives a child that exits with 127 and writes nothing |
 | `child_write(c: &mut Child, data: &Bytes) -> bool` | Writes to the child's standard input; false if it can no longer be written |
 | `child_close(c: &mut Child)` | Closes the child's standard input, so a program that reads to the end of its input can finish |
@@ -970,6 +973,30 @@ fn main(host: &mut Host) -> u64 {
   return bad;
 }
 ```
+
+### Machine code from plans
+
+For a JIT compiler (stage1 only, hosted, C backend; machine code on x86-64 Linux, macOS and the BSDs). A program never writes machine code: it writes a *plan*, a `Vec[u64]` of items, and `code_build` assembles it from a fixed set of instruction forms. The code can only call the program's *stencils*, proved functions without preconditions, with constant arguments, and branch on what they return. Whatever the plan says, every callee is safe to call with any numbers and every jump lands on an instruction `code_build` wrote, so a wrong plan computes a wrong answer but cannot break memory safety.
+
+| Builtin | Effect |
+| --- | --- |
+| `stencil(f) -> u64` | `f`'s number in the stencil table. `f` must be `fn(ctx: &mut T, a: u64, b: u64, c: u64, d: u64) -> u64`, not generic, without `requires` (`E-TYPE`); every stencil and every `code_call` uses the same struct `T` |
+| `code_build(h: &Host, plan: &Vec[u64]) -> u64` | Checks the plan and builds its code; returns its id, or 0 if the plan breaks a rule, memory cannot be mapped or the platform has no machine code |
+| `code_call(code: u64, ctx: &mut T, entry: u64) -> u64` | Runs the code from entry point `entry`, lending it `ctx`, and returns what it returns. 0 for an unknown or freed id or a missing entry. Afterwards nothing proved about `ctx` before the call is known (the stencils may have changed it in any way) |
+| `code_free(h: &Host, code: u64)` | Unmaps the code (when the last call into it returns, if it is running). Ids are never reused |
+
+A plan item is an opcode word followed by its operands; a label `L` is the offset in the plan of an item, or the plan's length:
+
+| Item | Meaning |
+| --- | --- |
+| `0 k a b c d` | Call stencil `k` with `(ctx, a, b, c, d)`; the result is the current value (0 on entry) |
+| `1 L` / `2 L` | Go to `L` if the current value is 0 / is not 0 |
+| `3 v L` | Go to `L` if the current value is `v` |
+| `4 L` | Go to `L` |
+| `5` / `6 v` | Return the current value / `v` |
+| `7 L` | The next entry point (numbered from 0 in plan order) starts at `L` |
+
+Running off the end returns the current value. The pages are written while read-write and then made read-execute, never both at once (W^X). Termination is not guaranteed, as for any code. The assembler is part of the trusted base (`prelude code` in `--trusted-base`). `tests/pass/code_plan.bastio` runs a loop through stencils.
 
 ## Kernel capabilities
 

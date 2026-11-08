@@ -62,8 +62,11 @@ OSARG=
 export BASTIOC OSARG
 # One program, built by both backends; JOBS of them at a time.
 both() {
-  local f=$1 cs xs
-  if ! "$BASTIOC" -o "$w/c.exe" "$f" 2>/dev/null; then
+  local f=$1 cs xs be
+  # `// backend: c`: the reference build must ask for the C backend, which a
+  # hosted x86-64 program does not get by default.
+  be=$(sed -n 's|^// backend: *||p' "$f" | head -1)
+  if ! "$BASTIOC" ${be:+--backend "$be"} -o "$w/c.exe" "$f" 2>/dev/null; then
     echo "FAIL $f: the C backend rejected it"; echo =fail; return
   fi
   "$BASTIOC" --backend "${BACKEND:-native}" ${OSARG:-} -o "$w/x.exe" "$f" 2>"$w/err"; rc=$?
@@ -81,7 +84,7 @@ both() {
 }
 export -f both
 lost=0
-pfor both $(s1files tests/pass/*.bastio bench/*.bastio) || lost=1
+pfor both $(cfiles tests/pass/*.bastio bench/*.bastio) || lost=1
 # The example libraries (`export fn`, no `main`) built by the native backend
 # pass the same C harnesses as their C builds.
 libs=0

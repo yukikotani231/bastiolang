@@ -16,10 +16,12 @@ BASTIOC=${BASTIOC:-$(tests/bastioc1.sh)} || exit 1
 . tests/stage1_only.sh
 export BASTIOC
 both() {
-  local f=$1 cs xs rc
+  local f=$1 cs xs rc be
   # It checks its own executable for an ELF, Mach-O or PE header.
   case "$f" in tests/pass/bytes_host.bastio) echo "skip $f: reads its own executable's header"; echo =skip; return;; esac
-  if ! "$BASTIOC" -o "$w/c.exe" "$f" 2>/dev/null; then
+  # `// backend: c`: the reference build must ask for the C backend.
+  be=$(sed -n 's|^// backend: *||p' "$f" | head -1)
+  if ! "$BASTIOC" ${be:+--backend "$be"} -o "$w/c.exe" "$f" 2>/dev/null; then
     echo "FAIL $f: the C backend rejected it"; echo =fail; return
   fi
   "$BASTIOC" --arch wasm32 -o "$w/x.wasm" "$f" 2>"$w/err"; rc=$?
@@ -37,7 +39,7 @@ both() {
 }
 export -f both
 lost=0
-pfor both $(s1files tests/pass/*.bastio bench/*.bastio examples/todoapi.bastio) || lost=1
+pfor both $(cfiles tests/pass/*.bastio bench/*.bastio examples/todoapi.bastio) || lost=1
 pass=$(n pass) skip=$(n skip) fail=$(($(n fail) + lost))
 echo "wasm: $pass same as the C backend, $skip skipped (unsupported), $fail failed"
 [ $fail = 0 ]
