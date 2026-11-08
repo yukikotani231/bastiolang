@@ -90,13 +90,15 @@ fn main(h: &mut Host) -> u64 {
       let r = p.start;
       let w = p.end;
       let mut got = balloc(0);
-      if !os_nonblock(h, r, true) || os_read(h, r, 8, &mut got) is Option::Some || os_errno(h) == 0 {
+      // Windows has no non-blocking pipes, poll or epoll: only the pipe itself.
+      let nb = os_nonblock(h, r, true);
+      if nb && (os_read(h, r, 8, &mut got) is Option::Some || os_errno(h) == 0) {
         bad = bad | 4096;
       }
       let mut fds = balloc(8);
       bset(&mut fds, 0, cast[u8](r & 255));
       bset(&mut fds, 4, 1);   // POLLIN
-      if !(os_poll(h, &mut fds, 0) is Option::Some) || blen(fds) != 8 || bget(fds, 6) != 0 {
+      if nb && (!(os_poll(h, &mut fds, 0) is Option::Some) || blen(fds) != 8 || bget(fds, 6) != 0) {
         bad = bad | 8192;
       }
       let mut x = bfrom("x");
@@ -110,7 +112,9 @@ fn main(h: &mut Host) -> u64 {
           }
         },
         Option::None => {
-          bad = bad | 32768;
+          if nb {
+            bad = bad | 32768;
+          }
         },
       }
       // epoll (Linux): the read end is ready, with the data word given.

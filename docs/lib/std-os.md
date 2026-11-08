@@ -602,7 +602,8 @@ fn os_nonblock(h: &Host, fd: u64, on: bool) -> bool
 ```
 
 Makes reads and writes on `fd` return at once (failing with EAGAIN, 11
-on Linux) instead of waiting, or wait again.
+on Linux) instead of waiting, or wait again. False on Windows, which has no
+such mode for these descriptors.
 
 Example:
 
@@ -614,7 +615,7 @@ match os_pipe(host) {
     let r = os_read(host, p.start, 8, &mut got);   // nothing written yet
     bfree(got);
     os_close(host, p.start); os_close(host, p.end);
-    if !ok || r is Option::Some { return 1; }
+    if ok && r is Option::Some { return 1; }
   },
   Option::None => { return 1; },
 }
@@ -630,7 +631,7 @@ Waits until one of the descriptors in `fds` is ready or `ms`
 milliseconds pass (`OS_FAIL`: no limit). `fds` holds 8 bytes a
 descriptor, little endian: the descriptor (32 bits), the events to wait
 for (16 bits: 1 input, 4 output) and the events that happened (16 bits,
-filled in). The result is how many are ready.
+filled in). The result is how many are ready. On Windows it is `None`.
 
 Example:
 
@@ -645,7 +646,7 @@ match os_pipe(host) {
     if blen(fds) == 8 { ready = bget(fds, 6); }
     bfree(fds);
     os_close(host, p.start); os_close(host, p.end);
-    if !(n is Option::Some) || ready != 4 { return 1; }
+    if n is Option::Some && ready != 4 { return 1; }
   },
   Option::None => { return 1; },
 }
