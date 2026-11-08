@@ -208,7 +208,7 @@ if echo 'int main(void){return 0;}' | ${CC:-cc} -fsanitize=address,undefined -x 
     name=$(basename "$f" .bastio)
     want=$(sed -n 's|^// expect-exit: *||p' "$f" | head -1)
     "$BASTIOC" --emit-c -o "$w/$name.c" "$f" 2>/dev/null
-    ${CC:-cc} -fsanitize=address,undefined -fno-sanitize-recover=all -g -o "$w/$name.san" "$w/$name.c"
+    ${CC:-cc} -fsanitize=address,undefined -fno-sanitize-recover=all -g -o "$w/$name.san" "$w/$name.c" -lm
     # A failed allocation returns NULL, as calloc does without ASan, so the
     # `try_alloc` path that handles it is the one checked.
     ASAN_OPTIONS=allocator_may_return_null=1 \
@@ -287,7 +287,9 @@ if python3 tests/libref.py --check >"$tmp/libref.out" 2>&1; then pass=$((pass+1)
   echo "FAIL tests/libref.py --check"; sed 's/^/    /' "$tmp/libref.out"; fail=$((fail+1)); fi
 python3 tests/libref.py --examples "$tmp/libref" >"$tmp/libref.list"
 while read -r mod prog names; do
-  if ! "$BASTIOC" --lib "$PWD" -o "${prog%.bastio}" "$prog" 2>"$tmp/libref.err"; then
+  # A module whose top comment says `// backend: c` builds its examples that way.
+  be=$(sed -n 's|^// backend: *||p' "$mod" | head -1)
+  if ! "$BASTIOC" --lib "$PWD" ${be:+--backend "$be"} -o "${prog%.bastio}" "$prog" 2>"$tmp/libref.err"; then
     echo "FAIL examples of $mod: rejected"; sed 's/^/    /' "$tmp/libref.err"; fail=$((fail+1)); continue
   fi
   "${prog%.bastio}" </dev/null >/dev/null 2>&1; got=$?

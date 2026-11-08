@@ -1,0 +1,323 @@
+// std/f64.bastio: IEEE 754 double-precision numbers (binary64) for programs
+// on the hosted target. An `F64` holds the 64 bits of a double; every
+// operation is the hardware's (or the C library's), rounded to nearest, with
+// NaN and the infinities as IEEE 754 says. Proofs see the bits as a word and
+// know nothing about the results of arithmetic, so a program checks what it
+// needs at run time. The `f64_*` builtins under these functions are stage1
+// only and, for now, need the C backend:
+// backend: c
+
+/// A double, as its 64 bits (sign, 11 exponent bits, 52 fraction bits).
+struct F64 { bits: u64 }
+
+/// The double whose bits are `b`.
+/// ```
+/// let one = f64_of_bits(4607182418800017408);
+/// if !feq(one, fnum(1)) { return 1; }
+/// ```
+fn f64_of_bits(b: u64) -> F64
+  ensures result.bits == b
+{
+  return F64 { bits: b };
+}
+
+/// The bits of `x`.
+/// ```
+/// if fbits(fnum(2)) != 4611686018427387904 { return 1; }
+/// ```
+fn fbits(x: F64) -> u64
+  ensures result == x.bits
+{
+  return x.bits;
+}
+
+/// The double nearest to `n`.
+/// ```
+/// if fbits(fnum(0)) != 0 { return 1; }
+/// ```
+fn fnum(n: u64) -> F64 {
+  return F64 { bits: f64_from_u64(n) };
+}
+
+/// The double nearest to the signed `n`.
+/// ```
+/// let m = fnum_i(-3);
+/// if !feq(m, fneg(fnum(3))) { return 1; }
+/// ```
+fn fnum_i(n: i64) -> F64 {
+  return F64 { bits: f64_from_i64(n) };
+}
+
+/// Not a number (the quiet NaN 0x7ff8000000000000).
+/// ```
+/// if !fisnan(fnan()) { return 1; }
+/// ```
+fn fnan() -> F64 {
+  return F64 { bits: 9221120237041090560 };
+}
+
+/// Positive infinity.
+/// ```
+/// if !flt(fnum(1000000), finf()) { return 1; }
+/// ```
+fn finf() -> F64 {
+  return F64 { bits: 9218868437227405312 };
+}
+
+/// `x + y`.
+/// ```
+/// if !feq(fadd(fnum(1), fnum(2)), fnum(3)) { return 1; }
+/// ```
+fn fadd(x: F64, y: F64) -> F64 {
+  return F64 { bits: f64_add(x.bits, y.bits) };
+}
+
+/// `x - y`.
+/// ```
+/// if !feq(fsub(fnum(1), fnum(3)), fnum_i(-2)) { return 1; }
+/// ```
+fn fsub(x: F64, y: F64) -> F64 {
+  return F64 { bits: f64_sub(x.bits, y.bits) };
+}
+
+/// `x * y`.
+/// ```
+/// if !feq(fmul(fnum(6), fnum(7)), fnum(42)) { return 1; }
+/// ```
+fn fmul(x: F64, y: F64) -> F64 {
+  return F64 { bits: f64_mul(x.bits, y.bits) };
+}
+
+/// `x / y` (division by zero gives an infinity or NaN).
+/// ```
+/// if !feq(fdiv(fnum(1), fnum(0)), finf()) { return 1; }
+/// if !fisnan(fdiv(fnum(0), fnum(0))) { return 1; }
+/// ```
+fn fdiv(x: F64, y: F64) -> F64 {
+  return F64 { bits: f64_div(x.bits, y.bits) };
+}
+
+/// The remainder of `x / y` truncated toward zero, with the sign of `x`
+/// (C's `fmod`, JavaScript's `%`).
+/// ```
+/// if !feq(frem(fnum_i(-7), fnum(3)), fnum_i(-1)) { return 1; }
+/// ```
+fn frem(x: F64, y: F64) -> F64 {
+  return F64 { bits: f64_math2(2, x.bits, y.bits) };
+}
+
+/// `x * y + z` with one rounding.
+/// ```
+/// if !feq(ffma(fnum(2), fnum(3), fnum(4)), fnum(10)) { return 1; }
+/// ```
+fn ffma(x: F64, y: F64, z: F64) -> F64 {
+  return F64 { bits: f64_fma(x.bits, y.bits, z.bits) };
+}
+
+/// `-x` (only the sign bit changes, also for NaN and zero).
+/// ```
+/// if fbits(fneg(fnum(0))) != 9223372036854775808 { return 1; }
+/// ```
+fn fneg(x: F64) -> F64 {
+  return F64 { bits: x.bits ^ 9223372036854775808 };
+}
+
+/// `|x|` (the sign bit cleared).
+/// ```
+/// if !feq(fabs(fnum_i(-5)), fnum(5)) { return 1; }
+/// ```
+fn fabs(x: F64) -> F64 {
+  return F64 { bits: x.bits & 9223372036854775807 };
+}
+
+/// `x` with the sign of `s`.
+/// ```
+/// if !feq(fcopysign(fnum(2), fnum_i(-1)), fnum_i(-2)) { return 1; }
+/// ```
+fn fcopysign(x: F64, s: F64) -> F64 {
+  return F64 { bits: (x.bits & 9223372036854775807) | (s.bits & 9223372036854775808) };
+}
+
+/// Is `x == y`? False if either is NaN; `0 == -0`.
+/// ```
+/// if !feq(fnum(0), fneg(fnum(0))) || feq(fnan(), fnan()) { return 1; }
+/// ```
+fn feq(x: F64, y: F64) -> bool {
+  return f64_eq(x.bits, y.bits);
+}
+
+/// Is `x < y`? False if either is NaN.
+/// ```
+/// if !flt(fnum(1), fnum(2)) || flt(fnan(), fnum(2)) { return 1; }
+/// ```
+fn flt(x: F64, y: F64) -> bool {
+  return f64_lt(x.bits, y.bits);
+}
+
+/// Is `x <= y`? False if either is NaN.
+/// ```
+/// if !fle(fnum(2), fnum(2)) { return 1; }
+/// ```
+fn fle(x: F64, y: F64) -> bool {
+  return f64_le(x.bits, y.bits);
+}
+
+/// Is `x` NaN?
+/// ```
+/// if fisnan(fnum(1)) { return 1; }
+/// ```
+fn fisnan(x: F64) -> bool {
+  return (x.bits & 9223372036854775807) > 9218868437227405312;
+}
+
+/// Is `x` neither an infinity nor NaN?
+/// ```
+/// if !fisfinite(fnum(1)) || fisfinite(finf()) || fisfinite(fnan()) { return 1; }
+/// ```
+fn fisfinite(x: F64) -> bool {
+  return (x.bits & 9218868437227405312) != 9218868437227405312;
+}
+
+/// Is the sign bit of `x` set (also for -0 and a negative NaN)?
+/// ```
+/// if !fsignbit(fneg(fnum(0))) || fsignbit(fnum(0)) { return 1; }
+/// ```
+fn fsignbit(x: F64) -> bool {
+  return x.bits >= 9223372036854775808;
+}
+
+/// One of the C library's functions of one argument, by number: 0 `sqrt`,
+/// 1 `floor`, 2 `ceil`, 3 `trunc`, 4 `round` (halves away from zero), 5
+/// `nearbyint` (halves to even), 6 `exp`, 7 `expm1`, 8 `log`, 9 `log1p`, 10
+/// `log2`, 11 `log10`, 12 `sin`, 13 `cos`, 14 `tan`, 15 `asin`, 16 `acos`,
+/// 17 `atan`, 18 `sinh`, 19 `cosh`, 20 `tanh`, 21 `asinh`, 22 `acosh`, 23
+/// `atanh`, 24 `cbrt`, 25 `exp2`. Any other number gives NaN.
+/// ```
+/// if !feq(fmath(1, f64_of_bits(4612811918334230528)), fnum(2)) { return 1; }   // floor(2.5)
+/// if !feq(fmath(25, fnum(10)), fnum(1024)) { return 1; }
+/// ```
+fn fmath(op: u64, x: F64) -> F64 {
+  return F64 { bits: f64_math(op, x.bits) };
+}
+
+/// The square root of `x` (NaN below zero).
+/// ```
+/// if !feq(fsqrt(fnum(81)), fnum(9)) || !fisnan(fsqrt(fnum_i(-1))) { return 1; }
+/// ```
+fn fsqrt(x: F64) -> F64 {
+  return F64 { bits: f64_math(0, x.bits) };
+}
+
+/// The largest integer not above `x`.
+/// ```
+/// if !feq(ffloor(fdiv(fnum_i(-3), fnum(2))), fnum_i(-2)) { return 1; }
+/// ```
+fn ffloor(x: F64) -> F64 {
+  return F64 { bits: f64_math(1, x.bits) };
+}
+
+/// The smallest integer not below `x`.
+/// ```
+/// if !feq(fceil(fdiv(fnum(3), fnum(2))), fnum(2)) { return 1; }
+/// ```
+fn fceil(x: F64) -> F64 {
+  return F64 { bits: f64_math(2, x.bits) };
+}
+
+/// `x` with its fraction dropped (toward zero).
+/// ```
+/// if !feq(ftrunc(fdiv(fnum_i(-7), fnum(2))), fnum_i(-3)) { return 1; }
+/// ```
+fn ftrunc(x: F64) -> F64 {
+  return F64 { bits: f64_math(3, x.bits) };
+}
+
+/// One of the C library's functions of two arguments, by number: 0 `pow`,
+/// 1 `atan2`, 2 `fmod`, 3 `hypot`. Any other number gives NaN.
+/// ```
+/// if !feq(fmath2(3, fnum(3), fnum(4)), fnum(5)) { return 1; }
+/// ```
+fn fmath2(op: u64, x: F64, y: F64) -> F64 {
+  return F64 { bits: f64_math2(op, x.bits, y.bits) };
+}
+
+/// `x` to the power `y` (C's `pow`).
+/// ```
+/// if !feq(fpow(fnum(2), fnum(10)), fnum(1024)) { return 1; }
+/// ```
+fn fpow(x: F64, y: F64) -> F64 {
+  return F64 { bits: f64_math2(0, x.bits, y.bits) };
+}
+
+/// `x` toward zero as a `u64`, 0 for NaN and below, `2^64 - 1` above.
+/// ```
+/// if fto_u64(fdiv(fnum(7), fnum(2))) != 3 || fto_u64(fnum_i(-1)) != 0 { return 1; }
+/// ```
+fn fto_u64(x: F64) -> u64 {
+  return f64_to_u64(x.bits);
+}
+
+/// `x` toward zero as an `i64`, 0 for NaN, saturating at the ends.
+/// ```
+/// if fto_i64(fdiv(fnum_i(-7), fnum(2))) != -3 { return 1; }
+/// ```
+fn fto_i64(x: F64) -> i64 {
+  return f64_to_i64(x.bits);
+}
+
+/// The number the bytes spell, rounded to nearest (the C library's `strtod`
+/// in the C locale: decimal, hexadecimal such as `0x1p-3`, `inf`, `nan`), or
+/// NaN unless all of `s` is one number. A caller with a stricter syntax
+/// (JavaScript's, say) checks it first.
+/// ```
+/// let s = bfrom("1.5e3");
+/// let x = fparse(s);
+/// bfree(s);
+/// if !feq(x, fnum(1500)) { return 1; }
+/// ```
+fn fparse(s: &Bytes) -> F64 {
+  return F64 { bits: f64_parse(s) };
+}
+
+/// The shortest decimal digits that read back as `x` (the closest such),
+/// into `out` (replacing it), and the decimal exponent `n` with
+/// `|x| = 0.digits * 10^n`: `15` and 1 for 1.5, `1` and -1 for 0.01. The
+/// sign is left out. For 0 the digits are `0` (and `n` is 1), for an
+/// infinity `inf` and for NaN `nan` (and `n` is 0). JavaScript's
+/// `Number.prototype.toString` is built from these.
+/// ```
+/// let mut d = balloc(0);
+/// let n = fdigits(fdiv(fnum(1), fnum(8)), &mut d);   // 0.125
+/// let ok = n == 0 && blen(d) == 3 && bget(d, 0) == 49;
+/// bfree(d);
+/// if !ok { return 1; }
+/// ```
+fn fdigits(x: F64, out: &mut Bytes) -> i64 {
+  return f64_digits(x.bits, &mut out);
+}
+
+/// `x` as printf's `%.*e`, with `prec` digits after the point (at most 100),
+/// into `out` (replacing it); the result is the length.
+/// ```
+/// let mut t = balloc(0);
+/// let n = fformat_e(fnum(1500), 2, &mut t);   // "1.50e+03"
+/// let ok = n == 8 && blen(t) == 8 && bget(t, 4) == 101;
+/// bfree(t);
+/// if !ok { return 1; }
+/// ```
+fn fformat_e(x: F64, prec: u64, out: &mut Bytes) -> u64 {
+  return f64_fmt_e(x.bits, prec, &mut out);
+}
+
+/// `x` as printf's `%.*f`, with `prec` digits after the point (at most 100),
+/// into `out` (replacing it); the result is the length.
+/// ```
+/// let mut t = balloc(0);
+/// let n = fformat_f(fdiv(fnum(2), fnum(3)), 3, &mut t);   // "0.667"
+/// let ok = n == 5 && blen(t) == 5 && bget(t, 4) == 55;
+/// bfree(t);
+/// if !ok { return 1; }
+/// ```
+fn fformat_f(x: F64, prec: u64, out: &mut Bytes) -> u64 {
+  return f64_fmt_f(x.bits, prec, &mut out);
+}

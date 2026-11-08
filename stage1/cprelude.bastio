@@ -873,6 +873,177 @@ fn cg_prelude_child(out: &mut Vec[u64]) {
   w_s(&mut out, "}\n");
 }
 
+/// The prelude part for the `f64_*` builtins (stage1 only): added after the
+/// hosted prelude, and only to a program that calls one.
+fn cg_prelude_f64(out: &mut Vec[u64]) {
+  w_s(&mut out, "#include <math.h>\n");
+  w_s(&mut out, "/* f64: IEEE 754 doubles, carried as their 64 bits in a uint64_t (so a Vec,\n");
+  w_s(&mut out, " * a struct field or a proof sees a plain word). Each operation is the C\n");
+  w_s(&mut out, " * one on the values those bits stand for, rounded to nearest. */\n");
+  w_s(&mut out, "static inline double bst_f64_d(uint64_t b) { double d; memcpy(&d, &b, 8); return d; }\n");
+  w_s(&mut out, "static inline uint64_t bst_f64_b(double d) { uint64_t b; memcpy(&b, &d, 8); return b; }\n");
+  w_s(&mut out, "static inline uint64_t bst_f64_add(uint64_t a, uint64_t b) { return bst_f64_b(bst_f64_d(a) + bst_f64_d(b)); }\n");
+  w_s(&mut out, "static inline uint64_t bst_f64_sub(uint64_t a, uint64_t b) { return bst_f64_b(bst_f64_d(a) - bst_f64_d(b)); }\n");
+  w_s(&mut out, "static inline uint64_t bst_f64_mul(uint64_t a, uint64_t b) { return bst_f64_b(bst_f64_d(a) * bst_f64_d(b)); }\n");
+  w_s(&mut out, "static inline uint64_t bst_f64_div(uint64_t a, uint64_t b) { return bst_f64_b(bst_f64_d(a) / bst_f64_d(b)); }\n");
+  w_s(&mut out, "static inline uint64_t bst_f64_fma(uint64_t a, uint64_t b, uint64_t c) { return bst_f64_b(fma(bst_f64_d(a), bst_f64_d(b), bst_f64_d(c))); }\n");
+  w_s(&mut out, "static inline bool bst_f64_eq(uint64_t a, uint64_t b) { return bst_f64_d(a) == bst_f64_d(b); }\n");
+  w_s(&mut out, "static inline bool bst_f64_lt(uint64_t a, uint64_t b) { return bst_f64_d(a) < bst_f64_d(b); }\n");
+  w_s(&mut out, "static inline bool bst_f64_le(uint64_t a, uint64_t b) { return bst_f64_d(a) <= bst_f64_d(b); }\n");
+  w_s(&mut out, "static inline uint64_t bst_f64_from_u64(uint64_t a) { return bst_f64_b((double)a); }\n");
+  w_s(&mut out, "static inline uint64_t bst_f64_from_i64(int64_t a) { return bst_f64_b((double)a); }\n");
+  w_s(&mut out, "/* Toward zero, saturating at the type's ends; NaN is 0. */\n");
+  w_s(&mut out, "static inline uint64_t bst_f64_to_u64(uint64_t a) {\n");
+  w_s(&mut out, "    double d = bst_f64_d(a);\n");
+  w_s(&mut out, "    if (!(d > -1.0)) return 0;\n");
+  w_s(&mut out, "    if (d >= 18446744073709551616.0) return ~(uint64_t)0;\n");
+  w_s(&mut out, "    return (uint64_t)d;\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "static inline int64_t bst_f64_to_i64(uint64_t a) {\n");
+  w_s(&mut out, "    double d = bst_f64_d(a);\n");
+  w_s(&mut out, "    if (d != d) return 0;\n");
+  w_s(&mut out, "    if (d <= -9223372036854775808.0) return INT64_MIN;\n");
+  w_s(&mut out, "    if (d >= 9223372036854775808.0) return INT64_MAX;\n");
+  w_s(&mut out, "    return (int64_t)d;\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "/* The functions of one argument, by number (an unknown one is NaN). */\n");
+  w_s(&mut out, "static uint64_t bst_f64_math(uint64_t op, uint64_t a) {\n");
+  w_s(&mut out, "    double x = bst_f64_d(a), r;\n");
+  w_s(&mut out, "    switch (op) {\n");
+  w_s(&mut out, "    case 0: r = sqrt(x); break;\n");
+  w_s(&mut out, "    case 1: r = floor(x); break;\n");
+  w_s(&mut out, "    case 2: r = ceil(x); break;\n");
+  w_s(&mut out, "    case 3: r = trunc(x); break;\n");
+  w_s(&mut out, "    case 4: r = round(x); break;\n");
+  w_s(&mut out, "    case 5: r = nearbyint(x); break;\n");
+  w_s(&mut out, "    case 6: r = exp(x); break;\n");
+  w_s(&mut out, "    case 7: r = expm1(x); break;\n");
+  w_s(&mut out, "    case 8: r = log(x); break;\n");
+  w_s(&mut out, "    case 9: r = log1p(x); break;\n");
+  w_s(&mut out, "    case 10: r = log2(x); break;\n");
+  w_s(&mut out, "    case 11: r = log10(x); break;\n");
+  w_s(&mut out, "    case 12: r = sin(x); break;\n");
+  w_s(&mut out, "    case 13: r = cos(x); break;\n");
+  w_s(&mut out, "    case 14: r = tan(x); break;\n");
+  w_s(&mut out, "    case 15: r = asin(x); break;\n");
+  w_s(&mut out, "    case 16: r = acos(x); break;\n");
+  w_s(&mut out, "    case 17: r = atan(x); break;\n");
+  w_s(&mut out, "    case 18: r = sinh(x); break;\n");
+  w_s(&mut out, "    case 19: r = cosh(x); break;\n");
+  w_s(&mut out, "    case 20: r = tanh(x); break;\n");
+  w_s(&mut out, "    case 21: r = asinh(x); break;\n");
+  w_s(&mut out, "    case 22: r = acosh(x); break;\n");
+  w_s(&mut out, "    case 23: r = atanh(x); break;\n");
+  w_s(&mut out, "    case 24: r = cbrt(x); break;\n");
+  w_s(&mut out, "    case 25: r = exp2(x); break;\n");
+  w_s(&mut out, "    default: r = NAN; break;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    return bst_f64_b(r);\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "/* The functions of two arguments, by number (an unknown one is NaN). */\n");
+  w_s(&mut out, "static uint64_t bst_f64_math2(uint64_t op, uint64_t a, uint64_t b) {\n");
+  w_s(&mut out, "    double x = bst_f64_d(a), y = bst_f64_d(b), r;\n");
+  w_s(&mut out, "    switch (op) {\n");
+  w_s(&mut out, "    case 0: r = pow(x, y); break;\n");
+  w_s(&mut out, "    case 1: r = atan2(x, y); break;\n");
+  w_s(&mut out, "    case 2: r = fmod(x, y); break;\n");
+  w_s(&mut out, "    case 3: r = hypot(x, y); break;\n");
+  w_s(&mut out, "    default: r = NAN; break;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    return bst_f64_b(r);\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "/* The number the bytes spell (strtod, in the C locale: decimal or hexadecimal,\n");
+  w_s(&mut out, " * inf, nan), rounded to nearest; NaN unless every byte is used. */\n");
+  w_s(&mut out, "static uint64_t bst_f64_parse(bst_bytes s) {\n");
+  w_s(&mut out, "    char small[64];\n");
+  w_s(&mut out, "    char *t = s.len < sizeof small ? small : (char *)malloc(s.len + 1);\n");
+  w_s(&mut out, "    if (!t) { fputs(\"Bastio: out of memory\\n\", stderr); abort(); }\n");
+  w_s(&mut out, "    memcpy(t, s.data, s.len);\n");
+  w_s(&mut out, "    t[s.len] = 0;\n");
+  w_s(&mut out, "    char *end = t;\n");
+  w_s(&mut out, "    double d = s.len == 0 || memchr(s.data, 0, s.len) ? NAN : strtod(t, &end);\n");
+  w_s(&mut out, "    if (end != t + s.len) d = NAN;\n");
+  w_s(&mut out, "    if (t != small) free(t);\n");
+  w_s(&mut out, "    return bst_f64_b(d);\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "static void bst_f64_put(bst_bytes *out, const char *s, size_t n) {\n");
+  w_s(&mut out, "    unsigned char *d = (unsigned char *)malloc(n ? n : 1);\n");
+  w_s(&mut out, "    if (!d) { fputs(\"Bastio: out of memory\\n\", stderr); abort(); }\n");
+  w_s(&mut out, "    memcpy(d, s, n);\n");
+  w_s(&mut out, "    free(out->data);\n");
+  w_s(&mut out, "    out->len = n;\n");
+  w_s(&mut out, "    out->data = d;\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "/* Does the decimal with the `p` digits `d` and exponent `e` (d[0].d[1..] * 10^e) read back as `x`? */\n");
+  w_s(&mut out, "static bool bst_f64_back(const char *d, int p, int e, double x) {\n");
+  w_s(&mut out, "    char t[48];\n");
+  w_s(&mut out, "    int k = 0;\n");
+  w_s(&mut out, "    t[k++] = d[0];\n");
+  w_s(&mut out, "    t[k++] = '.';\n");
+  w_s(&mut out, "    for (int i = 1; i < p; i++) t[k++] = d[i];\n");
+  w_s(&mut out, "    snprintf(t + k, sizeof t - (size_t)k, \"e%d\", e);\n");
+  w_s(&mut out, "    return strtod(t, NULL) == x;\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "/* The shortest decimal digits that read back as `a` (the closest such), alone\n");
+  w_s(&mut out, " * (`15` for 1.5), replacing `*out`; the result is the decimal exponent n with\n");
+  w_s(&mut out, " * |a| = 0.digits * 10^n. For 0 the digits are `0` and n is 1; for an infinity\n");
+  w_s(&mut out, " * `inf` and for NaN `nan`, and n is 0. For each length p from 1, the p digits\n");
+  w_s(&mut out, " * nearest to `a` are tried, then their neighbour on the other side of `a`\n");
+  w_s(&mut out, " * (at a power of two the gap below is half the gap above, so the nearest can\n");
+  w_s(&mut out, " * miss while the neighbour reads back). */\n");
+  w_s(&mut out, "static int64_t bst_f64_digits(uint64_t a, bst_bytes *out) {\n");
+  w_s(&mut out, "    double x = bst_f64_d(a);\n");
+  w_s(&mut out, "    char t[64], d[24];\n");
+  w_s(&mut out, "    if (x != x) { bst_f64_put(out, \"nan\", 3); return 0; }\n");
+  w_s(&mut out, "    if (x == 0) { bst_f64_put(out, \"0\", 1); return 1; }\n");
+  w_s(&mut out, "    if (x - x != 0) { bst_f64_put(out, \"inf\", 3); return 0; }\n");
+  w_s(&mut out, "    if (x < 0) x = -x;\n");
+  w_s(&mut out, "    int p = 1, e = 0;\n");
+  w_s(&mut out, "    for (; p <= 17; p++) {\n");
+  w_s(&mut out, "        snprintf(t, sizeof t, \"%.*e\", p - 1, x);\n");
+  w_s(&mut out, "        int k = 0;\n");
+  w_s(&mut out, "        const char *c = t;\n");
+  w_s(&mut out, "        for (; *c && *c != 'e'; c++) if (*c >= '0' && *c <= '9') d[k++] = *c;\n");
+  w_s(&mut out, "        e = atoi(c + 1);\n");
+  w_s(&mut out, "        double near = strtod(t, NULL);\n");
+  w_s(&mut out, "        if (near == x || p == 17) break;\n");
+  w_s(&mut out, "        char n[24];\n");
+  w_s(&mut out, "        int ne = e;\n");
+  w_s(&mut out, "        memcpy(n, d, (size_t)p);\n");
+  w_s(&mut out, "        int i = p - 1;\n");
+  w_s(&mut out, "        if (near < x) {   /* one unit up in the last digit */\n");
+  w_s(&mut out, "            while (i >= 0 && n[i] == '9') n[i--] = '0';\n");
+  w_s(&mut out, "            if (i < 0) { n[0] = '1'; ne++; } else n[i]++;\n");
+  w_s(&mut out, "        } else {          /* one unit down */\n");
+  w_s(&mut out, "            while (i >= 0 && n[i] == '0') n[i--] = '9';\n");
+  w_s(&mut out, "            n[i]--;\n");
+  w_s(&mut out, "            if (n[0] == '0') { memmove(n, n + 1, (size_t)p - 1); n[p - 1] = '9'; ne--; }\n");
+  w_s(&mut out, "        }\n");
+  w_s(&mut out, "        if (bst_f64_back(n, p, ne, x)) { memcpy(d, n, (size_t)p); e = ne; break; }\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    int k = p;\n");
+  w_s(&mut out, "    while (k > 1 && d[k - 1] == '0') k--;\n");
+  w_s(&mut out, "    bst_f64_put(out, d, (size_t)k);\n");
+  w_s(&mut out, "    return (int64_t)e + 1;\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "/* printf's %.*e (`e`) or %.*f with `prec` (at most 100) digits after the point,\n");
+  w_s(&mut out, " * replacing `*out`; the result is the length. */\n");
+  w_s(&mut out, "static uint64_t bst_f64_fmt(uint64_t a, uint64_t prec, bst_bytes *out, int e) {\n");
+  w_s(&mut out, "    double x = bst_f64_d(a);\n");
+  w_s(&mut out, "    if (prec > 100) prec = 100;\n");
+  w_s(&mut out, "    int n = snprintf(NULL, 0, e ? \"%.*e\" : \"%.*f\", (int)prec, x);\n");
+  w_s(&mut out, "    if (n < 0) n = 0;\n");
+  w_s(&mut out, "    char *t = (char *)malloc((size_t)n + 1);\n");
+  w_s(&mut out, "    if (!t) { fputs(\"Bastio: out of memory\\n\", stderr); abort(); }\n");
+  w_s(&mut out, "    snprintf(t, (size_t)n + 1, e ? \"%.*e\" : \"%.*f\", (int)prec, x);\n");
+  w_s(&mut out, "    bst_f64_put(out, t, (size_t)n);\n");
+  w_s(&mut out, "    free(t);\n");
+  w_s(&mut out, "    return (uint64_t)n;\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "static uint64_t bst_f64_fmt_e(uint64_t a, uint64_t prec, bst_bytes *out) { return bst_f64_fmt(a, prec, out, 1); }\n");
+  w_s(&mut out, "static uint64_t bst_f64_fmt_f(uint64_t a, uint64_t prec, bst_bytes *out) { return bst_f64_fmt(a, prec, out, 0); }\n");
+}
+
 /// The prelude part for `code_build`, `code_call` and `code_free` (stage1
 /// only): added after the hosted prelude, and only to a program that calls
 /// them. `bst_stencil_tab` and `BST_NSTENCILS` are the stencil table, which
@@ -2520,6 +2691,8 @@ const PART_USER_A64: u64 = 22;
 const PART_DMA_A64: u64 = 23;
 /// Not in any target's list (stage0 has no such part): see `cg_prelude_net`.
 const PART_NET: u64 = 24;
+/// Not in any target's list either: see `cg_prelude_f64`.
+const PART_F64: u64 = 26;
 /// Not in any target's list either: see `cg_prelude_code`.
 const PART_CODE: u64 = 27;
 
@@ -2548,6 +2721,7 @@ fn cg_part_name(id: u64) -> Str {
   if id == PART_USER_A64 { return "user_a64"; }
   if id == PART_DMA_A64 { return "dma_a64"; }
   if id == PART_NET { return "net"; }
+  if id == PART_F64 { return "f64"; }
   if id == PART_CODE { return "code"; }
   return "user";
 }
@@ -2579,6 +2753,7 @@ fn cg_part(out: &mut Vec[u64], id: u64) {
   else if id == PART_USER_A64 { cg_prelude_user_a64(&mut out); }
   else if id == PART_DMA_A64 { cg_prelude_dma_a64(&mut out); }
   else if id == PART_NET { cg_prelude_net(&mut out); }
+  else if id == PART_F64 { cg_prelude_f64(&mut out); }
   else if id == PART_CODE { cg_prelude_code(&mut out); }
   else { cg_prelude_user(&mut out); }
 }

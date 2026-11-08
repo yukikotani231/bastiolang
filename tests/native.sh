@@ -84,7 +84,7 @@ both() {
 }
 export -f both
 lost=0
-pfor both $(s1files tests/pass/*.bastio bench/*.bastio) || lost=1
+pfor both $(cfiles tests/pass/*.bastio bench/*.bastio) || lost=1
 # The example libraries (`export fn`, no `main`) built by the native backend
 # pass the same C harnesses as their C builds.
 libs=0

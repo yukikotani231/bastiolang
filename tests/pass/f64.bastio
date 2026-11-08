@@ -1,0 +1,95 @@
+// stage1-only: f64 builtins (IEEE 754 doubles as their bits)
+// backend: c
+// expect-exit: 0
+// Arithmetic, comparisons with NaN and signed zeros, conversions that
+// saturate, the C library's functions, and decimal text both ways, through
+// std/f64.bastio and the builtins under it.
+import "../../std/f64.bastio";
+
+fn text_is(b: &Bytes, s: Str) -> bool {
+  if blen(b) != slen(s) {
+    return false;
+  }
+  let mut i = 0;
+  while i < blen(b)
+    invariant blen(b) == slen(s)
+  {
+    if bget(b, i) != sget(s, i) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn pnum(s: Str) -> F64 {
+  let b = bfrom(s);
+  let x = fparse(b);
+  bfree(b);
+  return x;
+}
+
+fn main(h: &mut Host) -> u64 {
+  let mut bad = 0;
+  let tenth = fdiv(fnum(1), fnum(10));
+  let fifth = fdiv(fnum(1), fnum(5));
+  // 0.1 + 0.2 is not 0.3, and the shortest digits say so.
+  let sum = fadd(tenth, fifth);
+  let mut d = balloc(0);
+  if feq(sum, pnum("0.3")) || fdigits(sum, &mut d) != 0 || !text_is(d, "30000000000000004") {
+    bad = bad | 1;
+  }
+  if fdigits(tenth, &mut d) != 0 || !text_is(d, "1") {
+    bad = bad | 2;
+  }
+  // 2^-77: the nearest 16 digits do not read back, but the next 16 above do.
+  if fdigits(f64_of_bits(4260405247492489216), &mut d) != -23 || !text_is(d, "6617444900424222") {
+    bad = bad | 2048;
+  }
+  if fdigits(fnum(1000), &mut d) != 4 || !text_is(d, "1") || fdigits(fnan(), &mut d) != 0 || !text_is(d, "nan") {
+    bad = bad | 4;
+  }
+  // NaN is unordered and unequal to itself; -0 equals 0 but keeps its sign.
+  let nan = fdiv(fnum(0), fnum(0));
+  let nz = fneg(fnum(0));
+  if !fisnan(nan) || feq(nan, nan) || flt(nan, fnum(1)) || fle(fnum(1), nan) || !feq(nz, fnum(0)) || !fsignbit(nz) {
+    bad = bad | 8;
+  }
+  // Conversions toward zero, saturating; NaN is 0.
+  if fto_i64(fnum_i(-7)) != -7 || fto_i64(fdiv(fnum_i(-15), fnum(2))) != -7 || fto_u64(nan) != 0
+    || fto_u64(fmul(finf(), fnum(1))) != 18446744073709551615 || fto_i64(fneg(finf())) != -9223372036854775808 {
+    bad = bad | 16;
+  }
+  if fto_u64(fnum(18446744073709551615)) != 18446744073709551615 || fbits(fnum(9007199254740993)) != fbits(fnum(9007199254740992)) {
+    bad = bad | 32;
+  }
+  // The C library's functions, and rounding of halves.
+  let half = fdiv(fnum(5), fnum(2));
+  if !feq(fmath(4, half), fnum(3)) || !feq(fmath(5, half), fnum(2)) || !feq(ffloor(fneg(half)), fnum_i(-3))
+    || !feq(fsqrt(fnum(2)), pnum("1.4142135623730951")) || !feq(fmath(8, fmath(6, fnum(1))), fnum(1)) {
+    bad = bad | 64;
+  }
+  if !feq(fmath2(1, fnum(0), fnum_i(-1)), pnum("3.141592653589793")) || !fisnan(fmath(99, fnum(1))) || !fisnan(fmath2(99, fnum(1), fnum(1))) {
+    bad = bad | 128;
+  }
+  // fma rounds once: 0.1 * 10 - 1 is 0 rounded twice, not once.
+  if !feq(fsub(fmul(tenth, fnum(10)), fnum(1)), fnum(0)) || feq(ffma(tenth, fnum(10), fnum_i(-1)), fnum(0)) {
+    bad = bad | 256;
+  }
+  // Parsing: all of the text or NaN; hexadecimal and the infinities.
+  if !fisnan(pnum("1.5x")) || !fisnan(pnum("")) || !feq(pnum("0x1p-2"), fdiv(fnum(1), fnum(4)))
+    || !feq(pnum("-inf"), fneg(finf())) || !feq(pnum("1e400"), finf()) {
+    bad = bad | 512;
+  }
+  let mut t = balloc(0);
+  if fformat_f(fdiv(fnum(1), fnum(3)), 4, &mut t) != 6 || !text_is(t, "0.3333") || fformat_e(fnum(123456), 1, &mut t) != 7 || !text_is(t, "1.2e+05") {
+    bad = bad | 1024;
+  }
+  bfree(t);
+  bfree(d);
+  if bad != 0 {
+    print(bad);
+    return 1;
+  }
+  return 0;
+}
