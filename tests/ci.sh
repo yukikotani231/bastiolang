@@ -43,6 +43,7 @@ if command -v z3 >/dev/null; then
   step "tests/as64.sh";      tests/as64.sh
   step "tests/net6.sh";      tests/net6.sh
   step "tests/macho.sh";     tests/macho.sh
+  step "tests/nolibm.sh";      tests/nolibm.sh
   step "tests/proof_cache.sh"; tests/proof_cache.sh
   step "tests/package.sh";     tests/package.sh
   step "tests/tools.sh";     tests/tools.sh
