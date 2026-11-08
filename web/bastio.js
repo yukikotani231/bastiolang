@@ -191,6 +191,8 @@
           if (op === 3 && r.result !== NONE) fill(cell, r.data);
           return r.result;
         }
+        case 33:                                     // host_sandbox: nothing to give up or name here
+          return NONE;
         default:
           throw new Error('bastio: unsupported host routine ' + call);
       }

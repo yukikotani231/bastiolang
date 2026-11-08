@@ -77,6 +77,7 @@ What will be 0.2.0.
 
 ### Language
 
+- `host_sandbox(h, op, a, b, buf)` (stage1, hosted): no_new_privs, seccomp filters, Landlock rulesets (ABI version, create, path and TCP port rules, restrict), `realpath`, the current directory and the last error number, for programs that confine themselves. C backend everywhere; x86-64 and AArch64 native on Linux; every call fails on the macOS and Windows native backends and in WebAssembly.
 - `try_alloc` and `try_balloc`: allocation that returns an empty buffer when
   memory runs out instead of stopping the program. The prover makes the
   program check the length before using it.

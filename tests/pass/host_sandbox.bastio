@@ -1,0 +1,115 @@
+// stage1-only: host_sandbox (no_new_privs, seccomp, Landlock, realpath and getcwd)
+// expect-exit: 0
+// Names paths and, on Linux, gives up only what costs this test nothing:
+// no_new_privs, a seccomp filter that allows every call, and a Landlock
+// ruleset that is filled and closed but never applied. A failing call is
+// 2^64 - 1. Where the current directory cannot be read (WebAssembly, the
+// Windows native backend) every call fails, and that is all it checks.
+
+fn same(a: &Bytes, b: &Bytes) -> bool {
+  if blen(a) != blen(b) {
+    return false;
+  }
+  let mut i = 0;
+  while i < blen(a)
+    invariant blen(a) == blen(b)
+  {
+    if bget(a, i) != bget(b, i) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn main(h: &mut Host) -> u64 {
+  let fail = 18446744073709551615;
+  let mut bad = 0;
+  let mut cwd = balloc(0);
+  if host_sandbox(h, 9, 0, 0, &mut cwd) == fail {
+    bfree(cwd);
+    let mut none = balloc(0);
+    if host_sandbox(h, 2, 0, 0, &mut none) != fail || host_sandbox(h, 0, 0, 0, &mut none) != fail {
+      bad = bad + 1;
+    }
+    bfree(none);
+    return bad;
+  }
+  if blen(cwd) == 0 {
+    bad = bad + 1;
+  }
+  // realpath of "." is the current directory.
+  let mut dot = bfrom(".");
+  if host_sandbox(h, 8, 0, 0, &mut dot) != 0 || !same(dot, cwd) {
+    bad = bad + 2;
+  }
+  // A path that does not exist fails with ENOENT and leaves the bytes alone.
+  let mut gone = bfrom("no/such/dir/here");
+  if host_sandbox(h, 8, 0, 0, &mut gone) != fail || host_sandbox(h, 10, 0, 0, &mut gone) != 2 || blen(gone) != 16 {
+    bad = bad + 4;
+  }
+  // A path with a NUL in it fails with EINVAL.
+  let mut nul = bfrom("a.b");
+  bset(&mut nul, 1, 0);
+  if host_sandbox(h, 8, 0, 0, &mut nul) != fail || host_sandbox(h, 10, 0, 0, &mut nul) != 22 {
+    bad = bad + 8;
+  }
+  // An unknown operation fails.
+  if host_sandbox(h, 99, 0, 0, &mut nul) != fail {
+    bad = bad + 16;
+  }
+  // An empty filter and one whose length is not a multiple of 8 are refused.
+  let mut empty = balloc(0);
+  let mut odd = balloc(12);
+  if host_sandbox(h, 1, 0, 0, &mut empty) != fail || host_sandbox(h, 1, 0, 0, &mut odd) != fail {
+    bad = bad + 32;
+  }
+  if host_sandbox(h, 0, 0, 0, &mut empty) == 0 {
+    // Linux: one instruction, BPF_RET | BPF_K with SECCOMP_RET_ALLOW (0x7fff0000).
+    let mut allow = balloc(8);
+    bset(&mut allow, 0, 6);
+    bset(&mut allow, 6, 255);
+    bset(&mut allow, 7, 127);
+    // qemu-user has no seccomp and says ENOSYS.
+    if host_sandbox(h, 1, 0, 0, &mut allow) != 0 && host_sandbox(h, 10, 0, 0, &mut allow) != 38 {
+      bad = bad + 64;
+    }
+    bfree(allow);
+    let abi = host_sandbox(h, 2, 0, 0, &mut empty);
+    if abi != fail && abi >= 1 {
+      // handled_access_fs = READ_FILE | READ_DIR (12), 8 bytes.
+      let mut attr = balloc(8);
+      bset(&mut attr, 0, 12);
+      let rs = host_sandbox(h, 3, 0, 0, &mut attr);
+      if rs == fail {
+        bad = bad + 128;
+      } else {
+        let mut root = bfrom("/");
+        if host_sandbox(h, 4, rs, 12, &mut root) != 0 {
+          bad = bad + 256;
+        }
+        bfree(root);
+        // READ_DIR (8) on a file is dropped rather than refused.
+        let mut exe = bfrom("/proc/self/exe");
+        if host_sandbox(h, 4, rs, 12, &mut exe) != 0 {
+          bad = bad + 1024;
+        }
+        bfree(exe);
+        if host_sandbox(h, 7, rs, 0, &mut empty) != 0 {
+          bad = bad + 512;
+        }
+      }
+      bfree(attr);
+    }
+  }
+  bfree(empty);
+  bfree(odd);
+  bfree(nul);
+  bfree(gone);
+  bfree(dot);
+  bfree(cwd);
+  if bad != 0 {
+    print(bad);
+  }
+  return bad;
+}
