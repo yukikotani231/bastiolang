@@ -873,6 +873,149 @@ fn cg_prelude_child(out: &mut Vec[u64]) {
   w_s(&mut out, "}\n");
 }
 
+/// The prelude part for `host_sandbox` (stage1 only): added after the hosted
+/// prelude, and only to a program that calls it.
+fn cg_prelude_sandbox(out: &mut Vec[u64]) {
+  w_s(&mut out, "#include <errno.h>\n");
+  w_s(&mut out, "#include <limits.h>\n");
+  w_s(&mut out, "#include <sys/stat.h>\n");
+  w_s(&mut out, "#ifdef _WIN32\n");
+  w_s(&mut out, "#include <direct.h>\n");
+  w_s(&mut out, "#else\n");
+  w_s(&mut out, "char *realpath(const char *, char *);   /* XSI: hidden by _POSIX_C_SOURCE alone */\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "/* host_sandbox: the calls a program makes to give up what it may do (Linux:\n");
+  w_s(&mut out, " * no_new_privs, seccomp, Landlock) and to name paths before it does. `op` 0 sets\n");
+  w_s(&mut out, " * no_new_privs; 1 installs the seccomp filter whose instructions (8 bytes each:\n");
+  w_s(&mut out, " * code u16, jt u8, jf u8, k u32, little endian) are `*buf`, with flags `a`; 2\n");
+  w_s(&mut out, " * returns the Landlock ABI version; 3 creates a Landlock ruleset from the\n");
+  w_s(&mut out, " * attribute bytes in `*buf` and returns its descriptor; 4 lets ruleset `a` reach\n");
+  w_s(&mut out, " * the path `*buf` with access `b`; 5 lets ruleset `a` reach TCP port `b & 65535`\n");
+  w_s(&mut out, " * with access `b >> 16`; 6 restricts the program to ruleset `a`; 7 closes `a`;\n");
+  w_s(&mut out, " * 8 replaces `*buf` with its path made absolute (realpath); 9 replaces `*buf`\n");
+  w_s(&mut out, " * with the current directory; 10 returns the error number of the last call that\n");
+  w_s(&mut out, " * failed. The failure of any is 2^64 - 1. Ops 0 to 7 fail outside Linux. */\n");
+  w_s(&mut out, "static uint64_t bst_sb_errno;\n");
+  w_s(&mut out, "static uint64_t bst_sb_fail(void) { bst_sb_errno = (uint64_t)errno; return ~(uint64_t)0; }\n");
+  w_s(&mut out, "static void bst_sb_replace(bst_bytes *buf, const char *s) {\n");
+  w_s(&mut out, "    size_t n = strlen(s);\n");
+  w_s(&mut out, "    unsigned char *d = (unsigned char *)malloc(n ? n : 1);\n");
+  w_s(&mut out, "    if (!d) { fputs(\"Bastio: out of memory\\n\", stderr); abort(); }\n");
+  w_s(&mut out, "    memcpy(d, s, n);\n");
+  w_s(&mut out, "    free(buf->data);\n");
+  w_s(&mut out, "    buf->len = n;\n");
+  w_s(&mut out, "    buf->data = d;\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "/* `*buf` as a C string (NUL-terminated, malloc'd), or NULL if it holds a NUL. */\n");
+  w_s(&mut out, "static char *bst_sb_cstr(const bst_bytes *buf) {\n");
+  w_s(&mut out, "    if (memchr(buf->data, 0, buf->len)) { errno = EINVAL; return NULL; }\n");
+  w_s(&mut out, "    char *s = (char *)malloc(buf->len + 1);\n");
+  w_s(&mut out, "    if (!s) { fputs(\"Bastio: out of memory\\n\", stderr); abort(); }\n");
+  w_s(&mut out, "    memcpy(s, buf->data, buf->len);\n");
+  w_s(&mut out, "    s[buf->len] = 0;\n");
+  w_s(&mut out, "    return s;\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "#if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))\n");
+  w_s(&mut out, "long syscall(long, ...);\n");
+  w_s(&mut out, "#ifdef __x86_64__\n");
+  w_s(&mut out, "#define BST_SYS_SECCOMP 317\n");
+  w_s(&mut out, "#define BST_SYS_PRCTL 157\n");
+  w_s(&mut out, "#else\n");
+  w_s(&mut out, "#define BST_SYS_SECCOMP 277\n");
+  w_s(&mut out, "#define BST_SYS_PRCTL 167\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "#define BST_SB_LINUX 1\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "static uint64_t bst_host_sandbox(bst_host h, uint64_t op, uint64_t a, uint64_t b, bst_bytes *buf) {\n");
+  w_s(&mut out, "    (void)h;\n");
+  w_s(&mut out, "    if (op == 10) return bst_sb_errno;\n");
+  w_s(&mut out, "    if (op == 8) {\n");
+  w_s(&mut out, "        char *p = bst_sb_cstr(buf);\n");
+  w_s(&mut out, "        if (!p) return bst_sb_fail();\n");
+  w_s(&mut out, "#ifdef _WIN32\n");
+  w_s(&mut out, "        char *r = _fullpath(NULL, p, 0);\n");
+  w_s(&mut out, "        /* _fullpath names a path that need not exist; realpath does not. */\n");
+  w_s(&mut out, "        struct _stat64 st;\n");
+  w_s(&mut out, "        if (r && _stat64(r, &st) != 0) { int e = errno; free(r); r = NULL; errno = e; }\n");
+  w_s(&mut out, "#else\n");
+  w_s(&mut out, "        char *r = realpath(p, NULL);\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "        if (!r) { bst_sb_errno = (uint64_t)errno; free(p); return ~(uint64_t)0; }\n");
+  w_s(&mut out, "        free(p);\n");
+  w_s(&mut out, "        bst_sb_replace(buf, r);\n");
+  w_s(&mut out, "        free(r);\n");
+  w_s(&mut out, "        return 0;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    if (op == 9) {\n");
+  w_s(&mut out, "        size_t cap = 256;\n");
+  w_s(&mut out, "        for (;;) {\n");
+  w_s(&mut out, "            char *d = (char *)malloc(cap);\n");
+  w_s(&mut out, "            if (!d) { fputs(\"Bastio: out of memory\\n\", stderr); abort(); }\n");
+  w_s(&mut out, "#ifdef _WIN32\n");
+  w_s(&mut out, "            char *r = _getcwd(d, (int)cap);\n");
+  w_s(&mut out, "#else\n");
+  w_s(&mut out, "            char *r = getcwd(d, cap);\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "            if (r) { bst_sb_replace(buf, d); free(d); return 0; }\n");
+  w_s(&mut out, "            int e = errno;\n");
+  w_s(&mut out, "            free(d);\n");
+  w_s(&mut out, "            if (e != ERANGE || cap >= ((size_t)1 << 20)) { errno = e; return bst_sb_fail(); }\n");
+  w_s(&mut out, "            cap *= 2;\n");
+  w_s(&mut out, "        }\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "#ifdef BST_SB_LINUX\n");
+  w_s(&mut out, "    if (op == 0) return syscall(BST_SYS_PRCTL, 38L, 1L, 0L, 0L, 0L) == 0 ? 0 : bst_sb_fail();   /* PR_SET_NO_NEW_PRIVS */\n");
+  w_s(&mut out, "    if (op == 1) {\n");
+  w_s(&mut out, "        if (buf->len == 0 || buf->len % 8 != 0 || buf->len / 8 > 4096) { errno = EINVAL; return bst_sb_fail(); }\n");
+  w_s(&mut out, "        struct { unsigned short len; const void *filter; } prog;   /* struct sock_fprog */\n");
+  w_s(&mut out, "        prog.len = (unsigned short)(buf->len / 8);\n");
+  w_s(&mut out, "        prog.filter = buf->data;\n");
+  w_s(&mut out, "        long r = syscall(BST_SYS_SECCOMP, 1L, (long)a, &prog);   /* SECCOMP_SET_MODE_FILTER */\n");
+  w_s(&mut out, "        return r < 0 ? bst_sb_fail() : (uint64_t)r;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    if (op == 2) {\n");
+  w_s(&mut out, "        long r = syscall(444L, (void *)0, 0L, 1L);   /* landlock_create_ruleset(NULL, 0, VERSION) */\n");
+  w_s(&mut out, "        return r < 0 ? bst_sb_fail() : (uint64_t)r;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    if (op == 3) {\n");
+  w_s(&mut out, "        long r = syscall(444L, buf->data, (long)buf->len, 0L);\n");
+  w_s(&mut out, "        return r < 0 ? bst_sb_fail() : (uint64_t)r;   /* the kernel opens it close-on-exec */\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    if (op == 4) {\n");
+  w_s(&mut out, "        char *p = bst_sb_cstr(buf);\n");
+  w_s(&mut out, "        if (!p) return bst_sb_fail();\n");
+  w_s(&mut out, "        int fd = open(p, 010000000 | O_CLOEXEC);   /* O_PATH */\n");
+  w_s(&mut out, "        free(p);\n");
+  w_s(&mut out, "        if (fd < 0) return bst_sb_fail();\n");
+  w_s(&mut out, "        struct stat st;   /* a rule for a file that is not a directory carries only the file rights */\n");
+  w_s(&mut out, "        if (fstat(fd, &st) == 0 && !S_ISDIR(st.st_mode)) b &= 49159;   /* EXECUTE | WRITE_FILE | READ_FILE | TRUNCATE | IOCTL_DEV */\n");
+  w_s(&mut out, "        unsigned char attr[12];   /* struct landlock_path_beneath_attr, packed: allowed_access u64, parent_fd s32 */\n");
+  w_s(&mut out, "        int32_t pfd = fd;\n");
+  w_s(&mut out, "        memcpy(attr, &b, 8);\n");
+  w_s(&mut out, "        memcpy(attr + 8, &pfd, 4);\n");
+  w_s(&mut out, "        long r = syscall(445L, (long)a, 1L, attr, 0L);   /* LANDLOCK_RULE_PATH_BENEATH */\n");
+  w_s(&mut out, "        int e = errno;\n");
+  w_s(&mut out, "        close(fd);\n");
+  w_s(&mut out, "        if (r < 0) { errno = e; return bst_sb_fail(); }\n");
+  w_s(&mut out, "        return 0;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    if (op == 5) {\n");
+  w_s(&mut out, "        uint64_t attr[2];   /* struct landlock_net_port_attr: allowed_access, port */\n");
+  w_s(&mut out, "        attr[0] = b >> 16;\n");
+  w_s(&mut out, "        attr[1] = b & 65535;\n");
+  w_s(&mut out, "        long r = syscall(445L, (long)a, 2L, attr, 0L);   /* LANDLOCK_RULE_NET_PORT */\n");
+  w_s(&mut out, "        return r < 0 ? bst_sb_fail() : 0;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    if (op == 6) return syscall(446L, (long)a, 0L) == 0 ? 0 : bst_sb_fail();\n");
+  w_s(&mut out, "    if (op == 7) return close((int)a) == 0 ? 0 : bst_sb_fail();\n");
+  w_s(&mut out, "#else\n");
+  w_s(&mut out, "    (void)a; (void)b;\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "    errno = ENOSYS;\n");
+  w_s(&mut out, "    return bst_sb_fail();\n");
+  w_s(&mut out, "}\n");
+}
+
 /// The prelude part for the `f64_*` builtins (stage1 only): added after the
 /// hosted prelude, and only to a program that calls one.
 fn cg_prelude_f64(out: &mut Vec[u64]) {
@@ -1005,13 +1148,13 @@ fn cg_prelude_f64(out: &mut Vec[u64]) {
   w_s(&mut out, "        const char *c = t;\n");
   w_s(&mut out, "        for (; *c && *c != 'e'; c++) if (*c >= '0' && *c <= '9') d[k++] = *c;\n");
   w_s(&mut out, "        e = atoi(c + 1);\n");
-  w_s(&mut out, "        double near = strtod(t, NULL);\n");
-  w_s(&mut out, "        if (near == x || p == 17) break;\n");
+  w_s(&mut out, "        double got = strtod(t, NULL);\n");
+  w_s(&mut out, "        if (got == x || p == 17) break;\n");
   w_s(&mut out, "        char n[24];\n");
   w_s(&mut out, "        int ne = e;\n");
   w_s(&mut out, "        memcpy(n, d, (size_t)p);\n");
   w_s(&mut out, "        int i = p - 1;\n");
-  w_s(&mut out, "        if (near < x) {   /* one unit up in the last digit */\n");
+  w_s(&mut out, "        if (got < x) {   /* one unit up in the last digit */\n");
   w_s(&mut out, "            while (i >= 0 && n[i] == '9') n[i--] = '0';\n");
   w_s(&mut out, "            if (i < 0) { n[0] = '1'; ne++; } else n[i]++;\n");
   w_s(&mut out, "        } else {          /* one unit down */\n");
@@ -3054,6 +3197,8 @@ const PART_USER_A64: u64 = 22;
 const PART_DMA_A64: u64 = 23;
 /// Not in any target's list (stage0 has no such part): see `cg_prelude_net`.
 const PART_NET: u64 = 24;
+/// Not in any target's list either: see `cg_prelude_sandbox`.
+const PART_SANDBOX: u64 = 25;
 /// Not in any target's list either: see `cg_prelude_f64`.
 const PART_F64: u64 = 26;
 /// Not in any target's list either: see `cg_prelude_sys`.
@@ -3086,6 +3231,7 @@ fn cg_part_name(id: u64) -> Str {
   if id == PART_USER_A64 { return "user_a64"; }
   if id == PART_DMA_A64 { return "dma_a64"; }
   if id == PART_NET { return "net"; }
+  if id == PART_SANDBOX { return "sandbox"; }
   if id == PART_F64 { return "f64"; }
   if id == PART_SYS { return "sys"; }
   if id == PART_CODE { return "code"; }
@@ -3119,6 +3265,7 @@ fn cg_part(out: &mut Vec[u64], id: u64) {
   else if id == PART_USER_A64 { cg_prelude_user_a64(&mut out); }
   else if id == PART_DMA_A64 { cg_prelude_dma_a64(&mut out); }
   else if id == PART_NET { cg_prelude_net(&mut out); }
+  else if id == PART_SANDBOX { cg_prelude_sandbox(&mut out); }
   else if id == PART_F64 { cg_prelude_f64(&mut out); }
   else if id == PART_SYS { cg_prelude_sys(&mut out); }
   else if id == PART_CODE { cg_prelude_code(&mut out); }
