@@ -81,6 +81,7 @@
   - [core/wtext.bastio](lib-core-wtext.md)
   - [core/wgnoise.bastio](lib-core-wgnoise.md)
   - [std/dns.bastio](lib-std-dns.md)
+  - [std/f64.bastio](lib-std-f64.md)
   - [std/host.bastio](lib-std-host.md)
   - [std/net.bastio](lib-std-net.md)
   - [std/http.bastio](lib-std-http.md)
