@@ -24,6 +24,9 @@ backend: c
 | [`os_mono_ns`](#os_mono_ns) | The monotonic clock in nanoseconds (for measuring time and timers; its zero is some moment in the past). |
 | [`os_time_ns`](#os_time_ns) | The time in nanoseconds since 1970-01-01 UTC (`Date.now()` is this divided by a million). |
 | [`os_cpu_ns`](#os_cpu_ns) | The processor time the program has used, in nanoseconds. |
+| [`os_tz`](#os_tz) | The local time zone at `secs` seconds since 1970 (UTC; a time before 1970 is its two's complement), from the `TZ` variable or the system's zone files. |
+| [`os_tz_east`](#os_tz_east) | How many seconds east of UTC the zone `os_tz` returned is (0 if it is west). |
+| [`os_tz_west`](#os_tz_west) | How many seconds west of UTC the zone `os_tz` returned is (0 if it is east). |
 | [`os_stat_at`](#os_stat_at) | What the file at `path` is (following symbolic links when `follow`). |
 | [`os_stat`](#os_stat) | What the file at `path` is, following symbolic links. |
 | [`os_list`](#os_list) | The entries of the directory at `path` (not `.` and `..`), into `out` (replacing it). |
@@ -49,6 +52,22 @@ Every example below is built, verified and run by `tests/run.sh`. An `assert` in
 ```bastio
 const OS_FAIL: u64 = 18446744073709551615;
 ```
+
+### `OS_TZ_BIAS`
+
+```bastio
+const OS_TZ_BIAS: u64 = 172800;
+```
+
+Added to the offset `os_tz` returns, so that a zone west of UTC is not negative.
+
+### `OS_TZ_DST`
+
+```bastio
+const OS_TZ_DST: u64 = 4294967296;
+```
+
+Added to what `os_tz` returns while summer time is in force.
 
 ### `OS_READ`
 
@@ -291,6 +310,57 @@ Example:
 
 ```bastio
 if os_cpu_ns(host) == OS_FAIL { return 1; }
+```
+
+### `os_tz`
+
+```bastio
+fn os_tz(h: &Host, secs: u64, name: &mut Bytes) -> u64
+```
+
+The local time zone at `secs` seconds since 1970 (UTC; a time before 1970
+is its two's complement), from the `TZ` variable or the system's zone
+files: `name` is replaced with its abbreviation (such as `JST`), and the
+result is the offset east of UTC in seconds plus `OS_TZ_BIAS`, with
+`OS_TZ_DST` added while summer time is in force (`OS_FAIL` if it cannot be
+told). `os_tz_east` and `os_tz_west` take the offset apart.
+
+Example:
+
+```bastio
+let mut name = balloc(0);
+let z = os_tz(host, 1700000000, &mut name);
+bfree(name);
+if z == OS_FAIL { return 1; }
+if os_tz_east(z) > 93600 || os_tz_west(z) > 93600 { return 1; }
+```
+
+### `os_tz_east`
+
+```bastio
+fn os_tz_east(z: u64) -> u64
+```
+
+How many seconds east of UTC the zone `os_tz` returned is (0 if it is west).
+
+Example:
+
+```bastio
+if os_tz_east(OS_TZ_BIAS + 32400) != 32400 { return 1; }
+```
+
+### `os_tz_west`
+
+```bastio
+fn os_tz_west(z: u64) -> u64
+```
+
+How many seconds west of UTC the zone `os_tz` returned is (0 if it is east).
+
+Example:
+
+```bastio
+if os_tz_west(OS_TZ_BIAS - 18000 + OS_TZ_DST) != 18000 { return 1; }
 ```
 
 ### `os_stat_at`
