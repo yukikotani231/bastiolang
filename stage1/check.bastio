@@ -113,7 +113,16 @@ struct Checker {
   inv: bool,
   /// Checking the argument of `old(..)` in a loop invariant, which may
   /// name only parameters (they alone have a value at the call).
-  old_only: bool
+  old_only: bool,
+  /// The functions named by `stencil(f)`, in the order first seen: f's
+  /// number is its index here. Machine code built by `code_build` may call
+  /// them (stage1 only).
+  stencils: Vec[u64],
+  /// The type `T` every stencil takes as `&mut T` first, and `code_call`
+  /// lends (0 until one is seen).
+  stencil_ctx: u64,
+  /// The instances that call `code_call`: each may call every stencil.
+  code_callers: Vec[u64]
 }
 
 struct Edge { from: u64, to: u64 }
@@ -143,6 +152,8 @@ fn checker_free(c: Checker) {
   vec_free(c.lsites);
   vec_free(c.emsg);
   vec_free(c.enotes);
+  vec_free(c.stencils);
+  vec_free(c.code_callers);
 }
 
 fn bsig(c: &mut Checker, name: Str, avail: u64, np: u64, p0: u64, p1: u64, p2: u64, p3: u64, ret: u64) {
@@ -185,7 +196,8 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
     paths: paths, pix: ix_new(), cix: ix_new(), bix: ix_new(), vars: vec_new[Var](), moved: vec_new[u64](), mlocs: vec_new[u64](), bound: vec_new[u64](),
     target: target, arch: ARCH_X86_64, ret: un, env: 0, spec_lim: 0, spec_pos: 0, tu64: u, tbool: b, tunit: un, tstr: st,
     failed: false, efile: 0, eline: 0, ecol: 0, ecode: 0, emsg: vec_new[u64](), enotes: vec_new[u64](), int_ops: vec_new[IntOp](),
-    calls: vec_new[Edge](), lsites: vec_new[LockSite](), nparams: 0, inv: false, old_only: false
+    calls: vec_new[Edge](), lsites: vec_new[LockSite](), nparams: 0, inv: false, old_only: false,
+    stencils: vec_new[u64](), stencil_ctx: 0, code_callers: vec_new[u64]()
   };
   let buf = prim(&mut m, p, TY_BUF);
   let byt = prim(&mut m, p, TY_BYTES);
@@ -261,6 +273,10 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   bsig(&mut c, "host_cpus", AV_HOSTED, 1, rhst, 0, 0, 0, u);
   bsig5(&mut c, "host_net", AV_HOSTED, rhst, u, u, u, mbyt, u);
   bsig(&mut c, "host_spawn", AV_HOSTED, 2, rhst, rvbyt, 0, 0, chd);
+  let vu = intern(&mut m, p, TY_VEC, u);
+  let rvu = ref_to(&mut m, p, vu);
+  bsig(&mut c, "code_build", AV_HOSTED, 2, rhst, rvu, 0, 0, u);
+  bsig(&mut c, "code_free", AV_HOSTED, 2, rhst, u, 0, 0, un);
   bsig(&mut c, "child_write", AV_HOSTED, 2, mchd, rbyt, 0, 0, b);
   bsig(&mut c, "child_close", AV_HOSTED, 1, mchd, 0, 0, 0, un);
   bsig(&mut c, "child_read_line", AV_HOSTED, 2, mchd, mbyt, 0, 0, b);
@@ -1087,9 +1103,14 @@ fn is_pt_borrow_builtin(p: &Parser, s: u64, e: u64) -> bool {
   return span_is(p, s, e, "pt_borrow") || span_is(p, s, e, "pt_borrow_frame");
 }
 
+/// The builtins for machine code built from plans (stage1, C backend only).
+fn is_code_builtin(p: &Parser, s: u64, e: u64) -> bool {
+  return span_is(p, s, e, "stencil") || span_is(p, s, e, "code_call") || span_is(p, s, e, "code_build") || span_is(p, s, e, "code_free");
+}
+
 fn is_builtin_name(c: &Checker, p: &Parser, s: u64, e: u64) -> bool {
   return span_is(p, s, e, "box") || span_is(p, s, e, "try_box") || span_is(p, s, e, "unbox") || span_is(p, s, e, "cast") || span_is(p, s, e, "wrap")
-    || span_is(p, s, e, "smp_run") || is_pt_borrow_builtin(p, s, e) || is_lock_builtin(p, s, e) || is_atomic_builtin(p, s, e)
+    || span_is(p, s, e, "smp_run") || span_is(p, s, e, "stencil") || span_is(p, s, e, "code_call") || is_pt_borrow_builtin(p, s, e) || is_lock_builtin(p, s, e) || is_atomic_builtin(p, s, e)
     || is_vec_builtin(p, s, e) || is_wrap_builtin(p, s, e) || bs_index(c, p, s, e) != 0;
 }
 
@@ -2240,6 +2261,20 @@ fn check_program(c: &mut Checker, m: &mut Mono, p: &Parser) {
     j = j + 1;
   }
   if !c.failed {
+    // Machine code from `code_build` may call any stencil, so each
+    // `code_call` counts as a call of every one of them.
+    let me = c.env;
+    let mut a = 0;
+    while a < vec_len(c.code_callers) {
+      c.env = vec_get(c.code_callers, a);
+      let mut b = 0;
+      while b < vec_len(c.stencils) {
+        note_call(&mut c, vec_get(c.stencils, b));
+        b = b + 1;
+      }
+      a = a + 1;
+    }
+    c.env = me;
     lock_order(&mut c, m, p);
   }
 }
@@ -3834,6 +3869,12 @@ fn ck_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
   if is_pt_borrow_builtin(p, s, e) {
     return pt_borrow_call(&mut c, &mut m, p, i);
   }
+  if span_is(p, s, e, "stencil") {
+    return stencil_call(&mut c, &mut m, p, i);
+  }
+  if span_is(p, s, e, "code_call") {
+    return code_call_call(&mut c, &mut m, p, i);
+  }
   let d = plain_fn(p, s, e);
   if d == 0 {
     if cm_new(&mut c, p, i, C_TYPE) {
@@ -4226,6 +4267,151 @@ fn smp_run_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
   let t = call_with_v(&mut c, &mut m, p, ps, r, args, i, x);
   vec_free(ps);
   vec_free(args);
+  return t;
+}
+
+/// `stencil(f)` (hosted, stage1 only): f's number in the program's stencil
+/// table, the functions machine code built by `code_build` may call. Each
+/// must be `fn(ctx: &mut T, a: u64, b: u64, c: u64, d: u64) -> u64` for one
+/// struct `T` shared by all of them, not generic, without `requires`: the
+/// machine code passes whatever numbers its plan holds, which no proof
+/// constrains.
+fn stencil_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
+  if c.target != TARGET_HOSTED {
+    if cm_new(&mut c, p, i, C_TARGET) {
+      cm_s(&mut c, "`stencil` is not available on this target");
+    }
+    return 0;
+  }
+  let n = node_at(p.nodes, i);
+  if list_len(p, n.a) != 1 {
+    cm_arity(&mut c, p, i, 1);
+    return 0;
+  }
+  let x = named_fn(&mut c, &mut m, p, i, n.a);
+  if c.failed {
+    return 0;
+  }
+  let xi = inst_at(m, x);
+  let dn = node_at(p.nodes, xi.def);
+  if dn.v != 0 || dn.c != 0 {
+    if cm_new(&mut c, p, n.a, C_TYPE) {
+      cm_s(&mut c, "`");
+      cm_inst(&mut c, m, p, x);
+      if dn.v != 0 {
+        cm_s(&mut c, "` cannot be a stencil: it is generic");
+      } else {
+        cm_s(&mut c, "` cannot be a stencil: it has a `requires`");
+        cm_note(&mut c, "machine code calls a stencil with whatever numbers its plan holds, so nothing can be assumed of them; check them in the body instead");
+      }
+    }
+    return 0;
+  }
+  let ps = fn_params(&mut m, p, xi.def, x);
+  let r = conv(&mut m, p, dn.b, x, xi.def);
+  let mut ok = vec_len(ps) == 5 && r == c.tu64 && kind_t(m, u_at(ps, 0)) == TY_MUTREF
+    && kind_t(m, inner_t(m, u_at(ps, 0))) == TY_STRUCT;
+  let mut j = 1;
+  while ok && j < 5 {
+    ok = u_at(ps, j) == c.tu64;
+    j = j + 1;
+  }
+  let mut ctx = 0;
+  if ok {
+    ctx = inner_t(m, u_at(ps, 0));
+  }
+  vec_free(ps);
+  if !ok {
+    if cm_new(&mut c, p, n.a, C_TYPE) {
+      cm_s(&mut c, "`");
+      cm_inst(&mut c, m, p, x);
+      cm_s(&mut c, "` cannot be a stencil: it must take `&mut T` for a struct `T`, then four `u64`, and return `u64`");
+    }
+    return 0;
+  }
+  if !stencil_ctx_is(&mut c, m, p, n.a, ctx) {
+    return 0;
+  }
+  let mut k = 0;
+  while k < vec_len(c.stencils) && vec_get(c.stencils, k) != x {
+    k = k + 1;
+  }
+  if k == vec_len(c.stencils) {
+    vec_push(&mut c.stencils, x);
+  }
+  return c.tu64;
+}
+
+/// Records `ctx` as the stencils' context type, or reports (at `loc`) that
+/// it differs from the one already seen.
+fn stencil_ctx_is(c: &mut Checker, m: &Mono, p: &Parser, loc: u64, ctx: u64) -> bool {
+  if c.stencil_ctx == 0 {
+    c.stencil_ctx = ctx;
+    return true;
+  }
+  if c.stencil_ctx == ctx {
+    return true;
+  }
+  if cm_new(&mut c, p, loc, C_TYPE) {
+    cm_s(&mut c, "every stencil and `code_call` must use one context type: this is ");
+    cm_ty(&mut c, m, p, ctx);
+    cm_s(&mut c, ", another is ");
+    cm_ty(&mut c, m, p, c.stencil_ctx);
+  }
+  return false;
+}
+
+/// `code_call(code, &mut ctx, entry)` (hosted, stage1 only): runs the
+/// machine code `code_build` made, from entry point `entry`, lending it
+/// `ctx`, and returns what the code returns. The code can only call
+/// stencils (each of which may change `ctx` in any way it could) and branch
+/// within itself.
+fn code_call_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
+  if c.target != TARGET_HOSTED {
+    if cm_new(&mut c, p, i, C_TARGET) {
+      cm_s(&mut c, "`code_call` is not available on this target");
+    }
+    return 0;
+  }
+  let n = node_at(p.nodes, i);
+  if list_len(p, n.a) != 3 {
+    cm_arity(&mut c, p, i, 3);
+    return 0;
+  }
+  let a1 = next_of(p, n.a);
+  let an = node_at(p.nodes, a1);
+  let mut vt = 0;
+  if an.kind == E_MUTBORROW {
+    let pk = list_path(&mut c, p, an.a);
+    if pk != 0 && !c.failed {
+      vt = path_type(&mut c, m, p, pk, i);
+    }
+  }
+  if c.failed {
+    return 0;
+  }
+  if vt == 0 || kind_t(m, vt) != TY_STRUCT {
+    if cm_new(&mut c, p, a1, C_TYPE) {
+      cm_s(&mut c, "the second argument of `code_call` must be `&mut` a struct, the stencils' context");
+    }
+    return 0;
+  }
+  if !stencil_ctx_is(&mut c, m, p, a1, vt) {
+    return 0;
+  }
+  let mut k = 0;
+  while k < vec_len(c.code_callers) && vec_get(c.code_callers, k) != c.env {
+    k = k + 1;
+  }
+  if k == vec_len(c.code_callers) {
+    vec_push(&mut c.code_callers, c.env);
+  }
+  let mut ps = vec_new[u64]();
+  vec_push(&mut ps, c.tu64);
+  vec_push(&mut ps, mut_to(&mut m, p, vt));
+  vec_push(&mut ps, c.tu64);
+  let t = call_with(&mut c, &mut m, p, ps, c.tu64, n.a, i, 0);
+  vec_free(ps);
   return t;
 }
 

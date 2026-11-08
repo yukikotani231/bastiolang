@@ -77,6 +77,7 @@ What will be 0.2.0.
 
 ### Language
 
+- Machine code from plans (stage1, hosted, C backend, x86-64): `stencil(f)` numbers a function `fn(&mut T, u64, u64, u64, u64) -> u64` without `requires` in the program's stencil table; `code_build(h, &plan)` turns a plan (calls of stencils with constant arguments, and branches on their results) into machine code, written read-write and then made read-execute; `code_call(code, &mut ctx, entry)` runs it; `code_free(h, code)` unmaps it. The code can only call proved functions and jump within itself, so a wrong plan computes a wrong result but cannot break memory safety. For JITs (a call-threaded baseline tier). Elsewhere `code_build` returns 0.
 - `try_alloc` and `try_balloc`: allocation that returns an empty buffer when
   memory runs out instead of stopping the program. The prover makes the
   program check the length before using it.
