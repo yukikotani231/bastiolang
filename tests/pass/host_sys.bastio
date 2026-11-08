@@ -1,0 +1,145 @@
+// stage1-only: host_sys (files, descriptors, clocks, poll and epoll)
+// backend: c
+// expect-exit: 0
+// A file written, sought in, read back, stat'ed, listed and removed; a pipe
+// read without blocking, then polled and (on Linux) waited on with epoll.
+import "../../std/os.bastio";
+
+fn main(h: &mut Host) -> u64 {
+  let mut bad = 0;
+  let fail = 18446744073709551615;
+  let dir = bfrom("host_sys.tmpdir");
+  let path = bfrom("host_sys.tmpdir/f.txt");
+  if !os_mkdir(h, dir, 493) {
+    bad = bad | 1;
+  }
+  match os_open(h, path, OS_READ | OS_WRITE | OS_CREATE | OS_TRUNC, 420) {
+    Option::Some(fd) => {
+      let mut hello = bfrom("hello, world");
+      if host_sys(h, 0, fd, 0, &mut hello) != 12 {
+        bad = bad | 2;
+      }
+      // From 7 bytes in, five bytes: "world".
+      if host_sys(h, 4, fd, 7, &mut hello) != 7 {
+        bad = bad | 4;
+      }
+      let mut got = balloc(0);
+      if host_sys(h, 1, fd, 100, &mut got) != 5 || blen(got) != 5 || bget(got, 0) != 119 {
+        bad = bad | 8;
+      }
+      // The end of the file is the size; seeking from the end by -2.
+      if host_sys(h, 5, fd, 18446744073709551614, &mut got) != 10 {
+        bad = bad | 16;
+      }
+      if host_sys(h, 21, fd, 0, &mut got) != 1 || blen(got) != 64 || bget(got, 8) != 12 {
+        bad = bad | 32;
+      }
+      bfree(got);
+      bfree(hello);
+      os_close(h, fd);
+    },
+    Option::None => {
+      bad = bad | 64;
+    },
+  }
+  match os_stat(h, path) {
+    Option::Some(s) => {
+      if s.kind != 1 || s.size != 12 || s.perm & 448 != 384 || s.mtime == 0 {
+        bad = bad | 128;
+      }
+    },
+    Option::None => {
+      bad = bad | 128;
+    },
+  }
+  let mut names = balloc(0);
+  match os_list(h, dir, &mut names) {
+    Option::Some(n) => {
+      // One entry: kind 1, "f.txt", a zero byte.
+      if n != 1 || blen(names) != 7 || bget(names, 0) != 1 || bget(names, 1) != 102 || bget(names, 6) != 0 {
+        bad = bad | 256;
+      }
+    },
+    Option::None => {
+      bad = bad | 256;
+    },
+  }
+  bfree(names);
+  // A directory that is not empty cannot go; ENOTEMPTY is 39 on Linux, 66 on macOS.
+  if os_rmdir(h, dir) || os_errno(h) == 0 {
+    bad = bad | 512;
+  }
+  if !os_unlink(h, path) || !os_rmdir(h, dir) || os_stat(h, dir) is Option::Some {
+    bad = bad | 1024;
+  }
+  // Clocks: monotonic, and the time since 1970 after 2023.
+  let t0 = os_mono_ns(h);
+  let t1 = os_mono_ns(h);
+  if t0 == fail || t1 < t0 || os_time_ns(h) < 1700000000000000000 {
+    bad = bad | 2048;
+  }
+  match os_pipe(h) {
+    Option::Some(p) => {
+      let r = p.start;
+      let w = p.end;
+      let mut got = balloc(0);
+      if !os_nonblock(h, r, true) || os_read(h, r, 8, &mut got) is Option::Some || os_errno(h) == 0 {
+        bad = bad | 4096;
+      }
+      let mut fds = balloc(8);
+      bset(&mut fds, 0, cast[u8](r & 255));
+      bset(&mut fds, 4, 1);   // POLLIN
+      if !(os_poll(h, &mut fds, 0) is Option::Some) || blen(fds) != 8 || bget(fds, 6) != 0 {
+        bad = bad | 8192;
+      }
+      let mut x = bfrom("x");
+      if host_sys(h, 0, w, 0, &mut x) != 1 {
+        bad = bad | 16384;
+      }
+      match os_poll(h, &mut fds, 1000) {
+        Option::Some(n) => {
+          if n != 1 || blen(fds) != 8 || bget(fds, 6) != 1 {
+            bad = bad | 32768;
+          }
+        },
+        Option::None => {
+          bad = bad | 32768;
+        },
+      }
+      // epoll (Linux): the read end is ready, with the data word given.
+      let mut none = balloc(0);
+      let ep = host_sys(h, 53, 0, 0, &mut none);
+      if ep != fail {
+        let mut ev = balloc(12);
+        bset(&mut ev, 0, 1);    // EPOLLIN
+        bset(&mut ev, 4, 42);   // data = 42
+        if host_sys(h, 54, ep, 1 + (r & 65535) * 256, &mut ev) != 0 {
+          bad = bad | 65536;
+        }
+        let mut out = balloc(8);   // no time limit beyond 0 ms
+        if host_sys(h, 55, ep, 4, &mut out) != 1 || blen(out) != 12 || bget(out, 0) != 1 || bget(out, 4) != 42 {
+          bad = bad | 131072;
+        }
+        bfree(out);
+        bfree(ev);
+        os_close(h, ep);
+      }
+      bfree(none);
+      bfree(x);
+      bfree(fds);
+      bfree(got);
+      os_close(h, r);
+      os_close(h, w);
+    },
+    Option::None => {
+      bad = bad | 262144;
+    },
+  }
+  bfree(path);
+  bfree(dir);
+  if bad != 0 {
+    print(bad);
+    return 1;
+  }
+  return 0;
+}

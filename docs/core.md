@@ -95,6 +95,7 @@ Each module has a reference page, generated from its source: every function with
 | [`std/http.bastio`](lib/std-http.md) | HTTP/1.1 over std/net.bastio, for programs on the hosted target. |
 | [`std/https.bastio`](lib/std-https.md) | HTTPS (or any protocol over TLS 1.3) for programs on the hosted target. |
 | [`std/net.bastio`](lib/std-net.md) | TCP sockets for programs on the hosted target (Linux and the other targets whose native or C backend links the C library's socket calls). |
+| [`std/os.bastio`](lib/std-os.md) | The operating system's files and descriptors, clocks, directories and readiness (poll, epoll), for programs on the hosted target, over the `host_sys` builtin. |
 <!-- libref: end -->
 
 ## Gaps

@@ -78,6 +78,7 @@ What will be 0.2.0.
 ### Language
 
 - `f64_*` builtins (stage1, hosted, C backend for now) and `std/f64.bastio`: IEEE 754 doubles as their bits in a `u64`, wrapped in a type `F64`, with arithmetic, `fma`, comparisons that are false with NaN, saturating conversions, the C library's math functions, `strtod` and the shortest round-trip digits. A test program or library can say `// backend: c` to be built that way by `tests/run.sh`.
+- `host_sys(h, op, a, b, buf)` (stage1, hosted, C backend for now) and `std/os.bastio`: descriptors (write, including standard output, read, open, close, seek), the monotonic and real-time clocks in nanoseconds, stat, directory listing, mkdir, rmdir, unlink, chdir, chmod, rename, symlinks, the current and real paths, pipes, non-blocking descriptors, poll and (Linux) epoll.
 - `try_alloc` and `try_balloc`: allocation that returns an empty buffer when
   memory runs out instead of stopping the program. The prover makes the
   program check the length before using it.
