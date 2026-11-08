@@ -1241,6 +1241,9 @@ fn cg_call(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64)
     if is_pt_borrow_builtin(p, n.s, n.e) {
       return cg_pt_borrow(&mut g, c, &mut m, p, i);
     }
+    if name_is(p, i, "stencil") {
+      return cg_stencil(&mut g, c, &mut m, p, i);
+    }
   }
   let xs = cg_args_of(p, i);
   let mut vals = vec_new[CgSp]();
@@ -1263,7 +1266,7 @@ fn cg_call(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64)
     cg_t(&mut g, ".data[");
     cg_sp(&mut g, a1);
     cg_t(&mut g, "])");
-  } else if inst == 0 && bs_index(c, p, n.s, n.e) != 0 {
+  } else if inst == 0 && (bs_index(c, p, n.s, n.e) != 0 || name_is(p, i, "code_call")) {
     cg_t(&mut g, "bst_");
     cg_src(&mut g, p, n.s, n.e);
     cg_t(&mut g, "(");
@@ -2606,6 +2609,45 @@ fn cg_calls(v: &Vec[u64], pat: Str) -> bool {
 
 /// Generates the C file for the program monomorphized into `m` and checked
 /// by `c`, into `g.out`.
+/// The stencil table `code_build` reads: the functions `stencil(f)`
+/// names, in their numbers' order.
+fn cg_stencil_tab(g: &mut Cg, c: &Checker, m: &Mono, p: &Parser) {
+  let start = cg_mark(g);
+  cg_t(&mut g, "#define BST_NSTENCILS UINT64_C(");
+  cg_n(&mut g, vec_len(c.stencils));
+  cg_t(&mut g, ")\nstatic const bst_stencil_fn bst_stencil_tab[] = {");
+  let mut k = 0;
+  while k < vec_len(c.stencils) {
+    if k > 0 {
+      cg_t(&mut g, ",");
+    }
+    cg_t(&mut g, " (bst_stencil_fn)");
+    cg_fname(&mut g, m, p, vec_get(c.stencils, k));
+    k = k + 1;
+  }
+  if k == 0 {
+    cg_t(&mut g, " 0");
+  }
+  cg_t(&mut g, " };\n");
+  cg_to_out(&mut g, start);
+}
+
+/// `stencil(f)`: f's number in the stencil table, a constant.
+fn cg_stencil(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp {
+  let n = node_at(p.nodes, i);
+  let fnode = node_at(p.nodes, n.a);
+  let x = plain_inst(&mut m, plain_fn(p, fnode.s, fnode.e));
+  let mut k = 0;
+  while k < vec_len(c.stencils) && vec_get(c.stencils, k) != x {
+    k = k + 1;
+  }
+  let start = cg_mark(g);
+  cg_t(&mut g, "UINT64_C(");
+  cg_n(&mut g, k);
+  cg_t(&mut g, ")");
+  return cg_span(g, start);
+}
+
 fn cg_program(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser) {
   let mut k = 0;
   while k < vec_len(m.fns) {
@@ -2622,6 +2664,10 @@ fn cg_program(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser) {
   if g.target == TARGET_HOSTED && cg_calls(g.body, "bst_host_sys(") {
     cg_part(&mut g.out, PART_SYS);
   }
+  let code = g.target == TARGET_HOSTED && cg_calls(g.body, "bst_code_");
+  if code {
+    cg_part(&mut g.out, PART_CODE);
+  }
   cg_types(&mut g, c, m, p);
   cg_helpers(&mut g, m, p);
   cg_blobs(&mut g, p);
@@ -2632,6 +2678,9 @@ fn cg_program(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser) {
     cg_t(&mut g, ";\n");
     cg_to_out(&mut g, start);
     k = k + 1;
+  }
+  if code {
+    cg_stencil_tab(&mut g, c, m, p);
   }
   k = 0;
   while k < vec_len(g.smp) {

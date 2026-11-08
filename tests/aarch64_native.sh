@@ -56,7 +56,7 @@ both() {
 }
 export -f both
 lost=0
-pfor both $(s1files tests/pass/*.bastio bench/*.bastio) || lost=1
+pfor both $(cfiles tests/pass/*.bastio bench/*.bastio) || lost=1
 # A copy to or from a page lent to a device is ordered both ways (`dmb osh`,
 # as the C prelude's bytes_to_dma and dma_to_bytes are): two copies, four
 # barriers, besides the two full ones of dma_lend and dma_take.
