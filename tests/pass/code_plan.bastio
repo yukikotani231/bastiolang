@@ -1,0 +1,95 @@
+// stage1-only: code_build, code_call and stencil (machine code from plans)
+// backend: c
+// expect-exit: 0
+// A plan that sums 0..999 by calling stencils in a loop, an entry point that
+// does not exist, a freed region, and a plan naming a stencil the table does
+// not have. Where there is no machine code (code_build gives 0) it checks only
+// that every call returns 0.
+struct Vm { regs: Vec[u64] }
+
+fn reg(vm: &Vm, r: u64) -> u64 {
+  if r < vec_len(vm.regs) {
+    return vec_get(vm.regs, r);
+  }
+  return 0;
+}
+
+fn op_set(vm: &mut Vm, a: u64, b: u64, c: u64, d: u64) -> u64 {
+  if a < vec_len(vm.regs) {
+    vec_set(&mut vm.regs, a, b);
+  }
+  return 0;
+}
+
+fn op_add(vm: &mut Vm, a: u64, b: u64, c: u64, d: u64) -> u64 {
+  let x = wrap_add(reg(vm, b), reg(vm, c));
+  if a < vec_len(vm.regs) {
+    vec_set(&mut vm.regs, a, x);
+  }
+  return 0;
+}
+
+fn op_lt(vm: &mut Vm, a: u64, b: u64, c: u64, d: u64) -> u64 {
+  if reg(vm, a) < reg(vm, b) {
+    return 1;
+  }
+  return 0;
+}
+
+fn op_get(vm: &mut Vm, a: u64, b: u64, c: u64, d: u64) -> u64 {
+  return reg(vm, a);
+}
+
+fn item(plan: &mut Vec[u64], a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) {
+  vec_push(&mut plan, a); vec_push(&mut plan, b); vec_push(&mut plan, c);
+  vec_push(&mut plan, d); vec_push(&mut plan, e); vec_push(&mut plan, f);
+}
+
+fn main(host: &mut Host) -> u64 {
+  let mut vm = Vm { regs: vec_new[u64]() };
+  let mut i = 0;
+  while i < 8 {
+    vec_push(&mut vm.regs, 0);
+    i = i + 1;
+  }
+  let set = stencil(op_set);
+  let add = stencil(op_add);
+  let lt = stencil(op_lt);
+  let get = stencil(op_get);
+  let mut plan = vec_new[u64]();
+  vec_push(&mut plan, 7);       // ENTRY 2
+  vec_push(&mut plan, 2);
+  item(&mut plan, 0, set, 0, 0, 0, 0);      // 2: r0 = 0
+  item(&mut plan, 0, set, 1, 0, 0, 0);      // 8: r1 = 0
+  item(&mut plan, 0, set, 2, 1, 0, 0);      // 14: r2 = 1
+  item(&mut plan, 0, set, 4, 1000, 0, 0);   // 20: r4 = 1000
+  item(&mut plan, 0, lt, 0, 4, 0, 0);       // 26: r0 < r4 ?
+  vec_push(&mut plan, 1);                   // 32: BRZ 48
+  vec_push(&mut plan, 48);
+  item(&mut plan, 0, add, 1, 1, 0, 0);      // 34: r1 = r1 + r0
+  item(&mut plan, 0, add, 0, 0, 2, 0);      // 40: r0 = r0 + r2
+  vec_push(&mut plan, 4);                   // 46: JMP 26
+  vec_push(&mut plan, 26);
+  item(&mut plan, 0, get, 1, 0, 0, 0);      // 48: return r1
+  vec_push(&mut plan, 5);
+  let code = code_build(host, plan);
+  let r = code_call(code, &mut vm, 0);
+  let missing = code_call(code, &mut vm, 1);
+  code_free(host, code);
+  let freed = code_call(code, &mut vm, 0);
+  // A plan that names a stencil the table does not have builds nothing.
+  item(&mut plan, 0, 99, 0, 0, 0, 0);
+  let bad = code_build(host, plan);
+  vec_free(plan);
+  vec_free(vm.regs);
+  if bad != 0 || missing != 0 || freed != 0 {
+    return 2;
+  }
+  if code == 0 {
+    return 0;                   // no machine code on this platform
+  }
+  if r != 499500 {
+    return 1;
+  }
+  return 0;
+}

@@ -1044,6 +1044,237 @@ fn cg_prelude_f64(out: &mut Vec[u64]) {
   w_s(&mut out, "static uint64_t bst_f64_fmt_f(uint64_t a, uint64_t prec, bst_bytes *out) { return bst_f64_fmt(a, prec, out, 0); }\n");
 }
 
+/// The prelude part for `code_build`, `code_call` and `code_free` (stage1
+/// only): added after the hosted prelude, and only to a program that calls
+/// them. `bst_stencil_tab` and `BST_NSTENCILS` are the stencil table, which
+/// the code generator writes after the prototypes.
+fn cg_prelude_code(out: &mut Vec[u64]) {
+  w_s(&mut out, "/* code_build, code_call and code_free (stage1, hosted): machine code built\n");
+  w_s(&mut out, " * from a plan that can only call the program's stencils (proved Bastio\n");
+  w_s(&mut out, " * functions, numbered by stencil(f)) and branch within itself. The plan is a\n");
+  w_s(&mut out, " * list of items, each an opcode word and its operands:\n");
+  w_s(&mut out, " *   0 CALL k a b c d   call stencil k with (ctx, a, b, c, d); its result is\n");
+  w_s(&mut out, " *                      the current value (0 when the code is entered)\n");
+  w_s(&mut out, " *   1 BRZ L, 2 BRNZ L  go to item L if the current value is 0 / is not 0\n");
+  w_s(&mut out, " *   3 BREQ v L         go to item L if the current value is v\n");
+  w_s(&mut out, " *   4 JMP L            go to item L\n");
+  w_s(&mut out, " *   5 RET, 6 RETI v    return the current value / v\n");
+  w_s(&mut out, " *   7 ENTRY L          entry point n (counting ENTRY items) starts at item L\n");
+  w_s(&mut out, " * L is the word offset of an item in the plan. Running off the end returns\n");
+  w_s(&mut out, " * the current value. A plan that breaks a rule (an unknown opcode, a missing\n");
+  w_s(&mut out, " * operand, k outside the table, L not an item) builds nothing: the id is 0.\n");
+  w_s(&mut out, " * Pages are written while read-write, then made read-execute: never both\n");
+  w_s(&mut out, " * (W^X). An id is never reused; calling a freed or unknown id, or an entry\n");
+  w_s(&mut out, " * that does not exist, returns 0, and a region freed while it runs is\n");
+  w_s(&mut out, " * unmapped when the last call into it returns. x86-64 on Linux, macOS and\n");
+  w_s(&mut out, " * the BSDs; elsewhere code_build returns 0, so programs fall back on what\n");
+  w_s(&mut out, " * they would do without machine code. Not thread-safe. */\n");
+  w_s(&mut out, "typedef void (*bst_stencil_fn)(void);\n");
+  w_s(&mut out, "typedef struct { unsigned char *mem; size_t size; uint64_t nentry; uint32_t *entry; uint64_t running; int freed; } bst_code_region;\n");
+  w_s(&mut out, "static bst_code_region *bst_codes;\n");
+  w_s(&mut out, "static uint64_t bst_ncodes, bst_capcodes;\n");
+  w_s(&mut out, "#if defined(__x86_64__) && (defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__))\n");
+  w_s(&mut out, "#include <sys/mman.h>\n");
+  w_s(&mut out, "#include <unistd.h>\n");
+  w_s(&mut out, "#ifndef MAP_ANONYMOUS              /* hidden by _POSIX_C_SOURCE alone */\n");
+  w_s(&mut out, "#ifdef __linux__\n");
+  w_s(&mut out, "#define MAP_ANONYMOUS 0x20\n");
+  w_s(&mut out, "#else\n");
+  w_s(&mut out, "#define MAP_ANONYMOUS 0x1000\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "#define BST_CODE_X86 1\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "#ifdef BST_CODE_X86\n");
+  w_s(&mut out, "#define BST_CODE_STUB 11u\n");
+  w_s(&mut out, "/* The length of the item at plan[i] (0: not a valid item). */\n");
+  w_s(&mut out, "static uint64_t bst_code_ilen(const uint64_t *w, uint64_t n, uint64_t i) {\n");
+  w_s(&mut out, "    static const uint64_t lens[8] = { 6, 2, 2, 3, 2, 1, 2, 2 };\n");
+  w_s(&mut out, "    if (i >= n || w[i] > 7 || lens[w[i]] > n - i) return 0;\n");
+  w_s(&mut out, "    return lens[w[i]];\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "static unsigned bst_code_imm(uint64_t x) { return x <= 0xffffffffu ? 5u : 10u; }\n");
+  w_s(&mut out, "/* The machine code bytes of the item at plan[i]. */\n");
+  w_s(&mut out, "static uint64_t bst_code_isize(const uint64_t *w, uint64_t i) {\n");
+  w_s(&mut out, "    switch (w[i]) {\n");
+  w_s(&mut out, "    case 0: return 3 + bst_code_imm(w[i + 2]) + bst_code_imm(w[i + 3]) + bst_code_imm(w[i + 4])\n");
+  w_s(&mut out, "                 + (w[i + 5] <= 0xffffffffu ? 6u : 10u) + 12;\n");
+  w_s(&mut out, "    case 1: case 2: return 9;\n");
+  w_s(&mut out, "    case 3: return (w[i + 1] < 0x80000000u ? 6u : 13u) + 6;\n");
+  w_s(&mut out, "    case 4: return 5;\n");
+  w_s(&mut out, "    case 5: return 2;\n");
+  w_s(&mut out, "    case 6: return bst_code_imm(w[i + 1]) + 2;\n");
+  w_s(&mut out, "    default: return 0;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "static void bst_code_put(unsigned char **p, const char *bytes, unsigned n) { memcpy(*p, bytes, n); *p += n; }\n");
+  w_s(&mut out, "static void bst_code_u32(unsigned char **p, uint32_t x) { memcpy(*p, &x, 4); *p += 4; }\n");
+  w_s(&mut out, "static void bst_code_u64(unsigned char **p, uint64_t x) { memcpy(*p, &x, 8); *p += 8; }\n");
+  w_s(&mut out, "/* mov $x into the register of mov-immediate opcode op (%eax..%edi), in 32\n");
+  w_s(&mut out, " * bits (which clears the top half) when x fits. */\n");
+  w_s(&mut out, "static void bst_code_mov(unsigned char **p, unsigned op, uint64_t x) {\n");
+  w_s(&mut out, "    if (x <= 0xffffffffu) {\n");
+  w_s(&mut out, "        *(*p)++ = (unsigned char)op;\n");
+  w_s(&mut out, "        bst_code_u32(p, (uint32_t)x);\n");
+  w_s(&mut out, "    } else {\n");
+  w_s(&mut out, "        *(*p)++ = 0x48;\n");
+  w_s(&mut out, "        *(*p)++ = (unsigned char)op;\n");
+  w_s(&mut out, "        bst_code_u64(p, x);\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "static void bst_code_rel(unsigned char **p, const unsigned char *mem, const uint32_t *off, uint64_t l) {\n");
+  w_s(&mut out, "    int64_t d = (int64_t)off[l] - (int64_t)((*p + 4) - mem);\n");
+  w_s(&mut out, "    bst_code_u32(p, (uint32_t)(int32_t)d);\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "static uint64_t bst_code_build_(bst_host h, bst_vec plan, const bst_stencil_fn *tab, uint64_t ntab) {\n");
+  w_s(&mut out, "    (void)h;\n");
+  w_s(&mut out, "#ifdef BST_CODE_X86\n");
+  w_s(&mut out, "    const uint64_t *w = (const uint64_t *)plan.data;\n");
+  w_s(&mut out, "    uint64_t n = plan.len, i, nentry = 0;\n");
+  w_s(&mut out, "    if (n == 0 || n > (1u << 24)) return 0;\n");
+  w_s(&mut out, "    /* Pass 1: every item well formed; each item's code offset. */\n");
+  w_s(&mut out, "    uint32_t *off = (uint32_t *)calloc(n + 1, sizeof(uint32_t));\n");
+  w_s(&mut out, "    unsigned char *start = (unsigned char *)calloc(n + 1, 1);\n");
+  w_s(&mut out, "    if (!off || !start) { free(off); free(start); return 0; }\n");
+  w_s(&mut out, "    for (i = 0; i < n; i += bst_code_ilen(w, n, i)) {\n");
+  w_s(&mut out, "        uint64_t l = bst_code_ilen(w, n, i);\n");
+  w_s(&mut out, "        if (l == 0 || (w[i] == 0 && w[i + 1] >= ntab)) { free(off); free(start); return 0; }\n");
+  w_s(&mut out, "        start[i] = 1;\n");
+  w_s(&mut out, "        if (w[i] == 7) nentry++;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    start[n] = 1;\n");
+  w_s(&mut out, "    uint64_t size = BST_CODE_STUB * nentry;\n");
+  w_s(&mut out, "    for (i = 0; i < n; i += bst_code_ilen(w, n, i)) {\n");
+  w_s(&mut out, "        off[i] = (uint32_t)size;\n");
+  w_s(&mut out, "        size += bst_code_isize(w, i);\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    off[n] = (uint32_t)size;\n");
+  w_s(&mut out, "    size += 2;\n");
+  w_s(&mut out, "    /* Pass 2: every label an item (or the end). */\n");
+  w_s(&mut out, "    for (i = 0; i < n; i += bst_code_ilen(w, n, i)) {\n");
+  w_s(&mut out, "        uint64_t l = 0;\n");
+  w_s(&mut out, "        int lab = 1;\n");
+  w_s(&mut out, "        if (w[i] == 1 || w[i] == 2 || w[i] == 4 || w[i] == 7) l = w[i + 1];\n");
+  w_s(&mut out, "        else if (w[i] == 3) l = w[i + 2];\n");
+  w_s(&mut out, "        else lab = 0;\n");
+  w_s(&mut out, "        if (lab && (l > n || !start[l])) { free(off); free(start); return 0; }\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    free(start);\n");
+  w_s(&mut out, "    long pg = sysconf(_SC_PAGESIZE);\n");
+  w_s(&mut out, "    if (pg <= 0) pg = 4096;\n");
+  w_s(&mut out, "    size_t mapped = (size_t)((size + (uint64_t)pg - 1) / (uint64_t)pg * (uint64_t)pg);\n");
+  w_s(&mut out, "    void *m = mmap(NULL, mapped, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);\n");
+  w_s(&mut out, "    uint32_t *entry = (uint32_t *)malloc((nentry ? nentry : 1) * sizeof(uint32_t));\n");
+  w_s(&mut out, "    if (m == MAP_FAILED || !entry) { if (m != MAP_FAILED) munmap(m, mapped); free(entry); free(off); return 0; }\n");
+  w_s(&mut out, "    unsigned char *mem = (unsigned char *)m, *p = mem;\n");
+  w_s(&mut out, "    /* The entry stubs: save rbx, keep ctx in it, current value 0. */\n");
+  w_s(&mut out, "    uint64_t e = 0;\n");
+  w_s(&mut out, "    for (i = 0; i < n; i += bst_code_ilen(w, n, i)) {\n");
+  w_s(&mut out, "        if (w[i] != 7) continue;\n");
+  w_s(&mut out, "        entry[e++] = (uint32_t)(p - mem);\n");
+  w_s(&mut out, "        bst_code_put(&p, \"\\x53\\x48\\x89\\xfb\\x31\\xc0\\xe9\", 7);   /* push %rbx; mov %rdi,%rbx; xor %eax,%eax; jmp */\n");
+  w_s(&mut out, "        bst_code_rel(&p, mem, off, w[i + 1]);\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    for (i = 0; i < n; i += bst_code_ilen(w, n, i)) {\n");
+  w_s(&mut out, "        switch (w[i]) {\n");
+  w_s(&mut out, "        case 0:\n");
+  w_s(&mut out, "            bst_code_put(&p, \"\\x48\\x89\\xdf\", 3);                   /* mov %rbx,%rdi */\n");
+  w_s(&mut out, "            bst_code_mov(&p, 0xbe, w[i + 2]);                     /* %rsi */\n");
+  w_s(&mut out, "            bst_code_mov(&p, 0xba, w[i + 3]);                     /* %rdx */\n");
+  w_s(&mut out, "            bst_code_mov(&p, 0xb9, w[i + 4]);                     /* %rcx */\n");
+  w_s(&mut out, "            if (w[i + 5] <= 0xffffffffu) {                           /* %r8 */\n");
+  w_s(&mut out, "                bst_code_put(&p, \"\\x41\\xb8\", 2); bst_code_u32(&p, (uint32_t)w[i + 5]);\n");
+  w_s(&mut out, "            } else {\n");
+  w_s(&mut out, "                bst_code_put(&p, \"\\x49\\xb8\", 2); bst_code_u64(&p, w[i + 5]);\n");
+  w_s(&mut out, "            }\n");
+  w_s(&mut out, "            bst_code_put(&p, \"\\x48\\xb8\", 2);                       /* movabs $fn,%rax */\n");
+  w_s(&mut out, "            bst_code_u64(&p, (uint64_t)(uintptr_t)tab[w[i + 1]]);\n");
+  w_s(&mut out, "            bst_code_put(&p, \"\\xff\\xd0\", 2);                       /* call *%rax */\n");
+  w_s(&mut out, "            break;\n");
+  w_s(&mut out, "        case 1: case 2:\n");
+  w_s(&mut out, "            bst_code_put(&p, \"\\x48\\x85\\xc0\\x0f\", 4);               /* test %rax,%rax; jz / jnz */\n");
+  w_s(&mut out, "            *p++ = w[i] == 1 ? 0x84 : 0x85;\n");
+  w_s(&mut out, "            bst_code_rel(&p, mem, off, w[i + 1]);\n");
+  w_s(&mut out, "            break;\n");
+  w_s(&mut out, "        case 3:\n");
+  w_s(&mut out, "            if (w[i + 1] < 0x80000000u) {\n");
+  w_s(&mut out, "                bst_code_put(&p, \"\\x48\\x3d\", 2); bst_code_u32(&p, (uint32_t)w[i + 1]);   /* cmp $v,%rax */\n");
+  w_s(&mut out, "            } else {\n");
+  w_s(&mut out, "                bst_code_put(&p, \"\\x48\\xb9\", 2); bst_code_u64(&p, w[i + 1]);             /* movabs $v,%rcx */\n");
+  w_s(&mut out, "                bst_code_put(&p, \"\\x48\\x39\\xc8\", 3);                                     /* cmp %rcx,%rax */\n");
+  w_s(&mut out, "            }\n");
+  w_s(&mut out, "            bst_code_put(&p, \"\\x0f\\x84\", 2);                       /* je */\n");
+  w_s(&mut out, "            bst_code_rel(&p, mem, off, w[i + 2]);\n");
+  w_s(&mut out, "            break;\n");
+  w_s(&mut out, "        case 4:\n");
+  w_s(&mut out, "            *p++ = 0xe9;                                             /* jmp */\n");
+  w_s(&mut out, "            bst_code_rel(&p, mem, off, w[i + 1]);\n");
+  w_s(&mut out, "            break;\n");
+  w_s(&mut out, "        case 5:\n");
+  w_s(&mut out, "            bst_code_put(&p, \"\\x5b\\xc3\", 2);                       /* pop %rbx; ret */\n");
+  w_s(&mut out, "            break;\n");
+  w_s(&mut out, "        case 6:\n");
+  w_s(&mut out, "            bst_code_mov(&p, 0xb8, w[i + 1]);                     /* %rax */\n");
+  w_s(&mut out, "            bst_code_put(&p, \"\\x5b\\xc3\", 2);\n");
+  w_s(&mut out, "            break;\n");
+  w_s(&mut out, "        default:\n");
+  w_s(&mut out, "            break;\n");
+  w_s(&mut out, "        }\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    bst_code_put(&p, \"\\x5b\\xc3\", 2);\n");
+  w_s(&mut out, "    free(off);\n");
+  w_s(&mut out, "    if ((uint64_t)(p - mem) != size || mprotect(m, mapped, PROT_READ | PROT_EXEC) != 0) {\n");
+  w_s(&mut out, "        munmap(m, mapped); free(entry); return 0;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    if (bst_ncodes == bst_capcodes) {\n");
+  w_s(&mut out, "        uint64_t cap = bst_capcodes ? bst_capcodes * 2 : 16;\n");
+  w_s(&mut out, "        bst_code_region *r = (bst_code_region *)realloc(bst_codes, cap * sizeof(bst_code_region));\n");
+  w_s(&mut out, "        if (!r) { munmap(m, mapped); free(entry); return 0; }\n");
+  w_s(&mut out, "        bst_codes = r;\n");
+  w_s(&mut out, "        bst_capcodes = cap;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    bst_code_region *r = &bst_codes[bst_ncodes++];\n");
+  w_s(&mut out, "    r->mem = mem; r->size = mapped; r->nentry = nentry; r->entry = entry; r->running = 0; r->freed = 0;\n");
+  w_s(&mut out, "    return bst_ncodes;\n");
+  w_s(&mut out, "#else\n");
+  w_s(&mut out, "    (void)plan; (void)tab; (void)ntab;\n");
+  w_s(&mut out, "    return 0;\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "static uint64_t bst_code_call_(uint64_t id, void *ctx, uint64_t e) {\n");
+  w_s(&mut out, "#ifdef BST_CODE_X86\n");
+  w_s(&mut out, "    if (id == 0 || id > bst_ncodes) return 0;\n");
+  w_s(&mut out, "    bst_code_region *r = &bst_codes[id - 1];\n");
+  w_s(&mut out, "    if (r->freed || e >= r->nentry) return 0;\n");
+  w_s(&mut out, "    uint64_t (*f)(void *);\n");
+  w_s(&mut out, "    void *at = r->mem + r->entry[e];\n");
+  w_s(&mut out, "    memcpy(&f, &at, sizeof f);\n");
+  w_s(&mut out, "    r->running++;\n");
+  w_s(&mut out, "    uint64_t res = f(ctx);\n");
+  w_s(&mut out, "    r = &bst_codes[id - 1];          /* the table may have moved */\n");
+  w_s(&mut out, "    r->running--;\n");
+  w_s(&mut out, "    if (r->freed && r->running == 0 && r->mem) { munmap(r->mem, r->size); free(r->entry); r->mem = NULL; r->entry = NULL; }\n");
+  w_s(&mut out, "    return res;\n");
+  w_s(&mut out, "#else\n");
+  w_s(&mut out, "    (void)id; (void)ctx; (void)e;\n");
+  w_s(&mut out, "    return 0;\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "static void bst_code_free(bst_host h, uint64_t id) {\n");
+  w_s(&mut out, "    (void)h;\n");
+  w_s(&mut out, "    if (id == 0 || id > bst_ncodes) return;\n");
+  w_s(&mut out, "    bst_code_region *r = &bst_codes[id - 1];\n");
+  w_s(&mut out, "    if (r->freed) return;\n");
+  w_s(&mut out, "    r->freed = 1;\n");
+  w_s(&mut out, "#ifdef BST_CODE_X86\n");
+  w_s(&mut out, "    if (r->running == 0 && r->mem) { munmap(r->mem, r->size); free(r->entry); r->mem = NULL; r->entry = NULL; }\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "#define bst_code_build(h, plan) bst_code_build_((h), (plan), bst_stencil_tab, BST_NSTENCILS)\n");
+  w_s(&mut out, "#define bst_code_call(id, ctx, e) bst_code_call_((id), (void *)(ctx), (e))\n");
+}
+
 /// The prelude part for `host_net`, which stage0 does not have: added after the
 /// hosted prelude, and only to a program that calls it.
 fn cg_prelude_net(out: &mut Vec[u64]) {
@@ -2462,6 +2693,8 @@ const PART_DMA_A64: u64 = 23;
 const PART_NET: u64 = 24;
 /// Not in any target's list either: see `cg_prelude_f64`.
 const PART_F64: u64 = 26;
+/// Not in any target's list either: see `cg_prelude_code`.
+const PART_CODE: u64 = 27;
 
 fn cg_part_name(id: u64) -> Str {
   if id == PART_POSIX { return "posix"; }
@@ -2489,6 +2722,7 @@ fn cg_part_name(id: u64) -> Str {
   if id == PART_DMA_A64 { return "dma_a64"; }
   if id == PART_NET { return "net"; }
   if id == PART_F64 { return "f64"; }
+  if id == PART_CODE { return "code"; }
   return "user";
 }
 
@@ -2520,6 +2754,7 @@ fn cg_part(out: &mut Vec[u64], id: u64) {
   else if id == PART_DMA_A64 { cg_prelude_dma_a64(&mut out); }
   else if id == PART_NET { cg_prelude_net(&mut out); }
   else if id == PART_F64 { cg_prelude_f64(&mut out); }
+  else if id == PART_CODE { cg_prelude_code(&mut out); }
   else { cg_prelude_user(&mut out); }
 }
 
