@@ -37,12 +37,14 @@ trap 'rm -rf "$tmp"' EXIT
 export BASTIOC ARCH RUN
 # One check of the lists below; JOBS of them run at a time.
 pass_one() {
-  local f=$1 want name got out be
+  local f=$1 want name got out be fl
   want=$(sed -n 's|^// expect-exit: *||p' "$f" | head -1)
   name=$(basename "$f" .bastio)
   # `// backend: c`: a program whose builtins only the C backend has so far.
   be=$(sed -n 's|^// backend: *||p' "$f" | head -1)
-  if ! "$BASTIOC" --arch "$ARCH" ${be:+--backend "$be"} -o "$w/$name" "$f" 2>"$w/$name.err"; then
+  # `// flags: --opt ...`: options for the compiler, for a C backend feature that is off by default.
+  fl=; [ -n "$stage0_compiler" ] || fl=$(sed -n 's|^// flags: *||p' "$f" | head -1)   # stage0 has none
+  if ! "$BASTIOC" --arch "$ARCH" ${be:+--backend "$be"} $fl -o "$w/$name" "$f" 2>"$w/$name.err"; then
     echo "FAIL $f: rejected"; sed 's/^/    /' "$w/$name.err"; echo =fail; return
   fi
   $RUN "$w/$name" </dev/null >"$w/$name.out"; got=$?

@@ -48,14 +48,17 @@ struct Cg {
   env: u64,
   target: u64,
   /// The architecture (`ARCH_*`), set by the driver after `cg_new`.
-  arch: u64
+  arch: u64,
+  /// `--ref-params`, set by the driver: a shared borrow of a struct or enum
+  /// is passed by address (see `cg_is_refagg`).
+  refs: bool
 }
 
 fn cg_new(target: u64) -> Cg {
   return Cg {
     out: vec_new[u64](), body: vec_new[u64](), pool: vec_new[u64](), smp: vec_new[u64](), nsmp: 0,
     vecs: vec_new[u64](), boxed: vec_new[u64](), blobs: vec_new[u64](),
-    vars: vec_new[CgVar](), mutp: vec_new[CgVar](), tmps: 0, env: 0, target: target, arch: ARCH_X86_64
+    vars: vec_new[CgVar](), mutp: vec_new[CgVar](), tmps: 0, env: 0, target: target, arch: ARCH_X86_64, refs: false
   };
 }
 
@@ -1248,10 +1251,9 @@ fn cg_call(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64)
   let xs = cg_args_of(p, i);
   let mut vals = vec_new[CgSp]();
   let pre = cg_operands(&mut g, c, &mut m, p, xs, true, &mut vals);
-  vec_free(xs);
   let a0 = sp_at(vals, 0);
   let a1 = sp_at(vals, 1);
-  let start = cg_mark(g);
+  let mut start = cg_mark(g);
   if inst == 0 && (name_is(p, i, "len") || name_is(p, i, "slen") || name_is(p, i, "blen")) {
     cg_sp(&mut g, a0);
     cg_t(&mut g, ".len");
@@ -1274,12 +1276,28 @@ fn cg_call(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64)
     cg_t(&mut g, ")");
   } else {
     let x = cg_callee(&mut m, p, i, inst);
+    let xi = inst_at(m, x);
+    let ps = fn_params(&mut m, p, xi.def, x);
+    let mut j = 0;
+    while j < vec_len(vals) && j < vec_len(ps) {
+      if cg_is_refagg(g, m, u_at(ps, j)) {
+        let an = node_at(p.nodes, u_at(xs, j));
+        let w = an.kind == E_VAR || an.kind == E_FIELD;
+        let sp = cg_ref_arg(&mut g, m, p, u_at(ps, j), sp_at(vals, j), w);
+        vec_set(&mut vals, j, sp);
+      }
+      j = j + 1;
+    }
+    vec_free(ps);
+    // The wrapped arguments are complete; the call starts here.
+    start = cg_mark(g);
     cg_fname(&mut g, m, p, x);
     cg_t(&mut g, "(");
     cg_list(&mut g, vals);
     cg_t(&mut g, ")");
   }
   vec_free(vals);
+  vec_free(xs);
   let e = cg_span(g, start);
   return cg_seq(&mut g, pre, e);
 }
@@ -1303,21 +1321,41 @@ fn cg_vec_with(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgS
   let mut vals = vec_new[CgSp]();
   let pre = cg_operands(&mut g, c, &mut m, p, xs, true, &mut vals);
   vec_free(xs);
+  let xi = inst_at(m, x);
+  let ps = fn_params(&mut m, p, xi.def, x);
+  // The element: a C value, so a shared borrow of a struct takes a copy.
+  let mut elem = CgSp { s: 0, n: 0 };
+  if vec_len(ps) > 0 {
+    let st = cg_mark(g);
+    cg_t(&mut g, "bst_vec_get_");
+    cg_tyname(&mut g, m, p, el, CG_HELPER);
+    cg_t(&mut g, "(");
+    cg_sp(&mut g, sp_at(vals, 0));
+    cg_t(&mut g, ", ");
+    cg_sp(&mut g, sp_at(vals, 1));
+    cg_t(&mut g, ")");
+    let ge = cg_span(g, st);
+    elem = cg_ref_arg(&mut g, m, p, u_at(ps, 0), ge, false);
+  }
+  let mut rest = vec_new[CgSp]();
+  let mut q = 1;
+  while cg_add(q, 1) < vec_len(vals) {
+    let w = cg_ref_arg(&mut g, m, p, u_at(ps, q), sp_at(vals, cg_add(q, 1)), true);
+    vec_push(&mut rest, w);
+    q = cg_add(q, 1);
+  }
+  vec_free(ps);
   let start = cg_mark(g);
   cg_fname(&mut g, m, p, x);
-  cg_t(&mut g, "(bst_vec_get_");
-  cg_tyname(&mut g, m, p, el, CG_HELPER);
   cg_t(&mut g, "(");
-  cg_sp(&mut g, sp_at(vals, 0));
-  cg_t(&mut g, ", ");
-  cg_sp(&mut g, sp_at(vals, 1));
-  cg_t(&mut g, ")");
-  let mut j = 2;
-  while j < vec_len(vals) {
+  cg_sp(&mut g, elem);
+  q = 0;
+  while q < vec_len(rest) {
     cg_t(&mut g, ", ");
-    cg_sp(&mut g, sp_at(vals, j));
-    j = j + 1;
+    cg_sp(&mut g, sp_at(rest, q));
+    q = q + 1;
   }
+  vec_free(rest);
   cg_t(&mut g, ")");
   vec_free(vals);
   let e = cg_span(g, start);
@@ -1620,13 +1658,66 @@ fn cg_lock(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp {
 }
 
 /// `T` or `T *` for a parameter of type `pt`.
+/// Is `pt` a shared borrow of a struct or enum? Those are passed by address
+/// (`const T *`), not copied: a big struct would otherwise be copied at every
+/// call. The borrow rules mean the pointee cannot change during the call.
+fn cg_is_refagg(g: &Cg, m: &Mono, pt: u64) -> bool {
+  if !g.refs || kind_t(m, pt) != TY_REF {
+    return false;
+  }
+  let k = kind_t(m, inner_t(m, pt));
+  return k == TY_STRUCT || k == TY_ENUM;
+}
+
 fn cg_param_cty(g: &mut Cg, m: &Mono, p: &Parser, pt: u64) {
   if kind_t(m, pt) == TY_MUTREF {
+    cg_cty(&mut g, m, p, inner_t(m, pt));
+    cg_t(&mut g, " *");
+  } else if cg_is_refagg(g, m, pt) {
+    cg_t(&mut g, "const ");
     cg_cty(&mut g, m, p, inner_t(m, pt));
     cg_t(&mut g, " *");
   } else {
     cg_cty(&mut g, m, p, pt);
   }
+}
+
+/// Writes argument `e` for a parameter of type `pt` into the text being
+/// built: as is, or for a shared borrow of a struct or enum a pointer to a
+/// copy (see `cg_ref_arg` for the address of a place).
+fn cg_emit_ref_arg(g: &mut Cg, m: &Mono, p: &Parser, pt: u64, e: CgSp) {
+  if cg_is_refagg(g, m, pt) {
+    cg_t(&mut g, "((");
+    cg_cty(&mut g, m, p, inner_t(m, pt));
+    cg_t(&mut g, "[1]){ ");
+    cg_sp(&mut g, e);
+    cg_t(&mut g, " })");
+  } else {
+    cg_sp(&mut g, e);
+  }
+}
+
+/// Argument `e` for a parameter of type `pt`: unchanged, or for a shared
+/// borrow of a struct or enum its address. `place` says `e` is an lvalue; any
+/// other value is first put in a one-element compound literal (one copy, as
+/// before).
+fn cg_ref_arg(g: &mut Cg, m: &Mono, p: &Parser, pt: u64, e: CgSp, place: bool) -> CgSp {
+  if !cg_is_refagg(g, m, pt) {
+    return e;
+  }
+  let start = cg_mark(g);
+  if place {
+    cg_t(&mut g, "(&(");
+    cg_sp(&mut g, e);
+    cg_t(&mut g, "))");
+  } else {
+    cg_t(&mut g, "((");
+    cg_cty(&mut g, m, p, inner_t(m, pt));
+    cg_t(&mut g, "[1]){ ");
+    cg_sp(&mut g, e);
+    cg_t(&mut g, " })");
+  }
+  return cg_span(g, start);
 }
 
 fn cg_locked(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp {
@@ -1665,7 +1756,7 @@ fn cg_locked(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp 
     cg_t(&mut g, "_");
     cg_n(&mut g, j);
     cg_t(&mut g, " = ");
-    cg_sp(&mut g, sp_at(es, j));
+    cg_emit_ref_arg(&mut g, m, p, u_at(ps, cg_add(j, 1)), sp_at(es, j));
     cg_t(&mut g, ";");
     j = j + 1;
   }
@@ -1755,7 +1846,7 @@ fn cg_pt_borrow(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> Cg
     cg_t(&mut g, "_");
     cg_n(&mut g, j);
     cg_t(&mut g, " = ");
-    cg_sp(&mut g, sp_at(es, j));
+    cg_emit_ref_arg(&mut g, m, p, u_at(ps, cg_add(j, 1)), sp_at(es, j));
     cg_t(&mut g, ";");
     j = j + 1;
   }
@@ -1842,6 +1933,9 @@ fn cg_smp_run(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp
         cg_t(&mut g, "&mmu");
       }
     } else {
+      if cg_is_refagg(g, m, pt) {
+        cg_t(&mut g, "&");
+      }
       cg_t(&mut g, "a->a");
       cg_n(&mut g, j);
     }
@@ -1895,6 +1989,9 @@ fn cg_smp_run(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp
     if kind_t(m, u_at(ps, j)) == TY_MUTREF {
       cg_sp(&mut g, sp_at(es, j));
     } else {
+      if cg_is_refagg(g, m, u_at(ps, j)) {
+        cg_t(&mut g, "&");
+      }
       cg_t(&mut g, "sa_");
       cg_n(&mut g, k);
       cg_t(&mut g, ".a");
@@ -2119,6 +2216,9 @@ fn cg_proto(g: &mut Cg, m: &mut Mono, p: &Parser, x: u64) {
     if kind_t(m, pt) == TY_MUTREF {
       cg_cty(&mut g, m, p, inner_t(m, pt));
       cg_t(&mut g, " *v_");
+    } else if cg_is_refagg(g, m, pt) {
+      cg_param_cty(&mut g, m, p, pt);
+      cg_t(&mut g, "v_");
     } else {
       cg_cty(&mut g, m, p, pt);
       cg_t(&mut g, " v_");
@@ -2147,7 +2247,7 @@ fn cg_fn(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, x: u64) {
   while q != 0 {
     let qn = node_at(p.nodes, q);
     let pt = conv(&mut m, p, qn.a, x, q);
-    if kind_t(m, pt) == TY_MUTREF {
+    if kind_t(m, pt) == TY_MUTREF || cg_is_refagg(g, m, pt) {
       vec_push(&mut g.mutp, CgVar { s: qn.s, e: qn.e, ty: pt });
     }
     cg_bind(&mut g, qn.s, qn.e, base_t(m, pt));
@@ -2471,6 +2571,9 @@ fn cg_export(g: &mut Cg, m: &mut Mono, p: &Parser, x: u64) {
       cg_src(&mut g, p, qn.s, qn.e);
       cg_t(&mut g, " }");
     } else {
+      if cg_is_refagg(g, m, pt) {
+        cg_t(&mut g, "&");
+      }
       cg_src(&mut g, p, qn.s, qn.e);
     }
     q = qn.next;
