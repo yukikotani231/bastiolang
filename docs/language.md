@@ -952,6 +952,9 @@ On the hosted target, `main` can ask for `&mut Host`: the program's command line
 | `child_close(c: &mut Child)` | Closes the child's standard input, so a program that reads to the end of its input can finish |
 | `child_read_line(c: &mut Child, out: &mut Bytes) -> bool` | Replaces `out` with the next line of output, without the newline; false at the end of the output |
 | `child_wait(c: Child) -> u64` | Closes the pipes, waits for the child and returns its exit status (128 + the signal number if a signal ended it); the prover knows it is `<= 255` |
+| `host_spawn_err(h: &Host, argv: &Vec[Bytes]) -> Child` | Like `host_spawn`, but the child's standard error is a pipe of its own instead of the program's (stage1 only, C backend only so far). Read it with `child_read_err_line`, and keep reading: a child that fills the pipe waits for its reader |
+| `child_read_err_line(c: &mut Child, out: &mut Bytes) -> bool` | Replaces `out` with the next line of the standard error of a child started with `host_spawn_err`, without the newline; false at the end, or for a child started with `host_spawn` (stage1 only, C backend only so far) |
+| `child_kill(c: &Child, sig: u64) -> bool` | Sends signal `sig` to the child, which `child_wait` has not yet waited for (on Windows any signal but 0 ends it, and 0 asks whether it still runs); false if that failed or the child could not be started (stage1 only, C backend only so far) |
 
 ```bastio
 // expect-exit: 0
