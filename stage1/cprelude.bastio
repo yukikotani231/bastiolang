@@ -873,6 +873,154 @@ fn cg_prelude_child(out: &mut Vec[u64]) {
   w_s(&mut out, "}\n");
 }
 
+/// The prelude part for `host_spawn_err`, `child_read_err_line` and `child_kill`
+/// (stage1 only): added after the child part, and only to a program that calls
+/// one of them.
+fn cg_prelude_spawn_err(out: &mut Vec[u64]) {
+  w_s(&mut out, "/* host_spawn_err and child_read_err_line: a child whose standard error is a\n");
+  w_s(&mut out, " * pipe of its own, and child_kill. The pipe's read end lives in a list keyed by\n");
+  w_s(&mut out, " * the child's pid, so the bst_child of the always-present part stays as it is. */\n");
+  w_s(&mut out, "typedef struct bst_errnode { intptr_t pid; FILE *err; struct bst_errnode *next; } bst_errnode;\n");
+  w_s(&mut out, "static bst_errnode *bst_errs;\n");
+  w_s(&mut out, "static bst_child bst_host_spawn_err(bst_host h, bst_vec argv) {\n");
+  w_s(&mut out, "    (void)h;\n");
+  w_s(&mut out, "    bst_child c = { -1, -1, NULL };\n");
+  w_s(&mut out, "    int to[2], from[2], ef[2];\n");
+  w_s(&mut out, "    if (argv.len == 0 || pipe(to) != 0) return c;\n");
+  w_s(&mut out, "    if (pipe(from) != 0) { close(to[0]); close(to[1]); return c; }\n");
+  w_s(&mut out, "    if (pipe(ef) != 0) { close(to[0]); close(to[1]); close(from[0]); close(from[1]); return c; }\n");
+  w_s(&mut out, "#ifndef _WIN32\n");
+  w_s(&mut out, "    fcntl(to[1], F_SETFD, FD_CLOEXEC);\n");
+  w_s(&mut out, "    fcntl(from[0], F_SETFD, FD_CLOEXEC);\n");
+  w_s(&mut out, "    fcntl(ef[0], F_SETFD, FD_CLOEXEC);\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "    char **av = (char **)malloc((argv.len + 1) * sizeof(char *));\n");
+  w_s(&mut out, "    if (!av) { fputs(\"Bastio: out of memory\\n\", stderr); abort(); }\n");
+  w_s(&mut out, "    for (uint64_t i = 0; i < argv.len; i++) av[i] = bst_cpath(((bst_bytes *)argv.data)[i]);\n");
+  w_s(&mut out, "    av[argv.len] = NULL;\n");
+  w_s(&mut out, "    fflush(NULL);\n");
+  w_s(&mut out, "#ifdef _WIN32\n");
+  w_s(&mut out, "    intptr_t pid = -1;\n");
+  w_s(&mut out, "    {\n");
+  w_s(&mut out, "        size_t cap = 1;\n");
+  w_s(&mut out, "        for (uint64_t i = 0; i < argv.len; i++) cap += 2 * strlen(av[i]) + 3;\n");
+  w_s(&mut out, "        char *cl = (char *)malloc(cap), *w = cl;\n");
+  w_s(&mut out, "        if (!cl) { fputs(\"Bastio: out of memory\\n\", stderr); abort(); }\n");
+  w_s(&mut out, "        for (uint64_t i = 0; i < argv.len; i++) {\n");
+  w_s(&mut out, "            const char *a = av[i];\n");
+  w_s(&mut out, "            int q = !*a || strpbrk(a, \" \\t\\\"\") != NULL;\n");
+  w_s(&mut out, "            if (i) *w++ = ' ';\n");
+  w_s(&mut out, "            if (q) *w++ = '\"';\n");
+  w_s(&mut out, "            size_t b = 0;\n");
+  w_s(&mut out, "            for (; *a; a++) {\n");
+  w_s(&mut out, "                if (*a == '\\\\') { b++; continue; }\n");
+  w_s(&mut out, "                if (*a == '\"') b = 2 * b + 1;\n");
+  w_s(&mut out, "                for (; b; b--) *w++ = '\\\\';\n");
+  w_s(&mut out, "                *w++ = *a;\n");
+  w_s(&mut out, "            }\n");
+  w_s(&mut out, "            for (b = q ? 2 * b : b; b; b--) *w++ = '\\\\';\n");
+  w_s(&mut out, "            if (q) *w++ = '\"';\n");
+  w_s(&mut out, "        }\n");
+  w_s(&mut out, "        *w = 0;\n");
+  w_s(&mut out, "        HANDLE hin = (HANDLE)_get_osfhandle(to[0]), hout = (HANDLE)_get_osfhandle(from[1]), herr = (HANDLE)_get_osfhandle(ef[1]);\n");
+  w_s(&mut out, "        SetHandleInformation(hin, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);\n");
+  w_s(&mut out, "        SetHandleInformation(hout, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);\n");
+  w_s(&mut out, "        SetHandleInformation(herr, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);\n");
+  w_s(&mut out, "        STARTUPINFOA si;\n");
+  w_s(&mut out, "        PROCESS_INFORMATION pi;\n");
+  w_s(&mut out, "        memset(&si, 0, sizeof si);\n");
+  w_s(&mut out, "        si.cb = sizeof si;\n");
+  w_s(&mut out, "        si.dwFlags = STARTF_USESTDHANDLES;\n");
+  w_s(&mut out, "        si.hStdInput = hin;\n");
+  w_s(&mut out, "        si.hStdOutput = hout;\n");
+  w_s(&mut out, "        si.hStdError = herr;\n");
+  w_s(&mut out, "        if (CreateProcessA(NULL, cl, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {\n");
+  w_s(&mut out, "            CloseHandle(pi.hThread);\n");
+  w_s(&mut out, "            pid = (intptr_t)pi.hProcess;\n");
+  w_s(&mut out, "        }\n");
+  w_s(&mut out, "        SetHandleInformation(hin, HANDLE_FLAG_INHERIT, 0);\n");
+  w_s(&mut out, "        SetHandleInformation(hout, HANDLE_FLAG_INHERIT, 0);\n");
+  w_s(&mut out, "        SetHandleInformation(herr, HANDLE_FLAG_INHERIT, 0);\n");
+  w_s(&mut out, "        free(cl);\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "#else\n");
+  w_s(&mut out, "    int pid = -1;\n");
+  w_s(&mut out, "    posix_spawn_file_actions_t fa;\n");
+  w_s(&mut out, "    if (posix_spawn_file_actions_init(&fa) == 0) {\n");
+  w_s(&mut out, "        if (posix_spawn_file_actions_adddup2(&fa, to[0], 0) != 0 ||\n");
+  w_s(&mut out, "            posix_spawn_file_actions_adddup2(&fa, from[1], 1) != 0 ||\n");
+  w_s(&mut out, "            posix_spawn_file_actions_adddup2(&fa, ef[1], 2) != 0 ||\n");
+  w_s(&mut out, "            posix_spawn_file_actions_addclose(&fa, to[0]) != 0 ||\n");
+  w_s(&mut out, "            posix_spawn_file_actions_addclose(&fa, from[1]) != 0 ||\n");
+  w_s(&mut out, "            posix_spawn_file_actions_addclose(&fa, ef[1]) != 0 ||\n");
+  w_s(&mut out, "            posix_spawnp(&pid, av[0], &fa, NULL, av, environ) != 0) pid = -1;\n");
+  w_s(&mut out, "        posix_spawn_file_actions_destroy(&fa);\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "    for (uint64_t i = 0; i < argv.len; i++) free(av[i]);\n");
+  w_s(&mut out, "    free(av);\n");
+  w_s(&mut out, "    close(to[0]);\n");
+  w_s(&mut out, "    close(from[1]);\n");
+  w_s(&mut out, "    close(ef[1]);\n");
+  w_s(&mut out, "    if (pid < 0) { close(to[1]); close(from[0]); close(ef[0]); return c; }\n");
+  w_s(&mut out, "#ifdef SIGPIPE\n");
+  w_s(&mut out, "    signal(SIGPIPE, SIG_IGN);\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "    c.pid = pid;\n");
+  w_s(&mut out, "    c.in = to[1];\n");
+  w_s(&mut out, "    c.out = fdopen(from[0], \"rb\");\n");
+  w_s(&mut out, "    bst_errnode *n = (bst_errnode *)malloc(sizeof *n);\n");
+  w_s(&mut out, "    if (!c.out || !n) { fputs(\"Bastio: out of memory\\n\", stderr); abort(); }\n");
+  w_s(&mut out, "    n->pid = pid;\n");
+  w_s(&mut out, "    n->err = fdopen(ef[0], \"rb\");\n");
+  w_s(&mut out, "    if (!n->err) { fputs(\"Bastio: out of memory\\n\", stderr); abort(); }\n");
+  w_s(&mut out, "    n->next = bst_errs;\n");
+  w_s(&mut out, "    bst_errs = n;\n");
+  w_s(&mut out, "    return c;\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "/* The next line of the child's standard error; false at its end, or for a\n");
+  w_s(&mut out, " * child that was not started with host_spawn_err. */\n");
+  w_s(&mut out, "static bool bst_child_read_err_line(bst_child *c, bst_bytes *out) {\n");
+  w_s(&mut out, "    for (bst_errnode *n = bst_errs; n; n = n->next) {\n");
+  w_s(&mut out, "        if (n->pid == c->pid && c->pid >= 0) {\n");
+  w_s(&mut out, "            bst_child t = *c;\n");
+  w_s(&mut out, "            t.out = n->err;\n");
+  w_s(&mut out, "            return bst_child_read_line(&t, out);\n");
+  w_s(&mut out, "        }\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    return false;\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "/* Sends signal `sig` to the child (Windows: any signal but 0 ends it; 0 asks\n");
+  w_s(&mut out, " * whether it still runs). False if that failed, for instance because the child\n");
+  w_s(&mut out, " * could not be started. */\n");
+  w_s(&mut out, "static bool bst_child_kill(bst_child c, uint64_t sig) {\n");
+  w_s(&mut out, "    if (c.pid < 0) return false;\n");
+  w_s(&mut out, "#ifdef _WIN32\n");
+  w_s(&mut out, "    if (sig == 0) {\n");
+  w_s(&mut out, "        DWORD code;\n");
+  w_s(&mut out, "        return GetExitCodeProcess((HANDLE)c.pid, &code) && code == STILL_ACTIVE;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    return TerminateProcess((HANDLE)c.pid, 1) != 0;\n");
+  w_s(&mut out, "#else\n");
+  w_s(&mut out, "    return kill((pid_t)c.pid, (int)sig) == 0;\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "/* child_wait also closes the standard error pipe of a child that has one. */\n");
+  w_s(&mut out, "static uint64_t bst_child_wait_err(bst_child c) {\n");
+  w_s(&mut out, "    for (bst_errnode **p = &bst_errs; *p; p = &(*p)->next) {\n");
+  w_s(&mut out, "        if ((*p)->pid == c.pid && c.pid >= 0) {\n");
+  w_s(&mut out, "            bst_errnode *n = *p;\n");
+  w_s(&mut out, "            *p = n->next;\n");
+  w_s(&mut out, "            fclose(n->err);\n");
+  w_s(&mut out, "            free(n);\n");
+  w_s(&mut out, "            break;\n");
+  w_s(&mut out, "        }\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    return bst_child_wait(c);\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "#define bst_child_wait(c) bst_child_wait_err(c)\n");
+}
+
 /// The prelude part for `host_sandbox` (stage1 only): added after the hosted
 /// prelude, and only to a program that calls it.
 fn cg_prelude_sandbox(out: &mut Vec[u64]) {
@@ -3289,6 +3437,8 @@ const PART_F64: u64 = 26;
 const PART_SYS: u64 = 28;
 /// Not in any target's list either: see `cg_prelude_code`.
 const PART_CODE: u64 = 27;
+/// Not in any target's list either: see `cg_prelude_spawn_err`.
+const PART_SPAWN_ERR: u64 = 29;
 
 fn cg_part_name(id: u64) -> Str {
   if id == PART_POSIX { return "posix"; }
@@ -3319,6 +3469,7 @@ fn cg_part_name(id: u64) -> Str {
   if id == PART_F64 { return "f64"; }
   if id == PART_SYS { return "sys"; }
   if id == PART_CODE { return "code"; }
+  if id == PART_SPAWN_ERR { return "spawn_err"; }
   return "user";
 }
 
@@ -3353,6 +3504,7 @@ fn cg_part(out: &mut Vec[u64], id: u64) {
   else if id == PART_F64 { cg_prelude_f64(&mut out); }
   else if id == PART_SYS { cg_prelude_sys(&mut out); }
   else if id == PART_CODE { cg_prelude_code(&mut out); }
+  else if id == PART_SPAWN_ERR { cg_prelude_spawn_err(&mut out); }
   else { cg_prelude_user(&mut out); }
 }
 

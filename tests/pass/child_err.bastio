@@ -1,0 +1,70 @@
+// expect-exit: 0
+// stage1-only: host_spawn_err, child_read_err_line and child_kill
+// backend: c
+// A child with its own standard error pipe, and a signal sent to a child.
+
+fn arg(v: &mut Vec[Bytes], s: Str) {
+  vec_push(&mut v, bfrom(s));
+}
+
+fn drop_args(v: Vec[Bytes]) {
+  let mut w = v;
+  while vec_len(w) > 0 {
+    bfree(vec_pop(&mut w));
+  }
+  vec_free(w);
+}
+
+fn main(h: &mut Host) -> u64 {
+  let mut bad = 0;
+
+  // sh writes one line to each stream; they arrive on separate pipes.
+  let mut argv = vec_new[Bytes]();
+  arg(&mut argv, "sh");
+  arg(&mut argv, "-c");
+  arg(&mut argv, "echo out; echo err >&2");
+  let mut c = host_spawn_err(h, argv);
+  drop_args(argv);
+  let mut line = balloc(0);
+  if !child_read_line(&mut c, &mut line) || blen(line) != 3 || bget(line, 0) != 111 {
+    bad = bad + 1;
+  }
+  if !child_read_err_line(&mut c, &mut line) || blen(line) != 3 || bget(line, 0) != 101 {
+    bad = bad + 1;
+  }
+  if child_read_err_line(&mut c, &mut line) {
+    bad = bad + 1;
+  }
+  if child_wait(c) != 0 {
+    bad = bad + 1;
+  }
+
+  // A child that would wait for a minute is ended by SIGTERM (15).
+  let mut argv2 = vec_new[Bytes]();
+  arg(&mut argv2, "sleep");
+  arg(&mut argv2, "60");
+  let k = host_spawn_err(h, argv2);
+  drop_args(argv2);
+  if !child_kill(k, 15) {
+    bad = bad + 1;
+  }
+  if child_wait(k) == 0 {
+    bad = bad + 1;
+  }
+
+  // A program that cannot be started: nothing to read. (Whether kill finds a
+  // process depends on how the C library reports the failed exec, so it is not
+  // checked.)
+  let mut argv3 = vec_new[Bytes]();
+  arg(&mut argv3, "no-such-program-bastio");
+  let mut z = host_spawn_err(h, argv3);
+  drop_args(argv3);
+  if child_read_err_line(&mut z, &mut line) {
+    bad = bad + 1;
+  }
+  if child_wait(z) != 127 {
+    bad = bad + 1;
+  }
+  bfree(line);
+  return bad;
+}
