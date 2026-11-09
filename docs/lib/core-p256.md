@@ -124,106 +124,106 @@ fn p256_nib(c: u8) -> u64
 
 Internal: the value of the hex digit `c` (0 for anything else).
 
-### `bn_zero`
+### `p256_bn_zero`
 
 ```bastio
-fn bn_zero() -> Vec[u64]
+fn p256_bn_zero() -> Vec[u64]
   ensures vlen(result) == 16
 ```
 
 Internal: the number 0.
 
-### `bn_copy`
+### `p256_bn_copy`
 
 ```bastio
-fn bn_copy(a: &Vec[u64]) -> Vec[u64]
+fn p256_bn_copy(a: &Vec[u64]) -> Vec[u64]
   requires vlen(a) == 16
   ensures vlen(result) == 16
 ```
 
 Internal: a copy of `a`.
 
-### `bn_small`
+### `p256_bn_small`
 
 ```bastio
-fn bn_small(v: u64) -> Vec[u64]
+fn p256_bn_small(v: u64) -> Vec[u64]
   requires v < 65536
   ensures vlen(result) == 16
 ```
 
 Internal: the number `v` (below 65536).
 
-### `bn_hex`
+### `p256_bn_hex`
 
 ```bastio
-fn bn_hex(s: Str) -> Vec[u64]
+fn p256_bn_hex(s: Str) -> Vec[u64]
   requires slen(s) == 64
   ensures vlen(result) == 16
 ```
 
 Internal: the number written as the 64 hex digits of `s`.
 
-### `bn_from_bytes`
+### `p256_bn_from_bytes`
 
 ```bastio
-fn bn_from_bytes(b: &Bytes, at: u64) -> Vec[u64]
+fn p256_bn_from_bytes(b: &Bytes, at: u64) -> Vec[u64]
   requires at + 32 <= blen(b) && at < 274877906944
   ensures vlen(result) == 16
 ```
 
 Internal: the big-endian number in the 32 bytes `b[at..at+32]`.
 
-### `bn_ge`
+### `p256_bn_ge`
 
 ```bastio
-fn bn_ge(a: &Vec[u64], b: &Vec[u64]) -> bool
+fn p256_bn_ge(a: &Vec[u64], b: &Vec[u64]) -> bool
   requires vlen(a) == 16 && vlen(b) == 16
 ```
 
 Internal: whether `a >= b`.
 
-### `bn_eq`
+### `p256_bn_eq`
 
 ```bastio
-fn bn_eq(a: &Vec[u64], b: &Vec[u64]) -> bool
+fn p256_bn_eq(a: &Vec[u64], b: &Vec[u64]) -> bool
   requires vlen(a) == 16 && vlen(b) == 16
 ```
 
 Internal: whether `a == b`.
 
-### `bn_is_zero`
+### `p256_bn_is_zero`
 
 ```bastio
-fn bn_is_zero(a: &Vec[u64]) -> bool
+fn p256_bn_is_zero(a: &Vec[u64]) -> bool
   requires vlen(a) == 16
 ```
 
 Internal: whether `a == 0`.
 
-### `bn_add17`
+### `p256_bn_add17`
 
 ```bastio
-fn bn_add17(a: &Vec[u64], b: &Vec[u64]) -> Vec[u64]
+fn p256_bn_add17(a: &Vec[u64], b: &Vec[u64]) -> Vec[u64]
   requires vlen(a) == 16 && vlen(b) == 16
   ensures vlen(result) == 17
 ```
 
 Internal: `a + b` modulo 2^256, and in the 17th limb the carry.
 
-### `bn_add_wrap`
+### `p256_bn_add_wrap`
 
 ```bastio
-fn bn_add_wrap(a: &Vec[u64], b: &Vec[u64]) -> Vec[u64]
+fn p256_bn_add_wrap(a: &Vec[u64], b: &Vec[u64]) -> Vec[u64]
   requires vlen(a) == 16 && vlen(b) == 16
   ensures vlen(result) == 16
 ```
 
 Internal: `a + b` modulo 2^256.
 
-### `bn_sub_wrap`
+### `p256_bn_sub_wrap`
 
 ```bastio
-fn bn_sub_wrap(a: &Vec[u64], b: &Vec[u64]) -> Vec[u64]
+fn p256_bn_sub_wrap(a: &Vec[u64], b: &Vec[u64]) -> Vec[u64]
   requires vlen(a) == 16 && vlen(b) == 16
   ensures vlen(result) == 16
 ```
@@ -250,10 +250,10 @@ fn mod_sub(a: &Vec[u64], b: &Vec[u64], m: &Modulus) -> Vec[u64]
 
 Internal: `a - b` modulo `m` (for `a` and `b` below `m`).
 
-### `bn_bit`
+### `p256_bn_bit`
 
 ```bastio
-fn bn_bit(a: &Vec[u64], i: u64) -> u64
+fn p256_bn_bit(a: &Vec[u64], i: u64) -> u64
   requires vlen(a) == 16 && i < 256
   ensures result <= 1
 ```
