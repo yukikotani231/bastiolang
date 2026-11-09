@@ -1,0 +1,38 @@
+// expect-exit: 0
+// flags: --ref-params
+// With `--ref-params` the C backend passes a shared borrow of a struct or an
+// enum by address (`const T *`) instead of copying it into every call; what
+// the program computes is the same. Here a struct and an enum are lent on
+// through two levels of calls and a field of a struct is lent too.
+struct Big { a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, h: u64 }
+enum Sh { A(u64), B }
+fn sum(x: &Big) -> u64 {
+  return wrap_add(wrap_add(wrap_add(x.a, x.b), wrap_add(x.c, x.d)), wrap_add(wrap_add(x.e, x.f), wrap_add(x.g, x.h)));
+}
+fn twice(x: &Big) -> u64 {
+  return wrap_add(sum(x), sum(x));
+}
+fn mk() -> Big { return Big { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8 }; }
+fn sh(s: &Sh) -> u64 {
+  match s { Sh::A(v) => { return v; }, Sh::B => { return 7; }, }
+}
+struct Outer { big: Big, n: u64 }
+
+fn outer_sum(o: &Outer) -> u64 {
+  return wrap_add(sum(o.big), o.n);
+}
+
+fn main() -> u64 {
+  let b = mk();
+  let t = twice(b);
+  let mb = mk();
+  let u = sum(mb);
+  let s1 = Sh::A(5);
+  let s2 = Sh::B;
+  let k = wrap_add(sh(s1), sh(s2));
+  let o = Outer { big: mk(), n: 100 };
+  let os = outer_sum(o);
+  let inner = sum(o.big);
+  if t == 72 && u == 36 && k == 12 && os == 136 && inner == 36 { return 0; }
+  return 1;
+}
