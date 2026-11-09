@@ -1893,6 +1893,7 @@ fn cg_prelude_net(out: &mut Vec[u64]) {
   w_s(&mut out, "    int (__stdcall *send)(bst_sock, const char *, int, int);\n");
   w_s(&mut out, "    int (__stdcall *closesocket)(bst_sock);\n");
   w_s(&mut out, "    int (__stdcall *getsockname)(bst_sock, void *, int *);\n");
+  w_s(&mut out, "    int (__stdcall *shutdown)(bst_sock, int);\n");
   w_s(&mut out, "} bst_ws;\n");
   w_s(&mut out, "static int bst_ws_init(void) {\n");
   w_s(&mut out, "    if (bst_ws.state) return bst_ws.state > 0;\n");
@@ -1909,9 +1910,10 @@ fn cg_prelude_net(out: &mut Vec[u64]) {
   w_s(&mut out, "    bst_ws.send = (int (__stdcall *)(bst_sock, const char *, int, int))(void *)GetProcAddress(m, \"send\");\n");
   w_s(&mut out, "    bst_ws.closesocket = (int (__stdcall *)(bst_sock))(void *)GetProcAddress(m, \"closesocket\");\n");
   w_s(&mut out, "    bst_ws.getsockname = (int (__stdcall *)(bst_sock, void *, int *))(void *)GetProcAddress(m, \"getsockname\");\n");
+  w_s(&mut out, "    bst_ws.shutdown = (int (__stdcall *)(bst_sock, int))(void *)GetProcAddress(m, \"shutdown\");\n");
   w_s(&mut out, "    char wsadata[512];\n");
   w_s(&mut out, "    if (!start || !bst_ws.socket || !bst_ws.bind || !bst_ws.listen || !bst_ws.accept || !bst_ws.connect\n");
-  w_s(&mut out, "        || !bst_ws.recv || !bst_ws.send || !bst_ws.closesocket || !bst_ws.getsockname) return 0;\n");
+  w_s(&mut out, "        || !bst_ws.recv || !bst_ws.send || !bst_ws.closesocket || !bst_ws.getsockname || !bst_ws.shutdown) return 0;\n");
   w_s(&mut out, "    if (start(0x0202, wsadata) != 0) return 0;\n");
   w_s(&mut out, "    bst_ws.state = 1;\n");
   w_s(&mut out, "    return 1;\n");
@@ -1972,6 +1974,7 @@ fn cg_prelude_net(out: &mut Vec[u64]) {
   w_s(&mut out, "        return r < 0 ? ~(uint64_t)0 : (uint64_t)r;\n");
   w_s(&mut out, "    }\n");
   w_s(&mut out, "    if (op == 5) return bst_ws.closesocket((bst_sock)a) == 0 ? 0 : ~(uint64_t)0;\n");
+  w_s(&mut out, "    if (op == 10) return b <= 2 && bst_ws.shutdown((bst_sock)a, (int)b) == 0 ? 0 : ~(uint64_t)0;\n");
   w_s(&mut out, "    if (op == 6) {\n");
   w_s(&mut out, "        int len = 16;\n");
   w_s(&mut out, "        if (bst_ws.getsockname((bst_sock)a, sa, &len) != 0) return ~(uint64_t)0;\n");
@@ -1987,7 +1990,9 @@ fn cg_prelude_net(out: &mut Vec[u64]) {
   w_s(&mut out, " * result is end of file); 4 writes `*buf` to socket `a` and returns how many bytes\n");
   w_s(&mut out, " * went; 5 closes socket `a`; 6 returns the local port of socket `a`;\n");
   w_s(&mut out, " * 7 returns the time in seconds since 1970; 8 replaces `*buf` with `b` (at most\n");
-  w_s(&mut out, " * 256) random bytes from the system's source. The failure of any is 2^64 - 1. */\n");
+  w_s(&mut out, " * 256) random bytes from the system's source; 10 shuts down one direction of socket\n");
+  w_s(&mut out, " * `a` (`b` 0 reading, 1 writing, 2 both) and leaves it open. The failure of any\n");
+  w_s(&mut out, " * is 2^64 - 1. */\n");
   w_s(&mut out, "static uint64_t bst_host_net(bst_host h, uint64_t op, uint64_t a, uint64_t b, bst_bytes *buf) {\n");
   w_s(&mut out, "    (void)h;\n");
   w_s(&mut out, "#ifdef _WIN32\n");
@@ -2068,6 +2073,7 @@ fn cg_prelude_net(out: &mut Vec[u64]) {
   w_s(&mut out, "        return n < 0 ? ~(uint64_t)0 : (uint64_t)n;\n");
   w_s(&mut out, "    }\n");
   w_s(&mut out, "    if (op == 5) return close((int)a) == 0 ? 0 : ~(uint64_t)0;\n");
+  w_s(&mut out, "    if (op == 10) return b <= 2 && shutdown((int)a, (int)b) == 0 ? 0 : ~(uint64_t)0;\n");
   w_s(&mut out, "    if (op == 6) {\n");
   w_s(&mut out, "        socklen_t len = sizeof sa;\n");
   w_s(&mut out, "        if (getsockname((int)a, (struct sockaddr *)&sa, &len) != 0) return ~(uint64_t)0;\n");

@@ -23,6 +23,7 @@ listener, a closed descriptor, an address in use) gives `Option::None` or
 | [`net_recv`](#net_recv) | Reads up to `max` bytes into `out` (replacing it). |
 | [`net_send_all`](#net_send_all) | Sends all of `data`, retrying after a partial write. |
 | [`net_close`](#net_close) | Closes a socket. |
+| [`net_shutdown_send`](#net_shutdown_send) | Shuts down the sending direction of a connected socket. |
 | [`net_now`](#net_now) | The time in seconds since 1970-01-01 UTC, from the system clock (0 if there is none). |
 | [`net_random`](#net_random) | `n` random bytes (at most 256) from the system's source (`/dev/urandom`, `RtlGenRandom`, `crypto.getRandomValues`), or `None` when there is none. |
 
@@ -292,6 +293,60 @@ match net_listen(host, net_ip4(127, 0, 0, 1), 0) {
   Option::Some(s) => { net_close(host, s); },
   Option::None => { return 1; },
 }
+```
+
+### `net_shutdown_send`
+
+```bastio
+fn net_shutdown_send(h: &Host, sock: u64) -> bool
+```
+
+Shuts down the sending direction of a connected socket: the peer reads
+the end of the stream once it has read what was sent, while this side can
+still receive. False if `sock` is not a connected socket.
+
+Example:
+
+```bastio
+let lo = net_ip4(127, 0, 0, 1);
+let mut bad = 1;
+match net_listen(host, lo, 0) {
+  Option::Some(s) => {
+    match net_connect(host, lo, net_port(host, s)) {
+      Option::Some(c) => {
+        match net_accept(host, s) {
+          Option::Some(a) => {
+            let msg = bfrom("bye");
+            let sent = net_send_all(host, c, msg);
+            bfree(msg);
+            let down = net_shutdown_send(host, c);
+            // The peer reads the message, then the end of the stream ...
+            let mut got = balloc(0);
+            let mut n1 = 0;
+            let mut n2 = 1;
+            match net_recv(host, a, 16, &mut got) { Option::Some(n) => { n1 = n; }, Option::None => {}, }
+            match net_recv(host, a, 16, &mut got) { Option::Some(n) => { n2 = n; }, Option::None => {}, }
+            // ... and can still answer.
+            let ans = bfrom("ok");
+            let back = net_send_all(host, a, ans);
+            bfree(ans);
+            let mut n3 = 0;
+            match net_recv(host, c, 16, &mut got) { Option::Some(n) => { n3 = n; }, Option::None => {}, }
+            bfree(got);
+            if sent && down && back && n1 == 3 && n2 == 0 && n3 == 2 { bad = 0; }
+            net_close(host, a);
+          },
+          Option::None => {},
+        }
+        net_close(host, c);
+      },
+      Option::None => {},
+    }
+    net_close(host, s);
+  },
+  Option::None => {},
+}
+if bad != 0 { return 1; }
 ```
 
 ### `net_now`
