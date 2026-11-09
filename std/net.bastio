@@ -273,6 +273,61 @@ fn net_close(h: &Host, sock: u64) {
   bfree(none);
 }
 
+/// Shuts down the sending direction of a connected socket: the peer reads
+/// the end of the stream once it has read what was sent, while this side can
+/// still receive. False if `sock` is not a connected socket, and on the
+/// native backends, which do not have the call yet (the C backend does).
+/// ```
+/// let lo = net_ip4(127, 0, 0, 1);
+/// let mut bad = 1;
+/// match net_listen(host, lo, 0) {
+///   Option::Some(s) => {
+///     match net_connect(host, lo, net_port(host, s)) {
+///       Option::Some(c) => {
+///         match net_accept(host, s) {
+///           Option::Some(a) => {
+///             let msg = bfrom("bye");
+///             let sent = net_send_all(host, c, msg);
+///             bfree(msg);
+///             if net_shutdown_send(host, c) {
+///               // The peer reads the message, then the end of the stream ...
+///               let mut got = balloc(0);
+///               let mut n1 = 0;
+///               let mut n2 = 1;
+///               match net_recv(host, a, 16, &mut got) { Option::Some(n) => { n1 = n; }, Option::None => {}, }
+///               match net_recv(host, a, 16, &mut got) { Option::Some(n) => { n2 = n; }, Option::None => {}, }
+///               // ... and can still answer.
+///               let ans = bfrom("ok");
+///               let back = net_send_all(host, a, ans);
+///               bfree(ans);
+///               let mut n3 = 0;
+///               match net_recv(host, c, 16, &mut got) { Option::Some(n) => { n3 = n; }, Option::None => {}, }
+///               bfree(got);
+///               if sent && back && n1 == 3 && n2 == 0 && n3 == 2 { bad = 0; }
+///             } else {
+///               bad = 0;
+///             }
+///             net_close(host, a);
+///           },
+///           Option::None => {},
+///         }
+///         net_close(host, c);
+///       },
+///       Option::None => {},
+///     }
+///     net_close(host, s);
+///   },
+///   Option::None => {},
+/// }
+/// if bad != 0 { return 1; }
+/// ```
+fn net_shutdown_send(h: &Host, sock: u64) -> bool {
+  let mut none = balloc(0);
+  let r = host_net(h, 10, sock, 1, &mut none);
+  bfree(none);
+  return r == 0;
+}
+
 /// The time in seconds since 1970-01-01 UTC, from the system clock (0 if
 /// there is none). The caller of the TLS client gives this as `now`.
 /// ```
