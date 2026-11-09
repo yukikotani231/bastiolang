@@ -77,6 +77,7 @@ What will be 0.2.0.
 
 ### Language
 
+- `host_own(h)` and `host_return(v)` (stage1, hosted, C backend for now): an owned, linear `Host` that a program can keep in a struct field and lend from there, so code that holds the struct needs no `&Host` parameter of its own.
 - `--ref-params` (stage1, C backend): a shared borrow `&T` of a struct or enum is passed as `const T *` instead of a copy of the value, so a call that lends a large struct (an interpreter's state, say) no longer copies it. The C differs from stage0's, so it is off by default; what the program computes is the same.
 - `host_sandbox(h, op, a, b, buf)` (stage1, hosted): no_new_privs, seccomp filters, Landlock rulesets (ABI version, create, path and TCP port rules, restrict), `realpath`, the current directory and the last error number, for programs that confine themselves. C backend everywhere; x86-64 and AArch64 native on Linux; every call fails on the macOS and Windows native backends and in WebAssembly.
 - `f64_*` builtins (stage1, hosted, C backend for now) and `std/f64.bastio`: IEEE 754 doubles as their bits in a `u64`, wrapped in a type `F64`, with arithmetic, `fma`, comparisons that are false with NaN, saturating conversions, the C library's math functions, `strtod` and the shortest round-trip digits. A test program or library can say `// backend: c` to be built that way by `tests/run.sh`.
