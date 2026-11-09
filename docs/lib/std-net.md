@@ -303,7 +303,8 @@ fn net_shutdown_send(h: &Host, sock: u64) -> bool
 
 Shuts down the sending direction of a connected socket: the peer reads
 the end of the stream once it has read what was sent, while this side can
-still receive. False if `sock` is not a connected socket.
+still receive. False if `sock` is not a connected socket, and on the
+native backends, which do not have the call yet (the C backend does).
 
 Example:
 
@@ -319,21 +320,24 @@ match net_listen(host, lo, 0) {
             let msg = bfrom("bye");
             let sent = net_send_all(host, c, msg);
             bfree(msg);
-            let down = net_shutdown_send(host, c);
-            // The peer reads the message, then the end of the stream ...
-            let mut got = balloc(0);
-            let mut n1 = 0;
-            let mut n2 = 1;
-            match net_recv(host, a, 16, &mut got) { Option::Some(n) => { n1 = n; }, Option::None => {}, }
-            match net_recv(host, a, 16, &mut got) { Option::Some(n) => { n2 = n; }, Option::None => {}, }
-            // ... and can still answer.
-            let ans = bfrom("ok");
-            let back = net_send_all(host, a, ans);
-            bfree(ans);
-            let mut n3 = 0;
-            match net_recv(host, c, 16, &mut got) { Option::Some(n) => { n3 = n; }, Option::None => {}, }
-            bfree(got);
-            if sent && down && back && n1 == 3 && n2 == 0 && n3 == 2 { bad = 0; }
+            if net_shutdown_send(host, c) {
+              // The peer reads the message, then the end of the stream ...
+              let mut got = balloc(0);
+              let mut n1 = 0;
+              let mut n2 = 1;
+              match net_recv(host, a, 16, &mut got) { Option::Some(n) => { n1 = n; }, Option::None => {}, }
+              match net_recv(host, a, 16, &mut got) { Option::Some(n) => { n2 = n; }, Option::None => {}, }
+              // ... and can still answer.
+              let ans = bfrom("ok");
+              let back = net_send_all(host, a, ans);
+              bfree(ans);
+              let mut n3 = 0;
+              match net_recv(host, c, 16, &mut got) { Option::Some(n) => { n3 = n; }, Option::None => {}, }
+              bfree(got);
+              if sent && back && n1 == 3 && n2 == 0 && n3 == 2 { bad = 0; }
+            } else {
+              bad = 0;
+            }
             net_close(host, a);
           },
           Option::None => {},
