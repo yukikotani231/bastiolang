@@ -24,6 +24,8 @@ listener, a closed descriptor, an address in use) gives `Option::None` or
 | [`net_send_all`](#net_send_all) | Sends all of `data`, retrying after a partial write. |
 | [`net_close`](#net_close) | Closes a socket. |
 | [`net_shutdown_send`](#net_shutdown_send) | Shuts down the sending direction of a connected socket. |
+| [`net_connect_start`](#net_connect_start) | Starts a connection to `ip`:`port` without waiting for it. |
+| [`net_connect_result`](#net_connect_result) | The outcome of a connection started with `net_connect_start`, once the socket is writable. |
 | [`net_now`](#net_now) | The time in seconds since 1970-01-01 UTC, from the system clock (0 if there is none). |
 | [`net_random`](#net_random) | `n` random bytes (at most 256) from the system's source (`/dev/urandom`, `RtlGenRandom`, `crypto.getRandomValues`), or `None` when there is none. |
 
@@ -351,6 +353,54 @@ match net_listen(host, lo, 0) {
   Option::None => {},
 }
 if bad != 0 { return 1; }
+```
+
+### `net_connect_start`
+
+```bastio
+fn net_connect_start(h: &Host, ip: u64, port: u64) -> Option[u64]
+```
+
+Starts a connection to `ip`:`port` without waiting for it: the socket
+that comes back is non-blocking and the connection is under way. Wait
+until the socket can be written to (`host_sys` operation 50, `os_poll`),
+then ask `net_connect_result`. `None` when the socket cannot be made, and
+on targets without this call (only the Linux C backend has it).
+
+Example:
+
+```bastio
+// The socket is made at once, whatever the answer will be; a listener
+// that is there accepts the connection.
+let lo = net_ip4(127, 0, 0, 1);
+match net_listen(host, lo, 0) {
+  Option::Some(l) => {
+    match net_connect_start(host, lo, net_port(host, l)) {
+      Option::Some(c) => { net_close(host, c); },
+      Option::None => {},
+    }
+    net_close(host, l);
+  },
+  Option::None => {},
+}
+```
+
+### `net_connect_result`
+
+```bastio
+fn net_connect_result(h: &Host, sock: u64) -> u64
+```
+
+The outcome of a connection started with `net_connect_start`, once the
+socket is writable: 0 when it is connected, else the system's error
+number (111, refused, on Linux). 2^64 - 1 if `sock` cannot be asked.
+Before the socket is writable the answer is 0 too, so wait first.
+
+Example:
+
+```bastio
+// A descriptor that is not a socket cannot be asked.
+if net_connect_result(host, 99999) != 18446744073709551615 { return 1; }
 ```
 
 ### `net_now`
