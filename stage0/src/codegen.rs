@@ -1430,16 +1430,30 @@ static inline uint64_t bst_cpu_get(bst_cpu c, uint64_t r) { (void)c; return bst_
 static inline void bst_cpu_set(bst_cpu *c, uint64_t r, uint64_t v) { (void)c; bst_platform_ctx()[r] = v; }
 /* The user's x87/SSE state, in a page the kernel owns (the platform has
  * enabled CR4.OSFXSR). fxrstor faults on reserved MXCSR bits, so the load
- * keeps only the defined bits (0-15) while it runs and puts the word back. */
+ * keeps only the defined bits (0-15) while it runs and puts the word back.
+ * A platform that has also enabled CR4.OSXSAVE and set XCR0 defines
+ * bst_platform_xsave_mask (the components in XCR0, at most 32 bits): the page
+ * then holds the XSAVE area, which starts on a 64-byte boundary and must fit it
+ * (832 bytes for x87, SSE and AVX), and the load keeps only what the header may
+ * say: x87 and SSE are always loaded from the page, the other bits of
+ * XSTATE_BV are limited to the mask, and the rest of the header is zero. */
+extern uint64_t bst_platform_xsave_mask __attribute__((weak));
+static inline uint64_t bst_xsave_mask(void) { return &bst_platform_xsave_mask ? bst_platform_xsave_mask : 0; }
 static inline void bst_cpu_fpu_save(bst_cpu *c, bst_frame *f) {
     (void)c;
-    __asm__ volatile ("fxsave64 (%0)" : : "r"(*f) : "memory");
+    uint64_t m = bst_xsave_mask();
+    if (m) __asm__ volatile ("xsave64 (%0)" : : "r"(*f), "a"((uint32_t)m), "d"((uint32_t)(m >> 32)) : "memory");
+    else __asm__ volatile ("fxsave64 (%0)" : : "r"(*f) : "memory");
 }
 static inline void bst_cpu_fpu_load(bst_cpu *c, bst_frame f) {
     (void)c;
-    uint64_t *w = (uint64_t *)f, w3 = w[3];
+    uint64_t *w = (uint64_t *)f, w3 = w[3], m = bst_xsave_mask();
     w[3] = w3 & 0xFFFF;                 /* bytes 24-27 are MXCSR, 28-31 its mask (ignored) */
-    __asm__ volatile ("fxrstor64 (%0)" : : "r"(f) : "memory");
+    if (m) {
+        w[64] = (w[64] | 3) & m;        /* XSTATE_BV */
+        for (int i = 65; i < 72; i++) w[i] = 0;   /* XCOMP_BV and the reserved bytes: the standard format */
+        __asm__ volatile ("xrstor64 (%0)" : : "r"(f), "a"((uint32_t)m), "d"((uint32_t)(m >> 32)) : "memory");
+    } else __asm__ volatile ("fxrstor64 (%0)" : : "r"(f) : "memory");
     w[3] = w3;                          /* the page reads as it did */
 }
 static inline uint64_t bst_cpu_run(bst_cpu *c, bst_mmu m) {
