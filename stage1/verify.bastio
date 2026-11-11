@@ -542,6 +542,7 @@ fn push_ty(v: &mut Vr, m: &Mono, p: &Parser, t: u64) {
   else if k == TY_LEASE { push_str(&mut v, "Lease"); }
   else if k == TY_SHARED { push_str(&mut v, "Shared"); }
   else if k == TY_DIRTY { push_str(&mut v, "Dirty"); }
+  else if k == TY_SBYTES { push_str(&mut v, "SharedBytes"); }
   else if k == TY_U8 { push_str(&mut v, "u8"); }
   else if k == TY_U16 { push_str(&mut v, "u16"); }
   else if k == TY_U32 { push_str(&mut v, "u32"); }
@@ -551,6 +552,7 @@ fn push_ty(v: &mut Vr, m: &Mono, p: &Parser, t: u64) {
   else if k == TY_I64 { push_str(&mut v, "i64"); }
   else if k == TY_STRUCT || k == TY_ENUM { push_inst(&mut v, m, p, x.a); }
   else if k == TY_BOX { push_str(&mut v, "Box["); push_ty(&mut v, m, p, x.a); push_str(&mut v, "]"); }
+  else if k == TY_THREAD { push_str(&mut v, "Thread["); push_ty(&mut v, m, p, x.a); push_str(&mut v, "]"); }
   else if k == TY_VEC { push_str(&mut v, "Vec["); push_ty(&mut v, m, p, x.a); push_str(&mut v, "]"); }
   else if k == TY_REF { push_str(&mut v, "&"); push_ty(&mut v, m, p, x.a); }
   else if k == TY_MUTREF { push_str(&mut v, "&mut "); push_ty(&mut v, m, p, x.a); }
@@ -1569,7 +1571,7 @@ fn term(v: &Vr, x: u64) -> u64 {
 fn obj_fields(k: u64) -> u64 {
   if k == TY_PT { return 5; }
   if k == TY_POOL { return 2; }
-  if k == TY_FRAME || k == TY_MMU || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA || k == TY_SHARED || k == TY_DIRTY { return 1; }
+  if k == TY_FRAME || k == TY_MMU || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA || k == TY_SHARED || k == TY_DIRTY || k == TY_SBYTES { return 1; }
   if k == TY_PORTIO || k == TY_MMIO { return 2; }
   return 0;
 }
@@ -2200,6 +2202,10 @@ fn list_text(v: &mut Vr, p: &Parser, head: u64) -> u64 {
 // ---- Fresh values ----
 
 fn fresh_field(v: &mut Vr, tk: u64, j: u64, hint: u64) -> u64 {
+  if tk == TY_SBYTES {
+    let h = cat_str(&mut v, hint, "_len");
+    return fresh_int(&mut v, h, v.t_zero, v.t_allocmax);
+  }
   if tk == TY_PT && j == 2 {
     let h = cat_str(&mut v, hint, "_used");
     return fresh_array(&mut v, h, SO_BOOL);
@@ -2262,7 +2268,7 @@ fn fresh_field(v: &mut Vr, tk: u64, j: u64, hint: u64) -> u64 {
 /// Ghost fields a loop keeps when only builtins that never change them
 /// change the object (a page table keeps its id and level).
 fn kept_by_builtins(tk: u64, j: u64) -> bool {
-  return ((tk == TY_FRAME || tk == TY_PT || tk == TY_DMA || tk == TY_SHARED || tk == TY_DIRTY) && j == 0) || (tk == TY_PT && (j == 1 || j == 3)) || (tk == TY_POOL && j == 1)
+  return ((tk == TY_FRAME || tk == TY_PT || tk == TY_DMA || tk == TY_SHARED || tk == TY_DIRTY || tk == TY_SBYTES) && j == 0) || (tk == TY_PT && (j == 1 || j == 3)) || (tk == TY_POOL && j == 1)
     || ((tk == TY_PORTIO || tk == TY_MMIO) && j <= 1);
 }
 
@@ -2394,7 +2400,8 @@ fn fresh_of(v: &mut Vr, c: &Checker, m: &Mono, p: &Parser, tyx: u64, hint: u64) 
     let cap = fresh_cap(&mut v, l, hint);
     return mk(&mut v, VV_VEC, inner_t(m, tyx), l, el, cap, 0);
   }
-  if k == TY_BOX {
+  // A thread reads like a box holding its function's result.
+  if k == TY_BOX || k == TY_THREAD {
     if v.box_depth >= BOX_DEPTH {
       return mk(&mut v, VV_BOXO, inner_t(m, tyx), 0, 0, 0, 0);
     }
@@ -3480,6 +3487,9 @@ fn vspec_builtin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, env:
   if span_is(p, n.s, n.e, "mmio_len") {
     return g_len(v, x);
   }
+  if span_is(p, n.s, n.e, "sbytes_len") {
+    return g_id(v, x);
+  }
   if span_is(p, n.s, n.e, "pt_shared") {
     let ix = spec_tm(&mut v, c, &mut m, p, arg_node(p, i, 1), env, oenv, has_old, res, &mut bound);
     return app2(&mut v, OP_SELECT, g_shared(v, x), ix);
@@ -4068,6 +4078,9 @@ fn vcall(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VSt
   if inst == 0 && name_is(p, i, "smp_run") {
     return vsmp_run(&mut v, c, &mut m, p, i, &mut st);
   }
+  if inst == 0 && name_is(p, i, "thread_spawn") {
+    return vthread_spawn(&mut v, c, &mut m, p, i, &mut st);
+  }
   if inst == 0 && (name_is(p, i, "pt_borrow") || name_is(p, i, "pt_borrow_frame")) {
     return vpt_borrow(&mut v, c, &mut m, p, i, &mut st);
   }
@@ -4596,6 +4609,235 @@ fn vsmp_run(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut 
   return res;
 }
 
+fn is_sbytes_builtin(p: &Parser, i: u64) -> bool {
+  let n = node_at(p.nodes, i);
+  return n.e > n.s && n.e - n.s > 7 && span_is(p, n.s, n.s + 7, "sbytes_");
+}
+
+/// Proves that the access of `w` bytes at offset `i` (arguments `wi` and
+/// `ii`) of SharedBytes `b` is a whole word inside it: `w` is one of `ws`
+/// (1, 2, 4 and 8, or with `big` only 4 and 8), `i` is a multiple of `w`
+/// and `i + w <= sbytes_len(b)`.
+fn vsb_word(v: &mut Vr, p: &Parser, i: u64, args: &Vec[u64], vals: &Vec[u64], ii: u64, wi: u64, big: bool, st: &VState) {
+  let b = u_at(vals, 0);
+  let off = term(v, u_at(vals, ii));
+  let w = term(v, u_at(vals, wi));
+  let four = num(&mut v, 4);
+  let eight = num(&mut v, 8);
+  let is4 = app2(&mut v, OP_EQ, w, four);
+  let is8 = app2(&mut v, OP_EQ, w, eight);
+  let mut ok = app2(&mut v, OP_OR, is4, is8);
+  if !big {
+    let one = num(&mut v, 1);
+    let two = num(&mut v, 2);
+    let is1 = app2(&mut v, OP_EQ, w, one);
+    let is2 = app2(&mut v, OP_EQ, w, two);
+    let small = app2(&mut v, OP_OR, is1, is2);
+    ok = app2(&mut v, OP_OR, small, ok);
+  }
+  vm_s(&mut v, "that the width `");
+  vm_arg(&mut v, p, u_at(args, wi));
+  if big {
+    vm_s(&mut v, "` is 4 or 8 bytes");
+  } else {
+    vm_s(&mut v, "` is 1, 2, 4 or 8 bytes");
+  }
+  prove(&mut v, st, ok, i, VC_BOUNDS);
+  let end = app2(&mut v, OP_ADD, off, w);
+  let g = app2(&mut v, OP_LE, end, g_id(v, b));
+  vm_s(&mut v, "that offset `");
+  vm_arg(&mut v, p, u_at(args, ii));
+  vm_s(&mut v, "` is within `");
+  vm_arg(&mut v, p, u_at(args, 0));
+  vm_s(&mut v, "` (`");
+  vm_arg(&mut v, p, u_at(args, ii));
+  vm_s(&mut v, " + ");
+  vm_arg(&mut v, p, u_at(args, wi));
+  vm_s(&mut v, " <= sbytes_len(");
+  vm_arg(&mut v, p, u_at(args, 0));
+  vm_s(&mut v, ")`)");
+  prove(&mut v, st, g, i, VC_BOUNDS);
+  // An atomic access must not straddle two words.
+  let md = app2(&mut v, OP_MOD, off, w);
+  let g2 = app2(&mut v, OP_EQ, md, v.t_zero);
+  vm_s(&mut v, "that the access at offset `");
+  vm_arg(&mut v, p, u_at(args, ii));
+  vm_s(&mut v, "` of `");
+  vm_arg(&mut v, p, u_at(args, 0));
+  vm_s(&mut v, "` is aligned to its width `");
+  vm_arg(&mut v, p, u_at(args, wi));
+  vm_s(&mut v, "`");
+  prove(&mut v, st, g2, i, VC_BOUNDS);
+}
+
+/// A word read from shared bytes: any value another thread may have
+/// written, but it fits in `w` bytes (value `wi`).
+fn vsb_read(v: &mut Vr, p: &Parser, i: u64, vals: &Vec[u64], wi: u64, st: &mut VState) -> u64 {
+  let w = term(v, u_at(vals, wi));
+  let n = node_at(p.nodes, i);
+  let h = atom_src(&mut v, p, n.s, n.e);
+  let r = fresh_u64(&mut v, h);
+  let tr = term(v, r);
+  let one = num(&mut v, 1);
+  let two = num(&mut v, 2);
+  let four = num(&mut v, 4);
+  let m1 = num(&mut v, 255);
+  let m2 = num(&mut v, 65535);
+  let m4 = num(&mut v, 4294967295);
+  let e1 = app2(&mut v, OP_EQ, w, one);
+  let l1 = app2(&mut v, OP_LE, tr, m1);
+  let i1 = app2(&mut v, OP_IMP, e1, l1);
+  vec_push(&mut st.pc, i1);
+  let e2 = app2(&mut v, OP_EQ, w, two);
+  let l2 = app2(&mut v, OP_LE, tr, m2);
+  let i2 = app2(&mut v, OP_IMP, e2, l2);
+  vec_push(&mut st.pc, i2);
+  let e4 = app2(&mut v, OP_EQ, w, four);
+  let l4 = app2(&mut v, OP_LE, tr, m4);
+  let i4 = app2(&mut v, OP_IMP, e4, l4);
+  vec_push(&mut st.pc, i4);
+  return r;
+}
+
+/// The SharedBytes builtins (stage1, hosted). The bytes may change at any
+/// moment, so nothing is known of a value read except that it fits; what
+/// is proved is that every access is inside the bytes and, for the word
+/// accesses, aligned. The length never changes.
+fn vsbytes(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Vec[u64], vals: &Vec[u64], st: &mut VState) -> u64 {
+  let x0 = u_at(vals, 0);
+  let a0 = vl_at(v, x0);
+  let sbt = kind_ty(m, p, TY_SBYTES);
+  if name_is(p, i, "sbytes_new") {
+    let g = app2(&mut v, OP_LE, a0.a, v.t_allocmax);
+    vm_s(&mut v, "that the allocation size `");
+    vm_arg(&mut v, p, u_at(args, 0));
+    vm_s(&mut v, "` is at most 2^60 bytes");
+    prove(&mut v, st, g, i, VC_ALLOC);
+    return mk_obj(&mut v, m, sbt, a0.a, 0, 0);
+  }
+  if name_is(p, i, "sbytes_len") {
+    return mk_u(&mut v, g_id(v, x0));
+  }
+  if name_is(p, i, "sbytes_clone") {
+    return mk_obj(&mut v, m, sbt, g_id(v, x0), 0, 0);
+  }
+  if name_is(p, i, "sbytes_drop") {
+    return v.unit;
+  }
+  if name_is(p, i, "sbytes_load") || name_is(p, i, "sbytes_get") {
+    vsb_word(&mut v, p, i, args, vals, 1, 2, false, st);
+    return vsb_read(&mut v, p, i, vals, 2, &mut st);
+  }
+  if name_is(p, i, "sbytes_store") || name_is(p, i, "sbytes_set") {
+    vsb_word(&mut v, p, i, args, vals, 1, 2, false, st);
+    return v.unit;
+  }
+  if name_is(p, i, "sbytes_rmw") {
+    let op = term(v, u_at(vals, 1));
+    let five = num(&mut v, 5);
+    let g = app2(&mut v, OP_LE, op, five);
+    vm_s(&mut v, "that the operation `");
+    vm_arg(&mut v, p, u_at(args, 1));
+    vm_s(&mut v, "` is at most 5 (add, sub, and, or, xor, exchange)");
+    prove(&mut v, st, g, i, VC_BOUNDS);
+    vsb_word(&mut v, p, i, args, vals, 2, 3, false, st);
+    return vsb_read(&mut v, p, i, vals, 3, &mut st);
+  }
+  if name_is(p, i, "sbytes_cas") {
+    vsb_word(&mut v, p, i, args, vals, 1, 2, false, st);
+    return vsb_read(&mut v, p, i, vals, 2, &mut st);
+  }
+  if name_is(p, i, "sbytes_wait") {
+    vsb_word(&mut v, p, i, args, vals, 1, 2, true, st);
+    let h = atom_str(&mut v, "wait");
+    let two = num(&mut v, 2);
+    let t = fresh_int(&mut v, h, v.t_zero, two);
+    return mk_u(&mut v, t);
+  }
+  if name_is(p, i, "sbytes_notify") {
+    let off = term(v, u_at(vals, 1));
+    let g = app2(&mut v, OP_LT, off, g_id(v, x0));
+    vm_s(&mut v, "that offset `");
+    vm_arg(&mut v, p, u_at(args, 1));
+    vm_s(&mut v, "` is within `");
+    vm_arg(&mut v, p, u_at(args, 0));
+    vm_s(&mut v, "` (`");
+    vm_arg(&mut v, p, u_at(args, 1));
+    vm_s(&mut v, " < sbytes_len(");
+    vm_arg(&mut v, p, u_at(args, 0));
+    vm_s(&mut v, ")`)");
+    prove(&mut v, st, g, i, VC_BOUNDS);
+    let h = atom_str(&mut v, "woken");
+    let t = fresh_int(&mut v, h, v.t_zero, term(v, u_at(vals, 2)));
+    return mk_u(&mut v, t);
+  }
+  // sbytes_read(b, from, out, at, n) and sbytes_write(b, at, src, from, n):
+  // both ranges inside their buffers. What is read is unknown.
+  let bi = 2;
+  let si = 1;
+  let bo = 3;
+  let mut wh = "source";
+  if name_is(p, i, "sbytes_read") {
+    wh = "destination";
+  }
+  let n = term(v, u_at(vals, 4));
+  let s = term(v, u_at(vals, si));
+  let se = app2(&mut v, OP_ADD, s, n);
+  let g = app2(&mut v, OP_LE, se, g_id(v, x0));
+  vm_s(&mut v, "that bytes `");
+  vm_arg(&mut v, p, u_at(args, si));
+  vm_s(&mut v, "` to `");
+  vm_arg(&mut v, p, u_at(args, si));
+  vm_s(&mut v, " + ");
+  vm_arg(&mut v, p, u_at(args, 4));
+  vm_s(&mut v, "` are within `");
+  vm_arg(&mut v, p, u_at(args, 0));
+  vm_s(&mut v, "` (at most `sbytes_len(");
+  vm_arg(&mut v, p, u_at(args, 0));
+  vm_s(&mut v, ")`)");
+  prove(&mut v, st, g, i, VC_BOUNDS);
+  let bx = u_at(vals, bi);
+  let bv = vl_at(v, bx);
+  let o = term(v, u_at(vals, bo));
+  let oe = app2(&mut v, OP_ADD, o, n);
+  let g2 = app2(&mut v, OP_LE, oe, bv.a);
+  vm_brange(&mut v, p, args, wh, bo, 4, bi);
+  prove(&mut v, st, g2, i, VC_BOUNDS);
+  if name_is(p, i, "sbytes_read") {
+    let h = atom_str(&mut v, "sbytes_read");
+    let fresh = fresh_array(&mut v, h, SO_INT);
+    let inr = port_range(&mut v, o, n);
+    let from = app2(&mut v, OP_SELECT, fresh, v.t_k);
+    let kept = app2(&mut v, OP_SELECT, bv.b, v.t_k);
+    let body = app3(&mut v, OP_ITE, inr, from, kept);
+    let nd = lambda_tm(&mut v, v.t_k, body);
+    let nb = mk(&mut v, VV_BUF, 0, bv.a, nd, 0, 0);
+    put_back(&mut v, m, p, &mut st, u_at(args, bi), nb);
+  }
+  return v.unit;
+}
+
+/// `thread_spawn(f, args..)`: the new thread computes `f(args..)` from
+/// arguments nobody else can reach any more (they were moved in), so it is
+/// verified as that call: `f`'s precondition is proved here. The thread
+/// holds the result like a box, and `thread_join` takes it out with `f`'s
+/// postcondition known of it.
+fn vthread_spawn(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VState) -> u64 {
+  let n = node_at(p.nodes, i);
+  let a0 = n.a;
+  let fnode = node_at(p.nodes, a0);
+  let x = plain_inst(&mut m, plain_fn(p, fnode.s, fnode.e));
+  let mut args = vec_new[u64]();
+  let mut a = next_of(p, a0);
+  while a != 0 {
+    vec_push(&mut args, a);
+    a = next_of(p, a);
+  }
+  let res = vcall_args(&mut v, c, &mut m, p, i, args, 0, &mut st, x);
+  vec_free(args);
+  return mk(&mut v, VV_BOXK, 0, res, 0, 0, 0);
+}
+
 /// A call of a user function (instance `x`): only its contract is used.
 fn vuser_call(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, x: u64, loc: u64, args: &Vec[u64], vals: &Vec[u64], hid: u64, st: &mut VState) -> u64 {
   let xi = inst_at(m, x);
@@ -4897,7 +5139,7 @@ fn vbuiltin(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Ve
     vec_free(invs);
     return r;
   }
-  if name_is(p, i, "unbox") {
+  if name_is(p, i, "unbox") || name_is(p, i, "thread_join") {
     if a0.kind == VV_BOXK {
       return a0.a;
     }
@@ -5250,6 +5492,9 @@ fn vbuiltin_3(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &
   let x1 = u_at(vals, 1);
   let x2 = u_at(vals, 2);
   let a0 = vl_at(v, x0);
+  if is_sbytes_builtin(p, i) {
+    return vsbytes(&mut v, c, &mut m, p, i, args, vals, &mut st);
+  }
   if name_is(p, i, "host_argc") {
     return fresh_u64_named(&mut v, "argc");
   }
@@ -6713,7 +6958,7 @@ fn shape_keeping(p: &Parser, i: u64) -> bool {
     || name_is(p, i, "pt_take") || name_is(p, i, "pt_put_frame") || name_is(p, i, "pt_take_frame")
     || name_is(p, i, "pt_borrow") || name_is(p, i, "pt_borrow_frame") || name_is(p, i, "pt_lease_count") || name_is(p, i, "pt_set_access")
     || name_is(p, i, "pt_put_shared") || name_is(p, i, "pt_take_shared") || name_is(p, i, "shared_drop") || name_is(p, i, "pool_take") || name_is(p, i, "pool_take_dirty") || name_is(p, i, "pool_give") || name_is(p, i, "frame_write")
-    || name_is(p, i, "frame_write8") || name_is(p, i, "bcopy") || name_is(p, i, "bmove") || name_is(p, i, "frame_to_bytes")
+    || name_is(p, i, "frame_write8") || name_is(p, i, "bcopy") || name_is(p, i, "bmove") || name_is(p, i, "frame_to_bytes") || name_is(p, i, "sbytes_read")
     || name_is(p, i, "bytes_to_frame") || name_is(p, i, "frame_to_frame") || name_is(p, i, "dma_to_bytes") || name_is(p, i, "bytes_to_dma") || name_is(p, i, "cpu_set") || name_is(p, i, "cpu_run") || name_is(p, i, "cpu_idle")
     || name_is(p, i, "cpu_fpu_save") || name_is(p, i, "cpu_fpu_load") || name_is(p, i, "pio_in8") || name_is(p, i, "pio_in16")
     || name_is(p, i, "pio_in32") || name_is(p, i, "pio_out8") || name_is(p, i, "pio_out16") || name_is(p, i, "pio_out32")
