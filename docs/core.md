@@ -68,7 +68,7 @@ Each module has a reference page, generated from its source: every function with
 | [`core/print.bastio`](lib/core-print.md) | Writing text and numbers to the serial console. |
 | [`core/ring.bastio`](lib/core-ring.md) | Ring buffers and fixed-capacity FIFO queues. |
 | [`core/rows.bastio`](lib/core-rows.md) | Tables of fixed-size rows in one `Buf`. |
-| [`core/rsa.bastio`](lib/core-rsa.md) | RSA signature verification with SHA-256, SHA-384 and SHA-512 (RFC 8017). |
+| [`core/rsa.bastio`](lib/core-rsa.md) | RSA with SHA-256, SHA-384 and SHA-512 (RFC 8017). |
 | [`core/scan.bastio`](lib/core-scan.md) | Cutting a byte string into pieces. |
 | [`core/set.bastio`](lib/core-set.md) | A set of `u64`, built on core/hashmap.bastio. |
 | [`core/sha1.bastio`](lib/core-sha1.md) | SHA-1 (FIPS 180-4) and HMAC-SHA-1 (RFC 2104). |
