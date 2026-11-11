@@ -48,7 +48,10 @@ import "rsa.bastio";
 /// TLS 1.2 handshake is (0 Certificate, 1 ServerKeyExchange, 2
 /// ServerHelloDone, 3 the server's ChangeCipherSpec, 4 its Finished), `rnd`
 /// the client and then the server random, `ms` the premaster and then the
-/// master secret, `ems` whether it is an extended master secret.
+/// master secret, `ems` whether it is an extended master secret. The
+/// server of core/tls13server keeps its signing key in `sk_kind` (0 none, 1
+/// RSA with the modulus in `sk_a` and the private exponent in `sk_b`, 2
+/// ECDSA P-256 with the scalar in `sk_a`).
 struct Tls13Client {
   state: u64, priv_key: Bytes, name: Bytes, transcript: Bytes,
   hs_secret: Bytes, c_hs: Bytes, s_hs: Bytes,
@@ -57,7 +60,8 @@ struct Tls13Client {
   c_secret: Bytes, s_secret: Bytes, c_seq: u64, s_seq: u64,
   inbuf: Bytes, hsbuf: Bytes, leaf: Bytes,
   verify: bool, verdict: u64, alpn: Bytes, sent_close: bool,
-  allow12: bool, v12: bool, step: u64, rnd: Bytes, ms: Bytes, ems: bool, cs12: u64
+  allow12: bool, v12: bool, step: u64, rnd: Bytes, ms: Bytes, ems: bool, cs12: u64,
+  sk_kind: u64, sk_a: Bytes, sk_b: Bytes
 }
 
 /// Internal: the handshake and traffic secrets of `c` all have `n` bytes, the
@@ -77,6 +81,7 @@ spec fn tls13c_ok(c: &Tls13Client) -> bool {
     && blen(c.name) <= 255
     && blen(c.transcript) < 1073741824 && blen(c.inbuf) < 1073741824 && blen(c.hsbuf) < 1073741824 && blen(c.leaf) < 1048576
     && blen(c.alpn) <= 256 && blen(c.rnd) <= 64 && blen(c.ms) <= 48
+    && blen(c.sk_a) < 65536 && blen(c.sk_b) < 65536
 }
 
 /// Internal: the 9 as a field element, the base point of X25519.
@@ -227,7 +232,8 @@ fn tls13c_new_opts(random: &Bytes, session_id: &Bytes, priv_key: &Bytes, name: &
     c_secret: balloc(32), s_secret: balloc(32), c_seq: 0, s_seq: 0,
     inbuf: balloc(0), hsbuf: balloc(0), leaf: balloc(0),
     verify: (opts & 1) == 0, verdict: 0, alpn: bytes_slice(alpn, 0, blen(alpn)), sent_close: false,
-    allow12: allow12, v12: false, step: 0, rnd: bytes_slice(random, 0, 32), ms: balloc(0), ems: false, cs12: 0
+    allow12: allow12, v12: false, step: 0, rnd: bytes_slice(random, 0, 32), ms: balloc(0), ems: false, cs12: 0,
+    sk_kind: 0, sk_a: balloc(0), sk_b: balloc(0)
   };
 }
 
@@ -251,7 +257,8 @@ fn tls13c_blank() -> Tls13Client
     c_secret: balloc(0), s_secret: balloc(0), c_seq: 0, s_seq: 0,
     inbuf: balloc(0), hsbuf: balloc(0), leaf: balloc(0),
     verify: true, verdict: 0, alpn: balloc(0), sent_close: false,
-    allow12: false, v12: false, step: 0, rnd: balloc(0), ms: balloc(0), ems: false, cs12: 0
+    allow12: false, v12: false, step: 0, rnd: balloc(0), ms: balloc(0), ems: false, cs12: 0,
+    sk_kind: 0, sk_a: balloc(0), sk_b: balloc(0)
   };
 }
 
@@ -275,6 +282,8 @@ fn tls13c_free(c: Tls13Client) {
   bfree(c.alpn);
   bfree(c.rnd);
   bfree(c.ms);
+  bfree(c.sk_a);
+  bfree(c.sk_b);
 }
 
 /// The protocol version in use: 772 (TLS 1.3), or 771 once a server chose
@@ -329,6 +338,7 @@ fn tls13c_check(c: &Tls13Client) -> bool
   else { return false; }
   if blen(c.c_iv) != 12 || blen(c.s_iv) != 12 { return false; }
   if blen(c.name) > 255 || blen(c.alpn) > 256 || blen(c.rnd) > 64 || blen(c.ms) > 48 { return false; }
+  if blen(c.sk_a) >= 65536 || blen(c.sk_b) >= 65536 { return false; }
   if blen(c.transcript) >= 1073741824 || blen(c.inbuf) >= 1073741824 || blen(c.hsbuf) >= 1073741824 || blen(c.leaf) >= 1048576 { return false; }
   return true;
 }

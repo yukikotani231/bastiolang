@@ -273,4 +273,65 @@ PY
   fetch "fetch: not an https URL" "http://localhost:$port/ok" ec.roots 1 "no answer"
 fi
 
+# The server of core/tls13server (examples/httpsserve) against OpenSSL's client.
+if command -v python3 >/dev/null; then
+  "$BASTIOC" -o "$tmp/httpsserve" examples/httpsserve.bastio >/dev/null || fail "cannot build examples/httpsserve.bastio"
+  # The raw key httpsserve reads: the P-256 scalar, or the RSA modulus and
+  # private exponent of the same length.
+  rawkey() { # name kind(ec|rsa)
+    openssl "$2" -in "$tmp/$1.key" -noout -text 2>/dev/null | python3 -c '
+import re, sys
+t, kind, out = sys.stdin.read(), sys.argv[1], sys.argv[2]
+def field(name):
+    m = re.search(name + r":\s*\n((?:\s+[0-9a-f:]+\n)+)", t)
+    return bytes.fromhex(re.sub(r"[\s:]", "", m.group(1))).lstrip(b"\0")
+if kind == "ec":
+    key = field("priv").rjust(32, b"\0")
+else:
+    n = field("modulus"); key = n + field("privateExponent").rjust(len(n), b"\0")
+open(out, "wb").write(key)' "$2" "$tmp/$1.raw"
+  }
+  sserve() { # chain key kind
+    port=$((port + 1))
+    "$tmp/httpsserve" "$port" "$tmp/$1" "$3" "$tmp/$2.raw" 1000 >"$tmp/serve.log" 2>&1 &
+    pids+=($!)
+    local i
+    for i in $(seq 1 100); do
+      (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && return 0
+      sleep 0.1
+    done
+    echo "tls: the server did not start"; cat "$tmp/serve.log"; return 1
+  }
+  sclient() { # description want(0|1) text CAfile [s_client options...]
+    local d=$1 want=$2 text=$3 ca=$4 out rc
+    shift 4
+    out=$(printf 'GET / HTTP/1.0\r\nHost: localhost\r\n\r\n' | timeout 20 openssl s_client -connect "127.0.0.1:$port" \
+      -CAfile "$tmp/$ca" -verify_return_error -verify_hostname localhost -ign_eof "$@" 2>&1); rc=$?
+    if [ "$want" = 0 ] && { [ $rc != 0 ] || ! printf '%s' "$out" | grep -qF -- "$text"; }; then
+      fail "$d: exit $rc"; printf '%s\n' "$out" | grep -iE 'error|alert|verify' | head -3 | sed 's/^/    /'
+    elif [ "$want" != 0 ] && printf '%s' "$out" | grep -qF -- "hello alpn"; then fail "$d: answered"
+    else echo "ok   $d"; fi
+  }
+  openssl x509 -in "$tmp/eclocal.pem" -outform DER -out "$tmp/eclocal.der"
+  openssl x509 -in "$tmp/rsalocal.pem" -outform DER -out "$tmp/rsalocal.der"
+  openssl x509 -in "$tmp/chainleaf.pem" -outform DER -out "$tmp/chainleaf.der"
+  openssl x509 -in "$tmp/mid.pem" -outform DER -out "$tmp/mid.der"
+  cat "$tmp/chainleaf.der" "$tmp/mid.der" > "$tmp/chain2.der"
+  rawkey eclocal ec; rawkey rsalocal rsa; rawkey chainleaf ec
+  sserve eclocal.der eclocal 2 && {
+    sclient "server: ECDSA certificate, ALPN and SNI" 0 "hello alpn=http/1.1 sni=localhost" ecca.pem -servername localhost -alpn h2,http/1.1
+    sclient "server: ALPN, the server's preference" 0 "hello alpn=http/1.1" ecca.pem -alpn h2,http/1.1
+    sclient "server: no ALPN, no SNI" 0 "hello alpn= sni=" ecca.pem -noservername
+    sclient "server: TLS_AES_128_GCM_SHA256" 0 "Cipher is TLS_AES_128_GCM_SHA256" ecca.pem -ciphersuites TLS_AES_128_GCM_SHA256
+    sclient "server: TLS_AES_256_GCM_SHA384" 0 "Cipher is TLS_AES_256_GCM_SHA384" ecca.pem -ciphersuites TLS_AES_256_GCM_SHA384
+    sclient "server: TLS_CHACHA20_POLY1305_SHA256" 0 "Cipher is TLS_CHACHA20_POLY1305_SHA256" ecca.pem -ciphersuites TLS_CHACHA20_POLY1305_SHA256
+    sclient "server: client that trusts another root" 1 "" other.pem
+    sclient "server: client that only speaks TLS 1.2" 1 "" ecca.pem -tls1_2
+    sclient "server: client with no X25519 share (no HelloRetryRequest yet)" 1 "" ecca.pem -groups P-256
+  }
+  sserve rsalocal.der rsalocal 1 && sclient "server: RSA certificate (rsa_pss_rsae_sha256)" 0 "Peer signature type: RSA-PSS" rsaca.pem
+  sserve chain2.der chainleaf 2 && sclient "server: chain through an intermediate" 0 "hello alpn" ecca.pem
+  sserve rsalocal.der eclocal 2 && sclient "server: key that does not match the certificate" 1 "" rsaca.pem
+fi
+
 [ $fails = 0 ] && echo "tls: all passed" || { echo "tls: $fails failed"; exit 1; }

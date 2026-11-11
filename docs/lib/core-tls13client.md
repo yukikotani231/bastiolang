@@ -63,7 +63,8 @@ struct Tls13Client {
   c_secret: Bytes, s_secret: Bytes, c_seq: u64, s_seq: u64,
   inbuf: Bytes, hsbuf: Bytes, leaf: Bytes,
   verify: bool, verdict: u64, alpn: Bytes, sent_close: bool,
-  allow12: bool, v12: bool, step: u64, rnd: Bytes, ms: Bytes, ems: bool, cs12: u64
+  allow12: bool, v12: bool, step: u64, rnd: Bytes, ms: Bytes, ems: bool, cs12: u64,
+  sk_kind: u64, sk_a: Bytes, sk_b: Bytes
 }
 ```
 
@@ -79,7 +80,10 @@ once the server chose it (cipher suite `cs12`); `step` is then where the
 TLS 1.2 handshake is (0 Certificate, 1 ServerKeyExchange, 2
 ServerHelloDone, 3 the server's ChangeCipherSpec, 4 its Finished), `rnd`
 the client and then the server random, `ms` the premaster and then the
-master secret, `ems` whether it is an extended master secret.
+master secret, `ems` whether it is an extended master secret. The
+server of core/tls13server keeps its signing key in `sk_kind` (0 none, 1
+RSA with the modulus in `sk_a` and the private exponent in `sk_b`, 2
+ECDSA P-256 with the scalar in `sk_a`).
 
 ## Functions
 
@@ -515,6 +519,7 @@ spec fn tls13c_ok(c: &Tls13Client) -> bool {
     && blen(c.name) <= 255
     && blen(c.transcript) < 1073741824 && blen(c.inbuf) < 1073741824 && blen(c.hsbuf) < 1073741824 && blen(c.leaf) < 1048576
     && blen(c.alpn) <= 256 && blen(c.rnd) <= 64 && blen(c.ms) <= 48
+    && blen(c.sk_a) < 65536 && blen(c.sk_b) < 65536
 }
 ```
 

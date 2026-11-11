@@ -1,0 +1,227 @@
+// stage1-only: host_net (sockets), core/tls13server
+// A small HTTPS server on this machine: it listens on 127.0.0.1, runs the
+// TLS 1.3 handshake of core/tls13server with the certificate chain and the
+// key in files, reads a request and answers it, until COUNT requests are
+// answered.
+//
+//   httpsserve PORT CHAIN KIND KEY COUNT
+//
+// CHAIN is a file of DER certificates, the server's own first. KIND is 1 for
+// an RSA key, whose file holds the modulus and then the private exponent,
+// both of the same length, or 2 for an ECDSA P-256 key, whose file holds the
+// 32-byte scalar. The server offers the ALPN protocols http/1.1 and h2 (in
+// that order) and answers every request with `200 OK` and a body that names
+// the protocol chosen and the server name the client sent. With no arguments
+// it only checks that a server refuses bytes that are no ClientHello.
+//
+// What the compiler proves: no buffer is read or written out of bounds and
+// none leaks, whatever the client sends. tests/tls.sh runs OpenSSL's client
+// against it.
+import "core/num.bastio";
+import "core/print.bastio";
+import "core/text.bastio";
+import "core/tls13server.bastio";
+import "std/host.bastio";
+import "std/https.bastio";
+import "std/net.bastio";
+
+/// The ALPN list the server speaks: http/1.1, then h2.
+fn protocols() -> Bytes
+  ensures blen(result) <= 256
+{
+  let mut t = text_new();
+  text_push(&mut t, 8);
+  text_push_str(&mut t, "http/1.1");
+  text_push(&mut t, 2);
+  text_push_str(&mut t, "h2");
+  let b = text_finish(t);
+  if blen(b) > 256 { bfree(b); return balloc(0); }
+  return b;
+}
+
+/// Whether `app` holds the end of a request head.
+fn has_head(app: &Vec[u8]) -> bool {
+  let b = text_to_bytes(app);
+  let end = bfrom("\r\n\r\n");
+  let found = bytes_find(b, end, 0);
+  bfree(end);
+  bfree(b);
+  match found {
+    Option::Some(i) => { return true; },
+    Option::None => { return false; },
+  }
+}
+
+/// Serves one connection on the socket `sock`. True if a request was answered.
+fn serve(con: &Serial, h: &Host, sock: u64, chain: &Bytes, kind: u64, ka: &Bytes, kb: &Bytes) -> bool
+  requires blen(chain) < 1048576 && blen(ka) < 65536 && blen(kb) < 65536
+{
+  let mut rnd = balloc(96);
+  match net_random(h, 96) {
+    Option::Some(r) => { bfree(rnd); rnd = r; },
+    Option::None => {},
+  }
+  if blen(rnd) != 96 { bfree(rnd); return false; }
+  let random = bytes_slice(rnd, 0, 32);
+  let key = bytes_slice(rnd, 32, 64);
+  let nonce = bytes_slice(rnd, 64, 96);
+  bfree(rnd);
+  let alpn = protocols();
+  let mut s = tls13s_new(random, key, nonce, chain, kind, ka, kb, alpn);
+  bfree(alpn);
+  bfree(nonce);
+  bfree(key);
+  bfree(random);
+  let mut out = text_new();
+  let mut app = text_new();
+  let mut buf = balloc(0);
+  let mut alive = true;
+  let mut answered = false;
+  let mut rounds = 0;
+  while alive && rounds < 100000 && tls13c_state(s) < 6
+    invariant tls13c_ok(s) && rounds <= 100000
+  {
+    rounds = rounds + 1;
+    match net_recv(h, sock, 16384, &mut buf) {
+      Option::None => { alive = false; },
+      Option::Some(n) => {
+        if n == 0 || blen(buf) >= 1048576 {
+          alive = false;
+        } else {
+          let code = tls13s_feed(&mut s, buf, &mut out, &mut app);
+          if code != 0 {
+            print_str(con, "tls error ");
+            print_u64(con, code);
+            print_str(con, "\n");
+            alive = false;
+          }
+        }
+      },
+    }
+    if alive && !answered && tls13c_state(s) == 5 && has_head(app) {
+      let mut body = text_new();
+      text_push_str(&mut body, "hello alpn=");
+      let a = tls13c_alpn(s);
+      text_push_bytes(&mut body, a);
+      bfree(a);
+      text_push_str(&mut body, " sni=");
+      let nm = tls13s_name(s);
+      text_push_bytes(&mut body, nm);
+      bfree(nm);
+      let bb = text_finish(body);
+      let mut resp = text_new();
+      text_push_str(&mut resp, "HTTP/1.0 200 OK\r\nContent-Length: ");
+      fmt_u64(&mut resp, blen(bb));
+      text_push_str(&mut resp, "\r\nConnection: close\r\n\r\n");
+      text_push_bytes(&mut resp, bb);
+      bfree(bb);
+      let rb = text_finish(resp);
+      if blen(rb) < 1073741824 { alive = tls13s_send(&mut s, rb, &mut out); }
+      bfree(rb);
+      if alive { tls13s_shutdown(&mut s, &mut out); }
+      answered = true;
+    }
+    if alive { alive = https_flush(h, sock, &mut out); }
+  }
+  https_flush(h, sock, &mut out);
+  bfree(buf);
+  vec_free(app);
+  vec_free(out);
+  tls13c_free(s);
+  return answered;
+}
+
+/// With no arguments: a server that gets bytes that are no TLS fails.
+fn selfcheck(con: &Serial) -> u64 {
+  let random = balloc(32);
+  let key = balloc(32);
+  let nonce = balloc(32);
+  let chain = balloc(0);
+  let d = balloc(32);
+  let none = balloc(0);
+  let alpn = protocols();
+  let mut s = tls13s_new(random, key, nonce, chain, 2, d, none, alpn);
+  let mut out = text_new();
+  let mut app = text_new();
+  let junk = bfrom("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+  let code = tls13s_feed(&mut s, junk, &mut out, &mut app);
+  let failed = code != 0 && tls13c_state(s) == 7 && vec_len(out) == 0;
+  bfree(junk);
+  vec_free(app);
+  vec_free(out);
+  tls13c_free(s);
+  bfree(alpn);
+  bfree(none);
+  bfree(d);
+  bfree(chain);
+  bfree(nonce);
+  bfree(key);
+  bfree(random);
+  if failed {
+    print_str(con, "ok\n");
+    return 0;
+  }
+  print_str(con, "self-check failed\n");
+  return 1;
+}
+
+fn main(con: &mut Serial, h: &mut Host) -> u64 {
+  if host_argc(h) < 6 { return selfcheck(con); }
+  let a_port = host_arg(h, 1);
+  let a_chain = host_arg(h, 2);
+  let a_kind = host_arg(h, 3);
+  let a_key = host_arg(h, 4);
+  let a_count = host_arg(h, 5);
+  let port = opt_or[u64](parse_u64(a_port, 0, blen(a_port)), 0);
+  let kind = opt_or[u64](parse_u64(a_kind, 0, blen(a_kind)), 0);
+  let count = opt_or[u64](parse_u64(a_count, 0, blen(a_count)), 0);
+  let mut chain = balloc(0);
+  let mut key = balloc(0);
+  let mut code = 2;
+  if port != 0 && (kind == 1 || kind == 2) && host_read(h, a_chain, &mut chain) && host_read(h, a_key, &mut key)
+    && blen(chain) < 1048576 && blen(key) < 65536 {
+    let mut ka = bytes_slice(key, 0, blen(key));
+    let mut kb = balloc(0);
+    if kind == 1 {
+      bfree(ka);
+      ka = bytes_slice(key, 0, blen(key) / 2);
+      bfree(kb);
+      kb = bytes_slice(key, blen(key) / 2, blen(key));
+    }
+    match net_listen(h, net_ip4(127, 0, 0, 1), port) {
+      Option::Some(ls) => {
+        code = 0;
+        // Only answered connections count: a client that gives up (or one
+        // that only checks the port is open) does not.
+        let mut i = 0;
+        let mut tries = 0;
+        while i < count && tries < 1000
+          invariant blen(chain) < 1048576 && blen(ka) < 65536 && blen(kb) < 65536
+        {
+          tries = tries + 1;
+          match net_accept(h, ls) {
+            Option::Some(c) => {
+              if serve(con, h, c, chain, kind, ka, kb) { i = i + 1; }
+              net_close(h, c);
+            },
+            Option::None => { code = 1; },
+          }
+        }
+        net_close(h, ls);
+      },
+      Option::None => { print_str(con, "cannot listen\n"); },
+    }
+    bfree(kb);
+    bfree(ka);
+  } else {
+    print_str(con, "usage: httpsserve PORT CHAIN KIND KEY COUNT\n");
+  }
+  bfree(key);
+  bfree(chain);
+  bfree(a_count);
+  bfree(a_key);
+  bfree(a_kind);
+  bfree(a_chain);
+  bfree(a_port);
+  return code;
+}
