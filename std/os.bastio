@@ -380,6 +380,50 @@ fn os_chmod(h: &Host, path: &Bytes, perm: u64) -> bool {
   return os_path_op(h, 27, path, perm);
 }
 
+/// Makes `to` a hard link to the existing file `from`.
+/// ```
+/// let a = bfrom("no/such/file");
+/// let b = bfrom("no/such/link");
+/// let bad = os_link(host, a, b);
+/// bfree(a); bfree(b);
+/// if bad { return 1; }
+/// ```
+fn os_link(h: &Host, from: &Bytes, to: &Bytes) -> bool {
+  if blen(from) > 4096 || blen(to) > 4096 {
+    return false;
+  }
+  let mut both = bytes_concat(from, to);
+  let r = host_sys(h, 34, blen(from), 0, &mut both);
+  bfree(both);
+  return r == 0;
+}
+
+/// Sets the access and modification times of `path`, in nanoseconds since 1970.
+/// ```
+/// let p = bfrom("no/such/file");
+/// let bad = os_utimes(host, p, 1, 2);
+/// bfree(p);
+/// if bad { return 1; }
+/// ```
+fn os_utimes(h: &Host, path: &Bytes, atime_ns: u64, mtime_ns: u64) -> bool {
+  let mut p = bytes_slice(path, 0, blen(path));
+  let r = host_sys(h, 35, atime_ns, mtime_ns, &mut p);
+  bfree(p);
+  return r == 0;
+}
+
+/// Sets the permission bits of the open file `fd`.
+/// ```
+/// let bad = os_fchmod(host, 1000000, 420);
+/// if bad { return 1; }
+/// ```
+fn os_fchmod(h: &Host, fd: u64, perm: u64) -> bool {
+  let mut none = balloc(0);
+  let r = host_sys(h, 36, fd, perm, &mut none);
+  bfree(none);
+  return r == 0;
+}
+
 /// Renames `from` to `to` (replacing a file `to`).
 /// ```
 /// let a = bfrom("os_ren_a.tmp");
