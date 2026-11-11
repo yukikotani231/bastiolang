@@ -1,0 +1,61 @@
+// stage1-only: host_sys signals (catch, take, pipe, kill)
+// backend: c
+// expect-exit: 0
+// A process catches SIGTERM sent to itself instead of dying: the signal shows
+// in the mask, once, and wakes the pipe. Windows has no signals: the catch
+// fails and the test has nothing to check.
+import "../../std/os.bastio";
+
+fn main(h: &mut Host) -> u64 {
+  let mut none = balloc(0);
+  let pid = host_sys(h, 40, 0, 0, &mut none);
+  bfree(none);
+  if !os_signal_catch(h, 15, true) {
+    return 0;
+  }
+  let mut bad = 0;
+  if os_signals_take(h) != 0 {
+    bad = bad | 1;
+  }
+  if !os_kill(h, pid, 15) {
+    bad = bad | 2;
+  }
+  let want = 32768;
+  if os_signals_take(h) != want {
+    bad = bad | 4;
+  }
+  if os_signals_take(h) != 0 {
+    bad = bad | 8;
+  }
+  match os_signal_fd(h) {
+    Option::Some(fd) => {
+      let mut got = balloc(0);
+      match os_read(h, fd, 8, &mut got) {
+        Option::Some(n) => {
+          if n != 1 {
+            bad = bad | 16;
+          }
+        },
+        Option::None => {
+          bad = bad | 16;
+        },
+      }
+      bfree(got);
+    },
+    Option::None => {
+      bad = bad | 32;
+    },
+  }
+  // KILL cannot be caught, and a number out of range is refused.
+  if os_signal_catch(h, 9, true) || os_signal_catch(h, 64, true) {
+    bad = bad | 64;
+  }
+  if !os_signal_catch(h, 15, false) {
+    bad = bad | 128;
+  }
+  if bad != 0 {
+    print(bad);
+    return 1;
+  }
+  return 0;
+}
