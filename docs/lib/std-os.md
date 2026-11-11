@@ -39,6 +39,9 @@ backend: c
 | [`os_signals_take`](#os_signals_take) | The signals caught since the last call, as a mask with bit `n` set for signal `n`; they are forgotten. |
 | [`os_signal_fd`](#os_signal_fd) | The read end of a non-blocking pipe that gets a byte for each caught signal, to wait on with `os_poll`; the caller reads the bytes away. |
 | [`os_kill`](#os_kill) | Sends signal `sig` to process `pid`. |
+| [`os_link`](#os_link) | Makes `to` a hard link to the existing file `from`. |
+| [`os_utimes`](#os_utimes) | Sets the access and modification times of `path`, in nanoseconds since 1970. |
+| [`os_fchmod`](#os_fchmod) | Sets the permission bits of the open file `fd`. |
 | [`os_rename`](#os_rename) | Renames `from` to `to` (replacing a file `to`). |
 | [`os_cwd`](#os_cwd) | The current directory, into `out` (replacing it). |
 | [`os_realpath`](#os_realpath) | `path` made absolute, with `.`, `..` and symbolic links resolved, into `out` (replacing it); the file must exist. |
@@ -576,6 +579,56 @@ Example:
 
 ```bastio
 let bad = os_kill(host, 2147483647, 0);
+if bad { return 1; }
+```
+
+### `os_link`
+
+```bastio
+fn os_link(h: &Host, from: &Bytes, to: &Bytes) -> bool
+```
+
+Makes `to` a hard link to the existing file `from`.
+
+Example:
+
+```bastio
+let a = bfrom("no/such/file");
+let b = bfrom("no/such/link");
+let bad = os_link(host, a, b);
+bfree(a); bfree(b);
+if bad { return 1; }
+```
+
+### `os_utimes`
+
+```bastio
+fn os_utimes(h: &Host, path: &Bytes, atime_ns: u64, mtime_ns: u64) -> bool
+```
+
+Sets the access and modification times of `path`, in nanoseconds since 1970.
+
+Example:
+
+```bastio
+let p = bfrom("no/such/file");
+let bad = os_utimes(host, p, 1, 2);
+bfree(p);
+if bad { return 1; }
+```
+
+### `os_fchmod`
+
+```bastio
+fn os_fchmod(h: &Host, fd: u64, perm: u64) -> bool
+```
+
+Sets the permission bits of the open file `fd`.
+
+Example:
+
+```bastio
+let bad = os_fchmod(host, 1000000, 420);
 if bad { return 1; }
 ```
 
