@@ -1,0 +1,140 @@
+// stage1-only: register items of plans (machine code from plans)
+// backend: c
+// expect-exit: 0
+// The same counting loop as a plan that calls a stencil for every step and as
+// one that does the steps on registers: the register plan must be several
+// times faster. (A threshold of 3 is far below what it measures, so a loaded
+// machine does not fail it; where there is no machine code it only checks
+// that.)
+import "../../std/os.bastio";
+
+struct Vm { regs: Vec[u64] }
+
+fn reg(vm: &Vm, r: u64) -> u64 {
+  if r < vec_len(vm.regs) {
+    return vec_get(vm.regs, r);
+  }
+  return 0;
+}
+
+fn op_set(vm: &mut Vm, a: u64, b: u64, c: u64, d: u64) -> u64 {
+  if a < vec_len(vm.regs) {
+    vec_set(&mut vm.regs, a, b);
+  }
+  return 0;
+}
+
+fn op_add(vm: &mut Vm, a: u64, b: u64, c: u64, d: u64) -> u64 {
+  let x = wrap_add(reg(vm, b), reg(vm, c));
+  if a < vec_len(vm.regs) {
+    vec_set(&mut vm.regs, a, x);
+  }
+  return 0;
+}
+
+fn op_lt(vm: &mut Vm, a: u64, b: u64, c: u64, d: u64) -> u64 {
+  if reg(vm, a) < reg(vm, b) {
+    return 1;
+  }
+  return 0;
+}
+
+fn op_get(vm: &mut Vm, a: u64, b: u64, c: u64, d: u64) -> u64 {
+  return reg(vm, a);
+}
+
+fn w(plan: &mut Vec[u64], a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, n: u64) {
+  vec_push(&mut plan, a);
+  if n > 1 { vec_push(&mut plan, b); }
+  if n > 2 { vec_push(&mut plan, c); }
+  if n > 3 { vec_push(&mut plan, d); }
+  if n > 4 { vec_push(&mut plan, e); }
+  if n > 5 { vec_push(&mut plan, f); }
+}
+
+// The sum of 0..n-1 with a stencil call for each step.
+fn stencil_plan(n: u64) -> Vec[u64] {
+  let set = stencil(op_set);
+  let add = stencil(op_add);
+  let lt = stencil(op_lt);
+  let get = stencil(op_get);
+  let mut p = vec_new[u64]();
+  w(&mut p, 7, 2, 0, 0, 0, 0, 2);
+  w(&mut p, 0, set, 0, 0, 0, 0, 6);
+  w(&mut p, 0, set, 1, 0, 0, 0, 6);
+  w(&mut p, 0, set, 2, 1, 0, 0, 6);
+  w(&mut p, 0, set, 4, n, 0, 0, 6);
+  w(&mut p, 0, lt, 0, 4, 0, 0, 6);              // 26
+  w(&mut p, 1, 48, 0, 0, 0, 0, 2);
+  w(&mut p, 0, add, 1, 1, 0, 0, 6);
+  w(&mut p, 0, add, 0, 0, 2, 0, 6);
+  w(&mut p, 4, 26, 0, 0, 0, 0, 2);
+  w(&mut p, 0, get, 1, 0, 0, 0, 6);             // 48
+  w(&mut p, 5, 0, 0, 0, 0, 0, 1);
+  return p;
+}
+
+// The same on registers.
+fn reg_plan(n: u64) -> Vec[u64] {
+  let mut p = vec_new[u64]();
+  w(&mut p, 7, 2, 0, 0, 0, 0, 2);
+  w(&mut p, 8, 0, 0, 0, 0, 0, 3);
+  w(&mut p, 8, 1, 0, 0, 0, 0, 3);
+  w(&mut p, 8, 2, n, 0, 0, 0, 3);
+  w(&mut p, 13, 5, 0, 2, 28, 0, 5);             // 11: if r0 >= r2 go to 28
+  w(&mut p, 10, 0, 1, 1, 0, 0, 5);              // 16: r1 = r1 + r0
+  w(&mut p, 11, 0, 0, 0, 1, 0, 5);              // 21: r0 = r0 + 1
+  w(&mut p, 4, 11, 0, 0, 0, 0, 2);              // 26
+  w(&mut p, 16, 1, 0, 0, 0, 0, 2);              // 28: current value = r1
+  w(&mut p, 5, 0, 0, 0, 0, 0, 1);
+  return p;
+}
+
+fn timed(host: &Host, vm: &mut Vm, p: Vec[u64], rounds: u64, want: u64) -> u64 {
+  let code = code_build(host, p);
+  vec_free(p);
+  if code == 0 {
+    return 0;
+  }
+  let mut best = 18446744073709551615;
+  let mut k = 0;
+  while k < rounds {
+    let t0 = os_mono_ns(host);
+    let r = code_call(code, &mut vm, 0);
+    let t1 = os_mono_ns(host);
+    if r != want {
+      code_free(host, code);
+      return 18446744073709551615;
+    }
+    if t1 > t0 && t1 - t0 < best {
+      best = t1 - t0;
+    }
+    k = k + 1;
+  }
+  code_free(host, code);
+  return best;
+}
+
+fn main(host: &mut Host) -> u64 {
+  let mut vm = Vm { regs: vec_new[u64]() };
+  let mut i = 0;
+  while i < 8 {
+    vec_push(&mut vm.regs, 0);
+    i = i + 1;
+  }
+  let n = 200000;
+  let want = 19999900000;           // 0 + 1 + .. + 199999
+  let slow = timed(host, &mut vm, stencil_plan(n), 5, want);
+  let fast = timed(host, &mut vm, reg_plan(n), 5, want);
+  vec_free(vm.regs);
+  if slow == 0 || fast == 0 {
+    return 0;                       // no machine code on this platform
+  }
+  if slow == 18446744073709551615 || fast == 18446744073709551615 {
+    return 1;                       // a wrong sum
+  }
+  if slow < wrap_mul(3, fast) {
+    return 2;                       // the registers were not 3 times faster
+  }
+  return 0;
+}

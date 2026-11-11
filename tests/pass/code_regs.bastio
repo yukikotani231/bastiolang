@@ -1,0 +1,251 @@
+// stage1-only: code_field and the register items of plans (machine code from plans)
+// backend: c
+// expect-exit: 0
+// Plans that compute on registers of their own: a counting loop, shifts and
+// signed and unsigned compares, 32-bit overflow exits, loads and stores of a
+// `Vec[u64]` field of the context with the index compared against the length
+// each time, the current value, and a stencil called with register arguments.
+// Where there is no machine code (code_build gives 0) it checks only that.
+struct Vm { regs: Vec[u64] }
+
+fn op_set(vm: &mut Vm, a: u64, b: u64, c: u64, d: u64) -> u64 {
+  if a < vec_len(vm.regs) {
+    vec_set(&mut vm.regs, a, b);
+  }
+  return 0;
+}
+
+fn op_get(vm: &mut Vm, a: u64, b: u64, c: u64, d: u64) -> u64 {
+  if a < vec_len(vm.regs) {
+    return vec_get(vm.regs, a);
+  }
+  return 0;
+}
+
+fn push6(p: &mut Vec[u64], a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, n: u64) {
+  vec_push(&mut p, a);
+  if n > 1 { vec_push(&mut p, b); }
+  if n > 2 { vec_push(&mut p, c); }
+  if n > 3 { vec_push(&mut p, d); }
+  if n > 4 { vec_push(&mut p, e); }
+  if n > 5 { vec_push(&mut p, f); }
+}
+
+fn i_const(p: &mut Vec[u64], d: u64, x: u64) { push6(&mut p, 8, d, x, 0, 0, 0, 3); }
+fn i_alu(p: &mut Vec[u64], op: u64, d: u64, a: u64, b: u64) { push6(&mut p, 10, op, d, a, b, 0, 5); }
+fn i_alui(p: &mut Vec[u64], op: u64, d: u64, a: u64, x: u64) { push6(&mut p, 11, op, d, a, x, 0, 5); }
+fn i_alu32(p: &mut Vec[u64], op: u64, d: u64, a: u64, b: u64, l: u64) { push6(&mut p, 12, op, d, a, b, l, 6); }
+fn i_cmpbr(p: &mut Vec[u64], c: u64, a: u64, b: u64, l: u64) { push6(&mut p, 13, c, a, b, l, 0, 5); }
+fn i_cmpbri(p: &mut Vec[u64], c: u64, a: u64, x: u64, l: u64) { push6(&mut p, 14, c, a, x, l, 0, 5); }
+fn i_getcur(p: &mut Vec[u64], d: u64) { push6(&mut p, 15, d, 0, 0, 0, 0, 2); }
+fn i_setcur(p: &mut Vec[u64], a: u64) { push6(&mut p, 16, a, 0, 0, 0, 0, 2); }
+fn i_load(p: &mut Vec[u64], d: u64, f: u64, b: u64, i: u64, l: u64) { push6(&mut p, 17, d, f, b, i, l, 6); }
+fn i_store(p: &mut Vec[u64], f: u64, b: u64, i: u64, s: u64, l: u64) { push6(&mut p, 18, f, b, i, s, l, 6); }
+fn i_callr(p: &mut Vec[u64], k: u64, a: u64, b: u64, c: u64, d: u64) { push6(&mut p, 19, k, a, b, c, d, 6); }
+fn i_jmp(p: &mut Vec[u64], l: u64) { push6(&mut p, 4, l, 0, 0, 0, 0, 2); }
+fn i_ret(p: &mut Vec[u64]) { push6(&mut p, 5, 0, 0, 0, 0, 0, 1); }
+fn i_call(p: &mut Vec[u64], k: u64, a: u64, b: u64, c: u64, d: u64) { push6(&mut p, 0, k, a, b, c, d, 6); }
+
+// Every plan starts with `ENTRY 2`, then a `RET` at word 2 that the exits use.
+fn start(p: &mut Vec[u64]) {
+  push6(&mut p, 7, 3, 0, 0, 0, 0, 2);
+  i_ret(&mut p);
+}
+
+// Stores r[s] at index `ix` of field `f`; an index out of range leaves the code.
+fn out(p: &mut Vec[u64], f: u64, ix: u64, s: u64) {
+  i_const(&mut p, 14, ix);
+  i_store(&mut p, f, 13, 14, s, 2);
+}
+
+fn patch(p: &mut Vec[u64], at: u64, v: u64) {
+  if at < vec_len(p) {
+    vec_set(&mut p, at, v);
+  }
+}
+
+fn reg(vm: &Vm, k: u64) -> u64 {
+  if k < vec_len(vm.regs) {
+    return vec_get(vm.regs, k);
+  }
+  return 0;
+}
+
+fn run(host: &Host, vm: &mut Vm, p: Vec[u64], e: u64) -> u64 {
+  let code = code_build(host, p);
+  vec_free(p);
+  if code == 0 {
+    return 0;
+  }
+  let r = code_call(code, &mut vm, e);
+  code_free(host, code);
+  return r;
+}
+
+fn main(host: &mut Host) -> u64 {
+  let mut vm = Vm { regs: vec_new[u64]() };
+  let mut k = 0;
+  while k < 32 {
+    vec_push(&mut vm.regs, 0);
+    k = k + 1;
+  }
+  let f = code_field(regs);
+  let set = stencil(op_set);
+  let get = stencil(op_get);
+
+  // A counting loop: the sum of 0..999, returned as the current value.
+  let mut a = vec_new[u64]();
+  start(&mut a);
+  i_const(&mut a, 0, 0);
+  i_const(&mut a, 1, 0);
+  i_const(&mut a, 2, 1000);
+  let top = vec_len(a);
+  i_cmpbr(&mut a, 5, 0, 2, 0);
+  let exit_at = wrap_sub(vec_len(a), 1);
+  i_alu(&mut a, 0, 1, 1, 0);
+  i_alui(&mut a, 0, 0, 0, 1);
+  i_jmp(&mut a, top);
+  patch(&mut a, exit_at, vec_len(a));
+  i_setcur(&mut a, 1);
+  i_ret(&mut a);
+  let sum = run(host, &mut vm, a, 0);
+
+  // Shifts, signed and unsigned compares, 32-bit overflow exits, the current
+  // value and a stencil with register arguments; the results go to the field.
+  let mut c = vec_new[u64]();
+  start(&mut c);
+  i_const(&mut c, 0, 18446744073709551608);     // -8
+  i_alui(&mut c, 7, 1, 0, 1);                   // sar: -4
+  out(&mut c, f, 0, 1);
+  i_alui(&mut c, 8, 1, 0, 60);                  // shr: 15
+  out(&mut c, f, 1, 1);
+  i_alui(&mut c, 6, 1, 0, 4);                   // shl: -128
+  out(&mut c, f, 2, 1);
+  i_const(&mut c, 3, 4);
+  i_alu(&mut c, 2, 1, 3, 3);                    // mul: 16
+  out(&mut c, f, 3, 1);
+  i_const(&mut c, 4, 0);
+  i_cmpbri(&mut c, 2, 0, 0, 0);                 // signed -8 < 0: taken
+  let t1 = wrap_sub(vec_len(c), 1);
+  i_jmp(&mut c, 0);
+  let j1 = wrap_sub(vec_len(c), 1);
+  patch(&mut c, t1, vec_len(c));
+  i_const(&mut c, 4, 1);
+  patch(&mut c, j1, vec_len(c));
+  out(&mut c, f, 4, 4);
+  i_const(&mut c, 5, 0);
+  i_cmpbri(&mut c, 6, 0, 0, 0);                 // unsigned: not taken
+  let t2 = wrap_sub(vec_len(c), 1);
+  i_jmp(&mut c, 0);
+  let j2 = wrap_sub(vec_len(c), 1);
+  patch(&mut c, t2, vec_len(c));
+  i_const(&mut c, 5, 1);
+  patch(&mut c, j2, vec_len(c));
+  out(&mut c, f, 5, 5);
+  // 32-bit add: 100 + 200 fits.
+  i_const(&mut c, 6, 100);
+  i_const(&mut c, 7, 200);
+  i_alu32(&mut c, 0, 8, 6, 7, 2);
+  out(&mut c, f, 6, 8);
+  // 2e9 + 2e9 does not: r2 keeps 5 and the exit is taken.
+  i_const(&mut c, 6, 2000000000);
+  i_const(&mut c, 2, 5);
+  i_const(&mut c, 9, 111);
+  i_alu32(&mut c, 0, 2, 6, 6, 0);
+  let ov = wrap_sub(vec_len(c), 1);
+  i_jmp(&mut c, 0);
+  let jo = wrap_sub(vec_len(c), 1);
+  patch(&mut c, ov, vec_len(c));
+  i_const(&mut c, 9, 222);
+  patch(&mut c, jo, vec_len(c));
+  out(&mut c, f, 7, 9);
+  out(&mut c, f, 8, 2);
+  // 65536 * 65536 overflows, 46340 * 46340 does not.
+  i_const(&mut c, 6, 65536);
+  i_const(&mut c, 9, 111);
+  i_alu32(&mut c, 2, 8, 6, 6, 0);
+  let ov2 = wrap_sub(vec_len(c), 1);
+  i_jmp(&mut c, 0);
+  let jo2 = wrap_sub(vec_len(c), 1);
+  patch(&mut c, ov2, vec_len(c));
+  i_const(&mut c, 9, 222);
+  patch(&mut c, jo2, vec_len(c));
+  out(&mut c, f, 9, 9);
+  i_const(&mut c, 6, 46340);
+  i_alu32(&mut c, 2, 8, 6, 6, 2);
+  out(&mut c, f, 10, 8);
+  // 0 - 2^31 is the smallest int32.
+  i_const(&mut c, 6, 0);
+  i_const(&mut c, 7, 2147483648);
+  i_alu32(&mut c, 1, 8, 6, 7, 2);
+  out(&mut c, f, 11, 8);
+  // The current value: a stencil result moved to a register and back.
+  i_call(&mut c, get, 6, 0, 0, 0);
+  i_getcur(&mut c, 10);
+  i_alui(&mut c, 0, 10, 10, 1);
+  out(&mut c, f, 12, 10);
+  // A stencil called with register arguments: regs[21] = 1234.
+  i_const(&mut c, 6, 21);
+  i_const(&mut c, 7, 1234);
+  i_callr(&mut c, set, 6, 7, 7, 7);
+  // A load below the length reads; one at or above it leaves the code.
+  i_const(&mut c, 6, 12);
+  i_load(&mut c, 8, f, 13, 6, 2);
+  out(&mut c, f, 13, 8);
+  i_const(&mut c, 6, 32);
+  i_const(&mut c, 8, 999);
+  i_load(&mut c, 8, f, 13, 6, 0);
+  let oob = wrap_sub(vec_len(c), 1);
+  i_const(&mut c, 9, 7777);                     // not reached
+  out(&mut c, f, 14, 9);
+  patch(&mut c, oob, vec_len(c));
+  out(&mut c, f, 15, 8);                        // 999: the load left it alone
+  // A store at an index equal to the length leaves the code; the next one
+  // would store 5555 at index 3 and must not run.
+  i_const(&mut c, 6, 32);
+  i_const(&mut c, 7, 5555);
+  i_store(&mut c, f, 13, 6, 7, 2);
+  out(&mut c, f, 16, 7);
+  let r = run(host, &mut vm, c, 0);
+
+  let code_works = sum != 0;
+  let r0 = reg(vm, 0);
+  let r1 = reg(vm, 1);
+  let r2 = reg(vm, 2);
+  let r3 = reg(vm, 3);
+  let r4 = reg(vm, 4);
+  let r5 = reg(vm, 5);
+  let r6 = reg(vm, 6);
+  let r7 = reg(vm, 7);
+  let r8 = reg(vm, 8);
+  let r9 = reg(vm, 9);
+  let r10 = reg(vm, 10);
+  let r11 = reg(vm, 11);
+  let r12 = reg(vm, 12);
+  let r13 = reg(vm, 13);
+  let r14 = reg(vm, 14);
+  let r15 = reg(vm, 15);
+  let r16 = reg(vm, 16);
+  let r21 = reg(vm, 21);
+  vec_free(vm.regs);
+  if !code_works {
+    return 0;
+  }
+  // The number of the first check that fails is the exit code.
+  if sum != 499500 { return 1; }
+  if r0 != 18446744073709551612 { return 2; }
+  if r1 != 15 { return 3; }
+  if r2 != 18446744073709551488 { return 4; }
+  if r3 != 16 { return 5; }
+  if r4 != 1 || r5 != 0 { return 6; }
+  if r6 != 300 { return 7; }
+  if r7 != 222 || r8 != 5 { return 8; }
+  if r9 != 222 { return 9; }
+  if r10 != 2147395600 { return 10; }
+  if r11 != 18446744071562067968 { return 11; }
+  if r12 != 301 || r13 != 301 { return 12; }
+  if r21 != 1234 { return 13; }
+  if r14 != 0 || r15 != 999 || r16 != 0 { return 14; }
+  if r != 0 { return 15; }
+  return 0;
+}

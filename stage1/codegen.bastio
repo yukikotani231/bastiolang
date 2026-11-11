@@ -1250,6 +1250,9 @@ fn cg_call(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64)
     if name_is(p, i, "stencil") {
       return cg_stencil(&mut g, c, &mut m, p, i);
     }
+    if name_is(p, i, "code_field") {
+      return cg_code_field(&mut g, c, p, i);
+    }
   }
   let xs = cg_args_of(p, i);
   let mut vals = vec_new[CgSp]();
@@ -2802,6 +2805,47 @@ fn cg_stencil_tab(g: &mut Cg, c: &Checker, m: &Mono, p: &Parser) {
   cg_to_out(&mut g, start);
 }
 
+/// The field table `code_build` reads: for each field `code_field(name)`
+/// named, in the order of the numbers, its offset in the context struct.
+fn cg_field_tab(g: &mut Cg, c: &Checker, m: &Mono, p: &Parser) {
+  let start = cg_mark(g);
+  cg_t(&mut g, "#define BST_NFIELDS UINT64_C(");
+  cg_n(&mut g, vec_len(c.code_fields) / 3);
+  cg_t(&mut g, ")\nstatic const uint64_t bst_field_tab[] = {");
+  let mut k = 0;
+  while k < vec_len(c.code_fields) {
+    if k > 0 {
+      cg_t(&mut g, ",");
+    }
+    cg_t(&mut g, " offsetof(struct bst_s_");
+    cg_instname(&mut g, m, p, inner_t(m, c.stencil_ctx), CG_CID);
+    cg_t(&mut g, ", ");
+    cg_src(&mut g, p, cf_at(c, k), cf_at(c, k + 1));
+    cg_t(&mut g, ")");
+    k = k + 3;
+  }
+  if k == 0 {
+    cg_t(&mut g, " 0");
+  }
+  cg_t(&mut g, " };\n");
+  cg_to_out(&mut g, start);
+}
+
+/// `code_field(name)`: the field's number in the field table, a constant.
+fn cg_code_field(g: &mut Cg, c: &Checker, p: &Parser, i: u64) -> CgSp {
+  let n = node_at(p.nodes, i);
+  let an = node_at(p.nodes, n.a);
+  let mut k = 0;
+  while k < vec_len(c.code_fields) && !same(p.src, cf_at(c, k), cf_at(c, k + 1), an.s, an.e) {
+    k = k + 3;
+  }
+  let start = cg_mark(g);
+  cg_t(&mut g, "UINT64_C(");
+  cg_n(&mut g, k / 3);
+  cg_t(&mut g, ")");
+  return cg_span(g, start);
+}
+
 /// `stencil(f)`: f's number in the stencil table, a constant.
 fn cg_stencil(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp {
   let n = node_at(p.nodes, i);
@@ -2857,6 +2901,7 @@ fn cg_program(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser) {
   }
   if code {
     cg_stencil_tab(&mut g, c, m, p);
+    cg_field_tab(&mut g, c, m, p);
   }
   k = 0;
   while k < vec_len(g.smp) {
