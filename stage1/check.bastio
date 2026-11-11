@@ -121,6 +121,9 @@ struct Checker {
   /// The type `T` every stencil takes as `&mut T` first, and `code_call`
   /// lends (0 until one is seen).
   stencil_ctx: u64,
+  /// The `code_field(name)` calls: name start, name end and call node, three
+  /// words each. A field's number is the position of its first call.
+  code_fields: Vec[u64],
   /// The instances that call `code_call`: each may call every stencil.
   code_callers: Vec[u64]
 }
@@ -153,6 +156,7 @@ fn checker_free(c: Checker) {
   vec_free(c.emsg);
   vec_free(c.enotes);
   vec_free(c.stencils);
+  vec_free(c.code_fields);
   vec_free(c.code_callers);
 }
 
@@ -197,7 +201,7 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
     target: target, arch: ARCH_X86_64, ret: un, env: 0, spec_lim: 0, spec_pos: 0, tu64: u, tbool: b, tunit: un, tstr: st,
     failed: false, efile: 0, eline: 0, ecol: 0, ecode: 0, emsg: vec_new[u64](), enotes: vec_new[u64](), int_ops: vec_new[IntOp](),
     calls: vec_new[Edge](), lsites: vec_new[LockSite](), nparams: 0, inv: false, old_only: false,
-    stencils: vec_new[u64](), stencil_ctx: 0, code_callers: vec_new[u64]()
+    stencils: vec_new[u64](), stencil_ctx: 0, code_fields: vec_new[u64](), code_callers: vec_new[u64]()
   };
   let buf = prim(&mut m, p, TY_BUF);
   let byt = prim(&mut m, p, TY_BYTES);
@@ -1136,7 +1140,8 @@ fn is_pt_borrow_builtin(p: &Parser, s: u64, e: u64) -> bool {
 
 /// The builtins for machine code built from plans (stage1, C backend only).
 fn is_code_builtin(p: &Parser, s: u64, e: u64) -> bool {
-  return span_is(p, s, e, "stencil") || span_is(p, s, e, "code_call") || span_is(p, s, e, "code_build") || span_is(p, s, e, "code_free");
+  return span_is(p, s, e, "stencil") || span_is(p, s, e, "code_call") || span_is(p, s, e, "code_build") || span_is(p, s, e, "code_free")
+    || span_is(p, s, e, "code_field");
 }
 
 fn is_builtin_name(c: &Checker, p: &Parser, s: u64, e: u64) -> bool {
@@ -2306,6 +2311,7 @@ fn check_program(c: &mut Checker, m: &mut Mono, p: &Parser) {
       a = a + 1;
     }
     c.env = me;
+    check_code_fields(&mut c, &mut m, p);
     lock_order(&mut c, m, p);
   }
 }
@@ -3906,6 +3912,9 @@ fn ck_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
   if span_is(p, s, e, "code_call") {
     return code_call_call(&mut c, &mut m, p, i);
   }
+  if span_is(p, s, e, "code_field") {
+    return code_field_call(&mut c, &mut m, p, i);
+  }
   let d = plain_fn(p, s, e);
   if d == 0 {
     if cm_new(&mut c, p, i, C_TYPE) {
@@ -4371,6 +4380,78 @@ fn stencil_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
     vec_push(&mut c.stencils, x);
   }
   return c.tu64;
+}
+
+/// Word `k` of the `code_field` records (0 past the end).
+fn cf_at(c: &Checker, k: u64) -> u64 {
+  if k < vec_len(c.code_fields) {
+    return vec_get(c.code_fields, k);
+  }
+  return 0;
+}
+
+/// `code_field(name)` (hosted, stage1 only): the number of the `Vec[u64]`
+/// field `name` of the stencils' context struct in the table machine code
+/// reads and writes through (plan items `LOAD` and `STORE`). The struct is
+/// known from the program's stencils and `code_call`s, so the field is checked
+/// once all the functions have been.
+fn code_field_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
+  if c.target != TARGET_HOSTED {
+    if cm_new(&mut c, p, i, C_TARGET) {
+      cm_s(&mut c, "`code_field` is not available on this target");
+    }
+    return 0;
+  }
+  let n = node_at(p.nodes, i);
+  if list_len(p, n.a) != 1 {
+    cm_arity(&mut c, p, i, 1);
+    return 0;
+  }
+  let an = node_at(p.nodes, n.a);
+  if an.kind != E_VAR || an.next != 0 {
+    if cm_new(&mut c, p, n.a, C_TYPE) {
+      cm_s(&mut c, "write the name of a field of the stencils' context struct: `code_field(regs)`");
+    }
+    return 0;
+  }
+  let mut k = 0;
+  while k < vec_len(c.code_fields) && !same(p.src, cf_at(c, k), cf_at(c, k + 1), an.s, an.e) {
+    k = k + 3;
+  }
+  if k == vec_len(c.code_fields) {
+    vec_push(&mut c.code_fields, an.s);
+    vec_push(&mut c.code_fields, an.e);
+    vec_push(&mut c.code_fields, i);
+  }
+  return c.tu64;
+}
+
+/// Checks the fields `code_field` named against the context struct.
+fn check_code_fields(c: &mut Checker, m: &mut Mono, p: &Parser) {
+  let mut k = 0;
+  while k < vec_len(c.code_fields) && !c.failed {
+    let s = cf_at(c, k);
+    let e = cf_at(c, k + 1);
+    let loc = cf_at(c, k + 2);
+    if c.stencil_ctx == 0 {
+      if cm_new(&mut c, p, loc, C_TYPE) {
+        cm_s(&mut c, "`code_field` needs the context struct, which a `stencil` or a `code_call` names");
+      }
+      return;
+    }
+    let x = inner_t(m, c.stencil_ctx);
+    let dn = def_node(m, p, x);
+    let j = index_in(p, dn.a, s, e);
+    let vu = intern(&mut m, p, TY_VEC, c.tu64);
+    if j == 0 || fld_ty(c, x, j - 1) != vu {
+      if cm_new(&mut c, p, loc, C_TYPE) {
+        cm_s(&mut c, "`code_field` names a field of type `Vec[u64]` of ");
+        cm_ty(&mut c, m, p, c.stencil_ctx);
+      }
+      return;
+    }
+    k = k + 3;
+  }
 }
 
 /// Records `ctx` as the stencils' context type, or reports (at `loc`) that
