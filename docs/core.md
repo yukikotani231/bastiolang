@@ -83,6 +83,7 @@ Each module has a reference page, generated from its source: every function with
 | [`core/tls13client.bastio`](lib/core-tls13client.md) | A TLS 1.3 client that does no input or output of its own. |
 | [`core/tls13hs.bastio`](lib/core-tls13hs.md) | The first two messages of a TLS 1.3 handshake (RFC 8446 section 4). |
 | [`core/tls13record.bastio`](lib/core-tls13record.md) | The TLS 1.3 record layer with the ChaCha20-Poly1305, AES-128-GCM or AES-256-GCM cipher suite (RFC 8446 section 5). |
+| [`core/tls13server.bastio`](lib/core-tls13server.md) | The server side of TLS 1.3, with no input or output of its own, like core/tls13client. |
 | [`core/url.bastio`](lib/core-url.md) | Percent-encoding (RFC 3986 section 2.1) and the query string of a request target (`/path?a=1&b=two%20words`). |
 | [`core/utf8.bastio`](lib/core-utf8.md) | UTF-8 validation (RFC 3629). |
 | [`core/wgnoise.bastio`](lib/core-wgnoise.md) | The Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s pattern, as a set of pure functions on byte strings (no clocks, no random numbers, no sockets). |
