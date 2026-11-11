@@ -1335,6 +1335,234 @@ fn cg_prelude_f64(out: &mut Vec[u64]) {
   w_s(&mut out, "static uint64_t bst_f64_fmt_f(uint64_t a, uint64_t prec, bst_bytes *out) { return bst_f64_fmt(a, prec, out, 0); }\n");
 }
 
+/// The prelude part for `host_display` (stage1 only): windows, a frame
+/// buffer and input events over X11 (loaded at run time), added after the
+/// hosted prelude and only to a program that calls it.
+fn cg_prelude_display(out: &mut Vec[u64]) {
+  w_s(&mut out, "/* host_display: windows, a frame buffer and input events, one call with an\n");
+  w_s(&mut out, " * operation number (see docs/language.md for the table). X11 on Linux and\n");
+  w_s(&mut out, " * the BSDs, loaded with dlopen at the first call, so building needs no X\n");
+  w_s(&mut out, " * headers and a program runs where there is no display (it gets a\n");
+  w_s(&mut out, " * failure). The failure of any operation is 2^64 - 1, and 60 then gives errno. */\n");
+  w_s(&mut out, "#if (defined(__linux__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)) && defined(__LP64__)\n");
+  w_s(&mut out, "#define BST_DISPLAY_X11 1\n");
+  w_s(&mut out, "#include <dlfcn.h>\n");
+  w_s(&mut out, "#include <poll.h>\n");
+  w_s(&mut out, "#include <time.h>\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "#include <errno.h>\n");
+  w_s(&mut out, "static uint64_t bst_dsp_errno;\n");
+  w_s(&mut out, "static uint64_t bst_dsp_fail(int e) { bst_dsp_errno = (uint64_t)e; return ~(uint64_t)0; }\n");
+  w_s(&mut out, "#ifdef BST_DISPLAY_X11\n");
+  w_s(&mut out, "#define BST_DSP_MAX 16\n");
+  w_s(&mut out, "static struct {\n");
+  w_s(&mut out, "    uint64_t txt_win, txt_cp;\n");
+  w_s(&mut out, "    int tried; void *dpy; int screen; unsigned long root; void *vis; int depth;\n");
+  w_s(&mut out, "    struct { unsigned long id; void *gc; unsigned long del; uint64_t w, h; } win[BST_DSP_MAX];\n");
+  w_s(&mut out, "    void *(*open)(const char *); int (*close)(void *);\n");
+  w_s(&mut out, "    int (*defscreen)(void *); unsigned long (*rootwin)(void *, int); unsigned long (*black)(void *, int);\n");
+  w_s(&mut out, "    void *(*defvisual)(void *, int); int (*defdepth)(void *, int);\n");
+  w_s(&mut out, "    int (*dispw)(void *, int); int (*disph)(void *, int);\n");
+  w_s(&mut out, "    unsigned long (*create)(void *, unsigned long, int, int, unsigned, unsigned, unsigned, unsigned long, unsigned long);\n");
+  w_s(&mut out, "    int (*destroy)(void *, unsigned long); int (*map)(void *, unsigned long);\n");
+  w_s(&mut out, "    int (*name)(void *, unsigned long, const char *); int (*select)(void *, unsigned long, long);\n");
+  w_s(&mut out, "    unsigned long (*atom)(void *, const char *, int); int (*protocols)(void *, unsigned long, unsigned long *, int);\n");
+  w_s(&mut out, "    int (*pending)(void *); int (*next)(void *, void *); int (*connfd)(void *);\n");
+  w_s(&mut out, "    void *(*creategc)(void *, unsigned long, unsigned long, void *); int (*freegc)(void *, void *);\n");
+  w_s(&mut out, "    void *(*createimage)(void *, void *, unsigned, int, int, char *, unsigned, unsigned, int, int);\n");
+  w_s(&mut out, "    int (*putimage)(void *, unsigned long, void *, void *, int, int, int, int, unsigned, unsigned);\n");
+  w_s(&mut out, "    int (*destroyimage)(void *); int (*sync)(void *, int);\n");
+  w_s(&mut out, "    int (*lookup)(void *, char *, int, unsigned long *, void *);\n");
+  w_s(&mut out, "} bst_dsp;\n");
+  w_s(&mut out, "static int bst_dsp_init(void) {\n");
+  w_s(&mut out, "    if (bst_dsp.dpy) return 1;\n");
+  w_s(&mut out, "    if (bst_dsp.tried) { errno = ENODEV; return 0; }\n");
+  w_s(&mut out, "    bst_dsp.tried = 1;\n");
+  w_s(&mut out, "    void *lib = dlopen(\"libX11.so.6\", RTLD_NOW);\n");
+  w_s(&mut out, "    if (!lib) lib = dlopen(\"libX11.so\", RTLD_NOW);\n");
+  w_s(&mut out, "    if (!lib) { errno = ENOSYS; return 0; }\n");
+  w_s(&mut out, "#define BST_DSP_SYM(f, n) *(void **)&bst_dsp.f = dlsym(lib, n); if (!bst_dsp.f) { errno = ENOSYS; return 0; }\n");
+  w_s(&mut out, "    BST_DSP_SYM(open, \"XOpenDisplay\") BST_DSP_SYM(close, \"XCloseDisplay\") BST_DSP_SYM(defscreen, \"XDefaultScreen\")\n");
+  w_s(&mut out, "    BST_DSP_SYM(rootwin, \"XRootWindow\") BST_DSP_SYM(black, \"XBlackPixel\") BST_DSP_SYM(defvisual, \"XDefaultVisual\")\n");
+  w_s(&mut out, "    BST_DSP_SYM(defdepth, \"XDefaultDepth\") BST_DSP_SYM(dispw, \"XDisplayWidth\") BST_DSP_SYM(disph, \"XDisplayHeight\")\n");
+  w_s(&mut out, "    BST_DSP_SYM(create, \"XCreateSimpleWindow\") BST_DSP_SYM(destroy, \"XDestroyWindow\") BST_DSP_SYM(map, \"XMapWindow\")\n");
+  w_s(&mut out, "    BST_DSP_SYM(name, \"XStoreName\") BST_DSP_SYM(select, \"XSelectInput\") BST_DSP_SYM(atom, \"XInternAtom\")\n");
+  w_s(&mut out, "    BST_DSP_SYM(protocols, \"XSetWMProtocols\") BST_DSP_SYM(pending, \"XPending\") BST_DSP_SYM(next, \"XNextEvent\")\n");
+  w_s(&mut out, "    BST_DSP_SYM(connfd, \"XConnectionNumber\") BST_DSP_SYM(creategc, \"XCreateGC\") BST_DSP_SYM(freegc, \"XFreeGC\")\n");
+  w_s(&mut out, "    BST_DSP_SYM(createimage, \"XCreateImage\") BST_DSP_SYM(putimage, \"XPutImage\") BST_DSP_SYM(destroyimage, \"XDestroyImage\")\n");
+  w_s(&mut out, "    BST_DSP_SYM(sync, \"XSync\") BST_DSP_SYM(lookup, \"XLookupString\")\n");
+  w_s(&mut out, "#undef BST_DSP_SYM\n");
+  w_s(&mut out, "    void *d = bst_dsp.open(0);\n");
+  w_s(&mut out, "    if (!d) { errno = ENODEV; return 0; }\n");
+  w_s(&mut out, "    int s = bst_dsp.defscreen(d);\n");
+  w_s(&mut out, "    void *vis = bst_dsp.defvisual(d, s);\n");
+  w_s(&mut out, "    int depth = bst_dsp.defdepth(d, s);\n");
+  w_s(&mut out, "    unsigned long *m = (unsigned long *)((char *)vis + 24);   /* Visual: red, green, blue masks */\n");
+  w_s(&mut out, "    if (depth < 24 || m[0] != 0xff0000ul || m[1] != 0xff00ul || m[2] != 0xfful) { bst_dsp.close(d); errno = ENOTSUP; return 0; }\n");
+  w_s(&mut out, "    bst_dsp.screen = s; bst_dsp.root = bst_dsp.rootwin(d, s); bst_dsp.vis = vis; bst_dsp.depth = depth;\n");
+  w_s(&mut out, "    bst_dsp.dpy = d;\n");
+  w_s(&mut out, "    return 1;\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "static int bst_dsp_find(uint64_t id) {\n");
+  w_s(&mut out, "    for (int i = 0; i < BST_DSP_MAX; i++) if (bst_dsp.win[i].id && bst_dsp.win[i].id == id) return i;\n");
+  w_s(&mut out, "    return -1;\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "static char *bst_dsp_cstr(const bst_bytes *buf) {\n");
+  w_s(&mut out, "    char *s = (char *)malloc(buf->len + 1);\n");
+  w_s(&mut out, "    if (!s) { fputs(\"Bastio: out of memory\\n\", stderr); abort(); }\n");
+  w_s(&mut out, "    memcpy(s, buf->data, buf->len);\n");
+  w_s(&mut out, "    for (uint64_t i = 0; i < buf->len; i++) if (!s[i]) s[i] = '?';\n");
+  w_s(&mut out, "    s[buf->len] = 0;\n");
+  w_s(&mut out, "    return s;\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "static uint64_t bst_dsp_put(bst_bytes *buf, const uint64_t *r);\n");
+  w_s(&mut out, "/* The next event for one of our windows as 5 little-endian words (kind, window, p1, p2, p3), or 0. */\n");
+  w_s(&mut out, "static uint64_t bst_dsp_event(bst_bytes *buf, long *ev) {\n");
+  w_s(&mut out, "    uint64_t r[5] = {0, 0, 0, 0, 0};\n");
+  w_s(&mut out, "    int type = *(int *)ev;\n");
+  w_s(&mut out, "    unsigned long win = (unsigned long)ev[4];\n");
+  w_s(&mut out, "    int wi = bst_dsp_find(win);\n");
+  w_s(&mut out, "    if (wi < 0) return 0;\n");
+  w_s(&mut out, "    r[1] = win;\n");
+  w_s(&mut out, "    if (type == 2 || type == 3) {   /* KeyPress, KeyRelease */\n");
+  w_s(&mut out, "        unsigned long ks = 0; char t[16];\n");
+  w_s(&mut out, "        bst_dsp.lookup(ev, t, sizeof t, &ks, 0);\n");
+  w_s(&mut out, "        r[0] = type == 2 ? 2 : 3; r[1] = win; r[2] = ks; r[3] = *(unsigned *)((char *)ev + 80); r[4] = *(unsigned *)((char *)ev + 84);\n");
+  w_s(&mut out, "        unsigned st = (unsigned)r[3];\n");
+  w_s(&mut out, "        if (type == 2 && !(st & 12) && ((ks >= 0x20 && ks < 0x7f) || (ks >= 0xa0 && ks <= 0xff) || ks >= 0x1000100ul)) {\n");
+  w_s(&mut out, "            bst_dsp.txt_win = win; bst_dsp.txt_cp = ks < 0x100 ? ks : ks - 0x1000000ul;   /* the text event follows */\n");
+  w_s(&mut out, "        }\n");
+  w_s(&mut out, "    } else if (type == 6) {   /* MotionNotify */\n");
+  w_s(&mut out, "        r[0] = 4; r[2] = (uint64_t)(int64_t)*(int *)((char *)ev + 64); r[3] = (uint64_t)(int64_t)*(int *)((char *)ev + 68); r[4] = *(unsigned *)((char *)ev + 80);\n");
+  w_s(&mut out, "    } else if (type == 4 || type == 5) {   /* ButtonPress, ButtonRelease */\n");
+  w_s(&mut out, "        unsigned b = *(unsigned *)((char *)ev + 84);\n");
+  w_s(&mut out, "        r[2] = (uint64_t)(int64_t)*(int *)((char *)ev + 64); r[3] = (uint64_t)(int64_t)*(int *)((char *)ev + 68);\n");
+  w_s(&mut out, "        if (b == 4 || b == 5) { if (type == 4) { r[0] = 7; r[4] = b == 4 ? 1 : ~(uint64_t)0; } else return 0; }\n");
+  w_s(&mut out, "        else if (b >= 1 && b <= 3) { r[0] = type == 4 ? 5 : 6; r[4] = b; }\n");
+  w_s(&mut out, "        else return 0;\n");
+  w_s(&mut out, "    } else if (type == 22) {   /* ConfigureNotify */\n");
+  w_s(&mut out, "        uint64_t w = (uint64_t)*(int *)((char *)ev + 56), h = (uint64_t)*(int *)((char *)ev + 60);\n");
+  w_s(&mut out, "        if (w == 0 || h == 0 || (w == bst_dsp.win[wi].w && h == bst_dsp.win[wi].h)) return 0;\n");
+  w_s(&mut out, "        bst_dsp.win[wi].w = w; bst_dsp.win[wi].h = h;\n");
+  w_s(&mut out, "        r[0] = 8; r[2] = w; r[3] = h;\n");
+  w_s(&mut out, "    } else if (type == 12) {   /* Expose: only the last of a run */\n");
+  w_s(&mut out, "        if (*(int *)((char *)ev + 56) != 0) return 0;\n");
+  w_s(&mut out, "        r[0] = 9;\n");
+  w_s(&mut out, "    } else if (type == 33) {   /* ClientMessage: WM_DELETE_WINDOW */\n");
+  w_s(&mut out, "        if ((unsigned long)ev[7] != bst_dsp.win[wi].del) return 0;\n");
+  w_s(&mut out, "        r[0] = 1;\n");
+  w_s(&mut out, "    } else return 0;\n");
+  w_s(&mut out, "    return bst_dsp_put(buf, r);\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "static uint64_t bst_dsp_put(bst_bytes *buf, const uint64_t *r) {\n");
+  w_s(&mut out, "    unsigned char out[40];\n");
+  w_s(&mut out, "    for (int i = 0; i < 5; i++) for (int k = 0; k < 8; k++) out[i * 8 + k] = (unsigned char)(r[i] >> (8 * k));\n");
+  w_s(&mut out, "    unsigned char *d = (unsigned char *)malloc(40);\n");
+  w_s(&mut out, "    if (!d) { fputs(\"Bastio: out of memory\\n\", stderr); abort(); }\n");
+  w_s(&mut out, "    memcpy(d, out, 40);\n");
+  w_s(&mut out, "    free(buf->data); buf->data = d; buf->len = 40;\n");
+  w_s(&mut out, "    return r[0];\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "static uint64_t bst_host_display(bst_host h, uint64_t op, uint64_t a, uint64_t b, bst_bytes *buf) {\n");
+  w_s(&mut out, "    (void)h;\n");
+  w_s(&mut out, "    if (op == 60) return bst_dsp_errno;\n");
+  w_s(&mut out, "#ifndef BST_DISPLAY_X11\n");
+  w_s(&mut out, "    (void)a; (void)b; (void)buf;\n");
+  w_s(&mut out, "    return bst_dsp_fail(ENOSYS);\n");
+  w_s(&mut out, "#else\n");
+  w_s(&mut out, "    if (!bst_dsp_init()) return bst_dsp_fail(errno);\n");
+  w_s(&mut out, "    void *d = bst_dsp.dpy;\n");
+  w_s(&mut out, "    if (op == 0) {   /* open a window of a & 0xffffffff by a >> 32 pixels, titled *buf */\n");
+  w_s(&mut out, "        uint64_t w = a & 0xffffffffu, ht = a >> 32;\n");
+  w_s(&mut out, "        if (w == 0 || ht == 0 || w > 16384 || ht > 16384) return bst_dsp_fail(EINVAL);\n");
+  w_s(&mut out, "        int i = 0;\n");
+  w_s(&mut out, "        while (i < BST_DSP_MAX && bst_dsp.win[i].id) i++;\n");
+  w_s(&mut out, "        if (i == BST_DSP_MAX) return bst_dsp_fail(EMFILE);\n");
+  w_s(&mut out, "        unsigned long id = bst_dsp.create(d, bst_dsp.root, 0, 0, (unsigned)w, (unsigned)ht, 0, 0, bst_dsp.black(d, bst_dsp.screen));\n");
+  w_s(&mut out, "        if (!id) return bst_dsp_fail(ENOMEM);\n");
+  w_s(&mut out, "        char *t = bst_dsp_cstr(buf);\n");
+  w_s(&mut out, "        bst_dsp.name(d, id, t);\n");
+  w_s(&mut out, "        free(t);\n");
+  w_s(&mut out, "        bst_dsp.select(d, id, (1L << 0) | (1L << 1) | (1L << 2) | (1L << 3) | (1L << 6) | (1L << 15) | (1L << 17));\n");
+  w_s(&mut out, "        unsigned long del = bst_dsp.atom(d, \"WM_DELETE_WINDOW\", 0);\n");
+  w_s(&mut out, "        bst_dsp.protocols(d, id, &del, 1);\n");
+  w_s(&mut out, "        bst_dsp.map(d, id);\n");
+  w_s(&mut out, "        bst_dsp.win[i].id = id; bst_dsp.win[i].w = w; bst_dsp.win[i].h = ht; bst_dsp.win[i].del = del;\n");
+  w_s(&mut out, "        bst_dsp.win[i].gc = bst_dsp.creategc(d, id, 0, 0);\n");
+  w_s(&mut out, "        bst_dsp.sync(d, 0);\n");
+  w_s(&mut out, "        return (uint64_t)id;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    if (op == 7) return (uint64_t)bst_dsp.dispw(d, bst_dsp.screen) | ((uint64_t)bst_dsp.disph(d, bst_dsp.screen) << 32);\n");
+  w_s(&mut out, "    if (op == 6) { int f = bst_dsp.connfd(d); return f < 0 ? bst_dsp_fail(EBADF) : (uint64_t)f; }\n");
+  w_s(&mut out, "    if (op == 4) {   /* the next event, waiting at most a ms (2^64 - 1: no limit): *buf = kind, window, p1, p2, p3 */\n");
+  w_s(&mut out, "        struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);\n");
+  w_s(&mut out, "        for (;;) {\n");
+  w_s(&mut out, "            if (bst_dsp.txt_cp) {   /* kind 10: text typed, p1 the code point */\n");
+  w_s(&mut out, "                uint64_t r[5] = {10, bst_dsp.txt_win, bst_dsp.txt_cp, 0, 0};\n");
+  w_s(&mut out, "                bst_dsp.txt_cp = 0;\n");
+  w_s(&mut out, "                return bst_dsp_put(buf, r);\n");
+  w_s(&mut out, "            }\n");
+  w_s(&mut out, "            while (bst_dsp.pending(d)) {\n");
+  w_s(&mut out, "                long ev[24];\n");
+  w_s(&mut out, "                bst_dsp.next(d, ev);\n");
+  w_s(&mut out, "                uint64_t k = bst_dsp_event(buf, ev);\n");
+  w_s(&mut out, "                if (k) return k;\n");
+  w_s(&mut out, "            }\n");
+  w_s(&mut out, "            int ms = -1;\n");
+  w_s(&mut out, "            if (a != ~(uint64_t)0) {\n");
+  w_s(&mut out, "                struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);\n");
+  w_s(&mut out, "                long long el = (long long)(t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;\n");
+  w_s(&mut out, "                long long left = (long long)(a > 2000000000u ? 2000000000u : a) - el;\n");
+  w_s(&mut out, "                if (left <= 0) return 0;\n");
+  w_s(&mut out, "                ms = (int)left;\n");
+  w_s(&mut out, "            }\n");
+  w_s(&mut out, "            struct pollfd p; p.fd = bst_dsp.connfd(d); p.events = POLLIN; p.revents = 0;\n");
+  w_s(&mut out, "            int r = poll(&p, 1, ms);\n");
+  w_s(&mut out, "            if (r < 0 && errno != EINTR) return bst_dsp_fail(errno);\n");
+  w_s(&mut out, "            if (r == 0) return 0;\n");
+  w_s(&mut out, "        }\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    int wi = bst_dsp_find(a);\n");
+  w_s(&mut out, "    if (wi < 0) return bst_dsp_fail(EBADF);\n");
+  w_s(&mut out, "    if (op == 1) {\n");
+  w_s(&mut out, "        bst_dsp.freegc(d, bst_dsp.win[wi].gc);\n");
+  w_s(&mut out, "        bst_dsp.destroy(d, bst_dsp.win[wi].id);\n");
+  w_s(&mut out, "        bst_dsp.sync(d, 0);\n");
+  w_s(&mut out, "        bst_dsp.win[wi].id = 0;\n");
+  w_s(&mut out, "        return 0;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    if (op == 3) return bst_dsp.win[wi].w | (bst_dsp.win[wi].h << 32);\n");
+  w_s(&mut out, "    if (op == 5) {\n");
+  w_s(&mut out, "        char *t = bst_dsp_cstr(buf);\n");
+  w_s(&mut out, "        bst_dsp.name(d, bst_dsp.win[wi].id, t);\n");
+  w_s(&mut out, "        free(t);\n");
+  w_s(&mut out, "        bst_dsp.sync(d, 0);\n");
+  w_s(&mut out, "        return 0;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    if (op == 2) {   /* draw *buf, b & 0xfffff by b >> 20 pixels of 3 (RGB) or 4 (RGBA, alpha ignored) bytes, at the corner */\n");
+  w_s(&mut out, "        uint64_t w = b & 0xfffff, ht = (b >> 20) & 0xfffff;\n");
+  w_s(&mut out, "        if (w == 0 || ht == 0 || (b >> 40) != 0) return bst_dsp_fail(EINVAL);\n");
+  w_s(&mut out, "        uint64_t bpp = buf->len / (w * ht);\n");
+  w_s(&mut out, "        if ((bpp != 3 && bpp != 4) || bpp * w * ht != buf->len) return bst_dsp_fail(EINVAL);\n");
+  w_s(&mut out, "        unsigned char *px = (unsigned char *)malloc(w * ht * 4);\n");
+  w_s(&mut out, "        if (!px) { fputs(\"Bastio: out of memory\\n\", stderr); abort(); }\n");
+  w_s(&mut out, "        const unsigned char *s = buf->data;\n");
+  w_s(&mut out, "        for (uint64_t i = 0; i < w * ht; i++) {\n");
+  w_s(&mut out, "            px[i * 4] = s[i * bpp + 2]; px[i * 4 + 1] = s[i * bpp + 1]; px[i * 4 + 2] = s[i * bpp]; px[i * 4 + 3] = 0;\n");
+  w_s(&mut out, "        }\n");
+  w_s(&mut out, "        void *img = bst_dsp.createimage(d, bst_dsp.vis, (unsigned)bst_dsp.depth, 2, 0, (char *)px, (unsigned)w, (unsigned)ht, 32, 0);\n");
+  w_s(&mut out, "        if (!img) { free(px); return bst_dsp_fail(ENOMEM); }\n");
+  w_s(&mut out, "        bst_dsp.putimage(d, bst_dsp.win[wi].id, bst_dsp.win[wi].gc, img, 0, 0, 0, 0, (unsigned)w, (unsigned)ht);\n");
+  w_s(&mut out, "        bst_dsp.destroyimage(img);\n");
+  w_s(&mut out, "        bst_dsp.sync(d, 0);\n");
+  w_s(&mut out, "        return 0;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    return bst_dsp_fail(EINVAL);\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "}\n");
+}
+
 /// The prelude part for `host_sys` (stage1 only): added after the hosted
 /// prelude, and only to a program that calls it.
 fn cg_prelude_sys(out: &mut Vec[u64]) {
@@ -3621,6 +3849,8 @@ const PART_SYS: u64 = 28;
 const PART_CODE: u64 = 27;
 /// Not in any target's list either: see `cg_prelude_spawn_err`.
 const PART_SPAWN_ERR: u64 = 29;
+/// Not in any target's list either: see `cg_prelude_display`.
+const PART_DISPLAY: u64 = 30;
 
 fn cg_part_name(id: u64) -> Str {
   if id == PART_POSIX { return "posix"; }
@@ -3652,6 +3882,7 @@ fn cg_part_name(id: u64) -> Str {
   if id == PART_SYS { return "sys"; }
   if id == PART_CODE { return "code"; }
   if id == PART_SPAWN_ERR { return "spawn_err"; }
+  if id == PART_DISPLAY { return "display"; }
   return "user";
 }
 
@@ -3687,6 +3918,7 @@ fn cg_part(out: &mut Vec[u64], id: u64) {
   else if id == PART_SYS { cg_prelude_sys(&mut out); }
   else if id == PART_CODE { cg_prelude_code(&mut out); }
   else if id == PART_SPAWN_ERR { cg_prelude_spawn_err(&mut out); }
+  else if id == PART_DISPLAY { cg_prelude_display(&mut out); }
   else { cg_prelude_user(&mut out); }
 }
 

@@ -1,0 +1,51 @@
+// stage1-only: host_display (windows, a frame buffer and input events)
+// backend: c
+// expect-exit: 0
+// Opens a window, draws a frame, reads the size back and closes it. Where
+// there is no display (or no libX11, or a platform without X11) the open
+// fails with an error number and the test has nothing more to check.
+import "../../std/display.bastio";
+
+fn main(h: &mut Host) -> u64 {
+  let mut bad = 0;
+  match dsp_open(h, 64, 48, "host_display test") {
+    Option::Some(win) => {
+      let mut px = balloc(64 * 48 * 3);
+      let mut i = 0;
+      while i < 64 * 48
+        invariant i <= 64 * 48 && blen(px) == 64 * 48 * 3
+      {
+        bset(&mut px, i * 3, cast[u8](i % 256));
+        bset(&mut px, i * 3 + 1, 128);
+        bset(&mut px, i * 3 + 2, 32);
+        i = i + 1;
+      }
+      if !dsp_present(h, win, 64, 48, px) { bad = bad | 1; }
+      // A frame of the wrong length is refused.
+      if dsp_present(h, win, 65, 48, px) { bad = bad | 2; }
+      bfree(px);
+      match dsp_size(h, win) {
+        Option::Some(s) => { if s.w != 64 || s.h != 48 { bad = bad | 4; } }
+        Option::None => { bad = bad | 8; }
+      }
+      if !dsp_title(h, win, "renamed") { bad = bad | 16; }
+      // Nothing was typed or clicked: waiting 20 ms ends with no event or an expose.
+      match dsp_next(h, 20) {
+        Option::Some(e) => { if e.kind != EV_NONE && e.kind != EV_EXPOSE && e.kind != EV_RESIZE { bad = bad | 32; } }
+        Option::None => { bad = bad | 64; }
+      }
+      match dsp_fd(h) {
+        Option::Some(fd) => { if fd > 100000 { bad = bad | 128; } }
+        Option::None => { bad = bad | 256; }
+      }
+      if !dsp_close(h, win) { bad = bad | 512; }
+      // A closed window is gone.
+      if dsp_close(h, win) { bad = bad | 1024; }
+    }
+    Option::None => {
+      let e = dsp_errno(h);
+      if e == 0 { bad = bad | 2048; }
+    }
+  }
+  return bad;
+}

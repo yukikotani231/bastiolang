@@ -1,0 +1,228 @@
+// std/display.bastio: windows, a frame buffer and input events, for programs
+// on the hosted target, over the `host_display` builtin. On Linux and the
+// BSDs (64-bit) this is X11, loaded at run time with dlopen, so a program
+// needs no X library to build and gets a failure (`None`, `false`) where
+// there is no display or no libX11. Windows and macOS report failure for now.
+// `host_display` is stage1 only and needs the C backend:
+// backend: c
+import "../core/bytes.bastio";
+import "host.bastio";
+
+const DSP_FAIL: u64 = 18446744073709551615;
+
+/// What `dsp_next` returns, in `Event::kind`: 0 nothing before the time limit.
+const EV_NONE: u64 = 0;
+/// The window manager asked to close the window (`a`, `b`, `c` unused).
+const EV_CLOSE: u64 = 1;
+/// A key went down: `a` its X keysym (Latin-1 characters are their codes, Return 65293, Escape 65307, Left 65361, ...), `b` the modifier mask (1 shift, 2 caps lock, 4 control, 8 alt), `c` the key code.
+const EV_KEY_DOWN: u64 = 2;
+/// A key went up (fields as for `EV_KEY_DOWN`).
+const EV_KEY_UP: u64 = 3;
+/// The pointer moved: `a`, `b` the position in the window (signed), `c` the button and modifier mask.
+const EV_MOUSE_MOVE: u64 = 4;
+/// A button went down: `a`, `b` the position, `c` the button (1 left, 2 middle, 3 right).
+const EV_MOUSE_DOWN: u64 = 5;
+/// A button went up (fields as for `EV_MOUSE_DOWN`).
+const EV_MOUSE_UP: u64 = 6;
+/// The wheel turned: `a`, `b` the position, `c` 1 for up and 2^64 - 1 for down.
+const EV_WHEEL: u64 = 7;
+/// The window changed size: `a` the new width, `b` the new height (`dsp_size` gives the same).
+const EV_RESIZE: u64 = 8;
+/// Part of the window needs painting again: call `dsp_present`.
+const EV_EXPOSE: u64 = 9;
+/// Text was typed: `a` the Unicode code point (follows the key down that made it; not sent while control or alt is held).
+const EV_TEXT: u64 = 10;
+
+/// A width and a height in pixels.
+struct DspSize { w: u64, h: u64 }
+
+/// One event: the kind, the window it is for and three fields whose meaning depends on the kind.
+struct Event { kind: u64, window: u64, a: u64, b: u64, c: u64 }
+
+/// Opens a window `w` by `h` pixels (each 1 to 16384) with a title and shows it. At most 16 windows are open at once.
+/// ```
+/// match dsp_open(host, 64, 48, "demo") {
+///   Option::Some(win) => { dsp_close(host, win); }
+///   Option::None => { }   // no display here
+/// }
+/// ```
+fn dsp_open(h: &Host, w: u64, ht: u64, title: Str) -> Option[u64] {
+  if w > 16384 || ht > 16384 { return Option[u64]::None; }
+  let mut t = bfrom(title);
+  let r = host_display(h, 0, w | (ht << 32), 0, &mut t);
+  bfree(t);
+  if r == DSP_FAIL { return Option[u64]::None; }
+  return Option[u64]::Some(r);
+}
+
+/// Closes a window.
+fn dsp_close(h: &Host, win: u64) -> bool {
+  let mut none = balloc(0);
+  let r = host_display(h, 1, win, 0, &mut none);
+  bfree(none);
+  return r != DSP_FAIL;
+}
+
+/// Draws `pixels` (`w * h * 3` bytes, red green blue, rows from the top; or `w * h * 4` with an alpha byte that is ignored) at the window's top left corner. It is the whole frame: what is outside it keeps the previous picture, and what lies outside the window is cut off.
+///
+/// ```
+/// match dsp_open(host, 2, 1, "frame") {
+///   Option::Some(win) => {
+///     let mut px = balloc(6);
+///     bset(&mut px, 0, 255);
+///     let ok = dsp_present(host, win, 2, 1, px);
+///     bfree(px);
+///     if !ok { return 1; }
+///     dsp_close(host, win);
+///   },
+///   Option::None => { },
+/// }
+/// ```
+fn dsp_present(h: &Host, win: u64, w: u64, ht: u64, pixels: &Bytes) -> bool {
+  if w == 0 || ht == 0 || w >= 1048576 || ht >= 1048576 { return false; }
+  let mut copy = bytes_slice(pixels, 0, blen(pixels));
+  let r = host_display(h, 2, win, w | (ht << 20), &mut copy);
+  bfree(copy);
+  return r != DSP_FAIL;
+}
+
+/// The window's current size (it changes when the user resizes it, see `EV_RESIZE`): width and height.
+///
+/// ```
+/// match dsp_open(host, 8, 6, "size") {
+///   Option::Some(win) => {
+///     match dsp_size(host, win) {
+///       Option::Some(s) => { if s.w != 8 || s.h != 6 { return 1; } },
+///       Option::None => { return 2; },
+///     }
+///     dsp_close(host, win);
+///   },
+///   Option::None => { },
+/// }
+/// ```
+fn dsp_size(h: &Host, win: u64) -> Option[DspSize] {
+  let mut none = balloc(0);
+  let r = host_display(h, 3, win, 0, &mut none);
+  bfree(none);
+  if r == DSP_FAIL { return Option[DspSize]::None; }
+  return Option[DspSize]::Some(DspSize { w: r & 4294967295, h: r >> 32 });
+}
+
+/// The screen's size: width and height.
+///
+/// ```
+/// match dsp_screen(host) {
+///   Option::Some(s) => { if s.w == 0 || s.h == 0 { return 1; } },
+///   Option::None => { },   // no display here
+/// }
+/// ```
+fn dsp_screen(h: &Host) -> Option[DspSize] {
+  let mut none = balloc(0);
+  let r = host_display(h, 7, 0, 0, &mut none);
+  bfree(none);
+  if r == DSP_FAIL { return Option[DspSize]::None; }
+  return Option[DspSize]::Some(DspSize { w: r & 4294967295, h: r >> 32 });
+}
+
+/// Sets the window's title.
+///
+/// ```
+/// match dsp_open(host, 8, 8, "before") {
+///   Option::Some(win) => {
+///     if !dsp_title(host, win, "after") { return 1; }
+///     dsp_close(host, win);
+///   },
+///   Option::None => { },
+/// }
+/// ```
+fn dsp_title(h: &Host, win: u64, title: Str) -> bool {
+  let mut t = bfrom(title);
+  let r = host_display(h, 5, win, 0, &mut t);
+  bfree(t);
+  return r != DSP_FAIL;
+}
+
+/// The next event for any of the program's windows, waiting at most `ms` milliseconds (`DSP_FAIL`: no limit, 0: do not wait). Kind `EV_NONE` means the time ran out; `None` means the connection to the display failed.
+///
+/// ```
+/// match dsp_open(host, 8, 8, "events") {
+///   Option::Some(win) => {
+///     match dsp_next(host, 0) {
+///       Option::Some(e) => { if e.kind > EV_TEXT { return 1; } },
+///       Option::None => { return 2; },
+///     }
+///     dsp_close(host, win);
+///   },
+///   Option::None => { },
+/// }
+/// ```
+fn dsp_next(h: &Host, ms: u64) -> Option[Event] {
+  let mut buf = balloc(0);
+  let k = host_display(h, 4, ms, 0, &mut buf);
+  if k == DSP_FAIL { bfree(buf); return Option[Event]::None; }
+  if k == 0 || blen(buf) != 40 { bfree(buf); return Option[Event]::Some(Event { kind: 0, window: 0, a: 0, b: 0, c: 0 }); }
+  let e = Event { kind: dsp_word(buf, 0), window: dsp_word(buf, 1), a: dsp_word(buf, 2), b: dsp_word(buf, 3), c: dsp_word(buf, 4) };
+  bfree(buf);
+  return Option[Event]::Some(e);
+}
+
+/// The descriptor of the connection to the display, to wait on with `poll` or epoll (`std/os.bastio`) together with other descriptors; when it is readable `dsp_next(host, 0)` has an event.
+///
+/// ```
+/// match dsp_open(host, 8, 8, "fd") {
+///   Option::Some(win) => {
+///     match dsp_fd(host) {
+///       Option::Some(fd) => { if fd > 1000000 { return 1; } },
+///       Option::None => { return 2; },
+///     }
+///     dsp_close(host, win);
+///   },
+///   Option::None => { },
+/// }
+/// ```
+fn dsp_fd(h: &Host) -> Option[u64] {
+  let mut none = balloc(0);
+  let r = host_display(h, 6, 0, 0, &mut none);
+  bfree(none);
+  if r == DSP_FAIL { return Option[u64]::None; }
+  return Option[u64]::Some(r);
+}
+
+/// The error number (`errno`) of the last call of this module that failed (ENODEV: no display, ENOSYS: no libX11 or not supported here, ENOTSUP: the display is not 24-bit color).
+///
+/// ```
+/// match dsp_size(host, 99999) {
+///   Option::Some(s) => { return 1; },
+///   Option::None => { },
+/// }
+/// if dsp_errno(host) == 0 { return 2; }
+/// ```
+fn dsp_errno(h: &Host) -> u64 {
+  let mut none = balloc(0);
+  let e = host_display(h, 60, 0, 0, &mut none);
+  bfree(none);
+  return e;
+}
+
+/// Little-endian word `i` of an event record (what `dsp_next` unpacks).
+///
+/// ```
+/// let mut rec = balloc(40);
+/// bset(&mut rec, 8, 7);
+/// let bad = dsp_word(rec, 1) != 7 || dsp_word(rec, 0) != 0;
+/// bfree(rec);
+/// if bad { return 1; }
+/// ```
+fn dsp_word(b: &Bytes, i: u64) -> u64
+  requires i < 5 && blen(b) >= 40
+{
+  let mut v = 0;
+  let mut k = 8;
+  while k > 0
+    invariant k <= 8
+  {
+    k = k - 1;
+    v = wrap_add(wrap_mul(v, 256), cast[u64](bget(b, i * 8 + k)));
+  }
+  return v;
+}
