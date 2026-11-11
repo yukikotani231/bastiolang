@@ -239,9 +239,10 @@ fn tls13c_alpn(c: &Tls13Client) -> Bytes {
   return bytes_slice(c.alpn, 0, blen(c.alpn));
 }
 
-/// 0 when the server's certificate chain was checked and good; otherwise 6,
-/// the code a client that verifies fails with (only a client made with
-/// `verify` false gets that far).
+/// 0 when the server's certificate chain was checked and good; otherwise 10
+/// when only the host name is not the certificate's, or 6 (the code a client
+/// that verifies fails with in both cases; only a client made with `verify`
+/// false gets that far).
 /// ```
 /// let c = tls13c_blank();
 /// let v = tls13c_verdict(c);
@@ -398,6 +399,15 @@ fn tls13c_chain(msg: &Bytes, name: &Bytes, roots: &Bytes, now: u64) -> Option[By
   requires blen(msg) < 1048576 && blen(name) <= 255 && blen(roots) < 274877906944
   ensures result is Option::Some ==> blen(result.Some) < 1048576
 {
+  return tls13c_chain_for(msg, name, true, roots, now);
+}
+
+/// Internal: `tls13c_chain`, with the check of the host name only when
+/// `check_name`.
+fn tls13c_chain_for(msg: &Bytes, name: &Bytes, check_name: bool, roots: &Bytes, now: u64) -> Option[Bytes]
+  requires blen(msg) < 1048576 && blen(name) <= 255 && blen(roots) < 274877906944
+  ensures result is Option::Some ==> blen(result.Some) < 1048576
+{
   let n = blen(msg);
   // type, 24-bit length, empty request context, 24-bit list length
   if n < 8 || bget(msg, 0) != 11 || tls13c_u24(msg, 1) + 4 != n || bget(msg, 4) != 0 {
@@ -453,7 +463,7 @@ fn tls13c_chain(msg: &Bytes, name: &Bytes, roots: &Bytes, now: u64) -> Option[By
     Option::None => {},
     Option::Some(x) => {
       // The leaf must be valid now, be for the host, and not forbid signing.
-      good = x509_valid_at(x, now) && x509_has_name(leaf, x, name) && (x.key_usage == 65535 || (x.key_usage & 128) != 0);
+      good = x509_valid_at(x, now) && (!check_name || x509_has_name(leaf, x, name)) && (x.key_usage == 65535 || (x.key_usage & 128) != 0);
     },
   }
   if good { return Option[Bytes]::Some(leaf); }
@@ -713,7 +723,12 @@ fn tls13c_certificate(c: &mut Tls13Client, msg: &Bytes, roots: &Bytes, now: u64)
         Option::Some(leaf) => {
           bfree(c.leaf);
           c.leaf = leaf;
+          // 10 when only the name is wrong (the chain itself is good).
           c.verdict = 6;
+          match tls13c_chain_for(msg, c.name, false, roots, now) {
+            Option::Some(l2) => { bfree(l2); c.verdict = 10; },
+            Option::None => {},
+          }
           if !tls13c_note(&mut c, msg) { return tls13c_fail(&mut c, 1); }
           c.state = 3;
           return 0;

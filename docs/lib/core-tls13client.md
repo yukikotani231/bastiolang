@@ -36,7 +36,7 @@ check that the random values are random (the caller supplies them).
 | [`tls13c_blank`](#tls13c_blank) | A client that has already failed (state 7) and holds no keys or secrets. |
 | [`tls13c_free`](#tls13c_free) | Frees a client. |
 | [`tls13c_alpn`](#tls13c_alpn) | The application protocol the server chose (a copy; empty when it chose none or has not answered yet). |
-| [`tls13c_verdict`](#tls13c_verdict) | 0 when the server's certificate chain was checked and good; otherwise 6, the code a client that verifies fails with (only a client made with `verify` false gets that far). |
+| [`tls13c_verdict`](#tls13c_verdict) | 0 when the server's certificate chain was checked and good; otherwise 10 when only the host name is not the certificate's, or 6 (the code a client that verifies fails with in both cases; only a client made with `verify` false gets that far). |
 | [`tls13c_peer_cert`](#tls13c_peer_cert) | The server's own certificate (DER, a copy), once the client has it (state 3 or later); empty before. |
 | [`tls13c_state`](#tls13c_state) | The state of `c`. |
 | [`tls13c_feed`](#tls13c_feed) | Gives the client the bytes `data` that arrived from the server. |
@@ -205,9 +205,10 @@ if n != 0 { return 1; }
 fn tls13c_verdict(c: &Tls13Client) -> u64
 ```
 
-0 when the server's certificate chain was checked and good; otherwise 6,
-the code a client that verifies fails with (only a client made with
-`verify` false gets that far).
+0 when the server's certificate chain was checked and good; otherwise 10
+when only the host name is not the certificate's, or 6 (the code a client
+that verifies fails with in both cases; only a client made with `verify`
+false gets that far).
 
 Example:
 
@@ -528,6 +529,17 @@ fn tls13c_chain(msg: &Bytes, name: &Bytes, roots: &Bytes, now: u64) -> Option[By
 Internal: checks the Certificate message `msg` (with its header) for a
 server named `name` at time `now` against `roots`, and returns the
 server's own certificate if it is good.
+
+### `tls13c_chain_for`
+
+```bastio
+fn tls13c_chain_for(msg: &Bytes, name: &Bytes, check_name: bool, roots: &Bytes, now: u64) -> Option[Bytes]
+  requires blen(msg) < 1048576 && blen(name) <= 255 && blen(roots) < 274877906944
+  ensures result is Option::Some ==> blen(result.Some) < 1048576
+```
+
+Internal: `tls13c_chain`, with the check of the host name only when
+`check_name`.
 
 ### `tls13c_first_cert`
 
