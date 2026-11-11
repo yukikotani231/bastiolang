@@ -42,6 +42,7 @@ check that the random values are random (the caller supplies them).
 | [`tls13c_feed`](#tls13c_feed) | Gives the client the bytes `data` that arrived from the server. |
 | [`tls13c_send`](#tls13c_send) | Seals `data` as application data records and appends them to `out`. |
 | [`tls13c_close`](#tls13c_close) | Appends a close_notify alert to `out` and closes the connection on this side. |
+| [`tls13c_shutdown`](#tls13c_shutdown) | Appends a close_notify alert to `out` and closes the sending side only. |
 
 Every example below is built, verified and run by `tests/run.sh`. An `assert` in one is proved at compile time from the contracts above it.
 
@@ -57,7 +58,7 @@ struct Tls13Client {
   c_key: Bytes, c_iv: Bytes, s_key: Bytes, s_iv: Bytes,
   c_secret: Bytes, s_secret: Bytes, c_seq: u64, s_seq: u64,
   inbuf: Bytes, hsbuf: Bytes, leaf: Bytes,
-  verify: bool, verdict: u64, alpn: Bytes
+  verify: bool, verdict: u64, alpn: Bytes, sent_close: bool
 }
 ```
 
@@ -66,7 +67,9 @@ for EncryptedExtensions, 2 for the Certificate, 3 for CertificateVerify, 4
 for the server's Finished, 5 connected, 6 closed by the peer, 7 failed.
 `verify` is false when a chain the roots do not vouch for is accepted
 anyway (`verdict` then says why it would have been refused); `alpn` holds
-the protocols offered, then the one the server chose.
+the protocols offered, then the one the server chose. `sent_close` is true
+once `tls13c_shutdown` has said goodbye: nothing more is sent, but what the
+server still sends is read.
 
 ## Functions
 
@@ -346,6 +349,38 @@ bfree(k);
 bfree(s);
 bfree(r);
 if closed { return 1; }
+```
+
+### `tls13c_shutdown`
+
+```bastio
+fn tls13c_shutdown(c: &mut Tls13Client, out: &mut Vec[u8]) -> bool
+  requires tls13c_ok(c)
+  ensures tls13c_ok(c)
+```
+
+Appends a close_notify alert to `out` and closes the sending side only:
+`tls13c_send` refuses from now on, but `tls13c_feed` still takes what the
+server sends until it closes too (state 6). False unless the handshake is
+complete (or it was already shut).
+
+Example:
+
+```bastio
+let r = balloc(32);
+let s = balloc(32);
+let k = balloc(32);
+let name = bfrom("example.com");
+let mut out = text_new();
+let mut c = tls13c_new(r, s, k, name, &mut out);
+let shut = tls13c_shutdown(&mut c, &mut out);
+tls13c_free(c);
+vec_free(out);
+bfree(name);
+bfree(k);
+bfree(s);
+bfree(r);
+if shut { return 1; }
 ```
 
 ## Specification functions
