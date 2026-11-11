@@ -1021,6 +1021,79 @@ fn cg_prelude_spawn_err(out: &mut Vec[u64]) {
   w_s(&mut out, "#define bst_child_wait(c) bst_child_wait_err(c)\n");
 }
 
+/// The prelude part for `child_fd`, `child_try_read` and `child_try_wait`
+/// (stage1 only): added after the spawn_err part, and only to a program that
+/// calls one of them.
+fn cg_prelude_child_async(out: &mut Vec[u64]) {
+  w_s(&mut out, "/* child_fd, child_try_read and child_try_wait: a child driven without blocking.\n");
+  w_s(&mut out, " * try_read polls the pipe and reads what is there, so no flag is set on the\n");
+  w_s(&mut out, " * descriptor (and the EAGAIN value, 11 on Linux and 35 on macOS, never matters).\n");
+  w_s(&mut out, " * It reads the descriptor itself, so do not mix it with child_read_line on the\n");
+  w_s(&mut out, " * same stream. */\n");
+  w_s(&mut out, "#ifndef _WIN32\n");
+  w_s(&mut out, "#include <errno.h>\n");
+  w_s(&mut out, "#include <poll.h>\n");
+  w_s(&mut out, "#include <sys/wait.h>\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "static int bst_child_fdof(bst_child *c, uint64_t which) {\n");
+  w_s(&mut out, "    if (which == 0) return c->in;\n");
+  w_s(&mut out, "    if (which == 1) return c->out ? fileno(c->out) : -1;\n");
+  w_s(&mut out, "    if (which == 2 && c->pid >= 0) {\n");
+  w_s(&mut out, "        for (bst_errnode *n = bst_errs; n; n = n->next)\n");
+  w_s(&mut out, "            if (n->pid == c->pid) return fileno(n->err);\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    return -1;\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "static uint64_t bst_child_fd(bst_child c, uint64_t which) {\n");
+  w_s(&mut out, "    int fd = bst_child_fdof(&c, which);\n");
+  w_s(&mut out, "    return fd < 0 ? UINT64_MAX : (uint64_t)fd;\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "/* 0: a chunk of output replaced `out`; 1: nothing to read yet; 2: the end (or no such pipe). */\n");
+  w_s(&mut out, "static uint64_t bst_child_try_read(bst_child *c, uint64_t which, bst_bytes *out) {\n");
+  w_s(&mut out, "    int fd = bst_child_fdof(c, which);\n");
+  w_s(&mut out, "    if (which == 0 || fd < 0) return 2;\n");
+  w_s(&mut out, "#ifdef _WIN32\n");
+  w_s(&mut out, "    DWORD avail = 0;\n");
+  w_s(&mut out, "    if (!PeekNamedPipe((HANDLE)_get_osfhandle(fd), NULL, 0, NULL, &avail, NULL)) return 2;\n");
+  w_s(&mut out, "    if (avail == 0) return 1;\n");
+  w_s(&mut out, "#else\n");
+  w_s(&mut out, "    struct pollfd pf;\n");
+  w_s(&mut out, "    pf.fd = fd;\n");
+  w_s(&mut out, "    pf.events = POLLIN;\n");
+  w_s(&mut out, "    pf.revents = 0;\n");
+  w_s(&mut out, "    int r;\n");
+  w_s(&mut out, "    do { r = poll(&pf, 1, 0); } while (r < 0 && errno == EINTR);\n");
+  w_s(&mut out, "    if (r == 0) return 1;\n");
+  w_s(&mut out, "    if (r < 0) return 2;\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "    unsigned char *d = (unsigned char *)malloc(65536);\n");
+  w_s(&mut out, "    if (!d) { fputs(\"Bastio: out of memory\\n\", stderr); abort(); }\n");
+  w_s(&mut out, "    ssize_t n;\n");
+  w_s(&mut out, "    do { n = read(fd, d, 65536); } while (n < 0 && errno == EINTR);\n");
+  w_s(&mut out, "    if (n <= 0) { free(d); return 2; }\n");
+  w_s(&mut out, "    free(out->data);\n");
+  w_s(&mut out, "    out->len = (uint64_t)n;\n");
+  w_s(&mut out, "    out->data = d;\n");
+  w_s(&mut out, "    return 0;\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "/* 256 while the child runs, else its exit status as child_wait would report\n");
+  w_s(&mut out, " * it. The child is not reaped: child_wait still has to be called. */\n");
+  w_s(&mut out, "static uint64_t bst_child_try_wait(bst_child c) {\n");
+  w_s(&mut out, "    if (c.pid < 0) return 127;\n");
+  w_s(&mut out, "#ifdef _WIN32\n");
+  w_s(&mut out, "    DWORD code;\n");
+  w_s(&mut out, "    if (!GetExitCodeProcess((HANDLE)c.pid, &code)) return 255;\n");
+  w_s(&mut out, "    return code == STILL_ACTIVE ? 256 : (uint64_t)code;\n");
+  w_s(&mut out, "#else\n");
+  w_s(&mut out, "    siginfo_t si;\n");
+  w_s(&mut out, "    memset(&si, 0, sizeof si);\n");
+  w_s(&mut out, "    if (waitid(P_PID, (id_t)c.pid, &si, WEXITED | WNOHANG | WNOWAIT) != 0) return 255;\n");
+  w_s(&mut out, "    if (si.si_pid == 0) return 256;\n");
+  w_s(&mut out, "    return si.si_code == CLD_EXITED ? (uint64_t)si.si_status : 128 + (uint64_t)si.si_status;\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "}\n");
+}
+
 /// The prelude part for `host_sandbox` (stage1 only): added after the hosted
 /// prelude, and only to a program that calls it.
 fn cg_prelude_sandbox(out: &mut Vec[u64]) {
@@ -3664,6 +3737,8 @@ const PART_SYS: u64 = 28;
 const PART_CODE: u64 = 27;
 /// Not in any target's list either: see `cg_prelude_spawn_err`.
 const PART_SPAWN_ERR: u64 = 29;
+/// Not in any target's list either: see `cg_prelude_child_async`.
+const PART_CHILD_ASYNC: u64 = 30;
 
 fn cg_part_name(id: u64) -> Str {
   if id == PART_POSIX { return "posix"; }
@@ -3695,6 +3770,7 @@ fn cg_part_name(id: u64) -> Str {
   if id == PART_SYS { return "sys"; }
   if id == PART_CODE { return "code"; }
   if id == PART_SPAWN_ERR { return "spawn_err"; }
+  if id == PART_CHILD_ASYNC { return "child_async"; }
   return "user";
 }
 
@@ -3730,6 +3806,7 @@ fn cg_part(out: &mut Vec[u64], id: u64) {
   else if id == PART_SYS { cg_prelude_sys(&mut out); }
   else if id == PART_CODE { cg_prelude_code(&mut out); }
   else if id == PART_SPAWN_ERR { cg_prelude_spawn_err(&mut out); }
+  else if id == PART_CHILD_ASYNC { cg_prelude_child_async(&mut out); }
   else { cg_prelude_user(&mut out); }
 }
 
