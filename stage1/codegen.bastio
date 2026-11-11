@@ -618,7 +618,7 @@ fn cg_type_of(g: &Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) 
         let t = cg_type_of(g, c, &mut m, p, a0, 0);
         return inner_t(m, t);
       }
-      if name_is(p, i, "vec_with") {
+      if name_is(p, i, "vec_with") || name_is(p, i, "vec_with_mut") {
         let fnode = node_at(p.nodes, cg_arg(p, i, 2));
         let x = plain_inst(&mut m, plain_fn(p, fnode.s, fnode.e));
         return cg_ret_ty(&mut m, p, x);
@@ -1201,6 +1201,9 @@ fn cg_call(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64)
     if name_is(p, i, "vec_with") {
       return cg_vec_with(&mut g, c, &mut m, p, i);
     }
+    if name_is(p, i, "vec_with_mut") {
+      return cg_vec_with_mut(&mut g, c, &mut m, p, i);
+    }
     if is_vec_builtin(p, n.s, n.e) {
       return cg_vec_call(&mut g, c, &mut m, p, i);
     }
@@ -1358,6 +1361,61 @@ fn cg_vec_with(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgS
   cg_fname(&mut g, m, p, x);
   cg_t(&mut g, "(");
   cg_sp(&mut g, elem);
+  q = 0;
+  while q < vec_len(rest) {
+    cg_t(&mut g, ", ");
+    cg_sp(&mut g, sp_at(rest, q));
+    q = q + 1;
+  }
+  vec_free(rest);
+  cg_t(&mut g, ")");
+  vec_free(vals);
+  let e = cg_span(g, start);
+  return cg_seq(&mut g, pre, e);
+}
+
+/// `vec_with_mut(&mut v, i, f, args..)`: `f` gets a pointer to the element in
+/// the vector's own storage, so what it writes stays there.
+fn cg_vec_with_mut(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp {
+  let n = node_at(p.nodes, i);
+  let fnode = node_at(p.nodes, cg_arg(p, i, 2));
+  let x = plain_inst(&mut m, plain_fn(p, fnode.s, fnode.e));
+  let el = cg_vec_elem(g, c, &mut m, p, n.a);
+  cg_note(&mut g.vecs, el);
+  let mut xs = vec_new[u64]();
+  vec_push(&mut xs, n.a);
+  vec_push(&mut xs, cg_arg(p, i, 1));
+  let mut a = cg_arg(p, i, 3);
+  while a != 0 {
+    vec_push(&mut xs, a);
+    a = next_of(p, a);
+  }
+  let mut vals = vec_new[CgSp]();
+  let pre = cg_operands(&mut g, c, &mut m, p, xs, true, &mut vals);
+  vec_free(xs);
+  let xi = inst_at(m, x);
+  let ps = fn_params(&mut m, p, xi.def, x);
+  // The element's C type, written before the span that uses it starts.
+  let s1 = cg_mark(g);
+  cg_cty(&mut g, m, p, el);
+  let ct = cg_span(g, s1);
+  let mut rest = vec_new[CgSp]();
+  let mut q = 1;
+  while cg_add(q, 1) < vec_len(vals) {
+    let w = cg_ref_arg(&mut g, m, p, u_at(ps, q), sp_at(vals, cg_add(q, 1)), true);
+    vec_push(&mut rest, w);
+    q = cg_add(q, 1);
+  }
+  vec_free(ps);
+  let start = cg_mark(g);
+  cg_fname(&mut g, m, p, x);
+  cg_t(&mut g, "(&((");
+  cg_sp(&mut g, ct);
+  cg_t(&mut g, " *)(");
+  cg_sp(&mut g, sp_at(vals, 0));
+  cg_t(&mut g, ")->data)[");
+  cg_sp(&mut g, sp_at(vals, 1));
+  cg_t(&mut g, "]");
   q = 0;
   while q < vec_len(rest) {
     cg_t(&mut g, ", ");

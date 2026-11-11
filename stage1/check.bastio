@@ -1107,7 +1107,8 @@ fn is_vec_builtin(p: &Parser, s: u64, e: u64) -> bool {
   return span_is(p, s, e, "vec_new") || span_is(p, s, e, "vec_len") || span_is(p, s, e, "vec_push")
     || span_is(p, s, e, "vec_push_within") || span_is(p, s, e, "vec_try_reserve")
     || span_is(p, s, e, "vec_pop") || span_is(p, s, e, "vec_get") || span_is(p, s, e, "vec_set")
-    || span_is(p, s, e, "vec_swap") || span_is(p, s, e, "vec_free") || span_is(p, s, e, "vec_with");
+    || span_is(p, s, e, "vec_swap") || span_is(p, s, e, "vec_free") || span_is(p, s, e, "vec_with")
+    || span_is(p, s, e, "vec_with_mut");
 }
 
 /// Wrapping arithmetic: both operands and the result have one integer type.
@@ -4487,7 +4488,10 @@ fn vec_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
   let rv = ref_to(&mut m, p, vt);
   let mv = mut_to(&mut m, p, vt);
   if span_is(p, s, e, "vec_with") {
-    return vec_with_call(&mut c, &mut m, p, i, el, rv);
+    return vec_with_call(&mut c, &mut m, p, i, el, rv, false);
+  }
+  if span_is(p, s, e, "vec_with_mut") {
+    return vec_with_call(&mut c, &mut m, p, i, el, mv, true);
   }
   let mut ps = vec_new[u64]();
   let mut r = c.tunit;
@@ -4594,7 +4598,11 @@ fn ck_has_effect(p: &Parser, i: u64) -> bool {
 /// be copied out) or wide. `v` is only read for the call, and `f` gets a
 /// shared borrow of one element and values or borrows of other places, so
 /// the element cannot change or leave while `f` looks at it.
-fn vec_with_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, el: u64, rv: u64) -> u64 {
+///
+/// `vec_with_mut(&mut v, i, f, args..)` is the same with `&mut element`: `f`
+/// may change the element but, as with any `&mut` parameter, not move it out
+/// or drop what it holds that is linear. The element is a struct or an enum.
+fn vec_with_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, el: u64, rv: u64, writes: bool) -> u64 {
   let n = node_at(p.nodes, i);
   let a0 = n.a;
   let mut a1 = 0;
@@ -4613,14 +4621,35 @@ fn vec_with_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, el: u64, rv:
   let fps = fn_params(&mut m, p, xi.def, x);
   let dn = node_at(p.nodes, xi.def);
   let r = conv(&mut m, p, dn.b, x, xi.def);
-  if vec_len(fps) == 0 || u_at(fps, 0) != ref_to(&mut m, p, el) {
+  let mut want = ref_to(&mut m, p, el);
+  if writes {
+    want = mut_to(&mut m, p, el);
+  }
+  if vec_len(fps) == 0 || u_at(fps, 0) != want {
     vec_free(fps);
     if cm_new(&mut c, p, i, C_TYPE) {
       cm_s(&mut c, "`");
       cm_inst(&mut c, m, p, x);
-      cm_s(&mut c, "` must take `&");
+      if writes {
+        cm_s(&mut c, "` must take `&mut ");
+      } else {
+        cm_s(&mut c, "` must take `&");
+      }
       cm_ty(&mut c, m, p, el);
-      cm_s(&mut c, "` first, to receive the element `vec_with` lends");
+      if writes {
+        cm_s(&mut c, "` first, to receive the element `vec_with_mut` lends");
+      } else {
+        cm_s(&mut c, "` first, to receive the element `vec_with` lends");
+      }
+    }
+    return 0;
+  }
+  if writes && kind_t(m, el) != TY_STRUCT && kind_t(m, el) != TY_ENUM {
+    vec_free(fps);
+    if cm_new(&mut c, p, i, C_TYPE) {
+      cm_s(&mut c, "`vec_with_mut` lends a struct or an enum element in place, not ");
+      cm_ty(&mut c, m, p, el);
+      cm_note(&mut c, "use `vec_set` or `vec_swap` for other elements");
     }
     return 0;
   }
@@ -4634,7 +4663,11 @@ fn vec_with_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, el: u64, rv:
     if ck_has_effect(p, b) {
       vec_free(fps);
       if cm_new(&mut c, p, b, C_USE) {
-        cm_s(&mut c, "an argument of `vec_with` after the function must not call anything");
+        if writes {
+          cm_s(&mut c, "an argument of `vec_with_mut` after the function must not call anything");
+        } else {
+          cm_s(&mut c, "an argument of `vec_with` after the function must not call anything");
+        }
         cm_note(&mut c, "the element is lent after the arguments are evaluated, and a call could change the vector; compute the value into a variable first");
       }
       return 0;
