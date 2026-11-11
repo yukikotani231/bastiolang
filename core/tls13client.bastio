@@ -224,6 +224,35 @@ fn tls13c_free(c: Tls13Client) {
   bfree(c.alpn);
 }
 
+/// Whether `c` has the sizes and states the other functions require
+/// (`tls13c_ok`): true for a client made by `tls13c_new` or
+/// `tls13c_new_with` and kept by these functions, false for a blank one.
+/// Callers that keep clients in a vector use it after taking one out.
+/// ```
+/// let c = tls13c_blank();
+/// let ok = tls13c_check(c);
+/// tls13c_free(c);
+/// if ok { return 1; }
+/// ```
+fn tls13c_check(c: &Tls13Client) -> bool
+  ensures result ==> tls13c_ok(c)
+{
+  if c.state > 7 || blen(c.priv_key) != 32 { return false; }
+  let mut sec = 0;
+  if c.suite == 4866 { sec = 48; } else if c.suite == 4865 || c.suite == 4867 { sec = 32; } else { return false; }
+  if blen(c.hs_secret) != sec || blen(c.c_hs) != sec || blen(c.s_hs) != sec || blen(c.c_secret) != sec || blen(c.s_secret) != sec { return false; }
+  if c.c_suite == 4865 { if blen(c.c_key) != 16 { return false; } }
+  else if c.c_suite == 4866 || c.c_suite == 4867 { if blen(c.c_key) != 32 { return false; } }
+  else { return false; }
+  if c.s_suite == 4865 { if blen(c.s_key) != 16 { return false; } }
+  else if c.s_suite == 4866 || c.s_suite == 4867 { if blen(c.s_key) != 32 { return false; } }
+  else { return false; }
+  if blen(c.c_iv) != 12 || blen(c.s_iv) != 12 { return false; }
+  if blen(c.name) > 255 || blen(c.alpn) > 256 { return false; }
+  if blen(c.transcript) >= 1073741824 || blen(c.inbuf) >= 1073741824 || blen(c.hsbuf) >= 1073741824 || blen(c.leaf) >= 1048576 { return false; }
+  return true;
+}
+
 /// The application protocol the server chose (a copy; empty when it chose
 /// none or has not answered yet).
 /// ```

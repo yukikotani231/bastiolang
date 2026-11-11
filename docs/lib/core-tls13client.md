@@ -35,6 +35,7 @@ check that the random values are random (the caller supplies them).
 | [`tls13c_new_with`](#tls13c_new_with) | `tls13c_new` that also offers the application protocols `alpn` (RFC 7301; the ProtocolNameList without its length, each name behind a one-byte length, at most 256 bytes, empty for none; `tls13c_alpn` tells which one the server chose). |
 | [`tls13c_blank`](#tls13c_blank) | A client that has already failed (state 7) and holds no keys or secrets. |
 | [`tls13c_free`](#tls13c_free) | Frees a client. |
+| [`tls13c_check`](#tls13c_check) | Whether `c` has the sizes and states the other functions require (`tls13c_ok`). |
 | [`tls13c_alpn`](#tls13c_alpn) | The application protocol the server chose (a copy; empty when it chose none or has not answered yet). |
 | [`tls13c_verdict`](#tls13c_verdict) | 0 when the server's certificate chain was checked and good; otherwise 10 when only the host name is not the certificate's, or 6 (the code a client that verifies fails with in both cases; only a client made with `verify` false gets that far). |
 | [`tls13c_peer_cert`](#tls13c_peer_cert) | The server's own certificate (DER, a copy), once the client has it (state 3 or later); empty before. |
@@ -178,6 +179,27 @@ fn tls13c_free(c: Tls13Client)
 ```
 
 Frees a client.
+
+### `tls13c_check`
+
+```bastio
+fn tls13c_check(c: &Tls13Client) -> bool
+  ensures result ==> tls13c_ok(c)
+```
+
+Whether `c` has the sizes and states the other functions require
+(`tls13c_ok`): true for a client made by `tls13c_new` or
+`tls13c_new_with` and kept by these functions, false for a blank one.
+Callers that keep clients in a vector use it after taking one out.
+
+Example:
+
+```bastio
+let c = tls13c_blank();
+let ok = tls13c_check(c);
+tls13c_free(c);
+if ok { return 1; }
+```
 
 ### `tls13c_alpn`
 
