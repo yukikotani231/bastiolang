@@ -1,0 +1,123 @@
+// stage1-only: host_net UDP (datagram sockets)
+// backend: c
+// expect-exit: 0
+// Two datagram sockets on 127.0.0.1: a receive on an empty one is "try again",
+// a datagram sent from one arrives at the other with the sender's address
+// and port, an option round-trips and a bad address is refused. Windows has
+// no UDP here: the first open fails and the test has nothing to check.
+import "../../std/net.bastio";
+
+fn lo() -> Bytes {
+  let mut ip = balloc(4);
+  bset(&mut ip, 0, 127);
+  bset(&mut ip, 1, 0);
+  bset(&mut ip, 2, 0);
+  bset(&mut ip, 3, 1);
+  return ip;
+}
+
+fn main(h: &mut Host) -> u64 {
+  let ra = net_udp_open(h, false);
+  let rb = net_udp_open(h, false);
+  let mut bad = 0;
+  match ra {
+    Option::Some(a) => {
+      match rb {
+        Option::Some(b) => {
+          let ip = lo();
+          if !net_udp_bind(h, a, ip, 0, false) || !net_udp_bind(h, b, ip, 0, true) {
+            bad = bad | 1;
+          }
+          let mut aip = balloc(0);
+          let mut aport = 0;
+          let mut bip = balloc(0);
+          let mut bport = 0;
+          if !net_sockname(h, a, &mut aip, &mut aport) || !net_sockname(h, b, &mut bip, &mut bport) {
+            bad = bad | 2;
+          }
+          if aport == 0 || bport == 0 || aport == bport || blen(aip) != 4 || bget(aip, 0) != 127 {
+            bad = bad | 4;
+          }
+          let mut got = balloc(0);
+          let mut from = balloc(0);
+          let mut fport = 0;
+          // Nothing yet: not a result, and "try again".
+          if net_udp_recv(h, b, 100, &mut got, &mut from, &mut fport) is Option::Some || !net_udp_again(h) {
+            bad = bad | 8;
+          }
+          let msg = bfrom("hello udp");
+          match net_udp_send(h, a, ip, bport, msg) {
+            Option::Some(n) => {
+              if n != 9 {
+                bad = bad | 16;
+              }
+            },
+            Option::None => {
+              bad = bad | 16;
+            },
+          }
+          let mut tries = 0;
+          let mut n = 0;
+          let mut again = true;
+          while again && tries < 2000 {
+            match net_udp_recv(h, b, 100, &mut got, &mut from, &mut fport) {
+              Option::Some(k) => {
+                n = k;
+                again = false;
+              },
+              Option::None => {
+                if !net_udp_again(h) {
+                  again = false;
+                }
+              },
+            }
+            tries = tries + 1;
+          }
+          if n != 9 || blen(got) != 9 || bget(got, 0) != 104 || bget(got, 8) != 112 {
+            bad = bad | 32;
+          }
+          if fport != aport || blen(from) != 4 || bget(from, 3) != 1 {
+            bad = bad | 64;
+          }
+          if !net_udp_opt(h, a, NET_UDP_TTL, 5) {
+            bad = bad | 128;
+          }
+          match net_udp_getopt(h, a, NET_UDP_TTL) {
+            Option::Some(v) => {
+              if v != 5 {
+                bad = bad | 256;
+              }
+            },
+            Option::None => {
+              bad = bad | 256;
+            },
+          }
+          let short = balloc(3);
+          if net_udp_send(h, a, short, bport, msg) is Option::Some {
+            bad = bad | 512;
+          }
+          bfree(short);
+          bfree(msg);
+          bfree(got);
+          bfree(from);
+          bfree(aip);
+          bfree(bip);
+          bfree(ip);
+          net_close(h, b);
+          net_close(h, a);
+        },
+        Option::None => {
+          bad = bad | 1024;
+        },
+      }
+    },
+    Option::None => {
+      return 0;
+    },
+  }
+  if bad != 0 {
+    print(bad);
+    return 1;
+  }
+  return 0;
+}

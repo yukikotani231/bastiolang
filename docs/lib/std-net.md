@@ -28,8 +28,59 @@ listener, a closed descriptor, an address in use) gives `Option::None` or
 | [`net_connect_result`](#net_connect_result) | The outcome of a connection started with `net_connect_start`, once the socket is writable. |
 | [`net_now`](#net_now) | The time in seconds since 1970-01-01 UTC, from the system clock (0 if there is none). |
 | [`net_random`](#net_random) | `n` random bytes (at most 256) from the system's source (`/dev/urandom`, `RtlGenRandom`, `crypto.getRandomValues`), or `None` when there is none. |
+| [`net_udp_open`](#net_udp_open) | A UDP socket (IPv6 when `v6`), not yet bound. |
+| [`net_udp_bind`](#net_udp_bind) | Binds `sock` to `ip`:`port` (port 0. |
+| [`net_udp_send`](#net_udp_send) | Sends `data` as one datagram to `ip`:`port`. |
+| [`net_udp_recv`](#net_udp_recv) | Receives one datagram of at most `max` bytes (a longer one is cut) into `out`, with the sender's address in `from_ip` and its port in `from_port`. |
+| [`net_udp_again`](#net_udp_again) | True when the last failed UDP call only meant "not now" (EAGAIN or EWOULDBLOCK), as opposed to a real error. |
+| [`net_udp_opt`](#net_udp_opt) | Sets option `opt` (one of the `NET_UDP_*` numbers) to `val`. |
+| [`net_udp_getopt`](#net_udp_getopt) | The value of option `opt` (Linux reports twice the buffer sizes it was given). |
+| [`net_udp_membership`](#net_udp_membership) | Joins (`join`) or leaves the IPv4 multicast `group` (4 bytes) on the interface with address `iface` (4 bytes; all zero. |
+| [`net_sockname`](#net_sockname) | The local address and port of `sock` (a generalised `net_port`). |
 
 Every example below is built, verified and run by `tests/run.sh`. An `assert` in one is proved at compile time from the contracts above it.
+
+## Types and constants
+
+### `NET_UDP_BROADCAST`
+
+```bastio
+const NET_UDP_BROADCAST: u64 = 1;
+```
+
+Socket options for `net_udp_opt`: `NET_UDP_BROADCAST` (1 turns it on),
+the unicast and multicast time to live (hop limit), multicast loopback,
+and the receive and send buffer sizes in bytes.
+
+### `NET_UDP_TTL`
+
+```bastio
+const NET_UDP_TTL: u64 = 2;
+```
+
+### `NET_UDP_MULTICAST_TTL`
+
+```bastio
+const NET_UDP_MULTICAST_TTL: u64 = 3;
+```
+
+### `NET_UDP_MULTICAST_LOOP`
+
+```bastio
+const NET_UDP_MULTICAST_LOOP: u64 = 4;
+```
+
+### `NET_UDP_RCVBUF`
+
+```bastio
+const NET_UDP_RCVBUF: u64 = 5;
+```
+
+### `NET_UDP_SNDBUF`
+
+```bastio
+const NET_UDP_SNDBUF: u64 = 6;
+```
 
 ## Functions
 
@@ -449,5 +500,207 @@ match net_random(host, 32) {
     }
   },
   Option::None => { return 1; },
+}
+```
+
+### `net_udp_open`
+
+```bastio
+fn net_udp_open(h: &Host, v6: bool) -> Option[u64]
+```
+
+A UDP socket (IPv6 when `v6`), not yet bound.
+
+Example:
+
+```bastio
+match net_udp_open(host, false) {
+  Option::Some(s) => { net_close(host, s); },
+  Option::None => {},   // (no UDP on this backend or platform)
+}
+```
+
+### `net_udp_bind`
+
+```bastio
+fn net_udp_bind(h: &Host, sock: u64, ip: &Bytes, port: u64, reuse: bool) -> bool
+```
+
+Binds `sock` to `ip`:`port` (port 0: any free port, which `net_sockname`
+then gives). `reuse` sets SO_REUSEADDR first.
+
+Example:
+
+```bastio
+match net_udp_open(host, false) {
+  Option::Some(s) => {
+    let mut ip = balloc(4);
+    bset(&mut ip, 0, 127); bset(&mut ip, 1, 0); bset(&mut ip, 2, 0); bset(&mut ip, 3, 1);
+    let ok = net_udp_bind(host, s, ip, 0, false);
+    bfree(ip);
+    net_close(host, s);
+    if !ok { return 1; }
+  },
+  Option::None => {},   // (no UDP on this backend or platform)
+}
+```
+
+### `net_udp_send`
+
+```bastio
+fn net_udp_send(h: &Host, sock: u64, ip: &Bytes, port: u64, data: &Bytes) -> Option[u64]
+```
+
+Sends `data` as one datagram to `ip`:`port`. The count sent, or `None`
+(also when the send buffer is full: see `net_udp_again`).
+
+Example:
+
+```bastio
+match net_udp_open(host, false) {
+  Option::Some(s) => {
+    let mut ip = balloc(4);
+    bset(&mut ip, 0, 127); bset(&mut ip, 1, 0); bset(&mut ip, 2, 0); bset(&mut ip, 3, 1);
+    let d = bfrom("hi");
+    let r = net_udp_send(host, s, ip, 9, d);
+    bfree(d); bfree(ip);
+    net_close(host, s);
+    if r is Option::None { return 1; }
+  },
+  Option::None => {},   // (no UDP on this backend or platform)
+}
+```
+
+### `net_udp_recv`
+
+```bastio
+fn net_udp_recv(h: &Host, sock: u64, max: u64, out: &mut Bytes, from_ip: &mut Bytes, from_port: &mut u64) -> Option[u64]
+```
+
+Receives one datagram of at most `max` bytes (a longer one is cut) into
+`out`, with the sender's address in `from_ip` and its port in `from_port`.
+`None` when there is none yet (`net_udp_again` is true) or on an error.
+
+Example:
+
+```bastio
+match net_udp_open(host, false) {
+  Option::Some(s) => {
+    let mut out = balloc(0);
+    let mut ip = balloc(0);
+    let mut port = 0;
+    let r = net_udp_recv(host, s, 100, &mut out, &mut ip, &mut port);
+    bfree(out); bfree(ip);
+    net_close(host, s);
+    if r is Option::Some { return 1; }
+  },
+  Option::None => {},   // (no UDP on this backend or platform)
+}
+```
+
+### `net_udp_again`
+
+```bastio
+fn net_udp_again(h: &Host) -> bool
+```
+
+True when the last failed UDP call only meant "not now" (EAGAIN or
+EWOULDBLOCK), as opposed to a real error.
+
+Example:
+
+```bastio
+let again = net_udp_again(host);
+if again { return 1; }
+```
+
+### `net_udp_opt`
+
+```bastio
+fn net_udp_opt(h: &Host, sock: u64, opt: u64, val: u64) -> bool
+```
+
+Sets option `opt` (one of the `NET_UDP_*` numbers) to `val`.
+
+Example:
+
+```bastio
+match net_udp_open(host, false) {
+  Option::Some(s) => {
+    let ok = net_udp_opt(host, s, NET_UDP_BROADCAST, 1);
+    net_close(host, s);
+    if !ok { return 1; }
+  },
+  Option::None => {},   // (no UDP on this backend or platform)
+}
+```
+
+### `net_udp_getopt`
+
+```bastio
+fn net_udp_getopt(h: &Host, sock: u64, opt: u64) -> Option[u64]
+```
+
+The value of option `opt` (Linux reports twice the buffer sizes it was given).
+
+Example:
+
+```bastio
+match net_udp_open(host, false) {
+  Option::Some(s) => {
+    let v = net_udp_getopt(host, s, NET_UDP_RCVBUF);
+    net_close(host, s);
+    if v is Option::None { return 1; }
+  },
+  Option::None => {},   // (no UDP on this backend or platform)
+}
+```
+
+### `net_udp_membership`
+
+```bastio
+fn net_udp_membership(h: &Host, sock: u64, group: &Bytes, iface: &Bytes, join: bool) -> bool
+```
+
+Joins (`join`) or leaves the IPv4 multicast `group` (4 bytes) on the
+interface with address `iface` (4 bytes; all zero: the system's choice).
+
+Example:
+
+```bastio
+match net_udp_open(host, false) {
+  Option::Some(s) => {
+    let g = balloc(3);
+    let i = balloc(4);
+    let ok = net_udp_membership(host, s, g, i, true);
+    bfree(g); bfree(i);
+    net_close(host, s);
+    if ok { return 1; }
+  },
+  Option::None => {},   // (no UDP on this backend or platform)
+}
+```
+
+### `net_sockname`
+
+```bastio
+fn net_sockname(h: &Host, sock: u64, ip: &mut Bytes, port: &mut u64) -> bool
+```
+
+The local address and port of `sock` (a generalised `net_port`).
+
+Example:
+
+```bastio
+match net_udp_open(host, false) {
+  Option::Some(s) => {
+    let mut ip = balloc(0);
+    let mut port = 0;
+    let ok = net_sockname(host, s, &mut ip, &mut port);
+    bfree(ip);
+    net_close(host, s);
+    if !ok { return 1; }
+  },
+  Option::None => {},   // (no UDP on this backend or platform)
 }
 ```

@@ -422,3 +422,261 @@ fn net_random(h: &Host, n: u64) -> Option[Bytes]
   bfree(buf);
   return Option[Bytes]::None;
 }
+
+// UDP. A datagram socket is non-blocking, so it can be waited on with
+// `os_poll` (std/os.bastio) like any descriptor, and closed with `net_close`.
+// An address is 4 bytes (IPv4) or 16 bytes (IPv6) in network order. When a
+// call fails, `net_udp_again` tells "nothing to do yet" (EAGAIN) from a real
+// error. Linux and macOS (C backend); Winsock does not have these yet.
+
+/// Socket options for `net_udp_opt`: `NET_UDP_BROADCAST` (1 turns it on),
+/// the unicast and multicast time to live (hop limit), multicast loopback,
+/// and the receive and send buffer sizes in bytes.
+const NET_UDP_BROADCAST: u64 = 1;
+const NET_UDP_TTL: u64 = 2;
+const NET_UDP_MULTICAST_TTL: u64 = 3;
+const NET_UDP_MULTICAST_LOOP: u64 = 4;
+const NET_UDP_RCVBUF: u64 = 5;
+const NET_UDP_SNDBUF: u64 = 6;
+
+/// A UDP socket (IPv6 when `v6`), not yet bound.
+/// ```
+/// match net_udp_open(host, false) {
+///   Option::Some(s) => { net_close(host, s); },
+///   Option::None => {},   // (no UDP on this backend or platform)
+/// }
+/// ```
+fn net_udp_open(h: &Host, v6: bool) -> Option[u64] {
+  let mut none = balloc(0);
+  let mut a = 0;
+  if v6 {
+    a = 1;
+  }
+  let r = host_net(h, 20, a, 0, &mut none);
+  bfree(none);
+  if r == 18446744073709551615 {
+    return Option[u64]::None;
+  }
+  return Option[u64]::Some(r);
+}
+
+/// Binds `sock` to `ip`:`port` (port 0: any free port, which `net_sockname`
+/// then gives). `reuse` sets SO_REUSEADDR first.
+/// ```
+/// match net_udp_open(host, false) {
+///   Option::Some(s) => {
+///     let mut ip = balloc(4);
+///     bset(&mut ip, 0, 127); bset(&mut ip, 1, 0); bset(&mut ip, 2, 0); bset(&mut ip, 3, 1);
+///     let ok = net_udp_bind(host, s, ip, 0, false);
+///     bfree(ip);
+///     net_close(host, s);
+///     if !ok { return 1; }
+///   },
+///   Option::None => {},   // (no UDP on this backend or platform)
+/// }
+/// ```
+fn net_udp_bind(h: &Host, sock: u64, ip: &Bytes, port: u64, reuse: bool) -> bool {
+  let mut a = bytes_slice(ip, 0, blen(ip));
+  let mut b = port % 65536;
+  if reuse {
+    b = b + 65536;
+  }
+  let r = host_net(h, 21, sock, b, &mut a);
+  bfree(a);
+  return r == 0;
+}
+
+/// Sends `data` as one datagram to `ip`:`port`. The count sent, or `None`
+/// (also when the send buffer is full: see `net_udp_again`).
+/// ```
+/// match net_udp_open(host, false) {
+///   Option::Some(s) => {
+///     let mut ip = balloc(4);
+///     bset(&mut ip, 0, 127); bset(&mut ip, 1, 0); bset(&mut ip, 2, 0); bset(&mut ip, 3, 1);
+///     let d = bfrom("hi");
+///     let r = net_udp_send(host, s, ip, 9, d);
+///     bfree(d); bfree(ip);
+///     net_close(host, s);
+///     if r is Option::None { return 1; }
+///   },
+///   Option::None => {},   // (no UDP on this backend or platform)
+/// }
+/// ```
+fn net_udp_send(h: &Host, sock: u64, ip: &Bytes, port: u64, data: &Bytes) -> Option[u64] {
+  if blen(ip) > 16 || blen(data) > 65535 {
+    return Option[u64]::None;
+  }
+  let mut hdr = balloc(1);
+  bset(&mut hdr, 0, cast[u8](blen(ip)));
+  let part = bytes_concat(hdr, ip);
+  let mut all = bytes_concat(part, data);
+  bfree(hdr);
+  bfree(part);
+  let r = host_net(h, 22, sock, port % 65536, &mut all);
+  bfree(all);
+  if r == 18446744073709551615 {
+    return Option[u64]::None;
+  }
+  return Option[u64]::Some(r);
+}
+
+/// Receives one datagram of at most `max` bytes (a longer one is cut) into
+/// `out`, with the sender's address in `from_ip` and its port in `from_port`.
+/// `None` when there is none yet (`net_udp_again` is true) or on an error.
+/// ```
+/// match net_udp_open(host, false) {
+///   Option::Some(s) => {
+///     let mut out = balloc(0);
+///     let mut ip = balloc(0);
+///     let mut port = 0;
+///     let r = net_udp_recv(host, s, 100, &mut out, &mut ip, &mut port);
+///     bfree(out); bfree(ip);
+///     net_close(host, s);
+///     if r is Option::Some { return 1; }
+///   },
+///   Option::None => {},   // (no UDP on this backend or platform)
+/// }
+/// ```
+fn net_udp_recv(h: &Host, sock: u64, max: u64, out: &mut Bytes, from_ip: &mut Bytes, from_port: &mut u64) -> Option[u64] {
+  let mut all = balloc(0);
+  let r = host_net(h, 23, sock, max, &mut all);
+  if r == 18446744073709551615 {
+    bfree(all);
+    return Option[u64]::None;
+  }
+  let n = r % 4294967296;
+  if blen(all) == 0 {
+    bfree(all);
+    return Option[u64]::None;
+  }
+  let il = cast[u64](bget(all, 0));
+  if blen(all) < 1 + il {
+    bfree(all);
+    return Option[u64]::None;
+  }
+  bfree(out);
+  bfree(from_ip);
+  out = bytes_slice(all, 1 + il, blen(all));
+  from_ip = bytes_slice(all, 1, 1 + il);
+  from_port = r / 4294967296;
+  bfree(all);
+  return Option[u64]::Some(n);
+}
+
+/// True when the last failed UDP call only meant "not now" (EAGAIN or
+/// EWOULDBLOCK), as opposed to a real error.
+/// ```
+/// let again = net_udp_again(host);
+/// if again { return 1; }
+/// ```
+fn net_udp_again(h: &Host) -> bool {
+  let mut none = balloc(0);
+  let e = host_net(h, 28, 0, 0, &mut none);
+  bfree(none);
+  return e == 11 || e == 35;
+}
+
+/// Sets option `opt` (one of the `NET_UDP_*` numbers) to `val`.
+/// ```
+/// match net_udp_open(host, false) {
+///   Option::Some(s) => {
+///     let ok = net_udp_opt(host, s, NET_UDP_BROADCAST, 1);
+///     net_close(host, s);
+///     if !ok { return 1; }
+///   },
+///   Option::None => {},   // (no UDP on this backend or platform)
+/// }
+/// ```
+fn net_udp_opt(h: &Host, sock: u64, opt: u64, val: u64) -> bool {
+  let mut none = balloc(0);
+  let r = host_net(h, 24, sock, opt % 256 + (val % 2147483648) * 256, &mut none);
+  bfree(none);
+  return r == 0;
+}
+
+/// The value of option `opt` (Linux reports twice the buffer sizes it was given).
+/// ```
+/// match net_udp_open(host, false) {
+///   Option::Some(s) => {
+///     let v = net_udp_getopt(host, s, NET_UDP_RCVBUF);
+///     net_close(host, s);
+///     if v is Option::None { return 1; }
+///   },
+///   Option::None => {},   // (no UDP on this backend or platform)
+/// }
+/// ```
+fn net_udp_getopt(h: &Host, sock: u64, opt: u64) -> Option[u64] {
+  let mut none = balloc(0);
+  let r = host_net(h, 25, sock, opt, &mut none);
+  bfree(none);
+  if r == 18446744073709551615 {
+    return Option[u64]::None;
+  }
+  return Option[u64]::Some(r);
+}
+
+/// Joins (`join`) or leaves the IPv4 multicast `group` (4 bytes) on the
+/// interface with address `iface` (4 bytes; all zero: the system's choice).
+/// ```
+/// match net_udp_open(host, false) {
+///   Option::Some(s) => {
+///     let g = balloc(3);
+///     let i = balloc(4);
+///     let ok = net_udp_membership(host, s, g, i, true);
+///     bfree(g); bfree(i);
+///     net_close(host, s);
+///     if ok { return 1; }
+///   },
+///   Option::None => {},   // (no UDP on this backend or platform)
+/// }
+/// ```
+fn net_udp_membership(h: &Host, sock: u64, group: &Bytes, iface: &Bytes, join: bool) -> bool {
+  if blen(group) != 4 || blen(iface) != 4 {
+    return false;
+  }
+  let mut both = bytes_concat(group, iface);
+  let mut j = 0;
+  if join {
+    j = 1;
+  }
+  let r = host_net(h, 26, sock, j, &mut both);
+  bfree(both);
+  return r == 0;
+}
+
+/// The local address and port of `sock` (a generalised `net_port`).
+/// ```
+/// match net_udp_open(host, false) {
+///   Option::Some(s) => {
+///     let mut ip = balloc(0);
+///     let mut port = 0;
+///     let ok = net_sockname(host, s, &mut ip, &mut port);
+///     bfree(ip);
+///     net_close(host, s);
+///     if !ok { return 1; }
+///   },
+///   Option::None => {},   // (no UDP on this backend or platform)
+/// }
+/// ```
+fn net_sockname(h: &Host, sock: u64, ip: &mut Bytes, port: &mut u64) -> bool {
+  let mut all = balloc(0);
+  let r = host_net(h, 27, sock, 0, &mut all);
+  if r == 18446744073709551615 {
+    bfree(all);
+    return false;
+  }
+  if blen(all) == 0 {
+    bfree(all);
+    return false;
+  }
+  let il = cast[u64](bget(all, 0));
+  if blen(all) < 1 + il {
+    bfree(all);
+    return false;
+  }
+  bfree(ip);
+  ip = bytes_slice(all, 1, 1 + il);
+  port = r;
+  bfree(all);
+  return true;
+}
