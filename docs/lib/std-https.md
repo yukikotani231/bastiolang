@@ -131,18 +131,33 @@ server that only speaks TLS 1.2.
 Example:
 
 ```bastio
-let host = host_new();
-let request = bfrom("GET / HTTP/1.0\r\n\r\n");
+// The server hangs up at once: the handshake never gets going.
+let lo = net_ip4(127, 0, 0, 1);
 let name = bfrom("localhost");
+let request = bfrom("GET / HTTP/1.0\r\n\r\n");
 let roots = balloc(0);
 let random = balloc(32);
 let session = balloc(32);
 let key = balloc(32);
-match net_connect(host, net_ip4(127, 0, 0, 1), 1) {
-  Option::Some(c) => {
-    let r = https_run_opts(host, c, name, request, roots, 1800000000, random, session, key, 2);
-    https_result_free(r);
-    net_close(host, c);
+let mut bad = 1;
+match net_listen(host, lo, 0) {
+  Option::Some(s) => {
+    match net_connect(host, lo, net_port(host, s)) {
+      Option::Some(c) => {
+        match net_accept(host, s) {
+          Option::Some(a) => {
+            net_close(host, a);
+            let r = https_run_opts(host, c, name, request, roots, 1800000000, random, session, key, 2);
+            if r.state == 0 && r.error == 0 && blen(r.data) == 0 { bad = 0; }
+            https_result_free(r);
+          },
+          Option::None => {},
+        }
+        net_close(host, c);
+      },
+      Option::None => {},
+    }
+    net_close(host, s);
   },
   Option::None => {},
 }
@@ -150,8 +165,9 @@ bfree(key);
 bfree(session);
 bfree(random);
 bfree(roots);
-bfree(name);
 bfree(request);
+bfree(name);
+if bad != 0 { return 1; }
 ```
 
 ### `https_result_free`
