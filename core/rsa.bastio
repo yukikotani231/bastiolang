@@ -1,16 +1,21 @@
-// core/rsa.bastio: RSA signature verification with SHA-256, SHA-384 and
-// SHA-512 (RFC 8017): the padding RSASSA-PSS that TLS 1.3 uses in
-// rsa_pss_rsae_sha256 and rsa_pss_rsae_sha384 and the older
-// RSASSA-PKCS1-v1_5 that most certificates are still signed with. Keys of
-// 2048 to 4096 bits.
+// core/rsa.bastio: RSA with SHA-256, SHA-384 and SHA-512 (RFC 8017): the
+// verification of RSASSA-PSS, which TLS 1.3 uses in rsa_pss_rsae_sha256 and
+// rsa_pss_rsae_sha384, and of the older RSASSA-PKCS1-v1_5 that most
+// certificates are still signed with (keys of 2048 to 4096 bits), and, for the
+// Web Crypto API, signing with both paddings, RSAES-OAEP encryption and
+// decryption, and the private-key operation under them (keys of 512 to 4096
+// bits when the caller asks for a smaller minimum).
 //
 // What is proved: every access is in bounds, nothing leaks, and the numbers
 // the arithmetic works on have the length of the key. Not proved: that the
 // arithmetic and the padding checks are right; the tests check signatures
 // made by OpenSSL (2048, 3072 and 4096 bits, several public exponents), many
 // one-bit changes of signature and message being refused, and padding that
-// breaks each rule of the standard. The code is not constant time and does
-// not need to be: verification handles only public values.
+// breaks each rule of the standard; signatures and ciphertexts made here equal
+// or are accepted by OpenSSL. The code is not constant time: verification
+// handles only public values, but the private-key operation takes a secret
+// exponent and OAEP decryption answers chosen ciphertexts, so their running time
+// depends on secrets and they are for programs where nobody can measure it.
 //
 // A number is a `Vec[u64]` of `l` limbs of 16 bits, least significant first.
 import "bytes.bastio";
@@ -254,9 +259,9 @@ fn rsa_pow(s: &Vec[u64], e: u64, n: &Vec[u64], l: u64) -> Vec[u64]
 /// a signature that is not of `k` bytes and below `n`. `k` is the length
 /// of the key in bytes, which the result also has; the key bits are in
 /// `modbits`.
-fn rsa_encode(n: &Bytes, e: &Bytes, sig: &Bytes) -> Option[Bytes]
-  requires blen(n) < 65536 && blen(e) < 65536 && blen(sig) < 65536
-  ensures result is Option::Some ==> blen(result.Some) >= 256 && blen(result.Some) <= 512
+fn rsa_encode_min(n: &Bytes, e: &Bytes, sig: &Bytes, minb: u64) -> Option[Bytes]
+  requires blen(n) < 65536 && blen(e) < 65536 && blen(sig) < 65536 && minb >= 1 && minb <= 256
+  ensures result is Option::Some ==> blen(result.Some) >= minb && blen(result.Some) <= 512
 {
   // Drop leading zero bytes of the modulus and the exponent.
   let mut ns = 0;
@@ -273,7 +278,7 @@ fn rsa_encode(n: &Bytes, e: &Bytes, sig: &Bytes) -> Option[Bytes]
   }
   let k = blen(n) - ns;
   let el = blen(e) - es;
-  if k < 256 || k > 512 || el < 1 || el > 4 { return Option[Bytes]::None; }
+  if k < minb || k > 512 || el < 1 || el > 4 { return Option[Bytes]::None; }
   if bget(n, blen(n) - 1) % 2 == 0 || bget(e, blen(e) - 1) % 2 == 0 { return Option[Bytes]::None; }
   if blen(sig) != k { return Option[Bytes]::None; }
   let mut ev = 0;
@@ -309,6 +314,14 @@ fn rsa_encode(n: &Bytes, e: &Bytes, sig: &Bytes) -> Option[Bytes]
   vec_free(sl);
   vec_free(nl);
   return Option[Bytes]::Some(out);
+}
+
+/// Internal: `rsa_encode_min` for keys of at least 2048 bits.
+fn rsa_encode(n: &Bytes, e: &Bytes, sig: &Bytes) -> Option[Bytes]
+  requires blen(n) < 65536 && blen(e) < 65536 && blen(sig) < 65536
+  ensures result is Option::Some ==> blen(result.Some) >= 256 && blen(result.Some) <= 512
+{
+  return rsa_encode_min(n, e, sig, 256);
 }
 
 /// Internal: the digest of `m` with the hash of `hl` bytes (32: SHA-256,
@@ -357,29 +370,13 @@ fn rsa_mgf1(seed: &Bytes, len: u64, hl: u64) -> Bytes
   return out;
 }
 
-/// Whether `sig` is a valid RSASSA-PSS signature of `msg` under the key
-/// (`n`, `e`) (both big-endian, `n` of 2048 to 4096 bits, `e` odd and below
-/// 2^32), with the hash of `hl` bytes (32: SHA-256, 48: SHA-384, 64:
-/// SHA-512), MGF1 with the same hash and a salt of `hl` bytes: the
-/// rsa_pss_rsae_sha256, rsa_pss_rsae_sha384 and rsa_pss_rsae_sha512 schemes
-/// of TLS 1.3. Any other `hl` is refused.
-/// ```
-/// let n = balloc(256);
-/// let e = bfrom("");
-/// let msg = bfrom("hello");
-/// let sig = balloc(256);
-/// let ok = rsa_pss_verify(n, e, msg, sig, 48);
-/// bfree(sig);
-/// bfree(msg);
-/// bfree(e);
-/// bfree(n);
-/// if ok { return 1; }
-/// ```
-fn rsa_pss_verify(n: &Bytes, e: &Bytes, msg: &Bytes, sig: &Bytes, hl: u64) -> bool
-  requires blen(n) < 65536 && blen(e) < 65536 && blen(sig) < 65536 && blen(msg) < 274877906944
+/// Internal: `rsa_pss_verify` for a salt of `sl` bytes and keys of at least
+/// `minb` bytes.
+fn rsa_pss_verify_salt(n: &Bytes, e: &Bytes, msg: &Bytes, sig: &Bytes, hl: u64, sl: u64, minb: u64) -> bool
+  requires blen(n) < 65536 && blen(e) < 65536 && blen(sig) < 65536 && blen(msg) < 274877906944 && sl < 1024 && minb >= 1 && minb <= 256
 {
   if hl != 32 && hl != 48 && hl != 64 { return false; }
-  match rsa_encode(n, e, sig) {
+  match rsa_encode_min(n, e, sig, minb) {
     Option::None => { return false; },
     Option::Some(em_full) => {
       let k = blen(em_full);
@@ -405,7 +402,7 @@ fn rsa_pss_verify(n: &Bytes, e: &Bytes, msg: &Bytes, sig: &Bytes, hl: u64) -> bo
       let mod_bits = 8 * (k - 1) + topbits;
       let em_bits = mod_bits - 1;
       let em_len = (em_bits + 7) / 8;
-      if em_len + 1 < k || em_len > k || em_len < 2 * hl + 2 {
+      if em_len + 1 < k || em_len > k || em_len < hl + sl + 2 {
         bfree(em_full);
         return false;
       }
@@ -439,11 +436,11 @@ fn rsa_pss_verify(n: &Bytes, e: &Bytes, msg: &Bytes, sig: &Bytes, hl: u64) -> bo
           // Clear the leftmost bits.
           bset(&mut db, 0, bget(db, 0) & cast[u8](255 >> mask_bits));
         }
-        // The padding is zeros and a 1, then the salt of `hl` bytes.
-        let pad_len = db_len - hl - 1;
+        // The padding is zeros and a 1, then the salt of `sl` bytes.
+        let pad_len = db_len - sl - 1;
         j = 0;
         while j < pad_len
-          invariant j <= pad_len && pad_len == db_len - hl - 1 && blen(db) == db_len
+          invariant j <= pad_len && pad_len == db_len - sl - 1 && blen(db) == db_len
         {
           if bget(db, j) != 0 { ok = false; }
           j = j + 1;
@@ -482,6 +479,31 @@ fn rsa_pss_verify(n: &Bytes, e: &Bytes, msg: &Bytes, sig: &Bytes, hl: u64) -> bo
 }
 
 /// Whether `sig` is a valid RSASSA-PSS signature of `msg` under the key
+/// (`n`, `e`) (both big-endian, `n` of 2048 to 4096 bits, `e` odd and below
+/// 2^32), with the hash of `hl` bytes (32: SHA-256, 48: SHA-384, 64:
+/// SHA-512), MGF1 with the same hash and a salt of `hl` bytes: the
+/// rsa_pss_rsae_sha256, rsa_pss_rsae_sha384 and rsa_pss_rsae_sha512 schemes
+/// of TLS 1.3. Any other `hl` is refused.
+/// ```
+/// let n = balloc(256);
+/// let e = bfrom("");
+/// let msg = bfrom("hello");
+/// let sig = balloc(256);
+/// let ok = rsa_pss_verify(n, e, msg, sig, 48);
+/// bfree(sig);
+/// bfree(msg);
+/// bfree(e);
+/// bfree(n);
+/// if ok { return 1; }
+/// ```
+fn rsa_pss_verify(n: &Bytes, e: &Bytes, msg: &Bytes, sig: &Bytes, hl: u64) -> bool
+  requires blen(n) < 65536 && blen(e) < 65536 && blen(sig) < 65536 && blen(msg) < 274877906944
+{
+  if hl != 32 && hl != 48 && hl != 64 { return false; }
+  return rsa_pss_verify_salt(n, e, msg, sig, hl, hl, 256);
+}
+
+/// Whether `sig` is a valid RSASSA-PSS signature of `msg` under the key
 /// (`n`, `e`) with SHA-256, MGF1 with SHA-256 and a salt of 32 bytes: the
 /// rsa_pss_rsae_sha256 scheme of TLS 1.3 (`rsa_pss_verify` with 32).
 /// ```
@@ -502,30 +524,12 @@ fn rsa_pss_sha256_verify(n: &Bytes, e: &Bytes, msg: &Bytes, sig: &Bytes) -> bool
   return rsa_pss_verify(n, e, msg, sig, 32);
 }
 
-/// Whether `sig` is a valid RSASSA-PKCS1-v1_5 signature of `msg` under the
-/// key (`n`, `e`) (both big-endian, `n` of 2048 to 4096 bits, `e` odd and
-/// below 2^32), with the hash of `hl` bytes (32: SHA-256, 48: SHA-384, 64:
-/// SHA-512): the padding of sha256WithRSAEncryption and its siblings, as
-/// most certificates are signed. The padding must be exactly 0x00 0x01, 0xff
-/// bytes (at least 8), 0x00 and the DigestInfo of the hash. Any other `hl`
-/// is refused.
-/// ```
-/// let n = balloc(256);
-/// let e = bfrom("");
-/// let msg = bfrom("hello");
-/// let sig = balloc(256);
-/// let ok = rsa_pkcs1_verify(n, e, msg, sig, 48);
-/// bfree(sig);
-/// bfree(msg);
-/// bfree(e);
-/// bfree(n);
-/// if ok { return 1; }
-/// ```
-fn rsa_pkcs1_verify(n: &Bytes, e: &Bytes, msg: &Bytes, sig: &Bytes, hl: u64) -> bool
-  requires blen(n) < 65536 && blen(e) < 65536 && blen(sig) < 65536 && blen(msg) < 274877906944
+/// Internal: `rsa_pkcs1_verify` for keys of at least `minb` bytes.
+fn rsa_pkcs1_verify_min(n: &Bytes, e: &Bytes, msg: &Bytes, sig: &Bytes, hl: u64, minb: u64) -> bool
+  requires blen(n) < 65536 && blen(e) < 65536 && blen(sig) < 65536 && blen(msg) < 274877906944 && minb >= 1 && minb <= 256
 {
   if hl != 32 && hl != 48 && hl != 64 { return false; }
-  match rsa_encode(n, e, sig) {
+  match rsa_encode_min(n, e, sig, minb) {
     Option::None => { return false; },
     Option::Some(em) => {
       let k = blen(em);
@@ -572,6 +576,31 @@ fn rsa_pkcs1_verify(n: &Bytes, e: &Bytes, msg: &Bytes, sig: &Bytes, hl: u64) -> 
 }
 
 /// Whether `sig` is a valid RSASSA-PKCS1-v1_5 signature of `msg` under the
+/// key (`n`, `e`) (both big-endian, `n` of 2048 to 4096 bits, `e` odd and
+/// below 2^32), with the hash of `hl` bytes (32: SHA-256, 48: SHA-384, 64:
+/// SHA-512): the padding of sha256WithRSAEncryption and its siblings, as
+/// most certificates are signed. The padding must be exactly 0x00 0x01, 0xff
+/// bytes (at least 8), 0x00 and the DigestInfo of the hash. Any other `hl`
+/// is refused.
+/// ```
+/// let n = balloc(256);
+/// let e = bfrom("");
+/// let msg = bfrom("hello");
+/// let sig = balloc(256);
+/// let ok = rsa_pkcs1_verify(n, e, msg, sig, 48);
+/// bfree(sig);
+/// bfree(msg);
+/// bfree(e);
+/// bfree(n);
+/// if ok { return 1; }
+/// ```
+fn rsa_pkcs1_verify(n: &Bytes, e: &Bytes, msg: &Bytes, sig: &Bytes, hl: u64) -> bool
+  requires blen(n) < 65536 && blen(e) < 65536 && blen(sig) < 65536 && blen(msg) < 274877906944
+{
+  return rsa_pkcs1_verify_min(n, e, msg, sig, hl, 256);
+}
+
+/// Whether `sig` is a valid RSASSA-PKCS1-v1_5 signature of `msg` under the
 /// key (`n`, `e`) with SHA-256: sha256WithRSAEncryption (`rsa_pkcs1_verify`
 /// with 32).
 /// ```
@@ -599,4 +628,450 @@ fn rsa_nib(c: u8) -> u8
   if c >= 48 && c <= 57 { return c - 48; }
   if c >= 97 && c <= 102 { return c - 87; }
   return 0;
+}
+
+/// Internal: `s` to the power `e` (big-endian, at most 512 bytes) modulo the
+/// odd number `n` of `l` limbs, for `s` below `n`. The exponent is secret in
+/// a private-key operation and the running time depends on it.
+fn rsa_pow_bytes(s: &Vec[u64], e: &Bytes, n: &Vec[u64], l: u64) -> Vec[u64]
+  requires vlen(s) == l && vlen(n) == l && l >= 1 && l <= 256 && blen(e) <= 512
+  ensures vlen(result) == l
+{
+  let n0 = vec_get(n, 0);
+  let mut inv = 1;
+  let mut k = 0;
+  while k < 5
+    invariant k <= 5
+  {
+    inv = wrap_mul(inv, wrap_sub(2, wrap_mul(n0, inv))) & 65535;
+    k = k + 1;
+  }
+  let ninv = wrap_sub(65536, inv) & 65535;
+  let mut r2 = rsa_zero(l);
+  vec_set(&mut r2, 0, 1);
+  k = 0;
+  while k < 32 * l
+    invariant k <= 32 * l && vlen(r2) == l && vlen(n) == l && l <= 256
+  {
+    let d = rsa_double(r2, n, l);
+    vec_free(r2);
+    r2 = d;
+    k = k + 1;
+  }
+  let sm = rsa_mont(s, r2, n, ninv, l);
+  let mut one = rsa_zero(l);
+  vec_set(&mut one, 0, 1);
+  // 1 in Montgomery form is R modulo n.
+  let mut x = rsa_mont(r2, one, n, ninv, l);
+  let total = 8 * blen(e);
+  let mut bit = total;
+  while bit > 0
+    invariant bit <= total && total == 8 * blen(e) && blen(e) <= 512 && vlen(x) == l && vlen(sm) == l && vlen(n) == l && l >= 1 && l <= 256
+  {
+    bit = bit - 1;
+    let sq = rsa_mont(x, x, n, ninv, l);
+    vec_free(x);
+    x = sq;
+    let byte = cast[u64](bget(e, blen(e) - 1 - bit / 8));
+    if (byte >> (bit % 8)) & 1 == 1 {
+      let p = rsa_mont(x, sm, n, ninv, l);
+      vec_free(x);
+      x = p;
+    }
+  }
+  let out = rsa_mont(x, one, n, ninv, l);
+  vec_free(one);
+  vec_free(x);
+  vec_free(sm);
+  vec_free(r2);
+  return out;
+}
+
+/// Internal: the number `m` of `l` limbs as `k` big-endian bytes, where
+/// `l == (k + 1) / 2`.
+fn rsa_to_bytes(m: &Vec[u64], l: u64, k: u64) -> Bytes
+  requires vlen(m) == l && l == (k + 1) / 2 && k >= 1 && k <= 512
+  ensures blen(result) == k
+{
+  let mut out = balloc(k);
+  let mut j = 0;
+  while j < k
+    invariant j <= k && blen(out) == k && vlen(m) == l && l == (k + 1) / 2
+  {
+    let limb = vec_get(m, j / 2);
+    let mut v = limb & 255;
+    if j % 2 == 1 { v = (limb >> 8) & 255; }
+    bset(&mut out, k - 1 - j, cast[u8](v));
+    j = j + 1;
+  }
+  return out;
+}
+
+/// Internal: the number of leading zero bytes of `n`.
+fn rsa_skip_zeros(n: &Bytes) -> u64
+  ensures result <= blen(n)
+{
+  let mut ns = 0;
+  while ns < blen(n) && bget(n, ns) == 0
+    invariant ns <= blen(n)
+  {
+    ns = ns + 1;
+  }
+  return ns;
+}
+
+/// Internal: `c ^ d mod n` as `k` bytes, where `k` is the length of `n`
+/// without leading zeros, or `None` for a key that is not usable (`n` not odd
+/// or not of `minb` to 512 bytes, `d` zero or longer than `n`) or a `c` that
+/// is not `k` bytes and below `n`. This is the private-key operation of RSA
+/// (RFC 8017 RSADP and RSASP1) without the Chinese remainder theorem.
+fn rsa_private_raw(n: &Bytes, d: &Bytes, c: &Bytes, minb: u64) -> Option[Bytes]
+  requires blen(n) < 65536 && blen(d) < 65536 && blen(c) < 65536 && minb >= 1 && minb <= 256
+  ensures result is Option::Some ==> blen(result.Some) >= minb && blen(result.Some) <= 512
+{
+  let ns = rsa_skip_zeros(n);
+  let ds = rsa_skip_zeros(d);
+  let k = blen(n) - ns;
+  let dl = blen(d) - ds;
+  if k < minb || k > 512 || dl < 1 || dl > k { return Option[Bytes]::None; }
+  if bget(n, blen(n) - 1) % 2 == 0 { return Option[Bytes]::None; }
+  if blen(c) != k { return Option[Bytes]::None; }
+  let l = (k + 1) / 2;
+  let nl = rsa_limbs(n, ns, blen(n), l);
+  let cl = rsa_limbs(c, 0, blen(c), l);
+  if rsa_ge(cl, nl, l) {
+    vec_free(cl);
+    vec_free(nl);
+    return Option[Bytes]::None;
+  }
+  let ex = bytes_slice(d, ds, blen(d));
+  let m = rsa_pow_bytes(cl, ex, nl, l);
+  let out = rsa_to_bytes(m, l, k);
+  bfree(ex);
+  vec_free(m);
+  vec_free(cl);
+  vec_free(nl);
+  return Option[Bytes]::Some(out);
+}
+
+/// Internal: the DigestInfo prefix of PKCS#1 v1.5 for the hash of `hl` bytes
+/// (19 bytes) as hex.
+fn rsa_prefix(hl: u64) -> Str
+  ensures slen(result) == 38
+{
+  if hl == 48 { return "3041300d060960864801650304020205000430"; }
+  if hl == 64 { return "3051300d060960864801650304020305000440"; }
+  return "3031300d060960864801650304020105000420";
+}
+
+/// Signs `msg` with RSASSA-PKCS1-v1_5 (RFC 8017 section 8.2) under the
+/// private key (`n`, `d`) (both big-endian) with the hash of `hl` bytes (32:
+/// SHA-256, 48: SHA-384, 64: SHA-512). The signature has the length of `n`.
+/// `minb` is the smallest key in bytes that is accepted (1 to 256; 256 is
+/// 2048 bits). The result is `None` for a key that is not usable or too small
+/// for the hash, or any other `hl`. Not constant time: the time depends on
+/// `d`, so use it only where nobody can measure it.
+/// ```
+/// let n = balloc(256);
+/// let d = balloc(256);
+/// let msg = bfrom("hello");
+/// let r = rsa_pkcs1_sign(n, d, msg, 32, 256);
+/// bfree(msg);
+/// bfree(d);
+/// bfree(n);
+/// match r {
+///   Option::None => { },
+///   Option::Some(s) => { bfree(s); },
+/// }
+/// ```
+fn rsa_pkcs1_sign(n: &Bytes, d: &Bytes, msg: &Bytes, hl: u64, minb: u64) -> Option[Bytes]
+  requires blen(n) < 65536 && blen(d) < 65536 && blen(msg) < 274877906944 && minb >= 1 && minb <= 256
+  ensures result is Option::Some ==> blen(result.Some) >= minb && blen(result.Some) <= 512
+{
+  if hl != 32 && hl != 48 && hl != 64 { return Option[Bytes]::None; }
+  let ns = rsa_skip_zeros(n);
+  let k = blen(n) - ns;
+  let t_len = 19 + hl;
+  if k < t_len + 11 || k > 512 { return Option[Bytes]::None; }
+  let mhash = rsa_hash(msg, hl);
+  let prefix = rsa_prefix(hl);
+  let mut em = balloc(k);
+  let ps_end = k - t_len - 1;
+  bset(&mut em, 1, 1);
+  let mut i = 2;
+  while i < ps_end
+    invariant i <= ps_end && ps_end == k - t_len - 1 && blen(em) == k
+  {
+    bset(&mut em, i, 255);
+    i = i + 1;
+  }
+  let mut j = 0;
+  while j < 19
+    invariant j <= 19 && blen(em) == k && k >= t_len + 11 && slen(prefix) >= 38 && t_len == 19 + hl && ps_end == k - t_len - 1
+  {
+    let hi = rsa_nib(sget(prefix, 2 * j));
+    let lo = rsa_nib(sget(prefix, 2 * j + 1));
+    bset(&mut em, ps_end + 1 + j, hi * 16 + lo);
+    j = j + 1;
+  }
+  j = 0;
+  while j < hl
+    invariant j <= hl && blen(em) == k && k >= t_len + 11 && t_len == 19 + hl && blen(mhash) == hl && ps_end == k - t_len - 1
+  {
+    bset(&mut em, ps_end + 20 + j, bget(mhash, j));
+    j = j + 1;
+  }
+  let r = rsa_private_raw(n, d, em, minb);
+  bfree(em);
+  bfree(mhash);
+  return r;
+}
+
+/// Signs `msg` with RSASSA-PSS (RFC 8017 section 8.1) under the private key
+/// (`n`, `d`) with the hash of `hl` bytes (32, 48 or 64), MGF1 with the same
+/// hash and the salt `salt` (any length below 1024; the caller draws it from
+/// a random source, and `hl` bytes is the usual length). The signature has
+/// the length of `n`; `rsa_pss_verify_salt` checks it. `minb` is as in
+/// `rsa_pkcs1_sign`. The result is `None` for a key that is not usable, or
+/// too small for the hash and the salt, or any other `hl`. Not constant time.
+/// ```
+/// let n = balloc(256);
+/// let d = balloc(256);
+/// let msg = bfrom("hello");
+/// let salt = balloc(32);
+/// let r = rsa_pss_sign(n, d, msg, salt, 32, 256);
+/// bfree(salt);
+/// bfree(msg);
+/// bfree(d);
+/// bfree(n);
+/// match r {
+///   Option::None => { },
+///   Option::Some(s) => { bfree(s); },
+/// }
+/// ```
+fn rsa_pss_sign(n: &Bytes, d: &Bytes, msg: &Bytes, salt: &Bytes, hl: u64, minb: u64) -> Option[Bytes]
+  requires blen(n) < 65536 && blen(d) < 65536 && blen(msg) < 274877906944 && blen(salt) < 1024 && minb >= 1 && minb <= 256
+  ensures result is Option::Some ==> blen(result.Some) >= minb && blen(result.Some) <= 512
+{
+  if hl != 32 && hl != 48 && hl != 64 { return Option[Bytes]::None; }
+  let ns = rsa_skip_zeros(n);
+  let k = blen(n) - ns;
+  if k < minb || k > 512 { return Option[Bytes]::None; }
+  let top = bget(n, ns);
+  let mut topbits = 8;
+  while topbits > 1 && (top >> (topbits - 1)) == 0
+    invariant topbits <= 8 && topbits >= 1
+  {
+    topbits = topbits - 1;
+  }
+  let mod_bits = 8 * (k - 1) + topbits;
+  let em_bits = mod_bits - 1;
+  let em_len = (em_bits + 7) / 8;
+  let sl = blen(salt);
+  if em_len + 1 < k || em_len > k || em_len < hl + sl + 2 { return Option[Bytes]::None; }
+  let mask_bits = 8 * em_len - em_bits;
+  if mask_bits >= 8 { return Option[Bytes]::None; }
+  let skip = k - em_len;
+  let db_len = em_len - hl - 1;
+  let pad_len = db_len - sl - 1;
+  // H = hash(8 zero bytes || hash(msg) || salt)
+  let mhash = rsa_hash(msg, hl);
+  let mut t = text_new();
+  let mut z = 0;
+  while z < 8
+    invariant z <= 8 && vlen(t) == z
+  {
+    text_push(&mut t, 0);
+    z = z + 1;
+  }
+  text_push_bytes(&mut t, mhash);
+  text_push_bytes(&mut t, salt);
+  let mprime = text_finish(t);
+  let h = rsa_hash(mprime, hl);
+  bfree(mprime);
+  bfree(mhash);
+  // DB = zeros || 0x01 || salt, masked with MGF1(H).
+  let mut db = balloc(db_len);
+  bset(&mut db, pad_len, 1);
+  bytes_copy_span(&mut db, pad_len + 1, salt, 0, sl);
+  let mask = rsa_mgf1(h, db_len, hl);
+  let mut j = 0;
+  while j < db_len
+    invariant j <= db_len && blen(db) == db_len && blen(mask) == db_len
+  {
+    bset(&mut db, j, bget(db, j) ^ bget(mask, j));
+    j = j + 1;
+  }
+  if mask_bits > 0 {
+    bset(&mut db, 0, bget(db, 0) & cast[u8](255 >> mask_bits));
+  }
+  let mut block = balloc(k);
+  bytes_copy_span(&mut block, skip, db, 0, db_len);
+  bytes_copy_span(&mut block, skip + db_len, h, 0, hl);
+  bset(&mut block, k - 1, 188);
+  let r = rsa_private_raw(n, d, block, minb);
+  bfree(block);
+  bfree(mask);
+  bfree(db);
+  bfree(h);
+  return r;
+}
+
+/// Encrypts `msg` with RSAES-OAEP (RFC 8017 section 7.1) under the public key
+/// (`n`, `e`) with the hash of `hl` bytes (32, 48 or 64), MGF1 with the same
+/// hash, the label `label` and the `seed` of `hl` bytes, which the caller
+/// draws from a random source and uses once. The result has the length of
+/// `n`. `minb` is as in `rsa_pkcs1_sign`. The result is `None` for a key that
+/// is not usable, a message longer than the key allows (the length of `n`
+/// minus twice `hl` minus 2), a seed of the wrong length or any other `hl`.
+/// ```
+/// let n = balloc(256);
+/// let e = bfrom("");
+/// let msg = bfrom("hello");
+/// let label = bfrom("");
+/// let seed = balloc(32);
+/// let r = rsa_oaep_encrypt(n, e, msg, label, seed, 32, 256);
+/// bfree(seed);
+/// bfree(label);
+/// bfree(msg);
+/// bfree(e);
+/// bfree(n);
+/// match r {
+///   Option::None => { },
+///   Option::Some(c) => { bfree(c); },
+/// }
+/// ```
+fn rsa_oaep_encrypt(n: &Bytes, e: &Bytes, msg: &Bytes, label: &Bytes, seed: &Bytes, hl: u64, minb: u64) -> Option[Bytes]
+  requires blen(n) < 65536 && blen(e) < 65536 && blen(msg) < 65536 && blen(label) < 274877906944 && blen(seed) < 65536 && minb >= 1 && minb <= 256
+  ensures result is Option::Some ==> blen(result.Some) >= minb && blen(result.Some) <= 512
+{
+  if hl != 32 && hl != 48 && hl != 64 { return Option[Bytes]::None; }
+  let ns = rsa_skip_zeros(n);
+  let k = blen(n) - ns;
+  if k < minb || k > 512 || blen(seed) != hl { return Option[Bytes]::None; }
+  let mlen = blen(msg);
+  if k < 2 * hl + 2 || mlen > k - 2 * hl - 2 { return Option[Bytes]::None; }
+  let db_len = k - hl - 1;
+  let lhash = rsa_hash(label, hl);
+  let mut db = balloc(db_len);
+  bytes_copy_span(&mut db, 0, lhash, 0, hl);
+  bset(&mut db, db_len - mlen - 1, 1);
+  bytes_copy_span(&mut db, db_len - mlen, msg, 0, mlen);
+  let dbmask = rsa_mgf1(seed, db_len, hl);
+  let mut j = 0;
+  while j < db_len
+    invariant j <= db_len && blen(db) == db_len && blen(dbmask) == db_len
+  {
+    bset(&mut db, j, bget(db, j) ^ bget(dbmask, j));
+    j = j + 1;
+  }
+  let seedmask = rsa_mgf1(db, hl, hl);
+  let mut em = balloc(k);
+  j = 0;
+  while j < hl
+    invariant j <= hl && blen(em) == k && blen(seed) == hl && blen(seedmask) == hl && k >= 2 * hl + 2
+  {
+    bset(&mut em, 1 + j, bget(seed, j) ^ bget(seedmask, j));
+    j = j + 1;
+  }
+  bytes_copy_span(&mut em, 1 + hl, db, 0, db_len);
+  let r = rsa_encode_min(n, e, em, minb);
+  bfree(em);
+  bfree(seedmask);
+  bfree(dbmask);
+  bfree(db);
+  bfree(lhash);
+  return r;
+}
+
+/// Decrypts `ct` with RSAES-OAEP (RFC 8017 section 7.1) under the private
+/// key (`n`, `d`), with the hash of `hl` bytes (32, 48 or 64), MGF1 with the
+/// same hash and the label `label`. `minb` is as in `rsa_pkcs1_sign`. The
+/// result is `None` when the key is not usable, `ct` is not the length of
+/// `n` and below it, or the padding is wrong: every failure looks the same
+/// to the caller, as the standard asks. Not constant time, so a program that
+/// answers many chosen ciphertexts should not let the caller time it.
+/// ```
+/// let n = balloc(256);
+/// let d = balloc(256);
+/// let ct = balloc(256);
+/// let label = bfrom("");
+/// let r = rsa_oaep_decrypt(n, d, ct, label, 32, 256);
+/// bfree(label);
+/// bfree(ct);
+/// bfree(d);
+/// bfree(n);
+/// match r {
+///   Option::None => { },
+///   Option::Some(m) => { bfree(m); },
+/// }
+/// ```
+fn rsa_oaep_decrypt(n: &Bytes, d: &Bytes, ct: &Bytes, label: &Bytes, hl: u64, minb: u64) -> Option[Bytes]
+  requires blen(n) < 65536 && blen(d) < 65536 && blen(ct) < 65536 && blen(label) < 274877906944 && minb >= 1 && minb <= 256
+  ensures result is Option::Some ==> blen(result.Some) <= 512
+{
+  if hl != 32 && hl != 48 && hl != 64 { return Option[Bytes]::None; }
+  let ns = rsa_skip_zeros(n);
+  let k = blen(n) - ns;
+  if k < minb || k > 512 || k < 2 * hl + 2 { return Option[Bytes]::None; }
+  match rsa_private_raw(n, d, ct, minb) {
+    Option::None => { return Option[Bytes]::None; },
+    Option::Some(em) => {
+      if blen(em) != k {
+        bfree(em);
+        return Option[Bytes]::None;
+      }
+      let db_len = k - hl - 1;
+      let mseed = bytes_slice(em, 1, 1 + hl);
+      let mdb = bytes_slice(em, 1 + hl, k);
+      let seedmask = rsa_mgf1(mdb, hl, hl);
+      let mut seed = balloc(hl);
+      let mut j = 0;
+      while j < hl
+        invariant j <= hl && blen(seed) == hl && blen(mseed) == hl && blen(seedmask) == hl
+      {
+        bset(&mut seed, j, bget(mseed, j) ^ bget(seedmask, j));
+        j = j + 1;
+      }
+      let dbmask = rsa_mgf1(seed, db_len, hl);
+      let mut db = balloc(db_len);
+      j = 0;
+      while j < db_len
+        invariant j <= db_len && blen(db) == db_len && blen(mdb) == db_len && blen(dbmask) == db_len
+      {
+        bset(&mut db, j, bget(mdb, j) ^ bget(dbmask, j));
+        j = j + 1;
+      }
+      let lhash = rsa_hash(label, hl);
+      let mut ok = bget(em, 0) == 0;
+      j = 0;
+      while j < hl
+        invariant j <= hl && blen(db) == db_len && db_len >= hl + 1 && blen(lhash) == hl
+      {
+        if bget(db, j) != bget(lhash, j) { ok = false; }
+        j = j + 1;
+      }
+      let mut at = hl;
+      while at < db_len && bget(db, at) == 0
+        invariant at <= db_len && blen(db) == db_len
+      {
+        at = at + 1;
+      }
+      if at >= db_len || bget(db, at) != 1 { ok = false; }
+      bfree(lhash);
+      bfree(dbmask);
+      bfree(seedmask);
+      bfree(seed);
+      bfree(mdb);
+      bfree(mseed);
+      bfree(em);
+      if !ok {
+        bfree(db);
+        return Option[Bytes]::None;
+      }
+      let m = bytes_slice(db, at + 1, db_len);
+      bfree(db);
+      return Option[Bytes]::Some(m);
+    },
+  }
 }

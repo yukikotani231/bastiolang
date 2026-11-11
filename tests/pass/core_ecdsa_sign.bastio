@@ -1,0 +1,235 @@
+// expect-exit: 0
+// core/p256 and core/p384: public keys, ECDH secrets and ECDSA signatures (made with a
+// chosen nonce) equal the values computed independently and checked against OpenSSL (the
+// public keys and secrets are OpenSSL's, each signature verifies under OpenSSL); a private
+// key or nonce of 0 or n, a peer point off the curve and wrong lengths are refused.
+import "core/p256.bastio";
+import "core/p384.bastio";
+
+/// The value of the hex digit `c` (0 for anything else).
+fn nib(c: u8) -> u8
+  ensures result < 16
+{
+  if c >= 48 && c <= 57 { return c - 48; }
+  if c >= 97 && c <= 102 { return c - 87; }
+  return 0;
+}
+
+/// The bytes written as hex digits in `s`.
+fn unhex(s: Str) -> Bytes
+  requires slen(s) < 100000
+  ensures blen(result) == slen(s) / 2
+{
+  let n = slen(s) / 2;
+  let mut b = balloc(n);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && blen(b) == n && slen(s) >= 2 * n
+  {
+    bset(&mut b, i, nib(sget(s, 2 * i)) * 16 + nib(sget(s, 2 * i + 1)));
+    i = i + 1;
+  }
+  return b;
+}
+
+/// Whether `r` is `Some` of the bytes written as hex in `want`; consumes `r`.
+fn is_hex(r: Option[Bytes], want: Str) -> bool
+  requires slen(want) < 100000
+{
+  match r {
+    Option::None => { return false; },
+    Option::Some(b) => {
+      let w = unhex(want);
+      let same = bytes_eq(b, w);
+      bfree(w);
+      bfree(b);
+      return same;
+    },
+  }
+}
+
+/// Whether `r` is `None`; consumes `r`.
+fn is_none(r: Option[Bytes]) -> bool {
+  match r {
+    Option::None => { return true; },
+    Option::Some(b) => {
+      bfree(b);
+      return false;
+    },
+  }
+}
+
+fn vec0() -> u64 {
+  let d = unhex("d23f0824128b2f330c5c7fd0a6a3a4506513270e269e0d37f2a74de452e6b439");
+  let k = unhex("36f675cc81e74ef5e8e25d940ed904759531985d5d9dc9f81818e811892f902c");
+  let dg = unhex("1fc0214264e80a6677ef3fce610ca52f0758c7dbbcdc48f44b0ed9f166b1d2c4");
+  let peer = unhex("0477c552ac5c9dfd5f7b358dc2b7386adce7948e099d045f7f551bf78257170e8dbca9fbce99cfc1f420283957fedad27ac005001f10516a162b9806330d27256f");
+  let mut bad = 0;
+  if !is_hex(ecdsa_p256_public_key(d), "0414b8a2c95626f164e38703bd976b200e0650503e4b701ecbf29f96abf786d31f9b978f67b1ea482736e63b98c445745a521135bf468d6d0c168ef66a4163f46f") { bad = bad + 1; }
+  if !is_hex(ecdsa_p256_sign_digest(d, dg, k), "8dd0cb91f783328c76cbdbdc3106e4435e34cd7635a747f135f4457e8ecf1a6ca3144e0d717716e30f102fe8f57efd092de7bae91ad99a766c8f0b5ae9e040e1") { bad = bad + 1; }
+  if !is_hex(ecdh_p256(d, peer), "e1253e3e3dfea8cfdb4b16d0ab4d95621634e2852e5979cf1a8c70cc8f5ed272") { bad = bad + 1; }
+  bfree(peer);
+  bfree(dg);
+  bfree(k);
+  bfree(d);
+  return bad;
+}
+
+fn vec1() -> u64 {
+  let d = unhex("a170b33839263059f28c105d1fb17c2390c192cfd3ac94af0f21ddb66cad4a27");
+  let k = unhex("0cb1e29c658cda1495e60af593bd04cf0fd630f1f29d0da9953f48f1a09f76b6");
+  let dg = unhex("e8bce79224daa5a42d1c8b4540b2bebb83a611979003d4e81e983ac9d9119935");
+  let peer = unhex("04bf85eb6886a1c0fcb9a03211e4ec7f4b33ab88d2462527c64f73cac6da522ca97b4c4c3168e87d050e4801a07c792a47475c189b66e12be93dfa27a80b6bd175");
+  let mut bad = 0;
+  if !is_hex(ecdsa_p256_public_key(d), "0434bd6e33388c49e6c136f6d1c5b98933c7e728e58e8bff31849e444b4efe3ed8eac33303baf8df855fe2bf68cbefe75015b473282d4eb696485e7cd46732fb62") { bad = bad + 1; }
+  if !is_hex(ecdsa_p256_sign_digest(d, dg, k), "548fba47167aa166d7890814551b77e3cf499a0d963901d5aa0979443ef1223ce1831a6ef92cbe5821ec25de5294d4ce928174cf3e474adb6c62c561e7d3436d") { bad = bad + 1; }
+  if !is_hex(ecdh_p256(d, peer), "29144e39c957088229955be2e9b9ab0c7d8cc2274c783074bba5389a1e95fbb9") { bad = bad + 1; }
+  bfree(peer);
+  bfree(dg);
+  bfree(k);
+  bfree(d);
+  return bad;
+}
+
+fn vec2() -> u64 {
+  let d = unhex("ae97ba94d0eda82f8f6d05584ef8aa38922766581e27a1c08a6a63ec24ede6a5");
+  let k = unhex("18f135d25f557203301850c5a38fd547923a736994e3bf911a61dbe22e44158c");
+  let dg = unhex("9f7da0582b86c266add828ef20bbba64e92fb2daa682181676c2148ab00b6440");
+  let peer = unhex("04515f727248c3a5c01465f0d69223169759288c064a4723a141550958393c262a752d10525b55bf76d8eac26f4b68d7eec81d121f83c68c647e777d1d9f163c95");
+  let mut bad = 0;
+  if !is_hex(ecdsa_p256_public_key(d), "04b0bb72eb8293b39aaa3cb2267dfc3c07ec9b450897d76e88e3e78c4719e03bef2a7ae344bc661ad15fabd33e82c041c9ff808873e7ead8449c636ae6756e42ac") { bad = bad + 1; }
+  if !is_hex(ecdsa_p256_sign_digest(d, dg, k), "037cbd0a71e8e489ed7735bdd4a226a5f5361dc4bc331caecf1ebd7012b3f9c6d4602c274221fa0304c53fc6d299ab520d28b292c80f46c728e319ea82329f26") { bad = bad + 1; }
+  if !is_hex(ecdh_p256(d, peer), "d0d7dc37a042ea5c1a7220d3f2d29fb7380b7d410005e3dffedc746c9f29772a") { bad = bad + 1; }
+  bfree(peer);
+  bfree(dg);
+  bfree(k);
+  bfree(d);
+  return bad;
+}
+
+fn vec3() -> u64 {
+  let d = unhex("3f98e2774cbd87ad5c90a9587403e430ec66a78795e761d17731af10506bf2efc6f877186d76b07e881ed162ae2eb155");
+  let k = unhex("57ee05cde00902c77ebff206867347214cdd2055930d6eaf14f4733f3e7d1bfbc7a2ea20b2f14c942e05319acb5c7428");
+  let dg = unhex("fba69605d8eabbadc6720d9b0860371cf6aee5b254b0f478ec23d68ca2cf5e7b3821f394c77b3b4bd55e7aad27e82ce9");
+  let peer = unhex("04376fbd2d18a04660e5caeea300346e0addf49440d909ab85605b5d7a485f3a5ab69bd09a15c614a27c9d38833997c92b489edac34803c47c7e9fbad696e3a16286158cd95878560121d23cafc8bd08f1eada0e9a9212f2ecf32875e28145221a");
+  let mut bad = 0;
+  if !is_hex(ecdsa_p384_public_key(d), "0438c31c10e45f09f8ff95e49345492c25dbc9ef6e377ddec4a64494b4d9f0ddddf025bdf9a0b4e9e146750c718daaefb576dd3396b90fc0352de8faa9c410e8d74fa911c644de8c453782cd708d9395d1513d0b51f89a5599c8350c281cb4a1f1") { bad = bad + 1; }
+  if !is_hex(ecdsa_p384_sign_digest(d, dg, k), "7807d095e91f177259e178a85d5b916707ba5d3ef782460158e69433df973693285170c496f117bb91fe54f6559c4441880590c39ab64d3f570b4d30f50c03cbf08498c36ef46b8cdce42293319d3e23c80db7881516d3859cdee1d75de5979f") { bad = bad + 1; }
+  if !is_hex(ecdh_p384(d, peer), "e20161cdccf56ccb96aeec0c63af2d95663f2581476f957a7d4ab714c47e6c1ff50e9c9fb65093495b182b42fcccac15") { bad = bad + 1; }
+  bfree(peer);
+  bfree(dg);
+  bfree(k);
+  bfree(d);
+  return bad;
+}
+
+fn vec4() -> u64 {
+  let d = unhex("ca02135e92b1d3f28ede0d7ac3baea9e13deef86ab1031d0f646e1f40a097c976bf46c697d2caf82eeeacbe226e87556");
+  let k = unhex("119a72d174c9df6acc011cdd9474031b7f26144b98289fcd59a54a7bb1fee08f571242425051c1ccd17f9acae01f5058");
+  let dg = unhex("7fdbbefe2099af030b2e42580adfa19931326baf2ee33d3c948f0a5524e601cbe65b020394ed858869bf1f3a5a3d1120");
+  let peer = unhex("0478186d8d9c9836eaa20ab35049f24670c8527ce56d07630c27bfd81a72d07fad19561b74a1ccc9003877b91b1b55c121603e1280faf3e9774430b065dbc4e366a8e00bac7e1a3e37aa9d8c9dfb243f4c5b899a13c044013a9a5de7ec7ba21e5e");
+  let mut bad = 0;
+  if !is_hex(ecdsa_p384_public_key(d), "04e133fc51442307e5596a6255c43f1f2330d0877c48ee97d5cea0bc2c0e5a46dc7ae2ac25f77ca44e3d72c45ad52c6e8247b7abb4b74db10a4cf5a66dc7f790dad8a8965ded80e448c625759f355b2fc816dc91719f20c4b3c52ac3202e053eaa") { bad = bad + 1; }
+  if !is_hex(ecdsa_p384_sign_digest(d, dg, k), "32c11360ff5a2db02b969de688924107eeefee8c9925f986299634181b64c56506dbbba6f7da39ecfdd6ca7d453b509febb73a65c477f822522e2dd7a7a45a39433c1c3c53f895325700d2201bad297b069251031efd626e0ee4562de3b7bc15") { bad = bad + 1; }
+  if !is_hex(ecdh_p384(d, peer), "b918ec43caec623228ef1e88afc5822c8a074faf6f552712f459fd84932a8337f167518dd1685a75fbc735e5c9357cf8") { bad = bad + 1; }
+  bfree(peer);
+  bfree(dg);
+  bfree(k);
+  bfree(d);
+  return bad;
+}
+
+fn vec5() -> u64 {
+  let d = unhex("58d5563dab2cd31ee315128862c33a4fb774eb5248db40af72158370d269a9a5ae658f33fe3b890b93f448b3a5aa3c82");
+  let k = unhex("49952399c4aaeac137dc76fb0f17a3007e62aa0a1df9fd789c6539382b0537e65affb2297631a992f0ce583505c6af08");
+  let dg = unhex("461543709b6d719537555abdd6fa134b34db3057622c722d3a1981ea3ded8c9c6ebbde15ea363bcd077348ddaf4de685");
+  let peer = unhex("045f6f67b6c586f0839098705f2ce22a7736d7ff15dccb4906f93c246500f834b7a4b48d03b9489234bdd49c466d07aa17ce319859d923cd8cbd07ecab5a0731d529d58edf9b1e03ea17d04512a348299a096818f2c618b01b074e936a03d79d0e");
+  let mut bad = 0;
+  if !is_hex(ecdsa_p384_public_key(d), "04a147b3da5e66f733155e7e0776fd5df6ab25c31f1101e0bfb31624dcc38e7c59e6921f22b9e7cd2b906fb1c31e18ec22ce789cb766dd20ee005f4449ca7302475ea002a771e310ff90f6d4f7f164fe6ee86a8480566db56ca33827d17cd92189") { bad = bad + 1; }
+  if !is_hex(ecdsa_p384_sign_digest(d, dg, k), "0f63cbba97b705d868013275e8ab70c1f7eb980d87bcc70b6dc3fa26b0b80743a383bfc8cbb7d795b7301c9b93032e05bbe5b17d636b8279d67d24652ad5e51d733a0bcc436100dc22b0325192ab3aab1d70aff6587378d65c2c3060342b3582") { bad = bad + 1; }
+  if !is_hex(ecdh_p384(d, peer), "65e4e5f59cef5d44145587b9eaa4053e9d9a38ccb6fb60117c919325efd600d3eff1a96da710886ab503df198b8eb8ab") { bad = bad + 1; }
+  bfree(peer);
+  bfree(dg);
+  bfree(k);
+  bfree(d);
+  return bad;
+}
+
+fn neg_p256() -> u64 {
+  let zero = unhex("0000000000000000000000000000000000000000000000000000000000000000");
+  let order = unhex("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551");
+  let one = unhex("0000000000000000000000000000000000000000000000000000000000000001");
+  let dg = unhex("abababababababababababababababababababababababababababababababab");
+  let short = unhex("0102");
+  let peer = unhex("0414b8a2c95626f164e38703bd976b200e0650503e4b701ecbf29f96abf786d31f9b978f67b1ea482736e63b98c445745a521135bf468d6d0c168ef66a4163f46f");
+  let mut off = unhex("0414b8a2c95626f164e38703bd976b200e0650503e4b701ecbf29f96abf786d31f9b978f67b1ea482736e63b98c445745a521135bf468d6d0c168ef66a4163f46f");
+  bset(&mut off, 64, bget(off, 64) ^ 1);
+  let mut bad = 0;
+  if !is_none(ecdsa_p256_public_key(zero)) { bad = bad + 1; }
+  if !is_none(ecdsa_p256_public_key(order)) { bad = bad + 1; }
+  if !is_none(ecdsa_p256_public_key(short)) { bad = bad + 1; }
+  if is_none(ecdsa_p256_public_key(one)) { bad = bad + 1; }
+  if !is_none(ecdsa_p256_sign_digest(zero, dg, one)) { bad = bad + 1; }
+  if !is_none(ecdsa_p256_sign_digest(one, dg, zero)) { bad = bad + 1; }
+  if !is_none(ecdsa_p256_sign_digest(one, dg, order)) { bad = bad + 1; }
+  if !is_none(ecdsa_p256_sign_digest(short, dg, one)) { bad = bad + 1; }
+  if is_none(ecdsa_p256_sign_digest(one, dg, one)) { bad = bad + 1; }
+  if !is_none(ecdh_p256(zero, peer)) { bad = bad + 1; }
+  if !is_none(ecdh_p256(one, off)) { bad = bad + 1; }
+  if !is_none(ecdh_p256(one, short)) { bad = bad + 1; }
+  if is_none(ecdh_p256(one, peer)) { bad = bad + 1; }
+  bfree(off);
+  bfree(peer);
+  bfree(short);
+  bfree(dg);
+  bfree(one);
+  bfree(order);
+  bfree(zero);
+  return bad;
+}
+
+fn neg_p384() -> u64 {
+  let zero = unhex("000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+  let order = unhex("ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973");
+  let one = unhex("000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001");
+  let dg = unhex("abababababababababababababababababababababababababababababababababababababababababababababababab");
+  let short = unhex("0102");
+  let peer = unhex("0438c31c10e45f09f8ff95e49345492c25dbc9ef6e377ddec4a64494b4d9f0ddddf025bdf9a0b4e9e146750c718daaefb576dd3396b90fc0352de8faa9c410e8d74fa911c644de8c453782cd708d9395d1513d0b51f89a5599c8350c281cb4a1f1");
+  let mut off = unhex("0438c31c10e45f09f8ff95e49345492c25dbc9ef6e377ddec4a64494b4d9f0ddddf025bdf9a0b4e9e146750c718daaefb576dd3396b90fc0352de8faa9c410e8d74fa911c644de8c453782cd708d9395d1513d0b51f89a5599c8350c281cb4a1f1");
+  bset(&mut off, 96, bget(off, 96) ^ 1);
+  let mut bad = 0;
+  if !is_none(ecdsa_p384_public_key(zero)) { bad = bad + 1; }
+  if !is_none(ecdsa_p384_public_key(order)) { bad = bad + 1; }
+  if !is_none(ecdsa_p384_public_key(short)) { bad = bad + 1; }
+  if is_none(ecdsa_p384_public_key(one)) { bad = bad + 1; }
+  if !is_none(ecdsa_p384_sign_digest(zero, dg, one)) { bad = bad + 1; }
+  if !is_none(ecdsa_p384_sign_digest(one, dg, zero)) { bad = bad + 1; }
+  if !is_none(ecdsa_p384_sign_digest(one, dg, order)) { bad = bad + 1; }
+  if !is_none(ecdsa_p384_sign_digest(short, dg, one)) { bad = bad + 1; }
+  if is_none(ecdsa_p384_sign_digest(one, dg, one)) { bad = bad + 1; }
+  if !is_none(ecdh_p384(zero, peer)) { bad = bad + 1; }
+  if !is_none(ecdh_p384(one, off)) { bad = bad + 1; }
+  if !is_none(ecdh_p384(one, short)) { bad = bad + 1; }
+  if is_none(ecdh_p384(one, peer)) { bad = bad + 1; }
+  bfree(off);
+  bfree(peer);
+  bfree(short);
+  bfree(dg);
+  bfree(one);
+  bfree(order);
+  bfree(zero);
+  return bad;
+}
+
+fn main() -> u64 {
+  let mut bad = 0;
+  bad = wrap_add(bad, vec0());
+  bad = wrap_add(bad, vec1());
+  bad = wrap_add(bad, vec2());
+  bad = wrap_add(bad, vec3());
+  bad = wrap_add(bad, vec4());
+  bad = wrap_add(bad, vec5());
+  bad = wrap_add(bad, neg_p256());
+  bad = wrap_add(bad, neg_p384());
+  return bad;
+}
