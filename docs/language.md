@@ -1016,8 +1016,11 @@ The code also has sixteen 64-bit registers `r0..r15` of its own (all 0 on entry)
 | `17 d f b i L` | `r[d] = ` element `r[b] + r[i]` of ctx field `f` (from `code_field`), or go to `L` if that index is not below the field's length now |
 | `18 f b i s L` | Element `r[b] + r[i]` of field `f` `= r[s]`, or go to `L` |
 | `19 k a b c d` | `CALL` with arguments `r[a]`, `r[b]`, `r[c]`, `r[d]` |
+| `20 op d a b` | `r[d] = r[a] op r[b]` on the registers as doubles (their bits); op 0 add, 1 sub, 2 mul, 3 div |
+| `21 op d a` | `r[d]` from `r[a]` as a double; op 0 sqrt, 1 neg, 2 abs, 3 the signed integer `r[a]` as a double, 4 `r[a]` cut towards 0 to a signed integer (a NaN or a value out of range gives 2^63) |
+| `22 c a b L` | Go to `L` if `r[a] c r[b]` as doubles; c 0 eq, 1 ne, 2 lt, 3 le, 4 gt, 5 ge. Every compare with a NaN is false except ne |
 
-The length and data pointer of a field are read from the context at every access, so a stencil that grows the vector cannot leave the code a stale pointer, and every index is compared with the length first: a plan that indexes out of range takes its `L` branch (the usual place to fall back to the stencil path) instead of touching memory. `tests/pass/code_regs.bastio` checks each item; `tests/pass/code_regs_speed.bastio` checks that a counting loop on registers is at least 3 times faster than the same loop through stencils.
+The length and data pointer of a field are read from the context at every access, so a stencil that grows the vector cannot leave the code a stale pointer, and every index is compared with the length first: a plan that indexes out of range takes its `L` branch (the usual place to fall back to the stencil path) instead of touching memory. `tests/pass/code_regs.bastio` checks each item; `tests/pass/code_f64.bastio` checks the double items against `std/f64.bastio`; `tests/pass/code_regs_speed.bastio` checks that a counting loop on registers is at least 3 times faster than the same loop through stencils.
 
 Running off the end returns the current value. The pages are written while read-write and then made read-execute, never both at once (W^X). Termination is not guaranteed, as for any code. The assembler is part of the trusted base (`prelude code` in `--trusted-base`). `tests/pass/code_plan.bastio` runs a loop through stencils.
 
