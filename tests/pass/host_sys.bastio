@@ -65,6 +65,73 @@ fn main(h: &mut Host) -> u64 {
     },
   }
   bfree(names);
+  // A hard link, set times, and fchmod through a descriptor.
+  // Windows has neither hard links here nor fchmod; os_nonblock tells it apart.
+  let mut win = true;
+  match os_pipe(h) {
+    Option::Some(p) => {
+      win = !os_nonblock(h, p.start, true);
+      os_close(h, p.start);
+      os_close(h, p.end);
+    },
+    Option::None => {},
+  }
+  let lpath = bfrom("host_sys.tmpdir/l.txt");
+  if !win {
+    if !os_link(h, path, lpath) {
+      bad = bad | 1048576;
+    }
+    match os_stat(h, lpath) {
+      Option::Some(s) => {
+        if s.kind != 1 || s.size != 12 {
+          bad = bad | 2097152;
+        }
+      },
+      Option::None => {
+        bad = bad | 2097152;
+      },
+    }
+  }
+  if !os_utimes(h, path, 1500000000000000000, 1600000000000000000) {
+    bad = bad | 4194304;
+  }
+  match os_stat(h, path) {
+    Option::Some(s) => {
+      if s.mtime != 1600000000000000000 {
+        bad = bad | 8388608;
+      }
+    },
+    Option::None => {
+      bad = bad | 8388608;
+    },
+  }
+  if !win {
+    match os_open(h, path, OS_READ, 0) {
+      Option::Some(fd) => {
+        if !os_fchmod(h, fd, 384) {
+          bad = bad | 16777216;
+        }
+        os_close(h, fd);
+      },
+      Option::None => {
+        bad = bad | 16777216;
+      },
+    }
+    match os_stat(h, path) {
+      Option::Some(s) => {
+        if s.perm & 511 != 384 {
+          bad = bad | 33554432;
+        }
+      },
+      Option::None => {
+        bad = bad | 33554432;
+      },
+    }
+    if !os_unlink(h, lpath) {
+      bad = bad | 67108864;
+    }
+  }
+  bfree(lpath);
   // A directory that is not empty cannot go; ENOTEMPTY is 39 on Linux, 66 on macOS.
   if os_rmdir(h, dir) || os_errno(h) == 0 {
     bad = bad | 512;
