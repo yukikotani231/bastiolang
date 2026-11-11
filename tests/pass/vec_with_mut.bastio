@@ -1,0 +1,83 @@
+// stage1-only: vec_with_mut
+// expect-exit: 0
+// `vec_with_mut(&mut v, i, f, args..)` lends element `i` of a vector to `f`
+// as its `&mut` first argument, in place: a big struct is written without
+// being taken out with `vec_swap` and put back. The prover knows the new
+// element, so the caller can rely on what `f` ensures.
+struct Obj { kind: u64, a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, name: Bytes }
+
+fn bump(o: &mut Obj, by: u64) {
+  o.a = wrap_add(o.a, by);
+}
+
+fn set_a(o: &mut Obj, x: u64)
+  ensures o.a == x
+{
+  o.a = x;
+}
+
+// The prover knows the element after `vec_with_mut`: what `set_a` ensures
+// is what `read_a` sees.
+fn set_then_read(v: &mut Vec[Obj]) -> u64
+  requires vlen(v) > 1
+  ensures result == 9
+{
+  vec_with_mut(&mut v, 1, set_a, 9);
+  return vec_with(v, 1, read_a);
+}
+
+fn rename(o: &mut Obj, name: &Bytes) {
+  bfree(o.name);
+  o.name = bfrom_bytes(name);
+}
+
+fn bfrom_bytes(b: &Bytes) -> Bytes {
+  let mut out = balloc(blen(b));
+  let mut k = 0;
+  while k < blen(b)
+    invariant k <= blen(b) && blen(out) == blen(b)
+  {
+    bset(&mut out, k, bget(b, k));
+    k = k + 1;
+  }
+  return out;
+}
+
+fn read_a(o: &Obj) -> u64
+  ensures result == o.a
+{
+  return o.a;
+}
+fn name_len(o: &Obj) -> u64 { return blen(o.name); }
+
+fn mk(kind: u64, a: u64) -> Obj {
+  return Obj { kind: kind, a: a, b: 0, c: 0, d: 0, e: 0, f: 0, name: balloc(2) };
+}
+
+fn main() -> u64 {
+  let mut v = vec_new[Obj]();
+  vec_push(&mut v, mk(1, 10));
+  vec_push(&mut v, mk(2, 20));
+  vec_with_mut(&mut v, 1, bump, 5);
+  vec_with_mut(&mut v, 1, bump, 7);
+  vec_with_mut(&mut v, 0, bump, 1);
+  let nm = bfrom("hello");
+  vec_with_mut(&mut v, 0, rename, nm);
+  bfree(nm);
+  let w = set_then_read(&mut v);
+  vec_with_mut(&mut v, 1, bump, 23);
+  let x = vec_with(v, 1, read_a);
+  let y = vec_with(v, 0, read_a);
+  let z = vec_with(v, 0, name_len);
+  let mut bad = 0;
+  if x != 32 { bad = 1; }
+  if y != 11 { bad = bad + 2; }
+  if z != 5 { bad = bad + 4; }
+  if w != 9 { bad = bad + 8; }
+  while vec_len(v) > 0 {
+    let o = vec_pop(&mut v);
+    bfree(o.name);
+  }
+  vec_free(v);
+  return bad;
+}

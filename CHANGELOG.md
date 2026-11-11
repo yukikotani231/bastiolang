@@ -15,6 +15,7 @@ What will be 0.2.0.
 
 ### Tools
 
+- `vec_with_mut(&mut v, i, f, args..)` lends element `i` of a vector to `f` as `&mut`, in place (stage1 only; struct and enum elements): a wide struct is written without the `vec_swap` copy out and back. The prover takes what `f` hands back as the slot's new value. C backend and native-ir (x86-64 and AArch64); the direct native emitter reports it as not supported yet. `tests/pass/vec_with_mut.bastio`.
 - `host_spawn_err` starts a child whose standard error is a pipe of its own, `child_read_err_line` reads it, and `child_kill(c, sig)` sends the child a signal (`TerminateProcess` on Windows). Stage1 only, C backend only so far; their prelude (142 lines) is added only to a program that calls one of them, so no other program's C changes. `tests/pass/child_err.bastio`.
 - `core/aes`: AES-192 (`aes192_new`, FIPS 197 C.2), usable with `aes_ctr` and the CBC functions like the other key sizes; `aes_ok` accepts its 12 rounds and 208-byte schedule.
 - `core/aesmodes`: `aes_ecb_encrypt` and `aes_ecb_decrypt` (whole blocks, SP 800-38A F.1), for interfaces that name `ecb(aes)`; ECB hides no patterns, so it is a building block, not a mode to store data with.

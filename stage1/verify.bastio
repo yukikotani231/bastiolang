@@ -4071,6 +4071,9 @@ fn vcall(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VSt
   if inst == 0 && (name_is(p, i, "pt_borrow") || name_is(p, i, "pt_borrow_frame")) {
     return vpt_borrow(&mut v, c, &mut m, p, i, &mut st);
   }
+  if inst == 0 && name_is(p, i, "vec_with_mut") {
+    return vvec_with_mut(&mut v, c, &mut m, p, i, &mut st);
+  }
   if inst == 0 && name_is(p, i, "vec_with") {
     return vvec_with(&mut v, c, &mut m, p, i, &mut st);
   }
@@ -4414,6 +4417,77 @@ fn vpt_borrow(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mu
     vm_s(&mut v, "` hands back what `pt_borrow_frame` lent it, unchanged but for its contents");
   }
   prove(&mut v, st, same, i, VC_OWN);
+  return res;
+}
+
+/// `vec_with_mut(&mut v, i, f, args..)`: element `i` (in bounds) is lent to
+/// `f` as its `&mut` first argument, left in place; what `f` hands back is the
+/// element's new value, written into the vector as `vec_set` would.
+fn vvec_with_mut(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VState) -> u64 {
+  let n = node_at(p.nodes, i);
+  let a0 = n.a;
+  let a1 = next_of(p, a0);
+  let a2 = next_of(p, a1);
+  let mut pre = vec_new[u64]();
+  vec_push(&mut pre, a0);
+  vec_push(&mut pre, a1);
+  let vals = vcall_vals(&mut v, c, &mut m, p, pre, 0, &mut st);
+  let vv = vl_at(v, u_at(vals, 0));
+  let ix = term(v, u_at(vals, 1));
+  let g = app2(&mut v, OP_LT, ix, vv.a);
+  vm_index(&mut v, p, pre, "vlen", false);
+  prove(&mut v, st, g, i, VC_BOUNDS);
+  let el = vec_read(&mut v, c, m, p, vv.ty, vv.b, ix, &mut st);
+  // The element lives in a variable no program can name, for the call.
+  if v.counter < U64_MAX {
+    v.counter = v.counter + 1;
+  }
+  let start = vec_len(v.pool);
+  push_str(&mut v, "with_mut*");
+  push_num(&mut v, v.counter);
+  let key = seal(&mut v, start);
+  let kt = tm_at(v, key);
+  vec_push(&mut st.env, Bind { s: vadd(kt.a, kt.b), e: kt.a, val: el });
+  let mut args = vec_new[u64]();
+  vec_push(&mut args, 0);
+  let mut a = next_of(p, a2);
+  while a != 0 {
+    vec_push(&mut args, a);
+    a = next_of(p, a);
+  }
+  let an = node_at(p.nodes, a2);
+  let x = plain_inst(&mut m, plain_fn(p, an.s, an.e));
+  let res = vcall_args(&mut v, c, &mut m, p, i, args, key, &mut st, x);
+  vec_free(args);
+  let after = get_path(v, m, p, st.env, key);
+  let mut env = vec_new[Bind]();
+  let mut k = 0;
+  while k < vec_len(st.env) {
+    let b = bind_at(st.env, k);
+    if !bind_named(v, p, b, kt.a, kt.b) {
+      vec_push(&mut env, b);
+    }
+    k = k + 1;
+  }
+  let prev = st.env;
+  st.env = env;
+  vec_free(prev);
+  // The element goes back as `vec_set` would put it.
+  let ew = vec_write(&mut v, m, vv.b, ix, after);
+  let ea = vl_at(v, vv.b);
+  let eb = vl_at(v, ew);
+  if v.counts && ea.kind == VV_U && eb.kind == VV_U {
+    let din = count_one(&mut v, term(v, after));
+    let y = app2(&mut v, OP_SELECT, ea.a, ix);
+    let dout = count_one(&mut v, y);
+    let d = app2(&mut v, OP_SUB, din, dout);
+    let f = count_step(&mut v, eb.a, vv.a, ea.a, vv.a, d);
+    vec_push(&mut st.pc, f);
+  }
+  let nv = mk(&mut v, VV_VEC, vv.ty, vv.a, ew, vv.c, 0);
+  put_back(&mut v, m, p, &mut st, a0, nv);
+  vec_free(pre);
+  vec_free(vals);
   return res;
 }
 
@@ -6729,6 +6803,16 @@ fn call_changes(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst:
   } else if inst == 0 && (name_is(p, i, "pt_borrow") || name_is(p, i, "pt_borrow_frame")) && n.a != 0
     && kind_of(p, n.a) == E_MUTBORROW && next_of(p, n.a) != 0 && kind_of(p, next_of(p, next_of(p, n.a))) == E_VAR {
     // `pt_borrow(t, i, f, ..)` keeps `t` and lends the rest to `f`.
+    let tn = node_at(p.nodes, n.a);
+    let tname = list_text(&mut v, p, tn.a);
+    note(&mut v, &mut out, tname, true);
+    changed_in_expr(&mut v, c, &mut m, p, next_of(p, n.a), &mut out);
+    fnode = next_of(p, next_of(p, n.a));
+    skip = 3;
+    j = 1;
+  } else if inst == 0 && name_is(p, i, "vec_with_mut") && n.a != 0 && next_of(p, n.a) != 0
+    && kind_of(p, next_of(p, next_of(p, n.a))) == E_VAR {
+    // `vec_with_mut(&mut v, i, f, ..)` changes `v` and lends the rest to `f`.
     let tn = node_at(p.nodes, n.a);
     let tname = list_text(&mut v, p, tn.a);
     note(&mut v, &mut out, tname, true);
