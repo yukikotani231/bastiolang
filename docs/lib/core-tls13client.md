@@ -32,7 +32,12 @@ check that the random values are random (the caller supplies them).
 | Function | |
 | --- | --- |
 | [`tls13c_new`](#tls13c_new) | Starts a connection to the server named `name` (at most 255 bytes). |
+| [`tls13c_new_with`](#tls13c_new_with) | `tls13c_new` that also offers the application protocols `alpn` (RFC 7301; the ProtocolNameList without its length, each name behind a one-byte length, at most 256 bytes, empty for none; `tls13c_alpn` tells which one the server chose). |
+| [`tls13c_blank`](#tls13c_blank) | A client that has already failed (state 7) and holds no keys or secrets. |
 | [`tls13c_free`](#tls13c_free) | Frees a client. |
+| [`tls13c_alpn`](#tls13c_alpn) | The application protocol the server chose (a copy; empty when it chose none or has not answered yet). |
+| [`tls13c_verdict`](#tls13c_verdict) | 0 when the server's certificate chain was checked and good; otherwise 6, the code a client that verifies fails with (only a client made with `verify` false gets that far). |
+| [`tls13c_peer_cert`](#tls13c_peer_cert) | The server's own certificate (DER, a copy), once the client has it (state 3 or later); empty before. |
 | [`tls13c_state`](#tls13c_state) | The state of `c`. |
 | [`tls13c_feed`](#tls13c_feed) | Gives the client the bytes `data` that arrived from the server. |
 | [`tls13c_send`](#tls13c_send) | Seals `data` as application data records and appends them to `out`. |
@@ -51,13 +56,17 @@ struct Tls13Client {
   suite: u64, c_suite: u64, s_suite: u64,
   c_key: Bytes, c_iv: Bytes, s_key: Bytes, s_iv: Bytes,
   c_secret: Bytes, s_secret: Bytes, c_seq: u64, s_seq: u64,
-  inbuf: Bytes, hsbuf: Bytes, leaf: Bytes
+  inbuf: Bytes, hsbuf: Bytes, leaf: Bytes,
+  verify: bool, verdict: u64, alpn: Bytes
 }
 ```
 
 The state of one connection. `state` is 0 waiting for the ServerHello, 1
 for EncryptedExtensions, 2 for the Certificate, 3 for CertificateVerify, 4
 for the server's Finished, 5 connected, 6 closed by the peer, 7 failed.
+`verify` is false when a chain the roots do not vouch for is accepted
+anyway (`verdict` then says why it would have been refused); `alpn` holds
+the protocols offered, then the one the server chose.
 
 ## Functions
 
@@ -95,6 +104,70 @@ bfree(r);
 if first != 22 || st != 0 { return 1; }
 ```
 
+### `tls13c_new_with`
+
+```bastio
+fn tls13c_new_with(random: &Bytes, session_id: &Bytes, priv_key: &Bytes, name: &Bytes, alpn: &Bytes, verify: bool, out: &mut Vec[u8]) -> Tls13Client
+  requires blen(random) == 32 && blen(session_id) == 32 && blen(priv_key) == 32 && blen(name) <= 255 && blen(alpn) <= 256
+  ensures tls13c_ok(result) && result.state == 0
+  ensures vlen(out) > vlen(old(out))
+```
+
+`tls13c_new` that also offers the application protocols `alpn` (RFC
+7301; the ProtocolNameList without its length, each name behind a one-byte
+length, at most 256 bytes, empty for none; `tls13c_alpn` tells which one
+the server chose). With `verify` false a certificate chain that the roots
+do not vouch for, or that is for another name, is accepted (the server
+must still prove it holds the key of its certificate); `tls13c_verdict`
+then says what was wrong with it.
+
+Example:
+
+```bastio
+let r = balloc(32);
+let s = balloc(32);
+let k = balloc(32);
+let name = bfrom("example.com");
+let mut a = text_new();
+text_push(&mut a, 2);
+text_push_str(&mut a, "h2");
+let alpn = text_finish(a);
+let mut out = text_new();
+let c = tls13c_new_with(r, s, k, name, alpn, false, &mut out);
+let st = tls13c_state(c);
+let chosen = tls13c_alpn(c);
+let none = blen(chosen) == 0;
+bfree(chosen);
+tls13c_free(c);
+vec_free(out);
+bfree(alpn);
+bfree(name);
+bfree(k);
+bfree(s);
+bfree(r);
+if st != 0 || !none { return 1; }
+```
+
+### `tls13c_blank`
+
+```bastio
+fn tls13c_blank() -> Tls13Client
+  ensures result.state == 7
+```
+
+A client that has already failed (state 7) and holds no keys or secrets:
+a placeholder for a slot whose connection is gone. Callers use it instead
+of building the struct, so new fields do not break them.
+
+Example:
+
+```bastio
+let c = tls13c_blank();
+let st = tls13c_state(c);
+tls13c_free(c);
+if st != 7 { return 1; }
+```
+
 ### `tls13c_free`
 
 ```bastio
@@ -102,6 +175,65 @@ fn tls13c_free(c: Tls13Client)
 ```
 
 Frees a client.
+
+### `tls13c_alpn`
+
+```bastio
+fn tls13c_alpn(c: &Tls13Client) -> Bytes
+```
+
+The application protocol the server chose (a copy; empty when it chose
+none or has not answered yet).
+
+Example:
+
+```bastio
+let c = tls13c_blank();
+let a = tls13c_alpn(c);
+let n = blen(a);
+bfree(a);
+tls13c_free(c);
+if n != 0 { return 1; }
+```
+
+### `tls13c_verdict`
+
+```bastio
+fn tls13c_verdict(c: &Tls13Client) -> u64
+```
+
+0 when the server's certificate chain was checked and good; otherwise 6,
+the code a client that verifies fails with (only a client made with
+`verify` false gets that far).
+
+Example:
+
+```bastio
+let c = tls13c_blank();
+let v = tls13c_verdict(c);
+tls13c_free(c);
+if v != 0 { return 1; }
+```
+
+### `tls13c_peer_cert`
+
+```bastio
+fn tls13c_peer_cert(c: &Tls13Client) -> Bytes
+```
+
+The server's own certificate (DER, a copy), once the client has it
+(state 3 or later); empty before.
+
+Example:
+
+```bastio
+let c = tls13c_blank();
+let p = tls13c_peer_cert(c);
+let n = blen(p);
+bfree(p);
+tls13c_free(c);
+if n != 0 { return 1; }
+```
 
 ### `tls13c_state`
 
@@ -241,6 +373,7 @@ spec fn tls13c_ok(c: &Tls13Client) -> bool {
     && blen(c.c_iv) == 12 && blen(c.s_iv) == 12
     && blen(c.name) <= 255
     && blen(c.transcript) < 1073741824 && blen(c.inbuf) < 1073741824 && blen(c.hsbuf) < 1073741824 && blen(c.leaf) < 1048576
+    && blen(c.alpn) <= 256
 }
 ```
 
@@ -361,6 +494,17 @@ Internal: checks the Certificate message `msg` (with its header) for a
 server named `name` at time `now` against `roots`, and returns the
 server's own certificate if it is good.
 
+### `tls13c_first_cert`
+
+```bastio
+fn tls13c_first_cert(msg: &Bytes) -> Option[Bytes]
+  requires blen(msg) < 1048576
+  ensures result is Option::Some ==> blen(result.Some) < 1048576
+```
+
+Internal: the first certificate of the Certificate message `msg` (the
+server's own), if it is one x509_parse reads.
+
 ### `tls13c_all_zero`
 
 ```bastio
@@ -423,6 +567,15 @@ fn tls13c_server_hello(c: &mut Tls13Client, msg: &Bytes) -> u64
 ```
 
 Internal: handles a ServerHello `msg` (state 0).
+
+### `tls13c_offered`
+
+```bastio
+fn tls13c_offered(list: &Bytes, name: &Bytes) -> bool
+```
+
+Internal: whether `name` is one of the names of the ProtocolNameList
+contents `list` (each behind a one-byte length).
 
 ### `tls13c_encrypted_extensions`
 

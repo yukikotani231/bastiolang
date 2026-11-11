@@ -39,13 +39,17 @@ import "rsa.bastio";
 /// The state of one connection. `state` is 0 waiting for the ServerHello, 1
 /// for EncryptedExtensions, 2 for the Certificate, 3 for CertificateVerify, 4
 /// for the server's Finished, 5 connected, 6 closed by the peer, 7 failed.
+/// `verify` is false when a chain the roots do not vouch for is accepted
+/// anyway (`verdict` then says why it would have been refused); `alpn` holds
+/// the protocols offered, then the one the server chose.
 struct Tls13Client {
   state: u64, priv_key: Bytes, name: Bytes, transcript: Bytes,
   hs_secret: Bytes, c_hs: Bytes, s_hs: Bytes,
   suite: u64, c_suite: u64, s_suite: u64,
   c_key: Bytes, c_iv: Bytes, s_key: Bytes, s_iv: Bytes,
   c_secret: Bytes, s_secret: Bytes, c_seq: u64, s_seq: u64,
-  inbuf: Bytes, hsbuf: Bytes, leaf: Bytes
+  inbuf: Bytes, hsbuf: Bytes, leaf: Bytes,
+  verify: bool, verdict: u64, alpn: Bytes
 }
 
 /// Internal: the handshake and traffic secrets of `c` all have `n` bytes, the
@@ -64,6 +68,7 @@ spec fn tls13c_ok(c: &Tls13Client) -> bool {
     && blen(c.c_iv) == 12 && blen(c.s_iv) == 12
     && blen(c.name) <= 255
     && blen(c.transcript) < 1073741824 && blen(c.inbuf) < 1073741824 && blen(c.hsbuf) < 1073741824 && blen(c.leaf) < 1048576
+    && blen(c.alpn) <= 256
 }
 
 /// Internal: the 9 as a field element, the base point of X25519.
@@ -115,9 +120,51 @@ fn tls13c_new(random: &Bytes, session_id: &Bytes, priv_key: &Bytes, name: &Bytes
   ensures tls13c_ok(result) && result.state == 0
   ensures vlen(out) > vlen(old(out))
 {
+  let none = balloc(0);
+  let c = tls13c_new_with(random, session_id, priv_key, name, none, true, &mut out);
+  bfree(none);
+  return c;
+}
+
+/// `tls13c_new` that also offers the application protocols `alpn` (RFC
+/// 7301; the ProtocolNameList without its length, each name behind a one-byte
+/// length, at most 256 bytes, empty for none; `tls13c_alpn` tells which one
+/// the server chose). With `verify` false a certificate chain that the roots
+/// do not vouch for, or that is for another name, is accepted (the server
+/// must still prove it holds the key of its certificate); `tls13c_verdict`
+/// then says what was wrong with it.
+/// ```
+/// let r = balloc(32);
+/// let s = balloc(32);
+/// let k = balloc(32);
+/// let name = bfrom("example.com");
+/// let mut a = text_new();
+/// text_push(&mut a, 2);
+/// text_push_str(&mut a, "h2");
+/// let alpn = text_finish(a);
+/// let mut out = text_new();
+/// let c = tls13c_new_with(r, s, k, name, alpn, false, &mut out);
+/// let st = tls13c_state(c);
+/// let chosen = tls13c_alpn(c);
+/// let none = blen(chosen) == 0;
+/// bfree(chosen);
+/// tls13c_free(c);
+/// vec_free(out);
+/// bfree(alpn);
+/// bfree(name);
+/// bfree(k);
+/// bfree(s);
+/// bfree(r);
+/// if st != 0 || !none { return 1; }
+/// ```
+fn tls13c_new_with(random: &Bytes, session_id: &Bytes, priv_key: &Bytes, name: &Bytes, alpn: &Bytes, verify: bool, out: &mut Vec[u8]) -> Tls13Client
+  requires blen(random) == 32 && blen(session_id) == 32 && blen(priv_key) == 32 && blen(name) <= 255 && blen(alpn) <= 256
+  ensures tls13c_ok(result) && result.state == 0
+  ensures vlen(out) > vlen(old(out))
+{
   let base = tls13c_base();
   let pubkey = x25519(priv_key, base);
-  let hello = tls13_client_hello(random, session_id, name, pubkey);
+  let hello = tls13_client_hello_alpn(random, session_id, name, pubkey, alpn);
   tls13c_plain_record(&mut out, 22, hello);
   bfree(pubkey);
   bfree(base);
@@ -127,7 +174,31 @@ fn tls13c_new(random: &Bytes, session_id: &Bytes, priv_key: &Bytes, name: &Bytes
     suite: 4867, c_suite: 4867, s_suite: 4867,
     c_key: balloc(32), c_iv: balloc(12), s_key: balloc(32), s_iv: balloc(12),
     c_secret: balloc(32), s_secret: balloc(32), c_seq: 0, s_seq: 0,
-    inbuf: balloc(0), hsbuf: balloc(0), leaf: balloc(0)
+    inbuf: balloc(0), hsbuf: balloc(0), leaf: balloc(0),
+    verify: verify, verdict: 0, alpn: bytes_slice(alpn, 0, blen(alpn))
+  };
+}
+
+/// A client that has already failed (state 7) and holds no keys or secrets:
+/// a placeholder for a slot whose connection is gone. Callers use it instead
+/// of building the struct, so new fields do not break them.
+/// ```
+/// let c = tls13c_blank();
+/// let st = tls13c_state(c);
+/// tls13c_free(c);
+/// if st != 7 { return 1; }
+/// ```
+fn tls13c_blank() -> Tls13Client
+  ensures result.state == 7
+{
+  return Tls13Client {
+    state: 7, priv_key: balloc(0), name: balloc(0), transcript: balloc(0),
+    hs_secret: balloc(0), c_hs: balloc(0), s_hs: balloc(0),
+    suite: 4867, c_suite: 4867, s_suite: 4867,
+    c_key: balloc(0), c_iv: balloc(0), s_key: balloc(0), s_iv: balloc(0),
+    c_secret: balloc(0), s_secret: balloc(0), c_seq: 0, s_seq: 0,
+    inbuf: balloc(0), hsbuf: balloc(0), leaf: balloc(0),
+    verify: true, verdict: 0, alpn: balloc(0)
   };
 }
 
@@ -148,6 +219,49 @@ fn tls13c_free(c: Tls13Client) {
   bfree(c.inbuf);
   bfree(c.hsbuf);
   bfree(c.leaf);
+  bfree(c.alpn);
+}
+
+/// The application protocol the server chose (a copy; empty when it chose
+/// none or has not answered yet).
+/// ```
+/// let c = tls13c_blank();
+/// let a = tls13c_alpn(c);
+/// let n = blen(a);
+/// bfree(a);
+/// tls13c_free(c);
+/// if n != 0 { return 1; }
+/// ```
+fn tls13c_alpn(c: &Tls13Client) -> Bytes {
+  if c.state <= 1 { return balloc(0); }
+  return bytes_slice(c.alpn, 0, blen(c.alpn));
+}
+
+/// 0 when the server's certificate chain was checked and good; otherwise 6,
+/// the code a client that verifies fails with (only a client made with
+/// `verify` false gets that far).
+/// ```
+/// let c = tls13c_blank();
+/// let v = tls13c_verdict(c);
+/// tls13c_free(c);
+/// if v != 0 { return 1; }
+/// ```
+fn tls13c_verdict(c: &Tls13Client) -> u64 {
+  return c.verdict;
+}
+
+/// The server's own certificate (DER, a copy), once the client has it
+/// (state 3 or later); empty before.
+/// ```
+/// let c = tls13c_blank();
+/// let p = tls13c_peer_cert(c);
+/// let n = blen(p);
+/// bfree(p);
+/// tls13c_free(c);
+/// if n != 0 { return 1; }
+/// ```
+fn tls13c_peer_cert(c: &Tls13Client) -> Bytes {
+  return bytes_slice(c.leaf, 0, blen(c.leaf));
 }
 
 /// The state of `c`: 0 waiting for the ServerHello, 1 for the
@@ -345,6 +459,27 @@ fn tls13c_chain(msg: &Bytes, name: &Bytes, roots: &Bytes, now: u64) -> Option[By
   return Option[Bytes]::None;
 }
 
+/// Internal: the first certificate of the Certificate message `msg` (the
+/// server's own), if it is one x509_parse reads.
+fn tls13c_first_cert(msg: &Bytes) -> Option[Bytes]
+  requires blen(msg) < 1048576
+  ensures result is Option::Some ==> blen(result.Some) < 1048576
+{
+  let n = blen(msg);
+  if n < 11 || bget(msg, 0) != 11 || bget(msg, 4) != 0 { return Option[Bytes]::None; }
+  let cl = tls13c_u24(msg, 8);
+  if cl == 0 || n - 11 < cl { return Option[Bytes]::None; }
+  let leaf = bytes_slice(msg, 11, 11 + cl);
+  let mut good = false;
+  match x509_parse(leaf) {
+    Option::None => {},
+    Option::Some(x) => { good = true; },
+  }
+  if good { return Option[Bytes]::Some(leaf); }
+  bfree(leaf);
+  return Option[Bytes]::None;
+}
+
 /// Internal: 1 if all of `b` is zero.
 fn tls13c_all_zero(b: &Bytes) -> bool {
   let mut i = 0;
@@ -501,6 +636,27 @@ fn tls13c_server_hello(c: &mut Tls13Client, msg: &Bytes) -> u64
   }
 }
 
+/// Internal: whether `name` is one of the names of the ProtocolNameList
+/// contents `list` (each behind a one-byte length).
+fn tls13c_offered(list: &Bytes, name: &Bytes) -> bool {
+  let n = blen(list);
+  let mut at = 0;
+  while at < n
+    invariant at <= n && n == blen(list)
+  {
+    let l = cast[u64](bget(list, at));
+    if l == 0 || n - at - 1 < l { return false; }
+    if l == blen(name) {
+      let it = bytes_slice(list, at + 1, at + 1 + l);
+      let same = bytes_eq(it, name);
+      bfree(it);
+      if same { return true; }
+    }
+    at = at + 1 + l;
+  }
+  return false;
+}
+
 /// Internal: handles EncryptedExtensions `msg` (state 1): the extensions are
 /// read for their lengths and not used.
 fn tls13c_encrypted_extensions(c: &mut Tls13Client, msg: &Bytes) -> u64
@@ -512,14 +668,29 @@ fn tls13c_encrypted_extensions(c: &mut Tls13Client, msg: &Bytes) -> u64
     return tls13c_fail(&mut c, 1);
   }
   let mut at = 6;
+  let mut chosen = balloc(0);
   while at < n
-    invariant at <= n && n == blen(msg) && tls13c_ok(c)
+    invariant at <= n && n == blen(msg) && tls13c_ok(c) && blen(chosen) <= 255
   {
-    if n - at < 4 { return tls13c_fail(&mut c, 1); }
+    if n - at < 4 { bfree(chosen); return tls13c_fail(&mut c, 1); }
+    let ty = tls13c_u16(msg, at);
     let l = tls13c_u16(msg, at + 2);
-    if n - at - 4 < l { return tls13c_fail(&mut c, 1); }
+    if n - at - 4 < l { bfree(chosen); return tls13c_fail(&mut c, 1); }
+    if ty == 16 {
+      // application_layer_protocol_negotiation: exactly one name, one the
+      // client offered, and only once.
+      if l < 4 || blen(chosen) != 0 { bfree(chosen); return tls13c_fail(&mut c, 1); }
+      let nl = cast[u64](bget(msg, at + 6));
+      if tls13c_u16(msg, at + 4) != l - 2 || nl + 3 != l || nl == 0 { bfree(chosen); return tls13c_fail(&mut c, 1); }
+      let name = bytes_slice(msg, at + 7, at + 7 + nl);
+      if !tls13c_offered(c.alpn, name) { bfree(name); bfree(chosen); return tls13c_fail(&mut c, 2); }
+      bfree(chosen);
+      chosen = name;
+    }
     at = at + 4 + l;
   }
+  bfree(c.alpn);
+  c.alpn = chosen;
   if !tls13c_note(&mut c, msg) { return tls13c_fail(&mut c, 1); }
   c.state = 2;
   return 0;
@@ -531,7 +702,22 @@ fn tls13c_certificate(c: &mut Tls13Client, msg: &Bytes, roots: &Bytes, now: u64)
   ensures tls13c_ok(c)
 {
   match tls13c_chain(msg, c.name, roots, now) {
-    Option::None => { return tls13c_fail(&mut c, 6); },
+    Option::None => {
+      if c.verify { return tls13c_fail(&mut c, 6); }
+      // Not verified, as the caller asked: go on with the server's own
+      // certificate, whose key must still sign the CertificateVerify.
+      match tls13c_first_cert(msg) {
+        Option::None => { return tls13c_fail(&mut c, 6); },
+        Option::Some(leaf) => {
+          bfree(c.leaf);
+          c.leaf = leaf;
+          c.verdict = 6;
+          if !tls13c_note(&mut c, msg) { return tls13c_fail(&mut c, 1); }
+          c.state = 3;
+          return 0;
+        },
+      }
+    },
     Option::Some(leaf) => {
       bfree(c.leaf);
       c.leaf = leaf;

@@ -166,6 +166,78 @@ fn tls13_client_hello(random: &Bytes, session_id: &Bytes, server_name: &Bytes, k
   return text_finish(m);
 }
 
+/// `tls13_client_hello` that also offers the application protocols `alpn`
+/// (RFC 7301): the ProtocolNameList without its own length, each name behind
+/// a one-byte length (for example the bytes 8 and "http/1.1"), at most 256
+/// bytes; empty offers none and gives what `tls13_client_hello` gives.
+/// ```
+/// let random = balloc(32);
+/// let sid = balloc(32);
+/// let key = balloc(32);
+/// let name = bfrom("example.com");
+/// let mut a = text_new();
+/// text_push(&mut a, 8);
+/// text_push_str(&mut a, "http/1.1");
+/// let alpn = text_finish(a);
+/// let plain = tls13_client_hello(random, sid, name, key);
+/// let hello = tls13_client_hello_alpn(random, sid, name, key, alpn);
+/// let n = blen(hello);
+/// let ln = load_be16(hello, 2);
+/// let grew = n == blen(plain) + 4 + 2 + blen(alpn);
+/// bfree(hello);
+/// bfree(plain);
+/// bfree(alpn);
+/// bfree(name);
+/// bfree(key);
+/// bfree(sid);
+/// bfree(random);
+/// if cast[u64](ln) + 4 != n || !grew { return 1; }
+/// ```
+fn tls13_client_hello_alpn(random: &Bytes, session_id: &Bytes, server_name: &Bytes, key_share: &Bytes, alpn: &Bytes) -> Bytes
+  requires blen(random) == 32 && blen(session_id) == 32 && blen(key_share) == 32 && blen(server_name) <= 255 && blen(alpn) <= 256
+  ensures blen(result) > 4 && blen(result) < 900
+{
+  let base = tls13_hello_extensions(server_name, key_share);
+  let mut e = text_new();
+  text_push_bytes(&mut e, base);
+  bfree(base);
+  if blen(alpn) > 0 {
+    let mut l = text_new();
+    tls13_push_block16(&mut l, alpn);
+    let list = text_finish(l);
+    tls13_push_ext(&mut e, 16, list);
+    bfree(list);
+  }
+  let exts = text_finish(e);
+  let mut t = text_new();
+  tls13_push_u16(&mut t, 771);
+  text_push_bytes(&mut t, random);
+  text_push(&mut t, 32);
+  text_push_bytes(&mut t, session_id);
+  tls13_push_u16(&mut t, 6);
+  tls13_push_u16(&mut t, 4865);
+  tls13_push_u16(&mut t, 4866);
+  tls13_push_u16(&mut t, 4867);
+  text_push(&mut t, 1);
+  text_push(&mut t, 0);
+  tls13_push_block16(&mut t, exts);
+  bfree(exts);
+  let n = vec_len(t);
+  let mut m = text_new();
+  text_push(&mut m, 1);
+  text_push(&mut m, 0);
+  tls13_push_u16(&mut m, n);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && vlen(m) == 4 + i && vlen(t) == n
+  {
+    text_push(&mut m, vec_get(t, i));
+    i = i + 1;
+  }
+  vec_free(t);
+  return text_finish(m);
+}
+
 /// The X25519 public key (32 bytes) in the ServerHello `msg` (the whole
 /// handshake message, with its 4-byte header), or `None` unless it is a
 /// ServerHello for what `tls13_client_hello` offers: TLS 1.2 in the legacy
