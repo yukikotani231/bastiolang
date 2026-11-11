@@ -238,6 +238,147 @@ fn tls13_client_hello_alpn(random: &Bytes, session_id: &Bytes, server_name: &Byt
   return text_finish(m);
 }
 
+/// A ClientHello that offers TLS 1.3 as `tls13_client_hello_alpn` does and
+/// TLS 1.2 too: supported_versions lists both, the TLS 1.2 suites
+/// ECDHE_{ECDSA,RSA}_WITH_{AES_128_GCM_SHA256, AES_256_GCM_SHA384,
+/// CHACHA20_POLY1305_SHA256} follow the TLS 1.3 ones, the signature schemes
+/// add rsa_pkcs1_sha256/384/512, and it asks for the extended master secret
+/// (RFC 7627) and secure renegotiation (an empty renegotiation_info, RFC
+/// 5746) with uncompressed points. The key exchange is X25519 only;
+/// secp256r1 and secp384r1 are listed for the curves of ECDSA certificates.
+/// ```
+/// let random = balloc(32);
+/// let sid = balloc(32);
+/// let key = balloc(32);
+/// let name = bfrom("example.com");
+/// let alpn = balloc(0);
+/// let hello = tls13_client_hello_v12(random, sid, name, key, alpn);
+/// let n = blen(hello);
+/// let ln = load_be16(hello, 2);
+/// bfree(hello);
+/// bfree(alpn);
+/// bfree(name);
+/// bfree(key);
+/// bfree(sid);
+/// bfree(random);
+/// if cast[u64](ln) + 4 != n { return 1; }
+/// ```
+fn tls13_client_hello_v12(random: &Bytes, session_id: &Bytes, server_name: &Bytes, key_share: &Bytes, alpn: &Bytes) -> Bytes
+  requires blen(random) == 32 && blen(session_id) == 32 && blen(key_share) == 32 && blen(server_name) <= 255 && blen(alpn) <= 256
+  ensures blen(result) > 4 && blen(result) < 1200
+{
+  let mut e = text_new();
+  if blen(server_name) > 0 {
+    let mut x = text_new();
+    text_push(&mut x, 0);
+    tls13_push_u16(&mut x, blen(server_name));
+    text_push_bytes(&mut x, server_name);
+    let entry = text_finish(x);
+    let mut l = text_new();
+    tls13_push_block16(&mut l, entry);
+    let list = text_finish(l);
+    tls13_push_ext(&mut e, 0, list);
+    bfree(list);
+    bfree(entry);
+  }
+  // supported_groups: X25519 for the key exchange; secp256r1 and secp384r1
+  // say which curves of ECDSA certificates the client takes (TLS 1.2 servers
+  // check it), and only X25519 has a key share.
+  let groups = tls13_u16_list(29, 23, 24, 0, 0, 3);
+  tls13_push_ext(&mut e, 10, groups);
+  bfree(groups);
+  // ec_point_formats: uncompressed only.
+  let mut pf = text_new();
+  text_push(&mut pf, 1);
+  text_push(&mut pf, 0);
+  let formats = text_finish(pf);
+  tls13_push_ext(&mut e, 11, formats);
+  bfree(formats);
+  // signature_algorithms: the TLS 1.3 five, then rsa_pkcs1_sha256/384/512.
+  let mut sa = text_new();
+  tls13_push_u16(&mut sa, 16);
+  tls13_push_u16(&mut sa, 2055);
+  tls13_push_u16(&mut sa, 1027);
+  tls13_push_u16(&mut sa, 1283);
+  tls13_push_u16(&mut sa, 2052);
+  tls13_push_u16(&mut sa, 2053);
+  tls13_push_u16(&mut sa, 1025);
+  tls13_push_u16(&mut sa, 1281);
+  tls13_push_u16(&mut sa, 1537);
+  let schemes = text_finish(sa);
+  tls13_push_ext(&mut e, 13, schemes);
+  bfree(schemes);
+  if blen(alpn) > 0 {
+    let mut l2 = text_new();
+    tls13_push_block16(&mut l2, alpn);
+    let list2 = text_finish(l2);
+    tls13_push_ext(&mut e, 16, list2);
+    bfree(list2);
+  }
+  // extended_master_secret: empty.
+  let none = balloc(0);
+  tls13_push_ext(&mut e, 23, none);
+  // supported_versions: TLS 1.3, then TLS 1.2.
+  let mut v = text_new();
+  text_push(&mut v, 4);
+  tls13_push_u16(&mut v, 772);
+  tls13_push_u16(&mut v, 771);
+  let versions = text_finish(v);
+  tls13_push_ext(&mut e, 43, versions);
+  bfree(versions);
+  let mut k = text_new();
+  tls13_push_u16(&mut k, 29);
+  tls13_push_block16(&mut k, key_share);
+  let entry2 = text_finish(k);
+  let mut l3 = text_new();
+  tls13_push_block16(&mut l3, entry2);
+  let list3 = text_finish(l3);
+  tls13_push_ext(&mut e, 51, list3);
+  bfree(list3);
+  bfree(entry2);
+  // renegotiation_info: an empty one (this is no renegotiation).
+  let mut ri = text_new();
+  text_push(&mut ri, 0);
+  let reneg = text_finish(ri);
+  tls13_push_ext(&mut e, 65281, reneg);
+  bfree(reneg);
+  bfree(none);
+  let exts = text_finish(e);
+  let mut t = text_new();
+  tls13_push_u16(&mut t, 771);
+  text_push_bytes(&mut t, random);
+  text_push(&mut t, 32);
+  text_push_bytes(&mut t, session_id);
+  tls13_push_u16(&mut t, 18);
+  tls13_push_u16(&mut t, 4865);
+  tls13_push_u16(&mut t, 4866);
+  tls13_push_u16(&mut t, 4867);
+  tls13_push_u16(&mut t, 49195);
+  tls13_push_u16(&mut t, 49199);
+  tls13_push_u16(&mut t, 49196);
+  tls13_push_u16(&mut t, 49200);
+  tls13_push_u16(&mut t, 52393);
+  tls13_push_u16(&mut t, 52392);
+  text_push(&mut t, 1);
+  text_push(&mut t, 0);
+  tls13_push_block16(&mut t, exts);
+  bfree(exts);
+  let n = vec_len(t);
+  let mut m = text_new();
+  text_push(&mut m, 1);
+  text_push(&mut m, 0);
+  tls13_push_u16(&mut m, n);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && vlen(m) == 4 + i && vlen(t) == n
+  {
+    text_push(&mut m, vec_get(t, i));
+    i = i + 1;
+  }
+  vec_free(t);
+  return text_finish(m);
+}
+
 /// The X25519 public key (32 bytes) in the ServerHello `msg` (the whole
 /// handshake message, with its 4-byte header), or `None` unless it is a
 /// ServerHello for what `tls13_client_hello` offers: TLS 1.2 in the legacy

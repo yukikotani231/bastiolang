@@ -3,7 +3,7 @@
 // handshake of core/tls13client, checks the server's certificate against the
 // roots in a file, sends `GET / HTTP/1.0` and prints the answer.
 //
-//   httpsget PORT NAME ROOTS SEED NOW
+//   httpsget PORT NAME ROOTS SEED NOW [12]
 //   httpsget PORT NAME ROOTS
 //   httpsget URL ROOTS
 //
@@ -11,7 +11,8 @@
 // for (and to send), ROOTS a file of DER certificates one after the other,
 // SEED a file of 32 bytes that must be unpredictable (every value that has
 // to be random is made from it, so it may be used only once), and NOW the
-// time in seconds since 1970. It exits with 0 if the answer starts with
+// time in seconds since 1970; a sixth argument also accepts a server that
+// only speaks TLS 1.2. It exits with 0 if the answer starts with
 // `HTTP/1.` and a 200 status. With two arguments, URL is an `https://` URL: the
 // host is looked up (std/dns), redirects are followed (at most 5) and the
 // status and the body of the last answer are printed (`https_fetch`); the exit
@@ -47,14 +48,14 @@ fn derive(seed: &Bytes, tag: u8) -> Bytes
 }
 
 /// Runs the whole exchange on the connected socket `sock`; the exit code.
-fn exchange(con: &Serial, h: &Host, sock: u64, name: &Bytes, roots: &Bytes, seed: &Bytes, now: u64) -> u64
+fn exchange(con: &Serial, h: &Host, sock: u64, name: &Bytes, roots: &Bytes, seed: &Bytes, now: u64, opts: u64) -> u64
   requires blen(name) <= 255 && blen(roots) < 274877906944 && blen(seed) == 32
 {
   let random = derive(seed, 1);
   let session = derive(seed, 2);
   let key = derive(seed, 3);
   let request = bfrom("GET / HTTP/1.0\r\nConnection: close\r\n\r\n");
-  let r = https_run(h, sock, name, request, roots, now, random, session, key);
+  let r = https_run_opts(h, sock, name, request, roots, now, random, session, key, opts);
   print_str(con, "state ");
   print_u64(con, r.state);
   print_str(con, ", error ");
@@ -168,6 +169,8 @@ fn main(con: &mut Serial, h: &mut Host) -> u64 {
   let a_seed = host_arg(h, 4);
   let a_now = host_arg(h, 5);
   let mut code = 2;
+  let mut opts = 0;
+  if host_argc(h) > 6 { opts = 2; }
   let port = opt_or[u64](parse_u64(a_port, 0, blen(a_port)), 0);
   let now = opt_or[u64](parse_u64(a_now, 0, blen(a_now)), 0);
   let mut roots = balloc(0);
@@ -175,7 +178,7 @@ fn main(con: &mut Serial, h: &mut Host) -> u64 {
   if port != 0 && now != 0 && blen(name) <= 255 && host_read(h, a_roots, &mut roots) && host_read(h, a_seed, &mut seed) && blen(seed) == 32 && blen(roots) < 16777216 {
     match net_connect(h, net_ip4(127, 0, 0, 1), port) {
       Option::Some(sock) => {
-        code = exchange(con, h, sock, name, roots, seed, now);
+        code = exchange(con, h, sock, name, roots, seed, now, opts);
         net_close(h, sock);
       },
       Option::None => { print_str(con, "cannot connect\n"); },

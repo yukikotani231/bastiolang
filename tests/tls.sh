@@ -59,6 +59,20 @@ make_cert() { # name kind ca names [ca_flag [hash]]
 }
 port=24000
 suites=TLS_CHACHA20_POLY1305_SHA256
+v12=
+# Starts a TLS 1.2 server with one cipher (OpenSSL name) and sets $port.
+serve12() { # cert key cipher
+  port=$((port + 1))
+  openssl s_server -www -accept "127.0.0.1:$port" -tls1_2 -cipher "$3" -groups X25519:P-256:P-384 \
+    -cert "$tmp/$1.pem" -key "$tmp/$2.key" >"$tmp/server.log" 2>&1 &
+  pids+=($!)
+  local i
+  for i in $(seq 1 100); do
+    (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && return 0
+    sleep 0.1
+  done
+  echo "tls: the server did not start"; cat "$tmp/server.log"; return 1
+}
 # Starts a server with the certificate file cert (its chain behind it) and key, and sets $port.
 serve() { # cert key [chain]
   port=$((port + 1))
@@ -77,7 +91,7 @@ serve() { # cert key [chain]
 # Runs the client against the server on $port and checks its exit code.
 client() { # description want(0|nonzero) name roots now
   local d=$1 want=$2 name=$3 roots=$4 t=${5:-$(date +%s)}
-  timeout 60 "$tmp/httpsget" "$port" "$name" "$tmp/$roots" "$tmp/seed" "$t" > "$tmp/out" 2>&1
+  timeout 60 "$tmp/httpsget" "$port" "$name" "$tmp/$roots" "$tmp/seed" "$t" $v12 > "$tmp/out" 2>&1
   local rc=$?
   if [ "$want" = 0 ] && [ $rc != 0 ]; then fail "$d: exit $rc"; sed 's/^/    /' "$tmp/out" | head -5
   elif [ "$want" != 0 ] && [ $rc = 0 ]; then fail "$d: accepted"; sed 's/^/    /' "$tmp/out" | head -5
@@ -152,12 +166,34 @@ serve chainleaf chainleaf mid && {
   client "chain through an intermediate" 0 localhost ec.roots
   client "chain, root of another chain" 1 localhost rsa.roots
 }
+# The server sends a certificate after the one a root signed (as servers do
+# with a root that another, older root cross-signed): the chain ends there.
+cat "$tmp/mid.pem" "$tmp/other.pem" > "$tmp/midextra.pem"
+serve chainleaf chainleaf midextra && client "chain with an extra certificate after the trusted one" 0 localhost ec.roots
 # The server sends only the leaf: the intermediate is missing.
 serve chainleaf chainleaf && client "intermediate missing" 1 localhost ec.roots
 # A leaf signed by a certificate that is not a CA.
 make_cert notca ec ecca "DNS:localhost"
 make_cert badchild ec notca "DNS:localhost"
 serve badchild badchild notca && client "signer is not a CA" 1 localhost ec.roots
+
+# TLS 1.2 (ECDHE with X25519): refused unless the client allows it, then every suite.
+serve12 eclocal eclocal ECDHE-ECDSA-AES128-GCM-SHA256 && {
+  client "TLS 1.2 server, client that wants TLS 1.3" 1 localhost ec.roots
+  v12=12
+  client "TLS 1.2: ECDHE-ECDSA-AES128-GCM-SHA256" 0 localhost ec.roots
+  client "TLS 1.2: wrong name" 1 example.org ec.roots
+  client "TLS 1.2: untrusted root" 1 localhost other.roots
+  v12=
+}
+v12=12
+serve12 eclocal eclocal ECDHE-ECDSA-AES256-GCM-SHA384 && client "TLS 1.2: ECDHE-ECDSA-AES256-GCM-SHA384" 0 localhost ec.roots
+serve12 eclocal eclocal ECDHE-ECDSA-CHACHA20-POLY1305 && client "TLS 1.2: ECDHE-ECDSA-CHACHA20-POLY1305" 0 localhost ec.roots
+serve12 rsalocal rsalocal ECDHE-RSA-AES128-GCM-SHA256 && client "TLS 1.2: ECDHE-RSA-AES128-GCM-SHA256" 0 localhost rsa.roots
+serve12 rsalocal rsalocal ECDHE-RSA-AES256-GCM-SHA384 && client "TLS 1.2: ECDHE-RSA-AES256-GCM-SHA384" 0 localhost rsa.roots
+serve12 rsalocal rsalocal ECDHE-RSA-CHACHA20-POLY1305 && client "TLS 1.2: ECDHE-RSA-CHACHA20-POLY1305" 0 localhost rsa.roots
+serve chainleaf chainleaf mid && client "TLS 1.3 server, client that allows TLS 1.2" 0 localhost ec.roots
+v12=
 
 # https_fetch (URLs, host lookup, redirects) against a small HTTPS server in python3 with the ECDSA certificate.
 if command -v python3 >/dev/null; then

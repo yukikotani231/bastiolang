@@ -20,6 +20,7 @@ of the standard (it takes the one suite and group the client offered).
 | --- | --- |
 | [`tls13_client_hello`](#tls13_client_hello) | The ClientHello message (handshake type 1) offering TLS 1.3 with TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and TLS_CHACHA20_POLY1305_SHA256, the group X25519 (with the key share `key_share`, 32 bytes) and the signature schemes ed25519, ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384, rsa_pss_rsae_sha256 and rsa_pss_rsae_sha384, for the server named `server_name` (the host name, at most 255 bytes; empty for none). |
 | [`tls13_client_hello_alpn`](#tls13_client_hello_alpn) | `tls13_client_hello` that also offers the application protocols `alpn` (RFC 7301). |
+| [`tls13_client_hello_v12`](#tls13_client_hello_v12) | A ClientHello that offers TLS 1.3 as `tls13_client_hello_alpn` does and TLS 1.2 too. |
 | [`tls13_parse_server_hello`](#tls13_parse_server_hello) | The X25519 public key (32 bytes) in the ServerHello `msg` (the whole handshake message, with its 4-byte header), or `None` unless it is a ServerHello for what `tls13_client_hello` offers. |
 | [`tls13_server_hello_suite`](#tls13_server_hello_suite) | The cipher suite a ServerHello `msg` chose. |
 
@@ -101,6 +102,43 @@ bfree(key);
 bfree(sid);
 bfree(random);
 if cast[u64](ln) + 4 != n || !grew { return 1; }
+```
+
+### `tls13_client_hello_v12`
+
+```bastio
+fn tls13_client_hello_v12(random: &Bytes, session_id: &Bytes, server_name: &Bytes, key_share: &Bytes, alpn: &Bytes) -> Bytes
+  requires blen(random) == 32 && blen(session_id) == 32 && blen(key_share) == 32 && blen(server_name) <= 255 && blen(alpn) <= 256
+  ensures blen(result) > 4 && blen(result) < 1200
+```
+
+A ClientHello that offers TLS 1.3 as `tls13_client_hello_alpn` does and
+TLS 1.2 too: supported_versions lists both, the TLS 1.2 suites
+ECDHE_{ECDSA,RSA}_WITH_{AES_128_GCM_SHA256, AES_256_GCM_SHA384,
+CHACHA20_POLY1305_SHA256} follow the TLS 1.3 ones, the signature schemes
+add rsa_pkcs1_sha256/384/512, and it asks for the extended master secret
+(RFC 7627) and secure renegotiation (an empty renegotiation_info, RFC
+5746) with uncompressed points. The key exchange is X25519 only;
+secp256r1 and secp384r1 are listed for the curves of ECDSA certificates.
+
+Example:
+
+```bastio
+let random = balloc(32);
+let sid = balloc(32);
+let key = balloc(32);
+let name = bfrom("example.com");
+let alpn = balloc(0);
+let hello = tls13_client_hello_v12(random, sid, name, key, alpn);
+let n = blen(hello);
+let ln = load_be16(hello, 2);
+bfree(hello);
+bfree(alpn);
+bfree(name);
+bfree(key);
+bfree(sid);
+bfree(random);
+if cast[u64](ln) + 4 != n { return 1; }
 ```
 
 ### `tls13_parse_server_hello`

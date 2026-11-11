@@ -84,9 +84,44 @@ fn https_run(h: &Host, sock: u64, name: &Bytes, request: &Bytes, roots: &Bytes, 
   requires blen(name) <= 255 && blen(request) < 1073741824 && blen(roots) < 274877906944
   requires blen(random) == 32 && blen(session) == 32 && blen(key) == 32
 {
+  return https_run_opts(h, sock, name, request, roots, now, random, session, key, 0);
+}
+
+/// `https_run` with the options of `tls13c_new_opts`: 2 also accepts a
+/// server that only speaks TLS 1.2.
+///
+/// ```
+/// let host = host_new();
+/// let request = bfrom("GET / HTTP/1.0\r\n\r\n");
+/// let name = bfrom("localhost");
+/// let roots = balloc(0);
+/// let random = balloc(32);
+/// let session = balloc(32);
+/// let key = balloc(32);
+/// match net_connect(host, net_ip4(127, 0, 0, 1), 1) {
+///   Option::Some(c) => {
+///     let r = https_run_opts(host, c, name, request, roots, 1800000000, random, session, key, 2);
+///     https_result_free(r);
+///     net_close(host, c);
+///   },
+///   Option::None => {},
+/// }
+/// bfree(key);
+/// bfree(session);
+/// bfree(random);
+/// bfree(roots);
+/// bfree(name);
+/// bfree(request);
+/// ```
+fn https_run_opts(h: &Host, sock: u64, name: &Bytes, request: &Bytes, roots: &Bytes, now: u64, random: &Bytes, session: &Bytes, key: &Bytes, opts: u64) -> HttpsResult
+  requires blen(name) <= 255 && blen(request) < 1073741824 && blen(roots) < 274877906944
+  requires blen(random) == 32 && blen(session) == 32 && blen(key) == 32
+{
   let mut out = text_new();
   let mut app = text_new();
-  let mut client = tls13c_new(random, session, key, name, &mut out);
+  let none = balloc(0);
+  let mut client = tls13c_new_opts(random, session, key, name, none, opts, &mut out);
+  bfree(none);
   let mut asked = false;
   let mut alive = https_flush(h, sock, &mut out);
   let mut buf = balloc(0);
