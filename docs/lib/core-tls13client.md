@@ -32,11 +32,21 @@ check that the random values are random (the caller supplies them).
 | Function | |
 | --- | --- |
 | [`tls13c_new`](#tls13c_new) | Starts a connection to the server named `name` (at most 255 bytes). |
+| [`tls13c_new_with`](#tls13c_new_with) | `tls13c_new` that also offers the application protocols `alpn` (RFC 7301; the ProtocolNameList without its length, each name behind a one-byte length, at most 256 bytes, empty for none; `tls13c_alpn` tells which one the server chose). |
+| [`tls13c_new_opts`](#tls13c_new_opts) | `tls13c_new_with` with options as bits. |
+| [`tls13c_blank`](#tls13c_blank) | A client that has already failed (state 7) and holds no keys or secrets. |
 | [`tls13c_free`](#tls13c_free) | Frees a client. |
+| [`tls13c_version`](#tls13c_version) | The protocol version in use. |
+| [`tls13c_suite`](#tls13c_suite) | The cipher suite in use (its IANA number, 0x1301.. |
+| [`tls13c_check`](#tls13c_check) | Whether `c` has the sizes and states the other functions require (`tls13c_ok`). |
+| [`tls13c_alpn`](#tls13c_alpn) | The application protocol the server chose (a copy; empty when it chose none or has not answered yet). |
+| [`tls13c_verdict`](#tls13c_verdict) | 0 when the server's certificate chain was checked and good; otherwise 10 when only the host name is not the certificate's, or 6 (the code a client that verifies fails with in both cases; only a client made with `verify` false gets that far). |
+| [`tls13c_peer_cert`](#tls13c_peer_cert) | The server's own certificate (DER, a copy), once the client has it (state 3 or later); empty before. |
 | [`tls13c_state`](#tls13c_state) | The state of `c`. |
 | [`tls13c_feed`](#tls13c_feed) | Gives the client the bytes `data` that arrived from the server. |
 | [`tls13c_send`](#tls13c_send) | Seals `data` as application data records and appends them to `out`. |
 | [`tls13c_close`](#tls13c_close) | Appends a close_notify alert to `out` and closes the connection on this side. |
+| [`tls13c_shutdown`](#tls13c_shutdown) | Appends a close_notify alert to `out` and closes the sending side only. |
 
 Every example below is built, verified and run by `tests/run.sh`. An `assert` in one is proved at compile time from the contracts above it.
 
@@ -51,13 +61,25 @@ struct Tls13Client {
   suite: u64, c_suite: u64, s_suite: u64,
   c_key: Bytes, c_iv: Bytes, s_key: Bytes, s_iv: Bytes,
   c_secret: Bytes, s_secret: Bytes, c_seq: u64, s_seq: u64,
-  inbuf: Bytes, hsbuf: Bytes, leaf: Bytes
+  inbuf: Bytes, hsbuf: Bytes, leaf: Bytes,
+  verify: bool, verdict: u64, alpn: Bytes, sent_close: bool,
+  allow12: bool, v12: bool, step: u64, rnd: Bytes, ms: Bytes, ems: bool, cs12: u64
 }
 ```
 
 The state of one connection. `state` is 0 waiting for the ServerHello, 1
 for EncryptedExtensions, 2 for the Certificate, 3 for CertificateVerify, 4
 for the server's Finished, 5 connected, 6 closed by the peer, 7 failed.
+`verify` is false when a chain the roots do not vouch for is accepted
+anyway (`verdict` then says why it would have been refused); `alpn` holds
+the protocols offered, then the one the server chose. `sent_close` is true
+once `tls13c_shutdown` has said goodbye: nothing more is sent, but what the
+server still sends is read. `allow12` offers TLS 1.2 too; `v12` is true
+once the server chose it (cipher suite `cs12`); `step` is then where the
+TLS 1.2 handshake is (0 Certificate, 1 ServerKeyExchange, 2
+ServerHelloDone, 3 the server's ChangeCipherSpec, 4 its Finished), `rnd`
+the client and then the server random, `ms` the premaster and then the
+master secret, `ems` whether it is an extended master secret.
 
 ## Functions
 
@@ -95,6 +117,108 @@ bfree(r);
 if first != 22 || st != 0 { return 1; }
 ```
 
+### `tls13c_new_with`
+
+```bastio
+fn tls13c_new_with(random: &Bytes, session_id: &Bytes, priv_key: &Bytes, name: &Bytes, alpn: &Bytes, verify: bool, out: &mut Vec[u8]) -> Tls13Client
+  requires blen(random) == 32 && blen(session_id) == 32 && blen(priv_key) == 32 && blen(name) <= 255 && blen(alpn) <= 256
+  ensures tls13c_ok(result) && result.state == 0
+  ensures vlen(out) > vlen(old(out))
+```
+
+`tls13c_new` that also offers the application protocols `alpn` (RFC
+7301; the ProtocolNameList without its length, each name behind a one-byte
+length, at most 256 bytes, empty for none; `tls13c_alpn` tells which one
+the server chose). With `verify` false a certificate chain that the roots
+do not vouch for, or that is for another name, is accepted (the server
+must still prove it holds the key of its certificate); `tls13c_verdict`
+then says what was wrong with it.
+
+Example:
+
+```bastio
+let r = balloc(32);
+let s = balloc(32);
+let k = balloc(32);
+let name = bfrom("example.com");
+let mut a = text_new();
+text_push(&mut a, 2);
+text_push_str(&mut a, "h2");
+let alpn = text_finish(a);
+let mut out = text_new();
+let c = tls13c_new_with(r, s, k, name, alpn, false, &mut out);
+let st = tls13c_state(c);
+let chosen = tls13c_alpn(c);
+let none = blen(chosen) == 0;
+bfree(chosen);
+tls13c_free(c);
+vec_free(out);
+bfree(alpn);
+bfree(name);
+bfree(k);
+bfree(s);
+bfree(r);
+if st != 0 || !none { return 1; }
+```
+
+### `tls13c_new_opts`
+
+```bastio
+fn tls13c_new_opts(random: &Bytes, session_id: &Bytes, priv_key: &Bytes, name: &Bytes, alpn: &Bytes, opts: u64, out: &mut Vec[u8]) -> Tls13Client
+  requires blen(random) == 32 && blen(session_id) == 32 && blen(priv_key) == 32 && blen(name) <= 255 && blen(alpn) <= 256
+  ensures tls13c_ok(result) && result.state == 0
+  ensures vlen(out) > vlen(old(out))
+```
+
+`tls13c_new_with` with options as bits: 1 accepts a chain the roots do not
+vouch for (`verify` false), 2 offers TLS 1.2 as well (for servers and
+proxies that do not speak TLS 1.3: ECDHE with X25519, AES-GCM or
+ChaCha20-Poly1305, the extended master secret when the server has it, no
+renegotiation; a TLS 1.3 server that is made to fall back is noticed by
+the value RFC 8446 puts at the end of its random).
+
+Example:
+
+```bastio
+let r = balloc(32);
+let s = balloc(32);
+let k = balloc(32);
+let name = bfrom("example.com");
+let alpn = balloc(0);
+let mut out = text_new();
+let c = tls13c_new_opts(r, s, k, name, alpn, 2, &mut out);
+let st = tls13c_state(c);
+let v = tls13c_version(c);
+tls13c_free(c);
+vec_free(out);
+bfree(alpn);
+bfree(name);
+bfree(k);
+bfree(s);
+bfree(r);
+if st != 0 || v != 772 { return 1; }
+```
+
+### `tls13c_blank`
+
+```bastio
+fn tls13c_blank() -> Tls13Client
+  ensures result.state == 7
+```
+
+A client that has already failed (state 7) and holds no keys or secrets:
+a placeholder for a slot whose connection is gone. Callers use it instead
+of building the struct, so new fields do not break them.
+
+Example:
+
+```bastio
+let c = tls13c_blank();
+let st = tls13c_state(c);
+tls13c_free(c);
+if st != 7 { return 1; }
+```
+
 ### `tls13c_free`
 
 ```bastio
@@ -102,6 +226,123 @@ fn tls13c_free(c: Tls13Client)
 ```
 
 Frees a client.
+
+### `tls13c_version`
+
+```bastio
+fn tls13c_version(c: &Tls13Client) -> u64
+```
+
+The protocol version in use: 772 (TLS 1.3), or 771 once a server chose
+TLS 1.2.
+
+Example:
+
+```bastio
+let c = tls13c_blank();
+let v = tls13c_version(c);
+tls13c_free(c);
+if v != 772 { return 1; }
+```
+
+### `tls13c_suite`
+
+```bastio
+fn tls13c_suite(c: &Tls13Client) -> u64
+```
+
+The cipher suite in use (its IANA number, 0x1301.. for TLS 1.3 or
+0xC02B.. for TLS 1.2); 0 before the ServerHello.
+
+Example:
+
+```bastio
+let c = tls13c_blank();
+let s = tls13c_suite(c);
+tls13c_free(c);
+if s != 0 { return 1; }
+```
+
+### `tls13c_check`
+
+```bastio
+fn tls13c_check(c: &Tls13Client) -> bool
+  ensures result ==> tls13c_ok(c)
+```
+
+Whether `c` has the sizes and states the other functions require
+(`tls13c_ok`): true for a client made by `tls13c_new` or
+`tls13c_new_with` and kept by these functions, false for a blank one.
+Callers that keep clients in a vector use it after taking one out.
+
+Example:
+
+```bastio
+let c = tls13c_blank();
+let ok = tls13c_check(c);
+tls13c_free(c);
+if ok { return 1; }
+```
+
+### `tls13c_alpn`
+
+```bastio
+fn tls13c_alpn(c: &Tls13Client) -> Bytes
+```
+
+The application protocol the server chose (a copy; empty when it chose
+none or has not answered yet).
+
+Example:
+
+```bastio
+let c = tls13c_blank();
+let a = tls13c_alpn(c);
+let n = blen(a);
+bfree(a);
+tls13c_free(c);
+if n != 0 { return 1; }
+```
+
+### `tls13c_verdict`
+
+```bastio
+fn tls13c_verdict(c: &Tls13Client) -> u64
+```
+
+0 when the server's certificate chain was checked and good; otherwise 10
+when only the host name is not the certificate's, or 6 (the code a client
+that verifies fails with in both cases; only a client made with `verify`
+false gets that far).
+
+Example:
+
+```bastio
+let c = tls13c_blank();
+let v = tls13c_verdict(c);
+tls13c_free(c);
+if v != 0 { return 1; }
+```
+
+### `tls13c_peer_cert`
+
+```bastio
+fn tls13c_peer_cert(c: &Tls13Client) -> Bytes
+```
+
+The server's own certificate (DER, a copy), once the client has it
+(state 3 or later); empty before.
+
+Example:
+
+```bastio
+let c = tls13c_blank();
+let p = tls13c_peer_cert(c);
+let n = blen(p);
+bfree(p);
+tls13c_free(c);
+if n != 0 { return 1; }
+```
 
 ### `tls13c_state`
 
@@ -216,6 +457,38 @@ bfree(r);
 if closed { return 1; }
 ```
 
+### `tls13c_shutdown`
+
+```bastio
+fn tls13c_shutdown(c: &mut Tls13Client, out: &mut Vec[u8]) -> bool
+  requires tls13c_ok(c)
+  ensures tls13c_ok(c)
+```
+
+Appends a close_notify alert to `out` and closes the sending side only:
+`tls13c_send` refuses from now on, but `tls13c_feed` still takes what the
+server sends until it closes too (state 6). False unless the handshake is
+complete (or it was already shut).
+
+Example:
+
+```bastio
+let r = balloc(32);
+let s = balloc(32);
+let k = balloc(32);
+let name = bfrom("example.com");
+let mut out = text_new();
+let mut c = tls13c_new(r, s, k, name, &mut out);
+let shut = tls13c_shutdown(&mut c, &mut out);
+tls13c_free(c);
+vec_free(out);
+bfree(name);
+bfree(k);
+bfree(s);
+bfree(r);
+if shut { return 1; }
+```
+
 ## Specification functions
 
 ### `tls13c_secrets`
@@ -241,6 +514,7 @@ spec fn tls13c_ok(c: &Tls13Client) -> bool {
     && blen(c.c_iv) == 12 && blen(c.s_iv) == 12
     && blen(c.name) <= 255
     && blen(c.transcript) < 1073741824 && blen(c.inbuf) < 1073741824 && blen(c.hsbuf) < 1073741824 && blen(c.leaf) < 1048576
+    && blen(c.alpn) <= 256 && blen(c.rnd) <= 64 && blen(c.ms) <= 48
 }
 ```
 
@@ -361,6 +635,28 @@ Internal: checks the Certificate message `msg` (with its header) for a
 server named `name` at time `now` against `roots`, and returns the
 server's own certificate if it is good.
 
+### `tls13c_chain_for`
+
+```bastio
+fn tls13c_chain_for(msg: &Bytes, name: &Bytes, check_name: bool, roots: &Bytes, now: u64) -> Option[Bytes]
+  requires blen(msg) < 1048576 && blen(name) <= 255 && blen(roots) < 274877906944
+  ensures result is Option::Some ==> blen(result.Some) < 1048576
+```
+
+Internal: `tls13c_chain`, with the check of the host name only when
+`check_name`.
+
+### `tls13c_first_cert`
+
+```bastio
+fn tls13c_first_cert(msg: &Bytes) -> Option[Bytes]
+  requires blen(msg) < 1048576
+  ensures result is Option::Some ==> blen(result.Some) < 1048576
+```
+
+Internal: the first certificate of the Certificate message `msg` (the
+server's own), if it is one x509_parse reads.
+
 ### `tls13c_all_zero`
 
 ```bastio
@@ -423,6 +719,15 @@ fn tls13c_server_hello(c: &mut Tls13Client, msg: &Bytes) -> u64
 ```
 
 Internal: handles a ServerHello `msg` (state 0).
+
+### `tls13c_offered`
+
+```bastio
+fn tls13c_offered(list: &Bytes, name: &Bytes) -> bool
+```
+
+Internal: whether `name` is one of the names of the ProtocolNameList
+contents `list` (each behind a one-byte length).
 
 ### `tls13c_encrypted_extensions`
 
@@ -539,3 +844,176 @@ fn tls13c_record(c: &mut Tls13Client, rec: &Bytes, roots: &Bytes, now: u64, out:
 ```
 
 Internal: handles one whole record `rec` (with its header).
+
+### `tls12c_hmac`
+
+```bastio
+fn tls12c_hmac(big: bool, key: &Bytes, msg: &Bytes) -> Bytes
+  ensures blen(result) == 32 || blen(result) == 48
+```
+
+Internal: an HMAC with SHA-384 when `big`, else with SHA-256.
+
+### `tls12c_prf`
+
+```bastio
+fn tls12c_prf(big: bool, secret: &Bytes, label: Str, seed: &Bytes, n: u64) -> Bytes
+  requires n <= 256 && slen(label) <= 64 && blen(seed) <= 1024
+  ensures blen(result) == n
+```
+
+Internal: the TLS 1.2 PRF (P_SHA256, or P_SHA384 when `big`): `n` bytes
+from `secret`, the `label` and `seed`.
+
+### `tls12c_aad`
+
+```bastio
+fn tls12c_aad(seq: u64, ty: u8, len: u64) -> Bytes
+  requires len < 65536
+  ensures blen(result) == 13
+```
+
+Internal: the additional data of a TLS 1.2 AEAD record: the sequence
+number, the type, the version and the length of the plaintext.
+
+### `tls12c_plain`
+
+```bastio
+fn tls12c_plain(out: &mut Vec[u8], ty: u8, body: &Bytes)
+  requires blen(body) < 65536
+```
+
+Internal: appends a TLS 1.2 record of type `ty` with `body` as it is.
+
+### `tls12c_seal`
+
+```bastio
+fn tls12c_seal(c: &mut Tls13Client, ty: u8, plain: &Bytes, out: &mut Vec[u8]) -> bool
+  requires tls13c_ok(c) && blen(plain) <= 16384
+  ensures tls13c_ok(c)
+```
+
+Internal: seals `plain` as a TLS 1.2 record of type `ty` with the
+client's keys (AES-GCM with the sequence number as the explicit nonce, or
+ChaCha20-Poly1305 with the nonce of RFC 7905) and appends it to `out`.
+
+### `tls12c_open`
+
+```bastio
+fn tls12c_open(c: &mut Tls13Client, rec: &Bytes) -> Option[Bytes]
+  requires tls13c_ok(c) && blen(rec) >= 5 && blen(rec) <= 16645
+  ensures tls13c_ok(c)
+  ensures result is Option::Some ==> blen(result.Some) <= 16640
+```
+
+Internal: opens the TLS 1.2 record `rec` (with its header) with the
+server's keys; the plaintext, or None if it is not genuine.
+
+### `tls12c_signed`
+
+```bastio
+fn tls12c_signed(leaf: &Bytes, scheme: u64, content: &Bytes, sig: &Bytes) -> bool
+  requires blen(content) < 1048576 && blen(sig) < 65536 && blen(leaf) < 1048576
+```
+
+Internal: does the signature `sig` with the scheme `scheme` (a TLS
+SignatureScheme) over `content` check out with the key of the
+certificate `leaf`?
+
+### `tls12c_server_hello`
+
+```bastio
+fn tls12c_server_hello(c: &mut Tls13Client, msg: &Bytes) -> u64
+  requires tls13c_ok(c) && blen(msg) < 1048576
+  ensures tls13c_ok(c)
+```
+
+Internal: the ServerHello `msg` if it is one for TLS 1.2 (no
+supported_versions extension); returns 1000 when it is not, for the TLS
+1.3 path to take it.
+
+### `tls12c_certificate`
+
+```bastio
+fn tls12c_certificate(c: &mut Tls13Client, msg: &Bytes, roots: &Bytes, now: u64) -> u64
+  requires tls13c_ok(c) && blen(msg) < 1048576 && blen(roots) < 274877906944
+  ensures tls13c_ok(c)
+```
+
+Internal: the TLS 1.2 Certificate `msg`, checked as `tls13c_certificate`
+checks a TLS 1.3 one (it is rewritten in that form first).
+
+### `tls12c_key_exchange`
+
+```bastio
+fn tls12c_key_exchange(c: &mut Tls13Client, msg: &Bytes) -> u64
+  requires tls13c_ok(c) && blen(msg) < 1048576
+  ensures tls13c_ok(c)
+```
+
+Internal: the ServerKeyExchange `msg`: an X25519 share signed with the
+key of the server's certificate over both randoms and the parameters.
+
+### `tls12c_keys`
+
+```bastio
+fn tls12c_keys(c: &mut Tls13Client)
+  requires tls13c_ok(c) && blen(c.rnd) == 64 && blen(c.ms) == 48
+  ensures tls13c_ok(c)
+```
+
+Internal: the key block from the master secret: the write keys and IVs
+(an AES-GCM salt of 4 bytes is kept as the first 4 of 12, then zeros, so
+tls13_nonce puts the sequence number behind it).
+
+### `tls12c_hello_done`
+
+```bastio
+fn tls12c_hello_done(c: &mut Tls13Client, msg: &Bytes, out: &mut Vec[u8]) -> u64
+  requires tls13c_ok(c) && blen(msg) < 1048576
+  ensures tls13c_ok(c)
+```
+
+Internal: the ServerHelloDone `msg`: the client sends its share, changes
+to the new keys and sends its Finished.
+
+### `tls12c_finished`
+
+```bastio
+fn tls12c_finished(c: &mut Tls13Client, msg: &Bytes) -> u64
+  requires tls13c_ok(c) && blen(msg) < 1048576
+  ensures tls13c_ok(c)
+```
+
+Internal: the server's Finished `msg` (after its ChangeCipherSpec).
+
+### `tls12c_message`
+
+```bastio
+fn tls12c_message(c: &mut Tls13Client, msg: &Bytes, roots: &Bytes, now: u64, out: &mut Vec[u8]) -> u64
+  requires tls13c_ok(c) && blen(msg) < 1048576 && blen(roots) < 274877906944
+  ensures tls13c_ok(c)
+```
+
+Internal: a handshake message for a client that offered TLS 1.2 (the
+ServerHello, then the TLS 1.2 flight when the server chose it).
+
+### `tls12c_handshake_data`
+
+```bastio
+fn tls12c_handshake_data(c: &mut Tls13Client, plain: &Bytes, roots: &Bytes, now: u64, out: &mut Vec[u8]) -> u64
+  requires tls13c_ok(c) && blen(plain) <= 16640 && blen(roots) < 274877906944
+  ensures tls13c_ok(c)
+```
+
+Internal: handshake bytes for `tls12c_message`, cut into messages.
+
+### `tls12c_record`
+
+```bastio
+fn tls12c_record(c: &mut Tls13Client, rec: &Bytes, roots: &Bytes, now: u64, out: &mut Vec[u8], app: &mut Vec[u8]) -> u64
+  requires tls13c_ok(c) && blen(rec) >= 5 && blen(rec) <= 16645 && blen(roots) < 274877906944
+  ensures tls13c_ok(c)
+```
+
+Internal: one whole record `rec` for a client that is in TLS 1.2.
