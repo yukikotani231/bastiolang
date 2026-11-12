@@ -557,3 +557,50 @@ fn net_random(h: &Host, n: u64) -> Option[Bytes]
   bfree(buf);
   return Option[Bytes]::None;
 }
+
+/// Connects to the Unix domain socket at `path` (1 to 107 bytes, no NUL
+/// byte), giving up after `ms` milliseconds (0 means no limit). On Linux a
+/// path that starts with `@` names an abstract socket: the `@` becomes the
+/// NUL byte of the kernel's name (`@/tmp/.X11-unix/X0` is the X server's).
+/// `None` when nothing listens there, the path is too long or the host has no
+/// Unix sockets (Windows, WebAssembly). The socket is read and written with
+/// `net_recv`, `net_send_all` and `net_close` like a TCP one.
+/// ```
+/// let p = bfrom("/no/such/socket");
+/// match net_connect_unix(host, p, 1000) {
+///   Option::Some(s) => { net_close(host, s); bfree(p); return 1; },
+///   Option::None => {},
+/// }
+/// bfree(p);
+/// ```
+fn net_connect_unix(h: &Host, path: &Bytes, ms: u64) -> Option[u64] {
+  let mut p = bytes_slice(path, 0, blen(path));
+  let limit = ms % 3600001;
+  let r = host_net(h, 17, 0, limit * 65536, &mut p);
+  bfree(p);
+  if r == 18446744073709551615 {
+    return Option[u64]::None;
+  }
+  return Option[u64]::Some(r);
+}
+
+/// Listens on the Unix domain socket at `path` (as `net_connect_unix` reads
+/// it); a socket file that is already there makes it fail, so remove it first
+/// with `os_unlink` (an abstract socket leaves none). Accept with `net_accept`.
+/// ```
+/// let p = bfrom("/no/such/dir/socket");
+/// match net_listen_unix(host, p) {
+///   Option::Some(l) => { net_close(host, l); bfree(p); return 1; },
+///   Option::None => {},
+/// }
+/// bfree(p);
+/// ```
+fn net_listen_unix(h: &Host, path: &Bytes) -> Option[u64] {
+  let mut p = bytes_slice(path, 0, blen(path));
+  let r = host_net(h, 18, 0, 0, &mut p);
+  bfree(p);
+  if r == 18446744073709551615 {
+    return Option[u64]::None;
+  }
+  return Option[u64]::Some(r);
+}

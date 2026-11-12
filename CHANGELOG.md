@@ -15,6 +15,7 @@ What will be 0.2.0.
 
 ### Tools
 
+- `host_net` gets `17` and `18` (connect to, and listen on, a Unix domain socket by path, with `@name` for a Linux abstract socket), wrapped by `net_connect_unix` and `net_listen_unix` in `std/net.bastio`: a hayate-style `net.connect({path})`, or the X server at `@/tmp/.X11-unix/X0`. Stage1 only, C backend; Windows fails them. `prelude net` grows by about 35 lines. `tests/pass/host_net_unix.bastio`.
 - `code_build` plans get double-precision items on the same registers (their bits): `FALU` (add, sub, mul, div), `FUN` (sqrt, neg, abs, integer to double, double to integer) and `FCMPBR` (compare and branch, false for a NaN except `ne`). Stage1 only, C backend, x86-64; `prelude code` grows by about 60 lines. `tests/pass/code_f64.bastio`.
 - `core/ed25519`: `ed25519_public(seed)` (key derivation, which is also key generation from 32 random bytes) and `ed25519_sign(seed, msg)` (RFC 8032 sections 5.1.5 and 5.1.6), beside `ed25519_verify`. Proved memory safe like the rest of core; not constant time, so not for secrets a local attacker can time. `tests/pass/core_ed25519_sign.bastio` (RFC 8032 tests 1 and 2 byte for byte).
 - `host_sys` gets `34` (hard link), `35` (set access and modification times of a path, in nanoseconds) and `36` (fchmod), wrapped by `os_link`, `os_utimes` and `os_fchmod` in `std/os.bastio`; the three fail on Windows where there is no equivalent (`35` uses `_utime`, second resolution). Stage1 only, C backend. `tests/pass/host_sys.bastio`.
