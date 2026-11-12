@@ -66,7 +66,7 @@ struct Tls13Client {
   inbuf: Bytes, hsbuf: Bytes, leaf: Bytes,
   verify: bool, verdict: u64, alpn: Bytes, sent_close: bool,
   allow12: bool, v12: bool, step: u64, rnd: Bytes, ms: Bytes, ems: bool, cs12: u64,
-  sk_kind: u64, sk_a: Bytes, sk_b: Bytes, group: u64, retried: bool
+  sk_kind: u64, sk_a: Bytes, sk_b: Bytes, group: u64, retried: bool, defer_name: bool
 }
 
 /// Internal: the handshake and traffic secrets of `c` all have `n` bytes, the
@@ -187,10 +187,13 @@ fn tls13c_new_with(random: &Bytes, session_id: &Bytes, priv_key: &Bytes, name: &
 
 /// `tls13c_new_with` with options as bits: 1 accepts a chain the roots do not
 /// vouch for (`verify` false), 2 offers TLS 1.2 as well (for servers and
-/// proxies that do not speak TLS 1.3: ECDHE with X25519, AES-GCM or
-/// ChaCha20-Poly1305, the extended master secret when the server has it, no
-/// renegotiation; a TLS 1.3 server that is made to fall back is noticed by
-/// the value RFC 8446 puts at the end of its random).
+/// proxies that do not speak TLS 1.3: ECDHE with X25519, P-256 or P-384,
+/// AES-GCM or ChaCha20-Poly1305, the extended master secret when the server
+/// has it, no renegotiation; a TLS 1.3 server that is made to fall back is
+/// noticed by the value RFC 8446 puts at the end of its random), 4 checks
+/// the chain but leaves the host name to the caller: a chain the roots vouch
+/// for that is for another name goes on with `tls13c_verdict` 10, so the
+/// caller can apply its own rule (node:tls's checkServerIdentity).
 /// ```
 /// let r = balloc(32);
 /// let s = balloc(32);
@@ -238,7 +241,7 @@ fn tls13c_new_opts(random: &Bytes, session_id: &Bytes, priv_key: &Bytes, name: &
     inbuf: balloc(0), hsbuf: balloc(0), leaf: balloc(0),
     verify: (opts & 1) == 0, verdict: 0, alpn: bytes_slice(alpn, 0, blen(alpn)), sent_close: false,
     allow12: allow12, v12: false, step: 0, rnd: bytes_slice(random, 0, 32), ms: balloc(0), ems: false, cs12: 0,
-    sk_kind: 0, sk_a: balloc(0), sk_b: balloc(0), group: 29, retried: false
+    sk_kind: 0, sk_a: balloc(0), sk_b: balloc(0), group: 29, retried: false, defer_name: (opts & 4) != 0
   };
 }
 
@@ -263,7 +266,7 @@ fn tls13c_blank() -> Tls13Client
     inbuf: balloc(0), hsbuf: balloc(0), leaf: balloc(0),
     verify: true, verdict: 0, alpn: balloc(0), sent_close: false,
     allow12: false, v12: false, step: 0, rnd: balloc(0), ms: balloc(0), ems: false, cs12: 0,
-    sk_kind: 0, sk_a: balloc(0), sk_b: balloc(0), group: 29, retried: false
+    sk_kind: 0, sk_a: balloc(0), sk_b: balloc(0), group: 29, retried: false, defer_name: false
   };
 }
 
@@ -366,7 +369,7 @@ fn tls13c_alpn(c: &Tls13Client) -> Bytes {
 /// 0 when the server's certificate chain was checked and good; otherwise 10
 /// when only the host name is not the certificate's, or 6 (the code a client
 /// that verifies fails with in both cases; only a client made with `verify`
-/// false gets that far).
+/// false gets that far, or with option 4 for 10).
 /// ```
 /// let c = tls13c_blank();
 /// let v = tls13c_verdict(c);
@@ -998,28 +1001,8 @@ fn tls13c_certificate(c: &mut Tls13Client, msg: &Bytes, roots: &Bytes, now: u64)
   requires tls13c_ok(c) && blen(msg) < 1048576 && blen(roots) < 274877906944
   ensures tls13c_ok(c)
 {
-  match tls13c_chain(msg, c.name, roots, now) {
-    Option::None => {
-      if c.verify { return tls13c_fail(&mut c, 6); }
-      // Not verified, as the caller asked: go on with the server's own
-      // certificate, whose key must still sign the CertificateVerify.
-      match tls13c_first_cert(msg) {
-        Option::None => { return tls13c_fail(&mut c, 6); },
-        Option::Some(leaf) => {
-          bfree(c.leaf);
-          c.leaf = leaf;
-          // 10 when only the name is wrong (the chain itself is good).
-          c.verdict = 6;
-          match tls13c_chain_for(msg, c.name, false, roots, now) {
-            Option::Some(l2) => { bfree(l2); c.verdict = 10; },
-            Option::None => {},
-          }
-          if !tls13c_note(&mut c, msg) { return tls13c_fail(&mut c, 1); }
-          c.state = 3;
-          return 0;
-        },
-      }
-    },
+  match tls13c_leaf_for(&mut c, msg, roots, now) {
+    Option::None => { return tls13c_fail(&mut c, 6); },
     Option::Some(leaf) => {
       bfree(c.leaf);
       c.leaf = leaf;
@@ -1028,6 +1011,35 @@ fn tls13c_certificate(c: &mut Tls13Client, msg: &Bytes, roots: &Bytes, now: u64)
       return 0;
     },
   }
+}
+
+/// Internal: the server's certificate from the Certificate message `msg`
+/// (in the TLS 1.3 form), or `None` when the client refuses it. A chain the
+/// roots vouch for and that names the server gives verdict 0. One the roots
+/// vouch for but for another name is refused, unless the client leaves the
+/// name to its caller (`defer_name`) or does not verify: verdict 10. Any
+/// other chain is refused by a verifying client, and gives verdict 6
+/// otherwise (the server's own certificate, whose key must still sign).
+fn tls13c_leaf_for(c: &mut Tls13Client, msg: &Bytes, roots: &Bytes, now: u64) -> Option[Bytes]
+  requires tls13c_ok(c) && blen(msg) < 1048576 && blen(roots) < 274877906944
+  ensures tls13c_ok(c)
+  ensures result is Option::Some ==> blen(result.Some) < 1048576
+{
+  match tls13c_chain(msg, c.name, roots, now) {
+    Option::Some(l) => { return Option[Bytes]::Some(l); },
+    Option::None => {},
+  }
+  if c.verify && !c.defer_name { return Option[Bytes]::None; }
+  match tls13c_chain_for(msg, c.name, false, roots, now) {
+    Option::Some(l2) => {
+      c.verdict = 10;
+      return Option[Bytes]::Some(l2);
+    },
+    Option::None => {},
+  }
+  if c.verify { return Option[Bytes]::None; }
+  c.verdict = 6;
+  return tls13c_first_cert(msg);
 }
 
 /// Internal: what the server signs in its CertificateVerify (RFC 8446
@@ -1821,24 +1833,9 @@ fn tls12c_certificate(c: &mut Tls13Client, msg: &Bytes, roots: &Bytes, now: u64)
   if blen(m13) >= 1048576 { bfree(m13); return tls13c_fail(&mut c, 1); }
   let mut leaf = balloc(0);
   let mut good = false;
-  match tls13c_chain(m13, c.name, roots, now) {
+  match tls13c_leaf_for(&mut c, m13, roots, now) {
     Option::Some(l) => { bfree(leaf); leaf = l; good = true; },
     Option::None => {},
-  }
-  if !good && !c.verify {
-    match tls13c_first_cert(m13) {
-      Option::Some(l) => {
-        bfree(leaf);
-        leaf = l;
-        good = true;
-        c.verdict = 6;
-        match tls13c_chain_for(m13, c.name, false, roots, now) {
-          Option::Some(l2) => { bfree(l2); c.verdict = 10; },
-          Option::None => {},
-        }
-      },
-      Option::None => {},
-    }
   }
   bfree(m13);
   if !good { bfree(leaf); return tls13c_fail(&mut c, 6); }
