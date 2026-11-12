@@ -90,6 +90,7 @@ Each module has a reference page, generated from its source: every function with
 | [`core/wtext.bastio`](lib/core-wtext.md) | Text kept as a `Vec[u64]`, one character a word. |
 | [`core/x25519.bastio`](lib/core-x25519.md) | X25519, the Diffie-Hellman function on Curve25519 (RFC 7748), with field elements of 16 limbs of 16 bits in the style of TweetNaCl. |
 | [`core/x509.bastio`](lib/core-x509.md) | Reading X.509 certificates (RFC 5280) and checking their signatures, for the chain a TLS 1.3 server sends. |
+| [`std/display.bastio`](lib/std-display.md) | Windows, a frame buffer and input events, for programs on the hosted target, over the `host_display` builtin. |
 | [`std/dns.bastio`](lib/std-dns.md) | The IPv4 or IPv6 address of a host name, for programs on the hosted target. |
 | [`std/f64.bastio`](lib/std-f64.md) | IEEE 754 double-precision numbers (binary64) for programs on the hosted target. |
 | [`std/host.bastio`](lib/std-host.md) | The command line, files and standard error, for programs on the hosted target. |

@@ -85,6 +85,7 @@
   - [std/f64.bastio](lib-std-f64.md)
   - [std/host.bastio](lib-std-host.md)
   - [std/net.bastio](lib-std-net.md)
+  - [std/display.bastio](lib-std-display.md)
   - [std/os.bastio](lib-std-os.md)
   - [std/http.bastio](lib-std-http.md)
   - [std/https.bastio](lib-std-https.md)
