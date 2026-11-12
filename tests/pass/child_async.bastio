@@ -1,0 +1,101 @@
+// expect-exit: 0
+// stage1-only: child_fd, child_try_read and child_try_wait
+// backend: c
+// A child driven without blocking: poll its pipes and its status.
+
+fn arg(v: &mut Vec[Bytes], s: Str) {
+  vec_push(&mut v, bfrom(s));
+}
+
+fn drop_args(v: Vec[Bytes]) {
+  let mut w = v;
+  while vec_len(w) > 0 {
+    bfree(vec_pop(&mut w));
+  }
+  vec_free(w);
+}
+
+fn main(h: &mut Host) -> u64 {
+  let mut bad = 0;
+
+  // sh waits for a line on its input, then answers on both streams and exits 3.
+  let mut argv = vec_new[Bytes]();
+  arg(&mut argv, "sh");
+  arg(&mut argv, "-c");
+  arg(&mut argv, "read x; echo out-$x; echo err-$x >&2; exit 3");
+  let mut c = host_spawn_err(h, argv);
+  drop_args(argv);
+  let mut chunk = balloc(0);
+
+  if child_fd(c, 1) == 18446744073709551615 || child_fd(c, 2) == 18446744073709551615 {
+    bad = wrap_add(bad, 1);
+  }
+  // Nothing has been written yet: nothing to read, and the child still runs.
+  if child_try_read(&mut c, 1, &mut chunk) != 1 {
+    bad = wrap_add(bad, 1);
+  }
+  if child_try_wait(c) != 256 {
+    bad = wrap_add(bad, 1);
+  }
+
+  let msg = bfrom("a\n");
+  if !child_write(&mut c, msg) {
+    bad = wrap_add(bad, 1);
+  }
+  bfree(msg);
+  // Poll until stdout shows the answer.
+  let mut got = 0;
+  let mut spins = 0;
+  while got == 0 && spins < 20000000
+    invariant spins <= 20000000
+  {
+    let r = child_try_read(&mut c, 1, &mut chunk);
+    if r == 0 {
+      got = 1;
+      if blen(chunk) != 6 || bget(chunk, 0) != 111 {
+        bad = wrap_add(bad, 1);
+      }
+    } else if r == 2 {
+      got = 2;
+      bad = wrap_add(bad, 1);
+    } else {
+    }
+    spins = spins + 1;
+  }
+  if got != 1 {
+    bad = wrap_add(bad, 1);
+  }
+  // Stderr has its line too.
+  let mut e = child_try_read(&mut c, 2, &mut chunk);
+  spins = 0;
+  while e == 1 && spins < 20000000
+    invariant spins <= 20000000
+  {
+    e = child_try_read(&mut c, 2, &mut chunk);
+    spins = spins + 1;
+  }
+  if e != 0 || blen(chunk) != 6 {
+    bad = wrap_add(bad, 1);
+  }
+  // The child exits; try_wait reports 3 and does not reap, so wait still works.
+  let mut st = child_try_wait(c);
+  spins = 0;
+  while st == 256 && spins < 20000000
+    invariant spins <= 20000000
+  {
+    st = child_try_wait(c);
+    spins = spins + 1;
+  }
+  if st != 3 {
+    bad = wrap_add(bad, 1);
+  }
+  // The streams end.
+  if child_try_read(&mut c, 1, &mut chunk) != 2 {
+    bad = wrap_add(bad, 1);
+  }
+  if child_wait(c) != 3 {
+    bad = wrap_add(bad, 1);
+  }
+  bfree(chunk);
+  return bad;
+}

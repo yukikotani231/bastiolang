@@ -26,6 +26,13 @@ listener, a closed descriptor, an address in use) gives `Option::None` or
 | [`net_shutdown_send`](#net_shutdown_send) | Shuts down the sending direction of a connected socket. |
 | [`net_connect_start`](#net_connect_start) | Starts a connection to `ip`:`port` without waiting for it. |
 | [`net_connect_result`](#net_connect_result) | The outcome of a connection started with `net_connect_start`, once the socket is writable. |
+| [`net_listen6`](#net_listen6) | Listens on the IPv6 address `ip` (16 bytes, network order; all zeros is the wildcard, which also takes IPv4 clients) and `port` (0. |
+| [`net_udp_open`](#net_udp_open) | A non-blocking UDP socket bound to the IPv4 address `ip` and `port` (0. |
+| [`net_udp_send`](#net_udp_send) | Sends `data` as one datagram from the UDP socket `sock` to `ip`:`port`. |
+| [`net_udp_recv`](#net_udp_recv) | Receives one datagram of at most `max` bytes (at most 65535) into `out` (replacing it) without waiting. |
+| [`net_udp_from_ip`](#net_udp_from_ip) | The sender's IPv4 address in an answer of `net_udp_recv`. |
+| [`net_udp_from_port`](#net_udp_from_port) | The sender's port in an answer of `net_udp_recv`. |
+| [`net_udp_len`](#net_udp_len) | The datagram's length in an answer of `net_udp_recv`. |
 | [`net_now`](#net_now) | The time in seconds since 1970-01-01 UTC, from the system clock (0 if there is none). |
 | [`net_random`](#net_random) | `n` random bytes (at most 256) from the system's source (`/dev/urandom`, `RtlGenRandom`, `crypto.getRandomValues`), or `None` when there is none. |
 
@@ -401,6 +408,160 @@ Example:
 ```bastio
 // A descriptor that is not a socket cannot be asked.
 if net_connect_result(host, 99999) != 18446744073709551615 { return 1; }
+```
+
+### `net_listen6`
+
+```bastio
+fn net_listen6(h: &Host, ip: &Bytes, port: u64) -> Option[u64]
+```
+
+Listens on the IPv6 address `ip` (16 bytes, network order; all zeros is
+the wildcard, which also takes IPv4 clients) and `port` (0: any free
+port). `None` if `ip` is not 16 bytes, the host has no IPv6, the address
+is in use, or the target has no such call (only the Linux C backend has it).
+
+Example:
+
+```bastio
+let any = balloc(16);
+match net_listen6(host, any, 0) {
+  Option::Some(l) => {
+    if net_port(host, l) == 0 { bfree(any); return 1; }
+    net_close(host, l);
+  },
+  Option::None => {},
+}
+bfree(any);
+```
+
+### `net_udp_open`
+
+```bastio
+fn net_udp_open(h: &Host, ip: u64, port: u64) -> Option[u64]
+```
+
+A non-blocking UDP socket bound to the IPv4 address `ip` and `port` (0:
+any free port; read it with `net_port`). `None` if it cannot be made or
+bound, or on targets without UDP (only the Linux C backend has it).
+
+Example:
+
+```bastio
+match net_udp_open(host, net_ip4(127, 0, 0, 1), 0) {
+  Option::Some(u) => {
+    if net_port(host, u) == 0 { return 1; }
+    net_close(host, u);
+  },
+  Option::None => {},
+}
+```
+
+### `net_udp_send`
+
+```bastio
+fn net_udp_send(h: &Host, sock: u64, ip: u64, port: u64, data: &Bytes) -> Option[u64]
+```
+
+Sends `data` as one datagram from the UDP socket `sock` to `ip`:`port`.
+The count sent, or `None` on failure (no socket, a datagram that is too
+large).
+
+Example:
+
+```bastio
+let lo = net_ip4(127, 0, 0, 1);
+match net_udp_open(host, lo, 0) {
+  Option::Some(a) => {
+    match net_udp_open(host, lo, 0) {
+      Option::Some(b) => {
+        let msg = bfrom("ping");
+        let mut bad = 1;
+        match net_udp_send(host, a, lo, net_port(host, b), msg) {
+          Option::Some(n) => { if n == 4 { bad = 0; } },
+          Option::None => {},
+        }
+        bfree(msg);
+        if bad != 0 { net_close(host, b); net_close(host, a); return 1; }
+        net_close(host, b);
+      },
+      Option::None => {},
+    }
+    net_close(host, a);
+  },
+  Option::None => {},
+}
+```
+
+### `net_udp_recv`
+
+```bastio
+fn net_udp_recv(h: &Host, sock: u64, max: u64, out: &mut Bytes) -> Option[u64]
+```
+
+Receives one datagram of at most `max` bytes (at most 65535) into `out`
+(replacing it) without waiting. The answer packs the sender's IPv4 address
+(`net_udp_from_ip`), port (`net_udp_from_port`) and the length
+(`net_udp_len`); `None` when nothing is waiting or on failure.
+
+Example:
+
+```bastio
+let lo = net_ip4(127, 0, 0, 1);
+match net_udp_open(host, lo, 0) {
+  Option::Some(a) => {
+    let mut got = balloc(0);
+    match net_udp_recv(host, a, 64, &mut got) {
+      Option::Some(p) => { bfree(got); return 1; },
+      Option::None => {},
+    }
+    bfree(got);
+    net_close(host, a);
+  },
+  Option::None => {},
+}
+```
+
+### `net_udp_from_ip`
+
+```bastio
+fn net_udp_from_ip(packed: u64) -> u64
+```
+
+The sender's IPv4 address in an answer of `net_udp_recv`.
+
+Example:
+
+```bastio
+if net_udp_from_ip(72623859711344645) != net_ip4(1, 2, 3, 4) { return 1; }
+```
+
+### `net_udp_from_port`
+
+```bastio
+fn net_udp_from_port(packed: u64) -> u64
+```
+
+The sender's port in an answer of `net_udp_recv`.
+
+Example:
+
+```bastio
+if net_udp_from_port(72623859711344645) != 80 { return 1; }
+```
+
+### `net_udp_len`
+
+```bastio
+fn net_udp_len(packed: u64) -> u64
+```
+
+The datagram's length in an answer of `net_udp_recv`.
+
+Example:
+
+```bastio
+if net_udp_len(72623859711344645) != 5 { return 1; }
 ```
 
 ### `net_now`

@@ -1,0 +1,242 @@
+// expect-exit: 0
+// core/tls13server against core/tls13client in memory: the handshake with an
+// ECDSA P-256 and an RSA certificate (made by OpenSSL under one P-256 root),
+// ALPN (the server's choice among the client's), the server name, data both
+// ways and close_notify; a client that also offers TLS 1.2 still gets TLS 1.3;
+// a server whose key does not match its certificate fails the client's
+// CertificateVerify check, a client that trusts another root refuses it, and
+// and a server with no chain, or an ECDSA key behind an RSA certificate, fails.
+import "core/tls13server.bastio";
+
+/// The value of the hex digit `c` (0 for anything else).
+fn nib(c: u8) -> u8
+  ensures result < 16
+{
+  if c >= 48 && c <= 57 { return c - 48; }
+  if c >= 97 && c <= 102 { return c - 87; }
+  return 0;
+}
+
+/// The bytes written as hex digits in `s`.
+fn unhex(s: Str) -> Bytes
+  requires slen(s) < 100000
+  ensures blen(result) == slen(s) / 2
+{
+  let n = slen(s) / 2;
+  let mut b = balloc(n);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && blen(b) == n && slen(s) >= 2 * n
+  {
+    bset(&mut b, i, nib(sget(s, 2 * i)) * 16 + nib(sget(s, 2 * i + 1)));
+    i = i + 1;
+  }
+  return b;
+}
+
+fn ca_der() -> Bytes
+  ensures blen(result) < 50000
+{
+  return unhex("3082018a30820131a003020102021430d9fb6588b50e15619a6797dc2da2ae93c958dd300a06082a8648ce3d04030230123110300e06035504030c07546573742043413020170d3236313131313036343334375a180f32313236313031383036343334375a30123110300e06035504030c07546573742043413059301306072a8648ce3d020106082a8648ce3d03010703420004f60988a76c87a5b4ecc9a58621220cd23f1988b6ad71ebc773152d557eaf1390fe46ac82ae6d9ccb2fcfdcabe3a1a578502008bda3e2629b06c6d6a91fbf6e8fa3633061301d0603551d0e04160414586230a8bc3d19f1ebd38807d05e3bab686ba411301f0603551d23041830168014586230a8bc3d19f1ebd38807d05e3bab686ba411300f0603551d130101ff040530030101ff300e0603551d0f0101ff040403020106300a06082a8648ce3d0403020347003044022004154afcb1c24b52053123585668421a5b8fba3d06dcd283943ccec112d467cd02202d5490641bf6dcdc52ec0a4f6701eaa7f31a0a85c5e4543fcfea8bf4ec0c9833");
+}
+
+fn ec_der() -> Bytes
+  ensures blen(result) < 50000
+{
+  return unhex("308201a030820146a0030201020214520555f93cdb7a6e6ff5179babbde72976b604a8300a06082a8648ce3d04030230123110300e06035504030c07546573742043413020170d3236313131313036343334375a180f32313236313031383036343334375a30143112301006035504030c096c6f63616c686f73743059301306072a8648ce3d020106082a8648ce3d030107034200046bfcf9b193fcee2d07c460b62420cf780e90d66e6c44ef4c518e4a6acc9f7f152dea7cbbe0520a14fa820fe3e15f2d5ae02a1c561c7a972a80aa5ab2b4c0a43aa3763074300c0603551d130101ff04023000300e0603551d0f0101ff04040302078030140603551d11040d300b82096c6f63616c686f7374301d0603551d0e04160414b0246ff1b27895f81b9404dac9fedc6977ca88c0301f0603551d23041830168014586230a8bc3d19f1ebd38807d05e3bab686ba411300a06082a8648ce3d0403020348003045022100e27452e49c847c620707eee216016dbb43a341ce51826358c686ce0a39663cbb0220217dcb0d170ca3ddd753a717055b8aae57638880dcffddff4cdb37e98028b8d6");
+}
+
+fn rsa_der() -> Bytes
+  ensures blen(result) < 50000
+{
+  return unhex("3082026b30820211a0030201020214520555f93cdb7a6e6ff5179babbde72976b604a9300a06082a8648ce3d04030230123110300e06035504030c07546573742043413020170d3236313131313036343334375a180f32313236313031383036343334375a30143112301006035504030c096c6f63616c686f737430820122300d06092a864886f70d01010105000382010f003082010a0282010100eb8bce5501fdb4091863c894ff5bac97d5b0e447b59b687c9350ba472c9c834922ea18befd37bd63e98b6a899eca82441cfe3f9e6be083f94984bbbe0903f476dab33c3a08da342a65b85d4cf61d355d84a07f09a6d7b63b788a237127091a71dff05326899db6c40ec085c9c27062b3b524f478c8b6c6879a1b21684be95cba6821f61a37b9ab9e5dfeeba216ca27c524b6d94a8a7f2c99181185e488535a88918a151ab435608712d33c70898fcd626fbda9a85e4ab41d40e3fc7917b77f1c1b6dcf0146ddbcbeee11cdc79b351378ca27f740b0101bcd1b94f015429d2b94bdc79fb3450f4258a3b1ce38e90d644000b75c31246c15d4a9fa9d8e3ae490690203010001a3763074300c0603551d130101ff04023000300e0603551d0f0101ff04040302078030140603551d11040d300b82096c6f63616c686f7374301d0603551d0e04160414248d71e1c3ce24181e4511dab10e675e9ebc011f301f0603551d23041830168014586230a8bc3d19f1ebd38807d05e3bab686ba411300a06082a8648ce3d04030203480030450221008f85913c80649527775a6ccd1018a494392a018906ad4d94aba27f0d7e2aeb91022034b95b733732af123816cc5c7640eb73afd8efddd56d8ac400505dbf59beb469");
+}
+
+fn ec_d() -> Bytes
+  ensures blen(result) < 50000
+{
+  return unhex("3a69f81853cc8fc895509a3512ce7aabf8861f070048f32043bc6e43fada886c");
+}
+
+fn rsa_n() -> Bytes
+  ensures blen(result) < 50000
+{
+  return unhex("eb8bce5501fdb4091863c894ff5bac97d5b0e447b59b687c9350ba472c9c834922ea18befd37bd63e98b6a899eca82441cfe3f9e6be083f94984bbbe0903f476dab33c3a08da342a65b85d4cf61d355d84a07f09a6d7b63b788a237127091a71dff05326899db6c40ec085c9c27062b3b524f478c8b6c6879a1b21684be95cba6821f61a37b9ab9e5dfeeba216ca27c524b6d94a8a7f2c99181185e488535a88918a151ab435608712d33c70898fcd626fbda9a85e4ab41d40e3fc7917b77f1c1b6dcf0146ddbcbeee11cdc79b351378ca27f740b0101bcd1b94f015429d2b94bdc79fb3450f4258a3b1ce38e90d644000b75c31246c15d4a9fa9d8e3ae49069");
+}
+
+fn rsa_d() -> Bytes
+  ensures blen(result) < 50000
+{
+  return unhex("4cb237ab975be030ebf7a5bada5123e846a4f417e36ae88153c87ff727f008919a64464d7e0f15c48029acb585f663a741178a688fb0c9d834979b381c20650c0457433f945d548a0f98120d3ac034fdafef409e486cc9c220943e491c504b03944ae11055d3fc4c678f49a0f2067d250dd12c275e17a19a4ad415b32bb09f47d530ddc687149d7042b6e4313c7cdb7d43c9420744799a22b6f033f584c55d5ab52ed6f38fbfb30f8a5c7986c0b88635d346cd4d0d05268bd6dd346b566761c01acb881e074d18a482fb3a381430e2a8ee1f99271f07ccc348f350606bd95dc7b506af9815bf63800f8be9592455909194abd133bb737f903bca67f1ae117a2f");
+}
+
+/// 32 bytes of the value `v`.
+fn fill(v: u8) -> Bytes
+  requires v < 200
+  ensures blen(result) == 32
+{
+  let mut b = balloc(32);
+  let mut i = 0;
+  while i < 32
+    invariant i <= 32 && blen(b) == 32
+  {
+    bset(&mut b, i, v + cast[u8](i));
+    i = i + 1;
+  }
+  return b;
+}
+
+/// Passes the flights between the client `c` and the server `s`, starting
+/// with `first` from the client, until both are connected or one failed.
+fn pump(c: &mut Tls13Client, s: &mut Tls13Client, first: Bytes, roots: &Bytes)
+  requires tls13c_ok(c) && tls13c_ok(s) && blen(roots) < 1048576
+  ensures tls13c_ok(c) && tls13c_ok(s)
+{
+  let mut to_s = first;
+  let mut rounds = 0;
+  while rounds < 10
+    invariant tls13c_ok(c) && tls13c_ok(s) && blen(roots) < 1048576
+  {
+    rounds = rounds + 1;
+    let mut sout = text_new();
+    let mut sapp = text_new();
+    if blen(to_s) < 1048576 { tls13s_feed(&mut s, to_s, &mut sout, &mut sapp); }
+    bfree(to_s);
+    vec_free(sapp);
+    let to_c = text_finish(sout);
+    let mut cout = text_new();
+    let mut capp = text_new();
+    if blen(to_c) < 1048576 { tls13c_feed(&mut c, to_c, roots, 1800000000, &mut cout, &mut capp); }
+    bfree(to_c);
+    vec_free(capp);
+    to_s = text_finish(cout);
+  }
+  bfree(to_s);
+}
+
+/// One connection: the server signs with key `kind` (`ka`, `kb`) and sends
+/// `chain`; the client trusts `roots` and offers TLS 1.2 too when `v12`.
+/// Returns 0 when everything that should work did; in `want_fail` mode, 0
+/// when neither side got connected.
+fn run(chain: &Bytes, kind: u64, ka: &Bytes, kb: &Bytes, roots: &Bytes, v12: bool, want_fail: bool) -> u64
+  requires blen(chain) < 1048576 && blen(ka) < 65536 && blen(kb) < 65536 && blen(roots) < 1048576 && (kind == 1 || kind == 2)
+{
+  let r1 = fill(1);
+  let r2 = fill(2);
+  let r3 = fill(3);
+  let r4 = fill(4);
+  let r5 = fill(5);
+  let r6 = fill(6);
+  let name = bfrom("localhost");
+  let mut ct = text_new();
+  text_push(&mut ct, 2);
+  text_push_str(&mut ct, "h2");
+  text_push(&mut ct, 8);
+  text_push_str(&mut ct, "http/1.1");
+  let calpn = text_finish(ct);
+  let mut st = text_new();
+  text_push(&mut st, 8);
+  text_push_str(&mut st, "http/1.1");
+  text_push(&mut st, 6);
+  text_push_str(&mut st, "spdy/3");
+  let salpn = text_finish(st);
+  let mut first = text_new();
+  let mut opts = 0;
+  if v12 { opts = 2; }
+  let mut c = tls13c_new_opts(r1, r2, r3, name, calpn, opts, &mut first);
+  let mut s = tls13s_new(r4, r5, r6, chain, kind, ka, kb, salpn);
+  pump(&mut c, &mut s, text_finish(first), roots);
+  let mut bad = 0;
+  if want_fail {
+    if tls13c_state(c) == 5 || tls13c_state(s) == 5 { if bad == 0 { bad = 1; } }
+  } else {
+    if tls13c_state(c) != 5 || tls13c_state(s) != 5 { bad = 10 + c.state * 10 + s.state; }
+    let a = tls13c_alpn(c);
+    let a2 = tls13c_alpn(s);
+    let sn = tls13s_name(s);
+    if !bytes_eq_str(a, "http/1.1") || !bytes_eq_str(a2, "http/1.1") || !bytes_eq_str(sn, "localhost") { if bad == 0 { bad = 2; } }
+    if tls13c_version(c) != 772 { if bad == 0 { bad = 3; } }
+    bfree(sn);
+    bfree(a2);
+    bfree(a);
+    // Data both ways, then the client says goodbye.
+    let ping = bfrom("ping");
+    let mut co = text_new();
+    if !tls13c_send(&mut c, ping, &mut co) { if bad == 0 { bad = 4; } }
+    let cb = text_finish(co);
+    let mut so = text_new();
+    let mut sapp = text_new();
+    if blen(cb) < 1048576 { tls13s_feed(&mut s, cb, &mut so, &mut sapp); }
+    let got = text_finish(sapp);
+    if !bytes_eq_str(got, "ping") { if bad == 0 { bad = 5; } }
+    bfree(got);
+    bfree(cb);
+    let pong = bfrom("pong");
+    if !tls13s_send(&mut s, pong, &mut so) { if bad == 0 { bad = 6; } }
+    let sb = text_finish(so);
+    let mut co2 = text_new();
+    let mut capp = text_new();
+    if blen(sb) < 1048576 { tls13c_feed(&mut c, sb, roots, 1800000000, &mut co2, &mut capp); }
+    let got2 = text_finish(capp);
+    if !bytes_eq_str(got2, "pong") { if bad == 0 { bad = 7; } }
+    bfree(got2);
+    bfree(sb);
+    tls13c_close(&mut c, &mut co2);
+    let cb2 = text_finish(co2);
+    let mut so2 = text_new();
+    let mut sapp2 = text_new();
+    if blen(cb2) < 1048576 { tls13s_feed(&mut s, cb2, &mut so2, &mut sapp2); }
+    if tls13c_state(s) != 6 { if bad == 0 { bad = 8; } }
+    vec_free(sapp2);
+    vec_free(so2);
+    bfree(cb2);
+    bfree(pong);
+    bfree(ping);
+  }
+  tls13c_free(s);
+  tls13c_free(c);
+  bfree(salpn);
+  bfree(calpn);
+  bfree(name);
+  bfree(r6);
+  bfree(r5);
+  bfree(r4);
+  bfree(r3);
+  bfree(r2);
+  bfree(r1);
+  return bad;
+}
+
+fn main() -> u64 {
+  let ca = ca_der();
+  let ec = ec_der();
+  let rsa = rsa_der();
+  let d = ec_d();
+  let n = rsa_n();
+  let e = rsa_d();
+  let none = balloc(0);
+  let other = fill(9);
+  let mut bad = 0;
+  let b1 = run(ec, 2, d, none, ca, false, false);
+  if b1 != 0 { bad = 100 + b1 % 100; }
+  let b2 = run(rsa, 1, n, e, ca, false, false);
+  if b2 != 0 { bad = 200 + b2 % 100; }
+  let b3 = run(ec, 2, d, none, ca, true, false);
+  if b3 != 0 { bad = 300 + b3 % 100; }
+  // The key of another certificate: the signature does not verify.
+  if run(ec, 2, other, none, ca, false, true) != 0 { if bad == 0 { bad = 400; } }
+  // A root the client does not trust.
+  if run(ec, 2, d, none, rsa, false, true) != 0 { if bad == 0 { bad = 500; } }
+  // No chain at all, and an RSA certificate with an ECDSA key.
+  if run(none, 2, d, none, ca, false, true) != 0 { if bad == 0 { bad = 600; } }
+  if run(rsa, 2, d, none, ca, false, true) != 0 { if bad == 0 { bad = 700; } }
+  bfree(other);
+  bfree(none);
+  bfree(e);
+  bfree(n);
+  bfree(d);
+  bfree(rsa);
+  bfree(ec);
+  bfree(ca);
+  return bad;
+}

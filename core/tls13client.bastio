@@ -39,13 +39,29 @@ import "rsa.bastio";
 /// The state of one connection. `state` is 0 waiting for the ServerHello, 1
 /// for EncryptedExtensions, 2 for the Certificate, 3 for CertificateVerify, 4
 /// for the server's Finished, 5 connected, 6 closed by the peer, 7 failed.
+/// `verify` is false when a chain the roots do not vouch for is accepted
+/// anyway (`verdict` then says why it would have been refused); `alpn` holds
+/// the protocols offered, then the one the server chose. `sent_close` is true
+/// once `tls13c_shutdown` has said goodbye: nothing more is sent, but what the
+/// server still sends is read. `allow12` offers TLS 1.2 too; `v12` is true
+/// once the server chose it (cipher suite `cs12`); `step` is then where the
+/// TLS 1.2 handshake is (0 Certificate, 1 ServerKeyExchange, 2
+/// ServerHelloDone, 3 the server's ChangeCipherSpec, 4 its Finished), `rnd`
+/// the client and then the server random, `ms` the premaster and then the
+/// master secret, `ems` whether it is an extended master secret. The
+/// server of core/tls13server keeps its signing key in `sk_kind` (0 none, 1
+/// RSA with the modulus in `sk_a` and the private exponent in `sk_b`, 2
+/// ECDSA P-256 with the scalar in `sk_a`).
 struct Tls13Client {
   state: u64, priv_key: Bytes, name: Bytes, transcript: Bytes,
   hs_secret: Bytes, c_hs: Bytes, s_hs: Bytes,
   suite: u64, c_suite: u64, s_suite: u64,
   c_key: Bytes, c_iv: Bytes, s_key: Bytes, s_iv: Bytes,
   c_secret: Bytes, s_secret: Bytes, c_seq: u64, s_seq: u64,
-  inbuf: Bytes, hsbuf: Bytes, leaf: Bytes
+  inbuf: Bytes, hsbuf: Bytes, leaf: Bytes,
+  verify: bool, verdict: u64, alpn: Bytes, sent_close: bool,
+  allow12: bool, v12: bool, step: u64, rnd: Bytes, ms: Bytes, ems: bool, cs12: u64,
+  sk_kind: u64, sk_a: Bytes, sk_b: Bytes
 }
 
 /// Internal: the handshake and traffic secrets of `c` all have `n` bytes, the
@@ -64,6 +80,8 @@ spec fn tls13c_ok(c: &Tls13Client) -> bool {
     && blen(c.c_iv) == 12 && blen(c.s_iv) == 12
     && blen(c.name) <= 255
     && blen(c.transcript) < 1073741824 && blen(c.inbuf) < 1073741824 && blen(c.hsbuf) < 1073741824 && blen(c.leaf) < 1048576
+    && blen(c.alpn) <= 256 && blen(c.rnd) <= 64 && blen(c.ms) <= 48
+    && blen(c.sk_a) < 65536 && blen(c.sk_b) < 65536
 }
 
 /// Internal: the 9 as a field element, the base point of X25519.
@@ -115,9 +133,94 @@ fn tls13c_new(random: &Bytes, session_id: &Bytes, priv_key: &Bytes, name: &Bytes
   ensures tls13c_ok(result) && result.state == 0
   ensures vlen(out) > vlen(old(out))
 {
+  let none = balloc(0);
+  let c = tls13c_new_opts(random, session_id, priv_key, name, none, 0, &mut out);
+  bfree(none);
+  return c;
+}
+
+/// `tls13c_new` that also offers the application protocols `alpn` (RFC
+/// 7301; the ProtocolNameList without its length, each name behind a one-byte
+/// length, at most 256 bytes, empty for none; `tls13c_alpn` tells which one
+/// the server chose). With `verify` false a certificate chain that the roots
+/// do not vouch for, or that is for another name, is accepted (the server
+/// must still prove it holds the key of its certificate); `tls13c_verdict`
+/// then says what was wrong with it.
+/// ```
+/// let r = balloc(32);
+/// let s = balloc(32);
+/// let k = balloc(32);
+/// let name = bfrom("example.com");
+/// let mut a = text_new();
+/// text_push(&mut a, 2);
+/// text_push_str(&mut a, "h2");
+/// let alpn = text_finish(a);
+/// let mut out = text_new();
+/// let c = tls13c_new_with(r, s, k, name, alpn, false, &mut out);
+/// let st = tls13c_state(c);
+/// let chosen = tls13c_alpn(c);
+/// let none = blen(chosen) == 0;
+/// bfree(chosen);
+/// tls13c_free(c);
+/// vec_free(out);
+/// bfree(alpn);
+/// bfree(name);
+/// bfree(k);
+/// bfree(s);
+/// bfree(r);
+/// if st != 0 || !none { return 1; }
+/// ```
+fn tls13c_new_with(random: &Bytes, session_id: &Bytes, priv_key: &Bytes, name: &Bytes, alpn: &Bytes, verify: bool, out: &mut Vec[u8]) -> Tls13Client
+  requires blen(random) == 32 && blen(session_id) == 32 && blen(priv_key) == 32 && blen(name) <= 255 && blen(alpn) <= 256
+  ensures tls13c_ok(result) && result.state == 0
+  ensures vlen(out) > vlen(old(out))
+{
+  let mut opts = 0;
+  if !verify { opts = 1; }
+  return tls13c_new_opts(random, session_id, priv_key, name, alpn, opts, &mut out);
+}
+
+/// `tls13c_new_with` with options as bits: 1 accepts a chain the roots do not
+/// vouch for (`verify` false), 2 offers TLS 1.2 as well (for servers and
+/// proxies that do not speak TLS 1.3: ECDHE with X25519, AES-GCM or
+/// ChaCha20-Poly1305, the extended master secret when the server has it, no
+/// renegotiation; a TLS 1.3 server that is made to fall back is noticed by
+/// the value RFC 8446 puts at the end of its random).
+/// ```
+/// let r = balloc(32);
+/// let s = balloc(32);
+/// let k = balloc(32);
+/// let name = bfrom("example.com");
+/// let alpn = balloc(0);
+/// let mut out = text_new();
+/// let c = tls13c_new_opts(r, s, k, name, alpn, 2, &mut out);
+/// let st = tls13c_state(c);
+/// let v = tls13c_version(c);
+/// tls13c_free(c);
+/// vec_free(out);
+/// bfree(alpn);
+/// bfree(name);
+/// bfree(k);
+/// bfree(s);
+/// bfree(r);
+/// if st != 0 || v != 772 { return 1; }
+/// ```
+fn tls13c_new_opts(random: &Bytes, session_id: &Bytes, priv_key: &Bytes, name: &Bytes, alpn: &Bytes, opts: u64, out: &mut Vec[u8]) -> Tls13Client
+  requires blen(random) == 32 && blen(session_id) == 32 && blen(priv_key) == 32 && blen(name) <= 255 && blen(alpn) <= 256
+  ensures tls13c_ok(result) && result.state == 0
+  ensures vlen(out) > vlen(old(out))
+{
   let base = tls13c_base();
   let pubkey = x25519(priv_key, base);
-  let hello = tls13_client_hello(random, session_id, name, pubkey);
+  let allow12 = (opts & 2) != 0;
+  let mut hello = balloc(0);
+  if allow12 {
+    bfree(hello);
+    hello = tls13_client_hello_v12(random, session_id, name, pubkey, alpn);
+  } else {
+    bfree(hello);
+    hello = tls13_client_hello_alpn(random, session_id, name, pubkey, alpn);
+  }
   tls13c_plain_record(&mut out, 22, hello);
   bfree(pubkey);
   bfree(base);
@@ -127,7 +230,35 @@ fn tls13c_new(random: &Bytes, session_id: &Bytes, priv_key: &Bytes, name: &Bytes
     suite: 4867, c_suite: 4867, s_suite: 4867,
     c_key: balloc(32), c_iv: balloc(12), s_key: balloc(32), s_iv: balloc(12),
     c_secret: balloc(32), s_secret: balloc(32), c_seq: 0, s_seq: 0,
-    inbuf: balloc(0), hsbuf: balloc(0), leaf: balloc(0)
+    inbuf: balloc(0), hsbuf: balloc(0), leaf: balloc(0),
+    verify: (opts & 1) == 0, verdict: 0, alpn: bytes_slice(alpn, 0, blen(alpn)), sent_close: false,
+    allow12: allow12, v12: false, step: 0, rnd: bytes_slice(random, 0, 32), ms: balloc(0), ems: false, cs12: 0,
+    sk_kind: 0, sk_a: balloc(0), sk_b: balloc(0)
+  };
+}
+
+/// A client that has already failed (state 7) and holds no keys or secrets:
+/// a placeholder for a slot whose connection is gone. Callers use it instead
+/// of building the struct, so new fields do not break them.
+/// ```
+/// let c = tls13c_blank();
+/// let st = tls13c_state(c);
+/// tls13c_free(c);
+/// if st != 7 { return 1; }
+/// ```
+fn tls13c_blank() -> Tls13Client
+  ensures result.state == 7
+{
+  return Tls13Client {
+    state: 7, priv_key: balloc(0), name: balloc(0), transcript: balloc(0),
+    hs_secret: balloc(0), c_hs: balloc(0), s_hs: balloc(0),
+    suite: 4867, c_suite: 4867, s_suite: 4867,
+    c_key: balloc(0), c_iv: balloc(0), s_key: balloc(0), s_iv: balloc(0),
+    c_secret: balloc(0), s_secret: balloc(0), c_seq: 0, s_seq: 0,
+    inbuf: balloc(0), hsbuf: balloc(0), leaf: balloc(0),
+    verify: true, verdict: 0, alpn: balloc(0), sent_close: false,
+    allow12: false, v12: false, step: 0, rnd: balloc(0), ms: balloc(0), ems: false, cs12: 0,
+    sk_kind: 0, sk_a: balloc(0), sk_b: balloc(0)
   };
 }
 
@@ -148,6 +279,111 @@ fn tls13c_free(c: Tls13Client) {
   bfree(c.inbuf);
   bfree(c.hsbuf);
   bfree(c.leaf);
+  bfree(c.alpn);
+  bfree(c.rnd);
+  bfree(c.ms);
+  bfree(c.sk_a);
+  bfree(c.sk_b);
+}
+
+/// The protocol version in use: 772 (TLS 1.3), or 771 once a server chose
+/// TLS 1.2.
+/// ```
+/// let c = tls13c_blank();
+/// let v = tls13c_version(c);
+/// tls13c_free(c);
+/// if v != 772 { return 1; }
+/// ```
+fn tls13c_version(c: &Tls13Client) -> u64 {
+  if c.v12 { return 771; }
+  return 772;
+}
+
+/// The cipher suite in use (its IANA number, 0x1301.. for TLS 1.3 or
+/// 0xC02B.. for TLS 1.2); 0 before the ServerHello.
+/// ```
+/// let c = tls13c_blank();
+/// let s = tls13c_suite(c);
+/// tls13c_free(c);
+/// if s != 0 { return 1; }
+/// ```
+fn tls13c_suite(c: &Tls13Client) -> u64 {
+  if c.v12 { return c.cs12; }
+  if c.state == 0 || c.state == 7 && blen(c.transcript) == 0 { return 0; }
+  return c.suite;
+}
+
+/// Whether `c` has the sizes and states the other functions require
+/// (`tls13c_ok`): true for a client made by `tls13c_new` or
+/// `tls13c_new_with` and kept by these functions, false for a blank one.
+/// Callers that keep clients in a vector use it after taking one out.
+/// ```
+/// let c = tls13c_blank();
+/// let ok = tls13c_check(c);
+/// tls13c_free(c);
+/// if ok { return 1; }
+/// ```
+fn tls13c_check(c: &Tls13Client) -> bool
+  ensures result ==> tls13c_ok(c)
+{
+  if c.state > 7 || blen(c.priv_key) != 32 { return false; }
+  let mut sec = 0;
+  if c.suite == 4866 { sec = 48; } else if c.suite == 4865 || c.suite == 4867 { sec = 32; } else { return false; }
+  if blen(c.hs_secret) != sec || blen(c.c_hs) != sec || blen(c.s_hs) != sec || blen(c.c_secret) != sec || blen(c.s_secret) != sec { return false; }
+  if c.c_suite == 4865 { if blen(c.c_key) != 16 { return false; } }
+  else if c.c_suite == 4866 || c.c_suite == 4867 { if blen(c.c_key) != 32 { return false; } }
+  else { return false; }
+  if c.s_suite == 4865 { if blen(c.s_key) != 16 { return false; } }
+  else if c.s_suite == 4866 || c.s_suite == 4867 { if blen(c.s_key) != 32 { return false; } }
+  else { return false; }
+  if blen(c.c_iv) != 12 || blen(c.s_iv) != 12 { return false; }
+  if blen(c.name) > 255 || blen(c.alpn) > 256 || blen(c.rnd) > 64 || blen(c.ms) > 48 { return false; }
+  if blen(c.sk_a) >= 65536 || blen(c.sk_b) >= 65536 { return false; }
+  if blen(c.transcript) >= 1073741824 || blen(c.inbuf) >= 1073741824 || blen(c.hsbuf) >= 1073741824 || blen(c.leaf) >= 1048576 { return false; }
+  return true;
+}
+
+/// The application protocol the server chose (a copy; empty when it chose
+/// none or has not answered yet).
+/// ```
+/// let c = tls13c_blank();
+/// let a = tls13c_alpn(c);
+/// let n = blen(a);
+/// bfree(a);
+/// tls13c_free(c);
+/// if n != 0 { return 1; }
+/// ```
+fn tls13c_alpn(c: &Tls13Client) -> Bytes {
+  if c.state <= 1 { return balloc(0); }
+  return bytes_slice(c.alpn, 0, blen(c.alpn));
+}
+
+/// 0 when the server's certificate chain was checked and good; otherwise 10
+/// when only the host name is not the certificate's, or 6 (the code a client
+/// that verifies fails with in both cases; only a client made with `verify`
+/// false gets that far).
+/// ```
+/// let c = tls13c_blank();
+/// let v = tls13c_verdict(c);
+/// tls13c_free(c);
+/// if v != 0 { return 1; }
+/// ```
+fn tls13c_verdict(c: &Tls13Client) -> u64 {
+  return c.verdict;
+}
+
+/// The server's own certificate (DER, a copy), once the client has it
+/// (state 3 or later); empty before.
+/// ```
+/// let c = tls13c_blank();
+/// let p = tls13c_peer_cert(c);
+/// let n = blen(p);
+/// bfree(p);
+/// tls13c_free(c);
+/// if n != 0 { return 1; }
+/// ```
+fn tls13c_peer_cert(c: &Tls13Client) -> Bytes {
+  return bytes_slice(c.leaf, 0, blen(c.leaf));
 }
 
 /// The state of `c`: 0 waiting for the ServerHello, 1 for the
@@ -282,6 +518,15 @@ fn tls13c_chain(msg: &Bytes, name: &Bytes, roots: &Bytes, now: u64) -> Option[By
   requires blen(msg) < 1048576 && blen(name) <= 255 && blen(roots) < 274877906944
   ensures result is Option::Some ==> blen(result.Some) < 1048576
 {
+  return tls13c_chain_for(msg, name, true, roots, now);
+}
+
+/// Internal: `tls13c_chain`, with the check of the host name only when
+/// `check_name`.
+fn tls13c_chain_for(msg: &Bytes, name: &Bytes, check_name: bool, roots: &Bytes, now: u64) -> Option[Bytes]
+  requires blen(msg) < 1048576 && blen(name) <= 255 && blen(roots) < 274877906944
+  ensures result is Option::Some ==> blen(result.Some) < 1048576
+{
   let n = blen(msg);
   // type, 24-bit length, empty request context, 24-bit list length
   if n < 8 || bget(msg, 0) != 11 || tls13c_u24(msg, 1) + 4 != n || bget(msg, 4) != 0 {
@@ -319,15 +564,25 @@ fn tls13c_chain(msg: &Bytes, name: &Bytes, roots: &Bytes, now: u64) -> Option[By
     return Option[Bytes]::None;
   }
   let count = vec_len(spans);
+  // The chain is good up to the first certificate a root vouches for (or
+  // that is a root): a chain may go on past it, as when the server sends a
+  // root cross-signed by an older one the trust store no longer has.
   let mut i = 0;
-  while i + 1 < count && ok
-    invariant i + 1 <= count && count == vlen(spans) && n == blen(msg) && n < 1048576
+  let mut anchored = false;
+  while i < count && ok && !anchored
+    invariant i <= count && count == vlen(spans) && n == blen(msg) && n < 1048576 && blen(roots) < 274877906944
     invariant forall k: u64 :: k < vlen(spans) ==> vget(spans, k).start <= vget(spans, k).end && vget(spans, k).end <= n
   {
-    ok = tls13c_link(msg, vec_get(spans, i), vec_get(spans, i + 1), now);
-    i = i + 1;
+    if tls13c_anchored(msg, vec_get(spans, i), roots, now) {
+      anchored = true;
+    } else if i + 1 < count {
+      ok = tls13c_link(msg, vec_get(spans, i), vec_get(spans, i + 1), now);
+      i = i + 1;
+    } else {
+      ok = false;
+    }
   }
-  if ok { ok = tls13c_anchored(msg, vec_get(spans, count - 1), roots, now); }
+  ok = ok && anchored;
   let first = vec_get(spans, 0);
   vec_free(spans);
   if !ok { return Option[Bytes]::None; }
@@ -337,8 +592,29 @@ fn tls13c_chain(msg: &Bytes, name: &Bytes, roots: &Bytes, now: u64) -> Option[By
     Option::None => {},
     Option::Some(x) => {
       // The leaf must be valid now, be for the host, and not forbid signing.
-      good = x509_valid_at(x, now) && x509_has_name(leaf, x, name) && (x.key_usage == 65535 || (x.key_usage & 128) != 0);
+      good = x509_valid_at(x, now) && (!check_name || x509_has_name(leaf, x, name)) && (x.key_usage == 65535 || (x.key_usage & 128) != 0);
     },
+  }
+  if good { return Option[Bytes]::Some(leaf); }
+  bfree(leaf);
+  return Option[Bytes]::None;
+}
+
+/// Internal: the first certificate of the Certificate message `msg` (the
+/// server's own), if it is one x509_parse reads.
+fn tls13c_first_cert(msg: &Bytes) -> Option[Bytes]
+  requires blen(msg) < 1048576
+  ensures result is Option::Some ==> blen(result.Some) < 1048576
+{
+  let n = blen(msg);
+  if n < 11 || bget(msg, 0) != 11 || bget(msg, 4) != 0 { return Option[Bytes]::None; }
+  let cl = tls13c_u24(msg, 8);
+  if cl == 0 || n - 11 < cl { return Option[Bytes]::None; }
+  let leaf = bytes_slice(msg, 11, 11 + cl);
+  let mut good = false;
+  match x509_parse(leaf) {
+    Option::None => {},
+    Option::Some(x) => { good = true; },
   }
   if good { return Option[Bytes]::Some(leaf); }
   bfree(leaf);
@@ -501,6 +777,27 @@ fn tls13c_server_hello(c: &mut Tls13Client, msg: &Bytes) -> u64
   }
 }
 
+/// Internal: whether `name` is one of the names of the ProtocolNameList
+/// contents `list` (each behind a one-byte length).
+fn tls13c_offered(list: &Bytes, name: &Bytes) -> bool {
+  let n = blen(list);
+  let mut at = 0;
+  while at < n
+    invariant at <= n && n == blen(list)
+  {
+    let l = cast[u64](bget(list, at));
+    if l == 0 || n - at - 1 < l { return false; }
+    if l == blen(name) {
+      let it = bytes_slice(list, at + 1, at + 1 + l);
+      let same = bytes_eq(it, name);
+      bfree(it);
+      if same { return true; }
+    }
+    at = at + 1 + l;
+  }
+  return false;
+}
+
 /// Internal: handles EncryptedExtensions `msg` (state 1): the extensions are
 /// read for their lengths and not used.
 fn tls13c_encrypted_extensions(c: &mut Tls13Client, msg: &Bytes) -> u64
@@ -512,14 +809,29 @@ fn tls13c_encrypted_extensions(c: &mut Tls13Client, msg: &Bytes) -> u64
     return tls13c_fail(&mut c, 1);
   }
   let mut at = 6;
+  let mut chosen = balloc(0);
   while at < n
-    invariant at <= n && n == blen(msg) && tls13c_ok(c)
+    invariant at <= n && n == blen(msg) && tls13c_ok(c) && blen(chosen) <= 255
   {
-    if n - at < 4 { return tls13c_fail(&mut c, 1); }
+    if n - at < 4 { bfree(chosen); return tls13c_fail(&mut c, 1); }
+    let ty = tls13c_u16(msg, at);
     let l = tls13c_u16(msg, at + 2);
-    if n - at - 4 < l { return tls13c_fail(&mut c, 1); }
+    if n - at - 4 < l { bfree(chosen); return tls13c_fail(&mut c, 1); }
+    if ty == 16 {
+      // application_layer_protocol_negotiation: exactly one name, one the
+      // client offered, and only once.
+      if l < 4 || blen(chosen) != 0 { bfree(chosen); return tls13c_fail(&mut c, 1); }
+      let nl = cast[u64](bget(msg, at + 6));
+      if tls13c_u16(msg, at + 4) != l - 2 || nl + 3 != l || nl == 0 { bfree(chosen); return tls13c_fail(&mut c, 1); }
+      let name = bytes_slice(msg, at + 7, at + 7 + nl);
+      if !tls13c_offered(c.alpn, name) { bfree(name); bfree(chosen); return tls13c_fail(&mut c, 2); }
+      bfree(chosen);
+      chosen = name;
+    }
     at = at + 4 + l;
   }
+  bfree(c.alpn);
+  c.alpn = chosen;
   if !tls13c_note(&mut c, msg) { return tls13c_fail(&mut c, 1); }
   c.state = 2;
   return 0;
@@ -531,7 +843,27 @@ fn tls13c_certificate(c: &mut Tls13Client, msg: &Bytes, roots: &Bytes, now: u64)
   ensures tls13c_ok(c)
 {
   match tls13c_chain(msg, c.name, roots, now) {
-    Option::None => { return tls13c_fail(&mut c, 6); },
+    Option::None => {
+      if c.verify { return tls13c_fail(&mut c, 6); }
+      // Not verified, as the caller asked: go on with the server's own
+      // certificate, whose key must still sign the CertificateVerify.
+      match tls13c_first_cert(msg) {
+        Option::None => { return tls13c_fail(&mut c, 6); },
+        Option::Some(leaf) => {
+          bfree(c.leaf);
+          c.leaf = leaf;
+          // 10 when only the name is wrong (the chain itself is good).
+          c.verdict = 6;
+          match tls13c_chain_for(msg, c.name, false, roots, now) {
+            Option::Some(l2) => { bfree(l2); c.verdict = 10; },
+            Option::None => {},
+          }
+          if !tls13c_note(&mut c, msg) { return tls13c_fail(&mut c, 1); }
+          c.state = 3;
+          return 0;
+        },
+      }
+    },
     Option::Some(leaf) => {
       bfree(c.leaf);
       c.leaf = leaf;
@@ -615,6 +947,7 @@ fn tls13c_send_record(c: &mut Tls13Client, ty: u8, plain: &Bytes, out: &mut Vec[
   requires tls13c_ok(c) && blen(plain) <= 16384
   ensures tls13c_ok(c)
 {
+  if c.v12 { return tls12c_seal(&mut c, ty, plain, &mut out); }
   if c.c_seq >= 4611686018427387904 { return false; }
   let rec = tls13_seal(c.c_suite, c.c_key, c.c_iv, c.c_seq, ty, plain, 0);
   c.c_seq = c.c_seq + 1;
@@ -696,7 +1029,7 @@ fn tls13c_after(c: &mut Tls13Client, msg: &Bytes, out: &mut Vec[u8]) -> u64
   let k3 = bytes_slice(c.s_secret, 0, blen(c.s_secret));
   tls13c_keys(&mut c, k3, false);
   bfree(k3);
-  if bget(msg, 4) == 1 {
+  if bget(msg, 4) == 1 && !c.sent_close {
     // The peer asked for the client's keys to change too: say so is not
     // needed, send an update that asks for nothing, then change.
     let mut up = text_new();
@@ -769,8 +1102,17 @@ fn tls13c_record(c: &mut Tls13Client, rec: &Bytes, roots: &Bytes, now: u64, out:
   requires tls13c_ok(c) && blen(rec) >= 5 && blen(rec) <= 16645 && blen(roots) < 274877906944
   ensures tls13c_ok(c)
 {
+  if c.v12 { return tls12c_record(&mut c, rec, roots, now, &mut out, &mut app); }
   let ty = bget(rec, 0);
   let n = blen(rec) - 5;
+  if ty == 22 && c.state == 0 && c.allow12 {
+    // The ServerHello of a client that offered TLS 1.2 too, perhaps with the
+    // rest of a TLS 1.2 server's first flight behind it.
+    let body = bytes_slice(rec, 5, blen(rec));
+    let code = tls12c_handshake_data(&mut c, body, roots, now, &mut out);
+    bfree(body);
+    return code;
+  }
   if ty == 20 {
     // Change cipher spec, only for middleboxes, once the handshake is under way.
     if c.state >= 1 && c.state <= 4 && n == 1 && bget(rec, 5) == 1 { return 0; }
@@ -906,7 +1248,7 @@ fn tls13c_feed(c: &mut Tls13Client, data: &Bytes, roots: &Bytes, now: u64, out: 
 fn tls13c_send(c: &mut Tls13Client, data: &Bytes, out: &mut Vec[u8]) -> bool
   requires tls13c_ok(c) && blen(data) < 1073741824
 {
-  if c.state != 5 { return false; }
+  if c.state != 5 || c.sent_close { return false; }
   let mut at = 0;
   while at < blen(data)
     invariant at <= blen(data) && tls13c_ok(c) && blen(data) < 1073741824
@@ -943,7 +1285,7 @@ fn tls13c_send(c: &mut Tls13Client, data: &Bytes, out: &mut Vec[u8]) -> bool
 fn tls13c_close(c: &mut Tls13Client, out: &mut Vec[u8]) -> bool
   requires tls13c_ok(c)
 {
-  if c.state != 5 { return false; }
+  if c.state != 5 || c.sent_close { return false; }
   let mut al = text_new();
   text_push(&mut al, 1);
   text_push(&mut al, 0);
@@ -952,4 +1294,662 @@ fn tls13c_close(c: &mut Tls13Client, out: &mut Vec[u8]) -> bool
   bfree(ab);
   c.state = 6;
   return sent;
+}
+
+/// Appends a close_notify alert to `out` and closes the sending side only:
+/// `tls13c_send` refuses from now on, but `tls13c_feed` still takes what the
+/// server sends until it closes too (state 6). False unless the handshake is
+/// complete (or it was already shut).
+/// ```
+/// let r = balloc(32);
+/// let s = balloc(32);
+/// let k = balloc(32);
+/// let name = bfrom("example.com");
+/// let mut out = text_new();
+/// let mut c = tls13c_new(r, s, k, name, &mut out);
+/// let shut = tls13c_shutdown(&mut c, &mut out);
+/// tls13c_free(c);
+/// vec_free(out);
+/// bfree(name);
+/// bfree(k);
+/// bfree(s);
+/// bfree(r);
+/// if shut { return 1; }
+/// ```
+fn tls13c_shutdown(c: &mut Tls13Client, out: &mut Vec[u8]) -> bool
+  requires tls13c_ok(c)
+  ensures tls13c_ok(c)
+{
+  if c.state != 5 || c.sent_close { return false; }
+  let mut al = text_new();
+  text_push(&mut al, 1);
+  text_push(&mut al, 0);
+  let ab = text_finish(al);
+  let sent = tls13c_send_record(&mut c, 21, ab, &mut out);
+  bfree(ab);
+  c.sent_close = true;
+  return sent;
+}
+
+// ---- TLS 1.2 (RFC 5246, 5289, 7905, 7627) for a client made with option 2 ----
+
+/// Internal: an HMAC with SHA-384 when `big`, else with SHA-256.
+fn tls12c_hmac(big: bool, key: &Bytes, msg: &Bytes) -> Bytes
+  ensures blen(result) == 32 || blen(result) == 48
+{
+  if big { return hmac_sha384(key, msg); }
+  return hmac_sha256(key, msg);
+}
+
+/// Internal: the TLS 1.2 PRF (P_SHA256, or P_SHA384 when `big`): `n` bytes
+/// from `secret`, the `label` and `seed`.
+fn tls12c_prf(big: bool, secret: &Bytes, label: Str, seed: &Bytes, n: u64) -> Bytes
+  requires n <= 256 && slen(label) <= 64 && blen(seed) <= 1024
+  ensures blen(result) == n
+{
+  let mut t = text_new();
+  text_push_str(&mut t, label);
+  text_push_bytes(&mut t, seed);
+  let ls = text_finish(t);
+  let mut a = tls12c_hmac(big, secret, ls);
+  let mut out = text_new();
+  let mut rounds = 0;
+  while vec_len(out) < n && rounds < 16
+    invariant rounds <= 16 && vlen(out) <= rounds * 48 && (blen(a) == 32 || blen(a) == 48) && blen(ls) <= 1088
+  {
+    let x = bytes_concat(a, ls);
+    let b = tls12c_hmac(big, secret, x);
+    text_push_bytes(&mut out, b);
+    bfree(b);
+    bfree(x);
+    let a2 = tls12c_hmac(big, secret, a);
+    bfree(a);
+    a = a2;
+    rounds = rounds + 1;
+  }
+  bfree(a);
+  bfree(ls);
+  let o = text_finish(out);
+  if blen(o) < n {
+    bfree(o);
+    return balloc(n);
+  }
+  let r = bytes_slice(o, 0, n);
+  bfree(o);
+  return r;
+}
+
+/// Internal: the additional data of a TLS 1.2 AEAD record: the sequence
+/// number, the type, the version and the length of the plaintext.
+fn tls12c_aad(seq: u64, ty: u8, len: u64) -> Bytes
+  requires len < 65536
+  ensures blen(result) == 13
+{
+  let mut t = text_new();
+  let mut i = 0;
+  while i < 8
+    invariant i <= 8 && vlen(t) == i
+  {
+    text_push(&mut t, cast[u8]((seq >> (56 - 8 * i)) & 255));
+    i = i + 1;
+  }
+  text_push(&mut t, ty);
+  text_push(&mut t, 3);
+  text_push(&mut t, 3);
+  text_push(&mut t, cast[u8](len / 256));
+  text_push(&mut t, cast[u8](len % 256));
+  return text_finish(t);
+}
+
+/// Internal: appends a TLS 1.2 record of type `ty` with `body` as it is.
+fn tls12c_plain(out: &mut Vec[u8], ty: u8, body: &Bytes)
+  requires blen(body) < 65536
+{
+  text_push(&mut out, ty);
+  text_push(&mut out, 3);
+  text_push(&mut out, 3);
+  text_push(&mut out, cast[u8](blen(body) / 256));
+  text_push(&mut out, cast[u8](blen(body) % 256));
+  text_push_bytes(&mut out, body);
+}
+
+/// Internal: seals `plain` as a TLS 1.2 record of type `ty` with the
+/// client's keys (AES-GCM with the sequence number as the explicit nonce, or
+/// ChaCha20-Poly1305 with the nonce of RFC 7905) and appends it to `out`.
+fn tls12c_seal(c: &mut Tls13Client, ty: u8, plain: &Bytes, out: &mut Vec[u8]) -> bool
+  requires tls13c_ok(c) && blen(plain) <= 16384
+  ensures tls13c_ok(c)
+{
+  if c.c_seq >= 4611686018427387904 { return false; }
+  let seq = c.c_seq;
+  let nonce = tls13_nonce(c.c_iv, seq);
+  let aad = tls12c_aad(seq, ty, blen(plain));
+  let ct = tls13_aead_seal(c.c_suite, c.c_key, nonce, aad, plain);
+  let gcm = c.c_suite != 4867;
+  let mut n = blen(ct);
+  if gcm { n = n + 8; }
+  text_push(&mut out, ty);
+  text_push(&mut out, 3);
+  text_push(&mut out, 3);
+  text_push(&mut out, cast[u8](n / 256));
+  text_push(&mut out, cast[u8](n % 256));
+  if gcm {
+    let mut i = 0;
+    while i < 8
+      invariant i <= 8
+    {
+      text_push(&mut out, cast[u8]((seq >> (56 - 8 * i)) & 255));
+      i = i + 1;
+    }
+  }
+  text_push_bytes(&mut out, ct);
+  bfree(ct);
+  bfree(aad);
+  bfree(nonce);
+  c.c_seq = seq + 1;
+  return true;
+}
+
+/// Internal: opens the TLS 1.2 record `rec` (with its header) with the
+/// server's keys; the plaintext, or None if it is not genuine.
+fn tls12c_open(c: &mut Tls13Client, rec: &Bytes) -> Option[Bytes]
+  requires tls13c_ok(c) && blen(rec) >= 5 && blen(rec) <= 16645
+  ensures tls13c_ok(c)
+  ensures result is Option::Some ==> blen(result.Some) <= 16640
+{
+  if c.s_seq >= 4611686018427387904 { return Option[Bytes]::None; }
+  let ty = bget(rec, 0);
+  let n = blen(rec);
+  let gcm = c.s_suite != 4867;
+  let mut nonce = balloc(0);
+  let mut ct = balloc(0);
+  if gcm {
+    if n < 5 + 8 + 16 { bfree(nonce); bfree(ct); return Option[Bytes]::None; }
+    let salt = bytes_slice(c.s_iv, 0, 4);
+    let explicit = bytes_slice(rec, 5, 13);
+    bfree(nonce);
+    nonce = bytes_concat(salt, explicit);
+    bfree(explicit);
+    bfree(salt);
+    bfree(ct);
+    ct = bytes_slice(rec, 13, n);
+  } else {
+    if n < 5 + 16 { bfree(nonce); bfree(ct); return Option[Bytes]::None; }
+    bfree(nonce);
+    nonce = tls13_nonce(c.s_iv, c.s_seq);
+    bfree(ct);
+    ct = bytes_slice(rec, 5, n);
+  }
+  let aad = tls12c_aad(c.s_seq, ty, blen(ct) - 16);
+  let r = tls13_aead_open(c.s_suite, c.s_key, nonce, aad, ct);
+  bfree(aad);
+  bfree(ct);
+  bfree(nonce);
+  match r {
+    Option::None => { return Option[Bytes]::None; },
+    Option::Some(p) => {
+      c.s_seq = c.s_seq + 1;
+      return Option[Bytes]::Some(p);
+    },
+  }
+}
+
+/// Internal: does the signature `sig` with the scheme `scheme` (a TLS
+/// SignatureScheme) over `content` check out with the key of the
+/// certificate `leaf`?
+fn tls12c_signed(leaf: &Bytes, scheme: u64, content: &Bytes, sig: &Bytes) -> bool
+  requires blen(content) < 1048576 && blen(sig) < 65536 && blen(leaf) < 1048576
+{
+  let mut ok = false;
+  match x509_parse(leaf) {
+    Option::None => {},
+    Option::Some(x) => {
+      let ka = bytes_slice(leaf, x.key_a.start, x.key_a.end);
+      let kb = bytes_slice(leaf, x.key_b.start, x.key_b.end);
+      if scheme == 2055 && x.key_kind == 3 && blen(ka) == 32 && blen(sig) == 64 {
+        ok = ed25519_verify(ka, content, sig);
+      }
+      if scheme == 1027 && x.key_kind == 2 {
+        ok = ecdsa_p256_verify(ka, content, sig);
+      }
+      if scheme == 1283 && x.key_kind == 4 {
+        ok = ecdsa_p384_verify(ka, content, sig);
+      }
+      if x.key_kind == 1 && blen(ka) < 65536 && blen(kb) < 65536 {
+        if scheme == 2052 { ok = rsa_pss_sha256_verify(ka, kb, content, sig); }
+        if scheme == 2053 { ok = rsa_pss_verify(ka, kb, content, sig, 48); }
+        if scheme == 1025 { ok = rsa_pkcs1_verify(ka, kb, content, sig, 32); }
+        if scheme == 1281 { ok = rsa_pkcs1_verify(ka, kb, content, sig, 48); }
+        if scheme == 1537 { ok = rsa_pkcs1_verify(ka, kb, content, sig, 64); }
+      }
+      bfree(kb);
+      bfree(ka);
+    },
+  }
+  return ok;
+}
+
+/// Internal: the ServerHello `msg` if it is one for TLS 1.2 (no
+/// supported_versions extension); returns 1000 when it is not, for the TLS
+/// 1.3 path to take it.
+fn tls12c_server_hello(c: &mut Tls13Client, msg: &Bytes) -> u64
+  requires tls13c_ok(c) && blen(msg) < 1048576
+  ensures tls13c_ok(c)
+{
+  let n = blen(msg);
+  if n < 42 || bget(msg, 0) != 2 || tls13c_u24(msg, 1) + 4 != n || tls13c_u16(msg, 4) != 771 { return 1000; }
+  let sl = cast[u64](bget(msg, 38));
+  if sl > 32 || n < 39 + sl + 3 { return 1000; }
+  let at = 39 + sl;
+  let suite = tls13c_u16(msg, at);
+  let comp = bget(msg, at + 2);
+  let mut p = at + 3;
+  let mut end = n;
+  if n > p {
+    if n - p < 2 { return 1000; }
+    if tls13c_u16(msg, p) + p + 2 != n { return 1000; }
+    p = p + 2;
+  }
+  // Is it TLS 1.3 (supported_versions)? Then it is not ours.
+  let mut q = p;
+  while q < end
+    invariant q <= end && end == n && n == blen(msg)
+  {
+    if end - q < 4 { return 1000; }
+    let ty = tls13c_u16(msg, q);
+    let l = tls13c_u16(msg, q + 2);
+    if end - q - 4 < l { return 1000; }
+    if ty == 43 { return 1000; }
+    q = q + 4 + l;
+  }
+  if !c.allow12 { return 1000; }
+  // A TLS 1.3 server that was made to fall back says so in its random.
+  if bytes_span_eq_str(msg, 30, 37, "DOWNGRD") { return tls13c_fail(&mut c, 3); }
+  if comp != 0 { return tls13c_fail(&mut c, 3); }
+  let mut aead = 0;
+  if suite == 49195 || suite == 49199 { aead = 4865; }
+  if suite == 49196 || suite == 49200 { aead = 4866; }
+  if suite == 52393 || suite == 52392 { aead = 4867; }
+  if aead == 0 { return tls13c_fail(&mut c, 3); }
+  let mut ems = false;
+  let mut reneg = false;
+  let mut chosen = balloc(0);
+  while p < end
+    invariant p <= end && end == n && n == blen(msg) && blen(chosen) <= 255 && tls13c_ok(c)
+  {
+    if end - p < 4 { bfree(chosen); return tls13c_fail(&mut c, 3); }
+    let ty = tls13c_u16(msg, p);
+    let l = tls13c_u16(msg, p + 2);
+    if end - p - 4 < l { bfree(chosen); return tls13c_fail(&mut c, 3); }
+    if ty == 23 {
+      if l != 0 || ems { bfree(chosen); return tls13c_fail(&mut c, 3); }
+      ems = true;
+    } else if ty == 65281 {
+      // renegotiation_info: empty in a first handshake.
+      if l != 1 || bget(msg, p + 4) != 0 || reneg { bfree(chosen); return tls13c_fail(&mut c, 3); }
+      reneg = true;
+    } else if ty == 16 {
+      if l < 4 || blen(chosen) != 0 { bfree(chosen); return tls13c_fail(&mut c, 3); }
+      let nl = cast[u64](bget(msg, p + 6));
+      if tls13c_u16(msg, p + 4) != l - 2 || nl + 3 != l || nl == 0 { bfree(chosen); return tls13c_fail(&mut c, 3); }
+      let name = bytes_slice(msg, p + 7, p + 7 + nl);
+      if !tls13c_offered(c.alpn, name) { bfree(name); bfree(chosen); return tls13c_fail(&mut c, 3); }
+      bfree(chosen);
+      chosen = name;
+    } else if ty == 11 || (ty == 0 && l == 0) {
+      // ec_point_formats, or the server saw the name.
+    } else {
+      bfree(chosen);
+      return tls13c_fail(&mut c, 3);
+    }
+    p = p + 4 + l;
+  }
+  if blen(c.rnd) != 32 { bfree(chosen); return tls13c_fail(&mut c, 3); }
+  let sr = bytes_slice(msg, 6, 38);
+  let both = tls13c_append(c.rnd, sr);
+  c.rnd = both;
+  bfree(sr);
+  bfree(c.alpn);
+  c.alpn = chosen;
+  tls13c_set_suite(&mut c, aead);
+  if !tls13c_note(&mut c, msg) { return tls13c_fail(&mut c, 1); }
+  c.v12 = true;
+  c.cs12 = suite;
+  c.ems = ems;
+  c.step = 0;
+  c.state = 1;
+  return 0;
+}
+
+/// Internal: the TLS 1.2 Certificate `msg`, checked as `tls13c_certificate`
+/// checks a TLS 1.3 one (it is rewritten in that form first).
+fn tls12c_certificate(c: &mut Tls13Client, msg: &Bytes, roots: &Bytes, now: u64) -> u64
+  requires tls13c_ok(c) && blen(msg) < 1048576 && blen(roots) < 274877906944
+  ensures tls13c_ok(c)
+{
+  let n = blen(msg);
+  if n < 7 || bget(msg, 0) != 11 || tls13c_u24(msg, 1) + 4 != n || tls13c_u24(msg, 4) + 7 != n {
+    return tls13c_fail(&mut c, 1);
+  }
+  let mut list = text_new();
+  let mut at = 7;
+  let mut count = 0;
+  while at < n
+    invariant at <= n && n == blen(msg) && count <= 9 && vlen(list) <= at + 2 * count && tls13c_ok(c)
+  {
+    if n - at < 3 || count >= 9 { vec_free(list); return tls13c_fail(&mut c, 6); }
+    let cl = tls13c_u24(msg, at);
+    if n - at - 3 < cl { vec_free(list); return tls13c_fail(&mut c, 1); }
+    let cert = bytes_slice(msg, at, at + 3 + cl);
+    text_push_bytes(&mut list, cert);
+    bfree(cert);
+    text_push(&mut list, 0);
+    text_push(&mut list, 0);
+    at = at + 3 + cl;
+    count = count + 1;
+  }
+  let ln = vec_len(list);
+  let mut m = text_new();
+  text_push(&mut m, 11);
+  text_push(&mut m, cast[u8](((ln + 4) >> 16) & 255));
+  text_push(&mut m, cast[u8](((ln + 4) >> 8) & 255));
+  text_push(&mut m, cast[u8]((ln + 4) & 255));
+  text_push(&mut m, 0);
+  text_push(&mut m, cast[u8]((ln >> 16) & 255));
+  text_push(&mut m, cast[u8]((ln >> 8) & 255));
+  text_push(&mut m, cast[u8](ln & 255));
+  let lb = text_finish(list);
+  text_push_bytes(&mut m, lb);
+  bfree(lb);
+  let m13 = text_finish(m);
+  if blen(m13) >= 1048576 { bfree(m13); return tls13c_fail(&mut c, 1); }
+  let mut leaf = balloc(0);
+  let mut good = false;
+  match tls13c_chain(m13, c.name, roots, now) {
+    Option::Some(l) => { bfree(leaf); leaf = l; good = true; },
+    Option::None => {},
+  }
+  if !good && !c.verify {
+    match tls13c_first_cert(m13) {
+      Option::Some(l) => {
+        bfree(leaf);
+        leaf = l;
+        good = true;
+        c.verdict = 6;
+        match tls13c_chain_for(m13, c.name, false, roots, now) {
+          Option::Some(l2) => { bfree(l2); c.verdict = 10; },
+          Option::None => {},
+        }
+      },
+      Option::None => {},
+    }
+  }
+  bfree(m13);
+  if !good { bfree(leaf); return tls13c_fail(&mut c, 6); }
+  bfree(c.leaf);
+  c.leaf = leaf;
+  if !tls13c_note(&mut c, msg) { return tls13c_fail(&mut c, 1); }
+  c.step = 1;
+  return 0;
+}
+
+/// Internal: the ServerKeyExchange `msg`: an X25519 share signed with the
+/// key of the server's certificate over both randoms and the parameters.
+fn tls12c_key_exchange(c: &mut Tls13Client, msg: &Bytes) -> u64
+  requires tls13c_ok(c) && blen(msg) < 1048576
+  ensures tls13c_ok(c)
+{
+  let n = blen(msg);
+  if n < 44 || bget(msg, 0) != 12 || tls13c_u24(msg, 1) + 4 != n { return tls13c_fail(&mut c, 1); }
+  if bget(msg, 4) != 3 || tls13c_u16(msg, 5) != 29 || bget(msg, 7) != 32 { return tls13c_fail(&mut c, 4); }
+  let scheme = tls13c_u16(msg, 40);
+  let sl = tls13c_u16(msg, 42);
+  if sl + 44 != n { return tls13c_fail(&mut c, 1); }
+  if blen(c.rnd) != 64 { return tls13c_fail(&mut c, 4); }
+  let params = bytes_slice(msg, 4, 40);
+  let content = bytes_concat(c.rnd, params);
+  let sig = bytes_slice(msg, 44, n);
+  let ok = tls12c_signed(c.leaf, scheme, content, sig);
+  bfree(sig);
+  bfree(content);
+  bfree(params);
+  if !ok { return tls13c_fail(&mut c, 7); }
+  let share = bytes_slice(msg, 8, 40);
+  let shared = x25519(c.priv_key, share);
+  bfree(share);
+  if tls13c_all_zero(shared) { bfree(shared); return tls13c_fail(&mut c, 4); }
+  bfree(c.ms);
+  c.ms = shared;
+  if !tls13c_note(&mut c, msg) { return tls13c_fail(&mut c, 1); }
+  c.step = 2;
+  return 0;
+}
+
+/// Internal: the key block from the master secret: the write keys and IVs
+/// (an AES-GCM salt of 4 bytes is kept as the first 4 of 12, then zeros, so
+/// tls13_nonce puts the sequence number behind it).
+fn tls12c_keys(c: &mut Tls13Client)
+  requires tls13c_ok(c) && blen(c.rnd) == 64 && blen(c.ms) == 48
+  ensures tls13c_ok(c)
+{
+  let mut kl = 32;
+  if c.suite == 4865 { kl = 16; }
+  let mut il = 4;
+  if c.suite == 4867 { il = 12; }
+  let sr = bytes_slice(c.rnd, 32, 64);
+  let cr = bytes_slice(c.rnd, 0, 32);
+  let seed = bytes_concat(sr, cr);
+  let kb = tls12c_prf(c.suite == 4866, c.ms, "key expansion", seed, 2 * kl + 2 * il);
+  let ck = bytes_slice(kb, 0, kl);
+  let sk = bytes_slice(kb, kl, 2 * kl);
+  let ci = bytes_slice(kb, 2 * kl, 2 * kl + il);
+  let si = bytes_slice(kb, 2 * kl + il, 2 * kl + 2 * il);
+  let pad = balloc(12 - il);
+  let civ = bytes_concat(ci, pad);
+  let siv = bytes_concat(si, pad);
+  bfree(c.c_key);
+  bfree(c.s_key);
+  bfree(c.c_iv);
+  bfree(c.s_iv);
+  c.c_key = ck;
+  c.s_key = sk;
+  c.c_iv = civ;
+  c.s_iv = siv;
+  c.c_suite = c.suite;
+  c.s_suite = c.suite;
+  c.c_seq = 0;
+  c.s_seq = 0;
+  bfree(pad);
+  bfree(si);
+  bfree(ci);
+  bfree(kb);
+  bfree(seed);
+  bfree(cr);
+  bfree(sr);
+}
+
+/// Internal: the ServerHelloDone `msg`: the client sends its share, changes
+/// to the new keys and sends its Finished.
+fn tls12c_hello_done(c: &mut Tls13Client, msg: &Bytes, out: &mut Vec[u8]) -> u64
+  requires tls13c_ok(c) && blen(msg) < 1048576
+  ensures tls13c_ok(c)
+{
+  if blen(msg) != 4 || bget(msg, 0) != 14 || bget(msg, 1) != 0 || bget(msg, 2) != 0 || bget(msg, 3) != 0 { return tls13c_fail(&mut c, 1); }
+  if !tls13c_note(&mut c, msg) { return tls13c_fail(&mut c, 1); }
+  if blen(c.ms) != 32 || blen(c.rnd) != 64 { return tls13c_fail(&mut c, 4); }
+  let base = tls13c_base();
+  let pubkey = x25519(c.priv_key, base);
+  bfree(base);
+  let mut k = text_new();
+  text_push(&mut k, 16);
+  text_push(&mut k, 0);
+  text_push(&mut k, 0);
+  text_push(&mut k, 33);
+  text_push(&mut k, 32);
+  text_push_bytes(&mut k, pubkey);
+  bfree(pubkey);
+  let cke = text_finish(k);
+  if !tls13c_note(&mut c, cke) { bfree(cke); return tls13c_fail(&mut c, 1); }
+  let big = c.suite == 4866;
+  let mut ms = balloc(0);
+  if c.ems {
+    let h = tls13c_hash(c);
+    bfree(ms);
+    ms = tls12c_prf(big, c.ms, "extended master secret", h, 48);
+    bfree(h);
+  } else {
+    bfree(ms);
+    ms = tls12c_prf(big, c.ms, "master secret", c.rnd, 48);
+  }
+  bfree(c.ms);
+  c.ms = ms;
+  tls12c_keys(&mut c);
+  tls12c_plain(&mut out, 22, cke);
+  bfree(cke);
+  let mut cs = text_new();
+  text_push(&mut cs, 1);
+  let ccs = text_finish(cs);
+  tls12c_plain(&mut out, 20, ccs);
+  bfree(ccs);
+  let h2 = tls13c_hash(c);
+  let vd = tls12c_prf(big, c.ms, "client finished", h2, 12);
+  bfree(h2);
+  let mut f = text_new();
+  text_push(&mut f, 20);
+  text_push(&mut f, 0);
+  text_push(&mut f, 0);
+  text_push(&mut f, 12);
+  text_push_bytes(&mut f, vd);
+  bfree(vd);
+  let fin = text_finish(f);
+  if !tls13c_note(&mut c, fin) { bfree(fin); return tls13c_fail(&mut c, 1); }
+  let sent = tls12c_seal(&mut c, 22, fin, &mut out);
+  bfree(fin);
+  if !sent { return tls13c_fail(&mut c, 1); }
+  c.step = 3;
+  return 0;
+}
+
+/// Internal: the server's Finished `msg` (after its ChangeCipherSpec).
+fn tls12c_finished(c: &mut Tls13Client, msg: &Bytes) -> u64
+  requires tls13c_ok(c) && blen(msg) < 1048576
+  ensures tls13c_ok(c)
+{
+  if blen(msg) != 16 || bget(msg, 0) != 20 || tls13c_u24(msg, 1) != 12 { return tls13c_fail(&mut c, 8); }
+  let h = tls13c_hash(c);
+  let want = tls12c_prf(c.suite == 4866, c.ms, "server finished", h, 12);
+  bfree(h);
+  let got = bytes_slice(msg, 4, 16);
+  let same = bytes_eq(want, got);
+  bfree(got);
+  bfree(want);
+  if !same { return tls13c_fail(&mut c, 8); }
+  if !tls13c_note(&mut c, msg) { return tls13c_fail(&mut c, 1); }
+  c.state = 5;
+  return 0;
+}
+
+/// Internal: a handshake message for a client that offered TLS 1.2 (the
+/// ServerHello, then the TLS 1.2 flight when the server chose it).
+fn tls12c_message(c: &mut Tls13Client, msg: &Bytes, roots: &Bytes, now: u64, out: &mut Vec[u8]) -> u64
+  requires tls13c_ok(c) && blen(msg) < 1048576 && blen(roots) < 274877906944
+  ensures tls13c_ok(c)
+{
+  if c.state == 0 {
+    let r = tls12c_server_hello(&mut c, msg);
+    if r != 1000 { return r; }
+    return tls13c_server_hello(&mut c, msg);
+  }
+  if !c.v12 || blen(msg) < 4 { return tls13c_fail(&mut c, 2); }
+  let ty = bget(msg, 0);
+  if c.state == 5 {
+    // A HelloRequest asks for a renegotiation, which this client does not do.
+    if ty == 0 { return 0; }
+    return tls13c_fail(&mut c, 2);
+  }
+  if c.step == 0 && ty == 11 { return tls12c_certificate(&mut c, msg, roots, now); }
+  if c.step == 1 && ty == 12 { return tls12c_key_exchange(&mut c, msg); }
+  if c.step == 2 && ty == 14 { return tls12c_hello_done(&mut c, msg, &mut out); }
+  if c.step == 4 && ty == 20 { return tls12c_finished(&mut c, msg); }
+  return tls13c_fail(&mut c, 2);
+}
+
+/// Internal: handshake bytes for `tls12c_message`, cut into messages.
+fn tls12c_handshake_data(c: &mut Tls13Client, plain: &Bytes, roots: &Bytes, now: u64, out: &mut Vec[u8]) -> u64
+  requires tls13c_ok(c) && blen(plain) <= 16640 && blen(roots) < 274877906944
+  ensures tls13c_ok(c)
+{
+  if blen(c.hsbuf) > 131072 { return tls13c_fail(&mut c, 1); }
+  let joined = tls13c_append(c.hsbuf, plain);
+  c.hsbuf = joined;
+  let mut more = true;
+  while more
+    invariant tls13c_ok(c)
+  {
+    more = false;
+    if blen(c.hsbuf) >= 4 {
+      let len = tls13c_u24(c.hsbuf, 1);
+      if len > 65536 { return tls13c_fail(&mut c, 1); }
+      if blen(c.hsbuf) >= 4 + len {
+        let msg = bytes_slice(c.hsbuf, 0, 4 + len);
+        let rest = bytes_slice(c.hsbuf, 4 + len, blen(c.hsbuf));
+        bfree(c.hsbuf);
+        c.hsbuf = rest;
+        let code = tls12c_message(&mut c, msg, roots, now, &mut out);
+        bfree(msg);
+        if code != 0 { return code; }
+        more = true;
+      }
+    }
+  }
+  // A TLS 1.3 server's ServerHello ends its record.
+  if !c.v12 && c.state == 1 && blen(c.hsbuf) != 0 { return tls13c_fail(&mut c, 2); }
+  return 0;
+}
+
+/// Internal: one whole record `rec` for a client that is in TLS 1.2.
+fn tls12c_record(c: &mut Tls13Client, rec: &Bytes, roots: &Bytes, now: u64, out: &mut Vec[u8], app: &mut Vec[u8]) -> u64
+  requires tls13c_ok(c) && blen(rec) >= 5 && blen(rec) <= 16645 && blen(roots) < 274877906944
+  ensures tls13c_ok(c)
+{
+  let ty = bget(rec, 0);
+  let n = blen(rec) - 5;
+  if ty == 20 {
+    if c.step == 3 && n == 1 && bget(rec, 5) == 1 { c.step = 4; return 0; }
+    return tls13c_fail(&mut c, 2);
+  }
+  if c.step < 4 {
+    // Before the server's ChangeCipherSpec everything is in the clear.
+    if ty == 22 && c.step <= 2 {
+      let body = bytes_slice(rec, 5, blen(rec));
+      let code = tls12c_handshake_data(&mut c, body, roots, now, &mut out);
+      bfree(body);
+      return code;
+    }
+    if ty == 21 { return tls13c_fail(&mut c, 9); }
+    return tls13c_fail(&mut c, 2);
+  }
+  match tls12c_open(&mut c, rec) {
+    Option::None => { return tls13c_fail(&mut c, 5); },
+    Option::Some(data) => {
+      let mut code = 0;
+      if ty == 22 {
+        code = tls12c_handshake_data(&mut c, data, roots, now, &mut out);
+      } else if ty == 21 {
+        if blen(data) == 2 && bget(data, 1) == 0 && c.state == 5 {
+          c.state = 6;
+        } else if blen(data) == 2 && bget(data, 0) == 1 && c.state == 5 {
+          // A warning (no_renegotiation and the like): the connection goes on.
+        } else {
+          code = tls13c_fail(&mut c, 9);
+        }
+      } else if ty == 23 && c.state == 5 {
+        text_push_bytes(&mut app, data);
+      } else {
+        code = tls13c_fail(&mut c, 2);
+      }
+      bfree(data);
+      return code;
+    },
+  }
 }
