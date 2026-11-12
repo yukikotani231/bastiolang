@@ -1,0 +1,165 @@
+// expect-exit: 0
+// core/rsa: key generation helpers. rsa_key_parts gives n, d, d mod (p-1), d mod (q-1) and q^-1 mod p equal
+// to Python's big-integer arithmetic for 1024-bit and 2048-bit primes drawn by OpenSSL (public exponents 65537
+// and 3); a swapped pair, an even prime and an exponent that divides p - 1 are refused. rsa_probable_prime
+// accepts those primes and refuses composites: 25326001 (a strong pseudoprime to the bases 2, 3 and 5), a
+// product of two primes, even numbers and a number with a small factor.
+import "core/rsa.bastio";
+
+/// The value of the hex digit `c` (0 for anything else).
+fn nib(c: u8) -> u8
+  ensures result < 16
+{
+  if c >= 48 && c <= 57 { return c - 48; }
+  if c >= 97 && c <= 102 { return c - 87; }
+  return 0;
+}
+
+/// The bytes written as hex digits in `s`.
+fn unhex(s: Str) -> Bytes
+  requires slen(s) < 100000
+  ensures blen(result) == slen(s) / 2
+{
+  let n = slen(s) / 2;
+  let mut b = balloc(n);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && blen(b) == n && slen(s) >= 2 * n
+  {
+    bset(&mut b, i, nib(sget(s, 2 * i)) * 16 + nib(sget(s, 2 * i + 1)));
+    i = i + 1;
+  }
+  return b;
+}
+
+/// Whether `r` is `Some` of the bytes written as hex in `want`; consumes `r`.
+fn is_hex(r: Option[Bytes], want: Str) -> bool
+  requires slen(want) < 100000
+{
+  match r {
+    Option::None => { return false; },
+    Option::Some(b) => {
+      let w = unhex(want);
+      let same = bytes_eq(b, w);
+      bfree(w);
+      bfree(b);
+      return same;
+    },
+  }
+}
+
+/// Whether `r` is `None`; consumes `r`.
+fn is_none(r: Option[Bytes]) -> bool {
+  match r {
+    Option::None => { return true; },
+    Option::Some(b) => {
+      bfree(b);
+      return false;
+    },
+  }
+}
+
+/// Whether `a` is prime by `rsa_probable_prime` with 8 rounds.
+fn prime(hex: Str) -> bool
+  requires slen(hex) < 100000
+{
+  let c = unhex(hex);
+  let r = rsa_probable_prime(c, 8);
+  bfree(c);
+  return r;
+}
+
+fn key0() -> u64 {
+  let p = unhex("dd6140835192fb8e9a711d6464b6d7929e763bd3c4c0d5aee3dd25f4aa38cce6596ccf6a1e2a55c5498bfc6c28efff08646489b81e5814c47e4aaa292bfe0fd5");
+  let q = unhex("dc1d609aebac1fbcbc446a856c53d4a44f71145d8ecfb02a601a6871cdad41a3228b77c0a3cf40af3fa194ca7909ae7063998bdeb2d5cc9fe66be13648d2a1a5");
+  let mut bad = 0;
+  if !is_hex(rsa_key_parts(p, q, 65537), "be58faff9979ba6d1dc81a16c6ae7ef35262a2a9c56dfd4997a56dba732891c599683cf7b40555cfa242789837ef67fdbefa178d43f4436d645885f598bf7bd0de76b7e445ab91c66e698bcb83f0f2705bca5efa03ad3f9454bdc0e1492933a3daf54a19ba0eebf8a83fbfe030619b97cc704d1dae35da3c14d1a7ff076f2949ab0e6da9eb33706c84ba016ffc666de19e64d3873bcc2735ce58b4ee3c74f5e31c84875d96e2c085d26c67d16b5af31a1e58c37788dce707548915016b9e90d5cb84437afdb0f31c956589a37750e744ced2a0c38b3895545db3af439df0f853e58efbe6e2fcd117e590426ccf73e892e93cf7577424a8e4b3f6f95711bce53134e526cff9aebff27bce693272aa096a1bf8ae24d44f2aff65ac92841a24063947c6aaec7516b275b833fd752e76e19df4b6dcfd242af1935d85a390c0d52c9d2d0a0dd46558c8fdb38044539cc0e287e4817ceb4fe78b62805ba6f772607b47c82fc587337d9afcc1066d0da90aa418f7285a086d8b75dd5a26c4e478ae30c9527f8641433c8b9bc37e58d8554201f36814e12bbbae8f052f541482653e0d5b4564638acae201f72ea4862384fc656065cd2baaf499045d7d74cfc265d6f6b3") { bad = wrap_add(bad, 1); }
+  if !is_none(rsa_key_parts(q, p, 65537)) { bad = wrap_add(bad, 1); }
+  if !is_none(rsa_key_parts(p, p, 65537)) { bad = wrap_add(bad, 1); }
+  if !is_none(rsa_key_parts(p, q, 5)) { bad = wrap_add(bad, 1); }
+  if !rsa_key_prime(p, 65537) { bad = wrap_add(bad, 1); }
+  if !rsa_key_prime(q, 65537) { bad = wrap_add(bad, 1); }
+  if rsa_key_prime(p, 5) { bad = wrap_add(bad, 1); }
+  if !prime("dd6140835192fb8e9a711d6464b6d7929e763bd3c4c0d5aee3dd25f4aa38cce6596ccf6a1e2a55c5498bfc6c28efff08646489b81e5814c47e4aaa292bfe0fd5") || !prime("dc1d609aebac1fbcbc446a856c53d4a44f71145d8ecfb02a601a6871cdad41a3228b77c0a3cf40af3fa194ca7909ae7063998bdeb2d5cc9fe66be13648d2a1a5") { bad = wrap_add(bad, 1); }
+  if prime("be58faff9979ba6d1dc81a16c6ae7ef35262a2a9c56dfd4997a56dba732891c599683cf7b40555cfa242789837ef67fdbefa178d43f4436d645885f598bf7bd0de76b7e445ab91c66e698bcb83f0f2705bca5efa03ad3f9454bdc0e1492933a3daf54a19ba0eebf8a83fbfe030619b97cc704d1dae35da3c14d1a7ff076f2949") { bad = wrap_add(bad, 1); }
+  let mut ev = unhex("dd6140835192fb8e9a711d6464b6d7929e763bd3c4c0d5aee3dd25f4aa38cce6596ccf6a1e2a55c5498bfc6c28efff08646489b81e5814c47e4aaa292bfe0fd5");
+  bset(&mut ev, blen(ev) - 1, bget(ev, blen(ev) - 1) ^ 1);
+  if rsa_probable_prime(ev, 8) { bad = wrap_add(bad, 1); }
+  bset(&mut ev, blen(ev) - 1, bget(ev, blen(ev) - 1) ^ 3);
+  if rsa_probable_prime(ev, 8) { bad = wrap_add(bad, 1); }
+  bfree(ev);
+  bfree(q);
+  bfree(p);
+  return bad;
+}
+
+fn key1() -> u64 {
+  let p = unhex("d0b3f077574b7d223cd4a702b7ea0fd541d5b99d789f72c46bbc09fbbc01de845fbe8ac94439a3c1c65e0eb80473090845c690d27e288fb746d24407872c9a4cb3c42936e516c4bf600bf9fce76e47e48d522bf6c75e2a9c2b047758d7e0d1a89f966805c26dae733f60d488fc98abb459db9541f9945fd97e73151ab5f218f7");
+  let q = unhex("bed5a0ab66b9a8fe9bb9a44f56fdc9e1e790a9d3cb1c0b071f5092758145570883314bb88e134a8ec772714fa29451182a4af5bc2f947438c4c8f9d309de73660e21db22d68a595fa0f46cfad7cc2fbecc27f075b6f00a937a317929b3886ee724ab87e47c7d1118f60e6ce955e26fce7d8058f8856ae5997f9eaaa58824072b");
+  let mut bad = 0;
+  if !is_hex(rsa_key_parts(p, q, 65537), "9b93b52bd850ec92fe95c876b9c71ba1ea692a14429f91da273a0cf1f70050a218582ce22cb44a0468ad1b795ca5af5653c3a429cbfbfc4701a870898a915dca3933420897aa9f2153ee3e028467b9ac6fc852a7a3dd480f509cbf2ab0d007505f96936e1ebf7dedc398a56936f8b671dc531667ddcf00c65a9fd7cc3e34daf2b5aea8edc3007ce4b5c00adff023bb1e2d11bde87e0c11e1552e13bd1c45c5d8f77abbb0600156bfe1f3941e7f2e9f0424647d5a1d46934904cffec98c5e513d50a9b6e9e9343b0f4dbfa45d252ebbda73093a9953090326eeb34ac32bc0bb0e68c77756d3683b494de31439cc69b47048efd98e2a8992d9866296f7e914f27d00a54c4b324aa3b0b87dc6a7377e2c0f2ff9dfc2d5c3f3c70402a9ab176b58ea534f8a6025ef599f4b0fecdd44152bf51fc3e01a8c4e2f6ddc03e6f3ab2f8f441798aedd7a43ab056863c4be1dee9046b6f00de7c43656e6395f6d2bb0302cd7988df76ead91fde3cebc0373bc56abeb2d0eeb38e322c8ce09f23fe3091f0f09912ef63a517af9913689ce51b86d9731e641ffce1edfd6bd806943257d777101dfd3f3bf8db701f7f45170f3e751c2676f88289e0f88729fdbe8ec2411c6f6b0cc86e366d5c9968528cc6264d9577a31005a27b5e7ec1e8eb82f5d0087a9d54851467c9966c45e8f1a5ae0b5133c7a460202ab275dbee53357bd7e272cfe81c1a8ff9c9036eb14f83d84017d6d0a272a0c36922896bd9f04b92cba74d3483c34bb0723815932c78d29218f0fa9e2b104b6e3d4efee62d0059c5eb5e1d6aee27f8bee2365a55aab9540a452195e1a6a3303d0ef72d4fc46cad0f6bbe20065b7c0b101ed58049a26728276d983d7ef94d2e514afa78dff7d223487e22610016bff097d601705edb79ca9abcaa2f3657d73916b5d369e040ffc53af53092adb82df767eae104868672dc0774d71335982cadbd78c6ec642f0a09e108c73d52acdbc4679a28711fa2145a3206486f8d23b91965f6a12c07d2159821b11b6642a25b1b2de20ccd8eff338b58bb418ca5f8f45ca71e67abd4fba892e927a53eef833af153820071956a0b6382ea39a4710894ab54427c0677f36e0939a0d427e29f9f23140dc6da5bb0721ffe4825635e41b857478e3cc23316d39ffdf4e4cc62063ac6a7a05456bd332d1b5a55677b34079b21c60d0e3de82528bcbfc8adbc1bb2dd2fe4a2c8fc831611d6d1394416963ae7b2a95746139d7a7c7cfa914aeb4fba80f") { bad = wrap_add(bad, 1); }
+  if !is_none(rsa_key_parts(q, p, 65537)) { bad = wrap_add(bad, 1); }
+  if !is_none(rsa_key_parts(p, p, 65537)) { bad = wrap_add(bad, 1); }
+  if !is_none(rsa_key_parts(p, q, 11)) { bad = wrap_add(bad, 1); }
+  if !rsa_key_prime(p, 65537) { bad = wrap_add(bad, 1); }
+  if !rsa_key_prime(q, 65537) { bad = wrap_add(bad, 1); }
+  if rsa_key_prime(p, 11) { bad = wrap_add(bad, 1); }
+  if !prime("d0b3f077574b7d223cd4a702b7ea0fd541d5b99d789f72c46bbc09fbbc01de845fbe8ac94439a3c1c65e0eb80473090845c690d27e288fb746d24407872c9a4cb3c42936e516c4bf600bf9fce76e47e48d522bf6c75e2a9c2b047758d7e0d1a89f966805c26dae733f60d488fc98abb459db9541f9945fd97e73151ab5f218f7") || !prime("bed5a0ab66b9a8fe9bb9a44f56fdc9e1e790a9d3cb1c0b071f5092758145570883314bb88e134a8ec772714fa29451182a4af5bc2f947438c4c8f9d309de73660e21db22d68a595fa0f46cfad7cc2fbecc27f075b6f00a937a317929b3886ee724ab87e47c7d1118f60e6ce955e26fce7d8058f8856ae5997f9eaaa58824072b") { bad = wrap_add(bad, 1); }
+  if prime("9b93b52bd850ec92fe95c876b9c71ba1ea692a14429f91da273a0cf1f70050a218582ce22cb44a0468ad1b795ca5af5653c3a429cbfbfc4701a870898a915dca3933420897aa9f2153ee3e028467b9ac6fc852a7a3dd480f509cbf2ab0d007505f96936e1ebf7dedc398a56936f8b671dc531667ddcf00c65a9fd7cc3e34daf2b5aea8edc3007ce4b5c00adff023bb1e2d11bde87e0c11e1552e13bd1c45c5d8f77abbb0600156bfe1f3941e7f2e9f0424647d5a1d46934904cffec98c5e513d50a9b6e9e9343b0f4dbfa45d252ebbda73093a9953090326eeb34ac32bc0bb0e68c77756d3683b494de31439cc69b47048efd98e2a8992d9866296f7e914f27d") { bad = wrap_add(bad, 1); }
+  let mut ev = unhex("d0b3f077574b7d223cd4a702b7ea0fd541d5b99d789f72c46bbc09fbbc01de845fbe8ac94439a3c1c65e0eb80473090845c690d27e288fb746d24407872c9a4cb3c42936e516c4bf600bf9fce76e47e48d522bf6c75e2a9c2b047758d7e0d1a89f966805c26dae733f60d488fc98abb459db9541f9945fd97e73151ab5f218f7");
+  bset(&mut ev, blen(ev) - 1, bget(ev, blen(ev) - 1) ^ 1);
+  if rsa_probable_prime(ev, 8) { bad = wrap_add(bad, 1); }
+  bset(&mut ev, blen(ev) - 1, bget(ev, blen(ev) - 1) ^ 3);
+  if rsa_probable_prime(ev, 8) { bad = wrap_add(bad, 1); }
+  bfree(ev);
+  bfree(q);
+  bfree(p);
+  return bad;
+}
+
+fn key2() -> u64 {
+  let p = unhex("ef7addf5e0fba23d2c5e5c68e1c0edc4408f6d60b1f484b1fbe4f657fd0f9489de1984dfe4090c7f2945534f3440160421e21d26c76a8ee666d5c4aea3f8d015");
+  let q = unhex("ce6acfbfa8073ba972e5a935a50a95d5dd15e5cd30f29701fb5a78068261386acb96aac143aaad3b0c1166fc4bf00d7a6045003f2c2bace078f488dc2ccc03a5");
+  let mut bad = 0;
+  if !is_hex(rsa_key_parts(p, q, 3), "c118c9d3662e75f1fd13d98280007da2fc8c2fb59f610a40a1a76212fd8e73c385a2812344f3a8d29c7bb9f95680b25eead2445392e8274a9baa2ed30626826efcb72d6db008506bff4bef7b18e9ba6780d340a64078ebb66a13aa44a8a3a153032e6ea7d1a310de2b4f8324638ac28d8a26d715b92f641cccd13891068a5c8980bb313799744ea153629101aaaafe6ca85d7523bf9606d5c11a4161fe5ef7d7ae6c5617834d1b3712fd26a639ab21949c8c2d8d0c9ac4dc67c6c9e20419ac48d48baa7ac4ae4c58eaaff13db6becf339773f3a593b68aac4c8d7d441b77383ee6542a04714a3a17f95085e5ece714b4afffd11fd910c58e9e049caece83b08b9fa73ea3eb526c28c83ee845ebd5f3d82b0a48eb214dadcbfd434ee5535fb85be966589542b0b2ff70d8e234cd800ead6bec136f2f9c5f44448e831f17fb3563899c8a7fc55a27c64c991b7918b1b9393e0e993375f70f56a791a559ac40d047326471d62d1c737cb2b644a832a008fc402e002a1d72734050a305e81ddd57c391ddaaa2a5a2851cad9729aabd27c0426b4d524aed6b54a33adad9f37e4ff0880632b6bcd7777fd5b7a58cb624e3e398969e0273557a1d257bfb3398cda73abd") { bad = wrap_add(bad, 1); }
+  if !is_none(rsa_key_parts(q, p, 3)) { bad = wrap_add(bad, 1); }
+  if !is_none(rsa_key_parts(p, p, 3)) { bad = wrap_add(bad, 1); }
+  if !is_none(rsa_key_parts(p, q, 5)) { bad = wrap_add(bad, 1); }
+  if !rsa_key_prime(p, 3) { bad = wrap_add(bad, 1); }
+  if !rsa_key_prime(q, 3) { bad = wrap_add(bad, 1); }
+  if rsa_key_prime(p, 5) { bad = wrap_add(bad, 1); }
+  if !prime("ef7addf5e0fba23d2c5e5c68e1c0edc4408f6d60b1f484b1fbe4f657fd0f9489de1984dfe4090c7f2945534f3440160421e21d26c76a8ee666d5c4aea3f8d015") || !prime("ce6acfbfa8073ba972e5a935a50a95d5dd15e5cd30f29701fb5a78068261386acb96aac143aaad3b0c1166fc4bf00d7a6045003f2c2bace078f488dc2ccc03a5") { bad = wrap_add(bad, 1); }
+  if prime("c118c9d3662e75f1fd13d98280007da2fc8c2fb59f610a40a1a76212fd8e73c385a2812344f3a8d29c7bb9f95680b25eead2445392e8274a9baa2ed30626826efcb72d6db008506bff4bef7b18e9ba6780d340a64078ebb66a13aa44a8a3a153032e6ea7d1a310de2b4f8324638ac28d8a26d715b92f641cccd13891068a5c89") { bad = wrap_add(bad, 1); }
+  let mut ev = unhex("ef7addf5e0fba23d2c5e5c68e1c0edc4408f6d60b1f484b1fbe4f657fd0f9489de1984dfe4090c7f2945534f3440160421e21d26c76a8ee666d5c4aea3f8d015");
+  bset(&mut ev, blen(ev) - 1, bget(ev, blen(ev) - 1) ^ 1);
+  if rsa_probable_prime(ev, 8) { bad = wrap_add(bad, 1); }
+  bset(&mut ev, blen(ev) - 1, bget(ev, blen(ev) - 1) ^ 3);
+  if rsa_probable_prime(ev, 8) { bad = wrap_add(bad, 1); }
+  bfree(ev);
+  bfree(q);
+  bfree(p);
+  return bad;
+}
+
+fn small() -> u64 {
+  let mut bad = 0;
+  if prime("0182b731") { bad = wrap_add(bad, 1); }
+  if !prime("1fffffffffffffff") { bad = wrap_add(bad, 1); }
+  if prime("1ffffffffffffffd") { bad = wrap_add(bad, 1); }
+  if prime("bf8d6d57") { bad = wrap_add(bad, 1); }
+  if prime("000102030405") { bad = wrap_add(bad, 1); }
+  if prime("010203") { bad = wrap_add(bad, 1); }
+  // 7919 * 104729 and 2^31 - 1 (prime), 2^32 - 5 (prime).
+  if prime("316edc57") { bad = wrap_add(bad, 1); }
+  if !prime("7fffffff") { bad = wrap_add(bad, 1); }
+  if !prime("fffffffb") { bad = wrap_add(bad, 1); }
+  return bad;
+}
+
+fn main() -> u64 {
+  let mut bad = small();
+  bad = wrap_add(bad, key0());
+  bad = wrap_add(bad, key1());
+  bad = wrap_add(bad, key2());
+  return bad;
+}
