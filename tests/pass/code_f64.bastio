@@ -1,0 +1,217 @@
+// stage1-only: f64 items of plans (machine code from plans)
+// backend: c
+// expect-exit: 0
+// Plans that compute on doubles held in their registers as bits: add, sub,
+// mul, div, sqrt, neg, abs, conversions to and from integers and compares,
+// each checked against the f64 builtins; a loop that counts in doubles. The
+// exit code is the number of the first check that failed. Where there is no
+// machine code (code_build gives 0) it checks only that.
+import "../../std/f64.bastio";
+
+struct Vm { regs: Vec[u64] }
+
+fn op_set(vm: &mut Vm, a: u64, b: u64, c: u64, d: u64) -> u64 {
+  if a < vec_len(vm.regs) {
+    vec_set(&mut vm.regs, a, b);
+  }
+  return 0;
+}
+
+fn op_get(vm: &mut Vm, a: u64, b: u64, c: u64, d: u64) -> u64 {
+  if a < vec_len(vm.regs) {
+    return vec_get(vm.regs, a);
+  }
+  return 0;
+}
+
+fn push6(p: &mut Vec[u64], a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, n: u64) {
+  vec_push(&mut p, a);
+  if n > 1 { vec_push(&mut p, b); }
+  if n > 2 { vec_push(&mut p, c); }
+  if n > 3 { vec_push(&mut p, d); }
+  if n > 4 { vec_push(&mut p, e); }
+  if n > 5 { vec_push(&mut p, f); }
+}
+
+fn i_const(p: &mut Vec[u64], d: u64, x: u64) { push6(&mut p, 8, d, x, 0, 0, 0, 3); }
+fn i_alu(p: &mut Vec[u64], op: u64, d: u64, a: u64, b: u64) { push6(&mut p, 10, op, d, a, b, 0, 5); }
+fn i_alui(p: &mut Vec[u64], op: u64, d: u64, a: u64, x: u64) { push6(&mut p, 11, op, d, a, x, 0, 5); }
+fn i_alu32(p: &mut Vec[u64], op: u64, d: u64, a: u64, b: u64, l: u64) { push6(&mut p, 12, op, d, a, b, l, 6); }
+fn i_cmpbr(p: &mut Vec[u64], c: u64, a: u64, b: u64, l: u64) { push6(&mut p, 13, c, a, b, l, 0, 5); }
+fn i_cmpbri(p: &mut Vec[u64], c: u64, a: u64, x: u64, l: u64) { push6(&mut p, 14, c, a, x, l, 0, 5); }
+fn i_getcur(p: &mut Vec[u64], d: u64) { push6(&mut p, 15, d, 0, 0, 0, 0, 2); }
+fn i_setcur(p: &mut Vec[u64], a: u64) { push6(&mut p, 16, a, 0, 0, 0, 0, 2); }
+fn i_load(p: &mut Vec[u64], d: u64, f: u64, b: u64, i: u64, l: u64) { push6(&mut p, 17, d, f, b, i, l, 6); }
+fn i_store(p: &mut Vec[u64], f: u64, b: u64, i: u64, s: u64, l: u64) { push6(&mut p, 18, f, b, i, s, l, 6); }
+fn i_callr(p: &mut Vec[u64], k: u64, a: u64, b: u64, c: u64, d: u64) { push6(&mut p, 19, k, a, b, c, d, 6); }
+fn i_jmp(p: &mut Vec[u64], l: u64) { push6(&mut p, 4, l, 0, 0, 0, 0, 2); }
+fn i_ret(p: &mut Vec[u64]) { push6(&mut p, 5, 0, 0, 0, 0, 0, 1); }
+fn i_call(p: &mut Vec[u64], k: u64, a: u64, b: u64, c: u64, d: u64) { push6(&mut p, 0, k, a, b, c, d, 6); }
+
+// Every plan starts with `ENTRY 2`, then a `RET` at word 2 that the exits use.
+fn start(p: &mut Vec[u64]) {
+  push6(&mut p, 7, 3, 0, 0, 0, 0, 2);
+  i_ret(&mut p);
+}
+
+// Stores r[s] at index `ix` of field `f`; an index out of range leaves the code.
+fn out(p: &mut Vec[u64], f: u64, ix: u64, s: u64) {
+  i_const(&mut p, 14, ix);
+  i_store(&mut p, f, 13, 14, s, 2);
+}
+
+fn patch(p: &mut Vec[u64], at: u64, v: u64) {
+  if at < vec_len(p) {
+    vec_set(&mut p, at, v);
+  }
+}
+
+fn reg(vm: &Vm, k: u64) -> u64 {
+  if k < vec_len(vm.regs) {
+    return vec_get(vm.regs, k);
+  }
+  return 0;
+}
+
+fn run(host: &Host, vm: &mut Vm, p: Vec[u64], e: u64) -> u64 {
+  let code = code_build(host, p);
+  vec_free(p);
+  if code == 0 {
+    return 0;
+  }
+  let r = code_call(code, &mut vm, e);
+  code_free(host, code);
+  return r;
+}
+
+fn i_falu(p: &mut Vec[u64], op: u64, d: u64, a: u64, b: u64) { push6(&mut p, 20, op, d, a, b, 0, 5); }
+fn i_fun(p: &mut Vec[u64], op: u64, d: u64, a: u64) { push6(&mut p, 21, op, d, a, 0, 0, 4); }
+fn i_fcmpbr(p: &mut Vec[u64], c: u64, a: u64, b: u64, l: u64) { push6(&mut p, 22, c, a, b, l, 0, 5); }
+
+// Sets r[d] to 1 when `c` holds for r[a], r[b] as doubles, else 0, and stores
+// it at index `ix` of the field.
+fn cmp_to(p: &mut Vec[u64], f: u64, ix: u64, c: u64, a: u64, b: u64) {
+  i_const(&mut p, 9, 0);
+  i_fcmpbr(&mut p, c, a, b, 0);
+  let t = wrap_sub(vec_len(p), 1);
+  i_jmp(&mut p, 0);
+  let j = wrap_sub(vec_len(p), 1);
+  patch(&mut p, t, vec_len(p));
+  i_const(&mut p, 9, 1);
+  patch(&mut p, j, vec_len(p));
+  out(&mut p, f, ix, 9);
+}
+
+fn want_bits(j: u64) -> u64 {
+  if j == 0 { return fbits(fadd(fnum(3), fnum(2))); }
+  if j == 1 { return fbits(fsub(fnum(3), fnum(2))); }
+  if j == 2 { return fbits(fmul(fnum(3), fnum(2))); }
+  if j == 3 { return fbits(fdiv(fnum(3), fnum(2))); }
+  if j == 4 { return fbits(fsqrt(fnum(2))); }
+  if j == 5 { return fbits(fneg(fnum(3))); }
+  if j == 6 { return fbits(fnum(3)); }
+  return fbits(fnum_i(-7));
+}
+
+// 3 == 2, 3 != 2, 2 < 3, 3 <= 2, 3 > 2, 3 >= 3, then with a NaN: ==, !=, <, >=.
+fn expect_at(j: u64) -> u64 {
+  if j == 1 || j == 2 || j == 4 || j == 5 || j == 7 { return 1; }
+  return 0;
+}
+
+fn main(host: &mut Host) -> u64 {
+  let mut vm = Vm { regs: vec_new[u64]() };
+  let mut k = 0;
+  while k < 64 {
+    vec_push(&mut vm.regs, 0);
+    k = k + 1;
+  }
+  let f = code_field(regs);
+  let three = fbits(fnum(3));
+  let two = fbits(fnum(2));
+  let nan = fbits(fnan());
+  let mut a = vec_new[u64]();
+  start(&mut a);
+  i_const(&mut a, 0, three);
+  i_const(&mut a, 1, two);
+  i_falu(&mut a, 0, 2, 0, 1);  out(&mut a, f, 0, 2);
+  i_falu(&mut a, 1, 2, 0, 1);  out(&mut a, f, 1, 2);
+  i_falu(&mut a, 2, 2, 0, 1);  out(&mut a, f, 2, 2);
+  i_falu(&mut a, 3, 2, 0, 1);  out(&mut a, f, 3, 2);
+  i_fun(&mut a, 0, 2, 1);      out(&mut a, f, 4, 2);   // sqrt 2
+  i_fun(&mut a, 1, 2, 0);      out(&mut a, f, 5, 2);   // neg 3
+  i_fun(&mut a, 2, 2, 2);      out(&mut a, f, 6, 2);   // abs of -3
+  i_const(&mut a, 3, 18446744073709551609);            // -7
+  i_fun(&mut a, 3, 2, 3);      out(&mut a, f, 7, 2);   // -7 as a double
+  i_const(&mut a, 4, fbits(fdiv(fnum(79), fnum(10))));
+  i_fun(&mut a, 1, 4, 4);                              // -7.9 (neg of 7.9)
+  i_fun(&mut a, 4, 2, 4);      out(&mut a, f, 8, 2);   // cut to an integer: -7
+  i_const(&mut a, 5, nan);
+  i_fun(&mut a, 4, 2, 5);      out(&mut a, f, 9, 2);   // NaN: 2^63
+  // Compares of 3 and 2: eq ne lt le gt ge, then with a NaN.
+  cmp_to(&mut a, f, 10, 0, 0, 1);
+  cmp_to(&mut a, f, 11, 1, 0, 1);
+  cmp_to(&mut a, f, 12, 2, 1, 0);
+  cmp_to(&mut a, f, 13, 3, 0, 1);
+  cmp_to(&mut a, f, 14, 4, 0, 1);
+  cmp_to(&mut a, f, 15, 5, 0, 0);
+  cmp_to(&mut a, f, 16, 0, 5, 5);   // NaN == NaN: false
+  cmp_to(&mut a, f, 17, 1, 5, 5);   // NaN != NaN: true
+  cmp_to(&mut a, f, 18, 2, 5, 0);   // NaN < 3: false
+  cmp_to(&mut a, f, 19, 5, 0, 5);   // 3 >= NaN: false
+  i_ret(&mut a);
+  let r1 = run(host, &mut vm, a, 0);
+
+  // A loop in doubles: x += 0.5 until x >= 1000.0, then x as an integer.
+  let mut c = vec_new[u64]();
+  start(&mut c);
+  i_const(&mut c, 0, 0);
+  i_const(&mut c, 1, fbits(fdiv(fnum(1), fnum(2))));
+  i_const(&mut c, 2, fbits(fnum(1000)));
+  let top = vec_len(c);
+  i_fcmpbr(&mut c, 5, 0, 2, 0);
+  let exit_at = wrap_sub(vec_len(c), 1);
+  i_falu(&mut c, 0, 0, 0, 1);
+  i_jmp(&mut c, top);
+  patch(&mut c, exit_at, vec_len(c));
+  i_fun(&mut c, 4, 3, 0);
+  i_setcur(&mut c, 3);
+  i_ret(&mut c);
+  let r2 = run(host, &mut vm, c, 0);
+  let mut bad = 0;
+  if reg(vm, 0) == 0 {
+    bad = 100;                      // no machine code on this platform: nothing ran
+  }
+  let mut j = 0;
+  while bad == 0 && j < 8 {
+    if reg(vm, j) != want_bits(j) {
+      bad = j + 1;
+    }
+    j = j + 1;
+  }
+  if bad == 0 && reg(vm, 8) != 18446744073709551609 {
+    bad = 9;
+  }
+  if bad == 0 && reg(vm, 9) != 9223372036854775808 {
+    bad = 10;
+  }
+  // eq ne lt le gt ge on 3 and 2 (as 3 == 2, 3 != 2, 2 < 3, 3 <= 2, 3 > 2, 3 >= 3), then the NaN ones.
+  j = 0;
+  while bad == 0 && j < 10 {
+    if reg(vm, 10 + j) != expect_at(j) {
+      bad = 11 + j;
+    }
+    j = j + 1;
+  }
+  if bad == 0 && r2 != 1000 {
+    bad = 21;
+  }
+  if bad == 100 {
+    bad = 0;
+  }
+  if r1 != 0 {
+    bad = 22;
+  }
+  vec_free(vm.regs);
+  return bad;
+}
