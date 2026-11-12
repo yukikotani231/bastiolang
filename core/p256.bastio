@@ -1,13 +1,15 @@
 // core/p256.bastio: ECDSA signatures over the curve P-256 (secp256r1) with
-// SHA-256, verification only (FIPS 186-4, RFC 6979 is for signing), for the
-// ecdsa_secp256r1_sha256 scheme of TLS 1.3 certificates.
+// SHA-256: verification for the ecdsa_secp256r1_sha256 scheme of TLS 1.3
+// certificates (FIPS 186-4), and public keys, ECDH and signing with a caller-drawn
+// nonce, for the Web Crypto API.
 //
 // What is proved: every access is in bounds, nothing leaks, and the numbers
 // the arithmetic works on have 16 limbs. Not proved: that the arithmetic is
 // right; the tests check signatures made by OpenSSL, many one-bit changes of
 // the signature, key and message being refused, and out-of-range values. The
-// code is not constant time and does not need to be: verification handles
-// only public values.
+// code is not constant time: verification handles only public values, but
+// key generation, ECDH and signing take secrets, so their running time depends
+// on them and they are for programs where nobody can measure it.
 //
 // A number is a `Vec[u64]` of 16 limbs of 16 bits, least significant first,
 // below 2^256. Products are built by doubling and adding, which is slow (a
@@ -806,4 +808,239 @@ fn ecdsa_p256_verify(pubkey: &Bytes, msg: &Bytes, sig: &Bytes) -> bool
   let ok = ecdsa_p256_verify_digest(pubkey, digest, sig);
   bfree(digest);
   return ok;
+}
+
+/// Internal: writes the number `a` as 32 big-endian bytes at `out[at..at+32]`.
+fn p256_bn_put(a: &Vec[u64], out: &mut Bytes, at: u64)
+  requires vlen(a) == 16 && at + 32 <= blen(out) && at < 274877906944
+  ensures blen(out) == blen(old(out))
+{
+  let mut i = 0;
+  while i < 16
+    invariant i <= 16 && vlen(a) == 16 && at + 32 <= blen(out) && blen(out) == blen(old(out))
+  {
+    let v = vec_get(a, i);
+    bset(&mut out, at + 30 - 2 * i, cast[u8]((v >> 8) & 255));
+    bset(&mut out, at + 31 - 2 * i, cast[u8](v & 255));
+    i = i + 1;
+  }
+}
+
+/// Internal: the affine coordinates of `q` as 32 bytes of x and 32 bytes of
+/// y, or None for the point at infinity.
+fn p256_affine(q: &P256Point, p: &Modulus) -> Option[Bytes]
+  requires vlen(q.x) == 16 && vlen(q.y) == 16 && vlen(q.z) == 16 && mod_ok(p)
+  ensures result is Option::Some ==> blen(result.Some) == 64
+{
+  if p256_bn_is_zero(q.z) { return Option[Bytes]::None; }
+  let zi = mod_inv(q.z, p);
+  let zi2 = p256_sq(zi, p);
+  let zi3 = mod_mul(zi2, zi, p);
+  let x = mod_mul(q.x, zi2, p);
+  let y = mod_mul(q.y, zi3, p);
+  let mut out = balloc(64);
+  p256_bn_put(x, &mut out, 0);
+  p256_bn_put(y, &mut out, 32);
+  vec_free(y);
+  vec_free(x);
+  vec_free(zi3);
+  vec_free(zi2);
+  vec_free(zi);
+  return Option[Bytes]::Some(out);
+}
+
+/// Internal: the base point of the curve.
+fn p256_base() -> P256Point
+  ensures vlen(result.x) == 16 && vlen(result.y) == 16 && vlen(result.z) == 16
+{
+  return P256Point { x: p256_bn_hex("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"), y: p256_bn_hex("4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"), z: p256_bn_small(1) };
+}
+
+/// The public key for the private key `d` on the curve P-256: the 65 bytes of an
+/// uncompressed point (0x04, x, y). `d` is a 32-byte big-endian number that
+/// must be in 1..n-1, else the result is None. Not constant time: the time
+/// taken depends on the key, so use it only where nobody can measure it.
+/// ```
+/// let d = balloc(32);
+/// let r = ecdsa_p256_public_key(d);
+/// bfree(d);
+/// match r {
+///   Option::None => { },
+///   Option::Some(k) => { bfree(k); },
+/// }
+/// ```
+fn ecdsa_p256_public_key(d: &Bytes) -> Option[Bytes]
+  requires blen(d) < 274877906944
+  ensures result is Option::Some ==> blen(result.Some) == 65
+{
+  if blen(d) != 32 { return Option[Bytes]::None; }
+  let p = mod_new(p256_bn_hex("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff"));
+  let n = mod_new(p256_bn_hex("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"));
+  let dn = p256_bn_from_bytes(d, 0);
+  if p256_bn_is_zero(dn) || p256_bn_ge(dn, n.m) {
+    vec_free(dn);
+    mod_free(n);
+    mod_free(p);
+    return Option[Bytes]::None;
+  }
+  let g = p256_base();
+  let q = p256_mul(dn, g, p);
+  let aff = p256_affine(q, p);
+  p256_free(q);
+  p256_free(g);
+  vec_free(dn);
+  mod_free(n);
+  mod_free(p);
+  match aff {
+    Option::None => { return Option[Bytes]::None; },
+    Option::Some(xy) => {
+      let mut out = balloc(65);
+      bset(&mut out, 0, 4);
+      bytes_copy_span(&mut out, 1, xy, 0, 64);
+      bfree(xy);
+      return Option[Bytes]::Some(out);
+    },
+  }
+}
+
+/// The shared secret of ECDH on the curve P-256: the 32-byte x coordinate of
+/// the private key `d` times the point `peer` (65 bytes, 0x04, x, y). The
+/// result is None when `d` is not in 1..n-1 or `peer` is not on the curve.
+/// Not constant time, as `ecdsa_p256_public_key`.
+/// ```
+/// let d = balloc(32);
+/// let peer = balloc(65);
+/// let r = ecdh_p256(d, peer);
+/// bfree(peer);
+/// bfree(d);
+/// match r {
+///   Option::None => { },
+///   Option::Some(k) => { bfree(k); },
+/// }
+/// ```
+fn ecdh_p256(d: &Bytes, peer: &Bytes) -> Option[Bytes]
+  requires blen(d) < 274877906944 && blen(peer) < 274877906944
+  ensures result is Option::Some ==> blen(result.Some) == 32
+{
+  if blen(d) != 32 || blen(peer) != 65 || bget(peer, 0) != 4 { return Option[Bytes]::None; }
+  let p = mod_new(p256_bn_hex("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff"));
+  let n = mod_new(p256_bn_hex("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"));
+  let dn = p256_bn_from_bytes(d, 0);
+  let qx = p256_bn_from_bytes(peer, 1);
+  let qy = p256_bn_from_bytes(peer, 33);
+  if p256_bn_is_zero(dn) || p256_bn_ge(dn, n.m) || !p256_on_curve(qx, qy, p) {
+    vec_free(qy);
+    vec_free(qx);
+    vec_free(dn);
+    mod_free(n);
+    mod_free(p);
+    return Option[Bytes]::None;
+  }
+  let q = P256Point { x: qx, y: qy, z: p256_bn_small(1) };
+  let r = p256_mul(dn, q, p);
+  let aff = p256_affine(r, p);
+  p256_free(r);
+  p256_free(q);
+  vec_free(dn);
+  mod_free(n);
+  mod_free(p);
+  match aff {
+    Option::None => { return Option[Bytes]::None; },
+    Option::Some(xy) => {
+      let mut out = balloc(32);
+      bytes_copy_span(&mut out, 0, xy, 0, 32);
+      bfree(xy);
+      return Option[Bytes]::Some(out);
+    },
+  }
+}
+
+/// An ECDSA signature on the curve P-256 of the message whose digest is `digest`
+/// (cut to its leftmost 32 bytes when longer), with the private key `d` and
+/// the nonce `k`: the 64 bytes of r then s. `d` and `k` are 32-byte big-endian
+/// numbers; the nonce must be secret, uniformly random in 1..n-1 and used
+/// once, or the key leaks. The result is None when `d` or `k` is not in 1..n-1
+/// or when r or s comes out 0 (the caller then draws another `k`). Not
+/// constant time, as `ecdsa_p256_public_key`.
+/// ```
+/// let d = balloc(32);
+/// let k = balloc(32);
+/// let digest = balloc(32);
+/// let r = ecdsa_p256_sign_digest(d, digest, k);
+/// bfree(digest);
+/// bfree(k);
+/// bfree(d);
+/// match r {
+///   Option::None => { },
+///   Option::Some(s) => { bfree(s); },
+/// }
+/// ```
+fn ecdsa_p256_sign_digest(d: &Bytes, digest: &Bytes, k: &Bytes) -> Option[Bytes]
+  requires blen(d) < 274877906944 && blen(digest) < 274877906944 && blen(k) < 274877906944
+  ensures result is Option::Some ==> blen(result.Some) == 64
+{
+  if blen(d) != 32 || blen(k) != 32 { return Option[Bytes]::None; }
+  let p = mod_new(p256_bn_hex("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff"));
+  let n = mod_new(p256_bn_hex("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"));
+  let dn = p256_bn_from_bytes(d, 0);
+  let kn = p256_bn_from_bytes(k, 0);
+  if p256_bn_is_zero(dn) || p256_bn_ge(dn, n.m) || p256_bn_is_zero(kn) || p256_bn_ge(kn, n.m) {
+    vec_free(kn);
+    vec_free(dn);
+    mod_free(n);
+    mod_free(p);
+    return Option[Bytes]::None;
+  }
+  let g = p256_base();
+  let q = p256_mul(kn, g, p);
+  let aff = p256_affine(q, p);
+  p256_free(q);
+  p256_free(g);
+  match aff {
+    Option::None => {
+      vec_free(kn);
+      vec_free(dn);
+      mod_free(n);
+      mod_free(p);
+      return Option[Bytes]::None;
+    },
+    Option::Some(xy) => {
+      let mut r = p256_bn_from_bytes(xy, 0);
+      bfree(xy);
+      if p256_bn_ge(r, n.m) {
+        let r2 = p256_bn_sub_wrap(r, n.m);
+        vec_free(r);
+        r = r2;
+      }
+      let mut e = p256_hash_number(digest);
+      if p256_bn_ge(e, n.m) {
+        let e2 = p256_bn_sub_wrap(e, n.m);
+        vec_free(e);
+        e = e2;
+      }
+      let rd = mod_mul(r, dn, n);
+      let sum = mod_add(e, rd, n);
+      let ki = mod_inv(kn, n);
+      let s = mod_mul(ki, sum, n);
+      let mut out = balloc(64);
+      p256_bn_put(r, &mut out, 0);
+      p256_bn_put(s, &mut out, 32);
+      let bad = p256_bn_is_zero(r) || p256_bn_is_zero(s);
+      vec_free(s);
+      vec_free(ki);
+      vec_free(sum);
+      vec_free(rd);
+      vec_free(e);
+      vec_free(r);
+      vec_free(kn);
+      vec_free(dn);
+      mod_free(n);
+      mod_free(p);
+      if bad {
+        bfree(out);
+        return Option[Bytes]::None;
+      }
+      return Option[Bytes]::Some(out);
+    },
+  }
 }
