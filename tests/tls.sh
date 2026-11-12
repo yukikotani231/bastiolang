@@ -59,11 +59,14 @@ make_cert() { # name kind ca names [ca_flag [hash]]
 }
 port=24000
 suites=TLS_CHACHA20_POLY1305_SHA256
+groups=X25519
+groups12=X25519:P-256:P-384
+sflags=
 v12=
 # Starts a TLS 1.2 server with one cipher (OpenSSL name) and sets $port.
 serve12() { # cert key cipher
   port=$((port + 1))
-  openssl s_server -www -accept "127.0.0.1:$port" -tls1_2 -cipher "$3" -groups X25519:P-256:P-384 \
+  openssl s_server -www -accept "127.0.0.1:$port" -tls1_2 -cipher "$3" -groups "$groups12" \
     -cert "$tmp/$1.pem" -key "$tmp/$2.key" >"$tmp/server.log" 2>&1 &
   pids+=($!)
   local i
@@ -78,7 +81,7 @@ serve() { # cert key [chain]
   port=$((port + 1))
   local chain=()
   [ -n "${3:-}" ] && chain=(-cert_chain "$tmp/$3.pem")
-  openssl s_server -www -accept "127.0.0.1:$port" -tls1_3 -ciphersuites "$suites" -groups X25519 \
+  openssl s_server -www -accept "127.0.0.1:$port" -tls1_3 -ciphersuites "$suites" -groups "$groups" $sflags \
     -cert "$tmp/$1.pem" -key "$tmp/$1.key" "${chain[@]}" >"$tmp/server.log" 2>&1 &
   pids+=($!)
   local i
@@ -135,6 +138,22 @@ serve eclocal eclocal && client "AES-256-GCM only server (SHA-384 key schedule)"
 suites=TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256
 serve eclocal eclocal && client "server that offers all three suites" 0 localhost ec.roots
 suites=TLS_CHACHA20_POLY1305_SHA256
+# A server without X25519 asks for another key share in a HelloRetryRequest.
+groups=P-256
+serve eclocal eclocal && client "HelloRetryRequest for a P-256 key share" 0 localhost ec.roots
+groups=P-384
+serve eclocal eclocal && client "HelloRetryRequest for a P-384 key share" 0 localhost ec.roots
+suites=TLS_AES_256_GCM_SHA384
+groups=P-256
+serve eclocal eclocal && client "HelloRetryRequest with the SHA-384 key schedule" 0 localhost ec.roots
+suites=TLS_CHACHA20_POLY1305_SHA256
+groups=X25519
+sflags=-stateless
+serve eclocal eclocal && client "HelloRetryRequest with a cookie (stateless server)" 0 localhost ec.roots
+sflags=
+groups=ffdhe2048
+serve eclocal eclocal && client "server with only a group the client does not offer" 1 localhost ec.roots
+groups=X25519
 make_cert rsalocal rsa rsaca "DNS:localhost"
 serve rsalocal rsalocal && client "RSA certificate (rsa_pss_rsae_sha256)" 0 localhost rsa.roots
 make_cert edlocal ed25519 edca "DNS:localhost"
@@ -177,7 +196,7 @@ make_cert notca ec ecca "DNS:localhost"
 make_cert badchild ec notca "DNS:localhost"
 serve badchild badchild notca && client "signer is not a CA" 1 localhost ec.roots
 
-# TLS 1.2 (ECDHE with X25519): refused unless the client allows it, then every suite.
+# TLS 1.2 (ECDHE with X25519, P-256 or P-384): refused unless the client allows it, then every suite.
 serve12 eclocal eclocal ECDHE-ECDSA-AES128-GCM-SHA256 && {
   client "TLS 1.2 server, client that wants TLS 1.3" 1 localhost ec.roots
   v12=12
@@ -193,6 +212,15 @@ serve12 rsalocal rsalocal ECDHE-RSA-AES128-GCM-SHA256 && client "TLS 1.2: ECDHE-
 serve12 rsalocal rsalocal ECDHE-RSA-AES256-GCM-SHA384 && client "TLS 1.2: ECDHE-RSA-AES256-GCM-SHA384" 0 localhost rsa.roots
 serve12 rsalocal rsalocal ECDHE-RSA-CHACHA20-POLY1305 && client "TLS 1.2: ECDHE-RSA-CHACHA20-POLY1305" 0 localhost rsa.roots
 serve chainleaf chainleaf mid && client "TLS 1.3 server, client that allows TLS 1.2" 0 localhost ec.roots
+groups12=P-256
+serve12 eclocal eclocal ECDHE-ECDSA-AES128-GCM-SHA256 && client "TLS 1.2: ECDHE with P-256" 0 localhost ec.roots
+serve12 rsalocal rsalocal ECDHE-RSA-AES256-GCM-SHA384 && client "TLS 1.2: ECDHE with P-256, RSA certificate" 0 localhost rsa.roots
+groups12=P-384
+serve12 eclocal eclocal ECDHE-ECDSA-AES256-GCM-SHA384 && client "TLS 1.2: ECDHE with P-384" 0 localhost ec.roots
+groups12=X25519:P-256:P-384
+groups=P-256
+serve eclocal eclocal && client "HelloRetryRequest, client that allows TLS 1.2" 0 localhost ec.roots
+groups=X25519
 v12=
 
 # https_fetch (URLs, host lookup, redirects) against a small HTTPS server in python3 with the ECDSA certificate.
