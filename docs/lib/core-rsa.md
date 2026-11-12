@@ -338,6 +338,16 @@ fn rsa_double(a: &Vec[u64], n: &Vec[u64], l: u64) -> Vec[u64]
 
 Internal: `2 * a` modulo `n` (for `a` below `n`).
 
+### `rsa_l32`
+
+```bastio
+fn rsa_l32(a: &Vec[u64], i: u64, l: u64) -> u64
+  requires vlen(a) == l && 2 * i < l
+```
+
+Internal: limb `i` of `a` (of `l` limbs of 16 bits) read as limbs of 32
+bits, the high half 0 past the end.
+
 ### `rsa_mont`
 
 ```bastio
@@ -346,8 +356,33 @@ fn rsa_mont(a: &Vec[u64], b: &Vec[u64], n: &Vec[u64], ninv: u64, l: u64) -> Vec[
   ensures vlen(result) == l
 ```
 
-Internal: `a * b / 2^(16 l)` modulo `n` (Montgomery multiplication, for
-`a` and `b` below `n`); `ninv` is -1/n modulo 2^16.
+Internal: `a * b / R` modulo `n` (Montgomery multiplication, for `a` and
+`b` below `n`), where R = 2^(32 L) and L = (l + 1) / 2; `ninv` is -1/n
+modulo 2^32. The numbers are kept in 16-bit limbs, but the product is
+formed on 32-bit limbs: every step `t + x * y + c` with 32-bit `t`, `x`,
+`y` and `c` is at most 2^64 - 1, so it fits a u64.
+
+### `rsa_ninv`
+
+```bastio
+fn rsa_ninv(n: &Vec[u64], l: u64) -> u64
+  requires vlen(n) == l && l >= 1
+```
+
+Internal: -1/n modulo 2^32 for the odd number `n`.
+
+### `rsa_r2`
+
+```bastio
+fn rsa_r2(n: &Vec[u64], ninv: u64, l: u64) -> Vec[u64]
+  requires vlen(n) == l && l >= 1 && l <= 256
+  ensures vlen(result) == l
+```
+
+Internal: R^2 modulo `n` for `rsa_mont` (R = 2^(32 L), L = (l + 1) / 2),
+for an odd `n` above 1. With RB = 32 L = t 2^k for an odd t: start from the
+top bit of n, double up to 2^(RB + t), and square k times in Montgomery
+form, each square taking the power p to 2 p - RB, which ends at 2 RB.
 
 ### `rsa_pow`
 

@@ -16,9 +16,11 @@ key generation, ECDH and signing take secrets, so their running time depends
 on them and they are for programs where nobody can measure it.
 
 A number is a `Vec[u64]` of 16 limbs of 16 bits, least significant first,
-below 2^256. Products are built by doubling and adding, which is slow (a
-verification takes about as long as a few thousand field multiplications of
-256 steps each) but short enough to read.
+below 2^256. Products are Montgomery multiplications formed on 32-bit limbs
+(a 32 by 32 bit product plus two 32-bit values fits a u64); the points are
+kept in Montgomery form while they are added and doubled, and a
+verification computes u1 G + u2 Q with one doubling per bit (Shamir's
+trick).
 
 `import "core/p256.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/der.bastio](core-der.md), [core/endian.bastio](core-endian.md), [core/text.bastio](core-text.md), [core/sha256.bastio](core-sha256.md).
 
@@ -37,11 +39,12 @@ Every example below is built, verified and run by `tests/run.sh`. An `assert` in
 ### `Modulus`
 
 ```bastio
-struct Modulus { m: Vec[u64], r2: Vec[u64], minv: u64 }
+struct Modulus { m: Vec[u64], r2: Vec[u64], minv: u64, minv32: u64 }
 ```
 
 Internal: a prime modulus `m` with what Montgomery multiplication needs:
-`r2` is 2^512 modulo `m` and `minv` is -1/m modulo 2^16.
+`r2` is 2^512 modulo `m`, `minv` is -1/m modulo 2^16 and `minv32` is
+-1/m modulo 2^32.
 
 ### `P256Point`
 
@@ -213,6 +216,16 @@ fn p256_nib(c: u8) -> u64
 
 Internal: the value of the hex digit `c` (0 for anything else).
 
+### `p256_vec`
+
+```bastio
+fn p256_vec(n: u64) -> Vec[u64]
+  ensures vlen(result) == 0
+```
+
+Internal: an empty vector with room for `n` limbs (so that pushing them
+allocates once; if the room cannot be had, the pushes grow it as usual).
+
 ### `p256_bn_zero`
 
 ```bastio
@@ -349,6 +362,15 @@ fn p256_bn_bit(a: &Vec[u64], i: u64) -> u64
 
 Internal: bit `i` of `a` (0 or 1).
 
+### `p256_l32`
+
+```bastio
+fn p256_l32(a: &Vec[u64], i: u64) -> u64
+  requires vlen(a) == 16 && i < 8
+```
+
+Internal: limb `i` of `a` when it is read as 8 limbs of 32 bits.
+
 ### `mont_mul`
 
 ```bastio
@@ -358,7 +380,9 @@ fn mont_mul(a: &Vec[u64], b: &Vec[u64], m: &Modulus) -> Vec[u64]
 ```
 
 Internal: `a * b / 2^256` modulo `m` (Montgomery multiplication, for `a`
-and `b` below `m`).
+and `b` below `m`). The numbers are kept in 16-bit limbs, but the product
+is formed on 32-bit limbs: every step `t + x * y + c` with 32-bit `t`, `x`,
+`y` and `c` is at most 2^64 - 1, so it fits a u64.
 
 ### `mod_mul`
 
@@ -396,7 +420,8 @@ fn mod_pow(a: &Vec[u64], e: &Vec[u64], m: &Modulus) -> Vec[u64]
   ensures vlen(result) == 16
 ```
 
-Internal: `a` to the power `e`, modulo `m`.
+Internal: `a` to the power `e`, modulo `m` (for `a` below `m`). The
+powers are kept in Montgomery form, so each step is one multiplication.
 
 ### `mod_inv`
 
@@ -445,6 +470,27 @@ fn p256_sq(a: &Vec[u64], p: &Modulus) -> Vec[u64]
 
 Internal: `a * a` modulo `p`.
 
+### `p256_msq`
+
+```bastio
+fn p256_msq(a: &Vec[u64], p: &Modulus) -> Vec[u64]
+  requires vlen(a) == 16 && mod_ok(p)
+  ensures vlen(result) == 16
+```
+
+Internal: `a * a / 2^256` modulo `p` (a square in Montgomery form).
+
+### `p256_mont`
+
+```bastio
+fn p256_mont(q: &P256Point, p: &Modulus, out: bool) -> P256Point
+  requires vlen(q.x) == 16 && vlen(q.y) == 16 && vlen(q.z) == 16 && mod_ok(p)
+  ensures vlen(result.x) == 16 && vlen(result.y) == 16 && vlen(result.z) == 16
+```
+
+Internal: `q` with each coordinate times 2^256 modulo `p` (into
+Montgomery form), or divided by it when `out` is true.
+
 ### `p256_double`
 
 ```bastio
@@ -453,7 +499,8 @@ fn p256_double(q: &P256Point, p: &Modulus) -> P256Point
   ensures vlen(result.x) == 16 && vlen(result.y) == 16 && vlen(result.z) == 16
 ```
 
-Internal: `2 * q`.
+Internal: `2 * q`, for a point in Montgomery form (each coordinate times
+2^256 modulo `p`).
 
 ### `p256_add`
 
@@ -464,7 +511,7 @@ fn p256_add(q1: &P256Point, q2: &P256Point, p: &Modulus) -> P256Point
   ensures vlen(result.x) == 16 && vlen(result.y) == 16 && vlen(result.z) == 16
 ```
 
-Internal: `q1 + q2`.
+Internal: `q1 + q2`, for points in Montgomery form.
 
 ### `p256_mul`
 
@@ -475,6 +522,18 @@ fn p256_mul(k: &Vec[u64], q: &P256Point, p: &Modulus) -> P256Point
 ```
 
 Internal: `k * q`.
+
+### `p256_mul2`
+
+```bastio
+fn p256_mul2(k1: &Vec[u64], q1: &P256Point, k2: &Vec[u64], q2: &P256Point, p: &Modulus) -> P256Point
+  requires vlen(k1) == 16 && vlen(q1.x) == 16 && vlen(q1.y) == 16 && vlen(q1.z) == 16 && mod_ok(p)
+  requires vlen(k2) == 16 && vlen(q2.x) == 16 && vlen(q2.y) == 16 && vlen(q2.z) == 16
+  ensures vlen(result.x) == 16 && vlen(result.y) == 16 && vlen(result.z) == 16
+```
+
+Internal: `k1 * q1 + k2 * q2`, with one doubling per bit for both
+(Shamir's trick).
 
 ### `p256_on_curve`
 
