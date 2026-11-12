@@ -4,7 +4,9 @@
 // certificates are still signed with (keys of 2048 to 4096 bits), and, for the
 // Web Crypto API, signing with both paddings, RSAES-OAEP encryption and
 // decryption, and the private-key operation under them (keys of 512 to 4096
-// bits when the caller asks for a smaller minimum).
+// bits when the caller asks for a smaller minimum), and the parts of key
+// generation: a probable-prime test and the rest of a private key from its two
+// primes (the caller draws the candidates).
 //
 // What is proved: every access is in bounds, nothing leaks, and the numbers
 // the arithmetic works on have the length of the key. Not proved: that the
@@ -1074,4 +1076,442 @@ fn rsa_oaep_decrypt(n: &Bytes, d: &Bytes, ct: &Bytes, label: &Bytes, hl: u64, mi
       return Option[Bytes]::Some(m);
     },
   }
+}
+
+/// Internal: `a * b` for numbers of `la` and `lb` limbs, as `la + lb` limbs.
+fn rsa_mul(a: &Vec[u64], la: u64, b: &Vec[u64], lb: u64) -> Vec[u64]
+  requires vlen(a) == la && vlen(b) == lb && la <= 1024 && lb <= 1024
+  ensures vlen(result) == la + lb
+{
+  let mut out = rsa_zero(la + lb);
+  let mut i = 0;
+  while i < la
+    invariant i <= la && vlen(out) == la + lb && vlen(a) == la && vlen(b) == lb && la <= 1024 && lb <= 1024
+  {
+    let ai = vec_get(a, i);
+    let mut c = 0;
+    let mut j = 0;
+    while j < lb
+      invariant j <= lb && i < la && vlen(out) == la + lb && vlen(b) == lb && lb <= 1024
+    {
+      let x = wrap_add(wrap_add(vec_get(out, i + j), wrap_mul(ai, vec_get(b, j))), c);
+      vec_set(&mut out, i + j, x & 65535);
+      c = x >> 16;
+      j = j + 1;
+    }
+    vec_set(&mut out, i + lb, c);
+    i = i + 1;
+  }
+  return out;
+}
+
+/// Internal: `a * m + add` for `m` and `add` below 2^32, as `la + 3` limbs.
+fn rsa_mul_small(a: &Vec[u64], la: u64, m: u64, add: u64) -> Vec[u64]
+  requires vlen(a) == la && la <= 1024 && m < 4294967296 && add < 4294967296
+  ensures vlen(result) == la + 3
+{
+  let mut out = rsa_zero(la + 3);
+  let mut c = add;
+  let mut i = 0;
+  while i < la
+    invariant i <= la && vlen(out) == la + 3 && vlen(a) == la && la <= 1024 && c < 281474976710656
+  {
+    let x = (vec_get(a, i) & 65535) * m + c;
+    vec_set(&mut out, i, x & 65535);
+    c = x >> 16;
+    i = i + 1;
+  }
+  vec_set(&mut out, la, c & 65535);
+  vec_set(&mut out, la + 1, (c >> 16) & 65535);
+  vec_set(&mut out, la + 2, c >> 32);
+  return out;
+}
+
+/// Internal: `a / m` (floor) for `m` in 1 .. 2^32 - 1, with `la` limbs.
+fn rsa_div_small(a: &Vec[u64], la: u64, m: u64) -> Vec[u64]
+  requires vlen(a) == la && la <= 1024 && m >= 1 && m < 4294967296
+  ensures vlen(result) == la
+{
+  let mut out = rsa_zero(la);
+  let mut r = 0;
+  let mut i = la;
+  while i > 0
+    invariant i <= la && vlen(out) == la && vlen(a) == la && r < m && m >= 1 && m < 4294967296
+  {
+    i = i - 1;
+    let x = r * 65536 + (vec_get(a, i) & 65535);
+    vec_set(&mut out, i, (x / m) & 65535);
+    r = x % m;
+  }
+  return out;
+}
+
+/// Internal: `a mod m` for `m` in 1 .. 2^32 - 1, with `la` limbs.
+fn rsa_mod_small(a: &Vec[u64], la: u64, m: u64) -> u64
+  requires vlen(a) == la && la <= 1024 && m >= 1 && m < 4294967296
+  ensures result < m
+{
+  let mut r = 0;
+  let mut i = la;
+  while i > 0
+    invariant i <= la && vlen(a) == la && r < m && m >= 1 && m < 4294967296
+  {
+    i = i - 1;
+    r = (r * 65536 + (vec_get(a, i) & 65535)) % m;
+  }
+  return r;
+}
+
+/// Internal: `a mod m` for `la` and `lm` limbs, as `lm` limbs (shift and
+/// subtract; `m` must not be zero).
+fn rsa_mod_big(a: &Vec[u64], la: u64, m: &Vec[u64], lm: u64) -> Vec[u64]
+  requires vlen(a) == la && vlen(m) == lm && la <= 1024 && lm >= 1 && lm <= 1024
+  ensures vlen(result) == lm
+{
+  let mut r = rsa_zero(lm);
+  let mut bit = 16 * la;
+  while bit > 0
+    invariant bit <= 16 * la && vlen(r) == lm && vlen(a) == la && vlen(m) == lm && la <= 1024 && lm >= 1 && lm <= 1024
+  {
+    bit = bit - 1;
+    // r = 2 r + bit, keeping the carry out of the top limb.
+    let inb = (vec_get(a, bit / 16) >> (bit % 16)) & 1;
+    let mut carry = inb;
+    let mut i = 0;
+    while i < lm
+      invariant i <= lm && vlen(r) == lm && carry <= 1
+    {
+      let x = wrap_add(wrap_mul(vec_get(r, i), 2), carry);
+      vec_set(&mut r, i, x & 65535);
+      carry = (x >> 16) & 1;
+      i = i + 1;
+    }
+    if carry > 0 || rsa_ge(r, m, lm) {
+      let d = rsa_sub(r, m, lm);
+      vec_free(r);
+      r = d;
+    }
+  }
+  return r;
+}
+
+/// Internal: the inverse of `a` modulo `m` (`m` in 2 .. 2^32 - 1), or 0 when
+/// there is none.
+fn rsa_inv_small(a: u64, m: u64) -> u64
+  requires m >= 2 && m < 4294967296
+  ensures result < m
+{
+  let mut r0 = m;
+  let mut r1 = a % m;
+  let mut s0 = 0;
+  let mut s1 = 1;
+  let mut guard = 0;
+  while r1 != 0 && guard < 100
+    invariant r0 <= m && r1 < m && s0 < m && s1 < m && m >= 2 && m < 4294967296 && guard <= 100
+  {
+    let q = r0 / r1;
+    let r2 = r0 - q * r1;
+    let ns = (s0 + m - ((q % m) * s1) % m) % m;
+    r0 = r1;
+    r1 = r2;
+    s0 = s1;
+    s1 = ns;
+    guard = guard + 1;
+  }
+  if r0 != 1 { return 0; }
+  return s0;
+}
+
+/// Internal: whether the numbers `a` and `b` of `l` limbs are equal.
+fn rsa_eq(a: &Vec[u64], b: &Vec[u64], l: u64) -> bool
+  requires vlen(a) == l && vlen(b) == l
+{
+  let mut i = 0;
+  while i < l
+    invariant i <= l && vlen(a) == l && vlen(b) == l
+  {
+    if vec_get(a, i) != vec_get(b, i) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+/// Internal: the `i`-th Miller-Rabin base (the first twelve primes).
+fn rsa_mr_base(i: u64) -> u64
+  ensures result >= 2 && result <= 37
+{
+  if i == 0 { return 2; }
+  if i == 1 { return 3; }
+  if i == 2 { return 5; }
+  if i == 3 { return 7; }
+  if i == 4 { return 11; }
+  if i == 5 { return 13; }
+  if i == 6 { return 17; }
+  if i == 7 { return 19; }
+  if i == 8 { return 23; }
+  if i == 9 { return 29; }
+  if i == 10 { return 31; }
+  return 37;
+}
+
+/// Internal: whether the odd number `nl` (`l` limbs, at least 2^24) passes
+/// the Miller-Rabin test for the base `a`, where `nm1` is `nl - 1`, `d` the
+/// odd part of `nm1` as bytes and `r` the number of factors of 2 in it.
+fn rsa_mr_round(nl: &Vec[u64], nm1: &Vec[u64], d: &Bytes, r: u64, a: u64, l: u64) -> bool
+  requires vlen(nl) == l && vlen(nm1) == l && l >= 1 && l <= 256 && blen(d) <= 512 && r >= 1 && r <= 4096 && a >= 2 && a <= 37
+{
+  let mut base = rsa_zero(l);
+  vec_set(&mut base, 0, a);
+  let mut x = rsa_pow_bytes(base, d, nl, l);
+  vec_free(base);
+  let mut one = rsa_zero(l);
+  vec_set(&mut one, 0, 1);
+  let mut ok = rsa_eq(x, one, l) || rsa_eq(x, nm1, l);
+  let mut two = balloc(1);
+  bset(&mut two, 0, 2);
+  let mut j = 1;
+  while !ok && j < r
+    invariant j >= 1 && j <= r + 1 && vlen(x) == l && vlen(nl) == l && vlen(nm1) == l && vlen(one) == l && l >= 1 && l <= 256 && blen(two) == 1
+  {
+    let sq = rsa_pow_bytes(x, two, nl, l);
+    vec_free(x);
+    x = sq;
+    if rsa_eq(x, nm1, l) { ok = true; }
+    // Reaching 1 without passing through -1 means a nontrivial root of 1.
+    if !ok && rsa_eq(x, one, l) { j = r; }
+    j = j + 1;
+  }
+  bfree(two);
+  vec_free(one);
+  vec_free(x);
+  return ok;
+}
+
+/// Whether the big-endian number `cand` (at least 4 bytes, the first not 0)
+/// is prime with high probability: it is odd, has no divisor below 1000 and
+/// passes the Miller-Rabin test for the first `rounds` primes as bases
+/// (at most 12; 5 or more is plenty for numbers that were drawn at random).
+/// Numbers up to 4096 bits. Not constant time.
+/// ```
+/// let c = bfrom("abcdefgh");
+/// let p = rsa_probable_prime(c, 5);
+/// bfree(c);
+/// if p { return 1; }
+/// ```
+fn rsa_probable_prime(cand: &Bytes, rounds: u64) -> bool
+  requires rounds <= 12
+{
+  let k = blen(cand);
+  if k < 4 || k > 512 || bget(cand, 0) == 0 { return false; }
+  if bget(cand, k - 1) % 2 == 0 { return false; }
+  // No small odd divisor.
+  let mut p = 3;
+  while p < 1000
+    invariant p >= 3 && p < 1002 && k == blen(cand)
+  {
+    let mut rem = 0;
+    let mut i = 0;
+    while i < k
+      invariant i <= k && k == blen(cand) && rem < p && p >= 3 && p < 1002
+    {
+      rem = (rem * 256 + cast[u64](bget(cand, i))) % p;
+      i = i + 1;
+    }
+    if rem == 0 { return false; }
+    p = p + 2;
+  }
+  let l = (k + 1) / 2;
+  let nl = rsa_limbs(cand, 0, k, l);
+  let mut nm1 = rsa_zero(l);
+  let mut i = 0;
+  while i < l
+    invariant i <= l && vlen(nm1) == l && vlen(nl) == l
+  {
+    vec_set(&mut nm1, i, vec_get(nl, i));
+    i = i + 1;
+  }
+  // The modulus is odd, so its lowest limb is not 0.
+  if vec_get(nm1, 0) == 0 {
+    vec_free(nm1);
+    vec_free(nl);
+    return false;
+  }
+  vec_set(&mut nm1, 0, vec_get(nm1, 0) - 1);
+  // r: the number of trailing zero bits of nm1 (at least 1).
+  let mut r = 0;
+  while r < 16 * l && ((vec_get(nm1, r / 16) >> (r % 16)) & 1) == 0
+    invariant r <= 16 * l && vlen(nm1) == l && l >= 1
+  {
+    r = r + 1;
+  }
+  if r >= 16 * l || r == 0 {
+    vec_free(nm1);
+    vec_free(nl);
+    return false;
+  }
+  // d = nm1 >> r.
+  let mut dl = rsa_zero(l);
+  let sh = r / 16;
+  let bits = r % 16;
+  i = 0;
+  while i + sh < l
+    invariant i <= l && vlen(dl) == l && vlen(nm1) == l && sh <= l && sh == r / 16 && bits == r % 16
+  {
+    let lo = (vec_get(nm1, i + sh) & 65535) >> bits;
+    let mut hi = 0;
+    if i + sh + 1 < l { hi = ((vec_get(nm1, i + sh + 1) & 65535) << (16 - bits)) & 65535; }
+    vec_set(&mut dl, i, lo | hi);
+    i = i + 1;
+  }
+  let d = rsa_to_bytes(dl, l, k);
+  vec_free(dl);
+  let mut prime = true;
+  let mut round = 0;
+  while prime && round < rounds
+    invariant round <= rounds && rounds <= 12 && vlen(nl) == l && vlen(nm1) == l && l >= 1 && l <= 256 && blen(d) == k && k <= 512 && r >= 1 && r <= 4096
+  {
+    if !rsa_mr_round(nl, nm1, d, r, rsa_mr_base(round), l) { prime = false; }
+    round = round + 1;
+  }
+  bfree(d);
+  vec_free(nm1);
+  vec_free(nl);
+  return prime;
+}
+
+/// Whether `cand` could be one of the two primes of an RSA key with the
+/// public exponent `e` (odd, 3 to 2^32 - 1): `rsa_probable_prime` with 5
+/// rounds, and `cand - 1` not divisible by `e`.
+/// ```
+/// let c = bfrom("abcdefgh");
+/// let p = rsa_key_prime(c, 65537);
+/// bfree(c);
+/// if p { return 1; }
+/// ```
+fn rsa_key_prime(cand: &Bytes, e: u64) -> bool
+  requires e >= 3 && e < 4294967296
+{
+  let k = blen(cand);
+  if k < 4 || k > 512 { return false; }
+  let mut rem = 0;
+  let mut i = 0;
+  while i < k
+    invariant i <= k && k == blen(cand) && rem < e && e >= 3 && e < 4294967296
+  {
+    rem = (rem * 256 + cast[u64](bget(cand, i))) % e;
+    i = i + 1;
+  }
+  if rem == 1 { return false; }
+  return rsa_probable_prime(cand, 5);
+}
+
+/// The rest of an RSA private key from the primes `p` > `q` (big-endian, `h`
+/// bytes each, `h` even, 32 to 256) and the public exponent `e` (odd, 3 to
+/// 2^32 - 1): n (2h bytes), d (2h), d mod (p - 1) (h), d mod (q - 1) (h) and
+/// the inverse of q modulo p (h), one after the other, where d is the
+/// inverse of e modulo (p - 1)(q - 1). The result is `None` when `p` is not
+/// above `q`, either is even, or `e` has a factor in common with
+/// (p - 1)(q - 1). Not constant time.
+/// ```
+/// let p = balloc(32);
+/// let q = balloc(32);
+/// let r = rsa_key_parts(p, q, 65537);
+/// bfree(q);
+/// bfree(p);
+/// match r {
+///   Option::None => { },
+///   Option::Some(k) => { bfree(k); },
+/// }
+/// ```
+fn rsa_key_parts(p: &Bytes, q: &Bytes, e: u64) -> Option[Bytes]
+  requires e >= 3 && e < 4294967296
+  ensures result is Option::Some ==> blen(result.Some) == 7 * blen(p)
+{
+  let h = blen(p);
+  if h != blen(q) || h < 32 || h > 256 || h % 2 != 0 { return Option[Bytes]::None; }
+  let hl = h / 2;
+  let pl = rsa_limbs(p, 0, h, hl);
+  let ql = rsa_limbs(q, 0, h, hl);
+  if !rsa_ge(pl, ql, hl) || rsa_eq(pl, ql, hl) || vec_get(pl, 0) % 2 == 0 || vec_get(ql, 0) % 2 == 0 {
+    vec_free(ql);
+    vec_free(pl);
+    return Option[Bytes]::None;
+  }
+  let mut pm1 = rsa_zero(hl);
+  let mut qm1 = rsa_zero(hl);
+  let mut i = 0;
+  while i < hl
+    invariant i <= hl && vlen(pm1) == hl && vlen(qm1) == hl && vlen(pl) == hl && vlen(ql) == hl
+  {
+    vec_set(&mut pm1, i, vec_get(pl, i));
+    vec_set(&mut qm1, i, vec_get(ql, i));
+    i = i + 1;
+  }
+  vec_set(&mut pm1, 0, vec_get(pm1, 0) & 65534);
+  vec_set(&mut qm1, 0, vec_get(qm1, 0) & 65534);
+  let n = rsa_mul(pl, hl, ql, hl);
+  let phi = rsa_mul(pm1, hl, qm1, hl);
+  let g = rsa_mod_small(phi, 2 * hl, e);
+  let inv = rsa_inv_small(g, e);
+  if inv == 0 {
+    vec_free(phi);
+    vec_free(n);
+    vec_free(qm1);
+    vec_free(pm1);
+    vec_free(ql);
+    vec_free(pl);
+    return Option[Bytes]::None;
+  }
+  // d = (1 + t phi) / e with t = -1/phi modulo e.
+  let t = (e - inv) % e;
+  let prod = rsa_mul_small(phi, 2 * hl, t, 1);
+  let quot = rsa_div_small(prod, 2 * hl + 3, e);
+  let mut d = rsa_zero(2 * hl);
+  i = 0;
+  while i < 2 * hl
+    invariant i <= 2 * hl && vlen(d) == 2 * hl && vlen(quot) == 2 * hl + 3
+  {
+    vec_set(&mut d, i, vec_get(quot, i));
+    i = i + 1;
+  }
+  let dp = rsa_mod_big(d, 2 * hl, pm1, hl);
+  let dq = rsa_mod_big(d, 2 * hl, qm1, hl);
+  // q^-1 = q^(p-2) modulo p.
+  let mut two = rsa_zero(hl);
+  vec_set(&mut two, 0, 2);
+  let pm2 = rsa_sub(pl, two, hl);
+  let pm2b = rsa_to_bytes(pm2, hl, h);
+  let qi = rsa_pow_bytes(ql, pm2b, pl, hl);
+  let mut out = balloc(7 * h);
+  let nb = rsa_to_bytes(n, 2 * hl, 2 * h);
+  let db = rsa_to_bytes(d, 2 * hl, 2 * h);
+  let dpb = rsa_to_bytes(dp, hl, h);
+  let dqb = rsa_to_bytes(dq, hl, h);
+  let qib = rsa_to_bytes(qi, hl, h);
+  bytes_copy_span(&mut out, 0, nb, 0, 2 * h);
+  bytes_copy_span(&mut out, 2 * h, db, 0, 2 * h);
+  bytes_copy_span(&mut out, 4 * h, dpb, 0, h);
+  bytes_copy_span(&mut out, 5 * h, dqb, 0, h);
+  bytes_copy_span(&mut out, 6 * h, qib, 0, h);
+  bfree(qib);
+  bfree(dqb);
+  bfree(dpb);
+  bfree(db);
+  bfree(nb);
+  bfree(pm2b);
+  vec_free(qi);
+  vec_free(pm2);
+  vec_free(two);
+  vec_free(dq);
+  vec_free(dp);
+  vec_free(d);
+  vec_free(quot);
+  vec_free(prod);
+  vec_free(phi);
+  vec_free(n);
+  vec_free(qm1);
+  vec_free(pm1);
+  vec_free(ql);
+  vec_free(pl);
+  return Option[Bytes]::Some(out);
 }

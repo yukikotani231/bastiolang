@@ -167,6 +167,7 @@ fn main(con: &mut Serial) -> u64 {
 | `Box[T]` | An owning pointer to a `T` on the heap; the only way a type can contain itself |
 | A struct with a linear field, an enum with a linear payload | |
 | `Host`, `Child` | The host system, and a child process (hosted target only) |
+| `Thread[R]`, `SharedBytes` | A running thread that will return an `R`, and a handle to bytes threads share (hosted target only, stage1 only). See [Threads](#threads) |
 | `Serial`, `Pool`, `Frame`, `PageTable`, `Mmu`, `Cpu`, `Lease`, `Ports`, `PortIo`, `MmioSpace`, `Mmio`, `Dma` | Capabilities: the console, physical pages, page tables, the MMU, the CPU's user context, a processor's hold on the address space it runs on, I/O ports, memory-mapped device registers and pages lent to devices. See [Kernel capabilities](#kernel-capabilities) |
 
 **Borrows** are allowed only as parameter types, so a borrow can never be stored, returned or outlive the call:
@@ -597,6 +598,63 @@ fn main() -> u64 {
 - Every access is sequentially consistent, so a program behaves as if the processors' steps were interleaved one at a time. Weaker orderings are not available (see [concurrency.md](concurrency.md)).
 - An atomic is linear: it must be consumed by `atomic_end` (`E-LINEAR-LEAK`). It cannot hand over ownership: it never holds a linear value.
 - Generated code: an atomic is a pointer to the word on the heap; the operations are the C compiler's `__atomic` builtins with `__ATOMIC_SEQ_CST`. Invariants generate nothing.
+
+### Threads
+
+`thread_spawn(f, args..)` runs `f(args..)` on a new thread and returns a `Thread[R]`, where `R` is what `f` returns. `thread_join(t)` waits for the thread and gives back `f`'s result (stage1 only, hosted target, C backend only so far).
+
+```bastio
+// expect-ok
+fn sum_to(n: u64, b: Buf) -> Buf
+  requires n <= 1000 && len(b) == 1
+  ensures len(result) == 1
+{
+  let mut s = 0;
+  let mut i = 1;
+  while i <= n invariant i >= 1 && i <= n + 1 && s <= i * 1000 {
+    s = s + i;
+    i = i + 1;
+  }
+  return set(b, 0, s);
+}
+
+fn main() -> u64 {
+  let t = thread_spawn(sum_to, 10, alloc(1));   // proves sum_to's requires
+  let b = thread_join(t);                       // len(b) == 1 is known
+  let s = get(b, 0);
+  free(b);
+  return s % 50;
+}
+```
+
+- `f` is the name of a function (not generic, as for `locked`). Every argument is **moved** into the thread, so `f` cannot take a borrow (`E-TYPE`): the thread may outlive the caller's variables, and two threads could otherwise both write one value. What a thread is given is its own until it hands it back as its result; the only memory two threads touch at once is a `SharedBytes` (below), whose every access is atomic. So no data race can be written.
+- `f`'s precondition is proved where the thread is started, and its postcondition is known of what `thread_join` returns, exactly as for a call: the thread computes `f` of values nobody else can reach.
+- A `Thread` is linear: it must be joined (`E-LINEAR-LEAK`), so whatever the thread owns comes back. Joining a thread that never ends waits forever; that is a deadlock, which is not ruled out (see [concurrency.md](concurrency.md)).
+- An owned `Host` (`host_own`) can be passed to a thread to give it the file system. A `Cpu`, `Mmu` or `Lease` cannot (`E-PIN`), but they do not exist on the hosted target.
+- Generated code: a POSIX thread (`pthread_create`, with a 64 MiB stack; define `BST_THREAD_STACK` for another size). The thread's block on the heap holds its `pthread_t`, the result and the arguments; the `Thread` is its address. A thread that cannot be started stops the program, as running out of memory does.
+
+### Shared bytes
+
+A `SharedBytes` is a run of bytes that any number of threads read and write at once. It is a handle: `sbytes_clone` makes another handle to the same bytes (to move into a thread), and the bytes are freed when the last handle is dropped. Every access is atomic, so there is nothing to prove about who touches the bytes; what is proved is that each access is inside them and, for the word accesses, aligned to its width. This is what JavaScript's `SharedArrayBuffer` and `Atomics` need (stage1 only, hosted target, C backend only so far).
+
+| Builtin | Requires (proved) | Effect |
+| --- | --- | --- |
+| `sbytes_new(n: u64) -> SharedBytes` | `n <= 2^60` | `n` zero bytes; `sbytes_len` of the result is `n` |
+| `sbytes_len(b: &SharedBytes) -> u64` | | The length (`sbytes_len(b)` in specifications); it never changes |
+| `sbytes_clone(b: &SharedBytes) -> SharedBytes` | | Another handle to the same bytes |
+| `sbytes_drop(b: SharedBytes)` | | Gives up a handle; the last one frees the bytes |
+| `sbytes_load(b, i, w) -> u64` and `sbytes_store(b, i, w, v)` | `w` is 1, 2, 4 or 8; `i % w == 0`; `i + w <= sbytes_len(b)` | Reads, or writes the low `w` bytes of `v`, as one sequentially consistent atomic access (little endian, as the machine is) |
+| `sbytes_get(b, i, w) -> u64` and `sbytes_set(b, i, w, v)` | as for `sbytes_load` | The same with relaxed ordering: atomic, but ordered with nothing else (JavaScript's "unordered" accesses) |
+| `sbytes_rmw(b, op, i, w, v) -> u64` | `op <= 5`; as for `sbytes_load` | Atomically replaces the word `x` with `x + v`, `x - v` (both wrapping), `x & v`, `x \| v`, `x ^ v` or `v` (op 0 to 5), and returns `x` |
+| `sbytes_cas(b, i, w, x, v) -> u64` | as for `sbytes_load` | Writes `v` if the word is `x` (both cut to `w` bytes), and returns the word it found |
+| `sbytes_wait(b, i, w, x, ns) -> u64` | `w` is 4 or 8; `i % w == 0`; `i + w <= sbytes_len(b)` | Sleeps while the word is `x`, until `sbytes_notify` wakes this thread or `ns` nanoseconds pass (2^64 - 1: no limit). 0: woken, 1: the word was not `x`, 2: timed out (`Atomics.wait`) |
+| `sbytes_notify(b, i, count) -> u64` | `i < sbytes_len(b)` | Wakes up to `count` threads waiting on the word at `i`, longest waiting first, and returns how many it woke (at most `count`) |
+| `sbytes_read(b, from, out: &mut Bytes, at, n)` | `from + n <= sbytes_len(b)`; `at + n <= blen(out)` | Copies `n` bytes into `out`, each one a relaxed atomic read |
+| `sbytes_write(b, at, src: &Bytes, from, n)` | `at + n <= sbytes_len(b)`; `from + n <= blen(src)` | Copies `n` bytes from `src`, each one a relaxed atomic write |
+
+- Another thread may change the bytes at any moment, so nothing is known of a value read except that it fits in `w` bytes.
+- Only `sbytes_wait` blocks. Its check of the word and its going to sleep happen under the mutex that `sbytes_notify` takes, so a notification sent after the word changed is never lost.
+- Generated code: the handle points to a block holding the count of handles (an atomic), the length, a mutex with the list of waiters, and the bytes; the accesses are the C compiler's `__atomic` builtins. Mixing word sizes on the same bytes is outside what C11 defines but is what every processor does atomically, as in JavaScript engines; it is part of the trusted base with the rest of the prelude.
 
 ## Enums and `match`
 
@@ -1492,7 +1550,7 @@ Syntax, types and linearity:
 | `E-LINEAR-LEAK` | A linear value is still owned at the end of its scope or at a `return`, is overwritten, or is dropped by `_` |
 | `E-LINEAR-BRANCH` | Only one arm of an `if` or a `match` consumes a value; a loop body changes the ownership of an outer value |
 | `E-LOCK-ORDER` | A lock may be taken while a lock of the same class (contents type) is held, or lock classes are taken in opposite orders in two places |
-| `E-PIN` | A `Cpu`, `Mmu` or `Lease` (or a value holding one) is put in a lock or shared between processors by `smp_run` |
+| `E-PIN` | A `Cpu`, `Mmu` or `Lease` (or a value holding one) is put in a lock, shared between processors by `smp_run` or moved to another thread by `thread_spawn` |
 
 Proofs:
 
@@ -1602,4 +1660,4 @@ What a program that `bastioc0` accepts is guaranteed: no out-of-bounds access, n
 
 ## Not in the language yet
 
-Planned, in [ROADMAP.md](../ROADMAP.md): the rest of concurrency (threads, atomics, interrupt-safe locks; designed in [concurrency.md](concurrency.md)), more hardware capabilities (`IrqOff`), allocation failure in the type, and a native x86-64 backend. Inference of type arguments, modules with qualified names, and hand-written lemmas for proofs Z3 cannot find are open questions.
+Planned, in [ROADMAP.md](../ROADMAP.md): the rest of concurrency (fork-join `par`, `Share`, channels, interrupt-safe locks; designed in [concurrency.md](concurrency.md)), more hardware capabilities (`IrqOff`), allocation failure in the type, and a native x86-64 backend. Inference of type arguments, modules with qualified names, and hand-written lemmas for proofs Z3 cannot find are open questions.

@@ -834,7 +834,7 @@ fn x86_words(g: &mut X86, c: &Checker, m: &Mono, p: &Parser, t: u64) -> u64 {
   if k == TY_BUF || k == TY_BYTES || k == TY_STR || k == TY_POOL {
     return 2;
   }
-  if (k == TY_LOCK || k == TY_ATOMIC || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA || k == TY_MMU || k == TY_CPU || k == TY_LEASE || k == TY_SHARED || k == TY_DIRTY) && !g.stage0 {
+  if (k == TY_LOCK || k == TY_ATOMIC || k == TY_PORTS || k == TY_MMIOSPACE || k == TY_DMA || k == TY_MMU || k == TY_CPU || k == TY_LEASE || k == TY_SHARED || k == TY_DIRTY || k == TY_THREAD || k == TY_SBYTES) && !g.stage0 {
     return 1;     // a lock or atomic word's address; Ports, MmioSpace, Mmu and Cpu (0); a frame's address (a Lease: its table; a Shared or Dirty page)
   }
   if (k == TY_PORTIO || k == TY_MMIO) && !g.stage0 {
@@ -2601,6 +2601,15 @@ fn x86_ty_in(g: &mut X86, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u
       }
       if name_is(p, i, "atomic_store") || name_is(p, i, "smp_run") {
         return c.tunit;
+      }
+      if name_is(p, i, "thread_spawn") {
+        let fnode = node_at(p.nodes, n.a);
+        let x = plain_inst(&mut m, plain_fn(p, fnode.s, fnode.e));
+        return intern(&mut m, p, TY_THREAD, cg_ret_ty(&mut m, p, x));
+      }
+      if name_is(p, i, "thread_join") {
+        let t = x86_ty(&mut g, c, &mut m, p, n.a);
+        return inner_t(m, t);
       }
       if name_is(p, i, "atomic_cas") {
         return c.tbool;
