@@ -297,6 +297,8 @@ fn cg_tyname(g: &mut Cg, m: &Mono, p: &Parser, t: u64, mode: u64) {
   else if k == TY_VEC { cg_tn(&mut g, "Vec[", mode); cg_tyname(&mut g, m, p, x.a, mode); cg_tn(&mut g, "]", mode); }
   else if k == TY_LOCK { cg_tn(&mut g, "Lock[", mode); cg_tyname(&mut g, m, p, x.a, mode); cg_tn(&mut g, "]", mode); }
   else if k == TY_THREAD { cg_tn(&mut g, "Thread[", mode); cg_tyname(&mut g, m, p, x.a, mode); cg_tn(&mut g, "]", mode); }
+  else if k == TY_CHAN { cg_tn(&mut g, "Chan[", mode); cg_tyname(&mut g, m, p, x.a, mode); cg_tn(&mut g, "]", mode); }
+  else if k == TY_SHARE { cg_tn(&mut g, "Share[", mode); cg_tyname(&mut g, m, p, x.a, mode); cg_tn(&mut g, "]", mode); }
   else if k == TY_ATOMIC { cg_tn(&mut g, "Atomic[", mode); cg_tyname(&mut g, m, p, x.a, mode); cg_tn(&mut g, "]", mode); }
   else if k == TY_REF { cg_tn(&mut g, "&", mode); cg_tyname(&mut g, m, p, x.a, mode); }
   else if k == TY_MUTREF { cg_tn(&mut g, "&mut ", mode); cg_tyname(&mut g, m, p, x.a, mode); }
@@ -360,6 +362,10 @@ fn cg_cty(g: &mut Cg, m: &Mono, p: &Parser, t: u64) {
   else if k == TY_SBYTES { cg_t(&mut g, "struct bst_shb *"); }
   // The thread block: its pthread_t, the result, then the arguments.
   else if k == TY_THREAD { cg_t(&mut g, "void *"); }
+  // A handle to the queue: its count of handles, its mutex and the elements.
+  else if k == TY_CHAN { cg_t(&mut g, "struct bst_chan *"); }
+  // The value, with the count of handles 16 bytes before it (bst_share_alloc).
+  else if k == TY_SHARE { cg_cty(&mut g, m, p, x.a); cg_t(&mut g, " *"); }
   else if k == TY_STRUCT { cg_t(&mut g, "bst_s_"); cg_instname(&mut g, m, p, x.a, CG_CID); }
   else if k == TY_ENUM { cg_t(&mut g, "bst_e_"); cg_instname(&mut g, m, p, x.a, CG_CID); }
   else if k == TY_BOX { cg_cty(&mut g, m, p, x.a); cg_t(&mut g, " *"); }
@@ -678,6 +684,44 @@ fn cg_type_of(g: &Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) 
       if name_is(p, i, "thread_join") {
         let t = cg_type_of(g, c, &mut m, p, a0, 0);
         return inner_t(m, t);
+      }
+      if name_is(p, i, "par_each") {
+        return c.tunit;
+      }
+      if is_share_builtin(p, n.s, n.e) {
+        if name_is(p, i, "share_with") {
+          let fnode = node_at(p.nodes, cg_arg(p, i, 1));
+          let x = plain_inst(&mut m, plain_fn(p, fnode.s, fnode.e));
+          return cg_ret_ty(&mut m, p, x);
+        }
+        let t = base_t(m, cg_type_of(g, c, &mut m, p, a0, 0));
+        if name_is(p, i, "share_new") {
+          return intern(&mut m, p, TY_SHARE, t);
+        }
+        if name_is(p, i, "share_clone") {
+          return t;
+        }
+        return intern(&mut m, p, TY_VEC, inner_t(m, t));
+      }
+      if is_chan_builtin(p, n.s, n.e) {
+        let t = cg_type_of(g, c, &mut m, p, a0, 0);
+        let bt = base_t(m, t);
+        if name_is(p, i, "chan_new") {
+          return intern(&mut m, p, TY_CHAN, inner_t(m, bt));
+        }
+        if name_is(p, i, "chan_clone") {
+          return bt;
+        }
+        if name_is(p, i, "chan_drop") {
+          return intern(&mut m, p, TY_VEC, inner_t(m, bt));
+        }
+        if name_is(p, i, "chan_send") {
+          return c.tunit;
+        }
+        if name_is(p, i, "chan_recv") {
+          return c.tbool;
+        }
+        return c.tu64;
       }
       if is_pt_borrow_builtin(p, n.s, n.e) {
         let fnode = node_at(p.nodes, cg_arg(p, i, 2));
@@ -1260,11 +1304,20 @@ fn cg_call(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64)
     if name_is(p, i, "smp_run") {
       return cg_smp_run(&mut g, c, &mut m, p, i);
     }
+    if name_is(p, i, "par_each") {
+      return cg_par_each(&mut g, c, &mut m, p, i);
+    }
     if name_is(p, i, "thread_spawn") {
       return cg_thread_spawn(&mut g, c, &mut m, p, i);
     }
     if name_is(p, i, "thread_join") {
       return cg_thread_join(&mut g, c, &mut m, p, i);
+    }
+    if is_chan_builtin(p, n.s, n.e) {
+      return cg_chan(&mut g, c, &mut m, p, i);
+    }
+    if is_share_builtin(p, n.s, n.e) {
+      return cg_share(&mut g, c, &mut m, p, i);
     }
     if is_pt_borrow_builtin(p, n.s, n.e) {
       return cg_pt_borrow(&mut g, c, &mut m, p, i);
@@ -2097,6 +2150,111 @@ fn cg_smp_run(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp
   return cg_span(g, start);
 }
 
+/// `par_each(&mut v, f, args..)`: a block with a pointer to the elements
+/// and the other arguments, and a body that calls `f` on element `k`;
+/// `bst_par_run` hands the indices out to the threads.
+fn cg_par_each(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp {
+  let n = node_at(p.nodes, i);
+  let fnode = node_at(p.nodes, cg_arg(p, i, 1));
+  let x = plain_inst(&mut m, plain_fn(p, fnode.s, fnode.e));
+  let el = cg_vec_elem(g, c, &mut m, p, n.a);
+  cg_note(&mut g.vecs, el);
+  let k = g.nsmp;
+  g.nsmp = cg_add(k, 1);
+  let mut xs = vec_new[u64]();
+  vec_push(&mut xs, n.a);
+  let mut a = cg_arg(p, i, 2);
+  while a != 0 {
+    vec_push(&mut xs, a);
+    a = next_of(p, a);
+  }
+  let mut vals = vec_new[CgSp]();
+  let pre = cg_operands(&mut g, c, &mut m, p, xs, true, &mut vals);
+  vec_free(xs);
+  let xi = inst_at(m, x);
+  let ps = fn_params(&mut m, p, xi.def, x);
+  let mut rest = vec_new[CgSp]();
+  let mut q = 1;
+  while q < vec_len(vals) && q < vec_len(ps) {
+    let w = cg_ref_arg(&mut g, m, p, u_at(ps, q), sp_at(vals, q), true);
+    vec_push(&mut rest, w);
+    q = cg_add(q, 1);
+  }
+  // The block and the body.
+  let s1 = cg_mark(g);
+  cg_t(&mut g, "struct bst_par_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " { ");
+  cg_cty(&mut g, m, p, el);
+  cg_t(&mut g, " *d;");
+  let mut j = 1;
+  while j < vec_len(ps) {
+    cg_t(&mut g, " ");
+    cg_param_cty(&mut g, m, p, u_at(ps, j));
+    cg_t(&mut g, " a");
+    cg_n(&mut g, j);
+    cg_t(&mut g, ";");
+    j = cg_add(j, 1);
+  }
+  cg_t(&mut g, " };\nstatic void bst_par_body_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, "(void *q, uint64_t k) { struct bst_par_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " *a = q; ");
+  cg_fname(&mut g, m, p, x);
+  cg_t(&mut g, "(&a->d[k]");
+  j = 1;
+  while j < vec_len(ps) {
+    cg_t(&mut g, ", a->a");
+    cg_n(&mut g, j);
+    j = cg_add(j, 1);
+  }
+  cg_t(&mut g, "); }\n");
+  let def = cg_span(g, s1);
+  let mut b = vec_new[u64]();
+  cg_copy(g, def, &mut b);
+  let mut z = 0;
+  while z < vec_len(b) {
+    vec_push(&mut g.smp, u_at(b, z));
+    z = z + 1;
+  }
+  vec_free(b);
+  vec_free(ps);
+  // The call: fill the block, run the body on every index.
+  let start = cg_mark(g);
+  cg_t(&mut g, "({ struct bst_par_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " bst_pa_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, "; bst_pa_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, ".d = (void *)(");
+  cg_sp(&mut g, sp_at(vals, 0));
+  cg_t(&mut g, ")->data; ");
+  j = 0;
+  while j < vec_len(rest) {
+    cg_t(&mut g, "bst_pa_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, ".a");
+    cg_n(&mut g, cg_add(j, 1));
+    cg_t(&mut g, " = ");
+    cg_sp(&mut g, sp_at(rest, j));
+    cg_t(&mut g, "; ");
+    j = cg_add(j, 1);
+  }
+  cg_t(&mut g, "bst_par_run((");
+  cg_sp(&mut g, sp_at(vals, 0));
+  cg_t(&mut g, ")->len, bst_par_body_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, ", &bst_pa_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, "); })");
+  vec_free(rest);
+  vec_free(vals);
+  let e = cg_span(g, start);
+  return cg_seq(&mut g, pre, e);
+}
+
 /// `thread_spawn(f, args..)`: a block on the heap holds the thread's
 /// pthread_t, then the result, then the arguments (every one moved in), and
 /// a thunk the new thread runs calls `f` on them. The `Thread` is the
@@ -2201,6 +2359,179 @@ fn cg_thread_spawn(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) ->
   vec_free(xs);
   vec_free(ps);
   return cg_seq(&mut g, pre, e);
+}
+
+/// The channel builtins: the prelude's queue works on elements of any size,
+/// so each call passes `sizeof(T)`, and a sent value goes through a
+/// temporary whose address the queue copies from.
+fn cg_chan(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp {
+  let n = node_at(p.nodes, i);
+  let t0 = base_t(m, cg_type_of(g, c, &mut m, p, n.a, 0));
+  let el = inner_t(m, t0);
+  let s1 = cg_mark(g);
+  cg_t(&mut g, "sizeof(");
+  cg_cty(&mut g, m, p, el);
+  cg_t(&mut g, ")");
+  let size = cg_span(g, s1);
+  let xs = cg_args_of(p, i);
+  let mut vals = vec_new[CgSp]();
+  let pre = cg_operands(&mut g, c, &mut m, p, xs, true, &mut vals);
+  let start = cg_mark(g);
+  if name_is(p, i, "chan_send") {
+    let k = cg_tmp(&mut g);
+    cg_t(&mut g, "({ ");
+    cg_cty(&mut g, m, p, el);
+    cg_t(&mut g, " cx_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, " = ");
+    cg_sp(&mut g, sp_at(vals, 1));
+    cg_t(&mut g, "; bst_chan_send(");
+    cg_sp(&mut g, sp_at(vals, 0));
+    cg_t(&mut g, ", &cx_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, ", ");
+    cg_sp(&mut g, size);
+    cg_t(&mut g, "); })");
+  } else {
+    cg_t(&mut g, "bst_");
+    cg_src(&mut g, p, n.s, n.e);
+    cg_t(&mut g, "(");
+    cg_list(&mut g, vals);
+    if !name_is(p, i, "chan_clone") && !name_is(p, i, "chan_len") {
+      cg_t(&mut g, ", ");
+      cg_sp(&mut g, size);
+    }
+    cg_t(&mut g, ")");
+  }
+  vec_free(vals);
+  vec_free(xs);
+  let e = cg_span(g, start);
+  return cg_seq(&mut g, pre, e);
+}
+
+/// The `Share` builtins. A `Share[T]` points to the value; the count of
+/// handles is 16 bytes before it (`bst_share_alloc`). The value is written
+/// once, before the handle can reach another thread, and only read after.
+fn cg_share(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp {
+  let n = node_at(p.nodes, i);
+  if name_is(p, i, "share_with") {
+    let fnode = node_at(p.nodes, cg_arg(p, i, 1));
+    let x = plain_inst(&mut m, plain_fn(p, fnode.s, fnode.e));
+    let mut xs = vec_new[u64]();
+    vec_push(&mut xs, n.a);
+    let mut a = cg_arg(p, i, 2);
+    while a != 0 {
+      vec_push(&mut xs, a);
+      a = next_of(p, a);
+    }
+    let mut vals = vec_new[CgSp]();
+    let pre = cg_operands(&mut g, c, &mut m, p, xs, true, &mut vals);
+    let xi = inst_at(m, x);
+    let ps = fn_params(&mut m, p, xi.def, x);
+    let st = cg_mark(g);
+    cg_t(&mut g, "(*");
+    cg_sp(&mut g, sp_at(vals, 0));
+    cg_t(&mut g, ")");
+    let ge = cg_span(g, st);
+    let elem = cg_ref_arg(&mut g, m, p, u_at(ps, 0), ge, true);
+    let mut rest = vec_new[CgSp]();
+    let mut q = 1;
+    while q < vec_len(vals) && q < vec_len(ps) {
+      let an = node_at(p.nodes, u_at(xs, q));
+      let pl = an.kind == E_VAR || an.kind == E_FIELD || pre.n != 0;
+      let w = cg_ref_arg(&mut g, m, p, u_at(ps, q), sp_at(vals, q), pl);
+      vec_push(&mut rest, w);
+      q = cg_add(q, 1);
+    }
+    vec_free(ps);
+    vec_free(xs);
+    let start = cg_mark(g);
+    cg_fname(&mut g, m, p, x);
+    cg_t(&mut g, "(");
+    cg_sp(&mut g, elem);
+    q = 0;
+    while q < vec_len(rest) {
+      cg_t(&mut g, ", ");
+      cg_sp(&mut g, sp_at(rest, q));
+      q = q + 1;
+    }
+    cg_t(&mut g, ")");
+    vec_free(rest);
+    vec_free(vals);
+    let e = cg_span(g, start);
+    return cg_seq(&mut g, pre, e);
+  }
+  let t0 = base_t(m, cg_type_of(g, c, &mut m, p, n.a, 0));
+  let mut el = t0;
+  if !name_is(p, i, "share_new") {
+    el = inner_t(m, t0);
+  }
+  let s1 = cg_mark(g);
+  cg_cty(&mut g, m, p, el);
+  let ct = cg_span(g, s1);
+  let e0 = cg_expr(&mut g, c, &mut m, p, n.a, 0);
+  let k = cg_tmp(&mut g);
+  let start = cg_mark(g);
+  if name_is(p, i, "share_clone") {
+    cg_t(&mut g, "((");
+    cg_sp(&mut g, ct);
+    cg_t(&mut g, " *)bst_share_clone(");
+    cg_sp(&mut g, e0);
+    cg_t(&mut g, "))");
+  } else if name_is(p, i, "share_new") {
+    cg_t(&mut g, "({ ");
+    cg_sp(&mut g, ct);
+    cg_t(&mut g, " sv_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, " = ");
+    cg_sp(&mut g, e0);
+    cg_t(&mut g, "; ");
+    cg_sp(&mut g, ct);
+    cg_t(&mut g, " *sp_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, " = bst_share_alloc(sizeof(");
+    cg_sp(&mut g, ct);
+    cg_t(&mut g, ")); *sp_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, " = sv_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, "; sp_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, "; })");
+  } else {
+    // share_drop: the value in a vector of one if this was the last handle.
+    cg_t(&mut g, "({ ");
+    cg_sp(&mut g, ct);
+    cg_t(&mut g, " *sp_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, " = ");
+    cg_sp(&mut g, e0);
+    cg_t(&mut g, "; bst_vec sr_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, " = { 0, 0, 0 }; if (bst_share_release(sp_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, ")) { sr_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, ".data = bst_regrow(0, 0, (sizeof(");
+    cg_sp(&mut g, ct);
+    cg_t(&mut g, ") + 7) / 8); *(");
+    cg_sp(&mut g, ct);
+    cg_t(&mut g, " *)sr_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, ".data = *sp_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, "; sr_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, ".len = sr_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, ".cap = 1; bst_share_free(sp_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, "); } sr_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, "; })");
+  }
+  let e = cg_span(g, start);
+  return e;
 }
 
 /// `thread_join(t)`: waits for the thread, takes the result out of its
@@ -3054,7 +3385,7 @@ fn cg_program(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser) {
   if child_async {
     cg_part(&mut g.out, PART_CHILD_ASYNC);
   }
-  if g.target == TARGET_HOSTED && (cg_calls(g.body, "bst_thread_") || cg_calls(g.body, "bst_sbytes_")) {
+  if g.target == TARGET_HOSTED && (cg_calls(g.body, "bst_thread_") || cg_calls(g.body, "bst_sbytes_") || cg_calls(g.body, "bst_chan_") || cg_calls(g.body, "bst_share_") || cg_calls(g.body, "bst_par_run(")) {
     cg_part(&mut g.out, PART_THREAD);
   }
   let code = g.target == TARGET_HOSTED && cg_calls(g.body, "bst_code_");
