@@ -122,6 +122,10 @@ serve eclocal eclocal && {
   client "ECDSA certificate, name in capitals" 0 LOCALHOST ec.roots
   client "ECDSA certificate, several roots" 0 localhost all.roots
   client "wrong name" 1 example.org ec.roots
+  v12=name
+  client "wrong name, left to the caller (option 4)" 0 example.org ec.roots
+  client "untrusted root, name left to the caller" 1 localhost other.roots
+  v12=
   client "name below a wildcard of two labels" 1 a.b.test.example ec.roots
   client "untrusted root" 1 localhost other.roots
   client "no roots at all" 1 localhost /dev/null
