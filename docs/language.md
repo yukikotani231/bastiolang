@@ -773,7 +773,7 @@ fn main() -> u64 {
 - Every other parameter is a shared borrow `&T` or a value that is not linear (`E-TYPE` for `&mut` or a linear value, which every call would own). A shared borrow cannot change anything but what a `Lock`, an `Atomic` or a `SharedBytes` holds, so the threads share nothing they could race on. `S` and `T` cannot hold a `Cpu`, `Mmu` or `Lease` (`E-PIN`).
 - The vector is lent `&mut` for the whole call, so it cannot also be an argument (`E-LINEAR-USE`).
 - Proof: one call is verified for an element of which only its type's invariants are known, so `f`'s `requires` must follow from them and from the other arguments, and then hold for every element. Afterwards the vector has the same length, and the prover forgets its contents (`f`'s `ensures` are not kept).
-- Generated code: a block with a pointer to the elements and the other arguments; the calling thread and up to one fewer threads than there are processors take indices from one atomic counter, and every thread is joined before `par_each` returns.
+- Generated code: a block with a pointer to the elements and the other arguments; the calling thread and up to one fewer threads than there are processors take indices from one atomic counter, and `par_each` returns when every call has. The other threads are a pool started on first use and kept asleep between calls, so a loop that calls `par_each` often (a collector's mark phase) does not start threads each time; a `par_each` that starts while the pool is in use (nested in a body, or on another thread) starts and joins threads of its own.
 
 ## Enums and `match`
 

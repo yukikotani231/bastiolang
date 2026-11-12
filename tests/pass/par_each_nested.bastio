@@ -1,0 +1,79 @@
+// expect-exit: 42
+// stage1-only: par_each
+// backend: c
+// par_each many times over, and a par_each inside a par_each: the inner
+// ones find the pool in use and start threads of their own.
+
+struct Cell { v: u64 }
+struct Row { cells: Vec[Cell], sum: u64 }
+
+fn bump(c: &mut Cell, by: u64) {
+  if c.v < 1000000 && by < 1000000 {
+    c.v = c.v + by;
+  }
+}
+
+fn row(r: &mut Row, by: u64) {
+  par_each(&mut r.cells, bump, by);
+  let mut s = 0;
+  let mut k = 0;
+  while k < vec_len(r.cells) invariant s <= 1000000000 {
+    let c = vec_get(r.cells, k);
+    if c.v <= 1000000 && s < 1000000000 - 1000000 {
+      s = s + c.v;
+    }
+    k = k + 1;
+  }
+  r.sum = s;
+}
+
+fn main() -> u64 {
+  let mut cells = vec_new[Cell]();
+  let mut k = 0;
+  while k < 64 invariant true {
+    vec_push(&mut cells, Cell { v: 0 });
+    k = k + 1;
+  }
+  let mut round = 0;
+  while round < 300 invariant true {
+    par_each(&mut cells, bump, 1);
+    round = round + 1;
+  }
+  let mut ok = true;
+  k = 0;
+  while k < vec_len(cells) invariant true {
+    let c = vec_get(cells, k);
+    if c.v != 300 {
+      ok = false;
+    }
+    k = k + 1;
+  }
+  vec_free(cells);
+  let mut rows = vec_new[Row]();
+  k = 0;
+  while k < 6 invariant true {
+    let mut cs = vec_new[Cell]();
+    let mut j = 0;
+    while j < 7 invariant true {
+      vec_push(&mut cs, Cell { v: j });
+      j = j + 1;
+    }
+    vec_push(&mut rows, Row { cells: cs, sum: 0 });
+    k = k + 1;
+  }
+  par_each(&mut rows, row, 1);
+  let mut total = 0;
+  while vec_len(rows) > 0 invariant total <= 1000000000 {
+    let r = vec_pop(&mut rows);
+    if r.sum == 28 && total < 1000 {
+      total = total + 1;
+    }
+    vec_free(r.cells);
+  }
+  vec_free(rows);
+  // 6 rows of 1 + 2 + .. + 7 = 28 each.
+  if ok && total == 6 {
+    return 42;
+  }
+  return 1;
+}
