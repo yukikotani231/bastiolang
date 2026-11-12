@@ -44,7 +44,7 @@ check that the random values are random (the caller supplies them).
 | [`tls13c_suite`](#tls13c_suite) | The cipher suite in use (its IANA number, 0x1301.. |
 | [`tls13c_check`](#tls13c_check) | Whether `c` has the sizes and states the other functions require (`tls13c_ok`). |
 | [`tls13c_alpn`](#tls13c_alpn) | The application protocol the server chose (a copy; empty when it chose none or has not answered yet). |
-| [`tls13c_verdict`](#tls13c_verdict) | 0 when the server's certificate chain was checked and good; otherwise 10 when only the host name is not the certificate's, or 6 (the code a client that verifies fails with in both cases; only a client made with `verify` false gets that far). |
+| [`tls13c_verdict`](#tls13c_verdict) | 0 when the server's certificate chain was checked and good; otherwise 10 when only the host name is not the certificate's, or 6 (the code a client that verifies fails with in both cases; only a client made with `verify` false gets that far, or with option 4 for 10). |
 | [`tls13c_peer_cert`](#tls13c_peer_cert) | The server's own certificate (DER, a copy), once the client has it (state 3 or later); empty before. |
 | [`tls13c_state`](#tls13c_state) | The state of `c`. |
 | [`tls13c_feed`](#tls13c_feed) | Gives the client the bytes `data` that arrived from the server. |
@@ -68,7 +68,7 @@ struct Tls13Client {
   inbuf: Bytes, hsbuf: Bytes, leaf: Bytes,
   verify: bool, verdict: u64, alpn: Bytes, sent_close: bool,
   allow12: bool, v12: bool, step: u64, rnd: Bytes, ms: Bytes, ems: bool, cs12: u64,
-  sk_kind: u64, sk_a: Bytes, sk_b: Bytes, group: u64, retried: bool
+  sk_kind: u64, sk_a: Bytes, sk_b: Bytes, group: u64, retried: bool, defer_name: bool
 }
 ```
 
@@ -180,10 +180,13 @@ fn tls13c_new_opts(random: &Bytes, session_id: &Bytes, priv_key: &Bytes, name: &
 
 `tls13c_new_with` with options as bits: 1 accepts a chain the roots do not
 vouch for (`verify` false), 2 offers TLS 1.2 as well (for servers and
-proxies that do not speak TLS 1.3: ECDHE with X25519, AES-GCM or
-ChaCha20-Poly1305, the extended master secret when the server has it, no
-renegotiation; a TLS 1.3 server that is made to fall back is noticed by
-the value RFC 8446 puts at the end of its random).
+proxies that do not speak TLS 1.3: ECDHE with X25519, P-256 or P-384,
+AES-GCM or ChaCha20-Poly1305, the extended master secret when the server
+has it, no renegotiation; a TLS 1.3 server that is made to fall back is
+noticed by the value RFC 8446 puts at the end of its random), 4 checks
+the chain but leaves the host name to the caller: a chain the roots vouch
+for that is for another name goes on with `tls13c_verdict` 10, so the
+caller can apply its own rule (node:tls's checkServerIdentity).
 
 Example:
 
@@ -321,7 +324,7 @@ fn tls13c_verdict(c: &Tls13Client) -> u64
 0 when the server's certificate chain was checked and good; otherwise 10
 when only the host name is not the certificate's, or 6 (the code a client
 that verifies fails with in both cases; only a client made with `verify`
-false gets that far).
+false gets that far, or with option 4 for 10).
 
 Example:
 
@@ -797,6 +800,23 @@ fn tls13c_certificate(c: &mut Tls13Client, msg: &Bytes, roots: &Bytes, now: u64)
 ```
 
 Internal: handles the Certificate `msg` (state 2).
+
+### `tls13c_leaf_for`
+
+```bastio
+fn tls13c_leaf_for(c: &mut Tls13Client, msg: &Bytes, roots: &Bytes, now: u64) -> Option[Bytes]
+  requires tls13c_ok(c) && blen(msg) < 1048576 && blen(roots) < 274877906944
+  ensures tls13c_ok(c)
+  ensures result is Option::Some ==> blen(result.Some) < 1048576
+```
+
+Internal: the server's certificate from the Certificate message `msg`
+(in the TLS 1.3 form), or `None` when the client refuses it. A chain the
+roots vouch for and that names the server gives verdict 0. One the roots
+vouch for but for another name is refused, unless the client leaves the
+name to its caller (`defer_name`) or does not verify: verdict 10. Any
+other chain is refused by a verifying client, and gives verdict 6
+otherwise (the server's own certificate, whose key must still sign).
 
 ### `tls13c_signed_content`
 
