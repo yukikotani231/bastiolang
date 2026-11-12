@@ -8,7 +8,9 @@ rsa_pss_rsae_sha384, and of the older RSASSA-PKCS1-v1_5 that most
 certificates are still signed with (keys of 2048 to 4096 bits), and, for the
 Web Crypto API, signing with both paddings, RSAES-OAEP encryption and
 decryption, and the private-key operation under them (keys of 512 to 4096
-bits when the caller asks for a smaller minimum).
+bits when the caller asks for a smaller minimum), and the parts of key
+generation: a probable-prime test and the rest of a private key from its two
+primes (the caller draws the candidates).
 
 What is proved: every access is in bounds, nothing leaks, and the numbers
 the arithmetic works on have the length of the key. Not proved: that the
@@ -35,6 +37,9 @@ A number is a `Vec[u64]` of `l` limbs of 16 bits, least significant first.
 | [`rsa_pss_sign`](#rsa_pss_sign) | Signs `msg` with RSASSA-PSS (RFC 8017 section 8.1) under the private key (`n`, `d`) with the hash of `hl` bytes (32, 48 or 64), MGF1 with the same hash and the salt `salt` (any length below 1024; the caller draws it from a random source, and `hl` bytes is the usual length). |
 | [`rsa_oaep_encrypt`](#rsa_oaep_encrypt) | Encrypts `msg` with RSAES-OAEP (RFC 8017 section 7.1) under the public key (`n`, `e`) with the hash of `hl` bytes (32, 48 or 64), MGF1 with the same hash, the label `label` and the `seed` of `hl` bytes, which the caller draws from a random source and uses once. |
 | [`rsa_oaep_decrypt`](#rsa_oaep_decrypt) | Decrypts `ct` with RSAES-OAEP (RFC 8017 section 7.1) under the private key (`n`, `d`), with the hash of `hl` bytes (32, 48 or 64), MGF1 with the same hash and the label `label`. |
+| [`rsa_probable_prime`](#rsa_probable_prime) | Whether the big-endian number `cand` (at least 4 bytes, the first not 0) is prime with high probability. |
+| [`rsa_key_prime`](#rsa_key_prime) | Whether `cand` could be one of the two primes of an RSA key with the public exponent `e` (odd, 3 to 2^32 - 1). |
+| [`rsa_key_parts`](#rsa_key_parts) | The rest of an RSA private key from the primes `p` > `q` (big-endian, `h` bytes each, `h` even, 32 to 256) and the public exponent `e` (odd, 3 to 2^32 - 1). |
 
 Every example below is built, verified and run by `tests/run.sh`. An `assert` in one is proved at compile time from the contracts above it.
 
@@ -287,6 +292,78 @@ match r {
 }
 ```
 
+### `rsa_probable_prime`
+
+```bastio
+fn rsa_probable_prime(cand: &Bytes, rounds: u64) -> bool
+  requires rounds <= 12
+```
+
+Whether the big-endian number `cand` (at least 4 bytes, the first not 0)
+is prime with high probability: it is odd, has no divisor below 1000 and
+passes the Miller-Rabin test for the first `rounds` primes as bases
+(at most 12; 5 or more is plenty for numbers that were drawn at random).
+Numbers up to 4096 bits. Not constant time.
+
+Example:
+
+```bastio
+let c = bfrom("abcdefgh");
+let p = rsa_probable_prime(c, 5);
+bfree(c);
+if p { return 1; }
+```
+
+### `rsa_key_prime`
+
+```bastio
+fn rsa_key_prime(cand: &Bytes, e: u64) -> bool
+  requires e >= 3 && e < 4294967296
+```
+
+Whether `cand` could be one of the two primes of an RSA key with the
+public exponent `e` (odd, 3 to 2^32 - 1): `rsa_probable_prime` with 5
+rounds, and `cand - 1` not divisible by `e`.
+
+Example:
+
+```bastio
+let c = bfrom("abcdefgh");
+let p = rsa_key_prime(c, 65537);
+bfree(c);
+if p { return 1; }
+```
+
+### `rsa_key_parts`
+
+```bastio
+fn rsa_key_parts(p: &Bytes, q: &Bytes, e: u64) -> Option[Bytes]
+  requires e >= 3 && e < 4294967296
+  ensures result is Option::Some ==> blen(result.Some) == 7 * blen(p)
+```
+
+The rest of an RSA private key from the primes `p` > `q` (big-endian, `h`
+bytes each, `h` even, 32 to 256) and the public exponent `e` (odd, 3 to
+2^32 - 1): n (2h bytes), d (2h), d mod (p - 1) (h), d mod (q - 1) (h) and
+the inverse of q modulo p (h), one after the other, where d is the
+inverse of e modulo (p - 1)(q - 1). The result is `None` when `p` is not
+above `q`, either is even, or `e` has a factor in common with
+(p - 1)(q - 1). Not constant time.
+
+Example:
+
+```bastio
+let p = balloc(32);
+let q = balloc(32);
+let r = rsa_key_parts(p, q, 65537);
+bfree(q);
+bfree(p);
+match r {
+  Option::None => { },
+  Option::Some(k) => { bfree(k); },
+}
+```
+
 ## Internals
 
 ### `rsa_zero`
@@ -490,3 +567,94 @@ fn rsa_prefix(hl: u64) -> Str
 
 Internal: the DigestInfo prefix of PKCS#1 v1.5 for the hash of `hl` bytes
 (19 bytes) as hex.
+
+### `rsa_mul`
+
+```bastio
+fn rsa_mul(a: &Vec[u64], la: u64, b: &Vec[u64], lb: u64) -> Vec[u64]
+  requires vlen(a) == la && vlen(b) == lb && la <= 1024 && lb <= 1024
+  ensures vlen(result) == la + lb
+```
+
+Internal: `a * b` for numbers of `la` and `lb` limbs, as `la + lb` limbs.
+
+### `rsa_mul_small`
+
+```bastio
+fn rsa_mul_small(a: &Vec[u64], la: u64, m: u64, add: u64) -> Vec[u64]
+  requires vlen(a) == la && la <= 1024 && m < 4294967296 && add < 4294967296
+  ensures vlen(result) == la + 3
+```
+
+Internal: `a * m + add` for `m` and `add` below 2^32, as `la + 3` limbs.
+
+### `rsa_div_small`
+
+```bastio
+fn rsa_div_small(a: &Vec[u64], la: u64, m: u64) -> Vec[u64]
+  requires vlen(a) == la && la <= 1024 && m >= 1 && m < 4294967296
+  ensures vlen(result) == la
+```
+
+Internal: `a / m` (floor) for `m` in 1 .. 2^32 - 1, with `la` limbs.
+
+### `rsa_mod_small`
+
+```bastio
+fn rsa_mod_small(a: &Vec[u64], la: u64, m: u64) -> u64
+  requires vlen(a) == la && la <= 1024 && m >= 1 && m < 4294967296
+  ensures result < m
+```
+
+Internal: `a mod m` for `m` in 1 .. 2^32 - 1, with `la` limbs.
+
+### `rsa_mod_big`
+
+```bastio
+fn rsa_mod_big(a: &Vec[u64], la: u64, m: &Vec[u64], lm: u64) -> Vec[u64]
+  requires vlen(a) == la && vlen(m) == lm && la <= 1024 && lm >= 1 && lm <= 1024
+  ensures vlen(result) == lm
+```
+
+Internal: `a mod m` for `la` and `lm` limbs, as `lm` limbs (shift and
+subtract; `m` must not be zero).
+
+### `rsa_inv_small`
+
+```bastio
+fn rsa_inv_small(a: u64, m: u64) -> u64
+  requires m >= 2 && m < 4294967296
+  ensures result < m
+```
+
+Internal: the inverse of `a` modulo `m` (`m` in 2 .. 2^32 - 1), or 0 when
+there is none.
+
+### `rsa_eq`
+
+```bastio
+fn rsa_eq(a: &Vec[u64], b: &Vec[u64], l: u64) -> bool
+  requires vlen(a) == l && vlen(b) == l
+```
+
+Internal: whether the numbers `a` and `b` of `l` limbs are equal.
+
+### `rsa_mr_base`
+
+```bastio
+fn rsa_mr_base(i: u64) -> u64
+  ensures result >= 2 && result <= 37
+```
+
+Internal: the `i`-th Miller-Rabin base (the first twelve primes).
+
+### `rsa_mr_round`
+
+```bastio
+fn rsa_mr_round(nl: &Vec[u64], nm1: &Vec[u64], d: &Bytes, r: u64, a: u64, l: u64) -> bool
+  requires vlen(nl) == l && vlen(nm1) == l && l >= 1 && l <= 256 && blen(d) <= 512 && r >= 1 && r <= 4096 && a >= 2 && a <= 37
+```
+
+Internal: whether the odd number `nl` (`l` limbs, at least 2^24) passes
+the Miller-Rabin test for the base `a`, where `nm1` is `nl - 1`, `d` the
+odd part of `nm1` as bytes and `r` the number of factors of 2 in it.
