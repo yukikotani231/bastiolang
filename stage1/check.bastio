@@ -4394,11 +4394,19 @@ fn cf_at(c: &Checker, k: u64) -> u64 {
   return 0;
 }
 
-/// `code_field(name)` (hosted, stage1 only): the number of the `Vec[u64]`
-/// field `name` of the stencils' context struct in the table machine code
-/// reads and writes through (plan items `LOAD` and `STORE`). The struct is
-/// known from the program's stencils and `code_call`s, so the field is checked
-/// once all the functions have been.
+/// Words in one `code_field` record: name start, end and call node of the
+/// path, then the same for the member (0 without one), the element struct
+/// instance (0 for `Vec[u64]`), and the kind: 0 a `Vec[u64]`, 1 a `Vec[S]`, 2 a
+/// `Vec[u64]` member of `S`, 3 a scalar member of `S`.
+const CF_W: u64 = 7;
+
+/// `code_field(path)` or `code_field(path, member)` (hosted, stage1 only): the
+/// number, in the table machine code reads and writes through, of the
+/// `Vec[u64]` or `Vec[S]` field `path` of the stencils' context struct (`path`
+/// is a field, or `a.b` through struct fields), with `member` naming a scalar
+/// (`bool` or an unsigned integer) or a `Vec[u64]` field of the struct `S` of
+/// its elements. The struct is known from the program's stencils and
+/// `code_call`s, so the field is checked once all the functions have been.
 fn code_field_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
   if c.target != TARGET_HOSTED {
     if cm_new(&mut c, p, i, C_TARGET) {
@@ -4407,35 +4415,115 @@ fn code_field_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
     return 0;
   }
   let n = node_at(p.nodes, i);
-  if list_len(p, n.a) != 1 {
+  let na = list_len(p, n.a);
+  if na != 1 && na != 2 {
     cm_arity(&mut c, p, i, 1);
     return 0;
   }
   let an = node_at(p.nodes, n.a);
-  if an.kind != E_VAR || an.next != 0 {
+  let mut ps = 0;
+  let mut ok = cf_is_path(p, n.a);
+  if ok {
+    ps = cf_path_start(p, n.a);
+  }
+  let mut ms = 0;
+  let mut me = 0;
+  if ok && na == 2 {
+    let mn = node_at(p.nodes, an.next);
+    if mn.kind != E_VAR {
+      ok = false;
+    } else {
+      ms = mn.s;
+      me = mn.e;
+    }
+  }
+  if !ok {
     if cm_new(&mut c, p, n.a, C_TYPE) {
-      cm_s(&mut c, "write the name of a field of the stencils' context struct: `code_field(regs)`");
+      cm_s(&mut c, "write the path of a field of the stencils' context struct, then optionally a member: `code_field(regs)`, `code_field(h.objs, props)`");
     }
     return 0;
   }
   let mut k = 0;
-  while k < vec_len(c.code_fields) && !same(p.src, cf_at(c, k), cf_at(c, k + 1), an.s, an.e) {
-    k = k + 3;
+  while k < vec_len(c.code_fields) && !cf_same(c, p, k, ps, an.e, ms, me) {
+    k = k + CF_W;
   }
   if k == vec_len(c.code_fields) {
-    vec_push(&mut c.code_fields, an.s);
+    vec_push(&mut c.code_fields, ps);
     vec_push(&mut c.code_fields, an.e);
     vec_push(&mut c.code_fields, i);
+    vec_push(&mut c.code_fields, ms);
+    vec_push(&mut c.code_fields, me);
+    vec_push(&mut c.code_fields, 0);
+    vec_push(&mut c.code_fields, 0);
   }
   return c.tu64;
 }
 
-/// Checks the fields `code_field` named against the context struct.
+/// Is node `i` a variable, or fields of one (`a.b.c`)?
+fn cf_is_path(p: &Parser, i: u64) -> bool {
+  let n = node_at(p.nodes, i);
+  if n.kind == E_VAR {
+    return true;
+  }
+  if n.kind == E_FIELD {
+    return cf_is_path(p, n.a);
+  }
+  return false;
+}
+
+/// Where the source of path node `i` starts (the variable's name).
+fn cf_path_start(p: &Parser, i: u64) -> u64 {
+  let n = node_at(p.nodes, i);
+  if n.kind == E_FIELD {
+    return cf_path_start(p, n.a);
+  }
+  return n.s;
+}
+
+/// Does record `k` name the same path (`ps..pe`) and member (`ms..me`)?
+fn cf_same(c: &Checker, p: &Parser, k: u64, ps: u64, pe: u64, ms: u64, me: u64) -> bool {
+  if !same(p.src, cf_at(c, k), cf_at(c, wrap_add(k, 1)), ps, pe) {
+    return false;
+  }
+  if (cf_at(c, wrap_add(k, 3)) == 0) != (ms == 0) {
+    return false;
+  }
+  return ms == 0 || same(p.src, cf_at(c, wrap_add(k, 3)), cf_at(c, wrap_add(k, 4)), ms, me);
+}
+
+/// The type of field `s..e` of struct type `st`, or 0.
+fn cf_field_ty(c: &Checker, m: &Mono, p: &Parser, st: u64, s: u64, e: u64) -> u64 {
+  if kind_t(m, st) != TY_STRUCT {
+    return 0;
+  }
+  let x = inner_t(m, st);
+  let dn = def_node(m, p, x);
+  let j = index_in(p, dn.a, s, e);
+  if j == 0 {
+    return 0;
+  }
+  return fld_ty(c, x, j - 1);
+}
+
+/// The type of the path `i` (a variable, or fields of one) from the context
+/// struct `ctx`, or 0.
+fn cf_path_ty(c: &Checker, m: &Mono, p: &Parser, ctx: u64, i: u64) -> u64 {
+  let n = node_at(p.nodes, i);
+  if n.kind == E_VAR {
+    return cf_field_ty(c, m, p, ctx, n.s, n.e);
+  }
+  let b = cf_path_ty(c, m, p, ctx, n.a);
+  if b == 0 {
+    return 0;
+  }
+  return cf_field_ty(c, m, p, b, n.s, n.e);
+}
+
+/// Checks the fields `code_field` named against the context struct, and
+/// records each one's element struct and kind.
 fn check_code_fields(c: &mut Checker, m: &mut Mono, p: &Parser) {
   let mut k = 0;
   while k < vec_len(c.code_fields) && !c.failed {
-    let s = cf_at(c, k);
-    let e = cf_at(c, k + 1);
     let loc = cf_at(c, k + 2);
     if c.stencil_ctx == 0 {
       if cm_new(&mut c, p, loc, C_TYPE) {
@@ -4443,18 +4531,46 @@ fn check_code_fields(c: &mut Checker, m: &mut Mono, p: &Parser) {
       }
       return;
     }
-    let x = inner_t(m, c.stencil_ctx);
-    let dn = def_node(m, p, x);
-    let j = index_in(p, dn.a, s, e);
-    let vu = intern(&mut m, p, TY_VEC, c.tu64);
-    if j == 0 || fld_ty(c, x, j - 1) != vu {
+    let call = node_at(p.nodes, loc);
+    let t = cf_path_ty(c, m, p, c.stencil_ctx, call.a);
+    let mut kind = 9;
+    let mut einst = 0;
+    if t != 0 && kind_t(m, t) == TY_VEC {
+      let et = inner_t(m, t);
+      if cf_at(c, k + 3) == 0 {
+        if et == c.tu64 {
+          kind = 0;
+        } else if kind_t(m, et) == TY_STRUCT {
+          kind = 1;
+          einst = inner_t(m, et);
+        }
+      } else if kind_t(m, et) == TY_STRUCT {
+        einst = inner_t(m, et);
+        let mt = cf_field_ty(c, m, p, et, cf_at(c, k + 3), cf_at(c, k + 4));
+        let vu = intern(&mut m, p, TY_VEC, c.tu64);
+        if mt != 0 && mt == vu {
+          kind = 2;
+        } else if mt != 0 {
+          let mk = kind_t(m, mt);
+          if mk == TY_U8 || mk == TY_U16 || mk == TY_U32 || mk == TY_U64 || mk == TY_BOOL {
+            kind = 3;
+          }
+        }
+      }
+    }
+    if kind == 9 {
       if cm_new(&mut c, p, loc, C_TYPE) {
-        cm_s(&mut c, "`code_field` names a field of type `Vec[u64]` of ");
+        cm_s(&mut c, "`code_field` names a field of type `Vec[u64]` or `Vec[S]` of ");
         cm_ty(&mut c, m, p, c.stencil_ctx);
+        cm_s(&mut c, ", with a `bool`, unsigned integer or `Vec[u64]` member of the struct `S` if it has a second argument");
       }
       return;
     }
-    k = k + 3;
+    if k + 6 < vec_len(c.code_fields) {
+      vec_set(&mut c.code_fields, k + 5, einst);
+      vec_set(&mut c.code_fields, k + 6, kind);
+    }
+    k = k + CF_W;
   }
 }
 
