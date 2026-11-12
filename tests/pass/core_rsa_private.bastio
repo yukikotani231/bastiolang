@@ -1,0 +1,484 @@
+// expect-exit: 0
+// core/rsa: signatures, ciphertexts and decryptions with a private key. RSASSA-PKCS1-v1_5
+// signatures equal OpenSSL's (they are deterministic); RSASSA-PSS signatures and RSAES-OAEP
+// ciphertexts made with a chosen salt or seed equal an independent encoder's, whose output
+// OpenSSL accepts; ciphertexts made by OpenSSL decrypt. Keys of 2048 and 1024 bits (with a
+// smaller minimum), SHA-256, SHA-384 and SHA-512. A wrong label, a changed ciphertext, a
+// message too long, a small key under the 2048-bit minimum and a changed signature fail.
+import "core/rsa.bastio";
+
+/// The value of the hex digit `c` (0 for anything else).
+fn nib(c: u8) -> u8
+  ensures result < 16
+{
+  if c >= 48 && c <= 57 { return c - 48; }
+  if c >= 97 && c <= 102 { return c - 87; }
+  return 0;
+}
+
+/// The bytes written as hex digits in `s`.
+fn unhex(s: Str) -> Bytes
+  requires slen(s) < 100000
+  ensures blen(result) == slen(s) / 2
+{
+  let n = slen(s) / 2;
+  let mut b = balloc(n);
+  let mut i = 0;
+  while i < n
+    invariant i <= n && blen(b) == n && slen(s) >= 2 * n
+  {
+    bset(&mut b, i, nib(sget(s, 2 * i)) * 16 + nib(sget(s, 2 * i + 1)));
+    i = i + 1;
+  }
+  return b;
+}
+
+/// Whether `r` is `Some` of the bytes written as hex in `want`; consumes `r`.
+fn is_hex(r: Option[Bytes], want: Str) -> bool
+  requires slen(want) < 100000
+{
+  match r {
+    Option::None => { return false; },
+    Option::Some(b) => {
+      let w = unhex(want);
+      let same = bytes_eq(b, w);
+      bfree(w);
+      bfree(b);
+      return same;
+    },
+  }
+}
+
+/// Whether `r` is `None`; consumes `r`.
+fn is_none(r: Option[Bytes]) -> bool {
+  match r {
+    Option::None => { return true; },
+    Option::Some(b) => {
+      bfree(b);
+      return false;
+    },
+  }
+}
+
+fn k0_t0(n: &Bytes, d: &Bytes, e: &Bytes) -> u64
+  requires blen(n) < 65536 && blen(d) < 65536 && blen(e) < 65536
+{
+  let msg = unhex("45c7cabe8b689837c9b1271e5a83c4f77b");
+  let mut bad = 0;
+  if !is_hex(rsa_pkcs1_sign(n, d, msg, 32, 256), "a9e00a4fb40e28187d54c44f740a04fa5bb87d4bd31ad74cdfa4bc70f110ab0c0a63e8c39aaac22f68078fd5b22e49df111bc502818d70bc71adc842f6bdef384288c5a7f8a60d6d0b23e6c0bab9e08f3221d84f863e3306262a157394a7234393564295164e3dd960f2eb37e70c5fc9ec1d13527957ff84a33bedd051ef9ebf624a51996539eb39f9632fbe8e6c9ca7d2c0adc76609c3bf37cfb594078328ed502131cffe4b3da1f96dc9226258bc7852b81c7518511f35cdd0659d22352ab39672bb25b77c6b2931171c3e89c849b9b31bc1d96491054691994a74b637c060aca1f26725b32d91a0366ef0012a80658ebaba39d5c0a4d5f9c43927f0a35fe4") { bad = wrap_add(bad, 1); }
+  let mut sig = unhex("a9e00a4fb40e28187d54c44f740a04fa5bb87d4bd31ad74cdfa4bc70f110ab0c0a63e8c39aaac22f68078fd5b22e49df111bc502818d70bc71adc842f6bdef384288c5a7f8a60d6d0b23e6c0bab9e08f3221d84f863e3306262a157394a7234393564295164e3dd960f2eb37e70c5fc9ec1d13527957ff84a33bedd051ef9ebf624a51996539eb39f9632fbe8e6c9ca7d2c0adc76609c3bf37cfb594078328ed502131cffe4b3da1f96dc9226258bc7852b81c7518511f35cdd0659d22352ab39672bb25b77c6b2931171c3e89c849b9b31bc1d96491054691994a74b637c060aca1f26725b32d91a0366ef0012a80658ebaba39d5c0a4d5f9c43927f0a35fe4");
+  if !rsa_pkcs1_verify_min(n, e, msg, sig, 32, 256) { bad = wrap_add(bad, 1); }
+  bset(&mut sig, 5, bget(sig, 5) ^ 1);
+  if rsa_pkcs1_verify_min(n, e, msg, sig, 32, 256) { bad = wrap_add(bad, 1); }
+  bfree(sig);
+  bfree(msg);
+  return bad;
+}
+
+fn k0_t1(n: &Bytes, d: &Bytes, e: &Bytes) -> u64
+  requires blen(n) < 65536 && blen(d) < 65536 && blen(e) < 65536
+{
+  let msg = unhex("45c7cabe8b689837c9b1271e5a83c4f77b");
+  let salt = unhex("2de3ef3f4171e45ac8ab46911a4458b9667a54116ed3eddf33010b202fbfa629");
+  let mut bad = 0;
+  if !is_hex(rsa_pss_sign(n, d, msg, salt, 32, 256), "13dbad0394bceb24f6588fbdc21490f07d45bf8bbbcb56769341ba484422a7577ee948df241e8372653f3766b1a8966cfd9f1a975c1a264750ba950c552c9a0c4abdf2ca482f6210a7b5ccd0a40230c8c19a5e00cdd459c64bc7e765af53bcbff7eabc55a20236b978f056ea66fa96b44f76cbde263271f342925fc1c9d8e3e99ee8e5402f56d2a27fa5628396a47f67cf08bdc95ac427c640b5c75ae2e08b16e3b1e8829a632aee31776101cccc2ef4ca324ef3b109be833e598dd7e7891215509989e03e54e5a51db3ba19bab191c647360c166c1391952c9a05ff9dff60de319a2c7526af1db89cd824b6d941fcd4e67ecf718b18ea847e1b13f2efd1ca76") { bad = wrap_add(bad, 1); }
+  let mut sig = unhex("13dbad0394bceb24f6588fbdc21490f07d45bf8bbbcb56769341ba484422a7577ee948df241e8372653f3766b1a8966cfd9f1a975c1a264750ba950c552c9a0c4abdf2ca482f6210a7b5ccd0a40230c8c19a5e00cdd459c64bc7e765af53bcbff7eabc55a20236b978f056ea66fa96b44f76cbde263271f342925fc1c9d8e3e99ee8e5402f56d2a27fa5628396a47f67cf08bdc95ac427c640b5c75ae2e08b16e3b1e8829a632aee31776101cccc2ef4ca324ef3b109be833e598dd7e7891215509989e03e54e5a51db3ba19bab191c647360c166c1391952c9a05ff9dff60de319a2c7526af1db89cd824b6d941fcd4e67ecf718b18ea847e1b13f2efd1ca76");
+  if !rsa_pss_verify_salt(n, e, msg, sig, 32, 32, 256) { bad = wrap_add(bad, 1); }
+  if rsa_pss_verify_salt(n, e, msg, sig, 32, 33, 256) { bad = wrap_add(bad, 1); }
+  bset(&mut sig, 7, bget(sig, 7) ^ 1);
+  if rsa_pss_verify_salt(n, e, msg, sig, 32, 32, 256) { bad = wrap_add(bad, 1); }
+  bfree(sig);
+  bfree(salt);
+  bfree(msg);
+  return bad;
+}
+
+fn k0_t2(n: &Bytes, d: &Bytes, e: &Bytes) -> u64
+  requires blen(n) < 65536 && blen(d) < 65536 && blen(e) < 65536
+{
+  let pt = unhex("a10ee46d50229578d80561f83e789f903b36c5e110cfef7eaa1166e48346");
+  let seed = unhex("536868bb5b4124520424111a3649b3ac8ebe0d6ff7d29d20d4d502d749ba5b61");
+  let label = unhex("6b51c4");
+  let other = unhex("ab");
+  let mut bad = 0;
+  if !is_hex(rsa_oaep_encrypt(n, e, pt, label, seed, 32, 256), "ae255d7cde283ea0862aea01a79d299870e6804dbaed030d4f6fe7323e70efa2e524c498680c7bd5bac962c32111280ab211c4e89779db55b5decee49c42d6906641ccc37670ade7bad5399ef223c372afe18f20fdcb447fe35f4f18a81cec1737e78197f71f1796866eb1b6c1ba77bd0f97d7ee228677a46a11c15136738d1c7fc9ee857fec8fa81be99ed00774f9aaf2ebbf55300fd8f4261fa2bcb19d3f0ca88cf31fd15a7deac5fd3d7f79eef51b6933d060913276e8161f8d6d08fd4809a1d520338693dc38df3789f6945a6ad84d8893a20127ba3071c996fde592039eadcba857b085bc5c032ac9428f79a48e4a702e34ecafebd4c2d5e0d8b50f2fe5") { bad = wrap_add(bad, 1); }
+  let mut ct = unhex("ae255d7cde283ea0862aea01a79d299870e6804dbaed030d4f6fe7323e70efa2e524c498680c7bd5bac962c32111280ab211c4e89779db55b5decee49c42d6906641ccc37670ade7bad5399ef223c372afe18f20fdcb447fe35f4f18a81cec1737e78197f71f1796866eb1b6c1ba77bd0f97d7ee228677a46a11c15136738d1c7fc9ee857fec8fa81be99ed00774f9aaf2ebbf55300fd8f4261fa2bcb19d3f0ca88cf31fd15a7deac5fd3d7f79eef51b6933d060913276e8161f8d6d08fd4809a1d520338693dc38df3789f6945a6ad84d8893a20127ba3071c996fde592039eadcba857b085bc5c032ac9428f79a48e4a702e34ecafebd4c2d5e0d8b50f2fe5");
+  if !is_hex(rsa_oaep_decrypt(n, d, ct, label, 32, 256), "a10ee46d50229578d80561f83e789f903b36c5e110cfef7eaa1166e48346") { bad = wrap_add(bad, 1); }
+  if !is_none(rsa_oaep_decrypt(n, d, ct, other, 32, 256)) { bad = wrap_add(bad, 1); }
+  bset(&mut ct, 9, bget(ct, 9) ^ 1);
+  if !is_none(rsa_oaep_decrypt(n, d, ct, label, 32, 256)) { bad = wrap_add(bad, 1); }
+  bfree(ct);
+  bfree(other);
+  bfree(label);
+  bfree(seed);
+  bfree(pt);
+  return bad;
+}
+
+fn k0_t3(n: &Bytes, d: &Bytes, e: &Bytes) -> u64
+  requires blen(n) < 65536 && blen(d) < 65536 && blen(e) < 65536
+{
+  let mut ct = unhex("a95cf604c09b4780027b849ed08d8df6ab3c66dac9a84a9765d780b90cca7f0545f693d56a647c4abb8a285de11b6892d00b1f04986276cd3d5644d766536df5e65e8d2592f458cc778cc90e9b16e829dbe1ac386583b794534345fc5a6aa7ede67dec0e6abac7f1bd0104b231cd51344d97d3e7ff32b00c8f8ba64fc2c8d799b0b81b4979aa8118f19466b767d3e1ab5dcfaf5dab716d6b9b8021180507ce3b16d6ea70398898d50f7c8fc2ee6f3b604c69b8f0d0f7374e59e3ce275ba4068b544fd53177ac53584375ce9432b6292c2223d8793e339583012dc3f2ad7de969346200fc46124f1d0a6e724751cbfa031e5ec0610806832e9423ef24d7bcf5ab");
+  let label = unhex("6b51c4");
+  let mut bad = 0;
+  if !is_hex(rsa_oaep_decrypt(n, d, ct, label, 32, 256), "a10ee46d50229578d80561f83e789f903b36c5e110cfef7eaa1166e48346") { bad = wrap_add(bad, 1); }
+  bfree(label);
+  bfree(ct);
+  return bad;
+}
+
+fn k0_t4(n: &Bytes, d: &Bytes, e: &Bytes) -> u64
+  requires blen(n) < 65536 && blen(d) < 65536 && blen(e) < 65536
+{
+  let msg = unhex("dcd1153ed6f16357a23993dfa93fe91f4c");
+  let mut bad = 0;
+  if !is_hex(rsa_pkcs1_sign(n, d, msg, 48, 256), "c1a3da4db40c03d4ca3d748f17b0d90a86daaeb7e43d7661208ec4debab594249ccd4265d74f71022bba33abcfddd22191daae52403d91b028da89335be5e039ae51a42ada709bc08f2e250f634002a83e025e3e62861ed5c502c9f900ea34cc1a46de7cd64fc5045144c6b804181f70c36ddd8b1432c8606b37b11df068e975381712e568b7b61f5ce6bc128e66fb2bfa1a6ff390da9e8d99bf51056d16803dc52f507641a6c1e1379b7cabccde650451645fbf4d0f20e371d79fcbba265e3ab663c54cbf2a3c534712c480fd30a84e3026a514f391ded2d4140e895907be3d536f88cd51d3f605fe7f4d6397de50844631a281c7b45d25661eae20ab347138") { bad = wrap_add(bad, 1); }
+  let mut sig = unhex("c1a3da4db40c03d4ca3d748f17b0d90a86daaeb7e43d7661208ec4debab594249ccd4265d74f71022bba33abcfddd22191daae52403d91b028da89335be5e039ae51a42ada709bc08f2e250f634002a83e025e3e62861ed5c502c9f900ea34cc1a46de7cd64fc5045144c6b804181f70c36ddd8b1432c8606b37b11df068e975381712e568b7b61f5ce6bc128e66fb2bfa1a6ff390da9e8d99bf51056d16803dc52f507641a6c1e1379b7cabccde650451645fbf4d0f20e371d79fcbba265e3ab663c54cbf2a3c534712c480fd30a84e3026a514f391ded2d4140e895907be3d536f88cd51d3f605fe7f4d6397de50844631a281c7b45d25661eae20ab347138");
+  if !rsa_pkcs1_verify_min(n, e, msg, sig, 48, 256) { bad = wrap_add(bad, 1); }
+  bset(&mut sig, 5, bget(sig, 5) ^ 1);
+  if rsa_pkcs1_verify_min(n, e, msg, sig, 48, 256) { bad = wrap_add(bad, 1); }
+  bfree(sig);
+  bfree(msg);
+  return bad;
+}
+
+fn k0_t5(n: &Bytes, d: &Bytes, e: &Bytes) -> u64
+  requires blen(n) < 65536 && blen(d) < 65536 && blen(e) < 65536
+{
+  let msg = unhex("dcd1153ed6f16357a23993dfa93fe91f4c");
+  let salt = unhex("133b1841a7ea877459288a29d17b600568ac439a");
+  let mut bad = 0;
+  if !is_hex(rsa_pss_sign(n, d, msg, salt, 48, 256), "1b7735f4da5a44cd2ab54cf6ff76276174540743de61431fb5777130f3abe8ed9bfbcc4560c50bfb9631aed7155b759da9f3cec75bcdb1ac2f1a83bdc903103cc684b440f3bb5751fab838a5aa4fae10732ccf90e31185c73e6687875b1e3119f3016cda1a79cd63197196ef2f162a6081eae601176b15ad3b8459b06e0b4544ebae569b7ab760bbec399e03d2f027c44092e8858851a1c48b20e8b25a58097dec062bfba6f0ba9c4504f9f2a760e0fde197e0230d69a4400167099a9c64de849b8196781997bcf5946541788946ab754d29657632673a2eac1de5c75e027178b04486886d8b84c998aafdea83c9304199d097f8ebddd5449fce24d68b943cad") { bad = wrap_add(bad, 1); }
+  let mut sig = unhex("1b7735f4da5a44cd2ab54cf6ff76276174540743de61431fb5777130f3abe8ed9bfbcc4560c50bfb9631aed7155b759da9f3cec75bcdb1ac2f1a83bdc903103cc684b440f3bb5751fab838a5aa4fae10732ccf90e31185c73e6687875b1e3119f3016cda1a79cd63197196ef2f162a6081eae601176b15ad3b8459b06e0b4544ebae569b7ab760bbec399e03d2f027c44092e8858851a1c48b20e8b25a58097dec062bfba6f0ba9c4504f9f2a760e0fde197e0230d69a4400167099a9c64de849b8196781997bcf5946541788946ab754d29657632673a2eac1de5c75e027178b04486886d8b84c998aafdea83c9304199d097f8ebddd5449fce24d68b943cad");
+  if !rsa_pss_verify_salt(n, e, msg, sig, 48, 20, 256) { bad = wrap_add(bad, 1); }
+  if rsa_pss_verify_salt(n, e, msg, sig, 48, 21, 256) { bad = wrap_add(bad, 1); }
+  bset(&mut sig, 7, bget(sig, 7) ^ 1);
+  if rsa_pss_verify_salt(n, e, msg, sig, 48, 20, 256) { bad = wrap_add(bad, 1); }
+  bfree(sig);
+  bfree(salt);
+  bfree(msg);
+  return bad;
+}
+
+fn k0_t6(n: &Bytes, d: &Bytes, e: &Bytes) -> u64
+  requires blen(n) < 65536 && blen(d) < 65536 && blen(e) < 65536
+{
+  let pt = unhex("726cf20ca08ead8b122e846c0339d6552a4fc0ed5edb48474a23bf813ebd");
+  let seed = unhex("5f3099ff26f083d367eb5dbea18991dee7ce0c5be3c58778a0ba6eadb01af509420f62c9c030076d4596bdcfcc16a5ab");
+  let label = unhex("");
+  let other = unhex("ab");
+  let mut bad = 0;
+  if !is_hex(rsa_oaep_encrypt(n, e, pt, label, seed, 48, 256), "373b8c51857e04c9fd04d96b3df07de8bf9e3d856066f27403d25562ec64481fd2f00711c74e8edeba19e1a6f39e95483967df3ad4e2259e47bd37b3f1191ed5bf8a3e5b3cc1ce10ca5735e931bf0038985281ce11ba9df96fb9e885f5ecab3330b9eb0c35889455b4d7a9c9cf882235c0628f04718d8da820d0c22a7999326baae0b4ff36ffefcffc4a30b3713318b3f670adcc5f96696922cc7a671358f0dddffb0e8f3553e70eb06fdc65c3031d1909c30c5f1a5af6553c1ff7ff4873773c76dce1f6e8d200796d275553297cb424eabe194769377893dda5312c72c4ea5259eb61613202d55c7ac62ca702a4479d2c210b2049cbaa2292509acf1aa39189") { bad = wrap_add(bad, 1); }
+  let mut ct = unhex("373b8c51857e04c9fd04d96b3df07de8bf9e3d856066f27403d25562ec64481fd2f00711c74e8edeba19e1a6f39e95483967df3ad4e2259e47bd37b3f1191ed5bf8a3e5b3cc1ce10ca5735e931bf0038985281ce11ba9df96fb9e885f5ecab3330b9eb0c35889455b4d7a9c9cf882235c0628f04718d8da820d0c22a7999326baae0b4ff36ffefcffc4a30b3713318b3f670adcc5f96696922cc7a671358f0dddffb0e8f3553e70eb06fdc65c3031d1909c30c5f1a5af6553c1ff7ff4873773c76dce1f6e8d200796d275553297cb424eabe194769377893dda5312c72c4ea5259eb61613202d55c7ac62ca702a4479d2c210b2049cbaa2292509acf1aa39189");
+  if !is_hex(rsa_oaep_decrypt(n, d, ct, label, 48, 256), "726cf20ca08ead8b122e846c0339d6552a4fc0ed5edb48474a23bf813ebd") { bad = wrap_add(bad, 1); }
+  if !is_none(rsa_oaep_decrypt(n, d, ct, other, 48, 256)) { bad = wrap_add(bad, 1); }
+  bset(&mut ct, 9, bget(ct, 9) ^ 1);
+  if !is_none(rsa_oaep_decrypt(n, d, ct, label, 48, 256)) { bad = wrap_add(bad, 1); }
+  bfree(ct);
+  bfree(other);
+  bfree(label);
+  bfree(seed);
+  bfree(pt);
+  return bad;
+}
+
+fn k0_t7(n: &Bytes, d: &Bytes, e: &Bytes) -> u64
+  requires blen(n) < 65536 && blen(d) < 65536 && blen(e) < 65536
+{
+  let mut ct = unhex("49d1d4990866778631bb63d7f8d265ad9e6adc02e7e179cc564fd889a829a11832c9bbf1a08cdec8d6ea7864a415098b2aa0031bcfdc12fd2bb93a60a29779e51497ae9014a80a6dea7cec1b5ff44bcc5da928067d3f14bdc4fc86b6cfc01242b66909496cbd208f98e97867d61007a44f51c65e453b49db0cfb02236d043037a5d6349c1419a11d5febfea28dc691ba8625bba30a70481d71b4e2e89dce0de06221c199f56d4a7905e5ab32144ef4253bcd8ce995f5971387caa920ad9a51d279baa34abf06aefc74504425574351b4d67770bc78c09ff6336fb6b4f8651e8fc514e061fdcec4f87a1bac03a35faaa928c0c85df15bb485f483fb656d28f99a");
+  let label = unhex("");
+  let mut bad = 0;
+  if !is_hex(rsa_oaep_decrypt(n, d, ct, label, 48, 256), "726cf20ca08ead8b122e846c0339d6552a4fc0ed5edb48474a23bf813ebd") { bad = wrap_add(bad, 1); }
+  bfree(label);
+  bfree(ct);
+  return bad;
+}
+
+fn k0_t8(n: &Bytes, d: &Bytes, e: &Bytes) -> u64
+  requires blen(n) < 65536 && blen(d) < 65536 && blen(e) < 65536
+{
+  let msg = unhex("70cc947bcf92f4adf251cbdc741736e45d");
+  let mut bad = 0;
+  if !is_hex(rsa_pkcs1_sign(n, d, msg, 64, 256), "83e47f78e469d919552eceb450a0aa72c373837fd7cbbbce941726e747ca4dadcc0ab6e5895375adce76facf6305f4269a13b7638e0ca240e6dad55d951c87de71be1c65c1ac514a5f03edadeca363270855c72af932617b99e9d52c0c5a03d0ec4ea678eb06f0227c55247670d567b420e73385fb51b7bd782bd7bc872c8f75f8a67e218996bae65418e1732b24e780603d6b218a35f39f1ad70b2619b9a29bd40d00b2408fcff91b6793251edeac322230d18f734a76c8a8cbe81f1a65979f2bde8654aaff41065cbca89dc9bc0fdabe024b49dd4bfa889ea6d7374d7a986f811ee14568b52094dd0fd8dbcc1e539620f94c160febd106ac507d77f6d64fcd") { bad = wrap_add(bad, 1); }
+  let mut sig = unhex("83e47f78e469d919552eceb450a0aa72c373837fd7cbbbce941726e747ca4dadcc0ab6e5895375adce76facf6305f4269a13b7638e0ca240e6dad55d951c87de71be1c65c1ac514a5f03edadeca363270855c72af932617b99e9d52c0c5a03d0ec4ea678eb06f0227c55247670d567b420e73385fb51b7bd782bd7bc872c8f75f8a67e218996bae65418e1732b24e780603d6b218a35f39f1ad70b2619b9a29bd40d00b2408fcff91b6793251edeac322230d18f734a76c8a8cbe81f1a65979f2bde8654aaff41065cbca89dc9bc0fdabe024b49dd4bfa889ea6d7374d7a986f811ee14568b52094dd0fd8dbcc1e539620f94c160febd106ac507d77f6d64fcd");
+  if !rsa_pkcs1_verify_min(n, e, msg, sig, 64, 256) { bad = wrap_add(bad, 1); }
+  bset(&mut sig, 5, bget(sig, 5) ^ 1);
+  if rsa_pkcs1_verify_min(n, e, msg, sig, 64, 256) { bad = wrap_add(bad, 1); }
+  bfree(sig);
+  bfree(msg);
+  return bad;
+}
+
+fn k0_t9(n: &Bytes, d: &Bytes, e: &Bytes) -> u64
+  requires blen(n) < 65536 && blen(d) < 65536 && blen(e) < 65536
+{
+  let msg = unhex("70cc947bcf92f4adf251cbdc741736e45d");
+  let salt = unhex("62973d9127b9fcb319693c5a9e2ebe98d4b360c54cbd5f0dc6adfafbbf5e0639eaf026f0bed938bcf895dd14715aee4cd8d9de1c06df4fe7fabda5eea9009db1");
+  let mut bad = 0;
+  if !is_hex(rsa_pss_sign(n, d, msg, salt, 64, 256), "7647daa6b7f4595c6f5dfb3e2b5bc3ecaad654b3dbab55e55f481abd187a841afac47880f720bc6fd2a2694fe3b6e37fc8a4789ec6f10ac6cf98ca10ded684a1a19ff660d4891af403e5bb7a64856c8e771e306f25ab56124ce42c52842ec60fabcba8b2d87270a9332be5de87baf39a614f524ebee2df8cc96fbf75a6d37f1c4d5a104753b0c0c22b6cb52fa8108a70aaa222f0cbbee8dcca1d8ea52242bf3578f62427bf1ca0b2caa60bb0c6ebafca052f5167cc5e8f7a9d363bb4f7b61a6e4101ad735617cff17315407c1c21ea9aa0a32d4ad623d53582a23a80d8361c8267f6148dfa496a5e86fb0080acf64af5de3a322ab1fa2a2e604b7e2ef9ee2109") { bad = wrap_add(bad, 1); }
+  let mut sig = unhex("7647daa6b7f4595c6f5dfb3e2b5bc3ecaad654b3dbab55e55f481abd187a841afac47880f720bc6fd2a2694fe3b6e37fc8a4789ec6f10ac6cf98ca10ded684a1a19ff660d4891af403e5bb7a64856c8e771e306f25ab56124ce42c52842ec60fabcba8b2d87270a9332be5de87baf39a614f524ebee2df8cc96fbf75a6d37f1c4d5a104753b0c0c22b6cb52fa8108a70aaa222f0cbbee8dcca1d8ea52242bf3578f62427bf1ca0b2caa60bb0c6ebafca052f5167cc5e8f7a9d363bb4f7b61a6e4101ad735617cff17315407c1c21ea9aa0a32d4ad623d53582a23a80d8361c8267f6148dfa496a5e86fb0080acf64af5de3a322ab1fa2a2e604b7e2ef9ee2109");
+  if !rsa_pss_verify_salt(n, e, msg, sig, 64, 64, 256) { bad = wrap_add(bad, 1); }
+  if rsa_pss_verify_salt(n, e, msg, sig, 64, 65, 256) { bad = wrap_add(bad, 1); }
+  bset(&mut sig, 7, bget(sig, 7) ^ 1);
+  if rsa_pss_verify_salt(n, e, msg, sig, 64, 64, 256) { bad = wrap_add(bad, 1); }
+  bfree(sig);
+  bfree(salt);
+  bfree(msg);
+  return bad;
+}
+
+fn k0_t10(n: &Bytes, d: &Bytes, e: &Bytes) -> u64
+  requires blen(n) < 65536 && blen(d) < 65536 && blen(e) < 65536
+{
+  let pt = unhex("9035db1a9207433993964f8d18067b4e0a68aa0517bca4addc4148c86654");
+  let seed = unhex("85e3b1d9870cd362d6bad982368535f08c13662baf91b55b5b011605cf313cdd5fa811b822b2597446e988718994edf79b5e75ed203ea1347c98cced1cc7b5c5");
+  let label = unhex("");
+  let other = unhex("ab");
+  let mut bad = 0;
+  if !is_hex(rsa_oaep_encrypt(n, e, pt, label, seed, 64, 256), "c1528677d43a8a4726319a3f1108d1955e959da7af5cd5c323591a60f5176b2dbca8223d50864fa0a36c87f5d846a3721a28e318951ae839f117aaec9389c74bcb11c005a446e1600ac0360b13c36ad0c11fbf2456ab40c6fe94deb9ab185613276168b68d762f00ada359d812875137f773cbbd3fa6eef854c6038d65bb8371874cfb843fa578eedab54d8576c3f5f63573d5ec1e69c206b2a3ddcf1ac1e4e14b8a1eef51a5eee142eee3a4f4f4fd61dd7a66ecafd3e337e91adabd9849c0c1619d77c543bc9630cd83d7f8506999c4db2bb47ccc100a93f2d8f0db9a34d38de3b59b708f8717b9a871534e2d617d53295785b54fc2d585a2910d498c90f648") { bad = wrap_add(bad, 1); }
+  let mut ct = unhex("c1528677d43a8a4726319a3f1108d1955e959da7af5cd5c323591a60f5176b2dbca8223d50864fa0a36c87f5d846a3721a28e318951ae839f117aaec9389c74bcb11c005a446e1600ac0360b13c36ad0c11fbf2456ab40c6fe94deb9ab185613276168b68d762f00ada359d812875137f773cbbd3fa6eef854c6038d65bb8371874cfb843fa578eedab54d8576c3f5f63573d5ec1e69c206b2a3ddcf1ac1e4e14b8a1eef51a5eee142eee3a4f4f4fd61dd7a66ecafd3e337e91adabd9849c0c1619d77c543bc9630cd83d7f8506999c4db2bb47ccc100a93f2d8f0db9a34d38de3b59b708f8717b9a871534e2d617d53295785b54fc2d585a2910d498c90f648");
+  if !is_hex(rsa_oaep_decrypt(n, d, ct, label, 64, 256), "9035db1a9207433993964f8d18067b4e0a68aa0517bca4addc4148c86654") { bad = wrap_add(bad, 1); }
+  if !is_none(rsa_oaep_decrypt(n, d, ct, other, 64, 256)) { bad = wrap_add(bad, 1); }
+  bset(&mut ct, 9, bget(ct, 9) ^ 1);
+  if !is_none(rsa_oaep_decrypt(n, d, ct, label, 64, 256)) { bad = wrap_add(bad, 1); }
+  bfree(ct);
+  bfree(other);
+  bfree(label);
+  bfree(seed);
+  bfree(pt);
+  return bad;
+}
+
+fn k0_t11(n: &Bytes, d: &Bytes, e: &Bytes) -> u64
+  requires blen(n) < 65536 && blen(d) < 65536 && blen(e) < 65536
+{
+  let mut ct = unhex("c3e26f8a836a6d58f32628ab0da1554539222d8c772aa407a72a2d1e011f80683d169bf4f7a9dedfd78cc3aee1577c541cec2ed9072a2490e425b952e7466f94756a4773cdb8a053020c9d4f4ae832114497ab03f78c7919eca739f448c1372295f5a8e15e055cf1ad7d7bfbd5f950b6d12cd0b9100ffc33c62b110fb9f2accb18fce7b9112fb7fb485391a64f72f0220152b26ad0fb8b1104af85102b946bb15c057b4dc92426236be5ae20a5f8e50fd8a7efee6a8cf28f2cf9675387c13f397f623e7a932905b7ca302b109b077b9d2db472dda65f357fad4303b34aa18776a162c6cc5886f9dc1172e409770c0e190554e09b6ef0b1335f92a72d3dc42b9e");
+  let label = unhex("");
+  let mut bad = 0;
+  if !is_hex(rsa_oaep_decrypt(n, d, ct, label, 64, 256), "9035db1a9207433993964f8d18067b4e0a68aa0517bca4addc4148c86654") { bad = wrap_add(bad, 1); }
+  bfree(label);
+  bfree(ct);
+  return bad;
+}
+
+fn key0() -> u64 {
+  let n = unhex("c8a76c0e41a13026fe5c9b791e64a1d3bda9fd13da609b623ca91db2b4882762010f9f9abe2d260567f09b99841bacb72361f807e29155c7784c57aad14ff59372cc65a851e334d999381f7ad8129271dabbbf37b8eb936881a31b92fee384645a4089937fdcc3deabc062331e71a92dc005033005ef95e138fc2e4780df71a78469f05226e0abc1f9b4673afc5b629107fe78acb1237768142508af7de3a76c44f95087fd1bc5fa8fa0f8de22a5a08969044e040a995cc6a432c589ac8e30ecd989a2e072ddb53ca687148722b81b406f884a890dbc0dbb7b3c6bf714cb3dd8d93720c381e96d1304cb79be9c5aba44a999693231e7a0da1f67cea223c1cfed");
+  let d = unhex("434a32288dc5da7a192f414c5aeef07e2bcac7fe526bb770385b9684099ae76a2c64eae76003900e9c0eca7faf1800d1e1e1c6e60e0b2333239aa683b872122f027e9d50d73554d1ec5a2fe46875c1fac099d9c47c1534780591877bc252d661390b0f9811771d909d14855a134996acab0a834925947534f4814d9bd91215f0b8fad802221d64f132ae98dc21894e07d944b1025ee6abefade84e924cb485f05414c48a1636d281f598a2da93e60f6293823f511e8cf4cb65f5b112057206d722699c4422baf56acfd647bb78147243943f38a89a3913ec9668ffdff87983866c6205299435e00d597aec5c6f6701c194ee2b0e46e45bc3fc4bebf37937ed59");
+  let e = unhex("010001");
+  let mut bad = 0;
+  bad = wrap_add(bad, k0_t0(n, d, e));
+  bad = wrap_add(bad, k0_t1(n, d, e));
+  bad = wrap_add(bad, k0_t2(n, d, e));
+  bad = wrap_add(bad, k0_t3(n, d, e));
+  bad = wrap_add(bad, k0_t4(n, d, e));
+  bad = wrap_add(bad, k0_t5(n, d, e));
+  bad = wrap_add(bad, k0_t6(n, d, e));
+  bad = wrap_add(bad, k0_t7(n, d, e));
+  bad = wrap_add(bad, k0_t8(n, d, e));
+  bad = wrap_add(bad, k0_t9(n, d, e));
+  bad = wrap_add(bad, k0_t10(n, d, e));
+  bad = wrap_add(bad, k0_t11(n, d, e));
+  bfree(e);
+  bfree(d);
+  bfree(n);
+  return bad;
+}
+
+fn k1_t0(n: &Bytes, d: &Bytes, e: &Bytes) -> u64
+  requires blen(n) < 65536 && blen(d) < 65536 && blen(e) < 65536
+{
+  let msg = unhex("a49d712305e7b0ec3daec0f49c9a732b58");
+  let mut bad = 0;
+  if !is_hex(rsa_pkcs1_sign(n, d, msg, 32, 64), "14eefd824e735b3860837a54eafdb8e50db3fe4e75f432310477fe25ceb795fb4a32ce2921bafae278acc4c73cc11834bcbf27f27496bd659fa84ae19968abcad061c47ac5faa373fd2298b79b5aeafe168691cd41b7a49cc8e98fe9094d0f0704a5772f8088348337ac1383ef01edb13e6c9bd84cea2bc1b45714e5a8f60114") { bad = wrap_add(bad, 1); }
+  let mut sig = unhex("14eefd824e735b3860837a54eafdb8e50db3fe4e75f432310477fe25ceb795fb4a32ce2921bafae278acc4c73cc11834bcbf27f27496bd659fa84ae19968abcad061c47ac5faa373fd2298b79b5aeafe168691cd41b7a49cc8e98fe9094d0f0704a5772f8088348337ac1383ef01edb13e6c9bd84cea2bc1b45714e5a8f60114");
+  if !rsa_pkcs1_verify_min(n, e, msg, sig, 32, 64) { bad = wrap_add(bad, 1); }
+  bset(&mut sig, 5, bget(sig, 5) ^ 1);
+  if rsa_pkcs1_verify_min(n, e, msg, sig, 32, 64) { bad = wrap_add(bad, 1); }
+  bfree(sig);
+  bfree(msg);
+  return bad;
+}
+
+fn k1_t1(n: &Bytes, d: &Bytes, e: &Bytes) -> u64
+  requires blen(n) < 65536 && blen(d) < 65536 && blen(e) < 65536
+{
+  let msg = unhex("a49d712305e7b0ec3daec0f49c9a732b58");
+  let salt = unhex("599a5806ae5db8cf7dc3b8522a0f963643209d2afa4c44901aed4ba6b0a65887");
+  let mut bad = 0;
+  if !is_hex(rsa_pss_sign(n, d, msg, salt, 32, 64), "bcf274e81b97ea74cd273ae49e00d27fd9f8c455a9745deec3c13f8a89e215d343d60fa4d99c07f2c2a918e149789cf09669dc989cf6c4b1c08a32dc83950966f78b4bcc70e0e53430edd855e09d90ace49468a664bc838889ec4b8fb47a2941bee76d84d967ab313398280c15d91c6432712406227a5059676dc522df5e3642") { bad = wrap_add(bad, 1); }
+  let mut sig = unhex("bcf274e81b97ea74cd273ae49e00d27fd9f8c455a9745deec3c13f8a89e215d343d60fa4d99c07f2c2a918e149789cf09669dc989cf6c4b1c08a32dc83950966f78b4bcc70e0e53430edd855e09d90ace49468a664bc838889ec4b8fb47a2941bee76d84d967ab313398280c15d91c6432712406227a5059676dc522df5e3642");
+  if !rsa_pss_verify_salt(n, e, msg, sig, 32, 32, 64) { bad = wrap_add(bad, 1); }
+  if rsa_pss_verify_salt(n, e, msg, sig, 32, 33, 64) { bad = wrap_add(bad, 1); }
+  bset(&mut sig, 7, bget(sig, 7) ^ 1);
+  if rsa_pss_verify_salt(n, e, msg, sig, 32, 32, 64) { bad = wrap_add(bad, 1); }
+  bfree(sig);
+  bfree(salt);
+  bfree(msg);
+  return bad;
+}
+
+fn k1_t2(n: &Bytes, d: &Bytes, e: &Bytes) -> u64
+  requires blen(n) < 65536 && blen(d) < 65536 && blen(e) < 65536
+{
+  let pt = unhex("e12cde4a5dea4d27031741d14a9b3bb3aac4435593047ac469d2020d1dd7");
+  let seed = unhex("f7ba33dfa0e7f7a7d326242f970b32c7a8f4c8261688e2dbe5190af69090f911");
+  let label = unhex("276c4f");
+  let other = unhex("ab");
+  let mut bad = 0;
+  if !is_hex(rsa_oaep_encrypt(n, e, pt, label, seed, 32, 64), "6bbade72d17be9449c6703ce6b2d4c25ca936a9e8b85f0995c73650b685f7fba0e4d7bf122e592d13da2be3db89aaf54b58ee649b139a0994b54ff9b66ae90e7bdadf36ef2332b2a7fb7e75162f26e9904f36d97c36d4f6861fc2a433d96f921971a2226fe4f7db5079597ac32e6827f3cff69dc938c60e55fba93d3f4d0d5fb") { bad = wrap_add(bad, 1); }
+  let mut ct = unhex("6bbade72d17be9449c6703ce6b2d4c25ca936a9e8b85f0995c73650b685f7fba0e4d7bf122e592d13da2be3db89aaf54b58ee649b139a0994b54ff9b66ae90e7bdadf36ef2332b2a7fb7e75162f26e9904f36d97c36d4f6861fc2a433d96f921971a2226fe4f7db5079597ac32e6827f3cff69dc938c60e55fba93d3f4d0d5fb");
+  if !is_hex(rsa_oaep_decrypt(n, d, ct, label, 32, 64), "e12cde4a5dea4d27031741d14a9b3bb3aac4435593047ac469d2020d1dd7") { bad = wrap_add(bad, 1); }
+  if !is_none(rsa_oaep_decrypt(n, d, ct, other, 32, 64)) { bad = wrap_add(bad, 1); }
+  bset(&mut ct, 9, bget(ct, 9) ^ 1);
+  if !is_none(rsa_oaep_decrypt(n, d, ct, label, 32, 64)) { bad = wrap_add(bad, 1); }
+  bfree(ct);
+  bfree(other);
+  bfree(label);
+  bfree(seed);
+  bfree(pt);
+  return bad;
+}
+
+fn k1_t3(n: &Bytes, d: &Bytes, e: &Bytes) -> u64
+  requires blen(n) < 65536 && blen(d) < 65536 && blen(e) < 65536
+{
+  let mut ct = unhex("7155327496bed9daec9a564deb958df2e459bdfe3851e750f755672d346f73c9465e5d2163b42d641b0109216a3e00b2b410f5f49171c1564b44f9a5bcd68591afd07979f145c7d27c1a0e345d8288160f49da16726af9408335448488cb288f479f8c680fa1f26311eb3690ba7058106af7459b77361389996a04bc6a4e2c3d");
+  let label = unhex("276c4f");
+  let mut bad = 0;
+  if !is_hex(rsa_oaep_decrypt(n, d, ct, label, 32, 64), "e12cde4a5dea4d27031741d14a9b3bb3aac4435593047ac469d2020d1dd7") { bad = wrap_add(bad, 1); }
+  bfree(label);
+  bfree(ct);
+  return bad;
+}
+
+fn k1_t4(n: &Bytes, d: &Bytes, e: &Bytes) -> u64
+  requires blen(n) < 65536 && blen(d) < 65536 && blen(e) < 65536
+{
+  let msg = unhex("a5fc602366bda2ae5ae3efac1533d97656");
+  let mut bad = 0;
+  if !is_hex(rsa_pkcs1_sign(n, d, msg, 48, 64), "26e3d2dc23b58e4f2d08653cd70c60054bd680343a18e1a7bc5031b8f7d42640a5a19c38745e41121bca6164f9ae778d7a479d1757643961e0b5e88cefafd484d42332cb705ef887b67f7972d7a32698ca9a775e710669636e54b2e0d4b11680416163e2126e7aafbf2d7ecaf64a93d250cbb74d7033857c17df9c0315879265") { bad = wrap_add(bad, 1); }
+  let mut sig = unhex("26e3d2dc23b58e4f2d08653cd70c60054bd680343a18e1a7bc5031b8f7d42640a5a19c38745e41121bca6164f9ae778d7a479d1757643961e0b5e88cefafd484d42332cb705ef887b67f7972d7a32698ca9a775e710669636e54b2e0d4b11680416163e2126e7aafbf2d7ecaf64a93d250cbb74d7033857c17df9c0315879265");
+  if !rsa_pkcs1_verify_min(n, e, msg, sig, 48, 64) { bad = wrap_add(bad, 1); }
+  bset(&mut sig, 5, bget(sig, 5) ^ 1);
+  if rsa_pkcs1_verify_min(n, e, msg, sig, 48, 64) { bad = wrap_add(bad, 1); }
+  bfree(sig);
+  bfree(msg);
+  return bad;
+}
+
+fn k1_t5(n: &Bytes, d: &Bytes, e: &Bytes) -> u64
+  requires blen(n) < 65536 && blen(d) < 65536 && blen(e) < 65536
+{
+  let msg = unhex("a5fc602366bda2ae5ae3efac1533d97656");
+  let salt = unhex("4f77cadafad3f4fc6965b87db62e6aa4318ce183");
+  let mut bad = 0;
+  if !is_hex(rsa_pss_sign(n, d, msg, salt, 48, 64), "d1c0fe7f4d5e981962fe6cc2aabde68be22a31c8423334e7fb83a8ee5c4151aa5669beb0aec012434a2cfd365761ef098f61a4a8332d7ac26f2794df02feca6a07d1eae8e29eb3551b2c9011ac7b25c8da2dd479bc716483fab4482a31ef127d5d57191cd296faa610413d5ec23612d03a7313304c4fbcfab10276c5334f0ed2") { bad = wrap_add(bad, 1); }
+  let mut sig = unhex("d1c0fe7f4d5e981962fe6cc2aabde68be22a31c8423334e7fb83a8ee5c4151aa5669beb0aec012434a2cfd365761ef098f61a4a8332d7ac26f2794df02feca6a07d1eae8e29eb3551b2c9011ac7b25c8da2dd479bc716483fab4482a31ef127d5d57191cd296faa610413d5ec23612d03a7313304c4fbcfab10276c5334f0ed2");
+  if !rsa_pss_verify_salt(n, e, msg, sig, 48, 20, 64) { bad = wrap_add(bad, 1); }
+  if rsa_pss_verify_salt(n, e, msg, sig, 48, 21, 64) { bad = wrap_add(bad, 1); }
+  bset(&mut sig, 7, bget(sig, 7) ^ 1);
+  if rsa_pss_verify_salt(n, e, msg, sig, 48, 20, 64) { bad = wrap_add(bad, 1); }
+  bfree(sig);
+  bfree(salt);
+  bfree(msg);
+  return bad;
+}
+
+fn k1_t6(n: &Bytes, d: &Bytes, e: &Bytes) -> u64
+  requires blen(n) < 65536 && blen(d) < 65536 && blen(e) < 65536
+{
+  let pt = unhex("77526fe0dd1c0c8e71a7a46216faf081bf01c6d8761965d69e79ea6857cf");
+  let seed = unhex("45f44a021084d121ca9431e01c149542b69df0a07444f98f1f4537e461a4d68852f79592ab616fd56ceebe53f3bdcf3e");
+  let label = unhex("");
+  let other = unhex("ab");
+  let mut bad = 0;
+  if !is_hex(rsa_oaep_encrypt(n, e, pt, label, seed, 48, 64), "98d61e0ee74a6cc070f7892616918a32dfc39a2cf92b200313c478e83cfa994179522f74029606ea5884c1bdf9d3cdce1d83ca1cb8a1d1a83e7865c717e1be23abbf61f9158fbbbfe5eb00de0f2933ce85a20f392f554a0c699b2ccdd7a3e66130fcc52a3eb700b9305591167abf4907caa982cda53b88a5685d46a340b70aa1") { bad = wrap_add(bad, 1); }
+  let mut ct = unhex("98d61e0ee74a6cc070f7892616918a32dfc39a2cf92b200313c478e83cfa994179522f74029606ea5884c1bdf9d3cdce1d83ca1cb8a1d1a83e7865c717e1be23abbf61f9158fbbbfe5eb00de0f2933ce85a20f392f554a0c699b2ccdd7a3e66130fcc52a3eb700b9305591167abf4907caa982cda53b88a5685d46a340b70aa1");
+  if !is_hex(rsa_oaep_decrypt(n, d, ct, label, 48, 64), "77526fe0dd1c0c8e71a7a46216faf081bf01c6d8761965d69e79ea6857cf") { bad = wrap_add(bad, 1); }
+  if !is_none(rsa_oaep_decrypt(n, d, ct, other, 48, 64)) { bad = wrap_add(bad, 1); }
+  bset(&mut ct, 9, bget(ct, 9) ^ 1);
+  if !is_none(rsa_oaep_decrypt(n, d, ct, label, 48, 64)) { bad = wrap_add(bad, 1); }
+  bfree(ct);
+  bfree(other);
+  bfree(label);
+  bfree(seed);
+  bfree(pt);
+  return bad;
+}
+
+fn k1_t7(n: &Bytes, d: &Bytes, e: &Bytes) -> u64
+  requires blen(n) < 65536 && blen(d) < 65536 && blen(e) < 65536
+{
+  let mut ct = unhex("7b86da50edb5cf2b82d953626d1fd8f220a45e9965594fa17dc9012ea53bd2cb7ed901963473c78f4cda53633c927e67346b9d998298fac6851cfb6c17c72d774afae38b8ed593d14be7401ac756c4f990c56dd63946748acf934d2947433fe22919a488fe1b07fd487c2d0c1e97eff91115832554a6eac3111c60ca2a5a86a2");
+  let label = unhex("");
+  let mut bad = 0;
+  if !is_hex(rsa_oaep_decrypt(n, d, ct, label, 48, 64), "77526fe0dd1c0c8e71a7a46216faf081bf01c6d8761965d69e79ea6857cf") { bad = wrap_add(bad, 1); }
+  bfree(label);
+  bfree(ct);
+  return bad;
+}
+
+fn k1_t8(n: &Bytes, d: &Bytes, e: &Bytes) -> u64
+  requires blen(n) < 65536 && blen(d) < 65536 && blen(e) < 65536
+{
+  let msg = unhex("95546a5171150463cfdd89ad9a6f8ed577");
+  let mut bad = 0;
+  if !is_hex(rsa_pkcs1_sign(n, d, msg, 64, 64), "8a34281c03fe99915e0bfe98f7e7e8a74a8b5fd97d5e2cc23bcf593043ed4bb35df3d54c53c4ab9da1ddf023da8f1079a6f2843cf0b135846013696bfc7d9afbac419c6daccf434ddfbc60c2398283efd1e904b5a5e943f69fbebbd16a9d5a897aad564c603640f37dd5a8a574918baccd5ac969bb3f540ce95322c68da7ae80") { bad = wrap_add(bad, 1); }
+  let mut sig = unhex("8a34281c03fe99915e0bfe98f7e7e8a74a8b5fd97d5e2cc23bcf593043ed4bb35df3d54c53c4ab9da1ddf023da8f1079a6f2843cf0b135846013696bfc7d9afbac419c6daccf434ddfbc60c2398283efd1e904b5a5e943f69fbebbd16a9d5a897aad564c603640f37dd5a8a574918baccd5ac969bb3f540ce95322c68da7ae80");
+  if !rsa_pkcs1_verify_min(n, e, msg, sig, 64, 64) { bad = wrap_add(bad, 1); }
+  bset(&mut sig, 5, bget(sig, 5) ^ 1);
+  if rsa_pkcs1_verify_min(n, e, msg, sig, 64, 64) { bad = wrap_add(bad, 1); }
+  bfree(sig);
+  bfree(msg);
+  return bad;
+}
+
+fn k1_t9(n: &Bytes, d: &Bytes, e: &Bytes) -> u64
+  requires blen(n) < 65536 && blen(d) < 65536 && blen(e) < 65536
+{
+  let msg = unhex("95546a5171150463cfdd89ad9a6f8ed577");
+  let salt = unhex("dbecf025ddaeb2e43c1a90d305725ac551b53802246293e0c828f6997f159670f3fa3288dd2b2588f73dc78204d75e88d9335814a392b988dfc1e664408b");
+  let mut bad = 0;
+  if !is_hex(rsa_pss_sign(n, d, msg, salt, 64, 64), "c1a2005b2961039add42e3700ed00e47bc02b457ecf5070a93ab3402eb7536a6ceb28a08fa559f2f0209d95478b71a954a2837fb05ecf3c8e2c02aab104e8d9448cbdee323313c0d2049fb55eeff7d2c9e90ce98cfed8330f9b66d5f58e4fd960e77cc50fcffc4fe2f3dd4bd5002a8b55687b1fc38944ca8876cd5fb6fd2533d") { bad = wrap_add(bad, 1); }
+  let mut sig = unhex("c1a2005b2961039add42e3700ed00e47bc02b457ecf5070a93ab3402eb7536a6ceb28a08fa559f2f0209d95478b71a954a2837fb05ecf3c8e2c02aab104e8d9448cbdee323313c0d2049fb55eeff7d2c9e90ce98cfed8330f9b66d5f58e4fd960e77cc50fcffc4fe2f3dd4bd5002a8b55687b1fc38944ca8876cd5fb6fd2533d");
+  if !rsa_pss_verify_salt(n, e, msg, sig, 64, 62, 64) { bad = wrap_add(bad, 1); }
+  if rsa_pss_verify_salt(n, e, msg, sig, 64, 63, 64) { bad = wrap_add(bad, 1); }
+  bset(&mut sig, 7, bget(sig, 7) ^ 1);
+  if rsa_pss_verify_salt(n, e, msg, sig, 64, 62, 64) { bad = wrap_add(bad, 1); }
+  bfree(sig);
+  bfree(salt);
+  bfree(msg);
+  return bad;
+}
+
+fn key1() -> u64 {
+  let n = unhex("dbff68e970882a4dc3442c4a9cfaf9253cd31328ff9c62d445a84b718598b11d72b295482c323c8297681d4749af68424e74d1557d4a160d42e2e64ed37757afae75e3c5160daac08e384d0cb7a48675f2dcf8179f39c0de41d5ea28fc00adc65730ee1250a995ed60a547db6ba1287331f167a60f8b306d1a13625f2c02f1a5");
+  let d = unhex("0f6b01fe423db8c1446b15b390f6e1d9233f23bb9ed665f2bc8303ee8bcf5cb254a48163d27d1ed2842beec95d37a6d5e6cbb71407b8d67ccd703b75d0ca2f61e64e1ba05f2682ef05fbcb43c5ceec534f43a85073350c9a6d799981f5bfe978ae31ff30227fd36535d95f08540c576afc1f9262664e0a7dd39f3af0c57dd121");
+  let e = unhex("010001");
+  let mut bad = 0;
+  bad = wrap_add(bad, k1_t0(n, d, e));
+  bad = wrap_add(bad, k1_t1(n, d, e));
+  bad = wrap_add(bad, k1_t2(n, d, e));
+  bad = wrap_add(bad, k1_t3(n, d, e));
+  bad = wrap_add(bad, k1_t4(n, d, e));
+  bad = wrap_add(bad, k1_t5(n, d, e));
+  bad = wrap_add(bad, k1_t6(n, d, e));
+  bad = wrap_add(bad, k1_t7(n, d, e));
+  bad = wrap_add(bad, k1_t8(n, d, e));
+  bad = wrap_add(bad, k1_t9(n, d, e));
+  let msg = unhex("00");
+  // Under the default minimum of 256 bytes the small key is refused.
+  if !is_none(rsa_pkcs1_sign(n, d, msg, 32, 256)) { bad = wrap_add(bad, 1); }
+  bfree(msg);
+  bfree(e);
+  bfree(d);
+  bfree(n);
+  return bad;
+}
+
+fn main() -> u64 {
+  let mut bad = 0;
+  bad = wrap_add(bad, key0());
+  bad = wrap_add(bad, key1());
+  return bad;
+}

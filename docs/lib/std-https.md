@@ -17,6 +17,7 @@ certificates and no resumption; see core/tls13client.bastio for what is checked 
 | Function | |
 | --- | --- |
 | [`https_run`](#https_run) | Runs a TLS 1.3 exchange on the connected socket `sock`. |
+| [`https_run_opts`](#https_run_opts) | `https_run` with the options of `tls13c_new_opts`. |
 | [`https_result_free`](#https_result_free) | Frees a result (see `https_run`). |
 | [`https_request`](#https_request) | Connects to `ip`:`port`, runs a TLS exchange with the server `name` (see `https_run`) and returns what the server sent after `request`, if it ended with a close_notify (a connection that is cut off, which could hide a truncated answer, gives `None`, as does any failure of the handshake). |
 | [`https_exchange`](#https_exchange) | Like `https_request`, but gives the whole result whatever state the exchange ended in (6 for a close_notify, 5 for a connection that was cut off after the handshake, 7 for a failure), for a caller that can tell by other means (a `Content-Length`) whether the answer is complete. |
@@ -94,6 +95,59 @@ match net_listen(host, lo, 0) {
           Option::Some(a) => {
             net_close(host, a);
             let r = https_run(host, c, name, request, roots, 1800000000, random, session, key);
+            if r.state == 0 && r.error == 0 && blen(r.data) == 0 { bad = 0; }
+            https_result_free(r);
+          },
+          Option::None => {},
+        }
+        net_close(host, c);
+      },
+      Option::None => {},
+    }
+    net_close(host, s);
+  },
+  Option::None => {},
+}
+bfree(key);
+bfree(session);
+bfree(random);
+bfree(roots);
+bfree(request);
+bfree(name);
+if bad != 0 { return 1; }
+```
+
+### `https_run_opts`
+
+```bastio
+fn https_run_opts(h: &Host, sock: u64, name: &Bytes, request: &Bytes, roots: &Bytes, now: u64, random: &Bytes, session: &Bytes, key: &Bytes, opts: u64) -> HttpsResult
+  requires blen(name) <= 255 && blen(request) < 1073741824 && blen(roots) < 274877906944
+  requires blen(random) == 32 && blen(session) == 32 && blen(key) == 32
+```
+
+`https_run` with the options of `tls13c_new_opts`: 2 also accepts a
+server that only speaks TLS 1.2.
+
+Example:
+
+```bastio
+// The server hangs up at once: the handshake never gets going.
+let lo = net_ip4(127, 0, 0, 1);
+let name = bfrom("localhost");
+let request = bfrom("GET / HTTP/1.0\r\n\r\n");
+let roots = balloc(0);
+let random = balloc(32);
+let session = balloc(32);
+let key = balloc(32);
+let mut bad = 1;
+match net_listen(host, lo, 0) {
+  Option::Some(s) => {
+    match net_connect(host, lo, net_port(host, s)) {
+      Option::Some(c) => {
+        match net_accept(host, s) {
+          Option::Some(a) => {
+            net_close(host, a);
+            let r = https_run_opts(host, c, name, request, roots, 1800000000, random, session, key, 2);
             if r.state == 0 && r.error == 0 && blen(r.data) == 0 { bad = 0; }
             https_result_free(r);
           },

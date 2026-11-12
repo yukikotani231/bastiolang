@@ -61,14 +61,14 @@ Each module has a reference page, generated from its source: every function with
 | [`core/md5.bastio`](lib/core-md5.md) | MD5 (RFC 1321) and HMAC-MD5 (RFC 2104). |
 | [`core/num.bastio`](lib/core-num.md) | Parsing integers from bytes and formatting them as text. |
 | [`core/option.bastio`](lib/core-option.md) | An optional value, and a span of a byte string. |
-| [`core/p256.bastio`](lib/core-p256.md) | ECDSA signatures over the curve P-256 (secp256r1) with SHA-256, verification only (FIPS 186-4, RFC 6979 is for signing), for the ecdsa_secp256r1_sha256 scheme of TLS 1.3 certificates. |
-| [`core/p384.bastio`](lib/core-p384.md) | ECDSA signatures over the curve P-384 (secp384r1) with SHA-384, verification only (FIPS 186-4, RFC 6979 is for signing), for the ecdsa_secp384r1_sha384 scheme of TLS 1.3 certificates. |
+| [`core/p256.bastio`](lib/core-p256.md) | ECDSA signatures over the curve P-256 (secp256r1) with SHA-256. |
+| [`core/p384.bastio`](lib/core-p384.md) | ECDSA signatures over the curve P-384 (secp384r1) with SHA-384. |
 | [`core/path.bastio`](lib/core-path.md) | File names. |
 | [`core/poly1305.bastio`](lib/core-poly1305.md) | The Poly1305 one-time authenticator (RFC 8439 section 2.5), in the 26-bit-limb form of poly1305-donna. |
 | [`core/print.bastio`](lib/core-print.md) | Writing text and numbers to the serial console. |
 | [`core/ring.bastio`](lib/core-ring.md) | Ring buffers and fixed-capacity FIFO queues. |
 | [`core/rows.bastio`](lib/core-rows.md) | Tables of fixed-size rows in one `Buf`. |
-| [`core/rsa.bastio`](lib/core-rsa.md) | RSA signature verification with SHA-256, SHA-384 and SHA-512 (RFC 8017). |
+| [`core/rsa.bastio`](lib/core-rsa.md) | RSA with SHA-256, SHA-384 and SHA-512 (RFC 8017). |
 | [`core/scan.bastio`](lib/core-scan.md) | Cutting a byte string into pieces. |
 | [`core/set.bastio`](lib/core-set.md) | A set of `u64`, built on core/hashmap.bastio. |
 | [`core/sha1.bastio`](lib/core-sha1.md) | SHA-1 (FIPS 180-4) and HMAC-SHA-1 (RFC 2104). |
@@ -83,6 +83,7 @@ Each module has a reference page, generated from its source: every function with
 | [`core/tls13client.bastio`](lib/core-tls13client.md) | A TLS 1.3 client that does no input or output of its own. |
 | [`core/tls13hs.bastio`](lib/core-tls13hs.md) | The first two messages of a TLS 1.3 handshake (RFC 8446 section 4). |
 | [`core/tls13record.bastio`](lib/core-tls13record.md) | The TLS 1.3 record layer with the ChaCha20-Poly1305, AES-128-GCM or AES-256-GCM cipher suite (RFC 8446 section 5). |
+| [`core/tls13server.bastio`](lib/core-tls13server.md) | The server side of TLS 1.3, with no input or output of its own, like core/tls13client. |
 | [`core/url.bastio`](lib/core-url.md) | Percent-encoding (RFC 3986 section 2.1) and the query string of a request target (`/path?a=1&b=two%20words`). |
 | [`core/utf8.bastio`](lib/core-utf8.md) | UTF-8 validation (RFC 3629). |
 | [`core/wgnoise.bastio`](lib/core-wgnoise.md) | The Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s pattern, as a set of pure functions on byte strings (no clocks, no random numbers, no sockets). |
