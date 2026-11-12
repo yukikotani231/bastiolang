@@ -1207,6 +1207,79 @@ fn cg_prelude_spawn_err(out: &mut Vec[u64]) {
   w_s(&mut out, "#define bst_child_wait(c) bst_child_wait_err(c)\n");
 }
 
+/// The prelude part for `child_fd`, `child_try_read` and `child_try_wait`
+/// (stage1 only): added after the spawn_err part, and only to a program that
+/// calls one of them.
+fn cg_prelude_child_async(out: &mut Vec[u64]) {
+  w_s(&mut out, "/* child_fd, child_try_read and child_try_wait: a child driven without blocking.\n");
+  w_s(&mut out, " * try_read polls the pipe and reads what is there, so no flag is set on the\n");
+  w_s(&mut out, " * descriptor (and the EAGAIN value, 11 on Linux and 35 on macOS, never matters).\n");
+  w_s(&mut out, " * It reads the descriptor itself, so do not mix it with child_read_line on the\n");
+  w_s(&mut out, " * same stream. */\n");
+  w_s(&mut out, "#ifndef _WIN32\n");
+  w_s(&mut out, "#include <errno.h>\n");
+  w_s(&mut out, "#include <poll.h>\n");
+  w_s(&mut out, "#include <sys/wait.h>\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "static int bst_child_fdof(bst_child *c, uint64_t which) {\n");
+  w_s(&mut out, "    if (which == 0) return c->in;\n");
+  w_s(&mut out, "    if (which == 1) return c->out ? fileno(c->out) : -1;\n");
+  w_s(&mut out, "    if (which == 2 && c->pid >= 0) {\n");
+  w_s(&mut out, "        for (bst_errnode *n = bst_errs; n; n = n->next)\n");
+  w_s(&mut out, "            if (n->pid == c->pid) return fileno(n->err);\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    return -1;\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "static uint64_t bst_child_fd(bst_child c, uint64_t which) {\n");
+  w_s(&mut out, "    int fd = bst_child_fdof(&c, which);\n");
+  w_s(&mut out, "    return fd < 0 ? UINT64_MAX : (uint64_t)fd;\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "/* 0: a chunk of output replaced `out`; 1: nothing to read yet; 2: the end (or no such pipe). */\n");
+  w_s(&mut out, "static uint64_t bst_child_try_read(bst_child *c, uint64_t which, bst_bytes *out) {\n");
+  w_s(&mut out, "    int fd = bst_child_fdof(c, which);\n");
+  w_s(&mut out, "    if (which == 0 || fd < 0) return 2;\n");
+  w_s(&mut out, "#ifdef _WIN32\n");
+  w_s(&mut out, "    DWORD avail = 0;\n");
+  w_s(&mut out, "    if (!PeekNamedPipe((HANDLE)_get_osfhandle(fd), NULL, 0, NULL, &avail, NULL)) return 2;\n");
+  w_s(&mut out, "    if (avail == 0) return 1;\n");
+  w_s(&mut out, "#else\n");
+  w_s(&mut out, "    struct pollfd pf;\n");
+  w_s(&mut out, "    pf.fd = fd;\n");
+  w_s(&mut out, "    pf.events = POLLIN;\n");
+  w_s(&mut out, "    pf.revents = 0;\n");
+  w_s(&mut out, "    int r;\n");
+  w_s(&mut out, "    do { r = poll(&pf, 1, 0); } while (r < 0 && errno == EINTR);\n");
+  w_s(&mut out, "    if (r == 0) return 1;\n");
+  w_s(&mut out, "    if (r < 0) return 2;\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "    unsigned char *d = (unsigned char *)malloc(65536);\n");
+  w_s(&mut out, "    if (!d) { fputs(\"Bastio: out of memory\\n\", stderr); abort(); }\n");
+  w_s(&mut out, "    ssize_t n;\n");
+  w_s(&mut out, "    do { n = read(fd, d, 65536); } while (n < 0 && errno == EINTR);\n");
+  w_s(&mut out, "    if (n <= 0) { free(d); return 2; }\n");
+  w_s(&mut out, "    free(out->data);\n");
+  w_s(&mut out, "    out->len = (uint64_t)n;\n");
+  w_s(&mut out, "    out->data = d;\n");
+  w_s(&mut out, "    return 0;\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "/* 256 while the child runs, else its exit status as child_wait would report\n");
+  w_s(&mut out, " * it. The child is not reaped: child_wait still has to be called. */\n");
+  w_s(&mut out, "static uint64_t bst_child_try_wait(bst_child c) {\n");
+  w_s(&mut out, "    if (c.pid < 0) return 127;\n");
+  w_s(&mut out, "#ifdef _WIN32\n");
+  w_s(&mut out, "    DWORD code;\n");
+  w_s(&mut out, "    if (!GetExitCodeProcess((HANDLE)c.pid, &code)) return 255;\n");
+  w_s(&mut out, "    return code == STILL_ACTIVE ? 256 : (uint64_t)code;\n");
+  w_s(&mut out, "#else\n");
+  w_s(&mut out, "    siginfo_t si;\n");
+  w_s(&mut out, "    memset(&si, 0, sizeof si);\n");
+  w_s(&mut out, "    if (waitid(P_PID, (id_t)c.pid, &si, WEXITED | WNOHANG | WNOWAIT) != 0) return 255;\n");
+  w_s(&mut out, "    if (si.si_pid == 0) return 256;\n");
+  w_s(&mut out, "    return si.si_code == CLD_EXITED ? (uint64_t)si.si_status : 128 + (uint64_t)si.si_status;\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "}\n");
+}
+
 /// The prelude part for `host_sandbox` (stage1 only): added after the hosted
 /// prelude, and only to a program that calls it.
 fn cg_prelude_sandbox(out: &mut Vec[u64]) {
@@ -2026,6 +2099,13 @@ fn cg_prelude_code(out: &mut Vec[u64]) {
   w_s(&mut out, " *                      below the field's length now\n");
   w_s(&mut out, " *  18 STORE f b i s L  field f [ r[b] + r[i] ] = r[s], or go to item L\n");
   w_s(&mut out, " *  19 CALLR k a b c d  as CALL, with the arguments r[a], r[b], r[c], r[d]\n");
+  w_s(&mut out, " *  20 FALU op d a b    r[d] = r[a] op r[b] as doubles (the registers hold their\n");
+  w_s(&mut out, " *                      bits); op: 0 add, 1 sub, 2 mul, 3 div\n");
+  w_s(&mut out, " *  21 FUN op d a       r[d] = op r[a] as a double; op: 0 sqrt, 1 neg, 2 abs, 3 the\n");
+  w_s(&mut out, " *                      signed integer r[a] as a double, 4 r[a] as a double cut\n");
+  w_s(&mut out, " *                      towards 0 to a signed integer (NaN and out of range: 2^63)\n");
+  w_s(&mut out, " *  22 FCMPBR c a b L   go to item L if r[a] c r[b] as doubles; c: 0 eq, 1 ne, 2 lt,\n");
+  w_s(&mut out, " *                      3 le, 4 gt, 5 ge (false for a NaN, except ne)\n");
   w_s(&mut out, " * The registers are 0 when the code is entered. L is the word offset of an\n");
   w_s(&mut out, " * item in the plan; f is a number from code_field. Running off the end\n");
   w_s(&mut out, " * returns the current value. A plan that breaks a rule (an unknown opcode, a\n");
@@ -2064,8 +2144,8 @@ fn cg_prelude_code(out: &mut Vec[u64]) {
   w_s(&mut out, "#define BST_CODE_EPI 18u       /* add $136,%rsp; pop %rbp, %r15..%r12, %rbx; ret */\n");
   w_s(&mut out, "/* The length in words of the item at plan[i] (0: not a valid item). */\n");
   w_s(&mut out, "static uint64_t bst_code_ilen(const uint64_t *w, uint64_t n, uint64_t i) {\n");
-  w_s(&mut out, "    static const uint64_t lens[20] = { 6, 2, 2, 3, 2, 1, 2, 2, 3, 3, 5, 5, 6, 5, 5, 2, 2, 6, 6, 6 };\n");
-  w_s(&mut out, "    if (i >= n || w[i] > 19 || lens[w[i]] > n - i) return 0;\n");
+  w_s(&mut out, "    static const uint64_t lens[23] = { 6, 2, 2, 3, 2, 1, 2, 2, 3, 3, 5, 5, 6, 5, 5, 2, 2, 6, 6, 6, 5, 4, 5 };\n");
+  w_s(&mut out, "    if (i >= n || w[i] > 22 || lens[w[i]] > n - i) return 0;\n");
   w_s(&mut out, "    return lens[w[i]];\n");
   w_s(&mut out, "}\n");
   w_s(&mut out, "static unsigned bst_code_imm(uint64_t x) { return x <= 0xffffffffu ? 5u : 10u; }\n");
@@ -2084,6 +2164,9 @@ fn cg_prelude_code(out: &mut Vec[u64]) {
   w_s(&mut out, "    case 17: return w[i + 1] < 16 && w[i + 2] < nfield && w[i + 3] < 16 && w[i + 4] < 16;\n");
   w_s(&mut out, "    case 18: return w[i + 1] < nfield && w[i + 2] < 16 && w[i + 3] < 16 && w[i + 4] < 16;\n");
   w_s(&mut out, "    case 19: return w[i + 1] < ntab && w[i + 2] < 16 && w[i + 3] < 16 && w[i + 4] < 16 && w[i + 5] < 16;\n");
+  w_s(&mut out, "    case 20: return w[i + 1] <= 3 && w[i + 2] < 16 && w[i + 3] < 16 && w[i + 4] < 16;\n");
+  w_s(&mut out, "    case 21: return w[i + 1] <= 4 && w[i + 2] < 16 && w[i + 3] < 16;\n");
+  w_s(&mut out, "    case 22: return w[i + 1] <= 5 && w[i + 2] < 16 && w[i + 3] < 16;\n");
   w_s(&mut out, "    default: return 1;\n");
   w_s(&mut out, "    }\n");
   w_s(&mut out, "}\n");
@@ -2093,7 +2176,7 @@ fn cg_prelude_code(out: &mut Vec[u64]) {
   w_s(&mut out, "    case 1: case 2: case 4: case 7: return (int64_t)w[i + 1];\n");
   w_s(&mut out, "    case 3: return (int64_t)w[i + 2];\n");
   w_s(&mut out, "    case 12: case 17: case 18: return (int64_t)w[i + 5];\n");
-  w_s(&mut out, "    case 13: case 14: return (int64_t)w[i + 4];\n");
+  w_s(&mut out, "    case 13: case 14: case 22: return (int64_t)w[i + 4];\n");
   w_s(&mut out, "    default: return -1;\n");
   w_s(&mut out, "    }\n");
   w_s(&mut out, "}\n");
@@ -2122,6 +2205,9 @@ fn cg_prelude_code(out: &mut Vec[u64]) {
   w_s(&mut out, "    case 17: return bst_code_vl(w[i + 3]) + bst_code_vl(w[i + 4]) + 3 + 7 + 9 + 7 + 4 + bst_code_vl(w[i + 1]);\n");
   w_s(&mut out, "    case 18: return bst_code_vl(w[i + 2]) + bst_code_vl(w[i + 3]) + 3 + 7 + 9 + 7 + bst_code_vl(w[i + 4]) + 4;\n");
   w_s(&mut out, "    case 19: return 3 + bst_code_vl(w[i + 2]) + bst_code_vl(w[i + 3]) + bst_code_vl(w[i + 4]) + bst_code_vl(w[i + 5]) + 12 + 10 + 2 + 3;\n");
+  w_s(&mut out, "    case 20: return bst_code_vl(w[i + 3]) + bst_code_vl(w[i + 4]) + 5 + 5 + 4 + 5 + bst_code_vl(w[i + 2]);\n");
+  w_s(&mut out, "    case 21: return bst_code_vl(w[i + 3]) + (w[i + 1] == 1 || w[i + 1] == 2 ? 5u : w[i + 1] == 0 ? 14u : 10u) + bst_code_vl(w[i + 2]);\n");
+  w_s(&mut out, "    case 22: return bst_code_vl(w[i + 2]) + bst_code_vl(w[i + 3]) + 5 + 5 + 4 + (w[i + 1] == 0 ? 8u : w[i + 1] == 1 ? 12u : 6u);\n");
   w_s(&mut out, "    default: return 0;\n");
   w_s(&mut out, "    }\n");
   w_s(&mut out, "}\n");
@@ -2345,6 +2431,49 @@ fn cg_prelude_code(out: &mut Vec[u64]) {
   w_s(&mut out, "            bst_code_ld(&p, 1, w[i + 4]);\n");
   w_s(&mut out, "            bst_code_put(&p, \"\\x48\\x89\\x0c\\xc2\", 4);                      /* mov %rcx,(%rdx,%rax,8) */\n");
   w_s(&mut out, "            break;\n");
+  w_s(&mut out, "        case 20: {\n");
+  w_s(&mut out, "            static const unsigned char fop[4] = { 0x58, 0x5c, 0x59, 0x5e };\n");
+  w_s(&mut out, "            bst_code_ld(&p, 0, w[i + 3]);\n");
+  w_s(&mut out, "            bst_code_ld(&p, 1, w[i + 4]);\n");
+  w_s(&mut out, "            bst_code_put(&p, \"\\x66\\x48\\x0f\\x6e\\xc0\\x66\\x48\\x0f\\x6e\\xc9\", 10);   /* movq %rax,%xmm0; movq %rcx,%xmm1 */\n");
+  w_s(&mut out, "            bst_code_put(&p, \"\\xf2\\x0f\", 2);\n");
+  w_s(&mut out, "            *p++ = fop[w[i + 1]];\n");
+  w_s(&mut out, "            *p++ = 0xc1;                                                         /* addsd etc. %xmm1,%xmm0 */\n");
+  w_s(&mut out, "            bst_code_put(&p, \"\\x66\\x48\\x0f\\x7e\\xc0\", 5);                    /* movq %xmm0,%rax */\n");
+  w_s(&mut out, "            bst_code_st(&p, w[i + 2], 0);\n");
+  w_s(&mut out, "            break;\n");
+  w_s(&mut out, "        }\n");
+  w_s(&mut out, "        case 21:\n");
+  w_s(&mut out, "            bst_code_ld(&p, 0, w[i + 3]);\n");
+  w_s(&mut out, "            switch (w[i + 1]) {\n");
+  w_s(&mut out, "            case 0: bst_code_put(&p, \"\\x66\\x48\\x0f\\x6e\\xc0\\xf2\\x0f\\x51\\xc0\\x66\\x48\\x0f\\x7e\\xc0\", 14); break;   /* sqrtsd */\n");
+  w_s(&mut out, "            case 1: bst_code_put(&p, \"\\x48\\x0f\\xba\\xf8\\x3f\", 5); break;                                           /* btc $63,%rax */\n");
+  w_s(&mut out, "            case 2: bst_code_put(&p, \"\\x48\\x0f\\xba\\xf0\\x3f\", 5); break;                                           /* btr $63,%rax */\n");
+  w_s(&mut out, "            case 3: bst_code_put(&p, \"\\xf2\\x48\\x0f\\x2a\\xc0\\x66\\x48\\x0f\\x7e\\xc0\", 10); break;                  /* cvtsi2sd %rax,%xmm0; movq */\n");
+  w_s(&mut out, "            default: bst_code_put(&p, \"\\x66\\x48\\x0f\\x6e\\xc0\\xf2\\x48\\x0f\\x2c\\xc0\", 10); break;                 /* movq; cvttsd2si %xmm0,%rax */\n");
+  w_s(&mut out, "            }\n");
+  w_s(&mut out, "            bst_code_st(&p, w[i + 2], 0);\n");
+  w_s(&mut out, "            break;\n");
+  w_s(&mut out, "        case 22: {\n");
+  w_s(&mut out, "            uint64_t c = w[i + 1];\n");
+  w_s(&mut out, "            bst_code_ld(&p, 0, w[i + 2]);\n");
+  w_s(&mut out, "            bst_code_ld(&p, 1, w[i + 3]);\n");
+  w_s(&mut out, "            bst_code_put(&p, \"\\x66\\x48\\x0f\\x6e\\xc0\\x66\\x48\\x0f\\x6e\\xc9\", 10);   /* movq %rax,%xmm0; movq %rcx,%xmm1 */\n");
+  w_s(&mut out, "            if (c == 2 || c == 3) bst_code_put(&p, \"\\x66\\x0f\\x2e\\xc8\", 4);   /* ucomisd %xmm0,%xmm1 */\n");
+  w_s(&mut out, "            else bst_code_put(&p, \"\\x66\\x0f\\x2e\\xc1\", 4);                    /* ucomisd %xmm1,%xmm0 */\n");
+  w_s(&mut out, "            if (c == 0) {                                                      /* jp over; je l */\n");
+  w_s(&mut out, "                bst_code_put(&p, \"\\x7a\\x06\\x0f\\x84\", 4);\n");
+  w_s(&mut out, "            } else if (c == 1) {                                               /* jp l; jne l */\n");
+  w_s(&mut out, "                bst_code_put(&p, \"\\x0f\\x8a\", 2);\n");
+  w_s(&mut out, "                bst_code_rel(&p, mem, off, w[i + 4]);\n");
+  w_s(&mut out, "                bst_code_put(&p, \"\\x0f\\x85\", 2);\n");
+  w_s(&mut out, "            } else {                                                           /* ja or jae */\n");
+  w_s(&mut out, "                bst_code_put(&p, \"\\x0f\", 1);\n");
+  w_s(&mut out, "                *p++ = (c == 2 || c == 4) ? 0x87 : 0x83;\n");
+  w_s(&mut out, "            }\n");
+  w_s(&mut out, "            bst_code_rel(&p, mem, off, w[i + 4]);\n");
+  w_s(&mut out, "            break;\n");
+  w_s(&mut out, "        }\n");
   w_s(&mut out, "        default:\n");
   w_s(&mut out, "            break;\n");
   w_s(&mut out, "        }\n");
@@ -2554,7 +2683,10 @@ fn cg_prelude_net(out: &mut Vec[u64]) {
   w_s(&mut out, " * `a` (`b` 0 reading, 1 writing, 2 both) and leaves it open; 11 starts a connect\n");
   w_s(&mut out, " * to address `a`, port `b` without waiting (the socket is non-blocking: ready\n");
   w_s(&mut out, " * to write when it is made); 12 returns 0 when the connect of socket `a` has\n");
-  w_s(&mut out, " * succeeded, or its error number. Only the Linux C backend has 11 and 12. The failure of any\n");
+  w_s(&mut out, " * succeeded, or its error number; 13 listens over IPv6 on the 16 bytes in `*buf`;\n");
+  w_s(&mut out, " * 14 binds a non-blocking UDP socket to IPv4 address `a`, port `b`; 15 sends `*buf` from\n");
+  w_s(&mut out, " * UDP socket `a` to address `b >> 16`, port `b & 65535`; 16 receives one datagram of at\n");
+  w_s(&mut out, " * most `b` bytes (the result is the sender's address << 32, port << 16 and length). Only the Linux C backend has 11 to 16. The failure of any\n");
   w_s(&mut out, " * is 2^64 - 1. */\n");
   w_s(&mut out, "static uint64_t bst_host_net(bst_host h, uint64_t op, uint64_t a, uint64_t b, bst_bytes *buf) {\n");
   w_s(&mut out, "    (void)h;\n");
@@ -2599,6 +2731,51 @@ fn cg_prelude_net(out: &mut Vec[u64]) {
   w_s(&mut out, "            return ~(uint64_t)0;\n");
   w_s(&mut out, "        }\n");
   w_s(&mut out, "        return (uint64_t)fd;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    if (op == 13) {   /* listen over IPv6 on the 16 bytes in *buf, port b (dual stack on ::) */\n");
+  w_s(&mut out, "        if (buf->len != 16) return ~(uint64_t)0;\n");
+  w_s(&mut out, "        int fd = socket(AF_INET6, SOCK_STREAM, 0);\n");
+  w_s(&mut out, "        if (fd < 0) return ~(uint64_t)0;\n");
+  w_s(&mut out, "        int one = 1, zero = 0;\n");
+  w_s(&mut out, "        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);\n");
+  w_s(&mut out, "        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof zero);\n");
+  w_s(&mut out, "        memset(&sa6, 0, sizeof sa6);\n");
+  w_s(&mut out, "        sa6.sin6_family = AF_INET6;\n");
+  w_s(&mut out, "        sa6.sin6_port = htons((uint16_t)b);\n");
+  w_s(&mut out, "        memcpy(&sa6.sin6_addr, buf->data, 16);\n");
+  w_s(&mut out, "        if (bind(fd, (struct sockaddr *)&sa6, sizeof sa6) != 0 || listen(fd, 128) != 0) { close(fd); return ~(uint64_t)0; }\n");
+  w_s(&mut out, "        return (uint64_t)fd;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    if (op == 14) {   /* a non-blocking UDP socket bound to IPv4 address a, port b */\n");
+  w_s(&mut out, "        int fd = socket(AF_INET, SOCK_DGRAM, 0);\n");
+  w_s(&mut out, "        if (fd < 0) return ~(uint64_t)0;\n");
+  w_s(&mut out, "        int one = 1;\n");
+  w_s(&mut out, "        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);\n");
+  w_s(&mut out, "        int fl = fcntl(fd, F_GETFL, 0);\n");
+  w_s(&mut out, "        if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) != 0 || bind(fd, (struct sockaddr *)&sa, sizeof sa) != 0) { close(fd); return ~(uint64_t)0; }\n");
+  w_s(&mut out, "        return (uint64_t)fd;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    if (op == 15) {   /* send *buf from UDP socket a to the address b >> 16 (host order), port b & 65535 */\n");
+  w_s(&mut out, "        struct sockaddr_in to;\n");
+  w_s(&mut out, "        memset(&to, 0, sizeof to);\n");
+  w_s(&mut out, "        to.sin_family = AF_INET;\n");
+  w_s(&mut out, "        to.sin_port = htons((uint16_t)b);\n");
+  w_s(&mut out, "        to.sin_addr.s_addr = htonl((uint32_t)(b >> 16));\n");
+  w_s(&mut out, "        ssize_t n = sendto((int)a, buf->data, buf->len, 0, (struct sockaddr *)&to, sizeof to);\n");
+  w_s(&mut out, "        return n < 0 ? ~(uint64_t)0 : (uint64_t)n;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    if (op == 16) {   /* receive one datagram of at most b bytes from UDP socket a into *buf */\n");
+  w_s(&mut out, "        if (b > 65535) b = 65535;\n");
+  w_s(&mut out, "        unsigned char *d = (unsigned char *)malloc(b ? b : 1);\n");
+  w_s(&mut out, "        if (!d) { fputs(\"Bastio: out of memory\\n\", stderr); abort(); }\n");
+  w_s(&mut out, "        struct sockaddr_in from;\n");
+  w_s(&mut out, "        socklen_t fl = sizeof from;\n");
+  w_s(&mut out, "        ssize_t n = recvfrom((int)a, d, b, 0, (struct sockaddr *)&from, &fl);\n");
+  w_s(&mut out, "        if (n < 0) { free(d); return ~(uint64_t)0; }\n");
+  w_s(&mut out, "        free(buf->data);\n");
+  w_s(&mut out, "        buf->len = (uint64_t)n;\n");
+  w_s(&mut out, "        buf->data = d;\n");
+  w_s(&mut out, "        return ((uint64_t)ntohl(from.sin_addr.s_addr) << 32) | ((uint64_t)ntohs(from.sin_port) << 16) | (uint64_t)n;\n");
   w_s(&mut out, "    }\n");
   w_s(&mut out, "    if (op == 12) {   /* the outcome of a connect that was started with 11 */\n");
   w_s(&mut out, "        int err = 0;\n");
@@ -3850,8 +4027,10 @@ const PART_SYS: u64 = 28;
 const PART_CODE: u64 = 27;
 /// Not in any target's list either: see `cg_prelude_spawn_err`.
 const PART_SPAWN_ERR: u64 = 29;
+/// Not in any target's list either: see `cg_prelude_child_async`.
+const PART_CHILD_ASYNC: u64 = 30;
 /// Not in any target's list either: see `cg_prelude_thread`.
-const PART_THREAD: u64 = 30;
+const PART_THREAD: u64 = 31;
 
 fn cg_part_name(id: u64) -> Str {
   if id == PART_POSIX { return "posix"; }
@@ -3883,6 +4062,7 @@ fn cg_part_name(id: u64) -> Str {
   if id == PART_SYS { return "sys"; }
   if id == PART_CODE { return "code"; }
   if id == PART_SPAWN_ERR { return "spawn_err"; }
+  if id == PART_CHILD_ASYNC { return "child_async"; }
   if id == PART_THREAD { return "thread"; }
   return "user";
 }
@@ -3919,6 +4099,7 @@ fn cg_part(out: &mut Vec[u64], id: u64) {
   else if id == PART_SYS { cg_prelude_sys(&mut out); }
   else if id == PART_CODE { cg_prelude_code(&mut out); }
   else if id == PART_SPAWN_ERR { cg_prelude_spawn_err(&mut out); }
+  else if id == PART_CHILD_ASYNC { cg_prelude_child_async(&mut out); }
   else if id == PART_THREAD { cg_prelude_thread(&mut out); }
   else { cg_prelude_user(&mut out); }
 }

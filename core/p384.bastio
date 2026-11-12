@@ -1,13 +1,15 @@
 // core/p384.bastio: ECDSA signatures over the curve P-384 (secp384r1) with
-// SHA-384, verification only (FIPS 186-4, RFC 6979 is for signing), for the
-// ecdsa_secp384r1_sha384 scheme of TLS 1.3 certificates.
+// SHA-384: verification for the ecdsa_secp384r1_sha384 scheme of TLS 1.3
+// certificates (FIPS 186-4), and public keys, ECDH and signing with a caller-drawn
+// nonce, for the Web Crypto API.
 //
 // What is proved: every access is in bounds, nothing leaks, and the numbers
 // the arithmetic works on have 24 limbs. Not proved: that the arithmetic is
 // right; the tests check signatures made by OpenSSL, many one-bit changes of
 // the signature, key and message being refused, and out-of-range values. The
-// code is not constant time and does not need to be: verification handles
-// only public values.
+// code is not constant time: verification handles only public values, but
+// key generation, ECDH and signing take secrets, so their running time depends
+// on them and they are for programs where nobody can measure it.
 //
 // A number is a `Vec[u64]` of 24 limbs of 16 bits, least significant first,
 // below 2^384. Products are built by doubling and adding, which is slow (a
@@ -806,4 +808,239 @@ fn ecdsa_p384_verify(pubkey: &Bytes, msg: &Bytes, sig: &Bytes) -> bool
   let ok = ecdsa_p384_verify_digest(pubkey, digest, sig);
   bfree(digest);
   return ok;
+}
+
+/// Internal: writes the number `a` as 48 big-endian bytes at `out[at..at+48]`.
+fn p384_bn_put(a: &Vec[u64], out: &mut Bytes, at: u64)
+  requires vlen(a) == 24 && at + 48 <= blen(out) && at < 274877906944
+  ensures blen(out) == blen(old(out))
+{
+  let mut i = 0;
+  while i < 24
+    invariant i <= 24 && vlen(a) == 24 && at + 48 <= blen(out) && blen(out) == blen(old(out))
+  {
+    let v = vec_get(a, i);
+    bset(&mut out, at + 46 - 2 * i, cast[u8]((v >> 8) & 255));
+    bset(&mut out, at + 47 - 2 * i, cast[u8](v & 255));
+    i = i + 1;
+  }
+}
+
+/// Internal: the affine coordinates of `q` as 48 bytes of x and 48 bytes of
+/// y, or None for the point at infinity.
+fn p384_affine(q: &P384Point, p: &Modulus384) -> Option[Bytes]
+  requires vlen(q.x) == 24 && vlen(q.y) == 24 && vlen(q.z) == 24 && mod384_ok(p)
+  ensures result is Option::Some ==> blen(result.Some) == 96
+{
+  if bn384_is_zero(q.z) { return Option[Bytes]::None; }
+  let zi = mod384_inv(q.z, p);
+  let zi2 = p384_sq(zi, p);
+  let zi3 = mod384_mul(zi2, zi, p);
+  let x = mod384_mul(q.x, zi2, p);
+  let y = mod384_mul(q.y, zi3, p);
+  let mut out = balloc(96);
+  p384_bn_put(x, &mut out, 0);
+  p384_bn_put(y, &mut out, 48);
+  vec_free(y);
+  vec_free(x);
+  vec_free(zi3);
+  vec_free(zi2);
+  vec_free(zi);
+  return Option[Bytes]::Some(out);
+}
+
+/// Internal: the base point of the curve.
+fn p384_base() -> P384Point
+  ensures vlen(result.x) == 24 && vlen(result.y) == 24 && vlen(result.z) == 24
+{
+  return P384Point { x: bn384_hex("aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab7"), y: bn384_hex("3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f"), z: bn384_small(1) };
+}
+
+/// The public key for the private key `d` on the curve P-384: the 97 bytes of an
+/// uncompressed point (0x04, x, y). `d` is a 48-byte big-endian number that
+/// must be in 1..n-1, else the result is None. Not constant time: the time
+/// taken depends on the key, so use it only where nobody can measure it.
+/// ```
+/// let d = balloc(48);
+/// let r = ecdsa_p384_public_key(d);
+/// bfree(d);
+/// match r {
+///   Option::None => { },
+///   Option::Some(k) => { bfree(k); },
+/// }
+/// ```
+fn ecdsa_p384_public_key(d: &Bytes) -> Option[Bytes]
+  requires blen(d) < 274877906944
+  ensures result is Option::Some ==> blen(result.Some) == 97
+{
+  if blen(d) != 48 { return Option[Bytes]::None; }
+  let p = mod384_new(bn384_hex("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff"));
+  let n = mod384_new(bn384_hex("ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973"));
+  let dn = bn384_from_bytes(d, 0);
+  if bn384_is_zero(dn) || bn384_ge(dn, n.m) {
+    vec_free(dn);
+    mod384_free(n);
+    mod384_free(p);
+    return Option[Bytes]::None;
+  }
+  let g = p384_base();
+  let q = p384_mul(dn, g, p);
+  let aff = p384_affine(q, p);
+  p384_free(q);
+  p384_free(g);
+  vec_free(dn);
+  mod384_free(n);
+  mod384_free(p);
+  match aff {
+    Option::None => { return Option[Bytes]::None; },
+    Option::Some(xy) => {
+      let mut out = balloc(97);
+      bset(&mut out, 0, 4);
+      bytes_copy_span(&mut out, 1, xy, 0, 96);
+      bfree(xy);
+      return Option[Bytes]::Some(out);
+    },
+  }
+}
+
+/// The shared secret of ECDH on the curve P-384: the 48-byte x coordinate of
+/// the private key `d` times the point `peer` (97 bytes, 0x04, x, y). The
+/// result is None when `d` is not in 1..n-1 or `peer` is not on the curve.
+/// Not constant time, as `ecdsa_p384_public_key`.
+/// ```
+/// let d = balloc(48);
+/// let peer = balloc(97);
+/// let r = ecdh_p384(d, peer);
+/// bfree(peer);
+/// bfree(d);
+/// match r {
+///   Option::None => { },
+///   Option::Some(k) => { bfree(k); },
+/// }
+/// ```
+fn ecdh_p384(d: &Bytes, peer: &Bytes) -> Option[Bytes]
+  requires blen(d) < 274877906944 && blen(peer) < 274877906944
+  ensures result is Option::Some ==> blen(result.Some) == 48
+{
+  if blen(d) != 48 || blen(peer) != 97 || bget(peer, 0) != 4 { return Option[Bytes]::None; }
+  let p = mod384_new(bn384_hex("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff"));
+  let n = mod384_new(bn384_hex("ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973"));
+  let dn = bn384_from_bytes(d, 0);
+  let qx = bn384_from_bytes(peer, 1);
+  let qy = bn384_from_bytes(peer, 49);
+  if bn384_is_zero(dn) || bn384_ge(dn, n.m) || !p384_on_curve(qx, qy, p) {
+    vec_free(qy);
+    vec_free(qx);
+    vec_free(dn);
+    mod384_free(n);
+    mod384_free(p);
+    return Option[Bytes]::None;
+  }
+  let q = P384Point { x: qx, y: qy, z: bn384_small(1) };
+  let r = p384_mul(dn, q, p);
+  let aff = p384_affine(r, p);
+  p384_free(r);
+  p384_free(q);
+  vec_free(dn);
+  mod384_free(n);
+  mod384_free(p);
+  match aff {
+    Option::None => { return Option[Bytes]::None; },
+    Option::Some(xy) => {
+      let mut out = balloc(48);
+      bytes_copy_span(&mut out, 0, xy, 0, 48);
+      bfree(xy);
+      return Option[Bytes]::Some(out);
+    },
+  }
+}
+
+/// An ECDSA signature on the curve P-384 of the message whose digest is `digest`
+/// (cut to its leftmost 48 bytes when longer), with the private key `d` and
+/// the nonce `k`: the 96 bytes of r then s. `d` and `k` are 48-byte big-endian
+/// numbers; the nonce must be secret, uniformly random in 1..n-1 and used
+/// once, or the key leaks. The result is None when `d` or `k` is not in 1..n-1
+/// or when r or s comes out 0 (the caller then draws another `k`). Not
+/// constant time, as `ecdsa_p384_public_key`.
+/// ```
+/// let d = balloc(48);
+/// let k = balloc(48);
+/// let digest = balloc(48);
+/// let r = ecdsa_p384_sign_digest(d, digest, k);
+/// bfree(digest);
+/// bfree(k);
+/// bfree(d);
+/// match r {
+///   Option::None => { },
+///   Option::Some(s) => { bfree(s); },
+/// }
+/// ```
+fn ecdsa_p384_sign_digest(d: &Bytes, digest: &Bytes, k: &Bytes) -> Option[Bytes]
+  requires blen(d) < 274877906944 && blen(digest) < 274877906944 && blen(k) < 274877906944
+  ensures result is Option::Some ==> blen(result.Some) == 96
+{
+  if blen(d) != 48 || blen(k) != 48 { return Option[Bytes]::None; }
+  let p = mod384_new(bn384_hex("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff"));
+  let n = mod384_new(bn384_hex("ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973"));
+  let dn = bn384_from_bytes(d, 0);
+  let kn = bn384_from_bytes(k, 0);
+  if bn384_is_zero(dn) || bn384_ge(dn, n.m) || bn384_is_zero(kn) || bn384_ge(kn, n.m) {
+    vec_free(kn);
+    vec_free(dn);
+    mod384_free(n);
+    mod384_free(p);
+    return Option[Bytes]::None;
+  }
+  let g = p384_base();
+  let q = p384_mul(kn, g, p);
+  let aff = p384_affine(q, p);
+  p384_free(q);
+  p384_free(g);
+  match aff {
+    Option::None => {
+      vec_free(kn);
+      vec_free(dn);
+      mod384_free(n);
+      mod384_free(p);
+      return Option[Bytes]::None;
+    },
+    Option::Some(xy) => {
+      let mut r = bn384_from_bytes(xy, 0);
+      bfree(xy);
+      if bn384_ge(r, n.m) {
+        let r2 = bn384_sub_wrap(r, n.m);
+        vec_free(r);
+        r = r2;
+      }
+      let mut e = p384_hash_number(digest);
+      if bn384_ge(e, n.m) {
+        let e2 = bn384_sub_wrap(e, n.m);
+        vec_free(e);
+        e = e2;
+      }
+      let rd = mod384_mul(r, dn, n);
+      let sum = mod384_add(e, rd, n);
+      let ki = mod384_inv(kn, n);
+      let s = mod384_mul(ki, sum, n);
+      let mut out = balloc(96);
+      p384_bn_put(r, &mut out, 0);
+      p384_bn_put(s, &mut out, 48);
+      let bad = bn384_is_zero(r) || bn384_is_zero(s);
+      vec_free(s);
+      vec_free(ki);
+      vec_free(sum);
+      vec_free(rd);
+      vec_free(e);
+      vec_free(r);
+      vec_free(kn);
+      vec_free(dn);
+      mod384_free(n);
+      mod384_free(p);
+      if bad {
+        bfree(out);
+        return Option[Bytes]::None;
+      }
+      return Option[Bytes]::Some(out);
+    },
+  }
 }
