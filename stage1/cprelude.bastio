@@ -873,6 +873,192 @@ fn cg_prelude_child(out: &mut Vec[u64]) {
   w_s(&mut out, "}\n");
 }
 
+/// The prelude part for `thread_spawn`, `thread_join` and the `sbytes_*`
+/// builtins (stage1 only): POSIX threads, and the shared bytes with their
+/// waiter lists. Part of the trusted base, as the lock and atomic
+/// primitives are.
+fn cg_prelude_thread(out: &mut Vec[u64]) {
+  w_s(&mut out, "/* Threads and shared bytes (stage1 only). thread_spawn runs a function on a\n");
+  w_s(&mut out, " * new POSIX thread; its block (the pthread_t, the result, the arguments)\n");
+  w_s(&mut out, " * stays on the heap until thread_join frees it. Every access to shared\n");
+  w_s(&mut out, " * bytes is a C11 atomic: sbytes_load, sbytes_store, sbytes_rmw and\n");
+  w_s(&mut out, " * sbytes_cas sequentially consistent, sbytes_get, sbytes_set and the bulk\n");
+  w_s(&mut out, " * copies relaxed (JavaScript's \"unordered\"), so no access is a data race.\n");
+  w_s(&mut out, " * A SharedBytes is a handle: the count of handles, the length, the waiters\n");
+  w_s(&mut out, " * of sbytes_wait (a list kept under a mutex) and the bytes. */\n");
+  w_s(&mut out, "#include <pthread.h>\n");
+  w_s(&mut out, "#include <time.h>\n");
+  w_s(&mut out, "#include <errno.h>\n");
+  w_s(&mut out, "#ifndef BST_THREAD_STACK\n");
+  w_s(&mut out, "#define BST_THREAD_STACK ((size_t)64 << 20)\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "static void *bst_thread_block(size_t n) {\n");
+  w_s(&mut out, "    void *p = calloc(1, n);\n");
+  w_s(&mut out, "    if (!p) { fputs(\"Bastio: out of memory\\n\", stderr); abort(); }\n");
+  w_s(&mut out, "    return p;\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "static void bst_thread_start(pthread_t *t, void *(*f)(void *), void *a) {\n");
+  w_s(&mut out, "    pthread_attr_t at;\n");
+  w_s(&mut out, "    int e = pthread_attr_init(&at);\n");
+  w_s(&mut out, "    if (!e) e = pthread_attr_setstacksize(&at, BST_THREAD_STACK);\n");
+  w_s(&mut out, "    if (!e) e = pthread_create(t, &at, f, a);\n");
+  w_s(&mut out, "    pthread_attr_destroy(&at);\n");
+  w_s(&mut out, "    if (e) { fputs(\"Bastio: cannot start a thread\\n\", stderr); abort(); }\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "static void bst_thread_wait(void *th) {\n");
+  w_s(&mut out, "    if (pthread_join(*(pthread_t *)th, 0)) { fputs(\"Bastio: cannot join a thread\\n\", stderr); abort(); }\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "struct bst_shw { struct bst_shw *next, *prev; uint64_t at; pthread_cond_t cv; int woken; };\n");
+  w_s(&mut out, "struct bst_shb { uint64_t refs, len; pthread_mutex_t mu; struct bst_shw *head, *tail; uint64_t data[]; };\n");
+  w_s(&mut out, "static struct bst_shb *bst_sbytes_new(uint64_t n) {\n");
+  w_s(&mut out, "    struct bst_shb *b = calloc(1, sizeof(struct bst_shb) + (n + 7) / 8 * 8);\n");
+  w_s(&mut out, "    if (!b) { fputs(\"Bastio: out of memory\\n\", stderr); abort(); }\n");
+  w_s(&mut out, "    b->refs = 1;\n");
+  w_s(&mut out, "    b->len = n;\n");
+  w_s(&mut out, "    pthread_mutex_init(&b->mu, 0);\n");
+  w_s(&mut out, "    return b;\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "static inline uint64_t bst_sbytes_len(struct bst_shb *b) { return b->len; }\n");
+  w_s(&mut out, "static inline struct bst_shb *bst_sbytes_clone(struct bst_shb *b) {\n");
+  w_s(&mut out, "    __atomic_add_fetch(&b->refs, 1, __ATOMIC_RELAXED);\n");
+  w_s(&mut out, "    return b;\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "static void bst_sbytes_drop(struct bst_shb *b) {\n");
+  w_s(&mut out, "    if (__atomic_sub_fetch(&b->refs, 1, __ATOMIC_ACQ_REL) == 0) {\n");
+  w_s(&mut out, "        pthread_mutex_destroy(&b->mu);\n");
+  w_s(&mut out, "        free(b);\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "#define BST_SHB_AT(b, i) ((unsigned char *)(b)->data + (i))\n");
+  w_s(&mut out, "static inline uint64_t bst_sbytes_ld(struct bst_shb *b, uint64_t i, uint64_t w, int o) {\n");
+  w_s(&mut out, "    unsigned char *p = BST_SHB_AT(b, i);\n");
+  w_s(&mut out, "    switch (w) {\n");
+  w_s(&mut out, "    case 1: return __atomic_load_n((uint8_t *)p, o);\n");
+  w_s(&mut out, "    case 2: return __atomic_load_n((uint16_t *)p, o);\n");
+  w_s(&mut out, "    case 4: return __atomic_load_n((uint32_t *)p, o);\n");
+  w_s(&mut out, "    default: return __atomic_load_n((uint64_t *)p, o);\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "static inline void bst_sbytes_st(struct bst_shb *b, uint64_t i, uint64_t w, uint64_t v, int o) {\n");
+  w_s(&mut out, "    unsigned char *p = BST_SHB_AT(b, i);\n");
+  w_s(&mut out, "    switch (w) {\n");
+  w_s(&mut out, "    case 1: __atomic_store_n((uint8_t *)p, (uint8_t)v, o); break;\n");
+  w_s(&mut out, "    case 2: __atomic_store_n((uint16_t *)p, (uint16_t)v, o); break;\n");
+  w_s(&mut out, "    case 4: __atomic_store_n((uint32_t *)p, (uint32_t)v, o); break;\n");
+  w_s(&mut out, "    default: __atomic_store_n((uint64_t *)p, v, o); break;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "static inline uint64_t bst_sbytes_load(struct bst_shb *b, uint64_t i, uint64_t w) { return bst_sbytes_ld(b, i, w, __ATOMIC_SEQ_CST); }\n");
+  w_s(&mut out, "static inline void bst_sbytes_store(struct bst_shb *b, uint64_t i, uint64_t w, uint64_t v) { bst_sbytes_st(b, i, w, v, __ATOMIC_SEQ_CST); }\n");
+  w_s(&mut out, "static inline uint64_t bst_sbytes_get(struct bst_shb *b, uint64_t i, uint64_t w) { return bst_sbytes_ld(b, i, w, __ATOMIC_RELAXED); }\n");
+  w_s(&mut out, "static inline void bst_sbytes_set(struct bst_shb *b, uint64_t i, uint64_t w, uint64_t v) { bst_sbytes_st(b, i, w, v, __ATOMIC_RELAXED); }\n");
+  w_s(&mut out, "#define BST_SHB_RMW(T) do { T *q = (T *)p; T x = (T)v; switch (op) { \\\n");
+  w_s(&mut out, "    case 0: return __atomic_fetch_add(q, x, __ATOMIC_SEQ_CST); \\\n");
+  w_s(&mut out, "    case 1: return __atomic_fetch_sub(q, x, __ATOMIC_SEQ_CST); \\\n");
+  w_s(&mut out, "    case 2: return __atomic_fetch_and(q, x, __ATOMIC_SEQ_CST); \\\n");
+  w_s(&mut out, "    case 3: return __atomic_fetch_or(q, x, __ATOMIC_SEQ_CST); \\\n");
+  w_s(&mut out, "    case 4: return __atomic_fetch_xor(q, x, __ATOMIC_SEQ_CST); \\\n");
+  w_s(&mut out, "    default: return __atomic_exchange_n(q, x, __ATOMIC_SEQ_CST); } } while (0)\n");
+  w_s(&mut out, "/* op: 0 add, 1 sub, 2 and, 3 or, 4 xor, 5 exchange; wraps at the width. */\n");
+  w_s(&mut out, "static uint64_t bst_sbytes_rmw(struct bst_shb *b, uint64_t op, uint64_t i, uint64_t w, uint64_t v) {\n");
+  w_s(&mut out, "    unsigned char *p = BST_SHB_AT(b, i);\n");
+  w_s(&mut out, "    switch (w) {\n");
+  w_s(&mut out, "    case 1: BST_SHB_RMW(uint8_t);\n");
+  w_s(&mut out, "    case 2: BST_SHB_RMW(uint16_t);\n");
+  w_s(&mut out, "    case 4: BST_SHB_RMW(uint32_t);\n");
+  w_s(&mut out, "    default: BST_SHB_RMW(uint64_t);\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "#define BST_SHB_CAS(T) do { T e = (T)x; __atomic_compare_exchange_n((T *)p, &e, (T)v, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); return e; } while (0)\n");
+  w_s(&mut out, "/* Writes v if the word is x (both cut to the width); returns the word it found. */\n");
+  w_s(&mut out, "static uint64_t bst_sbytes_cas(struct bst_shb *b, uint64_t i, uint64_t w, uint64_t x, uint64_t v) {\n");
+  w_s(&mut out, "    unsigned char *p = BST_SHB_AT(b, i);\n");
+  w_s(&mut out, "    switch (w) {\n");
+  w_s(&mut out, "    case 1: BST_SHB_CAS(uint8_t);\n");
+  w_s(&mut out, "    case 2: BST_SHB_CAS(uint16_t);\n");
+  w_s(&mut out, "    case 4: BST_SHB_CAS(uint32_t);\n");
+  w_s(&mut out, "    default: BST_SHB_CAS(uint64_t);\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "static void bst_sbytes_read(struct bst_shb *b, uint64_t from, bst_bytes *out, uint64_t at, uint64_t n) {\n");
+  w_s(&mut out, "    unsigned char *s = BST_SHB_AT(b, from);\n");
+  w_s(&mut out, "    for (uint64_t k = 0; k < n; k++) out->data[at + k] = __atomic_load_n(s + k, __ATOMIC_RELAXED);\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "static void bst_sbytes_write(struct bst_shb *b, uint64_t at, bst_bytes src, uint64_t from, uint64_t n) {\n");
+  w_s(&mut out, "    unsigned char *d = BST_SHB_AT(b, at);\n");
+  w_s(&mut out, "    for (uint64_t k = 0; k < n; k++) __atomic_store_n(d + k, src.data[from + k], __ATOMIC_RELAXED);\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "/* Atomics.wait: sleeps while the word at i is x, until sbytes_notify wakes\n");
+  w_s(&mut out, " * this waiter or timeout nanoseconds pass (2^64 - 1: no timeout). 0: woken,\n");
+  w_s(&mut out, " * 1: the word was not x, 2: timed out. The check and the sleep happen under\n");
+  w_s(&mut out, " * the mutex sbytes_notify takes, so no notification is lost in between. */\n");
+  w_s(&mut out, "static uint64_t bst_sbytes_wait(struct bst_shb *b, uint64_t i, uint64_t w, uint64_t x, uint64_t timeout) {\n");
+  w_s(&mut out, "    if (w == 4) x = (uint32_t)x;\n");
+  w_s(&mut out, "    struct bst_shw me;\n");
+  w_s(&mut out, "    struct timespec dl;\n");
+  w_s(&mut out, "    int timed = timeout != ~(uint64_t)0;\n");
+  w_s(&mut out, "    pthread_mutex_lock(&b->mu);\n");
+  w_s(&mut out, "    if (bst_sbytes_ld(b, i, w, __ATOMIC_SEQ_CST) != x) { pthread_mutex_unlock(&b->mu); return 1; }\n");
+  w_s(&mut out, "    me.at = i;\n");
+  w_s(&mut out, "    me.woken = 0;\n");
+  w_s(&mut out, "    me.next = 0;\n");
+  w_s(&mut out, "    me.prev = b->tail;\n");
+  w_s(&mut out, "    if (b->tail) b->tail->next = &me; else b->head = &me;\n");
+  w_s(&mut out, "    b->tail = &me;\n");
+  w_s(&mut out, "#ifdef __APPLE__\n");
+  w_s(&mut out, "    pthread_cond_init(&me.cv, 0);\n");
+  w_s(&mut out, "    if (timed) clock_gettime(CLOCK_REALTIME, &dl);\n");
+  w_s(&mut out, "#else\n");
+  w_s(&mut out, "    pthread_condattr_t ca;\n");
+  w_s(&mut out, "    pthread_condattr_init(&ca);\n");
+  w_s(&mut out, "    pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);\n");
+  w_s(&mut out, "    pthread_cond_init(&me.cv, &ca);\n");
+  w_s(&mut out, "    pthread_condattr_destroy(&ca);\n");
+  w_s(&mut out, "    if (timed) clock_gettime(CLOCK_MONOTONIC, &dl);\n");
+  w_s(&mut out, "#endif\n");
+  w_s(&mut out, "    if (timed) {\n");
+  w_s(&mut out, "        uint64_t s = timeout / 1000000000u, ns = (uint64_t)dl.tv_nsec + timeout % 1000000000u;\n");
+  w_s(&mut out, "        if (ns >= 1000000000u) { ns -= 1000000000u; s++; }\n");
+  w_s(&mut out, "        if (s > (uint64_t)1 << 40) timed = 0;   /* tens of thousands of years: forever */\n");
+  w_s(&mut out, "        else { dl.tv_sec += (time_t)s; dl.tv_nsec = (long)ns; }\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    int e = 0;\n");
+  w_s(&mut out, "    while (!me.woken && e != ETIMEDOUT) {\n");
+  w_s(&mut out, "        if (timed) e = pthread_cond_timedwait(&me.cv, &b->mu, &dl);\n");
+  w_s(&mut out, "        else pthread_cond_wait(&me.cv, &b->mu);\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    uint64_t r = 0;\n");
+  w_s(&mut out, "    if (!me.woken) {\n");
+  w_s(&mut out, "        if (me.prev) me.prev->next = me.next; else b->head = me.next;\n");
+  w_s(&mut out, "        if (me.next) me.next->prev = me.prev; else b->tail = me.prev;\n");
+  w_s(&mut out, "        r = 2;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    pthread_mutex_unlock(&b->mu);\n");
+  w_s(&mut out, "    pthread_cond_destroy(&me.cv);\n");
+  w_s(&mut out, "    return r;\n");
+  w_s(&mut out, "}\n");
+  w_s(&mut out, "/* Atomics.notify: wakes up to count waiters on the word at i, oldest\n");
+  w_s(&mut out, " * first, and returns how many it woke. */\n");
+  w_s(&mut out, "static uint64_t bst_sbytes_notify(struct bst_shb *b, uint64_t i, uint64_t count) {\n");
+  w_s(&mut out, "    uint64_t n = 0;\n");
+  w_s(&mut out, "    pthread_mutex_lock(&b->mu);\n");
+  w_s(&mut out, "    struct bst_shw *q = b->head;\n");
+  w_s(&mut out, "    while (q && n < count) {\n");
+  w_s(&mut out, "        struct bst_shw *nx = q->next;\n");
+  w_s(&mut out, "        if (q->at == i) {\n");
+  w_s(&mut out, "            if (q->prev) q->prev->next = q->next; else b->head = q->next;\n");
+  w_s(&mut out, "            if (q->next) q->next->prev = q->prev; else b->tail = q->prev;\n");
+  w_s(&mut out, "            q->woken = 1;\n");
+  w_s(&mut out, "            pthread_cond_signal(&q->cv);\n");
+  w_s(&mut out, "            n++;\n");
+  w_s(&mut out, "        }\n");
+  w_s(&mut out, "        q = nx;\n");
+  w_s(&mut out, "    }\n");
+  w_s(&mut out, "    pthread_mutex_unlock(&b->mu);\n");
+  w_s(&mut out, "    return n;\n");
+  w_s(&mut out, "}\n");
+}
+
 /// The prelude part for `host_spawn_err`, `child_read_err_line` and `child_kill`
 /// (stage1 only): added after the child part, and only to a program that calls
 /// one of them.
@@ -1914,6 +2100,13 @@ fn cg_prelude_code(out: &mut Vec[u64]) {
   w_s(&mut out, " *                      below the field's length now\n");
   w_s(&mut out, " *  18 STORE f b i s L  field f [ r[b] + r[i] ] = r[s], or go to item L\n");
   w_s(&mut out, " *  19 CALLR k a b c d  as CALL, with the arguments r[a], r[b], r[c], r[d]\n");
+  w_s(&mut out, " *  20 FALU op d a b    r[d] = r[a] op r[b] as doubles (the registers hold their\n");
+  w_s(&mut out, " *                      bits); op: 0 add, 1 sub, 2 mul, 3 div\n");
+  w_s(&mut out, " *  21 FUN op d a       r[d] = op r[a] as a double; op: 0 sqrt, 1 neg, 2 abs, 3 the\n");
+  w_s(&mut out, " *                      signed integer r[a] as a double, 4 r[a] as a double cut\n");
+  w_s(&mut out, " *                      towards 0 to a signed integer (NaN and out of range: 2^63)\n");
+  w_s(&mut out, " *  22 FCMPBR c a b L   go to item L if r[a] c r[b] as doubles; c: 0 eq, 1 ne, 2 lt,\n");
+  w_s(&mut out, " *                      3 le, 4 gt, 5 ge (false for a NaN, except ne)\n");
   w_s(&mut out, " * The registers are 0 when the code is entered. L is the word offset of an\n");
   w_s(&mut out, " * item in the plan; f is a number from code_field. Running off the end\n");
   w_s(&mut out, " * returns the current value. A plan that breaks a rule (an unknown opcode, a\n");
@@ -1952,8 +2145,8 @@ fn cg_prelude_code(out: &mut Vec[u64]) {
   w_s(&mut out, "#define BST_CODE_EPI 18u       /* add $136,%rsp; pop %rbp, %r15..%r12, %rbx; ret */\n");
   w_s(&mut out, "/* The length in words of the item at plan[i] (0: not a valid item). */\n");
   w_s(&mut out, "static uint64_t bst_code_ilen(const uint64_t *w, uint64_t n, uint64_t i) {\n");
-  w_s(&mut out, "    static const uint64_t lens[20] = { 6, 2, 2, 3, 2, 1, 2, 2, 3, 3, 5, 5, 6, 5, 5, 2, 2, 6, 6, 6 };\n");
-  w_s(&mut out, "    if (i >= n || w[i] > 19 || lens[w[i]] > n - i) return 0;\n");
+  w_s(&mut out, "    static const uint64_t lens[23] = { 6, 2, 2, 3, 2, 1, 2, 2, 3, 3, 5, 5, 6, 5, 5, 2, 2, 6, 6, 6, 5, 4, 5 };\n");
+  w_s(&mut out, "    if (i >= n || w[i] > 22 || lens[w[i]] > n - i) return 0;\n");
   w_s(&mut out, "    return lens[w[i]];\n");
   w_s(&mut out, "}\n");
   w_s(&mut out, "static unsigned bst_code_imm(uint64_t x) { return x <= 0xffffffffu ? 5u : 10u; }\n");
@@ -1972,6 +2165,9 @@ fn cg_prelude_code(out: &mut Vec[u64]) {
   w_s(&mut out, "    case 17: return w[i + 1] < 16 && w[i + 2] < nfield && w[i + 3] < 16 && w[i + 4] < 16;\n");
   w_s(&mut out, "    case 18: return w[i + 1] < nfield && w[i + 2] < 16 && w[i + 3] < 16 && w[i + 4] < 16;\n");
   w_s(&mut out, "    case 19: return w[i + 1] < ntab && w[i + 2] < 16 && w[i + 3] < 16 && w[i + 4] < 16 && w[i + 5] < 16;\n");
+  w_s(&mut out, "    case 20: return w[i + 1] <= 3 && w[i + 2] < 16 && w[i + 3] < 16 && w[i + 4] < 16;\n");
+  w_s(&mut out, "    case 21: return w[i + 1] <= 4 && w[i + 2] < 16 && w[i + 3] < 16;\n");
+  w_s(&mut out, "    case 22: return w[i + 1] <= 5 && w[i + 2] < 16 && w[i + 3] < 16;\n");
   w_s(&mut out, "    default: return 1;\n");
   w_s(&mut out, "    }\n");
   w_s(&mut out, "}\n");
@@ -1981,7 +2177,7 @@ fn cg_prelude_code(out: &mut Vec[u64]) {
   w_s(&mut out, "    case 1: case 2: case 4: case 7: return (int64_t)w[i + 1];\n");
   w_s(&mut out, "    case 3: return (int64_t)w[i + 2];\n");
   w_s(&mut out, "    case 12: case 17: case 18: return (int64_t)w[i + 5];\n");
-  w_s(&mut out, "    case 13: case 14: return (int64_t)w[i + 4];\n");
+  w_s(&mut out, "    case 13: case 14: case 22: return (int64_t)w[i + 4];\n");
   w_s(&mut out, "    default: return -1;\n");
   w_s(&mut out, "    }\n");
   w_s(&mut out, "}\n");
@@ -2010,6 +2206,9 @@ fn cg_prelude_code(out: &mut Vec[u64]) {
   w_s(&mut out, "    case 17: return bst_code_vl(w[i + 3]) + bst_code_vl(w[i + 4]) + 3 + 7 + 9 + 7 + 4 + bst_code_vl(w[i + 1]);\n");
   w_s(&mut out, "    case 18: return bst_code_vl(w[i + 2]) + bst_code_vl(w[i + 3]) + 3 + 7 + 9 + 7 + bst_code_vl(w[i + 4]) + 4;\n");
   w_s(&mut out, "    case 19: return 3 + bst_code_vl(w[i + 2]) + bst_code_vl(w[i + 3]) + bst_code_vl(w[i + 4]) + bst_code_vl(w[i + 5]) + 12 + 10 + 2 + 3;\n");
+  w_s(&mut out, "    case 20: return bst_code_vl(w[i + 3]) + bst_code_vl(w[i + 4]) + 5 + 5 + 4 + 5 + bst_code_vl(w[i + 2]);\n");
+  w_s(&mut out, "    case 21: return bst_code_vl(w[i + 3]) + (w[i + 1] == 1 || w[i + 1] == 2 ? 5u : w[i + 1] == 0 ? 14u : 10u) + bst_code_vl(w[i + 2]);\n");
+  w_s(&mut out, "    case 22: return bst_code_vl(w[i + 2]) + bst_code_vl(w[i + 3]) + 5 + 5 + 4 + (w[i + 1] == 0 ? 8u : w[i + 1] == 1 ? 12u : 6u);\n");
   w_s(&mut out, "    default: return 0;\n");
   w_s(&mut out, "    }\n");
   w_s(&mut out, "}\n");
@@ -2233,6 +2432,49 @@ fn cg_prelude_code(out: &mut Vec[u64]) {
   w_s(&mut out, "            bst_code_ld(&p, 1, w[i + 4]);\n");
   w_s(&mut out, "            bst_code_put(&p, \"\\x48\\x89\\x0c\\xc2\", 4);                      /* mov %rcx,(%rdx,%rax,8) */\n");
   w_s(&mut out, "            break;\n");
+  w_s(&mut out, "        case 20: {\n");
+  w_s(&mut out, "            static const unsigned char fop[4] = { 0x58, 0x5c, 0x59, 0x5e };\n");
+  w_s(&mut out, "            bst_code_ld(&p, 0, w[i + 3]);\n");
+  w_s(&mut out, "            bst_code_ld(&p, 1, w[i + 4]);\n");
+  w_s(&mut out, "            bst_code_put(&p, \"\\x66\\x48\\x0f\\x6e\\xc0\\x66\\x48\\x0f\\x6e\\xc9\", 10);   /* movq %rax,%xmm0; movq %rcx,%xmm1 */\n");
+  w_s(&mut out, "            bst_code_put(&p, \"\\xf2\\x0f\", 2);\n");
+  w_s(&mut out, "            *p++ = fop[w[i + 1]];\n");
+  w_s(&mut out, "            *p++ = 0xc1;                                                         /* addsd etc. %xmm1,%xmm0 */\n");
+  w_s(&mut out, "            bst_code_put(&p, \"\\x66\\x48\\x0f\\x7e\\xc0\", 5);                    /* movq %xmm0,%rax */\n");
+  w_s(&mut out, "            bst_code_st(&p, w[i + 2], 0);\n");
+  w_s(&mut out, "            break;\n");
+  w_s(&mut out, "        }\n");
+  w_s(&mut out, "        case 21:\n");
+  w_s(&mut out, "            bst_code_ld(&p, 0, w[i + 3]);\n");
+  w_s(&mut out, "            switch (w[i + 1]) {\n");
+  w_s(&mut out, "            case 0: bst_code_put(&p, \"\\x66\\x48\\x0f\\x6e\\xc0\\xf2\\x0f\\x51\\xc0\\x66\\x48\\x0f\\x7e\\xc0\", 14); break;   /* sqrtsd */\n");
+  w_s(&mut out, "            case 1: bst_code_put(&p, \"\\x48\\x0f\\xba\\xf8\\x3f\", 5); break;                                           /* btc $63,%rax */\n");
+  w_s(&mut out, "            case 2: bst_code_put(&p, \"\\x48\\x0f\\xba\\xf0\\x3f\", 5); break;                                           /* btr $63,%rax */\n");
+  w_s(&mut out, "            case 3: bst_code_put(&p, \"\\xf2\\x48\\x0f\\x2a\\xc0\\x66\\x48\\x0f\\x7e\\xc0\", 10); break;                  /* cvtsi2sd %rax,%xmm0; movq */\n");
+  w_s(&mut out, "            default: bst_code_put(&p, \"\\x66\\x48\\x0f\\x6e\\xc0\\xf2\\x48\\x0f\\x2c\\xc0\", 10); break;                 /* movq; cvttsd2si %xmm0,%rax */\n");
+  w_s(&mut out, "            }\n");
+  w_s(&mut out, "            bst_code_st(&p, w[i + 2], 0);\n");
+  w_s(&mut out, "            break;\n");
+  w_s(&mut out, "        case 22: {\n");
+  w_s(&mut out, "            uint64_t c = w[i + 1];\n");
+  w_s(&mut out, "            bst_code_ld(&p, 0, w[i + 2]);\n");
+  w_s(&mut out, "            bst_code_ld(&p, 1, w[i + 3]);\n");
+  w_s(&mut out, "            bst_code_put(&p, \"\\x66\\x48\\x0f\\x6e\\xc0\\x66\\x48\\x0f\\x6e\\xc9\", 10);   /* movq %rax,%xmm0; movq %rcx,%xmm1 */\n");
+  w_s(&mut out, "            if (c == 2 || c == 3) bst_code_put(&p, \"\\x66\\x0f\\x2e\\xc8\", 4);   /* ucomisd %xmm0,%xmm1 */\n");
+  w_s(&mut out, "            else bst_code_put(&p, \"\\x66\\x0f\\x2e\\xc1\", 4);                    /* ucomisd %xmm1,%xmm0 */\n");
+  w_s(&mut out, "            if (c == 0) {                                                      /* jp over; je l */\n");
+  w_s(&mut out, "                bst_code_put(&p, \"\\x7a\\x06\\x0f\\x84\", 4);\n");
+  w_s(&mut out, "            } else if (c == 1) {                                               /* jp l; jne l */\n");
+  w_s(&mut out, "                bst_code_put(&p, \"\\x0f\\x8a\", 2);\n");
+  w_s(&mut out, "                bst_code_rel(&p, mem, off, w[i + 4]);\n");
+  w_s(&mut out, "                bst_code_put(&p, \"\\x0f\\x85\", 2);\n");
+  w_s(&mut out, "            } else {                                                           /* ja or jae */\n");
+  w_s(&mut out, "                bst_code_put(&p, \"\\x0f\", 1);\n");
+  w_s(&mut out, "                *p++ = (c == 2 || c == 4) ? 0x87 : 0x83;\n");
+  w_s(&mut out, "            }\n");
+  w_s(&mut out, "            bst_code_rel(&p, mem, off, w[i + 4]);\n");
+  w_s(&mut out, "            break;\n");
+  w_s(&mut out, "        }\n");
   w_s(&mut out, "        default:\n");
   w_s(&mut out, "            break;\n");
   w_s(&mut out, "        }\n");
@@ -3788,6 +4030,8 @@ const PART_CODE: u64 = 27;
 const PART_SPAWN_ERR: u64 = 29;
 /// Not in any target's list either: see `cg_prelude_child_async`.
 const PART_CHILD_ASYNC: u64 = 30;
+/// Not in any target's list either: see `cg_prelude_thread`.
+const PART_THREAD: u64 = 31;
 
 fn cg_part_name(id: u64) -> Str {
   if id == PART_POSIX { return "posix"; }
@@ -3820,6 +4064,7 @@ fn cg_part_name(id: u64) -> Str {
   if id == PART_CODE { return "code"; }
   if id == PART_SPAWN_ERR { return "spawn_err"; }
   if id == PART_CHILD_ASYNC { return "child_async"; }
+  if id == PART_THREAD { return "thread"; }
   return "user";
 }
 
@@ -3856,6 +4101,7 @@ fn cg_part(out: &mut Vec[u64], id: u64) {
   else if id == PART_CODE { cg_prelude_code(&mut out); }
   else if id == PART_SPAWN_ERR { cg_prelude_spawn_err(&mut out); }
   else if id == PART_CHILD_ASYNC { cg_prelude_child_async(&mut out); }
+  else if id == PART_THREAD { cg_prelude_thread(&mut out); }
   else { cg_prelude_user(&mut out); }
 }
 

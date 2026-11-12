@@ -1,0 +1,92 @@
+// expect-exit: 42
+// stage1-only: thread_spawn, thread_join and SharedBytes
+// backend: c
+// Threads and shared bytes. Each thread owns what it was given (every
+// argument is moved in) and hands it back through `thread_join`; the only
+// memory two threads touch at once is a SharedBytes, whose every access is
+// atomic, so no data race can be written.
+
+// Sums 1..=n and gives the buffer back: thread_join knows the postcondition.
+fn sum_to(n: u64, b: Buf) -> Buf
+  requires n <= 1000 && len(b) == 1
+  ensures len(result) == 1
+{
+  let mut s = 0;
+  let mut i = 1;
+  while i <= n invariant i >= 1 && i <= n + 1 && s <= i * 1000 {
+    s = s + i;
+    i = i + 1;
+  }
+  return set(b, 0, s);
+}
+
+// Adds 1 to the counter at byte 8, `times` times, then drops its handle.
+fn bump(b: SharedBytes, times: u64) -> u64
+  requires sbytes_len(b) == 64 && times <= 1000
+  ensures result == times
+{
+  let mut i = 0;
+  while i < times invariant sbytes_len(b) == 64 {
+    sbytes_rmw(b, 0, 8, 8, 1);
+    i = i + 1;
+  }
+  sbytes_drop(b);
+  return times;
+}
+
+// Waits until the word at 0 stops being 0, then reports what it saw.
+fn waiter(b: SharedBytes) -> u64
+  requires sbytes_len(b) == 64
+{
+  let mut r = sbytes_wait(b, 0, 4, 0, 18446744073709551615);
+  while sbytes_load(b, 0, 4) == 0 invariant sbytes_len(b) == 64 {
+    r = sbytes_wait(b, 0, 4, 0, 18446744073709551615);
+  }
+  let v = sbytes_load(b, 0, 4);
+  sbytes_drop(b);
+  return v;
+}
+
+fn main() -> u64 {
+  let t = thread_spawn(sum_to, 10, alloc(1));
+  let b = thread_join(t);
+  let s = get(b, 0);                         // len(b) == 1 is known
+  free(b);
+
+  let sb = sbytes_new(64);
+  let t1 = thread_spawn(bump, sbytes_clone(sb), 1000);
+  let t2 = thread_spawn(bump, sbytes_clone(sb), 1000);
+  let w = thread_spawn(waiter, sbytes_clone(sb));
+  let n1 = thread_join(t1);
+  let n2 = thread_join(t2);
+  let count = sbytes_load(sb, 8, 8);         // 2000: no increment was lost
+  // A wait on a word that does not hold the expected value returns at once.
+  let ne = sbytes_wait(sb, 0, 4, 9, 0);
+  // A wait with a short timeout times out.
+  let to = sbytes_wait(sb, 0, 4, 0, 1000000);
+  // Wakes the waiter if it is asleep; if it has not gone to sleep yet, its
+  // wait finds 7 and returns at once.
+  sbytes_store(sb, 0, 4, 7);
+  let woken = sbytes_notify(sb, 0, 1);
+  let seen = thread_join(w);
+  sbytes_set(sb, 16, 1, woken);
+  let flag = sbytes_get(sb, 16, 1);
+  // cas: swap 7 for 9, then fail to swap 7 for 1.
+  let old1 = sbytes_cas(sb, 0, 4, 7, 9);
+  let old2 = sbytes_cas(sb, 0, 4, 7, 1);
+  let mut out = balloc(4);
+  sbytes_write(sb, 32, out, 0, 4);
+  sbytes_store(sb, 32, 2, 258);
+  sbytes_read(sb, 32, &mut out, 0, 4);
+  let lo = bget(out, 0);                     // 2
+  let hi = bget(out, 1);                     // 1
+  bfree(out);
+  sbytes_drop(sb);
+  let mut r = 0;
+  if s == 55 { r = r + 10; }
+  if n1 + n2 == 2000 && count == 2000 { r = r + 10; }
+  if ne == 1 && to == 2 && seen == 7 && flag <= 1 { r = r + 10; }
+  if old1 == 7 && old2 == 9 { r = r + 6; }
+  if lo == 2 && hi == 1 { r = r + 6; }
+  return r;
+}
