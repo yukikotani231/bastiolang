@@ -167,7 +167,7 @@ fn main(con: &mut Serial) -> u64 {
 | `Box[T]` | An owning pointer to a `T` on the heap; the only way a type can contain itself |
 | A struct with a linear field, an enum with a linear payload | |
 | `Host`, `Child` | The host system, and a child process (hosted target only) |
-| `Thread[R]`, `SharedBytes` | A running thread that will return an `R`, and a handle to bytes threads share (hosted target only, stage1 only). See [Threads](#threads) |
+| `Thread[R]`, `SharedBytes`, `Chan[T]`, `Share[T]` | A running thread that will return an `R`, a handle to bytes threads share, a handle to a queue of `T`s threads pass to each other, and a handle to a `T` threads read together (hosted target only, stage1 only). See [Threads](#threads) |
 | `Serial`, `Pool`, `Frame`, `PageTable`, `Mmu`, `Cpu`, `Lease`, `Ports`, `PortIo`, `MmioSpace`, `Mmio`, `Dma` | Capabilities: the console, physical pages, page tables, the MMU, the CPU's user context, a processor's hold on the address space it runs on, I/O ports, memory-mapped device registers and pages lent to devices. See [Kernel capabilities](#kernel-capabilities) |
 
 **Borrows** are allowed only as parameter types, so a borrow can never be stored, returned or outlive the call:
@@ -627,7 +627,7 @@ fn main() -> u64 {
 }
 ```
 
-- `f` is the name of a function (not generic, as for `locked`). Every argument is **moved** into the thread, so `f` cannot take a borrow (`E-TYPE`): the thread may outlive the caller's variables, and two threads could otherwise both write one value. What a thread is given is its own until it hands it back as its result; the only memory two threads touch at once is a `SharedBytes` (below), whose every access is atomic. So no data race can be written.
+- `f` is the name of a function (not generic, as for `locked`). Every argument is **moved** into the thread, so `f` cannot take a borrow (`E-TYPE`): the thread may outlive the caller's variables, and two threads could otherwise both write one value. What a thread is given is its own until it hands it back as its result; the only memory two threads touch at once is a `SharedBytes` (below), whose every access is atomic, values move between running threads only through a `Chan` (below), which hands each one over whole, and a value several threads read at once is behind a `Share` (below), through which only a `Lock`, an `Atomic` and the other two can change. So no data race can be written.
 - `f`'s precondition is proved where the thread is started, and its postcondition is known of what `thread_join` returns, exactly as for a call: the thread computes `f` of values nobody else can reach.
 - A `Thread` is linear: it must be joined (`E-LINEAR-LEAK`), so whatever the thread owns comes back. Joining a thread that never ends waits forever; that is a deadlock, which is not ruled out (see [concurrency.md](concurrency.md)).
 - An owned `Host` (`host_own`) can be passed to a thread to give it the file system. A `Cpu`, `Mmu` or `Lease` cannot (`E-PIN`), but they do not exist on the hosted target.
@@ -655,6 +655,125 @@ A `SharedBytes` is a run of bytes that any number of threads read and write at o
 - Another thread may change the bytes at any moment, so nothing is known of a value read except that it fits in `w` bytes.
 - Only `sbytes_wait` blocks. Its check of the word and its going to sleep happen under the mutex that `sbytes_notify` takes, so a notification sent after the word changed is never lost.
 - Generated code: the handle points to a block holding the count of handles (an atomic), the length, a mutex with the list of waiters, and the bytes; the accesses are the C compiler's `__atomic` builtins. Mixing word sizes on the same bytes is outside what C11 defines but is what every processor does atomically, as in JavaScript engines; it is part of the trusted base with the rest of the prelude.
+
+### Channels
+
+A `Chan[T]` is a handle to a queue of `T`s that any number of threads send to and receive from (stage1 only, hosted target, C backend only so far). Sending moves the value into the queue and receiving moves it out, so a linear value (a `Bytes`, a struct holding a `Vec`) has exactly one owner at every moment. The queue's mutex orders everything the sender did to the value before everything the receiver does to it, so handing a value over is not a data race.
+
+| Builtin | Effect |
+| --- | --- |
+| `chan_new(v: Vec[T]) -> Chan[T]` | A channel holding the elements of `v` (usually `vec_new[T]()`), oldest first |
+| `chan_clone(c: &Chan[T]) -> Chan[T]` | Another handle to the same channel, to move into a thread |
+| `chan_send(c: &Chan[T], x: T)` | Appends `x`; never waits (the queue grows) |
+| `chan_recv(c: &Chan[T], out: &mut Vec[T], ns: u64) -> bool` | Waits up to `ns` nanoseconds (0: not at all; 2^64 - 1: no limit) for a value, moves the oldest one to the end of `out` and returns true; false if none came. The prover knows `vlen(out)` grew by one exactly when the result is true, but forgets `out`'s elements |
+| `chan_len(c: &Chan[T]) -> u64` | How many values are queued right now (others may change it at once) |
+| `chan_drop(c: Chan[T]) -> Vec[T]` | Gives up a handle. The last one frees the channel and returns what is still queued; any other returns an empty vector. The prover does not know which, so a vector of linear values must be emptied before `vec_free` |
+
+- A handle is linear (`E-LINEAR-LEAK` if one is never dropped) and carries a run-time count of handles, like `SharedBytes`.
+- `T` cannot hold a `Cpu`, `Mmu` or `Lease` (`E-PIN`).
+- Generated code: the handle points to a block with the count, a mutex, a condition variable and a ring of elements that doubles when full; values are copied in and out by size.
+
+### Sharing a value between threads
+
+A `Share[T]` is a handle to a `T` that any number of threads read at once (stage1 only, hosted target, C backend only so far). It is how threads reach a `Lock` or an `Atomic` together: nothing can change through a shared borrow except the contents of a `Lock` or `Atomic`, the bytes of a `SharedBytes` and the queue of a `Chan`, and each of those is made for several threads, so reading a shared value is never a data race.
+
+```bastio
+// expect-ok
+struct Tally { n: u64 } invariant n <= 1000;
+struct State { tally: Lock[Tally] }
+
+fn add_one(t: &mut Tally) requires t.n <= 1000 ensures t.n <= 1000 {
+  if t.n < 1000 { t.n = t.n + 1; }
+}
+
+fn run(st: &State) { locked(st.tally, add_one); }
+
+fn worker(s: Share[State]) {
+  share_with(s, run);                 // run(&contents)
+  drop_state(share_drop(s));          // not the last handle: nothing comes back
+}
+
+fn drop_state(v: Vec[State]) {
+  let mut w = v;
+  while vec_len(w) > 0 invariant true {
+    let st = vec_pop(&mut w);
+    lock_end(st.tally);
+  }
+  vec_free(w);
+}
+
+fn main() -> u64 {
+  let s = share_new(State { tally: lock_new(Tally { n: 0 }) });
+  let t = thread_spawn(worker, share_clone(s));
+  thread_join(t);
+  drop_state(share_drop(s));          // the last handle: the State comes back
+  return 0;
+}
+```
+
+| Builtin | Effect |
+| --- | --- |
+| `share_new(v: T) -> Share[T]` | Moves `v` to the heap behind a first handle; proves the invariants of `v` (`E-VERIFY-LOCKINV`), as `lock_new` does |
+| `share_clone(s: &Share[T]) -> Share[T]` | Another handle to the same value |
+| `share_with(s: &Share[T], f, args..) -> R` | Calls `f(&value, args..)` and returns what `f` returns. `f` must take `&T` first (`E-TYPE` otherwise). Other threads hold the value too, so only its invariants are known of it, and `f`'s `requires` must follow from them |
+| `share_drop(s: Share[T]) -> Vec[T]` | Gives up a handle. The last one frees the allocation and returns the value in a vector of one; any other returns an empty vector. The prover knows only that the length is at most 1 |
+
+- A handle is linear and carries a run-time count of handles, like `SharedBytes` and `Chan`: the value comes back from whichever handle is dropped last, on whichever thread.
+- `T` cannot hold a `Cpu`, `Mmu` or `Lease` (`E-PIN`). Lock order (`E-LOCK-ORDER`) is checked over every thread's calls together: `share_with` and `thread_spawn` count as calls of the function they name.
+- Generated code: the value with an atomic count of handles before it; `share_with` passes the value as any `&T` argument is passed.
+
+### Parallel loops
+
+`par_each(&mut v, f, args..)` calls `f(&mut v[k], args..)` for every element of `v` at once, spread over the machine's processors, and returns when every call has returned (stage1 only, hosted target, C backend only so far). It is fork-join, so `f` may take shared borrows of the caller's variables: they outlive the call.
+
+```bastio
+// expect-ok
+struct Job { lo: u64, hi: u64, sum: u64 } invariant lo <= hi;
+
+fn part(j: &mut Job, data: &Vec[u64])
+  requires j.lo <= j.hi              // follows from the invariant
+{
+  if j.hi > vec_len(data) {
+    return;
+  }
+  let mut s = 0;
+  let mut k = j.lo;
+  while k < j.hi invariant k <= j.hi && j.hi <= vlen(data) && s <= k {
+    if vec_get(data, k) == 1 {
+      s = s + 1;
+    }
+    k = k + 1;
+  }
+  j.sum = s;
+}
+
+fn main() -> u64 {
+  let mut data = vec_new[u64]();
+  let mut k = 0;
+  while k < 84 invariant true {
+    vec_push(&mut data, k % 2);
+    k = k + 1;
+  }
+  let mut jobs = vec_new[Job]();
+  vec_push(&mut jobs, Job { lo: 0, hi: 40, sum: 0 });
+  vec_push(&mut jobs, Job { lo: 40, hi: 84, sum: 0 });
+  par_each(&mut jobs, part, data);    // two threads, one job each
+  let b = vec_pop(&mut jobs);
+  let a = vec_pop(&mut jobs);
+  vec_free(jobs);
+  vec_free(data);
+  if a.sum > 42 || b.sum > 42 {
+    return 0;
+  }
+  return a.sum + b.sum;
+}
+```
+
+- `f` returns nothing and takes `&mut S` first, `S` a struct or an enum (`E-TYPE` otherwise): each call gets an element of its own, so no two threads write the same memory.
+- Every other parameter is a shared borrow `&T` or a value that is not linear (`E-TYPE` for `&mut` or a linear value, which every call would own). A shared borrow cannot change anything but what a `Lock`, an `Atomic` or a `SharedBytes` holds, so the threads share nothing they could race on. `S` and `T` cannot hold a `Cpu`, `Mmu` or `Lease` (`E-PIN`).
+- The vector is lent `&mut` for the whole call, so it cannot also be an argument (`E-LINEAR-USE`).
+- Proof: one call is verified for an element of which only its type's invariants are known, so `f`'s `requires` must follow from them and from the other arguments, and then hold for every element. Afterwards the vector has the same length, and the prover forgets its contents (`f`'s `ensures` are not kept).
+- Generated code: a block with a pointer to the elements and the other arguments; the calling thread and up to one fewer threads than there are processors take indices from one atomic counter, and `par_each` returns when every call has. The other threads are a pool started on first use and kept asleep between calls, so a loop that calls `par_each` often (a collector's mark phase) does not start threads each time; a `par_each` that starts while the pool is in use (nested in a body, or on another thread) starts and joins threads of its own.
 
 ## Enums and `match`
 
@@ -1053,6 +1172,8 @@ For a JIT compiler (stage1 only, hosted, C backend; machine code on x86-64 Linux
 | `code_build(h: &Host, plan: &Vec[u64]) -> u64` | Checks the plan and builds its code; returns its id, or 0 if the plan breaks a rule, memory cannot be mapped or the platform has no machine code |
 | `code_call(code: u64, ctx: &mut T, entry: u64) -> u64` | Runs the code from entry point `entry`, lending it `ctx`, and returns what it returns. 0 for an unknown or freed id or a missing entry. Afterwards nothing proved about `ctx` before the call is known (the stencils may have changed it in any way) |
 | `code_free(h: &Host, code: u64)` | Unmaps the code (when the last call into it returns, if it is running). Ids are never reused |
+
+Each thread (`thread_spawn`) has its own table of code: an id is known only on the thread that built it, and elsewhere `code_call` gives 0 and `code_free` does nothing.
 
 A plan item is an opcode word followed by its operands; a label `L` is the offset in the plan of an item, or the plan's length:
 
@@ -1660,4 +1781,4 @@ What a program that `bastioc0` accepts is guaranteed: no out-of-bounds access, n
 
 ## Not in the language yet
 
-Planned, in [ROADMAP.md](../ROADMAP.md): the rest of concurrency (fork-join `par`, `Share`, channels, interrupt-safe locks; designed in [concurrency.md](concurrency.md)), more hardware capabilities (`IrqOff`), allocation failure in the type, and a native x86-64 backend. Inference of type arguments, modules with qualified names, and hand-written lemmas for proofs Z3 cannot find are open questions.
+Planned, in [ROADMAP.md](../ROADMAP.md): the rest of concurrency (fork-join `par`, interrupt-safe locks; designed in [concurrency.md](concurrency.md)), more hardware capabilities (`IrqOff`), allocation failure in the type, and a native x86-64 backend. Inference of type arguments, modules with qualified names, and hand-written lemmas for proofs Z3 cannot find are open questions.
