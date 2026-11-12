@@ -30,6 +30,9 @@ listener, a closed descriptor, an address in use) gives `Option::None` or
 | [`net_udp_open`](#net_udp_open) | A non-blocking UDP socket bound to the IPv4 address `ip` and `port` (0. |
 | [`net_udp_send`](#net_udp_send) | Sends `data` as one datagram from the UDP socket `sock` to `ip`:`port`. |
 | [`net_udp_recv`](#net_udp_recv) | Receives one datagram of at most `max` bytes (at most 65535) into `out` (replacing it) without waiting. |
+| [`net_sockname`](#net_sockname) | The address of a socket. |
+| [`net_sockname_port`](#net_sockname_port) | The port in an answer of `net_sockname`. |
+| [`net_sockname_family`](#net_sockname_family) | The address family (4 or 6) in an answer of `net_sockname`. |
 | [`net_udp_from_ip`](#net_udp_from_ip) | The sender's IPv4 address in an answer of `net_udp_recv`. |
 | [`net_udp_from_port`](#net_udp_from_port) | The sender's port in an answer of `net_udp_recv`. |
 | [`net_udp_len`](#net_udp_len) | The datagram's length in an answer of `net_udp_recv`. |
@@ -520,6 +523,57 @@ match net_udp_open(host, lo, 0) {
   },
   Option::None => {},
 }
+```
+
+### `net_sockname`
+
+```bastio
+fn net_sockname(h: &Host, sock: u64, peer: u64, out: &mut Bytes) -> Option[u64]
+```
+
+The address of a socket: with `peer` 0 its own (`getsockname`), with 1 the
+other end (`getpeername`). The address bytes (4 for IPv4, 16 for IPv6) go
+into `out`; the answer is the port in the low 16 bits and 4 or 6 above
+them (`net_sockname_port`, `net_sockname_family`). `None` on failure or on
+targets without it (only the Linux C backend has it).
+
+Example:
+
+```bastio
+let mut a = balloc(0);
+match net_sockname(host, 0, 0, &mut a) {
+  Option::Some(r) => {},
+  Option::None => {},
+}
+bfree(a);
+```
+
+### `net_sockname_port`
+
+```bastio
+fn net_sockname_port(packed: u64) -> u64
+```
+
+The port in an answer of `net_sockname`.
+
+Example:
+
+```bastio
+if net_sockname_port(4 * 65536 + 80) != 80 { return 1; }
+```
+
+### `net_sockname_family`
+
+```bastio
+fn net_sockname_family(packed: u64) -> u64
+```
+
+The address family (4 or 6) in an answer of `net_sockname`.
+
+Example:
+
+```bastio
+if net_sockname_family(4 * 65536 + 80) != 4 { return 1; }
 ```
 
 ### `net_udp_from_ip`
