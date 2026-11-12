@@ -484,6 +484,43 @@ fn net_udp_recv(h: &Host, sock: u64, max: u64, out: &mut Bytes) -> Option[u64] {
   return Option[u64]::Some(r);
 }
 
+/// The address of a socket: with `peer` 0 its own (`getsockname`), with 1 the
+/// other end (`getpeername`). The address bytes (4 for IPv4, 16 for IPv6) go
+/// into `out`; the answer is the port in the low 16 bits and 4 or 6 above
+/// them (`net_sockname_port`, `net_sockname_family`). `None` on failure or on
+/// targets without it (only the Linux C backend has it).
+/// ```
+/// let mut a = balloc(0);
+/// match net_sockname(host, 0, 0, &mut a) {
+///   Option::Some(r) => {},
+///   Option::None => {},
+/// }
+/// bfree(a);
+/// ```
+fn net_sockname(h: &Host, sock: u64, peer: u64, out: &mut Bytes) -> Option[u64] {
+  let r = host_net(h, 17, sock, peer % 2, &mut out);
+  if r == 18446744073709551615 {
+    return Option[u64]::None;
+  }
+  return Option[u64]::Some(r);
+}
+
+/// The port in an answer of `net_sockname`.
+/// ```
+/// if net_sockname_port(4 * 65536 + 80) != 80 { return 1; }
+/// ```
+fn net_sockname_port(packed: u64) -> u64 {
+  return packed % 65536;
+}
+
+/// The address family (4 or 6) in an answer of `net_sockname`.
+/// ```
+/// if net_sockname_family(4 * 65536 + 80) != 4 { return 1; }
+/// ```
+fn net_sockname_family(packed: u64) -> u64 {
+  return (packed / 65536) % 65536;
+}
+
 /// The sender's IPv4 address in an answer of `net_udp_recv`.
 /// ```
 /// if net_udp_from_ip(72623859711344645) != net_ip4(1, 2, 3, 4) { return 1; }
