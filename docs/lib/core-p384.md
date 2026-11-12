@@ -16,9 +16,11 @@ key generation, ECDH and signing take secrets, so their running time depends
 on them and they are for programs where nobody can measure it.
 
 A number is a `Vec[u64]` of 24 limbs of 16 bits, least significant first,
-below 2^384. Products are built by doubling and adding, which is slow (a
-verification takes about as long as a few thousand field multiplications of
-384 steps each) but short enough to read.
+below 2^384. Products are Montgomery multiplications formed on 32-bit limbs
+(a 32 by 32 bit product plus two 32-bit values fits a u64); the points are
+kept in Montgomery form while they are added and doubled, and a
+verification computes u1 G + u2 Q with one doubling per bit (Shamir's
+trick).
 
 `import "core/p384.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/der.bastio](core-der.md), [core/endian.bastio](core-endian.md), [core/text.bastio](core-text.md), [core/sha512.bastio](core-sha512.md).
 
@@ -37,11 +39,12 @@ Every example below is built, verified and run by `tests/run.sh`. An `assert` in
 ### `Modulus384`
 
 ```bastio
-struct Modulus384 { m: Vec[u64], r2: Vec[u64], minv: u64 }
+struct Modulus384 { m: Vec[u64], r2: Vec[u64], minv: u64, minv32: u64 }
 ```
 
 Internal: a prime modulus `m` with what Montgomery multiplication needs:
-`r2` is 2^768 modulo `m` and `minv` is -1/m modulo 2^16.
+`r2` is 2^768 modulo `m`, `minv` is -1/m modulo 2^16 and `minv32` is
+-1/m modulo 2^32.
 
 ### `P384Point`
 
@@ -213,6 +216,16 @@ fn p384_nib(c: u8) -> u64
 
 Internal: the value of the hex digit `c` (0 for anything else).
 
+### `p384_vec`
+
+```bastio
+fn p384_vec(n: u64) -> Vec[u64]
+  ensures vlen(result) == 0
+```
+
+Internal: an empty vector with room for `n` limbs (so that pushing them
+allocates once; if the room cannot be had, the pushes grow it as usual).
+
 ### `bn384_zero`
 
 ```bastio
@@ -349,6 +362,15 @@ fn bn384_bit(a: &Vec[u64], i: u64) -> u64
 
 Internal: bit `i` of `a` (0 or 1).
 
+### `p384_l32`
+
+```bastio
+fn p384_l32(a: &Vec[u64], i: u64) -> u64
+  requires vlen(a) == 24 && i < 12
+```
+
+Internal: limb `i` of `a` when it is read as 12 limbs of 32 bits.
+
 ### `mont384_mul`
 
 ```bastio
@@ -358,7 +380,9 @@ fn mont384_mul(a: &Vec[u64], b: &Vec[u64], m: &Modulus384) -> Vec[u64]
 ```
 
 Internal: `a * b / 2^384` modulo `m` (Montgomery multiplication, for `a`
-and `b` below `m`).
+and `b` below `m`). The numbers are kept in 16-bit limbs, but the product
+is formed on 32-bit limbs: every step `t + x * y + c` with 32-bit `t`, `x`,
+`y` and `c` is at most 2^64 - 1, so it fits a u64.
 
 ### `mod384_mul`
 
@@ -396,7 +420,8 @@ fn mod384_pow(a: &Vec[u64], e: &Vec[u64], m: &Modulus384) -> Vec[u64]
   ensures vlen(result) == 24
 ```
 
-Internal: `a` to the power `e`, modulo `m`.
+Internal: `a` to the power `e`, modulo `m` (for `a` below `m`). The
+powers are kept in Montgomery form, so each step is one multiplication.
 
 ### `mod384_inv`
 
@@ -445,6 +470,27 @@ fn p384_sq(a: &Vec[u64], p: &Modulus384) -> Vec[u64]
 
 Internal: `a * a` modulo `p`.
 
+### `p384_msq`
+
+```bastio
+fn p384_msq(a: &Vec[u64], p: &Modulus384) -> Vec[u64]
+  requires vlen(a) == 24 && mod384_ok(p)
+  ensures vlen(result) == 24
+```
+
+Internal: `a * a / 2^384` modulo `p` (a square in Montgomery form).
+
+### `p384_mont`
+
+```bastio
+fn p384_mont(q: &P384Point, p: &Modulus384, out: bool) -> P384Point
+  requires vlen(q.x) == 24 && vlen(q.y) == 24 && vlen(q.z) == 24 && mod384_ok(p)
+  ensures vlen(result.x) == 24 && vlen(result.y) == 24 && vlen(result.z) == 24
+```
+
+Internal: `q` with each coordinate times 2^384 modulo `p` (into
+Montgomery form), or divided by it when `out` is true.
+
 ### `p384_double`
 
 ```bastio
@@ -453,7 +499,8 @@ fn p384_double(q: &P384Point, p: &Modulus384) -> P384Point
   ensures vlen(result.x) == 24 && vlen(result.y) == 24 && vlen(result.z) == 24
 ```
 
-Internal: `2 * q`.
+Internal: `2 * q`, for a point in Montgomery form (each coordinate times
+2^384 modulo `p`).
 
 ### `p384_add`
 
@@ -464,7 +511,7 @@ fn p384_add(q1: &P384Point, q2: &P384Point, p: &Modulus384) -> P384Point
   ensures vlen(result.x) == 24 && vlen(result.y) == 24 && vlen(result.z) == 24
 ```
 
-Internal: `q1 + q2`.
+Internal: `q1 + q2`, for points in Montgomery form.
 
 ### `p384_mul`
 
@@ -475,6 +522,18 @@ fn p384_mul(k: &Vec[u64], q: &P384Point, p: &Modulus384) -> P384Point
 ```
 
 Internal: `k * q`.
+
+### `p384_mul2`
+
+```bastio
+fn p384_mul2(k1: &Vec[u64], q1: &P384Point, k2: &Vec[u64], q2: &P384Point, p: &Modulus384) -> P384Point
+  requires vlen(k1) == 24 && vlen(q1.x) == 24 && vlen(q1.y) == 24 && vlen(q1.z) == 24 && mod384_ok(p)
+  requires vlen(k2) == 24 && vlen(q2.x) == 24 && vlen(q2.y) == 24 && vlen(q2.z) == 24
+  ensures vlen(result.x) == 24 && vlen(result.y) == 24 && vlen(result.z) == 24
+```
+
+Internal: `k1 * q1 + k2 * q2`, with one doubling per bit for both
+(Shamir's trick).
 
 ### `p384_on_curve`
 

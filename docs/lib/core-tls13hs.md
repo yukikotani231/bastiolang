@@ -4,8 +4,9 @@
 
 The first two messages of a TLS 1.3 handshake (RFC
 8446 section 4): the ClientHello a client sends and the reading of the
-ServerHello that answers it, for the cipher suite
-TLS_CHACHA20_POLY1305_SHA256 and the key exchange X25519.
+ServerHello that answers it, for the three cipher suites and the key
+exchanges X25519, secp256r1 and secp384r1, and the HelloRetryRequest and
+second ClientHello of a server that wants another group.
 
 What is proved: every access is in bounds, nothing leaks, a ClientHello
 has the length its fields add up to, and `tls13_parse_server_hello` reads
@@ -18,10 +19,15 @@ of the standard (it takes the one suite and group the client offered).
 
 | Function | |
 | --- | --- |
-| [`tls13_client_hello`](#tls13_client_hello) | The ClientHello message (handshake type 1) offering TLS 1.3 with TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and TLS_CHACHA20_POLY1305_SHA256, the group X25519 (with the key share `key_share`, 32 bytes) and the signature schemes ed25519, ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384, rsa_pss_rsae_sha256 and rsa_pss_rsae_sha384, for the server named `server_name` (the host name, at most 255 bytes; empty for none). |
+| [`tls13_client_hello`](#tls13_client_hello) | The ClientHello message (handshake type 1) offering TLS 1.3 with TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and TLS_CHACHA20_POLY1305_SHA256, the groups X25519 (with the key share `key_share`, 32 bytes), secp256r1 and secp384r1 (without one) and the signature schemes ed25519, ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384, rsa_pss_rsae_sha256 and rsa_pss_rsae_sha384, for the server named `server_name` (the host name, at most 255 bytes; empty for none). |
 | [`tls13_client_hello_alpn`](#tls13_client_hello_alpn) | `tls13_client_hello` that also offers the application protocols `alpn` (RFC 7301). |
 | [`tls13_client_hello_v12`](#tls13_client_hello_v12) | A ClientHello that offers TLS 1.3 as `tls13_client_hello_alpn` does and TLS 1.2 too. |
 | [`tls13_parse_server_hello`](#tls13_parse_server_hello) | The X25519 public key (32 bytes) in the ServerHello `msg` (the whole handshake message, with its 4-byte header), or `None` unless it is a ServerHello for what `tls13_client_hello` offers. |
+| [`tls13_share_len`](#tls13_share_len) | The length of a key share of the group `group`. |
+| [`tls13_parse_server_hello_group`](#tls13_parse_server_hello_group) | The server's key share in the ServerHello `msg` as `tls13_parse_server_hello` checks it, but for the group `group` (29 x25519, 23 secp256r1 or 24 secp384r1). |
+| [`tls13_is_hello_retry`](#tls13_is_hello_retry) | Whether the ServerHello `msg` is a HelloRetryRequest (its random is the fixed value of RFC 8446 4.1.3). |
+| [`tls13_parse_hello_retry`](#tls13_parse_hello_retry) | What the HelloRetryRequest `msg` asks for. |
+| [`tls13_retry_hello`](#tls13_retry_hello) | The second ClientHello after a HelloRetryRequest. |
 | [`tls13_server_hello_suite`](#tls13_server_hello_suite) | The cipher suite a ServerHello `msg` chose. |
 
 Every example below is built, verified and run by `tests/run.sh`. An `assert` in one is proved at compile time from the contracts above it.
@@ -37,8 +43,8 @@ fn tls13_client_hello(random: &Bytes, session_id: &Bytes, server_name: &Bytes, k
 ```
 
 The ClientHello message (handshake type 1) offering TLS 1.3 with
-TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and TLS_CHACHA20_POLY1305_SHA256, the group X25519 (with the key share
-`key_share`, 32 bytes) and the signature schemes ed25519,
+TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and TLS_CHACHA20_POLY1305_SHA256, the groups X25519 (with the key share
+`key_share`, 32 bytes), secp256r1 and secp384r1 (without one) and the signature schemes ed25519,
 ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384, rsa_pss_rsae_sha256 and
 rsa_pss_rsae_sha384, for the server named
 `server_name` (the host name, at most 255 bytes; empty for none). `random` and
@@ -118,8 +124,8 @@ ECDHE_{ECDSA,RSA}_WITH_{AES_128_GCM_SHA256, AES_256_GCM_SHA384,
 CHACHA20_POLY1305_SHA256} follow the TLS 1.3 ones, the signature schemes
 add rsa_pkcs1_sha256/384/512, and it asks for the extended master secret
 (RFC 7627) and secure renegotiation (an empty renegotiation_info, RFC
-5746) with uncompressed points. The key exchange is X25519 only;
-secp256r1 and secp384r1 are listed for the curves of ECDSA certificates.
+5746) with uncompressed points. The key share is X25519; secp256r1 and
+secp384r1 are listed too, for a HelloRetryRequest or a TLS 1.2 ECDHE.
 
 Example:
 
@@ -178,6 +184,142 @@ bfree(random);
 if !ok { return 1; }
 ```
 
+### `tls13_share_len`
+
+```bastio
+fn tls13_share_len(group: u64) -> u64
+  ensures result == 32 || result == 65 || result == 97
+  ensures (group == 23) ==> result == 65
+  ensures (group == 24) ==> result == 97
+  ensures (group != 23 && group != 24) ==> result == 32
+```
+
+The length of a key share of the group `group`: 32 for x25519 (29), 65
+for secp256r1 (23) and 97 for secp384r1 (24), the uncompressed points.
+
+Example:
+
+```bastio
+if tls13_share_len(23) != 65 || tls13_share_len(29) != 32 { return 1; }
+```
+
+### `tls13_parse_server_hello_group`
+
+```bastio
+fn tls13_parse_server_hello_group(msg: &Bytes, group: u64) -> Option[Bytes]
+  requires blen(msg) < 274877906944 && (group == 29 || group == 23 || group == 24)
+  ensures result is Option::Some ==> tls13_share_ok(group, blen(result.Some))
+```
+
+The server's key share in the ServerHello `msg` as
+`tls13_parse_server_hello` checks it, but for the group `group` (29
+x25519, 23 secp256r1 or 24 secp384r1): the share has
+`tls13_share_len(group)` bytes.
+
+Example:
+
+```bastio
+let msg = balloc(60);
+let mut ok = false;
+match tls13_parse_server_hello_group(msg, 23) {
+  Option::Some(k) => { bfree(k); },
+  Option::None => { ok = true; },
+}
+bfree(msg);
+if !ok { return 1; }
+```
+
+### `tls13_is_hello_retry`
+
+```bastio
+fn tls13_is_hello_retry(msg: &Bytes) -> bool
+```
+
+Whether the ServerHello `msg` is a HelloRetryRequest (its random is the
+fixed value of RFC 8446 4.1.3).
+
+Example:
+
+```bastio
+let msg = balloc(60);
+let r = tls13_is_hello_retry(msg);
+bfree(msg);
+if r { return 1; }
+```
+
+### `tls13_parse_hello_retry`
+
+```bastio
+fn tls13_parse_hello_retry(msg: &Bytes) -> Option[Bytes]
+  requires blen(msg) < 274877906944
+  ensures result is Option::Some ==> blen(result.Some) >= 2 && blen(result.Some) < 70100
+```
+
+What the HelloRetryRequest `msg` asks for: the group of the key share it
+wants (2 bytes, big-endian; 0 when it names none) followed by the cookie
+to send back (empty when it has none), or `None` unless it is a
+HelloRetryRequest with TLS 1.2 in the legacy version, one of the three
+suites, no compression, and exactly the extensions supported_versions
+(TLS 1.3), key_share (a group) and cookie, each at most once, at least
+one of the last two present, and the length of each part inside the one
+before it.
+
+Example:
+
+```bastio
+let msg = balloc(60);
+let mut ok = false;
+match tls13_parse_hello_retry(msg) {
+  Option::Some(k) => { bfree(k); },
+  Option::None => { ok = true; },
+}
+bfree(msg);
+if !ok { return 1; }
+```
+
+### `tls13_retry_hello`
+
+```bastio
+fn tls13_retry_hello(first: &Bytes, group: u64, share: &Bytes, cookie: &Bytes) -> Option[Bytes]
+  requires blen(first) < 4096 && group < 65536 && blen(share) <= 97 && blen(cookie) < 65500
+  ensures result is Option::Some ==> blen(result.Some) > 4 && blen(result.Some) < 1048576
+```
+
+The second ClientHello after a HelloRetryRequest: the ClientHello `first`
+with its key_share extension replaced by one entry, of the group `group`
+with the share `share`, and a cookie extension with `cookie` behind the
+others when `cookie` is not empty (RFC 8446 4.1.2). `None` unless `first`
+is a ClientHello whose parts fit inside one another and that has a
+key_share extension.
+
+Example:
+
+```bastio
+let random = balloc(32);
+let sid = balloc(32);
+let key = balloc(32);
+let name = bfrom("example.com");
+let hello = tls13_client_hello(random, sid, name, key);
+let share = balloc(65);
+let cookie = balloc(0);
+let mut ok = false;
+match tls13_retry_hello(hello, 23, share, cookie) {
+  Option::Some(h) => {
+    ok = blen(h) == blen(hello) + 33;
+    bfree(h);
+  },
+  Option::None => {},
+}
+bfree(cookie);
+bfree(share);
+bfree(hello);
+bfree(name);
+bfree(key);
+bfree(sid);
+bfree(random);
+if !ok { return 1; }
+```
+
 ### `tls13_server_hello_suite`
 
 ```bastio
@@ -199,6 +341,19 @@ let s = tls13_server_hello_suite(msg);
 bfree(msg);
 if s != 0 { return 1; }
 ```
+
+## Specification functions
+
+### `tls13_share_ok`
+
+```bastio
+spec fn tls13_share_ok(group: u64, n: u64) -> bool {
+  (group == 29 && n == 32) || (group == 23 && n == 65) || (group == 24 && n == 97)
+}
+```
+
+Whether `n` is the length of a key share of the group `group` (29, 23
+or 24).
 
 ## Internals
 
@@ -248,7 +403,7 @@ first `n` of five) behind their length.
 ```bastio
 fn tls13_hello_extensions(server_name: &Bytes, key_share: &Bytes) -> Bytes
   requires blen(key_share) == 32 && blen(server_name) <= 255
-  ensures blen(result) <= 340
+  ensures blen(result) <= 344
 ```
 
 Internal: the extensions of a ClientHello, behind none of their length.

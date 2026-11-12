@@ -12,9 +12,11 @@
 // on them and they are for programs where nobody can measure it.
 //
 // A number is a `Vec[u64]` of 16 limbs of 16 bits, least significant first,
-// below 2^256. Products are built by doubling and adding, which is slow (a
-// verification takes about as long as a few thousand field multiplications of
-// 256 steps each) but short enough to read.
+// below 2^256. Products are Montgomery multiplications formed on 32-bit limbs
+// (a 32 by 32 bit product plus two 32-bit values fits a u64); the points are
+// kept in Montgomery form while they are added and doubled, and a
+// verification computes u1 G + u2 Q with one doubling per bit (Shamir's
+// trick).
 import "bytes.bastio";
 import "der.bastio";
 import "option.bastio";
@@ -29,11 +31,21 @@ fn p256_nib(c: u8) -> u64
   return 0;
 }
 
+/// Internal: an empty vector with room for `n` limbs (so that pushing them
+/// allocates once; if the room cannot be had, the pushes grow it as usual).
+fn p256_vec(n: u64) -> Vec[u64]
+  ensures vlen(result) == 0
+{
+  let mut v = vec_new[u64]();
+  if vec_try_reserve(&mut v, n) { return v; }
+  return v;
+}
+
 /// Internal: the number 0.
 fn p256_bn_zero() -> Vec[u64]
   ensures vlen(result) == 16
 {
-  let mut r = vec_new[u64]();
+  let mut r = p256_vec(16);
   let mut i = 0;
   while i < 16
     invariant i <= 16 && vlen(r) == i
@@ -49,7 +61,7 @@ fn p256_bn_copy(a: &Vec[u64]) -> Vec[u64]
   requires vlen(a) == 16
   ensures vlen(result) == 16
 {
-  let mut r = vec_new[u64]();
+  let mut r = p256_vec(16);
   let mut i = 0;
   while i < 16
     invariant i <= 16 && vlen(r) == i && vlen(a) == 16
@@ -156,7 +168,7 @@ fn p256_bn_add17(a: &Vec[u64], b: &Vec[u64]) -> Vec[u64]
   requires vlen(a) == 16 && vlen(b) == 16
   ensures vlen(result) == 17
 {
-  let mut r = vec_new[u64]();
+  let mut r = p256_vec(17);
   let mut carry = 0;
   let mut i = 0;
   while i < 16
@@ -209,8 +221,9 @@ fn p256_bn_sub_wrap(a: &Vec[u64], b: &Vec[u64]) -> Vec[u64]
 }
 
 /// Internal: a prime modulus `m` with what Montgomery multiplication needs:
-/// `r2` is 2^512 modulo `m` and `minv` is -1/m modulo 2^16.
-struct Modulus { m: Vec[u64], r2: Vec[u64], minv: u64 }
+/// `r2` is 2^512 modulo `m`, `minv` is -1/m modulo 2^16 and `minv32` is
+/// -1/m modulo 2^32.
+struct Modulus { m: Vec[u64], r2: Vec[u64], minv: u64, minv32: u64 }
 
 /// Internal: the modulus has 16 limbs, like its `r2`.
 spec fn mod_ok(m: &Modulus) -> bool {
@@ -261,64 +274,77 @@ fn p256_bn_bit(a: &Vec[u64], i: u64) -> u64
   return (vec_get(a, i / 16) >> (i % 16)) & 1;
 }
 
+/// Internal: limb `i` of `a` when it is read as 8 limbs of 32 bits.
+fn p256_l32(a: &Vec[u64], i: u64) -> u64
+  requires vlen(a) == 16 && i < 8
+{
+  return (vec_get(a, 2 * i) & 65535) | ((vec_get(a, 2 * i + 1) & 65535) << 16);
+}
+
 /// Internal: `a * b / 2^256` modulo `m` (Montgomery multiplication, for `a`
-/// and `b` below `m`).
+/// and `b` below `m`). The numbers are kept in 16-bit limbs, but the product
+/// is formed on 32-bit limbs: every step `t + x * y + c` with 32-bit `t`, `x`,
+/// `y` and `c` is at most 2^64 - 1, so it fits a u64.
 fn mont_mul(a: &Vec[u64], b: &Vec[u64], m: &Modulus) -> Vec[u64]
   requires vlen(a) == 16 && vlen(b) == 16 && mod_ok(m)
   ensures vlen(result) == 16
 {
-  let mut t = vec_new[u64]();
+  let mask = 4294967295;
+  let mut t = p256_vec(10);
   let mut k = 0;
-  while k < 18
-    invariant k <= 18 && vlen(t) == k
+  while k < 10
+    invariant k <= 10 && vlen(t) == k
   {
     vec_push(&mut t, 0);
     k = k + 1;
   }
+  let minv = m.minv32 & mask;
   let mut i = 0;
-  while i < 16
-    invariant i <= 16 && vlen(t) == 18 && vlen(a) == 16 && vlen(b) == 16 && mod_ok(m)
+  while i < 8
+    invariant i <= 8 && vlen(t) == 10 && vlen(a) == 16 && vlen(b) == 16 && mod_ok(m)
   {
-    let ai = vec_get(a, i);
+    let ai = p256_l32(a, i);
     let mut c = 0;
     let mut j = 0;
-    while j < 16
-      invariant j <= 16 && vlen(t) == 18 && vlen(b) == 16
+    while j < 8
+      invariant j <= 8 && vlen(t) == 10 && vlen(b) == 16
     {
-      let x = wrap_add(wrap_add(vec_get(t, j), wrap_mul(ai, vec_get(b, j))), c);
-      vec_set(&mut t, j, x & 65535);
-      c = x >> 16;
+      let x = wrap_add(wrap_add(vec_get(t, j) & mask, wrap_mul(ai, p256_l32(b, j))), c & mask);
+      vec_set(&mut t, j, x & mask);
+      c = x >> 32;
       j = j + 1;
     }
-    let x16 = wrap_add(vec_get(t, 16), c);
-    vec_set(&mut t, 16, x16 & 65535);
-    vec_set(&mut t, 17, x16 >> 16);
-    let q = wrap_mul(vec_get(t, 0), m.minv) & 65535;
+    let x8 = wrap_add(vec_get(t, 8) & mask, c & mask);
+    vec_set(&mut t, 8, x8 & mask);
+    vec_set(&mut t, 9, x8 >> 32);
+    let q = wrap_mul(vec_get(t, 0) & mask, minv) & mask;
     c = 0;
     j = 0;
-    while j < 16
-      invariant j <= 16 && vlen(t) == 18 && vlen(m.m) == 16
+    while j < 8
+      invariant j <= 8 && vlen(t) == 10 && vlen(m.m) == 16
     {
-      let y = wrap_add(wrap_add(vec_get(t, j), wrap_mul(q, vec_get(m.m, j))), c);
-      if j > 0 { vec_set(&mut t, j - 1, y & 65535); }
-      c = y >> 16;
+      let y = wrap_add(wrap_add(vec_get(t, j) & mask, wrap_mul(q, p256_l32(m.m, j))), c & mask);
+      if j > 0 { vec_set(&mut t, j - 1, y & mask); }
+      c = y >> 32;
       j = j + 1;
     }
-    let y16 = wrap_add(vec_get(t, 16), c);
-    vec_set(&mut t, 15, y16 & 65535);
-    vec_set(&mut t, 16, wrap_add(vec_get(t, 17), y16 >> 16));
-    vec_set(&mut t, 17, 0);
+    let y8 = wrap_add(vec_get(t, 8) & mask, c & mask);
+    vec_set(&mut t, 7, y8 & mask);
+    vec_set(&mut t, 8, wrap_add(vec_get(t, 9), y8 >> 32));
+    vec_set(&mut t, 9, 0);
     i = i + 1;
   }
   let mut low = p256_bn_zero();
   i = 0;
-  while i < 16
-    invariant i <= 16 && vlen(low) == 16 && vlen(t) == 18
+  while i < 8
+    invariant i <= 8 && vlen(low) == 16 && vlen(t) == 10
   {
-    vec_set(&mut low, i, vec_get(t, i));
+    let w = vec_get(t, i);
+    vec_set(&mut low, 2 * i, w & 65535);
+    vec_set(&mut low, 2 * i + 1, (w >> 16) & 65535);
     i = i + 1;
   }
-  let over = vec_get(t, 16) > 0 || p256_bn_ge(low, m.m);
+  let over = vec_get(t, 8) > 0 || p256_bn_ge(low, m.m);
   vec_free(t);
   if over {
     let r = p256_bn_sub_wrap(low, m.m);
@@ -355,9 +381,20 @@ fn mod_new(m: Vec[u64]) -> Modulus
     k = k + 1;
   }
   let minv = wrap_sub(65536, inv) & 65535;
+  // The same for 2^32, from the 32-bit low limb.
+  let m32 = (vec_get(m, 0) & 65535) | ((vec_get(m, 1) & 65535) << 16);
+  let mut inv32 = 1;
+  k = 0;
+  while k < 6
+    invariant k <= 6
+  {
+    inv32 = wrap_mul(inv32, wrap_sub(2, wrap_mul(m32, inv32))) & 4294967295;
+    k = k + 1;
+  }
+  let minv32 = wrap_sub(4294967296, inv32) & 4294967295;
   // 2^512 modulo m: 1 doubled 512 times (m is a prime well above 2).
   let mut r2 = p256_bn_small(1);
-  let mut stub = Modulus { m: m, r2: p256_bn_zero(), minv: minv };
+  let mut stub = Modulus { m: m, r2: p256_bn_zero(), minv: minv, minv32: minv32 };
   k = 0;
   while k < 512
     invariant k <= 512 && vlen(r2) == 16 && mod_ok(stub)
@@ -378,27 +415,34 @@ fn mod_free(m: Modulus) {
   vec_free(m.r2);
 }
 
-/// Internal: `a` to the power `e`, modulo `m`.
+/// Internal: `a` to the power `e`, modulo `m` (for `a` below `m`). The
+/// powers are kept in Montgomery form, so each step is one multiplication.
 fn mod_pow(a: &Vec[u64], e: &Vec[u64], m: &Modulus) -> Vec[u64]
   requires vlen(a) == 16 && vlen(e) == 16 && mod_ok(m)
   ensures vlen(result) == 16
 {
-  let mut r = p256_bn_small(1);
+  let one = p256_bn_small(1);
+  let am = mont_mul(a, m.r2, m);
+  let mut r = mont_mul(one, m.r2, m);
   let mut k = 0;
   while k < 256
-    invariant k <= 256 && vlen(r) == 16 && vlen(a) == 16 && vlen(e) == 16 && mod_ok(m)
+    invariant k <= 256 && vlen(r) == 16 && vlen(am) == 16 && vlen(e) == 16 && mod_ok(m)
   {
-    let sq = mod_mul(r, r, m);
+    let sq = mont_mul(r, r, m);
     vec_free(r);
     r = sq;
     if p256_bn_bit(e, 255 - k) == 1 {
-      let p = mod_mul(r, a, m);
+      let p = mont_mul(r, am, m);
       vec_free(r);
       r = p;
     }
     k = k + 1;
   }
-  return r;
+  let out = mont_mul(r, one, m);
+  vec_free(r);
+  vec_free(am);
+  vec_free(one);
+  return out;
 }
 
 /// Internal: the inverse of `a` modulo the prime `m` (0 for 0).
@@ -448,32 +492,56 @@ fn p256_sq(a: &Vec[u64], p: &Modulus) -> Vec[u64]
   return mod_mul(a, a, p);
 }
 
-/// Internal: `2 * q`.
+/// Internal: `a * a / 2^256` modulo `p` (a square in Montgomery form).
+fn p256_msq(a: &Vec[u64], p: &Modulus) -> Vec[u64]
+  requires vlen(a) == 16 && mod_ok(p)
+  ensures vlen(result) == 16
+{
+  return mont_mul(a, a, p);
+}
+
+/// Internal: `q` with each coordinate times 2^256 modulo `p` (into
+/// Montgomery form), or divided by it when `out` is true.
+fn p256_mont(q: &P256Point, p: &Modulus, out: bool) -> P256Point
+  requires vlen(q.x) == 16 && vlen(q.y) == 16 && vlen(q.z) == 16 && mod_ok(p)
+  ensures vlen(result.x) == 16 && vlen(result.y) == 16 && vlen(result.z) == 16
+{
+  if out {
+    let one = p256_bn_small(1);
+    let r = P256Point { x: mont_mul(q.x, one, p), y: mont_mul(q.y, one, p), z: mont_mul(q.z, one, p) };
+    vec_free(one);
+    return r;
+  }
+  return P256Point { x: mont_mul(q.x, p.r2, p), y: mont_mul(q.y, p.r2, p), z: mont_mul(q.z, p.r2, p) };
+}
+
+/// Internal: `2 * q`, for a point in Montgomery form (each coordinate times
+/// 2^256 modulo `p`).
 fn p256_double(q: &P256Point, p: &Modulus) -> P256Point
   requires vlen(q.x) == 16 && vlen(q.y) == 16 && vlen(q.z) == 16 && mod_ok(p)
   ensures vlen(result.x) == 16 && vlen(result.y) == 16 && vlen(result.z) == 16
 {
   if p256_bn_is_zero(q.z) { return p256_infinity(); }
-  let delta = p256_sq(q.z, p);
-  let gamma = p256_sq(q.y, p);
-  let beta = mod_mul(q.x, gamma, p);
+  let delta = p256_msq(q.z, p);
+  let gamma = p256_msq(q.y, p);
+  let beta = mont_mul(q.x, gamma, p);
   let t1 = mod_sub(q.x, delta, p);
   let t2 = mod_add(q.x, delta, p);
-  let t3 = mod_mul(t1, t2, p);
+  let t3 = mont_mul(t1, t2, p);
   let t3b = mod_add(t3, t3, p);
   let alpha = mod_add(t3b, t3, p);
-  let a2 = p256_sq(alpha, p);
+  let a2 = p256_msq(alpha, p);
   let b2 = mod_add(beta, beta, p);
   let b4 = mod_add(b2, b2, p);
   let b8 = mod_add(b4, b4, p);
   let x3 = mod_sub(a2, b8, p);
   let yz = mod_add(q.y, q.z, p);
-  let yz2 = p256_sq(yz, p);
+  let yz2 = p256_msq(yz, p);
   let z1 = mod_sub(yz2, gamma, p);
   let z3 = mod_sub(z1, delta, p);
   let t4 = mod_sub(b4, x3, p);
-  let t5 = mod_mul(alpha, t4, p);
-  let g2 = p256_sq(gamma, p);
+  let t5 = mont_mul(alpha, t4, p);
+  let g2 = p256_msq(gamma, p);
   let g4 = mod_add(g2, g2, p);
   let g8 = mod_add(g4, g4, p);
   let g16 = mod_add(g8, g8, p);
@@ -502,7 +570,7 @@ fn p256_double(q: &P256Point, p: &Modulus) -> P256Point
   return P256Point { x: x3, y: y3, z: z3 };
 }
 
-/// Internal: `q1 + q2`.
+/// Internal: `q1 + q2`, for points in Montgomery form.
 fn p256_add(q1: &P256Point, q2: &P256Point, p: &Modulus) -> P256Point
   requires vlen(q1.x) == 16 && vlen(q1.y) == 16 && vlen(q1.z) == 16
   requires vlen(q2.x) == 16 && vlen(q2.y) == 16 && vlen(q2.z) == 16 && mod_ok(p)
@@ -510,14 +578,14 @@ fn p256_add(q1: &P256Point, q2: &P256Point, p: &Modulus) -> P256Point
 {
   if p256_bn_is_zero(q1.z) { return p256_copy(q2); }
   if p256_bn_is_zero(q2.z) { return p256_copy(q1); }
-  let z1z1 = p256_sq(q1.z, p);
-  let z2z2 = p256_sq(q2.z, p);
-  let u1 = mod_mul(q1.x, z2z2, p);
-  let u2 = mod_mul(q2.x, z1z1, p);
-  let y1z2 = mod_mul(q1.y, q2.z, p);
-  let s1 = mod_mul(y1z2, z2z2, p);
-  let y2z1 = mod_mul(q2.y, q1.z, p);
-  let s2 = mod_mul(y2z1, z1z1, p);
+  let z1z1 = p256_msq(q1.z, p);
+  let z2z2 = p256_msq(q2.z, p);
+  let u1 = mont_mul(q1.x, z2z2, p);
+  let u2 = mont_mul(q2.x, z1z1, p);
+  let y1z2 = mont_mul(q1.y, q2.z, p);
+  let s1 = mont_mul(y1z2, z2z2, p);
+  let y2z1 = mont_mul(q2.y, q1.z, p);
+  let s2 = mont_mul(y2z1, z1z1, p);
   let h = mod_sub(u2, u1, p);
   let r = mod_sub(s2, s1, p);
   let mut out = p256_infinity();
@@ -527,19 +595,19 @@ fn p256_add(q1: &P256Point, q2: &P256Point, p: &Modulus) -> P256Point
       out = p256_double(q1, p);
     }
   } else {
-    let h2 = p256_sq(h, p);
-    let h3 = mod_mul(h2, h, p);
-    let u1h2 = mod_mul(u1, h2, p);
-    let r2 = p256_sq(r, p);
+    let h2 = p256_msq(h, p);
+    let h3 = mont_mul(h2, h, p);
+    let u1h2 = mont_mul(u1, h2, p);
+    let r2 = p256_msq(r, p);
     let x1 = mod_sub(r2, h3, p);
     let u1h2x2 = mod_add(u1h2, u1h2, p);
     let x3 = mod_sub(x1, u1h2x2, p);
     let y1 = mod_sub(u1h2, x3, p);
-    let y2 = mod_mul(r, y1, p);
-    let s1h3 = mod_mul(s1, h3, p);
+    let y2 = mont_mul(r, y1, p);
+    let s1h3 = mont_mul(s1, h3, p);
     let y3 = mod_sub(y2, s1h3, p);
-    let z12 = mod_mul(q1.z, q2.z, p);
-    let z3 = mod_mul(z12, h, p);
+    let z12 = mont_mul(q1.z, q2.z, p);
+    let z3 = mont_mul(z12, h, p);
     vec_free(z12);
     vec_free(s1h3);
     vec_free(y2);
@@ -571,24 +639,75 @@ fn p256_mul(k: &Vec[u64], q: &P256Point, p: &Modulus) -> P256Point
   requires vlen(k) == 16 && vlen(q.x) == 16 && vlen(q.y) == 16 && vlen(q.z) == 16 && mod_ok(p)
   ensures vlen(result.x) == 16 && vlen(result.y) == 16 && vlen(result.z) == 16
 {
+  let qm = p256_mont(q, p, false);
   let mut r = p256_infinity();
   let mut i = 0;
   while i < 256
     invariant i <= 256 && vlen(k) == 16 && mod_ok(p)
     invariant vlen(r.x) == 16 && vlen(r.y) == 16 && vlen(r.z) == 16
-    invariant vlen(q.x) == 16 && vlen(q.y) == 16 && vlen(q.z) == 16
+    invariant vlen(qm.x) == 16 && vlen(qm.y) == 16 && vlen(qm.z) == 16
   {
     let d = p256_double(r, p);
     p256_free(r);
     r = d;
     if p256_bn_bit(k, 255 - i) == 1 {
-      let s = p256_add(r, q, p);
+      let s = p256_add(r, qm, p);
       p256_free(r);
       r = s;
     }
     i = i + 1;
   }
-  return r;
+  p256_free(qm);
+  let out = p256_mont(r, p, true);
+  p256_free(r);
+  return out;
+}
+
+/// Internal: `k1 * q1 + k2 * q2`, with one doubling per bit for both
+/// (Shamir's trick).
+fn p256_mul2(k1: &Vec[u64], q1: &P256Point, k2: &Vec[u64], q2: &P256Point, p: &Modulus) -> P256Point
+  requires vlen(k1) == 16 && vlen(q1.x) == 16 && vlen(q1.y) == 16 && vlen(q1.z) == 16 && mod_ok(p)
+  requires vlen(k2) == 16 && vlen(q2.x) == 16 && vlen(q2.y) == 16 && vlen(q2.z) == 16
+  ensures vlen(result.x) == 16 && vlen(result.y) == 16 && vlen(result.z) == 16
+{
+  let m1 = p256_mont(q1, p, false);
+  let m2 = p256_mont(q2, p, false);
+  let m12 = p256_add(m1, m2, p);
+  let mut r = p256_infinity();
+  let mut i = 0;
+  while i < 256
+    invariant i <= 256 && vlen(k1) == 16 && vlen(k2) == 16 && mod_ok(p)
+    invariant vlen(r.x) == 16 && vlen(r.y) == 16 && vlen(r.z) == 16
+    invariant vlen(m1.x) == 16 && vlen(m1.y) == 16 && vlen(m1.z) == 16
+    invariant vlen(m2.x) == 16 && vlen(m2.y) == 16 && vlen(m2.z) == 16
+    invariant vlen(m12.x) == 16 && vlen(m12.y) == 16 && vlen(m12.z) == 16
+  {
+    let d = p256_double(r, p);
+    p256_free(r);
+    r = d;
+    let b1 = p256_bn_bit(k1, 255 - i);
+    let b2 = p256_bn_bit(k2, 255 - i);
+    if b1 == 1 && b2 == 1 {
+      let s = p256_add(r, m12, p);
+      p256_free(r);
+      r = s;
+    } else if b1 == 1 {
+      let s = p256_add(r, m1, p);
+      p256_free(r);
+      r = s;
+    } else if b2 == 1 {
+      let s = p256_add(r, m2, p);
+      p256_free(r);
+      r = s;
+    }
+    i = i + 1;
+  }
+  p256_free(m12);
+  p256_free(m2);
+  p256_free(m1);
+  let out = p256_mont(r, p, true);
+  p256_free(r);
+  return out;
 }
 
 /// Internal: whether (x, y) is on the curve y^2 = x^3 - 3x + b, with both
@@ -667,9 +786,7 @@ fn p256_verify_numbers(qx: &Vec[u64], qy: &Vec[u64], e: &Vec[u64], r: &Vec[u64],
     let gy = p256_bn_hex("4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5");
     let g = P256Point { x: gx, y: gy, z: p256_bn_small(1) };
     let q = P256Point { x: p256_bn_copy(qx), y: p256_bn_copy(qy), z: p256_bn_small(1) };
-    let a = p256_mul(u1, g, p);
-    let b = p256_mul(u2, q, p);
-    let sum = p256_add(a, b, p);
+    let sum = p256_mul2(u1, g, u2, q, p);
     if !p256_bn_is_zero(sum.z) {
       let zi = mod_inv(sum.z, p);
       let zi2 = p256_sq(zi, p);
@@ -687,8 +804,6 @@ fn p256_verify_numbers(qx: &Vec[u64], qy: &Vec[u64], e: &Vec[u64], r: &Vec[u64],
       vec_free(zi);
     }
     p256_free(sum);
-    p256_free(b);
-    p256_free(a);
     p256_free(q);
     p256_free(g);
     vec_free(u2);

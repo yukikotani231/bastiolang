@@ -12,9 +12,11 @@
 // on them and they are for programs where nobody can measure it.
 //
 // A number is a `Vec[u64]` of 24 limbs of 16 bits, least significant first,
-// below 2^384. Products are built by doubling and adding, which is slow (a
-// verification takes about as long as a few thousand field multiplications of
-// 384 steps each) but short enough to read.
+// below 2^384. Products are Montgomery multiplications formed on 32-bit limbs
+// (a 32 by 32 bit product plus two 32-bit values fits a u64); the points are
+// kept in Montgomery form while they are added and doubled, and a
+// verification computes u1 G + u2 Q with one doubling per bit (Shamir's
+// trick).
 import "bytes.bastio";
 import "der.bastio";
 import "option.bastio";
@@ -29,11 +31,21 @@ fn p384_nib(c: u8) -> u64
   return 0;
 }
 
+/// Internal: an empty vector with room for `n` limbs (so that pushing them
+/// allocates once; if the room cannot be had, the pushes grow it as usual).
+fn p384_vec(n: u64) -> Vec[u64]
+  ensures vlen(result) == 0
+{
+  let mut v = vec_new[u64]();
+  if vec_try_reserve(&mut v, n) { return v; }
+  return v;
+}
+
 /// Internal: the number 0.
 fn bn384_zero() -> Vec[u64]
   ensures vlen(result) == 24
 {
-  let mut r = vec_new[u64]();
+  let mut r = p384_vec(24);
   let mut i = 0;
   while i < 24
     invariant i <= 24 && vlen(r) == i
@@ -49,7 +61,7 @@ fn bn384_copy(a: &Vec[u64]) -> Vec[u64]
   requires vlen(a) == 24
   ensures vlen(result) == 24
 {
-  let mut r = vec_new[u64]();
+  let mut r = p384_vec(24);
   let mut i = 0;
   while i < 24
     invariant i <= 24 && vlen(r) == i && vlen(a) == 24
@@ -156,7 +168,7 @@ fn bn384_add17(a: &Vec[u64], b: &Vec[u64]) -> Vec[u64]
   requires vlen(a) == 24 && vlen(b) == 24
   ensures vlen(result) == 25
 {
-  let mut r = vec_new[u64]();
+  let mut r = p384_vec(25);
   let mut carry = 0;
   let mut i = 0;
   while i < 24
@@ -209,8 +221,9 @@ fn bn384_sub_wrap(a: &Vec[u64], b: &Vec[u64]) -> Vec[u64]
 }
 
 /// Internal: a prime modulus `m` with what Montgomery multiplication needs:
-/// `r2` is 2^768 modulo `m` and `minv` is -1/m modulo 2^16.
-struct Modulus384 { m: Vec[u64], r2: Vec[u64], minv: u64 }
+/// `r2` is 2^768 modulo `m`, `minv` is -1/m modulo 2^16 and `minv32` is
+/// -1/m modulo 2^32.
+struct Modulus384 { m: Vec[u64], r2: Vec[u64], minv: u64, minv32: u64 }
 
 /// Internal: the modulus has 24 limbs, like its `r2`.
 spec fn mod384_ok(m: &Modulus384) -> bool {
@@ -261,64 +274,77 @@ fn bn384_bit(a: &Vec[u64], i: u64) -> u64
   return (vec_get(a, i / 16) >> (i % 16)) & 1;
 }
 
+/// Internal: limb `i` of `a` when it is read as 12 limbs of 32 bits.
+fn p384_l32(a: &Vec[u64], i: u64) -> u64
+  requires vlen(a) == 24 && i < 12
+{
+  return (vec_get(a, 2 * i) & 65535) | ((vec_get(a, 2 * i + 1) & 65535) << 16);
+}
+
 /// Internal: `a * b / 2^384` modulo `m` (Montgomery multiplication, for `a`
-/// and `b` below `m`).
+/// and `b` below `m`). The numbers are kept in 16-bit limbs, but the product
+/// is formed on 32-bit limbs: every step `t + x * y + c` with 32-bit `t`, `x`,
+/// `y` and `c` is at most 2^64 - 1, so it fits a u64.
 fn mont384_mul(a: &Vec[u64], b: &Vec[u64], m: &Modulus384) -> Vec[u64]
   requires vlen(a) == 24 && vlen(b) == 24 && mod384_ok(m)
   ensures vlen(result) == 24
 {
-  let mut t = vec_new[u64]();
+  let mask = 4294967295;
+  let mut t = p384_vec(14);
   let mut k = 0;
-  while k < 26
-    invariant k <= 26 && vlen(t) == k
+  while k < 14
+    invariant k <= 14 && vlen(t) == k
   {
     vec_push(&mut t, 0);
     k = k + 1;
   }
+  let minv = m.minv32 & mask;
   let mut i = 0;
-  while i < 24
-    invariant i <= 24 && vlen(t) == 26 && vlen(a) == 24 && vlen(b) == 24 && mod384_ok(m)
+  while i < 12
+    invariant i <= 12 && vlen(t) == 14 && vlen(a) == 24 && vlen(b) == 24 && mod384_ok(m)
   {
-    let ai = vec_get(a, i);
+    let ai = p384_l32(a, i);
     let mut c = 0;
     let mut j = 0;
-    while j < 24
-      invariant j <= 24 && vlen(t) == 26 && vlen(b) == 24
+    while j < 12
+      invariant j <= 12 && vlen(t) == 14 && vlen(b) == 24
     {
-      let x = wrap_add(wrap_add(vec_get(t, j), wrap_mul(ai, vec_get(b, j))), c);
-      vec_set(&mut t, j, x & 65535);
-      c = x >> 16;
+      let x = wrap_add(wrap_add(vec_get(t, j) & mask, wrap_mul(ai, p384_l32(b, j))), c & mask);
+      vec_set(&mut t, j, x & mask);
+      c = x >> 32;
       j = j + 1;
     }
-    let x16 = wrap_add(vec_get(t, 24), c);
-    vec_set(&mut t, 24, x16 & 65535);
-    vec_set(&mut t, 25, x16 >> 16);
-    let q = wrap_mul(vec_get(t, 0), m.minv) & 65535;
+    let x12 = wrap_add(vec_get(t, 12) & mask, c & mask);
+    vec_set(&mut t, 12, x12 & mask);
+    vec_set(&mut t, 13, x12 >> 32);
+    let q = wrap_mul(vec_get(t, 0) & mask, minv) & mask;
     c = 0;
     j = 0;
-    while j < 24
-      invariant j <= 24 && vlen(t) == 26 && vlen(m.m) == 24
+    while j < 12
+      invariant j <= 12 && vlen(t) == 14 && vlen(m.m) == 24
     {
-      let y = wrap_add(wrap_add(vec_get(t, j), wrap_mul(q, vec_get(m.m, j))), c);
-      if j > 0 { vec_set(&mut t, j - 1, y & 65535); }
-      c = y >> 16;
+      let y = wrap_add(wrap_add(vec_get(t, j) & mask, wrap_mul(q, p384_l32(m.m, j))), c & mask);
+      if j > 0 { vec_set(&mut t, j - 1, y & mask); }
+      c = y >> 32;
       j = j + 1;
     }
-    let y16 = wrap_add(vec_get(t, 24), c);
-    vec_set(&mut t, 23, y16 & 65535);
-    vec_set(&mut t, 24, wrap_add(vec_get(t, 25), y16 >> 16));
-    vec_set(&mut t, 25, 0);
+    let y12 = wrap_add(vec_get(t, 12) & mask, c & mask);
+    vec_set(&mut t, 11, y12 & mask);
+    vec_set(&mut t, 12, wrap_add(vec_get(t, 13), y12 >> 32));
+    vec_set(&mut t, 13, 0);
     i = i + 1;
   }
   let mut low = bn384_zero();
   i = 0;
-  while i < 24
-    invariant i <= 24 && vlen(low) == 24 && vlen(t) == 26
+  while i < 12
+    invariant i <= 12 && vlen(low) == 24 && vlen(t) == 14
   {
-    vec_set(&mut low, i, vec_get(t, i));
+    let w = vec_get(t, i);
+    vec_set(&mut low, 2 * i, w & 65535);
+    vec_set(&mut low, 2 * i + 1, (w >> 16) & 65535);
     i = i + 1;
   }
-  let over = vec_get(t, 24) > 0 || bn384_ge(low, m.m);
+  let over = vec_get(t, 12) > 0 || bn384_ge(low, m.m);
   vec_free(t);
   if over {
     let r = bn384_sub_wrap(low, m.m);
@@ -355,9 +381,20 @@ fn mod384_new(m: Vec[u64]) -> Modulus384
     k = k + 1;
   }
   let minv = wrap_sub(65536, inv) & 65535;
+  // The same for 2^32, from the 32-bit low limb.
+  let m32 = (vec_get(m, 0) & 65535) | ((vec_get(m, 1) & 65535) << 16);
+  let mut inv32 = 1;
+  k = 0;
+  while k < 6
+    invariant k <= 6
+  {
+    inv32 = wrap_mul(inv32, wrap_sub(2, wrap_mul(m32, inv32))) & 4294967295;
+    k = k + 1;
+  }
+  let minv32 = wrap_sub(4294967296, inv32) & 4294967295;
   // 2^768 modulo m: 1 doubled 768 times (m is a prime well above 2).
   let mut r2 = bn384_small(1);
-  let mut stub = Modulus384 { m: m, r2: bn384_zero(), minv: minv };
+  let mut stub = Modulus384 { m: m, r2: bn384_zero(), minv: minv, minv32: minv32 };
   k = 0;
   while k < 768
     invariant k <= 768 && vlen(r2) == 24 && mod384_ok(stub)
@@ -378,27 +415,34 @@ fn mod384_free(m: Modulus384) {
   vec_free(m.r2);
 }
 
-/// Internal: `a` to the power `e`, modulo `m`.
+/// Internal: `a` to the power `e`, modulo `m` (for `a` below `m`). The
+/// powers are kept in Montgomery form, so each step is one multiplication.
 fn mod384_pow(a: &Vec[u64], e: &Vec[u64], m: &Modulus384) -> Vec[u64]
   requires vlen(a) == 24 && vlen(e) == 24 && mod384_ok(m)
   ensures vlen(result) == 24
 {
-  let mut r = bn384_small(1);
+  let one = bn384_small(1);
+  let am = mont384_mul(a, m.r2, m);
+  let mut r = mont384_mul(one, m.r2, m);
   let mut k = 0;
   while k < 384
-    invariant k <= 384 && vlen(r) == 24 && vlen(a) == 24 && vlen(e) == 24 && mod384_ok(m)
+    invariant k <= 384 && vlen(r) == 24 && vlen(am) == 24 && vlen(e) == 24 && mod384_ok(m)
   {
-    let sq = mod384_mul(r, r, m);
+    let sq = mont384_mul(r, r, m);
     vec_free(r);
     r = sq;
     if bn384_bit(e, 383 - k) == 1 {
-      let p = mod384_mul(r, a, m);
+      let p = mont384_mul(r, am, m);
       vec_free(r);
       r = p;
     }
     k = k + 1;
   }
-  return r;
+  let out = mont384_mul(r, one, m);
+  vec_free(r);
+  vec_free(am);
+  vec_free(one);
+  return out;
 }
 
 /// Internal: the inverse of `a` modulo the prime `m` (0 for 0).
@@ -448,32 +492,56 @@ fn p384_sq(a: &Vec[u64], p: &Modulus384) -> Vec[u64]
   return mod384_mul(a, a, p);
 }
 
-/// Internal: `2 * q`.
+/// Internal: `a * a / 2^384` modulo `p` (a square in Montgomery form).
+fn p384_msq(a: &Vec[u64], p: &Modulus384) -> Vec[u64]
+  requires vlen(a) == 24 && mod384_ok(p)
+  ensures vlen(result) == 24
+{
+  return mont384_mul(a, a, p);
+}
+
+/// Internal: `q` with each coordinate times 2^384 modulo `p` (into
+/// Montgomery form), or divided by it when `out` is true.
+fn p384_mont(q: &P384Point, p: &Modulus384, out: bool) -> P384Point
+  requires vlen(q.x) == 24 && vlen(q.y) == 24 && vlen(q.z) == 24 && mod384_ok(p)
+  ensures vlen(result.x) == 24 && vlen(result.y) == 24 && vlen(result.z) == 24
+{
+  if out {
+    let one = bn384_small(1);
+    let r = P384Point { x: mont384_mul(q.x, one, p), y: mont384_mul(q.y, one, p), z: mont384_mul(q.z, one, p) };
+    vec_free(one);
+    return r;
+  }
+  return P384Point { x: mont384_mul(q.x, p.r2, p), y: mont384_mul(q.y, p.r2, p), z: mont384_mul(q.z, p.r2, p) };
+}
+
+/// Internal: `2 * q`, for a point in Montgomery form (each coordinate times
+/// 2^384 modulo `p`).
 fn p384_double(q: &P384Point, p: &Modulus384) -> P384Point
   requires vlen(q.x) == 24 && vlen(q.y) == 24 && vlen(q.z) == 24 && mod384_ok(p)
   ensures vlen(result.x) == 24 && vlen(result.y) == 24 && vlen(result.z) == 24
 {
   if bn384_is_zero(q.z) { return p384_infinity(); }
-  let delta = p384_sq(q.z, p);
-  let gamma = p384_sq(q.y, p);
-  let beta = mod384_mul(q.x, gamma, p);
+  let delta = p384_msq(q.z, p);
+  let gamma = p384_msq(q.y, p);
+  let beta = mont384_mul(q.x, gamma, p);
   let t1 = mod384_sub(q.x, delta, p);
   let t2 = mod384_add(q.x, delta, p);
-  let t3 = mod384_mul(t1, t2, p);
+  let t3 = mont384_mul(t1, t2, p);
   let t3b = mod384_add(t3, t3, p);
   let alpha = mod384_add(t3b, t3, p);
-  let a2 = p384_sq(alpha, p);
+  let a2 = p384_msq(alpha, p);
   let b2 = mod384_add(beta, beta, p);
   let b4 = mod384_add(b2, b2, p);
   let b8 = mod384_add(b4, b4, p);
   let x3 = mod384_sub(a2, b8, p);
   let yz = mod384_add(q.y, q.z, p);
-  let yz2 = p384_sq(yz, p);
+  let yz2 = p384_msq(yz, p);
   let z1 = mod384_sub(yz2, gamma, p);
   let z3 = mod384_sub(z1, delta, p);
   let t4 = mod384_sub(b4, x3, p);
-  let t5 = mod384_mul(alpha, t4, p);
-  let g2 = p384_sq(gamma, p);
+  let t5 = mont384_mul(alpha, t4, p);
+  let g2 = p384_msq(gamma, p);
   let g4 = mod384_add(g2, g2, p);
   let g8 = mod384_add(g4, g4, p);
   let g16 = mod384_add(g8, g8, p);
@@ -502,7 +570,7 @@ fn p384_double(q: &P384Point, p: &Modulus384) -> P384Point
   return P384Point { x: x3, y: y3, z: z3 };
 }
 
-/// Internal: `q1 + q2`.
+/// Internal: `q1 + q2`, for points in Montgomery form.
 fn p384_add(q1: &P384Point, q2: &P384Point, p: &Modulus384) -> P384Point
   requires vlen(q1.x) == 24 && vlen(q1.y) == 24 && vlen(q1.z) == 24
   requires vlen(q2.x) == 24 && vlen(q2.y) == 24 && vlen(q2.z) == 24 && mod384_ok(p)
@@ -510,14 +578,14 @@ fn p384_add(q1: &P384Point, q2: &P384Point, p: &Modulus384) -> P384Point
 {
   if bn384_is_zero(q1.z) { return p384_copy(q2); }
   if bn384_is_zero(q2.z) { return p384_copy(q1); }
-  let z1z1 = p384_sq(q1.z, p);
-  let z2z2 = p384_sq(q2.z, p);
-  let u1 = mod384_mul(q1.x, z2z2, p);
-  let u2 = mod384_mul(q2.x, z1z1, p);
-  let y1z2 = mod384_mul(q1.y, q2.z, p);
-  let s1 = mod384_mul(y1z2, z2z2, p);
-  let y2z1 = mod384_mul(q2.y, q1.z, p);
-  let s2 = mod384_mul(y2z1, z1z1, p);
+  let z1z1 = p384_msq(q1.z, p);
+  let z2z2 = p384_msq(q2.z, p);
+  let u1 = mont384_mul(q1.x, z2z2, p);
+  let u2 = mont384_mul(q2.x, z1z1, p);
+  let y1z2 = mont384_mul(q1.y, q2.z, p);
+  let s1 = mont384_mul(y1z2, z2z2, p);
+  let y2z1 = mont384_mul(q2.y, q1.z, p);
+  let s2 = mont384_mul(y2z1, z1z1, p);
   let h = mod384_sub(u2, u1, p);
   let r = mod384_sub(s2, s1, p);
   let mut out = p384_infinity();
@@ -527,19 +595,19 @@ fn p384_add(q1: &P384Point, q2: &P384Point, p: &Modulus384) -> P384Point
       out = p384_double(q1, p);
     }
   } else {
-    let h2 = p384_sq(h, p);
-    let h3 = mod384_mul(h2, h, p);
-    let u1h2 = mod384_mul(u1, h2, p);
-    let r2 = p384_sq(r, p);
+    let h2 = p384_msq(h, p);
+    let h3 = mont384_mul(h2, h, p);
+    let u1h2 = mont384_mul(u1, h2, p);
+    let r2 = p384_msq(r, p);
     let x1 = mod384_sub(r2, h3, p);
     let u1h2x2 = mod384_add(u1h2, u1h2, p);
     let x3 = mod384_sub(x1, u1h2x2, p);
     let y1 = mod384_sub(u1h2, x3, p);
-    let y2 = mod384_mul(r, y1, p);
-    let s1h3 = mod384_mul(s1, h3, p);
+    let y2 = mont384_mul(r, y1, p);
+    let s1h3 = mont384_mul(s1, h3, p);
     let y3 = mod384_sub(y2, s1h3, p);
-    let z12 = mod384_mul(q1.z, q2.z, p);
-    let z3 = mod384_mul(z12, h, p);
+    let z12 = mont384_mul(q1.z, q2.z, p);
+    let z3 = mont384_mul(z12, h, p);
     vec_free(z12);
     vec_free(s1h3);
     vec_free(y2);
@@ -571,24 +639,75 @@ fn p384_mul(k: &Vec[u64], q: &P384Point, p: &Modulus384) -> P384Point
   requires vlen(k) == 24 && vlen(q.x) == 24 && vlen(q.y) == 24 && vlen(q.z) == 24 && mod384_ok(p)
   ensures vlen(result.x) == 24 && vlen(result.y) == 24 && vlen(result.z) == 24
 {
+  let qm = p384_mont(q, p, false);
   let mut r = p384_infinity();
   let mut i = 0;
   while i < 384
     invariant i <= 384 && vlen(k) == 24 && mod384_ok(p)
     invariant vlen(r.x) == 24 && vlen(r.y) == 24 && vlen(r.z) == 24
-    invariant vlen(q.x) == 24 && vlen(q.y) == 24 && vlen(q.z) == 24
+    invariant vlen(qm.x) == 24 && vlen(qm.y) == 24 && vlen(qm.z) == 24
   {
     let d = p384_double(r, p);
     p384_free(r);
     r = d;
     if bn384_bit(k, 383 - i) == 1 {
-      let s = p384_add(r, q, p);
+      let s = p384_add(r, qm, p);
       p384_free(r);
       r = s;
     }
     i = i + 1;
   }
-  return r;
+  p384_free(qm);
+  let out = p384_mont(r, p, true);
+  p384_free(r);
+  return out;
+}
+
+/// Internal: `k1 * q1 + k2 * q2`, with one doubling per bit for both
+/// (Shamir's trick).
+fn p384_mul2(k1: &Vec[u64], q1: &P384Point, k2: &Vec[u64], q2: &P384Point, p: &Modulus384) -> P384Point
+  requires vlen(k1) == 24 && vlen(q1.x) == 24 && vlen(q1.y) == 24 && vlen(q1.z) == 24 && mod384_ok(p)
+  requires vlen(k2) == 24 && vlen(q2.x) == 24 && vlen(q2.y) == 24 && vlen(q2.z) == 24
+  ensures vlen(result.x) == 24 && vlen(result.y) == 24 && vlen(result.z) == 24
+{
+  let m1 = p384_mont(q1, p, false);
+  let m2 = p384_mont(q2, p, false);
+  let m12 = p384_add(m1, m2, p);
+  let mut r = p384_infinity();
+  let mut i = 0;
+  while i < 384
+    invariant i <= 384 && vlen(k1) == 24 && vlen(k2) == 24 && mod384_ok(p)
+    invariant vlen(r.x) == 24 && vlen(r.y) == 24 && vlen(r.z) == 24
+    invariant vlen(m1.x) == 24 && vlen(m1.y) == 24 && vlen(m1.z) == 24
+    invariant vlen(m2.x) == 24 && vlen(m2.y) == 24 && vlen(m2.z) == 24
+    invariant vlen(m12.x) == 24 && vlen(m12.y) == 24 && vlen(m12.z) == 24
+  {
+    let d = p384_double(r, p);
+    p384_free(r);
+    r = d;
+    let b1 = bn384_bit(k1, 383 - i);
+    let b2 = bn384_bit(k2, 383 - i);
+    if b1 == 1 && b2 == 1 {
+      let s = p384_add(r, m12, p);
+      p384_free(r);
+      r = s;
+    } else if b1 == 1 {
+      let s = p384_add(r, m1, p);
+      p384_free(r);
+      r = s;
+    } else if b2 == 1 {
+      let s = p384_add(r, m2, p);
+      p384_free(r);
+      r = s;
+    }
+    i = i + 1;
+  }
+  p384_free(m12);
+  p384_free(m2);
+  p384_free(m1);
+  let out = p384_mont(r, p, true);
+  p384_free(r);
+  return out;
 }
 
 /// Internal: whether (x, y) is on the curve y^2 = x^3 - 3x + b, with both
@@ -667,9 +786,7 @@ fn p384_verify_numbers(qx: &Vec[u64], qy: &Vec[u64], e: &Vec[u64], r: &Vec[u64],
     let gy = bn384_hex("3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f");
     let g = P384Point { x: gx, y: gy, z: bn384_small(1) };
     let q = P384Point { x: bn384_copy(qx), y: bn384_copy(qy), z: bn384_small(1) };
-    let a = p384_mul(u1, g, p);
-    let b = p384_mul(u2, q, p);
-    let sum = p384_add(a, b, p);
+    let sum = p384_mul2(u1, g, u2, q, p);
     if !bn384_is_zero(sum.z) {
       let zi = mod384_inv(sum.z, p);
       let zi2 = p384_sq(zi, p);
@@ -687,8 +804,6 @@ fn p384_verify_numbers(qx: &Vec[u64], qy: &Vec[u64], e: &Vec[u64], r: &Vec[u64],
       vec_free(zi);
     }
     p384_free(sum);
-    p384_free(b);
-    p384_free(a);
     p384_free(q);
     p384_free(g);
     vec_free(u2);

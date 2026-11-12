@@ -9,7 +9,11 @@ the caller writes to the connection, and the data received from the peer is
 appended to another. So the same code runs over a socket, a pipe or a test.
 
 It speaks three suites, TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and
-TLS_CHACHA20_POLY1305_SHA256, with X25519, and checks
+TLS_CHACHA20_POLY1305_SHA256, with X25519; a server that wants secp256r1
+or secp384r1 asks for it in a HelloRetryRequest (with a cookie or not),
+which the client answers. The P-256 and P-384 key exchanges are not
+constant time (core/p256, core/p384): they are used only for servers that
+do not take X25519. It checks
 the server: the certificate chain against the trusted roots the caller
 gives (X.509 with RSA, ECDSA (P-256 and P-384) and Ed25519 signatures made
 with SHA-256, SHA-384 or SHA-512, validity, host name, CA flags and key
@@ -40,7 +44,7 @@ check that the random values are random (the caller supplies them).
 | [`tls13c_suite`](#tls13c_suite) | The cipher suite in use (its IANA number, 0x1301.. |
 | [`tls13c_check`](#tls13c_check) | Whether `c` has the sizes and states the other functions require (`tls13c_ok`). |
 | [`tls13c_alpn`](#tls13c_alpn) | The application protocol the server chose (a copy; empty when it chose none or has not answered yet). |
-| [`tls13c_verdict`](#tls13c_verdict) | 0 when the server's certificate chain was checked and good; otherwise 10 when only the host name is not the certificate's, or 6 (the code a client that verifies fails with in both cases; only a client made with `verify` false gets that far). |
+| [`tls13c_verdict`](#tls13c_verdict) | 0 when the server's certificate chain was checked and good; otherwise 10 when only the host name is not the certificate's, or 6 (the code a client that verifies fails with in both cases; only a client made with `verify` false gets that far, or with option 4 for 10). |
 | [`tls13c_peer_cert`](#tls13c_peer_cert) | The server's own certificate (DER, a copy), once the client has it (state 3 or later); empty before. |
 | [`tls13c_state`](#tls13c_state) | The state of `c`. |
 | [`tls13c_feed`](#tls13c_feed) | Gives the client the bytes `data` that arrived from the server. |
@@ -64,7 +68,7 @@ struct Tls13Client {
   inbuf: Bytes, hsbuf: Bytes, leaf: Bytes,
   verify: bool, verdict: u64, alpn: Bytes, sent_close: bool,
   allow12: bool, v12: bool, step: u64, rnd: Bytes, ms: Bytes, ems: bool, cs12: u64,
-  sk_kind: u64, sk_a: Bytes, sk_b: Bytes
+  sk_kind: u64, sk_a: Bytes, sk_b: Bytes, group: u64, retried: bool, defer_name: bool
 }
 ```
 
@@ -176,10 +180,13 @@ fn tls13c_new_opts(random: &Bytes, session_id: &Bytes, priv_key: &Bytes, name: &
 
 `tls13c_new_with` with options as bits: 1 accepts a chain the roots do not
 vouch for (`verify` false), 2 offers TLS 1.2 as well (for servers and
-proxies that do not speak TLS 1.3: ECDHE with X25519, AES-GCM or
-ChaCha20-Poly1305, the extended master secret when the server has it, no
-renegotiation; a TLS 1.3 server that is made to fall back is noticed by
-the value RFC 8446 puts at the end of its random).
+proxies that do not speak TLS 1.3: ECDHE with X25519, P-256 or P-384,
+AES-GCM or ChaCha20-Poly1305, the extended master secret when the server
+has it, no renegotiation; a TLS 1.3 server that is made to fall back is
+noticed by the value RFC 8446 puts at the end of its random), 4 checks
+the chain but leaves the host name to the caller: a chain the roots vouch
+for that is for another name goes on with `tls13c_verdict` 10, so the
+caller can apply its own rule (node:tls's checkServerIdentity).
 
 Example:
 
@@ -317,7 +324,7 @@ fn tls13c_verdict(c: &Tls13Client) -> u64
 0 when the server's certificate chain was checked and good; otherwise 10
 when only the host name is not the certificate's, or 6 (the code a client
 that verifies fails with in both cases; only a client made with `verify`
-false gets that far).
+false gets that far, or with option 4 for 10).
 
 Example:
 
@@ -693,16 +700,42 @@ Internal: switches `c` to the cipher suite `suite`, which fixes the hash
 and so the length of the secrets: they are replaced by zeros of the right
 length (they are made anew from the key exchange right after).
 
+### `tls13c_group_public`
+
+```bastio
+fn tls13c_group_public(c: &Tls13Client, group: u64) -> Option[Bytes]
+  requires tls13c_ok(c) && (group == 29 || group == 23 || group == 24)
+  ensures result is Option::Some ==> tls13_share_ok(group, blen(result.Some))
+```
+
+Internal: the client's public key for the group `group` (29 x25519, 23
+secp256r1, 24 secp384r1). The P-256 and P-384 private keys are SHA-256
+and SHA-384 of the X25519 one, so the client keeps one secret; `None`
+when that falls outside the curve's range (about one time in 2^32).
+
+### `tls13c_group_shared`
+
+```bastio
+fn tls13c_group_shared(c: &Tls13Client, group: u64, share: &Bytes) -> Option[Bytes]
+  requires tls13c_ok(c) && blen(share) <= 97
+  ensures result is Option::Some ==> (blen(result.Some) == 32 || blen(result.Some) == 48)
+```
+
+Internal: the secret shared with the server's key share `share` of the
+group `group`: 32 bytes for x25519 and secp256r1, 48 for secp384r1.
+`None` for a share that is not a point of the curve (or an X25519 share
+that gives zero).
+
 ### `tls13c_handshake_keys`
 
 ```bastio
 fn tls13c_handshake_keys(c: &mut Tls13Client, share: &Bytes) -> bool
-  requires tls13c_ok(c) && blen(share) == 32
+  requires tls13c_ok(c) && blen(share) <= 97
   ensures tls13c_ok(c)
 ```
 
 Internal: the handshake secrets from the server's key share `share`
-(32 bytes), with the ServerHello already in the transcript.
+(of the group `c.group`), with the ServerHello already in the transcript.
 
 ### `tls13c_application_keys`
 
@@ -715,10 +748,23 @@ fn tls13c_application_keys(c: &mut Tls13Client)
 Internal: the application traffic secrets and keys, with the server's
 Finished already in the transcript.
 
+### `tls13c_hello_retry`
+
+```bastio
+fn tls13c_hello_retry(c: &mut Tls13Client, msg: &Bytes, out: &mut Vec[u8]) -> u64
+  requires tls13c_ok(c) && blen(msg) < 1048576
+  ensures tls13c_ok(c)
+```
+
+Internal: handles a HelloRetryRequest `msg` (state 0, before any other):
+the transcript starts again from the hash of the first ClientHello
+(RFC 8446 4.4.1), and a second ClientHello goes out with a key share of
+the group the server asked for and its cookie.
+
 ### `tls13c_server_hello`
 
 ```bastio
-fn tls13c_server_hello(c: &mut Tls13Client, msg: &Bytes) -> u64
+fn tls13c_server_hello(c: &mut Tls13Client, msg: &Bytes, out: &mut Vec[u8]) -> u64
   requires tls13c_ok(c) && blen(msg) < 1048576
   ensures tls13c_ok(c)
 ```
@@ -754,6 +800,23 @@ fn tls13c_certificate(c: &mut Tls13Client, msg: &Bytes, roots: &Bytes, now: u64)
 ```
 
 Internal: handles the Certificate `msg` (state 2).
+
+### `tls13c_leaf_for`
+
+```bastio
+fn tls13c_leaf_for(c: &mut Tls13Client, msg: &Bytes, roots: &Bytes, now: u64) -> Option[Bytes]
+  requires tls13c_ok(c) && blen(msg) < 1048576 && blen(roots) < 274877906944
+  ensures tls13c_ok(c)
+  ensures result is Option::Some ==> blen(result.Some) < 1048576
+```
+
+Internal: the server's certificate from the Certificate message `msg`
+(in the TLS 1.3 form), or `None` when the client refuses it. A chain the
+roots vouch for and that names the server gives verdict 0. One the roots
+vouch for but for another name is refused, unless the client leaves the
+name to its caller (`defer_name`) or does not verify: verdict 10. Any
+other chain is refused by a verifying client, and gives verdict 6
+otherwise (the server's own certificate, whose key must still sign).
 
 ### `tls13c_signed_content`
 

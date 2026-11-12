@@ -1,7 +1,8 @@
 // core/tls13hs.bastio: the first two messages of a TLS 1.3 handshake (RFC
 // 8446 section 4): the ClientHello a client sends and the reading of the
-// ServerHello that answers it, for the cipher suite
-// TLS_CHACHA20_POLY1305_SHA256 and the key exchange X25519.
+// ServerHello that answers it, for the three cipher suites and the key
+// exchanges X25519, secp256r1 and secp384r1, and the HelloRetryRequest and
+// second ClientHello of a server that wants another group.
 //
 // What is proved: every access is in bounds, nothing leaks, a ClientHello
 // has the length its fields add up to, and `tls13_parse_server_hello` reads
@@ -60,7 +61,7 @@ fn tls13_u16_list(a: u64, b: u64, c: u64, d: u64, e: u64, n: u64) -> Bytes
 /// Internal: the extensions of a ClientHello, behind none of their length.
 fn tls13_hello_extensions(server_name: &Bytes, key_share: &Bytes) -> Bytes
   requires blen(key_share) == 32 && blen(server_name) <= 255
-  ensures blen(result) <= 340
+  ensures blen(result) <= 344
 {
   let mut t = text_new();
   if blen(server_name) > 0 {
@@ -77,8 +78,9 @@ fn tls13_hello_extensions(server_name: &Bytes, key_share: &Bytes) -> Bytes
     bfree(list);
     bfree(entry);
   }
-  // supported_groups: x25519.
-  let groups = tls13_u16_list(29, 0, 0, 0, 0, 1);
+  // supported_groups: x25519 (the key share), then secp256r1 and secp384r1,
+  // which a server that does not take X25519 asks for in a HelloRetryRequest.
+  let groups = tls13_u16_list(29, 23, 24, 0, 0, 3);
   tls13_push_ext(&mut t, 10, groups);
   bfree(groups);
   // signature_algorithms: ed25519, ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384,
@@ -108,8 +110,8 @@ fn tls13_hello_extensions(server_name: &Bytes, key_share: &Bytes) -> Bytes
 }
 
 /// The ClientHello message (handshake type 1) offering TLS 1.3 with
-/// TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and TLS_CHACHA20_POLY1305_SHA256, the group X25519 (with the key share
-/// `key_share`, 32 bytes) and the signature schemes ed25519,
+/// TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and TLS_CHACHA20_POLY1305_SHA256, the groups X25519 (with the key share
+/// `key_share`, 32 bytes), secp256r1 and secp384r1 (without one) and the signature schemes ed25519,
 /// ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384, rsa_pss_rsae_sha256 and
 /// rsa_pss_rsae_sha384, for the server named
 /// `server_name` (the host name, at most 255 bytes; empty for none). `random` and
@@ -244,8 +246,8 @@ fn tls13_client_hello_alpn(random: &Bytes, session_id: &Bytes, server_name: &Byt
 /// CHACHA20_POLY1305_SHA256} follow the TLS 1.3 ones, the signature schemes
 /// add rsa_pkcs1_sha256/384/512, and it asks for the extended master secret
 /// (RFC 7627) and secure renegotiation (an empty renegotiation_info, RFC
-/// 5746) with uncompressed points. The key exchange is X25519 only;
-/// secp256r1 and secp384r1 are listed for the curves of ECDSA certificates.
+/// 5746) with uncompressed points. The key share is X25519; secp256r1 and
+/// secp384r1 are listed too, for a HelloRetryRequest or a TLS 1.2 ECDHE.
 /// ```
 /// let random = balloc(32);
 /// let sid = balloc(32);
@@ -281,9 +283,10 @@ fn tls13_client_hello_v12(random: &Bytes, session_id: &Bytes, server_name: &Byte
     bfree(list);
     bfree(entry);
   }
-  // supported_groups: X25519 for the key exchange; secp256r1 and secp384r1
-  // say which curves of ECDSA certificates the client takes (TLS 1.2 servers
-  // check it), and only X25519 has a key share.
+  // supported_groups: X25519 for the key exchange, then secp256r1 and
+  // secp384r1: a TLS 1.3 server that does not take X25519 asks for one of
+  // them in a HelloRetryRequest, a TLS 1.2 server picks one for its
+  // ECDHE, and they say which curves of ECDSA certificates the client takes.
   let groups = tls13_u16_list(29, 23, 24, 0, 0, 3);
   tls13_push_ext(&mut e, 10, groups);
   bfree(groups);
@@ -408,6 +411,49 @@ fn tls13_parse_server_hello(msg: &Bytes) -> Option[Bytes]
   requires blen(msg) < 274877906944
   ensures result is Option::Some ==> blen(result.Some) == 32
 {
+  return tls13_parse_server_hello_group(msg, 29);
+}
+
+/// Whether `n` is the length of a key share of the group `group` (29, 23
+/// or 24).
+spec fn tls13_share_ok(group: u64, n: u64) -> bool {
+  (group == 29 && n == 32) || (group == 23 && n == 65) || (group == 24 && n == 97)
+}
+
+/// The length of a key share of the group `group`: 32 for x25519 (29), 65
+/// for secp256r1 (23) and 97 for secp384r1 (24), the uncompressed points.
+/// ```
+/// if tls13_share_len(23) != 65 || tls13_share_len(29) != 32 { return 1; }
+/// ```
+fn tls13_share_len(group: u64) -> u64
+  ensures result == 32 || result == 65 || result == 97
+  ensures (group == 23) ==> result == 65
+  ensures (group == 24) ==> result == 97
+  ensures (group != 23 && group != 24) ==> result == 32
+{
+  if group == 23 { return 65; }
+  if group == 24 { return 97; }
+  return 32;
+}
+
+/// The server's key share in the ServerHello `msg` as
+/// `tls13_parse_server_hello` checks it, but for the group `group` (29
+/// x25519, 23 secp256r1 or 24 secp384r1): the share has
+/// `tls13_share_len(group)` bytes.
+/// ```
+/// let msg = balloc(60);
+/// let mut ok = false;
+/// match tls13_parse_server_hello_group(msg, 23) {
+///   Option::Some(k) => { bfree(k); },
+///   Option::None => { ok = true; },
+/// }
+/// bfree(msg);
+/// if !ok { return 1; }
+/// ```
+fn tls13_parse_server_hello_group(msg: &Bytes, group: u64) -> Option[Bytes]
+  requires blen(msg) < 274877906944 && (group == 29 || group == 23 || group == 24)
+  ensures result is Option::Some ==> tls13_share_ok(group, blen(result.Some))
+{
   let n = blen(msg);
   if n < 48 || n > 70000 { return Option[Bytes]::None; }
   if bget(msg, 0) != 2 { return Option[Bytes]::None; }
@@ -431,7 +477,7 @@ fn tls13_parse_server_hello(msg: &Bytes) -> Option[Bytes]
   let mut have_key = false;
   let mut share = balloc(0);
   while p < n
-    invariant p <= n && n == blen(msg) && (have_key ==> blen(share) == 32)
+    invariant p <= n && n == blen(msg) && (have_key ==> tls13_share_ok(group, blen(share))) && (group == 29 || group == 23 || group == 24)
   {
     if p + 4 > n {
       bfree(share);
@@ -446,10 +492,10 @@ fn tls13_parse_server_hello(msg: &Bytes) -> Option[Bytes]
     }
     if ty == 43 && !have_version && el == 2 && load_be16(msg, p) == 772 {
       have_version = true;
-    } else if ty == 51 && !have_key && el == 36 && load_be16(msg, p) == 29 && load_be16(msg, p + 2) == 32 {
+    } else if ty == 51 && !have_key && el == 4 + tls13_share_len(group) && cast[u64](load_be16(msg, p)) == group && cast[u64](load_be16(msg, p + 2)) == tls13_share_len(group) {
       have_key = true;
       bfree(share);
-      share = bytes_slice(msg, p + 4, p + 36);
+      share = bytes_slice(msg, p + 4, p + 4 + tls13_share_len(group));
     } else {
       bfree(share);
       return Option[Bytes]::None;
@@ -459,6 +505,231 @@ fn tls13_parse_server_hello(msg: &Bytes) -> Option[Bytes]
   if have_version && have_key { return Option[Bytes]::Some(share); }
   bfree(share);
   return Option[Bytes]::None;
+}
+
+/// Whether the ServerHello `msg` is a HelloRetryRequest (its random is the
+/// fixed value of RFC 8446 4.1.3).
+/// ```
+/// let msg = balloc(60);
+/// let r = tls13_is_hello_retry(msg);
+/// bfree(msg);
+/// if r { return 1; }
+/// ```
+fn tls13_is_hello_retry(msg: &Bytes) -> bool {
+  if blen(msg) < 38 || bget(msg, 0) != 2 { return false; }
+  let hrr = tls13_hrr_random();
+  let retry = bytes_span_eq(msg, 6, hrr, 0, 32);
+  bfree(hrr);
+  return retry;
+}
+
+/// What the HelloRetryRequest `msg` asks for: the group of the key share it
+/// wants (2 bytes, big-endian; 0 when it names none) followed by the cookie
+/// to send back (empty when it has none), or `None` unless it is a
+/// HelloRetryRequest with TLS 1.2 in the legacy version, one of the three
+/// suites, no compression, and exactly the extensions supported_versions
+/// (TLS 1.3), key_share (a group) and cookie, each at most once, at least
+/// one of the last two present, and the length of each part inside the one
+/// before it.
+/// ```
+/// let msg = balloc(60);
+/// let mut ok = false;
+/// match tls13_parse_hello_retry(msg) {
+///   Option::Some(k) => { bfree(k); },
+///   Option::None => { ok = true; },
+/// }
+/// bfree(msg);
+/// if !ok { return 1; }
+/// ```
+fn tls13_parse_hello_retry(msg: &Bytes) -> Option[Bytes]
+  requires blen(msg) < 274877906944
+  ensures result is Option::Some ==> blen(result.Some) >= 2 && blen(result.Some) < 70100
+{
+  let n = blen(msg);
+  if n < 48 || n > 70000 { return Option[Bytes]::None; }
+  if !tls13_is_hello_retry(msg) { return Option[Bytes]::None; }
+  let len = cast[u64](bget(msg, 1)) * 65536 + cast[u64](load_be16(msg, 2));
+  if len + 4 != n { return Option[Bytes]::None; }
+  if load_be16(msg, 4) != 771 { return Option[Bytes]::None; }
+  let sid = cast[u64](bget(msg, 38));
+  let at = 39 + sid;
+  if at + 5 + 2 > n { return Option[Bytes]::None; }
+  let suite = load_be16(msg, at);
+  if suite != 4867 && suite != 4865 && suite != 4866 { return Option[Bytes]::None; }
+  if bget(msg, at + 2) != 0 { return Option[Bytes]::None; }
+  let ext_len = cast[u64](load_be16(msg, at + 3));
+  let mut p = at + 5;
+  if p + ext_len != n { return Option[Bytes]::None; }
+  let mut have_version = false;
+  let mut group = 0;
+  let mut have_cookie = false;
+  let mut cookie = balloc(0);
+  while p < n
+    invariant p <= n && n == blen(msg) && n <= 70000 && blen(cookie) < 70000 && group < 65536
+  {
+    if p + 4 > n {
+      bfree(cookie);
+      return Option[Bytes]::None;
+    }
+    let ty = cast[u64](load_be16(msg, p));
+    let el = cast[u64](load_be16(msg, p + 2));
+    p = p + 4;
+    if el > n - p {
+      bfree(cookie);
+      return Option[Bytes]::None;
+    }
+    if ty == 43 && !have_version && el == 2 && load_be16(msg, p) == 772 {
+      have_version = true;
+    } else if ty == 51 && group == 0 && el == 2 && load_be16(msg, p) != 0 {
+      group = cast[u64](load_be16(msg, p));
+    } else if ty == 44 && !have_cookie && el >= 3 && cast[u64](load_be16(msg, p)) + 2 == el {
+      have_cookie = true;
+      bfree(cookie);
+      cookie = bytes_slice(msg, p + 2, p + el);
+    } else {
+      bfree(cookie);
+      return Option[Bytes]::None;
+    }
+    p = p + el;
+  }
+  if !have_version || (group == 0 && !have_cookie) {
+    bfree(cookie);
+    return Option[Bytes]::None;
+  }
+  let mut t = text_new();
+  tls13_push_u16(&mut t, group);
+  text_push_bytes(&mut t, cookie);
+  bfree(cookie);
+  return Option[Bytes]::Some(text_finish(t));
+}
+
+/// The second ClientHello after a HelloRetryRequest: the ClientHello `first`
+/// with its key_share extension replaced by one entry, of the group `group`
+/// with the share `share`, and a cookie extension with `cookie` behind the
+/// others when `cookie` is not empty (RFC 8446 4.1.2). `None` unless `first`
+/// is a ClientHello whose parts fit inside one another and that has a
+/// key_share extension.
+/// ```
+/// let random = balloc(32);
+/// let sid = balloc(32);
+/// let key = balloc(32);
+/// let name = bfrom("example.com");
+/// let hello = tls13_client_hello(random, sid, name, key);
+/// let share = balloc(65);
+/// let cookie = balloc(0);
+/// let mut ok = false;
+/// match tls13_retry_hello(hello, 23, share, cookie) {
+///   Option::Some(h) => {
+///     ok = blen(h) == blen(hello) + 33;
+///     bfree(h);
+///   },
+///   Option::None => {},
+/// }
+/// bfree(cookie);
+/// bfree(share);
+/// bfree(hello);
+/// bfree(name);
+/// bfree(key);
+/// bfree(sid);
+/// bfree(random);
+/// if !ok { return 1; }
+/// ```
+fn tls13_retry_hello(first: &Bytes, group: u64, share: &Bytes, cookie: &Bytes) -> Option[Bytes]
+  requires blen(first) < 4096 && group < 65536 && blen(share) <= 97 && blen(cookie) < 65500
+  ensures result is Option::Some ==> blen(result.Some) > 4 && blen(result.Some) < 1048576
+{
+  let n = blen(first);
+  if n < 43 || bget(first, 0) != 1 { return Option[Bytes]::None; }
+  let len = cast[u64](bget(first, 1)) * 65536 + cast[u64](load_be16(first, 2));
+  if len + 4 != n { return Option[Bytes]::None; }
+  // Behind the type and length: version (2), random (32), session id.
+  let mut p = 38;
+  let sl = cast[u64](bget(first, p));
+  p = p + 1 + sl;
+  if p + 2 > n { return Option[Bytes]::None; }
+  let cl = cast[u64](load_be16(first, p));
+  p = p + 2 + cl;
+  if p + 1 > n { return Option[Bytes]::None; }
+  let ml = cast[u64](bget(first, p));
+  p = p + 1 + ml;
+  if p + 2 > n { return Option[Bytes]::None; }
+  let el = cast[u64](load_be16(first, p));
+  let head_end = p;
+  p = p + 2;
+  if p + el != n { return Option[Bytes]::None; }
+  let mut e = text_new();
+  let mut replaced = false;
+  while p < n
+    invariant p <= n && n == blen(first) && n < 4096 && blen(share) <= 97 && (!replaced ==> vlen(e) <= p) && vlen(e) <= p + 120
+  {
+    if p + 4 > n {
+      vec_free(e);
+      return Option[Bytes]::None;
+    }
+    let ty = cast[u64](load_be16(first, p));
+    let l = cast[u64](load_be16(first, p + 2));
+    if l > n - p - 4 {
+      vec_free(e);
+      return Option[Bytes]::None;
+    }
+    if ty == 51 {
+      if replaced {
+        vec_free(e);
+        return Option[Bytes]::None;
+      }
+      replaced = true;
+      let mut k = text_new();
+      tls13_push_u16(&mut k, group);
+      tls13_push_block16(&mut k, share);
+      let entry = text_finish(k);
+      let mut l2 = text_new();
+      tls13_push_block16(&mut l2, entry);
+      let list = text_finish(l2);
+      tls13_push_ext(&mut e, 51, list);
+      bfree(list);
+      bfree(entry);
+    } else if ty != 44 {
+      let part = bytes_slice(first, p, p + 4 + l);
+      text_push_bytes(&mut e, part);
+      bfree(part);
+    }
+    p = p + 4 + l;
+  }
+  if !replaced {
+    vec_free(e);
+    return Option[Bytes]::None;
+  }
+  if blen(cookie) > 0 {
+    let mut ck = text_new();
+    tls13_push_block16(&mut ck, cookie);
+    let body = text_finish(ck);
+    tls13_push_ext(&mut e, 44, body);
+    bfree(body);
+  }
+  let exts = text_finish(e);
+  if blen(exts) >= 65536 {
+    bfree(exts);
+    return Option[Bytes]::None;
+  }
+  let head = bytes_slice(first, 4, head_end);
+  let mut t = text_new();
+  text_push_bytes(&mut t, head);
+  tls13_push_block16(&mut t, exts);
+  bfree(exts);
+  bfree(head);
+  let body = text_finish(t);
+  let bl = blen(body);
+  if bl >= 65536 {
+    bfree(body);
+    return Option[Bytes]::None;
+  }
+  let mut m = text_new();
+  text_push(&mut m, 1);
+  text_push(&mut m, 0);
+  tls13_push_u16(&mut m, bl);
+  text_push_bytes(&mut m, body);
+  bfree(body);
+  return Option[Bytes]::Some(text_finish(m));
 }
 
 /// The cipher suite a ServerHello `msg` chose: 4865 (TLS_AES_128_GCM_SHA256,
