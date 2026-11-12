@@ -1,4 +1,5 @@
-// core/ed25519.bastio: Ed25519 signature verification (RFC 8032 section
+// core/ed25519.bastio: Ed25519 key derivation, signing (RFC 8032 sections
+// 5.1.5 and 5.1.6) and signature verification (section
 // 5.1.7), on the field arithmetic of core/x25519.bastio and the hash of
 // core/sha512.bastio.
 //
@@ -7,7 +8,10 @@
 // accepts exactly the signatures RFC 8032 accepts (the tests check the
 // RFC's vectors, signatures made by another implementation, and every
 // single-bit change of a signature, a message and a key being refused).
-// Verification works on public data only, so nothing here is constant time.
+// Verification works on public data only, so nothing there is constant time.
+// Signing and `ed25519_public` handle a secret and are not constant time
+// either (the point multiplication and the scalar arithmetic branch and index
+// on the secret): do not use them where a local attacker can time them.
 //
 // A point is a `Vec[u64]` of 64 limbs: the extended coordinates X, Y, Z and
 // T, 16 limbs each, with x = X/Z, y = Y/Z and x * y = T/Z.
@@ -483,4 +487,254 @@ fn ed25519_verify(pubkey: &Bytes, msg: &Bytes, sig: &Bytes) -> bool
       return same;
     },
   }
+}
+
+/// Internal: the 64-byte little-endian number `x` modulo the group order L, as
+/// 32 bytes (a binary long division: not constant time).
+fn ed_sc_reduce(x: &Bytes) -> Bytes
+  requires blen(x) == 64
+  ensures blen(result) == 32
+{
+  let l = ed_const("edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010");
+  let lb = ed_bytes(l);
+  vec_free(l);
+  let mut r = balloc(33);
+  let mut i = 512;
+  while i > 0
+    invariant i <= 512 && blen(r) == 33 && blen(lb) == 32 && blen(x) == 64
+  {
+    i = i - 1;
+    // r = 2 * r + the next bit of x.
+    let mut carry = cast[u64]((bget(x, i / 8) >> cast[u8](i % 8)) & 1);
+    let mut j = 0;
+    while j < 33
+      invariant j <= 33 && blen(r) == 33
+    {
+      let v = wrap_add(wrap_mul(cast[u64](bget(r, j)), 2), carry);
+      bset(&mut r, j, cast[u8](v & 255));
+      carry = v >> 8;
+      j = j + 1;
+    }
+    // r >= L?
+    let mut ge = true;
+    let mut decided = false;
+    let mut k = 33;
+    while k > 0
+      invariant k <= 33 && blen(r) == 33 && blen(lb) == 32
+    {
+      k = k - 1;
+      if !decided {
+        let mut lk = 0;
+        if k < 32 {
+          lk = cast[u64](bget(lb, k));
+        }
+        let rk = cast[u64](bget(r, k));
+        if rk > lk {
+          decided = true;
+        } else {
+          if rk < lk {
+            ge = false;
+            decided = true;
+          }
+        }
+      }
+    }
+    if ge {
+      let mut borrow = 0;
+      let mut m = 0;
+      while m < 33
+        invariant m <= 33 && borrow <= 1 && blen(r) == 33 && blen(lb) == 32
+      {
+        let mut lm = 0;
+        if m < 32 {
+          lm = cast[u64](bget(lb, m));
+        }
+        let rm = cast[u64](bget(r, m));
+        let sub = wrap_add(lm, borrow);
+        if rm >= sub {
+          bset(&mut r, m, cast[u8](rm - sub));
+          borrow = 0;
+        } else {
+          bset(&mut r, m, cast[u8](rm + 256 - sub));
+          borrow = 1;
+        }
+        m = m + 1;
+      }
+    }
+  }
+  let out = bytes_slice(r, 0, 32);
+  bfree(r);
+  bfree(lb);
+  return out;
+}
+
+/// Internal: the 64-byte little-endian product of the 32-byte numbers `a` and
+/// `b`.
+fn ed_sc_mul(a: &Bytes, b: &Bytes) -> Bytes
+  requires blen(a) == 32 && blen(b) == 32
+  ensures blen(result) == 64
+{
+  let mut acc = vec_new[u64]();
+  let mut n = 0;
+  while n < 64
+    invariant n <= 64 && vlen(acc) == n
+  {
+    vec_push(&mut acc, 0);
+    n = n + 1;
+  }
+  let mut i = 0;
+  while i < 32
+    invariant i <= 32 && vlen(acc) == 64 && blen(a) == 32 && blen(b) == 32
+  {
+    let mut j = 0;
+    while j < 32
+      invariant j <= 32 && i < 32 && vlen(acc) == 64 && blen(a) == 32 && blen(b) == 32
+    {
+      let at = i + j;
+      vec_set(&mut acc, at, wrap_add(vec_get(acc, at), wrap_mul(cast[u64](bget(a, i)), cast[u64](bget(b, j)))));
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  let mut out = balloc(64);
+  let mut carry = 0;
+  let mut k = 0;
+  while k < 64
+    invariant k <= 64 && vlen(acc) == 64 && blen(out) == 64
+  {
+    let v = wrap_add(vec_get(acc, k), carry);
+    bset(&mut out, k, cast[u8](v & 255));
+    carry = v >> 8;
+    k = k + 1;
+  }
+  vec_free(acc);
+  return out;
+}
+
+/// Internal: the 64-byte number `p` plus the 32-byte number `r` (little
+/// endian; the sum must fit 64 bytes, which it does for the values used).
+fn ed_sc_add(p: &Bytes, r: &Bytes) -> Bytes
+  requires blen(p) == 64 && blen(r) == 32
+  ensures blen(result) == 64
+{
+  let mut out = balloc(64);
+  let mut carry = 0;
+  let mut k = 0;
+  while k < 64
+    invariant k <= 64 && blen(p) == 64 && blen(r) == 32 && blen(out) == 64
+  {
+    let mut rk = 0;
+    if k < 32 {
+      rk = cast[u64](bget(r, k));
+    }
+    let v = wrap_add(wrap_add(cast[u64](bget(p, k)), rk), carry);
+    bset(&mut out, k, cast[u8](v & 255));
+    carry = v >> 8;
+    k = k + 1;
+  }
+  return out;
+}
+
+/// Internal: SHA-512 of the 32-byte seed with the first half clamped into the
+/// secret scalar `a` (in place) and the second half left as the prefix.
+fn ed_expand(seed: &Bytes) -> Bytes
+  requires blen(seed) == 32
+  ensures blen(result) == 64
+{
+  let mut h = sha512(seed);
+  bset(&mut h, 0, bget(h, 0) & 248);
+  bset(&mut h, 31, (bget(h, 31) & 127) | 64);
+  return h;
+}
+
+/// The public key (32 bytes) of the 32-byte secret `seed` (RFC 8032 section
+/// 5.1.5). A seed is 32 random bytes, so this is also key generation.
+/// ```
+/// let seed = balloc(32);
+/// let pubkey = ed25519_public(seed);
+/// let n = blen(pubkey);
+/// bfree(pubkey);
+/// bfree(seed);
+/// if n != 32 { return 1; }
+/// ```
+fn ed25519_public(seed: &Bytes) -> Bytes
+  requires blen(seed) == 32
+  ensures blen(result) == 32
+{
+  let h = ed_expand(seed);
+  let a = bytes_slice(h, 0, 32);
+  let base = ed_base();
+  let pt = ed_mul(base, a);
+  let out = ed_compress(pt);
+  vec_free(pt);
+  vec_free(base);
+  bfree(a);
+  bfree(h);
+  return out;
+}
+
+/// The Ed25519 signature (64 bytes) of `msg` under the 32-byte secret `seed`
+/// (RFC 8032 section 5.1.6). Signatures are deterministic.
+/// ```
+/// let seed = balloc(32);
+/// let pubkey = ed25519_public(seed);
+/// let msg = bfrom("hello");
+/// let sig = ed25519_sign(seed, msg);
+/// let ok = ed25519_verify(pubkey, msg, sig);
+/// bfree(sig);
+/// bfree(msg);
+/// bfree(pubkey);
+/// bfree(seed);
+/// if !ok { return 1; }
+/// ```
+fn ed25519_sign(seed: &Bytes, msg: &Bytes) -> Bytes
+  requires blen(seed) == 32 && blen(msg) < 1000000000
+  ensures blen(result) == 64
+{
+  let h = ed_expand(seed);
+  let a = bytes_slice(h, 0, 32);
+  let base = ed_base();
+  let apt = ed_mul(base, a);
+  let pubkey = ed_compress(apt);
+  // r = SHA-512(prefix || M) mod L; R = [r]B.
+  let mut d1 = text_new();
+  text_push_span(&mut d1, h, 32, 64);
+  text_push_bytes(&mut d1, msg);
+  let d1b = text_finish(d1);
+  let rh = sha512(d1b);
+  bfree(d1b);
+  let r = ed_sc_reduce(rh);
+  bfree(rh);
+  let rpt = ed_mul(base, r);
+  let rb = ed_compress(rpt);
+  // k = SHA-512(R || A || M) mod L; S = (r + k * a) mod L.
+  let mut d2 = text_new();
+  text_push_bytes(&mut d2, rb);
+  text_push_bytes(&mut d2, pubkey);
+  text_push_bytes(&mut d2, msg);
+  let d2b = text_finish(d2);
+  let kh = sha512(d2b);
+  bfree(d2b);
+  let k = ed_sc_reduce(kh);
+  bfree(kh);
+  let ka = ed_sc_mul(k, a);
+  let sum = ed_sc_add(ka, r);
+  let s = ed_sc_reduce(sum);
+  let mut sig = text_new();
+  text_push_bytes(&mut sig, rb);
+  text_push_bytes(&mut sig, s);
+  let out = text_finish(sig);
+  bfree(s);
+  bfree(sum);
+  bfree(ka);
+  bfree(k);
+  vec_free(rpt);
+  bfree(rb);
+  bfree(r);
+  bfree(pubkey);
+  vec_free(apt);
+  vec_free(base);
+  bfree(a);
+  bfree(h);
+  return out;
 }
