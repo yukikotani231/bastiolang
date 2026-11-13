@@ -38,6 +38,8 @@ listener, a closed descriptor, an address in use) gives `Option::None` or
 | [`net_udp_len`](#net_udp_len) | The datagram's length in an answer of `net_udp_recv`. |
 | [`net_now`](#net_now) | The time in seconds since 1970-01-01 UTC, from the system clock (0 if there is none). |
 | [`net_random`](#net_random) | `n` random bytes (at most 256) from the system's source (`/dev/urandom`, `RtlGenRandom`, `crypto.getRandomValues`), or `None` when there is none. |
+| [`net_connect_unix`](#net_connect_unix) | Connects to the Unix domain socket at `path` (1 to 107 bytes, no NUL byte), giving up after `ms` milliseconds (0 means no limit). |
+| [`net_listen_unix`](#net_listen_unix) | Listens on the Unix domain socket at `path` (as `net_connect_unix` reads it); a socket file that is already there makes it fail, so remove it first with `os_unlink` (an abstract socket leaves none). |
 
 Every example below is built, verified and run by `tests/run.sh`. An `assert` in one is proved at compile time from the contracts above it.
 
@@ -665,4 +667,50 @@ match net_random(host, 32) {
   },
   Option::None => { return 1; },
 }
+```
+
+### `net_connect_unix`
+
+```bastio
+fn net_connect_unix(h: &Host, path: &Bytes, ms: u64) -> Option[u64]
+```
+
+Connects to the Unix domain socket at `path` (1 to 107 bytes, no NUL
+byte), giving up after `ms` milliseconds (0 means no limit). On Linux a
+path that starts with `@` names an abstract socket: the `@` becomes the
+NUL byte of the kernel's name (`@/tmp/.X11-unix/X0` is the X server's).
+`None` when nothing listens there, the path is too long or the host has no
+Unix sockets (Windows, WebAssembly). The socket is read and written with
+`net_recv`, `net_send_all` and `net_close` like a TCP one.
+
+Example:
+
+```bastio
+let p = bfrom("/no/such/socket");
+match net_connect_unix(host, p, 1000) {
+  Option::Some(s) => { net_close(host, s); bfree(p); return 1; },
+  Option::None => {},
+}
+bfree(p);
+```
+
+### `net_listen_unix`
+
+```bastio
+fn net_listen_unix(h: &Host, path: &Bytes) -> Option[u64]
+```
+
+Listens on the Unix domain socket at `path` (as `net_connect_unix` reads
+it); a socket file that is already there makes it fail, so remove it first
+with `os_unlink` (an abstract socket leaves none). Accept with `net_accept`.
+
+Example:
+
+```bastio
+let p = bfrom("/no/such/dir/socket");
+match net_listen_unix(host, p) {
+  Option::Some(l) => { net_close(host, l); bfree(p); return 1; },
+  Option::None => {},
+}
+bfree(p);
 ```
