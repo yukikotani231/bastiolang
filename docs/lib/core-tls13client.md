@@ -40,7 +40,7 @@ check that the random values are random (the caller supplies them).
 | [`tls13c_suite`](#tls13c_suite) | The cipher suite in use (its IANA number, 0x1301.. |
 | [`tls13c_check`](#tls13c_check) | Whether `c` has the sizes and states the other functions require (`tls13c_ok`). |
 | [`tls13c_alpn`](#tls13c_alpn) | The application protocol the server chose (a copy; empty when it chose none or has not answered yet). |
-| [`tls13c_verdict`](#tls13c_verdict) | 0 when the server's certificate chain was checked and good; otherwise 10 when only the host name is not the certificate's, or 6 (the code a client that verifies fails with in both cases; only a client made with `verify` false gets that far). |
+| [`tls13c_verdict`](#tls13c_verdict) | 0 when the server's certificate chain was checked and good; otherwise 10 when only the host name is not the certificate's, or 6 (the code a client that verifies fails with in both cases; a client that verifies keeps the refused certificate and this verdict too, after the failure). |
 | [`tls13c_peer_cert`](#tls13c_peer_cert) | The server's own certificate (DER, a copy), once the client has it (state 3 or later); empty before. |
 | [`tls13c_state`](#tls13c_state) | The state of `c`. |
 | [`tls13c_feed`](#tls13c_feed) | Gives the client the bytes `data` that arrived from the server. |
@@ -316,8 +316,8 @@ fn tls13c_verdict(c: &Tls13Client) -> u64
 
 0 when the server's certificate chain was checked and good; otherwise 10
 when only the host name is not the certificate's, or 6 (the code a client
-that verifies fails with in both cases; only a client made with `verify`
-false gets that far).
+that verifies fails with in both cases; a client that verifies keeps the
+refused certificate and this verdict too, after the failure).
 
 Example:
 
