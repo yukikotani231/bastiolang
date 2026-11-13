@@ -1,0 +1,113 @@
+// stage1-only: the indirect jump of plans (INDJMP, item 29)
+// backend: c
+// expect-exit: 0
+// A plan that "calls" inside the machine code: one entry point's body jumps to
+// another's by the number in a register, which stays in the same frame with the
+// registers as they were, and back; a number that is not an entry's falls
+// through to the next item. Where there is no machine code (code_build gives
+// 0) it checks only that.
+struct Vm { out: Vec[u64] }
+
+fn op_nop(vm: &mut Vm, a: u64, b: u64, c: u64, d: u64) -> u64 {
+  return a;
+}
+
+fn push6(p: &mut Vec[u64], a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, n: u64) {
+  vec_push(&mut p, a);
+  if n > 1 { vec_push(&mut p, b); }
+  if n > 2 { vec_push(&mut p, c); }
+  if n > 3 { vec_push(&mut p, d); }
+  if n > 4 { vec_push(&mut p, e); }
+  if n > 5 { vec_push(&mut p, f); }
+}
+
+fn i_const(p: &mut Vec[u64], d: u64, x: u64) { push6(&mut p, 8, d, x, 0, 0, 0, 3); }
+fn i_store(p: &mut Vec[u64], f: u64, b: u64, i: u64, s: u64, l: u64) { push6(&mut p, 18, f, b, i, s, l, 6); }
+fn i_ret(p: &mut Vec[u64]) { push6(&mut p, 5, 0, 0, 0, 0, 0, 1); }
+fn i_entry(p: &mut Vec[u64], l: u64) { push6(&mut p, 7, l, 0, 0, 0, 0, 2); }
+fn i_indjmp(p: &mut Vec[u64], a: u64) { push6(&mut p, 29, a, 0, 0, 0, 0, 2); }
+
+// out[ix] = x; the code leaves if ix is out of range.
+fn out(p: &mut Vec[u64], f: u64, ix: u64, x: u64) {
+  i_const(&mut p, 12, 0);
+  i_const(&mut p, 13, ix);
+  i_const(&mut p, 11, x);
+  i_store(&mut p, f, 12, 13, 11, 2);
+}
+
+fn patch(p: &mut Vec[u64], at: u64, v: u64) {
+  if at < vec_len(p) {
+    vec_set(&mut p, at, v);
+  }
+}
+
+fn got(vm: &Vm, k: u64) -> u64 {
+  if k < vec_len(vm.out) {
+    return vec_get(vm.out, k);
+  }
+  return 0;
+}
+
+// Plan: entries 0, 1 and 2 at A, F and R. A jumps to entry 1 (F) with r0, F
+// stores 111 and jumps to entry 2 (R) with r1, R stores 222, tries entry 77
+// (nothing happens) and stores 333.
+fn plan_a(f: u64, nofall: u64) -> Vec[u64] {
+  let mut c = vec_new[u64]();
+  i_entry(&mut c, 0);
+  i_entry(&mut c, 0);
+  i_entry(&mut c, 0);
+  i_ret(&mut c);
+  patch(&mut c, 1, vec_len(c));                 // entry 0: A
+  i_const(&mut c, 0, 1);
+  i_const(&mut c, 1, 2);
+  i_indjmp(&mut c, 0);
+  out(&mut c, f, 9, nofall);                    // not reached
+  i_ret(&mut c);
+  patch(&mut c, 3, vec_len(c));                 // entry 1: F
+  out(&mut c, f, 0, 111);
+  i_indjmp(&mut c, 1);
+  out(&mut c, f, 8, nofall);                    // not reached
+  i_ret(&mut c);
+  patch(&mut c, 5, vec_len(c));                 // entry 2: R
+  out(&mut c, f, 1, 222);
+  i_const(&mut c, 2, 77);
+  i_indjmp(&mut c, 2);
+  out(&mut c, f, 2, 333);
+  i_ret(&mut c);
+  return c;
+}
+
+fn main(host: &mut Host) -> u64 {
+  let mut vm = Vm { out: vec_new[u64]() };
+  let mut k = 0;
+  while k < 16 {
+    vec_push(&mut vm.out, 0);
+    k = k + 1;
+  }
+  let f = code_field(out);
+  let nop = stencil(op_nop);
+  let c = plan_a(f, 9999);
+  let code = code_build(host, c);
+  vec_free(c);
+  let mut r = 0;
+  if code != 0 {
+    r = code_call(code, &mut vm, 0);
+    // Entry 2 directly (its registers are 0): 77 is not set, r2 = 0 is entry 0.
+    code_free(host, code);
+  }
+  let g0 = got(vm, 0);
+  let g1 = got(vm, 1);
+  let g2 = got(vm, 2);
+  let g8 = got(vm, 8);
+  let g9 = got(vm, 9);
+  vec_free(vm.out);
+  if code == 0 {
+    return 0;
+  }
+  if g0 != 111 { return 1; }
+  if g1 != 222 { return 2; }
+  if g2 != 333 { return 3; }
+  if g8 != 0 || g9 != 0 { return 4; }
+  if r != 0 { return 5; }
+  return 0;
+}

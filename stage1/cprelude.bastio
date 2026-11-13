@@ -2160,6 +2160,8 @@ fn cg_prelude_code(out: &mut Vec[u64]) {
   w_s(&mut out, " *  26 STOREIN f i j s L  that element = r[s], or go to L\n");
   w_s(&mut out, " *  27 LEN d f          r[d] = the length of field f now\n");
   w_s(&mut out, " *  28 LENIN d f i L    r[d] = the length of the Vec[u64] member of element r[i]; or go to L\n");
+  w_s(&mut out, " *  29 INDJMP a         go to the body of entry point r[a] (numbered by ENTRY, from 0), keeping the\n");
+  w_s(&mut out, " *                      registers; if r[a] is not an entry's number, the next item runs\n");
   w_s(&mut out, " * The registers are 0 when the code is entered. L is the word offset of an\n");
   w_s(&mut out, " * item in the plan; f is a number from code_field. Running off the end\n");
   w_s(&mut out, " * returns the current value. A plan that breaks a rule (an unknown opcode, a\n");
@@ -2198,8 +2200,8 @@ fn cg_prelude_code(out: &mut Vec[u64]) {
   w_s(&mut out, "#define BST_CODE_EPI 18u       /* add $136,%rsp; pop %rbp, %r15..%r12, %rbx; ret */\n");
   w_s(&mut out, "/* The length in words of the item at plan[i] (0: not a valid item). */\n");
   w_s(&mut out, "static uint64_t bst_code_ilen(const uint64_t *w, uint64_t n, uint64_t i) {\n");
-  w_s(&mut out, "    static const uint64_t lens[29] = { 6, 2, 2, 3, 2, 1, 2, 2, 3, 3, 5, 5, 6, 5, 5, 2, 2, 6, 6, 6, 5, 4, 5, 5, 5, 6, 6, 3, 5 };\n");
-  w_s(&mut out, "    if (i >= n || w[i] > 28 || lens[w[i]] > n - i) return 0;\n");
+  w_s(&mut out, "    static const uint64_t lens[30] = { 6, 2, 2, 3, 2, 1, 2, 2, 3, 3, 5, 5, 6, 5, 5, 2, 2, 6, 6, 6, 5, 4, 5, 5, 5, 6, 6, 3, 5, 2 };\n");
+  w_s(&mut out, "    if (i >= n || w[i] > 29 || lens[w[i]] > n - i) return 0;\n");
   w_s(&mut out, "    return lens[w[i]];\n");
   w_s(&mut out, "}\n");
   w_s(&mut out, "static unsigned bst_code_imm(uint64_t x) { return x <= 0xffffffffu ? 5u : 10u; }\n");
@@ -2227,6 +2229,7 @@ fn cg_prelude_code(out: &mut Vec[u64]) {
   w_s(&mut out, "    case 26: return w[i + 1] < nfield && etab[4 * w[i + 1] + 2] == 2 && w[i + 2] < 16 && w[i + 3] < 16 && w[i + 4] < 16;\n");
   w_s(&mut out, "    case 27: return w[i + 1] < 16 && w[i + 2] < nfield;\n");
   w_s(&mut out, "    case 28: return w[i + 1] < 16 && w[i + 2] < nfield && etab[4 * w[i + 2] + 2] == 2 && w[i + 3] < 16;\n");
+  w_s(&mut out, "    case 29: return w[i + 1] < 16;\n");
   w_s(&mut out, "    default: return 1;\n");
   w_s(&mut out, "    }\n");
   w_s(&mut out, "}\n");
@@ -2281,6 +2284,7 @@ fn cg_prelude_code(out: &mut Vec[u64]) {
   w_s(&mut out, "    case 26: return bst_code_elem_len(w[i + 2]) + 7 + bst_code_vl(w[i + 3]) + 3 + 6 + 7 + bst_code_vl(w[i + 4]) + 4;\n");
   w_s(&mut out, "    case 27: return 7 + bst_code_vl(w[i + 1]);\n");
   w_s(&mut out, "    case 28: return bst_code_elem_len(w[i + 3]) + 7 + bst_code_vl(w[i + 1]);\n");
+  w_s(&mut out, "    case 29: return bst_code_vl(w[i + 1]) + 28;\n");
   w_s(&mut out, "    default: return 0;\n");
   w_s(&mut out, "    }\n");
   w_s(&mut out, "}\n");
@@ -2379,6 +2383,7 @@ fn cg_prelude_code(out: &mut Vec[u64]) {
   w_s(&mut out, "#ifdef BST_CODE_X86\n");
   w_s(&mut out, "    const uint64_t *w = (const uint64_t *)plan.data;\n");
   w_s(&mut out, "    uint64_t n = plan.len, i, nentry = 0;\n");
+  w_s(&mut out, "    int has29 = 0;\n");
   w_s(&mut out, "    if (n == 0 || n > (1u << 24)) return 0;\n");
   w_s(&mut out, "    for (i = 0; i < nfield; i++) {\n");
   w_s(&mut out, "        if (ftab[i] + sizeof(bst_vec) >= 0x7fffffffu || etab[4 * i] >= 0x7fffffffu || etab[4 * i + 1] + sizeof(bst_vec) >= 0x7fffffffu) return 0;\n");
@@ -2392,6 +2397,7 @@ fn cg_prelude_code(out: &mut Vec[u64]) {
   w_s(&mut out, "        if (l == 0 || !bst_code_ops_ok(w, i, ntab, nfield, etab)) { free(off); free(start); return 0; }\n");
   w_s(&mut out, "        start[i] = 1;\n");
   w_s(&mut out, "        if (w[i] == 7) nentry++;\n");
+  w_s(&mut out, "        if (w[i] == 29) has29 = 1;\n");
   w_s(&mut out, "    }\n");
   w_s(&mut out, "    start[n] = 1;\n");
   w_s(&mut out, "    uint64_t size = BST_CODE_STUB * nentry;\n");
@@ -2401,6 +2407,8 @@ fn cg_prelude_code(out: &mut Vec[u64]) {
   w_s(&mut out, "    }\n");
   w_s(&mut out, "    off[n] = (uint32_t)size;\n");
   w_s(&mut out, "    size += 3 + BST_CODE_EPI;\n");
+  w_s(&mut out, "    uint64_t tabpos = size;\n");
+  w_s(&mut out, "    if (has29) size += 4 * nentry;     /* the entry points' addresses, for item 29 */\n");
   w_s(&mut out, "    /* Pass 2: every label an item (or the end). */\n");
   w_s(&mut out, "    for (i = 0; i < n; i += bst_code_ilen(w, n, i)) {\n");
   w_s(&mut out, "        uint64_t l;\n");
@@ -2531,6 +2539,15 @@ fn cg_prelude_code(out: &mut Vec[u64]) {
   w_s(&mut out, "            bst_code_ld(&p, 1, w[i + 4]);\n");
   w_s(&mut out, "            bst_code_put(&p, \"\\x48\\x89\\x0c\\xc2\", 4);                      /* mov %rcx,(%rdx,%rax,8) */\n");
   w_s(&mut out, "            break;\n");
+  w_s(&mut out, "        case 29:\n");
+  w_s(&mut out, "            bst_code_ld(&p, 0, w[i + 1]);\n");
+  w_s(&mut out, "            bst_code_put(&p, \"\\x48\\x3d\", 2);                              /* cmp $nentry,%rax */\n");
+  w_s(&mut out, "            bst_code_u32(&p, (uint32_t)nentry);\n");
+  w_s(&mut out, "            bst_code_put(&p, \"\\x0f\\x83\\x10\\x00\\x00\\x00\", 6);             /* jae past the jump: an entry number out of range does nothing */\n");
+  w_s(&mut out, "            bst_code_put(&p, \"\\x48\\x8d\\x0d\", 3);                          /* lea table(%rip),%rcx */\n");
+  w_s(&mut out, "            bst_code_u32(&p, (uint32_t)((int64_t)tabpos - (int64_t)((p + 4) - mem)));\n");
+  w_s(&mut out, "            bst_code_put(&p, \"\\x48\\x63\\x04\\x81\\x48\\x01\\xc8\\xff\\xe0\", 9);   /* movslq (%rcx,%rax,4),%rax; add %rcx,%rax; jmp *%rax */\n");
+  w_s(&mut out, "            break;\n");
   w_s(&mut out, "        case 23: case 25: case 28: {\n");
   w_s(&mut out, "            uint64_t f = w[i + 2], ix = w[i + 3], l = w[i] == 25 ? w[i + 5] : w[i + 4];\n");
   w_s(&mut out, "            bst_code_elem(&p, mem, off, ix, f, l, ftab, etab);\n");
@@ -2623,6 +2640,11 @@ fn cg_prelude_code(out: &mut Vec[u64]) {
   w_s(&mut out, "        }\n");
   w_s(&mut out, "    }\n");
   w_s(&mut out, "    bst_code_put(&p, \"\\x4c\\x89\\xe0\\x48\\x81\\xc4\\x88\\x00\\x00\\x00\\x5d\\x41\\x5f\\x41\\x5e\\x41\\x5d\\x41\\x5c\\x5b\\xc3\", 21);\n");
+  w_s(&mut out, "    if (has29) {   /* the table: entry e's body, relative to the table */\n");
+  w_s(&mut out, "        for (i = 0; i < n; i += bst_code_ilen(w, n, i)) {\n");
+  w_s(&mut out, "            if (w[i] == 7) bst_code_u32(&p, (uint32_t)((int64_t)off[w[i + 1]] - (int64_t)tabpos));\n");
+  w_s(&mut out, "        }\n");
+  w_s(&mut out, "    }\n");
   w_s(&mut out, "    free(off);\n");
   w_s(&mut out, "    if ((uint64_t)(p - mem) != size || mprotect(m, mapped, PROT_READ | PROT_EXEC) != 0) {\n");
   w_s(&mut out, "        munmap(m, mapped); free(entry); return 0;\n");
