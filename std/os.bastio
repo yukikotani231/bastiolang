@@ -380,6 +380,70 @@ fn os_chmod(h: &Host, path: &Bytes, perm: u64) -> bool {
   return os_path_op(h, 27, path, perm);
 }
 
+/// Starts (`on`) or stops catching signal `sig` (Linux numbers; macOS differs for
+/// some): a caught signal is recorded for `os_signals_take` instead of acting.
+/// False for KILL, STOP, a number outside 1 to 63, and on Windows.
+/// ```
+/// let bad = os_signal_catch(host, 9, true);
+/// if bad { return 1; }
+/// ```
+fn os_signal_catch(h: &Host, sig: u64, on: bool) -> bool {
+  let mut none = balloc(0);
+  let mut b = 0;
+  if on {
+    b = 1;
+  }
+  let r = host_sys(h, 61, sig, b, &mut none);
+  bfree(none);
+  return r == 0;
+}
+
+/// The signals caught since the last call, as a mask with bit `n` set for
+/// signal `n`; they are forgotten. 0 when there are none (and on Windows).
+/// ```
+/// let m = os_signals_take(host);
+/// if m != 0 { return 1; }
+/// ```
+fn os_signals_take(h: &Host) -> u64 {
+  let mut none = balloc(0);
+  let r = host_sys(h, 62, 0, 0, &mut none);
+  bfree(none);
+  if r == 18446744073709551615 {
+    return 0;
+  }
+  return r;
+}
+
+/// The read end of a non-blocking pipe that gets a byte for each caught signal,
+/// to wait on with `os_poll`; the caller reads the bytes away.
+/// ```
+/// match os_signal_fd(host) {
+///   Option::Some(fd) => { os_close(host, fd); },
+///   Option::None => {},
+/// }
+/// ```
+fn os_signal_fd(h: &Host) -> Option[u64] {
+  let mut none = balloc(0);
+  let r = host_sys(h, 63, 0, 0, &mut none);
+  bfree(none);
+  if r == 18446744073709551615 {
+    return Option[u64]::None;
+  }
+  return Option[u64]::Some(r);
+}
+
+/// Sends signal `sig` to process `pid`.
+/// ```
+/// let bad = os_kill(host, 2147483647, 0);
+/// if bad { return 1; }
+/// ```
+fn os_kill(h: &Host, pid: u64, sig: u64) -> bool {
+  let mut none = balloc(0);
+  let r = host_sys(h, 64, pid, sig, &mut none);
+  bfree(none);
+  return r == 0;
+}
+
 /// Makes `to` a hard link to the existing file `from`.
 /// ```
 /// let a = bfrom("no/such/file");
