@@ -307,6 +307,24 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   let rvu = ref_to(&mut m, p, vu);
   bsig(&mut c, "code_build", AV_HOSTED, 2, rhst, rvu, 0, 0, u);
   bsig(&mut c, "code_free", AV_HOSTED, 2, rhst, u, 0, 0, un);
+  // Bytes several threads read and write at once (stage1 only): every
+  // access is atomic, so there is no data race to prove absent.
+  let sbt = prim(&mut m, p, TY_SBYTES);
+  let rsbt = ref_to(&mut m, p, sbt);
+  bsig(&mut c, "sbytes_new", AV_HOSTED, 1, u, 0, 0, 0, sbt);
+  bsig(&mut c, "sbytes_len", AV_HOSTED, 1, rsbt, 0, 0, 0, u);
+  bsig(&mut c, "sbytes_clone", AV_HOSTED, 1, rsbt, 0, 0, 0, sbt);
+  bsig(&mut c, "sbytes_drop", AV_HOSTED, 1, sbt, 0, 0, 0, un);
+  bsig(&mut c, "sbytes_load", AV_HOSTED, 3, rsbt, u, u, 0, u);
+  bsig(&mut c, "sbytes_store", AV_HOSTED, 4, rsbt, u, u, u, un);
+  bsig(&mut c, "sbytes_get", AV_HOSTED, 3, rsbt, u, u, 0, u);
+  bsig(&mut c, "sbytes_set", AV_HOSTED, 4, rsbt, u, u, u, un);
+  bsig5(&mut c, "sbytes_rmw", AV_HOSTED, rsbt, u, u, u, u, u);
+  bsig5(&mut c, "sbytes_cas", AV_HOSTED, rsbt, u, u, u, u, u);
+  bsig5(&mut c, "sbytes_wait", AV_HOSTED, rsbt, u, u, u, u, u);
+  bsig(&mut c, "sbytes_notify", AV_HOSTED, 3, rsbt, u, u, 0, u);
+  bsig5(&mut c, "sbytes_read", AV_HOSTED, rsbt, u, mbyt, u, u, un);
+  bsig5(&mut c, "sbytes_write", AV_HOSTED, rsbt, u, rbyt, u, u, un);
   bsig(&mut c, "child_write", AV_HOSTED, 2, mchd, rbyt, 0, 0, b);
   bsig(&mut c, "child_close", AV_HOSTED, 1, mchd, 0, 0, 0, un);
   bsig(&mut c, "child_read_line", AV_HOSTED, 2, mchd, mbyt, 0, 0, b);
@@ -440,6 +458,7 @@ fn checker_new(m: &mut Mono, p: &Parser, target: u64) -> Checker {
   ghost(&mut c, "mmio_len", mio, false, u);
   ghost(&mut c, "mmio_free", msp, true, b);
   ghost(&mut c, "dma_id", dma, false, u);
+  ghost(&mut c, "sbytes_len", sbt, false, u);
   field_types(&mut c, &mut m, p);
   return c;
 }
@@ -632,7 +651,7 @@ fn def_node(m: &Mono, p: &Parser, x: u64) -> Node {
 /// Is a value of type `t` linear (must it be consumed exactly once)?
 fn ck_linear(c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
   let k = kind_t(m, t);
-  if (k >= TY_BUF && k <= TY_DMA) || k == TY_LEASE || k == TY_SHARED || k == TY_DIRTY || k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_ATOMIC {
+  if (k >= TY_BUF && k <= TY_DMA) || k == TY_LEASE || k == TY_SHARED || k == TY_DIRTY || k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_ATOMIC || k == TY_THREAD || k == TY_SBYTES {
     return true;
   }
   if k == TY_STRUCT || k == TY_ENUM {
@@ -658,7 +677,7 @@ fn is_pinned(c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
   if k == TY_MMU || k == TY_CPU || k == TY_LEASE {
     return true;
   }
-  if k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_ATOMIC || k == TY_REF || k == TY_MUTREF {
+  if k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_ATOMIC || k == TY_THREAD || k == TY_REF || k == TY_MUTREF {
     return is_pinned(c, m, p, inner_t(m, t));
   }
   if k == TY_STRUCT || k == TY_ENUM {
@@ -777,12 +796,14 @@ fn tyn_to(out: &mut Vec[u64], m: &Mono, p: &Parser, t: u64) {
   else if k == TY_LEASE { w_s(&mut out, "Lease"); }
   else if k == TY_SHARED { w_s(&mut out, "Shared"); }
   else if k == TY_DIRTY { w_s(&mut out, "Dirty"); }
+  else if k == TY_SBYTES { w_s(&mut out, "SharedBytes"); }
   else if k == TY_STRUCT || k == TY_ENUM { tyn_inst_to(&mut out, m, p, x.a); }
   else if k == TY_UNKNOWN { tyn_name(&mut out, p, x.a); }
   else if k == TY_BOX { w_s(&mut out, "Box["); tyn_to(&mut out, m, p, x.a); w_s(&mut out, "]"); }
   else if k == TY_VEC { w_s(&mut out, "Vec["); tyn_to(&mut out, m, p, x.a); w_s(&mut out, "]"); }
   else if k == TY_LOCK { w_s(&mut out, "Lock["); tyn_to(&mut out, m, p, x.a); w_s(&mut out, "]"); }
   else if k == TY_ATOMIC { w_s(&mut out, "Atomic["); tyn_to(&mut out, m, p, x.a); w_s(&mut out, "]"); }
+  else if k == TY_THREAD { w_s(&mut out, "Thread["); tyn_to(&mut out, m, p, x.a); w_s(&mut out, "]"); }
   else if k == TY_REF { w_s(&mut out, "&"); tyn_to(&mut out, m, p, x.a); }
   else if k == TY_MUTREF { w_s(&mut out, "&mut "); tyn_to(&mut out, m, p, x.a); }
 }
@@ -1148,8 +1169,13 @@ fn is_code_builtin(p: &Parser, s: u64, e: u64) -> bool {
     || span_is(p, s, e, "code_field");
 }
 
+/// The builtins that start a thread and wait for it (stage1, hosted).
+fn is_thread_builtin(p: &Parser, s: u64, e: u64) -> bool {
+  return span_is(p, s, e, "thread_spawn") || span_is(p, s, e, "thread_join");
+}
+
 fn is_builtin_name(c: &Checker, p: &Parser, s: u64, e: u64) -> bool {
-  return span_is(p, s, e, "box") || span_is(p, s, e, "try_box") || span_is(p, s, e, "unbox") || span_is(p, s, e, "cast") || span_is(p, s, e, "wrap")
+  return is_thread_builtin(p, s, e) || span_is(p, s, e, "box") || span_is(p, s, e, "try_box") || span_is(p, s, e, "unbox") || span_is(p, s, e, "cast") || span_is(p, s, e, "wrap")
     || span_is(p, s, e, "smp_run") || span_is(p, s, e, "stencil") || span_is(p, s, e, "code_call") || is_pt_borrow_builtin(p, s, e) || is_lock_builtin(p, s, e) || is_atomic_builtin(p, s, e)
     || is_vec_builtin(p, s, e) || is_wrap_builtin(p, s, e) || bs_index(c, p, s, e) != 0;
 }
@@ -1858,7 +1884,7 @@ fn known_type(c: &mut Checker, m: &Mono, p: &Parser, t: u64, loc: u64) {
   let k = kind_t(m, t);
   if k == TY_UNKNOWN {
     cm_unknown_type(&mut c, m, p, loc, t);
-  } else if k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_ATOMIC || k == TY_REF || k == TY_MUTREF {
+  } else if k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_ATOMIC || k == TY_THREAD || k == TY_REF || k == TY_MUTREF {
     known_type(&mut c, m, p, inner_t(m, t), loc);
   }
 }
@@ -1874,7 +1900,8 @@ fn is_reserved_type(p: &Parser, s: u64, e: u64) -> bool {
     || span_is(p, s, e, "PageTable") || span_is(p, s, e, "Pool") || span_is(p, s, e, "Mmu")
     || span_is(p, s, e, "Cpu") || span_is(p, s, e, "Ports") || span_is(p, s, e, "PortIo")
     || span_is(p, s, e, "MmioSpace") || span_is(p, s, e, "Mmio") || span_is(p, s, e, "Dma")
-    || span_is(p, s, e, "Lease") || span_is(p, s, e, "Shared") || span_is(p, s, e, "Dirty") || span_is(p, s, e, "Lock") || span_is(p, s, e, "Atomic");
+    || span_is(p, s, e, "Lease") || span_is(p, s, e, "Shared") || span_is(p, s, e, "Dirty") || span_is(p, s, e, "Lock") || span_is(p, s, e, "Atomic")
+    || span_is(p, s, e, "Thread") || span_is(p, s, e, "SharedBytes");
 }
 
 /// Struct and enum instances: no reserved names, known field and payload
@@ -1898,7 +1925,7 @@ fn check_structs(c: &mut Checker, m: &Mono, p: &Parser) {
     let mut j = 0;
     while j < n {
       let mut u = fld_ty(c, x, j);
-      while kind_t(m, u) == TY_BOX || kind_t(m, u) == TY_VEC || kind_t(m, u) == TY_LOCK || kind_t(m, u) == TY_ATOMIC {
+      while kind_t(m, u) == TY_BOX || kind_t(m, u) == TY_VEC || kind_t(m, u) == TY_LOCK || kind_t(m, u) == TY_ATOMIC || kind_t(m, u) == TY_THREAD {
         u = inner_t(m, u);
       }
       if u != 0 && kind_t(m, u) == TY_UNKNOWN {
@@ -3907,6 +3934,9 @@ fn ck_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
   if span_is(p, s, e, "smp_run") {
     return smp_run_call(&mut c, &mut m, p, i);
   }
+  if is_thread_builtin(p, s, e) {
+    return thread_call(&mut c, &mut m, p, i);
+  }
   if is_pt_borrow_builtin(p, s, e) {
     return pt_borrow_call(&mut c, &mut m, p, i);
   }
@@ -4314,6 +4344,98 @@ fn smp_run_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
   return t;
 }
 
+/// `thread_spawn(f, args..)` (hosted, stage1 only): runs `f(args..)` on a
+/// new thread and returns a `Thread[R]` for it, `R` being what `f` returns.
+/// Every argument is moved in: `f` takes no borrows, since the thread may
+/// outlive every variable of the caller. `thread_join(t)` waits for the
+/// thread and gives back `f`'s result; a `Thread` is linear, so every thread
+/// is joined and whatever it owns comes back.
+fn thread_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
+  if c.target != TARGET_HOSTED {
+    if cm_new(&mut c, p, i, C_TARGET) {
+      cm_s(&mut c, "`");
+      cm_name(&mut c, p, i);
+      cm_s(&mut c, "` is not available on this target");
+    }
+    return 0;
+  }
+  let n = node_at(p.nodes, i);
+  let a0 = n.a;
+  if name_is(p, i, "thread_join") {
+    if list_len(p, a0) != 1 {
+      cm_arity(&mut c, p, i, 1);
+      return 0;
+    }
+    let t = ck_expr(&mut c, &mut m, p, a0);
+    if c.failed {
+      return 0;
+    }
+    if kind_t(m, t) != TY_THREAD {
+      cm_needs(&mut c, m, p, a0, "`thread_join` needs a Thread, found ", t);
+      return 0;
+    }
+    return inner_t(m, t);
+  }
+  let x = named_fn(&mut c, &mut m, p, i, a0);
+  if c.failed {
+    return 0;
+  }
+  note_call(&mut c, x);
+  let xi = inst_at(m, x);
+  let ps = fn_params(&mut m, p, xi.def, x);
+  let dn = node_at(p.nodes, xi.def);
+  let r = conv(&mut m, p, dn.b, x, xi.def);
+  let mut j = 0;
+  while j < vec_len(ps) {
+    let t = vec_get(ps, j);
+    let k = kind_t(m, t);
+    if k == TY_REF || k == TY_MUTREF {
+      vec_free(ps);
+      if cm_new(&mut c, p, a0, C_TYPE) {
+        cm_s(&mut c, "`");
+        cm_inst(&mut c, m, p, x);
+        cm_s(&mut c, "` cannot run on a thread of its own: its parameter of type ");
+        cm_ty(&mut c, m, p, t);
+        cm_s(&mut c, " is a borrow");
+        cm_note(&mut c, "a thread may outlive the caller's variables, so `thread_spawn` moves every argument in; share what threads read through a `SharedBytes`, or pass it in and get it back from `thread_join`");
+      }
+      return 0;
+    }
+    if is_pinned(c, m, p, t) {
+      vec_free(ps);
+      if cm_new(&mut c, p, a0, C_PIN) {
+        cm_s(&mut c, "a ");
+        cm_ty(&mut c, m, p, t);
+        cm_s(&mut c, " cannot be moved to another thread: it holds a capability of this processor");
+      }
+      return 0;
+    }
+    j = j + 1;
+  }
+  if is_pinned(c, m, p, r) {
+    vec_free(ps);
+    if cm_new(&mut c, p, a0, C_PIN) {
+      cm_s(&mut c, "a ");
+      cm_ty(&mut c, m, p, r);
+      cm_s(&mut c, " cannot come back from another thread: it holds a capability of that processor");
+    }
+    return 0;
+  }
+  let mut args = vec_new[u64]();
+  let mut a = next_of(p, a0);
+  while a != 0 {
+    vec_push(&mut args, a);
+    a = next_of(p, a);
+  }
+  let t = call_with_v(&mut c, &mut m, p, ps, r, args, i, x);
+  vec_free(ps);
+  vec_free(args);
+  if c.failed {
+    return 0;
+  }
+  return intern(&mut m, p, TY_THREAD, r);
+}
+
 /// `stencil(f)` (hosted, stage1 only): f's number in the program's stencil
 /// table, the functions machine code built by `code_build` may call. Each
 /// must be `fn(ctx: &mut T, a: u64, b: u64, c: u64, d: u64) -> u64` for one
@@ -4394,11 +4516,19 @@ fn cf_at(c: &Checker, k: u64) -> u64 {
   return 0;
 }
 
-/// `code_field(name)` (hosted, stage1 only): the number of the `Vec[u64]`
-/// field `name` of the stencils' context struct in the table machine code
-/// reads and writes through (plan items `LOAD` and `STORE`). The struct is
-/// known from the program's stencils and `code_call`s, so the field is checked
-/// once all the functions have been.
+/// Words in one `code_field` record: name start, end and call node of the
+/// path, then the same for the member (0 without one), the element struct
+/// instance (0 for `Vec[u64]`), and the kind: 0 a `Vec[u64]`, 1 a `Vec[S]`, 2 a
+/// `Vec[u64]` member of `S`, 3 a scalar member of `S`.
+const CF_W: u64 = 7;
+
+/// `code_field(path)` or `code_field(path, member)` (hosted, stage1 only): the
+/// number, in the table machine code reads and writes through, of the
+/// `Vec[u64]` or `Vec[S]` field `path` of the stencils' context struct (`path`
+/// is a field, or `a.b` through struct fields), with `member` naming a scalar
+/// (`bool` or an unsigned integer) or a `Vec[u64]` field of the struct `S` of
+/// its elements. The struct is known from the program's stencils and
+/// `code_call`s, so the field is checked once all the functions have been.
 fn code_field_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
   if c.target != TARGET_HOSTED {
     if cm_new(&mut c, p, i, C_TARGET) {
@@ -4407,35 +4537,115 @@ fn code_field_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
     return 0;
   }
   let n = node_at(p.nodes, i);
-  if list_len(p, n.a) != 1 {
+  let na = list_len(p, n.a);
+  if na != 1 && na != 2 {
     cm_arity(&mut c, p, i, 1);
     return 0;
   }
   let an = node_at(p.nodes, n.a);
-  if an.kind != E_VAR || an.next != 0 {
+  let mut ps = 0;
+  let mut ok = cf_is_path(p, n.a);
+  if ok {
+    ps = cf_path_start(p, n.a);
+  }
+  let mut ms = 0;
+  let mut me = 0;
+  if ok && na == 2 {
+    let mn = node_at(p.nodes, an.next);
+    if mn.kind != E_VAR {
+      ok = false;
+    } else {
+      ms = mn.s;
+      me = mn.e;
+    }
+  }
+  if !ok {
     if cm_new(&mut c, p, n.a, C_TYPE) {
-      cm_s(&mut c, "write the name of a field of the stencils' context struct: `code_field(regs)`");
+      cm_s(&mut c, "write the path of a field of the stencils' context struct, then optionally a member: `code_field(regs)`, `code_field(h.objs, props)`");
     }
     return 0;
   }
   let mut k = 0;
-  while k < vec_len(c.code_fields) && !same(p.src, cf_at(c, k), cf_at(c, k + 1), an.s, an.e) {
-    k = k + 3;
+  while k < vec_len(c.code_fields) && !cf_same(c, p, k, ps, an.e, ms, me) {
+    k = k + CF_W;
   }
   if k == vec_len(c.code_fields) {
-    vec_push(&mut c.code_fields, an.s);
+    vec_push(&mut c.code_fields, ps);
     vec_push(&mut c.code_fields, an.e);
     vec_push(&mut c.code_fields, i);
+    vec_push(&mut c.code_fields, ms);
+    vec_push(&mut c.code_fields, me);
+    vec_push(&mut c.code_fields, 0);
+    vec_push(&mut c.code_fields, 0);
   }
   return c.tu64;
 }
 
-/// Checks the fields `code_field` named against the context struct.
+/// Is node `i` a variable, or fields of one (`a.b.c`)?
+fn cf_is_path(p: &Parser, i: u64) -> bool {
+  let n = node_at(p.nodes, i);
+  if n.kind == E_VAR {
+    return true;
+  }
+  if n.kind == E_FIELD {
+    return cf_is_path(p, n.a);
+  }
+  return false;
+}
+
+/// Where the source of path node `i` starts (the variable's name).
+fn cf_path_start(p: &Parser, i: u64) -> u64 {
+  let n = node_at(p.nodes, i);
+  if n.kind == E_FIELD {
+    return cf_path_start(p, n.a);
+  }
+  return n.s;
+}
+
+/// Does record `k` name the same path (`ps..pe`) and member (`ms..me`)?
+fn cf_same(c: &Checker, p: &Parser, k: u64, ps: u64, pe: u64, ms: u64, me: u64) -> bool {
+  if !same(p.src, cf_at(c, k), cf_at(c, wrap_add(k, 1)), ps, pe) {
+    return false;
+  }
+  if (cf_at(c, wrap_add(k, 3)) == 0) != (ms == 0) {
+    return false;
+  }
+  return ms == 0 || same(p.src, cf_at(c, wrap_add(k, 3)), cf_at(c, wrap_add(k, 4)), ms, me);
+}
+
+/// The type of field `s..e` of struct type `st`, or 0.
+fn cf_field_ty(c: &Checker, m: &Mono, p: &Parser, st: u64, s: u64, e: u64) -> u64 {
+  if kind_t(m, st) != TY_STRUCT {
+    return 0;
+  }
+  let x = inner_t(m, st);
+  let dn = def_node(m, p, x);
+  let j = index_in(p, dn.a, s, e);
+  if j == 0 {
+    return 0;
+  }
+  return fld_ty(c, x, j - 1);
+}
+
+/// The type of the path `i` (a variable, or fields of one) from the context
+/// struct `ctx`, or 0.
+fn cf_path_ty(c: &Checker, m: &Mono, p: &Parser, ctx: u64, i: u64) -> u64 {
+  let n = node_at(p.nodes, i);
+  if n.kind == E_VAR {
+    return cf_field_ty(c, m, p, ctx, n.s, n.e);
+  }
+  let b = cf_path_ty(c, m, p, ctx, n.a);
+  if b == 0 {
+    return 0;
+  }
+  return cf_field_ty(c, m, p, b, n.s, n.e);
+}
+
+/// Checks the fields `code_field` named against the context struct, and
+/// records each one's element struct and kind.
 fn check_code_fields(c: &mut Checker, m: &mut Mono, p: &Parser) {
   let mut k = 0;
   while k < vec_len(c.code_fields) && !c.failed {
-    let s = cf_at(c, k);
-    let e = cf_at(c, k + 1);
     let loc = cf_at(c, k + 2);
     if c.stencil_ctx == 0 {
       if cm_new(&mut c, p, loc, C_TYPE) {
@@ -4443,18 +4653,46 @@ fn check_code_fields(c: &mut Checker, m: &mut Mono, p: &Parser) {
       }
       return;
     }
-    let x = inner_t(m, c.stencil_ctx);
-    let dn = def_node(m, p, x);
-    let j = index_in(p, dn.a, s, e);
-    let vu = intern(&mut m, p, TY_VEC, c.tu64);
-    if j == 0 || fld_ty(c, x, j - 1) != vu {
+    let call = node_at(p.nodes, loc);
+    let t = cf_path_ty(c, m, p, c.stencil_ctx, call.a);
+    let mut kind = 9;
+    let mut einst = 0;
+    if t != 0 && kind_t(m, t) == TY_VEC {
+      let et = inner_t(m, t);
+      if cf_at(c, k + 3) == 0 {
+        if et == c.tu64 {
+          kind = 0;
+        } else if kind_t(m, et) == TY_STRUCT {
+          kind = 1;
+          einst = inner_t(m, et);
+        }
+      } else if kind_t(m, et) == TY_STRUCT {
+        einst = inner_t(m, et);
+        let mt = cf_field_ty(c, m, p, et, cf_at(c, k + 3), cf_at(c, k + 4));
+        let vu = intern(&mut m, p, TY_VEC, c.tu64);
+        if mt != 0 && mt == vu {
+          kind = 2;
+        } else if mt != 0 {
+          let mk = kind_t(m, mt);
+          if mk == TY_U8 || mk == TY_U16 || mk == TY_U32 || mk == TY_U64 || mk == TY_BOOL {
+            kind = 3;
+          }
+        }
+      }
+    }
+    if kind == 9 {
       if cm_new(&mut c, p, loc, C_TYPE) {
-        cm_s(&mut c, "`code_field` names a field of type `Vec[u64]` of ");
+        cm_s(&mut c, "`code_field` names a field of type `Vec[u64]` or `Vec[S]` of ");
         cm_ty(&mut c, m, p, c.stencil_ctx);
+        cm_s(&mut c, ", with a `bool`, unsigned integer or `Vec[u64]` member of the struct `S` if it has a second argument");
       }
       return;
     }
-    k = k + 3;
+    if k + 6 < vec_len(c.code_fields) {
+      vec_set(&mut c.code_fields, k + 5, einst);
+      vec_set(&mut c.code_fields, k + 6, kind);
+    }
+    k = k + CF_W;
   }
 }
 

@@ -1,0 +1,245 @@
+// stage1-only: struct elements and nested paths in code_field, and the object items of plans
+// backend: c
+// expect-exit: 0
+// Machine code reads and writes the members of the elements of a `Vec[Obj]`
+// (reached through a nested path, `h.objs`), reads and writes the `Vec[u64]`
+// member `props` of an element, and takes lengths; every element index and
+// every inner index is compared against the live length, and a failed
+// comparison leaves through the plan's label. Where there is no machine code
+// (code_build gives 0) it checks only that.
+struct Obj { live: bool, flags: u8, w: u16, shape: u32, id: u64, props: Vec[u64] }
+struct Heap { objs: Vec[Obj], out: Vec[u64] }
+struct Vm { h: Heap }
+
+fn op_nop(vm: &mut Vm, a: u64, b: u64, c: u64, d: u64) -> u64 {
+  return a;
+}
+
+fn push6(p: &mut Vec[u64], a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, n: u64) {
+  vec_push(&mut p, a);
+  if n > 1 { vec_push(&mut p, b); }
+  if n > 2 { vec_push(&mut p, c); }
+  if n > 3 { vec_push(&mut p, d); }
+  if n > 4 { vec_push(&mut p, e); }
+  if n > 5 { vec_push(&mut p, f); }
+}
+
+fn i_const(p: &mut Vec[u64], d: u64, x: u64) { push6(&mut p, 8, d, x, 0, 0, 0, 3); }
+fn i_store(p: &mut Vec[u64], f: u64, b: u64, i: u64, s: u64, l: u64) { push6(&mut p, 18, f, b, i, s, l, 6); }
+fn i_load(p: &mut Vec[u64], d: u64, f: u64, b: u64, i: u64, l: u64) { push6(&mut p, 17, d, f, b, i, l, 6); }
+fn i_ret(p: &mut Vec[u64]) { push6(&mut p, 5, 0, 0, 0, 0, 0, 1); }
+fn i_loadf(p: &mut Vec[u64], d: u64, f: u64, i: u64, l: u64) { push6(&mut p, 23, d, f, i, l, 0, 5); }
+fn i_storef(p: &mut Vec[u64], f: u64, i: u64, s: u64, l: u64) { push6(&mut p, 24, f, i, s, l, 0, 5); }
+fn i_loadin(p: &mut Vec[u64], d: u64, f: u64, i: u64, j: u64, l: u64) { push6(&mut p, 25, d, f, i, j, l, 6); }
+fn i_storein(p: &mut Vec[u64], f: u64, i: u64, j: u64, s: u64, l: u64) { push6(&mut p, 26, f, i, j, s, l, 6); }
+fn i_len(p: &mut Vec[u64], d: u64, f: u64) { push6(&mut p, 27, d, f, 0, 0, 0, 3); }
+fn i_lenin(p: &mut Vec[u64], d: u64, f: u64, i: u64, l: u64) { push6(&mut p, 28, d, f, i, l, 0, 5); }
+
+fn start(p: &mut Vec[u64]) {
+  push6(&mut p, 7, 3, 0, 0, 0, 0, 2);
+  i_ret(&mut p);
+}
+
+// Stores r[s] at index `ix` of the out vector; an index out of range leaves the code.
+fn out(p: &mut Vec[u64], f: u64, ix: u64, s: u64) {
+  i_const(&mut p, 14, 0);
+  i_const(&mut p, 15, ix);
+  i_store(&mut p, f, 14, 15, s, 2);
+}
+
+fn patch(p: &mut Vec[u64], at: u64, v: u64) {
+  if at < vec_len(p) {
+    vec_set(&mut p, at, v);
+  }
+}
+
+fn got(vm: &Vm, k: u64) -> u64 {
+  if k < vec_len(vm.h.out) {
+    return vec_get(vm.h.out, k);
+  }
+  return 0;
+}
+
+fn add_obj(vm: &mut Vm, live: bool, flags: u8, w: u16, shape: u32, id: u64, n: u64) {
+  let mut props = vec_new[u64]();
+  let mut k = 0;
+  while k < n {
+    vec_push(&mut props, wrap_add(wrap_mul(id, 100), k));
+    k = k + 1;
+  }
+  vec_push(&mut vm.h.objs, Obj { live: live, flags: flags, w: w, shape: shape, id: id, props: props });
+}
+
+fn main(host: &mut Host) -> u64 {
+  let mut vm = Vm { h: Heap { objs: vec_new[Obj](), out: vec_new[u64]() } };
+  add_obj(&mut vm, true, 7, 513, 4000000000, 1, 3);
+  add_obj(&mut vm, false, 255, 65535, 12345, 2, 5);
+  add_obj(&mut vm, true, 0, 1, 1, 3, 0);
+  let mut k = 0;
+  while k < 24 {
+    vec_push(&mut vm.h.out, 0);
+    k = k + 1;
+  }
+  let objs = code_field(h.objs);
+  let live = code_field(h.objs, live);
+  let flags = code_field(h.objs, flags);
+  let w = code_field(h.objs, w);
+  let shape = code_field(h.objs, shape);
+  let id = code_field(h.objs, id);
+  let props = code_field(h.objs, props);
+  let o = code_field(h.out);
+  let nop = stencil(op_nop);
+
+  let mut c = vec_new[u64]();
+  start(&mut c);
+  i_const(&mut c, 0, 1);                        // the element
+  i_loadf(&mut c, 1, live, 0, 2);
+  out(&mut c, o, 0, 1);                         // 0: live of obj 1 = false
+  i_loadf(&mut c, 1, flags, 0, 2);
+  out(&mut c, o, 1, 1);                         // 1: 255
+  i_loadf(&mut c, 1, w, 0, 2);
+  out(&mut c, o, 2, 1);                         // 2: 65535
+  i_loadf(&mut c, 1, shape, 0, 2);
+  out(&mut c, o, 3, 1);                         // 3: 12345
+  i_loadf(&mut c, 1, id, 0, 2);
+  out(&mut c, o, 4, 1);                         // 4: 2
+  i_const(&mut c, 2, 4);
+  i_loadin(&mut c, 1, props, 0, 2, 2);
+  out(&mut c, o, 5, 1);                         // 5: props[4] of obj 1 = 204
+  i_lenin(&mut c, 1, props, 0, 2);
+  out(&mut c, o, 6, 1);                         // 6: 5
+  i_len(&mut c, 1, objs);
+  out(&mut c, o, 7, 1);                         // 7: 3
+  i_len(&mut c, 1, o);
+  out(&mut c, o, 8, 1);                         // 8: 24
+  // Writes: obj 2 shape, flags, w, live; obj 0 props[1].
+  i_const(&mut c, 3, 2);
+  i_const(&mut c, 4, 4294967295);
+  i_storef(&mut c, shape, 3, 4, 2);
+  i_const(&mut c, 4, 200);
+  i_storef(&mut c, flags, 3, 4, 2);
+  i_const(&mut c, 4, 4660);
+  i_storef(&mut c, w, 3, 4, 2);
+  i_const(&mut c, 4, 1);
+  i_storef(&mut c, live, 3, 4, 2);
+  i_const(&mut c, 5, 0);
+  i_const(&mut c, 6, 1);
+  i_const(&mut c, 4, 777);
+  i_storein(&mut c, props, 5, 6, 4, 2);
+  // Out of range: element 3 of 3, then props index 5 of 5 and 3 of 3: each
+  // leaves the code before the 9999 is stored.
+  i_const(&mut c, 7, 9);
+  i_const(&mut c, 8, 9999);
+  i_const(&mut c, 3, 3);
+  i_loadf(&mut c, 7, shape, 3, 0);
+  let oob1 = wrap_sub(vec_len(c), 1);
+  out(&mut c, o, 9, 8);                         // not reached
+  patch(&mut c, oob1, vec_len(c));
+  out(&mut c, o, 9, 7);                         // 9: 9, the load left it alone
+  i_const(&mut c, 7, 11);
+  i_const(&mut c, 5, 1);
+  i_const(&mut c, 6, 5);
+  i_loadin(&mut c, 7, props, 5, 6, 0);
+  let oob2 = wrap_sub(vec_len(c), 1);
+  out(&mut c, o, 10, 8);                        // not reached
+  patch(&mut c, oob2, vec_len(c));
+  out(&mut c, o, 10, 7);                        // 10: 11
+  i_const(&mut c, 7, 12);
+  i_const(&mut c, 5, 2);
+  i_const(&mut c, 6, 0);
+  i_storein(&mut c, props, 5, 6, 8, 0);         // obj 2 has no props
+  let oob3 = wrap_sub(vec_len(c), 1);
+  out(&mut c, o, 11, 8);                        // not reached
+  patch(&mut c, oob3, vec_len(c));
+  out(&mut c, o, 11, 7);                        // 11: 12
+  i_const(&mut c, 7, 13);
+  i_lenin(&mut c, 7, props, 3, 0);
+  let oob4 = wrap_sub(vec_len(c), 1);
+  out(&mut c, o, 12, 8);                        // not reached
+  patch(&mut c, oob4, vec_len(c));
+  out(&mut c, o, 12, 7);                        // 12: 13
+  i_storef(&mut c, id, 3, 8, 0);
+  let oob5 = wrap_sub(vec_len(c), 1);
+  out(&mut c, o, 13, 8);                        // not reached
+  patch(&mut c, oob5, vec_len(c));
+  i_ret(&mut c);
+  let code = code_build(host, c);
+  vec_free(c);
+  let mut r = 0;
+  if code != 0 {
+    r = code_call(code, &mut vm, 0);
+    code_free(host, code);
+  }
+  let code_works = code != 0;
+  // An item on a field of the wrong kind is no plan: LOAD needs a `Vec[u64]`,
+  // LOADF a scalar member, LOADIN a `Vec[u64]` member.
+  let mut bad = 0;
+  if code_works {
+    let mut b1 = vec_new[u64]();
+    start(&mut b1);
+    i_load(&mut b1, 0, objs, 1, 2, 0);
+    bad = wrap_add(bad, code_build(host, b1));
+    vec_free(b1);
+    let mut b2 = vec_new[u64]();
+    start(&mut b2);
+    i_loadf(&mut b2, 0, props, 1, 0);
+    bad = wrap_add(bad, code_build(host, b2));
+    vec_free(b2);
+    let mut b3 = vec_new[u64]();
+    start(&mut b3);
+    i_loadin(&mut b3, 0, shape, 1, 2, 0);
+    bad = wrap_add(bad, code_build(host, b3));
+    vec_free(b3);
+  }
+  let g0 = got(vm, 0);
+  let g1 = got(vm, 1);
+  let g2 = got(vm, 2);
+  let g3 = got(vm, 3);
+  let g4 = got(vm, 4);
+  let g5 = got(vm, 5);
+  let g6 = got(vm, 6);
+  let g7 = got(vm, 7);
+  let g8 = got(vm, 8);
+  let g9 = got(vm, 9);
+  let g10 = got(vm, 10);
+  let g11 = got(vm, 11);
+  let g12 = got(vm, 12);
+  let g13 = got(vm, 13);
+  vec_free(vm.h.out);
+  // Pop the objects to read what the code wrote and to free them.
+  let mut sh2 = 0;
+  let mut fl2 = 0;
+  let mut w2 = 0;
+  let mut lv2 = false;
+  let mut id2 = 0;
+  let mut p01 = 0;
+  while vec_len(vm.h.objs) > 0 {
+    let ob = vec_pop(&mut vm.h.objs);
+    let at = vec_len(vm.h.objs);
+    if at == 2 {
+      sh2 = cast[u64](ob.shape);
+      fl2 = cast[u64](ob.flags);
+      w2 = cast[u64](ob.w);
+      lv2 = ob.live;
+      id2 = ob.id;
+    }
+    if at == 0 && vec_len(ob.props) > 1 {
+      p01 = vec_get(ob.props, 1);
+    }
+    vec_free(ob.props);
+  }
+  vec_free(vm.h.objs);
+  if !code_works {
+    return 0;
+  }
+  // The number of the first check that fails is the exit code.
+  if g0 != 0 { return 1; }
+  if g1 != 255 || g2 != 65535 || g3 != 12345 || g4 != 2 { return 2; }
+  if g5 != 204 || g6 != 5 || g7 != 3 || g8 != 24 { return 3; }
+  if sh2 != 4294967295 || fl2 != 200 || w2 != 4660 || !lv2 { return 4; }
+  if p01 != 777 { return 5; }
+  if g9 != 9 || g10 != 11 || g11 != 12 || g12 != 13 || g13 != 0 { return 6; }
+  if id2 != 3 || r != 0 { return 7; }
+  if bad != 0 { return 8; }
+  return 0;
+}

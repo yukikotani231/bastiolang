@@ -1,0 +1,42 @@
+// stage1-only: host_net operation 17 (the local and remote address of a socket)
+// expect-exit: 0
+// On a loopback connection the client's remote address is the listener's
+// (127.0.0.1, its port) and the accepted socket's remote port is the client's
+// local port. Targets without operation 17 (only the Linux C backend has it)
+// answer 2^64 - 1 and the program passes without checking.
+fn main(h: &mut Host) -> u64 {
+  let none_ok = 18446744073709551615;
+  let mut none = balloc(0);
+  let lo = 2130706433;
+  let srv = host_net(h, 0, lo, 0, &mut none);
+  if srv == none_ok {
+    bfree(none);
+    return 1;
+  }
+  let port = host_net(h, 6, srv, 0, &mut none);
+  let cli = host_net(h, 2, lo, port, &mut none);
+  let conn = host_net(h, 1, srv, 0, &mut none);
+  let mut bad = 0;
+  if port == 0 || port == none_ok || cli == none_ok || conn == none_ok {
+    bad = bad + 1;
+  } else {
+    let mut a = balloc(0);
+    let remote = host_net(h, 17, cli, 1, &mut a);
+    if remote != none_ok {
+      if remote % 65536 != port || remote / 65536 != 4 || blen(a) != 4 || bget(a, 0) != 127 || bget(a, 3) != 1 {
+        bad = bad + 1;
+      }
+      let local = host_net(h, 17, cli, 0, &mut a);
+      let peer = host_net(h, 17, conn, 1, &mut a);
+      if local == none_ok || peer == none_ok || local % 65536 != peer % 65536 || local % 65536 == port {
+        bad = bad + 1;
+      }
+    }
+    bfree(a);
+  }
+  host_net(h, 5, cli, 0, &mut none);
+  host_net(h, 5, conn, 0, &mut none);
+  host_net(h, 5, srv, 0, &mut none);
+  bfree(none);
+  return bad;
+}

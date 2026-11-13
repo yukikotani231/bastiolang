@@ -291,10 +291,12 @@ fn cg_tyname(g: &mut Cg, m: &Mono, p: &Parser, t: u64, mode: u64) {
   else if k == TY_LEASE { cg_tn(&mut g, "Lease", mode); }
   else if k == TY_SHARED { cg_tn(&mut g, "Shared", mode); }
   else if k == TY_DIRTY { cg_tn(&mut g, "Dirty", mode); }
+  else if k == TY_SBYTES { cg_tn(&mut g, "SharedBytes", mode); }
   else if k == TY_STRUCT || k == TY_ENUM { cg_instname(&mut g, m, p, x.a, mode); }
   else if k == TY_BOX { cg_tn(&mut g, "Box[", mode); cg_tyname(&mut g, m, p, x.a, mode); cg_tn(&mut g, "]", mode); }
   else if k == TY_VEC { cg_tn(&mut g, "Vec[", mode); cg_tyname(&mut g, m, p, x.a, mode); cg_tn(&mut g, "]", mode); }
   else if k == TY_LOCK { cg_tn(&mut g, "Lock[", mode); cg_tyname(&mut g, m, p, x.a, mode); cg_tn(&mut g, "]", mode); }
+  else if k == TY_THREAD { cg_tn(&mut g, "Thread[", mode); cg_tyname(&mut g, m, p, x.a, mode); cg_tn(&mut g, "]", mode); }
   else if k == TY_ATOMIC { cg_tn(&mut g, "Atomic[", mode); cg_tyname(&mut g, m, p, x.a, mode); cg_tn(&mut g, "]", mode); }
   else if k == TY_REF { cg_tn(&mut g, "&", mode); cg_tyname(&mut g, m, p, x.a, mode); }
   else if k == TY_MUTREF { cg_tn(&mut g, "&mut ", mode); cg_tyname(&mut g, m, p, x.a, mode); }
@@ -354,6 +356,10 @@ fn cg_cty(g: &mut Cg, m: &Mono, p: &Parser, t: u64) {
   else if k == TY_LEASE { cg_t(&mut g, "bst_lease"); }
   else if k == TY_SHARED { cg_t(&mut g, "bst_frame"); }
   else if k == TY_DIRTY { cg_t(&mut g, "bst_frame"); }
+  // A handle: the block holding the count of handles, the length and the bytes.
+  else if k == TY_SBYTES { cg_t(&mut g, "struct bst_shb *"); }
+  // The thread block: its pthread_t, the result, then the arguments.
+  else if k == TY_THREAD { cg_t(&mut g, "void *"); }
   else if k == TY_STRUCT { cg_t(&mut g, "bst_s_"); cg_instname(&mut g, m, p, x.a, CG_CID); }
   else if k == TY_ENUM { cg_t(&mut g, "bst_e_"); cg_instname(&mut g, m, p, x.a, CG_CID); }
   else if k == TY_BOX { cg_cty(&mut g, m, p, x.a); cg_t(&mut g, " *"); }
@@ -662,6 +668,16 @@ fn cg_type_of(g: &Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) 
       }
       if name_is(p, i, "smp_run") {
         return c.tunit;
+      }
+      if name_is(p, i, "thread_spawn") {
+        let fnode = node_at(p.nodes, a0);
+        let x = plain_inst(&mut m, plain_fn(p, fnode.s, fnode.e));
+        let r = cg_ret_ty(&mut m, p, x);
+        return intern(&mut m, p, TY_THREAD, r);
+      }
+      if name_is(p, i, "thread_join") {
+        let t = cg_type_of(g, c, &mut m, p, a0, 0);
+        return inner_t(m, t);
       }
       if is_pt_borrow_builtin(p, n.s, n.e) {
         let fnode = node_at(p.nodes, cg_arg(p, i, 2));
@@ -1243,6 +1259,12 @@ fn cg_call(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64)
     }
     if name_is(p, i, "smp_run") {
       return cg_smp_run(&mut g, c, &mut m, p, i);
+    }
+    if name_is(p, i, "thread_spawn") {
+      return cg_thread_spawn(&mut g, c, &mut m, p, i);
+    }
+    if name_is(p, i, "thread_join") {
+      return cg_thread_join(&mut g, c, &mut m, p, i);
     }
     if is_pt_borrow_builtin(p, n.s, n.e) {
       return cg_pt_borrow(&mut g, c, &mut m, p, i);
@@ -2075,6 +2097,150 @@ fn cg_smp_run(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp
   return cg_span(g, start);
 }
 
+/// `thread_spawn(f, args..)`: a block on the heap holds the thread's
+/// pthread_t, then the result, then the arguments (every one moved in), and
+/// a thunk the new thread runs calls `f` on them. The `Thread` is the
+/// block's address. The result comes right after the pthread_t in every
+/// block, so `thread_join` finds it whichever call started the thread.
+fn cg_thread_spawn(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp {
+  let fnode = node_at(p.nodes, cg_arg(p, i, 0));
+  let x = plain_inst(&mut m, plain_fn(p, fnode.s, fnode.e));
+  let xi = inst_at(m, x);
+  let ps = fn_params(&mut m, p, xi.def, x);
+  let r = cg_ret_ty(&mut m, p, x);
+  let unit = kind_t(m, r) == TY_UNIT;
+  let k = g.nsmp;
+  g.nsmp = cg_add(k, 1);
+  let mut xs = vec_new[u64]();
+  let mut a = cg_arg(p, i, 1);
+  while a != 0 {
+    vec_push(&mut xs, a);
+    a = next_of(p, a);
+  }
+  let mut vals = vec_new[CgSp]();
+  let pre = cg_operands(&mut g, c, &mut m, p, xs, true, &mut vals);
+  // The block and the thunk.
+  let s1 = cg_mark(g);
+  cg_t(&mut g, "struct bst_spawn_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " { pthread_t t;");
+  if !unit {
+    cg_t(&mut g, " ");
+    cg_cty(&mut g, m, p, r);
+    cg_t(&mut g, " r;");
+  }
+  let mut j = 0;
+  while j < vec_len(ps) {
+    cg_t(&mut g, " ");
+    cg_cty(&mut g, m, p, u_at(ps, j));
+    cg_t(&mut g, " a");
+    cg_n(&mut g, j);
+    cg_t(&mut g, ";");
+    j = j + 1;
+  }
+  cg_t(&mut g, " };\nstatic void *bst_spawn_thunk_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, "(void *q) { struct bst_spawn_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " *a = q; ");
+  if !unit {
+    cg_t(&mut g, "a->r = ");
+  }
+  cg_fname(&mut g, m, p, x);
+  cg_t(&mut g, "(");
+  j = 0;
+  while j < vec_len(ps) {
+    if j > 0 {
+      cg_t(&mut g, ", ");
+    }
+    cg_t(&mut g, "a->a");
+    cg_n(&mut g, j);
+    j = j + 1;
+  }
+  cg_t(&mut g, "); return 0; }\n");
+  let def = cg_span(g, s1);
+  let mut b = vec_new[u64]();
+  cg_copy(g, def, &mut b);
+  let mut q = 0;
+  while q < vec_len(b) {
+    vec_push(&mut g.smp, u_at(b, q));
+    q = q + 1;
+  }
+  vec_free(b);
+  // The call: fill the block, start the thread.
+  let start = cg_mark(g);
+  cg_t(&mut g, "({ struct bst_spawn_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " *bst_sp_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " = bst_thread_block(sizeof(struct bst_spawn_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, ")); ");
+  j = 0;
+  while j < vec_len(vals) {
+    cg_t(&mut g, "bst_sp_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, "->a");
+    cg_n(&mut g, j);
+    cg_t(&mut g, " = ");
+    cg_sp(&mut g, sp_at(vals, j));
+    cg_t(&mut g, "; ");
+    j = j + 1;
+  }
+  cg_t(&mut g, "bst_thread_start(&bst_sp_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, "->t, bst_spawn_thunk_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, ", bst_sp_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, "); (void *)bst_sp_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, "; })");
+  let e = cg_span(g, start);
+  vec_free(vals);
+  vec_free(xs);
+  vec_free(ps);
+  return cg_seq(&mut g, pre, e);
+}
+
+/// `thread_join(t)`: waits for the thread, takes the result out of its
+/// block and frees the block.
+fn cg_thread_join(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, i: u64) -> CgSp {
+  let n = node_at(p.nodes, i);
+  let t = cg_type_of(g, c, &mut m, p, n.a, 0);
+  let r = inner_t(m, t);
+  let e = cg_expr(&mut g, c, &mut m, p, n.a, 0);
+  let k = g.nsmp;
+  g.nsmp = cg_add(k, 1);
+  let start = cg_mark(g);
+  cg_t(&mut g, "({ void *bst_th_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " = ");
+  cg_sp(&mut g, e);
+  cg_t(&mut g, "; bst_thread_wait(bst_th_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, "); ");
+  if kind_t(m, r) == TY_UNIT {
+    cg_t(&mut g, "free(bst_th_");
+    cg_n(&mut g, k);
+    cg_t(&mut g, "); })");
+    return cg_span(g, start);
+  }
+  cg_cty(&mut g, m, p, r);
+  cg_t(&mut g, " bst_tr_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, " = ((struct { pthread_t t; ");
+  cg_cty(&mut g, m, p, r);
+  cg_t(&mut g, " r; } *)bst_th_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, ")->r; free(bst_th_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, "); bst_tr_");
+  cg_n(&mut g, k);
+  cg_t(&mut g, "; })");
+  return cg_span(g, start);
+}
+
 // ---- Statements ----
 
 fn cg_block(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser, head: u64, d: u64) {
@@ -2805,12 +2971,15 @@ fn cg_stencil_tab(g: &mut Cg, c: &Checker, m: &Mono, p: &Parser) {
   cg_to_out(&mut g, start);
 }
 
-/// The field table `code_build` reads: for each field `code_field(name)`
-/// named, in the order of the numbers, its offset in the context struct.
+/// The field tables `code_build` reads: for each field `code_field(...)`
+/// named, in the order of the numbers, its offset in the context struct, and
+/// four words about its elements: the size of an element, the offset of the
+/// member in it, the kind (0 a `Vec[u64]`, 1 a `Vec[S]`, 2 a `Vec[u64]`
+/// member, 3 a scalar member) and the size of a scalar member.
 fn cg_field_tab(g: &mut Cg, c: &Checker, m: &Mono, p: &Parser) {
   let start = cg_mark(g);
   cg_t(&mut g, "#define BST_NFIELDS UINT64_C(");
-  cg_n(&mut g, vec_len(c.code_fields) / 3);
+  cg_n(&mut g, vec_len(c.code_fields) / CF_W);
   cg_t(&mut g, ")\nstatic const uint64_t bst_field_tab[] = {");
   let mut k = 0;
   while k < vec_len(c.code_fields) {
@@ -2822,7 +2991,43 @@ fn cg_field_tab(g: &mut Cg, c: &Checker, m: &Mono, p: &Parser) {
     cg_t(&mut g, ", ");
     cg_src(&mut g, p, cf_at(c, k), cf_at(c, k + 1));
     cg_t(&mut g, ")");
-    k = k + 3;
+    k = k + CF_W;
+  }
+  if k == 0 {
+    cg_t(&mut g, " 0");
+  }
+  cg_t(&mut g, " };\nstatic const uint64_t bst_field_ext[] = {");
+  k = 0;
+  while k < vec_len(c.code_fields) {
+    if k > 0 {
+      cg_t(&mut g, ",");
+    }
+    let kind = cf_at(c, k + 6);
+    if kind == 0 {
+      cg_t(&mut g, " 8, 0, 0, 0");
+    } else {
+      cg_t(&mut g, " sizeof(struct bst_s_");
+      cg_instname(&mut g, m, p, cf_at(c, k + 5), CG_CID);
+      cg_t(&mut g, ")");
+      if cf_at(c, k + 3) == 0 {
+        cg_t(&mut g, ", 0, 1, 0");
+      } else {
+        cg_t(&mut g, ", offsetof(struct bst_s_");
+        cg_instname(&mut g, m, p, cf_at(c, k + 5), CG_CID);
+        cg_t(&mut g, ", ");
+        cg_src(&mut g, p, cf_at(c, k + 3), cf_at(c, k + 4));
+        if kind == 2 {
+          cg_t(&mut g, "), 2, 0");
+        } else {
+          cg_t(&mut g, "), 3, sizeof(((struct bst_s_");
+          cg_instname(&mut g, m, p, cf_at(c, k + 5), CG_CID);
+          cg_t(&mut g, " *)0)->");
+          cg_src(&mut g, p, cf_at(c, k + 3), cf_at(c, k + 4));
+          cg_t(&mut g, ")");
+        }
+      }
+    }
+    k = k + CF_W;
   }
   if k == 0 {
     cg_t(&mut g, " 0");
@@ -2831,17 +3036,24 @@ fn cg_field_tab(g: &mut Cg, c: &Checker, m: &Mono, p: &Parser) {
   cg_to_out(&mut g, start);
 }
 
-/// `code_field(name)`: the field's number in the field table, a constant.
+/// `code_field(...)`: the field's number in the field table, a constant.
 fn cg_code_field(g: &mut Cg, c: &Checker, p: &Parser, i: u64) -> CgSp {
   let n = node_at(p.nodes, i);
   let an = node_at(p.nodes, n.a);
+  let mut ms = 0;
+  let mut me = 0;
+  if an.next != 0 {
+    let mn = node_at(p.nodes, an.next);
+    ms = mn.s;
+    me = mn.e;
+  }
   let mut k = 0;
-  while k < vec_len(c.code_fields) && !same(p.src, cf_at(c, k), cf_at(c, k + 1), an.s, an.e) {
-    k = k + 3;
+  while k < vec_len(c.code_fields) && !cf_same(c, p, k, cf_path_start(p, n.a), an.e, ms, me) {
+    k = k + CF_W;
   }
   let start = cg_mark(g);
   cg_t(&mut g, "UINT64_C(");
-  cg_n(&mut g, k / 3);
+  cg_n(&mut g, k / CF_W);
   cg_t(&mut g, ")");
   return cg_span(g, start);
 }
@@ -2887,6 +3099,9 @@ fn cg_program(g: &mut Cg, c: &Checker, m: &mut Mono, p: &Parser) {
   }
   if child_async {
     cg_part(&mut g.out, PART_CHILD_ASYNC);
+  }
+  if g.target == TARGET_HOSTED && (cg_calls(g.body, "bst_thread_") || cg_calls(g.body, "bst_sbytes_")) {
+    cg_part(&mut g.out, PART_THREAD);
   }
   let code = g.target == TARGET_HOSTED && cg_calls(g.body, "bst_code_");
   if code {
