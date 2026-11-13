@@ -27,6 +27,9 @@ share is refused), client certificates, session tickets and early data.
 | Function | |
 | --- | --- |
 | [`tls13s_new`](#tls13s_new) | Starts a server connection. |
+| [`tls13s_client_auth`](#tls13s_client_auth) | Asks the client for a certificate during the handshake (mutual TLS). |
+| [`tls13s_peer_verdict`](#tls13s_peer_verdict) | What the server made of the client's certificate. |
+| [`tls13s_peer_cert`](#tls13s_peer_cert) | The client's own certificate (DER, a copy), empty when there is none. |
 | [`tls13s_name`](#tls13s_name) | The server name the client asked for (a copy; empty if it sent none). |
 | [`tls13s_feed`](#tls13s_feed) | Gives the server the bytes `data` that arrived from the client. |
 | [`tls13s_send`](#tls13s_send) | Seals `data` as application data records from the server and appends them to `out`. |
@@ -87,6 +90,87 @@ bfree(nonce);
 bfree(k);
 bfree(r);
 if st != 0 { return 1; }
+```
+
+### `tls13s_client_auth`
+
+```bastio
+fn tls13s_client_auth(c: &mut Tls13Client, roots: &Bytes, require: bool, now: u64)
+  requires tls13c_ok(c) && blen(roots) < 274877906944
+  ensures tls13c_ok(c)
+```
+
+Asks the client for a certificate during the handshake (mutual TLS). Call
+it right after `tls13s_new`, before the first `tls13s_feed`. The client's
+chain is checked against `roots` (certificates in the `fe_roots` format, as
+`tls13c_new_with` takes) at time `now` (seconds since 1970). With
+`require` the handshake fails (code 7) when the client sends no certificate
+or one the roots do not vouch for; without it the connection goes on and
+`tls13s_peer_verdict` says what happened. A certificate the client sends
+must still prove it holds the key (CertificateVerify).
+
+Example:
+
+```bastio
+let r = balloc(32);
+let k = balloc(32);
+let nonce = balloc(32);
+let chain = balloc(0);
+let d = balloc(32);
+let none = balloc(0);
+let alpn = balloc(0);
+let roots = balloc(0);
+let mut s = tls13s_new(r, k, nonce, chain, 2, d, none, alpn);
+tls13s_client_auth(&mut s, roots, false, 0);
+let v = tls13s_peer_verdict(s);
+tls13c_free(s);
+bfree(roots);
+bfree(alpn);
+bfree(none);
+bfree(d);
+bfree(chain);
+bfree(nonce);
+bfree(k);
+bfree(r);
+if v != 0 { return 1; }
+```
+
+### `tls13s_peer_verdict`
+
+```bastio
+fn tls13s_peer_verdict(c: &Tls13Client) -> u64
+```
+
+What the server made of the client's certificate: 0 none was asked for or
+none came, 1 the chain is good, 6 the chain is not vouched for by the
+roots.
+
+Example:
+
+```bastio
+let c = tls13c_blank();
+let v = tls13s_peer_verdict(c);
+tls13c_free(c);
+if v != 0 { return 1; }
+```
+
+### `tls13s_peer_cert`
+
+```bastio
+fn tls13s_peer_cert(c: &Tls13Client) -> Bytes
+```
+
+The client's own certificate (DER, a copy), empty when there is none.
+
+Example:
+
+```bastio
+let c = tls13c_blank();
+let p = tls13s_peer_cert(c);
+let n = blen(p);
+bfree(p);
+tls13c_free(c);
+if n != 0 { return 1; }
 ```
 
 ### `tls13s_name`
@@ -220,6 +304,16 @@ if s { return 1; }
 ```
 
 ## Internals
+
+### `tls13s_certificate_request`
+
+```bastio
+fn tls13s_certificate_request() -> Bytes
+```
+
+Internal: the CertificateRequest message (RFC 8446 section 4.3.2): an
+empty request context and the signature_algorithms extension with the
+schemes `tls13c_certificate_verify` can check.
 
 ### `tls13s_push_u24`
 
@@ -394,6 +488,36 @@ fn tls13s_client_hello(c: &mut Tls13Client, msg: &Bytes, out: &mut Vec[u8]) -> u
 
 Internal: handles the ClientHello `msg` (state 0): sends the server's
 whole flight and waits for the client's Finished (state 4).
+
+### `tls13s_client_certificate`
+
+```bastio
+fn tls13s_client_certificate(c: &mut Tls13Client, msg: &Bytes) -> u64
+  requires tls13c_ok(c) && blen(msg) < 1048576
+  ensures tls13c_ok(c)
+```
+
+Internal: handles the client's Certificate `msg` (state 8).
+
+### `tls13s_signed_content`
+
+```bastio
+fn tls13s_signed_content(h: &Bytes) -> Bytes
+  requires blen(h) == 32 || blen(h) == 48
+  ensures blen(result) == 98 + blen(h)
+```
+
+Internal: what the client signs in its CertificateVerify.
+
+### `tls13s_client_verify`
+
+```bastio
+fn tls13s_client_verify(c: &mut Tls13Client, msg: &Bytes) -> u64
+  requires tls13c_ok(c) && blen(msg) < 1048576
+  ensures tls13c_ok(c)
+```
+
+Internal: handles the client's CertificateVerify `msg` (state 9).
 
 ### `tls13s_finished`
 
