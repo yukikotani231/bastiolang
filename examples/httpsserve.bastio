@@ -4,7 +4,7 @@
 // key in files, reads a request and answers it, until COUNT requests are
 // answered.
 //
-//   httpsserve PORT CHAIN KIND KEY COUNT
+//   httpsserve PORT CHAIN KIND KEY COUNT [ROOTS MODE]
 //
 // CHAIN is a file of DER certificates, the server's own first. KIND is 1 for
 // an RSA key, whose file holds the modulus and then the private exponent,
@@ -12,7 +12,11 @@
 // 32-byte scalar. The server offers the ALPN protocols http/1.1 and h2 (in
 // that order) and answers every request with `200 OK` and a body that names
 // the protocol chosen and the server name the client sent. With no arguments
-// it only checks that a server refuses bytes that are no ClientHello.
+// it only checks that a server refuses bytes that are no ClientHello. With
+// ROOTS (a file of DER certificates) and MODE (1 to ask the client for a
+// certificate and go on whatever it sends, 2 to refuse a client without one the
+// roots vouch for) the server asks for a client certificate, and the body
+// also names what it made of it (peer=0 none, 1 good, 6 not vouched for).
 //
 // What the compiler proves: no buffer is read or written out of bounds and
 // none leaks, whatever the client sends. tests/tls.sh runs OpenSSL's client
@@ -53,8 +57,8 @@ fn has_head(app: &Vec[u8]) -> bool {
 }
 
 /// Serves one connection on the socket `sock`. True if a request was answered.
-fn serve(con: &Serial, h: &Host, sock: u64, chain: &Bytes, kind: u64, ka: &Bytes, kb: &Bytes) -> bool
-  requires blen(chain) < 1048576 && blen(ka) < 65536 && blen(kb) < 65536 && (kind == 1 || kind == 2)
+fn serve(con: &Serial, h: &Host, sock: u64, chain: &Bytes, kind: u64, ka: &Bytes, kb: &Bytes, roots: &Bytes, mode: u64) -> bool
+  requires blen(chain) < 1048576 && blen(ka) < 65536 && blen(kb) < 65536 && (kind == 1 || kind == 2) && blen(roots) < 274877906944
 {
   let mut rnd = balloc(96);
   match net_random(h, 96) {
@@ -68,6 +72,7 @@ fn serve(con: &Serial, h: &Host, sock: u64, chain: &Bytes, kind: u64, ka: &Bytes
   bfree(rnd);
   let alpn = protocols();
   let mut s = tls13s_new(random, key, nonce, chain, kind, ka, kb, alpn);
+  if mode > 0 { tls13s_client_auth(&mut s, roots, mode == 2, net_now(h)); }
   bfree(alpn);
   bfree(nonce);
   bfree(key);
@@ -108,6 +113,8 @@ fn serve(con: &Serial, h: &Host, sock: u64, chain: &Bytes, kind: u64, ka: &Bytes
       let nm = tls13s_name(s);
       text_push_bytes(&mut body, nm);
       bfree(nm);
+      text_push_str(&mut body, " peer=");
+      fmt_u64(&mut body, tls13s_peer_verdict(s));
       let bb = text_finish(body);
       let mut resp = text_new();
       text_push_str(&mut resp, "HTTP/1.0 200 OK\r\nContent-Length: ");
@@ -177,6 +184,16 @@ fn main(con: &mut Serial, h: &mut Host) -> u64 {
   let count = opt_or[u64](parse_u64(a_count, 0, blen(a_count)), 0);
   let mut chain = balloc(0);
   let mut key = balloc(0);
+  let mut roots = balloc(0);
+  let mut mode = 0;
+  if host_argc(h) >= 8 {
+    let a_roots = host_arg(h, 6);
+    let a_mode = host_arg(h, 7);
+    mode = opt_or[u64](parse_u64(a_mode, 0, blen(a_mode)), 0);
+    if mode > 2 || !host_read(h, a_roots, &mut roots) || blen(roots) >= 16777216 { mode = 0; bfree(roots); roots = balloc(0); }
+    bfree(a_mode);
+    bfree(a_roots);
+  }
   let mut code = 2;
   if port != 0 && (kind == 1 || kind == 2) && host_read(h, a_chain, &mut chain) && host_read(h, a_key, &mut key)
     && blen(chain) < 1048576 && blen(key) < 65536 {
@@ -196,12 +213,12 @@ fn main(con: &mut Serial, h: &mut Host) -> u64 {
         let mut i = 0;
         let mut tries = 0;
         while i < count && tries < 1000
-          invariant blen(chain) < 1048576 && blen(ka) < 65536 && blen(kb) < 65536 && (kind == 1 || kind == 2)
+          invariant blen(chain) < 1048576 && blen(ka) < 65536 && blen(kb) < 65536 && (kind == 1 || kind == 2) && blen(roots) < 16777216
         {
           tries = tries + 1;
           match net_accept(h, ls) {
             Option::Some(c) => {
-              if serve(con, h, c, chain, kind, ka, kb) { i = i + 1; }
+              if serve(con, h, c, chain, kind, ka, kb, roots, mode) { i = i + 1; }
               net_close(h, c);
             },
             Option::None => { code = 1; },
@@ -218,6 +235,7 @@ fn main(con: &mut Serial, h: &mut Host) -> u64 {
   }
   bfree(key);
   bfree(chain);
+  bfree(roots);
   bfree(a_count);
   bfree(a_key);
   bfree(a_kind);

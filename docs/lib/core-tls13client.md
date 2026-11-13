@@ -64,7 +64,8 @@ struct Tls13Client {
   inbuf: Bytes, hsbuf: Bytes, leaf: Bytes,
   verify: bool, verdict: u64, alpn: Bytes, sent_close: bool,
   allow12: bool, v12: bool, step: u64, rnd: Bytes, ms: Bytes, ems: bool, cs12: u64,
-  sk_kind: u64, sk_a: Bytes, sk_b: Bytes
+  sk_kind: u64, sk_a: Bytes, sk_b: Bytes,
+  creq: u64, croots: Bytes, cleaf: Bytes, cnow: u64, cverdict: u64
 }
 ```
 
@@ -356,7 +357,8 @@ fn tls13c_state(c: &Tls13Client) -> u64
 
 The state of `c`: 0 waiting for the ServerHello, 1 for the
 EncryptedExtensions, 2 for the Certificate, 3 for the CertificateVerify, 4
-for the Finished, 5 connected, 6 closed by the peer, 7 failed.
+for the Finished, 5 connected, 6 closed by the peer, 7 failed. A server
+still waiting for the client's certificate is in state 4 too.
 
 ### `tls13c_feed`
 
@@ -511,7 +513,7 @@ SHA-384).
 
 ```bastio
 spec fn tls13c_ok(c: &Tls13Client) -> bool {
-  c.state <= 7 && blen(c.priv_key) == 32
+  c.state <= 9 && blen(c.priv_key) == 32
     && ((c.suite == 4866 && tls13c_secrets(c, 48)) || ((c.suite == 4865 || c.suite == 4867) && tls13c_secrets(c, 32)))
     && ((c.c_suite == 4867 && blen(c.c_key) == 32) || (c.c_suite == 4866 && blen(c.c_key) == 32) || (c.c_suite == 4865 && blen(c.c_key) == 16))
     && ((c.s_suite == 4867 && blen(c.s_key) == 32) || (c.s_suite == 4866 && blen(c.s_key) == 32) || (c.s_suite == 4865 && blen(c.s_key) == 16))
@@ -520,6 +522,7 @@ spec fn tls13c_ok(c: &Tls13Client) -> bool {
     && blen(c.transcript) < 1073741824 && blen(c.inbuf) < 1073741824 && blen(c.hsbuf) < 1073741824 && blen(c.leaf) < 1048576
     && blen(c.alpn) <= 256 && blen(c.rnd) <= 64 && blen(c.ms) <= 48
     && blen(c.sk_a) < 65536 && blen(c.sk_b) < 65536
+    && blen(c.croots) < 274877906944 && blen(c.cleaf) < 1048576
 }
 ```
 
