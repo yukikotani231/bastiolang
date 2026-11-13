@@ -360,8 +360,8 @@ fn tls13c_alpn(c: &Tls13Client) -> Bytes {
 
 /// 0 when the server's certificate chain was checked and good; otherwise 10
 /// when only the host name is not the certificate's, or 6 (the code a client
-/// that verifies fails with in both cases; only a client made with `verify`
-/// false gets that far).
+/// that verifies fails with in both cases; a client that verifies keeps the
+/// refused certificate and this verdict too, after the failure).
 /// ```
 /// let c = tls13c_blank();
 /// let v = tls13c_verdict(c);
@@ -844,7 +844,23 @@ fn tls13c_certificate(c: &mut Tls13Client, msg: &Bytes, roots: &Bytes, now: u64)
 {
   match tls13c_chain(msg, c.name, roots, now) {
     Option::None => {
-      if c.verify { return tls13c_fail(&mut c, 6); }
+      if c.verify {
+        // Keep the refused certificate and why (10: only the name is wrong),
+        // so the caller can tell a bad name from an untrusted issuer.
+        match tls13c_first_cert(msg) {
+          Option::None => {},
+          Option::Some(leaf0) => {
+            bfree(c.leaf);
+            c.leaf = leaf0;
+            c.verdict = 6;
+            match tls13c_chain_for(msg, c.name, false, roots, now) {
+              Option::Some(l3) => { bfree(l3); c.verdict = 10; },
+              Option::None => {},
+            }
+          },
+        }
+        return tls13c_fail(&mut c, 6);
+      }
       // Not verified, as the caller asked: go on with the server's own
       // certificate, whose key must still sign the CertificateVerify.
       match tls13c_first_cert(msg) {
@@ -1684,6 +1700,20 @@ fn tls12c_certificate(c: &mut Tls13Client, msg: &Bytes, roots: &Bytes, now: u64)
         }
       },
       Option::None => {},
+    }
+  }
+  if !good {
+    match tls13c_first_cert(m13) {
+      Option::None => {},
+      Option::Some(l0) => {
+        bfree(c.leaf);
+        c.leaf = l0;
+        c.verdict = 6;
+        match tls13c_chain_for(m13, c.name, false, roots, now) {
+          Option::Some(l2) => { bfree(l2); c.verdict = 10; },
+          Option::None => {},
+        }
+      },
     }
   }
   bfree(m13);
