@@ -74,7 +74,8 @@ fn tls13s_new(random: &Bytes, priv_key: &Bytes, nonce: &Bytes, chain: &Bytes, ki
     verify: false, verdict: 0, alpn: bytes_slice(alpn, 0, blen(alpn)), sent_close: false,
     allow12: false, v12: false, step: 0, rnd: rnd, ms: balloc(0), ems: false, cs12: 0,
     sk_kind: kind, sk_a: bytes_slice(ka, 0, blen(ka)), sk_b: bytes_slice(kb, 0, blen(kb)),
-    creq: 0, croots: balloc(0), cleaf: balloc(0), cnow: 0, cverdict: 0
+    creq: 0, croots: balloc(0), cleaf: balloc(0), cnow: 0, cverdict: 0,
+    ck_kind: 0, ck_nonce: balloc(0)
   };
 }
 
@@ -159,7 +160,7 @@ fn tls13s_certificate_request() -> Bytes {
   tls13_push_u16(&mut t, 1027);
   tls13_push_u16(&mut t, 1283);
   tls13_push_u16(&mut t, 2053);
-  return tls13s_wrap(13, text_finish(t));
+  return tls13_wrap(13, text_finish(t));
 }
 
 /// The server name the client asked for (a copy; empty if it sent none).
@@ -173,29 +174,6 @@ fn tls13s_certificate_request() -> Bytes {
 /// ```
 fn tls13s_name(c: &Tls13Client) -> Bytes {
   return bytes_slice(c.name, 0, blen(c.name));
-}
-
-/// Internal: appends the 24-bit big-endian number `v` to `t`.
-fn tls13s_push_u24(t: &mut Vec[u8], v: u64)
-  requires v < 16777216
-  ensures vlen(t) == vlen(old(t)) + 3
-{
-  text_push(&mut t, cast[u8](v / 65536));
-  text_push(&mut t, cast[u8]((v / 256) % 256));
-  text_push(&mut t, cast[u8](v % 256));
-}
-
-/// Internal: the handshake message of type `ty` with the contents `body`.
-fn tls13s_wrap(ty: u8, body: Bytes) -> Bytes
-  requires blen(body) < 16777216
-  ensures blen(result) == blen(body) + 4
-{
-  let mut t = text_new();
-  text_push(&mut t, ty);
-  tls13s_push_u24(&mut t, blen(body));
-  text_push_bytes(&mut t, body);
-  bfree(body);
-  return text_finish(t);
 }
 
 /// Internal: appends a plain record of type `ty` (version 0x0303) around `body`.
@@ -246,85 +224,8 @@ fn tls13s_send_message(c: &mut Tls13Client, msg: &Bytes, out: &mut Vec[u8]) -> b
   return true;
 }
 
-/// Internal: the length of the DER element at `b[at..]` with its header, or
-/// 0 when it is not a SEQUENCE that fits.
-fn tls13s_der_len(b: &Bytes, at: u64) -> u64
-  requires at <= blen(b)
-  ensures result == 0 || (result >= 2 && result <= blen(b) - at)
-{
-  let n = blen(b) - at;
-  if n < 2 || bget(b, at) != 48 { return 0; }
-  let l = cast[u64](bget(b, at + 1));
-  let mut total = 0;
-  if l < 128 {
-    total = 2 + l;
-  } else if l == 129 && n >= 3 {
-    total = 3 + cast[u64](bget(b, at + 2));
-  } else if l == 130 && n >= 4 {
-    total = 4 + cast[u64](bget(b, at + 2)) * 256 + cast[u64](bget(b, at + 3));
-  } else if l == 131 && n >= 5 {
-    total = 5 + cast[u64](bget(b, at + 2)) * 65536 + cast[u64](bget(b, at + 3)) * 256 + cast[u64](bget(b, at + 4));
-  } else {
-    return 0;
-  }
-  if total > n { return 0; }
-  return total;
-}
-
-/// Internal: the Certificate message for the DER certificates `chain`, or
-/// None when they do not split into certificates.
-fn tls13s_certificate(chain: &Bytes) -> Option[Bytes]
-  requires blen(chain) < 1048576
-  ensures result is Option::Some ==> blen(result.Some) < 8388608
-{
-  let n = blen(chain);
-  if n == 0 { return Option[Bytes]::None; }
-  let mut list = text_new();
-  let mut at = 0;
-  while at < n
-    invariant at <= n && n == blen(chain) && vlen(list) <= 4 * at
-  {
-    let l = tls13s_der_len(chain, at);
-    if l == 0 { vec_free(list); return Option[Bytes]::None; }
-    tls13s_push_u24(&mut list, l);
-    text_push_span(&mut list, chain, at, at + l);
-    text_push(&mut list, 0);
-    text_push(&mut list, 0);
-    at = at + l;
-  }
-  let mut body = text_new();
-  text_push(&mut body, 0);
-  tls13s_push_u24(&mut body, vec_len(list));
-  let lb = text_finish(list);
-  text_push_bytes(&mut body, lb);
-  bfree(lb);
-  let b = text_finish(body);
-  return Option[Bytes]::Some(tls13s_wrap(11, b));
-}
-
-/// Internal: appends the DER INTEGER for the 32-byte big-endian number at
-/// `b[from..from+32]`.
-fn tls13s_der_int(t: &mut Vec[u8], b: &Bytes, from: u64)
-  requires from + 32 <= blen(b)
-  ensures vlen(t) <= vlen(old(t)) + 35
-{
-  let mut i = from;
-  while i < from + 31 && bget(b, i) == 0
-    invariant i >= from && i <= from + 31
-  {
-    i = i + 1;
-  }
-  let pad = bget(b, i) >= 128;
-  let mut l = from + 32 - i;
-  if pad { l = l + 1; }
-  text_push(&mut t, 2);
-  text_push(&mut t, cast[u8](l));
-  if pad { text_push(&mut t, 0); }
-  text_push_span(&mut t, b, i, from + 32);
-}
-
 /// Internal: the signature of the server's key over the CertificateVerify
-/// contents for the transcript hash `h`, and the scheme, or None.
+/// contents for the transcript hash `h`, or None.
 fn tls13s_sign(c: &Tls13Client, h: &Bytes, scheme: u64) -> Option[Bytes]
   requires tls13c_ok(c) && (blen(h) == 32 || blen(h) == 48)
   ensures result is Option::Some ==> blen(result.Some) <= 512
@@ -335,38 +236,10 @@ fn tls13s_sign(c: &Tls13Client, h: &Bytes, scheme: u64) -> Option[Bytes]
     bfree(nonce);
     nonce = bytes_slice(c.rnd, 32, 64);
   }
-  if scheme == 1027 && c.sk_kind == 2 {
-    let digest = sha256(content);
-    let raw = ecdsa_p256_sign_digest(c.sk_a, digest, nonce);
-    bfree(digest);
-    bfree(nonce);
-    bfree(content);
-    match raw {
-      Option::None => { return Option[Bytes]::None; },
-      Option::Some(rs) => {
-        let mut t = text_new();
-        tls13s_der_int(&mut t, rs, 0);
-        tls13s_der_int(&mut t, rs, 32);
-        let ints = text_finish(t);
-        let mut d = text_new();
-        text_push(&mut d, 48);
-        text_push(&mut d, cast[u8](blen(ints)));
-        text_push_bytes(&mut d, ints);
-        bfree(ints);
-        bfree(rs);
-        return Option[Bytes]::Some(text_finish(d));
-      },
-    }
-  }
-  if scheme == 2052 && c.sk_kind == 1 {
-    let r = rsa_pss_sign(c.sk_a, c.sk_b, content, nonce, 32, 256);
-    bfree(nonce);
-    bfree(content);
-    return r;
-  }
+  let r = tls13_sign(c.sk_kind, c.sk_a, c.sk_b, nonce, content, scheme);
   bfree(nonce);
   bfree(content);
-  return Option[Bytes]::None;
+  return r;
 }
 
 /// Internal: the ClientHello fields the server needs.
@@ -547,7 +420,7 @@ fn tls13s_server_hello(h: &Tls13sHello, random: &Bytes, pubkey: &Bytes) -> Bytes
   tls13_push_u16(&mut t, 29);
   tls13_push_u16(&mut t, 32);
   text_push_bytes(&mut t, pubkey);
-  return tls13s_wrap(2, text_finish(t));
+  return tls13_wrap(2, text_finish(t));
 }
 
 /// Internal: the EncryptedExtensions, with the chosen protocol if any.
@@ -566,7 +439,7 @@ fn tls13s_encrypted_extensions(proto: &Bytes) -> Bytes
     text_push(&mut t, cast[u8](blen(proto)));
     text_push_bytes(&mut t, proto);
   }
-  return tls13s_wrap(8, text_finish(t));
+  return tls13_wrap(8, text_finish(t));
 }
 
 /// Internal: handles the ClientHello `msg` (state 0): sends the server's
@@ -638,7 +511,7 @@ fn tls13s_client_hello(c: &mut Tls13Client, msg: &Bytes, out: &mut Vec[u8]) -> u
         bfree(cr);
         if !sentr { return tls13c_fail(&mut c, 1); }
       }
-      match tls13s_certificate(c.leaf) {
+      match tls13_certificate_msg(c.leaf) {
         Option::None => { return tls13c_fail(&mut c, 7); },
         Option::Some(cm) => {
           let ok = blen(cm) < 1048576 && tls13s_send_message(&mut c, cm, &mut out);
@@ -654,7 +527,7 @@ fn tls13s_client_hello(c: &mut Tls13Client, msg: &Bytes, out: &mut Vec[u8]) -> u
           tls13_push_u16(&mut t, scheme);
           tls13_push_block16(&mut t, sig);
           bfree(sig);
-          let cv = tls13s_wrap(15, text_finish(t));
+          let cv = tls13_wrap(15, text_finish(t));
           let ok = tls13s_send_message(&mut c, cv, &mut out);
           bfree(cv);
           bfree(hh);
@@ -662,7 +535,7 @@ fn tls13s_client_hello(c: &mut Tls13Client, msg: &Bytes, out: &mut Vec[u8]) -> u
         },
       }
       let h2 = tls13c_hash(c);
-      let fin = tls13s_wrap(20, tls13_finished(c.s_hs, h2));
+      let fin = tls13_wrap(20, tls13_finished(c.s_hs, h2));
       bfree(h2);
       let ok = tls13s_send_message(&mut c, fin, &mut out);
       bfree(fin);
@@ -735,25 +608,6 @@ fn tls13s_client_certificate(c: &mut Tls13Client, msg: &Bytes) -> u64
   return 0;
 }
 
-/// Internal: what the client signs in its CertificateVerify.
-fn tls13s_signed_content(h: &Bytes) -> Bytes
-  requires blen(h) == 32 || blen(h) == 48
-  ensures blen(result) == 98 + blen(h)
-{
-  let mut t = text_new();
-  let mut i = 0;
-  while i < 64
-    invariant i <= 64 && vlen(t) == i
-  {
-    text_push(&mut t, 32);
-    i = i + 1;
-  }
-  text_push_str(&mut t, "TLS 1.3, client CertificateVerify");
-  text_push(&mut t, 0);
-  text_push_bytes(&mut t, h);
-  return text_finish(t);
-}
-
 /// Internal: handles the client's CertificateVerify `msg` (state 9).
 fn tls13s_client_verify(c: &mut Tls13Client, msg: &Bytes) -> u64
   requires tls13c_ok(c) && blen(msg) < 1048576
@@ -766,7 +620,7 @@ fn tls13s_client_verify(c: &mut Tls13Client, msg: &Bytes) -> u64
   let scheme = tls13c_u16(msg, 4);
   let sig = bytes_slice(msg, 8, n);
   let h = tls13c_hash(c);
-  let content = tls13s_signed_content(h);
+  let content = tls13_client_signed_content(h);
   let mut ok = false;
   match x509_parse(c.cleaf) {
     Option::None => {},
