@@ -255,7 +255,7 @@ fn tls13_client_hello_alpn(random: &Bytes, session_id: &Bytes, server_name: &Byt
 /// let key = balloc(32);
 /// let name = bfrom("example.com");
 /// let alpn = balloc(0);
-/// let hello = tls13_client_hello_v12(random, sid, name, key, alpn);
+/// let hello = tls13_client_hello_v12(random, sid, name, key, alpn, false);
 /// let n = blen(hello);
 /// let ln = load_be16(hello, 2);
 /// bfree(hello);
@@ -266,7 +266,7 @@ fn tls13_client_hello_alpn(random: &Bytes, session_id: &Bytes, server_name: &Byt
 /// bfree(random);
 /// if cast[u64](ln) + 4 != n { return 1; }
 /// ```
-fn tls13_client_hello_v12(random: &Bytes, session_id: &Bytes, server_name: &Bytes, key_share: &Bytes, alpn: &Bytes) -> Bytes
+fn tls13_client_hello_v12(random: &Bytes, session_id: &Bytes, server_name: &Bytes, key_share: &Bytes, alpn: &Bytes, only12: bool) -> Bytes
   requires blen(random) == 32 && blen(session_id) == 32 && blen(key_share) == 32 && blen(server_name) <= 255 && blen(alpn) <= 256
   ensures blen(result) > 4 && blen(result) < 1200
 {
@@ -321,24 +321,31 @@ fn tls13_client_hello_v12(random: &Bytes, session_id: &Bytes, server_name: &Byte
   // extended_master_secret: empty.
   let none = balloc(0);
   tls13_push_ext(&mut e, 23, none);
-  // supported_versions: TLS 1.3, then TLS 1.2.
+  // supported_versions: TLS 1.3, then TLS 1.2 (only TLS 1.2 when `only12`,
+  // with no TLS 1.3 key share either).
   let mut v = text_new();
-  text_push(&mut v, 4);
-  tls13_push_u16(&mut v, 772);
+  if only12 {
+    text_push(&mut v, 2);
+  } else {
+    text_push(&mut v, 4);
+    tls13_push_u16(&mut v, 772);
+  }
   tls13_push_u16(&mut v, 771);
   let versions = text_finish(v);
   tls13_push_ext(&mut e, 43, versions);
   bfree(versions);
-  let mut k = text_new();
-  tls13_push_u16(&mut k, 29);
-  tls13_push_block16(&mut k, key_share);
-  let entry2 = text_finish(k);
-  let mut l3 = text_new();
-  tls13_push_block16(&mut l3, entry2);
-  let list3 = text_finish(l3);
-  tls13_push_ext(&mut e, 51, list3);
-  bfree(list3);
-  bfree(entry2);
+  if !only12 {
+    let mut k = text_new();
+    tls13_push_u16(&mut k, 29);
+    tls13_push_block16(&mut k, key_share);
+    let entry2 = text_finish(k);
+    let mut l3 = text_new();
+    tls13_push_block16(&mut l3, entry2);
+    let list3 = text_finish(l3);
+    tls13_push_ext(&mut e, 51, list3);
+    bfree(list3);
+    bfree(entry2);
+  }
   // renegotiation_info: an empty one (this is no renegotiation).
   let mut ri = text_new();
   text_push(&mut ri, 0);

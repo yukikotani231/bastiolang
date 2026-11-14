@@ -64,7 +64,7 @@ struct Tls13Client {
   c_secret: Bytes, s_secret: Bytes, c_seq: u64, s_seq: u64,
   inbuf: Bytes, hsbuf: Bytes, leaf: Bytes,
   verify: bool, verdict: u64, alpn: Bytes, sent_close: bool,
-  allow12: bool, v12: bool, step: u64, rnd: Bytes, ms: Bytes, ems: bool, cs12: u64,
+  allow12: bool, only12: bool, v12: bool, step: u64, rnd: Bytes, ms: Bytes, ems: bool, cs12: u64,
   sk_kind: u64, sk_a: Bytes, sk_b: Bytes,
   creq: u64, croots: Bytes, cleaf: Bytes, cnow: u64, cverdict: u64,
   ck_kind: u64, ck_nonce: Bytes
@@ -177,7 +177,8 @@ fn tls13c_new_opts(random: &Bytes, session_id: &Bytes, priv_key: &Bytes, name: &
   ensures vlen(out) > vlen(old(out))
 ```
 
-`tls13c_new_with` with options as bits: 1 accepts a chain the roots do not
+`tls13c_new_with` with options as bits: 8 offers TLS 1.2 only (a server
+that answers with TLS 1.3 fails the connection), 1 accepts a chain the roots do not
 vouch for (`verify` false), 2 offers TLS 1.2 as well (for servers and
 proxies that do not speak TLS 1.3: ECDHE with X25519, AES-GCM or
 ChaCha20-Poly1305, the extended master secret when the server has it, no

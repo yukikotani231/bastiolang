@@ -129,6 +129,15 @@ serve eclocal eclocal && {
   system_client "std/https: untrusted root" 1 localhost other.roots
 }
 suites=TLS_AES_128_GCM_SHA256
+# A client that offers only TLS 1.2: a server that speaks both answers with 1.2, one that only speaks 1.3 fails it.
+port=$((port + 1))
+openssl s_server -www -accept "127.0.0.1:$port" -cert "$tmp/eclocal.pem" -key "$tmp/eclocal.key" >"$tmp/server.log" 2>&1 &
+pids+=($!)
+for i in $(seq 1 100); do (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break; sleep 0.1; done
+v12=1200
+client "client that offers only TLS 1.2: a server of both" 0 localhost ec.roots
+v12=
+serve eclocal eclocal && { v12=1200; client "client that offers only TLS 1.2: a TLS 1.3 only server" 1 localhost ec.roots; v12=; }
 serve eclocal eclocal && client "AES-128-GCM only server" 0 localhost ec.roots
 suites=TLS_AES_256_GCM_SHA384
 serve eclocal eclocal && client "AES-256-GCM only server (SHA-384 key schedule)" 0 localhost ec.roots
