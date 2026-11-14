@@ -385,7 +385,7 @@ let chain = balloc(0);
 let ka = balloc(32);
 let kb = balloc(0);
 let nonce = balloc(32);
-tls13c_identity(&mut c, chain, 2, ka, kb, nonce);
+if tls13c_check(c) { tls13c_identity(&mut c, chain, 2, ka, kb, nonce); }
 bfree(nonce);
 bfree(kb);
 bfree(ka);
