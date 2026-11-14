@@ -15,6 +15,7 @@ What will be 0.2.0.
 
 ### Tools
 
+- `host_net` op 20 (socket options) builds on macOS and the BSDs under `-std=c11` (the `IP_*` constants are defined there when the headers hide them) and `tests/pass/host_net_setopt.bastio` no longer fails where UDP sockets are unavailable (Windows). `prelude net` grows by 9 lines.
 - `code_build` plans get the indirect jump `INDJMP a` (item 29): go to the body of entry point `r[a]`, with the registers and frame as they are, or run the next item when `r[a]` is no entry's number. With it a JIT can call and return between its functions inside the machine code. Stage1 only, C backend, x86-64; the trusted `prelude code` grows by about 15 lines (a jump table after the code). `tests/pass/code_indjmp.bastio`.
 - `host_sys` catches signals (stage1, C backend, not Windows): `61` catch or restore a signal, `62` the mask of signals caught since the last call, `63` the read end of a pipe that gets a byte per catch (for `poll`/epoll), `64` kill. The handler only sets a bit and writes a byte. `os_signal_catch`, `os_signals_take`, `os_signal_fd` and `os_kill` in `std/os.bastio`. `tests/pass/host_sys_signal.bastio`.
 - `host_net` gets `18` and `19` (connect to, and listen on, a Unix domain socket by path, with `@name` for a Linux abstract socket), wrapped by `net_connect_unix` and `net_listen_unix` in `std/net.bastio`: a hayate-style `net.connect({path})`, or the X server at `@/tmp/.X11-unix/X0`. Stage1 only, C backend; Windows fails them. `prelude net` grows by about 35 lines. `tests/pass/host_net_unix.bastio`.
