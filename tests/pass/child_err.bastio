@@ -1,6 +1,8 @@
 // expect-exit: 0
 // stage1-only: host_spawn_err, child_read_err_line, child_kill and child_pid
 // backend: c
+import "../../std/os.bastio";
+
 // A child with its own standard error pipe, and a signal sent to a child.
 
 fn arg(v: &mut Vec[Bytes], s: Str) {
@@ -73,7 +75,17 @@ fn main(h: &mut Host) -> u64 {
       j = j + 1;
     }
   }
-  if qpid == 0 || told != qpid {
+  // On Windows the shell's $$ is the MSYS id, not the process id: only check it is not 0.
+  let mut win = true;
+  match os_pipe(h) {
+    Option::Some(pp) => {
+      win = !os_nonblock(h, pp.start, true);
+      os_close(h, pp.start);
+      os_close(h, pp.end);
+    },
+    Option::None => {},
+  }
+  if qpid == 0 || (!win && told != qpid) {
     bad = bad + 1;
   }
   if child_wait(q) != 0 {
