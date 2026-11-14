@@ -14,7 +14,7 @@ that a ClientHello is one a server accepts (the tests compare it with one
 assembled by another program) or that the reader accepts every ServerHello
 of the standard (it takes the one suite and group the client offered).
 
-`import "core/tls13hs.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/endian.bastio](core-endian.md), [core/text.bastio](core-text.md).
+`import "core/tls13hs.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/endian.bastio](core-endian.md), [core/text.bastio](core-text.md), [core/sha256.bastio](core-sha256.md), [core/der.bastio](core-der.md), [core/p256.bastio](core-p256.md), [core/sha512.bastio](core-sha512.md), [core/rsa.bastio](core-rsa.md).
 
 | Function | |
 | --- | --- |
@@ -270,3 +270,79 @@ fn tls13_nib(c: u8) -> u8
 ```
 
 Internal: the value of the hex digit `c`.
+
+### `tls13_push_u24`
+
+```bastio
+fn tls13_push_u24(t: &mut Vec[u8], v: u64)
+  requires v < 16777216
+  ensures vlen(t) == vlen(old(t)) + 3
+```
+
+Internal: appends the 24-bit big-endian number `v` to `t`.
+
+### `tls13_wrap`
+
+```bastio
+fn tls13_wrap(ty: u8, body: Bytes) -> Bytes
+  requires blen(body) < 16777216
+  ensures blen(result) == blen(body) + 4
+```
+
+Internal: the handshake message of type `ty` with the contents `body`.
+
+### `tls13_der_len`
+
+```bastio
+fn tls13_der_len(b: &Bytes, at: u64) -> u64
+  requires at <= blen(b)
+  ensures result == 0 || (result >= 2 && result <= blen(b) - at)
+```
+
+Internal: the length of the DER element at `b[at..]` with its header, or
+0 when it is not a SEQUENCE that fits.
+
+### `tls13_certificate_msg`
+
+```bastio
+fn tls13_certificate_msg(chain: &Bytes) -> Option[Bytes]
+  requires blen(chain) < 1048576
+  ensures result is Option::Some ==> blen(result.Some) < 8388608
+```
+
+Internal: the Certificate message for the DER certificates `chain`, or
+None when they do not split into certificates.
+
+### `tls13_der_int`
+
+```bastio
+fn tls13_der_int(t: &mut Vec[u8], b: &Bytes, from: u64)
+  requires from + 32 <= blen(b)
+  ensures vlen(t) <= vlen(old(t)) + 35
+```
+
+Internal: appends the DER INTEGER for the 32-byte big-endian number at
+`b[from..from+32]`.
+
+### `tls13_sign`
+
+```bastio
+fn tls13_sign(kind: u64, ka: &Bytes, kb: &Bytes, nonce: &Bytes, content: &Bytes, scheme: u64) -> Option[Bytes]
+  requires blen(ka) < 65536 && blen(kb) < 65536 && blen(nonce) < 1024 && (blen(content) == 130 || blen(content) == 146)
+  ensures result is Option::Some ==> blen(result.Some) <= 512
+```
+
+Internal: the signature over `content` (the CertificateVerify contents) of
+the key `kind` (1 RSA: `ka` the modulus, `kb` the private exponent; 2 ECDSA
+P-256: `ka` the scalar) under `scheme` (1027 or 2052), or None. `nonce` is
+32 secret bytes that are not used again.
+
+### `tls13_client_signed_content`
+
+```bastio
+fn tls13_client_signed_content(h: &Bytes) -> Bytes
+  requires blen(h) == 32 || blen(h) == 48
+  ensures blen(result) == 98 + blen(h)
+```
+
+Internal: what the client signs in its CertificateVerify.

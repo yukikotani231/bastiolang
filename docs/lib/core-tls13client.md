@@ -27,7 +27,7 @@ Not done: certificate path length and name constraints, extended key usage
 and revocation checks; session tickets; a
 check that the random values are random (the caller supplies them).
 
-`import "core/tls13client.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/endian.bastio](core-endian.md), [core/text.bastio](core-text.md), [core/sha256.bastio](core-sha256.md), [core/sha512.bastio](core-sha512.md), [core/hkdf.bastio](core-hkdf.md), [core/tls13.bastio](core-tls13.md), [core/tls13hs.bastio](core-tls13hs.md), [core/aes.bastio](core-aes.md), [core/aesgcm.bastio](core-aesgcm.md), [core/chacha20.bastio](core-chacha20.md), [core/poly1305.bastio](core-poly1305.md), [core/chacha20poly1305.bastio](core-chacha20poly1305.md), [core/tls13record.bastio](core-tls13record.md), [core/x25519.bastio](core-x25519.md), [core/der.bastio](core-der.md), [core/ed25519.bastio](core-ed25519.md), [core/p256.bastio](core-p256.md), [core/p384.bastio](core-p384.md), [core/rsa.bastio](core-rsa.md), [core/x509.bastio](core-x509.md).
+`import "core/tls13client.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/endian.bastio](core-endian.md), [core/text.bastio](core-text.md), [core/sha256.bastio](core-sha256.md), [core/sha512.bastio](core-sha512.md), [core/hkdf.bastio](core-hkdf.md), [core/tls13.bastio](core-tls13.md), [core/der.bastio](core-der.md), [core/p256.bastio](core-p256.md), [core/rsa.bastio](core-rsa.md), [core/tls13hs.bastio](core-tls13hs.md), [core/aes.bastio](core-aes.md), [core/aesgcm.bastio](core-aesgcm.md), [core/chacha20.bastio](core-chacha20.md), [core/poly1305.bastio](core-poly1305.md), [core/chacha20poly1305.bastio](core-chacha20poly1305.md), [core/tls13record.bastio](core-tls13record.md), [core/x25519.bastio](core-x25519.md), [core/ed25519.bastio](core-ed25519.md), [core/p384.bastio](core-p384.md), [core/x509.bastio](core-x509.md).
 
 | Function | |
 | --- | --- |
@@ -43,6 +43,7 @@ check that the random values are random (the caller supplies them).
 | [`tls13c_verdict`](#tls13c_verdict) | 0 when the server's certificate chain was checked and good; otherwise 10 when only the host name is not the certificate's, or 6 (the code a client that verifies fails with in both cases; a client that verifies keeps the refused certificate and this verdict too, after the failure). |
 | [`tls13c_peer_cert`](#tls13c_peer_cert) | The server's own certificate (DER, a copy), once the client has it (state 3 or later); empty before. |
 | [`tls13c_state`](#tls13c_state) | The state of `c`. |
+| [`tls13c_identity`](#tls13c_identity) | Gives the client a certificate to show if the server asks for one (TLS 1.3). |
 | [`tls13c_feed`](#tls13c_feed) | Gives the client the bytes `data` that arrived from the server. |
 | [`tls13c_send`](#tls13c_send) | Seals `data` as application data records and appends them to `out`. |
 | [`tls13c_close`](#tls13c_close) | Appends a close_notify alert to `out` and closes the connection on this side. |
@@ -65,7 +66,8 @@ struct Tls13Client {
   verify: bool, verdict: u64, alpn: Bytes, sent_close: bool,
   allow12: bool, v12: bool, step: u64, rnd: Bytes, ms: Bytes, ems: bool, cs12: u64,
   sk_kind: u64, sk_a: Bytes, sk_b: Bytes,
-  creq: u64, croots: Bytes, cleaf: Bytes, cnow: u64, cverdict: u64
+  creq: u64, croots: Bytes, cleaf: Bytes, cnow: u64, cverdict: u64,
+  ck_kind: u64, ck_nonce: Bytes
 }
 ```
 
@@ -360,6 +362,37 @@ EncryptedExtensions, 2 for the Certificate, 3 for the CertificateVerify, 4
 for the Finished, 5 connected, 6 closed by the peer, 7 failed. A server
 still waiting for the client's certificate is in state 4 too.
 
+### `tls13c_identity`
+
+```bastio
+fn tls13c_identity(c: &mut Tls13Client, chain: &Bytes, kind: u64, ka: &Bytes, kb: &Bytes, nonce: &Bytes)
+  requires tls13c_ok(c) && blen(chain) < 1048576 && blen(ka) < 65536 && blen(kb) < 65536 && blen(nonce) < 1024
+  ensures tls13c_ok(c)
+```
+
+Gives the client a certificate to show if the server asks for one (TLS
+1.3): `chain` is the DER certificates, the client's own first, `kind` 1 for
+an RSA key (`ka` the modulus, `kb` the private exponent, signing with
+rsa_pss_rsae_sha256) or 2 for an ECDSA P-256 key (`ka` the scalar), and
+`nonce` 32 unpredictable bytes. A server that asks and a client without a
+usable key get an empty Certificate.
+
+Example:
+
+```bastio
+let mut c = tls13c_blank();
+let chain = balloc(0);
+let ka = balloc(32);
+let kb = balloc(0);
+let nonce = balloc(32);
+if tls13c_check(c) { tls13c_identity(&mut c, chain, 2, ka, kb, nonce); }
+bfree(nonce);
+bfree(kb);
+bfree(ka);
+bfree(chain);
+tls13c_free(c);
+```
+
 ### `tls13c_feed`
 
 ```bastio
@@ -522,7 +555,7 @@ spec fn tls13c_ok(c: &Tls13Client) -> bool {
     && blen(c.transcript) < 1073741824 && blen(c.inbuf) < 1073741824 && blen(c.hsbuf) < 1073741824 && blen(c.leaf) < 1048576
     && blen(c.alpn) <= 256 && blen(c.rnd) <= 64 && blen(c.ms) <= 48
     && blen(c.sk_a) < 65536 && blen(c.sk_b) < 65536
-    && blen(c.croots) < 274877906944 && blen(c.cleaf) < 1048576
+    && blen(c.croots) < 274877906944 && blen(c.cleaf) < 1048576 && blen(c.ck_nonce) < 1024
 }
 ```
 
@@ -718,6 +751,17 @@ fn tls13c_application_keys(c: &mut Tls13Client)
 Internal: the application traffic secrets and keys, with the server's
 Finished already in the transcript.
 
+### `tls13c_application_keys_for`
+
+```bastio
+fn tls13c_application_keys_for(c: &mut Tls13Client, h: &Bytes)
+  requires tls13c_ok(c) && blen(h) == blen(c.hs_secret)
+  ensures tls13c_ok(c)
+```
+
+Internal: the application keys for the transcript hash `h` (through the
+server's Finished).
+
 ### `tls13c_server_hello`
 
 ```bastio
@@ -790,6 +834,28 @@ fn tls13c_send_record(c: &mut Tls13Client, ty: u8, plain: &Bytes, out: &mut Vec[
 Internal: appends a record of type `ty` carrying `plain`, sealed with
 the client's keys, to `out`.
 
+### `tls13c_send_message`
+
+```bastio
+fn tls13c_send_message(c: &mut Tls13Client, msg: &Bytes, out: &mut Vec[u8]) -> bool
+  requires tls13c_ok(c) && blen(msg) < 1048576
+  ensures tls13c_ok(c)
+```
+
+Internal: adds the handshake message `msg` to the transcript and sends it,
+sealed with the client's keys, in as many records as it takes.
+
+### `tls13c_client_flight`
+
+```bastio
+fn tls13c_client_flight(c: &mut Tls13Client, out: &mut Vec[u8]) -> u64
+  requires tls13c_ok(c)
+  ensures tls13c_ok(c)
+```
+
+Internal: sends the client's Certificate, and its CertificateVerify when
+the server asked for a certificate and the client has one that fits.
+
 ### `tls13c_finished`
 
 ```bastio
@@ -821,6 +887,17 @@ fn tls13c_after(c: &mut Tls13Client, msg: &Bytes, out: &mut Vec[u8]) -> u64
 
 Internal: handles a handshake message `msg` after the handshake (state 5):
 NewSessionTicket is ignored and KeyUpdate changes the keys.
+
+### `tls13c_cert_request`
+
+```bastio
+fn tls13c_cert_request(c: &mut Tls13Client, msg: &Bytes) -> u64
+  requires tls13c_ok(c) && blen(msg) < 1048576
+  ensures tls13c_ok(c)
+```
+
+Internal: handles a CertificateRequest `msg` (state 2): the client picks
+a signature scheme for its own key, or none.
 
 ### `tls13c_message`
 

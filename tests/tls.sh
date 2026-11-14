@@ -349,6 +349,42 @@ open(out, "wb").write(key)' "$2" "$tmp/$1.raw"
   sserve rsalocal.der rsalocal 1 && sclient "server: RSA certificate (rsa_pss_rsae_sha256)" 0 "Peer signature type: RSA-PSS" rsaca.pem
   sserve chain2.der chainleaf 2 && sclient "server: chain through an intermediate" 0 "hello alpn" ecca.pem
   sserve rsalocal.der eclocal 2 && sclient "server: key that does not match the certificate" 1 "" rsaca.pem
+  # A client certificate that httpsget shows when OpenSSL's server asks for one.
+  openssl x509 -in "$tmp/clicert.pem" -outform DER -out "$tmp/clicert.der"
+  openssl x509 -in "$tmp/clirsa.pem" -outform DER -out "$tmp/clirsa.der"
+  openssl x509 -in "$tmp/clifake.pem" -outform DER -out "$tmp/clifake.der"
+  rawkey clicert ec; rawkey clirsa rsa; rawkey clifake ec
+  authserve() { # mode (verify: asks, Verify: requires)
+    port=$((port + 1))
+    openssl s_server -www -accept "127.0.0.1:$port" -tls1_3 -ciphersuites "$suites" -groups X25519 \
+      -cert "$tmp/eclocal.pem" -key "$tmp/eclocal.key" -CAfile "$tmp/ecca.pem" -verify_return_error -"$1" 1 >"$tmp/server.log" 2>&1 &
+    pids+=($!)
+    local i
+    for i in $(seq 1 100); do
+      (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && return 0
+      sleep 0.1
+    done
+    echo "tls: the server did not start"; cat "$tmp/server.log"; return 1
+  }
+  cclient() { # description want(0|1) [chain kind key]
+    local d=$1 want=$2 id=()
+    [ -n "${3:-}" ] && id=("$tmp/$3.der" "$4" "$tmp/$5.raw")
+    timeout 60 "$tmp/httpsget" "$port" localhost "$tmp/ec.roots" "$tmp/seed" "$(date +%s)" 0 "${id[@]}" > "$tmp/out" 2>&1
+    local rc=$?
+    if [ "$want" = 0 ] && [ $rc != 0 ]; then fail "$d: exit $rc"; sed 's/^/    /' "$tmp/out" | head -5
+    elif [ "$want" != 0 ] && [ $rc = 0 ]; then fail "$d: accepted"; sed 's/^/    /' "$tmp/out" | head -5
+    else echo "ok   $d"; fi
+  }
+  authserve Verify && {
+    cclient "client certificate (required): ECDSA" 0 clicert 2 clicert
+    cclient "client certificate (required): RSA" 0 clirsa 1 clirsa
+    cclient "client certificate (required): none" 1
+    cclient "client certificate (required): certificate of another CA" 1 clifake 2 clifake
+  }
+  authserve verify && {
+    cclient "client certificate (asked): ECDSA" 0 clicert 2 clicert
+    cclient "client certificate (asked): none" 0
+  }
 fi
 
 [ $fails = 0 ] && echo "tls: all passed" || { echo "tls: $fails failed"; exit 1; }

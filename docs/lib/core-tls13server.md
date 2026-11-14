@@ -22,7 +22,7 @@ proved: that the protocol is followed (tests/tls.sh runs OpenSSL's client
 against it). Not done: HelloRetryRequest (a client that sends no X25519
 share is refused), client certificates, session tickets and early data.
 
-`import "core/tls13server.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/endian.bastio](core-endian.md), [core/text.bastio](core-text.md), [core/sha256.bastio](core-sha256.md), [core/sha512.bastio](core-sha512.md), [core/hkdf.bastio](core-hkdf.md), [core/tls13.bastio](core-tls13.md), [core/tls13hs.bastio](core-tls13hs.md), [core/aes.bastio](core-aes.md), [core/aesgcm.bastio](core-aesgcm.md), [core/chacha20.bastio](core-chacha20.md), [core/poly1305.bastio](core-poly1305.md), [core/chacha20poly1305.bastio](core-chacha20poly1305.md), [core/tls13record.bastio](core-tls13record.md), [core/x25519.bastio](core-x25519.md), [core/der.bastio](core-der.md), [core/ed25519.bastio](core-ed25519.md), [core/p256.bastio](core-p256.md), [core/p384.bastio](core-p384.md), [core/rsa.bastio](core-rsa.md), [core/x509.bastio](core-x509.md), [core/tls13client.bastio](core-tls13client.md).
+`import "core/tls13server.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/endian.bastio](core-endian.md), [core/text.bastio](core-text.md), [core/sha256.bastio](core-sha256.md), [core/sha512.bastio](core-sha512.md), [core/hkdf.bastio](core-hkdf.md), [core/tls13.bastio](core-tls13.md), [core/der.bastio](core-der.md), [core/p256.bastio](core-p256.md), [core/rsa.bastio](core-rsa.md), [core/tls13hs.bastio](core-tls13hs.md), [core/aes.bastio](core-aes.md), [core/aesgcm.bastio](core-aesgcm.md), [core/chacha20.bastio](core-chacha20.md), [core/poly1305.bastio](core-poly1305.md), [core/chacha20poly1305.bastio](core-chacha20poly1305.md), [core/tls13record.bastio](core-tls13record.md), [core/x25519.bastio](core-x25519.md), [core/ed25519.bastio](core-ed25519.md), [core/p384.bastio](core-p384.md), [core/x509.bastio](core-x509.md), [core/tls13client.bastio](core-tls13client.md).
 
 | Function | |
 | --- | --- |
@@ -315,26 +315,6 @@ Internal: the CertificateRequest message (RFC 8446 section 4.3.2): an
 empty request context and the signature_algorithms extension with the
 schemes `tls13c_certificate_verify` can check.
 
-### `tls13s_push_u24`
-
-```bastio
-fn tls13s_push_u24(t: &mut Vec[u8], v: u64)
-  requires v < 16777216
-  ensures vlen(t) == vlen(old(t)) + 3
-```
-
-Internal: appends the 24-bit big-endian number `v` to `t`.
-
-### `tls13s_wrap`
-
-```bastio
-fn tls13s_wrap(ty: u8, body: Bytes) -> Bytes
-  requires blen(body) < 16777216
-  ensures blen(result) == blen(body) + 4
-```
-
-Internal: the handshake message of type `ty` with the contents `body`.
-
 ### `tls13s_plain`
 
 ```bastio
@@ -366,39 +346,6 @@ fn tls13s_send_message(c: &mut Tls13Client, msg: &Bytes, out: &mut Vec[u8]) -> b
 Internal: adds the handshake message `msg` to the transcript and sends
 it, sealed, in as many records as it takes.
 
-### `tls13s_der_len`
-
-```bastio
-fn tls13s_der_len(b: &Bytes, at: u64) -> u64
-  requires at <= blen(b)
-  ensures result == 0 || (result >= 2 && result <= blen(b) - at)
-```
-
-Internal: the length of the DER element at `b[at..]` with its header, or
-0 when it is not a SEQUENCE that fits.
-
-### `tls13s_certificate`
-
-```bastio
-fn tls13s_certificate(chain: &Bytes) -> Option[Bytes]
-  requires blen(chain) < 1048576
-  ensures result is Option::Some ==> blen(result.Some) < 8388608
-```
-
-Internal: the Certificate message for the DER certificates `chain`, or
-None when they do not split into certificates.
-
-### `tls13s_der_int`
-
-```bastio
-fn tls13s_der_int(t: &mut Vec[u8], b: &Bytes, from: u64)
-  requires from + 32 <= blen(b)
-  ensures vlen(t) <= vlen(old(t)) + 35
-```
-
-Internal: appends the DER INTEGER for the 32-byte big-endian number at
-`b[from..from+32]`.
-
 ### `tls13s_sign`
 
 ```bastio
@@ -408,7 +355,7 @@ fn tls13s_sign(c: &Tls13Client, h: &Bytes, scheme: u64) -> Option[Bytes]
 ```
 
 Internal: the signature of the server's key over the CertificateVerify
-contents for the transcript hash `h`, and the scheme, or None.
+contents for the transcript hash `h`, or None.
 
 ### `tls13s_hello_free`
 
@@ -498,16 +445,6 @@ fn tls13s_client_certificate(c: &mut Tls13Client, msg: &Bytes) -> u64
 ```
 
 Internal: handles the client's Certificate `msg` (state 8).
-
-### `tls13s_signed_content`
-
-```bastio
-fn tls13s_signed_content(h: &Bytes) -> Bytes
-  requires blen(h) == 32 || blen(h) == 48
-  ensures blen(result) == 98 + blen(h)
-```
-
-Internal: what the client signs in its CertificateVerify.
 
 ### `tls13s_client_verify`
 
