@@ -30,6 +30,7 @@ listener, a closed descriptor, an address in use) gives `Option::None` or
 | [`net_udp_open`](#net_udp_open) | A non-blocking UDP socket bound to the IPv4 address `ip` and `port` (0. |
 | [`net_udp_send`](#net_udp_send) | Sends `data` as one datagram from the UDP socket `sock` to `ip`:`port`. |
 | [`net_udp_recv`](#net_udp_recv) | Receives one datagram of at most `max` bytes (at most 65535) into `out` (replacing it) without waiting. |
+| [`net_setopt`](#net_setopt) | Sets an option of the socket `sock` from the bytes `value`. |
 | [`net_sockname`](#net_sockname) | The address of a socket. |
 | [`net_sockname_port`](#net_sockname_port) | The port in an answer of `net_sockname`. |
 | [`net_sockname_family`](#net_sockname_family) | The address family (4 or 6) in an answer of `net_sockname`. |
@@ -525,6 +526,29 @@ match net_udp_open(host, lo, 0) {
   },
   Option::None => {},
 }
+```
+
+### `net_setopt`
+
+```bastio
+fn net_setopt(h: &Host, sock: u64, opt: u64, value: &Bytes) -> bool
+```
+
+Sets an option of the socket `sock` from the bytes `value`: `opt` 1 joins
+and 2 leaves an IPv4 multicast group (`value` is the group address and
+then the interface address, 4 bytes each, network order, 0.0.0.0 for any
+interface), 3 chooses the interface multicast datagrams leave by (4
+bytes), 4 sets the multicast TTL, 5 multicast loopback (0 or 1), 6 the
+TTL and 7 SO_BROADCAST (0 or 1; one byte each). False on failure and on
+targets without it (only the Linux C backend has it).
+
+Example:
+
+```bastio
+let v = balloc(1);
+let ok = net_setopt(host, 0, 6, v);
+bfree(v);
+if ok { return 1; }
 ```
 
 ### `net_sockname`
