@@ -1016,6 +1016,7 @@ On the hosted target, `main` can ask for `&mut Host`: the program's command line
 | `child_fd(c: &Child, which: u64) -> u64` | The descriptor of the child's standard input (`which` 0), output (1) or error pipe (2, only for `host_spawn_err`), for a caller that polls; `u64::MAX` if there is none (stage1 only, C backend only so far) |
 | `child_try_read(c: &mut Child, which: u64, out: &mut Bytes) -> u64` | Reads what the pipe has now without waiting: 0 and `out` replaced by the chunk (up to 64 KiB), 1 if nothing is there yet, 2 at the end of the stream. Reads the descriptor itself, so do not mix it with `child_read_line` on the same stream (stage1 only, C backend only so far) |
 | `child_try_wait(c: &Child) -> u64` | 256 while the child runs, else its exit status as `child_wait` reports it, except that a child ended by a signal gives 512 plus the signal number (an exit status of 130 and death by signal 2 stay apart). It does not reap the child: `child_wait` must still be called (stage1 only, C backend only so far) |
+| `child_pid(c: &Child) -> u64` | The operating system's process id of the child (0 if it could not be started), for `os_kill` and for programs that report it (stage1 only, C backend only so far) |
 | `child_kill(c: &Child, sig: u64) -> bool` | Sends signal `sig` to the child, which `child_wait` has not yet waited for (on Windows any signal but 0 ends it, and 0 asks whether it still runs); false if that failed or the child could not be started (stage1 only, C backend only so far) |
 
 ```bastio
