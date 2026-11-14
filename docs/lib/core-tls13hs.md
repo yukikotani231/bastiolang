@@ -107,7 +107,7 @@ if cast[u64](ln) + 4 != n || !grew { return 1; }
 ### `tls13_client_hello_v12`
 
 ```bastio
-fn tls13_client_hello_v12(random: &Bytes, session_id: &Bytes, server_name: &Bytes, key_share: &Bytes, alpn: &Bytes) -> Bytes
+fn tls13_client_hello_v12(random: &Bytes, session_id: &Bytes, server_name: &Bytes, key_share: &Bytes, alpn: &Bytes, only12: bool) -> Bytes
   requires blen(random) == 32 && blen(session_id) == 32 && blen(key_share) == 32 && blen(server_name) <= 255 && blen(alpn) <= 256
   ensures blen(result) > 4 && blen(result) < 1200
 ```
@@ -129,7 +129,7 @@ let sid = balloc(32);
 let key = balloc(32);
 let name = bfrom("example.com");
 let alpn = balloc(0);
-let hello = tls13_client_hello_v12(random, sid, name, key, alpn);
+let hello = tls13_client_hello_v12(random, sid, name, key, alpn, false);
 let n = blen(hello);
 let ln = load_be16(hello, 2);
 bfree(hello);
