@@ -13,7 +13,7 @@ syn keyword bastioRepeat while
 syn keyword bastioStatement return unreachable assert
 syn keyword bastioSpec requires ensures invariant forall
 syn keyword bastioBoolean true false
-syn keyword bastioType u8 u16 u32 u64 i8 i16 i32 i64 bool Str Bytes Vec Box Option Lock Atomic Thread SharedBytes
+syn keyword bastioType u8 u16 u32 u64 i8 i16 i32 i64 bool Str Bytes Vec Box Option Lock Atomic Thread SharedBytes Chan Share
 syn keyword bastioType Serial Pool Frame PageTable Shared Dirty Mmu Cpu Lease Ports PortIo MmioSpace Mmio Dma Host Child
 syn keyword bastioBuiltin cast wrap old result
 

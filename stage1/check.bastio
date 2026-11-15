@@ -651,7 +651,7 @@ fn def_node(m: &Mono, p: &Parser, x: u64) -> Node {
 /// Is a value of type `t` linear (must it be consumed exactly once)?
 fn ck_linear(c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
   let k = kind_t(m, t);
-  if (k >= TY_BUF && k <= TY_DMA) || k == TY_LEASE || k == TY_SHARED || k == TY_DIRTY || k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_ATOMIC || k == TY_THREAD || k == TY_SBYTES {
+  if (k >= TY_BUF && k <= TY_DMA) || k == TY_LEASE || k == TY_SHARED || k == TY_DIRTY || k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_ATOMIC || k == TY_THREAD || k == TY_SBYTES || k == TY_CHAN || k == TY_SHARE {
     return true;
   }
   if k == TY_STRUCT || k == TY_ENUM {
@@ -677,7 +677,7 @@ fn is_pinned(c: &Checker, m: &Mono, p: &Parser, t: u64) -> bool {
   if k == TY_MMU || k == TY_CPU || k == TY_LEASE {
     return true;
   }
-  if k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_ATOMIC || k == TY_THREAD || k == TY_REF || k == TY_MUTREF {
+  if k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_ATOMIC || k == TY_THREAD || k == TY_CHAN || k == TY_SHARE || k == TY_REF || k == TY_MUTREF {
     return is_pinned(c, m, p, inner_t(m, t));
   }
   if k == TY_STRUCT || k == TY_ENUM {
@@ -804,6 +804,8 @@ fn tyn_to(out: &mut Vec[u64], m: &Mono, p: &Parser, t: u64) {
   else if k == TY_LOCK { w_s(&mut out, "Lock["); tyn_to(&mut out, m, p, x.a); w_s(&mut out, "]"); }
   else if k == TY_ATOMIC { w_s(&mut out, "Atomic["); tyn_to(&mut out, m, p, x.a); w_s(&mut out, "]"); }
   else if k == TY_THREAD { w_s(&mut out, "Thread["); tyn_to(&mut out, m, p, x.a); w_s(&mut out, "]"); }
+  else if k == TY_CHAN { w_s(&mut out, "Chan["); tyn_to(&mut out, m, p, x.a); w_s(&mut out, "]"); }
+  else if k == TY_SHARE { w_s(&mut out, "Share["); tyn_to(&mut out, m, p, x.a); w_s(&mut out, "]"); }
   else if k == TY_REF { w_s(&mut out, "&"); tyn_to(&mut out, m, p, x.a); }
   else if k == TY_MUTREF { w_s(&mut out, "&mut "); tyn_to(&mut out, m, p, x.a); }
 }
@@ -1171,11 +1173,23 @@ fn is_code_builtin(p: &Parser, s: u64, e: u64) -> bool {
 
 /// The builtins that start a thread and wait for it (stage1, hosted).
 fn is_thread_builtin(p: &Parser, s: u64, e: u64) -> bool {
-  return span_is(p, s, e, "thread_spawn") || span_is(p, s, e, "thread_join");
+  return span_is(p, s, e, "thread_spawn") || span_is(p, s, e, "thread_join") || span_is(p, s, e, "par_each");
+}
+
+/// The channel builtins (stage1, hosted).
+fn is_chan_builtin(p: &Parser, s: u64, e: u64) -> bool {
+  return span_is(p, s, e, "chan_new") || span_is(p, s, e, "chan_clone") || span_is(p, s, e, "chan_send")
+    || span_is(p, s, e, "chan_recv") || span_is(p, s, e, "chan_len") || span_is(p, s, e, "chan_drop");
+}
+
+/// The builtins of `Share` (stage1, hosted).
+fn is_share_builtin(p: &Parser, s: u64, e: u64) -> bool {
+  return span_is(p, s, e, "share_new") || span_is(p, s, e, "share_clone") || span_is(p, s, e, "share_with")
+    || span_is(p, s, e, "share_drop");
 }
 
 fn is_builtin_name(c: &Checker, p: &Parser, s: u64, e: u64) -> bool {
-  return is_thread_builtin(p, s, e) || span_is(p, s, e, "box") || span_is(p, s, e, "try_box") || span_is(p, s, e, "unbox") || span_is(p, s, e, "cast") || span_is(p, s, e, "wrap")
+  return is_thread_builtin(p, s, e) || is_chan_builtin(p, s, e) || is_share_builtin(p, s, e) || span_is(p, s, e, "box") || span_is(p, s, e, "try_box") || span_is(p, s, e, "unbox") || span_is(p, s, e, "cast") || span_is(p, s, e, "wrap")
     || span_is(p, s, e, "smp_run") || span_is(p, s, e, "stencil") || span_is(p, s, e, "code_call") || is_pt_borrow_builtin(p, s, e) || is_lock_builtin(p, s, e) || is_atomic_builtin(p, s, e)
     || is_vec_builtin(p, s, e) || is_wrap_builtin(p, s, e) || bs_index(c, p, s, e) != 0;
 }
@@ -1884,7 +1898,7 @@ fn known_type(c: &mut Checker, m: &Mono, p: &Parser, t: u64, loc: u64) {
   let k = kind_t(m, t);
   if k == TY_UNKNOWN {
     cm_unknown_type(&mut c, m, p, loc, t);
-  } else if k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_ATOMIC || k == TY_THREAD || k == TY_REF || k == TY_MUTREF {
+  } else if k == TY_BOX || k == TY_VEC || k == TY_LOCK || k == TY_ATOMIC || k == TY_THREAD || k == TY_CHAN || k == TY_SHARE || k == TY_REF || k == TY_MUTREF {
     known_type(&mut c, m, p, inner_t(m, t), loc);
   }
 }
@@ -1901,7 +1915,7 @@ fn is_reserved_type(p: &Parser, s: u64, e: u64) -> bool {
     || span_is(p, s, e, "Cpu") || span_is(p, s, e, "Ports") || span_is(p, s, e, "PortIo")
     || span_is(p, s, e, "MmioSpace") || span_is(p, s, e, "Mmio") || span_is(p, s, e, "Dma")
     || span_is(p, s, e, "Lease") || span_is(p, s, e, "Shared") || span_is(p, s, e, "Dirty") || span_is(p, s, e, "Lock") || span_is(p, s, e, "Atomic")
-    || span_is(p, s, e, "Thread") || span_is(p, s, e, "SharedBytes");
+    || span_is(p, s, e, "Thread") || span_is(p, s, e, "SharedBytes") || span_is(p, s, e, "Chan") || span_is(p, s, e, "Share");
 }
 
 /// Struct and enum instances: no reserved names, known field and payload
@@ -1925,7 +1939,7 @@ fn check_structs(c: &mut Checker, m: &Mono, p: &Parser) {
     let mut j = 0;
     while j < n {
       let mut u = fld_ty(c, x, j);
-      while kind_t(m, u) == TY_BOX || kind_t(m, u) == TY_VEC || kind_t(m, u) == TY_LOCK || kind_t(m, u) == TY_ATOMIC || kind_t(m, u) == TY_THREAD {
+      while kind_t(m, u) == TY_BOX || kind_t(m, u) == TY_VEC || kind_t(m, u) == TY_LOCK || kind_t(m, u) == TY_ATOMIC || kind_t(m, u) == TY_THREAD || kind_t(m, u) == TY_CHAN || kind_t(m, u) == TY_SHARE {
         u = inner_t(m, u);
       }
       if u != 0 && kind_t(m, u) == TY_UNKNOWN {
@@ -3937,6 +3951,12 @@ fn ck_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64, inst: u64) -> u64 
   if is_thread_builtin(p, s, e) {
     return thread_call(&mut c, &mut m, p, i);
   }
+  if is_chan_builtin(p, s, e) {
+    return chan_call(&mut c, &mut m, p, i);
+  }
+  if is_share_builtin(p, s, e) {
+    return share_call(&mut c, &mut m, p, i);
+  }
   if is_pt_borrow_builtin(p, s, e) {
     return pt_borrow_call(&mut c, &mut m, p, i);
   }
@@ -4376,6 +4396,9 @@ fn thread_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
     }
     return inner_t(m, t);
   }
+  if name_is(p, i, "par_each") {
+    return par_each_call(&mut c, &mut m, p, i);
+  }
   let x = named_fn(&mut c, &mut m, p, i, a0);
   if c.failed {
     return 0;
@@ -4434,6 +4457,321 @@ fn thread_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
     return 0;
   }
   return intern(&mut m, p, TY_THREAD, r);
+}
+
+/// `par_each(&mut v, f, args..)` (hosted, stage1 only): calls
+/// `f(&mut v[k], args..)` for every element `k` of `v`, spread over as many
+/// threads as the machine has processors, and returns when every call has
+/// returned. Each call gets an element of its own, so no two threads write
+/// the same memory; every other argument is a shared borrow of a value with
+/// no capability in it, or a copy, so what the threads share cannot change
+/// but through a `Lock`, an `Atomic` or a `SharedBytes`.
+fn par_each_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
+  let n = node_at(p.nodes, i);
+  let a0 = n.a;
+  let mut a1 = 0;
+  if a0 != 0 {
+    a1 = next_of(p, a0);
+  }
+  let x = named_fn(&mut c, &mut m, p, i, a1);
+  if c.failed {
+    return 0;
+  }
+  let xi = inst_at(m, x);
+  let fps = fn_params(&mut m, p, xi.def, x);
+  let dn = node_at(p.nodes, xi.def);
+  let r = conv(&mut m, p, dn.b, x, xi.def);
+  if r != c.tunit {
+    vec_free(fps);
+    if cm_new(&mut c, p, a1, C_TYPE) {
+      cm_s(&mut c, "`");
+      cm_inst(&mut c, m, p, x);
+      cm_s(&mut c, "` must return nothing to run on every element");
+    }
+    return 0;
+  }
+  let mut el = 0;
+  if vec_len(fps) > 0 && kind_t(m, u_at(fps, 0)) == TY_MUTREF {
+    el = inner_t(m, u_at(fps, 0));
+  }
+  if el == 0 || (kind_t(m, el) != TY_STRUCT && kind_t(m, el) != TY_ENUM) {
+    vec_free(fps);
+    if cm_new(&mut c, p, a1, C_TYPE) {
+      cm_s(&mut c, "`");
+      cm_inst(&mut c, m, p, x);
+      cm_s(&mut c, "` must take `&mut` of a struct or an enum first, to receive the element `par_each` lends");
+    }
+    return 0;
+  }
+  if is_pinned(c, m, p, el) {
+    vec_free(fps);
+    if cm_new(&mut c, p, a1, C_PIN) {
+      cm_s(&mut c, "a ");
+      cm_ty(&mut c, m, p, el);
+      cm_s(&mut c, " cannot be handed to another thread: it holds a capability of this processor");
+    }
+    return 0;
+  }
+  let mut j = 1;
+  while j < vec_len(fps) {
+    let t = u_at(fps, j);
+    let k = kind_t(m, t);
+    let mut ok = false;
+    if k == TY_REF {
+      ok = !is_pinned(c, m, p, inner_t(m, t));
+    } else if k != TY_MUTREF {
+      ok = !ck_linear(c, m, p, t) && !is_pinned(c, m, p, t);
+    }
+    if !ok {
+      vec_free(fps);
+      if cm_new(&mut c, p, a1, C_TYPE) {
+        cm_s(&mut c, "`");
+        cm_inst(&mut c, m, p, x);
+        cm_s(&mut c, "` cannot run on many threads at once: its parameter of type ");
+        cm_ty(&mut c, m, p, t);
+        cm_s(&mut c, " would be shared between them");
+        cm_note(&mut c, "after the element, each parameter must be a shared borrow `&T` or a copy; a thread changes only its own element, or shared memory through a `Lock`, an `Atomic` or a `SharedBytes`");
+      }
+      return 0;
+    }
+    j = j + 1;
+  }
+  note_call(&mut c, x);
+  let vt = intern(&mut m, p, TY_VEC, el);
+  let mut ps = vec_new[u64]();
+  vec_push(&mut ps, mut_to(&mut m, p, vt));
+  j = 1;
+  while j < vec_len(fps) {
+    vec_push(&mut ps, u_at(fps, j));
+    j = j + 1;
+  }
+  vec_free(fps);
+  let mut args = vec_new[u64]();
+  if a0 != 0 {
+    vec_push(&mut args, a0);
+  }
+  let mut a = 0;
+  if a1 != 0 {
+    a = next_of(p, a1);
+  }
+  while a != 0 {
+    vec_push(&mut args, a);
+    a = next_of(p, a);
+  }
+  let t = call_with_v(&mut c, &mut m, p, ps, c.tunit, args, i, x);
+  vec_free(ps);
+  vec_free(args);
+  return t;
+}
+
+/// The channel builtins (hosted, stage1 only). A `Chan[T]` is a handle to
+/// a queue of `T`s that any number of threads send to and receive from;
+/// sending moves the value in and receiving moves it out, so a linear value
+/// has one owner at every moment, and the queue's mutex orders the sender's
+/// writes to it before the receiver's reads.
+fn chan_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
+  if c.target != TARGET_HOSTED {
+    if cm_new(&mut c, p, i, C_TARGET) {
+      cm_s(&mut c, "`");
+      cm_name(&mut c, p, i);
+      cm_s(&mut c, "` is not available on this target");
+    }
+    return 0;
+  }
+  let n = node_at(p.nodes, i);
+  let a0 = n.a;
+  if name_is(p, i, "chan_new") || name_is(p, i, "chan_drop") {
+    if list_len(p, a0) != 1 {
+      cm_arity(&mut c, p, i, 1);
+      return 0;
+    }
+    let t = ck_expr(&mut c, &mut m, p, a0);
+    if c.failed {
+      return 0;
+    }
+    if name_is(p, i, "chan_new") {
+      if kind_t(m, t) != TY_VEC {
+        cm_needs(&mut c, m, p, a0, "`chan_new` needs the vector of values the channel starts with, found ", t);
+        return 0;
+      }
+      if is_pinned(c, m, p, t) {
+        if cm_new(&mut c, p, a0, C_PIN) {
+          cm_s(&mut c, "a ");
+          cm_ty(&mut c, m, p, inner_t(m, t));
+          cm_s(&mut c, " cannot be sent to another thread: it holds a capability of this processor");
+        }
+        return 0;
+      }
+      return intern(&mut m, p, TY_CHAN, inner_t(m, t));
+    }
+    if kind_t(m, t) != TY_CHAN {
+      cm_needs(&mut c, m, p, a0, "`chan_drop` needs a Chan, found ", t);
+      return 0;
+    }
+    return intern(&mut m, p, TY_VEC, inner_t(m, t));
+  }
+  let mut pk = 0;
+  if a0 != 0 {
+    pk = place_of(&mut c, p, a0);
+  }
+  if pk == 0 {
+    let mut loc = i;
+    if a0 != 0 {
+      loc = a0;
+    }
+    if cm_new(&mut c, p, loc, C_TYPE) {
+      cm_s(&mut c, "the first argument of `");
+      cm_name(&mut c, p, i);
+      cm_s(&mut c, "` must name a channel");
+    }
+    return 0;
+  }
+  let ct = path_type(&mut c, m, p, pk, a0);
+  if c.failed {
+    return 0;
+  }
+  if kind_t(m, ct) != TY_CHAN {
+    cm_call_needs(&mut c, m, p, a0, i, "` needs a Chan, found ", ct);
+    return 0;
+  }
+  let t = inner_t(m, ct);
+  let mut ps = vec_new[u64]();
+  vec_push(&mut ps, ref_to(&mut m, p, ct));
+  let mut r = c.tu64;
+  if name_is(p, i, "chan_clone") {
+    r = ct;
+  } else if name_is(p, i, "chan_send") {
+    vec_push(&mut ps, t);
+    r = c.tunit;
+  } else if name_is(p, i, "chan_recv") {
+    let vt = intern(&mut m, p, TY_VEC, t);
+    vec_push(&mut ps, mut_to(&mut m, p, vt));
+    vec_push(&mut ps, c.tu64);
+    r = c.tbool;
+  }
+  let r2 = call_with(&mut c, &mut m, p, ps, r, a0, i, 0);
+  vec_free(ps);
+  return r2;
+}
+
+/// The `Share` builtins (hosted, stage1 only). A `Share[T]` is a handle to
+/// a `T` that any number of threads read at once: nothing can change
+/// through a shared borrow except the contents of a `Lock` or `Atomic` (and
+/// the bytes of a `SharedBytes` and the queue of a `Chan`), which are made
+/// for it, so there is no data race. `share_with(s, f, args..)` calls
+/// `f(&contents, args..)`; the contents are reachable no other way.
+fn share_call(c: &mut Checker, m: &mut Mono, p: &Parser, i: u64) -> u64 {
+  if c.target != TARGET_HOSTED {
+    if cm_new(&mut c, p, i, C_TARGET) {
+      cm_s(&mut c, "`");
+      cm_name(&mut c, p, i);
+      cm_s(&mut c, "` is not available on this target");
+    }
+    return 0;
+  }
+  let n = node_at(p.nodes, i);
+  let a0 = n.a;
+  if name_is(p, i, "share_new") || name_is(p, i, "share_drop") {
+    if list_len(p, a0) != 1 {
+      cm_arity(&mut c, p, i, 1);
+      return 0;
+    }
+    let t = ck_expr(&mut c, &mut m, p, a0);
+    if c.failed {
+      return 0;
+    }
+    if name_is(p, i, "share_new") {
+      if is_pinned(c, m, p, t) {
+        if cm_new(&mut c, p, a0, C_PIN) {
+          cm_s(&mut c, "a ");
+          cm_ty(&mut c, m, p, t);
+          cm_s(&mut c, " cannot be shared between threads: it holds a capability of this processor");
+        }
+        return 0;
+      }
+      // The verifier reads every integer as a u64, so the type is recorded.
+      vec_push(&mut c.int_ops, IntOp { x: c.env, node: i, ty: t });
+      return intern(&mut m, p, TY_SHARE, t);
+    }
+    if kind_t(m, t) != TY_SHARE {
+      cm_needs(&mut c, m, p, a0, "`share_drop` needs a Share, found ", t);
+      return 0;
+    }
+    return intern(&mut m, p, TY_VEC, inner_t(m, t));
+  }
+  let mut pk = 0;
+  if a0 != 0 {
+    pk = place_of(&mut c, p, a0);
+  }
+  if pk == 0 {
+    let mut loc = i;
+    if a0 != 0 {
+      loc = a0;
+    }
+    if cm_new(&mut c, p, loc, C_TYPE) {
+      cm_s(&mut c, "the first argument of `");
+      cm_name(&mut c, p, i);
+      cm_s(&mut c, "` must name a share");
+    }
+    return 0;
+  }
+  let st = path_type(&mut c, m, p, pk, a0);
+  if c.failed {
+    return 0;
+  }
+  if kind_t(m, st) != TY_SHARE {
+    cm_call_needs(&mut c, m, p, a0, i, "` needs a Share, found ", st);
+    return 0;
+  }
+  if name_is(p, i, "share_clone") {
+    let mut ps = vec_new[u64]();
+    vec_push(&mut ps, ref_to(&mut m, p, st));
+    let r = call_with(&mut c, &mut m, p, ps, st, a0, i, 0);
+    vec_free(ps);
+    return r;
+  }
+  // share_with(s, f, args..)
+  let a1 = next_of(p, a0);
+  let x = named_fn(&mut c, &mut m, p, i, a1);
+  if c.failed {
+    return 0;
+  }
+  let xi = inst_at(m, x);
+  let fps = fn_params(&mut m, p, xi.def, x);
+  let dn = node_at(p.nodes, xi.def);
+  let r = conv(&mut m, p, dn.b, x, xi.def);
+  let inner = inner_t(m, st);
+  if vec_len(fps) == 0 || u_at(fps, 0) != ref_to(&mut m, p, inner) {
+    vec_free(fps);
+    if cm_new(&mut c, p, a1, C_TYPE) {
+      cm_s(&mut c, "`");
+      cm_inst(&mut c, m, p, x);
+      cm_s(&mut c, "` must take `&");
+      cm_ty(&mut c, m, p, inner);
+      cm_s(&mut c, "` first, to receive the contents of the share");
+    }
+    return 0;
+  }
+  note_call(&mut c, x);
+  let mut ps = vec_new[u64]();
+  vec_push(&mut ps, ref_to(&mut m, p, st));
+  let mut j = 1;
+  while j < vec_len(fps) {
+    vec_push(&mut ps, vec_get(fps, j));
+    j = j + 1;
+  }
+  vec_free(fps);
+  let mut args = vec_new[u64]();
+  vec_push(&mut args, a0);
+  let mut a = next_of(p, a1);
+  while a != 0 {
+    vec_push(&mut args, a);
+    a = next_of(p, a);
+  }
+  let t = call_with_v(&mut c, &mut m, p, ps, r, args, i, x);
+  vec_free(ps);
+  vec_free(args);
+  return t;
 }
 
 /// `stencil(f)` (hosted, stage1 only): f's number in the program's stencil

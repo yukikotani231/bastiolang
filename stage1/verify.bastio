@@ -553,6 +553,8 @@ fn push_ty(v: &mut Vr, m: &Mono, p: &Parser, t: u64) {
   else if k == TY_STRUCT || k == TY_ENUM { push_inst(&mut v, m, p, x.a); }
   else if k == TY_BOX { push_str(&mut v, "Box["); push_ty(&mut v, m, p, x.a); push_str(&mut v, "]"); }
   else if k == TY_THREAD { push_str(&mut v, "Thread["); push_ty(&mut v, m, p, x.a); push_str(&mut v, "]"); }
+  else if k == TY_CHAN { push_str(&mut v, "Chan["); push_ty(&mut v, m, p, x.a); push_str(&mut v, "]"); }
+  else if k == TY_SHARE { push_str(&mut v, "Share["); push_ty(&mut v, m, p, x.a); push_str(&mut v, "]"); }
   else if k == TY_VEC { push_str(&mut v, "Vec["); push_ty(&mut v, m, p, x.a); push_str(&mut v, "]"); }
   else if k == TY_REF { push_str(&mut v, "&"); push_ty(&mut v, m, p, x.a); }
   else if k == TY_MUTREF { push_str(&mut v, "&mut "); push_ty(&mut v, m, p, x.a); }
@@ -969,7 +971,9 @@ fn states_invariants(m: &Mono, p: &Parser, b: u64, none: &Vec[u64]) -> bool {
     || block_mentions_count(m, p, b, "lock_end", none) || block_mentions_count(m, p, b, "atomic_new", none)
     || block_mentions_count(m, p, b, "atomic_load", none) || block_mentions_count(m, p, b, "atomic_store", none)
     || block_mentions_count(m, p, b, "atomic_swap", none) || block_mentions_count(m, p, b, "atomic_cas", none)
-    || block_mentions_count(m, p, b, "atomic_wrap_add", none) || block_mentions_count(m, p, b, "atomic_end", none);
+    || block_mentions_count(m, p, b, "atomic_wrap_add", none) || block_mentions_count(m, p, b, "atomic_end", none)
+    || block_mentions_count(m, p, b, "share_new", none) || block_mentions_count(m, p, b, "share_with", none)
+    || block_mentions_count(m, p, b, "par_each", none);
 }
 
 /// (lambda ((q Int)) body)
@@ -4081,6 +4085,12 @@ fn vcall(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VSt
   if inst == 0 && name_is(p, i, "thread_spawn") {
     return vthread_spawn(&mut v, c, &mut m, p, i, &mut st);
   }
+  if inst == 0 && name_is(p, i, "share_with") {
+    return vshare_with(&mut v, c, &mut m, p, i, &mut st);
+  }
+  if inst == 0 && name_is(p, i, "par_each") {
+    return vpar_each(&mut v, c, &mut m, p, i, &mut st);
+  }
   if inst == 0 && (name_is(p, i, "pt_borrow") || name_is(p, i, "pt_borrow_frame")) {
     return vpt_borrow(&mut v, c, &mut m, p, i, &mut st);
   }
@@ -4609,6 +4619,50 @@ fn vsmp_run(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut 
   return res;
 }
 
+fn is_chan_vbuiltin(p: &Parser, i: u64) -> bool {
+  let n = node_at(p.nodes, i);
+  return n.e > n.s && n.e - n.s > 5 && span_is(p, n.s, n.s + 5, "chan_");
+}
+
+/// The channel builtins. Other threads send and receive at any moment, so
+/// what comes out of a channel is unknown, and so is how many values it
+/// holds; nothing has to be proved.
+fn vchan(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Vec[u64], vals: &Vec[u64], st: &mut VState) -> u64 {
+  let x0 = u_at(vals, 0);
+  let a0 = vl_at(v, x0);
+  if name_is(p, i, "chan_new") {
+    let ct = intern(&mut m, p, TY_CHAN, a0.ty);
+    return mk_obj(&mut v, m, ct, 0, 0, 0);
+  }
+  if name_is(p, i, "chan_clone") {
+    return mk_obj(&mut v, m, a0.ty, 0, 0, 0);
+  }
+  if name_is(p, i, "chan_send") {
+    return v.unit;
+  }
+  if name_is(p, i, "chan_len") {
+    return fresh_u64_named(&mut v, "chan_len");
+  }
+  let vt = intern(&mut m, p, TY_VEC, inner_t(m, a0.ty));
+  if name_is(p, i, "chan_drop") {
+    return fresh_of_named(&mut v, c, m, p, vt, "chan_left");
+  }
+  // chan_recv: one more element in `out` exactly when it returns true. The
+  // prover forgets the rest of `out`'s contents, but not its length.
+  let ok = fresh_bool_named(&mut v, "recv_ok");
+  let prev = vl_at(v, u_at(vals, 1));
+  let nv = fresh_of_named(&mut v, c, m, p, vt, "recv");
+  let nl = vl_at(v, nv);
+  let one = num(&mut v, 1);
+  let up = app2(&mut v, OP_ADD, prev.a, one);
+  let grown = app2(&mut v, OP_EQ, nl.a, up);
+  let same = app2(&mut v, OP_EQ, nl.a, prev.a);
+  let both = app3(&mut v, OP_ITE, term(v, ok), grown, same);
+  vec_push(&mut st.pc, both);
+  put_back(&mut v, m, p, &mut st, u_at(args, 1), nv);
+  return ok;
+}
+
 fn is_sbytes_builtin(p: &Parser, i: u64) -> bool {
   let n = node_at(p.nodes, i);
   return n.e > n.s && n.e - n.s > 7 && span_is(p, n.s, n.s + 7, "sbytes_");
@@ -4815,6 +4869,130 @@ fn vsbytes(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &Vec
     put_back(&mut v, m, p, &mut st, u_at(args, bi), nb);
   }
   return v.unit;
+}
+
+/// `share_with(s, f, args..)`: `f` gets the shared value as a shared
+/// borrow. Other threads hold it too, so it is a fresh value of which only
+/// its type's invariants are known (proved by `share_new`); `f` cannot
+/// change it.
+fn vshare_with(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VState) -> u64 {
+  let n = node_at(p.nodes, i);
+  let a0 = n.a;
+  let a1 = next_of(p, a0);
+  let lp = place_text(&mut v, p, a0);
+  open_path(&mut v, c, m, p, &mut st.env, lp);
+  let lv = vl_at(v, get_path(v, m, p, st.env, lp));
+  let h = cat_str(&mut v, lp, "_shared");
+  let inner = fresh_of(&mut v, c, m, p, inner_t(m, lv.ty), h);
+  let mut invs = vec_new[u64]();
+  invariant_terms(&mut v, c, &mut m, p, inner, &mut invs);
+  let mut k = 0;
+  while k < vec_len(invs) {
+    vec_push(&mut st.pc, u_at(invs, k));
+    k = vadd(k, 3);
+  }
+  vec_free(invs);
+  // The contents live in a variable no program can name, for the call.
+  if v.counter < U64_MAX {
+    v.counter = v.counter + 1;
+  }
+  let start = vec_len(v.pool);
+  push_str(&mut v, "shared*");
+  push_num(&mut v, v.counter);
+  let key = seal(&mut v, start);
+  let kt = tm_at(v, key);
+  vec_push(&mut st.env, Bind { s: vadd(kt.a, kt.b), e: kt.a, val: inner });
+  let mut args = vec_new[u64]();
+  vec_push(&mut args, 0);
+  let mut a = next_of(p, a1);
+  while a != 0 {
+    vec_push(&mut args, a);
+    a = next_of(p, a);
+  }
+  let an = node_at(p.nodes, a1);
+  let x = plain_inst(&mut m, plain_fn(p, an.s, an.e));
+  let res = vcall_args(&mut v, c, &mut m, p, i, args, key, &mut st, x);
+  vec_free(args);
+  let mut env = vec_new[Bind]();
+  k = 0;
+  while k < vec_len(st.env) {
+    let b = bind_at(st.env, k);
+    if !bind_named(v, p, b, kt.a, kt.b) {
+      vec_push(&mut env, b);
+    }
+    k = k + 1;
+  }
+  let prev = st.env;
+  st.env = env;
+  vec_free(prev);
+  return res;
+}
+
+/// `par_each(&mut v, f, args..)`: `f` runs on every element, each call on
+/// a thread of its own, in no order. One call is verified for an element
+/// the prover knows nothing of but its type's invariants, so `f`'s
+/// precondition is proved for every element at once. Afterwards the vector
+/// has the same length and contents the prover forgets.
+fn vpar_each(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, st: &mut VState) -> u64 {
+  let n = node_at(p.nodes, i);
+  let a0 = n.a;
+  let a1 = next_of(p, a0);
+  let mut pre = vec_new[u64]();
+  vec_push(&mut pre, a0);
+  let vals = vcall_vals(&mut v, c, &mut m, p, pre, 0, &mut st);
+  let vv = vl_at(v, u_at(vals, 0));
+  // A vector value's type is its element type.
+  let el = fresh_of_named(&mut v, c, m, p, vv.ty, "par_elem");
+  let mut invs = vec_new[u64]();
+  invariant_terms(&mut v, c, &mut m, p, el, &mut invs);
+  let mut k = 0;
+  while k < vec_len(invs) {
+    vec_push(&mut st.pc, u_at(invs, k));
+    k = vadd(k, 3);
+  }
+  vec_free(invs);
+  // The element lives in a variable no program can name, for the call.
+  if v.counter < U64_MAX {
+    v.counter = v.counter + 1;
+  }
+  let start = vec_len(v.pool);
+  push_str(&mut v, "par_each*");
+  push_num(&mut v, v.counter);
+  let key = seal(&mut v, start);
+  let kt = tm_at(v, key);
+  vec_push(&mut st.env, Bind { s: vadd(kt.a, kt.b), e: kt.a, val: el });
+  let mut args = vec_new[u64]();
+  vec_push(&mut args, 0);
+  let mut a = next_of(p, a1);
+  while a != 0 {
+    vec_push(&mut args, a);
+    a = next_of(p, a);
+  }
+  let an = node_at(p.nodes, a1);
+  let x = plain_inst(&mut m, plain_fn(p, an.s, an.e));
+  let res = vcall_args(&mut v, c, &mut m, p, i, args, key, &mut st, x);
+  vec_free(args);
+  let mut env = vec_new[Bind]();
+  k = 0;
+  while k < vec_len(st.env) {
+    let b = bind_at(st.env, k);
+    if !bind_named(v, p, b, kt.a, kt.b) {
+      vec_push(&mut env, b);
+    }
+    k = k + 1;
+  }
+  let prev = st.env;
+  st.env = env;
+  vec_free(prev);
+  let vt = intern(&mut m, p, TY_VEC, vv.ty);
+  let nv = fresh_of_named(&mut v, c, m, p, vt, "par_each");
+  let nl = vl_at(v, nv);
+  let same = app2(&mut v, OP_EQ, nl.a, vv.a);
+  vec_push(&mut st.pc, same);
+  put_back(&mut v, m, p, &mut st, a0, nv);
+  vec_free(pre);
+  vec_free(vals);
+  return res;
 }
 
 /// `thread_spawn(f, args..)`: the new thread computes `f(args..)` from
@@ -5494,6 +5672,42 @@ fn vbuiltin_3(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, args: &
   let a0 = vl_at(v, x0);
   if is_sbytes_builtin(p, i) {
     return vsbytes(&mut v, c, &mut m, p, i, args, vals, &mut st);
+  }
+  if is_chan_vbuiltin(p, i) {
+    return vchan(&mut v, c, &mut m, p, i, args, vals, &mut st);
+  }
+  if name_is(p, i, "share_new") {
+    let mut invs = vec_new[u64]();
+    invariant_terms(&mut v, c, &mut m, p, x0, &mut invs);
+    let mut k = 0;
+    while k < vec_len(invs) {
+      vm_s(&mut v, "that the value shared satisfies the invariant ");
+      vm_inv(&mut v, m, p, u_at(invs, vadd(k, 1)), u_at(invs, vadd(k, 2)));
+      prove(&mut v, st, u_at(invs, k), i, VC_LOCKINV);
+      k = vadd(k, 3);
+    }
+    vec_free(invs);
+    let mut t = 0;
+    if has_int_op(c, v.env, i) {
+      t = int_op_ty(c, m, v.env, i);
+    } else {
+      t = val_type(v, &mut m, p, x0);
+    }
+    let sty = intern(&mut m, p, TY_SHARE, t);
+    return mk_obj(&mut v, m, sty, 0, 0, 0);
+  }
+  if name_is(p, i, "share_clone") {
+    return mk_obj(&mut v, m, a0.ty, 0, 0, 0);
+  }
+  if name_is(p, i, "share_drop") {
+    // The value back if this was the last handle, else nothing.
+    let vt = intern(&mut m, p, TY_VEC, inner_t(m, a0.ty));
+    let r = fresh_of_named(&mut v, c, m, p, vt, "unshared");
+    let rv = vl_at(v, r);
+    let one = num(&mut v, 1);
+    let le = app2(&mut v, OP_LE, rv.a, one);
+    vec_push(&mut st.pc, le);
+    return r;
   }
   if name_is(p, i, "host_argc") {
     return fresh_u64_named(&mut v, "argc");
@@ -7053,7 +7267,7 @@ fn call_changes(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst:
   let mut fnode = i;
   let mut skip = 0;
   let mut j = 0;
-  if inst == 0 && name_is(p, i, "locked") && n.a != 0 && kind_of(p, next_of(p, n.a)) == E_VAR {
+  if inst == 0 && (name_is(p, i, "locked") || name_is(p, i, "share_with")) && n.a != 0 && kind_of(p, next_of(p, n.a)) == E_VAR {
     fnode = next_of(p, n.a);
     skip = 2;
     j = 1;
@@ -7079,6 +7293,15 @@ fn call_changes(v: &mut Vr, c: &Checker, m: &mut Mono, p: &Parser, i: u64, inst:
     changed_in_expr(&mut v, c, &mut m, p, next_of(p, n.a), &mut out);
     fnode = next_of(p, next_of(p, n.a));
     skip = 3;
+    j = 1;
+  } else if inst == 0 && name_is(p, i, "par_each") && n.a != 0 && kind_of(p, n.a) == E_MUTBORROW
+    && next_of(p, n.a) != 0 && kind_of(p, next_of(p, n.a)) == E_VAR {
+    // `par_each(&mut v, f, ..)` changes `v` and lends the rest to `f`.
+    let tn = node_at(p.nodes, n.a);
+    let tname = list_text(&mut v, p, tn.a);
+    note(&mut v, &mut out, tname, true);
+    fnode = next_of(p, n.a);
+    skip = 2;
     j = 1;
   } else if inst == 0 && name_is(p, i, "vec_with") && n.a != 0 && next_of(p, n.a) != 0
     && kind_of(p, next_of(p, next_of(p, n.a))) == E_VAR {

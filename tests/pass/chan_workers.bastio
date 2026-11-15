@@ -1,0 +1,97 @@
+// expect-exit: 42
+// stage1-only: Chan
+// backend: c
+// Channels: threads hand each other linear values. Sending moves the value
+// into the queue and receiving moves it out, so every Bytes has exactly one
+// owner at every moment, and the queue's mutex orders the sender's writes
+// before the receiver's reads.
+
+struct Job { id: u64, data: Bytes }
+
+// Takes jobs until one with id 0, doubles every byte, sends each job back.
+fn worker(jobs: Chan[Job], done: Chan[Job]) -> u64
+  ensures result <= 1000000
+{
+  let mut n = 0;
+  let mut more = true;
+  let mut got = vec_new[Job]();
+  while more invariant n <= 1000000 && vlen(got) == 0 {
+    if chan_recv(jobs, &mut got, 18446744073709551615) {
+      let j = vec_pop(&mut got);
+      if j.id == 0 {
+        more = false;
+        bfree(j.data);
+      } else {
+        let mut d = j.data;
+        let mut k = 0;
+        while k < blen(d) invariant k <= blen(d) {
+          bset(&mut d, k, cast[u8](bget(d, k) % 128 * 2));
+          k = k + 1;
+        }
+        chan_send(done, Job { id: j.id, data: d });
+        if n < 1000000 { n = n + 1; }
+      }
+    }
+  }
+  vec_free(got);
+  drop_all(chan_drop(jobs));
+  drop_all(chan_drop(done));
+  return n;
+}
+
+fn drop_all(v: Vec[Job]) {
+  let mut v2 = v;
+  while vec_len(v2) > 0 invariant true {
+    let j = vec_pop(&mut v2);
+    bfree(j.data);
+  }
+  vec_free(v2);
+}
+
+fn main() -> u64 {
+  let jobs = chan_new(vec_new[Job]());
+  let done = chan_new(vec_new[Job]());
+  let t1 = thread_spawn(worker, chan_clone(jobs), chan_clone(done));
+  let t2 = thread_spawn(worker, chan_clone(jobs), chan_clone(done));
+  let mut i = 1;
+  while i <= 20 invariant i >= 1 && i <= 21 {
+    let mut b = balloc(3);
+    bset(&mut b, 0, 1);
+    bset(&mut b, 1, 2);
+    bset(&mut b, 2, cast[u8](i));
+    chan_send(jobs, Job { id: i, data: b });
+    i = i + 1;
+  }
+  // Collect the 20 answers.
+  let mut back = vec_new[Job]();
+  let mut sum = 0;
+  let mut seen = 0;
+  while seen < 20 invariant seen <= 20 && vlen(back) == 0 && sum <= seen * 1000 {
+    if chan_recv(done, &mut back, 1000000000) {
+      let j = vec_pop(&mut back);
+      if blen(j.data) == 3 {
+        sum = sum + cast[u64](bget(j.data, 0)) + cast[u64](bget(j.data, 1)) + cast[u64](bget(j.data, 2)) % 100;
+      }
+      bfree(j.data);
+      seen = seen + 1;
+    }
+  }
+  vec_free(back);
+  // Two stop jobs; a receive with no time limit of zero returns at once.
+  chan_send(jobs, Job { id: 0, data: balloc(0) });
+  chan_send(jobs, Job { id: 0, data: balloc(0) });
+  let a = thread_join(t1);
+  let b = thread_join(t2);
+  let mut empty = vec_new[Job]();
+  let none = chan_recv(done, &mut empty, 0);
+  drop_all(empty);
+  let left = chan_len(jobs);
+  drop_all(chan_drop(jobs));
+  drop_all(chan_drop(done));
+  // sum: 20 * (2 + 4) + 2 * (1 + .. + 20) = 120 + 420 = 540
+  let mut r = 0;
+  if a + b == 20 { r = r + 20; }
+  if sum == 540 { r = r + 20; }
+  if !none && left == 0 { r = r + 2; }
+  return r;
+}

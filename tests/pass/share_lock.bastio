@@ -1,0 +1,78 @@
+// expect-exit: 42
+// stage1-only: Share
+// backend: c
+// Several threads update one counter under a lock, reached through a
+// Share. A shared borrow of the shared value cannot change anything but
+// the contents of its Lock and Atomic, so there is no data race, and the
+// lock's invariant holds whenever it is free.
+
+struct Tally { n: u64, max: u64 } invariant n <= max && max == 100000;
+struct State { tally: Lock[Tally], hits: Atomic[u64], name: Bytes }
+
+fn add_one(t: &mut Tally) -> bool
+  requires t.n <= t.max && t.max == 100000
+  ensures t.n <= t.max && t.max == 100000
+{
+  if t.n < t.max {
+    t.n = t.n + 1;
+    return true;
+  }
+  return false;
+}
+
+fn run(st: &State, times: u64) -> u64 {
+  if blen(st.name) != 5 {
+    return 0;
+  }
+  let mut i = 0;
+  let mut ok = 0;
+  while i < times invariant ok <= i {
+    if locked(st.tally, add_one) {
+      ok = ok + 1;
+    }
+    atomic_wrap_add(st.hits, 1);
+    i = i + 1;
+  }
+  return ok;
+}
+
+fn worker(s: Share[State], times: u64) -> u64
+  requires times <= 1000
+{
+  let r = share_with(s, run, times);
+  free_all(share_drop(s));
+  return r;
+}
+
+fn free_all(v: Vec[State]) {
+  let mut w = v;
+  while vec_len(w) > 0 invariant true {
+    let st = vec_pop(&mut w);
+    lock_end(st.tally);
+    atomic_end(st.hits);
+    bfree(st.name);
+  }
+  vec_free(w);
+}
+
+fn main() -> u64 {
+  let s = share_new(State { tally: lock_new(Tally { n: 0, max: 100000 }), hits: atomic_new(cast[u64](0)), name: bfrom("tally") });
+  let t1 = thread_spawn(worker, share_clone(s), 1000);
+  let t2 = thread_spawn(worker, share_clone(s), 1000);
+  let t3 = thread_spawn(worker, share_clone(s), 1000);
+  let a = thread_join(t1);
+  let b = thread_join(t2);
+  let c = thread_join(t3);
+  let mut r = 0;
+  let mut left = share_drop(s);
+  if vec_len(left) == 1 {
+    let st = vec_pop(&mut left);
+    let t = lock_end(st.tally);
+    let h = atomic_end(st.hits);
+    bfree(st.name);
+    if t.n == 3000 && h == 3000 { r = 40; }
+  }
+  free_all(left);
+  if a == 1000 && b == 1000 && c == 1000 { r = r + 2; }
+  return r;
+}
