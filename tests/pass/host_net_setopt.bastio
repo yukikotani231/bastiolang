@@ -7,6 +7,7 @@
 // lack, so only a join with a bad value is tried.) Windows has no option
 // call here: there the first call fails and the test stops.
 import "../../std/net.bastio";
+import "../../std/os.bastio";
 
 fn one(v: u8) -> Bytes {
   let mut b = balloc(1);
@@ -42,7 +43,19 @@ fn main(h: &mut Host) -> u64 {
       bfree(short);
       net_close(h, s);
     },
-    Option::None => { bad = 1; },
+    Option::None => {
+      // UDP sockets are Linux only so far: Windows may not open one.
+      let mut win = true;
+      match os_pipe(h) {
+        Option::Some(pp) => {
+          win = !os_nonblock(h, pp.start, true);
+          os_close(h, pp.start);
+          os_close(h, pp.end);
+        },
+        Option::None => {},
+      }
+      if !win { bad = 1; }
+    },
   }
   if bad > 0 { return 1; }
   return 0;
