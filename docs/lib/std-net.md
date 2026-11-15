@@ -28,6 +28,7 @@ listener, a closed descriptor, an address in use) gives `Option::None` or
 | [`net_connect_result`](#net_connect_result) | The outcome of a connection started with `net_connect_start`, once the socket is writable. |
 | [`net_listen6`](#net_listen6) | Listens on the IPv6 address `ip` (16 bytes, network order; all zeros is the wildcard, which also takes IPv4 clients) and `port` (0. |
 | [`net_udp_open`](#net_udp_open) | A non-blocking UDP socket bound to the IPv4 address `ip` and `port` (0. |
+| [`net_udp_open_reuse`](#net_udp_open_reuse) | Like `net_udp_open`, but sets `SO_REUSEADDR`, so that several sockets can bind the same port (what a multicast listener needs). |
 | [`net_udp_send`](#net_udp_send) | Sends `data` as one datagram from the UDP socket `sock` to `ip`:`port`. |
 | [`net_udp_recv`](#net_udp_recv) | Receives one datagram of at most `max` bytes (at most 65535) into `out` (replacing it) without waiting. |
 | [`net_setopt`](#net_setopt) | Sets an option of the socket `sock` from the bytes `value`. |
@@ -459,6 +460,26 @@ match net_udp_open(host, net_ip4(127, 0, 0, 1), 0) {
     if net_port(host, u) == 0 { return 1; }
     net_close(host, u);
   },
+  Option::None => {},
+}
+```
+
+### `net_udp_open_reuse`
+
+```bastio
+fn net_udp_open_reuse(h: &Host, ip: u64, port: u64) -> Option[u64]
+```
+
+Like `net_udp_open`, but sets `SO_REUSEADDR`, so that several sockets can
+bind the same port (what a multicast listener needs). `net_udp_open` does
+not set it: a second bind of a taken port fails.
+
+Example:
+
+```bastio
+let lo = net_ip4(127, 0, 0, 1);
+match net_udp_open_reuse(host, lo, 0) {
+  Option::Some(u) => { net_close(host, u); },
   Option::None => {},
 }
 ```
