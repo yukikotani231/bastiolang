@@ -1,0 +1,134 @@
+// stage1-only: element access with an immediate index (LOADX and STOREX, items 30 and 31)
+// backend: c
+// expect-exit: 0
+// LOADX d f b k L reads element r[b] + k and STOREX f b k s L writes it; both go
+// to L when the index is not below the length now, including a sum that wraps
+// round 2^64 and a k near 2^31. Where there is no machine code (code_build gives
+// 0) it checks only that.
+struct Vm { out: Vec[u64] }
+
+fn op_nop(vm: &mut Vm, a: u64, b: u64, c: u64, d: u64) -> u64 {
+  return a;
+}
+
+fn push6(p: &mut Vec[u64], a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, n: u64) {
+  vec_push(&mut p, a);
+  if n > 1 { vec_push(&mut p, b); }
+  if n > 2 { vec_push(&mut p, c); }
+  if n > 3 { vec_push(&mut p, d); }
+  if n > 4 { vec_push(&mut p, e); }
+  if n > 5 { vec_push(&mut p, f); }
+}
+
+fn i_const(p: &mut Vec[u64], d: u64, x: u64) { push6(&mut p, 8, d, x, 0, 0, 0, 3); }
+fn i_store(p: &mut Vec[u64], f: u64, b: u64, i: u64, s: u64, l: u64) { push6(&mut p, 18, f, b, i, s, l, 6); }
+fn i_entry(p: &mut Vec[u64], l: u64) { push6(&mut p, 7, l, 0, 0, 0, 0, 2); }
+fn i_ret(p: &mut Vec[u64]) { push6(&mut p, 5, 0, 0, 0, 0, 0, 1); }
+fn i_loadx(p: &mut Vec[u64], d: u64, f: u64, b: u64, k: u64, l: u64) { push6(&mut p, 30, d, f, b, k, l, 6); }
+fn i_storex(p: &mut Vec[u64], f: u64, b: u64, k: u64, s: u64, l: u64) { push6(&mut p, 31, f, b, k, s, l, 6); }
+
+// out[ix] = x
+fn out(p: &mut Vec[u64], f: u64, ix: u64, x: u64) {
+  i_const(&mut p, 12, 0);
+  i_const(&mut p, 13, ix);
+  i_const(&mut p, 11, x);
+  i_store(&mut p, f, 12, 13, 11, 0);
+}
+
+fn patch(p: &mut Vec[u64], at: u64, v: u64) {
+  if at < vec_len(p) {
+    vec_set(&mut p, at, v);
+  }
+}
+
+fn got(vm: &Vm, k: u64) -> u64 {
+  if k < vec_len(vm.out) {
+    return vec_get(vm.out, k);
+  }
+  return 0;
+}
+
+// r0 = b; r5 = out[b + k] (or 99 stored at out[hit] if out of range); out[dst] = r5.
+fn plan_load(f: u64, b: u64, k: u64, dst: u64, miss: u64) -> Vec[u64] {
+  let mut c = vec_new[u64]();
+  i_entry(&mut c, 2);
+  i_const(&mut c, 0, b);
+  i_const(&mut c, 5, 0);
+  let at = vec_len(c);
+  i_loadx(&mut c, 5, f, 0, k, 0);
+  i_const(&mut c, 6, 0);
+  i_const(&mut c, 7, dst);
+  i_const(&mut c, 8, 0);
+  // out[dst] = r5, via r8 = 0 base
+  push6(&mut c, 18, f, 8, 7, 5, 0, 6);
+  i_ret(&mut c);
+  patch(&mut c, at + 5, vec_len(c));
+  out(&mut c, f, miss, 99);
+  i_ret(&mut c);
+  return c;
+}
+
+// r0 = b; out[b + k] = 777, or out[miss] = 99 when out of range.
+fn plan_store(f: u64, b: u64, k: u64, miss: u64) -> Vec[u64] {
+  let mut c = vec_new[u64]();
+  i_entry(&mut c, 2);
+  i_const(&mut c, 0, b);
+  i_const(&mut c, 5, 777);
+  let at = vec_len(c);
+  i_storex(&mut c, f, 0, k, 5, 0);
+  i_ret(&mut c);
+  patch(&mut c, at + 5, vec_len(c));
+  out(&mut c, f, miss, 99);
+  i_ret(&mut c);
+  return c;
+}
+
+fn run(host: &mut Host, vm: &mut Vm, c: Vec[u64]) -> bool {
+  let code = code_build(host, c);
+  vec_free(c);
+  if code == 0 { return false; }
+  let r = code_call(code, &mut vm, 0);
+  code_free(host, code);
+  return true;
+}
+
+fn main(host: &mut Host) -> u64 {
+  let mut vm = Vm { out: vec_new[u64]() };
+  let mut k = 0;
+  while k < 16 {
+    vec_push(&mut vm.out, 0);
+    k = k + 1;
+  }
+  if vec_len(vm.out) > 5 { vec_set(&mut vm.out, 5, 555); }
+  let f = code_field(out);
+  // out[2 + 3] = 555 goes to out[8]
+  if !run(&mut host, &mut vm, plan_load(f, 2, 3, 8, 9)) { vec_free(vm.out); return 0; }
+  // 14 + 3 = 17 is past the length: out[10] = 99
+  let a = run(&mut host, &mut vm, plan_load(f, 14, 3, 11, 10));
+  // r0 = 2^64 - 1, k = 3: the sum wraps to 2, which is in range: out[2] (0) goes to out[12]
+  let b = run(&mut host, &mut vm, plan_load(f, 18446744073709551615, 3, 12, 13));
+  // r0 = 0, k = 2^31 - 2: far past the length
+  let c = run(&mut host, &mut vm, plan_load(f, 0, 2147483646, 14, 1));
+  // store: out[4 + 3] = 777; out[15 + 1] is out of range: out[2] = 99... use miss 3
+  let d = run(&mut host, &mut vm, plan_store(f, 4, 3, 4));
+  let e = run(&mut host, &mut vm, plan_store(f, 15, 1, 3));
+  let g8 = got(vm, 8);
+  let g9 = got(vm, 9);
+  let g10 = got(vm, 10);
+  let g11 = got(vm, 11);
+  let g12 = got(vm, 12);
+  let g13 = got(vm, 13);
+  let g14 = got(vm, 14);
+  let g1 = got(vm, 1);
+  let g7 = got(vm, 7);
+  let g4 = got(vm, 4);
+  let g3 = got(vm, 3);
+  vec_free(vm.out);
+  if g8 != 555 || g9 != 0 { return 1; }
+  if g10 != 99 || g11 != 0 { return 2; }
+  if g12 != 0 || g13 != 0 { return 3; }
+  if g14 != 0 || g1 != 99 { return 4; }
+  if g7 != 777 || g4 != 0 { return 5; }
+  if g3 != 99 { return 6; }
+  return 0;
+}
