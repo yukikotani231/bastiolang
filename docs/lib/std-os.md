@@ -35,6 +35,10 @@ backend: c
 | [`os_unlink`](#os_unlink) | Removes the file `path`. |
 | [`os_chdir`](#os_chdir) | Makes `path` the current directory. |
 | [`os_chmod`](#os_chmod) | Sets the permission bits of `path`. |
+| [`os_signal_catch`](#os_signal_catch) | Starts (`on`) or stops catching signal `sig` (Linux numbers; macOS differs for some). |
+| [`os_signals_take`](#os_signals_take) | The signals caught since the last call, as a mask with bit `n` set for signal `n`; they are forgotten. |
+| [`os_signal_fd`](#os_signal_fd) | The read end of a non-blocking pipe that gets a byte for each caught signal, to wait on with `os_poll`; the caller reads the bytes away. |
+| [`os_kill`](#os_kill) | Sends signal `sig` to process `pid`. |
 | [`os_link`](#os_link) | Makes `to` a hard link to the existing file `from`. |
 | [`os_utimes`](#os_utimes) | Sets the access and modification times of `path`, in nanoseconds since 1970. |
 | [`os_fchmod`](#os_fchmod) | Sets the permission bits of the open file `fd`. |
@@ -509,6 +513,72 @@ Example:
 let p = bfrom("no/such/file");
 let bad = os_chmod(host, p, 420);
 bfree(p);
+if bad { return 1; }
+```
+
+### `os_signal_catch`
+
+```bastio
+fn os_signal_catch(h: &Host, sig: u64, on: bool) -> bool
+```
+
+Starts (`on`) or stops catching signal `sig` (Linux numbers; macOS differs for
+some): a caught signal is recorded for `os_signals_take` instead of acting.
+False for KILL, STOP, a number outside 1 to 63, and on Windows.
+
+Example:
+
+```bastio
+let bad = os_signal_catch(host, 9, true);
+if bad { return 1; }
+```
+
+### `os_signals_take`
+
+```bastio
+fn os_signals_take(h: &Host) -> u64
+```
+
+The signals caught since the last call, as a mask with bit `n` set for
+signal `n`; they are forgotten. 0 when there are none (and on Windows).
+
+Example:
+
+```bastio
+let m = os_signals_take(host);
+if m != 0 { return 1; }
+```
+
+### `os_signal_fd`
+
+```bastio
+fn os_signal_fd(h: &Host) -> Option[u64]
+```
+
+The read end of a non-blocking pipe that gets a byte for each caught signal,
+to wait on with `os_poll`; the caller reads the bytes away.
+
+Example:
+
+```bastio
+match os_signal_fd(host) {
+  Option::Some(fd) => { os_close(host, fd); },
+  Option::None => {},
+}
+```
+
+### `os_kill`
+
+```bastio
+fn os_kill(h: &Host, pid: u64, sig: u64) -> bool
+```
+
+Sends signal `sig` to process `pid`.
+
+Example:
+
+```bastio
+let bad = os_kill(host, 2147483647, 0);
 if bad { return 1; }
 ```
 

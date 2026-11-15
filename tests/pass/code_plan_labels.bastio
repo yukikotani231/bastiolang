@@ -1,0 +1,79 @@
+// stage1-only: code_build (plan labels outside the plan)
+// backend: c
+// expect-exit: 0
+// A label is a word offset into the plan. One that is past the end of the
+// plan builds nothing, also when its top bit is set (2^63 and 2^64 - 1 read
+// as negative numbers must not pass for "no label"), for every item that
+// has a label: ENTRY, BRZ, BRNZ, JMP, BREQ, ALU32, CMPBR, CMPBRI, LOAD, STORE.
+struct Vm { regs: Vec[u64] }
+
+fn op_get(vm: &mut Vm, a: u64, b: u64, c: u64, d: u64) -> u64 {
+  return a;
+}
+
+/// Builds ENTRY 2 followed by `body` and RET; the id (0 when refused).
+fn build(host: &Host, body: &Vec[u64]) -> u64 {
+  let mut plan = vec_new[u64]();
+  vec_push(&mut plan, 7);
+  vec_push(&mut plan, 2);
+  let mut i = 0;
+  while i < vec_len(body) {
+    vec_push(&mut plan, vec_get(body, i));
+    i = i + 1;
+  }
+  vec_push(&mut plan, 5);
+  let code = code_build(host, plan);
+  vec_free(plan);
+  return code;
+}
+
+fn one(host: &Host, op: u64, a: u64, b: u64, c: u64, d: u64, e: u64, n: u64) -> u64 {
+  let mut body = vec_new[u64]();
+  vec_push(&mut body, op);
+  if n > 0 { vec_push(&mut body, a); }
+  if n > 1 { vec_push(&mut body, b); }
+  if n > 2 { vec_push(&mut body, c); }
+  if n > 3 { vec_push(&mut body, d); }
+  if n > 4 { vec_push(&mut body, e); }
+  let code = build(host, body);
+  vec_free(body);
+  return code;
+}
+
+fn bad_labels(host: &Host, l: u64) -> u64 {
+  let mut bad = 0;
+  if one(host, 1, l, 0, 0, 0, 0, 1) != 0 { bad = bad + 1; }      // BRZ L
+  if one(host, 2, l, 0, 0, 0, 0, 1) != 0 { bad = bad + 1; }      // BRNZ L
+  if one(host, 4, l, 0, 0, 0, 0, 1) != 0 { bad = bad + 1; }      // JMP L
+  if one(host, 7, l, 0, 0, 0, 0, 1) != 0 { bad = bad + 1; }      // ENTRY L
+  if one(host, 3, 9, l, 0, 0, 0, 2) != 0 { bad = bad + 1; }      // BREQ v L
+  if one(host, 12, 0, 1, 2, 3, l, 5) != 0 { bad = bad + 1; }     // ALU32 op d a b L
+  if one(host, 13, 0, 1, 2, l, 0, 4) != 0 { bad = bad + 1; }     // CMPBR c a b L
+  if one(host, 14, 0, 1, 2, l, 0, 4) != 0 { bad = bad + 1; }     // CMPBRI c a x L
+  if one(host, 17, 0, 0, 1, 2, l, 5) != 0 { bad = bad + 1; }     // LOAD d f b i L
+  if one(host, 18, 0, 1, 2, 3, l, 5) != 0 { bad = bad + 1; }     // STORE f b i s L
+  return bad;
+}
+
+fn main(host: &mut Host) -> u64 {
+  let mut vm = Vm { regs: vec_new[u64]() };
+  vec_push(&mut vm.regs, 0);
+  let get = stencil(op_get);
+  // The control: a good plan builds (where there is machine code) and runs.
+  let mut body = vec_new[u64]();
+  vec_push(&mut body, 0); vec_push(&mut body, get); vec_push(&mut body, 42);
+  vec_push(&mut body, 0); vec_push(&mut body, 0); vec_push(&mut body, 0);
+  let good = build(host, body);
+  vec_free(body);
+  let r = code_call(good, &mut vm, 0);
+  code_free(host, good);
+  let mut bad = 0;
+  bad = wrap_add(bad, bad_labels(host, 1000));
+  bad = wrap_add(bad, bad_labels(host, 9223372036854775808));
+  bad = wrap_add(bad, bad_labels(host, 18446744073709551615));
+  bad = wrap_add(bad, bad_labels(host, 18446744073709551614));
+  vec_free(vm.regs);
+  if bad != 0 { return 1; }
+  if good != 0 && r != 42 { return 2; }
+  return 0;
+}

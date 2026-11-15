@@ -12,12 +12,13 @@ TLS_CHACHA20_POLY1305_SHA256, with X25519), servers by IPv4 address or, with
 `https_get_by_name`, by a name looked up through std/dns, no client
 certificates and no resumption; see core/tls13client.bastio for what is checked and what is not.
 
-`import "std/https.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/text.bastio](core-text.md), [core/endian.bastio](core-endian.md), [core/sha256.bastio](core-sha256.md), [core/sha512.bastio](core-sha512.md), [core/hkdf.bastio](core-hkdf.md), [core/tls13.bastio](core-tls13.md), [core/tls13hs.bastio](core-tls13hs.md), [core/aes.bastio](core-aes.md), [core/aesgcm.bastio](core-aesgcm.md), [core/chacha20.bastio](core-chacha20.md), [core/poly1305.bastio](core-poly1305.md), [core/chacha20poly1305.bastio](core-chacha20poly1305.md), [core/tls13record.bastio](core-tls13record.md), [core/x25519.bastio](core-x25519.md), [core/der.bastio](core-der.md), [core/ed25519.bastio](core-ed25519.md), [core/p256.bastio](core-p256.md), [core/p384.bastio](core-p384.md), [core/rsa.bastio](core-rsa.md), [core/x509.bastio](core-x509.md), [core/tls13client.bastio](core-tls13client.md), [core/num.bastio](core-num.md), [core/httpsurl.bastio](core-httpsurl.md), [core/dns.bastio](core-dns.md), [std/net.bastio](std-net.md), [std/host.bastio](std-host.md), [std/dns.bastio](std-dns.md), `examples/http/http.bastio`, [std/http.bastio](std-http.md).
+`import "std/https.bastio";` also loads [core/option.bastio](core-option.md), [core/bytes.bastio](core-bytes.md), [core/text.bastio](core-text.md), [core/endian.bastio](core-endian.md), [core/sha256.bastio](core-sha256.md), [core/sha512.bastio](core-sha512.md), [core/hkdf.bastio](core-hkdf.md), [core/tls13.bastio](core-tls13.md), [core/der.bastio](core-der.md), [core/p256.bastio](core-p256.md), [core/rsa.bastio](core-rsa.md), [core/tls13hs.bastio](core-tls13hs.md), [core/aes.bastio](core-aes.md), [core/aesgcm.bastio](core-aesgcm.md), [core/chacha20.bastio](core-chacha20.md), [core/poly1305.bastio](core-poly1305.md), [core/chacha20poly1305.bastio](core-chacha20poly1305.md), [core/tls13record.bastio](core-tls13record.md), [core/x25519.bastio](core-x25519.md), [core/ed25519.bastio](core-ed25519.md), [core/p384.bastio](core-p384.md), [core/x509.bastio](core-x509.md), [core/tls13client.bastio](core-tls13client.md), [core/num.bastio](core-num.md), [core/httpsurl.bastio](core-httpsurl.md), [core/dns.bastio](core-dns.md), [std/net.bastio](std-net.md), [std/host.bastio](std-host.md), [std/dns.bastio](std-dns.md), `examples/http/http.bastio`, [std/http.bastio](std-http.md).
 
 | Function | |
 | --- | --- |
 | [`https_run`](#https_run) | Runs a TLS 1.3 exchange on the connected socket `sock`. |
 | [`https_run_opts`](#https_run_opts) | `https_run` with the options of `tls13c_new_opts`. |
+| [`https_run_id`](#https_run_id) | `https_run_opts` for a client that has a certificate to show a server that asks for one (TLS 1.3). |
 | [`https_result_free`](#https_result_free) | Frees a result (see `https_run`). |
 | [`https_request`](#https_request) | Connects to `ip`:`port`, runs a TLS exchange with the server `name` (see `https_run`) and returns what the server sent after `request`, if it ended with a close_notify (a connection that is cut off, which could hide a truncated answer, gives `None`, as does any failure of the handshake). |
 | [`https_exchange`](#https_exchange) | Like `https_request`, but gives the whole result whatever state the exchange ended in (6 for a close_notify, 5 for a connection that was cut off after the handshake, 7 for a failure), for a caller that can tell by other means (a `Content-Length`) whether the answer is complete. |
@@ -161,6 +162,70 @@ match net_listen(host, lo, 0) {
   },
   Option::None => {},
 }
+bfree(key);
+bfree(session);
+bfree(random);
+bfree(roots);
+bfree(request);
+bfree(name);
+if bad != 0 { return 1; }
+```
+
+### `https_run_id`
+
+```bastio
+fn https_run_id(h: &Host, sock: u64, name: &Bytes, request: &Bytes, roots: &Bytes, now: u64, random: &Bytes, session: &Bytes, key: &Bytes, opts: u64, chain: &Bytes, kind: u64, ka: &Bytes, kb: &Bytes, nonce: &Bytes) -> HttpsResult
+  requires blen(name) <= 255 && blen(request) < 1073741824 && blen(roots) < 274877906944
+  requires blen(random) == 32 && blen(session) == 32 && blen(key) == 32
+  requires blen(chain) < 1048576 && blen(ka) < 65536 && blen(kb) < 65536 && blen(nonce) < 1024
+```
+
+`https_run_opts` for a client that has a certificate to show a server that
+asks for one (TLS 1.3): `chain` is the DER certificates, the client's own
+first, `kind` 1 for an RSA key (`ka` the modulus, `kb` the private
+exponent) or 2 for an ECDSA P-256 key (`ka` the scalar), and `nonce` 32
+unpredictable bytes (see `tls13c_identity`); `kind` 0 shows none.
+
+Example:
+
+```bastio
+let lo = net_ip4(127, 0, 0, 1);
+let name = bfrom("localhost");
+let request = bfrom("GET / HTTP/1.0\r\n\r\n");
+let roots = balloc(0);
+let random = balloc(32);
+let session = balloc(32);
+let key = balloc(32);
+let chain = balloc(0);
+let ka = balloc(32);
+let kb = balloc(0);
+let nonce = balloc(32);
+let mut bad = 1;
+match net_listen(host, lo, 0) {
+  Option::Some(s) => {
+    match net_connect(host, lo, net_port(host, s)) {
+      Option::Some(c) => {
+        match net_accept(host, s) {
+          Option::Some(a) => {
+            net_close(host, a);
+            let r = https_run_id(host, c, name, request, roots, 1800000000, random, session, key, 0, chain, 2, ka, kb, nonce);
+            if r.state == 0 && r.error == 0 && blen(r.data) == 0 { bad = 0; }
+            https_result_free(r);
+          },
+          Option::None => {},
+        }
+        net_close(host, c);
+      },
+      Option::None => {},
+    }
+    net_close(host, s);
+  },
+  Option::None => {},
+}
+bfree(nonce);
+bfree(kb);
+bfree(ka);
+bfree(chain);
 bfree(key);
 bfree(session);
 bfree(random);

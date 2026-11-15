@@ -132,11 +132,80 @@ fn https_run_opts(h: &Host, sock: u64, name: &Bytes, request: &Bytes, roots: &By
   requires blen(name) <= 255 && blen(request) < 1073741824 && blen(roots) < 274877906944
   requires blen(random) == 32 && blen(session) == 32 && blen(key) == 32
 {
+  let chain = balloc(0);
+  let ka = balloc(0);
+  let kb = balloc(0);
+  let nonce = balloc(0);
+  let r = https_run_id(h, sock, name, request, roots, now, random, session, key, opts, chain, 0, ka, kb, nonce);
+  bfree(nonce);
+  bfree(kb);
+  bfree(ka);
+  bfree(chain);
+  return r;
+}
+
+/// `https_run_opts` for a client that has a certificate to show a server that
+/// asks for one (TLS 1.3): `chain` is the DER certificates, the client's own
+/// first, `kind` 1 for an RSA key (`ka` the modulus, `kb` the private
+/// exponent) or 2 for an ECDSA P-256 key (`ka` the scalar), and `nonce` 32
+/// unpredictable bytes (see `tls13c_identity`); `kind` 0 shows none.
+/// ```
+/// let lo = net_ip4(127, 0, 0, 1);
+/// let name = bfrom("localhost");
+/// let request = bfrom("GET / HTTP/1.0\r\n\r\n");
+/// let roots = balloc(0);
+/// let random = balloc(32);
+/// let session = balloc(32);
+/// let key = balloc(32);
+/// let chain = balloc(0);
+/// let ka = balloc(32);
+/// let kb = balloc(0);
+/// let nonce = balloc(32);
+/// let mut bad = 1;
+/// match net_listen(host, lo, 0) {
+///   Option::Some(s) => {
+///     match net_connect(host, lo, net_port(host, s)) {
+///       Option::Some(c) => {
+///         match net_accept(host, s) {
+///           Option::Some(a) => {
+///             net_close(host, a);
+///             let r = https_run_id(host, c, name, request, roots, 1800000000, random, session, key, 0, chain, 2, ka, kb, nonce);
+///             if r.state == 0 && r.error == 0 && blen(r.data) == 0 { bad = 0; }
+///             https_result_free(r);
+///           },
+///           Option::None => {},
+///         }
+///         net_close(host, c);
+///       },
+///       Option::None => {},
+///     }
+///     net_close(host, s);
+///   },
+///   Option::None => {},
+/// }
+/// bfree(nonce);
+/// bfree(kb);
+/// bfree(ka);
+/// bfree(chain);
+/// bfree(key);
+/// bfree(session);
+/// bfree(random);
+/// bfree(roots);
+/// bfree(request);
+/// bfree(name);
+/// if bad != 0 { return 1; }
+/// ```
+fn https_run_id(h: &Host, sock: u64, name: &Bytes, request: &Bytes, roots: &Bytes, now: u64, random: &Bytes, session: &Bytes, key: &Bytes, opts: u64, chain: &Bytes, kind: u64, ka: &Bytes, kb: &Bytes, nonce: &Bytes) -> HttpsResult
+  requires blen(name) <= 255 && blen(request) < 1073741824 && blen(roots) < 274877906944
+  requires blen(random) == 32 && blen(session) == 32 && blen(key) == 32
+  requires blen(chain) < 1048576 && blen(ka) < 65536 && blen(kb) < 65536 && blen(nonce) < 1024
+{
   let mut out = text_new();
   let mut app = text_new();
   let none = balloc(0);
   let mut client = tls13c_new_opts(random, session, key, name, none, opts, &mut out);
   bfree(none);
+  if kind != 0 { tls13c_identity(&mut client, chain, kind, ka, kb, nonce); }
   let mut asked = false;
   let mut alive = https_flush(h, sock, &mut out);
   let mut buf = balloc(0);

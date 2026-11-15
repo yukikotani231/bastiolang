@@ -1,0 +1,89 @@
+// stage1-only: Unix domain sockets in host_net, net_listen_unix and net_connect_unix
+// backend: c
+// expect-exit: 0
+// A Unix socket server on a path and on an abstract name (Linux), a client
+// that connects to each, a message each way, a connect to a path nobody
+// listens on that fails, and a path that is too long. Windows has no Unix
+// sockets here: there the listen fails and the test stops after checking
+// that.
+import "../../std/net.bastio";
+import "../../std/os.bastio";
+
+fn talk(h: &Host, l: u64, path: &Bytes) -> u64 {
+  let mut bad = 0;
+  match net_connect_unix(h, path, 3000) {
+    Option::Some(c) => {
+      match net_accept(h, l) {
+        Option::Some(a) => {
+          let msg = bfrom("hello");
+          let sent = net_send_all(h, c, msg);
+          bfree(msg);
+          let mut got = balloc(0);
+          match net_recv(h, a, 16, &mut got) {
+            Option::Some(n) => { if !sent || n != 5 { bad = 1; } },
+            Option::None => { bad = 1; },
+          }
+          bfree(got);
+          let back = bfrom("ok");
+          let sent2 = net_send_all(h, a, back);
+          bfree(back);
+          let mut got2 = balloc(0);
+          match net_recv(h, c, 16, &mut got2) {
+            Option::Some(n) => { if !sent2 || n != 2 { bad = 1; } },
+            Option::None => { bad = 1; },
+          }
+          bfree(got2);
+          net_close(h, a);
+        },
+        Option::None => { bad = 1; },
+      }
+      net_close(h, c);
+    },
+    Option::None => { bad = 1; },
+  }
+  return bad;
+}
+
+fn main(h: &mut Host) -> u64 {
+  let mut bad = 0;
+  let path = bfrom("host_net_unix.sock");
+  os_unlink(h, path);
+  match net_listen_unix(h, path) {
+    Option::Some(l) => {
+      bad = bad | talk(h, l, path);
+      net_close(h, l);
+      os_unlink(h, path);
+    },
+    Option::None => {
+      // No Unix sockets (Windows): nothing more to check.
+      bfree(path);
+      return 0;
+    },
+  }
+  bfree(path);
+  let abs = bfrom("@bastio-host-net-unix-test");
+  match net_listen_unix(h, abs) {
+    Option::Some(l) => {
+      bad = bad | talk(h, l, abs);
+      net_close(h, l);
+    },
+    Option::None => {
+      // Only Linux has abstract sockets.
+    },
+  }
+  bfree(abs);
+  let none = bfrom("host_net_unix.nobody");
+  match net_connect_unix(h, none, 1000) {
+    Option::Some(s) => { net_close(h, s); bad = bad | 1; },
+    Option::None => {},
+  }
+  bfree(none);
+  let long = bfrom("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+  match net_connect_unix(h, long, 1000) {
+    Option::Some(s) => { net_close(h, s); bad = bad | 1; },
+    Option::None => {},
+  }
+  bfree(long);
+  if bad > 0 { return 1; }
+  return 0;
+}

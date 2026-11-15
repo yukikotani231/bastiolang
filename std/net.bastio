@@ -484,6 +484,26 @@ fn net_udp_recv(h: &Host, sock: u64, max: u64, out: &mut Bytes) -> Option[u64] {
   return Option[u64]::Some(r);
 }
 
+/// Sets an option of the socket `sock` from the bytes `value`: `opt` 1 joins
+/// and 2 leaves an IPv4 multicast group (`value` is the group address and
+/// then the interface address, 4 bytes each, network order, 0.0.0.0 for any
+/// interface), 3 chooses the interface multicast datagrams leave by (4
+/// bytes), 4 sets the multicast TTL, 5 multicast loopback (0 or 1), 6 the
+/// TTL and 7 SO_BROADCAST (0 or 1; one byte each). False on failure and on
+/// targets without it (only the Linux C backend has it).
+/// ```
+/// let v = balloc(1);
+/// let ok = net_setopt(host, 0, 6, v);
+/// bfree(v);
+/// if ok { return 1; }
+/// ```
+fn net_setopt(h: &Host, sock: u64, opt: u64, value: &Bytes) -> bool {
+  let mut v = bytes_slice(value, 0, blen(value));
+  let r = host_net(h, 20, sock, opt, &mut v);
+  bfree(v);
+  return r == 0;
+}
+
 /// The address of a socket: with `peer` 0 its own (`getsockname`), with 1 the
 /// other end (`getpeername`). The address bytes (4 for IPv4, 16 for IPv6) go
 /// into `out`; the answer is the port in the low 16 bits and 4 or 6 above
@@ -593,4 +613,51 @@ fn net_random(h: &Host, n: u64) -> Option[Bytes]
   }
   bfree(buf);
   return Option[Bytes]::None;
+}
+
+/// Connects to the Unix domain socket at `path` (1 to 107 bytes, no NUL
+/// byte), giving up after `ms` milliseconds (0 means no limit). On Linux a
+/// path that starts with `@` names an abstract socket: the `@` becomes the
+/// NUL byte of the kernel's name (`@/tmp/.X11-unix/X0` is the X server's).
+/// `None` when nothing listens there, the path is too long or the host has no
+/// Unix sockets (Windows, WebAssembly). The socket is read and written with
+/// `net_recv`, `net_send_all` and `net_close` like a TCP one.
+/// ```
+/// let p = bfrom("/no/such/socket");
+/// match net_connect_unix(host, p, 1000) {
+///   Option::Some(s) => { net_close(host, s); bfree(p); return 1; },
+///   Option::None => {},
+/// }
+/// bfree(p);
+/// ```
+fn net_connect_unix(h: &Host, path: &Bytes, ms: u64) -> Option[u64] {
+  let mut p = bytes_slice(path, 0, blen(path));
+  let limit = ms % 3600001;
+  let r = host_net(h, 18, 0, limit * 65536, &mut p);
+  bfree(p);
+  if r == 18446744073709551615 {
+    return Option[u64]::None;
+  }
+  return Option[u64]::Some(r);
+}
+
+/// Listens on the Unix domain socket at `path` (as `net_connect_unix` reads
+/// it); a socket file that is already there makes it fail, so remove it first
+/// with `os_unlink` (an abstract socket leaves none). Accept with `net_accept`.
+/// ```
+/// let p = bfrom("/no/such/dir/socket");
+/// match net_listen_unix(host, p) {
+///   Option::Some(l) => { net_close(host, l); bfree(p); return 1; },
+///   Option::None => {},
+/// }
+/// bfree(p);
+/// ```
+fn net_listen_unix(h: &Host, path: &Bytes) -> Option[u64] {
+  let mut p = bytes_slice(path, 0, blen(path));
+  let r = host_net(h, 19, 0, 0, &mut p);
+  bfree(p);
+  if r == 18446744073709551615 {
+    return Option[u64]::None;
+  }
+  return Option[u64]::Some(r);
 }

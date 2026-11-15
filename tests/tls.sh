@@ -129,6 +129,15 @@ serve eclocal eclocal && {
   system_client "std/https: untrusted root" 1 localhost other.roots
 }
 suites=TLS_AES_128_GCM_SHA256
+# A client that offers only TLS 1.2: a server that speaks both answers with 1.2, one that only speaks 1.3 fails it.
+port=$((port + 1))
+openssl s_server -www -accept "127.0.0.1:$port" -cert "$tmp/eclocal.pem" -key "$tmp/eclocal.key" >"$tmp/server.log" 2>&1 &
+pids+=($!)
+for i in $(seq 1 100); do (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break; sleep 0.1; done
+v12=1200
+client "client that offers only TLS 1.2: a server of both" 0 localhost ec.roots
+v12=
+serve eclocal eclocal && { v12=1200; client "client that offers only TLS 1.2: a TLS 1.3 only server" 1 localhost ec.roots; v12=; }
 serve eclocal eclocal && client "AES-128-GCM only server" 0 localhost ec.roots
 suites=TLS_AES_256_GCM_SHA384
 serve eclocal eclocal && client "AES-256-GCM only server (SHA-384 key schedule)" 0 localhost ec.roots
@@ -291,9 +300,9 @@ else:
     n = field("modulus"); key = n + field("privateExponent").rjust(len(n), b"\0")
 open(out, "wb").write(key)' "$2" "$tmp/$1.raw"
   }
-  sserve() { # chain key kind
+  sserve() { # chain key kind [roots mode]
     port=$((port + 1))
-    "$tmp/httpsserve" "$port" "$tmp/$1" "$3" "$tmp/$2.raw" 1000 >"$tmp/serve.log" 2>&1 &
+    "$tmp/httpsserve" "$port" "$tmp/$1" "$3" "$tmp/$2.raw" 1000 ${4:+"$tmp/$4" $5} >"$tmp/serve.log" 2>&1 &
     pids+=($!)
     local i
     for i in $(seq 1 100); do
@@ -308,7 +317,7 @@ open(out, "wb").write(key)' "$2" "$tmp/$1.raw"
     out=$(printf 'GET / HTTP/1.0\r\nHost: localhost\r\n\r\n' | timeout 20 openssl s_client -connect "127.0.0.1:$port" \
       -CAfile "$tmp/$ca" -verify_return_error -verify_hostname localhost -ign_eof "$@" 2>&1); rc=$?
     if [ "$want" = 0 ] && { [ $rc != 0 ] || ! printf '%s' "$out" | grep -qF -- "$text"; }; then
-      fail "$d: exit $rc"; printf '%s\n' "$out" | grep -iE 'error|alert|verify' | head -3 | sed 's/^/    /'
+      fail "$d: exit $rc"; printf "%s\n" "$out" | grep -iE "error|alert|verify" | head -3 | sed "s/^/    /"
     elif [ "$want" != 0 ] && printf '%s' "$out" | grep -qF -- "hello alpn"; then fail "$d: answered"
     else echo "ok   $d"; fi
   }
@@ -329,9 +338,62 @@ open(out, "wb").write(key)' "$2" "$tmp/$1.raw"
     sclient "server: client that only speaks TLS 1.2" 1 "" ecca.pem -tls1_2
     sclient "server: client with no X25519 share (no HelloRetryRequest yet)" 1 "" ecca.pem -groups P-256
   }
+  # A client certificate, asked for by the server (httpsserve ROOTS MODE).
+  make_cert clicert ec ecca "DNS:client.local" || fail "cannot make the client certificate"
+  make_cert clirsa rsa ecca "DNS:client.local" || fail "cannot make the RSA client certificate"
+  make_ca otherca ec || fail "cannot make another CA"
+  make_cert clifake ec otherca "DNS:client.local" || fail "cannot make the other client certificate"
+  cp "$tmp/ecca.der" "$tmp/ec.roots"
+  sserve eclocal.der eclocal 2 ec.roots 1 && {
+    sclient "client auth (request): ECDSA client certificate" 0 "peer=1" ecca.pem -cert "$tmp/clicert.pem" -key "$tmp/clicert.key"
+    sclient "client auth (request): RSA client certificate" 0 "peer=1" ecca.pem -cert "$tmp/clirsa.pem" -key "$tmp/clirsa.key"
+    sclient "client auth (request): no client certificate" 0 "peer=0" ecca.pem
+    sclient "client auth (request): certificate of another CA" 0 "peer=6" ecca.pem -cert "$tmp/clifake.pem" -key "$tmp/clifake.key"
+  }
+  sserve eclocal.der eclocal 2 ec.roots 2 && {
+    sclient "client auth (require): good client certificate" 0 "peer=1" ecca.pem -cert "$tmp/clicert.pem" -key "$tmp/clicert.key"
+    sclient "client auth (require): no client certificate" 1 "" ecca.pem
+    sclient "client auth (require): certificate of another CA" 1 "" ecca.pem -cert "$tmp/clifake.pem" -key "$tmp/clifake.key"
+  }
   sserve rsalocal.der rsalocal 1 && sclient "server: RSA certificate (rsa_pss_rsae_sha256)" 0 "Peer signature type: RSA-PSS" rsaca.pem
   sserve chain2.der chainleaf 2 && sclient "server: chain through an intermediate" 0 "hello alpn" ecca.pem
   sserve rsalocal.der eclocal 2 && sclient "server: key that does not match the certificate" 1 "" rsaca.pem
+  # A client certificate that httpsget shows when OpenSSL's server asks for one.
+  openssl x509 -in "$tmp/clicert.pem" -outform DER -out "$tmp/clicert.der"
+  openssl x509 -in "$tmp/clirsa.pem" -outform DER -out "$tmp/clirsa.der"
+  openssl x509 -in "$tmp/clifake.pem" -outform DER -out "$tmp/clifake.der"
+  rawkey clicert ec; rawkey clirsa rsa; rawkey clifake ec
+  authserve() { # mode (verify: asks, Verify: requires)
+    port=$((port + 1))
+    openssl s_server -www -accept "127.0.0.1:$port" -tls1_3 -ciphersuites "$suites" -groups X25519 \
+      -cert "$tmp/eclocal.pem" -key "$tmp/eclocal.key" -CAfile "$tmp/ecca.pem" -verify_return_error -"$1" 1 >"$tmp/server.log" 2>&1 &
+    pids+=($!)
+    local i
+    for i in $(seq 1 100); do
+      (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && return 0
+      sleep 0.1
+    done
+    echo "tls: the server did not start"; cat "$tmp/server.log"; return 1
+  }
+  cclient() { # description want(0|1) [chain kind key]
+    local d=$1 want=$2 id=()
+    [ -n "${3:-}" ] && id=("$tmp/$3.der" "$4" "$tmp/$5.raw")
+    timeout 60 "$tmp/httpsget" "$port" localhost "$tmp/ec.roots" "$tmp/seed" "$(date +%s)" 0 "${id[@]}" > "$tmp/out" 2>&1
+    local rc=$?
+    if [ "$want" = 0 ] && [ $rc != 0 ]; then fail "$d: exit $rc"; sed 's/^/    /' "$tmp/out" | head -5
+    elif [ "$want" != 0 ] && [ $rc = 0 ]; then fail "$d: accepted"; sed 's/^/    /' "$tmp/out" | head -5
+    else echo "ok   $d"; fi
+  }
+  authserve Verify && {
+    cclient "client certificate (required): ECDSA" 0 clicert 2 clicert
+    cclient "client certificate (required): RSA" 0 clirsa 1 clirsa
+    cclient "client certificate (required): none" 1
+    cclient "client certificate (required): certificate of another CA" 1 clifake 2 clifake
+  }
+  authserve verify && {
+    cclient "client certificate (asked): ECDSA" 0 clicert 2 clicert
+    cclient "client certificate (asked): none" 0
+  }
 fi
 
 [ $fails = 0 ] && echo "tls: all passed" || { echo "tls: $fails failed"; exit 1; }

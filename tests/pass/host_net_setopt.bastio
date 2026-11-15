@@ -1,0 +1,49 @@
+// stage1-only: socket options in host_net, net_setopt
+// backend: c
+// expect-exit: 0
+// Options of a UDP socket: the TTL, multicast TTL and loopback and
+// SO_BROADCAST are set, an unknown option and a value of the wrong length
+// are refused. (Joining a group needs a multicast route, which a sandbox may
+// lack, so only a join with a bad value is tried.) Windows has no option
+// call here: there the first call fails and the test stops.
+import "../../std/net.bastio";
+
+fn one(v: u8) -> Bytes {
+  let mut b = balloc(1);
+  bset(&mut b, 0, v);
+  return b;
+}
+
+fn main(h: &mut Host) -> u64 {
+  let mut bad = 0;
+  match net_udp_open(h, 2130706433, 0) {
+    Option::Some(s) => {
+      let ttl = one(7);
+      if !net_setopt(h, s, 6, ttl) {
+        // No option call on this target.
+        bfree(ttl);
+        net_close(h, s);
+        return 0;
+      }
+      if !net_setopt(h, s, 4, ttl) { bad = 1; }
+      if !net_setopt(h, s, 7, ttl) { bad = 1; }
+      bfree(ttl);
+      let on = one(1);
+      if !net_setopt(h, s, 5, on) { bad = 1; }
+      bfree(on);
+      let two = balloc(2);
+      if net_setopt(h, s, 6, two) { bad = 1; }
+      bfree(two);
+      let v = one(1);
+      if net_setopt(h, s, 99, v) { bad = 1; }
+      bfree(v);
+      let short = balloc(5);
+      if net_setopt(h, s, 1, short) { bad = 1; }
+      bfree(short);
+      net_close(h, s);
+    },
+    Option::None => { bad = 1; },
+  }
+  if bad > 0 { return 1; }
+  return 0;
+}
