@@ -1,0 +1,136 @@
+// stage1-only: push a zeroed element and shorten a Vec in machine code (PUSHZ and SETLEN, items 33 and 34)
+// backend: c
+// expect-exit: 0
+// PUSHZ f L appends one element, all bytes zero, to a Vec (u64 elements or structs) when
+// it has room, else goes to L. SETLEN f n L sets the length to r[n], or goes to L when
+// that would make the Vec longer. Neither grows or frees anything. Where there is no
+// machine code (code_build gives 0) it checks only that.
+struct S { a: u64, b: u64, c: bool }
+struct Vm { fr: Vec[S], out: Vec[u64] }
+
+fn push6(p: &mut Vec[u64], a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, n: u64) {
+  vec_push(&mut p, a);
+  if n > 1 { vec_push(&mut p, b); }
+  if n > 2 { vec_push(&mut p, c); }
+  if n > 3 { vec_push(&mut p, d); }
+  if n > 4 { vec_push(&mut p, e); }
+  if n > 5 { vec_push(&mut p, f); }
+}
+
+fn i_const(p: &mut Vec[u64], d: u64, x: u64) { push6(&mut p, 8, d, x, 0, 0, 0, 3); }
+fn i_entry(p: &mut Vec[u64], l: u64) { push6(&mut p, 7, l, 0, 0, 0, 0, 2); }
+fn i_ret(p: &mut Vec[u64]) { push6(&mut p, 5, 0, 0, 0, 0, 0, 1); }
+fn i_pushz(p: &mut Vec[u64], f: u64, l: u64) { push6(&mut p, 33, f, l, 0, 0, 0, 3); }
+fn i_setlen(p: &mut Vec[u64], f: u64, n: u64, l: u64) { push6(&mut p, 34, f, n, l, 0, 0, 4); }
+
+fn patch(p: &mut Vec[u64], at: u64, v: u64) {
+  if at < vec_len(p) {
+    vec_set(&mut p, at, v);
+  }
+}
+
+// r1 = how many PUSHZ to try on fr (member a); a miss count is stored in out[0] by the Bastio side:
+// each PUSHZ that has no room jumps to the end, so fewer elements appear.
+fn plan_push(fa: u64, count: u64) -> Vec[u64] {
+  let mut c = vec_new[u64]();
+  i_entry(&mut c, 2);
+  let mut k = 0;
+  let mut ats = vec_new[u64]();
+  while k < count {
+    vec_push(&mut ats, vec_len(c));
+    i_pushz(&mut c, fa, 0);
+    k = k + 1;
+  }
+  i_ret(&mut c);
+  let end = vec_len(c);
+  let mut j = 0;
+  while j < vec_len(ats) {
+    patch(&mut c, wrap_add(vec_get(ats, j), 2), end);
+    j = j + 1;
+  }
+  vec_free(ats);
+  return c;
+}
+
+// r1 = n; SETLEN f r1 -> L (on a miss out[0] = 99 via the Bastio side is not needed: a
+// miss leaves the length alone and the plan returns 1).
+fn plan_setlen(fa: u64, n: u64) -> Vec[u64] {
+  let mut c = vec_new[u64]();
+  i_entry(&mut c, 2);
+  i_const(&mut c, 1, n);
+  let at = vec_len(c);
+  i_setlen(&mut c, fa, 1, 0);
+  i_ret(&mut c);
+  patch(&mut c, at + 3, vec_len(c));
+  i_const(&mut c, 2, 1);
+  push6(&mut c, 15, 2, 0, 0, 0, 0, 2);
+  i_ret(&mut c);
+  return c;
+}
+
+fn run(host: &mut Host, vm: &mut Vm, c: Vec[u64]) -> bool {
+  let code = code_build(host, c);
+  vec_free(c);
+  if code == 0 { return false; }
+  let r = code_call(code, &mut vm, 0);
+  code_free(host, code);
+  return true;
+}
+
+fn fa(vm: &Vm, k: u64) -> u64 {
+  if k < vec_len(vm.fr) { let e = vec_get(vm.fr, k); return e.a; }
+  return 12345;
+}
+fn fb(vm: &Vm, k: u64) -> u64 {
+  if k < vec_len(vm.fr) { let e = vec_get(vm.fr, k); return e.b; }
+  return 12345;
+}
+fn fc(vm: &Vm, k: u64) -> bool {
+  if k < vec_len(vm.fr) { let e = vec_get(vm.fr, k); return e.c; }
+  return true;
+}
+fn ov(vm: &Vm, k: u64) -> u64 {
+  if k < vec_len(vm.out) { return vec_get(vm.out, k); }
+  return 5;
+}
+
+fn main(host: &mut Host) -> u64 {
+  let mut vm = Vm { fr: vec_new[S](), out: vec_new[u64]() };
+  // the memory the next push lands on holds junk from an element that was popped
+  vec_push(&mut vm.fr, S { a: 7, b: 8, c: true });
+  vec_push(&mut vm.fr, S { a: 9, b: 10, c: true });
+  let junk = vec_pop(&mut vm.fr);
+  let junk2 = vec_pop(&mut vm.fr);
+  if !vec_try_reserve(&mut vm.fr, 3) { vec_free(vm.fr); vec_free(vm.out); return 0; }
+  let f = code_field(fr, a);
+  let g = code_field(out);
+  // four pushes with room for 3 (at least; the Vec may have more): count what appeared
+  if !run(&mut host, &mut vm, plan_push(f, 2)) { vec_free(vm.fr); vec_free(vm.out); return 0; }
+  let l1 = vec_len(vm.fr);
+  let a0 = fa(vm, 0);
+  let a1 = fa(vm, 1);
+  let b1 = fb(vm, 1);
+  let c1 = fc(vm, 1);
+  // shorten to 1, then try to lengthen to 5: refused
+  let r1 = run(&mut host, &mut vm, plan_setlen(f, 1));
+  let l2 = vec_len(vm.fr);
+  let r2 = run(&mut host, &mut vm, plan_setlen(f, 5));
+  let l3 = vec_len(vm.fr);
+  // u64 elements too: out has no room until reserved
+  let r3 = run(&mut host, &mut vm, plan_push(g, 1));
+  let l4 = vec_len(vm.out);
+  let ok = vec_try_reserve(&mut vm.out, 2);
+  let r4 = run(&mut host, &mut vm, plan_push(g, 1));
+  let l5 = vec_len(vm.out);
+  let v0 = ov(vm, 0);
+  vec_free(vm.fr);
+  vec_free(vm.out);
+  if l1 != 2 { return 1; }
+  if a0 != 0 || a1 != 0 || b1 != 0 || c1 { return 2; }
+  if l2 != 1 { return 3; }
+  if l3 != 1 { return 4; }
+  if l4 != 0 && l4 != 1 { return 5; }
+  if l5 != l4 + 1 && l5 != l4 { return 6; }
+  if l5 > 0 && v0 != 0 { return 7; }
+  return 0;
+}
