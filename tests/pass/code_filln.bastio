@@ -1,0 +1,105 @@
+// stage1-only: append copies to a Vec in machine code (FILLN, item 32)
+// backend: c
+// expect-exit: 0
+// FILLN f n x L appends r[n] copies of r[x] to the Vec[u64] field f when it has room
+// for them now, and goes to L otherwise, including a count that would wrap the
+// length round 2^64. It never grows the Vec. Where there is no machine code
+// (code_build gives 0) it checks only that.
+struct Vm { out: Vec[u64] }
+
+fn op_nop(vm: &mut Vm, a: u64, b: u64, c: u64, d: u64) -> u64 {
+  return a;
+}
+
+fn push6(p: &mut Vec[u64], a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, n: u64) {
+  vec_push(&mut p, a);
+  if n > 1 { vec_push(&mut p, b); }
+  if n > 2 { vec_push(&mut p, c); }
+  if n > 3 { vec_push(&mut p, d); }
+  if n > 4 { vec_push(&mut p, e); }
+  if n > 5 { vec_push(&mut p, f); }
+}
+
+fn i_const(p: &mut Vec[u64], d: u64, x: u64) { push6(&mut p, 8, d, x, 0, 0, 0, 3); }
+fn i_store(p: &mut Vec[u64], f: u64, b: u64, i: u64, s: u64, l: u64) { push6(&mut p, 18, f, b, i, s, l, 6); }
+fn i_entry(p: &mut Vec[u64], l: u64) { push6(&mut p, 7, l, 0, 0, 0, 0, 2); }
+fn i_ret(p: &mut Vec[u64]) { push6(&mut p, 5, 0, 0, 0, 0, 0, 1); }
+fn i_loadx(p: &mut Vec[u64], d: u64, f: u64, b: u64, k: u64, l: u64) { push6(&mut p, 30, d, f, b, k, l, 6); }
+fn i_storex(p: &mut Vec[u64], f: u64, b: u64, k: u64, s: u64, l: u64) { push6(&mut p, 31, f, b, k, s, l, 6); }
+
+// out[ix] = x
+fn out(p: &mut Vec[u64], f: u64, ix: u64, x: u64) {
+  i_const(&mut p, 12, 0);
+  i_const(&mut p, 13, ix);
+  i_const(&mut p, 11, x);
+  i_store(&mut p, f, 12, 13, 11, 0);
+}
+
+fn patch(p: &mut Vec[u64], at: u64, v: u64) {
+  if at < vec_len(p) {
+    vec_set(&mut p, at, v);
+  }
+}
+
+fn got(vm: &Vm, k: u64) -> u64 {
+  if k < vec_len(vm.out) {
+    return vec_get(vm.out, k);
+  }
+  return 0;
+}
+
+
+fn i_filln(p: &mut Vec[u64], f: u64, n: u64, x: u64, l: u64) { push6(&mut p, 32, f, n, x, l, 0, 5); }
+
+// r1 = n; r2 = x; FILLN; on a miss out[0] = 99 (the miss cell is written with STORE).
+fn plan_fill(f: u64, n: u64, x: u64) -> Vec[u64] {
+  let mut c = vec_new[u64]();
+  i_entry(&mut c, 2);
+  i_const(&mut c, 1, n);
+  i_const(&mut c, 2, x);
+  let at = vec_len(c);
+  i_filln(&mut c, f, 1, 2, 0);
+  i_ret(&mut c);
+  patch(&mut c, at + 4, vec_len(c));
+  out(&mut c, f, 0, 99);
+  i_ret(&mut c);
+  return c;
+}
+
+fn run(host: &mut Host, vm: &mut Vm, c: Vec[u64]) -> bool {
+  let code = code_build(host, c);
+  vec_free(c);
+  if code == 0 { return false; }
+  let r = code_call(code, &mut vm, 0);
+  code_free(host, code);
+  return true;
+}
+
+fn main(host: &mut Host) -> u64 {
+  let mut vm = Vm { out: vec_new[u64]() };
+  vec_push(&mut vm.out, 5);
+  vec_push(&mut vm.out, 6);
+  if !vec_try_reserve(&mut vm.out, 6) { vec_free(vm.out); return 0; }
+  let f = code_field(out);
+  // room for 6 more now: three copies of 7 are appended
+  if !run(&mut host, &mut vm, plan_fill(f, 3, 7)) { vec_free(vm.out); return 0; }
+  let l1 = vec_len(vm.out);
+  // zero copies: nothing changes
+  let a = run(&mut host, &mut vm, plan_fill(f, 0, 8));
+  let l2 = vec_len(vm.out);
+  // 2^64 - 1 copies would wrap the new length to 4: refused, out[0] = 99
+  let b = run(&mut host, &mut vm, plan_fill(f, 18446744073709551615, 9));
+  let l3 = vec_len(vm.out);
+  let g0 = got(vm, 0);
+  let g1 = got(vm, 1);
+  let g2 = got(vm, 2);
+  let g4 = got(vm, 4);
+  let g5 = got(vm, 5);
+  vec_free(vm.out);
+  if l1 != 5 { return 1; }
+  if l2 != 5 { return 2; }
+  if l3 != 5 { return 3; }
+  if g0 != 99 || g1 != 6 { return 4; }
+  if g2 != 7 || g4 != 7 || g5 != 0 { return 5; }
+  return 0;
+}
