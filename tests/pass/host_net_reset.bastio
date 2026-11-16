@@ -1,0 +1,50 @@
+// stage1-only: net_setopt option 8 (close with a reset)
+// backend: c
+// expect-exit: 0
+// A TCP socket whose close is set to reset makes the peer's read fail, where
+// an ordinary close makes it read zero bytes. Targets without the option call
+// fail the first net_setopt and the test stops there.
+import "../../std/net.bastio";
+
+fn one(v: u8) -> Bytes {
+  let mut b = balloc(1);
+  bset(&mut b, 0, v);
+  return b;
+}
+
+fn main(h: &mut Host) -> u64 {
+  let lo = net_ip4(127, 0, 0, 1);
+  let mut bad = 0;
+  match net_listen(h, lo, 0) {
+    Option::Some(l) => {
+      let port = net_port(h, l);
+      match net_connect(h, lo, port) {
+        Option::Some(c) => {
+          match net_accept(h, l) {
+            Option::Some(a) => {
+              let v = one(1);
+              if net_setopt(h, c, 8, v) {
+                net_close(h, c);
+                let mut buf = balloc(8);
+                match net_recv(h, a, 8, &mut buf) {
+                  Option::Some(n) => { bad = 1; },
+                  Option::None => {},
+                }
+                bfree(buf);
+              } else {
+                net_close(h, c);
+              }
+              bfree(v);
+              net_close(h, a);
+            },
+            Option::None => { net_close(h, c); bad = 2; },
+          }
+        },
+        Option::None => { bad = 3; },
+      }
+      net_close(h, l);
+    },
+    Option::None => {},
+  }
+  return bad;
+}
