@@ -1,0 +1,45 @@
+// stage1-only: u64 fields of the context itself in machine code plans (LOADS and STORES, items 35 and 36)
+// backend: c
+// expect-exit: 0
+// code_field(path) names a u64 field of the context struct, also a nested one (h.allocs), and
+// LOADS d f / STORES f s read and write it. Where there is no machine code (code_build
+// gives 0) it checks only that.
+struct Heap { allocs: u64, limit: u64 }
+struct Vm { n: u64, h: Heap, out: Vec[u64] }
+
+fn push6(p: &mut Vec[u64], a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, n: u64) {
+  vec_push(&mut p, a);
+  if n > 1 { vec_push(&mut p, b); }
+  if n > 2 { vec_push(&mut p, c); }
+  if n > 3 { vec_push(&mut p, d); }
+  if n > 4 { vec_push(&mut p, e); }
+  if n > 5 { vec_push(&mut p, f); }
+}
+
+fn main(host: &mut Host) -> u64 {
+  let mut vm = Vm { n: 41, h: Heap { allocs: 7, limit: 9 }, out: vec_new[u64]() };
+  let fn_ = code_field(n);
+  let fal = code_field(h.allocs);
+  let fli = code_field(h.limit);
+  let mut c = vec_new[u64]();
+  push6(&mut c, 7, 2, 0, 0, 0, 0, 2);          // ENTRY 2
+  push6(&mut c, 35, 1, fn_, 0, 0, 0, 3);       // r1 = n
+  push6(&mut c, 11, 0, 2, 1, 1, 0, 5);         // r2 = r1 + 1
+  push6(&mut c, 36, fal, 2, 0, 0, 0, 3);       // h.allocs = r2
+  push6(&mut c, 35, 3, fli, 0, 0, 0, 3);       // r3 = h.limit
+  push6(&mut c, 36, fn_, 3, 0, 0, 0, 3);       // n = r3
+  push6(&mut c, 16, 2, 0, 0, 0, 0, 2);         // cur = r2
+  push6(&mut c, 5, 0, 0, 0, 0, 0, 1);          // RET
+  let code = code_build(host, c);
+  vec_free(c);
+  if code == 0 { vec_free(vm.out); return 0; }
+  let r = code_call(code, &mut vm, 0);
+  code_free(host, code);
+  let a = vm.h.allocs;
+  let n = vm.n;
+  vec_free(vm.out);
+  if r != 42 { return 1; }
+  if a != 42 { return 2; }
+  if n != 9 { return 3; }
+  return 0;
+}
